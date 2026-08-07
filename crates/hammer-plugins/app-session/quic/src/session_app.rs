@@ -83,13 +83,27 @@ fn connected(
     session: SessionId,
     _: SessionAppContext,
 ) -> RuntimeResult<()> {
-    let (application, app, opaque, _) = worker
+    let (_, _, opaque, _) = worker
         .session_app_endpoint(session)
         .ok_or_else(|| QuicSessionError::ContextMissing { session })?;
+    let context = opaque
+        .map(ContextId::from)
+        .ok_or(QuicSessionError::ContextMissing { session })?;
     let connection = with_quic_worker(worker, |quic| {
-        quic.connect_connection(session, application, app, opaque)
+        quic.connect_connection(context, session, Instant::now())
     })?;
-    publish_context(worker, session, connection)
+    publish_context(worker, session, connection)?;
+    let main = QUIC_MAIN
+        .get()
+        .ok_or(RuntimeError::PluginStateNotInitialized { plugin: NAME })?;
+    main.with_worker_and_sessions(worker, |sessions, quic| {
+        quic.send_packets(sessions, connection, Instant::now())
+    })
+    .map_err(|error| {
+        let _ = with_quic_worker(worker, |quic| quic.remove_context(connection));
+        let _ = worker.set_app_session(session, 0);
+        error
+    })
 }
 
 fn builtin_rx(

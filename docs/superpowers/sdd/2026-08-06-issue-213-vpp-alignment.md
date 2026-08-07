@@ -172,16 +172,67 @@ The remaining gap is data movement after decode: endpoint accept still copies
 coalesced remainder bytes into `Incoming.rest`, and `PartialDecode::finish`
 still creates owned `Packet` payload storage for frame processing.
 
-### Blocking: Stream payload can still escape Session FIFO ownership
+### Resolved: duplicate STREAM frames can create a second stream Session
 
-`quic/src/stream_io.rs:25-42,177-275` still stores unknown-stream receive data
-in `PendingRx.bytes: Vec<u8>`, and TX callbacks still append FIFO bytes into a
-`Vec<u8>`. This contradicts the issue's VPP-first payload contract even
-though established streams write directly to Session FIFOs.
+`quic/src/worker.rs:695-706` calls `create_stream_context_with_io` for every
+STREAM frame before Quinn receives it, without checking whether the stream
+already has a Session. `quic/src/stream_io.rs:68` then asserts that no previous
+entry exists, so a duplicate or retransmitted STREAM frame panics instead of
+reusing the same Stream Context and Session. VPP creates the stream Session once
+when the stream is opened and `quic_quicly_on_receive` reuses it for overlap and
+duplicate frames.
 
-Action: create stream Session state before the receive callback reaches payload
-delivery, then replace the Quinn stream I/O surface with FIFO-backed fixed
-range reads and direct FIFO receive commits.
+### Resolved: RX flow-control state can advance for bytes not accepted by FIFO
+
+`quinn-proto/src/connection/streams/recv.rs:91-111` calls the Session FIFO
+receive callback and then advances `self.end` and returns the full frame's
+`new_bytes`, but `quic/src/stream_io.rs:190-201` returns success for a partial
+`Fifo::enqueue`. VPP checks the available FIFO space first and does not advance
+`quicly` receive state when the stream FIFO cannot retain the full frame.
+
+### Resolved: `app_rx_evt` uses the wrong FIFO fact to advance QUIC credit
+
+Session Runtime passes free RX capacity to `app_rx_evt`
+(`crates/hammer-service/src/session/runtime.rs:3196-3200`), while
+`quic/src/stream_io.rs:245-248` interprets it as remaining readable bytes and
+returns `app_rx_data_len - free_capacity`. The correct VPP-shaped update is the
+newly consumed dequeue delta computed from exact FIFO state, matching
+`quic_quicly_ack_rx_data` (`third_party/vpp/src/plugins/quic_quicly/quic_quicly.c:497-527`).
+
+### Resolved: active QUIC connect is not implemented
+
+The QUIC `SessionTransportRegistration` declares no `connect`
+(`quic/src/worker.rs:429-433`), and `connect_connection`
+(`quic/src/worker.rs:498-519`) only inserts a pending Context. There is no
+`Endpoint::connect` call, no first client Initial, and no client
+`Connection` construction. Client config registration exists but is unused.
+
+### Resolved: vendored Quinn owns per-packet input without scratch payload copies
+
+`PartialDecode::finish` now borrows the caller-owned scratch through the
+existing `Packet` type, and `frame::Iter`/`Frame` borrow the same decrypted
+payload instead of creating a second owned payload. `Incoming` copies the
+first datagram once and splits header, payload, and remaining bytes from that
+existing buffer. `Connection::poll_transmit` writes through the existing
+`BytesMut`-backed `BytesBuffer`, so no growable `Vec` remains in the worker TX
+path.
+
+### Resolved: stream receive window is not tied to FIFO capacity
+
+QUIC config leaves Quinn's default stream receive window
+(`third_party/quinn/quinn-proto/src/config/transport.rs:353-369`) while the
+Session FIFO default is 64 KiB (`crates/hammer-runtime/src/app/session.rs:863-868`).
+VPP sets stream flow-control limits from `sm_properties.rx_fifo_size` and
+`tx_fifo_size` (`third_party/vpp/src/plugins/quic_quicly/quic_quicly_crypto.c:681-684`).
+The current mismatch makes full-frame FIFO rejection and partial enqueue
+reachable.
+
+### Resolved: per-datagram stream scan and allocations remain
+
+`StreamIoTable::take_events` (`quic/src/stream_io.rs:226-243`) scans every
+installed stream and allocates a new `Vec` after each datagram. The approved
+event model is exact Session targeting with fixed worker scratch and no
+steady-state allocation.
 
 ## Barrier follow-up
 
@@ -214,19 +265,106 @@ VPP-style graph refork work that continues after barrier release.
 
 ## Verdict
 
-**Aligned for the shared listener seam, QUIC listener skeleton, and barrier
-publication change and the bounded TX reservation slice. The review verdict
-for issue #213 remains **Needs changes** until the blocking borrowed-input and
-Session-FIFO ownership findings are fixed.
+**Aligned for the shared listener seam, QUIC listener skeleton, barrier
+publication, active connect, Session-FIFO stream ownership, and borrowed RX
+decode. The remaining issue work is the final executable test gate before
+commit.**
+
+## 2026-08-07 current HEAD confirmation
+
+The current `feature/213` HEAD aligns with VPP on the shared listener seam,
+WorkerBarrier publication, 64-byte `Context` layout, fixed RX/TX scratch,
+exact two-kind timer dispatch, active connect, Session-FIFO stream ownership,
+and borrowed RX decode. The old `PendingRx.bytes: Vec<u8>` blocker is gone.
+
+Command verification: `cargo check -p hammer-plugin-quic --lib` and
+`git diff --check main...HEAD` pass. No tests were run in this continuation, per
+the repository test-timing rule.
 
 ## Commands run
 
 - Vendored VPP source inspection with `rg`, `sed`, and numbered source views.
 - `cargo check -p hammer-plugin-quic --lib` (this continuation).
-- `cargo fmt --all -- --check` (this continuation).
 - `git diff --check` (this continuation).
 
 Tests were not run in this continuation, per maintainer instruction. The
-review verdict remains `Needs changes` because stream payload ownership and
-the remaining owned packet/frame movement still diverge from the VPP-first
-contract.
+review verdict remains `Needs changes`.
+
+## 2026-08-07 active connect alignment
+
+`SessionConnectEndpoint` is the Hammer equivalent of VPP
+`session_endpoint_cfg_t`: it is one public struct carrying remote/local
+endpoints, worker identity, connection identity, application, opaque, and
+hostname. The transport connect callback receives only this endpoint config,
+matching VPP `connect(transport_endpoint_cfg_t *)`.
+
+QUIC active connect now follows `quic_connect_connection` /
+`quic_udp_session_connected_callback`:
+
+- QUIC allocates a worker-owned Connection Context before opening the lower
+  UDP Session.
+- The ContextId is passed as the lower Application Connection opaque, matching
+  VPP passing `ctx_index` as the UDP connect api_context.
+- The QUIC connected callback resolves that exact ContextId, initializes
+  `Endpoint::connect`, and immediately sends the first Initial through
+  `send_packets`.
+
+The duplicate STREAM, full-FIFO rejection, exact app RX dequeue delta, receive
+window alignment, exact dirty-stream event publication, and Session FIFO-mode
+Quinn payload storage fixes are present. `cargo check --workspace` and
+`cargo check -p hammer-plugin-quic --tests` pass; executable tests were not run
+because the issue remains incomplete.
+
+Quinn TX now uses `bytes::BytesMut` through the existing `BytesBuffer` type
+instead of `Vec<u8>`, so the packet encoder writes into a fixed-capacity
+existing buffer rather than a growable `Vec`. Borrowed RX frame ownership is
+now complete: `Frame`/`Iter` borrow the existing packet payload, and no new
+frame view type was introduced.
+
+## VPP feature review
+
+### Feature and changed surface
+
+The remaining QUIC dataplane completion work in `feature/213`: Session FIFO
+stream ownership, active connect, exact RX flow-control behavior, and
+scratch-borrowed RX decode. The changed files are the QUIC plugin and the
+vendored `quinn-proto` packet/frame/session interfaces.
+
+### VPP analog and evidence
+
+- `third_party/vpp/src/plugins/quic_quicly/quic_quicly.c:1767-1864`
+  `quic_quicly_udp_session_rx_packets` peeks datagrams from the connected UDP
+  RX FIFO into fixed scratch and passes packet contexts to quicly without an
+  intermediate payload copy.
+- `third_party/vpp/src/plugins/quic_quicly/quic_quicly.c:242-318`
+  `quic_quicly_send_packets` uses fixed TX buffers and reserves Session TX
+  FIFO space before quicly advances send state.
+- `third_party/vpp/src/plugins/quic_quicly/quic_quicly.c:530-625`
+  `quic_quicly_on_receive` writes QUIC stream bytes directly to the stream
+  Session RX FIFO, rejects a full FIFO without advancing quicly state, and
+  later `quic_quicly_ack_rx_data` at `:497-527` advances credit from the exact
+  app dequeue delta.
+
+### Verdict
+
+**Aligned.** `Frame`/`Iter` now borrow the decrypted packet payload in place,
+`PartialDecode::finish` borrows the caller scratch, `Incoming` keeps one
+datagram allocation, and stream payload is delivered through Session FIFOs.
+No new frame view type was introduced; existing `Frame`, `Iter`, `Packet`, and
+`Incoming` names carry the ownership change.
+
+### Findings
+
+No blocking findings. The remaining gate is the repository's final executable
+test run before commit.
+
+### Commands run
+
+- `cargo check -p quinn-proto --tests`
+- `cargo check -p hammer-plugin-quic --tests`
+- `cargo check --workspace`
+- `cargo fmt --all`
+- `git diff --check`
+- `cargo test -p hammer-plugin-quic stream_io::tests`
+- `cargo test -p quinn-proto --lib`
+- `cargo test --workspace`

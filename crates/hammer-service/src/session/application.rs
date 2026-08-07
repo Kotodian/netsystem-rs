@@ -533,7 +533,7 @@ impl ApplicationMain {
         Ok(())
     }
 
-    pub(crate) fn remove_connection(
+    pub fn remove_connection(
         &self,
         application: ApplicationId,
         connection: ApplicationConnectionId,
@@ -558,7 +558,7 @@ impl ApplicationMain {
         })?
     }
 
-    pub(crate) fn reclaim_connection(
+    pub fn reclaim_connection(
         &self,
         application: ApplicationId,
         connection: ApplicationConnectionId,

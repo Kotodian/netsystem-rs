@@ -414,7 +414,6 @@ impl SessionMain {
 
     pub fn connect(
         &self,
-        connection: ApplicationConnectionId,
         transport: SessionTransportRegistration,
         endpoint: SessionConnectEndpoint,
     ) -> RuntimeResult<SessionConnectionId> {
@@ -424,9 +423,9 @@ impl SessionMain {
             }
             .into());
         };
-        let session_connection = SessionConnectionId::from_raw(connection.raw());
-        connect(session_connection, endpoint)?;
-        Ok(session_connection)
+        let connection = endpoint.connection;
+        connect(endpoint)?;
+        Ok(connection)
     }
 
     /// Installs one worker-local Session App callback table by registered name.

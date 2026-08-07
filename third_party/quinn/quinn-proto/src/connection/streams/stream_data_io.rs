@@ -9,6 +9,7 @@
 
 use std::ops::Range;
 
+use bytes::BytesMut;
 use thiserror::Error;
 
 use crate::StreamId;
@@ -91,7 +92,7 @@ pub struct StreamDataIo {
     pub user_data: usize,
     /// Copy stream bytes at `range` into `output`.
     pub transmit:
-        unsafe fn(usize, StreamId, Range<u64>, &mut Vec<u8>) -> Result<usize, StreamDataError>,
+        unsafe fn(usize, StreamId, Range<u64>, &mut BytesMut) -> Result<usize, StreamDataError>,
     /// Release a newly contiguous acknowledged TX prefix ending at `offset`.
     pub ack: unsafe fn(usize, StreamId, u64) -> Result<(), StreamDataError>,
     /// Deliver one decrypted STREAM payload to the Session FIFO.
@@ -104,7 +105,7 @@ impl StreamDataIo {
         self,
         id: StreamId,
         offsets: Range<u64>,
-        output: &mut Vec<u8>,
+        output: &mut BytesMut,
     ) -> Result<usize, StreamDataError> {
         unsafe { (self.transmit)(self.user_data, id, offsets, output) }
     }
@@ -130,7 +131,7 @@ impl StreamDataIo {
 }
 
 pub(crate) fn append_io_bytes(
-    output: &mut Vec<u8>,
+    output: &mut BytesMut,
     io: StreamDataIo,
     id: StreamId,
     mut offsets: Range<u64>,

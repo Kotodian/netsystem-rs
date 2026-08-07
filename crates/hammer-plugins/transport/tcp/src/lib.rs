@@ -315,25 +315,22 @@ pub(crate) fn stop_listen(listener: SessionListenerId) -> RuntimeResult<()> {
     main.listeners.close_session_listener(listener)
 }
 
-pub(crate) fn connect(
-    connection: SessionConnectionId,
-    endpoint: SessionConnectEndpoint,
-) -> RuntimeResult<()> {
-    let local = endpoint.local().ok_or(TcpError::InvalidConnection)?;
-    if local.is_ipv4() != endpoint.remote().is_ipv4() || local.port() == 0 {
+pub(crate) fn connect(endpoint: SessionConnectEndpoint) -> RuntimeResult<()> {
+    let local = endpoint.local.ok_or(TcpError::InvalidConnection)?;
+    if local.is_ipv4() != endpoint.remote.is_ipv4() || local.port() == 0 {
         return Err(TcpError::InvalidConnection.into());
     }
     let main = TCP_MAIN
         .load_full()
         .ok_or(RuntimeError::PluginStateNotInitialized { plugin: "tcp" })?;
-    let worker = endpoint.worker();
+    let worker = endpoint.worker;
     let worker_slot = worker.slot();
     let (completion, completed) = mpsc::sync_channel(1);
     Engine::with_current(|engine| {
         engine.schedule_on_worker(worker, move || {
             let result = with_data_plane_runtime(|runtime| {
                 main.with_worker(runtime, |sessions, tcp| {
-                    start_connect(sessions, tcp, connection, local, endpoint.remote())
+                    start_connect(sessions, tcp, endpoint.connection, local, endpoint.remote)
                 })
             });
             if completion.send(result).is_err() {

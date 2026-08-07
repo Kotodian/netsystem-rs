@@ -1069,6 +1069,7 @@ name = "hammer-infra"
 version = "0.1.0"
 dependencies = [
  "byte-unit",
+ "bytes",
  "crossbeam-utils",
  "libc",
  "libmimalloc-sys",

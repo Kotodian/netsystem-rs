@@ -25,6 +25,7 @@ use crate::{
 pub struct PartialDecode {
     plain_header: ProtectedHeader,
     packet_range: Range<usize>,
+    pn_offset: usize,
 }
 
 #[allow(clippy::len_without_is_empty)]
@@ -40,6 +41,7 @@ impl PartialDecode {
         let mut buf = io::Cursor::new(bytes);
         let plain_header =
             ProtectedHeader::decode(&mut buf, cid_parser, supported_versions, grease_quic_bit)?;
+        let pn_offset = buf.position() as usize;
         let dgram_len = buf.get_ref().len();
         let packet_len = plain_header
             .payload_len()
@@ -50,6 +52,7 @@ impl PartialDecode {
                 Self {
                     plain_header,
                     packet_range: offset..offset + packet_len,
+                    pn_offset,
                 },
                 None,
             )),
@@ -60,6 +63,7 @@ impl PartialDecode {
                 Self {
                     plain_header,
                     packet_range: offset..offset + packet_len,
+                    pn_offset,
                 },
                 Some(offset + packet_len..offset + dgram_len),
             )),
@@ -118,17 +122,21 @@ impl PartialDecode {
         self.packet_range.len()
     }
 
-    pub(crate) fn finish(
+    pub(crate) fn finish<'a>(
         self,
-        scratch: &mut [u8],
+        scratch: &'a mut [u8],
         header_crypto: Option<&dyn crypto::HeaderKey>,
-    ) -> Result<Packet, PacketDecodeError> {
+    ) -> Result<Packet<'a>, PacketDecodeError> {
         use ProtectedHeader::*;
         let Self {
             plain_header,
             packet_range,
+            pn_offset,
         } = self;
+        let packet_start = packet_range.start;
+        let packet_end = packet_range.end;
         let mut buf = io::Cursor::new(&mut scratch[packet_range.clone()]);
+        buf.set_position(pn_offset as u64);
 
         if let Initial(ProtectedInitialHeader {
             dst_cid,
@@ -140,9 +148,8 @@ impl PartialDecode {
         {
             let number = Self::decrypt_header(&mut buf, header_crypto.unwrap())?;
             let header_len = buf.position() as usize;
-            let mut bytes = BytesMut::from(&scratch[packet_range.clone()]);
-
-            let header_data = bytes.split_to(header_len).freeze();
+            let header_data =
+                Bytes::copy_from_slice(&scratch[packet_start..packet_start + header_len]);
             let token = header_data.slice(token_pos.start..token_pos.end);
             return Ok(Packet {
                 header: Header::Initial(InitialHeader {
@@ -153,7 +160,8 @@ impl PartialDecode {
                     version,
                 }),
                 header_data,
-                payload: bytes,
+                payload: &mut scratch[packet_start + header_len..packet_end],
+                payload_len: packet_end - packet_start - header_len,
             });
         }
 
@@ -203,11 +211,12 @@ impl PartialDecode {
         };
 
         let header_len = buf.position() as usize;
-        let mut bytes = BytesMut::from(&scratch[packet_range]);
+        let header_data = Bytes::copy_from_slice(&scratch[packet_start..packet_start + header_len]);
         Ok(Packet {
             header,
-            header_data: bytes.split_to(header_len).freeze(),
-            payload: bytes,
+            header_data,
+            payload: &mut scratch[packet_start + header_len..packet_end],
+            payload_len: packet_end - packet_start - header_len,
         })
     }
 
@@ -230,13 +239,14 @@ impl PartialDecode {
     }
 }
 
-pub(crate) struct Packet {
+pub(crate) struct Packet<'a> {
     pub(crate) header: Header,
     pub(crate) header_data: Bytes,
-    pub(crate) payload: BytesMut,
+    pub(crate) payload: &'a mut [u8],
+    pub(crate) payload_len: usize,
 }
 
-impl Packet {
+impl Packet<'_> {
     pub(crate) fn reserved_bits_valid(&self) -> bool {
         let mask = match self.header {
             Header::Short { .. } => SHORT_RESERVED_BITS,
@@ -252,12 +262,20 @@ pub(crate) struct InitialPacket {
     pub(crate) payload: BytesMut,
 }
 
-impl From<InitialPacket> for Packet {
-    fn from(x: InitialPacket) -> Self {
+impl<'a> From<&'a mut InitialPacket> for Packet<'a> {
+    fn from(x: &'a mut InitialPacket) -> Self {
+        let payload_len = x.payload.len();
         Self {
-            header: Header::Initial(x.header),
-            header_data: x.header_data,
-            payload: x.payload,
+            header: Header::Initial(InitialHeader {
+                dst_cid: x.header.dst_cid,
+                src_cid: x.header.src_cid,
+                token: x.header.token.clone(),
+                number: x.header.number,
+                version: x.header.version,
+            }),
+            header_data: x.header_data.clone(),
+            payload: &mut x.payload[..],
+            payload_len,
         }
     }
 }
@@ -292,7 +310,7 @@ pub(crate) enum Header {
 }
 
 impl Header {
-    pub(crate) fn encode(&self, w: &mut Vec<u8>) -> PartialEncode {
+    pub(crate) fn encode(&self, w: &mut BytesMut) -> PartialEncode {
         use Header::*;
         let start = w.len();
         match *self {
@@ -914,7 +932,7 @@ mod tests {
     use std::io;
 
     fn check_pn(typed: PacketNumber, encoded: &[u8]) {
-        let mut buf = Vec::new();
+        let mut buf = BytesMut::new();
         typed.encode(&mut buf);
         assert_eq!(&buf[..], encoded);
         let decoded = PacketNumber::decode(typed.len(), &mut io::Cursor::new(&buf)).unwrap();
@@ -962,7 +980,7 @@ mod tests {
 
         let suite = initial_suite_from_provider(&std::sync::Arc::new(provider)).unwrap();
         let client = initial_keys(Version::V1, dcid, Side::Client, &suite);
-        let mut buf = Vec::new();
+        let mut buf = BytesMut::new();
         let header = Header::Initial(InitialHeader {
             number: PacketNumber::U8(0),
             src_cid: ConnectionId::new(&[]),
@@ -993,7 +1011,7 @@ mod tests {
 
         let server = initial_keys(Version::V1, dcid, Side::Server, &suite);
         let supported_versions = crate::DEFAULT_SUPPORTED_VERSIONS.to_vec();
-        let mut scratch = BytesMut::from(buf.as_slice());
+        let mut scratch = BytesMut::from(&buf[..]);
         let decode = PartialDecode::new(
             &scratch,
             0,
@@ -1015,8 +1033,8 @@ mod tests {
             .remote
             .decrypt(0, &packet.header_data, &mut packet.payload)
             .unwrap();
-        packet.payload.truncate(payload_len);
-        assert_eq!(packet.payload[..], [0; 16]);
+        packet.payload_len = payload_len;
+        assert_eq!(packet.payload[..packet.payload_len], [0; 16]);
         match packet.header {
             Header::Initial(InitialHeader {
                 number: PacketNumber::U8(0),

@@ -114,6 +114,10 @@ struct EngineConnection {
     application: ApplicationId,
     app: Option<SessionAppId>,
     opaque: Option<u64>,
+    client_config: Option<Arc<quinn_proto::ClientConfig>>,
+    client_server_name: Option<String>,
+    client_local: Option<SocketAddr>,
+    client_remote: Option<SocketAddr>,
     io_table: Box<StreamIoTable>,
 }
 
@@ -133,6 +137,36 @@ impl EngineConnection {
             application,
             app,
             opaque,
+            client_config: None,
+            client_server_name: None,
+            client_local: None,
+            client_remote: None,
+            io_table: StreamIoTable::new(),
+        }
+    }
+
+    fn client(
+        config: Arc<quinn_proto::ClientConfig>,
+        server_name: String,
+        local: SocketAddr,
+        remote: SocketAddr,
+        application: ApplicationId,
+        app: Option<SessionAppId>,
+        opaque: Option<u64>,
+    ) -> Self {
+        Self {
+            handle: None,
+            connection: None,
+            remote: None,
+            local: None,
+            server_config: None,
+            application,
+            app,
+            opaque,
+            client_config: Some(config),
+            client_server_name: Some(server_name),
+            client_local: Some(local),
+            client_remote: Some(remote),
             io_table: StreamIoTable::new(),
         }
     }
@@ -227,6 +261,37 @@ impl Context {
                 lower_session,
                 upper_session: None,
                 listener,
+                state: ConnectionState::Handshaking,
+                flags: 0,
+                reserved: [0; 6],
+            }),
+        }
+    }
+
+    fn connection_with_client(
+        lower_session: SessionId,
+        application: ApplicationId,
+        app: Option<SessionAppId>,
+        opaque: Option<u64>,
+        config: Arc<quinn_proto::ClientConfig>,
+        server_name: String,
+        local: SocketAddr,
+        remote: SocketAddr,
+    ) -> Self {
+        Self {
+            role: ContextRole::Connection(ConnectionContext {
+                engine: Some(Box::new(EngineConnection::client(
+                    config,
+                    server_name,
+                    local,
+                    remote,
+                    application,
+                    app,
+                    opaque,
+                ))),
+                lower_session,
+                upper_session: None,
+                listener: None,
                 state: ConnectionState::Handshaking,
                 flags: 0,
                 reserved: [0; 6],
@@ -430,6 +495,7 @@ impl QuicTimers {
     name = "quic",
     start_listen = crate::listener::start_listen,
     stop_listen = crate::listener::stop_listen,
+    connect = crate::listener::connect,
 )]
 pub struct QuicWorker {
     endpoint: Endpoint,
@@ -437,6 +503,7 @@ pub struct QuicWorker {
     timers: QuicTimers,
     rx_datagrams: [Option<Box<RxDatagramScratch>>; RX_DATAGRAM_BURST],
     rx_packet_descriptors: Vec<PartialDecode>,
+    stream_io_events: Vec<crate::stream_io::StreamIoEvent>,
     tx_bufs: BytesBuffer,
     connection_tx_pending: Vec<ContextId>,
     connection_tx_ready: Vec<ContextId>,
@@ -450,6 +517,7 @@ impl QuicWorker {
             timers: QuicTimers::new(Instant::now()),
             rx_datagrams: std::array::from_fn(|_| Some(Box::new(RxDatagramScratch::default()))),
             rx_packet_descriptors: Vec::with_capacity(64),
+            stream_io_events: Vec::with_capacity(64),
             tx_bufs: BytesBuffer::with_capacity(TX_PACKET_BURST * MAX_PACKET_SIZE),
             connection_tx_pending: Vec::with_capacity(QUIC_CONTEXT_CAPACITY),
             connection_tx_ready: Vec::with_capacity(QUIC_CONTEXT_CAPACITY),
@@ -495,27 +563,103 @@ impl QuicWorker {
         Ok(context)
     }
 
-    pub(super) fn connect_connection(
+    pub(super) fn allocate_client_connect(
         &mut self,
-        lower_session: SessionId,
+        config: Arc<quinn_proto::ClientConfig>,
+        server_name: String,
+        local: SocketAddr,
+        remote: SocketAddr,
         application: ApplicationId,
         app: Option<SessionAppId>,
         opaque: Option<u64>,
     ) -> RuntimeResult<ContextId> {
-        Ok(self
+        if self.contexts.len() == self.contexts.capacity() {
+            return Err(QuicWorkerError::ContextCapacityExhausted {
+                capacity: self.contexts.capacity(),
+            }
+            .into());
+        }
+        let context = self
             .contexts
-            .insert(Context::connection_with_listener(
-                lower_session,
-                None,
+            .insert(Context::connection_with_client(
+                SessionId::from_raw(0),
                 application,
-                None,
                 app,
                 opaque,
+                config,
+                server_name,
+                local,
+                remote,
             ))
-            .map(ContextId::from)
-            .ok_or_else(|| QuicWorkerError::ContextCapacityExhausted {
-                capacity: self.contexts.capacity(),
-            })?)
+            .expect("client connect context capacity was preflighted");
+        Ok(ContextId::from(context))
+    }
+
+    pub(super) fn connect_connection(
+        &mut self,
+        context: ContextId,
+        lower_session: SessionId,
+        now: Instant,
+    ) -> RuntimeResult<ContextId> {
+        let context_index = context.into();
+        {
+            let connection = self
+                .contexts
+                .get_mut(context_index)
+                .and_then(Context::connection_mut)
+                .ok_or_else(|| QuicWorkerError::ContextMissing { context })?;
+            connection.lower_session = lower_session;
+        }
+        let (config, server_name, local, remote, io) = {
+            let engine = self
+                .contexts
+                .get_mut(context_index)
+                .ok_or_else(|| QuicWorkerError::ContextMissing { context })?
+                .engine_mut(context)?;
+            (
+                engine
+                    .client_config
+                    .take()
+                    .ok_or(QuicWorkerError::ClientConfigurationMissing)?,
+                engine
+                    .client_server_name
+                    .take()
+                    .ok_or(QuicWorkerError::ClientConfigurationMissing)?,
+                engine
+                    .client_local
+                    .take()
+                    .ok_or(QuicWorkerError::ClientConfigurationMissing)?,
+                engine
+                    .client_remote
+                    .take()
+                    .ok_or(QuicWorkerError::ClientConfigurationMissing)?,
+                engine.io_table.io(),
+            )
+        };
+        let (handle, mut connection) =
+            match self
+                .endpoint
+                .connect(now, config.as_ref().clone(), remote, &server_name)
+            {
+                Ok(connection) => connection,
+                Err(source) => {
+                    let _ = self.remove_context(context);
+                    return Err(QuicWorkerError::ClientConnectFailed { context, source }.into());
+                }
+            };
+        connection.set_stream_data_io(Some(io));
+        {
+            let engine = self
+                .contexts
+                .get_mut(context_index)
+                .ok_or_else(|| QuicWorkerError::ContextMissing { context })?
+                .engine_mut(context)?;
+            engine.handle = Some(handle);
+            engine.connection = Some(connection);
+            engine.remote = Some(remote);
+            engine.local = Some(local);
+        }
+        Ok(context)
     }
 
     pub(super) fn context_session(&self, context: ContextId) -> RuntimeResult<SessionId> {
@@ -1009,6 +1153,16 @@ impl QuicWorker {
         stream: quinn_proto::StreamId,
         accepted: bool,
     ) -> RuntimeResult<()> {
+        if self
+            .contexts
+            .get(context.into())
+            .and_then(Context::connection)
+            .and_then(|connection| connection.engine.as_ref())
+            .map(|engine| engine.io_table.stream_session(stream).is_some())
+            .unwrap_or(false)
+        {
+            return Ok(());
+        }
         let connection_context = self
             .contexts
             .get(context.into())
@@ -1057,6 +1211,9 @@ impl QuicWorker {
         opaque: Option<u64>,
         io_table: &mut StreamIoTable,
     ) -> RuntimeResult<()> {
+        if io_table.stream_session(stream).is_some() {
+            return Ok(());
+        }
         let (stream_context, session_id, rx_fifo, tx_fifo, app_tx_data_len) = self
             .allocate_stream_context(
                 sessions,
@@ -1138,13 +1295,15 @@ impl QuicWorker {
         sessions: &mut SessionWorker<Index>,
         context: ContextId,
     ) -> RuntimeResult<()> {
-        let engine = self
-            .contexts
-            .get_mut(context.into())
-            .ok_or_else(|| QuicWorkerError::ContextMissing { context })?
-            .engine_mut(context)?;
-        let events = engine.io_table.take_events();
-        for event in events {
+        {
+            let engine = self
+                .contexts
+                .get_mut(context.into())
+                .ok_or_else(|| QuicWorkerError::ContextMissing { context })?
+                .engine_mut(context)?;
+            engine.io_table.take_events(&mut self.stream_io_events);
+        }
+        for event in &self.stream_io_events {
             if event.rx != 0 {
                 sessions.publish_rx_enqueue(event.session, event.rx as usize)?;
             }
@@ -1162,6 +1321,7 @@ impl QuicWorker {
                 stream.bytes_written = event.bytes_written;
             }
         }
+        self.stream_io_events.clear();
         Ok(())
     }
 
@@ -1404,22 +1564,35 @@ impl QuicWorker {
             .get_mut(parent)
             .and_then(Context::connection_mut)
             .and_then(|connection| connection.engine.as_mut())
-            .and_then(|engine| engine.io_table.app_rx_consumed(stream_id, rx_available))
+            .and_then(|engine| engine.io_table.app_rx_consumed(stream_id))
             .unwrap_or(0);
-        if consumed != 0
-            && let Ok(should_transmit) = self
+        if consumed != 0 {
+            let should_transmit = self
                 .contexts
                 .get_mut(parent)
                 .and_then(Context::connection_mut)
                 .and_then(|connection| connection.engine.as_mut())
                 .and_then(|engine| engine.connection_mut().ok())
                 .map(|connection| connection.recv_stream(stream_id).credit_read(consumed))
-                .unwrap_or(Ok(Default::default()))
-            && should_transmit.should_transmit()
-        {
-            self.queue_connection_output(parent_context);
+                .unwrap_or(Ok(Default::default()));
+            if should_transmit.is_ok() {
+                if let Some(engine) = self
+                    .contexts
+                    .get_mut(parent)
+                    .and_then(Context::connection_mut)
+                    .and_then(|connection| connection.engine.as_mut())
+                {
+                    engine.io_table.confirm_app_rx_consumed(stream_id);
+                }
+            }
+            if should_transmit
+                .map(|value| value.should_transmit())
+                .unwrap_or(false)
+            {
+                self.queue_connection_output(parent_context);
+            }
         }
-        Ok(false)
+        Ok(rx_available == 0)
     }
 
     fn update_time(
@@ -1622,6 +1795,14 @@ pub(super) enum QuicWorkerError {
     ConnectionMissing,
     #[error("QUIC server configuration is missing for context {context:?}")]
     ServerConfigMissing { context: ContextId },
+    #[error("QUIC client configuration is missing for active connect")]
+    ClientConfigurationMissing,
+    #[error("QUIC client connect failed for context {context:?}: {source}")]
+    ClientConnectFailed {
+        context: ContextId,
+        #[source]
+        source: quinn_proto::ConnectError,
+    },
     #[error("QUIC first Initial accept failed for context {context:?}: {source}")]
     AcceptFailed {
         context: ContextId,
@@ -1760,5 +1941,59 @@ mod tests {
         assert_eq!(token.context, context);
         assert_eq!(token.kind, QuicTimerKind::Transmit);
         assert!(timers.take_pending().is_none());
+    }
+
+    #[test]
+    fn active_connect_allocates_context_then_builds_engine_and_first_initial() {
+        let certified = rcgen::generate_simple_self_signed(vec!["localhost".to_owned()])
+            .expect("generate QUIC test certificate");
+        let mut roots = quinn_proto::rustls::RootCertStore::empty();
+        roots
+            .add(certified.cert.der().clone())
+            .expect("add test trust anchor");
+        let builder = quinn_proto::rustls::ClientConfig::builder()
+            .with_root_certificates(roots)
+            .with_no_client_auth();
+        let crypto = quinn_proto::crypto::rustls::QuicClientConfig::try_from(Arc::new(builder))
+            .expect("build QUIC client crypto");
+        let mut config = quinn_proto::ClientConfig::new(Arc::new(crypto));
+        config.transport_config(Arc::new(quinn_proto::TransportConfig::default()));
+
+        let mut worker = QuicWorker::new(DataWorkerId::new(0));
+        let local = "127.0.0.1:443".parse().expect("local endpoint");
+        let remote = "127.0.0.1:444".parse().expect("remote endpoint");
+        let context = worker
+            .allocate_client_connect(
+                Arc::new(config),
+                "localhost".to_owned(),
+                local,
+                remote,
+                ApplicationId::new(7, 1),
+                None,
+                Some(ConfigId::from_raw(9).raw()),
+            )
+            .expect("allocate active connect context before UDP connect");
+        let now = Instant::now();
+        worker
+            .connect_connection(context, SessionId::from_raw(11), now)
+            .expect("initialize client engine from preallocated context");
+
+        let mut tx_bufs = BytesBuffer::with_capacity(1280);
+        let transmit = {
+            let engine = worker
+                .contexts
+                .get_mut(context.into())
+                .and_then(Context::connection_mut)
+                .and_then(|connection| connection.engine.as_deref_mut())
+                .expect("active connect engine");
+            assert_eq!(engine.remote, Some(remote));
+            engine
+                .connection
+                .as_mut()
+                .expect("connection")
+                .poll_transmit(now, 1, &mut *tx_bufs)
+                .expect("first client Initial")
+        };
+        assert!(transmit.size >= 1200);
     }
 }

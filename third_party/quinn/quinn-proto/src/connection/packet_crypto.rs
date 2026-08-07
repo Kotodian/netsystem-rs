@@ -8,13 +8,13 @@ use crate::Instant;
 use crate::{TransportError, RESET_TOKEN_SIZE};
 
 /// Removes header protection of a packet, or returns `None` if the packet was dropped
-pub(super) fn unprotect_header(
+pub(super) fn unprotect_header<'a>(
     partial_decode: PartialDecode,
-    scratch: &mut [u8],
+    scratch: &'a mut [u8],
     spaces: &[PacketSpace; 3],
     zero_rtt_crypto: Option<&ZeroRttCrypto>,
     stateless_reset_token: Option<ResetToken>,
-) -> Option<UnprotectHeaderResult> {
+) -> Option<UnprotectHeaderResult<'a>> {
     let header_crypto = if partial_decode.is_0rtt() {
         if let Some(crypto) = zero_rtt_crypto {
             Some(&*crypto.header)
@@ -55,17 +55,17 @@ pub(super) fn unprotect_header(
     }
 }
 
-pub(super) struct UnprotectHeaderResult {
+pub(super) struct UnprotectHeaderResult<'a> {
     /// The packet with the now unprotected header (`None` in the case of stateless reset packets
     /// that fail to be decoded)
-    pub(super) packet: Option<Packet>,
+    pub(super) packet: Option<Packet<'a>>,
     /// Whether the packet was a stateless reset packet
     pub(super) stateless_reset: bool,
 }
 
 /// Decrypts a packet's body in-place
 pub(super) fn decrypt_packet_body(
-    packet: &mut Packet,
+    packet: &mut Packet<'_>,
     spaces: &[PacketSpace; 3],
     zero_rtt_crypto: Option<&ZeroRttCrypto>,
     conn_key_phase: bool,
@@ -110,7 +110,7 @@ pub(super) fn decrypt_packet_body(
     let payload_len = crypto
         .decrypt(number, &packet.header_data, packet.payload.as_mut())
         .map_err(|_| None)?;
-    packet.payload.truncate(payload_len);
+    packet.payload_len = payload_len;
 
     if !packet.reserved_bits_valid() {
         return Err(Some(TransportError::PROTOCOL_VIOLATION(

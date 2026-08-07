@@ -558,7 +558,7 @@ impl Connection {
         &mut self,
         now: Instant,
         max_datagrams: usize,
-        buf: &mut Vec<u8>,
+        buf: &mut BytesMut,
     ) -> Option<Transmit> {
         assert!(max_datagrams != 0);
         let max_datagrams = match self.config.enable_segmentation_offload {
@@ -1126,7 +1126,7 @@ impl Connection {
     }
 
     /// Send PATH_CHALLENGE for a previous path if necessary
-    fn send_path_challenge(&mut self, now: Instant, buf: &mut Vec<u8>) -> Option<Transmit> {
+    fn send_path_challenge(&mut self, now: Instant, buf: &mut BytesMut) -> Option<Transmit> {
         let (prev_cid, prev_path) = self.prev_path.as_mut()?;
         if !prev_path.challenge_pending {
             return None;
@@ -2129,7 +2129,7 @@ impl Connection {
         remote: SocketAddr,
         ecn: Option<EcnCodepoint>,
         packet_number: u64,
-        packet: InitialPacket,
+        mut packet: InitialPacket,
         remaining: Option<BytesMut>,
     ) -> Result<(), ConnectionError> {
         let span = trace_span!("first recv");
@@ -2154,7 +2154,7 @@ impl Connection {
             false,
         );
 
-        self.process_decrypted_packet(now, remote, Some(packet_number), packet.into())?;
+        self.process_decrypted_packet(now, remote, Some(packet_number), Packet::from(&mut packet))?;
         if let Some(data) = remaining {
             self.handle_coalesced(now, remote, ecn, data);
         }
@@ -2530,7 +2530,7 @@ impl Connection {
         now: Instant,
         remote: SocketAddr,
         ecn: Option<EcnCodepoint>,
-        packet: Option<Packet>,
+        packet: Option<Packet<'_>>,
         stateless_reset: bool,
         prepare_stream: &mut F,
     ) where
@@ -2541,7 +2541,7 @@ impl Connection {
             trace!(
                 "got {:?} packet ({} bytes) from {} using id {}",
                 packet.header.space(),
-                packet.payload.len() + packet.header_data.len(),
+                packet.payload_len + packet.header_data.len(),
                 remote,
                 packet.header.dst_cid(),
             );
@@ -2692,7 +2692,7 @@ impl Connection {
         now: Instant,
         remote: SocketAddr,
         number: Option<u64>,
-        packet: Packet,
+        packet: Packet<'_>,
     ) -> Result<(), ConnectionError> {
         self.process_decrypted_packet_with_stream_setup(
             now,
@@ -2708,7 +2708,7 @@ impl Connection {
         now: Instant,
         remote: SocketAddr,
         number: Option<u64>,
-        packet: Packet,
+        packet: Packet<'_>,
         prepare_stream: &mut F,
     ) -> Result<(), ConnectionError>
     where
@@ -2732,7 +2732,7 @@ impl Connection {
                 return Ok(());
             }
             State::Closed(_) => {
-                for result in frame::Iter::new(packet.payload.freeze())? {
+                for result in frame::Iter::new(&packet.payload[..packet.payload_len])? {
                     let frame = match result {
                         Ok(frame) => frame,
                         Err(err) => {
@@ -2768,11 +2768,11 @@ impl Connection {
                 }
 
                 if self.total_authed_packets > 1
-                            || packet.payload.len() <= 16 // token + 16 byte tag
+                            || packet.payload_len <= 16 // token + 16 byte tag
                             || !self.crypto.is_valid_retry(
                                 &self.rem_cids.active(),
                                 &packet.header_data,
-                                &packet.payload,
+                                &packet.payload[..packet.payload_len],
                             )
                 {
                     self.stats.udp_rx.on_packet_drop();
@@ -2820,11 +2820,11 @@ impl Connection {
                 }
                 self.streams.retransmit_all_for_0rtt();
 
-                let token_len = packet.payload.len() - 16;
+                let token_len = packet.payload_len - 16;
                 let ConnectionSide::Client { ref mut token, .. } = self.side else {
                     unreachable!("we already short-circuited if we're server");
                 };
-                *token = packet.payload.freeze().split_to(token_len);
+                *token = Bytes::copy_from_slice(&packet.payload[..token_len]);
                 self.state = State::Handshake(state::Handshake {
                     expected_token: Bytes::new(),
                     rem_cid_set: false,
@@ -2979,12 +2979,12 @@ impl Connection {
     fn process_early_payload(
         &mut self,
         now: Instant,
-        packet: Packet,
+        packet: Packet<'_>,
     ) -> Result<(), TransportError> {
         debug_assert_ne!(packet.header.space(), SpaceId::Data);
-        let payload_len = packet.payload.len();
+        let payload_len = packet.payload_len;
         let mut ack_eliciting = false;
-        for result in frame::Iter::new(packet.payload.freeze())? {
+        for result in frame::Iter::new(&packet.payload[..packet.payload_len])? {
             let frame = result?;
             let span = match frame {
                 Frame::Padding => continue,
@@ -3035,7 +3035,7 @@ impl Connection {
         now: Instant,
         remote: SocketAddr,
         number: u64,
-        packet: Packet,
+        packet: Packet<'_>,
     ) -> Result<(), TransportError> {
         self.process_payload_with_stream_setup(now, remote, number, packet, &mut |_| Ok(()))
     }
@@ -3045,13 +3045,13 @@ impl Connection {
         now: Instant,
         remote: SocketAddr,
         number: u64,
-        packet: Packet,
+        packet: Packet<'_>,
         prepare_stream: &mut F,
     ) -> Result<(), TransportError>
     where
         F: FnMut(StreamId) -> Result<(), StreamDataError>,
     {
-        let payload = packet.payload.freeze();
+        let payload = &packet.payload[..packet.payload_len];
         let mut is_probing_packet = true;
         let mut close = None;
         let payload_len = payload.len();
@@ -3484,7 +3484,7 @@ impl Connection {
         &mut self,
         now: Instant,
         space_id: SpaceId,
-        buf: &mut Vec<u8>,
+        buf: &mut BytesMut,
         max_size: usize,
         pn: u64,
     ) -> Result<SentFrames, StreamDataError> {
@@ -3750,7 +3750,7 @@ impl Connection {
         receiving_ecn: bool,
         sent: &mut SentFrames,
         space: &mut PacketSpace,
-        buf: &mut Vec<u8>,
+        buf: &mut BytesMut,
         stats: &mut ConnectionStats,
     ) {
         debug_assert!(!space.pending_acks.ranges().is_empty());
@@ -3832,7 +3832,7 @@ impl Connection {
     fn decrypt_packet(
         &mut self,
         now: Instant,
-        packet: &mut Packet,
+        packet: &mut Packet<'_>,
     ) -> Result<Option<u64>, Option<TransportError>> {
         let result = packet_crypto::decrypt_packet_body(
             packet,
@@ -3945,7 +3945,7 @@ impl Connection {
         )
         .ok()?;
 
-        Some(packet.payload.to_vec())
+        Some(packet.payload[..packet.payload_len].to_vec())
     }
 
     /// The number of bytes of packets containing retransmittable frames that have not been

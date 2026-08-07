@@ -144,7 +144,7 @@ impl Endpoint {
         local_ip: Option<IpAddr>,
         ecn: Option<EcnCodepoint>,
         mut data: BytesMut,
-        buf: &mut Vec<u8>,
+        buf: &mut BytesMut,
     ) -> Option<DatagramEvent> {
         self.handle_scratch(now, remote, local_ip, ecn, &mut data, buf)
     }
@@ -157,7 +157,7 @@ impl Endpoint {
         local_ip: Option<IpAddr>,
         ecn: Option<EcnCodepoint>,
         data: &mut [u8],
-        buf: &mut Vec<u8>,
+        buf: &mut BytesMut,
     ) -> Option<DatagramEvent> {
         let mut packet_descriptors = Vec::with_capacity(1);
         self.handle_scratch_with_descriptors(
@@ -180,7 +180,7 @@ impl Endpoint {
         ecn: Option<EcnCodepoint>,
         data: &mut [u8],
         packet_descriptors: &mut Vec<PartialDecode>,
-        buf: &mut Vec<u8>,
+        buf: &mut BytesMut,
     ) -> Option<DatagramEvent> {
         // Partially decode packet or short-circuit if unable
         let datagram_len = data.len();
@@ -282,7 +282,6 @@ impl Endpoint {
                 now,
                 ecn,
                 first_decode,
-                remaining,
                 data,
                 addresses,
                 buf,
@@ -313,7 +312,7 @@ impl Endpoint {
         inciting_dgram_len: usize,
         addresses: FourTuple,
         dst_cid: ConnectionId,
-        buf: &mut Vec<u8>,
+        buf: &mut BytesMut,
     ) -> Option<Transmit> {
         if self
             .last_stateless_reset
@@ -469,10 +468,9 @@ impl Endpoint {
         now: Instant,
         ecn: Option<EcnCodepoint>,
         first_decode: PartialDecode,
-        remaining: Option<std::ops::Range<usize>>,
         scratch: &mut [u8],
         addresses: FourTuple,
-        buf: &mut Vec<u8>,
+        buf: &mut BytesMut,
     ) -> Option<DatagramEvent> {
         let dst_cid = first_decode.dst_cid();
         let header = first_decode.initial_header().unwrap().clone();
@@ -525,9 +523,18 @@ impl Endpoint {
             return None;
         }
 
-        let Header::Initial(header) = packet.header else {
+        let Header::Initial(header) = &packet.header else {
             panic!("non-initial packet in handle_first_packet()");
         };
+        let header = InitialHeader {
+            dst_cid: header.dst_cid,
+            src_cid: header.src_cid,
+            token: header.token.clone(),
+            number: header.number,
+            version: header.version,
+        };
+        let header_data = packet.header_data.clone();
+        let packet_len = header_data.len() + packet.payload.len();
 
         let server_config = self.server_config.as_ref().unwrap().clone();
 
@@ -550,16 +557,26 @@ impl Endpoint {
         self.index
             .insert_initial_incoming(header.dst_cid, incoming_idx);
 
+        let mut datagram = BytesMut::from(&scratch[..]);
+        let mut first_packet = datagram.split_to(packet_len);
+        let header_data = first_packet.split_to(header_data.len()).freeze();
+        let payload = first_packet;
+        let rest = if datagram.is_empty() {
+            None
+        } else {
+            Some(datagram)
+        };
+
         Some(DatagramEvent::NewConnection(Incoming {
             received_at: now,
             addresses,
             ecn,
             packet: InitialPacket {
                 header,
-                header_data: packet.header_data,
-                payload: packet.payload,
+                header_data,
+                payload,
             },
-            rest: remaining.map(|range| BytesMut::from(&scratch[range])),
+            rest,
             crypto,
             token,
             incoming_idx,
@@ -572,7 +589,7 @@ impl Endpoint {
         &mut self,
         mut incoming: Incoming,
         now: Instant,
-        buf: &mut Vec<u8>,
+        buf: &mut BytesMut,
         server_config: Option<Arc<ServerConfig>>,
     ) -> Result<(ConnectionHandle, Connection), AcceptError> {
         let remote_address_validated = incoming.remote_address_validated();
@@ -750,7 +767,7 @@ impl Endpoint {
     }
 
     /// Reject this incoming connection attempt
-    pub fn refuse(&mut self, incoming: Incoming, buf: &mut Vec<u8>) -> Transmit {
+    pub fn refuse(&mut self, incoming: Incoming, buf: &mut BytesMut) -> Transmit {
         self.clean_up_incoming(&incoming);
         incoming.improper_drop_warner.dismiss();
 
@@ -767,7 +784,11 @@ impl Endpoint {
     /// Respond with a retry packet, requiring the client to retry with address validation
     ///
     /// Errors if `incoming.may_retry()` is false.
-    pub fn retry(&mut self, incoming: Incoming, buf: &mut Vec<u8>) -> Result<Transmit, RetryError> {
+    pub fn retry(
+        &mut self,
+        incoming: Incoming,
+        buf: &mut BytesMut,
+    ) -> Result<Transmit, RetryError> {
         if !incoming.may_retry() {
             return Err(RetryError(Box::new(incoming)));
         }
@@ -900,7 +921,7 @@ impl Endpoint {
         crypto: &Keys,
         remote_id: &ConnectionId,
         reason: TransportError,
-        buf: &mut Vec<u8>,
+        buf: &mut BytesMut,
     ) -> Transmit {
         // We don't need to worry about CID collisions in initial closes because the peer
         // shouldn't respond, and if it does, and the CID collides, we'll just drop the

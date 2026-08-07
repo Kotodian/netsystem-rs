@@ -4,7 +4,7 @@ use std::{
     mem,
 };
 
-use bytes::BufMut;
+use bytes::{BufMut, BytesMut};
 use rustc_hash::FxHashMap;
 use tracing::{debug, trace};
 
@@ -275,7 +275,7 @@ impl StreamsState {
     #[cfg(test)]
     pub(crate) fn received(
         &mut self,
-        frame: frame::Stream,
+        frame: frame::Stream<'_>,
         payload_len: usize,
     ) -> Result<ShouldTransmit, TransportError> {
         let mut no_stream_setup = |_| Ok(());
@@ -294,7 +294,7 @@ impl StreamsState {
 
     pub(crate) fn received_with_stream_setup(
         &mut self,
-        frame: frame::Stream,
+        frame: frame::Stream<'_>,
         payload_len: usize,
         prepare_stream: &mut impl FnMut(StreamId) -> Result<(), StreamDataError>,
     ) -> Result<ShouldTransmit, StreamReceiveError> {
@@ -461,7 +461,7 @@ impl StreamsState {
 
     pub(in crate::connection) fn write_control_frames(
         &mut self,
-        buf: &mut Vec<u8>,
+        buf: &mut BytesMut,
         pending: &mut Retransmits,
         retransmits: &mut ThinRetransmits,
         stats: &mut FrameStats,
@@ -592,7 +592,7 @@ impl StreamsState {
 
     pub(crate) fn write_stream_frames(
         &mut self,
-        buf: &mut Vec<u8>,
+        buf: &mut BytesMut,
         max_buf_size: usize,
         fair: bool,
     ) -> Result<StreamMetaVec, StreamDataError> {
@@ -1052,8 +1052,6 @@ mod tests {
         connection::State as ConnState, connection::Streams, ReadableError, RecvStream, SendStream,
         TransportErrorCode, WriteError,
     };
-    use bytes::Bytes;
-
     fn make(side: Side) -> StreamsState {
         StreamsState::new(
             side,
@@ -1069,7 +1067,7 @@ mod tests {
         _: usize,
         _: StreamId,
         _: std::ops::Range<u64>,
-        _: &mut Vec<u8>,
+        _: &mut BytesMut,
     ) -> Result<usize, StreamDataError> {
         unreachable!("transmit is not used by receive error tests")
     }
@@ -1108,7 +1106,7 @@ mod tests {
         _: usize,
         stream: StreamId,
         offsets: std::ops::Range<u64>,
-        _: &mut Vec<u8>,
+        _: &mut BytesMut,
     ) -> Result<usize, StreamDataError> {
         Err(StreamDataError::TxRangeUnavailable {
             stream,
@@ -1135,7 +1133,7 @@ mod tests {
                 id,
                 offset: 0,
                 fin: false,
-                data: Bytes::from_static(b"payload"),
+                data: b"payload",
             },
             "payload".len(),
         );
@@ -1177,7 +1175,9 @@ mod tests {
             pending: &mut pending,
             conn_state: &state,
         };
-        stream.write(b"payload").expect("write stream payload");
+        stream
+            .sync(b"payload".len() as u64)
+            .expect("sync stream payload");
         let unacked_before = server.unacked_data;
 
         let result = server.received_ack_of(frame::StreamMeta {
@@ -1223,9 +1223,11 @@ mod tests {
             pending: &mut pending,
             conn_state: &state,
         };
-        stream.write(b"payload").expect("write stream payload");
+        stream
+            .sync(b"payload".len() as u64)
+            .expect("sync stream payload");
 
-        let mut output = Vec::with_capacity(128);
+        let mut output = BytesMut::with_capacity(128);
         let result = server.write_stream_frames(&mut output, 128, true);
 
         assert!(matches!(
@@ -1258,7 +1260,7 @@ mod tests {
                         id,
                         offset: 0,
                         fin: true,
-                        data: Bytes::from_static(&[0; MESSAGE_SIZE]),
+                        data: &[0; MESSAGE_SIZE],
                     },
                     2048
                 )
@@ -1299,7 +1301,7 @@ mod tests {
                         id,
                         offset: 0,
                         fin: false,
-                        data: Bytes::from_static(&[0; 2048]),
+                        data: &[0; 2048],
                     },
                     2048
                 )
@@ -1362,7 +1364,7 @@ mod tests {
                         id,
                         offset: 4096,
                         fin: false,
-                        data: Bytes::from_static(&[0; 0]),
+                        data: &[0; 0],
                     },
                     0
                 )
@@ -1425,7 +1427,7 @@ mod tests {
                         id,
                         offset: 0,
                         fin: false,
-                        data: Bytes::from_static(&[0; 32]),
+                        data: &[0; 32],
                     },
                     32
                 )
@@ -1457,7 +1459,7 @@ mod tests {
                         id,
                         offset: 32,
                         fin: true,
-                        data: Bytes::from_static(&[0; 16]),
+                        data: &[0; 16],
                     },
                     16
                 )
@@ -1480,7 +1482,7 @@ mod tests {
                         id,
                         offset: 0,
                         fin: false,
-                        data: Bytes::from_static(&[0; 32])
+                        data: &[0; 32]
                     },
                     32
                 )
@@ -1620,7 +1622,7 @@ mod tests {
         high.set_priority(1).unwrap();
         high.write(b"high").unwrap();
 
-        let mut buf = Vec::with_capacity(40);
+        let mut buf = BytesMut::with_capacity(40);
         let meta = server.write_stream_frames(&mut buf, 40, true).unwrap();
         assert_eq!(meta[0].id, id_high);
         assert_eq!(meta[1].id, id_mid);
@@ -1679,7 +1681,7 @@ mod tests {
         };
         high.set_priority(-1).unwrap();
 
-        let mut buf = Vec::with_capacity(1000);
+        let mut buf = BytesMut::with_capacity(1000);
         let meta = server.write_stream_frames(&mut buf, 40, true).unwrap();
         assert_eq!(meta.len(), 1);
         assert_eq!(meta[0].id, id_high);
@@ -1744,7 +1746,7 @@ mod tests {
             stream_c.write(&[b'c'; 100]).unwrap();
 
             let mut metas = vec![];
-            let mut buf = Vec::with_capacity(1024);
+            let mut buf = BytesMut::with_capacity(1024);
 
             // loop until all the streams are written
             loop {
@@ -1818,7 +1820,7 @@ mod tests {
         stream_b.write(&[b'b'; 100]).unwrap();
 
         let mut metas = vec![];
-        let mut buf = Vec::with_capacity(1024);
+        let mut buf = BytesMut::with_capacity(1024);
 
         // Write the first chunk of stream_a
         let buf_len = buf.len();
@@ -1873,7 +1875,7 @@ mod tests {
                     id,
                     offset: 0,
                     fin: true,
-                    data: Bytes::from_static(&[0; 32]),
+                    data: &[0; 32],
                 },
                 32,
             )
@@ -1928,7 +1930,7 @@ mod tests {
                     id: StreamId::new(Side::Server, Dir::Uni, 127),
                     offset: 0,
                     fin: true,
-                    data: Bytes::from_static(&[]),
+                    data: &[],
                 },
                 0
             ),
@@ -1942,7 +1944,7 @@ mod tests {
                         id: StreamId::new(Side::Server, Dir::Uni, 128),
                         offset: 0,
                         fin: true,
-                        data: Bytes::from_static(&[]),
+                        data: &[],
                     },
                     0
                 )
@@ -1967,7 +1969,7 @@ mod tests {
                     id: StreamId::new(Side::Server, Dir::Uni, 128),
                     offset: 0,
                     fin: true,
-                    data: Bytes::from_static(&[]),
+                    data: &[],
                 },
                 0
             ),
@@ -1985,7 +1987,7 @@ mod tests {
                     id: StreamId::new(Side::Server, Dir::Uni, 127),
                     offset: 0,
                     fin: true,
-                    data: Bytes::from_static(&[]),
+                    data: &[],
                 },
                 0
             ),
@@ -1999,7 +2001,7 @@ mod tests {
                         id: StreamId::new(Side::Server, Dir::Uni, 128),
                         offset: 0,
                         fin: true,
-                        data: Bytes::from_static(&[]),
+                        data: &[],
                     },
                     0
                 )
@@ -2018,7 +2020,7 @@ mod tests {
                     id: StreamId::new(Side::Server, Dir::Uni, 128),
                     offset: 0,
                     fin: true,
-                    data: Bytes::from_static(&[]),
+                    data: &[],
                 },
                 0
             ),
@@ -2036,7 +2038,7 @@ mod tests {
                     id: StreamId::new(Side::Server, Dir::Uni, 127),
                     offset: 0,
                     fin: true,
-                    data: Bytes::from_static(&[]),
+                    data: &[],
                 },
                 0
             ),
@@ -2063,7 +2065,7 @@ mod tests {
                         id: StreamId::new(Side::Server, Dir::Uni, 128),
                         offset: 0,
                         fin: true,
-                        data: Bytes::from_static(&[]),
+                        data: &[],
                     },
                     0
                 )
@@ -2096,7 +2098,7 @@ mod tests {
                     id: StreamId::new(Side::Server, Dir::Uni, 128),
                     offset: 0,
                     fin: true,
-                    data: Bytes::from_static(&[]),
+                    data: &[],
                 },
                 0
             ),

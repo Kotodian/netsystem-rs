@@ -3,7 +3,9 @@ use hammer_runtime::app::{
     SessionMsgQueue, dequeue_application_session_request, enqueue_application_session_reply,
 };
 use hammer_runtime::plugin::PluginError;
-use hammer_runtime::{Engine, RuntimeError, RuntimeResult, SessionConnectEndpoint};
+use hammer_runtime::{
+    Engine, RuntimeError, RuntimeResult, SessionConnectEndpoint, SessionConnectionId,
+};
 
 use super::application::ApplicationError;
 use super::runtime::SessionMain;
@@ -50,7 +52,9 @@ impl SessionMain {
             } => self.application_connect(
                 application,
                 &transport,
-                SessionConnectEndpoint::new(remote, local, worker),
+                remote,
+                local,
+                worker,
                 server_name,
                 app,
                 opaque,
@@ -99,7 +103,9 @@ impl SessionMain {
         &self,
         application: ApplicationId,
         transport_name: &str,
-        endpoint: SessionConnectEndpoint,
+        remote: std::net::SocketAddr,
+        local: Option<std::net::SocketAddr>,
+        worker: hammer_runtime::DataWorkerId,
         server_name: Option<String>,
         app: Option<hammer_runtime::app::SessionAppId>,
         opaque: Option<u64>,
@@ -110,9 +116,18 @@ impl SessionMain {
         }
         let application_connection = self
             .applications()
-            .register_connection(application, server_name, app, opaque)
+            .register_connection(application, server_name.clone(), app, opaque)
             .map_err(application_status)?;
-        match self.connect(application_connection, transport, endpoint) {
+        let endpoint = SessionConnectEndpoint::new(
+            remote,
+            local,
+            worker,
+            SessionConnectionId::from_raw(application_connection.raw()),
+            application,
+            opaque,
+            server_name,
+        );
+        match self.connect(transport, endpoint) {
             Ok(_) => {
                 self.applications()
                     .reclaim_connection(application, application_connection)

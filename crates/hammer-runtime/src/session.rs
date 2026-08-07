@@ -1,5 +1,6 @@
 use std::net::SocketAddr;
 
+use crate::app::ApplicationId;
 use crate::{DataWorkerId, RuntimeResult};
 
 /// Opaque Session-layer listener identity supplied to one selected transport.
@@ -64,36 +65,37 @@ pub struct SessionListenEndpoint {
 }
 
 /// Transport endpoint selected for one Session active-open request.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SessionConnectEndpoint {
-    remote: SocketAddr,
-    local: Option<SocketAddr>,
-    worker: DataWorkerId,
+    pub remote: SocketAddr,
+    pub local: Option<SocketAddr>,
+    pub worker: DataWorkerId,
+    pub connection: SessionConnectionId,
+    pub application: ApplicationId,
+    pub opaque: Option<u64>,
+    pub server_name: Option<String>,
 }
 
 impl SessionConnectEndpoint {
     #[inline]
-    pub const fn new(remote: SocketAddr, local: Option<SocketAddr>, worker: DataWorkerId) -> Self {
+    pub const fn new(
+        remote: SocketAddr,
+        local: Option<SocketAddr>,
+        worker: DataWorkerId,
+        connection: SessionConnectionId,
+        application: ApplicationId,
+        opaque: Option<u64>,
+        server_name: Option<String>,
+    ) -> Self {
         Self {
             remote,
             local,
             worker,
+            connection,
+            application,
+            opaque,
+            server_name,
         }
-    }
-
-    #[inline]
-    pub const fn remote(self) -> SocketAddr {
-        self.remote
-    }
-
-    #[inline]
-    pub const fn local(self) -> Option<SocketAddr> {
-        self.local
-    }
-
-    #[inline]
-    pub const fn worker(self) -> DataWorkerId {
-        self.worker
     }
 }
 
@@ -121,8 +123,6 @@ pub type SessionTransportStartListen = fn(
     SessionListenEndpoint,
 ) -> RuntimeResult<()>;
 pub type SessionTransportStopListen = fn(SessionListenerId) -> RuntimeResult<()>;
-pub type SessionTransportConnect =
-    fn(SessionConnectionId, SessionConnectEndpoint) -> RuntimeResult<()>;
 
 /// Static operations registered by one transport plugin.
 #[derive(Debug, Clone, Copy)]
@@ -130,7 +130,7 @@ pub struct SessionTransportRegistration {
     name: &'static str,
     start_listen: Option<SessionTransportStartListen>,
     stop_listen: Option<SessionTransportStopListen>,
-    connect: Option<SessionTransportConnect>,
+    connect: Option<fn(SessionConnectEndpoint) -> RuntimeResult<()>>,
 }
 
 impl SessionTransportRegistration {
@@ -140,7 +140,7 @@ impl SessionTransportRegistration {
         name: &'static str,
         start_listen: Option<SessionTransportStartListen>,
         stop_listen: Option<SessionTransportStopListen>,
-        connect: Option<SessionTransportConnect>,
+        connect: Option<fn(SessionConnectEndpoint) -> RuntimeResult<()>>,
     ) -> Self {
         Self {
             name,
@@ -166,7 +166,7 @@ impl SessionTransportRegistration {
     }
 
     #[inline]
-    pub const fn connect(self) -> Option<SessionTransportConnect> {
+    pub const fn connect(self) -> Option<fn(SessionConnectEndpoint) -> RuntimeResult<()>> {
         self.connect
     }
 }

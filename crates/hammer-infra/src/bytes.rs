@@ -2,26 +2,28 @@
 
 use std::ops::{Deref, DerefMut};
 
+use bytes::BytesMut;
+
 /// Fixed-capacity byte storage allocated from the Hammer Main Heap.
 ///
 /// The buffer does not grow after construction. Callers use the `Deref`
 /// implementation or [`BytesBuffer::as_mut_slice`] to access storage.
 #[derive(Debug)]
 pub struct BytesBuffer {
-    bytes: Vec<u8>,
+    bytes: BytesMut,
 }
 
 impl BytesBuffer {
     /// Allocates `capacity` bytes of Main Heap scratch.
     pub fn with_capacity(capacity: usize) -> Self {
         Self {
-            bytes: Vec::with_capacity(capacity),
+            bytes: BytesMut::with_capacity(capacity),
         }
     }
 
     /// Fixed capacity retained for the lifetime of this buffer.
     #[inline]
-    pub const fn capacity(&self) -> usize {
+    pub fn capacity(&self) -> usize {
         self.bytes.capacity()
     }
 
@@ -64,28 +66,28 @@ impl BytesBuffer {
     /// Access to the initialized bytes.
     #[inline]
     pub fn as_slice(&self) -> &[u8] {
-        self.bytes.as_slice()
+        &self.bytes[..]
     }
 
     /// Mutable access to the initialized bytes.
     #[inline]
     pub fn as_mut_slice(&mut self) -> &mut [u8] {
-        self.bytes.as_mut_slice()
+        &mut self.bytes[..]
     }
 }
 
 impl Deref for BytesBuffer {
-    type Target = Vec<u8>;
+    type Target = BytesMut;
 
     #[inline]
-    fn deref(&self) -> &Vec<u8> {
+    fn deref(&self) -> &BytesMut {
         &self.bytes
     }
 }
 
 impl DerefMut for BytesBuffer {
     #[inline]
-    fn deref_mut(&mut self) -> &mut Vec<u8> {
+    fn deref_mut(&mut self) -> &mut BytesMut {
         &mut self.bytes
     }
 }

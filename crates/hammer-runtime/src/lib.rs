@@ -87,8 +87,7 @@ pub use process::{
 pub use registry::RuntimeRegistry;
 pub use session::{
     SessionConnectEndpoint, SessionConnectionId, SessionListenEndpoint, SessionListenerId,
-    SessionTransportConnect, SessionTransportRegistration, SessionTransportStartListen,
-    SessionTransportStopListen,
+    SessionTransportRegistration, SessionTransportStartListen, SessionTransportStopListen,
 };
 pub use trace::{
     PacketTrace, TraceControlHandle, TraceControlPlane, TraceEntry, TraceFormatter,

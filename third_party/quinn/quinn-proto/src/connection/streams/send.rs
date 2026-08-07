@@ -27,7 +27,7 @@ impl Send {
         Box::new(Self {
             max_data: max_data.into(),
             state: SendState::Ready,
-            pending: SendBuffer::new(),
+            pending: SendBuffer::new(io.is_some()),
             priority: 0,
             fin_pending: false,
             connection_blocked: false,

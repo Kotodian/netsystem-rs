@@ -1,4 +1,4 @@
-use bytes::Bytes;
+use bytes::{Bytes, BytesMut};
 use rand::Rng;
 use tracing::{debug, trace, trace_span};
 
@@ -36,7 +36,7 @@ impl PacketBuilder {
         now: Instant,
         space_id: SpaceId,
         dst_cid: ConnectionId,
-        buffer: &mut Vec<u8>,
+        buffer: &mut BytesMut,
         buffer_capacity: usize,
         datagram_start: usize,
         ack_eliciting: bool,
@@ -186,7 +186,7 @@ impl PacketBuilder {
         now: Instant,
         conn: &mut Connection,
         sent: Option<SentFrames>,
-        buffer: &mut Vec<u8>,
+        buffer: &mut BytesMut,
     ) {
         let ack_eliciting = self.ack_eliciting;
         let exact_number = self.exact_number;
@@ -234,7 +234,7 @@ impl PacketBuilder {
         self,
         conn: &mut Connection,
         now: Instant,
-        buffer: &mut Vec<u8>,
+        buffer: &mut BytesMut,
     ) -> (usize, bool) {
         let pad = buffer.len() < self.min_size;
         if pad {

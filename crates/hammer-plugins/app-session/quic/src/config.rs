@@ -4,7 +4,7 @@ use std::thread::{self, ThreadId};
 
 use hammer_infra::pool::{Index, Pool};
 use hammer_runtime::Engine;
-use hammer_runtime::app::ApplicationId;
+use hammer_runtime::app::{AppSessionConfig, ApplicationId};
 use prost::Message;
 use quinn_proto::rustls::pki_types::{CertificateDer, PrivateKeyDer};
 use quinn_proto::rustls::server::WebPkiClientVerifier;
@@ -197,9 +197,10 @@ impl QuicConfigRegistry {
         &self,
         application: ApplicationId,
         config: ServerConfig,
+        fifo_capacity: usize,
     ) -> Result<ConfigId, ConfigError> {
         let transport = config.transport;
-        let config = Arc::new(build_server_config(config)?);
+        let config = Arc::new(build_server_config(config, fifo_capacity)?);
         self.insert(application, ConnectionConfig::Server { config, transport })
     }
 
@@ -207,9 +208,10 @@ impl QuicConfigRegistry {
         &self,
         application: ApplicationId,
         config: ClientConfig,
+        fifo_capacity: usize,
     ) -> Result<ConfigId, ConfigError> {
         let transport = config.transport;
-        let config = Arc::new(build_client_config(config)?);
+        let config = Arc::new(build_client_config(config, fifo_capacity)?);
         self.insert(application, ConnectionConfig::Client { config, transport })
     }
 
@@ -398,7 +400,11 @@ impl QuicMain {
         config: ServerConfig,
     ) -> Result<ConfigId, ConfigError> {
         self.ensure_application(application)?;
-        self.configs.register_server_config(application, config)
+        self.configs.register_server_config(
+            application,
+            config,
+            AppSessionConfig::DEFAULT.fifo_capacity,
+        )
     }
 
     pub fn register_client_config(
@@ -407,7 +413,11 @@ impl QuicMain {
         config: ClientConfig,
     ) -> Result<ConfigId, ConfigError> {
         self.ensure_application(application)?;
-        self.configs.register_client_config(application, config)
+        self.configs.register_client_config(
+            application,
+            config,
+            AppSessionConfig::DEFAULT.fifo_capacity,
+        )
     }
 
     pub fn server_config(
@@ -471,7 +481,10 @@ pub(crate) fn main() -> Result<&'static Arc<QuicMain>, ConfigError> {
     QUIC_MAIN.get().ok_or(ConfigError::MainNotInitialized)
 }
 
-fn build_server_config(config: ServerConfig) -> Result<quinn_proto::ServerConfig, ConfigError> {
+fn build_server_config(
+    config: ServerConfig,
+    fifo_capacity: usize,
+) -> Result<quinn_proto::ServerConfig, ConfigError> {
     if config.certificate_der.is_empty() {
         return Err(ConfigError::CertificateChainEmpty);
     }
@@ -504,11 +517,14 @@ fn build_server_config(config: ServerConfig) -> Result<quinn_proto::ServerConfig
     let crypto = quinn_proto::crypto::rustls::QuicServerConfig::try_from(Arc::new(rustls))
         .map_err(|source| ConfigError::ServerCryptoInvalid { source })?;
     let mut quic = quinn_proto::ServerConfig::with_crypto(Arc::new(crypto));
-    quic.transport_config(build_transport_config(config.transport)?);
+    quic.transport_config(build_transport_config(config.transport, fifo_capacity)?);
     Ok(quic)
 }
 
-fn build_client_config(config: ClientConfig) -> Result<quinn_proto::ClientConfig, ConfigError> {
+fn build_client_config(
+    config: ClientConfig,
+    fifo_capacity: usize,
+) -> Result<quinn_proto::ClientConfig, ConfigError> {
     if config.trust_anchor_der.is_empty() {
         return Err(ConfigError::TrustAnchorsEmpty);
     }
@@ -538,12 +554,13 @@ fn build_client_config(config: ClientConfig) -> Result<quinn_proto::ClientConfig
     let crypto = quinn_proto::crypto::rustls::QuicClientConfig::try_from(Arc::new(rustls))
         .map_err(|source| ConfigError::ClientCryptoInvalid { source })?;
     let mut quic = quinn_proto::ClientConfig::new(Arc::new(crypto));
-    quic.transport_config(build_transport_config(config.transport)?);
+    quic.transport_config(build_transport_config(config.transport, fifo_capacity)?);
     Ok(quic)
 }
 
 fn build_transport_config(
     config: TransportConfig,
+    fifo_capacity: usize,
 ) -> Result<Arc<quinn_proto::TransportConfig>, ConfigError> {
     if config.connection_timeout == 0 {
         return Err(ConfigError::ConnectionTimeoutInvalid);
@@ -552,6 +569,8 @@ fn build_transport_config(
         .try_into()
         .map_err(|_| ConfigError::ConnectionTimeoutInvalid)?;
     let mut transport = quinn_proto::TransportConfig::default();
+    let stream_receive_window = quinn_proto::VarInt::try_from(fifo_capacity as u64)
+        .expect("Session FIFO capacity fits QUIC VarInt");
     transport
         .max_idle_timeout(Some(timeout))
         .max_concurrent_bidi_streams(quinn_proto::VarInt::from_u32(
@@ -560,6 +579,7 @@ fn build_transport_config(
         .max_concurrent_uni_streams(quinn_proto::VarInt::from_u32(
             config.max_concurrent_uni_streams,
         ))
+        .stream_receive_window(stream_receive_window)
         .datagram_receive_buffer_size(None)
         .datagram_send_buffer_size(0);
     Ok(Arc::new(transport))

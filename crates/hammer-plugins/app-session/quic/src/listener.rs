@@ -1,5 +1,5 @@
 use std::cell::UnsafeCell;
-use std::sync::{Arc, OnceLock};
+use std::sync::{Arc, OnceLock, mpsc};
 use std::thread::{self, ThreadId};
 
 use hammer_infra::align::CacheLine;
@@ -8,8 +8,8 @@ use hammer_infra::pool::Pool;
 use hammer_infra::thread_owned::ThreadOwned;
 use hammer_runtime::app::{ApplicationId, SessionAppId};
 use hammer_runtime::{
-    DataWorkerId, Engine, RuntimeError, RuntimeResult, SessionListenEndpoint, SessionListenerId,
-    SessionTransportRegistration,
+    DataWorkerId, Engine, RuntimeError, RuntimeResult, SessionConnectEndpoint, SessionConnectionId,
+    SessionListenEndpoint, SessionListenerId, SessionTransportRegistration,
 };
 use hammer_service::session::runtime::{SessionMain, SessionWorker};
 
@@ -24,6 +24,10 @@ pub(crate) enum QuicListenerError {
     ListenerMissing { listener: SessionListenerId },
     #[error("QUIC listener capacity {capacity} is exhausted")]
     ListenerCapacityExhausted { capacity: usize },
+    #[error("QUIC active connect requires an explicit local endpoint")]
+    LocalEndpointMissing,
+    #[error("QUIC active connect endpoint family mismatch between local and remote")]
+    ConnectEndpointMismatch,
 }
 
 /// Main Thread-owned QUIC listener authority.
@@ -293,6 +297,113 @@ impl QuicMain {
 }
 
 pub(crate) static QUIC_MAIN: OnceLock<Arc<QuicMain>> = OnceLock::new();
+
+pub(crate) fn connect(endpoint: SessionConnectEndpoint) -> RuntimeResult<()> {
+    let main = QUIC_MAIN
+        .get()
+        .ok_or(RuntimeError::PluginStateNotInitialized { plugin: "quic" })?;
+    let config = endpoint
+        .opaque
+        .map(ConfigId::from_raw)
+        .ok_or(crate::config::ConfigError::ConfigurationRequired)?;
+    let client_config = main
+        .client_config(endpoint.application, config)
+        .map_err(RuntimeError::from)?;
+    let local = endpoint
+        .local
+        .ok_or(QuicListenerError::LocalEndpointMissing)?;
+    let remote = endpoint.remote;
+    if local.is_ipv4() != remote.is_ipv4() {
+        return Err(QuicListenerError::ConnectEndpointMismatch.into());
+    }
+    let server_name = endpoint.server_name.unwrap_or_else(|| remote.to_string());
+    let worker = endpoint.worker;
+
+    let (completion, completed) = mpsc::sync_channel(1);
+    Engine::with_current(|engine| {
+        engine.schedule_on_worker(worker, {
+            let main = Arc::clone(main);
+            let client_config = Arc::clone(&client_config);
+            let server_name = server_name.clone();
+            let local = local;
+            let remote = remote;
+            move || {
+                let result = main.with_worker(worker, |quic| {
+                    quic.allocate_client_connect(
+                        client_config,
+                        server_name,
+                        local,
+                        remote,
+                        endpoint.application,
+                        None,
+                        endpoint.opaque,
+                    )
+                });
+                if completion.send(result).is_err() {
+                    return;
+                }
+            }
+        })
+    })
+    .ok_or(RuntimeError::WorkerControlRequiresMainEngine)??;
+    let context = completed
+        .recv()
+        .map_err(|_| RuntimeError::DataWorkerCallCanceled {
+            worker: worker.slot(),
+        })??;
+
+    let inner_connection = main
+        .sessions
+        .applications()
+        .register_connection(
+            main.inner_application,
+            None,
+            Some(main.session_app),
+            Some(context.into()),
+        )
+        .map_err(RuntimeError::from)?;
+    if let Err(error) = main.sessions.connect(
+        main.udp_transport,
+        SessionConnectEndpoint::new(
+            endpoint.remote,
+            endpoint.local,
+            endpoint.worker,
+            SessionConnectionId::from_raw(inner_connection.raw()),
+            main.inner_application,
+            Some(context.into()),
+            None,
+        ),
+    ) {
+        let _ = main
+            .sessions
+            .applications()
+            .remove_connection(main.inner_application, inner_connection);
+        let (completion, completed) = mpsc::sync_channel(1);
+        Engine::with_current(|engine| {
+            engine.schedule_on_worker(worker, {
+                let main = Arc::clone(main);
+                move || {
+                    let result = main.with_worker(worker, |quic| quic.remove_context(context));
+                    if completion.send(result).is_err() {
+                        return;
+                    }
+                }
+            })
+        })
+        .ok_or(RuntimeError::WorkerControlRequiresMainEngine)??;
+        let _ = completed
+            .recv()
+            .map_err(|_| RuntimeError::DataWorkerCallCanceled {
+                worker: worker.slot(),
+            })?;
+        return Err(error);
+    }
+    main.sessions
+        .applications()
+        .reclaim_connection(main.inner_application, inner_connection)
+        .map_err(RuntimeError::from)?;
+    Ok(())
+}
 
 pub(crate) fn start_listen(
     listener: SessionListenerId,
