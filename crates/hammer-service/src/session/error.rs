@@ -1,7 +1,7 @@
 use hammer_core::data_plane::NodeId;
 use hammer_infra::fifo::FifoError;
+use hammer_runtime::SessionListenerId;
 use hammer_runtime::app::ApplicationId;
-use hammer_runtime::{SessionConnectionId, SessionListenerId};
 use thiserror::Error;
 
 use super::SessionId;
@@ -10,8 +10,6 @@ use super::SessionId;
 #[derive(Debug, Error)]
 #[repr(u16)]
 pub enum SessionQueueError {
-    #[error("dispatch failed")]
-    DispatchFailed,
     #[error("session queue node is not registered")]
     NodeMissing,
     #[error("runtime thread {thread_index} is not a data worker")]
@@ -51,18 +49,17 @@ impl SessionQueueError {
     #[inline(always)]
     pub const fn code(&self) -> u16 {
         match self {
-            Self::DispatchFailed => 0,
-            Self::NodeMissing => 1,
-            Self::WorkerUnavailable { .. } => 2,
-            Self::WorkerOutOfRange { .. } => 3,
-            Self::WorkerAlreadyInstalled { .. } => 4,
-            Self::WorkerAccess { .. } => 5,
-            Self::OutputMissing { .. } => 6,
-            Self::ApplicationMqAlreadyRegistered { .. } => 7,
-            Self::ApplicationMqMissing { .. } => 8,
-            Self::SessionAppContextCreateUnsupported => 9,
-            Self::SessionAppAlreadyInstalled { .. } => 10,
-            Self::SessionAppNotInstalled { .. } => 11,
+            Self::NodeMissing => 0,
+            Self::WorkerUnavailable { .. } => 1,
+            Self::WorkerOutOfRange { .. } => 2,
+            Self::WorkerAlreadyInstalled { .. } => 3,
+            Self::WorkerAccess { .. } => 4,
+            Self::OutputMissing { .. } => 5,
+            Self::ApplicationMqAlreadyRegistered { .. } => 6,
+            Self::ApplicationMqMissing { .. } => 7,
+            Self::SessionAppContextCreateUnsupported => 8,
+            Self::SessionAppAlreadyInstalled { .. } => 9,
+            Self::SessionAppNotInstalled { .. } => 10,
         }
     }
 }
@@ -129,10 +126,6 @@ pub(crate) enum SessionError {
     OooSpanMissing { session_id: SessionId },
     #[error("session {session_id:?} accepted OOO delivery reported an invalid span")]
     OooSpanInvalid { session_id: SessionId },
-    #[error(
-        "Application connection {connection:?} requires an Application Main on this Data Worker"
-    )]
-    ApplicationMainMissingForConnection { connection: SessionConnectionId },
     #[error("Session listener state is unavailable on this Data Worker")]
     ListenerMainMissing,
     #[error("Session listener {listener:?} is not registered")]
@@ -149,8 +142,6 @@ pub(crate) enum SessionError {
 
 #[cfg(test)]
 mod tests {
-    use std::error::Error;
-
     use hammer_runtime::RuntimeError;
 
     use super::{SessionError, SessionQueueError};

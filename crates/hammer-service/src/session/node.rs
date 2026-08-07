@@ -13,6 +13,36 @@ use crate::session::runtime::{SessionMain, SessionWorker};
 /// Shared Session Queue IO allowance for normal and custom TX in one dispatch.
 pub const SESSION_QUEUE_IO_BUDGET: usize = 128;
 
+/// Fixed node-error codes recorded by the Session Queue node.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u16)]
+pub enum SessionQueueNodeErrorCode {
+    MainMissing = 0,
+    WorkerAccess = 1,
+    AppPoll = 2,
+    SessionEventPoll = 3,
+    SessionAppContext = 4,
+    SessionAppCallback = 5,
+    ApplicationEvent = 6,
+    TransportUpdateTime = 7,
+    TransportDisconnect = 8,
+    TransportAppRx = 9,
+    TransportControlTx = 10,
+    TransportSendParams = 11,
+    TxBufferAllocation = 12,
+    TxFifoCopy = 13,
+    TransportTxAction = 14,
+    OutputFrame = 15,
+    SessionState = 16,
+}
+
+impl SessionQueueNodeErrorCode {
+    #[inline(always)]
+    pub const fn code(self) -> u16 {
+        self as u16
+    }
+}
+
 /// Per-node error counters for `appsl-rx-mqs-input`.
 ///
 /// This mirrors VPP's `vlib_node_increment_counter` error table; node
@@ -397,48 +427,67 @@ fn session_queue_node_process(
     let mut output = SessionQueueOutput::default();
     let ptr = data.word(0) as usize as *const SessionMain;
     if ptr.is_null() {
-        let _ = runtime.record_current_node_error(SessionQueueError::DispatchFailed.code());
+        let _ = runtime.record_current_node_error(SessionQueueNodeErrorCode::MainMissing.code());
         return NodeResult::drop();
     }
     // SAFETY: worker NodeRuntimeData is installed by the owning Data Worker and
     // the SessionMain Arc remains alive in that worker's SessionMain.
     let main = unsafe { &*ptr };
-    let result = main.with_worker_mut(runtime, |sessions| {
-        let dispatch_count = sessions.transport_dispatches.len();
-        for dispatch_index in 0..dispatch_count {
-            let dispatch = sessions.transport_dispatches[dispatch_index];
-            (dispatch.update_time)(
-                runtime,
-                sessions,
-                data,
-                dispatch.output_next,
-                now,
-                frame,
-                &mut output,
-            )?;
+    let result = main.with_worker_mut(
+        runtime,
+        |sessions| -> RuntimeResult<Option<SessionQueueNodeErrorCode>> {
+            let dispatch_count = sessions.transport_dispatches.len();
+            for dispatch_index in 0..dispatch_count {
+                let dispatch = sessions.transport_dispatches[dispatch_index];
+                if (dispatch.update_time)(
+                    runtime,
+                    sessions,
+                    data,
+                    dispatch.output_next,
+                    now,
+                    frame,
+                    &mut output,
+                )
+                .is_err()
+                {
+                    return Ok(Some(SessionQueueNodeErrorCode::TransportUpdateTime));
+                }
+            }
+            if sessions.poll_session_events().is_err() {
+                return Ok(Some(SessionQueueNodeErrorCode::SessionEventPoll));
+            }
+            let dispatch_count = sessions.transport_dispatches.len();
+            for dispatch_index in 0..dispatch_count {
+                let dispatch = sessions.transport_dispatches[dispatch_index];
+                if (dispatch.function)(
+                    runtime,
+                    sessions,
+                    data,
+                    dispatch.output_next,
+                    now,
+                    frame,
+                    &mut output,
+                )
+                .is_err()
+                {
+                    return Ok(Some(SessionQueueNodeErrorCode::SessionState));
+                }
+            }
+            if sessions.update_state(runtime, output.io_count()).is_err() {
+                return Ok(Some(SessionQueueNodeErrorCode::SessionState));
+            }
+            Ok(None)
+        },
+    );
+    match result {
+        Ok(Some(code)) => {
+            let _ = runtime.record_current_node_error(code.code());
         }
-        sessions.poll_session_events()?;
-        let dispatch_count = sessions.transport_dispatches.len();
-        for dispatch_index in 0..dispatch_count {
-            let dispatch = sessions.transport_dispatches[dispatch_index];
-            (dispatch.function)(
-                runtime,
-                sessions,
-                data,
-                dispatch.output_next,
-                now,
-                frame,
-                &mut output,
-            )
-            .map_err(|_| SessionQueueError::DispatchFailed)?;
+        Ok(None) => {}
+        Err(_) => {
+            let _ =
+                runtime.record_current_node_error(SessionQueueNodeErrorCode::WorkerAccess.code());
         }
-        sessions.update_state(runtime, output.io_count())?;
-        Ok(())
-    });
-    if result.is_err() {
-        let _ = runtime.record_current_node_error(SessionQueueError::DispatchFailed.code());
-        output.flush(runtime, frame);
-        return NodeResult::drop();
     }
     output.flush(runtime, frame);
     NodeResult::drop()
