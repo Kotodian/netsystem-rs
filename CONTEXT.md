@@ -152,10 +152,12 @@ length-prefixed protobuf stream on a Tokio Unix socket. Each plugin declares
 typed protobuf request/reply methods through the component macro; its retained
 registration image carries only immutable method identity and the generated
 adapter. Binary API dispatch resolves the current `PluginMain` registration on
-the Main Thread and invokes the plugin without a handler registry lock. Local
-applications bypass protobuf and Unix I/O and call the same plugin-owned Main
-Thread operation through its ABI.
-_Avoid_: CLI IPC as Binary API, SVM FIFO as control API, handler mutex, Tokio worker dispatch, daemon-owned plugin message schema, protobuf in the data path
+the Main Thread and invokes exactly one plugin method at a time without a
+handler registry lock. The synchronous method call runs under the worker
+barrier and cannot spawn parallel method work or cross an await boundary.
+Local applications bypass protobuf and Unix I/O and call the same plugin-owned
+Main Thread operation through its ABI.
+_Avoid_: CLI IPC as Binary API, SVM FIFO as control API, handler mutex, parallel method dispatch, await inside method dispatch, Tokio worker dispatch, daemon-owned plugin message schema, protobuf in the data path
 
 **Binary API Layer Contract**:
 - `hammer-runtime` carries immutable cross-DSO method registrations and retains
@@ -395,15 +397,15 @@ A Session Lifecycle state in which the app-facing transport object no longer exi
 _Avoid_: stale connection index, TCP closed flag, tombstone connection
 
 **Transport Connection**:
-The transport-worker-owned state for one protocol connection. A TCP Connection is represented by one Session, while a QUIC Connection multiplexes multiple QUIC Streams and every stream is represented by one Session; no Transport Connection owns app/session FIFOs or Session Runtime scheduling.
+The transport-worker-owned state for one protocol connection. A TCP Connection is represented by one Session; a QUIC Connection is represented by one parent Session and each of its QUIC Streams is represented by another Session. No Transport Connection owns app/session FIFOs or Session Runtime scheduling.
 _Avoid_: app session, runtime session, socket object
 
 **Transport Index**:
-An opaque transport-provided index from a Session to its exact private transport state. TCP uses it for `TcpConnection` state and QUIC uses it for the stream state backing that Session; the QUIC stream state privately references its parent `QuicConnection`. Session Runtime preserves and passes the index without interpreting the transport's pool representation, parent relationship, or state.
+An opaque transport-provided index from a Session to its exact private transport state. TCP uses it for `TcpConnection`; a QUIC Connection Session uses it for connection state, while a QUIC Stream Session uses it for stream state that privately references its parent connection state. Session Runtime preserves and passes the index without interpreting the transport's pool representation, parent relationship, or state.
 _Avoid_: TCP connection in Session Runtime, QUIC stream id in Session Runtime, shared QUIC connection index for multiple Sessions, SessionId passed into transport dispatch
 
 **Session Transport Driver**:
-The worker-local `SessionTransport` implementation through which Session Queue advances a transport, schedules TX, applies close operations, and maps an exact per-Session Transport Index to its owning transport connection index. TCP maps its connection state to itself, while QUIC maps private stream state to its parent `QuicConnection`. The VPP-aligned `app_rx_evt` operation is invoked only after Session Queue resolves an `RxDeq` event to the exact transport Session; despite its established name, it is not a direct App-to-transport callback. The driver receives only transport-owned indexes and transport-neutral Session facts, and never selects or invokes an App Session protocol.
+The worker-local `SessionTransport` implementation through which Session Queue advances a transport, schedules TX, applies close operations, and maps an exact per-Session Transport Index to its owning transport connection index. TCP and a QUIC Connection Session map their connection state to itself, while a QUIC Stream Session maps its stream state to the parent QUIC Connection state. The VPP-aligned `app_rx_evt` operation is invoked only after Session Queue resolves an `RxDeq` event to the exact transport Session; despite its established name, it is not a direct App-to-transport callback. The driver receives only transport-owned indexes and transport-neutral Session facts, and never selects or invokes an App Session protocol.
 _Avoid_: transport Graph Node, QUIC-specific Session API, SessionId transport dispatch, direct App-to-transport callback, App Session protocol dispatch
 
 **TX Byte Retention**:
@@ -457,12 +459,24 @@ An application-selected secure datagram relationship that uses DTLS records over
 _Avoid_: UDP TLS connection, stream session, encrypted UDP helper
 
 **QUIC Connection**:
-A Transport Connection over UDP packets that uses the TLS 1.3 handshake and owns QUIC packet protection, reliability, congestion control, connection identity, and its QUIC Streams. It occupies the same transport-layer role as a TCP Connection, but it does not use the TLS or DTLS record layer and is not itself a Session or AppSession.
-_Avoid_: TLS record transport, UDP session, DTLS stream, QUIC Session, QUIC AppSession
+A Transport Connection over UDP packets that uses the TLS 1.3 handshake and owns QUIC packet protection, reliability, congestion control, connection identity, and its QUIC Streams. It is represented by one payloadless parent Session whose handle opens or accepts child QUIC Stream Sessions; it is not a shared byte-stream AppSession and does not use the TLS or DTLS record layer.
+_Avoid_: TLS record transport, UDP session, DTLS stream, shared multi-stream AppSession, connection payload stream
+
+**QUIC Context**:
+One cache-line-sized worker-owned identity in the QUIC context pool representing exactly one listener, connection, or stream. Each role retains only the identities and hot lifecycle facts needed to reach its owner; large engine state and role-irrelevant fields are not part of every context.
+_Avoid_: common context with every role's fields, copied Quinn connection state, second stream pool, cold diagnostics in a hot context
+
+**QUIC Session App**:
+The built-in protocol owner selected over a lower connected UDP Session. Like TLS, it obtains immutable Application-owned configuration from the Main Thread and advances concrete protocol state on exactly one Data Worker through Session App callbacks; unlike TLS, it also publishes a payloadless QUIC Connection Session and its child QUIC Stream Sessions as an upper Session Transport.
+_Avoid_: QUIC Graph Node, runtime endpoint task, generic QUIC engine VFT, QUIC policy in UDP, worker-shared protocol state
+
+**QUIC Configuration**:
+An immutable Application-owned client or server policy registered with the QUIC Main Thread authority under a generation-checked identity. Its transport policy selects connection timeout and peer-advertised bidirectional and unidirectional stream limits; protocol-engine tuning, QUIC DATAGRAM, and 0-RTT are not Application configuration. Binary API publication and removal cross the worker barrier before any Data Worker may resolve the configuration; a worker retains its immutable configuration independently after constructing a connection.
+_Avoid_: TLS configuration identity reused for QUIC, UDP-owned QUIC policy, worker-mutated configuration, unbarriered configuration publication, public engine-tuning bag
 
 **QUIC Stream**:
-A multiplexed reliable byte stream represented by exactly one Session. Its Transport Index addresses protocol-private stream state inside `transport/quic`, and that state references the owning QUIC Connection; it is not a second app-facing stream identity. With no selected upper protocol the Session is published directly as one AppSession; closing or resetting one stream does not close its siblings, while closing the owning connection closes every remaining stream.
-_Avoid_: QUIC Connection session, UDP datagram, shared multi-stream AppSession
+A multiplexed reliable byte stream represented by exactly one child Session beneath a QUIC Connection Session. Its payload is retained only in that Stream Session's FIFOs; QUIC retains protocol offsets and ranges rather than another payload copy. Its Transport Index addresses protocol-private stream state inside `transport/quic`, and that state references the owning QUIC Connection; with no selected upper protocol the Stream Session is published directly as one AppSession. Closing or resetting one stream does not close its siblings, while closing the parent connection closes every remaining stream.
+_Avoid_: UDP datagram, shared multi-stream AppSession, stream without a parent Connection Session, Quinn-owned stream payload
 
 ## IP Reassembly
 

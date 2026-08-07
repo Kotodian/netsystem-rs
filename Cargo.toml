@@ -10,11 +10,13 @@ members = [
     "crates/hammer-plugins/ip",
     "crates/hammer-plugins/transport/tcp",
     "crates/hammer-plugins/transport/udp",
+    "crates/hammer-plugins/transport/quic",
     "crates/hammer-plugins/app-session/tls",
     "crates/hammer-app",
     "crates/hammer-ipc",
     "crates/hammer",
     "crates/hammerctl",
+    "third_party/quinn/quinn-proto",
 ]
 exclude = [
     "third_party/allocator-api2",
@@ -73,6 +75,7 @@ rustc-hash = "2"
 indoc = "2.0"
 rcgen = "0.14"
 rustls = { version = "=0.23.31", default-features = false, features = ["ring", "std"] }
+quinn-proto = { path = "third_party/quinn/quinn-proto", default-features = false, features = ["rustls"] }
 criterion = { version = "0.5", default-features = false, features = ["plotters", "cargo_bench_support"] }
 linkme = "0.3"
 petgraph = "0.6"

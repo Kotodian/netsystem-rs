@@ -1,0 +1,9 @@
+# QUIC Graph Nodes follow Runtime ownership boundaries
+
+Status: accepted
+
+The QUIC plugin registers five protocol-specific Graph Nodes: `quic-input`, `quic-listen`, `quic-handshake`, `quic-recv-process`, and `quic-output`. `quic-input` performs invariant-header and CID-owner classification; unknown Initial datagrams enter `quic-listen`; handshaking connections enter `quic-handshake`; and later connection input enters `quic-recv-process`. `quic-handshake` consumes one coalesced UDP datagram atomically, so completing the handshake changes the route only for subsequent datagrams rather than transferring a partially processed datagram between Nodes.
+
+QUIC does not register protocol-specific timer, handoff, drop, Session Queue, or UDP output Nodes. The shared `session-queue` Node advances each QUIC worker's connection deadlines through the transport `update_time` callback, the Runtime and service `handoff` Node transfer buffers to the CID owner worker before re-entering `quic-input`, and the existing `drop` and `udp-output` Nodes retain their generic responsibilities. QUIC frame-type complexity remains behind the connection engine's narrow internal modules because one packet can contain ACK, CRYPTO, STREAM, and control frames simultaneously; splitting those frame types into mutually exclusive Graph next arcs would require duplicated parsing or intermediate packet events.
+
+All five QUIC Nodes and the QUIC `SessionTransport` implementation operate on one worker-owned `Pool<QuicCtx>`, aligned with VPP's single `quic_ctx_t` pool. A Rust enum distinguishes connection and stream contexts instead of reproducing the C union. A stream context contains its parent `quic_connection_ctx_id`, quinn stream identity, and reverse `SessionId`; a Session Transport Index is the stream context's pool index. No second connection pool, stream pool, or cross-pool identity is introduced.
