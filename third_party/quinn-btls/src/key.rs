@@ -4,7 +4,6 @@ use crate::secret::Secret;
 use crate::suite::{CipherSuite, ID};
 use crate::{Error, QuicVersion};
 use btls_sys as bffi;
-use bytes::BytesMut;
 use quinn_proto::crypto;
 use std::ffi::c_uint;
 use std::fmt::{Debug, Formatter};
@@ -393,15 +392,11 @@ impl crypto::PacketKey for PacketKey {
         &self,
         packet_number: u64,
         header: &[u8],
-        payload: &mut BytesMut,
-    ) -> StdResult<(), crypto::CryptoError> {
+        payload: &mut [u8],
+    ) -> StdResult<usize, crypto::CryptoError> {
         let nonce = self.nonce_for_packet(packet_number);
 
-        let plain_len = self
-            .aead_key
-            .open_in_place(&nonce, payload.as_mut(), header)?;
-        payload.truncate(plain_len);
-        Ok(())
+        self.aead_key.open_in_place(&nonce, payload, header)
     }
 
     #[inline]

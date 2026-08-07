@@ -994,11 +994,12 @@ mod tests {
             packet.header_data[..],
             hex!("c0000000010806b858ec6f80452b0000402100")[..]
         );
-        server
+        let payload_len = server
             .packet
             .remote
             .decrypt(0, &packet.header_data, &mut packet.payload)
             .unwrap();
+        packet.payload.truncate(payload_len);
         assert_eq!(packet.payload[..], [0; 16]);
         match packet.header {
             Header::Initial(InitialHeader {

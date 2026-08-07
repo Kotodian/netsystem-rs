@@ -568,24 +568,22 @@ impl Endpoint {
             });
         }
 
-        if incoming
-            .crypto
-            .packet
-            .remote
-            .decrypt(
-                packet_number,
-                &incoming.packet.header_data,
-                &mut incoming.packet.payload,
-            )
-            .is_err()
-        {
-            debug!(packet_number, "failed to authenticate initial packet");
-            self.index.remove_initial(dst_cid);
-            return Err(AcceptError {
-                cause: TransportError::PROTOCOL_VIOLATION("authentication failed").into(),
-                response: None,
-            });
+        let payload_len = match incoming.crypto.packet.remote.decrypt(
+            packet_number,
+            &incoming.packet.header_data,
+            &mut incoming.packet.payload,
+        ) {
+            Ok(payload_len) => payload_len,
+            Err(_) => {
+                debug!(packet_number, "failed to authenticate initial packet");
+                self.index.remove_initial(dst_cid);
+                return Err(AcceptError {
+                    cause: TransportError::PROTOCOL_VIOLATION("authentication failed").into(),
+                    response: None,
+                });
+            }
         };
+        incoming.packet.payload.truncate(payload_len);
 
         let ch = ConnectionHandle(self.connections.vacant_key());
         let loc_cid = self.new_cid(ch);

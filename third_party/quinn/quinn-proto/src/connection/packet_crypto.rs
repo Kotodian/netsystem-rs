@@ -109,12 +109,13 @@ pub(super) fn decrypt_packet_body(
         &next_crypto.unwrap().remote
     };
 
-    crypto
-        .decrypt(number, &packet.header_data, &mut packet.payload)
+    let payload_len = crypto
+        .decrypt(number, &packet.header_data, packet.payload.as_mut())
         .map_err(|_| {
             trace!("decryption failed with packet number {}", number);
             None
         })?;
+    packet.payload.truncate(payload_len);
 
     if !packet.reserved_bits_valid() {
         return Err(Some(TransportError::PROTOCOL_VIOLATION(
