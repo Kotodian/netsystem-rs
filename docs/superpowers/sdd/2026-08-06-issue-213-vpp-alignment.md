@@ -16,8 +16,9 @@ listener design and the TCP/UDP migration to that seam:
   listener registry.
 - `hammer-plugin-quic` is limited to the VPP-shaped listener skeleton: it
   owns the lower UDP listener relationship, plugin-local listener/config
-  identity, and Session App registration. It does not yet implement QUIC
-  packet processing, connection/stream Session fan-out, or timer delivery.
+  identity, and Session App registration. Its worker now contains a partial
+  VPP-shaped TX burst path, but QUIC packet input, complete connection/stream
+  Session fan-out, and full timer delivery remain incomplete.
 
 ## VPP analog and evidence
 
@@ -125,6 +126,54 @@ Lower UDP FIFO to Quinn sans-I/O RX/TX, worker-owned connection/stream context
 creation, Session fan-out, exact timer-token delivery, and FIFO-only stream
 payload ownership remain required before QUIC is a usable transport.
 
+### Dataplane slice: TX reservation and publication
+
+The current worker TX slice follows the VPP send path at
+`third_party/vpp/src/plugins/quic_quicly/quic_quicly.c:242-318`:
+
+- the lower UDP TX FIFO is checked against a maximum-sized record and the
+  VPP two-record backpressure threshold before polling Quinn;
+- one maximum-sized FIFO reservation is established before each
+  `poll_transmit`, so resource failure is returned before Quinn advances its
+  send state;
+- the actual Session datagram copies only `Transmit::size` bytes and commits
+  one complete record; one `publish_tx_enqueue` follows the burst;
+- the worker TX pending queue has fixed startup capacity and deduplicates one
+  connection, so steady-state scheduling does not use `mem::take` to force a
+  new allocation.
+
+The post-poll copy/commit result is a local invariant assertion, matching VPP
+`ASSERT(ret > 0)` after `svm_fifo_provision_chunks`; the pre-poll reservation
+failure remains a typed `FifoError` source on `OutputReservationFailed`. Engine
+and protocol-connection absence now remain typed worker errors, while the
+timer-wheel bound is a local assertion matching VPP's invariant checks. The
+timer-arm rollback preserves the primary timer error and only logs a secondary
+cleanup failure.
+
+### Blocking: borrowed QUIC input boundary is still missing
+
+The worker RX path at `quic/src/worker.rs:520-584` still allocates one
+`BytesMut` per complete UDP datagram. The vendored Quinn entry points at
+`third_party/quinn/quinn-proto/src/endpoint.rs:140-148` and
+`connection/mod.rs:445-451` still take ownership of `BytesMut`, so the worker
+cannot yet reuse fixed RX scratch storage. `PartialDecode` also owns its
+buffer at `third_party/quinn/quinn-proto/src/packet.rs:25-57`.
+
+Action: add the approved synchronous fixed-buffer decode/handle seam and make
+the worker own 16 datagram slots plus 64 packet descriptors before removing
+the per-datagram allocation.
+
+### Blocking: Stream payload can still escape Session FIFO ownership
+
+`quic/src/stream_io.rs:25-42,177-275` still stores unknown-stream receive data
+in `PendingRx.bytes: Vec<u8>`, and TX callbacks still append FIFO bytes into a
+`Vec<u8>`. This contradicts the issue's VPP-first payload contract even
+though established streams write directly to Session FIFOs.
+
+Action: create stream Session state before the receive callback reaches payload
+delivery, then replace the Quinn stream I/O surface with FIFO-backed fixed
+range reads and direct FIFO receive commits.
+
 ## Barrier follow-up
 
 The generic `hammer_runtime::Barrier<T>` has been removed. Runtime graph,
@@ -157,9 +206,9 @@ VPP-style graph refork work that continues after barrier release.
 ## Verdict
 
 **Aligned for the shared listener seam, QUIC listener skeleton, and barrier
-publication change.** The shared contract follows VPP's ownership and ordering
-without moving QUIC-specific state below the plugin boundary. This is not a
-claim that the QUIC transport is feature complete.
+publication change and the bounded TX reservation slice. The review verdict
+for issue #213 remains **Needs changes** until the blocking borrowed-input and
+Session-FIFO ownership findings are fixed.
 
 ## Commands run
 
@@ -180,6 +229,8 @@ claim that the QUIC transport is feature complete.
 - `cargo clippy --workspace --all-targets`
 - `cargo fmt --all -- --check`
 - `git diff --check`
+- `cargo check -p hammer-plugin-quic` (after the TX reservation slice; no test
+  suite was rerun)
 
 Workspace checking and the full workspace test pass, including the runtime
 barrier tests and all QUIC tests. Workspace-wide clippy still reports existing

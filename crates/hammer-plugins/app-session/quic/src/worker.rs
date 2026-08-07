@@ -8,6 +8,7 @@ use std::time::{Duration, Instant};
 use bytes::BytesMut;
 use hammer_core::data_plane::BufferFrame;
 use hammer_infra::bytes::BytesBuffer;
+use hammer_infra::fifo::FifoError;
 use hammer_infra::pool::{Index, Pool};
 use hammer_infra::thread_owned::ThreadOwnedError;
 use hammer_infra::timer_wheel::TimerWheel1t2w2048sl;
@@ -31,6 +32,7 @@ pub(super) const QUIC_CONTEXT_CAPACITY: usize = 4_096;
 const MAX_PACKET_SIZE: usize = 1280;
 const RX_DATAGRAM_BURST: usize = 16;
 const TX_PACKET_BURST: usize = 10;
+const CONNECTION_TX_PENDING: u8 = 1;
 const TIMER_RESOLUTION: Duration = Duration::from_millis(1);
 const TIMER_MAX_TICKS_PER_UPDATE: u32 = 1_024;
 const TIMER_EXPIRY_BUDGET: usize = 256;
@@ -125,7 +127,7 @@ impl EngineConnection {
     fn connection_mut(&mut self) -> RuntimeResult<&mut Connection> {
         self.connection
             .as_mut()
-            .ok_or_else(|| QuicWorkerError::EngineMissing.into())
+            .ok_or_else(|| QuicWorkerError::ConnectionMissing.into())
     }
 }
 
@@ -263,6 +265,12 @@ impl Context {
         }
     }
 
+    fn engine_mut(&mut self, context: ContextId) -> RuntimeResult<&mut EngineConnection> {
+        self.connection_mut()
+            .and_then(|connection| connection.engine.as_deref_mut())
+            .ok_or_else(|| QuicWorkerError::EngineMissing { context }.into())
+    }
+
     fn stream_mut(&mut self) -> Option<&mut StreamContext> {
         match &mut self.role {
             ContextRole::Stream(stream) => Some(stream),
@@ -357,8 +365,12 @@ impl QuicTimers {
         self.expired.clear();
         let tick_before = self.wheel.current_tick();
         self.wheel.expire(requested_ticks, &mut self.expired);
-        let consumed_ticks = u32::try_from(self.wheel.current_tick() - tick_before)
-            .expect("QUIC timer wheel consumes no more than the requested u32 ticks");
+        let consumed_ticks = self.wheel.current_tick() - tick_before;
+        assert!(
+            consumed_ticks <= u64::from(requested_ticks),
+            "QUIC timer wheel must not consume more ticks than requested"
+        );
+        let consumed_ticks = consumed_ticks as u32;
         self.last_update += TIMER_RESOLUTION * consumed_ticks;
         for payload in self.expired.as_slice() {
             let Some((slot, generation, kind_id)) = self.wheel.take_expired_timer(*payload) else {
@@ -412,6 +424,7 @@ pub struct QuicWorker {
     timers: QuicTimers,
     tx_bufs: BytesBuffer,
     connection_tx_pending: Vec<ContextId>,
+    connection_tx_ready: Vec<ContextId>,
 }
 
 impl QuicWorker {
@@ -421,7 +434,8 @@ impl QuicWorker {
             contexts: Pool::with_capacity(QUIC_CONTEXT_CAPACITY),
             timers: QuicTimers::new(Instant::now()),
             tx_bufs: BytesBuffer::with_capacity(TX_PACKET_BURST * MAX_PACKET_SIZE),
-            connection_tx_pending: Vec::new(),
+            connection_tx_pending: Vec::with_capacity(QUIC_CONTEXT_CAPACITY),
+            connection_tx_ready: Vec::with_capacity(QUIC_CONTEXT_CAPACITY),
         }
     }
 
@@ -452,8 +466,13 @@ impl QuicWorker {
                 Duration::from_millis(30_000),
             )
             .map_err(|error| {
-                self.remove_context(context)
-                    .expect("new QUIC context remains present when timer start fails");
+                if let Err(cleanup_error) = self.remove_context(context) {
+                    tracing::error!(
+                        ?context,
+                        %cleanup_error,
+                        "QUIC connection context rollback failed after timer arm error"
+                    );
+                }
                 error
             })?;
         Ok(context)
@@ -602,15 +621,11 @@ impl QuicWorker {
         if !has_connection {
             return self.accept_first_datagram(sessions, context, local, remote, data, now);
         }
-        let connection_context = self
+        let engine = self
             .contexts
             .get_mut(context.into())
-            .and_then(Context::connection_mut)
-            .ok_or_else(|| QuicWorkerError::ContextMissing { context })?;
-        let engine = connection_context
-            .engine
-            .as_mut()
-            .expect("QUIC Connection context owns an EngineConnection");
+            .ok_or_else(|| QuicWorkerError::ContextMissing { context })?
+            .engine_mut(context)?;
         engine.remote = Some(remote);
         engine.local = Some(local);
         let connection = engine.connection_mut()?;
@@ -661,15 +676,11 @@ impl QuicWorker {
                         context,
                         source: error.cause,
                     })?;
-                let connection_context = self
+                let engine = self
                     .contexts
                     .get_mut(context.into())
-                    .and_then(Context::connection_mut)
-                    .ok_or_else(|| QuicWorkerError::ContextMissing { context })?;
-                let engine = connection_context
-                    .engine
-                    .as_mut()
-                    .expect("QUIC Connection context owns an EngineConnection");
+                    .ok_or_else(|| QuicWorkerError::ContextMissing { context })?
+                    .engine_mut(context)?;
                 let io = engine.io_table.io();
                 connection.set_stream_data_io(Some(io));
                 engine.handle = Some(handle);
@@ -704,15 +715,11 @@ impl QuicWorker {
     ) -> RuntimeResult<()> {
         for _ in 0..8 {
             let (events, endpoint_events, handled) = {
-                let connection_context = self
+                let engine = self
                     .contexts
                     .get_mut(context.into())
-                    .and_then(Context::connection_mut)
-                    .ok_or_else(|| QuicWorkerError::ContextMissing { context })?;
-                let engine = connection_context
-                    .engine
-                    .as_mut()
-                    .expect("QUIC Connection context owns an EngineConnection");
+                    .ok_or_else(|| QuicWorkerError::ContextMissing { context })?
+                    .engine_mut(context)?;
                 let Some(connection) = engine.connection.as_mut() else {
                     return Ok(());
                 };
@@ -928,9 +935,8 @@ impl QuicWorker {
         let engine = self
             .contexts
             .get_mut(context.into())
-            .and_then(Context::connection_mut)
-            .and_then(|connection| connection.engine.as_mut())
-            .expect("QUIC Connection context owns an EngineConnection");
+            .ok_or_else(|| QuicWorkerError::ContextMissing { context })?
+            .engine_mut(context)?;
         if let Err(_error) = engine.io_table.drain_pending(
             stream,
             stream_context,
@@ -955,9 +961,8 @@ impl QuicWorker {
         let engine = self
             .contexts
             .get_mut(context.into())
-            .and_then(Context::connection_mut)
-            .and_then(|connection| connection.engine.as_mut())
-            .expect("QUIC Connection context owns an EngineConnection");
+            .ok_or_else(|| QuicWorkerError::ContextMissing { context })?
+            .engine_mut(context)?;
         let events = engine.io_table.take_events();
         for event in events {
             if event.rx != 0 {
@@ -985,11 +990,40 @@ impl QuicWorker {
         sessions: &mut SessionWorker<Index>,
         now: Instant,
     ) -> RuntimeResult<()> {
-        let contexts = std::mem::take(&mut self.connection_tx_pending);
-        for context in contexts {
+        std::mem::swap(
+            &mut self.connection_tx_pending,
+            &mut self.connection_tx_ready,
+        );
+        while let Some(context) = self.connection_tx_ready.pop() {
+            if let Some(connection) = self
+                .contexts
+                .get_mut(context.into())
+                .and_then(Context::connection_mut)
+            {
+                connection.flags &= !CONNECTION_TX_PENDING;
+            }
             self.send_packets(sessions, context, now)?;
         }
         Ok(())
+    }
+
+    fn queue_connection_output(&mut self, context: ContextId) {
+        let connection = self
+            .contexts
+            .get_mut(context.into())
+            .and_then(Context::connection_mut)
+            .unwrap_or_else(|| {
+                panic!("QUIC TX scheduling requires connection context {context:?}")
+            });
+        if connection.flags & CONNECTION_TX_PENDING != 0 {
+            return;
+        }
+        connection.flags |= CONNECTION_TX_PENDING;
+        assert!(
+            self.connection_tx_pending.len() < self.connection_tx_pending.capacity(),
+            "QUIC connection TX queue capacity must cover the worker context pool"
+        );
+        self.connection_tx_pending.push(context);
     }
 
     pub(super) fn send_packets(
@@ -1003,15 +1037,22 @@ impl QuicWorker {
             .get_mut(context.into())
             .and_then(Context::connection_mut)
             .ok_or_else(|| QuicWorkerError::ContextMissing { context })?;
+        let lower_session = connection_context.lower_session;
         let engine = connection_context
             .engine
-            .as_mut()
-            .expect("QUIC Connection context owns an EngineConnection");
+            .as_deref_mut()
+            .ok_or_else(|| QuicWorkerError::EngineMissing { context })?;
         let (remote, local) = match (engine.remote, engine.local) {
             (Some(remote), Some(local)) => (remote, local),
             _ => return Ok(()),
         };
-        let lower_session = connection_context.lower_session;
+        SessionDgramHeader::new(local, remote, MAX_PACKET_SIZE).ok_or(
+            QuicWorkerError::InvalidEndpoint {
+                context,
+                local,
+                remote,
+            },
+        )?;
         let record_size = SessionDgramHeader::SIZE + MAX_PACKET_SIZE;
         let packet_budget = {
             let (_, tx_fifo) = sessions.fifo_pair(lower_session).ok_or_else(|| {
@@ -1028,20 +1069,34 @@ impl QuicWorker {
         };
         let mut produced = 0usize;
         for _ in 0..packet_budget {
+            // VPP provisions UDP FIFO chunks before `quicly_send`, so a
+            // resource failure cannot follow a committed QUIC transmit.
+            let mut reservation = {
+                let (_, tx_fifo) = sessions.fifo_pair(lower_session).ok_or_else(|| {
+                    QuicWorkerError::SessionMissing {
+                        session: lower_session,
+                    }
+                })?;
+                tx_fifo.reserve_write(record_size).map_err(|source| {
+                    QuicWorkerError::OutputReservationFailed {
+                        context,
+                        bytes: record_size,
+                        source,
+                    }
+                })?
+            };
             let Some(transmit) = engine
                 .connection_mut()?
                 .poll_transmit(now, 1, &mut *self.tx_bufs)
             else {
+                reservation.cancel();
                 break;
             };
             let payload_len = transmit.size;
-            if payload_len == 0 || payload_len > self.tx_bufs.len() {
-                return Err(QuicWorkerError::OutputLengthInvalid {
-                    context,
-                    length: payload_len,
-                }
-                .into());
-            }
+            assert!(
+                (1..=MAX_PACKET_SIZE).contains(&payload_len) && payload_len <= self.tx_bufs.len(),
+                "QUIC engine produced {payload_len} bytes outside the initialized fixed TX scratch"
+            );
             let header = SessionDgramHeader::new(local, remote, payload_len).ok_or(
                 QuicWorkerError::InvalidEndpoint {
                     context,
@@ -1057,39 +1112,18 @@ impl QuicWorker {
                         length: payload_len as u32,
                     })?;
             let header_bytes = header.to_bytes();
-            let committed = {
-                let (_, tx_fifo) = sessions.fifo_pair(lower_session).ok_or_else(|| {
-                    QuicWorkerError::SessionMissing {
-                        session: lower_session,
-                    }
-                })?;
-                match tx_fifo.reserve_write(record_len) {
-                    Ok(mut reservation) => {
-                        reservation
-                            .copy_from_segments([header_bytes.as_slice(), self.tx_bufs.as_slice()])
-                            .map_err(|_| QuicWorkerError::OutputReservationFailed {
-                                context,
-                                bytes: record_len,
-                            })?;
-                        reservation.commit(record_len).map_err(|_| {
-                            QuicWorkerError::OutputReservationFailed {
-                                context,
-                                bytes: record_len,
-                            }
-                        })?;
-                        true
-                    }
-                    Err(_) => {
-                        tx_fifo.want_deq_notification();
-                        false
-                    }
-                }
-            };
-            if committed {
-                produced = produced.saturating_add(record_len);
-            } else {
-                break;
-            }
+            let committed = reservation
+                .copy_from_segments([
+                    header_bytes.as_slice(),
+                    &self.tx_bufs.as_slice()[..payload_len],
+                ])
+                .and_then(|written| reservation.commit(written));
+            assert_eq!(
+                committed,
+                Ok(record_len),
+                "a pre-reserved QUIC datagram record must commit atomically"
+            );
+            produced = produced.saturating_add(record_len);
         }
         if produced != 0 {
             sessions.publish_tx_enqueue(lower_session, produced)?;
@@ -1141,22 +1175,25 @@ impl QuicWorker {
                     session: lower_session,
                 }
             })?;
-            let mut reservation = tx_fifo.reserve_write(record_len).map_err(|_| {
+            let mut reservation = tx_fifo.reserve_write(record_len).map_err(|source| {
                 QuicWorkerError::OutputReservationFailed {
                     context,
                     bytes: record_len,
+                    source,
                 }
             })?;
             reservation
                 .copy_from_segments([header_bytes.as_slice(), payload])
-                .map_err(|_| QuicWorkerError::OutputReservationFailed {
+                .map_err(|source| QuicWorkerError::OutputReservationFailed {
                     context,
                     bytes: record_len,
+                    source,
                 })?;
-            reservation.commit(record_len).map_err(|_| {
+            reservation.commit(record_len).map_err(|source| {
                 QuicWorkerError::OutputReservationFailed {
                     context,
                     bytes: record_len,
+                    source,
                 }
             })?;
         }
@@ -1200,7 +1237,7 @@ impl QuicWorker {
                 .unwrap_or(Ok(Default::default()))
             && should_transmit.should_transmit()
         {
-            self.connection_tx_pending.push(parent_context);
+            self.queue_connection_output(parent_context);
         }
         Ok(false)
     }
@@ -1314,7 +1351,7 @@ impl QuicWorker {
         {
             stream.app_tx_data_len = end_offset;
         }
-        self.connection_tx_pending.push(parent_context);
+        self.queue_connection_output(parent_context);
         self.schedule_connection_outputs(sessions, now)
     }
 }
@@ -1399,8 +1436,10 @@ pub(super) enum QuicWorkerError {
     ContextMissing { context: ContextId },
     #[error("QUIC stream {stream:?} is missing")]
     StreamMissing { stream: quinn_proto::StreamId },
-    #[error("QUIC engine is not installed")]
-    EngineMissing,
+    #[error("QUIC engine is not installed for context {context:?}")]
+    EngineMissing { context: ContextId },
+    #[error("QUIC protocol connection is not established")]
+    ConnectionMissing,
     #[error("QUIC server configuration is missing for context {context:?}")]
     ServerConfigMissing { context: ContextId },
     #[error("QUIC first Initial accept failed for context {context:?}: {source}")]
@@ -1419,10 +1458,13 @@ pub(super) enum QuicWorkerError {
         local: SocketAddr,
         remote: SocketAddr,
     },
-    #[error("QUIC context {context:?} produced an invalid output length {length}")]
-    OutputLengthInvalid { context: ContextId, length: usize },
     #[error("QUIC context {context:?} could not reserve {bytes} output bytes")]
-    OutputReservationFailed { context: ContextId, bytes: usize },
+    OutputReservationFailed {
+        context: ContextId,
+        bytes: usize,
+        #[source]
+        source: FifoError,
+    },
     #[error("QUIC stream Session creation failed for context {context:?} stream {stream:?}")]
     StreamSessionCreationFailed {
         context: ContextId,
