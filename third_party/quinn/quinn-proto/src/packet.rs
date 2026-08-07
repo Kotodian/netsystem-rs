@@ -24,18 +24,19 @@ use crate::{
 #[derive(Debug)]
 pub struct PartialDecode {
     plain_header: ProtectedHeader,
-    buf: io::Cursor<BytesMut>,
+    packet_range: Range<usize>,
 }
 
 #[allow(clippy::len_without_is_empty)]
 impl PartialDecode {
     /// Begin decoding a QUIC packet from `bytes`, returning any trailing data not part of that packet
     pub fn new(
-        bytes: BytesMut,
+        bytes: &[u8],
+        offset: usize,
         cid_parser: &(impl ConnectionIdParser + ?Sized),
         supported_versions: &[u32],
         grease_quic_bit: bool,
-    ) -> Result<(Self, Option<BytesMut>), PacketDecodeError> {
+    ) -> Result<(Self, Option<Range<usize>>), PacketDecodeError> {
         let mut buf = io::Cursor::new(bytes);
         let plain_header =
             ProtectedHeader::decode(&mut buf, cid_parser, supported_versions, grease_quic_bit)?;
@@ -45,20 +46,29 @@ impl PartialDecode {
             .map(|len| (buf.position() + len) as usize)
             .unwrap_or(dgram_len);
         match dgram_len.cmp(&packet_len) {
-            Ordering::Equal => Ok((Self { plain_header, buf }, None)),
+            Ordering::Equal => Ok((
+                Self {
+                    plain_header,
+                    packet_range: offset..offset + packet_len,
+                },
+                None,
+            )),
             Ordering::Less => Err(PacketDecodeError::InvalidHeader(
                 "packet too short to contain payload length",
             )),
-            Ordering::Greater => {
-                let rest = Some(buf.get_mut().split_off(packet_len));
-                Ok((Self { plain_header, buf }, rest))
-            }
+            Ordering::Greater => Ok((
+                Self {
+                    plain_header,
+                    packet_range: offset..offset + packet_len,
+                },
+                Some(offset + packet_len..offset + dgram_len),
+            )),
         }
     }
 
     /// The underlying partially-decoded packet data
-    pub(crate) fn data(&self) -> &[u8] {
-        self.buf.get_ref()
+    pub(crate) fn data<'a>(&self, scratch: &'a [u8]) -> &'a [u8] {
+        &scratch[self.packet_range.clone()]
     }
 
     pub(crate) fn initial_header(&self) -> Option<&ProtectedInitialHeader> {
@@ -105,18 +115,20 @@ impl PartialDecode {
     /// Length of QUIC packet being decoded
     #[allow(unreachable_pub)] // fuzzing only
     pub fn len(&self) -> usize {
-        self.buf.get_ref().len()
+        self.packet_range.len()
     }
 
     pub(crate) fn finish(
         self,
+        scratch: &mut [u8],
         header_crypto: Option<&dyn crypto::HeaderKey>,
     ) -> Result<Packet, PacketDecodeError> {
         use ProtectedHeader::*;
         let Self {
             plain_header,
-            mut buf,
+            packet_range,
         } = self;
+        let mut buf = io::Cursor::new(&mut scratch[packet_range.clone()]);
 
         if let Initial(ProtectedInitialHeader {
             dst_cid,
@@ -128,7 +140,7 @@ impl PartialDecode {
         {
             let number = Self::decrypt_header(&mut buf, header_crypto.unwrap())?;
             let header_len = buf.position() as usize;
-            let mut bytes = buf.into_inner();
+            let mut bytes = BytesMut::from(&scratch[packet_range.clone()]);
 
             let header_data = bytes.split_to(header_len).freeze();
             let token = header_data.slice(token_pos.start..token_pos.end);
@@ -191,7 +203,7 @@ impl PartialDecode {
         };
 
         let header_len = buf.position() as usize;
-        let mut bytes = buf.into_inner();
+        let mut bytes = BytesMut::from(&scratch[packet_range]);
         Ok(Packet {
             header,
             header_data: bytes.split_to(header_len).freeze(),
@@ -200,7 +212,7 @@ impl PartialDecode {
     }
 
     fn decrypt_header(
-        buf: &mut io::Cursor<BytesMut>,
+        buf: &mut io::Cursor<&mut [u8]>,
         header_crypto: &dyn crypto::HeaderKey,
     ) -> Result<PacketNumber, PacketDecodeError> {
         let packet_length = buf.get_ref().len();
@@ -575,7 +587,7 @@ impl ProtectedHeader {
 
     /// Decode a plain header from given buffer, with given [`ConnectionIdParser`].
     pub fn decode(
-        buf: &mut io::Cursor<BytesMut>,
+        buf: &mut io::Cursor<&[u8]>,
         cid_parser: &(impl ConnectionIdParser + ?Sized),
         supported_versions: &[u32],
         grease_quic_bit: bool,
@@ -981,15 +993,19 @@ mod tests {
 
         let server = initial_keys(Version::V1, dcid, Side::Server, &suite);
         let supported_versions = crate::DEFAULT_SUPPORTED_VERSIONS.to_vec();
+        let mut scratch = BytesMut::from(buf.as_slice());
         let decode = PartialDecode::new(
-            buf.as_slice().into(),
+            &scratch,
+            0,
             &FixedLengthConnectionIdParser::new(0),
             &supported_versions,
             false,
         )
         .unwrap()
         .0;
-        let mut packet = decode.finish(Some(&*server.header.remote)).unwrap();
+        let mut packet = decode
+            .finish(&mut scratch, Some(&*server.header.remote))
+            .unwrap();
         assert_eq!(
             packet.header_data[..],
             hex!("c0000000010806b858ec6f80452b0000402100")[..]

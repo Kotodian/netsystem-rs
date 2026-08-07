@@ -14,11 +14,11 @@ listener design and the TCP/UDP migration to that seam:
 - TCP and UDP register their own Session transport callbacks. Their plugins
   own endpoint lookup and worker state; they do not publish a second generic
   listener registry.
-- `hammer-plugin-quic` is limited to the VPP-shaped listener skeleton: it
-  owns the lower UDP listener relationship, plugin-local listener/config
-  identity, and Session App registration. Its worker now contains a partial
-  VPP-shaped TX burst path, but QUIC packet input, complete connection/stream
-  Session fan-out, and full timer delivery remain incomplete.
+- `hammer-plugin-quic` owns the lower UDP listener relationship, plugin-local
+  listener/config identity, Session App registration, and the worker-local
+  QUIC data path. The worker now reuses 16 fixed RX datagram slots, 64 packet
+  descriptors, and 10 TX slots; complete connection/stream Session fan-out,
+  full timer delivery, and FIFO-only stream payload movement remain incomplete.
 
 ## VPP analog and evidence
 
@@ -45,6 +45,16 @@ listener design and the TCP/UDP migration to that seam:
   lower UDP Session's opaque field. `:363-383` stops that lower listener before
   freeing the QUIC listener context. Its transport registration is at
   `:899-919` and `:953-970`.
+- `third_party/vpp/src/plugins/quic_quicly/quic_quicly.c:1357-1365` stops the
+  current receive batch when packet decoding fails, while `:1834-1855`
+  counts decoded packets and dispatches them in wire order. Fatal
+  `quicly_receive` resource/state failures at `:1608-1628` close the
+  connection. `third_party/vpp/src/plugins/quic/quic_error.def:26` names the
+  packet-drop counter.
+- `third_party/vpp/src/plugins/quic_quicly/quic_quicly_crypto.c:933-1003`
+  removes header protection and decrypts in place; a failed AEAD operation is
+  dropped and a successful operation truncates the visible packet to
+  `ptlen + aead_off`.
 
 ## Ownership and barrier
 
@@ -150,18 +160,17 @@ timer-wheel bound is a local assertion matching VPP's invariant checks. The
 timer-arm rollback preserves the primary timer error and only logs a secondary
 cleanup failure.
 
-### Blocking: borrowed QUIC input boundary is still missing
+### Non-blocking: fixed QUIC input scratch boundary is now present
 
-The worker RX path at `quic/src/worker.rs:520-584` still allocates one
-`BytesMut` per complete UDP datagram. The vendored Quinn entry points at
-`third_party/quinn/quinn-proto/src/endpoint.rs:140-148` and
-`connection/mod.rs:445-451` still take ownership of `BytesMut`, so the worker
-cannot yet reuse fixed RX scratch storage. `PartialDecode` also owns its
-buffer at `third_party/quinn/quinn-proto/src/packet.rs:25-57`.
+The worker RX path at `quic/src/worker.rs:556-645` reuses 16 aligned datagram
+slots and one 64-entry descriptor vector. The synchronous Quinn entry points
+at `third_party/quinn/quinn-proto/src/endpoint.rs:152-184` and
+`connection/mod.rs:459-525` borrow the caller-owned scratch, while
+`PartialDecode` retains only the parsed header and packet range.
 
-Action: add the approved synchronous fixed-buffer decode/handle seam and make
-the worker own 16 datagram slots plus 64 packet descriptors before removing
-the per-datagram allocation.
+The remaining gap is data movement after decode: endpoint accept still copies
+coalesced remainder bytes into `Incoming.rest`, and `PartialDecode::finish`
+still creates owned `Packet` payload storage for frame processing.
 
 ### Blocking: Stream payload can still escape Session FIFO ownership
 
@@ -212,28 +221,12 @@ Session-FIFO ownership findings are fixed.
 
 ## Commands run
 
-- `cargo check -p hammer-plugin-quic --lib`
-- `cargo test -p hammer-plugin-quic --lib`
-- `cargo test -p hammer-service --lib session::runtime`
-- `cargo test -p hammer-service --test application_listener`
-- `cargo test -p hammer-service --test binary_api`
-- `cargo test -p hammer-plugin-tcp --all-targets`
-- `cargo test -p hammer-plugin-udp --all-targets`
-- `cargo clippy -p hammer-plugin-quic --lib --tests --message-format=short`
-- `cargo test -p hammer-runtime --lib`
-- `cargo test -p hammer-runtime barrier::tests --lib`
-- `cargo check -p hammer-runtime -p hammer-plugin-quic`
-- `cargo check --workspace`
-- `cargo test --workspace`
-- `cargo clippy -p hammer-service --test binary_api --message-format=short`
-- `cargo clippy --workspace --all-targets`
-- `cargo fmt --all -- --check`
-- `git diff --check`
-- `cargo check -p hammer-plugin-quic` (after the TX reservation slice; no test
-  suite was rerun)
+- Vendored VPP source inspection with `rg`, `sed`, and numbered source views.
+- `cargo check -p hammer-plugin-quic --lib` (this continuation).
+- `cargo fmt --all -- --check` (this continuation).
+- `git diff --check` (this continuation).
 
-Workspace checking and the full workspace test pass, including the runtime
-barrier tests and all QUIC tests. Workspace-wide clippy still reports existing
-`mut_from_ref` errors at `quic/src/listener.rs:66`,
-`udp/src/input.rs:555`, and `udp/src/worker.rs:92`; none of those files are part
-of this barrier change.
+Tests were not run in this continuation, per maintainer instruction. The
+review verdict remains `Needs changes` because stream payload ownership and
+the remaining owned packet/frame movement still diverge from the VPP-first
+contract.

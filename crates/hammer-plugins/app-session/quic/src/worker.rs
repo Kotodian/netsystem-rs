@@ -5,7 +5,6 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use bytes::BytesMut;
 use hammer_core::data_plane::BufferFrame;
 use hammer_infra::bytes::BytesBuffer;
 use hammer_infra::fifo::{Fifo, FifoError};
@@ -21,7 +20,8 @@ use hammer_service::session::runtime::{
     TransportInternalTx,
 };
 use quinn_proto::{
-    Connection, ConnectionHandle, DatagramEvent, Endpoint, EndpointConfig, Event, StreamEvent,
+    Connection, ConnectionHandle, DatagramEvent, Endpoint, EndpointConfig, Event, PartialDecode,
+    StreamEvent,
 };
 
 use crate::config::ConfigId;
@@ -37,6 +37,19 @@ const TIMER_RESOLUTION: Duration = Duration::from_millis(1);
 const TIMER_MAX_TICKS_PER_UPDATE: u32 = 1_024;
 const TIMER_EXPIRY_BUDGET: usize = 256;
 const TIMER_WHEEL_MAX_INTERVAL_TICKS: u64 = 2048 * 2048 - 1;
+
+#[repr(C, align(64))]
+struct RxDatagramScratch {
+    data: [u8; MAX_PACKET_SIZE],
+}
+
+impl Default for RxDatagramScratch {
+    fn default() -> Self {
+        Self {
+            data: [0; MAX_PACKET_SIZE],
+        }
+    }
+}
 
 /// Generation-checked identity for one QUIC listener, connection, or stream
 /// context. Main Thread listener contexts and Data Worker transport contexts
@@ -422,6 +435,8 @@ pub struct QuicWorker {
     endpoint: Endpoint,
     contexts: Pool<Context>,
     timers: QuicTimers,
+    rx_datagrams: [Option<Box<RxDatagramScratch>>; RX_DATAGRAM_BURST],
+    rx_packet_descriptors: Vec<PartialDecode>,
     tx_bufs: BytesBuffer,
     connection_tx_pending: Vec<ContextId>,
     connection_tx_ready: Vec<ContextId>,
@@ -433,6 +448,8 @@ impl QuicWorker {
             endpoint: Endpoint::new(Arc::new(EndpointConfig::default()), None, false, None),
             contexts: Pool::with_capacity(QUIC_CONTEXT_CAPACITY),
             timers: QuicTimers::new(Instant::now()),
+            rx_datagrams: std::array::from_fn(|_| Some(Box::new(RxDatagramScratch::default()))),
+            rx_packet_descriptors: Vec::with_capacity(64),
             tx_bufs: BytesBuffer::with_capacity(TX_PACKET_BURST * MAX_PACKET_SIZE),
             connection_tx_pending: Vec::with_capacity(QUIC_CONTEXT_CAPACITY),
             connection_tx_ready: Vec::with_capacity(QUIC_CONTEXT_CAPACITY),
@@ -544,8 +561,8 @@ impl QuicWorker {
         now: Instant,
     ) -> RuntimeResult<()> {
         let mut consumed = 0usize;
-        for _ in 0..RX_DATAGRAM_BURST {
-            let (header, data, record_len) = {
+        for datagram_slot in 0..RX_DATAGRAM_BURST {
+            let (header, payload_len, record_len) = {
                 let (rx_fifo, _) = sessions.fifo_pair(lower_session).ok_or_else(|| {
                     QuicWorkerError::SessionMissing {
                         session: lower_session,
@@ -577,17 +594,44 @@ impl QuicWorker {
                     consumed = consumed.saturating_add(record_len);
                     continue;
                 }
-                let mut data = BytesMut::with_capacity(payload_len);
-                data.resize(payload_len, 0);
-                let copied = rx_fifo.peek(SessionDgramHeader::SIZE, payload_len, &mut data[..]);
-                if copied != payload_len {
-                    break;
-                }
-                (header, data, record_len)
+                (header, payload_len, record_len)
             };
+            let Some(mut scratch) = self.rx_datagrams[datagram_slot].take() else {
+                panic!("QUIC RX datagram scratch slot {datagram_slot} is already in use");
+            };
+            let copied = match sessions.fifo_pair(lower_session) {
+                Some((rx_fifo, _)) => rx_fifo.peek(
+                    SessionDgramHeader::SIZE,
+                    payload_len,
+                    &mut scratch.data[..payload_len],
+                ),
+                None => {
+                    self.rx_datagrams[datagram_slot] = Some(scratch);
+                    return Err(QuicWorkerError::SessionMissing {
+                        session: lower_session,
+                    }
+                    .into());
+                }
+            };
+            if copied != payload_len {
+                self.rx_datagrams[datagram_slot] = Some(scratch);
+                break;
+            }
             let remote = header.remote();
             let local = header.local();
-            self.process_one_datagram(sessions, context, local, remote, data, now)?;
+            let mut packet_descriptors = std::mem::take(&mut self.rx_packet_descriptors);
+            let process_result = self.process_one_datagram(
+                sessions,
+                context,
+                local,
+                remote,
+                &mut scratch.data[..payload_len],
+                &mut packet_descriptors,
+                now,
+            );
+            self.rx_packet_descriptors = packet_descriptors;
+            self.rx_datagrams[datagram_slot] = Some(scratch);
+            process_result?;
             sessions
                 .fifo_pair(lower_session)
                 .map(|(rx, _)| rx.dequeue_drop(record_len))
@@ -608,7 +652,8 @@ impl QuicWorker {
         context: ContextId,
         local: SocketAddr,
         remote: SocketAddr,
-        data: BytesMut,
+        data: &mut [u8],
+        packet_descriptors: &mut Vec<PartialDecode>,
         now: Instant,
     ) -> RuntimeResult<()> {
         let has_connection = self
@@ -619,7 +664,15 @@ impl QuicWorker {
             .map(|engine| engine.connection.is_some())
             .unwrap_or(false);
         if !has_connection {
-            return self.accept_first_datagram(sessions, context, local, remote, data, now);
+            return self.accept_first_datagram(
+                sessions,
+                context,
+                local,
+                remote,
+                data,
+                packet_descriptors,
+                now,
+            );
         }
         let mut engine = self
             .contexts
@@ -639,7 +692,7 @@ impl QuicWorker {
                 .as_mut()
                 .ok_or_else(|| QuicWorkerError::ConnectionMissing)?;
             let local_side = connection.side();
-            connection.handle_datagram_with_stream_setup(now, remote, None, data, |stream| {
+            let mut stream_setup = |stream| {
                 self.create_stream_context_with_io(
                     sessions,
                     context,
@@ -651,7 +704,15 @@ impl QuicWorker {
                     io_table,
                 )
                 .map_err(|_| quinn_proto::StreamDataError::StreamMissing { stream })
-            });
+            };
+            connection.handle_datagram_with_stream_setup_scratch(
+                now,
+                remote,
+                None,
+                data,
+                packet_descriptors,
+                &mut stream_setup,
+            );
             connection.take_stream_data_error()
         };
         self.contexts
@@ -672,7 +733,8 @@ impl QuicWorker {
         context: ContextId,
         local: SocketAddr,
         remote: SocketAddr,
-        data: BytesMut,
+        data: &mut [u8],
+        packet_descriptors: &mut Vec<PartialDecode>,
         now: Instant,
     ) -> RuntimeResult<()> {
         let server_config = self
@@ -684,12 +746,13 @@ impl QuicWorker {
             .ok_or(QuicWorkerError::ServerConfigMissing { context })?;
         self.endpoint
             .set_server_config(Some(Arc::clone(&server_config)));
-        let event = self.endpoint.handle(
+        let event = self.endpoint.handle_scratch_with_descriptors(
             now,
             remote,
             Some(local.ip()),
             None,
             data,
+            packet_descriptors,
             &mut *self.tx_bufs,
         );
         let Some(event) = event else {

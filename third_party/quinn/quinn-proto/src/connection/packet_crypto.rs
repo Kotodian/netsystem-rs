@@ -1,4 +1,4 @@
-use tracing::{debug, trace};
+use tracing::debug;
 
 use crate::connection::spaces::PacketSpace;
 use crate::crypto::{HeaderKey, KeyPair, PacketKey};
@@ -10,6 +10,7 @@ use crate::{TransportError, RESET_TOKEN_SIZE};
 /// Removes header protection of a packet, or returns `None` if the packet was dropped
 pub(super) fn unprotect_header(
     partial_decode: PartialDecode,
+    scratch: &mut [u8],
     spaces: &[PacketSpace; 3],
     zero_rtt_crypto: Option<&ZeroRttCrypto>,
     stateless_reset_token: Option<ResetToken>,
@@ -37,11 +38,11 @@ pub(super) fn unprotect_header(
         None
     };
 
-    let packet = partial_decode.data();
+    let packet = partial_decode.data(scratch);
     let stateless_reset = packet.len() >= RESET_TOKEN_SIZE + 5
         && stateless_reset_token.as_deref() == Some(&packet[packet.len() - RESET_TOKEN_SIZE..]);
 
-    match partial_decode.finish(header_crypto) {
+    match partial_decode.finish(scratch, header_crypto) {
         Ok(packet) => Some(UnprotectHeaderResult {
             packet: Some(packet),
             stateless_reset,
@@ -50,10 +51,7 @@ pub(super) fn unprotect_header(
             packet: None,
             stateless_reset: true,
         }),
-        Err(e) => {
-            trace!("unable to complete packet decoding: {}", e);
-            None
-        }
+        Err(_) => None,
     }
 }
 
@@ -111,10 +109,7 @@ pub(super) fn decrypt_packet_body(
 
     let payload_len = crypto
         .decrypt(number, &packet.header_data, packet.payload.as_mut())
-        .map_err(|_| {
-            trace!("decryption failed with packet number {}", number);
-            None
-        })?;
+        .map_err(|_| None)?;
     packet.payload.truncate(payload_len);
 
     if !packet.reserved_bits_valid() {

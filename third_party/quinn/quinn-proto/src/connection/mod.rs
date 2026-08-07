@@ -91,6 +91,8 @@ mod timer;
 use crate::congestion::Controller;
 use timer::{Timer, TimerTable};
 
+const MAX_RX_PACKET_DESCRIPTORS: usize = 64;
+
 /// Protocol state and logic for a single QUIC connection
 ///
 /// Objects of this type receive [`ConnectionEvent`]s and emit [`EndpointEvent`]s and application
@@ -459,31 +461,64 @@ impl Connection {
         now: Instant,
         remote: SocketAddr,
         ecn: Option<EcnCodepoint>,
-        data: BytesMut,
+        mut data: BytesMut,
         mut prepare_stream: F,
     ) where
         F: FnMut(StreamId) -> Result<(), StreamDataError>,
     {
-        let (first_decode, remaining) = match PartialDecode::new(
-            data,
-            &FixedLengthConnectionIdParser::new(self.local_cid_state.cid_len()),
-            &[self.version],
-            self.endpoint_config.grease_quic_bit,
-        ) {
-            Ok(decoded) => decoded,
-            Err(error) => {
-                trace!("malformed QUIC datagram: {}", error);
-                return;
-            }
-        };
-        self.handle_datagram_decodes(
+        let mut packet_descriptors = Vec::with_capacity(MAX_RX_PACKET_DESCRIPTORS);
+        self.handle_datagram_with_stream_setup_scratch(
             now,
             remote,
             ecn,
-            first_decode,
-            remaining,
+            &mut data,
+            &mut packet_descriptors,
             &mut prepare_stream,
         );
+    }
+
+    /// Process a connected datagram from caller-owned worker scratch.
+    pub fn handle_datagram_with_stream_setup_scratch<F>(
+        &mut self,
+        now: Instant,
+        remote: SocketAddr,
+        ecn: Option<EcnCodepoint>,
+        data: &mut [u8],
+        packet_descriptors: &mut Vec<PartialDecode>,
+        prepare_stream: &mut F,
+    ) where
+        F: FnMut(StreamId) -> Result<(), StreamDataError>,
+    {
+        if data.is_empty() {
+            packet_descriptors.clear();
+            return;
+        }
+        packet_descriptors.clear();
+        let mut offset = 0;
+        while offset < data.len() {
+            let (partial_decode, remaining) = match PartialDecode::new(
+                &data[offset..],
+                offset,
+                &FixedLengthConnectionIdParser::new(self.local_cid_state.cid_len()),
+                &[self.version],
+                self.endpoint_config.grease_quic_bit,
+            ) {
+                Ok(decoded) => decoded,
+                Err(_) => {
+                    self.stats.udp_rx.on_packet_drop();
+                    packet_descriptors.clear();
+                    return;
+                }
+            };
+            if packet_descriptors.len() == packet_descriptors.capacity() {
+                self.stats.udp_rx.on_packet_drop();
+                packet_descriptors.clear();
+                return;
+            }
+            packet_descriptors.push(partial_decode);
+            offset = remaining.map_or(data.len(), |range| range.start);
+        }
+        self.handle_decoded_datagram(now, remote, ecn, packet_descriptors, data, prepare_stream);
     }
 
     /// Provide control over streams
@@ -1179,6 +1214,7 @@ impl Connection {
                 ecn,
                 first_decode,
                 remaining,
+                mut data,
             }) => {
                 self.handle_datagram_decodes(
                     now,
@@ -1186,6 +1222,7 @@ impl Connection {
                     ecn,
                     first_decode,
                     remaining,
+                    &mut data,
                     &mut |_| Ok(()),
                 );
             }
@@ -2307,7 +2344,52 @@ impl Connection {
         remote: SocketAddr,
         ecn: Option<EcnCodepoint>,
         first_decode: PartialDecode,
-        remaining: Option<BytesMut>,
+        remaining: Option<std::ops::Range<usize>>,
+        scratch: &mut [u8],
+        prepare_stream: &mut F,
+    ) where
+        F: FnMut(StreamId) -> Result<(), StreamDataError>,
+    {
+        let mut packet_descriptors = Vec::with_capacity(1 + usize::from(remaining.is_some()));
+        packet_descriptors.push(first_decode);
+        if let Some(range) = remaining {
+            let mut offset = range.start;
+            while offset < scratch.len() {
+                match PartialDecode::new(
+                    &scratch[offset..],
+                    offset,
+                    &FixedLengthConnectionIdParser::new(self.local_cid_state.cid_len()),
+                    &[self.version],
+                    self.endpoint_config.grease_quic_bit,
+                ) {
+                    Ok((partial_decode, rest)) => {
+                        packet_descriptors.push(partial_decode);
+                        offset = rest.map_or(scratch.len(), |next| next.start);
+                    }
+                    Err(_) => {
+                        self.stats.udp_rx.on_packet_drop();
+                        return;
+                    }
+                }
+            }
+        }
+        self.handle_decoded_datagram(
+            now,
+            remote,
+            ecn,
+            &mut packet_descriptors,
+            scratch,
+            prepare_stream,
+        );
+    }
+
+    fn handle_decoded_datagram<F>(
+        &mut self,
+        now: Instant,
+        remote: SocketAddr,
+        ecn: Option<EcnCodepoint>,
+        packet_descriptors: &mut Vec<PartialDecode>,
+        scratch: &mut [u8],
         prepare_stream: &mut F,
     ) where
         F: FnMut(StreamId) -> Result<(), StreamDataError>,
@@ -2316,26 +2398,30 @@ impl Connection {
         // forbids migration, drop the datagram. This could be relaxed to heuristically
         // permit NAT-rebinding-like migration.
         if remote != self.path.remote && !self.side.remote_may_migrate() {
-            trace!("discarding packet from unrecognized peer {}", remote);
+            self.stats.udp_rx.on_packet_drop();
             return;
         }
 
         let was_anti_amplification_blocked = self.path.anti_amplification_blocked(1);
 
         self.stats.udp_rx.datagrams += 1;
-        self.stats.udp_rx.bytes += first_decode.len() as u64;
-        let data_len = first_decode.len();
+        self.stats.udp_rx.bytes += scratch.len() as u64;
 
-        self.handle_decode_with_stream_setup(now, remote, ecn, first_decode, prepare_stream);
-        // The current `path` might have changed inside `handle_decode`,
-        // since the packet could have triggered a migration. Make sure
-        // the data received is accounted for the most recent path by accessing
-        // `path` after `handle_decode`.
-        self.path.total_recvd = self.path.total_recvd.saturating_add(data_len as u64);
-
-        if let Some(data) = remaining {
-            self.stats.udp_rx.bytes += data.len() as u64;
-            self.handle_coalesced_with_stream_setup(now, remote, ecn, data, prepare_stream);
+        for partial_decode in packet_descriptors.drain(..) {
+            let data_len = partial_decode.len();
+            self.handle_decode_with_stream_setup(
+                now,
+                remote,
+                ecn,
+                partial_decode,
+                scratch,
+                prepare_stream,
+            );
+            // The current `path` might have changed inside `handle_decode`,
+            // since the packet could have triggered a migration. Make sure
+            // the data received is accounted for the most recent path by accessing
+            // `path` after `handle_decode`.
+            self.path.total_recvd = self.path.total_recvd.saturating_add(data_len as u64);
         }
 
         self.config.qlog_sink.emit_recovery_metrics(
@@ -2360,7 +2446,8 @@ impl Connection {
         ecn: Option<EcnCodepoint>,
         data: BytesMut,
     ) {
-        self.handle_coalesced_with_stream_setup(now, remote, ecn, data, &mut |_| Ok(()));
+        let mut data = data;
+        self.handle_coalesced_with_stream_setup(now, remote, ecn, &mut data, 0, &mut |_| Ok(()));
     }
 
     fn handle_coalesced_with_stream_setup<F>(
@@ -2368,32 +2455,37 @@ impl Connection {
         now: Instant,
         remote: SocketAddr,
         ecn: Option<EcnCodepoint>,
-        data: BytesMut,
+        data: &mut [u8],
+        mut offset: usize,
         prepare_stream: &mut F,
     ) where
         F: FnMut(StreamId) -> Result<(), StreamDataError>,
     {
-        self.path.total_recvd = self.path.total_recvd.saturating_add(data.len() as u64);
-        let mut remaining = Some(data);
-        while let Some(data) = remaining {
+        self.path.total_recvd = self
+            .path
+            .total_recvd
+            .saturating_add((data.len() - offset) as u64);
+        while offset < data.len() {
             match PartialDecode::new(
-                data,
+                &data[offset..],
+                offset,
                 &FixedLengthConnectionIdParser::new(self.local_cid_state.cid_len()),
                 &[self.version],
                 self.endpoint_config.grease_quic_bit,
             ) {
                 Ok((partial_decode, rest)) => {
-                    remaining = rest;
+                    offset = rest.map_or(data.len(), |range| range.start);
                     self.handle_decode_with_stream_setup(
                         now,
                         remote,
                         ecn,
                         partial_decode,
+                        data,
                         prepare_stream,
                     );
                 }
-                Err(e) => {
-                    trace!("malformed header: {}", e);
+                Err(_) => {
+                    self.stats.udp_rx.on_packet_drop();
                     return;
                 }
             }
@@ -2406,16 +2498,22 @@ impl Connection {
         remote: SocketAddr,
         ecn: Option<EcnCodepoint>,
         partial_decode: PartialDecode,
+        scratch: &mut [u8],
         prepare_stream: &mut F,
     ) where
         F: FnMut(StreamId) -> Result<(), StreamDataError>,
     {
-        if let Some(decoded) = packet_crypto::unprotect_header(
+        let decoded = packet_crypto::unprotect_header(
             partial_decode,
+            scratch,
             &self.spaces,
             self.zero_rtt_crypto.as_ref(),
             self.peer_params.stateless_reset_token,
-        ) {
+        );
+        if decoded.is_none() {
+            self.stats.udp_rx.on_packet_drop();
+        }
+        if let Some(decoded) = decoded {
             self.handle_packet_with_stream_setup(
                 now,
                 remote,
@@ -2473,7 +2571,7 @@ impl Connection {
                 Err(e.into())
             }
             Err(None) => {
-                debug!("failed to authenticate packet");
+                self.stats.udp_rx.on_packet_drop();
                 self.authentication_failures += 1;
                 let integrity_limit = self.spaces[self.highest_space]
                     .crypto
@@ -2501,7 +2599,7 @@ impl Connection {
                     return;
                 } else if self.state.is_handshake() && packet.header.is_short() {
                     // TODO: SHOULD buffer these to improve reordering tolerance.
-                    trace!("dropping short packet during handshake");
+                    self.stats.udp_rx.on_packet_drop();
                     return;
                 } else {
                     if let Header::Initial(InitialHeader { ref token, .. }) = packet.header {
@@ -2628,7 +2726,7 @@ impl Connection {
                     )?,
                     _ if packet.header.has_frames() => self.process_early_payload(now, packet)?,
                     _ => {
-                        trace!("discarding unexpected pre-handshake packet");
+                        self.stats.udp_rx.on_packet_drop();
                     }
                 }
                 return Ok(());
@@ -2677,7 +2775,7 @@ impl Connection {
                                 &packet.payload,
                             )
                 {
-                    trace!("discarding invalid Retry");
+                    self.stats.udp_rx.on_packet_drop();
                     // - After the client has received and processed an Initial or Retry
                     //   packet from the server, it MUST discard any subsequent Retry
                     //   packets that it receives.
@@ -3824,8 +3922,13 @@ impl Connection {
             panic!("Packets should never be coalesced in tests");
         }
 
+        let mut scratch = match &event.0 {
+            ConnectionEventInner::Datagram(DatagramConnectionEvent { data, .. }) => data.clone(),
+            _ => return None,
+        };
         let decrypted_header = packet_crypto::unprotect_header(
             first_decode.clone(),
+            &mut scratch,
             &self.spaces,
             self.zero_rtt_crypto.as_ref(),
             self.peer_params.stateless_reset_token,

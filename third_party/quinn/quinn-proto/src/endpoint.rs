@@ -143,24 +143,55 @@ impl Endpoint {
         remote: SocketAddr,
         local_ip: Option<IpAddr>,
         ecn: Option<EcnCodepoint>,
-        data: BytesMut,
+        mut data: BytesMut,
+        buf: &mut Vec<u8>,
+    ) -> Option<DatagramEvent> {
+        self.handle_scratch(now, remote, local_ip, ecn, &mut data, buf)
+    }
+
+    /// Process an incoming UDP datagram from caller-owned worker scratch.
+    pub fn handle_scratch(
+        &mut self,
+        now: Instant,
+        remote: SocketAddr,
+        local_ip: Option<IpAddr>,
+        ecn: Option<EcnCodepoint>,
+        data: &mut [u8],
+        buf: &mut Vec<u8>,
+    ) -> Option<DatagramEvent> {
+        let mut packet_descriptors = Vec::with_capacity(1);
+        self.handle_scratch_with_descriptors(
+            now,
+            remote,
+            local_ip,
+            ecn,
+            data,
+            &mut packet_descriptors,
+            buf,
+        )
+    }
+
+    /// Process a scratch datagram while reusing the caller's packet descriptors.
+    pub fn handle_scratch_with_descriptors(
+        &mut self,
+        now: Instant,
+        remote: SocketAddr,
+        local_ip: Option<IpAddr>,
+        ecn: Option<EcnCodepoint>,
+        data: &mut [u8],
+        packet_descriptors: &mut Vec<PartialDecode>,
         buf: &mut Vec<u8>,
     ) -> Option<DatagramEvent> {
         // Partially decode packet or short-circuit if unable
         let datagram_len = data.len();
-        let event = match PartialDecode::new(
+        let (first_decode, remaining) = match PartialDecode::new(
             data,
+            0,
             &FixedLengthConnectionIdParser::new(self.local_cid_generator.cid_len()),
             &self.config.supported_versions,
             self.config.grease_quic_bit,
         ) {
-            Ok((first_decode, remaining)) => DatagramConnectionEvent {
-                now,
-                remote,
-                ecn,
-                first_decode,
-                remaining,
-            },
+            Ok(decoded) => decoded,
             Err(PacketDecodeError::UnsupportedVersion {
                 src_cid,
                 dst_cid,
@@ -194,16 +225,29 @@ impl Endpoint {
                     src_ip: local_ip,
                 }));
             }
-            Err(e) => {
-                trace!("malformed header: {}", e);
+            Err(_) => {
                 return None;
             }
         };
+        packet_descriptors.clear();
+        packet_descriptors.push(first_decode);
+        let first_decode = match packet_descriptors.pop() {
+            Some(descriptor) => descriptor,
+            None => return None,
+        };
 
         let addresses = FourTuple { remote, local_ip };
-        let dst_cid = event.first_decode.dst_cid();
+        let dst_cid = first_decode.dst_cid();
 
-        if let Some(route_to) = self.index.get(&addresses, &event.first_decode) {
+        if let Some(route_to) = self.index.get(&addresses, &first_decode, data) {
+            let event = DatagramConnectionEvent {
+                now,
+                remote,
+                ecn,
+                data: BytesMut::from(&*data),
+                first_decode,
+                remaining,
+            };
             // Handle packet on existing connection
             match route_to {
                 RouteDatagramTo::Incoming(incoming_idx) => {
@@ -231,23 +275,29 @@ impl Endpoint {
                     ConnectionEvent(ConnectionEventInner::Datagram(event)),
                 )),
             }
-        } else if event.first_decode.initial_header().is_some() {
+        } else if first_decode.initial_header().is_some() {
             // Potentially create a new connection
-
-            self.handle_first_packet(datagram_len, event, addresses, buf)
-        } else if event.first_decode.has_long_header() {
+            self.handle_first_packet_scratch(
+                datagram_len,
+                now,
+                ecn,
+                first_decode,
+                remaining,
+                data,
+                addresses,
+                buf,
+            )
+        } else if first_decode.has_long_header() {
             debug!(
                 "ignoring non-initial packet for unknown connection {}",
                 dst_cid
             );
             None
-        } else if !event.first_decode.is_initial()
-            && self.local_cid_generator.validate(dst_cid).is_err()
+        } else if !first_decode.is_initial() && self.local_cid_generator.validate(dst_cid).is_err()
         {
             debug!("dropping packet with invalid CID");
             None
         } else if dst_cid.is_empty() {
-            trace!("dropping unrecognized short packet without ID");
             None
         } else {
             // If we got this far, we're receiving a seemingly valid packet for an unknown
@@ -413,20 +463,24 @@ impl Endpoint {
         }
     }
 
-    fn handle_first_packet(
+    fn handle_first_packet_scratch(
         &mut self,
         datagram_len: usize,
-        event: DatagramConnectionEvent,
+        now: Instant,
+        ecn: Option<EcnCodepoint>,
+        first_decode: PartialDecode,
+        remaining: Option<std::ops::Range<usize>>,
+        scratch: &mut [u8],
         addresses: FourTuple,
         buf: &mut Vec<u8>,
     ) -> Option<DatagramEvent> {
-        let dst_cid = event.first_decode.dst_cid();
-        let header = event.first_decode.initial_header().unwrap();
+        let dst_cid = first_decode.dst_cid();
+        let header = first_decode.initial_header().unwrap().clone();
 
         let Some(server_config) = &self.server_config else {
             debug!("packet for unrecognized connection {}", dst_cid);
             return self
-                .stateless_reset(event.now, datagram_len, addresses, *dst_cid, buf)
+                .stateless_reset(now, datagram_len, addresses, *dst_cid, buf)
                 .map(DatagramEvent::Response);
         };
 
@@ -448,7 +502,7 @@ impl Endpoint {
             }
         };
 
-        if let Err(reason) = self.early_validate_first_packet(header) {
+        if let Err(reason) = self.early_validate_first_packet(&header) {
             return Some(DatagramEvent::Response(self.initial_close(
                 header.version,
                 addresses,
@@ -459,10 +513,9 @@ impl Endpoint {
             )));
         }
 
-        let packet = match event.first_decode.finish(Some(&*crypto.header.remote)) {
+        let packet = match first_decode.finish(scratch, Some(&*crypto.header.remote)) {
             Ok(packet) => packet,
-            Err(e) => {
-                trace!("unable to decode initial packet: {}", e);
+            Err(_) => {
                 return None;
             }
         };
@@ -498,15 +551,15 @@ impl Endpoint {
             .insert_initial_incoming(header.dst_cid, incoming_idx);
 
         Some(DatagramEvent::NewConnection(Incoming {
-            received_at: event.now,
+            received_at: now,
             addresses,
-            ecn: event.ecn,
+            ecn,
             packet: InitialPacket {
                 header,
                 header_data: packet.header_data,
                 payload: packet.payload,
             },
-            rest: event.remaining,
+            rest: remaining.map(|range| BytesMut::from(&scratch[range])),
             crypto,
             token,
             incoming_idx,
@@ -1064,7 +1117,12 @@ impl ConnectionIndex {
     }
 
     /// Find the existing connection that `datagram` should be routed to, if any
-    fn get(&self, addresses: &FourTuple, datagram: &PartialDecode) -> Option<RouteDatagramTo> {
+    fn get(
+        &self,
+        addresses: &FourTuple,
+        datagram: &PartialDecode,
+        scratch: &[u8],
+    ) -> Option<RouteDatagramTo> {
         if !datagram.dst_cid().is_empty() {
             if let Some(&ch) = self.connection_ids.get(datagram.dst_cid()) {
                 return Some(RouteDatagramTo::Connection(ch));
@@ -1083,7 +1141,7 @@ impl ConnectionIndex {
                 return Some(RouteDatagramTo::Connection(ch));
             }
         }
-        let data = datagram.data();
+        let data = datagram.data(scratch);
         if data.len() < RESET_TOKEN_SIZE {
             return None;
         }

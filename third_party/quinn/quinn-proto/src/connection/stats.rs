@@ -16,6 +16,8 @@ pub struct UdpStats {
     ///
     /// Can be less than `datagrams` when GSO, GRO, and/or batched system calls are in use.
     pub ios: u64,
+    /// The number of packets discarded before protocol processing.
+    pub packet_drops: u64,
 }
 
 impl UdpStats {
@@ -23,6 +25,10 @@ impl UdpStats {
         self.datagrams += datagrams;
         self.bytes += bytes as u64;
         self.ios += 1;
+    }
+
+    pub(crate) fn on_packet_drop(&mut self) {
+        self.packet_drops += 1;
     }
 }
 
