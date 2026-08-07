@@ -1595,7 +1595,7 @@ pub fn session_app(args: TokenStream, input: TokenStream) -> TokenStream {
             let __hammer_context = if __hammer_context == 0 {
                 let (__hammer_application, __hammer_app, __hammer_config, __hammer_server_name) =
                     __hammer_worker
-                        .session_app_facts(__hammer_session)
+                        .session_app_selection(__hammer_session)
                         .ok_or(::hammer_service::session::SessionQueueError::SessionAppContextCreateUnsupported)?;
                 let __hammer_app_state =
                     <#ident as ::hammer_service::session::protocol::SessionApp>::create(
@@ -1648,7 +1648,7 @@ pub fn session_app(args: TokenStream, input: TokenStream) -> TokenStream {
             let __hammer_context = if __hammer_context == 0 {
                 let (__hammer_application, __hammer_app, __hammer_config, __hammer_server_name) =
                     __hammer_worker
-                        .session_app_facts(__hammer_session)
+                        .session_app_selection(__hammer_session)
                         .ok_or(::hammer_service::session::SessionQueueError::SessionAppContextCreateUnsupported)?;
                 let __hammer_app_state =
                     <#ident as ::hammer_service::session::protocol::SessionApp>::create(

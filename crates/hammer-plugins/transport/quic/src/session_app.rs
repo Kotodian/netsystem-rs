@@ -56,7 +56,15 @@ fn accept(
     session: SessionId,
     context: SessionAppContext,
 ) -> RuntimeResult<()> {
-    let listener = ContextId::from(context);
+    let listener = if context == 0 {
+        worker
+            .session_app_selection(session)
+            .and_then(|(_, _, config, _)| config)
+            .ok_or_else(|| QuicSessionError::ContextMissing { session })?
+    } else {
+        context
+    };
+    let listener = ContextId::from(listener);
     let connection = with_quic_worker(worker, |quic| quic.accept_connection(session, listener))?;
     publish_context(worker, session, connection)
 }

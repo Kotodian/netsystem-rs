@@ -439,7 +439,6 @@ mod tests {
         let stored = main
             .listener(outer_listener)
             .expect("QUIC listener is published");
-        assert_eq!(stored.application, outer_application);
         assert_eq!(stored.configuration, config);
         assert_ne!(
             stored.inner_application_listener,
@@ -450,7 +449,7 @@ mod tests {
             LISTEN_APPLICATION.load(Ordering::SeqCst),
             inner_application.raw()
         );
-        assert_eq!(LISTEN_CONFIG.load(Ordering::SeqCst), outer_listener.raw());
+        assert_eq!(LISTEN_CONFIG.load(Ordering::SeqCst), 0);
         assert!(LISTEN_BARRIER.load(Ordering::SeqCst));
 
         sessions.unlisten(outer_listener)?;

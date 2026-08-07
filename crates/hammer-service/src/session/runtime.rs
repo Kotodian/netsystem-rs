@@ -1196,7 +1196,7 @@ impl<Index: Copy + Eq> SessionWorker<Index> {
     }
 
     #[inline]
-    pub fn session_app_facts(
+    pub fn session_app_selection(
         &self,
         session_id: SessionId,
     ) -> Option<(
@@ -1221,7 +1221,7 @@ impl<Index: Copy + Eq> SessionWorker<Index> {
         context: SessionAppContext,
     ) -> RuntimeResult<SessionId> {
         let (application, app, _config, _server_name) = self
-            .session_app_facts(lower)
+            .session_app_selection(lower)
             .ok_or(SessionError::SessionMissing { session_id: lower })?;
         let Some(app) = app else {
             return Err(SessionError::SessionMissing { session_id: lower }.into());
