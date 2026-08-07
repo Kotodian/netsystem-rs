@@ -27,6 +27,7 @@ mod state;
 pub use state::StreamsState;
 
 mod stream_data_io;
+pub(crate) use state::StreamReceiveError;
 pub use stream_data_io::{StreamDataError, StreamDataIo};
 
 /// Access to streams

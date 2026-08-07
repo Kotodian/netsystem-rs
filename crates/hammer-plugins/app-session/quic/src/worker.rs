@@ -8,7 +8,7 @@ use std::time::{Duration, Instant};
 use bytes::BytesMut;
 use hammer_core::data_plane::BufferFrame;
 use hammer_infra::bytes::BytesBuffer;
-use hammer_infra::fifo::FifoError;
+use hammer_infra::fifo::{Fifo, FifoError};
 use hammer_infra::pool::{Index, Pool};
 use hammer_infra::thread_owned::ThreadOwnedError;
 use hammer_infra::timer_wheel::TimerWheel1t2w2048sl;
@@ -621,15 +621,48 @@ impl QuicWorker {
         if !has_connection {
             return self.accept_first_datagram(sessions, context, local, remote, data, now);
         }
-        let engine = self
+        let mut engine = self
             .contexts
             .get_mut(context.into())
             .ok_or_else(|| QuicWorkerError::ContextMissing { context })?
-            .engine_mut(context)?;
+            .connection_mut()
+            .and_then(|connection| connection.engine.take())
+            .ok_or(QuicWorkerError::EngineMissing { context })?;
         engine.remote = Some(remote);
         engine.local = Some(local);
-        let connection = engine.connection_mut()?;
-        connection.handle_datagram(now, remote, None, data);
+        let application = engine.application;
+        let app = engine.app;
+        let opaque = engine.opaque;
+        let stream_error = {
+            let (connection, io_table) = (&mut engine.connection, &mut engine.io_table);
+            let connection = connection
+                .as_mut()
+                .ok_or_else(|| QuicWorkerError::ConnectionMissing)?;
+            let local_side = connection.side();
+            connection.handle_datagram_with_stream_setup(now, remote, None, data, |stream| {
+                self.create_stream_context_with_io(
+                    sessions,
+                    context,
+                    stream,
+                    stream.initiator() != local_side,
+                    application,
+                    app,
+                    opaque,
+                    io_table,
+                )
+                .map_err(|_| quinn_proto::StreamDataError::StreamMissing { stream })
+            });
+            connection.take_stream_data_error()
+        };
+        self.contexts
+            .get_mut(context.into())
+            .ok_or_else(|| QuicWorkerError::ContextMissing { context })?
+            .connection_mut()
+            .ok_or_else(|| QuicWorkerError::ContextMissing { context })?
+            .engine = Some(engine);
+        if let Some(error) = stream_error {
+            return Err(QuicWorkerError::StreamData { context, error }.into());
+        }
         self.drain_connection_events(sessions, context, now)
     }
 
@@ -808,15 +841,30 @@ impl QuicWorker {
         let mut to_close = None;
         match event {
             StreamEvent::Opened { dir } => {
-                let streams = self
-                    .contexts
-                    .get_mut(context.into())
-                    .and_then(Context::connection_mut)
-                    .and_then(|connection| connection.engine.as_mut())
-                    .and_then(|engine| engine.connection_mut().ok())
-                    .ok_or_else(|| QuicWorkerError::ContextMissing { context })?;
-                while let Some(stream) = streams.streams().accept(dir) {
-                    to_create.push((stream, true));
+                let mut accepted_streams = Vec::new();
+                {
+                    let streams = self
+                        .contexts
+                        .get_mut(context.into())
+                        .and_then(Context::connection_mut)
+                        .and_then(|connection| connection.engine.as_mut())
+                        .and_then(|engine| engine.connection_mut().ok())
+                        .ok_or_else(|| QuicWorkerError::ContextMissing { context })?;
+                    while let Some(stream) = streams.streams().accept(dir) {
+                        accepted_streams.push(stream);
+                    }
+                }
+                for stream in accepted_streams {
+                    let missing = self
+                        .contexts
+                        .get(context.into())
+                        .and_then(Context::connection)
+                        .and_then(|connection| connection.engine.as_ref())
+                        .map(|engine| engine.io_table.stream_session(stream).is_none())
+                        .unwrap_or(true);
+                    if missing {
+                        to_create.push((stream, true));
+                    }
                 }
             }
             StreamEvent::Readable { id } | StreamEvent::Writable { id } => {
@@ -908,6 +956,76 @@ impl QuicWorker {
             .as_ref()
             .map(|engine| (engine.application, engine.app, engine.opaque))
             .unwrap_or((ApplicationId::new(0, 0), None, None));
+        let (stream_context, session_id, rx_fifo, tx_fifo, app_tx_data_len) = self
+            .allocate_stream_context(
+                sessions,
+                context,
+                stream,
+                accepted,
+                application,
+                app,
+                opaque,
+            )?;
+        let engine = self
+            .contexts
+            .get_mut(context.into())
+            .ok_or_else(|| QuicWorkerError::ContextMissing { context })?
+            .engine_mut(context)?;
+        engine.io_table.install_stream(
+            stream,
+            stream_context,
+            session_id,
+            rx_fifo,
+            tx_fifo,
+            0,
+            app_tx_data_len,
+        );
+        Ok(())
+    }
+
+    fn create_stream_context_with_io(
+        &mut self,
+        sessions: &mut SessionWorker<Index>,
+        context: ContextId,
+        stream: quinn_proto::StreamId,
+        accepted: bool,
+        application: ApplicationId,
+        app: Option<SessionAppId>,
+        opaque: Option<u64>,
+        io_table: &mut StreamIoTable,
+    ) -> RuntimeResult<()> {
+        let (stream_context, session_id, rx_fifo, tx_fifo, app_tx_data_len) = self
+            .allocate_stream_context(
+                sessions,
+                context,
+                stream,
+                accepted,
+                application,
+                app,
+                opaque,
+            )?;
+        io_table.install_stream(
+            stream,
+            stream_context,
+            session_id,
+            rx_fifo,
+            tx_fifo,
+            0,
+            app_tx_data_len,
+        );
+        Ok(())
+    }
+
+    fn allocate_stream_context(
+        &mut self,
+        sessions: &mut SessionWorker<Index>,
+        context: ContextId,
+        stream: quinn_proto::StreamId,
+        accepted: bool,
+        application: ApplicationId,
+        app: Option<SessionAppId>,
+        opaque: Option<u64>,
+    ) -> RuntimeResult<(Index, SessionId, Arc<Fifo>, Arc<Fifo>, u64)> {
         let parent = context.into();
         let session_id = sessions.construct_transport_session(
             QuicWorker::ID,
@@ -926,31 +1044,30 @@ impl QuicWorker {
                 session: session_id,
             })?;
         let app_tx_data_len = tx_fifo.max_dequeue() as u64;
-        let stream_context = self
+        let Some(stream_context) = self
             .contexts
             .insert(Context::stream(parent, session_id, stream))
-            .ok_or_else(|| QuicWorkerError::ContextCapacityExhausted {
+        else {
+            if let Err(cleanup_error) = sessions.rollback_session_creation(session_id) {
+                tracing::error!(
+                    ?context,
+                    ?stream,
+                    %cleanup_error,
+                    "QUIC stream Session rollback failed after context capacity exhaustion"
+                );
+            }
+            return Err(QuicWorkerError::ContextCapacityExhausted {
                 capacity: self.contexts.capacity(),
-            })?;
-        let engine = self
-            .contexts
-            .get_mut(context.into())
-            .ok_or_else(|| QuicWorkerError::ContextMissing { context })?
-            .engine_mut(context)?;
-        if let Err(_error) = engine.io_table.drain_pending(
-            stream,
+            }
+            .into());
+        };
+        Ok((
             stream_context,
             session_id,
-            Arc::clone(&rx_fifo),
-            Arc::clone(&tx_fifo),
-            0,
+            rx_fifo,
+            tx_fifo,
             app_tx_data_len,
-        ) {
-            self.contexts.remove(stream_context);
-            sessions.rollback_session_creation(session_id)?;
-            return Err(QuicWorkerError::StreamSessionCreationFailed { context, stream }.into());
-        }
-        Ok(())
+        ))
     }
 
     fn drain_io_events(
@@ -1464,11 +1581,6 @@ pub(super) enum QuicWorkerError {
         bytes: usize,
         #[source]
         source: FifoError,
-    },
-    #[error("QUIC stream Session creation failed for context {context:?} stream {stream:?}")]
-    StreamSessionCreationFailed {
-        context: ContextId,
-        stream: quinn_proto::StreamId,
     },
     #[error("QUIC timer update failed for context {context:?}")]
     TimerUpdateFailed { context: ContextId },

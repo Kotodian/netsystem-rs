@@ -22,13 +22,6 @@ pub(super) struct StreamIoEntry {
 }
 
 #[derive(Debug)]
-pub(super) struct PendingRx {
-    pub(super) stream: StreamId,
-    pub(super) offset: u64,
-    pub(super) bytes: Vec<u8>,
-}
-
-#[derive(Debug)]
 pub(super) struct StreamIoEvent {
     pub(super) context: Index,
     pub(super) session: SessionId,
@@ -39,14 +32,12 @@ pub(super) struct StreamIoEvent {
 
 pub(super) struct StreamIoTable {
     streams: HashMap<StreamId, StreamIoEntry>,
-    pending_rx: Vec<PendingRx>,
 }
 
 impl StreamIoTable {
     pub(super) fn new() -> Box<Self> {
         Box::new(Self {
             streams: HashMap::new(),
-            pending_rx: Vec::new(),
         })
     }
 
@@ -74,7 +65,7 @@ impl StreamIoTable {
                 pending_tx_deq: 0,
             },
         );
-        debug_assert!(previous.is_none(), "stream Session installed exactly once");
+        assert!(previous.is_none(), "stream Session installed exactly once");
     }
 
     pub(super) fn stream_session(&self, stream: StreamId) -> Option<SessionId> {
@@ -183,14 +174,10 @@ impl StreamIoTable {
         if data.is_empty() {
             return Ok(0);
         }
-        let Some(entry) = self.streams.get_mut(&stream) else {
-            self.pending_rx.push(PendingRx {
-                stream,
-                offset,
-                bytes: data.to_vec(),
-            });
-            return Ok(0);
-        };
+        let entry = self
+            .streams
+            .get_mut(&stream)
+            .ok_or(StreamDataError::StreamMissing { stream })?;
         let (offset, data) = if offset < entry.app_rx_data_len {
             let consumed = entry.app_rx_data_len.saturating_sub(offset) as usize;
             if consumed >= data.len() {
@@ -234,39 +221,6 @@ impl StreamIoTable {
             entry.pending_rx = entry.pending_rx.saturating_add(result.delivered as u64);
             Ok(result.delivered as u64)
         }
-    }
-
-    pub(super) fn drain_pending(
-        &mut self,
-        stream: StreamId,
-        context: Index,
-        session: SessionId,
-        rx_fifo: Arc<Fifo>,
-        tx_fifo: Arc<Fifo>,
-        bytes_written: u64,
-        app_tx_data_len: u64,
-    ) -> Result<usize, StreamDataError> {
-        self.install_stream(
-            stream,
-            context,
-            session,
-            rx_fifo,
-            tx_fifo,
-            bytes_written,
-            app_tx_data_len,
-        );
-        let mut delivered = 0u64;
-        let mut index = 0;
-        while index < self.pending_rx.len() {
-            if self.pending_rx[index].stream != stream {
-                index += 1;
-                continue;
-            }
-            let pending = self.pending_rx.remove(index);
-            delivered =
-                delivered.saturating_add(self.receive(stream, pending.offset, &pending.bytes)?);
-        }
-        Ok(delivered as usize)
     }
 
     pub(super) fn take_events(&mut self) -> Vec<StreamIoEvent> {

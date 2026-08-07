@@ -141,6 +141,11 @@ pub struct StreamsState {
     pub(super) stream_data_io: Option<StreamDataIo>,
 }
 
+pub(crate) enum StreamReceiveError {
+    Transport(TransportError),
+    Data(StreamDataError),
+}
+
 impl StreamsState {
     #[allow(unreachable_pub)] // fuzzing only
     pub fn new(
@@ -267,16 +272,41 @@ impl StreamsState {
     /// Process incoming stream frame
     ///
     /// If successful, returns whether a `MAX_DATA` frame needs to be transmitted
+    #[cfg(test)]
     pub(crate) fn received(
         &mut self,
         frame: frame::Stream,
         payload_len: usize,
     ) -> Result<ShouldTransmit, TransportError> {
+        let mut no_stream_setup = |_| Ok(());
+        match self.received_with_stream_setup(frame, payload_len, &mut no_stream_setup) {
+            Ok(should_transmit) => Ok(should_transmit),
+            Err(StreamReceiveError::Transport(error)) => Err(error),
+            Err(StreamReceiveError::Data(error)) => {
+                trace!(
+                    ?error,
+                    "dropping STREAM frame without advancing flow control"
+                );
+                Ok(ShouldTransmit(false))
+            }
+        }
+    }
+
+    pub(crate) fn received_with_stream_setup(
+        &mut self,
+        frame: frame::Stream,
+        payload_len: usize,
+        prepare_stream: &mut impl FnMut(StreamId) -> Result<(), StreamDataError>,
+    ) -> Result<ShouldTransmit, StreamReceiveError> {
         let id = frame.id;
         self.validate_receive_id(id).map_err(|e| {
             debug!("received illegal STREAM frame");
-            e
+            StreamReceiveError::Transport(e)
         })?;
+
+        if self.stream_data_io.is_some() {
+            prepare_stream(id).map_err(StreamReceiveError::Data)?;
+        }
 
         let rs = match self.recv.get_mut(&id).map(get_or_insert_recv(
             self.stream_receive_window,
@@ -297,13 +327,7 @@ impl StreamsState {
         let (new_bytes, closed) =
             match rs.ingest(frame, payload_len, self.data_recvd, self.local_max_data) {
                 Ok(result) => result,
-                Err(error) => {
-                    trace!(
-                        ?error,
-                        "dropping STREAM frame without advancing flow control"
-                    );
-                    return Ok(ShouldTransmit(false));
-                }
+                Err(error) => return Err(StreamReceiveError::Data(error)),
             };
         self.data_recvd = self.data_recvd.saturating_add(new_bytes);
 
