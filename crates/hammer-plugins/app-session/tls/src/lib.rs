@@ -212,11 +212,11 @@ impl SessionApp for Connection {
     fn create(
         application: Option<ApplicationId>,
         _: Option<SessionAppId>,
-        config: Option<u64>,
+        opaque: Option<u64>,
         server_name: Option<&str>,
     ) -> RuntimeResult<Self> {
         let application = application.ok_or(config::ConfigError::ApplicationRequired)?;
-        let config_id = config
+        let config_id = opaque
             .map(config::ConfigId::from_raw)
             .ok_or(config::ConfigError::ConfigurationRequired)?;
         if let Some(server_name) = server_name {

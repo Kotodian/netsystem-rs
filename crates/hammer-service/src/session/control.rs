@@ -35,9 +35,9 @@ impl SessionMain {
                 transport,
                 endpoint,
                 app,
-                config,
+                opaque,
                 ..
-            } => self.application_listen(application, &transport, endpoint, app, config),
+            } => self.application_listen(application, &transport, endpoint, app, opaque),
             ApplicationSessionRequest::Connect {
                 transport,
                 remote,
@@ -45,7 +45,7 @@ impl SessionMain {
                 worker,
                 server_name,
                 app,
-                config,
+                opaque,
                 ..
             } => self.application_connect(
                 application,
@@ -53,7 +53,7 @@ impl SessionMain {
                 SessionConnectEndpoint::new(remote, local, worker),
                 server_name,
                 app,
-                config,
+                opaque,
             ),
             ApplicationSessionRequest::Unlisten { listener, .. } => {
                 self.application_unlisten(application, listener).map(|()| 0)
@@ -71,7 +71,7 @@ impl SessionMain {
         transport_name: &str,
         endpoint: hammer_runtime::SessionListenEndpoint,
         app: Option<hammer_runtime::app::SessionAppId>,
-        config: Option<u64>,
+        opaque: Option<u64>,
     ) -> Result<u64, ApplicationSessionStatus> {
         self.with_control_barrier(|| {
             let transport = session_transport(transport_name)?;
@@ -80,7 +80,7 @@ impl SessionMain {
             }
             let application_listener = self
                 .applications()
-                .register_listener(application, app, config)
+                .register_listener(application, app, opaque)
                 .map_err(application_status)?;
             match self.listen(application_listener, transport, endpoint) {
                 Ok(listener) => Ok(listener.raw()),
@@ -102,7 +102,7 @@ impl SessionMain {
         endpoint: SessionConnectEndpoint,
         server_name: Option<String>,
         app: Option<hammer_runtime::app::SessionAppId>,
-        config: Option<u64>,
+        opaque: Option<u64>,
     ) -> Result<u64, ApplicationSessionStatus> {
         let transport = session_transport(transport_name)?;
         if transport.connect().is_none() {
@@ -110,7 +110,7 @@ impl SessionMain {
         }
         let application_connection = self
             .applications()
-            .register_connection(application, server_name, app, config)
+            .register_connection(application, server_name, app, opaque)
             .map_err(application_status)?;
         match self.connect(application_connection, transport, endpoint) {
             Ok(_) => {

@@ -8,7 +8,7 @@ fn install_quic_session_app(_: &mut hammer_runtime::Engine) -> hammer_runtime::R
 fn destroy_quic_session_app(_: hammer_runtime::DataWorkerId, _: u64) {}
 
 #[test]
-fn application_listener_owns_a_validated_session_app_selection() {
+fn application_listener_owns_a_validated_session_app_endpoint() {
     let applications = ApplicationMain::new(4);
     let application = applications.attach().expect("attach Application");
     let listener = applications

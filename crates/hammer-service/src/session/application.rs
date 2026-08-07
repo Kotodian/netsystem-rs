@@ -28,13 +28,13 @@ struct ApplicationState {
 pub(crate) struct ApplicationListener {
     application: ApplicationId,
     app: Option<SessionAppId>,
-    config: Option<u64>,
+    opaque: Option<u64>,
 }
 
 pub(crate) struct ApplicationConnection {
     application: ApplicationId,
     app: Option<SessionAppId>,
-    config: Option<u64>,
+    opaque: Option<u64>,
     server_name: Option<String>,
     completion: AtomicU8,
 }
@@ -51,8 +51,8 @@ impl ApplicationListener {
     }
 
     #[inline]
-    pub(crate) const fn config(&self) -> Option<u64> {
-        self.config
+    pub(crate) const fn opaque(&self) -> Option<u64> {
+        self.opaque
     }
 }
 
@@ -68,8 +68,8 @@ impl ApplicationConnection {
     }
 
     #[inline]
-    pub(crate) const fn config(&self) -> Option<u64> {
-        self.config
+    pub(crate) const fn opaque(&self) -> Option<u64> {
+        self.opaque
     }
 
     #[inline]
@@ -450,14 +450,14 @@ impl ApplicationMain {
         &self,
         application: ApplicationId,
         app: Option<SessionAppId>,
-        config: Option<u64>,
+        opaque: Option<u64>,
     ) -> Result<ApplicationListenerId, ApplicationError> {
         self.ensure_active(application)?;
         self.validate_session_app(app)?;
         let listener = ApplicationListener {
             application,
             app,
-            config,
+            opaque,
         };
         self.with_state_mut(|state| {
             state
@@ -475,14 +475,14 @@ impl ApplicationMain {
         application: ApplicationId,
         server_name: Option<String>,
         app: Option<SessionAppId>,
-        config: Option<u64>,
+        opaque: Option<u64>,
     ) -> Result<ApplicationConnectionId, ApplicationError> {
         self.ensure_active(application)?;
         self.validate_session_app(app)?;
         let connection = ApplicationConnection {
             application,
             app,
-            config,
+            opaque,
             server_name,
             completion: AtomicU8::new(CONNECTION_PENDING),
         };
@@ -624,13 +624,13 @@ impl ApplicationMain {
         })?
     }
 
-    /// Publishes the opaque configuration fact carried by one Application
-    /// listener while the owning Main Thread holds the worker barrier.
-    pub fn update_listener_config(
+    /// Publishes the opaque fact carried by one Application listener while the
+    /// owning Main Thread holds the worker barrier.
+    pub fn update_listener_opaque(
         &self,
         application: ApplicationId,
         listener_id: ApplicationListenerId,
-        config: Option<u64>,
+        opaque: Option<u64>,
     ) -> Result<(), ApplicationError> {
         self.ensure_active(application)?;
         self.with_state_mut(|state| {
@@ -646,7 +646,7 @@ impl ApplicationMain {
                     listener: listener_id,
                 });
             }
-            listener.config = config;
+            listener.opaque = opaque;
             Ok(())
         })?
     }

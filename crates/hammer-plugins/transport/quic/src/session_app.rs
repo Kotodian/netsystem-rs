@@ -58,8 +58,8 @@ fn accept(
 ) -> RuntimeResult<()> {
     let listener = if context == 0 {
         worker
-            .session_app_selection(session)
-            .and_then(|(_, _, config, _)| config)
+            .session_app_endpoint(session)
+            .and_then(|(_, _, opaque, _)| opaque)
             .ok_or_else(|| QuicSessionError::ContextMissing { session })?
     } else {
         context

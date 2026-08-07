@@ -127,7 +127,7 @@ impl QuicMain {
         // `udp_listen_session->opaque` publication point, and it remains in
         // the outer SessionMain barrier transaction.
         applications
-            .update_listener_config(
+            .update_listener_opaque(
                 self.inner_application,
                 inner_application_listener,
                 Some(context.into()),
@@ -320,7 +320,7 @@ mod tests {
     use super::*;
 
     static LISTEN_APPLICATION: AtomicU64 = AtomicU64::new(0);
-    static LISTEN_CONFIG: AtomicU64 = AtomicU64::new(0);
+    static LISTEN_OPAQUE: AtomicU64 = AtomicU64::new(0);
     static LISTEN_BARRIER: AtomicBool = AtomicBool::new(false);
     static STOP_LISTENER: AtomicU64 = AtomicU64::new(0);
 
@@ -333,11 +333,11 @@ mod tests {
     fn record_start(
         listener: SessionListenerId,
         application: ApplicationId,
-        config: Option<u64>,
+        opaque: Option<u64>,
         _: SessionListenEndpoint,
     ) -> RuntimeResult<()> {
         LISTEN_APPLICATION.store(application.raw(), Ordering::SeqCst);
-        LISTEN_CONFIG.store(config.unwrap_or_default(), Ordering::SeqCst);
+        LISTEN_OPAQUE.store(opaque.unwrap_or_default(), Ordering::SeqCst);
         LISTEN_BARRIER.store(
             Engine::with_current(|engine| engine.worker_barrier().is_pending()).unwrap_or(false),
             Ordering::SeqCst,
@@ -415,7 +415,7 @@ mod tests {
             .register_server_config(outer_application, server_config())
             .map_err(RuntimeError::from)?;
         LISTEN_APPLICATION.store(0, Ordering::SeqCst);
-        LISTEN_CONFIG.store(0, Ordering::SeqCst);
+        LISTEN_OPAQUE.store(0, Ordering::SeqCst);
         LISTEN_BARRIER.store(false, Ordering::SeqCst);
         STOP_LISTENER.store(0, Ordering::SeqCst);
 
@@ -449,7 +449,7 @@ mod tests {
             LISTEN_APPLICATION.load(Ordering::SeqCst),
             inner_application.raw()
         );
-        assert_eq!(LISTEN_CONFIG.load(Ordering::SeqCst), 0);
+        assert_eq!(LISTEN_OPAQUE.load(Ordering::SeqCst), 0);
         assert!(LISTEN_BARRIER.load(Ordering::SeqCst));
 
         sessions.unlisten(outer_listener)?;

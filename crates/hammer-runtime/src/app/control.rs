@@ -16,7 +16,7 @@ pub enum ApplicationSessionRequest {
         transport: String,
         endpoint: SessionListenEndpoint,
         app: Option<SessionAppId>,
-        config: Option<u64>,
+        opaque: Option<u64>,
     },
     Connect {
         context: u64,
@@ -26,7 +26,7 @@ pub enum ApplicationSessionRequest {
         worker: DataWorkerId,
         server_name: Option<String>,
         app: Option<SessionAppId>,
-        config: Option<u64>,
+        opaque: Option<u64>,
     },
     Unlisten {
         context: u64,

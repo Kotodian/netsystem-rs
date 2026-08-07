@@ -1505,14 +1505,14 @@ pub fn session_app(args: TokenStream, input: TokenStream) -> TokenStream {
             __hammer_worker_count: usize,
             __hammer_application: ::std::option::Option<::hammer_runtime::app::ApplicationId>,
             __hammer_app: ::std::option::Option<::hammer_runtime::app::SessionAppId>,
-            __hammer_config: ::std::option::Option<u64>,
+            __hammer_opaque: ::std::option::Option<u64>,
             __hammer_server_name: ::std::option::Option<&str>,
         ) -> ::hammer_runtime::RuntimeResult<::hammer_runtime::app::SessionAppContext> {
             let __hammer_app_state =
                 <#ident as ::hammer_service::session::protocol::SessionApp>::create(
                     __hammer_application,
                     __hammer_app,
-                    __hammer_config,
+                    __hammer_opaque,
                     __hammer_server_name,
                 )?;
             #contexts_ident
@@ -1593,15 +1593,15 @@ pub fn session_app(args: TokenStream, input: TokenStream) -> TokenStream {
             __hammer_context: ::hammer_runtime::app::SessionAppContext,
         ) -> ::hammer_runtime::RuntimeResult<()> {
             let __hammer_context = if __hammer_context == 0 {
-                let (__hammer_application, __hammer_app, __hammer_config, __hammer_server_name) =
+                let (__hammer_application, __hammer_app, __hammer_opaque, __hammer_server_name) =
                     __hammer_worker
-                        .session_app_selection(__hammer_session)
+                        .session_app_endpoint(__hammer_session)
                         .ok_or(::hammer_service::session::SessionQueueError::SessionAppContextCreateUnsupported)?;
                 let __hammer_app_state =
                     <#ident as ::hammer_service::session::protocol::SessionApp>::create(
                         ::std::option::Option::Some(__hammer_application),
                         __hammer_app,
-                        __hammer_config,
+                        __hammer_opaque,
                         __hammer_server_name,
                     )?;
                 let __hammer_context = #contexts_ident
@@ -1646,15 +1646,15 @@ pub fn session_app(args: TokenStream, input: TokenStream) -> TokenStream {
             __hammer_context: ::hammer_runtime::app::SessionAppContext,
         ) -> ::hammer_runtime::RuntimeResult<()> {
             let __hammer_context = if __hammer_context == 0 {
-                let (__hammer_application, __hammer_app, __hammer_config, __hammer_server_name) =
+                let (__hammer_application, __hammer_app, __hammer_opaque, __hammer_server_name) =
                     __hammer_worker
-                        .session_app_selection(__hammer_session)
+                        .session_app_endpoint(__hammer_session)
                         .ok_or(::hammer_service::session::SessionQueueError::SessionAppContextCreateUnsupported)?;
                 let __hammer_app_state =
                     <#ident as ::hammer_service::session::protocol::SessionApp>::create(
                         ::std::option::Option::Some(__hammer_application),
                         __hammer_app,
-                        __hammer_config,
+                        __hammer_opaque,
                         __hammer_server_name,
                     )?;
                 let __hammer_context = #contexts_ident
