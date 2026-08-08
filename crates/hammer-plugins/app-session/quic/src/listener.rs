@@ -67,6 +67,7 @@ impl QuicListenerContexts {
     }
 
     #[inline]
+    #[allow(clippy::mut_from_ref)]
     fn get_mut(&self) -> &mut Pool<Context> {
         // SAFETY: callers must be the Main Thread and hold the worker barrier
         // (or run before Data Workers exist), which is enforced by
