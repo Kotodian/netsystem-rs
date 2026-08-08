@@ -1260,6 +1260,55 @@ impl<Index: Copy + Eq> SessionWorker<Index> {
         Ok(upper)
     }
 
+    /// Creates an App-facing upper Session bound to a lower Session and to
+    /// the transport index that owns its Connection or Stream state.
+    pub fn create_upper_transport_session(
+        &mut self,
+        lower: SessionId,
+        transport: SessionTransportId,
+        index: Index,
+        context: SessionAppContext,
+    ) -> RuntimeResult<SessionId> {
+        let (application, _app, opaque, server_name) = self
+            .session_app_endpoint(lower)
+            .ok_or(SessionError::SessionMissing { session_id: lower })?;
+        let server_name = server_name.map(str::to_owned);
+        let upper = self.construct_transport_session(
+            transport,
+            index,
+            lower.get(),
+            application,
+            None,
+            opaque,
+            server_name.as_deref(),
+            false,
+        )?;
+        let entry = self
+            .entries
+            .get_mut(upper.pool_index())
+            .expect("new upper transport Session remains installed during publication");
+        entry.app_session = context;
+        entry.lower_session = Some(lower);
+        Ok(upper)
+    }
+
+    /// Publishes a handshake-established transport Session and notifies the
+    /// external App without re-entering the lower Session App callback.
+    pub fn publish_connected_transport_session(
+        &mut self,
+        session_id: SessionId,
+    ) -> RuntimeResult<()> {
+        self.connection_published(session_id)?;
+        if let Err(error) = self.connected(session_id) {
+            assert!(
+                self.remove_session(session_id).is_ok(),
+                "upper transport Session rollback failed"
+            );
+            return Err(error);
+        }
+        Ok(())
+    }
+
     #[cfg(test)]
     pub(crate) fn local_app(&self) -> &AppWorker {
         &self.app
@@ -3261,7 +3310,7 @@ mod tests {
 
     use super::{
         DEFAULT_SESSION_POOL_CAPACITY, SessionMain, SessionQueueNext, SessionTransportId,
-        SessionWorker, SessionWorkerState, queue_for_worker,
+        SessionType, SessionWorker, SessionWorkerState, queue_for_worker,
     };
     use crate::session::ApplicationMain;
     use crate::session::SessionId;
@@ -4591,6 +4640,141 @@ mod tests {
         sessions
             .remove_session(lower)
             .expect("remove lower Session");
+        assert!(!sessions.has_session(upper));
+    }
+
+    #[test]
+    fn upper_transport_session_publishes_connect_without_session_app_callback() {
+        static SESSION_APP_CONNECTED_CALLS: AtomicU64 = AtomicU64::new(0);
+
+        fn record_connected(
+            _: &mut SessionWorker<Index>,
+            _: SessionId,
+            _: u64,
+        ) -> RuntimeResult<()> {
+            SESSION_APP_CONNECTED_CALLS.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        }
+
+        SESSION_APP_CONNECTED_CALLS.store(0, Ordering::SeqCst);
+        let applications = ApplicationMain::new(4);
+        let application = applications.attach().expect("attach Application");
+        let mut sessions = SessionWorker::<Index>::new(
+            DataWorkerId::new(0),
+            1,
+            AppSessionConfig::default(),
+            DEFAULT_SESSION_POOL_CAPACITY,
+            applications,
+            None,
+        )
+        .expect("Session worker");
+        sessions
+            .install_application_mq_for_test(application)
+            .expect("install test Application MQ");
+        sessions
+            .install_session_app(
+                hammer_runtime::app::SessionAppId::new(0),
+                SessionAppCallbacks {
+                    connected: Some(record_connected),
+                    ..Default::default()
+                },
+            )
+            .expect("install Session App callbacks");
+        let lower = sessions
+            .construct_stream_sessions(
+                SessionTransportId::new(1),
+                Index::new(1, 1),
+                1,
+                application,
+                Some(hammer_runtime::app::SessionAppId::new(0)),
+                None,
+                None,
+                false,
+            )
+            .expect("construct lower Session App session");
+        let transport = SessionTransportId::new(3);
+        let transport_index = Index::new(7, 1);
+        let upper = sessions
+            .create_upper_transport_session(lower, transport, transport_index, 0x55)
+            .expect("create upper transport Session");
+
+        assert_eq!(
+            sessions.session_transport(upper),
+            Some((transport, transport_index))
+        );
+        assert_eq!(
+            sessions
+                .entries
+                .get(upper.pool_index())
+                .and_then(|entry| entry.lower_session),
+            Some(lower)
+        );
+
+        sessions
+            .publish_connected_transport_session(upper)
+            .expect("publish connected upper transport Session");
+        assert_eq!(SESSION_APP_CONNECTED_CALLS.load(Ordering::SeqCst), 0);
+        let state =
+            sessions
+                .entries
+                .get(upper.pool_index())
+                .and_then(|entry| match entry.session_type {
+                    Some(SessionType::Transport { state, .. }) => Some(state),
+                    None => None,
+                });
+        assert!(matches!(
+            state,
+            Some(crate::session::state::SessionState::Active(_))
+        ));
+    }
+
+    #[test]
+    fn upper_transport_session_teardown_keeps_app_session_until_app_close() {
+        let applications = ApplicationMain::new(4);
+        let application = applications.attach().expect("attach Application");
+        let mut sessions = SessionWorker::<Index>::new(
+            DataWorkerId::new(0),
+            1,
+            AppSessionConfig::default(),
+            DEFAULT_SESSION_POOL_CAPACITY,
+            applications,
+            None,
+        )
+        .expect("Session worker");
+        sessions
+            .install_application_mq_for_test(application)
+            .expect("install test Application MQ");
+        let lower = sessions
+            .construct_stream_sessions(
+                SessionTransportId::new(1),
+                Index::new(1, 1),
+                1,
+                application,
+                Some(hammer_runtime::app::SessionAppId::new(0)),
+                None,
+                None,
+                false,
+            )
+            .expect("construct lower Session App session");
+        let transport = SessionTransportId::new(3);
+        let transport_index = Index::new(7, 1);
+        let upper = sessions
+            .create_upper_transport_session(lower, transport, transport_index, 0x55)
+            .expect("create upper transport Session");
+        sessions
+            .publish_connected_transport_session(upper)
+            .expect("publish connected upper transport Session");
+
+        sessions
+            .notify_transport_closed(upper, transport_index)
+            .expect("notify transport close");
+        sessions
+            .notify_transport_deleted(upper, transport_index)
+            .expect("notify transport delete");
+        assert!(sessions.has_session(upper));
+        sessions
+            .close_transport_session(upper)
+            .expect("app close completes transport deletion");
         assert!(!sessions.has_session(upper));
     }
 }

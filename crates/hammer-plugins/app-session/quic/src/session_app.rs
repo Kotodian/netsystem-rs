@@ -40,14 +40,10 @@ fn publish_context(
     context: ContextId,
 ) -> RuntimeResult<()> {
     if let Err(error) = worker.set_app_session(session, context.into()) {
-        if let Err(cleanup_error) = with_quic_worker(worker, |quic| quic.remove_context(context)) {
-            tracing::error!(
-                ?session,
-                ?context,
-                %cleanup_error,
-                "QUIC Session App context rollback failed"
-            );
-        }
+        assert!(
+            with_quic_worker(worker, |quic| quic.remove_context(context)).is_ok(),
+            "QUIC Session App context rollback failed"
+        );
         return Err(error);
     }
     Ok(())
@@ -100,8 +96,14 @@ fn connected(
         quic.send_packets(sessions, connection, Instant::now())
     })
     .map_err(|error| {
-        let _ = with_quic_worker(worker, |quic| quic.remove_context(connection));
-        let _ = worker.set_app_session(session, 0);
+        assert!(
+            with_quic_worker(worker, |quic| quic.remove_context(connection)).is_ok(),
+            "QUIC active connect rollback failed"
+        );
+        assert!(
+            worker.set_app_session(session, 0).is_ok(),
+            "QUIC active connect Session rollback failed"
+        );
         error
     })
 }
@@ -152,7 +154,7 @@ fn builtin_tx(
         })
 }
 
-fn lifecycle(
+fn close_lower_connection(
     worker: &mut SessionWorker<Index>,
     session: SessionId,
     context: SessionAppContext,
@@ -161,12 +163,17 @@ fn lifecycle(
         return Err(QuicSessionError::ContextMissing { session }.into());
     }
     let context = ContextId::from(context);
-    with_quic_worker(worker, |quic| {
-        let owner = quic.context_session(context)?;
-        if owner != session {
+    let main = QUIC_MAIN
+        .get()
+        .ok_or(RuntimeError::PluginStateNotInitialized { plugin: NAME })?;
+    main.with_worker_and_sessions(worker, |sessions, quic| {
+        let Some(lower) = quic.lower_session_if_present(context) else {
+            return Ok(());
+        };
+        if lower != session {
             return Err(QuicSessionError::ContextSessionMismatch { context, session }.into());
         }
-        Ok(())
+        quic.close_connection(sessions, context)
     })
 }
 
@@ -192,10 +199,10 @@ fn destroy(worker: DataWorkerId, context: SessionAppContext) {
 pub(crate) static CALLBACKS: SessionAppCallbacks = SessionAppCallbacks {
     accept: Some(accept),
     connected: Some(connected),
-    disconnect: Some(lifecycle),
-    reset: Some(lifecycle),
-    transport_closed: Some(lifecycle),
-    cleanup: Some(lifecycle),
+    disconnect: Some(close_lower_connection),
+    reset: Some(close_lower_connection),
+    transport_closed: Some(close_lower_connection),
+    cleanup: Some(close_lower_connection),
     builtin_rx: Some(builtin_rx),
     builtin_tx: Some(builtin_tx),
     ..SessionAppCallbacks::all_none()

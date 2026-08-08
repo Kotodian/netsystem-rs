@@ -182,7 +182,7 @@ impl EngineConnection {
 struct ConnectionContext {
     engine: Option<Box<EngineConnection>>,
     lower_session: SessionId,
-    upper_session: Option<SessionId>,
+    connection_session: Option<SessionId>,
     listener: Option<ContextId>,
     state: ConnectionState,
     flags: u8,
@@ -259,7 +259,7 @@ impl Context {
                     opaque,
                 ))),
                 lower_session,
-                upper_session: None,
+                connection_session: None,
                 listener,
                 state: ConnectionState::Handshaking,
                 flags: 0,
@@ -290,7 +290,7 @@ impl Context {
                     opaque,
                 ))),
                 lower_session,
-                upper_session: None,
+                connection_session: None,
                 listener: None,
                 state: ConnectionState::Handshaking,
                 flags: 0,
@@ -313,9 +313,16 @@ impl Context {
         }
     }
 
-    fn session(&self) -> Option<SessionId> {
+    fn lower_session(&self) -> Option<SessionId> {
         match &self.role {
             ContextRole::Connection(connection) => Some(connection.lower_session),
+            ContextRole::Stream(_) | ContextRole::Listener(_) => None,
+        }
+    }
+
+    fn transport_session(&self) -> Option<SessionId> {
+        match &self.role {
+            ContextRole::Connection(connection) => connection.connection_session,
             ContextRole::Stream(stream) => Some(stream.session),
             ContextRole::Listener(_) => None,
         }
@@ -490,6 +497,12 @@ impl QuicTimers {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum QuicRxOutcome {
+    Processed,
+    Dropped,
+}
+
 /// Data Worker-owned QUIC context pool and sans-I/O endpoint.
 #[hammer_component_macros::session_transport(
     name = "quic",
@@ -507,6 +520,8 @@ pub struct QuicWorker {
     tx_bufs: BytesBuffer,
     connection_tx_pending: Vec<ContextId>,
     connection_tx_ready: Vec<ContextId>,
+    rx_datagram_drops: u64,
+    rx_packet_drops: u64,
 }
 
 impl QuicWorker {
@@ -521,6 +536,8 @@ impl QuicWorker {
             tx_bufs: BytesBuffer::with_capacity(TX_PACKET_BURST * MAX_PACKET_SIZE),
             connection_tx_pending: Vec::with_capacity(QUIC_CONTEXT_CAPACITY),
             connection_tx_ready: Vec::with_capacity(QUIC_CONTEXT_CAPACITY),
+            rx_datagram_drops: 0,
+            rx_packet_drops: 0,
         }
     }
 
@@ -551,13 +568,10 @@ impl QuicWorker {
                 Duration::from_millis(30_000),
             )
             .map_err(|error| {
-                if let Err(cleanup_error) = self.remove_context(context) {
-                    tracing::error!(
-                        ?context,
-                        %cleanup_error,
-                        "QUIC connection context rollback failed after timer arm error"
-                    );
-                }
+                assert!(
+                    self.remove_context(context).is_ok(),
+                    "QUIC connection context rollback failed after timer arm error"
+                );
                 error
             })?;
         Ok(context)
@@ -662,11 +676,17 @@ impl QuicWorker {
         Ok(context)
     }
 
-    pub(super) fn context_session(&self, context: ContextId) -> RuntimeResult<SessionId> {
+    pub(super) fn lower_session(&self, context: ContextId) -> RuntimeResult<SessionId> {
         self.contexts
             .get(context.into())
-            .and_then(Context::session)
+            .and_then(Context::lower_session)
             .ok_or_else(|| QuicWorkerError::ContextMissing { context }.into())
+    }
+
+    pub(super) fn lower_session_if_present(&self, context: ContextId) -> Option<SessionId> {
+        self.contexts
+            .get(context.into())
+            .and_then(Context::lower_session)
     }
 
     pub(super) fn listener_context_id(&self, context: ContextId) -> Option<ContextId> {
@@ -720,21 +740,24 @@ impl QuicWorker {
                     break;
                 }
                 let Some(header) = SessionDgramHeader::from_bytes(&header_bytes) else {
-                    break;
+                    rx_fifo.dequeue_drop(SessionDgramHeader::SIZE);
+                    self.rx_datagram_drops += 1;
+                    consumed = consumed.saturating_add(SessionDgramHeader::SIZE);
+                    continue;
                 };
                 let payload_len = header.data_length() as usize;
-                let record_len =
-                    header
-                        .total_len()
-                        .ok_or_else(|| QuicWorkerError::InvalidDatagram {
-                            session: lower_session,
-                            length: header.data_length(),
-                        })?;
+                let Some(record_len) = header.total_len() else {
+                    rx_fifo.dequeue_drop(SessionDgramHeader::SIZE);
+                    self.rx_datagram_drops += 1;
+                    consumed = consumed.saturating_add(SessionDgramHeader::SIZE);
+                    continue;
+                };
                 if rx_fifo.max_dequeue() < record_len {
                     break;
                 }
                 if payload_len > MAX_PACKET_SIZE {
                     rx_fifo.dequeue_drop(record_len);
+                    self.rx_datagram_drops += 1;
                     consumed = consumed.saturating_add(record_len);
                     continue;
                 }
@@ -775,12 +798,26 @@ impl QuicWorker {
             );
             self.rx_packet_descriptors = packet_descriptors;
             self.rx_datagrams[datagram_slot] = Some(scratch);
-            process_result?;
-            sessions
-                .fifo_pair(lower_session)
-                .map(|(rx, _)| rx.dequeue_drop(record_len))
-                .unwrap_or(0);
-            consumed = consumed.saturating_add(record_len);
+            let outcome = match process_result {
+                Ok(outcome) => outcome,
+                Err(error) => {
+                    if let Some((rx_fifo, _)) = sessions.fifo_pair(lower_session) {
+                        debug_assert_eq!(rx_fifo.dequeue_drop(record_len), record_len);
+                    }
+                    return Err(error);
+                }
+            };
+            if outcome == QuicRxOutcome::Dropped {
+                self.rx_datagram_drops += 1;
+            }
+            let (rx_fifo, _) = sessions.fifo_pair(lower_session).ok_or_else(|| {
+                QuicWorkerError::SessionMissing {
+                    session: lower_session,
+                }
+            })?;
+            let dropped = rx_fifo.dequeue_drop(record_len);
+            debug_assert_eq!(dropped, record_len);
+            consumed = consumed.saturating_add(dropped);
             self.drain_io_events(sessions, context)?;
         }
         if consumed != 0 {
@@ -799,7 +836,7 @@ impl QuicWorker {
         data: &mut [u8],
         packet_descriptors: &mut Vec<PartialDecode>,
         now: Instant,
-    ) -> RuntimeResult<()> {
+    ) -> RuntimeResult<QuicRxOutcome> {
         let has_connection = self
             .contexts
             .get(context.into())
@@ -865,10 +902,12 @@ impl QuicWorker {
             .connection_mut()
             .ok_or_else(|| QuicWorkerError::ContextMissing { context })?
             .engine = Some(engine);
-        if let Some(error) = stream_error {
-            return Err(QuicWorkerError::StreamData { context, error }.into());
+        if stream_error.is_some() {
+            self.rx_packet_drops += 1;
+            return Ok(QuicRxOutcome::Dropped);
         }
-        self.drain_connection_events(sessions, context, now)
+        self.drain_connection_events(sessions, context, now)?;
+        Ok(QuicRxOutcome::Processed)
     }
 
     fn accept_first_datagram(
@@ -880,7 +919,7 @@ impl QuicWorker {
         data: &mut [u8],
         packet_descriptors: &mut Vec<PartialDecode>,
         now: Instant,
-    ) -> RuntimeResult<()> {
+    ) -> RuntimeResult<QuicRxOutcome> {
         let server_config = self
             .contexts
             .get(context.into())
@@ -900,22 +939,23 @@ impl QuicWorker {
             &mut *self.tx_bufs,
         );
         let Some(event) = event else {
-            return Ok(());
+            self.rx_packet_drops += 1;
+            return Ok(QuicRxOutcome::Dropped);
         };
         match event {
             DatagramEvent::NewConnection(incoming) => {
-                let (handle, mut connection) = self
-                    .endpoint
-                    .accept(
-                        incoming,
-                        now,
-                        &mut *self.tx_bufs,
-                        Some(Arc::clone(&server_config)),
-                    )
-                    .map_err(|error| QuicWorkerError::AcceptFailed {
-                        context,
-                        source: error.cause,
-                    })?;
+                let (handle, mut connection) = match self.endpoint.accept(
+                    incoming,
+                    now,
+                    &mut *self.tx_bufs,
+                    Some(Arc::clone(&server_config)),
+                ) {
+                    Ok(accepted) => accepted,
+                    Err(_) => {
+                        self.rx_packet_drops += 1;
+                        return Ok(QuicRxOutcome::Dropped);
+                    }
+                };
                 let engine = self
                     .contexts
                     .get_mut(context.into())
@@ -928,7 +968,9 @@ impl QuicWorker {
                 engine.remote = Some(remote);
                 engine.local = Some(local);
                 self.timers.stop(context, QuicTimerKind::Accept);
-                self.drain_connection_events(sessions, context, now)
+                self.queue_connection_output(context);
+                self.drain_connection_events(sessions, context, now)?;
+                Ok(QuicRxOutcome::Processed)
             }
             DatagramEvent::Response(transmit) => {
                 let mut response = [0u8; MAX_PACKET_SIZE];
@@ -941,9 +983,9 @@ impl QuicWorker {
                     &response[..transmit.size],
                     now,
                 )?;
-                Ok(())
+                Ok(QuicRxOutcome::Processed)
             }
-            DatagramEvent::ConnectionEvent(_, _) => Ok(()),
+            DatagramEvent::ConnectionEvent(_, _) => Ok(QuicRxOutcome::Processed),
         }
     }
 
@@ -1011,16 +1053,43 @@ impl QuicWorker {
         let mut stream_event = None;
         match event {
             Event::Connected => {
+                let lower = self
+                    .contexts
+                    .get(context.into())
+                    .and_then(Context::connection)
+                    .map(|connection| connection.lower_session)
+                    .ok_or_else(|| QuicWorkerError::ContextMissing { context })?;
+                let has_connection_session = self
+                    .contexts
+                    .get(context.into())
+                    .and_then(Context::connection)
+                    .and_then(|connection| connection.connection_session)
+                    .is_some();
+                if !has_connection_session {
+                    let upper = sessions.create_upper_transport_session(
+                        lower,
+                        QuicWorker::ID,
+                        context.into(),
+                        context.into(),
+                    )?;
+                    if let Err(error) = sessions.publish_connected_transport_session(upper) {
+                        assert!(
+                            self.remove_context(context).is_ok(),
+                            "QUIC Connection Session rollback failed"
+                        );
+                        return Err(error);
+                    }
+                    self.contexts
+                        .get_mut(context.into())
+                        .and_then(Context::connection_mut)
+                        .expect("QUIC Connection Context remains during publication")
+                        .connection_session = Some(upper);
+                }
                 let connection_context = self
                     .contexts
                     .get_mut(context.into())
                     .and_then(Context::connection_mut)
                     .ok_or_else(|| QuicWorkerError::ContextMissing { context })?;
-                if connection_context.upper_session.is_none() {
-                    let upper = sessions
-                        .create_upper_session(connection_context.lower_session, context.into())?;
-                    connection_context.upper_session = Some(upper);
-                }
                 connection_context.state = ConnectionState::Established;
                 connection_context.listener = None;
             }
@@ -1268,14 +1337,10 @@ impl QuicWorker {
             .contexts
             .insert(Context::stream(parent, session_id, stream))
         else {
-            if let Err(cleanup_error) = sessions.rollback_session_creation(session_id) {
-                tracing::error!(
-                    ?context,
-                    ?stream,
-                    %cleanup_error,
-                    "QUIC stream Session rollback failed after context capacity exhaustion"
-                );
-            }
+            assert!(
+                sessions.rollback_session_creation(session_id).is_ok(),
+                "QUIC stream Session rollback failed after context capacity exhaustion"
+            );
             return Err(QuicWorkerError::ContextCapacityExhausted {
                 capacity: self.contexts.capacity(),
             }
@@ -1494,7 +1559,7 @@ impl QuicWorker {
         payload: &[u8],
         now: Instant,
     ) -> RuntimeResult<()> {
-        let lower_session = self.context_session(context)?;
+        let lower_session = self.lower_session(context)?;
         let header = SessionDgramHeader::new(local, remote, payload.len()).ok_or(
             QuicWorkerError::InvalidEndpoint {
                 context,
@@ -1604,11 +1669,18 @@ impl QuicWorker {
         while let Some(token) = self.timers.take_pending() {
             match token.kind {
                 QuicTimerKind::Accept => {
-                    if let Ok(lower_session) = self.context_session(token.context) {
-                        sessions.set_app_session(lower_session, 0)?;
+                    if let Ok(lower_session) = self.lower_session(token.context) {
+                        if let Err(error) = sessions.set_app_session(lower_session, 0) {
+                            if self.contexts.contains_key(token.context.into()) {
+                                let _ = self.remove_context(token.context);
+                            }
+                            return Err(error);
+                        }
                         sessions.schedule_disconnect(lower_session);
                     }
-                    self.remove_context(token.context)?;
+                    if self.contexts.contains_key(token.context.into()) {
+                        self.remove_context(token.context)?;
+                    }
                 }
                 QuicTimerKind::Transmit => {
                     if let Some(connection) = self
@@ -1627,18 +1699,28 @@ impl QuicWorker {
         self.schedule_connection_outputs(sessions, now)
     }
 
-    fn close_connection(
+    pub(super) fn close_connection(
         &mut self,
         sessions: &mut SessionWorker<Index>,
         context: ContextId,
     ) -> RuntimeResult<()> {
-        let upper = self
+        let connection_session = self
             .contexts
             .get_mut(context.into())
             .and_then(Context::connection_mut)
-            .and_then(|connection| connection.upper_session.take());
-        if let Some(upper) = upper {
-            sessions.notify_transport_closed(upper, context.into())?;
+            .and_then(|connection| connection.connection_session.take());
+        if let Some(connection_session) = connection_session {
+            let transport_index = context.into();
+            sessions.notify_transport_closed(connection_session, transport_index)?;
+            sessions.notify_transport_deleted(connection_session, transport_index)?;
+        }
+        if let Some(lower_session) = self
+            .contexts
+            .get(context.into())
+            .and_then(Context::lower_session)
+        {
+            sessions.set_app_session(lower_session, 0)?;
+            sessions.schedule_disconnect(lower_session);
         }
         self.timers.stop(context, QuicTimerKind::Accept);
         self.timers.stop(context, QuicTimerKind::Transmit);
@@ -1651,7 +1733,9 @@ impl QuicWorker {
             engine.io_table = StreamIoTable::new();
             let _ = engine.connection.take();
         }
-        self.remove_context(context)?;
+        if self.contexts.contains_key(context.into()) {
+            self.remove_context(context)?;
+        }
         Ok(())
     }
 
@@ -1754,11 +1838,17 @@ impl SessionTransport<Index> for QuicWorker {
         _: Instant,
     ) -> RuntimeResult<()> {
         let context = ContextId::from(index);
-        let session = self.context_session(context)?;
-        self.remove_context(context)?;
-        if sessions.has_session(session) {
-            sessions.set_app_session(session, 0)?;
+        let session = self
+            .contexts
+            .get(index)
+            .and_then(Context::transport_session);
+        if let Some(session) = session
+            && sessions.has_session(session)
+        {
             sessions.notify_transport_deleted(session, index)?;
+        }
+        if self.contexts.contains_key(index) {
+            self.remove_context(context)?;
         }
         Ok(())
     }
@@ -1802,12 +1892,6 @@ pub(super) enum QuicWorkerError {
         context: ContextId,
         #[source]
         source: quinn_proto::ConnectError,
-    },
-    #[error("QUIC first Initial accept failed for context {context:?}: {source}")]
-    AcceptFailed {
-        context: ContextId,
-        #[source]
-        source: quinn_proto::ConnectionError,
     },
     #[error("QUIC Session {session:?} is missing")]
     SessionMissing { session: SessionId },
@@ -1856,6 +1940,55 @@ pub(super) enum QuicWorkerError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    use bytes::BytesMut;
+
+    fn server_config() -> Arc<quinn_proto::ServerConfig> {
+        let certified = rcgen::generate_simple_self_signed(vec!["localhost".to_owned()])
+            .expect("generate QUIC test certificate");
+        let rustls = quinn_proto::rustls::ServerConfig::builder()
+            .with_no_client_auth()
+            .with_single_cert(
+                vec![certified.cert.der().clone()],
+                quinn_proto::rustls::pki_types::PrivateKeyDer::try_from(
+                    certified.signing_key.serialize_der(),
+                )
+                .expect("encode QUIC server private key"),
+            )
+            .expect("build QUIC server rustls config");
+        let crypto = quinn_proto::crypto::rustls::QuicServerConfig::try_from(Arc::new(rustls))
+            .expect("build QUIC server crypto");
+        let mut config = quinn_proto::ServerConfig::with_crypto(Arc::new(crypto));
+        config.transport_config(Arc::new(quinn_proto::TransportConfig::default()));
+        Arc::new(config)
+    }
+
+    fn test_lower_session() -> RuntimeResult<(SessionWorker<Index>, SessionId)> {
+        let applications = hammer_service::session::ApplicationMain::new(4);
+        let application = applications
+            .attach()
+            .map_err(hammer_runtime::RuntimeError::from)?;
+        let mut sessions = hammer_service::session::SessionWorker::<Index>::new(
+            DataWorkerId::new(0),
+            1,
+            hammer_runtime::app::AppSessionConfig::default(),
+            64,
+            applications,
+            None,
+        )?;
+        sessions.install_application_mq_for_test(application)?;
+        let lower = sessions.construct_transport_session(
+            SessionTransportId::new(1),
+            Index::new(1, 1),
+            1,
+            application,
+            Some(hammer_runtime::app::SessionAppId::new(0)),
+            None,
+            None,
+            false,
+        )?;
+        Ok((sessions, lower))
+    }
 
     #[test]
     fn context_roles_fit_one_cache_line_and_pool_identity_is_generation_checked() {
@@ -1995,5 +2128,297 @@ mod tests {
                 .expect("first client Initial")
         };
         assert!(transmit.size >= 1200);
+    }
+
+    #[test]
+    fn connected_event_publishes_exact_upper_transport_session() -> RuntimeResult<()> {
+        let applications = hammer_service::session::ApplicationMain::new(4);
+        let application = applications
+            .attach()
+            .map_err(hammer_runtime::RuntimeError::from)?;
+        let mut sessions = hammer_service::session::SessionWorker::<Index>::new(
+            DataWorkerId::new(0),
+            1,
+            hammer_runtime::app::AppSessionConfig::default(),
+            64,
+            applications,
+            None,
+        )?;
+        sessions.install_application_mq_for_test(application)?;
+        let lower = sessions.construct_transport_session(
+            SessionTransportId::new(1),
+            Index::new(1, 1),
+            1,
+            application,
+            Some(hammer_runtime::app::SessionAppId::new(0)),
+            None,
+            None,
+            false,
+        )?;
+
+        let mut worker = QuicWorker::new(DataWorkerId::new(0));
+        let listener_id = ContextId::from(0x1234u64);
+        let listener = ListenerContext {
+            outer_listener: SessionListenerId::new(1, 1),
+            outer_application: application,
+            inner_application_listener: hammer_runtime::app::ApplicationListenerId::new(2, 1),
+            inner_session_listener: SessionListenerId::new(3, 1),
+            configuration: ConfigId::from_raw(4),
+            server_config: Some(server_config()),
+        };
+        let context = worker.accept_connection(lower, listener_id, &listener)?;
+        worker.handle_connection_event(&mut sessions, context, Event::Connected)?;
+
+        let connection_session = worker
+            .contexts
+            .get(context.into())
+            .and_then(Context::connection)
+            .and_then(|connection| connection.connection_session)
+            .expect("QUIC Connection Session is published exactly once");
+        assert_eq!(
+            sessions.session_transport(connection_session),
+            Some((QuicWorker::ID, context.into()))
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn oversized_datagram_is_dropped_and_consumed_once() -> RuntimeResult<()> {
+        let (mut sessions, lower) = test_lower_session()?;
+        let mut worker = QuicWorker::new(DataWorkerId::new(0));
+        let listener_id = ContextId::from(0x1234u64);
+        let listener = ListenerContext {
+            outer_listener: SessionListenerId::new(1, 1),
+            outer_application: ApplicationId::new(1, 1),
+            inner_application_listener: hammer_runtime::app::ApplicationListenerId::new(2, 1),
+            inner_session_listener: SessionListenerId::new(3, 1),
+            configuration: ConfigId::from_raw(4),
+            server_config: None,
+        };
+        let context = worker.accept_connection(lower, listener_id, &listener)?;
+        let server_addr = "127.0.0.1:443".parse().expect("server address");
+        let client_addr = "127.0.0.1:444".parse().expect("client address");
+        let payload_len = MAX_PACKET_SIZE + 1;
+        let header = SessionDgramHeader::new(server_addr, client_addr, payload_len)
+            .expect("oversized test header");
+        let mut record = header.to_bytes().to_vec();
+        record.resize(record.len() + payload_len, 0);
+        {
+            let (rx_fifo, _) = sessions
+                .fifo_pair(lower)
+                .ok_or_else(|| QuicWorkerError::SessionMissing { session: lower })?;
+            assert_eq!(rx_fifo.enqueue(&record), record.len());
+        }
+
+        worker.process_udp_rx(&mut sessions, lower, context, Instant::now())?;
+
+        let (rx_fifo, _) = sessions
+            .fifo_pair(lower)
+            .ok_or_else(|| QuicWorkerError::SessionMissing { session: lower })?;
+        assert_eq!(rx_fifo.max_dequeue(), 0);
+        assert_eq!(worker.rx_datagram_drops, 1);
+        assert_eq!(worker.rx_packet_drops, 0);
+        Ok(())
+    }
+
+    #[test]
+    fn server_handshake_publishes_upper_connection_session_through_real_session_fifos()
+    -> RuntimeResult<()> {
+        let certified = rcgen::generate_simple_self_signed(vec!["localhost".to_owned()])
+            .expect("generate QUIC test certificate");
+        let rustls_server = quinn_proto::rustls::ServerConfig::builder()
+            .with_no_client_auth()
+            .with_single_cert(
+                vec![certified.cert.der().clone()],
+                quinn_proto::rustls::pki_types::PrivateKeyDer::try_from(
+                    certified.signing_key.serialize_der(),
+                )
+                .expect("encode QUIC server private key"),
+            )
+            .expect("build QUIC server rustls config");
+        let crypto_server =
+            quinn_proto::crypto::rustls::QuicServerConfig::try_from(Arc::new(rustls_server))
+                .expect("build QUIC server crypto");
+        let mut server_config = quinn_proto::ServerConfig::with_crypto(Arc::new(crypto_server));
+        server_config.transport_config(Arc::new(quinn_proto::TransportConfig::default()));
+
+        let mut roots = quinn_proto::rustls::RootCertStore::empty();
+        roots
+            .add(certified.cert.der().clone())
+            .expect("add QUIC test trust anchor");
+        let rustls_client = quinn_proto::rustls::ClientConfig::builder()
+            .with_root_certificates(roots)
+            .with_no_client_auth();
+        let crypto_client =
+            quinn_proto::crypto::rustls::QuicClientConfig::try_from(Arc::new(rustls_client))
+                .expect("build QUIC client crypto");
+        let mut client_config = quinn_proto::ClientConfig::new(Arc::new(crypto_client));
+        client_config.transport_config(Arc::new(quinn_proto::TransportConfig::default()));
+
+        let applications = hammer_service::session::ApplicationMain::new(4);
+        let application = applications
+            .attach()
+            .map_err(hammer_runtime::RuntimeError::from)?;
+        let mut sessions = hammer_service::session::SessionWorker::<Index>::new(
+            DataWorkerId::new(0),
+            1,
+            hammer_runtime::app::AppSessionConfig::default(),
+            64,
+            applications,
+            None,
+        )?;
+        sessions.install_application_mq_for_test(application)?;
+        let lower = sessions.construct_transport_session(
+            SessionTransportId::new(1),
+            Index::new(1, 1),
+            1,
+            application,
+            Some(hammer_runtime::app::SessionAppId::new(0)),
+            None,
+            None,
+            false,
+        )?;
+
+        let mut worker = QuicWorker::new(DataWorkerId::new(0));
+        let listener_id = ContextId::from(0x1234u64);
+        let listener = ListenerContext {
+            outer_listener: SessionListenerId::new(1, 1),
+            outer_application: application,
+            inner_application_listener: hammer_runtime::app::ApplicationListenerId::new(2, 1),
+            inner_session_listener: SessionListenerId::new(3, 1),
+            configuration: ConfigId::from_raw(4),
+            server_config: Some(Arc::new(server_config)),
+        };
+        let context = worker.accept_connection(lower, listener_id, &listener)?;
+
+        let server_addr = "127.0.0.1:443".parse().expect("server address");
+        let client_addr = "127.0.0.1:444".parse().expect("client address");
+        let now = Instant::now();
+        let mut client_endpoint =
+            Endpoint::new(Arc::new(EndpointConfig::default()), None, true, None);
+        let (client_handle, mut client_connection) = client_endpoint
+            .connect(now, client_config, server_addr, "localhost")
+            .map_err(|source| QuicWorkerError::ClientConnectFailed { context, source })?;
+        let mut client_buf = BytesMut::with_capacity(2_048);
+        let initial = client_connection
+            .poll_transmit(now, 1, &mut client_buf)
+            .expect("client Initial datagram");
+        while let Some(event) = client_connection.poll_endpoint_events() {
+            client_endpoint.handle_event(client_handle, event);
+        }
+        let mut to_server = vec![client_buf[..initial.size].to_vec()];
+
+        for _ in 0..16 {
+            if worker
+                .contexts
+                .get(context.into())
+                .and_then(Context::connection)
+                .and_then(|connection| connection.connection_session)
+                .is_some()
+            {
+                break;
+            }
+            while let Some(packet) = to_server.pop() {
+                let (lower_rx, _) = sessions
+                    .fifo_pair(lower)
+                    .ok_or_else(|| QuicWorkerError::SessionMissing { session: lower })?;
+                let header = SessionDgramHeader::new(server_addr, client_addr, packet.len())
+                    .ok_or_else(|| QuicWorkerError::InvalidEndpoint {
+                        context,
+                        local: server_addr,
+                        remote: client_addr,
+                    })?;
+                let header_bytes = header.to_bytes();
+                assert_eq!(lower_rx.enqueue(&header_bytes), header_bytes.len());
+                assert_eq!(lower_rx.enqueue(&packet), packet.len());
+                worker.process_udp_rx(&mut sessions, lower, context, now)?;
+
+                let mut responses = Vec::new();
+                loop {
+                    let (_, lower_tx) = sessions
+                        .fifo_pair(lower)
+                        .ok_or_else(|| QuicWorkerError::SessionMissing { session: lower })?;
+                    if lower_tx.max_dequeue() < SessionDgramHeader::SIZE {
+                        break;
+                    }
+                    let mut header_bytes = [0u8; SessionDgramHeader::SIZE];
+                    assert_eq!(
+                        lower_tx.peek(0, header_bytes.len(), &mut header_bytes),
+                        header_bytes.len()
+                    );
+                    let Some(header) = SessionDgramHeader::from_bytes(&header_bytes) else {
+                        break;
+                    };
+                    let payload_len = header.data_length() as usize;
+                    let record_len =
+                        header
+                            .total_len()
+                            .ok_or_else(|| QuicWorkerError::InvalidDatagram {
+                                session: lower,
+                                length: header.data_length(),
+                            })?;
+                    if lower_tx.max_dequeue() < record_len {
+                        break;
+                    }
+                    let mut payload = vec![0; payload_len];
+                    assert_eq!(
+                        lower_tx.peek(SessionDgramHeader::SIZE, payload_len, &mut payload),
+                        payload_len
+                    );
+                    assert_eq!(lower_tx.dequeue_drop(record_len), record_len);
+                    responses.push(payload);
+                }
+                for response in responses {
+                    let mut data = response;
+                    let mut descriptors = Vec::new();
+                    let mut endpoint_buf = BytesMut::with_capacity(2_048);
+                    if let Some(event) = client_endpoint.handle_scratch_with_descriptors(
+                        now,
+                        server_addr,
+                        None,
+                        None,
+                        &mut data,
+                        &mut descriptors,
+                        &mut endpoint_buf,
+                    ) {
+                        match event {
+                            DatagramEvent::ConnectionEvent(handle, event)
+                                if handle == client_handle =>
+                            {
+                                client_connection.handle_event(event);
+                            }
+                            DatagramEvent::Response(transmit) => {
+                                let size = transmit.size;
+                                to_server.push(endpoint_buf[..size].to_vec());
+                            }
+                            DatagramEvent::NewConnection(_)
+                            | DatagramEvent::ConnectionEvent(_, _) => {}
+                        }
+                    }
+                    while let Some(event) = client_connection.poll_endpoint_events() {
+                        client_endpoint.handle_event(client_handle, event);
+                    }
+                    let mut client_buf = BytesMut::with_capacity(2_048);
+                    while let Some(transmit) =
+                        client_connection.poll_transmit(now, 1, &mut client_buf)
+                    {
+                        to_server.push(client_buf[..transmit.size].to_vec());
+                        client_buf.clear();
+                    }
+                }
+            }
+        }
+
+        let connection_session = worker
+            .contexts
+            .get(context.into())
+            .and_then(Context::connection)
+            .and_then(|connection| connection.connection_session)
+            .expect("QUIC handshake publishes one Connection Session");
+        assert_eq!(
+            sessions.session_transport(connection_session),
+            Some((QuicWorker::ID, context.into()))
+        );
+        Ok(())
     }
 }
