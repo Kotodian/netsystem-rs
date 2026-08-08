@@ -64,8 +64,12 @@ impl SessionMain {
             }
         };
         match result {
-            Ok(handle) => ApplicationSessionReply::success(context, handle),
-            Err(status) => ApplicationSessionReply::rejected(context, status),
+            Ok(handle) => ApplicationSessionReply::response(
+                context,
+                ApplicationSessionStatus::Success,
+                handle,
+            ),
+            Err(status) => ApplicationSessionReply::response(context, status, 0),
         }
     }
 
@@ -128,12 +132,7 @@ impl SessionMain {
             server_name,
         );
         match self.connect(transport, endpoint) {
-            Ok(_) => {
-                self.applications()
-                    .reclaim_connection(application, application_connection)
-                    .expect("completed Session connect leaves its Application connection available for reclamation");
-                Ok(application_connection.raw())
-            }
+            Ok(_) => Ok(application_connection.raw()),
             Err(_) => {
                 self.applications()
                     .remove_connection(application, application_connection)

@@ -1,7 +1,7 @@
 use hammer_core::data_plane::NodeId;
 use hammer_infra::fifo::FifoError;
-use hammer_runtime::SessionListenerId;
-use hammer_runtime::app::ApplicationId;
+use hammer_runtime::app::{ApplicationId, ApplicationSessionStatus};
+use hammer_runtime::{RuntimeError, SessionListenerId};
 use thiserror::Error;
 
 use super::SessionId;
@@ -60,6 +60,50 @@ impl SessionQueueError {
             Self::SessionAppContextCreateUnsupported => 8,
             Self::SessionAppAlreadyInstalled { .. } => 9,
             Self::SessionAppNotInstalled { .. } => 10,
+        }
+    }
+}
+
+/// One final active-connect failure before a Session exists.
+///
+/// This is the Session-owned error category at the transport-to-Session seam.
+/// Quinn and other transport errors are classified by the owning plugin and
+/// translated once into this type; the wire status remains
+/// [`ApplicationSessionStatus`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Error)]
+pub enum SessionConnectError {
+    #[error("TLS alert {alert}")]
+    TlsAlert { alert: u8 },
+    #[error("QUIC version is unsupported")]
+    QuicVersionUnsupported,
+    #[error("QUIC handshake timed out")]
+    TimedOut,
+    #[error("the peer refused the connection")]
+    ConnectionRefused,
+    #[error("the peer reset the connection")]
+    ConnectionReset,
+    #[error("the peer closed the connection with code {code}")]
+    PeerClosed { code: u64 },
+    #[error("QUIC transport error {code}")]
+    QuicTransportError { code: u64 },
+    #[error("local QUIC connection resources are exhausted")]
+    LocalResourceExhausted,
+    #[error("the local connection closed during the handshake")]
+    LocalClosed,
+}
+
+impl From<SessionConnectError> for ApplicationSessionStatus {
+    fn from(error: SessionConnectError) -> Self {
+        match error {
+            SessionConnectError::TlsAlert { alert } => Self::TlsAlert { alert },
+            SessionConnectError::QuicVersionUnsupported => Self::QuicVersionUnsupported,
+            SessionConnectError::TimedOut => Self::HandshakeTimedOut,
+            SessionConnectError::ConnectionRefused => Self::ConnectionRefused,
+            SessionConnectError::ConnectionReset => Self::ConnectionReset,
+            SessionConnectError::PeerClosed { code } => Self::PeerClosed { code },
+            SessionConnectError::QuicTransportError { code } => Self::QuicTransportError { code },
+            SessionConnectError::LocalResourceExhausted => Self::LocalConnectionResourceExhausted,
+            SessionConnectError::LocalClosed => Self::LocalConnectionClosed,
         }
     }
 }
@@ -138,6 +182,13 @@ pub(crate) enum SessionError {
     TransportListenUnsupported { transport: &'static str },
     #[error("Session transport `{transport}` does not register active-open")]
     TransportConnectUnsupported { transport: &'static str },
+    #[error("Session {session_id:?} connect publication failed and its cleanup failed")]
+    ConnectPublicationCleanup {
+        session_id: SessionId,
+        #[source]
+        publication: RuntimeError,
+        cleanup: RuntimeError,
+    },
 }
 
 #[cfg(test)]

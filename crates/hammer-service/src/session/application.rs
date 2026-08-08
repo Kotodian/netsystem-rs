@@ -487,6 +487,19 @@ impl ApplicationMain {
             completion: AtomicU8::new(CONNECTION_PENDING),
         };
         self.with_state_mut(|state| {
+            let completed = state
+                .connections
+                .iter()
+                .filter_map(|(index, connection)| {
+                    (connection.completion.load(Ordering::Acquire) == CONNECTION_COMPLETED)
+                        .then_some(index)
+                })
+                .collect::<Vec<_>>();
+            for index in completed {
+                state.connections.remove(index).expect(
+                    "completed Application connection remains present until allocation reclaim",
+                );
+            }
             state
                 .connections
                 .insert(connection)
@@ -984,6 +997,24 @@ mod tests {
         );
         let replacement = register_connection(&main, application);
         assert_ne!(connection, replacement);
+    }
+
+    #[test]
+    fn register_connection_reclaims_completed_connections_before_capacity_check() {
+        let main = ApplicationMain::new(1);
+        let application = main.attach().expect("attach Application");
+        let completed = register_connection(&main, application);
+
+        main.complete_connection(completed)
+            .expect("complete Application connection");
+        let replacement = register_connection(&main, application);
+
+        assert_ne!(completed, replacement);
+        assert!(matches!(
+            main.with_connection(completed, |_| ()),
+            Err(ApplicationError::ConnectionMissing { connection }) if connection == completed
+        ));
+        assert!(main.with_connection(replacement, |_| ()).is_ok());
     }
 
     #[test]
