@@ -338,6 +338,7 @@ pub(crate) fn connect(endpoint: SessionConnectEndpoint) -> RuntimeResult<()> {
                         endpoint.application,
                         None,
                         endpoint.opaque,
+                        endpoint.connection,
                     )
                 });
                 if completion.send(result).is_err() {

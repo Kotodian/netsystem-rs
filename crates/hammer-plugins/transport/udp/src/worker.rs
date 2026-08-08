@@ -88,6 +88,7 @@ impl UdpListenerCell {
         unsafe { &*self.value.get() }
     }
 
+    #[allow(clippy::mut_from_ref)]
     #[inline]
     fn get_mut(&self) -> &mut Vec<UdpListener> {
         // SAFETY: only the main/control thread mutates this list and only
@@ -278,34 +279,15 @@ impl UdpWorker {
                         remote| {
             udp.rollback_accept(sessions, session_id, index, local, remote)
         };
-        let initial = match sessions.connection_published(session_id) {
-            Ok(initial) => initial,
-            Err(error) => {
-                if let Err(cleanup_error) =
-                    rollback(sessions, self, session_id, index, local, remote)
-                {
-                    tracing::error!(
-                        ?session_id,
-                        %cleanup_error,
-                        "UDP accept publication rollback failed"
-                    );
-                }
-                return Err(error);
+        if let Err(error) = sessions.complete_stream_connect(session_id) {
+            if let Err(cleanup_error) = rollback(sessions, self, session_id, index, local, remote) {
+                tracing::error!(
+                    ?session_id,
+                    %cleanup_error,
+                    "UDP accept App publication rollback failed"
+                );
             }
-        };
-        if initial {
-            if let Err(error) = sessions.connected(session_id) {
-                if let Err(cleanup_error) =
-                    rollback(sessions, self, session_id, index, local, remote)
-                {
-                    tracing::error!(
-                        ?session_id,
-                        %cleanup_error,
-                        "UDP accept App publication rollback failed"
-                    );
-                }
-                return Err(error);
-            }
+            return Err(error);
         }
         Ok((index, session_id))
     }
@@ -328,7 +310,7 @@ impl UdpWorker {
         let connection_state = UdpConnection::connected(self.worker, local, remote)
             .ok_or(UdpTransportError::InvalidConnection)?;
         let index = self.insert_connection(connection_state)?;
-        let session_id = match sessions.stream_connect(UdpWorker::ID, index, connection) {
+        let session_id = match sessions.stream_connect_pending(UdpWorker::ID, index, connection) {
             Ok(session_id) => session_id,
             Err(error) => {
                 self.remove_connection(index);
@@ -345,18 +327,9 @@ impl UdpWorker {
         }
         self.lookup.insert_tuple(index, local, remote);
         self.insert_session_lookup(session_id, local, remote);
-        let initial = match sessions.connection_published(session_id) {
-            Ok(initial) => initial,
-            Err(error) => {
-                self.rollback_accept(sessions, session_id, index, local, remote)?;
-                return Err(error);
-            }
-        };
-        if initial {
-            if let Err(error) = sessions.connected(session_id) {
-                self.rollback_accept(sessions, session_id, index, local, remote)?;
-                return Err(error);
-            }
+        if let Err(error) = sessions.complete_stream_connect(session_id) {
+            self.rollback_accept(sessions, session_id, index, local, remote)?;
+            return Err(error);
         }
         Ok(session_id)
     }

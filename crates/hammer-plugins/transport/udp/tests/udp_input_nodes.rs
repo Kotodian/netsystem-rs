@@ -99,6 +99,7 @@ impl CaptureCell {
         unsafe { &*self.state.get() }
     }
 
+    #[allow(clippy::mut_from_ref)]
     fn borrow_mut(&self) -> &mut CaptureState {
         unsafe { &mut *self.state.get() }
     }

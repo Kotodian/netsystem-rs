@@ -5,7 +5,9 @@ use thiserror::Error;
 
 use crate::{DataWorkerId, SessionListenEndpoint, SessionListenerId};
 
-use super::{ApplicationConnectionId, SessionAppId, SessionMsgQueue, SessionMsgQueueError};
+use super::{
+    ApplicationConnectionId, SessionAppId, SessionHandle, SessionMsgQueue, SessionMsgQueueError,
+};
 
 pub const APPLICATION_SESSION_CONTROL_BYTES: usize = 2048;
 
@@ -72,46 +74,91 @@ pub enum ApplicationSessionStatus {
     TransportUnlistenFailed,
     TransportConnectUnsupported,
     TransportConnectFailed,
+    TlsAlert { alert: u8 },
+    QuicVersionUnsupported,
+    HandshakeTimedOut,
+    ConnectionRefused,
+    ConnectionReset,
+    PeerClosed { code: u64 },
+    QuicTransportError { code: u64 },
+    LocalConnectionResourceExhausted,
+    LocalConnectionClosed,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-pub struct ApplicationSessionReply {
-    context: u64,
-    status: ApplicationSessionStatus,
-    handle: u64,
+pub enum ApplicationSessionReply {
+    Response {
+        context: u64,
+        status: ApplicationSessionStatus,
+        handle: u64,
+    },
+    Connected {
+        connection: ApplicationConnectionId,
+        session: SessionHandle,
+    },
+    ConnectFailed {
+        connection: ApplicationConnectionId,
+        status: ApplicationSessionStatus,
+    },
 }
 
 impl ApplicationSessionReply {
-    pub const fn success(context: u64, handle: u64) -> Self {
-        Self {
+    pub const fn response(context: u64, status: ApplicationSessionStatus, handle: u64) -> Self {
+        Self::Response {
             context,
-            status: ApplicationSessionStatus::Success,
+            status,
             handle,
         }
     }
 
-    pub const fn rejected(context: u64, status: ApplicationSessionStatus) -> Self {
-        Self {
-            context,
-            status,
-            handle: 0,
+    pub const fn connected(connection: ApplicationConnectionId, session: SessionHandle) -> Self {
+        Self::Connected {
+            connection,
+            session,
         }
     }
 
+    pub const fn connect_failed(
+        connection: ApplicationConnectionId,
+        status: ApplicationSessionStatus,
+    ) -> Self {
+        Self::ConnectFailed { connection, status }
+    }
+
     pub const fn context(self) -> u64 {
-        self.context
+        match self {
+            Self::Response { context, .. } => context,
+            Self::Connected { connection, .. } | Self::ConnectFailed { connection, .. } => {
+                connection.raw()
+            }
+        }
     }
 
     pub const fn status(self) -> ApplicationSessionStatus {
-        self.status
+        match self {
+            Self::Response { status, .. } | Self::ConnectFailed { status, .. } => status,
+            Self::Connected { .. } => ApplicationSessionStatus::Success,
+        }
+    }
+
+    pub const fn is_response(self) -> bool {
+        matches!(self, Self::Response { .. })
     }
 
     pub const fn listener(self) -> SessionListenerId {
-        SessionListenerId::from_raw(self.handle)
+        match self {
+            Self::Response { handle, .. } => SessionListenerId::from_raw(handle),
+            Self::Connected { .. } | Self::ConnectFailed { .. } => SessionListenerId::from_raw(0),
+        }
     }
 
     pub const fn connection(self) -> ApplicationConnectionId {
-        ApplicationConnectionId::from_raw(self.handle)
+        match self {
+            Self::Response { handle, .. } => ApplicationConnectionId::from_raw(handle),
+            Self::Connected { connection, .. } | Self::ConnectFailed { connection, .. } => {
+                connection
+            }
+        }
     }
 }
 

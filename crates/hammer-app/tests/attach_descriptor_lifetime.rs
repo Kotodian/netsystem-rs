@@ -1,4 +1,4 @@
-//! Attach-protocol v2 integration tests: per-Application Rx MQ publication,
+//! Attach-protocol v3 integration tests: per-Application Rx MQ publication,
 //! AppClient worker mapping, session publication, and descriptor lifetime on
 //! every failure path.
 
@@ -15,8 +15,10 @@ use hammer_app::attach::{AppClient, AppClientError};
 use hammer_infra::fifo::Fifo;
 use hammer_infra::segment::Segment;
 use hammer_runtime::app::{
-    AppSession, ApplicationId, SessionEventQueue, SessionEvtType, SessionHandle, SessionMsgQueue,
-    SessionOffsets,
+    AppSession, ApplicationConnectionId, ApplicationId, ApplicationSessionReply,
+    ApplicationSessionRequest, ApplicationSessionStatus, SessionEventQueue, SessionEvtType,
+    SessionHandle, SessionMsgQueue, SessionOffsets, dequeue_application_session_request,
+    enqueue_application_session_reply,
 };
 use hammer_runtime::attach::{
     APPLICATION_MQ_BASE_DESCRIPTOR_COUNT, APPLICATION_MQ_METADATA_WORDS, ATTACH_DESCRIPTOR_COUNT,
@@ -230,6 +232,40 @@ fn spawn_serve(
                 Ok::<ApplicationMqPublication, Infallible>(application_mqs.publication.clone())
             },
             |_, _, _| Ok(()),
+            |_| {},
+        ));
+    });
+}
+
+fn spawn_serve_with_control(
+    server: Arc<AppServer>,
+    first_application: ApplicationId,
+    application_mqs: ApplicationMqs,
+    control: impl Fn(
+        ApplicationId,
+        &SessionMsgQueue,
+        &SessionMsgQueue,
+    ) -> hammer_runtime::RuntimeResult<()>
+    + Send
+    + 'static,
+) {
+    let next_application = Arc::new(AtomicU64::new(first_application.raw()));
+    std::thread::spawn(move || {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("serve runtime");
+        let attach_sequence = Arc::clone(&next_application);
+        let _ = runtime.block_on(server.serve(
+            move || {
+                Ok::<ApplicationId, Infallible>(ApplicationId::from_raw(
+                    attach_sequence.fetch_add(1, Ordering::Relaxed),
+                ))
+            },
+            move |_| {
+                Ok::<ApplicationMqPublication, Infallible>(application_mqs.publication.clone())
+            },
+            control,
             |_| {},
         ));
     });
@@ -514,6 +550,116 @@ fn assert_publication_queue_reports_full_and_closed() {
         closed,
         RuntimeError::Attach(AttachError::PublicationQueueClosed)
     ));
+    let _ = std::fs::remove_file(path);
+}
+
+#[test]
+fn app_client_buffers_interleaved_connection_completion() {
+    let path = socket_path();
+    let path_text = path.to_str().expect("socket path").to_owned();
+    let server = Arc::new(AppServer::bind(&path_text, 4).expect("bind app server"));
+    let application = ApplicationId::from_raw(40);
+    let application_mqs = build_application_mqs();
+    let connection = ApplicationConnectionId::from_raw(0x4000_0001);
+    spawn_serve_with_control(
+        Arc::clone(&server),
+        application,
+        application_mqs,
+        move |_, requests, replies| {
+            let request = dequeue_application_session_request(requests)
+                .expect("dequeue Application Session request")
+                .expect("listen request");
+            let context = match request {
+                ApplicationSessionRequest::Listen { context, .. } => context,
+                ApplicationSessionRequest::Connect { .. }
+                | ApplicationSessionRequest::Unlisten { .. } => {
+                    panic!("unexpected request in interleaving test")
+                }
+            };
+            enqueue_application_session_reply(
+                replies,
+                &ApplicationSessionReply::connect_failed(
+                    connection,
+                    ApplicationSessionStatus::HandshakeTimedOut,
+                ),
+            )
+            .expect("enqueue asynchronous connection completion");
+            enqueue_application_session_reply(
+                replies,
+                &ApplicationSessionReply::response(
+                    context,
+                    ApplicationSessionStatus::Success,
+                    0x4000_0002,
+                ),
+            )
+            .expect("enqueue listen response");
+            Ok(())
+        },
+    );
+
+    let mut client = AppClient::attach(&path_text).expect("attach client");
+    let listener = client
+        .listen(
+            "test",
+            hammer_runtime::SessionListenEndpoint::new(
+                "127.0.0.1:0".parse().expect("listen endpoint"),
+                hammer_runtime::DataWorkerId::new(0),
+            ),
+            None,
+            None,
+        )
+        .expect("listen response after asynchronous completion");
+    assert_eq!(listener.raw(), 0x4000_0002);
+
+    let error = client
+        .wait_connection(connection)
+        .expect_err("buffered asynchronous connection failure");
+    assert!(matches!(
+        error,
+        AppClientError::SessionConnectFailed {
+            connection: actual,
+            status: ApplicationSessionStatus::HandshakeTimedOut,
+        } if actual == connection
+    ));
+    drop(client);
+    let _ = std::fs::remove_file(path);
+}
+
+#[test]
+fn app_client_rejects_connected_completion_with_mismatched_session_handle() {
+    let path = socket_path();
+    let path_text = path.to_str().expect("socket path").to_owned();
+    let server = Arc::new(AppServer::bind(&path_text, 4).expect("bind app server"));
+    let publisher = server.publisher();
+    let application = ApplicationId::from_raw(41);
+    let actual_handle = SessionHandle::new(41, 1);
+    let wrong_handle = SessionHandle::new(42, 1);
+    let published = build_publication(application, actual_handle);
+    let mut publication = published.publication;
+    let connection = ApplicationConnectionId::from_raw(0x4100_0001);
+    publication
+        .set_connect_completion(ApplicationSessionReply::connected(connection, wrong_handle));
+    spawn_serve(
+        Arc::clone(&server),
+        application,
+        published.application_mqs.clone(),
+    );
+
+    let client = AppClient::attach(&path_text).expect("attach client");
+    publisher
+        .try_publish(&publication)
+        .expect("publish connected completion");
+    let error = client
+        .wait_connection(connection)
+        .expect_err("mismatched connected Session handle");
+    assert!(matches!(
+        error,
+        AppClientError::SessionHandleMismatch {
+            expected,
+            actual,
+        } if expected == wrong_handle && actual == actual_handle
+    ));
+    drop(client);
     let _ = std::fs::remove_file(path);
 }
 

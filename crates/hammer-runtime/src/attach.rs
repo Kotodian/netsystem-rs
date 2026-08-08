@@ -2,6 +2,7 @@ use std::collections::{HashMap, VecDeque};
 use std::io;
 use std::os::fd::RawFd;
 use std::sync::{Arc, Weak};
+use std::time::Duration;
 
 use crossbeam_queue::ArrayQueue;
 use hammer_infra::segment::Segment;
@@ -9,8 +10,11 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::Notify;
 
 use crate::app::SessionMsgQueue;
-use crate::app::{AppSession, ApplicationId, SessionEventQueue, SessionOffsets};
-use crate::{AttachError, RuntimeResult};
+use crate::app::{
+    AppSession, ApplicationId, ApplicationSessionMqError, ApplicationSessionReply,
+    SessionEventQueue, SessionMsgQueueError, SessionOffsets, enqueue_application_session_reply,
+};
+use crate::{AttachError, RuntimeError, RuntimeResult};
 
 mod application;
 mod descriptor;
@@ -23,7 +27,7 @@ pub use application::{
     METADATA_WORDS as APPLICATION_MQ_METADATA_WORDS,
 };
 
-pub const ATTACH_PROTOCOL_VERSION: u64 = 2;
+pub const ATTACH_PROTOCOL_VERSION: u64 = 3;
 pub const ATTACH_REQUEST_BYTES: usize = size_of::<u64>();
 pub const ATTACH_REPLY_WORDS: usize = 3;
 pub const ATTACH_REPLY_BYTES: usize = ATTACH_REPLY_WORDS * size_of::<u64>();
@@ -40,6 +44,8 @@ pub struct AppSessionPublication {
     application: ApplicationId,
     session_segment: Segment,
     offsets: SessionOffsets,
+    completion: Option<ApplicationSessionReply>,
+    descriptors_sent: bool,
 }
 
 impl AppSessionPublication {
@@ -60,13 +66,35 @@ impl AppSessionPublication {
             application,
             session_segment,
             offsets,
+            completion: None,
+            descriptors_sent: false,
         })
+    }
+
+    /// Attaches the VPP `session_connected_msg_t` completion to a Session
+    /// publication. The attach server sends descriptors first, then writes
+    /// this completion to the existing CTRL reply queue.
+    pub fn set_connect_completion(&mut self, completion: ApplicationSessionReply) {
+        self.completion = Some(completion);
     }
 }
 
+enum AppPublication {
+    Session(AppSessionPublication),
+    ConnectFailed {
+        application: ApplicationId,
+        reply: ApplicationSessionReply,
+    },
+}
+
 struct AppSessionPublicationQueue {
-    entries: ArrayQueue<AppSessionPublication>,
+    entries: ArrayQueue<AppPublication>,
     ready: Notify,
+}
+
+enum PublicationSendError {
+    Retry,
+    Fatal(RuntimeError),
 }
 
 #[derive(Clone)]
@@ -82,7 +110,26 @@ impl AppSessionPublisher {
             .ok_or(AttachError::PublicationQueueClosed)?;
         queue
             .entries
-            .push(publication.clone())
+            .push(AppPublication::Session(publication.clone()))
+            .map_err(|_| AttachError::PublicationQueueFull)?;
+        queue.ready.notify_one();
+        Ok(())
+    }
+
+    /// Queues an active-connect failure completion on the existing attach
+    /// publication queue. No Session descriptors are sent.
+    pub fn try_publish_connect_failure(
+        &self,
+        application: ApplicationId,
+        reply: ApplicationSessionReply,
+    ) -> RuntimeResult<()> {
+        let queue = self
+            .queue
+            .upgrade()
+            .ok_or(AttachError::PublicationQueueClosed)?;
+        queue
+            .entries
+            .push(AppPublication::ConnectFailed { application, reply })
             .map_err(|_| AttachError::PublicationQueueFull)?;
         queue.ready.notify_one();
         Ok(())
@@ -151,21 +198,37 @@ impl AppServer {
         let (detached_tx, mut detached_rx) = tokio::sync::mpsc::channel(self.capacity);
         let (control_tx, mut control_rx) = tokio::sync::mpsc::channel(self.capacity);
         let mut clients = HashMap::<ApplicationId, AttachedApplication>::new();
-        let mut publications = HashMap::<ApplicationId, VecDeque<AppSessionPublication>>::new();
+        let mut publications = HashMap::<ApplicationId, VecDeque<AppPublication>>::new();
+        let mut retry_tick = tokio::time::interval(Duration::from_millis(1));
+        retry_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
         loop {
             while let Some(publication) = self.publications.entries.pop() {
-                let application = publication.application;
+                let application = match &publication {
+                    AppPublication::Session(publication) => publication.application,
+                    AppPublication::ConnectFailed { application, .. } => *application,
+                };
                 match clients
                     .get(&application)
                     .map(|client| Arc::clone(&client.stream))
                 {
                     Some(client) => {
-                        if let Err(error) = send_publication(&client, &publication).await {
-                            tracing::warn!(%error, ?application, "failed to publish App Session");
-                            if clients.remove(&application).is_some() {
-                                publications.remove(&application);
-                                application_detached(application);
+                        let replies = Arc::clone(&clients[&application].replies);
+                        let mut publication = publication;
+                        match send_publication(&client, &replies, &mut publication).await {
+                            Ok(()) => {}
+                            Err(PublicationSendError::Retry) => {
+                                publications
+                                    .entry(application)
+                                    .or_default()
+                                    .push_front(publication);
+                            }
+                            Err(PublicationSendError::Fatal(error)) => {
+                                tracing::warn!(%error, ?application, "failed to publish App Session");
+                                if clients.remove(&application).is_some() {
+                                    publications.remove(&application);
+                                    application_detached(application);
+                                }
                             }
                         }
                     }
@@ -331,13 +394,18 @@ impl AppServer {
                         let _ = detached_tx.send(application).await;
                     });
                     if let Some(mut pending) = publications.remove(&application) {
-                        while let Some(publication) = pending.pop_front() {
-                            if let Err(error) = send_publication(&client, &publication).await {
+                        let replies = Arc::clone(&clients[&application].replies);
+                        match flush_publications(&client, &replies, &mut pending).await {
+                            Ok(()) | Err(PublicationSendError::Retry) => {
+                                if !pending.is_empty() {
+                                    publications.insert(application, pending);
+                                }
+                            }
+                            Err(PublicationSendError::Fatal(error)) => {
                                 tracing::warn!(%error, ?application, "failed to publish App Session");
                                 if clients.remove(&application).is_some() {
                                     application_detached(application);
                                 }
-                                break;
                             }
                         }
                     }
@@ -365,6 +433,41 @@ impl AppServer {
                     }
                 }
                 () = self.publications.ready.notified() => {}
+                _ = retry_tick.tick(), if publications.iter().any(|(application, pending)| {
+                    !pending.is_empty() && clients.contains_key(application)
+                }) => {
+                    let pending_applications = publications
+                        .keys()
+                        .copied()
+                        .filter(|application| clients.contains_key(application))
+                        .collect::<Vec<_>>();
+                    for application in pending_applications {
+                        let Some(mut pending) = publications.remove(&application) else {
+                            continue;
+                        };
+                        let Some(client) = clients
+                            .get(&application)
+                            .map(|client| Arc::clone(&client.stream))
+                        else {
+                            publications.insert(application, pending);
+                            continue;
+                        };
+                        let replies = Arc::clone(&clients[&application].replies);
+                        match flush_publications(&client, &replies, &mut pending).await {
+                            Ok(()) | Err(PublicationSendError::Retry) => {
+                                if !pending.is_empty() {
+                                    publications.insert(application, pending);
+                                }
+                            }
+                            Err(PublicationSendError::Fatal(error)) => {
+                                tracing::warn!(%error, ?application, "failed to retry App Session publication");
+                                if clients.remove(&application).is_some() {
+                                    application_detached(application);
+                                }
+                            }
+                        }
+                    }
+                }
             }
         }
     }
@@ -392,31 +495,79 @@ async fn send_attach_reply(
 
 async fn send_publication(
     client: &tokio::net::UnixStream,
-    current: &AppSessionPublication,
-) -> RuntimeResult<()> {
-    let descriptors: [RawFd; ATTACH_DESCRIPTOR_COUNT] = [
-        current
-            .session_segment
-            .shared_fd()
-            .ok_or(AttachError::SegmentDescriptorMissing)?,
-        current
-            .session
-            .evt_q()
-            .read_fd()
-            .ok_or(AttachError::SessionSignalMissing)?,
-    ];
-    let words = [
-        ATTACH_PROTOCOL_VERSION,
-        current.session.session_handle().raw(),
-        current.session_segment.size() as u64,
-        current.offsets.rx_fifo_off,
-        current.offsets.tx_fifo_off,
-        current.offsets.evt_q_off,
-    ];
-    let mut metadata = [0_u8; ATTACH_METADATA_BYTES];
-    for (chunk, word) in metadata.chunks_exact_mut(size_of::<u64>()).zip(words) {
-        chunk.copy_from_slice(&word.to_le_bytes());
-    }
+    replies: &SessionMsgQueue,
+    current: &mut AppPublication,
+) -> Result<(), PublicationSendError> {
+    match current {
+        AppPublication::ConnectFailed { reply, .. } => enqueue_completion(replies, reply),
+        AppPublication::Session(current) => {
+            if !current.descriptors_sent {
+                let descriptors: [RawFd; ATTACH_DESCRIPTOR_COUNT] = [
+                    current
+                        .session_segment
+                        .shared_fd()
+                        .ok_or(AttachError::SegmentDescriptorMissing)
+                        .map_err(|error| PublicationSendError::Fatal(error.into()))?,
+                    current
+                        .session
+                        .evt_q()
+                        .read_fd()
+                        .ok_or(AttachError::SessionSignalMissing)
+                        .map_err(|error| PublicationSendError::Fatal(error.into()))?,
+                ];
+                let words = [
+                    ATTACH_PROTOCOL_VERSION,
+                    current.session.session_handle().raw(),
+                    current.session_segment.size() as u64,
+                    current.offsets.rx_fifo_off,
+                    current.offsets.tx_fifo_off,
+                    current.offsets.evt_q_off,
+                ];
+                let mut metadata = [0_u8; ATTACH_METADATA_BYTES];
+                for (chunk, word) in metadata.chunks_exact_mut(size_of::<u64>()).zip(words) {
+                    chunk.copy_from_slice(&word.to_le_bytes());
+                }
 
-    descriptor::send(client, &metadata, &descriptors).await
+                descriptor::send(client, &metadata, &descriptors)
+                    .await
+                    .map_err(PublicationSendError::Fatal)?;
+                current.descriptors_sent = true;
+            }
+            match current.completion {
+                Some(reply) => enqueue_completion(replies, &reply),
+                None => Ok(()),
+            }
+        }
+    }
+}
+
+async fn flush_publications(
+    client: &tokio::net::UnixStream,
+    replies: &SessionMsgQueue,
+    pending: &mut VecDeque<AppPublication>,
+) -> Result<(), PublicationSendError> {
+    while let Some(mut publication) = pending.pop_front() {
+        match send_publication(client, replies, &mut publication).await {
+            Ok(()) => {}
+            Err(PublicationSendError::Retry) => {
+                pending.push_front(publication);
+                return Err(PublicationSendError::Retry);
+            }
+            Err(error) => return Err(error),
+        }
+    }
+    Ok(())
+}
+
+fn enqueue_completion(
+    replies: &SessionMsgQueue,
+    reply: &ApplicationSessionReply,
+) -> Result<(), PublicationSendError> {
+    match enqueue_application_session_reply(replies, reply) {
+        Ok(()) => Ok(()),
+        Err(ApplicationSessionMqError::ReplyEnqueue {
+            source: SessionMsgQueueError::ControlFull,
+        }) => Err(PublicationSendError::Retry),
+        Err(error) => Err(PublicationSendError::Fatal(error.into())),
+    }
 }

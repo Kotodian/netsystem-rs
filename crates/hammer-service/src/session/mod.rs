@@ -24,7 +24,7 @@ pub use application::{
     ApplicationError, ApplicationMain, ApplicationMqResources, ApplicationRegistration,
 };
 pub use config::Session;
-pub use error::SessionQueueError;
+pub use error::{SessionConnectError, SessionQueueError};
 pub use id::SessionId;
 pub use node::{AppSessionInputNode, SESSION_QUEUE_IO_BUDGET, SessionQueueNext, SessionQueueNode};
 pub use protocol::{

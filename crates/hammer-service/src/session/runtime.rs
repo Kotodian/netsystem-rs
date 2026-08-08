@@ -17,8 +17,9 @@ use hammer_infra::segment::Segment;
 use hammer_infra::thread_owned::ThreadOwned;
 use hammer_runtime::app::{
     AppSession, AppSessionConfig, AppSessionError, ApplicationConnectionId, ApplicationId,
-    ApplicationListenerId, SessionAppContext, SessionAppId, SessionDgramHeader, SessionEventQueue,
-    SessionEvt, SessionEvtFlags, SessionEvtType, SessionHandle, SessionMqRing, SessionMsgQueue,
+    ApplicationListenerId, ApplicationSessionReply, ApplicationSessionStatus, SessionAppContext,
+    SessionAppId, SessionDgramHeader, SessionEventQueue, SessionEvt, SessionEvtFlags,
+    SessionEvtType, SessionHandle, SessionMqRing, SessionMsgQueue,
 };
 use hammer_runtime::attach::AppSessionPublisher;
 use hammer_runtime::{
@@ -32,7 +33,7 @@ use hammer_runtime::{
 
 use crate::session::app::AppWorkerError;
 use crate::session::application::{ApplicationMain, ApplicationMqResources};
-use crate::session::error::{SessionError, SessionQueueError};
+use crate::session::error::{SessionConnectError, SessionError, SessionQueueError};
 use crate::session::node::{AppSessionInputNode, SessionQueueTransportDispatch};
 use crate::session::protocol::SessionAppCallbacks;
 use crate::session::state::SessionState;
@@ -150,6 +151,7 @@ struct SessionEntry<Index> {
     app_session: SessionAppContext,
     app_opaque: Option<u64>,
     server_name: Option<String>,
+    application_connection: Option<ApplicationConnectionId>,
     accepted: bool,
     lower_session: Option<SessionId>,
     rx_fifo: Arc<Fifo>,
@@ -175,6 +177,7 @@ impl<Index: Copy + Eq> SessionEntry<Index> {
             app_session: 0,
             app_opaque: None,
             server_name: None,
+            application_connection: None,
             accepted: false,
             lower_session: None,
             rx_fifo,
@@ -193,6 +196,7 @@ impl<Index: Copy + Eq> SessionEntry<Index> {
             app_session: 0,
             app_opaque: None,
             server_name: None,
+            application_connection: None,
             accepted: false,
             lower_session: None,
             rx_fifo,
@@ -898,6 +902,7 @@ impl<Index: Copy + Eq> SessionWorker<Index> {
             .saturating_add(self.new_io_events.len())
             .saturating_add(self.old_io_events.len())
             .saturating_add(self.app_rx_mq_pending.len())
+            .saturating_add(usize::from(self.app.has_pending_connected_sessions()))
     }
 
     fn apply_state(
@@ -1252,7 +1257,7 @@ impl<Index: Copy + Eq> SessionWorker<Index> {
         entry.app_session = context;
         entry.lower_session = Some(lower);
         self.app.attach_session(upper, app_session);
-        if let Err(error) = self.app.connected(upper) {
+        if let Err(error) = self.app.connected(upper).map(|_| ()) {
             let _ = self.entries.remove(upper.pool_index());
             self.app.detach_session(upper);
             return Err(error);
@@ -1297,14 +1302,42 @@ impl<Index: Copy + Eq> SessionWorker<Index> {
     pub fn publish_connected_transport_session(
         &mut self,
         session_id: SessionId,
+        completion: Option<ApplicationSessionReply>,
     ) -> RuntimeResult<()> {
-        self.connection_published(session_id)?;
+        if let Err(error) = self.connection_published(session_id) {
+            return Err(match self.remove_session(session_id) {
+                Ok(()) => error,
+                Err(cleanup) => SessionError::ConnectPublicationCleanup {
+                    session_id,
+                    publication: error,
+                    cleanup,
+                }
+                .into(),
+            });
+        }
+        if let Some(completion) = completion {
+            if let Err(error) = self.app.set_connect_completion(session_id, completion) {
+                return Err(match self.remove_session(session_id) {
+                    Ok(()) => error,
+                    Err(cleanup) => SessionError::ConnectPublicationCleanup {
+                        session_id,
+                        publication: error,
+                        cleanup,
+                    }
+                    .into(),
+                });
+            }
+        }
         if let Err(error) = self.connected(session_id) {
-            assert!(
-                self.remove_session(session_id).is_ok(),
-                "upper transport Session rollback failed"
-            );
-            return Err(error);
+            return Err(match self.remove_session(session_id) {
+                Ok(()) => error,
+                Err(cleanup) => SessionError::ConnectPublicationCleanup {
+                    session_id,
+                    publication: error,
+                    cleanup,
+                }
+                .into(),
+            });
         }
         Ok(())
     }
@@ -1600,6 +1633,20 @@ impl<Index: Copy + Eq> SessionWorker<Index> {
         index: Index,
         connection: SessionConnectionId,
     ) -> RuntimeResult<SessionId> {
+        let session_id = self.stream_connect_pending(transport, index, connection)?;
+        self.complete_stream_connect(session_id)?;
+        Ok(session_id)
+    }
+
+    /// Constructs the Session owned by a transport half-open connection.
+    /// Publication and application notification remain deferred until the
+    /// transport reports that the connection is established.
+    pub fn stream_connect_pending(
+        &mut self,
+        transport: SessionTransportId,
+        index: Index,
+        connection: SessionConnectionId,
+    ) -> RuntimeResult<SessionId> {
         let application_connection = ApplicationConnectionId::from_raw(connection.raw());
         let applications = Arc::clone(&self.applications);
         let session_id = applications
@@ -1616,11 +1663,48 @@ impl<Index: Copy + Eq> SessionWorker<Index> {
                 )
             })
             .map_err(RuntimeError::from)??;
-        if let Err(source) = applications.complete_connection(application_connection) {
-            self.remove_session(session_id)?;
-            return Err(RuntimeError::from(source));
-        }
+        let entry = self
+            .entries
+            .get_mut(session_id.pool_index())
+            .ok_or(SessionError::SessionMissing { session_id })?;
+        entry.application_connection = Some(application_connection);
         Ok(session_id)
+    }
+
+    /// Completes a previously constructed transport connect transaction.
+    pub fn complete_stream_connect(&mut self, session_id: SessionId) -> RuntimeResult<()> {
+        let completion = self
+            .entries
+            .get(session_id.pool_index())
+            .and_then(|entry| entry.application_connection)
+            .filter(|_| self.app.app_session(session_id).is_some())
+            .map(|connection| {
+                ApplicationSessionReply::connected(connection, self.session_handle(session_id))
+            });
+        self.publish_connected_transport_session(session_id, completion)
+    }
+
+    pub fn stream_connect_failed(
+        &self,
+        connection: SessionConnectionId,
+        error: SessionConnectError,
+    ) -> RuntimeResult<bool> {
+        let application_connection = ApplicationConnectionId::from_raw(connection.raw());
+        let application = self
+            .applications
+            .with_connection(application_connection, |entry| entry.application())
+            .map_err(RuntimeError::from)?;
+        let completion = ApplicationSessionReply::connect_failed(
+            application_connection,
+            ApplicationSessionStatus::from(error),
+        );
+        let accepted = self.app.publish_connect_failed(application, completion)?;
+        if accepted {
+            self.applications
+                .complete_connection(application_connection)
+                .map_err(RuntimeError::from)?;
+        }
+        Ok(accepted)
     }
 
     fn construct_stream_sessions(
@@ -2172,7 +2256,15 @@ impl<Index: Copy + Eq> SessionWorker<Index> {
         });
         self.control_events = control_events;
         self.new_io_events = new_io_events;
-        Ok(app_mq_handled)
+        let pending_sessions = self.app.pending_connected_sessions();
+        let pending_session_count = pending_sessions.len();
+        for session_id in pending_sessions {
+            let accepted = self.dispatch_application(session_id, SessionEvtType::Connect)?;
+            if accepted {
+                self.complete_application_connection(session_id)?;
+            }
+        }
+        Ok(app_mq_handled.saturating_add(pending_session_count))
     }
 
     pub(crate) fn poll_session_events(&mut self) -> RuntimeResult<usize> {
@@ -2195,13 +2287,14 @@ impl<Index: Copy + Eq> SessionWorker<Index> {
         &mut self,
         session_id: SessionId,
         event: SessionEvtType,
-    ) -> RuntimeResult<()> {
+    ) -> RuntimeResult<bool> {
         let app = self
             .entries
             .get(session_id.pool_index())
             .and_then(|entry| entry.app);
         if let Some(app) = app {
-            return self.dispatch_app_event(session_id, app, event);
+            self.dispatch_app_event(session_id, app, event)?;
+            return Ok(true);
         }
         let application = self
             .entries
@@ -2211,14 +2304,15 @@ impl<Index: Copy + Eq> SessionWorker<Index> {
             Some(SessionApplication::External(_)) => match event {
                 SessionEvtType::RxEnq | SessionEvtType::TxDeq => {
                     let Some(session) = self.app.app_session(session_id) else {
-                        return Ok(());
+                        return Ok(true);
                     };
-                    session.push_io_event(event).map_err(RuntimeError::from)
+                    session.push_io_event(event).map_err(RuntimeError::from)?;
+                    Ok(true)
                 }
                 SessionEvtType::Connect => self.app.connected(session_id),
-                _ => Ok(()),
+                _ => Ok(true),
             },
-            None => Ok(()),
+            None => Ok(true),
         }
     }
 
@@ -2513,7 +2607,8 @@ impl<Index: Copy + Eq> SessionWorker<Index> {
                 .on_connected()
                 .ok_or(SessionError::NotPublished { session_id })?
         };
-        self.dispatch_application(session_id, SessionEvtType::Connect)?;
+        let publication_accepted =
+            self.dispatch_application(session_id, SessionEvtType::Connect)?;
         let entry = self
             .entries
             .get_mut(session_id.pool_index())
@@ -2522,6 +2617,30 @@ impl<Index: Copy + Eq> SessionWorker<Index> {
             panic!("validated transport Session retains its type during App publication");
         };
         *state = next_state;
+        if publication_accepted {
+            self.complete_application_connection(session_id)?;
+        }
+        Ok(())
+    }
+
+    fn complete_application_connection(&mut self, session_id: SessionId) -> RuntimeResult<()> {
+        let connection = self
+            .entries
+            .get(session_id.pool_index())
+            .and_then(|entry| entry.application_connection);
+        let Some(connection) = connection else {
+            return Ok(());
+        };
+        self.applications
+            .complete_connection(connection)
+            .map_err(RuntimeError::from)?;
+        let entry = self
+            .entries
+            .get_mut(session_id.pool_index())
+            .ok_or(SessionError::SessionMissing { session_id })?;
+        if entry.application_connection == Some(connection) {
+            entry.application_connection = None;
+        }
         Ok(())
     }
 
@@ -3813,7 +3932,7 @@ mod tests {
     }
 
     #[test]
-    fn app_publication_queue_full_keeps_session_rollback_eligible() {
+    fn app_publication_queue_full_keeps_active_session_pending() {
         let socket_path =
             std::path::PathBuf::from(format!("/tmp/hammer-sp-f-{}.sock", std::process::id()));
         let socket_path = socket_path.to_str().expect("socket path");
@@ -3879,21 +3998,78 @@ mod tests {
         sessions
             .connection_published(second)
             .expect("publish second connection");
-        let error = sessions
+        sessions
             .connected(second)
-            .expect_err("full publication queue rejects connection establishment");
-        assert!(matches!(
-            error,
-            RuntimeError::Attach(AttachError::PublicationQueueFull)
-        ));
+            .expect("full publication queue defers connection completion");
 
-        assert_eq!(
-            sessions
-                .rollback_session_creation(second)
-                .expect("publication failure remains rollback eligible"),
-            Some(second_index)
-        );
-        assert!(!sessions.has_session(second));
+        assert!(sessions.has_session(second));
+        assert!(sessions.rollback_session_creation(second).is_err());
+        assert!(sessions.app.has_pending_connected_sessions());
+    }
+
+    #[test]
+    fn app_control_queue_full_keeps_connect_retry_pending() {
+        let socket_path = std::path::PathBuf::from(format!(
+            "/tmp/hammer-sp-ctrl-full-{}.sock",
+            std::process::id()
+        ));
+        let socket_path = socket_path.to_str().expect("socket path");
+        let server = AppServer::bind(socket_path, 2).expect("bind App server");
+        let applications = ApplicationMain::new(1);
+        let application = applications.attach().expect("attach Application");
+        let queue = ApplicationMqResources::create_local(application, 1, 128)
+            .expect("Application MQ resources")
+            .queue(DataWorkerId::new(0))
+            .expect("worker Application MQ")
+            .clone();
+        let mut sessions = SessionWorker::<Index>::new(
+            DataWorkerId::new(0),
+            1,
+            hammer_runtime::app::AppSessionConfig::default(),
+            DEFAULT_SESSION_POOL_CAPACITY,
+            applications,
+            Some(server.publisher()),
+        )
+        .expect("Session worker with external App publication");
+        let mut runtime = DataPlaneRuntime::new(DataPlaneRuntimeConfig::default())
+            .for_worker(1, 0)
+            .expect("worker runtime");
+        sessions
+            .install_app_mq(
+                application,
+                queue,
+                hammer_core::data_plane::NodeId::new(0),
+                &mut runtime,
+            )
+            .expect("install worker Application MQ");
+
+        let session_id = sessions
+            .construct_stream_sessions(
+                SessionTransportId::new(1),
+                Index::new(1, 1),
+                1,
+                application,
+                None,
+                None,
+                None,
+                true,
+            )
+            .expect("accepted Session");
+        let session = sessions
+            .app_session(session_id)
+            .cloned()
+            .expect("external App Session");
+        while session.push_control_event(SessionEvtType::RxEnq).is_ok() {}
+
+        sessions
+            .connection_published(session_id)
+            .expect("publish connection");
+        sessions
+            .connected(session_id)
+            .expect("full CTRL queue defers connection notification");
+
+        assert!(sessions.has_session(session_id));
+        assert!(sessions.app.has_pending_connected_sessions());
     }
 
     #[test]
@@ -4711,7 +4887,7 @@ mod tests {
         );
 
         sessions
-            .publish_connected_transport_session(upper)
+            .publish_connected_transport_session(upper, None)
             .expect("publish connected upper transport Session");
         assert_eq!(SESSION_APP_CONNECTED_CALLS.load(Ordering::SeqCst), 0);
         let state =
@@ -4762,7 +4938,7 @@ mod tests {
             .create_upper_transport_session(lower, transport, transport_index, 0x55)
             .expect("create upper transport Session");
         sessions
-            .publish_connected_transport_session(upper)
+            .publish_connected_transport_session(upper, None)
             .expect("publish connected upper transport Session");
 
         sessions

@@ -148,20 +148,20 @@ pub(crate) fn publish_tcp_connection(
             Ok(_) => Ok(()),
         }
     };
-    let initial = match sessions.connection_published(session_id) {
-        Ok(initial) => initial,
-        Err(error) => {
-            if let Err(cleanup_error) = rollback(sessions, tcp) {
-                tracing::error!(
-                    ?session_id,
-                    %cleanup_error,
-                    "TCP connection publication rollback failed"
-                );
-            }
-            return Err(error);
-        }
-    };
     if close {
+        let initial = match sessions.connection_published(session_id) {
+            Ok(initial) => initial,
+            Err(error) => {
+                if let Err(cleanup_error) = rollback(sessions, tcp) {
+                    tracing::error!(
+                        ?session_id,
+                        %cleanup_error,
+                        "TCP connection publication rollback failed"
+                    );
+                }
+                return Err(error);
+            }
+        };
         let close_reason = tcp.connection(index).and_then(TcpConnection::close_reason);
         if initial {
             let error = TcpError::ConnectionClosed.into();
@@ -181,17 +181,15 @@ pub(crate) fn publish_tcp_connection(
         }
         let _ = tcp.remove_connection(index);
         sessions.notify_transport_deleted(session_id, index)?;
-    } else if initial {
-        if let Err(error) = sessions.connected(session_id) {
-            if let Err(cleanup_error) = rollback(sessions, tcp) {
-                tracing::error!(
-                    ?session_id,
-                    %cleanup_error,
-                    "App publication rollback failed"
-                );
-            }
-            return Err(error);
+    } else if let Err(error) = sessions.complete_stream_connect(session_id) {
+        if let Err(cleanup_error) = rollback(sessions, tcp) {
+            tracing::error!(
+                ?session_id,
+                %cleanup_error,
+                "App publication rollback failed"
+            );
         }
+        return Err(error);
     }
     Ok(())
 }
@@ -358,15 +356,16 @@ fn start_connect(
         TcpConnection::new(None, sessions.worker(), local.port(), Some(local), remote);
     transport.connect_state(initial_sequence);
     let connection_index = tcp.insert_connection(transport)?;
-    let session_id = match sessions.stream_connect(TcpWorker::ID, connection_index, connection) {
-        Ok(session_id) => session_id,
-        Err(error) => {
-            tcp.remove_connection(connection_index).expect(
-                "new TCP connection remains installed until Session construction completes",
-            );
-            return Err(error);
-        }
-    };
+    let session_id =
+        match sessions.stream_connect_pending(TcpWorker::ID, connection_index, connection) {
+            Ok(session_id) => session_id,
+            Err(error) => {
+                tcp.remove_connection(connection_index).expect(
+                    "new TCP connection remains installed until Session construction completes",
+                );
+                return Err(error);
+            }
+        };
     tcp.connection_mut(connection_index)
         .expect("new TCP connection remains installed until it binds its Session")
         .attach_session(session_id)
