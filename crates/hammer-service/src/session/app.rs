@@ -6,11 +6,12 @@ use hammer_infra::align::align_up;
 use hammer_infra::fifo::Fifo;
 use hammer_infra::segment::Segment;
 use hammer_runtime::app::{
-    AppSession, AppSessionConfig, AppSessionError, ApplicationId, SessionEventQueue,
-    SessionEvtType, SessionHandle, SessionMsgQueue, SessionMsgQueueError, SessionOffsets,
+    AppSession, AppSessionConfig, AppSessionError, ApplicationId, ApplicationSessionReply,
+    SessionEventQueue, SessionEvtType, SessionHandle, SessionMsgQueue, SessionMsgQueueError,
+    SessionOffsets,
 };
 use hammer_runtime::attach::{AppSessionPublication, AppSessionPublisher};
-use hammer_runtime::{RuntimeError, RuntimeResult};
+use hammer_runtime::{AttachError, RuntimeError, RuntimeResult};
 
 use crate::session::SessionId;
 
@@ -28,6 +29,8 @@ pub(crate) enum AppWorkerError {
     SessionSegmentSizeOverflow,
     #[error("listener segment cannot hold the session layout")]
     SessionSegmentExhausted,
+    #[error("App Session connect completion publication is unavailable")]
+    ConnectCompletionUnavailable,
 }
 
 pub struct AppWorker {
@@ -51,6 +54,8 @@ struct SessionSlot {
 struct AttachSlot {
     allocation_owner: Option<u64>,
     publication: Option<AppSessionPublication>,
+    connect_pending: bool,
+    connect_event_sent: bool,
 }
 
 struct SegmentManager {
@@ -329,22 +334,106 @@ impl AppWorker {
             .and_then(|slot| (slot.session_id == session_id).then_some(&slot.app_session))
     }
 
-    pub fn connected(&mut self, session_id: SessionId) -> RuntimeResult<()> {
+    pub fn connected(&mut self, session_id: SessionId) -> RuntimeResult<bool> {
         let Some(session) = self.app_session(session_id).cloned() else {
-            return Ok(());
+            return Ok(true);
         };
-        session
-            .push_control_event(SessionEvtType::Connect)
-            .map_err(RuntimeError::from)?;
-        self.notify_evt(&session);
-        let attach_slot = &mut self.attach_slots[session.session_handle().session_index() as usize];
-        if let (Some(publication), Some(publisher)) =
-            (attach_slot.publication.as_ref(), &self.publisher)
+        let index = session.session_handle().session_index() as usize;
+        self.attach_slots[index].connect_pending = true;
+        self.try_connected(&session)
+    }
+
+    fn try_connected(&mut self, session: &Arc<AppSession>) -> RuntimeResult<bool> {
+        let index = session.session_handle().session_index() as usize;
+        if !self.attach_slots[index].connect_event_sent {
+            match session.push_control_event(SessionEvtType::Connect) {
+                Ok(()) => {
+                    self.attach_slots[index].connect_event_sent = true;
+                    self.notify_evt(session);
+                }
+                Err(AppSessionError::EventQueueFull { .. }) => {}
+                Err(error) => return Err(error.into()),
+            }
+        }
+        let publisher = self.publisher.clone();
+        if let Some(publisher) = publisher
+            && let Some(publication) = self.attach_slots[index].publication.as_ref()
         {
-            publisher.try_publish(publication)?;
-            attach_slot.publication = None;
+            match publisher.try_publish(publication) {
+                Ok(()) => self.attach_slots[index].publication = None,
+                Err(RuntimeError::Attach(AttachError::PublicationQueueFull)) => {}
+                Err(error) => return Err(error),
+            }
+        }
+        let publication_accepted = self.attach_slots[index].publication.is_none();
+        if self.attach_slots[index].connect_event_sent && publication_accepted {
+            self.attach_slots[index].connect_pending = false;
+        }
+        Ok(publication_accepted)
+    }
+
+    pub(crate) fn pending_connected_sessions(&self) -> Vec<SessionId> {
+        self.session_slots
+            .iter()
+            .flatten()
+            .filter_map(|slot| {
+                let index = slot.app_session.session_handle().session_index() as usize;
+                self.attach_slots
+                    .get(index)
+                    .filter(|attach_slot| attach_slot.connect_pending)
+                    .map(|_| slot.session_id)
+            })
+            .collect()
+    }
+
+    pub(crate) fn has_pending_connected_sessions(&self) -> bool {
+        self.session_slots.iter().flatten().any(|slot| {
+            let index = slot.app_session.session_handle().session_index() as usize;
+            self.attach_slots
+                .get(index)
+                .is_some_and(|attach_slot| attach_slot.connect_pending)
+        })
+    }
+
+    pub(crate) fn set_connect_completion(
+        &mut self,
+        session_id: SessionId,
+        completion: ApplicationSessionReply,
+    ) -> RuntimeResult<()> {
+        let session = self.app_session(session_id).cloned().ok_or_else(|| {
+            RuntimeError::from(AppSessionError::NotFound {
+                app_worker: self.worker_index,
+                session: session_id.get(),
+            })
+        })?;
+        let index = session.session_handle().session_index() as usize;
+        let slot = self
+            .attach_slots
+            .get_mut(index)
+            .ok_or(AppWorkerError::ConnectCompletionUnavailable)?;
+        if self.publisher.is_some() {
+            let publication = slot
+                .publication
+                .as_mut()
+                .ok_or(AppWorkerError::ConnectCompletionUnavailable)?;
+            publication.set_connect_completion(completion);
         }
         Ok(())
+    }
+
+    pub(crate) fn publish_connect_failed(
+        &self,
+        application: ApplicationId,
+        completion: ApplicationSessionReply,
+    ) -> RuntimeResult<bool> {
+        let Some(publisher) = self.publisher.as_ref() else {
+            return Ok(true);
+        };
+        match publisher.try_publish_connect_failure(application, completion) {
+            Ok(()) => Ok(true),
+            Err(RuntimeError::Attach(AttachError::PublicationQueueFull)) => Ok(false),
+            Err(error) => Err(error),
+        }
     }
 
     pub fn disconnected(&self, session_id: SessionId) -> RuntimeResult<()> {
@@ -519,6 +608,8 @@ impl AppWorker {
         self.attach_slots[slot] = AttachSlot {
             allocation_owner: Some(allocation_owner),
             publication,
+            connect_pending: false,
+            connect_event_sent: false,
         };
         Ok(created.session)
     }

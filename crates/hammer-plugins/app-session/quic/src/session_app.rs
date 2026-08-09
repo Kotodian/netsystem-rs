@@ -173,7 +173,7 @@ fn close_lower_connection(
         if lower != session {
             return Err(QuicSessionError::ContextSessionMismatch { context, session }.into());
         }
-        quic.close_connection(sessions, context)
+        quic.close_connection(sessions, context, None)
     })
 }
 

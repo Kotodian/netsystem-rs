@@ -549,6 +549,7 @@ impl UdpInputSnapshotCell {
         unsafe { &*self.value.get() }
     }
 
+    #[allow(clippy::mut_from_ref)]
     #[inline]
     fn get_mut(&self) -> &mut UdpInputSnapshot {
         // SAFETY: callers hold the control-thread/barrier mutation contract.

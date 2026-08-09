@@ -12,16 +12,20 @@ use hammer_infra::pool::{Index, Pool};
 use hammer_infra::thread_owned::ThreadOwnedError;
 use hammer_infra::timer_wheel::TimerWheel1t2w2048sl;
 use hammer_runtime::app::{ApplicationId, SessionAppId, SessionDgramHeader};
-use hammer_runtime::{DataPlaneRuntime, DataWorkerId, RuntimeResult, SessionListenerId};
+use hammer_runtime::{
+    DataPlaneRuntime, DataWorkerId, RuntimeError, RuntimeResult, SessionConnectionId,
+    SessionListenerId,
+};
 use hammer_service::session::SessionId;
+use hammer_service::session::error::SessionConnectError;
 use hammer_service::session::node::{SessionQueueNext, SessionQueueOutput};
 use hammer_service::session::runtime::{
     SessionTransport, SessionTransportId, SessionWorker, TransportInternalTransport,
     TransportInternalTx,
 };
 use quinn_proto::{
-    Connection, ConnectionHandle, DatagramEvent, Endpoint, EndpointConfig, Event, PartialDecode,
-    StreamEvent,
+    Connection, ConnectionError, ConnectionHandle, DatagramEvent, Endpoint, EndpointConfig, Event,
+    PartialDecode, StreamEvent,
 };
 
 use crate::config::ConfigId;
@@ -37,6 +41,83 @@ const TIMER_RESOLUTION: Duration = Duration::from_millis(1);
 const TIMER_MAX_TICKS_PER_UPDATE: u32 = 1_024;
 const TIMER_EXPIRY_BUDGET: usize = 256;
 const TIMER_WHEEL_MAX_INTERVAL_TICKS: u64 = 2048 * 2048 - 1;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum QuicConnectionError {
+    TlsAlert { alert: u8 },
+    QuicVersionUnsupported,
+    TimedOut,
+    ConnectionRefused,
+    ConnectionReset,
+    PeerClosed { code: u64 },
+    QuicTransportError { code: u64 },
+    LocalResourceExhausted,
+    LocalClosed,
+}
+
+impl From<quinn_proto::TransportError> for QuicConnectionError {
+    fn from(error: quinn_proto::TransportError) -> Self {
+        let code = u64::from(error.code);
+        if (0x100..0x200).contains(&code) {
+            Self::TlsAlert {
+                alert: (code - 0x100) as u8,
+            }
+        } else {
+            Self::QuicTransportError { code }
+        }
+    }
+}
+
+impl From<quinn_proto::ConnectionClose> for QuicConnectionError {
+    fn from(error: quinn_proto::ConnectionClose) -> Self {
+        if error.error_code == quinn_proto::TransportErrorCode::CONNECTION_REFUSED {
+            Self::ConnectionRefused
+        } else {
+            Self::QuicTransportError {
+                code: u64::from(error.error_code),
+            }
+        }
+    }
+}
+
+impl From<quinn_proto::ApplicationClose> for QuicConnectionError {
+    fn from(error: quinn_proto::ApplicationClose) -> Self {
+        Self::PeerClosed {
+            code: u64::from(error.error_code),
+        }
+    }
+}
+
+impl From<ConnectionError> for QuicConnectionError {
+    fn from(error: ConnectionError) -> Self {
+        match error {
+            ConnectionError::VersionMismatch => Self::QuicVersionUnsupported,
+            ConnectionError::TransportError(error) => error.into(),
+            ConnectionError::ConnectionClosed(error) => error.into(),
+            ConnectionError::ApplicationClosed(error) => error.into(),
+            ConnectionError::Reset => Self::ConnectionReset,
+            ConnectionError::TimedOut => Self::TimedOut,
+            ConnectionError::LocallyClosed => Self::LocalClosed,
+            ConnectionError::CidsExhausted => Self::LocalResourceExhausted,
+        }
+    }
+}
+
+impl From<QuicConnectionError> for SessionConnectError {
+    fn from(error: QuicConnectionError) -> Self {
+        match error {
+            QuicConnectionError::TlsAlert { alert } => Self::TlsAlert { alert },
+            QuicConnectionError::QuicVersionUnsupported => Self::QuicVersionUnsupported,
+            QuicConnectionError::TimedOut => Self::TimedOut,
+            QuicConnectionError::ConnectionRefused => Self::ConnectionRefused,
+            QuicConnectionError::ConnectionReset => Self::ConnectionReset,
+            QuicConnectionError::PeerClosed { code } => Self::PeerClosed { code },
+            QuicConnectionError::QuicTransportError { code } => Self::QuicTransportError { code },
+            QuicConnectionError::LocalResourceExhausted => Self::LocalResourceExhausted,
+            QuicConnectionError::LocalClosed => Self::LocalClosed,
+        }
+    }
+}
 
 #[repr(C, align(64))]
 struct RxDatagramScratch {
@@ -113,7 +194,15 @@ struct EngineConnection {
     server_config: Option<Arc<quinn_proto::ServerConfig>>,
     application: ApplicationId,
     app: Option<SessionAppId>,
-    opaque: Option<u64>,
+    /// Application-supplied opaque for child Stream Sessions. Not VPP
+    /// `quic_ctx_t.client_opaque`.
+    app_opaque: Option<u64>,
+    /// VPP `quic_ctx_t.client_opaque`: outer active Application Connection
+    /// correlation retained through the handshake.
+    client_opaque: Option<SessionConnectionId>,
+    /// Outer Session listener retained through a passive handshake.
+    outer_listener: Option<SessionListenerId>,
+    pending_connect_error: Option<SessionConnectError>,
     client_config: Option<Arc<quinn_proto::ClientConfig>>,
     client_server_name: Option<String>,
     client_local: Option<SocketAddr>,
@@ -126,7 +215,9 @@ impl EngineConnection {
         server_config: Option<Arc<quinn_proto::ServerConfig>>,
         application: ApplicationId,
         app: Option<SessionAppId>,
-        opaque: Option<u64>,
+        app_opaque: Option<u64>,
+        client_opaque: Option<SessionConnectionId>,
+        outer_listener: Option<SessionListenerId>,
     ) -> Self {
         Self {
             handle: None,
@@ -136,7 +227,10 @@ impl EngineConnection {
             server_config,
             application,
             app,
-            opaque,
+            app_opaque,
+            client_opaque,
+            outer_listener,
+            pending_connect_error: None,
             client_config: None,
             client_server_name: None,
             client_local: None,
@@ -152,7 +246,8 @@ impl EngineConnection {
         remote: SocketAddr,
         application: ApplicationId,
         app: Option<SessionAppId>,
-        opaque: Option<u64>,
+        app_opaque: Option<u64>,
+        client_opaque: Option<SessionConnectionId>,
     ) -> Self {
         Self {
             handle: None,
@@ -162,7 +257,10 @@ impl EngineConnection {
             server_config: None,
             application,
             app,
-            opaque,
+            app_opaque,
+            client_opaque,
+            outer_listener: None,
+            pending_connect_error: None,
             client_config: Some(config),
             client_server_name: Some(server_name),
             client_local: Some(local),
@@ -247,7 +345,7 @@ impl Context {
         application: ApplicationId,
         listener_context: Option<&ListenerContext>,
         app: Option<SessionAppId>,
-        opaque: Option<u64>,
+        app_opaque: Option<u64>,
     ) -> Self {
         let server_config = listener_context.and_then(|listener| listener.server_config.clone());
         Self {
@@ -256,7 +354,9 @@ impl Context {
                     server_config,
                     application,
                     app,
-                    opaque,
+                    app_opaque,
+                    None,
+                    listener_context.map(|listener| listener.outer_listener),
                 ))),
                 lower_session,
                 connection_session: None,
@@ -270,9 +370,10 @@ impl Context {
 
     fn connection_with_client(
         lower_session: SessionId,
+        application_connection: SessionConnectionId,
         application: ApplicationId,
         app: Option<SessionAppId>,
-        opaque: Option<u64>,
+        app_opaque: Option<u64>,
         config: Arc<quinn_proto::ClientConfig>,
         server_name: String,
         local: SocketAddr,
@@ -287,7 +388,8 @@ impl Context {
                     remote,
                     application,
                     app,
-                    opaque,
+                    app_opaque,
+                    Some(application_connection),
                 ))),
                 lower_session,
                 connection_session: None,
@@ -372,7 +474,7 @@ const _: () = {
 #[repr(u32)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum QuicTimerKind {
-    Accept = 0,
+    Handshake = 0,
     Transmit = 1,
 }
 
@@ -385,7 +487,7 @@ impl QuicTimerKind {
     #[inline]
     const fn from_id(id: u32) -> Option<Self> {
         match id {
-            0 => Some(Self::Accept),
+            0 => Some(Self::Handshake),
             1 => Some(Self::Transmit),
             _ => None,
         }
@@ -561,19 +663,21 @@ impl QuicWorker {
             .ok_or_else(|| QuicWorkerError::ContextCapacityExhausted {
                 capacity: self.contexts.capacity(),
             })?;
-        self.timers
-            .set(
-                context,
-                QuicTimerKind::Accept,
-                Duration::from_millis(30_000),
-            )
-            .map_err(|error| {
-                assert!(
-                    self.remove_context(context).is_ok(),
-                    "QUIC connection context rollback failed after timer arm error"
-                );
-                error
-            })?;
+        if let Err(timer) = self.timers.set(
+            context,
+            QuicTimerKind::Handshake,
+            Duration::from_millis(30_000),
+        ) {
+            return match self.remove_context(context) {
+                Ok(()) => Err(timer),
+                Err(cleanup) => Err(QuicWorkerError::TimerUpdateCleanupFailed {
+                    context,
+                    timer,
+                    cleanup,
+                }
+                .into()),
+            };
+        }
         Ok(context)
     }
 
@@ -585,7 +689,8 @@ impl QuicWorker {
         remote: SocketAddr,
         application: ApplicationId,
         app: Option<SessionAppId>,
-        opaque: Option<u64>,
+        app_opaque: Option<u64>,
+        application_connection: SessionConnectionId,
     ) -> RuntimeResult<ContextId> {
         if self.contexts.len() == self.contexts.capacity() {
             return Err(QuicWorkerError::ContextCapacityExhausted {
@@ -597,16 +702,35 @@ impl QuicWorker {
             .contexts
             .insert(Context::connection_with_client(
                 SessionId::from_raw(0),
+                application_connection,
                 application,
                 app,
-                opaque,
+                app_opaque,
                 config,
                 server_name,
                 local,
                 remote,
             ))
-            .expect("client connect context capacity was preflighted");
-        Ok(ContextId::from(context))
+            .map(ContextId::from)
+            .ok_or_else(|| QuicWorkerError::ContextCapacityExhausted {
+                capacity: self.contexts.capacity(),
+            })?;
+        if let Err(error) = self.timers.set(
+            context,
+            QuicTimerKind::Handshake,
+            Duration::from_millis(30_000),
+        ) {
+            return match self.remove_context(context) {
+                Ok(()) => Err(error),
+                Err(cleanup) => Err(QuicWorkerError::TimerUpdateCleanupFailed {
+                    context,
+                    timer: error,
+                    cleanup,
+                }
+                .into()),
+            };
+        }
+        Ok(context)
     }
 
     pub(super) fn connect_connection(
@@ -657,8 +781,17 @@ impl QuicWorker {
             {
                 Ok(connection) => connection,
                 Err(source) => {
-                    let _ = self.remove_context(context);
-                    return Err(QuicWorkerError::ClientConnectFailed { context, source }.into());
+                    return match self.remove_context(context) {
+                        Ok(()) => {
+                            Err(QuicWorkerError::ClientConnectFailed { context, source }.into())
+                        }
+                        Err(cleanup) => Err(QuicWorkerError::ClientConnectCleanupFailed {
+                            context,
+                            connect: source,
+                            cleanup,
+                        }
+                        .into()),
+                    };
                 }
             };
         connection.set_stream_data_io(Some(io));
@@ -709,7 +842,7 @@ impl QuicWorker {
     }
 
     pub(super) fn remove_context(&mut self, context: ContextId) -> RuntimeResult<()> {
-        self.timers.stop(context, QuicTimerKind::Accept);
+        self.timers.stop(context, QuicTimerKind::Handshake);
         self.timers.stop(context, QuicTimerKind::Transmit);
         self.contexts
             .remove(context.into())
@@ -866,7 +999,7 @@ impl QuicWorker {
         engine.local = Some(local);
         let application = engine.application;
         let app = engine.app;
-        let opaque = engine.opaque;
+        let opaque = engine.app_opaque;
         let stream_error = {
             let (connection, io_table) = (&mut engine.connection, &mut engine.io_table);
             let connection = connection
@@ -967,7 +1100,6 @@ impl QuicWorker {
                 engine.connection = Some(connection);
                 engine.remote = Some(remote);
                 engine.local = Some(local);
-                self.timers.stop(context, QuicTimerKind::Accept);
                 self.queue_connection_output(context);
                 self.drain_connection_events(sessions, context, now)?;
                 Ok(QuicRxOutcome::Processed)
@@ -1049,57 +1181,65 @@ impl QuicWorker {
         context: ContextId,
         event: Event,
     ) -> RuntimeResult<()> {
-        let mut close = false;
+        let mut close_reason = None;
         let mut stream_event = None;
         match event {
             Event::Connected => {
-                let lower = self
+                let (application_connection, listener, outer_listener, state) = self
                     .contexts
                     .get(context.into())
                     .and_then(Context::connection)
-                    .map(|connection| connection.lower_session)
+                    .map(|connection| {
+                        (
+                            connection
+                                .engine
+                                .as_ref()
+                                .and_then(|engine| engine.client_opaque),
+                            connection.listener,
+                            connection
+                                .engine
+                                .as_ref()
+                                .and_then(|engine| engine.outer_listener),
+                            connection.state,
+                        )
+                    })
                     .ok_or_else(|| QuicWorkerError::ContextMissing { context })?;
-                let has_connection_session = self
-                    .contexts
-                    .get(context.into())
-                    .and_then(Context::connection)
-                    .and_then(|connection| connection.connection_session)
-                    .is_some();
-                if !has_connection_session {
-                    let upper = sessions.create_upper_transport_session(
-                        lower,
-                        QuicWorker::ID,
-                        context.into(),
-                        context.into(),
-                    )?;
-                    if let Err(error) = sessions.publish_connected_transport_session(upper) {
-                        assert!(
-                            self.remove_context(context).is_ok(),
-                            "QUIC Connection Session rollback failed"
-                        );
-                        return Err(error);
-                    }
-                    self.contexts
-                        .get_mut(context.into())
-                        .and_then(Context::connection_mut)
-                        .expect("QUIC Connection Context remains during publication")
-                        .connection_session = Some(upper);
+                if state != ConnectionState::Handshaking {
+                    return Ok(());
                 }
+                let upper = if let Some(connection) = application_connection {
+                    sessions.stream_connect(QuicWorker::ID, context.into(), connection)?
+                } else if listener.is_some() {
+                    let outer_listener = outer_listener
+                        .ok_or_else(|| QuicWorkerError::ContextMissing { context })?;
+                    let upper =
+                        sessions.stream_accept(QuicWorker::ID, context.into(), outer_listener)?;
+                    sessions.complete_stream_connect(upper)?;
+                    upper
+                } else {
+                    return Err(QuicWorkerError::ContextMissing { context }.into());
+                };
                 let connection_context = self
                     .contexts
                     .get_mut(context.into())
                     .and_then(Context::connection_mut)
                     .ok_or_else(|| QuicWorkerError::ContextMissing { context })?;
+                connection_context.connection_session = Some(upper);
                 connection_context.state = ConnectionState::Established;
-                connection_context.listener = None;
+                self.timers.stop(context, QuicTimerKind::Handshake);
+                if let Some(engine) = connection_context.engine.as_mut() {
+                    engine.client_opaque = None;
+                }
             }
             Event::HandshakeDataReady => {}
-            Event::ConnectionLost { .. } => close = true,
+            Event::ConnectionLost { reason } => {
+                close_reason = Some(QuicConnectionError::from(reason).into());
+            }
             Event::Stream(event) => stream_event = Some(event),
             Event::DatagramReceived | Event::DatagramsUnblocked => {}
         }
-        if close {
-            self.close_connection(sessions, context)?;
+        if let Some(reason) = close_reason {
+            self.close_connection(sessions, context, Some(reason))?;
         }
         if let Some(event) = stream_event {
             self.handle_stream_event(sessions, context, event)?;
@@ -1240,7 +1380,7 @@ impl QuicWorker {
         let (application, app, opaque) = connection_context
             .engine
             .as_ref()
-            .map(|engine| (engine.application, engine.app, engine.opaque))
+            .map(|engine| (engine.application, engine.app, engine.app_opaque))
             .unwrap_or((ApplicationId::new(0, 0), None, None));
         let (stream_context, session_id, rx_fifo, tx_fifo, app_tx_data_len) = self
             .allocate_stream_context(
@@ -1668,18 +1808,13 @@ impl QuicWorker {
         self.timers.advance(now);
         while let Some(token) = self.timers.take_pending() {
             match token.kind {
-                QuicTimerKind::Accept => {
-                    if let Ok(lower_session) = self.lower_session(token.context) {
-                        if let Err(error) = sessions.set_app_session(lower_session, 0) {
-                            if self.contexts.contains_key(token.context.into()) {
-                                let _ = self.remove_context(token.context);
-                            }
-                            return Err(error);
-                        }
-                        sessions.schedule_disconnect(lower_session);
-                    }
+                QuicTimerKind::Handshake => {
                     if self.contexts.contains_key(token.context.into()) {
-                        self.remove_context(token.context)?;
+                        self.close_connection(
+                            sessions,
+                            token.context,
+                            Some(SessionConnectError::TimedOut),
+                        )?;
                     }
                 }
                 QuicTimerKind::Transmit => {
@@ -1703,7 +1838,52 @@ impl QuicWorker {
         &mut self,
         sessions: &mut SessionWorker<Index>,
         context: ContextId,
+        reason: Option<SessionConnectError>,
     ) -> RuntimeResult<()> {
+        let (application_connection, pending_error, state) = self
+            .contexts
+            .get(context.into())
+            .and_then(Context::connection)
+            .map(|connection| {
+                (
+                    connection
+                        .engine
+                        .as_ref()
+                        .and_then(|engine| engine.client_opaque),
+                    connection
+                        .engine
+                        .as_ref()
+                        .and_then(|engine| engine.pending_connect_error),
+                    connection.state,
+                )
+            })
+            .ok_or_else(|| QuicWorkerError::ContextMissing { context })?;
+        if state == ConnectionState::Handshaking
+            && let Some(connection) = application_connection
+        {
+            let error = pending_error
+                .or(reason)
+                .unwrap_or(SessionConnectError::LocalClosed);
+            if !sessions.stream_connect_failed(connection, error)? {
+                let engine = self
+                    .contexts
+                    .get_mut(context.into())
+                    .ok_or_else(|| QuicWorkerError::ContextMissing { context })?
+                    .engine_mut(context)?;
+                engine.pending_connect_error = Some(error);
+                self.timers.stop(context, QuicTimerKind::Transmit);
+                self.timers
+                    .set(context, QuicTimerKind::Handshake, TIMER_RESOLUTION)?;
+                return Ok(());
+            }
+            let engine = self
+                .contexts
+                .get_mut(context.into())
+                .ok_or_else(|| QuicWorkerError::ContextMissing { context })?
+                .engine_mut(context)?;
+            engine.pending_connect_error = None;
+            engine.client_opaque = None;
+        }
         let connection_session = self
             .contexts
             .get_mut(context.into())
@@ -1722,7 +1902,7 @@ impl QuicWorker {
             sessions.set_app_session(lower_session, 0)?;
             sessions.schedule_disconnect(lower_session);
         }
-        self.timers.stop(context, QuicTimerKind::Accept);
+        self.timers.stop(context, QuicTimerKind::Handshake);
         self.timers.stop(context, QuicTimerKind::Transmit);
         if let Some(engine) = self
             .contexts
@@ -1893,6 +2073,15 @@ pub(super) enum QuicWorkerError {
         #[source]
         source: quinn_proto::ConnectError,
     },
+    #[error(
+        "QUIC client connect failed for context {context:?}: {connect}; context cleanup failed: {cleanup}"
+    )]
+    ClientConnectCleanupFailed {
+        context: ContextId,
+        #[source]
+        connect: quinn_proto::ConnectError,
+        cleanup: RuntimeError,
+    },
     #[error("QUIC Session {session:?} is missing")]
     SessionMissing { session: SessionId },
     #[error("QUIC datagram for Session {session:?} has invalid length {length}")]
@@ -1912,6 +2101,15 @@ pub(super) enum QuicWorkerError {
     },
     #[error("QUIC timer update failed for context {context:?}")]
     TimerUpdateFailed { context: ContextId },
+    #[error(
+        "QUIC timer update failed for context {context:?}: {timer}; context cleanup failed: {cleanup}"
+    )]
+    TimerUpdateCleanupFailed {
+        context: ContextId,
+        #[source]
+        timer: RuntimeError,
+        cleanup: RuntimeError,
+    },
     #[error("QUIC Session FIFO stream data error: {error}")]
     StreamData {
         context: ContextId,
@@ -1963,6 +2161,44 @@ mod tests {
         Arc::new(config)
     }
 
+    fn test_listener_start(
+        _: SessionListenerId,
+        _: ApplicationId,
+        _: Option<u64>,
+        _: hammer_runtime::SessionListenEndpoint,
+    ) -> RuntimeResult<()> {
+        Ok(())
+    }
+
+    fn register_test_outer_listener(
+        applications: &Arc<hammer_service::session::ApplicationMain>,
+        application: ApplicationId,
+        sessions: &mut SessionWorker<Index>,
+    ) -> RuntimeResult<SessionListenerId> {
+        let main = Arc::new(hammer_service::session::runtime::SessionMain::new(
+            1,
+            Arc::clone(applications),
+        ));
+        let application_listener = applications
+            .register_listener(application, None, None)
+            .map_err(hammer_runtime::RuntimeError::from)?;
+        let listener = main.listen(
+            application_listener,
+            hammer_runtime::SessionTransportRegistration::new(
+                "quic-worker-test",
+                Some(test_listener_start),
+                None,
+                None,
+            ),
+            hammer_runtime::SessionListenEndpoint::new(
+                "127.0.0.1:0".parse().expect("test listener endpoint"),
+                DataWorkerId::new(0),
+            ),
+        )?;
+        sessions.set_listener_main(main);
+        Ok(listener)
+    }
+
     fn test_lower_session() -> RuntimeResult<(SessionWorker<Index>, SessionId)> {
         let applications = hammer_service::session::ApplicationMain::new(4);
         let application = applications
@@ -1973,7 +2209,7 @@ mod tests {
             1,
             hammer_runtime::app::AppSessionConfig::default(),
             64,
-            applications,
+            Arc::clone(&applications),
             None,
         )?;
         sessions.install_application_mq_for_test(application)?;
@@ -2104,6 +2340,7 @@ mod tests {
                 ApplicationId::new(7, 1),
                 None,
                 Some(ConfigId::from_raw(9).raw()),
+                SessionConnectionId::from_raw(7),
             )
             .expect("allocate active connect context before UDP connect");
         let now = Instant::now();
@@ -2141,7 +2378,7 @@ mod tests {
             1,
             hammer_runtime::app::AppSessionConfig::default(),
             64,
-            applications,
+            Arc::clone(&applications),
             None,
         )?;
         sessions.install_application_mq_for_test(application)?;
@@ -2155,11 +2392,13 @@ mod tests {
             None,
             false,
         )?;
+        let outer_listener =
+            register_test_outer_listener(&applications, application, &mut sessions)?;
 
         let mut worker = QuicWorker::new(DataWorkerId::new(0));
         let listener_id = ContextId::from(0x1234u64);
         let listener = ListenerContext {
-            outer_listener: SessionListenerId::new(1, 1),
+            outer_listener,
             outer_application: application,
             inner_application_listener: hammer_runtime::app::ApplicationListenerId::new(2, 1),
             inner_session_listener: SessionListenerId::new(3, 1),
@@ -2179,6 +2418,107 @@ mod tests {
             sessions.session_transport(connection_session),
             Some((QuicWorker::ID, context.into()))
         );
+        Ok(())
+    }
+
+    #[test]
+    fn active_failure_publication_backpressure_retains_quic_context() -> RuntimeResult<()> {
+        let certified = rcgen::generate_simple_self_signed(vec!["localhost".to_owned()])
+            .expect("generate QUIC test certificate");
+        let mut roots = quinn_proto::rustls::RootCertStore::empty();
+        roots
+            .add(certified.cert.der().clone())
+            .expect("add test trust anchor");
+        let builder = quinn_proto::rustls::ClientConfig::builder()
+            .with_root_certificates(roots)
+            .with_no_client_auth();
+        let crypto = quinn_proto::crypto::rustls::QuicClientConfig::try_from(Arc::new(builder))
+            .expect("build QUIC client crypto");
+        let mut config = quinn_proto::ClientConfig::new(Arc::new(crypto));
+        config.transport_config(Arc::new(quinn_proto::TransportConfig::default()));
+
+        let socket_path = format!(
+            "/tmp/hammer-quic-connect-failure-{}.sock",
+            std::process::id()
+        );
+        let server =
+            hammer_runtime::attach::AppServer::bind(&socket_path, 1).expect("bind App server");
+        let applications = hammer_service::session::ApplicationMain::new(4);
+        let application = applications
+            .attach()
+            .map_err(hammer_runtime::RuntimeError::from)?;
+        let mut sessions = hammer_service::session::SessionWorker::<Index>::new(
+            DataWorkerId::new(0),
+            1,
+            hammer_runtime::app::AppSessionConfig::default(),
+            64,
+            Arc::clone(&applications),
+            Some(server.publisher()),
+        )?;
+        sessions.install_application_mq_for_test(application)?;
+
+        let published = sessions.construct_transport_session(
+            SessionTransportId::new(1),
+            Index::new(1, 1),
+            1,
+            application,
+            None,
+            None,
+            None,
+            false,
+        )?;
+        sessions.connection_published(published)?;
+        sessions.connected(published)?;
+
+        let lower = sessions.construct_transport_session(
+            SessionTransportId::new(1),
+            Index::new(2, 1),
+            2,
+            application,
+            None,
+            None,
+            None,
+            false,
+        )?;
+        let application_connection = applications
+            .register_connection(application, None, None, None)
+            .map_err(hammer_runtime::RuntimeError::from)?;
+        let outer_connection = SessionConnectionId::from_raw(application_connection.raw());
+        let local = "127.0.0.1:443".parse().expect("local endpoint");
+        let remote = "127.0.0.1:444".parse().expect("remote endpoint");
+        let mut worker = QuicWorker::new(DataWorkerId::new(0));
+        let context = worker.allocate_client_connect(
+            Arc::new(config),
+            "localhost".to_owned(),
+            local,
+            remote,
+            application,
+            None,
+            None,
+            outer_connection,
+        )?;
+        worker.connect_connection(context, lower, Instant::now())?;
+
+        worker.close_connection(&mut sessions, context, Some(SessionConnectError::TimedOut))?;
+
+        assert!(worker.contexts.contains_key(context.into()));
+        let pending_error = worker
+            .contexts
+            .get(context.into())
+            .and_then(Context::connection)
+            .and_then(|connection| connection.engine.as_ref())
+            .and_then(|engine| engine.pending_connect_error);
+        assert_eq!(pending_error, Some(SessionConnectError::TimedOut));
+        assert_eq!(worker.lower_session(context)?, lower);
+        assert!(matches!(
+            applications.reclaim_connection(application, application_connection),
+            Err(hammer_service::session::application::ApplicationError::ConnectionNotCompleted {
+                connection,
+            }) if connection == application_connection
+        ));
+
+        drop(server);
+        let _ = std::fs::remove_file(socket_path);
         Ok(())
     }
 
@@ -2264,7 +2604,7 @@ mod tests {
             1,
             hammer_runtime::app::AppSessionConfig::default(),
             64,
-            applications,
+            Arc::clone(&applications),
             None,
         )?;
         sessions.install_application_mq_for_test(application)?;
@@ -2278,11 +2618,13 @@ mod tests {
             None,
             false,
         )?;
+        let outer_listener =
+            register_test_outer_listener(&applications, application, &mut sessions)?;
 
         let mut worker = QuicWorker::new(DataWorkerId::new(0));
         let listener_id = ContextId::from(0x1234u64);
         let listener = ListenerContext {
-            outer_listener: SessionListenerId::new(1, 1),
+            outer_listener,
             outer_application: application,
             inner_application_listener: hammer_runtime::app::ApplicationListenerId::new(2, 1),
             inner_session_listener: SessionListenerId::new(3, 1),

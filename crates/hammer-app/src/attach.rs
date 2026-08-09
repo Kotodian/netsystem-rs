@@ -1,3 +1,5 @@
+use std::cell::RefCell;
+use std::collections::VecDeque;
 use std::io::{Read, Write};
 use std::os::fd::{AsRawFd, IntoRawFd};
 use std::os::unix::net::UnixStream;
@@ -114,6 +116,16 @@ pub enum AppClientError {
     SessionReplyContext { expected: u64, actual: u64 },
     #[error("Application Session request was rejected with status {status:?}")]
     SessionRejected { status: ApplicationSessionStatus },
+    #[error("Application connection {connection:?} failed with status {status:?}")]
+    SessionConnectFailed {
+        connection: hammer_runtime::app::ApplicationConnectionId,
+        status: ApplicationSessionStatus,
+    },
+    #[error("Application Session handle mismatch: expected {expected:?}, got {actual:?}")]
+    SessionHandleMismatch {
+        expected: SessionHandle,
+        actual: SessionHandle,
+    },
 }
 
 pub struct AppClient {
@@ -123,6 +135,7 @@ pub struct AppClient {
     pub(crate) session_replies: SessionMsgQueue,
     rx_mqs: Box<[Arc<SessionMsgQueue>]>,
     pub(crate) next_session_context: u64,
+    pub(crate) pending_replies: RefCell<VecDeque<hammer_runtime::app::ApplicationSessionReply>>,
 }
 
 impl AppClient {
@@ -281,6 +294,7 @@ impl AppClient {
             session_replies,
             rx_mqs: rx_mqs.into_boxed_slice(),
             next_session_context: 1,
+            pending_replies: RefCell::new(VecDeque::new()),
         })
     }
 
@@ -290,6 +304,13 @@ impl AppClient {
     }
 
     pub fn accept(&self) -> Result<AppSession, AppClientError> {
+        self.accept_with_handle(None)
+    }
+
+    pub(crate) fn accept_with_handle(
+        &self,
+        expected_handle: Option<SessionHandle>,
+    ) -> Result<AppSession, AppClientError> {
         let (metadata, descriptors) = descriptor::receive(&self.stream, ATTACH_METADATA_BYTES)?;
         let words = descriptor::words_prefix::<ATTACH_METADATA_WORDS>(&metadata)?;
         if words[0] != ATTACH_PROTOCOL_VERSION {
@@ -302,6 +323,14 @@ impl AppClient {
             });
         }
         let handle = SessionHandle::from(words[1]);
+        if let Some(expected) = expected_handle
+            && expected != handle
+        {
+            return Err(AppClientError::SessionHandleMismatch {
+                expected,
+                actual: handle,
+            });
+        }
         let session_segment_size =
             usize::try_from(words[2]).map_err(|_| AppClientError::OffsetOverflow)?;
         if session_segment_size == 0 || session_segment_size > isize::MAX as usize {
