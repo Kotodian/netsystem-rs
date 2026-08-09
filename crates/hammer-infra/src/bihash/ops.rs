@@ -1,11 +1,12 @@
 //! Hot-path operations: lookup, insert, remove, clear.
 //!
-//! Lookup scans immutable published pages. Writers hold the bucket lock,
-//! modify an unpublished replacement, publish its offset, and retire the old
-//! allocation through PageAlloc.
+//! Lookup scans published pages. Writers atomically own VPP's `bucket.lock`
+//! writer bit and modify the live value page in place; readers wait on the
+//! lock bit. Split/rehash allocates through `PageAlloc` under alloc_lock.
 
 use crate::bihash::{AtomicBucket, Bihash, BihashKey, Bucket, FREE_U64, Kv, ValuePage};
 use crate::prefetch::prefetch_read_l1;
+use std::sync::atomic::{fence, Ordering};
 
 type Slot = (usize, usize);
 
@@ -64,7 +65,9 @@ impl<K: BihashKey + Default, const KVP: usize> Bihash<K, KVP> {
                 },
             );
             if let Some(found) = found {
-                return found;
+                if self.load_bucket(bucket_idx) == bucket {
+                    return found;
+                }
             }
         }
     }
@@ -91,9 +94,12 @@ impl<K: BihashKey + Default, const KVP: usize> Bihash<K, KVP> {
             return Err(existing);
         }
         if let Some(slot) = free {
-            self.replace_locked(bucket_idx, bucket, bucket.refcnt() + 1, |pages| {
-                pages[slot.0].slots_mut()[slot.1] = Kv { key, value };
-            });
+            let pages = self
+                .pages
+                .live_pages_mut(bucket.offset(), bucket.log2_pages())
+                .expect("locked bucket retains its live value pages");
+            write_live_slot(&mut pages[slot.0].slots_mut()[slot.1], key, value);
+            self.publish_unlocked(bucket_idx, bucket, bucket.refcnt() + 1);
             self.add_len(1);
             return Ok(());
         }
@@ -120,20 +126,59 @@ impl<K: BihashKey + Default, const KVP: usize> Bihash<K, KVP> {
 
         let (found, free) = self.inspect_locked(bucket, key, hash);
         if let Some((slot, _)) = found {
-            self.replace_locked(bucket_idx, bucket, bucket.refcnt(), |pages| {
-                pages[slot.0].slots_mut()[slot.1].value = value;
-            });
+            let pages = self
+                .pages
+                .live_pages_mut(bucket.offset(), bucket.log2_pages())
+                .expect("locked bucket retains its live value pages");
+            pages[slot.0].slots_mut()[slot.1].value = value;
+            self.unlock_unchanged(bucket_idx, bucket);
             return;
         }
         if let Some(slot) = free {
-            self.replace_locked(bucket_idx, bucket, bucket.refcnt() + 1, |pages| {
-                pages[slot.0].slots_mut()[slot.1] = Kv { key, value };
-            });
+            let pages = self
+                .pages
+                .live_pages_mut(bucket.offset(), bucket.log2_pages())
+                .expect("locked bucket retains its live value pages");
+            write_live_slot(&mut pages[slot.0].slots_mut()[slot.1], key, value);
+            self.publish_unlocked(bucket_idx, bucket, bucket.refcnt() + 1);
             self.add_len(1);
             return;
         }
 
         self.split_and_rehash(bucket_idx, bucket, key, value);
+    }
+
+    /// Replace a key only when its current value is exactly `old_value`.
+    ///
+    /// This is the compare-current-value publication operation used by an
+    /// owner that must not overwrite a newer generation or another owner.
+    pub fn replace_if_current(&self, key: &K, old_value: u64, new_value: u64) -> bool {
+        debug_assert_ne!(new_value, FREE_U64);
+        let hash = key.hash();
+        let bucket_idx = ((hash as u32) & (self.nbuckets() - 1)) as usize;
+        let bucket = self.lock_bucket(bucket_idx);
+        if bucket.is_empty() {
+            self.unlock_unchanged(bucket_idx, bucket);
+            return false;
+        }
+
+        let (found, _) = self.inspect_locked(bucket, *key, hash);
+        let Some((slot, current)) = found else {
+            self.unlock_unchanged(bucket_idx, bucket);
+            return false;
+        };
+        if current != old_value {
+            self.unlock_unchanged(bucket_idx, bucket);
+            return false;
+        }
+
+        let pages = self
+            .pages
+            .live_pages_mut(bucket.offset(), bucket.log2_pages())
+            .expect("locked bucket retains its live value pages");
+        pages[slot.0].slots_mut()[slot.1].value = new_value;
+        self.unlock_unchanged(bucket_idx, bucket);
+        true
     }
 
     /// Remove a key from the table. Returns `true` if the key was found.
@@ -152,13 +197,54 @@ impl<K: BihashKey + Default, const KVP: usize> Bihash<K, KVP> {
             return false;
         };
 
+        let pages = self
+            .pages
+            .live_pages_mut(bucket.offset(), bucket.log2_pages())
+            .expect("locked bucket retains its live value pages");
+        pages[slot.0].slots_mut()[slot.1].mark_free();
         if bucket.refcnt() == 1 {
             self.store_bucket(bucket_idx, Bucket::empty());
             self.pages.retire(bucket.offset(), bucket.log2_pages());
         } else {
-            self.replace_locked(bucket_idx, bucket, bucket.refcnt() - 1, |pages| {
-                pages[slot.0].slots_mut()[slot.1].mark_free();
-            });
+            self.publish_unlocked(bucket_idx, bucket, bucket.refcnt() - 1);
+        }
+        self.add_len(-1);
+        true
+    }
+
+    /// Remove a key only when its current value is exactly `value`.
+    ///
+    /// Stale cleanup uses this so an old owner cannot delete a route already
+    /// replaced by a newer Session handle or generation.
+    pub fn remove_if_current(&self, key: &K, value: u64) -> bool {
+        let hash = key.hash();
+        let bucket_idx = ((hash as u32) & (self.nbuckets() - 1)) as usize;
+        let bucket = self.lock_bucket(bucket_idx);
+        if bucket.is_empty() {
+            self.unlock_unchanged(bucket_idx, bucket);
+            return false;
+        }
+
+        let (found, _) = self.inspect_locked(bucket, *key, hash);
+        let Some((slot, current)) = found else {
+            self.unlock_unchanged(bucket_idx, bucket);
+            return false;
+        };
+        if current != value {
+            self.unlock_unchanged(bucket_idx, bucket);
+            return false;
+        }
+
+        let pages = self
+            .pages
+            .live_pages_mut(bucket.offset(), bucket.log2_pages())
+            .expect("locked bucket retains its live value pages");
+        pages[slot.0].slots_mut()[slot.1].mark_free();
+        if bucket.refcnt() == 1 {
+            self.store_bucket(bucket_idx, Bucket::empty());
+            self.pages.retire(bucket.offset(), bucket.log2_pages());
+        } else {
+            self.publish_unlocked(bucket_idx, bucket, bucket.refcnt() - 1);
         }
         self.add_len(-1);
         true
@@ -188,47 +274,32 @@ impl<K: BihashKey + Default, const KVP: usize> Bihash<K, KVP> {
         key: K,
         hash: u64,
     ) -> (Option<(Slot, u64)>, Option<Slot>) {
-        self.pages
-            .inspect(bucket.offset(), bucket.log2_pages(), |pages| {
-                scan_pages(
-                    pages,
-                    bucket.log2_pages(),
-                    bucket.is_linear_search(),
-                    key,
-                    hash,
-                    self.log2_nbuckets(),
-                )
-            })
+        let pages = self
+            .pages
+            .live_pages_mut(bucket.offset(), bucket.log2_pages())
+            .expect("locked bucket retains its live value pages");
+        scan_pages(
+            &*pages,
+            bucket.log2_pages(),
+            bucket.is_linear_search(),
+            key,
+            hash,
+            self.log2_nbuckets(),
+        )
     }
 
-    fn replace_locked(
-        &self,
-        bucket_idx: usize,
-        bucket: Bucket,
-        refcnt: u16,
-        update: impl FnOnce(&mut [ValuePage<K, KVP>]),
-    ) {
-        let (offset, _) = self.pages.replace(
-            bucket.offset(),
-            bucket.log2_pages(),
-            bucket.log2_pages(),
-            |old, new| {
-                new.clone_from_slice(old);
-                update(new);
-            },
-        );
+    fn publish_unlocked(&self, bucket_idx: usize, bucket: Bucket, refcnt: u16) {
         self.store_bucket(
             bucket_idx,
             Bucket::pack(
-                offset,
+                bucket.offset(),
                 bucket.log2_pages(),
                 refcnt,
-                bucket.generation().wrapping_add(1) & 0x1F,
+                bucket.generation(),
                 bucket.is_linear_search(),
                 false,
             ),
         );
-        self.pages.retire(bucket.offset(), bucket.log2_pages());
     }
 
     #[inline]
@@ -245,6 +316,13 @@ impl<K: BihashKey + Default, const KVP: usize> Bihash<K, KVP> {
             ),
         );
     }
+}
+
+#[inline(always)]
+fn write_live_slot<K: Copy>(slot: &mut Kv<K>, key: K, value: u64) {
+    slot.value = value;
+    fence(Ordering::Release);
+    slot.key = key;
 }
 
 #[inline(always)]

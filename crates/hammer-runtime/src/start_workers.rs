@@ -21,7 +21,11 @@ pub fn start_workers(engine: &mut Engine) -> RuntimeResult<()> {
     engine.main_loop_exit_now.store(false, Ordering::Release);
     engine.prepare_worker_runtime_stats(worker_config.count);
 
-    let handoff = DataPlaneHandoff::new(worker_config.count, worker_config.handoff.queue_capacity);
+    let handoff = DataPlaneHandoff::with_node_capacity(
+        worker_config.count,
+        worker_config.handoff.queue_capacity,
+        engine.runtime.nodes().node_count(),
+    );
     let worker_control_queues: std::sync::Arc<[spawn::DataRemoteLocalQueue]> = (0..worker_count)
         .map(|_| spawn::DataRemoteLocalQueue::new(worker_config.control.queue_capacity))
         .collect::<Vec<_>>()
@@ -74,13 +78,26 @@ pub fn start_workers(engine: &mut Engine) -> RuntimeResult<()> {
                     let exit_status =
                         crate::main_loop::engine_main_loop(&mut engine, &tokio, &remote_local);
                     tracing::debug!(worker = thread_index, exit_status, "worker exited");
-                    if exit_status == 0 {
+                    let loop_result = if exit_status == 0 {
                         Ok(())
                     } else {
                         Err(RuntimeError::lifecycle(
                             format!("data worker {thread_index} main loop"),
                             format!("exited with status {exit_status}"),
                         ))
+                    };
+                    let exit_result = crate::init::run_worker_exit_functions(&mut engine);
+                    match (loop_result, exit_result) {
+                        (Ok(()), result) => result,
+                        (Err(loop_error), Ok(())) => Err(loop_error),
+                        (Err(loop_error), Err(exit_error)) => {
+                            tracing::error!(
+                                worker = thread_index,
+                                %exit_error,
+                                "data worker exit callback failed"
+                            );
+                            Err(loop_error)
+                        }
                     }
                 }));
                 remote_local.close();

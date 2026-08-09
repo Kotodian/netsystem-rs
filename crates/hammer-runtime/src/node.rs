@@ -1754,6 +1754,11 @@ impl NodeRuntime {
     }
 
     #[inline]
+    pub(crate) fn node_count(&self) -> usize {
+        self.inner.borrow().nodes.len()
+    }
+
+    #[inline]
     pub fn node_by_name(&self, name: &str) -> Option<NodeId> {
         self.inner.borrow().declared_nodes.get(name).copied()
     }

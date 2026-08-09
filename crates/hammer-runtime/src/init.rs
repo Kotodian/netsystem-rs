@@ -162,6 +162,23 @@ pub fn run_worker_init_functions(engine: &mut Engine) -> RuntimeResult<()> {
     result
 }
 
+pub fn run_worker_exit_functions(engine: &mut Engine) -> RuntimeResult<()> {
+    let functions = engine.take_worker_exit_functions();
+    let mut first_error = None;
+    for function in functions {
+        match catch_unwind(AssertUnwindSafe(|| function(engine))) {
+            Ok(Ok(())) => {}
+            Ok(Err(error)) => {
+                if first_error.is_none() {
+                    first_error = Some(error);
+                }
+            }
+            Err(payload) => std::panic::resume_unwind(payload),
+        }
+    }
+    first_error.map_or(Ok(()), Err)
+}
+
 pub fn run_main_loop_enter(engine: &mut Engine) -> RuntimeResult<()> {
     let functions = engine.plugin_main().main_loop_enter_functions();
     let mut called = std::mem::take(&mut engine.called_main_loop_enter_functions);
@@ -218,8 +235,17 @@ pub fn run_config_functions(engine: &mut Engine, early: bool, document: &str) ->
 
 #[cfg(test)]
 mod tests {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
     use super::*;
     use crate::error::RuntimeError;
+
+    static WORKER_EXIT_CALLS: AtomicUsize = AtomicUsize::new(0);
+
+    fn record_worker_exit(_: &mut Engine) -> RuntimeResult<()> {
+        WORKER_EXIT_CALLS.fetch_add(1, Ordering::Relaxed);
+        Ok(())
+    }
 
     fn mock(
         specs: &[(
@@ -237,6 +263,21 @@ mod tests {
                 func: |_| Ok(()),
             })
             .collect()
+    }
+
+    #[test]
+    fn worker_exit_callbacks_are_drained_once() {
+        WORKER_EXIT_CALLS.store(0, Ordering::Relaxed);
+        let mut engine = Engine::new(
+            crate::DataPlaneRuntime::new(crate::DataPlaneRuntimeConfig::default()),
+            crate::RuntimeRegistry::new(),
+        );
+        engine.register_worker_exit_function(record_worker_exit);
+
+        run_worker_exit_functions(&mut engine).expect("worker exit callback");
+        run_worker_exit_functions(&mut engine).expect("worker exit callback drain");
+
+        assert_eq!(WORKER_EXIT_CALLS.load(Ordering::Relaxed), 1);
     }
 
     #[test]

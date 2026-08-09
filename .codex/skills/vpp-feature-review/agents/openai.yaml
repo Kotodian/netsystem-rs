@@ -1,0 +1,4 @@
+interface:
+  display_name: "VPP Feature Review"
+  short_description: "Compare completed Hammer features to VPP."
+  default_prompt: "Use $vpp-feature-review to review this completed feature against vendored VPP before declaring it done."

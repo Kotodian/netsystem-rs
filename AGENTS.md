@@ -341,11 +341,23 @@ For TCP, session, dataplane buffer, and recovery work:
 
 ## Testing Guidelines
 
+### Test timing
+
+- Do not run any test command while implementation work is still in progress.
+  This includes `cargo test`, `make test`, integration-test runners, lab tests,
+  and equivalent test wrappers.
+- Run the required tests only when the implementation, review, formatting, and
+  commit contents are ready and the next action is the commit itself.
+- If those tests pass, commit immediately. Do not run another test suite after
+  the commit as part of the same task.
+- If the tests fail, keep the work uncommitted, fix the failure, and repeat the
+  same final pre-commit test gate only after the next commit candidate is ready.
+
 Add integration tests near the crate whose behavior changes. Test files live in crate-local `tests/` directories (e.g. `crates/hammer-runtime/tests/`, `crates/hammer-core/tests/`). Use descriptive file names like `service_lifecycle.rs`, `config_parse.rs`, `tcp_output.rs`, or `fifo_ooo.rs`. Prefer focused tests for config parsing, lifecycle behavior, routing, TCP protocol edge cases, and data-structure correctness.
 
 Do not write source-text assertion tests that read `.rs`, `Cargo.toml`, or other implementation files and use `contains`, regular expressions, or string matching to claim behavioral or architectural correctness. Such tests do not prove that code compiles, symbols are registered, dynamic libraries export the required inventory, generic dispatch is preserved, or runtime state is installed. Verify those properties through compile-time type checks, real `dlopen`/`dlsym` integration tests, callable lifecycle hooks, and observable runtime graph/state assertions. Source inspection is allowed only in dedicated repository-policy tooling when the property is inherently textual and cannot be expressed through compilation or behavior; it must not substitute for an executable test.
 
-The project follows a TDD rhythm (RED → GREEN → commit) documented in `docs/superpowers/plans/`. Run `cargo test --workspace` before a PR; use `cargo test -p <crate>` while iterating.
+The project follows a TDD rhythm (RED → GREEN → commit) documented in `docs/superpowers/plans/`, with the repository test-timing rule above: test commands are reserved for the final pre-commit gate, not iterative development or post-commit verification.
 
 TUN/TCP lab integration is CI-only. The GitHub Actions workflow owns creation,
 configuration, diagnostics, and cleanup of the host-side utun/TUN interface;

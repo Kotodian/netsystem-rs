@@ -517,6 +517,7 @@ fn build_server_config(
     let crypto = quinn_proto::crypto::rustls::QuicServerConfig::try_from(Arc::new(rustls))
         .map_err(|source| ConfigError::ServerCryptoInvalid { source })?;
     let mut quic = quinn_proto::ServerConfig::with_crypto(Arc::new(crypto));
+    quic.migration(false);
     quic.transport_config(build_transport_config(config.transport, fifo_capacity)?);
     Ok(quic)
 }

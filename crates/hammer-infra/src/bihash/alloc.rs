@@ -1,8 +1,9 @@
 //! Page allocation, publication, and reclamation for bihash values.
 //!
-//! Published pages are immutable. Writers build a private replacement and
-//! publish its allocator offset through the bucket word. Retired offsets are
-//! reused only after no lookup hazard protects them.
+//! VPP writers mutate the live value page under the bucket writer bit. The
+//! allocator owns new value pages for split/rehash, publishes their offset
+//! through the bucket word, and retires old offsets only after no lookup
+//! hazard protects them.
 
 use std::alloc::{GlobalAlloc, Layout, handle_alloc_error};
 use std::cell::{Cell, RefCell, UnsafeCell};
@@ -142,12 +143,6 @@ impl<K: Copy + Default, const KVP: usize> PageAllocState<K, KVP> {
         }
     }
 
-    fn pages(&self, offset: u64, log2_pages: u8) -> &[ValuePage<K, KVP>] {
-        let block = self.block(offset, log2_pages);
-        // SAFETY: PageBlock owns `2^log2_pages` initialized contiguous pages.
-        unsafe { std::slice::from_raw_parts(block.pages.as_ptr(), 1usize << log2_pages) }
-    }
-
     fn pages_mut(&mut self, offset: u64, log2_pages: u8) -> &mut [ValuePage<K, KVP>] {
         let block = self.block(offset, log2_pages);
         // SAFETY: allocator serialization and unpublished/freelist state provide
@@ -253,13 +248,37 @@ impl<K: Copy + Default, const KVP: usize> PageAlloc<K, KVP> {
         })
     }
 
-    pub(crate) fn inspect<R>(
+    /// Exclusive live-page access valid only while the caller owns the bucket
+    /// writer bit for the exact bucket naming `offset`.
+    ///
+    /// VPP reads and writes the live bucket value while `bucket.lock` is set;
+    /// readers wait on that bit and cannot race this exclusive access.
+    #[inline(always)]
+    pub(crate) fn live_pages_mut(
         &self,
         offset: u64,
         log2_pages: u8,
-        inspect: impl FnOnce(&[ValuePage<K, KVP>]) -> R,
-    ) -> R {
-        self.with_state(|state| inspect(state.pages(offset, log2_pages)))
+    ) -> Option<&mut [ValuePage<K, KVP>]> {
+        let directory = self.directory.load(Ordering::Acquire);
+        if directory.is_null() {
+            return None;
+        }
+        let index = usize::try_from(offset.checked_sub(1)?).ok()?;
+        // SAFETY: `directory` is an append-only published directory. The
+        // caller owns the bucket writer bit, so this offset cannot be retired
+        // or replaced while this slice is live.
+        let address = unsafe { directory.add(index).read() };
+        if address == 0 {
+            return None;
+        }
+        // SAFETY: the page block remains allocated and exclusively owned by
+        // the bucket writer for the lifetime of this mutable slice.
+        unsafe {
+            Some(std::slice::from_raw_parts_mut(
+                address as *mut ValuePage<K, KVP>,
+                1usize << log2_pages,
+            ))
+        }
     }
 
     #[inline(always)]

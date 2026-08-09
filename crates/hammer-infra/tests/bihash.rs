@@ -350,6 +350,30 @@ fn bihash_insert_if_absent_keeps_first_writer_value() {
 }
 
 #[test]
+fn bihash_replace_if_current_replaces_only_expected_value() {
+    let table = Bihash::<u64, 7>::new(32);
+    table.insert(7, 70);
+
+    assert!(!table.replace_if_current(&7, 99, 71));
+    assert_eq!(table.lookup(&7), Some(70));
+    assert!(table.replace_if_current(&7, 70, 71));
+    assert_eq!(table.lookup(&7), Some(71));
+}
+
+#[test]
+fn bihash_remove_if_current_preserves_newer_value() {
+    let table = Bihash::<u64, 7>::new(32);
+    table.insert(7, 70);
+    assert!(table.replace_if_current(&7, 70, 71));
+
+    assert!(!table.remove_if_current(&7, 70));
+    assert_eq!(table.lookup(&7), Some(71));
+    assert!(table.remove_if_current(&7, 71));
+    assert_eq!(table.lookup(&7), None);
+    assert_eq!(table.len(), 0);
+}
+
+#[test]
 fn bihash_concurrent_overwrite_lookup_observes_complete_values() {
     use std::sync::Barrier;
     use std::thread;

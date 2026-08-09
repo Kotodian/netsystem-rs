@@ -178,6 +178,7 @@ pub struct Engine {
     pub(crate) memory_initialized: bool,
     processes: ProcessMain,
     pub(crate) worker_init_functions: Vec<InitFunction>,
+    worker_exit_functions: Vec<fn(&mut Engine) -> RuntimeResult<()>>,
     worker_config: Worker,
     pub(crate) called_init_functions: HashSet<&'static str>,
     pub(crate) called_worker_init_functions: HashSet<&'static str>,
@@ -224,6 +225,7 @@ impl Engine {
             memory_initialized,
             plugin_main: PluginMain::default(),
             worker_init_functions,
+            worker_exit_functions: Vec::new(),
             worker_config,
             called_init_functions: HashSet::new(),
             called_worker_init_functions: HashSet::new(),
@@ -256,6 +258,7 @@ impl Engine {
             memory_initialized: false,
             plugin_main: PluginMain::default(),
             worker_init_functions: Vec::new(),
+            worker_exit_functions: Vec::new(),
             worker_config: Worker::default(),
             called_init_functions: HashSet::new(),
             called_worker_init_functions: HashSet::new(),
@@ -539,6 +542,19 @@ impl Engine {
         } else {
             self.worker_init_functions.clone()
         }
+    }
+
+    pub fn register_worker_exit_function(
+        &mut self,
+        function: fn(&mut Engine) -> RuntimeResult<()>,
+    ) {
+        self.worker_exit_functions.push(function);
+    }
+
+    pub(crate) fn take_worker_exit_functions(
+        &mut self,
+    ) -> Vec<fn(&mut Engine) -> RuntimeResult<()>> {
+        std::mem::take(&mut self.worker_exit_functions)
     }
 
     pub(crate) fn apply_worker_config(&mut self, worker: Worker) -> RuntimeResult<()> {
@@ -871,21 +887,25 @@ impl EnginePool {
     pub fn main_loop_exit(engine: &Engine) {
         engine
             .main_loop_exit_now
-            .store(true, std::sync::atomic::Ordering::Relaxed);
+            .store(true, std::sync::atomic::Ordering::Release);
     }
 
     pub fn close(&mut self) -> RuntimeResult<()> {
-        Self::main_loop_exit(self.main_engine());
+        let barrier = self.main_engine().barrier.clone();
+        let exit_result = barrier.sync(|| {
+            let result = {
+                let main = self.main_engine_mut();
+                if main.main_loop_exit_functions_called {
+                    Ok(())
+                } else {
+                    main.main_loop_exit_functions_called = true;
+                    crate::init::run_main_loop_exit(main)
+                }
+            };
+            Self::main_loop_exit(self.main_engine());
+            result
+        });
         let worker_result = self.main_engine_mut().join_worker_threads();
-        let exit_result = {
-            let main = self.main_engine_mut();
-            if main.main_loop_exit_functions_called {
-                Ok(())
-            } else {
-                main.main_loop_exit_functions_called = true;
-                crate::init::run_main_loop_exit(main)
-            }
-        };
         if let Some(listener) = self.ipc_listener.take() {
             drop(listener);
         }

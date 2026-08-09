@@ -2,7 +2,7 @@ use std::fmt::Write as _;
 
 use hammer_component_macros::ipc_handler;
 use hammer_ipc::{PluginCommandError, PluginCommandReply};
-use hammer_runtime::engine::{Engine, WorkerRuntimeStats};
+use hammer_runtime::engine::{Engine, EnginePool, WorkerRuntimeStats};
 use hammer_runtime::{RuntimeError, TraceControlPlane};
 
 #[ipc_handler(name = "ping")]
@@ -128,9 +128,7 @@ fn handle_wake(_engine: &mut Engine, _request: &[u8]) -> Vec<u8> {
 
 #[ipc_handler(name = "shutdown")]
 fn handle_shutdown(engine: &mut Engine, _request: &[u8]) -> Vec<u8> {
-    engine
-        .main_loop_exit_now
-        .store(true, std::sync::atomic::Ordering::Relaxed);
+    EnginePool::main_loop_exit(engine);
     Vec::new()
 }
 

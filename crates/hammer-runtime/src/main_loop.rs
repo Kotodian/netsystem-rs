@@ -36,6 +36,7 @@ pub fn engine_main_loop(
     DATA_LOCAL_DRIVER_WAKER.with(|slot| {
         *slot.borrow_mut() = Some(worker_waker.clone());
     });
+    engine.runtime.attach_worker_interrupt_thread();
 
     let io_wake = {
         let _reactor = runtime.enter();
@@ -83,6 +84,9 @@ pub fn engine_main_loop(
             }
         }
         with_data_plane_runtime(|rt| {
+            if let Ok(scheduled) = rt.schedule_remote_interrupts() {
+                progress |= scheduled != 0;
+            }
             if let Ok(scheduled) = rt.schedule_polling_pre_input_nodes() {
                 progress |= scheduled != 0;
             }
