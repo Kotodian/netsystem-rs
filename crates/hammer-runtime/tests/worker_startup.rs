@@ -154,9 +154,11 @@ fn verify_worker_startup_contract(engine: &mut Engine) -> RuntimeResult<()> {
         .nodes()
         .set_node_state(node, NodeState::Polling)?;
     let index = engine.runtime.alloc_index_with_bytes(&[0; 128])?;
+    let mut handoff_frame = BufferFrame::with_capacity(1);
+    handoff_frame.push_index(index)?;
     engine
         .runtime
-        .handoff_indices(worker, STARTUP_NODE_HANDLE, std::iter::once(index))?;
+        .handoff_indices(worker, STARTUP_NODE_HANDLE, &mut handoff_frame)?;
     assert_eq!(engine.runtime.run_ready_nodes()?, 1);
 
     let case = CASE.load(Ordering::Acquire);

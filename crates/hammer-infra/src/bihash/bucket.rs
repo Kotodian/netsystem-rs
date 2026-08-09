@@ -129,6 +129,12 @@ impl Bucket {
         Bucket(raw)
     }
 
+    /// Returns a copy with VPP's `lock:1` writer bit set.
+    #[inline(always)]
+    pub const fn with_lock(self) -> Self {
+        Bucket(self.0 | (1u64 << LOCK_SHIFT))
+    }
+
     /// Increment the generation counter, wrapping at 32.
     #[inline(always)]
     pub const fn bump_generation(self) -> Self {
@@ -209,5 +215,11 @@ impl AtomicBucket {
     #[inline(always)]
     pub fn swap(&self, b: Bucket, order: Ordering) -> Bucket {
         Bucket(self.0.swap(b.0, order))
+    }
+
+    /// Atomically ORs a mask into the bucket and returns the previous word.
+    #[inline(always)]
+    pub fn fetch_or(&self, mask: Bucket, order: Ordering) -> Bucket {
+        Bucket(self.0.fetch_or(mask.0, order))
     }
 }

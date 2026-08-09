@@ -1253,6 +1253,7 @@ dependencies = [
  "arc-swap",
  "async-trait",
  "bitflags 2.11.1",
+ "crossbeam-queue",
  "crossbeam-utils",
  "etherparse",
  "hammer-component-macros",

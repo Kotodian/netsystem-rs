@@ -1,0 +1,4 @@
+interface:
+  display_name: "VPP Sync Primitives"
+  short_description: "Align Hammer synchronization with VPP"
+  default_prompt: "Use $vpp-sync-primitives to audit this synchronization change against vendored VPP."

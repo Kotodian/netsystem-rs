@@ -59,6 +59,11 @@ impl<K: BihashKey + Default, const KVP: usize> Iterator for BihashIter<'_, K, KV
                             (!kv_slot_is_free(&kv)).then_some((kv.key, kv.value))
                         },
                     );
+                    if self.bihash.load_bucket(self.bucket_idx) != bucket {
+                        self.page_rel = 0;
+                        self.slot_idx = 0;
+                        continue 'bucket;
+                    }
                     match item {
                         Some(Some(item)) => return Some(item),
                         Some(None) => {}

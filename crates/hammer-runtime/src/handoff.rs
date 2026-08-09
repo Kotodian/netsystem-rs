@@ -1,8 +1,11 @@
-use std::sync::Arc;
+use std::fmt;
+use std::sync::{Arc, OnceLock};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::thread;
 
 use crate::error::RuntimeResult;
 use crossbeam_queue::ArrayQueue;
-use hammer_core::data_plane::{BufferPoolArena, Index, NodeHandle};
+use hammer_core::data_plane::{BufferPoolArena, Index, NodeHandle, NodeId};
 use hammer_core::error::DataPlaneError;
 
 pub(crate) const HANDOFF_SLOT_CAPACITY: usize = 32;
@@ -34,10 +37,27 @@ pub struct DataPlaneHandoff {
     inner: Arc<DataPlaneHandoffInner>,
 }
 
-#[derive(Debug)]
 struct DataPlaneHandoffInner {
     queues: Box<[ArrayQueue<HandoffFrame>]>,
     buffer_arena: Option<BufferPoolArena>,
+    worker_interrupt_pending: Box<[Vec<AtomicBool>]>,
+    worker_interrupt_threads: Box<[OnceLock<thread::Thread>]>,
+}
+
+impl fmt::Debug for DataPlaneHandoffInner {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("DataPlaneHandoffInner")
+            .field("workers", &self.queues.len())
+            .field(
+                "nodes",
+                &self
+                    .worker_interrupt_pending
+                    .first()
+                    .map(|pending| pending.len()),
+            )
+            .finish()
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -132,12 +152,27 @@ impl HandoffEnqueueError {
 impl DataPlaneHandoff {
     #[inline]
     pub fn new(workers: usize, queue_capacity: usize) -> Self {
+        Self::with_node_capacity(workers, queue_capacity, 0)
+    }
+
+    #[inline]
+    pub fn with_node_capacity(
+        workers: usize,
+        queue_capacity: usize,
+        node_capacity: usize,
+    ) -> Self {
         Self {
             inner: Arc::new(DataPlaneHandoffInner {
                 queues: (0..workers)
                     .map(|_| ArrayQueue::new(queue_capacity))
                     .collect::<Box<[_]>>(),
                 buffer_arena: None,
+                worker_interrupt_pending: (0..workers)
+                    .map(|_| (0..node_capacity).map(|_| AtomicBool::new(false)).collect())
+                    .collect(),
+                worker_interrupt_threads: (0..workers)
+                    .map(|_| OnceLock::new())
+                    .collect(),
             }),
         }
     }
@@ -148,12 +183,28 @@ impl DataPlaneHandoff {
         queue_capacity: usize,
         buffer_arena: BufferPoolArena,
     ) -> Self {
+        Self::new_shared_buffer_arena_with_node_capacity(workers, queue_capacity, 0, buffer_arena)
+    }
+
+    #[inline]
+    pub fn new_shared_buffer_arena_with_node_capacity(
+        workers: usize,
+        queue_capacity: usize,
+        node_capacity: usize,
+        buffer_arena: BufferPoolArena,
+    ) -> Self {
         Self {
             inner: Arc::new(DataPlaneHandoffInner {
                 queues: (0..workers)
                     .map(|_| ArrayQueue::new(queue_capacity))
                     .collect::<Box<[_]>>(),
                 buffer_arena: Some(buffer_arena),
+                worker_interrupt_pending: (0..workers)
+                    .map(|_| (0..node_capacity).map(|_| AtomicBool::new(false)).collect())
+                    .collect(),
+                worker_interrupt_threads: (0..workers)
+                    .map(|_| OnceLock::new())
+                    .collect(),
             }),
         }
     }
@@ -239,6 +290,50 @@ impl DataPlaneHandoffWorker {
             .queues
             .get(self.worker.slot())
             .and_then(|queue| queue.pop())
+    }
+
+    #[inline]
+    pub(crate) fn attach_current_thread(&self) {
+        if let Some(slot) = self.inner.worker_interrupt_threads.get(self.worker.slot()) {
+            let _ = slot.set(thread::current());
+        }
+    }
+
+    #[inline]
+    pub(crate) fn set_worker_node_interrupt_pending(
+        &self,
+        worker: DataWorkerId,
+        node: NodeId,
+    ) {
+        let Some(pending) = self.inner.worker_interrupt_pending.get(worker.slot()) else {
+            return;
+        };
+        let Some(bit) = pending.get(node.slot() as usize) else {
+            return;
+        };
+        if bit.swap(true, Ordering::Release) {
+            return;
+        }
+        if let Some(thread) = self
+            .inner
+            .worker_interrupt_threads
+            .get(worker.slot())
+            .and_then(OnceLock::get)
+        {
+            thread.unpark();
+        }
+    }
+
+    #[inline]
+    pub(crate) fn drain_worker_interrupts(&self, mut schedule: impl FnMut(NodeId)) {
+        let Some(pending) = self.inner.worker_interrupt_pending.get(self.worker.slot()) else {
+            return;
+        };
+        for (node_slot, bit) in pending.iter().enumerate() {
+            if bit.swap(false, Ordering::Acquire) {
+                schedule(NodeId::new(node_slot as u32));
+            }
+        }
     }
 }
 

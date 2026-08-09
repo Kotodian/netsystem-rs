@@ -294,6 +294,10 @@ _Avoid_: parallel local/remote session objects, TLS-specific app session, wrappe
 An Application-owned accepted-connection destination. The Application fixes its Session App selection when listening; Session Runtime uses the Application Listener identity to select the Session App and final Local or SVM delivery, while the selected Transport retains only its own endpoint lookup and an opaque route back to that Application Listener.
 _Avoid_: TCP listener as Application identity, Transport-owned TLS mode, SVM segment key as listener semantics
 
+**Application Connection**:
+An Application-owned outbound connection attempt identified by an `ApplicationConnectionId`. Acceptance of the connect request makes the attempt pending; it does not mean that a layered transport handshake has completed. Session retains the Application Connection until the owning Data Worker publishes exact success or failure. A successful attempt produces the app-facing Session, while a pre-publication failure completes against the Application Connection because no Session identity exists yet.
+_Avoid_: reclaiming the connection identity after lower-transport setup, treating request acceptance as handshake success, reporting pre-publication failure through a synthetic Session
+
 **Session App**:
 A concrete plugin-registered Session callback provider selected by an Application endpoint. Session owns every Session, FIFO, event route, lifecycle transition, and publication; the plugin owns worker-local protocol state addressed by `app_session`. One Session App may aggregate multiple Sessions for HTTP/3 or operate one-to-one for TLS.
 _Avoid_: AppSessionProtocol, generic protocol relationship registry, ordered protocol-chain policy, Session-owned protocol state
@@ -335,6 +339,10 @@ _Avoid_: `session_evt_q` as the only event staging point, per-protocol event lis
 **Session Worker State**:
 The worker-local polling/interrupt/idle state that controls whether `appsl-rx-mqs-input` wakes `session-queue` and what timerfd deadline the worker arms, matching VPP session worker state semantics.
 _Avoid_: graph node state as worker state, always-interrupt wake, fixed polling-only behavior
+
+**Datagram Session Worker Migration**:
+The one-time transfer of an `OPENED` connected datagram Transport Connection and its Session to the Data Worker that receives the first datagram. The new Session retains the same FIFO storage, the old worker performs Application notification and owner-local cleanup, and the target Session cannot receive application data until migration is accepted. `READY` and `ACCEPTING` Sessions retain their current owner; a packet received elsewhere is handed to that owner instead of triggering another migration.
+_Avoid_: treating wrong-worker handoff as migration, moving Session requests through Runtime, QUIC network-path migration, migrating a ready Session again
 
 **Transport Timer Policy**:
 The transport-owned rules that decide which timer kinds are active, when they should expire, and how exact Timer Token expiry changes transport state. The transport worker owns scheduling and dispatch; Session Runtime does not store, advance, interpret, or deliver transport timers.
@@ -383,6 +391,10 @@ _Avoid_: generation-bearing session handle, SessionId-as-app-handle, opaque cook
 **Session Event**:
 An app↔session or Session-internal Session Message Queue event aligned with VPP `session_event_t`. IO events (`RxEnq`, `RxDeq`, `TxEnq`, `TxDeq`, and `ProtocolOutput`) use the IO ring and carry session index only; control Session Events (`Connect` / `Close`) use the CTRL ring and carry a Session Handle. `ProtocolOutput` is produced and consumed only inside Session Runtime; an external App cannot use it to drive a protocol binding. Consume paths drop events whose session slot is free or unmapped. Slot reuse after free may still target a replacement session; that window matches VPP and is not closed by adding generation to the event. These are not worker-local Session Control Events.
 _Avoid_: generation-safe SessionEvt, Index-in-event as ownership proof, one identity field for every event kind, confusing MQ CTRL-ring events with Session Control Events
+
+**Application Session Connect Completion**:
+A VPP `session_connected_msg_t`-shaped variant of the existing Application Session reply protocol, published on the existing Application CTRL reply queue. It carries the pending `ApplicationConnectionId` as the connect context, a concrete completion status, and a Session handle only on success. It is not a new `SessionEvtType`; the existing `SessionEvtType::Connect` remains the event for a published Session, while the existing App Session publication path carries its FIFO/segment descriptors.
+_Avoid_: encoding an Application Connection in SessionEvt identity, adding a second Connect event enum, creating a parallel completion queue, using an untagged immediate reply for asynchronous handshake completion
 
 **Session Control Event**:
 A worker-local session lifecycle command, such as disconnect, dispatched by Session Runtime separately from TX/RX session work and separately from Session Message Queue CTRL-ring Session Events. Control events may invoke transport close handling, but they are not readiness facts and do not enter the Session Work Batch.

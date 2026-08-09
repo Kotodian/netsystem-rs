@@ -6,10 +6,11 @@
 //! instead of the C preprocessor.
 //!
 //! Concurrency (VPP-shaped):
-//! - Lookups load `AtomicBucket` and never take a mutex.
-//! - Writers CAS the per-bucket lock bit, prepare immutable replacement pages,
-//!   then publish an unlocked bucket word.
-//! - Page allocation and reclamation use an allocator-only spin lock.
+//! - Lookups load `AtomicBucket` and never take a mutex or a project lock.
+//! - Writers atomically set VPP's `bucket.lock` writer bit (`lock:1`),
+//!   modify the live value page, then publish an unlocked word.
+//! - Page allocation and reclamation use VPP's `alloc_lock`-shaped atomic
+//!   serialization bit; this is allocator state, not a data-plane object lock.
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -103,44 +104,25 @@ impl<K: BihashKey + Default, const KVP: usize> Bihash<K, KVP> {
 
     #[inline]
     pub(crate) fn load_bucket(&self, idx: usize) -> Bucket {
-        self.buckets[idx].load(Ordering::SeqCst)
+        self.buckets[idx].load(Ordering::Acquire)
     }
 
     #[inline]
     pub(crate) fn store_bucket(&self, idx: usize, bucket: Bucket) {
-        self.buckets[idx].store(bucket, Ordering::SeqCst);
+        self.buckets[idx].store(bucket, Ordering::Release);
     }
 
-    #[inline]
-    pub(crate) fn cas_bucket(
-        &self,
-        idx: usize,
-        current: Bucket,
-        new: Bucket,
-    ) -> Result<Bucket, Bucket> {
-        self.buckets[idx].compare_exchange(current, new, Ordering::SeqCst, Ordering::SeqCst)
-    }
-
-    /// Lock the bucket word (VPP lock bit). Returns the locked snapshot.
+    /// Atomically set the VPP bucket writer bit (`lock:1`). Returns the locked
+    /// snapshot. Readers wait only while a writer owns that bit.
     pub(crate) fn lock_bucket(&self, idx: usize) -> Bucket {
         loop {
-            let cur = self.load_bucket(idx);
-            if cur.is_locked() {
+            let mask = Bucket::empty().with_lock();
+            let old = self.buckets[idx].fetch_or(mask, Ordering::Acquire);
+            if old.is_locked() {
                 core::hint::spin_loop();
                 continue;
             }
-            let locked = Bucket::pack(
-                cur.offset(),
-                cur.log2_pages(),
-                cur.refcnt(),
-                cur.generation(),
-                cur.is_linear_search(),
-                true,
-            );
-            match self.cas_bucket(idx, cur, locked) {
-                Ok(_) => return locked,
-                Err(_) => core::hint::spin_loop(),
-            }
+            return old.with_lock();
         }
     }
 

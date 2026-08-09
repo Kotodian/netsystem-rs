@@ -668,6 +668,42 @@ impl DataPlaneRuntime {
         Ok(true)
     }
 
+    /// VPP `vlib_node_set_interrupt_pending(target_vm, node)`.
+    ///
+    /// Atomically coalesces one exact node interrupt on the target Data
+    /// Worker and wakes that worker. It carries no payload and performs no
+    /// Session work. Invalid published worker/node identity is a Runtime
+    /// invariant violation, not a per-packet recoverable failure.
+    #[inline]
+    pub fn set_worker_node_interrupt_pending(
+        &self,
+        worker: DataWorkerId,
+        node: NodeId,
+    ) {
+        if let Some(handoff) = &self.handoff {
+            handoff.set_worker_node_interrupt_pending(worker, node);
+        }
+    }
+
+    pub(crate) fn attach_worker_interrupt_thread(&self) {
+        if let Some(handoff) = &self.handoff {
+            handoff.attach_current_thread();
+        }
+    }
+
+    pub(crate) fn schedule_remote_interrupts(&self) -> RuntimeResult<usize> {
+        let Some(handoff) = &self.handoff else {
+            return Ok(0);
+        };
+        let mut scheduled = 0;
+        handoff.drain_worker_interrupts(|node| {
+            self.schedule_empty_frame(node)
+                .expect("published worker interrupt node must schedule");
+            scheduled += 1;
+        });
+        Ok(scheduled)
+    }
+
     #[inline]
     pub fn run_ready_nodes(&self) -> RuntimeResult<usize> {
         self.drain_handoff_frames()?;
@@ -710,13 +746,17 @@ impl DataPlaneRuntime {
         if pending == 0 {
             return Ok(());
         }
+        let target_node = self.nodes.node_for_handle(target)?;
         let slots = pending.div_ceil(HANDOFF_SLOT_CAPACITY);
         handoff.ensure_enqueue_slots(worker, slots)?;
         while !frame.pending_indices().is_empty() {
             let slot = HandoffSlot::from_prefix(frame.pending_indices());
             let slot_len = slot.len();
             match handoff.enqueue_slot(worker, target, slot) {
-                Ok(()) => frame.discard_prefix(slot_len),
+                Ok(()) => {
+                    frame.discard_prefix(slot_len);
+                    self.set_worker_node_interrupt_pending(worker, target_node);
+                }
                 Err(err) => {
                     let (error, _) = err.into_parts();
                     return Err(error.into());
@@ -731,31 +771,9 @@ impl DataPlaneRuntime {
         &self,
         worker: DataWorkerId,
         target: NodeHandle,
-        indices: impl IntoIterator<Item = Index>,
+        frame: &mut BufferFrame,
     ) -> RuntimeResult<()> {
-        let Some(handoff) = &self.handoff else {
-            return Err(DataPlaneError::HandoffNotConfigured.into());
-        };
-        let indices = indices.into_iter();
-        if let (_, Some(upper)) = indices.size_hint()
-            && upper == 0
-        {
-            return Ok(());
-        }
-        if let (_, Some(upper)) = indices.size_hint() {
-            handoff.ensure_enqueue_slots(worker, upper.div_ceil(HANDOFF_SLOT_CAPACITY))?;
-        }
-        let mut slot = HandoffSlot::new();
-        for index in indices {
-            if !slot.push(index) {
-                self.enqueue_handoff_slot_or_drop(worker, target, slot)?;
-                slot = HandoffSlot::single(index);
-            }
-        }
-        if !slot.is_empty() {
-            self.enqueue_handoff_slot_or_drop(worker, target, slot)?;
-        }
-        Ok(())
+        self.handoff_frame(worker, target, frame)
     }
 
     #[inline]
@@ -776,34 +794,38 @@ impl DataPlaneRuntime {
         let Some(handoff) = &self.handoff else {
             return Err(DataPlaneError::HandoffNotConfigured.into());
         };
+        let target_node = self.nodes.node_for_handle(target)?;
         handoff.ensure_enqueue_slots(worker, 1)?;
         match handoff.enqueue_index(worker, target, index) {
-            Ok(()) => Ok(()),
+            Ok(()) => {
+                self.set_worker_node_interrupt_pending(worker, target_node);
+                Ok(())
+            }
             Err(err) => {
-                let (error, slot) = err.into_parts();
-                let guard = HandoffSlotGuard::new(self, slot);
-                drop(guard);
+                let (error, _) = err.into_parts();
                 Err(error.into())
             }
         }
     }
 
     #[inline]
-    fn enqueue_handoff_slot_or_drop(
+    fn enqueue_handoff_slot(
         &self,
         worker: DataWorkerId,
         target: NodeHandle,
+        target_node: NodeId,
         slot: HandoffSlot,
     ) -> RuntimeResult<()> {
         let Some(handoff) = &self.handoff else {
             return Err(DataPlaneError::HandoffNotConfigured.into());
         };
         match handoff.enqueue_slot(worker, target, slot) {
-            Ok(()) => Ok(()),
+            Ok(()) => {
+                self.set_worker_node_interrupt_pending(worker, target_node);
+                Ok(())
+            }
             Err(err) => {
-                let (error, slot) = err.into_parts();
-                let guard = HandoffSlotGuard::new(self, slot);
-                drop(guard);
+                let (error, _) = err.into_parts();
                 Err(error.into())
             }
         }

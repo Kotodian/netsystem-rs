@@ -1,0 +1,4 @@
+interface:
+  display_name: "VPP Error Handling"
+  short_description: "Classify Hammer failures by VPP ownership."
+  default_prompt: "Use $vpp-error-handling to review this Hammer error path before changing it."
