@@ -1,11 +1,13 @@
 use std::cell::UnsafeCell;
 use std::collections::VecDeque;
+use std::net::SocketAddr;
 use std::num::NonZeroU32;
 use std::os::fd::BorrowedFd;
 use std::sync::Arc;
 use std::thread::{self, ThreadId};
 use std::time::{Duration, Instant};
 
+use crossbeam_queue::ArrayQueue;
 use hammer_core::data_plane::{
     BufferFrame, DataPlaneBuffers, Index as BufferIndex, NodeId, NodeState,
 };
@@ -33,6 +35,7 @@ use hammer_runtime::{
 use crate::session::app::AppWorkerError;
 use crate::session::application::{ApplicationMain, ApplicationMqResources};
 use crate::session::error::{SessionError, SessionQueueError};
+use crate::session::lookup::{SessionEndpointLookup, SessionEndpointState};
 use crate::session::node::{AppSessionInputNode, SessionQueueTransportDispatch};
 use crate::session::protocol::SessionAppCallbacks;
 use crate::session::state::SessionState;
@@ -79,6 +82,11 @@ impl SessionTransportId {
     #[inline]
     pub const fn new(value: u8) -> Self {
         Self(value)
+    }
+
+    #[inline]
+    pub const fn raw(self) -> u8 {
+        self.0
     }
 }
 
@@ -127,6 +135,168 @@ const _: () = assert!(core::mem::size_of::<RxDelivery>() <= 24);
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct SessionQueueStep {
     pub scheduled_sessions: usize,
+}
+
+const DEFAULT_SESSION_MIGRATE_QUEUE_CAPACITY: usize = 1024;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SessionDgramArgs {
+    pub index: BufferIndex,
+    pub payload_offset: usize,
+    pub payload_len: usize,
+    pub urgent: bool,
+    pub return_node: NodeId,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SessionMigrateResult {
+    Queued,
+    Handoff,
+    Busy,
+    QueueFull,
+    Unavailable,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SessionSwitchPoolArgs {
+    pub old_sh: SessionHandle,
+    pub new_sh: Option<SessionHandle>,
+    pub old_thread: DataWorkerId,
+    pub new_thread: DataWorkerId,
+    pub transport: SessionTransportId,
+    pub local: SocketAddr,
+    pub remote: SocketAddr,
+    pub dgram: SessionDgramArgs,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SessionSwitchPoolStatus {
+    Rejected,
+    Prepared,
+}
+
+pub struct SessionMigrationState {
+    transport: SessionTransportId,
+    rx_fifo: Arc<Fifo>,
+    tx_fifo: Arc<Fifo>,
+}
+
+pub struct SessionSwitchPoolReply {
+    pub old_sh: SessionHandle,
+    pub new_sh: Option<SessionHandle>,
+    pub old_thread: DataWorkerId,
+    pub new_thread: DataWorkerId,
+    pub transport: SessionTransportId,
+    pub local: SocketAddr,
+    pub remote: SocketAddr,
+    pub status: SessionSwitchPoolStatus,
+    pub state: Option<SessionMigrationState>,
+    pub dgram: SessionDgramArgs,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SessionSwitchPoolCompletionStatus {
+    Accepted,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SessionSwitchPoolCompletion {
+    pub old_sh: SessionHandle,
+    pub new_sh: SessionHandle,
+    pub old_thread: DataWorkerId,
+    pub new_thread: DataWorkerId,
+    pub transport: SessionTransportId,
+    pub local: SocketAddr,
+    pub remote: SocketAddr,
+    pub status: SessionSwitchPoolCompletionStatus,
+}
+
+struct SessionMigrateQueues {
+    session_migrate_requests: Box<[ArrayQueue<SessionSwitchPoolArgs>]>,
+    session_switch_pool_replies: Box<[ArrayQueue<SessionSwitchPoolReply>]>,
+    session_switch_pool_completions: Box<[ArrayQueue<SessionSwitchPoolCompletion>]>,
+}
+
+impl SessionMigrateQueues {
+    fn new(worker_count: usize) -> Self {
+        Self {
+            session_migrate_requests: (0..worker_count)
+                .map(|_| ArrayQueue::new(DEFAULT_SESSION_MIGRATE_QUEUE_CAPACITY))
+                .collect(),
+            session_switch_pool_replies: (0..worker_count)
+                .map(|_| ArrayQueue::new(DEFAULT_SESSION_MIGRATE_QUEUE_CAPACITY))
+                .collect(),
+            session_switch_pool_completions: (0..worker_count)
+                .map(|_| ArrayQueue::new(DEFAULT_SESSION_MIGRATE_QUEUE_CAPACITY))
+                .collect(),
+        }
+    }
+
+    #[inline]
+    fn push_session_migrate_request(
+        &self,
+        args: SessionSwitchPoolArgs,
+    ) -> Result<(), SessionSwitchPoolArgs> {
+        let Some(queue) = self.session_migrate_requests.get(args.old_thread.slot()) else {
+            return Err(args);
+        };
+        queue.push(args)
+    }
+
+    #[inline]
+    fn pop_session_migrate_request(&self, worker: DataWorkerId) -> Option<SessionSwitchPoolArgs> {
+        self.session_migrate_requests
+            .get(worker.slot())
+            .and_then(ArrayQueue::pop)
+    }
+
+    #[inline]
+    fn push_session_switch_pool_reply(
+        &self,
+        reply: SessionSwitchPoolReply,
+    ) -> Result<(), SessionSwitchPoolReply> {
+        let Some(queue) = self
+            .session_switch_pool_replies
+            .get(reply.new_thread.slot())
+        else {
+            return Err(reply);
+        };
+        queue.push(reply)
+    }
+
+    #[inline]
+    fn pop_session_switch_pool_reply(
+        &self,
+        worker: DataWorkerId,
+    ) -> Option<SessionSwitchPoolReply> {
+        self.session_switch_pool_replies
+            .get(worker.slot())
+            .and_then(ArrayQueue::pop)
+    }
+
+    #[inline]
+    fn push_session_switch_pool_completion(
+        &self,
+        completion: SessionSwitchPoolCompletion,
+    ) -> Result<(), SessionSwitchPoolCompletion> {
+        let Some(queue) = self
+            .session_switch_pool_completions
+            .get(completion.old_thread.slot())
+        else {
+            return Err(completion);
+        };
+        queue.push(completion)
+    }
+
+    #[inline]
+    fn pop_session_switch_pool_completion(
+        &self,
+        worker: DataWorkerId,
+    ) -> Option<SessionSwitchPoolCompletion> {
+        self.session_switch_pool_completions
+            .get(worker.slot())
+            .and_then(ArrayQueue::pop)
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -267,6 +437,8 @@ pub struct SessionMain {
     workers: Box<[CacheLine<ThreadOwned<SessionWorker<PoolIndex>>>]>,
     owner: ThreadId,
     listeners: UnsafeCell<Pool<SessionListener>>,
+    endpoint_lookup: SessionEndpointLookup,
+    session_switch_pool_queues: Arc<SessionMigrateQueues>,
     applications: Arc<ApplicationMain>,
 }
 
@@ -326,8 +498,217 @@ impl SessionMain {
             workers,
             owner: thread::current().id(),
             listeners: UnsafeCell::new(Pool::with_capacity(pool_capacity)),
+            endpoint_lookup: SessionEndpointLookup::new(),
+            session_switch_pool_queues: Arc::new(SessionMigrateQueues::new(worker_count)),
             applications,
         }
+    }
+
+    pub(crate) fn insert_endpoint(
+        &self,
+        local: std::net::SocketAddr,
+        remote: std::net::SocketAddr,
+        transport: SessionTransportId,
+        handle: SessionHandle,
+    ) -> bool {
+        self.endpoint_lookup
+            .insert(local, remote, transport, handle)
+    }
+
+    pub(crate) fn mark_endpoint_ready(
+        &self,
+        local: std::net::SocketAddr,
+        remote: std::net::SocketAddr,
+        transport: SessionTransportId,
+        handle: SessionHandle,
+    ) -> bool {
+        self.endpoint_lookup
+            .mark_ready(local, remote, transport, handle)
+    }
+
+    pub(crate) fn remove_endpoint_if_current(
+        &self,
+        local: std::net::SocketAddr,
+        remote: std::net::SocketAddr,
+        transport: SessionTransportId,
+        handle: SessionHandle,
+    ) -> bool {
+        self.endpoint_lookup
+            .remove_if_current(local, remote, transport, handle)
+    }
+
+    pub(crate) fn replace_endpoint_if_current(
+        &self,
+        local: std::net::SocketAddr,
+        remote: std::net::SocketAddr,
+        transport: SessionTransportId,
+        old_handle: SessionHandle,
+        new_handle: SessionHandle,
+    ) -> bool {
+        self.endpoint_lookup
+            .replace_if_current(local, remote, transport, old_handle, new_handle)
+    }
+
+    pub(crate) fn publish_migration_endpoint(
+        &self,
+        local: std::net::SocketAddr,
+        remote: std::net::SocketAddr,
+        transport: SessionTransportId,
+        old_handle: SessionHandle,
+        new_handle: SessionHandle,
+    ) -> bool {
+        self.endpoint_lookup
+            .publish_migration(local, remote, transport, old_handle, new_handle)
+    }
+
+    pub fn lookup_endpoint(
+        &self,
+        local: std::net::SocketAddr,
+        remote: std::net::SocketAddr,
+        transport: SessionTransportId,
+    ) -> Option<SessionHandle> {
+        self.endpoint_lookup.lookup(local, remote, transport)
+    }
+
+    pub fn endpoint_is_migrating(
+        &self,
+        local: std::net::SocketAddr,
+        remote: std::net::SocketAddr,
+        transport: SessionTransportId,
+    ) -> bool {
+        self.endpoint_lookup.state(local, remote, transport)
+            == Some(SessionEndpointState::Migrating)
+    }
+
+    pub fn program_thread_migration(
+        &self,
+        runtime: &DataPlaneRuntime,
+        target_worker: DataWorkerId,
+        old_handle: SessionHandle,
+        transport: SessionTransportId,
+        local: SocketAddr,
+        remote: SocketAddr,
+        dgram: SessionDgramArgs,
+    ) -> SessionMigrateResult {
+        let source_worker = DataWorkerId::new(old_handle.worker_index());
+        if source_worker == target_worker
+            || source_worker.slot() >= self.workers.len()
+            || target_worker.slot() >= self.workers.len()
+        {
+            return SessionMigrateResult::Unavailable;
+        }
+
+        if !self
+            .endpoint_lookup
+            .claim_migration(local, remote, transport, old_handle)
+        {
+            return match self.endpoint_lookup.state(local, remote, transport) {
+                Some(crate::session::lookup::SessionEndpointState::Ready)
+                    if self.endpoint_lookup.lookup(local, remote, transport)
+                        == Some(old_handle) =>
+                {
+                    SessionMigrateResult::Handoff
+                }
+                Some(crate::session::lookup::SessionEndpointState::Migrating) => {
+                    SessionMigrateResult::Busy
+                }
+                _ => SessionMigrateResult::Unavailable,
+            };
+        }
+
+        let args = SessionSwitchPoolArgs {
+            old_sh: old_handle,
+            new_sh: None,
+            old_thread: source_worker,
+            new_thread: target_worker,
+            transport,
+            local,
+            remote,
+            dgram,
+        };
+        if self
+            .session_switch_pool_queues
+            .push_session_migrate_request(args)
+            .is_err()
+        {
+            let _ = self
+                .endpoint_lookup
+                .cancel_migration(local, remote, transport, old_handle);
+            return SessionMigrateResult::QueueFull;
+        }
+        self.wake_worker(runtime, source_worker);
+        SessionMigrateResult::Queued
+    }
+
+    pub(crate) fn cancel_migration(
+        &self,
+        local: SocketAddr,
+        remote: SocketAddr,
+        transport: SessionTransportId,
+        old_handle: SessionHandle,
+    ) -> bool {
+        self.endpoint_lookup
+            .cancel_migration(local, remote, transport, old_handle)
+    }
+
+    fn wake_worker(&self, runtime: &DataPlaneRuntime, worker: DataWorkerId) {
+        if let Some(session_queue) = runtime.node_by_name("session-queue") {
+            runtime.set_worker_node_interrupt_pending(worker, session_queue);
+        }
+    }
+
+    pub fn push_session_switch_pool_reply(
+        &self,
+        runtime: &DataPlaneRuntime,
+        reply: SessionSwitchPoolReply,
+    ) -> Result<(), SessionSwitchPoolReply> {
+        let target_worker = reply.new_thread;
+        let result = self
+            .session_switch_pool_queues
+            .push_session_switch_pool_reply(reply);
+        if result.is_ok() {
+            self.wake_worker(runtime, target_worker);
+        }
+        result
+    }
+
+    pub fn push_session_switch_pool_completion(
+        &self,
+        runtime: &DataPlaneRuntime,
+        completion: SessionSwitchPoolCompletion,
+    ) -> Result<(), SessionSwitchPoolCompletion> {
+        let source_worker = completion.old_thread;
+        let result = self
+            .session_switch_pool_queues
+            .push_session_switch_pool_completion(completion);
+        if result.is_ok() {
+            self.wake_worker(runtime, source_worker);
+        }
+        result
+    }
+
+    pub fn pop_session_migrate_request(
+        &self,
+        worker: DataWorkerId,
+    ) -> Option<SessionSwitchPoolArgs> {
+        self.session_switch_pool_queues
+            .pop_session_migrate_request(worker)
+    }
+
+    pub fn pop_session_switch_pool_reply(
+        &self,
+        worker: DataWorkerId,
+    ) -> Option<SessionSwitchPoolReply> {
+        self.session_switch_pool_queues
+            .pop_session_switch_pool_reply(worker)
+    }
+
+    pub fn pop_session_switch_pool_completion(
+        &self,
+        worker: DataWorkerId,
+    ) -> Option<SessionSwitchPoolCompletion> {
+        self.session_switch_pool_queues
+            .pop_session_switch_pool_completion(worker)
     }
 
     pub fn listen(
@@ -1783,6 +2164,195 @@ impl<Index: Copy + Eq> SessionWorker<Index> {
         SessionHandle::new(session_id.pool_index().slot(), self.worker.slot() as u32)
     }
 
+    #[inline]
+    pub fn session_id_from_handle(&self, handle: SessionHandle) -> Option<SessionId> {
+        if handle.worker_index() != self.worker.slot() as u32 {
+            return None;
+        }
+        self.entries
+            .index_at_slot(handle.session_index())
+            .map(SessionId::from)
+    }
+
+    pub fn program_thread_migration(
+        &self,
+        runtime: &DataPlaneRuntime,
+        target_worker: DataWorkerId,
+        old_handle: SessionHandle,
+        transport: SessionTransportId,
+        local: SocketAddr,
+        remote: SocketAddr,
+        dgram: SessionDgramArgs,
+    ) -> SessionMigrateResult {
+        self.listener_main
+            .as_ref()
+            .map_or(SessionMigrateResult::Unavailable, |main| {
+                main.program_thread_migration(
+                    runtime,
+                    target_worker,
+                    old_handle,
+                    transport,
+                    local,
+                    remote,
+                    dgram,
+                )
+            })
+    }
+
+    pub fn cancel_thread_migration(
+        &self,
+        old_handle: SessionHandle,
+        transport: SessionTransportId,
+        local: SocketAddr,
+        remote: SocketAddr,
+    ) -> bool {
+        self.listener_main
+            .as_ref()
+            .is_some_and(|main| main.cancel_migration(local, remote, transport, old_handle))
+    }
+
+    pub fn push_session_switch_pool_reply(
+        &self,
+        runtime: &DataPlaneRuntime,
+        reply: SessionSwitchPoolReply,
+    ) -> Result<(), SessionSwitchPoolReply> {
+        let Some(main) = self.listener_main.as_ref() else {
+            return Err(reply);
+        };
+        main.push_session_switch_pool_reply(runtime, reply)
+    }
+
+    pub fn pop_session_migrate_request(&self) -> Option<SessionSwitchPoolArgs> {
+        self.listener_main
+            .as_ref()?
+            .pop_session_migrate_request(self.worker)
+    }
+
+    pub fn pop_session_switch_pool_reply(&self) -> Option<SessionSwitchPoolReply> {
+        self.listener_main
+            .as_ref()?
+            .pop_session_switch_pool_reply(self.worker)
+    }
+
+    pub fn push_session_switch_pool_completion(
+        &self,
+        runtime: &DataPlaneRuntime,
+        completion: SessionSwitchPoolCompletion,
+    ) -> Result<(), SessionSwitchPoolCompletion> {
+        self.listener_main.as_ref().map_or(Err(completion), |main| {
+            main.push_session_switch_pool_completion(runtime, completion)
+        })
+    }
+
+    pub fn pop_session_switch_pool_completion(&self) -> Option<SessionSwitchPoolCompletion> {
+        self.listener_main
+            .as_ref()?
+            .pop_session_switch_pool_completion(self.worker)
+    }
+
+    pub fn insert_session_endpoint(
+        &self,
+        session_id: SessionId,
+        transport: SessionTransportId,
+        local: std::net::SocketAddr,
+        remote: std::net::SocketAddr,
+    ) -> RuntimeResult<bool> {
+        let main = self
+            .listener_main
+            .as_ref()
+            .ok_or(SessionError::ListenerMainMissing)?;
+        Ok(main.insert_endpoint(local, remote, transport, self.session_handle(session_id)))
+    }
+
+    pub fn mark_session_endpoint_ready(
+        &self,
+        session_id: SessionId,
+        transport: SessionTransportId,
+        local: std::net::SocketAddr,
+        remote: std::net::SocketAddr,
+    ) -> RuntimeResult<bool> {
+        let main = self
+            .listener_main
+            .as_ref()
+            .ok_or(SessionError::ListenerMainMissing)?;
+        Ok(main.mark_endpoint_ready(local, remote, transport, self.session_handle(session_id)))
+    }
+
+    pub fn remove_session_endpoint(
+        &self,
+        session_id: SessionId,
+        transport: SessionTransportId,
+        local: std::net::SocketAddr,
+        remote: std::net::SocketAddr,
+    ) -> RuntimeResult<bool> {
+        let main = self
+            .listener_main
+            .as_ref()
+            .ok_or(SessionError::ListenerMainMissing)?;
+        Ok(main.remove_endpoint_if_current(
+            local,
+            remote,
+            transport,
+            self.session_handle(session_id),
+        ))
+    }
+
+    pub fn replace_session_endpoint(
+        &self,
+        old_session: SessionHandle,
+        new_session: SessionHandle,
+        transport: SessionTransportId,
+        local: std::net::SocketAddr,
+        remote: std::net::SocketAddr,
+    ) -> RuntimeResult<bool> {
+        let main = self
+            .listener_main
+            .as_ref()
+            .ok_or(SessionError::ListenerMainMissing)?;
+        Ok(main.replace_endpoint_if_current(local, remote, transport, old_session, new_session))
+    }
+
+    pub fn publish_session_migration(
+        &self,
+        old_session: SessionHandle,
+        new_session: SessionHandle,
+        transport: SessionTransportId,
+        local: std::net::SocketAddr,
+        remote: std::net::SocketAddr,
+    ) -> RuntimeResult<bool> {
+        let main = self
+            .listener_main
+            .as_ref()
+            .ok_or(SessionError::ListenerMainMissing)?;
+        Ok(main.publish_migration_endpoint(local, remote, transport, old_session, new_session))
+    }
+
+    pub fn lookup_session_endpoint(
+        &self,
+        transport: SessionTransportId,
+        local: std::net::SocketAddr,
+        remote: std::net::SocketAddr,
+    ) -> RuntimeResult<Option<SessionHandle>> {
+        let main = self
+            .listener_main
+            .as_ref()
+            .ok_or(SessionError::ListenerMainMissing)?;
+        Ok(main.lookup_endpoint(local, remote, transport))
+    }
+
+    pub fn session_endpoint_is_migrating(
+        &self,
+        transport: SessionTransportId,
+        local: std::net::SocketAddr,
+        remote: std::net::SocketAddr,
+    ) -> RuntimeResult<bool> {
+        let main = self
+            .listener_main
+            .as_ref()
+            .ok_or(SessionError::ListenerMainMissing)?;
+        Ok(main.endpoint_is_migrating(local, remote, transport))
+    }
+
     fn finish_transport_creation(&mut self, session_id: SessionId, index: Index) {
         let entry = self
             .entries
@@ -1811,6 +2381,103 @@ impl<Index: Copy + Eq> SessionWorker<Index> {
         Ok(initial)
     }
 
+    pub fn migration_snapshot(&self, session_id: SessionId) -> Option<SessionMigrationState> {
+        let entry = self.entries.get(session_id.pool_index())?;
+        if entry.application.is_some()
+            || entry.owner_application.is_some()
+            || entry.app.is_some()
+            || entry.app_session != 0
+            || entry.lower_session.is_some()
+        {
+            return None;
+        }
+        let Some(SessionType::Transport { transport, state }) = entry.session_type else {
+            return None;
+        };
+        state.transport_index()?;
+        Some(SessionMigrationState {
+            transport,
+            rx_fifo: Arc::clone(&entry.rx_fifo),
+            tx_fifo: Arc::clone(&entry.tx_fifo),
+        })
+    }
+
+    pub fn install_migrated_session(
+        &mut self,
+        state: SessionMigrationState,
+        index: Index,
+    ) -> RuntimeResult<(SessionId, SessionHandle)> {
+        let session_id = self.insert_session_entry(SessionEntry::creating_transport(
+            state.transport,
+            state.rx_fifo,
+            state.tx_fifo,
+        ))?;
+        self.finish_transport_creation(session_id, index);
+        if let Err(error) = self.connection_published(session_id) {
+            let _ = self.remove_session(session_id);
+            return Err(error);
+        }
+        Ok((session_id, self.session_handle(session_id)))
+    }
+
+    pub fn accept_migrated_session(&mut self, session_id: SessionId) -> RuntimeResult<()> {
+        self.connected(session_id)?;
+        let (tx_pending, rx_event) = {
+            let entry = self
+                .entries
+                .get(session_id.pool_index())
+                .ok_or(SessionError::SessionMissing { session_id })?;
+            (entry.tx_fifo.max_dequeue() != 0, entry.rx_fifo.has_event())
+        };
+        if tx_pending {
+            self.mark_ready(session_id);
+        }
+        if rx_event {
+            self.new_io_events.push_back(SessionEvt::io(
+                session_id.pool_index().slot(),
+                SessionEvtType::RxEnq,
+            ));
+        }
+        Ok(())
+    }
+
+    pub fn notify_migrated_session(
+        &mut self,
+        old_session: SessionId,
+        new_handle: SessionHandle,
+    ) -> RuntimeResult<()> {
+        let Some((app, context)) = self.entries.get(old_session.pool_index()).and_then(|entry| {
+            entry
+                .app
+                .zip((entry.app_session != 0).then_some(entry.app_session))
+        }) else {
+            return Ok(());
+        };
+        let callback = self
+            .session_app_callbacks(app)
+            .and_then(|callbacks| callbacks.migrate);
+        if let Some(callback) = callback {
+            callback(self, old_session, new_handle, context)?;
+        }
+        Ok(())
+    }
+
+    pub fn remove_migrated_session(&mut self, session_id: SessionId) -> RuntimeResult<()> {
+        let entry = self
+            .entries
+            .get(session_id.pool_index())
+            .ok_or(SessionError::SessionMissing { session_id })?;
+        if entry.application.is_some()
+            || entry.owner_application.is_some()
+            || entry.app.is_some()
+            || entry.app_session != 0
+            || entry.lower_session.is_some()
+        {
+            return Err(SessionError::SessionMissing { session_id }.into());
+        }
+        self.remove_session(session_id)
+    }
+
     pub fn rollback_session_creation(
         &mut self,
         session_id: SessionId,
@@ -1827,6 +2494,22 @@ impl<Index: Copy + Eq> SessionWorker<Index> {
             .map_err(|_| SessionError::RollbackRejected { session_id })?;
         self.remove_session(session_id)?;
         Ok(index)
+    }
+
+    #[doc(hidden)]
+    pub fn insert_unbound_transport_session_for_test(
+        &mut self,
+        transport: SessionTransportId,
+        index: Index,
+    ) -> RuntimeResult<SessionId> {
+        let (rx_fifo, tx_fifo) = self.create_local_fifos()?;
+        let session_id = self.insert_session_entry(SessionEntry::creating_transport(
+            transport, rx_fifo, tx_fifo,
+        ))?;
+        self.finish_transport_creation(session_id, index);
+        self.connection_published(session_id)?;
+        self.connected(session_id)?;
+        Ok(session_id)
     }
 
     pub fn insert_session_for_test(
@@ -3310,7 +3993,8 @@ mod tests {
 
     use super::{
         DEFAULT_SESSION_POOL_CAPACITY, SessionMain, SessionQueueNext, SessionTransportId,
-        SessionType, SessionWorker, SessionWorkerState, queue_for_worker,
+        SessionEntry, SessionState, SessionType, SessionWorker, SessionWorkerState,
+        queue_for_worker,
     };
     use crate::session::ApplicationMain;
     use crate::session::SessionId;
@@ -4288,6 +4972,57 @@ mod tests {
             1
         );
         assert!(!sessions.mark_app_mq_pending(application));
+    }
+
+    #[test]
+    fn migrated_session_accept_reschedules_existing_fifo_events()
+    -> Result<(), SessionTestFailure> {
+        let applications = ApplicationMain::new(1);
+        let main = Arc::new(SessionMain::new(1, Arc::clone(&applications)));
+        let mut sessions = SessionWorker::<Index>::new(
+            DataWorkerId::new(0),
+            1,
+            AppSessionConfig::default(),
+            DEFAULT_SESSION_POOL_CAPACITY,
+            applications,
+            None,
+        )?;
+        sessions.set_listener_main(main);
+        let (rx_fifo, tx_fifo) = sessions.create_local_fifos()?;
+        let session_id = sessions.insert_session_entry(SessionEntry::creating_transport(
+            SessionTransportId::new(2),
+            rx_fifo.clone(),
+            tx_fifo.clone(),
+        ))?;
+        let transport_index = Index::new(7, 1);
+        sessions.finish_transport_creation(session_id, transport_index);
+        assert!(sessions.connection_published(session_id)?);
+
+        assert_eq!(tx_fifo.enqueue(b"tx"), 2);
+        assert_eq!(rx_fifo.enqueue(b"rx"), 2);
+        assert!(rx_fifo.set_event());
+
+        sessions.accept_migrated_session(session_id)?;
+
+        assert!(matches!(
+            sessions
+                .entries
+                .get(session_id.pool_index())
+                .and_then(|entry| entry.session_type),
+            Some(SessionType::Transport {
+                state: SessionState::Active(_),
+                ..
+            })
+        ));
+        assert!(sessions.new_io_events.iter().any(|event| {
+            event.session_index() == session_id.pool_index().slot()
+                && event.evt_type == SessionEvtType::TxEnq
+        }));
+        assert!(sessions.new_io_events.iter().any(|event| {
+            event.session_index() == session_id.pool_index().slot()
+                && event.evt_type == SessionEvtType::RxEnq
+        }));
+        Ok(())
     }
 
     #[test]

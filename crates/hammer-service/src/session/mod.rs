@@ -12,6 +12,7 @@ pub mod app;
 pub mod application;
 pub mod config;
 mod control;
+mod lookup;
 pub mod error;
 pub mod id;
 pub mod node;

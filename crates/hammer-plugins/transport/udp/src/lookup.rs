@@ -23,16 +23,19 @@ fn ip_words(ip: SocketAddr) -> (u64, u64) {
         SocketAddr::V4(address) => (u64::from(u32::from(*address.ip())), 0),
         SocketAddr::V6(address) => {
             let octets = address.ip().octets();
-            (
-                u64::from_be_bytes(octets[..8].try_into().expect("IPv6 half has eight bytes")),
-                u64::from_be_bytes(octets[8..].try_into().expect("IPv6 half has eight bytes")),
-            )
+            let mut first = [0; 8];
+            let mut second = [0; 8];
+            first.copy_from_slice(&octets[..8]);
+            second.copy_from_slice(&octets[8..]);
+            (u64::from_be_bytes(first), u64::from_be_bytes(second))
         }
     }
 }
 
-/// Exact UDP 4-tuple key. The version and both port values are included in
-/// the key, so IPv4, IPv6, and adjacent port pairs cannot alias.
+/// Exact UDP 4-tuple key for the worker-local connection index.
+///
+/// The shared connected-session directory keeps its own private key in the
+/// Session crate; UDP never publishes that key representation as an API.
 #[derive(Clone, Copy, Default, PartialEq, Eq)]
 struct UdpTupleKey([u64; 6]);
 
@@ -52,44 +55,6 @@ impl UdpTupleKey {
             remote_lo,
             (u64::from(local.port()) << 16) | u64::from(remote.port()),
         ]))
-    }
-}
-
-/// VPP `session_lookup_safe4/6` shared table for connected UDP tuples.
-///
-/// The value is a `SessionHandle` (worker index in the high word and session
-/// slot in the low word). It is used only to classify a packet that reaches a
-/// non-owning Data Worker; it is not a handoff route or port dispatch table.
-pub(crate) struct UdpSessionLookup {
-    table: Bihash<UdpTupleKey, 8>,
-}
-
-impl UdpSessionLookup {
-    #[inline]
-    pub(crate) fn new() -> Self {
-        Self {
-            table: Bihash::new(UDP_TUPLE_CAPACITY),
-        }
-    }
-
-    #[inline]
-    pub(crate) fn insert(&self, local: SocketAddr, remote: SocketAddr, handle: u64) {
-        if let Some(key) = UdpTupleKey::new(local, remote) {
-            self.table.insert(key, handle);
-        }
-    }
-
-    #[inline]
-    pub(crate) fn remove(&self, local: SocketAddr, remote: SocketAddr) {
-        if let Some(key) = UdpTupleKey::new(local, remote) {
-            self.table.remove(&key);
-        }
-    }
-
-    #[inline]
-    pub(crate) fn lookup(&self, local: SocketAddr, remote: SocketAddr) -> Option<u64> {
-        let key = UdpTupleKey::new(local, remote)?;
-        self.table.lookup(&key)
     }
 }
 
