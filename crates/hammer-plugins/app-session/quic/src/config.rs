@@ -14,7 +14,8 @@ use thiserror::Error;
 use crate::listener::{QUIC_MAIN, QuicMain};
 
 pub(crate) const QUIC_CONFIG_CAPACITY: usize = 1_024;
-const DEFAULT_CONNECTION_TIMEOUT: u32 = 30_000;
+pub(crate) const DEFAULT_CONNECTION_TIMEOUT: u32 = 30_000;
+pub(crate) const MAX_CONNECTION_TIMEOUT: u32 = 2_048 * 2_048 - 1;
 const DEFAULT_MAX_STREAMS_BIDI: u32 = 100;
 const DEFAULT_MAX_STREAMS_UNI: u32 = 100;
 
@@ -563,7 +564,7 @@ fn build_transport_config(
     config: TransportConfig,
     fifo_capacity: usize,
 ) -> Result<Arc<quinn_proto::TransportConfig>, ConfigError> {
-    if config.connection_timeout == 0 {
+    if !(1..=MAX_CONNECTION_TIMEOUT).contains(&config.connection_timeout) {
         return Err(ConfigError::ConnectionTimeoutInvalid);
     }
     let timeout = std::time::Duration::from_millis(u64::from(config.connection_timeout))
@@ -955,6 +956,16 @@ mod tests {
         let (certificate_der, _) = identity();
         main.register_client_config(application, ClientConfig::new(certificate_der))
             .expect("register QUIC client configuration");
+    }
+
+    #[test]
+    fn connection_timeout_rejects_timer_wheel_overflow() {
+        let config = TransportConfig::new(MAX_CONNECTION_TIMEOUT + 1, 1, 1);
+
+        assert!(matches!(
+            build_transport_config(config, 1_024),
+            Err(ConfigError::ConnectionTimeoutInvalid)
+        ));
     }
 
     #[test]

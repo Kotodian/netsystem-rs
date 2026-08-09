@@ -1,6 +1,8 @@
 # QUIC Graph Nodes follow Runtime ownership boundaries
 
-Status: accepted
+Status: superseded by ADR 0038
+
+Superseded historical design. Current QUIC ownership and Session boundaries are defined by ADR 0038 and ADR 0040.
 
 The QUIC plugin registers five protocol-specific Graph Nodes: `quic-input`, `quic-listen`, `quic-handshake`, `quic-recv-process`, and `quic-output`. `quic-input` performs invariant-header and CID-owner classification; unknown Initial datagrams enter `quic-listen`; handshaking connections enter `quic-handshake`; and later connection input enters `quic-recv-process`. `quic-handshake` consumes one coalesced UDP datagram atomically, so completing the handshake changes the route only for subsequent datagrams rather than transferring a partially processed datagram between Nodes.
 

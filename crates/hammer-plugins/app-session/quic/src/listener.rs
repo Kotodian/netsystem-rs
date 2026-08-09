@@ -2,6 +2,7 @@ use std::cell::UnsafeCell;
 use std::sync::{Arc, OnceLock, mpsc};
 use std::thread::{self, ThreadId};
 
+use hammer_core::data_plane::NodeState;
 use hammer_infra::align::CacheLine;
 use hammer_infra::pool::Index;
 use hammer_infra::pool::Pool;
@@ -11,6 +12,7 @@ use hammer_runtime::{
     DataWorkerId, Engine, RuntimeError, RuntimeResult, SessionConnectEndpoint, SessionConnectionId,
     SessionListenEndpoint, SessionListenerId, SessionTransportRegistration,
 };
+use hammer_service::session::node::SessionQueueNode;
 use hammer_service::session::runtime::{SessionMain, SessionWorker};
 
 use crate::config::{ConfigId, QUIC_CONFIG_CAPACITY, QuicConfigRegistry};
@@ -20,6 +22,8 @@ use crate::worker::{Context, ContextId, QUIC_CONTEXT_CAPACITY, QuicWorker, QuicW
 #[hammer_component_macros::runtime_error(subsystem = "quic")]
 #[derive(Debug, thiserror::Error)]
 pub(crate) enum QuicListenerError {
+    #[error("required graph node `{name}` is not registered")]
+    NodeMissing { name: &'static str },
     #[error("QUIC listener {listener:?} is not registered")]
     ListenerMissing { listener: SessionListenerId },
     #[error("QUIC listener capacity {capacity} is exhausted")]
@@ -28,6 +32,11 @@ pub(crate) enum QuicListenerError {
     LocalEndpointMissing,
     #[error("QUIC active connect endpoint family mismatch between local and remote")]
     ConnectEndpointMismatch,
+    #[error("QUIC worker graph setup failed: {setup}; attachment rollback failed: {cleanup}")]
+    WorkerGraphRollbackFailed {
+        setup: RuntimeError,
+        cleanup: RuntimeError,
+    },
 }
 
 /// Main Thread-owned QUIC listener authority.
@@ -125,7 +134,7 @@ impl QuicMain {
             .map(ConfigId::from_raw)
             .ok_or(crate::config::ConfigError::ConfigurationRequired)?;
         let server_config = self.configs.server_config(outer_application, config)?;
-        self.configs.transport_config(outer_application, config)?;
+        let transport_config = self.configs.transport_config(outer_application, config)?;
 
         let applications = self.sessions.applications();
         let inner_application_listener = applications
@@ -155,6 +164,7 @@ impl QuicMain {
                     inner_application_listener,
                     inner_session_listener,
                     config,
+                    transport_config.connection_timeout,
                     Some(server_config),
                 ))
                 .map(ContextId::from)
@@ -310,6 +320,10 @@ pub(crate) fn connect(endpoint: SessionConnectEndpoint) -> RuntimeResult<()> {
     let client_config = main
         .client_config(endpoint.application, config)
         .map_err(RuntimeError::from)?;
+    let connection_timeout = main
+        .configs
+        .transport_config(endpoint.application, config)?
+        .connection_timeout;
     let local = endpoint
         .local
         .ok_or(QuicListenerError::LocalEndpointMissing)?;
@@ -330,7 +344,7 @@ pub(crate) fn connect(endpoint: SessionConnectEndpoint) -> RuntimeResult<()> {
             let remote = remote;
             move || {
                 let result = main.with_worker(worker, |quic| {
-                    quic.allocate_client_connect(
+                    quic.allocate_client_connect_with_timeout(
                         client_config,
                         server_name,
                         local,
@@ -339,6 +353,7 @@ pub(crate) fn connect(endpoint: SessionConnectEndpoint) -> RuntimeResult<()> {
                         None,
                         endpoint.opaque,
                         endpoint.connection,
+                        connection_timeout,
                     )
                 });
                 if completion.send(result).is_err() {
@@ -463,16 +478,61 @@ fn init_quic(engine: &mut Engine, sessions: Arc<SessionMain>) -> RuntimeResult<A
     Ok(main)
 }
 
+fn bind_worker_graph(engine: &mut Engine, main: &QuicMain) -> RuntimeResult<()> {
+    let worker = engine.data_worker_id()?;
+    let session_queue =
+        engine
+            .runtime
+            .node_by_name("session-queue")
+            .ok_or(QuicListenerError::NodeMissing {
+                name: "session-queue",
+            })?;
+    let udp_output = engine
+        .runtime
+        .node_by_name("udp-output")
+        .ok_or(QuicListenerError::NodeMissing { name: "udp-output" })?;
+    let session_queue_data = engine.runtime.nodes().node_runtime_data(session_queue)?;
+    let session_queue_output =
+        SessionQueueNode::existing_output_next(&engine.runtime, session_queue, udp_output)?;
+    let attachment_installed = SessionQueueNode::install_worker_attachment(
+        &engine.runtime,
+        session_queue_data,
+        session_queue_output,
+        crate::worker::quic_session_queue_update_time,
+        crate::worker::quic_session_queue_dispatch,
+    )?;
+    let setup = main.install_worker(worker).and_then(|()| {
+        engine
+            .runtime
+            .nodes()
+            .set_node_state(session_queue, NodeState::Polling)
+    });
+    if let Err(setup) = setup {
+        if attachment_installed {
+            if let Err(cleanup) = SessionQueueNode::remove_worker_attachment(
+                &engine.runtime,
+                session_queue_data,
+                session_queue_output,
+                crate::worker::quic_session_queue_update_time,
+                crate::worker::quic_session_queue_dispatch,
+            ) {
+                return Err(QuicListenerError::WorkerGraphRollbackFailed { setup, cleanup }.into());
+            }
+        }
+        return Err(setup);
+    }
+    Ok(())
+}
+
 #[hammer_component_macros::worker_init_function(
     name = "quic_worker_init",
     runs_after = ["session_worker_init", "udp_worker_init"]
 )]
 fn init_quic_worker(engine: &mut Engine) -> RuntimeResult<()> {
-    let worker = engine.data_worker_id()?;
-    QUIC_MAIN
+    let main = QUIC_MAIN
         .get()
-        .ok_or(RuntimeError::PluginStateNotInitialized { plugin: "quic" })?
-        .install_worker(worker)
+        .ok_or(RuntimeError::PluginStateNotInitialized { plugin: "quic" })?;
+    bind_worker_graph(engine, main)
 }
 
 #[cfg(test)]

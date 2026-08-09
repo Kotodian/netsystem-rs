@@ -369,7 +369,7 @@ impl SessionQueueNode {
         output_next: SessionQueueNext,
         update_time: SessionQueueUpdateTimeFn,
         function: SessionQueueDispatchFn,
-    ) -> RuntimeResult<()> {
+    ) -> RuntimeResult<bool> {
         let ptr = runtime_data.word(0) as usize as *const SessionMain;
         if ptr.is_null() {
             return Err(RuntimeError::RuntimeCapabilityMissing {
@@ -380,6 +380,13 @@ impl SessionQueueNode {
         // and the SessionMain Arc remains alive in that worker's SessionMain.
         let main = unsafe { &*ptr };
         main.with_worker_mut(runtime, |sessions| {
+            if sessions.transport_dispatches.iter().any(|dispatch| {
+                dispatch.output_next == output_next
+                    && std::ptr::fn_addr_eq(dispatch.update_time, update_time)
+                    && std::ptr::fn_addr_eq(dispatch.function, function)
+            }) {
+                return Ok(false);
+            }
             sessions
                 .transport_dispatches
                 .push(SessionQueueTransportDispatch {
@@ -387,7 +394,37 @@ impl SessionQueueNode {
                     update_time,
                     function,
                 });
-            Ok(())
+            Ok(true)
+        })
+    }
+
+    /// Removes one exact worker-local transport dispatch attachment.
+    pub fn remove_worker_attachment(
+        runtime: &DataPlaneRuntime,
+        runtime_data: NodeRuntimeData,
+        output_next: SessionQueueNext,
+        update_time: SessionQueueUpdateTimeFn,
+        function: SessionQueueDispatchFn,
+    ) -> RuntimeResult<bool> {
+        let ptr = runtime_data.word(0) as usize as *const SessionMain;
+        if ptr.is_null() {
+            return Err(RuntimeError::RuntimeCapabilityMissing {
+                type_name: std::any::type_name::<SessionMain>(),
+            });
+        }
+        // SAFETY: worker NodeRuntimeData is installed by the owning Data Worker
+        // and the SessionMain Arc remains alive in that worker's SessionMain.
+        let main = unsafe { &*ptr };
+        main.with_worker_mut(runtime, |sessions| {
+            let Some(index) = sessions.transport_dispatches.iter().position(|dispatch| {
+                dispatch.output_next == output_next
+                    && std::ptr::fn_addr_eq(dispatch.update_time, update_time)
+                    && std::ptr::fn_addr_eq(dispatch.function, function)
+            }) else {
+                return Ok(false);
+            };
+            sessions.transport_dispatches.remove(index);
+            Ok(true)
         })
     }
 }
