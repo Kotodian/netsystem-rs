@@ -2032,6 +2032,22 @@ impl<Index: Copy + Eq> SessionWorker<Index> {
     }
 
     #[inline]
+    pub fn session_app_closed(&self, session_id: SessionId) -> bool {
+        self.entries
+            .get(session_id.pool_index())
+            .and_then(|entry| entry.session_type)
+            .is_some_and(|session_type| {
+                matches!(
+                    session_type,
+                    SessionType::Transport {
+                        state: SessionState::AppClosed(_) | SessionState::Closed(_),
+                        ..
+                    }
+                )
+            })
+    }
+
+    #[inline]
     pub fn app_session(&self, session_id: SessionId) -> Option<&Arc<AppSession>> {
         self.app.app_session(session_id)
     }
@@ -2365,11 +2381,7 @@ impl<Index: Copy + Eq> SessionWorker<Index> {
             })
     }
 
-    pub fn cancel_thread_migration(
-        &self,
-        old_handle: SessionHandle,
-        tuple: SessionTuple,
-    ) -> bool {
+    pub fn cancel_thread_migration(&self, old_handle: SessionHandle, tuple: SessionTuple) -> bool {
         self.listener_main
             .as_ref()
             .is_some_and(|main| main.cancel_migration(tuple, old_handle))
@@ -2634,11 +2646,15 @@ impl<Index: Copy + Eq> SessionWorker<Index> {
         old_session: SessionId,
         new_handle: SessionHandle,
     ) -> RuntimeResult<()> {
-        let Some((app, context)) = self.entries.get(old_session.pool_index()).and_then(|entry| {
-            entry
-                .app
-                .zip((entry.app_session != 0).then_some(entry.app_session))
-        }) else {
+        let Some((app, context)) = self
+            .entries
+            .get(old_session.pool_index())
+            .and_then(|entry| {
+                entry
+                    .app
+                    .zip((entry.app_session != 0).then_some(entry.app_session))
+            })
+        else {
             return Ok(());
         };
         let callback = self
@@ -2810,10 +2826,23 @@ impl<Index: Copy + Eq> SessionWorker<Index> {
 
     pub fn notify_transport_closing(
         &mut self,
-        runtime: &DataPlaneRuntime,
+        runtime: Option<&DataPlaneRuntime>,
         session_id: SessionId,
         index: Index,
     ) -> RuntimeResult<()> {
+        if self.notify_transport_closing_event(session_id, index)?
+            && let Some(runtime) = runtime
+        {
+            self.wake_session_queue(runtime)?;
+        }
+        Ok(())
+    }
+
+    fn notify_transport_closing_event(
+        &mut self,
+        session_id: SessionId,
+        index: Index,
+    ) -> RuntimeResult<bool> {
         let notify_application =
             self.entries
                 .get_mut(session_id.pool_index())
@@ -2826,9 +2855,8 @@ impl<Index: Copy + Eq> SessionWorker<Index> {
                 });
         if notify_application {
             self.notify_application_event(session_id, SessionEvtType::Disconnected)?;
-            self.wake_session_queue(runtime)?;
         }
-        Ok(())
+        Ok(notify_application)
     }
 
     pub fn notify_transport_reset(
@@ -4217,10 +4245,9 @@ mod tests {
     };
 
     use super::{
-        DEFAULT_SESSION_POOL_CAPACITY, SessionDgramArgs, SessionMain, SessionMigrateResult,
-        SessionQueueNext, SessionTransportId, SessionEntry, SessionState, SessionType,
-        SessionWorker, SessionWorkerState,
-        queue_for_worker,
+        DEFAULT_SESSION_POOL_CAPACITY, SessionDgramArgs, SessionEntry, SessionMain,
+        SessionMigrateResult, SessionQueueNext, SessionState, SessionTransportId, SessionType,
+        SessionWorker, SessionWorkerState, queue_for_worker,
     };
     use crate::session::ApplicationMain;
     use crate::session::SessionId;
@@ -4361,9 +4388,7 @@ mod tests {
             SessionMigrateResult::Unavailable
         );
         assert!(!main.endpoint_is_migrating(local, remote, tuple.0));
-        runtime
-            .buffers()
-            .drop_index_owned_with_trace(index, |_| {});
+        runtime.buffers().drop_index_owned_with_trace(index, |_| {});
     }
 
     #[test]
@@ -4379,11 +4404,13 @@ mod tests {
             None,
         )?;
         let transport_index = Index::new(7, 1);
-        let session_id = sessions
-            .insert_unbound_transport_session_for_test(SessionTransportId::new(1), transport_index)?;
+        let session_id = sessions.insert_unbound_transport_session_for_test(
+            SessionTransportId::new(1),
+            transport_index,
+        )?;
 
         assert!(sessions.migration_snapshot(session_id).is_some());
-        sessions.notify_transport_closing(&runtime, session_id, transport_index)?;
+        sessions.notify_transport_closing(Some(&runtime), session_id, transport_index)?;
         assert!(sessions.migration_snapshot(session_id).is_none());
         Ok(())
     }
@@ -4602,9 +4629,49 @@ mod tests {
         )?;
         sessions.connection_published(session_id)?;
         sessions.connected(session_id)?;
-        sessions.notify_transport_closing(&runtime, session_id, Index::new(7, 1))?;
+        sessions.notify_transport_closing(Some(&runtime), session_id, Index::new(7, 1))?;
 
         assert!(!runtime.set_node_interrupt_pending(session_queue)?);
+        let app_session = sessions
+            .app_session(session_id)
+            .expect("external App Session remains published");
+        let mut events = [SessionEvt::io(0, SessionEvtType::Connect); 4];
+        let event_count = app_session.poll_events(&mut events);
+        assert!(
+            events[..event_count]
+                .iter()
+                .any(|event| event.evt_type == SessionEvtType::Disconnected)
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn transport_closing_without_runtime_notifies_external_app() -> Result<(), SessionTestFailure> {
+        let applications = ApplicationMain::new(1);
+        let application = applications.attach()?;
+        let mut sessions = SessionWorker::<Index>::new(
+            DataWorkerId::new(0),
+            1,
+            AppSessionConfig::default(),
+            DEFAULT_SESSION_POOL_CAPACITY,
+            Arc::clone(&applications),
+            None,
+        )?;
+        sessions.install_application_mq_for_test(application)?;
+        let session_id = sessions.construct_stream_sessions(
+            SessionTransportId::new(1),
+            Index::new(7, 1),
+            7,
+            application,
+            None,
+            None,
+            None,
+            true,
+        )?;
+        sessions.connection_published(session_id)?;
+        sessions.connected(session_id)?;
+        sessions.notify_transport_closing(None, session_id, Index::new(7, 1))?;
+
         let app_session = sessions
             .app_session(session_id)
             .expect("external App Session remains published");
@@ -5193,6 +5260,26 @@ mod tests {
             test_dispatch,
         )
         .expect("install dispatch");
+        assert!(
+            !SessionQueueNode::install_worker_attachment(
+                &runtime,
+                data,
+                SessionQueueNext::from_slot(0),
+                test_dispatch,
+                test_dispatch,
+            )
+            .expect("skip duplicate dispatch")
+        );
+        assert!(
+            SessionQueueNode::remove_worker_attachment(
+                &runtime,
+                data,
+                SessionQueueNext::from_slot(0),
+                test_dispatch,
+                test_dispatch,
+            )
+            .expect("remove dispatch")
+        );
 
         let duplicate = SessionWorker::<Index>::new(
             worker,
@@ -5213,7 +5300,7 @@ mod tests {
         let dispatches = main
             .with_worker_mut(&runtime, |sessions| Ok(sessions.transport_dispatches.len()))
             .expect("read dispatches");
-        assert_eq!(dispatches, 1);
+        assert_eq!(dispatches, 0);
     }
 
     #[test]
@@ -5317,8 +5404,8 @@ mod tests {
     }
 
     #[test]
-    fn migrated_session_accept_reschedules_existing_fifo_events()
-    -> Result<(), SessionTestFailure> {
+    fn migrated_session_accept_reschedules_existing_fifo_events() -> Result<(), SessionTestFailure>
+    {
         let applications = ApplicationMain::new(1);
         let main = Arc::new(SessionMain::new(1, Arc::clone(&applications)));
         let mut sessions = SessionWorker::<Index>::new(

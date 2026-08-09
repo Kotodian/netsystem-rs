@@ -634,7 +634,7 @@ fn fin_with_payload_is_processed_after_rx_enqueue_and_notifies_app_once() {
         assert!(fin.is_some(), "FIN+payload must emit an ACK");
     }
     sessions
-        .notify_transport_closing(&runtime, session_id, index)
+        .notify_transport_closing(Some(&runtime), session_id, index)
         .expect("notify app close");
 
     assert_eq!(
