@@ -62,6 +62,15 @@ fn init_session(
     )))
 }
 
+#[hammer_component_macros::main_loop_exit_function]
+fn exit_session(
+    _engine: &mut Engine,
+    main: Arc<runtime::SessionMain>,
+) -> RuntimeResult<()> {
+    main.begin_session_migration_shutdown();
+    Ok(())
+}
+
 #[hammer_component_macros::init_function(name = "application_init")]
 fn init_application(
     engine: &mut Engine,

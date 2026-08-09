@@ -1,9 +1,11 @@
 use std::cell::UnsafeCell;
 use std::collections::VecDeque;
+use std::hint::spin_loop;
 use std::net::SocketAddr;
 use std::num::NonZeroU32;
 use std::os::fd::BorrowedFd;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::thread::{self, ThreadId};
 use std::time::{Duration, Instant};
 
@@ -91,6 +93,8 @@ impl SessionTransportId {
     }
 }
 
+pub type SessionTuple = (SessionTransportId, SocketAddr, SocketAddr);
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct OooSpan {
     start: u32,
@@ -164,9 +168,7 @@ pub struct SessionSwitchPoolArgs {
     pub new_sh: Option<SessionHandle>,
     pub old_thread: DataWorkerId,
     pub new_thread: DataWorkerId,
-    pub transport: SessionTransportId,
-    pub local: SocketAddr,
-    pub remote: SocketAddr,
+    pub tuple: SessionTuple,
     pub dgram: SessionDgramArgs,
 }
 
@@ -187,9 +189,7 @@ pub struct SessionSwitchPoolReply {
     pub new_sh: Option<SessionHandle>,
     pub old_thread: DataWorkerId,
     pub new_thread: DataWorkerId,
-    pub transport: SessionTransportId,
-    pub local: SocketAddr,
-    pub remote: SocketAddr,
+    pub tuple: SessionTuple,
     pub status: SessionSwitchPoolStatus,
     pub state: Option<SessionMigrationState>,
     pub dgram: SessionDgramArgs,
@@ -206,16 +206,20 @@ pub struct SessionSwitchPoolCompletion {
     pub new_sh: SessionHandle,
     pub old_thread: DataWorkerId,
     pub new_thread: DataWorkerId,
-    pub transport: SessionTransportId,
-    pub local: SocketAddr,
-    pub remote: SocketAddr,
+    pub tuple: SessionTuple,
     pub status: SessionSwitchPoolCompletionStatus,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SessionSwitchPoolClosed {
+    pub new_sh: SessionHandle,
 }
 
 struct SessionMigrateQueues {
     session_migrate_requests: Box<[ArrayQueue<SessionSwitchPoolArgs>]>,
     session_switch_pool_replies: Box<[ArrayQueue<SessionSwitchPoolReply>]>,
     session_switch_pool_completions: Box<[ArrayQueue<SessionSwitchPoolCompletion>]>,
+    session_switch_pool_closed: Box<[ArrayQueue<SessionSwitchPoolClosed>]>,
 }
 
 impl SessionMigrateQueues {
@@ -228,6 +232,9 @@ impl SessionMigrateQueues {
                 .map(|_| ArrayQueue::new(DEFAULT_SESSION_MIGRATE_QUEUE_CAPACITY))
                 .collect(),
             session_switch_pool_completions: (0..worker_count)
+                .map(|_| ArrayQueue::new(DEFAULT_SESSION_MIGRATE_QUEUE_CAPACITY))
+                .collect(),
+            session_switch_pool_closed: (0..worker_count)
                 .map(|_| ArrayQueue::new(DEFAULT_SESSION_MIGRATE_QUEUE_CAPACITY))
                 .collect(),
         }
@@ -295,6 +302,30 @@ impl SessionMigrateQueues {
         worker: DataWorkerId,
     ) -> Option<SessionSwitchPoolCompletion> {
         self.session_switch_pool_completions
+            .get(worker.slot())
+            .and_then(ArrayQueue::pop)
+    }
+
+    #[inline]
+    fn push_session_switch_pool_closed(
+        &self,
+        closed: SessionSwitchPoolClosed,
+    ) -> Result<(), SessionSwitchPoolClosed> {
+        let Some(queue) = self
+            .session_switch_pool_closed
+            .get(closed.new_sh.worker_index() as usize)
+        else {
+            return Err(closed);
+        };
+        queue.push(closed)
+    }
+
+    #[inline]
+    fn pop_session_switch_pool_closed(
+        &self,
+        worker: DataWorkerId,
+    ) -> Option<SessionSwitchPoolClosed> {
+        self.session_switch_pool_closed
             .get(worker.slot())
             .and_then(ArrayQueue::pop)
     }
@@ -443,6 +474,9 @@ pub struct SessionMain {
     listeners: UnsafeCell<Pool<SessionListener>>,
     endpoint_lookup: SessionEndpointLookup,
     session_switch_pool_queues: Arc<SessionMigrateQueues>,
+    session_migration_shutdown: AtomicBool,
+    session_migration_shutdown_workers: AtomicU32,
+    session_migration_shutdown_phase: AtomicU32,
     applications: Arc<ApplicationMain>,
 }
 
@@ -504,7 +538,47 @@ impl SessionMain {
             listeners: UnsafeCell::new(Pool::with_capacity(pool_capacity)),
             endpoint_lookup: SessionEndpointLookup::new(),
             session_switch_pool_queues: Arc::new(SessionMigrateQueues::new(worker_count)),
+            session_migration_shutdown: AtomicBool::new(false),
+            session_migration_shutdown_workers: AtomicU32::new(0),
+            session_migration_shutdown_phase: AtomicU32::new(0),
             applications,
+        }
+    }
+
+    pub fn begin_session_migration_shutdown(&self) {
+        self.session_migration_shutdown
+            .store(true, Ordering::Release);
+    }
+
+    #[inline]
+    pub fn session_migration_shutdown(&self) -> bool {
+        self.session_migration_shutdown.load(Ordering::Acquire)
+    }
+
+    pub fn wait_session_migration_shutdown_phase(&self) {
+        let worker_count = self.workers.len() as u32;
+        if worker_count == 0 {
+            return;
+        }
+        let phase = self
+            .session_migration_shutdown_phase
+            .load(Ordering::Acquire);
+        let expected = phase.saturating_add(1).saturating_mul(worker_count);
+        let arrived = self
+            .session_migration_shutdown_workers
+            .fetch_add(1, Ordering::AcqRel)
+            .saturating_add(1);
+        if arrived == expected {
+            self.session_migration_shutdown_phase
+                .store(phase.saturating_add(1), Ordering::Release);
+            return;
+        }
+        while self
+            .session_migration_shutdown_phase
+            .load(Ordering::Acquire)
+            <= phase
+        {
+            spin_loop();
         }
     }
 
@@ -589,11 +663,13 @@ impl SessionMain {
         runtime: &DataPlaneRuntime,
         target_worker: DataWorkerId,
         old_handle: SessionHandle,
-        transport: SessionTransportId,
-        local: SocketAddr,
-        remote: SocketAddr,
+        tuple: SessionTuple,
         dgram: SessionDgramArgs,
     ) -> SessionMigrateResult {
+        let (transport, local, remote) = tuple;
+        if self.session_migration_shutdown() {
+            return SessionMigrateResult::Unavailable;
+        }
         let source_worker = DataWorkerId::new(old_handle.worker_index());
         if source_worker == target_worker
             || source_worker.slot() >= self.workers.len()
@@ -625,9 +701,7 @@ impl SessionMain {
             new_sh: None,
             old_thread: source_worker,
             new_thread: target_worker,
-            transport,
-            local,
-            remote,
+            tuple,
             dgram,
         };
         if self
@@ -644,13 +718,8 @@ impl SessionMain {
         SessionMigrateResult::Queued
     }
 
-    pub(crate) fn cancel_migration(
-        &self,
-        local: SocketAddr,
-        remote: SocketAddr,
-        transport: SessionTransportId,
-        old_handle: SessionHandle,
-    ) -> bool {
+    pub(crate) fn cancel_migration(&self, tuple: SessionTuple, old_handle: SessionHandle) -> bool {
+        let (transport, local, remote) = tuple;
         self.endpoint_lookup
             .cancel_migration(local, remote, transport, old_handle)
     }
@@ -691,6 +760,21 @@ impl SessionMain {
         result
     }
 
+    pub fn push_session_switch_pool_closed(
+        &self,
+        runtime: &DataPlaneRuntime,
+        closed: SessionSwitchPoolClosed,
+    ) -> Result<(), SessionSwitchPoolClosed> {
+        let target_worker = DataWorkerId::new(closed.new_sh.worker_index());
+        let result = self
+            .session_switch_pool_queues
+            .push_session_switch_pool_closed(closed);
+        if result.is_ok() {
+            self.wake_worker(runtime, target_worker);
+        }
+        result
+    }
+
     pub fn pop_session_migrate_request(
         &self,
         worker: DataWorkerId,
@@ -713,6 +797,14 @@ impl SessionMain {
     ) -> Option<SessionSwitchPoolCompletion> {
         self.session_switch_pool_queues
             .pop_session_switch_pool_completion(worker)
+    }
+
+    pub fn pop_session_switch_pool_closed(
+        &self,
+        worker: DataWorkerId,
+    ) -> Option<SessionSwitchPoolClosed> {
+        self.session_switch_pool_queues
+            .pop_session_switch_pool_closed(worker)
     }
 
     pub fn listen(
@@ -2263,36 +2355,24 @@ impl<Index: Copy + Eq> SessionWorker<Index> {
         runtime: &DataPlaneRuntime,
         target_worker: DataWorkerId,
         old_handle: SessionHandle,
-        transport: SessionTransportId,
-        local: SocketAddr,
-        remote: SocketAddr,
+        tuple: SessionTuple,
         dgram: SessionDgramArgs,
     ) -> SessionMigrateResult {
         self.listener_main
             .as_ref()
             .map_or(SessionMigrateResult::Unavailable, |main| {
-                main.program_thread_migration(
-                    runtime,
-                    target_worker,
-                    old_handle,
-                    transport,
-                    local,
-                    remote,
-                    dgram,
-                )
+                main.program_thread_migration(runtime, target_worker, old_handle, tuple, dgram)
             })
     }
 
     pub fn cancel_thread_migration(
         &self,
         old_handle: SessionHandle,
-        transport: SessionTransportId,
-        local: SocketAddr,
-        remote: SocketAddr,
+        tuple: SessionTuple,
     ) -> bool {
         self.listener_main
             .as_ref()
-            .is_some_and(|main| main.cancel_migration(local, remote, transport, old_handle))
+            .is_some_and(|main| main.cancel_migration(tuple, old_handle))
     }
 
     pub fn push_session_switch_pool_reply(
@@ -2332,6 +2412,28 @@ impl<Index: Copy + Eq> SessionWorker<Index> {
         self.listener_main
             .as_ref()?
             .pop_session_switch_pool_completion(self.worker)
+    }
+
+    pub fn push_session_switch_pool_closed(
+        &self,
+        runtime: &DataPlaneRuntime,
+        closed: SessionSwitchPoolClosed,
+    ) -> Result<(), SessionSwitchPoolClosed> {
+        self.listener_main.as_ref().map_or(Err(closed), |main| {
+            main.push_session_switch_pool_closed(runtime, closed)
+        })
+    }
+
+    pub fn pop_session_switch_pool_closed(&self) -> Option<SessionSwitchPoolClosed> {
+        self.listener_main
+            .as_ref()?
+            .pop_session_switch_pool_closed(self.worker)
+    }
+
+    pub fn wait_session_migration_shutdown_phase(&self) {
+        if let Some(main) = self.listener_main.as_ref() {
+            main.wait_session_migration_shutdown_phase();
+        }
     }
 
     pub fn insert_session_endpoint(
@@ -2478,7 +2580,9 @@ impl<Index: Copy + Eq> SessionWorker<Index> {
         let Some(SessionType::Transport { transport, state }) = entry.session_type else {
             return None;
         };
-        state.transport_index()?;
+        if !matches!(state, SessionState::Active(_)) {
+            return None;
+        }
         Some(SessionMigrationState {
             transport,
             rx_fifo: Arc::clone(&entry.rx_fifo),
@@ -4103,7 +4207,9 @@ mod tests {
 
     use hammer_core::data_plane::{BufferFrame, NodeId, NodeState};
     use hammer_infra::pool::Index;
-    use hammer_runtime::app::{AppSessionConfig, SessionEvt, SessionEvtType, SessionMsgQueueError};
+    use hammer_runtime::app::{
+        AppSessionConfig, SessionEvt, SessionEvtType, SessionHandle, SessionMsgQueueError,
+    };
     use hammer_runtime::attach::AppServer;
     use hammer_runtime::{
         AttachError, DataPlaneRuntime, DataPlaneRuntimeConfig, DataWorkerId, Engine,
@@ -4111,8 +4217,9 @@ mod tests {
     };
 
     use super::{
-        DEFAULT_SESSION_POOL_CAPACITY, SessionMain, SessionQueueNext, SessionTransportId,
-        SessionEntry, SessionState, SessionType, SessionWorker, SessionWorkerState,
+        DEFAULT_SESSION_POOL_CAPACITY, SessionDgramArgs, SessionMain, SessionMigrateResult,
+        SessionQueueNext, SessionTransportId, SessionEntry, SessionState, SessionType,
+        SessionWorker, SessionWorkerState,
         queue_for_worker,
     };
     use crate::session::ApplicationMain;
@@ -4219,6 +4326,65 @@ mod tests {
         _: &mut BufferFrame,
         _: &mut SessionQueueOutput,
     ) -> RuntimeResult<()> {
+        Ok(())
+    }
+
+    #[test]
+    fn migration_is_unavailable_after_session_shutdown_begins() {
+        let applications = ApplicationMain::new(1);
+        let main = SessionMain::new(2, applications);
+        let runtime = DataPlaneRuntime::new(DataPlaneRuntimeConfig::default());
+        let index = runtime
+            .alloc_index_with_bytes(b"")
+            .expect("test datagram buffer");
+        let local = "127.0.0.1:9000".parse().expect("local endpoint");
+        let remote = "127.0.0.1:50000".parse().expect("remote endpoint");
+        let tuple = (SessionTransportId::new(1), local, remote);
+        let old_handle = SessionHandle::new(1, 0);
+
+        main.begin_session_migration_shutdown();
+
+        assert_eq!(
+            main.program_thread_migration(
+                &runtime,
+                DataWorkerId::new(1),
+                old_handle,
+                tuple,
+                SessionDgramArgs {
+                    index,
+                    payload_offset: 0,
+                    payload_len: 0,
+                    urgent: false,
+                    return_node: NodeId::new(0),
+                },
+            ),
+            SessionMigrateResult::Unavailable
+        );
+        assert!(!main.endpoint_is_migrating(local, remote, tuple.0));
+        runtime
+            .buffers()
+            .drop_index_owned_with_trace(index, |_| {});
+    }
+
+    #[test]
+    fn migration_snapshot_rejects_transport_closing_session() -> Result<(), SessionTestFailure> {
+        let runtime = DataPlaneRuntime::new(DataPlaneRuntimeConfig::default());
+        let applications = ApplicationMain::new(1);
+        let mut sessions = SessionWorker::<Index>::new(
+            DataWorkerId::new(0),
+            1,
+            AppSessionConfig::default(),
+            DEFAULT_SESSION_POOL_CAPACITY,
+            applications,
+            None,
+        )?;
+        let transport_index = Index::new(7, 1);
+        let session_id = sessions
+            .insert_unbound_transport_session_for_test(SessionTransportId::new(1), transport_index)?;
+
+        assert!(sessions.migration_snapshot(session_id).is_some());
+        sessions.notify_transport_closing(&runtime, session_id, transport_index)?;
+        assert!(sessions.migration_snapshot(session_id).is_none());
         Ok(())
     }
 
