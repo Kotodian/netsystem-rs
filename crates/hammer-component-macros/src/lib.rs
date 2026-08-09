@@ -1816,6 +1816,7 @@ pub fn session_app(args: TokenStream, input: TokenStream) -> TokenStream {
                 ::hammer_infra::pool::Index,
             >,
             __hammer_session: ::hammer_service::session::SessionId,
+            __hammer_new_handle: ::hammer_runtime::app::SessionHandle,
             __hammer_context: ::hammer_runtime::app::SessionAppContext,
         ) -> ::hammer_runtime::RuntimeResult<()> {
             #contexts_ident
@@ -1829,6 +1830,7 @@ pub fn session_app(args: TokenStream, input: TokenStream) -> TokenStream {
                             __hammer_app,
                             __hammer_worker,
                             __hammer_session,
+                            __hammer_new_handle,
                             __hammer_context,
                         )
                     },

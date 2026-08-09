@@ -2,7 +2,7 @@
 
 use hammer_infra::pool::Index;
 use hammer_runtime::RuntimeResult;
-use hammer_runtime::app::{ApplicationId, SessionAppContext, SessionAppId};
+use hammer_runtime::app::{ApplicationId, SessionAppContext, SessionAppId, SessionHandle};
 
 use super::SessionId;
 use super::runtime::SessionWorker;
@@ -14,6 +14,14 @@ pub type SessionAppCallback<Index = hammer_infra::pool::Index> =
 /// One Session App callback that carries a segment handle instead of a Session.
 pub type SessionAppSegmentCallback<Index = hammer_infra::pool::Index> =
     fn(&mut SessionWorker<Index>, u64, SessionAppContext) -> RuntimeResult<()>;
+
+/// VPP `session_cb_vft_t.migrate` callback with the old and new handles.
+pub type SessionAppMigrateCallback<Index = hammer_infra::pool::Index> = fn(
+    &mut SessionWorker<Index>,
+    SessionId,
+    SessionHandle,
+    SessionAppContext,
+) -> RuntimeResult<()>;
 
 /// Concrete static callback table matching VPP `session_cb_vft_t`.
 ///
@@ -30,7 +38,7 @@ pub struct SessionAppCallbacks<Index = hammer_infra::pool::Index> {
     pub transport_closed: Option<SessionAppCallback<Index>>,
     pub cleanup: Option<SessionAppCallback<Index>>,
     pub half_open_cleanup: Option<SessionAppCallback<Index>>,
-    pub migrate: Option<SessionAppCallback<Index>>,
+    pub migrate: Option<SessionAppMigrateCallback<Index>>,
     pub listened: Option<SessionAppCallback<Index>>,
     pub unlistened: Option<SessionAppCallback<Index>>,
     pub builtin_rx: Option<SessionAppCallback<Index>>,
@@ -162,6 +170,7 @@ pub trait SessionApp: Sized + Send + 'static {
         &mut self,
         _: &mut SessionWorker<Index>,
         _: SessionId,
+        _: SessionHandle,
         _: SessionAppContext,
     ) -> RuntimeResult<()> {
         Ok(())

@@ -5,9 +5,7 @@ use std::num::NonZeroU64;
 use std::sync::{Arc, OnceLock};
 
 use crate::wire::UdpHeader;
-use hammer_core::data_plane::{
-    BufferFrame, BufferPacketCursor, DEFAULT_BUFFER_FRAME_CAPACITY, Index, NodeId, SecondaryOpaque,
-};
+use hammer_core::data_plane::{BufferFrame, BufferPacketCursor, Index, NodeId, SecondaryOpaque};
 use hammer_infra::bitmap::Bitmap;
 use hammer_infra::checksum::internet_checksum_parts;
 use hammer_infra::sparse_vec::SparseVec;
@@ -661,17 +659,24 @@ fn udp_input_process_frame(
     snapshot: &UdpInputSnapshot,
 ) -> NodeResult {
     let drop_slot = UdpInputNext::Drop.slot() as u16;
-    let mut nexts = [drop_slot; DEFAULT_BUFFER_FRAME_CAPACITY];
-    let mut count = 0usize;
-    for index in frame.iter_indices() {
-        let slot = match next_slot_for_index(runtime, *index, snapshot) {
-            Ok(Some(slot)) => slot,
-            _ => drop_slot,
-        };
-        nexts[count] = slot;
-        count += 1;
+    let width = runtime.preferred_frame_batch_width();
+    let mut nexts = Vec::with_capacity(frame.len());
+    let _ = frame.rewrite_indices_batched(width, |index| {
+        match next_slot_for_index(runtime, index, snapshot) {
+            Ok(Some(slot)) => {
+                nexts.push(slot);
+                Ok(Some(index))
+            }
+            Ok(None) => Ok(None),
+            Err(_) => {
+                nexts.push(drop_slot);
+                Ok(Some(index))
+            }
+        }
+    });
+    if !nexts.is_empty() {
+        runtime.enqueue_to_next(frame, nexts.as_slice());
     }
-    runtime.enqueue_to_next(frame, &nexts[..count]);
     NodeResult::drop()
 }
 
@@ -853,6 +858,9 @@ fn next_slot_for_index(
             .ok_or(UdpControlError::HeaderOutOfRange {
                 offset: cursor.transport_header_offset(),
             })?;
+        let return_node = runtime
+            .current_node()
+            .ok_or(UdpControlError::NodeRuntimeUnavailable)?;
         match main.deliver_datagram(
             runtime,
             index,
@@ -861,6 +869,7 @@ fn next_slot_for_index(
             payload_offset,
             payload_len,
             false,
+            return_node,
         ) {
             Ok(crate::worker::UdpDelivery::Delivered) => {
                 clear_success_metadata(runtime, index)?;
@@ -889,6 +898,9 @@ fn next_slot_for_index(
                     Some(source_port),
                     Some(destination_port),
                 );
+            }
+            Ok(crate::worker::UdpDelivery::MigrationQueued) => {
+                return Ok(None);
             }
             Ok(crate::worker::UdpDelivery::WrongWorker) => {
                 return resolve_drop_error(
