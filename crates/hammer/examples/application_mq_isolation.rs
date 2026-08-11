@@ -50,22 +50,22 @@ fn main() -> Result<(), ExampleError> {
 
     assert_eq!(
         local_application_mq.dequeue(),
-        Some(local_first),
+        Ok(Some(local_first)),
         "local MQ returned an event from another Application"
     );
     assert_eq!(
         local_application_mq.dequeue(),
-        Some(local_second),
+        Ok(Some(local_second)),
         "local MQ lost its own event ordering"
     );
     assert_eq!(
         external_application_mq.dequeue(),
-        Some(external_first),
+        Ok(Some(external_first)),
         "external MQ returned an event from another Application"
     );
     assert_eq!(
         external_application_mq.dequeue(),
-        Some(external_second),
+        Ok(Some(external_second)),
         "external MQ lost its own event ordering"
     );
 
@@ -74,10 +74,10 @@ fn main() -> Result<(), ExampleError> {
     local_application_mq.enqueue_io(local_after_external_full)?;
     assert_eq!(
         local_application_mq.dequeue(),
-        Some(local_after_external_full)
+        Ok(Some(local_after_external_full))
     );
-    assert_eq!(local_application_mq.dequeue(), None);
-    assert_eq!(external_application_mq.dequeue(), None);
+    assert_eq!(local_application_mq.dequeue(), Ok(None));
+    assert_eq!(external_application_mq.dequeue(), Ok(None));
 
     println!("local Application MQ: PASS");
     println!("external Application MQ: PASS");

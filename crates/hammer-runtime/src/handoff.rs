@@ -1,6 +1,6 @@
 use std::fmt;
-use std::sync::{Arc, OnceLock};
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, OnceLock};
 use std::thread;
 
 use crate::error::RuntimeResult;
@@ -156,11 +156,7 @@ impl DataPlaneHandoff {
     }
 
     #[inline]
-    pub fn with_node_capacity(
-        workers: usize,
-        queue_capacity: usize,
-        node_capacity: usize,
-    ) -> Self {
+    pub fn with_node_capacity(workers: usize, queue_capacity: usize, node_capacity: usize) -> Self {
         Self {
             inner: Arc::new(DataPlaneHandoffInner {
                 queues: (0..workers)
@@ -170,9 +166,7 @@ impl DataPlaneHandoff {
                 worker_interrupt_pending: (0..workers)
                     .map(|_| (0..node_capacity).map(|_| AtomicBool::new(false)).collect())
                     .collect(),
-                worker_interrupt_threads: (0..workers)
-                    .map(|_| OnceLock::new())
-                    .collect(),
+                worker_interrupt_threads: (0..workers).map(|_| OnceLock::new()).collect(),
             }),
         }
     }
@@ -202,9 +196,7 @@ impl DataPlaneHandoff {
                 worker_interrupt_pending: (0..workers)
                     .map(|_| (0..node_capacity).map(|_| AtomicBool::new(false)).collect())
                     .collect(),
-                worker_interrupt_threads: (0..workers)
-                    .map(|_| OnceLock::new())
-                    .collect(),
+                worker_interrupt_threads: (0..workers).map(|_| OnceLock::new()).collect(),
             }),
         }
     }
@@ -300,11 +292,7 @@ impl DataPlaneHandoffWorker {
     }
 
     #[inline]
-    pub(crate) fn set_worker_node_interrupt_pending(
-        &self,
-        worker: DataWorkerId,
-        node: NodeId,
-    ) {
+    pub(crate) fn set_worker_node_interrupt_pending(&self, worker: DataWorkerId, node: NodeId) {
         let Some(pending) = self.inner.worker_interrupt_pending.get(worker.slot()) else {
             return;
         };

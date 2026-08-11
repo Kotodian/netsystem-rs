@@ -1,9 +1,17 @@
 use std::fmt::Write as _;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use hammer_component_macros::ipc_handler;
 use hammer_ipc::{PluginCommandError, PluginCommandReply};
-use hammer_runtime::engine::{Engine, EnginePool, WorkerRuntimeStats};
+use hammer_runtime::engine::{Engine, WorkerRuntimeStats};
 use hammer_runtime::{RuntimeError, TraceControlPlane};
+
+/// Shutdown was requested over IPC but workers must not see the exit flag yet:
+/// `EnginePool::close` parks them at the VPP-style barrier, runs the main-loop
+/// exit functions while they are held, and only then sets the exit flag that
+/// lets them leave and be joined. Setting `main_loop_exit_now` here would make
+/// data workers exit before the final barrier sync and deadlock `close`.
+pub(crate) static SHUTDOWN_REQUESTED: AtomicBool = AtomicBool::new(false);
 
 #[ipc_handler(name = "ping")]
 fn handle_ping(_engine: &mut Engine, _request: &[u8]) -> Vec<u8> {
@@ -127,8 +135,8 @@ fn handle_wake(_engine: &mut Engine, _request: &[u8]) -> Vec<u8> {
 }
 
 #[ipc_handler(name = "shutdown")]
-fn handle_shutdown(engine: &mut Engine, _request: &[u8]) -> Vec<u8> {
-    EnginePool::main_loop_exit(engine);
+fn handle_shutdown(_engine: &mut Engine, _request: &[u8]) -> Vec<u8> {
+    SHUTDOWN_REQUESTED.store(true, Ordering::Release);
     Vec::new()
 }
 

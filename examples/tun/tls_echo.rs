@@ -13,7 +13,7 @@ use clap::Parser;
 use hammer_app::attach::{AppClient, AppClientError};
 use hammer_app::echo::run_echo_loop;
 use hammer_app::{AppSession, AppSessionError, DataWorkerId, SessionAppId, SessionListenEndpoint};
-use hammer_runtime::app::SessionEvtType;
+use hammer_runtime::app::{SessionEvtType, TransportProtocol};
 use hammer_service::binary_api::{BinaryApiClient, BinaryApiError};
 use prost::Message;
 
@@ -167,7 +167,7 @@ fn main() -> Result<(), EchoError> {
     eprintln!("registered TLS server configuration {config}");
 
     let listener = application.listen(
-        "tcp",
+        TransportProtocol::Tcp,
         SessionListenEndpoint::new(arguments.listen, DataWorkerId::new(0)),
         Some(SessionAppId::new(0)),
         Some(config),
@@ -266,6 +266,14 @@ async fn run_echo(session: &AppSession) -> Result<(), EchoError> {
         }
         match event.evt_type {
             SessionEvtType::Connect
+            | SessionEvtType::ConnectStream
+            | SessionEvtType::Bound
+            | SessionEvtType::Listen
+            | SessionEvtType::Unlisten
+            | SessionEvtType::UnlistenReply
+            | SessionEvtType::Accepted
+            | SessionEvtType::AcceptedReply
+            | SessionEvtType::Connected
             | SessionEvtType::RxDeq
             | SessionEvtType::TxEnq
             | SessionEvtType::ProtocolOutput => {}

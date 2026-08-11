@@ -675,11 +675,7 @@ impl DataPlaneRuntime {
     /// Session work. Invalid published worker/node identity is a Runtime
     /// invariant violation, not a per-packet recoverable failure.
     #[inline]
-    pub fn set_worker_node_interrupt_pending(
-        &self,
-        worker: DataWorkerId,
-        node: NodeId,
-    ) {
+    pub fn set_worker_node_interrupt_pending(&self, worker: DataWorkerId, node: NodeId) {
         if let Some(handoff) = &self.handoff {
             handoff.set_worker_node_interrupt_pending(worker, node);
         }

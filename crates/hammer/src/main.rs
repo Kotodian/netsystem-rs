@@ -302,11 +302,12 @@ fn run(config: String, roots: Vec<String>, worker: Worker) {
         }
     });
 
-    let pool_engine = pool.main_engine_mut();
-    EnginePool::main_loop_exit(pool_engine);
-    pool_engine
+    pool.main_engine_mut()
         .shutdown_process_nodes(&rt)
         .unwrap_or_else(|error| tracing::error!(%error, "Process Node shutdown failed"));
+    // VPP ordering: `close` syncs the worker barrier first, runs the main-loop
+    // exit functions while the workers are held, then sets the exit flag that
+    // lets them leave and be joined. The exit flag must not be set beforehand.
     pool.close()
         .unwrap_or_else(|error| tracing::error!(%error, "Main-loop exit hook failed"));
     Engine::uninstall_current();

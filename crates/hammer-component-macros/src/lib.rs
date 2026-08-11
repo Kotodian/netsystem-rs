@@ -2104,6 +2104,7 @@ struct SessionTransportArgs {
     start_listen: Option<Path>,
     stop_listen: Option<Path>,
     connect: Option<Path>,
+    connect_stream: Option<Path>,
 }
 
 impl Parse for SessionTransportArgs {
@@ -2112,6 +2113,7 @@ impl Parse for SessionTransportArgs {
         let mut start_listen = None;
         let mut stop_listen = None;
         let mut connect = None;
+        let mut connect_stream = None;
         while !input.is_empty() {
             let key: Ident = input.parse()?;
             input.parse::<Token![=]>()?;
@@ -2120,11 +2122,12 @@ impl Parse for SessionTransportArgs {
                 "start_listen" => start_listen = Some(input.parse()?),
                 "stop_listen" => stop_listen = Some(input.parse()?),
                 "connect" => connect = Some(input.parse()?),
+                "connect_stream" => connect_stream = Some(input.parse()?),
                 other => {
                     return Err(Error::new(
                         key.span(),
                         format!(
-                            "unknown `session_transport` argument `{other}`; expected `name`, `start_listen`, `stop_listen`, or `connect`"
+                            "unknown `session_transport` argument `{other}`; expected `name`, `start_listen`, `stop_listen`, `connect`, or `connect_stream`"
                         ),
                     ));
                 }
@@ -2138,6 +2141,7 @@ impl Parse for SessionTransportArgs {
             start_listen,
             stop_listen,
             connect,
+            connect_stream,
         })
     }
 }
@@ -2185,12 +2189,17 @@ pub fn session_transport(args: TokenStream, input: TokenStream) -> TokenStream {
         Some(connect) => quote!(::core::option::Option::Some(#connect)),
         None => quote!(::core::option::Option::None),
     };
+    let connect_stream = match args.connect_stream {
+        Some(connect_stream) => quote!(::core::option::Option::Some(#connect_stream)),
+        None => quote!(::core::option::Option::None),
+    };
     let registration = quote! {
-        ::hammer_runtime::SessionTransportRegistration::new(
+        ::hammer_runtime::SessionTransportRegistration::with_connect_stream(
             #name,
             #start_listen,
             #stop_listen,
             #connect,
+            #connect_stream,
         )
     };
     quote! {

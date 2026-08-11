@@ -13,6 +13,7 @@ use crate::app::SessionHandle;
 use crate::app::SessionOffsets;
 use crate::app::session_msg_queue::{
     SessionEventQueue, SessionEvt, SessionEvtFlags, SessionEvtType, SessionMsgQueue,
+    SessionMsgQueueError,
 };
 
 /// VPP-style app/session object: per-session byte FIFOs plus event queue.
@@ -62,6 +63,11 @@ pub enum AppSessionError {
     },
     #[error("app session datagram length {payload_len} does not match header length {header_len}")]
     DatagramLengthMismatch { payload_len: usize, header_len: u32 },
+    #[error("app session event queue rejected an element")]
+    EventQueueControl {
+        #[source]
+        source: SessionMsgQueueError,
+    },
     #[error("app session datagram FIFO reservation failed")]
     DatagramFifo {
         #[source]
@@ -451,9 +457,26 @@ impl AppSession {
 
     /// App-side convenience: drain up to `out.len()` events from this session's
     /// event queue. Returns the count written.
+    ///
+    /// A misconfigured queue element stops the batch drain with a typed error
+    /// at the [`SessionMsgQueue`] seam (see [`SessionEventQueue::dequeue_batch`]);
+    /// this count-based convenience cannot act on it: the offending element
+    /// was already consumed, so the queue keeps draining on the next call, and
+    /// the failure is surfaced as a warning with the typed error and the
+    /// session handle instead of a silent empty batch.
     #[inline]
     pub fn poll_events(&self, out: &mut [SessionEvt]) -> usize {
-        self.evt_q.dequeue_batch(out)
+        match self.evt_q.dequeue_batch(out) {
+            Ok(count) => count,
+            Err(error) => {
+                tracing::warn!(
+                    session = ?self.handle,
+                    ?error,
+                    "session event queue drain aborted; offending element was consumed"
+                );
+                0
+            }
+        }
     }
 
     /// App-side convenience: read the edge-triggered signal flag. Returns true
@@ -581,6 +604,14 @@ impl AppSession {
     #[inline]
     pub fn close(&self) -> Result<(), AppSessionError> {
         self.enqueue_app_control(SessionEvtType::Close)
+    }
+
+    /// App-side control: request an abrupt transport reset (VPP
+    /// `SESSION_CTRL_EVT_RESET`). The owning transport decides stream-local
+    /// reset behavior; it is not folded into [`Self::close`].
+    #[inline]
+    pub fn reset(&self) -> Result<(), AppSessionError> {
+        self.enqueue_app_control(SessionEvtType::Reset)
     }
 
     fn enqueue_app_control(&self, evt_type: SessionEvtType) -> Result<(), AppSessionError> {
@@ -716,7 +747,11 @@ impl AppSession {
     /// App-side async event receive from the session event queue.
     pub async fn next_event(&self) -> Result<SessionEvt, AppSessionError> {
         loop {
-            if let Some(event) = self.evt_q.dequeue() {
+            if let Some(event) = self
+                .evt_q
+                .dequeue()
+                .map_err(|source| AppSessionError::EventQueueControl { source })?
+            {
                 return Ok(event);
             }
             self.wait_for_event().await?;
@@ -768,16 +803,19 @@ impl AppSession {
         offsets: &SessionOffsets,
         evt_q_read: Option<RawFd>,
         app_rx_mq: Arc<SessionMsgQueue>,
-    ) -> Self {
-        let evt_q = Arc::new(unsafe {
-            SessionMsgQueue::from_shared(
-                session_segment.clone(),
-                offsets.evt_q_off,
-                evt_q_read,
-                None,
-            )
-        });
-        Self {
+    ) -> Result<Self, AppSessionError> {
+        let evt_q = Arc::new(
+            unsafe {
+                SessionMsgQueue::from_shared(
+                    session_segment.clone(),
+                    offsets.evt_q_off,
+                    evt_q_read,
+                    None,
+                )
+            }
+            .map_err(|error| AppSessionError::EventQueueControl { source: error })?,
+        );
+        Ok(Self {
             rx_fifo: Arc::new(unsafe {
                 Fifo::from_shared(session_segment.clone(), offsets.rx_fifo_off)
             }),
@@ -788,7 +826,7 @@ impl AppSession {
             app_rx_mq,
             handle,
             async_fd: OnceCell::new(),
-        }
+        })
     }
 }
 
@@ -920,10 +958,13 @@ mod tests {
         ));
         assert!(!session.tx_fifo().has_event());
 
-        assert!(app_rx_mq.dequeue().is_some());
+        assert!(app_rx_mq.dequeue().expect("dequeue").is_some());
         assert_eq!(session.send_bytes(b"y").expect("retry after drain"), 1);
         assert!(session.tx_fifo().has_event());
-        let evt = app_rx_mq.dequeue().expect("tx enqueue after retry");
+        let evt = app_rx_mq
+            .dequeue()
+            .expect("dequeue")
+            .expect("tx enqueue after retry");
         assert_eq!(evt.evt_type, SessionEvtType::TxEnq);
         assert_eq!(evt.session_index(), 1);
     }
@@ -950,16 +991,20 @@ mod tests {
         assert_eq!(session.enqueue_rx(b"abcdef").expect("enqueue rx"), 6);
 
         assert_eq!(session.consume_rx(1), 1);
-        assert!(session.app_rx_mq().dequeue().is_none());
+        assert!(session.app_rx_mq().dequeue().expect("dequeue").is_none());
 
         session.rx_fifo().want_deq_notification();
         assert_eq!(session.consume_rx(2), 2);
-        let event = session.app_rx_mq().dequeue().expect("rx dequeue event");
+        let event = session
+            .app_rx_mq()
+            .dequeue()
+            .expect("dequeue")
+            .expect("rx dequeue event");
         assert_eq!(event.evt_type, SessionEvtType::RxDeq);
         assert_eq!(event.session_index(), 7);
 
         assert_eq!(session.consume_rx(1), 1);
-        assert!(session.app_rx_mq().dequeue().is_none());
+        assert!(session.app_rx_mq().dequeue().expect("dequeue").is_none());
     }
 
     #[test]
@@ -1024,7 +1069,7 @@ mod tests {
         assert!(matches!(error, AppSessionError::EventQueueFull { .. }));
         assert!(!session.rx_fifo().has_event());
 
-        assert!(session.evt_q().dequeue().is_some());
+        assert!(session.evt_q().dequeue().expect("dequeue").is_some());
         assert_eq!(session.enqueue_rx(b"y").expect("retry after drain"), 1);
         assert!(session.rx_fifo().has_event());
     }
@@ -1047,7 +1092,11 @@ mod tests {
         let session = new_session(AppSessionConfig::new(64, 4), 3);
         session.half_close().expect("half close");
 
-        let event = session.app_rx_mq().dequeue().expect("half close event");
+        let event = session
+            .app_rx_mq()
+            .dequeue()
+            .expect("dequeue")
+            .expect("half close event");
         assert_eq!(event.evt_type, SessionEvtType::HalfClose);
         assert_eq!(event.session_index(), 3);
         assert_eq!(event.worker_index(), 0);
@@ -1058,8 +1107,27 @@ mod tests {
         let session = new_session(AppSessionConfig::new(64, 4), 3);
         session.close().expect("close");
 
-        let event = session.app_rx_mq().dequeue().expect("close event");
+        let event = session
+            .app_rx_mq()
+            .dequeue()
+            .expect("dequeue")
+            .expect("close event");
         assert_eq!(event.evt_type, SessionEvtType::Close);
+        assert_eq!(event.session_index(), 3);
+        assert_eq!(event.worker_index(), 0);
+    }
+
+    #[test]
+    fn app_session_reset_posts_control_event_to_worker_queue() {
+        let session = new_session(AppSessionConfig::new(64, 4), 3);
+        session.reset().expect("reset");
+
+        let event = session
+            .app_rx_mq()
+            .dequeue()
+            .expect("dequeue")
+            .expect("reset event");
+        assert_eq!(event.evt_type, SessionEvtType::Reset);
         assert_eq!(event.session_index(), 3);
         assert_eq!(event.worker_index(), 0);
     }

@@ -141,6 +141,16 @@ pub enum RuntimeError {
     ControlCommandTimedOut,
     #[error(transparent)]
     AppSession(#[from] crate::app::AppSessionError),
+    #[error("Application Session control operation failed")]
+    SessionControl {
+        #[source]
+        source: crate::app::SessionMsgQueueError,
+    },
+    #[error("Application Session control payload decode failed")]
+    SessionControlDecode {
+        #[source]
+        source: crate::app::SessionControlDecodeError,
+    },
     #[error("duplicate Process Node `{name}`")]
     DuplicateProcessNode { name: &'static str },
     #[error("data worker {worker:?} does not match Handoff owner {handoff_owner:?}")]
@@ -258,6 +268,23 @@ pub enum AttachError {
         #[source]
         source: crate::app::SessionMsgQueueError,
     },
+    #[error("Application Session control operation failed")]
+    SessionControl {
+        #[source]
+        source: crate::app::SessionMsgQueueError,
+    },
+    #[error("Application Session ExtConfig request exceeds the fixed chunk capacity")]
+    ExtConfigOversized { requested: usize, max: usize },
+    #[error("Application Session ExtConfig storage is exhausted")]
+    ExtConfigExhausted,
+    #[error("Application Session ExtConfig offset is out of range")]
+    ExtConfigOffsetOutOfRange,
+    #[error(
+        "Application Session ExtConfig chunk is not allocated (double free or stale reference)"
+    )]
+    ExtConfigNotAllocated,
+    #[error("Application Session ACCEPTED publication is unavailable")]
+    AcceptedPublicationUnavailable,
     #[error("Application Session control queue signal is missing")]
     ControlSignalMissing,
     #[error("failed to duplicate Application Session control queue signal")]

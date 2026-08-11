@@ -11,19 +11,21 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
-use hammer_app::attach::{AppClient, AppClientError};
+use hammer_app::attach::{AppClient, AppClientError, ControlReply};
 use hammer_infra::fifo::Fifo;
 use hammer_infra::segment::Segment;
 use hammer_runtime::app::{
-    AppSession, ApplicationConnectionId, ApplicationId, ApplicationSessionReply,
-    ApplicationSessionRequest, ApplicationSessionStatus, SessionEventQueue, SessionEvtType,
-    SessionHandle, SessionMsgQueue, SessionOffsets, dequeue_application_session_request,
-    enqueue_application_session_reply,
+    AppSession, ApplicationConnectionId, ApplicationId, SessionAcceptedMsg,
+    SessionAcceptedReplyMsg, SessionBoundMsg, SessionConnectError, SessionConnectMsg,
+    SessionConnectedMsg, SessionEvtType, SessionFlags, SessionHandle, SessionListenMsg,
+    SessionMsgQueue, SessionMsgQueueError, SessionOffsets, SessionProducer, SingleProducer,
+    TransportProtocol,
 };
 use hammer_runtime::attach::{
     APPLICATION_MQ_BASE_DESCRIPTOR_COUNT, APPLICATION_MQ_METADATA_WORDS, ATTACH_DESCRIPTOR_COUNT,
     ATTACH_PROTOCOL_VERSION, ATTACH_REPLY_BYTES, ATTACH_REQUEST_BYTES, ATTACH_STATUS_ACCEPTED,
-    AppServer, AppSessionPublication, ApplicationMqPublication,
+    AppServer, AppSessionPublication, ApplicationMqPublication, EXT_CONFIG_CHUNK_BYTES,
+    EXT_CONFIG_CHUNK_COUNT, ExtConfigStore,
 };
 use hammer_runtime::{AttachError, RuntimeError};
 
@@ -82,6 +84,14 @@ struct ApplicationMqs {
     segment: Segment,
     queues: Box<[Arc<SessionMsgQueue>]>,
     offsets: Box<[u64]>,
+    ext_config_offset: u64,
+}
+
+impl ApplicationMqs {
+    fn ext_config_store(&self) -> ExtConfigStore {
+        ExtConfigStore::from_shared(self.segment.clone(), self.ext_config_offset as usize)
+            .expect("attached ext-config store")
+    }
 }
 
 fn queue_capacity_words() -> (u32, u32) {
@@ -112,14 +122,27 @@ fn build_application_mqs() -> ApplicationMqs {
     }
     let queues = queues.into_boxed_slice();
     let offsets = offsets.into_boxed_slice();
-    let publication =
-        ApplicationMqPublication::new(segment.clone(), queues.clone(), offsets.clone())
-            .expect("Application MQ publication");
+    let ext_config_offset = segment
+        .alloc(ExtConfigStore::layout_bytes(), 64)
+        .expect("ext-config store offset");
+    // SAFETY: the store layout was just allocated in an exclusively owned
+    // segment; the free list is initialized exactly once before any client
+    // attaches and reads or allocates from it.
+    let ext_config =
+        unsafe { ExtConfigStore::init_at(segment.clone(), ext_config_offset as usize) };
+    let publication = ApplicationMqPublication::new(
+        segment.clone(),
+        queues.clone(),
+        offsets.clone(),
+        ext_config.offset() as u64,
+    )
+    .expect("Application MQ publication");
     ApplicationMqs {
         publication,
         segment,
         queues,
         offsets,
+        ext_config_offset,
     }
 }
 
@@ -243,8 +266,8 @@ fn spawn_serve_with_control(
     application_mqs: ApplicationMqs,
     control: impl Fn(
         ApplicationId,
-        &SessionMsgQueue,
-        &SessionMsgQueue,
+        &mut SessionMsgQueue<SingleProducer>,
+        &mut SessionProducer,
     ) -> hammer_runtime::RuntimeResult<()>
     + Send
     + 'static,
@@ -323,7 +346,7 @@ fn accept_application(
     application: ApplicationId,
     application_mqs: &ApplicationMqs,
 ) {
-    accept_application_with(
+    let _ = accept_application_with(
         stream,
         application,
         application_mqs,
@@ -338,23 +361,27 @@ fn accept_application_with(
     application: ApplicationId,
     application_mqs: &ApplicationMqs,
     send: impl FnOnce(&mut UnixStream, &[RawFd], &[u64]),
+) -> (
+    SessionMsgQueue<SingleProducer>,
+    SessionMsgQueue<SingleProducer>,
 ) {
     accept_registration(stream, application);
 
     let counter = NAME_COUNTER.fetch_add(1, Ordering::Relaxed);
     let segment = Segment::shared(&format!("hc{}-{counter}", std::process::id()), 1024 * 1024)
         .expect("Application control segment");
-    let queue_bytes = SessionMsgQueue::layout_bytes(16, 8).expect("control queue layout");
+    let queue_bytes =
+        SessionMsgQueue::layout_bytes_with_control(16, 8).expect("control queue layout");
     let request_offset = segment
         .alloc(queue_bytes, 64)
         .expect("request queue offset");
     let reply_offset = segment.alloc(queue_bytes, 64).expect("reply queue offset");
     let requests = unsafe {
-        SessionMsgQueue::init_at_with_signal(segment.clone(), request_offset, 16, 8)
+        SessionMsgQueue::init_at_with_signal_and_control(segment.clone(), request_offset, 16, 8)
             .expect("request queue")
     };
     let replies = unsafe {
-        SessionMsgQueue::init_at_with_signal(segment.clone(), reply_offset, 16, 8)
+        SessionMsgQueue::init_at_with_signal_and_control(segment.clone(), reply_offset, 16, 8)
             .expect("reply queue")
     };
     let mut descriptors = vec![
@@ -376,11 +403,17 @@ fn accept_application_with(
         reply_offset,
         application_mqs.segment.size() as u64,
         application_mqs.queues.len() as u64,
+        application_mqs.ext_config_offset,
     ];
     for offset in &application_mqs.offsets {
         words.push(*offset);
     }
     send(stream, &descriptors, &words);
+    // Hand the control queues back so callers can keep their signal read ends
+    // open for the client's lifetime (the real daemon stores them in
+    // AttachedApplication); dropping them here would EPIPE the client's next
+    // enqueue signal.
+    (requests, replies)
 }
 
 fn accept_registration(stream: &mut UnixStream, application: ApplicationId) {
@@ -451,6 +484,7 @@ fn assert_publish_then_connect_round_trips_handle_and_descriptors() {
     assert_eq!(&echoed[..read], b"pong");
     let event = published.worker_queues[handle.worker_index() as usize]
         .dequeue()
+        .expect("per-worker MQ dequeue")
         .expect("per-worker MQ event");
     assert_eq!(event.session_index(), handle.session_index());
     assert_eq!(event.evt_type, SessionEvtType::TxEnq);
@@ -554,7 +588,7 @@ fn assert_publication_queue_reports_full_and_closed() {
 }
 
 #[test]
-fn app_client_buffers_interleaved_connection_completion() {
+fn app_client_buffers_interleaved_connected_messages() {
     let path = socket_path();
     let path_text = path.to_str().expect("socket path").to_owned();
     let server = Arc::new(AppServer::bind(&path_text, 4).expect("bind app server"));
@@ -566,33 +600,28 @@ fn app_client_buffers_interleaved_connection_completion() {
         application,
         application_mqs,
         move |_, requests, replies| {
-            let request = dequeue_application_session_request(requests)
-                .expect("dequeue Application Session request")
+            let item = requests
+                .dequeue_control()
+                .expect("dequeue Session control request")
                 .expect("listen request");
-            let context = match request {
-                ApplicationSessionRequest::Listen { context, .. } => context,
-                ApplicationSessionRequest::Connect { .. }
-                | ApplicationSessionRequest::Unlisten { .. } => {
-                    panic!("unexpected request in interleaving test")
-                }
+            let request = item
+                .decode::<SessionListenMsg>()
+                .expect("decode listen request")
+                .expect("decode listen payload");
+            let failure =
+                SessionConnectedMsg::new(connection.raw(), Err(SessionConnectError::TimedOut));
+            replies
+                .enqueue_control(&failure)
+                .expect("enqueue asynchronous CONNECTED message");
+            let bound = SessionBoundMsg {
+                context: request.context,
+                result: Ok(SessionHandle::from(0x4000_0002)),
+                local: None,
+                opaque: None,
             };
-            enqueue_application_session_reply(
-                replies,
-                &ApplicationSessionReply::connect_failed(
-                    connection,
-                    ApplicationSessionStatus::HandshakeTimedOut,
-                ),
-            )
-            .expect("enqueue asynchronous connection completion");
-            enqueue_application_session_reply(
-                replies,
-                &ApplicationSessionReply::response(
-                    context,
-                    ApplicationSessionStatus::Success,
-                    0x4000_0002,
-                ),
-            )
-            .expect("enqueue listen response");
+            replies
+                .enqueue_control(&bound)
+                .expect("enqueue listen response");
             Ok(())
         },
     );
@@ -600,7 +629,7 @@ fn app_client_buffers_interleaved_connection_completion() {
     let mut client = AppClient::attach(&path_text).expect("attach client");
     let listener = client
         .listen(
-            "test",
+            TransportProtocol::Tcp,
             hammer_runtime::SessionListenEndpoint::new(
                 "127.0.0.1:0".parse().expect("listen endpoint"),
                 hammer_runtime::DataWorkerId::new(0),
@@ -608,7 +637,7 @@ fn app_client_buffers_interleaved_connection_completion() {
             None,
             None,
         )
-        .expect("listen response after asynchronous completion");
+        .expect("listen response after asynchronous CONNECTED message");
     assert_eq!(listener.raw(), 0x4000_0002);
 
     let error = client
@@ -618,7 +647,7 @@ fn app_client_buffers_interleaved_connection_completion() {
         error,
         AppClientError::SessionConnectFailed {
             connection: actual,
-            status: ApplicationSessionStatus::HandshakeTimedOut,
+            error: SessionConnectError::TimedOut,
         } if actual == connection
     ));
     drop(client);
@@ -626,7 +655,7 @@ fn app_client_buffers_interleaved_connection_completion() {
 }
 
 #[test]
-fn app_client_rejects_connected_completion_with_mismatched_session_handle() {
+fn app_client_rejects_connected_message_with_mismatched_session_handle() {
     let path = socket_path();
     let path_text = path.to_str().expect("socket path").to_owned();
     let server = Arc::new(AppServer::bind(&path_text, 4).expect("bind app server"));
@@ -637,8 +666,7 @@ fn app_client_rejects_connected_completion_with_mismatched_session_handle() {
     let published = build_publication(application, actual_handle);
     let mut publication = published.publication;
     let connection = ApplicationConnectionId::from_raw(0x4100_0001);
-    publication
-        .set_connect_completion(ApplicationSessionReply::connected(connection, wrong_handle));
+    publication.set_connected(SessionConnectedMsg::new(connection.raw(), Ok(wrong_handle)));
     spawn_serve(
         Arc::clone(&server),
         application,
@@ -648,7 +676,7 @@ fn app_client_rejects_connected_completion_with_mismatched_session_handle() {
     let client = AppClient::attach(&path_text).expect("attach client");
     publisher
         .try_publish(&publication)
-        .expect("publish connected completion");
+        .expect("publish CONNECTED message");
     let error = client
         .wait_connection(connection)
         .expect_err("mismatched connected Session handle");
@@ -659,6 +687,63 @@ fn app_client_rejects_connected_completion_with_mismatched_session_handle() {
             actual,
         } if expected == wrong_handle && actual == actual_handle
     ));
+    drop(client);
+    let _ = std::fs::remove_file(path);
+}
+
+#[test]
+fn app_client_accepts_accepted_session_and_replies_accepted_reply() {
+    let path = socket_path();
+    let path_text = path.to_str().expect("socket path").to_owned();
+    let server = Arc::new(AppServer::bind(&path_text, 4).expect("bind app server"));
+    let publisher = server.publisher();
+    let application = ApplicationId::from_raw(42);
+    let handle = SessionHandle::new(7, 1);
+    let listener = SessionHandle::from(0x4000_0001);
+    let (accepted_tx, accepted_rx) = std::sync::mpsc::channel();
+    let published = build_publication(application, handle);
+    let mut publication = published.publication;
+    publication
+        .set_accepted(SessionAcceptedMsg::new(
+            application.raw(),
+            listener,
+            handle,
+            SessionFlags::empty(),
+        ))
+        .expect("set ACCEPTED message");
+    spawn_serve_with_control(
+        Arc::clone(&server),
+        application,
+        published.application_mqs.clone(),
+        move |_, requests, _| {
+            let item = requests
+                .dequeue_control()
+                .expect("dequeue Session control request")
+                .expect("accepted reply request");
+            let reply = item
+                .decode::<SessionAcceptedReplyMsg>()
+                .expect("decode accepted reply")
+                .expect("decode accepted reply payload");
+            accepted_tx.send(reply).expect("send accepted reply");
+            Ok(())
+        },
+    );
+
+    let client = AppClient::attach(&path_text).expect("attach client");
+    publisher
+        .try_publish(&publication)
+        .expect("publish accepted session");
+    let session = client
+        .accept_accepted()
+        .expect("accept accepted App Session");
+    assert_eq!(session.session_handle(), handle);
+
+    let reply = accepted_rx
+        .recv_timeout(Duration::from_secs(5))
+        .expect("ACCEPTED_REPLY received by the service");
+    assert_eq!(reply.context, application.raw());
+    assert_eq!(reply.session, handle);
+    assert!(reply.result.is_ok());
     drop(client);
     let _ = std::fs::remove_file(path);
 }
@@ -700,7 +785,7 @@ fn attach_reads_fragmented_application_mq_metadata() {
     let application_mqs = build_application_mqs();
     let server_thread = std::thread::spawn(move || {
         let (mut stream, _) = listener.accept().expect("accept fragmented attach client");
-        accept_application_with(
+        let _ = accept_application_with(
             &mut stream,
             application,
             &application_mqs,
@@ -1008,6 +1093,7 @@ fn attach_maps_each_worker_to_its_application_rx_mq() {
     assert_eq!(first_session.send_bytes(b"a").expect("send"), 1);
     let first_event = published.worker_queues[0]
         .dequeue()
+        .expect("worker 0 dequeue")
         .expect("worker 0 event");
     assert_eq!(first_event.session_index(), 11);
 
@@ -1015,9 +1101,15 @@ fn attach_maps_each_worker_to_its_application_rx_mq() {
     assert_eq!(second_session.send_bytes(b"b").expect("send"), 1);
     let second_event = published.worker_queues[2]
         .dequeue()
+        .expect("worker 2 dequeue")
         .expect("worker 2 event");
     assert_eq!(second_event.session_index(), 22);
-    assert!(published.worker_queues[1].dequeue().is_none());
+    assert!(
+        published.worker_queues[1]
+            .dequeue()
+            .expect("worker 1 dequeue")
+            .is_none()
+    );
     let _ = std::fs::remove_file(path);
 }
 
@@ -1075,5 +1167,340 @@ fn attach_connection_close_detaches_only_its_application_once() {
         second
     );
     assert!(detached_rx.try_recv().is_err());
+    let _ = std::fs::remove_file(path);
+}
+
+#[test]
+fn connect_carries_server_name_in_bounded_ext_config_chunk() {
+    let path = socket_path();
+    let path_text = path.to_str().expect("socket path").to_owned();
+    let server = Arc::new(AppServer::bind(&path_text, 4).expect("bind app server"));
+    let publisher = server.publisher();
+    let application = ApplicationId::from_raw(50);
+    let handle = SessionHandle::new(7, 1);
+    let published = build_publication(application, handle);
+    let mut publication = published.publication;
+    let connection = ApplicationConnectionId::from_raw(0x5000_0001);
+    publication.set_connected(SessionConnectedMsg::new(connection.raw(), Ok(handle)));
+    let daemon_store = published.application_mqs.ext_config_store();
+    let (observed_tx, observed_rx) = std::sync::mpsc::channel::<()>();
+    spawn_serve_with_control(
+        Arc::clone(&server),
+        application,
+        published.application_mqs.clone(),
+        move |_, requests, _| {
+            let item = requests
+                .dequeue_control()
+                .expect("dequeue Session control request")
+                .expect("connect request");
+            let request = item
+                .decode::<SessionConnectMsg>()
+                .expect("decode connect request")
+                .expect("decode connect payload");
+            let offset = request.ext_config.expect("bounded ext-config reference");
+            assert_eq!(
+                daemon_store.read(offset).expect("read ext-config chunk"),
+                b"example.com"
+            );
+            daemon_store
+                .free(offset)
+                .expect("free ext-config chunk exactly once");
+            assert!(
+                daemon_store.read(offset).is_err(),
+                "ext-config chunk must be freed after the daemon read it"
+            );
+            let _ = observed_tx.send(());
+            Ok(())
+        },
+    );
+
+    let mut client = AppClient::attach(&path_text).expect("attach client");
+    publisher
+        .try_publish(&publication)
+        .expect("publish CONNECTED message");
+    let _ = client
+        .connect(
+            TransportProtocol::Tcp,
+            "127.0.0.1:0".parse().expect("remote endpoint"),
+            None,
+            None,
+            None,
+            Some("example.com"),
+        )
+        .expect("connect with server name");
+    // The published CONNECTED message carries the test's connection identity,
+    // not the client-local context.
+    let session = client
+        .wait_connection(connection)
+        .expect("connected session");
+    assert_eq!(session.session_handle(), handle);
+    observed_rx
+        .recv_timeout(Duration::from_secs(5))
+        .expect("serve callback must report before the client drops");
+    drop(client);
+    let _ = std::fs::remove_file(path);
+}
+
+#[test]
+fn connect_rejects_oversized_server_name_before_enqueue() {
+    let path = socket_path();
+    let path_text = path.to_str().expect("socket path").to_owned();
+    let server = Arc::new(AppServer::bind(&path_text, 4).expect("bind app server"));
+    let application = ApplicationId::from_raw(51);
+    let application_mqs = build_application_mqs();
+    let daemon_store = application_mqs.ext_config_store();
+    let (observed_tx, observed_rx) = std::sync::mpsc::channel::<()>();
+    spawn_serve_with_control(
+        Arc::clone(&server),
+        application,
+        application_mqs,
+        move |_, requests, _| {
+            let item = requests
+                .dequeue_control()
+                .expect("dequeue Session control request")
+                .expect("connect request");
+            let request = item
+                .decode::<SessionConnectMsg>()
+                .expect("decode connect request")
+                .expect("decode connect payload");
+            let offset = request.ext_config.expect("bounded ext-config reference");
+            assert_eq!(
+                daemon_store.read(offset).expect("read ext-config chunk"),
+                b"ok.example"
+            );
+            daemon_store.free(offset).expect("free ext-config chunk");
+            drop(item);
+            assert!(
+                requests.dequeue_control().expect("dequeue").is_none(),
+                "oversized server_name must not be enqueued"
+            );
+            let _ = observed_tx.send(());
+            Ok(())
+        },
+    );
+
+    let mut client = AppClient::attach(&path_text).expect("attach client");
+    let error = client
+        .connect(
+            TransportProtocol::Tcp,
+            "127.0.0.1:0".parse().expect("remote endpoint"),
+            None,
+            None,
+            None,
+            Some(&"x".repeat(EXT_CONFIG_CHUNK_BYTES + 1)),
+        )
+        .expect_err("oversized server_name must be rejected before enqueue");
+    assert!(
+        matches!(error, AppClientError::ExtConfig { .. }),
+        "unexpected oversized server_name error: {error:?}"
+    );
+    // The client stays usable and the next valid name is delivered intact.
+    client
+        .connect(
+            TransportProtocol::Tcp,
+            "127.0.0.1:0".parse().expect("remote endpoint"),
+            None,
+            None,
+            None,
+            Some("ok.example"),
+        )
+        .expect("valid connect after oversized rejection");
+    observed_rx
+        .recv_timeout(Duration::from_secs(5))
+        .expect("serve callback must report before the client drops");
+    drop(client);
+    let _ = std::fs::remove_file(path);
+}
+
+#[test]
+fn connect_frees_ext_config_chunk_when_enqueue_fails() {
+    let path = socket_path();
+    let listener = UnixListener::bind(&path).expect("bind queue-full attach server");
+    let application = ApplicationId::from_raw(52);
+    let application_mqs = build_application_mqs();
+    let daemon_store = application_mqs.ext_config_store();
+    let (hold_tx, hold_rx) = std::sync::mpsc::channel::<()>();
+    let server_thread = std::thread::spawn(move || {
+        let (mut stream, _) = listener.accept().expect("accept queue-full attach client");
+        let (_requests, _replies) = accept_application_with(
+            &mut stream,
+            application,
+            &application_mqs,
+            |stream, fds, words| {
+                send_fds(stream, fds, words);
+            },
+        );
+        // Hold the attach stream and the control queues (keeping their signal
+        // read ends open); the fake daemon never drains the request queue, so
+        // it fills and the next enqueue must fail.
+        let _ = hold_rx.recv();
+    });
+
+    let mut client = AppClient::attach(path.to_str().expect("socket path")).expect("attach client");
+    // The fake daemon's Ctrl ring holds 8 fixed control slots, so connects
+    // 1..=8 enqueue and the 9th hits ControlFull.
+    for name in 0..8 {
+        client
+            .connect(
+                TransportProtocol::Tcp,
+                "127.0.0.1:0".parse().expect("remote endpoint"),
+                None,
+                None,
+                None,
+                Some(&format!("name-{name}")),
+            )
+            .expect("connect while the request queue has capacity");
+    }
+    let error = client
+        .connect(
+            TransportProtocol::Tcp,
+            "127.0.0.1:0".parse().expect("remote endpoint"),
+            None,
+            None,
+            None,
+            Some("overflow"),
+        )
+        .expect_err("connect past the request queue capacity");
+    assert!(
+        matches!(
+            &error,
+            AppClientError::SessionControl {
+                source: SessionMsgQueueError::ControlFull
+            }
+        ),
+        "unexpected queue-full connect error: {error:?}"
+    );
+    // The failed enqueue's chunk must have been returned to the free list:
+    // the client holds chunks 0..=7 (still queued), chunk 8 was allocated for
+    // the failed request and freed again, so all remaining 24 chunks are
+    // allocatable by the daemon. A leaked chunk would make the last probe
+    // fail with ExtConfigExhausted.
+    for probe in 0..EXT_CONFIG_CHUNK_COUNT - 8 {
+        daemon_store
+            .alloc(format!("probe-{probe}").as_bytes())
+            .expect("freed ext-config chunk must be reusable");
+    }
+    drop(hold_tx);
+    server_thread.join().expect("join queue-full server");
+    let _ = std::fs::remove_file(path);
+}
+
+#[test]
+fn app_client_stream_connect_publishes_parent_and_flags_then_polls_nonblocking() {
+    let path = socket_path();
+    let path_text = path.to_str().expect("socket path").to_owned();
+    let server = Arc::new(AppServer::bind(&path_text, 4).expect("bind app server"));
+    let application = ApplicationId::from_raw(50);
+    let parent = SessionHandle::new(9, 1);
+    let child = SessionHandle::new(10, 1);
+    let flags = SessionFlags::STREAM | SessionFlags::UNIDIRECTIONAL;
+    let (observed_tx, observed_rx) =
+        std::sync::mpsc::channel::<(Option<SessionHandle>, SessionFlags)>();
+    spawn_serve_with_control(
+        Arc::clone(&server),
+        application,
+        build_application_mqs(),
+        move |_, requests, replies| {
+            while let Some(item) = requests
+                .dequeue_control()
+                .expect("dequeue Session control request")
+            {
+                match item.event_type() {
+                    SessionEvtType::ConnectStream => {
+                        let request = item
+                            .decode::<SessionConnectMsg>()
+                            .expect("decode CONNECT_STREAM")
+                            .expect("decode CONNECT_STREAM payload");
+                        assert_eq!(request.parent_handle, Some(parent));
+                        assert_eq!(request.flags, flags);
+                        let _ = observed_tx.send((request.parent_handle, request.flags));
+                        replies
+                            .enqueue_control(&SessionConnectedMsg {
+                                context: request.context,
+                                result: Ok(child),
+                                local: None,
+                                remote: None,
+                                flags,
+                                opaque: None,
+                            })
+                            .expect("enqueue CONNECTED message");
+                    }
+                    SessionEvtType::Listen => {
+                        let request = item
+                            .decode::<SessionListenMsg>()
+                            .expect("decode LISTEN")
+                            .expect("decode LISTEN payload");
+                        replies
+                            .enqueue_control(&SessionBoundMsg {
+                                context: request.context,
+                                result: Ok(SessionHandle::from(0x5000_0002)),
+                                local: None,
+                                opaque: None,
+                            })
+                            .expect("enqueue BOUND message");
+                    }
+                    event => panic!("unexpected Session control request {event:?}"),
+                }
+            }
+            Ok(())
+        },
+    );
+
+    let mut client = AppClient::attach(&path_text).expect("attach client");
+    let connection = client
+        .connect_stream(
+            0x5000_0001,
+            TransportProtocol::Tcp,
+            "127.0.0.1:9000".parse().expect("remote endpoint"),
+            None,
+            None,
+            parent,
+            flags,
+        )
+        .expect("enqueue CONNECT_STREAM");
+    assert_eq!(connection.raw(), 0x5000_0001);
+
+    let poll_deadline = std::time::Instant::now() + Duration::from_secs(5);
+    let reply = loop {
+        if let Some(reply) = client.poll_control().expect("poll Session control") {
+            break reply;
+        }
+        assert!(
+            std::time::Instant::now() < poll_deadline,
+            "timed out waiting for the CONNECTED control reply"
+        );
+        std::thread::sleep(Duration::from_millis(1));
+    };
+    let ControlReply::Connected(connected) = reply else {
+        panic!("expected CONNECTED control reply");
+    };
+    assert_eq!(connected.context, connection.raw());
+    assert_eq!(connected.result, Ok(child));
+    assert_eq!(connected.flags, flags);
+    let (observed_parent, observed_flags) = observed_rx
+        .recv_timeout(Duration::from_secs(5))
+        .expect("serve callback must report CONNECT_STREAM observations");
+    assert_eq!(observed_parent, Some(parent));
+    assert_eq!(observed_flags, flags);
+
+    // The nonblocking poll drained the client's single inbox: a second poll
+    // returns immediately and finds nothing (it never blocks or spins).
+    assert!(client.poll_control().expect("poll empty inbox").is_none());
+
+    // Blocking paths reuse the same inbox and wait: listen() still completes
+    // after the nonblocking poll consumed the CONNECTED message.
+    let listener = client
+        .listen(
+            TransportProtocol::Tcp,
+            hammer_runtime::SessionListenEndpoint::new(
+                "127.0.0.1:0".parse().expect("listen endpoint"),
+                hammer_runtime::DataWorkerId::new(0),
+            ),
+            None,
+            None,
+        )
+        .expect("blocking listen after nonblocking poll");
+    assert_eq!(listener.raw(), 0x5000_0002);
+    drop(client);
     let _ = std::fs::remove_file(path);
 }

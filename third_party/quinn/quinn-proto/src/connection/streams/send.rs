@@ -175,6 +175,17 @@ impl Send {
     pub(super) fn is_writable(&self) -> bool {
         matches!(self.state, SendState::Ready)
     }
+
+    /// Whether the send side reached its terminal state (VPP
+    /// `quicly_sendstate_transfer_complete`): a RESET was sent, or the FIN
+    /// was sent and fully acknowledged.
+    pub(super) fn transfer_complete(&self) -> bool {
+        match self.state {
+            SendState::Ready => false,
+            SendState::DataSent { finish_acked } => finish_acked && self.pending.is_fully_acked(),
+            SendState::ResetSent => true,
+        }
+    }
 }
 
 /// A [`BytesSource`] implementation for `&'a mut [Bytes]`
@@ -432,5 +443,18 @@ mod tests {
                 assert_eq!(chunks_consumed, 0);
             }
         }
+    }
+
+    #[test]
+    fn transfer_complete_tracks_terminal_states() {
+        let mut send = Send::new(0u32.into(), None);
+        assert!(!send.transfer_complete());
+        // Finished but not yet acknowledged is still transferring.
+        send.finish().unwrap();
+        assert!(!send.transfer_complete());
+        // A sent RESET is terminal.
+        let mut reset = Send::new(0u32.into(), None);
+        reset.reset();
+        assert!(reset.transfer_complete());
     }
 }

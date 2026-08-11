@@ -186,7 +186,6 @@ impl UdpMain {
             )
         })
     }
-
 }
 
 pub(crate) static UDP_MAIN: OnceLock<Arc<UdpMain>> = OnceLock::new();
@@ -331,7 +330,15 @@ impl UdpWorker {
             return Err(UdpTransportError::EndpointInUse { endpoint: local }.into());
         }
         if let Err(error) = sessions.complete_stream_connect(session_id) {
-            self.rollback_accept(sessions, session_id, index, local, remote)?;
+            if let Err(cleanup_error) =
+                self.rollback_accept(sessions, session_id, index, local, remote)
+            {
+                tracing::error!(
+                    ?session_id,
+                    %cleanup_error,
+                    "UDP connect App publication rollback failed"
+                );
+            }
             return Err(error);
         }
         Ok(session_id)
@@ -583,8 +590,7 @@ impl UdpWorker {
                 self.handoff_migration_datagram_or_drop(runtime, reply);
                 return Ok(());
             };
-            let Some(connection) = UdpConnection::connected(self.worker, local, remote)
-            else {
+            let Some(connection) = UdpConnection::connected(self.worker, local, remote) else {
                 let reply = self.rejected_migration_reply(sessions, reply);
                 self.handoff_migration_datagram_or_drop(runtime, reply);
                 return Ok(());
@@ -605,19 +611,10 @@ impl UdpWorker {
             let attached = self
                 .connection_mut(connection_index)
                 .is_some_and(|connection| connection.attach_session(session_id));
-            let inserted = attached
-                && self
-                    .lookup
-                    .insert_tuple(connection_index, local, remote);
+            let inserted = attached && self.lookup.insert_tuple(connection_index, local, remote);
             let published = inserted
                 && sessions
-                    .publish_session_migration(
-                        reply.old_sh,
-                        new_handle,
-                        transport,
-                        local,
-                        remote,
-                    )
+                    .publish_session_migration(reply.old_sh, new_handle, transport, local, remote)
                     .unwrap_or(false);
             let accepted = published && sessions.accept_migrated_session(session_id).is_ok();
             if !accepted {
@@ -680,10 +677,7 @@ impl UdpWorker {
             return true;
         };
         if transport != tuple_transport
-            || self
-                .lookup
-                .find_tuple(&self.connections, local, remote)
-                != Some(index)
+            || self.lookup.find_tuple(&self.connections, local, remote) != Some(index)
             || !self
                 .connection(index)
                 .is_some_and(|connection| connection.session() == Some(session_id))
@@ -696,18 +690,12 @@ impl UdpWorker {
             .is_err()
             || sessions.remove_migrated_session(session_id).is_err()
             || sessions
-                .remove_session_endpoint(
-                    session_id,
-                    transport,
-                    local,
-                    remote,
-                )
+                .remove_session_endpoint(session_id, transport, local, remote)
                 .is_err()
         {
             return false;
         }
-        self.lookup
-            .remove_tuple(local, remote);
+        self.lookup.remove_tuple(local, remote);
         let _ = self.remove_connection(index);
         true
     }
@@ -1254,21 +1242,42 @@ mod tests {
         Ok(())
     }
 
+    /// Binds a publication server for the external App Session CONNECTED
+    /// publication and keeps the server alive for the worker's lifetime.
+    fn test_publisher() -> (
+        hammer_runtime::attach::AppServer,
+        hammer_runtime::attach::AppSessionPublisher,
+    ) {
+        static PUBLISHER_SEQUENCE: std::sync::atomic::AtomicUsize =
+            std::sync::atomic::AtomicUsize::new(0);
+        let socket_path = format!(
+            "/tmp/hammer-udp-test-{}-{}.sock",
+            std::process::id(),
+            PUBLISHER_SEQUENCE.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        );
+        let server =
+            hammer_runtime::attach::AppServer::bind(&socket_path, 4).expect("bind test server");
+        let publisher = server.publisher();
+        (server, publisher)
+    }
+
     fn worker_state() -> (
         SessionWorker<PoolIndex>,
         UdpWorker,
         Arc<ApplicationMain>,
         Arc<SessionMain>,
+        hammer_runtime::attach::AppServer,
     ) {
         let applications = ApplicationMain::new(1024);
         let main = Arc::new(SessionMain::new(1, Arc::clone(&applications)));
+        let (server, publisher) = test_publisher();
         let mut sessions = SessionWorker::<PoolIndex>::new(
             DataWorkerId::new(0),
             1,
             AppSessionConfig::default(),
             1024,
             Arc::clone(&applications),
-            None,
+            Some(publisher),
         )
         .expect("Session worker");
         sessions.set_listener_main(Arc::clone(&main));
@@ -1277,6 +1286,7 @@ mod tests {
             UdpWorker::new(DataWorkerId::new(0)),
             applications,
             main,
+            server,
         )
     }
 
@@ -1355,7 +1365,7 @@ mod tests {
     #[test]
     fn udp_accept_delivers_datagram_into_exact_session_fifo()
     -> Result<(), Box<dyn std::error::Error>> {
-        let (mut sessions, mut udp, applications, main) = worker_state();
+        let (mut sessions, mut udp, applications, main, _server) = worker_state();
         let application = applications.attach()?;
         sessions.install_application_mq_for_test(application)?;
         let application_listener = applications.register_listener(application, None, None)?;
@@ -1408,11 +1418,11 @@ mod tests {
     #[test]
     fn udp_active_connect_registers_exact_tuple_session() -> Result<(), Box<dyn std::error::Error>>
     {
-        let (mut sessions, mut udp, applications, _main) = worker_state();
+        let (mut sessions, mut udp, applications, _main, _server) = worker_state();
         let application = applications.attach()?;
         sessions.install_application_mq_for_test(application)?;
         let application_connection =
-            applications.register_connection(application, None, None, None)?;
+            applications.register_connection(application, 0, None, None, None)?;
         let (local, remote) = test_endpoints();
         let connection_id =
             hammer_runtime::SessionConnectionId::from_raw(application_connection.raw());
@@ -1430,12 +1440,12 @@ mod tests {
 
     #[test]
     fn udp_wrong_worker_classifies_connected_tuple() -> Result<(), Box<dyn std::error::Error>> {
-        let (mut sessions, mut udp, applications, _main) = worker_state();
+        let (mut sessions, mut udp, applications, _main, _server) = worker_state();
         let mut udp_other = UdpWorker::new(DataWorkerId::new(1));
         let application = applications.attach()?;
         sessions.install_application_mq_for_test(application)?;
         let application_connection =
-            applications.register_connection(application, None, None, None)?;
+            applications.register_connection(application, 0, None, None, None)?;
         let (local, remote) = test_endpoints();
         let connection_id =
             hammer_runtime::SessionConnectionId::from_raw(application_connection.raw());
@@ -1466,13 +1476,14 @@ mod tests {
     -> Result<(), Box<dyn std::error::Error>> {
         let applications = ApplicationMain::new(1024);
         let main = Arc::new(SessionMain::new(2, Arc::clone(&applications)));
+        let (_server, publisher) = test_publisher();
         let mut sessions = SessionWorker::<PoolIndex>::new(
             DataWorkerId::new(0),
             2,
             AppSessionConfig::default(),
             1024,
             Arc::clone(&applications),
-            None,
+            Some(publisher),
         )?;
         sessions.set_listener_main(Arc::clone(&main));
         let mut udp = UdpWorker::new(DataWorkerId::new(0));
@@ -1480,7 +1491,7 @@ mod tests {
         let application = applications.attach()?;
         sessions.install_application_mq_for_test(application)?;
         let application_connection =
-            applications.register_connection(application, None, None, None)?;
+            applications.register_connection(application, 0, None, None, None)?;
         let (local, remote) = test_endpoints();
         let connection_id =
             hammer_runtime::SessionConnectionId::from_raw(application_connection.raw());
@@ -1512,13 +1523,14 @@ mod tests {
     -> Result<(), Box<dyn std::error::Error>> {
         let applications = ApplicationMain::new(1024);
         let main = Arc::new(SessionMain::new(2, Arc::clone(&applications)));
+        let (_server, publisher) = test_publisher();
         let mut sessions = SessionWorker::<PoolIndex>::new(
             DataWorkerId::new(0),
             2,
             AppSessionConfig::default(),
             1024,
             Arc::clone(&applications),
-            None,
+            Some(publisher),
         )?;
         sessions.set_listener_main(Arc::clone(&main));
         let mut source_udp = UdpWorker::new(DataWorkerId::new(0));
@@ -1526,7 +1538,7 @@ mod tests {
         let application = applications.attach()?;
         sessions.install_application_mq_for_test(application)?;
         let application_connection =
-            applications.register_connection(application, None, None, None)?;
+            applications.register_connection(application, 0, None, None, None)?;
         let (local, remote) = test_endpoints();
         let connection_id =
             hammer_runtime::SessionConnectionId::from_raw(application_connection.raw());
@@ -1629,13 +1641,14 @@ mod tests {
     -> Result<(), Box<dyn std::error::Error>> {
         let applications = ApplicationMain::new(1024);
         let main = Arc::new(SessionMain::new(2, Arc::clone(&applications)));
+        let (_server, publisher) = test_publisher();
         let mut sessions = SessionWorker::<PoolIndex>::new(
             DataWorkerId::new(0),
             2,
             AppSessionConfig::default(),
             1024,
             Arc::clone(&applications),
-            None,
+            Some(publisher),
         )?;
         sessions.set_listener_main(Arc::clone(&main));
         let mut source_udp = UdpWorker::new(DataWorkerId::new(0));
@@ -1643,7 +1656,7 @@ mod tests {
         let application = applications.attach()?;
         sessions.install_application_mq_for_test(application)?;
         let application_connection =
-            applications.register_connection(application, None, None, None)?;
+            applications.register_connection(application, 0, None, None, None)?;
         let (local, remote) = test_endpoints();
         let connection_id =
             hammer_runtime::SessionConnectionId::from_raw(application_connection.raw());
@@ -1704,11 +1717,11 @@ mod tests {
     #[test]
     fn udp_completion_retry_does_not_block_later_completion()
     -> Result<(), Box<dyn std::error::Error>> {
-        let (mut sessions, mut udp, applications, main) = worker_state();
+        let (mut sessions, mut udp, applications, main, _server) = worker_state();
         let application = applications.attach()?;
         sessions.install_application_mq_for_test(application)?;
         let application_connection =
-            applications.register_connection(application, None, None, None)?;
+            applications.register_connection(application, 0, None, None, None)?;
         let (local, first_remote) = test_endpoints();
         let connection_id =
             hammer_runtime::SessionConnectionId::from_raw(application_connection.raw());
@@ -1742,22 +1755,24 @@ mod tests {
             .lookup_endpoint(local, second_remote, UdpWorker::ID)
             .ok_or("missing bare Session route")?;
 
-        udp.session_switch_pool_completions.push_back(SessionSwitchPoolCompletion {
-            old_sh: first_handle,
-            new_sh: second_handle,
-            old_thread: DataWorkerId::new(0),
-            new_thread: DataWorkerId::new(0),
-            tuple: (UdpWorker::ID, local, first_remote),
-            status: SessionSwitchPoolCompletionStatus::Accepted,
-        });
-        udp.session_switch_pool_completions.push_back(SessionSwitchPoolCompletion {
-            old_sh: second_handle,
-            new_sh: first_handle,
-            old_thread: DataWorkerId::new(0),
-            new_thread: DataWorkerId::new(0),
-            tuple: (UdpWorker::ID, local, second_remote),
-            status: SessionSwitchPoolCompletionStatus::Accepted,
-        });
+        udp.session_switch_pool_completions
+            .push_back(SessionSwitchPoolCompletion {
+                old_sh: first_handle,
+                new_sh: second_handle,
+                old_thread: DataWorkerId::new(0),
+                new_thread: DataWorkerId::new(0),
+                tuple: (UdpWorker::ID, local, first_remote),
+                status: SessionSwitchPoolCompletionStatus::Accepted,
+            });
+        udp.session_switch_pool_completions
+            .push_back(SessionSwitchPoolCompletion {
+                old_sh: second_handle,
+                new_sh: first_handle,
+                old_thread: DataWorkerId::new(0),
+                new_thread: DataWorkerId::new(0),
+                tuple: (UdpWorker::ID, local, second_remote),
+                status: SessionSwitchPoolCompletionStatus::Accepted,
+            });
 
         let runtime = DataPlaneRuntime::new(DataPlaneRuntimeConfig::default()).for_worker(1, 0)?;
         udp.drain_migration_completions(&mut sessions, &runtime);
@@ -1780,13 +1795,14 @@ mod tests {
     -> Result<(), Box<dyn std::error::Error>> {
         let applications = ApplicationMain::new(1024);
         let main = Arc::new(SessionMain::new(2, Arc::clone(&applications)));
+        let (_server, publisher) = test_publisher();
         let mut sessions = SessionWorker::<PoolIndex>::new(
             DataWorkerId::new(0),
             2,
             AppSessionConfig::default(),
             1024,
             Arc::clone(&applications),
-            None,
+            Some(publisher),
         )?;
         sessions.set_listener_main(Arc::clone(&main));
         let mut udp = UdpWorker::new(DataWorkerId::new(0));
@@ -1794,7 +1810,7 @@ mod tests {
         let application = applications.attach()?;
         sessions.install_application_mq_for_test(application)?;
         let application_connection =
-            applications.register_connection(application, None, None, None)?;
+            applications.register_connection(application, 0, None, None, None)?;
         let (local, remote) = test_endpoints();
         let connection_id =
             hammer_runtime::SessionConnectionId::from_raw(application_connection.raw());
@@ -2071,10 +2087,12 @@ mod tests {
             Instant::now(),
         )?;
         assert!(source_sessions.session_id_from_handle(old_handle).is_none());
-        assert!(source_udp
-            .lookup
-            .find_tuple(&source_udp.connections, local, remote)
-            .is_none());
+        assert!(
+            source_udp
+                .lookup
+                .find_tuple(&source_udp.connections, local, remote)
+                .is_none()
+        );
 
         <UdpWorker as SessionTransport<PoolIndex>>::update_time(
             &mut source_udp,
@@ -2088,7 +2106,10 @@ mod tests {
         let closed = main
             .pop_session_switch_pool_closed(DataWorkerId::new(1))
             .ok_or("missing closed notification")?;
-        assert!(main.push_session_switch_pool_closed(&target_runtime, closed).is_ok());
+        assert!(
+            main.push_session_switch_pool_closed(&target_runtime, closed)
+                .is_ok()
+        );
         <UdpWorker as SessionTransport<PoolIndex>>::update_time(
             &mut target_udp,
             &mut target_sessions,
@@ -2107,12 +2128,13 @@ mod tests {
                 .is_none()
         );
 
-        assert!(main
-            .push_session_switch_pool_closed(
+        assert!(
+            main.push_session_switch_pool_closed(
                 &target_runtime,
                 SessionSwitchPoolClosed { new_sh: new_handle },
             )
-            .is_ok());
+            .is_ok()
+        );
         <UdpWorker as SessionTransport<PoolIndex>>::update_time(
             &mut target_udp,
             &mut target_sessions,
@@ -2146,8 +2168,8 @@ mod tests {
         let connection = UdpConnection::connected(DataWorkerId::new(0), local, remote)
             .ok_or("source UDP connection")?;
         let connection_index = udp.insert_connection(connection)?;
-        let session_id = sessions
-            .insert_unbound_transport_session_for_test(UdpWorker::ID, connection_index)?;
+        let session_id =
+            sessions.insert_unbound_transport_session_for_test(UdpWorker::ID, connection_index)?;
         if !udp
             .connection_mut(connection_index)
             .is_some_and(|connection| connection.attach_session(session_id))
@@ -2155,17 +2177,11 @@ mod tests {
             return Err("source UDP Session attachment failed".into());
         }
         assert!(udp.lookup.insert_tuple(connection_index, local, remote));
-        assert!(sessions.insert_session_endpoint(
-            session_id,
-            UdpWorker::ID,
-            local,
-            remote,
-        )?);
+        assert!(sessions.insert_session_endpoint(session_id, UdpWorker::ID, local, remote,)?);
         let old_handle = main
             .lookup_endpoint(local, remote, UdpWorker::ID)
             .ok_or("missing source UDP Session route")?;
-        let runtime = DataPlaneRuntime::new(DataPlaneRuntimeConfig::default())
-            .for_worker(2, 0)?;
+        let runtime = DataPlaneRuntime::new(DataPlaneRuntimeConfig::default()).for_worker(2, 0)?;
         let request_buffer = runtime.alloc_index_with_bytes(b"request")?;
         assert_eq!(
             sessions.program_thread_migration(
@@ -2184,8 +2200,8 @@ mod tests {
             SessionMigrateResult::Queued
         );
         let reply_buffer = runtime.alloc_index_with_bytes(b"reply")?;
-        assert!(main
-            .push_session_switch_pool_reply(
+        assert!(
+            main.push_session_switch_pool_reply(
                 &runtime,
                 SessionSwitchPoolReply {
                     old_sh: old_handle,
@@ -2204,7 +2220,8 @@ mod tests {
                     },
                 },
             )
-            .is_ok());
+            .is_ok()
+        );
 
         main.begin_session_migration_shutdown();
         let rendezvous_main = Arc::clone(&main);
@@ -2227,8 +2244,8 @@ mod tests {
     }
 
     #[test]
-    fn udp_source_reply_retry_republishes_to_target_queue()
-    -> Result<(), Box<dyn std::error::Error>> {
+    fn udp_source_reply_retry_republishes_to_target_queue() -> Result<(), Box<dyn std::error::Error>>
+    {
         let applications = ApplicationMain::new(1024);
         let main = Arc::new(SessionMain::new(2, Arc::clone(&applications)));
         let mut source_sessions = SessionWorker::<PoolIndex>::new(
@@ -2294,8 +2311,8 @@ mod tests {
             return_node: NodeId::new(0),
         };
         for _ in 0..1024 {
-            assert!(main
-                .push_session_switch_pool_reply(
+            assert!(
+                main.push_session_switch_pool_reply(
                     &source_runtime,
                     SessionSwitchPoolReply {
                         old_sh: old_handle,
@@ -2308,18 +2325,21 @@ mod tests {
                         dgram,
                     },
                 )
-                .is_ok());
+                .is_ok()
+            );
         }
-        source_udp.session_switch_pool_replies.push_back(SessionSwitchPoolReply {
-            old_sh: old_handle,
-            new_sh: None,
-            old_thread: DataWorkerId::new(0),
-            new_thread: DataWorkerId::new(1),
-            tuple: (UdpWorker::ID, local, remote),
-            status: SessionSwitchPoolStatus::Prepared,
-            state: Some(state),
-            dgram,
-        });
+        source_udp
+            .session_switch_pool_replies
+            .push_back(SessionSwitchPoolReply {
+                old_sh: old_handle,
+                new_sh: None,
+                old_thread: DataWorkerId::new(0),
+                new_thread: DataWorkerId::new(1),
+                tuple: (UdpWorker::ID, local, remote),
+                status: SessionSwitchPoolStatus::Prepared,
+                state: Some(state),
+                dgram,
+            });
 
         source_udp.drain_migration_replies(&mut source_sessions, &source_runtime);
 
@@ -2334,11 +2354,11 @@ mod tests {
     #[test]
     fn udp_disconnect_removes_connection_and_session_lookup()
     -> Result<(), Box<dyn std::error::Error>> {
-        let (mut sessions, mut udp, applications, _main) = worker_state();
+        let (mut sessions, mut udp, applications, _main, _server) = worker_state();
         let application = applications.attach()?;
         sessions.install_application_mq_for_test(application)?;
         let application_connection =
-            applications.register_connection(application, None, None, None)?;
+            applications.register_connection(application, 0, None, None, None)?;
         let (local, remote) = test_endpoints();
         let connection_id =
             hammer_runtime::SessionConnectionId::from_raw(application_connection.raw());
@@ -2376,7 +2396,7 @@ mod tests {
     #[test]
     fn udp_tx_writes_datagram_buffer_without_consuming_untill_output_commit()
     -> Result<(), Box<dyn std::error::Error>> {
-        let (mut sessions, mut udp, applications, main) = worker_state();
+        let (mut sessions, mut udp, applications, main, _server) = worker_state();
         let application = applications.attach()?;
         sessions.install_application_mq_for_test(application)?;
         let application_listener = applications.register_listener(application, None, None)?;

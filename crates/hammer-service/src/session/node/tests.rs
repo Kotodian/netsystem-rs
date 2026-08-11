@@ -104,6 +104,20 @@ impl SessionTransport<Index> for RecordingTransport {
         self.events.push("control");
         Ok(())
     }
+
+    fn reset(
+        &mut self,
+        _: &mut SessionWorker<Index>,
+        _: Index,
+        _: &DataPlaneRuntime,
+        _: SessionQueueNext,
+        _: &mut BufferFrame,
+        _: &mut super::SessionQueueOutput,
+        _: Instant,
+    ) -> RuntimeResult<()> {
+        self.events.push("reset");
+        Ok(())
+    }
 }
 
 fn session_worker_for_test() -> SessionWorker<Index> {
@@ -211,6 +225,32 @@ impl SessionPacketizedTransport<Index> for TcpTransport {
         self.tx_actions.push(index);
         Ok(())
     }
+}
+
+#[test]
+fn app_reset_dispatch_invokes_transport_reset_distinct_from_close() -> RuntimeResult<()> {
+    let runtime = DataPlaneRuntime::new(DataPlaneRuntimeConfig::default());
+    let mut sessions = session_worker_for_test();
+    let mut transport = RecordingTransport::default();
+    let session_id = sessions.insert_session_for_test(RecordingTransport::ID, Index::new(4, 1));
+    let app = attach_local_app_session(&mut sessions, session_id);
+    app.app_rx_mq()
+        .enqueue_ctrl(SessionEvt::ctrl(
+            app.session_index(),
+            0,
+            SessionEvtType::Reset,
+        ))
+        .expect("enqueue app reset");
+    sessions.poll_app().expect("stage app reset");
+    let sink = runtime.nodes().register_internal(BlackholeNode);
+    let (owner, next) = test_session_queue_next(&runtime, sink);
+
+    dispatch_session_queue_once(&runtime, owner, &mut sessions, &mut transport, next)
+        .expect("dispatch app reset");
+
+    assert!(transport.events.iter().any(|event| *event == "reset"));
+    assert!(!transport.events.iter().any(|event| *event == "control"));
+    Ok(())
 }
 
 #[test]

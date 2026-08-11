@@ -6,7 +6,7 @@
 
 use crate::bihash::{AtomicBucket, Bihash, BihashKey, Bucket, FREE_U64, Kv, ValuePage};
 use crate::prefetch::prefetch_read_l1;
-use std::sync::atomic::{fence, Ordering};
+use std::sync::atomic::{Ordering, fence};
 
 type Slot = (usize, usize);
 
