@@ -4,8 +4,8 @@ use std::net::SocketAddr;
 use hammer_app::AppSession;
 use hammer_app::attach::{AppClient, AppClientError, ControlReply};
 use hammer_runtime::app::{
-    SessionAcceptedMsg, SessionAcceptedReplyMsg, SessionConnectError, SessionConnectedMsg,
-    SessionControlError, SessionFlags, SessionHandle, TransportProtocol,
+    ApplicationConnectionId, SessionAcceptedMsg, SessionAcceptedReplyMsg, SessionConnectError,
+    SessionConnectedMsg, SessionControlError, SessionFlags, SessionHandle, TransportProtocol,
 };
 use hammer_runtime::{SessionListenEndpoint, SessionListenerId};
 
@@ -64,6 +64,14 @@ pub(crate) struct ConnectBegin {
     pub(crate) nonblocking: bool,
 }
 
+/// What an ordinary (non-stream) active open needs to enqueue and how it
+/// completes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct ConnectParams {
+    pub(crate) proto: TransportProtocol,
+    pub(crate) nonblocking: bool,
+}
+
 /// Worker-local Session domain (VPP `vcl_worker_t` session table): the
 /// fixed-capacity generation-safe pool plus the wire-handle lookup, and the
 /// pure VCL state transitions. No IO: attach, control MQ, and descriptor
@@ -75,6 +83,28 @@ pub(crate) struct SessionStore {
     /// session_table_add_vpp_handle): resolves ACCEPTED listeners and drops
     /// stale wire events.
     vpp_handles: HashMap<u64, VclSessionHandle>,
+    /// In-flight generic (non-stream) connects by the client-owned
+    /// connection identity, connection -> Session. `AppClient::connect`
+    /// assigns the identity, so its CONNECTED event carries the connection
+    /// identity rather than the Session identity (VPP instead uses
+    /// `mp->context = s->session_index`, vcl_send_session_connect,
+    /// vppcom.c:76); this map resolves it.
+    ///
+    /// Stream connects need no entry: their context is the Session handle
+    /// itself. The two spaces are disjoint within the limits of their
+    /// widths: a Session handle raw is always >= 2^32 (the slot generation
+    /// occupies the high 32 bits and starts at 1), while connection
+    /// identities are the client's consecutive per-connect counters, which
+    /// stay below 2^32 only until the client opens 2^32 connects (the
+    /// wrapping u64 counter then begins to reach Session-handle territory).
+    /// `resolve_connected` consults this map first, so a generic connect is
+    /// unambiguous for any pool lifetime, where the counter remains far
+    /// below that bound.
+    pending_connects: HashMap<ApplicationConnectionId, VclSessionHandle>,
+    /// Reverse index, Session -> connection, for exactly-once O(1) removal
+    /// when the Session closes or its CONNECTED resolves: a daemon that
+    /// never replies leaves no map residue.
+    pending_by_handle: HashMap<VclSessionHandle, ApplicationConnectionId>,
 }
 
 impl SessionStore {
@@ -85,6 +115,8 @@ impl SessionStore {
         Ok(Self {
             pool: SessionPool::new(capacity),
             vpp_handles: HashMap::new(),
+            pending_connects: HashMap::new(),
+            pending_by_handle: HashMap::new(),
         })
     }
 
@@ -198,6 +230,93 @@ impl SessionStore {
         })
     }
 
+    /// Validates one ordinary active open and marks the Session Connecting
+    /// (VPP `vppcom_session_connect`, vppcom.c:2102: `vcl_send_session_connect`,
+    /// vppcom.c:76): only a CLOSED Session connects, and the transport is
+    /// the Session's own create-time protocol (`mp->proto = s->session_type`).
+    /// Returns what the caller needs to enqueue CONNECT and how to complete.
+    pub(crate) fn begin_connect(
+        &mut self,
+        session: VclSessionHandle,
+    ) -> Result<ConnectParams, VclError> {
+        let state = self.pool.state(session)?;
+        if state != VclSessionState::Closed {
+            return Err(VclError::NotConnectable { session, state });
+        }
+        let (proto, nonblocking) = {
+            let session = self.pool.get_mut(session)?;
+            session.initiator = VclInitiator::Local;
+            session.state = VclSessionState::Connecting;
+            (session.proto, session.nonblocking)
+        };
+        Ok(ConnectParams { proto, nonblocking })
+    }
+
+    /// Transactional rollback of an ordinary active open whose CONNECT could
+    /// not be enqueued: the Session returns to Closed and can connect again
+    /// (VPP's `vcl_send_session_connect` is infallible; Hammer's control
+    /// enqueue is fallible). Idempotent: a Session that is no longer
+    /// Connecting is untouched.
+    pub(crate) fn rollback_connect(
+        &mut self,
+        session: VclSessionHandle,
+    ) -> Result<(), VclError> {
+        if self.pool.state(session)? != VclSessionState::Connecting {
+            return Ok(());
+        }
+        let session = self.pool.get_mut(session)?;
+        session.state = VclSessionState::Closed;
+        session.initiator = VclInitiator::Local;
+        Ok(())
+    }
+
+    /// Transactional rollback of a stream connect whose CONNECT_STREAM could
+    /// not be enqueued: the child returns to Closed and is untracked from
+    /// the parent. Idempotent: a child that is no longer Connecting is
+    /// untouched.
+    pub(crate) fn rollback_stream_connect(
+        &mut self,
+        child: VclSessionHandle,
+        parent: VclSessionHandle,
+    ) -> Result<(), VclError> {
+        if self.pool.state(child)? != VclSessionState::Connecting {
+            return Ok(());
+        }
+        self.pool.get_mut(parent)?.children.retain(|entry| *entry != child);
+        let child = self.pool.get_mut(child)?;
+        child.parent = None;
+        child.flags = SessionFlags::empty();
+        child.initiator = VclInitiator::Local;
+        child.state = VclSessionState::Closed;
+        Ok(())
+    }
+
+    /// Registers an in-flight generic connect in both indexes. Infallible:
+    /// both maps are keyed by owned values and the Session was validated by
+    /// [`SessionStore::begin_connect`] immediately prior — nothing in
+    /// between can free it — so no Session-side write and no error path
+    /// exist; a later enqueue failure rolls back through
+    /// [`SessionStore::rollback_connect`], which leaves no registration to
+    /// unwind (the maps are only written after the enqueue succeeded).
+    pub(crate) fn register_connect(
+        &mut self,
+        session: VclSessionHandle,
+        connection: ApplicationConnectionId,
+    ) {
+        self.pending_connects.insert(connection, session);
+        self.pending_by_handle.insert(session, connection);
+    }
+
+    /// Resolves the CONNECTED event of one in-flight generic connect, if
+    /// any: removes the tracking in both indexes and returns its Session.
+    /// Infallible; a context that names no in-flight connect yields `None`.
+    pub(crate) fn resolve_connected(&mut self, context: u64) -> Option<VclSessionHandle> {
+        let connection = ApplicationConnectionId::from_raw(context);
+        let handle = self.pending_connects.remove(&connection)?;
+        self.pending_by_handle.remove(&handle);
+        Some(handle)
+    }
+
     /// Applies one CONNECTED event (VPP `vcl_session_connected_handler`): the
     /// context selects the local Session; only a Connecting Session
     /// transitions. Stale handles and non-Connecting Sessions drop without
@@ -268,7 +387,11 @@ impl SessionStore {
         if !matches!(self.pool.state(parent), Ok(VclSessionState::Listen)) {
             return Ok(PeerOutcome::Drop);
         }
-        match self.pool.alloc(VclSession::peer_child(flags)) {
+        // The child inherits the listener's transport (VPP
+        // `vcl_session_accepted_handler`: `session->session_type =
+        // listen_session->session_type`, vppcom.c:365).
+        let proto = self.pool.get(parent)?.proto;
+        match self.pool.alloc(VclSession::peer_child(proto, flags)) {
             Ok(handle) => Ok(PeerOutcome::Child { handle, parent }),
             Err(VclError::PoolFull { .. }) => Ok(PeerOutcome::RejectCapacity),
             Err(error) => Err(error),
@@ -307,7 +430,9 @@ impl SessionStore {
     /// `vcl_session_cleanup`). The exactly-once guard is the Session state: a
     /// Session already Closed or Disconnect is a no-op, so re-entry through
     /// any path cannot double-close; every child is attempted even when an
-    /// individual step fails. Returns whether the Session was freed.
+    /// individual step fails. An in-flight generic connect is untracked in
+    /// O(1) so a daemon that never replies leaves no map residue. Returns
+    /// whether the Session was freed.
     pub(crate) fn close_cascade(&mut self, handle: VclSessionHandle) -> Result<bool, VclError> {
         let (parent, wire) = {
             let session = self.pool.get(handle)?;
@@ -326,6 +451,9 @@ impl SessionStore {
             let _ = self.close_cascade(child);
         }
         if self.pool.free(handle) {
+            if let Some(connection) = self.pending_by_handle.remove(&handle) {
+                self.pending_connects.remove(&connection);
+            }
             if let Some(wire) = wire {
                 self.vpp_handles.remove(&wire.raw());
             }
@@ -416,21 +544,70 @@ impl VclWorker {
         // The control context carries the local (slot, generation) identity
         // (VPP `mp->context = s->session_index`): the CONNECTED event
         // resolves directly to this Session and generation-staleness drops.
-        self.client
-            .connect_stream(
-                child.raw(),
-                begin.proto,
-                remote,
-                local,
-                None,
-                begin.parent_wire,
-                flags | SessionFlags::STREAM,
-            )
-            .map_err(app_error)?;
+        if let Err(error) = self.client.connect_stream(
+            child.raw(),
+            begin.proto,
+            remote,
+            local,
+            None,
+            begin.parent_wire,
+            flags | SessionFlags::STREAM,
+        ) {
+            // Transactional rollback: the child must not remain stuck in
+            // Connecting when the enqueue failed. VPP's send is infallible
+            // here (mp is pre-allocated); Hammer's queue can be full.
+            self.store.rollback_stream_connect(child, parent)?;
+            return Err(app_error(error));
+        }
         if begin.nonblocking {
             return Ok(());
         }
         self.wait_connected(child)
+    }
+
+    /// Generic two-step active open (VPP `vppcom_session_connect`,
+    /// vppcom.c:2102 / `vcl_send_session_connect`, vppcom.c:76): opens an
+    /// ordinary connection on a CLOSED Session using its create-time
+    /// transport, forwarding the local/remote endpoint, server name (SNI),
+    /// and opaque value without parsing transport-specific configuration.
+    ///
+    /// On enqueue failure the Session is transactionally rolled back to
+    /// `Closed` and re-connectable (VPP's send is infallible here; Hammer's
+    /// shared control queue can be full, so the two-step begin is unwound).
+    /// Registration happens only after the enqueue succeeded and is
+    /// infallible (both tracking indexes take owned values), so a successful
+    /// CONNECT is never left untracked.
+    ///
+    /// Blocking Sessions wait on the single control inbox and surface
+    /// failure as [`VclError::ConnectFailed`]; nonblocking Sessions return
+    /// immediately in `Connecting` and complete through [`Self::session_poll`],
+    /// with failure observable the same way every asynchronous outcome is:
+    /// the Session reaches [`VclSessionState::Detached`], read through
+    /// [`Self::session_state`]. No transport-specific case is added.
+    pub fn session_connect(
+        &mut self,
+        session: VclSessionHandle,
+        remote: SocketAddr,
+        local: Option<SocketAddr>,
+        server_name: Option<&str>,
+        opaque: Option<u64>,
+    ) -> Result<(), VclError> {
+        let params = self.store.begin_connect(session)?;
+        let connection = match self
+            .client
+            .connect(params.proto, remote, local, None, opaque, server_name)
+        {
+            Ok(connection) => connection,
+            Err(error) => {
+                self.store.rollback_connect(session)?;
+                return Err(app_error(error));
+            }
+        };
+        self.store.register_connect(session, connection);
+        if params.nonblocking {
+            return Ok(());
+        }
+        self.wait_connected(session)
     }
 
     /// Consumes all currently available Session control events, nonblocking.
@@ -523,6 +700,13 @@ impl VclWorker {
         self.store.attributes(handle)
     }
 
+    /// Transport protocol of one Session: the create-time protocol for
+    /// local Sessions, the listener-inherited protocol for accepted peer
+    /// children (VPP `VPPCOM_ATTR_GET_PROTOCOL`, vppcom.h:143).
+    pub fn session_proto(&self, handle: VclSessionHandle) -> Result<TransportProtocol, VclError> {
+        Ok(self.store.get(handle)?.proto)
+    }
+
     /// Blocking completion of one active open: drain the single control
     /// inbox until the CONNECTED event resolves `child`.
     fn wait_connected(&mut self, child: VclSessionHandle) -> Result<(), VclError> {
@@ -580,16 +764,30 @@ impl VclWorker {
         &mut self,
         connected: SessionConnectedMsg,
     ) -> Result<Option<VclEvent>, VclError> {
-        let handle = VclSessionHandle::from_raw(connected.context);
+        // Generic connects resolve through their application connection id;
+        // stream connects carry the local (slot, generation) identity and
+        // fall through to the raw handle (VPP `mp->context = s->session_index`).
+        let handle = match self.store.resolve_connected(connected.context) {
+            Some(handle) => handle,
+            None => VclSessionHandle::from_raw(connected.context),
+        };
         let Some(outcome) = self.store.accept_connected(handle, connected.result)? else {
             return Ok(None);
         };
         match outcome {
             ConnectOutcome::Established { wire } => {
-                let app = self
-                    .client
-                    .accept_with_handle(Some(wire))
-                    .map_err(app_error)?;
+                let app = match self.client.accept_with_handle(Some(wire)) {
+                    Ok(app) => app,
+                    Err(AppClientError::SessionHandleMismatch { .. }) => {
+                        // Stale/mismatched CONNECTED: the published
+                        // descriptors belong to a newer Session. Drop the
+                        // Session exactly as ACCEPTED handling does; the
+                        // pending-connect tracking was already resolved.
+                        self.store.close_cascade(handle)?;
+                        return Ok(None);
+                    }
+                    Err(error) => return Err(app_error(error)),
+                };
                 self.store
                     .complete_connected(handle, wire, connected.flags, Some(app))?;
                 Ok(Some(VclEvent::Connected { session: handle }))
@@ -761,6 +959,132 @@ mod tests {
     }
 
     #[test]
+    fn begin_connect_marks_connecting_and_returns_params() {
+        let mut store = store();
+        let session = store
+            .create(TransportProtocol::Http, true)
+            .expect("create");
+        let params = store.begin_connect(session).expect("begin connect");
+        assert_eq!(params.proto, TransportProtocol::Http);
+        assert!(params.nonblocking);
+        let session = store.pool.get(session).expect("session");
+        assert_eq!(session.state, VclSessionState::Connecting);
+        assert_eq!(session.initiator, VclInitiator::Local);
+    }
+
+    #[test]
+    fn begin_connect_rejects_non_closed_session() {
+        let mut store = store();
+        let ready = seed_ready(&mut store, TCP, wire(1), SessionFlags::empty());
+        let error = store.begin_connect(ready).expect_err("non-closed session");
+        assert!(matches!(
+            error,
+            VclError::NotConnectable { session, state } if session == ready && state == VclSessionState::Ready
+        ));
+    }
+
+    #[test]
+    fn begin_connect_rolls_back_to_closed() {
+        let mut store = store();
+        let session = store
+            .create(TransportProtocol::Http, false)
+            .expect("create");
+        store.begin_connect(session).expect("begin connect");
+        store.rollback_connect(session).expect("rollback connect");
+        let session = store.pool.get(session).expect("session");
+        assert_eq!(session.state, VclSessionState::Closed);
+        assert_eq!(session.initiator, VclInitiator::Local);
+    }
+
+    #[test]
+    fn rollback_connect_is_idempotent() {
+        let mut store = store();
+        let session = store
+            .create(TransportProtocol::Http, false)
+            .expect("create");
+        store
+            .rollback_connect(session)
+            .expect("rollback of CLOSED is a no-op");
+        assert_eq!(
+            store.pool.state(session).expect("state"),
+            VclSessionState::Closed
+        );
+        store.begin_connect(session).expect("begin connect");
+        store.rollback_connect(session).expect("rollback");
+        store.rollback_connect(session).expect("rollback again");
+        assert_eq!(
+            store.pool.state(session).expect("state"),
+            VclSessionState::Closed
+        );
+    }
+
+    #[test]
+    fn begin_stream_connect_rolls_back_and_untracks() {
+        let mut store = store();
+        let parent = seed_ready(&mut store, TCP, wire(1), SessionFlags::empty());
+        let child = store.create(TCP, false).expect("create child");
+        store
+            .begin_stream_connect(child, parent, SessionFlags::UNIDIRECTIONAL)
+            .expect("begin stream connect");
+        store
+            .rollback_stream_connect(child, parent)
+            .expect("rollback stream connect");
+        let child_session = store.pool.get(child).expect("child");
+        assert_eq!(child_session.state, VclSessionState::Closed);
+        assert_eq!(child_session.parent, None);
+        assert_eq!(child_session.flags, SessionFlags::empty());
+        let parent_session = store.pool.get(parent).expect("parent");
+        assert!(
+            !parent_session.children.contains(&child),
+            "rolled-back child must be untracked"
+        );
+    }
+
+    #[test]
+    fn register_connect_tracks_and_resolve_clears() {
+        let mut store = store();
+        let session = store
+            .create(TransportProtocol::Http, true)
+            .expect("create");
+        let connection = ApplicationConnectionId::new(1, 0);
+        store.register_connect(session, connection);
+        assert_eq!(store.pending_connects.get(&connection), Some(&session));
+        assert_eq!(store.pending_by_handle.get(&session), Some(&connection));
+        assert_eq!(store.resolve_connected(connection.raw()), Some(session));
+        assert!(
+            store.pending_connects.is_empty(),
+            "resolve must clear the connection index"
+        );
+        assert!(
+            store.pending_by_handle.is_empty(),
+            "resolve must clear the reverse index"
+        );
+        assert_eq!(store.resolve_connected(connection.raw()), None);
+    }
+
+    #[test]
+    fn close_cascade_removes_pending_connect() {
+        let mut store = store();
+        let session = store
+            .create(TransportProtocol::Http, true)
+            .expect("create");
+        store.begin_connect(session).expect("begin connect");
+        let connection = ApplicationConnectionId::new(1, 0);
+        store.register_connect(session, connection);
+        assert!(store.pending_connects.contains_key(&connection));
+        assert!(store.pending_by_handle.contains_key(&session));
+        assert!(store.close_cascade(session).expect("close session"));
+        assert!(
+            store.pending_connects.is_empty(),
+            "closing a connecting Session must leave no map residue"
+        );
+        assert!(
+            store.pending_by_handle.is_empty(),
+            "closing a connecting Session must leave no reverse residue"
+        );
+    }
+
+    #[test]
     fn accept_connected_drops_stale_handle() {
         let mut store = store();
         let (_, child) = seed_connecting(&mut store, wire(1));
@@ -868,6 +1192,28 @@ mod tests {
             store.pool.state(listener),
             Ok(VclSessionState::Listen)
         ));
+    }
+
+    #[test]
+    fn allocate_peer_child_inherits_listener_protocol() {
+        let mut store = store();
+        let listener = store
+            .bind_listener(TransportProtocol::Http, wire(1))
+            .expect("listener");
+        let outcome = store
+            .allocate_peer(wire(1).raw(), SessionFlags::STREAM)
+            .expect("alloc");
+        let (child, parent) = match outcome {
+            PeerOutcome::Child { handle, parent } => (handle, parent),
+            _ => panic!("expected child allocation"),
+        };
+        assert_eq!(parent, listener);
+        let session = store.pool.get(child).expect("child");
+        assert_eq!(
+            session.proto,
+            TransportProtocol::Http,
+            "accepted child must inherit the listener transport"
+        );
     }
 
     #[test]
