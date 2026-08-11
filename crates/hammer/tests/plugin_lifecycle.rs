@@ -211,6 +211,35 @@ main_heap_size = "256 MiB"
 }
 
 #[test]
+fn daemon_exits_after_shutdown_without_plugins() {
+    let mut daemon = Daemon::start(
+        r#"
+plugins = []
+
+[memory]
+main_heap_size = "256 MiB"
+"#,
+    );
+    let _ = request(daemon.address, "shutdown", Vec::new());
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        if daemon
+            .child
+            .try_wait()
+            .expect("inspect hammer daemon")
+            .is_some()
+        {
+            return;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "hammer daemon did not exit after shutdown"
+        );
+        thread::sleep(Duration::from_millis(10));
+    }
+}
+
+#[test]
 fn daemon_rejects_malformed_plugin_owned_config() {
     let config_path = write_config(
         r#"

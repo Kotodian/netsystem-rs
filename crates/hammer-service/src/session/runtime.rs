@@ -21,9 +21,10 @@ use hammer_infra::segment::Segment;
 use hammer_infra::thread_owned::ThreadOwned;
 use hammer_runtime::app::{
     AppSession, AppSessionConfig, AppSessionError, ApplicationConnectionId, ApplicationId,
-    ApplicationListenerId, ApplicationSessionReply, ApplicationSessionStatus, SessionAppContext,
-    SessionAppId, SessionDgramHeader, SessionEventQueue, SessionEvt, SessionEvtFlags,
-    SessionEvtType, SessionHandle, SessionMqRing, SessionMsgQueue,
+    ApplicationListenerId, SessionAcceptedMsg, SessionAppContext, SessionAppId,
+    SessionConnectError, SessionConnectedMsg, SessionControlError, SessionDgramHeader,
+    SessionEventQueue, SessionEvt, SessionEvtFlags, SessionEvtType, SessionFlags, SessionHandle,
+    SessionMqRing, SessionMsgQueue, SessionMsgQueueError,
 };
 use hammer_runtime::attach::AppSessionPublisher;
 use hammer_runtime::{
@@ -37,7 +38,7 @@ use hammer_runtime::{
 
 use crate::session::app::AppWorkerError;
 use crate::session::application::{ApplicationMain, ApplicationMqResources};
-use crate::session::error::{SessionConnectError, SessionError, SessionQueueError};
+use crate::session::error::{SessionError, SessionQueueError};
 use crate::session::lookup::{SessionEndpointLookup, SessionEndpointState};
 use crate::session::node::{AppSessionInputNode, SessionQueueTransportDispatch};
 use crate::session::protocol::SessionAppCallbacks;
@@ -354,6 +355,8 @@ struct SessionEntry<Index> {
     server_name: Option<String>,
     application_connection: Option<ApplicationConnectionId>,
     accepted: bool,
+    listener: Option<SessionHandle>,
+    flags: SessionFlags,
     lower_session: Option<SessionId>,
     rx_fifo: Arc<Fifo>,
     tx_fifo: Arc<Fifo>,
@@ -380,6 +383,8 @@ impl<Index: Copy + Eq> SessionEntry<Index> {
             server_name: None,
             application_connection: None,
             accepted: false,
+            listener: None,
+            flags: SessionFlags::empty(),
             lower_session: None,
             rx_fifo,
             tx_fifo,
@@ -399,6 +404,8 @@ impl<Index: Copy + Eq> SessionEntry<Index> {
             server_name: None,
             application_connection: None,
             accepted: false,
+            listener: None,
+            flags: SessionFlags::empty(),
             lower_session: None,
             rx_fifo,
             tx_fifo,
@@ -442,7 +449,7 @@ impl AppRxMqEntry {
     fn drain_snapshot_to(
         &mut self,
         dispatch_event: &mut impl FnMut(SessionMqRing, SessionEvt),
-    ) -> usize {
+    ) -> Result<usize, SessionMsgQueueError> {
         let was_postponed = self.postponed;
         if !was_postponed {
             self.queue.drain();
@@ -450,12 +457,14 @@ impl AppRxMqEntry {
         self.postponed = false;
 
         let snapshot = self.queue.len();
-        let dispatched = (0..snapshot)
-            .map_while(|_| self.queue.dequeue_with_ring())
-            .map(|(ring, event)| {
-                dispatch_event(ring, event);
-            })
-            .count();
+        let mut dispatched = 0usize;
+        for _ in 0..snapshot {
+            let Some((ring, event)) = self.queue.dequeue_with_ring()? else {
+                break;
+            };
+            dispatch_event(ring, event);
+            dispatched += 1;
+        }
 
         let mut has_work = !self.queue.is_empty();
         if was_postponed && !has_work {
@@ -464,7 +473,7 @@ impl AppRxMqEntry {
         }
         self.pending = has_work;
         self.postponed = has_work;
-        dispatched
+        Ok(dispatched)
     }
 }
 
@@ -812,67 +821,76 @@ impl SessionMain {
         application_listener: ApplicationListenerId,
         transport: SessionTransportRegistration,
         endpoint: SessionListenEndpoint,
-    ) -> RuntimeResult<SessionListenerId> {
+    ) -> Result<SessionListenerId, SessionError> {
         self.with_control_barrier(|| {
             let (application, opaque) = self
                 .applications
                 .with_listener(application_listener, |listener| {
                     (listener.application(), listener.opaque())
                 })
-                .map_err(RuntimeError::from)?;
-            let listener = self.with_listeners_mut(|listeners| {
-                listeners
-                    .insert(SessionListener {
-                        application,
-                        application_listener,
-                        transport,
-                    })
-                    .map(session_listener_id)
-                    .ok_or(SessionError::ListenerCapacityExhausted {
-                        capacity: listeners.capacity(),
-                    })
-            })??;
+                .map_err(|source| SessionError::TransportOpFailed {
+                    source: source.into(),
+                })?;
+            let listener = self
+                .with_listeners_mut(|listeners| {
+                    listeners
+                        .insert(SessionListener {
+                            application,
+                            application_listener,
+                            transport,
+                        })
+                        .map(session_listener_id)
+                        .ok_or(SessionError::ListenerCapacityExhausted {
+                            capacity: listeners.capacity(),
+                        })
+                })
+                .map_err(|_| SessionError::ListenerControlWrongThread)??;
             let Some(start_listen) = transport.start_listen() else {
                 self.with_listeners_mut(|listeners| {
                     listeners
                         .remove(session_listener_index(listener))
                         .expect("new Session listener remains present until rollback");
-                })?;
+                })
+                .map_err(|_| SessionError::ListenerControlWrongThread)?;
                 return Err(SessionError::TransportListenUnsupported {
                     transport: transport.name(),
-                }
-                .into());
+                });
             };
             if let Err(error) = start_listen(listener, application, opaque, endpoint) {
                 self.with_listeners_mut(|listeners| {
                     listeners
                         .remove(session_listener_index(listener))
                         .expect("new Session listener remains present until rollback");
-                })?;
-                return Err(error);
+                })
+                .map_err(|_| SessionError::ListenerControlWrongThread)?;
+                return Err(SessionError::TransportOpFailed { source: error });
             }
             Ok(listener)
-        })?
+        })
+        .map_err(|_| SessionError::ListenerControlWrongThread)?
     }
 
-    pub fn unlisten(&self, listener: SessionListenerId) -> RuntimeResult<()> {
+    pub fn unlisten(&self, listener: SessionListenerId) -> Result<(), SessionError> {
         self.with_control_barrier(|| {
-            let transport = self.with_listener(listener, |entry| entry.transport)?;
+            let transport = self
+                .with_listener(listener, |entry| entry.transport)
+                .map_err(|_| SessionError::ListenerMissing { listener })?;
             let Some(stop_listen) = transport.stop_listen() else {
                 return Err(SessionError::TransportListenUnsupported {
                     transport: transport.name(),
-                }
-                .into());
+                });
             };
-            stop_listen(listener)?;
+            stop_listen(listener).map_err(|source| SessionError::TransportOpFailed { source })?;
             self.with_listeners_mut(|listeners| {
                 listeners
                     .remove(session_listener_index(listener))
                     .ok_or(SessionError::ListenerMissing { listener })
                     .map(drop)
-            })??;
+            })
+            .map_err(|_| SessionError::ListenerControlWrongThread)??;
             Ok(())
-        })?
+        })
+        .map_err(|_| SessionError::ListenerControlWrongThread)?
     }
 
     pub(super) fn with_control_barrier<R>(
@@ -893,15 +911,52 @@ impl SessionMain {
         &self,
         transport: SessionTransportRegistration,
         endpoint: SessionConnectEndpoint,
-    ) -> RuntimeResult<SessionConnectionId> {
+    ) -> Result<SessionConnectionId, SessionError> {
         let Some(connect) = transport.connect() else {
             return Err(SessionError::TransportConnectUnsupported {
                 transport: transport.name(),
-            }
-            .into());
+            });
         };
         let connection = endpoint.connection;
-        connect(endpoint)?;
+        let worker_count = self.workers.len();
+        if worker_count == 0 {
+            return Err(SessionError::NoDataWorkers);
+        }
+        let application_connection = ApplicationConnectionId::from_raw(connection.raw());
+        let endpoint = SessionConnectEndpoint {
+            worker: DataWorkerId::new(
+                (application_connection.slot() as usize % worker_count) as u32,
+            ),
+            ..endpoint
+        };
+        connect(endpoint).map_err(|source| SessionError::TransportOpFailed { source })?;
+        Ok(connection)
+    }
+
+    /// Opens one child stream on the parent Session's owning worker.
+    pub fn connect_stream(
+        &self,
+        transport: SessionTransportRegistration,
+        endpoint: SessionConnectEndpoint,
+    ) -> Result<SessionConnectionId, SessionError> {
+        let parent = endpoint
+            .parent_handle
+            .ok_or(SessionError::ConnectStreamParentMissing)?;
+        let expected_worker = DataWorkerId::new(parent.worker_index());
+        if endpoint.worker != expected_worker {
+            return Err(SessionError::ConnectStreamWrongWorker {
+                parent,
+                expected: expected_worker,
+                actual: endpoint.worker,
+            });
+        }
+        let Some(connect_stream) = transport.connect_stream() else {
+            return Err(SessionError::TransportConnectStreamUnsupported {
+                transport: transport.name(),
+            });
+        };
+        let connection = endpoint.connection;
+        connect_stream(endpoint).map_err(|source| SessionError::TransportOpFailed { source })?;
         Ok(connection)
     }
 
@@ -1136,7 +1191,7 @@ impl SessionMain {
     }
 }
 
-fn schedule_worker_task<R: Send + 'static>(
+pub(super) fn schedule_worker_task<R: Send + 'static>(
     engine: &Engine,
     worker: DataWorkerId,
     task: impl FnOnce() -> RuntimeResult<R> + Send + 'static,
@@ -1449,9 +1504,9 @@ impl<Index: Copy + Eq> SessionWorker<Index> {
     }
 
     #[inline]
-    pub fn fifo_pair(&self, session_id: SessionId) -> Option<(&Fifo, &Fifo)> {
+    pub fn fifo_pair(&self, session_id: SessionId) -> Option<(&Arc<Fifo>, &Arc<Fifo>)> {
         let entry = self.entries.get(session_id.pool_index())?;
-        Some((entry.rx_fifo.as_ref(), entry.tx_fifo.as_ref()))
+        Some((&entry.rx_fifo, &entry.tx_fifo))
     }
 
     /// Enqueue one complete VPP-shaped datagram into a Session RX FIFO.
@@ -1775,7 +1830,7 @@ impl<Index: Copy + Eq> SessionWorker<Index> {
     pub fn publish_connected_transport_session(
         &mut self,
         session_id: SessionId,
-        completion: Option<ApplicationSessionReply>,
+        connected: Option<SessionConnectedMsg>,
     ) -> RuntimeResult<()> {
         if let Err(error) = self.connection_published(session_id) {
             return Err(match self.remove_session(session_id) {
@@ -1788,8 +1843,8 @@ impl<Index: Copy + Eq> SessionWorker<Index> {
                 .into(),
             });
         }
-        if let Some(completion) = completion {
-            if let Err(error) = self.app.set_connect_completion(session_id, completion) {
+        if let Some(connected) = connected {
+            if let Err(error) = self.app.set_connected(session_id, connected) {
                 return Err(match self.remove_session(session_id) {
                     Ok(()) => error,
                     Err(cleanup) => SessionError::ConnectPublicationCleanup {
@@ -1802,6 +1857,73 @@ impl<Index: Copy + Eq> SessionWorker<Index> {
             }
         }
         if let Err(error) = self.connected(session_id) {
+            return Err(match self.remove_session(session_id) {
+                Ok(()) => error,
+                Err(cleanup) => SessionError::ConnectPublicationCleanup {
+                    session_id,
+                    publication: error,
+                    cleanup,
+                }
+                .into(),
+            });
+        }
+        Ok(())
+    }
+
+    /// Publishes an accepted external child with an ACCEPTED message (VPP
+    /// `session_api.c` `app_wrk_send_ctrl_evt(app_wrk,
+    /// SESSION_CTRL_EVT_ACCEPTED, &m, sizeof(m))`, session_api.c:301).
+    ///
+    /// The Session transitions Creating -> Published and stays Published
+    /// (VPP LISTENING) until the Application answers ACCEPTED_REPLY; the
+    /// ACCEPTED event is pushed to the App Session event queue and the
+    /// ACCEPTED message rides the App Session publication. Queue-full
+    /// retries are drained by [`SessionWorker::poll_app`] from
+    /// [`AppWorker::pending_accepted`] without scanning.
+    pub fn publish_accepted_transport_session(
+        &mut self,
+        session_id: SessionId,
+    ) -> RuntimeResult<()> {
+        let (application, listener, flags) = self
+            .entries
+            .get(session_id.pool_index())
+            .and_then(|entry| {
+                let application = match entry.application {
+                    Some(SessionApplication::External(application)) => Some(application),
+                    _ => None,
+                }?;
+                Some((application, entry.listener?, entry.flags))
+            })
+            .ok_or(SessionError::SessionMissing { session_id })?;
+        let accepted = SessionAcceptedMsg::new(
+            application.raw(),
+            listener,
+            self.session_handle(session_id),
+            flags,
+        );
+        if let Err(error) = self.connection_published(session_id) {
+            return Err(match self.remove_session(session_id) {
+                Ok(()) => error,
+                Err(cleanup) => SessionError::ConnectPublicationCleanup {
+                    session_id,
+                    publication: error,
+                    cleanup,
+                }
+                .into(),
+            });
+        }
+        if let Err(error) = self.app.set_accepted(session_id, accepted) {
+            return Err(match self.remove_session(session_id) {
+                Ok(()) => error,
+                Err(cleanup) => SessionError::ConnectPublicationCleanup {
+                    session_id,
+                    publication: error,
+                    cleanup,
+                }
+                .into(),
+            });
+        }
+        if let Err(error) = self.app.accepted(session_id) {
             return Err(match self.remove_session(session_id) {
                 Ok(()) => error,
                 Err(cleanup) => SessionError::ConnectPublicationCleanup {
@@ -1964,24 +2086,24 @@ impl<Index: Copy + Eq> SessionWorker<Index> {
     fn drain_app_mq_events_to(
         &mut self,
         mut dispatch_event: impl FnMut(SessionMqRing, SessionEvt),
-    ) -> usize {
+    ) -> Result<usize, SessionMsgQueueError> {
         let pending_snapshot = core::mem::take(&mut self.app_rx_mq_pending);
-        pending_snapshot
-            .into_iter()
-            .fold(0usize, |dispatched, application| {
-                let slot = application.slot() as usize;
-                let Some(Some(entry)) = self.app_rx_mqs.get_mut(slot) else {
-                    return dispatched;
-                };
-                if entry.application != application || !entry.pending {
-                    return dispatched;
-                }
-                let entry_dispatched = entry.drain_snapshot_to(&mut dispatch_event);
-                if entry.pending {
-                    self.app_rx_mq_pending.push_back(application);
-                }
-                dispatched.saturating_add(entry_dispatched)
-            })
+        let mut dispatched = 0usize;
+        for application in pending_snapshot {
+            let slot = application.slot() as usize;
+            let Some(Some(entry)) = self.app_rx_mqs.get_mut(slot) else {
+                continue;
+            };
+            if entry.application != application || !entry.pending {
+                continue;
+            }
+            let entry_dispatched = entry.drain_snapshot_to(&mut dispatch_event)?;
+            if entry.pending {
+                self.app_rx_mq_pending.push_back(application);
+            }
+            dispatched = dispatched.saturating_add(entry_dispatched);
+        }
+        Ok(dispatched)
     }
 
     pub(crate) fn drain_app_mq(&mut self, application: ApplicationId) -> RuntimeResult<usize> {
@@ -1989,7 +2111,7 @@ impl<Index: Copy + Eq> SessionWorker<Index> {
         let mut new_io_events = core::mem::take(&mut self.new_io_events);
         let handled = self.drain_one_app_mq_to(application, |ring, event| {
             enqueue_app_event(&mut control_events, &mut new_io_events, ring, event);
-        });
+        })?;
         self.control_events = control_events;
         self.new_io_events = new_io_events;
         Ok(handled)
@@ -1999,22 +2121,22 @@ impl<Index: Copy + Eq> SessionWorker<Index> {
         &mut self,
         application: ApplicationId,
         mut dispatch_event: impl FnMut(SessionMqRing, SessionEvt),
-    ) -> usize {
+    ) -> Result<usize, SessionMsgQueueError> {
         self.app_rx_mq_pending
             .retain(|candidate| *candidate != application);
         let slot = application.slot() as usize;
         let Some(Some(entry)) = self.app_rx_mqs.get_mut(slot) else {
-            return 0;
+            return Ok(0);
         };
         if entry.application != application {
-            return 0;
+            return Ok(0);
         }
 
-        let dispatched = entry.drain_snapshot_to(&mut dispatch_event);
+        let dispatched = entry.drain_snapshot_to(&mut dispatch_event)?;
         if entry.pending {
             self.app_rx_mq_pending.push_back(application);
         }
-        dispatched
+        Ok(dispatched)
     }
 
     #[inline]
@@ -2052,6 +2174,13 @@ impl<Index: Copy + Eq> SessionWorker<Index> {
         self.app.app_session(session_id)
     }
 
+    /// Allocation owner of the Session's AppSession AttachSlot, used to
+    /// inherit the parent worker for peer-opened transport children.
+    #[inline]
+    pub fn session_allocation_owner(&self, session_id: SessionId) -> Option<u64> {
+        self.app.session_allocation_owner(session_id)
+    }
+
     #[inline]
     pub fn prefetch_session(&self, session_id: SessionId) {
         self.entries.prefetch_slot(session_id.pool_index());
@@ -2070,7 +2199,8 @@ impl<Index: Copy + Eq> SessionWorker<Index> {
             .ok_or(SessionError::ListenerMainMissing)?;
         let application_listener =
             main.with_listener(listener, SessionListener::application_listener)?;
-        main.applications
+        let session_id = main
+            .applications
             .with_listener(application_listener, |listener| {
                 self.construct_stream_sessions(
                     transport,
@@ -2083,7 +2213,65 @@ impl<Index: Copy + Eq> SessionWorker<Index> {
                     true,
                 )
             })
-            .map_err(RuntimeError::from)?
+            .map_err(RuntimeError::from)??;
+        // VPP `session_accepted_msg_t.listener_handle` (application_interface.h)
+        // names the accepting listener; it rides the ACCEPTED publication.
+        let entry = self
+            .entries
+            .get_mut(session_id.pool_index())
+            .expect("new accepted Session remains installed during listener pinning");
+        entry.listener = Some(SessionHandle::from(listener.raw()));
+        Ok(session_id)
+    }
+
+    /// Derives the child Session flags a transport computed for the stream
+    /// (VPP `session_alloc_for_stream`, `quic_quicly_on_stream_open`:
+    /// SESSION_F_STREAM, SESSION_F_UNIDIRECTIONAL). They ride the ACCEPTED
+    /// message (`mq_send_session_accepted_cb`, session_api.c:255).
+    pub fn set_session_flags(
+        &mut self,
+        session_id: SessionId,
+        flags: SessionFlags,
+    ) -> RuntimeResult<()> {
+        let entry = self
+            .entries
+            .get_mut(session_id.pool_index())
+            .ok_or(SessionError::SessionMissing { session_id })?;
+        entry.flags = flags;
+        Ok(())
+    }
+
+    /// Names the accepting listener of an accepted Session before the
+    /// ACCEPTED publication is emitted (VPP `session_accepted_msg_t
+    /// .listener_handle`, application_interface.h: quic_quicly_on_stream_open
+    /// sets `stream_session->listener_handle =
+    /// listen_session_get_handle (quic_session)`).
+    pub fn pin_accepted_listener(
+        &mut self,
+        session_id: SessionId,
+        listener: SessionHandle,
+    ) -> RuntimeResult<()> {
+        let entry = self
+            .entries
+            .get_mut(session_id.pool_index())
+            .ok_or(SessionError::SessionMissing { session_id })?;
+        entry.listener = Some(listener);
+        Ok(())
+    }
+
+    /// Test seam: the flags derived for a Session (`set_session_flags`).
+    #[doc(hidden)]
+    pub fn session_flags(&self, session_id: SessionId) -> Option<SessionFlags> {
+        self.entries
+            .get(session_id.pool_index())
+            .map(|entry| entry.flags)
+    }
+
+    /// Test seam: the retained ACCEPTED message of a Session whose
+    /// publication is still pending delivery to the Application.
+    #[doc(hidden)]
+    pub fn accepted_message(&self, session_id: SessionId) -> Option<SessionAcceptedMsg> {
+        self.app.accepted_message(session_id)
     }
 
     /// Constructs one transport Session with explicit Session-owned
@@ -2143,7 +2331,7 @@ impl<Index: Copy + Eq> SessionWorker<Index> {
                 self.construct_stream_sessions(
                     transport,
                     index,
-                    application_connection.raw(),
+                    connection.context(),
                     connection.application(),
                     connection.app(),
                     connection.opaque(),
@@ -2161,16 +2349,36 @@ impl<Index: Copy + Eq> SessionWorker<Index> {
     }
 
     /// Completes a previously constructed transport connect transaction.
+    ///
+    /// Accepted children of an external listener publish an ACCEPTED
+    /// publication instead of CONNECTED and stay Published (VPP listening)
+    /// until the Application answers ACCEPTED_REPLY.
     pub fn complete_stream_connect(&mut self, session_id: SessionId) -> RuntimeResult<()> {
-        let completion = self
+        let accepted_external = self
+            .entries
+            .get(session_id.pool_index())
+            .is_some_and(|entry| {
+                entry.accepted && matches!(entry.application, Some(SessionApplication::External(_)))
+            });
+        if accepted_external {
+            return self.publish_accepted_transport_session(session_id);
+        }
+        let connected = self
             .entries
             .get(session_id.pool_index())
             .and_then(|entry| entry.application_connection)
             .filter(|_| self.app.app_session(session_id).is_some())
             .map(|connection| {
-                ApplicationSessionReply::connected(connection, self.session_handle(session_id))
-            });
-        self.publish_connected_transport_session(session_id, completion)
+                let context = self
+                    .applications
+                    .with_connection(connection, |entry| entry.context())
+                    .map_err(RuntimeError::from)?;
+                let connected =
+                    SessionConnectedMsg::new(context, Ok(self.session_handle(session_id)));
+                Ok::<_, RuntimeError>(connected)
+            })
+            .transpose()?;
+        self.publish_connected_transport_session(session_id, connected)
     }
 
     pub fn stream_connect_failed(
@@ -2179,18 +2387,17 @@ impl<Index: Copy + Eq> SessionWorker<Index> {
         error: SessionConnectError,
     ) -> RuntimeResult<bool> {
         let application_connection = ApplicationConnectionId::from_raw(connection.raw());
-        let application = self
+        let (application, context) = self
             .applications
-            .with_connection(application_connection, |entry| entry.application())
+            .with_connection(application_connection, |entry| {
+                (entry.application(), entry.context())
+            })
             .map_err(RuntimeError::from)?;
-        let completion = ApplicationSessionReply::connect_failed(
-            application_connection,
-            ApplicationSessionStatus::from(error),
-        );
-        let accepted = self.app.publish_connect_failed(application, completion)?;
+        let message = SessionConnectedMsg::new(context, Err(error));
+        let accepted = self.app.publish_connect_failed(application, message)?;
         if accepted {
             self.applications
-                .complete_connection(application_connection)
+                .mark_connected(application_connection)
                 .map_err(RuntimeError::from)?;
         }
         Ok(accepted)
@@ -2243,13 +2450,13 @@ impl<Index: Copy + Eq> SessionWorker<Index> {
         let entry = self
             .entries
             .get_mut(session_id.pool_index())
-            .expect("new Session App transport Session remains installed during construction");
+            .ok_or(SessionError::TransportSessionCreateIncomplete { session_id })?;
         entry.owner_application = Some(application);
         entry.app = Some(app);
         entry.app_opaque = opaque;
         entry.server_name = server_name.map(str::to_owned);
         entry.accepted = accepted;
-        self.finish_transport_creation(session_id, index);
+        self.finish_transport_creation(session_id, index)?;
         Ok(session_id)
     }
 
@@ -2288,13 +2495,13 @@ impl<Index: Copy + Eq> SessionWorker<Index> {
             let entry = self
                 .entries
                 .get_mut(session_id.pool_index())
-                .expect("new external Transport Session remains installed during construction");
+                .ok_or(SessionError::TransportSessionCreateIncomplete { session_id })?;
             entry.rx_fifo = Arc::clone(application_session.rx_fifo());
             entry.tx_fifo = Arc::clone(application_session.tx_fifo());
             entry.application = Some(SessionApplication::External(application));
             entry.owner_application = Some(application);
         }
-        self.finish_transport_creation(session_id, index);
+        self.finish_transport_creation(session_id, index)?;
         self.app.attach_session(session_id, application_session);
         Ok(session_id)
     }
@@ -2352,7 +2559,7 @@ impl<Index: Copy + Eq> SessionWorker<Index> {
     }
 
     #[inline]
-    fn session_handle(&self, session_id: SessionId) -> SessionHandle {
+    pub fn session_handle(&self, session_id: SessionId) -> SessionHandle {
         SessionHandle::new(session_id.pool_index().slot(), self.worker.slot() as u32)
     }
 
@@ -2551,17 +2758,22 @@ impl<Index: Copy + Eq> SessionWorker<Index> {
         Ok(main.endpoint_is_migrating(local, remote, transport))
     }
 
-    fn finish_transport_creation(&mut self, session_id: SessionId, index: Index) {
+    fn finish_transport_creation(
+        &mut self,
+        session_id: SessionId,
+        index: Index,
+    ) -> RuntimeResult<()> {
         let entry = self
             .entries
             .get_mut(session_id.pool_index())
-            .expect("new Session entry remains installed until creation completes");
+            .ok_or(SessionError::TransportSessionCreateIncomplete { session_id })?;
         let Some(SessionType::Transport { state, .. }) = entry.session_type.as_mut() else {
-            panic!("new transport Session retains its session type");
+            return Err(SessionError::TransportSessionCreateIncomplete { session_id }.into());
         };
         *state = state
             .finish_creation(index)
-            .expect("new Session entry remains in Creating state until creation completes");
+            .ok_or(SessionError::TransportSessionCreateIncomplete { session_id })?;
+        Ok(())
     }
 
     pub fn connection_published(&mut self, session_id: SessionId) -> RuntimeResult<bool> {
@@ -2612,7 +2824,7 @@ impl<Index: Copy + Eq> SessionWorker<Index> {
             state.rx_fifo,
             state.tx_fifo,
         ))?;
-        self.finish_transport_creation(session_id, index);
+        self.finish_transport_creation(session_id, index)?;
         if let Err(error) = self.connection_published(session_id) {
             let _ = self.remove_session(session_id);
             return Err(error);
@@ -2710,7 +2922,7 @@ impl<Index: Copy + Eq> SessionWorker<Index> {
         let session_id = self.insert_session_entry(SessionEntry::creating_transport(
             transport, rx_fifo, tx_fifo,
         ))?;
-        self.finish_transport_creation(session_id, index);
+        self.finish_transport_creation(session_id, index)?;
         self.connection_published(session_id)?;
         self.connected(session_id)?;
         Ok(session_id)
@@ -2721,6 +2933,10 @@ impl<Index: Copy + Eq> SessionWorker<Index> {
         transport: SessionTransportId,
         index: Index,
     ) -> SessionId {
+        // Unique per-call allocation owner: the shared segment name embeds
+        // the owner, and parallel test workers using the same name would
+        // race on macOS shm_open.
+        static TEST_SESSION_OWNER: AtomicU32 = AtomicU32::new(0);
         let application = self.applications.attach().expect("attach test Application");
         self.install_application_mq_for_test(application)
             .expect("install Application Rx MQ");
@@ -2737,7 +2953,7 @@ impl<Index: Copy + Eq> SessionWorker<Index> {
         let session = self
             .app
             .create_app_session(
-                0,
+                TEST_SESSION_OWNER.fetch_add(1, Ordering::Relaxed).into(),
                 None,
                 self.session_handle(session_id),
                 self.app_session_config,
@@ -2751,7 +2967,8 @@ impl<Index: Copy + Eq> SessionWorker<Index> {
         entry.rx_fifo = Arc::clone(session.rx_fifo());
         entry.tx_fifo = Arc::clone(session.tx_fifo());
         entry.application = Some(SessionApplication::External(application));
-        self.finish_transport_creation(session_id, index);
+        self.finish_transport_creation(session_id, index)
+            .expect("test Session transport creation completes");
         self.app.attach_session(session_id, session);
         self.connection_published(session_id)
             .expect("publish session connection");
@@ -3068,7 +3285,7 @@ impl<Index: Copy + Eq> SessionWorker<Index> {
         let mut new_io_events = core::mem::take(&mut self.new_io_events);
         let app_mq_handled = self.drain_app_mq_events_to(|ring, event| {
             enqueue_app_event(&mut control_events, &mut new_io_events, ring, event);
-        });
+        })?;
         self.control_events = control_events;
         self.new_io_events = new_io_events;
         let pending_sessions = self.app.pending_connected_sessions();
@@ -3079,22 +3296,40 @@ impl<Index: Copy + Eq> SessionWorker<Index> {
                 self.complete_application_connection(session_id)?;
             }
         }
-        Ok(app_mq_handled.saturating_add(pending_session_count))
+        // Drain accepted-publication retries from the bounded deque: each
+        // session is re-attempted once per round and re-queued when still
+        // blocked, so a full publisher queue cannot be lost or spun.
+        let mut accepted_count = 0usize;
+        while self.app.has_pending_accepted_sessions() {
+            let Some(session_id) = self.app.next_pending_accepted() else {
+                break;
+            };
+            if self.app.retry_pending_accepted(session_id)? {
+                accepted_count += 1;
+            } else {
+                break;
+            }
+        }
+        Ok(app_mq_handled
+            .saturating_add(pending_session_count)
+            .saturating_add(accepted_count))
     }
 
     pub(crate) fn poll_session_events(&mut self) -> RuntimeResult<usize> {
         let snapshot = self.session_evt_q.len();
-        let handled = (0..snapshot)
-            .map_while(|_| self.session_evt_q.dequeue_with_ring())
-            .map(|(ring, event)| {
-                enqueue_app_event(
-                    &mut self.control_events,
-                    &mut self.new_io_events,
-                    ring,
-                    event,
-                );
-            })
-            .count();
+        let mut handled = 0usize;
+        for _ in 0..snapshot {
+            let Some((ring, event)) = self.session_evt_q.dequeue_with_ring()? else {
+                break;
+            };
+            enqueue_app_event(
+                &mut self.control_events,
+                &mut self.new_io_events,
+                ring,
+                event,
+            );
+            handled += 1;
+        }
         Ok(handled)
     }
 
@@ -3447,7 +3682,7 @@ impl<Index: Copy + Eq> SessionWorker<Index> {
             return Ok(());
         };
         self.applications
-            .complete_connection(connection)
+            .mark_connected(connection)
             .map_err(RuntimeError::from)?;
         let entry = self
             .entries
@@ -3455,6 +3690,111 @@ impl<Index: Copy + Eq> SessionWorker<Index> {
             .ok_or(SessionError::SessionMissing { session_id })?;
         if entry.application_connection == Some(connection) {
             entry.application_connection = None;
+        }
+        Ok(())
+    }
+
+    /// Applies an ACCEPTED_REPLY from the Application (VPP
+    /// `session_mq_accepted_reply_handler`, session_node.c:506-581).
+    ///
+    /// VPP redirects main-thread arrivals back to a worker before this
+    /// handler runs (session_node.c:511-515); Hammer executes this
+    /// worker-local transition through the engine task queue
+    /// ([`schedule_worker_task`]), the only runtime-model difference. The
+    /// transition mirrors VPP:
+    /// - unknown Session or application-ownership mismatch: drop the reply
+    ///   (session_node.c:516-521);
+    /// - error retval: disconnect only this Session
+    ///   (`vnet_disconnect_session` with this handle, session_node.c:523-528);
+    /// - success: Published -> Active (VPP LISTENING -> READY +
+    ///   `SESSION_F_RX_READY`, session_node.c:531-533), rx notify when the
+    ///   fifo is non-empty (session_node.c:550-553), and a close that arrived
+    ///   while the Application was deciding is resent with the closing state
+    ///   kept (session_node.c:556-563).
+    pub(crate) fn accept_reply(
+        &mut self,
+        application: ApplicationId,
+        handle: SessionHandle,
+        result: Result<(), SessionControlError>,
+    ) -> RuntimeResult<()> {
+        let Some(session_id) = self.session_id_from_handle(handle) else {
+            return Ok(());
+        };
+        let owner =
+            self.entries
+                .get(session_id.pool_index())
+                .and_then(|entry| match entry.application {
+                    Some(SessionApplication::External(owner)) => Some(owner),
+                    _ => None,
+                });
+        if owner != Some(application) {
+            tracing::warn!(?handle, ?application, "app doesn't own session");
+            return Ok(());
+        }
+        if result.is_err() {
+            return self.remove_session(session_id);
+        }
+        let next_state = {
+            let entry = self
+                .entries
+                .get(session_id.pool_index())
+                .ok_or(SessionError::SessionMissing { session_id })?;
+            let Some(SessionType::Transport { state, .. }) = entry.session_type else {
+                return Err(SessionError::SessionMissing { session_id }.into());
+            };
+            state.on_connected()
+        };
+        if let Some(next_state) = next_state {
+            let entry = self
+                .entries
+                .get_mut(session_id.pool_index())
+                .ok_or(SessionError::SessionMissing { session_id })?;
+            let Some(SessionType::Transport { state, .. }) = entry.session_type.as_mut() else {
+                return Err(SessionError::SessionMissing { session_id }.into());
+            };
+            *state = next_state;
+        } else {
+            let state = self
+                .entries
+                .get(session_id.pool_index())
+                .and_then(|entry| match &entry.session_type {
+                    Some(SessionType::Transport { state, .. }) => Some(*state),
+                    None => None,
+                })
+                .ok_or(SessionError::SessionMissing { session_id })?;
+            match state {
+                SessionState::AppClosed(_)
+                | SessionState::TransportClosed(_)
+                | SessionState::Closed(_) => {
+                    // VPP: closed while waiting for the app to reply; resend
+                    // the close and keep the closing state (session_node.c:
+                    // 556-563).
+                    self.notify_application_event(session_id, SessionEvtType::Disconnected)?;
+                }
+                SessionState::Creating | SessionState::Created(_) => {
+                    tracing::warn!(
+                        ?handle,
+                        ?application,
+                        "ACCEPTED_REPLY for a Session that was never published"
+                    );
+                }
+                SessionState::Active(_)
+                | SessionState::Published(_)
+                | SessionState::TransportDeleted => {
+                    // Duplicate reply for an already-ready Session.
+                }
+            }
+        }
+        // VPP: `if (!svm_fifo_is_empty_prod (s->rx_fifo)) app_worker_rx_notify
+        // (app_wrk, s);` (session_node.c:550-553).
+        let notify_rx = self
+            .entries
+            .get(session_id.pool_index())
+            .is_some_and(|entry| !entry.rx_fifo.is_empty() && entry.rx_fifo.set_event());
+        if notify_rx && let Some(session) = self.app.app_session(session_id) {
+            session
+                .push_io_event(SessionEvtType::RxEnq)
+                .map_err(RuntimeError::from)?;
         }
         Ok(())
     }
@@ -3741,6 +4081,26 @@ pub trait SessionTransport<Index>: Sized {
         output: &mut crate::session::node::SessionQueueOutput,
         now: Instant,
     ) -> RuntimeResult<()>;
+
+    /// App-initiated transport reset (VPP `SESSION_CTRL_EVT_RESET` ->
+    /// `session_transport_reset` -> `transport_reset`).
+    ///
+    /// The Session worker has already recorded the app-close state before
+    /// invoking this method. Transports without a real reset fall back to
+    /// [`Self::disconnect`], matching VPP `transport_reset` closing the
+    /// connection when the transport VFT has no reset entry.
+    fn reset(
+        &mut self,
+        sessions: &mut SessionWorker<Index>,
+        index: Index,
+        runtime: &DataPlaneRuntime,
+        output_next: SessionQueueNext,
+        frame: &mut BufferFrame,
+        output: &mut crate::session::node::SessionQueueOutput,
+        now: Instant,
+    ) -> RuntimeResult<()> {
+        self.disconnect(sessions, index, runtime, output_next, frame, output, now)
+    }
 }
 
 pub trait SessionPacketizedTransport<Index>: SessionTransport<Index> {
@@ -3995,7 +4355,7 @@ where
         |event| -> RuntimeResult<()> {
             if matches!(
                 event.evt_type,
-                SessionEvtType::Close | SessionEvtType::HalfClose
+                SessionEvtType::Close | SessionEvtType::HalfClose | SessionEvtType::Reset
             ) && event.worker_index() != sessions.worker.slot() as u32
             {
                 return Ok(());
@@ -4054,6 +4414,34 @@ where
                         && transport_id == T::ID
                     {
                         transport.disconnect(
+                            sessions,
+                            index,
+                            runtime,
+                            output_next,
+                            frame,
+                            output,
+                            now,
+                        )?;
+                    }
+                }
+                SessionEvtType::Reset => {
+                    // VPP `session_transport_reset`: record the app-close
+                    // state, then invoke the transport reset VFT. Stream
+                    // children are not rerouted to a lower Session; the
+                    // owning transport decides stream-local behavior and
+                    // reports a typed error for unsupported contexts.
+                    let session_transport = sessions.session_transport(session_id);
+                    if session_transport.is_some_and(|(transport_id, _)| transport_id != T::ID) {
+                        sessions.control_events.push_back(event);
+                        return Ok(());
+                    }
+                    if !sessions.close_transport_session(session_id)? {
+                        return Ok(());
+                    }
+                    if let Some((transport_id, index)) = session_transport
+                        && transport_id == T::ID
+                    {
+                        transport.reset(
                             sessions,
                             index,
                             runtime,
@@ -4252,20 +4640,21 @@ mod tests {
     use crate::session::ApplicationMain;
     use crate::session::SessionId;
     use crate::session::application::{ApplicationError, ApplicationMqResources};
+    use crate::session::error::SessionError;
     use crate::session::node::{
         SessionQueueNode, SessionQueueOutput, register_app_session_input_node,
         register_session_queue_node,
     };
     use crate::session::protocol::SessionAppCallbacks;
 
-    static SESSION_APP_RECORDED: AtomicU64 = AtomicU64::new(0);
+    static SESSION_APP_CALLBACK_VALUE: AtomicU64 = AtomicU64::new(0);
     static SESSION_LISTEN_BARRIER_SEEN: AtomicBool = AtomicBool::new(false);
     static SESSION_UNLISTEN_BARRIER_SEEN: AtomicBool = AtomicBool::new(false);
     static SESSION_LISTEN_APPLICATION: AtomicU64 = AtomicU64::new(0);
     static SESSION_LISTEN_OPAQUE: AtomicU64 = AtomicU64::new(0);
     static SESSION_LISTEN_ATTEMPTED: AtomicU64 = AtomicU64::new(0);
 
-    fn record_listen_barrier(
+    fn observe_listen_barrier(
         _: hammer_runtime::SessionListenerId,
         application: hammer_runtime::app::ApplicationId,
         opaque: Option<u64>,
@@ -4280,7 +4669,7 @@ mod tests {
         Ok(())
     }
 
-    fn record_unlisten_barrier(_: hammer_runtime::SessionListenerId) -> RuntimeResult<()> {
+    fn observe_unlisten_barrier(_: hammer_runtime::SessionListenerId) -> RuntimeResult<()> {
         SESSION_UNLISTEN_BARRIER_SEEN.store(
             Engine::with_current(|engine| engine.worker_barrier().is_pending()).unwrap_or(false),
             Ordering::SeqCst,
@@ -4306,24 +4695,41 @@ mod tests {
         ))
     }
 
-    fn record_session_app_rx(
+    fn stream_connect_must_not_run(_: hammer_runtime::SessionConnectEndpoint) -> RuntimeResult<()> {
+        Err(RuntimeError::config_validation(
+            "wrong-worker CONNECT_STREAM callback was invoked",
+        ))
+    }
+
+    fn connect_endpoint_has_worker_one(
+        endpoint: hammer_runtime::SessionConnectEndpoint,
+    ) -> RuntimeResult<()> {
+        if endpoint.worker == DataWorkerId::new(1) {
+            return Ok(());
+        }
+        Err(RuntimeError::config_validation(
+            "ordinary CONNECT selected the wrong worker",
+        ))
+    }
+
+    fn session_app_rx_callback(
         _: &mut SessionWorker<Index>,
         session: SessionId,
         context: u64,
     ) -> RuntimeResult<()> {
-        SESSION_APP_RECORDED.store(
+        SESSION_APP_CALLBACK_VALUE.store(
             (u64::from(session.pool_index().slot()) << 32) | (context & 0xffff_ffff),
             Ordering::SeqCst,
         );
         Ok(())
     }
 
-    fn record_session_app_connected(
+    fn session_app_connected_callback(
         _: &mut SessionWorker<Index>,
         session: SessionId,
         context: u64,
     ) -> RuntimeResult<()> {
-        SESSION_APP_RECORDED.store(
+        SESSION_APP_CALLBACK_VALUE.store(
             (u64::from(session.pool_index().slot()) << 32) | (context & 0xffff_ffff),
             Ordering::SeqCst,
         );
@@ -4340,6 +4746,8 @@ mod tests {
         EventQueue(#[from] SessionMsgQueueError),
         #[error(transparent)]
         SessionQueue(#[from] crate::session::SessionQueueError),
+        #[error(transparent)]
+        Session(#[from] SessionError),
         #[error(transparent)]
         Conversion(#[from] std::num::TryFromIntError),
     }
@@ -4436,8 +4844,8 @@ mod tests {
             application_listener,
             hammer_runtime::SessionTransportRegistration::new(
                 "barrier-udp",
-                Some(record_listen_barrier),
-                Some(record_unlisten_barrier),
+                Some(observe_listen_barrier),
+                Some(observe_unlisten_barrier),
                 None,
             ),
             hammer_runtime::SessionListenEndpoint::new(
@@ -4534,7 +4942,7 @@ mod tests {
             application_listener,
             hammer_runtime::SessionTransportRegistration::new(
                 "unlisten-failure",
-                Some(record_listen_barrier),
+                Some(observe_listen_barrier),
                 Some(fail_unlisten),
                 None,
             ),
@@ -4553,6 +4961,66 @@ mod tests {
 
         Engine::uninstall_current();
         Ok(())
+    }
+
+    #[test]
+    fn ordinary_connect_uses_session_owned_worker_policy() {
+        let main = SessionMain::new(3, ApplicationMain::new(1));
+        let endpoint = hammer_runtime::SessionConnectEndpoint::new(
+            "127.0.0.1:4433".parse().expect("remote endpoint"),
+            None,
+            DataWorkerId::new(2),
+            hammer_runtime::SessionConnectionId::from_raw(
+                hammer_runtime::app::ApplicationConnectionId::new(4, 1).raw(),
+            ),
+            hammer_runtime::app::ApplicationId::new(1, 0),
+            None,
+            None,
+        );
+        main.connect(
+            hammer_runtime::SessionTransportRegistration::new(
+                "connect-test",
+                None,
+                None,
+                Some(connect_endpoint_has_worker_one),
+            ),
+            endpoint,
+        )
+        .expect("ordinary CONNECT must use a configured Session worker");
+    }
+
+    #[test]
+    fn connect_stream_drops_endpoint_for_the_wrong_parent_worker() {
+        let main = SessionMain::new(2, ApplicationMain::new(1));
+        let parent = SessionHandle::new(7, 1);
+        let endpoint = hammer_runtime::SessionConnectEndpoint::new_stream(
+            "127.0.0.1:4433".parse().expect("remote endpoint"),
+            None,
+            DataWorkerId::new(0),
+            hammer_runtime::SessionConnectionId::from_raw(11),
+            hammer_runtime::app::ApplicationId::new(1, 0),
+            parent,
+            hammer_runtime::app::SessionFlags::empty(),
+            None,
+            None,
+        );
+        let error = main
+            .connect_stream(
+                hammer_runtime::SessionTransportRegistration::with_connect_stream(
+                    "stream-test",
+                    None,
+                    None,
+                    None,
+                    Some(stream_connect_must_not_run),
+                ),
+                endpoint,
+            )
+            .expect_err("wrong-worker CONNECT_STREAM must be dropped");
+
+        assert!(matches!(
+            &error,
+            super::SessionError::ConnectStreamWrongWorker { .. }
+        ));
     }
 
     #[test]
@@ -4641,6 +5109,47 @@ mod tests {
             events[..event_count]
                 .iter()
                 .any(|event| event.evt_type == SessionEvtType::Disconnected)
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn external_connect_keeps_session_tracked() -> Result<(), SessionTestFailure> {
+        let socket_path = format!(
+            "/tmp/hammer-external-connect-tracked-{}.sock",
+            std::process::id()
+        );
+        let server = AppServer::bind(&socket_path, 4)?;
+        let applications = ApplicationMain::new(1);
+        let application = applications.attach()?;
+        let mut sessions = SessionWorker::<Index>::new(
+            DataWorkerId::new(0),
+            1,
+            AppSessionConfig::default(),
+            DEFAULT_SESSION_POOL_CAPACITY,
+            Arc::clone(&applications),
+            Some(server.publisher()),
+        )?;
+        sessions.install_application_mq_for_test(application)?;
+        let application_connection =
+            applications.register_connection(application, 0, None, None, None)?;
+        let connection_id =
+            hammer_runtime::SessionConnectionId::from_raw(application_connection.raw());
+
+        let session_id = sessions.stream_connect_pending(
+            SessionTransportId::new(1),
+            Index::new(7, 1),
+            connection_id,
+        )?;
+        assert!(sessions.has_session(session_id));
+        sessions.complete_stream_connect(session_id)?;
+        assert!(
+            sessions.has_session(session_id),
+            "external CONNECT keeps the Session tracked after publication"
+        );
+        assert!(
+            sessions.app_session(session_id).is_some(),
+            "external CONNECT attaches the App Session"
         );
         Ok(())
     }
@@ -4917,7 +5426,7 @@ mod tests {
             .expect("publish second connection");
         sessions
             .connected(second)
-            .expect("full publication queue defers connection completion");
+            .expect("full publication queue defers CONNECTED message");
 
         assert!(sessions.has_session(second));
         assert!(sessions.rollback_session_creation(second).is_err());
@@ -5424,7 +5933,7 @@ mod tests {
             tx_fifo.clone(),
         ))?;
         let transport_index = Index::new(7, 1);
-        sessions.finish_transport_creation(session_id, transport_index);
+        sessions.finish_transport_creation(session_id, transport_index)?;
         assert!(sessions.connection_published(session_id)?);
 
         assert_eq!(tx_fifo.enqueue(b"tx"), 2);
@@ -5587,7 +6096,7 @@ mod tests {
                     .enqueue_io(SessionEvt::io(1, SessionEvtType::TxDeq))
                     .expect("append event after the MQ snapshot");
             }
-        });
+        })?;
 
         assert_eq!(handled, 1);
         assert_eq!(dispatched, 1);
@@ -5660,7 +6169,7 @@ mod tests {
 
     #[test]
     fn session_app_rx_dispatches_exact_session_and_opaque_context() {
-        SESSION_APP_RECORDED.store(0, Ordering::SeqCst);
+        SESSION_APP_CALLBACK_VALUE.store(0, Ordering::SeqCst);
         let applications = ApplicationMain::new(4);
         let application = applications.attach().expect("attach Application");
         let mut sessions = SessionWorker::<Index>::new(
@@ -5694,7 +6203,7 @@ mod tests {
             .install_session_app(
                 hammer_runtime::app::SessionAppId::new(0),
                 SessionAppCallbacks {
-                    builtin_rx: Some(record_session_app_rx),
+                    builtin_rx: Some(session_app_rx_callback),
                     ..Default::default()
                 },
             )
@@ -5704,14 +6213,14 @@ mod tests {
             .dispatch_application(session_id, SessionEvtType::RxEnq)
             .expect("dispatch exact Session App RX event");
         assert_eq!(
-            SESSION_APP_RECORDED.load(Ordering::SeqCst),
+            SESSION_APP_CALLBACK_VALUE.load(Ordering::SeqCst),
             (u64::from(session_id.pool_index().slot()) << 32) | 0xABCD
         );
     }
 
     #[test]
     fn session_app_connected_dispatches_exact_opaque_context() {
-        SESSION_APP_RECORDED.store(0, Ordering::SeqCst);
+        SESSION_APP_CALLBACK_VALUE.store(0, Ordering::SeqCst);
         let applications = ApplicationMain::new(4);
         let application = applications.attach().expect("attach Application");
         let mut sessions = SessionWorker::<Index>::new(
@@ -5745,7 +6254,7 @@ mod tests {
             .install_session_app(
                 hammer_runtime::app::SessionAppId::new(0),
                 SessionAppCallbacks {
-                    connected: Some(record_session_app_connected),
+                    connected: Some(session_app_connected_callback),
                     ..Default::default()
                 },
             )
@@ -5755,7 +6264,7 @@ mod tests {
             .dispatch_application(session_id, SessionEvtType::Connect)
             .expect("dispatch exact Session App connected event");
         assert_eq!(
-            SESSION_APP_RECORDED.load(Ordering::SeqCst),
+            SESSION_APP_CALLBACK_VALUE.load(Ordering::SeqCst),
             (u64::from(session_id.pool_index().slot()) << 32) | 0x1234
         );
     }
@@ -5811,7 +6320,7 @@ mod tests {
     fn upper_transport_session_publishes_connect_without_session_app_callback() {
         static SESSION_APP_CONNECTED_CALLS: AtomicU64 = AtomicU64::new(0);
 
-        fn record_connected(
+        fn count_session_app_connected(
             _: &mut SessionWorker<Index>,
             _: SessionId,
             _: u64,
@@ -5839,7 +6348,7 @@ mod tests {
             .install_session_app(
                 hammer_runtime::app::SessionAppId::new(0),
                 SessionAppCallbacks {
-                    connected: Some(record_connected),
+                    connected: Some(count_session_app_connected),
                     ..Default::default()
                 },
             )
@@ -5940,6 +6449,397 @@ mod tests {
             .close_transport_session(upper)
             .expect("app close completes transport deletion");
         assert!(!sessions.has_session(upper));
+    }
+    fn accepted_reply_fixture(
+        application: hammer_runtime::app::ApplicationId,
+        publisher: hammer_runtime::attach::AppSessionPublisher,
+        applications: Arc<ApplicationMain>,
+        session_index: u32,
+    ) -> (SessionWorker<Index>, SessionId) {
+        let mut sessions = SessionWorker::<Index>::new(
+            DataWorkerId::new(0),
+            1,
+            AppSessionConfig::default(),
+            DEFAULT_SESSION_POOL_CAPACITY,
+            applications,
+            Some(publisher),
+        )
+        .expect("Session worker with external App publication");
+        sessions
+            .install_application_mq_for_test(application)
+            .expect("install test Application MQ");
+        let session_id = sessions
+            .construct_stream_sessions(
+                SessionTransportId::new(1),
+                Index::new(session_index, 1),
+                session_index as u64,
+                application,
+                None,
+                None,
+                None,
+                true,
+            )
+            .expect("accepted external Session");
+        // Production pins the accepting listener in `stream_accept`
+        // (VPP `session_accepted_msg_t.listener_handle`); the direct
+        // construction seam used here mirrors that step.
+        sessions
+            .entries
+            .get_mut(session_id.pool_index())
+            .expect("accepted Session entry")
+            .listener = Some(SessionHandle::new(7, 0));
+        sessions
+            .publish_accepted_transport_session(session_id)
+            .expect("publish ACCEPTED message");
+        (sessions, session_id)
+    }
+
+    #[test]
+    fn accepted_publication_carries_stream_session_flags() {
+        let socket_path = std::path::PathBuf::from(format!(
+            "/tmp/hammer-sr-accept-flags-{}.sock",
+            std::process::id()
+        ));
+        let server = AppServer::bind(socket_path.to_str().expect("socket path"), 1)
+            .expect("bind App server");
+        let applications = ApplicationMain::new(1);
+        let application = applications.attach().expect("attach Application");
+        let mut sessions = SessionWorker::<Index>::new(
+            DataWorkerId::new(0),
+            1,
+            AppSessionConfig::default(),
+            DEFAULT_SESSION_POOL_CAPACITY,
+            Arc::clone(&applications),
+            Some(server.publisher()),
+        )
+        .expect("Session worker with external App publication");
+        sessions
+            .install_application_mq_for_test(application)
+            .expect("install test Application MQ");
+        // The first accepted Session fills the single publication slot so
+        // the second Session's ACCEPTED message stays retained in the
+        // pending publication and its payload can be inspected.
+        let first = sessions
+            .construct_stream_sessions(
+                SessionTransportId::new(1),
+                Index::new(11, 1),
+                11,
+                application,
+                None,
+                None,
+                None,
+                true,
+            )
+            .expect("first accepted external Session");
+        sessions
+            .entries
+            .get_mut(first.pool_index())
+            .expect("first accepted Session entry")
+            .listener = Some(SessionHandle::new(7, 0));
+        sessions
+            .publish_accepted_transport_session(first)
+            .expect("publish first ACCEPTED publication");
+        let second = sessions
+            .construct_stream_sessions(
+                SessionTransportId::new(1),
+                Index::new(12, 1),
+                12,
+                application,
+                None,
+                None,
+                None,
+                true,
+            )
+            .expect("second accepted external Session");
+        sessions
+            .entries
+            .get_mut(second.pool_index())
+            .expect("second accepted Session entry")
+            .listener = Some(SessionHandle::new(7, 0));
+        sessions
+            .set_session_flags(
+                second,
+                hammer_runtime::app::SessionFlags::STREAM
+                    | hammer_runtime::app::SessionFlags::UNIDIRECTIONAL,
+            )
+            .expect("derive QUIC stream Session flags");
+        sessions
+            .publish_accepted_transport_session(second)
+            .expect("publish second ACCEPTED publication");
+        // VPP `mq_send_session_accepted_cb` (session_api.c:255) rides the
+        // child Session flags on the ACCEPTED payload.
+        let accepted = sessions
+            .accepted_message(second)
+            .expect("retained ACCEPTED message");
+        assert_eq!(
+            accepted.flags,
+            hammer_runtime::app::SessionFlags::STREAM
+                | hammer_runtime::app::SessionFlags::UNIDIRECTIONAL
+        );
+        assert_eq!(accepted.session, sessions.session_handle(second));
+        assert_eq!(accepted.listener, SessionHandle::new(7, 0));
+        let _ = std::fs::remove_file(socket_path);
+    }
+
+    #[test]
+    fn accepted_reply_transitions_published_session_to_active_with_rx_notify() {
+        let socket_path = std::path::PathBuf::from(format!(
+            "/tmp/hammer-sr-accept-reply-{}.sock",
+            std::process::id()
+        ));
+        let server = AppServer::bind(socket_path.to_str().expect("socket path"), 4)
+            .expect("bind App server");
+        let applications = ApplicationMain::new(1);
+        let application = applications.attach().expect("attach Application");
+        let (mut sessions, session_id) = accepted_reply_fixture(
+            application,
+            server.publisher(),
+            Arc::clone(&applications),
+            2,
+        );
+        let handle = sessions.session_handle(session_id);
+        let entry = sessions
+            .entries
+            .get(session_id.pool_index())
+            .expect("accepted Session entry");
+        assert!(matches!(
+            entry.session_type,
+            Some(SessionType::Transport {
+                state: SessionState::Published(_),
+                ..
+            })
+        ));
+        // Data that arrived while the Application was deciding: the success
+        // reply must issue the rx notification VPP sends after READY
+        // (session_node.c:550-553).
+        entry.rx_fifo.enqueue(&[1_u8; 16]);
+        sessions
+            .accept_reply(application, handle, Ok(()))
+            .expect("apply ACCEPTED_REPLY");
+        let entry = sessions
+            .entries
+            .get(session_id.pool_index())
+            .expect("active Session entry");
+        assert!(matches!(
+            entry.session_type,
+            Some(SessionType::Transport {
+                state: SessionState::Active(_),
+                ..
+            })
+        ));
+        let app_session = sessions
+            .app
+            .app_session(session_id)
+            .expect("Application Session");
+        let event = app_session
+            .evt_q()
+            .dequeue()
+            .expect("dequeue ACCEPTED control event")
+            .expect("ACCEPTED control event");
+        assert_eq!(event.evt_type, SessionEvtType::Accepted);
+        let event = app_session
+            .evt_q()
+            .dequeue()
+            .expect("dequeue rx notification")
+            .expect("rx notification event");
+        assert_eq!(event.evt_type, SessionEvtType::RxEnq);
+    }
+
+    #[test]
+    fn accepted_reply_resends_pending_close_removes_on_error_and_drops_foreign_owner() {
+        let socket_path = std::path::PathBuf::from(format!(
+            "/tmp/hammer-sr-accept-close-{}.sock",
+            std::process::id()
+        ));
+        let server = AppServer::bind(socket_path.to_str().expect("socket path"), 4)
+            .expect("bind App server");
+        let applications = ApplicationMain::new(1);
+        let application = applications.attach().expect("attach Application");
+        let publisher = server.publisher();
+
+        // A close that arrived while the Application was deciding is recorded
+        // without notifying (state.rs) and resent by ACCEPTED_REPLY with the
+        // closing state kept (session_node.c:556-563).
+        let (mut sessions, session_id) =
+            accepted_reply_fixture(application, publisher.clone(), Arc::clone(&applications), 2);
+        let handle = sessions.session_handle(session_id);
+        let index = Index::new(2, 1);
+        sessions
+            .notify_transport_closing(None, session_id, index)
+            .expect("record transport closing");
+        let entry = sessions
+            .entries
+            .get(session_id.pool_index())
+            .expect("closing Session entry");
+        assert!(matches!(
+            entry.session_type,
+            Some(SessionType::Transport {
+                state: SessionState::TransportClosed(_),
+                ..
+            })
+        ));
+        {
+            let app_session = sessions
+                .app
+                .app_session(session_id)
+                .expect("Application Session");
+            let event = app_session
+                .evt_q()
+                .dequeue()
+                .expect("dequeue ACCEPTED control event")
+                .expect("ACCEPTED control event");
+            assert_eq!(event.evt_type, SessionEvtType::Accepted);
+            assert!(
+                app_session.evt_q().dequeue().expect("dequeue").is_none(),
+                "pending close is recorded without notifying until ACCEPTED_REPLY"
+            );
+        }
+        sessions
+            .accept_reply(application, handle, Ok(()))
+            .expect("apply ACCEPTED_REPLY to closing Session");
+        let entry = sessions
+            .entries
+            .get(session_id.pool_index())
+            .expect("closing Session entry after reply");
+        assert!(matches!(
+            entry.session_type,
+            Some(SessionType::Transport {
+                state: SessionState::TransportClosed(_),
+                ..
+            })
+        ));
+        assert_eq!(
+            sessions
+                .app
+                .app_session(session_id)
+                .expect("Application Session")
+                .evt_q()
+                .dequeue()
+                .expect("dequeue close resend")
+                .expect("close resend event")
+                .evt_type,
+            SessionEvtType::Disconnected
+        );
+
+        // An error reply disconnects only this child Session
+        // (vnet_disconnect_session with this handle, session_node.c:523-528).
+        let (mut sessions, session_id) =
+            accepted_reply_fixture(application, publisher.clone(), Arc::clone(&applications), 3);
+        let handle = sessions.session_handle(session_id);
+        sessions
+            .accept_reply(
+                application,
+                handle,
+                Err(hammer_runtime::app::SessionControlError::ApplicationMissing),
+            )
+            .expect("apply rejecting ACCEPTED_REPLY");
+        assert!(sessions.session_id_from_handle(handle).is_none());
+
+        // A reply from an Application that does not own the Session is
+        // dropped and leaves the Session Published (session_node.c:516-521).
+        let foreign_applications = ApplicationMain::new(2);
+        let owner = foreign_applications.attach().expect("owner Application");
+        let foreign = foreign_applications.attach().expect("foreign Application");
+        let (mut sessions, session_id) =
+            accepted_reply_fixture(owner, publisher, Arc::clone(&foreign_applications), 5);
+        let handle = sessions.session_handle(session_id);
+        sessions
+            .accept_reply(foreign, handle, Ok(()))
+            .expect("drop foreign ACCEPTED_REPLY");
+        let entry = sessions
+            .entries
+            .get(session_id.pool_index())
+            .expect("Session entry");
+        assert!(matches!(
+            entry.session_type,
+            Some(SessionType::Transport {
+                state: SessionState::Published(_),
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn accept_reply_for_stale_or_missing_child_never_aborts_worker_and_sibling_remains_valid() {
+        let socket_path = std::path::PathBuf::from(format!(
+            "/tmp/hammer-sr-accept-stale-{}.sock",
+            std::process::id()
+        ));
+        let server = AppServer::bind(socket_path.to_str().expect("socket path"), 4)
+            .expect("bind App server");
+        let applications = ApplicationMain::new(1);
+        let application = applications.attach().expect("attach Application");
+        let (mut sessions, stale_id) = accepted_reply_fixture(
+            application,
+            server.publisher(),
+            Arc::clone(&applications),
+            2,
+        );
+        let stale_handle = sessions.session_handle(stale_id);
+        let sibling_id = sessions
+            .construct_stream_sessions(
+                SessionTransportId::new(1),
+                Index::new(3, 1),
+                3,
+                application,
+                None,
+                None,
+                None,
+                true,
+            )
+            .expect("sibling external Session");
+        sessions
+            .entries
+            .get_mut(sibling_id.pool_index())
+            .expect("sibling Session entry")
+            .listener = Some(SessionHandle::new(7, 0));
+        sessions
+            .publish_accepted_transport_session(sibling_id)
+            .expect("publish sibling ACCEPTED message");
+        let sibling_handle = sessions.session_handle(sibling_id);
+
+        // The child Session is removed while the Application is deciding; the
+        // late reply is a stale handle and must be dropped without aborting
+        // the worker (VPP `session_get_from_handle_if_valid` miss,
+        // session_node.c:526-528).
+        sessions
+            .remove_session(stale_id)
+            .expect("remove child before its reply");
+        assert!(sessions.session_id_from_handle(stale_handle).is_none());
+        sessions
+            .accept_reply(application, stale_handle, Ok(()))
+            .expect("stale child reply is dropped");
+        // A reply for a Session that was never created is dropped the same way.
+        sessions
+            .accept_reply(application, SessionHandle::new(0, 0), Ok(()))
+            .expect("missing child reply is dropped");
+
+        // The sibling is untouched and its own reply still applies.
+        let entry = sessions
+            .entries
+            .get(sibling_id.pool_index())
+            .expect("sibling Session entry");
+        assert!(matches!(
+            entry.session_type,
+            Some(SessionType::Transport {
+                state: SessionState::Published(_),
+                ..
+            })
+        ));
+        sessions
+            .accept_reply(application, sibling_handle, Ok(()))
+            .expect("apply sibling ACCEPTED_REPLY");
+        let entry = sessions
+            .entries
+            .get(sibling_id.pool_index())
+            .expect("sibling Session entry after reply");
+        assert!(matches!(
+            entry.session_type,
+            Some(SessionType::Transport {
+                state: SessionState::Active(_),
+                ..
+            })
+        ));
     }
 }
 

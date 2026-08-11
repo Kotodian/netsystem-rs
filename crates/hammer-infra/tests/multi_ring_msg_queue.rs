@@ -7,7 +7,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::thread;
 
 use hammer_infra::multi_ring_msg_queue::{
-    MultiRingMsgQueue, MultiRingMsgQueueCfg, MultiRingMsgQueueError, RingCfg,
+    MultiProducer, MultiRingMsgQueue, MultiRingMsgQueueCfg, MultiRingMsgQueueError, RingCfg,
 };
 use hammer_infra::segment::Segment;
 
@@ -233,7 +233,7 @@ fn svm_init_at_and_from_shared_roundtrip_preserves_payload() {
             },
         ],
     };
-    let bytes = MultiRingMsgQueue::layout_bytes(&cfg);
+    let bytes = MultiRingMsgQueue::<MultiProducer>::layout_bytes(&cfg);
     let seg = Segment::shared_default();
     let off = seg.alloc(bytes, 64).expect("queue allocation");
 
@@ -241,7 +241,7 @@ fn svm_init_at_and_from_shared_roundtrip_preserves_payload() {
     write_u64(&producer, 0, 0x1111_2222_3333_4444).expect("io");
     write_u64(&producer, 1, 0xaaaa_bbbb_cccc_dddd).expect("ctrl");
 
-    let consumer = unsafe { MultiRingMsgQueue::from_shared(seg, off) };
+    let consumer = unsafe { MultiRingMsgQueue::from_shared(seg, off) }.expect("from_shared");
     let first = consumer.sub().expect("first");
     assert_eq!(first.ring_index(), 0);
     assert_eq!(read_u64(&first), 0x1111_2222_3333_4444);
@@ -251,4 +251,269 @@ fn svm_init_at_and_from_shared_roundtrip_preserves_payload() {
     assert_eq!(read_u64(&second), 0xaaaa_bbbb_cccc_dddd);
     drop(second);
     assert!(consumer.sub().is_none());
+}
+
+#[test]
+fn single_producer_mode_roundtrips_without_freelist() {
+    use hammer_infra::multi_ring_msg_queue::SingleProducer;
+
+    let mut q = MultiRingMsgQueue::<SingleProducer>::with_cfg(MultiRingMsgQueueCfg {
+        q_nitems: 8,
+        rings: &[RingCfg {
+            nitems: 4,
+            elsize: 16,
+        }],
+    })
+    .expect("queue");
+
+    let mut producer = q.claim_producer().expect("claim producer");
+    let mut reservation = producer.reserve(0).expect("reserve");
+    reservation
+        .payload_mut()
+        .copy_from_slice(b"abcdefghijklmnop");
+    assert!(
+        reservation.publish(),
+        "first publish on an empty queue must report the empty -> nonempty transition"
+    );
+    drop(reservation);
+
+    let msg = q.sub().expect("message");
+    assert_eq!(msg.as_slice(), b"abcdefghijklmnop");
+    drop(msg);
+    assert!(q.sub().is_none());
+
+    // The slot was returned in order; the producer can reuse it without a
+    // freelist or ABA bookkeeping.
+    let mut reservation = producer.reserve(0).expect("reserve after free");
+    reservation
+        .payload_mut()
+        .copy_from_slice(b"0123456789abcdef");
+    reservation.publish();
+    drop(reservation);
+    let msg = q.sub().expect("reused message");
+    assert_eq!(msg.as_slice(), b"0123456789abcdef");
+    drop(msg);
+    assert!(q.sub().is_none());
+}
+
+#[test]
+fn single_producer_mode_full_and_wrap_are_typed() {
+    use hammer_infra::multi_ring_msg_queue::SingleProducer;
+
+    let mut q = MultiRingMsgQueue::<SingleProducer>::with_cfg(MultiRingMsgQueueCfg {
+        q_nitems: 64,
+        rings: &[RingCfg {
+            nitems: 4,
+            elsize: 8,
+        }],
+    })
+    .expect("queue");
+    let mut producer = q.claim_producer().expect("claim producer");
+
+    for i in 0..4u64 {
+        let mut reservation = producer.reserve(0).expect("reserve");
+        reservation.payload_mut().copy_from_slice(&i.to_le_bytes());
+        reservation.publish();
+    }
+    // Ring is full: the fifth reserve is a typed error, never a panic.
+    assert!(matches!(
+        producer.reserve(0),
+        Err(MultiRingMsgQueueError::RingFull)
+    ));
+
+    // Consume in order; each Drop returns the slot, so the cursors wrap.
+    for i in 0..4 {
+        let msg = q.sub().expect("message");
+        assert_eq!(read_u64(&msg), i);
+        drop(msg);
+    }
+    assert!(q.sub().is_none());
+
+    // Cursor wrapped: slot 0 is reused after the full round.
+    let mut reservation = producer.reserve(0).expect("reserve after wrap");
+    reservation
+        .payload_mut()
+        .copy_from_slice(&99u64.to_le_bytes());
+    reservation.publish();
+    drop(reservation);
+    let msg = q.sub().expect("wrapped message");
+    assert_eq!(read_u64(&msg), 99);
+    drop(msg);
+}
+
+#[test]
+fn single_producer_mode_descriptor_queue_full_is_typed() {
+    use hammer_infra::multi_ring_msg_queue::SingleProducer;
+
+    let mut q = MultiRingMsgQueue::<SingleProducer>::with_cfg(MultiRingMsgQueueCfg {
+        q_nitems: 2,
+        rings: &[RingCfg {
+            nitems: 16,
+            elsize: 8,
+        }],
+    })
+    .expect("queue");
+    let mut producer = q.claim_producer().expect("claim producer");
+
+    for i in 0..2u64 {
+        let mut reservation = producer.reserve(0).expect("reserve");
+        reservation.payload_mut().copy_from_slice(&i.to_le_bytes());
+        reservation.publish();
+    }
+    assert!(matches!(
+        producer.reserve(0),
+        Err(MultiRingMsgQueueError::QueueFull)
+    ));
+
+    // Consuming one descriptor frees space for the next reserve.
+    drop(q.sub().expect("message"));
+    let mut reservation = producer.reserve(0).expect("reserve after consume");
+    reservation
+        .payload_mut()
+        .copy_from_slice(&7u64.to_le_bytes());
+    reservation.publish();
+    drop(reservation);
+    let mut seen = Vec::new();
+    while let Some(msg) = q.sub() {
+        seen.push(read_u64(&msg));
+    }
+    assert_eq!(seen, vec![1, 7]);
+}
+
+#[test]
+fn single_producer_mode_mapping_mode_mismatch_is_typed() {
+    use hammer_infra::multi_ring_msg_queue::SingleProducer;
+
+    let cfg = MultiRingMsgQueueCfg {
+        q_nitems: 8,
+        rings: &[RingCfg {
+            nitems: 4,
+            elsize: 8,
+        }],
+    };
+    let bytes = MultiRingMsgQueue::<MultiProducer>::layout_bytes(&cfg);
+    let seg = Segment::shared_default();
+    let off = seg.alloc(bytes, 64).expect("queue allocation");
+    unsafe { MultiRingMsgQueue::<SingleProducer>::init_at(seg.clone(), off, &cfg) }
+        .expect("SP init");
+
+    // An SP queue mapped as MP must fail with the mode tag mismatch.
+    let error = match unsafe { MultiRingMsgQueue::<MultiProducer>::from_shared(seg.clone(), off) } {
+        Err(error) => error,
+        Ok(_) => panic!("SP queue mapped as MP must be rejected"),
+    };
+    assert!(matches!(
+        error,
+        MultiRingMsgQueueError::ModeMismatch {
+            expected: 0,
+            actual: 1
+        }
+    ));
+
+    // And an MP queue mapped as SP fails symmetrically.
+    let mp_bytes = MultiRingMsgQueue::<MultiProducer>::layout_bytes(&cfg);
+    let mp_seg = Segment::shared_default();
+    let mp_off = mp_seg.alloc(mp_bytes, 64).expect("queue allocation");
+    unsafe { MultiRingMsgQueue::<MultiProducer>::init_at(mp_seg.clone(), mp_off, &cfg) }
+        .expect("MP init");
+    let error = match unsafe { MultiRingMsgQueue::<SingleProducer>::from_shared(mp_seg, mp_off) } {
+        Err(error) => error,
+        Ok(_) => panic!("MP queue mapped as SP must be rejected"),
+    };
+    assert!(matches!(
+        error,
+        MultiRingMsgQueueError::ModeMismatch {
+            expected: 1,
+            actual: 0
+        }
+    ));
+}
+
+#[test]
+fn single_producer_cross_mapping_double_claim_is_typed() {
+    use hammer_infra::multi_ring_msg_queue::SingleProducer;
+
+    let cfg = MultiRingMsgQueueCfg {
+        q_nitems: 8,
+        rings: &[RingCfg {
+            nitems: 4,
+            elsize: 8,
+        }],
+    };
+    let bytes = MultiRingMsgQueue::<MultiProducer>::layout_bytes(&cfg);
+    let seg = Segment::shared_default();
+    let off = seg.alloc(bytes, 64).expect("queue allocation");
+    unsafe { MultiRingMsgQueue::<SingleProducer>::init_at(seg.clone(), off, &cfg) }
+        .expect("SP init");
+
+    let first = unsafe { MultiRingMsgQueue::<SingleProducer>::from_shared(seg.clone(), off) }
+        .expect("first mapping");
+    let second = unsafe { MultiRingMsgQueue::<SingleProducer>::from_shared(seg, off) }
+        .expect("second mapping");
+
+    first.claim_producer().expect("first claim");
+    assert!(matches!(
+        second.claim_producer(),
+        Err(MultiRingMsgQueueError::ProducerClaimed)
+    ));
+}
+
+#[test]
+fn single_producer_concurrent_fifo_preserves_order_and_reuses_slots() {
+    use hammer_infra::multi_ring_msg_queue::SingleProducer;
+
+    const TOTAL: u64 = 100_000;
+    let cfg = MultiRingMsgQueueCfg {
+        q_nitems: 4096,
+        rings: &[RingCfg {
+            nitems: 1024,
+            elsize: 16,
+        }],
+    };
+    let bytes = MultiRingMsgQueue::<MultiProducer>::layout_bytes(&cfg);
+    let seg = Segment::shared_default();
+    let off = seg.alloc(bytes, 64).expect("queue allocation");
+    unsafe { MultiRingMsgQueue::<SingleProducer>::init_at(seg.clone(), off, &cfg) }
+        .expect("SP init");
+
+    let mut queue = unsafe { MultiRingMsgQueue::<SingleProducer>::from_shared(seg.clone(), off) }
+        .expect("consumer mapping");
+    let producer = queue.claim_producer().expect("claim producer");
+
+    let consumer = thread::spawn(move || {
+        let mut expected = 0u64;
+        while expected < TOTAL {
+            if let Some(msg) = queue.sub() {
+                let bytes: [u8; 16] = msg.as_slice().try_into().expect("elsize 16");
+                let value = u64::from_le_bytes(bytes[..8].try_into().expect("value"));
+                assert_eq!(value, expected, "FIFO order violated");
+                expected += 1;
+                // Drop returns the slot in order; a freelist/ABA bug would
+                // surface here as a duplicate or corrupted sequence value.
+            }
+        }
+        assert!(queue.sub().is_none());
+        expected
+    });
+
+    let mut producer = producer;
+    for i in 0..TOTAL {
+        loop {
+            match producer.reserve(0) {
+                Ok(mut reservation) => {
+                    let payload = reservation.payload_mut();
+                    payload[..8].copy_from_slice(&i.to_le_bytes());
+                    payload[8..].fill(0);
+                    reservation.publish();
+                    break;
+                }
+                Err(MultiRingMsgQueueError::RingFull | MultiRingMsgQueueError::QueueFull) => {
+                    thread::yield_now();
+                }
+                Err(other) => panic!("unexpected {other:?}"),
+            }
+        }
+    }
+
+    assert_eq!(consumer.join().expect("consumer"), TOTAL);
 }

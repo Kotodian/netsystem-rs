@@ -12,7 +12,7 @@ use hammer_runtime::app::{
     ApplicationConnectionId, ApplicationId, ApplicationListenerId, SessionAppId,
     SessionAppRegistration, SessionMsgQueue, SessionMsgQueueError,
 };
-use hammer_runtime::attach::ApplicationMqPublication;
+use hammer_runtime::attach::{ApplicationMqPublication, ExtConfigStore};
 use hammer_runtime::{AttachError, DataWorkerId, RuntimeError};
 use thiserror::Error;
 
@@ -33,10 +33,11 @@ pub(crate) struct ApplicationListener {
 
 pub(crate) struct ApplicationConnection {
     application: ApplicationId,
+    context: u64,
     app: Option<SessionAppId>,
     opaque: Option<u64>,
     server_name: Option<String>,
-    completion: AtomicU8,
+    connect_state: AtomicU8,
 }
 
 impl ApplicationListener {
@@ -60,6 +61,11 @@ impl ApplicationConnection {
     #[inline]
     pub(crate) const fn application(&self) -> ApplicationId {
         self.application
+    }
+
+    #[inline]
+    pub(crate) const fn context(&self) -> u64 {
+        self.context
     }
 
     #[inline]
@@ -88,6 +94,7 @@ pub struct ApplicationMqResources {
     segment: Segment,
     queues: Box<[Arc<SessionMsgQueue>]>,
     offsets: Box<[u64]>,
+    ext_config: Option<ExtConfigStore>,
 }
 
 impl ApplicationMqResources {
@@ -154,12 +161,33 @@ impl ApplicationMqResources {
             queues.push(Arc::new(queue));
             offsets.push(offset);
         }
+        // The bounded ext-config store (QUIC/TLS Session control data) lives
+        // in the Rx MQ segment from the headroom and is published to the
+        // Application with the queues; the Application allocates one fixed
+        // chunk per connect and the daemon reads and frees it exactly once
+        // (VPP ext_config uword ownership, session_node.c:80-100).
+        let ext_config = segment
+            .alloc(ExtConfigStore::layout_bytes(), 64)
+            .map(|offset| {
+                // SAFETY: the segment has enough bytes at `offset` for the
+                // whole store layout, and this is the only initializer for
+                // this offset.
+                unsafe { ExtConfigStore::init_at(segment.clone(), offset as usize) }
+            })
+            .ok_or(ApplicationError::MqSegmentExhausted)?;
         Ok(Self {
             application,
             segment,
             queues: queues.into_boxed_slice(),
             offsets: offsets.into_boxed_slice(),
+            ext_config: Some(ext_config),
         })
+    }
+
+    /// The bounded ext-config store for this Application's Session control
+    /// data, when the segment carried headroom for one.
+    pub(crate) fn ext_config_store(&self) -> Option<ExtConfigStore> {
+        self.ext_config.clone()
     }
 
     #[inline]
@@ -177,13 +205,17 @@ impl ApplicationMqResources {
             self.segment.clone(),
             self.queues.clone(),
             self.offsets.clone(),
+            self.ext_config
+                .as_ref()
+                .map(|store| store.offset() as u64)
+                .unwrap_or(0),
         )
         .map_err(|source| ApplicationError::MqPublication { source })
     }
 }
 
-const CONNECTION_PENDING: u8 = 0;
-const CONNECTION_COMPLETED: u8 = 1;
+const CONNECTION_CONNECTING: u8 = 0;
+const CONNECTION_CONNECTED: u8 = 1;
 
 /// Main Thread authority for Application identity and lifetime.
 pub struct ApplicationMain {
@@ -200,8 +232,8 @@ const APP_MQ_SEGMENT_HEADROOM: usize = 1 << 20;
 // mutation or removal occurs only while WorkerBarrier stops those readers.
 // ApplicationRegistration remains !Send.
 unsafe impl Send for ApplicationMain {}
-// SAFETY: worker reads follow the publication contract above, and connection
-// completion changes only its dedicated atomic state.
+// SAFETY: worker reads follow the publication contract above, and the
+// connecting/connected transition changes only its dedicated atomic state.
 unsafe impl Sync for ApplicationMain {}
 
 impl ApplicationMain {
@@ -370,6 +402,25 @@ impl ApplicationMain {
         resources.publication()
     }
 
+    /// Runs `operation` against the stored Rx MQ resources of `application`.
+    ///
+    /// The control path uses this to read and free one ext-config chunk
+    /// owned by the Application (see `ExtConfigStore`).
+    pub(crate) fn with_application_mq<R>(
+        &self,
+        application: ApplicationId,
+        operation: impl FnOnce(&ApplicationMqResources) -> Result<R, ApplicationError>,
+    ) -> Result<R, ApplicationError> {
+        let resources = self
+            .state()?
+            .mq_resources
+            .get(application.slot() as usize)
+            .and_then(Option::as_ref)
+            .filter(|resources| resources.application == application)
+            .ok_or(ApplicationError::Missing { application })?;
+        operation(resources)
+    }
+
     pub fn contains(&self, application: ApplicationId) -> Result<bool, ApplicationError> {
         Ok(self
             .state()?
@@ -473,6 +524,7 @@ impl ApplicationMain {
     pub fn register_connection(
         &self,
         application: ApplicationId,
+        context: u64,
         server_name: Option<String>,
         app: Option<SessionAppId>,
         opaque: Option<u64>,
@@ -481,24 +533,31 @@ impl ApplicationMain {
         self.validate_session_app(app)?;
         let connection = ApplicationConnection {
             application,
+            context,
             app,
             opaque,
             server_name,
-            completion: AtomicU8::new(CONNECTION_PENDING),
+            connect_state: AtomicU8::new(CONNECTION_CONNECTING),
         };
         self.with_state_mut(|state| {
-            let completed = state
+            // Reap connected entries ahead of the primary insert. VPP
+            // session_free is void best-effort cleanup (session.c:258-265):
+            // a vanished entry is logged, never fatal to the insert.
+            let connected = state
                 .connections
                 .iter()
                 .filter_map(|(index, connection)| {
-                    (connection.completion.load(Ordering::Acquire) == CONNECTION_COMPLETED)
+                    (connection.connect_state.load(Ordering::Acquire) == CONNECTION_CONNECTED)
                         .then_some(index)
                 })
                 .collect::<Vec<_>>();
-            for index in completed {
-                state.connections.remove(index).expect(
-                    "completed Application connection remains present until allocation reclaim",
-                );
+            for index in connected {
+                if state.connections.remove(index).is_none() {
+                    tracing::warn!(
+                        ?index,
+                        "connected Application connection vanished before reap"
+                    );
+                }
             }
             state
                 .connections
@@ -525,24 +584,24 @@ impl ApplicationMain {
             .ok_or(ApplicationError::ConnectionMissing { connection })
     }
 
-    pub(crate) fn complete_connection(
+    pub(crate) fn mark_connected(
         &self,
         connection: ApplicationConnectionId,
     ) -> Result<(), ApplicationError> {
         let entry =
             self.with_connection(connection, |entry| entry as *const ApplicationConnection)?;
         // SAFETY: the entry remains published until Main Thread observes the
-        // completed state under the worker barrier and reaps it.
+        // connected state under the worker barrier and reaps it.
         let entry = unsafe { &*entry };
         entry
-            .completion
+            .connect_state
             .compare_exchange(
-                CONNECTION_PENDING,
-                CONNECTION_COMPLETED,
+                CONNECTION_CONNECTING,
+                CONNECTION_CONNECTED,
                 Ordering::AcqRel,
                 Ordering::Acquire,
             )
-            .map_err(|_| ApplicationError::ConnectionAlreadyCompleted { connection })?;
+            .map_err(|_| ApplicationError::ConnectionAlreadyConnected { connection })?;
         Ok(())
     }
 
@@ -566,7 +625,7 @@ impl ApplicationMain {
             state
                 .connections
                 .remove(application_connection_index(connection))
-                .expect("validated Application connection remains present until removal");
+                .ok_or(ApplicationError::ConnectionMissing { connection })?;
             Ok(())
         })?
     }
@@ -588,15 +647,13 @@ impl ApplicationMain {
                     connection,
                 });
             }
-            if entry.completion.load(Ordering::Acquire) != CONNECTION_COMPLETED {
-                return Err(ApplicationError::ConnectionNotCompleted { connection });
+            if entry.connect_state.load(Ordering::Acquire) != CONNECTION_CONNECTED {
+                return Err(ApplicationError::ConnectionNotConnected { connection });
             }
             state
                 .connections
                 .remove(application_connection_index(connection))
-                .expect(
-                    "validated completed Application connection remains present until reclamation",
-                );
+                .ok_or(ApplicationError::ConnectionMissing { connection })?;
             Ok(())
         })?
     }
@@ -882,10 +939,10 @@ pub enum ApplicationError {
         application: ApplicationId,
         connection: ApplicationConnectionId,
     },
-    #[error("Application connection {connection:?} was already completed")]
-    ConnectionAlreadyCompleted { connection: ApplicationConnectionId },
-    #[error("Application connection {connection:?} is not completed")]
-    ConnectionNotCompleted { connection: ApplicationConnectionId },
+    #[error("Application connection {connection:?} was already connected")]
+    ConnectionAlreadyConnected { connection: ApplicationConnectionId },
+    #[error("Application connection {connection:?} is not connected")]
+    ConnectionNotConnected { connection: ApplicationConnectionId },
 }
 
 #[inline]
@@ -921,7 +978,6 @@ fn application_connection_index(connection: ApplicationConnectionId) -> Index {
 #[cfg(test)]
 mod tests {
     use hammer_runtime::DataWorkerId;
-    use hammer_runtime::app::SessionEventQueue;
 
     use super::{
         ApplicationConnectionId, ApplicationError, ApplicationId, ApplicationMain,
@@ -932,7 +988,7 @@ mod tests {
         main: &ApplicationMain,
         application: ApplicationId,
     ) -> ApplicationConnectionId {
-        main.register_connection(application, None, None, None)
+        main.register_connection(application, 0, None, None, None)
             .expect("register Application connection")
     }
 
@@ -978,15 +1034,15 @@ mod tests {
     }
 
     #[test]
-    fn completed_connection_reclaims_exact_identity_without_later_connect() {
+    fn connected_connection_reclaims_exact_identity_without_later_connect() {
         let main = ApplicationMain::new(1);
         let application = main.attach().expect("attach Application");
         let connection = register_connection(&main, application);
 
-        main.complete_connection(connection)
-            .expect("complete Application connection");
+        main.mark_connected(connection)
+            .expect("mark Application connection connected");
         main.reclaim_connection(application, connection)
-            .expect("reclaim completed Application connection");
+            .expect("reclaim connected Application connection");
 
         assert_eq!(
             main.state()
@@ -1000,34 +1056,34 @@ mod tests {
     }
 
     #[test]
-    fn register_connection_reclaims_completed_connections_before_capacity_check() {
+    fn register_connection_reclaims_connected_connections_before_capacity_check() {
         let main = ApplicationMain::new(1);
         let application = main.attach().expect("attach Application");
-        let completed = register_connection(&main, application);
+        let connected = register_connection(&main, application);
 
-        main.complete_connection(completed)
-            .expect("complete Application connection");
+        main.mark_connected(connected)
+            .expect("mark Application connection connected");
         let replacement = register_connection(&main, application);
 
-        assert_ne!(completed, replacement);
+        assert_ne!(connected, replacement);
         assert!(matches!(
-            main.with_connection(completed, |_| ()),
-            Err(ApplicationError::ConnectionMissing { connection }) if connection == completed
+            main.with_connection(connected, |_| ()),
+            Err(ApplicationError::ConnectionMissing { connection }) if connection == connected
         ));
         assert!(main.with_connection(replacement, |_| ()).is_ok());
     }
 
     #[test]
-    fn reclamation_uses_exact_completion_identity_in_any_order() {
+    fn reclamation_uses_exact_connect_state_identity_in_any_order() {
         let main = ApplicationMain::new(4);
         let application = main.attach().expect("attach Application");
         let first = register_connection(&main, application);
         let second = register_connection(&main, application);
 
-        main.complete_connection(second)
-            .expect("complete second Application connection");
-        main.complete_connection(first)
-            .expect("complete first Application connection");
+        main.mark_connected(second)
+            .expect("mark second Application connection connected");
+        main.mark_connected(first)
+            .expect("mark first Application connection connected");
         main.reclaim_connection(application, second)
             .expect("reclaim second Application connection");
         main.reclaim_connection(application, first)
@@ -1043,17 +1099,17 @@ mod tests {
     }
 
     #[test]
-    fn pending_connection_is_not_reclaimed() {
+    fn connecting_connection_is_not_reclaimed() {
         let main = ApplicationMain::new(1);
         let application = main.attach().expect("attach Application");
         let connection = register_connection(&main, application);
 
         let error = main
             .reclaim_connection(application, connection)
-            .expect_err("pending Application connection is not reclaimable");
+            .expect_err("connecting Application connection is not reclaimable");
         assert!(matches!(
             error,
-            ApplicationError::ConnectionNotCompleted { connection: rejected }
+            ApplicationError::ConnectionNotConnected { connection: rejected }
                 if rejected == connection
         ));
     }
@@ -1064,8 +1120,8 @@ mod tests {
         let application = main.attach().expect("attach Application");
         let first = register_connection(&main, application);
 
-        main.complete_connection(first)
-            .expect("complete first Application connection");
+        main.mark_connected(first)
+            .expect("mark first Application connection connected");
         main.reclaim_connection(application, first)
             .expect("reclaim first Application connection");
         let replacement = register_connection(&main, application);
@@ -1082,22 +1138,22 @@ mod tests {
     }
 
     #[test]
-    fn detach_removes_pending_and_completed_connections() {
+    fn detach_removes_connecting_and_connected_connections() {
         let main = ApplicationMain::new(2);
         let application = main.attach().expect("attach Application");
-        let pending = register_connection(&main, application);
-        let completed = register_connection(&main, application);
+        let connecting = register_connection(&main, application);
+        let connected = register_connection(&main, application);
 
-        main.complete_connection(completed)
-            .expect("complete Application connection");
+        main.mark_connected(connected)
+            .expect("mark Application connection connected");
         main.detach(application)
-            .expect("detach Application with pending and completed connections");
+            .expect("detach Application with connecting and connected connections");
 
         let state = main.state().expect("read Application state");
         assert!(state.applications.is_empty());
         assert!(state.connections.is_empty());
         assert!(matches!(
-            main.reclaim_connection(application, pending),
+            main.reclaim_connection(application, connecting),
             Err(ApplicationError::Missing { application: missing })
                 if missing == application
         ));

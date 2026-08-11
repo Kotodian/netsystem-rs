@@ -12,6 +12,7 @@ use super::{
 };
 use crate::connection::assembler::{Assembler, Chunk, IllegalOrderedRead};
 use crate::connection::streams::state::StreamRecv;
+use crate::range_set::RangeSet;
 use crate::{frame, TransportError, VarInt};
 
 #[derive(Debug, Default)]
@@ -21,6 +22,11 @@ pub(super) struct Recv {
     pub(super) assembler: Option<Assembler>,
     sent_max_stream_data: u64,
     pub(super) end: u64,
+    /// Contiguous received boundary (VPP quicly recvstate `data_off`).
+    contiguous: u64,
+    /// Delivered ranges starting beyond the contiguous boundary, promoted as
+    /// the hole before them fills (VPP quicly recvstate `received.ranges`).
+    pending_ooo: RangeSet,
     pub(super) stopped: bool,
     bytes_read: u64,
     pub(super) io: Option<StreamDataIo>,
@@ -33,6 +39,8 @@ impl Recv {
             assembler: io.is_none().then(Assembler::new),
             sent_max_stream_data: initial_max_data,
             end: 0,
+            contiguous: 0,
+            pending_ooo: RangeSet::new(),
             stopped: false,
             bytes_read: 0,
             io,
@@ -48,6 +56,8 @@ impl Recv {
         }
         self.sent_max_stream_data = initial_max_data;
         self.end = 0;
+        self.contiguous = 0;
+        self.pending_ooo = RangeSet::new();
         self.stopped = false;
         self.bytes_read = 0;
         self.io = io;
@@ -106,6 +116,23 @@ impl Recv {
                         Bytes::copy_from_slice(frame.data),
                         payload_len,
                     );
+            }
+            // VPP quicly recvstate `data_off`: the contiguous boundary
+            // advances only when a frame starts at or before it; previously
+            // delivered out-of-order ranges are promoted as the hole before
+            // them fills.
+            if frame.offset <= self.contiguous {
+                self.contiguous = self.contiguous.max(end);
+                while let Some(pending) = self.pending_ooo.pop_min() {
+                    if pending.start <= self.contiguous {
+                        self.contiguous = self.contiguous.max(pending.end);
+                    } else {
+                        self.pending_ooo.insert(pending.start..pending.end);
+                        break;
+                    }
+                }
+            } else {
+                self.pending_ooo.insert(frame.offset..end);
             }
         }
 
@@ -222,6 +249,18 @@ impl Recv {
         match self.state {
             RecvState::Recv { size } => size,
             RecvState::ResetRecvd { size, .. } => Some(size),
+        }
+    }
+
+    /// Whether the peer finished sending on this stream (final offset known
+    /// via FIN, not reset) and every byte through the final offset has been
+    /// received contiguously. VPP `quicly_recvstate_transfer_complete`
+    /// compares the contiguous `data_off` against `received.end`; drives the
+    /// RX half-close notification.
+    pub(super) fn receive_transfer_complete(&self) -> bool {
+        match self.state {
+            RecvState::Recv { size: Some(size) } => self.contiguous == size,
+            RecvState::Recv { size: None } | RecvState::ResetRecvd { .. } => false,
         }
     }
 
@@ -545,6 +584,91 @@ mod tests {
             offset,
             len: data.len() as u64,
         })
+    }
+
+    #[test]
+    fn receive_transfer_complete_requires_contiguous_receive() {
+        let mut s = Recv::new(1024, None);
+        let id = StreamId::new(Side::Client, Dir::Uni, 0);
+        // The FIN arrives for bytes 4..5 while bytes 0..4 are still missing:
+        // the final offset is known but the transfer is not complete until
+        // the earlier range fills the hole (VPP `quicly_recvstate_transfer_
+        // complete` compares the contiguous `data_off` against the end).
+        s.ingest(
+            frame::Stream {
+                id,
+                offset: 4,
+                fin: true,
+                data: &[1],
+            },
+            1,
+            4,
+            1024,
+        )
+        .unwrap();
+        assert!(
+            !s.receive_transfer_complete(),
+            "final offset known with a missing earlier range must not be transfer complete"
+        );
+        // Filling the hole makes the receive contiguous and completes the
+        // transfer exactly once.
+        s.ingest(
+            frame::Stream {
+                id,
+                offset: 0,
+                fin: false,
+                data: &[0; 4],
+            },
+            4,
+            0,
+            1024,
+        )
+        .unwrap();
+        assert!(s.receive_transfer_complete());
+        // A reset still excludes transfer completion.
+        s.reset(VarInt::from_u32(1), VarInt::from_u32(5), 4, 1024)
+            .unwrap();
+        assert!(!s.receive_transfer_complete());
+    }
+
+    #[test]
+    fn receive_transfer_complete_tracks_fin_and_excludes_reset() {
+        let mut s = Recv::new(1024, None);
+        let id = StreamId::new(Side::Client, Dir::Uni, 0);
+        // Data without FIN: final offset unknown, transfer not complete.
+        assert!(!s.receive_transfer_complete());
+        s.ingest(
+            frame::Stream {
+                id,
+                offset: 0,
+                fin: false,
+                data: &[0; 4],
+            },
+            4,
+            0,
+            1024,
+        )
+        .unwrap();
+        assert!(!s.receive_transfer_complete());
+        // FIN at the final offset: transfer complete (RX half-close).
+        s.ingest(
+            frame::Stream {
+                id,
+                offset: 4,
+                fin: true,
+                data: &[1],
+            },
+            1,
+            4,
+            1024,
+        )
+        .unwrap();
+        assert!(s.receive_transfer_complete());
+        // A reset that observes the same final offset must not report
+        // transfer complete: FIN and reset are distinct peer signals.
+        s.reset(VarInt::from_u32(1), VarInt::from_u32(5), 4, 1024)
+            .unwrap();
+        assert!(!s.receive_transfer_complete());
     }
 
     #[test]

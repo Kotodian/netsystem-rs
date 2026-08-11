@@ -133,9 +133,18 @@ impl<Index: Copy + Eq> SessionState<Index> {
                 *self = Self::Closed(ClosedState { index: state.index });
                 false
             }
+            // A published (accepted-waiting or not-yet-connected) Session that
+            // the transport closes records the closing state without notifying
+            // the Application yet: for accepted children the close is resent
+            // when the Application replies to ACCEPTED (VPP
+            // `session_mq_accepted_reply_handler`, session_node.c:556-563
+            // resends the close when `old_state >= TRANSPORT_CLOSING`).
+            Self::Published(state) => {
+                *self = Self::TransportClosed(TransportClosedState { index: state.index });
+                false
+            }
             Self::Creating
             | Self::Created(_)
-            | Self::Published(_)
             | Self::TransportClosed(_)
             | Self::Closed(_)
             | Self::TransportDeleted => false,
@@ -242,6 +251,31 @@ mod tests {
         let active = published.on_connected().expect("active session");
         assert!(active.rollback_index().is_err());
         assert_eq!(active.transport_index(), Some(index));
+    }
+
+    #[test]
+    fn published_session_transport_close_records_closing_state_without_notifying() {
+        // An accepted child sits in Published until the Application replies to
+        // ACCEPTED. A transport close during that wait is recorded without
+        // notifying (VPP session_node.c:556-563 resends it when the reply
+        // arrives); a plain Active session still notifies immediately.
+        let index = Index::new(2, 5);
+        let mut state = SessionState::creating()
+            .finish_creation(index)
+            .expect("created session")
+            .on_connection_published()
+            .expect("published session")
+            .0;
+        let mut notifications = 0;
+        if state.on_transport_close(index) {
+            notifications += 1;
+        }
+        assert_eq!(notifications, 0);
+        assert!(matches!(state, SessionState::TransportClosed(_)));
+        assert_eq!(state.transport_index(), Some(index));
+        assert!(!state.on_app_close());
+        assert!(matches!(state, SessionState::Closed(_)));
+        assert!(state.on_transport_deleted(index));
     }
 
     fn active_state(index: Index) -> SessionState<Index> {

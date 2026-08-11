@@ -8,14 +8,16 @@ use std::sync::Arc;
 
 use hammer_infra::segment::Segment;
 use hammer_runtime::app::{
-    AppSession, ApplicationId, ApplicationSessionMqError, ApplicationSessionStatus, SessionHandle,
-    SessionMsgQueue, SessionOffsets,
+    AppSession, AppSessionError, ApplicationId, SessionAcceptedMsg, SessionBoundMsg,
+    SessionConnectError, SessionConnectedMsg, SessionControlDecodeError, SessionControlError,
+    SessionEvtType, SessionHandle, SessionMsgQueue, SessionMsgQueueError, SessionOffsets,
+    SessionProducer, SessionUnlistenReplyMsg, SingleProducer,
 };
 use hammer_runtime::attach::{
     APPLICATION_MQ_BASE_DESCRIPTOR_COUNT, APPLICATION_MQ_METADATA_BYTES,
     APPLICATION_MQ_METADATA_WORDS, ATTACH_DESCRIPTOR_COUNT, ATTACH_METADATA_BYTES,
     ATTACH_METADATA_WORDS, ATTACH_PROTOCOL_VERSION, ATTACH_REPLY_BYTES, ATTACH_REPLY_WORDS,
-    ATTACH_REQUEST_BYTES, ATTACH_STATUS_ACCEPTED, MAX_ATTACH_DESCRIPTORS,
+    ATTACH_REQUEST_BYTES, ATTACH_STATUS_ACCEPTED, ExtConfigStore, MAX_ATTACH_DESCRIPTORS,
 };
 use thiserror::Error;
 
@@ -68,6 +70,13 @@ pub enum AppClientError {
         #[source]
         source: std::io::Error,
     },
+    #[error("bounded ext-config storage published by the daemon is invalid")]
+    ExtConfig {
+        #[source]
+        source: hammer_runtime::AttachError,
+    },
+    #[error("the daemon published no bounded ext-config storage for this Application")]
+    ExtConfigStoreMissing,
     #[error(
         "Application MQ worker {worker} offset {offset} is outside segment size {segment_size}"
     )]
@@ -105,7 +114,17 @@ pub enum AppClientError {
     #[error("Application Session MQ operation failed")]
     SessionControl {
         #[source]
-        source: ApplicationSessionMqError,
+        source: SessionMsgQueueError,
+    },
+    #[error("Application Session control payload could not be decoded")]
+    SessionControlDecode {
+        #[source]
+        source: SessionControlDecodeError,
+    },
+    #[error("failed to reconstruct the Application Session")]
+    SessionFromSegment {
+        #[source]
+        source: AppSessionError,
     },
     #[error("failed while waiting for an Application Session reply")]
     SessionReplyWait {
@@ -114,13 +133,15 @@ pub enum AppClientError {
     },
     #[error("Application Session reply context mismatch: expected {expected}, got {actual}")]
     SessionReplyContext { expected: u64, actual: u64 },
-    #[error("Application Session request was rejected with status {status:?}")]
-    SessionRejected { status: ApplicationSessionStatus },
-    #[error("Application connection {connection:?} failed with status {status:?}")]
+    #[error("Application Session request was rejected: {error}")]
+    SessionRejected { error: SessionControlError },
+    #[error("Application connection {connection:?} failed: {error}")]
     SessionConnectFailed {
         connection: hammer_runtime::app::ApplicationConnectionId,
-        status: ApplicationSessionStatus,
+        error: SessionConnectError,
     },
+    #[error("Application Session emitted unexpected event {event:?}")]
+    UnexpectedSessionEvent { event: SessionEvtType },
     #[error("Application Session handle mismatch: expected {expected:?}, got {actual:?}")]
     SessionHandleMismatch {
         expected: SessionHandle,
@@ -128,14 +149,64 @@ pub enum AppClientError {
     },
 }
 
+/// One typed Application Session control message buffered by the client.
+///
+/// The client's single reply inbox: service messages (BOUND,
+/// UNLISTEN_REPLY, CONNECTED, ACCEPTED) are pushed in arrival order and
+/// consumed by context or Session handle. This is the in-memory typed view of
+/// the wire control slot; it is never serialized itself.
+#[derive(Debug)]
+pub enum ControlReply {
+    Bound(SessionBoundMsg),
+    Unlisten(SessionUnlistenReplyMsg),
+    Connected(SessionConnectedMsg),
+    Accepted(SessionAcceptedMsg),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ControlReplyKind {
+    Bound,
+    Unlisten,
+    Connected,
+    Accepted,
+}
+
+impl ControlReply {
+    #[inline]
+    pub fn kind(&self) -> ControlReplyKind {
+        match self {
+            Self::Bound(_) => ControlReplyKind::Bound,
+            Self::Unlisten(_) => ControlReplyKind::Unlisten,
+            Self::Connected(_) => ControlReplyKind::Connected,
+            Self::Accepted(_) => ControlReplyKind::Accepted,
+        }
+    }
+
+    #[inline]
+    pub(crate) fn context(&self) -> u64 {
+        match self {
+            Self::Bound(reply) => reply.context,
+            Self::Unlisten(reply) => reply.context,
+            Self::Connected(reply) => reply.context,
+            Self::Accepted(reply) => reply.context,
+        }
+    }
+}
+
 pub struct AppClient {
     stream: UnixStream,
     application: ApplicationId,
-    pub(crate) session_requests: SessionMsgQueue,
-    pub(crate) session_replies: SessionMsgQueue,
+    /// The Application-owned single-producer capability for Session control
+    /// requests. The daemon maps the same queue as a consumer only; it never
+    /// claims the producer.
+    pub(crate) session_requests: RefCell<SessionProducer>,
+    /// The Application-side consumer of Session control replies. The daemon
+    /// owns the reply single-producer capability.
+    pub(crate) session_replies: RefCell<SessionMsgQueue<SingleProducer>>,
     rx_mqs: Box<[Arc<SessionMsgQueue>]>,
+    pub(crate) ext_config: Option<ExtConfigStore>,
     pub(crate) next_session_context: u64,
-    pub(crate) pending_replies: RefCell<VecDeque<hammer_runtime::app::ApplicationSessionReply>>,
+    pub(crate) pending_replies: RefCell<VecDeque<ControlReply>>,
 }
 
 impl AppClient {
@@ -227,8 +298,11 @@ impl AppClient {
             control_segment_size,
         )
         .map_err(|source| AppClientError::SessionControlSegmentMap { source })?;
+        // The Application owns the request single-producer capability: it is
+        // claimed once here (a daemon-side claim would be a typed error) and
+        // outlives the mapping.
         let session_requests = unsafe {
-            SessionMsgQueue::from_shared(
+            SessionMsgQueue::<SingleProducer>::from_shared(
                 control_segment.clone(),
                 words[2],
                 None,
@@ -239,9 +313,12 @@ impl AppClient {
                         .into_raw_fd(),
                 ),
             )
-        };
+        }
+        .map_err(|source| AppClientError::SessionControl { source })?
+        .claim_producer()
+        .map_err(|source| AppClientError::SessionControl { source })?;
         let session_replies = unsafe {
-            SessionMsgQueue::from_shared(
+            SessionMsgQueue::<SingleProducer>::from_shared(
                 control_segment,
                 words[3],
                 Some(
@@ -252,7 +329,8 @@ impl AppClient {
                 ),
                 None,
             )
-        };
+        }
+        .map_err(|source| AppClientError::SessionControl { source })?;
         let rx_mqs_segment = Segment::from_fd(
             descriptors
                 .next()
@@ -263,6 +341,17 @@ impl AppClient {
         .map_err(|source| AppClientError::ApplicationMqSegmentMap { source })?;
         let rx_mq_offsets =
             descriptor::words_slice(&metadata, APPLICATION_MQ_METADATA_WORDS, worker_count)?;
+        let ext_config = if words[6] == 0 {
+            None
+        } else if words[6] < rx_mqs_segment_size as u64 {
+            ExtConfigStore::from_shared(rx_mqs_segment.clone(), words[6] as usize)
+                .map(Some)
+                .map_err(|source| AppClientError::ExtConfig { source })?
+        } else {
+            return Err(AppClientError::ExtConfig {
+                source: hammer_runtime::AttachError::ExtConfigOffsetOutOfRange,
+            });
+        };
         let mut rx_mqs = Vec::with_capacity(worker_count);
         for worker in 0..worker_count {
             let offset = rx_mq_offsets[worker];
@@ -273,29 +362,60 @@ impl AppClient {
                     segment_size: rx_mqs_segment.size() as u64,
                 });
             }
-            rx_mqs.push(Arc::new(unsafe {
-                SessionMsgQueue::from_shared(
-                    rx_mqs_segment.clone(),
-                    offset,
-                    None,
-                    Some(
-                        descriptors
-                            .next()
-                            .expect("validated attach descriptor count")
-                            .into_raw_fd(),
-                    ),
-                )
-            }));
+            rx_mqs.push(Arc::new(
+                unsafe {
+                    SessionMsgQueue::from_shared(
+                        rx_mqs_segment.clone(),
+                        offset,
+                        None,
+                        Some(
+                            descriptors
+                                .next()
+                                .expect("validated attach descriptor count")
+                                .into_raw_fd(),
+                        ),
+                    )
+                }
+                .map_err(|source| AppClientError::SessionControl { source })?,
+            ));
         }
         Ok(Self {
             stream,
             application,
-            session_requests,
-            session_replies,
+            session_requests: RefCell::new(session_requests),
+            session_replies: RefCell::new(session_replies),
             rx_mqs: rx_mqs.into_boxed_slice(),
+            ext_config,
             next_session_context: 1,
             pending_replies: RefCell::new(VecDeque::new()),
         })
+    }
+
+    /// Control-queue seam for hammer-vcl MQ protocol tests: builds a client
+    /// over an existing Session control request/reply queue pair, without the
+    /// attach handshake. `stream` is the descriptor stream: established-Session
+    /// methods (`accept` / `accept_with_handle`) read the production attach
+    /// metadata and SCM_RIGHTS descriptors from it, so the test must deliver
+    /// them in the daemon format (or avoid those methods). `rx_mqs` is the
+    /// per-worker Application Rx MQ set selected by
+    /// `handle.worker_index()`; no ext-config store is attached.
+    pub fn with_queues(
+        stream: UnixStream,
+        application: ApplicationId,
+        requests: SessionProducer,
+        replies: SessionMsgQueue<SingleProducer>,
+        rx_mqs: Box<[Arc<SessionMsgQueue>]>,
+    ) -> Self {
+        Self {
+            stream,
+            application,
+            session_requests: RefCell::new(requests),
+            session_replies: RefCell::new(replies),
+            rx_mqs,
+            ext_config: None,
+            next_session_context: 1,
+            pending_replies: RefCell::new(VecDeque::new()),
+        }
     }
 
     #[inline]
@@ -307,7 +427,15 @@ impl AppClient {
         self.accept_with_handle(None)
     }
 
-    pub(crate) fn accept_with_handle(
+    /// Reconstructs one established App Session from the published attach
+    /// descriptors, verifying the received Session handle against
+    /// `expected_handle` when given.
+    ///
+    /// This is the established-session seam consumed by `hammer-vcl`: the
+    /// CONNECTED/ACCEPTED control message carries the Session handle and
+    /// flags, and the descriptors arrive on the attach stream; the caller
+    /// preserves the flags from the control message itself.
+    pub fn accept_with_handle(
         &self,
         expected_handle: Option<SessionHandle>,
     ) -> Result<AppSession, AppClientError> {
@@ -366,7 +494,7 @@ impl AppClient {
                     worker,
                     worker_count: self.rx_mqs.len(),
                 })?;
-        Ok(unsafe {
+        unsafe {
             AppSession::from_segment(
                 handle,
                 &session_segment,
@@ -379,6 +507,7 @@ impl AppClient {
                 ),
                 worker_queue,
             )
-        })
+        }
+        .map_err(|source| AppClientError::SessionFromSegment { source })
     }
 }

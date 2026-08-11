@@ -11,7 +11,7 @@
 use hammer_app::attach::{AppClient, AppClientError};
 use hammer_app::echo::run_echo_loop;
 use hammer_app::{AppSession, AppSessionError, DataWorkerId, SessionListenEndpoint};
-use hammer_runtime::app::SessionEvtType;
+use hammer_runtime::app::{SessionEvtType, TransportProtocol};
 
 const DEFAULT_ATTACH_SOCKET: &str = "/tmp/hammer-tcp-integration.attach.sock";
 const DEFAULT_LISTEN_ADDRESS: &str = "10.66.77.1:7300";
@@ -56,7 +56,7 @@ fn main() -> Result<(), EchoError> {
         .map_err(|source| EchoError::TokioRuntime { source })?;
     let mut client = AppClient::attach(&socket_path)?;
     let listener = client.listen(
-        "tcp",
+        TransportProtocol::Tcp,
         SessionListenEndpoint::new(listen_address, DataWorkerId::new(0)),
         None,
         None,
@@ -85,6 +85,14 @@ async fn run_echo(session: &AppSession) -> Result<(), EchoError> {
         }
         match event.evt_type {
             SessionEvtType::Connect
+            | SessionEvtType::ConnectStream
+            | SessionEvtType::Bound
+            | SessionEvtType::Listen
+            | SessionEvtType::Unlisten
+            | SessionEvtType::UnlistenReply
+            | SessionEvtType::Accepted
+            | SessionEvtType::AcceptedReply
+            | SessionEvtType::Connected
             | SessionEvtType::RxDeq
             | SessionEvtType::TxEnq
             | SessionEvtType::ProtocolOutput => {}

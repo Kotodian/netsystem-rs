@@ -187,7 +187,10 @@ impl<T> fmt::Debug for ThreadOwned<T> {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
             .debug_struct("ThreadOwned")
-            .field("installed", &(self.state.load(Ordering::Relaxed) == INSTALLED))
+            .field(
+                "installed",
+                &(self.state.load(Ordering::Relaxed) == INSTALLED),
+            )
             .finish_non_exhaustive()
     }
 }

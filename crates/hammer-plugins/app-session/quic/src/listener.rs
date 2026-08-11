@@ -32,6 +32,8 @@ pub(crate) enum QuicListenerError {
     LocalEndpointMissing,
     #[error("QUIC active connect endpoint family mismatch between local and remote")]
     ConnectEndpointMismatch,
+    #[error("QUIC stream connect requires a parent Session handle")]
+    ParentSessionMissing,
     #[error("QUIC worker graph setup failed: {setup}; attachment rollback failed: {cleanup}")]
     WorkerGraphRollbackFailed {
         setup: RuntimeError,
@@ -150,7 +152,7 @@ impl QuicMain {
                     applications
                         .remove_listener(self.inner_application, inner_application_listener)
                         .expect("failed QUIC inner listen leaves Application listener available");
-                    return Err(error);
+                    return Err(error.into());
                 }
             };
 
@@ -374,6 +376,7 @@ pub(crate) fn connect(endpoint: SessionConnectEndpoint) -> RuntimeResult<()> {
         .applications()
         .register_connection(
             main.inner_application,
+            endpoint.connection.raw(),
             None,
             Some(main.session_app),
             Some(context.into()),
@@ -413,12 +416,50 @@ pub(crate) fn connect(endpoint: SessionConnectEndpoint) -> RuntimeResult<()> {
             .map_err(|_| RuntimeError::DataWorkerCallCanceled {
                 worker: worker.slot(),
             })?;
-        return Err(error);
+        return Err(error.into());
     }
     main.sessions
         .applications()
         .reclaim_connection(main.inner_application, inner_connection)
         .map_err(RuntimeError::from)?;
+    Ok(())
+}
+
+pub(crate) fn connect_stream(endpoint: SessionConnectEndpoint) -> RuntimeResult<()> {
+    let main = QUIC_MAIN
+        .get()
+        .ok_or(RuntimeError::PluginStateNotInitialized { plugin: "quic" })?;
+    let parent = endpoint
+        .parent_handle
+        .ok_or(QuicListenerError::ParentSessionMissing)?;
+    let worker = endpoint.worker;
+    let connection = endpoint.connection;
+    let flags = endpoint.flags;
+    let (completion, completed) = mpsc::sync_channel(1);
+
+    Engine::with_current(|engine| {
+        engine.schedule_on_worker(worker, {
+            let main = Arc::clone(main);
+            move || {
+                let result = hammer_runtime::with_data_plane_runtime(|runtime| {
+                    main.sessions.with_worker_mut(runtime, |sessions| {
+                        main.with_worker_and_sessions(sessions, |sessions, quic| {
+                            quic.connect_stream(sessions, parent, connection, flags)
+                                .map(|_| ())
+                        })
+                    })
+                });
+                let _ = completion.send(result);
+            }
+        })
+    })
+    .ok_or(RuntimeError::WorkerControlRequiresMainEngine)??;
+
+    completed
+        .recv()
+        .map_err(|_| RuntimeError::DataWorkerCallCanceled {
+            worker: worker.slot(),
+        })??;
     Ok(())
 }
 
@@ -555,6 +596,15 @@ mod tests {
     static LISTEN_OPAQUE: AtomicU64 = AtomicU64::new(0);
     static LISTEN_BARRIER: AtomicBool = AtomicBool::new(false);
     static STOP_LISTENER: AtomicU64 = AtomicU64::new(0);
+
+    #[test]
+    fn quic_transport_registration_exposes_connect_stream() {
+        assert!(
+            crate::worker::__SESSION_TRANSPORT_QUIC_WORKER
+                .connect_stream()
+                .is_some()
+        );
+    }
 
     fn install_session_app(_: &mut Engine) -> RuntimeResult<()> {
         Ok(())

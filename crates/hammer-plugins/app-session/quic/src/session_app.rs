@@ -40,10 +40,9 @@ fn publish_context(
     context: ContextId,
 ) -> RuntimeResult<()> {
     if let Err(error) = worker.set_app_session(session, context.into()) {
-        assert!(
-            with_quic_worker(worker, |quic| quic.remove_context(context)).is_ok(),
-            "QUIC Session App context rollback failed"
-        );
+        // Rollback is best effort and must not replace the primary
+        // set_app_session error; QUIC_MAIN may already be gone during teardown.
+        let _ = with_quic_worker(worker, |quic| quic.remove_context(context));
         return Err(error);
     }
     Ok(())
@@ -96,14 +95,10 @@ fn connected(
         quic.send_packets(sessions, connection, Instant::now())
     })
     .map_err(|error| {
-        assert!(
-            with_quic_worker(worker, |quic| quic.remove_context(connection)).is_ok(),
-            "QUIC active connect rollback failed"
-        );
-        assert!(
-            worker.set_app_session(session, 0).is_ok(),
-            "QUIC active connect Session rollback failed"
-        );
+        // Rollback is best effort and must not replace the primary
+        // send_packets error; QUIC_MAIN may already be gone during teardown.
+        let _ = with_quic_worker(worker, |quic| quic.remove_context(connection));
+        let _ = worker.set_app_session(session, 0);
         error
     })
 }
@@ -160,7 +155,9 @@ fn close_lower_connection(
     context: SessionAppContext,
 ) -> RuntimeResult<()> {
     if context == 0 {
-        return Err(QuicSessionError::ContextMissing { session }.into());
+        // Late lifecycle notification after finalize_connection cleared the
+        // lower Session's app context: teardown is already complete.
+        return Ok(());
     }
     let context = ContextId::from(context);
     let main = QUIC_MAIN
@@ -189,11 +186,14 @@ fn destroy(worker: DataWorkerId, context: SessionAppContext) {
         return;
     }
     let context = ContextId::from(context);
-    QUIC_MAIN
-        .get()
-        .expect("QUIC Main exists during Session App destruction")
-        .with_worker(worker, |quic| quic.remove_context(context))
-        .expect("QUIC Session App context is removed exactly once");
+    // A nonzero stale context is a no-op like VPP's invalid-context early
+    // return in quic_quicly_on_app_closed; QUIC_MAIN may already be gone
+    // during teardown, and destroy cannot report a Result, so removal is
+    // best effort and idempotent.
+    let Some(main) = QUIC_MAIN.get() else {
+        return;
+    };
+    let _ = main.with_worker(worker, |quic| quic.remove_context(context));
 }
 
 pub(crate) static CALLBACKS: SessionAppCallbacks = SessionAppCallbacks {
@@ -213,6 +213,8 @@ pub(crate) static QUIC_SESSION_APP: SessionAppRegistration =
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+
     use super::*;
 
     #[test]
@@ -223,5 +225,66 @@ mod tests {
         assert!(CALLBACKS.builtin_rx.is_some());
         assert!(CALLBACKS.builtin_tx.is_some());
         assert!(CALLBACKS.cleanup.is_some());
+    }
+
+    #[test]
+    fn zero_context_lower_lifecycle_callback_is_idempotent() {
+        // QUIC_MAIN is unset in this unit test, so this also proves the
+        // zero-context path succeeds without requiring QUIC_MAIN.
+        let applications = hammer_service::session::ApplicationMain::new(4);
+        let mut sessions = SessionWorker::<Index>::new(
+            DataWorkerId::new(0),
+            1,
+            hammer_runtime::app::AppSessionConfig::default(),
+            64,
+            Arc::clone(&applications),
+            None,
+        )
+        .expect("test SessionWorker");
+        let close = CALLBACKS
+            .transport_closed
+            .expect("transport_closed callback");
+        close(&mut sessions, SessionId::from_raw(123), 0).expect("zero-context close succeeds");
+    }
+
+    #[test]
+    fn publish_context_keeps_set_app_session_error_when_rollback_unavailable() {
+        // set_app_session fails for a session outside the worker's pool, and
+        // the rollback path cannot reach QUIC_MAIN, so publish_context must
+        // return the original set_app_session error instead of panicking.
+        let applications = hammer_service::session::ApplicationMain::new(4);
+        let mut sessions = SessionWorker::<Index>::new(
+            DataWorkerId::new(0),
+            1,
+            hammer_runtime::app::AppSessionConfig::default(),
+            64,
+            Arc::clone(&applications),
+            None,
+        )
+        .expect("test SessionWorker");
+        let error = publish_context(
+            &mut sessions,
+            SessionId::from_raw(123),
+            ContextId::from(1u64),
+        )
+        .expect_err("set_app_session fails for an unknown session");
+        assert!(
+            matches!(
+                error,
+                RuntimeError::Subsystem {
+                    subsystem: "session",
+                    ..
+                }
+            ),
+            "original set_app_session error expected, got {error:?}"
+        );
+    }
+
+    #[test]
+    fn destroy_with_stale_context_is_noop_without_quic_main() {
+        // destroy cannot return a Result, so a stale nonzero context must be
+        // dropped silently when QUIC_MAIN is unavailable, mirroring VPP's
+        // invalid-context no-op in quic_quicly_on_app_closed.
+        destroy(DataWorkerId::new(0), 42);
     }
 }

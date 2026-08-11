@@ -76,7 +76,7 @@ mod tests {
 
         assert_eq!(session.drop_tx_acked(8).expect("release TX capacity"), 8);
         assert!(
-            std::iter::from_fn(|| session.evt_q().dequeue())
+            std::iter::from_fn(|| session.evt_q().dequeue().ok().flatten())
                 .any(|event| event.evt_type == SessionEvtType::TxDeq)
         );
         assert_eq!(

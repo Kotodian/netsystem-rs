@@ -4,10 +4,11 @@ use tokio::net::TcpListener;
 
 pub async fn clnt_loop(listener: TcpListener) {
     loop {
-        if hammer_runtime::engine::Engine::with_current(|engine| {
-            engine.main_loop_exit_now.load(Ordering::Relaxed)
-        })
-        .unwrap_or(true)
+        if crate::ipc_handlers::SHUTDOWN_REQUESTED.load(Ordering::Acquire)
+            || hammer_runtime::engine::Engine::with_current(|engine| {
+                engine.main_loop_exit_now.load(Ordering::Relaxed)
+            })
+            .unwrap_or(true)
         {
             return;
         }
@@ -67,10 +68,11 @@ async fn conn_loop(stream: tokio::net::TcpStream) {
                             tracing::error!("IPC write error: {e}");
                             break;
                         }
-                        if hammer_runtime::engine::Engine::with_current(|engine| {
-                            engine.main_loop_exit_now.load(Ordering::Relaxed)
-                        })
-                        .unwrap_or(true)
+                        if crate::ipc_handlers::SHUTDOWN_REQUESTED.load(Ordering::Acquire)
+                            || hammer_runtime::engine::Engine::with_current(|engine| {
+                                engine.main_loop_exit_now.load(Ordering::Relaxed)
+                            })
+                            .unwrap_or(true)
                         {
                             return;
                         }

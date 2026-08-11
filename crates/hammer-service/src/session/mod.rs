@@ -12,9 +12,9 @@ pub mod app;
 pub mod application;
 pub mod config;
 mod control;
-mod lookup;
 pub mod error;
 pub mod id;
+mod lookup;
 pub mod node;
 pub mod protocol;
 pub mod runtime;
@@ -63,10 +63,7 @@ fn init_session(
 }
 
 #[hammer_component_macros::main_loop_exit_function]
-fn exit_session(
-    _engine: &mut Engine,
-    main: Arc<runtime::SessionMain>,
-) -> RuntimeResult<()> {
+fn exit_session(_engine: &mut Engine, main: Arc<runtime::SessionMain>) -> RuntimeResult<()> {
     main.begin_session_migration_shutdown();
     Ok(())
 }

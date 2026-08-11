@@ -28,6 +28,7 @@ fn one_application_mq_full_does_not_block_another_application_mq() {
     assert_eq!(
         second
             .dequeue()
+            .expect("dequeue")
             .expect("second Application event")
             .session_index(),
         9
@@ -35,6 +36,7 @@ fn one_application_mq_full_does_not_block_another_application_mq() {
     assert_eq!(
         first
             .dequeue()
+            .expect("dequeue")
             .expect("first Application event")
             .session_index(),
         1

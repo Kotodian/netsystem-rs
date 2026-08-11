@@ -1,6 +1,6 @@
 use std::net::SocketAddr;
 
-use crate::app::ApplicationId;
+use crate::app::{ApplicationId, SessionFlags, SessionHandle};
 use crate::{DataWorkerId, RuntimeResult};
 
 /// Opaque Session-layer listener identity supplied to one selected transport.
@@ -72,6 +72,8 @@ pub struct SessionConnectEndpoint {
     pub worker: DataWorkerId,
     pub connection: SessionConnectionId,
     pub application: ApplicationId,
+    pub parent_handle: Option<SessionHandle>,
+    pub flags: SessionFlags,
     pub opaque: Option<u64>,
     pub server_name: Option<String>,
 }
@@ -93,6 +95,32 @@ impl SessionConnectEndpoint {
             worker,
             connection,
             application,
+            parent_handle: None,
+            flags: SessionFlags::empty(),
+            opaque,
+            server_name,
+        }
+    }
+    #[inline]
+    pub const fn new_stream(
+        remote: SocketAddr,
+        local: Option<SocketAddr>,
+        worker: DataWorkerId,
+        connection: SessionConnectionId,
+        application: ApplicationId,
+        parent_handle: SessionHandle,
+        flags: SessionFlags,
+        opaque: Option<u64>,
+        server_name: Option<String>,
+    ) -> Self {
+        Self {
+            remote,
+            local,
+            worker,
+            connection,
+            application,
+            parent_handle: Some(parent_handle),
+            flags: flags.union(SessionFlags::STREAM),
             opaque,
             server_name,
         }
@@ -123,6 +151,8 @@ pub type SessionTransportStartListen = fn(
     SessionListenEndpoint,
 ) -> RuntimeResult<()>;
 pub type SessionTransportStopListen = fn(SessionListenerId) -> RuntimeResult<()>;
+pub type SessionTransportConnect = fn(SessionConnectEndpoint) -> RuntimeResult<()>;
+pub type SessionTransportConnectStream = fn(SessionConnectEndpoint) -> RuntimeResult<()>;
 
 /// Static operations registered by one transport plugin.
 #[derive(Debug, Clone, Copy)]
@@ -130,7 +160,8 @@ pub struct SessionTransportRegistration {
     name: &'static str,
     start_listen: Option<SessionTransportStartListen>,
     stop_listen: Option<SessionTransportStopListen>,
-    connect: Option<fn(SessionConnectEndpoint) -> RuntimeResult<()>>,
+    connect: Option<SessionTransportConnect>,
+    connect_stream: Option<SessionTransportConnectStream>,
 }
 
 impl SessionTransportRegistration {
@@ -140,13 +171,32 @@ impl SessionTransportRegistration {
         name: &'static str,
         start_listen: Option<SessionTransportStartListen>,
         stop_listen: Option<SessionTransportStopListen>,
-        connect: Option<fn(SessionConnectEndpoint) -> RuntimeResult<()>>,
+        connect: Option<SessionTransportConnect>,
     ) -> Self {
         Self {
             name,
             start_listen,
             stop_listen,
             connect,
+            connect_stream: None,
+        }
+    }
+
+    #[doc(hidden)]
+    #[inline]
+    pub const fn with_connect_stream(
+        name: &'static str,
+        start_listen: Option<SessionTransportStartListen>,
+        stop_listen: Option<SessionTransportStopListen>,
+        connect: Option<SessionTransportConnect>,
+        connect_stream: Option<SessionTransportConnectStream>,
+    ) -> Self {
+        Self {
+            name,
+            start_listen,
+            stop_listen,
+            connect,
+            connect_stream,
         }
     }
 
@@ -166,7 +216,12 @@ impl SessionTransportRegistration {
     }
 
     #[inline]
-    pub const fn connect(self) -> Option<fn(SessionConnectEndpoint) -> RuntimeResult<()>> {
+    pub const fn connect(self) -> Option<SessionTransportConnect> {
         self.connect
+    }
+
+    #[inline]
+    pub const fn connect_stream(self) -> Option<SessionTransportConnectStream> {
+        self.connect_stream
     }
 }

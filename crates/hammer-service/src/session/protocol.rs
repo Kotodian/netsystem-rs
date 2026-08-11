@@ -16,12 +16,8 @@ pub type SessionAppSegmentCallback<Index = hammer_infra::pool::Index> =
     fn(&mut SessionWorker<Index>, u64, SessionAppContext) -> RuntimeResult<()>;
 
 /// VPP `session_cb_vft_t.migrate` callback with the old and new handles.
-pub type SessionAppMigrateCallback<Index = hammer_infra::pool::Index> = fn(
-    &mut SessionWorker<Index>,
-    SessionId,
-    SessionHandle,
-    SessionAppContext,
-) -> RuntimeResult<()>;
+pub type SessionAppMigrateCallback<Index = hammer_infra::pool::Index> =
+    fn(&mut SessionWorker<Index>, SessionId, SessionHandle, SessionAppContext) -> RuntimeResult<()>;
 
 /// Concrete static callback table matching VPP `session_cb_vft_t`.
 ///

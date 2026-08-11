@@ -9,10 +9,9 @@ use hammer_infra::segment::Segment;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::Notify;
 
-use crate::app::SessionMsgQueue;
 use crate::app::{
-    AppSession, ApplicationId, ApplicationSessionMqError, ApplicationSessionReply,
-    SessionEventQueue, SessionMsgQueueError, SessionOffsets, enqueue_application_session_reply,
+    AppSession, ApplicationId, SessionAcceptedMsg, SessionConnectedMsg, SessionControlPayload,
+    SessionMsgQueue, SessionMsgQueueError, SessionOffsets, SessionProducer, SingleProducer,
 };
 use crate::{AttachError, RuntimeError, RuntimeResult};
 
@@ -23,11 +22,12 @@ use application::{ApplicationAttachment, AttachedApplication};
 
 pub use application::{
     ApplicationMqPublication, BASE_DESCRIPTOR_COUNT as APPLICATION_MQ_BASE_DESCRIPTOR_COUNT,
+    EXT_CONFIG_CHUNK_BYTES, EXT_CONFIG_CHUNK_COUNT, ExtConfigStore,
     METADATA_BYTES as APPLICATION_MQ_METADATA_BYTES,
     METADATA_WORDS as APPLICATION_MQ_METADATA_WORDS,
 };
 
-pub const ATTACH_PROTOCOL_VERSION: u64 = 3;
+pub const ATTACH_PROTOCOL_VERSION: u64 = 4;
 pub const ATTACH_REQUEST_BYTES: usize = size_of::<u64>();
 pub const ATTACH_REPLY_WORDS: usize = 3;
 pub const ATTACH_REPLY_BYTES: usize = ATTACH_REPLY_WORDS * size_of::<u64>();
@@ -44,7 +44,8 @@ pub struct AppSessionPublication {
     application: ApplicationId,
     session_segment: Segment,
     offsets: SessionOffsets,
-    completion: Option<ApplicationSessionReply>,
+    connected: Option<SessionConnectedMsg>,
+    accepted: Option<SessionAcceptedMsg>,
     descriptors_sent: bool,
 }
 
@@ -66,16 +67,33 @@ impl AppSessionPublication {
             application,
             session_segment,
             offsets,
-            completion: None,
+            connected: None,
+            accepted: None,
             descriptors_sent: false,
         })
     }
 
-    /// Attaches the VPP `session_connected_msg_t` completion to a Session
-    /// publication. The attach server sends descriptors first, then writes
-    /// this completion to the existing CTRL reply queue.
-    pub fn set_connect_completion(&mut self, completion: ApplicationSessionReply) {
-        self.completion = Some(completion);
+    /// Completes the Session with a CONNECTED control payload. At most one of
+    /// `set_connected`/`set_accepted` is set; CONNECTED wins when both are.
+    pub fn set_connected(&mut self, message: SessionConnectedMsg) {
+        self.connected = Some(message);
+    }
+
+    /// Completes the Session with an ACCEPTED control payload. Fails when a
+    /// message is already set: CONNECTED wins when both would apply, and an
+    /// accepted publication must not silently replace either one.
+    pub fn set_accepted(&mut self, message: SessionAcceptedMsg) -> Result<(), AttachError> {
+        if self.connected.is_some() || self.accepted.is_some() {
+            return Err(AttachError::AcceptedPublicationUnavailable);
+        }
+        self.accepted = Some(message);
+        Ok(())
+    }
+
+    /// The retained ACCEPTED message, when the publication has not yet been
+    /// delivered to an attached Application.
+    pub fn accepted_message(&self) -> Option<SessionAcceptedMsg> {
+        self.accepted.clone()
     }
 }
 
@@ -83,7 +101,7 @@ enum AppPublication {
     Session(AppSessionPublication),
     ConnectFailed {
         application: ApplicationId,
-        reply: ApplicationSessionReply,
+        message: SessionConnectedMsg,
     },
 }
 
@@ -116,12 +134,12 @@ impl AppSessionPublisher {
         Ok(())
     }
 
-    /// Queues an active-connect failure completion on the existing attach
+    /// Queues an active-connect failure message on the existing attach
     /// publication queue. No Session descriptors are sent.
     pub fn try_publish_connect_failure(
         &self,
         application: ApplicationId,
-        reply: ApplicationSessionReply,
+        reply: SessionConnectedMsg,
     ) -> RuntimeResult<()> {
         let queue = self
             .queue
@@ -129,7 +147,10 @@ impl AppSessionPublisher {
             .ok_or(AttachError::PublicationQueueClosed)?;
         queue
             .entries
-            .push(AppPublication::ConnectFailed { application, reply })
+            .push(AppPublication::ConnectFailed {
+                application,
+                message: reply,
+            })
             .map_err(|_| AttachError::PublicationQueueFull)?;
         queue.ready.notify_one();
         Ok(())
@@ -183,7 +204,11 @@ impl AppServer {
     where
         Attach: Fn() -> Result<ApplicationId, ApplicationError>,
         Mq: Fn(ApplicationId) -> Result<ApplicationMqPublication, ApplicationError>,
-        Control: Fn(ApplicationId, &SessionMsgQueue, &SessionMsgQueue) -> RuntimeResult<()>,
+        Control: Fn(
+            ApplicationId,
+            &mut SessionMsgQueue<SingleProducer>,
+            &mut SessionProducer,
+        ) -> RuntimeResult<()>,
         Detached: Fn(ApplicationId),
         ApplicationError: std::fmt::Display,
     {
@@ -208,35 +233,30 @@ impl AppServer {
                     AppPublication::Session(publication) => publication.application,
                     AppPublication::ConnectFailed { application, .. } => *application,
                 };
-                match clients
-                    .get(&application)
-                    .map(|client| Arc::clone(&client.stream))
-                {
-                    Some(client) => {
-                        let replies = Arc::clone(&clients[&application].replies);
-                        let mut publication = publication;
-                        match send_publication(&client, &replies, &mut publication).await {
-                            Ok(()) => {}
-                            Err(PublicationSendError::Retry) => {
-                                publications
-                                    .entry(application)
-                                    .or_default()
-                                    .push_front(publication);
-                            }
-                            Err(PublicationSendError::Fatal(error)) => {
-                                tracing::warn!(%error, ?application, "failed to publish App Session");
-                                if clients.remove(&application).is_some() {
-                                    publications.remove(&application);
-                                    application_detached(application);
-                                }
-                            }
-                        }
-                    }
-                    None => {
+                let Some(client) = clients.get_mut(&application) else {
+                    publications
+                        .entry(application)
+                        .or_default()
+                        .push_back(publication);
+                    continue;
+                };
+                let stream = Arc::clone(&client.stream);
+                let replies = &mut client.replies;
+                let mut publication = publication;
+                match send_publication(&stream, replies, &mut publication).await {
+                    Ok(()) => {}
+                    Err(PublicationSendError::Retry) => {
                         publications
                             .entry(application)
                             .or_default()
-                            .push_back(publication);
+                            .push_front(publication);
+                    }
+                    Err(PublicationSendError::Fatal(error)) => {
+                        tracing::warn!(%error, ?application, "failed to publish App Session");
+                        if clients.remove(&application).is_some() {
+                            publications.remove(&application);
+                            application_detached(application);
+                        }
                     }
                 }
             }
@@ -295,10 +315,26 @@ impl AppServer {
                             continue;
                         }
                     };
-                    assert!(
-                        !clients.contains_key(&application),
-                        "Application attach allocated an identity already held by a live client"
-                    );
+                    // VPP rejects a duplicate attach with SESSION_E_APP_ATTACHED
+                    // before allocating and the API handler replies with an error
+                    // retval, leaving the first application attached
+                    // (application.c:1138-1139, session_api.c:775-781). Mirror
+                    // that: reject the duplicate client and keep the live client,
+                    // so no `application_detached` for the colliding identity.
+                    if clients.contains_key(&application) {
+                        tracing::warn!(
+                            ?application,
+                            "Application attach reused an identity held by a live client"
+                        );
+                        if let Err(error) = send_attach_reply(
+                            &mut client,
+                            ATTACH_STATUS_REJECTED,
+                            None,
+                        ).await {
+                            tracing::warn!(%error, "failed to reject Application attach");
+                        }
+                        continue;
+                    }
                     let application_mqs = match application_mq_publication(application) {
                         Ok(application_mqs) => application_mqs,
                         Err(error) => {
@@ -394,8 +430,14 @@ impl AppServer {
                         let _ = detached_tx.send(application).await;
                     });
                     if let Some(mut pending) = publications.remove(&application) {
-                        let replies = Arc::clone(&clients[&application].replies);
-                        match flush_publications(&client, &replies, &mut pending).await {
+                        let Some(replies) = clients
+                            .get_mut(&application)
+                            .map(|client| &mut client.replies)
+                        else {
+                            publications.insert(application, pending);
+                            continue;
+                        };
+                        match flush_publications(&client, replies, &mut pending).await {
                             Ok(()) | Err(PublicationSendError::Retry) => {
                                 if !pending.is_empty() {
                                     publications.insert(application, pending);
@@ -411,13 +453,13 @@ impl AppServer {
                     }
                 }
                 Some(application) = control_rx.recv() => {
-                    let Some(client) = clients.get(&application) else {
+                    let Some(client) = clients.get_mut(&application) else {
                         continue;
                     };
                     if let Err(error) = application_session_control(
                         application,
-                        &client.requests,
-                        &client.replies,
+                        &mut client.requests,
+                        &mut client.replies,
                     ) {
                         tracing::error!(%error, ?application, "Application Session MQ dispatch failed");
                         if clients.remove(&application).is_some() {
@@ -452,8 +494,14 @@ impl AppServer {
                             publications.insert(application, pending);
                             continue;
                         };
-                        let replies = Arc::clone(&clients[&application].replies);
-                        match flush_publications(&client, &replies, &mut pending).await {
+                        let Some(replies) = clients
+                            .get_mut(&application)
+                            .map(|client| &mut client.replies)
+                        else {
+                            publications.insert(application, pending);
+                            continue;
+                        };
+                        match flush_publications(&client, replies, &mut pending).await {
                             Ok(()) | Err(PublicationSendError::Retry) => {
                                 if !pending.is_empty() {
                                     publications.insert(application, pending);
@@ -495,11 +543,13 @@ async fn send_attach_reply(
 
 async fn send_publication(
     client: &tokio::net::UnixStream,
-    replies: &SessionMsgQueue,
+    replies: &mut SessionProducer,
     current: &mut AppPublication,
 ) -> Result<(), PublicationSendError> {
     match current {
-        AppPublication::ConnectFailed { reply, .. } => enqueue_completion(replies, reply),
+        AppPublication::ConnectFailed { message, .. } => {
+            enqueue_publication_control(replies, message)
+        }
         AppPublication::Session(current) => {
             if !current.descriptors_sent {
                 let descriptors: [RawFd; ATTACH_DESCRIPTOR_COUNT] = [
@@ -533,9 +583,10 @@ async fn send_publication(
                     .map_err(PublicationSendError::Fatal)?;
                 current.descriptors_sent = true;
             }
-            match current.completion {
-                Some(reply) => enqueue_completion(replies, &reply),
-                None => Ok(()),
+            match (&current.connected, &current.accepted) {
+                (Some(connected), _) => enqueue_publication_control(replies, connected),
+                (None, Some(accepted)) => enqueue_publication_control(replies, accepted),
+                (None, None) => Ok(()),
             }
         }
     }
@@ -543,7 +594,7 @@ async fn send_publication(
 
 async fn flush_publications(
     client: &tokio::net::UnixStream,
-    replies: &SessionMsgQueue,
+    replies: &mut SessionProducer,
     pending: &mut VecDeque<AppPublication>,
 ) -> Result<(), PublicationSendError> {
     while let Some(mut publication) = pending.pop_front() {
@@ -559,15 +610,15 @@ async fn flush_publications(
     Ok(())
 }
 
-fn enqueue_completion(
-    replies: &SessionMsgQueue,
-    reply: &ApplicationSessionReply,
+fn enqueue_publication_control<M: SessionControlPayload>(
+    replies: &mut SessionProducer,
+    message: &M,
 ) -> Result<(), PublicationSendError> {
-    match enqueue_application_session_reply(replies, reply) {
+    match replies.enqueue_control(message) {
         Ok(()) => Ok(()),
-        Err(ApplicationSessionMqError::ReplyEnqueue {
-            source: SessionMsgQueueError::ControlFull,
-        }) => Err(PublicationSendError::Retry),
-        Err(error) => Err(PublicationSendError::Fatal(error.into())),
+        Err(SessionMsgQueueError::ControlFull) => Err(PublicationSendError::Retry),
+        Err(error) => Err(PublicationSendError::Fatal(
+            AttachError::SessionControl { source: error }.into(),
+        )),
     }
 }

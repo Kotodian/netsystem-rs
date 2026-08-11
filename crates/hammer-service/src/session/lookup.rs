@@ -43,19 +43,14 @@ impl SessionEndpointState {
 
 impl SessionEndpointKey {
     #[inline]
-    fn new(
-        local: SocketAddr,
-        remote: SocketAddr,
-        transport: SessionTransportId,
-    ) -> Option<Self> {
+    fn new(local: SocketAddr, remote: SocketAddr, transport: SessionTransportId) -> Option<Self> {
         if local.is_ipv4() != remote.is_ipv4() {
             return None;
         }
         let (local_hi, local_lo) = ip_words(local);
         let (remote_hi, remote_lo) = ip_words(remote);
         Some(Self([
-            (u64::from(transport.raw()) << 8)
-                | u64::from(if local.is_ipv4() { 4u8 } else { 6u8 }),
+            (u64::from(transport.raw()) << 8) | u64::from(if local.is_ipv4() { 4u8 } else { 6u8 }),
             local_hi,
             local_lo,
             remote_hi,

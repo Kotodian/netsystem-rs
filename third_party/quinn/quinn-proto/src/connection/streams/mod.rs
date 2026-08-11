@@ -254,6 +254,19 @@ impl RecvStream<'_> {
 
         Ok(Some(code))
     }
+
+    /// Whether the peer finished sending on this stream (final offset known
+    /// via FIN, not reset) and every byte through the final offset has been
+    /// received. Read-only RX half-close query (VPP
+    /// `quicly_recvstate_transfer_complete`).
+    pub fn receive_transfer_complete(&self) -> bool {
+        self.state
+            .recv
+            .get(&self.id)
+            .and_then(|entry| entry.as_ref())
+            .and_then(|stream| stream.as_open_recv())
+            .is_some_and(|recv| recv.receive_transfer_complete())
+    }
 }
 
 /// Access to streams
@@ -470,6 +483,17 @@ impl<'a> SendStream<'a> {
             .ok_or(ClosedStream { _private: () })?;
 
         Ok(stream.as_ref().map(|s| s.priority).unwrap_or_default())
+    }
+
+    /// Whether the send side has reached its terminal state (VPP
+    /// `quicly_sendstate_transfer_complete`): a RESET was sent, or the FIN
+    /// was sent and fully acknowledged. Read-only; does not modify state.
+    pub fn send_transfer_complete(&self) -> bool {
+        self.state
+            .send
+            .get(&self.id)
+            .and_then(|entry| entry.as_ref())
+            .is_some_and(|send| send.transfer_complete())
     }
 }
 

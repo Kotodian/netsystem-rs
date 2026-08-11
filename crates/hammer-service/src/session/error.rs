@@ -1,7 +1,7 @@
 use hammer_core::data_plane::NodeId;
 use hammer_infra::fifo::FifoError;
-use hammer_runtime::app::{ApplicationId, ApplicationSessionStatus};
-use hammer_runtime::{RuntimeError, SessionListenerId};
+use hammer_runtime::app::{ApplicationId, SessionControlError, SessionHandle};
+use hammer_runtime::{DataWorkerId, RuntimeError, SessionListenerId};
 use thiserror::Error;
 
 use super::SessionId;
@@ -64,53 +64,11 @@ impl SessionQueueError {
     }
 }
 
-/// One final active-connect failure before a Session exists.
-///
-/// This is the Session-owned error category at the transport-to-Session seam.
-/// Quinn and other transport errors are classified by the owning plugin and
-/// translated once into this type; the wire status remains
-/// [`ApplicationSessionStatus`].
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Error)]
-pub enum SessionConnectError {
-    #[error("TLS alert {alert}")]
-    TlsAlert { alert: u8 },
-    #[error("QUIC version is unsupported")]
-    QuicVersionUnsupported,
-    #[error("QUIC handshake timed out")]
-    TimedOut,
-    #[error("the peer refused the connection")]
-    ConnectionRefused,
-    #[error("the peer reset the connection")]
-    ConnectionReset,
-    #[error("the peer closed the connection with code {code}")]
-    PeerClosed { code: u64 },
-    #[error("QUIC transport error {code}")]
-    QuicTransportError { code: u64 },
-    #[error("local QUIC connection resources are exhausted")]
-    LocalResourceExhausted,
-    #[error("the local connection closed during the handshake")]
-    LocalClosed,
-}
-
-impl From<SessionConnectError> for ApplicationSessionStatus {
-    fn from(error: SessionConnectError) -> Self {
-        match error {
-            SessionConnectError::TlsAlert { alert } => Self::TlsAlert { alert },
-            SessionConnectError::QuicVersionUnsupported => Self::QuicVersionUnsupported,
-            SessionConnectError::TimedOut => Self::HandshakeTimedOut,
-            SessionConnectError::ConnectionRefused => Self::ConnectionRefused,
-            SessionConnectError::ConnectionReset => Self::ConnectionReset,
-            SessionConnectError::PeerClosed { code } => Self::PeerClosed { code },
-            SessionConnectError::QuicTransportError { code } => Self::QuicTransportError { code },
-            SessionConnectError::LocalResourceExhausted => Self::LocalConnectionResourceExhausted,
-            SessionConnectError::LocalClosed => Self::LocalConnectionClosed,
-        }
-    }
-}
+pub use hammer_runtime::app::SessionConnectError;
 
 #[hammer_component_macros::runtime_error(subsystem = "session")]
 #[derive(Debug, Error)]
-pub(crate) enum SessionError {
+pub enum SessionError {
     #[error("session pool capacity {capacity} is exhausted")]
     CapacityExhausted { capacity: usize },
     #[error("session {session_id:?} is not in the session pool")]
@@ -119,6 +77,8 @@ pub(crate) enum SessionError {
     PublicationRejected { session_id: SessionId },
     #[error("session {session_id:?} is active and cannot be rolled back")]
     RollbackRejected { session_id: SessionId },
+    #[error("transport Session {session_id:?} construction did not complete")]
+    TransportSessionCreateIncomplete { session_id: SessionId },
     #[error("session {session_id:?} connection is not published")]
     NotPublished { session_id: SessionId },
     #[error(
@@ -172,6 +132,8 @@ pub(crate) enum SessionError {
     OooSpanInvalid { session_id: SessionId },
     #[error("Session listener state is unavailable on this Data Worker")]
     ListenerMainMissing,
+    #[error("Session has no data workers configured")]
+    NoDataWorkers,
     #[error("Session listener {listener:?} is not registered")]
     ListenerMissing { listener: SessionListenerId },
     #[error("Session listener capacity {capacity} is exhausted")]
@@ -182,6 +144,23 @@ pub(crate) enum SessionError {
     TransportListenUnsupported { transport: &'static str },
     #[error("Session transport `{transport}` does not register active-open")]
     TransportConnectUnsupported { transport: &'static str },
+    #[error("Session transport `{transport}` does not register stream active-open")]
+    TransportConnectStreamUnsupported { transport: &'static str },
+    #[error("Session transport operation failed")]
+    TransportOpFailed {
+        #[source]
+        source: RuntimeError,
+    },
+    #[error("CONNECT_STREAM requires a parent Session handle")]
+    ConnectStreamParentMissing,
+    #[error(
+        "CONNECT_STREAM for parent {parent:?} arrived on worker {actual:?}, expected owner worker {expected:?}"
+    )]
+    ConnectStreamWrongWorker {
+        parent: SessionHandle,
+        expected: DataWorkerId,
+        actual: DataWorkerId,
+    },
     #[error("Session {session_id:?} connect publication failed and its cleanup failed")]
     ConnectPublicationCleanup {
         session_id: SessionId,
@@ -191,39 +170,48 @@ pub(crate) enum SessionError {
     },
 }
 
-#[cfg(test)]
-mod tests {
-    use hammer_runtime::RuntimeError;
-
-    use super::{SessionError, SessionQueueError};
-
-    #[test]
-    fn runtime_conversion_preserves_session_queue_source() {
-        let error: RuntimeError = SessionQueueError::NodeMissing.into();
-        let RuntimeError::Subsystem { subsystem, source } = error else {
-            panic!("session queue conversion must use the runtime subsystem seam");
-        };
-
-        assert_eq!(subsystem, "session queue");
-        assert!(matches!(
-            source.downcast_ref::<SessionQueueError>(),
-            Some(SessionQueueError::NodeMissing)
-        ));
-        assert!(source.source().is_none());
-    }
-
-    #[test]
-    fn runtime_conversion_preserves_session_source() {
-        let error: RuntimeError = SessionError::ListenerMainMissing.into();
-        let RuntimeError::Subsystem { subsystem, source } = error else {
-            panic!("session conversion must use the runtime subsystem seam");
-        };
-
-        assert_eq!(subsystem, "session");
-        assert!(matches!(
-            source.downcast_ref::<SessionError>(),
-            Some(SessionError::ListenerMainMissing)
-        ));
-        assert!(source.source().is_none());
+/// Maps a concrete [`SessionError`] to the control-protocol error the
+/// Application observes, mirroring `From<ApplicationError>`. VPP notifies the
+/// app worker with the specific rv of the failed connect/listen op
+/// (`app_worker_connect_notify` with `rv != SESSION_E_NONE`,
+/// session_node.c:263-267, session.c:1419-1452); every variant is listed
+/// explicitly so an unmapped internal failure cannot silently substitute a
+/// misleading wire error.
+impl From<SessionError> for SessionControlError {
+    fn from(error: SessionError) -> Self {
+        match error {
+            SessionError::CapacityExhausted { .. } => Self::CapacityExhausted,
+            SessionError::ListenerMainMissing => Self::SessionMainUnavailable,
+            SessionError::ListenerMissing { .. } => Self::ListenerMissing,
+            SessionError::ListenerCapacityExhausted { .. } => Self::ListenerCapacityExhausted,
+            SessionError::ListenerControlWrongThread => Self::ApplicationControlWrongThread,
+            SessionError::TransportListenUnsupported { .. } => Self::TransportListenUnsupported,
+            SessionError::TransportConnectUnsupported { .. } => Self::TransportConnectUnsupported,
+            SessionError::TransportConnectStreamUnsupported { .. } => {
+                Self::TransportConnectUnsupported
+            }
+            SessionError::TransportOpFailed { .. } => Self::TransportFailed,
+            SessionError::NoDataWorkers => Self::NoDataWorkers,
+            SessionError::ConnectStreamParentMissing => Self::ConnectStreamParentMissing,
+            SessionError::ConnectStreamWrongWorker { .. } => Self::ConnectStreamWrongWorker,
+            // Session-table internals are never produced by a control op; the
+            // concrete error stays in the source chain for diagnostics while
+            // the wire reports the generic transport failure.
+            SessionError::SessionMissing { .. }
+            | SessionError::PublicationRejected { .. }
+            | SessionError::RollbackRejected { .. }
+            | SessionError::NotPublished { .. }
+            | SessionError::RxOutOfOrderOffsetOverflow { .. }
+            | SessionError::RxOutOfOrderEnqueue { .. }
+            | SessionError::TxOffsetOutOfRange { .. }
+            | SessionError::TxFifoRangeInvalid { .. }
+            | SessionError::RxLengthOverflow { .. }
+            | SessionError::DatagramLengthMismatch { .. }
+            | SessionError::DatagramFifo { .. }
+            | SessionError::OooSpanMissing { .. }
+            | SessionError::OooSpanInvalid { .. }
+            | SessionError::TransportSessionCreateIncomplete { .. }
+            | SessionError::ConnectPublicationCleanup { .. } => Self::TransportFailed,
+        }
     }
 }
