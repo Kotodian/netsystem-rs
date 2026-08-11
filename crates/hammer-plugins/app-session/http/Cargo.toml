@@ -1,0 +1,12 @@
+[package]
+name = "hammer-plugin-http"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+
+[lib]
+name = "hammer_plugin_http"
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+bytes = { workspace = true }
