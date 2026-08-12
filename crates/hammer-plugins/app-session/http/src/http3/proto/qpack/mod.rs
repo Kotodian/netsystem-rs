@@ -5,8 +5,9 @@
 //! string codec (`prefix_string`) with its Huffman coding (`huffman`), the
 //! field line type (`field`), the fixed 99-entry static table
 //! (`static_table`), and the capacity-zero encoded field section prefix
-//! (`block`). Literal and post-base field lines, the encoder and the decoder
-//! are later slices.
+//! (`block`). The literal-with-name-reference field line (Section 4.5.4,
+//! static name only) is implemented in `block`; literal-name, post-base and
+//! the full decoder are later slices.
 //!
 //! References:
 //! - RFC 9204 Section 4.1.1 (prefix integers), Section 4.2 (prefix strings
@@ -53,10 +54,11 @@ pub(crate) enum QpackError {
     /// nonzero delta can only occur in a block that references dynamic
     /// entries.
     NonZeroDeltaBase { sign: u8, delta_base: u64 },
-    /// A dynamic-table reference in an indexed field line (RFC 9204
-    /// Section 4.5.2, T bit clear). This capacity-zero slice has no dynamic
-    /// table, so no dynamic index can be resolved; VPP reports the same
-    /// condition as `HPACK_ERROR_COMPRESSION`.
+    /// A dynamic-table reference in an indexed or literal-with-name-reference
+    /// field line (RFC 9204 Sections 4.5.2 and 4.5.4, T bit clear). This
+    /// capacity-zero slice has no dynamic table, so no dynamic index can be
+    /// resolved; VPP reports the same condition as
+    /// `HPACK_ERROR_COMPRESSION`.
     DynamicReference,
     /// A field-line or static-table index that resolves to no entry. The
     /// fixed 99-entry table (RFC 9204 Appendix A) is the only reference

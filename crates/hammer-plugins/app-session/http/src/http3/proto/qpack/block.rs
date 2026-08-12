@@ -19,13 +19,16 @@
 //! the existing typed errors from `prefix_int`.
 //!
 //! Field line representations (RFC 9204 Sections 4.5.2-4.5.6): this slice
-//! implements the indexed form (Section 4.5.2); literal and post-base
-//! representations are a later slice.
+//! implements the indexed form (Section 4.5.2) and the literal form with
+//! static name reference (Section 4.5.4); literal-name, post-base and the
+//! full decoder are later slices.
+
+use std::borrow::Cow;
 
 use bytes::{Buf, BufMut};
 
 use super::field::HeaderField;
-use super::{QpackError, prefix_int, static_table};
+use super::{QpackError, prefix_int, prefix_string, static_table};
 
 /// Decode the encoded field section prefix (RFC 9204 Section 4.5.1).
 ///
@@ -90,6 +93,66 @@ pub(crate) fn decode_field_line<B: Buf>(
         // keeps it typed rather than unreachable.
         _ => Ok(None),
     }
+}
+
+/// Decode one field line, recognizing only the literal-with-name-reference
+/// representation (RFC 9204 Section 4.5.4, `01N T xxxx`).
+///
+/// T = 1 resolves the 4-bit name index through `static_table::get` in O(1)
+/// and reads the value as an 8-bit-prefix string (RFC 9204 Section 4.2),
+/// returning a field whose name is the borrowed static-table entry and whose
+/// value owns the decoded bytes. The N bit marks the field never-indexed:
+/// it affects the encoder's indexing policy, not the decoded field, so it
+/// is parsed and dropped here.
+///
+/// This mirrors VPP's `case 5`/`case 7` in `qpack_parse_headers`
+/// (`third_party/vpp/src/plugins/http/http3/qpack.c`, qpack.c:982-997): the
+/// 4-bit name index via `hpack_decode_int`, the name-only lookup
+/// `qpack_get_static_table_entry (index, ..., 0)`, and the value via
+/// `qpack_decode_string (&p, end, buf, buf_len, 8)`; `case 7` sets
+/// `never_index` for the N bit, and the encoder writes `*a = never_index ?
+/// 0x70 : 0x50` in `qpack_encode_header` (qpack.c:1057). h3's
+/// `LiteralWithNameRef::decode` (`third_party/h3/h3/src/qpack/block.rs`) is
+/// the Rust reference.
+///
+/// T = 0 is a name reference into the dynamic table, which this
+/// capacity-zero decoder cannot resolve; VPP reports the same condition as
+/// `HPACK_ERROR_COMPRESSION` (`case 4`/`case 6`, qpack.c:998-1001).
+///
+/// The other representations (RFC 9204 Sections 4.5.2, 4.5.3, 4.5.5,
+/// 4.5.6) are handled by sibling decoders: the first byte is only peeked,
+/// so on `Ok(None)` the input is left untouched. Truncated and overflowing
+/// indices and prefix strings propagate the typed errors from `prefix_int`
+/// and `prefix_string`; a name index beyond the fixed 99-entry table is
+/// `QpackError::InvalidIndex`, and a failing value decode surfaces
+/// `QpackError::HuffmanDecoding`.
+pub(crate) fn decode_literal_name_ref<B: Buf>(
+    buf: &mut B,
+) -> Result<Option<HeaderField>, QpackError> {
+    let first = match buf.chunk().first() {
+        Some(&first) => first,
+        // No first byte at all: the field line is truncated, not merely of
+        // another representation.
+        None => return Err(QpackError::UnexpectedEnd),
+    };
+    // The two high bits `01` select this representation.
+    if first & 0b1100_0000 != 0b0100_0000 {
+        return Ok(None);
+    }
+    let (flags, index) = prefix_int::decode(4, buf)?;
+    if flags & 0b0001 == 0 {
+        // T bit clear: a name reference into the dynamic table.
+        return Err(QpackError::DynamicReference);
+    }
+    // The N bit (bit 5 of the first byte) marks the field never-indexed;
+    // it affects the encoder's indexing policy, not the decoded field, so
+    // it is dropped here.
+    let name = static_table::get(index as usize)?.name.clone();
+    let value = prefix_string::decode(8, buf)?;
+    Ok(Some(HeaderField {
+        name,
+        value: Cow::Owned(value),
+    }))
 }
 
 #[cfg(test)]
@@ -267,5 +330,108 @@ mod tests {
     fn decode_field_line_overflow_rejected() {
         let bytes = [0xFF, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80];
         assert_eq!(decode_line(&bytes), Err(QpackError::Overflow));
+    }
+
+    fn decode_literal(bytes: &[u8]) -> Result<Option<HeaderField>, QpackError> {
+        let mut read: &[u8] = bytes;
+        decode_literal_name_ref(&mut read)
+    }
+
+    /// T = 1 with a short index: the name comes from the static table
+    /// (entry 1 is `:path`), the value is the decoded wire string.
+    #[test]
+    fn decode_literal_name_ref_static_short_index() {
+        let mut read: &[u8] = &[0x51, 0x03, b'f', b'o', b'o'];
+        let field = decode_literal_name_ref(&mut read)
+            .expect("decoded")
+            .expect("recognized");
+        assert_eq!(&field.name[..], b":path");
+        assert_eq!(&field.value[..], b"foo");
+        assert!(!read.has_remaining());
+    }
+
+    /// Long name indices use continuation bytes: 0x5F 0x02 is 15 + 2 = 17.
+    #[test]
+    fn decode_literal_name_ref_static_long_index() {
+        let mut read: &[u8] = &[0x5F, 0x02, 0x03, b'f', b'o', b'o'];
+        let field = decode_literal_name_ref(&mut read)
+            .expect("decoded")
+            .expect("recognized");
+        assert_eq!(&field.name[..], b":method");
+        assert_eq!(&field.value[..], b"foo");
+        assert!(!read.has_remaining());
+    }
+
+    /// The N bit (0x70 vs 0x50) marks the field never-indexed; it affects
+    /// indexing policy, not the decoded field, so both forms decode alike.
+    #[test]
+    fn decode_literal_name_ref_never_index_bit_ignored() {
+        let never = decode_literal(&[0x70, 0x03, b'b', b'a', b'r']);
+        let plain = decode_literal(&[0x50, 0x03, b'b', b'a', b'r']);
+        assert_eq!(never, plain);
+    }
+
+    /// A Huffman-coded value decodes through the seam (flag bit set in the
+    /// 8-bit prefix string).
+    #[test]
+    fn decode_literal_name_ref_huffman_value() {
+        let mut out = Vec::new();
+        prefix_string::encode(8, 0, b"foo", &mut out).unwrap();
+        let mut wire = vec![0x50];
+        wire.extend_from_slice(&out);
+        let field = decode_literal(&wire).expect("decoded").expect("recognized");
+        assert_eq!(field.name, static_table::get(0).unwrap().name);
+        assert_eq!(&field.value[..], b"foo");
+    }
+
+    /// T bit clear is a name reference into the dynamic table; with no
+    /// dynamic table this capacity-zero decoder cannot resolve it (RFC
+    /// 9204 Section 4.5.4).
+    #[test]
+    fn decode_literal_name_ref_dynamic_is_typed_error() {
+        let wires: [&[u8]; 2] = [&[0x40, 0x03, b'a'], &[0x60, 0x00]];
+        for wire in wires {
+            assert_eq!(decode_literal(wire), Err(QpackError::DynamicReference));
+        }
+    }
+
+    /// 0x5F 0x54 is 15 + 84 = 99, beyond the fixed 99-entry table.
+    #[test]
+    fn decode_literal_name_ref_out_of_range_index() {
+        assert_eq!(
+            decode_literal(&[0x5F, 0x54, 0x00]),
+            Err(QpackError::InvalidIndex(99))
+        );
+    }
+
+    #[test]
+    fn decode_literal_name_ref_truncated_rejected() {
+        assert_eq!(decode_literal(&[]), Err(QpackError::UnexpectedEnd));
+        assert_eq!(decode_literal(&[0x50]), Err(QpackError::UnexpectedEnd));
+        assert_eq!(
+            decode_literal(&[0x50, 0x05, b'a']),
+            Err(QpackError::UnexpectedEnd)
+        );
+    }
+
+    /// A mid-code Huffman value propagates the typed decode error.
+    #[test]
+    fn decode_literal_name_ref_bad_huffman_value() {
+        assert!(matches!(
+            decode_literal(&[0x50, 0x81, 0xFF]),
+            Err(QpackError::HuffmanDecoding(_))
+        ));
+    }
+
+    /// The other representations are sibling decoders' seams; the first
+    /// byte is left in the input for them.
+    #[test]
+    fn decode_literal_name_ref_ignores_other_representations() {
+        let wires: [&[u8]; 4] = [&[0x00], &[0x10], &[0x20], &[0xC1]];
+        for wire in wires {
+            let mut read: &[u8] = wire;
+            assert_eq!(decode_literal_name_ref(&mut read), Ok(None));
+            assert!(read.has_remaining());
+        }
     }
 }
