@@ -221,6 +221,16 @@ pub(crate) struct StreamContext {
     /// in every stream slot: one pool slot per stream at most, bounded by
     /// the stream pool capacity.
     pub(crate) request_reader: Option<Index>,
+    /// Generation-checked slot of this stream's pending HEADERS field
+    /// section in the worker's separate `pending_field_sections` pool;
+    /// `None` until the first completed field section is retained. Mirrors
+    /// VPP recording the received request on the per-request `http_ctx_t`
+    /// owned by the data worker (`req->headers`, set in
+    /// `http3_req_state_wait_transport_method`, http3.c:835-899) for the
+    /// later app-dispatch stage; the section is not embedded in every stream
+    /// slot: one pool slot per stream at most, bounded by the stream pool
+    /// capacity, freed with the stream.
+    pub(crate) pending_field_section: Option<Index>,
 }
 
 /// Classification role of a peer unidirectional stream once its type varint
@@ -469,6 +479,20 @@ pub(crate) enum HttpWorkerError {
     RequestReaderCapacityExhausted { stream: StreamContextId, capacity: usize },
     #[error("http worker lost the request reader slot {index:?} for stream {stream:?}")]
     RequestReaderMissing { stream: StreamContextId, index: Index },
+    #[error("http stream {stream:?} pending field-section pool is full (capacity {capacity})")]
+    PendingFieldSectionCapacityExhausted {
+        stream: StreamContextId,
+        capacity: usize,
+    },
+    #[error("http worker lost the pending field-section slot {index:?} for stream {stream:?}")]
+    PendingFieldSectionMissing { stream: StreamContextId, index: Index },
+    #[error(
+        "http stream {stream:?} already has a pending HEADERS field section; the newer section is returned unreplaced"
+    )]
+    PendingFieldSectionOverflow {
+        stream: StreamContextId,
+        section: Vec<u8>,
+    },
     #[error("http stream context pool is full (capacity {capacity})")]
     StreamCapacityExhausted { capacity: usize },
     #[error("http stream context {stream:?} is not live")]
@@ -607,6 +631,15 @@ pub(crate) struct HttpWorker {
     /// records the slot, so the reader is not embedded in every stream slot;
     /// the pool is bounded by the stream capacity.
     request_readers: Pool<RequestFrameReader>,
+    /// Generation-checked pool of per-stream pending HEADERS field sections,
+    /// one slot per bidirectional request stream at most.
+    /// `StreamContext::pending_field_section` records the slot; a slot holds
+    /// `Some(section)` while the field section awaits the decode/publish
+    /// seam and `None` after it is taken. The pool is bounded by the stream
+    /// capacity, mirroring VPP keeping the received request on the
+    /// per-request `http_ctx_t` for the later app-dispatch stage
+    /// (`req->headers`, http3.c:835-899).
+    pending_field_sections: Pool<Option<Vec<u8>>>,
 }
 
 impl HttpWorker {
@@ -634,6 +667,7 @@ impl HttpWorker {
             streams: Pool::with_capacity(streams),
             readers: Pool::with_capacity(connections),
             request_readers: Pool::with_capacity(streams),
+            pending_field_sections: Pool::with_capacity(streams),
         }
     }
 
@@ -856,6 +890,7 @@ impl HttpWorker {
                 peer_uni_type: PeerUniStreamTypeDecode::default(),
                 peer_role: PeerUniStreamRole::Unclassified,
                 request_reader: None,
+                pending_field_section: None,
             })
             .map(StreamContextId::from)
             .ok_or(HttpWorkerError::StreamCapacityExhausted {
@@ -1166,8 +1201,10 @@ impl HttpWorker {
     /// (`max_deq - left_deq`) so trailing bytes stay with the caller. Here
     /// the [`RequestFrameReader`] is allocated lazily into the worker's
     /// `request_readers` pool on the first feed and recorded on the stream
-    /// context; a completed `Headers` field section is returned by value and
-    /// never silently stored or dropped.
+    /// context; a completed `Headers` field section is returned by value
+    /// with the worker-owned retention sink
+    /// ([`HttpWorker::retain_pending_field_section`]) as its destination, so
+    /// it is never silently dropped.
     ///
     /// Generation/session-checks the stream context and rejects non-bidi
     /// streams with `RequestStreamNotBidi`. Reader protocol errors surface as
@@ -1240,6 +1277,117 @@ impl HttpWorker {
         feed.map_err(RequestReadError::Protocol)
     }
 
+    /// Retains a completed HEADERS field section in the worker-local pending
+    /// slot of the generation-checked request stream.
+    ///
+    /// The RX seam moves the by-value `Headers(Vec<u8>)` returned by
+    /// [`HttpWorker::process_request_bytes`] into the stream's pending slot,
+    /// mirroring VPP recording the received request on the per-request
+    /// `http_ctx_t` owned by the data worker (`req->headers`, set in
+    /// `http3_req_state_wait_transport_method`, http3.c:835-899) for the
+    /// later app-dispatch stage. A section already pending (an optional
+    /// trailer completing while the initial section was not yet taken) is
+    /// rejected with `PendingFieldSectionOverflow` and the rejected section
+    /// is returned in the error — never silently replaced or discarded; the
+    /// slot content is replaced only after the previous section was
+    /// explicitly taken. O(1); generation/session-checks the stream, then at
+    /// most one pool operation; no lock, no FIFO, no allocation.
+    pub(crate) fn retain_pending_field_section(
+        &mut self,
+        stream: StreamContextId,
+        session: SessionId,
+        section: Vec<u8>,
+    ) -> Result<(), HttpWorkerError> {
+        let mut stream_context = *self
+            .streams
+            .get(stream.into())
+            .ok_or(HttpWorkerError::StreamMissing { stream })?;
+        if stream_context.session != session {
+            return Err(HttpWorkerError::StreamSessionMismatch {
+                stream,
+                expected: session,
+                actual: stream_context.session,
+            });
+        }
+        match stream_context.pending_field_section {
+            None => {
+                let slot = self
+                    .pending_field_sections
+                    .insert(Some(section))
+                    .ok_or(HttpWorkerError::PendingFieldSectionCapacityExhausted {
+                        stream,
+                        capacity: self.pending_field_sections.capacity(),
+                    })?;
+                stream_context.pending_field_section = Some(slot);
+                *self
+                    .streams
+                    .get_mut(stream.into())
+                    .ok_or(HttpWorkerError::StreamMissing { stream })? =
+                    stream_context;
+            }
+            Some(slot) => {
+                let pending = self
+                    .pending_field_sections
+                    .get_mut(slot)
+                    .ok_or(HttpWorkerError::PendingFieldSectionMissing {
+                        stream,
+                        index: slot,
+                    })?;
+                if pending.is_some() {
+                    return Err(HttpWorkerError::PendingFieldSectionOverflow {
+                        stream,
+                        section,
+                    });
+                }
+                *pending = Some(section);
+            }
+        }
+        Ok(())
+    }
+
+    /// Takes the pending HEADERS field section of a generation-checked
+    /// request stream, if any.
+    ///
+    /// Ownership of the retained encoded field section moves to the caller
+    /// (the decode/publish callback seam), and the slot becomes empty but
+    /// stays recorded for a later trailer section. Mirrors the app-dispatch
+    /// stage reading the received request off the per-request `http_ctx_t`
+    /// in VPP (`http3_req_state_wait_app_method`, http3.c:456-475), whose
+    /// state is freed as the stream closes (`http3_stream_free_req`,
+    /// http3.c:59-78). `Ok(None)` when nothing is pending; a stale stream
+    /// identity is rejected with `StreamMissing`, so a reused slot can never
+    /// be observed by an old stream. O(1); generation/session-checks the
+    /// stream, then one generation-checked pool access; no lock, no FIFO, no
+    /// allocation.
+    pub(crate) fn take_pending_field_section(
+        &mut self,
+        stream: StreamContextId,
+        session: SessionId,
+    ) -> Result<Option<Vec<u8>>, HttpWorkerError> {
+        let stream_context = self
+            .streams
+            .get(stream.into())
+            .ok_or(HttpWorkerError::StreamMissing { stream })?;
+        if stream_context.session != session {
+            return Err(HttpWorkerError::StreamSessionMismatch {
+                stream,
+                expected: session,
+                actual: stream_context.session,
+            });
+        }
+        let Some(slot) = stream_context.pending_field_section else {
+            return Ok(None);
+        };
+        let pending = self
+            .pending_field_sections
+            .get_mut(slot)
+            .ok_or(HttpWorkerError::PendingFieldSectionMissing {
+                stream,
+                index: slot,
+            })?;
+        Ok(pending.take())
+    }
+
     /// Drains readable bytes of a registered drain-only peer uni stream
     /// (QPACK encoder, QPACK decoder, or Unknown) and returns the number of
     /// bytes drained, always the whole slice.
@@ -1294,6 +1442,12 @@ impl HttpWorker {
         // never free a live slot.
         if let Some(reader) = removed.request_reader {
             self.request_readers.remove(reader);
+        }
+        // The pending field-section slot dies with the stream, mirroring
+        // `http3_stream_free_req` freeing the per-request state as the
+        // stream closes; the recorded index can never free a live slot.
+        if let Some(slot) = removed.pending_field_section {
+            self.pending_field_sections.remove(slot);
         }
         if let Some(connection) = self.contexts.get_mut(removed.parent.into()) {
             if connection.peer_control == Some(stream) {
