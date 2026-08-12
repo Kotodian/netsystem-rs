@@ -119,6 +119,32 @@ impl<Index: Copy + Eq> SessionState<Index> {
         }
     }
 
+    /// App-close dispatch guard for the worker-local transport action seam;
+    /// mirrors VPP `session_transport_close`/`session_transport_reset`
+    /// (session.c:1657-1703): sessions at or beyond AppClosed, and sessions
+    /// still in Creating (no transport index yet), return false so the
+    /// transport is not notified; Created/Published/Active sessions record
+    /// AppClosed and return true so the transport action runs with the
+    /// close already recorded.
+    pub(crate) fn on_app_close_dispatch(&mut self) -> bool {
+        if matches!(
+            *self,
+            Self::Creating
+                | Self::AppClosed(_)
+                | Self::TransportClosed(_)
+                | Self::Closed(_)
+                | Self::TransportDeleted
+        ) {
+            return false;
+        }
+        // Remaining states with a transport index: Created, Published, Active.
+        let Some(index) = self.transport_index() else {
+            return false;
+        };
+        *self = Self::AppClosed(AppClosedState { index });
+        true
+    }
+
     /// Returns true when the app must receive its single close notification.
     pub(crate) fn on_transport_close(&mut self, index: Index) -> bool {
         if self.transport_index() != Some(index) {

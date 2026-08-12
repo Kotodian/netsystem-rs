@@ -27,6 +27,7 @@ use hammer_runtime::app::{
     SessionMqRing, SessionMsgQueue, SessionMsgQueueError,
 };
 use hammer_runtime::attach::AppSessionPublisher;
+use hammer_runtime::session::{SessionApplicationErrorCode, SessionStreamDirection};
 use hammer_runtime::{
     AttachError, RuntimeError, RuntimeResult, SessionConnectEndpoint, SessionConnectionId,
     SessionListenEndpoint, SessionListenerId, SessionTransportRegistration,
@@ -38,7 +39,7 @@ use hammer_runtime::{
 
 use crate::session::app::AppWorkerError;
 use crate::session::application::{ApplicationMain, ApplicationMqResources};
-use crate::session::error::{SessionError, SessionQueueError};
+use crate::session::error::{SessionError, SessionQueueError, SessionTransportActionError};
 use crate::session::lookup::{SessionEndpointLookup, SessionEndpointState};
 use crate::session::node::{AppSessionInputNode, SessionQueueTransportDispatch};
 use crate::session::protocol::SessionAppCallbacks;
@@ -417,6 +418,67 @@ impl<Index: Copy + Eq> SessionEntry<Index> {
     }
 }
 
+/// Static worker-local action table one transport installs for stream
+/// operations dispatched by the owning Session Worker.
+///
+/// Mirrors VPP's transport VFT (`transport_close`, `transport_reset`,
+/// `transport_half_close`, transport.h:63-70) and the application protocol
+/// error attribute (`app_proto_err_code`, transport_types.h:447): the
+/// transport implements the callbacks and receives the worker itself, so the
+/// callbacks need no global state. Dispatch copies the table (it is `Copy`)
+/// before invoking, keeping the path static, allocation-free and borrow-safe.
+#[derive(Debug, Clone, Copy)]
+pub struct SessionTransportWorkerActions<Index> {
+    open_stream: SessionTransportOpenStream<Index>,
+    reset_stream: SessionTransportResetStream<Index>,
+    stop_sending: SessionTransportStopSending<Index>,
+    close_connection: SessionTransportCloseConnection<Index>,
+}
+
+impl<Index> SessionTransportWorkerActions<Index> {
+    #[inline]
+    pub const fn new(
+        open_stream: SessionTransportOpenStream<Index>,
+        reset_stream: SessionTransportResetStream<Index>,
+        stop_sending: SessionTransportStopSending<Index>,
+        close_connection: SessionTransportCloseConnection<Index>,
+    ) -> Self {
+        Self {
+            open_stream,
+            reset_stream,
+            stop_sending,
+            close_connection,
+        }
+    }
+}
+
+/// Opens one stream child of `parent` on the worker; mirrors VPP
+/// `vnet_connect_stream (parent_handle)` (application.c:1447). Returns the new
+/// stream's Session identity.
+pub type SessionTransportOpenStream<Index> = fn(
+    &mut SessionWorker<Index>,
+    SessionId,
+    SessionStreamDirection,
+    SessionAppContext,
+) -> RuntimeResult<SessionId>;
+/// Resets one stream with an application error code; mirrors VPP
+/// `transport_reset (tp, conn_index, thread)` (transport.h:138).
+pub type SessionTransportResetStream<Index> =
+    fn(&mut SessionWorker<Index>, SessionId, SessionApplicationErrorCode) -> RuntimeResult<()>;
+/// Stops the peer's send direction on one stream; mirrors VPP
+/// `transport_half_close (tp, conn_index, thread)` (transport.h:135).
+pub type SessionTransportStopSending<Index> =
+    fn(&mut SessionWorker<Index>, SessionId, SessionApplicationErrorCode) -> RuntimeResult<()>;
+/// Closes one connection with an application error code and raw reason bytes;
+/// mirrors VPP `transport_close` plus the `APP_PROTO_ERR_CODE` endpoint
+/// attribute (transport_types.h:447, quic.c:701-718).
+pub type SessionTransportCloseConnection<Index> = fn(
+    &mut SessionWorker<Index>,
+    SessionId,
+    SessionApplicationErrorCode,
+    &[u8],
+) -> RuntimeResult<()>;
+
 pub struct SessionWorker<Index> {
     worker: DataWorkerId,
     worker_count: usize,
@@ -427,6 +489,7 @@ pub struct SessionWorker<Index> {
     session_evt_q: Arc<SessionMsgQueue>,
     app_session_config: AppSessionConfig,
     session_app_callbacks: Vec<Option<SessionAppCallbacks<Index>>>,
+    transport_actions: Vec<Option<SessionTransportWorkerActions<Index>>>,
     pub(crate) transport_dispatches: Vec<SessionQueueTransportDispatch>,
     pub(crate) control_events: LinkedList<SessionEvt>,
     pub(crate) new_io_events: LinkedList<SessionEvt>,
@@ -1504,6 +1567,185 @@ impl<Index: Copy + Eq> SessionWorker<Index> {
             .get(app.raw() as usize)
             .copied()
             .flatten()
+    }
+
+    /// Installs one transport's worker-local action table, keyed by transport
+    /// id. O(1); rejects a duplicate registration for the same id.
+    pub fn install_transport_actions(
+        &mut self,
+        transport: SessionTransportId,
+        actions: SessionTransportWorkerActions<Index>,
+    ) -> Result<(), SessionTransportActionError> {
+        let slot = transport.raw() as usize;
+        if self
+            .transport_actions
+            .get(slot)
+            .is_some_and(Option::is_some)
+        {
+            return Err(SessionTransportActionError::AlreadyRegistered { transport });
+        }
+        if self.transport_actions.len() <= slot {
+            self.transport_actions.resize(slot + 1, None);
+        }
+        self.transport_actions[slot] = Some(actions);
+        Ok(())
+    }
+
+    /// Copies one transport's worker action table out of the worker. O(1).
+    /// The table is `Copy`, so the borrow ends before the callback runs.
+    #[inline]
+    fn actions_for(
+        &self,
+        transport: SessionTransportId,
+    ) -> Result<SessionTransportWorkerActions<Index>, SessionTransportActionError> {
+        self.transport_actions
+            .get(transport.raw() as usize)
+            .copied()
+            .flatten()
+            .ok_or(SessionTransportActionError::MissingRegistration { transport })
+    }
+
+    /// Resolves one Session entry to the transport that owns it; mirrors VPP
+    /// `session_get_transport_proto (s)` guarding transport ownership before
+    /// VFT dispatch (session.c:1658-1712). The Session entry is the transport
+    /// authority, so dispatch never takes a caller-supplied transport id.
+    #[inline]
+    fn entry_transport(
+        &self,
+        session_id: SessionId,
+    ) -> Result<SessionTransportId, SessionTransportActionError> {
+        let entry = self
+            .entries
+            .get(session_id.pool_index())
+            .ok_or(SessionTransportActionError::InvalidSession { session_id })?;
+        let Some(SessionType::Transport { transport, .. }) = entry.session_type else {
+            return Err(SessionTransportActionError::InvalidSession { session_id });
+        };
+        Ok(transport)
+    }
+
+    /// Applies the VPP app-close state guard shared by `reset_stream` and
+    /// `close_connection` (session.c:1657-1703): returns Ok(false) without
+    /// notifying the transport for sessions at or beyond AppClosed and for
+    /// sessions still in Creating; returns Ok(true) for Created/Published/
+    /// Active sessions after recording AppClosed, so the transport action
+    /// runs with the close already recorded. The entry borrow ends before
+    /// any callback runs.
+    #[inline]
+    fn entry_app_close_guard(
+        &mut self,
+        session_id: SessionId,
+    ) -> Result<bool, SessionTransportActionError> {
+        let entry = self
+            .entries
+            .get_mut(session_id.pool_index())
+            .ok_or(SessionTransportActionError::InvalidSession { session_id })?;
+        let Some(SessionType::Transport { state, .. }) = entry.session_type.as_mut() else {
+            return Err(SessionTransportActionError::InvalidSession { session_id });
+        };
+        Ok(state.on_app_close_dispatch())
+    }
+
+    /// Dispatches one worker-local `open_stream` action to the transport that
+    /// owns `parent`; mirrors VPP `vnet_connect_stream (parent_handle)`
+    /// (application.c:1447). The transport allocates the child stream on this
+    /// worker and returns its Session identity.
+    pub fn open_stream(
+        &mut self,
+        parent: SessionId,
+        direction: SessionStreamDirection,
+        app_context: SessionAppContext,
+    ) -> Result<SessionId, SessionTransportActionError> {
+        let transport = self.entry_transport(parent)?;
+        let actions = self.actions_for(transport)?;
+        (actions.open_stream)(self, parent, direction, app_context).map_err(|source| {
+            SessionTransportActionError::TransportActionFailed {
+                action: "open_stream",
+                source,
+            }
+        })
+    }
+
+    /// Dispatches one worker-local `reset_stream` action to the transport that
+    /// owns the stream; mirrors VPP `session_transport_reset`
+    /// (session.c:1687-1703): only pre-close sessions dispatch, with AppClosed
+    /// recorded before the transport is notified.
+    pub fn reset_stream(
+        &mut self,
+        session_id: SessionId,
+        code: SessionApplicationErrorCode,
+    ) -> Result<(), SessionTransportActionError> {
+        let transport = self.entry_transport(session_id)?;
+        let actions = self.actions_for(transport)?;
+        if !self.entry_app_close_guard(session_id)? {
+            return Ok(());
+        }
+        (actions.reset_stream)(self, session_id, code).map_err(|source| {
+            SessionTransportActionError::TransportActionFailed {
+                action: "reset_stream",
+                source,
+            }
+        })
+    }
+
+    /// Dispatches one worker-local `stop_sending` action to the transport that
+    /// owns the stream; mirrors VPP `session_transport_half_close`
+    /// (session.c:1637-1648): only a READY session (Hammer's Active) can be
+    /// half-closed, so every other state returns Ok without notifying the
+    /// transport. Half-close never changes the session state.
+    pub fn stop_sending(
+        &mut self,
+        session_id: SessionId,
+        code: SessionApplicationErrorCode,
+    ) -> Result<(), SessionTransportActionError> {
+        let transport = self.entry_transport(session_id)?;
+        let actions = self.actions_for(transport)?;
+        let active = self
+            .entries
+            .get(session_id.pool_index())
+            .is_some_and(|entry| {
+                matches!(
+                    entry.session_type,
+                    Some(SessionType::Transport {
+                        state: SessionState::Active(_),
+                        ..
+                    })
+                )
+            });
+        if !active {
+            return Ok(());
+        }
+        (actions.stop_sending)(self, session_id, code).map_err(|source| {
+            SessionTransportActionError::TransportActionFailed {
+                action: "stop_sending",
+                source,
+            }
+        })
+    }
+
+    /// Dispatches one worker-local `close_connection` action to the transport
+    /// that owns the connection; mirrors VPP `session_transport_close`
+    /// (session.c:1657-1682) plus the `APP_PROTO_ERR_CODE` endpoint attribute
+    /// (transport_types.h:447, quic.c:701-718): only pre-close sessions
+    /// dispatch, with AppClosed recorded before the transport is notified.
+    /// The reason stays raw `&[u8]`, never narrowed to `&str`.
+    pub fn close_connection(
+        &mut self,
+        connection: SessionId,
+        code: SessionApplicationErrorCode,
+        reason: &[u8],
+    ) -> Result<(), SessionTransportActionError> {
+        let transport = self.entry_transport(connection)?;
+        let actions = self.actions_for(transport)?;
+        if !self.entry_app_close_guard(connection)? {
+            return Ok(());
+        }
+        (actions.close_connection)(self, connection, code, reason).map_err(|source| {
+            SessionTransportActionError::TransportActionFailed {
+                action: "close_connection",
+                source,
+            }
+        })
     }
 
     #[inline]
@@ -4023,6 +4265,7 @@ impl<Index: Copy + Eq> SessionWorker<Index> {
             session_evt_q,
             app_session_config,
             session_app_callbacks: Vec::new(),
+            transport_actions: Vec::new(),
             transport_dispatches: Vec::new(),
             control_events: LinkedList::new(),
             new_io_events: LinkedList::new(),
@@ -4650,6 +4893,7 @@ where
 
 #[cfg(test)]
 mod tests {
+    use std::cell::RefCell;
     use std::sync::Arc;
     use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
     use std::time::{Duration, Instant};
@@ -4657,9 +4901,11 @@ mod tests {
     use hammer_core::data_plane::{BufferFrame, NodeId, NodeState};
     use hammer_infra::pool::Index;
     use hammer_runtime::app::{
-        AppSessionConfig, SessionEvt, SessionEvtType, SessionHandle, SessionMsgQueueError,
+        AppSessionConfig, SessionAppContext, SessionEvt, SessionEvtType, SessionHandle,
+        SessionMsgQueueError,
     };
     use hammer_runtime::attach::AppServer;
+    use hammer_runtime::session::{SessionApplicationErrorCode, SessionStreamDirection};
     use hammer_runtime::{
         AttachError, DataPlaneRuntime, DataPlaneRuntimeConfig, DataWorkerId, Engine,
         NodeRuntimeData, RuntimeError, RuntimeRegistry, RuntimeResult,
@@ -4667,13 +4913,14 @@ mod tests {
 
     use super::{
         DEFAULT_SESSION_POOL_CAPACITY, SessionDgramArgs, SessionEntry, SessionMain,
-        SessionMigrateResult, SessionQueueNext, SessionState, SessionTransportId, SessionType,
-        SessionWorker, SessionWorkerState, queue_for_worker,
+        SessionMigrateResult, SessionQueueNext, SessionState, SessionTransportId,
+        SessionTransportWorkerActions, SessionType, SessionWorker, SessionWorkerState,
+        queue_for_worker,
     };
     use crate::session::ApplicationMain;
     use crate::session::SessionId;
     use crate::session::application::{ApplicationError, ApplicationMqResources};
-    use crate::session::error::SessionError;
+    use crate::session::error::{SessionError, SessionTransportActionError};
     use crate::session::node::{
         SessionQueueNode, SessionQueueOutput, register_app_session_input_node,
         register_session_queue_node,
@@ -4781,6 +5028,8 @@ mod tests {
         SessionQueue(#[from] crate::session::SessionQueueError),
         #[error(transparent)]
         Session(#[from] SessionError),
+        #[error(transparent)]
+        TransportAction(#[from] SessionTransportActionError),
         #[error(transparent)]
         Conversion(#[from] std::num::TryFromIntError),
     }
@@ -6967,6 +7216,510 @@ mod tests {
                 ..
             })
         ));
+    }
+
+    // --- Task 15: worker-local transport action dispatch ---
+
+    const ACTION_TRANSPORT: SessionTransportId = SessionTransportId::new(0);
+
+    /// Per-thread capture for the fake transport callbacks. The callbacks run
+    /// synchronously on the test's own worker thread, so a thread-local
+    /// capture is race-free under parallel cargo test without any
+    /// synchronization; the owned `close_reason` replaces the previous
+    /// raw-pointer reconstruction.
+    #[derive(Default)]
+    struct TransportActionCapture {
+        callback_count: u64,
+        state_at_callback: u8,
+        open_parent: u64,
+        open_direction: u8,
+        open_context: u64,
+        open_child: u64,
+        reset_session: u64,
+        reset_code: u64,
+        stop_session: u64,
+        stop_code: u64,
+        close_session: u64,
+        close_code: u64,
+        close_reason: Vec<u8>,
+    }
+
+    thread_local! {
+        static TRANSPORT_ACTION_CAPTURE: RefCell<TransportActionCapture> =
+            RefCell::new(TransportActionCapture::default());
+    }
+
+    fn with_capture<T>(f: impl FnOnce(&mut TransportActionCapture) -> T) -> T {
+        TRANSPORT_ACTION_CAPTURE.with(|cell| f(&mut cell.borrow_mut()))
+    }
+
+    fn callback_count() -> u64 {
+        with_capture(|capture| capture.callback_count)
+    }
+
+    fn state_at_callback() -> u8 {
+        with_capture(|capture| capture.state_at_callback)
+    }
+
+    fn reset_capture() {
+        with_capture(|capture| *capture = TransportActionCapture::default());
+    }
+
+    /// Applies one state-machine step to a Session entry from the test thread.
+    fn mutate_state(
+        sessions: &mut SessionWorker<Index>,
+        session_id: SessionId,
+        f: impl FnOnce(&mut SessionState<Index>),
+    ) {
+        let entry = sessions
+            .entries
+            .get_mut(session_id.pool_index())
+            .expect("transport Session entry");
+        let Some(SessionType::Transport { state, .. }) = entry.session_type.as_mut() else {
+            panic!("transport Session entry");
+        };
+        f(state);
+    }
+
+    fn fake_open_stream(
+        worker: &mut SessionWorker<Index>,
+        parent: SessionId,
+        direction: SessionStreamDirection,
+        app_context: SessionAppContext,
+    ) -> RuntimeResult<SessionId> {
+        with_capture(|capture| {
+            capture.callback_count += 1;
+            capture.open_parent = parent.get();
+            capture.open_direction = match direction {
+                SessionStreamDirection::Bidi => 0,
+                SessionStreamDirection::Uni => 1,
+            };
+            capture.open_context = app_context;
+        });
+        let (rx_fifo, tx_fifo) = worker.create_local_fifos()?;
+        let child = worker.insert_session_entry(SessionEntry::creating_transport(
+            ACTION_TRANSPORT,
+            rx_fifo,
+            tx_fifo,
+        ))?;
+        with_capture(|capture| capture.open_child = child.get());
+        Ok(child)
+    }
+
+    /// Records whether the Session entry already shows AppClosed at callback
+    /// time; proves the seam transitions state before invoking the transport.
+    fn record_state_at_callback(worker: &SessionWorker<Index>, session_id: SessionId) {
+        let app_closed = worker
+            .entries
+            .get(session_id.pool_index())
+            .is_some_and(|entry| {
+                matches!(
+                    entry.session_type,
+                    Some(SessionType::Transport {
+                        state: SessionState::AppClosed(_),
+                        ..
+                    })
+                )
+            });
+        with_capture(|capture| capture.state_at_callback = app_closed as u8);
+    }
+
+    fn fake_reset_stream(
+        worker: &mut SessionWorker<Index>,
+        session_id: SessionId,
+        code: SessionApplicationErrorCode,
+    ) -> RuntimeResult<()> {
+        with_capture(|capture| {
+            capture.callback_count += 1;
+            capture.reset_session = session_id.get();
+            capture.reset_code = u64::from(code);
+        });
+        record_state_at_callback(worker, session_id);
+        Ok(())
+    }
+
+    fn fake_stop_sending(
+        _worker: &mut SessionWorker<Index>,
+        session_id: SessionId,
+        code: SessionApplicationErrorCode,
+    ) -> RuntimeResult<()> {
+        with_capture(|capture| {
+            capture.callback_count += 1;
+            capture.stop_session = session_id.get();
+            capture.stop_code = u64::from(code);
+        });
+        Ok(())
+    }
+
+    fn fake_close_connection(
+        worker: &mut SessionWorker<Index>,
+        connection: SessionId,
+        code: SessionApplicationErrorCode,
+        reason: &[u8],
+    ) -> RuntimeResult<()> {
+        with_capture(|capture| {
+            capture.callback_count += 1;
+            capture.close_session = connection.get();
+            capture.close_code = u64::from(code);
+            capture.close_reason = reason.to_vec();
+        });
+        record_state_at_callback(worker, connection);
+        Ok(())
+    }
+
+    fn fake_worker_actions() -> SessionTransportWorkerActions<Index> {
+        SessionTransportWorkerActions::new(
+            fake_open_stream,
+            fake_reset_stream,
+            fake_stop_sending,
+            fake_close_connection,
+        )
+    }
+
+    fn worker_with_transport_session(
+        transport: SessionTransportId,
+        index: Index,
+    ) -> (SessionWorker<Index>, SessionId) {
+        let applications = ApplicationMain::new(1);
+        let mut sessions = SessionWorker::<Index>::new(
+            DataWorkerId::new(0),
+            1,
+            AppSessionConfig::default(),
+            DEFAULT_SESSION_POOL_CAPACITY,
+            applications,
+            None,
+        )
+        .expect("Session worker");
+        let (rx_fifo, tx_fifo) = sessions
+            .create_local_fifos()
+            .expect("Session FIFOs for transport action test");
+        let session_id = sessions
+            .insert_session_entry(SessionEntry::creating_transport(
+                transport, rx_fifo, tx_fifo,
+            ))
+            .expect("insert transport Session");
+        sessions
+            .finish_transport_creation(session_id, index)
+            .expect("complete transport Session");
+        (sessions, session_id)
+    }
+
+    /// Moves a Created transport Session to Active via the state machine
+    /// (Published then connected), as the transport does before dispatchable
+    /// streams exist.
+    fn make_active(sessions: &mut SessionWorker<Index>, session_id: SessionId) {
+        mutate_state(sessions, session_id, |state| {
+            let (published, _) = state
+                .on_connection_published()
+                .expect("Created transitions to Published");
+            *state = published;
+            *state = state
+                .on_connected()
+                .expect("Published transitions to Active");
+        });
+    }
+
+    #[test]
+    fn transport_worker_actions_receive_exact_typed_args() -> Result<(), SessionTestFailure> {
+        reset_capture();
+        let (mut sessions, parent) =
+            worker_with_transport_session(ACTION_TRANSPORT, Index::new(7, 1));
+        sessions.install_transport_actions(ACTION_TRANSPORT, fake_worker_actions())?;
+        assert!(
+            sessions
+                .install_transport_actions(ACTION_TRANSPORT, fake_worker_actions())
+                .is_err(),
+            "duplicate install is rejected"
+        );
+
+        let code = SessionApplicationErrorCode::from(0x1234u64);
+        let child = sessions.open_stream(parent, SessionStreamDirection::Uni, 0xDEAD_BEEF)?;
+        with_capture(|capture| {
+            assert_eq!(capture.open_parent, parent.get());
+            assert_eq!(capture.open_direction, 1);
+            assert_eq!(capture.open_context, 0xDEAD_BEEF);
+            assert_eq!(
+                child,
+                SessionId::from_raw(capture.open_child),
+                "open_stream returns the child Session the callback created"
+            );
+        });
+        assert_ne!(child, parent);
+        assert!(
+            sessions.entries.get(child.pool_index()).is_some(),
+            "the returned child exists on the worker"
+        );
+
+        // stop_sending dispatches only for an Active session (VPP READY-only
+        // half-close), so bring parent to Active before the close-family
+        // actions; each close-family dispatch records AppClosed, so each
+        // action below needs a still-open session.
+        make_active(&mut sessions, parent);
+        sessions.stop_sending(parent, code)?;
+        with_capture(|capture| {
+            assert_eq!(capture.stop_session, parent.get());
+            assert_eq!(capture.stop_code, 0x1234);
+        });
+
+        sessions.reset_stream(parent, code)?;
+        with_capture(|capture| {
+            assert_eq!(capture.reset_session, parent.get());
+            assert_eq!(capture.reset_code, 0x1234);
+        });
+
+        // Parent is AppClosed after the reset; finish and close the still-open
+        // child instead (a Creating Session would be a guarded no-op).
+        sessions
+            .finish_transport_creation(child, Index::new(7, 2))
+            .expect("complete child transport Session");
+        let reason = [0xFF, 0x00, 0xFE];
+        sessions.close_connection(child, code, &reason)?;
+        with_capture(|capture| {
+            assert_eq!(capture.close_session, child.get());
+            assert_eq!(capture.close_code, 0x1234);
+            assert_eq!(
+                capture.close_reason, reason,
+                "the raw non-UTF8 reason bytes are passed through"
+            );
+        });
+        Ok(())
+    }
+
+    #[test]
+    fn transport_worker_actions_missing_registration_is_typed() -> Result<(), SessionTestFailure> {
+        let (mut sessions, session) =
+            worker_with_transport_session(ACTION_TRANSPORT, Index::new(1, 1));
+
+        assert!(matches!(
+            sessions.open_stream(session, SessionStreamDirection::Bidi, 0),
+            Err(SessionTransportActionError::MissingRegistration { transport })
+                if transport == ACTION_TRANSPORT
+        ));
+        assert!(matches!(
+            sessions.reset_stream(session, SessionApplicationErrorCode::from(0u64)),
+            Err(SessionTransportActionError::MissingRegistration { .. })
+        ));
+        assert!(matches!(
+            sessions.stop_sending(session, SessionApplicationErrorCode::from(0u64)),
+            Err(SessionTransportActionError::MissingRegistration { .. })
+        ));
+        assert!(matches!(
+            sessions.close_connection(session, SessionApplicationErrorCode::from(0u64), &[1]),
+            Err(SessionTransportActionError::MissingRegistration { .. })
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn transport_worker_actions_derive_transport_and_validate_session()
+    -> Result<(), SessionTestFailure> {
+        reset_capture();
+        // The transport is derived from the Session entry, never caller-supplied:
+        // with no table installed, the typed error names the derived transport.
+        let (mut sessions, own) = worker_with_transport_session(ACTION_TRANSPORT, Index::new(1, 1));
+        assert!(matches!(
+            sessions.reset_stream(own, SessionApplicationErrorCode::from(0u64)),
+            Err(SessionTransportActionError::MissingRegistration { transport })
+                if transport == ACTION_TRANSPORT
+        ));
+
+        let foreign = SessionTransportId::new(1);
+        let (mut sessions, foreign_session) =
+            worker_with_transport_session(foreign, Index::new(1, 1));
+        sessions.install_transport_actions(foreign, fake_worker_actions())?;
+        assert!(matches!(
+            sessions.reset_stream(SessionId::new(999), SessionApplicationErrorCode::from(0u64)),
+            Err(SessionTransportActionError::InvalidSession { session_id })
+                if session_id == SessionId::new(999)
+        ));
+        sessions.reset_stream(foreign_session, SessionApplicationErrorCode::from(0x77u64))?;
+        with_capture(|capture| {
+            assert_eq!(
+                capture.reset_session,
+                foreign_session.get(),
+                "the derived transport 1 table dispatched the session"
+            );
+            assert_eq!(capture.reset_code, 0x77);
+        });
+        Ok(())
+    }
+
+    /// Inserts a Created transport Session (finished creation) on the worker.
+    fn extra_transport_session(sessions: &mut SessionWorker<Index>, index: Index) -> SessionId {
+        let (rx_fifo, tx_fifo) = sessions
+            .create_local_fifos()
+            .expect("Session FIFOs for transport action test");
+        let session_id = sessions
+            .insert_session_entry(SessionEntry::creating_transport(
+                ACTION_TRANSPORT,
+                rx_fifo,
+                tx_fifo,
+            ))
+            .expect("insert transport Session");
+        sessions
+            .finish_transport_creation(session_id, index)
+            .expect("complete transport Session");
+        session_id
+    }
+
+    #[test]
+    fn transport_worker_actions_repeated_or_invalid_states_keep_callback_count()
+    -> Result<(), SessionTestFailure> {
+        reset_capture();
+        let (mut sessions, session) =
+            worker_with_transport_session(ACTION_TRANSPORT, Index::new(2, 1));
+        sessions.install_transport_actions(ACTION_TRANSPORT, fake_worker_actions())?;
+        let code = SessionApplicationErrorCode::from(0x42u64);
+
+        // A still-Creating Session (no transport index yet) never dispatches.
+        let (rx_fifo, tx_fifo) = sessions.create_local_fifos().expect("Session FIFOs");
+        let creating = sessions
+            .insert_session_entry(SessionEntry::creating_transport(
+                ACTION_TRANSPORT,
+                rx_fifo,
+                tx_fifo,
+            ))
+            .expect("insert Creating Session");
+        sessions.stop_sending(creating, code)?;
+        sessions.reset_stream(creating, code)?;
+        sessions.close_connection(creating, code, &[])?;
+        assert_eq!(
+            callback_count(),
+            0,
+            "Creating Sessions never reach the transport"
+        );
+
+        // A Created (not yet Active) Session cannot half-close (VPP READY-only).
+        sessions.stop_sending(session, code)?;
+        assert_eq!(callback_count(), 0);
+
+        // But it does close: VPP dispatches transport_close for every state
+        // below APP_CLOSED, with AppClosed recorded first.
+        sessions.close_connection(session, code, &[])?;
+        assert_eq!(callback_count(), 1);
+        assert_eq!(
+            state_at_callback(),
+            1,
+            "AppClosed was recorded before the close callback ran"
+        );
+
+        // Repeated close, reset and stop on the AppClosed Session are no-ops.
+        sessions.close_connection(session, code, &[])?;
+        sessions.reset_stream(session, code)?;
+        sessions.stop_sending(session, code)?;
+        assert_eq!(
+            callback_count(),
+            1,
+            "repeated close-family actions on AppClosed never re-dispatch"
+        );
+
+        // A TransportClosed Session never dispatches close/reset/stop.
+        let transport_closed = extra_transport_session(&mut sessions, Index::new(2, 2));
+        make_active(&mut sessions, transport_closed);
+        mutate_state(&mut sessions, transport_closed, |state| {
+            let _ = state.on_transport_close(Index::new(2, 2));
+        });
+        sessions.close_connection(transport_closed, code, &[])?;
+        sessions.reset_stream(transport_closed, code)?;
+        sessions.stop_sending(transport_closed, code)?;
+        assert_eq!(
+            callback_count(),
+            1,
+            "TransportClosed Sessions never re-dispatch"
+        );
+
+        // A TransportDeleted Session never dispatches close/reset.
+        let transport_deleted = extra_transport_session(&mut sessions, Index::new(2, 3));
+        make_active(&mut sessions, transport_deleted);
+        mutate_state(&mut sessions, transport_deleted, |state| {
+            let _ = state.on_transport_deleted(Index::new(2, 3));
+        });
+        sessions.close_connection(transport_deleted, code, &[])?;
+        sessions.reset_stream(transport_deleted, code)?;
+        assert_eq!(
+            callback_count(),
+            1,
+            "TransportDeleted Sessions never re-dispatch"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn transport_worker_actions_reset_and_close_record_app_closed_before_callback()
+    -> Result<(), SessionTestFailure> {
+        reset_capture();
+        let (mut sessions, session) =
+            worker_with_transport_session(ACTION_TRANSPORT, Index::new(3, 1));
+        make_active(&mut sessions, session);
+        sessions.install_transport_actions(ACTION_TRANSPORT, fake_worker_actions())?;
+        let code = SessionApplicationErrorCode::from(0x51u64);
+
+        // reset_stream on an Active Session: AppClosed is recorded before the
+        // transport callback runs and remains after return.
+        sessions.reset_stream(session, code)?;
+        assert_eq!(callback_count(), 1);
+        assert_eq!(
+            state_at_callback(),
+            1,
+            "reset_stream recorded AppClosed before the callback ran"
+        );
+        let entry = sessions
+            .entries
+            .get(session.pool_index())
+            .expect("Session entry");
+        assert!(matches!(
+            entry.session_type,
+            Some(SessionType::Transport {
+                state: SessionState::AppClosed(_),
+                ..
+            })
+        ));
+
+        // stop_sending is half-close: it dispatches but never changes state.
+        let stream = extra_transport_session(&mut sessions, Index::new(3, 2));
+        make_active(&mut sessions, stream);
+        sessions.stop_sending(stream, code)?;
+        assert_eq!(callback_count(), 2);
+        let entry = sessions
+            .entries
+            .get(stream.pool_index())
+            .expect("Session entry");
+        assert!(matches!(
+            entry.session_type,
+            Some(SessionType::Transport {
+                state: SessionState::Active(_),
+                ..
+            })
+        ));
+
+        // close_connection on the Active stream: AppClosed before callback.
+        sessions.close_connection(stream, code, &[1, 2, 3])?;
+        assert_eq!(callback_count(), 3);
+        assert_eq!(
+            state_at_callback(),
+            1,
+            "close_connection recorded AppClosed before the callback ran"
+        );
+        let entry = sessions
+            .entries
+            .get(stream.pool_index())
+            .expect("Session entry");
+        assert!(matches!(
+            entry.session_type,
+            Some(SessionType::Transport {
+                state: SessionState::AppClosed(_),
+                ..
+            })
+        ));
+
+        // A second close on the now-AppClosed stream is a silent no-op.
+        sessions.close_connection(stream, code, &[4, 5])?;
+        assert_eq!(
+            callback_count(),
+            3,
+            "a second close on AppClosed never re-dispatches"
+        );
+        Ok(())
     }
 }
 

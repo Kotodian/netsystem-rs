@@ -5,6 +5,7 @@ use hammer_runtime::{DataWorkerId, RuntimeError, SessionListenerId};
 use thiserror::Error;
 
 use super::SessionId;
+use super::runtime::SessionTransportId;
 
 #[hammer_component_macros::runtime_error(subsystem = "session queue")]
 #[derive(Debug, Error)]
@@ -62,6 +63,29 @@ impl SessionQueueError {
             Self::SessionAppNotInstalled { .. } => 10,
         }
     }
+}
+
+/// Worker-local transport action dispatch error, returned to the transport
+/// calling through the Session Worker rather than to the Application control
+/// plane. The Session entry is the transport authority; dispatch derives the
+/// transport from it, so the remaining failures are a missing worker table and
+/// an absent or non-transport Session (mirroring VPP's transport VFT dispatch
+/// guards, session.c:1658-1712).
+#[hammer_component_macros::runtime_error(subsystem = "session transport action")]
+#[derive(Debug, Error)]
+pub enum SessionTransportActionError {
+    #[error("transport {transport:?} has no worker action table installed")]
+    MissingRegistration { transport: SessionTransportId },
+    #[error("transport {transport:?} already has a worker action table installed")]
+    AlreadyRegistered { transport: SessionTransportId },
+    #[error("session {session_id:?} is not present on this worker")]
+    InvalidSession { session_id: SessionId },
+    #[error("transport worker action `{action}` failed")]
+    TransportActionFailed {
+        action: &'static str,
+        #[source]
+        source: RuntimeError,
+    },
 }
 
 pub use hammer_runtime::app::SessionConnectError;
