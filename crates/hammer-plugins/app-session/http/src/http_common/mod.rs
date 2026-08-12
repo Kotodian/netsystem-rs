@@ -42,10 +42,12 @@
 //! The codec allocates nothing, takes no locks, and panics on no input:
 //! every read is bounds-checked and every arithmetic step is checked.
 
+mod body;
 #[cfg(test)]
 mod tests;
 mod types;
 
+pub(crate) use body::{BodyAccumulator, BodyError};
 pub use types::*;
 
 use hammer_infra::fifo::{Fifo, FifoError, FifoWriteReservation};

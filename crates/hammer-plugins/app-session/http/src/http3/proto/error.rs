@@ -7,6 +7,8 @@
 
 use std::fmt;
 
+use crate::http_common::BodyError;
+
 /// An HTTP/3 application error code, sent on the QUIC connection when the
 /// connection is closed.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -139,6 +141,22 @@ impl fmt::Display for ErrorCode {
             ErrorCode::QpackDecoderStreamError => "QPACK_DECODER_STREAM_ERROR",
         };
         f.write_str(name)
+    }
+}
+
+impl From<BodyError> for ErrorCode {
+    /// HTTP/3 adapter mapping for protocol-neutral body-length errors
+    /// (`crate::http_common::body`), matching VPP:
+    /// `http3_stream_transport_rx_req` rejects DATA outside the body phase
+    /// with `FRAME_UNEXPECTED`; `http3_req_state_transport_io_more_data`
+    /// errors an overrun with `GENERAL_PROTOCOL_ERROR` and a half-closed
+    /// incomplete body with `REQUEST_INCOMPLETE`.
+    fn from(error: BodyError) -> Self {
+        match error {
+            BodyError::DataWithoutDeclaredLength => ErrorCode::FrameUnexpected,
+            BodyError::MoreDataThanDeclared => ErrorCode::GeneralProtocolError,
+            BodyError::IncompleteAtEnd => ErrorCode::RequestIncomplete,
+        }
     }
 }
 

@@ -35,7 +35,7 @@
 //! `CACHE_LINE` by the pool itself. Session App callbacks, HTTP3 engine
 //! dispatch, QPACK, request publication, and stop_listen are later slices.
 
-use hammer_infra::fifo::FifoError;
+use hammer_infra::fifo::{Fifo, FifoError};
 use hammer_infra::pool::{Index, Pool};
 use hammer_infra::thread_owned::ThreadOwnedError;
 use hammer_runtime::DataWorkerId;
@@ -44,13 +44,13 @@ use hammer_runtime::error::RuntimeError;
 use hammer_runtime::session::SessionStreamDirection;
 use hammer_service::session::{SessionEndpointRole, SessionId, SessionWorker};
 
+use crate::http_common::{BodyAccumulator, PublishError, publish_body_chunk};
 use crate::http3::preface::encode_control_preface;
 use crate::http3::proto::coding::Decode;
 use crate::http3::proto::control::{ControlRead, ControlStreamError, ControlStreamReader};
 use crate::http3::proto::error::ErrorCode;
 use crate::http3::request_frame_reader::{RequestFrameError, RequestFrameRead, RequestFrameReader};
 use crate::http3::proto::stream::{StreamCategory, StreamType};
-use crate::http3::proto::varint::UnexpectedEnd;
 
 /// Default connection-context capacity of one data worker's pool, matching
 /// the QUIC per-worker context capacity (quic worker.rs:42).
@@ -231,6 +231,18 @@ pub(crate) struct StreamContext {
     /// slot: one pool slot per stream at most, bounded by the stream pool
     /// capacity, freed with the stream.
     pub(crate) pending_field_section: Option<Index>,
+    /// Declared-length body accounting of a bidirectional request stream,
+    /// installed from the request HEADERS Content-Length by
+    /// [`HttpWorker::install_request_body_length`] and advanced per DATA
+    /// frame by [`HttpWorker::process_request_data`]. Mirrors VPP's `to_recv`
+    /// on the per-request `http_ctx_t` (`http3_req_state_transport_io_more_data`,
+    /// http3.c:1184-1263): `NoBody` until a declared length is installed and
+    /// after a body-less HEADERS, so DATA is unexpected before then; a
+    /// half-closed stream with a declared but unreceived body is
+    /// `REQUEST_INCOMPLETE` ([`HttpWorker::validate_request_finish`]). Peer
+    /// uni streams never install or feed a body and keep the `NoBody`
+    /// default.
+    pub(crate) body: BodyAccumulator,
 }
 
 /// Classification role of a peer unidirectional stream once its type varint
@@ -511,6 +523,13 @@ pub(crate) enum HttpWorkerError {
     RequestStreamNotBidi {
         stream: StreamContextId,
         direction: SessionStreamDirection,
+    },
+    #[error(
+        "failed to publish a request body chunk for stream {stream:?} to the upper session FIFO: {error}"
+    )]
+    BodyChunkPublishFailed {
+        stream: StreamContextId,
+        error: PublishError,
     },
     #[error("http stream context allocation requires live parent connection context {parent:?}")]
     ParentContextMissing { parent: ContextId },
@@ -891,6 +910,7 @@ impl HttpWorker {
                 peer_role: PeerUniStreamRole::Unclassified,
                 request_reader: None,
                 pending_field_section: None,
+                body: BodyAccumulator::from(None),
             })
             .map(StreamContextId::from)
             .ok_or(HttpWorkerError::StreamCapacityExhausted {
@@ -1275,6 +1295,160 @@ impl HttpWorker {
             .ok_or(RequestReadError::Worker(HttpWorkerError::StreamMissing { stream }))? =
             stream_context;
         feed.map_err(RequestReadError::Protocol)
+    }
+
+    /// Installs the declared Content-Length of a bidirectional request
+    /// stream into its body accumulator.
+    ///
+    /// Called once per request when HEADERS completes: `Some(n)` declares a
+    /// length (a declared zero is immediately complete), `None` records a
+    /// body-less request in which DATA is unexpected (RFC 9114 Section 4.1).
+    /// Mirrors VPP installing `req->fh.length`/`to_recv` at the transport
+    /// method (`http3_req_state_wait_transport_method`, http3.c:835-899);
+    /// the accumulator itself mirrors the `to_recv` accounting of
+    /// `http3_req_state_transport_io_more_data` (http3.c:1184-1263).
+    /// Generation/session-checks the stream and rejects non-bidi streams
+    /// with `RequestStreamNotBidi`; every failure path mutates nothing.
+    /// O(1): one generation-checked lookup and write, no lock or allocation.
+    pub(crate) fn install_request_body_length(
+        &mut self,
+        stream: StreamContextId,
+        session: SessionId,
+        declared: Option<u64>,
+    ) -> Result<(), HttpWorkerError> {
+        let mut stream_context = *self
+            .streams
+            .get(stream.into())
+            .ok_or(HttpWorkerError::StreamMissing { stream })?;
+        if stream_context.session != session {
+            return Err(HttpWorkerError::StreamSessionMismatch {
+                stream,
+                expected: session,
+                actual: stream_context.session,
+            });
+        }
+        if stream_context.direction != SessionStreamDirection::Bidi {
+            return Err(HttpWorkerError::RequestStreamNotBidi {
+                stream,
+                direction: stream_context.direction,
+            });
+        }
+        stream_context.body = BodyAccumulator::from(declared);
+        *self
+            .streams
+            .get_mut(stream.into())
+            .ok_or(HttpWorkerError::StreamMissing { stream })? = stream_context;
+        Ok(())
+    }
+
+    /// Publishes one borrowed DATA `chunk` of a bidirectional request stream
+    /// to the upper Session FIFO, all-or-nothing.
+    ///
+    /// Mirrors the bounded app write of VPP
+    /// `http3_req_state_transport_io_more_data` (http3.c:1184-1263): the
+    /// body accounting rejects a chunk that overruns the declared remaining
+    /// length (`GeneralProtocolError`) before any FIFO mutation; a FIFO
+    /// that cannot hold the whole chunk returns `Capacity` with the body
+    /// unchanged, the dequeue notification armed, and the chunk still with
+    /// the caller; only after publication commits is the accumulator
+    /// advanced. The lower transport FIFO is never consumed here — the
+    /// caller owns the dequeue after success. `RequestReadError::Protocol`
+    /// carries the HTTP/3 error code; worker liveness failures (stale
+    /// identity, foreign session, non-bidi stream) arrive as
+    /// `RequestReadError::Worker` and mutate nothing. O(1): one
+    /// generation-checked lookup, one bounded FIFO write, no scan, lock,
+    /// or allocation.
+    pub(crate) fn process_request_data(
+        &mut self,
+        stream: StreamContextId,
+        session: SessionId,
+        upper_rx: &Fifo,
+        chunk: &[u8],
+    ) -> Result<(), RequestReadError> {
+        let mut stream_context = *self
+            .streams
+            .get(stream.into())
+            .ok_or(RequestReadError::Worker(HttpWorkerError::StreamMissing {
+                stream,
+            }))?;
+        if stream_context.session != session {
+            return Err(RequestReadError::Worker(HttpWorkerError::StreamSessionMismatch {
+                stream,
+                expected: session,
+                actual: stream_context.session,
+            }));
+        }
+        if stream_context.direction != SessionStreamDirection::Bidi {
+            return Err(RequestReadError::Worker(
+                HttpWorkerError::RequestStreamNotBidi {
+                    stream,
+                    direction: stream_context.direction,
+                },
+            ));
+        }
+        stream_context
+            .body
+            .on_data(chunk.len() as u64)
+            .map_err(|error| RequestReadError::Protocol(RequestFrameError::Phase(error.into())))?;
+        publish_body_chunk(upper_rx, chunk).map_err(|error| {
+            RequestReadError::Worker(HttpWorkerError::BodyChunkPublishFailed { stream, error })
+        })?;
+        // Persist the body advance only after publication committed; on a
+        // rejection or capacity/backpressure error the pool slot keeps its
+        // exact pre-call accumulator.
+        *self
+            .streams
+            .get_mut(stream.into())
+            .ok_or(RequestReadError::Worker(HttpWorkerError::StreamMissing { stream }))? =
+            stream_context;
+        Ok(())
+    }
+
+    /// Validates a bidirectional request stream's FIN against its declared
+    /// body: a half-closed stream with a declared but unreceived body is
+    /// `RequestIncomplete` (RFC 9114 Section 4.1), mirroring VPP
+    /// `http3_req_state_transport_io_more_data` terminating the stream with
+    /// `HTTP3_ERROR_REQUEST_INCOMPLETE` when the transport is half-closed,
+    /// has no more data, and `to_recv` is still pending (http3.c:1244-1252).
+    ///
+    /// Validates only — the stream is left live and unreleased on both
+    /// outcomes; the caller owns any termination and the
+    /// [`HttpWorker::release_request_stream`] removal, preserving existing
+    /// release behavior. `RequestReadError::Protocol` carries
+    /// `RequestIncomplete`; worker liveness failures (stale identity,
+    /// foreign session, non-bidi stream) arrive as `RequestReadError::Worker`
+    /// and mutate nothing. O(1): one generation-checked lookup, no lock or
+    /// allocation.
+    pub(crate) fn validate_request_finish(
+        &self,
+        stream: StreamContextId,
+        session: SessionId,
+    ) -> Result<(), RequestReadError> {
+        let stream_context = self
+            .streams
+            .get(stream.into())
+            .ok_or(RequestReadError::Worker(HttpWorkerError::StreamMissing {
+                stream,
+            }))?;
+        if stream_context.session != session {
+            return Err(RequestReadError::Worker(HttpWorkerError::StreamSessionMismatch {
+                stream,
+                expected: session,
+                actual: stream_context.session,
+            }));
+        }
+        if stream_context.direction != SessionStreamDirection::Bidi {
+            return Err(RequestReadError::Worker(
+                HttpWorkerError::RequestStreamNotBidi {
+                    stream,
+                    direction: stream_context.direction,
+                },
+            ));
+        }
+        stream_context
+            .body
+            .finish(true)
+            .map_err(|error| RequestReadError::Protocol(RequestFrameError::Phase(error.into())))
     }
 
     /// Retains a completed HEADERS field section in the worker-local pending
