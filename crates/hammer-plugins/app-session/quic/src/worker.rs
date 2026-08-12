@@ -1175,7 +1175,6 @@ impl QuicWorker {
     /// context index in O(1) (no pool scan). Rejects sessions unknown to the
     /// Session Worker, owned by another transport, or not backed by a stream
     /// or connection context.
-    #[allow(dead_code)] // consumed by the upcoming session action slice
     fn session_context(
         &self,
         sessions: &SessionWorker<Index>,
@@ -1203,7 +1202,6 @@ impl QuicWorker {
     /// quic.h:128) and encodes it as a varint through
     /// `QUICLY_ERROR_FROM_APPLICATION_ERROR_CODE`; the varint range is
     /// `0..2^62-1`, so anything at or above `2^62` is rejected.
-    #[allow(dead_code)] // consumed by the upcoming session action slice
     fn app_error_code_varint(
         session: SessionId,
         code: SessionApplicationErrorCode,
@@ -1214,6 +1212,69 @@ impl QuicWorker {
                 code: invalid,
             }
         })
+    }
+
+    /// Resets one stream Session with an application error code; the
+    /// transport half of the generic `SessionWorker::reset_stream` dispatch,
+    /// replacing the `transport_reset_unsupported` stub. Mirrors VPP
+    /// `session_transport_reset` (session.c:1687-1703) notifying the
+    /// transport, where the application error code recorded through the
+    /// `APP_PROTO_ERR_CODE` transport endpoint attribute (quic.c:701) is
+    /// carried on the RESET_STREAM frame. Resolution is O(1): `session_context`
+    /// derives the worker-local context index from the Session entry, the
+    /// stream context pins the exact quinn stream on the parent connection,
+    /// and only then is the send stream reset and the connection scheduled
+    /// for output so the frame transmits. Every validation precedes the
+    /// quinn call, so a rejection never mutates transport state.
+    pub(super) fn reset_stream(
+        &mut self,
+        sessions: &mut SessionWorker<Index>,
+        session: SessionId,
+        code: SessionApplicationErrorCode,
+    ) -> RuntimeResult<()> {
+        let context = self.session_context(sessions, session)?;
+        let (stream_id, parent, engine_closed) = self
+            .contexts
+            .get(context.into())
+            .and_then(Context::stream_ref)
+            .map(|stream| {
+                (
+                    stream.stream,
+                    stream.parent,
+                    stream.flags & STREAM_ENGINE_CLOSED != 0,
+                )
+            })
+            .ok_or(QuicWorkerError::SessionNotStream { session })?;
+        if engine_closed {
+            return Err(QuicWorkerError::StreamMissing { stream: stream_id }.into());
+        }
+        let error_code = Self::app_error_code_varint(session, code)?;
+        let connection = self
+            .contexts
+            .get_mut(parent)
+            .and_then(Context::connection_mut)
+            .ok_or_else(|| QuicWorkerError::ContextMissing {
+                context: ContextId::from(parent),
+            })?
+            .engine
+            .as_mut()
+            .ok_or_else(|| QuicWorkerError::EngineMissing {
+                context: ContextId::from(parent),
+            })?
+            .connection_mut()?;
+        if !stream_has_send_side(connection, stream_id) {
+            return Err(QuicWorkerError::StreamSendSideMissing { stream: stream_id }.into());
+        }
+        connection
+            .send_stream(stream_id)
+            .reset(error_code)
+            .map_err(|source| QuicWorkerError::StreamReset {
+                context,
+                stream: stream_id,
+                source,
+            })?;
+        self.queue_connection_output(ContextId::from(parent))?;
+        Ok(())
     }
 
     pub(super) fn lower_session(&self, context: ContextId) -> RuntimeResult<SessionId> {
@@ -3092,34 +3153,41 @@ pub(crate) fn quic_transport_open_stream(
 /// (session.c:1422, transport.c:500-505).
 ///
 /// Temporary constraint: `SessionTransportWorkerActions::new` requires all
-/// four fn pointers, but this slice implements only `open_stream` — nothing
-/// in the QUIC worker invokes `SessionWorker::reset_stream`, `stop_sending`
-/// or `close_connection` yet, so dispatch of those three slots is
-/// unreachable. Each slot therefore holds a minimal typed stub that returns
-/// an explicit `TransportActionUnsupported` error with zero side effects;
-/// replace each stub with the real action in the sub-seam that introduces
-/// its dispatch.
+/// four fn pointers, but this slice implements only `open_stream` and
+/// `reset_stream` — nothing in the QUIC worker invokes
+/// `SessionWorker::stop_sending` or `close_connection` yet, so dispatch of
+/// those two slots is unreachable. Each slot therefore holds a minimal typed
+/// stub that returns an explicit `TransportActionUnsupported` error with
+/// zero side effects; replace each stub with the real action in the
+/// sub-seam that introduces its dispatch.
 pub(crate) fn quic_transport_actions() -> SessionTransportWorkerActions<Index> {
     SessionTransportWorkerActions::new(
         quic_transport_open_stream,
-        transport_reset_unsupported,
+        quic_transport_reset_stream,
         transport_stop_sending_unsupported,
         transport_close_connection_unsupported,
     )
 }
 
-/// Minimal typed stub for the unreachable `reset_stream` slot (see
-/// `quic_transport_actions`): explicit unsupported error, no side effects.
-fn transport_reset_unsupported(
-    _sessions: &mut SessionWorker<Index>,
-    _session: SessionId,
-    _code: SessionApplicationErrorCode,
+/// Resets one QUIC stream Session through the Session Worker's worker-local
+/// transport action table; the `reset_stream` callback installed by
+/// `quic_transport_actions`. Mirrors VPP resolving the transport VFT and
+/// invoking `transport_reset` (transport.h:138) from `session_transport_reset`
+/// (session.c:1687-1703): the Session Worker resolves the owning worker from
+/// its own `DataWorkerId` in O(1), and the QUIC Main comes from the same
+/// QUIC_MAIN channel the session queue entry points use. No scan,
+/// allocation, or lock on the dispatch path.
+pub(crate) fn quic_transport_reset_stream(
+    sessions: &mut SessionWorker<Index>,
+    session: SessionId,
+    code: SessionApplicationErrorCode,
 ) -> RuntimeResult<()> {
-    Err(RuntimeError::from(
-        QuicWorkerError::TransportActionUnsupported {
-            action: "reset_stream",
-        },
-    ))
+    let main = QUIC_MAIN
+        .get()
+        .ok_or(RuntimeError::PluginStateNotInitialized { plugin: "quic" })?;
+    main.with_worker_and_sessions(sessions, |sessions, quic| {
+        quic.reset_stream(sessions, session, code)
+    })
 }
 
 /// Minimal typed stub for the unreachable `stop_sending` slot (see
@@ -3568,6 +3636,17 @@ pub(super) enum QuicWorkerError {
     },
     #[error("Session {session:?} is not owned by the QUIC worker")]
     SessionNotQuic { session: SessionId },
+    #[error("Session {session:?} is a QUIC connection, not a stream")]
+    SessionNotStream { session: SessionId },
+    #[error("QUIC stream {stream:?} has no local send side to reset")]
+    StreamSendSideMissing { stream: quinn_proto::StreamId },
+    #[error("QUIC stream {stream:?} reset failed for context {context:?}: {source}")]
+    StreamReset {
+        context: ContextId,
+        stream: quinn_proto::StreamId,
+        #[source]
+        source: quinn_proto::ClosedStream,
+    },
     #[error("QUIC application error code {code} for Session {session:?} is not a valid varint")]
     ApplicationErrorCodeInvalid { session: SessionId, code: u64 },
     #[error("QUIC transport action `{action}` is not supported yet")]
@@ -6986,6 +7065,405 @@ mod tests {
             Err(QuicWorkerError::ContextMissing { context })
                 if context == ContextId::from(listener_index)
         ));
+        Ok(())
+    }
+
+    /// Establishes a client QUIC connection and opens one stream child,
+    /// mirroring `open_stream_creates_direction_exact_child_carrying_app_context`;
+    /// returns the worker, sessions, application main, the bound AppServer
+    /// (kept alive so later stream opens can attach through its publisher),
+    /// parent connection context/Session, and the open stream
+    /// Session/index/StreamId.
+    fn test_established_stream() -> RuntimeResult<(
+        QuicWorker,
+        SessionWorker<Index>,
+        Arc<hammer_service::session::ApplicationMain>,
+        hammer_runtime::attach::AppServer,
+        ContextId,
+        SessionId,
+        SessionId,
+        Index,
+        quinn_proto::StreamId,
+    )> {
+        let applications = hammer_service::session::ApplicationMain::new(4);
+        let application = applications
+            .attach()
+            .map_err(hammer_runtime::RuntimeError::from)?;
+        let socket_path = unique_socket_path("hammer-quic-reset-stream");
+        let server =
+            hammer_runtime::attach::AppServer::bind(&socket_path, 1).expect("bind App server");
+        let mut sessions = hammer_service::session::SessionWorker::<Index>::new(
+            DataWorkerId::new(0),
+            1,
+            hammer_runtime::app::AppSessionConfig::default(),
+            64,
+            Arc::clone(&applications),
+            Some(server.publisher()),
+        )?;
+        sessions.install_session_app(
+            SessionAppId::new(0),
+            hammer_service::session::SessionAppCallbacks::all_none(),
+        )?;
+        sessions.install_application_mq_for_test(application)?;
+        let mut worker = QuicWorker::new(DataWorkerId::new(0));
+        let local = "127.0.0.1:443".parse().expect("local endpoint");
+        let remote = "127.0.0.1:444".parse().expect("remote endpoint");
+        let (client_config, server_config) = client_server_config_pair();
+        let parent_context = worker.allocate_client_connect(
+            Arc::clone(&client_config),
+            "localhost".to_owned(),
+            local,
+            remote,
+            application,
+            Some(SessionAppId::new(0)),
+            None,
+            SessionConnectionId::from_raw(7),
+        )?;
+        let now = Instant::now();
+        worker.connect_connection(parent_context, SessionId::from_raw(11), now)?;
+        drive_client_handshake(
+            &mut worker,
+            parent_context,
+            server_config,
+            local,
+            remote,
+            now,
+        )?;
+        let parent = sessions.construct_transport_session(
+            QuicWorker::ID,
+            parent_context.into(),
+            unique_allocation_owner(),
+            application,
+            None,
+            None,
+            None,
+            false,
+        )?;
+        worker
+            .contexts
+            .get_mut(parent_context.into())
+            .and_then(Context::connection_mut)
+            .ok_or(QuicWorkerError::ContextMissing {
+                context: parent_context,
+            })?
+            .connection_session = Some(parent);
+        worker
+            .contexts
+            .get_mut(parent_context.into())
+            .and_then(Context::connection_mut)
+            .ok_or(QuicWorkerError::ContextMissing {
+                context: parent_context,
+            })?
+            .state = ConnectionState::Established;
+        let bidi = worker.open_stream(
+            &applications,
+            &mut sessions,
+            parent,
+            SessionStreamDirection::Bidi,
+            0xB1D1,
+        )?;
+        let (_, bidi_index) = sessions
+            .session_transport(bidi)
+            .ok_or(QuicWorkerError::SessionMissing { session: bidi })?;
+        let bidi_id = worker
+            .contexts
+            .get(bidi_index)
+            .and_then(Context::stream_ref)
+            .ok_or(QuicWorkerError::ContextMissing {
+                context: ContextId::from(bidi_index),
+            })?
+            .stream;
+        let _ = std::fs::remove_file(socket_path);
+        Ok((
+            worker,
+            sessions,
+            applications,
+            server,
+            parent_context,
+            parent,
+            bidi,
+            bidi_index,
+            bidi_id,
+        ))
+    }
+
+    /// Probes the quinn send stream pinned by `stream`: true when it is
+    /// already in the terminal reset state (a redundant `reset` returns
+    /// `ClosedStream`). Probing itself resets an untouched stream, so it is
+    /// only used as the final assertion on a stream.
+    fn stream_already_reset(
+        worker: &mut QuicWorker,
+        parent: ContextId,
+        stream: quinn_proto::StreamId,
+    ) -> bool {
+        worker
+            .contexts
+            .get_mut(parent.into())
+            .and_then(Context::connection_mut)
+            .and_then(|connection| connection.engine.as_mut())
+            .and_then(|engine| engine.connection.as_mut())
+            .map(|connection| {
+                connection
+                    .send_stream(stream)
+                    .reset(quinn_proto::VarInt::from_u32(0))
+                    .is_err()
+            })
+            .unwrap_or(false)
+    }
+
+    #[test]
+    fn reset_stream_resets_exact_stream_and_leaves_connection_untouched() -> RuntimeResult<()> {
+        let (
+            mut worker,
+            mut sessions,
+            applications,
+            _server,
+            parent_context,
+            parent,
+            bidi,
+            bidi_index,
+            bidi_id,
+        ) = test_established_stream()?;
+        let uni = worker.open_stream(
+            &applications,
+            &mut sessions,
+            parent,
+            SessionStreamDirection::Uni,
+            0x55,
+        )?;
+        let (_, uni_index) = sessions
+            .session_transport(uni)
+            .ok_or(QuicWorkerError::SessionMissing { session: uni })?;
+        let uni_id = worker
+            .contexts
+            .get(uni_index)
+            .and_then(Context::stream_ref)
+            .ok_or(QuicWorkerError::ContextMissing {
+                context: ContextId::from(uni_index),
+            })?
+            .stream;
+
+        worker.reset_stream(&mut sessions, bidi, SessionApplicationErrorCode::from(42))?;
+
+        assert!(
+            stream_already_reset(&mut worker, parent_context, bidi_id),
+            "the exact stream pinned by the Session is reset at the quinn level"
+        );
+        assert!(
+            !stream_already_reset(&mut worker, parent_context, uni_id),
+            "the sibling stream is untouched"
+        );
+        assert!(
+            sessions.session_transport(bidi).is_some(),
+            "the stream Session survives the reset"
+        );
+        assert!(
+            worker
+                .contexts
+                .get(bidi_index)
+                .and_then(Context::stream_ref)
+                .is_some(),
+            "the stream context survives the reset"
+        );
+        let state = worker
+            .contexts
+            .get(parent_context.into())
+            .and_then(Context::connection)
+            .map(|connection| connection.state)
+            .ok_or(QuicWorkerError::ContextMissing {
+                context: parent_context,
+            })?;
+        assert_eq!(
+            state,
+            ConnectionState::Established,
+            "the parent connection is untouched by the stream reset"
+        );
+        let after = worker.open_stream(
+            &applications,
+            &mut sessions,
+            parent,
+            SessionStreamDirection::Bidi,
+            0xA5,
+        )?;
+        worker.reset_stream(&mut sessions, after, SessionApplicationErrorCode::from(0))?;
+        Ok(())
+    }
+
+    #[test]
+    fn reset_stream_rejects_out_of_range_code_before_any_side_effect() -> RuntimeResult<()> {
+        let (
+            mut worker,
+            mut sessions,
+            applications,
+            _server,
+            parent_context,
+            parent,
+            bidi,
+            _,
+            bidi_id,
+        ) = test_established_stream()?;
+        let error = worker
+            .reset_stream(
+                &mut sessions,
+                bidi,
+                SessionApplicationErrorCode::from(1u64 << 62),
+            )
+            .expect_err("code beyond the varint range is rejected");
+        assert!(
+            matches!(
+                &error,
+                RuntimeError::Subsystem { source, .. }
+                    if matches!(
+                        source.downcast_ref::<QuicWorkerError>(),
+                        Some(QuicWorkerError::ApplicationErrorCodeInvalid { session, .. })
+                            if session == &bidi
+                    )
+            ),
+            "typed ApplicationErrorCodeInvalid expected, got {error:?}"
+        );
+        assert!(
+            !stream_already_reset(&mut worker, parent_context, bidi_id),
+            "the rejected code performed no transport side effect"
+        );
+        // The probe above consumed the pinned stream (its final assertion
+        // resets it), so a valid code is proven on a fresh sibling stream.
+        let after = worker.open_stream(
+            &applications,
+            &mut sessions,
+            parent,
+            SessionStreamDirection::Bidi,
+            0xB1D2,
+        )?;
+        worker.reset_stream(&mut sessions, after, SessionApplicationErrorCode::from(0))?;
+        Ok(())
+    }
+
+    #[test]
+    fn reset_stream_rejects_engine_closed_stream_before_side_effects() -> RuntimeResult<()> {
+        let (mut worker, mut sessions, _, _server, parent_context, _, bidi, bidi_index, bidi_id) =
+            test_established_stream()?;
+        worker
+            .contexts
+            .get_mut(bidi_index)
+            .and_then(Context::stream_mut)
+            .expect("stream context")
+            .flags |= STREAM_ENGINE_CLOSED;
+        let error = worker
+            .reset_stream(&mut sessions, bidi, SessionApplicationErrorCode::from(0))
+            .expect_err("an engine-closed stream is stale");
+        assert!(
+            matches!(
+                &error,
+                RuntimeError::Subsystem { source, .. }
+                    if matches!(
+                        source.downcast_ref::<QuicWorkerError>(),
+                        Some(QuicWorkerError::StreamMissing { stream }) if stream == &bidi_id
+                    )
+            ),
+            "typed StreamMissing expected, got {error:?}"
+        );
+        assert!(
+            !stream_already_reset(&mut worker, parent_context, bidi_id),
+            "the stale rejection performed no transport side effect"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn reset_stream_rejects_connection_session_without_side_effects() -> RuntimeResult<()> {
+        let (mut worker, mut sessions, _, session, context, _) = test_quic_session()?;
+        let error = worker
+            .reset_stream(&mut sessions, session, SessionApplicationErrorCode::from(0))
+            .expect_err("a connection Session is not a stream");
+        assert!(
+            matches!(
+                &error,
+                RuntimeError::Subsystem { source, .. }
+                    if matches!(
+                        source.downcast_ref::<QuicWorkerError>(),
+                        Some(QuicWorkerError::SessionNotStream { session: rejected })
+                            if rejected == &session
+                    )
+            ),
+            "typed SessionNotStream expected, got {error:?}"
+        );
+        assert!(
+            worker
+                .contexts
+                .get(context.into())
+                .and_then(Context::connection)
+                .is_some(),
+            "the connection context is untouched"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn reset_stream_rejects_missing_session() -> RuntimeResult<()> {
+        let (mut worker, mut sessions, _, _, _, _) = test_quic_session()?;
+        let missing = SessionId::from_raw(0xDEAD);
+        assert!(matches!(
+            worker.reset_stream(&mut sessions, missing, SessionApplicationErrorCode::from(0)),
+            Err(RuntimeError::Subsystem { source, .. })
+                if matches!(source.downcast_ref::<QuicWorkerError>(), Some(QuicWorkerError::SessionMissing { .. }))
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn reset_stream_rejects_foreign_transport_session() -> RuntimeResult<()> {
+        let mut worker = QuicWorker::new(DataWorkerId::new(0));
+        let (mut sessions, foreign) = test_lower_session()?;
+        assert!(matches!(
+            worker.reset_stream(&mut sessions, foreign, SessionApplicationErrorCode::from(0)),
+            Err(RuntimeError::Subsystem { source, .. })
+                if matches!(source.downcast_ref::<QuicWorkerError>(), Some(QuicWorkerError::SessionNotQuic { .. }))
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn reset_stream_dispatch_reaches_transport_then_app_close_suppresses_repeats()
+    -> RuntimeResult<()> {
+        let (worker, mut sessions, _, _server, _, _, bidi, bidi_index, _) =
+            test_established_stream()?;
+        sessions.install_transport_actions(QuicWorker::ID, quic_transport_actions())?;
+        // Generic dispatch rejects a Session unknown to the Session Worker
+        // before any transport work (session.c:1675).
+        assert!(matches!(
+            sessions.reset_stream(
+                SessionId::from_raw(0xDEAD),
+                SessionApplicationErrorCode::from(0)
+            ),
+            Err(SessionTransportActionError::InvalidSession { .. })
+        ));
+        // A live stream dispatches through the AppClose guard to the QUIC
+        // action wrapper. The wrapper needs the process-global QUIC_MAIN
+        // worker channel, which unit tests do not own, so it fails typed
+        // without touching any worker state.
+        assert!(matches!(
+            &sessions.reset_stream(bidi, SessionApplicationErrorCode::from(7)),
+            Err(SessionTransportActionError::TransportActionFailed { action, .. })
+                if *action == "reset_stream"
+        ));
+        assert!(
+            sessions.session_app_closed(bidi),
+            "the dispatch guard records AppClosed before the transport is notified"
+        );
+        // Repeated dispatch is suppressed by Session state: Ok(()) with no
+        // transport work, even for a code the transport would reject.
+        assert!(matches!(
+            sessions.reset_stream(bidi, SessionApplicationErrorCode::from(1u64 << 62)),
+            Ok(())
+        ));
+        assert!(
+            worker
+                .contexts
+                .get(bidi_index)
+                .and_then(Context::stream_ref)
+                .is_some(),
+            "the suppressed dispatch leaves the stream context untouched"
+        );
         Ok(())
     }
 }
