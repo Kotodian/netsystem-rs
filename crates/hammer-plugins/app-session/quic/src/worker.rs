@@ -24,10 +24,11 @@ use hammer_runtime::{
 };
 use hammer_service::session::ApplicationMain;
 use hammer_service::session::SessionId;
+use hammer_service::session::error::SessionTransportActionError;
 use hammer_service::session::node::{SessionQueueNext, SessionQueueOutput};
 use hammer_service::session::runtime::{
-    SessionTransport, SessionTransportId, SessionWorker, TransportInternalTransport,
-    TransportInternalTx, dispatch_session_queue_events,
+    SessionTransport, SessionTransportId, SessionTransportWorkerActions, SessionWorker,
+    TransportInternalTransport, TransportInternalTx, dispatch_session_queue_events,
 };
 
 use crate::listener::QUIC_MAIN;
@@ -3059,6 +3060,97 @@ pub(crate) fn quic_session_queue_dispatch(
     })
 }
 
+/// Opens one stream child of `parent` through the Session Worker's
+/// worker-local transport action table; the `open_stream` callback installed
+/// by `QuicMain::install_transport_actions` (listener.rs). Mirrors VPP
+/// resolving the transport VFT and invoking `quic_connect_stream`
+/// (transport.c:500-505, quic.c:164) from the worker-local registration:
+/// the Session Worker resolves the owning worker from its own
+/// `DataWorkerId` in O(1), and the QUIC Main (with the Application
+/// authority) comes from the same QUIC_MAIN channel the session queue
+/// entry points use. No scan, allocation, or lock on the dispatch path.
+pub(crate) fn quic_transport_open_stream(
+    sessions: &mut SessionWorker<Index>,
+    parent: SessionId,
+    direction: SessionStreamDirection,
+    app_context: SessionAppContext,
+) -> RuntimeResult<SessionId> {
+    let main = QUIC_MAIN
+        .get()
+        .ok_or(RuntimeError::PluginStateNotInitialized { plugin: "quic" })?;
+    let applications = main.applications();
+    main.with_worker_and_sessions(sessions, |sessions, quic| {
+        quic.open_stream(applications, sessions, parent, direction, app_context)
+    })
+}
+
+/// Builds the QUIC transport's worker-local action table, installed once per
+/// owning worker at the bind point (`bind_worker_graph` in listener.rs).
+/// Mirrors VPP registering the transport VFT with
+/// `.connect_stream = quic_connect_stream` (quic.c:902) and dispatch
+/// resolving it from the session entry's transport proto
+/// (session.c:1422, transport.c:500-505).
+///
+/// Temporary constraint: `SessionTransportWorkerActions::new` requires all
+/// four fn pointers, but this slice implements only `open_stream` — nothing
+/// in the QUIC worker invokes `SessionWorker::reset_stream`, `stop_sending`
+/// or `close_connection` yet, so dispatch of those three slots is
+/// unreachable. Each slot therefore holds a minimal typed stub that returns
+/// an explicit `TransportActionUnsupported` error with zero side effects;
+/// replace each stub with the real action in the sub-seam that introduces
+/// its dispatch.
+pub(crate) fn quic_transport_actions() -> SessionTransportWorkerActions<Index> {
+    SessionTransportWorkerActions::new(
+        quic_transport_open_stream,
+        transport_reset_unsupported,
+        transport_stop_sending_unsupported,
+        transport_close_connection_unsupported,
+    )
+}
+
+/// Minimal typed stub for the unreachable `reset_stream` slot (see
+/// `quic_transport_actions`): explicit unsupported error, no side effects.
+fn transport_reset_unsupported(
+    _sessions: &mut SessionWorker<Index>,
+    _session: SessionId,
+    _code: SessionApplicationErrorCode,
+) -> RuntimeResult<()> {
+    Err(RuntimeError::from(
+        QuicWorkerError::TransportActionUnsupported {
+            action: "reset_stream",
+        },
+    ))
+}
+
+/// Minimal typed stub for the unreachable `stop_sending` slot (see
+/// `quic_transport_actions`): explicit unsupported error, no side effects.
+fn transport_stop_sending_unsupported(
+    _sessions: &mut SessionWorker<Index>,
+    _session: SessionId,
+    _code: SessionApplicationErrorCode,
+) -> RuntimeResult<()> {
+    Err(RuntimeError::from(
+        QuicWorkerError::TransportActionUnsupported {
+            action: "stop_sending",
+        },
+    ))
+}
+
+/// Minimal typed stub for the unreachable `close_connection` slot (see
+/// `quic_transport_actions`): explicit unsupported error, no side effects.
+fn transport_close_connection_unsupported(
+    _sessions: &mut SessionWorker<Index>,
+    _connection: SessionId,
+    _code: SessionApplicationErrorCode,
+    _reason: &[u8],
+) -> RuntimeResult<()> {
+    Err(RuntimeError::from(
+        QuicWorkerError::TransportActionUnsupported {
+            action: "close_connection",
+        },
+    ))
+}
+
 impl QuicWorker {
     fn begin_stream_close(
         &mut self,
@@ -3478,6 +3570,13 @@ pub(super) enum QuicWorkerError {
     SessionNotQuic { session: SessionId },
     #[error("QUIC application error code {code} for Session {session:?} is not a valid varint")]
     ApplicationErrorCodeInvalid { session: SessionId, code: u64 },
+    #[error("QUIC transport action `{action}` is not supported yet")]
+    TransportActionUnsupported { action: &'static str },
+    #[error("QUIC transport action table install failed")]
+    TransportActionsInstall {
+        #[source]
+        source: SessionTransportActionError,
+    },
     #[error("QUIC worker {worker} is outside the configured worker range")]
     WorkerOutOfRange { worker: usize },
     #[error("QUIC worker {worker} is already installed")]
