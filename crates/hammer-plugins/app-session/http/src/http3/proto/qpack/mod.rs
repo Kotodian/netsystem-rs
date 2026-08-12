@@ -4,10 +4,12 @@
 //! This slice wires the prefix integer codec (`prefix_int`), the prefix
 //! string codec (`prefix_string`) with its Huffman coding (`huffman`), the
 //! field line type (`field`), the fixed 99-entry static table
-//! (`static_table`), and the capacity-zero encoded field section prefix
-//! (`block`). The field-line representations (Sections 4.5.2-4.5.6, static
-//! only) and the full field-section decoder `decode_block` are implemented
-//! in `block`; the encoder is a later slice.
+//! (`static_table`), and the capacity-zero encoded field section (`block`).
+//! The field-line representations (Sections 4.5.2-4.5.6, static only), the
+//! full field-section decoder `decode_block`, and the capacity-zero encoder
+//! `encode_block` — which chooses each field line's representation through
+//! the `static_table` reverse lookups `find` / `find_name` — are all
+//! implemented in `block`.
 //!
 //! References:
 //! - RFC 9204 Section 4.1.1 (prefix integers), Section 4.2 (prefix strings

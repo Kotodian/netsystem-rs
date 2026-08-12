@@ -23,7 +23,11 @@
 //! name reference (Section 4.5.4) and the literal-name form (Section 4.5.6);
 //! the post-base forms (Sections 4.5.3 and 4.5.5) are recognized and
 //! rejected as dynamic-table references. `decode_block` composes the prefix
-//! and the five selectors into the full field-section decoder.
+//! and the five selectors into the full field-section decoder;
+//! `encode_block` is the capacity-zero encoder, choosing a representation
+//! per field line through the static-table reverse lookups
+//! (`static_table::find` / `find_name`) exactly as h3's `encode_stateless`
+//! and VPP's `qpack_encode_header` do.
 
 use std::borrow::Cow;
 
@@ -56,6 +60,65 @@ pub(crate) fn decode_prefix<B: Buf>(buf: &mut B) -> Result<(), QpackError> {
 pub(crate) fn encode_prefix<W: BufMut>(buf: &mut W) {
     buf.put_u8(0);
     buf.put_u8(0);
+}
+
+/// Encode a complete encoded field section (RFC 9204 Section 4.5): the
+/// `00 00` prefix first, then every field line in input order.
+///
+/// This is the encoder-side twin of `decode_block`: every line is a
+/// static-table representation, so the block needs no dynamic-table state
+/// and round-trips through the committed decoder unchanged. It mirrors h3's
+/// `encode_stateless` (`third_party/h3/h3/src/qpack/encoder.rs`,
+/// encoder.rs:192-215: `HeaderPrefix::new(0, 0, 0, 0)` then the per-field
+/// static path) and VPP's `qpack_serialize_request` / `qpack_serialize_response`
+/// (`third_party/vpp/src/plugins/http/http3/qpack.c`, qpack.c:1384-1510:
+/// "two zero bytes because we don't use dynamic table").
+///
+/// Total work is O(sum of field bytes): each line costs one bounded
+/// `static_table` reverse lookup plus the string encodings, and the only
+/// allocations are the Huffman-coded string outputs of `prefix_string`.
+pub(crate) fn encode_block<W: BufMut>(
+    buf: &mut W,
+    fields: &[HeaderField],
+) -> Result<(), QpackError> {
+    encode_prefix(buf);
+    for field in fields {
+        encode_field_line(buf, field)?;
+    }
+    Ok(())
+}
+
+/// Encode one field line, choosing the representation by reverse lookup:
+/// an exact static-table match is the indexed form (RFC 9204 Section
+/// 4.5.2), a static name match the literal-with-name-reference form
+/// (Section 4.5.4), and anything else the literal-with-literal-name form
+/// (Section 4.5.6).
+///
+/// Mirrors h3's `encode_stateless` field path (`third_party/h3/h3/src/
+/// qpack/encoder.rs`, encoder.rs:201-210) and VPP's `qpack_encode_header`
+/// (`third_party/vpp/src/plugins/http/http3/qpack.c`, qpack.c:1034-1079):
+/// a full match through `static_table::find` writes `0xC0` plus the 6-bit
+/// index; otherwise a name match through `static_table::find_name` writes
+/// `0x50` plus the 4-bit index and the value string; otherwise the
+/// literal-name form writes `0x20` and both strings. Both reverse lookups
+/// are explicit fixed matches in bounded O(1), never a scan of the 99-entry
+/// table; the strings always Huffman-code through `prefix_string::encode`,
+/// as h3's encoder does. The N bit stays clear: never-indexing is encoding
+/// policy for a later slice, exactly as h3's stateless encoder leaves it.
+pub(crate) fn encode_field_line<W: BufMut>(
+    buf: &mut W,
+    field: &HeaderField,
+) -> Result<(), QpackError> {
+    if let Some(index) = static_table::find(field) {
+        prefix_int::encode(6, 0b11, index as u64, buf)?;
+    } else if let Some(index) = static_table::find_name(field.name.as_ref()) {
+        prefix_int::encode(4, 0b0101, index as u64, buf)?;
+        prefix_string::encode(8, 0, field.value.as_ref(), buf)?;
+    } else {
+        prefix_string::encode(4, 0b0010, field.name.as_ref(), buf)?;
+        prefix_string::encode(8, 0, field.value.as_ref(), buf)?;
+    }
+    Ok(())
 }
 
 /// Decode a complete encoded field section (RFC 9204 Section 4.5): the
@@ -335,6 +398,96 @@ mod tests {
         let mut out = Vec::new();
         encode_prefix(&mut out);
         assert_eq!(out, vec![0x00, 0x00]);
+    }
+
+    fn encode_block_bytes(fields: &[HeaderField]) -> Result<Vec<u8>, QpackError> {
+        let mut out = Vec::new();
+        encode_block(&mut out, fields)?;
+        Ok(out)
+    }
+
+    /// An empty field section encodes to just the `00 00` prefix, and
+    /// round-trips through `decode_block` to the empty block.
+    #[test]
+    fn encode_block_empty_section_writes_only_prefix() {
+        let wire = encode_block_bytes(&[]).expect("encoded");
+        assert_eq!(wire, vec![0x00, 0x00]);
+        assert_eq!(decode_block_bytes(&wire).expect("decoded"), Vec::new());
+    }
+
+    /// Exact static full matches encode as the indexed representation in
+    /// order and round-trip: `:method` GET is index 17 (0xD1), `:path` "/"
+    /// index 1 (0xC1), `:status` 200 index 25 (0xD9), `:status` 404 index 27
+    /// (0xDB).
+    #[test]
+    fn encode_block_exact_static_matches_indexed() {
+        let fields = [
+            HeaderField::from((":method", "GET")),
+            HeaderField::from((":path", "/")),
+            HeaderField::from((":status", "200")),
+            HeaderField::from((":status", "404")),
+        ];
+        let wire = encode_block_bytes(&fields).expect("encoded");
+        assert_eq!(wire, vec![0x00, 0x00, 0xD1, 0xC1, 0xD9, 0xDB]);
+        assert_eq!(decode_block_bytes(&wire).expect("decoded"), fields);
+    }
+
+    /// A field that is literally a static-table entry, borrowed `'static`
+    /// Cows and all, encodes to its own index.
+    #[test]
+    fn encode_block_static_entry_encodes_to_its_index() {
+        let field = static_table::get(17).expect("index in range");
+        let wire = encode_block_bytes(std::slice::from_ref(field)).expect("encoded");
+        assert_eq!(wire, vec![0x00, 0x00, 0xD1]);
+        assert_eq!(
+            decode_block_bytes(&wire).expect("decoded"),
+            vec![(*field).clone()]
+        );
+    }
+
+    /// A name present in the table with a value that is not an exact match
+    /// encodes as the literal-with-name-reference form and round-trips:
+    /// `:method` name index 15 is the all-ones 4-bit escape 0x5F plus a zero
+    /// continuation byte (RFC 9204 Section 4.1.1: values less than 2^4 - 1
+    /// are single-byte, 15 needs the escape), then the Huffman-coded value.
+    #[test]
+    fn encode_block_static_name_ref() {
+        let fields = [HeaderField::from((":method", "PATCH"))];
+        let mut expected = vec![0x00, 0x00];
+        prefix_int::encode(4, 0b0101, 15, &mut expected).expect("encoded");
+        prefix_string::encode(8, 0, b"PATCH", &mut expected).expect("encoded");
+        let wire = encode_block_bytes(&fields).expect("encoded");
+        assert_eq!(wire, expected);
+        assert_eq!(decode_block_bytes(&wire).expect("decoded"), fields);
+    }
+
+    /// An unknown name falls back to the literal-with-literal-name form:
+    /// `0x20`-family name string then value string, both Huffman-coded, and
+    /// round-trips.
+    #[test]
+    fn encode_block_literal_name_fallback() {
+        let fields = [HeaderField::from(("x-custom", "hello"))];
+        let mut expected = vec![0x00, 0x00];
+        prefix_string::encode(4, 0b0010, b"x-custom", &mut expected).expect("encoded");
+        prefix_string::encode(8, 0, b"hello", &mut expected).expect("encoded");
+        let wire = encode_block_bytes(&fields).expect("encoded");
+        assert_eq!(wire, expected);
+        assert_eq!(decode_block_bytes(&wire).expect("decoded"), fields);
+    }
+
+    /// A mixed sequence round-trips through the committed decoder in wire
+    /// order: indexed, name-ref, and literal lines keep their input order.
+    #[test]
+    fn encode_block_preserves_field_order() {
+        let fields = [
+            HeaderField::from((":method", "GET")),
+            HeaderField::from((":method", "PATCH")),
+            HeaderField::from(("x-custom", "hello")),
+            HeaderField::from((":status", "200")),
+        ];
+        let wire = encode_block_bytes(&fields).expect("encoded");
+        let decoded = decode_block_bytes(&wire).expect("decoded");
+        assert_eq!(decoded, fields);
     }
 
     /// The canonical zero prefix decodes and consumes exactly two bytes,
