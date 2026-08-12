@@ -418,6 +418,25 @@ impl<Index: Copy + Eq> SessionEntry<Index> {
     }
 }
 
+/// Immutable accept-time metadata snapshot for one Session, read by a
+/// builtin Session App accept callback without touching the worker again.
+///
+/// Static `Copy` data: [`SessionFlags`] plus, for stream children, the parent
+/// connection's [`SessionAppContext`] resolved from the child's pinned
+/// listener handle (VPP `http_ts_accept_stream`, http.c:675: `conn_session =
+/// session_get_from_handle (stream_session->listener_handle)`, parent context
+/// `conn_session->opaque`). Root Sessions carry no parent context.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SessionAcceptMetadata {
+    /// The flags a transport derived for the accepted Session
+    /// (`set_session_flags`; VPP `SESSION_F_*`).
+    pub flags: SessionFlags,
+    /// The parent Session's `SessionAppContext`, `None` for roots and for
+    /// streams whose pinned listener handle is absent, foreign, or no longer
+    /// live.
+    pub parent_app_context: Option<SessionAppContext>,
+}
+
 /// Static worker-local action table one transport installs for stream
 /// operations dispatched by the owning Session Worker.
 ///
@@ -2540,6 +2559,36 @@ impl<Index: Copy + Eq> SessionWorker<Index> {
         self.entries
             .get(session_id.pool_index())
             .map(|entry| entry.flags)
+    }
+
+    /// O(1) snapshot of [`SessionAcceptMetadata`] for one accepted Session.
+    ///
+    /// Mirrors VPP `http_ts_accept_stream` (http.c:675), which resolves the
+    /// accepted stream's parent from its listener handle
+    /// (`conn_session = session_get_from_handle (stream_session->
+    /// listener_handle)`) and inherits the parent context (`conn_session->
+    /// opaque`). The child entry's flags gate the parent resolution exactly
+    /// as `SESSION_F_STREAM` gates VPP's stream accept path, so roots never
+    /// resolve a parent. The parent follows [`SessionWorker::
+    /// session_id_from_handle`] semantics precisely — the live Session at the
+    /// handle's slot, never a weaker stale check. Static `Copy` data from at
+    /// most two pool lookups: no allocation, locking, atomics, or scanning.
+    #[inline]
+    pub fn accept_metadata(&self, session_id: SessionId) -> Option<SessionAcceptMetadata> {
+        let entry = self.entries.get(session_id.pool_index())?;
+        let parent_app_context = if entry.flags.contains(SessionFlags::STREAM) {
+            entry
+                .listener
+                .and_then(|listener| self.session_id_from_handle(listener))
+                .and_then(|parent| self.entries.get(parent.pool_index()))
+                .map(|parent| parent.app_session)
+        } else {
+            None
+        };
+        Some(SessionAcceptMetadata {
+            flags: entry.flags,
+            parent_app_context,
+        })
     }
 
     /// Test seam: the retained ACCEPTED message of a Session whose
@@ -4906,8 +4955,8 @@ mod tests {
     use hammer_core::data_plane::{BufferFrame, NodeId, NodeState};
     use hammer_infra::pool::Index;
     use hammer_runtime::app::{
-        AppSessionConfig, SessionAppContext, SessionEvt, SessionEvtType, SessionHandle,
-        SessionMsgQueueError,
+        AppSessionConfig, SessionAppContext, SessionEvt, SessionEvtType, SessionFlags,
+        SessionHandle, SessionMsgQueueError,
     };
     use hammer_runtime::attach::AppServer;
     use hammer_runtime::session::{SessionApplicationErrorCode, SessionStreamDirection};
@@ -7010,6 +7059,272 @@ mod tests {
         assert_eq!(accepted.session, sessions.session_handle(second));
         assert_eq!(accepted.listener, SessionHandle::new(7, 0));
         let _ = std::fs::remove_file(socket_path);
+    }
+
+    /// Inserts a bare transport Session in the pool without App publication,
+    /// enough to exercise the static `accept_metadata` pool reads.
+    fn insert_metadata_test_session(
+        sessions: &mut SessionWorker<Index>,
+        transport: SessionTransportId,
+        index: Index,
+    ) -> SessionId {
+        let (rx_fifo, tx_fifo) = sessions
+            .create_local_fifos()
+            .expect("test Session FIFOs");
+        let session_id = sessions
+            .insert_session_entry(SessionEntry::creating_transport(
+                transport, rx_fifo, tx_fifo,
+            ))
+            .expect("insert test Session");
+        sessions
+            .finish_transport_creation(session_id, index)
+            .expect("finish test Session creation");
+        session_id
+    }
+
+    fn metadata_test_worker() -> SessionWorker<Index> {
+        SessionWorker::<Index>::new(
+            DataWorkerId::new(0),
+            1,
+            AppSessionConfig::default(),
+            DEFAULT_SESSION_POOL_CAPACITY,
+            ApplicationMain::new(1),
+            None,
+        )
+        .expect("Session worker")
+    }
+
+    #[test]
+    fn accept_metadata_root_never_resolves_parent_context() {
+        let mut sessions = metadata_test_worker();
+        let parent = insert_metadata_test_session(
+            &mut sessions,
+            SessionTransportId::new(1),
+            Index::new(1, 1),
+        );
+        sessions
+            .entries
+            .get_mut(parent.pool_index())
+            .expect("parent entry")
+            .app_session = 42;
+        // A root may pin its accepting listener (VPP accepted connections
+        // name the listener) but the `SESSION_F_STREAM` gate keeps it from
+        // resolving a parent: VPP walks `listener_handle` only on the stream
+        // accept path (`http_ts_accept_stream`).
+        let root = insert_metadata_test_session(
+            &mut sessions,
+            SessionTransportId::new(1),
+            Index::new(2, 1),
+        );
+        sessions
+            .entries
+            .get_mut(root.pool_index())
+            .expect("root entry")
+            .listener = Some(sessions.session_handle(parent));
+
+        let metadata = sessions.accept_metadata(root).expect("root accept metadata");
+        assert_eq!(metadata.flags, SessionFlags::empty());
+        assert_eq!(metadata.parent_app_context, None);
+    }
+
+    #[test]
+    fn accept_metadata_stream_children_carry_parent_app_context() {
+        let mut sessions = metadata_test_worker();
+        let parent = insert_metadata_test_session(
+            &mut sessions,
+            SessionTransportId::new(1),
+            Index::new(1, 1),
+        );
+        sessions
+            .entries
+            .get_mut(parent.pool_index())
+            .expect("parent entry")
+            .app_session = 42;
+        let parent_handle = sessions.session_handle(parent);
+
+        // Bidi stream child: VPP `http_ts_accept_stream` (http.c:675) resolves
+        // the parent connection from the child's pinned listener handle and
+        // inherits its context.
+        let bidi = insert_metadata_test_session(
+            &mut sessions,
+            SessionTransportId::new(1),
+            Index::new(2, 1),
+        );
+        sessions
+            .set_session_flags(bidi, SessionFlags::STREAM)
+            .expect("derive bidi stream flags");
+        sessions
+            .entries
+            .get_mut(bidi.pool_index())
+            .expect("bidi child entry")
+            .listener = Some(parent_handle);
+        let metadata = sessions.accept_metadata(bidi).expect("bidi accept metadata");
+        assert_eq!(metadata.flags, SessionFlags::STREAM);
+        assert_eq!(metadata.parent_app_context, Some(42));
+
+        // Uni stream child inherits the same parent context.
+        let uni = insert_metadata_test_session(
+            &mut sessions,
+            SessionTransportId::new(1),
+            Index::new(3, 1),
+        );
+        sessions
+            .set_session_flags(
+                uni,
+                SessionFlags::STREAM | SessionFlags::UNIDIRECTIONAL,
+            )
+            .expect("derive uni stream flags");
+        sessions
+            .entries
+            .get_mut(uni.pool_index())
+            .expect("uni child entry")
+            .listener = Some(parent_handle);
+        let metadata = sessions.accept_metadata(uni).expect("uni accept metadata");
+        assert_eq!(
+            metadata.flags,
+            SessionFlags::STREAM | SessionFlags::UNIDIRECTIONAL
+        );
+        assert_eq!(metadata.parent_app_context, Some(42));
+    }
+
+    #[test]
+    fn accept_metadata_missing_or_removed_child_returns_none() {
+        let mut sessions = metadata_test_worker();
+        // A Session id that was never installed (in-bounds slot, wrong
+        // generation) and one that was removed both fail the pool lookup.
+        assert!(sessions
+            .accept_metadata(SessionId::from(Index::new(1023, 1)))
+            .is_none());
+        let removed = insert_metadata_test_session(
+            &mut sessions,
+            SessionTransportId::new(1),
+            Index::new(1, 1),
+        );
+        sessions
+            .entries
+            .remove(removed.pool_index())
+            .expect("remove Session");
+        assert!(sessions.accept_metadata(removed).is_none());
+    }
+
+    #[test]
+    fn accept_metadata_stale_or_foreign_parent_handle_yields_no_parent() {
+        let mut sessions = metadata_test_worker();
+        // A freed parent's handle no longer resolves: the slot is empty, so
+        // `session_id_from_handle` misses exactly as VPP `session_get_from_handle`
+        // misses on a freed pool element.
+        let freed = insert_metadata_test_session(
+            &mut sessions,
+            SessionTransportId::new(1),
+            Index::new(1, 1),
+        );
+        let freed_handle = sessions.session_handle(freed);
+        let stale_child = insert_metadata_test_session(
+            &mut sessions,
+            SessionTransportId::new(1),
+            Index::new(2, 1),
+        );
+        sessions
+            .set_session_flags(stale_child, SessionFlags::STREAM)
+            .expect("derive stale child stream flags");
+        sessions
+            .entries
+            .get_mut(stale_child.pool_index())
+            .expect("stale child entry")
+            .listener = Some(freed_handle);
+        sessions
+            .entries
+            .remove(freed.pool_index())
+            .expect("free parent");
+        let metadata = sessions
+            .accept_metadata(stale_child)
+            .expect("stale child accept metadata");
+        assert_eq!(metadata.parent_app_context, None);
+
+        // A handle naming another worker's slot is foreign and never resolves.
+        let parent = insert_metadata_test_session(
+            &mut sessions,
+            SessionTransportId::new(1),
+            Index::new(3, 1),
+        );
+        let orphan_child = insert_metadata_test_session(
+            &mut sessions,
+            SessionTransportId::new(1),
+            Index::new(4, 1),
+        );
+        sessions
+            .set_session_flags(orphan_child, SessionFlags::STREAM)
+            .expect("derive orphan child stream flags");
+        sessions
+            .entries
+            .get_mut(orphan_child.pool_index())
+            .expect("orphan child entry")
+            .listener = Some(SessionHandle::new(
+                sessions.session_handle(parent).session_index(),
+                1,
+            ));
+        let metadata = sessions
+            .accept_metadata(orphan_child)
+            .expect("orphan child accept metadata");
+        assert_eq!(metadata.parent_app_context, None);
+    }
+
+    #[test]
+    fn accept_metadata_parent_handle_resolves_live_slot_occupant() {
+        let mut sessions = metadata_test_worker();
+        // A handle pins a slot, not a Session identity: when the parent is
+        // freed and the slot is reused, the child resolves the live occupant
+        // (VPP `session_get_from_handle` resolves by pool slot, so a stale
+        // handle sees the current entry, never a generation-checked miss).
+        let first = insert_metadata_test_session(
+            &mut sessions,
+            SessionTransportId::new(1),
+            Index::new(1, 1),
+        );
+        sessions
+            .entries
+            .get_mut(first.pool_index())
+            .expect("first parent entry")
+            .app_session = 100;
+        let child = insert_metadata_test_session(
+            &mut sessions,
+            SessionTransportId::new(1),
+            Index::new(2, 1),
+        );
+        sessions
+            .set_session_flags(child, SessionFlags::STREAM)
+            .expect("derive child stream flags");
+        sessions
+            .entries
+            .get_mut(child.pool_index())
+            .expect("child entry")
+            .listener = Some(sessions.session_handle(first));
+        sessions
+            .entries
+            .remove(first.pool_index())
+            .expect("free first parent");
+        let second = insert_metadata_test_session(
+            &mut sessions,
+            SessionTransportId::new(1),
+            Index::new(3, 1),
+        );
+        assert_eq!(
+            second.pool_index().slot(),
+            first.pool_index().slot(),
+            "the freed parent slot is reused"
+        );
+        sessions
+            .entries
+            .get_mut(second.pool_index())
+            .expect("second parent entry")
+            .app_session = 200;
+
+        let metadata = sessions.accept_metadata(child).expect("child accept metadata");
+        assert_eq!(
+            metadata.parent_app_context,
+            Some(200),
+            "the stale parent handle resolves the live slot occupant"
+        );
     }
 
     #[test]
