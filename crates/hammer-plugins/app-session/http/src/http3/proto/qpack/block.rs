@@ -22,8 +22,8 @@
 //! implements the indexed form (Section 4.5.2), the literal form with static
 //! name reference (Section 4.5.4) and the literal-name form (Section 4.5.6);
 //! the post-base forms (Sections 4.5.3 and 4.5.5) are recognized and
-//! rejected as dynamic-table references, and the full decoder is a later
-//! slice.
+//! rejected as dynamic-table references. `decode_block` composes the prefix
+//! and the five selectors into the full field-section decoder.
 
 use std::borrow::Cow;
 
@@ -56,6 +56,57 @@ pub(crate) fn decode_prefix<B: Buf>(buf: &mut B) -> Result<(), QpackError> {
 pub(crate) fn encode_prefix<W: BufMut>(buf: &mut W) {
     buf.put_u8(0);
     buf.put_u8(0);
+}
+
+/// Decode a complete encoded field section (RFC 9204 Section 4.5): the
+/// prefix first, then every field line until the input is exhausted,
+/// returning the ordered fields.
+///
+/// This composes `decode_prefix` with the field-line selectors below,
+/// mirroring VPP's `qpack_parse_request` / `qpack_parse_response`
+/// (`third_party/vpp/src/plugins/http/http3/qpack.c`, qpack.c:1341-1397):
+/// `qpack_parse_headers_prefix` first, then the per-field-line loop through
+/// `qpack_decode_header` in VPP's dispatch order — indexed, literal with
+/// name reference, literal with literal name, then the post-base rejections
+/// (qpack.c:958-1023, case labels 12-15, 7/5, 3/2, 1, 0). h3's
+/// `decode_stateless` (`third_party/h3/h3/src/qpack/decoder.rs`) is the
+/// Rust reference: prefix, then the same `while has_remaining` loop.
+/// An empty field section (only the two prefix bytes) decodes to an empty
+/// block, as in h3.
+///
+/// Each iteration claims the first byte with exactly one selector, which
+/// consumes at least that byte; a byte claimed by none falls through to the
+/// typed `InvalidFieldPrefix`, so a non-consuming `Ok(None)` selector can
+/// never spin the loop.
+///
+/// A static-table entry is cloned once, here at the ownership boundary of
+/// the returned block; the clone copies the borrowed Cows' pointers without
+/// allocating.
+pub(crate) fn decode_block<B: Buf>(buf: &mut B) -> Result<Vec<HeaderField>, QpackError> {
+    decode_prefix(buf)?;
+    let mut fields = Vec::new();
+    while buf.has_remaining() {
+        let field = if let Some(field) = decode_field_line(buf)? {
+            (*field).clone()
+        } else if let Some(field) = decode_literal_name_ref(buf)? {
+            field
+        } else if let Some(field) = decode_literal_name(buf)? {
+            field
+        } else {
+            // The post-base selectors reject rather than produce: a match is
+            // the typed `DynamicReference`, a non-match `Ok(None)` falls
+            // through.
+            decode_post_base_indexed(buf)?;
+            decode_post_base_name_ref(buf)?;
+            // The selectors above partition every first byte, so no byte
+            // reaches this arm; it keeps the dispatch total and typed so
+            // that no non-consuming `Ok(None)` selector can ever spin the
+            // loop.
+            return Err(QpackError::InvalidFieldPrefix(buf.chunk()[0]));
+        };
+        fields.push(field);
+    }
+    Ok(fields)
 }
 
 /// Decode one field line, recognizing only the indexed representation
@@ -366,6 +417,158 @@ mod tests {
             0x00, 0xFF, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80,
         ];
         assert_eq!(decode_prefix_bytes(&bytes), Err(QpackError::Overflow));
+    }
+
+    fn decode_block_bytes(bytes: &[u8]) -> Result<Vec<HeaderField>, QpackError> {
+        let mut read: &[u8] = bytes;
+        decode_block(&mut read)
+    }
+
+    /// The canonical zero prefix with no field lines decodes to an empty
+    /// block, as in h3's `decode_stateless`.
+    #[test]
+    fn decode_block_empty_section() {
+        assert_eq!(decode_block_bytes(&[0x00, 0x00]), Ok(Vec::new()));
+    }
+
+    /// Fields decode in wire order: 0xD1 is index 17 (`:method` GET) and
+    /// 0xC1 is index 1 (`:path` "/").
+    #[test]
+    fn decode_block_indexed_static_fields_in_order() {
+        let fields = decode_block_bytes(&[0x00, 0x00, 0xD1, 0xC1]).expect("decoded");
+        assert_eq!(fields.len(), 2);
+        assert_eq!(fields[0], *static_table::get(17).unwrap());
+        assert_eq!(fields[1], *static_table::get(1).unwrap());
+        // The clone at the block boundary copies the borrowed Cows' pointers,
+        // not the bytes.
+        assert!(matches!(fields[0].name, Cow::Borrowed(_)));
+        assert!(matches!(fields[0].value, Cow::Borrowed(_)));
+    }
+
+    /// Mixed representations decode in wire order: indexed static (0xC1),
+    /// literal with static name reference (0x51 ...), literal with literal
+    /// name (0x23 ...).
+    #[test]
+    fn decode_block_mixed_representations() {
+        let fields = decode_block_bytes(&[
+            0x00, 0x00, 0xC1, 0x51, 0x03, b'f', b'o', b'o', 0x23, b'f', b'o', b'o', 0x03, b'b',
+            b'a', b'r',
+        ])
+        .expect("decoded");
+        assert_eq!(fields.len(), 3);
+        assert_eq!(fields[0], *static_table::get(1).unwrap());
+        assert_eq!(
+            fields[1],
+            HeaderField {
+                name: static_table::get(1).unwrap().name.clone(),
+                value: Cow::Owned(b"foo".to_vec()),
+            }
+        );
+        assert_eq!(
+            fields[2],
+            HeaderField {
+                name: Cow::Owned(b"foo".to_vec()),
+                value: Cow::Owned(b"bar".to_vec()),
+            }
+        );
+    }
+
+    /// The prefix is validated before any field line: a nonzero Required
+    /// Insert Count or Delta Base fails the whole block.
+    #[test]
+    fn decode_block_rejects_nonzero_prefix() {
+        assert_eq!(
+            decode_block_bytes(&[0x01, 0x00, 0xC1]),
+            Err(QpackError::NonZeroInsertCount(1))
+        );
+        assert_eq!(
+            decode_block_bytes(&[0x00, 0x01, 0xC1]),
+            Err(QpackError::NonZeroDeltaBase {
+                sign: 0,
+                delta_base: 1
+            })
+        );
+    }
+
+    /// Dynamic-table references reject the whole block in every
+    /// representation: indexed (0x80), literal name reference (0x40),
+    /// indexed post-base (0x10) and literal post-base name reference (0x00).
+    #[test]
+    fn decode_block_dynamic_references_rejected() {
+        let wires: [&[u8]; 4] = [
+            &[0x00, 0x00, 0x80],
+            &[0x00, 0x00, 0x40, 0x00],
+            &[0x00, 0x00, 0x10],
+            &[0x00, 0x00, 0x00],
+        ];
+        for wire in wires {
+            assert_eq!(decode_block_bytes(wire), Err(QpackError::DynamicReference));
+        }
+    }
+
+    #[test]
+    fn decode_block_truncated_field_rejected() {
+        assert_eq!(
+            decode_block_bytes(&[0x00, 0x00, 0xFF]),
+            Err(QpackError::UnexpectedEnd)
+        );
+        assert_eq!(
+            decode_block_bytes(&[0x00, 0x00, 0x50, 0x03, b'a']),
+            Err(QpackError::UnexpectedEnd)
+        );
+    }
+
+    #[test]
+    fn decode_block_overflow_rejected() {
+        let bytes = [
+            0x00, 0x00, 0xFF, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80,
+        ];
+        assert_eq!(decode_block_bytes(&bytes), Err(QpackError::Overflow));
+    }
+
+    #[test]
+    fn decode_block_bad_huffman_rejected() {
+        assert!(matches!(
+            decode_block_bytes(&[0x00, 0x00, 0x50, 0x81, 0xFF]),
+            Err(QpackError::HuffmanDecoding(_))
+        ));
+    }
+
+    #[test]
+    fn decode_block_out_of_range_index_rejected() {
+        assert_eq!(
+            decode_block_bytes(&[0x00, 0x00, 0xFF, 0x40]),
+            Err(QpackError::InvalidIndex(127))
+        );
+    }
+
+    /// A Huffman-coded literal round-trips through `prefix_string::encode`,
+    /// the encoder-side twin of the 4-bit and 8-bit string decoders.
+    #[test]
+    fn decode_block_huffman_round_trip() {
+        let mut wire = vec![0x00, 0x00];
+        prefix_string::encode(4, 0b0010, b"foo", &mut wire).unwrap();
+        prefix_string::encode(8, 0, b"bar", &mut wire).unwrap();
+        let fields = decode_block_bytes(&wire).expect("decoded");
+        assert_eq!(fields.len(), 1);
+        assert_eq!(&fields[0].name[..], b"foo");
+        assert_eq!(&fields[0].value[..], b"bar");
+    }
+
+    /// The selectors partition every first byte, so no byte can reach the
+    /// `InvalidFieldPrefix` fallback; that arm keeps the dispatch total so a
+    /// non-consuming `Ok(None)` selector can never spin the loop. Every
+    /// single-byte field section must return some typed result instead.
+    #[test]
+    fn decode_block_claims_every_first_byte() {
+        for first in 0u8..=255 {
+            let mut read: &[u8] = &[0x00, 0x00, first];
+            let result = decode_block(&mut read);
+            assert!(
+                !matches!(result, Err(QpackError::InvalidFieldPrefix(_))),
+                "first byte {first:#04x} claimed by no selector"
+            );
+        }
     }
 
     fn decode_line(bytes: &[u8]) -> Result<Option<&'static HeaderField>, QpackError> {

@@ -5,9 +5,9 @@
 //! string codec (`prefix_string`) with its Huffman coding (`huffman`), the
 //! field line type (`field`), the fixed 99-entry static table
 //! (`static_table`), and the capacity-zero encoded field section prefix
-//! (`block`). The literal-with-name-reference field line (Section 4.5.4,
-//! static name only) is implemented in `block`; literal-name, post-base and
-//! the full decoder are later slices.
+//! (`block`). The field-line representations (Sections 4.5.2-4.5.6, static
+//! only) and the full field-section decoder `decode_block` are implemented
+//! in `block`; the encoder is a later slice.
 //!
 //! References:
 //! - RFC 9204 Section 4.1.1 (prefix integers), Section 4.2 (prefix strings
@@ -60,6 +60,12 @@ pub(crate) enum QpackError {
     /// resolved; VPP reports the same condition as
     /// `HPACK_ERROR_COMPRESSION`.
     DynamicReference,
+    /// A field-line first byte claimed by no representation decoder. The
+    /// selectors in `block` partition every byte, so this is unreachable
+    /// today; it keeps the field-block loop total and typed rather than
+    /// spinning on a non-consuming `Ok(None)` selector. h3 reports the same
+    /// condition as `DecoderError::UnknownPrefix`.
+    InvalidFieldPrefix(u8),
     /// A field-line or static-table index that resolves to no entry. The
     /// fixed 99-entry table (RFC 9204 Appendix A) is the only reference
     /// target this static-only decoder supports; VPP reports the failed
@@ -109,6 +115,9 @@ impl std::fmt::Display for QpackError {
             }
             QpackError::DynamicReference => {
                 write!(f, "dynamic table reference with a capacity-zero table")
+            }
+            QpackError::InvalidFieldPrefix(byte) => {
+                write!(f, "unknown field line prefix byte {byte:#04x}")
             }
             QpackError::InvalidIndex(index) => {
                 write!(f, "static table index {index} out of range")
