@@ -33,11 +33,22 @@
 use hammer_infra::pool::{Index, Pool};
 use hammer_infra::thread_owned::ThreadOwnedError;
 use hammer_runtime::DataWorkerId;
-use hammer_service::session::SessionId;
+use hammer_runtime::app::SessionAppContext;
+use hammer_runtime::session::SessionStreamDirection;
+use hammer_service::session::{SessionId, SessionWorker};
 
 /// Default connection-context capacity of one data worker's pool, matching
 /// the QUIC per-worker context capacity (quic worker.rs:42).
 pub(crate) const HTTP_CONTEXT_CAPACITY: usize = 4_096;
+
+/// Exact bytes of the local HTTP/3 control-stream preface: the CONTROL
+/// stream type (0x00) followed by a SETTINGS frame (type 0x04, length 0x04)
+/// carrying QPACK_MAX_TABLE_CAPACITY=0 (0x01 0x00) and QPACK_BLOCKED_STREAMS=0
+/// (0x07 0x00), in the write order of VPP `http3_conn_init` (http3.c:241-246):
+/// stream type first, then the SETTINGS frame. The `http3::proto` encoders
+/// (`StreamType`, `Settings`) target `BufMut`, so a fixed no-heap constant
+/// keeps the preface allocation-free on the worker.
+pub(crate) const LOCAL_CONTROL_PREFACE: [u8; 7] = [0x00, 0x04, 0x04, 0x01, 0x00, 0x07, 0x00];
 
 /// Generation-checked identity for one HTTP/3 connection context in the
 /// owning data worker's pool.
@@ -75,13 +86,20 @@ impl From<ContextId> for Index {
 
 /// Cold per-connection state bound to one data-worker context slot.
 ///
-/// Holds exactly the lower QUIC `SessionId` the context was allocated for;
-/// hot HTTP/3 connection state (frames, QPACK, streams) belongs to later
-/// slices.
+/// Holds the lower QUIC `SessionId` the context was allocated for plus the
+/// HTTP/3 bootstrap state of the local control stream; hot HTTP/3 connection
+/// state (frames, QPACK, streams) belongs to later slices.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct ConnectionContext {
     /// Lower QUIC session this connection context is bound to.
     pub(crate) session: SessionId,
+    /// Local control stream child Session, recorded only after the bootstrap
+    /// action succeeds; `None` until then. Mirrors VPP recording the opened
+    /// control stream in `http_ctx_t::our_ctrl_stream_index` (http3.c:234).
+    pub(crate) local_control: Option<SessionId>,
+    /// True until the peer's SETTINGS arrive on its control stream; set at
+    /// allocation and consumed by the peer-SETTINGS slice.
+    pub(crate) peer_settings_pending: bool,
 }
 
 /// Typed errors for per-worker connection context operations and container
@@ -102,6 +120,12 @@ pub(crate) enum HttpWorkerError {
         expected: SessionId,
         actual: SessionId,
     },
+    #[error("http connection context {context:?} already opened its control stream")]
+    ControlStreamAlreadyOpen { context: ContextId },
+    #[error(
+        "http connection context {context:?} failed to open its control stream through the Session Worker"
+    )]
+    ControlStreamOpenFailed { context: ContextId },
     #[error("http worker {worker} is outside the configured worker range")]
     WorkerOutOfRange { worker: usize },
     #[error("http worker {worker} is already installed")]
@@ -146,7 +170,11 @@ impl HttpWorker {
     /// O(1); fails with `ContextCapacityExhausted` when the pool is full.
     pub(crate) fn allocate(&mut self, session: SessionId) -> Result<ContextId, HttpWorkerError> {
         self.contexts
-            .insert(ConnectionContext { session })
+            .insert(ConnectionContext {
+                session,
+                local_control: None,
+                peer_settings_pending: true,
+            })
             .map(ContextId::from)
             .ok_or(HttpWorkerError::ContextCapacityExhausted {
                 capacity: self.contexts.capacity(),
@@ -183,6 +211,37 @@ impl HttpWorker {
         Ok(connection)
     }
 
+    /// Opens the local HTTP/3 control stream for a live context, exactly once.
+    ///
+    /// Mirrors VPP `http3_conn_init` (http3.c:216-250), where the control
+    /// stream is the first stream opened on a fresh connection. Rejects a
+    /// context that already recorded a control stream, invokes
+    /// `SessionWorker::open_stream(parent, Uni, app_context)` exactly once,
+    /// and records the returned child only after the action succeeds; on
+    /// failure the context is left unchanged and the typed error returned
+    /// (VPP also reports control-stream open failure without a child,
+    /// http3.c:224-230). The control-stream preface bytes are not written
+    /// here; that is the FIFO slice.
+    pub(crate) fn bootstrap_control_stream(
+        &mut self,
+        context: ContextId,
+        sessions: &mut SessionWorker<Index>,
+        app_context: SessionAppContext,
+    ) -> Result<SessionId, HttpWorkerError> {
+        let connection = self
+            .contexts
+            .get_mut(context.into())
+            .ok_or(HttpWorkerError::ContextMissing { context })?;
+        if connection.local_control.is_some() {
+            return Err(HttpWorkerError::ControlStreamAlreadyOpen { context });
+        }
+        let child = sessions
+            .open_stream(connection.session, SessionStreamDirection::Uni, app_context)
+            .map_err(|_| HttpWorkerError::ControlStreamOpenFailed { context })?;
+        connection.local_control = Some(child);
+        Ok(child)
+    }
+
     /// Releases a context slot back to the pool.
     ///
     /// O(1); the slot's generation advances, so previously issued identities
@@ -216,6 +275,109 @@ mod tests {
 
     fn session(slot: u32, generation: u32) -> SessionId {
         SessionId::from_raw(u64::from(slot) | (u64::from(generation) << 32))
+    }
+
+    use std::cell::Cell;
+
+    use hammer_runtime::app::{AppSessionConfig, SessionAppContext};
+    use hammer_runtime::session::{SessionApplicationErrorCode, SessionStreamDirection};
+    use hammer_runtime::{RuntimeError, RuntimeResult};
+    use hammer_service::session::application::ApplicationMain;
+    use hammer_service::session::runtime::{SessionTransportId, SessionTransportWorkerActions};
+
+    const ACTION_TRANSPORT: SessionTransportId = SessionTransportId::new(0);
+
+    /// Per-thread observation of the fake `open_stream` action: invocation
+    /// count, the passed `app_context`, and whether the next call fails.
+    thread_local! {
+        static OPEN_CALLS: Cell<u32> = const { Cell::new(0) };
+        static OPEN_CONTEXT: Cell<u64> = const { Cell::new(0) };
+        static OPEN_FAIL: Cell<bool> = const { Cell::new(false) };
+    }
+
+    fn fake_open_stream(
+        _sessions: &mut SessionWorker<Index>,
+        parent: SessionId,
+        direction: SessionStreamDirection,
+        app_context: SessionAppContext,
+    ) -> RuntimeResult<SessionId> {
+        OPEN_CALLS.with(|calls| calls.set(calls.get() + 1));
+        OPEN_CONTEXT.with(|seen| seen.set(app_context));
+        assert_eq!(direction, SessionStreamDirection::Uni);
+        if OPEN_FAIL.with(|fail| fail.get()) {
+            return Err(RuntimeError::ServiceClosed);
+        }
+        Ok(SessionId::from_raw(parent.get() + 1))
+    }
+
+    fn fake_reset_stream(
+        _sessions: &mut SessionWorker<Index>,
+        _session_id: SessionId,
+        _code: SessionApplicationErrorCode,
+    ) -> RuntimeResult<()> {
+        Ok(())
+    }
+
+    fn fake_stop_sending(
+        _sessions: &mut SessionWorker<Index>,
+        _session_id: SessionId,
+        _code: SessionApplicationErrorCode,
+    ) -> RuntimeResult<()> {
+        Ok(())
+    }
+
+    fn fake_close_connection(
+        _sessions: &mut SessionWorker<Index>,
+        _session_id: SessionId,
+        _code: SessionApplicationErrorCode,
+        _reason: &[u8],
+    ) -> RuntimeResult<()> {
+        Ok(())
+    }
+
+    /// An `HttpWorker` with one context allocated for a real Session-worker
+    /// parent Session whose transport has the fake action table installed.
+    fn harness() -> (HttpWorker, SessionWorker<Index>, ContextId, SessionId) {
+        let applications = ApplicationMain::new(4);
+        let application = applications.attach().expect("attach test Application");
+        let mut sessions = SessionWorker::<Index>::new(
+            DataWorkerId::new(0),
+            1,
+            AppSessionConfig::default(),
+            64,
+            applications,
+            None,
+        )
+        .expect("construct Session worker");
+        sessions
+            .install_transport_actions(
+                ACTION_TRANSPORT,
+                SessionTransportWorkerActions::new(
+                    fake_open_stream,
+                    fake_reset_stream,
+                    fake_stop_sending,
+                    fake_close_connection,
+                ),
+            )
+            .expect("install transport actions");
+        sessions
+            .install_application_mq_for_test(application)
+            .expect("install Application Rx MQ");
+        let parent = sessions
+            .construct_transport_session(
+                ACTION_TRANSPORT,
+                Index::new(3, 1),
+                0xCAFE_1234,
+                application,
+                None,
+                None,
+                None,
+                false,
+            )
+            .expect("construct parent transport Session");
+        let mut worker = HttpWorker::with_capacity(4);
+        let context = worker.allocate(parent).expect("allocate context");
+        (worker, sessions, context, parent)
     }
 
     #[test]
@@ -262,10 +424,10 @@ mod tests {
             Index::from(second).generation(),
             Index::from(first).generation()
         );
-        assert_eq!(
+        assert!(matches!(
             worker.get(first),
-            Err(HttpWorkerError::ContextMissing { context: first })
-        );
+            Err(HttpWorkerError::ContextMissing { context: c }) if c == first
+        ));
         assert_eq!(
             worker.get(second).expect("new identity live").session,
             session(7, 2)
@@ -276,16 +438,16 @@ mod tests {
     fn capacity_exhaustion_is_typed_error() {
         let mut worker = HttpWorker::with_capacity(1);
         worker.allocate(session(1, 1)).expect("first slot");
-        assert_eq!(
+        assert!(matches!(
             worker.allocate(session(2, 1)),
             Err(HttpWorkerError::ContextCapacityExhausted { capacity: 1 })
-        );
+        ));
         let mut empty = HttpWorker::with_capacity(0);
         assert!(empty.is_empty());
-        assert_eq!(
+        assert!(matches!(
             empty.allocate(session(3, 1)),
             Err(HttpWorkerError::ContextCapacityExhausted { capacity: 0 })
-        );
+        ));
     }
 
     #[test]
@@ -294,14 +456,14 @@ mod tests {
         let bound = session(1, 1);
         let other = session(2, 1);
         let context = worker.allocate(bound).expect("allocate");
-        assert_eq!(
+        assert!(matches!(
             worker.get_for_session(context, other),
             Err(HttpWorkerError::SessionMismatch {
-                context,
-                expected: other,
-                actual: bound,
-            })
-        );
+                context: c,
+                expected: e,
+                actual: a,
+            }) if c == context && e == other && a == bound
+        ));
         assert_eq!(
             worker
                 .get_for_session(context, bound)
@@ -315,15 +477,112 @@ mod tests {
     fn remove_missing_or_stale_identity_is_typed_error() {
         let mut worker = HttpWorker::with_capacity(2);
         let bogus = ContextId::from(u64::MAX);
-        assert_eq!(
+        assert!(matches!(
             worker.remove(bogus),
-            Err(HttpWorkerError::ContextMissing { context: bogus })
-        );
+            Err(HttpWorkerError::ContextMissing { context: c }) if c == bogus
+        ));
         let context = worker.allocate(session(1, 1)).expect("allocate");
         worker.remove(context).expect("remove");
-        assert_eq!(
+        assert!(matches!(
             worker.remove(context),
-            Err(HttpWorkerError::ContextMissing { context })
+            Err(HttpWorkerError::ContextMissing { context: c }) if c == context
+        ));
+    }
+
+    #[test]
+    fn fresh_context_has_no_local_control_and_awaits_peer_settings() {
+        let mut worker = HttpWorker::with_capacity(4);
+        let lower = session(3, 1);
+        let context = worker.allocate(lower).expect("allocate context");
+        let connection = worker.get(context).expect("live context");
+        assert_eq!(connection.local_control, None);
+        assert!(connection.peer_settings_pending);
+    }
+
+    #[test]
+    fn bootstrap_opens_one_uni_control_stream_and_records_child() {
+        let (mut worker, mut sessions, context, parent) = harness();
+        OPEN_CALLS.with(|calls| calls.set(0));
+        OPEN_CONTEXT.with(|seen| seen.set(0));
+        let child = worker
+            .bootstrap_control_stream(context, &mut sessions, 0x1234)
+            .expect("bootstrap succeeds");
+        assert_eq!(
+            child,
+            SessionId::from_raw(parent.get() + 1),
+            "the returned child is the one the action produced"
         );
+        assert_eq!(
+            worker.get(context).expect("live context").local_control,
+            Some(child),
+            "the child is recorded after success"
+        );
+        OPEN_CALLS.with(|calls| assert_eq!(calls.get(), 1, "open_stream invoked exactly once"));
+        OPEN_CONTEXT.with(|seen| assert_eq!(seen.get(), 0x1234, "app context passed through"));
+    }
+
+    #[test]
+    fn duplicate_bootstrap_is_rejected_without_a_second_action() {
+        let (mut worker, mut sessions, context, _parent) = harness();
+        OPEN_CALLS.with(|calls| calls.set(0));
+        worker
+            .bootstrap_control_stream(context, &mut sessions, 1)
+            .expect("first bootstrap succeeds");
+        let duplicate = worker.bootstrap_control_stream(context, &mut sessions, 2);
+        assert!(matches!(
+            duplicate,
+            Err(HttpWorkerError::ControlStreamAlreadyOpen { context: c }) if c == context
+        ));
+        OPEN_CALLS.with(|calls| assert_eq!(calls.get(), 1, "second bootstrap invokes no action"));
+    }
+
+    #[test]
+    fn action_failure_leaves_context_unbootstrapped_and_unchanged() {
+        let (mut worker, mut sessions, context, _parent) = harness();
+        OPEN_CALLS.with(|calls| calls.set(0));
+        OPEN_FAIL.with(|fail| fail.set(true));
+        let failed = worker.bootstrap_control_stream(context, &mut sessions, 7);
+        assert!(matches!(
+            failed,
+            Err(HttpWorkerError::ControlStreamOpenFailed { context: c }) if c == context
+        ));
+        OPEN_CALLS.with(|calls| assert_eq!(calls.get(), 1, "failing action still invoked once"));
+        let connection = worker.get(context).expect("live context");
+        assert_eq!(connection.local_control, None, "failure records no child");
+        assert!(
+            connection.peer_settings_pending,
+            "peer-SETTINGS expectation unchanged"
+        );
+        // The same context can still bootstrap after the failure.
+        OPEN_FAIL.with(|fail| fail.set(false));
+        let child = worker
+            .bootstrap_control_stream(context, &mut sessions, 7)
+            .expect("retry succeeds");
+        assert_eq!(
+            worker.get(context).expect("live context").local_control,
+            Some(child)
+        );
+        OPEN_CALLS.with(|calls| assert_eq!(calls.get(), 2, "retry invokes the action again"));
+    }
+
+    #[test]
+    fn local_control_preface_bytes_are_exact() {
+        use crate::http3::proto::coding::Encode;
+        use crate::http3::proto::frame::Settings;
+        use crate::http3::proto::stream::StreamType;
+
+        // Fixed no-heap constant: CONTROL stream type, then a SETTINGS frame
+        // (type 0x04, length 0x04) carrying QPACK_MAX_TABLE_CAPACITY=0
+        // (0x01 0x00) and QPACK_BLOCKED_STREAMS=0 (0x07 0x00).
+        assert_eq!(LOCAL_CONTROL_PREFACE, [0x00, 0x04, 0x04, 0x01, 0x00, 0x07, 0x00]);
+        // Cross-check against the proto encoders (test-only allocation is
+        // fine): CONTROL stream type, then the static-only QPACK SETTINGS.
+        let mut encoded = Vec::new();
+        StreamType::CONTROL.encode(&mut encoded);
+        Settings::qpack_zero_capacity()
+            .expect("static-only QPACK settings")
+            .encode(&mut encoded)
+            .expect("SETTINGS frame encodes into a Vec");
+        assert_eq!(encoded, LOCAL_CONTROL_PREFACE);
     }
 }
