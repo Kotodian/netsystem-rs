@@ -250,36 +250,7 @@ impl<'a> Request<'a> {
     pub fn encoded_len(&self) -> Result<usize, EncodeError> {
         let path_len = self.target_path.len() as u64;
         let body_len = self.body.len() as u64;
-        let mut headers_len: u64 = 0;
-        for header in self.headers {
-            let entry = match header {
-                AppHeader::Known {
-                    flags,
-                    name: _,
-                    value,
-                } => {
-                    if flags.bits() & FieldLineFlags::CUSTOM_NAME != 0 {
-                        return Err(EncodeError::ReservedFlag);
-                    }
-                    8u64.checked_add(value.len() as u64)
-                        .ok_or(EncodeError::LengthOverflow)?
-                }
-                AppHeader::Custom { flags, name, value } => {
-                    if flags.bits() & FieldLineFlags::CUSTOM_NAME != 0 {
-                        return Err(EncodeError::ReservedFlag);
-                    }
-                    if name.len() > u16::MAX as usize {
-                        return Err(EncodeError::LengthOverflow);
-                    }
-                    8u64.checked_add(name.len() as u64)
-                        .and_then(|n| n.checked_add(value.len() as u64))
-                        .ok_or(EncodeError::LengthOverflow)?
-                }
-            };
-            headers_len = headers_len
-                .checked_add(entry)
-                .ok_or(EncodeError::LengthOverflow)?;
-        }
+        let headers_len = header_entries_len(self.headers)?;
         if path_len > u32::MAX as u64 || headers_len > u32::MAX as u64 {
             return Err(EncodeError::LengthOverflow);
         }
@@ -451,24 +422,7 @@ pub(crate) fn publish_request(fifo: &Fifo, req: &Request<'_>) -> Result<(), Publ
     req.encode_msg_header(&layout, &mut meta);
     scatter(&mut reservation, [&meta[..]]).map_err(PublishError::Fifo)?;
     scatter(&mut reservation, [req.target_path]).map_err(PublishError::Fifo)?;
-    let mut prefix = [0u8; 8];
-    for header in req.headers {
-        match *header {
-            AppHeader::Known { flags, name, value } => {
-                let mut w = put_u16(&mut prefix, 0, flags.bits());
-                w = put_u16(&mut prefix, w, name);
-                put_u32(&mut prefix, w, value.len() as u32);
-                scatter(&mut reservation, [&prefix[..], value])
-            }
-            AppHeader::Custom { flags, name, value } => {
-                let mut w = put_u16(&mut prefix, 0, flags.bits() | FieldLineFlags::CUSTOM_NAME);
-                w = put_u16(&mut prefix, w, name.len() as u16);
-                put_u32(&mut prefix, w, value.len() as u32);
-                scatter(&mut reservation, [&prefix[..4], name, &prefix[4..], value])
-            }
-        }
-        .map_err(PublishError::Fifo)?;
-    }
+    scatter_headers(&mut reservation, req.headers).map_err(PublishError::Fifo)?;
     let copied = scatter(&mut reservation, [req.body]).map_err(PublishError::Fifo)?;
     if copied != total {
         reservation.cancel();
@@ -500,6 +454,289 @@ where
         reservation.cancel();
     }
     copied
+}
+
+/// Scatter-copy the header-list entries into `reservation`, each as its
+/// 8-byte prefix plus the value (name/value split for custom names), all
+/// prefixes reusing one stack buffer; returns the cumulative byte count. On
+/// failure the reservation is cancelled so no bytes become visible.
+#[allow(dead_code)] // used only by the FIFO publish paths, wired in a later seam
+fn scatter_headers(
+    reservation: &mut FifoWriteReservation<'_>,
+    headers: &[AppHeader<'_>],
+) -> Result<usize, FifoError> {
+    let mut prefix = [0u8; 8];
+    let mut copied = 0usize;
+    for header in headers {
+        copied = match *header {
+            AppHeader::Known { flags, name, value } => {
+                let mut w = put_u16(&mut prefix, 0, flags.bits());
+                w = put_u16(&mut prefix, w, name);
+                put_u32(&mut prefix, w, value.len() as u32);
+                scatter(reservation, [&prefix[..], value])?
+            }
+            AppHeader::Custom { flags, name, value } => {
+                let mut w = put_u16(&mut prefix, 0, flags.bits() | FieldLineFlags::CUSTOM_NAME);
+                w = put_u16(&mut prefix, w, name.len() as u16);
+                put_u32(&mut prefix, w, value.len() as u32);
+                scatter(reservation, [&prefix[..4], name, &prefix[4..], value])?
+            }
+        };
+    }
+    Ok(copied)
+}
+
+// --- Inbound publish: server/transport -> app --------------------------------
+
+/// One inbound request to publish: a request received from the transport and
+/// delivered to the app. All payloads are borrowed slices; the encoder writes
+/// the complete VPP byte layout into a FIFO in one reserve/commit.
+#[derive(Debug, Clone, Copy)]
+#[allow(dead_code)] // tests exercise it; the app-session publisher wires it in a later seam
+pub(crate) struct InboundRequest<'a> {
+    pub(crate) method: ReqMethod,
+    pub(crate) scheme: UrlScheme,
+    /// Request-target pseudo fields; each is a span with its own
+    /// offset/len pair in the fixed header, never a header-list entry.
+    pub(crate) target_authority: &'a [u8],
+    pub(crate) target_path: &'a [u8],
+    pub(crate) target_query: &'a [u8],
+    pub(crate) headers: &'a [AppHeader<'a>],
+    pub(crate) body: &'a [u8],
+}
+
+impl<'a> InboundRequest<'a> {
+    /// Total encoded size: 88-byte header + authority + path + query +
+    /// header list + body, with checked arithmetic and width validation.
+    /// Mirrors [`Request::encoded_len`]; the server layout prepends the
+    /// authority and query pseudo fields to the app layout's path region.
+    #[allow(dead_code)] // used only by `publish_inbound_request`
+    fn encoded_len(&self) -> Result<usize, EncodeError> {
+        let authority_len = self.target_authority.len() as u64;
+        let path_len = self.target_path.len() as u64;
+        let query_len = self.target_query.len() as u64;
+        let body_len = self.body.len() as u64;
+        let headers_len = header_entries_len(self.headers)?;
+        if authority_len > u32::MAX as u64
+            || path_len > u32::MAX as u64
+            || query_len > u32::MAX as u64
+            || headers_len > u32::MAX as u64
+        {
+            return Err(EncodeError::LengthOverflow);
+        }
+        let data_len = authority_len
+            .checked_add(path_len)
+            .and_then(|n| n.checked_add(query_len))
+            .and_then(|n| n.checked_add(headers_len))
+            .and_then(|n| n.checked_add(body_len))
+            .ok_or(EncodeError::LengthOverflow)?;
+        MSG_HEADER_LEN
+            .checked_add(data_len as usize)
+            .ok_or(EncodeError::LengthOverflow)
+    }
+
+    /// Encode the fixed 88-byte `http_msg_t` header into `buf` (which must
+    /// hold `MSG_HEADER_LEN` bytes), returning `MSG_HEADER_LEN`. Pseudo-field
+    /// spans tile the data area in order: authority at 0, path, query,
+    /// headers, body. `data.len` includes the body (the `decode` invariant).
+    #[allow(dead_code)] // used only by `publish_inbound_request`
+    fn encode_msg_header(&self, layout: &InboundLayout, buf: &mut [u8]) -> usize {
+        let mut w = 0usize;
+        w = put_u32(buf, w, MsgType::Request as u32);
+        w = put_u32(buf, w, self.method as u32);
+        w = put_u32(buf, w, MsgDataType::Inline as u32);
+        w += 4; // `http_msg_data_t` padding: type @8, len @16
+        w = put_u64(buf, w, layout.data_len);
+        w = put_u8(buf, w, self.scheme as u8);
+        w += 3; // `http_msg_data_t` padding: scheme @16, authority @20
+        w = put_u32(buf, w, 0); // target_authority_offset: authority is first
+        w = put_u32(buf, w, layout.authority_len);
+        w = put_u32(buf, w, layout.authority_len); // target_path_offset
+        w = put_u32(buf, w, layout.path_len);
+        w = put_u32(buf, w, layout.query_offset);
+        w = put_u32(buf, w, layout.query_len);
+        w = put_u32(buf, w, layout.headers_offset);
+        w = put_u32(buf, w, layout.headers_len);
+        w = put_u32(buf, w, layout.body_offset);
+        w = put_u64(buf, w, layout.body_len);
+        w = put_u64(buf, w, 0); // headers_ctx: server-side scratch, zero on publish
+        w = put_u8(buf, w, UpgradeProto::Na as u8);
+        w += 7; // tail padding of `http_msg_data_t` up to 80 bytes
+        w
+    }
+}
+
+/// Validated wire lengths and offsets for the inbound (server -> app) layout,
+/// derived once from an `encoded_len`-validated `total` so the header encode
+/// and the scatter copy agree on every offset without re-walking the header
+/// list. The data area tiles `[authority][path][query][headers][body]`; the
+/// authority is the first span (offset 0), unlike the app writer's path-first
+/// layout.
+#[derive(Debug, Clone, Copy)]
+#[allow(dead_code)] // used only by `publish_inbound_request`
+struct InboundLayout {
+    data_len: u64,
+    authority_len: u32,
+    path_len: u32,
+    query_len: u32,
+    query_offset: u32,
+    headers_len: u32,
+    headers_offset: u32,
+    body_len: u64,
+    body_offset: u32,
+}
+
+impl InboundLayout {
+    /// `total` must come from `InboundRequest::encoded_len` for the same
+    /// request; re-checked here so the no-panic contract does not rely on
+    /// that precondition.
+    #[allow(dead_code)] // used only by `publish_inbound_request`
+    fn derive(req: &InboundRequest<'_>, total: usize) -> Result<Self, EncodeError> {
+        let authority_len =
+            u32::try_from(req.target_authority.len()).map_err(|_| EncodeError::LengthOverflow)?;
+        let path_len =
+            u32::try_from(req.target_path.len()).map_err(|_| EncodeError::LengthOverflow)?;
+        let query_len =
+            u32::try_from(req.target_query.len()).map_err(|_| EncodeError::LengthOverflow)?;
+        let body_len = req.body.len() as u64;
+        let headers_len = total
+            .checked_sub(MSG_HEADER_LEN)
+            .and_then(|n| n.checked_sub(req.target_authority.len()))
+            .and_then(|n| n.checked_sub(req.target_path.len()))
+            .and_then(|n| n.checked_sub(req.target_query.len()))
+            .and_then(|n| n.checked_sub(req.body.len()))
+            .and_then(|n| u32::try_from(n).ok())
+            .ok_or(EncodeError::LengthOverflow)?;
+        let query_offset = authority_len
+            .checked_add(path_len)
+            .ok_or(EncodeError::LengthOverflow)?;
+        let headers_offset = query_offset
+            .checked_add(query_len)
+            .ok_or(EncodeError::LengthOverflow)?;
+        let body_offset = headers_offset
+            .checked_add(headers_len)
+            .ok_or(EncodeError::LengthOverflow)?;
+        let data_len = (body_offset as u64)
+            .checked_add(body_len)
+            .ok_or(EncodeError::LengthOverflow)?;
+        Ok(Self {
+            data_len,
+            authority_len,
+            path_len,
+            query_len,
+            query_offset,
+            headers_len,
+            headers_offset,
+            body_len,
+            body_offset,
+        })
+    }
+}
+
+/// Publish one server/transport -> app request to `fifo` in the VPP server
+/// `http_msg_t` layout, all-or-nothing.
+///
+/// Wire order: the 88-byte `http_msg_t`, then the request-target pseudo
+/// fields — authority, path, query — each tracked by its own offset/len pair
+/// in the fixed header (28/32, 36/40, 44/48) and never encoded as
+/// header-list entries, then the regular header list (52/56), then the body
+/// (60/64):
+///
+/// ```text
+/// [HttpMsg: 88 bytes][authority][path][query][header list][body]
+/// ```
+///
+/// `headers_ctx` (72) is written zero; `data.len` (u64 @16) is the sum of all
+/// five payload lengths including the body, exactly the invariant `decode`
+/// enforces.
+///
+/// Synchronization mirrors [`publish_request`]: the caller is the single
+/// producer, a capacity preflight (`max_enqueue`) arms
+/// `want_deq_notification` and returns with the FIFO untouched on failure,
+/// then one `reserve_write(total)` is followed by a scatter copy (the fixed
+/// 88-byte header from a stack buffer, then each borrowed span) and a single
+/// commit as the only visibility point. No FIFO event flag is raised here.
+///
+/// Hammer differences (documented; `decode` is unchanged): VPP servers may
+/// stream large bodies out of the data area (`HTTP_DATA_STREAMING`); this
+/// seam publishes the body inline so `decode`'s inline-only contract holds.
+/// `decode` also validates the app-writer layout (path at data offset 0), so
+/// a frame with a non-empty authority/query is deliberately not
+/// `decode`-able — the server layout differs and `decode` is not loosened.
+#[allow(dead_code)] // tests exercise it; the app-session publisher wires it in a later seam
+pub(crate) fn publish_inbound_request(
+    fifo: &Fifo,
+    req: &InboundRequest<'_>,
+) -> Result<(), PublishError> {
+    let total = req.encoded_len().map_err(PublishError::Encode)?;
+    let layout = InboundLayout::derive(req, total).map_err(PublishError::Encode)?;
+    let available = fifo.max_enqueue();
+    if available < total {
+        fifo.want_deq_notification();
+        return Err(PublishError::Capacity {
+            requested: total,
+            available,
+        });
+    }
+    let mut reservation = fifo.reserve_write(total).map_err(PublishError::Fifo)?;
+    let mut meta = [0u8; MSG_HEADER_LEN];
+    req.encode_msg_header(&layout, &mut meta);
+    scatter(&mut reservation, [&meta[..]]).map_err(PublishError::Fifo)?;
+    scatter(&mut reservation, [req.target_authority]).map_err(PublishError::Fifo)?;
+    scatter(&mut reservation, [req.target_path]).map_err(PublishError::Fifo)?;
+    scatter(&mut reservation, [req.target_query]).map_err(PublishError::Fifo)?;
+    scatter_headers(&mut reservation, req.headers).map_err(PublishError::Fifo)?;
+    let copied = scatter(&mut reservation, [req.body]).map_err(PublishError::Fifo)?;
+    if copied != total {
+        reservation.cancel();
+        return Err(PublishError::Fifo(FifoError::CommitExceedsReservation {
+            initialized: copied,
+            reserved: total,
+        }));
+    }
+    match reservation.commit(copied) {
+        Ok(_) => Ok(()),
+        Err(source) => {
+            reservation.cancel();
+            Err(PublishError::Fifo(source))
+        }
+    }
+}
+
+/// Total wire size of a header list: each entry's 8-byte prefix plus its
+/// value (and custom name), with the caller-set `CUSTOM_NAME` flag rejected
+/// and custom names width-checked against `u16`.
+fn header_entries_len(headers: &[AppHeader<'_>]) -> Result<u64, EncodeError> {
+    let mut headers_len: u64 = 0;
+    for header in headers {
+        let entry = match header {
+            AppHeader::Known {
+                flags,
+                name: _,
+                value,
+            } => {
+                if flags.bits() & FieldLineFlags::CUSTOM_NAME != 0 {
+                    return Err(EncodeError::ReservedFlag);
+                }
+                8u64.checked_add(value.len() as u64).ok_or(EncodeError::LengthOverflow)?
+            }
+            AppHeader::Custom { flags, name, value } => {
+                if flags.bits() & FieldLineFlags::CUSTOM_NAME != 0 {
+                    return Err(EncodeError::ReservedFlag);
+                }
+                if name.len() > u16::MAX as usize {
+                    return Err(EncodeError::LengthOverflow);
+                }
+                8u64.checked_add(name.len() as u64)
+                    .and_then(|n| n.checked_add(value.len() as u64))
+                    .ok_or(EncodeError::LengthOverflow)?
+            }
+        };
+        headers_len = headers_len
+            .checked_add(entry)
+            .ok_or(EncodeError::LengthOverflow)?;
+    }
+    Ok(headers_len)
 }
 
 /// Encode one header-list entry at `w`; returns the new write position.

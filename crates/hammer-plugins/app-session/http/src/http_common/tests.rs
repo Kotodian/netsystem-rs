@@ -531,3 +531,245 @@ fn publish_request_multi_chunk_body() {
     assert_eq!(decoded.target_path, b"/upload.bin");
     assert_eq!(decoded.body, body.as_slice());
 }
+
+// --- Inbound FIFO publish ----------------------------------------------------
+
+/// Little-endian `u32` at `off` in a published frame (tests only; the codec
+/// keeps its own checked readers).
+fn le32(buf: &[u8], off: usize) -> u32 {
+    u32::from_le_bytes(buf[off..off + 4].try_into().unwrap())
+}
+
+fn le64(buf: &[u8], off: usize) -> u64 {
+    u64::from_le_bytes(buf[off..off + 8].try_into().unwrap())
+}
+
+/// Inbound request exercising every request-target pseudo field: authority,
+/// path, query, the two regular headers and a body.
+fn inbound_request_value() -> InboundRequest<'static> {
+    InboundRequest {
+        method: ReqMethod::Post,
+        scheme: UrlScheme::Http,
+        target_authority: b"example.com",
+        target_path: b"/index.html",
+        target_query: b"a=1",
+        headers: &GOLDEN_HEADERS,
+        body: b"abc",
+    }
+}
+
+/// Expected on-FIFO bytes for `inbound_request_value`, built independently of
+/// the codec. The data area tiles [authority][path][query][header list][body]:
+/// 11 + 11 + 3 + 32 + 3 = 60 bytes after the 88-byte msg header, 148 total.
+fn golden_inbound_request() -> Vec<u8> {
+    let mut b = Vec::with_capacity(148);
+    // http_msg_t: type=REQUEST(0), method_or_code=POST(1), data.type=INLINE(0).
+    b.extend_from_slice(&[0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0]);
+    b.extend_from_slice(&[0, 0, 0, 0]); // `http_msg_data_t` padding: type @0, len @8
+    // data.len = 11 + 11 + 3 + 32 + 3 = 60.
+    b.extend_from_slice(&60u64.to_le_bytes());
+    b.push(0); // scheme: HTTP
+    b.extend_from_slice(&[0, 0, 0]); // struct padding
+    // authority @28 off=0 len=11; path @36 off=11 len=11; query @44 off=22
+    // len=3.
+    b.extend_from_slice(&0u32.to_le_bytes());
+    b.extend_from_slice(&11u32.to_le_bytes());
+    b.extend_from_slice(&11u32.to_le_bytes());
+    b.extend_from_slice(&11u32.to_le_bytes());
+    b.extend_from_slice(&22u32.to_le_bytes());
+    b.extend_from_slice(&3u32.to_le_bytes());
+    // headers @52 off=25 len=32; body @60 off=57 len=3; headers_ctx @72 = 0.
+    b.extend_from_slice(&25u32.to_le_bytes());
+    b.extend_from_slice(&32u32.to_le_bytes());
+    b.extend_from_slice(&57u32.to_le_bytes());
+    b.extend_from_slice(&3u64.to_le_bytes());
+    b.extend_from_slice(&0u64.to_le_bytes()); // headers_ctx
+    b.push(0); // upgrade_proto: NA
+    b.extend_from_slice(&[0; 7]); // struct tail padding
+    assert_eq!(b.len(), 88);
+    b.extend_from_slice(b"example.com");
+    b.extend_from_slice(b"/index.html");
+    b.extend_from_slice(b"a=1");
+    // Entry 1: known header ACCEPT (4), flags 0, value_len 9:
+    // [flags:u16][name:u16][value_len:u32][value] = 8 + 9 = 17 bytes.
+    b.extend_from_slice(&[0, 0]);
+    b.extend_from_slice(&4u16.to_le_bytes());
+    b.extend_from_slice(&9u32.to_le_bytes());
+    b.extend_from_slice(b"text/html");
+    // Entry 2: custom name "X-Test", flags CUSTOM_NAME(4), name_len 6,
+    // value_len 1: 8 + 6 + 1 = 15 bytes.
+    b.extend_from_slice(&[4, 0]);
+    b.extend_from_slice(&6u16.to_le_bytes());
+    b.extend_from_slice(b"X-Test");
+    b.extend_from_slice(&1u32.to_le_bytes());
+    b.extend_from_slice(b"1");
+    b.extend_from_slice(b"abc");
+    assert_eq!(b.len(), 148);
+    b
+}
+
+#[test]
+fn publish_inbound_request_writes_vpp_order_and_spans() {
+    let fifo = local_fifo(8192);
+    let req = inbound_request_value();
+    publish_inbound_request(&fifo, &req).unwrap();
+    // Successful publishes arm no deq notification.
+    assert!(!fifo.needs_deq_notification(1));
+    let observed = read_published(&fifo, 148);
+    assert_eq!(observed, golden_inbound_request());
+    // Fixed-header spans: authority off/len @28/32, path @36/40, query @44/48,
+    // headers @52/56, body @60/64, headers_ctx @72 = 0, data.len @16 = 60.
+    assert_eq!(le64(&observed, 16), 60);
+    assert_eq!(le32(&observed, 28), 0);
+    assert_eq!(le32(&observed, 32), 11);
+    assert_eq!(le32(&observed, 36), 11);
+    assert_eq!(le32(&observed, 40), 11);
+    assert_eq!(le32(&observed, 44), 22);
+    assert_eq!(le32(&observed, 48), 3);
+    assert_eq!(le32(&observed, 52), 25);
+    assert_eq!(le32(&observed, 56), 32);
+    assert_eq!(le32(&observed, 60), 57);
+    assert_eq!(le64(&observed, 64), 3);
+    assert_eq!(le64(&observed, 72), 0);
+    // Pseudo-field spans tile the data area in order; the authority bytes are
+    // NOT part of the header region. The regular header list begins after the
+    // query, at 88 + 25 = 113, with the first entry's prefix
+    // [flags:u16][name:u16][value_len:u32].
+    assert_eq!(&observed[88..99], b"example.com");
+    assert_eq!(&observed[99..110], b"/index.html");
+    assert_eq!(&observed[110..113], b"a=1");
+    assert_eq!(&observed[113..121], &[0, 0, 4, 0, 9, 0, 0, 0]);
+    assert_eq!(&observed[145..148], b"abc");
+}
+
+#[test]
+fn publish_inbound_request_round_trips_through_decode() {
+    // With empty authority and query the data area collapses to the app-writer
+    // layout (path at 0, headers after, body last, data.len the sum including
+    // the body), so the frame round-trips through `decode` unchanged.
+    let fifo = local_fifo(8192);
+    let req = InboundRequest {
+        method: ReqMethod::Post,
+        scheme: UrlScheme::Https,
+        target_authority: b"",
+        target_path: b"/x",
+        target_query: b"",
+        headers: &GOLDEN_HEADERS,
+        body: b"abc",
+    };
+    publish_inbound_request(&fifo, &req).unwrap();
+    let observed = read_published(&fifo, 125);
+    let decoded = decode(&observed).unwrap();
+    assert_eq!(decoded.method, req.method);
+    assert_eq!(decoded.scheme, req.scheme);
+    assert_eq!(decoded.target_authority, b"");
+    assert_eq!(decoded.target_path, b"/x");
+    assert_eq!(decoded.target_query, b"");
+    assert_eq!(decoded.body, b"abc");
+    // The header iterator begins at the regular header list, right after the
+    // path span.
+    let headers: Vec<_> = decoded.headers().collect();
+    assert_eq!(headers.len(), 2);
+    assert_eq!(headers[0].name, DecodedHeaderName::Known(header_name::ACCEPT));
+    assert_eq!(headers[0].value, b"text/html");
+    assert_eq!(headers[1].name, DecodedHeaderName::Custom(b"X-Test"));
+    assert_eq!(headers[1].value, b"1");
+}
+
+#[test]
+fn publish_inbound_request_empty_query_and_body() {
+    // Authority "h", path "/", empty query, no headers, empty body: data area
+    // = [h][/], 88 + 2 = 90 bytes total. Offsets stay consistent with the
+    // empty spans: query @2 len 0, headers @2 len 0, body @2 len 0.
+    let fifo = local_fifo(8192);
+    let req = InboundRequest {
+        method: ReqMethod::Get,
+        scheme: UrlScheme::Http,
+        target_authority: b"h",
+        target_path: b"/",
+        target_query: b"",
+        headers: &[],
+        body: b"",
+    };
+    publish_inbound_request(&fifo, &req).unwrap();
+    let observed = read_published(&fifo, 90);
+    assert_eq!(&observed[88..89], b"h");
+    assert_eq!(&observed[89..90], b"/");
+    assert_eq!(le64(&observed, 16), 2);
+    assert_eq!(le32(&observed, 28), 0);
+    assert_eq!(le32(&observed, 32), 1);
+    assert_eq!(le32(&observed, 36), 1);
+    assert_eq!(le32(&observed, 40), 1);
+    assert_eq!(le32(&observed, 44), 2);
+    assert_eq!(le32(&observed, 52), 2);
+    assert_eq!(le32(&observed, 60), 2);
+}
+
+#[test]
+fn inbound_authority_layout_is_not_decodeable() {
+    // Documented difference: `decode` validates the app-writer layout (path at
+    // data offset 0). The server layout puts the authority first, so the
+    // frame is deliberately not `decode`-able; `decode` is not loosened.
+    let fifo = local_fifo(8192);
+    publish_inbound_request(&fifo, &inbound_request_value()).unwrap();
+    let observed = read_published(&fifo, 148);
+    assert_eq!(decode(&observed).unwrap_err(), DecodeError::LayoutMismatch);
+}
+
+#[test]
+fn publish_inbound_request_capacity_preflight_leaves_fifo_unchanged() {
+    // 40-byte path + 1-byte body: 88 + 41 = 129 bytes, one byte over a
+    // 128-byte FIFO.
+    let path = [b'a'; 40];
+    let req = InboundRequest {
+        method: ReqMethod::Get,
+        scheme: UrlScheme::Http,
+        target_authority: b"",
+        target_path: &path,
+        target_query: b"",
+        headers: &[],
+        body: b"x",
+    };
+    assert_eq!(req.encoded_len().unwrap(), 129);
+    let fifo = local_fifo(128);
+    assert_eq!(
+        publish_inbound_request(&fifo, &req),
+        Err(PublishError::Capacity {
+            requested: 129,
+            available: 128
+        })
+    );
+    // The preflight armed the want-deq notification flag and the FIFO holds
+    // zero bytes: nothing was reserved or published.
+    assert!(fifo.needs_deq_notification(1));
+    assert_eq!(fifo.max_dequeue(), 0);
+}
+
+#[test]
+fn publish_inbound_request_encode_error_leaves_fifo_usable() {
+    let fifo = local_fifo(8192);
+    // A caller-set CUSTOM_NAME flag is rejected before any reservation, and
+    // arms no notification.
+    let bad = InboundRequest {
+        method: ReqMethod::Get,
+        scheme: UrlScheme::Http,
+        target_authority: b"",
+        target_path: b"/",
+        target_query: b"",
+        headers: &[AppHeader::Known {
+            flags: FieldLineFlags(FieldLineFlags::CUSTOM_NAME),
+            name: header_name::ACCEPT,
+            value: b"v",
+        }],
+        body: b"",
+    };
+    assert_eq!(
+        publish_inbound_request(&fifo, &bad),
+        Err(PublishError::Encode(EncodeError::ReservedFlag))
+    );
+    assert_eq!(fifo.max_dequeue(), 0);
+    assert!(!fifo.needs_deq_notification(1));
+    // The same FIFO still publishes a valid inbound request afterwards.
+    publish_inbound_request(&fifo, &inbound_request_value()).unwrap();
+    assert_eq!(read_published(&fifo, 148), golden_inbound_request());
+}
