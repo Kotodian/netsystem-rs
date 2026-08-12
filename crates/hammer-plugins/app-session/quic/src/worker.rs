@@ -17,6 +17,7 @@ use hammer_runtime::app::{
     ApplicationId, SessionAppId, SessionConnectError, SessionDgramHeader, SessionFlags,
     SessionHandle,
 };
+use hammer_runtime::session::SessionApplicationErrorCode;
 use hammer_runtime::{
     DataPlaneRuntime, DataWorkerId, NodeRuntimeData, RuntimeError, RuntimeResult,
     SessionConnectionId, SessionListenerId,
@@ -31,7 +32,7 @@ use hammer_service::session::runtime::{
 use crate::listener::QUIC_MAIN;
 use quinn_proto::{
     Connection, ConnectionError, ConnectionHandle, DatagramEvent, Endpoint, EndpointConfig, Event,
-    PartialDecode, StreamEvent, StreamId,
+    PartialDecode, StreamEvent, StreamId, VarInt,
 };
 
 use crate::config::ConfigId;
@@ -51,6 +52,23 @@ const STREAM_RECV_FIN: u8 = 1 << 3;
 /// `QUICLY_ERROR_FROM_APPLICATION_ERROR_CODE(ctx->app_err_code)`, which
 /// defaults to 0).
 const RESET_APP_ERROR_CODE: quinn_proto::VarInt = quinn_proto::VarInt::from_u32(0);
+
+/// QUIC-local wrapper around `SessionApplicationErrorCode` (foreign) so the
+/// checked `TryFrom` conversion into `VarInt` (foreign) can be implemented
+/// under the orphan rule.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[repr(transparent)]
+pub(super) struct QuicAppErrorCode(SessionApplicationErrorCode);
+
+impl TryFrom<QuicAppErrorCode> for VarInt {
+    type Error = u64;
+
+    #[inline]
+    fn try_from(code: QuicAppErrorCode) -> Result<Self, Self::Error> {
+        let raw = u64::from(code.0);
+        VarInt::try_from(raw).map_err(|_| raw)
+    }
+}
 const TIMER_RESOLUTION: Duration = Duration::from_millis(1);
 const TIMER_MAX_TICKS_PER_UPDATE: u32 = 1_024;
 const TIMER_EXPIRY_BUDGET: usize = 256;
@@ -483,6 +501,13 @@ impl Context {
         self.connection_mut()
             .and_then(|connection| connection.engine.as_deref_mut())
             .ok_or_else(|| QuicWorkerError::EngineMissing { context }.into())
+    }
+
+    fn stream_ref(&self) -> Option<&StreamContext> {
+        match &self.role {
+            ContextRole::Stream(stream) => Some(stream),
+            ContextRole::Connection(_) | ContextRole::Listener(_) => None,
+        }
     }
 
     fn stream_mut(&mut self) -> Option<&mut StreamContext> {
@@ -1010,6 +1035,51 @@ impl QuicWorker {
             return Err(error);
         }
         Ok(child_session)
+    }
+
+    /// Resolves `session` through the Session Worker into this worker's QUIC
+    /// context index in O(1) (no pool scan). Rejects sessions unknown to the
+    /// Session Worker, owned by another transport, or not backed by a stream
+    /// or connection context.
+    #[allow(dead_code)] // consumed by the upcoming session action slice
+    fn session_context(
+        &self,
+        sessions: &SessionWorker<Index>,
+        session: SessionId,
+    ) -> Result<ContextId, QuicWorkerError> {
+        let (transport, index) = sessions
+            .session_transport(session)
+            .ok_or(QuicWorkerError::SessionMissing { session })?;
+        if transport != Self::ID {
+            return Err(QuicWorkerError::SessionNotQuic { session });
+        }
+        let context = ContextId::from(index);
+        if !self
+            .contexts
+            .get(index)
+            .is_some_and(|context| context.connection().is_some() || context.stream_ref().is_some())
+        {
+            return Err(QuicWorkerError::ContextMissing { context });
+        }
+        Ok(context)
+    }
+
+    /// Checked conversion of a Session application error code to a QUIC
+    /// varint. VPP stores the code in `quic_app_err_code_t` (signed `i64`,
+    /// quic.h:128) and encodes it as a varint through
+    /// `QUICLY_ERROR_FROM_APPLICATION_ERROR_CODE`; the varint range is
+    /// `0..2^62-1`, so anything at or above `2^62` is rejected.
+    #[allow(dead_code)] // consumed by the upcoming session action slice
+    fn app_error_code_varint(
+        session: SessionId,
+        code: SessionApplicationErrorCode,
+    ) -> Result<VarInt, QuicWorkerError> {
+        VarInt::try_from(QuicAppErrorCode(code)).map_err(|invalid| {
+            QuicWorkerError::ApplicationErrorCodeInvalid {
+                session,
+                code: invalid,
+            }
+        })
     }
 
     pub(super) fn lower_session(&self, context: ContextId) -> RuntimeResult<SessionId> {
@@ -3260,6 +3330,10 @@ pub(super) enum QuicWorkerError {
         primary: RuntimeError,
         cleanup: RuntimeError,
     },
+    #[error("Session {session:?} is not owned by the QUIC worker")]
+    SessionNotQuic { session: SessionId },
+    #[error("QUIC application error code {code} for Session {session:?} is not a valid varint")]
+    ApplicationErrorCodeInvalid { session: SessionId, code: u64 },
     #[error("QUIC worker {worker} is outside the configured worker range")]
     WorkerOutOfRange { worker: usize },
     #[error("QUIC worker {worker} is already installed")]
@@ -6025,6 +6099,179 @@ mod tests {
                 .map(|engine| engine.io_table.stream_session(stream).is_some())
                 .unwrap_or(false)
         );
+        Ok(())
+    }
+
+    #[test]
+    fn app_error_code_varint_conversion_is_checked() {
+        let legal_min = QuicAppErrorCode(SessionApplicationErrorCode::from(0));
+        assert_eq!(
+            VarInt::try_from(legal_min),
+            Ok(VarInt::from_u32(0)),
+            "zero is the minimum legal application error code"
+        );
+        let legal_max = (1u64 << 62) - 1;
+        assert_eq!(
+            VarInt::try_from(QuicAppErrorCode(SessionApplicationErrorCode::from(
+                legal_max
+            ))),
+            Ok(VarInt::try_from(legal_max).expect("max legal varint")),
+            "2^62 - 1 is the maximum legal application error code"
+        );
+        let out_of_range = SessionApplicationErrorCode::from(1u64 << 62);
+        assert_eq!(
+            VarInt::try_from(QuicAppErrorCode(out_of_range)),
+            Err(1u64 << 62),
+            "1 << 62 exceeds the varint range and returns the original code"
+        );
+        assert_eq!(
+            u64::from(out_of_range),
+            1u64 << 62,
+            "failed conversion leaves the input unchanged"
+        );
+    }
+
+    #[test]
+    fn app_error_code_varint_rejects_out_of_range_with_session_error() {
+        let session = SessionId::from_raw(7);
+        let error = QuicWorker::app_error_code_varint(
+            session,
+            SessionApplicationErrorCode::from(1u64 << 62),
+        )
+        .expect_err("1 << 62 exceeds the varint range");
+        match error {
+            QuicWorkerError::ApplicationErrorCodeInvalid {
+                session: rejected,
+                code,
+            } => {
+                assert_eq!(rejected, session);
+                assert_eq!(code, 1u64 << 62, "original code is preserved");
+            }
+            other => panic!("unexpected error: {other:?}"),
+        }
+    }
+
+    fn test_quic_session() -> RuntimeResult<(
+        QuicWorker,
+        SessionWorker<Index>,
+        ApplicationId,
+        SessionId,
+        ContextId,
+        Index,
+    )> {
+        let applications = hammer_service::session::ApplicationMain::new(4);
+        let application = applications
+            .attach()
+            .map_err(hammer_runtime::RuntimeError::from)?;
+        let mut sessions = SessionWorker::<Index>::new(
+            DataWorkerId::new(0),
+            1,
+            hammer_runtime::app::AppSessionConfig::default(),
+            64,
+            Arc::clone(&applications),
+            None,
+        )?;
+        sessions.install_application_mq_for_test(application)?;
+        let mut worker = QuicWorker::new(DataWorkerId::new(0));
+        let listener = ListenerContext {
+            outer_listener: SessionListenerId::new(1, 1),
+            outer_application: ApplicationId::new(1, 1),
+            inner_application_listener: hammer_runtime::app::ApplicationListenerId::new(2, 1),
+            inner_session_listener: SessionListenerId::new(3, 1),
+            configuration: ConfigId::from_raw(4),
+            connection_timeout: 5,
+            server_config: None,
+        };
+        let context = worker
+            .accept_connection(
+                SessionId::from_raw(5),
+                ContextId::from(0x1234u64),
+                &listener,
+            )
+            .expect("accept connection");
+        let connection_index = Index::from(context);
+        let session = sessions.construct_transport_session(
+            QuicWorker::ID,
+            connection_index,
+            1,
+            application,
+            Some(hammer_runtime::app::SessionAppId::new(0)),
+            None,
+            None,
+            false,
+        )?;
+        let listener_index = worker
+            .contexts
+            .insert(Context::listener(
+                SessionListenerId::new(1, 1),
+                ApplicationId::new(1, 1),
+                hammer_runtime::app::ApplicationListenerId::new(2, 1),
+                SessionListenerId::new(3, 1),
+                ConfigId::from_raw(4),
+                5,
+                None,
+            ))
+            .expect("listener context capacity");
+        Ok((
+            worker,
+            sessions,
+            application,
+            session,
+            context,
+            listener_index,
+        ))
+    }
+
+    #[test]
+    fn session_context_resolves_quic_session_to_exact_context() -> RuntimeResult<()> {
+        let (worker, sessions, _, session, context, _) = test_quic_session()?;
+        let resolved = worker
+            .session_context(&sessions, session)
+            .expect("QUIC Session resolves");
+        assert_eq!(resolved, context);
+        Ok(())
+    }
+
+    #[test]
+    fn session_context_rejects_missing_session() -> RuntimeResult<()> {
+        let (worker, sessions, _, _, _, _) = test_quic_session()?;
+        let missing = SessionId::from_raw(0xDEAD);
+        assert!(matches!(
+            worker.session_context(&sessions, missing),
+            Err(QuicWorkerError::SessionMissing { session }) if session == missing
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn session_context_rejects_foreign_transport_session() -> RuntimeResult<()> {
+        let worker = QuicWorker::new(DataWorkerId::new(0));
+        let (sessions, foreign) = test_lower_session()?;
+        assert!(matches!(
+            worker.session_context(&sessions, foreign),
+            Err(QuicWorkerError::SessionNotQuic { session }) if session == foreign
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn session_context_rejects_non_stream_connection_context() -> RuntimeResult<()> {
+        let (worker, mut sessions, application, _, _, listener_index) = test_quic_session()?;
+        let non_quic = sessions.construct_transport_session(
+            QuicWorker::ID,
+            listener_index,
+            1,
+            application,
+            Some(hammer_runtime::app::SessionAppId::new(0)),
+            None,
+            None,
+            false,
+        )?;
+        assert!(matches!(
+            worker.session_context(&sessions, non_quic),
+            Err(QuicWorkerError::ContextMissing { context })
+                if context == ContextId::from(listener_index)
+        ));
         Ok(())
     }
 }
