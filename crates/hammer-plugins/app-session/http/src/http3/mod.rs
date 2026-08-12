@@ -9,3 +9,4 @@ pub mod proto;
 
 pub(crate) mod preface;
 pub(crate) mod request;
+pub(crate) mod request_fields;
