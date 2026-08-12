@@ -1,15 +1,18 @@
 //! Incremental frame reader for a client request stream: reads frames one
 //! at a time from arbitrary byte slices, capturing each HEADERS field
-//! section (the initial one and the optional trailer) and draining every
-//! other frame's payload without buffering it.
+//! section (the initial one and the optional trailer), surfacing each DATA
+//! frame's payload as a slice borrowed from the call's input, and draining
+//! every other frame's payload without buffering it.
 //!
 //! Mirrors VPP `http3_stream_transport_rx_req` (http3.c ~1732): a frame
 //! header is parsed against the per-stream table (`FrameHeader::parse` with
 //! `FrameStream::Request`, frame.c) and against the request-stream ordering
 //! (`RequestPhase`, RFC 9114 Section 4.1); a field section longer than
 //! [`MAX_FIELD_SECTION_LEN`] is rejected with H3_EXCESSIVE_LOAD before any
-//! of its payload is buffered; unknown frame payloads are drained by
-//! counting, with no allocation. Unlike the one-shot control-stream reader,
+//! of its payload is buffered; DATA payloads are surfaced as slices
+//! borrowed from the call's input (no allocation); unknown frame payloads
+//! are drained by counting, with no allocation. Unlike the one-shot
+//! control-stream reader,
 //! this reader spans the whole stream: it reports the exact number of bytes
 //! each call consumes, so the caller keeps the trailing bytes of the next
 //! frame in its own buffer.
@@ -67,15 +70,19 @@ impl RequestFrameError {
 
 /// The result of feeding bytes to [`RequestFrameReader`].
 #[derive(Debug, Clone, Eq, PartialEq)]
-pub(crate) enum RequestFrameRead {
+pub(crate) enum RequestFrameRead<'a> {
     /// More bytes are needed for the current frame; all input was consumed
     /// into the reader's partial-frame state.
     Incomplete,
     /// A complete HEADERS frame: its encoded field section (RFC 9114
     /// Section 4.2), exactly one allocation.
     Headers(Vec<u8>),
-    /// A complete non-HEADERS frame was drained without buffering its
-    /// payload; carries the frame type and payload length.
+    /// The current call's DATA payload, borrowed from the call's input (no
+    /// copy); `completed` is true exactly when the chunk exhausts the
+    /// frame's payload.
+    Data { chunk: &'a [u8], completed: bool },
+    /// A complete non-HEADERS, non-DATA frame was drained without buffering
+    /// its payload; carries the frame type and payload length.
     Drained(FrameType, u64),
 }
 
@@ -86,8 +93,9 @@ pub(crate) enum RequestFrameRead {
 /// bounded `Vec` capturing a HEADERS field section. Header and payload may
 /// arrive across any number of calls: `push` returns the outcome of the
 /// frame the call completes together with the exact number of bytes
-/// consumed, and bytes beyond the completed frame are never consumed, so the
-/// caller keeps them and passes them back on the next call.
+/// consumed, surfacing each call's DATA payload bytes as a slice borrowed
+/// from the call's input, and bytes beyond the completed frame are never
+/// consumed, so the caller keeps them and passes them back on the next call.
 #[derive(Debug, Clone, Eq, PartialEq)]
 pub(crate) struct RequestFrameReader {
     /// Staging for the current frame header; briefly also holds the payload
@@ -130,20 +138,32 @@ impl RequestFrameReader {
     /// or [`RequestFrameRead::Incomplete`] while a frame is still partial,
     /// together with the exact number of bytes consumed.
     ///
+    /// While a DATA frame is in progress, each call surfaces the payload
+    /// bytes it contributed as a slice borrowed from the call's input, with
+    /// `completed` set exactly when the chunk exhausts the frame's payload.
+    ///
     /// Bytes beyond the completed frame are never consumed: the caller keeps
     /// them and passes them back on the next call. On error the stream is
     /// dead and the reader must not be fed again.
-    pub(crate) fn push(
+    pub(crate) fn push<'a>(
         &mut self,
-        mut bytes: &[u8],
-    ) -> Result<(RequestFrameRead, usize), RequestFrameError> {
+        mut bytes: &'a [u8],
+    ) -> Result<(RequestFrameRead<'a>, usize), RequestFrameError> {
+        let input: &'a [u8] = bytes;
+        let payload_at_entry = self.payload_len;
         let mut taken = 0usize;
         // Header staging bytes that lie beyond the current frame: they were
         // pulled from the input with the header but are not part of the
         // frame, so the consumed count must exclude them.
         let mut past = 0usize;
+        // Input offset of this call's first DATA payload byte, when the
+        // current frame is DATA: the staged payload that followed a header
+        // parsed this call, or the start of the input on a continuation
+        // call.
+        let mut chunk_start = 0usize;
 
         if self.frame.is_none() {
+            let head_at_entry = self.header_len;
             let take = (MAX_FRAME_HEADER_LEN - self.header_len).min(bytes.len());
             self.header[self.header_len..self.header_len + take].copy_from_slice(&bytes[..take]);
             self.header_len += take;
@@ -180,6 +200,12 @@ impl RequestFrameReader {
                         );
                         self.pending_phase = Some(next);
                     }
+                    if frame.ty == FrameType::DATA {
+                        // The staged payload bytes were appended this call
+                        // (the header was incomplete at the call's start), so
+                        // they are surfaced by borrowing the input.
+                        chunk_start = frame.header_len - head_at_entry;
+                    }
                     self.header_len = 0;
                     self.frame = Some(frame);
                     self.payload_len = carry;
@@ -197,6 +223,16 @@ impl RequestFrameReader {
                 self.payload_len += take;
                 taken += take;
                 if self.payload_len < frame.len as usize {
+                    if frame.ty == FrameType::DATA && self.payload_len > payload_at_entry {
+                        return Ok((
+                            RequestFrameRead::Data {
+                                chunk: &input
+                                    [chunk_start..chunk_start + (self.payload_len - payload_at_entry)],
+                                completed: false,
+                            },
+                            taken - past,
+                        ));
+                    }
                     return Ok((RequestFrameRead::Incomplete, taken));
                 }
             }
@@ -209,6 +245,16 @@ impl RequestFrameReader {
             if frame.ty == FrameType::HEADERS {
                 let section = std::mem::take(&mut self.field_section);
                 return Ok((RequestFrameRead::Headers(section), taken - past));
+            }
+            if frame.ty == FrameType::DATA && frame.len > 0 {
+                return Ok((
+                    RequestFrameRead::Data {
+                        chunk: &input
+                            [chunk_start..chunk_start + (frame.len as usize - payload_at_entry)],
+                        completed: true,
+                    },
+                    taken - past,
+                ));
             }
             return Ok((RequestFrameRead::Drained(frame.ty, frame.len), taken - past));
         }
@@ -263,10 +309,13 @@ mod tests {
     /// Push `wire` one byte at a time, asserting every intermediate result is
     /// `Incomplete` with exactly one byte consumed, and return the first
     /// completed frame outcome with the total bytes consumed.
-    fn feed_bytewise(reader: &mut RequestFrameReader, wire: &[u8]) -> (RequestFrameRead, usize) {
+    fn feed_bytewise<'a>(
+        reader: &mut RequestFrameReader,
+        wire: &'a [u8],
+    ) -> (RequestFrameRead<'a>, usize) {
         let mut consumed = 0;
-        for &byte in wire {
-            let (read, n) = reader.push(&[byte]).expect("a partial frame must not error");
+        for i in 0..wire.len() {
+            let (read, n) = reader.push(&wire[i..i + 1]).expect("a partial frame must not error");
             consumed += n;
             if !matches!(read, RequestFrameRead::Incomplete) {
                 return (read, consumed);
@@ -292,7 +341,8 @@ mod tests {
     fn bytewise_header_split_including_multibyte_varint() {
         let mut reader = RequestFrameReader::new();
         // HEADERS, payload length 300 (two-byte varint 0x41 0x2c).
-        let (read, consumed) = feed_bytewise(&mut reader, &[0x01, 0x41, 0x2c]);
+        let wire = &[0x01, 0x41, 0x2c];
+        let (read, consumed) = feed_bytewise(&mut reader, wire);
         assert_eq!(read, RequestFrameRead::Incomplete);
         assert_eq!(consumed, 3);
 
@@ -301,7 +351,13 @@ mod tests {
         assert_eq!(read, RequestFrameRead::Incomplete);
         assert_eq!(consumed, 100);
         let (read, consumed) = feed_bytewise(&mut reader, &payload[100..]);
-        assert_eq!(read, RequestFrameRead::Headers(payload));
+        // `read` borrows `payload` (the helper returns the completing call's
+        // outcome), so extract its section before moving the payload.
+        let section = match read {
+            RequestFrameRead::Headers(section) => section,
+            _ => panic!("expected a completed HEADERS frame"),
+        };
+        assert_eq!(section, payload);
         assert_eq!(consumed, 200);
     }
 
@@ -437,7 +493,13 @@ mod tests {
         );
         assert_eq!(
             reader.push(&frame(0x00, 2, b"hi")),
-            Ok((RequestFrameRead::Drained(FrameType::DATA, 2), 4))
+            Ok((
+                RequestFrameRead::Data {
+                    chunk: b"hi",
+                    completed: true,
+                },
+                4
+            ))
         );
         assert_eq!(
             reader.push(&[0x01, 0x00]),
@@ -446,6 +508,134 @@ mod tests {
         assert_eq!(
             reader.push(&[0x00, 0x00]),
             Err(RequestFrameError::Phase(ErrorCode::FrameUnexpected))
+        );
+    }
+
+    /// A DATA frame split across calls: each call surfaces the borrowed
+    /// payload bytes of that call with `completed` false until the call that
+    /// finishes the frame.
+    #[test]
+    fn data_payload_borrowed_partial_then_complete() {
+        let mut reader = RequestFrameReader::new();
+        assert_eq!(
+            reader.push(&[0x01, 0x00]),
+            Ok((RequestFrameRead::Headers(Vec::new()), 2))
+        );
+        // DATA, length 10: header plus the first four payload bytes.
+        assert_eq!(
+            reader.push(&[0x00, 0x0a, b'a', b'b', b'c', b'd']),
+            Ok((
+                RequestFrameRead::Data {
+                    chunk: &b"abcd"[..],
+                    completed: false,
+                },
+                6
+            ))
+        );
+        // The remaining six payload bytes complete the frame.
+        assert_eq!(
+            reader.push(b"efghij"),
+            Ok((
+                RequestFrameRead::Data {
+                    chunk: &b"efghij"[..],
+                    completed: true,
+                },
+                6
+            ))
+        );
+    }
+
+    /// A DATA chunk must never include trailing next-frame bytes, and the
+    /// consumed count must exclude them: the caller keeps them for the next
+    /// call.
+    #[test]
+    fn data_chunk_excludes_trailing_next_frame_bytes() {
+        let mut reader = RequestFrameReader::new();
+        assert_eq!(
+            reader.push(&[0x01, 0x00]),
+            Ok((RequestFrameRead::Headers(Vec::new()), 2))
+        );
+        // DATA (length 2) with its payload, plus the next DATA frame's
+        // header and payload, in one call.
+        assert_eq!(
+            reader.push(&[0x00, 0x02, b'h', b'i', 0x00, 0x01, b'x']),
+            Ok((
+                RequestFrameRead::Data {
+                    chunk: &b"hi"[..],
+                    completed: true,
+                },
+                4
+            ))
+        );
+        assert_eq!(
+            reader.push(&[0x00, 0x01, b'x']),
+            Ok((
+                RequestFrameRead::Data {
+                    chunk: &b"x"[..],
+                    completed: true,
+                },
+                3
+            ))
+        );
+    }
+
+    /// DATA payload bytes staged with the header in the fixed 16-byte
+    /// staging are surfaced from the input call's borrow, with the exact
+    /// consumed count; the header and payload need not be split across
+    /// calls.
+    #[test]
+    fn data_payload_staged_with_header_borrowed_from_input() {
+        let mut reader = RequestFrameReader::new();
+        assert_eq!(
+            reader.push(&[0x01, 0x00]),
+            Ok((RequestFrameRead::Headers(Vec::new()), 2))
+        );
+        // DATA header and its whole five-byte payload arrive together.
+        assert_eq!(
+            reader.push(&[0x00, 0x05, b'a', b'b', b'c', b'd', b'e']),
+            Ok((
+                RequestFrameRead::Data {
+                    chunk: &b"abcde"[..],
+                    completed: true,
+                },
+                7
+            ))
+        );
+    }
+
+    /// A DATA header split across calls, with the payload starting in the
+    /// same call that completes the header: the staged payload bytes are
+    /// not lost.
+    #[test]
+    fn data_header_split_across_calls_then_payload() {
+        let mut reader = RequestFrameReader::new();
+        assert_eq!(
+            reader.push(&[0x01, 0x00]),
+            Ok((RequestFrameRead::Headers(Vec::new()), 2))
+        );
+        // The DATA type byte alone: header still incomplete.
+        assert_eq!(reader.push(&[0x00]), Ok((RequestFrameRead::Incomplete, 1)));
+        // The length varint plus the first two payload bytes.
+        assert_eq!(
+            reader.push(&[0x05, b'a', b'b']),
+            Ok((
+                RequestFrameRead::Data {
+                    chunk: &b"ab"[..],
+                    completed: false,
+                },
+                3
+            ))
+        );
+        // The remaining payload completes the frame.
+        assert_eq!(
+            reader.push(b"cde"),
+            Ok((
+                RequestFrameRead::Data {
+                    chunk: &b"cde"[..],
+                    completed: true,
+                },
+                3
+            ))
         );
     }
 

@@ -1213,12 +1213,12 @@ impl HttpWorker {
     /// generation-checked lookups and state beyond the reader's single
     /// bounded HEADERS allocation; no loop over multiple frames, no FIFO
     /// access, no lock.
-    pub(crate) fn process_request_bytes(
+    pub(crate) fn process_request_bytes<'a>(
         &mut self,
         stream: StreamContextId,
         session: SessionId,
-        bytes: &[u8],
-    ) -> Result<(RequestFrameRead, usize), RequestReadError> {
+        bytes: &'a [u8],
+    ) -> Result<(RequestFrameRead<'a>, usize), RequestReadError> {
         let mut stream_context = *self
             .streams
             .get(stream.into())
