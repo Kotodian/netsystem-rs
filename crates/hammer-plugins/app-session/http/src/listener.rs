@@ -32,8 +32,11 @@
 //! `http_main.wrk` array (http.c:1073); each worker installs itself once
 //! via the `http_worker_init` worker init function ordered after
 //! session/QUIC worker init, exactly as QUIC binds its workers (quic
-//! listener.rs:568-577). The HTTP3 engine, FIFO, QPACK, stop_listen, and
-//! Session App lifecycle are later slices.
+//! listener.rs:568-577). `stop_listen` (http.c:1453-1490) is mirrored with
+//! the same strict ordering: lower QUIC Session unlisten first (a typed
+//! failure preserves the context), inner Application listener removal
+//! second, outer HTTP context clear last. The HTTP3 engine, FIFO, QPACK,
+//! and Session App lifecycle are later slices.
 
 use std::cell::UnsafeCell;
 use std::sync::{Arc, OnceLock};
@@ -65,6 +68,8 @@ const HTTP_LISTENER_CONTEXT_CAPACITY: usize = 1024;
 pub(crate) enum HttpListenerError {
     #[error("HTTP listener context capacity {capacity} is exhausted")]
     ListenerCapacityExhausted { capacity: usize },
+    #[error("HTTP listener {listener:?} is not registered")]
+    ListenerMissing { listener: SessionListenerId },
     #[error(
         "HTTP listen requires a QUIC server config, but QUIC config registration \
          is not installed in this slice"
@@ -74,6 +79,11 @@ pub(crate) enum HttpListenerError {
 
 /// Direct HTTP listener context: outer session identity plus the nested
 /// inner Application listener and the lower QUIC `SessionListener` it owns.
+///
+/// `Copy`: `stop_listen` copies the validated context out of the O(1) slot
+/// table (which cannot hand out borrows through `with_contexts`) and then
+/// tears down the nested identities by value.
+#[derive(Clone, Copy)]
 struct ListenerContext {
     outer_listener: SessionListenerId,
     outer_application: ApplicationId,
@@ -249,6 +259,54 @@ impl HttpMain {
         Ok(())
     }
 
+    /// Tears down one nested listener in strict reverse order of
+    /// `start_listen`, mirroring `http_stop_listen` (http.c:1453-1490): the
+    /// lower QUIC Session unlisten runs first, the inner Application listener
+    /// is removed second, and the outer HTTP context is cleared last.
+    ///
+    /// The context is resolved by an O(1) lookup on the outer listener's
+    /// session-pool slot with full identity validation (`slot` and
+    /// `generation`), unlike QUIC's pool scan (quic listener.rs:190-201); a
+    /// missing or stale outer listener is a typed `ListenerMissing` error
+    /// before any side effect. A failed lower unlisten returns the typed
+    /// error and preserves the whole context — the nested identities remain
+    /// published for a retry, exactly as `http_stop_listen` warns and keeps
+    /// its `http_ctx_t` alive when `vnet_unlisten` fails (http.c:1464-1485).
+    /// Inner Application removal is fallible and its typed error is
+    /// propagated (contrast QUIC's invariant `expect`, quic
+    /// listener.rs:204-209); the context is then still cleared only after
+    /// both lower teardown steps succeeded, so the final slot store is an
+    /// infallible indexed write into the slot the lookup already validated.
+    pub(crate) fn stop_listen(&self, outer_listener: SessionListenerId) -> RuntimeResult<()> {
+        let context = self
+            .with_contexts(|slots| {
+                slots
+                    .get(outer_listener.slot() as usize)
+                    .and_then(Option::as_ref)
+                    .filter(|context| context.outer_listener == outer_listener)
+                    .copied()
+            })?
+            .ok_or(HttpListenerError::ListenerMissing {
+                listener: outer_listener,
+            })?;
+
+        // Lower QUIC Session unlisten first; a typed failure preserves the
+        // context (the slot store below never runs).
+        self.sessions
+            .unlisten(context.inner_session_listener)
+            .map_err(RuntimeError::from)?;
+        // Inner Application listener removal second.
+        self.sessions
+            .applications()
+            .remove_listener(self.inner_application, context.inner_application_listener)
+            .map_err(RuntimeError::from)?;
+        // Outer HTTP context clear last, after both lower teardowns
+        // succeeded. The lookup validated the slot, so the indexed store is
+        // infallible.
+        self.with_contexts(|slots| slots[outer_listener.slot() as usize] = None)?;
+        Ok(())
+    }
+
     fn with_contexts<R>(
         &self,
         operation: impl FnOnce(&mut Vec<Option<ListenerContext>>) -> R,
@@ -328,15 +386,29 @@ pub(crate) fn start_listen(
         .start_listen(listener, application, config, endpoint)
 }
 
+/// Registered `SessionTransportStopListen` callback.
+///
+/// Mirrors the `start_listen` gate: checks the main thread and worker
+/// barrier, then the authority, returning typed errors before any side
+/// effect. `SessionMain::unlisten` dispatches here with the outer
+/// `SessionListenerId` (session/runtime.rs:939-956).
+pub(crate) fn stop_listen(listener: SessionListenerId) -> RuntimeResult<()> {
+    hammer_runtime::ensure_main_thread_with_barrier()?;
+    HTTP_MAIN
+        .get()
+        .ok_or(RuntimeError::PluginStateNotInitialized { plugin: "http" })?
+        .stop_listen(listener)
+}
+
 /// Static HTTP transport registration published by the plugin descriptor.
 ///
 /// VPP registers the HTTP transport proto against the session layer in
-/// `http_transport_init` (http.c:1867-1903). This slice registers a real
-/// `start_listen` callback; stop/connect are later slices, so the entry is
-/// written by hand rather than through the `session_transport` macro (which
-/// requires `start_listen` and `stop_listen` together).
+/// `http_transport_init` (http.c:1867-1903). This slice registers real
+/// `start_listen` and `stop_listen` callbacks; connect is a later slice, so
+/// the entry is written by hand rather than through the `session_transport`
+/// macro (which requires `start_listen` and `stop_listen` together).
 pub(crate) static __SESSION_TRANSPORT_HTTP_TRANSPORT: SessionTransportRegistration =
-    SessionTransportRegistration::new("http", Some(start_listen), None, None);
+    SessionTransportRegistration::new("http", Some(start_listen), Some(stop_listen), None);
 
 /// Publish the main-thread HTTP listener authority.
 ///
@@ -473,6 +545,13 @@ mod tests {
     static LISTEN_BARRIER: AtomicBool = AtomicBool::new(false);
     static LISTEN_LISTENER: AtomicU64 = AtomicU64::new(0);
 
+    // Thread-local: transport dispatch is synchronous on the caller's test
+    // thread, so a thread-local keeps the recording out of the process-global
+    // LISTEN_* statics, which parallel tests would otherwise corrupt.
+    thread_local! {
+        static STOP_LISTENED: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+    }
+
     /// Recording stub lower QUIC transport: succeeds and records the exact
     /// nested identities the session layer handed it.
     fn record_start(
@@ -503,8 +582,35 @@ mod tests {
         ))
     }
 
+    /// Recording stub lower QUIC unlisten: succeeds and records the exact
+    /// inner Session listener the session layer handed to the QUIC transport.
+    fn record_stop(listener: SessionListenerId) -> RuntimeResult<()> {
+        STOP_LISTENED.with(|recorded| recorded.set(listener.raw()));
+        Ok(())
+    }
+
+    /// Success-only stub lower QUIC transport for stop tests whose start path
+    /// must succeed without touching the shared `LISTEN_*` recording statics
+    /// (owned exclusively by `http_listener_init_publishes_...`).
+    fn noop_start(
+        _: SessionListenerId,
+        _: ApplicationId,
+        _: Option<u64>,
+        _: SessionListenEndpoint,
+    ) -> RuntimeResult<()> {
+        Ok(())
+    }
+
+    /// Failing stub lower QUIC unlisten: exercises the preserve-on-failure
+    /// stop path.
+    fn fail_stop(_: SessionListenerId) -> RuntimeResult<()> {
+        Err(RuntimeError::config_validation(
+            "test QUIC lower unlisten failure",
+        ))
+    }
+
     static __FAKE_QUIC_TRANSPORT: SessionTransportRegistration =
-        SessionTransportRegistration::new("quic", Some(record_start), None, None);
+        SessionTransportRegistration::new("quic", Some(record_start), Some(record_stop), None);
 
     hammer_runtime::__declare_registration_image!(
         init_functions = [];
@@ -522,11 +628,11 @@ mod tests {
     );
 
     #[test]
-    fn http_listener_registration_exposes_start_listen() {
+    fn http_listener_registration_exposes_start_and_stop_listen() {
         let registration = __SESSION_TRANSPORT_HTTP_TRANSPORT;
         assert_eq!(registration.name(), "http");
         assert!(registration.start_listen().is_some());
-        assert!(registration.stop_listen().is_none());
+        assert!(registration.stop_listen().is_some());
         assert!(registration.connect().is_none());
         assert_eq!(HttpMain::TRANSPORT_ID, SessionTransportId::new(4));
 
@@ -540,6 +646,7 @@ mod tests {
             .expect("plugin descriptor registers the HTTP transport");
         assert_eq!(found.name(), "http");
         assert!(found.start_listen().is_some());
+        assert!(found.stop_listen().is_some());
     }
 
     #[test]
@@ -604,7 +711,12 @@ mod tests {
             .map_err(RuntimeError::from)?;
         let outer_listener = sessions.listen(
             outer_application_listener,
-            SessionTransportRegistration::new("http", Some(super::start_listen), None, None),
+            SessionTransportRegistration::new(
+                "http",
+                Some(super::start_listen),
+                Some(super::stop_listen),
+                None,
+            ),
             endpoint,
         )?;
 
@@ -650,6 +762,22 @@ mod tests {
             endpoint,
         )?;
         assert_eq!(LISTEN_OPAQUE.load(Ordering::SeqCst), config);
+
+        // Session generic dispatch reaches the HTTP `stop_listen` wrapper
+        // installed at the bind point, under this test's single HTTP_MAIN
+        // owner. Teardown is strict reverse order: the lower QUIC transport
+        // unlistens the exact inner Session listener first, then the inner
+        // Application listener is removed and the outer context cleared last.
+        // The inner id is copied out first: `stop_listen` clears the very
+        // slot this borrowed `context` points into.
+        let inner_session_listener = context.inner_session_listener.raw();
+        STOP_LISTENED.with(|recorded| recorded.set(0));
+        sessions.unlisten(outer_listener)?;
+        assert_eq!(
+            STOP_LISTENED.with(|recorded| recorded.get()),
+            inner_session_listener
+        );
+        assert!(main.contexts.get()[slot].is_none());
 
         Engine::uninstall_current();
         Ok(())
@@ -766,6 +894,175 @@ mod tests {
         })
         .join()
         .expect("authority start_listen thread completes");
+        assert!(matches!(error, RuntimeError::ControlRequiresMainThread));
+    }
+
+    #[test]
+    fn http_listener_stop_listen_removes_contexts_in_vpp_order() -> RuntimeResult<()> {
+        let mut engine = test_engine();
+        engine.install_current();
+        let sessions = Arc::new(SessionMain::new(
+            0,
+            ApplicationMain::with_session_apps(4, [crate::http_app::HTTP_SESSION_APP]),
+        ));
+        let outer_application = sessions.applications().attach().expect("outer attach");
+        let main = Arc::new(HttpMain::new(
+            Arc::clone(&sessions),
+            SessionTransportRegistration::new("quic", Some(noop_start), Some(record_stop), None),
+            SessionAppId::new(0),
+            sessions.applications().attach().expect("inner attach"),
+            0,
+        ));
+        let endpoint = test_endpoint();
+        let first = SessionListenerId::new(0, 0);
+        let second = SessionListenerId::new(1, 0);
+        main.start_listen(first, outer_application, Some(42), endpoint)?;
+        main.start_listen(second, outer_application, Some(43), endpoint)?;
+        let first_inner = main
+            .contexts
+            .get()
+            .get(0)
+            .and_then(Option::as_ref)
+            .expect("first context published")
+            .inner_session_listener;
+        let (second_inner, second_inner_application_listener) = {
+            let context = main
+                .contexts
+                .get()
+                .get(1)
+                .and_then(Option::as_ref)
+                .expect("second context published");
+            (context.inner_session_listener, context.inner_application_listener)
+        };
+
+        // A stale outer identity (same slot, different generation) is a typed
+        // missing-context error before any side effect; the live context in
+        // that slot is untouched.
+        STOP_LISTENED.with(|recorded| recorded.set(0));
+        let error = start_error(main.stop_listen(SessionListenerId::new(1, 1)));
+        assert!(causes_contain(&error, "not registered"));
+        assert_eq!(STOP_LISTENED.with(|recorded| recorded.get()), 0);
+        assert!(main.contexts.get()[1].is_some());
+
+        // Stop is strict reverse order: lower unlisten first with the exact
+        // inner Session identity, then inner Application listener removal
+        // (a second removal is a typed error), then the outer context clear.
+        main.stop_listen(second)?;
+        assert_eq!(STOP_LISTENED.with(|recorded| recorded.get()), second_inner.raw());
+        assert!(
+            sessions
+                .applications()
+                .remove_listener(main.inner_application, second_inner_application_listener)
+                .is_err(),
+            "inner Application listener was removed during stop"
+        );
+        assert!(main.contexts.get()[1].is_none());
+
+        // A repeated stop of the same outer identity is a typed error, and
+        // the other listener's context is unaffected.
+        let error = start_error(main.stop_listen(second));
+        assert!(causes_contain(&error, "not registered"));
+        assert!(main.contexts.get()[0].is_some());
+
+        main.stop_listen(first)?;
+        assert_eq!(STOP_LISTENED.with(|recorded| recorded.get()), first_inner.raw());
+        assert!(main.contexts.get()[0].is_none());
+
+        Engine::uninstall_current();
+        Ok(())
+    }
+
+    #[test]
+    fn http_listener_stop_listen_missing_context_is_typed_error() {
+        let mut engine = test_engine();
+        engine.install_current();
+        let sessions = test_sessions();
+        let main = Arc::new(HttpMain::new(
+            Arc::clone(&sessions),
+            SessionTransportRegistration::new("quic", Some(noop_start), Some(record_stop), None),
+            SessionAppId::new(0),
+            sessions.applications().attach().expect("inner attach"),
+            0,
+        ));
+
+        let error = start_error(main.stop_listen(SessionListenerId::new(0, 0)));
+        assert!(matches!(
+            error,
+            RuntimeError::Subsystem { subsystem, .. } if subsystem == "http"
+        ));
+        assert!(causes_contain(&error, "not registered"));
+
+        Engine::uninstall_current();
+    }
+
+    #[test]
+    fn http_listener_stop_listen_preserves_context_on_lower_unlisten_failure() -> RuntimeResult<()> {
+        let mut engine = test_engine();
+        engine.install_current();
+        let sessions = Arc::new(SessionMain::new(
+            0,
+            ApplicationMain::with_session_apps(4, [crate::http_app::HTTP_SESSION_APP]),
+        ));
+        let outer_application = sessions.applications().attach().expect("outer attach");
+        let main = Arc::new(HttpMain::new(
+            Arc::clone(&sessions),
+            SessionTransportRegistration::new("quic", Some(noop_start), Some(fail_stop), None),
+            SessionAppId::new(0),
+            sessions.applications().attach().expect("inner attach"),
+            0,
+        ));
+        let outer = SessionListenerId::new(0, 0);
+        main.start_listen(outer, outer_application, Some(42), test_endpoint())?;
+
+        let error = start_error(main.stop_listen(outer));
+        assert!(causes_contain(&error, "test QUIC lower unlisten failure"));
+        // The whole context survives the failed lower unlisten: outer
+        // identity, inner Application listener (still removable), and the
+        // outer context slot all remain published for a retry.
+        let slot = main
+            .contexts
+            .get()
+            .get(0)
+            .and_then(Option::as_ref)
+            .expect("context preserved after failed lower unlisten");
+        assert_eq!(slot.outer_listener, outer);
+        assert!(
+            sessions
+                .applications()
+                .remove_listener(main.inner_application, slot.inner_application_listener)
+                .is_ok(),
+            "inner Application listener survives a failed lower unlisten"
+        );
+
+        Engine::uninstall_current();
+        Ok(())
+    }
+
+    #[test]
+    fn http_listener_stop_listen_requires_main_thread() {
+        let error = thread::spawn(|| {
+            start_error(super::stop_listen(SessionListenerId::new(4, 0)))
+        })
+        .join()
+        .expect("stop_listen thread completes");
+        assert!(matches!(error, RuntimeError::ControlRequiresMainThread));
+    }
+
+    #[test]
+    fn http_listener_authority_stop_listen_enforces_owner_thread() {
+        let sessions = test_sessions();
+        let main = Arc::new(HttpMain::new(
+            Arc::clone(&sessions),
+            SessionTransportRegistration::new("quic", Some(noop_start), Some(record_stop), None),
+            SessionAppId::new(0),
+            sessions.applications().attach().expect("inner attach"),
+            0,
+        ));
+        let error = thread::spawn(move || {
+            start_error(main.stop_listen(SessionListenerId::new(5, 0)))
+        })
+        .join()
+        .expect("authority stop_listen thread completes");
         assert!(matches!(error, RuntimeError::ControlRequiresMainThread));
     }
 
