@@ -3654,6 +3654,55 @@ impl<Index: Copy + Eq> SessionWorker<Index> {
         Ok(())
     }
 
+    /// Worker-local rollback boundary for a newly-created upper Session: the
+    /// exactly-one HTTP/3 upper publication handoff removes the upper through
+    /// this method instead of sweeping through `remove_session`. Mirrors VPP's
+    /// callback-before-free ordering (`session_cleanup_notify`,
+    /// session.c:304-318): the Session App cleanup callback runs while the
+    /// upper is still live, then the entry is freed, then the lower owner link
+    /// is cleared and the external App is detached. A newly-created upper has
+    /// no published children, so no owner-link cascade is followed.
+    ///
+    /// The cleanup callback runs only for the exact requested `upper`
+    /// [`SessionId`]: its app/context are read through the generation-checked
+    /// lookup, so a stale or reused slot is a typed no-op before any callback
+    /// fires and a fresh occupant's cleanup is never invoked by a stale ID.
+    ///
+    /// Reentrant cleanup is safe: the callback runs with `&mut self` and may
+    /// itself remove or replace the upper. Removal and the follow-on detaches
+    /// are revalidated through the generation-checked [`SessionId`], so a slot
+    /// that was already removed or reused by the callback is left untouched
+    /// and the call returns `Ok(())`.
+    pub(crate) fn remove_upper_session(&mut self, upper: SessionId) -> RuntimeResult<()> {
+        // The callback must see only the occupant of the requested `upper`
+        // SessionId: the read is gated on the full generation-checked lookup,
+        // so a stale ID whose slot was reused is a safe no-op here, before any
+        // cleanup callback can run against a fresh occupant.
+        let Some(entry) = self.entries.get(upper.pool_index()) else {
+            return Ok(());
+        };
+        let (app, context) = (entry.app, entry.app_session);
+        if let Some(app) = app
+            && context != 0
+            && let Some(callbacks) = self.session_app_callbacks(app)
+            && let Some(cleanup) = callbacks.cleanup
+        {
+            cleanup(self, upper, context)?;
+        }
+        // The callback ran with `&mut self`; free only while the slot still
+        // holds this generation of the upper.
+        let Some(entry) = self.entries.remove(upper.pool_index()) else {
+            return Ok(());
+        };
+        if let Some(lower) = entry.lower_session {
+            self.detach_upper_session(lower, upper);
+        }
+        if matches!(entry.application, Some(SessionApplication::External(_))) {
+            drop(self.app.detach_session(upper));
+        }
+        Ok(())
+    }
+
     fn notify_application_event(
         &mut self,
         session_id: SessionId,
@@ -7101,6 +7150,329 @@ mod tests {
             "the existing reverse link is not overwritten"
         );
         assert_eq!(sessions.entries.len(), 2, "no leaked upper entry");
+    }
+
+    #[test]
+    fn rollback_upper_session_removes_upper_and_preserves_lower_link() {
+        let applications = ApplicationMain::new(4);
+        let application = applications.attach().expect("attach Application");
+        let mut sessions = SessionWorker::<Index>::new(
+            DataWorkerId::new(0),
+            1,
+            AppSessionConfig::default(),
+            DEFAULT_SESSION_POOL_CAPACITY,
+            applications,
+            None,
+        )
+        .expect("Session worker");
+        sessions
+            .install_application_mq_for_test(application)
+            .expect("install test Application MQ");
+        let lower = sessions
+            .construct_stream_sessions(
+                SessionTransportId::new(1),
+                Index::new(1, 1),
+                1,
+                application,
+                Some(hammer_runtime::app::SessionAppId::new(0)),
+                None,
+                None,
+                false,
+            )
+            .expect("construct lower Session App session");
+        let upper = sessions
+            .create_upper_session(lower, 0x55)
+            .expect("create upper Session");
+        assert_eq!(
+            sessions
+                .entries
+                .get(lower.pool_index())
+                .and_then(|entry| entry.upper_session),
+            Some(upper),
+            "the lower owns the upper before rollback"
+        );
+
+        sessions
+            .remove_upper_session(upper)
+            .expect("roll back the upper Session");
+
+        assert!(!sessions.has_session(upper), "the upper is removed");
+        assert!(sessions.has_session(lower), "the lower survives rollback");
+        assert_eq!(
+            sessions
+                .entries
+                .get(lower.pool_index())
+                .and_then(|entry| entry.upper_session),
+            None,
+            "rollback clears the lower owner link"
+        );
+        assert!(
+            sessions.app.detach_session(upper).is_none(),
+            "rollback detached the external App attachment"
+        );
+        assert_eq!(sessions.entries.len(), 1, "only the lower remains");
+    }
+
+    #[test]
+    fn rollback_upper_session_cleanup_error_preserves_state_and_primary_error() {
+        let applications = ApplicationMain::new(4);
+        let application = applications.attach().expect("attach Application");
+        let mut sessions = SessionWorker::<Index>::new(
+            DataWorkerId::new(0),
+            1,
+            AppSessionConfig::default(),
+            DEFAULT_SESSION_POOL_CAPACITY,
+            applications,
+            None,
+        )
+        .expect("Session worker");
+        sessions
+            .install_application_mq_for_test(application)
+            .expect("install test Application MQ");
+        sessions
+            .install_session_app(
+                hammer_runtime::app::SessionAppId::new(0),
+                SessionAppCallbacks {
+                    cleanup: Some(fail_cleanup_for_session),
+                    ..Default::default()
+                },
+            )
+            .expect("install Session App callbacks");
+        let lower = sessions
+            .construct_stream_sessions(
+                SessionTransportId::new(1),
+                Index::new(1, 1),
+                1,
+                application,
+                Some(hammer_runtime::app::SessionAppId::new(0)),
+                None,
+                None,
+                false,
+            )
+            .expect("construct lower Session App session");
+        let upper = sessions
+            .create_upper_session(lower, 0x55)
+            .expect("create upper Session");
+
+        SESSION_CLEANUP_ATTEMPTS.store(0, Ordering::SeqCst);
+        SESSION_CLEANUP_SUCCESSES.store(0, Ordering::SeqCst);
+        SESSION_CLEANUP_FAILING.store(upper.get(), Ordering::SeqCst);
+        let error = sessions
+            .remove_upper_session(upper)
+            .expect_err("the cleanup error propagates");
+        assert!(matches!(
+            &error,
+            RuntimeError::Subsystem { source, .. }
+                if matches!(
+                    source.downcast_ref::<SessionError>(),
+                    Some(SessionError::PublicationRejected { session_id })
+                        if *session_id == upper
+                )
+        ));
+        assert!(
+            sessions.has_session(upper),
+            "the upper stays live after a failed cleanup"
+        );
+        assert!(sessions.has_session(lower), "the lower is untouched");
+        assert_eq!(
+            sessions
+                .entries
+                .get(lower.pool_index())
+                .and_then(|entry| entry.upper_session),
+            Some(upper),
+            "the owner link is preserved when cleanup fails"
+        );
+        assert_eq!(
+            SESSION_CLEANUP_ATTEMPTS.load(Ordering::SeqCst),
+            1,
+            "the cleanup callback ran exactly once"
+        );
+        assert_eq!(
+            SESSION_CLEANUP_SUCCESSES.load(Ordering::SeqCst),
+            0,
+            "the failing cleanup counts no success"
+        );
+    }
+
+    static SESSION_CLEANUP_STALE_ATTEMPTS: AtomicU64 = AtomicU64::new(0);
+
+    fn count_stale_cleanup_attempt(
+        _: &mut SessionWorker<Index>,
+        _: SessionId,
+        _: u64,
+    ) -> RuntimeResult<()> {
+        SESSION_CLEANUP_STALE_ATTEMPTS.fetch_add(1, Ordering::SeqCst);
+        Ok(())
+    }
+
+    #[test]
+    fn rollback_upper_session_stale_generation_never_removes_reused_slot() {
+        let applications = ApplicationMain::new(4);
+        let application = applications.attach().expect("attach Application");
+        let mut sessions = SessionWorker::<Index>::new(
+            DataWorkerId::new(0),
+            1,
+            AppSessionConfig::default(),
+            DEFAULT_SESSION_POOL_CAPACITY,
+            applications,
+            None,
+        )
+        .expect("Session worker");
+        sessions
+            .install_application_mq_for_test(application)
+            .expect("install test Application MQ");
+        sessions
+            .install_session_app(
+                hammer_runtime::app::SessionAppId::new(0),
+                SessionAppCallbacks {
+                    cleanup: Some(count_stale_cleanup_attempt),
+                    ..Default::default()
+                },
+            )
+            .expect("install Session App callbacks");
+        let lower = sessions
+            .construct_stream_sessions(
+                SessionTransportId::new(1),
+                Index::new(1, 1),
+                1,
+                application,
+                Some(hammer_runtime::app::SessionAppId::new(0)),
+                None,
+                None,
+                false,
+            )
+            .expect("construct lower Session App session");
+        let upper = sessions
+            .create_upper_session(lower, 0x55)
+            .expect("first upper");
+
+        // Reentrant cleanup removes the upper and the slot is immediately
+        // reused by a fresh upper on the same lower: the Pool free list is
+        // LIFO (pop_free_slot, pool.rs:237-243), so the fresh upper occupies
+        // the same slot under a new generation.
+        sessions.entries.remove(upper.pool_index());
+        sessions.detach_upper_session(lower, upper);
+        let fresh = sessions
+            .create_upper_session(lower, 0x66)
+            .expect("fresh upper reuses the slot");
+        assert_eq!(
+            fresh.pool_index().slot(),
+            upper.pool_index().slot(),
+            "the fresh upper occupies the removed slot"
+        );
+        assert_ne!(
+            fresh.pool_index().generation(),
+            upper.pool_index().generation(),
+            "the fresh upper runs under a new generation"
+        );
+
+        SESSION_CLEANUP_STALE_ATTEMPTS.store(0, Ordering::SeqCst);
+        sessions
+            .remove_upper_session(upper)
+            .expect("a stale rollback id is a safe no-op");
+        assert_eq!(
+            SESSION_CLEANUP_STALE_ATTEMPTS.load(Ordering::SeqCst),
+            0,
+            "a stale rollback id never runs the fresh occupant's cleanup callback"
+        );
+
+        assert!(
+            sessions.has_session(fresh),
+            "the reused occupant survives the stale rollback"
+        );
+        assert!(!sessions.has_session(upper), "the stale id is not the occupant");
+        assert_eq!(
+            sessions
+                .entries
+                .get(lower.pool_index())
+                .and_then(|entry| entry.upper_session),
+            Some(fresh),
+            "the lower owner link still names the fresh upper"
+        );
+        assert_eq!(sessions.entries.len(), 2, "no session is swept");
+    }
+
+    static SESSION_CLEANUP_REMOVING: AtomicU64 = AtomicU64::new(0);
+
+    fn remove_upper_on_cleanup(
+        sessions: &mut SessionWorker<Index>,
+        session_id: SessionId,
+        _: u64,
+    ) -> RuntimeResult<()> {
+        SESSION_CLEANUP_REMOVING.fetch_add(1, Ordering::SeqCst);
+        let lower = sessions
+            .entries
+            .get(session_id.pool_index())
+            .and_then(|entry| entry.lower_session);
+        sessions.entries.remove(session_id.pool_index());
+        if let Some(lower) = lower {
+            sessions.detach_upper_session(lower, session_id);
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn rollback_upper_session_after_reentrant_removal_is_safe_noop() {
+        let applications = ApplicationMain::new(4);
+        let application = applications.attach().expect("attach Application");
+        let mut sessions = SessionWorker::<Index>::new(
+            DataWorkerId::new(0),
+            1,
+            AppSessionConfig::default(),
+            DEFAULT_SESSION_POOL_CAPACITY,
+            applications,
+            None,
+        )
+        .expect("Session worker");
+        sessions
+            .install_application_mq_for_test(application)
+            .expect("install test Application MQ");
+        sessions
+            .install_session_app(
+                hammer_runtime::app::SessionAppId::new(0),
+                SessionAppCallbacks {
+                    cleanup: Some(remove_upper_on_cleanup),
+                    ..Default::default()
+                },
+            )
+            .expect("install Session App callbacks");
+        let lower = sessions
+            .construct_stream_sessions(
+                SessionTransportId::new(1),
+                Index::new(1, 1),
+                1,
+                application,
+                Some(hammer_runtime::app::SessionAppId::new(0)),
+                None,
+                None,
+                false,
+            )
+            .expect("construct lower Session App session");
+        let upper = sessions
+            .create_upper_session(lower, 0x55)
+            .expect("create upper Session");
+
+        SESSION_CLEANUP_REMOVING.store(0, Ordering::SeqCst);
+        sessions
+            .remove_upper_session(upper)
+            .expect("the callback already removed the upper, so rollback is a no-op");
+
+        assert!(!sessions.has_session(upper), "the upper is gone");
+        assert!(sessions.has_session(lower), "the lower is untouched");
+        assert_eq!(
+            sessions
+                .entries
+                .get(lower.pool_index())
+                .and_then(|entry| entry.upper_session),
+            None,
+            "the reentrant cleanup cleared the owner link"
+        );
+        assert_eq!(sessions.entries.len(), 1, "no second removal happened");
+        assert_eq!(
+            SESSION_CLEANUP_REMOVING.load(Ordering::SeqCst),
+            1,
+            "the cleanup callback ran exactly once"
+        );
     }
 
     #[test]
