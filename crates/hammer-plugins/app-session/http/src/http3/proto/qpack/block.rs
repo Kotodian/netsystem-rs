@@ -21,7 +21,9 @@
 //! Field line representations (RFC 9204 Sections 4.5.2-4.5.6): this slice
 //! implements the indexed form (Section 4.5.2), the literal form with static
 //! name reference (Section 4.5.4) and the literal-name form (Section 4.5.6);
-//! post-base and the full decoder are later slices.
+//! the post-base forms (Sections 4.5.3 and 4.5.5) are recognized and
+//! rejected as dynamic-table references, and the full decoder is a later
+//! slice.
 
 use std::borrow::Cow;
 
@@ -68,10 +70,10 @@ pub(crate) fn encode_prefix<W: BufMut>(buf: &mut W) {
 /// VPP reports the same condition as `HPACK_ERROR_COMPRESSION`
 /// (`case 8 ... 11`).
 ///
-/// The other representations (RFC 9204 Sections 4.5.3-4.5.6) are later
-/// slices: the first byte is only peeked, so on `Ok(None)` the input is left
-/// untouched for the decoder that handles them. Truncated and overflowing
-/// indices propagate the typed errors from `prefix_int`.
+/// The other representations (RFC 9204 Sections 4.5.3-4.5.6) are handled by
+/// sibling decoders: the first byte is only peeked, so on `Ok(None)` the
+/// input is left untouched for the decoder that handles them. Truncated and
+/// overflowing indices propagate the typed errors from `prefix_int`.
 pub(crate) fn decode_field_line<B: Buf>(
     buf: &mut B,
 ) -> Result<Option<&'static HeaderField>, QpackError> {
@@ -197,6 +199,75 @@ pub(crate) fn decode_literal_name<B: Buf>(buf: &mut B) -> Result<Option<HeaderFi
         name: Cow::Owned(name),
         value: Cow::Owned(value),
     }))
+}
+
+/// Decode one field line, recognizing only the indexed-with-post-base-index
+/// representation (RFC 9204 Section 4.5.3, `0001xxxx`).
+///
+/// A post-base index addresses the dynamic table below the Base
+/// (Section 2.2.2.2), which this capacity-zero decoder cannot resolve, so
+/// the typed `QpackError::DynamicReference` is returned; VPP reports the
+/// same condition as `HPACK_ERROR_COMPRESSION` (`case 1` in
+/// `qpack_parse_headers`, `third_party/vpp/src/plugins/http/http3/qpack.c`,
+/// qpack.c:1018-1020). The index is decoded as a 4-bit prefix integer
+/// (Section 4.1.1) before the rejection, so truncated and overflowing
+/// indices surface the typed errors from `prefix_int`, exactly as
+/// `hpack_decode_int`'s failure precedes VPP's compression error. h3's
+/// `IndexedWithPostBase::decode` (`third_party/h3/h3/src/qpack/block.rs`)
+/// is the Rust reference.
+///
+/// The other representations (RFC 9204 Sections 4.5.2, 4.5.4-4.5.6) are
+/// handled by sibling decoders: the first byte is only peeked, so on
+/// `Ok(None)` the input is left untouched.
+pub(crate) fn decode_post_base_indexed<B: Buf>(buf: &mut B) -> Result<Option<()>, QpackError> {
+    let first = match buf.chunk().first() {
+        Some(&first) => first,
+        // No first byte at all: the field line is truncated, not merely of
+        // another representation.
+        None => return Err(QpackError::UnexpectedEnd),
+    };
+    // The four high bits `0001` select this representation.
+    if first & 0b1111_0000 != 0b0001_0000 {
+        return Ok(None);
+    }
+    let _ = prefix_int::decode(4, buf)?;
+    Err(QpackError::DynamicReference)
+}
+
+/// Decode one field line, recognizing only the literal-with-post-base-name-
+/// reference representation (RFC 9204 Section 4.5.5, `0000Nxxx`).
+///
+/// A post-base name index addresses the dynamic table below the Base
+/// (Section 2.2.2.2), which this capacity-zero decoder cannot resolve, so
+/// the typed `QpackError::DynamicReference` is returned; VPP reports the
+/// same condition as `HPACK_ERROR_COMPRESSION` (`case 0` in
+/// `qpack_parse_headers`, `third_party/vpp/src/plugins/http/http3/qpack.c`,
+/// qpack.c:1021-1023). The N bit (bit 3) marks the field never-indexed: it
+/// affects the encoder's indexing policy, not the rejection, so both N
+/// forms are rejected alike. The name index is decoded as a 3-bit prefix
+/// integer with the N bit riding above it (Section 4.1.1) before the
+/// rejection, so truncated and overflowing indices surface the typed errors
+/// from `prefix_int`; h3's `LiteralWithPostBaseNameRef::decode`
+/// (`third_party/h3/h3/src/qpack/block.rs`) is the Rust reference. The
+/// value string is not read: the rejection precedes it, as in VPP's
+/// `case 0`.
+///
+/// The other representations (RFC 9204 Sections 4.5.2-4.5.4, 4.5.6) are
+/// handled by sibling decoders: the first byte is only peeked, so on
+/// `Ok(None)` the input is left untouched.
+pub(crate) fn decode_post_base_name_ref<B: Buf>(buf: &mut B) -> Result<Option<()>, QpackError> {
+    let first = match buf.chunk().first() {
+        Some(&first) => first,
+        // No first byte at all: the field line is truncated, not merely of
+        // another representation.
+        None => return Err(QpackError::UnexpectedEnd),
+    };
+    // The four high bits `0000` select this representation.
+    if first & 0b1111_0000 != 0 {
+        return Ok(None);
+    }
+    let _ = prefix_int::decode(3, buf)?;
+    Err(QpackError::DynamicReference)
 }
 
 #[cfg(test)]
@@ -593,5 +664,121 @@ mod tests {
             decode_literal_literal(&[0x20, 0x81, 0xFF]),
             Err(QpackError::HuffmanDecoding(_))
         ));
+    }
+
+    fn decode_post_base_indexed_bytes(bytes: &[u8]) -> Result<Option<()>, QpackError> {
+        let mut read: &[u8] = bytes;
+        decode_post_base_indexed(&mut read)
+    }
+
+    /// A post-base index addresses the dynamic table, which this
+    /// capacity-zero decoder cannot resolve (RFC 9204 Section 4.5.3); VPP
+    /// reports the same condition as `HPACK_ERROR_COMPRESSION` (`case 1`).
+    #[test]
+    fn decode_post_base_indexed_is_dynamic_reference() {
+        let wires: [&[u8]; 4] = [&[0x10], &[0x11], &[0x1E], &[0x1F, 0x00]];
+        for wire in wires {
+            assert_eq!(
+                decode_post_base_indexed_bytes(wire),
+                Err(QpackError::DynamicReference)
+            );
+        }
+    }
+
+    /// The other representations, including the sibling post-base literal
+    /// form, are other decoders' seams; the first byte is left in the
+    /// input for them.
+    #[test]
+    fn decode_post_base_indexed_ignores_other_representations() {
+        let wires: [&[u8]; 6] = [&[0x00], &[0x08], &[0x20], &[0x40], &[0x80], &[0xC1]];
+        for wire in wires {
+            let mut read: &[u8] = wire;
+            assert_eq!(decode_post_base_indexed(&mut read), Ok(None));
+            assert!(read.has_remaining());
+        }
+    }
+
+    #[test]
+    fn decode_post_base_indexed_truncated_rejected() {
+        assert_eq!(
+            decode_post_base_indexed_bytes(&[]),
+            Err(QpackError::UnexpectedEnd)
+        );
+        // Index 15 (all-ones prefix) needs a continuation byte.
+        assert_eq!(
+            decode_post_base_indexed_bytes(&[0x1F]),
+            Err(QpackError::UnexpectedEnd)
+        );
+    }
+
+    /// An index prefix integer running past the 63-bit mantissa.
+    #[test]
+    fn decode_post_base_indexed_overflow_rejected() {
+        let bytes = [0x1F, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80];
+        assert_eq!(
+            decode_post_base_indexed_bytes(&bytes),
+            Err(QpackError::Overflow)
+        );
+    }
+
+    fn decode_post_base_name_ref_bytes(bytes: &[u8]) -> Result<Option<()>, QpackError> {
+        let mut read: &[u8] = bytes;
+        decode_post_base_name_ref(&mut read)
+    }
+
+    /// The N bit (0x08) marks the field never-indexed; both N forms are
+    /// post-base name references into the dynamic table, unresolvable here
+    /// (RFC 9204 Section 4.5.5); VPP reports the same condition as
+    /// `HPACK_ERROR_COMPRESSION` (`case 0`).
+    #[test]
+    fn decode_post_base_name_ref_is_dynamic_reference() {
+        let wires: [&[u8]; 4] = [&[0x00], &[0x06], &[0x08], &[0x07, 0x00]];
+        for wire in wires {
+            assert_eq!(
+                decode_post_base_name_ref_bytes(wire),
+                Err(QpackError::DynamicReference)
+            );
+        }
+    }
+
+    /// The other representations, including the sibling post-base indexed
+    /// form, are other decoders' seams; the first byte is left in the
+    /// input for them.
+    #[test]
+    fn decode_post_base_name_ref_ignores_other_representations() {
+        let wires: [&[u8]; 6] = [&[0x10], &[0x1F], &[0x20], &[0x40], &[0x80], &[0xC1]];
+        for wire in wires {
+            let mut read: &[u8] = wire;
+            assert_eq!(decode_post_base_name_ref(&mut read), Ok(None));
+            assert!(read.has_remaining());
+        }
+    }
+
+    #[test]
+    fn decode_post_base_name_ref_truncated_rejected() {
+        assert_eq!(
+            decode_post_base_name_ref_bytes(&[]),
+            Err(QpackError::UnexpectedEnd)
+        );
+        // Index 7 (all-ones prefix) needs a continuation byte, N clear and
+        // set.
+        assert_eq!(
+            decode_post_base_name_ref_bytes(&[0x07]),
+            Err(QpackError::UnexpectedEnd)
+        );
+        assert_eq!(
+            decode_post_base_name_ref_bytes(&[0x0F]),
+            Err(QpackError::UnexpectedEnd)
+        );
+    }
+
+    /// A name index prefix integer running past the 63-bit mantissa.
+    #[test]
+    fn decode_post_base_name_ref_overflow_rejected() {
+        let bytes = [0x07, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80];
+        assert_eq!(
+            decode_post_base_name_ref_bytes(&bytes),
+            Err(QpackError::Overflow)
+        );
     }
 }
