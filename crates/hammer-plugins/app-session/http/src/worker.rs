@@ -21,6 +21,11 @@
 //! worker init; `install_worker`/`with_worker` are O(1) slot lookups with
 //! typed out-of-range, not-installed, and wrong-thread errors.
 //!
+//! Stream contexts live in a second, independent generation-checked pool on
+//! the same worker, mirroring VPP `http_ts_accept_stream` (http.c:675-721):
+//! allocation generation-checks the parent connection context first, then
+//! records the child session, parent `ContextId`, and peer direction.
+//!
 //! Identities follow the Hammer QUIC conventions: `ContextId` packs
 //! `slot | generation << 32` exactly like the QUIC `ContextId`
 //! (quic worker.rs:178-205) and `SessionId` (hammer-service
@@ -40,6 +45,13 @@ use hammer_service::session::{SessionId, SessionWorker};
 /// Default connection-context capacity of one data worker's pool, matching
 /// the QUIC per-worker context capacity (quic worker.rs:42).
 pub(crate) const HTTP_CONTEXT_CAPACITY: usize = 4_096;
+
+/// Default per-worker stream-context capacity. HTTP/3 multiplexes many
+/// streams over one connection, so the stream pool is deliberately larger
+/// than, and independent from, `HTTP_CONTEXT_CAPACITY`: VPP shares one
+/// `http_ctx_t` pool between connections and streams (http.c:675-721), which
+/// Hammer splits so one cannot starve the other.
+pub(crate) const HTTP_STREAM_CAPACITY: usize = 16_384;
 
 /// Exact bytes of the local HTTP/3 control-stream preface: the CONTROL
 /// stream type (0x00) followed by a SETTINGS frame (type 0x04, length 0x04)
@@ -84,6 +96,41 @@ impl From<ContextId> for Index {
     }
 }
 
+/// Generation-checked identity for one HTTP/3 stream context in the owning
+/// data worker's stream pool, packed `slot | generation << 32` exactly like
+/// `ContextId`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[repr(transparent)]
+pub(crate) struct StreamContextId(u64);
+
+impl From<u64> for StreamContextId {
+    #[inline]
+    fn from(raw: u64) -> Self {
+        Self(raw)
+    }
+}
+
+impl From<StreamContextId> for u64 {
+    #[inline]
+    fn from(stream: StreamContextId) -> Self {
+        stream.0
+    }
+}
+
+impl From<Index> for StreamContextId {
+    #[inline]
+    fn from(index: Index) -> Self {
+        Self(u64::from(index.slot()) | (u64::from(index.generation()) << 32))
+    }
+}
+
+impl From<StreamContextId> for Index {
+    #[inline]
+    fn from(stream: StreamContextId) -> Self {
+        Self::new(stream.0 as u32, (stream.0 >> 32) as u32)
+    }
+}
+
 /// Cold per-connection state bound to one data-worker context slot.
 ///
 /// Holds the lower QUIC `SessionId` the context was allocated for plus the
@@ -100,6 +147,23 @@ pub(crate) struct ConnectionContext {
     /// True until the peer's SETTINGS arrive on its control stream; set at
     /// allocation and consumed by the peer-SETTINGS slice.
     pub(crate) peer_settings_pending: bool,
+}
+
+/// Cold per-stream state bound to one data-worker stream-pool slot.
+///
+/// Mirrors VPP `http_ts_accept_stream` (http.c:675-721), where the accepted
+/// stream context records its child session handle (`hc_tc_session_handle`),
+/// the peer direction flag (`SESSION_F_UNIDIRECTIONAL`), and its parent
+/// connection index (`hc_http_conn_index`). Hot HTTP/3 stream state (frames,
+/// QPACK) belongs to later slices.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct StreamContext {
+    /// Child QUIC session this stream context is bound to.
+    pub(crate) session: SessionId,
+    /// Parent connection context this stream belongs to.
+    pub(crate) parent: ContextId,
+    /// Peer stream direction: uni- or bidirectional.
+    pub(crate) direction: SessionStreamDirection,
 }
 
 /// Typed errors for per-worker connection context operations and container
@@ -122,6 +186,20 @@ pub(crate) enum HttpWorkerError {
     },
     #[error("http connection context {context:?} already opened its control stream")]
     ControlStreamAlreadyOpen { context: ContextId },
+    #[error("http stream context pool is full (capacity {capacity})")]
+    StreamCapacityExhausted { capacity: usize },
+    #[error("http stream context {stream:?} is not live")]
+    StreamMissing { stream: StreamContextId },
+    #[error(
+        "http stream context {stream:?} is bound to session {actual:?}, expected {expected:?}"
+    )]
+    StreamSessionMismatch {
+        stream: StreamContextId,
+        expected: SessionId,
+        actual: SessionId,
+    },
+    #[error("http stream context allocation requires live parent connection context {parent:?}")]
+    ParentContextMissing { parent: ContextId },
     #[error(
         "http connection context {context:?} failed to open its control stream through the Session Worker"
     )]
@@ -138,15 +216,18 @@ pub(crate) enum HttpWorkerError {
     },
 }
 
-/// Data-worker-owned bounded pool of HTTP/3 connection contexts.
+/// Data-worker-owned bounded pools of HTTP/3 connection and stream contexts.
 ///
 /// Owns `ConnectionContext` slots exactly as VPP's `http_worker_t::ctx_pool`
-/// does; callers resolve identities by `ContextId`, never by raw index.
-/// The container (worker installation/attachment) is deferred until Session
-/// App callbacks need it.
+/// does, plus a separate generation-checked `StreamContext` pool mirroring
+/// VPP `http_ts_accept_stream` (http.c:675-721); callers resolve identities
+/// by `ContextId`/`StreamContextId`, never by raw index. The container
+/// (worker installation/attachment) is deferred until Session App callbacks
+/// need it.
 #[derive(Debug)]
 pub(crate) struct HttpWorker {
     contexts: Pool<ConnectionContext>,
+    streams: Pool<StreamContext>,
 }
 
 impl HttpWorker {
@@ -160,8 +241,14 @@ impl HttpWorker {
     }
 
     pub(crate) fn with_capacity(capacity: usize) -> Self {
+        Self::with_capacities(capacity, HTTP_STREAM_CAPACITY)
+    }
+
+    /// Independent connection and stream pool capacities.
+    pub(crate) fn with_capacities(connections: usize, streams: usize) -> Self {
         Self {
-            contexts: Pool::with_capacity(capacity),
+            contexts: Pool::with_capacity(connections),
+            streams: Pool::with_capacity(streams),
         }
     }
 
@@ -266,6 +353,95 @@ impl HttpWorker {
     #[inline]
     pub(crate) fn is_empty(&self) -> bool {
         self.contexts.is_empty()
+    }
+
+    /// Allocates a stream context bound to child `session` of live connection
+    /// context `parent`, with the peer `direction`.
+    ///
+    /// Mirrors VPP `http_ts_accept_stream` (http.c:675-721), where the stream
+    /// context is taken from the same worker's pool, its parent connection
+    /// context resolved from the stream session's listener handle, and the
+    /// child session/direction/parent recorded on the stream context.
+    /// O(1); generation-checks the parent connection before inserting, so a
+    /// stale parent identity can never attach a new stream.
+    pub(crate) fn allocate_stream(
+        &mut self,
+        session: SessionId,
+        parent: ContextId,
+        direction: SessionStreamDirection,
+    ) -> Result<StreamContextId, HttpWorkerError> {
+        self.contexts
+            .get(parent.into())
+            .ok_or(HttpWorkerError::ParentContextMissing { parent })?;
+        self.streams
+            .insert(StreamContext {
+                session,
+                parent,
+                direction,
+            })
+            .map(StreamContextId::from)
+            .ok_or(HttpWorkerError::StreamCapacityExhausted {
+                capacity: self.streams.capacity(),
+            })
+    }
+
+    /// Resolves a live stream context by its generation-checked identity.
+    ///
+    /// O(1); rejects stale or out-of-range identities with `StreamMissing`.
+    pub(crate) fn get_stream(
+        &self,
+        stream: StreamContextId,
+    ) -> Result<&StreamContext, HttpWorkerError> {
+        self.streams
+            .get(stream.into())
+            .ok_or(HttpWorkerError::StreamMissing { stream })
+    }
+
+    /// Resolves a stream context and verifies it is bound to the exact
+    /// `session`.
+    ///
+    /// O(1); rejects mismatched bindings with `StreamSessionMismatch` so a
+    /// stale context can never be attributed to a different lower session.
+    pub(crate) fn get_stream_for_session(
+        &self,
+        stream: StreamContextId,
+        session: SessionId,
+    ) -> Result<&StreamContext, HttpWorkerError> {
+        let stream_context = self.get_stream(stream)?;
+        if stream_context.session != session {
+            return Err(HttpWorkerError::StreamSessionMismatch {
+                stream,
+                expected: session,
+                actual: stream_context.session,
+            });
+        }
+        Ok(stream_context)
+    }
+
+    /// Releases a stream context slot back to the pool.
+    ///
+    /// O(1); the slot's generation advances, so previously issued identities
+    /// become stale. Fails with `StreamMissing` for non-live identities.
+    pub(crate) fn remove_stream(&mut self, stream: StreamContextId) -> Result<(), HttpWorkerError> {
+        self.streams
+            .remove(stream.into())
+            .map(|_| ())
+            .ok_or(HttpWorkerError::StreamMissing { stream })
+    }
+
+    #[inline]
+    pub(crate) fn stream_len(&self) -> usize {
+        self.streams.len()
+    }
+
+    #[inline]
+    pub(crate) fn stream_capacity(&self) -> usize {
+        self.streams.capacity()
+    }
+
+    #[inline]
+    pub(crate) fn streams_is_empty(&self) -> bool {
+        self.streams.is_empty()
     }
 }
 
@@ -584,5 +760,146 @@ mod tests {
             .encode(&mut encoded)
             .expect("SETTINGS frame encodes into a Vec");
         assert_eq!(encoded, LOCAL_CONTROL_PREFACE);
+    }
+
+    #[test]
+    fn stream_allocate_binds_parent_session_and_direction() {
+        let mut worker = HttpWorker::with_capacities(4, 4);
+        let parent = worker.allocate(session(1, 1)).expect("parent context");
+        let child = session(2, 1);
+        let stream = worker
+            .allocate_stream(child, parent, SessionStreamDirection::Bidi)
+            .expect("allocate stream");
+        let context = worker.get_stream(stream).expect("live stream");
+        assert_eq!(context.session, child);
+        assert_eq!(context.parent, parent);
+        assert_eq!(context.direction, SessionStreamDirection::Bidi);
+        assert_eq!(StreamContextId::from(Index::from(stream)), stream);
+        assert_eq!(StreamContextId::from(u64::from(stream)), stream);
+        let uni = worker
+            .allocate_stream(child, parent, SessionStreamDirection::Uni)
+            .expect("allocate uni stream");
+        assert_eq!(
+            worker.get_stream(uni).expect("live stream").direction,
+            SessionStreamDirection::Uni
+        );
+    }
+
+    #[test]
+    fn stream_allocation_rejects_stale_or_missing_parent() {
+        let mut worker = HttpWorker::with_capacities(4, 4);
+        let bogus = ContextId::from(u64::MAX);
+        assert!(matches!(
+            worker.allocate_stream(session(1, 1), bogus, SessionStreamDirection::Bidi),
+            Err(HttpWorkerError::ParentContextMissing { parent: p }) if p == bogus
+        ));
+        let parent = worker.allocate(session(1, 1)).expect("parent context");
+        worker.remove(parent).expect("remove parent");
+        assert!(matches!(
+            worker.allocate_stream(session(2, 1), parent, SessionStreamDirection::Bidi),
+            Err(HttpWorkerError::ParentContextMissing { parent: p }) if p == parent
+        ));
+        assert_eq!(worker.stream_len(), 0, "failed allocation leaves no stream");
+    }
+
+    #[test]
+    fn stream_generation_advances_after_remove_and_slot_reuse() {
+        let mut worker = HttpWorker::with_capacities(4, 4);
+        let parent = worker.allocate(session(1, 1)).expect("parent");
+        let first = worker
+            .allocate_stream(session(2, 1), parent, SessionStreamDirection::Bidi)
+            .expect("allocate first stream");
+        worker.remove_stream(first).expect("remove stream");
+        let second = worker
+            .allocate_stream(session(3, 1), parent, SessionStreamDirection::Uni)
+            .expect("reuse slot");
+        assert_ne!(first, second);
+        assert_eq!(Index::from(second).slot(), Index::from(first).slot());
+        assert_ne!(
+            Index::from(second).generation(),
+            Index::from(first).generation()
+        );
+        assert!(matches!(
+            worker.get_stream(first),
+            Err(HttpWorkerError::StreamMissing { stream: s }) if s == first
+        ));
+        assert_eq!(
+            worker.get_stream(second).expect("new identity live").session,
+            session(3, 1)
+        );
+    }
+
+    #[test]
+    fn stream_session_mismatch_is_typed_error() {
+        let mut worker = HttpWorker::with_capacities(4, 4);
+        let parent = worker.allocate(session(1, 1)).expect("parent");
+        let child = session(2, 1);
+        let other = session(3, 1);
+        let stream = worker
+            .allocate_stream(child, parent, SessionStreamDirection::Bidi)
+            .expect("allocate stream");
+        assert!(matches!(
+            worker.get_stream_for_session(stream, other),
+            Err(HttpWorkerError::StreamSessionMismatch {
+                stream: s,
+                expected: e,
+                actual: a,
+            }) if s == stream && e == other && a == child
+        ));
+        assert_eq!(
+            worker
+                .get_stream_for_session(stream, child)
+                .expect("exact session")
+                .session,
+            child
+        );
+    }
+
+    #[test]
+    fn stream_and_connection_capacities_are_independent() {
+        let mut worker = HttpWorker::with_capacities(1, 2);
+        let parent = worker.allocate(session(1, 1)).expect("only connection");
+        assert!(matches!(
+            worker.allocate(session(2, 1)),
+            Err(HttpWorkerError::ContextCapacityExhausted { capacity: 1 })
+        ));
+        // Stream pool still has headroom despite connection pool exhaustion.
+        let first = worker
+            .allocate_stream(session(2, 1), parent, SessionStreamDirection::Bidi)
+            .expect("first stream");
+        let second = worker
+            .allocate_stream(session(3, 1), parent, SessionStreamDirection::Uni)
+            .expect("second stream");
+        assert!(matches!(
+            worker.allocate_stream(session(4, 1), parent, SessionStreamDirection::Bidi),
+            Err(HttpWorkerError::StreamCapacityExhausted { capacity: 2 })
+        ));
+        // Removing streams leaves the connection pool untouched.
+        worker.remove_stream(first).expect("remove first");
+        worker.remove_stream(second).expect("remove second");
+        assert_eq!(worker.len(), 1);
+        assert_eq!(worker.stream_len(), 0);
+        assert_eq!(worker.capacity(), 1);
+        assert_eq!(worker.stream_capacity(), 2);
+        assert!(worker.streams_is_empty());
+    }
+
+    #[test]
+    fn remove_stale_or_missing_stream_identity_is_typed_error() {
+        let mut worker = HttpWorker::with_capacities(2, 2);
+        let bogus = StreamContextId::from(u64::MAX);
+        assert!(matches!(
+            worker.remove_stream(bogus),
+            Err(HttpWorkerError::StreamMissing { stream: s }) if s == bogus
+        ));
+        let parent = worker.allocate(session(1, 1)).expect("parent");
+        let stream = worker
+            .allocate_stream(session(2, 1), parent, SessionStreamDirection::Bidi)
+            .expect("allocate stream");
+        worker.remove_stream(stream).expect("remove stream");
+        assert!(matches!(
+            worker.remove_stream(stream),
+            Err(HttpWorkerError::StreamMissing { stream: s }) if s == stream
+        ));
     }
 }
