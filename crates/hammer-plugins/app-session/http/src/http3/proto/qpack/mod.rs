@@ -5,8 +5,8 @@
 //! string codec (`prefix_string`) with its Huffman coding (`huffman`), the
 //! field line type (`field`), the fixed 99-entry static table
 //! (`static_table`), and the capacity-zero encoded field section prefix
-//! (`block`). Field line parsing, the encoder and the decoder are later
-//! slices.
+//! (`block`). Literal and post-base field lines, the encoder and the decoder
+//! are later slices.
 //!
 //! References:
 //! - RFC 9204 Section 4.1.1 (prefix integers), Section 4.2 (prefix strings
@@ -53,6 +53,11 @@ pub(crate) enum QpackError {
     /// nonzero delta can only occur in a block that references dynamic
     /// entries.
     NonZeroDeltaBase { sign: u8, delta_base: u64 },
+    /// A dynamic-table reference in an indexed field line (RFC 9204
+    /// Section 4.5.2, T bit clear). This capacity-zero slice has no dynamic
+    /// table, so no dynamic index can be resolved; VPP reports the same
+    /// condition as `HPACK_ERROR_COMPRESSION`.
+    DynamicReference,
     /// A field-line or static-table index that resolves to no entry. The
     /// fixed 99-entry table (RFC 9204 Appendix A) is the only reference
     /// target this static-only decoder supports; VPP reports the failed
@@ -99,6 +104,9 @@ impl std::fmt::Display for QpackError {
                     f,
                     "delta base sign {sign} value {delta_base} requires a dynamic table"
                 )
+            }
+            QpackError::DynamicReference => {
+                write!(f, "dynamic table reference with a capacity-zero table")
             }
             QpackError::InvalidIndex(index) => {
                 write!(f, "static table index {index} out of range")
