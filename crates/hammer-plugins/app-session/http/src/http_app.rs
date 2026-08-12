@@ -27,7 +27,7 @@ use hammer_infra::pool::Index;
 use hammer_runtime::app::{SessionAppContext, SessionAppRegistration, SessionFlags};
 use hammer_runtime::session::{SessionApplicationErrorCode, SessionStreamDirection};
 use hammer_runtime::{DataWorkerId, Engine, RuntimeError, RuntimeResult};
-use hammer_service::session::SessionId;
+use hammer_service::session::{SessionEndpointRole, SessionId};
 use hammer_service::session::protocol::SessionAppCallbacks;
 use hammer_service::session::runtime::{SessionAcceptMetadata, SessionWorker};
 
@@ -124,30 +124,34 @@ pub(crate) fn accept_on(
     // (runtime.rs, `SessionAcceptMetadata`).
     let Some(metadata) = worker.accept_metadata(session) else {
         // The Session is not live in the worker pool, so no role metadata
-        // exists to branch on. Fall back to the connection path: the
-        // allocation succeeds and `set_app_session` reports the typed
-        // SessionMissing, rolling the context back — the same observable
-        // behavior the connection path always had for unknown Sessions.
-        return accept_connection(main, worker, session);
+        // exists to branch on. Fall back to the connection path with role
+        // `None`: the allocation succeeds and `set_app_session` reports the
+        // typed SessionMissing, rolling the context back — the same
+        // observable behavior the connection path always had for unknown
+        // Sessions.
+        return accept_connection(main, worker, session, None);
     };
     if metadata.flags.contains(SessionFlags::STREAM) {
         accept_stream(main, worker, session, metadata)
     } else {
-        accept_connection(main, worker, session)
+        accept_connection(main, worker, session, metadata.role)
     }
 }
 
 /// `accept` dispatch for a root Session, mirroring VPP
 /// `http_ts_accept_connection` (http.c:586-673) plus the control-stream
 /// bootstrap of `http3_conn_accept_callback` (http3.c:2358-2374, via
-/// `http3_conn_init` http3.c:216-250).
+/// `http3_conn_init` http3.c:216-250). The allocated connection context
+/// records the accept-metadata endpoint role (worker.rs
+/// `allocate_with_role`); the missing-metadata fallback passes `None`.
 fn accept_connection(
     main: &HttpMain,
     worker: &mut SessionWorker<Index>,
     session: SessionId,
+    role: Option<SessionEndpointRole>,
 ) -> RuntimeResult<()> {
     let context = main.with_worker(worker.worker(), |http| {
-        http.allocate(session).map_err(RuntimeError::from)
+        http.allocate_with_role(session, role).map_err(RuntimeError::from)
     })?;
     if let Err(error) = worker.set_app_session(session, u64::from(context)) {
         // Rollback is best effort and must not replace the primary

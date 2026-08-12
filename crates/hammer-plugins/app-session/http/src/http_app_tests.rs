@@ -21,7 +21,7 @@ use hammer_runtime::{
 };
 use hammer_service::session::protocol::SessionAppCallbacks;
 use hammer_service::session::runtime::{SessionMain, SessionTransportWorkerActions, SessionWorker};
-use hammer_service::session::{ApplicationMain, SessionId};
+use hammer_service::session::{ApplicationMain, SessionEndpointRole, SessionId};
 
 use super::http_app::{
     CALLBACKS, HTTP_SESSION_APP, HttpAppError, NAME, accept, accept_on, destroy, install,
@@ -146,6 +146,29 @@ fn construct_session(
             false,
         )
         .expect("construct Session App session")
+}
+
+/// A root Session constructed as accepted from a listener, so accept
+/// metadata reports `Server` (runtime.rs `endpoint_role`), exactly like a
+/// lower QUIC connection the transport accepted.
+fn construct_accepted_root(
+    sessions: &mut SessionWorker<Index>,
+    application: ApplicationId,
+    session_app: SessionAppId,
+    transport_slot: u32,
+) -> SessionId {
+    sessions
+        .construct_transport_session(
+            HttpMain::TRANSPORT_ID,
+            Index::new(transport_slot, 0),
+            0,
+            application,
+            Some(session_app),
+            None,
+            None,
+            true,
+        )
+        .expect("construct accepted Session App session")
 }
 
 /// The typed `HttpWorkerError` inside a `RuntimeError` chain.
@@ -291,6 +314,28 @@ fn accept_allocates_one_context_and_keeps_it_on_successful_publication() {
 }
 
 #[test]
+fn accept_root_records_server_role_from_accept_metadata() {
+    let (main, mut sessions, application, session_app) = test_harness();
+    let session = construct_accepted_root(&mut sessions, application, session_app, 1);
+
+    accept_on(&main, &mut sessions, session, 0).expect("accept root");
+
+    // Fresh connection pool: the first allocation occupies slot 0 with
+    // generation 1, so its identity is deterministic.
+    let context = ContextId::from(Index::new(0, 1));
+    main.with_worker(DataWorkerId::new(0), |http| {
+        let connection = http.get(context).map_err(RuntimeError::from)?;
+        assert_eq!(
+            connection.role,
+            Some(SessionEndpointRole::Server),
+            "root accept records the accept-metadata role on the connection context"
+        );
+        Ok(())
+    })
+    .expect("worker accessible on the test thread");
+}
+
+#[test]
 fn accept_is_idempotent_when_context_is_already_published() {
     let (main, mut sessions, application, session_app) = test_harness();
     let session = construct_session(&mut sessions, application, session_app, 2);
@@ -392,6 +437,13 @@ fn accept_rolls_back_context_when_publication_fails() {
     // SessionMissing, so the context must be rolled back and the primary
     // error preserved.
     let bogus = SessionId::from_raw(123);
+    // No accept metadata exists for the out-of-range session, so the accept
+    // takes the missing-metadata fallback: the connection path allocates
+    // with role `None`, then the publication failure below rolls it back.
+    assert!(
+        sessions.accept_metadata(bogus).is_none(),
+        "fallback branch is the missing-metadata path"
+    );
     let error = accept_on(&main, &mut sessions, bogus, 0)
         .expect_err("out-of-range session cannot be published");
     assert!(
