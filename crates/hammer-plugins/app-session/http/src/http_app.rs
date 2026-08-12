@@ -7,31 +7,38 @@
 //! `APP_OPTIONS_FLAGS_IS_BUILTIN`). This slice owns the plugin descriptor and
 //! the Session App registration whose `install` path hands `SessionMain` a
 //! static callback table, plus the `accept` callback: it resolves the owning
-//! `ThreadOwned<HttpWorker>` by Session worker id, allocates exactly one O(1)
-//! `ConnectionContext` bound to the accepted lower QUIC Session, and
-//! publishes its `ContextId` through `SessionWorker::set_app_session`,
-//! mirroring VPP `http_ts_accept_connection` (http.c:586-673). Upward
+//! `ThreadOwned<HttpWorker>` by Session worker id, branches on the accepted
+//! Session's metadata exactly as VPP `http_ts_accept_callback`
+//! (http.c:733-740) branches on `SESSION_F_STREAM`, and allocates exactly
+//! one O(1) context — a `ConnectionContext` for a root
+//! (`http_ts_accept_connection`, http.c:586-673) or a `StreamContext` bound
+//! to its parent connection for a stream child (`http_ts_accept_stream`,
+//! http.c:675-721) — then publishes its `ContextId`/`StreamContextId`
+//! through `SessionWorker::set_app_session`. Upward
 //! `SessionTransport` registration, listener/connect, the HTTP3 engine, FIFO
 //! transfer/publication, QPACK, and worker contexts are later slices; no
 //! callback that needs their lifecycle state is installed here.
 
 use hammer_infra::pool::Index;
-use hammer_runtime::app::{SessionAppContext, SessionAppRegistration};
+use hammer_runtime::app::{SessionAppContext, SessionAppRegistration, SessionFlags};
+use hammer_runtime::session::SessionStreamDirection;
 use hammer_runtime::{DataWorkerId, Engine, RuntimeError, RuntimeResult};
 use hammer_service::session::SessionId;
 use hammer_service::session::protocol::SessionAppCallbacks;
-use hammer_service::session::runtime::SessionWorker;
+use hammer_service::session::runtime::{SessionAcceptMetadata, SessionWorker};
 
 use crate::listener::{HTTP_MAIN, HttpMain};
+use crate::worker::ContextId;
 
 pub(crate) const NAME: &str = "http";
 
 /// Static callback table passed to `SessionMain::install_session_app`,
 /// mirroring VPP's static `http_app_cb_vft` (http.c:1004-1017).
 ///
-/// `accept` is wired: it needs nothing beyond the per-worker context pool
-/// (`HttpWorker::allocate`/`remove`, listener.rs) and the Session worker's
-/// `set_app_session` publication. Every other VPP callback routes through
+/// `accept` is wired: it needs nothing beyond the per-worker context pools
+/// (`HttpWorker::allocate`/`allocate_stream`/`remove`/`remove_stream`,
+/// worker.rs) and the Session worker's `set_app_session` publication. Every
+/// other VPP callback routes through
 /// HTTP worker connection state (`http_ts_*` over `http_ctx_t`) that its
 /// owning slice does not provide yet; installing speculative no-ops would be
 /// wrong without that state. Deferred to the HTTP3/lifecycle slice:
@@ -45,17 +52,30 @@ pub(crate) static CALLBACKS: SessionAppCallbacks = SessionAppCallbacks {
     ..SessionAppCallbacks::all_none()
 };
 
+/// Typed errors of the builtin HTTP Session App accept path that the Session
+/// Worker and `HttpWorker` errors cannot express: a stream child whose accept
+/// metadata carries no parent connection context, so no `ContextId` exists to
+/// name in `HttpWorkerError::ParentContextMissing`.
+#[hammer_component_macros::runtime_error(subsystem = "http")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+pub(crate) enum HttpAppError {
+    #[error("http stream accept requires a live parent connection context, session {session:?} has none")]
+    StreamParentMissing { session: SessionId },
+}
+
 /// Session App `accept` for an accepted lower QUIC Session.
 ///
-/// Mirrors the ownership/order of VPP `http_ts_accept_connection`
-/// (http.c:586-673): the Session resolves the owning worker, one context is
-/// allocated bound to the Session, and only then is the connection state
-/// published. Here the per-worker `HttpWorker` slot is resolved by the
-/// Session's `DataWorkerId` (`HttpMain::with_worker`, listener.rs) and the
-/// publication is the Session worker's opaque `set_app_session`, with the
-/// allocated context removed directly when publication fails so the primary
-/// typed error is preserved (QUIC publish rollback, quic
-/// session_app.rs:37-49).
+/// Mirrors the ownership/order of VPP `http_ts_accept_callback`
+/// (http.c:733-740): the Session's role is read from its accept metadata and
+/// dispatched to `http_ts_accept_connection` (http.c:586-673) for roots or
+/// `http_ts_accept_stream` (http.c:675-721) for stream children. In both
+/// paths the Session resolves the owning worker, one context is allocated
+/// bound to the Session, and only then is the connection state published.
+/// Here the per-worker `HttpWorker` slot is resolved by the Session's
+/// `DataWorkerId` (`HttpMain::with_worker`, listener.rs) and the publication
+/// is the Session worker's opaque `set_app_session`, with the allocated
+/// context removed directly when publication fails so the primary typed
+/// error is preserved (QUIC publish rollback, quic session_app.rs:37-49).
 pub(crate) fn accept(
     worker: &mut SessionWorker<Index>,
     session: SessionId,
@@ -79,9 +99,35 @@ pub(crate) fn accept_on(
     if context != 0 {
         // A previous accept already published this Session's context; the
         // dispatch layer passes it back on every callback, so a duplicate
-        // accept is idempotent.
+        // accept is idempotent for both connection and stream roles.
         return Ok(());
     }
+    // VPP `http_ts_accept_callback` (http.c:733-740) branches on
+    // `SESSION_F_STREAM`; `worker.accept_metadata` supplies the flags and,
+    // for stream children, the parent connection's published context
+    // (runtime.rs, `SessionAcceptMetadata`).
+    let Some(metadata) = worker.accept_metadata(session) else {
+        // The Session is not live in the worker pool, so no role metadata
+        // exists to branch on. Fall back to the connection path: the
+        // allocation succeeds and `set_app_session` reports the typed
+        // SessionMissing, rolling the context back — the same observable
+        // behavior the connection path always had for unknown Sessions.
+        return accept_connection(main, worker, session);
+    };
+    if metadata.flags.contains(SessionFlags::STREAM) {
+        accept_stream(main, worker, session, metadata)
+    } else {
+        accept_connection(main, worker, session)
+    }
+}
+
+/// `accept` dispatch for a root Session, mirroring VPP
+/// `http_ts_accept_connection` (http.c:586-673).
+fn accept_connection(
+    main: &HttpMain,
+    worker: &mut SessionWorker<Index>,
+    session: SessionId,
+) -> RuntimeResult<()> {
     let context = main.with_worker(worker.worker(), |http| {
         http.allocate(session).map_err(RuntimeError::from)
     })?;
@@ -91,6 +137,49 @@ pub(crate) fn accept_on(
         // (quic session_app.rs:42-47).
         let _ = main.with_worker(worker.worker(), |http| {
             http.remove(context).map_err(RuntimeError::from)
+        });
+        return Err(error);
+    }
+    Ok(())
+}
+
+/// `accept` dispatch for one stream child, mirroring VPP
+/// `http_ts_accept_stream` (http.c:675-721): the parent connection context is
+/// required and converted to a generation-checked `ContextId`, then one
+/// `StreamContext` is allocated in the worker's stream pool bound to the
+/// child Session with the direction derived from `SESSION_F_UNIDIRECTIONAL`
+/// (http.c:688-690), and finally the `StreamContextId` is published through
+/// `set_app_session`. Parent liveness lives in `HttpWorker::allocate_stream`
+/// (worker.rs), which rejects stale or foreign parent identities with
+/// `ParentContextMissing`; on publication failure the allocated stream
+/// context is removed directly, preserving the primary typed error exactly
+/// as the connection path does.
+fn accept_stream(
+    main: &HttpMain,
+    worker: &mut SessionWorker<Index>,
+    session: SessionId,
+    metadata: SessionAcceptMetadata,
+) -> RuntimeResult<()> {
+    let parent = ContextId::from(
+        metadata
+            .parent_app_context
+            .ok_or(HttpAppError::StreamParentMissing { session })?,
+    );
+    let direction = if metadata.flags.contains(SessionFlags::UNIDIRECTIONAL) {
+        SessionStreamDirection::Uni
+    } else {
+        SessionStreamDirection::Bidi
+    };
+    let stream = main.with_worker(worker.worker(), |http| {
+        http.allocate_stream(session, parent, direction)
+            .map_err(RuntimeError::from)
+    })?;
+    if let Err(error) = worker.set_app_session(session, u64::from(stream)) {
+        // Rollback is best effort and must not replace the primary
+        // set_app_session error, mirroring the QUIC publish path
+        // (quic session_app.rs:42-47).
+        let _ = main.with_worker(worker.worker(), |http| {
+            http.remove_stream(stream).map_err(RuntimeError::from)
         });
         return Err(error);
     }
