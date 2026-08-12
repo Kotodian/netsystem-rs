@@ -1,18 +1,21 @@
 //! QPACK (RFC 9204) primitives: prefix integers, prefix strings, Huffman
-//! coding, and field lines.
+//! coding, field lines, and the static table.
 //!
 //! This slice wires the prefix integer codec (`prefix_int`), the prefix
-//! string codec (`prefix_string`) with its Huffman coding (`huffman`), and
-//! the field line type (`field`). The static table, block parsing, encoder
-//! and decoder are later slices and are not declared here.
+//! string codec (`prefix_string`) with its Huffman coding (`huffman`), the
+//! field line type (`field`), and the fixed 99-entry static table
+//! (`static_table`). Field block parsing, the encoder and the decoder are
+//! later slices and are not declared here.
 //!
 //! References:
 //! - RFC 9204 Section 4.1.1 (prefix integers), Section 4.2 (prefix strings
-//!   and Huffman coding), RFC 7541 Section 4.1 (entry size accounting) and
-//!   Appendix B (Huffman table)
-//! - `third_party/h3/h3/src/qpack/{mod,prefix_int,prefix_string,field}.rs`
-//! - `third_party/vpp/src/plugins/http/http2/hpack_inlines.h` (integer codec
-//!   and Huffman decode), `huffman_table.h` (RFC 7541 Appendix B data)
+//!   and Huffman coding), Appendix A (static table), RFC 7541 Section 4.1
+//!   (entry size accounting) and Appendix B (Huffman table)
+//! - `third_party/h3/h3/src/qpack/{mod,prefix_int,prefix_string,field,static_}.rs`
+//! - `third_party/vpp/src/plugins/http/http3/qpack.c` (static table),
+//!   `third_party/vpp/src/plugins/http/http2/hpack_inlines.h` (integer
+//!   codec and Huffman decode), `huffman_table.h` (RFC 7541 Appendix B
+//!   data)
 
 use super::varint::UnexpectedEnd;
 
@@ -20,13 +23,14 @@ pub(crate) mod field;
 pub(crate) mod huffman;
 pub(crate) mod prefix_int;
 pub(crate) mod prefix_string;
+pub(crate) mod static_table;
 
 /// Errors produced by the QPACK wire primitives wired in this slice.
 ///
-/// The variant set is what the prefix primitives can produce; later QPACK
-/// slices extend this only when their seams prove new variants. Unlike h3
-/// (which `assert!`s the prefix size) and VPP (which `ASSERT`s it), an
-/// invalid prefix size is a typed error here.
+/// The variant set is what the prefix and static table primitives can
+/// produce; later QPACK slices extend this only when their seams prove new
+/// variants. Unlike h3 (which `assert!`s the prefix size) and VPP (which
+/// `ASSERT`s it), an invalid prefix size is a typed error here.
 #[derive(Debug, Clone, Eq, PartialEq)]
 pub(crate) enum QpackError {
     /// A prefix size outside 1..=8 bits, which has no wire representation.
@@ -37,6 +41,11 @@ pub(crate) enum QpackError {
     /// The input ended before the integer was complete.
     /// VPP reports the same condition as `HPACK_INVALID_INT`.
     UnexpectedEnd,
+    /// A field-line or static-table index that resolves to no entry. The
+    /// fixed 99-entry table (RFC 9204 Appendix A) is the only reference
+    /// target this static-only decoder supports; VPP reports the failed
+    /// static-table lookup as `HPACK_ERROR_COMPRESSION`.
+    InvalidIndex(usize),
     /// Huffman decoding failed: input ending mid-code, trailing bits that
     /// are not all-ones (EOS-prefix) padding, or the all-ones EOS path
     /// resolving to no symbol (h3 `HuffmanDecodingError`).
@@ -70,6 +79,9 @@ impl std::fmt::Display for QpackError {
             QpackError::InvalidSize => write!(f, "prefix size must be between 1 and 8 bits"),
             QpackError::Overflow => write!(f, "prefix integer overflow"),
             QpackError::UnexpectedEnd => write!(f, "unexpected end of prefix integer"),
+            QpackError::InvalidIndex(index) => {
+                write!(f, "static table index {index} out of range")
+            }
             QpackError::HuffmanDecoding(e) => write!(f, "huffman decode failed: {:?}", e),
             QpackError::HuffmanEncoding(e) => write!(f, "huffman encode failed: {:?}", e),
         }
