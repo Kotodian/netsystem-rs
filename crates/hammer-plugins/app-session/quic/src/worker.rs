@@ -1365,6 +1365,71 @@ impl QuicWorker {
         Ok(())
     }
 
+    /// Closes one connection Session with an application error code and an
+    /// owned copy of the app reason; the transport half of the generic
+    /// `SessionWorker::close_connection` dispatch, replacing the
+    /// `transport_close_connection_unsupported` stub. Mirrors VPP
+    /// `quic_quicly_on_app_closed` (quic_quicly.c:1086-1177): only a
+    /// connection Session is admitted (O(1) `session_context` resolution),
+    /// the application error code is checked into a varint before any
+    /// transport side effect, and the connection-state machine follows VPP —
+    /// OPENED/HANDSHAKE/READY become ACTIVE_CLOSING with `quicly_close`
+    /// (Hammer's worker-local `Connection::close` with the checked code and
+    /// the owned reason bytes), PASSIVE_CLOSING becomes
+    /// PASSIVE_CLOSING_APP_CLOSED, PASSIVE_CLOSING_QUIC_CLOSED is cleaned up,
+    /// and ACTIVE_CLOSING is left alone. The connection is queued for output
+    /// and its deadline resynced only after the mutation, so the
+    /// CONNECTION_CLOSE frame transmits. The Session Worker's app-close guard
+    /// (runtime.rs:1740) already recorded AppClosed before dispatch, and the
+    /// connection state itself makes repeated dispatch a no-op.
+    pub(super) fn close_connection_action(
+        &mut self,
+        sessions: &mut SessionWorker<Index>,
+        session: SessionId,
+        code: SessionApplicationErrorCode,
+        reason: &[u8],
+    ) -> RuntimeResult<()> {
+        let context = self.session_context(sessions, session)?;
+        let state = self
+            .contexts
+            .get(context.into())
+            .and_then(Context::connection)
+            .map(|connection| connection.state)
+            .ok_or(QuicWorkerError::SessionNotConnection { session })?;
+        let error_code = Self::app_error_code_varint(session, code)?;
+        let reason = Bytes::copy_from_slice(reason);
+        let now = Instant::now();
+        match state {
+            ConnectionState::Handshaking | ConnectionState::Established => {
+                self.contexts
+                    .get_mut(context.into())
+                    .ok_or_else(|| QuicWorkerError::ContextMissing { context })?
+                    .engine_mut(context)?
+                    .connection_mut()?
+                    .close(now, error_code, reason);
+                self.contexts
+                    .get_mut(context.into())
+                    .and_then(Context::connection_mut)
+                    .ok_or_else(|| QuicWorkerError::ContextMissing { context })?
+                    .state = ConnectionState::ActiveClosing;
+                self.queue_connection_output(context)?;
+                self.sync_connection_deadline_from_engine(context, now)
+            }
+            ConnectionState::PassiveClosing | ConnectionState::PassiveClosingQuicClosed => {
+                self.contexts
+                    .get_mut(context.into())
+                    .and_then(Context::connection_mut)
+                    .ok_or_else(|| QuicWorkerError::ContextMissing { context })?
+                    .state = ConnectionState::PassiveClosingAppClosed;
+                self.maybe_finalize_connection(sessions, context)
+            }
+            ConnectionState::ActiveClosing | ConnectionState::PassiveClosingAppClosed => {
+                self.maybe_finalize_connection(sessions, context)
+            }
+            ConnectionState::TransportClosed => self.finalize_connection(sessions, context),
+        }
+    }
+
     pub(super) fn lower_session(&self, context: ContextId) -> RuntimeResult<SessionId> {
         self.contexts
             .get(context.into())
@@ -3240,20 +3305,12 @@ pub(crate) fn quic_transport_open_stream(
 /// resolving it from the session entry's transport proto
 /// (session.c:1422, transport.c:500-505).
 ///
-/// Temporary constraint: `SessionTransportWorkerActions::new` requires all
-/// four fn pointers, but this slice implements only `open_stream`,
-/// `reset_stream`, and `stop_sending` — nothing in the QUIC worker invokes
-/// `SessionWorker::close_connection` yet, so dispatch of that slot is
-/// unreachable. The slot therefore holds a minimal typed stub that returns an
-/// explicit `TransportActionUnsupported` error with zero side effects;
-/// replace it with the real action in the sub-seam that introduces its
-/// dispatch.
 pub(crate) fn quic_transport_actions() -> SessionTransportWorkerActions<Index> {
     SessionTransportWorkerActions::new(
         quic_transport_open_stream,
         quic_transport_reset_stream,
         quic_transport_stop_sending,
-        transport_close_connection_unsupported,
+        quic_transport_close_connection,
     )
 }
 
@@ -3300,19 +3357,28 @@ pub(crate) fn quic_transport_stop_sending(
     })
 }
 
-/// Minimal typed stub for the unreachable `close_connection` slot (see
-/// `quic_transport_actions`): explicit unsupported error, no side effects.
-fn transport_close_connection_unsupported(
-    _sessions: &mut SessionWorker<Index>,
-    _connection: SessionId,
-    _code: SessionApplicationErrorCode,
-    _reason: &[u8],
+/// Closes one connection Session through the Session Worker's worker-local
+/// transport action table; the `close_connection` callback installed by
+/// `quic_transport_actions`. Mirrors VPP resolving the transport VFT and
+/// invoking `transport_close` (transport.h:131) from `session_transport_close`
+/// (session.c:1657-1682): the Session Worker resolves the owning worker from
+/// its own `DataWorkerId` in O(1), the reason stays raw `&[u8]` (never
+/// narrowed to `&str`), and the QUIC Main comes from the same QUIC_MAIN
+/// channel the session queue entry points use. No scan, allocation, or lock
+/// on the dispatch path; the reason copy and the quinn close happen on the
+/// owning worker inside `close_connection_action`.
+pub(crate) fn quic_transport_close_connection(
+    sessions: &mut SessionWorker<Index>,
+    connection: SessionId,
+    code: SessionApplicationErrorCode,
+    reason: &[u8],
 ) -> RuntimeResult<()> {
-    Err(RuntimeError::from(
-        QuicWorkerError::TransportActionUnsupported {
-            action: "close_connection",
-        },
-    ))
+    let main = QUIC_MAIN
+        .get()
+        .ok_or(RuntimeError::PluginStateNotInitialized { plugin: "quic" })?;
+    main.with_worker_and_sessions(sessions, |sessions, quic| {
+        quic.close_connection_action(sessions, connection, code, reason)
+    })
 }
 
 impl QuicWorker {
@@ -3734,6 +3800,8 @@ pub(super) enum QuicWorkerError {
     SessionNotQuic { session: SessionId },
     #[error("Session {session:?} is a QUIC connection, not a stream")]
     SessionNotStream { session: SessionId },
+    #[error("Session {session:?} is a QUIC stream, not a connection")]
+    SessionNotConnection { session: SessionId },
     #[error("QUIC stream {stream:?} has no local send side to reset")]
     StreamSendSideMissing { stream: quinn_proto::StreamId },
     #[error("QUIC stream {stream:?} has no local receive side to stop")]
@@ -3754,8 +3822,6 @@ pub(super) enum QuicWorkerError {
     },
     #[error("QUIC application error code {code} for Session {session:?} is not a valid varint")]
     ApplicationErrorCodeInvalid { session: SessionId, code: u64 },
-    #[error("QUIC transport action `{action}` is not supported yet")]
-    TransportActionUnsupported { action: &'static str },
     #[error("QUIC transport action table install failed")]
     TransportActionsInstall {
         #[source]
@@ -7340,6 +7406,17 @@ mod tests {
             .unwrap_or(false)
     }
 
+    /// True when the worker-local quinn connection for `context` is closed.
+    fn connection_is_closed(worker: &QuicWorker, context: ContextId) -> bool {
+        worker
+            .contexts
+            .get(context.into())
+            .and_then(Context::connection)
+            .and_then(|connection| connection.engine.as_ref())
+            .and_then(|engine| engine.connection.as_ref())
+            .is_some_and(Connection::is_closed)
+    }
+
     #[test]
     fn reset_stream_resets_exact_stream_and_leaves_connection_untouched() -> RuntimeResult<()> {
         let (
@@ -8022,6 +8099,397 @@ mod tests {
                 .and_then(Context::stream_ref)
                 .is_some(),
             "the dispatch failure leaves the stream context untouched"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn close_connection_rejects_stream_session_before_any_side_effect() -> RuntimeResult<()> {
+        let (mut worker, mut sessions, _, _server, parent_context, _, bidi, _, _) =
+            test_established_stream()?;
+        let queued = worker.connection_tx_pending.len();
+
+        let error = worker
+            .close_connection_action(
+                &mut sessions,
+                bidi,
+                SessionApplicationErrorCode::from(0),
+                b"",
+            )
+            .expect_err("a stream Session is not a connection Session");
+
+        assert!(
+            matches!(
+                &error,
+                RuntimeError::Subsystem { source, .. }
+                    if matches!(
+                        source.downcast_ref::<QuicWorkerError>(),
+                        Some(QuicWorkerError::SessionNotConnection { session })
+                            if session == &bidi
+                    )
+            ),
+            "typed SessionNotConnection expected, got {error:?}"
+        );
+        assert_eq!(
+            worker.connection_tx_pending.len(),
+            queued,
+            "no output is queued for the rejected close"
+        );
+        assert!(
+            !connection_is_closed(&worker, parent_context),
+            "the parent connection is untouched"
+        );
+        assert_eq!(
+            worker
+                .contexts
+                .get(parent_context.into())
+                .and_then(Context::connection)
+                .map(|connection| connection.state),
+            Some(ConnectionState::Established)
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn close_connection_rejects_out_of_range_code_before_any_side_effect() -> RuntimeResult<()> {
+        let mut relay = peer_relay_established()?;
+        peer_relay_exchange(&mut relay)?;
+        relay
+            .worker
+            .schedule_connection_outputs(&mut relay.sessions, relay.now)?;
+        let queued = relay.worker.connection_tx_pending.len();
+
+        let error = relay
+            .worker
+            .close_connection_action(
+                &mut relay.sessions,
+                relay.connection_session,
+                SessionApplicationErrorCode::from(u64::MAX),
+                b"overflow",
+            )
+            .expect_err("2^64-1 is outside the varint range");
+
+        assert!(
+            matches!(
+                &error,
+                RuntimeError::Subsystem { source, .. }
+                    if matches!(
+                        source.downcast_ref::<QuicWorkerError>(),
+                        Some(QuicWorkerError::ApplicationErrorCodeInvalid { .. })
+                    )
+            ),
+            "typed ApplicationErrorCodeInvalid expected, got {error:?}"
+        );
+        assert_eq!(
+            relay.worker.connection_tx_pending.len(),
+            queued,
+            "no output is queued for the rejected close"
+        );
+        assert!(
+            !connection_is_closed(&relay.worker, relay.context),
+            "the connection is not closed before the code is validated"
+        );
+        assert_eq!(
+            relay
+                .worker
+                .contexts
+                .get(relay.context.into())
+                .and_then(Context::connection)
+                .map(|connection| connection.state),
+            Some(ConnectionState::Established)
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn close_connection_closes_established_connection_and_transmits_to_peer() -> RuntimeResult<()> {
+        let mut relay = peer_relay_established()?;
+        peer_relay_exchange(&mut relay)?;
+        relay
+            .worker
+            .schedule_connection_outputs(&mut relay.sessions, relay.now)?;
+        let queued = relay.worker.connection_tx_pending.len();
+
+        relay
+            .worker
+            .close_connection_action(
+                &mut relay.sessions,
+                relay.connection_session,
+                SessionApplicationErrorCode::from(42),
+                b"shutting down",
+            )
+            .expect("close an established connection");
+
+        assert_eq!(
+            relay
+                .worker
+                .contexts
+                .get(relay.context.into())
+                .and_then(Context::connection)
+                .map(|connection| connection.state),
+            Some(ConnectionState::ActiveClosing),
+            "VPP OPENED/HANDSHAKE/READY -> ACTIVE_CLOSING (quic_quicly.c:1150-1162)"
+        );
+        assert_eq!(
+            relay.worker.connection_tx_pending.len(),
+            queued + 1,
+            "the close queues the connection for output"
+        );
+        assert_eq!(
+            relay.worker.connection_tx_pending.last(),
+            Some(&relay.context),
+            "the queued output is the closed connection"
+        );
+        assert!(
+            connection_is_closed(&relay.worker, relay.context),
+            "the worker-local quinn connection is closed with the app code and reason"
+        );
+
+        // Drive the queued CONNECTION_CLOSE datagram and hand it to the peer.
+        relay
+            .worker
+            .schedule_connection_outputs(&mut relay.sessions, relay.now)?;
+        let (_, lower_tx) = relay
+            .sessions
+            .fifo_pair(relay.lower)
+            .ok_or_else(|| QuicWorkerError::SessionMissing {
+                session: relay.lower,
+            })?;
+        let mut responses = Vec::new();
+        loop {
+            if lower_tx.max_dequeue() < SessionDgramHeader::SIZE {
+                break;
+            }
+            let mut header_bytes = [0u8; SessionDgramHeader::SIZE];
+            assert_eq!(
+                lower_tx.peek(0, header_bytes.len(), &mut header_bytes),
+                header_bytes.len()
+            );
+            let Some(header) = SessionDgramHeader::from_bytes(&header_bytes) else {
+                break;
+            };
+            let payload_len = header.data_length() as usize;
+            let record_len = header.total_len().ok_or_else(|| {
+                QuicWorkerError::InvalidDatagram {
+                    session: relay.lower,
+                    length: header.data_length(),
+                }
+            })?;
+            if lower_tx.max_dequeue() < record_len {
+                break;
+            }
+            let mut payload = vec![0; payload_len];
+            assert_eq!(
+                lower_tx.peek(SessionDgramHeader::SIZE, payload_len, &mut payload),
+                payload_len
+            );
+            assert_eq!(lower_tx.dequeue_drop(record_len), record_len);
+            responses.push(payload);
+        }
+        for mut data in responses {
+            let mut descriptors = Vec::new();
+            let mut endpoint_buf = BytesMut::with_capacity(MAX_PACKET_SIZE);
+            if let Some(event) = relay.client_endpoint.handle_scratch_with_descriptors(
+                relay.now,
+                relay.server_addr,
+                None,
+                None,
+                &mut data,
+                &mut descriptors,
+                &mut endpoint_buf,
+            ) {
+                match event {
+                    DatagramEvent::ConnectionEvent(handle, event)
+                        if handle == relay.client_handle =>
+                    {
+                        relay.client_connection.handle_event(event);
+                    }
+                    DatagramEvent::Response(transmit) => {
+                        relay
+                            .to_server
+                            .push_back(endpoint_buf.split_to(transmit.size));
+                        endpoint_buf.reserve(MAX_PACKET_SIZE);
+                    }
+                    DatagramEvent::NewConnection(_) | DatagramEvent::ConnectionEvent(_, _) => {}
+                }
+            }
+        }
+        assert!(
+            relay.client_connection.is_closed(),
+            "the peer observes the transmitted CONNECTION_CLOSE"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn close_connection_during_handshake_starts_active_closing() -> RuntimeResult<()> {
+        let mut relay = peer_relay_established()?;
+        relay
+            .worker
+            .contexts
+            .get_mut(relay.context.into())
+            .and_then(Context::connection_mut)
+            .ok_or_else(|| QuicWorkerError::ContextMissing {
+                context: relay.context,
+            })?
+            .state = ConnectionState::Handshaking;
+        let queued = relay.worker.connection_tx_pending.len();
+
+        relay
+            .worker
+            .close_connection_action(
+                &mut relay.sessions,
+                relay.connection_session,
+                SessionApplicationErrorCode::from(1),
+                b"abort",
+            )
+            .expect("closing a handshaking connection is allowed");
+
+        assert_eq!(
+            relay
+                .worker
+                .contexts
+                .get(relay.context.into())
+                .and_then(Context::connection)
+                .map(|connection| connection.state),
+            Some(ConnectionState::ActiveClosing),
+            "VPP HANDSHAKE -> ACTIVE_CLOSING (quic_quicly.c:1150-1162)"
+        );
+        assert_eq!(
+            relay.worker.connection_tx_pending.len(),
+            queued + 1,
+            "the close queues the connection for output"
+        );
+        assert!(connection_is_closed(&relay.worker, relay.context));
+        Ok(())
+    }
+
+    #[test]
+    fn close_connection_repeats_are_idempotent_after_active_closing() -> RuntimeResult<()> {
+        let mut relay = peer_relay_established()?;
+        relay
+            .worker
+            .close_connection_action(
+                &mut relay.sessions,
+                relay.connection_session,
+                SessionApplicationErrorCode::from(42),
+                b"shutting down",
+            )
+            .expect("first close");
+        let queued = relay.worker.connection_tx_pending.len();
+
+        relay
+            .worker
+            .close_connection_action(
+                &mut relay.sessions,
+                relay.connection_session,
+                SessionApplicationErrorCode::from(7),
+                b"again",
+            )
+            .expect("repeated close on an ActiveClosing connection is a no-op");
+
+        assert_eq!(
+            relay
+                .worker
+                .contexts
+                .get(relay.context.into())
+                .and_then(Context::connection)
+                .map(|connection| connection.state),
+            Some(ConnectionState::ActiveClosing),
+            "VPP ACTIVE_CLOSING is left alone (quic_quicly.c:1171-1172)"
+        );
+        assert_eq!(
+            relay.worker.connection_tx_pending.len(),
+            queued,
+            "the repeated close queues no additional output"
+        );
+        assert!(connection_is_closed(&relay.worker, relay.context));
+        Ok(())
+    }
+
+    #[test]
+    fn close_connection_passive_closing_marks_app_closed() -> RuntimeResult<()> {
+        let (mut sessions, lower) = test_lower_session()?;
+        let mut worker = QuicWorker::new(DataWorkerId::new(0));
+        let context = worker
+            .contexts
+            .insert(Context::connection_with_listener(
+                lower,
+                None,
+                ApplicationId::new(1, 1),
+                None,
+                None,
+                None,
+            ))
+            .map(ContextId::from)
+            .ok_or(QuicWorkerError::ContextCapacityExhausted {
+                capacity: worker.contexts.capacity(),
+            })?;
+        let connection_session = sessions.insert_session_for_test(QuicWorker::ID, context.into());
+        worker
+            .contexts
+            .get_mut(context.into())
+            .and_then(Context::connection_mut)
+            .ok_or(QuicWorkerError::ContextMissing { context })?
+            .connection_session = Some(connection_session);
+        worker
+            .contexts
+            .get_mut(context.into())
+            .and_then(Context::connection_mut)
+            .ok_or(QuicWorkerError::ContextMissing { context })?
+            .state = ConnectionState::PassiveClosing;
+
+        worker.close_connection_action(
+            &mut sessions,
+            connection_session,
+            SessionApplicationErrorCode::from(0),
+            b"",
+        )?;
+
+        assert_eq!(
+            worker
+                .contexts
+                .get(context.into())
+                .and_then(Context::connection)
+                .map(|connection| connection.state),
+            Some(ConnectionState::PassiveClosingAppClosed),
+            "VPP PASSIVE_CLOSING -> PASSIVE_CLOSING_APP_CLOSED (quic_quicly.c:1163-1167)"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn close_connection_dispatch_records_app_closed_and_suppresses_repeat() -> RuntimeResult<()> {
+        let (worker, mut sessions, _, _server, _, _, bidi, bidi_index, _) =
+            test_established_stream()?;
+        sessions.install_transport_actions(QuicWorker::ID, quic_transport_actions())?;
+        // The first dispatch passes the pre-close guard (AppClosed recorded)
+        // and reaches the QUIC action wrapper, which needs the process-global
+        // QUIC_MAIN worker channel that unit tests do not own, so it fails
+        // typed without touching any worker state (mirrors the stop_sending
+        // dispatch test).
+        assert!(matches!(
+            &sessions.close_connection(bidi, SessionApplicationErrorCode::from(3), b"shutting down"),
+            Err(SessionTransportActionError::TransportActionFailed { action, .. })
+                if *action == "close_connection"
+        ));
+        assert!(
+            sessions.session_app_closed(bidi),
+            "close_connection records AppClosed before dispatch (session.c:1657-1682)"
+        );
+        // A repeated dispatch is suppressed by the AppClosed guard with Ok,
+        // matching VPP pre-close-only dispatch.
+        assert!(sessions
+            .close_connection(bidi, SessionApplicationErrorCode::from(3), b"shutting down")
+            .is_ok());
+        assert!(sessions.session_app_closed(bidi));
+        assert!(
+            worker
+                .contexts
+                .get(bidi_index)
+                .and_then(Context::stream_ref)
+                .is_some(),
+            "the dispatch leaves the worker context untouched"
         );
         Ok(())
     }
