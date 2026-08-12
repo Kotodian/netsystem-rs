@@ -3673,7 +3673,7 @@ impl<Index: Copy + Eq> SessionWorker<Index> {
     /// are revalidated through the generation-checked [`SessionId`], so a slot
     /// that was already removed or reused by the callback is left untouched
     /// and the call returns `Ok(())`.
-    pub(crate) fn remove_upper_session(&mut self, upper: SessionId) -> RuntimeResult<()> {
+    pub fn remove_upper_session(&mut self, upper: SessionId) -> RuntimeResult<()> {
         // The callback must see only the occupant of the requested `upper`
         // SessionId: the read is gated on the full generation-checked lookup,
         // so a stale ID whose slot was reused is a safe no-op here, before any

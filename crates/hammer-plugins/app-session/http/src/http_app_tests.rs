@@ -1747,3 +1747,31 @@ fn release_request_stream_rejects_non_bidi_without_mutation() {
         .remove_stream(uni)
         .expect("remove_stream still owns uni stream release");
 }
+
+#[test]
+fn remove_upper_session_rolls_back_upper_and_repeats_as_noop() {
+    // VPP rollback of a newly-created upper is a direct session_free with no
+    // app callback (session.c:782-801): the app was never notified, and the
+    // owner link dies with the session. Hammer exposes the same rollback to
+    // Session App plugins through the public `remove_upper_session` surface;
+    // this test proves the cross-crate visibility and the typed no-op for a
+    // stale ID.
+    let (_main, mut sessions, application, session_app) = test_harness();
+    sessions
+        .install_application_mq_for_test(application)
+        .expect("install test Application MQ");
+    let lower = construct_session(&mut sessions, application, session_app, 1);
+    let upper = sessions
+        .create_upper_session(lower, 0x55)
+        .expect("create upper Session from the lower");
+
+    sessions
+        .remove_upper_session(upper)
+        .expect("roll back the upper Session");
+
+    assert!(!sessions.has_session(upper), "the upper is removed");
+    assert!(sessions.has_session(lower), "the lower survives rollback");
+    sessions
+        .remove_upper_session(upper)
+        .expect("repeated removal of the stale upper is a typed no-op");
+}
