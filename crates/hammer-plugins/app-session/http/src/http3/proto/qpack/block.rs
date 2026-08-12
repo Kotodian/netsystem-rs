@@ -19,9 +19,9 @@
 //! the existing typed errors from `prefix_int`.
 //!
 //! Field line representations (RFC 9204 Sections 4.5.2-4.5.6): this slice
-//! implements the indexed form (Section 4.5.2) and the literal form with
-//! static name reference (Section 4.5.4); literal-name, post-base and the
-//! full decoder are later slices.
+//! implements the indexed form (Section 4.5.2), the literal form with static
+//! name reference (Section 4.5.4) and the literal-name form (Section 4.5.6);
+//! post-base and the full decoder are later slices.
 
 use std::borrow::Cow;
 
@@ -151,6 +151,50 @@ pub(crate) fn decode_literal_name_ref<B: Buf>(
     let value = prefix_string::decode(8, buf)?;
     Ok(Some(HeaderField {
         name,
+        value: Cow::Owned(value),
+    }))
+}
+
+/// Decode one field line, recognizing only the literal-with-literal-name
+/// representation (RFC 9204 Section 4.5.6, `001NHxxxx`).
+///
+/// The name is read as a 4-bit-prefix string (Huffman flag plus 3-bit length
+/// prefix, RFC 9204 Section 4.2) and the value as an 8-bit-prefix string;
+/// the returned field owns the decoded bytes of both. The N bit marks the
+/// field never-indexed: it affects the encoder's indexing policy, not the
+/// decoded field, so it is parsed and dropped here.
+///
+/// This mirrors VPP's `case 2`/`case 3` in `qpack_parse_headers`
+/// (`third_party/vpp/src/plugins/http/http3/qpack.c`, qpack.c:1002-1017):
+/// the name via `qpack_decode_string (&p, end, buf, buf_len, 4)` and the
+/// value via the same call with an 8-bit prefix; `case 3` sets `never_index`
+/// for the N bit, and the encoder writes `*a = never_index ? 0x30 : 0x20` in
+/// `qpack_encode_custom_header` (qpack.c:1088-1092). h3's `Literal::decode`
+/// (`third_party/h3/h3/src/qpack/block.rs`) is the Rust reference.
+///
+/// The other representations (RFC 9204 Sections 4.5.2-4.5.5) are handled by
+/// sibling decoders: the first byte is only peeked, so on `Ok(None)` the
+/// input is left untouched. Truncated and overflowing prefix strings
+/// propagate the typed errors from `prefix_string`, and a failing Huffman
+/// decode surfaces `QpackError::HuffmanDecoding`.
+pub(crate) fn decode_literal_name<B: Buf>(buf: &mut B) -> Result<Option<HeaderField>, QpackError> {
+    let first = match buf.chunk().first() {
+        Some(&first) => first,
+        // No first byte at all: the field line is truncated, not merely of
+        // another representation.
+        None => return Err(QpackError::UnexpectedEnd),
+    };
+    // The three high bits `001` select this representation.
+    if first & 0b1110_0000 != 0b0010_0000 {
+        return Ok(None);
+    }
+    // The N bit (bit 4 of the first byte) marks the field never-indexed; it
+    // affects the encoder's indexing policy, not the decoded field, so it is
+    // parsed and dropped here.
+    let name = prefix_string::decode(4, buf)?;
+    let value = prefix_string::decode(8, buf)?;
+    Ok(Some(HeaderField {
+        name: Cow::Owned(name),
         value: Cow::Owned(value),
     }))
 }
@@ -433,5 +477,121 @@ mod tests {
             assert_eq!(decode_literal_name_ref(&mut read), Ok(None));
             assert!(read.has_remaining());
         }
+    }
+
+    fn decode_literal_literal(bytes: &[u8]) -> Result<Option<HeaderField>, QpackError> {
+        let mut read: &[u8] = bytes;
+        decode_literal_name(&mut read)
+    }
+
+    /// A plain (non-Huffman) name and value: 0x23 is `001 N=0 H=0 len=3`,
+    /// the value starts with its own 8-bit-prefix length 0x03.
+    #[test]
+    fn decode_literal_name_plain_wire() {
+        let mut read: &[u8] = &[0x23, b'f', b'o', b'o', 0x03, b'b', b'a', b'r'];
+        let field = decode_literal_name(&mut read)
+            .expect("decoded")
+            .expect("recognized");
+        assert_eq!(&field.name[..], b"foo");
+        assert_eq!(&field.value[..], b"bar");
+        assert!(!read.has_remaining());
+    }
+
+    /// The encoder side always Huffman-codes, so a round trip through
+    /// `prefix_string::encode` covers the Huffman path for both strings:
+    /// `encode(4, 0b0010, ...)` writes the `001 N=0 H=1` first byte exactly
+    /// as h3's `Literal::encode` and VPP's `0x20` do.
+    #[test]
+    fn decode_literal_name_huffman_round_trip() {
+        let mut wire = Vec::new();
+        prefix_string::encode(4, 0b0010, b"foo", &mut wire).unwrap();
+        prefix_string::encode(8, 0, b"bar", &mut wire).unwrap();
+        let field = decode_literal_literal(&wire)
+            .expect("decoded")
+            .expect("recognized");
+        assert_eq!(&field.name[..], b"foo");
+        assert_eq!(&field.value[..], b"bar");
+    }
+
+    /// The N bit (0x30 vs 0x20 in VPP's encoder) marks the field
+    /// never-indexed; it affects indexing policy, not the decoded field, so
+    /// both forms decode alike.
+    #[test]
+    fn decode_literal_name_never_index_bit_ignored() {
+        let never = decode_literal_literal(&[0x33, b'f', b'o', b'o', 0x03, b'b', b'a', b'r']);
+        let plain = decode_literal_literal(&[0x23, b'f', b'o', b'o', 0x03, b'b', b'a', b'r']);
+        assert_eq!(never, plain);
+    }
+
+    /// Zero-length name and value strings still consume their length bytes.
+    #[test]
+    fn decode_literal_name_empty_strings() {
+        let mut read: &[u8] = &[0x20, 0x00];
+        let field = decode_literal_name(&mut read)
+            .expect("decoded")
+            .expect("recognized");
+        assert!(field.name.is_empty());
+        assert!(field.value.is_empty());
+        assert!(!read.has_remaining());
+    }
+
+    /// The other representations are sibling decoders' seams; the first
+    /// byte is left in the input for them.
+    #[test]
+    fn decode_literal_name_ignores_other_representations() {
+        let wires: [&[u8]; 5] = [&[0x00], &[0x10], &[0x40], &[0x80], &[0xC1]];
+        for wire in wires {
+            let mut read: &[u8] = wire;
+            assert_eq!(decode_literal_name(&mut read), Ok(None));
+            assert!(read.has_remaining());
+        }
+    }
+
+    #[test]
+    fn decode_literal_name_truncated_rejected() {
+        assert_eq!(decode_literal_literal(&[]), Err(QpackError::UnexpectedEnd));
+        // Name length 7 (continuation byte) with no name payload.
+        assert_eq!(
+            decode_literal_literal(&[0x27, 0x00]),
+            Err(QpackError::UnexpectedEnd)
+        );
+        // Name shorter than its length prefix claims.
+        assert_eq!(
+            decode_literal_literal(&[0x23, b'f', b'o']),
+            Err(QpackError::UnexpectedEnd)
+        );
+        // Value length prefix missing after a complete name.
+        assert_eq!(
+            decode_literal_literal(&[0x20]),
+            Err(QpackError::UnexpectedEnd)
+        );
+        // Value shorter than its length prefix claims.
+        assert_eq!(
+            decode_literal_literal(&[0x20, 0x03, b'a']),
+            Err(QpackError::UnexpectedEnd)
+        );
+    }
+
+    /// A name-length prefix integer that runs past the 63-bit mantissa.
+    #[test]
+    fn decode_literal_name_overflow_rejected() {
+        let bytes = [0x27, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80];
+        assert_eq!(decode_literal_literal(&bytes), Err(QpackError::Overflow));
+    }
+
+    /// A mid-code Huffman name or value propagates the typed decode error:
+    /// 0x29 is `001 N=0 H=1 len=1` with the all-ones payload 0xFF; the value
+    /// case reuses the `decode_literal_name_ref_bad_huffman_value` wire
+    /// (0x81 length, 0xFF payload) after an empty name.
+    #[test]
+    fn decode_literal_name_bad_huffman() {
+        assert!(matches!(
+            decode_literal_literal(&[0x29, 0xFF]),
+            Err(QpackError::HuffmanDecoding(_))
+        ));
+        assert!(matches!(
+            decode_literal_literal(&[0x20, 0x81, 0xFF]),
+            Err(QpackError::HuffmanDecoding(_))
+        ));
     }
 }
