@@ -360,8 +360,8 @@ pub(crate) enum RequestPublishError {
     /// QPACK decompression of the encoded field section failed.
     QpackDecompressionFailed,
     /// The field section violates RFC 9114 request semantics: structural
-    /// validation, the request field-line policy, or a missing required
-    /// pseudo.
+    /// validation, the request field-line policy, a missing required
+    /// pseudo, or a malformed declared Content-Length.
     MessageError,
     /// The `:method` value is not an ordinary method supported by this seam.
     GeneralProtocolError,
@@ -374,6 +374,53 @@ pub(crate) enum RequestPublishError {
 impl From<PublishError> for RequestPublishError {
     fn from(error: PublishError) -> Self {
         Self::Publish(error)
+    }
+}
+
+/// A request's declared Content-Length: a non-empty run of ASCII decimal
+/// digits that fits in a `u64`.
+///
+/// Only the first regular `content-length` field of a section is recognized,
+/// VPP's first-wins rule (`content_len_header_index == ~0` guard,
+/// hpack_inlines.h:594; http3.c:998); later duplicates are ignored without
+/// validation. The value is parsed with VPP's checked digit walk
+/// (`http_parse_content_length`, http_private.h:816): a non-digit or an
+/// overflow fails with [`RequestPublishError::MessageError`], as VPP
+/// terminates with `HTTP3_ERROR_MESSAGE_ERROR` (http3.c:1003). An empty
+/// value is deliberately rejected too, although VPP's loop accepts it as
+/// zero: RFC 9110 Section 8.6 requires Content-Length to be a non-empty
+/// digit run.
+///
+/// No allocation: one pass over the value bytes, O(n) time, O(1) space.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ContentLength(u64);
+
+impl TryFrom<&[u8]> for ContentLength {
+    type Error = RequestPublishError;
+
+    fn try_from(value: &[u8]) -> Result<Self, Self::Error> {
+        if value.is_empty() {
+            return Err(RequestPublishError::MessageError);
+        }
+        let mut len: u64 = 0;
+        for &b in value {
+            if !b.is_ascii_digit() {
+                return Err(RequestPublishError::MessageError);
+            }
+            // Checked accumulate: fail before `len * 10 + digit` can wrap.
+            let digit = u64::from(b - b'0');
+            if len > (u64::MAX - digit) / 10 {
+                return Err(RequestPublishError::MessageError);
+            }
+            len = len * 10 + digit;
+        }
+        Ok(Self(len))
+    }
+}
+
+impl From<ContentLength> for u64 {
+    fn from(len: ContentLength) -> Self {
+        len.0
     }
 }
 
@@ -399,6 +446,18 @@ impl From<PublishError> for RequestPublishError {
 /// scheme values map exactly as [`parse_method`] and [`parse_scheme`] do;
 /// `PublishError` passes through unchanged.
 ///
+/// On success the request's declared Content-Length is returned: the first
+/// regular `content-length` field, recorded in the same single walk (no
+/// second pass, no collection, no copy) and parsed with VPP's first-wins
+/// rule ([`ContentLength`]) only after the method, field-section
+/// structural, scheme, and authority/path checks have all succeeded — the
+/// order VPP uses before its own parse (http3.c:899-1013). `None` when the
+/// section declares none. A non-digit, empty, or overflowing declared value
+/// maps to [`RequestPublishError::MessageError`], as VPP's failure does
+/// (http3.c:1003). The declared length does not yet size the body: the
+/// published [`InboundRequest`] keeps its empty body, and the field still
+/// publishes as a regular [`AppHeader`] entry.
+///
 /// `:path` is split at the first `?` into the request-target path and query
 /// spans, both borrowing the same decoded buffer (no byte copy); a path
 /// without `?` yields an empty query. The leading slash of the path is
@@ -410,7 +469,7 @@ impl From<PublishError> for RequestPublishError {
 pub(crate) fn publish_request_field_section(
     fifo: &Fifo,
     encoded: &[u8],
-) -> Result<(), RequestPublishError> {
+) -> Result<Option<u64>, RequestPublishError> {
     let mut read = encoded;
     let mut fields =
         decode_block(&mut read).map_err(|_| RequestPublishError::QpackDecompressionFailed)?;
@@ -426,6 +485,11 @@ pub(crate) fn publish_request_field_section(
     let mut authority = None;
     let mut path = None;
     let mut headers = Vec::new();
+    // Value of the first regular `content-length` field, if any: recorded
+    // as a shared reference here in the walk, parsed only after the
+    // validation sequence (see the function doc); the decoded block stays
+    // alive through the publish.
+    let mut content_length_value = None;
     for field in &mut fields {
         validator
             .on_field(&field.name, &field.value)
@@ -440,6 +504,14 @@ pub(crate) fn publish_request_field_section(
             _ => {
                 validate_request_field_line(field)
                     .map_err(|_| RequestPublishError::MessageError)?;
+                // The first regular `content-length` field alone declares
+                // the body length (VPP's first-wins rule, hpack_inlines.h:
+                // 594); later duplicates are ignored without validation.
+                // Names are already lowercase tchar — the validator enforces
+                // VPP's lowercase fold — so the byte-exact match suffices.
+                if content_length_value.is_none() && field.name.as_ref() == b"content-length" {
+                    content_length_value = Some(field.value.as_ref());
+                }
                 // The decoded N bit (or an empty set) is published verbatim:
                 // the ABI flags must reflect the wire's never-index policy.
                 let flags = field.flags;
@@ -484,6 +556,16 @@ pub(crate) fn publish_request_field_section(
         None => (&path[..], &[][..]),
     };
 
+    // VPP parses the declared Content-Length only after the method,
+    // structural, scheme, and authority/path checks have all succeeded
+    // (http3.c:998), so the recorded first occurrence is parsed here, from
+    // the shared reference into the untouched regular-field value: no
+    // clone.
+    let content_length = match content_length_value {
+        Some(value) => Some(ContentLength::try_from(value)?.into()),
+        None => None,
+    };
+
     let request = InboundRequest {
         method,
         scheme,
@@ -494,7 +576,7 @@ pub(crate) fn publish_request_field_section(
         body: b"",
     };
     publish_inbound_request(fifo, &request)?;
-    Ok(())
+    Ok(content_length)
 }
 
 /// Map an `:method` value to the VPP request-method enum
@@ -1190,6 +1272,131 @@ mod tests {
         assert_eq!(decoded.target_path, b"/");
         assert_eq!(decoded.target_query, b"");
         assert_eq!(decoded.body, b"");
+    }
+
+    #[test]
+    fn publish_without_content_length_returns_none() {
+        let encoded = section(&[
+            HeaderField::new(":method", "GET"),
+            HeaderField::new(":scheme", "https"),
+            HeaderField::new(":authority", "example.com"),
+            HeaderField::new(":path", "/"),
+        ]);
+        let fifo = local_fifo(8192);
+        assert_eq!(
+            publish_request_field_section(&fifo, &encoded).expect("valid GET publishes"),
+            None
+        );
+    }
+
+    #[test]
+    fn publish_content_length_zero_and_max() {
+        // "0" is a valid declared length, and u64::MAX is the exact
+        // overflow boundary of the checked digit walk
+        // (http_private.h:816).
+        for (value, expected) in [
+            ("0", Some(0)),
+            ("18446744073709551615", Some(u64::MAX)),
+        ] {
+            let encoded = section(&[
+                HeaderField::new(":method", "GET"),
+                HeaderField::new(":scheme", "https"),
+                HeaderField::new(":authority", "example.com"),
+                HeaderField::new(":path", "/"),
+                HeaderField::new("content-length", value),
+            ]);
+            let fifo = local_fifo(8192);
+            assert_eq!(
+                publish_request_field_section(&fifo, &encoded).expect("valid GET publishes"),
+                expected
+            );
+        }
+    }
+
+    #[test]
+    fn publish_malformed_content_length_maps_message_error() {
+        // A non-digit, a leading space, an empty value, and an overflowing
+        // value all fail like VPP's http_parse_content_length (http3.c:
+        // 1003), before anything is published. The empty value is a
+        // deliberate RFC 9110 strictness difference: VPP's loop accepts it
+        // as zero.
+        for value in ["12a", " 10", "", "18446744073709551616"] {
+            let encoded = section(&[
+                HeaderField::new(":method", "GET"),
+                HeaderField::new(":scheme", "https"),
+                HeaderField::new(":authority", "example.com"),
+                HeaderField::new(":path", "/"),
+                HeaderField::new("content-length", value),
+            ]);
+            let fifo = local_fifo(8192);
+            assert_eq!(
+                publish_request_field_section(&fifo, &encoded),
+                Err(RequestPublishError::MessageError)
+            );
+            assert_eq!(fifo.max_dequeue(), 0);
+        }
+    }
+
+    #[test]
+    fn publish_method_error_precedes_content_length_parse() {
+        // VPP checks the `:method` value before parsing Content-Length
+        // (http3.c:899-1013): an unsupported method wins even with a
+        // malformed declared length in the same section.
+        let encoded = section(&[
+            HeaderField::new(":method", "GEPT"),
+            HeaderField::new(":scheme", "https"),
+            HeaderField::new(":authority", "example.com"),
+            HeaderField::new(":path", "/"),
+            HeaderField::new("content-length", "not-a-length"),
+        ]);
+        let fifo = local_fifo(8192);
+        assert_eq!(
+            publish_request_field_section(&fifo, &encoded),
+            Err(RequestPublishError::GeneralProtocolError)
+        );
+        assert_eq!(fifo.max_dequeue(), 0);
+    }
+
+    #[test]
+    fn publish_scheme_error_precedes_content_length_parse() {
+        // VPP maps an unknown `:scheme` before parsing Content-Length
+        // (http3.c:899-1013): the already-established scheme error wins
+        // over a malformed declared length.
+        let encoded = section(&[
+            HeaderField::new(":method", "GET"),
+            HeaderField::new(":scheme", "ftp"),
+            HeaderField::new(":authority", "example.com"),
+            HeaderField::new(":path", "/"),
+            HeaderField::new("content-length", "not-a-length"),
+        ]);
+        let fifo = local_fifo(8192);
+        assert_eq!(
+            publish_request_field_section(&fifo, &encoded),
+            Err(RequestPublishError::InternalError)
+        );
+        assert_eq!(fifo.max_dequeue(), 0);
+    }
+
+    #[test]
+    fn publish_duplicate_content_length_first_wins() {
+        // VPP records the first `content-length` index only
+        // (hpack_inlines.h:594); later duplicates are ignored without
+        // validation, so a malformed second value neither fails the section
+        // nor overrides the first.
+        let encoded = section(&[
+            HeaderField::new(":method", "GET"),
+            HeaderField::new(":scheme", "https"),
+            HeaderField::new(":authority", "example.com"),
+            HeaderField::new(":path", "/"),
+            HeaderField::new("content-length", "10"),
+            HeaderField::new("content-length", "not-a-length"),
+        ]);
+        let fifo = local_fifo(8192);
+        assert_eq!(
+            publish_request_field_section(&fifo, &encoded).expect("valid GET publishes"),
+            Some(10)
+        );
+        assert!(fifo.max_dequeue() > 0);
     }
 
     #[test]
