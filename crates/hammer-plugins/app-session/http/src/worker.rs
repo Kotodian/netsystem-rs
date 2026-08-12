@@ -43,6 +43,7 @@ use hammer_runtime::session::SessionStreamDirection;
 use hammer_service::session::{SessionId, SessionWorker};
 
 use crate::http3::proto::coding::Decode;
+use crate::http3::proto::error::ErrorCode;
 use crate::http3::proto::stream::{StreamCategory, StreamType};
 use crate::http3::proto::varint::UnexpectedEnd;
 
@@ -148,6 +149,16 @@ pub(crate) struct ConnectionContext {
     /// action succeeds; `None` until then. Mirrors VPP recording the opened
     /// control stream in `http_ctx_t::our_ctrl_stream_index` (http3.c:234).
     pub(crate) local_control: Option<SessionId>,
+    /// Peer control stream context, registered exactly once when the decoded
+    /// peer uni stream type is Control; `None` until then. Mirrors VPP
+    /// `http_ctx_t::peer_ctrl_stream_index` (http3.c:1683-1691).
+    pub(crate) peer_control: Option<StreamContextId>,
+    /// Peer QPACK encoder stream context, registered exactly once; mirrors
+    /// VPP `http_ctx_t::peer_encoder_stream_index` (http3.c:1703-1710).
+    pub(crate) peer_encoder: Option<StreamContextId>,
+    /// Peer QPACK decoder stream context, registered exactly once; mirrors
+    /// VPP `http_ctx_t::peer_decoder_stream_index` (http3.c:1693-1700).
+    pub(crate) peer_decoder: Option<StreamContextId>,
     /// True until the peer's SETTINGS arrive on its control stream; set at
     /// allocation and consumed by the peer-SETTINGS slice.
     pub(crate) peer_settings_pending: bool,
@@ -173,13 +184,19 @@ pub(crate) struct StreamContext {
     /// Incremental decode state for a peer unidirectional stream's type
     /// varint; stays `Unclassified` for bidi request streams.
     pub(crate) peer_uni_type: PeerUniStreamTypeDecode,
+    /// Registered peer uni role, recorded by
+    /// [`HttpWorker::register_peer_uni_stream`] only after the parent slot
+    /// registration succeeds; `Unclassified` until then. Bidi request
+    /// streams never register.
+    pub(crate) peer_role: PeerUniStreamRole,
 }
 
 /// Classification role of a peer unidirectional stream once its type varint
 /// is decoded, mirroring the switch in VPP
 /// `http3_stream_transport_rx_unknown_type` (http3.c:1680-1726).
-/// `Unclassified` while the varint is incomplete; registering the role with
-/// the parent connection is a later slice.
+/// `Unclassified` while the varint is incomplete;
+/// [`HttpWorker::register_peer_uni_stream`] registers the role with the
+/// parent connection once, after the varint completes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub(crate) enum PeerUniStreamRole {
     /// The stream-type varint has not fully arrived.
@@ -316,6 +333,27 @@ pub(crate) enum HttpWorkerError {
     },
     #[error("http connection context {context:?} already opened its control stream")]
     ControlStreamAlreadyOpen { context: ContextId },
+    #[error(
+        "peer {role:?} stream {stream:?} already registered on connection context {context:?}: HTTP/3 {code}"
+    )]
+    PeerStreamRoleDuplicate {
+        stream: StreamContextId,
+        context: ContextId,
+        role: PeerUniStreamRole,
+        code: ErrorCode,
+    },
+    #[error(
+        "peer push stream {stream:?} cannot apply the server/client push policy on connection context {context:?}: connection role metadata is unavailable"
+    )]
+    PeerPushPolicyUnavailable {
+        stream: StreamContextId,
+        context: ContextId,
+    },
+    #[error("peer uni stream {stream:?} on connection context {context:?} has no decoded type to register")]
+    PeerStreamRoleUnclassified {
+        stream: StreamContextId,
+        context: ContextId,
+    },
     #[error("http stream context pool is full (capacity {capacity})")]
     StreamCapacityExhausted { capacity: usize },
     #[error("http stream context {stream:?} is not live")]
@@ -390,6 +428,9 @@ impl HttpWorker {
             .insert(ConnectionContext {
                 session,
                 local_control: None,
+                peer_control: None,
+                peer_encoder: None,
+                peer_decoder: None,
                 peer_settings_pending: true,
             })
             .map(ContextId::from)
@@ -509,6 +550,7 @@ impl HttpWorker {
                 parent,
                 direction,
                 peer_uni_type: PeerUniStreamTypeDecode::default(),
+                peer_role: PeerUniStreamRole::Unclassified,
             })
             .map(StreamContextId::from)
             .ok_or(HttpWorkerError::StreamCapacityExhausted {
@@ -547,6 +589,100 @@ impl HttpWorker {
             });
         }
         Ok(stream_context)
+    }
+
+    /// Registers a decoded peer uni stream role with its parent connection,
+    /// exactly once per critical owner slot.
+    ///
+    /// Mirrors the classification switch of VPP
+    /// `http3_stream_transport_rx_unknown_type` (http3.c:1680-1726): Control,
+    /// QPACK encoder, and QPACK decoder each own one direct
+    /// `Option<StreamContextId>` slot on `ConnectionContext`
+    /// (`peer_ctrl_stream_index`, `peer_encoder_stream_index`,
+    /// `peer_decoder_stream_index`); a second stream claiming an occupied
+    /// slot terminates the connection with `HTTP3_ERROR_STREAM_CREATION_ERROR`
+    /// (http3.c:1683-1688, 1693-1698, 1703-1708), surfaced here as a typed
+    /// error carrying `ErrorCode::StreamCreationError`. `Unknown` stream
+    /// types are drained but never registered (http3.c:1723-1725). Push
+    /// registration applies VPP's server/client policy (http3.c:1712-1722),
+    /// which requires connection role metadata that does not exist yet, so it
+    /// is handed off as `PeerPushPolicyUnavailable` and records nothing.
+    ///
+    /// O(1): resolves the generation-checked stream and parent connection
+    /// once each, and records the stream's `peer_role` only after the parent
+    /// slot registration succeeds, so a failed duplicate or push leaves both
+    /// the current stream role and the parent slots unchanged.
+    pub(crate) fn register_peer_uni_stream(
+        &mut self,
+        stream: StreamContextId,
+        role: PeerUniStreamRole,
+    ) -> Result<(), HttpWorkerError> {
+        let parent = self
+            .streams
+            .get(stream.into())
+            .ok_or(HttpWorkerError::StreamMissing { stream })?
+            .parent;
+        let connection = self
+            .contexts
+            .get_mut(parent.into())
+            .ok_or(HttpWorkerError::ParentContextMissing { parent })?;
+        match role {
+            PeerUniStreamRole::Control => {
+                if connection.peer_control.is_some() {
+                    return Err(HttpWorkerError::PeerStreamRoleDuplicate {
+                        stream,
+                        context: parent,
+                        role,
+                        code: ErrorCode::StreamCreationError,
+                    });
+                }
+                connection.peer_control = Some(stream);
+            }
+            PeerUniStreamRole::QpackEncoder => {
+                if connection.peer_encoder.is_some() {
+                    return Err(HttpWorkerError::PeerStreamRoleDuplicate {
+                        stream,
+                        context: parent,
+                        role,
+                        code: ErrorCode::StreamCreationError,
+                    });
+                }
+                connection.peer_encoder = Some(stream);
+            }
+            PeerUniStreamRole::QpackDecoder => {
+                if connection.peer_decoder.is_some() {
+                    return Err(HttpWorkerError::PeerStreamRoleDuplicate {
+                        stream,
+                        context: parent,
+                        role,
+                        code: ErrorCode::StreamCreationError,
+                    });
+                }
+                connection.peer_decoder = Some(stream);
+            }
+            PeerUniStreamRole::Unknown => {
+                // Drain-only stream type: VPP's default arm never registers a
+                // slot (http3.c:1723-1725).
+            }
+            PeerUniStreamRole::Push => {
+                return Err(HttpWorkerError::PeerPushPolicyUnavailable {
+                    stream,
+                    context: parent,
+                });
+            }
+            PeerUniStreamRole::Unclassified => {
+                return Err(HttpWorkerError::PeerStreamRoleUnclassified {
+                    stream,
+                    context: parent,
+                });
+            }
+        }
+        let recorded = self
+            .streams
+            .get_mut(stream.into())
+            .ok_or(HttpWorkerError::StreamMissing { stream })?;
+        recorded.peer_role = role;
+        Ok(())
     }
 
     /// Releases a stream context slot back to the pool.
@@ -803,6 +939,9 @@ mod tests {
         let context = worker.allocate(lower).expect("allocate context");
         let connection = worker.get(context).expect("live context");
         assert_eq!(connection.local_control, None);
+        assert_eq!(connection.peer_control, None);
+        assert_eq!(connection.peer_encoder, None);
+        assert_eq!(connection.peer_decoder, None);
         assert!(connection.peer_settings_pending);
     }
 
@@ -1031,6 +1170,221 @@ mod tests {
         assert!(matches!(
             worker.remove_stream(stream),
             Err(HttpWorkerError::StreamMissing { stream: s }) if s == stream
+        ));
+    }
+
+    /// A live parent connection context and one live peer uni stream child of
+    /// it.
+    fn peer_uni_pair(worker: &mut HttpWorker) -> (ContextId, StreamContextId) {
+        let parent = worker.allocate(session(1, 1)).expect("allocate parent");
+        let stream = peer_stream(worker, parent);
+        (parent, stream)
+    }
+
+    /// A live peer uni stream child of `parent`, distinct from any earlier
+    /// child of the same parent.
+    fn peer_stream(worker: &mut HttpWorker, parent: ContextId) -> StreamContextId {
+        worker
+            .allocate_stream(session(2, 1), parent, SessionStreamDirection::Uni)
+            .expect("allocate peer uni stream")
+    }
+
+    #[test]
+    fn first_control_registration_records_slot_and_stream_role() {
+        let mut worker = HttpWorker::with_capacity(4);
+        let (parent, control) = peer_uni_pair(&mut worker);
+        worker
+            .register_peer_uni_stream(control, PeerUniStreamRole::Control)
+            .expect("first control registration succeeds");
+        let connection = worker.get(parent).expect("live connection");
+        assert_eq!(connection.peer_control, Some(control));
+        assert_eq!(connection.peer_encoder, None);
+        assert_eq!(connection.peer_decoder, None);
+        assert_eq!(
+            worker.get_stream(control).expect("live stream").peer_role,
+            PeerUniStreamRole::Control,
+            "stream role recorded only after slot registration"
+        );
+    }
+
+    #[test]
+    fn duplicate_control_registration_is_stream_creation_error_and_changes_nothing() {
+        let mut worker = HttpWorker::with_capacity(4);
+        let parent = worker.allocate(session(1, 1)).expect("allocate parent");
+        let first = peer_stream(&mut worker, parent);
+        let second = peer_stream(&mut worker, parent);
+        worker
+            .register_peer_uni_stream(first, PeerUniStreamRole::Control)
+            .expect("first registration");
+        let duplicate = worker.register_peer_uni_stream(second, PeerUniStreamRole::Control);
+        assert!(matches!(
+            duplicate,
+            Err(HttpWorkerError::PeerStreamRoleDuplicate {
+                stream,
+                context,
+                role: PeerUniStreamRole::Control,
+                code: ErrorCode::StreamCreationError,
+            }) if stream == second && context == parent
+        ));
+        let connection = worker.get(parent).expect("live connection");
+        assert_eq!(connection.peer_control, Some(first), "slot keeps the first owner");
+        assert_eq!(
+            worker.get_stream(second).expect("live stream").peer_role,
+            PeerUniStreamRole::Unclassified,
+            "failed duplicate records no stream role"
+        );
+    }
+
+    #[test]
+    fn first_encoder_and_decoder_registrations_fill_distinct_slots() {
+        let mut worker = HttpWorker::with_capacity(4);
+        let parent = worker.allocate(session(1, 1)).expect("allocate parent");
+        let encoder = peer_stream(&mut worker, parent);
+        let decoder = peer_stream(&mut worker, parent);
+        worker
+            .register_peer_uni_stream(encoder, PeerUniStreamRole::QpackEncoder)
+            .expect("first encoder registration");
+        worker
+            .register_peer_uni_stream(decoder, PeerUniStreamRole::QpackDecoder)
+            .expect("first decoder registration");
+        let connection = worker.get(parent).expect("live connection");
+        assert_eq!(connection.peer_control, None);
+        assert_eq!(connection.peer_encoder, Some(encoder));
+        assert_eq!(connection.peer_decoder, Some(decoder));
+        assert_eq!(
+            worker.get_stream(encoder).expect("live stream").peer_role,
+            PeerUniStreamRole::QpackEncoder
+        );
+        assert_eq!(
+            worker.get_stream(decoder).expect("live stream").peer_role,
+            PeerUniStreamRole::QpackDecoder
+        );
+    }
+
+    #[test]
+    fn duplicate_encoder_registration_is_stream_creation_error_and_changes_nothing() {
+        let mut worker = HttpWorker::with_capacity(4);
+        let parent = worker.allocate(session(1, 1)).expect("allocate parent");
+        let first = peer_stream(&mut worker, parent);
+        let second = peer_stream(&mut worker, parent);
+        worker
+            .register_peer_uni_stream(first, PeerUniStreamRole::QpackEncoder)
+            .expect("first registration");
+        let duplicate = worker.register_peer_uni_stream(second, PeerUniStreamRole::QpackEncoder);
+        assert!(matches!(
+            duplicate,
+            Err(HttpWorkerError::PeerStreamRoleDuplicate {
+                stream,
+                context,
+                role: PeerUniStreamRole::QpackEncoder,
+                code: ErrorCode::StreamCreationError,
+            }) if stream == second && context == parent
+        ));
+        let connection = worker.get(parent).expect("live connection");
+        assert_eq!(connection.peer_encoder, Some(first), "slot keeps the first owner");
+        assert_eq!(
+            worker.get_stream(second).expect("live stream").peer_role,
+            PeerUniStreamRole::Unclassified,
+            "failed duplicate records no stream role"
+        );
+    }
+
+    #[test]
+    fn duplicate_decoder_registration_is_stream_creation_error_and_changes_nothing() {
+        let mut worker = HttpWorker::with_capacity(4);
+        let parent = worker.allocate(session(1, 1)).expect("allocate parent");
+        let first = peer_stream(&mut worker, parent);
+        let second = peer_stream(&mut worker, parent);
+        worker
+            .register_peer_uni_stream(first, PeerUniStreamRole::QpackDecoder)
+            .expect("first registration");
+        let duplicate = worker.register_peer_uni_stream(second, PeerUniStreamRole::QpackDecoder);
+        assert!(matches!(
+            duplicate,
+            Err(HttpWorkerError::PeerStreamRoleDuplicate {
+                stream,
+                context,
+                role: PeerUniStreamRole::QpackDecoder,
+                code: ErrorCode::StreamCreationError,
+            }) if stream == second && context == parent
+        ));
+        let connection = worker.get(parent).expect("live connection");
+        assert_eq!(connection.peer_decoder, Some(first), "slot keeps the first owner");
+        assert_eq!(
+            worker.get_stream(second).expect("live stream").peer_role,
+            PeerUniStreamRole::Unclassified,
+            "failed duplicate records no stream role"
+        );
+    }
+
+    #[test]
+    fn unknown_registration_records_drain_role_without_any_slot() {
+        let mut worker = HttpWorker::with_capacity(4);
+        let (parent, stream) = peer_uni_pair(&mut worker);
+        worker
+            .register_peer_uni_stream(stream, PeerUniStreamRole::Unknown)
+            .expect("unknown registration succeeds");
+        let connection = worker.get(parent).expect("live connection");
+        assert_eq!(connection.peer_control, None);
+        assert_eq!(connection.peer_encoder, None);
+        assert_eq!(connection.peer_decoder, None);
+        assert_eq!(
+            worker.get_stream(stream).expect("live stream").peer_role,
+            PeerUniStreamRole::Unknown,
+            "unknown stream is drained under its recorded role"
+        );
+    }
+
+    #[test]
+    fn push_registration_hands_off_without_state_change() {
+        let mut worker = HttpWorker::with_capacity(4);
+        let (parent, stream) = peer_uni_pair(&mut worker);
+        let push = worker.register_peer_uni_stream(stream, PeerUniStreamRole::Push);
+        assert!(matches!(
+            push,
+            Err(HttpWorkerError::PeerPushPolicyUnavailable { stream: s, context: c })
+                if s == stream && c == parent
+        ));
+        let connection = worker.get(parent).expect("live connection");
+        assert_eq!(connection.peer_control, None);
+        assert_eq!(connection.peer_encoder, None);
+        assert_eq!(connection.peer_decoder, None);
+        assert_eq!(
+            worker.get_stream(stream).expect("live stream").peer_role,
+            PeerUniStreamRole::Unclassified,
+            "handed-off push records no stream role"
+        );
+    }
+
+    #[test]
+    fn unclassified_registration_is_typed_error_and_changes_nothing() {
+        let mut worker = HttpWorker::with_capacity(4);
+        let (parent, stream) = peer_uni_pair(&mut worker);
+        let unclassified = worker.register_peer_uni_stream(stream, PeerUniStreamRole::Unclassified);
+        assert!(matches!(
+            unclassified,
+            Err(HttpWorkerError::PeerStreamRoleUnclassified { stream: s, context: c })
+                if s == stream && c == parent
+        ));
+        assert_eq!(
+            worker.get_stream(stream).expect("live stream").peer_role,
+            PeerUniStreamRole::Unclassified
+        );
+    }
+
+    #[test]
+    fn registration_rejects_stale_stream_and_missing_parent() {
+        let mut worker = HttpWorker::with_capacity(4);
+        let stale = StreamContextId::from(u64::MAX);
+        assert!(matches!(
+            worker.register_peer_uni_stream(stale, PeerUniStreamRole::Control),
+            Err(HttpWorkerError::StreamMissing { stream: s }) if s == stale
+        ));
+        let (parent, stream) = peer_uni_pair(&mut worker);
+        worker.remove(parent).expect("remove parent");
+        assert!(matches!(
+            worker.register_peer_uni_stream(stream, PeerUniStreamRole::Control),
+            Err(HttpWorkerError::ParentContextMissing { parent: p }) if p == parent
         ));
     }
 
