@@ -136,8 +136,10 @@ impl<'a> Iterator for HeaderIter<'a> {
         if self.pos >= self.region.len() {
             return None;
         }
-        let flags = u16_le(self.region, self.pos)?;
-        if flags & FieldLineFlags::CUSTOM_NAME != 0 {
+        // The raw u16 is admitted with `from_bits_retain` so unknown/future
+        // VPP bits round-trip instead of being rejected or truncated.
+        let flags = FieldLineFlags::from_bits_retain(u16_le(self.region, self.pos)?);
+        if flags.contains(FieldLineFlags::CUSTOM_NAME) {
             let name_len = u16_le(self.region, self.pos + 2)? as usize;
             let name = self.region.get(self.pos + 4..self.pos + 4 + name_len)?;
             let value_len = u32_le(self.region, self.pos + 4 + name_len)? as usize;
@@ -146,7 +148,7 @@ impl<'a> Iterator for HeaderIter<'a> {
                 .get(self.pos + 8 + name_len..self.pos + 8 + name_len + value_len)?;
             self.pos += 8 + name_len + value_len;
             Some(DecodedHeader {
-                flags: FieldLineFlags(flags),
+                flags,
                 name: DecodedHeaderName::Custom(name),
                 value,
             })
@@ -157,7 +159,7 @@ impl<'a> Iterator for HeaderIter<'a> {
             let value = self.region.get(value_start..value_start + value_len)?;
             self.pos = value_start + value_len;
             Some(DecodedHeader {
-                flags: FieldLineFlags(flags),
+                flags,
                 name: DecodedHeaderName::Known(name),
                 value,
             })
@@ -480,7 +482,7 @@ fn scatter_headers(
                 scatter(reservation, [&prefix[..], value])?
             }
             AppHeader::Custom { flags, name, value } => {
-                let mut w = put_u16(&mut prefix, 0, flags.bits() | FieldLineFlags::CUSTOM_NAME);
+                let mut w = put_u16(&mut prefix, 0, (flags | FieldLineFlags::CUSTOM_NAME).bits());
                 w = put_u16(&mut prefix, w, name.len() as u16);
                 put_u32(&mut prefix, w, value.len() as u32);
                 scatter(reservation, [&prefix[..4], name, &prefix[4..], value])?
@@ -720,13 +722,13 @@ fn header_entries_len(headers: &[AppHeader<'_>]) -> Result<u64, EncodeError> {
                 name: _,
                 value,
             } => {
-                if flags.bits() & FieldLineFlags::CUSTOM_NAME != 0 {
+                if flags.contains(FieldLineFlags::CUSTOM_NAME) {
                     return Err(EncodeError::ReservedFlag);
                 }
                 8u64.checked_add(value.len() as u64).ok_or(EncodeError::LengthOverflow)?
             }
             AppHeader::Custom { flags, name, value } => {
-                if flags.bits() & FieldLineFlags::CUSTOM_NAME != 0 {
+                if flags.contains(FieldLineFlags::CUSTOM_NAME) {
                     return Err(EncodeError::ReservedFlag);
                 }
                 if name.len() > u16::MAX as usize {
@@ -756,7 +758,7 @@ fn encode_header(header: AppHeader<'_>, buf: &mut [u8], w: usize) -> usize {
             put_bytes(buf, w, value)
         }
         AppHeader::Custom { flags, name, value } => {
-            let mut w = put_u16(buf, w, flags.bits() | FieldLineFlags::CUSTOM_NAME);
+            let mut w = put_u16(buf, w, (flags | FieldLineFlags::CUSTOM_NAME).bits());
             w = put_u16(buf, w, name.len() as u16);
             w = put_bytes(buf, w, name);
             w = put_u32(buf, w, value.len() as u32);
@@ -920,7 +922,8 @@ fn validate_header_region(region: &[u8]) -> Result<(), DecodeError> {
             return Err(DecodeError::HeaderListOverrun);
         }
         let flags = u16_le(region, pos).ok_or(DecodeError::HeaderListOverrun)?;
-        let entry_len = if flags & FieldLineFlags::CUSTOM_NAME != 0 {
+        let flags = FieldLineFlags::from_bits_retain(flags);
+        let entry_len = if flags.contains(FieldLineFlags::CUSTOM_NAME) {
             let name_len = u16_le(region, pos + 2).ok_or(DecodeError::HeaderListOverrun)? as usize;
             let value_len =
                 u32_le(region, pos + 4 + name_len).ok_or(DecodeError::HeaderListOverrun)? as usize;

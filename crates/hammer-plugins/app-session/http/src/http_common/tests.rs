@@ -113,6 +113,24 @@ fn layout_matches_vpp() {
     assert_eq!(size_of::<UrlScheme>(), 1);
     assert_eq!(size_of::<UpgradeProto>(), 1);
     assert_eq!(size_of::<FieldLineFlags>(), 2);
+}
+
+/// The ABI constants are the `http_field_line_flags_` bit positions
+/// (http.h:252-258) as typed flag values, with the idiomatic operations.
+#[test]
+fn field_line_flags_known_bit_operations() {
+    assert_eq!(FieldLineFlags::INTERNAL.bits(), 1 << 0);
+    assert_eq!(FieldLineFlags::NEVER_INDEX.bits(), 1 << 1);
+    assert_eq!(FieldLineFlags::CUSTOM_NAME.bits(), 1 << 2);
+    assert_eq!(FieldLineFlags::HOP_BY_HOP.bits(), 1 << 3);
+    let combined = FieldLineFlags::CUSTOM_NAME | FieldLineFlags::NEVER_INDEX;
+    assert_eq!(combined.bits(), (1 << 2) | (1 << 1));
+    assert!(combined.contains(FieldLineFlags::NEVER_INDEX));
+    assert!(!combined.contains(FieldLineFlags::INTERNAL));
+    assert_eq!(
+        combined.intersection(FieldLineFlags::HOP_BY_HOP | FieldLineFlags::NEVER_INDEX),
+        FieldLineFlags::NEVER_INDEX
+    );
     // One header entry prefix: flags(2) + name/name_len(2) + value_len(4) = 8.
     let req = golden_request_value();
     assert_eq!(req.encoded_len().unwrap(), 134);
@@ -148,7 +166,7 @@ fn decode_matches_golden_bytes() {
     assert_eq!(headers[0].value, b"text/html");
     assert_eq!(
         headers[1].flags,
-        FieldLineFlags(FieldLineFlags::CUSTOM_NAME)
+        FieldLineFlags::CUSTOM_NAME
     );
     assert_eq!(headers[1].name, DecodedHeaderName::Custom(b"X-Test"));
     assert_eq!(headers[1].value, b"1");
@@ -172,6 +190,28 @@ fn encode_then_decode_round_trip() {
         DecodedHeaderName::Custom(b"X-Test")
     );
     assert_eq!(decoded_headers[1].value, b"1");
+}
+
+/// Unknown/future VPP flag bits survive the FIFO codec: `decode` admits the
+/// raw u16 via `from_bits_retain` (no reject, no truncate) and `encode`
+/// writes the bits back unchanged.
+#[test]
+fn unknown_flag_bits_round_trip_through_codec() {
+    let req = Request {
+        method: ReqMethod::Get,
+        scheme: UrlScheme::Http,
+        target_path: b"/",
+        headers: &[AppHeader::Known {
+            flags: FieldLineFlags::from_bits_retain(0x8000),
+            name: header_name::ACCEPT,
+            value: b"v",
+        }],
+        body: b"",
+    };
+    let mut buf = vec![0u8; req.encoded_len().unwrap()];
+    let n = req.encode(&mut buf).unwrap();
+    let decoded = decode(&buf[..n]).unwrap();
+    assert_eq!(decoded.headers().next().unwrap().flags.bits(), 0x8000);
 }
 
 #[test]
@@ -371,7 +411,7 @@ fn encode_rejects_bad_input() {
         scheme: UrlScheme::Http,
         target_path: b"/",
         headers: &[AppHeader::Known {
-            flags: FieldLineFlags(FieldLineFlags::CUSTOM_NAME),
+            flags: FieldLineFlags::CUSTOM_NAME,
             name: header_name::ACCEPT,
             value: b"v",
         }],
@@ -388,7 +428,7 @@ fn encode_custom_never_index_flags() {
         scheme: UrlScheme::Http,
         target_path: b"/",
         headers: &[AppHeader::Custom {
-            flags: FieldLineFlags(FieldLineFlags::NEVER_INDEX),
+            flags: FieldLineFlags::NEVER_INDEX,
             name: b"X-A",
             value: b"b",
         }],
@@ -486,7 +526,7 @@ fn publish_request_encode_error_leaves_fifo_usable() {
         scheme: UrlScheme::Http,
         target_path: b"/",
         headers: &[AppHeader::Known {
-            flags: FieldLineFlags(FieldLineFlags::CUSTOM_NAME),
+            flags: FieldLineFlags::CUSTOM_NAME,
             name: header_name::ACCEPT,
             value: b"v",
         }],
@@ -803,7 +843,7 @@ fn publish_inbound_request_encode_error_leaves_fifo_usable() {
         target_path: b"/",
         target_query: b"",
         headers: &[AppHeader::Known {
-            flags: FieldLineFlags(FieldLineFlags::CUSTOM_NAME),
+            flags: FieldLineFlags::CUSTOM_NAME,
             name: header_name::ACCEPT,
             value: b"v",
         }],

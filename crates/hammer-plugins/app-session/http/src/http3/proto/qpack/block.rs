@@ -35,6 +35,7 @@ use bytes::{Buf, BufMut};
 
 use super::field::HeaderField;
 use super::{QpackError, prefix_int, prefix_string, static_table};
+use crate::http_common::FieldLineFlags;
 
 /// Decode the encoded field section prefix (RFC 9204 Section 4.5.1).
 ///
@@ -103,8 +104,12 @@ pub(crate) fn encode_block<W: BufMut>(
 /// literal-name form writes `0x20` and both strings. Both reverse lookups
 /// are explicit fixed matches in bounded O(1), never a scan of the 99-entry
 /// table; the strings always Huffman-code through `prefix_string::encode`,
-/// as h3's encoder does. The N bit stays clear: never-indexing is encoding
-/// policy for a later slice, exactly as h3's stateless encoder leaves it.
+/// as h3's encoder does. A literal form whose field carries `NEVER_INDEX`
+/// sets the wire N bit (`0x70` / `0x30`), exactly VPP's `qpack_encode_header`
+/// (`*a = never_index ? 0x70 : 0x50`, qpack.c:1057) and
+/// `qpack_encode_custom_header` (`*a = never_index ? 0x30 : 0x20`,
+/// qpack.c:1090); the indexed form has no N bit, so the flag is dropped
+/// there, as in VPP.
 pub(crate) fn encode_field_line<W: BufMut>(
     buf: &mut W,
     field: &HeaderField,
@@ -112,10 +117,25 @@ pub(crate) fn encode_field_line<W: BufMut>(
     if let Some(index) = static_table::find(field) {
         prefix_int::encode(6, 0b11, index as u64, buf)?;
     } else if let Some(index) = static_table::find_name(field.name.as_ref()) {
-        prefix_int::encode(4, 0b0101, index as u64, buf)?;
+        // The N bit rides above the 4-bit index: `0b0111` with `NEVER_INDEX`,
+        // exactly VPP's `*a = never_index ? 0x70 : 0x50` (qpack.c:1057).
+        let flags = if field.flags.contains(FieldLineFlags::NEVER_INDEX) {
+            0b0111
+        } else {
+            0b0101
+        };
+        prefix_int::encode(4, flags, index as u64, buf)?;
         prefix_string::encode(8, 0, field.value.as_ref(), buf)?;
     } else {
-        prefix_string::encode(4, 0b0010, field.name.as_ref(), buf)?;
+        // The N bit rides above the 3-bit name length: `0b0011` with
+        // `NEVER_INDEX`, exactly VPP's `*a = never_index ? 0x30 : 0x20`
+        // (qpack.c:1090).
+        let flags = if field.flags.contains(FieldLineFlags::NEVER_INDEX) {
+            0b0011
+        } else {
+            0b0010
+        };
+        prefix_string::encode(4, flags, field.name.as_ref(), buf)?;
         prefix_string::encode(8, 0, field.value.as_ref(), buf)?;
     }
     Ok(())
@@ -217,9 +237,9 @@ pub(crate) fn decode_field_line<B: Buf>(
 /// T = 1 resolves the 4-bit name index through `static_table::get` in O(1)
 /// and reads the value as an 8-bit-prefix string (RFC 9204 Section 4.2),
 /// returning a field whose name is the borrowed static-table entry and whose
-/// value owns the decoded bytes. The N bit marks the field never-indexed:
-/// it affects the encoder's indexing policy, not the decoded field, so it
-/// is parsed and dropped here.
+/// value owns the decoded bytes. The N bit marks the field never-indexed
+/// and is carried into `flags` as `NEVER_INDEX`, the same merge VPP performs
+/// into its name token at `http.h:1114`.
 ///
 /// This mirrors VPP's `case 5`/`case 7` in `qpack_parse_headers`
 /// (`third_party/vpp/src/plugins/http/http3/qpack.c`, qpack.c:982-997): the
@@ -255,19 +275,25 @@ pub(crate) fn decode_literal_name_ref<B: Buf>(
     if first & 0b1100_0000 != 0b0100_0000 {
         return Ok(None);
     }
-    let (flags, index) = prefix_int::decode(4, buf)?;
-    if flags & 0b0001 == 0 {
+    let (prefix, index) = prefix_int::decode(4, buf)?;
+    if prefix & 0b0001 == 0 {
         // T bit clear: a name reference into the dynamic table.
         return Err(QpackError::DynamicReference);
     }
-    // The N bit (bit 5 of the first byte) marks the field never-indexed;
-    // it affects the encoder's indexing policy, not the decoded field, so
-    // it is dropped here.
+    // The N bit (bit 5 of the first byte) marks the field never-indexed; it
+    // is carried into `flags` as `NEVER_INDEX`, exactly the merge VPP
+    // performs in `case 7` (`*never_index = 1`, qpack.c:980-983).
+    let flags = if first & 0b0010_0000 != 0 {
+        FieldLineFlags::NEVER_INDEX
+    } else {
+        FieldLineFlags::empty()
+    };
     let name = static_table::get(index as usize)?.name.clone();
     let value = prefix_string::decode(8, buf)?;
     Ok(Some(HeaderField {
         name,
         value: Cow::Owned(value),
+        flags,
     }))
 }
 
@@ -277,8 +303,8 @@ pub(crate) fn decode_literal_name_ref<B: Buf>(
 /// The name is read as a 4-bit-prefix string (Huffman flag plus 3-bit length
 /// prefix, RFC 9204 Section 4.2) and the value as an 8-bit-prefix string;
 /// the returned field owns the decoded bytes of both. The N bit marks the
-/// field never-indexed: it affects the encoder's indexing policy, not the
-/// decoded field, so it is parsed and dropped here.
+/// field never-indexed and is carried into `flags` as `NEVER_INDEX`, the
+/// same merge VPP performs into its name token at `http.h:1114`.
 ///
 /// This mirrors VPP's `case 2`/`case 3` in `qpack_parse_headers`
 /// (`third_party/vpp/src/plugins/http/http3/qpack.c`, qpack.c:1002-1017):
@@ -305,13 +331,19 @@ pub(crate) fn decode_literal_name<B: Buf>(buf: &mut B) -> Result<Option<HeaderFi
         return Ok(None);
     }
     // The N bit (bit 4 of the first byte) marks the field never-indexed; it
-    // affects the encoder's indexing policy, not the decoded field, so it is
-    // parsed and dropped here.
+    // is carried into `flags` as `NEVER_INDEX`, exactly the merge VPP
+    // performs in `case 3` (`*never_index = 1`, qpack.c:1003-1006).
+    let flags = if first & 0b0001_0000 != 0 {
+        FieldLineFlags::NEVER_INDEX
+    } else {
+        FieldLineFlags::empty()
+    };
     let name = prefix_string::decode(4, buf)?;
     let value = prefix_string::decode(8, buf)?;
     Ok(Some(HeaderField {
         name: Cow::Owned(name),
         value: Cow::Owned(value),
+        flags,
     }))
 }
 
@@ -387,6 +419,8 @@ pub(crate) fn decode_post_base_name_ref<B: Buf>(buf: &mut B) -> Result<Option<()
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    use crate::http_common::FieldLineFlags;
 
     fn decode_prefix_bytes(bytes: &[u8]) -> Result<(), QpackError> {
         let mut read: &[u8] = bytes;
@@ -473,6 +507,83 @@ mod tests {
         let wire = encode_block_bytes(&fields).expect("encoded");
         assert_eq!(wire, expected);
         assert_eq!(decode_block_bytes(&wire).expect("decoded"), fields);
+    }
+
+    /// A name-reference literal whose field carries `NEVER_INDEX` emits the
+    /// N bit: `0b0111` above the 4-bit index, exactly VPP's `0x70` family in
+    /// `qpack_encode_header` (`*a = never_index ? 0x70 : 0x50`, qpack.c:1057).
+    /// The flags round-trip through the committed decoder.
+    #[test]
+    fn encode_literal_name_ref_never_index_round_trips() {
+        let field = HeaderField {
+            name: Cow::Borrowed(b":method"),
+            value: Cow::Owned(b"PATCH".to_vec()),
+            flags: FieldLineFlags::NEVER_INDEX,
+        };
+        let mut expected = vec![0x00, 0x00];
+        prefix_int::encode(4, 0b0111, 15, &mut expected).expect("encoded");
+        prefix_string::encode(8, 0, b"PATCH", &mut expected).expect("encoded");
+        let wire = encode_block_bytes(&[field.clone()]).expect("encoded");
+        assert_eq!(wire, expected);
+        assert_eq!(decode_block_bytes(&wire).expect("decoded"), vec![field]);
+    }
+
+    /// A literal-name field carrying `NEVER_INDEX` emits the N bit: `0b0011`
+    /// above the 3-bit name length, exactly VPP's `0x30` family in
+    /// `qpack_encode_custom_header` (`*a = never_index ? 0x30 : 0x20`,
+    /// qpack.c:1090). The flags round-trip through the committed decoder.
+    #[test]
+    fn encode_literal_name_never_index_round_trips() {
+        let field = HeaderField {
+            name: Cow::Owned(b"x-custom".to_vec()),
+            value: Cow::Owned(b"hello".to_vec()),
+            flags: FieldLineFlags::NEVER_INDEX,
+        };
+        let mut expected = vec![0x00, 0x00];
+        prefix_string::encode(4, 0b0011, b"x-custom", &mut expected).expect("encoded");
+        prefix_string::encode(8, 0, b"hello", &mut expected).expect("encoded");
+        let wire = encode_block_bytes(&[field.clone()]).expect("encoded");
+        assert_eq!(wire, expected);
+        assert_eq!(decode_block_bytes(&wire).expect("decoded"), vec![field]);
+    }
+
+    /// A full static match has no N bit on the wire (RFC 9204 Section
+    /// 4.5.2), so `NEVER_INDEX` is dropped rather than leaked into the
+    /// indexed byte, and the decoded static entry carries empty flags.
+    #[test]
+    fn encode_indexed_form_drops_never_index() {
+        let field = HeaderField {
+            name: Cow::Borrowed(b":method"),
+            value: Cow::Borrowed(b"GET"),
+            flags: FieldLineFlags::NEVER_INDEX,
+        };
+        let wire = encode_block_bytes(&[field]).expect("encoded");
+        assert_eq!(wire, vec![0x00, 0x00, 0xD1]);
+        let decoded = decode_block_bytes(&wire).expect("decoded");
+        assert_eq!(
+            decoded,
+            vec![HeaderField {
+                name: Cow::Borrowed(b":method"),
+                value: Cow::Borrowed(b"GET"),
+                flags: FieldLineFlags::empty(),
+            }]
+        );
+    }
+
+    /// Only `NEVER_INDEX` maps to the wire N bit: another flag (here
+    /// `HOP_BY_HOP`) must not leak into the literal prefix.
+    #[test]
+    fn encode_other_flags_do_not_leak_into_wire() {
+        let field = HeaderField {
+            name: Cow::Owned(b"x-custom".to_vec()),
+            value: Cow::Owned(b"hello".to_vec()),
+            flags: FieldLineFlags::HOP_BY_HOP,
+        };
+        let mut expected = vec![0x00, 0x00];
+        prefix_string::encode(4, 0b0010, b"x-custom", &mut expected).expect("encoded");
+        prefix_string::encode(8, 0, b"hello", &mut expected).expect("encoded");
+        let wire = encode_block_bytes(&[field]).expect("encoded");
+        assert_eq!(wire, expected);
     }
 
     /// A mixed sequence round-trips through the committed decoder in wire
@@ -615,6 +726,7 @@ mod tests {
             HeaderField {
                 name: static_table::get(1).unwrap().name.clone(),
                 value: Cow::Owned(b"foo".to_vec()),
+                flags: FieldLineFlags::empty(),
             }
         );
         assert_eq!(
@@ -622,6 +734,7 @@ mod tests {
             HeaderField {
                 name: Cow::Owned(b"foo".to_vec()),
                 value: Cow::Owned(b"bar".to_vec()),
+                flags: FieldLineFlags::empty(),
             }
         );
     }
@@ -833,13 +946,36 @@ mod tests {
         assert!(!read.has_remaining());
     }
 
-    /// The N bit (0x70 vs 0x50) marks the field never-indexed; it affects
-    /// indexing policy, not the decoded field, so both forms decode alike.
+    /// The N bit (0x70 vs 0x50, RFC 9204 Section 4.5.4 bit 5) marks the
+    /// field never-indexed and is carried into `flags`, exactly as VPP sets
+    /// `*never_index` in `case 7` (qpack.c:980); both forms still decode the
+    /// same name and value.
     #[test]
-    fn decode_literal_name_ref_never_index_bit_ignored() {
-        let never = decode_literal(&[0x70, 0x03, b'b', b'a', b'r']);
-        let plain = decode_literal(&[0x50, 0x03, b'b', b'a', b'r']);
-        assert_eq!(never, plain);
+    fn decode_literal_name_ref_n_bit_sets_never_index() {
+        let never = decode_literal(&[0x70, 0x03, b'b', b'a', b'r'])
+            .expect("decoded")
+            .expect("recognized");
+        let plain = decode_literal(&[0x50, 0x03, b'b', b'a', b'r'])
+            .expect("decoded")
+            .expect("recognized");
+        assert_eq!(never.name, plain.name);
+        assert_eq!(never.value, plain.value);
+        assert_eq!(never.flags, FieldLineFlags::NEVER_INDEX);
+        assert_eq!(plain.flags, FieldLineFlags::empty());
+    }
+
+    /// The N bit survives a continuation-byte name index: 0x7F 0x00 is
+    /// `01 1 1 1111` plus 0, index 15 (`:method`).
+    #[test]
+    fn decode_literal_name_ref_n_bit_with_long_index() {
+        let mut read: &[u8] = &[0x7F, 0x00, 0x03, b'f', b'o', b'o'];
+        let field = decode_literal_name_ref(&mut read)
+            .expect("decoded")
+            .expect("recognized");
+        assert_eq!(&field.name[..], b":method");
+        assert_eq!(&field.value[..], b"foo");
+        assert_eq!(field.flags, FieldLineFlags::NEVER_INDEX);
+        assert!(!read.has_remaining());
     }
 
     /// A Huffman-coded value decodes through the seam (flag bit set in the
@@ -940,14 +1076,22 @@ mod tests {
         assert_eq!(&field.value[..], b"bar");
     }
 
-    /// The N bit (0x30 vs 0x20 in VPP's encoder) marks the field
-    /// never-indexed; it affects indexing policy, not the decoded field, so
-    /// both forms decode alike.
+    /// The N bit (0x30 vs 0x20, RFC 9204 Section 4.5.6 bit 4) marks the
+    /// field never-indexed and is carried into `flags`, exactly as VPP sets
+    /// `*never_index` in `case 3` (qpack.c:1003); both forms still decode the
+    /// same name and value.
     #[test]
-    fn decode_literal_name_never_index_bit_ignored() {
-        let never = decode_literal_literal(&[0x33, b'f', b'o', b'o', 0x03, b'b', b'a', b'r']);
-        let plain = decode_literal_literal(&[0x23, b'f', b'o', b'o', 0x03, b'b', b'a', b'r']);
-        assert_eq!(never, plain);
+    fn decode_literal_name_n_bit_sets_never_index() {
+        let never = decode_literal_literal(&[0x33, b'f', b'o', b'o', 0x03, b'b', b'a', b'r'])
+            .expect("decoded")
+            .expect("recognized");
+        let plain = decode_literal_literal(&[0x23, b'f', b'o', b'o', 0x03, b'b', b'a', b'r'])
+            .expect("decoded")
+            .expect("recognized");
+        assert_eq!(never.name, plain.name);
+        assert_eq!(never.value, plain.value);
+        assert_eq!(never.flags, FieldLineFlags::NEVER_INDEX);
+        assert_eq!(plain.flags, FieldLineFlags::empty());
     }
 
     /// Zero-length name and value strings still consume their length bytes.

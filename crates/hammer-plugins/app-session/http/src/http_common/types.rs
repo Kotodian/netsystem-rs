@@ -132,25 +132,20 @@ impl TryFrom<u8> for UpgradeProto {
     }
 }
 
-/// `http_field_line_flags_t` — `enum http_field_line_flags_ : u16`,
-/// `http.h:252-258`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct FieldLineFlags(pub u16);
-
-impl FieldLineFlags {
-    pub const INTERNAL: u16 = 1 << 0;
-    pub const NEVER_INDEX: u16 = 1 << 1;
-    /// Implied on every custom-name header entry by the app-side writer
-    /// (`http_add_custom_header2`, `http.h:1152`).
-    pub const CUSTOM_NAME: u16 = 1 << 2;
-    pub const HOP_BY_HOP: u16 = 1 << 3;
-
-    pub const fn empty() -> Self {
-        Self(0)
-    }
-
-    pub const fn bits(self) -> u16 {
-        self.0
+bitflags::bitflags! {
+    /// `http_field_line_flags_t` — `enum http_field_line_flags_ : u16`,
+    /// `http.h:252-258`. The constants keep the exact ABI bits;
+    /// `from_bits_retain` is the wire read (unknown/future VPP bits are
+    /// retained), `.bits()` is the wire write.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+    #[repr(transparent)]
+    pub struct FieldLineFlags: u16 {
+        const INTERNAL = 1 << 0;
+        const NEVER_INDEX = 1 << 1;
+        /// Implied on every custom-name header entry by the app-side writer
+        /// (`http_add_custom_header2`, `http.h:1152`).
+        const CUSTOM_NAME = 1 << 2;
+        const HOP_BY_HOP = 1 << 3;
     }
 }
 
@@ -167,6 +162,38 @@ pub mod header_name {
     pub const CONTENT_TYPE: u16 = 39;
     pub const HOST: u16 = 52;
     pub const USER_AGENT: u16 = 87;
+}
+
+/// A known regular-field name of the publish seam, bound to its positional
+/// `http_header_name_t` index. `TryFrom<&[u8]>` is the single Rust-native
+/// name-to-ABI conversion: VPP matches the lowercased name column of
+/// `foreach_http_header_name` (`http.h:260-375`); any other name is not a
+/// `HeaderName` and its field publishes as `Custom`. O(1), zero allocation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct HeaderName(u16);
+
+impl TryFrom<&[u8]> for HeaderName {
+    type Error = ();
+
+    fn try_from(name: &[u8]) -> Result<Self, ()> {
+        match name {
+            b"accept" => Ok(Self(header_name::ACCEPT)),
+            b"accept-encoding" => Ok(Self(header_name::ACCEPT_ENCODING)),
+            b"accept-language" => Ok(Self(header_name::ACCEPT_LANGUAGE)),
+            b"connection" => Ok(Self(header_name::CONNECTION)),
+            b"content-length" => Ok(Self(header_name::CONTENT_LENGTH)),
+            b"content-type" => Ok(Self(header_name::CONTENT_TYPE)),
+            b"host" => Ok(Self(header_name::HOST)),
+            b"user-agent" => Ok(Self(header_name::USER_AGENT)),
+            _ => Err(()),
+        }
+    }
+}
+
+impl From<HeaderName> for u16 {
+    fn from(name: HeaderName) -> u16 {
+        name.0
+    }
 }
 
 /// `http_msg_data_t` — 80 bytes on x86_64 LP64, `http.h:426-444`. Field
@@ -204,4 +231,41 @@ pub struct HttpMsg {
     pub msg_type: MsgType,
     pub method_or_code: u32,
     pub data: MsgData,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{HeaderName, header_name};
+
+    #[test]
+    fn header_name_try_from_known() {
+        let known: &[(&[u8], u16)] = &[
+            (b"accept", header_name::ACCEPT),
+            (b"accept-encoding", header_name::ACCEPT_ENCODING),
+            (b"accept-language", header_name::ACCEPT_LANGUAGE),
+            (b"connection", header_name::CONNECTION),
+            (b"content-length", header_name::CONTENT_LENGTH),
+            (b"content-type", header_name::CONTENT_TYPE),
+            (b"host", header_name::HOST),
+            (b"user-agent", header_name::USER_AGENT),
+        ];
+        for &(name, index) in known {
+            let header = HeaderName::try_from(name).expect("declared known name");
+            assert_eq!(u16::from(header), index);
+        }
+    }
+
+    #[test]
+    fn header_name_try_from_unknown() {
+        let unknown: &[&[u8]] = &[
+            b"Accept",
+            b"cache-control",
+            b"x-test",
+            b"accept-encoding-extra",
+            b"",
+        ];
+        for &name in unknown {
+            assert!(HeaderName::try_from(name).is_err(), "unexpectedly known: {name:?}");
+        }
+    }
 }

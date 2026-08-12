@@ -10,6 +10,7 @@ crate-type = ["cdylib", "rlib"]
 
 [dependencies]
 abi_stable = { workspace = true }
+bitflags = { workspace = true }
 bytes = { workspace = true }
 hammer-component-macros = { path = "../../../hammer-component-macros" }
 hammer-infra = { path = "../../../hammer-infra" }

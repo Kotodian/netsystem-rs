@@ -8,17 +8,34 @@
 use std::borrow::Cow;
 use std::fmt;
 
+use crate::http_common::FieldLineFlags;
+
 /// The per-entry overhead of the dynamic table size calculation
 /// (RFC 7541 Section 4.1): the size of an entry is the sum of its name and
 /// value lengths plus 32.
 pub const ESTIMATED_OVERHEAD_BYTES: usize = 32;
 
 /// A field line: name and value as byte strings. Static-table entries borrow
-/// `'static` data; decoded literals own their bytes.
+/// `'static` data; decoded literals own their bytes. `flags` carries the
+/// field-line policy bits of the ABI (`FieldLineFlags`): the decoder sets
+/// `NEVER_INDEX` when the wire N bit (RFC 9204 Sections 4.5.4 and 4.5.6) is
+/// set — the same merge VPP performs at `http.h:1114` — and the encoder
+/// emits the N bit back when the flag is present. Static entries and
+/// ordinary `(name, value)` construction default to empty flags.
 #[derive(Debug, Clone, Eq, PartialEq, Hash)]
 pub struct HeaderField {
     pub name: Cow<'static, [u8]>,
     pub value: Cow<'static, [u8]>,
+    pub flags: FieldLineFlags,
+}
+
+/// `FieldLineFlags` does not derive `Hash`; `HeaderField` does, so the flag
+/// bits hash as the underlying `u16`. The impl lives beside `HeaderField`
+/// because it exists solely to keep that derive sound.
+impl std::hash::Hash for FieldLineFlags {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        self.bits().hash(state);
+    }
 }
 
 impl HeaderField {
@@ -30,6 +47,7 @@ impl HeaderField {
         HeaderField {
             name: Cow::Owned(name.into()),
             value: Cow::Owned(value.into()),
+            flags: FieldLineFlags::empty(),
         }
     }
 
@@ -47,6 +65,7 @@ impl HeaderField {
         Self {
             name: self.name.clone(),
             value: Cow::Owned(value.into()),
+            flags: self.flags,
         }
     }
 }
@@ -63,6 +82,7 @@ where
         Self {
             name: Cow::Owned(Vec::from(name.as_ref())),
             value: Cow::Owned(Vec::from(value.as_ref())),
+            flags: FieldLineFlags::empty(),
         }
     }
 }
@@ -88,6 +108,7 @@ mod tests {
         let field = HeaderField {
             name: Cow::Borrowed(b"Name"),
             value: Cow::Borrowed(b"Value"),
+            flags: FieldLineFlags::empty(),
         };
         assert_eq!(field.mem_size(), 4 + 5 + 32);
     }
@@ -97,12 +118,30 @@ mod tests {
         let field = HeaderField {
             name: Cow::Borrowed(b"Name"),
             value: Cow::Borrowed(b"Value"),
+            flags: FieldLineFlags::empty(),
         };
         assert_eq!(
             field.with_value("New value"),
             HeaderField {
                 name: Cow::Borrowed(b"Name"),
                 value: Cow::Borrowed(b"New value"),
+                flags: FieldLineFlags::empty(),
+            }
+        );
+        // Flags are indexing policy, independent of the value: replacing the
+        // value keeps `NEVER_INDEX` (VPP merges the same bit into the name
+        // token, http.h:1114).
+        let never = HeaderField {
+            name: Cow::Borrowed(b"Name"),
+            value: Cow::Borrowed(b"Value"),
+            flags: FieldLineFlags::NEVER_INDEX,
+        };
+        assert_eq!(
+            never.with_value("New value"),
+            HeaderField {
+                name: Cow::Borrowed(b"Name"),
+                value: Cow::Borrowed(b"New value"),
+                flags: FieldLineFlags::NEVER_INDEX,
             }
         );
     }
@@ -119,5 +158,20 @@ mod tests {
 
         let mixed = HeaderField::from((b"x".to_vec(), &b"y"[..]));
         assert_eq!(mixed.mem_size(), 1 + 1 + 32);
+    }
+
+    /// Ordinary construction defaults to empty flags: a field built by the
+    /// app must not carry `NEVER_INDEX` unless a decoded wire N bit or an
+    /// explicit flag assignment put it there.
+    #[test]
+    fn constructors_default_flags_empty() {
+        assert_eq!(
+            HeaderField::new(":method", "GET").flags,
+            FieldLineFlags::empty()
+        );
+        assert_eq!(
+            HeaderField::from(("x-custom", "1")).flags,
+            FieldLineFlags::empty()
+        );
     }
 }

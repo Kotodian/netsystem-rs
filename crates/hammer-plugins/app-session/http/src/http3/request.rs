@@ -49,18 +49,30 @@
 //! must syntactically carry a port, per VPP's `http3_verify_port_in_authority`
 //! (http3.c); see the function doc.
 //!
+//! [`publish_request_field_section`] is the publication sibling: it decodes
+//! one encoded field section, validates it in the same single walk, converts
+//! the regular fields to [`AppHeader`] entries, and publishes one
+//! [`InboundRequest`] with an empty body to the app FIFO (see the function
+//! doc).
+//!
 //! Awaiting their consumers: the request-stream slice wires the frame
 //! state machine and the field-section validation into stream dispatch, at
 //! which point the `dead_code` allow can go.
 #![allow(dead_code)]
 
 use std::borrow::Cow;
+use std::mem;
 
-use crate::http_common::{ReqMethod, UrlScheme};
+use crate::http_common::{
+    AppHeader, FieldLineFlags, HeaderName, InboundRequest, PublishError, ReqMethod, UrlScheme,
+    publish_inbound_request,
+};
 use crate::http3::proto::error::ErrorCode;
 use crate::http3::proto::frame::FrameType;
 use crate::http3::proto::headers::{FieldSectionValidator, MessageKind};
 use crate::http3::proto::qpack::block::decode_block;
+use crate::http3::request_fields::validate_request_field_line;
+use hammer_infra::fifo::Fifo;
 
 /// The phase of a client request stream, advanced one frame at a time.
 #[derive(Debug, Copy, Clone, Eq, PartialEq)]
@@ -173,11 +185,14 @@ pub(crate) struct ConnectRequestPseudoHeaders {
 /// while a missing or malformed port maps to [`ErrorCode::MessageError`].
 ///
 /// Extended CONNECT (`:protocol`, RFC 8441 / RFC 9220) is out of this seam's
-/// scope: only after the structural validation passes does a `:protocol`
-/// pseudo map to [`ErrorCode::GeneralProtocolError`], and any method other
-/// than CONNECT — which the structural validator admits — maps to
-/// [`ErrorCode::GeneralProtocolError`] too. Structural errors therefore take
-/// precedence over both mappings.
+/// scope: after the structural checks pass, a `:protocol` pseudo maps to
+/// [`ErrorCode::GeneralProtocolError`], and any method other than CONNECT
+/// maps to [`ErrorCode::GeneralProtocolError`] too. The `:method` presence
+/// and value are checked before the structural `finish`, matching VPP
+/// (http3.c): a missing `:method` maps to [`ErrorCode::MessageError`] first,
+/// then a non-CONNECT method value maps to
+/// [`ErrorCode::GeneralProtocolError`] before the
+/// missing-`:scheme`/`:path` structural checks.
 ///
 /// Returns only the pseudo values; the decoded field block is dropped.
 /// Synchronous and lock-free, with one decode allocation; the returned
@@ -190,8 +205,10 @@ pub(crate) fn validate_connect_request_field_section(
 
     let mut validator = FieldSectionValidator::new(MessageKind::Request);
     // The pseudo values are moved out of the decoded block as the walk
-    // passes them; the method is compared only after `finish`, so
-    // structural errors take precedence over the method check.
+    // passes them; the method is mapped before `finish`, matching VPP:
+    // `:method` presence, then its value, precede the missing-`:scheme` and
+    // missing-`:path` structural checks (http3.c).
+    let mut saw_method = false;
     let mut is_connect = false;
     let mut authority = None;
     let mut saw_scheme = false;
@@ -202,7 +219,10 @@ pub(crate) fn validate_connect_request_field_section(
             .on_field(&field.name, &field.value)
             .map_err(|_| ErrorCode::MessageError)?;
         match &field.name[..] {
-            b":method" => is_connect = field.value.as_ref() == b"CONNECT",
+            b":method" => {
+                saw_method = true;
+                is_connect = field.value.as_ref() == b"CONNECT";
+            }
             b":scheme" => saw_scheme = true,
             b":authority" => authority = Some(field.value),
             b":path" => saw_path = true,
@@ -210,17 +230,23 @@ pub(crate) fn validate_connect_request_field_section(
             _ => {}
         }
     }
-    validator.finish().map_err(|_| ErrorCode::MessageError)?;
-
-    // `finish` guarantees a `:method` and an `:authority` or a matching
-    // `Host`; this seam requires the `:authority` pseudo itself (VPP has no
-    // Host fallback), so the `ok_or` arm is a typed error rather than a
-    // panic.
+    // VPP checks `:method` presence first (MESSAGE_ERROR), then the method
+    // value (GENERAL_PROTOCOL_ERROR for an unsupported method), before the
+    // missing-`:scheme`/`:path` structural checks; a non-CONNECT method here
+    // is exactly that unsupported value, so it maps before `finish`.
+    if !saw_method {
+        return Err(ErrorCode::MessageError);
+    }
     if !is_connect {
         // Any other method is a different request kind, not a malformed
         // CONNECT.
         return Err(ErrorCode::GeneralProtocolError);
     }
+    validator.finish().map_err(|_| ErrorCode::MessageError)?;
+
+    // `finish` guarantees an `:authority` or a matching `Host`; this seam
+    // requires the `:authority` pseudo itself (VPP has no Host fallback),
+    // so the `ok_or` arm is a typed error rather than a panic.
     if saw_protocol {
         // Extended CONNECT (RFC 9220) is out of this seam's scope.
         return Err(ErrorCode::GeneralProtocolError);
@@ -266,7 +292,11 @@ pub(crate) fn validate_connect_request_field_section(
 /// table knows but which belongs to the CONNECT/CONNECT-UDP seam — maps to
 /// [`ErrorCode::InternalError`]. An unsupported method — including plain
 /// and extended CONNECT, which the validator structurally permits — maps to
-/// [`ErrorCode::GeneralProtocolError`]. Structural errors are always
+/// [`ErrorCode::GeneralProtocolError`]. The `:method` value is checked
+/// before `finish`, matching VPP: an unsupported method maps to
+/// [`ErrorCode::GeneralProtocolError`] even when `:scheme` is missing,
+/// and a missing `:method` maps to [`ErrorCode::MessageError`] first, as
+/// VPP checks presence before value. All other structural errors are
 /// reported before value mapping.
 ///
 /// Returns only the pseudo values; the decoded field block is dropped.
@@ -279,8 +309,9 @@ pub(crate) fn validate_request_field_section(encoded: &[u8]) -> Result<RequestPs
 
     let mut validator = FieldSectionValidator::new(MessageKind::Request);
     // The pseudo values are moved out of the decoded block as the walk
-    // passes them; method and scheme are mapped only after `finish`, so
-    // structural errors take precedence over value mapping.
+    // passes them; the method value is mapped before `finish` — VPP checks
+    // the method value before the missing-`:scheme` check (http3.c) — and
+    // the scheme value after it.
     let mut method = None;
     let mut scheme = None;
     let mut authority = None;
@@ -297,14 +328,18 @@ pub(crate) fn validate_request_field_section(encoded: &[u8]) -> Result<RequestPs
             _ => {}
         }
     }
+    // VPP rejects an unsupported `:method` (http3.c, GENERAL_PROTOCOL_ERROR)
+    // before the missing-`:scheme` structural check (http3.c, MESSAGE_ERROR),
+    // so the method value is mapped before `finish`; a missing `:method`
+    // still maps to MessageError here, before the value check, as VPP
+    // checks presence before value.
+    let method = parse_method(&method.ok_or(ErrorCode::MessageError)?)?;
     validator.finish().map_err(|_| ErrorCode::MessageError)?;
 
-    // `finish` guarantees exactly one non-empty `:method`, `:scheme`, and
-    // `:path` for an ordinary request and an `:authority` or a matching
-    // `Host`; this seam requires the `:authority` pseudo itself (VPP has no
-    // Host fallback), so the `ok_or` arms are typed errors rather than
-    // panics.
-    let method = parse_method(&method.ok_or(ErrorCode::MessageError)?)?;
+    // `finish` guarantees exactly one non-empty `:scheme` and `:path` for
+    // an ordinary request and an `:authority` or a matching `Host`; this
+    // seam requires the `:authority` pseudo itself (VPP has no Host
+    // fallback), so the `ok_or` arms are typed errors rather than panics.
     let scheme = parse_scheme(&scheme.ok_or(ErrorCode::MessageError)?)?;
     let authority = authority.ok_or(ErrorCode::MessageError)?;
     let path = path.ok_or(ErrorCode::MessageError)?;
@@ -314,6 +349,152 @@ pub(crate) fn validate_request_field_section(encoded: &[u8]) -> Result<RequestPs
         authority,
         path,
     })
+}
+
+/// Why publishing one request field section failed. The protocol-level
+/// variants carry the same connection-error mapping as the sibling
+/// [`validate_request_field_section`]; `Publish` passes a FIFO-level failure
+/// (capacity, reservation, or commit) through.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum RequestPublishError {
+    /// QPACK decompression of the encoded field section failed.
+    QpackDecompressionFailed,
+    /// The field section violates RFC 9114 request semantics: structural
+    /// validation, the request field-line policy, or a missing required
+    /// pseudo.
+    MessageError,
+    /// The `:method` value is not an ordinary method supported by this seam.
+    GeneralProtocolError,
+    /// The `:scheme` value is not http or https.
+    InternalError,
+    /// The request could not be published to the FIFO.
+    Publish(PublishError),
+}
+
+impl From<PublishError> for RequestPublishError {
+    fn from(error: PublishError) -> Self {
+        Self::Publish(error)
+    }
+}
+
+/// Decode one complete encoded request field section, validate it as an
+/// ordinary HTTP request (RFC 9114 Section 4.3.1), and publish it to `fifo`
+/// as one [`InboundRequest`] with an empty body.
+///
+/// Unlike [`validate_request_field_section`], which returns only the pseudo
+/// values and drops the decoded block, this seam keeps the decoded block
+/// alive for the whole build+publish call: the regular fields are converted
+/// to [`AppHeader`] entries borrowing the decoded bytes, and the pseudo
+/// values are moved out of the block without copying. The decoded block, the
+/// header-entry vector, and the FIFO reservation are the only allocations.
+///
+/// The walk mirrors `validate_request_field_section` (and VPP's
+/// `qpack_parse_request`, qpack.c, called by `http3_stream_transport_rx_req`,
+/// http3.c:871): one `decode_block`, then one pass through the committed
+/// [`FieldSectionValidator`] with the request-only field-line policy of
+/// [`validate_request_field_line`] applied to regular names in that same
+/// walk. A QPACK decode failure maps to
+/// [`RequestPublishError::QpackDecompressionFailed`]; any field-section
+/// violation maps to [`RequestPublishError::MessageError`]; method and
+/// scheme values map exactly as [`parse_method`] and [`parse_scheme`] do;
+/// `PublishError` passes through unchanged.
+///
+/// `:path` is split at the first `?` into the request-target path and query
+/// spans, both borrowing the same decoded buffer (no byte copy); a path
+/// without `?` yields an empty query. The leading slash of the path is
+/// retained, matching the Hammer golden fixtures.
+///
+/// Synchronous and lock-free: one QPACK decode, one validation/publication
+/// walk over the decoded fields (plus the `?` scan of the single path
+/// buffer), O(total field bytes).
+pub(crate) fn publish_request_field_section(
+    fifo: &Fifo,
+    encoded: &[u8],
+) -> Result<(), RequestPublishError> {
+    let mut read = encoded;
+    let mut fields =
+        decode_block(&mut read).map_err(|_| RequestPublishError::QpackDecompressionFailed)?;
+
+    let mut validator = FieldSectionValidator::new(MessageKind::Request);
+    // The pseudo values are moved out of the decoded block during the walk;
+    // the regular-field `AppHeader` entries borrow the block, which stays
+    // alive through the publish. The method value is mapped before `finish`
+    // — VPP checks the method value before the missing-`:scheme` check
+    // (http3.c) — and the scheme value after it.
+    let mut method = None;
+    let mut scheme = None;
+    let mut authority = None;
+    let mut path = None;
+    let mut headers = Vec::new();
+    for field in &mut fields {
+        validator
+            .on_field(&field.name, &field.value)
+            .map_err(|_| RequestPublishError::MessageError)?;
+        // Unknown pseudos were already rejected by `on_field`; this arm is
+        // exactly the regular fields.
+        match &field.name[..] {
+            b":method" => method = Some(mem::take(&mut field.value)),
+            b":scheme" => scheme = Some(mem::take(&mut field.value)),
+            b":authority" => authority = Some(mem::take(&mut field.value)),
+            b":path" => path = Some(mem::take(&mut field.value)),
+            _ => {
+                validate_request_field_line(field)
+                    .map_err(|_| RequestPublishError::MessageError)?;
+                // The decoded N bit (or an empty set) is published verbatim:
+                // the ABI flags must reflect the wire's never-index policy.
+                let flags = field.flags;
+                headers.push(match HeaderName::try_from(field.name.as_ref()) {
+                    Ok(name) => AppHeader::Known {
+                        flags,
+                        name: name.into(),
+                        value: field.value.as_ref(),
+                    },
+                    Err(_) => AppHeader::Custom {
+                        flags,
+                        name: field.name.as_ref(),
+                        value: field.value.as_ref(),
+                    },
+                });
+            }
+        }
+    }
+    // VPP rejects an unsupported `:method` (http3.c, GENERAL_PROTOCOL_ERROR)
+    // before the missing-`:scheme` structural check (http3.c, MESSAGE_ERROR),
+    // so the method value is mapped before `finish`; a missing `:method`
+    // still maps to MessageError here, before the value check, as VPP
+    // checks presence before value.
+    let method = parse_method(&method.ok_or(RequestPublishError::MessageError)?)
+        .map_err(|_| RequestPublishError::GeneralProtocolError)?;
+    validator.finish().map_err(|_| RequestPublishError::MessageError)?;
+
+    // `finish` guarantees exactly one non-empty `:scheme` and `:path` for
+    // an ordinary request and an `:authority` or a matching `Host`; this
+    // seam requires the `:authority` pseudo itself (VPP has no Host
+    // fallback), so the `ok_or` arms are typed errors rather than panics.
+    let scheme = parse_scheme(&scheme.ok_or(RequestPublishError::MessageError)?)
+        .map_err(|_| RequestPublishError::InternalError)?;
+    let authority = authority.ok_or(RequestPublishError::MessageError)?;
+    let path = path.ok_or(RequestPublishError::MessageError)?;
+
+    // Split `:path` at the first `?` into the target path and query spans.
+    // Both borrow the same decoded buffer, so no bytes are copied; a path
+    // without `?` yields an empty query.
+    let (target_path, target_query) = match path.iter().position(|&b| b == b'?') {
+        Some(query_start) => (&path[..query_start], &path[query_start + 1..]),
+        None => (&path[..], &[][..]),
+    };
+
+    let request = InboundRequest {
+        method,
+        scheme,
+        target_authority: authority.as_ref(),
+        target_path,
+        target_query,
+        headers: &headers,
+        body: b"",
+    };
+    publish_inbound_request(fifo, &request)?;
+    Ok(())
 }
 
 /// Map an `:method` value to the VPP request-method enum
@@ -370,13 +551,18 @@ fn verify_port_in_authority(authority: &[u8]) -> bool {
 #[cfg(test)]
 mod tests {
     use super::{
-        RequestPhase, validate_connect_request_field_section, validate_request_field_section,
+        RequestPhase, RequestPublishError, publish_request_field_section,
+        validate_connect_request_field_section, validate_request_field_section,
     };
     use crate::http3::proto::error::ErrorCode;
     use crate::http3::proto::frame::FrameType;
     use crate::http3::proto::qpack::block::encode_block;
     use crate::http3::proto::qpack::field::HeaderField;
-    use crate::http_common::{ReqMethod, UrlScheme};
+    use crate::http_common::{DecodedHeaderName, FieldLineFlags, ReqMethod, UrlScheme, decode, header_name};
+    use hammer_infra::fifo::Fifo;
+    use hammer_infra::segment::Segment;
+    use std::borrow::Cow;
+    use std::io::Read;
 
     #[test]
     fn data_before_headers_rejected() {
@@ -521,6 +707,37 @@ mod tests {
         assert_eq!(
             validate_request_field_section(&encoded),
             Err(ErrorCode::GeneralProtocolError)
+        );
+    }
+
+    #[test]
+    fn unknown_method_beats_missing_scheme() {
+        // VPP rejects an unsupported `:method` (http3.c, GENERAL_PROTOCOL_ERROR)
+        // before the missing-`:scheme` check (http3.c, MESSAGE_ERROR), so the
+        // unknown method decides the error even though `:scheme` is absent.
+        let encoded = section(&[
+            HeaderField::new(":method", "GEPT"),
+            HeaderField::new(":authority", "example.com"),
+            HeaderField::new(":path", "/"),
+        ]);
+        assert_eq!(
+            validate_request_field_section(&encoded),
+            Err(ErrorCode::GeneralProtocolError)
+        );
+    }
+
+    #[test]
+    fn missing_method_and_scheme_is_message_error() {
+        // With `:method` absent, the structural error wins: VPP checks
+        // `:method` presence (http3.c, MESSAGE_ERROR) before the method
+        // value, so the missing `:scheme` never decides the mapping.
+        let encoded = section(&[
+            HeaderField::new(":authority", "example.com"),
+            HeaderField::new(":path", "/"),
+        ]);
+        assert_eq!(
+            validate_request_field_section(&encoded),
+            Err(ErrorCode::MessageError)
         );
     }
 
@@ -760,5 +977,266 @@ mod tests {
                 .expect("syntactically ported CONNECT authority");
             assert_eq!(pseudo.authority.as_ref(), authority.as_bytes());
         }
+    }
+
+    #[test]
+    fn connect_non_connect_method_maps_before_missing_scheme_path() {
+        // VPP maps the `:method` value before the missing-`:scheme` and
+        // missing-`:path` structural checks (http3.c); this seam accepts
+        // only CONNECT, so any other method value — known or unknown — is
+        // the unsupported-method mapping (GENERAL_PROTOCOL_ERROR) even when
+        // `:scheme` or `:path` is absent.
+        for fields in [
+            vec![
+                HeaderField::new(":method", "GET"),
+                HeaderField::new(":authority", "example.com:443"),
+            ],
+            vec![
+                HeaderField::new(":method", "GET"),
+                HeaderField::new(":scheme", "https"),
+                HeaderField::new(":authority", "example.com:443"),
+            ],
+            vec![
+                HeaderField::new(":method", "GEPT"),
+                HeaderField::new(":authority", "example.com:443"),
+            ],
+        ] {
+            assert_eq!(
+                validate_connect_request_field_section(&section(&fields)),
+                Err(ErrorCode::GeneralProtocolError)
+            );
+        }
+    }
+
+    #[test]
+    fn connect_missing_method_maps_to_message_error() {
+        // VPP checks `:method` presence first (http3.c, MESSAGE_ERROR),
+        // before the method value and before any structural check, so a
+        // section without `:method` is MessageError even with `:scheme`,
+        // `:path`, and `:authority` present.
+        for fields in [
+            vec![HeaderField::new(":authority", "example.com:443")],
+            vec![
+                HeaderField::new(":scheme", "https"),
+                HeaderField::new(":authority", "example.com:443"),
+                HeaderField::new(":path", "/"),
+            ],
+        ] {
+            assert_eq!(
+                validate_connect_request_field_section(&section(&fields)),
+                Err(ErrorCode::MessageError)
+            );
+        }
+    }
+
+    // --- Request field-section decode + publish ---
+
+    /// A local FIFO of `capacity` data bytes backed by a private 1 MiB segment.
+    fn local_fifo(capacity: usize) -> Fifo {
+        Fifo::new(Segment::local(1 << 20), capacity).expect("local FIFO")
+    }
+
+    /// Read `len` published bytes out of `fifo`.
+    fn read_published(fifo: &Fifo, len: usize) -> Vec<u8> {
+        let mut out = vec![0u8; len];
+        let mut reader = fifo;
+        reader.read_exact(&mut out).expect("published request");
+        out
+    }
+
+    #[test]
+    fn publish_valid_get_round_trips_through_decode() {
+        let encoded = section(&[
+            HeaderField::new(":method", "GET"),
+            HeaderField::new(":scheme", "https"),
+            HeaderField::new(":authority", "example.com"),
+            HeaderField::new(":path", "/index.html?a=1"),
+            // One known-name field and one custom-name field.
+            HeaderField::new("accept", "text/html"),
+            HeaderField::new("x-test", "1"),
+        ]);
+        let fifo = local_fifo(8192);
+        publish_request_field_section(&fifo, &encoded).expect("valid GET publishes");
+        // Successful publishes arm no deq notification.
+        assert!(!fifo.needs_deq_notification(1));
+        // 88-byte msg header + authority(11) + path(11) + query(3) + headers(32).
+        let observed = read_published(&fifo, 145);
+        let decoded = decode(&observed).expect("published bytes decode");
+        assert_eq!(decoded.method, ReqMethod::Get);
+        assert_eq!(decoded.scheme, UrlScheme::Https);
+        assert_eq!(decoded.target_authority, b"example.com");
+        assert_eq!(decoded.target_path, b"/index.html");
+        assert_eq!(decoded.target_query, b"a=1");
+        assert_eq!(decoded.body, b"");
+        let headers: Vec<_> = decoded.headers().collect();
+        assert_eq!(headers.len(), 2);
+        assert_eq!(headers[0].name, DecodedHeaderName::Known(header_name::ACCEPT));
+        assert_eq!(headers[0].value, b"text/html");
+        assert_eq!(headers[1].name, DecodedHeaderName::Custom(b"x-test"));
+        assert_eq!(headers[1].value, b"1");
+    }
+
+    /// A decoded regular literal carrying the N bit publishes `NEVER_INDEX`
+    /// into the AppHeader ABI flags instead of a hardcoded empty value, and
+    /// the flag survives the ABI wire: the encoder emits the N bit, the
+    /// publish path passes `field.flags` through, and the writer keeps it
+    /// (VPP merges the same bit into the name token, http.h:1114). Pseudo
+    /// fields remain spans and never reach the ABI flags.
+    #[test]
+    fn publish_never_index_literal_carries_abi_flags() {
+        let encoded = section(&[
+            HeaderField::new(":method", "GET"),
+            HeaderField::new(":scheme", "https"),
+            HeaderField::new(":authority", "example.com"),
+            HeaderField::new(":path", "/"),
+            HeaderField {
+                name: Cow::Owned(b"x-test".to_vec()),
+                value: Cow::Owned(b"1".to_vec()),
+                flags: FieldLineFlags::NEVER_INDEX,
+            },
+        ]);
+        let fifo = local_fifo(8192);
+        publish_request_field_section(&fifo, &encoded).expect("valid GET publishes");
+        // 88-byte msg header + authority(11) + path(1) + query(0)
+        // + custom header entry (8 + name 6 + value 1).
+        let observed = read_published(&fifo, 88 + 11 + 1 + 15);
+        let decoded = decode(&observed).expect("published bytes decode");
+        let headers: Vec<_> = decoded.headers().collect();
+        assert_eq!(headers.len(), 1);
+        assert_eq!(headers[0].name, DecodedHeaderName::Custom(b"x-test"));
+        assert_eq!(headers[0].value, b"1");
+        assert_eq!(
+            headers[0].flags,
+            FieldLineFlags::CUSTOM_NAME | FieldLineFlags::NEVER_INDEX
+        );
+    }
+
+    #[test]
+    fn publish_forbidden_connection_field_leaves_fifo_untouched() {
+        let encoded = section(&[
+            HeaderField::new(":method", "GET"),
+            HeaderField::new(":scheme", "https"),
+            HeaderField::new(":authority", "example.com"),
+            HeaderField::new(":path", "/"),
+            HeaderField::new("connection", "close"),
+        ]);
+        let fifo = local_fifo(8192);
+        assert_eq!(
+            publish_request_field_section(&fifo, &encoded),
+            Err(RequestPublishError::MessageError)
+        );
+        assert_eq!(fifo.max_dequeue(), 0);
+        assert!(!fifo.needs_deq_notification(1));
+    }
+
+    #[test]
+    fn publish_invalid_te_leaves_fifo_untouched() {
+        let encoded = section(&[
+            HeaderField::new(":method", "GET"),
+            HeaderField::new(":scheme", "https"),
+            HeaderField::new(":authority", "example.com"),
+            HeaderField::new(":path", "/"),
+            HeaderField::new("te", "gzip"),
+        ]);
+        let fifo = local_fifo(8192);
+        assert_eq!(
+            publish_request_field_section(&fifo, &encoded),
+            Err(RequestPublishError::MessageError)
+        );
+        assert_eq!(fifo.max_dequeue(), 0);
+    }
+
+    #[test]
+    fn publish_pseudo_after_regular_maps_message_error() {
+        // Pseudo-headers must precede every regular field (RFC 9114 Section
+        // 4.3.1); the violation is caught before anything is published.
+        let encoded = section(&[
+            HeaderField::new(":method", "GET"),
+            HeaderField::new("host", "example.com"),
+            HeaderField::new(":authority", "example.com"),
+            HeaderField::new(":path", "/"),
+        ]);
+        let fifo = local_fifo(8192);
+        assert_eq!(
+            publish_request_field_section(&fifo, &encoded),
+            Err(RequestPublishError::MessageError)
+        );
+        assert_eq!(fifo.max_dequeue(), 0);
+    }
+
+    #[test]
+    fn publish_corrupt_qpack_maps_qpack_decompression_failed() {
+        let fifo = local_fifo(8192);
+        assert_eq!(
+            publish_request_field_section(&fifo, &[0x00]),
+            Err(RequestPublishError::QpackDecompressionFailed)
+        );
+        assert_eq!(fifo.max_dequeue(), 0);
+    }
+
+    #[test]
+    fn publish_path_without_query_yields_empty_query() {
+        let encoded = section(&[
+            HeaderField::new(":method", "GET"),
+            HeaderField::new(":scheme", "https"),
+            HeaderField::new(":authority", "example.com"),
+            HeaderField::new(":path", "/"),
+        ]);
+        let fifo = local_fifo(8192);
+        publish_request_field_section(&fifo, &encoded).expect("valid GET publishes");
+        // 88-byte msg header + authority(11) + path(1) + empty query.
+        let observed = read_published(&fifo, 100);
+        let decoded = decode(&observed).expect("published bytes decode");
+        assert_eq!(decoded.target_path, b"/");
+        assert_eq!(decoded.target_query, b"");
+        assert_eq!(decoded.body, b"");
+    }
+
+    #[test]
+    fn publish_unknown_method_maps_general_protocol_error() {
+        let encoded = section(&[
+            HeaderField::new(":method", "GEPT"),
+            HeaderField::new(":scheme", "https"),
+            HeaderField::new(":authority", "example.com"),
+            HeaderField::new(":path", "/"),
+        ]);
+        let fifo = local_fifo(8192);
+        assert_eq!(
+            publish_request_field_section(&fifo, &encoded),
+            Err(RequestPublishError::GeneralProtocolError)
+        );
+    }
+
+    #[test]
+    fn publish_unknown_method_beats_missing_scheme() {
+        // The publish seam mirrors VPP's ordering (http3.c): an unsupported
+        // `:method` maps to GeneralProtocolError before the
+        // missing-`:scheme` structural check would map to MessageError.
+        let encoded = section(&[
+            HeaderField::new(":method", "GEPT"),
+            HeaderField::new(":authority", "example.com"),
+            HeaderField::new(":path", "/"),
+        ]);
+        let fifo = local_fifo(8192);
+        assert_eq!(
+            publish_request_field_section(&fifo, &encoded),
+            Err(RequestPublishError::GeneralProtocolError)
+        );
+        assert_eq!(fifo.max_dequeue(), 0);
+    }
+
+    #[test]
+    fn publish_unknown_scheme_maps_internal_error() {
+        let encoded = section(&[
+            HeaderField::new(":method", "GET"),
+            HeaderField::new(":scheme", "ftp"),
+            HeaderField::new(":authority", "example.com"),
+            HeaderField::new(":path", "/"),
+        ]);
+        let fifo = local_fifo(8192);
+        assert_eq!(
+            publish_request_field_section(&fifo, &encoded),
+            Err(RequestPublishError::InternalError)
+        );
     }
 }
