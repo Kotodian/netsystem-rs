@@ -81,6 +81,14 @@ fn stream_has_send_side(connection: &Connection, stream: StreamId) -> bool {
     stream.dir() == quinn_proto::Dir::Bi || stream.initiator() == connection.side()
 }
 
+/// A stream has a local receive side when it is bidirectional or the peer
+/// initiated it (RFC 9000 2.1); mirrors VPP `quicly_stream_has_receive_side`
+/// guarding `quicly_request_stop` (quic_quicly.c:1253).
+#[inline]
+fn stream_has_receive_side(connection: &Connection, stream: StreamId) -> bool {
+    stream.dir() == quinn_proto::Dir::Bi || stream.initiator() != connection.side()
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum QuicConnectionError {
     TlsAlert { alert: u8 },
@@ -1269,6 +1277,86 @@ impl QuicWorker {
             .send_stream(stream_id)
             .reset(error_code)
             .map_err(|source| QuicWorkerError::StreamReset {
+                context,
+                stream: stream_id,
+                source,
+            })?;
+        self.queue_connection_output(ContextId::from(parent))?;
+        Ok(())
+    }
+
+    /// Stops a stream Session's receive side with an application error code;
+    /// the transport half of the generic `SessionWorker::stop_sending`
+    /// dispatch, replacing the `transport_stop_sending_unsupported` stub.
+    /// Mirrors VPP `quic_quicly_on_app_reset` (quic_quicly.c:1253-1259),
+    /// where a stream that still has a receive side calls `quicly_request_stop`
+    /// with the application error code, transmitting a STOP_SENDING frame,
+    /// but only while the receive state transfer is not complete
+    /// (`!quicly_recvstate_transfer_complete`): a receive side whose peer
+    /// already finished sending (FIN and every byte received contiguously)
+    /// gets no request. The wire gate needs an explicit query because quinn's
+    /// `RecvStream::stop` only suppresses the frame after the application has
+    /// read the stream out of `Recv` state (`is_receiving`,
+    /// streams/recv.rs:244), which lags the wire condition: after the peer's
+    /// FIN and all bytes arrive but before the app reads, quinn would still
+    /// emit STOP_SENDING. The gate is the O(1) public
+    /// `RecvStream::receive_transfer_complete` query (streams/mod.rs:262),
+    /// the same `!quicly_recvstate_transfer_complete` condition VPP applies.
+    /// The Session Worker's `stop_sending` guard (runtime.rs:1696) admits
+    /// only an Active stream and half-close never changes Session state, so
+    /// unlike `reset_stream` this action records no AppClosed and repeated
+    /// dispatches keep reaching the transport. Resolution is O(1):
+    /// `session_context` derives the worker-local context index from the
+    /// Session entry, the stream context pins the exact quinn stream on the
+    /// parent connection, and only then is that receive stream stopped and
+    /// the connection scheduled for output so the STOP_SENDING frame
+    /// transmits. Every validation precedes the quinn call, so a rejection
+    /// never mutates transport state.
+    pub(super) fn stop_sending(
+        &mut self,
+        sessions: &mut SessionWorker<Index>,
+        session: SessionId,
+        code: SessionApplicationErrorCode,
+    ) -> RuntimeResult<()> {
+        let context = self.session_context(sessions, session)?;
+        let (stream_id, parent, engine_closed) = self
+            .contexts
+            .get(context.into())
+            .and_then(Context::stream_ref)
+            .map(|stream| {
+                (
+                    stream.stream,
+                    stream.parent,
+                    stream.flags & STREAM_ENGINE_CLOSED != 0,
+                )
+            })
+            .ok_or(QuicWorkerError::SessionNotStream { session })?;
+        if engine_closed {
+            return Err(QuicWorkerError::StreamMissing { stream: stream_id }.into());
+        }
+        let error_code = Self::app_error_code_varint(session, code)?;
+        let connection = self
+            .contexts
+            .get_mut(parent)
+            .and_then(Context::connection_mut)
+            .ok_or_else(|| QuicWorkerError::ContextMissing {
+                context: ContextId::from(parent),
+            })?
+            .engine
+            .as_mut()
+            .ok_or_else(|| QuicWorkerError::EngineMissing {
+                context: ContextId::from(parent),
+            })?
+            .connection_mut()?;
+        if !stream_has_receive_side(connection, stream_id) {
+            return Err(QuicWorkerError::StreamReceiveSideMissing { stream: stream_id }.into());
+        }
+        let mut recv = connection.recv_stream(stream_id);
+        if recv.receive_transfer_complete() {
+            return Ok(());
+        }
+        recv.stop(error_code)
+            .map_err(|source| QuicWorkerError::StreamStop {
                 context,
                 stream: stream_id,
                 source,
@@ -3153,18 +3241,18 @@ pub(crate) fn quic_transport_open_stream(
 /// (session.c:1422, transport.c:500-505).
 ///
 /// Temporary constraint: `SessionTransportWorkerActions::new` requires all
-/// four fn pointers, but this slice implements only `open_stream` and
-/// `reset_stream` — nothing in the QUIC worker invokes
-/// `SessionWorker::stop_sending` or `close_connection` yet, so dispatch of
-/// those two slots is unreachable. Each slot therefore holds a minimal typed
-/// stub that returns an explicit `TransportActionUnsupported` error with
-/// zero side effects; replace each stub with the real action in the
-/// sub-seam that introduces its dispatch.
+/// four fn pointers, but this slice implements only `open_stream`,
+/// `reset_stream`, and `stop_sending` — nothing in the QUIC worker invokes
+/// `SessionWorker::close_connection` yet, so dispatch of that slot is
+/// unreachable. The slot therefore holds a minimal typed stub that returns an
+/// explicit `TransportActionUnsupported` error with zero side effects;
+/// replace it with the real action in the sub-seam that introduces its
+/// dispatch.
 pub(crate) fn quic_transport_actions() -> SessionTransportWorkerActions<Index> {
     SessionTransportWorkerActions::new(
         quic_transport_open_stream,
         quic_transport_reset_stream,
-        transport_stop_sending_unsupported,
+        quic_transport_stop_sending,
         transport_close_connection_unsupported,
     )
 }
@@ -3190,18 +3278,26 @@ pub(crate) fn quic_transport_reset_stream(
     })
 }
 
-/// Minimal typed stub for the unreachable `stop_sending` slot (see
-/// `quic_transport_actions`): explicit unsupported error, no side effects.
-fn transport_stop_sending_unsupported(
-    _sessions: &mut SessionWorker<Index>,
-    _session: SessionId,
-    _code: SessionApplicationErrorCode,
+/// Stops the receive side of one QUIC stream Session through the Session
+/// Worker's worker-local transport action table; the `stop_sending` callback
+/// installed by `quic_transport_actions`. Mirrors VPP resolving the transport
+/// VFT from `session_transport_half_close` (session.c:1637-1648) and the
+/// receive-side `quicly_request_stop` in `quic_quicly_on_app_reset`
+/// (quic_quicly.c:1253-1259): the Session Worker resolves the owning worker
+/// from its own `DataWorkerId` in O(1), and the QUIC Main comes from the same
+/// QUIC_MAIN channel the session queue entry points use. No scan, allocation,
+/// or lock on the dispatch path.
+pub(crate) fn quic_transport_stop_sending(
+    sessions: &mut SessionWorker<Index>,
+    session: SessionId,
+    code: SessionApplicationErrorCode,
 ) -> RuntimeResult<()> {
-    Err(RuntimeError::from(
-        QuicWorkerError::TransportActionUnsupported {
-            action: "stop_sending",
-        },
-    ))
+    let main = QUIC_MAIN
+        .get()
+        .ok_or(RuntimeError::PluginStateNotInitialized { plugin: "quic" })?;
+    main.with_worker_and_sessions(sessions, |sessions, quic| {
+        quic.stop_sending(sessions, session, code)
+    })
 }
 
 /// Minimal typed stub for the unreachable `close_connection` slot (see
@@ -3640,8 +3736,17 @@ pub(super) enum QuicWorkerError {
     SessionNotStream { session: SessionId },
     #[error("QUIC stream {stream:?} has no local send side to reset")]
     StreamSendSideMissing { stream: quinn_proto::StreamId },
+    #[error("QUIC stream {stream:?} has no local receive side to stop")]
+    StreamReceiveSideMissing { stream: quinn_proto::StreamId },
     #[error("QUIC stream {stream:?} reset failed for context {context:?}: {source}")]
     StreamReset {
+        context: ContextId,
+        stream: quinn_proto::StreamId,
+        #[source]
+        source: quinn_proto::ClosedStream,
+    },
+    #[error("QUIC stream {stream:?} stop failed for context {context:?}: {source}")]
+    StreamStop {
         context: ContextId,
         stream: quinn_proto::StreamId,
         #[source]
@@ -7211,6 +7316,30 @@ mod tests {
             .unwrap_or(false)
     }
 
+    /// Probes the quinn receive stream pinned by `stream`: true when it is
+    /// already stopped (a redundant `stop` returns `ClosedStream`, quinn
+    /// streams/recv.rs `Recv::stop`). Probing itself stops an untouched
+    /// stream, so it is only used as the final assertion on a stream.
+    fn stream_already_stopped(
+        worker: &mut QuicWorker,
+        parent: ContextId,
+        stream: quinn_proto::StreamId,
+    ) -> bool {
+        worker
+            .contexts
+            .get_mut(parent.into())
+            .and_then(Context::connection_mut)
+            .and_then(|connection| connection.engine.as_mut())
+            .and_then(|engine| engine.connection.as_mut())
+            .map(|connection| {
+                connection
+                    .recv_stream(stream)
+                    .stop(quinn_proto::VarInt::from_u32(0))
+                    .is_err()
+            })
+            .unwrap_or(false)
+    }
+
     #[test]
     fn reset_stream_resets_exact_stream_and_leaves_connection_untouched() -> RuntimeResult<()> {
         let (
@@ -7463,6 +7592,436 @@ mod tests {
                 .and_then(Context::stream_ref)
                 .is_some(),
             "the suppressed dispatch leaves the stream context untouched"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn stop_sending_stops_exact_recv_stream_and_leaves_others_untouched() -> RuntimeResult<()> {
+        let (
+            mut worker,
+            mut sessions,
+            applications,
+            _server,
+            parent_context,
+            parent,
+            bidi,
+            bidi_index,
+            bidi_id,
+        ) = test_established_stream()?;
+        let sibling = worker.open_stream(
+            &applications,
+            &mut sessions,
+            parent,
+            SessionStreamDirection::Bidi,
+            0x55,
+        )?;
+        let (_, sibling_index) = sessions
+            .session_transport(sibling)
+            .ok_or(QuicWorkerError::SessionMissing { session: sibling })?;
+        let sibling_id = worker
+            .contexts
+            .get(sibling_index)
+            .and_then(Context::stream_ref)
+            .ok_or(QuicWorkerError::ContextMissing {
+                context: ContextId::from(sibling_index),
+            })?
+            .stream;
+        let queued = worker.connection_tx_pending.len();
+
+        worker.stop_sending(&mut sessions, bidi, SessionApplicationErrorCode::from(42))?;
+
+        assert_eq!(
+            worker.connection_tx_pending.len(),
+            queued + 1,
+            "the STOP_SENDING frame queues the parent connection for output"
+        );
+        assert_eq!(
+            worker.connection_tx_pending.last(),
+            Some(&parent_context),
+            "the queued output is the parent connection of the stopped stream"
+        );
+        assert!(
+            stream_already_stopped(&mut worker, parent_context, bidi_id),
+            "the exact receive stream pinned by the Session is stopped at the quinn level"
+        );
+        assert!(
+            !stream_already_reset(&mut worker, parent_context, bidi_id),
+            "the send side of the stopped stream is untouched"
+        );
+        assert!(
+            !stream_already_stopped(&mut worker, parent_context, sibling_id),
+            "the sibling receive stream is untouched"
+        );
+        assert!(
+            sessions.session_transport(bidi).is_some(),
+            "the stream Session survives the stop"
+        );
+        assert!(
+            worker
+                .contexts
+                .get(bidi_index)
+                .and_then(Context::stream_ref)
+                .is_some(),
+            "the stream context survives the stop"
+        );
+        let state = worker
+            .contexts
+            .get(parent_context.into())
+            .and_then(Context::connection)
+            .map(|connection| connection.state)
+            .ok_or(QuicWorkerError::ContextMissing {
+                context: parent_context,
+            })?;
+        assert_eq!(
+            state,
+            ConnectionState::Established,
+            "the parent connection is untouched by the stream stop"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn stop_sending_skips_completed_receive_before_any_frame() -> RuntimeResult<()> {
+        let mut relay = peer_relay_established()?;
+        let stream = relay
+            .client_connection
+            .streams()
+            .open(quinn_proto::Dir::Bi)
+            .expect("open peer bidirectional stream");
+        relay
+            .client_connection
+            .send_stream(stream)
+            .write(&[0x5A; 3])
+            .expect("peer writes stream data");
+        relay
+            .client_connection
+            .send_stream(stream)
+            .finish()
+            .expect("finish peer stream data");
+        // The auto-accepted child Session appears on the worker once the
+        // peer's STREAM frame is processed; the FIN and every byte then sit
+        // unread in the recv buffer (transfer complete, still `Recv` state).
+        let child = loop {
+            let child = relay
+                .worker
+                .contexts
+                .get(relay.context.into())
+                .and_then(Context::connection)
+                .and_then(|connection| connection.engine.as_ref())
+                .and_then(|engine| engine.io_table.stream_session(stream));
+            if let Some(child) = child {
+                break child;
+            }
+            peer_relay_exchange(&mut relay)?;
+        };
+        assert!(
+            worker_connection_mut(&mut relay.worker.contexts, relay.context)?
+                .recv_stream(stream)
+                .receive_transfer_complete(),
+            "the peer FIN and every byte are fully received"
+        );
+        let queued = relay.worker.connection_tx_pending.len();
+        relay
+            .worker
+            .stop_sending(&mut relay.sessions, child, SessionApplicationErrorCode::from(42))?;
+        assert_eq!(
+            relay.worker.connection_tx_pending.len(),
+            queued,
+            "a completed receive side queues no STOP_SENDING output"
+        );
+        assert!(
+            worker_connection_mut(&mut relay.worker.contexts, relay.context)?
+                .recv_stream(stream)
+                .received_reset()
+                .is_ok(),
+            "the completed receive stream is not stopped"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn stop_sending_rejects_out_of_range_code_before_any_side_effect() -> RuntimeResult<()> {
+        let (
+            mut worker,
+            mut sessions,
+            applications,
+            _server,
+            parent_context,
+            parent,
+            bidi,
+            _,
+            bidi_id,
+        ) = test_established_stream()?;
+        let queued = worker.connection_tx_pending.len();
+        let error = worker
+            .stop_sending(
+                &mut sessions,
+                bidi,
+                SessionApplicationErrorCode::from(1u64 << 62),
+            )
+            .expect_err("code beyond the varint range is rejected");
+        assert!(
+            matches!(
+                &error,
+                RuntimeError::Subsystem { source, .. }
+                    if matches!(
+                        source.downcast_ref::<QuicWorkerError>(),
+                        Some(QuicWorkerError::ApplicationErrorCodeInvalid { session, .. })
+                            if session == &bidi
+                    )
+            ),
+            "typed ApplicationErrorCodeInvalid expected, got {error:?}"
+        );
+        assert_eq!(
+            worker.connection_tx_pending.len(),
+            queued,
+            "the rejected code performed no transport side effect"
+        );
+        assert!(
+            !stream_already_stopped(&mut worker, parent_context, bidi_id),
+            "the receive stream is untouched by the rejected code"
+        );
+        // The probe above stopped the pinned stream, so a valid code is
+        // proven on a fresh sibling stream.
+        let after = worker.open_stream(
+            &applications,
+            &mut sessions,
+            parent,
+            SessionStreamDirection::Bidi,
+            0xB1D2,
+        )?;
+        worker.stop_sending(&mut sessions, after, SessionApplicationErrorCode::from(0))?;
+        Ok(())
+    }
+
+    #[test]
+    fn stop_sending_rejects_engine_closed_stream_before_side_effects() -> RuntimeResult<()> {
+        let (mut worker, mut sessions, _, _server, parent_context, _, bidi, bidi_index, bidi_id) =
+            test_established_stream()?;
+        worker
+            .contexts
+            .get_mut(bidi_index)
+            .and_then(Context::stream_mut)
+            .expect("stream context")
+            .flags |= STREAM_ENGINE_CLOSED;
+        let queued = worker.connection_tx_pending.len();
+        let error = worker
+            .stop_sending(&mut sessions, bidi, SessionApplicationErrorCode::from(0))
+            .expect_err("an engine-closed stream is stale");
+        assert!(
+            matches!(
+                &error,
+                RuntimeError::Subsystem { source, .. }
+                    if matches!(
+                        source.downcast_ref::<QuicWorkerError>(),
+                        Some(QuicWorkerError::StreamMissing { stream }) if stream == &bidi_id
+                    )
+            ),
+            "typed StreamMissing expected, got {error:?}"
+        );
+        assert_eq!(
+            worker.connection_tx_pending.len(),
+            queued,
+            "the stale rejection performed no transport side effect"
+        );
+        assert!(
+            !stream_already_stopped(&mut worker, parent_context, bidi_id),
+            "the stale rejection performed no transport side effect"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn stop_sending_rejects_uni_send_only_stream_before_side_effects() -> RuntimeResult<()> {
+        let (mut worker, mut sessions, applications, _server, parent_context, parent, _, _, _) =
+            test_established_stream()?;
+        let uni = worker.open_stream(
+            &applications,
+            &mut sessions,
+            parent,
+            SessionStreamDirection::Uni,
+            0x11,
+        )?;
+        let (_, uni_index) = sessions
+            .session_transport(uni)
+            .ok_or(QuicWorkerError::SessionMissing { session: uni })?;
+        let uni_id = worker
+            .contexts
+            .get(uni_index)
+            .and_then(Context::stream_ref)
+            .ok_or(QuicWorkerError::ContextMissing {
+                context: ContextId::from(uni_index),
+            })?
+            .stream;
+        let queued = worker.connection_tx_pending.len();
+        let error = worker
+            .stop_sending(&mut sessions, uni, SessionApplicationErrorCode::from(0))
+            .expect_err("a client-initiated uni stream has no receive side");
+        assert!(
+            matches!(
+                &error,
+                RuntimeError::Subsystem { source, .. }
+                    if matches!(
+                        source.downcast_ref::<QuicWorkerError>(),
+                        Some(QuicWorkerError::StreamReceiveSideMissing { stream })
+                            if stream == &uni_id
+                    )
+            ),
+            "typed StreamReceiveSideMissing expected, got {error:?}"
+        );
+        assert_eq!(
+            worker.connection_tx_pending.len(),
+            queued,
+            "the rejected stream performed no transport side effect"
+        );
+        assert!(
+            worker
+                .contexts
+                .get(parent_context.into())
+                .and_then(Context::connection)
+                .is_some(),
+            "the connection context is untouched"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn stop_sending_rejects_connection_session_without_side_effects() -> RuntimeResult<()> {
+        let (mut worker, mut sessions, _, session, context, _) = test_quic_session()?;
+        let error = worker
+            .stop_sending(&mut sessions, session, SessionApplicationErrorCode::from(0))
+            .expect_err("a connection Session is not a stream");
+        assert!(
+            matches!(
+                &error,
+                RuntimeError::Subsystem { source, .. }
+                    if matches!(
+                        source.downcast_ref::<QuicWorkerError>(),
+                        Some(QuicWorkerError::SessionNotStream { session: rejected })
+                            if rejected == &session
+                    )
+            ),
+            "typed SessionNotStream expected, got {error:?}"
+        );
+        assert!(
+            worker
+                .contexts
+                .get(context.into())
+                .and_then(Context::connection)
+                .is_some(),
+            "the connection context is untouched"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn stop_sending_rejects_missing_session() -> RuntimeResult<()> {
+        let (mut worker, mut sessions, _, _, _, _) = test_quic_session()?;
+        let missing = SessionId::from_raw(0xDEAD);
+        assert!(matches!(
+            worker.stop_sending(&mut sessions, missing, SessionApplicationErrorCode::from(0)),
+            Err(RuntimeError::Subsystem { source, .. })
+                if matches!(source.downcast_ref::<QuicWorkerError>(), Some(QuicWorkerError::SessionMissing { .. }))
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn stop_sending_rejects_foreign_transport_session() -> RuntimeResult<()> {
+        let mut worker = QuicWorker::new(DataWorkerId::new(0));
+        let (mut sessions, foreign) = test_lower_session()?;
+        assert!(matches!(
+            worker.stop_sending(&mut sessions, foreign, SessionApplicationErrorCode::from(0)),
+            Err(RuntimeError::Subsystem { source, .. })
+                if matches!(source.downcast_ref::<QuicWorkerError>(), Some(QuicWorkerError::SessionNotQuic { .. }))
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn stop_sending_repeated_active_call_follows_quinn_semantics() -> RuntimeResult<()> {
+        let (mut worker, mut sessions, _, _server, parent_context, _, bidi, _, bidi_id) =
+            test_established_stream()?;
+        worker.stop_sending(&mut sessions, bidi, SessionApplicationErrorCode::from(9))?;
+        let queued = worker.connection_tx_pending.len();
+        let error = worker
+            .stop_sending(&mut sessions, bidi, SessionApplicationErrorCode::from(9))
+            .expect_err("a second stop on the same receive stream is ClosedStream");
+        assert!(
+            matches!(
+                &error,
+                RuntimeError::Subsystem { source, .. }
+                    if matches!(
+                        source.downcast_ref::<QuicWorkerError>(),
+                        Some(QuicWorkerError::StreamStop { stream, .. })
+                            if stream == &bidi_id
+                    )
+            ),
+            "typed StreamStop expected, got {error:?}"
+        );
+        assert_eq!(
+            worker.connection_tx_pending.len(),
+            queued,
+            "the repeated stop queues no additional output"
+        );
+        assert!(
+            stream_already_stopped(&mut worker, parent_context, bidi_id),
+            "the receive stream remains stopped"
+        );
+        assert!(
+            sessions.session_transport(bidi).is_some(),
+            "the stream Session stays active after the repeated stop"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn stop_sending_dispatch_reaches_transport_without_app_close() -> RuntimeResult<()> {
+        let (worker, mut sessions, _, _server, _, _, bidi, bidi_index, _) =
+            test_established_stream()?;
+        sessions.install_transport_actions(QuicWorker::ID, quic_transport_actions())?;
+        // Generic dispatch rejects a Session unknown to the Session Worker
+        // before any transport work (session.c:1675).
+        assert!(matches!(
+            sessions.stop_sending(
+                SessionId::from_raw(0xDEAD),
+                SessionApplicationErrorCode::from(0)
+            ),
+            Err(SessionTransportActionError::InvalidSession { .. })
+        ));
+        // A live stream dispatches through the Active-only guard to the QUIC
+        // action wrapper, which needs the process-global QUIC_MAIN worker
+        // channel that unit tests do not own, so it fails typed without
+        // touching any worker state.
+        assert!(matches!(
+            &sessions.stop_sending(bidi, SessionApplicationErrorCode::from(7)),
+            Err(SessionTransportActionError::TransportActionFailed { action, .. })
+                if *action == "stop_sending"
+        ));
+        assert!(
+            !sessions.session_app_closed(bidi),
+            "stop_sending is half-close: it never records AppClosed"
+        );
+        // Unlike reset, half-close leaves the Session Active, so repeated
+        // dispatch keeps reaching the transport instead of being suppressed
+        // by the AppClosed guard.
+        assert!(matches!(
+            &sessions.stop_sending(bidi, SessionApplicationErrorCode::from(7)),
+            Err(SessionTransportActionError::TransportActionFailed { action, .. })
+                if *action == "stop_sending"
+        ));
+        assert!(
+            !sessions.session_app_closed(bidi),
+            "repeated stop_sending still records no AppClosed"
+        );
+        assert!(
+            worker
+                .contexts
+                .get(bidi_index)
+                .and_then(Context::stream_ref)
+                .is_some(),
+            "the dispatch failure leaves the stream context untouched"
         );
         Ok(())
     }
