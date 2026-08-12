@@ -1101,7 +1101,11 @@ dependencies = [
 name = "hammer-plugin-http"
 version = "0.1.0"
 dependencies = [
+ "abi_stable",
  "bytes",
+ "hammer-component-macros",
+ "hammer-runtime",
+ "hammer-service",
 ]
 
 [[package]]
