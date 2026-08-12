@@ -1104,6 +1104,7 @@ dependencies = [
  "abi_stable",
  "bytes",
  "hammer-component-macros",
+ "hammer-infra",
  "hammer-runtime",
  "hammer-service",
 ]

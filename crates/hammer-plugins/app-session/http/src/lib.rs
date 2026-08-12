@@ -12,14 +12,16 @@
 //! bootstraps after QUIC/session init (VPP `http_transport_init`,
 //! http.c:1867-1903) and validates listener state; inner Application
 //! listener registration, QUIC listen publication, HTTP3 engine dispatch,
-//! FIFO transfer/publication, QPACK, and worker contexts are later slices;
-//! the Session App callback table stays empty until those slices own their
-//! lifecycle state.
+//! FIFO transfer/publication, QPACK, and the full worker lifecycle are later
+//! slices; `worker` owns only the per-data-worker connection-context pool
+//! primitive (VPP `http_worker_t::ctx_pool`). The Session App callback table
+//! stays empty until those slices own their lifecycle state.
 
 mod http3;
 mod http_app;
 mod http_common;
 mod listener;
+mod worker;
 
 #[cfg(test)]
 mod http_app_tests;
