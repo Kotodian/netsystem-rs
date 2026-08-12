@@ -425,6 +425,22 @@ pub(crate) enum HttpWorkerError {
         role: PeerUniStreamRole,
     },
     #[error(
+        "peer uni stream {stream:?} on connection context {context:?} is not the registered peer QPACK encoder/decoder stream (role {role:?})"
+    )]
+    PeerQpackStreamMismatch {
+        stream: StreamContextId,
+        context: ContextId,
+        role: PeerUniStreamRole,
+    },
+    #[error(
+        "peer uni stream {stream:?} on connection context {context:?} is not an Unknown drain-only stream (role {role:?})"
+    )]
+    PeerUnknownStreamMismatch {
+        stream: StreamContextId,
+        context: ContextId,
+        role: PeerUniStreamRole,
+    },
+    #[error(
         "peer control stream {stream:?} on connection context {context:?}: SETTINGS reader pool is full (capacity {capacity})"
     )]
     PeerControlReaderCapacityExhausted {
@@ -480,7 +496,8 @@ pub(crate) enum PeerControlOutcome {
     Complete { consumed: usize },
 }
 
-/// Errors from [`HttpWorker::process_peer_control_bytes`].
+/// Errors from [`HttpWorker::process_peer_control_bytes`] and
+/// [`HttpWorker::finish_peer_control_stream`].
 #[derive(Debug)]
 pub(crate) enum PeerControlError {
     /// The stream is not a live, registered peer control stream on a live
@@ -1076,6 +1093,184 @@ impl HttpWorker {
                 }
             }
         }
+        Ok(())
+    }
+
+    /// Accepts peer EOF on the registered peer control stream.
+    ///
+    /// Mirrors VPP `http3_transport_stream_close_callback` →
+    /// `http3_stream_close`: EOF on the peer control stream is accepted
+    /// silently both before and after SETTINGS. The peer control slot and
+    /// its SETTINGS reader are freed, and the stream context is released
+    /// directly; `peer_settings_pending` is left exactly as it is — an EOF
+    /// before SETTINGS keeps the expectation pending, and there is no
+    /// MISSING_SETTINGS error and no connection-close action here (the
+    /// caller owns any connection policy).
+    ///
+    /// Fails with `PeerControlError::Worker` for a stale stream identity, a
+    /// live non-Control stream, a missing parent, or a stream that is not
+    /// the parent's registered `peer_control`; every failure path mutates
+    /// nothing. O(1): two generation-checked lookups and a fixed number of
+    /// pool operations; no scan, recursion, allocation, or lock.
+    pub(crate) fn finish_peer_control_stream(
+        &mut self,
+        stream: StreamContextId,
+    ) -> Result<(), PeerControlError> {
+        let parent = {
+            let stream_context = self
+                .streams
+                .get(stream.into())
+                .ok_or(PeerControlError::Worker(HttpWorkerError::StreamMissing {
+                    stream,
+                }))?;
+            if stream_context.peer_role != PeerUniStreamRole::Control {
+                return Err(PeerControlError::Worker(
+                    HttpWorkerError::PeerControlStreamMismatch {
+                        stream,
+                        context: stream_context.parent,
+                        role: stream_context.peer_role,
+                    },
+                ));
+            }
+            stream_context.parent
+        };
+        let connection = self
+            .contexts
+            .get_mut(parent.into())
+            .ok_or(PeerControlError::Worker(HttpWorkerError::ParentContextMissing {
+                parent,
+            }))?;
+        if connection.peer_control != Some(stream) {
+            return Err(PeerControlError::Worker(
+                HttpWorkerError::PeerControlStreamMismatch {
+                    stream,
+                    context: parent,
+                    role: PeerUniStreamRole::Control,
+                },
+            ));
+        }
+        if let Some(reader) = connection.peer_control_reader.take() {
+            self.readers.remove(reader);
+        }
+        connection.peer_control = None;
+        self.streams
+            .remove(stream.into())
+            .ok_or(PeerControlError::Worker(HttpWorkerError::StreamMissing {
+                stream,
+            }))?;
+        Ok(())
+    }
+
+    /// Accepts peer EOF on a registered peer QPACK encoder or decoder stream.
+    ///
+    /// Mirrors VPP `http3_transport_stream_close_callback` → `http3_stream_close`:
+    /// plain EOF on either peer QPACK critical stream is silent and non-fatal.
+    /// `CLOSED_CRITICAL_STREAM` is raised for a RESET of a critical stream
+    /// only, never for EOF, so no error code is produced here; the matching
+    /// `peer_encoder` or `peer_decoder` slot is cleared and the stream context
+    /// is released directly, leaving the other QPACK slot, the control slot,
+    /// and the connection state unchanged. The role comes from the
+    /// generation-checked stream context, never from an untrusted caller
+    /// argument, and the corresponding slot must exactly equal this stream.
+    ///
+    /// Fails with `StreamMissing` for a stale stream identity, with
+    /// `PeerQpackStreamMismatch` (carrying the actual role) for a live stream
+    /// that is not a QPACK encoder or decoder, with `ParentContextMissing`
+    /// when the parent is gone, and with `PeerQpackStreamMismatch` when the
+    /// parent slot holds a different stream; every failure path mutates
+    /// nothing. O(1): two generation-checked lookups and a fixed number of
+    /// pool operations; no scan, recursion, allocation, or lock.
+    pub(crate) fn finish_peer_qpack_stream(
+        &mut self,
+        stream: StreamContextId,
+    ) -> Result<(), HttpWorkerError> {
+        let (parent, role) = {
+            let stream_context = self
+                .streams
+                .get(stream.into())
+                .ok_or(HttpWorkerError::StreamMissing { stream })?;
+            if !matches!(
+                stream_context.peer_role,
+                PeerUniStreamRole::QpackEncoder | PeerUniStreamRole::QpackDecoder
+            ) {
+                return Err(HttpWorkerError::PeerQpackStreamMismatch {
+                    stream,
+                    context: stream_context.parent,
+                    role: stream_context.peer_role,
+                });
+            }
+            (stream_context.parent, stream_context.peer_role)
+        };
+        let connection = self
+            .contexts
+            .get_mut(parent.into())
+            .ok_or(HttpWorkerError::ParentContextMissing { parent })?;
+        let slot = match role {
+            PeerUniStreamRole::QpackEncoder => &mut connection.peer_encoder,
+            PeerUniStreamRole::QpackDecoder => &mut connection.peer_decoder,
+            role => {
+                return Err(HttpWorkerError::PeerQpackStreamMismatch {
+                    stream,
+                    context: parent,
+                    role,
+                });
+            }
+        };
+        if *slot != Some(stream) {
+            return Err(HttpWorkerError::PeerQpackStreamMismatch {
+                stream,
+                context: parent,
+                role,
+            });
+        }
+        *slot = None;
+        self.streams
+            .remove(stream.into())
+            .ok_or(HttpWorkerError::StreamMissing { stream })?;
+        Ok(())
+    }
+
+    /// Accepts peer EOF on a registered peer Unknown (drain-only) uni stream.
+    ///
+    /// Mirrors VPP `http3_transport_stream_close_callback` → `http3_stream_close`:
+    /// plain EOF on a stream of an unknown type is silent and non-fatal, and
+    /// VPP's default arm never registers an `Unknown` slot
+    /// (http3.c:1723-1725), so only the stream context is released directly;
+    /// the peer control and QPACK slots, the SETTINGS reader, and the
+    /// connection state are all unchanged, and no error code is produced. The
+    /// role comes from the generation-checked stream context, never from an
+    /// untrusted caller argument.
+    ///
+    /// Fails with `StreamMissing` for a stale stream identity, with
+    /// `PeerUnknownStreamMismatch` (carrying the actual role) for a live
+    /// stream that is not `Unknown`, and with `ParentContextMissing` when the
+    /// parent connection context is gone; every failure path mutates nothing.
+    /// O(1): two generation-checked lookups and a fixed number of pool
+    /// operations; no scan, recursion, allocation, or lock.
+    pub(crate) fn finish_peer_unknown_stream(
+        &mut self,
+        stream: StreamContextId,
+    ) -> Result<(), HttpWorkerError> {
+        let parent = {
+            let stream_context = self
+                .streams
+                .get(stream.into())
+                .ok_or(HttpWorkerError::StreamMissing { stream })?;
+            if stream_context.peer_role != PeerUniStreamRole::Unknown {
+                return Err(HttpWorkerError::PeerUnknownStreamMismatch {
+                    stream,
+                    context: stream_context.parent,
+                    role: stream_context.peer_role,
+                });
+            }
+            stream_context.parent
+        };
+        self.contexts
+            .get(parent.into())
+            .ok_or(HttpWorkerError::ParentContextMissing { parent })?;
+        self.streams
+            .remove(stream.into())
+            .ok_or(HttpWorkerError::StreamMissing { stream })?;
         Ok(())
     }
 
@@ -2381,5 +2576,514 @@ mod tests {
             ),
             "unexpected error: {error:?}"
         );
+    }
+
+    #[test]
+    fn finish_peer_control_stream_before_settings_clears_slot_and_reader() {
+        let mut worker = HttpWorker::with_capacity(4);
+        let (parent, control) = peer_uni_pair(&mut worker);
+        worker
+            .register_peer_uni_stream(control, PeerUniStreamRole::Control)
+            .expect("register control stream");
+        assert_eq!(
+            worker
+                .process_peer_control_bytes(control, &[0x04])
+                .expect("no peer control error"),
+            PeerControlOutcome::Incomplete { consumed: 1 }
+        );
+        worker
+            .finish_peer_control_stream(control)
+            .expect("finish before SETTINGS succeeds");
+        let connection = worker.get(parent).expect("live connection");
+        assert_eq!(connection.peer_control, None, "peer control slot cleared");
+        assert!(
+            connection.peer_control_reader.is_none(),
+            "SETTINGS reader freed"
+        );
+        assert!(
+            connection.peer_settings_pending,
+            "expectation stays pending when EOF arrives before SETTINGS"
+        );
+        assert!(matches!(
+            worker.get_stream(control),
+            Err(HttpWorkerError::StreamMissing { stream: s }) if s == control
+        ));
+    }
+
+    #[test]
+    fn finish_peer_control_stream_after_settings_keeps_expectation_cleared() {
+        let mut worker = HttpWorker::with_capacity(4);
+        let (parent, control) = peer_uni_pair(&mut worker);
+        worker
+            .register_peer_uni_stream(control, PeerUniStreamRole::Control)
+            .expect("register control stream");
+        assert_eq!(
+            worker
+                .process_peer_control_bytes(control, &[0x04, 0x00])
+                .expect("no peer control error"),
+            PeerControlOutcome::Complete { consumed: 2 }
+        );
+        assert!(
+            !worker.get(parent).expect("live connection").peer_settings_pending,
+            "SETTINGS already complete"
+        );
+        worker
+            .finish_peer_control_stream(control)
+            .expect("finish after SETTINGS succeeds");
+        let connection = worker.get(parent).expect("live connection");
+        assert_eq!(connection.peer_control, None, "peer control slot cleared");
+        assert!(
+            connection.peer_control_reader.is_none(),
+            "SETTINGS reader freed"
+        );
+        assert!(
+            !connection.peer_settings_pending,
+            "the cleared expectation is left cleared"
+        );
+    }
+
+    #[test]
+    fn finish_peer_control_stream_without_any_bytes_frees_no_reader() {
+        let mut worker = HttpWorker::with_capacity(4);
+        let (parent, control) = peer_uni_pair(&mut worker);
+        worker
+            .register_peer_uni_stream(control, PeerUniStreamRole::Control)
+            .expect("register control stream");
+        worker
+            .finish_peer_control_stream(control)
+            .expect("finish on immediate EOF succeeds");
+        let connection = worker.get(parent).expect("live connection");
+        assert_eq!(connection.peer_control, None, "peer control slot cleared");
+        assert!(
+            connection.peer_control_reader.is_none(),
+            "no reader was ever allocated"
+        );
+        assert!(connection.peer_settings_pending, "expectation still pending");
+    }
+
+    #[test]
+    fn finish_stale_or_non_control_stream_changes_nothing() {
+        let mut worker = HttpWorker::with_capacity(4);
+        let (parent, control) = peer_uni_pair(&mut worker);
+        worker
+            .register_peer_uni_stream(control, PeerUniStreamRole::Control)
+            .expect("register control stream");
+        // A stale identity fails the liveness lookup before any state change.
+        worker.remove_stream(control).expect("remove control stream");
+        assert!(matches!(
+            worker.finish_peer_control_stream(control),
+            Err(PeerControlError::Worker(HttpWorkerError::StreamMissing { stream: s })) if s == control
+        ));
+        // A live non-control stream is a typed mismatch that changes nothing.
+        let drain = peer_stream(&mut worker, parent);
+        worker
+            .register_peer_uni_stream(drain, PeerUniStreamRole::QpackEncoder)
+            .expect("register encoder stream");
+        let error = worker
+            .finish_peer_control_stream(drain)
+            .expect_err("not a control stream");
+        assert!(
+            matches!(
+                error,
+                PeerControlError::Worker(HttpWorkerError::PeerControlStreamMismatch {
+                    stream,
+                    context,
+                    role: PeerUniStreamRole::QpackEncoder,
+                }) if stream == drain && context == parent
+            ),
+            "unexpected error: {error:?}"
+        );
+        let connection = worker.get(parent).expect("live connection");
+        assert_eq!(connection.peer_encoder, Some(drain), "encoder slot untouched");
+        assert_eq!(
+            worker.get_stream(drain).expect("live stream").peer_role,
+            PeerUniStreamRole::QpackEncoder,
+            "stream role untouched"
+        );
+    }
+
+    #[test]
+    fn finish_control_stream_mismatched_to_the_registered_slot_changes_nothing() {
+        let mut worker = HttpWorker::with_capacity(4);
+        let (parent, control) = peer_uni_pair(&mut worker);
+        worker
+            .register_peer_uni_stream(control, PeerUniStreamRole::Control)
+            .expect("register control stream");
+        assert_eq!(
+            worker
+                .process_peer_control_bytes(control, &[0x04])
+                .expect("no peer control error"),
+            PeerControlOutcome::Incomplete { consumed: 1 }
+        );
+        // Fabricate the otherwise unreachable invariant break: the parent's
+        // peer control slot points at a different live stream.
+        let other = peer_stream(&mut worker, parent);
+        worker
+            .contexts
+            .get_mut(parent.into())
+            .expect("live parent")
+            .peer_control = Some(other);
+        let error = worker
+            .finish_peer_control_stream(control)
+            .expect_err("slot mismatch");
+        assert!(
+            matches!(
+                error,
+                PeerControlError::Worker(HttpWorkerError::PeerControlStreamMismatch {
+                    stream,
+                    context,
+                    role: PeerUniStreamRole::Control,
+                }) if stream == control && context == parent
+            ),
+            "unexpected error: {error:?}"
+        );
+        let connection = worker.get(parent).expect("live connection");
+        assert_eq!(connection.peer_control, Some(other), "slot untouched");
+        assert!(
+            connection.peer_control_reader.is_some(),
+            "reader slot untouched"
+        );
+        assert_eq!(
+            worker.get_stream(control).expect("live stream").peer_role,
+            PeerUniStreamRole::Control,
+            "stream role untouched"
+        );
+    }
+
+    #[test]
+    fn finish_then_re_registered_control_stream_still_requires_settings() {
+        let mut worker = HttpWorker::with_capacity(4);
+        let (parent, first) = peer_uni_pair(&mut worker);
+        worker
+            .register_peer_uni_stream(first, PeerUniStreamRole::Control)
+            .expect("register first control stream");
+        assert_eq!(
+            worker
+                .process_peer_control_bytes(first, &[0x04])
+                .expect("no peer control error"),
+            PeerControlOutcome::Incomplete { consumed: 1 }
+        );
+        worker
+            .finish_peer_control_stream(first)
+            .expect("finish first control stream");
+        let second = peer_stream(&mut worker, parent);
+        worker
+            .register_peer_uni_stream(second, PeerUniStreamRole::Control)
+            .expect("re-register a fresh control stream");
+        let connection = worker.get(parent).expect("live connection");
+        assert_eq!(connection.peer_control, Some(second), "fresh slot registered");
+        assert!(
+            connection.peer_control_reader.is_none(),
+            "fresh reader on next feed"
+        );
+        assert!(
+            connection.peer_settings_pending,
+            "a re-registered control stream still must deliver SETTINGS"
+        );
+        assert_eq!(
+            worker
+                .process_peer_control_bytes(second, &[0x04])
+                .expect("no peer control error"),
+            PeerControlOutcome::Incomplete { consumed: 1 },
+            "the reused reader slot starts fresh, without the old reader's state"
+        );
+        assert_eq!(
+            worker
+                .process_peer_control_bytes(second, &[0x00])
+                .expect("no peer control error"),
+            PeerControlOutcome::Complete { consumed: 1 }
+        );
+        assert!(
+            !worker.get(parent).expect("live connection").peer_settings_pending,
+            "the fresh control stream's SETTINGS clears the expectation"
+        );
+    }
+
+    #[test]
+    fn finish_peer_encoder_stream_clears_slot_and_removes_stream() {
+        let mut worker = HttpWorker::with_capacity(4);
+        let (parent, encoder) = peer_uni_pair(&mut worker);
+        worker
+            .register_peer_uni_stream(encoder, PeerUniStreamRole::QpackEncoder)
+            .expect("register encoder stream");
+        worker
+            .finish_peer_qpack_stream(encoder)
+            .expect("finish encoder stream");
+        let connection = worker.get(parent).expect("live connection");
+        assert_eq!(connection.peer_encoder, None, "encoder slot cleared");
+        assert_eq!(connection.peer_decoder, None, "decoder slot untouched");
+        assert_eq!(connection.peer_control, None, "control slot untouched");
+        assert!(matches!(
+            worker.get_stream(encoder),
+            Err(HttpWorkerError::StreamMissing { stream: s }) if s == encoder
+        ));
+    }
+
+    #[test]
+    fn finish_peer_decoder_stream_clears_slot_and_removes_stream() {
+        let mut worker = HttpWorker::with_capacity(4);
+        let (parent, decoder) = peer_uni_pair(&mut worker);
+        worker
+            .register_peer_uni_stream(decoder, PeerUniStreamRole::QpackDecoder)
+            .expect("register decoder stream");
+        worker
+            .finish_peer_qpack_stream(decoder)
+            .expect("finish decoder stream");
+        let connection = worker.get(parent).expect("live connection");
+        assert_eq!(connection.peer_decoder, None, "decoder slot cleared");
+        assert_eq!(connection.peer_encoder, None, "encoder slot untouched");
+        assert!(matches!(
+            worker.get_stream(decoder),
+            Err(HttpWorkerError::StreamMissing { stream: s }) if s == decoder
+        ));
+    }
+
+    #[test]
+    fn finish_peer_encoder_stream_leaves_decoder_slot_untouched() {
+        let mut worker = HttpWorker::with_capacity(4);
+        let (parent, encoder) = peer_uni_pair(&mut worker);
+        let decoder = peer_stream(&mut worker, parent);
+        worker
+            .register_peer_uni_stream(encoder, PeerUniStreamRole::QpackEncoder)
+            .expect("register encoder stream");
+        worker
+            .register_peer_uni_stream(decoder, PeerUniStreamRole::QpackDecoder)
+            .expect("register decoder stream");
+        worker
+            .finish_peer_qpack_stream(encoder)
+            .expect("finish encoder stream");
+        let connection = worker.get(parent).expect("live connection");
+        assert_eq!(connection.peer_encoder, None, "encoder slot cleared");
+        assert_eq!(
+            connection.peer_decoder,
+            Some(decoder),
+            "decoder slot keeps its stream"
+        );
+        assert!(matches!(
+            worker.get_stream(encoder),
+            Err(HttpWorkerError::StreamMissing { stream: s }) if s == encoder
+        ));
+        assert_eq!(
+            worker.get_stream(decoder).expect("live decoder").peer_role,
+            PeerUniStreamRole::QpackDecoder,
+            "decoder stream untouched"
+        );
+    }
+
+    #[test]
+    fn finish_peer_qpack_stream_slot_mismatch_changes_nothing() {
+        let mut worker = HttpWorker::with_capacity(4);
+        let (parent, encoder) = peer_uni_pair(&mut worker);
+        worker
+            .register_peer_uni_stream(encoder, PeerUniStreamRole::QpackEncoder)
+            .expect("register encoder stream");
+        // Fabricate the otherwise unreachable invariant break: the parent's
+        // peer encoder slot points at a different live stream.
+        let other = peer_stream(&mut worker, parent);
+        worker
+            .contexts
+            .get_mut(parent.into())
+            .expect("live parent")
+            .peer_encoder = Some(other);
+        let error = worker
+            .finish_peer_qpack_stream(encoder)
+            .expect_err("slot mismatch");
+        assert!(
+            matches!(
+                error,
+                HttpWorkerError::PeerQpackStreamMismatch {
+                    stream,
+                    context,
+                    role: PeerUniStreamRole::QpackEncoder,
+                } if stream == encoder && context == parent
+            ),
+            "unexpected error: {error:?}"
+        );
+        let connection = worker.get(parent).expect("live connection");
+        assert_eq!(
+            connection.peer_encoder,
+            Some(other),
+            "encoder slot untouched"
+        );
+        assert_eq!(
+            worker.get_stream(encoder).expect("live stream").peer_role,
+            PeerUniStreamRole::QpackEncoder,
+            "stream role untouched"
+        );
+    }
+
+    #[test]
+    fn finish_stale_or_non_qpack_stream_changes_nothing() {
+        let mut worker = HttpWorker::with_capacity(4);
+        let (parent, control) = peer_uni_pair(&mut worker);
+        worker
+            .register_peer_uni_stream(control, PeerUniStreamRole::Control)
+            .expect("register control stream");
+        // A stale identity fails the liveness lookup before any state change.
+        worker.remove_stream(control).expect("remove control stream");
+        assert!(matches!(
+            worker.finish_peer_qpack_stream(control),
+            Err(HttpWorkerError::StreamMissing { stream: s }) if s == control
+        ));
+        // A live non-QPACK stream is a typed mismatch that changes nothing;
+        // use a fresh parent so the removed stream's stale control slot does
+        // not interfere.
+        let other_parent = worker.allocate(session(1, 1)).expect("allocate parent");
+        let control = peer_stream(&mut worker, other_parent);
+        worker
+            .register_peer_uni_stream(control, PeerUniStreamRole::Control)
+            .expect("register a control stream");
+        let error = worker
+            .finish_peer_qpack_stream(control)
+            .expect_err("not a QPACK stream");
+        assert!(
+            matches!(
+                error,
+                HttpWorkerError::PeerQpackStreamMismatch {
+                    stream,
+                    context,
+                    role: PeerUniStreamRole::Control,
+                } if stream == control && context == other_parent
+            ),
+            "unexpected error: {error:?}"
+        );
+        let connection = worker.get(other_parent).expect("live connection");
+        assert_eq!(
+            connection.peer_control,
+            Some(control),
+            "control slot untouched"
+        );
+        assert_eq!(
+            worker.get_stream(control).expect("live stream").peer_role,
+            PeerUniStreamRole::Control,
+            "stream role untouched"
+        );
+    }
+
+    #[test]
+    fn finish_peer_unknown_stream_removes_stream_and_preserves_slots() {
+        let mut worker = HttpWorker::with_capacity(4);
+        let (parent, control) = peer_uni_pair(&mut worker);
+        let encoder = peer_stream(&mut worker, parent);
+        let unknown = peer_stream(&mut worker, parent);
+        worker
+            .register_peer_uni_stream(control, PeerUniStreamRole::Control)
+            .expect("register control stream");
+        worker
+            .register_peer_uni_stream(encoder, PeerUniStreamRole::QpackEncoder)
+            .expect("register encoder stream");
+        worker
+            .register_peer_uni_stream(unknown, PeerUniStreamRole::Unknown)
+            .expect("register unknown stream");
+        worker
+            .finish_peer_unknown_stream(unknown)
+            .expect("finish unknown stream");
+        let connection = worker.get(parent).expect("live connection");
+        assert_eq!(
+            connection.peer_control,
+            Some(control),
+            "control slot untouched"
+        );
+        assert_eq!(
+            connection.peer_encoder,
+            Some(encoder),
+            "encoder slot untouched"
+        );
+        assert_eq!(connection.peer_decoder, None, "decoder slot untouched");
+        assert!(matches!(
+            worker.get_stream(unknown),
+            Err(HttpWorkerError::StreamMissing { stream: s }) if s == unknown
+        ));
+        assert_eq!(
+            worker.get_stream(control).expect("live control").peer_role,
+            PeerUniStreamRole::Control,
+            "control stream untouched"
+        );
+    }
+
+    #[test]
+    fn finish_stale_unknown_stream_changes_nothing() {
+        let mut worker = HttpWorker::with_capacity(4);
+        let (parent, unknown) = peer_uni_pair(&mut worker);
+        worker
+            .register_peer_uni_stream(unknown, PeerUniStreamRole::Unknown)
+            .expect("register unknown stream");
+        worker.remove_stream(unknown).expect("remove unknown stream");
+        assert!(matches!(
+            worker.finish_peer_unknown_stream(unknown),
+            Err(HttpWorkerError::StreamMissing { stream: s }) if s == unknown
+        ));
+        let connection = worker.get(parent).expect("live connection");
+        assert_eq!(connection.peer_control, None, "control slot untouched");
+        assert_eq!(connection.peer_encoder, None, "encoder slot untouched");
+        assert_eq!(connection.peer_decoder, None, "decoder slot untouched");
+    }
+
+    #[test]
+    fn finish_live_non_unknown_stream_is_typed_mismatch_and_changes_nothing() {
+        let mut worker = HttpWorker::with_capacity(4);
+        let (parent, control) = peer_uni_pair(&mut worker);
+        worker
+            .register_peer_uni_stream(control, PeerUniStreamRole::Control)
+            .expect("register control stream");
+        let error = worker
+            .finish_peer_unknown_stream(control)
+            .expect_err("not an unknown stream");
+        assert!(
+            matches!(
+                error,
+                HttpWorkerError::PeerUnknownStreamMismatch {
+                    stream,
+                    context,
+                    role: PeerUniStreamRole::Control,
+                } if stream == control && context == parent
+            ),
+            "unexpected error: {error:?}"
+        );
+        let connection = worker.get(parent).expect("live connection");
+        assert_eq!(
+            connection.peer_control,
+            Some(control),
+            "control slot untouched"
+        );
+        assert_eq!(
+            worker.get_stream(control).expect("live stream").peer_role,
+            PeerUniStreamRole::Control,
+            "stream role untouched"
+        );
+    }
+
+    #[test]
+    fn finish_then_re_registered_unknown_stream_finishes_again() {
+        let mut worker = HttpWorker::with_capacity(4);
+        let parent = worker.allocate(session(1, 1)).expect("allocate parent");
+        let first = peer_stream(&mut worker, parent);
+        worker
+            .register_peer_uni_stream(first, PeerUniStreamRole::Unknown)
+            .expect("register first unknown stream");
+        worker
+            .finish_peer_unknown_stream(first)
+            .expect("finish first unknown stream");
+        assert!(matches!(
+            worker.get_stream(first),
+            Err(HttpWorkerError::StreamMissing { stream: s }) if s == first
+        ));
+        // Unknown owns no connection slot, so a fresh Unknown stream on the
+        // same connection registers and finishes without touching any slot.
+        let second = peer_stream(&mut worker, parent);
+        worker
+            .register_peer_uni_stream(second, PeerUniStreamRole::Unknown)
+            .expect("register second unknown stream");
+        worker
+            .finish_peer_unknown_stream(second)
+            .expect("finish second unknown stream");
+        let connection = worker.get(parent).expect("live connection");
+        assert_eq!(connection.peer_control, None, "no control slot created");
+        assert_eq!(connection.peer_encoder, None, "no encoder slot created");
+        assert_eq!(connection.peer_decoder, None, "no decoder slot created");
+        assert!(matches!(
+            worker.get_stream(second),
+            Err(HttpWorkerError::StreamMissing { stream: s }) if s == second
+        ));
     }
 }
