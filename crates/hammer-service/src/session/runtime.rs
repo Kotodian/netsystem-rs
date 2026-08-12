@@ -358,6 +358,7 @@ struct SessionEntry<Index> {
     listener: Option<SessionHandle>,
     flags: SessionFlags,
     lower_session: Option<SessionId>,
+    parent_session: Option<SessionId>,
     rx_fifo: Arc<Fifo>,
     tx_fifo: Arc<Fifo>,
     schedule_pending: bool,
@@ -386,6 +387,7 @@ impl<Index: Copy + Eq> SessionEntry<Index> {
             listener: None,
             flags: SessionFlags::empty(),
             lower_session: None,
+            parent_session: None,
             rx_fifo,
             tx_fifo,
             schedule_pending: false,
@@ -407,6 +409,7 @@ impl<Index: Copy + Eq> SessionEntry<Index> {
             listener: None,
             flags: SessionFlags::empty(),
             lower_session: None,
+            parent_session: None,
             rx_fifo,
             tx_fifo,
             schedule_pending: false,
@@ -2151,6 +2154,36 @@ impl<Index: Copy + Eq> SessionWorker<Index> {
     #[inline]
     pub fn has_session(&self, session_id: SessionId) -> bool {
         self.entries.contains_key(session_id.pool_index())
+    }
+
+    /// Transport parent of a stream Session (VPP `sep_ext.parent_handle`,
+    /// session_types.h:109, wired by `http_connect_transport_stream`).
+    /// Parent topology is metadata distinct from `lower_session` protocol
+    /// attachment and never drives upper/lower cleanup.
+    #[inline]
+    pub(crate) fn parent_session(&self, session_id: SessionId) -> Option<SessionId> {
+        self.entries
+            .get(session_id.pool_index())
+            .and_then(|entry| entry.parent_session)
+    }
+
+    /// Records the transport parent of a stream Session. Mirrors VPP
+    /// `session_alloc_for_stream` (session.c:507-523) rejecting a child
+    /// whose parent handle is invalid. O(1).
+    #[inline]
+    pub(crate) fn set_parent_session(
+        &mut self,
+        session_id: SessionId,
+        parent: SessionId,
+    ) -> RuntimeResult<()> {
+        if !self.entries.contains_key(parent.pool_index()) {
+            return Err(SessionError::ConnectStreamParentMissing.into());
+        }
+        self.entries
+            .get_mut(session_id.pool_index())
+            .ok_or(SessionError::SessionMissing { session_id })?
+            .parent_session = Some(parent);
+        Ok(())
     }
 
     #[inline]
@@ -6450,6 +6483,100 @@ mod tests {
             .expect("app close completes transport deletion");
         assert!(!sessions.has_session(upper));
     }
+
+    #[test]
+    fn parent_session_is_distinct_metadata_never_cascading_on_cleanup() {
+        let applications = ApplicationMain::new(4);
+        let application = applications.attach().expect("attach Application");
+        let mut sessions = SessionWorker::<Index>::new(
+            DataWorkerId::new(0),
+            1,
+            AppSessionConfig::default(),
+            DEFAULT_SESSION_POOL_CAPACITY,
+            applications,
+            None,
+        )
+        .expect("Session worker");
+        sessions
+            .install_application_mq_for_test(application)
+            .expect("install test Application MQ");
+        let parent = sessions
+            .construct_stream_sessions(
+                SessionTransportId::new(1),
+                Index::new(1, 1),
+                1,
+                application,
+                Some(hammer_runtime::app::SessionAppId::new(0)),
+                None,
+                None,
+                false,
+            )
+            .expect("construct parent transport Session");
+        let child = sessions
+            .construct_stream_sessions(
+                SessionTransportId::new(3),
+                Index::new(7, 1),
+                1,
+                application,
+                Some(hammer_runtime::app::SessionAppId::new(0)),
+                None,
+                None,
+                false,
+            )
+            .expect("construct child transport Session");
+
+        assert_eq!(sessions.parent_session(child), None);
+        sessions
+            .set_parent_session(child, parent)
+            .expect("set transport parent");
+        assert_eq!(sessions.parent_session(child), Some(parent));
+        assert_eq!(
+            sessions
+                .entries
+                .get(child.pool_index())
+                .and_then(|entry| entry.lower_session),
+            None,
+            "parent topology must not create lower attachment"
+        );
+
+        // VPP `session_alloc_for_stream` (session.c:507-523) rejects a child
+        // whose parent handle is invalid; the same constraint applies here.
+        let missing = SessionId::new(99);
+        let error = sessions
+            .set_parent_session(child, missing)
+            .expect_err("missing parent rejects stream Session parenting");
+        assert!(matches!(
+            &error,
+            RuntimeError::Subsystem { source, .. }
+                if matches!(
+                    source.downcast_ref::<SessionError>(),
+                    Some(SessionError::ConnectStreamParentMissing)
+                )
+        ));
+        assert_eq!(
+            sessions.parent_session(child),
+            Some(parent),
+            "failed parenting must not mutate child metadata"
+        );
+
+        // Removing the parent must not sweep a child that only carries
+        // parent topology: the upper/lower cascade keys on `lower_session`
+        // attachment, never on `parent_session`.
+        sessions
+            .remove_session(parent)
+            .expect("remove parent Session");
+        assert!(!sessions.has_session(parent));
+        assert!(sessions.has_session(child));
+
+        // The child removes as a top-level Session: parent topology neither
+        // suppresses its own cleanup nor cascades anywhere.
+        sessions
+            .remove_session(child)
+            .expect("remove child Session");
+        assert!(!sessions.has_session(child));
+        assert_eq!(sessions.entries.len(), 0);
+    }
+
     fn accepted_reply_fixture(
         application: hammer_runtime::app::ApplicationId,
         publisher: hammer_runtime::attach::AppSessionPublisher,
