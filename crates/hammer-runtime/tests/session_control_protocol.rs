@@ -42,6 +42,9 @@ fn transport_protocol_stable_values_and_names() {
     assert_eq!(TransportProtocol::Quic.name(), "quic");
     assert_eq!(TransportProtocol::Tls.name(), "tls");
     assert_eq!(TransportProtocol::Ct.name(), "ct");
+    assert_eq!(TransportProtocol::Dtls.name(), "dtls");
+    assert_eq!(TransportProtocol::Srtp.name(), "srtp");
+    assert_eq!(TransportProtocol::Http.name(), "http");
 
     assert_eq!(
         TransportProtocol::try_from("tcp"),
@@ -51,10 +54,18 @@ fn transport_protocol_stable_values_and_names() {
         TransportProtocol::try_from("quic"),
         Ok(TransportProtocol::Quic)
     );
+    assert_eq!(
+        TransportProtocol::try_from("http"),
+        Ok(TransportProtocol::Http)
+    );
     assert!(TransportProtocol::try_from("sctp").is_err());
     assert_eq!(
         TransportProtocol::try_from(4_u8),
         Ok(TransportProtocol::Quic)
+    );
+    assert_eq!(
+        TransportProtocol::try_from(7_u8),
+        Ok(TransportProtocol::Http)
     );
     assert!(TransportProtocol::try_from(8_u8).is_err());
 }
