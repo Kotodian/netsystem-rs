@@ -3,7 +3,7 @@
 use std::collections::VecDeque;
 use std::net::SocketAddr;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use bytes::Bytes;
@@ -2282,11 +2282,25 @@ impl QuicWorker {
             .get(parent)
             .and_then(Context::connection)
             .and_then(|connection| connection.connection_session);
-        // Peer-accepted children are external even when the lower Session
-        // carries an app identity.
-        let child_app = if accepted { None } else { app };
         // VPP `quic_quicly_on_stream_open` inherits the parent connection's
-        // app worker (`sctx->parent_app_wrk_id = qctx->parent_app_wrk_id`).
+        // app worker onto the accepted stream Session
+        // (`sctx->parent_app_wrk_id = qctx->parent_app_wrk_id`,
+        // `stream_session->app_wrk_index = sctx->parent_app_wrk_id`,
+        // quic_quicly.c:831-853): an accepted child inherits the parent
+        // Session's builtin app endpoint when it carries an app; app-less
+        // and external parents keep external children (unchanged).
+        let parent_endpoint =
+            parent_session.and_then(|parent| sessions.session_app_endpoint(parent));
+        let (child_application, child_app, child_opaque, child_server_name) = match parent_endpoint
+        {
+            Some((application, Some(app), opaque, server_name)) if accepted => (
+                application,
+                Some(app),
+                opaque,
+                server_name.map(str::to_owned),
+            ),
+            _ => (application, if accepted { None } else { app }, opaque, None),
+        };
         let allocation_owner = if let Some(parent_session) = parent_session {
             if let Some(owner) = sessions.session_allocation_owner(parent_session) {
                 owner
@@ -2321,10 +2335,10 @@ impl QuicWorker {
             QuicWorker::ID,
             stream_context,
             allocation_owner,
-            application,
+            child_application,
             child_app,
-            opaque,
-            None,
+            child_opaque,
+            child_server_name.as_deref(),
             accepted,
         ) {
             Ok(session_id) => session_id,
@@ -2360,11 +2374,22 @@ impl QuicWorker {
             let publication = sessions
                 .set_session_flags(session_id, flags)
                 .and_then(|()| sessions.pin_accepted_listener(session_id, listener))
-                .and_then(|()| sessions.publish_accepted_transport_session(session_id));
+                .and_then(|()| {
+                    if child_app.is_some() {
+                        // VPP `quic_quicly_on_stream_open` fires the accept
+                        // callback on the inherited app worker
+                        // (`app_worker_accept_notify`, quic_quicly.c:873); the
+                        // builtin child completes through the same
+                        // `complete_stream_connect` as locally-initiated
+                        // streams so the Session App accept callback fires.
+                        sessions.complete_stream_connect(session_id)
+                    } else {
+                        sessions.publish_accepted_transport_session(session_id)
+                    }
+                });
             if let Err(primary) = publication {
-                // publish_accepted_transport_session already removes the
-                // Session on publication failure, so roll back only a
-                // still-live child Session.
+                // Both publication paths already remove the Session on
+                // failure, so roll back only a still-live child Session.
                 let session_cleanup = if sessions.has_session(session_id) {
                     sessions.rollback_session_creation(session_id).err()
                 } else {
@@ -2383,9 +2408,12 @@ impl QuicWorker {
                 });
             }
         }
+        // Builtin and external Session FIFOs are owned by SessionEntry
+        // (`construct_app_transport_session` / `construct_external_...`);
+        // `fifo_pair` resolves both paths O(1) without AppSession lookup.
         let (rx_fifo, tx_fifo) = sessions
-            .app_session(session_id)
-            .map(|session| (Arc::clone(session.rx_fifo()), Arc::clone(session.tx_fifo())))
+            .fifo_pair(session_id)
+            .map(|(rx, tx)| (Arc::clone(rx), Arc::clone(tx)))
             .ok_or_else(|| QuicWorkerError::SessionMissing {
                 session: session_id,
             })?;
@@ -4122,12 +4150,21 @@ mod tests {
         application: ApplicationId,
         sessions: &mut SessionWorker<Index>,
     ) -> RuntimeResult<SessionListenerId> {
+        register_test_outer_listener_with_app(applications, application, sessions, None)
+    }
+
+    fn register_test_outer_listener_with_app(
+        applications: &Arc<hammer_service::session::ApplicationMain>,
+        application: ApplicationId,
+        sessions: &mut SessionWorker<Index>,
+        app: Option<hammer_runtime::app::SessionAppId>,
+    ) -> RuntimeResult<SessionListenerId> {
         let main = Arc::new(hammer_service::session::runtime::SessionMain::new(
             1,
             Arc::clone(applications),
         ));
         let application_listener = applications
-            .register_listener(application, None, None)
+            .register_listener(application, app, None)
             .map_err(hammer_runtime::RuntimeError::from)?;
         let listener = main.listen(
             application_listener,
@@ -6550,6 +6587,26 @@ mod tests {
     }
 
     fn peer_relay_established() -> RuntimeResult<PeerRelay> {
+        peer_relay_established_with(
+            None,
+            hammer_service::session::SessionAppCallbacks::all_none(),
+        )
+    }
+
+    fn install_builtin_session_app(_: &mut hammer_runtime::Engine) -> RuntimeResult<()> {
+        Ok(())
+    }
+
+    fn destroy_builtin_session_app(_: hammer_runtime::DataWorkerId, _: u64) {}
+
+    /// `listener_app` names the app identity the outer listener carries into
+    /// the accepted Connection Session (`stream_accept` reads
+    /// `listener.app()`); peer streams opened over that Session then inherit
+    /// it as the parent endpoint (VPP `quic_quicly_on_stream_open`).
+    fn peer_relay_established_with(
+        listener_app: Option<hammer_runtime::app::SessionAppId>,
+        callbacks: hammer_service::session::SessionAppCallbacks<Index>,
+    ) -> RuntimeResult<PeerRelay> {
         let certified = rcgen::generate_simple_self_signed(vec!["localhost".to_owned()])
             .expect("generate QUIC test certificate");
         let rustls_server = quinn_proto::rustls::ServerConfig::builder()
@@ -6581,7 +6638,21 @@ mod tests {
         let mut client_config = quinn_proto::ClientConfig::new(Arc::new(crypto_client));
         client_config.transport_config(Arc::new(quinn_proto::TransportConfig::default()));
 
-        let applications = hammer_service::session::ApplicationMain::new(4);
+        // A builtin listener app must be registered with the ApplicationMain
+        // (VPP `vnet_register_session_app`), which assigns its SessionAppId by
+        // registration position; `register_listener` then validates it.
+        let applications = if listener_app.is_some() {
+            hammer_service::session::ApplicationMain::with_session_apps(
+                4,
+                [hammer_runtime::app::SessionAppRegistration::new(
+                    crate::session_app::NAME,
+                    install_builtin_session_app,
+                    destroy_builtin_session_app,
+                )],
+            )
+        } else {
+            hammer_service::session::ApplicationMain::new(4)
+        };
         let application = applications
             .attach()
             .map_err(hammer_runtime::RuntimeError::from)?;
@@ -6607,8 +6678,19 @@ mod tests {
             None,
             false,
         )?;
-        let outer_listener =
-            register_test_outer_listener(&applications, application, &mut sessions)?;
+        // A builtin listener app is only meaningful with its Session App
+        // callback table installed: both the accepted Connection Session and
+        // its accepted child streams dispatch the accept callback under this
+        // app id (VPP `app_worker_accept_notify`).
+        if let Some(app) = listener_app {
+            sessions.install_session_app(app, callbacks)?;
+        }
+        let outer_listener = register_test_outer_listener_with_app(
+            &applications,
+            application,
+            &mut sessions,
+            listener_app,
+        )?;
 
         let mut worker = QuicWorker::new(DataWorkerId::new(0));
         let listener_id = ContextId::from(0x1234u64);
@@ -6760,6 +6842,396 @@ mod tests {
             SessionHandle::new(child.pool_index().slot(), 0)
         );
         assert_eq!(accepted.flags, SessionFlags::STREAM);
+        Ok(())
+    }
+
+    // Per-thread state: `cargo test` runs these tests in parallel on separate
+    // threads and each relay drives its worker synchronously on the test
+    // thread, so thread-local counters keep the accept callback recordings of
+    // one test from leaking into another.
+    thread_local! {
+        static SESSION_APP_ACCEPT_COUNT: AtomicU64 = AtomicU64::new(0);
+        static SESSION_APP_ACCEPTED_SESSION: AtomicU64 = AtomicU64::new(u64::MAX);
+        static SESSION_APP_ACCEPT_FAIL: AtomicBool = AtomicBool::new(false);
+    }
+
+    fn session_app_accept_callback(
+        _: &mut SessionWorker<Index>,
+        session: SessionId,
+        _: SessionAppContext,
+    ) -> RuntimeResult<()> {
+        SESSION_APP_ACCEPT_COUNT.with(|count| count.fetch_add(1, Ordering::Relaxed));
+        SESSION_APP_ACCEPTED_SESSION
+            .with(|accepted| accepted.store(session.get(), Ordering::Relaxed));
+        Ok(())
+    }
+
+    /// Records the accepted Session like `session_app_accept_callback`, but
+    /// once the test-only failure flag is armed it returns a typed error
+    /// instead of succeeding, standing in for a Session App accept callback
+    /// that rejects the accepted child (VPP `app_worker_accept_notify`
+    /// failure).
+    fn session_app_accept_callback_failing(
+        _: &mut SessionWorker<Index>,
+        session: SessionId,
+        _: SessionAppContext,
+    ) -> RuntimeResult<()> {
+        SESSION_APP_ACCEPT_COUNT.with(|count| count.fetch_add(1, Ordering::Relaxed));
+        SESSION_APP_ACCEPTED_SESSION
+            .with(|accepted| accepted.store(session.get(), Ordering::Relaxed));
+        if SESSION_APP_ACCEPT_FAIL.with(|fail| fail.load(Ordering::Relaxed)) {
+            return Err(RuntimeError::subsystem(
+                "session-app-accept",
+                hammer_service::session::error::SessionError::PublicationRejected {
+                    session_id: session,
+                },
+            ));
+        }
+        Ok(())
+    }
+
+    /// A peer-opened bidirectional stream accepted under a builtin app
+    /// listener fires the Session App accept callback with the child Session
+    /// (`app_worker_accept_notify`, VPP quic_quicly.c:873) and inherits the
+    /// parent Connection Session's builtin endpoint, so the child's endpoint
+    /// equals the parent's including app and opaque. The child completes
+    /// through `complete_stream_connect` rather than the external ACCEPTED
+    /// publication, so no accepted_message is retained.
+    #[test]
+    fn builtin_peer_bidirectional_stream_accepts_with_parent_builtin_endpoint() -> RuntimeResult<()>
+    {
+        SESSION_APP_ACCEPT_COUNT.with(|count| count.store(0, Ordering::Relaxed));
+        SESSION_APP_ACCEPTED_SESSION.with(|accepted| accepted.store(u64::MAX, Ordering::Relaxed));
+        let mut relay = peer_relay_established_with(
+            Some(SessionAppId::new(0)),
+            hammer_service::session::SessionAppCallbacks {
+                accept: Some(session_app_accept_callback),
+                ..Default::default()
+            },
+        )?;
+        // The handshake accepts the root Connection Session exactly once.
+        let accept_snapshot = SESSION_APP_ACCEPT_COUNT.with(|count| count.load(Ordering::Relaxed));
+        assert_eq!(
+            accept_snapshot, 1,
+            "root Connection Session accept callback"
+        );
+        let stream = relay
+            .client_connection
+            .streams()
+            .open(quinn_proto::Dir::Bi)
+            .expect("open peer bidirectional stream");
+        relay
+            .client_connection
+            .send_stream(stream)
+            .finish()
+            .expect("finish peer stream data");
+        for _ in 0..16 {
+            let missing = relay
+                .worker
+                .contexts
+                .get(relay.context.into())
+                .and_then(Context::connection)
+                .and_then(|connection| connection.engine.as_ref())
+                .map(|engine| engine.io_table.stream_session(stream).is_none())
+                .unwrap_or(true);
+            if !missing {
+                break;
+            }
+            peer_relay_exchange(&mut relay)?;
+        }
+        let child = relay
+            .worker
+            .contexts
+            .get(relay.context.into())
+            .and_then(Context::connection)
+            .and_then(|connection| connection.engine.as_ref())
+            .and_then(|engine| engine.io_table.stream_session(stream))
+            .ok_or(QuicWorkerError::StreamMissing { stream })?;
+        let (_, child_context) = relay
+            .sessions
+            .session_transport(child)
+            .ok_or(QuicWorkerError::SessionMissing { session: child })?;
+        let stream_context = relay
+            .worker
+            .contexts
+            .get(child_context)
+            .and_then(|context| match &context.role {
+                ContextRole::Stream(stream) => Some(stream),
+                ContextRole::Listener(_) | ContextRole::Connection(_) => None,
+            })
+            .ok_or(QuicWorkerError::ContextMissing {
+                context: ContextId::from(child_context),
+            })?;
+        assert_eq!(stream_context.parent, relay.context.into());
+        assert_eq!(stream_context.stream.dir(), quinn_proto::Dir::Bi);
+        assert_eq!(stream_context.session, child);
+        assert_eq!(
+            SESSION_APP_ACCEPT_COUNT.with(|count| count.load(Ordering::Relaxed)),
+            accept_snapshot + 1,
+            "the peer stream fires exactly one more accept callback"
+        );
+        assert_eq!(
+            SESSION_APP_ACCEPTED_SESSION.with(|accepted| accepted.load(Ordering::Relaxed)),
+            child.get(),
+            "the recorded accept Session is the stream child"
+        );
+        assert_eq!(
+            relay.sessions.session_app_endpoint(child),
+            relay
+                .sessions
+                .session_app_endpoint(relay.connection_session),
+            "the child inherits the parent's builtin app endpoint"
+        );
+        assert_eq!(
+            relay.sessions.session_flags(child),
+            Some(SessionFlags::STREAM)
+        );
+        assert!(
+            relay.sessions.accepted_message(child).is_none(),
+            "builtin children publish no external ACCEPTED message"
+        );
+        Ok(())
+    }
+
+    /// A builtin child accept callback failure follows the established
+    /// StreamData path: the callback records the child then returns a typed
+    /// error; `complete_stream_connect` removes the child Session and the
+    /// worker rolls back the stream context, so the quinn stream-setup
+    /// failure surfaces as `StreamDataError` and `handle_stream_data_error`
+    /// closes the connection with LocalResourceExhausted (VPP
+    /// `app_worker_accept_notify` failure), counts `stream_data_errors`, and
+    /// leaves the connection Session/context in the VPP-aligned
+    /// PassiveClosingQuicClosed state.
+    #[test]
+    fn builtin_child_accept_callback_failure_follows_stream_data_path() -> RuntimeResult<()> {
+        SESSION_APP_ACCEPT_COUNT.with(|count| count.store(0, Ordering::Relaxed));
+        SESSION_APP_ACCEPTED_SESSION.with(|accepted| accepted.store(u64::MAX, Ordering::Relaxed));
+        SESSION_APP_ACCEPT_FAIL.with(|fail| fail.store(false, Ordering::Relaxed));
+        let mut relay = peer_relay_established_with(
+            Some(SessionAppId::new(0)),
+            hammer_service::session::SessionAppCallbacks {
+                accept: Some(session_app_accept_callback_failing),
+                ..Default::default()
+            },
+        )?;
+        assert_eq!(
+            SESSION_APP_ACCEPT_COUNT.with(|count| count.load(Ordering::Relaxed)),
+            1,
+            "the root handshake accept callback succeeds"
+        );
+        // Arm the test-only failure flag only after the root handshake
+        // accepted, so the peer child's accept callback is the first to fail.
+        SESSION_APP_ACCEPT_FAIL.with(|fail| fail.store(true, Ordering::Relaxed));
+
+        let stream = relay
+            .client_connection
+            .streams()
+            .open(quinn_proto::Dir::Bi)
+            .expect("open peer bidirectional stream");
+        relay
+            .client_connection
+            .send_stream(stream)
+            .finish()
+            .expect("finish peer stream data");
+
+        let mut error = None;
+        for _ in 0..16 {
+            match peer_relay_exchange(&mut relay) {
+                Ok(()) => {}
+                Err(returned) => {
+                    error = Some(returned);
+                    break;
+                }
+            }
+        }
+        let error = error.ok_or(QuicWorkerError::StreamMissing { stream })?;
+        assert!(
+            matches!(
+                &error,
+                RuntimeError::Subsystem { source, .. }
+                    if matches!(
+                        source.downcast_ref::<QuicWorkerError>(),
+                        Some(QuicWorkerError::StreamData { context, error })
+                            if *context == relay.context
+                                && matches!(
+                                    error,
+                                    quinn_proto::StreamDataError::StreamMissing { .. }
+                                )
+                    )
+            ),
+            "the accept callback failure surfaces as the established StreamData \
+             worker error, got {error:?}"
+        );
+
+        let child = SessionId::from_raw(
+            SESSION_APP_ACCEPTED_SESSION.with(|accepted| accepted.load(Ordering::Relaxed)),
+        );
+        assert_eq!(
+            SESSION_APP_ACCEPT_COUNT.with(|count| count.load(Ordering::Relaxed)),
+            2,
+            "the peer child fires the accept callback exactly once before failing"
+        );
+        assert!(
+            !relay.sessions.has_session(child),
+            "the failed accepted child Session is removed"
+        );
+        assert!(
+            !relay.worker.contexts.iter().any(|(_, context)| matches!(
+                &context.role,
+                ContextRole::Stream(stream_context)
+                    if stream_context.parent == relay.context.into()
+                        && stream_context.stream == stream
+            )),
+            "no stream context remains for the failed child"
+        );
+        assert!(
+            relay
+                .worker
+                .contexts
+                .get(relay.context.into())
+                .and_then(Context::connection)
+                .and_then(|connection| connection.engine.as_ref())
+                .is_none_or(|engine| engine.io_table.stream_session(stream).is_none()),
+            "no io-table entry remains for the failed child"
+        );
+        assert!(
+            relay.worker.contexts.contains_key(relay.context.into()),
+            "the connection context remains"
+        );
+        assert!(
+            relay.sessions.has_session(relay.connection_session),
+            "the connection Session remains"
+        );
+        assert_eq!(
+            relay
+                .worker
+                .contexts
+                .get(relay.context.into())
+                .and_then(Context::connection)
+                .map(|connection| connection.state),
+            Some(ConnectionState::PassiveClosingQuicClosed),
+            "the connection Session/context stays in the VPP-aligned closing state"
+        );
+        assert_eq!(relay.worker.stream_data_errors, 1);
+
+        // A follow-up exchange drains the client's remaining transmits and
+        // server responses without further errors: the StreamData close path
+        // keeps the quinn engine open (no client CONNECTION_CLOSE is
+        // emitted), so the connection stays in PassiveClosingQuicClosed.
+        peer_relay_exchange(&mut relay)?;
+        assert_eq!(relay.worker.stream_data_errors, 1);
+        assert_eq!(
+            relay
+                .worker
+                .contexts
+                .get(relay.context.into())
+                .and_then(Context::connection)
+                .map(|connection| connection.state),
+            Some(ConnectionState::PassiveClosingQuicClosed)
+        );
+        assert!(!relay.client_connection.is_closed());
+        Ok(())
+    }
+
+    /// A peer-opened unidirectional stream accepted under a builtin app
+    /// listener follows the builtin bidir path: the Session App accept
+    /// callback fires with the child Session and the child inherits the
+    /// parent Connection Session's builtin endpoint. It differs only in
+    /// capability, carrying STREAM | UNIDIRECTIONAL (VPP
+    /// `quic_quicly_on_stream_open` for a remote uni stream).
+    #[test]
+    fn builtin_peer_unidirectional_stream_accepts_with_parent_builtin_endpoint() -> RuntimeResult<()>
+    {
+        SESSION_APP_ACCEPT_COUNT.with(|count| count.store(0, Ordering::Relaxed));
+        SESSION_APP_ACCEPTED_SESSION.with(|accepted| accepted.store(u64::MAX, Ordering::Relaxed));
+        let mut relay = peer_relay_established_with(
+            Some(SessionAppId::new(0)),
+            hammer_service::session::SessionAppCallbacks {
+                accept: Some(session_app_accept_callback),
+                ..Default::default()
+            },
+        )?;
+        // The handshake accepts the root Connection Session exactly once.
+        let accept_snapshot = SESSION_APP_ACCEPT_COUNT.with(|count| count.load(Ordering::Relaxed));
+        assert_eq!(
+            accept_snapshot, 1,
+            "root Connection Session accept callback"
+        );
+        let stream = relay
+            .client_connection
+            .streams()
+            .open(quinn_proto::Dir::Uni)
+            .expect("open peer unidirectional stream");
+        relay
+            .client_connection
+            .send_stream(stream)
+            .finish()
+            .expect("finish peer stream data");
+        for _ in 0..16 {
+            let missing = relay
+                .worker
+                .contexts
+                .get(relay.context.into())
+                .and_then(Context::connection)
+                .and_then(|connection| connection.engine.as_ref())
+                .map(|engine| engine.io_table.stream_session(stream).is_none())
+                .unwrap_or(true);
+            if !missing {
+                break;
+            }
+            peer_relay_exchange(&mut relay)?;
+        }
+        let child = relay
+            .worker
+            .contexts
+            .get(relay.context.into())
+            .and_then(Context::connection)
+            .and_then(|connection| connection.engine.as_ref())
+            .and_then(|engine| engine.io_table.stream_session(stream))
+            .ok_or(QuicWorkerError::StreamMissing { stream })?;
+        let (_, child_context) = relay
+            .sessions
+            .session_transport(child)
+            .ok_or(QuicWorkerError::SessionMissing { session: child })?;
+        let stream_context = relay
+            .worker
+            .contexts
+            .get(child_context)
+            .and_then(|context| match &context.role {
+                ContextRole::Stream(stream) => Some(stream),
+                ContextRole::Listener(_) | ContextRole::Connection(_) => None,
+            })
+            .ok_or(QuicWorkerError::ContextMissing {
+                context: ContextId::from(child_context),
+            })?;
+        assert_eq!(stream_context.parent, relay.context.into());
+        assert_eq!(stream_context.stream.dir(), quinn_proto::Dir::Uni);
+        assert_eq!(stream_context.session, child);
+        assert_eq!(
+            SESSION_APP_ACCEPT_COUNT.with(|count| count.load(Ordering::Relaxed)),
+            accept_snapshot + 1,
+            "the peer stream fires exactly one more accept callback"
+        );
+        assert_eq!(
+            SESSION_APP_ACCEPTED_SESSION.with(|accepted| accepted.load(Ordering::Relaxed)),
+            child.get(),
+            "the recorded accept Session is the stream child"
+        );
+        assert_eq!(
+            relay.sessions.session_app_endpoint(child),
+            relay
+                .sessions
+                .session_app_endpoint(relay.connection_session),
+            "the child inherits the parent's builtin app endpoint"
+        );
+        assert_eq!(
+            relay.sessions.session_flags(child),
+            Some(SessionFlags::STREAM | SessionFlags::UNIDIRECTIONAL)
+        );
+        assert!(
+            relay.sessions.accepted_message(child).is_none(),
+            "builtin children publish no external ACCEPTED message"
+        );
         Ok(())
     }
 
