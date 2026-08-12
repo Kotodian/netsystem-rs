@@ -5,18 +5,22 @@
 //! `ConnectionContext` is bound to a root lower QUIC Session
 //! (`http_ts_accept_connection`, http.c:586) and one `StreamContext` is bound
 //! to a stream child's parent connection (`http_ts_accept_stream`, http.c:675).
+//! A root accept also bootstraps its local uni control stream exactly once
+//! (`http3_conn_init`, http3.c:216-250), with typed transport actions faked
+//! so the open and its failure rollback are observable.
 
+use std::cell::Cell;
 use std::sync::Arc;
 
 use hammer_infra::pool::Index;
-use hammer_runtime::app::{AppSessionConfig, ApplicationId, SessionAppId, SessionFlags};
-use hammer_runtime::session::SessionStreamDirection;
+use hammer_runtime::app::{AppSessionConfig, ApplicationId, SessionAppContext, SessionAppId, SessionFlags};
+use hammer_runtime::session::{SessionApplicationErrorCode, SessionStreamDirection};
 use hammer_runtime::{
     DataPlaneRuntime, DataPlaneRuntimeConfig, DataWorkerId, Engine, RuntimeError, RuntimeRegistry,
-    SessionTransportRegistration,
+    RuntimeResult, SessionTransportRegistration,
 };
 use hammer_service::session::protocol::SessionAppCallbacks;
-use hammer_service::session::runtime::{SessionMain, SessionWorker};
+use hammer_service::session::runtime::{SessionMain, SessionTransportWorkerActions, SessionWorker};
 use hammer_service::session::{ApplicationMain, SessionId};
 
 use super::http_app::{
@@ -36,7 +40,7 @@ fn test_harness() -> (Arc<HttpMain>, SessionWorker<Index>, ApplicationId, Sessio
     let session_app = applications
         .session_app_id(NAME)
         .expect("test Application registry registers the builtin HTTP Session App");
-    let sessions = SessionWorker::<Index>::new(
+    let mut sessions = SessionWorker::<Index>::new(
         DataWorkerId::new(0),
         1,
         AppSessionConfig::default(),
@@ -54,7 +58,73 @@ fn test_harness() -> (Arc<HttpMain>, SessionWorker<Index>, ApplicationId, Sessio
     ));
     main.install_worker(DataWorkerId::new(0))
         .expect("install test HttpWorker");
+    sessions
+        .install_transport_actions(
+            HttpMain::TRANSPORT_ID,
+            SessionTransportWorkerActions::new(
+                fake_open_stream,
+                fake_reset_stream,
+                fake_stop_sending,
+                fake_close_connection,
+            ),
+        )
+        .expect("install fake transport actions");
     (main, sessions, application, session_app)
+}
+
+/// Per-thread observation of the fake transport actions, mirroring the
+/// `worker` harness: invocation counts, the passed `app_context`, and whether
+/// the next `open_stream` call fails.
+thread_local! {
+    static OPEN_CALLS: Cell<u32> = const { Cell::new(0) };
+    static OPEN_CONTEXT: Cell<u64> = const { Cell::new(0) };
+    static OPEN_FAIL: Cell<bool> = const { Cell::new(false) };
+    static CLOSE_CALLS: Cell<u32> = const { Cell::new(0) };
+    static CLOSE_SESSION: Cell<u64> = const { Cell::new(0) };
+    static CLOSE_CODE: Cell<u64> = const { Cell::new(0) };
+}
+
+fn fake_open_stream(
+    _sessions: &mut SessionWorker<Index>,
+    parent: SessionId,
+    direction: SessionStreamDirection,
+    app_context: SessionAppContext,
+) -> RuntimeResult<SessionId> {
+    OPEN_CALLS.with(|calls| calls.set(calls.get() + 1));
+    OPEN_CONTEXT.with(|seen| seen.set(app_context));
+    assert_eq!(direction, SessionStreamDirection::Uni, "control stream is uni");
+    if OPEN_FAIL.with(|fail| fail.get()) {
+        return Err(RuntimeError::ServiceClosed);
+    }
+    Ok(SessionId::from_raw(parent.get() + 1))
+}
+
+fn fake_reset_stream(
+    _sessions: &mut SessionWorker<Index>,
+    _session_id: SessionId,
+    _code: SessionApplicationErrorCode,
+) -> RuntimeResult<()> {
+    Ok(())
+}
+
+fn fake_stop_sending(
+    _sessions: &mut SessionWorker<Index>,
+    _session_id: SessionId,
+    _code: SessionApplicationErrorCode,
+) -> RuntimeResult<()> {
+    Ok(())
+}
+
+fn fake_close_connection(
+    _sessions: &mut SessionWorker<Index>,
+    session_id: SessionId,
+    code: SessionApplicationErrorCode,
+    _reason: &[u8],
+) -> RuntimeResult<()> {
+    CLOSE_CALLS.with(|calls| calls.set(calls.get() + 1));
+    CLOSE_SESSION.with(|seen| seen.set(session_id.get()));
+    CLOSE_CODE.with(|seen| seen.set(u64::from(code)));
+    Ok(())
 }
 
 /// One Session App transport session owned by the test SessionWorker.
@@ -224,12 +294,94 @@ fn accept_allocates_one_context_and_keeps_it_on_successful_publication() {
 fn accept_is_idempotent_when_context_is_already_published() {
     let (main, mut sessions, application, session_app) = test_harness();
     let session = construct_session(&mut sessions, application, session_app, 2);
+    OPEN_CALLS.with(|calls| calls.set(0));
 
     accept_on(&main, &mut sessions, session, 0).expect("first accept");
+    OPEN_CALLS.with(|calls| assert_eq!(calls.get(), 1, "first accept bootstraps once"));
     // The dispatch layer passes the published nonzero context back on a
     // duplicate accept; it must allocate nothing further.
     accept_on(&main, &mut sessions, session, 1).expect("duplicate accept is a no-op");
+    OPEN_CALLS.with(|calls| assert_eq!(calls.get(), 1, "duplicate accept bootstraps nothing"));
     assert_eq!(worker_len(&main), 1);
+}
+
+#[test]
+fn connection_accept_bootstraps_control_stream_exactly_once() {
+    let (main, mut sessions, application, session_app) = test_harness();
+    let session = construct_session(&mut sessions, application, session_app, 1);
+    // Fresh connection pool: the first allocation occupies slot 0 with
+    // generation 1, so its identity is deterministic.
+    let context = ContextId::from(Index::new(0, 1));
+    OPEN_CALLS.with(|calls| calls.set(0));
+    OPEN_CONTEXT.with(|seen| seen.set(0));
+
+    accept_on(&main, &mut sessions, session, 0).expect("accept bootstraps the control stream");
+
+    OPEN_CALLS.with(|calls| assert_eq!(calls.get(), 1, "bootstrap invoked exactly once"));
+    OPEN_CONTEXT.with(|seen| {
+        assert_eq!(
+            seen.get(),
+            u64::from(context),
+            "the control stream carries the published connection context"
+        )
+    });
+    main.with_worker(DataWorkerId::new(0), |http| {
+        let connection = http.get(context).map_err(RuntimeError::from)?;
+        assert_eq!(
+            connection.local_control,
+            Some(SessionId::from_raw(session.get() + 1)),
+            "the opened control stream child is recorded on the context"
+        );
+        assert!(connection.peer_settings_pending, "peer SETTINGS still expected");
+        Ok(())
+    })
+    .expect("worker accessible on the test thread");
+}
+
+#[test]
+fn connection_accept_rolls_back_and_closes_lower_connection_when_bootstrap_fails() {
+    let (main, mut sessions, application, session_app) = test_harness();
+    let session = construct_session(&mut sessions, application, session_app, 1);
+    // Fresh connection pool: the first allocation occupies slot 0 with
+    // generation 1, so its identity is deterministic.
+    let context = ContextId::from(Index::new(0, 1));
+    OPEN_CALLS.with(|calls| calls.set(0));
+    OPEN_FAIL.with(|fail| fail.set(true));
+    CLOSE_CALLS.with(|calls| calls.set(0));
+    CLOSE_SESSION.with(|seen| seen.set(0));
+    CLOSE_CODE.with(|seen| seen.set(0));
+
+    let error = accept_on(&main, &mut sessions, session, 0)
+        .expect_err("bootstrap failure must fail the accept");
+    assert!(matches!(
+        http_error(&error),
+        HttpWorkerError::ControlStreamOpenFailed { context: failed } if *failed == context
+    ), "primary bootstrap error preserved, got {error:?}");
+    OPEN_CALLS.with(|calls| assert_eq!(calls.get(), 1, "failing action invoked once"));
+    assert_eq!(worker_len(&main), 0, "connection context removed in rollback");
+    CLOSE_CALLS.with(|calls| assert_eq!(calls.get(), 1, "lower connection closed in rollback"));
+    CLOSE_SESSION.with(|seen| {
+        assert_eq!(seen.get(), session.get(), "close names the lower connection")
+    });
+    CLOSE_CODE.with(|seen| {
+        assert_eq!(seen.get(), 0x0102, "close carries VPP H3_INTERNAL_ERROR")
+    });
+
+    // The cleared app context leaves the session fully re-acceptable: a fresh
+    // dispatch context re-runs the whole path and re-bootstraps a new context
+    // generation, with the failing open action healed.
+    OPEN_FAIL.with(|fail| fail.set(false));
+    OPEN_CALLS.with(|calls| calls.set(0));
+    accept_on(&main, &mut sessions, session, 0).expect("retry accept succeeds");
+    OPEN_CALLS.with(|calls| assert_eq!(calls.get(), 1, "retry bootstraps again"));
+    OPEN_CONTEXT.with(|seen| {
+        assert_eq!(
+            seen.get(),
+            u64::from(ContextId::from(Index::new(0, 2))),
+            "retry re-publishes a fresh context generation"
+        )
+    });
+    assert_eq!(worker_len(&main), 1, "retry left one live context");
 }
 
 #[test]

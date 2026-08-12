@@ -14,14 +14,18 @@
 //! (`http_ts_accept_connection`, http.c:586-673) or a `StreamContext` bound
 //! to its parent connection for a stream child (`http_ts_accept_stream`,
 //! http.c:675-721) — then publishes its `ContextId`/`StreamContextId`
-//! through `SessionWorker::set_app_session`. Upward
+//! through `SessionWorker::set_app_session`. A root connection additionally
+//! bootstraps its local uni control stream exactly once
+//! (`HttpWorker::bootstrap_control_stream`, mirroring `http3_conn_init`,
+//! http3.c:216-250), rolling the accept back on failure as
+//! `http3_conn_terminate` does (http3.c:152-165). Upward
 //! `SessionTransport` registration, listener/connect, the HTTP3 engine, FIFO
 //! transfer/publication, QPACK, and worker contexts are later slices; no
 //! callback that needs their lifecycle state is installed here.
 
 use hammer_infra::pool::Index;
 use hammer_runtime::app::{SessionAppContext, SessionAppRegistration, SessionFlags};
-use hammer_runtime::session::SessionStreamDirection;
+use hammer_runtime::session::{SessionApplicationErrorCode, SessionStreamDirection};
 use hammer_runtime::{DataWorkerId, Engine, RuntimeError, RuntimeResult};
 use hammer_service::session::SessionId;
 use hammer_service::session::protocol::SessionAppCallbacks;
@@ -32,13 +36,20 @@ use crate::worker::ContextId;
 
 pub(crate) const NAME: &str = "http";
 
+/// VPP `HTTP3_ERROR_INTERNAL_ERROR` (http3.h:17): the app error code
+/// `http3_conn_init` carries on the connection close that rolls back a
+/// failed control-stream open (http3.c:228).
+const H3_INTERNAL_ERROR: u64 = 0x0102;
+
 /// Static callback table passed to `SessionMain::install_session_app`,
 /// mirroring VPP's static `http_app_cb_vft` (http.c:1004-1017).
 ///
 /// `accept` is wired: it needs nothing beyond the per-worker context pools
-/// (`HttpWorker::allocate`/`allocate_stream`/`remove`/`remove_stream`,
-/// worker.rs) and the Session worker's `set_app_session` publication. Every
-/// other VPP callback routes through
+/// (`HttpWorker::allocate`/`bootstrap_control_stream`/`allocate_stream`/
+/// `remove`/`remove_stream`, worker.rs) and the Session worker's
+/// `set_app_session` publication plus the typed transport actions
+/// (`open_stream`/`close_connection`, runtime.rs). Every other VPP callback
+/// routes through
 /// HTTP worker connection state (`http_ts_*` over `http_ctx_t`) that its
 /// owning slice does not provide yet; installing speculative no-ops would be
 /// wrong without that state. Deferred to the HTTP3/lifecycle slice:
@@ -71,6 +82,11 @@ pub(crate) enum HttpAppError {
 /// `http_ts_accept_stream` (http.c:675-721) for stream children. In both
 /// paths the Session resolves the owning worker, one context is allocated
 /// bound to the Session, and only then is the connection state published.
+/// For roots the published `ConnectionContext` additionally bootstraps its
+/// local uni control stream exactly once
+/// (`HttpWorker::bootstrap_control_stream`, mirroring `http3_conn_init`,
+/// http3.c:216-250), and a bootstrap failure rolls the accept back as
+/// `http3_conn_terminate` does (http3.c:152-165).
 /// Here the per-worker `HttpWorker` slot is resolved by the Session's
 /// `DataWorkerId` (`HttpMain::with_worker`, listener.rs) and the publication
 /// is the Session worker's opaque `set_app_session`, with the allocated
@@ -122,7 +138,9 @@ pub(crate) fn accept_on(
 }
 
 /// `accept` dispatch for a root Session, mirroring VPP
-/// `http_ts_accept_connection` (http.c:586-673).
+/// `http_ts_accept_connection` (http.c:586-673) plus the control-stream
+/// bootstrap of `http3_conn_accept_callback` (http3.c:2358-2374, via
+/// `http3_conn_init` http3.c:216-250).
 fn accept_connection(
     main: &HttpMain,
     worker: &mut SessionWorker<Index>,
@@ -138,6 +156,31 @@ fn accept_connection(
         let _ = main.with_worker(worker.worker(), |http| {
             http.remove(context).map_err(RuntimeError::from)
         });
+        return Err(error);
+    }
+    if let Err(error) = main.with_worker(worker.worker(), |http| {
+        // The local uni control stream is opened exactly once per accepted
+        // connection, with the published `ContextId` as its app context,
+        // mirroring `http3_conn_init`'s first stream (http3.c:223-234).
+        http.bootstrap_control_stream(context, worker, u64::from(context))
+            .map_err(RuntimeError::from)
+    }) {
+        // VPP `http3_conn_terminate` (http3.c:152-165) after a failed
+        // control-stream open (http3.c:228): roll the direct owner/index
+        // paths back in reverse order, each best effort so the primary
+        // bootstrap error survives. The typed open action owns rollback of
+        // any child it created; then the published app context is cleared,
+        // the connection context released, and the lower connection closed
+        // with the VPP H3_INTERNAL_ERROR code.
+        let _ = worker.set_app_session(session, 0);
+        let _ = main.with_worker(worker.worker(), |http| {
+            http.remove(context).map_err(RuntimeError::from)
+        });
+        let _ = worker.close_connection(
+            session,
+            SessionApplicationErrorCode::from(H3_INTERNAL_ERROR),
+            &[],
+        );
         return Err(error);
     }
     Ok(())
