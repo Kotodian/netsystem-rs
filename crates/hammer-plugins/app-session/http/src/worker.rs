@@ -48,6 +48,7 @@ use crate::http3::preface::encode_control_preface;
 use crate::http3::proto::coding::Decode;
 use crate::http3::proto::control::{ControlRead, ControlStreamError, ControlStreamReader};
 use crate::http3::proto::error::ErrorCode;
+use crate::http3::request_frame_reader::{RequestFrameError, RequestFrameRead, RequestFrameReader};
 use crate::http3::proto::stream::{StreamCategory, StreamType};
 use crate::http3::proto::varint::UnexpectedEnd;
 
@@ -209,6 +210,17 @@ pub(crate) struct StreamContext {
     /// registration succeeds; `Unclassified` until then. Bidi request
     /// streams never register.
     pub(crate) peer_role: PeerUniStreamRole,
+    /// Generation-checked slot of this stream's request-frame reader in the
+    /// worker's separate `request_readers` pool; `None` until the first
+    /// readable bytes of a bidirectional request stream arrive. Mirrors VPP
+    /// keeping the request's frame-header staging (`fh`), phase
+    /// (`req_state`), and dispatch callback on the per-request `http_ctx_t`
+    /// owned by the data worker (`http3_stream_transport_rx_req`,
+    /// http3.c:1732-1799): established once per stream, looked up
+    /// generation-checked per readable segment. The reader is not embedded
+    /// in every stream slot: one pool slot per stream at most, bounded by
+    /// the stream pool capacity.
+    pub(crate) request_reader: Option<Index>,
 }
 
 /// Classification role of a peer unidirectional stream once its type varint
@@ -453,6 +465,10 @@ pub(crate) enum HttpWorkerError {
         stream: StreamContextId,
         index: Index,
     },
+    #[error("http stream {stream:?} request reader pool is full (capacity {capacity})")]
+    RequestReaderCapacityExhausted { stream: StreamContextId, capacity: usize },
+    #[error("http worker lost the request reader slot {index:?} for stream {stream:?}")]
+    RequestReaderMissing { stream: StreamContextId, index: Index },
     #[error("http stream context pool is full (capacity {capacity})")]
     StreamCapacityExhausted { capacity: usize },
     #[error("http stream context {stream:?} is not live")]
@@ -464,6 +480,13 @@ pub(crate) enum HttpWorkerError {
         stream: StreamContextId,
         expected: SessionId,
         actual: SessionId,
+    },
+    #[error(
+        "http stream context {stream:?} is not a bidirectional request stream (direction {direction:?})"
+    )]
+    RequestStreamNotBidi {
+        stream: StreamContextId,
+        direction: SessionStreamDirection,
     },
     #[error("http stream context allocation requires live parent connection context {parent:?}")]
     ParentContextMissing { parent: ContextId },
@@ -538,6 +561,29 @@ impl PeerControlError {
     }
 }
 
+/// Errors from [`HttpWorker::process_request_bytes`].
+#[derive(Debug)]
+pub(crate) enum RequestReadError {
+    /// The stream is not a live bidirectional request stream bound to the
+    /// exact session, or its reader slot is missing (liveness failure, not a
+    /// protocol violation).
+    Worker(HttpWorkerError),
+    /// A request-stream protocol error; the caller maps the connection error
+    /// via [`RequestFrameError::error_code`] and terminates the connection.
+    Protocol(RequestFrameError),
+}
+
+impl RequestReadError {
+    /// The connection error code for a protocol error; `None` for liveness
+    /// errors, which carry no HTTP/3 error code.
+    pub(crate) fn error_code(&self) -> Option<ErrorCode> {
+        match self {
+            RequestReadError::Worker(_) => None,
+            RequestReadError::Protocol(error) => Some(error.error_code()),
+        }
+    }
+}
+
 /// Data-worker-owned bounded pools of HTTP/3 connection and stream contexts.
 ///
 /// Owns `ConnectionContext` slots exactly as VPP's `http_worker_t::ctx_pool`
@@ -556,6 +602,11 @@ pub(crate) struct HttpWorker {
     /// stream slot; slots are freed when the owning stream or connection
     /// context is released.
     readers: Pool<ControlStreamReader>,
+    /// Generation-checked pool of per-stream request-frame readers, one slot
+    /// per bidirectional request stream at most. `StreamContext::request_reader`
+    /// records the slot, so the reader is not embedded in every stream slot;
+    /// the pool is bounded by the stream capacity.
+    request_readers: Pool<RequestFrameReader>,
 }
 
 impl HttpWorker {
@@ -573,13 +624,16 @@ impl HttpWorker {
     }
 
     /// Independent connection, stream, and reader pool capacities. The
-    /// reader pool is bounded by the connection capacity: each connection
-    /// owns at most one peer control stream and thus one reader.
+    /// peer-control reader pool is bounded by the connection capacity: each
+    /// connection owns at most one peer control stream and thus one reader.
+    /// The request-reader pool is bounded by the stream capacity: each
+    /// bidirectional request stream owns at most one request reader.
     pub(crate) fn with_capacities(connections: usize, streams: usize) -> Self {
         Self {
             contexts: Pool::with_capacity(connections),
             streams: Pool::with_capacity(streams),
             readers: Pool::with_capacity(connections),
+            request_readers: Pool::with_capacity(streams),
         }
     }
 
@@ -801,6 +855,7 @@ impl HttpWorker {
                 direction,
                 peer_uni_type: PeerUniStreamTypeDecode::default(),
                 peer_role: PeerUniStreamRole::Unclassified,
+                request_reader: None,
             })
             .map(StreamContextId::from)
             .ok_or(HttpWorkerError::StreamCapacityExhausted {
@@ -1100,6 +1155,91 @@ impl HttpWorker {
         }
     }
 
+    /// Feeds readable bytes of a bidirectional request stream into its
+    /// request-frame reader.
+    ///
+    /// Mirrors VPP `http3_stream_transport_rx_req` (http3.c:1732-1799): the
+    /// request's frame-header staging (`fh`), phase (`req_state`), and
+    /// dispatch callback live on the per-request `http_ctx_t` owned by the
+    /// data worker and are looked up generation-checked per readable segment,
+    /// and the call returns the exact number of consumed bytes
+    /// (`max_deq - left_deq`) so trailing bytes stay with the caller. Here
+    /// the [`RequestFrameReader`] is allocated lazily into the worker's
+    /// `request_readers` pool on the first feed and recorded on the stream
+    /// context; a completed `Headers` field section is returned by value and
+    /// never silently stored or dropped.
+    ///
+    /// Generation/session-checks the stream context and rejects non-bidi
+    /// streams with `RequestStreamNotBidi`. Reader protocol errors surface as
+    /// `RequestReadError::Protocol` with the HTTP/3 error code; worker
+    /// liveness failures as `RequestReadError::Worker`. O(bytes) with O(1)
+    /// generation-checked lookups and state beyond the reader's single
+    /// bounded HEADERS allocation; no loop over multiple frames, no FIFO
+    /// access, no lock.
+    pub(crate) fn process_request_bytes(
+        &mut self,
+        stream: StreamContextId,
+        session: SessionId,
+        bytes: &[u8],
+    ) -> Result<(RequestFrameRead, usize), RequestReadError> {
+        let mut stream_context = *self
+            .streams
+            .get(stream.into())
+            .ok_or(RequestReadError::Worker(HttpWorkerError::StreamMissing {
+                stream,
+            }))?;
+        if stream_context.session != session {
+            return Err(RequestReadError::Worker(HttpWorkerError::StreamSessionMismatch {
+                stream,
+                expected: session,
+                actual: stream_context.session,
+            }));
+        }
+        if stream_context.direction != SessionStreamDirection::Bidi {
+            return Err(RequestReadError::Worker(
+                HttpWorkerError::RequestStreamNotBidi {
+                    stream,
+                    direction: stream_context.direction,
+                },
+            ));
+        }
+        let reader_index = match stream_context.request_reader {
+            Some(index) => index,
+            None => {
+                let index = self
+                    .request_readers
+                    .insert(RequestFrameReader::new())
+                    .ok_or(RequestReadError::Worker(
+                        HttpWorkerError::RequestReaderCapacityExhausted {
+                            stream,
+                            capacity: self.request_readers.capacity(),
+                        },
+                    ))?;
+                stream_context.request_reader = Some(index);
+                index
+            }
+        };
+        let reader = self
+            .request_readers
+            .get_mut(reader_index)
+            .ok_or(RequestReadError::Worker(
+                HttpWorkerError::RequestReaderMissing {
+                    stream,
+                    index: reader_index,
+                },
+            ))?;
+        let feed = reader.push(bytes);
+        // Persist the stream copy: the reader slot on first feed. On error
+        // the slot stays recorded, so the stream dies with its reader, as
+        // VPP's per-request state does.
+        *self
+            .streams
+            .get_mut(stream.into())
+            .ok_or(RequestReadError::Worker(HttpWorkerError::StreamMissing { stream }))? =
+            stream_context;
+        feed.map_err(RequestReadError::Protocol)
+    }
+
     /// Drains readable bytes of a registered drain-only peer uni stream
     /// (QPACK encoder, QPACK decoder, or Unknown) and returns the number of
     /// bytes drained, always the whole slice.
@@ -1137,15 +1277,24 @@ impl HttpWorker {
     /// Releases a stream context slot back to the pool.
     ///
     /// O(1); the slot's generation advances, so previously issued identities
-    /// become stale. Fails with `StreamMissing` for non-live identities. If
-    /// the released stream was the registered peer control stream, its
-    /// SETTINGS reader slot is freed; if the parent connection is already
-    /// released, `remove` freed it.
+    /// become stale. Fails with `StreamMissing` for non-live identities. The
+    /// stream's lazily allocated request reader slot is freed with the
+    /// stream, mirroring VPP `http3_stream_free_req` (http3.c:59-78), which
+    /// frees the per-request state as the stream closes and clears the
+    /// stream's request index; here the recorded index dies with the removed
+    /// context. If the released stream was the registered peer control
+    /// stream, its SETTINGS reader slot is freed; if the parent connection
+    /// is already released, `remove` freed it.
     pub(crate) fn remove_stream(&mut self, stream: StreamContextId) -> Result<(), HttpWorkerError> {
         let removed = self
             .streams
             .remove(stream.into())
             .ok_or(HttpWorkerError::StreamMissing { stream })?;
+        // `Pool::remove` is generation-checked, so a stale reader index can
+        // never free a live slot.
+        if let Some(reader) = removed.request_reader {
+            self.request_readers.remove(reader);
+        }
         if let Some(connection) = self.contexts.get_mut(removed.parent.into()) {
             if connection.peer_control == Some(stream) {
                 if let Some(reader) = connection.peer_control_reader.take() {
@@ -1392,6 +1541,8 @@ mod tests {
     use hammer_runtime::{RuntimeError, RuntimeResult};
     use hammer_service::session::application::ApplicationMain;
     use hammer_service::session::runtime::{SessionTransportId, SessionTransportWorkerActions};
+
+    use crate::http3::proto::frame::FrameType;
 
     const ACTION_TRANSPORT: SessionTransportId = SessionTransportId::new(0);
 
@@ -3258,6 +3409,246 @@ mod tests {
         assert!(matches!(
             worker.get_stream(second),
             Err(HttpWorkerError::StreamMissing { stream: s }) if s == second
+        ));
+    }
+
+    /// A small worker with one bidirectional request stream bound to
+    /// `session(1, 0)` under a live parent connection context.
+    fn worker_with_request_stream() -> (HttpWorker, StreamContextId, SessionId) {
+        let mut worker = HttpWorker::with_capacities(4, 4);
+        let session = session(1, 0);
+        let parent = worker.allocate(session).expect("allocate parent context");
+        let stream = worker
+            .allocate_stream(session, parent, SessionStreamDirection::Bidi)
+            .expect("allocate request stream");
+        (worker, stream, session)
+    }
+
+    #[test]
+    fn request_bytes_lazy_allocates_and_reuses_reader_split_headers() {
+        let (mut worker, stream, session) = worker_with_request_stream();
+        assert!(
+            worker.get_stream(stream).expect("live stream").request_reader.is_none(),
+            "no reader before the first feed"
+        );
+        // HEADERS header plus two payload bytes: incomplete, all four bytes
+        // consumed into the reader's partial-frame state.
+        let (read, consumed) = worker
+            .process_request_bytes(stream, session, &[0x01, 0x04, b'a', b'b'])
+            .expect("feed partial frame");
+        assert_eq!(read, RequestFrameRead::Incomplete);
+        assert_eq!(consumed, 4);
+        let reader_index = worker
+            .get_stream(stream)
+            .expect("live stream")
+            .request_reader
+            .expect("lazily allocated reader");
+        // The same slot completes the frame: the split state survived the
+        // call boundary and the reader is reused, not reallocated.
+        let (read, consumed) = worker
+            .process_request_bytes(stream, session, &[b'c', b'd'])
+            .expect("complete frame");
+        assert_eq!(read, RequestFrameRead::Headers(b"abcd".to_vec()));
+        assert_eq!(consumed, 2);
+        assert_eq!(
+            worker.get_stream(stream).expect("live stream").request_reader,
+            Some(reader_index),
+            "reader slot persists across feeds"
+        );
+    }
+
+    #[test]
+    fn request_bytes_reader_freed_on_stream_removal_and_slot_reused() {
+        let mut worker = HttpWorker::with_capacities(4, 4);
+        let parent = worker.allocate(session(1, 0)).expect("allocate parent");
+        let first = worker
+            .allocate_stream(session(1, 1), parent, SessionStreamDirection::Bidi)
+            .expect("allocate first request stream");
+        worker
+            .process_request_bytes(first, session(1, 1), &[0x01, 0x00])
+            .expect("feed headers");
+        let first_reader = worker
+            .get_stream(first)
+            .expect("live stream")
+            .request_reader
+            .expect("lazily allocated reader");
+        assert_eq!(worker.request_readers.len(), 1);
+        worker.remove_stream(first).expect("remove first stream");
+        assert_eq!(
+            worker.request_readers.len(),
+            0,
+            "removing the stream frees its request reader"
+        );
+        // The next request stream reuses the freed slot at a fresh
+        // generation: feeding it succeeds and the stale first-reader
+        // identity no longer resolves.
+        let second = worker
+            .allocate_stream(session(2, 1), parent, SessionStreamDirection::Bidi)
+            .expect("allocate second request stream");
+        let (read, consumed) = worker
+            .process_request_bytes(second, session(2, 1), &[0x01, 0x02, b'h', b'i'])
+            .expect("feed headers on second stream");
+        assert_eq!(read, RequestFrameRead::Headers(b"hi".to_vec()));
+        assert_eq!(consumed, 4);
+        let second_reader = worker
+            .get_stream(second)
+            .expect("live stream")
+            .request_reader
+            .expect("reader reallocated for the second stream");
+        assert_eq!(worker.request_readers.len(), 1);
+        assert_eq!(
+            second_reader.slot(),
+            first_reader.slot(),
+            "the freed reader slot is reused"
+        );
+        assert!(
+            second_reader.generation() > first_reader.generation(),
+            "reuse advances the slot generation"
+        );
+        assert!(
+            worker.request_readers.get(first_reader).is_none(),
+            "the stale first-reader identity is generation-checked out"
+        );
+    }
+
+    #[test]
+    fn remove_stream_stale_identity_leaves_live_reader_untouched() {
+        let mut worker = HttpWorker::with_capacities(4, 4);
+        let parent = worker.allocate(session(1, 0)).expect("allocate parent");
+        let first = worker
+            .allocate_stream(session(1, 1), parent, SessionStreamDirection::Bidi)
+            .expect("allocate first request stream");
+        worker
+            .process_request_bytes(first, session(1, 1), &[0x01, 0x00])
+            .expect("feed headers");
+        worker.remove_stream(first).expect("remove first stream");
+        // A stale removal of the same identity fails before touching the
+        // reader pool.
+        assert!(matches!(
+            worker.remove_stream(first),
+            Err(HttpWorkerError::StreamMissing { stream: s }) if s == first
+        ));
+        assert_eq!(worker.request_readers.len(), 0);
+        // A replacement stream reuses the reader slot; removing the stale
+        // stream identity must not free the live reader of the replacement.
+        let second = worker
+            .allocate_stream(session(2, 1), parent, SessionStreamDirection::Bidi)
+            .expect("allocate second request stream");
+        worker
+            .process_request_bytes(second, session(2, 1), &[0x01, 0x00])
+            .expect("feed headers on second stream");
+        let live_reader = worker
+            .get_stream(second)
+            .expect("live stream")
+            .request_reader
+            .expect("reader reallocated for the second stream");
+        assert!(matches!(
+            worker.remove_stream(first),
+            Err(HttpWorkerError::StreamMissing { stream: s }) if s == first
+        ));
+        assert_eq!(worker.request_readers.len(), 1);
+        assert_eq!(
+            worker.get_stream(second).expect("live stream").request_reader,
+            Some(live_reader),
+            "the stale removal left the live reader in place"
+        );
+    }
+
+    #[test]
+    fn request_bytes_exact_consumed_and_trailing_bytes() {
+        let (mut worker, stream, session) = worker_with_request_stream();
+        // HEADERS payload plus the whole next DATA frame arrive in one call:
+        // only the HEADERS frame's bytes are consumed, the DATA bytes trail.
+        let (read, consumed) = worker
+            .process_request_bytes(
+                stream,
+                session,
+                &[0x01, 0x04, b'a', b'b', b'c', b'd', 0x00, 0x00],
+            )
+            .expect("feed headers and trailing data");
+        assert_eq!(read, RequestFrameRead::Headers(b"abcd".to_vec()));
+        assert_eq!(consumed, 6);
+        // The trailing bytes are passed back and drained exactly.
+        let (read, consumed) = worker
+            .process_request_bytes(stream, session, &[0x00, 0x00])
+            .expect("feed trailing data");
+        assert_eq!(read, RequestFrameRead::Drained(FrameType::DATA, 0));
+        assert_eq!(consumed, 2);
+        // PUSH_PROMISE is forbidden on a request stream: a typed protocol
+        // error carrying the HTTP/3 error code.
+        let err = worker
+            .process_request_bytes(stream, session, &[0x05, 0x00])
+            .expect_err("push promise rejected");
+        assert!(matches!(
+            err,
+            RequestReadError::Protocol(RequestFrameError::Phase(_))
+        ));
+        assert_eq!(err.error_code(), Some(ErrorCode::FrameUnexpected));
+    }
+
+    #[test]
+    fn request_bytes_unknown_drain_then_headers() {
+        let (mut worker, stream, session) = worker_with_request_stream();
+        // An unknown frame (0x2a) completes mid-call; the trailing HEADERS
+        // bytes are left unconsumed for the next call.
+        let (read, consumed) = worker
+            .process_request_bytes(
+                stream,
+                session,
+                &[0x2a, 0x03, b'x', b'y', b'z', 0x01, 0x02, b'h', b'i'],
+            )
+            .expect("feed unknown frame and trailing headers");
+        assert_eq!(
+            read,
+            RequestFrameRead::Drained(FrameType::from_value(0x2a).unwrap(), 3)
+        );
+        assert_eq!(consumed, 5);
+        let (read, consumed) = worker
+            .process_request_bytes(stream, session, &[0x01, 0x02, b'h', b'i'])
+            .expect("feed trailing headers");
+        assert_eq!(read, RequestFrameRead::Headers(b"hi".to_vec()));
+        assert_eq!(consumed, 4);
+    }
+
+    #[test]
+    fn request_bytes_stale_stream_is_typed_error() {
+        let (mut worker, stream, session) = worker_with_request_stream();
+        worker.remove_stream(stream).expect("remove stream");
+        assert!(matches!(
+            worker.process_request_bytes(stream, session, &[0x01, 0x00]),
+            Err(RequestReadError::Worker(HttpWorkerError::StreamMissing {
+                stream: s,
+            })) if s == stream
+        ));
+    }
+
+    #[test]
+    fn request_bytes_foreign_session_is_typed_error() {
+        let (mut worker, stream, bound) = worker_with_request_stream();
+        let foreign = session(2, 1);
+        assert!(matches!(
+            worker.process_request_bytes(stream, foreign, &[0x01, 0x00]),
+            Err(RequestReadError::Worker(HttpWorkerError::StreamSessionMismatch {
+                stream: s,
+                expected,
+                actual,
+            })) if s == stream && expected == foreign && actual == bound
+        ));
+    }
+
+    #[test]
+    fn request_bytes_uni_stream_rejected() {
+        let mut worker = HttpWorker::with_capacities(4, 4);
+        let parent = worker.allocate(session(1, 0)).expect("parent context");
+        let uni = worker
+            .allocate_stream(session(2, 0), parent, SessionStreamDirection::Uni)
+            .expect("allocate uni stream");
+        assert!(matches!(
+            worker.process_request_bytes(uni, session(2, 0), &[0x01, 0x00]),
+            Err(RequestReadError::Worker(HttpWorkerError::RequestStreamNotBidi {
+                stream: s,
+                direction,
+            })) if s == uni && direction == SessionStreamDirection::Uni
         ));
     }
 }

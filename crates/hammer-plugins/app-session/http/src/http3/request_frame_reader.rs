@@ -18,9 +18,11 @@
 //! frame metadata, and a payload byte counter. The only allocation is the
 //! single bounded `Vec` that captures a complete HEADERS field section.
 //!
-//! Awaiting its consumer: the request-stream slice wires this reader, the
-//! frame state machine, and the field-section validation into stream
-//! dispatch, at which point the `dead_code` allow can go.
+//! The worker-owned parsing API (`RequestFrameReader` through
+//! `HttpWorker::process_request_bytes`) exists and is consumed by the
+//! worker and its tests; production builtin RX callback wiring is a later
+//! seam (`builtin_rx` remains `None`), after which the `dead_code` allow
+//! can be removed.
 #![allow(dead_code)]
 
 use crate::http3::proto::error::ErrorCode;
@@ -54,10 +56,10 @@ pub(crate) enum RequestFrameError {
 
 impl RequestFrameError {
     /// The connection error code to send.
-    pub(crate) fn error_code(self) -> ErrorCode {
+    pub(crate) fn error_code(&self) -> ErrorCode {
         match self {
             RequestFrameError::Frame(e) => e.error_code().unwrap_or(ErrorCode::FrameError),
-            RequestFrameError::Phase(code) => code,
+            RequestFrameError::Phase(code) => *code,
             RequestFrameError::OversizedFieldSection(_) => ErrorCode::ExcessiveLoad,
         }
     }
