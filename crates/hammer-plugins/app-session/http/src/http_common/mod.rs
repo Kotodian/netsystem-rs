@@ -10,8 +10,11 @@
 //!
 //! Offsets follow the app writer `hc_msg_set_offsets`
 //! (`http_client.c:164-170`): path at 0, headers after the path, body after
-//! the headers; `data.len` is the sum of the three lengths. Header-list
-//! entries follow `http_add_header2` / `http_add_custom_header2`
+//! the headers; `data.len` is the sum of the three lengths. The server side
+//! tiles the same data area as `[authority][path][query][header list][body]`
+//! with one offset/len pair per span; `decode` accepts both tilings through
+//! the checked chain in [`decode`]. Header-list entries follow
+//! `http_add_header2` / `http_add_custom_header2`
 //! (`third_party/vpp/src/plugins/http/http.h:1103-1161`):
 //!
 //! ```text
@@ -206,10 +209,11 @@ pub enum DecodeError {
     InvalidScheme { value: u8 },
     /// Discriminant is not a valid `http_upgrade_proto_t`.
     InvalidUpgradeProto { value: u8 },
-    /// Offsets contradict the app publish layout (path at 0, headers after
-    /// the path, body after the headers, `len` equal to the total).
+    /// Offsets contradict the tiled data-area layout (authority, path,
+    /// query, header list, body in order, `len` equal to the body end).
     LayoutMismatch,
-    /// A declared span (authority/query) lies outside the data area.
+    /// A declared request-target span (authority/path/query) lies outside
+    /// the data area.
     InvalidDataSpan,
     /// A header entry extends past the end of the declared header region
     /// (also raised when entries end early: the leftover stub is then shorter
@@ -236,7 +240,7 @@ impl core::fmt::Display for DecodeError {
             Self::InvalidUpgradeProto { value } => {
                 write!(f, "invalid upgrade protocol discriminant {value}")
             }
-            Self::LayoutMismatch => write!(f, "offsets contradict the app publish layout"),
+            Self::LayoutMismatch => write!(f, "offsets contradict the tiled request layout"),
             Self::InvalidDataSpan => write!(f, "declared span outside the data area"),
             Self::HeaderListOverrun => write!(f, "header entry past the header region"),
         }
@@ -657,12 +661,13 @@ impl InboundLayout {
 /// 88-byte header from a stack buffer, then each borrowed span) and a single
 /// commit as the only visibility point. No FIFO event flag is raised here.
 ///
-/// Hammer differences (documented; `decode` is unchanged): VPP servers may
-/// stream large bodies out of the data area (`HTTP_DATA_STREAMING`); this
-/// seam publishes the body inline so `decode`'s inline-only contract holds.
-/// `decode` also validates the app-writer layout (path at data offset 0), so
-/// a frame with a non-empty authority/query is deliberately not
-/// `decode`-able — the server layout differs and `decode` is not loosened.
+/// Hammer differences (documented): VPP servers may stream large bodies out
+/// of the data area (`HTTP_DATA_STREAMING`); this seam publishes one complete
+/// request with the body inline and `data.len` including it, so `decode`'s
+/// inline-only contract holds. That is a bounded Hammer choice for this
+/// issue, not exact HTTP/3 streaming parity: a streamed body remains a later
+/// seam. `decode` accepts the server layout — authority first, then path,
+/// query, header list, body — via the same checked tiling as the app layout.
 #[allow(dead_code)] // tests exercise it; the app-session publisher wires it in a later seam
 pub(crate) fn publish_inbound_request(
     fifo: &Fifo,
@@ -763,6 +768,12 @@ fn encode_header(header: AppHeader<'_>, buf: &mut [u8], w: usize) -> usize {
 /// Checked decode of one complete request from `buf`. Requires `buf` to be
 /// exactly `88 + data.len` bytes: shorter input is [`DecodeError::Truncated`],
 /// longer [`DecodeError::TrailingData`]. Returns spans borrowing `buf`.
+///
+/// The data-area spans must tile in order — authority, path, query (a
+/// zero-length query may sit anywhere, as the app writer leaves its offset
+/// at 0), header list, body — each inside the data area, with `data.len`
+/// equal to the body end. Both the app-writer layout (path at 0) and the
+/// server layout (authority first) decode.
 pub fn decode(buf: &[u8]) -> Result<DecodedRequest<'_>, DecodeError> {
     if buf.len() < MSG_HEADER_LEN {
         return Err(DecodeError::Truncated);
@@ -794,37 +805,53 @@ pub fn decode(buf: &[u8]) -> Result<DecodedRequest<'_>, DecodeError> {
     let body_offset = u32_le(buf, 60).ok_or(DecodeError::Truncated)?;
     let body_len = u64_le(buf, 64).ok_or(DecodeError::Truncated)?;
 
-    // App publish layout (hc_msg_set_offsets): path at 0, headers after the
-    // path, body after the headers, data.len equal to the sum.
-    if target_path_offset != 0 {
-        return Err(DecodeError::LayoutMismatch);
-    }
-    if headers_offset != target_path_len {
-        return Err(DecodeError::LayoutMismatch);
-    }
-    let headers_end = (headers_offset as u64) + (headers_len as u64);
-    if headers_end > u32::MAX as u64 {
-        // The header region end must be representable as a u32 body offset.
-        return Err(DecodeError::LengthOverflow);
-    }
-    if body_offset as u64 != headers_end {
-        return Err(DecodeError::LayoutMismatch);
-    }
-    let body_end = headers_end
+    // Span ends, checked against the u32 offset width: an end beyond u32::MAX
+    // could not be represented as the next span's offset.
+    let authority_end = target_authority_offset
+        .checked_add(target_authority_len)
+        .ok_or(DecodeError::LengthOverflow)?;
+    let path_end = target_path_offset
+        .checked_add(target_path_len)
+        .ok_or(DecodeError::LengthOverflow)?;
+    let query_end = target_query_offset
+        .checked_add(target_query_len)
+        .ok_or(DecodeError::LengthOverflow)?;
+    let headers_end = headers_offset
+        .checked_add(headers_len)
+        .ok_or(DecodeError::LengthOverflow)?;
+    let body_end = (body_offset as u64)
         .checked_add(body_len)
         .ok_or(DecodeError::LengthOverflow)?;
-    if data_len != body_end {
-        return Err(DecodeError::LayoutMismatch);
-    }
-    // Authority/query spans (CONNECT-UDP payloads) must stay inside the data
-    // area; both are empty for the plain publish path.
-    for (off, len) in [
-        (target_authority_offset as u64, target_authority_len as u64),
-        (target_query_offset as u64, target_query_len as u64),
-    ] {
-        if off.checked_add(len).is_none_or(|end| end > data_len) {
+
+    // The request-target pseudo-field spans (authority, path, query) must
+    // stay inside the data area; the headers and body spans are then pinned
+    // inside it by the tiling chain below (`headers_end == body_offset` and
+    // `data.len == body_end`).
+    for end in [authority_end as u64, path_end as u64, query_end as u64] {
+        if end > data_len {
             return Err(DecodeError::InvalidDataSpan);
         }
+    }
+
+    // Offsets tile the data area in order — [authority][path][query][header
+    // list][body] — with `data.len` equal to the body end. This accepts both
+    // the app-writer layout (path at 0, empty authority/query) and the server
+    // layout with the authority first. A zero-length query may sit anywhere,
+    // as the app writer leaves its offset at 0.
+    if target_path_offset != authority_end {
+        return Err(DecodeError::LayoutMismatch);
+    }
+    if target_query_len != 0 && target_query_offset != path_end {
+        return Err(DecodeError::LayoutMismatch);
+    }
+    if headers_offset != path_end.max(query_end) {
+        return Err(DecodeError::LayoutMismatch);
+    }
+    if body_offset != headers_end {
+        return Err(DecodeError::LayoutMismatch);
+    }
+    if data_len != body_end {
+        return Err(DecodeError::LayoutMismatch);
     }
 
     let expected = MSG_HEADER_LEN
@@ -839,17 +866,33 @@ pub fn decode(buf: &[u8]) -> Result<DecodedRequest<'_>, DecodeError> {
 
     // All spans were validated above; `get_span` keeps every slice take
     // bounds-checked and typed rather than panicking.
-    let path =
-        get_span(buf, MSG_HEADER_LEN, target_path_len as usize).ok_or(DecodeError::Truncated)?;
+    let authority = get_span(
+        buf,
+        MSG_HEADER_LEN + target_authority_offset as usize,
+        target_authority_len as usize,
+    )
+    .ok_or(DecodeError::Truncated)?;
+    let path = get_span(
+        buf,
+        MSG_HEADER_LEN + target_path_offset as usize,
+        target_path_len as usize,
+    )
+    .ok_or(DecodeError::Truncated)?;
+    let query = get_span(
+        buf,
+        MSG_HEADER_LEN + target_query_offset as usize,
+        target_query_len as usize,
+    )
+    .ok_or(DecodeError::Truncated)?;
     let header_region = get_span(
         buf,
-        MSG_HEADER_LEN + target_path_len as usize,
+        MSG_HEADER_LEN + headers_offset as usize,
         headers_len as usize,
     )
     .ok_or(DecodeError::Truncated)?;
     let body = get_span(
         buf,
-        MSG_HEADER_LEN + headers_offset as usize + headers_len as usize,
+        MSG_HEADER_LEN + body_offset as usize,
         body_len as usize,
     )
     .ok_or(DecodeError::Truncated)?;
@@ -859,19 +902,9 @@ pub fn decode(buf: &[u8]) -> Result<DecodedRequest<'_>, DecodeError> {
         method,
         scheme,
         upgrade_proto,
-        target_authority: get_span(
-            buf,
-            MSG_HEADER_LEN + target_authority_offset as usize,
-            target_authority_len as usize,
-        )
-        .ok_or(DecodeError::Truncated)?,
+        target_authority: authority,
         target_path: path,
-        target_query: get_span(
-            buf,
-            MSG_HEADER_LEN + target_query_offset as usize,
-            target_query_len as usize,
-        )
-        .ok_or(DecodeError::Truncated)?,
+        target_query: query,
         body,
         header_region,
     })

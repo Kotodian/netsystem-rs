@@ -706,14 +706,60 @@ fn publish_inbound_request_empty_query_and_body() {
 }
 
 #[test]
-fn inbound_authority_layout_is_not_decodeable() {
-    // Documented difference: `decode` validates the app-writer layout (path at
-    // data offset 0). The server layout puts the authority first, so the
-    // frame is deliberately not `decode`-able; `decode` is not loosened.
+fn decode_server_layout_golden() {
+    // The server layout puts the authority first and tiles the data area as
+    // [authority][path][query][header list][body]; `decode` accepts it via
+    // the checked tiling (no path-at-0 assumption).
     let fifo = local_fifo(8192);
     publish_inbound_request(&fifo, &inbound_request_value()).unwrap();
     let observed = read_published(&fifo, 148);
-    assert_eq!(decode(&observed).unwrap_err(), DecodeError::LayoutMismatch);
+    let decoded = decode(&observed).unwrap();
+    assert_eq!(decoded.method, ReqMethod::Post);
+    assert_eq!(decoded.scheme, UrlScheme::Http);
+    assert_eq!(decoded.upgrade_proto, UpgradeProto::Na);
+    assert_eq!(decoded.target_authority, b"example.com");
+    assert_eq!(decoded.target_path, b"/index.html");
+    assert_eq!(decoded.target_query, b"a=1");
+    assert_eq!(decoded.body, b"abc");
+    // The header iterator begins at the regular header list, right after the
+    // query span, and never sees the authority/path/query pseudo fields.
+    let headers: Vec<_> = decoded.headers().collect();
+    assert_eq!(headers.len(), 2);
+    assert_eq!(headers[0].name, DecodedHeaderName::Known(header_name::ACCEPT));
+    assert_eq!(headers[0].value, b"text/html");
+    assert_eq!(headers[1].name, DecodedHeaderName::Custom(b"X-Test"));
+    assert_eq!(headers[1].value, b"1");
+}
+
+#[test]
+fn decode_rejects_bad_server_layout_offsets() {
+    // Negative offset mutations of the server-layout golden frame: each
+    // tiling equality is violated independently.
+    let mut b = golden_inbound_request();
+    // path_offset (36) must equal authority_end = 0 + 11.
+    b[36..40].copy_from_slice(&10u32.to_le_bytes());
+    assert_eq!(decode(&b).unwrap_err(), DecodeError::LayoutMismatch);
+    let mut b = golden_inbound_request();
+    // Non-empty query_offset (44) must equal path_end = 11 + 11 = 22.
+    b[44..48].copy_from_slice(&21u32.to_le_bytes());
+    assert_eq!(decode(&b).unwrap_err(), DecodeError::LayoutMismatch);
+    let mut b = golden_inbound_request();
+    // headers_offset (52) must equal max(path_end, query_end) = 25.
+    b[52..56].copy_from_slice(&24u32.to_le_bytes());
+    assert_eq!(decode(&b).unwrap_err(), DecodeError::LayoutMismatch);
+    let mut b = golden_inbound_request();
+    // body_offset (60) must equal headers_end = 25 + 32 = 57.
+    b[60..64].copy_from_slice(&56u32.to_le_bytes());
+    assert_eq!(decode(&b).unwrap_err(), DecodeError::LayoutMismatch);
+    let mut b = golden_inbound_request();
+    // data.len (16) must equal body_end = 57 + 3 = 60.
+    b[16..24].copy_from_slice(&59u64.to_le_bytes());
+    assert_eq!(decode(&b).unwrap_err(), DecodeError::LayoutMismatch);
+    // A pseudo-field span leaving the data area is still InvalidDataSpan.
+    let mut b = golden_inbound_request();
+    b[28..32].copy_from_slice(&60u32.to_le_bytes());
+    b[32..36].copy_from_slice(&1u32.to_le_bytes());
+    assert_eq!(decode(&b).unwrap_err(), DecodeError::InvalidDataSpan);
 }
 
 #[test]
