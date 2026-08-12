@@ -1,0 +1,405 @@
+//! Focused ABI tests for the VPP HTTP FIFO codec.
+//!
+//! `layout_matches_vpp` pins sizes/offsets against values verified with a C
+//! compiler probe of the structs in
+//! `third_party/vpp/src/plugins/http/http.h`. `golden_request` builds the
+//! exact expected on-FIFO bytes independently of the codec, so the encode
+//! test is a true golden-byte test.
+
+use core::mem::offset_of;
+
+use super::*;
+
+/// Headers of the golden request, static so tests can borrow them.
+static GOLDEN_HEADERS: [AppHeader<'static>; 2] = [
+    AppHeader::Known {
+        flags: FieldLineFlags::empty(),
+        name: header_name::ACCEPT,
+        value: b"text/html",
+    },
+    AppHeader::Custom {
+        flags: FieldLineFlags::empty(),
+        name: b"X-Test",
+        value: b"1",
+    },
+];
+
+/// Golden request, byte-for-byte independent of the codec:
+/// GET /index.html, headers Accept: text/html and X-Test: 1, body "abc".
+/// Total = 88 (msg) + 11 (path) + 32 (header list) + 3 (body) = 134 bytes.
+fn golden_request() -> Vec<u8> {
+    let mut b = Vec::with_capacity(134);
+    // http_msg_t: type=REQUEST(0), method_or_code=GET(0), data.type=INLINE(0).
+    b.extend_from_slice(&[0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]);
+    b.extend_from_slice(&[0, 0, 0, 0]); // `http_msg_data_t` padding: type @0, len @8
+    // data.len = 11 + 32 + 3 = 46.
+    b.extend_from_slice(&46u64.to_le_bytes());
+    b.push(0); // scheme: HTTP
+    b.extend_from_slice(&[0, 0, 0]); // struct padding
+    // target_authority_offset/len @28, target_path_offset=0 @36, path_len=11
+    // @40, query off/len @44.
+    b.extend_from_slice(&[0, 0, 0, 0, 0, 0, 0, 0]);
+    b.extend_from_slice(&0u32.to_le_bytes());
+    b.extend_from_slice(&11u32.to_le_bytes());
+    b.extend_from_slice(&[0, 0, 0, 0, 0, 0, 0, 0]);
+    // headers_offset=11, headers_len=32, body_offset=43, body_len=3.
+    b.extend_from_slice(&11u32.to_le_bytes());
+    b.extend_from_slice(&32u32.to_le_bytes());
+    b.extend_from_slice(&43u32.to_le_bytes());
+    b.extend_from_slice(&3u64.to_le_bytes());
+    b.extend_from_slice(&0u64.to_le_bytes()); // headers_ctx
+    b.push(0); // upgrade_proto: NA
+    b.extend_from_slice(&[0; 7]); // struct tail padding
+    assert_eq!(b.len(), 88);
+    b.extend_from_slice(b"/index.html");
+    // Entry 1: known header ACCEPT (4), flags 0, value_len 9:
+    // [flags:u16][name:u16][value_len:u32][value] = 8 + 9 = 17 bytes.
+    b.extend_from_slice(&[0, 0]);
+    b.extend_from_slice(&4u16.to_le_bytes());
+    b.extend_from_slice(&9u32.to_le_bytes());
+    b.extend_from_slice(b"text/html");
+    // Entry 2: custom name "X-Test", flags CUSTOM_NAME(4), name_len 6,
+    // value_len 1: [flags:u16][name_len:u16][name][value_len:u32][value]
+    // = 8 + 6 + 1 = 15 bytes. No padding between name and value_len.
+    b.extend_from_slice(&[4, 0]);
+    b.extend_from_slice(&6u16.to_le_bytes());
+    b.extend_from_slice(b"X-Test");
+    b.extend_from_slice(&1u32.to_le_bytes());
+    b.extend_from_slice(b"1");
+    b.extend_from_slice(b"abc");
+    assert_eq!(b.len(), 134);
+    b
+}
+
+fn golden_request_value() -> Request<'static> {
+    Request {
+        method: ReqMethod::Get,
+        scheme: UrlScheme::Http,
+        target_path: b"/index.html",
+        headers: &GOLDEN_HEADERS,
+        body: b"abc",
+    }
+}
+
+#[test]
+fn layout_matches_vpp() {
+    // Sizes/offsets verified with a C compiler probe of the VPP structs
+    // (http.h:87-91, 395-401, 412-418, 426-455).
+    assert_eq!(size_of::<HttpMsg>(), 88);
+    assert_eq!(size_of::<MsgData>(), 80);
+    assert_eq!(offset_of!(HttpMsg, msg_type), 0);
+    assert_eq!(offset_of!(HttpMsg, method_or_code), 4);
+    assert_eq!(offset_of!(HttpMsg, data), 8);
+    assert_eq!(offset_of!(MsgData, data_type), 0);
+    assert_eq!(offset_of!(MsgData, len), 8);
+    assert_eq!(offset_of!(MsgData, scheme), 16);
+    assert_eq!(offset_of!(MsgData, target_authority_offset), 20);
+    assert_eq!(offset_of!(MsgData, target_path_offset), 28);
+    assert_eq!(offset_of!(MsgData, target_path_len), 32);
+    assert_eq!(offset_of!(MsgData, headers_offset), 44);
+    assert_eq!(offset_of!(MsgData, headers_len), 48);
+    assert_eq!(offset_of!(MsgData, body_offset), 52);
+    assert_eq!(offset_of!(MsgData, body_len), 56);
+    assert_eq!(offset_of!(MsgData, headers_ctx), 64);
+    assert_eq!(offset_of!(MsgData, upgrade_proto), 72);
+    // Enum wire widths: plain C int enums are 4 bytes, `: u8`/`: u16` the rest.
+    assert_eq!(size_of::<MsgType>(), 4);
+    assert_eq!(size_of::<ReqMethod>(), 1);
+    assert_eq!(size_of::<MsgDataType>(), 4);
+    assert_eq!(size_of::<UrlScheme>(), 1);
+    assert_eq!(size_of::<UpgradeProto>(), 1);
+    assert_eq!(size_of::<FieldLineFlags>(), 2);
+    // One header entry prefix: flags(2) + name/name_len(2) + value_len(4) = 8.
+    let req = golden_request_value();
+    assert_eq!(req.encoded_len().unwrap(), 134);
+}
+
+#[test]
+fn encode_matches_golden_bytes() {
+    let req = golden_request_value();
+    let mut buf = vec![0u8; req.encoded_len().unwrap()];
+    let n = req.encode(&mut buf).unwrap();
+    assert_eq!(n, 134);
+    assert_eq!(buf, golden_request());
+}
+
+#[test]
+fn decode_matches_golden_bytes() {
+    let golden = golden_request();
+    let decoded = decode(&golden).unwrap();
+    assert_eq!(decoded.method, ReqMethod::Get);
+    assert_eq!(decoded.scheme, UrlScheme::Http);
+    assert_eq!(decoded.upgrade_proto, UpgradeProto::Na);
+    assert_eq!(decoded.target_authority, b"");
+    assert_eq!(decoded.target_path, b"/index.html");
+    assert_eq!(decoded.target_query, b"");
+    assert_eq!(decoded.body, b"abc");
+    let headers: Vec<DecodedHeader<'_>> = decoded.headers().collect();
+    assert_eq!(headers.len(), 2);
+    assert_eq!(headers[0].flags, FieldLineFlags::empty());
+    assert_eq!(
+        headers[0].name,
+        DecodedHeaderName::Known(header_name::ACCEPT)
+    );
+    assert_eq!(headers[0].value, b"text/html");
+    assert_eq!(
+        headers[1].flags,
+        FieldLineFlags(FieldLineFlags::CUSTOM_NAME)
+    );
+    assert_eq!(headers[1].name, DecodedHeaderName::Custom(b"X-Test"));
+    assert_eq!(headers[1].value, b"1");
+}
+
+#[test]
+fn encode_then_decode_round_trip() {
+    let req = golden_request_value();
+    let mut buf = vec![0u8; req.encoded_len().unwrap()];
+    let n = req.encode(&mut buf).unwrap();
+    let decoded = decode(&buf[..n]).unwrap();
+    assert_eq!(decoded.method, req.method);
+    assert_eq!(decoded.scheme, req.scheme);
+    assert_eq!(decoded.target_path, req.target_path);
+    assert_eq!(decoded.body, req.body);
+    let decoded_headers: Vec<_> = decoded.headers().collect();
+    assert_eq!(decoded_headers.len(), req.headers.len());
+    assert_eq!(decoded_headers[0].value, b"text/html");
+    assert_eq!(
+        decoded_headers[1].name,
+        DecodedHeaderName::Custom(b"X-Test")
+    );
+    assert_eq!(decoded_headers[1].value, b"1");
+}
+
+#[test]
+fn decode_minimal_request() {
+    let req = Request {
+        method: ReqMethod::Post,
+        scheme: UrlScheme::Https,
+        target_path: b"/",
+        headers: &[],
+        body: b"",
+    };
+    let mut buf = vec![0u8; req.encoded_len().unwrap()];
+    let n = req.encode(&mut buf).unwrap();
+    let decoded = decode(&buf[..n]).unwrap();
+    assert_eq!(decoded.method, ReqMethod::Post);
+    assert_eq!(decoded.scheme, UrlScheme::Https);
+    assert_eq!(decoded.target_path, b"/");
+    assert_eq!(decoded.body, b"");
+    assert_eq!(decoded.headers().count(), 0);
+    assert_eq!(n, 89); // 88 + 1 path byte + 0 headers + 0 body
+}
+
+#[test]
+fn decode_rejects_truncated() {
+    let golden = golden_request();
+    for cut in 0..golden.len() {
+        assert_eq!(
+            decode(&golden[..cut]).unwrap_err(),
+            DecodeError::Truncated,
+            "cut at {cut}"
+        );
+    }
+}
+
+#[test]
+fn decode_rejects_trailing_data() {
+    let mut golden = golden_request();
+    golden.push(0);
+    assert_eq!(decode(&golden).unwrap_err(), DecodeError::TrailingData);
+}
+
+#[test]
+fn decode_rejects_bad_discriminants() {
+    let mut b = golden_request();
+    // Unknown msg type.
+    b[0] = 7;
+    assert_eq!(
+        decode(&b).unwrap_err(),
+        DecodeError::InvalidMsgType { value: 7 }
+    );
+    b[0] = 1; // HTTP_MSG_REPLY: not publishable in this seam.
+    assert_eq!(
+        decode(&b).unwrap_err(),
+        DecodeError::InvalidMsgType { value: 1 }
+    );
+    let mut b = golden_request();
+    // Unknown method byte (offset 4).
+    b[4] = 6;
+    assert_eq!(
+        decode(&b).unwrap_err(),
+        DecodeError::InvalidMethod { value: 6 }
+    );
+    let mut b = golden_request();
+    // PTR data type (offset 8): out of seam scope.
+    b[8] = 1;
+    assert_eq!(
+        decode(&b).unwrap_err(),
+        DecodeError::InvalidDataType { value: 1 }
+    );
+    let mut b = golden_request();
+    // Unknown scheme (offset 24).
+    b[24] = 9;
+    assert_eq!(
+        decode(&b).unwrap_err(),
+        DecodeError::InvalidScheme { value: 9 }
+    );
+    let mut b = golden_request();
+    // Unknown upgrade proto (offset 80).
+    b[80] = 4;
+    assert_eq!(
+        decode(&b).unwrap_err(),
+        DecodeError::InvalidUpgradeProto { value: 4 }
+    );
+}
+
+#[test]
+fn decode_rejects_bad_offsets() {
+    let mut b = golden_request();
+    // headers_offset (52) disagrees with target_path_len (40 = 11).
+    b[52] = 12;
+    assert_eq!(decode(&b).unwrap_err(), DecodeError::LayoutMismatch);
+    let mut b = golden_request();
+    // body_offset (60) must equal headers_offset + headers_len = 51.
+    b[60] = 50;
+    assert_eq!(decode(&b).unwrap_err(), DecodeError::LayoutMismatch);
+    let mut b = golden_request();
+    // data.len (16) must equal 54.
+    b[16] = 53;
+    assert_eq!(decode(&b).unwrap_err(), DecodeError::LayoutMismatch);
+    let mut b = golden_request();
+    // headers_len = u32::MAX: headers_offset + headers_len overflows.
+    b[56..60].copy_from_slice(&u32::MAX.to_le_bytes());
+    assert_eq!(decode(&b).unwrap_err(), DecodeError::LengthOverflow);
+    let mut b = golden_request();
+    // data.len = u64::MAX: fails the data_len == body_end equality.
+    b[16..24].copy_from_slice(&u64::MAX.to_le_bytes());
+    assert_eq!(decode(&b).unwrap_err(), DecodeError::LayoutMismatch);
+    let mut b = golden_request();
+    // Authority span (offset 28, len 32) outside the 54-byte data area.
+    b[28..32].copy_from_slice(&60u32.to_le_bytes());
+    b[32..36].copy_from_slice(&1u32.to_le_bytes());
+    assert_eq!(decode(&b).unwrap_err(), DecodeError::InvalidDataSpan);
+}
+
+/// Build a wire frame with offsets kept consistent with the given path,
+/// header-region and body bytes, independent of the codec.
+fn build_frame(path: &[u8], region: &[u8], body: &[u8]) -> Vec<u8> {
+    let mut b = Vec::new();
+    b.extend_from_slice(&[0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]); // type, method, data.type
+    b.extend_from_slice(&[0, 0, 0, 0]); // struct padding: type @0, len @8
+    b.extend_from_slice(&((path.len() + region.len() + body.len()) as u64).to_le_bytes());
+    b.push(0); // scheme
+    b.extend_from_slice(&[0, 0, 0]); // struct padding
+    b.extend_from_slice(&[0, 0, 0, 0, 0, 0, 0, 0]); // authority off/len
+    b.extend_from_slice(&0u32.to_le_bytes()); // path offset
+    b.extend_from_slice(&(path.len() as u32).to_le_bytes());
+    b.extend_from_slice(&[0, 0, 0, 0, 0, 0, 0, 0]); // query off/len
+    b.extend_from_slice(&(path.len() as u32).to_le_bytes()); // headers offset
+    b.extend_from_slice(&(region.len() as u32).to_le_bytes()); // headers len
+    b.extend_from_slice(&((path.len() + region.len()) as u32).to_le_bytes()); // body offset
+    b.extend_from_slice(&(body.len() as u64).to_le_bytes());
+    b.extend_from_slice(&0u64.to_le_bytes()); // headers_ctx
+    b.push(0); // upgrade proto
+    b.extend_from_slice(&[0; 7]); // tail padding
+    b.extend_from_slice(path);
+    b.extend_from_slice(region);
+    b.extend_from_slice(body);
+    b
+}
+
+#[test]
+fn decode_rejects_bad_header_lists() {
+    // Region too short for even one entry (needs >= 8 bytes).
+    let frame = build_frame(b"/", &[0, 0, 0, 0], b"");
+    assert_eq!(decode(&frame).unwrap_err(), DecodeError::HeaderListOverrun);
+    // Known entry declaring value_len 5 with only 8 of 13 bytes present.
+    let mut region = vec![0, 0, 0, 0, 5, 0, 0, 0];
+    let frame = build_frame(b"/", &region, b"");
+    assert_eq!(decode(&frame).unwrap_err(), DecodeError::HeaderListOverrun);
+    // Custom entry whose name_len claims bytes past the region end.
+    region = vec![4, 0, 100, 0];
+    let frame = build_frame(b"/", &region, b"");
+    assert_eq!(decode(&frame).unwrap_err(), DecodeError::HeaderListOverrun);
+    // Valid entry followed by a 2-byte stub: leftover shorter than the
+    // 8-byte entry prefix.
+    let mut region = vec![0, 0, 0, 0, 1, 0, 0, 0, b'a'];
+    region.extend_from_slice(&[0, 0]);
+    let frame = build_frame(b"/", &region, b"");
+    assert_eq!(decode(&frame).unwrap_err(), DecodeError::HeaderListOverrun);
+    // Positive control: one exact-fit known entry decodes.
+    let region = vec![0, 0, 0, 0, 1, 0, 0, 0, b'a'];
+    let frame = build_frame(b"/", &region, b"");
+    let decoded = decode(&frame).unwrap();
+    let headers: Vec<_> = decoded.headers().collect();
+    assert_eq!(headers.len(), 1);
+    assert_eq!(headers[0].name, DecodedHeaderName::Known(0));
+    assert_eq!(headers[0].value, b"a");
+}
+
+#[test]
+fn encode_rejects_bad_input() {
+    let req = golden_request_value();
+    let mut small = [0u8; 10];
+    assert_eq!(
+        req.encode(&mut small),
+        Err(EncodeError::BufferTooSmall {
+            needed: 134,
+            available: 10
+        })
+    );
+    // Custom name longer than u16::MAX.
+    let long = Request {
+        method: ReqMethod::Get,
+        scheme: UrlScheme::Http,
+        target_path: b"/",
+        headers: &[AppHeader::Custom {
+            flags: FieldLineFlags::empty(),
+            name: &[0u8; u16::MAX as usize + 1],
+            value: b"",
+        }],
+        body: b"",
+    };
+    assert_eq!(long.encoded_len(), Err(EncodeError::LengthOverflow));
+    // CUSTOM_NAME bit set by the caller.
+    let reserved = Request {
+        method: ReqMethod::Get,
+        scheme: UrlScheme::Http,
+        target_path: b"/",
+        headers: &[AppHeader::Known {
+            flags: FieldLineFlags(FieldLineFlags::CUSTOM_NAME),
+            name: header_name::ACCEPT,
+            value: b"v",
+        }],
+        body: b"",
+    };
+    assert_eq!(reserved.encoded_len(), Err(EncodeError::ReservedFlag));
+}
+
+#[test]
+fn encode_custom_never_index_flags() {
+    // Custom header carrying NEVER_INDEX must encode flags = 4 | 2 = 6.
+    let req = Request {
+        method: ReqMethod::Put,
+        scheme: UrlScheme::Http,
+        target_path: b"/",
+        headers: &[AppHeader::Custom {
+            flags: FieldLineFlags(FieldLineFlags::NEVER_INDEX),
+            name: b"X-A",
+            value: b"b",
+        }],
+        body: b"",
+    };
+    let mut buf = vec![0u8; req.encoded_len().unwrap()];
+    let n = req.encode(&mut buf).unwrap();
+    assert_eq!(
+        decode(&buf[..n])
+            .unwrap()
+            .headers()
+            .next()
+            .unwrap()
+            .flags
+            .bits(),
+        6
+    );
+}
