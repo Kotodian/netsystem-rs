@@ -859,3 +859,77 @@ fn publish_inbound_request_encode_error_leaves_fifo_usable() {
     publish_inbound_request(&fifo, &inbound_request_value()).unwrap();
     assert_eq!(read_published(&fifo, 148), golden_inbound_request());
 }
+
+// --- Body-chunk FIFO publish -------------------------------------------------
+
+#[test]
+fn publish_body_chunk_writes_exact_bytes_across_split_reservation() {
+    // An 8192-byte FIFO carves 4096-byte data chunks; a 5000-byte chunk
+    // spans the boundary, so the reservation and scatter copy cross two
+    // chunks with no temporary buffer.
+    let chunk: Vec<u8> = (0..5000).map(|i| (i % 251) as u8).collect();
+    let fifo = local_fifo(8192);
+    publish_body_chunk(&fifo, &chunk).unwrap();
+    // Successful publishes arm no deq notification.
+    assert!(!fifo.needs_deq_notification(1));
+    assert_eq!(fifo.max_dequeue(), chunk.len());
+    assert_eq!(read_published(&fifo, chunk.len()), chunk.as_slice());
+}
+
+#[test]
+fn publish_body_chunk_capacity_preflight_leaves_fifo_unchanged() {
+    // 129-byte chunk on an empty 128-byte FIFO: short capacity.
+    let fifo = local_fifo(128);
+    let chunk = [b'a'; 129];
+    assert_eq!(
+        publish_body_chunk(&fifo, &chunk),
+        Err(PublishError::Capacity {
+            requested: 129,
+            available: 128
+        })
+    );
+    // The preflight armed the want-deq notification flag and the FIFO holds
+    // zero bytes: nothing was reserved or published.
+    assert!(fifo.needs_deq_notification(1));
+    assert_eq!(fifo.max_dequeue(), 0);
+
+    // A full FIFO reports zero available on the same backpressure path, and
+    // the previously published bytes are untouched.
+    let full = local_fifo(128);
+    publish_body_chunk(&full, &[b'x'; 128]).unwrap();
+    assert_eq!(
+        publish_body_chunk(&full, b"y"),
+        Err(PublishError::Capacity {
+            requested: 1,
+            available: 0
+        })
+    );
+    assert!(full.needs_deq_notification(1));
+    assert_eq!(read_published(&full, 128), [b'x'; 128]);
+}
+
+#[test]
+fn publish_body_chunk_empty_is_a_noop() {
+    // The empty chunk flows through the same reservation path and commits
+    // zero bytes: no allocation, nothing published, no notification armed.
+    let fifo = local_fifo(128);
+    publish_body_chunk(&fifo, b"").unwrap();
+    assert_eq!(fifo.max_dequeue(), 0);
+    assert!(!fifo.needs_deq_notification(1));
+    // The FIFO still publishes afterwards.
+    publish_body_chunk(&fifo, b"abc").unwrap();
+    assert_eq!(read_published(&fifo, 3), b"abc");
+}
+
+#[test]
+fn publish_body_chunk_exact_capacity_commit() {
+    // A 4096-byte FIFO holds exactly one 4096-byte data chunk; a chunk of
+    // that size commits with the FIFO exactly full.
+    let chunk: Vec<u8> = (0..4096).map(|i| (i % 251) as u8).collect();
+    let fifo = local_fifo(4096);
+    publish_body_chunk(&fifo, &chunk).unwrap();
+    assert!(!fifo.needs_deq_notification(1));
+    assert_eq!(fifo.max_enqueue(), 0);
+    assert_eq!(fifo.max_dequeue(), chunk.len());
+    assert_eq!(read_published(&fifo, chunk.len()), chunk.as_slice());
+}

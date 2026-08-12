@@ -449,7 +449,7 @@ pub(crate) fn publish_request(fifo: &Fifo, req: &Request<'_>) -> Result<(), Publ
 /// Scatter-copy one group of source slices into `reservation`, returning the
 /// cumulative byte count; on failure the reservation is cancelled so no
 /// bytes become visible.
-#[allow(dead_code)] // used only by `publish_request`, wired in a later seam
+#[allow(dead_code)] // used only by the FIFO publish paths, wired in a later seam
 fn scatter<I, S>(reservation: &mut FifoWriteReservation<'_>, segs: I) -> Result<usize, FifoError>
 where
     I: IntoIterator<Item = S>,
@@ -694,6 +694,54 @@ pub(crate) fn publish_inbound_request(
     scatter(&mut reservation, [req.target_query]).map_err(PublishError::Fifo)?;
     scatter_headers(&mut reservation, req.headers).map_err(PublishError::Fifo)?;
     let copied = scatter(&mut reservation, [req.body]).map_err(PublishError::Fifo)?;
+    if copied != total {
+        reservation.cancel();
+        return Err(PublishError::Fifo(FifoError::CommitExceedsReservation {
+            initialized: copied,
+            reserved: total,
+        }));
+    }
+    match reservation.commit(copied) {
+        Ok(_) => Ok(()),
+        Err(source) => {
+            reservation.cancel();
+            Err(PublishError::Fifo(source))
+        }
+    }
+}
+
+/// Publish one body chunk to `fifo` all-or-nothing.
+///
+/// Mirrors the bounded app write of `http3_req_state_transport_io_more_data`
+/// (`third_party/vpp/src/plugins/http/http3/http3.c:1184-1263`): the whole
+/// chunk is capacity-checked first, and zero or short capacity arms the
+/// dequeue notification and returns with the FIFO untouched, without any
+/// reservation or mutation; otherwise one `reserve_write` is followed by a
+/// single scatter copy of the borrowed chunk directly into the reservation
+/// segments (no temporary buffer, no separate sizing pass) and one commit as
+/// the only visibility point. A reservation is cancelled only on a pre-commit
+/// failure; committed bytes are never dequeued as rollback.
+///
+/// Hammer difference (documented): the VPP state machine copies at most
+/// `min(max_deq, max_enq)` bytes per call and carries the remainder in the
+/// transport stream; this seam publishes one whole chunk and reports
+/// `Capacity` for it instead, leaving incremental delivery to the caller. As
+/// in `publish_inbound_request`, no FIFO event flag is raised here: RX
+/// notification stays with the caller, and this seam does not speculate on
+/// moving it.
+#[allow(dead_code)] // tests exercise it; the app-session publisher wires it in a later seam
+pub(crate) fn publish_body_chunk(fifo: &Fifo, chunk: &[u8]) -> Result<(), PublishError> {
+    let total = chunk.len();
+    let available = fifo.max_enqueue();
+    if available < total {
+        fifo.want_deq_notification();
+        return Err(PublishError::Capacity {
+            requested: total,
+            available,
+        });
+    }
+    let mut reservation = fifo.reserve_write(total).map_err(PublishError::Fifo)?;
+    let copied = scatter(&mut reservation, [chunk]).map_err(PublishError::Fifo)?;
     if copied != total {
         reservation.cancel();
         return Err(PublishError::Fifo(FifoError::CommitExceedsReservation {
