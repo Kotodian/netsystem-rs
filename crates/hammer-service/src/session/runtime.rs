@@ -359,6 +359,7 @@ struct SessionEntry<Index> {
     listener: Option<SessionHandle>,
     flags: SessionFlags,
     lower_session: Option<SessionId>,
+    upper_session: Option<SessionId>,
     parent_session: Option<SessionId>,
     rx_fifo: Arc<Fifo>,
     tx_fifo: Arc<Fifo>,
@@ -388,6 +389,7 @@ impl<Index: Copy + Eq> SessionEntry<Index> {
             listener: None,
             flags: SessionFlags::empty(),
             lower_session: None,
+            upper_session: None,
             parent_session: None,
             rx_fifo,
             tx_fifo,
@@ -410,6 +412,7 @@ impl<Index: Copy + Eq> SessionEntry<Index> {
             listener: None,
             flags: SessionFlags::empty(),
             lower_session: None,
+            upper_session: None,
             parent_session: None,
             rx_fifo,
             tx_fifo,
@@ -2045,6 +2048,35 @@ impl<Index: Copy + Eq> SessionWorker<Index> {
         ))
     }
 
+    /// Generation-checked lower->upper owner link: the lower Session records
+    /// its single upper Session, mirroring VPP's per-session single app-worker
+    /// owner (`session_t.app_wrk_index`, session_types.h:266) and owner checks
+    /// (`SESSION_E_OWNER`, application.c:1507-1508). Attach refuses to silently
+    /// overwrite an existing attachment; the owner-link boundary is shared by
+    /// both upper creation APIs and by upper removal.
+    fn attach_upper_session(&mut self, lower: SessionId, upper: SessionId) -> RuntimeResult<()> {
+        let Some(entry) = self.entries.get_mut(lower.pool_index()) else {
+            return Err(SessionError::SessionMissing { session_id: lower }.into());
+        };
+        if entry.upper_session.is_some() {
+            return Err(SessionError::UpperSessionAlreadyAttached { lower }.into());
+        }
+        entry.upper_session = Some(upper);
+        Ok(())
+    }
+
+    /// Clears the lower->upper owner link iff it still names `upper`; a
+    /// reused slot or a newer attachment is never cleared, and the lower is
+    /// never removed.
+    #[inline]
+    fn detach_upper_session(&mut self, lower: SessionId, upper: SessionId) {
+        if let Some(entry) = self.entries.get_mut(lower.pool_index())
+            && entry.upper_session == Some(upper)
+        {
+            entry.upper_session = None;
+        }
+    }
+
     /// Publishes a Session-owned upper App Session from a Session App callback.
     pub fn create_upper_session(
         &mut self,
@@ -2062,6 +2094,10 @@ impl<Index: Copy + Eq> SessionWorker<Index> {
             .ok_or(SessionQueueError::ApplicationMqMissing { application })?;
         let (rx_fifo, tx_fifo) = self.create_local_fifos()?;
         let upper = self.insert_session_entry(SessionEntry::unbound(rx_fifo, tx_fifo))?;
+        if let Err(error) = self.attach_upper_session(lower, upper) {
+            let _ = self.entries.remove(upper.pool_index());
+            return Err(error);
+        }
         let app_session = self
             .app
             .create_app_session(
@@ -2073,6 +2109,7 @@ impl<Index: Copy + Eq> SessionWorker<Index> {
             )
             .map_err(|error| {
                 let _ = self.entries.remove(upper.pool_index());
+                self.detach_upper_session(lower, upper);
                 error
             })?;
         let entry = self
@@ -2090,6 +2127,7 @@ impl<Index: Copy + Eq> SessionWorker<Index> {
         if let Err(error) = self.app.connected(upper).map(|_| ()) {
             let _ = self.entries.remove(upper.pool_index());
             self.app.detach_session(upper);
+            self.detach_upper_session(lower, upper);
             return Err(error);
         }
         Ok(upper)
@@ -2124,6 +2162,10 @@ impl<Index: Copy + Eq> SessionWorker<Index> {
             .expect("new upper transport Session remains installed during publication");
         entry.app_session = context;
         entry.lower_session = Some(lower);
+        if let Err(error) = self.attach_upper_session(lower, upper) {
+            let _ = self.remove_session(upper);
+            return Err(error);
+        }
         Ok(upper)
     }
 
@@ -3549,6 +3591,9 @@ impl<Index: Copy + Eq> SessionWorker<Index> {
         let Some(entry) = self.entries.remove(session_id.pool_index()) else {
             return Ok(());
         };
+        if let Some(lower) = entry.lower_session {
+            self.detach_upper_session(lower, session_id);
+        }
         if matches!(entry.application, Some(SessionApplication::External(_))) {
             drop(self.app.detach_session(session_id));
         }
@@ -6882,6 +6927,342 @@ mod tests {
             .close_transport_session(upper)
             .expect("app close completes transport deletion");
         assert!(!sessions.has_session(upper));
+    }
+
+    #[test]
+    fn removing_upper_app_session_clears_lower_link_and_preserves_lower() {
+        let applications = ApplicationMain::new(4);
+        let application = applications.attach().expect("attach Application");
+        let mut sessions = SessionWorker::<Index>::new(
+            DataWorkerId::new(0),
+            1,
+            AppSessionConfig::default(),
+            DEFAULT_SESSION_POOL_CAPACITY,
+            applications,
+            None,
+        )
+        .expect("Session worker");
+        sessions
+            .install_application_mq_for_test(application)
+            .expect("install test Application MQ");
+        let lower = sessions
+            .construct_stream_sessions(
+                SessionTransportId::new(1),
+                Index::new(1, 1),
+                1,
+                application,
+                Some(hammer_runtime::app::SessionAppId::new(0)),
+                None,
+                None,
+                false,
+            )
+            .expect("construct lower Session App session");
+        let upper = sessions
+            .create_upper_session(lower, 0x55)
+            .expect("publish upper Session");
+        assert_eq!(
+            sessions
+                .entries
+                .get(lower.pool_index())
+                .and_then(|entry| entry.upper_session),
+            Some(upper),
+            "upper creation attaches the reverse link on the lower"
+        );
+
+        sessions
+            .remove_session(upper)
+            .expect("direct upper removal");
+        assert!(!sessions.has_session(upper), "upper is removed");
+        assert!(sessions.has_session(lower), "lower survives upper removal");
+        assert_eq!(
+            sessions
+                .entries
+                .get(lower.pool_index())
+                .and_then(|entry| entry.upper_session),
+            None,
+            "direct upper removal clears the lower reverse link"
+        );
+
+        let replacement = sessions
+            .create_upper_session(lower, 0x66)
+            .expect("lower accepts a fresh upper after the link was cleared");
+        assert_eq!(
+            sessions
+                .entries
+                .get(lower.pool_index())
+                .and_then(|entry| entry.upper_session),
+            Some(replacement),
+            "the fresh upper re-attaches the reverse link"
+        );
+    }
+
+    #[test]
+    fn duplicate_upper_attachment_rejected_without_overwrite_or_leak() {
+        let applications = ApplicationMain::new(4);
+        let application = applications.attach().expect("attach Application");
+        let mut sessions = SessionWorker::<Index>::new(
+            DataWorkerId::new(0),
+            1,
+            AppSessionConfig::default(),
+            DEFAULT_SESSION_POOL_CAPACITY,
+            applications,
+            None,
+        )
+        .expect("Session worker");
+        sessions
+            .install_application_mq_for_test(application)
+            .expect("install test Application MQ");
+        let lower = sessions
+            .construct_stream_sessions(
+                SessionTransportId::new(1),
+                Index::new(1, 1),
+                1,
+                application,
+                Some(hammer_runtime::app::SessionAppId::new(0)),
+                None,
+                None,
+                false,
+            )
+            .expect("construct lower Session App session");
+        let upper = sessions
+            .create_upper_session(lower, 0x55)
+            .expect("first upper");
+
+        let error = sessions
+            .create_upper_session(lower, 0x66)
+            .expect_err("duplicate upper attachment is rejected");
+        assert!(matches!(
+            &error,
+            RuntimeError::Subsystem { source, .. }
+                if matches!(
+                    source.downcast_ref::<SessionError>(),
+                    Some(SessionError::UpperSessionAlreadyAttached { lower: linked })
+                        if *linked == lower
+                )
+        ));
+
+        assert!(sessions.has_session(upper), "first upper survives");
+        assert_eq!(
+            sessions
+                .entries
+                .get(upper.pool_index())
+                .and_then(|entry| entry.lower_session),
+            Some(lower),
+            "first upper keeps its forward link"
+        );
+        assert_eq!(
+            sessions
+                .entries
+                .get(lower.pool_index())
+                .and_then(|entry| entry.upper_session),
+            Some(upper),
+            "the existing reverse link is not overwritten"
+        );
+        assert_eq!(sessions.entries.len(), 2, "no leaked upper entry");
+    }
+
+    #[test]
+    fn upper_creation_failure_rolls_back_lower_link() {
+        // A real publisher is required to make AppWorker::connected fail
+        // after the upper is attached (queue closed), the only upper-creation
+        // failure that happens after the lower reverse link is attached.
+        let socket_path = format!(
+            "/tmp/hammer-upper-rollback-{}.sock",
+            std::process::id()
+        );
+        let server = hammer_runtime::attach::AppServer::bind(&socket_path, 1)
+            .expect("bind App server with a single publication slot");
+        let publisher = server.publisher();
+        let applications = ApplicationMain::new(4);
+        let application = applications.attach().expect("attach Application");
+        let mut sessions = SessionWorker::<Index>::new(
+            DataWorkerId::new(0),
+            1,
+            AppSessionConfig::default(),
+            DEFAULT_SESSION_POOL_CAPACITY,
+            applications,
+            Some(publisher),
+        )
+        .expect("Session worker");
+        drop(server); // closes the publication queue
+
+        sessions
+            .install_application_mq_for_test(application)
+            .expect("install test Application MQ");
+        let lower = sessions
+            .construct_stream_sessions(
+                SessionTransportId::new(1),
+                Index::new(1, 1),
+                1,
+                application,
+                Some(hammer_runtime::app::SessionAppId::new(0)),
+                None,
+                None,
+                false,
+            )
+            .expect("construct lower Session App session");
+
+        let error = sessions
+            .create_upper_session(lower, 0x55)
+            .expect_err("connected publication fails once the server is dropped");
+        assert!(matches!(
+            &error,
+            RuntimeError::Attach(AttachError::PublicationQueueClosed)
+        ));
+        assert_eq!(sessions.entries.len(), 1, "upper entry rolls back");
+        assert!(sessions.has_session(lower), "lower survives the failed creation");
+        assert_eq!(
+            sessions
+                .entries
+                .get(lower.pool_index())
+                .and_then(|entry| entry.upper_session),
+            None,
+            "failed creation leaves the lower link unset"
+        );
+    }
+
+    #[test]
+    fn stale_upper_link_never_removes_reused_slot() {
+        let applications = ApplicationMain::new(4);
+        let application = applications.attach().expect("attach Application");
+        let mut sessions = SessionWorker::<Index>::new(
+            DataWorkerId::new(0),
+            1,
+            AppSessionConfig::default(),
+            DEFAULT_SESSION_POOL_CAPACITY,
+            applications,
+            None,
+        )
+        .expect("Session worker");
+        sessions
+            .install_application_mq_for_test(application)
+            .expect("install test Application MQ");
+        let lower = sessions
+            .construct_stream_sessions(
+                SessionTransportId::new(1),
+                Index::new(1, 1),
+                1,
+                application,
+                Some(hammer_runtime::app::SessionAppId::new(0)),
+                None,
+                None,
+                false,
+            )
+            .expect("construct lower Session App session");
+        let filler = sessions
+            .construct_stream_sessions(
+                SessionTransportId::new(3),
+                Index::new(7, 1),
+                1,
+                application,
+                Some(hammer_runtime::app::SessionAppId::new(0)),
+                None,
+                None,
+                false,
+            )
+            .expect("construct filler Session");
+
+        // Forge a stale reverse link: the recorded generation no longer
+        // matches the entry currently occupying the slot.
+        let stale = SessionId::from(Index::new(
+            filler.pool_index().slot(),
+            filler.pool_index().generation().wrapping_add(1),
+        ));
+        sessions
+            .entries
+            .get_mut(lower.pool_index())
+            .expect("lower entry")
+            .upper_session = Some(stale);
+
+        sessions
+            .remove_session(lower)
+            .expect("lower removal tolerates a stale upper link");
+        assert!(
+            sessions.has_session(filler),
+            "stale generation link must never remove a reused slot"
+        );
+        assert!(!sessions.has_session(lower), "lower itself is removed");
+    }
+
+    #[test]
+    fn transport_upper_teardown_and_direct_removal_use_the_reverse_link() {
+        let applications = ApplicationMain::new(4);
+        let application = applications.attach().expect("attach Application");
+        let mut sessions = SessionWorker::<Index>::new(
+            DataWorkerId::new(0),
+            1,
+            AppSessionConfig::default(),
+            DEFAULT_SESSION_POOL_CAPACITY,
+            applications,
+            None,
+        )
+        .expect("Session worker");
+        sessions
+            .install_application_mq_for_test(application)
+            .expect("install test Application MQ");
+        let transport = SessionTransportId::new(3);
+        let transport_index = Index::new(7, 1);
+
+        let lower = sessions
+            .construct_stream_sessions(
+                SessionTransportId::new(1),
+                Index::new(1, 1),
+                1,
+                application,
+                Some(hammer_runtime::app::SessionAppId::new(0)),
+                None,
+                None,
+                false,
+            )
+            .expect("construct lower Session App session");
+        let upper = sessions
+            .create_upper_transport_session(lower, transport, transport_index, 0x55)
+            .expect("create upper transport Session");
+        assert_eq!(
+            sessions
+                .entries
+                .get(lower.pool_index())
+                .and_then(|entry| entry.upper_session),
+            Some(upper),
+            "upper transport creation attaches the reverse link"
+        );
+
+        sessions
+            .remove_session(lower)
+            .expect("remove lower Session");
+        assert!(
+            !sessions.has_session(upper),
+            "lower removal removes the linked upper transport Session"
+        );
+        assert!(!sessions.has_session(lower), "lower is removed");
+
+        let lower = sessions
+            .construct_stream_sessions(
+                SessionTransportId::new(1),
+                Index::new(1, 1),
+                1,
+                application,
+                Some(hammer_runtime::app::SessionAppId::new(0)),
+                None,
+                None,
+                false,
+            )
+            .expect("construct a second lower Session");
+        let upper = sessions
+            .create_upper_transport_session(lower, transport, transport_index, 0x55)
+            .expect("create upper transport Session");
+        sessions
+            .remove_session(upper)
+            .expect("direct upper transport removal");
+        assert!(sessions.has_session(lower), "lower survives upper removal");
+        assert_eq!(
+            sessions
+                .entries
+                .get(lower.pool_index())
+                .and_then(|entry| entry.upper_session),
+            None,
+            "direct upper transport removal clears the reverse link"
+        );
     }
 
     #[test]

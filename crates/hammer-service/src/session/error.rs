@@ -97,6 +97,8 @@ pub enum SessionError {
     CapacityExhausted { capacity: usize },
     #[error("session {session_id:?} is not in the session pool")]
     SessionMissing { session_id: SessionId },
+    #[error("session {lower:?} already has an upper Session attached")]
+    UpperSessionAlreadyAttached { lower: SessionId },
     #[error("session {session_id:?} cannot publish its connection in its current state")]
     PublicationRejected { session_id: SessionId },
     #[error("session {session_id:?} is active and cannot be rolled back")]
@@ -222,6 +224,7 @@ impl From<SessionError> for SessionControlError {
             // concrete error stays in the source chain for diagnostics while
             // the wire reports the generic transport failure.
             SessionError::SessionMissing { .. }
+            | SessionError::UpperSessionAlreadyAttached { .. }
             | SessionError::PublicationRejected { .. }
             | SessionError::RollbackRejected { .. }
             | SessionError::NotPublished { .. }
