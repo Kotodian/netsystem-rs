@@ -305,7 +305,10 @@ impl HttpMain {
     }
 }
 
-static HTTP_MAIN: OnceLock<Arc<HttpMain>> = OnceLock::new();
+/// Process-wide authority published by `init_http_transport`; `pub(crate)` so
+/// the Session App `accept` callback resolves the owning worker by Session
+/// worker id (http_app.rs).
+pub(crate) static HTTP_MAIN: OnceLock<Arc<HttpMain>> = OnceLock::new();
 
 /// Registered `SessionTransportStartListen` callback.
 ///
