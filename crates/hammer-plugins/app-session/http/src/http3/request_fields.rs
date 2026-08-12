@@ -16,21 +16,32 @@
 use crate::http3::proto::error::ErrorCode;
 use crate::http3::proto::qpack::field::HeaderField;
 
+/// Validate a single regular field line of a decoded request field section.
+///
+/// Rejects connection-specific field names and any `te` value other than
+/// exactly `trailers` (RFC 9114 Section 4.2); no allocation.
+pub(crate) fn validate_request_field_line(
+    field: &HeaderField,
+) -> Result<(), RequestFieldLineError<'_>> {
+    let name = field.name.as_ref();
+    if is_connection_specific(name) {
+        return Err(RequestFieldLineError::ForbiddenField(name));
+    }
+    if name == b"te" && field.value.as_ref() != b"trailers" {
+        return Err(RequestFieldLineError::InvalidTe(field.value.as_ref()));
+    }
+    Ok(())
+}
+
 /// Validate the regular field lines of a decoded request field section.
 ///
-/// Walks the slice once and stops at the first offending field; no
-/// allocation on success.
+/// Walks the slice once, delegating to [`validate_request_field_line`], and
+/// stops at the first offending field; no allocation on success.
 pub(crate) fn validate_request_field_lines(
     fields: &[HeaderField],
 ) -> Result<(), RequestFieldLineError<'_>> {
     for field in fields {
-        let name = field.name.as_ref();
-        if is_connection_specific(name) {
-            return Err(RequestFieldLineError::ForbiddenField(name));
-        }
-        if name == b"te" && field.value.as_ref() != b"trailers" {
-            return Err(RequestFieldLineError::InvalidTe(field.value.as_ref()));
-        }
+        validate_request_field_line(field)?;
     }
     Ok(())
 }
@@ -113,5 +124,30 @@ mod tests {
             field("accept", "application/json"),
         ];
         assert!(validate_request_field_lines(&fields).is_ok());
+    }
+
+    #[test]
+    fn singular_accepts_ordinary_field() {
+        assert!(validate_request_field_line(&field("content-type", "text/plain")).is_ok());
+    }
+
+    #[test]
+    fn singular_rejects_connection_specific_field() {
+        let field = field("connection", "close");
+        let err = validate_request_field_line(&field).unwrap_err();
+        assert_eq!(err, RequestFieldLineError::ForbiddenField(b"connection"));
+        assert_eq!(err.error_code(), ErrorCode::MessageError);
+    }
+
+    #[test]
+    fn singular_accepts_te_with_value_trailers() {
+        assert!(validate_request_field_line(&field("te", "trailers")).is_ok());
+    }
+
+    #[test]
+    fn singular_rejects_te_with_another_value() {
+        let field = field("te", "gzip");
+        let err = validate_request_field_line(&field).unwrap_err();
+        assert_eq!(err, RequestFieldLineError::InvalidTe(b"gzip"));
     }
 }
