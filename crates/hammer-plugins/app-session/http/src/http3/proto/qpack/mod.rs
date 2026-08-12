@@ -3,9 +3,10 @@
 //!
 //! This slice wires the prefix integer codec (`prefix_int`), the prefix
 //! string codec (`prefix_string`) with its Huffman coding (`huffman`), the
-//! field line type (`field`), and the fixed 99-entry static table
-//! (`static_table`). Field block parsing, the encoder and the decoder are
-//! later slices and are not declared here.
+//! field line type (`field`), the fixed 99-entry static table
+//! (`static_table`), and the capacity-zero encoded field section prefix
+//! (`block`). Field line parsing, the encoder and the decoder are later
+//! slices.
 //!
 //! References:
 //! - RFC 9204 Section 4.1.1 (prefix integers), Section 4.2 (prefix strings
@@ -19,6 +20,7 @@
 
 use super::varint::UnexpectedEnd;
 
+pub(crate) mod block;
 pub(crate) mod field;
 pub(crate) mod huffman;
 pub(crate) mod prefix_int;
@@ -41,6 +43,16 @@ pub(crate) enum QpackError {
     /// The input ended before the integer was complete.
     /// VPP reports the same condition as `HPACK_INVALID_INT`.
     UnexpectedEnd,
+    /// A nonzero Required Insert Count in the encoded field section prefix
+    /// (RFC 9204 Section 4.5.1). This capacity-zero slice has no dynamic
+    /// table, so no insert count above zero can be satisfied; VPP reports
+    /// the same condition as `HPACK_ERROR_COMPRESSION`.
+    NonZeroInsertCount(u64),
+    /// A nonzero or sign-set Delta Base in the encoded field section prefix.
+    /// With no dynamic table the Base is necessarily 0, so a sign bit or a
+    /// nonzero delta can only occur in a block that references dynamic
+    /// entries.
+    NonZeroDeltaBase { sign: u8, delta_base: u64 },
     /// A field-line or static-table index that resolves to no entry. The
     /// fixed 99-entry table (RFC 9204 Appendix A) is the only reference
     /// target this static-only decoder supports; VPP reports the failed
@@ -79,6 +91,15 @@ impl std::fmt::Display for QpackError {
             QpackError::InvalidSize => write!(f, "prefix size must be between 1 and 8 bits"),
             QpackError::Overflow => write!(f, "prefix integer overflow"),
             QpackError::UnexpectedEnd => write!(f, "unexpected end of prefix integer"),
+            QpackError::NonZeroInsertCount(count) => {
+                write!(f, "required insert count {count} requires a dynamic table")
+            }
+            QpackError::NonZeroDeltaBase { sign, delta_base } => {
+                write!(
+                    f,
+                    "delta base sign {sign} value {delta_base} requires a dynamic table"
+                )
+            }
             QpackError::InvalidIndex(index) => {
                 write!(f, "static table index {index} out of range")
             }
