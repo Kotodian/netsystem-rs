@@ -509,7 +509,8 @@ pub enum FrameError {
     InvalidFrameValue,
     /// The input ended mid-frame; `usize` is the total number of bytes needed.
     Incomplete(usize),
-    /// An error in a SETTINGS payload (H3_SETTINGS_ERROR).
+    /// An error in a SETTINGS payload (H3_FRAME_ERROR if malformed,
+    /// H3_SETTINGS_ERROR otherwise).
     Settings(SettingsError),
     /// An invalid push ID in CANCEL_PUSH or MAX_PUSH_ID (H3_ID_ERROR).
     InvalidPushId(InvalidPushId),
@@ -525,7 +526,7 @@ impl FrameError {
                 Some(ErrorCode::FrameUnexpected)
             }
             FrameError::UnknownFrame(_) | FrameError::Incomplete(_) => None,
-            FrameError::Settings(_) => Some(ErrorCode::SettingsError),
+            FrameError::Settings(e) => Some(e.error_code()),
             FrameError::InvalidPushId(_) => Some(ErrorCode::IdError),
         }
     }
@@ -573,6 +574,23 @@ impl fmt::Display for SettingsError {
             SettingsError::InvalidSettingValue(id, value) => {
                 write!(f, "invalid value {} for setting {}", value, id)
             }
+        }
+    }
+}
+
+impl SettingsError {
+    /// The connection error code to send (RFC 9114 Sections 7.1, 7.2.5, 8.1).
+    /// A payload that is truncated or otherwise unparsable is a malformed
+    /// frame (H3_FRAME_ERROR, mirroring VPP `http3_frame_settings_read`);
+    /// duplicate, forbidden, or out-of-range entries are semantic SETTINGS
+    /// errors (H3_SETTINGS_ERROR).
+    pub(crate) fn error_code(&self) -> ErrorCode {
+        match self {
+            SettingsError::Malformed => ErrorCode::FrameError,
+            SettingsError::Repeated(_)
+            | SettingsError::Exceeded
+            | SettingsError::InvalidSettingId(_)
+            | SettingsError::InvalidSettingValue(_, _) => ErrorCode::SettingsError,
         }
     }
 }
@@ -907,6 +925,12 @@ mod tests {
             Some(ErrorCode::FrameUnexpected)
         );
         assert_eq!(FrameError::Incomplete(2).error_code(), None);
+        // malformed SETTINGS encoding is a frame error (RFC 9114 7.1)
+        assert_eq!(
+            FrameError::Settings(SettingsError::Malformed).error_code(),
+            Some(ErrorCode::FrameError)
+        );
+        // semantic SETTINGS errors keep H3_SETTINGS_ERROR
         assert_eq!(
             FrameError::Settings(SettingsError::Repeated(SettingId::MAX_FIELD_SECTION_SIZE))
                 .error_code(),
