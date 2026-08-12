@@ -12,20 +12,32 @@
 //! (http.c:876-899); HTTP3 request/stream contexts reference their
 //! connection context index and worker (http3.c:35-48).
 //!
+//! `HttpMain` owns one `HttpWorker` per data worker in a
+//! `CacheLine<ThreadOwned<HttpWorker>>` slot, mirroring `QuicMain.workers`
+//! (quic listener.rs:58) and VPP's `http_main.wrk`, a fixed array sized by
+//! thread count and indexed per thread by `http_worker_get` (http.c:1073,
+//! http_private.h:1275-1278). Each worker installs itself once via the
+//! `http_worker_init` worker init function, ordered after session/QUIC
+//! worker init; `install_worker`/`with_worker` are O(1) slot lookups with
+//! typed out-of-range, not-installed, and wrong-thread errors.
+//!
 //! Identities follow the Hammer QUIC conventions: `ContextId` packs
 //! `slot | generation << 32` exactly like the QUIC `ContextId`
 //! (quic worker.rs:178-205) and `SessionId` (hammer-service
 //! session/id.rs:6-25), with standard `From` conversions to and from `Index`
 //! and the packed `u64`. The underlying `Pool` (hammer-infra pool.rs) keeps
 //! allocate/get/remove O(1) and generation-checked, with slots aligned to
-//! `CACHE_LINE` by the pool itself. This primitive only owns context slots;
-//! Session App callbacks, HTTP3 engine dispatch, QPACK, request publication,
-//! and listener nesting are later slices.
-
-use std::fmt;
+//! `CACHE_LINE` by the pool itself. Session App callbacks, HTTP3 engine
+//! dispatch, QPACK, request publication, and stop_listen are later slices.
 
 use hammer_infra::pool::{Index, Pool};
+use hammer_infra::thread_owned::ThreadOwnedError;
+use hammer_runtime::DataWorkerId;
 use hammer_service::session::SessionId;
+
+/// Default connection-context capacity of one data worker's pool, matching
+/// the QUIC per-worker context capacity (quic worker.rs:42).
+pub(crate) const HTTP_CONTEXT_CAPACITY: usize = 4_096;
 
 /// Generation-checked identity for one HTTP/3 connection context in the
 /// owning data worker's pool.
@@ -72,47 +84,35 @@ pub(crate) struct ConnectionContext {
     pub(crate) session: SessionId,
 }
 
-/// Typed errors for per-worker connection context operations.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// Typed errors for per-worker connection context operations and container
+/// install/lookup, mirroring `QuicWorkerError`'s container variants
+/// (quic worker.rs:3556-3567).
+#[hammer_component_macros::runtime_error(subsystem = "http")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
 pub(crate) enum HttpWorkerError {
-    ContextCapacityExhausted {
-        capacity: usize,
-    },
-    ContextMissing {
-        context: ContextId,
-    },
+    #[error("http connection context pool is full (capacity {capacity})")]
+    ContextCapacityExhausted { capacity: usize },
+    #[error("http connection context {context:?} is not live")]
+    ContextMissing { context: ContextId },
+    #[error(
+        "http connection context {context:?} is bound to session {actual:?}, expected {expected:?}"
+    )]
     SessionMismatch {
         context: ContextId,
         expected: SessionId,
         actual: SessionId,
     },
+    #[error("http worker {worker} is outside the configured worker range")]
+    WorkerOutOfRange { worker: usize },
+    #[error("http worker {worker} is already installed")]
+    WorkerAlreadyInstalled { worker: usize },
+    #[error("http worker {worker} cannot be accessed")]
+    WorkerAccess {
+        worker: usize,
+        #[source]
+        source: ThreadOwnedError,
+    },
 }
-
-impl fmt::Display for HttpWorkerError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::ContextCapacityExhausted { capacity } => {
-                write!(
-                    f,
-                    "http connection context pool is full (capacity {capacity})"
-                )
-            }
-            Self::ContextMissing { context } => {
-                write!(f, "http connection context {context:?} is not live")
-            }
-            Self::SessionMismatch {
-                context,
-                expected,
-                actual,
-            } => write!(
-                f,
-                "http connection context {context:?} is bound to session {actual:?}, expected {expected:?}"
-            ),
-        }
-    }
-}
-
-impl std::error::Error for HttpWorkerError {}
 
 /// Data-worker-owned bounded pool of HTTP/3 connection contexts.
 ///
@@ -126,6 +126,15 @@ pub(crate) struct HttpWorker {
 }
 
 impl HttpWorker {
+    /// Constructs the worker for one data worker id.
+    ///
+    /// Called once per data worker by the `http_worker_init` worker init
+    /// function (listener.rs), mirroring `QuicWorker::new` (quic
+    /// worker.rs:684).
+    pub(crate) fn new(_worker: DataWorkerId) -> Self {
+        Self::with_capacity(HTTP_CONTEXT_CAPACITY)
+    }
+
     pub(crate) fn with_capacity(capacity: usize) -> Self {
         Self {
             contexts: Pool::with_capacity(capacity),

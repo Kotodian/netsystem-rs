@@ -10,12 +10,16 @@
 //! http.c:1004-1063), and the main-thread HTTP listener authority with its
 //! `start_listen`-only SessionTransport registration. The authority
 //! bootstraps after QUIC/session init (VPP `http_transport_init`,
-//! http.c:1867-1903) and validates listener state; inner Application
-//! listener registration, QUIC listen publication, HTTP3 engine dispatch,
-//! FIFO transfer/publication, QPACK, and the full worker lifecycle are later
-//! slices; `worker` owns only the per-data-worker connection-context pool
-//! primitive (VPP `http_worker_t::ctx_pool`). The Session App callback table
-//! stays empty until those slices own their lifecycle state.
+//! http.c:1867-1903), registers an inner Application listener, nests the
+//! lower QUIC listen, and publishes the listener context in the O(1)
+//! outer-listener slot map; stop_listen, HTTP3 engine dispatch, FIFO
+//! transfer/publication, QPACK, and the Session App lifecycle are later
+//! slices. `worker` owns the per-data-worker connection-context pool
+//! primitive (VPP `http_worker_t::ctx_pool`); the listener authority
+//! installs one worker per data worker through the `http_worker_init`
+//! worker init function (ordered after session/QUIC worker init), mirroring
+//! `QuicMain.workers`. The Session App callback table stays empty until
+//! those slices own their lifecycle state.
 
 mod http3;
 mod http_app;
@@ -34,7 +38,7 @@ hammer_component_macros::declare_plugin!(
     early_config_functions = [],
     main_loop_enter_functions = [],
     main_loop_exit_functions = [],
-    worker_init_functions = [],
+    worker_init_functions = [listener::__INIT_FN_HTTP_WORKER_INIT],
     graph_nodes = [],
     node_functions = [],
     process_nodes = [],
