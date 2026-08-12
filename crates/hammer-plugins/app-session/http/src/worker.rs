@@ -35,14 +35,18 @@
 //! `CACHE_LINE` by the pool itself. Session App callbacks, HTTP3 engine
 //! dispatch, QPACK, request publication, and stop_listen are later slices.
 
+use hammer_infra::fifo::FifoError;
 use hammer_infra::pool::{Index, Pool};
 use hammer_infra::thread_owned::ThreadOwnedError;
 use hammer_runtime::DataWorkerId;
 use hammer_runtime::app::SessionAppContext;
+use hammer_runtime::error::RuntimeError;
 use hammer_runtime::session::SessionStreamDirection;
-use hammer_service::session::{SessionId, SessionWorker};
+use hammer_service::session::{SessionEndpointRole, SessionId, SessionWorker};
 
+use crate::http3::preface::encode_control_preface;
 use crate::http3::proto::coding::Decode;
+use crate::http3::proto::control::{ControlRead, ControlStreamError, ControlStreamReader};
 use crate::http3::proto::error::ErrorCode;
 use crate::http3::proto::stream::{StreamCategory, StreamType};
 use crate::http3::proto::varint::UnexpectedEnd;
@@ -60,9 +64,14 @@ pub(crate) const HTTP_STREAM_CAPACITY: usize = 16_384;
 
 /// Exact bytes of the local HTTP/3 control-stream preface: the CONTROL
 /// stream type (0x00) followed by a SETTINGS frame (type 0x04, length 0x04)
-/// carrying QPACK_MAX_TABLE_CAPACITY=0 (0x01 0x00) and QPACK_BLOCKED_STREAMS=0
-/// (0x07 0x00), in the write order of VPP `http3_conn_init` (http3.c:241-246):
-/// stream type first, then the SETTINGS frame. The `http3::proto` encoders
+/// carrying explicit zero QPACK settings — QPACK_MAX_TABLE_CAPACITY=0
+/// (0x01 0x00) and QPACK_BLOCKED_STREAMS=0 (0x07 0x00) — the static-only
+/// QPACK policy. The zeros are deliberate, not a default-omission artifact:
+/// VPP's `http3_frame_settings_write` (frame.c:152-177) drops every setting
+/// equal to its default and `http3_conn_init` (http3.c:241-246) normally
+/// emits a nonzero SETTINGS_MAX_FIELD_SECTION_SIZE instead, so only the
+/// write ordering mirrors VPP (stream type, then SETTINGS, then one
+/// post-write event), not byte identity. The `http3::proto` encoders
 /// (`StreamType`, `Settings`) target `BufMut`, so a fixed no-heap constant
 /// keeps the preface allocation-free on the worker.
 pub(crate) const LOCAL_CONTROL_PREFACE: [u8; 7] = [0x00, 0x04, 0x04, 0x01, 0x00, 0x07, 0x00];
@@ -145,6 +154,11 @@ impl From<StreamContextId> for Index {
 pub(crate) struct ConnectionContext {
     /// Lower QUIC session this connection context is bound to.
     pub(crate) session: SessionId,
+    /// Endpoint role of the underlying Session: `Server` for
+    /// listener-accepted connections, `Client` for outbound connects;
+    /// `None` when accept-time role metadata is absent. Cold, read-only
+    /// metadata consumed by the peer uni stream registration policy.
+    pub(crate) role: Option<SessionEndpointRole>,
     /// Local control stream child Session, recorded only after the bootstrap
     /// action succeeds; `None` until then. Mirrors VPP recording the opened
     /// control stream in `http_ctx_t::our_ctrl_stream_index` (http3.c:234).
@@ -162,6 +176,12 @@ pub(crate) struct ConnectionContext {
     /// True until the peer's SETTINGS arrive on its control stream; set at
     /// allocation and consumed by the peer-SETTINGS slice.
     pub(crate) peer_settings_pending: bool,
+    /// Generation-checked slot of this connection's SETTINGS reader in the
+    /// worker's separate `readers` pool; `None` until the first readable
+    /// bytes arrive. The 192-byte `ControlStreamReader` is not embedded in
+    /// every connection or stream slot: one pool slot per connection is
+    /// enough, since each connection owns at most one peer control stream.
+    pub(crate) peer_control_reader: Option<Index>,
 }
 
 /// Cold per-stream state bound to one data-worker stream-pool slot.
@@ -317,7 +337,7 @@ impl PeerUniStreamTypeDecode {
 /// install/lookup, mirroring `QuicWorkerError`'s container variants
 /// (quic worker.rs:3556-3567).
 #[hammer_component_macros::runtime_error(subsystem = "http")]
-#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+#[derive(Debug, thiserror::Error)]
 pub(crate) enum HttpWorkerError {
     #[error("http connection context pool is full (capacity {capacity})")]
     ContextCapacityExhausted { capacity: usize },
@@ -334,6 +354,32 @@ pub(crate) enum HttpWorkerError {
     #[error("http connection context {context:?} already opened its control stream")]
     ControlStreamAlreadyOpen { context: ContextId },
     #[error(
+        "http connection context {context:?} has not opened its local control stream; bootstrap first"
+    )]
+    ControlStreamNotOpen { context: ContextId },
+    #[error(
+        "http connection context {context:?} cannot find the Session FIFO of local control child {child:?}"
+    )]
+    ControlStreamFifoMissing { context: ContextId, child: SessionId },
+    #[error("local control preface for connection context {context:?} does not encode")]
+    ControlPrefaceEncodeFailed { context: ContextId },
+    #[error(
+        "local control preface for connection context {context:?} failed to write to the child control stream FIFO: {source}"
+    )]
+    ControlPrefaceFifo {
+        context: ContextId,
+        #[source]
+        source: FifoError,
+    },
+    #[error(
+        "failed to publish the local control preface TX-enqueue event for connection context {context:?}: {source}"
+    )]
+    ControlPrefaceEventPublishFailed {
+        context: ContextId,
+        #[source]
+        source: RuntimeError,
+    },
+    #[error(
         "peer {role:?} stream {stream:?} already registered on connection context {context:?}: HTTP/3 {code}"
     )]
     PeerStreamRoleDuplicate {
@@ -343,9 +389,17 @@ pub(crate) enum HttpWorkerError {
         code: ErrorCode,
     },
     #[error(
-        "peer push stream {stream:?} cannot apply the server/client push policy on connection context {context:?}: connection role metadata is unavailable"
+        "peer push stream {stream:?} on connection context {context:?} is rejected by the local endpoint's push policy: HTTP/3 {code}"
     )]
-    PeerPushPolicyUnavailable {
+    PeerPushRejected {
+        stream: StreamContextId,
+        context: ContextId,
+        code: ErrorCode,
+    },
+    #[error(
+        "peer push stream {stream:?} on connection context {context:?} cannot apply the server/client push policy: connection role metadata is missing"
+    )]
+    PeerPushRoleMissing {
         stream: StreamContextId,
         context: ContextId,
     },
@@ -353,6 +407,35 @@ pub(crate) enum HttpWorkerError {
     PeerStreamRoleUnclassified {
         stream: StreamContextId,
         context: ContextId,
+    },
+    #[error(
+        "peer uni stream {stream:?} on connection context {context:?} is not drain-only (role {role:?})"
+    )]
+    PeerStreamNotDrainable {
+        stream: StreamContextId,
+        context: ContextId,
+        role: PeerUniStreamRole,
+    },
+    #[error(
+        "peer uni stream {stream:?} on connection context {context:?} is not the registered peer control stream (role {role:?})"
+    )]
+    PeerControlStreamMismatch {
+        stream: StreamContextId,
+        context: ContextId,
+        role: PeerUniStreamRole,
+    },
+    #[error(
+        "peer control stream {stream:?} on connection context {context:?}: SETTINGS reader pool is full (capacity {capacity})"
+    )]
+    PeerControlReaderCapacityExhausted {
+        stream: StreamContextId,
+        context: ContextId,
+        capacity: usize,
+    },
+    #[error("http worker lost the peer control SETTINGS reader slot {index:?} for stream {stream:?}")]
+    PeerControlReaderMissing {
+        stream: StreamContextId,
+        index: Index,
     },
     #[error("http stream context pool is full (capacity {capacity})")]
     StreamCapacityExhausted { capacity: usize },
@@ -384,6 +467,41 @@ pub(crate) enum HttpWorkerError {
     },
 }
 
+/// Outcome of feeding readable bytes to the registered peer control stream.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PeerControlOutcome {
+    /// The SETTINGS frame is not complete yet; the reader buffered all
+    /// `consumed` bytes and needs more. The parent connection state is
+    /// unchanged.
+    Incomplete { consumed: usize },
+    /// The SETTINGS frame spanned exactly `consumed` bytes and was valid; the
+    /// parent connection's `peer_settings_pending` was cleared. Bytes beyond
+    /// `consumed` belong to later control frames and were not read.
+    Complete { consumed: usize },
+}
+
+/// Errors from [`HttpWorker::process_peer_control_bytes`].
+#[derive(Debug)]
+pub(crate) enum PeerControlError {
+    /// The stream is not a live, registered peer control stream on a live
+    /// parent connection (liveness failure, not a protocol violation).
+    Worker(HttpWorkerError),
+    /// A SETTINGS protocol error; the caller maps the connection error via
+    /// [`ControlStreamError::error_code`] and terminates the connection.
+    Protocol(ControlStreamError),
+}
+
+impl PeerControlError {
+    /// The connection error code for a protocol error; `None` for liveness
+    /// errors, which carry no HTTP/3 error code.
+    pub(crate) fn error_code(&self) -> Option<ErrorCode> {
+        match self {
+            PeerControlError::Worker(_) => None,
+            PeerControlError::Protocol(error) => Some(error.clone().error_code()),
+        }
+    }
+}
+
 /// Data-worker-owned bounded pools of HTTP/3 connection and stream contexts.
 ///
 /// Owns `ConnectionContext` slots exactly as VPP's `http_worker_t::ctx_pool`
@@ -396,6 +514,12 @@ pub(crate) enum HttpWorkerError {
 pub(crate) struct HttpWorker {
     contexts: Pool<ConnectionContext>,
     streams: Pool<StreamContext>,
+    /// Generation-checked pool of peer control SETTINGS readers, one slot per
+    /// connection at most. `ConnectionContext::peer_control_reader` records
+    /// the slot, so the 192-byte reader is not embedded in every context or
+    /// stream slot; slots are freed when the owning stream or connection
+    /// context is released.
+    readers: Pool<ControlStreamReader>,
 }
 
 impl HttpWorker {
@@ -412,26 +536,45 @@ impl HttpWorker {
         Self::with_capacities(capacity, HTTP_STREAM_CAPACITY)
     }
 
-    /// Independent connection and stream pool capacities.
+    /// Independent connection, stream, and reader pool capacities. The
+    /// reader pool is bounded by the connection capacity: each connection
+    /// owns at most one peer control stream and thus one reader.
     pub(crate) fn with_capacities(connections: usize, streams: usize) -> Self {
         Self {
             contexts: Pool::with_capacity(connections),
             streams: Pool::with_capacity(streams),
+            readers: Pool::with_capacity(connections),
         }
     }
 
-    /// Allocates a context slot bound to the exact lower QUIC `session`.
+    /// Allocates a context slot bound to the exact lower QUIC `session`,
+    /// without role metadata (`None`).
     ///
     /// O(1); fails with `ContextCapacityExhausted` when the pool is full.
     pub(crate) fn allocate(&mut self, session: SessionId) -> Result<ContextId, HttpWorkerError> {
+        self.allocate_with_role(session, None)
+    }
+
+    /// Allocates a context slot bound to the exact lower QUIC `session` and
+    /// records its endpoint role, read from accept metadata by the
+    /// connection accept path.
+    ///
+    /// O(1); fails with `ContextCapacityExhausted` when the pool is full.
+    pub(crate) fn allocate_with_role(
+        &mut self,
+        session: SessionId,
+        role: Option<SessionEndpointRole>,
+    ) -> Result<ContextId, HttpWorkerError> {
         self.contexts
             .insert(ConnectionContext {
                 session,
+                role,
                 local_control: None,
                 peer_control: None,
                 peer_encoder: None,
                 peer_decoder: None,
                 peer_settings_pending: true,
+                peer_control_reader: None,
             })
             .map(ContextId::from)
             .ok_or(HttpWorkerError::ContextCapacityExhausted {
@@ -500,15 +643,86 @@ impl HttpWorker {
         Ok(child)
     }
 
+    /// Writes the local HTTP/3 control-stream preface into the child control
+    /// stream's TX FIFO and publishes a TX-enqueue event.
+    ///
+    /// Mirrors the ordering of VPP `http3_conn_init` (http3.c:241-246), not
+    /// its byte identity (see [`LOCAL_CONTROL_PREFACE`]): after the control
+    /// stream is opened, the stream type and SETTINGS frame are written to
+    /// the app TX FIFO via `http_io_ts_write`, followed by one
+    /// `http_io_ts_after_write (stream, 1)` event. Here the exact 7-byte
+    /// preface comes from [`encode_control_preface`], copied in one
+    /// `reserve_write` + `copy_from_segments` + `commit` so an
+    /// insufficient-capacity shortfall exposes zero bytes, then
+    /// [`SessionWorker::publish_tx_enqueue`] raises the child FIFO event
+    /// flag and enqueues a TxEnq. O(1): fixed 7-byte stack buffer, one
+    /// reservation, one commit, no allocation or copy beyond the preface.
+    ///
+    /// Event publication is edge-triggered and coalescing:
+    /// `publish_tx_enqueue` raises the flag and enqueues one TxEnq only on
+    /// the unset→set transition (`Fifo::set_event` returns the transition).
+    /// A repeat publish while the flag is still set appends the preface
+    /// bytes again but enqueues no second TxEnq until the data worker
+    /// consumes the event and clears the flag, so the post-write event
+    /// matches VPP's single `http_io_ts_after_write (stream, 1)` even across
+    /// repeated calls. Publishing is therefore deliberately not idempotent
+    /// as a FIFO write — each call appends bytes — while the single event
+    /// follows from the flag edge, not from call counting.
+    ///
+    /// The caller must have bootstrapped the control stream first
+    /// ([`Self::bootstrap_control_stream`]): a context without a recorded
+    /// child is a typed error, as is a missing child Session FIFO. An event
+    /// publication failure (MQ full) leaves the committed bytes visible with
+    /// the FIFO event flag unset (`publish_tx_enqueue` calls `unset_event`
+    /// before returning the `RuntimeError`) and never dequeues or drops TX
+    /// bytes from the app side.
+    pub(crate) fn publish_local_control_preface(
+        &self,
+        context: ContextId,
+        sessions: &SessionWorker<Index>,
+    ) -> Result<(), HttpWorkerError> {
+        let connection = self.get(context)?;
+        let child = connection
+            .local_control
+            .ok_or(HttpWorkerError::ControlStreamNotOpen { context })?;
+        let preface = encode_control_preface()
+            .map_err(|_| HttpWorkerError::ControlPrefaceEncodeFailed { context })?;
+        let (_, tx_fifo) = sessions
+            .fifo_pair(child)
+            .ok_or(HttpWorkerError::ControlStreamFifoMissing { context, child })?;
+        let mut reservation = tx_fifo
+            .reserve_write(preface.len())
+            .map_err(|source| HttpWorkerError::ControlPrefaceFifo { context, source })?;
+        let copied = reservation
+            .copy_from_segments([&preface[..]])
+            .map_err(|source| HttpWorkerError::ControlPrefaceFifo { context, source })?;
+        let committed = reservation
+            .commit(copied)
+            .map_err(|source| HttpWorkerError::ControlPrefaceFifo { context, source })?;
+        sessions
+            .publish_tx_enqueue(child, committed)
+            .map_err(|source| HttpWorkerError::ControlPrefaceEventPublishFailed {
+                context,
+                source,
+            })?;
+        Ok(())
+    }
+
     /// Releases a context slot back to the pool.
     ///
     /// O(1); the slot's generation advances, so previously issued identities
-    /// become stale. Fails with `ContextMissing` for non-live identities.
+    /// become stale. Fails with `ContextMissing` for non-live identities. A
+    /// released connection frees its SETTINGS reader slot, if one was
+    /// allocated.
     pub(crate) fn remove(&mut self, context: ContextId) -> Result<(), HttpWorkerError> {
-        self.contexts
+        let connection = self
+            .contexts
             .remove(context.into())
-            .map(|_| ())
-            .ok_or(HttpWorkerError::ContextMissing { context })
+            .ok_or(HttpWorkerError::ContextMissing { context })?;
+        if let Some(reader) = connection.peer_control_reader {
+            self.readers.remove(reader);
+        }
+        Ok(())
     }
 
     #[inline]
@@ -604,9 +818,11 @@ impl HttpWorker {
     /// (http3.c:1683-1688, 1693-1698, 1703-1708), surfaced here as a typed
     /// error carrying `ErrorCode::StreamCreationError`. `Unknown` stream
     /// types are drained but never registered (http3.c:1723-1725). Push
-    /// registration applies VPP's server/client policy (http3.c:1712-1722),
-    /// which requires connection role metadata that does not exist yet, so it
-    /// is handed off as `PeerPushPolicyUnavailable` and records nothing.
+    /// registration applies VPP's server/client policy (http3.c:1712-1722)
+    /// from the connection's endpoint role: rejected with
+    /// `StreamCreationError` on a server connection, `IdError` on a client
+    /// connection, or `PeerPushRoleMissing` when role metadata is absent —
+    /// each typed and recording nothing.
     ///
     /// O(1): resolves the generation-checked stream and parent connection
     /// once each, and records the stream's `peer_role` only after the parent
@@ -665,9 +881,26 @@ impl HttpWorker {
                 // slot (http3.c:1723-1725).
             }
             PeerUniStreamRole::Push => {
-                return Err(HttpWorkerError::PeerPushPolicyUnavailable {
-                    stream,
-                    context: parent,
+                // VPP's server/client push policy (http3.c:1712-1722)
+                // branches on the local endpoint role: a server never
+                // accepts a peer push stream, and a client's push is
+                // unsupported here; without role metadata there is no policy
+                // to apply. Each case is a typed error and records nothing.
+                return Err(match connection.role {
+                    Some(SessionEndpointRole::Server) => HttpWorkerError::PeerPushRejected {
+                        stream,
+                        context: parent,
+                        code: ErrorCode::StreamCreationError,
+                    },
+                    Some(SessionEndpointRole::Client) => HttpWorkerError::PeerPushRejected {
+                        stream,
+                        context: parent,
+                        code: ErrorCode::IdError,
+                    },
+                    None => HttpWorkerError::PeerPushRoleMissing {
+                        stream,
+                        context: parent,
+                    },
                 });
             }
             PeerUniStreamRole::Unclassified => {
@@ -685,15 +918,165 @@ impl HttpWorker {
         Ok(())
     }
 
+    /// Feeds readable bytes of the registered peer control stream into its
+    /// SETTINGS reader.
+    ///
+    /// Mirrors VPP `http3_stream_transport_rx_ctrl` (http3.c:1620-1635) and
+    /// `http3_stream_read_settings` (http3.c:1540-1570): the reader enforces
+    /// the settings-first rule, accepts an empty SETTINGS frame, and rejects
+    /// malformed, semantic, and nonzero-QPACK payloads with a typed
+    /// `ControlStreamError`. On `Complete`, exactly the SETTINGS frame bytes
+    /// were consumed and the parent connection's `peer_settings_pending` is
+    /// cleared; trailing bytes are left for the later control-frame loop. On
+    /// `Incomplete` or error, the parent connection state is unchanged; a
+    /// call after completion is a second SETTINGS frame (H3_FRAME_UNEXPECTED,
+    /// http3.c:1548-1552).
+    ///
+    /// The SETTINGS reader lives in the worker's `readers` pool, allocated
+    /// on the first feed and freed with the stream or connection; feeding
+    /// hands over one byte at a time because `ControlStreamReader::push`
+    /// does not report how many of the provided bytes it consumed, and the
+    /// reader is one-shot. Each push is O(1) (the reader buffers at most 16
+    /// header + 128 payload bytes), so the feed is O(frame) with fixed
+    /// auxiliary space and never scans trailing bytes.
+    pub(crate) fn process_peer_control_bytes(
+        &mut self,
+        stream: StreamContextId,
+        bytes: &[u8],
+    ) -> Result<PeerControlOutcome, PeerControlError> {
+        let parent = {
+            let stream_context = self
+                .streams
+                .get(stream.into())
+                .ok_or(PeerControlError::Worker(HttpWorkerError::StreamMissing {
+                    stream,
+                }))?;
+            if stream_context.peer_role != PeerUniStreamRole::Control {
+                return Err(PeerControlError::Worker(
+                    HttpWorkerError::PeerControlStreamMismatch {
+                        stream,
+                        context: stream_context.parent,
+                        role: stream_context.peer_role,
+                    },
+                ));
+            }
+            stream_context.parent
+        };
+        let mut connection = *self
+            .contexts
+            .get(parent.into())
+            .ok_or(PeerControlError::Worker(HttpWorkerError::ParentContextMissing {
+                parent,
+            }))?;
+        if !connection.peer_settings_pending {
+            return Err(PeerControlError::Protocol(
+                ControlStreamError::DuplicateSettings,
+            ));
+        }
+        let reader_index = match connection.peer_control_reader {
+            Some(index) => index,
+            None => {
+                let index = self
+                    .readers
+                    .insert(ControlStreamReader::new())
+                    .ok_or(PeerControlError::Worker(
+                        HttpWorkerError::PeerControlReaderCapacityExhausted {
+                            stream,
+                            context: parent,
+                            capacity: self.readers.capacity(),
+                        },
+                    ))?;
+                connection.peer_control_reader = Some(index);
+                index
+            }
+        };
+        let reader = self
+            .readers
+            .get_mut(reader_index)
+            .ok_or(PeerControlError::Worker(
+                HttpWorkerError::PeerControlReaderMissing {
+                    stream,
+                    index: reader_index,
+                },
+            ))?;
+        let feed = feed_control_reader(reader, bytes);
+        if let Ok((ControlRead::Complete(_), _)) = &feed {
+            connection.peer_settings_pending = false;
+        }
+        // Persist the connection copy: the reader slot on first feed and, on
+        // complete SETTINGS, the cleared pending flag. On error the pending
+        // flag stays set, so the connection state is unchanged.
+        *self
+            .contexts
+            .get_mut(parent.into())
+            .ok_or(PeerControlError::Worker(HttpWorkerError::ParentContextMissing {
+                parent,
+            }))? = connection;
+        match feed {
+            Ok((ControlRead::Complete(_), consumed)) => {
+                Ok(PeerControlOutcome::Complete { consumed })
+            }
+            Ok((ControlRead::Incomplete, consumed)) => Ok(PeerControlOutcome::Incomplete {
+                consumed,
+            }),
+            Err(error) => Err(PeerControlError::Protocol(error)),
+        }
+    }
+
+    /// Drains readable bytes of a registered drain-only peer uni stream
+    /// (QPACK encoder, QPACK decoder, or Unknown) and returns the number of
+    /// bytes drained, always the whole slice.
+    ///
+    /// Under the static-only QPACK (capacity-zero) policy there is no dynamic
+    /// QPACK state, so every provided byte is discarded without inspection,
+    /// mirroring VPP `http3_stream_transport_rx_unknown_type`
+    /// (http3.c:1723-1725), which drains unknown frame payloads on
+    /// drain-only streams. The caller dequeues exactly the returned byte
+    /// count from the stream FIFO. O(1); bounded by the provided bytes.
+    pub(crate) fn drain_peer_stream_bytes(
+        &self,
+        stream: StreamContextId,
+        bytes: &[u8],
+    ) -> Result<usize, HttpWorkerError> {
+        let stream_context = self
+            .streams
+            .get(stream.into())
+            .ok_or(HttpWorkerError::StreamMissing { stream })?;
+        if !matches!(
+            stream_context.peer_role,
+            PeerUniStreamRole::QpackEncoder
+                | PeerUniStreamRole::QpackDecoder
+                | PeerUniStreamRole::Unknown
+        ) {
+            return Err(HttpWorkerError::PeerStreamNotDrainable {
+                stream,
+                context: stream_context.parent,
+                role: stream_context.peer_role,
+            });
+        }
+        Ok(bytes.len())
+    }
+
     /// Releases a stream context slot back to the pool.
     ///
     /// O(1); the slot's generation advances, so previously issued identities
-    /// become stale. Fails with `StreamMissing` for non-live identities.
+    /// become stale. Fails with `StreamMissing` for non-live identities. If
+    /// the released stream was the registered peer control stream, its
+    /// SETTINGS reader slot is freed; if the parent connection is already
+    /// released, `remove` freed it.
     pub(crate) fn remove_stream(&mut self, stream: StreamContextId) -> Result<(), HttpWorkerError> {
-        self.streams
+        let removed = self
+            .streams
             .remove(stream.into())
-            .map(|_| ())
-            .ok_or(HttpWorkerError::StreamMissing { stream })
+            .ok_or(HttpWorkerError::StreamMissing { stream })?;
+        if let Some(connection) = self.contexts.get_mut(removed.parent.into()) {
+            if connection.peer_control == Some(stream) {
+                if let Some(reader) = connection.peer_control_reader.take() {
+                    self.readers.remove(reader);
+                }
+            }
+        }
+        Ok(())
     }
 
     #[inline]
@@ -710,6 +1093,33 @@ impl HttpWorker {
     pub(crate) fn streams_is_empty(&self) -> bool {
         self.streams.is_empty()
     }
+}
+
+/// Feeds the peer control stream's readable bytes into the connection's
+/// one-shot SETTINGS reader, one byte at a time, and returns the first
+/// non-`Incomplete` result together with the exact number of bytes consumed:
+/// `Complete` with the SETTINGS frame's length, `Incomplete` with the whole
+/// slice (the reader buffered everything), or the typed error that ended the
+/// read.
+///
+/// `ControlStreamReader::push` is fixed-buffer and one-shot and does not
+/// report how many of the bytes it was handed belong to the completed frame,
+/// so a single push of the whole slice would silently swallow later control
+/// frames on `Complete`. One push per byte makes the consumed count exact:
+/// every push before the terminal one returned `Incomplete`, so the frame
+/// spans exactly the fed prefix and trailing bytes stay in the stream FIFO
+/// for the later control-frame loop (RFC 9114 Section 6.2.1).
+fn feed_control_reader(
+    reader: &mut ControlStreamReader,
+    bytes: &[u8],
+) -> Result<(ControlRead, usize), ControlStreamError> {
+    for (index, byte) in bytes.iter().enumerate() {
+        let read = reader.push(std::slice::from_ref(byte))?;
+        if !matches!(read, ControlRead::Incomplete) {
+            return Ok((read, index + 1));
+        }
+    }
+    Ok((ControlRead::Incomplete, bytes.len()))
 }
 
 #[cfg(test)]
@@ -1032,6 +1442,162 @@ mod tests {
         assert_eq!(encoded, LOCAL_CONTROL_PREFACE);
     }
 
+    /// A bootstrapped context whose child control stream Session has a real
+    /// TX FIFO: the parent at slot 3 and the control child at slot 4, exactly
+    /// the child `fake_open_stream` returns (`parent + 1`).
+    fn preface_harness() -> (HttpWorker, SessionWorker<Index>, ContextId, SessionId) {
+        let applications = ApplicationMain::new(4);
+        let application = applications.attach().expect("attach test Application");
+        let mut sessions = SessionWorker::<Index>::new(
+            DataWorkerId::new(0),
+            1,
+            AppSessionConfig::default(),
+            64,
+            applications,
+            None,
+        )
+        .expect("construct Session worker");
+        sessions
+            .install_transport_actions(
+                ACTION_TRANSPORT,
+                SessionTransportWorkerActions::new(
+                    fake_open_stream,
+                    fake_reset_stream,
+                    fake_stop_sending,
+                    fake_close_connection,
+                ),
+            )
+            .expect("install transport actions");
+        sessions
+            .install_application_mq_for_test(application)
+            .expect("install Application Rx MQ");
+        let parent = sessions
+            .construct_transport_session(
+                ACTION_TRANSPORT,
+                Index::new(3, 1),
+                0xCAFE_1234,
+                application,
+                None,
+                None,
+                None,
+                false,
+            )
+            .expect("construct parent transport Session");
+        let child = sessions
+            .construct_transport_session(
+                ACTION_TRANSPORT,
+                Index::new(4, 1),
+                0xCAFE_1235,
+                application,
+                None,
+                None,
+                None,
+                false,
+            )
+            .expect("construct child control Session");
+        let mut worker = HttpWorker::with_capacity(4);
+        let context = worker.allocate(parent).expect("allocate context");
+        worker
+            .bootstrap_control_stream(context, &mut sessions, 1)
+            .expect("bootstrap records the child");
+        assert_eq!(
+            worker.get(context).expect("live context").local_control,
+            Some(child),
+            "bootstrap records the real child Session"
+        );
+        (worker, sessions, context, child)
+    }
+
+    #[test]
+    fn preface_publish_writes_exact_bytes_and_raises_tx_event() {
+        let (worker, sessions, context, child) = preface_harness();
+        worker
+            .publish_local_control_preface(context, &sessions)
+            .expect("preface publishes");
+        let (_, tx_fifo) = sessions.fifo_pair(child).expect("child TX FIFO");
+        let mut bytes = [0u8; LOCAL_CONTROL_PREFACE.len()];
+        assert_eq!(
+            tx_fifo.peek(0, bytes.len(), &mut bytes),
+            LOCAL_CONTROL_PREFACE.len(),
+            "the exact preface is visible"
+        );
+        assert_eq!(bytes, LOCAL_CONTROL_PREFACE, "golden preface bytes");
+        assert_eq!(
+            tx_fifo.max_dequeue(),
+            LOCAL_CONTROL_PREFACE.len(),
+            "nothing but the 7 preface bytes is visible"
+        );
+        // The harness exposes the FIFO event flag, not the exact MQ count
+        // behind ApplicationMain, so the success assertion is the flag.
+        assert!(tx_fifo.has_event(), "the TX-enqueue event flag is set");
+    }
+
+    // Blocked: an MQ-full/error-source test for
+    // `ControlPrefaceEventPublishFailed` (its `#[source] RuntimeError`)
+    // needs a full application Rx MQ, and no helper that fills that MQ
+    // exists in these tests — the fill loop below targets the child TX
+    // FIFO, whose full state fails earlier at `reserve_write` and never
+    // reaches `publish_tx_enqueue`. Such a test needs an integration seam
+    // into the ApplicationMain Rx MQ.
+    #[test]
+    fn preface_publish_insufficient_capacity_is_atomic() {
+        let (worker, sessions, context, child) = preface_harness();
+        let (_, tx_fifo) = sessions.fifo_pair(child).expect("child TX FIFO");
+        while tx_fifo.max_enqueue() > 0 {
+            assert!(tx_fifo.enqueue(&[0xAB; 1024]) > 0, "fill makes progress");
+        }
+        assert_eq!(tx_fifo.max_enqueue(), 0, "child TX FIFO is full");
+        let visible_before = tx_fifo.max_dequeue();
+        let failed = worker.publish_local_control_preface(context, &sessions);
+        assert!(matches!(
+            failed,
+            Err(HttpWorkerError::ControlPrefaceFifo {
+                context: c,
+                source: FifoError::InsufficientCapacity {
+                    requested: 7,
+                    available: 0,
+                },
+            }) if c == context
+        ));
+        assert_eq!(
+            tx_fifo.max_dequeue(),
+            visible_before,
+            "no preface bytes became visible"
+        );
+        assert!(!tx_fifo.has_event(), "no event was raised");
+    }
+
+    #[test]
+    fn preface_publish_before_bootstrap_is_typed_error() {
+        let (worker, sessions, context, _parent) = harness();
+        let failed = worker.publish_local_control_preface(context, &sessions);
+        assert!(matches!(
+            failed,
+            Err(HttpWorkerError::ControlStreamNotOpen { context: c }) if c == context
+        ));
+    }
+
+    #[test]
+    fn preface_publish_missing_child_fifo_is_typed_error() {
+        let (mut worker, mut sessions, context, _parent) = harness();
+        worker
+            .bootstrap_control_stream(context, &mut sessions, 1)
+            .expect("bootstrap records a child");
+        let child = worker
+            .get(context)
+            .expect("live context")
+            .local_control
+            .expect("child recorded");
+        let failed = worker.publish_local_control_preface(context, &sessions);
+        assert!(matches!(
+            failed,
+            Err(HttpWorkerError::ControlStreamFifoMissing {
+                context: c,
+                child: s,
+            }) if c == context && s == child
+        ));
+    }
+
     #[test]
     fn stream_allocate_binds_parent_session_and_direction() {
         let mut worker = HttpWorker::with_capacities(4, 4);
@@ -1189,6 +1755,20 @@ mod tests {
             .expect("allocate peer uni stream")
     }
 
+    /// A rejected push registration must leave the parent slots and the
+    /// stream role exactly as before the call.
+    fn assert_push_state_unchanged(worker: &HttpWorker, parent: ContextId, stream: StreamContextId) {
+        let connection = worker.get(parent).expect("live connection");
+        assert_eq!(connection.peer_control, None);
+        assert_eq!(connection.peer_encoder, None);
+        assert_eq!(connection.peer_decoder, None);
+        assert_eq!(
+            worker.get_stream(stream).expect("live stream").peer_role,
+            PeerUniStreamRole::Unclassified,
+            "rejected push records no stream role"
+        );
+    }
+
     #[test]
     fn first_control_registration_records_slot_and_stream_role() {
         let mut worker = HttpWorker::with_capacity(4);
@@ -1336,24 +1916,79 @@ mod tests {
     }
 
     #[test]
-    fn push_registration_hands_off_without_state_change() {
+    fn allocate_with_role_records_endpoint_role_metadata() {
+        let mut worker = HttpWorker::with_capacity(4);
+        let server = worker
+            .allocate_with_role(session(1, 1), Some(SessionEndpointRole::Server))
+            .expect("allocate server connection");
+        assert_eq!(
+            worker.get(server).expect("live").role,
+            Some(SessionEndpointRole::Server)
+        );
+        let client = worker
+            .allocate_with_role(session(2, 1), Some(SessionEndpointRole::Client))
+            .expect("allocate client connection");
+        assert_eq!(
+            worker.get(client).expect("live").role,
+            Some(SessionEndpointRole::Client)
+        );
+        let unclassified = worker.allocate(session(3, 1)).expect("allocate");
+        assert_eq!(
+            worker.get(unclassified).expect("live").role,
+            None,
+            "the default one-arg allocate records no role metadata"
+        );
+    }
+
+    #[test]
+    fn push_registration_without_role_metadata_is_typed_error_and_changes_nothing() {
         let mut worker = HttpWorker::with_capacity(4);
         let (parent, stream) = peer_uni_pair(&mut worker);
         let push = worker.register_peer_uni_stream(stream, PeerUniStreamRole::Push);
         assert!(matches!(
             push,
-            Err(HttpWorkerError::PeerPushPolicyUnavailable { stream: s, context: c })
+            Err(HttpWorkerError::PeerPushRoleMissing { stream: s, context: c })
                 if s == stream && c == parent
         ));
-        let connection = worker.get(parent).expect("live connection");
-        assert_eq!(connection.peer_control, None);
-        assert_eq!(connection.peer_encoder, None);
-        assert_eq!(connection.peer_decoder, None);
-        assert_eq!(
-            worker.get_stream(stream).expect("live stream").peer_role,
-            PeerUniStreamRole::Unclassified,
-            "handed-off push records no stream role"
-        );
+        assert_push_state_unchanged(&worker, parent, stream);
+    }
+
+    #[test]
+    fn push_registration_on_server_connection_is_stream_creation_error() {
+        let mut worker = HttpWorker::with_capacity(4);
+        let parent = worker
+            .allocate_with_role(session(1, 1), Some(SessionEndpointRole::Server))
+            .expect("allocate server connection");
+        let stream = peer_stream(&mut worker, parent);
+        let push = worker.register_peer_uni_stream(stream, PeerUniStreamRole::Push);
+        assert!(matches!(
+            push,
+            Err(HttpWorkerError::PeerPushRejected {
+                stream: s,
+                context: c,
+                code: ErrorCode::StreamCreationError,
+            }) if s == stream && c == parent
+        ));
+        assert_push_state_unchanged(&worker, parent, stream);
+    }
+
+    #[test]
+    fn push_registration_on_client_connection_is_id_error() {
+        let mut worker = HttpWorker::with_capacity(4);
+        let parent = worker
+            .allocate_with_role(session(1, 1), Some(SessionEndpointRole::Client))
+            .expect("allocate client connection");
+        let stream = peer_stream(&mut worker, parent);
+        let push = worker.register_peer_uni_stream(stream, PeerUniStreamRole::Push);
+        assert!(matches!(
+            push,
+            Err(HttpWorkerError::PeerPushRejected {
+                stream: s,
+                context: c,
+                code: ErrorCode::IdError,
+            }) if s == stream && c == parent
+        ));
+        assert_push_state_unchanged(&worker, parent, stream);
     }
 
     #[test]
@@ -1460,6 +2095,291 @@ mod tests {
                 category: StreamCategory::Unknown(max),
                 consumed: 4,
             }
+        );
+    }
+
+    #[test]
+    fn peer_settings_split_across_feeds_reports_consumed_and_pending() {
+        let mut worker = HttpWorker::with_capacity(4);
+        let (parent, control) = peer_uni_pair(&mut worker);
+        worker
+            .register_peer_uni_stream(control, PeerUniStreamRole::Control)
+            .expect("register control stream");
+        // SETTINGS, len 2, {QPACK_MAX_TABLE_CAPACITY = 0}.
+        let wire = [0x04, 0x02, 0x01, 0x00];
+        assert_eq!(
+            worker
+                .process_peer_control_bytes(control, &wire[..2])
+                .expect("no peer control error"),
+            PeerControlOutcome::Incomplete { consumed: 2 }
+        );
+        assert!(
+            worker.get(parent).expect("live").peer_settings_pending,
+            "pending survives an incomplete SETTINGS frame"
+        );
+        assert_eq!(
+            worker
+                .process_peer_control_bytes(control, &wire[2..])
+                .expect("no peer control error"),
+            PeerControlOutcome::Complete { consumed: 2 }
+        );
+        assert!(!worker.get(parent).expect("live").peer_settings_pending);
+    }
+
+    #[test]
+    fn peer_settings_exact_completion_leaves_trailing_bytes_unread() {
+        let mut worker = HttpWorker::with_capacity(4);
+        let (parent, control) = peer_uni_pair(&mut worker);
+        worker
+            .register_peer_uni_stream(control, PeerUniStreamRole::Control)
+            .expect("register control stream");
+        // SETTINGS, len 2, {QPACK_MAX_TABLE_CAPACITY = 0}, then the start of a
+        // GOAWAY frame: the one-shot reader must stop at the SETTINGS frame
+        // and leave the trailing bytes in the FIFO.
+        let wire = [0x04, 0x02, 0x01, 0x00, 0x07, 0x00];
+        assert_eq!(
+            worker
+                .process_peer_control_bytes(control, &wire)
+                .expect("no peer control error"),
+            PeerControlOutcome::Complete { consumed: 4 }
+        );
+        assert!(!worker.get(parent).expect("live").peer_settings_pending);
+    }
+
+    #[test]
+    fn empty_settings_frame_is_accepted() {
+        let mut worker = HttpWorker::with_capacity(4);
+        let (parent, control) = peer_uni_pair(&mut worker);
+        worker
+            .register_peer_uni_stream(control, PeerUniStreamRole::Control)
+            .expect("register control stream");
+        assert_eq!(
+            worker
+                .process_peer_control_bytes(control, &[0x04, 0x00])
+                .expect("no peer control error"),
+            PeerControlOutcome::Complete { consumed: 2 }
+        );
+        assert!(!worker.get(parent).expect("live").peer_settings_pending);
+    }
+
+    #[test]
+    fn malformed_settings_is_frame_error_and_leaves_pending() {
+        let mut worker = HttpWorker::with_capacity(4);
+        let (parent, control) = peer_uni_pair(&mut worker);
+        worker
+            .register_peer_uni_stream(control, PeerUniStreamRole::Control)
+            .expect("register control stream");
+        // DATA is not in the control-stream frame table, so header validation
+        // fails before the settings-first check.
+        let error = worker
+            .process_peer_control_bytes(control, &[0x00, 0x00])
+            .expect_err("DATA cannot start the control stream");
+        assert!(
+            matches!(error, PeerControlError::Protocol(ControlStreamError::Frame(_))),
+            "unexpected error: {error:?}"
+        );
+        assert_eq!(error.error_code(), Some(ErrorCode::FrameUnexpected));
+        assert!(
+            worker.get(parent).expect("live").peer_settings_pending,
+            "a protocol error leaves the settings pending"
+        );
+    }
+
+    #[test]
+    fn nonzero_qpack_settings_is_settings_error_and_leaves_pending() {
+        use crate::http3::proto::frame::SettingId;
+
+        let mut worker = HttpWorker::with_capacity(4);
+        let (parent, control) = peer_uni_pair(&mut worker);
+        worker
+            .register_peer_uni_stream(control, PeerUniStreamRole::Control)
+            .expect("register control stream");
+        // SETTINGS, len 2, {QPACK_MAX_TABLE_CAPACITY = 1}.
+        let error = worker
+            .process_peer_control_bytes(control, &[0x04, 0x02, 0x01, 0x01])
+            .expect_err("nonzero QPACK table capacity is unsupported");
+        assert!(
+            matches!(
+                error,
+                PeerControlError::Protocol(ControlStreamError::QpackNotSupported(
+                    SettingId::QPACK_MAX_TABLE_CAPACITY,
+                    1
+                ))
+            ),
+            "unexpected error: {error:?}"
+        );
+        assert_eq!(error.error_code(), Some(ErrorCode::SettingsError));
+        assert!(
+            worker.get(parent).expect("live").peer_settings_pending,
+            "a protocol error leaves the settings pending"
+        );
+    }
+
+    #[test]
+    fn duplicate_settings_after_completion_is_rejected() {
+        let mut worker = HttpWorker::with_capacity(4);
+        let (parent, control) = peer_uni_pair(&mut worker);
+        worker
+            .register_peer_uni_stream(control, PeerUniStreamRole::Control)
+            .expect("register control stream");
+        assert_eq!(
+            worker
+                .process_peer_control_bytes(control, &[0x04, 0x00])
+                .expect("no peer control error"),
+            PeerControlOutcome::Complete { consumed: 2 }
+        );
+        // The connection is settings-complete, so any further control bytes
+        // are a second SETTINGS frame (VPP http3.c:1548-1552).
+        let error = worker
+            .process_peer_control_bytes(control, &[0x04, 0x00])
+            .expect_err("second SETTINGS frame");
+        assert!(
+            matches!(
+                error,
+                PeerControlError::Protocol(ControlStreamError::DuplicateSettings)
+            ),
+            "unexpected error: {error:?}"
+        );
+        assert_eq!(error.error_code(), Some(ErrorCode::FrameUnexpected));
+        assert!(
+            !worker.get(parent).expect("live").peer_settings_pending,
+            "the rejected duplicate does not re-arm settings"
+        );
+    }
+
+    #[test]
+    fn drain_peer_stream_bytes_returns_the_whole_slice_for_drain_only_roles() {
+        let mut worker = HttpWorker::with_capacity(4);
+        let parent = worker.allocate(session(1, 1)).expect("allocate parent");
+        for role in [
+            PeerUniStreamRole::QpackEncoder,
+            PeerUniStreamRole::QpackDecoder,
+            PeerUniStreamRole::Unknown,
+        ] {
+            let stream = peer_stream(&mut worker, parent);
+            worker
+                .register_peer_uni_stream(stream, role)
+                .expect("register drain-only role");
+            assert_eq!(
+                worker.drain_peer_stream_bytes(stream, &[0xAA; 5]).expect("drain"),
+                5
+            );
+            assert_eq!(
+                worker.drain_peer_stream_bytes(stream, &[]).expect("drain empty"),
+                0
+            );
+        }
+    }
+
+    #[test]
+    fn drain_peer_stream_bytes_rejects_non_drain_only_roles() {
+        let mut worker = HttpWorker::with_capacity(4);
+        let (parent, control) = peer_uni_pair(&mut worker);
+        worker
+            .register_peer_uni_stream(control, PeerUniStreamRole::Control)
+            .expect("register control stream");
+        let error = worker
+            .drain_peer_stream_bytes(control, &[0x00])
+            .expect_err("control stream is not drain-only");
+        assert!(
+            matches!(
+                error,
+                HttpWorkerError::PeerStreamNotDrainable {
+                    stream,
+                    context,
+                    role: PeerUniStreamRole::Control,
+                } if stream == control && context == parent
+            ),
+            "unexpected error: {error:?}"
+        );
+        // An unregistered stream has no role at all and is also not drainable.
+        let unclassified = peer_stream(&mut worker, parent);
+        let error = worker
+            .drain_peer_stream_bytes(unclassified, &[0x00])
+            .expect_err("unclassified stream is not drain-only");
+        assert!(matches!(error, HttpWorkerError::PeerStreamNotDrainable { .. }));
+        // A released stream id fails the liveness lookup.
+        let removed = peer_stream(&mut worker, parent);
+        worker.remove_stream(removed).expect("remove stream");
+        let error = worker
+            .drain_peer_stream_bytes(removed, &[0x00])
+            .expect_err("released stream id");
+        assert!(matches!(error, HttpWorkerError::StreamMissing { .. }));
+    }
+
+    #[test]
+    fn releasing_the_connection_frees_the_reader_and_stales_identities() {
+        let mut worker = HttpWorker::with_capacity(4);
+        let parent = worker.allocate(session(1, 1)).expect("allocate parent");
+        let control = peer_stream(&mut worker, parent);
+        worker
+            .register_peer_uni_stream(control, PeerUniStreamRole::Control)
+            .expect("register control stream");
+        // The first feed allocates the reader slot.
+        assert_eq!(
+            worker
+                .process_peer_control_bytes(control, &[0x04])
+                .expect("no peer control error"),
+            PeerControlOutcome::Incomplete { consumed: 1 }
+        );
+        assert!(worker.get(parent).expect("live").peer_control_reader.is_some());
+        // Releasing the connection frees the reader slot; the stream context
+        // survives but its parent identity is stale.
+        worker.remove(parent).expect("release connection");
+        let error = worker
+            .process_peer_control_bytes(control, &[0x00])
+            .expect_err("parent context released");
+        assert!(
+            matches!(
+                error,
+                PeerControlError::Worker(HttpWorkerError::ParentContextMissing { .. })
+            ),
+            "unexpected error: {error:?}"
+        );
+        // The next allocation reuses the connection slot at a new generation
+        // with no reader, and a fresh reader starts over on the first feed.
+        let parent2 = worker.allocate(session(1, 1)).expect("reallocate");
+        assert!(worker.get(parent2).expect("live").peer_control_reader.is_none());
+        let control2 = peer_stream(&mut worker, parent2);
+        worker
+            .register_peer_uni_stream(control2, PeerUniStreamRole::Control)
+            .expect("register control stream");
+        assert_eq!(
+            worker
+                .process_peer_control_bytes(control2, &[0x04, 0x00])
+                .expect("no peer control error"),
+            PeerControlOutcome::Complete { consumed: 2 }
+        );
+    }
+
+    #[test]
+    fn removing_the_control_stream_frees_the_reader_slot() {
+        let mut worker = HttpWorker::with_capacity(4);
+        let (parent, control) = peer_uni_pair(&mut worker);
+        worker
+            .register_peer_uni_stream(control, PeerUniStreamRole::Control)
+            .expect("register control stream");
+        assert_eq!(
+            worker
+                .process_peer_control_bytes(control, &[0x04])
+                .expect("no peer control error"),
+            PeerControlOutcome::Incomplete { consumed: 1 }
+        );
+        worker.remove_stream(control).expect("remove control stream");
+        assert!(
+            worker.get(parent).expect("live").peer_control_reader.is_none(),
+            "removing the control stream frees its reader slot"
+        );
+        // The stale stream id now fails the liveness lookup before any feed.
+        let error = worker
+            .process_peer_control_bytes(control, &[0x00])
+            .expect_err("stream released");
+        assert!(
+            matches!(
+                error,
+                PeerControlError::Worker(HttpWorkerError::StreamMissing { .. })
+            ),
+            "unexpected error: {error:?}"
         );
     }
 }
