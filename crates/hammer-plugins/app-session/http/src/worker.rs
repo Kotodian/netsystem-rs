@@ -483,6 +483,23 @@ pub(crate) enum HttpWorkerError {
     },
 }
 
+/// Identities returned by
+/// [`HttpWorker::classify_peer_uni_stream_reset`]: the reset peer
+/// unidirectional stream, its parent connection context, the bound lower
+/// session, and the constant connection-terminating HTTP/3 error code.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct PeerUniStreamReset {
+    /// Generation-checked stream context identity of the reset stream.
+    pub(crate) stream: StreamContextId,
+    /// Parent connection context the reset stream belongs to.
+    pub(crate) context: ContextId,
+    /// Lower QUIC session the stream context is bound to.
+    pub(crate) session: SessionId,
+    /// HTTP/3 error code terminating the connection: always
+    /// `ErrorCode::ClosedCriticalStream` (0x0104).
+    pub(crate) error_code: ErrorCode,
+}
+
 /// Outcome of feeding readable bytes to the registered peer control stream.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum PeerControlOutcome {
@@ -933,6 +950,44 @@ impl HttpWorker {
             .ok_or(HttpWorkerError::StreamMissing { stream })?;
         recorded.peer_role = role;
         Ok(())
+    }
+
+    /// Classifies a reset received on a peer HTTP/3 unidirectional stream.
+    ///
+    /// Mirrors VPP `http3_transport_stream_reset_callback`, which checks
+    /// only unidirectional-ness: Control, QPACK encoder, QPACK decoder,
+    /// Unknown, Push, and type-not-yet-decoded (Unclassified) streams all
+    /// terminate the connection with `ErrorCode::ClosedCriticalStream`
+    /// (0x0104). This method is read-only classification: it generation-
+    /// checks the stream context and its parent connection, and returns
+    /// copied stream/parent/session identities plus the constant error code,
+    /// mutating nothing. It must not dispatch the close or clean up yet —
+    /// VPP records and dispatches the connection error before any stream
+    /// cleanup, which are separate tasks.
+    ///
+    /// Fails with `StreamMissing` for a stale or out-of-range stream
+    /// identity and `ParentContextMissing` for a live stream whose parent
+    /// connection is gone; every failure path mutates nothing. O(1): two
+    /// generation-checked lookups and a fixed number of copies; no scan,
+    /// recursion, allocation, or lock.
+    pub(crate) fn classify_peer_uni_stream_reset(
+        &self,
+        stream: StreamContextId,
+    ) -> Result<PeerUniStreamReset, HttpWorkerError> {
+        let stream_context = self
+            .streams
+            .get(stream.into())
+            .ok_or(HttpWorkerError::StreamMissing { stream })?;
+        let parent = stream_context.parent;
+        self.contexts
+            .get(parent.into())
+            .ok_or(HttpWorkerError::ParentContextMissing { parent })?;
+        Ok(PeerUniStreamReset {
+            stream,
+            context: parent,
+            session: stream_context.session,
+            error_code: ErrorCode::ClosedCriticalStream,
+        })
     }
 
     /// Feeds readable bytes of the registered peer control stream into its
@@ -2216,6 +2271,112 @@ mod tests {
             worker.register_peer_uni_stream(stream, PeerUniStreamRole::Control),
             Err(HttpWorkerError::ParentContextMissing { parent: p }) if p == parent
         ));
+    }
+
+    #[test]
+    fn classify_peer_uni_stream_reset_accepts_every_role_with_closed_critical_stream() {
+        let mut worker = HttpWorker::with_capacity(4);
+        let (parent, stream) = peer_uni_pair(&mut worker);
+        // Registration rejects Push (policy) and Unclassified (no decoded
+        // type), so the table writes the role directly: classification must
+        // not consult it, since every peer uni role is critical (VPP
+        // `http3_transport_stream_reset_callback` checks only
+        // unidirectional-ness).
+        let expected = PeerUniStreamReset {
+            stream,
+            context: parent,
+            session: session(2, 1),
+            error_code: ErrorCode::ClosedCriticalStream,
+        };
+        assert_eq!(expected.error_code.value(), 0x0104);
+        for role in [
+            PeerUniStreamRole::Unclassified,
+            PeerUniStreamRole::Control,
+            PeerUniStreamRole::Push,
+            PeerUniStreamRole::QpackEncoder,
+            PeerUniStreamRole::QpackDecoder,
+            PeerUniStreamRole::Unknown,
+        ] {
+            worker
+                .streams
+                .get_mut(stream.into())
+                .expect("live stream")
+                .peer_role = role;
+            assert_eq!(
+                worker
+                    .classify_peer_uni_stream_reset(stream)
+                    .expect("every peer uni role classifies as a critical stream"),
+                expected,
+            );
+        }
+    }
+
+    #[test]
+    fn classify_peer_uni_stream_reset_copies_identities_and_mutates_nothing() {
+        let mut worker = HttpWorker::with_capacity(4);
+        let (parent, stream) = peer_uni_pair(&mut worker);
+        worker
+            .register_peer_uni_stream(stream, PeerUniStreamRole::Control)
+            .expect("register control");
+        let connections = worker.len();
+        let streams = worker.stream_len();
+        let readers = worker.readers.len();
+        let reset = worker
+            .classify_peer_uni_stream_reset(stream)
+            .expect("live peer control stream classifies");
+        assert_eq!(
+            reset,
+            PeerUniStreamReset {
+                stream,
+                context: parent,
+                session: session(2, 1),
+                error_code: ErrorCode::ClosedCriticalStream,
+            }
+        );
+        assert_eq!(reset.error_code.value(), 0x0104);
+        // &self classification leaves every pool and registered slot as is.
+        assert_eq!(worker.len(), connections);
+        assert_eq!(worker.stream_len(), streams);
+        assert_eq!(worker.readers.len(), readers);
+        let connection = worker.get(parent).expect("live connection");
+        assert_eq!(connection.peer_control, Some(stream));
+        assert_eq!(connection.peer_encoder, None);
+        assert_eq!(connection.peer_decoder, None);
+        assert_eq!(connection.peer_control_reader, None);
+        assert_eq!(
+            worker.get_stream(stream).expect("live stream").peer_role,
+            PeerUniStreamRole::Control
+        );
+    }
+
+    #[test]
+    fn classify_peer_uni_stream_reset_rejects_stale_stream_without_mutation() {
+        let mut worker = HttpWorker::with_capacity(4);
+        let (parent, stream) = peer_uni_pair(&mut worker);
+        worker.remove_stream(stream).expect("remove stream");
+        assert!(matches!(
+            worker.classify_peer_uni_stream_reset(stream),
+            Err(HttpWorkerError::StreamMissing { stream: s }) if s == stream
+        ));
+        let connection = worker.get(parent).expect("live connection");
+        assert_eq!(connection.peer_control, None);
+        assert_eq!(connection.peer_encoder, None);
+        assert_eq!(connection.peer_decoder, None);
+        assert_eq!(worker.stream_len(), 0);
+    }
+
+    #[test]
+    fn classify_peer_uni_stream_reset_rejects_missing_parent_without_mutation() {
+        let mut worker = HttpWorker::with_capacity(4);
+        let parent = worker.allocate(session(1, 1)).expect("allocate parent");
+        let stream = peer_stream(&mut worker, parent);
+        worker.remove(parent).expect("remove parent");
+        assert!(matches!(
+            worker.classify_peer_uni_stream_reset(stream),
+            Err(HttpWorkerError::ParentContextMissing { parent: p }) if p == parent
+        ));
+        assert_eq!(worker.len(), 0);
+        assert_eq!(worker.stream_len(), 1);
     }
 
     #[test]
