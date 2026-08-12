@@ -416,21 +416,59 @@ impl<Index: Copy + Eq> SessionEntry<Index> {
             schedule_pending: false,
         }
     }
+
+    /// The connection endpoint role fixed by the Session's construction
+    /// lifecycle: `accepted` names Sessions that arrived through a listener,
+    /// the outbound connect paths construct with it unset. Per-entry and
+    /// generation-safe; never inferred from stream direction or app identity.
+    #[inline]
+    fn endpoint_role(&self) -> SessionEndpointRole {
+        if self.accepted {
+            SessionEndpointRole::Server
+        } else {
+            SessionEndpointRole::Client
+        }
+    }
+}
+
+/// Endpoint role of a Session connection, fixed at creation by the
+/// listener/connect lifecycle.
+///
+/// VPP carries no `SESSION_F_IS_SERVER` session flag: server-ness is the
+/// HTTP connection flag `HTTP_CONN_F_IS_SERVER`, set on the connection
+/// accepted from a listener (http.c:1438) and absent from client
+/// connections created by connect. Hammer records the same fact as the
+/// Session entry's `accepted` lifecycle field; this enum is the typed
+/// projection of that field. Stream children read their parent
+/// connection's projection.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SessionEndpointRole {
+    /// The Session arrived through a listener (accepted connection).
+    Server,
+    /// The Session is an outbound connect (client) connection.
+    Client,
 }
 
 /// Immutable accept-time metadata snapshot for one Session, read by a
 /// builtin Session App accept callback without touching the worker again.
 ///
-/// Static `Copy` data: [`SessionFlags`] plus, for stream children, the parent
-/// connection's [`SessionAppContext`] resolved from the child's pinned
-/// listener handle (VPP `http_ts_accept_stream`, http.c:675: `conn_session =
+/// Static `Copy` data: [`SessionFlags`], the connection endpoint role, and,
+/// for stream children, the parent connection's [`SessionAppContext`]
+/// resolved from the child's pinned listener handle (VPP
+/// `http_ts_accept_stream`, http.c:675: `conn_session =
 /// session_get_from_handle (stream_session->listener_handle)`, parent context
-/// `conn_session->opaque`). Root Sessions carry no parent context.
+/// `conn_session->opaque`). Root Sessions carry the role fixed by their own
+/// construction lifecycle and no parent context.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SessionAcceptMetadata {
     /// The flags a transport derived for the accepted Session
     /// (`set_session_flags`; VPP `SESSION_F_*`).
     pub flags: SessionFlags,
+    /// The Session's endpoint role: `Server` for connections accepted from a
+    /// listener, `Client` for outbound connects; stream children inherit the
+    /// parent connection's role, `None` when the parent is absent, foreign,
+    /// or no longer live (like [`Self::parent_app_context`]).
+    pub role: Option<SessionEndpointRole>,
     /// The parent Session's `SessionAppContext`, `None` for roots and for
     /// streams whose pinned listener handle is absent, foreign, or no longer
     /// live.
@@ -2571,22 +2609,31 @@ impl<Index: Copy + Eq> SessionWorker<Index> {
     /// as `SESSION_F_STREAM` gates VPP's stream accept path, so roots never
     /// resolve a parent. The parent follows [`SessionWorker::
     /// session_id_from_handle`] semantics precisely — the live Session at the
-    /// handle's slot, never a weaker stale check. Static `Copy` data from at
-    /// most two pool lookups: no allocation, locking, atomics, or scanning.
+    /// handle's slot, never a weaker stale check. Roots report the role
+    /// fixed by their construction lifecycle ([`SessionEntry::endpoint_role`]:
+    /// accepted `Server`, outbound connect `Client`); stream children inherit
+    /// the parent connection's role together with its context, so an absent,
+    /// foreign, or freed parent yields `None` for both. Static `Copy` data
+    /// from at most two pool lookups: no allocation, locking, atomics, or
+    /// scanning.
     #[inline]
     pub fn accept_metadata(&self, session_id: SessionId) -> Option<SessionAcceptMetadata> {
         let entry = self.entries.get(session_id.pool_index())?;
-        let parent_app_context = if entry.flags.contains(SessionFlags::STREAM) {
-            entry
+        let (role, parent_app_context) = if entry.flags.contains(SessionFlags::STREAM) {
+            match entry
                 .listener
                 .and_then(|listener| self.session_id_from_handle(listener))
                 .and_then(|parent| self.entries.get(parent.pool_index()))
-                .map(|parent| parent.app_session)
+            {
+                Some(parent) => (Some(parent.endpoint_role()), Some(parent.app_session)),
+                None => (None, None),
+            }
         } else {
-            None
+            (Some(entry.endpoint_role()), None)
         };
         Some(SessionAcceptMetadata {
             flags: entry.flags,
+            role,
             parent_app_context,
         })
     }
@@ -4966,8 +5013,8 @@ mod tests {
     };
 
     use super::{
-        DEFAULT_SESSION_POOL_CAPACITY, SessionDgramArgs, SessionEntry, SessionMain,
-        SessionMigrateResult, SessionQueueNext, SessionState, SessionTransportId,
+        DEFAULT_SESSION_POOL_CAPACITY, SessionDgramArgs, SessionEndpointRole, SessionEntry,
+        SessionMain, SessionMigrateResult, SessionQueueNext, SessionState, SessionTransportId,
         SessionTransportWorkerActions, SessionType, SessionWorker, SessionWorkerState,
         queue_for_worker,
     };
@@ -7124,6 +7171,9 @@ mod tests {
 
         let metadata = sessions.accept_metadata(root).expect("root accept metadata");
         assert_eq!(metadata.flags, SessionFlags::empty());
+        // Roots report their own construction-lifecycle role, never the
+        // pinned listener's, and carry no parent context.
+        assert_eq!(metadata.role, Some(SessionEndpointRole::Client));
         assert_eq!(metadata.parent_app_context, None);
     }
 
@@ -7140,11 +7190,18 @@ mod tests {
             .get_mut(parent.pool_index())
             .expect("parent entry")
             .app_session = 42;
+        // A server connection: accepted from a listener (VPP
+        // `HTTP_CONN_F_IS_SERVER`, http.c:1438).
+        sessions
+            .entries
+            .get_mut(parent.pool_index())
+            .expect("parent entry")
+            .accepted = true;
         let parent_handle = sessions.session_handle(parent);
 
         // Bidi stream child: VPP `http_ts_accept_stream` (http.c:675) resolves
         // the parent connection from the child's pinned listener handle and
-        // inherits its context.
+        // inherits its context and endpoint role.
         let bidi = insert_metadata_test_session(
             &mut sessions,
             SessionTransportId::new(1),
@@ -7160,9 +7217,10 @@ mod tests {
             .listener = Some(parent_handle);
         let metadata = sessions.accept_metadata(bidi).expect("bidi accept metadata");
         assert_eq!(metadata.flags, SessionFlags::STREAM);
+        assert_eq!(metadata.role, Some(SessionEndpointRole::Server));
         assert_eq!(metadata.parent_app_context, Some(42));
 
-        // Uni stream child inherits the same parent context.
+        // Uni stream child inherits the same parent context and role.
         let uni = insert_metadata_test_session(
             &mut sessions,
             SessionTransportId::new(1),
@@ -7184,7 +7242,66 @@ mod tests {
             metadata.flags,
             SessionFlags::STREAM | SessionFlags::UNIDIRECTIONAL
         );
+        assert_eq!(metadata.role, Some(SessionEndpointRole::Server));
         assert_eq!(metadata.parent_app_context, Some(42));
+    }
+
+    #[test]
+    fn accept_metadata_outbound_root_reports_client() {
+        let mut sessions = metadata_test_worker();
+        // Outbound connect root: `stream_connect_pending` constructs with
+        // `accepted` unset, so the root reports `Client` (VPP connects never
+        // set `HTTP_CONN_F_IS_SERVER`).
+        let root = insert_metadata_test_session(
+            &mut sessions,
+            SessionTransportId::new(1),
+            Index::new(1, 1),
+        );
+        let metadata = sessions.accept_metadata(root).expect("root accept metadata");
+        assert_eq!(metadata.role, Some(SessionEndpointRole::Client));
+        assert_eq!(metadata.parent_app_context, None);
+    }
+
+    #[test]
+    fn accept_metadata_stream_child_inherits_client_parent_role() {
+        let mut sessions = metadata_test_worker();
+        // Streams on an outbound connect root inherit its `Client` role
+        // exactly as they inherit its context, regardless of stream flags.
+        let parent = insert_metadata_test_session(
+            &mut sessions,
+            SessionTransportId::new(1),
+            Index::new(1, 1),
+        );
+        let parent_handle = sessions.session_handle(parent);
+        for (slot, flags) in [
+            (2, SessionFlags::STREAM),
+            (
+                3,
+                SessionFlags::STREAM | SessionFlags::UNIDIRECTIONAL,
+            ),
+        ] {
+            let child = insert_metadata_test_session(
+                &mut sessions,
+                SessionTransportId::new(1),
+                Index::new(slot, 1),
+            );
+            sessions
+                .set_session_flags(child, flags)
+                .expect("derive stream flags");
+            sessions
+                .entries
+                .get_mut(child.pool_index())
+                .expect("child entry")
+                .listener = Some(parent_handle);
+            let metadata = sessions
+                .accept_metadata(child)
+                .expect("child accept metadata");
+            assert_eq!(
+                metadata.role,
+                Some(SessionEndpointRole::Client),
+                "child inherits the parent connection role"
+            );
+        }
     }
 
     #[test]
@@ -7240,6 +7357,7 @@ mod tests {
             .accept_metadata(stale_child)
             .expect("stale child accept metadata");
         assert_eq!(metadata.parent_app_context, None);
+        assert_eq!(metadata.role, None);
 
         // A handle naming another worker's slot is foreign and never resolves.
         let parent = insert_metadata_test_session(
@@ -7267,6 +7385,7 @@ mod tests {
             .accept_metadata(orphan_child)
             .expect("orphan child accept metadata");
         assert_eq!(metadata.parent_app_context, None);
+        assert_eq!(metadata.role, None);
     }
 
     #[test]
@@ -7318,12 +7437,24 @@ mod tests {
             .get_mut(second.pool_index())
             .expect("second parent entry")
             .app_session = 200;
+        // The slot occupant is a server connection; the child inherits its
+        // role together with its context.
+        sessions
+            .entries
+            .get_mut(second.pool_index())
+            .expect("second parent entry")
+            .accepted = true;
 
         let metadata = sessions.accept_metadata(child).expect("child accept metadata");
         assert_eq!(
             metadata.parent_app_context,
             Some(200),
             "the stale parent handle resolves the live slot occupant"
+        );
+        assert_eq!(
+            metadata.role,
+            Some(SessionEndpointRole::Server),
+            "the role follows the live slot occupant"
         );
     }
 

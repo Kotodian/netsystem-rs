@@ -31,7 +31,7 @@ pub use node::{AppSessionInputNode, SESSION_QUEUE_IO_BUDGET, SessionQueueNext, S
 pub use protocol::{
     SessionApp, SessionAppCallback, SessionAppCallbacks, SessionAppSegmentCallback,
 };
-pub use runtime::{SessionAcceptMetadata, SessionWorker};
+pub use runtime::{SessionAcceptMetadata, SessionEndpointRole, SessionWorker};
 
 #[hammer_component_macros::config_function(
     name = "session_config",
