@@ -42,6 +42,10 @@ use hammer_runtime::app::SessionAppContext;
 use hammer_runtime::session::SessionStreamDirection;
 use hammer_service::session::{SessionId, SessionWorker};
 
+use crate::http3::proto::coding::Decode;
+use crate::http3::proto::stream::{StreamCategory, StreamType};
+use crate::http3::proto::varint::UnexpectedEnd;
+
 /// Default connection-context capacity of one data worker's pool, matching
 /// the QUIC per-worker context capacity (quic worker.rs:42).
 pub(crate) const HTTP_CONTEXT_CAPACITY: usize = 4_096;
@@ -155,7 +159,9 @@ pub(crate) struct ConnectionContext {
 /// stream context records its child session handle (`hc_tc_session_handle`),
 /// the peer direction flag (`SESSION_F_UNIDIRECTIONAL`), and its parent
 /// connection index (`hc_http_conn_index`). Hot HTTP/3 stream state (frames,
-/// QPACK) belongs to later slices.
+/// QPACK) belongs to later slices; the peer uni stream type decode state
+/// mirrors the varint consumption stage of VPP
+/// `http3_stream_transport_rx_unknown_type` (http3.c:1653-1673).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct StreamContext {
     /// Child QUIC session this stream context is bound to.
@@ -164,6 +170,130 @@ pub(crate) struct StreamContext {
     pub(crate) parent: ContextId,
     /// Peer stream direction: uni- or bidirectional.
     pub(crate) direction: SessionStreamDirection,
+    /// Incremental decode state for a peer unidirectional stream's type
+    /// varint; stays `Unclassified` for bidi request streams.
+    pub(crate) peer_uni_type: PeerUniStreamTypeDecode,
+}
+
+/// Classification role of a peer unidirectional stream once its type varint
+/// is decoded, mirroring the switch in VPP
+/// `http3_stream_transport_rx_unknown_type` (http3.c:1680-1726).
+/// `Unclassified` while the varint is incomplete; registering the role with
+/// the parent connection is a later slice.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub(crate) enum PeerUniStreamRole {
+    /// The stream-type varint has not fully arrived.
+    #[default]
+    Unclassified,
+    /// Control stream (0x00): carries SETTINGS, GOAWAY, MAX_PUSH_ID.
+    Control,
+    /// Push stream (0x01): not supported in this slice.
+    Push,
+    /// QPACK encoder stream (0x02): drained only.
+    QpackEncoder,
+    /// QPACK decoder stream (0x03): drained only.
+    QpackDecoder,
+    /// Any other stream type: ignored.
+    Unknown,
+}
+
+impl From<StreamCategory> for PeerUniStreamRole {
+    fn from(category: StreamCategory) -> Self {
+        match category {
+            StreamCategory::Control => Self::Control,
+            StreamCategory::Push => Self::Push,
+            StreamCategory::QpackEncoder => Self::QpackEncoder,
+            StreamCategory::QpackDecoder => Self::QpackDecoder,
+            StreamCategory::Unknown(_) => Self::Unknown,
+        }
+    }
+}
+
+/// Result of feeding one readable segment to
+/// [`PeerUniStreamTypeDecode::feed`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PeerUniStreamTypeOutcome {
+    /// The stream-type varint has not fully arrived; the partial prefix is
+    /// preserved in the decode state for the next feed.
+    Incomplete,
+    /// The varint completed within this segment: `consumed` bytes of the
+    /// segment were consumed, the state reset, and the caller continues
+    /// with `segment[consumed..]`.
+    Complete {
+        stream_type: StreamType,
+        category: StreamCategory,
+        consumed: usize,
+    },
+}
+
+/// Incremental decode state for a peer unidirectional stream's type varint
+/// (RFC 9114 Section 6.2, RFC 9000 Section 16).
+///
+/// Mirrors the varint consumption stage of VPP
+/// `http3_stream_transport_rx_unknown_type` (http3.c:1653-1673): at most
+/// `HTTP_VARINT_MAX_LEN` bytes are read and buffered until the varint is
+/// complete, then exactly the encoded varint is drained. Stateful across
+/// calls so a type split across FIFO segments decodes without re-reading.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct PeerUniStreamTypeDecode {
+    /// Partial varint prefix preserved across feeds, at most
+    /// `StreamType::MAX_ENCODED_SIZE` bytes.
+    buf: [u8; StreamType::MAX_ENCODED_SIZE],
+    /// Number of buffered bytes.
+    len: u8,
+    /// Decoded classification; `Unclassified` until the varint completes.
+    role: PeerUniStreamRole,
+}
+
+impl Default for PeerUniStreamTypeDecode {
+    fn default() -> Self {
+        Self {
+            buf: [0; StreamType::MAX_ENCODED_SIZE],
+            len: 0,
+            role: PeerUniStreamRole::Unclassified,
+        }
+    }
+}
+
+impl PeerUniStreamTypeDecode {
+    /// Decoded classification of the peer uni stream, or `Unclassified`
+    /// while the varint is incomplete.
+    #[inline]
+    pub(crate) fn role(&self) -> PeerUniStreamRole {
+        self.role
+    }
+
+    /// Feeds the next readable bytes of the peer unidirectional stream.
+    ///
+    /// Buffers at most `StreamType::MAX_ENCODED_SIZE` bytes across calls
+    /// and never scans beyond the varint: on `Complete` exactly the encoded
+    /// varint is consumed from `segment` and the state resets for the next
+    /// stream, so the caller continues with `segment[consumed..]`; on
+    /// `Incomplete` the partial prefix is preserved for the next feed.
+    pub(crate) fn feed(&mut self, segment: &[u8]) -> PeerUniStreamTypeOutcome {
+        let prefix = usize::from(self.len);
+        let take = segment.len().min(self.buf.len() - prefix);
+        self.buf[prefix..prefix + take].copy_from_slice(&segment[..take]);
+        let len = prefix + take;
+        self.len = len as u8;
+
+        // All previously buffered bytes are a strict prefix of the varint
+        // (it would have completed on the earlier feed), so decode fails
+        // only with UnexpectedEnd until enough bytes have arrived.
+        let mut buffered = &self.buf[..len];
+        let Ok(stream_type) = StreamType::decode(&mut buffered) else {
+            return PeerUniStreamTypeOutcome::Incomplete;
+        };
+        let used = len - buffered.len();
+        let category = stream_type.classify();
+        self.role = category.into();
+        self.len = 0;
+        PeerUniStreamTypeOutcome::Complete {
+            stream_type,
+            category,
+            consumed: used - prefix,
+        }
+    }
 }
 
 /// Typed errors for per-worker connection context operations and container
@@ -378,6 +508,7 @@ impl HttpWorker {
                 session,
                 parent,
                 direction,
+                peer_uni_type: PeerUniStreamTypeDecode::default(),
             })
             .map(StreamContextId::from)
             .ok_or(HttpWorkerError::StreamCapacityExhausted {
@@ -901,5 +1032,80 @@ mod tests {
             worker.remove_stream(stream),
             Err(HttpWorkerError::StreamMissing { stream: s }) if s == stream
         ));
+    }
+
+    #[test]
+    fn peer_uni_type_split_varint_preserves_partial_prefix() {
+        // Value 0x7F (127) encodes as a 2-byte varint: [0x40, 0x7F].
+        let stream_type = StreamType::from_value(0x7F).expect("in varint range");
+        let mut decode = PeerUniStreamTypeDecode::default();
+        assert_eq!(decode.role(), PeerUniStreamRole::Unclassified);
+        // A lone first byte cannot complete a 2-byte varint; the prefix is
+        // preserved for the next feed.
+        assert_eq!(
+            decode.feed(&[0x40]),
+            PeerUniStreamTypeOutcome::Incomplete
+        );
+        assert_eq!(decode.role(), PeerUniStreamRole::Unclassified);
+        // The second byte completes it, consuming exactly that byte.
+        assert_eq!(
+            decode.feed(&[0x7F]),
+            PeerUniStreamTypeOutcome::Complete {
+                stream_type,
+                category: StreamCategory::Unknown(0x7F),
+                consumed: 1,
+            }
+        );
+        assert_eq!(decode.role(), PeerUniStreamRole::Unknown);
+    }
+
+    #[test]
+    fn peer_uni_type_complete_consumes_exactly_the_encoded_varint() {
+        // LOCAL_CONTROL_PREFACE: the 1-byte CONTROL type followed by the
+        // SETTINGS frame; only the type varint may be consumed.
+        let mut decode = PeerUniStreamTypeDecode::default();
+        assert_eq!(
+            decode.feed(&LOCAL_CONTROL_PREFACE),
+            PeerUniStreamTypeOutcome::Complete {
+                stream_type: StreamType::CONTROL,
+                category: StreamCategory::Control,
+                consumed: 1,
+            }
+        );
+        assert_eq!(decode.role(), PeerUniStreamRole::Control);
+        // Consumption is exact: the state resets, so the trailing SETTINGS
+        // bytes were neither consumed nor lost, and decode the next type.
+        let settings_type = StreamType::from_value(0x04).expect("in varint range");
+        assert_eq!(
+            decode.feed(&LOCAL_CONTROL_PREFACE[1..]),
+            PeerUniStreamTypeOutcome::Complete {
+                stream_type: settings_type,
+                category: StreamCategory::Unknown(0x04),
+                consumed: 1,
+            }
+        );
+    }
+
+    #[test]
+    fn peer_uni_type_max_size_varint_completes_at_eight_bytes() {
+        // The largest varint (2^62 - 1) encodes as eight 0xFF bytes; any
+        // shorter prefix is Incomplete. The existing decoder has no
+        // malformed/oversized error (every complete varint is in bounds), so
+        // this boundary test stands in for that case.
+        let max = (1u64 << 62) - 1;
+        let stream_type = StreamType::from_value(max).expect("max varint in range");
+        let mut decode = PeerUniStreamTypeDecode::default();
+        assert_eq!(
+            decode.feed(&[0xFF, 0xFF, 0xFF, 0xFF]),
+            PeerUniStreamTypeOutcome::Incomplete
+        );
+        assert_eq!(
+            decode.feed(&[0xFF, 0xFF, 0xFF, 0xFF]),
+            PeerUniStreamTypeOutcome::Complete {
+                stream_type,
+                category: StreamCategory::Unknown(max),
+                consumed: 4,
+            }
+        );
     }
 }
