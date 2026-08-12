@@ -38,6 +38,7 @@ use hammer_service::session::protocol::SessionAppCallbacks;
 use hammer_service::session::runtime::{SessionAcceptMetadata, SessionWorker};
 
 use crate::http3::proto::error::ErrorCode;
+use crate::http3::request::RequestPublishError;
 use crate::listener::{HTTP_MAIN, HttpMain};
 use crate::worker::{ContextId, PeerControlError, PeerUniStreamRole, StreamContextId};
 
@@ -92,6 +93,14 @@ pub(crate) enum HttpAppError {
         "peer control stream finish reported a SETTINGS protocol error, which is structurally impossible; HTTP/3 code {code:?}"
     )]
     PeerControlFinishProtocol { code: ErrorCode },
+    #[error("HTTP/3 request publication failed: {error:?}")]
+    RequestPublish { error: RequestPublishError },
+}
+
+impl From<RequestPublishError> for HttpAppError {
+    fn from(error: RequestPublishError) -> Self {
+        Self::RequestPublish { error }
+    }
 }
 
 /// Session App `accept` for an accepted lower QUIC Session.

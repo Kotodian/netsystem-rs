@@ -39,6 +39,7 @@ use super::http_app::{
     install, reset_on,
 };
 use super::listener::{HTTP_MAIN, HttpMain};
+use crate::http3::request::RequestPublishError;
 use crate::http3::request_frame_reader::RequestFrameRead;
 use crate::worker::{
     ContextId, HTTP_CONTEXT_CAPACITY, HttpWorker, HttpWorkerError, PeerControlOutcome,
@@ -1774,4 +1775,12 @@ fn remove_upper_session_rolls_back_upper_and_repeats_as_noop() {
     sessions
         .remove_upper_session(upper)
         .expect("repeated removal of the stale upper is a typed no-op");
+}
+
+#[test]
+fn http_app_error_from_request_publish_error() {
+    let error = HttpAppError::from(RequestPublishError::MessageError);
+    assert_eq!(error, HttpAppError::RequestPublish { error: RequestPublishError::MessageError });
+    let runtime = RuntimeError::from(error);
+    assert!(matches!(runtime, RuntimeError::Subsystem { subsystem, .. } if subsystem == "http"));
 }
