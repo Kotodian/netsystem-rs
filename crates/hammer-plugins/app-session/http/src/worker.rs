@@ -1459,6 +1459,42 @@ impl HttpWorker {
         Ok(())
     }
 
+    /// Releases a bidirectional request stream exactly once, as the
+    /// worker-owned boundary for the later FIN/reset/cleanup callback.
+    ///
+    /// Mirrors VPP `http3_stream_cleanup_callback` (http3.c:2440-2463):
+    /// cleanup frees the bidi request stream's per-request state
+    /// (`http3_stream_free_req`, http3.c:59-78), while parent-request and
+    /// unidirectional cases return early. The request-role guard here is
+    /// the generation/session-checked stream context itself: the identity
+    /// must resolve to the exact `session` and be bidirectional, after
+    /// which the existing [`HttpWorker::remove_stream`] ownership path
+    /// frees the request reader and pending field-section slots and
+    /// releases the context, advancing the slot's generation.
+    ///
+    /// Idempotency is pinned like [`HttpWorker::remove_stream`]: a
+    /// repeated release of the same identity fails with `StreamMissing`
+    /// and mutates nothing, and a live context bound to a different
+    /// `session` fails with `StreamSessionMismatch`, also mutating
+    /// nothing. A stale identity can never release a reused slot: the
+    /// identity dies with the released context, and removal is
+    /// generation-checked.
+    ///
+    /// O(1): one generation-checked stream lookup with the session check,
+    /// a constant direction check, and the generation-checked removal
+    /// path; no scan, allocation, recursion, or lock.
+    pub(crate) fn release_request_stream(
+        &mut self,
+        stream: StreamContextId,
+        session: SessionId,
+    ) -> Result<(), HttpWorkerError> {
+        let direction = self.get_stream_for_session(stream, session)?.direction;
+        if direction != SessionStreamDirection::Bidi {
+            return Err(HttpWorkerError::RequestStreamNotBidi { stream, direction });
+        }
+        self.remove_stream(stream)
+    }
+
     /// Accepts peer EOF on the registered peer control stream.
     ///
     /// Mirrors VPP `http3_transport_stream_close_callback` →

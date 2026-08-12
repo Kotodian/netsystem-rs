@@ -15,6 +15,9 @@
 //! reset and closes the parent connection exactly once with
 //! `ClosedCriticalStream` (0x0104), mutating no HTTP worker state and leaving
 //! bidi request resets alone. The worker-owned retention sink for completed
+//! HEADERS field sections now exists (`retain_pending_field_section` /
+//! `take_pending_field_section`), but production `builtin_rx` callback wiring
+//! remains a later seam, so no wiring exists.
 
 use std::cell::Cell;
 use std::sync::Arc;
@@ -39,7 +42,7 @@ use super::listener::{HTTP_MAIN, HttpMain};
 use crate::http3::request_frame_reader::RequestFrameRead;
 use crate::worker::{
     ContextId, HTTP_CONTEXT_CAPACITY, HttpWorker, HttpWorkerError, PeerControlOutcome,
-    PeerUniStreamRole, StreamContextId,
+    PeerUniStreamRole, RequestReadError, StreamContextId,
 };
 
 /// SessionWorker (64-slot pool on data worker 0) whose Application registry
@@ -1522,4 +1525,225 @@ fn pending_field_section_rejects_foreign_session_identities() {
         Some(b"hi".to_vec()),
         "the bound session retains and takes normally"
     );
+}
+
+/// The worker-owned release boundary for bidi request stream cleanup
+/// (`release_request_stream`, the future FIN/reset callback entry):
+/// releasing a live bidi request stream frees its lazily allocated
+/// request reader and its retained pending field section through the
+/// existing `remove_stream` ownership path. Mirrors VPP
+/// `http3_stream_cleanup_callback` → `http3_stream_free_req`
+/// (http3.c:2440-2463, 59-78), where the bidi request stream's
+/// per-request state is freed as the stream is cleaned up.
+#[test]
+fn release_request_stream_frees_reader_and_pending_slot() {
+    let mut worker = HttpWorker::with_capacities(4, 4);
+    let session = SessionId::from_raw(1);
+    let parent = worker.allocate(session).expect("allocate parent context");
+    let stream = worker
+        .allocate_stream(session, parent, SessionStreamDirection::Bidi)
+        .expect("allocate bidi request stream");
+
+    // Establish both worker-owned slots: the lazily allocated request
+    // reader on first feed and the retained HEADERS field section.
+    worker
+        .process_request_bytes(stream, session, &[0x01, 0x02, b'h', b'i'])
+        .expect("feed one complete HEADERS frame");
+    worker
+        .retain_pending_field_section(stream, session, b"hi".to_vec())
+        .expect("retain the completed field section");
+    assert!(
+        worker
+            .get_stream(stream)
+            .expect("live stream")
+            .request_reader
+            .is_some(),
+        "the feed recorded the request reader slot"
+    );
+    assert!(
+        worker
+            .get_stream(stream)
+            .expect("live stream")
+            .pending_field_section
+            .is_some(),
+        "the retain recorded the pending section slot"
+    );
+
+    // The single release frees both slots and the stream context: the
+    // identity is dead for the read path, the retention path, and
+    // further release.
+    worker
+        .release_request_stream(stream, session)
+        .expect("release the live bidi request stream");
+    assert!(
+        matches!(
+            worker.process_request_bytes(stream, session, &[0x01]),
+            Err(RequestReadError::Worker(HttpWorkerError::StreamMissing { stream: s })) if s == stream
+        ),
+        "the released identity is dead for the read path"
+    );
+    assert!(
+        worker.take_pending_field_section(stream, session).is_err(),
+        "the released identity is dead for the retention path"
+    );
+    assert!(
+        matches!(worker.get_stream(stream), Err(HttpWorkerError::StreamMissing { stream: s }) if s == stream),
+        "the released stream context is gone"
+    );
+}
+
+/// A stale stream identity can never release a reused slot: after the
+/// release, the freed slot is reallocated to a fresh bidi request stream
+/// at a new generation, and releasing through the stale identity is
+/// rejected before any removal, leaving the fresh stream's reader and
+/// pending section untouched.
+#[test]
+fn release_request_stream_stale_identity_cannot_touch_reused_slot() {
+    let mut worker = HttpWorker::with_capacities(4, 4);
+    let session = SessionId::from_raw(1);
+    let parent = worker.allocate(session).expect("allocate parent context");
+    let first = worker
+        .allocate_stream(session, parent, SessionStreamDirection::Bidi)
+        .expect("allocate the first bidi request stream");
+    worker
+        .process_request_bytes(first, session, &[0x01, 0x02, b'h', b'i'])
+        .expect("feed HEADERS on the first stream");
+    worker
+        .retain_pending_field_section(first, session, b"hi".to_vec())
+        .expect("retain a section on the first stream");
+    worker
+        .release_request_stream(first, session)
+        .expect("release the first stream");
+
+    // The freed slot is reused by a fresh stream at a new generation.
+    let second = worker
+        .allocate_stream(session, parent, SessionStreamDirection::Bidi)
+        .expect("allocate a stream reusing the released slot");
+    worker
+        .process_request_bytes(second, session, &[0x01, 0x02, b'h', b'x'])
+        .expect("feed HEADERS on the fresh stream");
+    worker
+        .retain_pending_field_section(second, session, b"hx".to_vec())
+        .expect("retain a section on the fresh stream");
+
+    // The stale identity is rejected before any removal; the fresh
+    // stream's reader and pending section survive untouched.
+    assert!(
+        matches!(
+            worker.release_request_stream(first, session),
+            Err(HttpWorkerError::StreamMissing { stream: s }) if s == first
+        ),
+        "releasing through the stale identity is rejected"
+    );
+    let fresh = worker.get_stream(second).expect("fresh stream still live");
+    assert!(
+        fresh.request_reader.is_some(),
+        "the fresh stream's reader is untouched"
+    );
+    assert!(
+        fresh.pending_field_section.is_some(),
+        "the fresh stream's pending section is untouched"
+    );
+    assert_eq!(
+        worker.take_pending_field_section(second, session).unwrap(),
+        Some(b"hx".to_vec()),
+        "the fresh stream still owns its pending section"
+    );
+}
+
+/// Releasing through a foreign session is a typed
+/// `StreamSessionMismatch` that mutates nothing: the live stream stays
+/// live and can still be released through its bound session.
+#[test]
+fn release_request_stream_foreign_session_is_typed_mismatch_without_mutation() {
+    let mut worker = HttpWorker::with_capacities(4, 4);
+    let session = SessionId::from_raw(1);
+    let foreign = SessionId::from_raw(2);
+    let parent = worker.allocate(session).expect("allocate parent context");
+    let stream = worker
+        .allocate_stream(session, parent, SessionStreamDirection::Bidi)
+        .expect("allocate bidi request stream");
+
+    let error = worker
+        .release_request_stream(stream, foreign)
+        .expect_err("releasing through a foreign session must fail");
+    assert!(
+        matches!(
+            error,
+            HttpWorkerError::StreamSessionMismatch {
+                stream: s,
+                expected,
+                actual
+            } if s == stream && expected == foreign && actual == session
+        ),
+        "typed session mismatch expected, got {error:?}"
+    );
+    assert!(
+        worker
+            .get_stream(stream)
+            .expect("stream still live")
+            .request_reader
+            .is_none(),
+        "the failed release mutated nothing"
+    );
+    worker
+        .release_request_stream(stream, session)
+        .expect("the bound session still releases the stream");
+}
+
+/// A repeated release is pinned to a typed `StreamMissing`, never a
+/// silent no-op, matching `remove_stream` idempotency.
+#[test]
+fn release_request_stream_repeated_release_is_stream_missing() {
+    let mut worker = HttpWorker::with_capacities(4, 4);
+    let session = SessionId::from_raw(1);
+    let parent = worker.allocate(session).expect("allocate parent context");
+    let stream = worker
+        .allocate_stream(session, parent, SessionStreamDirection::Bidi)
+        .expect("allocate bidi request stream");
+
+    worker
+        .release_request_stream(stream, session)
+        .expect("first release frees the stream");
+    assert!(
+        matches!(
+            worker.release_request_stream(stream, session),
+            Err(HttpWorkerError::StreamMissing { stream: s }) if s == stream
+        ),
+        "a repeated release is a typed StreamMissing"
+    );
+}
+
+/// The bidi/request-role guard rejects a live non-bidi stream with a
+/// typed `RequestStreamNotBidi` and mutates nothing; the uni stream
+/// remains live and is released by `remove_stream` as before.
+#[test]
+fn release_request_stream_rejects_non_bidi_without_mutation() {
+    let mut worker = HttpWorker::with_capacities(4, 4);
+    let session = SessionId::from_raw(1);
+    let parent = worker.allocate(session).expect("allocate parent context");
+    let uni = worker
+        .allocate_stream(session, parent, SessionStreamDirection::Uni)
+        .expect("allocate a peer uni stream");
+
+    let error = worker
+        .release_request_stream(uni, session)
+        .expect_err("releasing a uni stream must fail");
+    assert!(
+        matches!(
+            error,
+            HttpWorkerError::RequestStreamNotBidi {
+                stream: s,
+                direction: SessionStreamDirection::Uni
+            } if s == uni
+        ),
+        "typed non-bidi rejection expected, got {error:?}"
+    );
+    assert!(
+        worker.get_stream(uni).is_ok(),
+        "the rejected release left the uni stream live"
+    );
+    worker
+        .remove_stream(uni)
+        .expect("remove_stream still owns uni stream release");
 }
