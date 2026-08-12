@@ -14,14 +14,15 @@ use hammer_infra::pool::{Index, Pool};
 use hammer_infra::thread_owned::ThreadOwnedError;
 use hammer_infra::timer_wheel::TimerWheel1t2w2048sl;
 use hammer_runtime::app::{
-    ApplicationId, SessionAppId, SessionConnectError, SessionDgramHeader, SessionFlags,
-    SessionHandle,
+    ApplicationId, SessionAppContext, SessionAppId, SessionConnectError, SessionDgramHeader,
+    SessionFlags, SessionHandle,
 };
-use hammer_runtime::session::SessionApplicationErrorCode;
+use hammer_runtime::session::{SessionApplicationErrorCode, SessionStreamDirection};
 use hammer_runtime::{
     DataPlaneRuntime, DataWorkerId, NodeRuntimeData, RuntimeError, RuntimeResult,
     SessionConnectionId, SessionListenerId,
 };
+use hammer_service::session::ApplicationMain;
 use hammer_service::session::SessionId;
 use hammer_service::session::node::{SessionQueueNext, SessionQueueOutput};
 use hammer_service::session::runtime::{
@@ -1035,6 +1036,138 @@ impl QuicWorker {
             return Err(error);
         }
         Ok(child_session)
+    }
+
+    /// Opens one stream child of an established QUIC connection Session;
+    /// mirrors VPP `session_open_stream` (session.c:1393) driving the QUIC
+    /// transport's `quic_connect_stream` (quic.c:164). `parent` must be
+    /// owned by a QUIC connection context (never a stream) whose worker-local
+    /// connection is live (quic.c:175-206); the child inherits the parent's
+    /// application endpoint and carries the supplied `app_context` as both
+    /// its Session App context and its VPP `opaque` (`s->opaque = sep->opaque`,
+    /// session.c:1410). The Application Connection is registered here on
+    /// `applications` exactly like the CONNECT_STREAM control path
+    /// (session/control.rs `application_connect`), which also rolls it back
+    /// when the transport connect fails; every validation precedes
+    /// registration, and failures after registration roll the connection
+    /// back so no orphaned Application connection, Session, or context is
+    /// left behind. The remaining open work reuses `connect_stream` and its
+    /// rollback paths.
+    #[allow(dead_code)] // consumed by the upcoming session action slice
+    pub(super) fn open_stream(
+        &mut self,
+        applications: &ApplicationMain,
+        sessions: &mut SessionWorker<Index>,
+        parent: SessionId,
+        direction: SessionStreamDirection,
+        app_context: SessionAppContext,
+    ) -> RuntimeResult<SessionId> {
+        let parent_handle = sessions.session_handle(parent);
+        let (transport, parent_index) =
+            sessions
+                .session_transport(parent)
+                .ok_or(QuicWorkerError::ParentSessionMissing {
+                    parent: parent_handle,
+                })?;
+        if transport != Self::ID
+            || !self.contexts.get(parent_index).is_some_and(|context| {
+                context.connection().is_some_and(|connection| {
+                    connection
+                        .engine
+                        .as_deref()
+                        .is_some_and(|engine| engine.connection.is_some())
+                })
+            })
+        {
+            return Err(QuicWorkerError::ParentSessionInvalid {
+                parent: parent_handle,
+            }
+            .into());
+        }
+
+        let (application, app, _parent_opaque, server_name) = sessions
+            .session_app_endpoint(parent)
+            .ok_or(QuicWorkerError::SessionMissing { session: parent })?;
+        // VPP session_open_stream hands the stream to the parent's app worker
+        // (quic.c:230-231 copies `qctx->parent_app_wrk_id`); the parent's
+        // allocation owner is inherited by the child Session through the
+        // registered Application Connection (stream_connect_pending reads
+        // `connection.context()` as the allocation owner). It must exist
+        // before any allocation so a missing owner fails typed instead of
+        // registering a zeroed connection.
+        let owner = sessions.session_allocation_owner(parent).ok_or(
+            QuicWorkerError::ParentAllocationOwnerMissing {
+                parent: parent_handle,
+            },
+        )?;
+        let server_name = server_name.map(str::to_owned);
+        let connection = applications
+            .register_connection(application, owner, server_name, app, Some(app_context))
+            .map_err(|error| RuntimeError::subsystem("application", error))?;
+        let flags = match direction {
+            SessionStreamDirection::Bidi => SessionFlags::STREAM,
+            SessionStreamDirection::Uni => SessionFlags::STREAM | SessionFlags::UNIDIRECTIONAL,
+        };
+        let child = match self.connect_stream(
+            sessions,
+            parent_handle,
+            SessionConnectionId::from_raw(connection.raw()),
+            flags,
+        ) {
+            Ok(child) => child,
+            Err(primary) => {
+                // VPP session.c:1425-1433: when the transport fails to open
+                // the stream the Session is freed and the app worker is
+                // notified so its connection object is dropped; the
+                // registered Application Connection is that counterpart and
+                // must not be left behind.
+                let cleanup = applications
+                    .remove_connection(application, connection)
+                    .map_err(|error| RuntimeError::subsystem("application", error))
+                    .err();
+                return match cleanup {
+                    Some(cleanup) => Err(QuicWorkerError::OpenStreamCleanupFailed {
+                        parent: parent_handle,
+                        primary,
+                        cleanup,
+                    }
+                    .into()),
+                    None => Err(primary),
+                };
+            }
+        };
+        if let Err(primary) = sessions.set_app_session(child, app_context) {
+            // VPP session.c:1425-1433 frees the stream Session and its
+            // transport context before the app worker is notified so its
+            // connection object is dropped; mirror that reverse ownership
+            // order (Session rollback, context removal, Application
+            // Connection removal), attempting each step independently so
+            // one cleanup failure does not skip the later steps. The child
+            // context index is resolved up front O(1) so context removal
+            // runs even when the Session rollback itself fails; the
+            // aggregation matches connect_stream's rollback path above.
+            let child_index = sessions.session_transport(child).map(|(_, index)| index);
+            let session_cleanup = sessions.rollback_session_creation(child).err();
+            let context_cleanup = match child_index {
+                Some(index) => self.remove_context(ContextId::from(index)).err(),
+                None => None,
+            };
+            let connection_cleanup = applications
+                .remove_connection(application, connection)
+                .map_err(|error| RuntimeError::subsystem("application", error))
+                .err();
+            let cleanup = session_cleanup.or(context_cleanup).or(connection_cleanup);
+            return match cleanup {
+                Some(cleanup) => Err(QuicWorkerError::OpenStreamCleanupFailed {
+                    parent: parent_handle,
+                    primary,
+                    cleanup,
+                }
+                .into()),
+                None => Err(primary),
+            };
+        }
+        Ok(child)
     }
 
     /// Resolves `session` through the Session Worker into this worker's QUIC
@@ -3316,6 +3449,8 @@ pub(super) enum QuicWorkerError {
     ParentSessionMissing { parent: SessionHandle },
     #[error("parent Session {parent:?} is not owned by a QUIC connection")]
     ParentSessionInvalid { parent: SessionHandle },
+    #[error("parent Session {parent:?} has no allocation owner")]
+    ParentAllocationOwnerMissing { parent: SessionHandle },
     #[error("QUIC {direction:?} stream limit is exhausted for parent context {context:?}")]
     StreamLimitReached {
         context: ContextId,
@@ -3326,6 +3461,15 @@ pub(super) enum QuicWorkerError {
     )]
     StreamConnectCleanupFailed {
         context: ContextId,
+        #[source]
+        primary: RuntimeError,
+        cleanup: RuntimeError,
+    },
+    #[error(
+        "open stream failed for parent {parent:?}: {primary}; rollback cleanup failed: {cleanup}"
+    )]
+    OpenStreamCleanupFailed {
+        parent: SessionHandle,
         #[source]
         primary: RuntimeError,
         cleanup: RuntimeError,
@@ -4142,6 +4286,477 @@ mod tests {
         assert_eq!(stream.stream.dir(), quinn_proto::Dir::Uni);
         assert_eq!(stream.stream.initiator(), quinn_proto::Side::Client);
         assert_eq!(stream.session, child);
+        drop(server);
+        let _ = std::fs::remove_file(socket_path);
+        Ok(())
+    }
+
+    #[test]
+    fn open_stream_creates_direction_exact_child_carrying_app_context() -> RuntimeResult<()> {
+        let applications = Arc::new(hammer_service::session::ApplicationMain::new(4));
+        let application = applications
+            .attach()
+            .map_err(hammer_runtime::RuntimeError::from)?;
+        let socket_path = unique_socket_path("hammer-quic-open-stream");
+        let server =
+            hammer_runtime::attach::AppServer::bind(&socket_path, 1).expect("bind App server");
+        let mut sessions = hammer_service::session::SessionWorker::<Index>::new(
+            DataWorkerId::new(0),
+            1,
+            hammer_runtime::app::AppSessionConfig::default(),
+            64,
+            Arc::clone(&applications),
+            Some(server.publisher()),
+        )?;
+        sessions.install_session_app(
+            SessionAppId::new(0),
+            hammer_service::session::SessionAppCallbacks::all_none(),
+        )?;
+        sessions.install_application_mq_for_test(application)?;
+        let mut worker = QuicWorker::new(DataWorkerId::new(0));
+        let local = "127.0.0.1:443".parse().expect("local endpoint");
+        let remote = "127.0.0.1:444".parse().expect("remote endpoint");
+        let (client_config, server_config) = client_server_config_pair();
+        let parent_context = worker.allocate_client_connect(
+            Arc::clone(&client_config),
+            "localhost".to_owned(),
+            local,
+            remote,
+            application,
+            Some(SessionAppId::new(0)),
+            None,
+            SessionConnectionId::from_raw(7),
+        )?;
+        let now = Instant::now();
+        worker.connect_connection(parent_context, SessionId::from_raw(11), now)?;
+        drive_client_handshake(
+            &mut worker,
+            parent_context,
+            server_config,
+            local,
+            remote,
+            now,
+        )?;
+        // The parent must be attached with an allocation owner: open_stream
+        // rejects a parent without one (VPP quic.c:230-231 inherits the
+        // parent's app worker). The attached external path is the only
+        // constructible route in these tests.
+        let parent = sessions.construct_transport_session(
+            QuicWorker::ID,
+            parent_context.into(),
+            unique_allocation_owner(),
+            application,
+            None,
+            None,
+            None,
+            false,
+        )?;
+        worker
+            .contexts
+            .get_mut(parent_context.into())
+            .and_then(Context::connection_mut)
+            .ok_or(QuicWorkerError::ContextMissing {
+                context: parent_context,
+            })?
+            .connection_session = Some(parent);
+        worker
+            .contexts
+            .get_mut(parent_context.into())
+            .and_then(Context::connection_mut)
+            .ok_or(QuicWorkerError::ContextMissing {
+                context: parent_context,
+            })?
+            .state = ConnectionState::Established;
+
+        let bidi_context = 0xCAFE_BEEFu64;
+        let bidi = worker.open_stream(
+            &applications,
+            &mut sessions,
+            parent,
+            SessionStreamDirection::Bidi,
+            bidi_context,
+        )?;
+        let (transport, bidi_index) = sessions
+            .session_transport(bidi)
+            .ok_or(QuicWorkerError::SessionMissing { session: bidi })?;
+        assert_eq!(transport, QuicWorker::ID);
+        let stream = worker
+            .contexts
+            .get(bidi_index)
+            .and_then(|context| match &context.role {
+                ContextRole::Stream(stream) => Some(stream),
+                ContextRole::Listener(_) | ContextRole::Connection(_) => None,
+            })
+            .ok_or(QuicWorkerError::ContextMissing {
+                context: ContextId::from(bidi_index),
+            })?;
+        assert_eq!(stream.parent, parent_context.into());
+        assert_eq!(stream.session, bidi);
+        assert_eq!(stream.stream.dir(), quinn_proto::Dir::Bi);
+        assert_eq!(
+            sessions.session_app_endpoint(bidi),
+            Some((application, None, Some(bidi_context), None)),
+            "the child Session carries the supplied SessionAppContext"
+        );
+
+        let uni_context = 0xDEAD_BEEFu64;
+        let uni = worker.open_stream(
+            &applications,
+            &mut sessions,
+            parent,
+            SessionStreamDirection::Uni,
+            uni_context,
+        )?;
+        let (_, uni_index) = sessions
+            .session_transport(uni)
+            .ok_or(QuicWorkerError::SessionMissing { session: uni })?;
+        let stream = worker
+            .contexts
+            .get(uni_index)
+            .and_then(|context| match &context.role {
+                ContextRole::Stream(stream) => Some(stream),
+                ContextRole::Listener(_) | ContextRole::Connection(_) => None,
+            })
+            .ok_or(QuicWorkerError::ContextMissing {
+                context: ContextId::from(uni_index),
+            })?;
+        assert_eq!(stream.parent, parent_context.into());
+        assert_eq!(stream.session, uni);
+        assert_eq!(stream.stream.dir(), quinn_proto::Dir::Uni);
+        assert_eq!(
+            sessions.session_app_endpoint(uni),
+            Some((application, None, Some(uni_context), None)),
+            "the child Session carries the supplied SessionAppContext"
+        );
+
+        // A parent Session unknown to the Session Worker is rejected before
+        // any allocation (VPP session_open_stream SESSION_E_INVALID).
+        let contexts = worker.contexts.len();
+        let missing = SessionId::from_raw(0xDEAD);
+        let error = worker
+            .open_stream(
+                &applications,
+                &mut sessions,
+                missing,
+                SessionStreamDirection::Bidi,
+                0,
+            )
+            .expect_err("unknown parent Session is rejected");
+        assert!(
+            matches!(
+                &error,
+                RuntimeError::Subsystem { source, .. }
+                    if matches!(
+                        source.downcast_ref::<QuicWorkerError>(),
+                        Some(QuicWorkerError::ParentSessionMissing { .. })
+                    )
+            ),
+            "typed ParentSessionMissing expected, got {error:?}"
+        );
+
+        // A stream child is not a valid parent (VPP quic.c:186-194 rejects a
+        // stream context) and leaves no orphaned context.
+        let error = worker
+            .open_stream(
+                &applications,
+                &mut sessions,
+                bidi,
+                SessionStreamDirection::Uni,
+                0,
+            )
+            .expect_err("stream Session parent is rejected");
+        assert!(
+            matches!(
+                &error,
+                RuntimeError::Subsystem { source, .. }
+                    if matches!(
+                        source.downcast_ref::<QuicWorkerError>(),
+                        Some(QuicWorkerError::ParentSessionInvalid { .. })
+                    )
+            ),
+            "typed ParentSessionInvalid expected, got {error:?}"
+        );
+        assert_eq!(worker.contexts.len(), contexts);
+
+        // A connection whose worker-local engine has no live connection is
+        // rejected up front (VPP quic.c:206 `if (!(conn = qctx->conn))`).
+        let idle = worker.allocate_client_connect(
+            Arc::clone(&client_config),
+            "localhost".to_owned(),
+            local,
+            remote,
+            application,
+            Some(SessionAppId::new(0)),
+            None,
+            SessionConnectionId::from_raw(8),
+        )?;
+        let idle_session = sessions.construct_transport_session(
+            QuicWorker::ID,
+            idle.into(),
+            unique_allocation_owner(),
+            application,
+            Some(SessionAppId::new(0)),
+            None,
+            None,
+            false,
+        )?;
+        // Baseline after all setup: the idle connection context above is a
+        // real allocation owned by the connection path, not by open_stream
+        // (VPP quic.c:206 returns without freeing the connection).
+        let idle_contexts = worker.contexts.len();
+        let error = worker
+            .open_stream(
+                &applications,
+                &mut sessions,
+                idle_session,
+                SessionStreamDirection::Bidi,
+                0,
+            )
+            .expect_err("connection without a live engine is rejected");
+        assert!(
+            matches!(
+                &error,
+                RuntimeError::Subsystem { source, .. }
+                    if matches!(
+                        source.downcast_ref::<QuicWorkerError>(),
+                        Some(QuicWorkerError::ParentSessionInvalid { .. })
+                    )
+            ),
+            "typed ParentSessionInvalid expected, got {error:?}"
+        );
+        assert_eq!(
+            worker.contexts.len(),
+            idle_contexts,
+            "the rejected open leaves the idle connection context and no stream context"
+        );
+
+        drop(server);
+        let _ = std::fs::remove_file(socket_path);
+        Ok(())
+    }
+
+    #[test]
+    fn open_stream_rejects_parent_without_allocation_owner_before_side_effects() -> RuntimeResult<()>
+    {
+        let applications = Arc::new(hammer_service::session::ApplicationMain::new(4));
+        let application = applications
+            .attach()
+            .map_err(hammer_runtime::RuntimeError::from)?;
+        let socket_path = unique_socket_path("hammer-quic-open-stream-owner");
+        let server =
+            hammer_runtime::attach::AppServer::bind(&socket_path, 1).expect("bind App server");
+        let mut sessions = hammer_service::session::SessionWorker::<Index>::new(
+            DataWorkerId::new(0),
+            1,
+            hammer_runtime::app::AppSessionConfig::default(),
+            64,
+            Arc::clone(&applications),
+            Some(server.publisher()),
+        )?;
+        sessions.install_session_app(
+            SessionAppId::new(0),
+            hammer_service::session::SessionAppCallbacks::all_none(),
+        )?;
+        sessions.install_application_mq_for_test(application)?;
+        let mut worker = QuicWorker::new(DataWorkerId::new(0));
+        let local = "127.0.0.1:443".parse().expect("local endpoint");
+        let remote = "127.0.0.1:444".parse().expect("remote endpoint");
+        let (client_config, server_config) = client_server_config_pair();
+        let parent_context = worker.allocate_client_connect(
+            Arc::clone(&client_config),
+            "localhost".to_owned(),
+            local,
+            remote,
+            application,
+            Some(SessionAppId::new(0)),
+            None,
+            SessionConnectionId::from_raw(7),
+        )?;
+        let now = Instant::now();
+        worker.connect_connection(parent_context, SessionId::from_raw(11), now)?;
+        drive_client_handshake(
+            &mut worker,
+            parent_context,
+            server_config,
+            local,
+            remote,
+            now,
+        )?;
+        // App-path construction never attaches the Session, so this parent
+        // has an application endpoint but no allocation owner.
+        let parent = sessions.construct_transport_session(
+            QuicWorker::ID,
+            parent_context.into(),
+            unique_allocation_owner(),
+            application,
+            Some(SessionAppId::new(0)),
+            None,
+            None,
+            false,
+        )?;
+        worker
+            .contexts
+            .get_mut(parent_context.into())
+            .and_then(Context::connection_mut)
+            .ok_or(QuicWorkerError::ContextMissing {
+                context: parent_context,
+            })?
+            .connection_session = Some(parent);
+        worker
+            .contexts
+            .get_mut(parent_context.into())
+            .and_then(Context::connection_mut)
+            .ok_or(QuicWorkerError::ContextMissing {
+                context: parent_context,
+            })?
+            .state = ConnectionState::Established;
+
+        let contexts = worker.contexts.len();
+        let error = worker
+            .open_stream(
+                &applications,
+                &mut sessions,
+                parent,
+                SessionStreamDirection::Bidi,
+                0,
+            )
+            .expect_err("parent without an allocation owner is rejected");
+        assert!(
+            matches!(
+                &error,
+                RuntimeError::Subsystem { source, .. }
+                    if matches!(
+                        source.downcast_ref::<QuicWorkerError>(),
+                        Some(QuicWorkerError::ParentAllocationOwnerMissing { .. })
+                    )
+            ),
+            "typed ParentAllocationOwnerMissing expected, got {error:?}"
+        );
+        assert_eq!(
+            worker.contexts.len(),
+            contexts,
+            "the rejected open leaves no stream context"
+        );
+
+        drop(server);
+        let _ = std::fs::remove_file(socket_path);
+        Ok(())
+    }
+
+    #[test]
+    fn open_stream_removes_application_connection_when_connect_stream_fails() -> RuntimeResult<()> {
+        // One connection slot: a leaked CONNECTING entry from a failed open
+        // would make the second attempt fail at registration instead.
+        let applications = Arc::new(hammer_service::session::ApplicationMain::new(1));
+        let application = applications
+            .attach()
+            .map_err(hammer_runtime::RuntimeError::from)?;
+        let socket_path = unique_socket_path("hammer-quic-open-stream-rollback");
+        let server =
+            hammer_runtime::attach::AppServer::bind(&socket_path, 1).expect("bind App server");
+        let mut sessions = hammer_service::session::SessionWorker::<Index>::new(
+            DataWorkerId::new(0),
+            1,
+            hammer_runtime::app::AppSessionConfig::default(),
+            64,
+            Arc::clone(&applications),
+            Some(server.publisher()),
+        )?;
+        sessions.install_session_app(
+            SessionAppId::new(0),
+            hammer_service::session::SessionAppCallbacks::all_none(),
+        )?;
+        sessions.install_application_mq_for_test(application)?;
+        let mut worker = QuicWorker::new(DataWorkerId::new(0));
+        let local = "127.0.0.1:443".parse().expect("local endpoint");
+        let remote = "127.0.0.1:444".parse().expect("remote endpoint");
+        let (client_config, server_config) = client_server_config_pair();
+        let parent_context = worker.allocate_client_connect(
+            Arc::clone(&client_config),
+            "localhost".to_owned(),
+            local,
+            remote,
+            application,
+            Some(SessionAppId::new(0)),
+            None,
+            SessionConnectionId::from_raw(7),
+        )?;
+        let now = Instant::now();
+        worker.connect_connection(parent_context, SessionId::from_raw(11), now)?;
+        drive_client_handshake(
+            &mut worker,
+            parent_context,
+            server_config,
+            local,
+            remote,
+            now,
+        )?;
+        let parent = sessions.construct_transport_session(
+            QuicWorker::ID,
+            parent_context.into(),
+            unique_allocation_owner(),
+            application,
+            None,
+            None,
+            None,
+            false,
+        )?;
+        worker
+            .contexts
+            .get_mut(parent_context.into())
+            .and_then(Context::connection_mut)
+            .ok_or(QuicWorkerError::ContextMissing {
+                context: parent_context,
+            })?
+            .connection_session = Some(parent);
+        worker
+            .contexts
+            .get_mut(parent_context.into())
+            .and_then(Context::connection_mut)
+            .ok_or(QuicWorkerError::ContextMissing {
+                context: parent_context,
+            })?
+            .state = ConnectionState::Established;
+
+        // Exhaust the context pool so connect_stream fails after the
+        // Application Connection is registered.
+        while worker.contexts.len() < QUIC_CONTEXT_CAPACITY {
+            worker
+                .contexts
+                .insert(Context::stream(
+                    parent_context.into(),
+                    SessionId::from_raw(0),
+                    quinn_proto::StreamId::new(quinn_proto::Side::Client, quinn_proto::Dir::Bi, 0),
+                ))
+                .expect("dummy stream context fits the pool");
+        }
+        assert_eq!(worker.contexts.len(), QUIC_CONTEXT_CAPACITY);
+
+        for attempt in 0..2 {
+            let error = worker
+                .open_stream(
+                    &applications,
+                    &mut sessions,
+                    parent,
+                    SessionStreamDirection::Bidi,
+                    0,
+                )
+                .expect_err("connect_stream failure propagates");
+            assert!(
+                matches!(
+                    &error,
+                    RuntimeError::Subsystem { source, .. }
+                        if matches!(
+                            source.downcast_ref::<QuicWorkerError>(),
+                            Some(QuicWorkerError::ContextCapacityExhausted { .. })
+                        )
+                ),
+                "attempt {attempt}: ContextCapacityExhausted expected, got {error:?} (a leaked \
+                 Application Connection would surface as ApplicationError::ConnectionCapacityExhausted)"
+            );
+            assert_eq!(worker.contexts.len(), QUIC_CONTEXT_CAPACITY);
+        }
+
         drop(server);
         let _ = std::fs::remove_file(socket_path);
         Ok(())
