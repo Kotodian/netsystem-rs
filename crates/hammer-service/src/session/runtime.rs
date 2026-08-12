@@ -3568,6 +3568,17 @@ impl<Index: Copy + Eq> SessionWorker<Index> {
         Ok(disconnect)
     }
 
+    /// Removes a Session and, when it is the lower-most Session of a Session App,
+    /// the chain of upper Sessions attached along the generation-checked owner
+    /// link. Mirrors VPP `session_cleanup_notify` (session.c:304-318): the app
+    /// cleanup callback runs while the Session is still live, then the entry is
+    /// freed. The cascade walks `upper_session` from the removed entry, follows
+    /// each upper only while its live entry still points back at the previous
+    /// link, and stops on a stale, reused, or mismatched link without touching
+    /// the occupant. The links are revalidated after the cleanup callback, which
+    /// runs with `&mut self` and may unlink or replace the entry or its child;
+    /// the walk then stops without removing anything further. O(chain) time,
+    /// O(1) space; no scan, collect, or recursion.
     fn remove_session(&mut self, session_id: SessionId) -> RuntimeResult<()> {
         let (app, context, lower_session) = self
             .entries
@@ -3591,23 +3602,54 @@ impl<Index: Copy + Eq> SessionWorker<Index> {
         let Some(entry) = self.entries.remove(session_id.pool_index()) else {
             return Ok(());
         };
+        let mut previous = session_id;
+        let mut next_upper = if app.is_some() && lower_session.is_none() {
+            entry.upper_session
+        } else {
+            None
+        };
         if let Some(lower) = entry.lower_session {
             self.detach_upper_session(lower, session_id);
         }
         if matches!(entry.application, Some(SessionApplication::External(_))) {
             drop(self.app.detach_session(session_id));
         }
-        if app.is_some() && lower_session.is_none() {
-            let upper_sessions = self
-                .entries
-                .iter()
-                .filter_map(|(index, entry)| {
-                    (entry.lower_session == Some(session_id)).then_some(SessionId::from(index))
-                })
-                .collect::<Vec<_>>();
-            for upper in upper_sessions {
-                self.remove_session(upper)?;
+        while let Some(upper) = next_upper {
+            let Some(upper_entry) = self.entries.get(upper.pool_index()) else {
+                break;
+            };
+            if upper_entry.lower_session != Some(previous) {
+                break;
             }
+            let upper_app = upper_entry.app;
+            let upper_context = upper_entry.app_session;
+            let upper_application = upper_entry.application;
+            let upper_child = upper_entry.upper_session;
+            if let Some(app) = upper_app
+                && upper_context != 0
+                && let Some(callbacks) = self.session_app_callbacks(app)
+                && let Some(cleanup) = callbacks.cleanup
+            {
+                cleanup(self, upper, upper_context)?;
+            }
+            // The callback ran with `&mut self` and may have unlinked or
+            // replaced this entry or its child; remove this node only while it
+            // still points back at the previous link, and never follow a child
+            // the callback detached or replaced.
+            let Some(upper_entry) = self.entries.get(upper.pool_index()) else {
+                break;
+            };
+            if upper_entry.lower_session != Some(previous)
+                || upper_entry.upper_session != upper_child
+            {
+                break;
+            }
+            let _ = self.entries.remove(upper.pool_index());
+            if matches!(upper_application, Some(SessionApplication::External(_))) {
+                drop(self.app.detach_session(upper));
+            }
+            previous = upper;
+            next_upper = upper_child;
         }
         Ok(())
     }
@@ -7262,6 +7304,367 @@ mod tests {
                 .and_then(|entry| entry.upper_session),
             None,
             "direct upper transport removal clears the reverse link"
+        );
+    }
+
+    #[test]
+    fn lower_removal_follows_owner_link_only_leaving_forward_link_orphan() {
+        let applications = ApplicationMain::new(4);
+        let application = applications.attach().expect("attach Application");
+        let mut sessions = SessionWorker::<Index>::new(
+            DataWorkerId::new(0),
+            1,
+            AppSessionConfig::default(),
+            DEFAULT_SESSION_POOL_CAPACITY,
+            applications,
+            None,
+        )
+        .expect("Session worker");
+        sessions
+            .install_application_mq_for_test(application)
+            .expect("install test Application MQ");
+        let lower = sessions
+            .construct_stream_sessions(
+                SessionTransportId::new(1),
+                Index::new(1, 1),
+                1,
+                application,
+                Some(hammer_runtime::app::SessionAppId::new(0)),
+                None,
+                None,
+                false,
+            )
+            .expect("construct lower Session App session");
+        let upper = sessions
+            .create_upper_session(lower, 0x55)
+            .expect("publish upper Session from callback");
+        assert_eq!(
+            sessions
+                .entries
+                .get(upper.pool_index())
+                .and_then(|entry| entry.lower_session),
+            Some(lower),
+            "upper carries the forward link"
+        );
+
+        // Break the reverse owner link so the upper is reachable only through
+        // its own forward `lower_session` pointer.
+        sessions
+            .entries
+            .get_mut(lower.pool_index())
+            .expect("lower entry")
+            .upper_session = None;
+
+        sessions
+            .remove_session(lower)
+            .expect("lower removal");
+        assert!(!sessions.has_session(lower), "lower is removed");
+        assert!(
+            sessions.has_session(upper),
+            "a forward-link-only orphan is not swept: the cascade follows the owner link"
+        );
+        assert_eq!(
+            sessions
+                .entries
+                .get(upper.pool_index())
+                .and_then(|entry| entry.lower_session),
+            Some(lower),
+            "the orphan keeps its forward link and is untouched"
+        );
+        assert_eq!(sessions.entries.len(), 1, "only the orphan remains");
+    }
+
+    #[test]
+    fn lower_removal_walks_full_owner_chain_lower_mid_top() {
+        let applications = ApplicationMain::new(4);
+        let application = applications.attach().expect("attach Application");
+        let mut sessions = SessionWorker::<Index>::new(
+            DataWorkerId::new(0),
+            1,
+            AppSessionConfig::default(),
+            DEFAULT_SESSION_POOL_CAPACITY,
+            applications,
+            None,
+        )
+        .expect("Session worker");
+        sessions
+            .install_application_mq_for_test(application)
+            .expect("install test Application MQ");
+        let lower = sessions
+            .construct_stream_sessions(
+                SessionTransportId::new(1),
+                Index::new(1, 1),
+                1,
+                application,
+                Some(hammer_runtime::app::SessionAppId::new(0)),
+                None,
+                None,
+                false,
+            )
+            .expect("construct lower Session App session");
+        let mid = sessions
+            .create_upper_session(lower, 0x55)
+            .expect("publish mid upper Session");
+        let top = sessions
+            .create_upper_session(mid, 0x66)
+            .expect("publish top upper Session");
+        assert_eq!(
+            sessions
+                .entries
+                .get(mid.pool_index())
+                .and_then(|entry| entry.lower_session),
+            Some(lower),
+            "mid points back at lower"
+        );
+        assert_eq!(
+            sessions
+                .entries
+                .get(lower.pool_index())
+                .and_then(|entry| entry.upper_session),
+            Some(mid),
+            "lower owns mid"
+        );
+        assert_eq!(
+            sessions
+                .entries
+                .get(top.pool_index())
+                .and_then(|entry| entry.lower_session),
+            Some(mid),
+            "top points back at mid"
+        );
+        assert_eq!(
+            sessions
+                .entries
+                .get(mid.pool_index())
+                .and_then(|entry| entry.upper_session),
+            Some(top),
+            "mid owns top"
+        );
+
+        sessions
+            .remove_session(lower)
+            .expect("remove lower Session");
+        assert!(!sessions.has_session(lower), "lower is removed");
+        assert!(
+            !sessions.has_session(mid),
+            "mid is removed through the owner link"
+        );
+        assert!(
+            !sessions.has_session(top),
+            "top is removed through the owner link"
+        );
+        assert_eq!(
+            sessions.entries.len(),
+            0,
+            "the whole chain is swept iteratively"
+        );
+    }
+
+    static SESSION_CLEANUP_FAILING: AtomicU64 = AtomicU64::new(0);
+    static SESSION_CLEANUP_ATTEMPTS: AtomicU64 = AtomicU64::new(0);
+    static SESSION_CLEANUP_SUCCESSES: AtomicU64 = AtomicU64::new(0);
+
+    fn fail_cleanup_for_session(
+        _: &mut SessionWorker<Index>,
+        session_id: SessionId,
+        _: u64,
+    ) -> RuntimeResult<()> {
+        SESSION_CLEANUP_ATTEMPTS.fetch_add(1, Ordering::SeqCst);
+        if session_id.get() == SESSION_CLEANUP_FAILING.load(Ordering::SeqCst) {
+            return Err(SessionError::PublicationRejected { session_id }.into());
+        }
+        SESSION_CLEANUP_SUCCESSES.fetch_add(1, Ordering::SeqCst);
+        Ok(())
+    }
+
+    #[test]
+    fn upper_cleanup_error_stops_walk_and_preserves_remaining_chain() {
+        let applications = ApplicationMain::new(4);
+        let application = applications.attach().expect("attach Application");
+        let mut sessions = SessionWorker::<Index>::new(
+            DataWorkerId::new(0),
+            1,
+            AppSessionConfig::default(),
+            DEFAULT_SESSION_POOL_CAPACITY,
+            applications,
+            None,
+        )
+        .expect("Session worker");
+        sessions
+            .install_application_mq_for_test(application)
+            .expect("install test Application MQ");
+        sessions
+            .install_session_app(
+                hammer_runtime::app::SessionAppId::new(0),
+                SessionAppCallbacks {
+                    cleanup: Some(fail_cleanup_for_session),
+                    ..Default::default()
+                },
+            )
+            .expect("install Session App callbacks");
+        let lower = sessions
+            .construct_stream_sessions(
+                SessionTransportId::new(1),
+                Index::new(1, 1),
+                1,
+                application,
+                Some(hammer_runtime::app::SessionAppId::new(0)),
+                None,
+                None,
+                false,
+            )
+            .expect("construct lower Session App session");
+        let mid = sessions
+            .create_upper_session(lower, 0x55)
+            .expect("publish mid upper Session");
+        let top = sessions
+            .create_upper_session(mid, 0x66)
+            .expect("publish top upper Session");
+
+        SESSION_CLEANUP_ATTEMPTS.store(0, Ordering::SeqCst);
+        SESSION_CLEANUP_SUCCESSES.store(0, Ordering::SeqCst);
+        SESSION_CLEANUP_FAILING.store(mid.get(), Ordering::SeqCst);
+        let error = sessions
+            .remove_session(lower)
+            .expect_err("the mid cleanup error propagates");
+        assert!(matches!(
+            &error,
+            RuntimeError::Subsystem { source, .. }
+                if matches!(
+                    source.downcast_ref::<SessionError>(),
+                    Some(SessionError::PublicationRejected { session_id })
+                        if *session_id == mid
+                )
+        ));
+        assert!(
+            !sessions.has_session(lower),
+            "lower is removed before the walk"
+        );
+        assert!(sessions.has_session(mid), "the failing upper stays live");
+        assert!(
+            sessions.has_session(top),
+            "the walk stops at the first cleanup error"
+        );
+        assert_eq!(
+            sessions.entries.len(),
+            2,
+            "exactly mid and top remain after the first cleanup error"
+        );
+        assert_eq!(
+            SESSION_CLEANUP_ATTEMPTS.load(Ordering::SeqCst),
+            1,
+            "only mid's cleanup ran: the lower has no app session context, and top was never reached"
+        );
+        assert_eq!(
+            SESSION_CLEANUP_SUCCESSES.load(Ordering::SeqCst),
+            0,
+            "the mid cleanup error propagates before any walk node is freed"
+        );
+    }
+
+    static SESSION_CLEANUP_DETACHING_CALLS: AtomicU64 = AtomicU64::new(0);
+
+    fn detach_child_on_cleanup(
+        sessions: &mut SessionWorker<Index>,
+        session_id: SessionId,
+        _: u64,
+    ) -> RuntimeResult<()> {
+        SESSION_CLEANUP_DETACHING_CALLS.fetch_add(1, Ordering::SeqCst);
+        let child = sessions
+            .entries
+            .get(session_id.pool_index())
+            .and_then(|entry| entry.upper_session);
+        if let Some(child) = child {
+            sessions.detach_upper_session(session_id, child);
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn cleanup_callback_detaching_child_stops_walk_before_removal() {
+        let applications = ApplicationMain::new(4);
+        let application = applications.attach().expect("attach Application");
+        let mut sessions = SessionWorker::<Index>::new(
+            DataWorkerId::new(0),
+            1,
+            AppSessionConfig::default(),
+            DEFAULT_SESSION_POOL_CAPACITY,
+            applications,
+            None,
+        )
+        .expect("Session worker");
+        sessions
+            .install_application_mq_for_test(application)
+            .expect("install test Application MQ");
+        sessions
+            .install_session_app(
+                hammer_runtime::app::SessionAppId::new(0),
+                SessionAppCallbacks {
+                    cleanup: Some(detach_child_on_cleanup),
+                    ..Default::default()
+                },
+            )
+            .expect("install Session App callbacks");
+        let lower = sessions
+            .construct_stream_sessions(
+                SessionTransportId::new(1),
+                Index::new(1, 1),
+                1,
+                application,
+                Some(hammer_runtime::app::SessionAppId::new(0)),
+                None,
+                None,
+                false,
+            )
+            .expect("construct lower Session App session");
+        let mid = sessions
+            .create_upper_session(lower, 0x55)
+            .expect("publish mid upper Session");
+        let top = sessions
+            .create_upper_session(mid, 0x66)
+            .expect("publish top upper Session");
+
+        SESSION_CLEANUP_DETACHING_CALLS.store(0, Ordering::SeqCst);
+        sessions
+            .remove_session(lower)
+            .expect("lower removal");
+        assert!(
+            !sessions.has_session(lower),
+            "lower is removed before the walk"
+        );
+        assert!(
+            sessions.has_session(mid),
+            "mid is not removed: its callback detached the child, so the walk stops at the restructured link"
+        );
+        assert!(
+            sessions.has_session(top),
+            "the child detached by the cleanup callback is never swept"
+        );
+        assert_eq!(
+            sessions
+                .entries
+                .get(mid.pool_index())
+                .and_then(|entry| entry.upper_session),
+            None,
+            "the callback detached the child from mid"
+        );
+        assert_eq!(
+            sessions
+                .entries
+                .get(top.pool_index())
+                .and_then(|entry| entry.lower_session),
+            Some(mid),
+            "the detached child's back-link is untouched"
+        );
+        assert_eq!(
+            SESSION_CLEANUP_DETACHING_CALLS.load(Ordering::SeqCst),
+            1,
+            "only mid's cleanup ran: the walk stops before any further cleanup"
+        );
+        assert_eq!(
+            sessions.entries.len(),
+            2,
+            "exactly mid and top remain after the restructured link"
         );
     }
 
