@@ -2695,6 +2695,7 @@ impl<Index: Copy + Eq> SessionWorker<Index> {
                 index,
                 allocation_owner,
                 application,
+                opaque,
             );
         };
         self.construct_app_transport_session(
@@ -2741,6 +2742,7 @@ impl<Index: Copy + Eq> SessionWorker<Index> {
         index: Index,
         allocation_owner: u64,
         application: ApplicationId,
+        opaque: Option<u64>,
     ) -> RuntimeResult<SessionId> {
         let (rx_fifo, tx_fifo) = self.create_local_fifos()?;
         let session_id = self.insert_session_entry(SessionEntry::creating_transport(
@@ -2775,6 +2777,9 @@ impl<Index: Copy + Eq> SessionWorker<Index> {
             entry.tx_fifo = Arc::clone(application_session.tx_fifo());
             entry.application = Some(SessionApplication::External(application));
             entry.owner_application = Some(application);
+            // VPP `session_open_stream` (session.c:1412) sets
+            // `s->opaque = sep->opaque` for external stream children too.
+            entry.app_opaque = opaque;
         }
         self.finish_transport_creation(session_id, index)?;
         self.app.attach_session(session_id, application_session);
@@ -5432,6 +5437,56 @@ mod tests {
         assert!(
             sessions.app_session(session_id).is_some(),
             "external CONNECT attaches the App Session"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn external_stream_connect_propagates_opaque_to_session_app_endpoint()
+    -> Result<(), SessionTestFailure> {
+        // VPP `session_open_stream` (session.c:1412) sets `s->opaque = sep->opaque`
+        // on the external stream child; the Session public seam must expose it.
+        let socket_path = format!(
+            "/tmp/hammer-external-connect-opaque-{}.sock",
+            std::process::id()
+        );
+        let server = AppServer::bind(&socket_path, 4)?;
+        let applications = ApplicationMain::new(2);
+        let application = applications.attach()?;
+        let mut sessions = SessionWorker::<Index>::new(
+            DataWorkerId::new(0),
+            1,
+            AppSessionConfig::default(),
+            DEFAULT_SESSION_POOL_CAPACITY,
+            Arc::clone(&applications),
+            Some(server.publisher()),
+        )?;
+        sessions.install_application_mq_for_test(application)?;
+
+        let opaque_connection =
+            applications.register_connection(application, 0, None, None, Some(0x77))?;
+        let opaque_id = sessions.stream_connect_pending(
+            SessionTransportId::new(1),
+            Index::new(7, 1),
+            hammer_runtime::SessionConnectionId::from_raw(opaque_connection.raw()),
+        )?;
+        assert_eq!(
+            sessions.session_app_endpoint(opaque_id),
+            Some((application, None, Some(0x77), None)),
+            "external stream child exposes the pending ApplicationConnection opaque"
+        );
+
+        let plain_connection =
+            applications.register_connection(application, 1, None, None, None)?;
+        let plain_id = sessions.stream_connect_pending(
+            SessionTransportId::new(1),
+            Index::new(8, 1),
+            hammer_runtime::SessionConnectionId::from_raw(plain_connection.raw()),
+        )?;
+        assert_eq!(
+            sessions.session_app_endpoint(plain_id),
+            Some((application, None, None, None)),
+            "external stream child without opaque stays None"
         );
         Ok(())
     }
