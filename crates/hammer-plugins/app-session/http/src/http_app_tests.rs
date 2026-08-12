@@ -7,7 +7,14 @@
 //! to a stream child's parent connection (`http_ts_accept_stream`, http.c:675).
 //! A root accept also bootstraps its local uni control stream exactly once
 //! (`http3_conn_init`, http3.c:216-250), with typed transport actions faked
-//! so the open and its failure rollback are observable.
+//! so the open and its failure rollback are observable. The `disconnect`
+//! callback (VPP `http3_transport_stream_close_callback` → `http3_stream_close`)
+//! finishes a peer uni stream FIN by peer role, clears its slot, and leaves
+//! bidi request FINs to request cleanup. The `reset` callback (VPP
+//! `http3_transport_stream_reset_callback`) classifies a peer uni stream
+//! reset and closes the parent connection exactly once with
+//! `ClosedCriticalStream` (0x0104), mutating no HTTP worker state and leaving
+//! bidi request resets alone. The worker-owned retention sink for completed
 
 use std::cell::Cell;
 use std::sync::Arc;
@@ -19,16 +26,21 @@ use hammer_runtime::{
     DataPlaneRuntime, DataPlaneRuntimeConfig, DataWorkerId, Engine, RuntimeError, RuntimeRegistry,
     RuntimeResult, SessionTransportRegistration,
 };
+use hammer_service::session::error::SessionTransportActionError;
 use hammer_service::session::protocol::SessionAppCallbacks;
 use hammer_service::session::runtime::{SessionMain, SessionTransportWorkerActions, SessionWorker};
 use hammer_service::session::{ApplicationMain, SessionEndpointRole, SessionId};
 
 use super::http_app::{
-    CALLBACKS, HTTP_SESSION_APP, HttpAppError, NAME, accept, accept_on, destroy, install,
+    CALLBACKS, HTTP_SESSION_APP, HttpAppError, NAME, accept, accept_on, destroy, disconnect_on,
+    install, reset_on,
 };
 use super::listener::{HTTP_MAIN, HttpMain};
 use crate::http3::request_frame_reader::RequestFrameRead;
-use crate::worker::{ContextId, HTTP_CONTEXT_CAPACITY, HttpWorker, HttpWorkerError, StreamContextId};
+use crate::worker::{
+    ContextId, HTTP_CONTEXT_CAPACITY, HttpWorker, HttpWorkerError, PeerControlOutcome,
+    PeerUniStreamRole, StreamContextId,
+};
 
 /// SessionWorker (64-slot pool on data worker 0) whose Application registry
 /// pre-registers the builtin HTTP Session App, plus an `HttpMain` owning one
@@ -83,6 +95,8 @@ thread_local! {
     static CLOSE_CALLS: Cell<u32> = const { Cell::new(0) };
     static CLOSE_SESSION: Cell<u64> = const { Cell::new(0) };
     static CLOSE_CODE: Cell<u64> = const { Cell::new(0) };
+    static RESET_CALLS: Cell<u32> = const { Cell::new(0) };
+    static CLOSE_FAIL: Cell<bool> = const { Cell::new(false) };
 }
 
 fn fake_open_stream(
@@ -105,6 +119,7 @@ fn fake_reset_stream(
     _session_id: SessionId,
     _code: SessionApplicationErrorCode,
 ) -> RuntimeResult<()> {
+    RESET_CALLS.with(|calls| calls.set(calls.get() + 1));
     Ok(())
 }
 
@@ -120,11 +135,15 @@ fn fake_close_connection(
     _sessions: &mut SessionWorker<Index>,
     session_id: SessionId,
     code: SessionApplicationErrorCode,
-    _reason: &[u8],
+    reason: &[u8],
 ) -> RuntimeResult<()> {
     CLOSE_CALLS.with(|calls| calls.set(calls.get() + 1));
     CLOSE_SESSION.with(|seen| seen.set(session_id.get()));
     CLOSE_CODE.with(|seen| seen.set(u64::from(code)));
+    assert!(reason.is_empty(), "connection close carries an empty reason");
+    if CLOSE_FAIL.with(|fail| fail.get()) {
+        return Err(RuntimeError::ServiceClosed);
+    }
     Ok(())
 }
 
@@ -186,6 +205,13 @@ fn http_app_error(error: &RuntimeError) -> &HttpAppError {
         .expect("typed HTTP app error in the chain")
 }
 
+/// The typed `SessionTransportActionError` inside a `RuntimeError` chain.
+fn transport_action_error(error: &RuntimeError) -> &SessionTransportActionError {
+    std::error::Error::source(error)
+        .and_then(|cause| cause.downcast_ref::<SessionTransportActionError>())
+        .expect("typed transport action error in the chain")
+}
+
 fn worker_len(main: &HttpMain) -> usize {
     main.with_worker(DataWorkerId::new(0), |http| Ok(http.len()))
         .expect("worker accessible on the test thread")
@@ -238,6 +264,50 @@ fn construct_stream(
     child
 }
 
+/// A peer uni stream child of `parent`, accepted through `accept_on`; in the
+/// fresh stream pool the first allocation's `StreamContextId` is the
+/// deterministic `Index::new(0, 1)`.
+fn accept_peer_uni_stream(
+    main: &HttpMain,
+    sessions: &mut SessionWorker<Index>,
+    application: ApplicationId,
+    session_app: SessionAppId,
+    transport_slot: u32,
+    parent: SessionId,
+) -> SessionId {
+    let child = construct_stream(sessions, application, session_app, transport_slot, parent, true);
+    accept_on(main, sessions, child, 0).expect("accept peer uni stream");
+    child
+}
+
+/// One live parent connection and one accepted peer uni stream child, with
+/// the parent connection context. In a fresh stream pool the single stream's
+/// `StreamContextId` is the deterministic `Index::new(0, 1)`.
+fn construct_reset_stream(
+    main: &HttpMain,
+    sessions: &mut SessionWorker<Index>,
+    application: ApplicationId,
+    session_app: SessionAppId,
+    transport_slot: u32,
+) -> (SessionId, ContextId, SessionId, StreamContextId) {
+    let (parent, parent_context) =
+        construct_parent(main, sessions, application, session_app, transport_slot);
+    let child = accept_peer_uni_stream(
+        main,
+        sessions,
+        application,
+        session_app,
+        transport_slot + 1,
+        parent,
+    );
+    (
+        parent,
+        parent_context,
+        child,
+        StreamContextId::from(Index::new(0, 1)),
+    )
+}
+
 #[test]
 fn plugin_descriptor_declares_name_http_loaded_after_quic() {
     let manifest = crate::__HAMMER_PLUGIN_MANIFEST_TOML;
@@ -254,19 +324,24 @@ fn registers_exactly_the_builtin_http_session_app() {
 }
 
 #[test]
-fn callback_table_wires_accept_and_defers_all_other_vpp_callbacks() {
-    // `accept` is the one VPP `http_app_cb_vft` entry (http.c:1004-1017) this
-    // slice owns: it needs nothing beyond the per-worker context pool. Every
-    // other entry needs HTTP worker lifecycle state (streams, FIFOs,
-    // publication) from later slices, so it stays `None`: no speculative
+fn callback_table_wires_accept_disconnect_and_reset_and_defers_the_rest() {
+    // `accept`, `disconnect`, and `reset` are the VPP `http_app_cb_vft`
+    // entries (http.c:1004-1017) this slice owns: accept needs nothing beyond
+    // the per-worker context pool, disconnect needs the worker's peer uni
+    // stream slots and `finish_peer_*`/`remove_stream` helpers (worker.rs),
+    // and reset needs only the committed `classify_peer_uni_stream_reset`
+    // classification plus the generic `close_connection` transport action —
+    // no HTTP worker state mutation, mirroring VPP
+    // `http3_transport_stream_reset_callback`. Every other entry needs
+    // lifecycle state from later slices, so it stays `None`: no speculative
     // no-ops until the owning slices land.
     let callbacks: SessionAppCallbacks = CALLBACKS;
     assert!(callbacks.accept.is_some());
+    assert!(callbacks.disconnect.is_some());
+    assert!(callbacks.reset.is_some());
     assert!(callbacks.add_segment.is_none());
     assert!(callbacks.del_segment.is_none());
     assert!(callbacks.connected.is_none());
-    assert!(callbacks.disconnect.is_none());
-    assert!(callbacks.reset.is_none());
     assert!(callbacks.transport_closed.is_none());
     assert!(callbacks.cleanup.is_none());
     assert!(callbacks.half_open_cleanup.is_none());
@@ -698,6 +773,509 @@ fn accept_stream_foreign_parent_context_is_typed_error() {
         Ok(())
     })
     .expect("worker accessible on the test thread");
+}
+
+#[test]
+fn disconnect_finishes_peer_control_stream_clearing_slot_and_reader() {
+    let (main, mut sessions, application, session_app) = test_harness();
+    let (parent, parent_context) =
+        construct_parent(&main, &mut sessions, application, session_app, 1);
+    let child = accept_peer_uni_stream(&main, &mut sessions, application, session_app, 2, parent);
+    let stream = StreamContextId::from(Index::new(0, 1));
+    main.with_worker(DataWorkerId::new(0), |http| {
+        http.register_peer_uni_stream(stream, PeerUniStreamRole::Control)
+            .map_err(RuntimeError::from)?;
+        // The first control byte allocates the one-shot SETTINGS reader.
+        assert_eq!(
+            http.process_peer_control_bytes(stream, &[0x04])
+                .expect("feed control byte"),
+            PeerControlOutcome::Incomplete { consumed: 1 }
+        );
+        Ok(())
+    })
+    .expect("register control role");
+
+    disconnect_on(&main, &mut sessions, child, u64::from(stream))
+        .expect("peer control FIN is silent");
+
+    main.with_worker(DataWorkerId::new(0), |http| {
+        let connection = http.get(parent_context).map_err(RuntimeError::from)?;
+        assert_eq!(connection.peer_control, None, "peer control slot cleared");
+        assert!(
+            connection.peer_control_reader.is_none(),
+            "SETTINGS reader freed with the control stream"
+        );
+        assert!(
+            connection.peer_settings_pending,
+            "EOF before SETTINGS keeps the expectation pending"
+        );
+        assert!(
+            matches!(
+                http.get_stream(stream),
+                Err(HttpWorkerError::StreamMissing { stream: stale }) if stale == stream
+            ),
+            "stream context released"
+        );
+        Ok(())
+    })
+    .expect("worker accessible on the test thread");
+}
+
+#[test]
+fn disconnect_finishes_only_the_matching_peer_qpack_stream() {
+    let (main, mut sessions, application, session_app) = test_harness();
+    let (parent, parent_context) =
+        construct_parent(&main, &mut sessions, application, session_app, 1);
+    let encoder_child =
+        accept_peer_uni_stream(&main, &mut sessions, application, session_app, 2, parent);
+    let decoder_child =
+        accept_peer_uni_stream(&main, &mut sessions, application, session_app, 3, parent);
+    let encoder = StreamContextId::from(Index::new(0, 1));
+    let decoder = StreamContextId::from(Index::new(1, 1));
+    main.with_worker(DataWorkerId::new(0), |http| {
+        http.register_peer_uni_stream(encoder, PeerUniStreamRole::QpackEncoder)
+            .map_err(RuntimeError::from)?;
+        http.register_peer_uni_stream(decoder, PeerUniStreamRole::QpackDecoder)
+            .map_err(RuntimeError::from)?;
+        Ok(())
+    })
+    .expect("register QPACK roles");
+
+    disconnect_on(&main, &mut sessions, encoder_child, u64::from(encoder))
+        .expect("QPACK encoder FIN is silent");
+
+    main.with_worker(DataWorkerId::new(0), |http| {
+        let connection = http.get(parent_context).map_err(RuntimeError::from)?;
+        assert_eq!(connection.peer_encoder, None, "encoder slot cleared");
+        assert_eq!(
+            connection.peer_decoder,
+            Some(decoder),
+            "decoder slot untouched by the encoder FIN"
+        );
+        assert!(
+            matches!(
+                http.get_stream(encoder),
+                Err(HttpWorkerError::StreamMissing { stream: stale }) if stale == encoder
+            ),
+            "encoder stream context released"
+        );
+        assert_eq!(
+            http.get_stream(decoder).map_err(RuntimeError::from)?.session,
+            decoder_child,
+            "decoder stream stays live"
+        );
+        Ok(())
+    })
+    .expect("worker accessible on the test thread");
+}
+
+#[test]
+fn disconnect_removes_unknown_peer_uni_stream_owning_no_slot() {
+    let (main, mut sessions, application, session_app) = test_harness();
+    let (parent, parent_context) =
+        construct_parent(&main, &mut sessions, application, session_app, 1);
+    let child = accept_peer_uni_stream(&main, &mut sessions, application, session_app, 2, parent);
+    let stream = StreamContextId::from(Index::new(0, 1));
+    main.with_worker(DataWorkerId::new(0), |http| {
+        http.register_peer_uni_stream(stream, PeerUniStreamRole::Unknown)
+            .map_err(RuntimeError::from)?;
+        Ok(())
+    })
+    .expect("register unknown role");
+
+    disconnect_on(&main, &mut sessions, child, u64::from(stream))
+        .expect("unknown stream FIN is silent");
+
+    main.with_worker(DataWorkerId::new(0), |http| {
+        let connection = http.get(parent_context).map_err(RuntimeError::from)?;
+        assert_eq!(connection.peer_control, None, "no control slot touched");
+        assert_eq!(connection.peer_encoder, None, "no encoder slot touched");
+        assert_eq!(connection.peer_decoder, None, "no decoder slot touched");
+        assert!(
+            connection.peer_control_reader.is_none(),
+            "no SETTINGS reader touched"
+        );
+        assert_eq!(http.stream_len(), 0, "stream context released");
+        Ok(())
+    })
+    .expect("worker accessible on the test thread");
+}
+
+#[test]
+fn disconnect_with_zero_context_is_a_lifecycle_noop() {
+    let (main, mut sessions, application, session_app) = test_harness();
+    let (parent, _parent_context) =
+        construct_parent(&main, &mut sessions, application, session_app, 1);
+    let child = accept_peer_uni_stream(&main, &mut sessions, application, session_app, 2, parent);
+
+    disconnect_on(&main, &mut sessions, child, 0).expect("zero context is a no-op");
+
+    main.with_worker(DataWorkerId::new(0), |http| {
+        assert_eq!(http.len(), 1, "no connection context touched");
+        assert_eq!(http.stream_len(), 1, "no stream touched");
+        Ok(())
+    })
+    .expect("worker accessible on the test thread");
+}
+
+#[test]
+fn disconnect_with_stale_stream_context_is_typed_error() {
+    let (main, mut sessions, application, session_app) = test_harness();
+    let (parent, _parent_context) =
+        construct_parent(&main, &mut sessions, application, session_app, 1);
+    let child = accept_peer_uni_stream(&main, &mut sessions, application, session_app, 2, parent);
+    let stream = StreamContextId::from(Index::new(0, 1));
+    main.with_worker(DataWorkerId::new(0), |http| {
+        http.remove_stream(stream).map_err(RuntimeError::from)
+    })
+    .expect("release stream before disconnect");
+
+    let error = disconnect_on(&main, &mut sessions, child, u64::from(stream))
+        .expect_err("stale stream identity must fail");
+    assert!(
+        matches!(
+            http_error(&error),
+            HttpWorkerError::StreamMissing { stream: stale } if *stale == stream
+        ),
+        "typed stale-stream error expected, got {error:?}"
+    );
+}
+
+#[test]
+fn disconnect_on_bidi_request_stream_mutates_nothing() {
+    let (main, mut sessions, application, session_app) = test_harness();
+    let (parent, parent_context) =
+        construct_parent(&main, &mut sessions, application, session_app, 1);
+    let child = construct_stream(&mut sessions, application, session_app, 2, parent, false);
+    accept_on(&main, &mut sessions, child, 0).expect("accept bidi stream");
+    let stream = StreamContextId::from(Index::new(0, 1));
+
+    disconnect_on(&main, &mut sessions, child, u64::from(stream))
+        .expect("bidi FIN is left for request cleanup");
+
+    main.with_worker(DataWorkerId::new(0), |http| {
+        let connection = http.get(parent_context).map_err(RuntimeError::from)?;
+        assert_eq!(connection.peer_control, None, "no control slot");
+        assert_eq!(connection.peer_encoder, None, "no encoder slot");
+        assert_eq!(connection.peer_decoder, None, "no decoder slot");
+        assert_eq!(http.stream_len(), 1, "bidi stream untouched");
+        Ok(())
+    })
+    .expect("worker accessible on the test thread");
+}
+
+#[test]
+fn disconnect_for_root_connection_with_colliding_stream_context_id_is_a_noop() {
+    let (main, mut sessions, application, session_app) = test_harness();
+    let (parent, parent_context) =
+        construct_parent(&main, &mut sessions, application, session_app, 1);
+    let child = accept_peer_uni_stream(&main, &mut sessions, application, session_app, 2, parent);
+    // Fresh connection and stream pools both place their first allocation
+    // at slot 0 with generation 1, so the root ConnectionContextId
+    // numerically equals the live StreamContextId.
+    let stream = StreamContextId::from(Index::new(0, 1));
+    assert_eq!(
+        u64::from(parent_context),
+        u64::from(stream),
+        "root connection context numerically collides with the stream context"
+    );
+    main.with_worker(DataWorkerId::new(0), |http| {
+        http.register_peer_uni_stream(stream, PeerUniStreamRole::Control)
+            .map_err(RuntimeError::from)?;
+        Ok(())
+    })
+    .expect("register control role");
+
+    // The root connection Disconnected callback carries the published
+    // ConnectionContextId of the parent Session — numerically identical to
+    // the live stream's StreamContextId — and must be a clean no-op, never
+    // a misattributed stream FIN.
+    disconnect_on(&main, &mut sessions, parent, u64::from(parent_context))
+        .expect("root connection disconnect is a no-op");
+
+    main.with_worker(DataWorkerId::new(0), |http| {
+        let connection = http.get(parent_context).map_err(RuntimeError::from)?;
+        assert_eq!(connection.peer_control, Some(stream), "control slot untouched");
+        assert_eq!(
+            http.get_stream(stream).map_err(RuntimeError::from)?.peer_role,
+            PeerUniStreamRole::Control,
+            "stream context untouched"
+        );
+        assert_eq!(http.stream_len(), 1, "stream stays live");
+        Ok(())
+    })
+    .expect("worker accessible on the test thread");
+}
+
+#[test]
+fn reset_on_peer_uni_stream_closes_connection_with_closed_critical_stream() {
+    let (main, mut sessions, application, session_app) = test_harness();
+    let (parent, _parent_context, child, stream) =
+        construct_reset_stream(&main, &mut sessions, application, session_app, 1);
+    CLOSE_CALLS.with(|calls| calls.set(0));
+    CLOSE_SESSION.with(|seen| seen.set(0));
+    CLOSE_CODE.with(|seen| seen.set(0));
+    RESET_CALLS.with(|calls| calls.set(0));
+
+    reset_on(&main, &mut sessions, child, u64::from(stream)).expect("peer uni reset closes");
+
+    assert_ne!(
+        parent,
+        child,
+        "child stream SessionId differs from the parent root SessionId"
+    );
+    CLOSE_CALLS.with(|calls| assert_eq!(calls.get(), 1, "connection closed exactly once"));
+    CLOSE_SESSION.with(|seen| {
+        assert_eq!(
+            seen.get(),
+            parent.get(),
+            "close names the parent root connection SessionId (reset.session)"
+        )
+    });
+    CLOSE_CODE.with(|seen| {
+        assert_eq!(seen.get(), 0x0104, "close carries ClosedCriticalStream")
+    });
+    RESET_CALLS.with(|calls| {
+        assert_eq!(calls.get(), 0, "no stream reset for a connection-terminating reset")
+    });
+    // The seam mutates no HttpWorker state: stream and connection stay live.
+    main.with_worker(DataWorkerId::new(0), |http| {
+        assert_eq!(http.len(), 1, "connection context untouched");
+        assert_eq!(http.stream_len(), 1, "stream context untouched");
+        assert_eq!(
+            http.get_stream_for_session(stream, child)
+                .map_err(RuntimeError::from)?
+                .session,
+            child,
+            "stream still bound to its session"
+        );
+        Ok(())
+    })
+    .expect("worker accessible on the test thread");
+}
+
+#[test]
+fn reset_repeated_callback_dispatches_the_close_exactly_once() {
+    let (main, mut sessions, application, session_app) = test_harness();
+    let (_parent, _parent_context, child, stream) =
+        construct_reset_stream(&main, &mut sessions, application, session_app, 1);
+    CLOSE_CALLS.with(|calls| calls.set(0));
+
+    reset_on(&main, &mut sessions, child, u64::from(stream)).expect("first reset closes");
+    CLOSE_CALLS.with(|calls| assert_eq!(calls.get(), 1, "first reset dispatches the close"));
+    // The Session app-close guard (`on_app_close_dispatch`, runtime.rs) has
+    // already recorded AppClosed, so the repeated dispatch through the public
+    // Session seam is a no-op instead of a second transport action.
+    reset_on(&main, &mut sessions, child, u64::from(stream))
+        .expect("repeated reset is guarded to a no-op");
+    CLOSE_CALLS.with(|calls| assert_eq!(calls.get(), 1, "close dispatched exactly once"));
+}
+
+#[test]
+fn reset_with_zero_context_is_a_lifecycle_noop() {
+    let (main, mut sessions, application, session_app) = test_harness();
+    let (_parent, _parent_context, child, _stream) =
+        construct_reset_stream(&main, &mut sessions, application, session_app, 1);
+    CLOSE_CALLS.with(|calls| calls.set(0));
+
+    reset_on(&main, &mut sessions, child, 0).expect("zero context is a no-op");
+
+    CLOSE_CALLS.with(|calls| assert_eq!(calls.get(), 0, "no close for a zero context"));
+    main.with_worker(DataWorkerId::new(0), |http| {
+        assert_eq!(http.len(), 1, "no connection context touched");
+        assert_eq!(http.stream_len(), 1, "no stream touched");
+        Ok(())
+    })
+    .expect("worker accessible on the test thread");
+}
+
+#[test]
+fn reset_with_stale_stream_context_is_typed_error_without_dispatch() {
+    let (main, mut sessions, application, session_app) = test_harness();
+    let (_parent, _parent_context, child, stream) =
+        construct_reset_stream(&main, &mut sessions, application, session_app, 1);
+    main.with_worker(DataWorkerId::new(0), |http| {
+        http.remove_stream(stream).map_err(RuntimeError::from)
+    })
+    .expect("release stream before reset");
+    CLOSE_CALLS.with(|calls| calls.set(0));
+
+    let error = reset_on(&main, &mut sessions, child, u64::from(stream))
+        .expect_err("stale stream identity must fail");
+    assert!(
+        matches!(
+            http_error(&error),
+            HttpWorkerError::StreamMissing { stream: stale } if *stale == stream
+        ),
+        "typed stale-stream error expected, got {error:?}"
+    );
+    CLOSE_CALLS.with(|calls| assert_eq!(calls.get(), 0, "no close dispatched"));
+}
+
+#[test]
+fn reset_with_foreign_session_is_typed_error_without_dispatch() {
+    let (main, mut sessions, application, session_app) = test_harness();
+    let (parent, _parent_context, _child, stream) =
+        construct_reset_stream(&main, &mut sessions, application, session_app, 1);
+    CLOSE_CALLS.with(|calls| calls.set(0));
+
+    // The dispatch layer always passes the reset stream's own Session; a
+    // foreign identity (here the parent connection's) must be rejected by the
+    // session-bound metadata check, not closed.
+    let error = reset_on(&main, &mut sessions, parent, u64::from(stream))
+        .expect_err("foreign session must fail");
+    assert!(
+        matches!(
+            http_error(&error),
+            HttpWorkerError::StreamSessionMismatch { stream: s, .. } if *s == stream
+        ),
+        "typed session-mismatch error expected, got {error:?}"
+    );
+    CLOSE_CALLS.with(|calls| assert_eq!(calls.get(), 0, "no close dispatched"));
+}
+
+#[test]
+fn reset_with_missing_parent_connection_is_typed_error_without_dispatch() {
+    let (main, mut sessions, application, session_app) = test_harness();
+    let (_parent, parent_context, child, stream) =
+        construct_reset_stream(&main, &mut sessions, application, session_app, 1);
+    main.with_worker(DataWorkerId::new(0), |http| {
+        http.remove(parent_context).map_err(RuntimeError::from)
+    })
+    .expect("release parent connection before reset");
+    CLOSE_CALLS.with(|calls| calls.set(0));
+
+    // The stream context is live but its parent connection is gone; the
+    // committed classification fails typed and nothing dispatches.
+    let error = reset_on(&main, &mut sessions, child, u64::from(stream))
+        .expect_err("missing parent must fail");
+    assert!(
+        matches!(
+            http_error(&error),
+            HttpWorkerError::ParentContextMissing { parent: p } if *p == parent_context
+        ),
+        "typed parent-missing error expected, got {error:?}"
+    );
+    CLOSE_CALLS.with(|calls| assert_eq!(calls.get(), 0, "no close dispatched"));
+}
+
+#[test]
+fn reset_closes_the_connection_for_every_peer_uni_role() {
+    let (main, mut sessions, application, session_app) = test_harness();
+    CLOSE_CALLS.with(|calls| calls.set(0));
+    // The committed classification is role-agnostic: every peer uni role is
+    // critical (VPP `http3_transport_stream_reset_callback` checks only
+    // unidirectional-ness), so the callback closes for each registerable
+    // role. Fixed table, no collection. Each iteration allocates exactly one
+    // stream and never removes it, so iteration `k` owns slot `k`.
+    for (index, (transport_slot, role)) in [
+        (0u32, PeerUniStreamRole::Control),
+        (2, PeerUniStreamRole::QpackEncoder),
+        (4, PeerUniStreamRole::QpackDecoder),
+        (6, PeerUniStreamRole::Unknown),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let (parent, _parent_context, child, _stream) = construct_reset_stream(
+            &main,
+            &mut sessions,
+            application,
+            session_app,
+            transport_slot,
+        );
+        let stream = StreamContextId::from(Index::new(index as u32, 1));
+        main.with_worker(DataWorkerId::new(0), |http| {
+            http.register_peer_uni_stream(stream, role)
+                .map_err(RuntimeError::from)?;
+            Ok(())
+        })
+        .expect("register peer uni role");
+
+        reset_on(&main, &mut sessions, child, u64::from(stream))
+            .expect("reset closes the connection for every peer uni role");
+
+        CLOSE_CALLS.with(|calls| {
+            assert_eq!(calls.get(), (index + 1) as u32, "role {role:?} closed once")
+        });
+        CLOSE_SESSION.with(|seen| {
+            assert_eq!(
+                seen.get(),
+                parent.get(),
+                "role {role:?} closes the parent root connection SessionId"
+            )
+        });
+        CLOSE_CODE.with(|seen| {
+            assert_eq!(seen.get(), 0x0104, "role {role:?} closes with ClosedCriticalStream")
+        });
+        main.with_worker(DataWorkerId::new(0), |http| {
+            assert_eq!(
+                http.get_stream_for_session(stream, child)
+                    .map_err(RuntimeError::from)?
+                    .peer_role,
+                role,
+                "reset records no role change on the stream"
+            );
+            Ok(())
+        })
+        .expect("worker accessible on the test thread");
+    }
+}
+
+#[test]
+fn reset_on_bidi_request_stream_mutates_nothing() {
+    let (main, mut sessions, application, session_app) = test_harness();
+    let (parent, _parent_context) =
+        construct_parent(&main, &mut sessions, application, session_app, 1);
+    let child = construct_stream(&mut sessions, application, session_app, 2, parent, false);
+    accept_on(&main, &mut sessions, child, 0).expect("accept bidi stream");
+    let stream = StreamContextId::from(Index::new(0, 1));
+    CLOSE_CALLS.with(|calls| calls.set(0));
+
+    reset_on(&main, &mut sessions, child, u64::from(stream))
+        .expect("bidi reset is left for request cleanup");
+
+    CLOSE_CALLS.with(|calls| {
+        assert_eq!(calls.get(), 0, "bidi reset must not close the connection")
+    });
+    main.with_worker(DataWorkerId::new(0), |http| {
+        assert_eq!(http.stream_len(), 1, "bidi stream untouched");
+        Ok(())
+    })
+    .expect("worker accessible on the test thread");
+}
+
+#[test]
+fn reset_close_action_failure_propagates_typed() {
+    let (main, mut sessions, application, session_app) = test_harness();
+    let (_parent, _parent_context, child, stream) =
+        construct_reset_stream(&main, &mut sessions, application, session_app, 1);
+    CLOSE_FAIL.with(|fail| fail.set(true));
+
+    let error = reset_on(&main, &mut sessions, child, u64::from(stream))
+        .expect_err("transport action failure must fail the reset");
+    assert!(
+        matches!(
+            error,
+            RuntimeError::Subsystem { subsystem, .. }
+                if subsystem == "session transport action"
+        ),
+        "typed transport action error expected, got {error:?}"
+    );
+    assert!(
+        matches!(
+            transport_action_error(&error),
+            SessionTransportActionError::TransportActionFailed {
+                action: "close_connection",
+                ..
+            }
+        ),
+        "close_connection action failure preserved in the chain"
+    );
+
+    // Restore the thread-local failure flag so a pooled test thread never
+    // leaks it into later tests.
+    CLOSE_FAIL.with(|fail| fail.set(false));
 }
 
 /// The worker-local retention sink for a completed request HEADERS field

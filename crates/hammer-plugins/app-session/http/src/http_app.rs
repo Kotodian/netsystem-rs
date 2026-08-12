@@ -20,8 +20,14 @@
 //! http3.c:216-250), rolling the accept back on failure as
 //! `http3_conn_terminate` does (http3.c:152-165). Upward
 //! `SessionTransport` registration, listener/connect, the HTTP3 engine, FIFO
-//! transfer/publication, QPACK, and worker contexts are later slices; no
-//! callback that needs their lifecycle state is installed here.
+//! transfer/publication, QPACK, and worker contexts are later slices; the
+//! `disconnect` callback is installed because the worker slice already
+//! provides the peer stream slots and `finish_peer_*`/`remove_stream`
+//! helpers it needs, and the `reset` callback terminates the parent
+//! connection on a peer uni stream RESET through the committed
+//! `classify_peer_uni_stream_reset` classification and the generic
+//! `close_connection` action, while every other callback still waits on
+//! lifecycle state its owning slice has not landed.
 
 use hammer_infra::pool::Index;
 use hammer_runtime::app::{SessionAppContext, SessionAppRegistration, SessionFlags};
@@ -31,8 +37,9 @@ use hammer_service::session::{SessionEndpointRole, SessionId};
 use hammer_service::session::protocol::SessionAppCallbacks;
 use hammer_service::session::runtime::{SessionAcceptMetadata, SessionWorker};
 
+use crate::http3::proto::error::ErrorCode;
 use crate::listener::{HTTP_MAIN, HttpMain};
-use crate::worker::ContextId;
+use crate::worker::{ContextId, PeerControlError, PeerUniStreamRole, StreamContextId};
 
 pub(crate) const NAME: &str = "http";
 
@@ -48,18 +55,27 @@ const H3_INTERNAL_ERROR: u64 = 0x0102;
 /// (`HttpWorker::allocate`/`bootstrap_control_stream`/`allocate_stream`/
 /// `remove`/`remove_stream`, worker.rs) and the Session worker's
 /// `set_app_session` publication plus the typed transport actions
-/// (`open_stream`/`close_connection`, runtime.rs). Every other VPP callback
-/// routes through
-/// HTTP worker connection state (`http_ts_*` over `http_ctx_t`) that its
-/// owning slice does not provide yet; installing speculative no-ops would be
-/// wrong without that state. Deferred to the HTTP3/lifecycle slice:
-/// `connected`, `disconnect`, `reset`, `transport_closed`, `cleanup`,
+/// (`open_stream`/`close_connection`, runtime.rs). `disconnect` is wired too:
+/// a peer HTTP/3 uni stream FIN resolves the worker and finishes the stream
+/// by role through the worker helpers this slice already provides. `reset`
+/// is wired as well: a peer HTTP/3 uni stream RESET terminates the parent
+/// connection with `ClosedCriticalStream` (0x0104) through the worker's
+/// committed `classify_peer_uni_stream_reset` classification and the generic
+/// `close_connection` transport action, mutating no HTTP worker state here
+/// (VPP `http3_transport_stream_reset_callback`). Every other VPP callback
+/// routes through HTTP worker connection state
+/// (`http_ts_*` over `http_ctx_t`) that its owning slice does not provide
+/// yet; installing speculative no-ops would be wrong without that state.
+/// Deferred to the HTTP3/lifecycle slice:
+/// `connected`, `transport_closed`, `cleanup`,
 /// `half_open_cleanup`, `builtin_rx`, `builtin_tx`. `add_segment` /
 /// `del_segment` stay `None` too: VPP's builtin entries are no-ops that are
 /// never invoked without shared-memory segments (http.c:997-1003), so the
 /// `SessionApp` trait's `Ok(())` default is behaviorally identical.
 pub(crate) static CALLBACKS: SessionAppCallbacks = SessionAppCallbacks {
     accept: Some(accept),
+    disconnect: Some(disconnect),
+    reset: Some(reset),
     ..SessionAppCallbacks::all_none()
 };
 
@@ -72,6 +88,10 @@ pub(crate) static CALLBACKS: SessionAppCallbacks = SessionAppCallbacks {
 pub(crate) enum HttpAppError {
     #[error("http stream accept requires a live parent connection context, session {session:?} has none")]
     StreamParentMissing { session: SessionId },
+    #[error(
+        "peer control stream finish reported a SETTINGS protocol error, which is structurally impossible; HTTP/3 code {code:?}"
+    )]
+    PeerControlFinishProtocol { code: ErrorCode },
 }
 
 /// Session App `accept` for an accepted lower QUIC Session.
@@ -231,6 +251,203 @@ fn accept_stream(
         return Err(error);
     }
     Ok(())
+}
+
+/// Session App `disconnect` for a peer HTTP/3 unidirectional stream FIN.
+///
+/// The lower QUIC transport dispatches a received FIN synchronously as this
+/// callback with the Session's published `SessionAppContext` naming the
+/// generation-checked `StreamContextId`; a RESET is dispatched separately
+/// through the `reset` callback. The owning `HttpWorker`
+/// is resolved by the Session worker id (`HttpMain::with_worker`,
+/// listener.rs) and the stream context is generation/session-checked with
+/// `HttpWorker::get_stream_for_session` before any mutation, exactly as
+/// `accept` resolves the worker and checks its metadata.
+///
+/// This callback owns peer unidirectional streams only; the dispatch mirrors
+/// VPP `http3_transport_stream_close_callback` → `http3_stream_close`:
+/// EOF on the peer control stream clears its slot and SETTINGS reader
+/// (`finish_peer_control_stream`), EOF on a peer QPACK encoder/decoder
+/// clears that slot (`finish_peer_qpack_stream`), and EOF on an Unknown
+/// stream is silent (`finish_peer_unknown_stream`). EOF on a Push or
+/// type-not-yet-decoded stream owns no slot, so the stream context is
+/// released directly through the existing generation-checked
+/// `HttpWorker::remove_stream`; no new worker code is added here. A
+/// bidi/request FIN is left for request cleanup and mutates nothing. The
+/// root connection's own Disconnected callback is a clean no-op: only a
+/// stream child carries `SessionFlags::STREAM` in its accept metadata, and
+/// the root's published `ConnectionContextId` shares the packed
+/// slot|generation layout with a `StreamContextId` in an unrelated pool, so
+/// it is never interpreted as a stream. No FIFO is drained — the peer's
+/// final bytes stay readable — and the whole path is O(1) with no scan,
+/// allocation, lock, channel, or async work. Errors propagate typed through
+/// the existing `RuntimeError` conversion; there is no connection-close
+/// action here.
+pub(crate) fn disconnect(
+    worker: &mut SessionWorker<Index>,
+    session: SessionId,
+    context: SessionAppContext,
+) -> RuntimeResult<()> {
+    let main = HTTP_MAIN
+        .get()
+        .ok_or(RuntimeError::PluginStateNotInitialized { plugin: NAME })?;
+    disconnect_on(&main, worker, session, context)
+}
+
+/// `disconnect` on a caller-resolved authority, so unit tests own their
+/// `HttpMain` without the process-wide `HTTP_MAIN` OnceLock, exactly as
+/// `accept_on` bypasses it (listener.rs:1071).
+pub(crate) fn disconnect_on(
+    main: &HttpMain,
+    worker: &mut SessionWorker<Index>,
+    session: SessionId,
+    context: SessionAppContext,
+) -> RuntimeResult<()> {
+    if context == 0 {
+        // A zero context names no published stream; the callback is a
+        // lifecycle fallback no-op, consistent with the accept and destroy
+        // fallbacks.
+        return Ok(());
+    }
+    // The root HTTP/3 connection's Disconnected callback carries the
+    // published `ConnectionContextId`, which shares the packed
+    // slot|generation layout with a `StreamContextId` in an unrelated pool;
+    // the raw value is never a stream identity by itself. The accept
+    // metadata distinguishes the roles exactly as VPP
+    // `http_ts_accept_callback` branches on `SESSION_F_STREAM`
+    // (http.c:733-740): only a stream child carries
+    // `SessionFlags::STREAM`, so a root connection disconnect — and a
+    // Session with no live metadata, which cannot own a stream context —
+    // is a clean no-op in this peer-uni FIN seam.
+    let Some(metadata) = worker.accept_metadata(session) else {
+        return Ok(());
+    };
+    if !metadata.flags.contains(SessionFlags::STREAM) {
+        return Ok(());
+    }
+    let stream = StreamContextId::from(context);
+    main.with_worker(worker.worker(), |http| {
+        let (direction, peer_role) = {
+            let stream_context = http
+                .get_stream_for_session(stream, session)
+                .map_err(RuntimeError::from)?;
+            (stream_context.direction, stream_context.peer_role)
+        };
+        if direction != SessionStreamDirection::Uni {
+            // Bidi/request FIN is owned by request cleanup, not by the
+            // peer-uni stream helpers.
+            return Ok(());
+        }
+        match peer_role {
+            PeerUniStreamRole::Control => http
+                .finish_peer_control_stream(stream)
+                .map_err(|error| match error {
+                    // The finish path only reports worker liveness failures,
+                    // preserved as the typed `HttpWorkerError` unchanged.
+                    PeerControlError::Worker(inner) => RuntimeError::from(inner),
+                    // `PeerControlError::Protocol` is shared with the
+                    // byte-processing path (`process_peer_control_bytes`) but
+                    // is structurally impossible from a FIN:
+                    // `finish_peer_control_stream` never parses SETTINGS, it
+                    // only clears the registered slot and reader. The
+                    // exhaustive conversion stays typed — naming the HTTP/3
+                    // connection error code rather than mislabeling the arm
+                    // as a lifecycle failure — and adds no connection policy.
+                    PeerControlError::Protocol(error) => {
+                        let code = error.error_code();
+                        RuntimeError::from(HttpAppError::PeerControlFinishProtocol { code })
+                    }
+                }),
+            PeerUniStreamRole::QpackEncoder | PeerUniStreamRole::QpackDecoder => http
+                .finish_peer_qpack_stream(stream)
+                .map_err(RuntimeError::from),
+            PeerUniStreamRole::Unknown => http
+                .finish_peer_unknown_stream(stream)
+                .map_err(RuntimeError::from),
+            // VPP's default arm records no slot for these (http3.c:1723-1725
+            // and the push policy http3.c:1712-1722), so EOF releases the
+            // stream context directly; `remove_stream` is generation-checked
+            // and frees the SETTINGS reader only if this stream was the
+            // registered peer control stream, which it cannot be here.
+            PeerUniStreamRole::Push | PeerUniStreamRole::Unclassified => http
+                .remove_stream(stream)
+                .map_err(RuntimeError::from),
+        }
+    })
+}
+
+/// Session App `reset` for a peer HTTP/3 unidirectional stream RESET.
+///
+/// The lower QUIC transport dispatches a received RESET synchronously as
+/// this callback with the Session's published `SessionAppContext` naming the
+/// generation-checked `StreamContextId`, and the owning `HttpWorker` is
+/// resolved by the Session worker id exactly as `disconnect` does. The
+/// stream context is generation/session-checked with
+/// `HttpWorker::get_stream_for_session` before anything else; a bidi/request
+/// stream RESET is owned by request cleanup, not by connection teardown, and
+/// mutates nothing — VPP `http3_transport_stream_reset_callback` checks only
+/// unidirectional-ness. For a peer uni stream the committed
+/// `HttpWorker::classify_peer_uni_stream_reset` copies the stream/parent/
+/// session identities plus the constant `ClosedCriticalStream` error code
+/// (0x0104), mutating nothing, and the parent connection is then closed
+/// exactly once through `SessionWorker::close_connection`; the Session
+/// app-close guard (`on_app_close_dispatch`) makes repeated dispatch a
+/// no-op, so no stream reset is sent and no HTTP worker state is mutated or
+/// cleaned up here (VPP dispatches the connection error before any stream
+/// cleanup). Errors from the metadata check, the classification, and the
+/// transport action propagate typed through the existing `RuntimeError`
+/// conversion. The whole path is O(1) with no scan, allocation, lock,
+/// channel, or async work.
+pub(crate) fn reset(
+    worker: &mut SessionWorker<Index>,
+    session: SessionId,
+    context: SessionAppContext,
+) -> RuntimeResult<()> {
+    let main = HTTP_MAIN
+        .get()
+        .ok_or(RuntimeError::PluginStateNotInitialized { plugin: NAME })?;
+    reset_on(&main, worker, session, context)
+}
+
+/// `reset` on a caller-resolved authority, so unit tests own their `HttpMain`
+/// without the process-wide `HTTP_MAIN` OnceLock, exactly as `accept_on`
+/// bypasses it (listener.rs:1071).
+pub(crate) fn reset_on(
+    main: &HttpMain,
+    worker: &mut SessionWorker<Index>,
+    session: SessionId,
+    context: SessionAppContext,
+) -> RuntimeResult<()> {
+    if context == 0 {
+        // A zero context names no published stream; the callback is a
+        // lifecycle fallback no-op, consistent with the accept, disconnect,
+        // and destroy fallbacks.
+        return Ok(());
+    }
+    let stream = StreamContextId::from(context);
+    main.with_worker(worker.worker(), |http| {
+        let direction = http
+            .get_stream_for_session(stream, session)
+            .map_err(RuntimeError::from)?
+            .direction;
+        if direction != SessionStreamDirection::Uni {
+            // Bidi/request RESET is owned by request cleanup, not by
+            // connection teardown; VPP `http3_transport_stream_reset_callback`
+            // returns before any error recording for non-uni streams.
+            return Ok(());
+        }
+        let reset = http
+            .classify_peer_uni_stream_reset(stream)
+            .map_err(RuntimeError::from)?;
+        worker
+            .close_connection(
+                reset.session,
+                SessionApplicationErrorCode::from(reset.error_code.value()),
+                &[],
+            )
+            .map_err(RuntimeError::from)?;
+        Ok(())
+    })
 }
 
 /// Installs the builtin HTTP Session App on every worker; mirrors VPP
