@@ -23,6 +23,11 @@
 //! buffer (adjacent-FIFO style, no copied payload ownership); no movement
 //! between FIFOs happens in this slice.
 //!
+//! [`publish_request`] writes the same layout to a FIFO in one
+//! reserve/commit: every length is validated first, then metadata and
+//! payloads are scattered from a fixed stack buffer, and the commit is the
+//! only visibility point (single producer, no locks, no event flag).
+//!
 //! Hammer differences (documented, bytes identical to VPP on x86_64):
 //! - byte order is explicit little-endian; VPP memcpys native-endian structs.
 //! - header entries are tight: `http_app_header_name_t`'s name union is
@@ -39,6 +44,8 @@ mod tests;
 mod types;
 
 pub use types::*;
+
+use hammer_infra::fifo::{Fifo, FifoError, FifoWriteReservation};
 
 /// Size of the fixed `http_msg_t` header on the wire.
 pub const MSG_HEADER_LEN: usize = 88;
@@ -295,38 +302,8 @@ impl<'a> Request<'a> {
                 available: buf.len(),
             });
         }
-        let path_len = self.target_path.len() as u32;
-        let body_len = self.body.len() as u64;
-        // Derived from the validated total instead of re-walking the headers.
-        let headers_len =
-            (total - MSG_HEADER_LEN - self.target_path.len() - self.body.len()) as u64;
-        let data_len = (path_len as u64) + headers_len + body_len;
-        let headers_offset = path_len;
-        // Validated in `encoded_len`; checked here for the no-panic contract.
-        let body_offset = headers_offset
-            .checked_add(headers_len as u32)
-            .ok_or(EncodeError::LengthOverflow)?;
-        let mut w = 0usize;
-        w = put_u32(buf, w, MsgType::Request as u32);
-        w = put_u32(buf, w, self.method as u32);
-        w = put_u32(buf, w, MsgDataType::Inline as u32);
-        w += 4; // `http_msg_data_t` padding: type @0, len @8
-        w = put_u64(buf, w, data_len);
-        w = put_u8(buf, w, self.scheme as u8);
-        w += 3; // `http_msg_data_t` padding: scheme @16, authority @20
-        w = put_u32(buf, w, 0); // target_authority_offset
-        w = put_u32(buf, w, 0); // target_authority_len
-        w = put_u32(buf, w, 0); // target_path_offset: app layout puts path at 0
-        w = put_u32(buf, w, path_len);
-        w = put_u32(buf, w, 0); // target_query_offset
-        w = put_u32(buf, w, 0); // target_query_len
-        w = put_u32(buf, w, headers_offset);
-        w = put_u32(buf, w, headers_len as u32);
-        w = put_u32(buf, w, body_offset);
-        w = put_u64(buf, w, body_len);
-        w = put_u64(buf, w, 0); // headers_ctx: server-side scratch, zero on publish
-        w = put_u8(buf, w, UpgradeProto::Na as u8);
-        w += 7; // tail padding of `http_msg_data_t` up to 80 bytes
+        let layout = WireLayout::derive(self, total)?;
+        let mut w = self.encode_msg_header(&layout, buf);
         buf[w..w + self.target_path.len()].copy_from_slice(self.target_path);
         w += self.target_path.len();
         for header in self.headers {
@@ -336,6 +313,193 @@ impl<'a> Request<'a> {
         w += self.body.len();
         Ok(w)
     }
+
+    /// Encode the fixed 88-byte `http_msg_t` header into `buf` (which must
+    /// hold `MSG_HEADER_LEN` bytes), returning `MSG_HEADER_LEN`. Offsets
+    /// follow the app writer `hc_msg_set_offsets`
+    /// (`third_party/vpp/src/plugins/hs_apps/http_client.c:163-166`): path
+    /// at 0, headers after the path, body after the headers.
+    fn encode_msg_header(&self, layout: &WireLayout, buf: &mut [u8]) -> usize {
+        let mut w = 0usize;
+        w = put_u32(buf, w, MsgType::Request as u32);
+        w = put_u32(buf, w, self.method as u32);
+        w = put_u32(buf, w, MsgDataType::Inline as u32);
+        w += 4; // `http_msg_data_t` padding: type @0, len @8
+        w = put_u64(buf, w, layout.data_len);
+        w = put_u8(buf, w, self.scheme as u8);
+        w += 3; // `http_msg_data_t` padding: scheme @16, authority @20
+        w = put_u32(buf, w, 0); // target_authority_offset
+        w = put_u32(buf, w, 0); // target_authority_len
+        w = put_u32(buf, w, 0); // target_path_offset: app layout puts path at 0
+        w = put_u32(buf, w, layout.path_len);
+        w = put_u32(buf, w, 0); // target_query_offset
+        w = put_u32(buf, w, 0); // target_query_len
+        w = put_u32(buf, w, layout.path_len); // headers_offset
+        w = put_u32(buf, w, layout.headers_len);
+        w = put_u32(buf, w, layout.body_offset);
+        w = put_u64(buf, w, layout.body_len);
+        w = put_u64(buf, w, 0); // headers_ctx: server-side scratch, zero on publish
+        w = put_u8(buf, w, UpgradeProto::Na as u8);
+        w += 7; // tail padding of `http_msg_data_t` up to 80 bytes
+        w
+    }
+}
+
+/// Validated wire lengths and offsets shared by the contiguous and FIFO
+/// writers, derived once from an `encoded_len`-validated `total` so both
+/// agree on every offset without re-walking the header list.
+#[derive(Debug, Clone, Copy)]
+struct WireLayout {
+    data_len: u64,
+    path_len: u32,
+    headers_len: u32,
+    body_len: u64,
+    body_offset: u32,
+}
+
+impl WireLayout {
+    /// `total` must come from `Request::encoded_len` for the same request;
+    /// re-checked here so the no-panic contract does not rely on that
+    /// precondition.
+    fn derive(req: &Request<'_>, total: usize) -> Result<Self, EncodeError> {
+        let path_len =
+            u32::try_from(req.target_path.len()).map_err(|_| EncodeError::LengthOverflow)?;
+        let headers_len = total
+            .checked_sub(MSG_HEADER_LEN)
+            .and_then(|n| n.checked_sub(req.target_path.len()))
+            .and_then(|n| n.checked_sub(req.body.len()))
+            .and_then(|n| u32::try_from(n).ok())
+            .ok_or(EncodeError::LengthOverflow)?;
+        let body_len = req.body.len() as u64;
+        let data_len = (path_len as u64)
+            .checked_add(headers_len as u64)
+            .and_then(|n| n.checked_add(body_len))
+            .ok_or(EncodeError::LengthOverflow)?;
+        let body_offset = path_len
+            .checked_add(headers_len)
+            .ok_or(EncodeError::LengthOverflow)?;
+        Ok(Self {
+            data_len,
+            path_len,
+            headers_len,
+            body_len,
+            body_offset,
+        })
+    }
+}
+
+/// Why a FIFO publish failed. `Encode` and `Capacity` leave the FIFO
+/// unchanged; `Fifo` covers reservation/copy/commit failures, which roll
+/// back so nothing becomes visible.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[allow(dead_code)] // exercised from tests; wired to the app publisher later
+pub(crate) enum PublishError {
+    /// The request is not encodable (wire-width or flag violations).
+    Encode(EncodeError),
+    /// The FIFO cannot hold the whole request. `want_deq_notification` was
+    /// armed so the producer is signalled when space frees up.
+    Capacity { requested: usize, available: usize },
+    /// Reservation, scatter copy, or commit failed on the FIFO.
+    Fifo(FifoError),
+}
+
+impl core::fmt::Display for PublishError {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            Self::Encode(inner) => write!(f, "request does not encode: {inner}"),
+            Self::Capacity {
+                requested,
+                available,
+            } => {
+                write!(f, "FIFO holds {available} bytes, request needs {requested}")
+            }
+            Self::Fifo(inner) => write!(f, "FIFO publish failed: {inner}"),
+        }
+    }
+}
+
+/// Publish one request to `fifo` in the VPP app-writer layout, all-or-nothing.
+///
+/// Wire order matches `hc_request`
+/// (`third_party/vpp/src/plugins/hs_apps/http_client.c:229-250`): the
+/// 88-byte `http_msg_t`, then the target path, then the header list, then
+/// the body. Synchronization mirrors that path: the caller is the single
+/// producer, `reserve_write` re-checks the FIFO head with an acquire load,
+/// and `commit` is the only visibility point (a release tail publication).
+/// No FIFO event flag is raised here.
+///
+/// Every length is computed and validated before anything is reserved. If
+/// the FIFO cannot hold the whole request, the capacity preflight arms
+/// `want_deq_notification` and returns with the FIFO untouched; otherwise
+/// one `reserve_write(total)` is followed by a scatter copy (metadata from
+/// a fixed stack buffer, path, header entries, body) and a single commit.
+/// Any copy or commit failure cancels the reservation, exposing zero bytes.
+#[allow(dead_code)] // tests exercise it; the app-session publisher wires it in a later seam
+pub(crate) fn publish_request(fifo: &Fifo, req: &Request<'_>) -> Result<(), PublishError> {
+    let total = req.encoded_len().map_err(PublishError::Encode)?;
+    let layout = WireLayout::derive(req, total).map_err(PublishError::Encode)?;
+    let available = fifo.max_enqueue();
+    if available < total {
+        fifo.want_deq_notification();
+        return Err(PublishError::Capacity {
+            requested: total,
+            available,
+        });
+    }
+    let mut reservation = fifo.reserve_write(total).map_err(PublishError::Fifo)?;
+    let mut meta = [0u8; MSG_HEADER_LEN];
+    req.encode_msg_header(&layout, &mut meta);
+    scatter(&mut reservation, [&meta[..]]).map_err(PublishError::Fifo)?;
+    scatter(&mut reservation, [req.target_path]).map_err(PublishError::Fifo)?;
+    let mut prefix = [0u8; 8];
+    for header in req.headers {
+        match *header {
+            AppHeader::Known { flags, name, value } => {
+                let mut w = put_u16(&mut prefix, 0, flags.bits());
+                w = put_u16(&mut prefix, w, name);
+                put_u32(&mut prefix, w, value.len() as u32);
+                scatter(&mut reservation, [&prefix[..], value])
+            }
+            AppHeader::Custom { flags, name, value } => {
+                let mut w = put_u16(&mut prefix, 0, flags.bits() | FieldLineFlags::CUSTOM_NAME);
+                w = put_u16(&mut prefix, w, name.len() as u16);
+                put_u32(&mut prefix, w, value.len() as u32);
+                scatter(&mut reservation, [&prefix[..4], name, &prefix[4..], value])
+            }
+        }
+        .map_err(PublishError::Fifo)?;
+    }
+    let copied = scatter(&mut reservation, [req.body]).map_err(PublishError::Fifo)?;
+    if copied != total {
+        reservation.cancel();
+        return Err(PublishError::Fifo(FifoError::CommitExceedsReservation {
+            initialized: copied,
+            reserved: total,
+        }));
+    }
+    match reservation.commit(copied) {
+        Ok(_) => Ok(()),
+        Err(source) => {
+            reservation.cancel();
+            Err(PublishError::Fifo(source))
+        }
+    }
+}
+
+/// Scatter-copy one group of source slices into `reservation`, returning the
+/// cumulative byte count; on failure the reservation is cancelled so no
+/// bytes become visible.
+#[allow(dead_code)] // used only by `publish_request`, wired in a later seam
+fn scatter<I, S>(reservation: &mut FifoWriteReservation<'_>, segs: I) -> Result<usize, FifoError>
+where
+    I: IntoIterator<Item = S>,
+    S: AsRef<[u8]>,
+{
+    let copied = reservation.copy_from_segments(segs);
+    if copied.is_err() {
+        reservation.cancel();
+    }
+    copied
 }
 
 /// Encode one header-list entry at `w`; returns the new write position.

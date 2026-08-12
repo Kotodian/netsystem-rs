@@ -7,6 +7,10 @@
 //! test is a true golden-byte test.
 
 use core::mem::offset_of;
+use std::io::Read;
+
+use hammer_infra::fifo::Fifo;
+use hammer_infra::segment::Segment;
 
 use super::*;
 
@@ -402,4 +406,128 @@ fn encode_custom_never_index_flags() {
             .bits(),
         6
     );
+}
+
+// --- FIFO publish -----------------------------------------------------------
+
+/// A local FIFO of `capacity` data bytes backed by a private 1 MiB segment.
+fn local_fifo(capacity: usize) -> Fifo {
+    Fifo::new(Segment::local(1 << 20), capacity).expect("local FIFO")
+}
+
+/// Read `len` published bytes out of `fifo`.
+fn read_published(fifo: &Fifo, len: usize) -> Vec<u8> {
+    let mut out = vec![0u8; len];
+    let mut reader = fifo;
+    reader.read_exact(&mut out).unwrap();
+    out
+}
+
+#[test]
+fn publish_request_writes_vpp_order_and_round_trips() {
+    // The published FIFO bytes must equal the literal VPP layout byte for
+    // byte: 88-byte msg header, then the target path, then the header list,
+    // then the body (`hc_request`, http_client.c:229-250). `golden_request`
+    // writes the path before the headers independently of the codec.
+    let fifo = local_fifo(8192);
+    let req = golden_request_value();
+    publish_request(&fifo, &req).unwrap();
+    // Successful publishes arm no deq notification.
+    assert!(!fifo.needs_deq_notification(1));
+    let observed = read_published(&fifo, 134);
+    assert_eq!(observed, golden_request());
+    // The published bytes decode back to the same request.
+    let decoded = decode(&observed).unwrap();
+    assert_eq!(decoded.method, req.method);
+    assert_eq!(decoded.scheme, req.scheme);
+    assert_eq!(decoded.target_path, req.target_path);
+    assert_eq!(decoded.body, req.body);
+    let headers: Vec<_> = decoded.headers().collect();
+    assert_eq!(headers.len(), 2);
+    assert_eq!(headers[0].value, b"text/html");
+    assert_eq!(headers[1].name, DecodedHeaderName::Custom(b"X-Test"));
+    assert_eq!(headers[1].value, b"1");
+}
+
+#[test]
+fn publish_request_capacity_preflight_leaves_fifo_unchanged() {
+    // 40-byte path + 1-byte body: 88 + 41 = 129 bytes, one byte over a
+    // 128-byte FIFO.
+    let path = [b'a'; 40];
+    let req = Request {
+        method: ReqMethod::Get,
+        scheme: UrlScheme::Http,
+        target_path: &path,
+        headers: &[],
+        body: b"x",
+    };
+    assert_eq!(req.encoded_len().unwrap(), 129);
+    let fifo = local_fifo(128);
+    assert_eq!(
+        publish_request(&fifo, &req),
+        Err(PublishError::Capacity {
+            requested: 129,
+            available: 128
+        })
+    );
+    // The preflight armed the want-deq notification flag and the FIFO holds
+    // zero bytes: nothing was reserved or published.
+    assert!(fifo.needs_deq_notification(1));
+    assert_eq!(fifo.max_dequeue(), 0);
+}
+
+#[test]
+fn publish_request_encode_error_leaves_fifo_usable() {
+    let fifo = local_fifo(8192);
+    // A caller-set CUSTOM_NAME flag is rejected before any reservation, and
+    // arms no notification.
+    let bad = Request {
+        method: ReqMethod::Get,
+        scheme: UrlScheme::Http,
+        target_path: b"/",
+        headers: &[AppHeader::Known {
+            flags: FieldLineFlags(FieldLineFlags::CUSTOM_NAME),
+            name: header_name::ACCEPT,
+            value: b"v",
+        }],
+        body: b"",
+    };
+    assert_eq!(
+        publish_request(&fifo, &bad),
+        Err(PublishError::Encode(EncodeError::ReservedFlag))
+    );
+    assert_eq!(fifo.max_dequeue(), 0);
+    assert!(!fifo.needs_deq_notification(1));
+    // The same FIFO still publishes a valid request afterwards.
+    let req = golden_request_value();
+    publish_request(&fifo, &req).unwrap();
+    assert_eq!(read_published(&fifo, 134), golden_request());
+}
+
+#[test]
+fn publish_request_multi_chunk_body() {
+    // An 8192-byte FIFO carves 4096-byte data chunks; a 5000-byte body
+    // pushes the request across the chunk boundary, so the reservation and
+    // scatter copy span two chunks.
+    let body: Vec<u8> = (0..5000).map(|i| (i % 251) as u8).collect();
+    let req = Request {
+        method: ReqMethod::Put,
+        scheme: UrlScheme::Http,
+        target_path: b"/upload.bin",
+        headers: &GOLDEN_HEADERS,
+        body: &body,
+    };
+    let total = req.encoded_len().unwrap();
+    assert!(total > 4096);
+    let fifo = local_fifo(8192);
+    publish_request(&fifo, &req).unwrap();
+    assert_eq!(fifo.max_dequeue(), total);
+    let observed = read_published(&fifo, total);
+    // The contiguous encode of the same request is the reference layout.
+    let mut reference = vec![0u8; total];
+    req.encode(&mut reference).unwrap();
+    assert_eq!(observed, reference);
+    let decoded = decode(&observed).unwrap();
+    assert_eq!(decoded.target_path, b"/upload.bin");
+    assert_eq!(decoded.body, body.as_slice());
 }
