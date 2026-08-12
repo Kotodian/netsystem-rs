@@ -485,15 +485,17 @@ pub(crate) enum HttpWorkerError {
 
 /// Identities returned by
 /// [`HttpWorker::classify_peer_uni_stream_reset`]: the reset peer
-/// unidirectional stream, its parent connection context, the bound lower
-/// session, and the constant connection-terminating HTTP/3 error code.
+/// unidirectional stream, its parent connection context, the parent
+/// connection's root lower session, and the constant connection-terminating
+/// HTTP/3 error code.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct PeerUniStreamReset {
     /// Generation-checked stream context identity of the reset stream.
     pub(crate) stream: StreamContextId,
     /// Parent connection context the reset stream belongs to.
     pub(crate) context: ContextId,
-    /// Lower QUIC session the stream context is bound to.
+    /// Root QUIC session of the parent connection, which the generic
+    /// `SessionWorker::close_connection` action targets.
     pub(crate) session: SessionId,
     /// HTTP/3 error code terminating the connection: always
     /// `ErrorCode::ClosedCriticalStream` (0x0104).
@@ -960,8 +962,10 @@ impl HttpWorker {
     /// terminate the connection with `ErrorCode::ClosedCriticalStream`
     /// (0x0104). This method is read-only classification: it generation-
     /// checks the stream context and its parent connection, and returns
-    /// copied stream/parent/session identities plus the constant error code,
-    /// mutating nothing. It must not dispatch the close or clean up yet —
+    /// copied stream/parent identities plus the parent connection's root
+    /// lower session (the `SessionId` the generic `close_connection` action
+    /// targets) and the constant error code, mutating nothing. It must not
+    /// dispatch the close or clean up yet —
     /// VPP records and dispatches the connection error before any stream
     /// cleanup, which are separate tasks.
     ///
@@ -979,13 +983,14 @@ impl HttpWorker {
             .get(stream.into())
             .ok_or(HttpWorkerError::StreamMissing { stream })?;
         let parent = stream_context.parent;
-        self.contexts
+        let connection = self
+            .contexts
             .get(parent.into())
             .ok_or(HttpWorkerError::ParentContextMissing { parent })?;
         Ok(PeerUniStreamReset {
             stream,
             context: parent,
-            session: stream_context.session,
+            session: connection.session,
             error_code: ErrorCode::ClosedCriticalStream,
         })
     }
@@ -2285,7 +2290,7 @@ mod tests {
         let expected = PeerUniStreamReset {
             stream,
             context: parent,
-            session: session(2, 1),
+            session: session(1, 1),
             error_code: ErrorCode::ClosedCriticalStream,
         };
         assert_eq!(expected.error_code.value(), 0x0104);
@@ -2329,11 +2334,19 @@ mod tests {
             PeerUniStreamReset {
                 stream,
                 context: parent,
-                session: session(2, 1),
+                session: session(1, 1),
                 error_code: ErrorCode::ClosedCriticalStream,
             }
         );
         assert_eq!(reset.error_code.value(), 0x0104);
+        // The returned session is the parent connection's root session, not
+        // the child stream's own lower session: `close_connection` targets
+        // the root connection SessionId.
+        assert_ne!(
+            worker.get(parent).expect("live connection").session,
+            worker.get_stream(stream).expect("live stream").session,
+            "child stream SessionId differs from its parent root SessionId"
+        );
         // &self classification leaves every pool and registered slot as is.
         assert_eq!(worker.len(), connections);
         assert_eq!(worker.stream_len(), streams);
