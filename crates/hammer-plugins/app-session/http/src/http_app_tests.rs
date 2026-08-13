@@ -14,10 +14,22 @@
 //! `http3_transport_stream_reset_callback`) classifies a peer uni stream
 //! reset and closes the parent connection exactly once with
 //! `ClosedCriticalStream` (0x0104), mutating no HTTP worker state and leaving
-//! bidi request resets alone. The worker-owned retention sink for completed
-//! HEADERS field sections now exists (`retain_pending_field_section` /
-//! `pending_field_section`), but production `builtin_rx` callback wiring
-//! remains a later seam, so no wiring exists.
+//! bidi request resets alone. The `cleanup` callback (VPP
+//! `http3_conn_cleanup_callback` / `http3_stream_cleanup_callback`) removes the
+//! root connection context and clears the published app session in
+//! delete-before-free order, and removes a bidi request stream's upper request
+//! Session before releasing its request stream context; uni request streams and
+//! zero contexts are lifecycle no-ops. The `builtin_rx` callback publishes a
+//! completed request HEADERS section and then the DATA payload from a bidi
+//! request stream's lower RX FIFO to its upper request Session RX FIFO (VPP
+//! `http3_stream_transport_rx_req`, http3.c:1733-1799, and
+//! `http3_req_state_transport_io_more_data`, http3.c:1184-1263): the upper
+//! request Session is created at the first completed HEADERS publication, a
+//! HEADERS capacity retry keeps the retained pending section and the
+//! unconsumed lower bytes intact for the next callback, and a DATA capacity
+//! failure resets the request stream with HTTP3_ERROR_INTERNAL_ERROR after
+//! dequeuing exactly the reader-accounted bytes, never re-feeding them; root,
+//! peer-uni, and context-less dispatches are no-ops.
 
 use std::cell::Cell;
 use std::sync::Arc;
@@ -25,7 +37,9 @@ use std::sync::Arc;
 use hammer_infra::fifo::{Fifo, FifoError};
 use hammer_infra::pool::Index;
 use hammer_infra::segment::Segment;
-use hammer_runtime::app::{AppSessionConfig, ApplicationId, SessionAppContext, SessionAppId, SessionFlags};
+use hammer_runtime::app::{
+    AppSessionConfig, ApplicationId, SessionAppContext, SessionAppId, SessionFlags,
+};
 use hammer_runtime::session::{SessionApplicationErrorCode, SessionStreamDirection};
 use hammer_runtime::{
     DataPlaneRuntime, DataPlaneRuntimeConfig, DataWorkerId, Engine, RuntimeError, RuntimeRegistry,
@@ -38,13 +52,16 @@ use hammer_service::session::{ApplicationMain, SessionEndpointRole, SessionId};
 
 use super::http_app::{
     CALLBACKS, HTTP_SESSION_APP, HttpAppError, NAME, RequestErrorAction, accept, accept_on,
-    destroy, disconnect_on, install, request_publish_error_action, reset_on,
+    builtin_rx_on, cleanup_on, destroy, disconnect_on, install, request_publish_error_action,
+    reset_on,
 };
 use super::listener::{HTTP_MAIN, HttpMain};
+use crate::http_common::{BodyAccumulator, EncodeError, PublishError};
 use crate::http3::proto::error::ErrorCode;
+use crate::http3::proto::qpack::block::encode_block;
+use crate::http3::proto::qpack::field::HeaderField;
 use crate::http3::request::RequestPublishError;
 use crate::http3::request_frame_reader::{RequestFrameError, RequestFrameRead};
-use crate::http_common::{EncodeError, PublishError};
 use crate::worker::{
     ContextId, HTTP_CONTEXT_CAPACITY, HttpWorker, HttpWorkerError, PeerControlOutcome,
     PeerUniStreamRole, PendingFieldSection, RequestReadError, StreamContextId,
@@ -55,7 +72,12 @@ use crate::worker::{
 /// installed worker slot on the current thread. Direct `HttpMain`, bypassing
 /// the process-wide `HTTP_MAIN` OnceLock so each test owns its authority,
 /// exactly as the listener tests do.
-fn test_harness() -> (Arc<HttpMain>, SessionWorker<Index>, ApplicationId, SessionAppId) {
+fn test_harness() -> (
+    Arc<HttpMain>,
+    SessionWorker<Index>,
+    ApplicationId,
+    SessionAppId,
+) {
     let applications = ApplicationMain::with_session_apps(8, [HTTP_SESSION_APP]);
     let application = applications.attach().expect("attach test Application");
     let session_app = applications
@@ -79,6 +101,12 @@ fn test_harness() -> (Arc<HttpMain>, SessionWorker<Index>, ApplicationId, Sessio
     ));
     main.install_worker(DataWorkerId::new(0))
         .expect("install test HttpWorker");
+    // These workers have no FileMain, so the per-Application MQ is staged by
+    // `poll_app`; the builtin_rx seam needs it to publish an upper Session
+    // (`create_upper_session`, runtime.rs `install_application_mq_for_test`).
+    sessions
+        .install_application_mq_for_test(application)
+        .expect("install test Application MQ");
     sessions
         .install_transport_actions(
             HttpMain::TRANSPORT_ID,
@@ -104,6 +132,8 @@ thread_local! {
     static CLOSE_SESSION: Cell<u64> = const { Cell::new(0) };
     static CLOSE_CODE: Cell<u64> = const { Cell::new(0) };
     static RESET_CALLS: Cell<u32> = const { Cell::new(0) };
+    static RESET_SESSION: Cell<u64> = const { Cell::new(0) };
+    static RESET_CODE: Cell<u64> = const { Cell::new(0) };
     static CLOSE_FAIL: Cell<bool> = const { Cell::new(false) };
 }
 
@@ -115,7 +145,11 @@ fn fake_open_stream(
 ) -> RuntimeResult<SessionId> {
     OPEN_CALLS.with(|calls| calls.set(calls.get() + 1));
     OPEN_CONTEXT.with(|seen| seen.set(app_context));
-    assert_eq!(direction, SessionStreamDirection::Uni, "control stream is uni");
+    assert_eq!(
+        direction,
+        SessionStreamDirection::Uni,
+        "control stream is uni"
+    );
     if OPEN_FAIL.with(|fail| fail.get()) {
         return Err(RuntimeError::ServiceClosed);
     }
@@ -124,10 +158,12 @@ fn fake_open_stream(
 
 fn fake_reset_stream(
     _sessions: &mut SessionWorker<Index>,
-    _session_id: SessionId,
-    _code: SessionApplicationErrorCode,
+    session_id: SessionId,
+    code: SessionApplicationErrorCode,
 ) -> RuntimeResult<()> {
     RESET_CALLS.with(|calls| calls.set(calls.get() + 1));
+    RESET_SESSION.with(|seen| seen.set(session_id.get()));
+    RESET_CODE.with(|seen| seen.set(u64::from(code)));
     Ok(())
 }
 
@@ -148,7 +184,10 @@ fn fake_close_connection(
     CLOSE_CALLS.with(|calls| calls.set(calls.get() + 1));
     CLOSE_SESSION.with(|seen| seen.set(session_id.get()));
     CLOSE_CODE.with(|seen| seen.set(u64::from(code)));
-    assert!(reason.is_empty(), "connection close carries an empty reason");
+    assert!(
+        reason.is_empty(),
+        "connection close carries an empty reason"
+    );
     if CLOSE_FAIL.with(|fail| fail.get()) {
         return Err(RuntimeError::ServiceClosed);
     }
@@ -283,7 +322,14 @@ fn accept_peer_uni_stream(
     transport_slot: u32,
     parent: SessionId,
 ) -> SessionId {
-    let child = construct_stream(sessions, application, session_app, transport_slot, parent, true);
+    let child = construct_stream(
+        sessions,
+        application,
+        session_app,
+        transport_slot,
+        parent,
+        true,
+    );
     accept_on(main, sessions, child, 0).expect("accept peer uni stream");
     child
 }
@@ -316,6 +362,49 @@ fn construct_reset_stream(
     )
 }
 
+/// A complete zero-body HEADERS frame: a QPACK-encoded GET field section of
+/// only pseudo fields (no Content-Length, so the request is body-less).
+fn zero_body_headers_frame() -> Vec<u8> {
+    let mut section = Vec::new();
+    encode_block(
+        &mut section,
+        &[
+            HeaderField::new(":method", "GET"),
+            HeaderField::new(":scheme", "https"),
+            HeaderField::new(":authority", "example.com"),
+            HeaderField::new(":path", "/"),
+        ],
+    )
+    .expect("fixture field section encodes");
+    assert!(section.len() < 64, "fixture fits a one-byte varint length");
+    let mut frame = vec![0x01, section.len() as u8];
+    frame.extend_from_slice(&section);
+    frame
+}
+
+/// A complete HEADERS frame whose field section declares a Content-Length of
+/// `len`: the request publishes like `zero_body_headers_frame` (the declared
+/// length is consumed into the body accumulator, not the published request)
+/// and its body accepts exactly `len` DATA bytes.
+fn content_length_headers_frame(len: u64) -> Vec<u8> {
+    let mut section = Vec::new();
+    encode_block(
+        &mut section,
+        &[
+            HeaderField::new(":method", "GET"),
+            HeaderField::new(":scheme", "https"),
+            HeaderField::new(":authority", "example.com"),
+            HeaderField::new(":path", "/"),
+            HeaderField::new("content-length", len.to_string().as_str()),
+        ],
+    )
+    .expect("fixture field section encodes");
+    assert!(section.len() < 64, "fixture fits a one-byte varint length");
+    let mut frame = vec![0x01, section.len() as u8];
+    frame.extend_from_slice(&section);
+    frame
+}
+
 #[test]
 fn plugin_descriptor_declares_name_http_loaded_after_quic() {
     let manifest = crate::__HAMMER_PLUGIN_MANIFEST_TOML;
@@ -332,31 +421,40 @@ fn registers_exactly_the_builtin_http_session_app() {
 }
 
 #[test]
-fn callback_table_wires_accept_disconnect_and_reset_and_defers_the_rest() {
-    // `accept`, `disconnect`, and `reset` are the VPP `http_app_cb_vft`
-    // entries (http.c:1004-1017) this slice owns: accept needs nothing beyond
-    // the per-worker context pool, disconnect needs the worker's peer uni
-    // stream slots and `finish_peer_*`/`remove_stream` helpers (worker.rs),
-    // and reset needs only the committed `classify_peer_uni_stream_reset`
-    // classification plus the generic `close_connection` transport action —
-    // no HTTP worker state mutation, mirroring VPP
-    // `http3_transport_stream_reset_callback`. Every other entry needs
-    // lifecycle state from later slices, so it stays `None`: no speculative
-    // no-ops until the owning slices land.
+fn callback_table_wires_accept_disconnect_reset_cleanup_and_builtin_rx_and_defers_the_rest() {
+    // `accept`, `disconnect`, `reset`, `cleanup`, and `builtin_rx` are the
+    // VPP `http_app_cb_vft` entries (http.c:1004-1017) this slice owns:
+    // accept needs nothing beyond the per-worker context pool, disconnect
+    // needs the worker's peer uni stream slots and
+    // `finish_peer_*`/`remove_stream` helpers (worker.rs), reset needs only
+    // the committed `classify_peer_uni_stream_reset` classification plus the
+    // generic `close_connection` transport action — no HTTP worker state
+    // mutation, mirroring VPP `http3_transport_stream_reset_callback` —
+    // cleanup needs only the worker's `remove`/`release_request_stream`
+    // pool removal plus the Session worker's `upper_session`/
+    // `remove_upper_session` and `set_app_session` publication, mirroring
+    // VPP `http3_conn_cleanup_callback`/`http3_stream_cleanup_callback`,
+    // and builtin_rx needs the worker's request reader, pending-section
+    // retention, and body publication plus the Session worker's
+    // `create_upper_session`/`fifo_pair`/`reset_stream`/`publish_rx_*`
+    // helpers, mirroring VPP `http3_stream_transport_rx_req`
+    // (http3.c:1733-1799). Every other entry needs lifecycle state from
+    // later slices, so it stays `None`: no speculative no-ops until the
+    // owning slices land.
     let callbacks: SessionAppCallbacks = CALLBACKS;
     assert!(callbacks.accept.is_some());
     assert!(callbacks.disconnect.is_some());
     assert!(callbacks.reset.is_some());
+    assert!(callbacks.cleanup.is_some());
+    assert!(callbacks.builtin_rx.is_some());
     assert!(callbacks.add_segment.is_none());
     assert!(callbacks.del_segment.is_none());
     assert!(callbacks.connected.is_none());
     assert!(callbacks.transport_closed.is_none());
-    assert!(callbacks.cleanup.is_none());
     assert!(callbacks.half_open_cleanup.is_none());
     assert!(callbacks.migrate.is_none());
     assert!(callbacks.listened.is_none());
     assert!(callbacks.unlistened.is_none());
-    assert!(callbacks.builtin_rx.is_none());
     assert!(callbacks.builtin_tx.is_none());
     assert!(callbacks.fifo_tuning.is_none());
     assert!(callbacks.proxy_alloc_fifos.is_none());
@@ -461,7 +559,10 @@ fn connection_accept_bootstraps_control_stream_exactly_once() {
             Some(SessionId::from_raw(session.get() + 1)),
             "the opened control stream child is recorded on the context"
         );
-        assert!(connection.peer_settings_pending, "peer SETTINGS still expected");
+        assert!(
+            connection.peer_settings_pending,
+            "peer SETTINGS still expected"
+        );
         Ok(())
     })
     .expect("worker accessible on the test thread");
@@ -482,19 +583,28 @@ fn connection_accept_rolls_back_and_closes_lower_connection_when_bootstrap_fails
 
     let error = accept_on(&main, &mut sessions, session, 0)
         .expect_err("bootstrap failure must fail the accept");
-    assert!(matches!(
-        http_error(&error),
-        HttpWorkerError::ControlStreamOpenFailed { context: failed } if *failed == context
-    ), "primary bootstrap error preserved, got {error:?}");
+    assert!(
+        matches!(
+            http_error(&error),
+            HttpWorkerError::ControlStreamOpenFailed { context: failed } if *failed == context
+        ),
+        "primary bootstrap error preserved, got {error:?}"
+    );
     OPEN_CALLS.with(|calls| assert_eq!(calls.get(), 1, "failing action invoked once"));
-    assert_eq!(worker_len(&main), 0, "connection context removed in rollback");
+    assert_eq!(
+        worker_len(&main),
+        0,
+        "connection context removed in rollback"
+    );
     CLOSE_CALLS.with(|calls| assert_eq!(calls.get(), 1, "lower connection closed in rollback"));
     CLOSE_SESSION.with(|seen| {
-        assert_eq!(seen.get(), session.get(), "close names the lower connection")
+        assert_eq!(
+            seen.get(),
+            session.get(),
+            "close names the lower connection"
+        )
     });
-    CLOSE_CODE.with(|seen| {
-        assert_eq!(seen.get(), 0x0102, "close carries VPP H3_INTERNAL_ERROR")
-    });
+    CLOSE_CODE.with(|seen| assert_eq!(seen.get(), 0x0102, "close carries VPP H3_INTERNAL_ERROR"));
 
     // The cleared app context leaves the session fully re-acceptable: a fresh
     // dispatch context re-runs the whole path and re-bootstraps a new context
@@ -534,7 +644,11 @@ fn accept_rolls_back_context_when_publication_fails() {
         matches!(error, RuntimeError::Subsystem { subsystem, .. } if subsystem == "session"),
         "primary set_app_session error preserved, got {error:?}"
     );
-    assert_eq!(worker_len(&main), 0, "failed publication rolled back the context");
+    assert_eq!(
+        worker_len(&main),
+        0,
+        "failed publication rolled back the context"
+    );
 }
 
 #[test]
@@ -607,8 +721,7 @@ fn accept_stream_allocates_bidi_stream_bound_to_parent_and_direction() {
             .get_stream_for_session(StreamContextId::from(Index::new(0, 1)), child)
             .map_err(RuntimeError::from)?;
         assert_eq!(
-            stream.parent,
-            parent_context,
+            stream.parent, parent_context,
             "stream bound to its parent connection context"
         );
         assert_eq!(
@@ -637,8 +750,7 @@ fn accept_stream_allocates_uni_stream_bound_to_parent_and_direction() {
             .get_stream_for_session(StreamContextId::from(Index::new(0, 1)), child)
             .map_err(RuntimeError::from)?;
         assert_eq!(
-            stream.parent,
-            parent_context,
+            stream.parent, parent_context,
             "stream bound to its parent connection context"
         );
         assert_eq!(
@@ -713,8 +825,8 @@ fn accept_stream_stale_parent_context_is_typed_error() {
     .expect("release parent context");
     let child = construct_stream(&mut sessions, application, session_app, 2, parent, false);
 
-    let error = accept_on(&main, &mut sessions, child, 0)
-        .expect_err("stale parent cannot be adopted");
+    let error =
+        accept_on(&main, &mut sessions, child, 0).expect_err("stale parent cannot be adopted");
     assert!(
         matches!(
             http_error(&error),
@@ -723,7 +835,11 @@ fn accept_stream_stale_parent_context_is_typed_error() {
         "typed parent-missing error expected, got {error:?}"
     );
     main.with_worker(DataWorkerId::new(0), |http| {
-        assert_eq!(http.stream_len(), 0, "no stream allocated under a stale parent");
+        assert_eq!(
+            http.stream_len(),
+            0,
+            "no stream allocated under a stale parent"
+        );
         Ok(())
     })
     .expect("worker accessible on the test thread");
@@ -766,8 +882,8 @@ fn accept_stream_foreign_parent_context_is_typed_error() {
         .expect("parent opaque names a foreign context");
     let child = construct_stream(&mut sessions, application, session_app, 2, parent, false);
 
-    let error = accept_on(&main, &mut sessions, child, 0)
-        .expect_err("foreign parent cannot be adopted");
+    let error =
+        accept_on(&main, &mut sessions, child, 0).expect_err("foreign parent cannot be adopted");
     assert!(
         matches!(
             http_error(&error),
@@ -777,7 +893,11 @@ fn accept_stream_foreign_parent_context_is_typed_error() {
     );
     assert_eq!(worker_len(&main), 1, "only the real parent context remains");
     main.with_worker(DataWorkerId::new(0), |http| {
-        assert_eq!(http.stream_len(), 0, "no stream allocated under a foreign parent");
+        assert_eq!(
+            http.stream_len(),
+            0,
+            "no stream allocated under a foreign parent"
+        );
         Ok(())
     })
     .expect("worker accessible on the test thread");
@@ -868,7 +988,9 @@ fn disconnect_finishes_only_the_matching_peer_qpack_stream() {
             "encoder stream context released"
         );
         assert_eq!(
-            http.get_stream(decoder).map_err(RuntimeError::from)?.session,
+            http.get_stream(decoder)
+                .map_err(RuntimeError::from)?
+                .session,
             decoder_child,
             "decoder stream stays live"
         );
@@ -967,8 +1089,14 @@ fn disconnect_on_bidi_request_stream_without_upper_releases_request() {
     disconnect_on(&main, &mut sessions, child, u64::from(stream))
         .expect("bidi FIN without an upper releases the request");
 
-    assert!(sessions.has_session(child), "the lower stream Session survives");
-    assert!(sessions.has_session(parent), "the parent connection Session survives");
+    assert!(
+        sessions.has_session(child),
+        "the lower stream Session survives"
+    );
+    assert!(
+        sessions.has_session(parent),
+        "the parent connection Session survives"
+    );
     CLOSE_CALLS.with(|calls| assert_eq!(calls.get(), 0, "no connection close"));
     RESET_CALLS.with(|calls| assert_eq!(calls.get(), 0, "no stream reset"));
     main.with_worker(DataWorkerId::new(0), |http| {
@@ -1013,9 +1141,15 @@ fn disconnect_for_root_connection_with_colliding_stream_context_id_is_a_noop() {
 
     main.with_worker(DataWorkerId::new(0), |http| {
         let connection = http.get(parent_context).map_err(RuntimeError::from)?;
-        assert_eq!(connection.peer_control, Some(stream), "control slot untouched");
         assert_eq!(
-            http.get_stream(stream).map_err(RuntimeError::from)?.peer_role,
+            connection.peer_control,
+            Some(stream),
+            "control slot untouched"
+        );
+        assert_eq!(
+            http.get_stream(stream)
+                .map_err(RuntimeError::from)?
+                .peer_role,
             PeerUniStreamRole::Control,
             "stream context untouched"
         );
@@ -1038,8 +1172,7 @@ fn reset_on_peer_uni_stream_closes_connection_with_closed_critical_stream() {
     reset_on(&main, &mut sessions, child, u64::from(stream)).expect("peer uni reset closes");
 
     assert_ne!(
-        parent,
-        child,
+        parent, child,
         "child stream SessionId differs from the parent root SessionId"
     );
     CLOSE_CALLS.with(|calls| assert_eq!(calls.get(), 1, "connection closed exactly once"));
@@ -1050,11 +1183,13 @@ fn reset_on_peer_uni_stream_closes_connection_with_closed_critical_stream() {
             "close names the parent root connection SessionId (reset.session)"
         )
     });
-    CLOSE_CODE.with(|seen| {
-        assert_eq!(seen.get(), 0x0104, "close carries ClosedCriticalStream")
-    });
+    CLOSE_CODE.with(|seen| assert_eq!(seen.get(), 0x0104, "close carries ClosedCriticalStream"));
     RESET_CALLS.with(|calls| {
-        assert_eq!(calls.get(), 0, "no stream reset for a connection-terminating reset")
+        assert_eq!(
+            calls.get(),
+            0,
+            "no stream reset for a connection-terminating reset"
+        )
     });
     // The seam mutates no HttpWorker state: stream and connection stay live.
     main.with_worker(DataWorkerId::new(0), |http| {
@@ -1213,9 +1348,8 @@ fn reset_closes_the_connection_for_every_peer_uni_role() {
         reset_on(&main, &mut sessions, child, u64::from(stream))
             .expect("reset closes the connection for every peer uni role");
 
-        CLOSE_CALLS.with(|calls| {
-            assert_eq!(calls.get(), (index + 1) as u32, "role {role:?} closed once")
-        });
+        CLOSE_CALLS
+            .with(|calls| assert_eq!(calls.get(), (index + 1) as u32, "role {role:?} closed once"));
         CLOSE_SESSION.with(|seen| {
             assert_eq!(
                 seen.get(),
@@ -1224,7 +1358,11 @@ fn reset_closes_the_connection_for_every_peer_uni_role() {
             )
         });
         CLOSE_CODE.with(|seen| {
-            assert_eq!(seen.get(), 0x0104, "role {role:?} closes with ClosedCriticalStream")
+            assert_eq!(
+                seen.get(),
+                0x0104,
+                "role {role:?} closes with ClosedCriticalStream"
+            )
         });
         main.with_worker(DataWorkerId::new(0), |http| {
             assert_eq!(
@@ -1258,16 +1396,24 @@ fn reset_on_bidi_request_stream_without_upper_releases_request() {
     reset_on(&main, &mut sessions, child, u64::from(stream))
         .expect("bidi reset without an upper releases the request");
 
-    assert!(sessions.has_session(child), "the lower stream Session survives");
-    assert!(sessions.has_session(parent), "the parent connection Session survives");
-    CLOSE_CALLS.with(|calls| {
-        assert_eq!(calls.get(), 0, "bidi reset must not close the connection")
-    });
+    assert!(
+        sessions.has_session(child),
+        "the lower stream Session survives"
+    );
+    assert!(
+        sessions.has_session(parent),
+        "the parent connection Session survives"
+    );
+    CLOSE_CALLS
+        .with(|calls| assert_eq!(calls.get(), 0, "bidi reset must not close the connection"));
     RESET_CALLS.with(|calls| assert_eq!(calls.get(), 0, "no stream reset"));
     main.with_worker(DataWorkerId::new(0), |http| {
         assert_eq!(http.len(), 1, "the parent connection context remains");
         assert_eq!(http.stream_len(), 0, "the request stream is released");
-        assert!(http.get(parent_context).is_ok(), "the parent connection context is still live");
+        assert!(
+            http.get(parent_context).is_ok(),
+            "the parent connection context is still live"
+        );
         Ok(())
     })
     .expect("worker accessible on the test thread");
@@ -1304,6 +1450,142 @@ fn reset_close_action_failure_propagates_typed() {
     // Restore the thread-local failure flag so a pooled test thread never
     // leaks it into later tests.
     CLOSE_FAIL.with(|fail| fail.set(false));
+}
+
+// --- cleanup callback lifecycle ---------------------------------------------
+
+/// The root connection's cleanup callback removes the HTTP root context and
+/// clears the published app session in delete-before-free order, mirroring
+/// VPP `http3_conn_cleanup_callback` (http3.c:2425-2436), which delete-
+/// notifies the parent request's connection before freeing it; the Session
+/// entry itself survives — the SessionWorker frees it after the callback —
+/// and no transport action is dispatched.
+#[test]
+fn cleanup_removes_root_http_context_and_clears_app_session() {
+    let (main, mut sessions, application, session_app) = test_harness();
+    let root = construct_accepted_root(&mut sessions, application, session_app, 1);
+    accept_on(&main, &mut sessions, root, 0).expect("accept root");
+    // Fresh connection pool: the first allocation occupies slot 0 with
+    // generation 1, so its identity is deterministic.
+    let context = ContextId::from(Index::new(0, 1));
+    // A live stream child's accept metadata reports the parent's published
+    // app session (runtime.rs `accept_metadata`), the observable side of the
+    // root's `set_app_session` publication and of its cleanup clearing.
+    let child = construct_stream(&mut sessions, application, session_app, 2, root, true);
+    let before = sessions
+        .accept_metadata(child)
+        .expect("live child metadata")
+        .parent_app_context;
+    assert_eq!(
+        before,
+        Some(u64::from(context)),
+        "parent app session published"
+    );
+    CLOSE_CALLS.with(|calls| calls.set(0));
+    RESET_CALLS.with(|calls| calls.set(0));
+
+    cleanup_on(&main, &mut sessions, root, u64::from(context)).expect("root cleanup succeeds");
+
+    assert!(
+        sessions.has_session(root),
+        "the root Session entry survives cleanup"
+    );
+    assert_eq!(worker_len(&main), 0, "the HTTP root context is removed");
+    let after = sessions
+        .accept_metadata(child)
+        .expect("live child metadata")
+        .parent_app_context;
+    assert_eq!(after, Some(0), "the published app session is cleared");
+    CLOSE_CALLS.with(|calls| assert_eq!(calls.get(), 0, "no connection close"));
+    RESET_CALLS.with(|calls| assert_eq!(calls.get(), 0, "no stream reset"));
+}
+
+/// A bidi request stream's cleanup callback removes the upper request
+/// Session before releasing the request stream context, matching VPP
+/// `http3_stream_cleanup_callback`'s delete-notify-then-free order
+/// (http3.c:2459-2462); the lower stream Session and the parent connection
+/// Session/context stay live and no transport action is dispatched.
+#[test]
+fn cleanup_on_bidi_request_stream_removes_upper_before_releasing_request() {
+    let (main, mut sessions, application, session_app) = test_harness();
+    let (parent, parent_context) =
+        construct_parent(&main, &mut sessions, application, session_app, 1);
+    let child = construct_stream(&mut sessions, application, session_app, 2, parent, false);
+    accept_on(&main, &mut sessions, child, 0).expect("accept bidi stream");
+    let stream = StreamContextId::from(Index::new(0, 1));
+    // These workers have no FileMain, so the per-Application MQ is staged by
+    // `install_application_mq_for_test` before `create_upper_session` can
+    // publish an upper Session (runtime.rs `create_upper_session`).
+    sessions
+        .install_application_mq_for_test(application)
+        .expect("install test Application MQ");
+    let upper = sessions
+        .create_upper_session(child, u64::from(stream))
+        .expect("publish upper request Session");
+    CLOSE_CALLS.with(|calls| calls.set(0));
+    RESET_CALLS.with(|calls| calls.set(0));
+
+    cleanup_on(&main, &mut sessions, child, u64::from(stream))
+        .expect("bidi request cleanup succeeds");
+
+    assert!(
+        !sessions.has_session(upper),
+        "the upper request Session is removed"
+    );
+    assert!(
+        sessions.has_session(child),
+        "the lower stream Session survives"
+    );
+    assert!(
+        sessions.has_session(parent),
+        "the parent connection Session survives"
+    );
+    CLOSE_CALLS.with(|calls| assert_eq!(calls.get(), 0, "no connection close"));
+    RESET_CALLS.with(|calls| assert_eq!(calls.get(), 0, "no stream reset"));
+    main.with_worker(DataWorkerId::new(0), |http| {
+        assert_eq!(http.len(), 1, "the parent connection context remains");
+        assert!(
+            http.get(parent_context).is_ok(),
+            "the parent connection context is still live"
+        );
+        assert_eq!(http.stream_len(), 0, "the request stream is released");
+        Ok(())
+    })
+    .expect("worker accessible on the test thread");
+}
+
+/// A zero context names no published HTTP context; the cleanup callback is a
+/// lifecycle fallback no-op, consistent with the accept, disconnect, and
+/// reset fallbacks.
+#[test]
+fn cleanup_with_zero_context_is_a_lifecycle_noop() {
+    let (main, mut sessions, application, session_app) = test_harness();
+    let (parent, parent_context) =
+        construct_parent(&main, &mut sessions, application, session_app, 1);
+    let child = construct_stream(&mut sessions, application, session_app, 2, parent, false);
+    accept_on(&main, &mut sessions, child, 0).expect("accept bidi stream");
+    let stream = StreamContextId::from(Index::new(0, 1));
+
+    cleanup_on(&main, &mut sessions, child, 0).expect("zero context is a no-op");
+
+    assert!(
+        sessions.has_session(child),
+        "the lower stream Session survives"
+    );
+    assert!(
+        sessions.has_session(parent),
+        "the parent connection Session survives"
+    );
+    main.with_worker(DataWorkerId::new(0), |http| {
+        assert_eq!(http.len(), 1, "the parent connection context remains");
+        assert_eq!(http.stream_len(), 1, "the request stream context remains");
+        assert!(
+            http.get(parent_context).is_ok(),
+            "the parent connection context is still live"
+        );
+        Ok(())
+    })
+    .expect("worker accessible on the test thread");
 }
 
 /// The worker-local retention sink for a completed request HEADERS field
@@ -1345,18 +1627,15 @@ fn builtin_rx_completed_headers_retains_field_section_in_worker_slot() {
     // lower-FIFO consumed count, and the borrow hands both back for the
     // decode/publish stage.
     worker
-        .retain_pending_field_section(
-            stream,
-            session,
-            PendingFieldSection { encoded, consumed },
-        )
+        .retain_pending_field_section(stream, session, PendingFieldSection { encoded, consumed })
         .expect("retain the completed field section");
     let pending = worker
         .pending_field_section(stream, session)
         .expect("live stream")
         .expect("a retained section is pending");
     assert_eq!(
-        pending.encoded, b"hi".to_vec(),
+        pending.encoded,
+        b"hi".to_vec(),
         "the pending section is the encoded HEADERS field section"
     );
     assert_eq!(
@@ -1372,6 +1651,674 @@ fn builtin_rx_completed_headers_retains_field_section_in_worker_slot() {
         worker.pending_field_section(stream, session).unwrap(),
         None,
         "clearing empties the pending slot"
+    );
+}
+
+/// `builtin_rx_on` routes only bidi request stream contexts: a root
+/// connection, a peer uni stream, and a Session without live metadata are
+/// no-ops that neither create an upper Session, touch the lower FIFO, nor
+/// reset anything, exactly as the accept metadata distinguishes the roles
+/// (VPP `http_ts_accept_callback` branches on `SESSION_F_STREAM`,
+/// http.c:733-740); only a bidi request stream feeds and publishes.
+#[test]
+fn builtin_rx_routes_only_bidi_request_streams() {
+    let (main, mut sessions, application, session_app) = test_harness();
+    let (parent, parent_context) =
+        construct_parent(&main, &mut sessions, application, session_app, 1);
+    RESET_CALLS.with(|calls| calls.set(0));
+
+    // A root connection dispatch is a no-op: no upper Session, the root RX
+    // bytes stay readable, nothing resets.
+    {
+        let (root_rx, _) = sessions.fifo_pair(parent).expect("root RX fifo");
+        root_rx.enqueue(b"ignored");
+    }
+    builtin_rx_on(&main, &mut sessions, parent, u64::from(parent_context))
+        .expect("root RX is a no-op");
+    assert!(
+        sessions.upper_session(parent).is_none(),
+        "no upper request Session for a root connection"
+    );
+    let (root_rx, _) = sessions.fifo_pair(parent).expect("root RX fifo");
+    assert_eq!(root_rx.max_dequeue(), 7, "root FIFO bytes stay readable");
+
+    // A peer uni stream dispatch is a no-op too: no upper Session, the uni
+    // RX bytes stay readable, nothing resets.
+    let uni = accept_peer_uni_stream(&main, &mut sessions, application, session_app, 2, parent);
+    let uni_stream = StreamContextId::from(Index::new(0, 1));
+    {
+        let (uni_rx, _) = sessions.fifo_pair(uni).expect("uni RX fifo");
+        uni_rx.enqueue(b"ignored");
+    }
+    builtin_rx_on(&main, &mut sessions, uni, u64::from(uni_stream))
+        .expect("peer uni stream RX is a no-op");
+    assert!(
+        sessions.upper_session(uni).is_none(),
+        "no upper request Session for a peer uni stream"
+    );
+    let (uni_rx, _) = sessions.fifo_pair(uni).expect("uni RX fifo");
+    assert_eq!(uni_rx.max_dequeue(), 7, "uni FIFO bytes stay readable");
+
+    // A bidi request stream dispatch feeds and publishes.
+    let child = construct_stream(&mut sessions, application, session_app, 3, parent, false);
+    accept_on(&main, &mut sessions, child, 0).expect("accept bidi request stream");
+    let stream = StreamContextId::from(Index::new(1, 1));
+    let frame = zero_body_headers_frame();
+    sessions
+        .fifo_pair(child)
+        .expect("lower RX fifo")
+        .0
+        .enqueue(&frame);
+    builtin_rx_on(&main, &mut sessions, child, u64::from(stream))
+        .expect("bidi request stream publishes");
+
+    let upper = sessions
+        .upper_session(child)
+        .expect("upper request Session created for the bidi stream");
+    let (upper_rx, _) = sessions.fifo_pair(upper).expect("upper RX fifo");
+    assert_eq!(
+        upper_rx.max_dequeue(),
+        88 + 11 + 1,
+        "the bidi request publishes"
+    );
+    let (lower_rx, _) = sessions.fifo_pair(child).expect("lower RX fifo");
+    assert_eq!(lower_rx.max_dequeue(), 0, "the consumed bytes dequeue");
+    RESET_CALLS.with(|calls| assert_eq!(calls.get(), 0, "no reset for root, uni, or bidi"));
+}
+
+/// `builtin_rx_on` publishes one completed zero-body request HEADERS section
+/// from the lower transport RX FIFO to the upper Session RX FIFO: the upper
+/// request Session is created on first RX, the exact consumed lower bytes
+/// dequeue after the upper commit, and the pending slot is cleared only
+/// after the commit, mirroring VPP dispatching the recorded request to the
+/// app (http3.c:456-475).
+#[test]
+fn builtin_rx_publishes_zero_body_headers_to_upper_session() {
+    let (main, mut sessions, application, session_app) = test_harness();
+    let (parent, _parent_context) =
+        construct_parent(&main, &mut sessions, application, session_app, 1);
+    let child = construct_stream(&mut sessions, application, session_app, 2, parent, false);
+    accept_on(&main, &mut sessions, child, 0).expect("accept bidi request stream");
+    let stream = StreamContextId::from(Index::new(0, 1));
+
+    // The lower RX FIFO carries one complete HEADERS frame with a
+    // QPACK-encoded GET field section of only pseudo fields (no
+    // Content-Length, so the request is body-less).
+    let frame = zero_body_headers_frame();
+    sessions
+        .fifo_pair(child)
+        .expect("lower RX fifo")
+        .0
+        .enqueue(&frame);
+
+    builtin_rx_on(&main, &mut sessions, child, u64::from(stream))
+        .expect("builtin RX publishes the zero-body request");
+
+    // The upper request Session exists and the request is published in the
+    // VPP inbound layout: 88-byte header + authority "example.com" (11) +
+    // path "/" (1), with empty query, header list, and body.
+    let upper = sessions
+        .upper_session(child)
+        .expect("upper request Session created");
+    let (upper_rx, _) = sessions.fifo_pair(upper).expect("upper RX fifo");
+    assert_eq!(
+        upper_rx.max_dequeue(),
+        88 + 11 + 1,
+        "published inbound request size"
+    );
+    let (lower_rx, _) = sessions.fifo_pair(child).expect("lower RX fifo");
+    assert_eq!(
+        lower_rx.max_dequeue(),
+        0,
+        "the exact consumed lower bytes are dequeued"
+    );
+
+    // The pending slot is cleared only after the upper FIFO commit, and the
+    // body accumulator was installed from the declared (absent)
+    // Content-Length: a body-less request that rejects any DATA.
+    main.with_worker(DataWorkerId::new(0), |http| {
+        assert_eq!(
+            http.pending_field_section(stream, child)
+                .expect("live stream"),
+            None,
+            "pending slot cleared after the upper commit"
+        );
+        let stream_context = http
+            .get_stream_for_session(stream, child)
+            .expect("live stream context");
+        assert!(
+            matches!(stream_context.body, BodyAccumulator::NoBody),
+            "no declared Content-Length installs a body-less accumulator"
+        );
+        Ok(())
+    })
+    .expect("worker accessible on the test thread");
+}
+
+/// A single HEADERS frame split across two RX callbacks: each callback
+/// dequeues exactly the bytes its reader consumed and never re-feeds bytes
+/// already in the reader's partial-frame state (VPP drains each callback's
+/// processed bytes, `max_deq - left_deq`, http3.c:1798, and never re-reads a
+/// frame's bytes), so the frame completes on the second callback and
+/// publishes exactly as a single-callback HEADERS does.
+#[test]
+fn builtin_rx_fragmented_headers_consumes_each_byte_once_across_callbacks() {
+    let (main, mut sessions, application, session_app) = test_harness();
+    let (parent, _parent_context) =
+        construct_parent(&main, &mut sessions, application, session_app, 1);
+    let child = construct_stream(&mut sessions, application, session_app, 2, parent, false);
+    accept_on(&main, &mut sessions, child, 0).expect("accept bidi request stream");
+    let stream = StreamContextId::from(Index::new(0, 1));
+
+    let frame = zero_body_headers_frame();
+    assert!(frame.len() >= 4, "fixture splits into two non-empty halves");
+    // The lower FIFO receives the single frame across two RX callbacks: the
+    // first feeds the frame prefix and half the payload, the second the
+    // remainder.
+    let split = 2 + (frame.len() - 2) / 2;
+    sessions
+        .fifo_pair(child)
+        .expect("lower RX fifo")
+        .0
+        .enqueue(&frame[..split]);
+    builtin_rx_on(&main, &mut sessions, child, u64::from(stream))
+        .expect("a partial frame returns Ok without publishing");
+
+    // The partial frame moved into the reader's state: nothing is published
+    // and no upper request Session exists yet (VPP records the request and
+    // dispatches the app only when the full HEADERS block arrives,
+    // http3.c:835-899 then http3.c:456-475); the exact fed bytes are
+    // dequeued, so the next callback starts at the first byte the reader
+    // has not seen.
+    {
+        assert!(
+            sessions.upper_session(child).is_none(),
+            "no upper request Session for an incomplete HEADERS frame"
+        );
+        let (lower_rx, _) = sessions.fifo_pair(child).expect("lower RX fifo");
+        assert_eq!(
+            lower_rx.max_dequeue(),
+            0,
+            "partial bytes move into the reader state, not the FIFO"
+        );
+    }
+
+    // The remainder completes the frame and commits the same publication as
+    // a single-callback HEADERS.
+    sessions
+        .fifo_pair(child)
+        .expect("lower RX fifo")
+        .0
+        .enqueue(&frame[split..]);
+    builtin_rx_on(&main, &mut sessions, child, u64::from(stream))
+        .expect("the completing bytes publish the request");
+    let upper = sessions
+        .upper_session(child)
+        .expect("upper request Session created");
+    let (upper_rx, _) = sessions.fifo_pair(upper).expect("upper RX fifo");
+    assert_eq!(
+        upper_rx.max_dequeue(),
+        88 + 11 + 1,
+        "published inbound request size"
+    );
+    let (lower_rx, _) = sessions.fifo_pair(child).expect("lower RX fifo");
+    assert_eq!(
+        lower_rx.max_dequeue(),
+        0,
+        "the exact consumed lower bytes are dequeued"
+    );
+    main.with_worker(DataWorkerId::new(0), |http| {
+        assert_eq!(
+            http.pending_field_section(stream, child)
+                .expect("live stream"),
+            None,
+            "pending slot cleared after the upper commit"
+        );
+        Ok(())
+    })
+    .expect("worker accessible on the test thread");
+}
+
+/// An empty HEADERS field section is a request-stream error, not a QPACK
+/// connection decompression failure: VPP checks `req->fh.length == 0` before
+/// `qpack_parse_request` and terminates the request stream with
+/// HTTP3_ERROR_MESSAGE_ERROR (http3.c:860-869, RFC 9114 Section 4.1.2).
+#[test]
+fn builtin_rx_empty_headers_resets_the_stream_with_message_error() {
+    let (main, mut sessions, application, session_app) = test_harness();
+    let (parent, _parent_context) =
+        construct_parent(&main, &mut sessions, application, session_app, 1);
+    let child = construct_stream(&mut sessions, application, session_app, 2, parent, false);
+    accept_on(&main, &mut sessions, child, 0).expect("accept bidi request stream");
+    let stream = StreamContextId::from(Index::new(0, 1));
+    RESET_CALLS.with(|calls| calls.set(0));
+    RESET_CODE.with(|seen| seen.set(0));
+
+    // One empty HEADERS frame: type 0x01, zero payload length.
+    sessions
+        .fifo_pair(child)
+        .expect("lower RX fifo")
+        .0
+        .enqueue(&[0x01, 0x00]);
+
+    builtin_rx_on(&main, &mut sessions, child, u64::from(stream))
+        .expect("empty HEADERS resets the stream, not the publication");
+
+    RESET_CALLS.with(|calls| assert_eq!(calls.get(), 1, "stream reset once"));
+    RESET_CODE.with(|seen| {
+        assert_eq!(
+            seen.get(),
+            ErrorCode::MessageError.value(),
+            "reset with HTTP3_ERROR_MESSAGE_ERROR"
+        )
+    });
+    assert!(
+        sessions.upper_session(child).is_none(),
+        "no upper request Session for an empty HEADERS field section"
+    );
+    let (lower_rx, _) = sessions.fifo_pair(child).expect("lower RX fifo");
+    assert_eq!(
+        lower_rx.max_dequeue(),
+        0,
+        "the empty frame bytes are dequeued"
+    );
+    main.with_worker(DataWorkerId::new(0), |http| {
+        assert_eq!(
+            http.pending_field_section(stream, child)
+                .expect("live stream"),
+            None,
+            "no section retained for an empty HEADERS"
+        );
+        Ok(())
+    })
+    .expect("worker accessible on the test thread");
+}
+
+/// FIFO-capacity backpressure on a HEADERS publication is transient: the
+/// callback returns `Ok(())` with the retained pending section and the
+/// unconsumed lower bytes intact — the exact dequeue happens only after a
+/// successful upper commit — so the next RX callback retries the same
+/// section against the already-attached upper (VPP stream-vs-connection
+/// error split, http3.c:1107-1113).
+#[test]
+fn builtin_rx_headers_capacity_retry_preserves_pending_section_and_lower_bytes() {
+    let (main, mut sessions, application, session_app) = test_harness();
+    let (parent, _parent_context) =
+        construct_parent(&main, &mut sessions, application, session_app, 1);
+    let child = construct_stream(&mut sessions, application, session_app, 2, parent, false);
+    accept_on(&main, &mut sessions, child, 0).expect("accept bidi request stream");
+    let stream = StreamContextId::from(Index::new(0, 1));
+
+    let frame = zero_body_headers_frame();
+    let (lower_rx, _) = sessions.fifo_pair(child).expect("lower RX fifo");
+    // Two complete inbound requests: the first creates the upper Session,
+    // the second is the one the capacity retry will publish.
+    lower_rx.enqueue(&frame);
+    lower_rx.enqueue(&frame);
+    builtin_rx_on(&main, &mut sessions, child, u64::from(stream))
+        .expect("the first HEADERS publishes");
+    let upper = sessions
+        .upper_session(child)
+        .expect("upper request Session created");
+    let (upper_rx, _) = sessions.fifo_pair(upper).expect("upper RX fifo");
+    let published = upper_rx.max_dequeue();
+    assert_eq!(published, 88 + 11 + 1, "the zero-body request publishes");
+
+    // Fill the upper RX FIFO so the second inbound request cannot fit.
+    let filler = vec![0xabu8; upper_rx.max_enqueue()];
+    upper_rx.enqueue(&filler);
+    builtin_rx_on(&main, &mut sessions, child, u64::from(stream))
+        .expect("a full upper FIFO is transient backpressure, not an error");
+
+    let (lower_rx, _) = sessions.fifo_pair(child).expect("lower RX fifo");
+    assert_eq!(
+        lower_rx.max_dequeue(),
+        frame.len(),
+        "the retried request stays readable"
+    );
+    let (upper_rx, _) = sessions.fifo_pair(upper).expect("upper RX fifo");
+    assert_eq!(
+        upper_rx.max_dequeue(),
+        filler.len() + published,
+        "no bytes were published into the full upper FIFO"
+    );
+    main.with_worker(DataWorkerId::new(0), |http| {
+        let pending = http
+            .pending_field_section(stream, child)
+            .expect("live request stream")
+            .expect("the retained field section survives the capacity retry");
+        assert_eq!(
+            pending.consumed,
+            frame.len(),
+            "the retained section keeps its exact lower-FIFO consumed count"
+        );
+        assert_eq!(
+            pending.encoded.as_slice(),
+            &frame[2..],
+            "the retained section is the unmodified encoded field section"
+        );
+        Ok(())
+    })
+    .expect("worker introspection");
+
+    // Drain the upper FIFO and retry: the callback publishes the exact
+    // retained request and dequeues the exact lower bytes only after the
+    // upper commit.
+    let (upper_rx, _) = sessions.fifo_pair(upper).expect("upper RX fifo");
+    upper_rx.dequeue_drop(upper_rx.max_dequeue());
+    builtin_rx_on(&main, &mut sessions, child, u64::from(stream))
+        .expect("the retry publishes the retained request");
+    let (upper_rx, _) = sessions.fifo_pair(upper).expect("upper RX fifo");
+    assert_eq!(
+        upper_rx.max_dequeue(),
+        published,
+        "the exact retained request is published after the drain"
+    );
+    let (lower_rx, _) = sessions.fifo_pair(child).expect("lower RX fifo");
+    assert_eq!(
+        lower_rx.max_dequeue(),
+        0,
+        "the exact retried bytes are dequeued only after the upper commit"
+    );
+    main.with_worker(DataWorkerId::new(0), |http| {
+        assert!(
+            http.pending_field_section(stream, child)
+                .expect("live request stream")
+                .is_none(),
+            "the pending slot is cleared after a successful publication"
+        );
+        Ok(())
+    })
+    .expect("worker introspection");
+}
+
+/// `builtin_rx_on` forwards a completed DATA frame's payload to the upper
+/// Session RX FIFO through the shared body publication
+/// (`HttpWorker::process_request_data`), advancing the body accumulator, and
+/// dequeues the exact lower bytes only after the upper commit (VPP
+/// `http3_req_state_transport_io_more_data`, http3.c:1184-1263, publishes
+/// each DATA frame's payload to the app FIFO).
+#[test]
+fn builtin_rx_data_publishes_chunk_advances_body_and_dequeues_after_commit() {
+    let (main, mut sessions, application, session_app) = test_harness();
+    let (parent, _parent_context) =
+        construct_parent(&main, &mut sessions, application, session_app, 1);
+    let child = construct_stream(&mut sessions, application, session_app, 2, parent, false);
+    accept_on(&main, &mut sessions, child, 0).expect("accept bidi request stream");
+    let stream = StreamContextId::from(Index::new(0, 1));
+
+    let frame = content_length_headers_frame(3);
+    let data_frame: &[u8] = &[0x00, 0x03, b'a', b'b', b'c'];
+    let mut combined = frame.clone();
+    combined.extend_from_slice(data_frame);
+    let (lower_rx, _) = sessions.fifo_pair(child).expect("lower RX fifo");
+    lower_rx.enqueue(&combined);
+
+    builtin_rx_on(&main, &mut sessions, child, u64::from(stream)).expect("the HEADERS publishes");
+    let upper = sessions
+        .upper_session(child)
+        .expect("upper request Session created");
+    let (upper_rx, _) = sessions.fifo_pair(upper).expect("upper RX fifo");
+    let request_bytes = upper_rx.max_dequeue();
+    assert!(
+        request_bytes > 88 + 11 + 1,
+        "the request with a declared Content-Length publishes more than the zero-body request"
+    );
+    let (lower_rx, _) = sessions.fifo_pair(child).expect("lower RX fifo");
+    assert_eq!(
+        lower_rx.max_dequeue(),
+        data_frame.len(),
+        "the DATA frame stays readable for the next RX callback"
+    );
+
+    builtin_rx_on(&main, &mut sessions, child, u64::from(stream)).expect("the DATA publishes");
+    let (upper_rx, _) = sessions.fifo_pair(upper).expect("upper RX fifo");
+    assert_eq!(
+        upper_rx.max_dequeue(),
+        request_bytes + 3,
+        "the DATA chunk is appended after the published request"
+    );
+    let mut all = [0u8; 256];
+    assert_eq!(
+        upper_rx.peek(0, all.len(), &mut all),
+        request_bytes + 3,
+        "the published request and chunk are readable"
+    );
+    assert_eq!(
+        &all[request_bytes..request_bytes + 3],
+        b"abc",
+        "the exact chunk bytes are published after the request"
+    );
+    let (lower_rx, _) = sessions.fifo_pair(child).expect("lower RX fifo");
+    assert_eq!(
+        lower_rx.max_dequeue(),
+        0,
+        "the exact DATA bytes are dequeued only after the upper commit"
+    );
+    main.with_worker(DataWorkerId::new(0), |http| {
+        let context = http
+            .get_stream_for_session(stream, child)
+            .expect("live stream");
+        assert_eq!(
+            context.body,
+            BodyAccumulator::Complete,
+            "the body accumulator advanced past the published chunk"
+        );
+        Ok(())
+    })
+    .expect("worker introspection");
+}
+
+/// FIFO-capacity backpressure on a completed DATA frame is never retryable:
+/// the reader already accounted for the frame's bytes (`payload_len`
+/// advanced over the rejected chunk, request_frame_reader.rs:216-258), so a
+/// retry would re-feed reader-consumed bytes into the frame reader and
+/// re-publish duplicated body bytes (VPP never faces this: it checks the
+/// app FIFO before draining any transport bytes, http3.c:1211-1218). The
+/// request stream resets with HTTP3_ERROR_INTERNAL_ERROR, the
+/// reader-accounted bytes dequeue exactly once, and the body accumulator and
+/// upper FIFO stay unchanged.
+#[test]
+fn builtin_rx_data_capacity_resets_without_retry_or_duplicate() {
+    let (main, mut sessions, application, session_app) = test_harness();
+    let (parent, _parent_context) =
+        construct_parent(&main, &mut sessions, application, session_app, 1);
+    let child = construct_stream(&mut sessions, application, session_app, 2, parent, false);
+    accept_on(&main, &mut sessions, child, 0).expect("accept bidi request stream");
+    let stream = StreamContextId::from(Index::new(0, 1));
+
+    let frame = content_length_headers_frame(3);
+    let mut combined = frame.clone();
+    combined.extend_from_slice(&[0x00, 0x03, b'a', b'b', b'c']);
+    let (lower_rx, _) = sessions.fifo_pair(child).expect("lower RX fifo");
+    lower_rx.enqueue(&combined);
+    builtin_rx_on(&main, &mut sessions, child, u64::from(stream)).expect("the HEADERS publishes");
+    let upper = sessions
+        .upper_session(child)
+        .expect("upper request Session created");
+    let (upper_rx, _) = sessions.fifo_pair(upper).expect("upper RX fifo");
+    let published = upper_rx.max_dequeue();
+
+    // Fill the upper FIFO so the DATA frame cannot be published.
+    let filler = vec![0xabu8; upper_rx.max_enqueue()];
+    upper_rx.enqueue(&filler);
+    RESET_CALLS.with(|calls| calls.set(0));
+    RESET_CODE.with(|seen| seen.set(0));
+    builtin_rx_on(&main, &mut sessions, child, u64::from(stream))
+        .expect("capacity on a completed DATA frame resets the stream, not the publication");
+    RESET_CALLS.with(|calls| assert_eq!(calls.get(), 1, "the stream resets exactly once"));
+    RESET_CODE.with(|seen| {
+        assert_eq!(
+            seen.get(),
+            ErrorCode::InternalError.value(),
+            "reset with HTTP3_ERROR_INTERNAL_ERROR"
+        )
+    });
+    let (lower_rx, _) = sessions.fifo_pair(child).expect("lower RX fifo");
+    assert_eq!(
+        lower_rx.max_dequeue(),
+        0,
+        "the reader-accounted DATA bytes dequeue with the stream error, never retried"
+    );
+    let (upper_rx, _) = sessions.fifo_pair(upper).expect("upper RX fifo");
+    assert_eq!(
+        upper_rx.max_dequeue(),
+        filler.len() + published,
+        "no chunk was published into the full upper FIFO"
+    );
+    main.with_worker(DataWorkerId::new(0), |http| {
+        let context = http
+            .get_stream_for_session(stream, child)
+            .expect("live stream");
+        assert_eq!(
+            context.body,
+            BodyAccumulator::Receiving { remaining: 3 },
+            "the rejected publication does not mutate the body accumulator"
+        );
+        Ok(())
+    })
+    .expect("worker introspection");
+}
+
+/// FIFO-capacity backpressure on a fragmented (incomplete) DATA chunk is not
+/// retryable: the reader already advanced `payload_len` over the very bytes
+/// the upper FIFO rejected, so a retry would re-feed accounted bytes into the
+/// in-progress frame and corrupt the body (VPP never faces this: it checks
+/// the app FIFO before draining any transport bytes, http3.c:1211-1218). The
+/// request stream resets with HTTP3_ERROR_INTERNAL_ERROR, the
+/// reader-accounted bytes dequeue exactly once, and the body accumulator and
+/// upper FIFO stay unchanged.
+#[test]
+fn builtin_rx_fragmented_data_capacity_resets_without_corrupt_body_or_retry() {
+    let (main, mut sessions, application, session_app) = test_harness();
+    let (parent, _parent_context) =
+        construct_parent(&main, &mut sessions, application, session_app, 1);
+    let child = construct_stream(&mut sessions, application, session_app, 2, parent, false);
+    accept_on(&main, &mut sessions, child, 0).expect("accept bidi request stream");
+    let stream = StreamContextId::from(Index::new(0, 1));
+
+    // HEADERS declares a three-byte body and publishes, attaching the upper
+    // request Session.
+    let (lower_rx, _) = sessions.fifo_pair(child).expect("lower RX fifo");
+    lower_rx.enqueue(&content_length_headers_frame(3));
+    builtin_rx_on(&main, &mut sessions, child, u64::from(stream)).expect("the HEADERS publishes");
+    let upper = sessions
+        .upper_session(child)
+        .expect("upper request Session created");
+
+    // The first fragment of a three-byte DATA frame: "a" surfaces with
+    // completed=false and publishes while the upper FIFO still has room.
+    let (lower_rx, _) = sessions.fifo_pair(child).expect("lower RX fifo");
+    lower_rx.enqueue(&[0x00, 0x03, b'a']);
+    builtin_rx_on(&main, &mut sessions, child, u64::from(stream))
+        .expect("the first fragment publishes");
+    main.with_worker(DataWorkerId::new(0), |http| {
+        let context = http
+            .get_stream_for_session(stream, child)
+            .expect("live stream");
+        assert_eq!(
+            context.body,
+            BodyAccumulator::Receiving { remaining: 2 },
+            "the committed fragment advances the body"
+        );
+        Ok(())
+    })
+    .expect("worker introspection");
+
+    // The remaining "b" arrives while the upper FIFO is full: its publication
+    // is rejected with capacity on a completed=false chunk, which the reader
+    // cannot re-feed (its payload_len already advanced over the byte), so the
+    // request stream resets instead of retrying.
+    let (upper_rx, _) = sessions.fifo_pair(upper).expect("upper RX fifo");
+    let published = upper_rx.max_dequeue();
+    let filler = vec![0xabu8; upper_rx.max_enqueue()];
+    upper_rx.enqueue(&filler);
+    RESET_CALLS.with(|calls| calls.set(0));
+    RESET_CODE.with(|seen| seen.set(0));
+    let (lower_rx, _) = sessions.fifo_pair(child).expect("lower RX fifo");
+    lower_rx.enqueue(&[b'b']);
+    builtin_rx_on(&main, &mut sessions, child, u64::from(stream))
+        .expect("capacity on a fragmented chunk resets the stream, not the publication");
+
+    RESET_CALLS.with(|calls| assert_eq!(calls.get(), 1, "the stream resets exactly once"));
+    RESET_CODE.with(|seen| {
+        assert_eq!(
+            seen.get(),
+            ErrorCode::InternalError.value(),
+            "reset with HTTP3_ERROR_INTERNAL_ERROR"
+        )
+    });
+    let (lower_rx, _) = sessions.fifo_pair(child).expect("lower RX fifo");
+    assert_eq!(
+        lower_rx.max_dequeue(),
+        0,
+        "the reader-accounted byte dequeues with the stream error, never retried"
+    );
+    let (upper_rx, _) = sessions.fifo_pair(upper).expect("upper RX fifo");
+    assert_eq!(
+        upper_rx.max_dequeue(),
+        filler.len() + published,
+        "no fragment was published into the full upper FIFO"
+    );
+    main.with_worker(DataWorkerId::new(0), |http| {
+        let context = http
+            .get_stream_for_session(stream, child)
+            .expect("live stream");
+        assert_eq!(
+            context.body,
+            BodyAccumulator::Receiving { remaining: 2 },
+            "the rejected fragment does not mutate the body accumulator"
+        );
+        Ok(())
+    })
+    .expect("worker introspection");
+}
+
+/// A DATA frame on a request with no declared Content-Length is a typed
+/// stream protocol error, not a silent discard: the request stream is reset
+/// with FRAME_UNEXPECTED (RFC 9114 Section 4.1.2; the shared body
+/// accumulator maps `DataWithoutDeclaredLength` to `FrameUnexpected`), the
+/// reader-consumed bytes dequeue, and nothing is published.
+#[test]
+fn builtin_rx_bodyless_data_resets_stream_with_frame_unexpected() {
+    let (main, mut sessions, application, session_app) = test_harness();
+    let (parent, _parent_context) =
+        construct_parent(&main, &mut sessions, application, session_app, 1);
+    let child = construct_stream(&mut sessions, application, session_app, 2, parent, false);
+    accept_on(&main, &mut sessions, child, 0).expect("accept bidi request stream");
+    let stream = StreamContextId::from(Index::new(0, 1));
+
+    let mut combined = zero_body_headers_frame();
+    combined.extend_from_slice(&[0x00, 0x03, b'a', b'b', b'c']);
+    let (lower_rx, _) = sessions.fifo_pair(child).expect("lower RX fifo");
+    lower_rx.enqueue(&combined);
+
+    builtin_rx_on(&main, &mut sessions, child, u64::from(stream)).expect("the HEADERS publishes");
+    let upper = sessions
+        .upper_session(child)
+        .expect("upper request Session created");
+    let (upper_rx, _) = sessions.fifo_pair(upper).expect("upper RX fifo");
+    let published = upper_rx.max_dequeue();
+    RESET_CALLS.with(|calls| calls.set(0));
+    RESET_CODE.with(|seen| seen.set(0));
+    builtin_rx_on(&main, &mut sessions, child, u64::from(stream))
+        .expect("body-less DATA is a typed stream protocol error, not a publish error");
+    RESET_CALLS
+        .with(|calls| assert_eq!(calls.get(), 1, "the request stream is reset exactly once"));
+    RESET_CODE.with(|seen| {
+        assert_eq!(
+            seen.get(),
+            ErrorCode::FrameUnexpected.value(),
+            "body-less DATA is FRAME_UNEXPECTED"
+        );
+    });
+    let (upper_rx, _) = sessions.fifo_pair(upper).expect("upper RX fifo");
+    assert_eq!(upper_rx.max_dequeue(), published, "no DATA was published");
+    let (lower_rx, _) = sessions.fifo_pair(child).expect("lower RX fifo");
+    assert_eq!(
+        lower_rx.max_dequeue(),
+        0,
+        "the reader-consumed DATA bytes dequeue with the stream error"
     );
 }
 
@@ -1394,11 +2341,7 @@ fn pending_field_section_borrow_survives_retry_until_clear() {
         panic!("a complete HEADERS frame must surface its encoded field section");
     };
     worker
-        .retain_pending_field_section(
-            stream,
-            session,
-            PendingFieldSection { encoded, consumed },
-        )
+        .retain_pending_field_section(stream, session, PendingFieldSection { encoded, consumed })
         .expect("retain the completed field section");
 
     // The first publication attempt borrows the section.
@@ -1458,7 +2401,10 @@ fn pending_field_section_rejects_overflow_and_stale_identities() {
         .retain_pending_field_section(
             stream,
             session,
-            PendingFieldSection { encoded: first, consumed: first_consumed },
+            PendingFieldSection {
+                encoded: first,
+                consumed: first_consumed,
+            },
         )
         .expect("retain the initial field section");
 
@@ -1474,7 +2420,10 @@ fn pending_field_section_rejects_overflow_and_stale_identities() {
         .retain_pending_field_section(
             stream,
             session,
-            PendingFieldSection { encoded: trailer, consumed: trailer_consumed },
+            PendingFieldSection {
+                encoded: trailer,
+                consumed: trailer_consumed,
+            },
         )
         .expect_err("a pending section rejects a second retain");
     assert!(
@@ -1494,7 +2443,8 @@ fn pending_field_section_rejects_overflow_and_stale_identities() {
         .expect("live stream")
         .expect("the initial section is still pending");
     assert_eq!(
-        pending.encoded, b"hi".to_vec(),
+        pending.encoded,
+        b"hi".to_vec(),
         "the pending initial section survives the rejected retain"
     );
     assert_eq!(
@@ -1522,7 +2472,10 @@ fn pending_field_section_rejects_overflow_and_stale_identities() {
             .retain_pending_field_section(
                 stream,
                 session,
-                PendingFieldSection { encoded: b"zz".to_vec(), consumed: 2 },
+                PendingFieldSection {
+                    encoded: b"zz".to_vec(),
+                    consumed: 2
+                },
             )
             .is_err(),
         "stale stream identity cannot retain on the reused slot"
@@ -1560,7 +2513,10 @@ fn pending_field_section_clear_then_trailer_refills_emptied_slot() {
         .retain_pending_field_section(
             stream,
             session,
-            PendingFieldSection { encoded: first, consumed },
+            PendingFieldSection {
+                encoded: first,
+                consumed,
+            },
         )
         .expect("retain the initial field section");
     let pending = worker
@@ -1568,7 +2524,8 @@ fn pending_field_section_clear_then_trailer_refills_emptied_slot() {
         .expect("live stream")
         .expect("the initial section is pending");
     assert_eq!(
-        pending.encoded, b"hi".to_vec(),
+        pending.encoded,
+        b"hi".to_vec(),
         "the initial section is borrowed"
     );
     assert_eq!(
@@ -1596,7 +2553,10 @@ fn pending_field_section_clear_then_trailer_refills_emptied_slot() {
         .retain_pending_field_section(
             stream,
             session,
-            PendingFieldSection { encoded: trailer, consumed },
+            PendingFieldSection {
+                encoded: trailer,
+                consumed,
+            },
         )
         .expect("the emptied slot refills with the trailer");
     let pending = worker
@@ -1604,7 +2564,8 @@ fn pending_field_section_clear_then_trailer_refills_emptied_slot() {
         .expect("live stream")
         .expect("the trailer section is pending");
     assert_eq!(
-        pending.encoded, b"hx".to_vec(),
+        pending.encoded,
+        b"hx".to_vec(),
         "the refilled trailer section is borrowed"
     );
     assert_eq!(
@@ -1673,7 +2634,10 @@ fn pending_field_section_rejects_foreign_session_identities() {
         .retain_pending_field_section(
             stream,
             foreign,
-            PendingFieldSection { encoded: b"zz".to_vec(), consumed: 2 },
+            PendingFieldSection {
+                encoded: b"zz".to_vec(),
+                consumed: 2,
+            },
         )
         .expect_err("retain with a foreign session must fail");
     assert!(
@@ -1698,7 +2662,10 @@ fn pending_field_section_rejects_foreign_session_identities() {
         .retain_pending_field_section(
             stream,
             session,
-            PendingFieldSection { encoded: b"hi".to_vec(), consumed: 2 },
+            PendingFieldSection {
+                encoded: b"hi".to_vec(),
+                consumed: 2,
+            },
         )
         .expect("retain with the bound session still works");
     let pending = worker
@@ -1706,7 +2673,8 @@ fn pending_field_section_rejects_foreign_session_identities() {
         .expect("live stream")
         .expect("the bound session's section is pending");
     assert_eq!(
-        pending.encoded, b"hi".to_vec(),
+        pending.encoded,
+        b"hi".to_vec(),
         "the bound session retains and borrows normally"
     );
     assert_eq!(
@@ -1741,7 +2709,10 @@ fn release_request_stream_frees_reader_and_pending_slot() {
         .retain_pending_field_section(
             stream,
             session,
-            PendingFieldSection { encoded: b"hi".to_vec(), consumed: 2 },
+            PendingFieldSection {
+                encoded: b"hi".to_vec(),
+                consumed: 2,
+            },
         )
         .expect("retain the completed field section");
     assert!(
@@ -1804,7 +2775,10 @@ fn release_request_stream_stale_identity_cannot_touch_reused_slot() {
         .retain_pending_field_section(
             first,
             session,
-            PendingFieldSection { encoded: b"hi".to_vec(), consumed: 2 },
+            PendingFieldSection {
+                encoded: b"hi".to_vec(),
+                consumed: 2,
+            },
         )
         .expect("retain a section on the first stream");
     worker
@@ -1822,7 +2796,10 @@ fn release_request_stream_stale_identity_cannot_touch_reused_slot() {
         .retain_pending_field_section(
             second,
             session,
-            PendingFieldSection { encoded: b"hx".to_vec(), consumed: 2 },
+            PendingFieldSection {
+                encoded: b"hx".to_vec(),
+                consumed: 2,
+            },
         )
         .expect("retain a section on the fresh stream");
 
@@ -1849,7 +2826,8 @@ fn release_request_stream_stale_identity_cannot_touch_reused_slot() {
         .expect("live stream")
         .expect("the fresh stream still owns its pending section");
     assert_eq!(
-        pending.encoded, b"hx".to_vec(),
+        pending.encoded,
+        b"hx".to_vec(),
         "the fresh stream still owns its pending section"
     );
     assert_eq!(
@@ -2250,7 +3228,12 @@ fn remove_upper_session_rolls_back_upper_and_repeats_as_noop() {
 #[test]
 fn http_app_error_from_request_publish_error() {
     let error = HttpAppError::from(RequestPublishError::MessageError);
-    assert_eq!(error, HttpAppError::RequestPublish { error: RequestPublishError::MessageError });
+    assert_eq!(
+        error,
+        HttpAppError::RequestPublish {
+            error: RequestPublishError::MessageError
+        }
+    );
     let runtime = RuntimeError::from(error);
     assert!(matches!(runtime, RuntimeError::Subsystem { subsystem, .. } if subsystem == "http"));
 }
@@ -2281,11 +3264,21 @@ fn request_stream_cleanup_fin_complete_removes_upper_and_releases_request() {
         .expect("bidi FIN completes the request");
 
     assert!(!sessions.has_session(upper), "the upper Session is removed");
-    assert!(sessions.has_session(child), "the lower stream Session survives");
-    assert!(sessions.has_session(parent), "the parent connection Session survives");
+    assert!(
+        sessions.has_session(child),
+        "the lower stream Session survives"
+    );
+    assert!(
+        sessions.has_session(parent),
+        "the parent connection Session survives"
+    );
     main.with_worker(DataWorkerId::new(0), |http| {
         assert_eq!(http.len(), 1, "the parent connection context remains");
-        assert_eq!(http.stream_len(), 0, "the request stream context is released");
+        assert_eq!(
+            http.stream_len(),
+            0,
+            "the request stream context is released"
+        );
         assert!(
             http.get(parent_context).is_ok(),
             "the parent connection context is still live"
@@ -2323,9 +3316,11 @@ fn request_stream_cleanup_fin_incomplete_keeps_stream_and_upper_live() {
         http.process_request_data(stream, child, &fifo, b"12")
             .map_err(|error| match error {
                 RequestReadError::Worker(inner) => RuntimeError::from(inner),
-                RequestReadError::Protocol(error) => RuntimeError::from(
-                    HttpAppError::RequestFinishProtocol { code: error.error_code() },
-                ),
+                RequestReadError::Protocol(error) => {
+                    RuntimeError::from(HttpAppError::RequestFinishProtocol {
+                        code: error.error_code(),
+                    })
+                }
             })
     })
     .expect("feed the first half of the declared body");
@@ -2336,14 +3331,22 @@ fn request_stream_cleanup_fin_incomplete_keeps_stream_and_upper_live() {
     assert!(
         matches!(
             http_app_error(&error),
-            HttpAppError::RequestFinishProtocol { code: ErrorCode::RequestIncomplete }
+            HttpAppError::RequestFinishProtocol {
+                code: ErrorCode::RequestIncomplete
+            }
         ),
         "typed incomplete-request error expected, got {error:?}"
     );
 
     assert!(sessions.has_session(upper), "the upper Session stays live");
-    assert!(sessions.has_session(child), "the lower stream Session stays live");
-    assert!(sessions.has_session(parent), "the parent connection Session stays live");
+    assert!(
+        sessions.has_session(child),
+        "the lower stream Session stays live"
+    );
+    assert!(
+        sessions.has_session(parent),
+        "the parent connection Session stays live"
+    );
     CLOSE_CALLS.with(|calls| assert_eq!(calls.get(), 0, "no connection close"));
     main.with_worker(DataWorkerId::new(0), |http| {
         assert_eq!(http.len(), 1, "the parent connection context remains");
@@ -2386,13 +3389,23 @@ fn request_stream_cleanup_reset_removes_upper_without_transport_actions() {
         .expect("bidi RESET releases the request");
 
     assert!(!sessions.has_session(upper), "the upper Session is removed");
-    assert!(sessions.has_session(child), "the lower stream Session survives");
-    assert!(sessions.has_session(parent), "the parent connection Session survives");
+    assert!(
+        sessions.has_session(child),
+        "the lower stream Session survives"
+    );
+    assert!(
+        sessions.has_session(parent),
+        "the parent connection Session survives"
+    );
     CLOSE_CALLS.with(|calls| assert_eq!(calls.get(), 0, "no connection close"));
     RESET_CALLS.with(|calls| assert_eq!(calls.get(), 0, "no stream reset"));
     main.with_worker(DataWorkerId::new(0), |http| {
         assert_eq!(http.len(), 1, "the parent connection context remains");
-        assert_eq!(http.stream_len(), 0, "the request stream context is released");
+        assert_eq!(
+            http.stream_len(),
+            0,
+            "the request stream context is released"
+        );
         Ok(())
     })
     .expect("worker accessible on the test thread");
@@ -2400,17 +3413,23 @@ fn request_stream_cleanup_reset_removes_upper_without_transport_actions() {
 
 #[test]
 fn request_error_action_capacity_retries() {
-    let action = request_publish_error_action(RequestPublishError::Publish(PublishError::Capacity {
-        requested: 8,
-        available: 2,
-    }));
+    let action =
+        request_publish_error_action(RequestPublishError::Publish(PublishError::Capacity {
+            requested: 8,
+            available: 2,
+        }));
     assert_eq!(action, RequestErrorAction::Retry);
 }
 
 #[test]
 fn request_error_action_message_error_resets_stream() {
     let action = request_publish_error_action(RequestPublishError::MessageError);
-    assert_eq!(action, RequestErrorAction::ResetStream { code: ErrorCode::MessageError });
+    assert_eq!(
+        action,
+        RequestErrorAction::ResetStream {
+            code: ErrorCode::MessageError
+        }
+    );
 }
 
 #[test]
@@ -2418,14 +3437,21 @@ fn request_error_action_general_protocol_error_resets_stream() {
     let action = request_publish_error_action(RequestPublishError::GeneralProtocolError);
     assert_eq!(
         action,
-        RequestErrorAction::ResetStream { code: ErrorCode::GeneralProtocolError }
+        RequestErrorAction::ResetStream {
+            code: ErrorCode::GeneralProtocolError
+        }
     );
 }
 
 #[test]
 fn request_error_action_internal_error_resets_stream() {
     let action = request_publish_error_action(RequestPublishError::InternalError);
-    assert_eq!(action, RequestErrorAction::ResetStream { code: ErrorCode::InternalError });
+    assert_eq!(
+        action,
+        RequestErrorAction::ResetStream {
+            code: ErrorCode::InternalError
+        }
+    );
 }
 
 #[test]
@@ -2433,7 +3459,9 @@ fn request_error_action_qpack_decompression_failed_closes_connection() {
     let action = request_publish_error_action(RequestPublishError::QpackDecompressionFailed);
     assert_eq!(
         action,
-        RequestErrorAction::CloseConnection { code: ErrorCode::QpackDecompressionFailed }
+        RequestErrorAction::CloseConnection {
+            code: ErrorCode::QpackDecompressionFailed
+        }
     );
 }
 
@@ -2442,21 +3470,39 @@ fn request_error_action_publish_encode_resets_stream() {
     let action = request_publish_error_action(RequestPublishError::Publish(PublishError::Encode(
         EncodeError::LengthOverflow,
     )));
-    assert_eq!(action, RequestErrorAction::ResetStream { code: ErrorCode::InternalError });
+    assert_eq!(
+        action,
+        RequestErrorAction::ResetStream {
+            code: ErrorCode::InternalError
+        }
+    );
 }
 
 #[test]
 fn request_error_action_publish_fifo_resets_stream() {
     let action = request_publish_error_action(RequestPublishError::Publish(PublishError::Fifo(
-        FifoError::CommitExceedsReservation { initialized: 0, reserved: 8 },
+        FifoError::CommitExceedsReservation {
+            initialized: 0,
+            reserved: 8,
+        },
     )));
-    assert_eq!(action, RequestErrorAction::ResetStream { code: ErrorCode::InternalError });
+    assert_eq!(
+        action,
+        RequestErrorAction::ResetStream {
+            code: ErrorCode::InternalError
+        }
+    );
 }
 
 #[test]
 fn request_frame_protocol_from_phase_frame_unexpected() {
     let error = HttpAppError::from(RequestFrameError::Phase(ErrorCode::FrameUnexpected));
-    assert_eq!(error, HttpAppError::RequestFrameProtocol { code: ErrorCode::FrameUnexpected });
+    assert_eq!(
+        error,
+        HttpAppError::RequestFrameProtocol {
+            code: ErrorCode::FrameUnexpected
+        }
+    );
     let runtime = RuntimeError::from(error);
     assert!(matches!(runtime, RuntimeError::Subsystem { subsystem, .. } if subsystem == "http"));
 }
