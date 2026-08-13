@@ -2508,6 +2508,14 @@ impl<Index: Copy + Eq> SessionWorker<Index> {
             .and_then(|entry| entry.parent_session)
     }
 
+    /// Returns the lower transport Session bound to an upper Session.
+    #[inline]
+    pub fn lower_session(&self, upper: SessionId) -> Option<SessionId> {
+        self.entries
+            .get(upper.pool_index())
+            .and_then(|entry| entry.lower_session)
+    }
+
     /// Records the transport parent of a stream Session. Mirrors VPP
     /// `session_alloc_for_stream` (session.c:507-523) rejecting a child
     /// whose parent handle is invalid. O(1).
@@ -7677,6 +7685,43 @@ mod tests {
             None,
             "direct upper transport removal clears the reverse link"
         );
+    }
+
+    #[test]
+    fn lower_session_returns_generation_checked_forward_link() {
+        let applications = ApplicationMain::new(4);
+        let application = applications.attach().expect("attach Application");
+        let mut sessions = SessionWorker::<Index>::new(
+            DataWorkerId::new(0),
+            1,
+            AppSessionConfig::default(),
+            DEFAULT_SESSION_POOL_CAPACITY,
+            applications,
+            None,
+        )
+        .expect("Session worker");
+        sessions
+            .install_application_mq_for_test(application)
+            .expect("install test Application MQ");
+        let lower = sessions
+            .construct_stream_sessions(
+                SessionTransportId::new(1),
+                Index::new(1, 1),
+                1,
+                application,
+                Some(hammer_runtime::app::SessionAppId::new(0)),
+                None,
+                None,
+                false,
+            )
+            .expect("construct lower Session App session");
+        let upper = sessions
+            .create_upper_session(lower, 0x55)
+            .expect("publish upper Session from callback");
+        assert_eq!(sessions.lower_session(upper), Some(lower));
+        assert_eq!(sessions.lower_session(lower), None);
+        sessions.remove_session(upper).expect("remove upper Session");
+        assert_eq!(sessions.lower_session(upper), None);
     }
 
     #[test]
