@@ -243,6 +243,17 @@ pub(crate) struct StreamContext {
     /// uni streams never install or feed a body and keep the `NoBody`
     /// default.
     pub(crate) body: BodyAccumulator,
+    /// The app-visible request is terminated and must never be recreated:
+    /// after a `ResetStreamAbortRequest` removed the upper request Session,
+    /// the stream context stays live so the peer's remaining RX bytes drain
+    /// dequeue-only, and a trailing frame — e.g. a trailer HEADERS the
+    /// reader's ordering phase accepts (RFC 9114 Section 4.1) — must not
+    /// re-enter the ready path and recreate the upper. Mirrors VPP marking
+    /// the request terminated and app-closed (`http3_stream_terminate`,
+    /// http3.c:140-149): the transport stream resets and the app is never
+    /// re-dispatched. Peer uni streams never abort and keep the `false`
+    /// default.
+    pub(crate) aborted: bool,
 }
 
 /// A completed HEADERS field section retained for publication: the encoded
@@ -928,6 +939,7 @@ impl HttpWorker {
                 request_reader: None,
                 pending_field_section: None,
                 body: BodyAccumulator::from(None),
+                aborted: false,
             })
             .map(StreamContextId::from)
             .ok_or(HttpWorkerError::StreamCapacityExhausted {
@@ -1358,6 +1370,47 @@ impl HttpWorker {
         Ok(())
     }
 
+    /// Marks a bidirectional request stream aborted: its app-visible request
+    /// ended with the upper request Session removed, but the stream context
+    /// stays live so the peer's remaining RX bytes drain dequeue-only, and a
+    /// trailing frame must never re-enter the ready path and recreate the
+    /// upper. Mirrors VPP setting the terminated/app-closed request state
+    /// (`http3_stream_terminate`, http3.c:140-149): the transport stream
+    /// resets and the app is never re-dispatched.
+    ///
+    /// Generation/session-checks the stream and rejects non-bidi streams
+    /// with `RequestStreamNotBidi`; every failure path mutates nothing.
+    /// O(1): one generation-checked lookup and write, no lock or allocation.
+    pub(crate) fn abort_request_stream(
+        &mut self,
+        stream: StreamContextId,
+        session: SessionId,
+    ) -> Result<(), HttpWorkerError> {
+        let mut stream_context = *self
+            .streams
+            .get(stream.into())
+            .ok_or(HttpWorkerError::StreamMissing { stream })?;
+        if stream_context.session != session {
+            return Err(HttpWorkerError::StreamSessionMismatch {
+                stream,
+                expected: session,
+                actual: stream_context.session,
+            });
+        }
+        if stream_context.direction != SessionStreamDirection::Bidi {
+            return Err(HttpWorkerError::RequestStreamNotBidi {
+                stream,
+                direction: stream_context.direction,
+            });
+        }
+        stream_context.aborted = true;
+        *self
+            .streams
+            .get_mut(stream.into())
+            .ok_or(HttpWorkerError::StreamMissing { stream })? = stream_context;
+        Ok(())
+    }
+
     /// Publishes one borrowed DATA `chunk` of a bidirectional request stream
     /// to the upper Session FIFO, all-or-nothing.
     ///
@@ -1687,6 +1740,7 @@ impl HttpWorker {
         }
         if let Some(connection) = self.contexts.get_mut(removed.parent.into()) {
             if connection.peer_control == Some(stream) {
+                connection.peer_control = None;
                 if let Some(reader) = connection.peer_control_reader.take() {
                     self.readers.remove(reader);
                 }

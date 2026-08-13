@@ -160,11 +160,19 @@ impl From<RequestFrameError> for HttpAppError {
 /// decompression failure is a connection error that closes the connection,
 /// message/protocol/internal errors are stream errors that reset the
 /// request stream, and FIFO capacity exhaustion is transient backpressure
-/// the caller retries.
+/// the caller retries. A DATA publication failure the reader already
+/// advanced over is never retryable and aborts the app-visible request
+/// (`ResetStreamAbortRequest`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum RequestErrorAction {
     CloseConnection { code: ErrorCode },
     ResetStream { code: ErrorCode },
+    /// A DATA publication failure the reader already advanced over: resets
+    /// the request stream with the typed code and aborts the app-visible
+    /// request by removing its upper Session — VPP `http3_stream_terminate`
+    /// notifies the app (`session_transport_reset_notify`, session.c:1165-1180)
+    /// before resetting the transport stream (http3.c:140-149).
+    ResetStreamAbortRequest { code: ErrorCode },
     Retry,
 }
 
@@ -195,10 +203,13 @@ pub(crate) fn request_publish_error_action(error: RequestPublishError) -> Reques
 /// the FIFO borrows of `builtin_rx_on` end (VPP's stream-vs-connection error
 /// split, http3.c:1107-1113: "message error is only stream error, otherwise
 /// connection error"): a connection error closes the lower connection, a
-/// stream error resets the request stream, and capacity backpressure is a
-/// no-op the caller already handled.
+/// stream error resets the request stream, capacity backpressure is a
+/// no-op the caller already handled, and a DATA publication failure also
+/// aborts the app-visible request.
 fn execute_request_error_action(
+    main: &HttpMain,
     worker: &mut SessionWorker<Index>,
+    stream: StreamContextId,
     session: SessionId,
     action: RequestErrorAction,
 ) -> RuntimeResult<()> {
@@ -213,6 +224,35 @@ fn execute_request_error_action(
         RequestErrorAction::ResetStream { code } => worker
             .reset_stream(session, SessionApplicationErrorCode::from(code.value()))
             .map_err(RuntimeError::from),
+        RequestErrorAction::ResetStreamAbortRequest { code } => {
+            // VPP `http3_stream_terminate` (http3.c:140-149) notifies the
+            // app before resetting the transport stream
+            // (`session_transport_reset_notify`, session.c:1165-1180): the
+            // app-visible request ends first — the same upper removal the
+            // FIN and peer-RESET seams use (`disconnect_on`/`reset_on`) —
+            // then the lower request stream resets. The request stream
+            // context is deliberately left live so the peer's remaining RX
+            // bytes keep draining through the worker (the removed upper
+            // makes those feeds dequeue-only); the `cleanup` callback
+            // releases the context when the lower Session is removed.
+            if let Some(upper) = worker.upper_session(session) {
+                worker.remove_upper_session(upper)?;
+            }
+            // Mark the retained stream aborted before the transport reset,
+            // so a later RX callback drains the peer's remaining bytes
+            // without re-entering the ready path: a trailing HEADERS (a
+            // legal trailer in the reader's ordering phase, RFC 9114
+            // Section 4.1) must not recreate the upper request Session
+            // (VPP never re-dispatches to the app after terminating the
+            // request, http3.c:140-149).
+            main.with_worker(worker.worker(), |http| {
+                http.abort_request_stream(stream, session)
+                    .map_err(RuntimeError::from)
+            })?;
+            worker
+                .reset_stream(session, SessionApplicationErrorCode::from(code.value()))
+                .map_err(RuntimeError::from)
+        }
         RequestErrorAction::Retry => Ok(()),
     }
 }
@@ -401,7 +441,10 @@ fn accept_stream(
 /// finished (`validate_request_finish`), the upper request Session is
 /// removed, and the request stream context is released, in VPP
 /// `http3_stream_cleanup_callback`'s delete-notify-then-free order
-/// (http3.c:2459-2462). The
+/// (http3.c:2459-2462). A request stream a `ResetStreamAbortRequest` already
+/// terminated (drain-only) skips the finish validation — VPP never re-runs
+/// the request-incomplete check on an app-closed/terminated request
+/// (http3.c:2312-2319) — but still releases the live context. The
 /// root connection's own Disconnected callback is a clean no-op: only a
 /// stream child carries `SessionFlags::STREAM` in its accept metadata, and
 /// the root's published `ConnectionContextId` shares the packed
@@ -454,11 +497,11 @@ pub(crate) fn disconnect_on(
         return Ok(());
     }
     let stream = StreamContextId::from(context);
-    let direction = main.with_worker(worker.worker(), |http| {
+    let (direction, aborted) = main.with_worker(worker.worker(), |http| {
         let stream_context = http
             .get_stream_for_session(stream, session)
             .map_err(RuntimeError::from)?;
-        Ok(stream_context.direction)
+        Ok((stream_context.direction, stream_context.aborted))
     })?;
     if direction != SessionStreamDirection::Uni {
         // Bidi/request FIN completes the request: the declared body must be
@@ -469,17 +512,31 @@ pub(crate) fn disconnect_on(
         // delete-notify-then-free order (http3.c:2459-2462). The upper
         // removal happens outside the worker borrow, so its typed error
         // aborts the cleanup before the stream is released.
-        main.with_worker(worker.worker(), |http| {
-            http.validate_request_finish(stream, session)
-                .map_err(|error| match error {
-                    RequestReadError::Worker(inner) => RuntimeError::from(inner),
-                    RequestReadError::Protocol(error) => {
-                        RuntimeError::from(HttpAppError::RequestFinishProtocol {
-                            code: error.error_code(),
-                        })
-                    }
-                })
-        })?;
+        //
+        // A request stream a `ResetStreamAbortRequest` terminated is
+        // drain-only — its app-visible request already ended with the upper
+        // removed (`http3_stream_terminate` notified the app and reset the
+        // transport stream, http3.c:140-149) — so its FIN must not
+        // revalidate the half-received body: VPP never re-runs the
+        // request-incomplete check on an app-closed/terminated request
+        // (`http3_transport_stream_close_callback` fires it only while
+        // `req_state < HTTP_REQ_STATE_WAIT_APP_REPLY`, i.e. before the
+        // completed request was dispatched to the app, http3.c:2312-2319).
+        // The upper removal is a no-op and the live lower stream context is
+        // still released in the same order.
+        if !aborted {
+            main.with_worker(worker.worker(), |http| {
+                http.validate_request_finish(stream, session)
+                    .map_err(|error| match error {
+                        RequestReadError::Worker(inner) => RuntimeError::from(inner),
+                        RequestReadError::Protocol(error) => {
+                            RuntimeError::from(HttpAppError::RequestFinishProtocol {
+                                code: error.error_code(),
+                            })
+                        }
+                    })
+            })?;
+        }
         if let Some(upper) = worker.upper_session(session) {
             worker.remove_upper_session(upper)?;
         }
@@ -545,7 +602,13 @@ pub(crate) fn disconnect_on(
 /// the request stream context is released with no finish validation, no
 /// connection close, and no stream reset — VPP
 /// `http3_transport_stream_reset_callback` checks only unidirectional-ness.
-/// For a peer uni stream the committed
+/// A root connection RESET — dispatched by the lower transport when the
+/// peer resets the whole connection, on every connection close — and a
+/// Session with no live role metadata are clean no-ops: VPP
+/// `http_ts_reset_callback` marks the connection closed and disconnects the
+/// transport (http.c:851-869), and the root context removal is owned by the
+/// cleanup callback when the SessionWorker removes the root entry. For a
+/// peer uni stream the committed
 /// `HttpWorker::classify_peer_uni_stream_reset` copies the stream/parent/
 /// session identities plus the constant `ClosedCriticalStream` error code
 /// (0x0104), mutating nothing, and the parent connection is then closed
@@ -553,10 +616,14 @@ pub(crate) fn disconnect_on(
 /// app-close guard (`on_app_close_dispatch`) makes repeated dispatch a
 /// no-op, so no stream reset is sent and no HTTP worker state is mutated or
 /// cleaned up here (VPP dispatches the connection error before any stream
-/// cleanup). Errors from the metadata check, the classification, and the
-/// transport action propagate typed through the existing `RuntimeError`
-/// conversion. The whole path is O(1) with no scan, allocation, lock,
-/// channel, or async work.
+/// cleanup). A stream context the reset or a sibling seam already released
+/// is a clean no-op, mirroring `cleanup_on`'s tolerance of the
+/// already-released identity: VPP's reset path frees nothing either
+/// (http3.c:2336-2361), so Hammer's eagerly-releasing seams never see
+/// released state. Errors from the stream resolution, the classification,
+/// and the transport action propagate typed through the existing
+/// `RuntimeError` conversion. The whole path is O(1) with no scan,
+/// allocation, lock, channel, or async work.
 pub(crate) fn reset(
     worker: &mut SessionWorker<Index>,
     session: SessionId,
@@ -566,6 +633,29 @@ pub(crate) fn reset(
         .get()
         .ok_or(RuntimeError::PluginStateNotInitialized { plugin: NAME })?;
     reset_on(&main, worker, session, context)
+}
+
+/// Resolves the live direction of `stream` bound to `session` for the reset
+/// and cleanup seams, tolerating an identity a sibling seam already released:
+/// `Ok(None)` means the stream is gone and the caller no-ops. VPP's reset
+/// path frees nothing either (http3.c:2336-2361), so its callbacks always
+/// find live request state; Hammer's seams release eagerly, so a repeated
+/// seam tolerates the released identity. All other resolution errors stay
+/// typed.
+fn stream_direction(
+    main: &HttpMain,
+    worker: &mut SessionWorker<Index>,
+    stream: StreamContextId,
+    session: SessionId,
+) -> RuntimeResult<Option<SessionStreamDirection>> {
+    main.with_worker(worker.worker(), |http| {
+        http.get_stream_for_session(stream, session)
+            .map(|stream_context| Some(stream_context.direction))
+            .or_else(|error| match error {
+                HttpWorkerError::StreamMissing { .. } => Ok(None),
+                error => Err(RuntimeError::from(error)),
+            })
+    })
 }
 
 /// `reset` on a caller-resolved authority, so unit tests own their `HttpMain`
@@ -583,13 +673,26 @@ pub(crate) fn reset_on(
         // and destroy fallbacks.
         return Ok(());
     }
+    // The accept metadata distinguishes the roles exactly as `disconnect`
+    // does (VPP `http_ts_accept_callback` branches on `SESSION_F_STREAM`,
+    // http.c:733-740): only a stream child carries `SessionFlags::STREAM`,
+    // so a root connection RESET — and a Session with no live metadata —
+    // is a clean no-op. The root context removal is owned by the cleanup
+    // callback when the SessionWorker removes the root entry, matching VPP
+    // `http_ts_reset_callback` marking the connection closed and
+    // disconnecting the transport (http.c:851-869).
+    let Some(metadata) = worker.accept_metadata(session) else {
+        return Ok(());
+    };
+    if !metadata.flags.contains(SessionFlags::STREAM) {
+        return Ok(());
+    }
     let stream = StreamContextId::from(context);
-    let direction = main.with_worker(worker.worker(), |http| {
-        let stream_context = http
-            .get_stream_for_session(stream, session)
-            .map_err(RuntimeError::from)?;
-        Ok(stream_context.direction)
-    })?;
+    // An identity a sibling seam (cleanup, disconnect) already released is a
+    // no-op (`stream_direction`); all other resolution errors stay typed.
+    let Some(direction) = stream_direction(main, worker, stream, session)? else {
+        return Ok(());
+    };
     if direction != SessionStreamDirection::Uni {
         // Bidi/request RESET aborts the request: no finish validation, the
         // upper request Session is removed, and the request stream context
@@ -599,16 +702,23 @@ pub(crate) fn reset_on(
         if let Some(upper) = worker.upper_session(session) {
             worker.remove_upper_session(upper)?;
         }
-        main.with_worker(worker.worker(), |http| {
-            http.release_request_stream(stream, session)
-                .map_err(RuntimeError::from)
+        main.with_worker(worker.worker(), |http| match http.release_request_stream(stream, session) {
+            Ok(()) => Ok(()),
+            // The release is the generation-checked ownership boundary; an
+            // already-released identity stays a no-op.
+            Err(HttpWorkerError::StreamMissing { .. }) => Ok(()),
+            Err(error) => Err(RuntimeError::from(error)),
         })?;
         return Ok(());
     }
     main.with_worker(worker.worker(), |http| {
-        let reset = http
-            .classify_peer_uni_stream_reset(stream)
-            .map_err(RuntimeError::from)?;
+        let reset = match http.classify_peer_uni_stream_reset(stream) {
+            Ok(reset) => reset,
+            // An already-released identity means the first reset already
+            // dispatched the close; the repeated reset is a no-op.
+            Err(HttpWorkerError::StreamMissing { .. }) => return Ok(()),
+            Err(error) => return Err(RuntimeError::from(error)),
+        };
         worker
             .close_connection(
                 reset.session,
@@ -635,10 +745,15 @@ pub(crate) fn reset_on(
 /// `http3_stream_cleanup_callback` (http3.c:2440-2462); the Session entry
 /// itself is freed by the SessionWorker after the callback. An upper request
 /// Session (identified by its owner link, since it shares the packed stream
-/// context of its lower), a uni stream (VPP owns no request state for it,
-/// http3.c:2446-2448), and a Session without live role metadata are no-ops.
-/// The whole path is O(1) with no scan, allocation, lock, channel, or async
-/// work.
+/// context of its lower), a Session without live role metadata, and a stream
+/// context the reset or disconnect seam already released are no-ops
+/// (VPP's reset path frees nothing either, http3.c:2336-2361, so its
+/// cleanup always finds live request state; Hammer's seams release eagerly,
+/// so cleanup tolerates the already-released identity). A live peer uni
+/// stream context is released, mirroring `http3_stream_cleanup_callback`
+/// freeing the uni stream's request state at cleanup (http3.c:2440-2462,
+/// falling through to `http3_stream_free_req`, http3.c:59-78). The whole
+/// path is O(1) with no scan, allocation, lock, channel, or async work.
 pub(crate) fn cleanup(
     worker: &mut SessionWorker<Index>,
     session: SessionId,
@@ -681,30 +796,44 @@ pub(crate) fn cleanup_on(
         return Ok(());
     };
     if metadata.flags.contains(SessionFlags::STREAM) {
-        // VPP `http3_stream_cleanup_callback` (http3.c:2440-2462): a bidi
-        // request stream's cleanup removes the upper request Session first
-        // (`session_transport_delete_notify`, http3.c:2459-2462) and then
-        // releases the request stream context, in delete-notify-then-free
-        // order. A uni stream owns no request state
-        // (`http_req_index == SESSION_INVALID_INDEX`, http3.c:2446-2448),
-        // so it returns early here; the peer uni stream seams own uni stream
-        // context release.
+        // VPP `http3_stream_cleanup_callback` (http3.c:2440-2462) runs when
+        // the SessionWorker removes the stream entry, after any reset or
+        // disconnect seam has already aborted or finished the stream; the
+        // stream context may therefore already be released, which
+        // `stream_direction` tolerates as a no-op.
         let stream = StreamContextId::from(context);
-        let direction = main.with_worker(worker.worker(), |http| {
-            let stream_context = http
-                .get_stream_for_session(stream, session)
-                .map_err(RuntimeError::from)?;
-            Ok(stream_context.direction)
-        })?;
-        if direction != SessionStreamDirection::Uni {
-            if let Some(upper) = worker.upper_session(session) {
-                worker.remove_upper_session(upper)?;
-            }
+        let Some(direction) = stream_direction(main, worker, stream, session)? else {
+            return Ok(());
+        };
+        if direction == SessionStreamDirection::Uni {
+            // A live peer uni stream context is released at cleanup,
+            // mirroring `http3_stream_cleanup_callback` freeing the uni
+            // stream's request state (http3.c:2440-2462, falling through to
+            // `http3_stream_free_req`, http3.c:59-78): the same
+            // `remove_stream` ownership path the FIN seam uses, which frees
+            // the SETTINGS reader when this stream was the registered peer
+            // control stream. An identity the FIN seam already released is
+            // a no-op.
             main.with_worker(worker.worker(), |http| {
-                http.release_request_stream(stream, session)
-                    .map_err(RuntimeError::from)
+                match http.remove_stream(stream) {
+                    Ok(()) => Ok(()),
+                    Err(HttpWorkerError::StreamMissing { .. }) => Ok(()),
+                    Err(error) => Err(RuntimeError::from(error)),
+                }
             })?;
+            return Ok(());
         }
+        // A bidi request stream's cleanup removes the upper request Session
+        // first (`session_transport_delete_notify`, http3.c:2459-2462) and
+        // then releases the request stream context, in delete-notify-then-
+        // free order.
+        if let Some(upper) = worker.upper_session(session) {
+            worker.remove_upper_session(upper)?;
+        }
+        main.with_worker(worker.worker(), |http| {
+            http.release_request_stream(stream, session)
+                .map_err(RuntimeError::from)
+        })?;
         return Ok(());
     }
     // Root connection cleanup, mirroring VPP `http3_conn_cleanup_callback`
@@ -818,6 +947,35 @@ pub(crate) fn builtin_rx_on(
     // FIFO before the feed borrows end, but the upper is created exactly
     // once at the first publication, never here.
     let upper = worker.upper_session(lower);
+    // A request stream a `ResetStreamAbortRequest` terminated is drain-only:
+    // its upper request Session was removed but the stream context stays
+    // live so the peer's remaining RX bytes keep dequeueing through the
+    // worker, mirroring VPP resetting the transport stream and never
+    // re-dispatching to the app (`http3_stream_terminate`, http3.c:140-149)
+    // plus the byte-drain of `http3_stream_transport_rx_drain`
+    // (http3.c:1571-1575). A trailing frame — e.g. a trailer HEADERS the
+    // reader's ordering phase accepts (RFC 9114 Section 4.1) — must not
+    // re-enter the ready path and recreate the upper. Only a stream with no
+    // attached upper can be aborted (the abort removed it), so live streams
+    // pay no extra lookup.
+    if upper.is_none()
+        && main.with_worker(worker.worker(), |http| {
+            http.get_stream_for_session(stream, lower)
+                .map(|stream_context| stream_context.aborted)
+                .map_err(RuntimeError::from)
+        })?
+    {
+        // Drain every readable lower byte without feeding the request
+        // reader: no HEADERS publication, no upper re-creation, no stream
+        // reset.
+        let (lower_rx, _) = worker
+            .fifo_pair(lower)
+            .ok_or(SessionError::SessionMissing { session_id: lower })?;
+        let consumed = lower_rx.max_dequeue();
+        lower_rx.dequeue_drop(consumed);
+        worker.publish_rx_dequeue(lower, consumed)?;
+        return Ok(());
+    }
     // The feed phase is worker-local: it borrows the readable lower bytes
     // and reports whether a completed HEADERS section is ready for
     // publication, the lower bytes the reader consumed, the bytes published
@@ -914,9 +1072,11 @@ pub(crate) fn builtin_rx_on(
                                 // all-or-nothing, and the lower dequeue
                                 // happens only after it.
                                 let Some(upper_rx) = upper_rx else {
-                                    // Only reachable after a prior stream
-                                    // error (no upper was ever created): the
-                                    // stream is already dead, so the
+                                    // Reachable after a prior stream error
+                                    // (no upper was ever created) or after a
+                                    // prior DATA publication-failure
+                                    // teardown removed the upper: the stream
+                                    // is already dead, so the
                                     // reader-consumed bytes dequeue and
                                     // nothing publishes.
                                     continue;
@@ -925,38 +1085,52 @@ pub(crate) fn builtin_rx_on(
                                     Ok(()) => produced += chunk.len(),
                                     Err(RequestReadError::Worker(
                                         HttpWorkerError::BodyChunkPublishFailed {
-                                            error: PublishError::Capacity { .. },
+                                            error:
+                                                PublishError::Capacity { .. }
+                                                | PublishError::Fifo(_),
                                             ..
                                         },
                                     )) => {
-                                        // FIFO-capacity backpressure on a DATA
-                                        // publication is never retryable: the
-                                        // reader has already advanced over the
-                                        // rejected bytes (`payload_len` moved
-                                        // past them, request_frame_reader.rs),
-                                        // so a retry would re-feed
+                                        // A DATA publication failure is never
+                                        // retryable: the reader has already
+                                        // advanced over the rejected bytes
+                                        // (`payload_len` moved past them,
+                                        // request_frame_reader.rs), so a
+                                        // retry would re-feed
                                         // reader-consumed bytes into the
                                         // in-progress frame and re-publish
                                         // duplicated body bytes (VPP never
                                         // faces this: it checks the app FIFO
-                                        // before draining any transport bytes,
-                                        // http3.c:1211-1218). Terminate the
-                                        // request stream with
-                                        // HTTP3_ERROR_INTERNAL_ERROR instead:
-                                        // dequeue exactly the
-                                        // reader-accounted bytes, without
-                                        // mutating the body accumulator or
-                                        // the upper FIFO
-                                        // (process_request_data keeps the
-                                        // slot's accumulator at its pre-call
-                                        // state on rejection, worker.rs).
+                                        // before draining any transport
+                                        // bytes, http3.c:1211-1218, and only
+                                        // pauses). Capacity exhaustion and
+                                        // FIFO reservation/copy/commit
+                                        // rollback both leave the upper FIFO
+                                        // and the slot's body accumulator at
+                                        // their pre-call state
+                                        // (process_request_data persists the
+                                        // advance only after the commit,
+                                        // worker.rs), so both abort the
+                                        // request: the app-visible request
+                                        // ends (its upper Session is removed,
+                                        // VPP `http3_stream_terminate` →
+                                        // `session_transport_reset_notify`,
+                                        // http3.c:140-149,
+                                        // session.c:1165-1180) and the
+                                        // request stream resets with
+                                        // HTTP3_ERROR_INTERNAL_ERROR,
+                                        // dequeueing exactly the
+                                        // reader-accounted bytes without
+                                        // further body or FIFO mutation.
                                         return Ok(FeedOutcome {
                                             ready: false,
                                             consumed: total,
                                             produced,
-                                            action: Some(RequestErrorAction::ResetStream {
-                                                code: ErrorCode::InternalError,
-                                            }),
+                                            action: Some(
+                                                RequestErrorAction::ResetStreamAbortRequest {
+                                                    code: ErrorCode::InternalError,
+                                                },
+                                            ),
                                         });
                                     }
                                     Err(RequestReadError::Worker(inner)) => {
@@ -1044,13 +1218,15 @@ pub(crate) fn builtin_rx_on(
         outcome
     };
     // Request-stream errors (an empty HEADERS section, body-less or
-    // overrunning DATA, an invalid request-stream frame, or DATA capacity
-    // backpressure) reset the request stream with the typed error code (VPP
-    // `http3_stream_terminate`, http3.c:140-165): a stream error that never
-    // reaches the upper Session. The action executes only after the FIFO
-    // borrows end.
+    // overrunning DATA, an invalid request-stream frame) reset the request
+    // stream with the typed error code (VPP `http3_stream_terminate`,
+    // http3.c:140-165): a stream error that never reaches the upper
+    // Session. A DATA publication failure additionally aborts the
+    // app-visible request — its upper Session is removed — because the
+    // reader already advanced over the rejected bytes. The action executes
+    // only after the FIFO borrows end.
     if let Some(action) = outcome.action {
-        execute_request_error_action(worker, lower, action)?;
+        execute_request_error_action(main, worker, stream, lower, action)?;
     }
     if !outcome.ready {
         // No completed HEADERS section to publish — a partial frame, no
@@ -1141,7 +1317,7 @@ pub(crate) fn builtin_rx_on(
     // internal encoding) executes its stream- or connection-level action
     // here, after the FIFO borrows end; nothing is published or dequeued.
     if let Some(action) = action {
-        execute_request_error_action(worker, lower, action)?;
+        execute_request_error_action(main, worker, stream, lower, action)?;
         return Ok(());
     }
     // Dequeue exactly the consumed lower bytes after the upper commit, then
