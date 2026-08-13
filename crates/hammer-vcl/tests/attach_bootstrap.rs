@@ -465,3 +465,101 @@ fn attach_bootstrap_connects_through_real_server_and_publication() {
     drop(worker);
     let _ = std::fs::remove_file(path);
 }
+
+/// Generic active open through the real attach path: `session_connect`
+/// drives the real ordinary CONNECT control message carrying the
+/// create-time transport, local/remote endpoints, opaque, and the server
+/// name stored in the real ext-config chunk (VPP `vcl_send_session_connect`,
+/// vppcom.c:76); the daemon's real CONNECTED publication completes the
+/// Session.
+#[test]
+fn attach_bootstrap_generic_connect_forwards_server_name_and_opaque() {
+    let path = socket_path();
+    let path_text = path.to_str().expect("socket path").to_owned();
+    let server = Arc::new(AppServer::bind(&path_text, 8).expect("bind app server"));
+    let publisher = server.publisher();
+    let application_mqs = build_application_mqs();
+    let allocated = Arc::new(AtomicU64::new(1));
+    let detached = Arc::new(AtomicU64::new(0));
+    let (seam_tx, seam_rx) = mpsc::channel();
+    spawn_serve(
+        Arc::clone(&server),
+        application_mqs.clone(),
+        Arc::clone(&allocated),
+        Arc::clone(&detached),
+        seam_tx,
+    );
+    let mut worker = VclWorker::attach(&path_text, 8).expect("VCL attach");
+
+    let session = worker
+        .session_create(TransportProtocol::Http, true)
+        .expect("create");
+    worker
+        .session_connect(
+            session,
+            REMOTE,
+            Some(LOCAL),
+            Some("example.com"),
+            Some(0xCAFE),
+        )
+        .expect("nonblocking connect returns immediately");
+    assert_eq!(
+        worker.session_state(session).expect("session state"),
+        VclSessionState::Connecting
+    );
+
+    // The scripted control seam consumed the real CONNECT: create-time
+    // transport, endpoints and opaque are forwarded, no parent and no
+    // stream flag; the server name was stored in the real ext-config chunk
+    // and carried as the opaque bounded offset.
+    let SeamEvent::Connect(request) = next_seam(&seam_rx) else {
+        panic!("expected Connect seam event")
+    };
+    assert_eq!(request.transport, TransportProtocol::Http);
+    assert_eq!(request.remote, REMOTE);
+    assert_eq!(request.local, Some(LOCAL));
+    assert_eq!(request.opaque, Some(0xCAFE));
+    assert_eq!(request.parent_handle, None);
+    assert!(!request.flags.contains(SessionFlags::STREAM));
+    let chunk = request.ext_config.expect("server name ext-config chunk");
+    let store = application_mqs
+        .publication
+        .ext_config_store()
+        .expect("ext-config store")
+        .expect("daemon published one");
+    assert_eq!(store.read(chunk).expect("read chunk"), b"example.com");
+
+    // The real CONNECTED publication with descriptors completes the Session
+    // through `session_poll`.
+    let application = ApplicationId::from_raw(allocated.load(Ordering::Relaxed));
+    let child_published = build_publication(application, CHILD_WIRE, &application_mqs);
+    let mut child_publication = child_published.publication;
+    child_publication.set_connected(SessionConnectedMsg {
+        context: request.context,
+        result: Ok(CHILD_WIRE),
+        local: Some(LOCAL),
+        remote: Some(REMOTE),
+        flags: SessionFlags::STREAM,
+        opaque: None,
+    });
+    publisher
+        .try_publish(&child_publication)
+        .expect("publish child");
+    let events = pump_events(&mut worker);
+    assert_eq!(events, vec![VclEvent::Connected { session }]);
+    assert_eq!(
+        worker.session_state(session).expect("session state"),
+        VclSessionState::Ready
+    );
+    let attributes = worker.session_attributes(session).expect("attributes");
+    assert!(attributes.stream);
+    assert_eq!(attributes.initiator, VclInitiator::Local);
+    assert_eq!(
+        worker.session_proto(session).expect("session proto"),
+        TransportProtocol::Http
+    );
+
+    assert_eq!(detached.load(Ordering::Relaxed), 0, "no detach observed");
+    drop(worker);
+    let _ = std::fs::remove_file(path);
+}

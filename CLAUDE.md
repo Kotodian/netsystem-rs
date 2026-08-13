@@ -39,7 +39,7 @@
 - Locate relevant symbols and line ranges before reading implementation. Every `Read` call must use an explicit `offset` and a `limit` of at most 250 lines. Do not read an entire large source, transcript, generated file, lockfile, vendored tree, or build artifact.
 - Bound shell output at its source. Scope `rg` to relevant paths and patterns, select narrow ranges with `sed`, and cap diagnostic or history output with an appropriate `head` or `tail`. Keep each command's expected output below roughly 12,000 characters.
 - Do not repeat a broad read after a truncated result. Narrow the query or continue from the next explicit range. Summarize established facts instead of carrying large quotations into later reasoning.
-- Run at most three subagents concurrently. Give each a non-overlapping scope and require a final report under 1,200 words containing findings and file/line references, without pasted source blocks or raw command output.
+- Run at most four subagents concurrently. Give each a non-overlapping scope and require a final report under 1,200 words containing findings and file/line references, without pasted source blocks or raw command output.
 - Never read full Claude session JSONL files or subagent transcript/output files into the conversation. Inspect only metadata, targeted matches, or bounded excerpts.
 
 ## Working Tree

@@ -3,7 +3,7 @@
 use std::collections::VecDeque;
 use std::net::SocketAddr;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use bytes::Bytes;
@@ -14,24 +14,27 @@ use hammer_infra::pool::{Index, Pool};
 use hammer_infra::thread_owned::ThreadOwnedError;
 use hammer_infra::timer_wheel::TimerWheel1t2w2048sl;
 use hammer_runtime::app::{
-    ApplicationId, SessionAppId, SessionConnectError, SessionDgramHeader, SessionFlags,
-    SessionHandle,
+    ApplicationId, SessionAppContext, SessionAppId, SessionConnectError, SessionDgramHeader,
+    SessionFlags, SessionHandle,
 };
+use hammer_runtime::session::{SessionApplicationErrorCode, SessionStreamDirection};
 use hammer_runtime::{
     DataPlaneRuntime, DataWorkerId, NodeRuntimeData, RuntimeError, RuntimeResult,
     SessionConnectionId, SessionListenerId,
 };
+use hammer_service::session::ApplicationMain;
 use hammer_service::session::SessionId;
+use hammer_service::session::error::SessionTransportActionError;
 use hammer_service::session::node::{SessionQueueNext, SessionQueueOutput};
 use hammer_service::session::runtime::{
-    SessionTransport, SessionTransportId, SessionWorker, TransportInternalTransport,
-    TransportInternalTx, dispatch_session_queue_events,
+    SessionTransport, SessionTransportId, SessionTransportWorkerActions, SessionWorker,
+    TransportInternalTransport, TransportInternalTx, dispatch_session_queue_events,
 };
 
 use crate::listener::QUIC_MAIN;
 use quinn_proto::{
     Connection, ConnectionError, ConnectionHandle, DatagramEvent, Endpoint, EndpointConfig, Event,
-    PartialDecode, StreamEvent, StreamId,
+    PartialDecode, StreamEvent, StreamId, VarInt,
 };
 
 use crate::config::ConfigId;
@@ -51,6 +54,23 @@ const STREAM_RECV_FIN: u8 = 1 << 3;
 /// `QUICLY_ERROR_FROM_APPLICATION_ERROR_CODE(ctx->app_err_code)`, which
 /// defaults to 0).
 const RESET_APP_ERROR_CODE: quinn_proto::VarInt = quinn_proto::VarInt::from_u32(0);
+
+/// QUIC-local wrapper around `SessionApplicationErrorCode` (foreign) so the
+/// checked `TryFrom` conversion into `VarInt` (foreign) can be implemented
+/// under the orphan rule.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[repr(transparent)]
+pub(super) struct QuicAppErrorCode(SessionApplicationErrorCode);
+
+impl TryFrom<QuicAppErrorCode> for VarInt {
+    type Error = u64;
+
+    #[inline]
+    fn try_from(code: QuicAppErrorCode) -> Result<Self, Self::Error> {
+        let raw = u64::from(code.0);
+        VarInt::try_from(raw).map_err(|_| raw)
+    }
+}
 const TIMER_RESOLUTION: Duration = Duration::from_millis(1);
 const TIMER_MAX_TICKS_PER_UPDATE: u32 = 1_024;
 const TIMER_EXPIRY_BUDGET: usize = 256;
@@ -59,6 +79,14 @@ const TIMER_WHEEL_MAX_INTERVAL_TICKS: u64 = crate::config::MAX_CONNECTION_TIMEOU
 #[inline]
 fn stream_has_send_side(connection: &Connection, stream: StreamId) -> bool {
     stream.dir() == quinn_proto::Dir::Bi || stream.initiator() == connection.side()
+}
+
+/// A stream has a local receive side when it is bidirectional or the peer
+/// initiated it (RFC 9000 2.1); mirrors VPP `quicly_stream_has_receive_side`
+/// guarding `quicly_request_stop` (quic_quicly.c:1253).
+#[inline]
+fn stream_has_receive_side(connection: &Connection, stream: StreamId) -> bool {
+    stream.dir() == quinn_proto::Dir::Bi || stream.initiator() != connection.side()
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -483,6 +511,13 @@ impl Context {
         self.connection_mut()
             .and_then(|connection| connection.engine.as_deref_mut())
             .ok_or_else(|| QuicWorkerError::EngineMissing { context }.into())
+    }
+
+    fn stream_ref(&self) -> Option<&StreamContext> {
+        match &self.role {
+            ContextRole::Stream(stream) => Some(stream),
+            ContextRole::Connection(_) | ContextRole::Listener(_) => None,
+        }
     }
 
     fn stream_mut(&mut self) -> Option<&mut StreamContext> {
@@ -1010,6 +1045,389 @@ impl QuicWorker {
             return Err(error);
         }
         Ok(child_session)
+    }
+
+    /// Opens one stream child of an established QUIC connection Session;
+    /// mirrors VPP `session_open_stream` (session.c:1393) driving the QUIC
+    /// transport's `quic_connect_stream` (quic.c:164). `parent` must be
+    /// owned by a QUIC connection context (never a stream) whose worker-local
+    /// connection is live (quic.c:175-206); the child inherits the parent's
+    /// application endpoint and carries the supplied `app_context` as both
+    /// its Session App context and its VPP `opaque` (`s->opaque = sep->opaque`,
+    /// session.c:1410). The Application Connection is registered here on
+    /// `applications` exactly like the CONNECT_STREAM control path
+    /// (session/control.rs `application_connect`), which also rolls it back
+    /// when the transport connect fails; every validation precedes
+    /// registration, and failures after registration roll the connection
+    /// back so no orphaned Application connection, Session, or context is
+    /// left behind. The remaining open work reuses `connect_stream` and its
+    /// rollback paths.
+    #[allow(dead_code)] // consumed by the upcoming session action slice
+    pub(super) fn open_stream(
+        &mut self,
+        applications: &ApplicationMain,
+        sessions: &mut SessionWorker<Index>,
+        parent: SessionId,
+        direction: SessionStreamDirection,
+        app_context: SessionAppContext,
+    ) -> RuntimeResult<SessionId> {
+        let parent_handle = sessions.session_handle(parent);
+        let (transport, parent_index) =
+            sessions
+                .session_transport(parent)
+                .ok_or(QuicWorkerError::ParentSessionMissing {
+                    parent: parent_handle,
+                })?;
+        if transport != Self::ID
+            || !self.contexts.get(parent_index).is_some_and(|context| {
+                context.connection().is_some_and(|connection| {
+                    connection
+                        .engine
+                        .as_deref()
+                        .is_some_and(|engine| engine.connection.is_some())
+                })
+            })
+        {
+            return Err(QuicWorkerError::ParentSessionInvalid {
+                parent: parent_handle,
+            }
+            .into());
+        }
+
+        let (application, app, _parent_opaque, server_name) = sessions
+            .session_app_endpoint(parent)
+            .ok_or(QuicWorkerError::SessionMissing { session: parent })?;
+        // VPP session_open_stream hands the stream to the parent's app worker
+        // (quic.c:230-231 copies `qctx->parent_app_wrk_id`); the parent's
+        // allocation owner is inherited by the child Session through the
+        // registered Application Connection (stream_connect_pending reads
+        // `connection.context()` as the allocation owner). It must exist
+        // before any allocation so a missing owner fails typed instead of
+        // registering a zeroed connection.
+        let owner = sessions.session_allocation_owner(parent).ok_or(
+            QuicWorkerError::ParentAllocationOwnerMissing {
+                parent: parent_handle,
+            },
+        )?;
+        let server_name = server_name.map(str::to_owned);
+        let connection = applications
+            .register_connection(application, owner, server_name, app, Some(app_context))
+            .map_err(|error| RuntimeError::subsystem("application", error))?;
+        let flags = match direction {
+            SessionStreamDirection::Bidi => SessionFlags::STREAM,
+            SessionStreamDirection::Uni => SessionFlags::STREAM | SessionFlags::UNIDIRECTIONAL,
+        };
+        let child = match self.connect_stream(
+            sessions,
+            parent_handle,
+            SessionConnectionId::from_raw(connection.raw()),
+            flags,
+        ) {
+            Ok(child) => child,
+            Err(primary) => {
+                // VPP session.c:1425-1433: when the transport fails to open
+                // the stream the Session is freed and the app worker is
+                // notified so its connection object is dropped; the
+                // registered Application Connection is that counterpart and
+                // must not be left behind.
+                let cleanup = applications
+                    .remove_connection(application, connection)
+                    .map_err(|error| RuntimeError::subsystem("application", error))
+                    .err();
+                return match cleanup {
+                    Some(cleanup) => Err(QuicWorkerError::OpenStreamCleanupFailed {
+                        parent: parent_handle,
+                        primary,
+                        cleanup,
+                    }
+                    .into()),
+                    None => Err(primary),
+                };
+            }
+        };
+        if let Err(primary) = sessions.set_app_session(child, app_context) {
+            // VPP session.c:1425-1433 frees the stream Session and its
+            // transport context before the app worker is notified so its
+            // connection object is dropped; mirror that reverse ownership
+            // order (Session rollback, context removal, Application
+            // Connection removal), attempting each step independently so
+            // one cleanup failure does not skip the later steps. The child
+            // context index is resolved up front O(1) so context removal
+            // runs even when the Session rollback itself fails; the
+            // aggregation matches connect_stream's rollback path above.
+            let child_index = sessions.session_transport(child).map(|(_, index)| index);
+            let session_cleanup = sessions.rollback_session_creation(child).err();
+            let context_cleanup = match child_index {
+                Some(index) => self.remove_context(ContextId::from(index)).err(),
+                None => None,
+            };
+            let connection_cleanup = applications
+                .remove_connection(application, connection)
+                .map_err(|error| RuntimeError::subsystem("application", error))
+                .err();
+            let cleanup = session_cleanup.or(context_cleanup).or(connection_cleanup);
+            return match cleanup {
+                Some(cleanup) => Err(QuicWorkerError::OpenStreamCleanupFailed {
+                    parent: parent_handle,
+                    primary,
+                    cleanup,
+                }
+                .into()),
+                None => Err(primary),
+            };
+        }
+        Ok(child)
+    }
+
+    /// Resolves `session` through the Session Worker into this worker's QUIC
+    /// context index in O(1) (no pool scan). Rejects sessions unknown to the
+    /// Session Worker, owned by another transport, or not backed by a stream
+    /// or connection context.
+    fn session_context(
+        &self,
+        sessions: &SessionWorker<Index>,
+        session: SessionId,
+    ) -> Result<ContextId, QuicWorkerError> {
+        let (transport, index) = sessions
+            .session_transport(session)
+            .ok_or(QuicWorkerError::SessionMissing { session })?;
+        if transport != Self::ID {
+            return Err(QuicWorkerError::SessionNotQuic { session });
+        }
+        let context = ContextId::from(index);
+        if !self
+            .contexts
+            .get(index)
+            .is_some_and(|context| context.connection().is_some() || context.stream_ref().is_some())
+        {
+            return Err(QuicWorkerError::ContextMissing { context });
+        }
+        Ok(context)
+    }
+
+    /// Checked conversion of a Session application error code to a QUIC
+    /// varint. VPP stores the code in `quic_app_err_code_t` (signed `i64`,
+    /// quic.h:128) and encodes it as a varint through
+    /// `QUICLY_ERROR_FROM_APPLICATION_ERROR_CODE`; the varint range is
+    /// `0..2^62-1`, so anything at or above `2^62` is rejected.
+    fn app_error_code_varint(
+        session: SessionId,
+        code: SessionApplicationErrorCode,
+    ) -> Result<VarInt, QuicWorkerError> {
+        VarInt::try_from(QuicAppErrorCode(code)).map_err(|invalid| {
+            QuicWorkerError::ApplicationErrorCodeInvalid {
+                session,
+                code: invalid,
+            }
+        })
+    }
+
+    /// Resets one stream Session with an application error code; the
+    /// transport half of the generic `SessionWorker::reset_stream` dispatch,
+    /// replacing the `transport_reset_unsupported` stub. Mirrors VPP
+    /// `session_transport_reset` (session.c:1687-1703) notifying the
+    /// transport, where the application error code recorded through the
+    /// `APP_PROTO_ERR_CODE` transport endpoint attribute (quic.c:701) is
+    /// carried on the RESET_STREAM frame. Resolution is O(1): `session_context`
+    /// derives the worker-local context index from the Session entry, the
+    /// stream context pins the exact quinn stream on the parent connection,
+    /// and only then is the send stream reset and the connection scheduled
+    /// for output so the frame transmits. Every validation precedes the
+    /// quinn call, so a rejection never mutates transport state.
+    pub(super) fn reset_stream(
+        &mut self,
+        sessions: &mut SessionWorker<Index>,
+        session: SessionId,
+        code: SessionApplicationErrorCode,
+    ) -> RuntimeResult<()> {
+        let context = self.session_context(sessions, session)?;
+        let (stream_id, parent, engine_closed) = self
+            .contexts
+            .get(context.into())
+            .and_then(Context::stream_ref)
+            .map(|stream| {
+                (
+                    stream.stream,
+                    stream.parent,
+                    stream.flags & STREAM_ENGINE_CLOSED != 0,
+                )
+            })
+            .ok_or(QuicWorkerError::SessionNotStream { session })?;
+        if engine_closed {
+            return Err(QuicWorkerError::StreamMissing { stream: stream_id }.into());
+        }
+        let error_code = Self::app_error_code_varint(session, code)?;
+        let connection = self
+            .contexts
+            .get_mut(parent)
+            .and_then(Context::connection_mut)
+            .ok_or_else(|| QuicWorkerError::ContextMissing {
+                context: ContextId::from(parent),
+            })?
+            .engine
+            .as_mut()
+            .ok_or_else(|| QuicWorkerError::EngineMissing {
+                context: ContextId::from(parent),
+            })?
+            .connection_mut()?;
+        if !stream_has_send_side(connection, stream_id) {
+            return Err(QuicWorkerError::StreamSendSideMissing { stream: stream_id }.into());
+        }
+        connection
+            .send_stream(stream_id)
+            .reset(error_code)
+            .map_err(|source| QuicWorkerError::StreamReset {
+                context,
+                stream: stream_id,
+                source,
+            })?;
+        self.queue_connection_output(ContextId::from(parent))?;
+        Ok(())
+    }
+
+    /// Stops a stream Session's receive side with an application error code;
+    /// the transport half of the generic `SessionWorker::stop_sending`
+    /// dispatch, replacing the `transport_stop_sending_unsupported` stub.
+    /// Mirrors VPP `quic_quicly_on_app_reset` (quic_quicly.c:1253-1259),
+    /// where a stream that still has a receive side calls `quicly_request_stop`
+    /// with the application error code, transmitting a STOP_SENDING frame,
+    /// but only while the receive state transfer is not complete
+    /// (`!quicly_recvstate_transfer_complete`): a receive side whose peer
+    /// already finished sending (FIN and every byte received contiguously)
+    /// gets no request. The wire gate needs an explicit query because quinn's
+    /// `RecvStream::stop` only suppresses the frame after the application has
+    /// read the stream out of `Recv` state (`is_receiving`,
+    /// streams/recv.rs:244), which lags the wire condition: after the peer's
+    /// FIN and all bytes arrive but before the app reads, quinn would still
+    /// emit STOP_SENDING. The gate is the O(1) public
+    /// `RecvStream::receive_transfer_complete` query (streams/mod.rs:262),
+    /// the same `!quicly_recvstate_transfer_complete` condition VPP applies.
+    /// The Session Worker's `stop_sending` guard (runtime.rs:1696) admits
+    /// only an Active stream and half-close never changes Session state, so
+    /// unlike `reset_stream` this action records no AppClosed and repeated
+    /// dispatches keep reaching the transport. Resolution is O(1):
+    /// `session_context` derives the worker-local context index from the
+    /// Session entry, the stream context pins the exact quinn stream on the
+    /// parent connection, and only then is that receive stream stopped and
+    /// the connection scheduled for output so the STOP_SENDING frame
+    /// transmits. Every validation precedes the quinn call, so a rejection
+    /// never mutates transport state.
+    pub(super) fn stop_sending(
+        &mut self,
+        sessions: &mut SessionWorker<Index>,
+        session: SessionId,
+        code: SessionApplicationErrorCode,
+    ) -> RuntimeResult<()> {
+        let context = self.session_context(sessions, session)?;
+        let (stream_id, parent, engine_closed) = self
+            .contexts
+            .get(context.into())
+            .and_then(Context::stream_ref)
+            .map(|stream| {
+                (
+                    stream.stream,
+                    stream.parent,
+                    stream.flags & STREAM_ENGINE_CLOSED != 0,
+                )
+            })
+            .ok_or(QuicWorkerError::SessionNotStream { session })?;
+        if engine_closed {
+            return Err(QuicWorkerError::StreamMissing { stream: stream_id }.into());
+        }
+        let error_code = Self::app_error_code_varint(session, code)?;
+        let connection = self
+            .contexts
+            .get_mut(parent)
+            .and_then(Context::connection_mut)
+            .ok_or_else(|| QuicWorkerError::ContextMissing {
+                context: ContextId::from(parent),
+            })?
+            .engine
+            .as_mut()
+            .ok_or_else(|| QuicWorkerError::EngineMissing {
+                context: ContextId::from(parent),
+            })?
+            .connection_mut()?;
+        if !stream_has_receive_side(connection, stream_id) {
+            return Err(QuicWorkerError::StreamReceiveSideMissing { stream: stream_id }.into());
+        }
+        let mut recv = connection.recv_stream(stream_id);
+        if recv.receive_transfer_complete() {
+            return Ok(());
+        }
+        recv.stop(error_code)
+            .map_err(|source| QuicWorkerError::StreamStop {
+                context,
+                stream: stream_id,
+                source,
+            })?;
+        self.queue_connection_output(ContextId::from(parent))?;
+        Ok(())
+    }
+
+    /// Closes one connection Session with an application error code and an
+    /// owned copy of the app reason; the transport half of the generic
+    /// `SessionWorker::close_connection` dispatch, replacing the
+    /// `transport_close_connection_unsupported` stub. Mirrors VPP
+    /// `quic_quicly_on_app_closed` (quic_quicly.c:1086-1177): only a
+    /// connection Session is admitted (O(1) `session_context` resolution),
+    /// the application error code is checked into a varint before any
+    /// transport side effect, and the connection-state machine follows VPP —
+    /// OPENED/HANDSHAKE/READY become ACTIVE_CLOSING with `quicly_close`
+    /// (Hammer's worker-local `Connection::close` with the checked code and
+    /// the owned reason bytes), PASSIVE_CLOSING becomes
+    /// PASSIVE_CLOSING_APP_CLOSED, PASSIVE_CLOSING_QUIC_CLOSED is cleaned up,
+    /// and ACTIVE_CLOSING is left alone. The connection is queued for output
+    /// and its deadline resynced only after the mutation, so the
+    /// CONNECTION_CLOSE frame transmits. The Session Worker's app-close guard
+    /// (runtime.rs:1740) already recorded AppClosed before dispatch, and the
+    /// connection state itself makes repeated dispatch a no-op.
+    pub(super) fn close_connection_action(
+        &mut self,
+        sessions: &mut SessionWorker<Index>,
+        session: SessionId,
+        code: SessionApplicationErrorCode,
+        reason: &[u8],
+    ) -> RuntimeResult<()> {
+        let context = self.session_context(sessions, session)?;
+        let state = self
+            .contexts
+            .get(context.into())
+            .and_then(Context::connection)
+            .map(|connection| connection.state)
+            .ok_or(QuicWorkerError::SessionNotConnection { session })?;
+        let error_code = Self::app_error_code_varint(session, code)?;
+        let reason = Bytes::copy_from_slice(reason);
+        let now = Instant::now();
+        match state {
+            ConnectionState::Handshaking | ConnectionState::Established => {
+                self.contexts
+                    .get_mut(context.into())
+                    .ok_or_else(|| QuicWorkerError::ContextMissing { context })?
+                    .engine_mut(context)?
+                    .connection_mut()?
+                    .close(now, error_code, reason);
+                self.contexts
+                    .get_mut(context.into())
+                    .and_then(Context::connection_mut)
+                    .ok_or_else(|| QuicWorkerError::ContextMissing { context })?
+                    .state = ConnectionState::ActiveClosing;
+                self.queue_connection_output(context)?;
+                self.sync_connection_deadline_from_engine(context, now)
+            }
+            ConnectionState::PassiveClosing | ConnectionState::PassiveClosingQuicClosed => {
+                self.contexts
+                    .get_mut(context.into())
+                    .and_then(Context::connection_mut)
+                    .ok_or_else(|| QuicWorkerError::ContextMissing { context })?
+                    .state = ConnectionState::PassiveClosingAppClosed;
+                self.maybe_finalize_connection(sessions, context)
+            }
+            ConnectionState::ActiveClosing | ConnectionState::PassiveClosingAppClosed => {
+                self.maybe_finalize_connection(sessions, context)
+            }
+            ConnectionState::TransportClosed => self.finalize_connection(sessions, context),
+        }
     }
 
     pub(super) fn lower_session(&self, context: ContextId) -> RuntimeResult<SessionId> {
@@ -1864,11 +2282,25 @@ impl QuicWorker {
             .get(parent)
             .and_then(Context::connection)
             .and_then(|connection| connection.connection_session);
-        // Peer-accepted children are external even when the lower Session
-        // carries an app identity.
-        let child_app = if accepted { None } else { app };
         // VPP `quic_quicly_on_stream_open` inherits the parent connection's
-        // app worker (`sctx->parent_app_wrk_id = qctx->parent_app_wrk_id`).
+        // app worker onto the accepted stream Session
+        // (`sctx->parent_app_wrk_id = qctx->parent_app_wrk_id`,
+        // `stream_session->app_wrk_index = sctx->parent_app_wrk_id`,
+        // quic_quicly.c:831-853): an accepted child inherits the parent
+        // Session's builtin app endpoint when it carries an app; app-less
+        // and external parents keep external children (unchanged).
+        let parent_endpoint =
+            parent_session.and_then(|parent| sessions.session_app_endpoint(parent));
+        let (child_application, child_app, child_opaque, child_server_name) = match parent_endpoint
+        {
+            Some((application, Some(app), opaque, server_name)) if accepted => (
+                application,
+                Some(app),
+                opaque,
+                server_name.map(str::to_owned),
+            ),
+            _ => (application, if accepted { None } else { app }, opaque, None),
+        };
         let allocation_owner = if let Some(parent_session) = parent_session {
             if let Some(owner) = sessions.session_allocation_owner(parent_session) {
                 owner
@@ -1903,10 +2335,10 @@ impl QuicWorker {
             QuicWorker::ID,
             stream_context,
             allocation_owner,
-            application,
+            child_application,
             child_app,
-            opaque,
-            None,
+            child_opaque,
+            child_server_name.as_deref(),
             accepted,
         ) {
             Ok(session_id) => session_id,
@@ -1942,11 +2374,22 @@ impl QuicWorker {
             let publication = sessions
                 .set_session_flags(session_id, flags)
                 .and_then(|()| sessions.pin_accepted_listener(session_id, listener))
-                .and_then(|()| sessions.publish_accepted_transport_session(session_id));
+                .and_then(|()| {
+                    if child_app.is_some() {
+                        // VPP `quic_quicly_on_stream_open` fires the accept
+                        // callback on the inherited app worker
+                        // (`app_worker_accept_notify`, quic_quicly.c:873); the
+                        // builtin child completes through the same
+                        // `complete_stream_connect` as locally-initiated
+                        // streams so the Session App accept callback fires.
+                        sessions.complete_stream_connect(session_id)
+                    } else {
+                        sessions.publish_accepted_transport_session(session_id)
+                    }
+                });
             if let Err(primary) = publication {
-                // publish_accepted_transport_session already removes the
-                // Session on publication failure, so roll back only a
-                // still-live child Session.
+                // Both publication paths already remove the Session on
+                // failure, so roll back only a still-live child Session.
                 let session_cleanup = if sessions.has_session(session_id) {
                     sessions.rollback_session_creation(session_id).err()
                 } else {
@@ -1965,9 +2408,12 @@ impl QuicWorker {
                 });
             }
         }
+        // Builtin and external Session FIFOs are owned by SessionEntry
+        // (`construct_app_transport_session` / `construct_external_...`);
+        // `fifo_pair` resolves both paths O(1) without AppSession lookup.
         let (rx_fifo, tx_fifo) = sessions
-            .app_session(session_id)
-            .map(|session| (Arc::clone(session.rx_fifo()), Arc::clone(session.tx_fifo())))
+            .fifo_pair(session_id)
+            .map(|(rx, tx)| (Arc::clone(rx), Arc::clone(tx)))
             .ok_or_else(|| QuicWorkerError::SessionMissing {
                 session: session_id,
             })?;
@@ -2856,6 +3302,113 @@ pub(crate) fn quic_session_queue_dispatch(
     })
 }
 
+/// Opens one stream child of `parent` through the Session Worker's
+/// worker-local transport action table; the `open_stream` callback installed
+/// by `QuicMain::install_transport_actions` (listener.rs). Mirrors VPP
+/// resolving the transport VFT and invoking `quic_connect_stream`
+/// (transport.c:500-505, quic.c:164) from the worker-local registration:
+/// the Session Worker resolves the owning worker from its own
+/// `DataWorkerId` in O(1), and the QUIC Main (with the Application
+/// authority) comes from the same QUIC_MAIN channel the session queue
+/// entry points use. No scan, allocation, or lock on the dispatch path.
+pub(crate) fn quic_transport_open_stream(
+    sessions: &mut SessionWorker<Index>,
+    parent: SessionId,
+    direction: SessionStreamDirection,
+    app_context: SessionAppContext,
+) -> RuntimeResult<SessionId> {
+    let main = QUIC_MAIN
+        .get()
+        .ok_or(RuntimeError::PluginStateNotInitialized { plugin: "quic" })?;
+    let applications = main.applications();
+    main.with_worker_and_sessions(sessions, |sessions, quic| {
+        quic.open_stream(applications, sessions, parent, direction, app_context)
+    })
+}
+
+/// Builds the QUIC transport's worker-local action table, installed once per
+/// owning worker at the bind point (`bind_worker_graph` in listener.rs).
+/// Mirrors VPP registering the transport VFT with
+/// `.connect_stream = quic_connect_stream` (quic.c:902) and dispatch
+/// resolving it from the session entry's transport proto
+/// (session.c:1422, transport.c:500-505).
+///
+pub(crate) fn quic_transport_actions() -> SessionTransportWorkerActions<Index> {
+    SessionTransportWorkerActions::new(
+        quic_transport_open_stream,
+        quic_transport_reset_stream,
+        quic_transport_stop_sending,
+        quic_transport_close_connection,
+    )
+}
+
+/// Resets one QUIC stream Session through the Session Worker's worker-local
+/// transport action table; the `reset_stream` callback installed by
+/// `quic_transport_actions`. Mirrors VPP resolving the transport VFT and
+/// invoking `transport_reset` (transport.h:138) from `session_transport_reset`
+/// (session.c:1687-1703): the Session Worker resolves the owning worker from
+/// its own `DataWorkerId` in O(1), and the QUIC Main comes from the same
+/// QUIC_MAIN channel the session queue entry points use. No scan,
+/// allocation, or lock on the dispatch path.
+pub(crate) fn quic_transport_reset_stream(
+    sessions: &mut SessionWorker<Index>,
+    session: SessionId,
+    code: SessionApplicationErrorCode,
+) -> RuntimeResult<()> {
+    let main = QUIC_MAIN
+        .get()
+        .ok_or(RuntimeError::PluginStateNotInitialized { plugin: "quic" })?;
+    main.with_worker_and_sessions(sessions, |sessions, quic| {
+        quic.reset_stream(sessions, session, code)
+    })
+}
+
+/// Stops the receive side of one QUIC stream Session through the Session
+/// Worker's worker-local transport action table; the `stop_sending` callback
+/// installed by `quic_transport_actions`. Mirrors VPP resolving the transport
+/// VFT from `session_transport_half_close` (session.c:1637-1648) and the
+/// receive-side `quicly_request_stop` in `quic_quicly_on_app_reset`
+/// (quic_quicly.c:1253-1259): the Session Worker resolves the owning worker
+/// from its own `DataWorkerId` in O(1), and the QUIC Main comes from the same
+/// QUIC_MAIN channel the session queue entry points use. No scan, allocation,
+/// or lock on the dispatch path.
+pub(crate) fn quic_transport_stop_sending(
+    sessions: &mut SessionWorker<Index>,
+    session: SessionId,
+    code: SessionApplicationErrorCode,
+) -> RuntimeResult<()> {
+    let main = QUIC_MAIN
+        .get()
+        .ok_or(RuntimeError::PluginStateNotInitialized { plugin: "quic" })?;
+    main.with_worker_and_sessions(sessions, |sessions, quic| {
+        quic.stop_sending(sessions, session, code)
+    })
+}
+
+/// Closes one connection Session through the Session Worker's worker-local
+/// transport action table; the `close_connection` callback installed by
+/// `quic_transport_actions`. Mirrors VPP resolving the transport VFT and
+/// invoking `transport_close` (transport.h:131) from `session_transport_close`
+/// (session.c:1657-1682): the Session Worker resolves the owning worker from
+/// its own `DataWorkerId` in O(1), the reason stays raw `&[u8]` (never
+/// narrowed to `&str`), and the QUIC Main comes from the same QUIC_MAIN
+/// channel the session queue entry points use. No scan, allocation, or lock
+/// on the dispatch path; the reason copy and the quinn close happen on the
+/// owning worker inside `close_connection_action`.
+pub(crate) fn quic_transport_close_connection(
+    sessions: &mut SessionWorker<Index>,
+    connection: SessionId,
+    code: SessionApplicationErrorCode,
+    reason: &[u8],
+) -> RuntimeResult<()> {
+    let main = QUIC_MAIN
+        .get()
+        .ok_or(RuntimeError::PluginStateNotInitialized { plugin: "quic" })?;
+    main.with_worker_and_sessions(sessions, |sessions, quic| {
+        quic.close_connection_action(sessions, connection, code, reason)
+    })
+}
+
 impl QuicWorker {
     fn begin_stream_close(
         &mut self,
@@ -3246,6 +3799,8 @@ pub(super) enum QuicWorkerError {
     ParentSessionMissing { parent: SessionHandle },
     #[error("parent Session {parent:?} is not owned by a QUIC connection")]
     ParentSessionInvalid { parent: SessionHandle },
+    #[error("parent Session {parent:?} has no allocation owner")]
+    ParentAllocationOwnerMissing { parent: SessionHandle },
     #[error("QUIC {direction:?} stream limit is exhausted for parent context {context:?}")]
     StreamLimitReached {
         context: ContextId,
@@ -3259,6 +3814,46 @@ pub(super) enum QuicWorkerError {
         #[source]
         primary: RuntimeError,
         cleanup: RuntimeError,
+    },
+    #[error(
+        "open stream failed for parent {parent:?}: {primary}; rollback cleanup failed: {cleanup}"
+    )]
+    OpenStreamCleanupFailed {
+        parent: SessionHandle,
+        #[source]
+        primary: RuntimeError,
+        cleanup: RuntimeError,
+    },
+    #[error("Session {session:?} is not owned by the QUIC worker")]
+    SessionNotQuic { session: SessionId },
+    #[error("Session {session:?} is a QUIC connection, not a stream")]
+    SessionNotStream { session: SessionId },
+    #[error("Session {session:?} is a QUIC stream, not a connection")]
+    SessionNotConnection { session: SessionId },
+    #[error("QUIC stream {stream:?} has no local send side to reset")]
+    StreamSendSideMissing { stream: quinn_proto::StreamId },
+    #[error("QUIC stream {stream:?} has no local receive side to stop")]
+    StreamReceiveSideMissing { stream: quinn_proto::StreamId },
+    #[error("QUIC stream {stream:?} reset failed for context {context:?}: {source}")]
+    StreamReset {
+        context: ContextId,
+        stream: quinn_proto::StreamId,
+        #[source]
+        source: quinn_proto::ClosedStream,
+    },
+    #[error("QUIC stream {stream:?} stop failed for context {context:?}: {source}")]
+    StreamStop {
+        context: ContextId,
+        stream: quinn_proto::StreamId,
+        #[source]
+        source: quinn_proto::ClosedStream,
+    },
+    #[error("QUIC application error code {code} for Session {session:?} is not a valid varint")]
+    ApplicationErrorCodeInvalid { session: SessionId, code: u64 },
+    #[error("QUIC transport action table install failed")]
+    TransportActionsInstall {
+        #[source]
+        source: SessionTransportActionError,
     },
     #[error("QUIC worker {worker} is outside the configured worker range")]
     WorkerOutOfRange { worker: usize },
@@ -3555,12 +4150,21 @@ mod tests {
         application: ApplicationId,
         sessions: &mut SessionWorker<Index>,
     ) -> RuntimeResult<SessionListenerId> {
+        register_test_outer_listener_with_app(applications, application, sessions, None)
+    }
+
+    fn register_test_outer_listener_with_app(
+        applications: &Arc<hammer_service::session::ApplicationMain>,
+        application: ApplicationId,
+        sessions: &mut SessionWorker<Index>,
+        app: Option<hammer_runtime::app::SessionAppId>,
+    ) -> RuntimeResult<SessionListenerId> {
         let main = Arc::new(hammer_service::session::runtime::SessionMain::new(
             1,
             Arc::clone(applications),
         ));
         let application_listener = applications
-            .register_listener(application, None, None)
+            .register_listener(application, app, None)
             .map_err(hammer_runtime::RuntimeError::from)?;
         let listener = main.listen(
             application_listener,
@@ -4068,6 +4672,477 @@ mod tests {
         assert_eq!(stream.stream.dir(), quinn_proto::Dir::Uni);
         assert_eq!(stream.stream.initiator(), quinn_proto::Side::Client);
         assert_eq!(stream.session, child);
+        drop(server);
+        let _ = std::fs::remove_file(socket_path);
+        Ok(())
+    }
+
+    #[test]
+    fn open_stream_creates_direction_exact_child_carrying_app_context() -> RuntimeResult<()> {
+        let applications = Arc::new(hammer_service::session::ApplicationMain::new(4));
+        let application = applications
+            .attach()
+            .map_err(hammer_runtime::RuntimeError::from)?;
+        let socket_path = unique_socket_path("hammer-quic-open-stream");
+        let server =
+            hammer_runtime::attach::AppServer::bind(&socket_path, 1).expect("bind App server");
+        let mut sessions = hammer_service::session::SessionWorker::<Index>::new(
+            DataWorkerId::new(0),
+            1,
+            hammer_runtime::app::AppSessionConfig::default(),
+            64,
+            Arc::clone(&applications),
+            Some(server.publisher()),
+        )?;
+        sessions.install_session_app(
+            SessionAppId::new(0),
+            hammer_service::session::SessionAppCallbacks::all_none(),
+        )?;
+        sessions.install_application_mq_for_test(application)?;
+        let mut worker = QuicWorker::new(DataWorkerId::new(0));
+        let local = "127.0.0.1:443".parse().expect("local endpoint");
+        let remote = "127.0.0.1:444".parse().expect("remote endpoint");
+        let (client_config, server_config) = client_server_config_pair();
+        let parent_context = worker.allocate_client_connect(
+            Arc::clone(&client_config),
+            "localhost".to_owned(),
+            local,
+            remote,
+            application,
+            Some(SessionAppId::new(0)),
+            None,
+            SessionConnectionId::from_raw(7),
+        )?;
+        let now = Instant::now();
+        worker.connect_connection(parent_context, SessionId::from_raw(11), now)?;
+        drive_client_handshake(
+            &mut worker,
+            parent_context,
+            server_config,
+            local,
+            remote,
+            now,
+        )?;
+        // The parent must be attached with an allocation owner: open_stream
+        // rejects a parent without one (VPP quic.c:230-231 inherits the
+        // parent's app worker). The attached external path is the only
+        // constructible route in these tests.
+        let parent = sessions.construct_transport_session(
+            QuicWorker::ID,
+            parent_context.into(),
+            unique_allocation_owner(),
+            application,
+            None,
+            None,
+            None,
+            false,
+        )?;
+        worker
+            .contexts
+            .get_mut(parent_context.into())
+            .and_then(Context::connection_mut)
+            .ok_or(QuicWorkerError::ContextMissing {
+                context: parent_context,
+            })?
+            .connection_session = Some(parent);
+        worker
+            .contexts
+            .get_mut(parent_context.into())
+            .and_then(Context::connection_mut)
+            .ok_or(QuicWorkerError::ContextMissing {
+                context: parent_context,
+            })?
+            .state = ConnectionState::Established;
+
+        let bidi_context = 0xCAFE_BEEFu64;
+        let bidi = worker.open_stream(
+            &applications,
+            &mut sessions,
+            parent,
+            SessionStreamDirection::Bidi,
+            bidi_context,
+        )?;
+        let (transport, bidi_index) = sessions
+            .session_transport(bidi)
+            .ok_or(QuicWorkerError::SessionMissing { session: bidi })?;
+        assert_eq!(transport, QuicWorker::ID);
+        let stream = worker
+            .contexts
+            .get(bidi_index)
+            .and_then(|context| match &context.role {
+                ContextRole::Stream(stream) => Some(stream),
+                ContextRole::Listener(_) | ContextRole::Connection(_) => None,
+            })
+            .ok_or(QuicWorkerError::ContextMissing {
+                context: ContextId::from(bidi_index),
+            })?;
+        assert_eq!(stream.parent, parent_context.into());
+        assert_eq!(stream.session, bidi);
+        assert_eq!(stream.stream.dir(), quinn_proto::Dir::Bi);
+        assert_eq!(
+            sessions.session_app_endpoint(bidi),
+            Some((application, None, Some(bidi_context), None)),
+            "the child Session carries the supplied SessionAppContext"
+        );
+
+        let uni_context = 0xDEAD_BEEFu64;
+        let uni = worker.open_stream(
+            &applications,
+            &mut sessions,
+            parent,
+            SessionStreamDirection::Uni,
+            uni_context,
+        )?;
+        let (_, uni_index) = sessions
+            .session_transport(uni)
+            .ok_or(QuicWorkerError::SessionMissing { session: uni })?;
+        let stream = worker
+            .contexts
+            .get(uni_index)
+            .and_then(|context| match &context.role {
+                ContextRole::Stream(stream) => Some(stream),
+                ContextRole::Listener(_) | ContextRole::Connection(_) => None,
+            })
+            .ok_or(QuicWorkerError::ContextMissing {
+                context: ContextId::from(uni_index),
+            })?;
+        assert_eq!(stream.parent, parent_context.into());
+        assert_eq!(stream.session, uni);
+        assert_eq!(stream.stream.dir(), quinn_proto::Dir::Uni);
+        assert_eq!(
+            sessions.session_app_endpoint(uni),
+            Some((application, None, Some(uni_context), None)),
+            "the child Session carries the supplied SessionAppContext"
+        );
+
+        // A parent Session unknown to the Session Worker is rejected before
+        // any allocation (VPP session_open_stream SESSION_E_INVALID).
+        let contexts = worker.contexts.len();
+        let missing = SessionId::from_raw(0xDEAD);
+        let error = worker
+            .open_stream(
+                &applications,
+                &mut sessions,
+                missing,
+                SessionStreamDirection::Bidi,
+                0,
+            )
+            .expect_err("unknown parent Session is rejected");
+        assert!(
+            matches!(
+                &error,
+                RuntimeError::Subsystem { source, .. }
+                    if matches!(
+                        source.downcast_ref::<QuicWorkerError>(),
+                        Some(QuicWorkerError::ParentSessionMissing { .. })
+                    )
+            ),
+            "typed ParentSessionMissing expected, got {error:?}"
+        );
+
+        // A stream child is not a valid parent (VPP quic.c:186-194 rejects a
+        // stream context) and leaves no orphaned context.
+        let error = worker
+            .open_stream(
+                &applications,
+                &mut sessions,
+                bidi,
+                SessionStreamDirection::Uni,
+                0,
+            )
+            .expect_err("stream Session parent is rejected");
+        assert!(
+            matches!(
+                &error,
+                RuntimeError::Subsystem { source, .. }
+                    if matches!(
+                        source.downcast_ref::<QuicWorkerError>(),
+                        Some(QuicWorkerError::ParentSessionInvalid { .. })
+                    )
+            ),
+            "typed ParentSessionInvalid expected, got {error:?}"
+        );
+        assert_eq!(worker.contexts.len(), contexts);
+
+        // A connection whose worker-local engine has no live connection is
+        // rejected up front (VPP quic.c:206 `if (!(conn = qctx->conn))`).
+        let idle = worker.allocate_client_connect(
+            Arc::clone(&client_config),
+            "localhost".to_owned(),
+            local,
+            remote,
+            application,
+            Some(SessionAppId::new(0)),
+            None,
+            SessionConnectionId::from_raw(8),
+        )?;
+        let idle_session = sessions.construct_transport_session(
+            QuicWorker::ID,
+            idle.into(),
+            unique_allocation_owner(),
+            application,
+            Some(SessionAppId::new(0)),
+            None,
+            None,
+            false,
+        )?;
+        // Baseline after all setup: the idle connection context above is a
+        // real allocation owned by the connection path, not by open_stream
+        // (VPP quic.c:206 returns without freeing the connection).
+        let idle_contexts = worker.contexts.len();
+        let error = worker
+            .open_stream(
+                &applications,
+                &mut sessions,
+                idle_session,
+                SessionStreamDirection::Bidi,
+                0,
+            )
+            .expect_err("connection without a live engine is rejected");
+        assert!(
+            matches!(
+                &error,
+                RuntimeError::Subsystem { source, .. }
+                    if matches!(
+                        source.downcast_ref::<QuicWorkerError>(),
+                        Some(QuicWorkerError::ParentSessionInvalid { .. })
+                    )
+            ),
+            "typed ParentSessionInvalid expected, got {error:?}"
+        );
+        assert_eq!(
+            worker.contexts.len(),
+            idle_contexts,
+            "the rejected open leaves the idle connection context and no stream context"
+        );
+
+        drop(server);
+        let _ = std::fs::remove_file(socket_path);
+        Ok(())
+    }
+
+    #[test]
+    fn open_stream_rejects_parent_without_allocation_owner_before_side_effects() -> RuntimeResult<()>
+    {
+        let applications = Arc::new(hammer_service::session::ApplicationMain::new(4));
+        let application = applications
+            .attach()
+            .map_err(hammer_runtime::RuntimeError::from)?;
+        let socket_path = unique_socket_path("hammer-quic-open-stream-owner");
+        let server =
+            hammer_runtime::attach::AppServer::bind(&socket_path, 1).expect("bind App server");
+        let mut sessions = hammer_service::session::SessionWorker::<Index>::new(
+            DataWorkerId::new(0),
+            1,
+            hammer_runtime::app::AppSessionConfig::default(),
+            64,
+            Arc::clone(&applications),
+            Some(server.publisher()),
+        )?;
+        sessions.install_session_app(
+            SessionAppId::new(0),
+            hammer_service::session::SessionAppCallbacks::all_none(),
+        )?;
+        sessions.install_application_mq_for_test(application)?;
+        let mut worker = QuicWorker::new(DataWorkerId::new(0));
+        let local = "127.0.0.1:443".parse().expect("local endpoint");
+        let remote = "127.0.0.1:444".parse().expect("remote endpoint");
+        let (client_config, server_config) = client_server_config_pair();
+        let parent_context = worker.allocate_client_connect(
+            Arc::clone(&client_config),
+            "localhost".to_owned(),
+            local,
+            remote,
+            application,
+            Some(SessionAppId::new(0)),
+            None,
+            SessionConnectionId::from_raw(7),
+        )?;
+        let now = Instant::now();
+        worker.connect_connection(parent_context, SessionId::from_raw(11), now)?;
+        drive_client_handshake(
+            &mut worker,
+            parent_context,
+            server_config,
+            local,
+            remote,
+            now,
+        )?;
+        // App-path construction never attaches the Session, so this parent
+        // has an application endpoint but no allocation owner.
+        let parent = sessions.construct_transport_session(
+            QuicWorker::ID,
+            parent_context.into(),
+            unique_allocation_owner(),
+            application,
+            Some(SessionAppId::new(0)),
+            None,
+            None,
+            false,
+        )?;
+        worker
+            .contexts
+            .get_mut(parent_context.into())
+            .and_then(Context::connection_mut)
+            .ok_or(QuicWorkerError::ContextMissing {
+                context: parent_context,
+            })?
+            .connection_session = Some(parent);
+        worker
+            .contexts
+            .get_mut(parent_context.into())
+            .and_then(Context::connection_mut)
+            .ok_or(QuicWorkerError::ContextMissing {
+                context: parent_context,
+            })?
+            .state = ConnectionState::Established;
+
+        let contexts = worker.contexts.len();
+        let error = worker
+            .open_stream(
+                &applications,
+                &mut sessions,
+                parent,
+                SessionStreamDirection::Bidi,
+                0,
+            )
+            .expect_err("parent without an allocation owner is rejected");
+        assert!(
+            matches!(
+                &error,
+                RuntimeError::Subsystem { source, .. }
+                    if matches!(
+                        source.downcast_ref::<QuicWorkerError>(),
+                        Some(QuicWorkerError::ParentAllocationOwnerMissing { .. })
+                    )
+            ),
+            "typed ParentAllocationOwnerMissing expected, got {error:?}"
+        );
+        assert_eq!(
+            worker.contexts.len(),
+            contexts,
+            "the rejected open leaves no stream context"
+        );
+
+        drop(server);
+        let _ = std::fs::remove_file(socket_path);
+        Ok(())
+    }
+
+    #[test]
+    fn open_stream_removes_application_connection_when_connect_stream_fails() -> RuntimeResult<()> {
+        // One connection slot: a leaked CONNECTING entry from a failed open
+        // would make the second attempt fail at registration instead.
+        let applications = Arc::new(hammer_service::session::ApplicationMain::new(1));
+        let application = applications
+            .attach()
+            .map_err(hammer_runtime::RuntimeError::from)?;
+        let socket_path = unique_socket_path("hammer-quic-open-stream-rollback");
+        let server =
+            hammer_runtime::attach::AppServer::bind(&socket_path, 1).expect("bind App server");
+        let mut sessions = hammer_service::session::SessionWorker::<Index>::new(
+            DataWorkerId::new(0),
+            1,
+            hammer_runtime::app::AppSessionConfig::default(),
+            64,
+            Arc::clone(&applications),
+            Some(server.publisher()),
+        )?;
+        sessions.install_session_app(
+            SessionAppId::new(0),
+            hammer_service::session::SessionAppCallbacks::all_none(),
+        )?;
+        sessions.install_application_mq_for_test(application)?;
+        let mut worker = QuicWorker::new(DataWorkerId::new(0));
+        let local = "127.0.0.1:443".parse().expect("local endpoint");
+        let remote = "127.0.0.1:444".parse().expect("remote endpoint");
+        let (client_config, server_config) = client_server_config_pair();
+        let parent_context = worker.allocate_client_connect(
+            Arc::clone(&client_config),
+            "localhost".to_owned(),
+            local,
+            remote,
+            application,
+            Some(SessionAppId::new(0)),
+            None,
+            SessionConnectionId::from_raw(7),
+        )?;
+        let now = Instant::now();
+        worker.connect_connection(parent_context, SessionId::from_raw(11), now)?;
+        drive_client_handshake(
+            &mut worker,
+            parent_context,
+            server_config,
+            local,
+            remote,
+            now,
+        )?;
+        let parent = sessions.construct_transport_session(
+            QuicWorker::ID,
+            parent_context.into(),
+            unique_allocation_owner(),
+            application,
+            None,
+            None,
+            None,
+            false,
+        )?;
+        worker
+            .contexts
+            .get_mut(parent_context.into())
+            .and_then(Context::connection_mut)
+            .ok_or(QuicWorkerError::ContextMissing {
+                context: parent_context,
+            })?
+            .connection_session = Some(parent);
+        worker
+            .contexts
+            .get_mut(parent_context.into())
+            .and_then(Context::connection_mut)
+            .ok_or(QuicWorkerError::ContextMissing {
+                context: parent_context,
+            })?
+            .state = ConnectionState::Established;
+
+        // Exhaust the context pool so connect_stream fails after the
+        // Application Connection is registered.
+        while worker.contexts.len() < QUIC_CONTEXT_CAPACITY {
+            worker
+                .contexts
+                .insert(Context::stream(
+                    parent_context.into(),
+                    SessionId::from_raw(0),
+                    quinn_proto::StreamId::new(quinn_proto::Side::Client, quinn_proto::Dir::Bi, 0),
+                ))
+                .expect("dummy stream context fits the pool");
+        }
+        assert_eq!(worker.contexts.len(), QUIC_CONTEXT_CAPACITY);
+
+        for attempt in 0..2 {
+            let error = worker
+                .open_stream(
+                    &applications,
+                    &mut sessions,
+                    parent,
+                    SessionStreamDirection::Bidi,
+                    0,
+                )
+                .expect_err("connect_stream failure propagates");
+            assert!(
+                matches!(
+                    &error,
+                    RuntimeError::Subsystem { source, .. }
+                        if matches!(
+                            source.downcast_ref::<QuicWorkerError>(),
+                            Some(QuicWorkerError::ContextCapacityExhausted { .. })
+                        )
+                ),
+                "attempt {attempt}: ContextCapacityExhausted expected, got {error:?} (a leaked \
+                 Application Connection would surface as ApplicationError::ConnectionCapacityExhausted)"
+            );
+            assert_eq!(worker.contexts.len(), QUIC_CONTEXT_CAPACITY);
+        }
+
         drop(server);
         let _ = std::fs::remove_file(socket_path);
         Ok(())
@@ -5512,6 +6587,26 @@ mod tests {
     }
 
     fn peer_relay_established() -> RuntimeResult<PeerRelay> {
+        peer_relay_established_with(
+            None,
+            hammer_service::session::SessionAppCallbacks::all_none(),
+        )
+    }
+
+    fn install_builtin_session_app(_: &mut hammer_runtime::Engine) -> RuntimeResult<()> {
+        Ok(())
+    }
+
+    fn destroy_builtin_session_app(_: hammer_runtime::DataWorkerId, _: u64) {}
+
+    /// `listener_app` names the app identity the outer listener carries into
+    /// the accepted Connection Session (`stream_accept` reads
+    /// `listener.app()`); peer streams opened over that Session then inherit
+    /// it as the parent endpoint (VPP `quic_quicly_on_stream_open`).
+    fn peer_relay_established_with(
+        listener_app: Option<hammer_runtime::app::SessionAppId>,
+        callbacks: hammer_service::session::SessionAppCallbacks<Index>,
+    ) -> RuntimeResult<PeerRelay> {
         let certified = rcgen::generate_simple_self_signed(vec!["localhost".to_owned()])
             .expect("generate QUIC test certificate");
         let rustls_server = quinn_proto::rustls::ServerConfig::builder()
@@ -5543,7 +6638,21 @@ mod tests {
         let mut client_config = quinn_proto::ClientConfig::new(Arc::new(crypto_client));
         client_config.transport_config(Arc::new(quinn_proto::TransportConfig::default()));
 
-        let applications = hammer_service::session::ApplicationMain::new(4);
+        // A builtin listener app must be registered with the ApplicationMain
+        // (VPP `vnet_register_session_app`), which assigns its SessionAppId by
+        // registration position; `register_listener` then validates it.
+        let applications = if listener_app.is_some() {
+            hammer_service::session::ApplicationMain::with_session_apps(
+                4,
+                [hammer_runtime::app::SessionAppRegistration::new(
+                    crate::session_app::NAME,
+                    install_builtin_session_app,
+                    destroy_builtin_session_app,
+                )],
+            )
+        } else {
+            hammer_service::session::ApplicationMain::new(4)
+        };
         let application = applications
             .attach()
             .map_err(hammer_runtime::RuntimeError::from)?;
@@ -5569,8 +6678,19 @@ mod tests {
             None,
             false,
         )?;
-        let outer_listener =
-            register_test_outer_listener(&applications, application, &mut sessions)?;
+        // A builtin listener app is only meaningful with its Session App
+        // callback table installed: both the accepted Connection Session and
+        // its accepted child streams dispatch the accept callback under this
+        // app id (VPP `app_worker_accept_notify`).
+        if let Some(app) = listener_app {
+            sessions.install_session_app(app, callbacks)?;
+        }
+        let outer_listener = register_test_outer_listener_with_app(
+            &applications,
+            application,
+            &mut sessions,
+            listener_app,
+        )?;
 
         let mut worker = QuicWorker::new(DataWorkerId::new(0));
         let listener_id = ContextId::from(0x1234u64);
@@ -5722,6 +6842,396 @@ mod tests {
             SessionHandle::new(child.pool_index().slot(), 0)
         );
         assert_eq!(accepted.flags, SessionFlags::STREAM);
+        Ok(())
+    }
+
+    // Per-thread state: `cargo test` runs these tests in parallel on separate
+    // threads and each relay drives its worker synchronously on the test
+    // thread, so thread-local counters keep the accept callback recordings of
+    // one test from leaking into another.
+    thread_local! {
+        static SESSION_APP_ACCEPT_COUNT: AtomicU64 = AtomicU64::new(0);
+        static SESSION_APP_ACCEPTED_SESSION: AtomicU64 = AtomicU64::new(u64::MAX);
+        static SESSION_APP_ACCEPT_FAIL: AtomicBool = AtomicBool::new(false);
+    }
+
+    fn session_app_accept_callback(
+        _: &mut SessionWorker<Index>,
+        session: SessionId,
+        _: SessionAppContext,
+    ) -> RuntimeResult<()> {
+        SESSION_APP_ACCEPT_COUNT.with(|count| count.fetch_add(1, Ordering::Relaxed));
+        SESSION_APP_ACCEPTED_SESSION
+            .with(|accepted| accepted.store(session.get(), Ordering::Relaxed));
+        Ok(())
+    }
+
+    /// Records the accepted Session like `session_app_accept_callback`, but
+    /// once the test-only failure flag is armed it returns a typed error
+    /// instead of succeeding, standing in for a Session App accept callback
+    /// that rejects the accepted child (VPP `app_worker_accept_notify`
+    /// failure).
+    fn session_app_accept_callback_failing(
+        _: &mut SessionWorker<Index>,
+        session: SessionId,
+        _: SessionAppContext,
+    ) -> RuntimeResult<()> {
+        SESSION_APP_ACCEPT_COUNT.with(|count| count.fetch_add(1, Ordering::Relaxed));
+        SESSION_APP_ACCEPTED_SESSION
+            .with(|accepted| accepted.store(session.get(), Ordering::Relaxed));
+        if SESSION_APP_ACCEPT_FAIL.with(|fail| fail.load(Ordering::Relaxed)) {
+            return Err(RuntimeError::subsystem(
+                "session-app-accept",
+                hammer_service::session::error::SessionError::PublicationRejected {
+                    session_id: session,
+                },
+            ));
+        }
+        Ok(())
+    }
+
+    /// A peer-opened bidirectional stream accepted under a builtin app
+    /// listener fires the Session App accept callback with the child Session
+    /// (`app_worker_accept_notify`, VPP quic_quicly.c:873) and inherits the
+    /// parent Connection Session's builtin endpoint, so the child's endpoint
+    /// equals the parent's including app and opaque. The child completes
+    /// through `complete_stream_connect` rather than the external ACCEPTED
+    /// publication, so no accepted_message is retained.
+    #[test]
+    fn builtin_peer_bidirectional_stream_accepts_with_parent_builtin_endpoint() -> RuntimeResult<()>
+    {
+        SESSION_APP_ACCEPT_COUNT.with(|count| count.store(0, Ordering::Relaxed));
+        SESSION_APP_ACCEPTED_SESSION.with(|accepted| accepted.store(u64::MAX, Ordering::Relaxed));
+        let mut relay = peer_relay_established_with(
+            Some(SessionAppId::new(0)),
+            hammer_service::session::SessionAppCallbacks {
+                accept: Some(session_app_accept_callback),
+                ..Default::default()
+            },
+        )?;
+        // The handshake accepts the root Connection Session exactly once.
+        let accept_snapshot = SESSION_APP_ACCEPT_COUNT.with(|count| count.load(Ordering::Relaxed));
+        assert_eq!(
+            accept_snapshot, 1,
+            "root Connection Session accept callback"
+        );
+        let stream = relay
+            .client_connection
+            .streams()
+            .open(quinn_proto::Dir::Bi)
+            .expect("open peer bidirectional stream");
+        relay
+            .client_connection
+            .send_stream(stream)
+            .finish()
+            .expect("finish peer stream data");
+        for _ in 0..16 {
+            let missing = relay
+                .worker
+                .contexts
+                .get(relay.context.into())
+                .and_then(Context::connection)
+                .and_then(|connection| connection.engine.as_ref())
+                .map(|engine| engine.io_table.stream_session(stream).is_none())
+                .unwrap_or(true);
+            if !missing {
+                break;
+            }
+            peer_relay_exchange(&mut relay)?;
+        }
+        let child = relay
+            .worker
+            .contexts
+            .get(relay.context.into())
+            .and_then(Context::connection)
+            .and_then(|connection| connection.engine.as_ref())
+            .and_then(|engine| engine.io_table.stream_session(stream))
+            .ok_or(QuicWorkerError::StreamMissing { stream })?;
+        let (_, child_context) = relay
+            .sessions
+            .session_transport(child)
+            .ok_or(QuicWorkerError::SessionMissing { session: child })?;
+        let stream_context = relay
+            .worker
+            .contexts
+            .get(child_context)
+            .and_then(|context| match &context.role {
+                ContextRole::Stream(stream) => Some(stream),
+                ContextRole::Listener(_) | ContextRole::Connection(_) => None,
+            })
+            .ok_or(QuicWorkerError::ContextMissing {
+                context: ContextId::from(child_context),
+            })?;
+        assert_eq!(stream_context.parent, relay.context.into());
+        assert_eq!(stream_context.stream.dir(), quinn_proto::Dir::Bi);
+        assert_eq!(stream_context.session, child);
+        assert_eq!(
+            SESSION_APP_ACCEPT_COUNT.with(|count| count.load(Ordering::Relaxed)),
+            accept_snapshot + 1,
+            "the peer stream fires exactly one more accept callback"
+        );
+        assert_eq!(
+            SESSION_APP_ACCEPTED_SESSION.with(|accepted| accepted.load(Ordering::Relaxed)),
+            child.get(),
+            "the recorded accept Session is the stream child"
+        );
+        assert_eq!(
+            relay.sessions.session_app_endpoint(child),
+            relay
+                .sessions
+                .session_app_endpoint(relay.connection_session),
+            "the child inherits the parent's builtin app endpoint"
+        );
+        assert_eq!(
+            relay.sessions.session_flags(child),
+            Some(SessionFlags::STREAM)
+        );
+        assert!(
+            relay.sessions.accepted_message(child).is_none(),
+            "builtin children publish no external ACCEPTED message"
+        );
+        Ok(())
+    }
+
+    /// A builtin child accept callback failure follows the established
+    /// StreamData path: the callback records the child then returns a typed
+    /// error; `complete_stream_connect` removes the child Session and the
+    /// worker rolls back the stream context, so the quinn stream-setup
+    /// failure surfaces as `StreamDataError` and `handle_stream_data_error`
+    /// closes the connection with LocalResourceExhausted (VPP
+    /// `app_worker_accept_notify` failure), counts `stream_data_errors`, and
+    /// leaves the connection Session/context in the VPP-aligned
+    /// PassiveClosingQuicClosed state.
+    #[test]
+    fn builtin_child_accept_callback_failure_follows_stream_data_path() -> RuntimeResult<()> {
+        SESSION_APP_ACCEPT_COUNT.with(|count| count.store(0, Ordering::Relaxed));
+        SESSION_APP_ACCEPTED_SESSION.with(|accepted| accepted.store(u64::MAX, Ordering::Relaxed));
+        SESSION_APP_ACCEPT_FAIL.with(|fail| fail.store(false, Ordering::Relaxed));
+        let mut relay = peer_relay_established_with(
+            Some(SessionAppId::new(0)),
+            hammer_service::session::SessionAppCallbacks {
+                accept: Some(session_app_accept_callback_failing),
+                ..Default::default()
+            },
+        )?;
+        assert_eq!(
+            SESSION_APP_ACCEPT_COUNT.with(|count| count.load(Ordering::Relaxed)),
+            1,
+            "the root handshake accept callback succeeds"
+        );
+        // Arm the test-only failure flag only after the root handshake
+        // accepted, so the peer child's accept callback is the first to fail.
+        SESSION_APP_ACCEPT_FAIL.with(|fail| fail.store(true, Ordering::Relaxed));
+
+        let stream = relay
+            .client_connection
+            .streams()
+            .open(quinn_proto::Dir::Bi)
+            .expect("open peer bidirectional stream");
+        relay
+            .client_connection
+            .send_stream(stream)
+            .finish()
+            .expect("finish peer stream data");
+
+        let mut error = None;
+        for _ in 0..16 {
+            match peer_relay_exchange(&mut relay) {
+                Ok(()) => {}
+                Err(returned) => {
+                    error = Some(returned);
+                    break;
+                }
+            }
+        }
+        let error = error.ok_or(QuicWorkerError::StreamMissing { stream })?;
+        assert!(
+            matches!(
+                &error,
+                RuntimeError::Subsystem { source, .. }
+                    if matches!(
+                        source.downcast_ref::<QuicWorkerError>(),
+                        Some(QuicWorkerError::StreamData { context, error })
+                            if *context == relay.context
+                                && matches!(
+                                    error,
+                                    quinn_proto::StreamDataError::StreamMissing { .. }
+                                )
+                    )
+            ),
+            "the accept callback failure surfaces as the established StreamData \
+             worker error, got {error:?}"
+        );
+
+        let child = SessionId::from_raw(
+            SESSION_APP_ACCEPTED_SESSION.with(|accepted| accepted.load(Ordering::Relaxed)),
+        );
+        assert_eq!(
+            SESSION_APP_ACCEPT_COUNT.with(|count| count.load(Ordering::Relaxed)),
+            2,
+            "the peer child fires the accept callback exactly once before failing"
+        );
+        assert!(
+            !relay.sessions.has_session(child),
+            "the failed accepted child Session is removed"
+        );
+        assert!(
+            !relay.worker.contexts.iter().any(|(_, context)| matches!(
+                &context.role,
+                ContextRole::Stream(stream_context)
+                    if stream_context.parent == relay.context.into()
+                        && stream_context.stream == stream
+            )),
+            "no stream context remains for the failed child"
+        );
+        assert!(
+            relay
+                .worker
+                .contexts
+                .get(relay.context.into())
+                .and_then(Context::connection)
+                .and_then(|connection| connection.engine.as_ref())
+                .is_none_or(|engine| engine.io_table.stream_session(stream).is_none()),
+            "no io-table entry remains for the failed child"
+        );
+        assert!(
+            relay.worker.contexts.contains_key(relay.context.into()),
+            "the connection context remains"
+        );
+        assert!(
+            relay.sessions.has_session(relay.connection_session),
+            "the connection Session remains"
+        );
+        assert_eq!(
+            relay
+                .worker
+                .contexts
+                .get(relay.context.into())
+                .and_then(Context::connection)
+                .map(|connection| connection.state),
+            Some(ConnectionState::PassiveClosingQuicClosed),
+            "the connection Session/context stays in the VPP-aligned closing state"
+        );
+        assert_eq!(relay.worker.stream_data_errors, 1);
+
+        // A follow-up exchange drains the client's remaining transmits and
+        // server responses without further errors: the StreamData close path
+        // keeps the quinn engine open (no client CONNECTION_CLOSE is
+        // emitted), so the connection stays in PassiveClosingQuicClosed.
+        peer_relay_exchange(&mut relay)?;
+        assert_eq!(relay.worker.stream_data_errors, 1);
+        assert_eq!(
+            relay
+                .worker
+                .contexts
+                .get(relay.context.into())
+                .and_then(Context::connection)
+                .map(|connection| connection.state),
+            Some(ConnectionState::PassiveClosingQuicClosed)
+        );
+        assert!(!relay.client_connection.is_closed());
+        Ok(())
+    }
+
+    /// A peer-opened unidirectional stream accepted under a builtin app
+    /// listener follows the builtin bidir path: the Session App accept
+    /// callback fires with the child Session and the child inherits the
+    /// parent Connection Session's builtin endpoint. It differs only in
+    /// capability, carrying STREAM | UNIDIRECTIONAL (VPP
+    /// `quic_quicly_on_stream_open` for a remote uni stream).
+    #[test]
+    fn builtin_peer_unidirectional_stream_accepts_with_parent_builtin_endpoint() -> RuntimeResult<()>
+    {
+        SESSION_APP_ACCEPT_COUNT.with(|count| count.store(0, Ordering::Relaxed));
+        SESSION_APP_ACCEPTED_SESSION.with(|accepted| accepted.store(u64::MAX, Ordering::Relaxed));
+        let mut relay = peer_relay_established_with(
+            Some(SessionAppId::new(0)),
+            hammer_service::session::SessionAppCallbacks {
+                accept: Some(session_app_accept_callback),
+                ..Default::default()
+            },
+        )?;
+        // The handshake accepts the root Connection Session exactly once.
+        let accept_snapshot = SESSION_APP_ACCEPT_COUNT.with(|count| count.load(Ordering::Relaxed));
+        assert_eq!(
+            accept_snapshot, 1,
+            "root Connection Session accept callback"
+        );
+        let stream = relay
+            .client_connection
+            .streams()
+            .open(quinn_proto::Dir::Uni)
+            .expect("open peer unidirectional stream");
+        relay
+            .client_connection
+            .send_stream(stream)
+            .finish()
+            .expect("finish peer stream data");
+        for _ in 0..16 {
+            let missing = relay
+                .worker
+                .contexts
+                .get(relay.context.into())
+                .and_then(Context::connection)
+                .and_then(|connection| connection.engine.as_ref())
+                .map(|engine| engine.io_table.stream_session(stream).is_none())
+                .unwrap_or(true);
+            if !missing {
+                break;
+            }
+            peer_relay_exchange(&mut relay)?;
+        }
+        let child = relay
+            .worker
+            .contexts
+            .get(relay.context.into())
+            .and_then(Context::connection)
+            .and_then(|connection| connection.engine.as_ref())
+            .and_then(|engine| engine.io_table.stream_session(stream))
+            .ok_or(QuicWorkerError::StreamMissing { stream })?;
+        let (_, child_context) = relay
+            .sessions
+            .session_transport(child)
+            .ok_or(QuicWorkerError::SessionMissing { session: child })?;
+        let stream_context = relay
+            .worker
+            .contexts
+            .get(child_context)
+            .and_then(|context| match &context.role {
+                ContextRole::Stream(stream) => Some(stream),
+                ContextRole::Listener(_) | ContextRole::Connection(_) => None,
+            })
+            .ok_or(QuicWorkerError::ContextMissing {
+                context: ContextId::from(child_context),
+            })?;
+        assert_eq!(stream_context.parent, relay.context.into());
+        assert_eq!(stream_context.stream.dir(), quinn_proto::Dir::Uni);
+        assert_eq!(stream_context.session, child);
+        assert_eq!(
+            SESSION_APP_ACCEPT_COUNT.with(|count| count.load(Ordering::Relaxed)),
+            accept_snapshot + 1,
+            "the peer stream fires exactly one more accept callback"
+        );
+        assert_eq!(
+            SESSION_APP_ACCEPTED_SESSION.with(|accepted| accepted.load(Ordering::Relaxed)),
+            child.get(),
+            "the recorded accept Session is the stream child"
+        );
+        assert_eq!(
+            relay.sessions.session_app_endpoint(child),
+            relay
+                .sessions
+                .session_app_endpoint(relay.connection_session),
+            "the child inherits the parent's builtin app endpoint"
+        );
+        assert_eq!(
+            relay.sessions.session_flags(child),
+            Some(SessionFlags::STREAM | SessionFlags::UNIDIRECTIONAL)
+        );
+        assert!(
+            relay.sessions.accepted_message(child).is_none(),
+            "builtin children publish no external ACCEPTED message"
+        );
         Ok(())
     }
 
@@ -6024,6 +7534,1434 @@ mod tests {
                 .and_then(|connection| connection.engine.as_ref())
                 .map(|engine| engine.io_table.stream_session(stream).is_some())
                 .unwrap_or(false)
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn app_error_code_varint_conversion_is_checked() {
+        let legal_min = QuicAppErrorCode(SessionApplicationErrorCode::from(0));
+        assert_eq!(
+            VarInt::try_from(legal_min),
+            Ok(VarInt::from_u32(0)),
+            "zero is the minimum legal application error code"
+        );
+        let legal_max = (1u64 << 62) - 1;
+        assert_eq!(
+            VarInt::try_from(QuicAppErrorCode(SessionApplicationErrorCode::from(
+                legal_max
+            ))),
+            Ok(VarInt::try_from(legal_max).expect("max legal varint")),
+            "2^62 - 1 is the maximum legal application error code"
+        );
+        let out_of_range = SessionApplicationErrorCode::from(1u64 << 62);
+        assert_eq!(
+            VarInt::try_from(QuicAppErrorCode(out_of_range)),
+            Err(1u64 << 62),
+            "1 << 62 exceeds the varint range and returns the original code"
+        );
+        assert_eq!(
+            u64::from(out_of_range),
+            1u64 << 62,
+            "failed conversion leaves the input unchanged"
+        );
+    }
+
+    #[test]
+    fn app_error_code_varint_rejects_out_of_range_with_session_error() {
+        let session = SessionId::from_raw(7);
+        let error = QuicWorker::app_error_code_varint(
+            session,
+            SessionApplicationErrorCode::from(1u64 << 62),
+        )
+        .expect_err("1 << 62 exceeds the varint range");
+        match error {
+            QuicWorkerError::ApplicationErrorCodeInvalid {
+                session: rejected,
+                code,
+            } => {
+                assert_eq!(rejected, session);
+                assert_eq!(code, 1u64 << 62, "original code is preserved");
+            }
+            other => panic!("unexpected error: {other:?}"),
+        }
+    }
+
+    fn test_quic_session() -> RuntimeResult<(
+        QuicWorker,
+        SessionWorker<Index>,
+        ApplicationId,
+        SessionId,
+        ContextId,
+        Index,
+    )> {
+        let applications = hammer_service::session::ApplicationMain::new(4);
+        let application = applications
+            .attach()
+            .map_err(hammer_runtime::RuntimeError::from)?;
+        let mut sessions = SessionWorker::<Index>::new(
+            DataWorkerId::new(0),
+            1,
+            hammer_runtime::app::AppSessionConfig::default(),
+            64,
+            Arc::clone(&applications),
+            None,
+        )?;
+        sessions.install_application_mq_for_test(application)?;
+        let mut worker = QuicWorker::new(DataWorkerId::new(0));
+        let listener = ListenerContext {
+            outer_listener: SessionListenerId::new(1, 1),
+            outer_application: ApplicationId::new(1, 1),
+            inner_application_listener: hammer_runtime::app::ApplicationListenerId::new(2, 1),
+            inner_session_listener: SessionListenerId::new(3, 1),
+            configuration: ConfigId::from_raw(4),
+            connection_timeout: 5,
+            server_config: None,
+        };
+        let context = worker
+            .accept_connection(
+                SessionId::from_raw(5),
+                ContextId::from(0x1234u64),
+                &listener,
+            )
+            .expect("accept connection");
+        let connection_index = Index::from(context);
+        let session = sessions.construct_transport_session(
+            QuicWorker::ID,
+            connection_index,
+            1,
+            application,
+            Some(hammer_runtime::app::SessionAppId::new(0)),
+            None,
+            None,
+            false,
+        )?;
+        let listener_index = worker
+            .contexts
+            .insert(Context::listener(
+                SessionListenerId::new(1, 1),
+                ApplicationId::new(1, 1),
+                hammer_runtime::app::ApplicationListenerId::new(2, 1),
+                SessionListenerId::new(3, 1),
+                ConfigId::from_raw(4),
+                5,
+                None,
+            ))
+            .expect("listener context capacity");
+        Ok((
+            worker,
+            sessions,
+            application,
+            session,
+            context,
+            listener_index,
+        ))
+    }
+
+    #[test]
+    fn session_context_resolves_quic_session_to_exact_context() -> RuntimeResult<()> {
+        let (worker, sessions, _, session, context, _) = test_quic_session()?;
+        let resolved = worker
+            .session_context(&sessions, session)
+            .expect("QUIC Session resolves");
+        assert_eq!(resolved, context);
+        Ok(())
+    }
+
+    #[test]
+    fn session_context_rejects_missing_session() -> RuntimeResult<()> {
+        let (worker, sessions, _, _, _, _) = test_quic_session()?;
+        let missing = SessionId::from_raw(0xDEAD);
+        assert!(matches!(
+            worker.session_context(&sessions, missing),
+            Err(QuicWorkerError::SessionMissing { session }) if session == missing
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn session_context_rejects_foreign_transport_session() -> RuntimeResult<()> {
+        let worker = QuicWorker::new(DataWorkerId::new(0));
+        let (sessions, foreign) = test_lower_session()?;
+        assert!(matches!(
+            worker.session_context(&sessions, foreign),
+            Err(QuicWorkerError::SessionNotQuic { session }) if session == foreign
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn session_context_rejects_non_stream_connection_context() -> RuntimeResult<()> {
+        let (worker, mut sessions, application, _, _, listener_index) = test_quic_session()?;
+        let non_quic = sessions.construct_transport_session(
+            QuicWorker::ID,
+            listener_index,
+            1,
+            application,
+            Some(hammer_runtime::app::SessionAppId::new(0)),
+            None,
+            None,
+            false,
+        )?;
+        assert!(matches!(
+            worker.session_context(&sessions, non_quic),
+            Err(QuicWorkerError::ContextMissing { context })
+                if context == ContextId::from(listener_index)
+        ));
+        Ok(())
+    }
+
+    /// Establishes a client QUIC connection and opens one stream child,
+    /// mirroring `open_stream_creates_direction_exact_child_carrying_app_context`;
+    /// returns the worker, sessions, application main, the bound AppServer
+    /// (kept alive so later stream opens can attach through its publisher),
+    /// parent connection context/Session, and the open stream
+    /// Session/index/StreamId.
+    fn test_established_stream() -> RuntimeResult<(
+        QuicWorker,
+        SessionWorker<Index>,
+        Arc<hammer_service::session::ApplicationMain>,
+        hammer_runtime::attach::AppServer,
+        ContextId,
+        SessionId,
+        SessionId,
+        Index,
+        quinn_proto::StreamId,
+    )> {
+        let applications = hammer_service::session::ApplicationMain::new(4);
+        let application = applications
+            .attach()
+            .map_err(hammer_runtime::RuntimeError::from)?;
+        let socket_path = unique_socket_path("hammer-quic-reset-stream");
+        let server =
+            hammer_runtime::attach::AppServer::bind(&socket_path, 1).expect("bind App server");
+        let mut sessions = hammer_service::session::SessionWorker::<Index>::new(
+            DataWorkerId::new(0),
+            1,
+            hammer_runtime::app::AppSessionConfig::default(),
+            64,
+            Arc::clone(&applications),
+            Some(server.publisher()),
+        )?;
+        sessions.install_session_app(
+            SessionAppId::new(0),
+            hammer_service::session::SessionAppCallbacks::all_none(),
+        )?;
+        sessions.install_application_mq_for_test(application)?;
+        let mut worker = QuicWorker::new(DataWorkerId::new(0));
+        let local = "127.0.0.1:443".parse().expect("local endpoint");
+        let remote = "127.0.0.1:444".parse().expect("remote endpoint");
+        let (client_config, server_config) = client_server_config_pair();
+        let parent_context = worker.allocate_client_connect(
+            Arc::clone(&client_config),
+            "localhost".to_owned(),
+            local,
+            remote,
+            application,
+            Some(SessionAppId::new(0)),
+            None,
+            SessionConnectionId::from_raw(7),
+        )?;
+        let now = Instant::now();
+        worker.connect_connection(parent_context, SessionId::from_raw(11), now)?;
+        drive_client_handshake(
+            &mut worker,
+            parent_context,
+            server_config,
+            local,
+            remote,
+            now,
+        )?;
+        let parent = sessions.construct_transport_session(
+            QuicWorker::ID,
+            parent_context.into(),
+            unique_allocation_owner(),
+            application,
+            None,
+            None,
+            None,
+            false,
+        )?;
+        worker
+            .contexts
+            .get_mut(parent_context.into())
+            .and_then(Context::connection_mut)
+            .ok_or(QuicWorkerError::ContextMissing {
+                context: parent_context,
+            })?
+            .connection_session = Some(parent);
+        worker
+            .contexts
+            .get_mut(parent_context.into())
+            .and_then(Context::connection_mut)
+            .ok_or(QuicWorkerError::ContextMissing {
+                context: parent_context,
+            })?
+            .state = ConnectionState::Established;
+        let bidi = worker.open_stream(
+            &applications,
+            &mut sessions,
+            parent,
+            SessionStreamDirection::Bidi,
+            0xB1D1,
+        )?;
+        let (_, bidi_index) = sessions
+            .session_transport(bidi)
+            .ok_or(QuicWorkerError::SessionMissing { session: bidi })?;
+        let bidi_id = worker
+            .contexts
+            .get(bidi_index)
+            .and_then(Context::stream_ref)
+            .ok_or(QuicWorkerError::ContextMissing {
+                context: ContextId::from(bidi_index),
+            })?
+            .stream;
+        let _ = std::fs::remove_file(socket_path);
+        Ok((
+            worker,
+            sessions,
+            applications,
+            server,
+            parent_context,
+            parent,
+            bidi,
+            bidi_index,
+            bidi_id,
+        ))
+    }
+
+    /// Probes the quinn send stream pinned by `stream`: true when it is
+    /// already in the terminal reset state (a redundant `reset` returns
+    /// `ClosedStream`). Probing itself resets an untouched stream, so it is
+    /// only used as the final assertion on a stream.
+    fn stream_already_reset(
+        worker: &mut QuicWorker,
+        parent: ContextId,
+        stream: quinn_proto::StreamId,
+    ) -> bool {
+        worker
+            .contexts
+            .get_mut(parent.into())
+            .and_then(Context::connection_mut)
+            .and_then(|connection| connection.engine.as_mut())
+            .and_then(|engine| engine.connection.as_mut())
+            .map(|connection| {
+                connection
+                    .send_stream(stream)
+                    .reset(quinn_proto::VarInt::from_u32(0))
+                    .is_err()
+            })
+            .unwrap_or(false)
+    }
+
+    /// Probes the quinn receive stream pinned by `stream`: true when it is
+    /// already stopped (a redundant `stop` returns `ClosedStream`, quinn
+    /// streams/recv.rs `Recv::stop`). Probing itself stops an untouched
+    /// stream, so it is only used as the final assertion on a stream.
+    fn stream_already_stopped(
+        worker: &mut QuicWorker,
+        parent: ContextId,
+        stream: quinn_proto::StreamId,
+    ) -> bool {
+        worker
+            .contexts
+            .get_mut(parent.into())
+            .and_then(Context::connection_mut)
+            .and_then(|connection| connection.engine.as_mut())
+            .and_then(|engine| engine.connection.as_mut())
+            .map(|connection| {
+                connection
+                    .recv_stream(stream)
+                    .stop(quinn_proto::VarInt::from_u32(0))
+                    .is_err()
+            })
+            .unwrap_or(false)
+    }
+
+    /// True when the worker-local quinn connection for `context` is closed.
+    fn connection_is_closed(worker: &QuicWorker, context: ContextId) -> bool {
+        worker
+            .contexts
+            .get(context.into())
+            .and_then(Context::connection)
+            .and_then(|connection| connection.engine.as_ref())
+            .and_then(|engine| engine.connection.as_ref())
+            .is_some_and(Connection::is_closed)
+    }
+
+    #[test]
+    fn reset_stream_resets_exact_stream_and_leaves_connection_untouched() -> RuntimeResult<()> {
+        let (
+            mut worker,
+            mut sessions,
+            applications,
+            _server,
+            parent_context,
+            parent,
+            bidi,
+            bidi_index,
+            bidi_id,
+        ) = test_established_stream()?;
+        let uni = worker.open_stream(
+            &applications,
+            &mut sessions,
+            parent,
+            SessionStreamDirection::Uni,
+            0x55,
+        )?;
+        let (_, uni_index) = sessions
+            .session_transport(uni)
+            .ok_or(QuicWorkerError::SessionMissing { session: uni })?;
+        let uni_id = worker
+            .contexts
+            .get(uni_index)
+            .and_then(Context::stream_ref)
+            .ok_or(QuicWorkerError::ContextMissing {
+                context: ContextId::from(uni_index),
+            })?
+            .stream;
+
+        worker.reset_stream(&mut sessions, bidi, SessionApplicationErrorCode::from(42))?;
+
+        assert!(
+            stream_already_reset(&mut worker, parent_context, bidi_id),
+            "the exact stream pinned by the Session is reset at the quinn level"
+        );
+        assert!(
+            !stream_already_reset(&mut worker, parent_context, uni_id),
+            "the sibling stream is untouched"
+        );
+        assert!(
+            sessions.session_transport(bidi).is_some(),
+            "the stream Session survives the reset"
+        );
+        assert!(
+            worker
+                .contexts
+                .get(bidi_index)
+                .and_then(Context::stream_ref)
+                .is_some(),
+            "the stream context survives the reset"
+        );
+        let state = worker
+            .contexts
+            .get(parent_context.into())
+            .and_then(Context::connection)
+            .map(|connection| connection.state)
+            .ok_or(QuicWorkerError::ContextMissing {
+                context: parent_context,
+            })?;
+        assert_eq!(
+            state,
+            ConnectionState::Established,
+            "the parent connection is untouched by the stream reset"
+        );
+        let after = worker.open_stream(
+            &applications,
+            &mut sessions,
+            parent,
+            SessionStreamDirection::Bidi,
+            0xA5,
+        )?;
+        worker.reset_stream(&mut sessions, after, SessionApplicationErrorCode::from(0))?;
+        Ok(())
+    }
+
+    #[test]
+    fn reset_stream_rejects_out_of_range_code_before_any_side_effect() -> RuntimeResult<()> {
+        let (
+            mut worker,
+            mut sessions,
+            applications,
+            _server,
+            parent_context,
+            parent,
+            bidi,
+            _,
+            bidi_id,
+        ) = test_established_stream()?;
+        let error = worker
+            .reset_stream(
+                &mut sessions,
+                bidi,
+                SessionApplicationErrorCode::from(1u64 << 62),
+            )
+            .expect_err("code beyond the varint range is rejected");
+        assert!(
+            matches!(
+                &error,
+                RuntimeError::Subsystem { source, .. }
+                    if matches!(
+                        source.downcast_ref::<QuicWorkerError>(),
+                        Some(QuicWorkerError::ApplicationErrorCodeInvalid { session, .. })
+                            if session == &bidi
+                    )
+            ),
+            "typed ApplicationErrorCodeInvalid expected, got {error:?}"
+        );
+        assert!(
+            !stream_already_reset(&mut worker, parent_context, bidi_id),
+            "the rejected code performed no transport side effect"
+        );
+        // The probe above consumed the pinned stream (its final assertion
+        // resets it), so a valid code is proven on a fresh sibling stream.
+        let after = worker.open_stream(
+            &applications,
+            &mut sessions,
+            parent,
+            SessionStreamDirection::Bidi,
+            0xB1D2,
+        )?;
+        worker.reset_stream(&mut sessions, after, SessionApplicationErrorCode::from(0))?;
+        Ok(())
+    }
+
+    #[test]
+    fn reset_stream_rejects_engine_closed_stream_before_side_effects() -> RuntimeResult<()> {
+        let (mut worker, mut sessions, _, _server, parent_context, _, bidi, bidi_index, bidi_id) =
+            test_established_stream()?;
+        worker
+            .contexts
+            .get_mut(bidi_index)
+            .and_then(Context::stream_mut)
+            .expect("stream context")
+            .flags |= STREAM_ENGINE_CLOSED;
+        let error = worker
+            .reset_stream(&mut sessions, bidi, SessionApplicationErrorCode::from(0))
+            .expect_err("an engine-closed stream is stale");
+        assert!(
+            matches!(
+                &error,
+                RuntimeError::Subsystem { source, .. }
+                    if matches!(
+                        source.downcast_ref::<QuicWorkerError>(),
+                        Some(QuicWorkerError::StreamMissing { stream }) if stream == &bidi_id
+                    )
+            ),
+            "typed StreamMissing expected, got {error:?}"
+        );
+        assert!(
+            !stream_already_reset(&mut worker, parent_context, bidi_id),
+            "the stale rejection performed no transport side effect"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn reset_stream_rejects_connection_session_without_side_effects() -> RuntimeResult<()> {
+        let (mut worker, mut sessions, _, session, context, _) = test_quic_session()?;
+        let error = worker
+            .reset_stream(&mut sessions, session, SessionApplicationErrorCode::from(0))
+            .expect_err("a connection Session is not a stream");
+        assert!(
+            matches!(
+                &error,
+                RuntimeError::Subsystem { source, .. }
+                    if matches!(
+                        source.downcast_ref::<QuicWorkerError>(),
+                        Some(QuicWorkerError::SessionNotStream { session: rejected })
+                            if rejected == &session
+                    )
+            ),
+            "typed SessionNotStream expected, got {error:?}"
+        );
+        assert!(
+            worker
+                .contexts
+                .get(context.into())
+                .and_then(Context::connection)
+                .is_some(),
+            "the connection context is untouched"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn reset_stream_rejects_missing_session() -> RuntimeResult<()> {
+        let (mut worker, mut sessions, _, _, _, _) = test_quic_session()?;
+        let missing = SessionId::from_raw(0xDEAD);
+        assert!(matches!(
+            worker.reset_stream(&mut sessions, missing, SessionApplicationErrorCode::from(0)),
+            Err(RuntimeError::Subsystem { source, .. })
+                if matches!(source.downcast_ref::<QuicWorkerError>(), Some(QuicWorkerError::SessionMissing { .. }))
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn reset_stream_rejects_foreign_transport_session() -> RuntimeResult<()> {
+        let mut worker = QuicWorker::new(DataWorkerId::new(0));
+        let (mut sessions, foreign) = test_lower_session()?;
+        assert!(matches!(
+            worker.reset_stream(&mut sessions, foreign, SessionApplicationErrorCode::from(0)),
+            Err(RuntimeError::Subsystem { source, .. })
+                if matches!(source.downcast_ref::<QuicWorkerError>(), Some(QuicWorkerError::SessionNotQuic { .. }))
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn reset_stream_dispatch_reaches_transport_then_app_close_suppresses_repeats()
+    -> RuntimeResult<()> {
+        let (worker, mut sessions, _, _server, _, _, bidi, bidi_index, _) =
+            test_established_stream()?;
+        sessions.install_transport_actions(QuicWorker::ID, quic_transport_actions())?;
+        // Generic dispatch rejects a Session unknown to the Session Worker
+        // before any transport work (session.c:1675).
+        assert!(matches!(
+            sessions.reset_stream(
+                SessionId::from_raw(0xDEAD),
+                SessionApplicationErrorCode::from(0)
+            ),
+            Err(SessionTransportActionError::InvalidSession { .. })
+        ));
+        // A live stream dispatches through the AppClose guard to the QUIC
+        // action wrapper. The wrapper needs the process-global QUIC_MAIN
+        // worker channel, which unit tests do not own, so it fails typed
+        // without touching any worker state.
+        assert!(matches!(
+            &sessions.reset_stream(bidi, SessionApplicationErrorCode::from(7)),
+            Err(SessionTransportActionError::TransportActionFailed { action, .. })
+                if *action == "reset_stream"
+        ));
+        assert!(
+            sessions.session_app_closed(bidi),
+            "the dispatch guard records AppClosed before the transport is notified"
+        );
+        // Repeated dispatch is suppressed by Session state: Ok(()) with no
+        // transport work, even for a code the transport would reject.
+        assert!(matches!(
+            sessions.reset_stream(bidi, SessionApplicationErrorCode::from(1u64 << 62)),
+            Ok(())
+        ));
+        assert!(
+            worker
+                .contexts
+                .get(bidi_index)
+                .and_then(Context::stream_ref)
+                .is_some(),
+            "the suppressed dispatch leaves the stream context untouched"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn stop_sending_stops_exact_recv_stream_and_leaves_others_untouched() -> RuntimeResult<()> {
+        let (
+            mut worker,
+            mut sessions,
+            applications,
+            _server,
+            parent_context,
+            parent,
+            bidi,
+            bidi_index,
+            bidi_id,
+        ) = test_established_stream()?;
+        let sibling = worker.open_stream(
+            &applications,
+            &mut sessions,
+            parent,
+            SessionStreamDirection::Bidi,
+            0x55,
+        )?;
+        let (_, sibling_index) = sessions
+            .session_transport(sibling)
+            .ok_or(QuicWorkerError::SessionMissing { session: sibling })?;
+        let sibling_id = worker
+            .contexts
+            .get(sibling_index)
+            .and_then(Context::stream_ref)
+            .ok_or(QuicWorkerError::ContextMissing {
+                context: ContextId::from(sibling_index),
+            })?
+            .stream;
+        let queued = worker.connection_tx_pending.len();
+
+        worker.stop_sending(&mut sessions, bidi, SessionApplicationErrorCode::from(42))?;
+
+        assert_eq!(
+            worker.connection_tx_pending.len(),
+            queued + 1,
+            "the STOP_SENDING frame queues the parent connection for output"
+        );
+        assert_eq!(
+            worker.connection_tx_pending.last(),
+            Some(&parent_context),
+            "the queued output is the parent connection of the stopped stream"
+        );
+        assert!(
+            stream_already_stopped(&mut worker, parent_context, bidi_id),
+            "the exact receive stream pinned by the Session is stopped at the quinn level"
+        );
+        assert!(
+            !stream_already_reset(&mut worker, parent_context, bidi_id),
+            "the send side of the stopped stream is untouched"
+        );
+        assert!(
+            !stream_already_stopped(&mut worker, parent_context, sibling_id),
+            "the sibling receive stream is untouched"
+        );
+        assert!(
+            sessions.session_transport(bidi).is_some(),
+            "the stream Session survives the stop"
+        );
+        assert!(
+            worker
+                .contexts
+                .get(bidi_index)
+                .and_then(Context::stream_ref)
+                .is_some(),
+            "the stream context survives the stop"
+        );
+        let state = worker
+            .contexts
+            .get(parent_context.into())
+            .and_then(Context::connection)
+            .map(|connection| connection.state)
+            .ok_or(QuicWorkerError::ContextMissing {
+                context: parent_context,
+            })?;
+        assert_eq!(
+            state,
+            ConnectionState::Established,
+            "the parent connection is untouched by the stream stop"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn stop_sending_skips_completed_receive_before_any_frame() -> RuntimeResult<()> {
+        let mut relay = peer_relay_established()?;
+        let stream = relay
+            .client_connection
+            .streams()
+            .open(quinn_proto::Dir::Bi)
+            .expect("open peer bidirectional stream");
+        relay
+            .client_connection
+            .send_stream(stream)
+            .write(&[0x5A; 3])
+            .expect("peer writes stream data");
+        relay
+            .client_connection
+            .send_stream(stream)
+            .finish()
+            .expect("finish peer stream data");
+        // The auto-accepted child Session appears on the worker once the
+        // peer's STREAM frame is processed; the FIN and every byte then sit
+        // unread in the recv buffer (transfer complete, still `Recv` state).
+        let child = loop {
+            let child = relay
+                .worker
+                .contexts
+                .get(relay.context.into())
+                .and_then(Context::connection)
+                .and_then(|connection| connection.engine.as_ref())
+                .and_then(|engine| engine.io_table.stream_session(stream));
+            if let Some(child) = child {
+                break child;
+            }
+            peer_relay_exchange(&mut relay)?;
+        };
+        assert!(
+            worker_connection_mut(&mut relay.worker.contexts, relay.context)?
+                .recv_stream(stream)
+                .receive_transfer_complete(),
+            "the peer FIN and every byte are fully received"
+        );
+        let queued = relay.worker.connection_tx_pending.len();
+        relay
+            .worker
+            .stop_sending(&mut relay.sessions, child, SessionApplicationErrorCode::from(42))?;
+        assert_eq!(
+            relay.worker.connection_tx_pending.len(),
+            queued,
+            "a completed receive side queues no STOP_SENDING output"
+        );
+        assert!(
+            worker_connection_mut(&mut relay.worker.contexts, relay.context)?
+                .recv_stream(stream)
+                .received_reset()
+                .is_ok(),
+            "the completed receive stream is not stopped"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn stop_sending_rejects_out_of_range_code_before_any_side_effect() -> RuntimeResult<()> {
+        let (
+            mut worker,
+            mut sessions,
+            applications,
+            _server,
+            parent_context,
+            parent,
+            bidi,
+            _,
+            bidi_id,
+        ) = test_established_stream()?;
+        let queued = worker.connection_tx_pending.len();
+        let error = worker
+            .stop_sending(
+                &mut sessions,
+                bidi,
+                SessionApplicationErrorCode::from(1u64 << 62),
+            )
+            .expect_err("code beyond the varint range is rejected");
+        assert!(
+            matches!(
+                &error,
+                RuntimeError::Subsystem { source, .. }
+                    if matches!(
+                        source.downcast_ref::<QuicWorkerError>(),
+                        Some(QuicWorkerError::ApplicationErrorCodeInvalid { session, .. })
+                            if session == &bidi
+                    )
+            ),
+            "typed ApplicationErrorCodeInvalid expected, got {error:?}"
+        );
+        assert_eq!(
+            worker.connection_tx_pending.len(),
+            queued,
+            "the rejected code performed no transport side effect"
+        );
+        assert!(
+            !stream_already_stopped(&mut worker, parent_context, bidi_id),
+            "the receive stream is untouched by the rejected code"
+        );
+        // The probe above stopped the pinned stream, so a valid code is
+        // proven on a fresh sibling stream.
+        let after = worker.open_stream(
+            &applications,
+            &mut sessions,
+            parent,
+            SessionStreamDirection::Bidi,
+            0xB1D2,
+        )?;
+        worker.stop_sending(&mut sessions, after, SessionApplicationErrorCode::from(0))?;
+        Ok(())
+    }
+
+    #[test]
+    fn stop_sending_rejects_engine_closed_stream_before_side_effects() -> RuntimeResult<()> {
+        let (mut worker, mut sessions, _, _server, parent_context, _, bidi, bidi_index, bidi_id) =
+            test_established_stream()?;
+        worker
+            .contexts
+            .get_mut(bidi_index)
+            .and_then(Context::stream_mut)
+            .expect("stream context")
+            .flags |= STREAM_ENGINE_CLOSED;
+        let queued = worker.connection_tx_pending.len();
+        let error = worker
+            .stop_sending(&mut sessions, bidi, SessionApplicationErrorCode::from(0))
+            .expect_err("an engine-closed stream is stale");
+        assert!(
+            matches!(
+                &error,
+                RuntimeError::Subsystem { source, .. }
+                    if matches!(
+                        source.downcast_ref::<QuicWorkerError>(),
+                        Some(QuicWorkerError::StreamMissing { stream }) if stream == &bidi_id
+                    )
+            ),
+            "typed StreamMissing expected, got {error:?}"
+        );
+        assert_eq!(
+            worker.connection_tx_pending.len(),
+            queued,
+            "the stale rejection performed no transport side effect"
+        );
+        assert!(
+            !stream_already_stopped(&mut worker, parent_context, bidi_id),
+            "the stale rejection performed no transport side effect"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn stop_sending_rejects_uni_send_only_stream_before_side_effects() -> RuntimeResult<()> {
+        let (mut worker, mut sessions, applications, _server, parent_context, parent, _, _, _) =
+            test_established_stream()?;
+        let uni = worker.open_stream(
+            &applications,
+            &mut sessions,
+            parent,
+            SessionStreamDirection::Uni,
+            0x11,
+        )?;
+        let (_, uni_index) = sessions
+            .session_transport(uni)
+            .ok_or(QuicWorkerError::SessionMissing { session: uni })?;
+        let uni_id = worker
+            .contexts
+            .get(uni_index)
+            .and_then(Context::stream_ref)
+            .ok_or(QuicWorkerError::ContextMissing {
+                context: ContextId::from(uni_index),
+            })?
+            .stream;
+        let queued = worker.connection_tx_pending.len();
+        let error = worker
+            .stop_sending(&mut sessions, uni, SessionApplicationErrorCode::from(0))
+            .expect_err("a client-initiated uni stream has no receive side");
+        assert!(
+            matches!(
+                &error,
+                RuntimeError::Subsystem { source, .. }
+                    if matches!(
+                        source.downcast_ref::<QuicWorkerError>(),
+                        Some(QuicWorkerError::StreamReceiveSideMissing { stream })
+                            if stream == &uni_id
+                    )
+            ),
+            "typed StreamReceiveSideMissing expected, got {error:?}"
+        );
+        assert_eq!(
+            worker.connection_tx_pending.len(),
+            queued,
+            "the rejected stream performed no transport side effect"
+        );
+        assert!(
+            worker
+                .contexts
+                .get(parent_context.into())
+                .and_then(Context::connection)
+                .is_some(),
+            "the connection context is untouched"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn stop_sending_rejects_connection_session_without_side_effects() -> RuntimeResult<()> {
+        let (mut worker, mut sessions, _, session, context, _) = test_quic_session()?;
+        let error = worker
+            .stop_sending(&mut sessions, session, SessionApplicationErrorCode::from(0))
+            .expect_err("a connection Session is not a stream");
+        assert!(
+            matches!(
+                &error,
+                RuntimeError::Subsystem { source, .. }
+                    if matches!(
+                        source.downcast_ref::<QuicWorkerError>(),
+                        Some(QuicWorkerError::SessionNotStream { session: rejected })
+                            if rejected == &session
+                    )
+            ),
+            "typed SessionNotStream expected, got {error:?}"
+        );
+        assert!(
+            worker
+                .contexts
+                .get(context.into())
+                .and_then(Context::connection)
+                .is_some(),
+            "the connection context is untouched"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn stop_sending_rejects_missing_session() -> RuntimeResult<()> {
+        let (mut worker, mut sessions, _, _, _, _) = test_quic_session()?;
+        let missing = SessionId::from_raw(0xDEAD);
+        assert!(matches!(
+            worker.stop_sending(&mut sessions, missing, SessionApplicationErrorCode::from(0)),
+            Err(RuntimeError::Subsystem { source, .. })
+                if matches!(source.downcast_ref::<QuicWorkerError>(), Some(QuicWorkerError::SessionMissing { .. }))
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn stop_sending_rejects_foreign_transport_session() -> RuntimeResult<()> {
+        let mut worker = QuicWorker::new(DataWorkerId::new(0));
+        let (mut sessions, foreign) = test_lower_session()?;
+        assert!(matches!(
+            worker.stop_sending(&mut sessions, foreign, SessionApplicationErrorCode::from(0)),
+            Err(RuntimeError::Subsystem { source, .. })
+                if matches!(source.downcast_ref::<QuicWorkerError>(), Some(QuicWorkerError::SessionNotQuic { .. }))
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn stop_sending_repeated_active_call_follows_quinn_semantics() -> RuntimeResult<()> {
+        let (mut worker, mut sessions, _, _server, parent_context, _, bidi, _, bidi_id) =
+            test_established_stream()?;
+        worker.stop_sending(&mut sessions, bidi, SessionApplicationErrorCode::from(9))?;
+        let queued = worker.connection_tx_pending.len();
+        let error = worker
+            .stop_sending(&mut sessions, bidi, SessionApplicationErrorCode::from(9))
+            .expect_err("a second stop on the same receive stream is ClosedStream");
+        assert!(
+            matches!(
+                &error,
+                RuntimeError::Subsystem { source, .. }
+                    if matches!(
+                        source.downcast_ref::<QuicWorkerError>(),
+                        Some(QuicWorkerError::StreamStop { stream, .. })
+                            if stream == &bidi_id
+                    )
+            ),
+            "typed StreamStop expected, got {error:?}"
+        );
+        assert_eq!(
+            worker.connection_tx_pending.len(),
+            queued,
+            "the repeated stop queues no additional output"
+        );
+        assert!(
+            stream_already_stopped(&mut worker, parent_context, bidi_id),
+            "the receive stream remains stopped"
+        );
+        assert!(
+            sessions.session_transport(bidi).is_some(),
+            "the stream Session stays active after the repeated stop"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn stop_sending_dispatch_reaches_transport_without_app_close() -> RuntimeResult<()> {
+        let (worker, mut sessions, _, _server, _, _, bidi, bidi_index, _) =
+            test_established_stream()?;
+        sessions.install_transport_actions(QuicWorker::ID, quic_transport_actions())?;
+        // Generic dispatch rejects a Session unknown to the Session Worker
+        // before any transport work (session.c:1675).
+        assert!(matches!(
+            sessions.stop_sending(
+                SessionId::from_raw(0xDEAD),
+                SessionApplicationErrorCode::from(0)
+            ),
+            Err(SessionTransportActionError::InvalidSession { .. })
+        ));
+        // A live stream dispatches through the Active-only guard to the QUIC
+        // action wrapper, which needs the process-global QUIC_MAIN worker
+        // channel that unit tests do not own, so it fails typed without
+        // touching any worker state.
+        assert!(matches!(
+            &sessions.stop_sending(bidi, SessionApplicationErrorCode::from(7)),
+            Err(SessionTransportActionError::TransportActionFailed { action, .. })
+                if *action == "stop_sending"
+        ));
+        assert!(
+            !sessions.session_app_closed(bidi),
+            "stop_sending is half-close: it never records AppClosed"
+        );
+        // Unlike reset, half-close leaves the Session Active, so repeated
+        // dispatch keeps reaching the transport instead of being suppressed
+        // by the AppClosed guard.
+        assert!(matches!(
+            &sessions.stop_sending(bidi, SessionApplicationErrorCode::from(7)),
+            Err(SessionTransportActionError::TransportActionFailed { action, .. })
+                if *action == "stop_sending"
+        ));
+        assert!(
+            !sessions.session_app_closed(bidi),
+            "repeated stop_sending still records no AppClosed"
+        );
+        assert!(
+            worker
+                .contexts
+                .get(bidi_index)
+                .and_then(Context::stream_ref)
+                .is_some(),
+            "the dispatch failure leaves the stream context untouched"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn close_connection_rejects_stream_session_before_any_side_effect() -> RuntimeResult<()> {
+        let (mut worker, mut sessions, _, _server, parent_context, _, bidi, _, _) =
+            test_established_stream()?;
+        let queued = worker.connection_tx_pending.len();
+
+        let error = worker
+            .close_connection_action(
+                &mut sessions,
+                bidi,
+                SessionApplicationErrorCode::from(0),
+                b"",
+            )
+            .expect_err("a stream Session is not a connection Session");
+
+        assert!(
+            matches!(
+                &error,
+                RuntimeError::Subsystem { source, .. }
+                    if matches!(
+                        source.downcast_ref::<QuicWorkerError>(),
+                        Some(QuicWorkerError::SessionNotConnection { session })
+                            if session == &bidi
+                    )
+            ),
+            "typed SessionNotConnection expected, got {error:?}"
+        );
+        assert_eq!(
+            worker.connection_tx_pending.len(),
+            queued,
+            "no output is queued for the rejected close"
+        );
+        assert!(
+            !connection_is_closed(&worker, parent_context),
+            "the parent connection is untouched"
+        );
+        assert_eq!(
+            worker
+                .contexts
+                .get(parent_context.into())
+                .and_then(Context::connection)
+                .map(|connection| connection.state),
+            Some(ConnectionState::Established)
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn close_connection_rejects_out_of_range_code_before_any_side_effect() -> RuntimeResult<()> {
+        let mut relay = peer_relay_established()?;
+        peer_relay_exchange(&mut relay)?;
+        relay
+            .worker
+            .schedule_connection_outputs(&mut relay.sessions, relay.now)?;
+        let queued = relay.worker.connection_tx_pending.len();
+
+        let error = relay
+            .worker
+            .close_connection_action(
+                &mut relay.sessions,
+                relay.connection_session,
+                SessionApplicationErrorCode::from(u64::MAX),
+                b"overflow",
+            )
+            .expect_err("2^64-1 is outside the varint range");
+
+        assert!(
+            matches!(
+                &error,
+                RuntimeError::Subsystem { source, .. }
+                    if matches!(
+                        source.downcast_ref::<QuicWorkerError>(),
+                        Some(QuicWorkerError::ApplicationErrorCodeInvalid { .. })
+                    )
+            ),
+            "typed ApplicationErrorCodeInvalid expected, got {error:?}"
+        );
+        assert_eq!(
+            relay.worker.connection_tx_pending.len(),
+            queued,
+            "no output is queued for the rejected close"
+        );
+        assert!(
+            !connection_is_closed(&relay.worker, relay.context),
+            "the connection is not closed before the code is validated"
+        );
+        assert_eq!(
+            relay
+                .worker
+                .contexts
+                .get(relay.context.into())
+                .and_then(Context::connection)
+                .map(|connection| connection.state),
+            Some(ConnectionState::Established)
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn close_connection_closes_established_connection_and_transmits_to_peer() -> RuntimeResult<()> {
+        let mut relay = peer_relay_established()?;
+        peer_relay_exchange(&mut relay)?;
+        relay
+            .worker
+            .schedule_connection_outputs(&mut relay.sessions, relay.now)?;
+        let queued = relay.worker.connection_tx_pending.len();
+
+        relay
+            .worker
+            .close_connection_action(
+                &mut relay.sessions,
+                relay.connection_session,
+                SessionApplicationErrorCode::from(42),
+                b"shutting down",
+            )
+            .expect("close an established connection");
+
+        assert_eq!(
+            relay
+                .worker
+                .contexts
+                .get(relay.context.into())
+                .and_then(Context::connection)
+                .map(|connection| connection.state),
+            Some(ConnectionState::ActiveClosing),
+            "VPP OPENED/HANDSHAKE/READY -> ACTIVE_CLOSING (quic_quicly.c:1150-1162)"
+        );
+        assert_eq!(
+            relay.worker.connection_tx_pending.len(),
+            queued + 1,
+            "the close queues the connection for output"
+        );
+        assert_eq!(
+            relay.worker.connection_tx_pending.last(),
+            Some(&relay.context),
+            "the queued output is the closed connection"
+        );
+        assert!(
+            connection_is_closed(&relay.worker, relay.context),
+            "the worker-local quinn connection is closed with the app code and reason"
+        );
+
+        // Drive the queued CONNECTION_CLOSE datagram and hand it to the peer.
+        relay
+            .worker
+            .schedule_connection_outputs(&mut relay.sessions, relay.now)?;
+        let (_, lower_tx) = relay
+            .sessions
+            .fifo_pair(relay.lower)
+            .ok_or_else(|| QuicWorkerError::SessionMissing {
+                session: relay.lower,
+            })?;
+        let mut responses = Vec::new();
+        loop {
+            if lower_tx.max_dequeue() < SessionDgramHeader::SIZE {
+                break;
+            }
+            let mut header_bytes = [0u8; SessionDgramHeader::SIZE];
+            assert_eq!(
+                lower_tx.peek(0, header_bytes.len(), &mut header_bytes),
+                header_bytes.len()
+            );
+            let Some(header) = SessionDgramHeader::from_bytes(&header_bytes) else {
+                break;
+            };
+            let payload_len = header.data_length() as usize;
+            let record_len = header.total_len().ok_or_else(|| {
+                QuicWorkerError::InvalidDatagram {
+                    session: relay.lower,
+                    length: header.data_length(),
+                }
+            })?;
+            if lower_tx.max_dequeue() < record_len {
+                break;
+            }
+            let mut payload = vec![0; payload_len];
+            assert_eq!(
+                lower_tx.peek(SessionDgramHeader::SIZE, payload_len, &mut payload),
+                payload_len
+            );
+            assert_eq!(lower_tx.dequeue_drop(record_len), record_len);
+            responses.push(payload);
+        }
+        for mut data in responses {
+            let mut descriptors = Vec::new();
+            let mut endpoint_buf = BytesMut::with_capacity(MAX_PACKET_SIZE);
+            if let Some(event) = relay.client_endpoint.handle_scratch_with_descriptors(
+                relay.now,
+                relay.server_addr,
+                None,
+                None,
+                &mut data,
+                &mut descriptors,
+                &mut endpoint_buf,
+            ) {
+                match event {
+                    DatagramEvent::ConnectionEvent(handle, event)
+                        if handle == relay.client_handle =>
+                    {
+                        relay.client_connection.handle_event(event);
+                    }
+                    DatagramEvent::Response(transmit) => {
+                        relay
+                            .to_server
+                            .push_back(endpoint_buf.split_to(transmit.size));
+                        endpoint_buf.reserve(MAX_PACKET_SIZE);
+                    }
+                    DatagramEvent::NewConnection(_) | DatagramEvent::ConnectionEvent(_, _) => {}
+                }
+            }
+        }
+        assert!(
+            relay.client_connection.is_closed(),
+            "the peer observes the transmitted CONNECTION_CLOSE"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn close_connection_during_handshake_starts_active_closing() -> RuntimeResult<()> {
+        let mut relay = peer_relay_established()?;
+        relay
+            .worker
+            .contexts
+            .get_mut(relay.context.into())
+            .and_then(Context::connection_mut)
+            .ok_or_else(|| QuicWorkerError::ContextMissing {
+                context: relay.context,
+            })?
+            .state = ConnectionState::Handshaking;
+        let queued = relay.worker.connection_tx_pending.len();
+
+        relay
+            .worker
+            .close_connection_action(
+                &mut relay.sessions,
+                relay.connection_session,
+                SessionApplicationErrorCode::from(1),
+                b"abort",
+            )
+            .expect("closing a handshaking connection is allowed");
+
+        assert_eq!(
+            relay
+                .worker
+                .contexts
+                .get(relay.context.into())
+                .and_then(Context::connection)
+                .map(|connection| connection.state),
+            Some(ConnectionState::ActiveClosing),
+            "VPP HANDSHAKE -> ACTIVE_CLOSING (quic_quicly.c:1150-1162)"
+        );
+        assert_eq!(
+            relay.worker.connection_tx_pending.len(),
+            queued + 1,
+            "the close queues the connection for output"
+        );
+        assert!(connection_is_closed(&relay.worker, relay.context));
+        Ok(())
+    }
+
+    #[test]
+    fn close_connection_repeats_are_idempotent_after_active_closing() -> RuntimeResult<()> {
+        let mut relay = peer_relay_established()?;
+        relay
+            .worker
+            .close_connection_action(
+                &mut relay.sessions,
+                relay.connection_session,
+                SessionApplicationErrorCode::from(42),
+                b"shutting down",
+            )
+            .expect("first close");
+        let queued = relay.worker.connection_tx_pending.len();
+
+        relay
+            .worker
+            .close_connection_action(
+                &mut relay.sessions,
+                relay.connection_session,
+                SessionApplicationErrorCode::from(7),
+                b"again",
+            )
+            .expect("repeated close on an ActiveClosing connection is a no-op");
+
+        assert_eq!(
+            relay
+                .worker
+                .contexts
+                .get(relay.context.into())
+                .and_then(Context::connection)
+                .map(|connection| connection.state),
+            Some(ConnectionState::ActiveClosing),
+            "VPP ACTIVE_CLOSING is left alone (quic_quicly.c:1171-1172)"
+        );
+        assert_eq!(
+            relay.worker.connection_tx_pending.len(),
+            queued,
+            "the repeated close queues no additional output"
+        );
+        assert!(connection_is_closed(&relay.worker, relay.context));
+        Ok(())
+    }
+
+    #[test]
+    fn close_connection_passive_closing_marks_app_closed() -> RuntimeResult<()> {
+        let (mut sessions, lower) = test_lower_session()?;
+        let mut worker = QuicWorker::new(DataWorkerId::new(0));
+        let context = worker
+            .contexts
+            .insert(Context::connection_with_listener(
+                lower,
+                None,
+                ApplicationId::new(1, 1),
+                None,
+                None,
+                None,
+            ))
+            .map(ContextId::from)
+            .ok_or(QuicWorkerError::ContextCapacityExhausted {
+                capacity: worker.contexts.capacity(),
+            })?;
+        let connection_session = sessions.insert_session_for_test(QuicWorker::ID, context.into());
+        worker
+            .contexts
+            .get_mut(context.into())
+            .and_then(Context::connection_mut)
+            .ok_or(QuicWorkerError::ContextMissing { context })?
+            .connection_session = Some(connection_session);
+        worker
+            .contexts
+            .get_mut(context.into())
+            .and_then(Context::connection_mut)
+            .ok_or(QuicWorkerError::ContextMissing { context })?
+            .state = ConnectionState::PassiveClosing;
+
+        worker.close_connection_action(
+            &mut sessions,
+            connection_session,
+            SessionApplicationErrorCode::from(0),
+            b"",
+        )?;
+
+        assert_eq!(
+            worker
+                .contexts
+                .get(context.into())
+                .and_then(Context::connection)
+                .map(|connection| connection.state),
+            Some(ConnectionState::PassiveClosingAppClosed),
+            "VPP PASSIVE_CLOSING -> PASSIVE_CLOSING_APP_CLOSED (quic_quicly.c:1163-1167)"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn close_connection_dispatch_records_app_closed_and_suppresses_repeat() -> RuntimeResult<()> {
+        let (worker, mut sessions, _, _server, _, _, bidi, bidi_index, _) =
+            test_established_stream()?;
+        sessions.install_transport_actions(QuicWorker::ID, quic_transport_actions())?;
+        // The first dispatch passes the pre-close guard (AppClosed recorded)
+        // and reaches the QUIC action wrapper, which needs the process-global
+        // QUIC_MAIN worker channel that unit tests do not own, so it fails
+        // typed without touching any worker state (mirrors the stop_sending
+        // dispatch test).
+        assert!(matches!(
+            &sessions.close_connection(bidi, SessionApplicationErrorCode::from(3), b"shutting down"),
+            Err(SessionTransportActionError::TransportActionFailed { action, .. })
+                if *action == "close_connection"
+        ));
+        assert!(
+            sessions.session_app_closed(bidi),
+            "close_connection records AppClosed before dispatch (session.c:1657-1682)"
+        );
+        // A repeated dispatch is suppressed by the AppClosed guard with Ok,
+        // matching VPP pre-close-only dispatch.
+        assert!(sessions
+            .close_connection(bidi, SessionApplicationErrorCode::from(3), b"shutting down")
+            .is_ok());
+        assert!(sessions.session_app_closed(bidi));
+        assert!(
+            worker
+                .contexts
+                .get(bidi_index)
+                .and_then(Context::stream_ref)
+                .is_some(),
+            "the dispatch leaves the worker context untouched"
         );
         Ok(())
     }

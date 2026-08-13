@@ -27,6 +27,7 @@ use hammer_runtime::app::{
     SessionMqRing, SessionMsgQueue, SessionMsgQueueError,
 };
 use hammer_runtime::attach::AppSessionPublisher;
+use hammer_runtime::session::{SessionApplicationErrorCode, SessionStreamDirection};
 use hammer_runtime::{
     AttachError, RuntimeError, RuntimeResult, SessionConnectEndpoint, SessionConnectionId,
     SessionListenEndpoint, SessionListenerId, SessionTransportRegistration,
@@ -38,7 +39,7 @@ use hammer_runtime::{
 
 use crate::session::app::AppWorkerError;
 use crate::session::application::{ApplicationMain, ApplicationMqResources};
-use crate::session::error::{SessionError, SessionQueueError};
+use crate::session::error::{SessionError, SessionQueueError, SessionTransportActionError};
 use crate::session::lookup::{SessionEndpointLookup, SessionEndpointState};
 use crate::session::node::{AppSessionInputNode, SessionQueueTransportDispatch};
 use crate::session::protocol::SessionAppCallbacks;
@@ -358,6 +359,8 @@ struct SessionEntry<Index> {
     listener: Option<SessionHandle>,
     flags: SessionFlags,
     lower_session: Option<SessionId>,
+    upper_session: Option<SessionId>,
+    parent_session: Option<SessionId>,
     rx_fifo: Arc<Fifo>,
     tx_fifo: Arc<Fifo>,
     schedule_pending: bool,
@@ -386,6 +389,8 @@ impl<Index: Copy + Eq> SessionEntry<Index> {
             listener: None,
             flags: SessionFlags::empty(),
             lower_session: None,
+            upper_session: None,
+            parent_session: None,
             rx_fifo,
             tx_fifo,
             schedule_pending: false,
@@ -407,12 +412,132 @@ impl<Index: Copy + Eq> SessionEntry<Index> {
             listener: None,
             flags: SessionFlags::empty(),
             lower_session: None,
+            upper_session: None,
+            parent_session: None,
             rx_fifo,
             tx_fifo,
             schedule_pending: false,
         }
     }
+
+    /// The connection endpoint role fixed by the Session's construction
+    /// lifecycle: `accepted` names Sessions that arrived through a listener,
+    /// the outbound connect paths construct with it unset. Per-entry and
+    /// generation-safe; never inferred from stream direction or app identity.
+    #[inline]
+    fn endpoint_role(&self) -> SessionEndpointRole {
+        if self.accepted {
+            SessionEndpointRole::Server
+        } else {
+            SessionEndpointRole::Client
+        }
+    }
 }
+
+/// Endpoint role of a Session connection, fixed at creation by the
+/// listener/connect lifecycle.
+///
+/// VPP carries no `SESSION_F_IS_SERVER` session flag: server-ness is the
+/// HTTP connection flag `HTTP_CONN_F_IS_SERVER`, set on the connection
+/// accepted from a listener (http.c:1438) and absent from client
+/// connections created by connect. Hammer records the same fact as the
+/// Session entry's `accepted` lifecycle field; this enum is the typed
+/// projection of that field. Stream children read their parent
+/// connection's projection.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SessionEndpointRole {
+    /// The Session arrived through a listener (accepted connection).
+    Server,
+    /// The Session is an outbound connect (client) connection.
+    Client,
+}
+
+/// Immutable accept-time metadata snapshot for one Session, read by a
+/// builtin Session App accept callback without touching the worker again.
+///
+/// Static `Copy` data: [`SessionFlags`], the connection endpoint role, and,
+/// for stream children, the parent connection's [`SessionAppContext`]
+/// resolved from the child's pinned listener handle (VPP
+/// `http_ts_accept_stream`, http.c:675: `conn_session =
+/// session_get_from_handle (stream_session->listener_handle)`, parent context
+/// `conn_session->opaque`). Root Sessions carry the role fixed by their own
+/// construction lifecycle and no parent context.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SessionAcceptMetadata {
+    /// The flags a transport derived for the accepted Session
+    /// (`set_session_flags`; VPP `SESSION_F_*`).
+    pub flags: SessionFlags,
+    /// The Session's endpoint role: `Server` for connections accepted from a
+    /// listener, `Client` for outbound connects; stream children inherit the
+    /// parent connection's role, `None` when the parent is absent, foreign,
+    /// or no longer live (like [`Self::parent_app_context`]).
+    pub role: Option<SessionEndpointRole>,
+    /// The parent Session's `SessionAppContext`, `None` for roots and for
+    /// streams whose pinned listener handle is absent, foreign, or no longer
+    /// live.
+    pub parent_app_context: Option<SessionAppContext>,
+}
+
+/// Static worker-local action table one transport installs for stream
+/// operations dispatched by the owning Session Worker.
+///
+/// Mirrors VPP's transport VFT (`transport_close`, `transport_reset`,
+/// `transport_half_close`, transport.h:63-70) and the application protocol
+/// error attribute (`app_proto_err_code`, transport_types.h:447): the
+/// transport implements the callbacks and receives the worker itself, so the
+/// callbacks need no global state. Dispatch copies the table (it is `Copy`)
+/// before invoking, keeping the path static, allocation-free and borrow-safe.
+#[derive(Debug, Clone, Copy)]
+pub struct SessionTransportWorkerActions<Index> {
+    open_stream: SessionTransportOpenStream<Index>,
+    reset_stream: SessionTransportResetStream<Index>,
+    stop_sending: SessionTransportStopSending<Index>,
+    close_connection: SessionTransportCloseConnection<Index>,
+}
+
+impl<Index> SessionTransportWorkerActions<Index> {
+    #[inline]
+    pub const fn new(
+        open_stream: SessionTransportOpenStream<Index>,
+        reset_stream: SessionTransportResetStream<Index>,
+        stop_sending: SessionTransportStopSending<Index>,
+        close_connection: SessionTransportCloseConnection<Index>,
+    ) -> Self {
+        Self {
+            open_stream,
+            reset_stream,
+            stop_sending,
+            close_connection,
+        }
+    }
+}
+
+/// Opens one stream child of `parent` on the worker; mirrors VPP
+/// `vnet_connect_stream (parent_handle)` (application.c:1447). Returns the new
+/// stream's Session identity.
+pub type SessionTransportOpenStream<Index> = fn(
+    &mut SessionWorker<Index>,
+    SessionId,
+    SessionStreamDirection,
+    SessionAppContext,
+) -> RuntimeResult<SessionId>;
+/// Resets one stream with an application error code; mirrors VPP
+/// `transport_reset (tp, conn_index, thread)` (transport.h:138).
+pub type SessionTransportResetStream<Index> =
+    fn(&mut SessionWorker<Index>, SessionId, SessionApplicationErrorCode) -> RuntimeResult<()>;
+/// Stops the peer's send direction on one stream; mirrors VPP
+/// `transport_half_close (tp, conn_index, thread)` (transport.h:135).
+pub type SessionTransportStopSending<Index> =
+    fn(&mut SessionWorker<Index>, SessionId, SessionApplicationErrorCode) -> RuntimeResult<()>;
+/// Closes one connection with an application error code and raw reason bytes;
+/// mirrors VPP `transport_close` plus the `APP_PROTO_ERR_CODE` endpoint
+/// attribute (transport_types.h:447, quic.c:701-718).
+pub type SessionTransportCloseConnection<Index> = fn(
+    &mut SessionWorker<Index>,
+    SessionId,
+    SessionApplicationErrorCode,
+    &[u8],
+) -> RuntimeResult<()>;
 
 pub struct SessionWorker<Index> {
     worker: DataWorkerId,
@@ -424,6 +549,7 @@ pub struct SessionWorker<Index> {
     session_evt_q: Arc<SessionMsgQueue>,
     app_session_config: AppSessionConfig,
     session_app_callbacks: Vec<Option<SessionAppCallbacks<Index>>>,
+    transport_actions: Vec<Option<SessionTransportWorkerActions<Index>>>,
     pub(crate) transport_dispatches: Vec<SessionQueueTransportDispatch>,
     pub(crate) control_events: LinkedList<SessionEvt>,
     pub(crate) new_io_events: LinkedList<SessionEvt>,
@@ -1503,6 +1629,185 @@ impl<Index: Copy + Eq> SessionWorker<Index> {
             .flatten()
     }
 
+    /// Installs one transport's worker-local action table, keyed by transport
+    /// id. O(1); rejects a duplicate registration for the same id.
+    pub fn install_transport_actions(
+        &mut self,
+        transport: SessionTransportId,
+        actions: SessionTransportWorkerActions<Index>,
+    ) -> Result<(), SessionTransportActionError> {
+        let slot = transport.raw() as usize;
+        if self
+            .transport_actions
+            .get(slot)
+            .is_some_and(Option::is_some)
+        {
+            return Err(SessionTransportActionError::AlreadyRegistered { transport });
+        }
+        if self.transport_actions.len() <= slot {
+            self.transport_actions.resize(slot + 1, None);
+        }
+        self.transport_actions[slot] = Some(actions);
+        Ok(())
+    }
+
+    /// Copies one transport's worker action table out of the worker. O(1).
+    /// The table is `Copy`, so the borrow ends before the callback runs.
+    #[inline]
+    fn actions_for(
+        &self,
+        transport: SessionTransportId,
+    ) -> Result<SessionTransportWorkerActions<Index>, SessionTransportActionError> {
+        self.transport_actions
+            .get(transport.raw() as usize)
+            .copied()
+            .flatten()
+            .ok_or(SessionTransportActionError::MissingRegistration { transport })
+    }
+
+    /// Resolves one Session entry to the transport that owns it; mirrors VPP
+    /// `session_get_transport_proto (s)` guarding transport ownership before
+    /// VFT dispatch (session.c:1658-1712). The Session entry is the transport
+    /// authority, so dispatch never takes a caller-supplied transport id.
+    #[inline]
+    fn entry_transport(
+        &self,
+        session_id: SessionId,
+    ) -> Result<SessionTransportId, SessionTransportActionError> {
+        let entry = self
+            .entries
+            .get(session_id.pool_index())
+            .ok_or(SessionTransportActionError::InvalidSession { session_id })?;
+        let Some(SessionType::Transport { transport, .. }) = entry.session_type else {
+            return Err(SessionTransportActionError::InvalidSession { session_id });
+        };
+        Ok(transport)
+    }
+
+    /// Applies the VPP app-close state guard shared by `reset_stream` and
+    /// `close_connection` (session.c:1657-1703): returns Ok(false) without
+    /// notifying the transport for sessions at or beyond AppClosed and for
+    /// sessions still in Creating; returns Ok(true) for Created/Published/
+    /// Active sessions after recording AppClosed, so the transport action
+    /// runs with the close already recorded. The entry borrow ends before
+    /// any callback runs.
+    #[inline]
+    fn entry_app_close_guard(
+        &mut self,
+        session_id: SessionId,
+    ) -> Result<bool, SessionTransportActionError> {
+        let entry = self
+            .entries
+            .get_mut(session_id.pool_index())
+            .ok_or(SessionTransportActionError::InvalidSession { session_id })?;
+        let Some(SessionType::Transport { state, .. }) = entry.session_type.as_mut() else {
+            return Err(SessionTransportActionError::InvalidSession { session_id });
+        };
+        Ok(state.on_app_close_dispatch())
+    }
+
+    /// Dispatches one worker-local `open_stream` action to the transport that
+    /// owns `parent`; mirrors VPP `vnet_connect_stream (parent_handle)`
+    /// (application.c:1447). The transport allocates the child stream on this
+    /// worker and returns its Session identity.
+    pub fn open_stream(
+        &mut self,
+        parent: SessionId,
+        direction: SessionStreamDirection,
+        app_context: SessionAppContext,
+    ) -> Result<SessionId, SessionTransportActionError> {
+        let transport = self.entry_transport(parent)?;
+        let actions = self.actions_for(transport)?;
+        (actions.open_stream)(self, parent, direction, app_context).map_err(|source| {
+            SessionTransportActionError::TransportActionFailed {
+                action: "open_stream",
+                source,
+            }
+        })
+    }
+
+    /// Dispatches one worker-local `reset_stream` action to the transport that
+    /// owns the stream; mirrors VPP `session_transport_reset`
+    /// (session.c:1687-1703): only pre-close sessions dispatch, with AppClosed
+    /// recorded before the transport is notified.
+    pub fn reset_stream(
+        &mut self,
+        session_id: SessionId,
+        code: SessionApplicationErrorCode,
+    ) -> Result<(), SessionTransportActionError> {
+        let transport = self.entry_transport(session_id)?;
+        let actions = self.actions_for(transport)?;
+        if !self.entry_app_close_guard(session_id)? {
+            return Ok(());
+        }
+        (actions.reset_stream)(self, session_id, code).map_err(|source| {
+            SessionTransportActionError::TransportActionFailed {
+                action: "reset_stream",
+                source,
+            }
+        })
+    }
+
+    /// Dispatches one worker-local `stop_sending` action to the transport that
+    /// owns the stream; mirrors VPP `session_transport_half_close`
+    /// (session.c:1637-1648): only a READY session (Hammer's Active) can be
+    /// half-closed, so every other state returns Ok without notifying the
+    /// transport. Half-close never changes the session state.
+    pub fn stop_sending(
+        &mut self,
+        session_id: SessionId,
+        code: SessionApplicationErrorCode,
+    ) -> Result<(), SessionTransportActionError> {
+        let transport = self.entry_transport(session_id)?;
+        let actions = self.actions_for(transport)?;
+        let active = self
+            .entries
+            .get(session_id.pool_index())
+            .is_some_and(|entry| {
+                matches!(
+                    entry.session_type,
+                    Some(SessionType::Transport {
+                        state: SessionState::Active(_),
+                        ..
+                    })
+                )
+            });
+        if !active {
+            return Ok(());
+        }
+        (actions.stop_sending)(self, session_id, code).map_err(|source| {
+            SessionTransportActionError::TransportActionFailed {
+                action: "stop_sending",
+                source,
+            }
+        })
+    }
+
+    /// Dispatches one worker-local `close_connection` action to the transport
+    /// that owns the connection; mirrors VPP `session_transport_close`
+    /// (session.c:1657-1682) plus the `APP_PROTO_ERR_CODE` endpoint attribute
+    /// (transport_types.h:447, quic.c:701-718): only pre-close sessions
+    /// dispatch, with AppClosed recorded before the transport is notified.
+    /// The reason stays raw `&[u8]`, never narrowed to `&str`.
+    pub fn close_connection(
+        &mut self,
+        connection: SessionId,
+        code: SessionApplicationErrorCode,
+        reason: &[u8],
+    ) -> Result<(), SessionTransportActionError> {
+        let transport = self.entry_transport(connection)?;
+        let actions = self.actions_for(transport)?;
+        if !self.entry_app_close_guard(connection)? {
+            return Ok(());
+        }
+        (actions.close_connection)(self, connection, code, reason).map_err(|source| {
+            SessionTransportActionError::TransportActionFailed {
+                action: "close_connection",
+                source,
+            }
+        })
+    }
+
     #[inline]
     pub fn fifo_pair(&self, session_id: SessionId) -> Option<(&Arc<Fifo>, &Arc<Fifo>)> {
         let entry = self.entries.get(session_id.pool_index())?;
@@ -1743,6 +2048,35 @@ impl<Index: Copy + Eq> SessionWorker<Index> {
         ))
     }
 
+    /// Generation-checked lower->upper owner link: the lower Session records
+    /// its single upper Session, mirroring VPP's per-session single app-worker
+    /// owner (`session_t.app_wrk_index`, session_types.h:266) and owner checks
+    /// (`SESSION_E_OWNER`, application.c:1507-1508). Attach refuses to silently
+    /// overwrite an existing attachment; the owner-link boundary is shared by
+    /// both upper creation APIs and by upper removal.
+    fn attach_upper_session(&mut self, lower: SessionId, upper: SessionId) -> RuntimeResult<()> {
+        let Some(entry) = self.entries.get_mut(lower.pool_index()) else {
+            return Err(SessionError::SessionMissing { session_id: lower }.into());
+        };
+        if entry.upper_session.is_some() {
+            return Err(SessionError::UpperSessionAlreadyAttached { lower }.into());
+        }
+        entry.upper_session = Some(upper);
+        Ok(())
+    }
+
+    /// Clears the lower->upper owner link iff it still names `upper`; a
+    /// reused slot or a newer attachment is never cleared, and the lower is
+    /// never removed.
+    #[inline]
+    fn detach_upper_session(&mut self, lower: SessionId, upper: SessionId) {
+        if let Some(entry) = self.entries.get_mut(lower.pool_index())
+            && entry.upper_session == Some(upper)
+        {
+            entry.upper_session = None;
+        }
+    }
+
     /// Publishes a Session-owned upper App Session from a Session App callback.
     pub fn create_upper_session(
         &mut self,
@@ -1760,6 +2094,10 @@ impl<Index: Copy + Eq> SessionWorker<Index> {
             .ok_or(SessionQueueError::ApplicationMqMissing { application })?;
         let (rx_fifo, tx_fifo) = self.create_local_fifos()?;
         let upper = self.insert_session_entry(SessionEntry::unbound(rx_fifo, tx_fifo))?;
+        if let Err(error) = self.attach_upper_session(lower, upper) {
+            let _ = self.entries.remove(upper.pool_index());
+            return Err(error);
+        }
         let app_session = self
             .app
             .create_app_session(
@@ -1771,6 +2109,7 @@ impl<Index: Copy + Eq> SessionWorker<Index> {
             )
             .map_err(|error| {
                 let _ = self.entries.remove(upper.pool_index());
+                self.detach_upper_session(lower, upper);
                 error
             })?;
         let entry = self
@@ -1788,6 +2127,7 @@ impl<Index: Copy + Eq> SessionWorker<Index> {
         if let Err(error) = self.app.connected(upper).map(|_| ()) {
             let _ = self.entries.remove(upper.pool_index());
             self.app.detach_session(upper);
+            self.detach_upper_session(lower, upper);
             return Err(error);
         }
         Ok(upper)
@@ -1822,6 +2162,10 @@ impl<Index: Copy + Eq> SessionWorker<Index> {
             .expect("new upper transport Session remains installed during publication");
         entry.app_session = context;
         entry.lower_session = Some(lower);
+        if let Err(error) = self.attach_upper_session(lower, upper) {
+            let _ = self.remove_session(upper);
+            return Err(error);
+        }
         Ok(upper)
     }
 
@@ -2153,6 +2497,52 @@ impl<Index: Copy + Eq> SessionWorker<Index> {
         self.entries.contains_key(session_id.pool_index())
     }
 
+    /// Transport parent of a stream Session (VPP `sep_ext.parent_handle`,
+    /// session_types.h:109, wired by `http_connect_transport_stream`).
+    /// Parent topology is metadata distinct from `lower_session` protocol
+    /// attachment and never drives upper/lower cleanup.
+    #[inline]
+    pub(crate) fn parent_session(&self, session_id: SessionId) -> Option<SessionId> {
+        self.entries
+            .get(session_id.pool_index())
+            .and_then(|entry| entry.parent_session)
+    }
+
+    /// Returns the lower transport Session bound to an upper Session.
+    #[inline]
+    pub fn lower_session(&self, upper: SessionId) -> Option<SessionId> {
+        self.entries
+            .get(upper.pool_index())
+            .and_then(|entry| entry.lower_session)
+    }
+
+    /// Returns the upper Session attached to a lower transport Session.
+    #[inline]
+    pub fn upper_session(&self, lower: SessionId) -> Option<SessionId> {
+        self.entries
+            .get(lower.pool_index())
+            .and_then(|entry| entry.upper_session)
+    }
+
+    /// Records the transport parent of a stream Session. Mirrors VPP
+    /// `session_alloc_for_stream` (session.c:507-523) rejecting a child
+    /// whose parent handle is invalid. O(1).
+    #[inline]
+    pub(crate) fn set_parent_session(
+        &mut self,
+        session_id: SessionId,
+        parent: SessionId,
+    ) -> RuntimeResult<()> {
+        if !self.entries.contains_key(parent.pool_index()) {
+            return Err(SessionError::ConnectStreamParentMissing.into());
+        }
+        self.entries
+            .get_mut(session_id.pool_index())
+            .ok_or(SessionError::SessionMissing { session_id })?
+            .parent_session = Some(parent);
+        Ok(())
+    }
+
     #[inline]
     pub fn session_app_closed(&self, session_id: SessionId) -> bool {
         self.entries
@@ -2265,6 +2655,45 @@ impl<Index: Copy + Eq> SessionWorker<Index> {
         self.entries
             .get(session_id.pool_index())
             .map(|entry| entry.flags)
+    }
+
+    /// O(1) snapshot of [`SessionAcceptMetadata`] for one accepted Session.
+    ///
+    /// Mirrors VPP `http_ts_accept_stream` (http.c:675), which resolves the
+    /// accepted stream's parent from its listener handle
+    /// (`conn_session = session_get_from_handle (stream_session->
+    /// listener_handle)`) and inherits the parent context (`conn_session->
+    /// opaque`). The child entry's flags gate the parent resolution exactly
+    /// as `SESSION_F_STREAM` gates VPP's stream accept path, so roots never
+    /// resolve a parent. The parent follows [`SessionWorker::
+    /// session_id_from_handle`] semantics precisely — the live Session at the
+    /// handle's slot, never a weaker stale check. Roots report the role
+    /// fixed by their construction lifecycle ([`SessionEntry::endpoint_role`]:
+    /// accepted `Server`, outbound connect `Client`); stream children inherit
+    /// the parent connection's role together with its context, so an absent,
+    /// foreign, or freed parent yields `None` for both. Static `Copy` data
+    /// from at most two pool lookups: no allocation, locking, atomics, or
+    /// scanning.
+    #[inline]
+    pub fn accept_metadata(&self, session_id: SessionId) -> Option<SessionAcceptMetadata> {
+        let entry = self.entries.get(session_id.pool_index())?;
+        let (role, parent_app_context) = if entry.flags.contains(SessionFlags::STREAM) {
+            match entry
+                .listener
+                .and_then(|listener| self.session_id_from_handle(listener))
+                .and_then(|parent| self.entries.get(parent.pool_index()))
+            {
+                Some(parent) => (Some(parent.endpoint_role()), Some(parent.app_session)),
+                None => (None, None),
+            }
+        } else {
+            (Some(entry.endpoint_role()), None)
+        };
+        Some(SessionAcceptMetadata {
+            flags: entry.flags,
+            role,
+            parent_app_context,
+        })
     }
 
     /// Test seam: the retained ACCEPTED message of a Session whose
@@ -2420,6 +2849,7 @@ impl<Index: Copy + Eq> SessionWorker<Index> {
                 index,
                 allocation_owner,
                 application,
+                opaque,
             );
         };
         self.construct_app_transport_session(
@@ -2466,6 +2896,7 @@ impl<Index: Copy + Eq> SessionWorker<Index> {
         index: Index,
         allocation_owner: u64,
         application: ApplicationId,
+        opaque: Option<u64>,
     ) -> RuntimeResult<SessionId> {
         let (rx_fifo, tx_fifo) = self.create_local_fifos()?;
         let session_id = self.insert_session_entry(SessionEntry::creating_transport(
@@ -2500,6 +2931,9 @@ impl<Index: Copy + Eq> SessionWorker<Index> {
             entry.tx_fifo = Arc::clone(application_session.tx_fifo());
             entry.application = Some(SessionApplication::External(application));
             entry.owner_application = Some(application);
+            // VPP `session_open_stream` (session.c:1412) sets
+            // `s->opaque = sep->opaque` for external stream children too.
+            entry.app_opaque = opaque;
         }
         self.finish_transport_creation(session_id, index)?;
         self.app.attach_session(session_id, application_session);
@@ -3150,6 +3584,17 @@ impl<Index: Copy + Eq> SessionWorker<Index> {
         Ok(disconnect)
     }
 
+    /// Removes a Session and, when it is the lower-most Session of a Session App,
+    /// the chain of upper Sessions attached along the generation-checked owner
+    /// link. Mirrors VPP `session_cleanup_notify` (session.c:304-318): the app
+    /// cleanup callback runs while the Session is still live, then the entry is
+    /// freed. The cascade walks `upper_session` from the removed entry, follows
+    /// each upper only while its live entry still points back at the previous
+    /// link, and stops on a stale, reused, or mismatched link without touching
+    /// the occupant. The links are revalidated after the cleanup callback, which
+    /// runs with `&mut self` and may unlink or replace the entry or its child;
+    /// the walk then stops without removing anything further. O(chain) time,
+    /// O(1) space; no scan, collect, or recursion.
     fn remove_session(&mut self, session_id: SessionId) -> RuntimeResult<()> {
         let (app, context, lower_session) = self
             .entries
@@ -3173,20 +3618,103 @@ impl<Index: Copy + Eq> SessionWorker<Index> {
         let Some(entry) = self.entries.remove(session_id.pool_index()) else {
             return Ok(());
         };
+        let mut previous = session_id;
+        let mut next_upper = if app.is_some() && lower_session.is_none() {
+            entry.upper_session
+        } else {
+            None
+        };
+        if let Some(lower) = entry.lower_session {
+            self.detach_upper_session(lower, session_id);
+        }
         if matches!(entry.application, Some(SessionApplication::External(_))) {
             drop(self.app.detach_session(session_id));
         }
-        if app.is_some() && lower_session.is_none() {
-            let upper_sessions = self
-                .entries
-                .iter()
-                .filter_map(|(index, entry)| {
-                    (entry.lower_session == Some(session_id)).then_some(SessionId::from(index))
-                })
-                .collect::<Vec<_>>();
-            for upper in upper_sessions {
-                self.remove_session(upper)?;
+        while let Some(upper) = next_upper {
+            let Some(upper_entry) = self.entries.get(upper.pool_index()) else {
+                break;
+            };
+            if upper_entry.lower_session != Some(previous) {
+                break;
             }
+            let upper_app = upper_entry.app;
+            let upper_context = upper_entry.app_session;
+            let upper_application = upper_entry.application;
+            let upper_child = upper_entry.upper_session;
+            if let Some(app) = upper_app
+                && upper_context != 0
+                && let Some(callbacks) = self.session_app_callbacks(app)
+                && let Some(cleanup) = callbacks.cleanup
+            {
+                cleanup(self, upper, upper_context)?;
+            }
+            // The callback ran with `&mut self` and may have unlinked or
+            // replaced this entry or its child; remove this node only while it
+            // still points back at the previous link, and never follow a child
+            // the callback detached or replaced.
+            let Some(upper_entry) = self.entries.get(upper.pool_index()) else {
+                break;
+            };
+            if upper_entry.lower_session != Some(previous)
+                || upper_entry.upper_session != upper_child
+            {
+                break;
+            }
+            let _ = self.entries.remove(upper.pool_index());
+            if matches!(upper_application, Some(SessionApplication::External(_))) {
+                drop(self.app.detach_session(upper));
+            }
+            previous = upper;
+            next_upper = upper_child;
+        }
+        Ok(())
+    }
+
+    /// Worker-local rollback boundary for a newly-created upper Session: the
+    /// exactly-one HTTP/3 upper publication handoff removes the upper through
+    /// this method instead of sweeping through `remove_session`. Mirrors VPP's
+    /// callback-before-free ordering (`session_cleanup_notify`,
+    /// session.c:304-318): the Session App cleanup callback runs while the
+    /// upper is still live, then the entry is freed, then the lower owner link
+    /// is cleared and the external App is detached. A newly-created upper has
+    /// no published children, so no owner-link cascade is followed.
+    ///
+    /// The cleanup callback runs only for the exact requested `upper`
+    /// [`SessionId`]: its app/context are read through the generation-checked
+    /// lookup, so a stale or reused slot is a typed no-op before any callback
+    /// fires and a fresh occupant's cleanup is never invoked by a stale ID.
+    ///
+    /// Reentrant cleanup is safe: the callback runs with `&mut self` and may
+    /// itself remove or replace the upper. Removal and the follow-on detaches
+    /// are revalidated through the generation-checked [`SessionId`], so a slot
+    /// that was already removed or reused by the callback is left untouched
+    /// and the call returns `Ok(())`.
+    pub fn remove_upper_session(&mut self, upper: SessionId) -> RuntimeResult<()> {
+        // The callback must see only the occupant of the requested `upper`
+        // SessionId: the read is gated on the full generation-checked lookup,
+        // so a stale ID whose slot was reused is a safe no-op here, before any
+        // cleanup callback can run against a fresh occupant.
+        let Some(entry) = self.entries.get(upper.pool_index()) else {
+            return Ok(());
+        };
+        let (app, context) = (entry.app, entry.app_session);
+        if let Some(app) = app
+            && context != 0
+            && let Some(callbacks) = self.session_app_callbacks(app)
+            && let Some(cleanup) = callbacks.cleanup
+        {
+            cleanup(self, upper, context)?;
+        }
+        // The callback ran with `&mut self`; free only while the slot still
+        // holds this generation of the upper.
+        let Some(entry) = self.entries.remove(upper.pool_index()) else {
+            return Ok(());
+        };
+        if let Some(lower) = entry.lower_session {
+            self.detach_upper_session(lower, upper);
+        }
+        if matches!(entry.application, Some(SessionApplication::External(_))) {
+            drop(self.app.detach_session(upper));
         }
         Ok(())
     }
@@ -3990,6 +4518,7 @@ impl<Index: Copy + Eq> SessionWorker<Index> {
             session_evt_q,
             app_session_config,
             session_app_callbacks: Vec::new(),
+            transport_actions: Vec::new(),
             transport_dispatches: Vec::new(),
             control_events: LinkedList::new(),
             new_io_events: LinkedList::new(),
@@ -4617,6 +5146,7 @@ where
 
 #[cfg(test)]
 mod tests {
+    use std::cell::RefCell;
     use std::sync::Arc;
     use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
     use std::time::{Duration, Instant};
@@ -4624,23 +5154,26 @@ mod tests {
     use hammer_core::data_plane::{BufferFrame, NodeId, NodeState};
     use hammer_infra::pool::Index;
     use hammer_runtime::app::{
-        AppSessionConfig, SessionEvt, SessionEvtType, SessionHandle, SessionMsgQueueError,
+        AppSessionConfig, SessionAppContext, SessionEvt, SessionEvtType, SessionFlags,
+        SessionHandle, SessionMsgQueueError,
     };
     use hammer_runtime::attach::AppServer;
+    use hammer_runtime::session::{SessionApplicationErrorCode, SessionStreamDirection};
     use hammer_runtime::{
         AttachError, DataPlaneRuntime, DataPlaneRuntimeConfig, DataWorkerId, Engine,
         NodeRuntimeData, RuntimeError, RuntimeRegistry, RuntimeResult,
     };
 
     use super::{
-        DEFAULT_SESSION_POOL_CAPACITY, SessionDgramArgs, SessionEntry, SessionMain,
-        SessionMigrateResult, SessionQueueNext, SessionState, SessionTransportId, SessionType,
-        SessionWorker, SessionWorkerState, queue_for_worker,
+        DEFAULT_SESSION_POOL_CAPACITY, SessionDgramArgs, SessionEndpointRole, SessionEntry,
+        SessionMain, SessionMigrateResult, SessionQueueNext, SessionState, SessionTransportId,
+        SessionTransportWorkerActions, SessionType, SessionWorker, SessionWorkerState,
+        queue_for_worker,
     };
     use crate::session::ApplicationMain;
     use crate::session::SessionId;
     use crate::session::application::{ApplicationError, ApplicationMqResources};
-    use crate::session::error::SessionError;
+    use crate::session::error::{SessionError, SessionTransportActionError};
     use crate::session::node::{
         SessionQueueNode, SessionQueueOutput, register_app_session_input_node,
         register_session_queue_node,
@@ -4748,6 +5281,8 @@ mod tests {
         SessionQueue(#[from] crate::session::SessionQueueError),
         #[error(transparent)]
         Session(#[from] SessionError),
+        #[error(transparent)]
+        TransportAction(#[from] SessionTransportActionError),
         #[error(transparent)]
         Conversion(#[from] std::num::TryFromIntError),
     }
@@ -5150,6 +5685,56 @@ mod tests {
         assert!(
             sessions.app_session(session_id).is_some(),
             "external CONNECT attaches the App Session"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn external_stream_connect_propagates_opaque_to_session_app_endpoint()
+    -> Result<(), SessionTestFailure> {
+        // VPP `session_open_stream` (session.c:1412) sets `s->opaque = sep->opaque`
+        // on the external stream child; the Session public seam must expose it.
+        let socket_path = format!(
+            "/tmp/hammer-external-connect-opaque-{}.sock",
+            std::process::id()
+        );
+        let server = AppServer::bind(&socket_path, 4)?;
+        let applications = ApplicationMain::new(2);
+        let application = applications.attach()?;
+        let mut sessions = SessionWorker::<Index>::new(
+            DataWorkerId::new(0),
+            1,
+            AppSessionConfig::default(),
+            DEFAULT_SESSION_POOL_CAPACITY,
+            Arc::clone(&applications),
+            Some(server.publisher()),
+        )?;
+        sessions.install_application_mq_for_test(application)?;
+
+        let opaque_connection =
+            applications.register_connection(application, 0, None, None, Some(0x77))?;
+        let opaque_id = sessions.stream_connect_pending(
+            SessionTransportId::new(1),
+            Index::new(7, 1),
+            hammer_runtime::SessionConnectionId::from_raw(opaque_connection.raw()),
+        )?;
+        assert_eq!(
+            sessions.session_app_endpoint(opaque_id),
+            Some((application, None, Some(0x77), None)),
+            "external stream child exposes the pending ApplicationConnection opaque"
+        );
+
+        let plain_connection =
+            applications.register_connection(application, 1, None, None, None)?;
+        let plain_id = sessions.stream_connect_pending(
+            SessionTransportId::new(1),
+            Index::new(8, 1),
+            hammer_runtime::SessionConnectionId::from_raw(plain_connection.raw()),
+        )?;
+        assert_eq!(
+            sessions.session_app_endpoint(plain_id),
+            Some((application, None, None, None)),
+            "external stream child without opaque stays None"
         );
         Ok(())
     }
@@ -6450,6 +7035,1194 @@ mod tests {
             .expect("app close completes transport deletion");
         assert!(!sessions.has_session(upper));
     }
+
+    #[test]
+    fn removing_upper_app_session_clears_lower_link_and_preserves_lower() {
+        let applications = ApplicationMain::new(4);
+        let application = applications.attach().expect("attach Application");
+        let mut sessions = SessionWorker::<Index>::new(
+            DataWorkerId::new(0),
+            1,
+            AppSessionConfig::default(),
+            DEFAULT_SESSION_POOL_CAPACITY,
+            applications,
+            None,
+        )
+        .expect("Session worker");
+        sessions
+            .install_application_mq_for_test(application)
+            .expect("install test Application MQ");
+        let lower = sessions
+            .construct_stream_sessions(
+                SessionTransportId::new(1),
+                Index::new(1, 1),
+                1,
+                application,
+                Some(hammer_runtime::app::SessionAppId::new(0)),
+                None,
+                None,
+                false,
+            )
+            .expect("construct lower Session App session");
+        let upper = sessions
+            .create_upper_session(lower, 0x55)
+            .expect("publish upper Session");
+        assert_eq!(
+            sessions
+                .entries
+                .get(lower.pool_index())
+                .and_then(|entry| entry.upper_session),
+            Some(upper),
+            "upper creation attaches the reverse link on the lower"
+        );
+
+        sessions
+            .remove_session(upper)
+            .expect("direct upper removal");
+        assert!(!sessions.has_session(upper), "upper is removed");
+        assert!(sessions.has_session(lower), "lower survives upper removal");
+        assert_eq!(
+            sessions
+                .entries
+                .get(lower.pool_index())
+                .and_then(|entry| entry.upper_session),
+            None,
+            "direct upper removal clears the lower reverse link"
+        );
+
+        let replacement = sessions
+            .create_upper_session(lower, 0x66)
+            .expect("lower accepts a fresh upper after the link was cleared");
+        assert_eq!(
+            sessions
+                .entries
+                .get(lower.pool_index())
+                .and_then(|entry| entry.upper_session),
+            Some(replacement),
+            "the fresh upper re-attaches the reverse link"
+        );
+    }
+
+    #[test]
+    fn duplicate_upper_attachment_rejected_without_overwrite_or_leak() {
+        let applications = ApplicationMain::new(4);
+        let application = applications.attach().expect("attach Application");
+        let mut sessions = SessionWorker::<Index>::new(
+            DataWorkerId::new(0),
+            1,
+            AppSessionConfig::default(),
+            DEFAULT_SESSION_POOL_CAPACITY,
+            applications,
+            None,
+        )
+        .expect("Session worker");
+        sessions
+            .install_application_mq_for_test(application)
+            .expect("install test Application MQ");
+        let lower = sessions
+            .construct_stream_sessions(
+                SessionTransportId::new(1),
+                Index::new(1, 1),
+                1,
+                application,
+                Some(hammer_runtime::app::SessionAppId::new(0)),
+                None,
+                None,
+                false,
+            )
+            .expect("construct lower Session App session");
+        let upper = sessions
+            .create_upper_session(lower, 0x55)
+            .expect("first upper");
+
+        let error = sessions
+            .create_upper_session(lower, 0x66)
+            .expect_err("duplicate upper attachment is rejected");
+        assert!(matches!(
+            &error,
+            RuntimeError::Subsystem { source, .. }
+                if matches!(
+                    source.downcast_ref::<SessionError>(),
+                    Some(SessionError::UpperSessionAlreadyAttached { lower: linked })
+                        if *linked == lower
+                )
+        ));
+
+        assert!(sessions.has_session(upper), "first upper survives");
+        assert_eq!(
+            sessions
+                .entries
+                .get(upper.pool_index())
+                .and_then(|entry| entry.lower_session),
+            Some(lower),
+            "first upper keeps its forward link"
+        );
+        assert_eq!(
+            sessions
+                .entries
+                .get(lower.pool_index())
+                .and_then(|entry| entry.upper_session),
+            Some(upper),
+            "the existing reverse link is not overwritten"
+        );
+        assert_eq!(sessions.entries.len(), 2, "no leaked upper entry");
+    }
+
+    #[test]
+    fn rollback_upper_session_removes_upper_and_preserves_lower_link() {
+        let applications = ApplicationMain::new(4);
+        let application = applications.attach().expect("attach Application");
+        let mut sessions = SessionWorker::<Index>::new(
+            DataWorkerId::new(0),
+            1,
+            AppSessionConfig::default(),
+            DEFAULT_SESSION_POOL_CAPACITY,
+            applications,
+            None,
+        )
+        .expect("Session worker");
+        sessions
+            .install_application_mq_for_test(application)
+            .expect("install test Application MQ");
+        let lower = sessions
+            .construct_stream_sessions(
+                SessionTransportId::new(1),
+                Index::new(1, 1),
+                1,
+                application,
+                Some(hammer_runtime::app::SessionAppId::new(0)),
+                None,
+                None,
+                false,
+            )
+            .expect("construct lower Session App session");
+        let upper = sessions
+            .create_upper_session(lower, 0x55)
+            .expect("create upper Session");
+        assert_eq!(
+            sessions
+                .entries
+                .get(lower.pool_index())
+                .and_then(|entry| entry.upper_session),
+            Some(upper),
+            "the lower owns the upper before rollback"
+        );
+
+        sessions
+            .remove_upper_session(upper)
+            .expect("roll back the upper Session");
+
+        assert!(!sessions.has_session(upper), "the upper is removed");
+        assert!(sessions.has_session(lower), "the lower survives rollback");
+        assert_eq!(
+            sessions
+                .entries
+                .get(lower.pool_index())
+                .and_then(|entry| entry.upper_session),
+            None,
+            "rollback clears the lower owner link"
+        );
+        assert!(
+            sessions.app.detach_session(upper).is_none(),
+            "rollback detached the external App attachment"
+        );
+        assert_eq!(sessions.entries.len(), 1, "only the lower remains");
+    }
+
+    #[test]
+    fn rollback_upper_session_cleanup_error_preserves_state_and_primary_error() {
+        let applications = ApplicationMain::new(4);
+        let application = applications.attach().expect("attach Application");
+        let mut sessions = SessionWorker::<Index>::new(
+            DataWorkerId::new(0),
+            1,
+            AppSessionConfig::default(),
+            DEFAULT_SESSION_POOL_CAPACITY,
+            applications,
+            None,
+        )
+        .expect("Session worker");
+        sessions
+            .install_application_mq_for_test(application)
+            .expect("install test Application MQ");
+        sessions
+            .install_session_app(
+                hammer_runtime::app::SessionAppId::new(0),
+                SessionAppCallbacks {
+                    cleanup: Some(fail_cleanup_for_session),
+                    ..Default::default()
+                },
+            )
+            .expect("install Session App callbacks");
+        let lower = sessions
+            .construct_stream_sessions(
+                SessionTransportId::new(1),
+                Index::new(1, 1),
+                1,
+                application,
+                Some(hammer_runtime::app::SessionAppId::new(0)),
+                None,
+                None,
+                false,
+            )
+            .expect("construct lower Session App session");
+        let upper = sessions
+            .create_upper_session(lower, 0x55)
+            .expect("create upper Session");
+
+        SESSION_CLEANUP_ATTEMPTS.store(0, Ordering::SeqCst);
+        SESSION_CLEANUP_SUCCESSES.store(0, Ordering::SeqCst);
+        SESSION_CLEANUP_FAILING.store(upper.get(), Ordering::SeqCst);
+        let error = sessions
+            .remove_upper_session(upper)
+            .expect_err("the cleanup error propagates");
+        assert!(matches!(
+            &error,
+            RuntimeError::Subsystem { source, .. }
+                if matches!(
+                    source.downcast_ref::<SessionError>(),
+                    Some(SessionError::PublicationRejected { session_id })
+                        if *session_id == upper
+                )
+        ));
+        assert!(
+            sessions.has_session(upper),
+            "the upper stays live after a failed cleanup"
+        );
+        assert!(sessions.has_session(lower), "the lower is untouched");
+        assert_eq!(
+            sessions
+                .entries
+                .get(lower.pool_index())
+                .and_then(|entry| entry.upper_session),
+            Some(upper),
+            "the owner link is preserved when cleanup fails"
+        );
+        assert_eq!(
+            SESSION_CLEANUP_ATTEMPTS.load(Ordering::SeqCst),
+            1,
+            "the cleanup callback ran exactly once"
+        );
+        assert_eq!(
+            SESSION_CLEANUP_SUCCESSES.load(Ordering::SeqCst),
+            0,
+            "the failing cleanup counts no success"
+        );
+    }
+
+    static SESSION_CLEANUP_STALE_ATTEMPTS: AtomicU64 = AtomicU64::new(0);
+
+    fn count_stale_cleanup_attempt(
+        _: &mut SessionWorker<Index>,
+        _: SessionId,
+        _: u64,
+    ) -> RuntimeResult<()> {
+        SESSION_CLEANUP_STALE_ATTEMPTS.fetch_add(1, Ordering::SeqCst);
+        Ok(())
+    }
+
+    #[test]
+    fn rollback_upper_session_stale_generation_never_removes_reused_slot() {
+        let applications = ApplicationMain::new(4);
+        let application = applications.attach().expect("attach Application");
+        let mut sessions = SessionWorker::<Index>::new(
+            DataWorkerId::new(0),
+            1,
+            AppSessionConfig::default(),
+            DEFAULT_SESSION_POOL_CAPACITY,
+            applications,
+            None,
+        )
+        .expect("Session worker");
+        sessions
+            .install_application_mq_for_test(application)
+            .expect("install test Application MQ");
+        sessions
+            .install_session_app(
+                hammer_runtime::app::SessionAppId::new(0),
+                SessionAppCallbacks {
+                    cleanup: Some(count_stale_cleanup_attempt),
+                    ..Default::default()
+                },
+            )
+            .expect("install Session App callbacks");
+        let lower = sessions
+            .construct_stream_sessions(
+                SessionTransportId::new(1),
+                Index::new(1, 1),
+                1,
+                application,
+                Some(hammer_runtime::app::SessionAppId::new(0)),
+                None,
+                None,
+                false,
+            )
+            .expect("construct lower Session App session");
+        let upper = sessions
+            .create_upper_session(lower, 0x55)
+            .expect("first upper");
+
+        // Reentrant cleanup removes the upper and the slot is immediately
+        // reused by a fresh upper on the same lower: the Pool free list is
+        // LIFO (pop_free_slot, pool.rs:237-243), so the fresh upper occupies
+        // the same slot under a new generation.
+        sessions.entries.remove(upper.pool_index());
+        sessions.detach_upper_session(lower, upper);
+        let fresh = sessions
+            .create_upper_session(lower, 0x66)
+            .expect("fresh upper reuses the slot");
+        assert_eq!(
+            fresh.pool_index().slot(),
+            upper.pool_index().slot(),
+            "the fresh upper occupies the removed slot"
+        );
+        assert_ne!(
+            fresh.pool_index().generation(),
+            upper.pool_index().generation(),
+            "the fresh upper runs under a new generation"
+        );
+
+        SESSION_CLEANUP_STALE_ATTEMPTS.store(0, Ordering::SeqCst);
+        sessions
+            .remove_upper_session(upper)
+            .expect("a stale rollback id is a safe no-op");
+        assert_eq!(
+            SESSION_CLEANUP_STALE_ATTEMPTS.load(Ordering::SeqCst),
+            0,
+            "a stale rollback id never runs the fresh occupant's cleanup callback"
+        );
+
+        assert!(
+            sessions.has_session(fresh),
+            "the reused occupant survives the stale rollback"
+        );
+        assert!(!sessions.has_session(upper), "the stale id is not the occupant");
+        assert_eq!(
+            sessions
+                .entries
+                .get(lower.pool_index())
+                .and_then(|entry| entry.upper_session),
+            Some(fresh),
+            "the lower owner link still names the fresh upper"
+        );
+        assert_eq!(sessions.entries.len(), 2, "no session is swept");
+    }
+
+    static SESSION_CLEANUP_REMOVING: AtomicU64 = AtomicU64::new(0);
+
+    fn remove_upper_on_cleanup(
+        sessions: &mut SessionWorker<Index>,
+        session_id: SessionId,
+        _: u64,
+    ) -> RuntimeResult<()> {
+        SESSION_CLEANUP_REMOVING.fetch_add(1, Ordering::SeqCst);
+        let lower = sessions
+            .entries
+            .get(session_id.pool_index())
+            .and_then(|entry| entry.lower_session);
+        sessions.entries.remove(session_id.pool_index());
+        if let Some(lower) = lower {
+            sessions.detach_upper_session(lower, session_id);
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn rollback_upper_session_after_reentrant_removal_is_safe_noop() {
+        let applications = ApplicationMain::new(4);
+        let application = applications.attach().expect("attach Application");
+        let mut sessions = SessionWorker::<Index>::new(
+            DataWorkerId::new(0),
+            1,
+            AppSessionConfig::default(),
+            DEFAULT_SESSION_POOL_CAPACITY,
+            applications,
+            None,
+        )
+        .expect("Session worker");
+        sessions
+            .install_application_mq_for_test(application)
+            .expect("install test Application MQ");
+        sessions
+            .install_session_app(
+                hammer_runtime::app::SessionAppId::new(0),
+                SessionAppCallbacks {
+                    cleanup: Some(remove_upper_on_cleanup),
+                    ..Default::default()
+                },
+            )
+            .expect("install Session App callbacks");
+        let lower = sessions
+            .construct_stream_sessions(
+                SessionTransportId::new(1),
+                Index::new(1, 1),
+                1,
+                application,
+                Some(hammer_runtime::app::SessionAppId::new(0)),
+                None,
+                None,
+                false,
+            )
+            .expect("construct lower Session App session");
+        let upper = sessions
+            .create_upper_session(lower, 0x55)
+            .expect("create upper Session");
+
+        SESSION_CLEANUP_REMOVING.store(0, Ordering::SeqCst);
+        sessions
+            .remove_upper_session(upper)
+            .expect("the callback already removed the upper, so rollback is a no-op");
+
+        assert!(!sessions.has_session(upper), "the upper is gone");
+        assert!(sessions.has_session(lower), "the lower is untouched");
+        assert_eq!(
+            sessions
+                .entries
+                .get(lower.pool_index())
+                .and_then(|entry| entry.upper_session),
+            None,
+            "the reentrant cleanup cleared the owner link"
+        );
+        assert_eq!(sessions.entries.len(), 1, "no second removal happened");
+        assert_eq!(
+            SESSION_CLEANUP_REMOVING.load(Ordering::SeqCst),
+            1,
+            "the cleanup callback ran exactly once"
+        );
+    }
+
+    #[test]
+    fn upper_creation_failure_rolls_back_lower_link() {
+        // A real publisher is required to make AppWorker::connected fail
+        // after the upper is attached (queue closed), the only upper-creation
+        // failure that happens after the lower reverse link is attached.
+        let socket_path = format!(
+            "/tmp/hammer-upper-rollback-{}.sock",
+            std::process::id()
+        );
+        let server = hammer_runtime::attach::AppServer::bind(&socket_path, 1)
+            .expect("bind App server with a single publication slot");
+        let publisher = server.publisher();
+        let applications = ApplicationMain::new(4);
+        let application = applications.attach().expect("attach Application");
+        let mut sessions = SessionWorker::<Index>::new(
+            DataWorkerId::new(0),
+            1,
+            AppSessionConfig::default(),
+            DEFAULT_SESSION_POOL_CAPACITY,
+            applications,
+            Some(publisher),
+        )
+        .expect("Session worker");
+        drop(server); // closes the publication queue
+
+        sessions
+            .install_application_mq_for_test(application)
+            .expect("install test Application MQ");
+        let lower = sessions
+            .construct_stream_sessions(
+                SessionTransportId::new(1),
+                Index::new(1, 1),
+                1,
+                application,
+                Some(hammer_runtime::app::SessionAppId::new(0)),
+                None,
+                None,
+                false,
+            )
+            .expect("construct lower Session App session");
+
+        let error = sessions
+            .create_upper_session(lower, 0x55)
+            .expect_err("connected publication fails once the server is dropped");
+        assert!(matches!(
+            &error,
+            RuntimeError::Attach(AttachError::PublicationQueueClosed)
+        ));
+        assert_eq!(sessions.entries.len(), 1, "upper entry rolls back");
+        assert!(sessions.has_session(lower), "lower survives the failed creation");
+        assert_eq!(
+            sessions
+                .entries
+                .get(lower.pool_index())
+                .and_then(|entry| entry.upper_session),
+            None,
+            "failed creation leaves the lower link unset"
+        );
+    }
+
+    #[test]
+    fn stale_upper_link_never_removes_reused_slot() {
+        let applications = ApplicationMain::new(4);
+        let application = applications.attach().expect("attach Application");
+        let mut sessions = SessionWorker::<Index>::new(
+            DataWorkerId::new(0),
+            1,
+            AppSessionConfig::default(),
+            DEFAULT_SESSION_POOL_CAPACITY,
+            applications,
+            None,
+        )
+        .expect("Session worker");
+        sessions
+            .install_application_mq_for_test(application)
+            .expect("install test Application MQ");
+        let lower = sessions
+            .construct_stream_sessions(
+                SessionTransportId::new(1),
+                Index::new(1, 1),
+                1,
+                application,
+                Some(hammer_runtime::app::SessionAppId::new(0)),
+                None,
+                None,
+                false,
+            )
+            .expect("construct lower Session App session");
+        let filler = sessions
+            .construct_stream_sessions(
+                SessionTransportId::new(3),
+                Index::new(7, 1),
+                1,
+                application,
+                Some(hammer_runtime::app::SessionAppId::new(0)),
+                None,
+                None,
+                false,
+            )
+            .expect("construct filler Session");
+
+        // Forge a stale reverse link: the recorded generation no longer
+        // matches the entry currently occupying the slot.
+        let stale = SessionId::from(Index::new(
+            filler.pool_index().slot(),
+            filler.pool_index().generation().wrapping_add(1),
+        ));
+        sessions
+            .entries
+            .get_mut(lower.pool_index())
+            .expect("lower entry")
+            .upper_session = Some(stale);
+
+        sessions
+            .remove_session(lower)
+            .expect("lower removal tolerates a stale upper link");
+        assert!(
+            sessions.has_session(filler),
+            "stale generation link must never remove a reused slot"
+        );
+        assert!(!sessions.has_session(lower), "lower itself is removed");
+    }
+
+    #[test]
+    fn transport_upper_teardown_and_direct_removal_use_the_reverse_link() {
+        let applications = ApplicationMain::new(4);
+        let application = applications.attach().expect("attach Application");
+        let mut sessions = SessionWorker::<Index>::new(
+            DataWorkerId::new(0),
+            1,
+            AppSessionConfig::default(),
+            DEFAULT_SESSION_POOL_CAPACITY,
+            applications,
+            None,
+        )
+        .expect("Session worker");
+        sessions
+            .install_application_mq_for_test(application)
+            .expect("install test Application MQ");
+        let transport = SessionTransportId::new(3);
+        let transport_index = Index::new(7, 1);
+
+        let lower = sessions
+            .construct_stream_sessions(
+                SessionTransportId::new(1),
+                Index::new(1, 1),
+                1,
+                application,
+                Some(hammer_runtime::app::SessionAppId::new(0)),
+                None,
+                None,
+                false,
+            )
+            .expect("construct lower Session App session");
+        let upper = sessions
+            .create_upper_transport_session(lower, transport, transport_index, 0x55)
+            .expect("create upper transport Session");
+        assert_eq!(
+            sessions
+                .entries
+                .get(lower.pool_index())
+                .and_then(|entry| entry.upper_session),
+            Some(upper),
+            "upper transport creation attaches the reverse link"
+        );
+
+        sessions
+            .remove_session(lower)
+            .expect("remove lower Session");
+        assert!(
+            !sessions.has_session(upper),
+            "lower removal removes the linked upper transport Session"
+        );
+        assert!(!sessions.has_session(lower), "lower is removed");
+
+        let lower = sessions
+            .construct_stream_sessions(
+                SessionTransportId::new(1),
+                Index::new(1, 1),
+                1,
+                application,
+                Some(hammer_runtime::app::SessionAppId::new(0)),
+                None,
+                None,
+                false,
+            )
+            .expect("construct a second lower Session");
+        let upper = sessions
+            .create_upper_transport_session(lower, transport, transport_index, 0x55)
+            .expect("create upper transport Session");
+        sessions
+            .remove_session(upper)
+            .expect("direct upper transport removal");
+        assert!(sessions.has_session(lower), "lower survives upper removal");
+        assert_eq!(
+            sessions
+                .entries
+                .get(lower.pool_index())
+                .and_then(|entry| entry.upper_session),
+            None,
+            "direct upper transport removal clears the reverse link"
+        );
+    }
+
+    #[test]
+    fn lower_session_returns_generation_checked_forward_link() {
+        let applications = ApplicationMain::new(4);
+        let application = applications.attach().expect("attach Application");
+        let mut sessions = SessionWorker::<Index>::new(
+            DataWorkerId::new(0),
+            1,
+            AppSessionConfig::default(),
+            DEFAULT_SESSION_POOL_CAPACITY,
+            applications,
+            None,
+        )
+        .expect("Session worker");
+        sessions
+            .install_application_mq_for_test(application)
+            .expect("install test Application MQ");
+        let lower = sessions
+            .construct_stream_sessions(
+                SessionTransportId::new(1),
+                Index::new(1, 1),
+                1,
+                application,
+                Some(hammer_runtime::app::SessionAppId::new(0)),
+                None,
+                None,
+                false,
+            )
+            .expect("construct lower Session App session");
+        let upper = sessions
+            .create_upper_session(lower, 0x55)
+            .expect("publish upper Session from callback");
+        assert_eq!(sessions.lower_session(upper), Some(lower));
+        assert_eq!(sessions.lower_session(lower), None);
+        sessions.remove_session(upper).expect("remove upper Session");
+        assert_eq!(sessions.lower_session(upper), None);
+    }
+
+    #[test]
+    fn upper_session_returns_generation_checked_owner_link() {
+        let applications = ApplicationMain::new(4);
+        let application = applications.attach().expect("attach Application");
+        let mut sessions = SessionWorker::<Index>::new(
+            DataWorkerId::new(0),
+            1,
+            AppSessionConfig::default(),
+            DEFAULT_SESSION_POOL_CAPACITY,
+            applications,
+            None,
+        )
+        .expect("Session worker");
+        sessions
+            .install_application_mq_for_test(application)
+            .expect("install test Application MQ");
+        let lower = sessions
+            .construct_stream_sessions(
+                SessionTransportId::new(1),
+                Index::new(1, 1),
+                1,
+                application,
+                Some(hammer_runtime::app::SessionAppId::new(0)),
+                None,
+                None,
+                false,
+            )
+            .expect("construct lower Session App session");
+        let upper = sessions
+            .create_upper_session(lower, 0x55)
+            .expect("publish upper Session from callback");
+        assert_eq!(sessions.upper_session(lower), Some(upper));
+        assert_eq!(sessions.upper_session(upper), None);
+        sessions.remove_upper_session(upper).expect("remove upper Session");
+        assert_eq!(sessions.upper_session(lower), None);
+    }
+
+    #[test]
+    fn lower_removal_follows_owner_link_only_leaving_forward_link_orphan() {
+        let applications = ApplicationMain::new(4);
+        let application = applications.attach().expect("attach Application");
+        let mut sessions = SessionWorker::<Index>::new(
+            DataWorkerId::new(0),
+            1,
+            AppSessionConfig::default(),
+            DEFAULT_SESSION_POOL_CAPACITY,
+            applications,
+            None,
+        )
+        .expect("Session worker");
+        sessions
+            .install_application_mq_for_test(application)
+            .expect("install test Application MQ");
+        let lower = sessions
+            .construct_stream_sessions(
+                SessionTransportId::new(1),
+                Index::new(1, 1),
+                1,
+                application,
+                Some(hammer_runtime::app::SessionAppId::new(0)),
+                None,
+                None,
+                false,
+            )
+            .expect("construct lower Session App session");
+        let upper = sessions
+            .create_upper_session(lower, 0x55)
+            .expect("publish upper Session from callback");
+        assert_eq!(
+            sessions
+                .entries
+                .get(upper.pool_index())
+                .and_then(|entry| entry.lower_session),
+            Some(lower),
+            "upper carries the forward link"
+        );
+
+        // Break the reverse owner link so the upper is reachable only through
+        // its own forward `lower_session` pointer.
+        sessions
+            .entries
+            .get_mut(lower.pool_index())
+            .expect("lower entry")
+            .upper_session = None;
+
+        sessions
+            .remove_session(lower)
+            .expect("lower removal");
+        assert!(!sessions.has_session(lower), "lower is removed");
+        assert!(
+            sessions.has_session(upper),
+            "a forward-link-only orphan is not swept: the cascade follows the owner link"
+        );
+        assert_eq!(
+            sessions
+                .entries
+                .get(upper.pool_index())
+                .and_then(|entry| entry.lower_session),
+            Some(lower),
+            "the orphan keeps its forward link and is untouched"
+        );
+        assert_eq!(sessions.entries.len(), 1, "only the orphan remains");
+    }
+
+    #[test]
+    fn lower_removal_walks_full_owner_chain_lower_mid_top() {
+        let applications = ApplicationMain::new(4);
+        let application = applications.attach().expect("attach Application");
+        let mut sessions = SessionWorker::<Index>::new(
+            DataWorkerId::new(0),
+            1,
+            AppSessionConfig::default(),
+            DEFAULT_SESSION_POOL_CAPACITY,
+            applications,
+            None,
+        )
+        .expect("Session worker");
+        sessions
+            .install_application_mq_for_test(application)
+            .expect("install test Application MQ");
+        let lower = sessions
+            .construct_stream_sessions(
+                SessionTransportId::new(1),
+                Index::new(1, 1),
+                1,
+                application,
+                Some(hammer_runtime::app::SessionAppId::new(0)),
+                None,
+                None,
+                false,
+            )
+            .expect("construct lower Session App session");
+        let mid = sessions
+            .create_upper_session(lower, 0x55)
+            .expect("publish mid upper Session");
+        let top = sessions
+            .create_upper_session(mid, 0x66)
+            .expect("publish top upper Session");
+        assert_eq!(
+            sessions
+                .entries
+                .get(mid.pool_index())
+                .and_then(|entry| entry.lower_session),
+            Some(lower),
+            "mid points back at lower"
+        );
+        assert_eq!(
+            sessions
+                .entries
+                .get(lower.pool_index())
+                .and_then(|entry| entry.upper_session),
+            Some(mid),
+            "lower owns mid"
+        );
+        assert_eq!(
+            sessions
+                .entries
+                .get(top.pool_index())
+                .and_then(|entry| entry.lower_session),
+            Some(mid),
+            "top points back at mid"
+        );
+        assert_eq!(
+            sessions
+                .entries
+                .get(mid.pool_index())
+                .and_then(|entry| entry.upper_session),
+            Some(top),
+            "mid owns top"
+        );
+
+        sessions
+            .remove_session(lower)
+            .expect("remove lower Session");
+        assert!(!sessions.has_session(lower), "lower is removed");
+        assert!(
+            !sessions.has_session(mid),
+            "mid is removed through the owner link"
+        );
+        assert!(
+            !sessions.has_session(top),
+            "top is removed through the owner link"
+        );
+        assert_eq!(
+            sessions.entries.len(),
+            0,
+            "the whole chain is swept iteratively"
+        );
+    }
+
+    static SESSION_CLEANUP_FAILING: AtomicU64 = AtomicU64::new(0);
+    static SESSION_CLEANUP_ATTEMPTS: AtomicU64 = AtomicU64::new(0);
+    static SESSION_CLEANUP_SUCCESSES: AtomicU64 = AtomicU64::new(0);
+
+    fn fail_cleanup_for_session(
+        _: &mut SessionWorker<Index>,
+        session_id: SessionId,
+        _: u64,
+    ) -> RuntimeResult<()> {
+        SESSION_CLEANUP_ATTEMPTS.fetch_add(1, Ordering::SeqCst);
+        if session_id.get() == SESSION_CLEANUP_FAILING.load(Ordering::SeqCst) {
+            return Err(SessionError::PublicationRejected { session_id }.into());
+        }
+        SESSION_CLEANUP_SUCCESSES.fetch_add(1, Ordering::SeqCst);
+        Ok(())
+    }
+
+    #[test]
+    fn upper_cleanup_error_stops_walk_and_preserves_remaining_chain() {
+        let applications = ApplicationMain::new(4);
+        let application = applications.attach().expect("attach Application");
+        let mut sessions = SessionWorker::<Index>::new(
+            DataWorkerId::new(0),
+            1,
+            AppSessionConfig::default(),
+            DEFAULT_SESSION_POOL_CAPACITY,
+            applications,
+            None,
+        )
+        .expect("Session worker");
+        sessions
+            .install_application_mq_for_test(application)
+            .expect("install test Application MQ");
+        sessions
+            .install_session_app(
+                hammer_runtime::app::SessionAppId::new(0),
+                SessionAppCallbacks {
+                    cleanup: Some(fail_cleanup_for_session),
+                    ..Default::default()
+                },
+            )
+            .expect("install Session App callbacks");
+        let lower = sessions
+            .construct_stream_sessions(
+                SessionTransportId::new(1),
+                Index::new(1, 1),
+                1,
+                application,
+                Some(hammer_runtime::app::SessionAppId::new(0)),
+                None,
+                None,
+                false,
+            )
+            .expect("construct lower Session App session");
+        let mid = sessions
+            .create_upper_session(lower, 0x55)
+            .expect("publish mid upper Session");
+        let top = sessions
+            .create_upper_session(mid, 0x66)
+            .expect("publish top upper Session");
+
+        SESSION_CLEANUP_ATTEMPTS.store(0, Ordering::SeqCst);
+        SESSION_CLEANUP_SUCCESSES.store(0, Ordering::SeqCst);
+        SESSION_CLEANUP_FAILING.store(mid.get(), Ordering::SeqCst);
+        let error = sessions
+            .remove_session(lower)
+            .expect_err("the mid cleanup error propagates");
+        assert!(matches!(
+            &error,
+            RuntimeError::Subsystem { source, .. }
+                if matches!(
+                    source.downcast_ref::<SessionError>(),
+                    Some(SessionError::PublicationRejected { session_id })
+                        if *session_id == mid
+                )
+        ));
+        assert!(
+            !sessions.has_session(lower),
+            "lower is removed before the walk"
+        );
+        assert!(sessions.has_session(mid), "the failing upper stays live");
+        assert!(
+            sessions.has_session(top),
+            "the walk stops at the first cleanup error"
+        );
+        assert_eq!(
+            sessions.entries.len(),
+            2,
+            "exactly mid and top remain after the first cleanup error"
+        );
+        assert_eq!(
+            SESSION_CLEANUP_ATTEMPTS.load(Ordering::SeqCst),
+            1,
+            "only mid's cleanup ran: the lower has no app session context, and top was never reached"
+        );
+        assert_eq!(
+            SESSION_CLEANUP_SUCCESSES.load(Ordering::SeqCst),
+            0,
+            "the mid cleanup error propagates before any walk node is freed"
+        );
+    }
+
+    static SESSION_CLEANUP_DETACHING_CALLS: AtomicU64 = AtomicU64::new(0);
+
+    fn detach_child_on_cleanup(
+        sessions: &mut SessionWorker<Index>,
+        session_id: SessionId,
+        _: u64,
+    ) -> RuntimeResult<()> {
+        SESSION_CLEANUP_DETACHING_CALLS.fetch_add(1, Ordering::SeqCst);
+        let child = sessions
+            .entries
+            .get(session_id.pool_index())
+            .and_then(|entry| entry.upper_session);
+        if let Some(child) = child {
+            sessions.detach_upper_session(session_id, child);
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn cleanup_callback_detaching_child_stops_walk_before_removal() {
+        let applications = ApplicationMain::new(4);
+        let application = applications.attach().expect("attach Application");
+        let mut sessions = SessionWorker::<Index>::new(
+            DataWorkerId::new(0),
+            1,
+            AppSessionConfig::default(),
+            DEFAULT_SESSION_POOL_CAPACITY,
+            applications,
+            None,
+        )
+        .expect("Session worker");
+        sessions
+            .install_application_mq_for_test(application)
+            .expect("install test Application MQ");
+        sessions
+            .install_session_app(
+                hammer_runtime::app::SessionAppId::new(0),
+                SessionAppCallbacks {
+                    cleanup: Some(detach_child_on_cleanup),
+                    ..Default::default()
+                },
+            )
+            .expect("install Session App callbacks");
+        let lower = sessions
+            .construct_stream_sessions(
+                SessionTransportId::new(1),
+                Index::new(1, 1),
+                1,
+                application,
+                Some(hammer_runtime::app::SessionAppId::new(0)),
+                None,
+                None,
+                false,
+            )
+            .expect("construct lower Session App session");
+        let mid = sessions
+            .create_upper_session(lower, 0x55)
+            .expect("publish mid upper Session");
+        let top = sessions
+            .create_upper_session(mid, 0x66)
+            .expect("publish top upper Session");
+
+        SESSION_CLEANUP_DETACHING_CALLS.store(0, Ordering::SeqCst);
+        sessions
+            .remove_session(lower)
+            .expect("lower removal");
+        assert!(
+            !sessions.has_session(lower),
+            "lower is removed before the walk"
+        );
+        assert!(
+            sessions.has_session(mid),
+            "mid is not removed: its callback detached the child, so the walk stops at the restructured link"
+        );
+        assert!(
+            sessions.has_session(top),
+            "the child detached by the cleanup callback is never swept"
+        );
+        assert_eq!(
+            sessions
+                .entries
+                .get(mid.pool_index())
+                .and_then(|entry| entry.upper_session),
+            None,
+            "the callback detached the child from mid"
+        );
+        assert_eq!(
+            sessions
+                .entries
+                .get(top.pool_index())
+                .and_then(|entry| entry.lower_session),
+            Some(mid),
+            "the detached child's back-link is untouched"
+        );
+        assert_eq!(
+            SESSION_CLEANUP_DETACHING_CALLS.load(Ordering::SeqCst),
+            1,
+            "only mid's cleanup ran: the walk stops before any further cleanup"
+        );
+        assert_eq!(
+            sessions.entries.len(),
+            2,
+            "exactly mid and top remain after the restructured link"
+        );
+    }
+
+    #[test]
+    fn parent_session_is_distinct_metadata_never_cascading_on_cleanup() {
+        let applications = ApplicationMain::new(4);
+        let application = applications.attach().expect("attach Application");
+        let mut sessions = SessionWorker::<Index>::new(
+            DataWorkerId::new(0),
+            1,
+            AppSessionConfig::default(),
+            DEFAULT_SESSION_POOL_CAPACITY,
+            applications,
+            None,
+        )
+        .expect("Session worker");
+        sessions
+            .install_application_mq_for_test(application)
+            .expect("install test Application MQ");
+        let parent = sessions
+            .construct_stream_sessions(
+                SessionTransportId::new(1),
+                Index::new(1, 1),
+                1,
+                application,
+                Some(hammer_runtime::app::SessionAppId::new(0)),
+                None,
+                None,
+                false,
+            )
+            .expect("construct parent transport Session");
+        let child = sessions
+            .construct_stream_sessions(
+                SessionTransportId::new(3),
+                Index::new(7, 1),
+                1,
+                application,
+                Some(hammer_runtime::app::SessionAppId::new(0)),
+                None,
+                None,
+                false,
+            )
+            .expect("construct child transport Session");
+
+        assert_eq!(sessions.parent_session(child), None);
+        sessions
+            .set_parent_session(child, parent)
+            .expect("set transport parent");
+        assert_eq!(sessions.parent_session(child), Some(parent));
+        assert_eq!(
+            sessions
+                .entries
+                .get(child.pool_index())
+                .and_then(|entry| entry.lower_session),
+            None,
+            "parent topology must not create lower attachment"
+        );
+
+        // VPP `session_alloc_for_stream` (session.c:507-523) rejects a child
+        // whose parent handle is invalid; the same constraint applies here.
+        let missing = SessionId::new(99);
+        let error = sessions
+            .set_parent_session(child, missing)
+            .expect_err("missing parent rejects stream Session parenting");
+        assert!(matches!(
+            &error,
+            RuntimeError::Subsystem { source, .. }
+                if matches!(
+                    source.downcast_ref::<SessionError>(),
+                    Some(SessionError::ConnectStreamParentMissing)
+                )
+        ));
+        assert_eq!(
+            sessions.parent_session(child),
+            Some(parent),
+            "failed parenting must not mutate child metadata"
+        );
+
+        // Removing the parent must not sweep a child that only carries
+        // parent topology: the upper/lower cascade keys on `lower_session`
+        // attachment, never on `parent_session`.
+        sessions
+            .remove_session(parent)
+            .expect("remove parent Session");
+        assert!(!sessions.has_session(parent));
+        assert!(sessions.has_session(child));
+
+        // The child removes as a top-level Session: parent topology neither
+        // suppresses its own cleanup nor cascades anywhere.
+        sessions
+            .remove_session(child)
+            .expect("remove child Session");
+        assert!(!sessions.has_session(child));
+        assert_eq!(sessions.entries.len(), 0);
+    }
+
     fn accepted_reply_fixture(
         application: hammer_runtime::app::ApplicationId,
         publisher: hammer_runtime::attach::AppSessionPublisher,
@@ -6579,6 +8352,356 @@ mod tests {
         assert_eq!(accepted.session, sessions.session_handle(second));
         assert_eq!(accepted.listener, SessionHandle::new(7, 0));
         let _ = std::fs::remove_file(socket_path);
+    }
+
+    /// Inserts a bare transport Session in the pool without App publication,
+    /// enough to exercise the static `accept_metadata` pool reads.
+    fn insert_metadata_test_session(
+        sessions: &mut SessionWorker<Index>,
+        transport: SessionTransportId,
+        index: Index,
+    ) -> SessionId {
+        let (rx_fifo, tx_fifo) = sessions
+            .create_local_fifos()
+            .expect("test Session FIFOs");
+        let session_id = sessions
+            .insert_session_entry(SessionEntry::creating_transport(
+                transport, rx_fifo, tx_fifo,
+            ))
+            .expect("insert test Session");
+        sessions
+            .finish_transport_creation(session_id, index)
+            .expect("finish test Session creation");
+        session_id
+    }
+
+    fn metadata_test_worker() -> SessionWorker<Index> {
+        SessionWorker::<Index>::new(
+            DataWorkerId::new(0),
+            1,
+            AppSessionConfig::default(),
+            DEFAULT_SESSION_POOL_CAPACITY,
+            ApplicationMain::new(1),
+            None,
+        )
+        .expect("Session worker")
+    }
+
+    #[test]
+    fn accept_metadata_root_never_resolves_parent_context() {
+        let mut sessions = metadata_test_worker();
+        let parent = insert_metadata_test_session(
+            &mut sessions,
+            SessionTransportId::new(1),
+            Index::new(1, 1),
+        );
+        sessions
+            .entries
+            .get_mut(parent.pool_index())
+            .expect("parent entry")
+            .app_session = 42;
+        // A root may pin its accepting listener (VPP accepted connections
+        // name the listener) but the `SESSION_F_STREAM` gate keeps it from
+        // resolving a parent: VPP walks `listener_handle` only on the stream
+        // accept path (`http_ts_accept_stream`).
+        let root = insert_metadata_test_session(
+            &mut sessions,
+            SessionTransportId::new(1),
+            Index::new(2, 1),
+        );
+        sessions
+            .entries
+            .get_mut(root.pool_index())
+            .expect("root entry")
+            .listener = Some(sessions.session_handle(parent));
+
+        let metadata = sessions.accept_metadata(root).expect("root accept metadata");
+        assert_eq!(metadata.flags, SessionFlags::empty());
+        // Roots report their own construction-lifecycle role, never the
+        // pinned listener's, and carry no parent context.
+        assert_eq!(metadata.role, Some(SessionEndpointRole::Client));
+        assert_eq!(metadata.parent_app_context, None);
+    }
+
+    #[test]
+    fn accept_metadata_stream_children_carry_parent_app_context() {
+        let mut sessions = metadata_test_worker();
+        let parent = insert_metadata_test_session(
+            &mut sessions,
+            SessionTransportId::new(1),
+            Index::new(1, 1),
+        );
+        sessions
+            .entries
+            .get_mut(parent.pool_index())
+            .expect("parent entry")
+            .app_session = 42;
+        // A server connection: accepted from a listener (VPP
+        // `HTTP_CONN_F_IS_SERVER`, http.c:1438).
+        sessions
+            .entries
+            .get_mut(parent.pool_index())
+            .expect("parent entry")
+            .accepted = true;
+        let parent_handle = sessions.session_handle(parent);
+
+        // Bidi stream child: VPP `http_ts_accept_stream` (http.c:675) resolves
+        // the parent connection from the child's pinned listener handle and
+        // inherits its context and endpoint role.
+        let bidi = insert_metadata_test_session(
+            &mut sessions,
+            SessionTransportId::new(1),
+            Index::new(2, 1),
+        );
+        sessions
+            .set_session_flags(bidi, SessionFlags::STREAM)
+            .expect("derive bidi stream flags");
+        sessions
+            .entries
+            .get_mut(bidi.pool_index())
+            .expect("bidi child entry")
+            .listener = Some(parent_handle);
+        let metadata = sessions.accept_metadata(bidi).expect("bidi accept metadata");
+        assert_eq!(metadata.flags, SessionFlags::STREAM);
+        assert_eq!(metadata.role, Some(SessionEndpointRole::Server));
+        assert_eq!(metadata.parent_app_context, Some(42));
+
+        // Uni stream child inherits the same parent context and role.
+        let uni = insert_metadata_test_session(
+            &mut sessions,
+            SessionTransportId::new(1),
+            Index::new(3, 1),
+        );
+        sessions
+            .set_session_flags(
+                uni,
+                SessionFlags::STREAM | SessionFlags::UNIDIRECTIONAL,
+            )
+            .expect("derive uni stream flags");
+        sessions
+            .entries
+            .get_mut(uni.pool_index())
+            .expect("uni child entry")
+            .listener = Some(parent_handle);
+        let metadata = sessions.accept_metadata(uni).expect("uni accept metadata");
+        assert_eq!(
+            metadata.flags,
+            SessionFlags::STREAM | SessionFlags::UNIDIRECTIONAL
+        );
+        assert_eq!(metadata.role, Some(SessionEndpointRole::Server));
+        assert_eq!(metadata.parent_app_context, Some(42));
+    }
+
+    #[test]
+    fn accept_metadata_outbound_root_reports_client() {
+        let mut sessions = metadata_test_worker();
+        // Outbound connect root: `stream_connect_pending` constructs with
+        // `accepted` unset, so the root reports `Client` (VPP connects never
+        // set `HTTP_CONN_F_IS_SERVER`).
+        let root = insert_metadata_test_session(
+            &mut sessions,
+            SessionTransportId::new(1),
+            Index::new(1, 1),
+        );
+        let metadata = sessions.accept_metadata(root).expect("root accept metadata");
+        assert_eq!(metadata.role, Some(SessionEndpointRole::Client));
+        assert_eq!(metadata.parent_app_context, None);
+    }
+
+    #[test]
+    fn accept_metadata_stream_child_inherits_client_parent_role() {
+        let mut sessions = metadata_test_worker();
+        // Streams on an outbound connect root inherit its `Client` role
+        // exactly as they inherit its context, regardless of stream flags.
+        let parent = insert_metadata_test_session(
+            &mut sessions,
+            SessionTransportId::new(1),
+            Index::new(1, 1),
+        );
+        let parent_handle = sessions.session_handle(parent);
+        for (slot, flags) in [
+            (2, SessionFlags::STREAM),
+            (
+                3,
+                SessionFlags::STREAM | SessionFlags::UNIDIRECTIONAL,
+            ),
+        ] {
+            let child = insert_metadata_test_session(
+                &mut sessions,
+                SessionTransportId::new(1),
+                Index::new(slot, 1),
+            );
+            sessions
+                .set_session_flags(child, flags)
+                .expect("derive stream flags");
+            sessions
+                .entries
+                .get_mut(child.pool_index())
+                .expect("child entry")
+                .listener = Some(parent_handle);
+            let metadata = sessions
+                .accept_metadata(child)
+                .expect("child accept metadata");
+            assert_eq!(
+                metadata.role,
+                Some(SessionEndpointRole::Client),
+                "child inherits the parent connection role"
+            );
+        }
+    }
+
+    #[test]
+    fn accept_metadata_missing_or_removed_child_returns_none() {
+        let mut sessions = metadata_test_worker();
+        // A Session id that was never installed (in-bounds slot, wrong
+        // generation) and one that was removed both fail the pool lookup.
+        assert!(sessions
+            .accept_metadata(SessionId::from(Index::new(1023, 1)))
+            .is_none());
+        let removed = insert_metadata_test_session(
+            &mut sessions,
+            SessionTransportId::new(1),
+            Index::new(1, 1),
+        );
+        sessions
+            .entries
+            .remove(removed.pool_index())
+            .expect("remove Session");
+        assert!(sessions.accept_metadata(removed).is_none());
+    }
+
+    #[test]
+    fn accept_metadata_stale_or_foreign_parent_handle_yields_no_parent() {
+        let mut sessions = metadata_test_worker();
+        // A freed parent's handle no longer resolves: the slot is empty, so
+        // `session_id_from_handle` misses exactly as VPP `session_get_from_handle`
+        // misses on a freed pool element.
+        let freed = insert_metadata_test_session(
+            &mut sessions,
+            SessionTransportId::new(1),
+            Index::new(1, 1),
+        );
+        let freed_handle = sessions.session_handle(freed);
+        let stale_child = insert_metadata_test_session(
+            &mut sessions,
+            SessionTransportId::new(1),
+            Index::new(2, 1),
+        );
+        sessions
+            .set_session_flags(stale_child, SessionFlags::STREAM)
+            .expect("derive stale child stream flags");
+        sessions
+            .entries
+            .get_mut(stale_child.pool_index())
+            .expect("stale child entry")
+            .listener = Some(freed_handle);
+        sessions
+            .entries
+            .remove(freed.pool_index())
+            .expect("free parent");
+        let metadata = sessions
+            .accept_metadata(stale_child)
+            .expect("stale child accept metadata");
+        assert_eq!(metadata.parent_app_context, None);
+        assert_eq!(metadata.role, None);
+
+        // A handle naming another worker's slot is foreign and never resolves.
+        let parent = insert_metadata_test_session(
+            &mut sessions,
+            SessionTransportId::new(1),
+            Index::new(3, 1),
+        );
+        let orphan_child = insert_metadata_test_session(
+            &mut sessions,
+            SessionTransportId::new(1),
+            Index::new(4, 1),
+        );
+        sessions
+            .set_session_flags(orphan_child, SessionFlags::STREAM)
+            .expect("derive orphan child stream flags");
+        sessions
+            .entries
+            .get_mut(orphan_child.pool_index())
+            .expect("orphan child entry")
+            .listener = Some(SessionHandle::new(
+                sessions.session_handle(parent).session_index(),
+                1,
+            ));
+        let metadata = sessions
+            .accept_metadata(orphan_child)
+            .expect("orphan child accept metadata");
+        assert_eq!(metadata.parent_app_context, None);
+        assert_eq!(metadata.role, None);
+    }
+
+    #[test]
+    fn accept_metadata_parent_handle_resolves_live_slot_occupant() {
+        let mut sessions = metadata_test_worker();
+        // A handle pins a slot, not a Session identity: when the parent is
+        // freed and the slot is reused, the child resolves the live occupant
+        // (VPP `session_get_from_handle` resolves by pool slot, so a stale
+        // handle sees the current entry, never a generation-checked miss).
+        let first = insert_metadata_test_session(
+            &mut sessions,
+            SessionTransportId::new(1),
+            Index::new(1, 1),
+        );
+        sessions
+            .entries
+            .get_mut(first.pool_index())
+            .expect("first parent entry")
+            .app_session = 100;
+        let child = insert_metadata_test_session(
+            &mut sessions,
+            SessionTransportId::new(1),
+            Index::new(2, 1),
+        );
+        sessions
+            .set_session_flags(child, SessionFlags::STREAM)
+            .expect("derive child stream flags");
+        sessions
+            .entries
+            .get_mut(child.pool_index())
+            .expect("child entry")
+            .listener = Some(sessions.session_handle(first));
+        sessions
+            .entries
+            .remove(first.pool_index())
+            .expect("free first parent");
+        let second = insert_metadata_test_session(
+            &mut sessions,
+            SessionTransportId::new(1),
+            Index::new(3, 1),
+        );
+        assert_eq!(
+            second.pool_index().slot(),
+            first.pool_index().slot(),
+            "the freed parent slot is reused"
+        );
+        sessions
+            .entries
+            .get_mut(second.pool_index())
+            .expect("second parent entry")
+            .app_session = 200;
+        // The slot occupant is a server connection; the child inherits its
+        // role together with its context.
+        sessions
+            .entries
+            .get_mut(second.pool_index())
+            .expect("second parent entry")
+            .accepted = true;
+
+        let metadata = sessions.accept_metadata(child).expect("child accept metadata");
+        assert_eq!(
+            metadata.parent_app_context,
+            Some(200),
+            "the stale parent handle resolves the live slot occupant"
+        );
+        assert_eq!(
+            metadata.role,
+            Some(SessionEndpointRole::Server),
+            "the role follows the live slot occupant"
+        );
     }
 
     #[test]
@@ -6840,6 +8963,510 @@ mod tests {
                 ..
             })
         ));
+    }
+
+    // --- Task 15: worker-local transport action dispatch ---
+
+    const ACTION_TRANSPORT: SessionTransportId = SessionTransportId::new(0);
+
+    /// Per-thread capture for the fake transport callbacks. The callbacks run
+    /// synchronously on the test's own worker thread, so a thread-local
+    /// capture is race-free under parallel cargo test without any
+    /// synchronization; the owned `close_reason` replaces the previous
+    /// raw-pointer reconstruction.
+    #[derive(Default)]
+    struct TransportActionCapture {
+        callback_count: u64,
+        state_at_callback: u8,
+        open_parent: u64,
+        open_direction: u8,
+        open_context: u64,
+        open_child: u64,
+        reset_session: u64,
+        reset_code: u64,
+        stop_session: u64,
+        stop_code: u64,
+        close_session: u64,
+        close_code: u64,
+        close_reason: Vec<u8>,
+    }
+
+    thread_local! {
+        static TRANSPORT_ACTION_CAPTURE: RefCell<TransportActionCapture> =
+            RefCell::new(TransportActionCapture::default());
+    }
+
+    fn with_capture<T>(f: impl FnOnce(&mut TransportActionCapture) -> T) -> T {
+        TRANSPORT_ACTION_CAPTURE.with(|cell| f(&mut cell.borrow_mut()))
+    }
+
+    fn callback_count() -> u64 {
+        with_capture(|capture| capture.callback_count)
+    }
+
+    fn state_at_callback() -> u8 {
+        with_capture(|capture| capture.state_at_callback)
+    }
+
+    fn reset_capture() {
+        with_capture(|capture| *capture = TransportActionCapture::default());
+    }
+
+    /// Applies one state-machine step to a Session entry from the test thread.
+    fn mutate_state(
+        sessions: &mut SessionWorker<Index>,
+        session_id: SessionId,
+        f: impl FnOnce(&mut SessionState<Index>),
+    ) {
+        let entry = sessions
+            .entries
+            .get_mut(session_id.pool_index())
+            .expect("transport Session entry");
+        let Some(SessionType::Transport { state, .. }) = entry.session_type.as_mut() else {
+            panic!("transport Session entry");
+        };
+        f(state);
+    }
+
+    fn fake_open_stream(
+        worker: &mut SessionWorker<Index>,
+        parent: SessionId,
+        direction: SessionStreamDirection,
+        app_context: SessionAppContext,
+    ) -> RuntimeResult<SessionId> {
+        with_capture(|capture| {
+            capture.callback_count += 1;
+            capture.open_parent = parent.get();
+            capture.open_direction = match direction {
+                SessionStreamDirection::Bidi => 0,
+                SessionStreamDirection::Uni => 1,
+            };
+            capture.open_context = app_context;
+        });
+        let (rx_fifo, tx_fifo) = worker.create_local_fifos()?;
+        let child = worker.insert_session_entry(SessionEntry::creating_transport(
+            ACTION_TRANSPORT,
+            rx_fifo,
+            tx_fifo,
+        ))?;
+        with_capture(|capture| capture.open_child = child.get());
+        Ok(child)
+    }
+
+    /// Records whether the Session entry already shows AppClosed at callback
+    /// time; proves the seam transitions state before invoking the transport.
+    fn record_state_at_callback(worker: &SessionWorker<Index>, session_id: SessionId) {
+        let app_closed = worker
+            .entries
+            .get(session_id.pool_index())
+            .is_some_and(|entry| {
+                matches!(
+                    entry.session_type,
+                    Some(SessionType::Transport {
+                        state: SessionState::AppClosed(_),
+                        ..
+                    })
+                )
+            });
+        with_capture(|capture| capture.state_at_callback = app_closed as u8);
+    }
+
+    fn fake_reset_stream(
+        worker: &mut SessionWorker<Index>,
+        session_id: SessionId,
+        code: SessionApplicationErrorCode,
+    ) -> RuntimeResult<()> {
+        with_capture(|capture| {
+            capture.callback_count += 1;
+            capture.reset_session = session_id.get();
+            capture.reset_code = u64::from(code);
+        });
+        record_state_at_callback(worker, session_id);
+        Ok(())
+    }
+
+    fn fake_stop_sending(
+        _worker: &mut SessionWorker<Index>,
+        session_id: SessionId,
+        code: SessionApplicationErrorCode,
+    ) -> RuntimeResult<()> {
+        with_capture(|capture| {
+            capture.callback_count += 1;
+            capture.stop_session = session_id.get();
+            capture.stop_code = u64::from(code);
+        });
+        Ok(())
+    }
+
+    fn fake_close_connection(
+        worker: &mut SessionWorker<Index>,
+        connection: SessionId,
+        code: SessionApplicationErrorCode,
+        reason: &[u8],
+    ) -> RuntimeResult<()> {
+        with_capture(|capture| {
+            capture.callback_count += 1;
+            capture.close_session = connection.get();
+            capture.close_code = u64::from(code);
+            capture.close_reason = reason.to_vec();
+        });
+        record_state_at_callback(worker, connection);
+        Ok(())
+    }
+
+    fn fake_worker_actions() -> SessionTransportWorkerActions<Index> {
+        SessionTransportWorkerActions::new(
+            fake_open_stream,
+            fake_reset_stream,
+            fake_stop_sending,
+            fake_close_connection,
+        )
+    }
+
+    fn worker_with_transport_session(
+        transport: SessionTransportId,
+        index: Index,
+    ) -> (SessionWorker<Index>, SessionId) {
+        let applications = ApplicationMain::new(1);
+        let mut sessions = SessionWorker::<Index>::new(
+            DataWorkerId::new(0),
+            1,
+            AppSessionConfig::default(),
+            DEFAULT_SESSION_POOL_CAPACITY,
+            applications,
+            None,
+        )
+        .expect("Session worker");
+        let (rx_fifo, tx_fifo) = sessions
+            .create_local_fifos()
+            .expect("Session FIFOs for transport action test");
+        let session_id = sessions
+            .insert_session_entry(SessionEntry::creating_transport(
+                transport, rx_fifo, tx_fifo,
+            ))
+            .expect("insert transport Session");
+        sessions
+            .finish_transport_creation(session_id, index)
+            .expect("complete transport Session");
+        (sessions, session_id)
+    }
+
+    /// Moves a Created transport Session to Active via the state machine
+    /// (Published then connected), as the transport does before dispatchable
+    /// streams exist.
+    fn make_active(sessions: &mut SessionWorker<Index>, session_id: SessionId) {
+        mutate_state(sessions, session_id, |state| {
+            let (published, _) = state
+                .on_connection_published()
+                .expect("Created transitions to Published");
+            *state = published;
+            *state = state
+                .on_connected()
+                .expect("Published transitions to Active");
+        });
+    }
+
+    #[test]
+    fn transport_worker_actions_receive_exact_typed_args() -> Result<(), SessionTestFailure> {
+        reset_capture();
+        let (mut sessions, parent) =
+            worker_with_transport_session(ACTION_TRANSPORT, Index::new(7, 1));
+        sessions.install_transport_actions(ACTION_TRANSPORT, fake_worker_actions())?;
+        assert!(
+            sessions
+                .install_transport_actions(ACTION_TRANSPORT, fake_worker_actions())
+                .is_err(),
+            "duplicate install is rejected"
+        );
+
+        let code = SessionApplicationErrorCode::from(0x1234u64);
+        let child = sessions.open_stream(parent, SessionStreamDirection::Uni, 0xDEAD_BEEF)?;
+        with_capture(|capture| {
+            assert_eq!(capture.open_parent, parent.get());
+            assert_eq!(capture.open_direction, 1);
+            assert_eq!(capture.open_context, 0xDEAD_BEEF);
+            assert_eq!(
+                child,
+                SessionId::from_raw(capture.open_child),
+                "open_stream returns the child Session the callback created"
+            );
+        });
+        assert_ne!(child, parent);
+        assert!(
+            sessions.entries.get(child.pool_index()).is_some(),
+            "the returned child exists on the worker"
+        );
+
+        // stop_sending dispatches only for an Active session (VPP READY-only
+        // half-close), so bring parent to Active before the close-family
+        // actions; each close-family dispatch records AppClosed, so each
+        // action below needs a still-open session.
+        make_active(&mut sessions, parent);
+        sessions.stop_sending(parent, code)?;
+        with_capture(|capture| {
+            assert_eq!(capture.stop_session, parent.get());
+            assert_eq!(capture.stop_code, 0x1234);
+        });
+
+        sessions.reset_stream(parent, code)?;
+        with_capture(|capture| {
+            assert_eq!(capture.reset_session, parent.get());
+            assert_eq!(capture.reset_code, 0x1234);
+        });
+
+        // Parent is AppClosed after the reset; finish and close the still-open
+        // child instead (a Creating Session would be a guarded no-op).
+        sessions
+            .finish_transport_creation(child, Index::new(7, 2))
+            .expect("complete child transport Session");
+        let reason = [0xFF, 0x00, 0xFE];
+        sessions.close_connection(child, code, &reason)?;
+        with_capture(|capture| {
+            assert_eq!(capture.close_session, child.get());
+            assert_eq!(capture.close_code, 0x1234);
+            assert_eq!(
+                capture.close_reason, reason,
+                "the raw non-UTF8 reason bytes are passed through"
+            );
+        });
+        Ok(())
+    }
+
+    #[test]
+    fn transport_worker_actions_missing_registration_is_typed() -> Result<(), SessionTestFailure> {
+        let (mut sessions, session) =
+            worker_with_transport_session(ACTION_TRANSPORT, Index::new(1, 1));
+
+        assert!(matches!(
+            sessions.open_stream(session, SessionStreamDirection::Bidi, 0),
+            Err(SessionTransportActionError::MissingRegistration { transport })
+                if transport == ACTION_TRANSPORT
+        ));
+        assert!(matches!(
+            sessions.reset_stream(session, SessionApplicationErrorCode::from(0u64)),
+            Err(SessionTransportActionError::MissingRegistration { .. })
+        ));
+        assert!(matches!(
+            sessions.stop_sending(session, SessionApplicationErrorCode::from(0u64)),
+            Err(SessionTransportActionError::MissingRegistration { .. })
+        ));
+        assert!(matches!(
+            sessions.close_connection(session, SessionApplicationErrorCode::from(0u64), &[1]),
+            Err(SessionTransportActionError::MissingRegistration { .. })
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn transport_worker_actions_derive_transport_and_validate_session()
+    -> Result<(), SessionTestFailure> {
+        reset_capture();
+        // The transport is derived from the Session entry, never caller-supplied:
+        // with no table installed, the typed error names the derived transport.
+        let (mut sessions, own) = worker_with_transport_session(ACTION_TRANSPORT, Index::new(1, 1));
+        assert!(matches!(
+            sessions.reset_stream(own, SessionApplicationErrorCode::from(0u64)),
+            Err(SessionTransportActionError::MissingRegistration { transport })
+                if transport == ACTION_TRANSPORT
+        ));
+
+        let foreign = SessionTransportId::new(1);
+        let (mut sessions, foreign_session) =
+            worker_with_transport_session(foreign, Index::new(1, 1));
+        sessions.install_transport_actions(foreign, fake_worker_actions())?;
+        assert!(matches!(
+            sessions.reset_stream(SessionId::new(999), SessionApplicationErrorCode::from(0u64)),
+            Err(SessionTransportActionError::InvalidSession { session_id })
+                if session_id == SessionId::new(999)
+        ));
+        sessions.reset_stream(foreign_session, SessionApplicationErrorCode::from(0x77u64))?;
+        with_capture(|capture| {
+            assert_eq!(
+                capture.reset_session,
+                foreign_session.get(),
+                "the derived transport 1 table dispatched the session"
+            );
+            assert_eq!(capture.reset_code, 0x77);
+        });
+        Ok(())
+    }
+
+    /// Inserts a Created transport Session (finished creation) on the worker.
+    fn extra_transport_session(sessions: &mut SessionWorker<Index>, index: Index) -> SessionId {
+        let (rx_fifo, tx_fifo) = sessions
+            .create_local_fifos()
+            .expect("Session FIFOs for transport action test");
+        let session_id = sessions
+            .insert_session_entry(SessionEntry::creating_transport(
+                ACTION_TRANSPORT,
+                rx_fifo,
+                tx_fifo,
+            ))
+            .expect("insert transport Session");
+        sessions
+            .finish_transport_creation(session_id, index)
+            .expect("complete transport Session");
+        session_id
+    }
+
+    #[test]
+    fn transport_worker_actions_repeated_or_invalid_states_keep_callback_count()
+    -> Result<(), SessionTestFailure> {
+        reset_capture();
+        let (mut sessions, session) =
+            worker_with_transport_session(ACTION_TRANSPORT, Index::new(2, 1));
+        sessions.install_transport_actions(ACTION_TRANSPORT, fake_worker_actions())?;
+        let code = SessionApplicationErrorCode::from(0x42u64);
+
+        // A still-Creating Session (no transport index yet) never dispatches.
+        let (rx_fifo, tx_fifo) = sessions.create_local_fifos().expect("Session FIFOs");
+        let creating = sessions
+            .insert_session_entry(SessionEntry::creating_transport(
+                ACTION_TRANSPORT,
+                rx_fifo,
+                tx_fifo,
+            ))
+            .expect("insert Creating Session");
+        sessions.stop_sending(creating, code)?;
+        sessions.reset_stream(creating, code)?;
+        sessions.close_connection(creating, code, &[])?;
+        assert_eq!(
+            callback_count(),
+            0,
+            "Creating Sessions never reach the transport"
+        );
+
+        // A Created (not yet Active) Session cannot half-close (VPP READY-only).
+        sessions.stop_sending(session, code)?;
+        assert_eq!(callback_count(), 0);
+
+        // But it does close: VPP dispatches transport_close for every state
+        // below APP_CLOSED, with AppClosed recorded first.
+        sessions.close_connection(session, code, &[])?;
+        assert_eq!(callback_count(), 1);
+        assert_eq!(
+            state_at_callback(),
+            1,
+            "AppClosed was recorded before the close callback ran"
+        );
+
+        // Repeated close, reset and stop on the AppClosed Session are no-ops.
+        sessions.close_connection(session, code, &[])?;
+        sessions.reset_stream(session, code)?;
+        sessions.stop_sending(session, code)?;
+        assert_eq!(
+            callback_count(),
+            1,
+            "repeated close-family actions on AppClosed never re-dispatch"
+        );
+
+        // A TransportClosed Session never dispatches close/reset/stop.
+        let transport_closed = extra_transport_session(&mut sessions, Index::new(2, 2));
+        make_active(&mut sessions, transport_closed);
+        mutate_state(&mut sessions, transport_closed, |state| {
+            let _ = state.on_transport_close(Index::new(2, 2));
+        });
+        sessions.close_connection(transport_closed, code, &[])?;
+        sessions.reset_stream(transport_closed, code)?;
+        sessions.stop_sending(transport_closed, code)?;
+        assert_eq!(
+            callback_count(),
+            1,
+            "TransportClosed Sessions never re-dispatch"
+        );
+
+        // A TransportDeleted Session never dispatches close/reset.
+        let transport_deleted = extra_transport_session(&mut sessions, Index::new(2, 3));
+        make_active(&mut sessions, transport_deleted);
+        mutate_state(&mut sessions, transport_deleted, |state| {
+            let _ = state.on_transport_deleted(Index::new(2, 3));
+        });
+        sessions.close_connection(transport_deleted, code, &[])?;
+        sessions.reset_stream(transport_deleted, code)?;
+        assert_eq!(
+            callback_count(),
+            1,
+            "TransportDeleted Sessions never re-dispatch"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn transport_worker_actions_reset_and_close_record_app_closed_before_callback()
+    -> Result<(), SessionTestFailure> {
+        reset_capture();
+        let (mut sessions, session) =
+            worker_with_transport_session(ACTION_TRANSPORT, Index::new(3, 1));
+        make_active(&mut sessions, session);
+        sessions.install_transport_actions(ACTION_TRANSPORT, fake_worker_actions())?;
+        let code = SessionApplicationErrorCode::from(0x51u64);
+
+        // reset_stream on an Active Session: AppClosed is recorded before the
+        // transport callback runs and remains after return.
+        sessions.reset_stream(session, code)?;
+        assert_eq!(callback_count(), 1);
+        assert_eq!(
+            state_at_callback(),
+            1,
+            "reset_stream recorded AppClosed before the callback ran"
+        );
+        let entry = sessions
+            .entries
+            .get(session.pool_index())
+            .expect("Session entry");
+        assert!(matches!(
+            entry.session_type,
+            Some(SessionType::Transport {
+                state: SessionState::AppClosed(_),
+                ..
+            })
+        ));
+
+        // stop_sending is half-close: it dispatches but never changes state.
+        let stream = extra_transport_session(&mut sessions, Index::new(3, 2));
+        make_active(&mut sessions, stream);
+        sessions.stop_sending(stream, code)?;
+        assert_eq!(callback_count(), 2);
+        let entry = sessions
+            .entries
+            .get(stream.pool_index())
+            .expect("Session entry");
+        assert!(matches!(
+            entry.session_type,
+            Some(SessionType::Transport {
+                state: SessionState::Active(_),
+                ..
+            })
+        ));
+
+        // close_connection on the Active stream: AppClosed before callback.
+        sessions.close_connection(stream, code, &[1, 2, 3])?;
+        assert_eq!(callback_count(), 3);
+        assert_eq!(
+            state_at_callback(),
+            1,
+            "close_connection recorded AppClosed before the callback ran"
+        );
+        let entry = sessions
+            .entries
+            .get(stream.pool_index())
+            .expect("Session entry");
+        assert!(matches!(
+            entry.session_type,
+            Some(SessionType::Transport {
+                state: SessionState::AppClosed(_),
+                ..
+            })
+        ));
+
+        // A second close on the now-AppClosed stream is a silent no-op.
+        sessions.close_connection(stream, code, &[4, 5])?;
+        assert_eq!(
+            callback_count(),
+            3,
+            "a second close on AppClosed never re-dispatches"
+        );
+        Ok(())
     }
 }
 

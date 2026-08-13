@@ -9,7 +9,8 @@
 //! - VPP-shaped local states with a precise nonblocking connecting interim
 //!   ([`VclSessionState::Connecting`]);
 //! - a two-step API: [`VclWorker::session_create`] then blocking or
-//!   nonblocking [`VclWorker::session_stream_connect`];
+//!   nonblocking [`VclWorker::session_stream_connect`], or the generic
+//!   transport-neutral [`VclWorker::session_connect`];
 //! - peer-open children created from the ACCEPTED event with an explicit
 //!   ACCEPTED_REPLY;
 //! - typed `thiserror` errors preserving the owning layer's source

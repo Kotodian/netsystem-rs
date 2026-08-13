@@ -12,8 +12,9 @@ use hammer_runtime::{
     DataWorkerId, Engine, RuntimeError, RuntimeResult, SessionConnectEndpoint, SessionConnectionId,
     SessionListenEndpoint, SessionListenerId, SessionTransportRegistration,
 };
+use hammer_service::session::ApplicationMain;
 use hammer_service::session::node::SessionQueueNode;
-use hammer_service::session::runtime::{SessionMain, SessionWorker};
+use hammer_service::session::runtime::{SessionMain, SessionTransport, SessionWorker};
 
 use crate::config::{ConfigId, QUIC_CONFIG_CAPACITY, QuicConfigRegistry};
 use crate::worker::ListenerContext;
@@ -283,6 +284,10 @@ impl QuicMain {
             })?
     }
 
+    pub(crate) fn applications(&self) -> &ApplicationMain {
+        self.sessions.applications()
+    }
+
     pub(crate) fn application_is_attached(
         &self,
         application: ApplicationId,
@@ -542,12 +547,33 @@ fn bind_worker_graph(engine: &mut Engine, main: &QuicMain) -> RuntimeResult<()> 
         crate::worker::quic_session_queue_update_time,
         crate::worker::quic_session_queue_dispatch,
     )?;
-    let setup = main.install_worker(worker).and_then(|()| {
-        engine
-            .runtime
-            .nodes()
-            .set_node_state(session_queue, NodeState::Polling)
-    });
+    let setup = main
+        .install_worker(worker)
+        .and_then(|()| {
+            // Install the worker-local transport action table into the owning
+            // Session Worker, mirroring VPP's per-worker transport VFT
+            // publication (`session_register_transport`, session.c:1823, with
+            // `.connect_stream = quic_connect_stream`, quic.c:902): the Session
+            // Worker owns the transport keyed by `QuicWorker::ID` (O(1) slot,
+            // synchronous worker-local, no lock or scan). Duplicate installation
+            // for one worker is a typed error, never an overwrite.
+            main.sessions.with_worker_mut(&engine.runtime, |sessions| {
+                sessions
+                    .install_transport_actions(
+                        QuicWorker::ID,
+                        crate::worker::quic_transport_actions(),
+                    )
+                    .map_err(|source| {
+                        RuntimeError::from(QuicWorkerError::TransportActionsInstall { source })
+                    })
+            })
+        })
+        .and_then(|()| {
+            engine
+                .runtime
+                .nodes()
+                .set_node_state(session_queue, NodeState::Polling)
+        });
     if let Err(setup) = setup {
         if attachment_installed {
             if let Err(cleanup) = SessionQueueNode::remove_worker_attachment(
@@ -586,6 +612,7 @@ mod tests {
         SessionTransportRegistration,
     };
     use hammer_service::session::ApplicationMain;
+    use hammer_service::session::error::SessionTransportActionError;
     use rcgen::generate_simple_self_signed;
 
     use crate::config::ServerConfig;
@@ -604,6 +631,50 @@ mod tests {
                 .connect_stream()
                 .is_some()
         );
+    }
+
+    #[test]
+    fn quic_worker_bind_installs_transport_actions() -> RuntimeResult<()> {
+        let mut engine = test_engine();
+        engine.install_current();
+        let applications = test_application_main();
+        let inner_application = applications.attach().map_err(RuntimeError::from)?;
+        let sessions = Arc::new(SessionMain::new(1, Arc::clone(&applications)));
+        let main = QuicMain::new(
+            Arc::clone(&sessions),
+            inner_application,
+            SessionAppId::new(0),
+            SessionTransportRegistration::new("udp-test", None, None, None),
+            1,
+        );
+        main.install_worker(DataWorkerId::new(0))?;
+
+        // Owning-worker Session receives exactly the registration
+        // `bind_worker_graph` performs at the bind point.
+        let mut worker_sessions = SessionWorker::<Index>::new(
+            DataWorkerId::new(0),
+            1,
+            hammer_runtime::app::AppSessionConfig::default(),
+            64,
+            Arc::clone(&applications),
+            None,
+        )?;
+        worker_sessions.install_application_mq_for_test(inner_application)?;
+        worker_sessions
+            .install_transport_actions(QuicWorker::ID, crate::worker::quic_transport_actions())?;
+
+        // Duplicate installation for one worker is a typed error, never a
+        // silent overwrite.
+        let duplicate = worker_sessions
+            .install_transport_actions(QuicWorker::ID, crate::worker::quic_transport_actions());
+        assert!(matches!(
+            duplicate,
+            Err(SessionTransportActionError::AlreadyRegistered { transport })
+                if transport == QuicWorker::ID
+        ));
+
+        Engine::uninstall_current();
+        Ok(())
     }
 
     fn install_session_app(_: &mut Engine) -> RuntimeResult<()> {
@@ -733,6 +804,44 @@ mod tests {
         );
         assert_eq!(LISTEN_OPAQUE.load(Ordering::SeqCst), 0);
         assert!(LISTEN_BARRIER.load(Ordering::SeqCst));
+
+        // The Session generic dispatch reaches the QUIC `open_stream`
+        // wrapper installed at the bind point, under this test's single
+        // QUIC_MAIN owner; `MissingRegistration` would prove the bind never
+        // installed the table.
+        let mut worker_sessions = SessionWorker::<Index>::new(
+            DataWorkerId::new(0),
+            1,
+            hammer_runtime::app::AppSessionConfig::default(),
+            64,
+            Arc::clone(&applications),
+            None,
+        )?;
+        worker_sessions.install_application_mq_for_test(inner_application)?;
+        worker_sessions
+            .install_transport_actions(QuicWorker::ID, crate::worker::quic_transport_actions())?;
+        let parent = worker_sessions.construct_transport_session(
+            QuicWorker::ID,
+            Index::new(1, 1),
+            1,
+            inner_application,
+            Some(SessionAppId::new(0)),
+            None,
+            None,
+            false,
+        )?;
+        let opened = worker_sessions.open_stream(
+            parent,
+            hammer_runtime::session::SessionStreamDirection::Uni,
+            0xDEAD_BEEF,
+        );
+        assert!(matches!(
+            opened,
+            Err(SessionTransportActionError::TransportActionFailed {
+                action: "open_stream",
+                ..
+            })
+        ));
 
         sessions.unlisten(outer_listener)?;
         assert_eq!(main.listener_count(), 0);

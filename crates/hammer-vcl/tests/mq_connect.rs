@@ -13,6 +13,7 @@ mod common;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 
 use common::{PublishedSession, TestControlPair, control_pair, publish_session};
+use hammer_app::attach::AppClientError;
 use hammer_infra::fifo::Fifo;
 use hammer_runtime::app::{
     AppSessionConfig, SessionAcceptedMsg, SessionAcceptedReplyMsg, SessionBoundMsg,
@@ -73,6 +74,52 @@ fn listen_and_accept(
     assert_eq!(reply.session, peer_wire);
     assert!(reply.result.is_ok());
     (listener, session, peer_wire)
+}
+
+/// An accepted child inherits the listener's transport protocol: an HTTP
+/// request accepted from an HTTP listener stays `TransportProtocol::Http`
+/// (VPP `vcl_session_accepted_handler`: `session->session_type =
+/// listen_session->session_type`, vppcom.c:365).
+#[test]
+fn accepted_child_inherits_listener_transport_protocol() {
+    let (client, mut pair) = control_pair();
+    let mut worker = VclWorker::with_client(client, 8).expect("worker");
+    let listener_wire = SessionHandle::new(101, 0);
+    pair.enqueue(&SessionBoundMsg {
+        context: 1,
+        result: Ok(listener_wire),
+        local: Some(LOCAL),
+        opaque: None,
+    });
+    let listener = worker
+        .session_listen(
+            TransportProtocol::Http,
+            SessionListenEndpoint::new(LOCAL, DataWorkerId::new(0)),
+            None,
+        )
+        .expect("listen");
+    assert_eq!(
+        worker.session_proto(listener).expect("listener proto"),
+        TransportProtocol::Http
+    );
+
+    let peer_wire = SessionHandle::new(5, 0);
+    publish_session(&pair.stream, peer_wire, AppSessionConfig::new(128, 16));
+    pair.enqueue(&SessionAcceptedMsg::new(
+        2,
+        listener_wire,
+        peer_wire,
+        SessionFlags::STREAM,
+    ));
+    let events = worker.session_poll().expect("poll accepted");
+    let VclEvent::Accepted { session: peer, .. } = events[0] else {
+        panic!("expected one Accepted event, got {events:?}");
+    };
+    assert_eq!(
+        worker.session_proto(peer).expect("peer proto"),
+        TransportProtocol::Http,
+        "an HTTP request accepted from an HTTP listener must remain Http"
+    );
 }
 
 #[test]
@@ -231,6 +278,351 @@ fn blocking_connect_failure_detaches_with_typed_error() {
         VclSessionState::Detached
     );
     assert!(worker.session_attributes(child).expect("attributes").stream);
+}
+
+/// Nonblocking generic active open over the real queue pair: the ordinary
+/// CONNECT request carries the create-time transport, local/remote
+/// endpoint, and opaque (VPP `vcl_send_session_connect`, vppcom.c:76: no
+/// parent, no stream flag); the real CONNECTED reply with published
+/// descriptors completes the Session through `session_poll`.
+#[test]
+fn nonblocking_connect_consumes_real_connected() {
+    let (client, mut pair) = control_pair();
+    let mut worker = VclWorker::with_client(client, 8).expect("worker");
+    let session = worker
+        .session_create(TransportProtocol::Http, true)
+        .expect("create");
+    worker
+        .session_connect(session, REMOTE, Some(LOCAL), None, Some(0xCAFE))
+        .expect("nonblocking connect returns immediately");
+    assert_eq!(
+        worker.session_state(session).expect("session state"),
+        VclSessionState::Connecting
+    );
+
+    // The generic connect context is the client-owned connection identity
+    // (the Session has no parent and no stream); the transport is the
+    // create-time protocol, endpoints and opaque are forwarded.
+    let request = pair.dequeue::<SessionConnectMsg>();
+    assert_eq!(request.transport, TransportProtocol::Http);
+    assert_eq!(request.remote, REMOTE);
+    assert_eq!(request.local, Some(LOCAL));
+    assert_eq!(request.opaque, Some(0xCAFE));
+    assert_eq!(request.parent_handle, None);
+    assert!(!request.flags.contains(SessionFlags::STREAM));
+
+    let child_wire = SessionHandle::new(9, 0);
+    let published = publish_session(&pair.stream, child_wire, AppSessionConfig::new(128, 16));
+    pair.enqueue(&SessionConnectedMsg {
+        context: request.context,
+        result: Ok(child_wire),
+        local: Some(LOCAL),
+        remote: Some(REMOTE),
+        flags: SessionFlags::STREAM,
+        opaque: None,
+    });
+    let events = worker.session_poll().expect("poll connected");
+    assert_eq!(events, vec![VclEvent::Connected { session }]);
+    assert_eq!(
+        worker.session_state(session).expect("session state"),
+        VclSessionState::Ready
+    );
+    let attributes = worker.session_attributes(session).expect("attributes");
+    assert!(attributes.stream);
+    assert_eq!(attributes.initiator, VclInitiator::Local);
+    assert!(attributes.readable());
+    assert!(attributes.writable());
+
+    // The descriptor-delivered AppSession is functional.
+    round_trip(&mut worker, session, &published);
+}
+
+/// Blocking generic connect waits on the real queue signal pair and returns
+/// only once the real CONNECTED message resolved the Session.
+#[test]
+fn blocking_connect_waits_on_real_signal() {
+    let (client, mut pair) = control_pair();
+    let mut worker = VclWorker::with_client(client, 8).expect("worker");
+    let session = worker
+        .session_create(TransportProtocol::Http, false)
+        .expect("create");
+    // The client's first generic connect owns connection context 1.
+    publish_session(
+        &pair.stream,
+        SessionHandle::new(9, 0),
+        AppSessionConfig::new(128, 16),
+    );
+    pair.enqueue(&SessionConnectedMsg {
+        context: 1,
+        result: Ok(SessionHandle::new(9, 0)),
+        local: None,
+        remote: None,
+        flags: SessionFlags::STREAM,
+        opaque: None,
+    });
+    worker
+        .session_connect(session, REMOTE, None, None, None)
+        .expect("blocking connect completes");
+    assert_eq!(
+        worker.session_state(session).expect("session state"),
+        VclSessionState::Ready
+    );
+}
+
+/// A failed generic CONNECTED reply detaches the Session retaining the typed
+/// `SessionConnectError`, through both the blocking wait and the nonblocking
+/// poll paths; no descriptors are delivered and no Session is attached.
+#[test]
+fn connect_failure_detaches_with_typed_error() {
+    let (client, mut pair) = control_pair();
+    let mut worker = VclWorker::with_client(client, 8).expect("worker");
+    let session = worker
+        .session_create(TransportProtocol::Http, false)
+        .expect("create");
+    pair.enqueue(&SessionConnectedMsg::new(1, Err(SessionConnectError::TimedOut)));
+    let error = worker
+        .session_connect(session, REMOTE, None, None, None)
+        .expect_err("blocking connect must fail");
+    assert!(
+        matches!(error, VclError::ConnectFailed { session: s, error: SessionConnectError::TimedOut } if s == session),
+        "expected ConnectFailed(TimedOut), got {error:?}"
+    );
+    assert_eq!(
+        worker.session_state(session).expect("session state"),
+        VclSessionState::Detached
+    );
+
+    // Nonblocking failure: the CONNECTED error is consumed by session_poll
+    // with no event and the Session Detached.
+    let other = worker
+        .session_create(TransportProtocol::Http, true)
+        .expect("create");
+    worker
+        .session_connect(other, REMOTE, None, None, None)
+        .expect("nonblocking connect returns immediately");
+    pair.enqueue(&SessionConnectedMsg::new(
+        2,
+        Err(SessionConnectError::ConnectionRefused),
+    ));
+    assert!(worker.session_poll().expect("poll failure").is_empty());
+    assert_eq!(
+        worker.session_state(other).expect("other state"),
+        VclSessionState::Detached
+    );
+}
+
+/// A failed CONNECT enqueue is transactional: when the real request queue
+/// is full, the Session returns to Closed instead of staying stuck in
+/// Connecting, and it is immediately reusable once the queue drains.
+#[test]
+fn generic_connect_enqueue_failure_rolls_back_to_closed() {
+    let (client, mut pair) = control_pair();
+    let mut worker = VclWorker::with_client(client, 40).expect("worker");
+    // Fill the real request queue (32 control slots) with in-flight
+    // connects; the daemon side never drains, so the next enqueue fails.
+    let (overflow, error) = loop {
+        let session = worker
+            .session_create(TransportProtocol::Http, true)
+            .expect("create");
+        match worker.session_connect(session, REMOTE, None, None, None) {
+            Ok(()) => {}
+            Err(error) => break (session, error),
+        }
+    };
+    assert!(
+        matches!(
+            error,
+            VclError::AppClient {
+                source: AppClientError::SessionControl { .. }
+            }
+        ),
+        "expected a queue-full control error, got {error:?}"
+    );
+    assert_eq!(
+        worker.session_state(overflow).expect("overflow state"),
+        VclSessionState::Closed,
+        "a failed CONNECT enqueue must roll back to Closed"
+    );
+    // The Session is reusable after the queue drains.
+    while pair
+        .requests
+        .dequeue_control()
+        .expect("dequeue")
+        .is_some()
+    {}
+    worker
+        .session_connect(overflow, REMOTE, None, None, None)
+        .expect("retry connect succeeds");
+    assert_eq!(
+        worker.session_state(overflow).expect("overflow state"),
+        VclSessionState::Connecting
+    );
+}
+
+/// The shared stream path is equally transactional: a failed CONNECT_STREAM
+/// enqueue rolls the child back to Closed and untracks it from the parent.
+#[test]
+fn stream_connect_enqueue_failure_rolls_back_and_untracks() {
+    let (client, mut pair) = control_pair();
+    let mut worker = VclWorker::with_client(client, 40).expect("worker");
+    let (_listener, parent, _parent_wire) = listen_and_accept(&mut worker, &mut pair);
+    // The listen and ACCEPTED_REPLY consumed two request slots; fill the
+    // rest with in-flight stream connects until the enqueue fails.
+    let (child, error) = loop {
+        let child = worker
+            .session_create(TransportProtocol::Quic, true)
+            .expect("create");
+        match worker.session_stream_connect(child, parent, REMOTE, None, SessionFlags::empty()) {
+            Ok(()) => {}
+            Err(error) => break (child, error),
+        }
+    };
+    assert!(
+        matches!(
+            error,
+            VclError::AppClient {
+                source: AppClientError::SessionControl { .. }
+            }
+        ),
+        "expected a queue-full control error, got {error:?}"
+    );
+    assert_eq!(
+        worker.session_state(child).expect("child state"),
+        VclSessionState::Closed,
+        "a failed CONNECT_STREAM enqueue must roll back to Closed"
+    );
+    // The child is reusable and the parent still closes cleanly.
+    while pair
+        .requests
+        .dequeue_control()
+        .expect("dequeue")
+        .is_some()
+    {}
+    worker
+        .session_stream_connect(child, parent, REMOTE, None, SessionFlags::empty())
+        .expect("retry stream connect succeeds");
+    assert_eq!(
+        worker.session_state(child).expect("child state"),
+        VclSessionState::Connecting
+    );
+}
+
+/// A CONNECTED reply whose published descriptors carry a different Session
+/// handle drops the connecting Session instead of leaving it stuck in
+/// Connecting (aligned with the ACCEPTED mismatch drop).
+#[test]
+fn mismatched_connected_drops_session_cleanly() {
+    let (client, mut pair) = control_pair();
+    let mut worker = VclWorker::with_client(client, 8).expect("worker");
+    let session = worker
+        .session_create(TransportProtocol::Http, true)
+        .expect("create");
+    worker
+        .session_connect(session, REMOTE, None, None, None)
+        .expect("connect");
+    let request = pair.dequeue::<SessionConnectMsg>();
+    // Publish descriptors for a different wire handle than CONNECTED says.
+    publish_session(
+        &pair.stream,
+        SessionHandle::new(99, 0),
+        AppSessionConfig::new(128, 16),
+    );
+    pair.enqueue(&SessionConnectedMsg {
+        context: request.context,
+        result: Ok(SessionHandle::new(9, 0)),
+        local: None,
+        remote: None,
+        flags: SessionFlags::empty(),
+        opaque: None,
+    });
+    assert!(worker.session_poll().expect("poll mismatch").is_empty());
+    assert!(
+        matches!(
+            worker.session_state(session),
+            Err(VclError::InvalidHandle { handle: h }) if h == session
+        ),
+        "the mismatched connecting Session must be dropped, not stuck"
+    );
+}
+
+/// The stream path drops a mismatched CONNECTED child the same way, and the
+/// parent remains closable (the child was untracked).
+#[test]
+fn mismatched_stream_connected_drops_child_cleanly() {
+    let (client, mut pair) = control_pair();
+    let mut worker = VclWorker::with_client(client, 8).expect("worker");
+    let (_listener, parent, _parent_wire) = listen_and_accept(&mut worker, &mut pair);
+    let child = worker
+        .session_create(TransportProtocol::Quic, true)
+        .expect("create");
+    worker
+        .session_stream_connect(child, parent, REMOTE, None, SessionFlags::empty())
+        .expect("connect");
+    let request = pair.dequeue::<SessionConnectMsg>();
+    publish_session(
+        &pair.stream,
+        SessionHandle::new(99, 0),
+        AppSessionConfig::new(128, 16),
+    );
+    pair.enqueue(&SessionConnectedMsg {
+        context: request.context,
+        result: Ok(SessionHandle::new(9, 0)),
+        local: None,
+        remote: None,
+        flags: SessionFlags::empty(),
+        opaque: None,
+    });
+    assert!(worker.session_poll().expect("poll mismatch").is_empty());
+    assert!(
+        matches!(
+            worker.session_state(child),
+            Err(VclError::InvalidHandle { handle: h }) if h == child
+        ),
+        "the mismatched connecting child must be dropped, not stuck"
+    );
+    assert!(
+        worker.session_close(parent).is_ok(),
+        "parent cascade must still close cleanly"
+    );
+}
+
+/// Closing a Session with an in-flight generic connect removes its pending
+/// tracking: a late CONNECTED for the closed connect drops without state
+/// mutation or error.
+#[test]
+fn closing_connecting_session_drops_late_connected() {
+    let (client, mut pair) = control_pair();
+    let mut worker = VclWorker::with_client(client, 8).expect("worker");
+    let session = worker
+        .session_create(TransportProtocol::Http, true)
+        .expect("create");
+    worker
+        .session_connect(session, REMOTE, None, None, None)
+        .expect("connect");
+    let request = pair.dequeue::<SessionConnectMsg>();
+    assert_eq!(
+        worker.session_state(session).expect("session state"),
+        VclSessionState::Connecting
+    );
+    worker.session_close(session).expect("close mid-flight");
+    assert!(
+        matches!(
+            worker.session_state(session),
+            Err(VclError::InvalidHandle { handle: h }) if h == session
+        )
+    );
+    pair.enqueue(&SessionConnectedMsg {
+        context: request.context,
+        result: Ok(SessionHandle::new(9, 0)),
+        local: None,
+        remote: None,
+        flags: SessionFlags::empty(),
+        opaque: None,
+    });
+    assert!(
+        worker.session_poll().expect("poll late").is_empty(),
+        "a late CONNECTED for a closed Session must drop"
+    );
 }
 
 /// A CONNECTED message whose context resolves to no local Session (or to a

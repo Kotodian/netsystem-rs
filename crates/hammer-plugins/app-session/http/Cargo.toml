@@ -1,0 +1,19 @@
+[package]
+name = "hammer-plugin-http"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+
+[lib]
+name = "hammer_plugin_http"
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+abi_stable = { workspace = true }
+bitflags = { workspace = true }
+bytes = { workspace = true }
+hammer-component-macros = { path = "../../../hammer-component-macros" }
+hammer-infra = { path = "../../../hammer-infra" }
+hammer-runtime = { path = "../../../hammer-runtime", default-features = false }
+hammer-service = { path = "../../../hammer-service", default-features = false }
+thiserror = { workspace = true }

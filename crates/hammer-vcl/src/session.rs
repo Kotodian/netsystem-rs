@@ -126,11 +126,14 @@ impl VclSession {
         }
     }
 
-    /// Peer-open child: READY once the worker attaches its FIFOs.
-    pub(crate) fn peer_child(flags: SessionFlags) -> Self {
+    /// Peer-open child: READY once the worker attaches its FIFOs. The
+    /// transport is the listener's, inherited at allocation (VPP
+    /// `vcl_session_accepted_handler`: `session->session_type =
+    /// listen_session->session_type`, vppcom.c:365).
+    pub(crate) fn peer_child(proto: TransportProtocol, flags: SessionFlags) -> Self {
         Self {
             state: VclSessionState::Ready,
-            proto: TransportProtocol::Quic,
+            proto,
             flags,
             initiator: VclInitiator::Peer,
             parent: None,

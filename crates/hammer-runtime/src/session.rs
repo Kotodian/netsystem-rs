@@ -144,6 +144,43 @@ impl SessionListenEndpoint {
     }
 }
 
+/// Application protocol error code carried by one transport close.
+///
+/// The u64 representation mirrors VPP's
+/// `transport_endpt_attr_t.app_proto_err_code` (transport_types.h:447),
+/// transported by QUIC as a varint error code (quic.c:701-718). Only the
+/// standard `u64` conversions exist; no reinterpretation of other integer
+/// types.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[repr(transparent)]
+pub struct SessionApplicationErrorCode(u64);
+
+impl From<u64> for SessionApplicationErrorCode {
+    #[inline]
+    fn from(code: u64) -> Self {
+        Self(code)
+    }
+}
+
+impl From<SessionApplicationErrorCode> for u64 {
+    #[inline]
+    fn from(code: SessionApplicationErrorCode) -> Self {
+        code.0
+    }
+}
+
+/// Direction of one stream opened through the transport worker actions.
+///
+/// QUIC distinguishes bidirectional and unidirectional streams; the direction
+/// is fixed at open time for the stream's lifetime.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum SessionStreamDirection {
+    /// The peer may send on the opened stream as well.
+    Bidi,
+    /// Only the opener may send on the opened stream.
+    Uni,
+}
+
 pub type SessionTransportStartListen = fn(
     SessionListenerId,
     crate::app::ApplicationId,

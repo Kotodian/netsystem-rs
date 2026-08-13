@@ -1098,6 +1098,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "hammer-plugin-http"
+version = "0.1.0"
+dependencies = [
+ "abi_stable",
+ "bitflags 2.11.1",
+ "bytes",
+ "hammer-component-macros",
+ "hammer-infra",
+ "hammer-runtime",
+ "hammer-service",
+ "thiserror 2.0.18",
+]
+
+[[package]]
 name = "hammer-plugin-ip"
 version = "0.1.0"
 dependencies = [
