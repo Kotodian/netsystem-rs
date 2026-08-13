@@ -164,7 +164,13 @@ impl fmt::Display for StreamId {
             Dir::Uni => "uni",
             Dir::Bi => "bi",
         };
-        write!(f, "{} {}directional stream {}", initiator, dir, self.index())
+        write!(
+            f,
+            "{} {}directional stream {}",
+            initiator,
+            dir,
+            self.index()
+        )
     }
 }
 
@@ -252,7 +258,10 @@ mod tests {
         assert!(!ctrl.is_push());
         assert_eq!(ctrl.index(), 3);
 
-        assert_eq!(VarInt::from(StreamId::try_from(0u64).unwrap()), VarInt::from_u32(0));
+        assert_eq!(
+            VarInt::from(StreamId::try_from(0u64).unwrap()),
+            VarInt::from_u32(0)
+        );
     }
 
     #[test]

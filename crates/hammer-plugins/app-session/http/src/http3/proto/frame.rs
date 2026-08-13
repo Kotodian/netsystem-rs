@@ -109,9 +109,15 @@ impl FrameHeader {
     pub fn parse<B: Buf>(buf: &mut B, stream: FrameStream) -> Result<FrameHeader, FrameError> {
         let remaining = buf.remaining();
         let ty = FrameType::decode(buf).map_err(|_| FrameError::Incomplete(remaining + 1))?;
-        let len = buf.get_var().map_err(|_| FrameError::Incomplete(remaining + 1))?;
+        let len = buf
+            .get_var()
+            .map_err(|_| FrameError::Incomplete(remaining + 1))?;
         let header_len = remaining - buf.remaining();
-        let header = FrameHeader { ty, len, header_len };
+        let header = FrameHeader {
+            ty,
+            len,
+            header_len,
+        };
         header.validate(stream)?;
         Ok(header)
     }
@@ -162,7 +168,9 @@ impl Frame {
     pub fn decode<B: Buf>(buf: &mut B) -> Result<Frame, FrameError> {
         let remaining = buf.remaining();
         let ty = FrameType::decode(buf).map_err(|_| FrameError::Incomplete(remaining + 1))?;
-        let len = buf.get_var().map_err(|_| FrameError::Incomplete(remaining + 1))?;
+        let len = buf
+            .get_var()
+            .map_err(|_| FrameError::Incomplete(remaining + 1))?;
 
         // DATA payloads are streamed, not copied: only the length is decoded.
         if ty == FrameType::DATA {
@@ -190,9 +198,9 @@ impl Frame {
             FrameType::SETTINGS => {
                 Frame::Settings(Settings::decode(&mut payload).map_err(FrameError::Settings)?)
             }
-            FrameType::PUSH_PROMISE => {
-                Frame::PushPromise(PushPromise::decode(&mut payload).map_err(|_| FrameError::Malformed)?)
-            }
+            FrameType::PUSH_PROMISE => Frame::PushPromise(
+                PushPromise::decode(&mut payload).map_err(|_| FrameError::Malformed)?,
+            ),
             FrameType::GOAWAY => {
                 let id = payload.get_var().map_err(|_| FrameError::Malformed)?;
                 // the payload must hold exactly one varint (VPP: FRAME_ERROR)
@@ -229,8 +237,8 @@ impl Frame {
                 Ok(())
             }
             Frame::Headers(payload) => {
-                let len =
-                    VarInt::from_u64(payload.len() as u64).map_err(|_| FrameError::InvalidFrameValue)?;
+                let len = VarInt::from_u64(payload.len() as u64)
+                    .map_err(|_| FrameError::InvalidFrameValue)?;
                 FrameType::HEADERS.encode(buf);
                 len.encode(buf);
                 buf.put_slice(payload);
@@ -372,7 +380,8 @@ impl Settings {
         if value < min || value > max {
             return Err(SettingsError::InvalidSettingValue(id, value));
         }
-        let value = VarInt::from_u64(value).map_err(|_| SettingsError::InvalidSettingValue(id, value))?;
+        let value =
+            VarInt::from_u64(value).map_err(|_| SettingsError::InvalidSettingValue(id, value))?;
         self.entries[self.len] = (id, value);
         self.len += 1;
         Ok(())
@@ -400,7 +409,8 @@ impl Settings {
     /// beyond the varint range, which the bounded capacity excludes.
     pub fn encode<B: BufMut>(&self, buf: &mut B) -> Result<(), SettingsError> {
         FrameType::SETTINGS.encode(buf);
-        let len = VarInt::from_u64(self.encoded_len() as u64).map_err(|_| SettingsError::Malformed)?;
+        let len =
+            VarInt::from_u64(self.encoded_len() as u64).map_err(|_| SettingsError::Malformed)?;
         len.encode(buf);
         for (id, value) in self.entries[..self.len].iter() {
             id.encode(buf);
@@ -622,7 +632,10 @@ mod tests {
             Err(FrameError::UnknownFrame(t)) if t.value() == 22
         ));
         // payload was consumed; next frame decodes normally
-        assert_eq!(Frame::decode(&mut buf), Ok(Frame::CancelPush(PushId::try_from(2).unwrap())));
+        assert_eq!(
+            Frame::decode(&mut buf),
+            Ok(Frame::CancelPush(PushId::try_from(2).unwrap()))
+        );
     }
 
     #[test]
@@ -652,16 +665,30 @@ mod tests {
     #[test]
     fn settings_frame() {
         let mut settings = Settings::default();
-        settings.insert(SettingId::MAX_FIELD_SECTION_SIZE, 0xfad1).unwrap();
-        settings.insert(SettingId::QPACK_MAX_TABLE_CAPACITY, 0xfad2).unwrap();
-        settings.insert(SettingId::QPACK_BLOCKED_STREAMS, 0xfad3).unwrap();
-        settings.insert(SettingId::from_value(95).unwrap(), 0).unwrap();
+        settings
+            .insert(SettingId::MAX_FIELD_SECTION_SIZE, 0xfad1)
+            .unwrap();
+        settings
+            .insert(SettingId::QPACK_MAX_TABLE_CAPACITY, 0xfad2)
+            .unwrap();
+        settings
+            .insert(SettingId::QPACK_BLOCKED_STREAMS, 0xfad3)
+            .unwrap();
+        settings
+            .insert(SettingId::from_value(95).unwrap(), 0)
+            .unwrap();
         let frame = Frame::Settings(settings);
 
         let mut expected = Settings::default();
-        expected.insert(SettingId::MAX_FIELD_SECTION_SIZE, 0xfad1).unwrap();
-        expected.insert(SettingId::QPACK_MAX_TABLE_CAPACITY, 0xfad2).unwrap();
-        expected.insert(SettingId::QPACK_BLOCKED_STREAMS, 0xfad3).unwrap();
+        expected
+            .insert(SettingId::MAX_FIELD_SECTION_SIZE, 0xfad1)
+            .unwrap();
+        expected
+            .insert(SettingId::QPACK_MAX_TABLE_CAPACITY, 0xfad2)
+            .unwrap();
+        expected
+            .insert(SettingId::QPACK_BLOCKED_STREAMS, 0xfad3)
+            .unwrap();
         codec_frame_check(
             &frame,
             &[
@@ -674,7 +701,11 @@ mod tests {
 
     #[test]
     fn settings_frame_empty() {
-        codec_frame_check(&Frame::Settings(Settings::default()), &[4, 0], &Frame::Settings(Settings::default()));
+        codec_frame_check(
+            &Frame::Settings(Settings::default()),
+            &[4, 0],
+            &Frame::Settings(Settings::default()),
+        );
     }
 
     #[test]
@@ -705,7 +736,9 @@ mod tests {
     #[test]
     fn settings_decode_duplicate_identifier() {
         let mut settings = Settings::default();
-        settings.insert(SettingId::MAX_FIELD_SECTION_SIZE, 1).unwrap();
+        settings
+            .insert(SettingId::MAX_FIELD_SECTION_SIZE, 1)
+            .unwrap();
         assert!(matches!(
             settings.insert(SettingId::MAX_FIELD_SECTION_SIZE, 2),
             Err(SettingsError::Repeated(_))
@@ -720,7 +753,11 @@ mod tests {
             settings.insert(SettingId::ENABLE_CONNECT_PROTOCOL, 2),
             Err(SettingsError::InvalidSettingValue(_, 2))
         ));
-        assert!(settings.insert(SettingId::ENABLE_CONNECT_PROTOCOL, 1).is_ok());
+        assert!(
+            settings
+                .insert(SettingId::ENABLE_CONNECT_PROTOCOL, 1)
+                .is_ok()
+        );
         // values must fit a varint
         assert!(settings.insert(SettingId::H3_DATAGRAM, 1 << 62).is_err());
     }
@@ -729,7 +766,9 @@ mod tests {
     fn settings_insert_overflow() {
         let mut settings = Settings::default();
         for i in 0..8u64 {
-            settings.insert(SettingId::from_value(i).unwrap(), 0).unwrap();
+            settings
+                .insert(SettingId::from_value(i).unwrap(), 0)
+                .unwrap();
         }
         assert!(matches!(
             settings.insert(SettingId::from_value(8).unwrap(), 0),
@@ -740,7 +779,9 @@ mod tests {
     #[test]
     fn settings_encode_needs_no_payload_allocation() {
         let mut settings = Settings::default();
-        settings.insert(SettingId::MAX_FIELD_SECTION_SIZE, 0xfad1).unwrap();
+        settings
+            .insert(SettingId::MAX_FIELD_SECTION_SIZE, 0xfad1)
+            .unwrap();
         let mut buf = Vec::new();
         settings.encode(&mut buf).unwrap();
         assert_eq!(buf, vec![4, 5, 6, 128, 0, 250, 209]);
@@ -764,7 +805,11 @@ mod tests {
 
     #[test]
     fn data_frame() {
-        codec_frame_check(&Frame::Data(7), &[0, 7, 48, 48, 48, 48, 48, 48, 48], &Frame::Data(7));
+        codec_frame_check(
+            &Frame::Data(7),
+            &[0, 7, 48, 48, 48, 48, 48, 48, 48],
+            &Frame::Data(7),
+        );
     }
 
     #[test]
@@ -774,7 +819,11 @@ mod tests {
             &[3, 1, 2],
             &Frame::CancelPush(PushId::try_from(2).unwrap()),
         );
-        codec_frame_check(&Frame::Goaway(VarInt::from_u32(2)), &[7, 1, 2], &Frame::Goaway(VarInt::from_u32(2)));
+        codec_frame_check(
+            &Frame::Goaway(VarInt::from_u32(2)),
+            &[7, 1, 2],
+            &Frame::Goaway(VarInt::from_u32(2)),
+        );
         codec_frame_check(
             &Frame::MaxPushId(PushId::try_from(2).unwrap()),
             &[13, 1, 2],

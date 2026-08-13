@@ -39,8 +39,12 @@ use hammer_service::session::runtime::{SessionAcceptMetadata, SessionWorker};
 
 use crate::http3::proto::error::ErrorCode;
 use crate::http3::request::RequestPublishError;
+use crate::http3::request_frame_reader::RequestFrameError;
+use crate::http_common::PublishError;
 use crate::listener::{HTTP_MAIN, HttpMain};
-use crate::worker::{ContextId, PeerControlError, PeerUniStreamRole, StreamContextId};
+use crate::worker::{
+    ContextId, PeerControlError, PeerUniStreamRole, RequestReadError, StreamContextId,
+};
 
 pub(crate) const NAME: &str = "http";
 
@@ -93,13 +97,60 @@ pub(crate) enum HttpAppError {
         "peer control stream finish reported a SETTINGS protocol error, which is structurally impossible; HTTP/3 code {code:?}"
     )]
     PeerControlFinishProtocol { code: ErrorCode },
+    #[error(
+        "bidi request FIN arrived before the declared body was fully received; HTTP/3 code {code:?}"
+    )]
+    RequestFinishProtocol { code: ErrorCode },
     #[error("HTTP/3 request publication failed: {error:?}")]
     RequestPublish { error: RequestPublishError },
+    #[error("HTTP/3 request frame processing failed; code {code:?}")]
+    RequestFrameProtocol { code: ErrorCode },
 }
 
 impl From<RequestPublishError> for HttpAppError {
     fn from(error: RequestPublishError) -> Self {
         Self::RequestPublish { error }
+    }
+}
+
+impl From<RequestFrameError> for HttpAppError {
+    fn from(error: RequestFrameError) -> Self {
+        Self::RequestFrameProtocol { code: error.error_code() }
+    }
+}
+
+/// Recovery decision for a failed HTTP/3 request publication, mirroring
+/// VPP's stream-vs-connection error split (http3.c:1107-1113): QPACK
+/// decompression failure is a connection error that closes the connection,
+/// message/protocol/internal errors are stream errors that reset the
+/// request stream, and FIFO capacity exhaustion is transient backpressure
+/// the caller retries.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum RequestErrorAction {
+    CloseConnection { code: ErrorCode },
+    ResetStream { code: ErrorCode },
+    Retry,
+}
+
+#[allow(dead_code)] // consumed by the builtin_rx wiring slice
+pub(crate) fn request_publish_error_action(error: RequestPublishError) -> RequestErrorAction {
+    match error {
+        RequestPublishError::QpackDecompressionFailed => RequestErrorAction::CloseConnection {
+            code: ErrorCode::QpackDecompressionFailed,
+        },
+        RequestPublishError::MessageError => RequestErrorAction::ResetStream {
+            code: ErrorCode::MessageError,
+        },
+        RequestPublishError::GeneralProtocolError => RequestErrorAction::ResetStream {
+            code: ErrorCode::GeneralProtocolError,
+        },
+        RequestPublishError::InternalError => RequestErrorAction::ResetStream {
+            code: ErrorCode::InternalError,
+        },
+        RequestPublishError::Publish(PublishError::Capacity { .. }) => RequestErrorAction::Retry,
+        RequestPublishError::Publish(PublishError::Encode(_) | PublishError::Fifo(_)) => {
+            RequestErrorAction::ResetStream { code: ErrorCode::InternalError }
+        }
     }
 }
 
@@ -282,7 +333,11 @@ fn accept_stream(
 /// type-not-yet-decoded stream owns no slot, so the stream context is
 /// released directly through the existing generation-checked
 /// `HttpWorker::remove_stream`; no new worker code is added here. A
-/// bidi/request FIN is left for request cleanup and mutates nothing. The
+/// bidi/request FIN completes the request: the declared body is validated
+/// finished (`validate_request_finish`), the upper request Session is
+/// removed, and the request stream context is released, in VPP
+/// `http3_stream_cleanup_callback`'s delete-notify-then-free order
+/// (http3.c:2459-2462). The
 /// root connection's own Disconnected callback is a clean no-op: only a
 /// stream child carries `SessionFlags::STREAM` in its accept metadata, and
 /// the root's published `ConnectionContextId` shares the packed
@@ -335,18 +390,43 @@ pub(crate) fn disconnect_on(
         return Ok(());
     }
     let stream = StreamContextId::from(context);
-    main.with_worker(worker.worker(), |http| {
-        let (direction, peer_role) = {
-            let stream_context = http
-                .get_stream_for_session(stream, session)
-                .map_err(RuntimeError::from)?;
-            (stream_context.direction, stream_context.peer_role)
-        };
-        if direction != SessionStreamDirection::Uni {
-            // Bidi/request FIN is owned by request cleanup, not by the
-            // peer-uni stream helpers.
-            return Ok(());
+    let direction = main.with_worker(worker.worker(), |http| {
+        let stream_context = http
+            .get_stream_for_session(stream, session)
+            .map_err(RuntimeError::from)?;
+        Ok(stream_context.direction)
+    })?;
+    if direction != SessionStreamDirection::Uni {
+        // Bidi/request FIN completes the request: the declared body must be
+        // fully received before any cleanup (`validate_request_finish`, a
+        // typed `RequestFinishProtocol` on a short body), then the upper
+        // request Session is removed before the request stream context is
+        // freed, matching VPP `http3_stream_cleanup_callback`'s
+        // delete-notify-then-free order (http3.c:2459-2462). The upper
+        // removal happens outside the worker borrow, so its typed error
+        // aborts the cleanup before the stream is released.
+        main.with_worker(worker.worker(), |http| {
+            http.validate_request_finish(stream, session)
+                .map_err(|error| match error {
+                    RequestReadError::Worker(inner) => RuntimeError::from(inner),
+                    RequestReadError::Protocol(error) => RuntimeError::from(
+                        HttpAppError::RequestFinishProtocol { code: error.error_code() },
+                    ),
+                })
+        })?;
+        if let Some(upper) = worker.upper_session(session) {
+            worker.remove_upper_session(upper)?;
         }
+        main.with_worker(worker.worker(), |http| {
+            http.release_request_stream(stream, session).map_err(RuntimeError::from)
+        })?;
+        return Ok(());
+    }
+    main.with_worker(worker.worker(), |http| {
+        let peer_role = http
+            .get_stream_for_session(stream, session)
+            .map_err(RuntimeError::from)?
+            .peer_role;
         match peer_role {
             PeerUniStreamRole::Control => http
                 .finish_peer_control_stream(stream)
@@ -393,9 +473,11 @@ pub(crate) fn disconnect_on(
 /// resolved by the Session worker id exactly as `disconnect` does. The
 /// stream context is generation/session-checked with
 /// `HttpWorker::get_stream_for_session` before anything else; a bidi/request
-/// stream RESET is owned by request cleanup, not by connection teardown, and
-/// mutates nothing — VPP `http3_transport_stream_reset_callback` checks only
-/// unidirectional-ness. For a peer uni stream the committed
+/// stream RESET aborts the request: the upper request Session is removed and
+/// the request stream context is released with no finish validation, no
+/// connection close, and no stream reset — VPP
+/// `http3_transport_stream_reset_callback` checks only unidirectional-ness.
+/// For a peer uni stream the committed
 /// `HttpWorker::classify_peer_uni_stream_reset` copies the stream/parent/
 /// session identities plus the constant `ClosedCriticalStream` error code
 /// (0x0104), mutating nothing, and the parent connection is then closed
@@ -434,17 +516,27 @@ pub(crate) fn reset_on(
         return Ok(());
     }
     let stream = StreamContextId::from(context);
-    main.with_worker(worker.worker(), |http| {
-        let direction = http
+    let direction = main.with_worker(worker.worker(), |http| {
+        let stream_context = http
             .get_stream_for_session(stream, session)
-            .map_err(RuntimeError::from)?
-            .direction;
-        if direction != SessionStreamDirection::Uni {
-            // Bidi/request RESET is owned by request cleanup, not by
-            // connection teardown; VPP `http3_transport_stream_reset_callback`
-            // returns before any error recording for non-uni streams.
-            return Ok(());
+            .map_err(RuntimeError::from)?;
+        Ok(stream_context.direction)
+    })?;
+    if direction != SessionStreamDirection::Uni {
+        // Bidi/request RESET aborts the request: no finish validation, the
+        // upper request Session is removed, and the request stream context
+        // is released; the parent connection is never closed and no stream
+        // reset is sent, matching VPP `http3_transport_stream_reset_callback`
+        // returning before any error recording for non-uni streams.
+        if let Some(upper) = worker.upper_session(session) {
+            worker.remove_upper_session(upper)?;
         }
+        main.with_worker(worker.worker(), |http| {
+            http.release_request_stream(stream, session).map_err(RuntimeError::from)
+        })?;
+        return Ok(());
+    }
+    main.with_worker(worker.worker(), |http| {
         let reset = http
             .classify_peer_uni_stream_reset(stream)
             .map_err(RuntimeError::from)?;

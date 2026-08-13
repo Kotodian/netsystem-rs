@@ -48,7 +48,11 @@ struct Seen {
 
 impl FieldSectionValidator {
     pub fn new(kind: MessageKind) -> FieldSectionValidator {
-        FieldSectionValidator { kind, seen_regular: false, seen: Seen::default() }
+        FieldSectionValidator {
+            kind,
+            seen_regular: false,
+            seen: Seen::default(),
+        }
     }
 
     /// Validate one field line. Field names and values are checked per
@@ -60,7 +64,9 @@ impl FieldSectionValidator {
         }
         if name[0] == b':' {
             if self.seen_regular {
-                return Err(MessageError::PseudoAfterRegular(Bytes::copy_from_slice(name)));
+                return Err(MessageError::PseudoAfterRegular(Bytes::copy_from_slice(
+                    name,
+                )));
             }
             self.on_pseudo(name, value)
         } else {
@@ -94,7 +100,9 @@ impl FieldSectionValidator {
                 }
                 match (&self.seen.authority, &self.seen.host) {
                     (None, None) => return Err(MessageError::MissingAuthority),
-                    (Some(a), Some(h)) if a != h => return Err(MessageError::ContradictedAuthority),
+                    (Some(a), Some(h)) if a != h => {
+                        return Err(MessageError::ContradictedAuthority);
+                    }
                     _ => {}
                 }
             }
@@ -108,7 +116,10 @@ impl FieldSectionValidator {
     }
 
     fn on_regular(&mut self, name: &[u8], value: &[u8]) -> Result<(), MessageError> {
-        if !name.iter().all(|c| c.is_ascii_lowercase() || is_token_char(*c)) {
+        if !name
+            .iter()
+            .all(|c| c.is_ascii_lowercase() || is_token_char(*c))
+        {
             return Err(MessageError::InvalidFieldName(Bytes::copy_from_slice(name)));
         }
         if !value.iter().all(is_valid_value_byte) {
@@ -147,9 +158,16 @@ impl FieldSectionValidator {
             b":protocol" => &mut self.seen.protocol,
             _ => return Err(MessageError::UnknownPseudo(Bytes::copy_from_slice(name))),
         };
-        let expected_kind = if name == b":status" { MessageKind::Response } else { MessageKind::Request };
+        let expected_kind = if name == b":status" {
+            MessageKind::Response
+        } else {
+            MessageKind::Request
+        };
         if self.kind != expected_kind {
-            return Err(MessageError::WrongKind(Bytes::copy_from_slice(name), self.kind));
+            return Err(MessageError::WrongKind(
+                Bytes::copy_from_slice(name),
+                self.kind,
+            ));
         }
         if *slot {
             return Err(MessageError::DuplicatePseudo(Bytes::copy_from_slice(name)));
@@ -174,13 +192,32 @@ impl FieldSectionValidator {
 }
 
 fn status_code(value: &[u8]) -> u16 {
-    value.iter().fold(0u16, |acc, c| acc * 10 + u16::from(c - b'0'))
+    value
+        .iter()
+        .fold(0u16, |acc, c| acc * 10 + u16::from(c - b'0'))
 }
 
 /// RFC 9110 field-name tokens (tchar), excluding letters: the caller accepts
 /// lowercase letters via `is_ascii_lowercase` and rejects uppercase ones.
 fn is_token_char(c: u8) -> bool {
-    matches!(c, b'!' | b'#' | b'$' | b'%' | b'&' | b'\'' | b'*' | b'+' | b'-' | b'.' | b'^' | b'_' | b'`' | b'|' | b'~' | b'0'..=b'9')
+    matches!(
+        c,
+        b'!' | b'#'
+            | b'$'
+            | b'%'
+            | b'&'
+            | b'\''
+            | b'*'
+            | b'+'
+            | b'-'
+            | b'.'
+            | b'^'
+            | b'_'
+            | b'`'
+            | b'|'
+            | b'~'
+            | b'0'..=b'9'
+    )
 }
 
 /// A byte permitted in a field value: HTAB, SP, VCHAR, or obs-text
@@ -507,7 +544,13 @@ mod tests {
 
     #[test]
     fn errors_map_to_message_error_code() {
-        assert_eq!(MessageError::MissingMethod.error_code(), ErrorCode::MessageError);
-        assert_eq!(MessageError::ContradictedAuthority.error_code(), ErrorCode::MessageError);
+        assert_eq!(
+            MessageError::MissingMethod.error_code(),
+            ErrorCode::MessageError
+        );
+        assert_eq!(
+            MessageError::ContradictedAuthority.error_code(),
+            ErrorCode::MessageError
+        );
     }
 }

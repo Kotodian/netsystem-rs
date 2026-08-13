@@ -22,7 +22,9 @@
 use std::cell::Cell;
 use std::sync::Arc;
 
+use hammer_infra::fifo::{Fifo, FifoError};
 use hammer_infra::pool::Index;
+use hammer_infra::segment::Segment;
 use hammer_runtime::app::{AppSessionConfig, ApplicationId, SessionAppContext, SessionAppId, SessionFlags};
 use hammer_runtime::session::{SessionApplicationErrorCode, SessionStreamDirection};
 use hammer_runtime::{
@@ -35,12 +37,14 @@ use hammer_service::session::runtime::{SessionMain, SessionTransportWorkerAction
 use hammer_service::session::{ApplicationMain, SessionEndpointRole, SessionId};
 
 use super::http_app::{
-    CALLBACKS, HTTP_SESSION_APP, HttpAppError, NAME, accept, accept_on, destroy, disconnect_on,
-    install, reset_on,
+    CALLBACKS, HTTP_SESSION_APP, HttpAppError, NAME, RequestErrorAction, accept, accept_on,
+    destroy, disconnect_on, install, request_publish_error_action, reset_on,
 };
 use super::listener::{HTTP_MAIN, HttpMain};
+use crate::http3::proto::error::ErrorCode;
 use crate::http3::request::RequestPublishError;
-use crate::http3::request_frame_reader::RequestFrameRead;
+use crate::http3::request_frame_reader::{RequestFrameError, RequestFrameRead};
+use crate::http_common::{EncodeError, PublishError};
 use crate::worker::{
     ContextId, HTTP_CONTEXT_CAPACITY, HttpWorker, HttpWorkerError, PeerControlOutcome,
     PeerUniStreamRole, PendingFieldSection, RequestReadError, StreamContextId,
@@ -946,23 +950,33 @@ fn disconnect_with_stale_stream_context_is_typed_error() {
 }
 
 #[test]
-fn disconnect_on_bidi_request_stream_mutates_nothing() {
+fn disconnect_on_bidi_request_stream_without_upper_releases_request() {
     let (main, mut sessions, application, session_app) = test_harness();
     let (parent, parent_context) =
         construct_parent(&main, &mut sessions, application, session_app, 1);
     let child = construct_stream(&mut sessions, application, session_app, 2, parent, false);
     accept_on(&main, &mut sessions, child, 0).expect("accept bidi stream");
     let stream = StreamContextId::from(Index::new(0, 1));
+    CLOSE_CALLS.with(|calls| calls.set(0));
+    RESET_CALLS.with(|calls| calls.set(0));
 
+    // With no upper request Session, a FIN on a complete request releases
+    // the request stream context while the lower stream Session and the
+    // parent connection Session/context stay live, and no transport action
+    // is dispatched.
     disconnect_on(&main, &mut sessions, child, u64::from(stream))
-        .expect("bidi FIN is left for request cleanup");
+        .expect("bidi FIN without an upper releases the request");
 
+    assert!(sessions.has_session(child), "the lower stream Session survives");
+    assert!(sessions.has_session(parent), "the parent connection Session survives");
+    CLOSE_CALLS.with(|calls| assert_eq!(calls.get(), 0, "no connection close"));
+    RESET_CALLS.with(|calls| assert_eq!(calls.get(), 0, "no stream reset"));
     main.with_worker(DataWorkerId::new(0), |http| {
         let connection = http.get(parent_context).map_err(RuntimeError::from)?;
         assert_eq!(connection.peer_control, None, "no control slot");
         assert_eq!(connection.peer_encoder, None, "no encoder slot");
         assert_eq!(connection.peer_decoder, None, "no decoder slot");
-        assert_eq!(http.stream_len(), 1, "bidi stream untouched");
+        assert_eq!(http.stream_len(), 0, "the request stream is released");
         Ok(())
     })
     .expect("worker accessible on the test thread");
@@ -1227,23 +1241,33 @@ fn reset_closes_the_connection_for_every_peer_uni_role() {
 }
 
 #[test]
-fn reset_on_bidi_request_stream_mutates_nothing() {
+fn reset_on_bidi_request_stream_without_upper_releases_request() {
     let (main, mut sessions, application, session_app) = test_harness();
-    let (parent, _parent_context) =
+    let (parent, parent_context) =
         construct_parent(&main, &mut sessions, application, session_app, 1);
     let child = construct_stream(&mut sessions, application, session_app, 2, parent, false);
     accept_on(&main, &mut sessions, child, 0).expect("accept bidi stream");
     let stream = StreamContextId::from(Index::new(0, 1));
     CLOSE_CALLS.with(|calls| calls.set(0));
+    RESET_CALLS.with(|calls| calls.set(0));
 
+    // With no upper request Session, a bidi RESET releases the request
+    // stream context while the lower stream Session and the parent
+    // connection Session/context stay live, and neither a connection close
+    // nor a stream reset is dispatched.
     reset_on(&main, &mut sessions, child, u64::from(stream))
-        .expect("bidi reset is left for request cleanup");
+        .expect("bidi reset without an upper releases the request");
 
+    assert!(sessions.has_session(child), "the lower stream Session survives");
+    assert!(sessions.has_session(parent), "the parent connection Session survives");
     CLOSE_CALLS.with(|calls| {
         assert_eq!(calls.get(), 0, "bidi reset must not close the connection")
     });
+    RESET_CALLS.with(|calls| assert_eq!(calls.get(), 0, "no stream reset"));
     main.with_worker(DataWorkerId::new(0), |http| {
-        assert_eq!(http.stream_len(), 1, "bidi stream untouched");
+        assert_eq!(http.len(), 1, "the parent connection context remains");
+        assert_eq!(http.stream_len(), 0, "the request stream is released");
+        assert!(http.get(parent_context).is_ok(), "the parent connection context is still live");
         Ok(())
     })
     .expect("worker accessible on the test thread");
@@ -1931,6 +1955,270 @@ fn release_request_stream_rejects_non_bidi_without_mutation() {
         .expect("remove_stream still owns uni stream release");
 }
 
+// --- request-body DATA ownership and publication ----------------------------
+
+/// A local FIFO of `capacity` data bytes backed by a private 1 MiB segment,
+/// as the http_common publish tests use.
+fn local_fifo(capacity: usize) -> Fifo {
+    Fifo::new(Segment::local(1 << 20), capacity).expect("local FIFO")
+}
+
+/// A worker with one live bidirectional request stream bound to
+/// `SessionId::from_raw(1)`, plus its parent connection context.
+fn request_stream_worker() -> (HttpWorker, SessionId, ContextId, StreamContextId) {
+    let mut worker = HttpWorker::with_capacities(4, 4);
+    let session = SessionId::from_raw(1);
+    let parent = worker.allocate(session).expect("allocate parent context");
+    let stream = worker
+        .allocate_stream(session, parent, SessionStreamDirection::Bidi)
+        .expect("allocate a bidi request stream");
+    (worker, session, parent, stream)
+}
+
+#[test]
+fn install_request_body_length_rejects_stale_foreign_and_non_bidi_without_mutation() {
+    let (mut worker, session, parent, stream) = request_stream_worker();
+    let foreign = SessionId::from_raw(2);
+    let uni = worker
+        .allocate_stream(session, parent, SessionStreamDirection::Uni)
+        .expect("allocate a peer uni stream");
+    worker
+        .release_request_stream(stream, session)
+        .expect("release the first bidi stream");
+    let stale = stream;
+
+    let error = worker
+        .install_request_body_length(stale, session, Some(4))
+        .expect_err("stale stream identity must be rejected");
+    assert!(
+        matches!(error, HttpWorkerError::StreamMissing { stream: s } if s == stale),
+        "typed stale rejection expected, got {error:?}"
+    );
+
+    let error = worker
+        .install_request_body_length(uni, session, Some(4))
+        .expect_err("a uni stream is not a request stream");
+    assert!(
+        matches!(
+            error,
+            HttpWorkerError::RequestStreamNotBidi {
+                stream: s,
+                direction: SessionStreamDirection::Uni
+            } if s == uni
+        ),
+        "typed non-bidi rejection expected, got {error:?}"
+    );
+
+    let stream = worker
+        .allocate_stream(session, parent, SessionStreamDirection::Bidi)
+        .expect("allocate a second bidi request stream");
+    let error = worker
+        .install_request_body_length(stream, foreign, Some(4))
+        .expect_err("foreign session must be rejected");
+    assert!(
+        matches!(
+            error,
+            HttpWorkerError::StreamSessionMismatch {
+                stream: s,
+                expected: e,
+                actual: a
+            } if s == stream && e == foreign && a == session
+        ),
+        "typed session mismatch expected, got {error:?}"
+    );
+    // The rejected installs left the accumulator at its `NoBody` default:
+    // DATA is still unexpected until a valid install declares a length.
+    let fifo = local_fifo(8192);
+    let error = worker
+        .process_request_data(stream, session, &fifo, b"data")
+        .expect_err("uninstalled body must reject DATA");
+    assert_eq!(error.error_code(), Some(ErrorCode::FrameUnexpected));
+    worker
+        .install_request_body_length(stream, session, Some(4))
+        .expect("valid install on the bidi stream");
+    worker
+        .process_request_data(stream, session, &fifo, b"data")
+        .expect("declared body accepts its DATA");
+    let mut out = [0u8; 4];
+    assert_eq!(fifo.peek(0, 4, &mut out), 4);
+    assert_eq!(&out, b"data");
+}
+
+#[test]
+fn process_request_data_rejects_stale_foreign_and_non_bidi_without_mutation() {
+    let (mut worker, session, parent, stream) = request_stream_worker();
+    let foreign = SessionId::from_raw(2);
+    let uni = worker
+        .allocate_stream(session, parent, SessionStreamDirection::Uni)
+        .expect("allocate a peer uni stream");
+    let fifo = local_fifo(8192);
+
+    let error = worker
+        .process_request_data(uni, session, &fifo, b"data")
+        .expect_err("a uni stream is not a request stream");
+    assert!(
+        matches!(
+            error,
+            RequestReadError::Worker(HttpWorkerError::RequestStreamNotBidi {
+                stream: s,
+                direction: SessionStreamDirection::Uni
+            }) if s == uni
+        ),
+        "typed non-bidi rejection expected, got {error:?}"
+    );
+
+    let error = worker
+        .process_request_data(stream, foreign, &fifo, b"data")
+        .expect_err("foreign session must be rejected");
+    assert!(
+        matches!(
+            error,
+            RequestReadError::Worker(HttpWorkerError::StreamSessionMismatch {
+                stream: s,
+                expected: e,
+                actual: a
+            }) if s == stream && e == foreign && a == session
+        ),
+        "typed session mismatch expected, got {error:?}"
+    );
+
+    worker
+        .release_request_stream(stream, session)
+        .expect("release the stream");
+    let error = worker
+        .process_request_data(stream, session, &fifo, b"data")
+        .expect_err("stale stream identity must be rejected");
+    assert!(
+        matches!(
+            error,
+            RequestReadError::Worker(HttpWorkerError::StreamMissing { stream: s }) if s == stream
+        ),
+        "typed stale rejection expected, got {error:?}"
+    );
+    // None of the rejected feeds touched the FIFO or a live body.
+    assert_eq!(fifo.max_enqueue(), 8192);
+
+    let stream = worker
+        .allocate_stream(session, parent, SessionStreamDirection::Bidi)
+        .expect("allocate a second bidi request stream");
+    worker
+        .install_request_body_length(stream, session, Some(6))
+        .expect("install the declared length");
+    worker
+        .process_request_data(stream, session, &fifo, b"ab")
+        .expect("first chunk publishes");
+    worker
+        .process_request_data(stream, session, &fifo, b"cdef")
+        .expect("second chunk publishes");
+    let mut out = [0u8; 6];
+    assert_eq!(fifo.peek(0, 6, &mut out), 6);
+    assert_eq!(&out, b"abcdef");
+}
+
+#[test]
+fn process_request_data_overrun_rejects_before_fifo_or_body_mutation() {
+    let (mut worker, session, _, stream) = request_stream_worker();
+    worker
+        .install_request_body_length(stream, session, Some(4))
+        .expect("install the declared length");
+    let fifo = local_fifo(8192);
+
+    let error = worker
+        .process_request_data(stream, session, &fifo, b"12345")
+        .expect_err("a chunk beyond the declared body must be rejected");
+    assert_eq!(error.error_code(), Some(ErrorCode::GeneralProtocolError));
+    assert_eq!(
+        fifo.max_enqueue(),
+        8192,
+        "the rejected chunk never touched the upper FIFO"
+    );
+
+    worker
+        .process_request_data(stream, session, &fifo, b"1234")
+        .expect("the full declared body publishes");
+    let mut out = [0u8; 4];
+    assert_eq!(fifo.peek(0, 4, &mut out), 4);
+    assert_eq!(&out, b"1234");
+    let error = worker
+        .process_request_data(stream, session, &fifo, b"5")
+        .expect_err("data after a complete body must be rejected");
+    assert_eq!(error.error_code(), Some(ErrorCode::FrameUnexpected));
+}
+
+#[test]
+fn process_request_data_capacity_arms_dequeue_notification_without_body_change() {
+    let (mut worker, session, _, stream) = request_stream_worker();
+    worker
+        .install_request_body_length(stream, session, Some(8))
+        .expect("install the declared length");
+    let tight = local_fifo(2);
+
+    let error = worker
+        .process_request_data(stream, session, &tight, b"12345678")
+        .expect_err("the tight FIFO cannot hold the whole chunk");
+    assert!(
+        matches!(
+            error,
+            RequestReadError::Worker(HttpWorkerError::BodyChunkPublishFailed {
+                stream: s,
+                error: PublishError::Capacity { requested: 8, available: 2 },
+            }) if s == stream
+        ),
+        "typed capacity rejection expected, got {error:?}"
+    );
+    assert!(
+        tight.needs_deq_notification(1),
+        "the capacity rejection armed the dequeue notification"
+    );
+    assert_eq!(
+        tight.max_enqueue(),
+        2,
+        "the rejected chunk never touched the tight FIFO"
+    );
+
+    // The body still expects all 8 bytes: the identical retry against a
+    // roomy FIFO completes it, so the failed publish never consumed them.
+    let fifo = local_fifo(8192);
+    worker
+        .process_request_data(stream, session, &fifo, b"12345678")
+        .expect("retry with room publishes the whole chunk");
+    let mut out = [0u8; 8];
+    assert_eq!(fifo.peek(0, 8, &mut out), 8);
+    assert_eq!(&out, b"12345678");
+}
+
+#[test]
+fn validate_request_finish_reports_incomplete_without_releasing_state() {
+    let (mut worker, session, _, stream) = request_stream_worker();
+    worker
+        .install_request_body_length(stream, session, Some(4))
+        .expect("install the declared length");
+    let fifo = local_fifo(8192);
+    worker
+        .process_request_data(stream, session, &fifo, b"12")
+        .expect("first half publishes");
+
+    let error = worker
+        .validate_request_finish(stream, session)
+        .expect_err("FIN with a declared but unreceived body must fail");
+    assert_eq!(error.error_code(), Some(ErrorCode::RequestIncomplete));
+    assert!(
+        worker.get_stream(stream).is_ok(),
+        "the rejected FIN left the stream live and unreleased"
+    );
+
+    worker
+        .process_request_data(stream, session, &fifo, b"34")
+        .expect("second half publishes");
+    worker
+        .validate_request_finish(stream, session)
+        .expect("FIN after the complete body passes");
+    let error = worker
+        .process_request_data(stream, session, &fifo, b"5")
+        .expect_err("data after a complete body must be rejected");
+    assert_eq!(error.error_code(), Some(ErrorCode::FrameUnexpected));
+}
+
 #[test]
 fn remove_upper_session_rolls_back_upper_and_repeats_as_noop() {
     // VPP rollback of a newly-created upper is a direct session_free with no
@@ -1963,6 +2251,212 @@ fn remove_upper_session_rolls_back_upper_and_repeats_as_noop() {
 fn http_app_error_from_request_publish_error() {
     let error = HttpAppError::from(RequestPublishError::MessageError);
     assert_eq!(error, HttpAppError::RequestPublish { error: RequestPublishError::MessageError });
+    let runtime = RuntimeError::from(error);
+    assert!(matches!(runtime, RuntimeError::Subsystem { subsystem, .. } if subsystem == "http"));
+}
+
+// --- bidi request FIN/reset cleanup ------------------------------------------
+
+/// A FIN on a complete request (no declared body) removes the upper request
+/// Session before the request stream context is released, exactly as VPP
+/// `http3_stream_cleanup_callback` deletes the app notification before
+/// freeing the request (http3.c:2459-2462); the lower stream and parent
+/// connection Sessions and contexts survive.
+#[test]
+fn request_stream_cleanup_fin_complete_removes_upper_and_releases_request() {
+    let (main, mut sessions, application, session_app) = test_harness();
+    let (parent, parent_context) =
+        construct_parent(&main, &mut sessions, application, session_app, 1);
+    let child = construct_stream(&mut sessions, application, session_app, 2, parent, false);
+    accept_on(&main, &mut sessions, child, 0).expect("accept bidi request stream");
+    let stream = StreamContextId::from(Index::new(0, 1));
+    sessions
+        .install_application_mq_for_test(application)
+        .expect("install test Application MQ");
+    let upper = sessions
+        .create_upper_session(child, 0x55)
+        .expect("create the upper request Session from the stream child");
+
+    disconnect_on(&main, &mut sessions, child, u64::from(stream))
+        .expect("bidi FIN completes the request");
+
+    assert!(!sessions.has_session(upper), "the upper Session is removed");
+    assert!(sessions.has_session(child), "the lower stream Session survives");
+    assert!(sessions.has_session(parent), "the parent connection Session survives");
+    main.with_worker(DataWorkerId::new(0), |http| {
+        assert_eq!(http.len(), 1, "the parent connection context remains");
+        assert_eq!(http.stream_len(), 0, "the request stream context is released");
+        assert!(
+            http.get(parent_context).is_ok(),
+            "the parent connection context is still live"
+        );
+        Ok(())
+    })
+    .expect("worker accessible on the test thread");
+}
+
+/// A FIN with a declared body that is only half received fails typed with
+/// `RequestFinishProtocol` carrying `RequestIncomplete` before any cleanup:
+/// the upper Session, the lower stream, and the parent connection all stay
+/// live and no connection close is dispatched.
+#[test]
+fn request_stream_cleanup_fin_incomplete_keeps_stream_and_upper_live() {
+    let (main, mut sessions, application, session_app) = test_harness();
+    let (parent, _parent_context) =
+        construct_parent(&main, &mut sessions, application, session_app, 1);
+    let child = construct_stream(&mut sessions, application, session_app, 2, parent, false);
+    accept_on(&main, &mut sessions, child, 0).expect("accept bidi request stream");
+    let stream = StreamContextId::from(Index::new(0, 1));
+    sessions
+        .install_application_mq_for_test(application)
+        .expect("install test Application MQ");
+    let upper = sessions
+        .create_upper_session(child, 0x55)
+        .expect("create the upper request Session from the stream child");
+    main.with_worker(DataWorkerId::new(0), |http| {
+        http.install_request_body_length(stream, child, Some(4))
+            .map_err(RuntimeError::from)
+    })
+    .expect("install the declared body length");
+    let fifo = local_fifo(8192);
+    main.with_worker(DataWorkerId::new(0), |http| {
+        http.process_request_data(stream, child, &fifo, b"12")
+            .map_err(|error| match error {
+                RequestReadError::Worker(inner) => RuntimeError::from(inner),
+                RequestReadError::Protocol(error) => RuntimeError::from(
+                    HttpAppError::RequestFinishProtocol { code: error.error_code() },
+                ),
+            })
+    })
+    .expect("feed the first half of the declared body");
+    CLOSE_CALLS.with(|calls| calls.set(0));
+
+    let error = disconnect_on(&main, &mut sessions, child, u64::from(stream))
+        .expect_err("FIN with an incomplete declared body must fail");
+    assert!(
+        matches!(
+            http_app_error(&error),
+            HttpAppError::RequestFinishProtocol { code: ErrorCode::RequestIncomplete }
+        ),
+        "typed incomplete-request error expected, got {error:?}"
+    );
+
+    assert!(sessions.has_session(upper), "the upper Session stays live");
+    assert!(sessions.has_session(child), "the lower stream Session stays live");
+    assert!(sessions.has_session(parent), "the parent connection Session stays live");
+    CLOSE_CALLS.with(|calls| assert_eq!(calls.get(), 0, "no connection close"));
+    main.with_worker(DataWorkerId::new(0), |http| {
+        assert_eq!(http.len(), 1, "the parent connection context remains");
+        assert_eq!(http.stream_len(), 1, "the request stream stays live");
+        assert_eq!(
+            http.get_stream_for_session(stream, child)
+                .map_err(RuntimeError::from)?
+                .session,
+            child,
+            "the stream is still bound to its Session"
+        );
+        Ok(())
+    })
+    .expect("worker accessible on the test thread");
+}
+
+/// A RESET on a bidi request stream removes the upper request Session and
+/// releases the request stream context without finish validation and without
+/// any transport action: the parent connection is never closed and no stream
+/// reset is sent, matching VPP `http3_transport_stream_reset_callback`
+/// returning before any error recording for non-uni streams.
+#[test]
+fn request_stream_cleanup_reset_removes_upper_without_transport_actions() {
+    let (main, mut sessions, application, session_app) = test_harness();
+    let (parent, _parent_context) =
+        construct_parent(&main, &mut sessions, application, session_app, 1);
+    let child = construct_stream(&mut sessions, application, session_app, 2, parent, false);
+    accept_on(&main, &mut sessions, child, 0).expect("accept bidi request stream");
+    let stream = StreamContextId::from(Index::new(0, 1));
+    sessions
+        .install_application_mq_for_test(application)
+        .expect("install test Application MQ");
+    let upper = sessions
+        .create_upper_session(child, 0x55)
+        .expect("create the upper request Session from the stream child");
+    CLOSE_CALLS.with(|calls| calls.set(0));
+    RESET_CALLS.with(|calls| calls.set(0));
+
+    reset_on(&main, &mut sessions, child, u64::from(stream))
+        .expect("bidi RESET releases the request");
+
+    assert!(!sessions.has_session(upper), "the upper Session is removed");
+    assert!(sessions.has_session(child), "the lower stream Session survives");
+    assert!(sessions.has_session(parent), "the parent connection Session survives");
+    CLOSE_CALLS.with(|calls| assert_eq!(calls.get(), 0, "no connection close"));
+    RESET_CALLS.with(|calls| assert_eq!(calls.get(), 0, "no stream reset"));
+    main.with_worker(DataWorkerId::new(0), |http| {
+        assert_eq!(http.len(), 1, "the parent connection context remains");
+        assert_eq!(http.stream_len(), 0, "the request stream context is released");
+        Ok(())
+    })
+    .expect("worker accessible on the test thread");
+}
+
+#[test]
+fn request_error_action_capacity_retries() {
+    let action = request_publish_error_action(RequestPublishError::Publish(PublishError::Capacity {
+        requested: 8,
+        available: 2,
+    }));
+    assert_eq!(action, RequestErrorAction::Retry);
+}
+
+#[test]
+fn request_error_action_message_error_resets_stream() {
+    let action = request_publish_error_action(RequestPublishError::MessageError);
+    assert_eq!(action, RequestErrorAction::ResetStream { code: ErrorCode::MessageError });
+}
+
+#[test]
+fn request_error_action_general_protocol_error_resets_stream() {
+    let action = request_publish_error_action(RequestPublishError::GeneralProtocolError);
+    assert_eq!(
+        action,
+        RequestErrorAction::ResetStream { code: ErrorCode::GeneralProtocolError }
+    );
+}
+
+#[test]
+fn request_error_action_internal_error_resets_stream() {
+    let action = request_publish_error_action(RequestPublishError::InternalError);
+    assert_eq!(action, RequestErrorAction::ResetStream { code: ErrorCode::InternalError });
+}
+
+#[test]
+fn request_error_action_qpack_decompression_failed_closes_connection() {
+    let action = request_publish_error_action(RequestPublishError::QpackDecompressionFailed);
+    assert_eq!(
+        action,
+        RequestErrorAction::CloseConnection { code: ErrorCode::QpackDecompressionFailed }
+    );
+}
+
+#[test]
+fn request_error_action_publish_encode_resets_stream() {
+    let action = request_publish_error_action(RequestPublishError::Publish(PublishError::Encode(
+        EncodeError::LengthOverflow,
+    )));
+    assert_eq!(action, RequestErrorAction::ResetStream { code: ErrorCode::InternalError });
+}
+
+#[test]
+fn request_error_action_publish_fifo_resets_stream() {
+    let action = request_publish_error_action(RequestPublishError::Publish(PublishError::Fifo(
+        FifoError::CommitExceedsReservation { initialized: 0, reserved: 8 },
+    )));
+    assert_eq!(action, RequestErrorAction::ResetStream { code: ErrorCode::InternalError });
+}
+
+#[test]
+fn request_frame_protocol_from_phase_frame_unexpected() {
+    let error = HttpAppError::from(RequestFrameError::Phase(ErrorCode::FrameUnexpected));
+    assert_eq!(error, HttpAppError::RequestFrameProtocol { code: ErrorCode::FrameUnexpected });
     let runtime = RuntimeError::from(error);
     assert!(matches!(runtime, RuntimeError::Subsystem { subsystem, .. } if subsystem == "http"));
 }

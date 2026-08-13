@@ -132,8 +132,14 @@ mod tests {
         let mut buf: &[u8] = &[0xff];
         assert_eq!(decode(9, &mut buf), Err(QpackError::InvalidSize));
         assert_eq!(decode(0, &mut buf), Err(QpackError::InvalidSize));
-        assert_eq!(encode(9, 0, 1, &mut Vec::new()), Err(QpackError::InvalidSize));
-        assert_eq!(encode(0, 0, 1, &mut Vec::new()), Err(QpackError::InvalidSize));
+        assert_eq!(
+            encode(9, 0, 1, &mut Vec::new()),
+            Err(QpackError::InvalidSize)
+        );
+        assert_eq!(
+            encode(0, 0, 1, &mut Vec::new()),
+            Err(QpackError::InvalidSize)
+        );
     }
 
     #[test]

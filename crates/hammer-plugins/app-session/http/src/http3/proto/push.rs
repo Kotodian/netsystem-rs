@@ -56,7 +56,10 @@ mod tests {
     fn push_id_from_u64() {
         let id = PushId::try_from(2u64).unwrap();
         assert_eq!(VarInt::from(id), VarInt::from_u32(2));
-        assert_eq!(VarInt::from(PushId::try_from(0u64).unwrap()), VarInt::from_u32(0));
+        assert_eq!(
+            VarInt::from(PushId::try_from(0u64).unwrap()),
+            VarInt::from_u32(0)
+        );
     }
 
     #[test]
