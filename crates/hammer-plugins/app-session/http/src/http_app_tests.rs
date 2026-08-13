@@ -16,7 +16,7 @@
 //! `ClosedCriticalStream` (0x0104), mutating no HTTP worker state and leaving
 //! bidi request resets alone. The worker-owned retention sink for completed
 //! HEADERS field sections now exists (`retain_pending_field_section` /
-//! `take_pending_field_section`), but production `builtin_rx` callback wiring
+//! `pending_field_section`), but production `builtin_rx` callback wiring
 //! remains a later seam, so no wiring exists.
 
 use std::cell::Cell;
@@ -43,7 +43,7 @@ use crate::http3::request::RequestPublishError;
 use crate::http3::request_frame_reader::RequestFrameRead;
 use crate::worker::{
     ContextId, HTTP_CONTEXT_CAPACITY, HttpWorker, HttpWorkerError, PeerControlOutcome,
-    PeerUniStreamRole, RequestReadError, StreamContextId,
+    PeerUniStreamRole, PendingFieldSection, RequestReadError, StreamContextId,
 };
 
 /// SessionWorker (64-slot pool on data worker 0) whose Application registry
@@ -1301,7 +1301,7 @@ fn builtin_rx_completed_headers_retains_field_section_in_worker_slot() {
 
     // Nothing is pending before any HEADERS completes.
     assert_eq!(
-        worker.take_pending_field_section(stream, session).unwrap(),
+        worker.pending_field_section(stream, session).unwrap(),
         None,
         "no field section pending before any HEADERS frame"
     );
@@ -1317,20 +1317,96 @@ fn builtin_rx_completed_headers_retains_field_section_in_worker_slot() {
     };
 
     // `encoded` is the by-value field section the RX seam must retain. The
-    // worker-owned pending slot takes ownership of it instead of dropping
-    // it, and the sink hands it back for the decode/publish stage.
+    // worker-owned pending slot takes ownership of it plus the exact
+    // lower-FIFO consumed count, and the borrow hands both back for the
+    // decode/publish stage.
     worker
-        .retain_pending_field_section(stream, session, encoded)
+        .retain_pending_field_section(
+            stream,
+            session,
+            PendingFieldSection { encoded, consumed },
+        )
         .expect("retain the completed field section");
+    let pending = worker
+        .pending_field_section(stream, session)
+        .expect("live stream")
+        .expect("a retained section is pending");
     assert_eq!(
-        worker.take_pending_field_section(stream, session).unwrap(),
-        Some(b"hi".to_vec()),
-        "the retained section is the encoded HEADERS field section"
+        pending.encoded, b"hi".to_vec(),
+        "the pending section is the encoded HEADERS field section"
     );
     assert_eq!(
-        worker.take_pending_field_section(stream, session).unwrap(),
+        pending.consumed, 4,
+        "the pending section records the exact lower-FIFO consumed count"
+    );
+
+    // Clearing empties the slot for a later trailer or retry.
+    worker
+        .clear_pending_field_section(stream, session)
+        .expect("clear the pending section");
+    assert_eq!(
+        worker.pending_field_section(stream, session).unwrap(),
         None,
-        "taking the section empties the pending slot"
+        "clearing empties the pending slot"
+    );
+}
+
+/// A publication retry borrows the same retained section without consuming
+/// it: the encoded block and its exact lower-FIFO consumed count stay
+/// identical across repeated borrows until the seam clears the slot.
+#[test]
+fn pending_field_section_borrow_survives_retry_until_clear() {
+    let mut worker = HttpWorker::with_capacities(4, 4);
+    let session = SessionId::from_raw(1);
+    let parent = worker.allocate(session).expect("allocate parent context");
+    let stream = worker
+        .allocate_stream(session, parent, SessionStreamDirection::Bidi)
+        .expect("allocate bidi request stream");
+
+    let (read, consumed) = worker
+        .process_request_bytes(stream, session, &[0x01, 0x02, b'h', b'i'])
+        .expect("feed one complete HEADERS frame");
+    let RequestFrameRead::Headers(encoded) = read else {
+        panic!("a complete HEADERS frame must surface its encoded field section");
+    };
+    worker
+        .retain_pending_field_section(
+            stream,
+            session,
+            PendingFieldSection { encoded, consumed },
+        )
+        .expect("retain the completed field section");
+
+    // The first publication attempt borrows the section.
+    let first = worker
+        .pending_field_section(stream, session)
+        .expect("live stream")
+        .expect("a retained section is pending");
+    // A retry borrows again, with no clear in between: the same bytes and
+    // the same exact consumed count must still be observable.
+    let second = worker
+        .pending_field_section(stream, session)
+        .expect("live stream")
+        .expect("the section survives the retry");
+    assert_eq!(
+        first.encoded, second.encoded,
+        "the retry re-borrows the same encoded block"
+    );
+    assert_eq!(
+        first.consumed, second.consumed,
+        "the retry re-borrows the same exact consumed count"
+    );
+    assert_eq!(first.encoded, b"hi".to_vec(), "the encoded block is intact");
+    assert_eq!(first.consumed, 4, "the lower-FIFO consumed count is intact");
+
+    // The seam clears the slot once the section is finally published.
+    worker
+        .clear_pending_field_section(stream, session)
+        .expect("clear the pending section");
+    assert_eq!(
+        worker.pending_field_section(stream, session).unwrap(),
+        None,
+        "the slot is empty after clear"
     );
 }
 
@@ -1346,18 +1422,23 @@ fn pending_field_section_rejects_overflow_and_stale_identities() {
         .expect("allocate bidi request stream");
 
     // The initial HEADERS and its optional trailer (RFC 9114 Section 4.1)
-    // complete on the same stream; both surface by value.
-    let (first, _) = worker
+    // complete on the same stream; both surface by value with the exact
+    // lower-FIFO consumed count of their feeds.
+    let (first, first_consumed) = worker
         .process_request_bytes(stream, session, &[0x01, 0x02, b'h', b'i'])
         .expect("feed the initial HEADERS frame");
     let RequestFrameRead::Headers(first) = first else {
         panic!("the initial HEADERS must surface its field section");
     };
     worker
-        .retain_pending_field_section(stream, session, first)
+        .retain_pending_field_section(
+            stream,
+            session,
+            PendingFieldSection { encoded: first, consumed: first_consumed },
+        )
         .expect("retain the initial field section");
 
-    let (trailer, _) = worker
+    let (trailer, trailer_consumed) = worker
         .process_request_bytes(stream, session, &[0x01, 0x02, b'h', b'x'])
         .expect("feed the trailer HEADERS frame");
     let RequestFrameRead::Headers(trailer) = trailer else {
@@ -1366,7 +1447,11 @@ fn pending_field_section_rejects_overflow_and_stale_identities() {
     // A section is already pending: the retain is rejected with the newer
     // section returned unreplaced, never silently replaced or dropped.
     let error = worker
-        .retain_pending_field_section(stream, session, trailer)
+        .retain_pending_field_section(
+            stream,
+            session,
+            PendingFieldSection { encoded: trailer, consumed: trailer_consumed },
+        )
         .expect_err("a pending section rejects a second retain");
     assert!(
         matches!(
@@ -1374,46 +1459,64 @@ fn pending_field_section_rejects_overflow_and_stale_identities() {
             HttpWorkerError::PendingFieldSectionOverflow {
                 stream: rejected_stream,
                 ref section
-            } if rejected_stream == stream && *section == b"hx".to_vec()
+            } if rejected_stream == stream
+                && section.encoded == b"hx".to_vec()
+                && section.consumed == trailer_consumed
         ),
         "overflow carries the rejected section back, got {error:?}"
     );
+    let pending = worker
+        .pending_field_section(stream, session)
+        .expect("live stream")
+        .expect("the initial section is still pending");
     assert_eq!(
-        worker.take_pending_field_section(stream, session).unwrap(),
-        Some(b"hi".to_vec()),
+        pending.encoded, b"hi".to_vec(),
         "the pending initial section survives the rejected retain"
     );
+    assert_eq!(
+        pending.consumed, first_consumed,
+        "its exact lower-FIFO consumed count survives too"
+    );
 
-    // The released stream's identity is stale: it can neither take nor
-    // retain on the reused slot, and the fresh stream starts empty.
+    // The released stream's identity is stale: it can neither borrow nor
+    // clear nor retain on the reused slot, and the fresh stream starts
+    // empty.
     worker.remove_stream(stream).expect("release the stream");
     let next = worker
         .allocate_stream(session, parent, SessionStreamDirection::Bidi)
         .expect("allocate a stream reusing the released slot");
     assert!(
-        worker.take_pending_field_section(stream, session).is_err(),
-        "stale stream identity cannot take on the reused slot"
+        worker.pending_field_section(stream, session).is_err(),
+        "stale stream identity cannot borrow on the reused slot"
+    );
+    assert!(
+        worker.clear_pending_field_section(stream, session).is_err(),
+        "stale stream identity cannot clear on the reused slot"
     );
     assert!(
         worker
-            .retain_pending_field_section(stream, session, b"zz".to_vec())
+            .retain_pending_field_section(
+                stream,
+                session,
+                PendingFieldSection { encoded: b"zz".to_vec(), consumed: 2 },
+            )
             .is_err(),
         "stale stream identity cannot retain on the reused slot"
     );
     assert_eq!(
-        worker.take_pending_field_section(next, session).unwrap(),
+        worker.pending_field_section(next, session).unwrap(),
         None,
         "the fresh stream observes no pending section from the released stream"
     );
 }
 
 /// The emptied-but-recorded pending slot refills with an optional trailer
-/// HEADERS (RFC 9114 Section 4.1) after the initial section was taken: the
-/// sink supports retain -> take -> retain trailer -> take on one recorded
-/// slot, mirroring VPP reusing `req->headers` on the same per-request
-/// `http_ctx_t` for the trailer section.
+/// HEADERS (RFC 9114 Section 4.1) after the initial section was cleared:
+/// the sink supports retain -> borrow -> clear -> retain trailer -> borrow
+/// on one recorded slot, mirroring VPP reusing `req->headers` on the same
+/// per-request `http_ctx_t` for the trailer section.
 #[test]
-fn pending_field_section_take_then_trailer_refills_emptied_slot() {
+fn pending_field_section_clear_then_trailer_refills_emptied_slot() {
     let mut worker = HttpWorker::with_capacities(4, 4);
     let session = SessionId::from_raw(1);
     let parent = worker.allocate(session).expect("allocate parent context");
@@ -1421,51 +1524,81 @@ fn pending_field_section_take_then_trailer_refills_emptied_slot() {
         .allocate_stream(session, parent, SessionStreamDirection::Bidi)
         .expect("allocate bidi request stream");
 
-    // Initial HEADERS: retained, then taken by the decode/publish seam.
-    let (first, _) = worker
+    // Initial HEADERS: retained, borrowed by the decode/publish seam, then
+    // cleared.
+    let (first, consumed) = worker
         .process_request_bytes(stream, session, &[0x01, 0x02, b'h', b'i'])
         .expect("feed the initial HEADERS frame");
     let RequestFrameRead::Headers(first) = first else {
         panic!("the initial HEADERS must surface its field section");
     };
     worker
-        .retain_pending_field_section(stream, session, first)
+        .retain_pending_field_section(
+            stream,
+            session,
+            PendingFieldSection { encoded: first, consumed },
+        )
         .expect("retain the initial field section");
+    let pending = worker
+        .pending_field_section(stream, session)
+        .expect("live stream")
+        .expect("the initial section is pending");
     assert_eq!(
-        worker.take_pending_field_section(stream, session).unwrap(),
-        Some(b"hi".to_vec()),
-        "the initial section is taken"
+        pending.encoded, b"hi".to_vec(),
+        "the initial section is borrowed"
     );
     assert_eq!(
-        worker.take_pending_field_section(stream, session).unwrap(),
+        pending.consumed, 4,
+        "the initial section's exact consumed count is borrowed"
+    );
+    worker
+        .clear_pending_field_section(stream, session)
+        .expect("clear the initial section");
+    assert_eq!(
+        worker.pending_field_section(stream, session).unwrap(),
         None,
-        "the slot is empty after taking"
+        "the slot is empty after clearing"
     );
 
-    // The trailer completes after the initial section was taken: the same
-    // recorded slot refills, and the trailer is taken in turn.
-    let (trailer, _) = worker
+    // The trailer completes after the initial section was cleared: the same
+    // recorded slot refills, and the trailer is borrowed in turn.
+    let (trailer, consumed) = worker
         .process_request_bytes(stream, session, &[0x01, 0x02, b'h', b'x'])
         .expect("feed the trailer HEADERS frame");
     let RequestFrameRead::Headers(trailer) = trailer else {
         panic!("the trailer HEADERS must surface its field section");
     };
     worker
-        .retain_pending_field_section(stream, session, trailer)
+        .retain_pending_field_section(
+            stream,
+            session,
+            PendingFieldSection { encoded: trailer, consumed },
+        )
         .expect("the emptied slot refills with the trailer");
+    let pending = worker
+        .pending_field_section(stream, session)
+        .expect("live stream")
+        .expect("the trailer section is pending");
     assert_eq!(
-        worker.take_pending_field_section(stream, session).unwrap(),
-        Some(b"hx".to_vec()),
-        "the refilled trailer section is taken"
+        pending.encoded, b"hx".to_vec(),
+        "the refilled trailer section is borrowed"
     );
     assert_eq!(
-        worker.take_pending_field_section(stream, session).unwrap(),
+        pending.consumed, 4,
+        "the trailer's exact consumed count is borrowed"
+    );
+    worker
+        .clear_pending_field_section(stream, session)
+        .expect("clear the trailer section");
+    assert_eq!(
+        worker.pending_field_section(stream, session).unwrap(),
         None,
-        "the slot is empty again after the trailer is taken"
+        "the slot is empty again after the trailer is cleared"
     );
 }
 
-/// A stream bound to one session rejects retain and take from a foreign
+/// A stream bound to one session rejects retain, borrow, and clear from a
+/// foreign
 /// session identity with the typed `StreamSessionMismatch` (the same
 /// session-bound metadata check every other worker seam performs), and the
 /// rejected calls leave the pending slot untouched.
@@ -1479,10 +1612,11 @@ fn pending_field_section_rejects_foreign_session_identities() {
         .allocate_stream(session, parent, SessionStreamDirection::Bidi)
         .expect("allocate bidi request stream");
 
-    // Take with a foreign session is rejected before touching the slot.
+    // Borrow and clear with a foreign session are rejected before touching
+    // the slot.
     let error = worker
-        .take_pending_field_section(stream, foreign)
-        .expect_err("take with a foreign session must fail");
+        .pending_field_section(stream, foreign)
+        .expect_err("borrow with a foreign session must fail");
     assert!(
         matches!(
             error,
@@ -1492,13 +1626,31 @@ fn pending_field_section_rejects_foreign_session_identities() {
                 actual
             } if s == stream && expected == foreign && actual == session
         ),
-        "take typed mismatch expected, got {error:?}"
+        "borrow typed mismatch expected, got {error:?}"
+    );
+    let error = worker
+        .clear_pending_field_section(stream, foreign)
+        .expect_err("clear with a foreign session must fail");
+    assert!(
+        matches!(
+            error,
+            HttpWorkerError::StreamSessionMismatch {
+                stream: s,
+                expected,
+                actual
+            } if s == stream && expected == foreign && actual == session
+        ),
+        "clear typed mismatch expected, got {error:?}"
     );
 
     // Retain with a foreign session is rejected the same way, and the
     // section is not left in the slot.
     let error = worker
-        .retain_pending_field_section(stream, foreign, b"zz".to_vec())
+        .retain_pending_field_section(
+            stream,
+            foreign,
+            PendingFieldSection { encoded: b"zz".to_vec(), consumed: 2 },
+        )
         .expect_err("retain with a foreign session must fail");
     assert!(
         matches!(
@@ -1512,19 +1664,30 @@ fn pending_field_section_rejects_foreign_session_identities() {
         "retain typed mismatch expected, got {error:?}"
     );
     assert_eq!(
-        worker.take_pending_field_section(stream, session).unwrap(),
+        worker.pending_field_section(stream, session).unwrap(),
         None,
         "the rejected retain left no section in the slot"
     );
 
     // The stream still accepts its own session afterwards.
     worker
-        .retain_pending_field_section(stream, session, b"hi".to_vec())
+        .retain_pending_field_section(
+            stream,
+            session,
+            PendingFieldSection { encoded: b"hi".to_vec(), consumed: 2 },
+        )
         .expect("retain with the bound session still works");
+    let pending = worker
+        .pending_field_section(stream, session)
+        .expect("live stream")
+        .expect("the bound session's section is pending");
     assert_eq!(
-        worker.take_pending_field_section(stream, session).unwrap(),
-        Some(b"hi".to_vec()),
-        "the bound session retains and takes normally"
+        pending.encoded, b"hi".to_vec(),
+        "the bound session retains and borrows normally"
+    );
+    assert_eq!(
+        pending.consumed, 2,
+        "the bound session's exact consumed count is borrowed"
     );
 }
 
@@ -1551,7 +1714,11 @@ fn release_request_stream_frees_reader_and_pending_slot() {
         .process_request_bytes(stream, session, &[0x01, 0x02, b'h', b'i'])
         .expect("feed one complete HEADERS frame");
     worker
-        .retain_pending_field_section(stream, session, b"hi".to_vec())
+        .retain_pending_field_section(
+            stream,
+            session,
+            PendingFieldSection { encoded: b"hi".to_vec(), consumed: 2 },
+        )
         .expect("retain the completed field section");
     assert!(
         worker
@@ -1584,7 +1751,7 @@ fn release_request_stream_frees_reader_and_pending_slot() {
         "the released identity is dead for the read path"
     );
     assert!(
-        worker.take_pending_field_section(stream, session).is_err(),
+        worker.pending_field_section(stream, session).is_err(),
         "the released identity is dead for the retention path"
     );
     assert!(
@@ -1610,7 +1777,11 @@ fn release_request_stream_stale_identity_cannot_touch_reused_slot() {
         .process_request_bytes(first, session, &[0x01, 0x02, b'h', b'i'])
         .expect("feed HEADERS on the first stream");
     worker
-        .retain_pending_field_section(first, session, b"hi".to_vec())
+        .retain_pending_field_section(
+            first,
+            session,
+            PendingFieldSection { encoded: b"hi".to_vec(), consumed: 2 },
+        )
         .expect("retain a section on the first stream");
     worker
         .release_request_stream(first, session)
@@ -1624,7 +1795,11 @@ fn release_request_stream_stale_identity_cannot_touch_reused_slot() {
         .process_request_bytes(second, session, &[0x01, 0x02, b'h', b'x'])
         .expect("feed HEADERS on the fresh stream");
     worker
-        .retain_pending_field_section(second, session, b"hx".to_vec())
+        .retain_pending_field_section(
+            second,
+            session,
+            PendingFieldSection { encoded: b"hx".to_vec(), consumed: 2 },
+        )
         .expect("retain a section on the fresh stream");
 
     // The stale identity is rejected before any removal; the fresh
@@ -1645,10 +1820,17 @@ fn release_request_stream_stale_identity_cannot_touch_reused_slot() {
         fresh.pending_field_section.is_some(),
         "the fresh stream's pending section is untouched"
     );
+    let pending = worker
+        .pending_field_section(second, session)
+        .expect("live stream")
+        .expect("the fresh stream still owns its pending section");
     assert_eq!(
-        worker.take_pending_field_section(second, session).unwrap(),
-        Some(b"hx".to_vec()),
+        pending.encoded, b"hx".to_vec(),
         "the fresh stream still owns its pending section"
+    );
+    assert_eq!(
+        pending.consumed, 2,
+        "the fresh stream's exact consumed count is intact"
     );
 }
 
