@@ -342,7 +342,11 @@ fn register_ip_reassembly(runtime: &DataPlaneRuntime) -> RuntimeResult<NodeId> {
 async fn ip_reassembly_expire_process(
     mut context: hammer_runtime::ProcessContext,
 ) -> RuntimeResult<()> {
-    let main = context.require::<IpReassemblyMain>()?;
+    // VPP `ip4_full_reass_walk_expired` reads the module-global main directly;
+    // the config phase stores it before Process Nodes start.
+    let main = IP_REASSEMBLY_MAIN
+        .load_full()
+        .ok_or(RuntimeError::PluginStateNotInitialized { plugin: "ip" })?;
     loop {
         let _ = context
             .wait_for_event_or_clock(REASSEMBLY_EXPIRE_WALK_INTERVAL)
