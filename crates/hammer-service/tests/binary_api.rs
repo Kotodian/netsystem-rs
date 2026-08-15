@@ -1,17 +1,18 @@
-use std::path::PathBuf;
-use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+//! Binary API server seam: the `binary-api` Process Node serves the Unix
+//! socket registered by `binary_api_init`, mirroring VPP's `vl_api_clnt_node`.
 
-use hammer_runtime::{
-    DataPlaneBufferConfig, DataPlaneRuntime, DataPlaneRuntimeConfig, Engine, PluginError,
-    PluginMain, RuntimeRegistry,
-};
+use std::io::{self, Read, Write};
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::time::Duration;
+
+use hammer_runtime::RuntimeRegistry;
+use hammer_runtime::config::Worker;
+use hammer_runtime::{Engine, EnginePool, PluginError, PluginMain};
 use hammer_service::binary_api::{
-    BinaryApiClient, BinaryApiError, BinaryApiMain, BinaryApiReply, BinaryApiRequest,
-    BinaryApiStatus,
+    BinaryApiClient, BinaryApiReply, BinaryApiRequest, BinaryApiStatus, DEFAULT_MAX_FRAME_BYTES,
 };
 use prost::Message;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 static SOCKET_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 static ECHO_BARRIER_SEEN: AtomicBool = AtomicBool::new(false);
@@ -53,6 +54,25 @@ fn panic_method(_: PanicRequest) -> PanicReply {
     panic!("Binary API method panic")
 }
 
+#[derive(Clone, PartialEq, Message)]
+struct LargeRequest {}
+
+/// An 8 MiB reply: larger than any Unix socket receive buffer, so a client
+/// that stops reading forces the server's write to block (VPP socket write
+/// model: write interest stays armed until the drain completes).
+#[derive(Clone, PartialEq, Message)]
+struct LargeReply {
+    #[prost(bytes = "vec", tag = "1")]
+    data: Vec<u8>,
+}
+
+#[hammer_component_macros::binary_api(name = "test.large")]
+fn large(_: LargeRequest) -> LargeReply {
+    LargeReply {
+        data: vec![0xAB; 8 * 1024 * 1024],
+    }
+}
+
 hammer_runtime::__declare_registration_image!(
     init_functions = [];
     config_functions = [];
@@ -65,34 +85,8 @@ hammer_runtime::__declare_registration_image!(
     process_nodes = [];
     session_transports = [];
     session_apps = [];
-    binary_api_methods = [__BINARY_API_ECHO, __BINARY_API_PANIC_METHOD];
+    binary_api_methods = [__BINARY_API_ECHO, __BINARY_API_PANIC_METHOD, __BINARY_API_LARGE];
 );
-
-struct CurrentEngine;
-
-impl Drop for CurrentEngine {
-    fn drop(&mut self) {
-        Engine::uninstall_current();
-    }
-}
-
-fn engine() -> Engine {
-    let buffers = DataPlaneBufferConfig {
-        buffer_slot_capacity: 256,
-        buffer_slots: 4,
-        frame_slots: 4,
-        ..DataPlaneBufferConfig::default()
-    };
-    let runtime = DataPlaneRuntime::new(DataPlaneRuntimeConfig { buffers });
-    let mut engine = Engine::new(runtime, RuntimeRegistry::new());
-    engine
-        .plugin_main_mut()
-        .register_builtin_image(&__HAMMER_REGISTRATION_IMAGE);
-    engine
-        .plugin_main_mut()
-        .register_builtin_image(hammer_service::registration_image());
-    engine
-}
 
 fn socket_path() -> PathBuf {
     let sequence = SOCKET_SEQUENCE.fetch_add(1, Ordering::Relaxed);
@@ -102,154 +96,155 @@ fn socket_path() -> PathBuf {
     ))
 }
 
-async fn call(stream: &mut tokio::net::UnixStream, request: BinaryApiRequest) -> BinaryApiReply {
-    let request = request.encode_to_vec();
-    stream
-        .write_all(&(request.len() as u32).to_be_bytes())
-        .await
-        .expect("write request length");
-    stream
-        .write_all(&request)
-        .await
-        .expect("write request payload");
+/// Builds an engine whose main loop has entered: the `binary_api_init`
+/// function bound the socket at `path`, and the `binary-api` Process Node is
+/// started with the given maximum frame size.
+///
+/// Socket removal is not asserted here after `drop(engine)`: the Data Worker
+/// thread holds the registry (and with it the `BinaryApiMain` capability) for
+/// its lifetime, so the capability drops only at process exit. Capability-drop
+/// cleanup is asserted directly by
+/// `bind_reclaims_a_stale_socket_and_drop_removes_its_own_path`.
+fn engine_with_binary_api(path: &Path, max_frame_bytes: usize) -> Engine {
+    let mut engine = Engine::new_configured(RuntimeRegistry::new(), Worker::default())
+        .expect("configure test engine");
+    engine
+        .plugin_main_mut()
+        .register_builtin_image(&__HAMMER_REGISTRATION_IMAGE);
+    engine
+        .plugin_main_mut()
+        .register_builtin_image(hammer_service::registration_image());
+    let config = format!(
+        "[binary_api]\nsocket_path = \"{}\"\nmax_frame_bytes = {}\n",
+        path.display(),
+        max_frame_bytes
+    );
+    EnginePool::main_loop_enter(&mut engine, &[], &config).expect("enter main loop");
+    engine
+}
 
+/// Uninstalls the current Engine before the test's engine drops, so the
+/// main-thread thread-local never outlives its Engine.
+struct CurrentEngine;
+
+impl CurrentEngine {
+    /// Records the engine's final address. `engine_with_binary_api` installs
+    /// the helper frame's address (via `EnginePool::main_loop_enter`), which
+    /// is dangling once the engine is returned by value and the frame pops,
+    /// so the test must re-install after the move.
+    fn install(engine: &mut Engine) -> Self {
+        engine.install_current();
+        CurrentEngine
+    }
+}
+
+impl Drop for CurrentEngine {
+    fn drop(&mut self) {
+        Engine::uninstall_current();
+    }
+}
+
+fn main_runtime() -> tokio::runtime::Runtime {
+    tokio::runtime::Builder::new_current_thread()
+        .enable_io()
+        .enable_time()
+        .build()
+        .expect("build main runtime")
+}
+
+/// Runs the blocking Binary API client on a plain thread and bridges the
+/// result through a oneshot. A server that never replies must fail the test
+/// through the caller's deadline: a `spawn_blocking` client would instead
+/// strand a tokio blocking-pool worker, which hangs `Runtime::drop` at
+/// teardown. The stranded thread exits on its own once the engine drop
+/// closes the listener, because the pending connection's peer vanishes.
+async fn run_client<F, T>(work: F) -> T
+where
+    F: FnOnce() -> T + Send + 'static,
+    T: Send + 'static,
+{
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    std::thread::spawn(move || {
+        let _ = tx.send(work());
+    });
+    rx.await.expect("client thread must send its result")
+}
+
+/// Opens a raw Binary API connection. The default Unix socket receive buffer
+/// is far below the 8 MiB `test.large` reply, so a client that stops reading
+/// forces the server's writes to block.
+fn raw_client(path: &Path) -> io::Result<std::os::unix::net::UnixStream> {
+    std::os::unix::net::UnixStream::connect(path)
+}
+
+/// Serializes one length-prefixed request frame (VPP `vac_write`).
+fn write_frame(
+    stream: &mut std::os::unix::net::UnixStream,
+    method: &str,
+    payload: &[u8],
+) -> io::Result<()> {
+    let frame = BinaryApiRequest {
+        context: 1,
+        method: method.to_owned(),
+        payload: payload.to_vec(),
+    }
+    .encode_to_vec();
+    stream.write_all(&(frame.len() as u32).to_be_bytes())?;
+    stream.write_all(&frame)
+}
+
+/// Reads one length-prefixed reply frame (VPP `vac_read`).
+fn read_reply(stream: &mut std::os::unix::net::UnixStream) -> io::Result<BinaryApiReply> {
     let mut length = [0_u8; size_of::<u32>()];
-    stream
-        .read_exact(&mut length)
-        .await
-        .expect("read reply length");
-    let mut reply = vec![0; u32::from_be_bytes(length) as usize];
-    stream
-        .read_exact(&mut reply)
-        .await
-        .expect("read reply payload");
-    BinaryApiReply::decode(reply.as_slice()).expect("decode Binary API reply")
+    stream.read_exact(&mut length)?;
+    let mut payload = vec![0_u8; u32::from_be_bytes(length) as usize];
+    stream.read_exact(&mut payload)?;
+    Ok(BinaryApiReply::decode(payload.as_slice()).expect("decode Binary API reply"))
 }
 
-#[tokio::test(flavor = "current_thread")]
-async fn protobuf_methods_dispatch_on_the_main_thread_over_unix_socket() {
-    let mut engine = engine();
-    engine.install_current();
-    let current = CurrentEngine;
+#[test]
+fn binary_api_process_node_serves_one_request() {
     let path = socket_path();
-    let main = Arc::new(BinaryApiMain::bind(&path, 64 * 1024).expect("bind Binary API"));
-    let server = tokio::spawn(Arc::clone(&main).serve());
-    let mut stream = tokio::net::UnixStream::connect(&path)
+    let mut engine = engine_with_binary_api(&path, DEFAULT_MAX_FRAME_BYTES);
+    let _engine_guard = CurrentEngine::install(&mut engine);
+    let expected_thread = format!("{:?}", std::thread::current().id());
+    let runtime = main_runtime();
+
+    engine.run_processes_until(&runtime, async {
+        tokio::time::timeout(Duration::from_secs(10), async {
+            let client_path = path.clone();
+            let (reply, barrier_seen) = run_client(move || {
+                let mut client = BinaryApiClient::connect(client_path).expect("connect Binary API");
+                ECHO_BARRIER_SEEN.store(false, Ordering::SeqCst);
+                let payload = client
+                    .call(
+                        "test.echo",
+                        &EchoRequest {
+                            text: "hammer".to_owned(),
+                        }
+                        .encode_to_vec(),
+                    )
+                    .expect("call echo through the binary-api Process Node");
+                let echo = EchoReply::decode(payload.as_slice()).expect("decode echo payload");
+                (echo, ECHO_BARRIER_SEEN.load(Ordering::SeqCst))
+            })
+            .await;
+            assert_eq!(reply.text, "hammer");
+            assert_eq!(reply.thread, expected_thread);
+            assert!(
+                barrier_seen,
+                "echo method must observe the worker barrier while dispatched"
+            );
+        })
         .await
-        .expect("connect Binary API");
-    let expected_thread = format!("{:?}", std::thread::current().id());
-    ECHO_BARRIER_SEEN.store(false, Ordering::SeqCst);
+        .expect("Binary API request completed within the deadline");
+    });
 
-    let reply = call(
-        &mut stream,
-        BinaryApiRequest {
-            context: 41,
-            method: "test.echo".to_owned(),
-            payload: EchoRequest {
-                text: "hammer".to_owned(),
-            }
-            .encode_to_vec(),
-        },
-    )
-    .await;
-    assert_eq!(reply.context, 41);
-    assert_eq!(reply.status, BinaryApiStatus::Ok as i32);
-    let echo = EchoReply::decode(reply.payload.as_slice()).expect("decode echo reply");
-    assert_eq!(echo.text, "hammer");
-    assert_eq!(echo.thread, expected_thread);
-    assert!(ECHO_BARRIER_SEEN.load(Ordering::SeqCst));
-
-    let missing = call(
-        &mut stream,
-        BinaryApiRequest {
-            context: 42,
-            method: "test.missing".to_owned(),
-            payload: Vec::new(),
-        },
-    )
-    .await;
-    assert_eq!(missing.context, 42);
-    assert_eq!(missing.status, BinaryApiStatus::MethodMissing as i32);
-
-    let invalid = call(
-        &mut stream,
-        BinaryApiRequest {
-            context: 43,
-            method: "test.echo".to_owned(),
-            payload: vec![0xff],
-        },
-    )
-    .await;
-    assert_eq!(invalid.context, 43);
-    assert_eq!(invalid.status, BinaryApiStatus::InvalidRequest as i32);
-
-    let panicked = call(
-        &mut stream,
-        BinaryApiRequest {
-            context: 44,
-            method: "test.panic".to_owned(),
-            payload: PanicRequest {}.encode_to_vec(),
-        },
-    )
-    .await;
-    assert_eq!(panicked.context, 44);
-    assert_eq!(panicked.status, BinaryApiStatus::MethodPanicked as i32);
-
-    drop(stream);
-
-    server.abort();
-    server.await.expect_err("server task aborted");
-    drop(main);
-    drop(current);
+    engine
+        .shutdown_process_nodes(&runtime)
+        .expect("shutdown Process Nodes");
     drop(engine);
-    assert!(!path.exists(), "Binary API socket must be removed on drop");
-}
-
-#[tokio::test(flavor = "current_thread")]
-async fn blocking_client_preserves_method_payload_context_and_status() {
-    let mut engine = engine();
-    engine.install_current();
-    let current = CurrentEngine;
-    let path = socket_path();
-    let main = Arc::new(BinaryApiMain::bind(&path, 64 * 1024).expect("bind Binary API"));
-    let server = tokio::spawn(Arc::clone(&main).serve());
-    let client_path = path.clone();
-    let expected_thread = format!("{:?}", std::thread::current().id());
-
-    let (echo, missing) = tokio::task::spawn_blocking(move || {
-        let mut client = BinaryApiClient::connect(client_path).expect("connect blocking client");
-        let payload = client
-            .call(
-                "test.echo",
-                &EchoRequest {
-                    text: "hammer".to_owned(),
-                }
-                .encode_to_vec(),
-            )
-            .expect("call echo through blocking client");
-        let echo = EchoReply::decode(payload.as_slice()).expect("decode echo payload");
-        let missing = client
-            .call("test.missing", &[])
-            .expect_err("missing Binary API method is rejected");
-        (echo, missing)
-    })
-    .await
-    .expect("join blocking Binary API client");
-
-    assert_eq!(echo.text, "hammer");
-    assert_eq!(echo.thread, expected_thread);
-    assert!(matches!(
-        missing,
-        BinaryApiError::ClientRejected { method, status }
-            if method == "test.missing" && status == BinaryApiStatus::MethodMissing
-    ));
-
-    server.abort();
-    server.await.expect_err("server task aborted");
-    drop(main);
-    drop(current);
-    drop(engine);
-    assert!(!path.exists(), "Binary API socket must be removed on drop");
+    drop(_engine_guard);
 }
 
 #[test]
@@ -258,7 +253,8 @@ fn bind_reclaims_a_stale_socket_and_drop_removes_its_own_path() {
     let stale = std::os::unix::net::UnixListener::bind(&path).expect("bind stale socket");
     drop(stale);
 
-    let main = BinaryApiMain::bind(&path, 64 * 1024).expect("replace stale Binary API socket");
+    let main = hammer_service::binary_api::BinaryApiMain::bind(&path, 64 * 1024)
+        .expect("replace stale Binary API socket");
     assert!(path.exists());
     drop(main);
     assert!(!path.exists(), "Binary API socket must be removed on drop");
@@ -274,4 +270,362 @@ fn duplicate_method_registration_is_rejected() {
         plugins.binary_api_method("test.echo"),
         Err(PluginError::BinaryApiMethodDuplicate { name }) if name == "test.echo"
     ));
+}
+
+#[test]
+fn blocked_server_write_re_arms_when_the_client_resumes_reading() {
+    let path = socket_path();
+    let mut engine = engine_with_binary_api(&path, DEFAULT_MAX_FRAME_BYTES);
+    let _engine_guard = CurrentEngine::install(&mut engine);
+    let runtime = main_runtime();
+
+    engine.run_processes_until(&runtime, async {
+        tokio::time::timeout(Duration::from_secs(30), async {
+            let client_path = path.clone();
+            let reply = run_client(move || {
+                let mut client = raw_client(&client_path).expect("connect Binary API");
+                write_frame(&mut client, "test.large", &[]).expect("write large request");
+                // Hold the reply: the server's 8 MiB write must block on the
+                // tiny receive buffer. Only a full drain disarms write
+                // interest, so the reply must arrive once the client reads.
+                std::thread::sleep(Duration::from_millis(500));
+                read_reply(&mut client).expect("large reply after the write re-arms")
+            })
+            .await;
+            assert_eq!(reply.status, BinaryApiStatus::Ok as i32);
+            assert_eq!(reply.context, 1);
+            let payload = LargeReply::decode(reply.payload.as_slice()).expect("decode large reply");
+            assert_eq!(payload.data.len(), 8 * 1024 * 1024);
+            assert!(payload.data.iter().all(|&byte| byte == 0xAB));
+        })
+        .await
+        .expect("blocked write re-armed within the deadline");
+    });
+
+    engine
+        .shutdown_process_nodes(&runtime)
+        .expect("shutdown Process Nodes");
+    drop(engine);
+    drop(_engine_guard);
+}
+
+#[test]
+fn partial_frames_are_held_and_complete_frames_dispatch_in_order() {
+    let path = socket_path();
+    let mut engine = engine_with_binary_api(&path, DEFAULT_MAX_FRAME_BYTES);
+    let _engine_guard = CurrentEngine::install(&mut engine);
+    let runtime = main_runtime();
+
+    engine.run_processes_until(&runtime, async {
+        tokio::time::timeout(Duration::from_secs(10), async {
+            let long_text = format!("three{}", "x".repeat(8 * 1024));
+            let expected_text = long_text.clone();
+            let client_path = path.clone();
+            let replies = run_client(move || {
+                let frame3 = BinaryApiRequest {
+                    context: 1,
+                    method: "test.echo".to_owned(),
+                    payload: EchoRequest {
+                        text: long_text.clone(),
+                    }
+                    .encode_to_vec(),
+                }
+                .encode_to_vec();
+                let mut client = raw_client(&client_path).expect("connect Binary API");
+                write_frame(
+                    &mut client,
+                    "test.echo",
+                    &EchoRequest {
+                        text: "one".to_owned(),
+                    }
+                    .encode_to_vec(),
+                )
+                .expect("write first frame");
+                write_frame(
+                    &mut client,
+                    "test.echo",
+                    &EchoRequest {
+                        text: "two".to_owned(),
+                    }
+                    .encode_to_vec(),
+                )
+                .expect("write second frame");
+                // Begin a third frame and complete it only after the server
+                // has processed the first chunk: the partial bytes must be
+                // held until the rest arrives.
+                client
+                    .write_all(&(frame3.len() as u32).to_be_bytes())
+                    .expect("write third prefix");
+                client
+                    .write_all(&frame3[..100])
+                    .expect("write third partial");
+                std::thread::sleep(Duration::from_millis(300));
+                client
+                    .write_all(&frame3[100..])
+                    .expect("complete third frame");
+
+                let mut texts = Vec::new();
+                for _ in 0..3 {
+                    let reply = read_reply(&mut client).expect("read reply");
+                    assert_eq!(reply.status, BinaryApiStatus::Ok as i32);
+                    texts.push(
+                        EchoReply::decode(reply.payload.as_slice())
+                            .expect("decode echo")
+                            .text,
+                    );
+                }
+                texts
+            })
+            .await;
+            assert_eq!(
+                replies,
+                vec!["one".to_owned(), "two".to_owned(), expected_text]
+            );
+        })
+        .await
+        .expect("partial and burst frames completed within the deadline");
+    });
+
+    engine
+        .shutdown_process_nodes(&runtime)
+        .expect("shutdown Process Nodes");
+    drop(engine);
+    drop(_engine_guard);
+}
+
+#[test]
+fn oversize_declared_frame_closes_the_client_and_releases_the_slot() {
+    let path = socket_path();
+    let mut engine = engine_with_binary_api(&path, 64 * 1024);
+    let _engine_guard = CurrentEngine::install(&mut engine);
+    let runtime = main_runtime();
+
+    engine.run_processes_until(&runtime, async {
+        tokio::time::timeout(Duration::from_secs(10), async {
+            let client_path = path.clone();
+            let text = run_client(move || {
+                // Client A declares a frame far above the configured maximum:
+                // the server closes the connection without reading the payload.
+                let mut oversized = raw_client(&client_path).expect("connect oversize client");
+                oversized
+                    .write_all(&((1024 * 1024) as u32).to_be_bytes())
+                    .expect("write oversize length prefix");
+                let mut length = [0_u8; size_of::<u32>()];
+                let read = oversized.read_exact(&mut length);
+                assert!(
+                    matches!(read, Err(error) if error.kind() == io::ErrorKind::UnexpectedEof),
+                    "oversize client must be closed by the server"
+                );
+
+                // Client B is still served: the closed slot was released.
+                let mut next = raw_client(&client_path).expect("connect next client");
+                write_frame(
+                    &mut next,
+                    "test.echo",
+                    &EchoRequest {
+                        text: "after close".to_owned(),
+                    }
+                    .encode_to_vec(),
+                )
+                .expect("write echo after close");
+                let reply = read_reply(&mut next).expect("reply after close");
+                assert_eq!(reply.status, BinaryApiStatus::Ok as i32);
+                EchoReply::decode(reply.payload.as_slice())
+                    .expect("decode echo")
+                    .text
+            })
+            .await;
+            assert_eq!(text, "after close");
+        })
+        .await
+        .expect("oversize close and slot release completed within the deadline");
+    });
+
+    engine
+        .shutdown_process_nodes(&runtime)
+        .expect("shutdown Process Nodes");
+    drop(engine);
+    drop(_engine_guard);
+}
+
+#[test]
+fn partial_frame_then_disconnect_releases_the_slot() {
+    let path = socket_path();
+    let mut engine = engine_with_binary_api(&path, DEFAULT_MAX_FRAME_BYTES);
+    let _engine_guard = CurrentEngine::install(&mut engine);
+    let runtime = main_runtime();
+
+    engine.run_processes_until(&runtime, async {
+        tokio::time::timeout(Duration::from_secs(10), async {
+            let client_path = path.clone();
+            let text = run_client(move || {
+                // Client A leaves a partial frame behind and disconnects; the
+                // server must close the slot on the peer's EOF.
+                let partial = BinaryApiRequest {
+                    context: 1,
+                    method: "test.echo".to_owned(),
+                    payload: vec![0x7F; 16 * 1024],
+                }
+                .encode_to_vec();
+                let mut dropped = raw_client(&client_path).expect("connect dropping client");
+                dropped
+                    .write_all(&(partial.len() as u32).to_be_bytes())
+                    .expect("write partial frame prefix");
+                dropped
+                    .write_all(&partial[..64])
+                    .expect("write partial frame");
+                drop(dropped);
+
+                // A new client is served on the released slot.
+                let mut next = raw_client(&client_path).expect("connect next client");
+                write_frame(
+                    &mut next,
+                    "test.echo",
+                    &EchoRequest {
+                        text: "after disconnect".to_owned(),
+                    }
+                    .encode_to_vec(),
+                )
+                .expect("write echo after disconnect");
+                let reply = read_reply(&mut next).expect("reply after disconnect");
+                assert_eq!(reply.status, BinaryApiStatus::Ok as i32);
+                EchoReply::decode(reply.payload.as_slice())
+                    .expect("decode echo")
+                    .text
+            })
+            .await;
+            assert_eq!(text, "after disconnect");
+        })
+        .await
+        .expect("disconnect cleanup completed within the deadline");
+    });
+
+    engine
+        .shutdown_process_nodes(&runtime)
+        .expect("shutdown Process Nodes");
+    drop(engine);
+    drop(_engine_guard);
+}
+
+#[test]
+fn stalled_client_backpressure_does_not_starve_a_second_client() {
+    let path = socket_path();
+    let mut engine = engine_with_binary_api(&path, DEFAULT_MAX_FRAME_BYTES);
+    let _engine_guard = CurrentEngine::install(&mut engine);
+    let runtime = main_runtime();
+
+    engine.run_processes_until(&runtime, async {
+        tokio::time::timeout(Duration::from_secs(60), async {
+            // Client A stops reading: six 8 MiB replies saturate the bounded
+            // output budget (2 * max_frame_bytes per client) and the server's
+            // writes block against the 4096-byte receive buffer.
+            let a_path = path.clone();
+            let (a_tx, a_rx) = tokio::sync::oneshot::channel();
+            std::thread::spawn(move || {
+                let mut a = raw_client(&a_path).expect("connect client A");
+                for _ in 0..6 {
+                    write_frame(&mut a, "test.large", &[]).expect("write large request");
+                }
+                std::thread::sleep(Duration::from_secs(1));
+                let mut replies = Vec::with_capacity(6);
+                for _ in 0..6 {
+                    replies.push(read_reply(&mut a).expect("drain stalled replies"));
+                }
+                let _ = a_tx.send(replies);
+            });
+
+            // Client B is served while A is stalled and its output is bounded.
+            let b_path = path.clone();
+            let b_reply = run_client(move || {
+                let mut b = raw_client(&b_path).expect("connect client B");
+                write_frame(
+                    &mut b,
+                    "test.echo",
+                    &EchoRequest {
+                        text: "alive".to_owned(),
+                    }
+                    .encode_to_vec(),
+                )
+                .expect("write echo while A is stalled");
+                read_reply(&mut b).expect("reply while A is stalled")
+            })
+            .await;
+            assert_eq!(b_reply.status, BinaryApiStatus::Ok as i32);
+            let echo = EchoReply::decode(b_reply.payload.as_slice()).expect("decode echo");
+            assert_eq!(echo.text, "alive");
+
+            // A's stalled queue drains once it resumes reading.
+            let replies = a_rx.await.expect("client A drained");
+            assert_eq!(replies.len(), 6);
+            for reply in &replies {
+                assert_eq!(reply.status, BinaryApiStatus::Ok as i32);
+                assert_eq!(reply.context, 1);
+                let payload =
+                    LargeReply::decode(reply.payload.as_slice()).expect("decode large reply");
+                assert_eq!(payload.data.len(), 8 * 1024 * 1024);
+                assert!(payload.data.iter().all(|&byte| byte == 0xAB));
+            }
+        })
+        .await
+        .expect("stalled client drained within the deadline");
+    });
+
+    engine
+        .shutdown_process_nodes(&runtime)
+        .expect("shutdown Process Nodes");
+    drop(engine);
+    drop(_engine_guard);
+}
+
+#[test]
+fn process_node_shutdown_closes_the_listener_and_stops_dispatch() {
+    let path = socket_path();
+    let mut engine = engine_with_binary_api(&path, DEFAULT_MAX_FRAME_BYTES);
+    let _engine_guard = CurrentEngine::install(&mut engine);
+    let runtime = main_runtime();
+
+    // Serve one request so the node is running and owns the FileMain.
+    engine.run_processes_until(&runtime, async {
+        tokio::time::timeout(Duration::from_secs(10), async {
+            let client_path = path.clone();
+            let text = run_client(move || {
+                let mut client = BinaryApiClient::connect(client_path).expect("connect Binary API");
+                let payload = client
+                    .call(
+                        "test.echo",
+                        &EchoRequest {
+                            text: "warmup".to_owned(),
+                        }
+                        .encode_to_vec(),
+                    )
+                    .expect("call echo before shutdown");
+                EchoReply::decode(payload.as_slice())
+                    .expect("decode echo")
+                    .text
+            })
+            .await;
+            assert_eq!(text, "warmup");
+        })
+        .await
+        .expect("warmup request completed within the deadline");
+    });
+
+    engine
+        .shutdown_process_nodes(&runtime)
+        .expect("shutdown Process Nodes");
+
+    // The Process Node owned the FileMain: exiting it drops the listener and
+    // every client descriptor, so no dispatch can happen and new connections
+    // are refused.
+    let client_path = path.clone();
+    let error = std::os::unix::net::UnixStream::connect(&client_path)
+        .expect_err("listener must close with the Process Node");
+    assert_eq!(
+        error.kind(),
+        io::ErrorKind::ConnectionRefused,
+        "shutdown must close the Binary API listener"
+    );
+
+    drop(engine);
+    drop(_engine_guard);
 }

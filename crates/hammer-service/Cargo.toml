@@ -17,6 +17,7 @@ crossbeam-queue = { workspace = true }
 crossbeam-utils = { workspace = true }
 hammer-core = { path = "../hammer-core" }
 hammer-infra = { path = "../hammer-infra" }
+hammer-ipc = { path = "../hammer-ipc" }
 hammer-component-macros = { path = "../hammer-component-macros" }
 hammer-runtime = { path = "../hammer-runtime", default-features = false }
 ipnet = { workspace = true }
