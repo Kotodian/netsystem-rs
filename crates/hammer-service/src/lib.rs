@@ -28,7 +28,7 @@ hammer_runtime::__declare_registration_image!(
         session::node::__SESSION_GRAPH_NODE_SESSION_QUEUE_NODE,
     ];
     node_functions = [];
-    process_nodes = [];
+    process_nodes = [binary_api::__PROCESS_NODE_BINARY_API];
     session_transports = [];
     session_apps = [];
     binary_api_methods = [];

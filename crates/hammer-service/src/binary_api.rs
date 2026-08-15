@@ -1,55 +1,41 @@
-//! Protobuf Binary API served on a Main Thread Tokio Unix socket.
+//! Protobuf Binary API served by the `binary-api` Process Node.
+//!
+//! Mirrors VPP's `vl_api_clnt_node` (`third_party/vpp/src/vlibmemory/socket_api.c`):
+//! FileMain readiness callbacks only signal this node; the node consumes the
+//! event batches to accept connections, read length-prefixed frames, dispatch
+//! them under the worker barrier, and flush replies with TCP backpressure.
+//! Per-event budgets keep one chatty client from monopolizing the main thread.
 
-use std::io::{self, Read, Write};
+use std::io;
 use std::os::unix::fs::MetadataExt;
 use std::os::unix::net::UnixListener as StdUnixListener;
 use std::os::unix::net::UnixStream as StdUnixStream;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::thread::{self, ThreadId};
+use std::time::Duration;
 
+use hammer_infra::pool::Index;
+use hammer_infra::thread_owned::ThreadOwned;
 use hammer_runtime::binary_api::BinaryApiMethodStatus;
-use hammer_runtime::{Engine, PluginError, RuntimeError, RuntimeResult, WorkerBarrier};
+use hammer_runtime::file::{File, FileFunctions, FileIoStatus, FileMain};
+use hammer_runtime::{
+    Engine, NodeRuntime, PluginError, ProcessContext, ProcessWake, RuntimeError, RuntimeResult,
+};
 use prost::Message;
-use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
-const DEFAULT_MAX_FRAME_BYTES: usize = 16 * 1024 * 1024;
+/// Shared envelope, blocking client, and client-facing errors owned by
+/// `hammer-ipc` and re-exported here so existing callers can reach them
+/// through the server crate.
+pub use hammer_ipc::binary_api::{
+    BinaryApiClient, BinaryApiError, BinaryApiReply, BinaryApiRequest, BinaryApiStatus,
+    DEFAULT_MAX_FRAME_BYTES,
+};
 
-#[derive(Clone, PartialEq, Message)]
-pub struct BinaryApiRequest {
-    #[prost(uint64, tag = "1")]
-    pub context: u64,
-    #[prost(string, tag = "2")]
-    pub method: String,
-    #[prost(bytes = "vec", tag = "3")]
-    pub payload: Vec<u8>,
-}
-
-#[derive(Clone, PartialEq, Message)]
-pub struct BinaryApiReply {
-    #[prost(uint64, tag = "1")]
-    pub context: u64,
-    #[prost(enumeration = "BinaryApiStatus", tag = "2")]
-    pub status: i32,
-    #[prost(bytes = "vec", tag = "3")]
-    pub payload: Vec<u8>,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq, prost::Enumeration)]
-#[repr(i32)]
-pub enum BinaryApiStatus {
-    Ok = 0,
-    InvalidRequest = 1,
-    MethodMissing = 2,
-    MethodDuplicate = 3,
-    MethodPanicked = 4,
-    MainThreadUnavailable = 5,
-    Internal = 6,
-}
-
+/// Server-side Binary API errors. Client-facing errors are `BinaryApiError`
+/// from `hammer-ipc`.
 #[hammer_component_macros::runtime_error(subsystem = "binary api")]
 #[derive(Debug, thiserror::Error)]
-pub enum BinaryApiError {
+pub enum BinaryApiServerError {
     #[error("Binary API socket path is empty")]
     SocketPathEmpty,
     #[error("Binary API maximum frame size {bytes} is invalid")]
@@ -60,313 +46,417 @@ pub enum BinaryApiError {
         #[source]
         source: io::Error,
     },
-    #[error("configure Binary API Unix socket as nonblocking")]
-    SocketNonblocking {
+    #[error("create Binary API FileMain")]
+    FileMainCreate {
         #[source]
-        source: io::Error,
+        source: RuntimeError,
     },
-    #[error("clone Binary API Unix listener")]
-    ListenerClone {
-        #[source]
-        source: io::Error,
-    },
-    #[error("register Binary API Unix listener with Tokio")]
+    #[error("register Binary API Unix listener with FileMain")]
     ListenerRegistration {
         #[source]
-        source: io::Error,
+        source: RuntimeError,
     },
-    #[error("accept Binary API connection")]
-    Accept {
-        #[source]
-        source: io::Error,
-    },
-    #[error("Binary API must run on its owning Main Thread")]
-    WrongThread,
-    #[error("read Binary API frame")]
-    FrameRead {
-        #[source]
-        source: io::Error,
-    },
-    #[error("write Binary API frame")]
-    FrameWrite {
-        #[source]
-        source: io::Error,
-    },
-    #[error("Binary API frame length {bytes} exceeds maximum {maximum}")]
-    FrameTooLarge { bytes: usize, maximum: usize },
-    #[error("connect to Binary API Unix socket at `{path}`")]
-    ClientConnect {
-        path: PathBuf,
-        #[source]
-        source: io::Error,
-    },
-    #[error("write Binary API request `{method}`")]
-    ClientWrite {
-        method: String,
-        #[source]
-        source: io::Error,
-    },
-    #[error("read Binary API reply for `{method}`")]
-    ClientRead {
-        method: String,
-        #[source]
-        source: io::Error,
-    },
-    #[error("decode Binary API reply for `{method}`")]
-    ClientReplyDecode {
-        method: String,
-        #[source]
-        source: prost::DecodeError,
-    },
-    #[error("Binary API reply context mismatch for `{method}`: expected {expected}, got {actual}")]
-    ClientReplyContext {
-        method: String,
-        expected: u64,
-        actual: u64,
-    },
-    #[error("Binary API reply for `{method}` returned unknown status {status}")]
-    ClientReplyStatusInvalid { method: String, status: i32 },
-    #[error("Binary API request `{method}` was rejected with {status:?}")]
-    ClientRejected {
-        method: String,
-        status: BinaryApiStatus,
-    },
+    #[error("Binary API FileMain is not ready for the Process Node")]
+    FileMainNotReady,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize)]
-#[serde(default, deny_unknown_fields)]
-struct Config {
-    socket_path: Option<String>,
-    max_frame_bytes: usize,
+// VPP `VL_API_CLNT_NODE` budgets: bounded work per readiness event so one
+// chatty client or a burst of connects cannot monopolize the main thread.
+const PROCESS_NODE_NAME: &str = "binary-api";
+const MAX_CLIENTS: usize = 1024;
+const MAX_ACCEPTS_PER_EVENT: usize = 16;
+const MAX_FRAMES_PER_READ_EVENT: usize = 16;
+const READ_CHUNK_BYTES: usize = 4096;
+const LISTENER_TOKEN: u64 = 0;
+const EVENT_ACCEPT_READY: u64 = 1;
+const EVENT_CLIENT_READ_READY: u64 = 2;
+const EVENT_CLIENT_WRITE_READY: u64 = 3;
+
+/// Generation-safe client identity carried in each client File's private
+/// data: `(generation << 32) | slot`. A stale event for a closed or recycled
+/// slot decodes to the wrong generation and is ignored.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct SocketToken(u64);
+
+impl SocketToken {
+    #[inline]
+    fn encode(slot: usize, generation: u32) -> Self {
+        Self(((generation as u64) << 32) | slot as u64)
+    }
+
+    #[inline]
+    fn slot(self) -> Option<usize> {
+        let slot = (self.0 & u32::MAX as u64) as usize;
+        (slot < MAX_CLIENTS).then_some(slot)
+    }
+
+    #[inline]
+    fn generation(self) -> u32 {
+        (self.0 >> 32) as u32
+    }
 }
 
-impl Default for Config {
+/// One accepted Binary API connection: the FileMain index, the frame buffer
+/// (VPP `unprocessed_input`), and the reply buffer flushed with TCP
+/// backpressure.
+struct ClientSlot {
+    generation: u32,
+    index: Option<Index>,
+    read_buf: Vec<u8>,
+    output: Vec<u8>,
+}
+
+impl Default for ClientSlot {
     fn default() -> Self {
         Self {
-            socket_path: None,
-            max_frame_bytes: DEFAULT_MAX_FRAME_BYTES,
+            generation: 0,
+            index: None,
+            read_buf: Vec::new(),
+            output: Vec::new(),
         }
     }
 }
 
-impl Config {
-    fn validate(&self) -> Result<(), BinaryApiError> {
-        if self
-            .socket_path
-            .as_ref()
-            .is_some_and(|path| path.trim().is_empty())
-        {
-            return Err(BinaryApiError::SocketPathEmpty);
+/// The socket-api client table: VPP's bounded `client_table`, keyed by
+/// generation-safe tokens.
+struct ClientTable {
+    listener: Index,
+    slots: Vec<ClientSlot>,
+    /// Monotonic generation source: a recycled slot's new token never matches
+    /// a stale token held by the previous occupant.
+    next_generation: u32,
+}
+
+impl ClientTable {
+    fn new(listener: Index) -> Self {
+        Self {
+            listener,
+            slots: (0..MAX_CLIENTS).map(|_| ClientSlot::default()).collect(),
+            next_generation: 0,
         }
-        if self.max_frame_bytes == 0 || self.max_frame_bytes > u32::MAX as usize {
-            return Err(BinaryApiError::FrameSizeInvalid {
-                bytes: self.max_frame_bytes,
-            });
+    }
+
+    #[inline]
+    fn slot(&self, token: SocketToken) -> Option<&ClientSlot> {
+        let slot = self.slots.get(token.slot()?)?;
+        (slot.generation == token.generation()).then_some(slot)
+    }
+
+    #[inline]
+    fn slot_mut(&mut self, token: SocketToken) -> Option<&mut ClientSlot> {
+        let slot = self.slots.get_mut(token.slot()?)?;
+        (slot.generation == token.generation()).then_some(slot)
+    }
+
+    fn reserve(&mut self) -> Option<SocketToken> {
+        self.next_generation = self.next_generation.wrapping_add(1).max(1);
+        let generation = self.next_generation;
+        for (slot_index, slot) in self.slots.iter_mut().enumerate() {
+            if slot.generation == 0 {
+                slot.generation = generation;
+                return Some(SocketToken::encode(slot_index, generation));
+            }
+        }
+        None
+    }
+
+    fn release(&mut self, token: SocketToken) {
+        if let Some(slot) = self.slot_mut(token) {
+            slot.generation = 0;
+        }
+    }
+
+    /// Consumes one event batch signalled by FileMain readiness callbacks.
+    fn process_event(
+        &mut self,
+        file_main: &mut FileMain,
+        event_type: u64,
+        data: &[u64],
+        max_frame_bytes: usize,
+    ) -> RuntimeResult<()> {
+        match event_type {
+            EVENT_ACCEPT_READY => {
+                for _ in 0..MAX_ACCEPTS_PER_EVENT {
+                    if !self.accept_ready(file_main)? {
+                        break;
+                    }
+                }
+            }
+            EVENT_CLIENT_READ_READY => {
+                for raw in data {
+                    self.client_read(file_main, SocketToken(*raw), max_frame_bytes);
+                }
+            }
+            EVENT_CLIENT_WRITE_READY => {
+                for raw in data {
+                    self.client_flush(file_main, SocketToken(*raw), max_frame_bytes);
+                }
+            }
+            _ => {}
         }
         Ok(())
     }
+
+    /// VPP `vl_api_socket_accept`: pulls one pending connection per call; the
+    /// per-event loop bounds the count.
+    fn accept_ready(&mut self, file_main: &mut FileMain) -> RuntimeResult<bool> {
+        let Some(token) = self.reserve() else {
+            return Ok(false); // table full: the kernel backlog holds connects
+        };
+        match file_main.accept(
+            self.listener,
+            "binary-api client",
+            token.0,
+            CLIENT_FUNCTIONS,
+        ) {
+            Ok(Some(index)) => {
+                match self.slot_mut(token) {
+                    Some(slot) => {
+                        slot.index = Some(index);
+                        slot.read_buf.clear();
+                        slot.output.clear();
+                    }
+                    None => {
+                        // Unreachable: the token was just reserved. Drop the
+                        // registered File rather than leak it.
+                        let _ = file_main.delete(index);
+                    }
+                }
+                Ok(true)
+            }
+            Ok(None) => {
+                self.release(token);
+                Ok(false)
+            }
+            Err(error) => {
+                // A per-connection accept failure must not kill the node: VPP
+                // logs and keeps polling. The dropped socket closes with the
+                // error path; the next listener readiness pulls a new one.
+                tracing::warn!(%error, "Binary API accept failed; dropping connection");
+                self.release(token);
+                Ok(false)
+            }
+        }
+    }
+
+    /// VPP `vl_api_socket_read`: one bounded chunk per readiness event into
+    /// `unprocessed_input`, then every complete frame in it.
+    fn client_read(
+        &mut self,
+        file_main: &mut FileMain,
+        token: SocketToken,
+        max_frame_bytes: usize,
+    ) {
+        let Some(slot) = self.slot(token) else {
+            return; // stale event for a closed or recycled slot
+        };
+        let Some(index) = slot.index else {
+            return;
+        };
+        let mut chunk = [0_u8; READ_CHUNK_BYTES];
+        match file_main.read_some(index, &mut chunk) {
+            Ok(FileIoStatus::Progress(n)) => {
+                if let Some(slot) = self.slot_mut(token) {
+                    slot.read_buf.extend_from_slice(&chunk[..n]);
+                }
+                self.parse_frames(file_main, token, max_frame_bytes);
+            }
+            Ok(FileIoStatus::WouldBlock) => {}
+            Ok(FileIoStatus::Closed) => self.close(file_main, token),
+            Err(error) => {
+                tracing::warn!(%error, "Binary API read failed; closing client");
+                self.close(file_main, token);
+            }
+        }
+    }
+
+    /// VPP `vl_api_socket_write`: flush the reply buffer; EAGAIN (WouldBlock)
+    /// keeps write interest armed so the next write readiness drains it, and
+    /// a complete drain clears it.
+    fn client_flush(
+        &mut self,
+        file_main: &mut FileMain,
+        token: SocketToken,
+        max_frame_bytes: usize,
+    ) {
+        loop {
+            // Resume frames stalled by a saturated output buffer first.
+            self.parse_frames(file_main, token, max_frame_bytes);
+            let Some(slot) = self.slot(token) else {
+                return;
+            };
+            if slot.output.is_empty() {
+                if let Some(index) = slot.index {
+                    let _ = file_main.set_data_available_to_write(index, false);
+                }
+                return;
+            }
+            let Some(index) = slot.index else {
+                return;
+            };
+            match file_main.write_some(index, &slot.output) {
+                Ok(FileIoStatus::Progress(n)) => {
+                    if let Some(slot) = self.slot_mut(token) {
+                        slot.output.drain(..n);
+                    }
+                }
+                Ok(FileIoStatus::WouldBlock) => return,
+                Ok(FileIoStatus::Closed) => {
+                    self.close(file_main, token);
+                    return;
+                }
+                Err(error) => {
+                    tracing::warn!(%error, "Binary API write failed; closing client");
+                    self.close(file_main, token);
+                    return;
+                }
+            }
+        }
+    }
+
+    /// Parses every complete length-prefixed frame in `read_buf`, dispatching
+    /// each under the worker barrier and enqueueing the reply. Stops when the
+    /// frame budget for this event is spent, the output buffer saturates, or
+    /// the buffer holds only a partial frame.
+    fn parse_frames(
+        &mut self,
+        file_main: &mut FileMain,
+        token: SocketToken,
+        max_frame_bytes: usize,
+    ) {
+        for _ in 0..MAX_FRAMES_PER_READ_EVENT {
+            let Some(slot) = self.slot(token) else {
+                return;
+            };
+            if slot.read_buf.len() < size_of::<u32>() {
+                return;
+            }
+            let declared = u32::from_be_bytes(
+                slot.read_buf[..size_of::<u32>()]
+                    .try_into()
+                    .expect("four-byte length prefix"),
+            ) as usize;
+            if declared > max_frame_bytes {
+                tracing::warn!(declared, "Binary API frame exceeds maximum; closing client");
+                self.close(file_main, token);
+                return;
+            }
+            let frame_len = size_of::<u32>() + declared;
+            if slot.read_buf.len() < frame_len {
+                return; // partial frame: VPP keeps it in unprocessed_input
+            }
+            let request = BinaryApiRequest::decode(&slot.read_buf[size_of::<u32>()..frame_len]);
+            let reply = match request {
+                Ok(request) => dispatch_barriered(request),
+                Err(_) => reply(0, BinaryApiStatus::InvalidRequest, Vec::new()),
+            };
+            let encoded = reply.encode_to_vec(); // single allocation for the reply frame
+            if encoded.len() > max_frame_bytes {
+                tracing::warn!(
+                    bytes = encoded.len(),
+                    "Binary API reply exceeds maximum; closing client"
+                );
+                self.close(file_main, token);
+                return;
+            }
+            let Some(slot) = self.slot_mut(token) else {
+                return;
+            };
+            // Saturate rather than grow: parsing stalls until a flush drains
+            // below the budget, and TCP backpressure limits the client.
+            if slot.output.len() + size_of::<u32>() + declared > output_budget(max_frame_bytes) {
+                return;
+            }
+            let arm_write = slot.output.is_empty();
+            slot.output
+                .extend_from_slice(&(encoded.len() as u32).to_be_bytes());
+            slot.output.extend_from_slice(&encoded);
+            slot.read_buf.drain(..frame_len);
+            if arm_write {
+                if let Some(index) = slot.index {
+                    let _ = file_main.set_data_available_to_write(index, true);
+                }
+            }
+        }
+    }
+
+    /// Closes one client: removes backend interest and the File record, then
+    /// frees the slot for reuse.
+    fn close(&mut self, file_main: &mut FileMain, token: SocketToken) {
+        if let Some(index) = self.slot(token).and_then(|slot| slot.index) {
+            let _ = file_main.delete(index);
+        }
+        self.release(token);
+    }
 }
 
-/// Main Thread owner of the Binary API Unix listener and frame policy.
+/// Main Thread owner of the Binary API Unix listener and frame policy. The
+/// listener's readiness is owned by a FileMain; the `binary-api` Process
+/// Node takes the FileMain over when it starts and drives it with
+/// `AsyncFileMain::next_ready`.
 pub struct BinaryApiMain {
-    listener: StdUnixListener,
+    file_main: ThreadOwned<Option<FileMain>>,
+    listener: Index,
     socket_path: PathBuf,
     socket_device: u64,
     socket_inode: u64,
-    connection: Arc<BinaryApiConnection>,
-}
-
-/// Blocking external client for the Binary API protobuf envelope.
-pub struct BinaryApiClient {
-    stream: StdUnixStream,
-    next_context: u64,
-}
-
-impl BinaryApiClient {
-    pub fn connect(path: impl AsRef<Path>) -> Result<Self, BinaryApiError> {
-        let path = path.as_ref();
-        let stream =
-            StdUnixStream::connect(path).map_err(|source| BinaryApiError::ClientConnect {
-                path: path.to_path_buf(),
-                source,
-            })?;
-        Ok(Self {
-            stream,
-            next_context: 1,
-        })
-    }
-
-    pub fn call(&mut self, method: &str, payload: &[u8]) -> Result<Vec<u8>, BinaryApiError> {
-        let context = self.next_context;
-        self.next_context = self.next_context.wrapping_add(1);
-        let frame = BinaryApiRequest {
-            context,
-            method: method.to_owned(),
-            payload: payload.to_vec(),
-        }
-        .encode_to_vec();
-        if frame.len() > DEFAULT_MAX_FRAME_BYTES {
-            return Err(BinaryApiError::FrameTooLarge {
-                bytes: frame.len(),
-                maximum: DEFAULT_MAX_FRAME_BYTES,
-            });
-        }
-        let frame_bytes = u32::try_from(frame.len()).expect("validated Binary API frame fits u32");
-        self.stream
-            .write_all(&frame_bytes.to_be_bytes())
-            .and_then(|()| self.stream.write_all(&frame))
-            .and_then(|()| self.stream.flush())
-            .map_err(|source| BinaryApiError::ClientWrite {
-                method: method.to_owned(),
-                source,
-            })?;
-
-        let mut reply_length = [0_u8; size_of::<u32>()];
-        self.stream
-            .read_exact(&mut reply_length)
-            .map_err(|source| BinaryApiError::ClientRead {
-                method: method.to_owned(),
-                source,
-            })?;
-        let reply_bytes = u32::from_be_bytes(reply_length) as usize;
-        if reply_bytes > DEFAULT_MAX_FRAME_BYTES {
-            return Err(BinaryApiError::FrameTooLarge {
-                bytes: reply_bytes,
-                maximum: DEFAULT_MAX_FRAME_BYTES,
-            });
-        }
-        let mut frame = vec![0; reply_bytes];
-        self.stream
-            .read_exact(&mut frame)
-            .map_err(|source| BinaryApiError::ClientRead {
-                method: method.to_owned(),
-                source,
-            })?;
-        let reply = BinaryApiReply::decode(frame.as_slice()).map_err(|source| {
-            BinaryApiError::ClientReplyDecode {
-                method: method.to_owned(),
-                source,
-            }
-        })?;
-        if reply.context != context {
-            return Err(BinaryApiError::ClientReplyContext {
-                method: method.to_owned(),
-                expected: context,
-                actual: reply.context,
-            });
-        }
-        let status = BinaryApiStatus::try_from(reply.status).map_err(|_| {
-            BinaryApiError::ClientReplyStatusInvalid {
-                method: method.to_owned(),
-                status: reply.status,
-            }
-        })?;
-        if status != BinaryApiStatus::Ok {
-            return Err(BinaryApiError::ClientRejected {
-                method: method.to_owned(),
-                status,
-            });
-        }
-        Ok(reply.payload)
-    }
-}
-
-struct BinaryApiConnection {
     max_frame_bytes: usize,
-    owner: ThreadId,
-    barrier: Option<WorkerBarrier>,
 }
 
 impl BinaryApiMain {
-    pub fn bind(path: impl AsRef<Path>, max_frame_bytes: usize) -> Result<Self, BinaryApiError> {
+    pub fn bind(
+        path: impl AsRef<Path>,
+        max_frame_bytes: usize,
+    ) -> Result<Self, BinaryApiServerError> {
         if max_frame_bytes == 0 || max_frame_bytes > u32::MAX as usize {
-            return Err(BinaryApiError::FrameSizeInvalid {
+            return Err(BinaryApiServerError::FrameSizeInvalid {
                 bytes: max_frame_bytes,
             });
         }
         let path = path.as_ref();
         if path.as_os_str().is_empty() {
-            return Err(BinaryApiError::SocketPathEmpty);
+            return Err(BinaryApiServerError::SocketPathEmpty);
         }
-        let listener = bind_listener(path).map_err(|source| BinaryApiError::SocketBind {
+        let listener = bind_listener(path).map_err(|source| BinaryApiServerError::SocketBind {
             path: path.to_path_buf(),
             source,
         })?;
-        let metadata = std::fs::metadata(path).map_err(|source| BinaryApiError::SocketBind {
-            path: path.to_path_buf(),
-            source,
-        })?;
-        listener
-            .set_nonblocking(true)
-            .map_err(|source| BinaryApiError::SocketNonblocking { source })?;
+        let metadata =
+            std::fs::metadata(path).map_err(|source| BinaryApiServerError::SocketBind {
+                path: path.to_path_buf(),
+                source,
+            })?;
+        let mut file_main =
+            FileMain::new().map_err(|source| BinaryApiServerError::FileMainCreate { source })?;
+        let listener_index = file_main
+            .add_listener(
+                listener,
+                "binary-api listener",
+                LISTENER_TOKEN,
+                LISTENER_FUNCTIONS,
+            )
+            .map_err(|source| BinaryApiServerError::ListenerRegistration { source })?;
+        let owned = ThreadOwned::new();
+        owned
+            .install(Some(file_main))
+            .map_err(|_| BinaryApiServerError::FileMainNotReady)?;
         Ok(Self {
-            listener,
+            file_main: owned,
+            listener: listener_index,
             socket_path: path.to_path_buf(),
             socket_device: metadata.dev(),
             socket_inode: metadata.ino(),
-            connection: Arc::new(BinaryApiConnection {
-                max_frame_bytes,
-                owner: thread::current().id(),
-                barrier: Engine::with_current(|engine| engine.worker_barrier()),
-            }),
+            max_frame_bytes,
         })
     }
 
-    pub async fn serve(self: Arc<Self>) -> Result<(), BinaryApiError> {
-        self.connection.ensure_main_thread()?;
-        let listener = self
-            .listener
-            .try_clone()
-            .map_err(|source| BinaryApiError::ListenerClone { source })?;
-        let listener = tokio::net::UnixListener::from_std(listener)
-            .map_err(|source| BinaryApiError::ListenerRegistration { source })?;
-        loop {
-            let (stream, _) = listener
-                .accept()
-                .await
-                .map_err(|source| BinaryApiError::Accept { source })?;
-            let connection = Arc::clone(&self.connection);
-            tokio::spawn(async move {
-                if let Err(error) = connection.serve(stream).await {
-                    tracing::warn!(%error, "Binary API connection closed after failure");
-                }
-            });
-        }
-    }
-}
-
-impl BinaryApiConnection {
-    async fn serve(&self, stream: tokio::net::UnixStream) -> Result<(), BinaryApiError> {
-        self.ensure_main_thread()?;
-        let (mut reader, mut writer) = stream.into_split();
-        loop {
-            let Some(frame) = read_frame(&mut reader, self.max_frame_bytes).await? else {
-                return Ok(());
-            };
-            let reply = match BinaryApiRequest::decode(frame.as_slice()) {
-                Ok(request) => self.dispatch(request),
-                Err(_) => reply(0, BinaryApiStatus::InvalidRequest, Vec::new()),
-            };
-            write_frame(&mut writer, &reply.encode_to_vec(), self.max_frame_bytes).await?;
-        }
-    }
-
-    fn ensure_main_thread(&self) -> Result<(), BinaryApiError> {
-        if thread::current().id() == self.owner {
-            Ok(())
-        } else {
-            Err(BinaryApiError::WrongThread)
-        }
-    }
-
-    fn dispatch(&self, request: BinaryApiRequest) -> BinaryApiReply {
-        let Some(barrier) = &self.barrier else {
-            return dispatch_method(request);
-        };
-        if barrier.is_pending() {
-            return dispatch_method(request);
-        }
-        barrier.sync(|| dispatch_method(request))
+    /// Hands the FileMain to the Process Node exactly once. The slot empties,
+    /// so a second node start fails instead of racing.
+    fn take_file_main(&self) -> Result<FileMain, BinaryApiServerError> {
+        self.file_main
+            .with_mut(|slot| slot.take())
+            .map_err(|_| BinaryApiServerError::FileMainNotReady)?
+            .ok_or(BinaryApiServerError::FileMainNotReady)
     }
 }
 
@@ -397,23 +487,71 @@ impl Drop for BinaryApiMain {
     }
 }
 
-fn bind_listener(path: &Path) -> io::Result<StdUnixListener> {
-    match StdUnixListener::bind(path) {
-        Ok(listener) => Ok(listener),
-        Err(bind_error) if bind_error.kind() == io::ErrorKind::AddrInUse => {
-            match StdUnixStream::connect(path) {
-                Ok(_) => Err(bind_error),
-                Err(source) if source.kind() == io::ErrorKind::ConnectionRefused => {
-                    std::fs::remove_file(path)?;
-                    StdUnixListener::bind(path)
-                }
-                Err(source) if source.kind() == io::ErrorKind::NotFound => {
-                    StdUnixListener::bind(path)
-                }
-                Err(_) => Err(bind_error),
-            }
-        }
-        Err(source) => Err(source),
+/// Readiness callback for the listener File: signals the Process Node to
+/// accept. One signal is enough regardless of how many connects are pending.
+fn listener_ready(_graph: &NodeRuntime, file: &mut File) -> RuntimeResult<()> {
+    signal_ready(EVENT_ACCEPT_READY, file)
+}
+
+/// Readiness callback for a client File with readable data or a closed peer.
+fn client_read_ready(_graph: &NodeRuntime, file: &mut File) -> RuntimeResult<()> {
+    signal_ready(EVENT_CLIENT_READ_READY, file)
+}
+
+/// Readiness callback for a client File whose output buffer freed space.
+fn client_write_ready(_graph: &NodeRuntime, file: &mut File) -> RuntimeResult<()> {
+    signal_ready(EVENT_CLIENT_WRITE_READY, file)
+}
+
+/// VPP's `vl_api_clnt_node` signal path: the callback never touches the
+/// client table; it only hands the File's token to the node. Without a live
+/// node (main process shutdown) the readiness is dropped.
+fn signal_ready(event_type: u64, file: &File) -> RuntimeResult<()> {
+    match Engine::with_current(|engine| engine.process_handle(PROCESS_NODE_NAME)) {
+        Some(Some(handle)) => handle.signal(event_type, file.private_data()),
+        _ => Ok(()),
+    }
+}
+
+const LISTENER_FUNCTIONS: FileFunctions = FileFunctions {
+    read: Some(listener_ready),
+    write: None,
+    error: Some(listener_ready),
+};
+
+const CLIENT_FUNCTIONS: FileFunctions = FileFunctions {
+    read: Some(client_read_ready),
+    write: Some(client_write_ready),
+    error: Some(client_read_ready),
+};
+
+#[inline]
+fn output_budget(max_frame_bytes: usize) -> usize {
+    2 * max_frame_bytes
+}
+
+/// Dispatches one request under the worker barrier exactly once per request:
+/// a pending barrier dispatches unlocked (VPP `msg_handler_internal` skips
+/// the barrier while one is already pending), otherwise the handler runs
+/// inside `barrier.sync` with no await while held.
+fn dispatch_barriered(request: BinaryApiRequest) -> BinaryApiReply {
+    let Some(barrier) = Engine::with_current(|engine| engine.worker_barrier()) else {
+        return dispatch_method(request);
+    };
+    if barrier.is_pending() {
+        return dispatch_method(request);
+    }
+    let context = request.context;
+    let method_reply = barrier.sync(|| dispatch_method(request));
+    // VPP `vlib_worker_thread_barrier_release` waits for the refork cohort at
+    // the outermost release (threads.c:1497): a graph publication finished
+    // inside this barrier is drained here, after the workers refork and
+    // before the reply completes. A deferred finish failure crosses the typed
+    // reply/status boundary instead of logging.
+    let deferred = Engine::with_current(|engine| engine.finish_deferred_worker_graph_update());
+    match deferred {
+        Some(Err(_)) => reply(context, BinaryApiStatus::Internal, Vec::new()),
+        _ => method_reply,
     }
 }
 
@@ -451,51 +589,24 @@ fn reply(context: u64, status: BinaryApiStatus, payload: Vec<u8>) -> BinaryApiRe
     }
 }
 
-async fn read_frame(
-    reader: &mut (impl AsyncRead + Unpin),
-    maximum: usize,
-) -> Result<Option<Vec<u8>>, BinaryApiError> {
-    let mut length = [0_u8; size_of::<u32>()];
-    match reader.read_exact(&mut length).await {
-        Ok(_) => {}
-        Err(source) if source.kind() == io::ErrorKind::UnexpectedEof => return Ok(None),
-        Err(source) => return Err(BinaryApiError::FrameRead { source }),
+fn bind_listener(path: &Path) -> io::Result<StdUnixListener> {
+    match StdUnixListener::bind(path) {
+        Ok(listener) => Ok(listener),
+        Err(bind_error) if bind_error.kind() == io::ErrorKind::AddrInUse => {
+            match StdUnixStream::connect(path) {
+                Ok(_) => Err(bind_error),
+                Err(source) if source.kind() == io::ErrorKind::ConnectionRefused => {
+                    std::fs::remove_file(path)?;
+                    StdUnixListener::bind(path)
+                }
+                Err(source) if source.kind() == io::ErrorKind::NotFound => {
+                    StdUnixListener::bind(path)
+                }
+                Err(_) => Err(bind_error),
+            }
+        }
+        Err(source) => Err(source),
     }
-    let bytes = u32::from_be_bytes(length) as usize;
-    if bytes > maximum {
-        return Err(BinaryApiError::FrameTooLarge { bytes, maximum });
-    }
-    let mut frame = vec![0; bytes];
-    reader
-        .read_exact(&mut frame)
-        .await
-        .map_err(|source| BinaryApiError::FrameRead { source })?;
-    Ok(Some(frame))
-}
-
-async fn write_frame(
-    writer: &mut (impl AsyncWrite + Unpin),
-    frame: &[u8],
-    maximum: usize,
-) -> Result<(), BinaryApiError> {
-    if frame.len() > maximum {
-        return Err(BinaryApiError::FrameTooLarge {
-            bytes: frame.len(),
-            maximum,
-        });
-    }
-    writer
-        .write_all(&(frame.len() as u32).to_be_bytes())
-        .await
-        .map_err(|source| BinaryApiError::FrameWrite { source })?;
-    writer
-        .write_all(frame)
-        .await
-        .map_err(|source| BinaryApiError::FrameWrite { source })?;
-    writer
-        .flush()
-        .await
-        .map_err(|source| BinaryApiError::FrameWrite { source })
 }
 
 #[hammer_component_macros::config_function(
@@ -517,4 +628,71 @@ fn init(config: Arc<Config>) -> RuntimeResult<Option<Arc<BinaryApiMain>>> {
         .map(Arc::new)
         .map(Some)
         .map_err(RuntimeError::from)
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize)]
+#[serde(default, deny_unknown_fields)]
+struct Config {
+    socket_path: Option<String>,
+    max_frame_bytes: usize,
+}
+
+impl Default for Config {
+    fn default() -> Self {
+        Self {
+            socket_path: None,
+            max_frame_bytes: hammer_ipc::binary_api::DEFAULT_MAX_FRAME_BYTES,
+        }
+    }
+}
+
+impl Config {
+    fn validate(&self) -> Result<(), BinaryApiServerError> {
+        if self
+            .socket_path
+            .as_ref()
+            .is_some_and(|path| path.trim().is_empty())
+        {
+            return Err(BinaryApiServerError::SocketPathEmpty);
+        }
+        if self.max_frame_bytes == 0 || self.max_frame_bytes > u32::MAX as usize {
+            return Err(BinaryApiServerError::FrameSizeInvalid {
+                bytes: self.max_frame_bytes,
+            });
+        }
+        Ok(())
+    }
+}
+
+#[hammer_component_macros::process_node(name = "binary-api")]
+async fn binary_api_clnt(mut context: ProcessContext) -> RuntimeResult<()> {
+    // VPP `vl_api_clnt_node`: FileMain readiness callbacks signal this node;
+    // the node consumes the batches and performs accept/read/write/dispatch.
+    let capability = context.require::<BinaryApiMain>()?;
+    let file_main = capability.take_file_main()?;
+    let graph = context.data_plane_runtime().nodes().clone();
+    let mut async_file_main = file_main.into_async()?;
+    let mut table = ClientTable::new(capability.listener);
+    let max_frame_bytes = capability.max_frame_bytes;
+    loop {
+        // One poll per iteration (VPP `vl_api_clnt_node` polls once per main
+        // loop turn): readiness is level-triggered, so re-polling until zero
+        // would re-dispatch a pending listener forever and starve the drain
+        // below. The drain empties every batch the callbacks signalled.
+        let _ = async_file_main.next_ready(&graph).await?;
+        // Drain every event batch signalled by the callback round.
+        loop {
+            match context.wait_for_event_or_clock(Duration::ZERO).await {
+                ProcessWake::Clock => break,
+                ProcessWake::Event(batch) => {
+                    table.process_event(
+                        async_file_main.file_main_mut(),
+                        batch.event_type(),
+                        batch.data(),
+                        max_frame_bytes,
+                    )?;
+                }
+            }
+        }
+    }
 }

@@ -1,8 +1,14 @@
 //! hammerctl — CLI client for hammer daemon
 
+use std::path::PathBuf;
+use std::process::ExitCode;
+
 use clap::{Parser, Subcommand};
-use hammer_ipc::{IpcResponse, PluginCommandError, PluginCommandReply};
-use tokio::net::TcpStream;
+use hammer_ipc::binary_api::BinaryApiClient;
+
+/// Default Binary API Unix socket path, matching the convention documented
+/// in the example daemon config (`examples/tun-tcp-echo.toml`).
+const DEFAULT_SOCKET: &str = "/tmp/hammer-tcp-integration.binary-api.sock";
 
 #[derive(Parser, Debug)]
 #[command(
@@ -11,9 +17,9 @@ use tokio::net::TcpStream;
     about = "hammerctl — CLI for hammer daemon"
 )]
 struct Cli {
-    /// IPC TCP address
-    #[arg(long = "addr", default_value = "127.0.0.1:7299", global = true)]
-    addr: String,
+    /// Binary API Unix socket path
+    #[arg(long = "socket", default_value = DEFAULT_SOCKET, global = true)]
+    socket: PathBuf,
 
     #[command(subcommand)]
     cmd: Command,
@@ -21,195 +27,61 @@ struct Cli {
 
 #[derive(Subcommand, Debug)]
 enum Command {
-    /// Pause the dataplane
-    Pause,
-    /// Wake the dataplane
-    Wake,
-    /// Reset network state
-    #[command(name = "reset-network")]
-    ResetNetwork,
-    /// Shutdown the daemon
-    Shutdown,
-    /// Get runtime status
-    Status,
-    /// Inspect or add runtime plugins
-    Plugin {
-        #[command(subcommand)]
-        command: PluginCommand,
-    },
-    /// Send a raw IPC command
+    /// Send one Binary API request and print the reply
     Send {
-        /// Handler name
-        name: String,
-        /// Payload as hex string
+        /// Binary API method name
+        method: String,
+        /// Request payload as hex; omitted or empty sends an empty payload
         #[arg(default_value = "")]
-        payload: String,
+        payload_hex: String,
     },
 }
 
-#[derive(Subcommand, Debug)]
-enum PluginCommand {
-    /// List activated plugins in load order
-    List,
-    /// Add plugin roots and their missing dependencies
-    Load {
-        /// Plugin root names
-        #[arg(required = true)]
-        roots: Vec<String>,
-    },
-}
-
-fn main() {
+fn main() -> ExitCode {
     hammer_infra::main_heap::init_default().unwrap_or_else(|error| {
         eprintln!("Failed to initialize main heap: {error}");
         std::process::exit(1);
     });
-    let runtime = tokio::runtime::Builder::new_current_thread()
-        .enable_io()
-        .build()
-        .unwrap_or_else(|error| {
-            eprintln!("Failed to initialize Tokio runtime: {error}");
-            std::process::exit(1);
-        });
-    runtime.block_on(run());
-}
-
-async fn run() {
     let cli = Cli::parse();
-
-    let mut stream = match TcpStream::connect(&cli.addr).await {
-        Ok(s) => s,
-        Err(e) => {
-            eprintln!("Failed to connect to {}: {e}", cli.addr);
-            std::process::exit(1);
+    let Command::Send {
+        method,
+        payload_hex,
+    } = &cli.cmd;
+    let payload = match decode_payload(payload_hex) {
+        Ok(payload) => payload,
+        Err(error) => {
+            eprintln!("Invalid hex payload: {error}");
+            return ExitCode::FAILURE;
         }
     };
-
-    let expects_plugin_reply = matches!(&cli.cmd, Command::Plugin { .. });
-    let (name, payload): (&str, Vec<u8>) = match &cli.cmd {
-        Command::Pause => ("pause", Vec::new()),
-        Command::Wake => ("wake", Vec::new()),
-        Command::ResetNetwork => ("reset_network", Vec::new()),
-        Command::Shutdown => ("shutdown", Vec::new()),
-        Command::Status => ("status", Vec::new()),
-        Command::Plugin {
-            command: PluginCommand::List,
-        } => ("plugin_list", Vec::new()),
-        Command::Plugin {
-            command: PluginCommand::Load { roots },
-        } => {
-            let encoded = match bincode::serialize(roots) {
-                Ok(encoded) => encoded,
-                Err(_) => {
-                    eprintln!("Failed to encode plugin roots");
-                    std::process::exit(1);
-                }
-            };
-            ("plugin_load", Vec::from(encoded))
-        }
-        Command::Send { name, payload } => {
-            let bytes = if payload.is_empty() {
-                Vec::new()
-            } else {
-                Vec::from(hex::decode(payload).unwrap_or_else(|e| {
-                    eprintln!("Invalid hex payload: {e}");
-                    std::process::exit(1);
-                }))
-            };
-            (name.as_str(), bytes)
+    let mut client = match BinaryApiClient::connect(&cli.socket) {
+        Ok(client) => client,
+        Err(error) => {
+            eprintln!("Failed to {error}");
+            return ExitCode::FAILURE;
         }
     };
-
-    let request = hammer_ipc::handler::IpcRequest {
-        name: name.to_string(),
-        payload,
-    };
-
-    let data = bincode::serialize(&request).unwrap_or_else(|e| {
-        eprintln!("Serialize error: {e}");
-        std::process::exit(1);
-    });
-
-    hammer_ipc::frame::async_write_frame(&mut stream, &data)
-        .await
-        .unwrap_or_else(|e| {
-            eprintln!("Write error: {e}");
-            std::process::exit(1);
-        });
-
-    let mut buf = vec![0u8; 65536];
-    match hammer_ipc::frame::async_read_frame(&mut stream, &mut buf).await {
-        Ok(Some(data)) => {
-            let response: IpcResponse = match bincode::deserialize(&data) {
-                Ok(response) => response,
-                Err(_) => {
-                    eprintln!("Invalid daemon response");
-                    std::process::exit(1);
-                }
-            };
-            if expects_plugin_reply {
-                print_plugin_reply(&response.payload);
-            } else if response.payload.is_empty() {
-                println!("OK");
-            } else {
-                match std::str::from_utf8(&response.payload) {
-                    Ok(s) => println!("{s}"),
-                    Err(_) => println!("<binary response, {} bytes>", response.payload.len()),
-                }
-            }
-        }
-        Ok(None) => {
-            eprintln!("Connection closed by server");
-            std::process::exit(1);
-        }
-        Err(e) => {
-            eprintln!("Read error: {e}");
-            std::process::exit(1);
+    match client.call(method, &payload) {
+        Ok(reply) => println!("{}", format_reply(&reply)),
+        Err(error) => {
+            eprintln!("Binary API call `{method}` failed: {error}");
+            return ExitCode::FAILURE;
         }
     }
+    ExitCode::SUCCESS
 }
 
-fn print_plugin_reply(payload: &[u8]) {
-    let reply: PluginCommandReply<'_> = match bincode::deserialize(payload) {
-        Ok(reply) => reply,
-        Err(_) => {
-            eprintln!("Invalid plugin response");
-            std::process::exit(1);
-        }
-    };
-    match reply {
-        PluginCommandReply::Loaded(names) => {
-            for name in names {
-                println!("{name}");
-            }
-        }
-        PluginCommandReply::Error(error) => {
-            eprintln!("{}", plugin_command_error_message(error));
-            std::process::exit(1);
-        }
+fn decode_payload(payload_hex: &str) -> Result<Vec<u8>, hex::FromHexError> {
+    if payload_hex.is_empty() {
+        return Ok(Vec::new());
     }
+    hex::decode(payload_hex)
 }
 
-fn plugin_command_error_message(error: PluginCommandError) -> &'static str {
-    match error {
-        PluginCommandError::InvalidRequest => "invalid plugin request",
-        PluginCommandError::MemoryNotInitialized => "runtime memory is not initialized",
-        PluginCommandError::DuplicateRoot => "plugin root was requested more than once",
-        PluginCommandError::DependencyCycle => "plugin dependency cycle",
-        PluginCommandError::HostVersionInvalid => "invalid host plugin version",
-        PluginCommandError::RequiredVersionInvalid => "invalid required plugin version",
-        PluginCommandError::VersionMismatch => "plugin version requirement is not satisfied",
-        PluginCommandError::LibraryOpen => "plugin library could not be opened",
-        PluginCommandError::RootModule => "plugin root module is unavailable or incompatible",
-        PluginCommandError::ModuleNameMismatch => "plugin module name mismatch",
-        PluginCommandError::ExecutablePath => "daemon executable path is unavailable",
-        PluginCommandError::ExecutableParentMissing => "daemon executable has no plugin directory",
-        PluginCommandError::Configuration => "plugin configuration failed",
-        PluginCommandError::GraphMaterialization => "plugin graph materialization failed",
-        PluginCommandError::WorkerCountOverflow => "configured worker count is unsupported",
-        PluginCommandError::WorkerGraphUpdatePending => "worker graph update is already pending",
-        PluginCommandError::WorkerGraphUpdate => "worker graph update failed",
-        PluginCommandError::Lifecycle => "plugin lifecycle failed",
+fn format_reply(payload: &[u8]) -> String {
+    match std::str::from_utf8(payload) {
+        Ok(text) => text.to_owned(),
+        Err(_) => format!("<binary response, {} bytes>", payload.len()),
     }
 }
 
@@ -218,22 +90,49 @@ mod tests {
     use super::*;
 
     #[test]
-    fn parses_nested_plugin_commands() {
-        let list = Cli::try_parse_from(["hammerctl", "plugin", "list"]).expect("plugin list");
-        assert!(matches!(
-            list.cmd,
-            Command::Plugin {
-                command: PluginCommand::List
-            }
-        ));
+    fn parses_generic_send_with_optional_hex_payload() {
+        let bare = Cli::try_parse_from(["hammerctl", "send", "show_version"]).expect("send");
+        let Command::Send {
+            method,
+            payload_hex,
+        } = bare.cmd;
+        assert_eq!(method, "show_version");
+        assert_eq!(payload_hex, "");
 
-        let load = Cli::try_parse_from(["hammerctl", "plugin", "load", "tcp", "udp"])
-            .expect("plugin load");
-        assert!(matches!(
-            load.cmd,
-            Command::Plugin {
-                command: PluginCommand::Load { roots }
-            } if roots.as_slice() == ["tcp", "udp"]
-        ));
+        let hex = Cli::try_parse_from(["hammerctl", "send", "method", "00ff10"]).expect("send");
+        let Command::Send {
+            method,
+            payload_hex,
+        } = hex.cmd;
+        assert_eq!(method, "method");
+        assert_eq!(payload_hex, "00ff10");
+    }
+
+    #[test]
+    fn socket_flag_is_global() {
+        let before = Cli::try_parse_from(["hammerctl", "--socket", "/tmp/a.sock", "send", "m"])
+            .expect("socket before subcommand");
+        assert_eq!(before.socket, PathBuf::from("/tmp/a.sock"));
+
+        let after = Cli::try_parse_from(["hammerctl", "send", "m", "--socket", "/tmp/b.sock"])
+            .expect("socket after subcommand");
+        assert_eq!(after.socket, PathBuf::from("/tmp/b.sock"));
+
+        let default = Cli::try_parse_from(["hammerctl", "send", "m"]).expect("default socket");
+        assert_eq!(default.socket, PathBuf::from(DEFAULT_SOCKET));
+    }
+
+    #[test]
+    fn decodes_empty_and_hex_payloads() {
+        assert_eq!(decode_payload("").unwrap(), Vec::<u8>::new());
+        assert_eq!(decode_payload("00ff10").unwrap(), vec![0x00, 0xff, 0x10]);
+        assert!(decode_payload("zz").is_err());
+    }
+
+    #[test]
+    fn formats_utf8_reply_and_binary_byte_count() {
+        assert_eq!(format_reply(b"hello"), "hello");
+        assert_eq!(format_reply(b"\xff\x00"), "<binary response, 2 bytes>");
+        assert_eq!(format_reply(b""), "");
     }
 }

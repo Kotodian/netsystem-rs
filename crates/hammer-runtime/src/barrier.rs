@@ -104,6 +104,14 @@ impl WorkerBarrier {
         self.state.wait.load(Ordering::Acquire) != 0
     }
 
+    /// Number of nested syncs currently held on the main thread (VPP
+    /// `vlib_worker_thread_barrier_sync` recursion count). Workers are parked
+    /// while non-zero, so nested code must not wait for worker progress.
+    #[inline]
+    pub(crate) fn recursion_level(&self) -> u32 {
+        self.state.wait.load(Ordering::Acquire)
+    }
+
     /// Acknowledges an armed barrier and waits for release.
     pub(crate) fn check(&self) {
         if !self.is_pending() {

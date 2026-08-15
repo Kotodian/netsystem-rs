@@ -190,6 +190,10 @@ pub struct Engine {
     materialized_registration_generation: u64,
     publication: Arc<WorkerPublication>,
     pub(crate) workers_updating_graph: Arc<AtomicU32>,
+    // VPP `need_vlib_worker_thread_node_runtime_update`: set when a graph
+    // publication finishes inside an outer barrier and the refork drain is
+    // deferred to the outermost barrier owner (Binary API dispatch).
+    deferred_finish_pending: AtomicBool,
     main_loop_exit_functions_called: bool,
     worker_threads: Vec<JoinHandle<RuntimeResult<()>>>,
     worker_control_queues: Arc<[DataRemoteLocalQueue]>,
@@ -237,6 +241,7 @@ impl Engine {
             materialized_registration_generation: 0,
             publication,
             workers_updating_graph,
+            deferred_finish_pending: AtomicBool::new(false),
             main_loop_exit_functions_called: false,
             worker_threads: Vec::new(),
             worker_control_queues: Arc::from([]),
@@ -270,6 +275,7 @@ impl Engine {
             materialized_registration_generation: 0,
             publication: Arc::new(WorkerPublication::new(0)),
             workers_updating_graph: Arc::new(AtomicU32::new(0)),
+            deferred_finish_pending: AtomicBool::new(false),
             main_loop_exit_functions_called: false,
             worker_threads: Vec::new(),
             worker_control_queues: Arc::from([]),
@@ -396,6 +402,34 @@ impl Engine {
     }
 
     fn finish_worker_graph_update(&self) -> RuntimeResult<()> {
+        // VPP recursive barrier semantics: when this load nests inside an
+        // outer barrier (Binary API dispatch), the workers are parked and can
+        // only refork at the outer release; they apply the pending update
+        // then. Record the finish as deferred and let the outermost barrier
+        // owner drain it after release
+        // (`finish_deferred_worker_graph_update`).
+        if self.barrier.recursion_level() != 0 {
+            self.deferred_finish_pending.store(true, Ordering::Release);
+            return Ok(());
+        }
+        self.drain_worker_graph_update()
+    }
+
+    /// Drains a graph publication whose finish was deferred by a nested
+    /// barrier (VPP `need_vlib_worker_thread_node_runtime_update` is applied
+    /// at the outermost `vlib_worker_thread_barrier_release`). The Binary API
+    /// dispatch owner calls this immediately after its outer
+    /// `WorkerBarrier::sync` releases, before the reply completes: it waits
+    /// for every worker refork, drains each worker's refork error exactly
+    /// once, and clears the deferred-finish record.
+    pub fn finish_deferred_worker_graph_update(&self) -> RuntimeResult<()> {
+        if !self.deferred_finish_pending.swap(false, Ordering::AcqRel) {
+            return Ok(());
+        }
+        self.drain_worker_graph_update()
+    }
+
+    fn drain_worker_graph_update(&self) -> RuntimeResult<()> {
         while self.workers_updating_graph.load(Ordering::Acquire) != 0 {
             spin_loop();
         }
@@ -406,19 +440,23 @@ impl Engine {
             return Err(RuntimeError::WorkerGraphUpdateMissing);
         }
 
-        let mut graph_update_error = None;
+        let mut failures = Vec::new();
         for worker in 0..self.publication.worker_count() {
             // SAFETY: the refork completion count is zero, so the worker that
             // owns this slot can no longer read or write it.
             if let Some(error) = unsafe { self.publication.take_graph_error(worker) } {
-                if graph_update_error.is_none() {
-                    graph_update_error = Some(error);
-                } else {
-                    tracing::error!(worker, %error, "additional worker graph update failed");
-                }
+                failures.push((worker, error));
             }
         }
-        graph_update_error.map_or(Ok(()), Err)
+        if failures.is_empty() {
+            Ok(())
+        } else {
+            // VPP waits for the refork cohort at the outermost release
+            // (threads.c:1497); every worker failure is delivered to the owner
+            // as one typed aggregate, exactly once, and never logged in
+            // synchronization code.
+            Err(RuntimeError::WorkerGraphUpdate { failures })
+        }
     }
 
     pub(crate) fn refork_worker_graph(&mut self) -> bool {
@@ -927,6 +965,7 @@ pub(crate) fn thread_panic_message(payload: Box<dyn std::any::Any + Send>) -> St
 mod tests {
     use super::*;
     use crate::DataPlaneBufferConfig;
+    use crate::start_workers::start_workers;
     use hammer_runtime::RuntimeRegistry;
     use hammer_runtime::{DataPlaneRuntime, DataPlaneRuntimeConfig};
     use std::sync::Arc;
@@ -1093,5 +1132,127 @@ mod tests {
         Engine::uninstall_current();
         let result = Engine::with_current(|_| true);
         assert_eq!(result, None);
+    }
+
+    // VPP `need_vlib_worker_thread_node_runtime_update`: a graph publication
+    // finished inside an outer barrier defers its refork drain to the
+    // outermost release. Both tests use real Data Workers that can refork only
+    // after the outer barrier releases, so the shared statics serialize.
+    static DEFERRED_FINISH_SERIAL: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    static FAIL_WORKER_REFORK: AtomicBool = AtomicBool::new(false);
+
+    #[hammer_component_macros::worker_init_function(name = "injected_refork_failure")]
+    fn injected_refork_failure(_: &mut Engine) -> RuntimeResult<()> {
+        if FAIL_WORKER_REFORK.load(Ordering::Acquire) {
+            return Err(RuntimeError::lifecycle(
+                "injected worker refork failure".to_string(),
+                "test injection".to_string(),
+            ));
+        }
+        Ok(())
+    }
+
+    crate::__declare_registration_image!(
+        init_functions = [];
+        config_functions = [];
+        early_config_functions = [];
+        main_loop_enter_functions = [];
+        main_loop_exit_functions = [];
+        worker_init_functions = [__INIT_FN_INJECTED_REFORK_FAILURE];
+        graph_nodes = [];
+        node_functions = [];
+        process_nodes = [];
+        session_transports = [];
+        session_apps = [];
+        binary_api_methods = [];
+    );
+
+    fn deferred_finish_pool() -> EnginePool {
+        let mut worker = Worker::default();
+        worker.count = 2;
+        worker.buffer.slot_bytes = 128;
+        worker.buffer.slots_per_numa = 64;
+        worker.buffer.frame_pool_size = 5;
+        worker.buffer.page_size = Some(hammer_infra::PageSize::Default);
+        EnginePool::new(
+            Engine::new_configured(RuntimeRegistry::new(), worker).expect("configured main engine"),
+        )
+    }
+
+    #[test]
+    fn nested_graph_finish_defers_to_outer_barrier_release_and_drains_once() {
+        let _serial = DEFERRED_FINISH_SERIAL
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let mut pool = deferred_finish_pool();
+        start_workers(pool.main_engine_mut()).expect("worker startup");
+
+        let engine = pool.main_engine();
+        let outer = engine.worker_barrier();
+        let nested = outer.sync(|| -> RuntimeResult<()> {
+            engine.publish_worker_graph(outer.worker_count())?;
+            engine.finish_worker_graph_update()?;
+            // Workers are parked by the outer barrier, so the nested finish
+            // must not wait for the refork completion count: it returns with
+            // the publication still pending.
+            assert_eq!(engine.workers_updating_graph.load(Ordering::Acquire), 2);
+            Ok(())
+        });
+        nested.expect("nested finish returns without waiting for parked workers");
+
+        // The outer release lets the workers refork; the deferred finish then
+        // waits for the cohort, drains once, and clears the pending record.
+        engine
+            .finish_deferred_worker_graph_update()
+            .expect("deferred finish waits for refork completion");
+        assert_eq!(engine.workers_updating_graph.load(Ordering::Acquire), 0);
+        engine
+            .finish_deferred_worker_graph_update()
+            .expect("repeat deferred finish is a no-op");
+
+        // `EnginePool::close` parks the workers, sets the exit flag inside the
+        // barrier, and joins: setting `main_loop_exit` before the sync would
+        // let the workers observe it at step 8 and exit before parking.
+        pool.close().expect("close worker pool");
+    }
+
+    #[test]
+    fn deferred_finish_drains_worker_refork_error_once_and_clears_state() {
+        let _serial = DEFERRED_FINISH_SERIAL
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        FAIL_WORKER_REFORK.store(false, Ordering::Release);
+        let mut pool = deferred_finish_pool();
+        start_workers(pool.main_engine_mut()).expect("worker startup");
+        // Register the failing init only after startup, so each worker's
+        // already-called set does not skip it during the deferred refork.
+        pool.main_engine_mut()
+            .plugin_main_mut()
+            .register_builtin_image(&__HAMMER_REGISTRATION_IMAGE);
+        FAIL_WORKER_REFORK.store(true, Ordering::Release);
+
+        let engine = pool.main_engine();
+        let outer = engine.worker_barrier();
+        outer
+            .sync(|| -> RuntimeResult<()> {
+                engine.publish_worker_graph(outer.worker_count())?;
+                engine.finish_worker_graph_update()?;
+                Ok(())
+            })
+            .expect("nested graph publication finishes without waiting");
+
+        // The deferred finish surfaces the refork error instead of reporting
+        // success, and clears the pending record: a repeat call is a no-op.
+        engine
+            .finish_deferred_worker_graph_update()
+            .expect_err("deferred finish surfaces the worker refork error");
+        engine
+            .finish_deferred_worker_graph_update()
+            .expect("pending state clears after the deferred drain");
+
+        // The failed refork made both workers exit; join directly instead of
+        // syncing the barrier with no workers parked.
+        pool.main_engine_mut().join_worker_threads().ok();
+        FAIL_WORKER_REFORK.store(false, Ordering::Release);
     }
 }

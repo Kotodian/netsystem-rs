@@ -34,6 +34,11 @@ pub enum RuntimeError {
         #[source]
         source: std::io::Error,
     },
+    #[error("accept on File descriptor")]
+    FileAccept {
+        #[source]
+        source: std::io::Error,
+    },
     #[error("File poller does not support required operation `{operation}`")]
     FilePollerOperationUnsupported { operation: &'static str },
     #[error("File poller completion queue is full while {operation}")]
@@ -62,6 +67,10 @@ pub enum RuntimeError {
     WorkerGraphUpdateStatePoisoned,
     #[error("worker graph update is not additive")]
     WorkerGraphUpdateNotAdditive,
+    #[error("worker graph update failed for {failures:?}")]
+    WorkerGraphUpdate {
+        failures: Vec<(usize, RuntimeError)>,
+    },
     #[error("plugin `{plugin}` state is not initialized")]
     PluginStateNotInitialized { plugin: &'static str },
     #[error("thread {thread_index} is not a data worker")]

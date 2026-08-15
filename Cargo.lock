@@ -1007,14 +1007,12 @@ dependencies = [
 name = "hammer"
 version = "0.1.0"
 dependencies = [
- "bincode",
  "clap",
  "core_affinity",
  "hammer-app",
  "hammer-component-macros",
  "hammer-core",
  "hammer-infra",
- "hammer-ipc",
  "hammer-plugin-ip",
  "hammer-plugin-tcp",
  "hammer-plugin-tun",
@@ -1024,7 +1022,6 @@ dependencies = [
  "ipnet",
  "libc",
  "libloading 0.8.9",
- "linkme",
  "prost",
  "serde",
  "thiserror 2.0.18",
@@ -1086,15 +1083,8 @@ dependencies = [
 name = "hammer-ipc"
 version = "0.1.0"
 dependencies = [
- "bincode",
- "hammer-core",
- "hammer-infra",
- "hammer-runtime",
- "libc",
- "linkme",
- "serde",
+ "prost",
  "thiserror 2.0.18",
- "tokio",
 ]
 
 [[package]]
@@ -1276,6 +1266,7 @@ dependencies = [
  "hammer-component-macros",
  "hammer-core",
  "hammer-infra",
+ "hammer-ipc",
  "hammer-runtime",
  "humantime-serde",
  "ipnet",
@@ -1307,12 +1298,10 @@ dependencies = [
 name = "hammerctl"
 version = "0.1.0"
 dependencies = [
- "bincode",
  "clap",
  "hammer-infra",
  "hammer-ipc",
  "hex",
- "tokio",
 ]
 
 [[package]]

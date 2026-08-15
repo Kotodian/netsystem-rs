@@ -1,6 +1,5 @@
 //! hammer — VPP-clone daemon
 
-use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::OnceLock;
@@ -15,9 +14,6 @@ use hammer_runtime::{RuntimeError, RuntimeResult};
 // Shared device/interface/transport/session infrastructure contributes host
 // builtins; loadable protocol and device-driver code comes only from DSOs.
 use hammer_service as _;
-
-mod ipc_handlers;
-mod ipc_loop;
 
 static STARTUP_CONFIG_PATH: OnceLock<PathBuf> = OnceLock::new();
 
@@ -177,13 +173,6 @@ fn run(config: String, roots: Vec<String>, worker: Worker) {
         .enable_time()
         .build()
         .expect("build tokio runtime");
-    let listener = {
-        let enter = rt.enter();
-        let listener = bind_ipc_socket();
-        drop(enter);
-        listener
-    };
-    pool.set_ipc_listener(listener);
 
     let pool_engine = pool.main_engine_mut();
     pool_engine
@@ -195,17 +184,17 @@ fn run(config: String, roots: Vec<String>, worker: Worker) {
     });
     drop(config);
 
-    let listener = pool.take_ipc_listener().expect("IPC listener configured");
     let attach_server = registry.get::<AppServer>();
-    let binary_api = registry.get::<hammer_service::binary_api::BinaryApiMain>();
     let applications = registry.get::<hammer_service::session::ApplicationMain>();
     let sessions = registry.get::<hammer_service::session::runtime::SessionMain>();
 
     tracing::info!("hammer started");
 
+    // The `binary-api` Process Node serves the Binary API socket; it runs as
+    // a registered Process Node, not as a control-loop select arm.
     pool.main_engine().run_processes_until(&rt, async move {
-        match (attach_server, binary_api) {
-            (Some(attach), Some(binary_api)) => {
+        match attach_server {
+            Some(attach) => {
                 let attach_applications = applications
                     .as_ref()
                     .cloned()
@@ -216,9 +205,8 @@ fn run(config: String, roots: Vec<String>, worker: Worker) {
                     .as_ref()
                     .cloned()
                     .expect("Session Main is initialized with attach server");
-                tokio::select! {
-                    () = ipc_loop::clnt_loop(listener) => {}
-                    result = attach.serve(
+                if let Err(error) = attach
+                    .serve(
                         move || attach_applications.attach_external_with_runtime(),
                         move |application| {
                             publish_applications.application_mq_publication(application)
@@ -237,68 +225,13 @@ fn run(config: String, roots: Vec<String>, worker: Worker) {
                                 tracing::error!(%error, ?application, "failed to detach Application after attach connection closed");
                             }
                         },
-                    ) => {
-                        if let Err(error) = result {
-                            tracing::error!(%error, "application attach server failed");
-                        }
-                    }
-                    result = binary_api.serve() => {
-                        if let Err(error) = result {
-                            tracing::error!(%error, "Binary API server failed");
-                        }
-                    }
+                    )
+                    .await
+                {
+                    tracing::error!(%error, "application attach server failed");
                 }
             }
-            (Some(attach), None) => {
-                let attach_applications = applications
-                    .as_ref()
-                    .cloned()
-                    .expect("Application Main is initialized with attach server");
-                let publish_applications = Arc::clone(&attach_applications);
-                let detach_applications = Arc::clone(&attach_applications);
-                let control_sessions = sessions
-                    .as_ref()
-                    .cloned()
-                    .expect("Session Main is initialized with attach server");
-                tokio::select! {
-                    () = ipc_loop::clnt_loop(listener) => {}
-                    result = attach.serve(
-                        move || attach_applications.attach_external_with_runtime(),
-                        move |application| {
-                            publish_applications.application_mq_publication(application)
-                        },
-                        move |application, requests, replies| {
-                            control_sessions.dispatch_application_session_mq(
-                                application,
-                                requests,
-                                replies,
-                            )
-                        },
-                        move |application| {
-                            if detach_applications.contains(application).unwrap_or(false)
-                                && let Err(error) = detach_applications.detach(application)
-                            {
-                                tracing::error!(%error, ?application, "failed to detach Application after attach connection closed");
-                            }
-                        },
-                    ) => {
-                        if let Err(error) = result {
-                            tracing::error!(%error, "application attach server failed");
-                        }
-                    }
-                }
-            }
-            (None, Some(binary_api)) => {
-                tokio::select! {
-                    () = ipc_loop::clnt_loop(listener) => {}
-                    result = binary_api.serve() => {
-                        if let Err(error) = result {
-                            tracing::error!(%error, "Binary API server failed");
-                        }
-                    }
-                }
-            }
-            (None, None) => ipc_loop::clnt_loop(listener).await,
+            None => std::future::pending::<()>().await,
         }
     });
 
@@ -332,26 +265,6 @@ pub(crate) fn load_current_config() -> std::io::Result<String> {
         .get()
         .ok_or_else(|| std::io::Error::other(StartupConfigPathUnset))?;
     read_config(path)
-}
-
-fn bind_ipc_socket() -> tokio::net::TcpListener {
-    let addr = std::env::var("HAMMER_IPC_ADDR").unwrap_or_else(|_| "127.0.0.1:7299".to_string());
-    let sock_addr: SocketAddr = addr.parse().unwrap_or_else(|e| {
-        eprintln!("Invalid IPC address {addr}: {e}");
-        std::process::exit(1);
-    });
-    let listener = std::net::TcpListener::bind(sock_addr).unwrap_or_else(|e| {
-        eprintln!("Failed to bind IPC {sock_addr}: {e}");
-        std::process::exit(1);
-    });
-    listener.set_nonblocking(true).unwrap_or_else(|e| {
-        eprintln!("Failed to set nonblocking: {e}");
-        std::process::exit(1);
-    });
-    tokio::net::TcpListener::from_std(listener).unwrap_or_else(|e| {
-        eprintln!("Failed to create tokio listener: {e}");
-        std::process::exit(1);
-    })
 }
 
 #[cfg(test)]
