@@ -19,7 +19,6 @@ path = "../../examples/tun/tls_echo.rs"
 [dependencies]
 hammer-runtime = { path = "../hammer-runtime" }
 hammer-infra = { path = "../hammer-infra" }
-hammer-ipc = { path = "../hammer-ipc" }
 hammer-service = { path = "../hammer-service" }
 hammer-core = { path = "../hammer-core" }
 hammer-component-macros = { path = "../hammer-component-macros" }
@@ -29,8 +28,6 @@ toml = { workspace = true }
 serde = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
-bincode = { workspace = true }
-linkme = { workspace = true }
 libloading = { workspace = true }
 thiserror = { workspace = true }
 
