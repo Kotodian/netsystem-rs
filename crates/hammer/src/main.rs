@@ -203,7 +203,7 @@ fn run(config: String, roots: Vec<String>, worker: Worker) {
 
     tracing::info!("hammer started");
 
-    rt.block_on(async move {
+    pool.main_engine().run_processes_until(&rt, async move {
         match (attach_server, binary_api) {
             (Some(attach), Some(binary_api)) => {
                 let attach_applications = applications
