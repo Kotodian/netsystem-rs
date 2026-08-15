@@ -5,9 +5,14 @@
 //! descriptor I/O. Device queues own packet and queue semantics.
 
 use std::fmt;
-use std::io;
-use std::os::fd::{AsRawFd, OwnedFd, RawFd};
+use std::io::{self, Read};
+use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
+use std::os::unix::net::{UnixListener, UnixStream};
 use std::time::Duration;
+
+use tokio::io::Interest;
+use tokio::io::unix::AsyncFd;
+use tokio::runtime::Handle;
 
 use crate::error::{RuntimeError, RuntimeResult};
 use hammer_infra::pool::{Index, Pool};
@@ -35,6 +40,18 @@ pub struct FileFunctions {
     pub read: Option<FileFunction>,
     pub write: Option<FileFunction>,
     pub error: Option<FileFunction>,
+}
+
+/// Outcome of one safe nonblocking socket operation on a FileMain-owned
+/// descriptor.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FileIoStatus {
+    /// The operation consumed or produced the reported byte count.
+    Progress(usize),
+    /// The descriptor would block; retry when readiness fires again.
+    WouldBlock,
+    /// The peer closed the connection (or it is otherwise unusable).
+    Closed,
 }
 
 /// Readiness metadata, callback state, and ownership for one descriptor.
@@ -77,6 +94,20 @@ impl File {
     /// Returns the registered descriptor without transferring ownership.
     pub fn fd(&self) -> RawFd {
         self.fd.as_raw_fd()
+    }
+
+    /// Duplicates the owned descriptor so a synchronous socket call never
+    /// races with the platform backend's poll registration or consumes its
+    /// readiness.
+    fn try_clone(&self) -> io::Result<OwnedFd> {
+        // SAFETY: `F_DUPFD_CLOEXEC` returns a fresh descriptor referencing
+        // the same socket; the registered descriptor stays FileMain-owned.
+        let duplicated = unsafe { libc::fcntl(self.fd(), libc::F_DUPFD_CLOEXEC, 0) };
+        if duplicated < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        // SAFETY: `duplicated` is a valid owned descriptor from fcntl.
+        Ok(unsafe { OwnedFd::from_raw_fd(duplicated) })
     }
 
     #[inline]
@@ -468,6 +499,171 @@ impl FileMain {
         Ok(previous)
     }
 
+    /// Registers a bound Unix listener with read interest, mirroring VPP's
+    /// `clib_file_main_add_socket`. Pending connections are pulled through
+    /// [`Self::accept`].
+    pub fn add_listener(
+        &mut self,
+        listener: UnixListener,
+        description: impl Into<String>,
+        private_data: u64,
+        functions: FileFunctions,
+    ) -> RuntimeResult<Index> {
+        listener
+            .set_nonblocking(true)
+            .map_err(|source| RuntimeError::FilePollerIo {
+                operation: "set Binary API listener nonblocking",
+                source,
+            })?;
+        let index = self.add(File::new(
+            OwnedFd::from(listener),
+            description.into(),
+            private_data,
+            functions,
+        ))?;
+        Ok(index)
+    }
+
+    /// Accepts one pending connection from a registered listener, or returns
+    /// `None` when no connection is pending. The accepted socket is
+    /// registered with read interest. The listener registration is untouched:
+    /// accept runs on a duplicated descriptor.
+    pub fn accept(
+        &mut self,
+        listener: Index,
+        description: impl Into<String>,
+        private_data: u64,
+        functions: FileFunctions,
+    ) -> RuntimeResult<Option<Index>> {
+        let file = self
+            .files
+            .get(listener)
+            .ok_or(RuntimeError::FileIndexInvalid { index: listener })?;
+        let duplicated = file
+            .try_clone()
+            .map_err(|source| RuntimeError::FilePollerIo {
+                operation: "duplicate listener for accept",
+                source,
+            })?;
+        let stream = match UnixListener::from(duplicated).accept() {
+            Ok((stream, _)) => stream,
+            Err(source) if source.kind() == io::ErrorKind::WouldBlock => return Ok(None),
+            Err(source) => return Err(RuntimeError::FileAccept { source }),
+        };
+        stream
+            .set_nonblocking(true)
+            .map_err(|source| RuntimeError::FilePollerIo {
+                operation: "set accepted Binary API socket nonblocking",
+                source,
+            })?;
+        // macOS: writes to a vanished peer must surface as `Closed`, not kill
+        // the daemon with SIGPIPE. The option is per-socket, so set it once
+        // while the connection is fresh; per-write setsockopt fails after the
+        // peer's EOF is drained.
+        #[cfg(target_os = "macos")]
+        {
+            let one: libc::c_int = 1;
+            // SAFETY: `setsockopt` on the accepted socket descriptor.
+            let rc = unsafe {
+                libc::setsockopt(
+                    stream.as_raw_fd(),
+                    libc::SOL_SOCKET,
+                    libc::SO_NOSIGPIPE,
+                    &one as *const libc::c_int as *const libc::c_void,
+                    size_of::<libc::c_int>() as libc::socklen_t,
+                )
+            };
+            if rc != 0 {
+                // macOS rejects setsockopt with EINVAL on a connection whose
+                // peer closed before accept (EOF is already pending on the
+                // accepted socket). Such a connection cannot be served and
+                // cannot take SO_NOSIGPIPE, so drop it and report no
+                // connection; the daemon keeps polling.
+                drop(stream);
+                return Ok(None);
+            }
+        }
+        let index = self.add(File::new(
+            OwnedFd::from(stream),
+            description.into(),
+            private_data,
+            functions,
+        ))?;
+        Ok(Some(index))
+    }
+
+    /// Performs one synchronous nonblocking read through a duplicated
+    /// descriptor, so the poll registration never consumes data or
+    /// readiness.
+    pub fn read_some(&self, index: Index, buffer: &mut [u8]) -> RuntimeResult<FileIoStatus> {
+        let file = self
+            .files
+            .get(index)
+            .ok_or(RuntimeError::FileIndexInvalid { index })?;
+        let duplicated = file
+            .try_clone()
+            .map_err(|source| RuntimeError::FilePollerIo {
+                operation: "duplicate descriptor for read",
+                source,
+            })?;
+        let mut stream = UnixStream::from(duplicated);
+        match stream.read(buffer) {
+            Ok(0) => Ok(FileIoStatus::Closed),
+            Ok(n) => Ok(FileIoStatus::Progress(n)),
+            Err(source) if peer_closed(&source) => Ok(FileIoStatus::Closed),
+            Err(source) if source.kind() == io::ErrorKind::WouldBlock => {
+                Ok(FileIoStatus::WouldBlock)
+            }
+            Err(source) => Err(RuntimeError::FileRead { source }),
+        }
+    }
+
+    /// Performs one synchronous nonblocking write through a duplicated
+    /// descriptor, so the poll registration is never consumed by a partial
+    /// flush.
+    pub fn write_some(&self, index: Index, buffer: &[u8]) -> RuntimeResult<FileIoStatus> {
+        let file = self
+            .files
+            .get(index)
+            .ok_or(RuntimeError::FileIndexInvalid { index })?;
+        let duplicated = file
+            .try_clone()
+            .map_err(|source| RuntimeError::FilePollerIo {
+                operation: "duplicate descriptor for write",
+                source,
+            })?;
+        // A vanished client must surface as `Closed`, not kill the daemon
+        // with SIGPIPE. Linux honors MSG_NOSIGNAL per send; macOS sets
+        // SO_NOSIGPIPE once on the socket in [`Self::accept`] (per-write
+        // setsockopt fails once the peer has closed and the EOF is drained).
+        #[cfg(target_os = "linux")]
+        let flags = libc::MSG_NOSIGNAL;
+        #[cfg(not(target_os = "linux"))]
+        let flags = 0;
+        // SAFETY: `duplicated` is a live socket descriptor for the call
+        // duration.
+        let written = unsafe {
+            libc::send(
+                duplicated.as_raw_fd(),
+                buffer.as_ptr() as *const libc::c_void,
+                buffer.len(),
+                flags,
+            )
+        };
+        if written >= 0 {
+            if written == 0 {
+                return Ok(FileIoStatus::Closed);
+            }
+            return Ok(FileIoStatus::Progress(written as usize));
+        }
+        let source = io::Error::last_os_error();
+        match source.kind() {
+            _ if peer_closed(&source) => Ok(FileIoStatus::Closed),
+            io::ErrorKind::WouldBlock => Ok(FileIoStatus::WouldBlock),
+            _ => Err(RuntimeError::FileWrite { source }),
+        }
+    }
+
     /// Performs one nonblocking readiness poll and dispatches live callbacks.
     pub fn poll(&mut self, graph: &NodeRuntime) -> RuntimeResult<usize> {
         let mut events = [PollEvent::default(); POLL_BATCH_SIZE];
@@ -514,6 +710,78 @@ impl FileMain {
             }
         }
         Ok(dispatched)
+    }
+
+    /// Converts this FileMain into an owned [`AsyncFileMain`], the
+    /// control-plane counterpart of the data-worker FileMain path.
+    ///
+    /// Only the platform poller's duplicated wake descriptor is wrapped in a
+    /// Tokio `AsyncFd`; managed sockets remain FileMain-owned descriptors
+    /// registered exclusively with the platform backend. A current Tokio
+    /// runtime context is required; its absence fails rather than panics.
+    pub fn into_async(self) -> RuntimeResult<AsyncFileMain> {
+        let duplicate = self.io_wake_fd()?;
+        let handle = Handle::try_current().map_err(|source| RuntimeError::FilePollerIo {
+            operation: "enter Tokio reactor for AsyncFileMain",
+            source: io::Error::other(source),
+        })?;
+        let _enter = handle.enter();
+        let wake = AsyncFd::with_interest(duplicate, Interest::READABLE).map_err(|source| {
+            RuntimeError::FilePollerIo {
+                operation: "register AsyncFileMain wake descriptor with Tokio",
+                source,
+            }
+        })?;
+        Ok(AsyncFileMain {
+            file_main: self,
+            wake,
+        })
+    }
+}
+
+/// Control-plane FileMain owned by one Tokio task.
+///
+/// `AsyncFileMain` is the single-owner control-plane counterpart to the
+/// data-worker FileMain path: it owns a plain [`FileMain`] and the Tokio
+/// `AsyncFd` created from only that FileMain's duplicated backend wake
+/// descriptor. Managed sockets remain FileMain-owned descriptors registered
+/// exclusively with the platform backend and are never dual-registered with
+/// Tokio. It is `!Sync` and therefore never registry-shared; one control
+/// ProcessNode owns it for its lifetime.
+pub struct AsyncFileMain {
+    file_main: FileMain,
+    wake: AsyncFd<OwnedFd>,
+}
+
+impl AsyncFileMain {
+    /// Awaits FileMain readiness and performs one nonblocking poll.
+    ///
+    /// Mirrors the data-worker wake order: the backend wake is cleared
+    /// before the reactor readiness is acknowledged, then
+    /// [`FileMain::poll`] dispatches live callbacks. Callback and poller
+    /// errors propagate to the awaiting control ProcessNode.
+    pub async fn next_ready(&mut self, graph: &NodeRuntime) -> RuntimeResult<usize> {
+        let mut guard =
+            self.wake
+                .readable()
+                .await
+                .map_err(|source| RuntimeError::FilePollerIo {
+                    operation: "await AsyncFileMain wake readiness",
+                    source,
+                })?;
+        self.file_main.clear_io_wake();
+        guard.clear_ready();
+        self.file_main.poll(graph)
+    }
+
+    /// Returns the owned FileMain for descriptor registration and lookup.
+    pub fn file_main(&self) -> &FileMain {
+        &self.file_main
+    }
+
+    /// Returns the owned FileMain mutably for descriptor registration.
+    pub fn file_main_mut(&mut self) -> &mut FileMain {
+        &mut self.file_main
     }
 }
 
@@ -568,6 +836,18 @@ impl Readiness {
     pub(super) fn insert(&mut self, readiness: Self) {
         self.0 |= readiness.0;
     }
+}
+
+/// Maps peer-disappearance errors to the `Closed` outcome instead of a
+/// daemon-fatal error.
+fn peer_closed(source: &io::Error) -> bool {
+    matches!(
+        source.kind(),
+        io::ErrorKind::BrokenPipe
+            | io::ErrorKind::ConnectionReset
+            | io::ErrorKind::ConnectionAborted
+            | io::ErrorKind::NotConnected
+    )
 }
 
 #[inline]
