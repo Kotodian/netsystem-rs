@@ -16,7 +16,7 @@ use std::time::Duration;
 
 use hammer_infra::pool::Index;
 use hammer_infra::thread_owned::ThreadOwned;
-use hammer_runtime::binary_api::BinaryApiMethodStatus;
+use hammer_runtime::binary_api::{BinaryApiMethodEntry, BinaryApiMethodStatus};
 use hammer_runtime::file::{File, FileFunctions, FileIoStatus, FileMain};
 use hammer_runtime::{
     Engine, NodeRuntime, PluginError, ProcessContext, ProcessWake, RuntimeError, RuntimeResult,
@@ -347,7 +347,7 @@ impl ClientTable {
             }
             let request = BinaryApiRequest::decode(&slot.read_buf[size_of::<u32>()..frame_len]);
             let reply = match request {
-                Ok(request) => dispatch_barriered(request),
+                Ok(request) => dispatch(request),
                 Err(_) => reply(0, BinaryApiStatus::InvalidRequest, Vec::new()),
             };
             let encoded = reply.encode_to_vec(); // single allocation for the reply frame
@@ -530,19 +530,86 @@ fn output_budget(max_frame_bytes: usize) -> usize {
     2 * max_frame_bytes
 }
 
+/// Resolves the method exactly once and routes it by `is_mp_safe`. Only a
+/// successfully resolved mp-safe entry can bypass the barrier; every
+/// resolution failure keeps the legacy reply and the legacy barriered path,
+/// so method-not-found and internal errors still enter the barrier/pending
+/// branches and run the same deferred graph-update finish.
+fn dispatch(request: BinaryApiRequest) -> BinaryApiReply {
+    let context = request.context;
+    let resolved: Result<BinaryApiMethodEntry, BinaryApiReply> = match Engine::with_current(
+        |engine| engine.plugin_main().binary_api_method(&request.method),
+    ) {
+        None => Err(reply(
+            context,
+            BinaryApiStatus::MainThreadUnavailable,
+            Vec::new(),
+        )),
+        Some(Err(PluginError::BinaryApiMethodMissing { .. })) => {
+            Err(reply(context, BinaryApiStatus::MethodMissing, Vec::new()))
+        }
+        Some(Err(PluginError::BinaryApiMethodDuplicate { .. })) => {
+            Err(reply(context, BinaryApiStatus::MethodDuplicate, Vec::new()))
+        }
+        Some(Err(_)) => Err(reply(context, BinaryApiStatus::Internal, Vec::new())),
+        Some(Ok(method)) => Ok(method),
+    };
+    match resolved {
+        // VPP's `msg_handler_internal` takes the worker barrier only when
+        // `!m->is_mp_safe` (api_shared.c:545, 564): an mp-safe method runs
+        // directly on the serial Main Thread and never fetches the barrier
+        // nor finishes deferred graph updates.
+        Ok(method) if method.is_mp_safe() => invoke_method(request, method),
+        _ => dispatch_barriered(request, resolved),
+    }
+}
+
+/// Calls an already-resolved handler exactly once and maps its status to the
+/// reply. Resolution happens once in `dispatch` before the mp-safe branch, so
+/// this helper never resolves and never touches the worker barrier or the
+/// deferred graph-update finish path.
+fn invoke_method(request: BinaryApiRequest, entry: BinaryApiMethodEntry) -> BinaryApiReply {
+    let method_reply = entry.call(&request.payload);
+    let status = match method_reply.status() {
+        BinaryApiMethodStatus::Ok => BinaryApiStatus::Ok,
+        BinaryApiMethodStatus::InvalidRequest => BinaryApiStatus::InvalidRequest,
+        BinaryApiMethodStatus::Panicked => BinaryApiStatus::MethodPanicked,
+    };
+    reply(request.context, status, method_reply.payload().to_vec())
+}
+
 /// Dispatches one request under the worker barrier exactly once per request:
 /// a pending barrier dispatches unlocked (VPP `msg_handler_internal` skips
 /// the barrier while one is already pending), otherwise the handler runs
-/// inside `barrier.sync` with no await while held.
-fn dispatch_barriered(request: BinaryApiRequest) -> BinaryApiReply {
+/// inside `barrier.sync` with no await while held. Resolution failures arrive
+/// as the `Err` reply and run the same branches and the same deferred
+/// graph-update finish as the previous resolution-inside-dispatch code.
+fn dispatch_barriered(
+    request: BinaryApiRequest,
+    resolved: Result<BinaryApiMethodEntry, BinaryApiReply>,
+) -> BinaryApiReply {
+    let context = request.context;
     let Some(barrier) = Engine::with_current(|engine| engine.worker_barrier()) else {
-        return dispatch_method(request);
+        // Legacy unlocked path: no barrier authority; the already-resolved
+        // handler or the resolution error reply runs with no barrier and no
+        // deferred finish.
+        return resolved.map_or_else(
+            |error_reply| error_reply,
+            |entry| invoke_method(request, entry),
+        );
     };
     if barrier.is_pending() {
-        return dispatch_method(request);
+        return resolved.map_or_else(
+            |error_reply| error_reply,
+            |entry| invoke_method(request, entry),
+        );
     }
-    let context = request.context;
-    let method_reply = barrier.sync(|| dispatch_method(request));
+    let method_reply = barrier.sync(|| {
+        resolved.map_or_else(
+            |error_reply| error_reply,
+            |entry| invoke_method(request, entry),
+        )
+    });
     // VPP `vlib_worker_thread_barrier_release` waits for the refork cohort at
     // the outermost release (threads.c:1497): a graph publication finished
     // inside this barrier is drained here, after the workers refork and
@@ -553,32 +620,6 @@ fn dispatch_barriered(request: BinaryApiRequest) -> BinaryApiReply {
         Some(Err(_)) => reply(context, BinaryApiStatus::Internal, Vec::new()),
         _ => method_reply,
     }
-}
-
-fn dispatch_method(request: BinaryApiRequest) -> BinaryApiReply {
-    let context = request.context;
-    let resolved =
-        Engine::with_current(|engine| engine.plugin_main().binary_api_method(&request.method));
-    let method = match resolved {
-        None => {
-            return reply(context, BinaryApiStatus::MainThreadUnavailable, Vec::new());
-        }
-        Some(Err(PluginError::BinaryApiMethodMissing { .. })) => {
-            return reply(context, BinaryApiStatus::MethodMissing, Vec::new());
-        }
-        Some(Err(PluginError::BinaryApiMethodDuplicate { .. })) => {
-            return reply(context, BinaryApiStatus::MethodDuplicate, Vec::new());
-        }
-        Some(Err(_)) => return reply(context, BinaryApiStatus::Internal, Vec::new()),
-        Some(Ok(method)) => method,
-    };
-    let method_reply = method.call(&request.payload);
-    let status = match method_reply.status() {
-        BinaryApiMethodStatus::Ok => BinaryApiStatus::Ok,
-        BinaryApiMethodStatus::InvalidRequest => BinaryApiStatus::InvalidRequest,
-        BinaryApiMethodStatus::Panicked => BinaryApiStatus::MethodPanicked,
-    };
-    reply(context, status, method_reply.payload().to_vec())
 }
 
 fn reply(context: u64, status: BinaryApiStatus, payload: Vec<u8>) -> BinaryApiReply {
