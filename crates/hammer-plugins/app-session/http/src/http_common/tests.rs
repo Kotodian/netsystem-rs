@@ -164,10 +164,7 @@ fn decode_matches_golden_bytes() {
         DecodedHeaderName::Known(header_name::ACCEPT)
     );
     assert_eq!(headers[0].value, b"text/html");
-    assert_eq!(
-        headers[1].flags,
-        FieldLineFlags::CUSTOM_NAME
-    );
+    assert_eq!(headers[1].flags, FieldLineFlags::CUSTOM_NAME);
     assert_eq!(headers[1].name, DecodedHeaderName::Custom(b"X-Test"));
     assert_eq!(headers[1].value, b"1");
 }
@@ -710,7 +707,10 @@ fn publish_inbound_request_round_trips_through_decode() {
     // path span.
     let headers: Vec<_> = decoded.headers().collect();
     assert_eq!(headers.len(), 2);
-    assert_eq!(headers[0].name, DecodedHeaderName::Known(header_name::ACCEPT));
+    assert_eq!(
+        headers[0].name,
+        DecodedHeaderName::Known(header_name::ACCEPT)
+    );
     assert_eq!(headers[0].value, b"text/html");
     assert_eq!(headers[1].name, DecodedHeaderName::Custom(b"X-Test"));
     assert_eq!(headers[1].value, b"1");
@@ -765,7 +765,10 @@ fn decode_server_layout_golden() {
     // query span, and never sees the authority/path/query pseudo fields.
     let headers: Vec<_> = decoded.headers().collect();
     assert_eq!(headers.len(), 2);
-    assert_eq!(headers[0].name, DecodedHeaderName::Known(header_name::ACCEPT));
+    assert_eq!(
+        headers[0].name,
+        DecodedHeaderName::Known(header_name::ACCEPT)
+    );
     assert_eq!(headers[0].value, b"text/html");
     assert_eq!(headers[1].name, DecodedHeaderName::Custom(b"X-Test"));
     assert_eq!(headers[1].value, b"1");

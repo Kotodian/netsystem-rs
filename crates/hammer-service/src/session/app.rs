@@ -163,8 +163,10 @@ impl SegmentManager {
                         .ok_or(AppWorkerError::SessionSegmentSizeOverflow)?,
                 );
                 let segment = if let Some(prefix) = &self.shared_name_prefix {
-                    let name =
-                        format!("{prefix}-{:x}", SEG_NAME_COUNTER.fetch_add(1, Ordering::Relaxed));
+                    let name = format!(
+                        "{prefix}-{:x}",
+                        SEG_NAME_COUNTER.fetch_add(1, Ordering::Relaxed)
+                    );
                     Segment::shared(&name, segment_bytes)
                         .map_err(|source| AppWorkerError::SessionSegment { source })?
                 } else {

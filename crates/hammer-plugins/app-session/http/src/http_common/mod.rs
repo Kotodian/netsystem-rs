@@ -775,7 +775,8 @@ fn header_entries_len(headers: &[AppHeader<'_>]) -> Result<u64, EncodeError> {
                 if flags.contains(FieldLineFlags::CUSTOM_NAME) {
                     return Err(EncodeError::ReservedFlag);
                 }
-                8u64.checked_add(value.len() as u64).ok_or(EncodeError::LengthOverflow)?
+                8u64.checked_add(value.len() as u64)
+                    .ok_or(EncodeError::LengthOverflow)?
             }
             AppHeader::Custom { flags, name, value } => {
                 if flags.contains(FieldLineFlags::CUSTOM_NAME) {

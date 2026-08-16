@@ -75,7 +75,10 @@ mod tests {
         let mut read: &[u8] = &preface;
         assert_eq!(StreamType::decode(&mut read).unwrap(), StreamType::CONTROL);
         let frame = Frame::decode(&mut read).unwrap();
-        assert_eq!(frame, Frame::Settings(Settings::qpack_zero_capacity().unwrap()));
+        assert_eq!(
+            frame,
+            Frame::Settings(Settings::qpack_zero_capacity().unwrap())
+        );
         assert!(!read.has_remaining());
     }
 }

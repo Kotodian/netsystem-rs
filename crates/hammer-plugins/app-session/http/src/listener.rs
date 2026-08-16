@@ -932,7 +932,10 @@ mod tests {
                 .get(1)
                 .and_then(Option::as_ref)
                 .expect("second context published");
-            (context.inner_session_listener, context.inner_application_listener)
+            (
+                context.inner_session_listener,
+                context.inner_application_listener,
+            )
         };
 
         // A stale outer identity (same slot, different generation) is a typed
@@ -948,7 +951,10 @@ mod tests {
         // inner Session identity, then inner Application listener removal
         // (a second removal is a typed error), then the outer context clear.
         main.stop_listen(second)?;
-        assert_eq!(STOP_LISTENED.with(|recorded| recorded.get()), second_inner.raw());
+        assert_eq!(
+            STOP_LISTENED.with(|recorded| recorded.get()),
+            second_inner.raw()
+        );
         assert!(
             sessions
                 .applications()
@@ -965,7 +971,10 @@ mod tests {
         assert!(main.contexts.get()[0].is_some());
 
         main.stop_listen(first)?;
-        assert_eq!(STOP_LISTENED.with(|recorded| recorded.get()), first_inner.raw());
+        assert_eq!(
+            STOP_LISTENED.with(|recorded| recorded.get()),
+            first_inner.raw()
+        );
         assert!(main.contexts.get()[0].is_none());
 
         Engine::uninstall_current();
@@ -996,7 +1005,8 @@ mod tests {
     }
 
     #[test]
-    fn http_listener_stop_listen_preserves_context_on_lower_unlisten_failure() -> RuntimeResult<()> {
+    fn http_listener_stop_listen_preserves_context_on_lower_unlisten_failure() -> RuntimeResult<()>
+    {
         let mut engine = test_engine();
         engine.install_current();
         let sessions = Arc::new(SessionMain::new(
@@ -1040,11 +1050,9 @@ mod tests {
 
     #[test]
     fn http_listener_stop_listen_requires_main_thread() {
-        let error = thread::spawn(|| {
-            start_error(super::stop_listen(SessionListenerId::new(4, 0)))
-        })
-        .join()
-        .expect("stop_listen thread completes");
+        let error = thread::spawn(|| start_error(super::stop_listen(SessionListenerId::new(4, 0))))
+            .join()
+            .expect("stop_listen thread completes");
         assert!(matches!(error, RuntimeError::ControlRequiresMainThread));
     }
 
@@ -1058,11 +1066,10 @@ mod tests {
             sessions.applications().attach().expect("inner attach"),
             0,
         ));
-        let error = thread::spawn(move || {
-            start_error(main.stop_listen(SessionListenerId::new(5, 0)))
-        })
-        .join()
-        .expect("authority stop_listen thread completes");
+        let error =
+            thread::spawn(move || start_error(main.stop_listen(SessionListenerId::new(5, 0))))
+                .join()
+                .expect("authority stop_listen thread completes");
         assert!(matches!(error, RuntimeError::ControlRequiresMainThread));
     }
 

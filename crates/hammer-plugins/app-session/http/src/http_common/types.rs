@@ -265,7 +265,10 @@ mod tests {
             b"",
         ];
         for &name in unknown {
-            assert!(HeaderName::try_from(name).is_err(), "unexpectedly known: {name:?}");
+            assert!(
+                HeaderName::try_from(name).is_err(),
+                "unexpectedly known: {name:?}"
+            );
         }
     }
 }

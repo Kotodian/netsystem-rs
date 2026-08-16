@@ -49,8 +49,8 @@ use crate::http3::preface::encode_control_preface;
 use crate::http3::proto::coding::Decode;
 use crate::http3::proto::control::{ControlRead, ControlStreamError, ControlStreamReader};
 use crate::http3::proto::error::ErrorCode;
-use crate::http3::request_frame_reader::{RequestFrameError, RequestFrameRead, RequestFrameReader};
 use crate::http3::proto::stream::{StreamCategory, StreamType};
+use crate::http3::request_frame_reader::{RequestFrameError, RequestFrameRead, RequestFrameReader};
 
 /// Default connection-context capacity of one data worker's pool, matching
 /// the QUIC per-worker context capacity (quic worker.rs:42).
@@ -420,7 +420,10 @@ pub(crate) enum HttpWorkerError {
     #[error(
         "http connection context {context:?} cannot find the Session FIFO of local control child {child:?}"
     )]
-    ControlStreamFifoMissing { context: ContextId, child: SessionId },
+    ControlStreamFifoMissing {
+        context: ContextId,
+        child: SessionId,
+    },
     #[error("local control preface for connection context {context:?} does not encode")]
     ControlPrefaceEncodeFailed { context: ContextId },
     #[error(
@@ -463,7 +466,9 @@ pub(crate) enum HttpWorkerError {
         stream: StreamContextId,
         context: ContextId,
     },
-    #[error("peer uni stream {stream:?} on connection context {context:?} has no decoded type to register")]
+    #[error(
+        "peer uni stream {stream:?} on connection context {context:?} has no decoded type to register"
+    )]
     PeerStreamRoleUnclassified {
         stream: StreamContextId,
         context: ContextId,
@@ -508,22 +513,33 @@ pub(crate) enum HttpWorkerError {
         context: ContextId,
         capacity: usize,
     },
-    #[error("http worker lost the peer control SETTINGS reader slot {index:?} for stream {stream:?}")]
+    #[error(
+        "http worker lost the peer control SETTINGS reader slot {index:?} for stream {stream:?}"
+    )]
     PeerControlReaderMissing {
         stream: StreamContextId,
         index: Index,
     },
     #[error("http stream {stream:?} request reader pool is full (capacity {capacity})")]
-    RequestReaderCapacityExhausted { stream: StreamContextId, capacity: usize },
+    RequestReaderCapacityExhausted {
+        stream: StreamContextId,
+        capacity: usize,
+    },
     #[error("http worker lost the request reader slot {index:?} for stream {stream:?}")]
-    RequestReaderMissing { stream: StreamContextId, index: Index },
+    RequestReaderMissing {
+        stream: StreamContextId,
+        index: Index,
+    },
     #[error("http stream {stream:?} pending field-section pool is full (capacity {capacity})")]
     PendingFieldSectionCapacityExhausted {
         stream: StreamContextId,
         capacity: usize,
     },
     #[error("http worker lost the pending field-section slot {index:?} for stream {stream:?}")]
-    PendingFieldSectionMissing { stream: StreamContextId, index: Index },
+    PendingFieldSectionMissing {
+        stream: StreamContextId,
+        index: Index,
+    },
     #[error(
         "http stream {stream:?} already has a pending HEADERS field section; the newer section is returned unreplaced"
     )]
@@ -535,9 +551,7 @@ pub(crate) enum HttpWorkerError {
     StreamCapacityExhausted { capacity: usize },
     #[error("http stream context {stream:?} is not live")]
     StreamMissing { stream: StreamContextId },
-    #[error(
-        "http stream context {stream:?} is bound to session {actual:?}, expected {expected:?}"
-    )]
+    #[error("http stream context {stream:?} is bound to session {actual:?}, expected {expected:?}")]
     StreamSessionMismatch {
         stream: StreamContextId,
         expected: SessionId,
@@ -1161,12 +1175,12 @@ impl HttpWorker {
         bytes: &[u8],
     ) -> Result<PeerControlOutcome, PeerControlError> {
         let parent = {
-            let stream_context = self
-                .streams
-                .get(stream.into())
-                .ok_or(PeerControlError::Worker(HttpWorkerError::StreamMissing {
-                    stream,
-                }))?;
+            let stream_context =
+                self.streams
+                    .get(stream.into())
+                    .ok_or(PeerControlError::Worker(HttpWorkerError::StreamMissing {
+                        stream,
+                    }))?;
             if stream_context.peer_role != PeerUniStreamRole::Control {
                 return Err(PeerControlError::Worker(
                     HttpWorkerError::PeerControlStreamMismatch {
@@ -1181,9 +1195,9 @@ impl HttpWorker {
         let mut connection = *self
             .contexts
             .get(parent.into())
-            .ok_or(PeerControlError::Worker(HttpWorkerError::ParentContextMissing {
-                parent,
-            }))?;
+            .ok_or(PeerControlError::Worker(
+                HttpWorkerError::ParentContextMissing { parent },
+            ))?;
         if !connection.peer_settings_pending {
             return Err(PeerControlError::Protocol(
                 ControlStreamError::DuplicateSettings,
@@ -1192,16 +1206,13 @@ impl HttpWorker {
         let reader_index = match connection.peer_control_reader {
             Some(index) => index,
             None => {
-                let index = self
-                    .readers
-                    .insert(ControlStreamReader::new())
-                    .ok_or(PeerControlError::Worker(
-                        HttpWorkerError::PeerControlReaderCapacityExhausted {
-                            stream,
-                            context: parent,
-                            capacity: self.readers.capacity(),
-                        },
-                    ))?;
+                let index = self.readers.insert(ControlStreamReader::new()).ok_or(
+                    PeerControlError::Worker(HttpWorkerError::PeerControlReaderCapacityExhausted {
+                        stream,
+                        context: parent,
+                        capacity: self.readers.capacity(),
+                    }),
+                )?;
                 connection.peer_control_reader = Some(index);
                 index
             }
@@ -1225,16 +1236,16 @@ impl HttpWorker {
         *self
             .contexts
             .get_mut(parent.into())
-            .ok_or(PeerControlError::Worker(HttpWorkerError::ParentContextMissing {
-                parent,
-            }))? = connection;
+            .ok_or(PeerControlError::Worker(
+                HttpWorkerError::ParentContextMissing { parent },
+            ))? = connection;
         match feed {
             Ok((ControlRead::Complete(_), consumed)) => {
                 Ok(PeerControlOutcome::Complete { consumed })
             }
-            Ok((ControlRead::Incomplete, consumed)) => Ok(PeerControlOutcome::Incomplete {
-                consumed,
-            }),
+            Ok((ControlRead::Incomplete, consumed)) => {
+                Ok(PeerControlOutcome::Incomplete { consumed })
+            }
             Err(error) => Err(PeerControlError::Protocol(error)),
         }
     }
@@ -1268,18 +1279,21 @@ impl HttpWorker {
         session: SessionId,
         bytes: &'a [u8],
     ) -> Result<(RequestFrameRead<'a>, usize), RequestReadError> {
-        let mut stream_context = *self
-            .streams
-            .get(stream.into())
-            .ok_or(RequestReadError::Worker(HttpWorkerError::StreamMissing {
-                stream,
-            }))?;
+        let mut stream_context =
+            *self
+                .streams
+                .get(stream.into())
+                .ok_or(RequestReadError::Worker(HttpWorkerError::StreamMissing {
+                    stream,
+                }))?;
         if stream_context.session != session {
-            return Err(RequestReadError::Worker(HttpWorkerError::StreamSessionMismatch {
-                stream,
-                expected: session,
-                actual: stream_context.session,
-            }));
+            return Err(RequestReadError::Worker(
+                HttpWorkerError::StreamSessionMismatch {
+                    stream,
+                    expected: session,
+                    actual: stream_context.session,
+                },
+            ));
         }
         if stream_context.direction != SessionStreamDirection::Bidi {
             return Err(RequestReadError::Worker(
@@ -1321,8 +1335,9 @@ impl HttpWorker {
         *self
             .streams
             .get_mut(stream.into())
-            .ok_or(RequestReadError::Worker(HttpWorkerError::StreamMissing { stream }))? =
-            stream_context;
+            .ok_or(RequestReadError::Worker(HttpWorkerError::StreamMissing {
+                stream,
+            }))? = stream_context;
         feed.map_err(RequestReadError::Protocol)
     }
 
@@ -1435,18 +1450,21 @@ impl HttpWorker {
         upper_rx: &Fifo,
         chunk: &[u8],
     ) -> Result<(), RequestReadError> {
-        let mut stream_context = *self
-            .streams
-            .get(stream.into())
-            .ok_or(RequestReadError::Worker(HttpWorkerError::StreamMissing {
-                stream,
-            }))?;
+        let mut stream_context =
+            *self
+                .streams
+                .get(stream.into())
+                .ok_or(RequestReadError::Worker(HttpWorkerError::StreamMissing {
+                    stream,
+                }))?;
         if stream_context.session != session {
-            return Err(RequestReadError::Worker(HttpWorkerError::StreamSessionMismatch {
-                stream,
-                expected: session,
-                actual: stream_context.session,
-            }));
+            return Err(RequestReadError::Worker(
+                HttpWorkerError::StreamSessionMismatch {
+                    stream,
+                    expected: session,
+                    actual: stream_context.session,
+                },
+            ));
         }
         if stream_context.direction != SessionStreamDirection::Bidi {
             return Err(RequestReadError::Worker(
@@ -1469,8 +1487,9 @@ impl HttpWorker {
         *self
             .streams
             .get_mut(stream.into())
-            .ok_or(RequestReadError::Worker(HttpWorkerError::StreamMissing { stream }))? =
-            stream_context;
+            .ok_or(RequestReadError::Worker(HttpWorkerError::StreamMissing {
+                stream,
+            }))? = stream_context;
         Ok(())
     }
 
@@ -1501,11 +1520,13 @@ impl HttpWorker {
                 stream,
             }))?;
         if stream_context.session != session {
-            return Err(RequestReadError::Worker(HttpWorkerError::StreamSessionMismatch {
-                stream,
-                expected: session,
-                actual: stream_context.session,
-            }));
+            return Err(RequestReadError::Worker(
+                HttpWorkerError::StreamSessionMismatch {
+                    stream,
+                    expected: session,
+                    actual: stream_context.session,
+                },
+            ));
         }
         if stream_context.direction != SessionStreamDirection::Bidi {
             return Err(RequestReadError::Worker(
@@ -1557,33 +1578,27 @@ impl HttpWorker {
         }
         match stream_context.pending_field_section {
             None => {
-                let slot = self
-                    .pending_field_sections
-                    .insert(Some(section))
-                    .ok_or(HttpWorkerError::PendingFieldSectionCapacityExhausted {
+                let slot = self.pending_field_sections.insert(Some(section)).ok_or(
+                    HttpWorkerError::PendingFieldSectionCapacityExhausted {
                         stream,
                         capacity: self.pending_field_sections.capacity(),
-                    })?;
+                    },
+                )?;
                 stream_context.pending_field_section = Some(slot);
                 *self
                     .streams
                     .get_mut(stream.into())
-                    .ok_or(HttpWorkerError::StreamMissing { stream })? =
-                    stream_context;
+                    .ok_or(HttpWorkerError::StreamMissing { stream })? = stream_context;
             }
             Some(slot) => {
-                let pending = self
-                    .pending_field_sections
-                    .get_mut(slot)
-                    .ok_or(HttpWorkerError::PendingFieldSectionMissing {
+                let pending = self.pending_field_sections.get_mut(slot).ok_or(
+                    HttpWorkerError::PendingFieldSectionMissing {
                         stream,
                         index: slot,
-                    })?;
+                    },
+                )?;
                 if pending.is_some() {
-                    return Err(HttpWorkerError::PendingFieldSectionOverflow {
-                        stream,
-                        section,
-                    });
+                    return Err(HttpWorkerError::PendingFieldSectionOverflow { stream, section });
                 }
                 *pending = Some(section);
             }
@@ -1625,13 +1640,12 @@ impl HttpWorker {
         let Some(slot) = stream_context.pending_field_section else {
             return Ok(None);
         };
-        let pending = self
-            .pending_field_sections
-            .get(slot)
-            .ok_or(HttpWorkerError::PendingFieldSectionMissing {
+        let pending = self.pending_field_sections.get(slot).ok_or(
+            HttpWorkerError::PendingFieldSectionMissing {
                 stream,
                 index: slot,
-            })?;
+            },
+        )?;
         Ok(pending.as_ref())
     }
 
@@ -1666,13 +1680,12 @@ impl HttpWorker {
         let Some(slot) = stream_context.pending_field_section else {
             return Ok(());
         };
-        let pending = self
-            .pending_field_sections
-            .get_mut(slot)
-            .ok_or(HttpWorkerError::PendingFieldSectionMissing {
+        let pending = self.pending_field_sections.get_mut(slot).ok_or(
+            HttpWorkerError::PendingFieldSectionMissing {
                 stream,
                 index: slot,
-            })?;
+            },
+        )?;
         *pending = None;
         Ok(())
     }
@@ -1806,12 +1819,12 @@ impl HttpWorker {
         stream: StreamContextId,
     ) -> Result<(), PeerControlError> {
         let parent = {
-            let stream_context = self
-                .streams
-                .get(stream.into())
-                .ok_or(PeerControlError::Worker(HttpWorkerError::StreamMissing {
-                    stream,
-                }))?;
+            let stream_context =
+                self.streams
+                    .get(stream.into())
+                    .ok_or(PeerControlError::Worker(HttpWorkerError::StreamMissing {
+                        stream,
+                    }))?;
             if stream_context.peer_role != PeerUniStreamRole::Control {
                 return Err(PeerControlError::Worker(
                     HttpWorkerError::PeerControlStreamMismatch {
@@ -1826,9 +1839,9 @@ impl HttpWorker {
         let connection = self
             .contexts
             .get_mut(parent.into())
-            .ok_or(PeerControlError::Worker(HttpWorkerError::ParentContextMissing {
-                parent,
-            }))?;
+            .ok_or(PeerControlError::Worker(
+                HttpWorkerError::ParentContextMissing { parent },
+            ))?;
         if connection.peer_control != Some(stream) {
             return Err(PeerControlError::Worker(
                 HttpWorkerError::PeerControlStreamMismatch {
@@ -2316,7 +2329,10 @@ mod tests {
         // Fixed no-heap constant: CONTROL stream type, then a SETTINGS frame
         // (type 0x04, length 0x04) carrying QPACK_MAX_TABLE_CAPACITY=0
         // (0x01 0x00) and QPACK_BLOCKED_STREAMS=0 (0x07 0x00).
-        assert_eq!(LOCAL_CONTROL_PREFACE, [0x00, 0x04, 0x04, 0x01, 0x00, 0x07, 0x00]);
+        assert_eq!(
+            LOCAL_CONTROL_PREFACE,
+            [0x00, 0x04, 0x04, 0x01, 0x00, 0x07, 0x00]
+        );
         // Cross-check against the proto encoders (test-only allocation is
         // fine): CONTROL stream type, then the static-only QPACK SETTINGS.
         let mut encoded = Vec::new();
@@ -2546,7 +2562,10 @@ mod tests {
             Err(HttpWorkerError::StreamMissing { stream: s }) if s == first
         ));
         assert_eq!(
-            worker.get_stream(second).expect("new identity live").session,
+            worker
+                .get_stream(second)
+                .expect("new identity live")
+                .session,
             session(3, 1)
         );
     }
@@ -2643,7 +2662,11 @@ mod tests {
 
     /// A rejected push registration must leave the parent slots and the
     /// stream role exactly as before the call.
-    fn assert_push_state_unchanged(worker: &HttpWorker, parent: ContextId, stream: StreamContextId) {
+    fn assert_push_state_unchanged(
+        worker: &HttpWorker,
+        parent: ContextId,
+        stream: StreamContextId,
+    ) {
         let connection = worker.get(parent).expect("live connection");
         assert_eq!(connection.peer_control, None);
         assert_eq!(connection.peer_encoder, None);
@@ -2693,7 +2716,11 @@ mod tests {
             }) if stream == second && context == parent
         ));
         let connection = worker.get(parent).expect("live connection");
-        assert_eq!(connection.peer_control, Some(first), "slot keeps the first owner");
+        assert_eq!(
+            connection.peer_control,
+            Some(first),
+            "slot keeps the first owner"
+        );
         assert_eq!(
             worker.get_stream(second).expect("live stream").peer_role,
             PeerUniStreamRole::Unclassified,
@@ -2747,7 +2774,11 @@ mod tests {
             }) if stream == second && context == parent
         ));
         let connection = worker.get(parent).expect("live connection");
-        assert_eq!(connection.peer_encoder, Some(first), "slot keeps the first owner");
+        assert_eq!(
+            connection.peer_encoder,
+            Some(first),
+            "slot keeps the first owner"
+        );
         assert_eq!(
             worker.get_stream(second).expect("live stream").peer_role,
             PeerUniStreamRole::Unclassified,
@@ -2775,7 +2806,11 @@ mod tests {
             }) if stream == second && context == parent
         ));
         let connection = worker.get(parent).expect("live connection");
-        assert_eq!(connection.peer_decoder, Some(first), "slot keeps the first owner");
+        assert_eq!(
+            connection.peer_decoder,
+            Some(first),
+            "slot keeps the first owner"
+        );
         assert_eq!(
             worker.get_stream(second).expect("live stream").peer_role,
             PeerUniStreamRole::Unclassified,
@@ -3031,10 +3066,7 @@ mod tests {
         assert_eq!(decode.role(), PeerUniStreamRole::Unclassified);
         // A lone first byte cannot complete a 2-byte varint; the prefix is
         // preserved for the next feed.
-        assert_eq!(
-            decode.feed(&[0x40]),
-            PeerUniStreamTypeOutcome::Incomplete
-        );
+        assert_eq!(decode.feed(&[0x40]), PeerUniStreamTypeOutcome::Incomplete);
         assert_eq!(decode.role(), PeerUniStreamRole::Unclassified);
         // The second byte completes it, consuming exactly that byte.
         assert_eq!(
@@ -3175,7 +3207,10 @@ mod tests {
             .process_peer_control_bytes(control, &[0x00, 0x00])
             .expect_err("DATA cannot start the control stream");
         assert!(
-            matches!(error, PeerControlError::Protocol(ControlStreamError::Frame(_))),
+            matches!(
+                error,
+                PeerControlError::Protocol(ControlStreamError::Frame(_))
+            ),
             "unexpected error: {error:?}"
         );
         assert_eq!(error.error_code(), Some(ErrorCode::FrameUnexpected));
@@ -3261,11 +3296,15 @@ mod tests {
                 .register_peer_uni_stream(stream, role)
                 .expect("register drain-only role");
             assert_eq!(
-                worker.drain_peer_stream_bytes(stream, &[0xAA; 5]).expect("drain"),
+                worker
+                    .drain_peer_stream_bytes(stream, &[0xAA; 5])
+                    .expect("drain"),
                 5
             );
             assert_eq!(
-                worker.drain_peer_stream_bytes(stream, &[]).expect("drain empty"),
+                worker
+                    .drain_peer_stream_bytes(stream, &[])
+                    .expect("drain empty"),
                 0
             );
         }
@@ -3297,7 +3336,10 @@ mod tests {
         let error = worker
             .drain_peer_stream_bytes(unclassified, &[0x00])
             .expect_err("unclassified stream is not drain-only");
-        assert!(matches!(error, HttpWorkerError::PeerStreamNotDrainable { .. }));
+        assert!(matches!(
+            error,
+            HttpWorkerError::PeerStreamNotDrainable { .. }
+        ));
         // A released stream id fails the liveness lookup.
         let removed = peer_stream(&mut worker, parent);
         worker.remove_stream(removed).expect("remove stream");
@@ -3322,7 +3364,13 @@ mod tests {
                 .expect("no peer control error"),
             PeerControlOutcome::Incomplete { consumed: 1 }
         );
-        assert!(worker.get(parent).expect("live").peer_control_reader.is_some());
+        assert!(
+            worker
+                .get(parent)
+                .expect("live")
+                .peer_control_reader
+                .is_some()
+        );
         // Releasing the connection frees the reader slot; the stream context
         // survives but its parent identity is stale.
         worker.remove(parent).expect("release connection");
@@ -3339,7 +3387,13 @@ mod tests {
         // The next allocation reuses the connection slot at a new generation
         // with no reader, and a fresh reader starts over on the first feed.
         let parent2 = worker.allocate(session(1, 1)).expect("reallocate");
-        assert!(worker.get(parent2).expect("live").peer_control_reader.is_none());
+        assert!(
+            worker
+                .get(parent2)
+                .expect("live")
+                .peer_control_reader
+                .is_none()
+        );
         let control2 = peer_stream(&mut worker, parent2);
         worker
             .register_peer_uni_stream(control2, PeerUniStreamRole::Control)
@@ -3365,9 +3419,15 @@ mod tests {
                 .expect("no peer control error"),
             PeerControlOutcome::Incomplete { consumed: 1 }
         );
-        worker.remove_stream(control).expect("remove control stream");
+        worker
+            .remove_stream(control)
+            .expect("remove control stream");
         assert!(
-            worker.get(parent).expect("live").peer_control_reader.is_none(),
+            worker
+                .get(parent)
+                .expect("live")
+                .peer_control_reader
+                .is_none(),
             "removing the control stream frees its reader slot"
         );
         // The stale stream id now fails the liveness lookup before any feed.
@@ -3429,7 +3489,10 @@ mod tests {
             PeerControlOutcome::Complete { consumed: 2 }
         );
         assert!(
-            !worker.get(parent).expect("live connection").peer_settings_pending,
+            !worker
+                .get(parent)
+                .expect("live connection")
+                .peer_settings_pending,
             "SETTINGS already complete"
         );
         worker
@@ -3463,7 +3526,10 @@ mod tests {
             connection.peer_control_reader.is_none(),
             "no reader was ever allocated"
         );
-        assert!(connection.peer_settings_pending, "expectation still pending");
+        assert!(
+            connection.peer_settings_pending,
+            "expectation still pending"
+        );
     }
 
     #[test]
@@ -3474,7 +3540,9 @@ mod tests {
             .register_peer_uni_stream(control, PeerUniStreamRole::Control)
             .expect("register control stream");
         // A stale identity fails the liveness lookup before any state change.
-        worker.remove_stream(control).expect("remove control stream");
+        worker
+            .remove_stream(control)
+            .expect("remove control stream");
         assert!(matches!(
             worker.finish_peer_control_stream(control),
             Err(PeerControlError::Worker(HttpWorkerError::StreamMissing { stream: s })) if s == control
@@ -3499,7 +3567,11 @@ mod tests {
             "unexpected error: {error:?}"
         );
         let connection = worker.get(parent).expect("live connection");
-        assert_eq!(connection.peer_encoder, Some(drain), "encoder slot untouched");
+        assert_eq!(
+            connection.peer_encoder,
+            Some(drain),
+            "encoder slot untouched"
+        );
         assert_eq!(
             worker.get_stream(drain).expect("live stream").peer_role,
             PeerUniStreamRole::QpackEncoder,
@@ -3576,7 +3648,11 @@ mod tests {
             .register_peer_uni_stream(second, PeerUniStreamRole::Control)
             .expect("re-register a fresh control stream");
         let connection = worker.get(parent).expect("live connection");
-        assert_eq!(connection.peer_control, Some(second), "fresh slot registered");
+        assert_eq!(
+            connection.peer_control,
+            Some(second),
+            "fresh slot registered"
+        );
         assert!(
             connection.peer_control_reader.is_none(),
             "fresh reader on next feed"
@@ -3599,7 +3675,10 @@ mod tests {
             PeerControlOutcome::Complete { consumed: 1 }
         );
         assert!(
-            !worker.get(parent).expect("live connection").peer_settings_pending,
+            !worker
+                .get(parent)
+                .expect("live connection")
+                .peer_settings_pending,
             "the fresh control stream's SETTINGS clears the expectation"
         );
     }
@@ -3725,7 +3804,9 @@ mod tests {
             .register_peer_uni_stream(control, PeerUniStreamRole::Control)
             .expect("register control stream");
         // A stale identity fails the liveness lookup before any state change.
-        worker.remove_stream(control).expect("remove control stream");
+        worker
+            .remove_stream(control)
+            .expect("remove control stream");
         assert!(matches!(
             worker.finish_peer_qpack_stream(control),
             Err(HttpWorkerError::StreamMissing { stream: s }) if s == control
@@ -3813,7 +3894,9 @@ mod tests {
         worker
             .register_peer_uni_stream(unknown, PeerUniStreamRole::Unknown)
             .expect("register unknown stream");
-        worker.remove_stream(unknown).expect("remove unknown stream");
+        worker
+            .remove_stream(unknown)
+            .expect("remove unknown stream");
         assert!(matches!(
             worker.finish_peer_unknown_stream(unknown),
             Err(HttpWorkerError::StreamMissing { stream: s }) if s == unknown
@@ -3908,7 +3991,11 @@ mod tests {
     fn request_bytes_lazy_allocates_and_reuses_reader_split_headers() {
         let (mut worker, stream, session) = worker_with_request_stream();
         assert!(
-            worker.get_stream(stream).expect("live stream").request_reader.is_none(),
+            worker
+                .get_stream(stream)
+                .expect("live stream")
+                .request_reader
+                .is_none(),
             "no reader before the first feed"
         );
         // HEADERS header plus two payload bytes: incomplete, all four bytes
@@ -3931,7 +4018,10 @@ mod tests {
         assert_eq!(read, RequestFrameRead::Headers(b"abcd".to_vec()));
         assert_eq!(consumed, 2);
         assert_eq!(
-            worker.get_stream(stream).expect("live stream").request_reader,
+            worker
+                .get_stream(stream)
+                .expect("live stream")
+                .request_reader,
             Some(reader_index),
             "reader slot persists across feeds"
         );
@@ -4028,7 +4118,10 @@ mod tests {
         ));
         assert_eq!(worker.request_readers.len(), 1);
         assert_eq!(
-            worker.get_stream(second).expect("live stream").request_reader,
+            worker
+                .get_stream(second)
+                .expect("live stream")
+                .request_reader,
             Some(live_reader),
             "the stale removal left the live reader in place"
         );

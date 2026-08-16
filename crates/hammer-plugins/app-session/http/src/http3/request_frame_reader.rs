@@ -226,8 +226,8 @@ impl RequestFrameReader {
                     if frame.ty == FrameType::DATA && self.payload_len > payload_at_entry {
                         return Ok((
                             RequestFrameRead::Data {
-                                chunk: &input
-                                    [chunk_start..chunk_start + (self.payload_len - payload_at_entry)],
+                                chunk: &input[chunk_start
+                                    ..chunk_start + (self.payload_len - payload_at_entry)],
                                 completed: false,
                             },
                             taken - past,
@@ -315,7 +315,9 @@ mod tests {
     ) -> (RequestFrameRead<'a>, usize) {
         let mut consumed = 0;
         for i in 0..wire.len() {
-            let (read, n) = reader.push(&wire[i..i + 1]).expect("a partial frame must not error");
+            let (read, n) = reader
+                .push(&wire[i..i + 1])
+                .expect("a partial frame must not error");
             consumed += n;
             if !matches!(read, RequestFrameRead::Incomplete) {
                 return (read, consumed);
@@ -398,13 +400,22 @@ mod tests {
         );
         // Control-stream-only frames (RFC 9114 Sections 7.2.3-7.2.7).
         for ty in [0x03, 0x04, 0x07, 0x0d] {
-            assert_eq!(error_code_on(&frame(ty, 0, &[])), ErrorCode::FrameUnexpected);
+            assert_eq!(
+                error_code_on(&frame(ty, 0, &[])),
+                ErrorCode::FrameUnexpected
+            );
         }
         // PUSH_PROMISE is forbidden on a client request stream (7.2.5).
-        assert_eq!(error_code_on(&frame(0x05, 0, &[])), ErrorCode::FrameUnexpected);
+        assert_eq!(
+            error_code_on(&frame(0x05, 0, &[])),
+            ErrorCode::FrameUnexpected
+        );
         // Reserved HTTP/2 frame types (7.2.8).
         for ty in [0x02, 0x06, 0x08, 0x09] {
-            assert_eq!(error_code_on(&frame(ty, 0, &[])), ErrorCode::FrameUnexpected);
+            assert_eq!(
+                error_code_on(&frame(ty, 0, &[])),
+                ErrorCode::FrameUnexpected
+            );
         }
     }
 
@@ -421,10 +432,10 @@ mod tests {
         );
         assert_eq!(
             reader.push(&[b'y', b'z']),
-            Ok((RequestFrameRead::Drained(
-                FrameType::from_value(0x2a).unwrap(),
-                3
-            ), 2))
+            Ok((
+                RequestFrameRead::Drained(FrameType::from_value(0x2a).unwrap(), 3),
+                2
+            ))
         );
         // The initial HEADERS is still accepted after the unknown frame.
         assert_eq!(
@@ -654,7 +665,11 @@ mod tests {
             if matches!(read, RequestFrameRead::Incomplete) {
                 continue;
             }
-            assert_eq!(n, chunk.len(), "the completing call consumes its whole chunk");
+            assert_eq!(
+                n,
+                chunk.len(),
+                "the completing call consumes its whole chunk"
+            );
             result = Some(read);
             break;
         }
