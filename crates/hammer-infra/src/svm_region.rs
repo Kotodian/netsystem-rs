@@ -65,9 +65,8 @@ impl SvmRegion {
         let reserved = validate_prefix(reserved_prefix, total, page)?;
         let fd = create_region_fd(total)?;
         let base = Self::map_shared(fd, total)?;
-        Self::claim_region(base, total, reserved, fd).ok_or_else(|| {
-            io::Error::other("SvmRegion: Talc failed to claim mapped memory")
-        })
+        Self::claim_region(base, total, reserved, fd)
+            .ok_or_else(|| io::Error::other("SvmRegion: Talc failed to claim mapped memory"))
     }
 
     /// Maps `total` bytes of `fd` as one shared mapping, closing the descriptor
@@ -133,26 +132,31 @@ impl SvmRegion {
         })
     }
 
-    pub(crate) fn from_created_fd_owned(fd: RawFd, size: usize) -> Option<SvmRegion> {
+    pub(crate) fn from_created_fd_owned(fd: RawFd, size: usize) -> io::Result<SvmRegion> {
         Self::from_created_fd_owned_with_prefix(fd, size, 0)
     }
 
+    /// Claims an existing created descriptor as a shared, page-rounded
+    /// mapping with a page-aligned `reserved_prefix` kept outside the
+    /// allocator's ownership, taking ownership of `fd` and closing it on
+    /// any failure.
     pub(crate) fn from_created_fd_owned_with_prefix(
         fd: RawFd,
         size: usize,
         reserved_prefix: usize,
-    ) -> Option<SvmRegion> {
-        let Some(page) = page_size().ok() else {
+    ) -> io::Result<SvmRegion> {
+        let page = page_size().map_err(|error| {
             unsafe { libc::close(fd) };
-            return None;
-        };
+            error
+        })?;
         let total = align_up(size, page);
-        let Some(reserved) = validate_prefix(reserved_prefix, total, page).ok() else {
+        let reserved = validate_prefix(reserved_prefix, total, page).map_err(|error| {
             unsafe { libc::close(fd) };
-            return None;
-        };
-        let base = Self::map_shared(fd, total).ok()?;
+            error
+        })?;
+        let base = Self::map_shared(fd, total)?;
         Self::claim_region(base, total, reserved, fd)
+            .ok_or_else(|| io::Error::other("SvmRegion: Talc failed to claim mapped memory"))
     }
 
     /// Claims the allocator over `[base + reserved, end)`. On failure, unmaps
@@ -310,7 +314,7 @@ impl Drop for SvmRegionInner {
 
 static SVM_REGION_COUNTER: AtomicU64 = AtomicU64::new(0);
 
-fn page_size() -> io::Result<usize> {
+pub fn page_size() -> io::Result<usize> {
     let page = unsafe { libc::sysconf(libc::_SC_PAGESIZE) };
     if page <= 0 {
         return Err(io::Error::other(

@@ -25,6 +25,9 @@ impl Segment {
     }
 
     /// Create a Segment whose mapping can be attached by another process.
+    ///
+    /// The shared mapping and its backing file are rounded up to a page
+    /// multiple, so `size` is a minimum rather than an exact size.
     pub fn shared(name: &str, size: usize) -> Result<Self, io::Error> {
         Self::shared_impl(name, size, None)
     }
@@ -32,11 +35,12 @@ impl Segment {
     /// Create a shared Segment whose first `reserved_prefix` bytes stay
     /// outside the allocator's ownership.
     ///
-    /// The prefix must be page-aligned and smaller than the page-rounded
-    /// mapping size. Talc claims only `[base + reserved_prefix, end)`, while
-    /// allocation offsets remain relative to the mapping base, so a fixed
-    /// shared header can live at offset zero without changing `alloc`/`free`
-    /// semantics.
+    /// The shared mapping and its backing file are rounded up to a page
+    /// multiple. The prefix must be page-aligned and smaller than the
+    /// page-rounded mapping size. Talc claims only
+    /// `[base + reserved_prefix, end)`, while allocation offsets remain
+    /// relative to the mapping base, so a fixed shared header can live at
+    /// offset zero without changing `alloc`/`free` semantics.
     pub fn shared_with_reserved_prefix(
         name: &str,
         size: usize,
@@ -59,15 +63,10 @@ impl Segment {
 
         // Round the file and mapping to the same page multiple so the sizes
         // always agree and the mapping never extends past the file.
-        let page = unsafe { libc::sysconf(libc::_SC_PAGESIZE) };
-        if page <= 0 {
-            return Err(io::Error::other(
-                "sysconf(_SC_PAGESIZE) must return a positive page size",
-            ));
-        }
-        let total = align_up(size, page as usize);
+        let page = crate::page_size()?;
+        let total = align_up(size, page);
         if let Some(prefix) = reserved_prefix
-            && (prefix % page as usize != 0 || prefix >= total)
+            && (prefix % page != 0 || prefix >= total)
         {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
@@ -95,8 +94,7 @@ impl Segment {
         let region = match reserved_prefix {
             None => SvmRegion::from_created_fd_owned(fd, total),
             Some(prefix) => SvmRegion::from_created_fd_owned_with_prefix(fd, total, prefix),
-        }
-        .ok_or_else(io::Error::last_os_error)?;
+        }?;
         Ok(Self {
             region,
             shareable: true,
@@ -204,12 +202,8 @@ mod tests {
     #[test]
     fn page_reserved_shared_segment_keeps_offset_zero_untouched() {
         let page = page_size();
-        let segment = Segment::shared_with_reserved_prefix(
-            "hammer-test-reserved",
-            2 * page,
-            page,
-        )
-        .expect("page-reserved shared segment");
+        let segment = Segment::shared_with_reserved_prefix("hammer-test-reserved", 2 * page, page)
+            .expect("page-reserved shared segment");
         unsafe { segment.base().write(0xAA) };
 
         let offset = segment
@@ -239,12 +233,8 @@ mod tests {
     fn reserved_shared_segment_rounds_requested_and_file_sizes_to_pages() {
         let page = page_size();
         let requested = page + 1000;
-        let segment = Segment::shared_with_reserved_prefix(
-            "hammer-test-sizes",
-            requested,
-            page,
-        )
-        .expect("page-reserved shared segment");
+        let segment = Segment::shared_with_reserved_prefix("hammer-test-sizes", requested, page)
+            .expect("page-reserved shared segment");
         let rounded = page * 2;
         assert_eq!(
             segment.size(),
@@ -257,8 +247,7 @@ mod tests {
         assert_eq!(result, 0, "fstat must succeed");
         let stat = unsafe { stat.assume_init() };
         assert_eq!(
-            stat.st_size as usize,
-            rounded,
+            stat.st_size as usize, rounded,
             "file size must match the page-rounded mapping size"
         );
     }
@@ -267,12 +256,8 @@ mod tests {
     fn reserved_shared_segment_exhaustion_fails_without_touching_the_prefix() {
         let page = page_size();
         // One reserved page leaves exactly one page for the allocator.
-        let segment = Segment::shared_with_reserved_prefix(
-            "hammer-test-exhaust",
-            2 * page,
-            page,
-        )
-        .expect("page-reserved shared segment");
+        let segment = Segment::shared_with_reserved_prefix("hammer-test-exhaust", 2 * page, page)
+            .expect("page-reserved shared segment");
         unsafe { segment.base().write(0x5A) };
 
         let mut allocations = 0usize;
