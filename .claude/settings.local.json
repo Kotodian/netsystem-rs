@@ -226,7 +226,21 @@
       "Bash(echo \"---worker-diff-stat-exit:$?\")",
       "Bash(set -o pipefail)",
       "Bash(echo \"diff-check exit=$?\")",
-      "Bash(echo \"scan-exit=$?\")"
+      "Bash(echo \"scan-exit=$?\")",
+      "Bash(diffstat)",
+      "Read(//Users/linqiankai/.cargo/registry/src/**)",
+      "Bash(rustfmt --edition 2021 crates/hammer-runtime/tests/process_daemon.rs)",
+      "Bash(rustfmt --edition 2024 crates/hammer-runtime/tests/process_daemon.rs crates/hammer-plugins/ip/src/ip/reassembly.rs crates/hammer/src/main.rs)",
+      "Bash(rustfmt --edition 2024 --emit stdout crates/hammer-runtime/tests/process_daemon.rs)",
+      "Bash(echo \"GREP_EXIT=$?\")",
+      "Bash(echo \"MERGE_EXIT=$?\")",
+      "Bash(echo \"LSREMOTE_EXIT=$?\")",
+      "Bash(echo \"CLEAN_EXIT=$?\")",
+      "Bash(sed -i '' 's/BinaryApiError/BinaryApiServerError/g' crates/hammer-service/src/binary_api.rs)",
+      "Bash(sed -i '' '24s/BinaryApiServerError/BinaryApiError/' crates/hammer-service/src/binary_api.rs)",
+      "Bash(sed -i '' '26s/BinaryApiServerError/BinaryApiError/' crates/hammer-service/src/binary_api.rs)",
+      "Bash(rustfmt --edition 2021 /Users/linqiankai/rust/src/github.com/Kotodian/hammer-ios-rs/crates/hammer-runtime/src/file/mod.rs /Users/linqiankai/rust/src/github.com/Kotodian/hammer-ios-rs/crates/hammer-runtime/src/lib.rs /Users/linqiankai/rust/src/github.com/Kotodian/hammer-ios-rs/crates/hammer-runtime/tests/async_file_main.rs)",
+      "Bash(rustfmt --edition 2024 /Users/linqiankai/rust/src/github.com/Kotodian/hammer-ios-rs/crates/hammer-runtime/src/file/mod.rs /Users/linqiankai/rust/src/github.com/Kotodian/hammer-ios-rs/crates/hammer-runtime/src/lib.rs)"
     ]
   }
 }
