@@ -66,12 +66,36 @@ impl BinaryApiMethodReply {
 pub struct BinaryApiMethodEntry {
     name: &'static str,
     call: BinaryApiMethodFn,
+    /// Multi-process-safe flag after VPP's `vl_msg_api_msg_config_t`
+    /// `is_mp_safe` bit (api_common.h:122), copied to the registered message
+    /// at registration (api_shared.c:754). A set flag dispatches the method
+    /// without the worker barrier.
+    is_mp_safe: bool,
 }
 
 impl BinaryApiMethodEntry {
+    /// Legacy constructor: the method runs under the worker barrier
+    /// (`is_mp_safe` defaults to false).
     #[doc(hidden)]
     pub const fn new(name: &'static str, call: BinaryApiMethodFn) -> Self {
-        Self { name, call }
+        Self {
+            name,
+            call,
+            is_mp_safe: false,
+        }
+    }
+
+    /// Marks the method multi-process safe: dispatch runs it on the serial
+    /// Main Thread with no worker barrier, after VPP's `is_mp_safe`
+    /// (`msg_handler_internal` takes the barrier only when `!m->is_mp_safe`,
+    /// api_shared.c:545, 564).
+    #[doc(hidden)]
+    pub const fn mp_safe(self) -> Self {
+        Self {
+            name: self.name,
+            call: self.call,
+            is_mp_safe: true,
+        }
     }
 
     #[inline]
@@ -80,7 +104,42 @@ impl BinaryApiMethodEntry {
     }
 
     #[inline]
+    pub const fn is_mp_safe(self) -> bool {
+        self.is_mp_safe
+    }
+
+    #[inline]
     pub fn call(self, request: &[u8]) -> BinaryApiMethodReply {
         (self.call)(RSlice::from_slice(request))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn noop_reply(_request: RSlice<'_, u8>) -> BinaryApiMethodReply {
+        BinaryApiMethodReply::ok(Vec::new())
+    }
+
+    #[test]
+    fn new_defaults_to_not_mp_safe() {
+        let entry = BinaryApiMethodEntry::new("test.method", noop_reply);
+        assert_eq!(entry.name(), "test.method");
+        assert!(!entry.is_mp_safe(), "legacy entries run under the barrier");
+    }
+
+    #[test]
+    fn mp_safe_marks_the_entry_mp_safe() {
+        let entry = BinaryApiMethodEntry::new("test.readonly", noop_reply).mp_safe();
+        assert_eq!(entry.name(), "test.readonly");
+        assert!(entry.is_mp_safe());
+    }
+
+    #[test]
+    fn mp_safe_builder_is_const() {
+        const ENTRY: BinaryApiMethodEntry =
+            BinaryApiMethodEntry::new("test.readonly", noop_reply).mp_safe();
+        assert!(ENTRY.is_mp_safe());
     }
 }

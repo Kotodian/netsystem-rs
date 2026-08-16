@@ -110,7 +110,10 @@ impl RequestPhase {
             // Control-stream-only frames (RFC 9114 Sections 7.2.3, 7.2.4,
             // 7.2.6, 7.2.7).
             (
-                FrameType::CANCEL_PUSH | FrameType::SETTINGS | FrameType::GOAWAY | FrameType::MAX_PUSH_ID,
+                FrameType::CANCEL_PUSH
+                | FrameType::SETTINGS
+                | FrameType::GOAWAY
+                | FrameType::MAX_PUSH_ID,
                 _,
             ) => Err(ErrorCode::FrameUnexpected),
             // A client MUST NOT send PUSH_PROMISE (RFC 9114 Section 7.2.5).
@@ -303,7 +306,9 @@ pub(crate) fn validate_connect_request_field_section(
 /// Synchronous and lock-free, with one decode allocation; the returned
 /// authority and path values are moved out of the decoded block, never
 /// copied (see [`RequestPseudoHeaders`]).
-pub(crate) fn validate_request_field_section(encoded: &[u8]) -> Result<RequestPseudoHeaders, ErrorCode> {
+pub(crate) fn validate_request_field_section(
+    encoded: &[u8],
+) -> Result<RequestPseudoHeaders, ErrorCode> {
     let mut read = encoded;
     let fields = decode_block(&mut read).map_err(|_| ErrorCode::QpackDecompressionFailed)?;
 
@@ -537,7 +542,9 @@ pub(crate) fn publish_request_field_section(
     // checks presence before value.
     let method = parse_method(&method.ok_or(RequestPublishError::MessageError)?)
         .map_err(|_| RequestPublishError::GeneralProtocolError)?;
-    validator.finish().map_err(|_| RequestPublishError::MessageError)?;
+    validator
+        .finish()
+        .map_err(|_| RequestPublishError::MessageError)?;
 
     // `finish` guarantees exactly one non-empty `:scheme` and `:path` for
     // an ordinary request and an `:authority` or a matching `Host`; this
@@ -636,11 +643,13 @@ mod tests {
         RequestPhase, RequestPublishError, publish_request_field_section,
         validate_connect_request_field_section, validate_request_field_section,
     };
+    use crate::http_common::{
+        DecodedHeaderName, FieldLineFlags, ReqMethod, UrlScheme, decode, header_name,
+    };
     use crate::http3::proto::error::ErrorCode;
     use crate::http3::proto::frame::FrameType;
     use crate::http3::proto::qpack::block::encode_block;
     use crate::http3::proto::qpack::field::HeaderField;
-    use crate::http_common::{DecodedHeaderName, FieldLineFlags, ReqMethod, UrlScheme, decode, header_name};
     use hammer_infra::fifo::Fifo;
     use hammer_infra::segment::Segment;
     use std::borrow::Cow;
@@ -1152,7 +1161,10 @@ mod tests {
         assert_eq!(decoded.body, b"");
         let headers: Vec<_> = decoded.headers().collect();
         assert_eq!(headers.len(), 2);
-        assert_eq!(headers[0].name, DecodedHeaderName::Known(header_name::ACCEPT));
+        assert_eq!(
+            headers[0].name,
+            DecodedHeaderName::Known(header_name::ACCEPT)
+        );
         assert_eq!(headers[0].value, b"text/html");
         assert_eq!(headers[1].name, DecodedHeaderName::Custom(b"x-test"));
         assert_eq!(headers[1].value, b"1");
@@ -1294,10 +1306,7 @@ mod tests {
         // "0" is a valid declared length, and u64::MAX is the exact
         // overflow boundary of the checked digit walk
         // (http_private.h:816).
-        for (value, expected) in [
-            ("0", Some(0)),
-            ("18446744073709551615", Some(u64::MAX)),
-        ] {
+        for (value, expected) in [("0", Some(0)), ("18446744073709551615", Some(u64::MAX))] {
             let encoded = section(&[
                 HeaderField::new(":method", "GET"),
                 HeaderField::new(":scheme", "https"),

@@ -2213,6 +2213,10 @@ pub fn session_transport(args: TokenStream, input: TokenStream) -> TokenStream {
 
 struct BinaryApiArgs {
     name: LitStr,
+    /// Bare `mp_safe` marker, after VPP's `vl_msg_api_msg_config_t`
+    /// `is_mp_safe` bit (api_common.h:122): absent means the legacy barriered
+    /// dispatch.
+    mp_safe: bool,
 }
 
 struct RuntimeErrorArgs {
@@ -2323,19 +2327,50 @@ fn expand_runtime_error(args: RuntimeErrorArgs, item: Item) -> Result<TokenStrea
 
 impl Parse for BinaryApiArgs {
     fn parse(input: ParseStream<'_>) -> Result<Self> {
-        let key: Ident = input.parse()?;
-        if key != "name" {
-            return Err(Error::new(key.span(), "expected `name`"));
+        let mut name: Option<LitStr> = None;
+        let mut mp_safe = false;
+        while !input.is_empty() {
+            let key: Ident = input.parse()?;
+            match key.to_string().as_str() {
+                "name" => {
+                    input.parse::<Token![=]>()?;
+                    if name.is_some() {
+                        return Err(Error::new(key.span(), "duplicate `name` argument"));
+                    }
+                    let value: LitStr = input.parse()?;
+                    if value.value().trim().is_empty() {
+                        return Err(Error::new(value.span(), "Binary API method name is empty"));
+                    }
+                    name = Some(value);
+                }
+                "mp_safe" => {
+                    if input.peek(Token![=]) {
+                        return Err(Error::new(
+                            key.span(),
+                            "the `mp_safe` argument takes no value; write `mp_safe` alone",
+                        ));
+                    }
+                    if mp_safe {
+                        return Err(Error::new(key.span(), "duplicate `mp_safe` argument"));
+                    }
+                    mp_safe = true;
+                }
+                other => {
+                    return Err(Error::new(
+                        key.span(),
+                        format!(
+                            "unknown Binary API argument `{other}`; expected `name` or `mp_safe`"
+                        ),
+                    ));
+                }
+            }
+            if input.is_empty() {
+                break;
+            }
+            input.parse::<Token![,]>()?;
         }
-        input.parse::<Token![=]>()?;
-        let name: LitStr = input.parse()?;
-        if name.value().trim().is_empty() {
-            return Err(Error::new(name.span(), "Binary API method name is empty"));
-        }
-        if input.parse::<Option<Token![,]>>()?.is_some() || !input.is_empty() {
-            return Err(Error::new(input.span(), "unexpected Binary API argument"));
-        }
-        Ok(Self { name })
+        let name = name.ok_or_else(|| Error::new(Span::call_site(), "missing `name` argument"))?;
+        Ok(Self { name, mp_safe })
     }
 }
 
@@ -2388,6 +2423,17 @@ fn expand_binary_api(args: BinaryApiArgs, function: ItemFn) -> Result<TokenStrea
         to_snake_case(&function_name.to_string()).to_ascii_uppercase()
     );
     let name = args.name;
+    // Absent `mp_safe` keeps the legacy `new` constructor (barriered); the
+    // bare marker appends the mp-safe builder, after VPP's `is_mp_safe` flag.
+    let entry = if args.mp_safe {
+        quote! {
+            ::hammer_runtime::__private::BinaryApiMethodEntry::new(#name, #adapter_name).mp_safe()
+        }
+    } else {
+        quote! {
+            ::hammer_runtime::__private::BinaryApiMethodEntry::new(#name, #adapter_name)
+        }
+    };
     let conditional_attributes: Vec<_> = function
         .attrs
         .iter()
@@ -2422,8 +2468,7 @@ fn expand_binary_api(args: BinaryApiArgs, function: ItemFn) -> Result<TokenStrea
         }
 
         #(#conditional_attributes)*
-        pub(crate) static #static_name: ::hammer_runtime::__private::BinaryApiMethodEntry =
-            ::hammer_runtime::__private::BinaryApiMethodEntry::new(#name, #adapter_name);
+        pub(crate) static #static_name: ::hammer_runtime::__private::BinaryApiMethodEntry = #entry;
     })
 }
 
@@ -3622,6 +3667,91 @@ mod tests {
         expand_registered_function(arguments, function)
             .expect("expand init function")
             .to_string()
+    }
+
+    fn expand_binary_api_method(arguments: &str, function: &str) -> String {
+        let args = syn::parse_str::<BinaryApiArgs>(arguments).expect("parse binary api arguments");
+        let function = syn::parse_str::<ItemFn>(function).expect("parse binary api function");
+        expand_binary_api(args, function)
+            .expect("expand binary api method")
+            .to_string()
+    }
+
+    #[test]
+    fn binary_api_absent_mp_safe_defaults_to_barriered_new() {
+        let expanded = expand_binary_api_method(
+            r#"name = "test.echo""#,
+            "fn echo(request: EchoRequest) -> EchoReply { EchoReply {} }",
+        );
+        assert!(expanded.contains("BinaryApiMethodEntry :: new"));
+        assert!(
+            !expanded.contains("mp_safe"),
+            "absent mp_safe must keep the legacy `new` constructor: {expanded}"
+        );
+    }
+
+    #[test]
+    fn binary_api_mp_safe_marker_emits_mp_safe_builder() {
+        let expanded = expand_binary_api_method(
+            r#"name = "test.readonly", mp_safe"#,
+            "fn read_only(request: ReadOnlyRequest) -> ReadOnlyReply { ReadOnlyReply {} }",
+        );
+        assert!(expanded.contains("BinaryApiMethodEntry :: new"));
+        assert!(
+            expanded.contains("mp_safe"),
+            "the bare marker must append the mp-safe builder: {expanded}"
+        );
+    }
+
+    #[test]
+    fn binary_api_accepts_mp_safe_before_name() {
+        let expanded = expand_binary_api_method(
+            r#"mp_safe, name = "test.readonly""#,
+            "fn read_only(request: ReadOnlyRequest) -> ReadOnlyReply { ReadOnlyReply {} }",
+        );
+        assert!(expanded.contains("BinaryApiMethodEntry :: new"));
+        assert!(expanded.contains("mp_safe"));
+    }
+
+    #[test]
+    fn binary_api_rejects_valued_mp_safe() {
+        let error = match syn::parse_str::<BinaryApiArgs>(r#"name = "test.echo", mp_safe = true"#) {
+            Ok(_) => panic!("valued mp_safe must be rejected"),
+            Err(error) => error,
+        };
+        assert!(
+            error
+                .to_string()
+                .contains("`mp_safe` argument takes no value"),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[test]
+    fn binary_api_rejects_duplicate_mp_safe() {
+        let error = match syn::parse_str::<BinaryApiArgs>(r#"name = "test.echo", mp_safe, mp_safe"#)
+        {
+            Ok(_) => panic!("duplicate mp_safe must be rejected"),
+            Err(error) => error,
+        };
+        assert!(
+            error.to_string().contains("duplicate `mp_safe` argument"),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[test]
+    fn binary_api_rejects_unknown_argument() {
+        let error = match syn::parse_str::<BinaryApiArgs>(r#"name = "test.echo", foo = 1"#) {
+            Ok(_) => panic!("unknown argument must be rejected"),
+            Err(error) => error,
+        };
+        assert!(
+            error
+                .to_string()
+                .contains("unknown Binary API argument `foo`"),
+            "unexpected error: {error}"
+        );
     }
 
     #[test]

@@ -8,11 +8,13 @@ hammer_runtime::__declare_registration_image!(
         session::__INIT_FN_SESSION_INIT,
         session::__INIT_FN_SESSION_ATTACH_SERVER,
         transport::__INIT_FN_TRANSPORT_INIT,
+        stats::__INIT_FN_STATS_INIT,
     ];
     config_functions = [];
     early_config_functions = [
         binary_api::__CONFIG_FN_BINARY_API_CONFIG,
         session::__CONFIG_FN_SESSION_CONFIG,
+        stats::__CONFIG_FN_STATS_CONFIG,
     ];
     main_loop_enter_functions = [];
     main_loop_exit_functions = [session::__INIT_FN_EXIT_SESSION];
@@ -28,10 +30,16 @@ hammer_runtime::__declare_registration_image!(
         session::node::__SESSION_GRAPH_NODE_SESSION_QUEUE_NODE,
     ];
     node_functions = [];
-    process_nodes = [binary_api::__PROCESS_NODE_BINARY_API];
+    process_nodes = [
+        binary_api::__PROCESS_NODE_BINARY_API,
+        stats::__PROCESS_NODE_STATS_COLLECTOR,
+    ];
     session_transports = [];
     session_apps = [];
-    binary_api_methods = [];
+    binary_api_methods = [
+        stats::__BINARY_API_STATS_LIST,
+        stats::__BINARY_API_STATS_DUMP,
+    ];
 );
 
 #[doc(hidden)]
@@ -51,6 +59,9 @@ pub mod net;
 pub mod opaque;
 /// Session layer — shared infrastructure, not a plugin.
 pub mod session;
+// Stats segment capability, collector Process Node, and `stats.*` Binary
+// API methods. Crate-internal: the public surface is the Binary API wire.
+mod stats;
 /// Transport-neutral helpers. Protocol plugins live under `hammer-plugins/transport/`.
 pub mod transport;
 

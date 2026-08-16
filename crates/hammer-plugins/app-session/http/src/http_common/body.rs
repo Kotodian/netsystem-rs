@@ -111,9 +111,7 @@ impl BodyAccumulator {
     /// all pass.
     pub(crate) fn finish(&self, stream_finished: bool) -> Result<(), BodyError> {
         match self {
-            BodyAccumulator::Receiving { .. } if stream_finished => {
-                Err(BodyError::IncompleteAtEnd)
-            }
+            BodyAccumulator::Receiving { .. } if stream_finished => Err(BodyError::IncompleteAtEnd),
             _ => Ok(()),
         }
     }

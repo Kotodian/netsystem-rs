@@ -379,7 +379,10 @@ fn connect_failure_detaches_with_typed_error() {
     let session = worker
         .session_create(TransportProtocol::Http, false)
         .expect("create");
-    pair.enqueue(&SessionConnectedMsg::new(1, Err(SessionConnectError::TimedOut)));
+    pair.enqueue(&SessionConnectedMsg::new(
+        1,
+        Err(SessionConnectError::TimedOut),
+    ));
     let error = worker
         .session_connect(session, REMOTE, None, None, None)
         .expect_err("blocking connect must fail");
@@ -444,12 +447,7 @@ fn generic_connect_enqueue_failure_rolls_back_to_closed() {
         "a failed CONNECT enqueue must roll back to Closed"
     );
     // The Session is reusable after the queue drains.
-    while pair
-        .requests
-        .dequeue_control()
-        .expect("dequeue")
-        .is_some()
-    {}
+    while pair.requests.dequeue_control().expect("dequeue").is_some() {}
     worker
         .session_connect(overflow, REMOTE, None, None, None)
         .expect("retry connect succeeds");
@@ -492,12 +490,7 @@ fn stream_connect_enqueue_failure_rolls_back_and_untracks() {
         "a failed CONNECT_STREAM enqueue must roll back to Closed"
     );
     // The child is reusable and the parent still closes cleanly.
-    while pair
-        .requests
-        .dequeue_control()
-        .expect("dequeue")
-        .is_some()
-    {}
+    while pair.requests.dequeue_control().expect("dequeue").is_some() {}
     worker
         .session_stream_connect(child, parent, REMOTE, None, SessionFlags::empty())
         .expect("retry stream connect succeeds");
@@ -605,12 +598,10 @@ fn closing_connecting_session_drops_late_connected() {
         VclSessionState::Connecting
     );
     worker.session_close(session).expect("close mid-flight");
-    assert!(
-        matches!(
-            worker.session_state(session),
-            Err(VclError::InvalidHandle { handle: h }) if h == session
-        )
-    );
+    assert!(matches!(
+        worker.session_state(session),
+        Err(VclError::InvalidHandle { handle: h }) if h == session
+    ));
     pair.enqueue(&SessionConnectedMsg {
         context: request.context,
         result: Ok(SessionHandle::new(9, 0)),

@@ -257,10 +257,7 @@ impl SessionStore {
     /// (VPP's `vcl_send_session_connect` is infallible; Hammer's control
     /// enqueue is fallible). Idempotent: a Session that is no longer
     /// Connecting is untouched.
-    pub(crate) fn rollback_connect(
-        &mut self,
-        session: VclSessionHandle,
-    ) -> Result<(), VclError> {
+    pub(crate) fn rollback_connect(&mut self, session: VclSessionHandle) -> Result<(), VclError> {
         if self.pool.state(session)? != VclSessionState::Connecting {
             return Ok(());
         }
@@ -282,7 +279,10 @@ impl SessionStore {
         if self.pool.state(child)? != VclSessionState::Connecting {
             return Ok(());
         }
-        self.pool.get_mut(parent)?.children.retain(|entry| *entry != child);
+        self.pool
+            .get_mut(parent)?
+            .children
+            .retain(|entry| *entry != child);
         let child = self.pool.get_mut(child)?;
         child.parent = None;
         child.flags = SessionFlags::empty();
@@ -593,16 +593,17 @@ impl VclWorker {
         opaque: Option<u64>,
     ) -> Result<(), VclError> {
         let params = self.store.begin_connect(session)?;
-        let connection = match self
-            .client
-            .connect(params.proto, remote, local, None, opaque, server_name)
-        {
-            Ok(connection) => connection,
-            Err(error) => {
-                self.store.rollback_connect(session)?;
-                return Err(app_error(error));
-            }
-        };
+        let connection =
+            match self
+                .client
+                .connect(params.proto, remote, local, None, opaque, server_name)
+            {
+                Ok(connection) => connection,
+                Err(error) => {
+                    self.store.rollback_connect(session)?;
+                    return Err(app_error(error));
+                }
+            };
         self.store.register_connect(session, connection);
         if params.nonblocking {
             return Ok(());
@@ -961,9 +962,7 @@ mod tests {
     #[test]
     fn begin_connect_marks_connecting_and_returns_params() {
         let mut store = store();
-        let session = store
-            .create(TransportProtocol::Http, true)
-            .expect("create");
+        let session = store.create(TransportProtocol::Http, true).expect("create");
         let params = store.begin_connect(session).expect("begin connect");
         assert_eq!(params.proto, TransportProtocol::Http);
         assert!(params.nonblocking);
@@ -1043,9 +1042,7 @@ mod tests {
     #[test]
     fn register_connect_tracks_and_resolve_clears() {
         let mut store = store();
-        let session = store
-            .create(TransportProtocol::Http, true)
-            .expect("create");
+        let session = store.create(TransportProtocol::Http, true).expect("create");
         let connection = ApplicationConnectionId::new(1, 0);
         store.register_connect(session, connection);
         assert_eq!(store.pending_connects.get(&connection), Some(&session));
@@ -1065,9 +1062,7 @@ mod tests {
     #[test]
     fn close_cascade_removes_pending_connect() {
         let mut store = store();
-        let session = store
-            .create(TransportProtocol::Http, true)
-            .expect("create");
+        let session = store.create(TransportProtocol::Http, true).expect("create");
         store.begin_connect(session).expect("begin connect");
         let connection = ApplicationConnectionId::new(1, 0);
         store.register_connect(session, connection);

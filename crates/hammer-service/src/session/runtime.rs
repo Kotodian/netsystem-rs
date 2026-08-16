@@ -7396,7 +7396,10 @@ mod tests {
             sessions.has_session(fresh),
             "the reused occupant survives the stale rollback"
         );
-        assert!(!sessions.has_session(upper), "the stale id is not the occupant");
+        assert!(
+            !sessions.has_session(upper),
+            "the stale id is not the occupant"
+        );
         assert_eq!(
             sessions
                 .entries
@@ -7496,10 +7499,7 @@ mod tests {
         // A real publisher is required to make AppWorker::connected fail
         // after the upper is attached (queue closed), the only upper-creation
         // failure that happens after the lower reverse link is attached.
-        let socket_path = format!(
-            "/tmp/hammer-upper-rollback-{}.sock",
-            std::process::id()
-        );
+        let socket_path = format!("/tmp/hammer-upper-rollback-{}.sock", std::process::id());
         let server = hammer_runtime::attach::AppServer::bind(&socket_path, 1)
             .expect("bind App server with a single publication slot");
         let publisher = server.publisher();
@@ -7540,7 +7540,10 @@ mod tests {
             RuntimeError::Attach(AttachError::PublicationQueueClosed)
         ));
         assert_eq!(sessions.entries.len(), 1, "upper entry rolls back");
-        assert!(sessions.has_session(lower), "lower survives the failed creation");
+        assert!(
+            sessions.has_session(lower),
+            "lower survives the failed creation"
+        );
         assert_eq!(
             sessions
                 .entries
@@ -7728,7 +7731,9 @@ mod tests {
             .expect("publish upper Session from callback");
         assert_eq!(sessions.lower_session(upper), Some(lower));
         assert_eq!(sessions.lower_session(lower), None);
-        sessions.remove_session(upper).expect("remove upper Session");
+        sessions
+            .remove_session(upper)
+            .expect("remove upper Session");
         assert_eq!(sessions.lower_session(upper), None);
     }
 
@@ -7765,7 +7770,9 @@ mod tests {
             .expect("publish upper Session from callback");
         assert_eq!(sessions.upper_session(lower), Some(upper));
         assert_eq!(sessions.upper_session(upper), None);
-        sessions.remove_upper_session(upper).expect("remove upper Session");
+        sessions
+            .remove_upper_session(upper)
+            .expect("remove upper Session");
         assert_eq!(sessions.upper_session(lower), None);
     }
 
@@ -7817,9 +7824,7 @@ mod tests {
             .expect("lower entry")
             .upper_session = None;
 
-        sessions
-            .remove_session(lower)
-            .expect("lower removal");
+        sessions.remove_session(lower).expect("lower removal");
         assert!(!sessions.has_session(lower), "lower is removed");
         assert!(
             sessions.has_session(upper),
@@ -8087,9 +8092,7 @@ mod tests {
             .expect("publish top upper Session");
 
         SESSION_CLEANUP_DETACHING_CALLS.store(0, Ordering::SeqCst);
-        sessions
-            .remove_session(lower)
-            .expect("lower removal");
+        sessions.remove_session(lower).expect("lower removal");
         assert!(
             !sessions.has_session(lower),
             "lower is removed before the walk"
@@ -8361,9 +8364,7 @@ mod tests {
         transport: SessionTransportId,
         index: Index,
     ) -> SessionId {
-        let (rx_fifo, tx_fifo) = sessions
-            .create_local_fifos()
-            .expect("test Session FIFOs");
+        let (rx_fifo, tx_fifo) = sessions.create_local_fifos().expect("test Session FIFOs");
         let session_id = sessions
             .insert_session_entry(SessionEntry::creating_transport(
                 transport, rx_fifo, tx_fifo,
@@ -8415,7 +8416,9 @@ mod tests {
             .expect("root entry")
             .listener = Some(sessions.session_handle(parent));
 
-        let metadata = sessions.accept_metadata(root).expect("root accept metadata");
+        let metadata = sessions
+            .accept_metadata(root)
+            .expect("root accept metadata");
         assert_eq!(metadata.flags, SessionFlags::empty());
         // Roots report their own construction-lifecycle role, never the
         // pinned listener's, and carry no parent context.
@@ -8461,7 +8464,9 @@ mod tests {
             .get_mut(bidi.pool_index())
             .expect("bidi child entry")
             .listener = Some(parent_handle);
-        let metadata = sessions.accept_metadata(bidi).expect("bidi accept metadata");
+        let metadata = sessions
+            .accept_metadata(bidi)
+            .expect("bidi accept metadata");
         assert_eq!(metadata.flags, SessionFlags::STREAM);
         assert_eq!(metadata.role, Some(SessionEndpointRole::Server));
         assert_eq!(metadata.parent_app_context, Some(42));
@@ -8473,10 +8478,7 @@ mod tests {
             Index::new(3, 1),
         );
         sessions
-            .set_session_flags(
-                uni,
-                SessionFlags::STREAM | SessionFlags::UNIDIRECTIONAL,
-            )
+            .set_session_flags(uni, SessionFlags::STREAM | SessionFlags::UNIDIRECTIONAL)
             .expect("derive uni stream flags");
         sessions
             .entries
@@ -8503,7 +8505,9 @@ mod tests {
             SessionTransportId::new(1),
             Index::new(1, 1),
         );
-        let metadata = sessions.accept_metadata(root).expect("root accept metadata");
+        let metadata = sessions
+            .accept_metadata(root)
+            .expect("root accept metadata");
         assert_eq!(metadata.role, Some(SessionEndpointRole::Client));
         assert_eq!(metadata.parent_app_context, None);
     }
@@ -8521,10 +8525,7 @@ mod tests {
         let parent_handle = sessions.session_handle(parent);
         for (slot, flags) in [
             (2, SessionFlags::STREAM),
-            (
-                3,
-                SessionFlags::STREAM | SessionFlags::UNIDIRECTIONAL,
-            ),
+            (3, SessionFlags::STREAM | SessionFlags::UNIDIRECTIONAL),
         ] {
             let child = insert_metadata_test_session(
                 &mut sessions,
@@ -8555,9 +8556,11 @@ mod tests {
         let mut sessions = metadata_test_worker();
         // A Session id that was never installed (in-bounds slot, wrong
         // generation) and one that was removed both fail the pool lookup.
-        assert!(sessions
-            .accept_metadata(SessionId::from(Index::new(1023, 1)))
-            .is_none());
+        assert!(
+            sessions
+                .accept_metadata(SessionId::from(Index::new(1023, 1)))
+                .is_none()
+        );
         let removed = insert_metadata_test_session(
             &mut sessions,
             SessionTransportId::new(1),
@@ -8624,9 +8627,9 @@ mod tests {
             .get_mut(orphan_child.pool_index())
             .expect("orphan child entry")
             .listener = Some(SessionHandle::new(
-                sessions.session_handle(parent).session_index(),
-                1,
-            ));
+            sessions.session_handle(parent).session_index(),
+            1,
+        ));
         let metadata = sessions
             .accept_metadata(orphan_child)
             .expect("orphan child accept metadata");
@@ -8691,7 +8694,9 @@ mod tests {
             .expect("second parent entry")
             .accepted = true;
 
-        let metadata = sessions.accept_metadata(child).expect("child accept metadata");
+        let metadata = sessions
+            .accept_metadata(child)
+            .expect("child accept metadata");
         assert_eq!(
             metadata.parent_app_context,
             Some(200),

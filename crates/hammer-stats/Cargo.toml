@@ -1,0 +1,10 @@
+[package]
+name = "hammer-stats"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+
+[dependencies]
+hammer-infra = { path = "../hammer-infra" }
+prometheus = { version = "0.14", default-features = false }
+regex = "1"

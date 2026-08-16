@@ -35,3 +35,4 @@ pub mod thread_owned;
 pub mod timer_wheel;
 
 pub use main_heap::PageSize;
+pub use svm_region::page_size;

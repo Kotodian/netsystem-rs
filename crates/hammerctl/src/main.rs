@@ -1,10 +1,13 @@
 //! hammerctl — CLI client for hammer daemon
 
+use std::io;
 use std::path::PathBuf;
 use std::process::ExitCode;
 
 use clap::{Parser, Subcommand};
 use hammer_ipc::binary_api::BinaryApiClient;
+
+mod stats;
 
 /// Default Binary API Unix socket path, matching the convention documented
 /// in the example daemon config (`examples/tun-tcp-echo.toml`).
@@ -35,6 +38,9 @@ enum Command {
         #[arg(default_value = "")]
         payload_hex: String,
     },
+    /// Inspect the daemon's live stats segment
+    #[command(subcommand)]
+    Stats(stats::StatsCommand),
 }
 
 fn main() -> ExitCode {
@@ -43,32 +49,42 @@ fn main() -> ExitCode {
         std::process::exit(1);
     });
     let cli = Cli::parse();
-    let Command::Send {
-        method,
-        payload_hex,
-    } = &cli.cmd;
-    let payload = match decode_payload(payload_hex) {
-        Ok(payload) => payload,
-        Err(error) => {
-            eprintln!("Invalid hex payload: {error}");
-            return ExitCode::FAILURE;
+    match &cli.cmd {
+        Command::Send {
+            method,
+            payload_hex,
+        } => {
+            let payload = match decode_payload(payload_hex) {
+                Ok(payload) => payload,
+                Err(error) => {
+                    eprintln!("Invalid hex payload: {error}");
+                    return ExitCode::FAILURE;
+                }
+            };
+            let mut client = match BinaryApiClient::connect(&cli.socket) {
+                Ok(client) => client,
+                Err(error) => {
+                    eprintln!("Failed to {error}");
+                    return ExitCode::FAILURE;
+                }
+            };
+            match client.call(method, &payload) {
+                Ok(reply) => println!("{}", format_reply(&reply)),
+                Err(error) => {
+                    eprintln!("Binary API call `{method}` failed: {error}");
+                    return ExitCode::FAILURE;
+                }
+            }
+            ExitCode::SUCCESS
         }
-    };
-    let mut client = match BinaryApiClient::connect(&cli.socket) {
-        Ok(client) => client,
-        Err(error) => {
-            eprintln!("Failed to {error}");
-            return ExitCode::FAILURE;
-        }
-    };
-    match client.call(method, &payload) {
-        Ok(reply) => println!("{}", format_reply(&reply)),
-        Err(error) => {
-            eprintln!("Binary API call `{method}` failed: {error}");
-            return ExitCode::FAILURE;
-        }
+        Command::Stats(command) => match stats::run(&cli.socket, command, &mut io::stdout()) {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(error) => {
+                eprintln!("stats command failed: {error}");
+                ExitCode::FAILURE
+            }
+        },
     }
-    ExitCode::SUCCESS
 }
 
 fn decode_payload(payload_hex: &str) -> Result<Vec<u8>, hex::FromHexError> {
@@ -95,7 +111,10 @@ mod tests {
         let Command::Send {
             method,
             payload_hex,
-        } = bare.cmd;
+        } = bare.cmd
+        else {
+            panic!("expected send")
+        };
         assert_eq!(method, "show_version");
         assert_eq!(payload_hex, "");
 
@@ -103,7 +122,10 @@ mod tests {
         let Command::Send {
             method,
             payload_hex,
-        } = hex.cmd;
+        } = hex.cmd
+        else {
+            panic!("expected send")
+        };
         assert_eq!(method, "method");
         assert_eq!(payload_hex, "00ff10");
     }
@@ -119,6 +141,49 @@ mod tests {
         assert_eq!(after.socket, PathBuf::from("/tmp/b.sock"));
 
         let default = Cli::try_parse_from(["hammerctl", "send", "m"]).expect("default socket");
+        assert_eq!(default.socket, PathBuf::from(DEFAULT_SOCKET));
+    }
+
+    #[test]
+    fn parses_stats_list_and_dump_with_zero_or_many_patterns() {
+        let bare = Cli::try_parse_from(["hammerctl", "stats", "list"]).expect("stats list");
+        match bare.cmd {
+            Command::Stats(stats::StatsCommand::List { patterns }) => {
+                assert!(patterns.is_empty(), "no patterns selects all entries")
+            }
+            other => panic!("expected stats list, got {other:?}"),
+        }
+
+        let one = Cli::try_parse_from(["hammerctl", "stats", "dump", "/sys/.*"])
+            .expect("stats dump with one pattern");
+        match one.cmd {
+            Command::Stats(stats::StatsCommand::Dump { patterns }) => {
+                assert_eq!(patterns, vec!["/sys/.*"])
+            }
+            other => panic!("expected stats dump, got {other:?}"),
+        }
+
+        let many = Cli::try_parse_from(["hammerctl", "stats", "list", "a", "b", "c"])
+            .expect("stats list with patterns");
+        match many.cmd {
+            Command::Stats(stats::StatsCommand::List { patterns }) => {
+                assert_eq!(patterns, vec!["a", "b", "c"])
+            }
+            other => panic!("expected stats list, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn socket_flag_is_global_across_nested_stats_subcommands() {
+        let before = Cli::try_parse_from(["hammerctl", "--socket", "/tmp/a.sock", "stats", "list"])
+            .expect("socket before nested subcommand");
+        assert_eq!(before.socket, PathBuf::from("/tmp/a.sock"));
+
+        let after = Cli::try_parse_from(["hammerctl", "stats", "dump", "--socket", "/tmp/b.sock"])
+            .expect("socket after nested subcommand");
+        assert_eq!(after.socket, PathBuf::from("/tmp/b.sock"));
+
+        let default = Cli::try_parse_from(["hammerctl", "stats", "list"]).expect("default socket");
         assert_eq!(default.socket, PathBuf::from(DEFAULT_SOCKET));
     }
 

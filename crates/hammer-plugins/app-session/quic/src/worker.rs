@@ -8271,9 +8271,11 @@ mod tests {
             "the peer FIN and every byte are fully received"
         );
         let queued = relay.worker.connection_tx_pending.len();
-        relay
-            .worker
-            .stop_sending(&mut relay.sessions, child, SessionApplicationErrorCode::from(42))?;
+        relay.worker.stop_sending(
+            &mut relay.sessions,
+            child,
+            SessionApplicationErrorCode::from(42),
+        )?;
         assert_eq!(
             relay.worker.connection_tx_pending.len(),
             queued,
@@ -8721,12 +8723,11 @@ mod tests {
         relay
             .worker
             .schedule_connection_outputs(&mut relay.sessions, relay.now)?;
-        let (_, lower_tx) = relay
-            .sessions
-            .fifo_pair(relay.lower)
-            .ok_or_else(|| QuicWorkerError::SessionMissing {
+        let (_, lower_tx) = relay.sessions.fifo_pair(relay.lower).ok_or_else(|| {
+            QuicWorkerError::SessionMissing {
                 session: relay.lower,
-            })?;
+            }
+        })?;
         let mut responses = Vec::new();
         loop {
             if lower_tx.max_dequeue() < SessionDgramHeader::SIZE {
@@ -8741,12 +8742,13 @@ mod tests {
                 break;
             };
             let payload_len = header.data_length() as usize;
-            let record_len = header.total_len().ok_or_else(|| {
-                QuicWorkerError::InvalidDatagram {
-                    session: relay.lower,
-                    length: header.data_length(),
-                }
-            })?;
+            let record_len =
+                header
+                    .total_len()
+                    .ok_or_else(|| QuicWorkerError::InvalidDatagram {
+                        session: relay.lower,
+                        length: header.data_length(),
+                    })?;
             if lower_tx.max_dequeue() < record_len {
                 break;
             }
@@ -8951,9 +8953,11 @@ mod tests {
         );
         // A repeated dispatch is suppressed by the AppClosed guard with Ok,
         // matching VPP pre-close-only dispatch.
-        assert!(sessions
-            .close_connection(bidi, SessionApplicationErrorCode::from(3), b"shutting down")
-            .is_ok());
+        assert!(
+            sessions
+                .close_connection(bidi, SessionApplicationErrorCode::from(3), b"shutting down")
+                .is_ok()
+        );
         assert!(sessions.session_app_closed(bidi));
         assert!(
             worker

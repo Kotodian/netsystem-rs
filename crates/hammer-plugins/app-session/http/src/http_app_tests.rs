@@ -1770,8 +1770,7 @@ fn cleanup_releases_peer_uni_stream_context_at_teardown() {
         assert_eq!(http.stream_len(), 0, "the uni stream context is released");
         let connection = http.get(parent_context).map_err(RuntimeError::from)?;
         assert_eq!(
-            connection.peer_control,
-            None,
+            connection.peer_control, None,
             "the peer control slot is cleared"
         );
         assert!(
@@ -2474,9 +2473,7 @@ fn builtin_rx_post_abort_trailing_headers_drains_without_recreating_upper() {
         0,
         "the trailing HEADERS bytes dequeue exactly once"
     );
-    RESET_CALLS.with(|calls| {
-        assert_eq!(calls.get(), 0, "the drain sends no second stream reset")
-    });
+    RESET_CALLS.with(|calls| assert_eq!(calls.get(), 0, "the drain sends no second stream reset"));
 }
 
 /// A disconnect/FIN arriving after `ResetStreamAbortRequest` aborted the
@@ -2528,8 +2525,7 @@ fn disconnect_after_abort_is_clean_without_revalidation_or_recreation() {
     // The FIN arrives on the drain-only stream: no RequestIncomplete
     // revalidation, no upper re-creation, no extra reset or close, and the
     // live lower stream context is released.
-    disconnect_on(&main, &mut sessions, child, u64::from(stream))
-        .expect("post-abort FIN is clean");
+    disconnect_on(&main, &mut sessions, child, u64::from(stream)).expect("post-abort FIN is clean");
     assert!(
         !sessions.has_session(upper),
         "the FIN does not recreate the upper request Session"
@@ -2692,7 +2688,10 @@ fn builtin_rx_data_publish_failure_abort_drains_remaining_rx() {
     builtin_rx_on(&main, &mut sessions, child, u64::from(stream))
         .expect("capacity aborts the request, not the publication");
     RESET_CALLS.with(|calls| assert_eq!(calls.get(), 1, "the stream resets exactly once"));
-    assert!(!sessions.has_session(upper), "the upper request Session is removed");
+    assert!(
+        !sessions.has_session(upper),
+        "the upper request Session is removed"
+    );
 
     // The peer's remaining RX bytes (here a fresh DATA frame past the
     // rejected one) drain silently: parsed, dequeued, nothing published.
