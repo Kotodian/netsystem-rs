@@ -5,3 +5,4 @@
 //! socket, mirroring VPP's separate vat2 client process.
 
 pub mod binary_api;
+pub mod stats;

@@ -3,14 +3,16 @@
 
 use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::time::Duration;
 
+use hammer_ipc::stats::{DumpValue, EntryId, StatsClient, StatsClientError, StatsServerError};
 use hammer_runtime::RuntimeRegistry;
 use hammer_runtime::config::Worker;
 use hammer_runtime::{Engine, EnginePool, PluginError, PluginMain};
 use hammer_service::binary_api::{
-    BinaryApiClient, BinaryApiReply, BinaryApiRequest, BinaryApiStatus, DEFAULT_MAX_FRAME_BYTES,
+    BinaryApiClient, BinaryApiError, BinaryApiReply, BinaryApiRequest, BinaryApiStatus,
+    DEFAULT_MAX_FRAME_BYTES,
 };
 use prost::Message;
 
@@ -73,6 +75,38 @@ fn large(_: LargeRequest) -> LargeReply {
     }
 }
 
+static MP_SAFE_BARRIER_SEEN: AtomicBool = AtomicBool::new(false);
+static MP_SAFE_CALL_COUNT: AtomicU32 = AtomicU32::new(0);
+
+#[derive(Clone, PartialEq, Message)]
+struct MpSafeRequest {
+    #[prost(string, tag = "1")]
+    text: String,
+}
+
+#[derive(Clone, PartialEq, Message)]
+struct MpSafeReply {
+    #[prost(string, tag = "1")]
+    text: String,
+    #[prost(string, tag = "2")]
+    thread: String,
+    #[prost(uint32, tag = "3")]
+    sequence: u32,
+}
+
+#[hammer_component_macros::binary_api(name = "test.mp_safe", mp_safe)]
+fn mp_safe_read(request: MpSafeRequest) -> MpSafeReply {
+    MP_SAFE_BARRIER_SEEN.store(
+        Engine::with_current(|engine| engine.worker_barrier().is_pending()).unwrap_or(false),
+        Ordering::SeqCst,
+    );
+    MpSafeReply {
+        text: request.text,
+        thread: format!("{:?}", std::thread::current().id()),
+        sequence: MP_SAFE_CALL_COUNT.fetch_add(1, Ordering::SeqCst) + 1,
+    }
+}
+
 hammer_runtime::__declare_registration_image!(
     init_functions = [];
     config_functions = [];
@@ -85,7 +119,12 @@ hammer_runtime::__declare_registration_image!(
     process_nodes = [];
     session_transports = [];
     session_apps = [];
-    binary_api_methods = [__BINARY_API_ECHO, __BINARY_API_PANIC_METHOD, __BINARY_API_LARGE];
+    binary_api_methods = [
+        __BINARY_API_ECHO,
+        __BINARY_API_PANIC_METHOD,
+        __BINARY_API_LARGE,
+        __BINARY_API_MP_SAFE_READ,
+    ];
 );
 
 fn socket_path() -> PathBuf {
@@ -106,6 +145,12 @@ fn socket_path() -> PathBuf {
 /// cleanup is asserted directly by
 /// `bind_reclaims_a_stale_socket_and_drop_removes_its_own_path`.
 fn engine_with_binary_api(path: &Path, max_frame_bytes: usize) -> Engine {
+    engine_with_sections(path, max_frame_bytes, "")
+}
+
+/// Like `engine_with_binary_api`, but appends `extra_sections` to the TOML
+/// configuration (e.g. a `[stats]` section for the collector cadence).
+fn engine_with_sections(path: &Path, max_frame_bytes: usize, extra_sections: &str) -> Engine {
     let mut engine = Engine::new_configured(RuntimeRegistry::new(), Worker::default())
         .expect("configure test engine");
     engine
@@ -115,9 +160,10 @@ fn engine_with_binary_api(path: &Path, max_frame_bytes: usize) -> Engine {
         .plugin_main_mut()
         .register_builtin_image(hammer_service::registration_image());
     let config = format!(
-        "[binary_api]\nsocket_path = \"{}\"\nmax_frame_bytes = {}\n",
+        "[binary_api]\nsocket_path = \"{}\"\nmax_frame_bytes = {}\n{}\n",
         path.display(),
-        max_frame_bytes
+        max_frame_bytes,
+        extra_sections
     );
     EnginePool::main_loop_enter(&mut engine, &[], &config).expect("enter main loop");
     engine
@@ -578,6 +624,140 @@ fn stalled_client_backpressure_does_not_starve_a_second_client() {
 }
 
 #[test]
+fn mp_safe_method_runs_on_the_main_thread_without_the_worker_barrier() {
+    let path = socket_path();
+    let mut engine = engine_with_binary_api(&path, DEFAULT_MAX_FRAME_BYTES);
+    let _engine_guard = CurrentEngine::install(&mut engine);
+    let expected_thread = format!("{:?}", std::thread::current().id());
+    let runtime = main_runtime();
+
+    engine.run_processes_until(&runtime, async {
+        tokio::time::timeout(Duration::from_secs(10), async {
+            let client_path = path.clone();
+            let (mp_safe, echo, mp_safe_barrier_seen, echo_barrier_seen) = run_client(move || {
+                MP_SAFE_BARRIER_SEEN.store(false, Ordering::SeqCst);
+                ECHO_BARRIER_SEEN.store(false, Ordering::SeqCst);
+                let mut client = BinaryApiClient::connect(client_path).expect("connect Binary API");
+
+                let read_payload = client
+                    .call(
+                        "test.mp_safe",
+                        &MpSafeRequest {
+                            text: "direct".to_owned(),
+                        }
+                        .encode_to_vec(),
+                    )
+                    .expect("call mp-safe method");
+                let mp_safe = MpSafeReply::decode(read_payload.as_slice()).expect("decode mp-safe");
+
+                let echo_payload = client
+                    .call(
+                        "test.echo",
+                        &EchoRequest {
+                            text: "barriered".to_owned(),
+                        }
+                        .encode_to_vec(),
+                    )
+                    .expect("call echo after mp-safe");
+                let echo = EchoReply::decode(echo_payload.as_slice()).expect("decode echo");
+
+                (
+                    mp_safe,
+                    echo,
+                    MP_SAFE_BARRIER_SEEN.load(Ordering::SeqCst),
+                    ECHO_BARRIER_SEEN.load(Ordering::SeqCst),
+                )
+            })
+            .await;
+            assert_eq!(mp_safe.text, "direct");
+            assert_eq!(
+                mp_safe.thread, expected_thread,
+                "mp-safe handler must run on the Main Thread"
+            );
+            assert_eq!(
+                mp_safe.sequence, 1,
+                "mp-safe handler must run exactly once per request"
+            );
+            assert!(
+                !mp_safe_barrier_seen,
+                "mp-safe method must not observe the worker barrier"
+            );
+            assert_eq!(echo.text, "barriered");
+            assert_eq!(echo.thread, expected_thread);
+            assert!(
+                echo_barrier_seen,
+                "the default method must still observe the worker barrier after a read-only request"
+            );
+        })
+        .await
+        .expect("read-only and barriered requests completed within the deadline");
+    });
+
+    engine
+        .shutdown_process_nodes(&runtime)
+        .expect("shutdown Process Nodes");
+    drop(engine);
+    drop(_engine_guard);
+}
+
+#[test]
+fn unknown_method_keeps_the_legacy_barriered_reply_and_dispatch_path() {
+    let path = socket_path();
+    let mut engine = engine_with_binary_api(&path, DEFAULT_MAX_FRAME_BYTES);
+    let _engine_guard = CurrentEngine::install(&mut engine);
+    let runtime = main_runtime();
+
+    engine.run_processes_until(&runtime, async {
+        tokio::time::timeout(Duration::from_secs(10), async {
+            let client_path = path.clone();
+            let echo_barrier_seen = run_client(move || {
+                ECHO_BARRIER_SEEN.store(false, Ordering::SeqCst);
+                let mut client = BinaryApiClient::connect(client_path).expect("connect Binary API");
+                let missing = client.call("test.does_not_exist", &[]);
+                assert!(
+                    matches!(
+                        missing,
+                        Err(BinaryApiError::ClientRejected {
+                            status: BinaryApiStatus::MethodMissing,
+                            ..
+                        })
+                    ),
+                    "unknown method must reply MethodMissing, got: {missing:?}"
+                );
+
+                // A follow-up default request still dispatches under the
+                // worker barrier: the unknown-method reply went through the
+                // legacy barriered path and released it cleanly.
+                let payload = client
+                    .call(
+                        "test.echo",
+                        &EchoRequest {
+                            text: "after missing".to_owned(),
+                        }
+                        .encode_to_vec(),
+                    )
+                    .expect("echo after unknown method");
+                let _echo = EchoReply::decode(payload.as_slice()).expect("decode echo");
+                ECHO_BARRIER_SEEN.load(Ordering::SeqCst)
+            })
+            .await;
+            assert!(
+                echo_barrier_seen,
+                "a subsequent default request must still observe the worker barrier"
+            );
+        })
+        .await
+        .expect("unknown method and follow-up completed within the deadline");
+    });
+
+    engine
+        .shutdown_process_nodes(&runtime)
+        .expect("shutdown Process Nodes");
+    drop(engine);
+    drop(_engine_guard);
+}
+
+#[test]
 fn process_node_shutdown_closes_the_listener_and_stops_dispatch() {
     let path = socket_path();
     let mut engine = engine_with_binary_api(&path, DEFAULT_MAX_FRAME_BYTES);
@@ -626,6 +806,241 @@ fn process_node_shutdown_closes_the_listener_and_stops_dispatch() {
         "shutdown must close the Binary API listener"
     );
 
+    drop(engine);
+    drop(_engine_guard);
+}
+
+/// `stats.list` / `stats.dump` roundtrip the system metrics through the
+/// wire: directory order, filtering, order/duplicate-preserving dumps, and
+/// the collector cadence advancing the heartbeat.
+#[test]
+fn stats_list_and_dump_roundtrip_system_metrics() {
+    let path = socket_path();
+    let mut engine = engine_with_sections(
+        &path,
+        DEFAULT_MAX_FRAME_BYTES,
+        "[stats]\nupdate_interval = \"50ms\"\n",
+    );
+    let _engine_guard = CurrentEngine::install(&mut engine);
+    let runtime = main_runtime();
+
+    engine.run_processes_until(&runtime, async {
+        tokio::time::timeout(Duration::from_secs(10), async {
+            let client_path = path.clone();
+            run_client(move || {
+                let mut client = StatsClient::connect(client_path).expect("connect stats client");
+
+                // Roundtrip: the three system scalars in directory order.
+                let entries = client.list(&[]).expect("list all");
+                assert_eq!(entries.len(), 3);
+                assert_eq!(entries[0].path, "/sys/heartbeat");
+                assert_eq!(entries[1].path, "/sys/boottime");
+                assert_eq!(entries[2].path, "/sys/last_stats_clear");
+                assert_eq!(entries[0].fq_name, "hammer_sys_heartbeat_total");
+                assert_eq!(entries[1].fq_name, "hammer_sys_boottime_seconds");
+                assert_eq!(entries[2].fq_name, "hammer_sys_last_stats_clear_seconds");
+                assert_eq!(
+                    entries[0].directory_type,
+                    hammer_ipc::stats::DirectoryType::ScalarIndex
+                );
+                assert_eq!(
+                    entries[0].prometheus_type,
+                    hammer_ipc::stats::PrometheusType::Counter
+                );
+                assert_eq!(
+                    entries[1].prometheus_type,
+                    hammer_ipc::stats::PrometheusType::Gauge
+                );
+
+                // Filtering with a single pattern.
+                let filtered = client
+                    .list(&["^/sys/heartbeat$".to_owned()])
+                    .expect("filter");
+                assert_eq!(filtered.len(), 1);
+                assert_eq!(filtered[0].path, "/sys/heartbeat");
+
+                // Dump preserves input order and duplicates.
+                let ids = [entries[2].id, entries[0].id, entries[2].id];
+                let dump = client.dump(&ids).expect("dump");
+                assert_eq!(dump.len(), 3);
+                assert_eq!(dump[0].id, entries[2].id);
+                assert_eq!(dump[1].id, entries[0].id);
+                assert_eq!(dump[2].id, entries[2].id);
+                // last-stats-clear stays 0 (no clear command in #246).
+                assert_eq!(dump[0].value, DumpValue::Gauge(0.0));
+
+                // The collector bumps the heartbeat once per 50 ms interval:
+                // wait for a strictly newer value than the first snapshot
+                // (bounded eventual check; no wall-clock value asserts).
+                let first_heartbeat = dump[1].value;
+                let deadline = std::time::Instant::now() + Duration::from_secs(5);
+                loop {
+                    std::thread::sleep(Duration::from_millis(25));
+                    let fresh = client.dump(&[entries[0].id]).expect("heartbeat dump");
+                    if fresh[0].value != first_heartbeat {
+                        assert!(
+                            matches!(fresh[0].value, DumpValue::Counter(_)),
+                            "heartbeat must be a counter: {:?}",
+                            fresh[0].value
+                        );
+                        break;
+                    }
+                    assert!(
+                        std::time::Instant::now() < deadline,
+                        "heartbeat never advanced"
+                    );
+                }
+            })
+            .await;
+        })
+        .await
+        .expect("stats roundtrip completed within the deadline");
+    });
+
+    engine
+        .shutdown_process_nodes(&runtime)
+        .expect("shutdown Process Nodes");
+    drop(engine);
+    drop(_engine_guard);
+}
+
+/// Two dumps inside the collector's idle window return the same heartbeat:
+/// `list`/`dump` never collect, and the default 10 s interval keeps the
+/// collector dormant between passes.
+#[test]
+fn stats_reads_within_the_idle_window_are_unchanged() {
+    let path = socket_path();
+    let mut engine = engine_with_binary_api(&path, DEFAULT_MAX_FRAME_BYTES);
+    let _engine_guard = CurrentEngine::install(&mut engine);
+    let runtime = main_runtime();
+
+    engine.run_processes_until(&runtime, async {
+        tokio::time::timeout(Duration::from_secs(10), async {
+            let client_path = path.clone();
+            run_client(move || {
+                let mut client = StatsClient::connect(client_path).expect("connect stats client");
+                let entries = client.list(&[]).expect("list");
+                let heartbeat = entries
+                    .iter()
+                    .find(|entry| entry.path == "/sys/heartbeat")
+                    .expect("heartbeat entry");
+                let first = client.dump(&[heartbeat.id]).expect("first dump");
+                std::thread::sleep(Duration::from_millis(250));
+                let second = client.dump(&[heartbeat.id]).expect("second dump");
+                assert_eq!(
+                    second[0].value, first[0].value,
+                    "idle-window dumps must not run a collector"
+                );
+            })
+            .await;
+        })
+        .await
+        .expect("idle-window reads completed within the deadline");
+    });
+
+    engine
+        .shutdown_process_nodes(&runtime)
+        .expect("shutdown Process Nodes");
+    drop(engine);
+    drop(_engine_guard);
+}
+
+/// In-band errors: stale ids (same index, newer generation), missing ids
+/// (high index), and invalid regex patterns arrive as typed server errors.
+#[test]
+fn stats_errors_arrive_typed_in_band() {
+    let path = socket_path();
+    let mut engine = engine_with_binary_api(&path, DEFAULT_MAX_FRAME_BYTES);
+    let _engine_guard = CurrentEngine::install(&mut engine);
+    let runtime = main_runtime();
+
+    engine.run_processes_until(&runtime, async {
+        tokio::time::timeout(Duration::from_secs(10), async {
+            let client_path = path.clone();
+            run_client(move || {
+                let mut client = StatsClient::connect(client_path).expect("connect stats client");
+                let entries = client.list(&[]).expect("list");
+                let heartbeat = entries
+                    .iter()
+                    .find(|entry| entry.path == "/sys/heartbeat")
+                    .expect("heartbeat entry");
+
+                // Same index, a newer non-zero generation: the entry lives at
+                // generation 1 and is never removed, so generation 2 is stale.
+                let stale = EntryId::new(heartbeat.id.index(), heartbeat.id.generation() + 1)
+                    .expect("stale id");
+                match client.dump(&[stale]) {
+                    Err(StatsClientError::Server {
+                        method: "stats.dump",
+                        source: StatsServerError::StaleEntry { id },
+                    }) if id == stale => {}
+                    other => panic!("expected stale error, got: {other:?}"),
+                }
+
+                // An index beyond every published entry is not found.
+                let missing = EntryId::new(999, 1).expect("missing id");
+                match client.dump(&[missing]) {
+                    Err(StatsClientError::Server {
+                        method: "stats.dump",
+                        source: StatsServerError::NotFound { id },
+                    }) if id == missing => {}
+                    other => panic!("expected not-found error, got: {other:?}"),
+                }
+
+                // An invalid regex arrives in-band with the exact pattern.
+                match client.list(&["(".to_owned()]) {
+                    Err(StatsClientError::Server {
+                        method: "stats.list",
+                        source: StatsServerError::InvalidPattern { pattern },
+                    }) if pattern == "(" => {}
+                    other => panic!("expected invalid-pattern error, got: {other:?}"),
+                }
+            })
+            .await;
+        })
+        .await
+        .expect("typed stats errors completed within the deadline");
+    });
+
+    engine
+        .shutdown_process_nodes(&runtime)
+        .expect("shutdown Process Nodes");
+    drop(engine);
+    drop(_engine_guard);
+}
+
+/// A malformed `stats.list` payload is a transport `InvalidRequest`, exactly
+/// like any other method: the adapter rejects it before the handler.
+#[test]
+fn stats_malformed_payload_is_a_transport_invalid_request() {
+    let path = socket_path();
+    let mut engine = engine_with_binary_api(&path, DEFAULT_MAX_FRAME_BYTES);
+    let _engine_guard = CurrentEngine::install(&mut engine);
+    let runtime = main_runtime();
+
+    engine.run_processes_until(&runtime, async {
+        tokio::time::timeout(Duration::from_secs(10), async {
+            let client_path = path.clone();
+            run_client(move || {
+                let mut raw = raw_client(&client_path).expect("connect raw client");
+                write_frame(&mut raw, "stats.list", &[0xFF; 64]).expect("write malformed payload");
+                let reply = read_reply(&mut raw).expect("read reply");
+                assert_eq!(
+                    reply.status,
+                    BinaryApiStatus::InvalidRequest as i32,
+                    "malformed stats payload must be a transport InvalidRequest"
+                );
+                assert_eq!(reply.context, 1);
+            })
+            .await;
+        })
+        .await
+        .expect("malformed stats payload rejected within the deadline");
+    });
+
+    engine
+        .shutdown_process_nodes(&runtime)
+        .expect("shutdown Process Nodes");
     drop(engine);
     drop(_engine_guard);
 }
