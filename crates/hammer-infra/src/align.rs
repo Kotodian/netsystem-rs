@@ -1,36 +1,9 @@
 use std::alloc::Layout;
 use std::fmt;
 use std::mem;
-use std::num::NonZeroUsize;
 use std::ops::{Deref, DerefMut};
 
 pub const CACHE_LINE: usize = 64;
-
-#[derive(Clone, Copy, PartialEq, Eq, Hash)]
-pub struct Alignment(NonZeroUsize);
-
-impl Alignment {
-    #[inline]
-    pub const fn new(value: usize) -> Option<Self> {
-        if value != 0 && value.is_power_of_two() {
-            // SAFETY: `value` was checked to be non-zero above.
-            Some(Self(unsafe { NonZeroUsize::new_unchecked(value) }))
-        } else {
-            None
-        }
-    }
-
-    #[inline(always)]
-    pub const fn get(self) -> usize {
-        self.0.get()
-    }
-}
-
-impl fmt::Debug for Alignment {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_tuple("Alignment").field(&self.get()).finish()
-    }
-}
 
 #[repr(C, align(64))]
 #[derive(Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]
