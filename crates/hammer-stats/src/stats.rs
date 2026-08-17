@@ -475,7 +475,8 @@ impl StatsMain {
             return Ok(Vec::new());
         }
 
-        self.release_removed_entries()?;
+        // Reclamation has its own publication boundary. Keep it outside this
+        // batch so allocation failure cannot mutate the visible directory.
         let mapping = Mapping::new(&self.segment);
         let header = mapping.header();
         let old_directory_offset = header.directory_offset();
@@ -1405,6 +1406,61 @@ mod tests {
             directory_offset.get() >= page as u64,
             "directory must start after the reserved first page"
         );
+    }
+
+    #[test]
+    fn register_failure_does_not_reclaim_removed_entries_before_staging() {
+        let page = hammer_infra::page_size().expect("page size must be queryable");
+        let mut stats = StatsMain::with_capacity(2 * page).expect("two pages construct");
+        let (id, handle) = stats
+            .add_counter("/removed", prometheus::Opts::new("removed", "removed"))
+            .expect("counter");
+        stats.remove_entry(id).expect("remove");
+        drop(handle);
+
+        let before = {
+            let mapping = Mapping::new(&stats.segment);
+            let header = mapping.header();
+            (
+                header.epoch(),
+                header.free_list_head(),
+                header.removed_list_head(),
+            )
+        };
+
+        let help = "x".repeat(1_000);
+        let count = page / 256 + 32;
+        let paths: Vec<String> = (0..count).map(|index| format!("/large/{index}")).collect();
+        let names: Vec<String> = (0..count).map(|index| format!("large_{index}")).collect();
+        let registrations: Vec<StatsRegistration<'_>> = paths
+            .iter()
+            .zip(&names)
+            .map(|(path, name)| StatsRegistration {
+                path,
+                descriptor: StatsDescriptor {
+                    fq_name: name,
+                    help: &help,
+                    const_labels: &[],
+                },
+                value: StatsValueLayout::Counter,
+            })
+            .collect();
+
+        let Err(error) = stats.register(&registrations) else {
+            panic!("capacity-constrained batch unexpectedly succeeded");
+        };
+        assert!(matches!(error, StatsError::SegmentFull));
+
+        let after = {
+            let mapping = Mapping::new(&stats.segment);
+            let header = mapping.header();
+            (
+                header.epoch(),
+                header.free_list_head(),
+                header.removed_list_head(),
+            )
+        };
+        assert_eq!(after, before);
     }
 
     /// Internal-corruption probe: a slot whose raw type bytes are each
