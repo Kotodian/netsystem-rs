@@ -172,7 +172,7 @@ impl TryFrom<u8> for PrometheusType {
 /// Encodes `name` as a NUL-terminated 128-byte directory name field.
 pub(crate) fn encode_name(name: &str) -> Result<[u8; ENTRY_NAME_LEN], StatsError> {
     let bytes = name.as_bytes();
-    if bytes.is_empty() || bytes.len() >= ENTRY_NAME_LEN {
+    if bytes.is_empty() || bytes.len() >= ENTRY_NAME_LEN || bytes.contains(&0) {
         return Err(StatsError::InvalidPath(name.to_owned()));
     }
     let mut out = [0u8; ENTRY_NAME_LEN];
@@ -326,5 +326,14 @@ mod tests {
                 "byte {byte} must be rejected"
             );
         }
+    }
+
+    #[test]
+    fn encode_name_rejects_embedded_nul() {
+        let name = "/if\0/rx";
+        assert!(matches!(
+            encode_name(name),
+            Err(StatsError::InvalidPath(path)) if path == name
+        ));
     }
 }
