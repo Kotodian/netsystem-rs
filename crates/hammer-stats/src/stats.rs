@@ -142,6 +142,22 @@ pub enum StatsEntry {
     Timestamp { id: EntryId, handle: Timestamp },
 }
 
+#[derive(Clone, Copy)]
+enum ScalarRegistrationKind {
+    Counter,
+    Gauge,
+    Timestamp,
+}
+
+struct StagedScalarMetric {
+    name: Box<str>,
+    id: EntryId,
+    kind: ScalarRegistrationKind,
+    value_offset: Offset,
+    entry: DirectorySlot,
+    allocation: SegmentAllocation,
+}
+
 /// A live handle to one counter value record.
 ///
 /// Owns one reference on the value record; the record's generation is
@@ -406,9 +422,9 @@ impl StatsMain {
 
     /// Registers a batch of protocol-neutral Stats Directory entries.
     ///
-    /// All currently supported scalar paths are validated before any
-    /// publishing constructor runs. Structural work remains owned by
-    /// `StatsMain`; later layout slices extend the same preparation boundary.
+    /// Scalar descriptors, directory slots, and value blocks are staged before
+    /// one VPP-style publication tail. A failed allocation drops every staged
+    /// owner while the current directory and header remain unchanged.
     pub fn register<'a>(
         &mut self,
         registrations: &[StatsRegistration<'a>],
@@ -416,10 +432,17 @@ impl StatsMain {
         let mut seen_paths = HashSet::with_capacity(registrations.len());
         let mut prepared = Vec::with_capacity(registrations.len());
         for registration in registrations {
-            let prometheus_type = match registration.value {
-                StatsValueLayout::Counter => PrometheusType::Counter,
-                StatsValueLayout::Gauge | StatsValueLayout::Timestamp => PrometheusType::Gauge,
+            let kind = match registration.value {
+                StatsValueLayout::Counter => ScalarRegistrationKind::Counter,
+                StatsValueLayout::Gauge => ScalarRegistrationKind::Gauge,
+                StatsValueLayout::Timestamp => ScalarRegistrationKind::Timestamp,
                 _ => return Err(StatsError::UnsupportedLayout),
+            };
+            let prometheus_type = match kind {
+                ScalarRegistrationKind::Counter => PrometheusType::Counter,
+                ScalarRegistrationKind::Gauge | ScalarRegistrationKind::Timestamp => {
+                    PrometheusType::Gauge
+                }
             };
             encode_name(registration.path)?;
             if self.names.contains_key(registration.path) || !seen_paths.insert(registration.path) {
@@ -433,26 +456,203 @@ impl StatsMain {
             for &(name, value) in registration.descriptor.const_labels {
                 opts = opts.const_label(name, value);
             }
-            crate::descriptor::normalize(&opts, prometheus_type)?;
-            prepared.push((registration.path, registration.value, opts));
+            let descriptor = crate::descriptor::normalize(&opts, prometheus_type)?;
+            prepared.push((registration.path, kind, descriptor));
         }
 
-        let mut entries = Vec::with_capacity(prepared.len());
-        for (path, value, opts) in prepared {
-            let entry = match value {
-                StatsValueLayout::Counter => {
-                    let (id, handle) = self.add_counter(path, opts)?;
-                    StatsEntry::Counter { id, handle }
+        self.register_scalar_batch(prepared)
+    }
+
+    fn register_scalar_batch<'a>(
+        &mut self,
+        prepared: Vec<(
+            &'a str,
+            ScalarRegistrationKind,
+            crate::descriptor::NormalizedDescriptor,
+        )>,
+    ) -> Result<Vec<StatsEntry>, StatsError> {
+        if prepared.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        self.release_removed_entries()?;
+        let mapping = Mapping::new(&self.segment);
+        let header = mapping.header();
+        let old_directory_offset = header.directory_offset();
+        let old_directory_capacity = header.directory_capacity();
+        let initialized = header.initialized_len();
+        let mut free_head = header.free_list_head();
+        let mut planned_initialized = initialized;
+        let mut planned_capacity = old_directory_capacity;
+        let mut slots = Vec::with_capacity(prepared.len());
+
+        for _ in &prepared {
+            if free_head != NULL_INDEX {
+                if free_head >= old_directory_capacity {
+                    return Err(StatsError::InvalidState(0xFF));
                 }
-                StatsValueLayout::Gauge => {
-                    let (id, handle) = self.add_gauge(path, opts)?;
-                    StatsEntry::Gauge { id, handle }
+                let free_entry = mapping.entry(old_directory_offset, free_head as u32)?;
+                if free_entry.state()? != EntryState::Free {
+                    return Err(StatsError::InvalidState(free_entry.state_byte()));
                 }
-                StatsValueLayout::Timestamp => {
-                    let (id, handle) = self.add_timestamp(path, opts)?;
-                    StatsEntry::Timestamp { id, handle }
+                slots.push((free_head as u32, free_entry.generation()));
+                free_head = free_entry.link();
+                continue;
+            }
+
+            if planned_initialized >= planned_capacity {
+                planned_capacity = planned_capacity
+                    .checked_mul(2)
+                    .ok_or(StatsError::OutOfBounds)?;
+            }
+            if planned_initialized >= u64::from(u32::MAX) {
+                return Err(StatsError::OutOfBounds);
+            }
+            slots.push((planned_initialized as u32, 1));
+            planned_initialized = planned_initialized
+                .checked_add(1)
+                .ok_or(StatsError::OutOfBounds)?;
+        }
+
+        let old_capacity =
+            usize::try_from(old_directory_capacity).map_err(|_| StatsError::OutOfBounds)?;
+        let old_directory_bytes = old_capacity
+            .checked_mul(SLOT_SIZE)
+            .ok_or(StatsError::OutOfBounds)?;
+        let directory_grew = planned_capacity != old_directory_capacity;
+        let directory_allocation = if directory_grew {
+            let new_capacity =
+                usize::try_from(planned_capacity).map_err(|_| StatsError::OutOfBounds)?;
+            let new_bytes = new_capacity
+                .checked_mul(SLOT_SIZE)
+                .ok_or(StatsError::OutOfBounds)?;
+            let layout =
+                Layout::from_size_align(new_bytes, 64).map_err(|_| StatsError::InvalidLayout)?;
+            Some(self.segment.allocate(layout)?)
+        } else {
+            None
+        };
+        let directory_offset = directory_allocation
+            .as_ref()
+            .map(|allocation| Offset::new(allocation.offset()))
+            .unwrap_or(old_directory_offset);
+
+        if let Some(allocation) = directory_allocation.as_ref() {
+            let initialized_count =
+                u32::try_from(initialized).map_err(|_| StatsError::OutOfBounds)?;
+            let mut old_entries = Vec::with_capacity(initialized_count as usize);
+            for index in 0..initialized_count {
+                old_entries.push(mapping.entry(old_directory_offset, index)?);
+            }
+            mapping.write_directory_entries(Offset::new(allocation.offset()), &old_entries)?;
+        }
+
+        let mut staged = Vec::with_capacity(prepared.len());
+        for ((path, kind, descriptor), (index, generation)) in prepared.into_iter().zip(slots) {
+            let name_key: Box<str> = path.into();
+            let name = encode_name(&name_key)?;
+            let layout = crate::descriptor::block_layout(&descriptor)?;
+            let mut allocation = self.segment.allocate(layout)?;
+            let value_offset_in_block = crate::descriptor::write_block(
+                &mut allocation.bytes_mut(),
+                &descriptor,
+                generation,
+            )?;
+            let block_offset = Offset::new(allocation.offset());
+            let value_offset = block_offset
+                .checked_add(value_offset_in_block)
+                .ok_or(StatsError::OutOfBounds)?;
+            let (directory_type, prometheus_type) = match kind {
+                ScalarRegistrationKind::Counter => {
+                    (DirectoryType::ScalarIndex, PrometheusType::Counter)
                 }
-                _ => return Err(StatsError::UnsupportedLayout),
+                ScalarRegistrationKind::Gauge => (DirectoryType::Gauge, PrometheusType::Gauge),
+                ScalarRegistrationKind::Timestamp => {
+                    (DirectoryType::ScalarIndex, PrometheusType::Gauge)
+                }
+            };
+            let entry = DirectorySlot::new_active(
+                name,
+                generation,
+                directory_type,
+                prometheus_type,
+                block_offset,
+                value_offset,
+            );
+            staged.push(StagedScalarMetric {
+                name: name_key,
+                id: EntryId { index, generation },
+                kind,
+                value_offset,
+                entry,
+                allocation,
+            });
+        }
+
+        let mut targets = Vec::with_capacity(staged.len());
+        for metric in &staged {
+            targets.push(mapping.entry_write_target(directory_offset, metric.id.index())?);
+        }
+        let mut entries = Vec::with_capacity(staged.len());
+
+        header.mark_in_progress();
+        if directory_grew {
+            header.store_directory_offset(directory_offset);
+            header.store_directory_capacity(planned_capacity);
+        }
+        for (target, metric) in targets.iter().zip(&staged) {
+            // SAFETY: every target was bounds-checked for this slot above and
+            // is consumed before the publication marker is cleared.
+            unsafe { mapping.write_entry(*target, metric.entry) };
+        }
+        header.store_free_list_head(free_head);
+        header.store_initialized_len(planned_initialized);
+        header.bump_epoch();
+        header.clear_in_progress();
+
+        if let Some(allocation) = directory_allocation {
+            let _ = allocation.into_raw_offset();
+            self.segment
+                .free(old_directory_offset.get(), old_directory_bytes);
+        }
+
+        let segment = self.segment.clone();
+        for metric in staged {
+            let StagedScalarMetric {
+                name,
+                id,
+                kind,
+                value_offset,
+                allocation,
+                ..
+            } = metric;
+            let _ = allocation.into_raw_offset();
+            self.names.insert(name, id);
+            let entry = match kind {
+                ScalarRegistrationKind::Counter => StatsEntry::Counter {
+                    id,
+                    handle: Counter {
+                        segment: segment.clone(),
+                        value_offset,
+                        id,
+                    },
+                },
+                ScalarRegistrationKind::Gauge => StatsEntry::Gauge {
+                    id,
+                    handle: Gauge {
+                        segment: segment.clone(),
+                        value_offset,
+                        id,
+                    },
+                },
+                ScalarRegistrationKind::Timestamp => StatsEntry::Timestamp {
+                    id,
+                    handle: Timestamp {
+                        segment: segment.clone(),
+                        value_offset,
+                        id,
+                    },
+                },
             };
             entries.push(entry);
         }

@@ -9,6 +9,7 @@ use std::error::Error as _;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, Ordering};
 
+use hammer_infra::page_size;
 use hammer_stats::{
     ConstLabel, DirectoryType, DumpValue, EntryId, PrometheusType, StatsDescriptor, StatsEntry,
     StatsError, StatsMain, StatsRegistration, StatsValueLayout,
@@ -77,6 +78,41 @@ fn register_batch_failure_publishes_nothing() {
     };
     assert!(matches!(error, StatsError::InvalidPath(path) if path.is_empty()));
     assert!(stats.list(&[]).expect("list after failed batch").is_empty());
+}
+
+/// A late allocator failure also leaves no earlier registration visible.
+#[test]
+fn register_capacity_failure_publishes_nothing() {
+    let page = page_size().expect("page size must be queryable");
+    let mut stats = StatsMain::with_capacity(2 * page).expect("two pages fit");
+    let help = "x".repeat(1_000);
+    let count = page / 256 + 32;
+    let paths: Vec<String> = (0..count).map(|index| format!("/large/{index}")).collect();
+    let names: Vec<String> = (0..count).map(|index| format!("large_{index}")).collect();
+    let registrations: Vec<StatsRegistration<'_>> = paths
+        .iter()
+        .zip(&names)
+        .map(|(path, name)| StatsRegistration {
+            path,
+            descriptor: StatsDescriptor {
+                fq_name: name,
+                help: &help,
+                const_labels: &[],
+            },
+            value: StatsValueLayout::Counter,
+        })
+        .collect();
+
+    let Err(error) = stats.register(&registrations) else {
+        panic!("capacity-constrained batch unexpectedly succeeded");
+    };
+    assert!(matches!(error, StatsError::SegmentFull));
+    assert!(
+        stats
+            .list(&[])
+            .expect("list after capacity failure")
+            .is_empty()
+    );
 }
 
 /// Gauge and timestamp registrations return their concrete direct handles and
