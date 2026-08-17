@@ -1,7 +1,7 @@
 //! The public stats segment API.
 
 use std::alloc::Layout;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use regex::Regex;
@@ -136,6 +136,10 @@ pub enum StatsValueLayout<'a> {
 pub enum StatsEntry {
     /// Direct scalar counter handle.
     Counter { id: EntryId, handle: Counter },
+    /// Direct scalar gauge handle.
+    Gauge { id: EntryId, handle: Gauge },
+    /// Direct scalar timestamp handle.
+    Timestamp { id: EntryId, handle: Timestamp },
 }
 
 /// A live handle to one counter value record.
@@ -402,18 +406,26 @@ impl StatsMain {
 
     /// Registers a batch of protocol-neutral Stats Directory entries.
     ///
-    /// The scalar counter branch returns its concrete direct handle; other
-    /// layouts are rejected until their matching registration slice is
-    /// implemented. Structural work remains owned by `StatsMain`.
+    /// All currently supported scalar paths are validated before any
+    /// publishing constructor runs. Structural work remains owned by
+    /// `StatsMain`; later layout slices extend the same preparation boundary.
     pub fn register<'a>(
         &mut self,
         registrations: &[StatsRegistration<'a>],
     ) -> Result<Vec<StatsEntry>, StatsError> {
-        let mut entries = Vec::with_capacity(registrations.len());
+        let mut seen_paths = HashSet::with_capacity(registrations.len());
+        let mut prepared = Vec::with_capacity(registrations.len());
         for registration in registrations {
-            let StatsValueLayout::Counter = registration.value else {
-                return Err(StatsError::UnsupportedLayout);
+            let prometheus_type = match registration.value {
+                StatsValueLayout::Counter => PrometheusType::Counter,
+                StatsValueLayout::Gauge | StatsValueLayout::Timestamp => PrometheusType::Gauge,
+                _ => return Err(StatsError::UnsupportedLayout),
             };
+            encode_name(registration.path)?;
+            if self.names.contains_key(registration.path) || !seen_paths.insert(registration.path) {
+                return Err(StatsError::DuplicateName(registration.path.to_owned()));
+            }
+
             let mut opts = prometheus::Opts::new(
                 registration.descriptor.fq_name,
                 registration.descriptor.help,
@@ -421,8 +433,28 @@ impl StatsMain {
             for &(name, value) in registration.descriptor.const_labels {
                 opts = opts.const_label(name, value);
             }
-            let (id, handle) = self.add_counter(registration.path, opts)?;
-            entries.push(StatsEntry::Counter { id, handle });
+            crate::descriptor::normalize(&opts, prometheus_type)?;
+            prepared.push((registration.path, registration.value, opts));
+        }
+
+        let mut entries = Vec::with_capacity(prepared.len());
+        for (path, value, opts) in prepared {
+            let entry = match value {
+                StatsValueLayout::Counter => {
+                    let (id, handle) = self.add_counter(path, opts)?;
+                    StatsEntry::Counter { id, handle }
+                }
+                StatsValueLayout::Gauge => {
+                    let (id, handle) = self.add_gauge(path, opts)?;
+                    StatsEntry::Gauge { id, handle }
+                }
+                StatsValueLayout::Timestamp => {
+                    let (id, handle) = self.add_timestamp(path, opts)?;
+                    StatsEntry::Timestamp { id, handle }
+                }
+                _ => return Err(StatsError::UnsupportedLayout),
+            };
+            entries.push(entry);
         }
         Ok(entries)
     }

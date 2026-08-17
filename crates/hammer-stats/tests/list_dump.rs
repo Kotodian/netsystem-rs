@@ -46,6 +46,96 @@ fn register_counter_returns_direct_handle_for_list_and_dump() {
     assert_eq!(dumped[0].value, DumpValue::Counter(42));
 }
 
+/// Registration validates the whole batch before publishing any directory
+/// entry, matching VPP's structural publication boundary.
+#[test]
+fn register_batch_failure_publishes_nothing() {
+    let mut stats = StatsMain::new().expect("default construction");
+    let registrations = [
+        StatsRegistration {
+            path: "/if/rx",
+            descriptor: StatsDescriptor {
+                fq_name: "rx_bytes",
+                help: "bytes received",
+                const_labels: &[],
+            },
+            value: StatsValueLayout::Counter,
+        },
+        StatsRegistration {
+            path: "",
+            descriptor: StatsDescriptor {
+                fq_name: "invalid_path_metric",
+                help: "must not publish",
+                const_labels: &[],
+            },
+            value: StatsValueLayout::Counter,
+        },
+    ];
+
+    let Err(error) = stats.register(&registrations) else {
+        panic!("an invalid registration unexpectedly published");
+    };
+    assert!(matches!(error, StatsError::InvalidPath(path) if path.is_empty()));
+    assert!(stats.list(&[]).expect("list after failed batch").is_empty());
+}
+
+/// Gauge and timestamp registrations return their concrete direct handles and
+/// preserve their distinct VPP directory representations.
+#[test]
+fn register_gauge_and_timestamp_returns_direct_handles() {
+    let mut stats = StatsMain::new().expect("default construction");
+    let registrations = [
+        StatsRegistration {
+            path: "/sys/temp",
+            descriptor: StatsDescriptor {
+                fq_name: "temperature_celsius",
+                help: "current temperature",
+                const_labels: &[],
+            },
+            value: StatsValueLayout::Gauge,
+        },
+        StatsRegistration {
+            path: "/sys/boottime",
+            descriptor: StatsDescriptor {
+                fq_name: "boottime_seconds",
+                help: "process boot time",
+                const_labels: &[],
+            },
+            value: StatsValueLayout::Timestamp,
+        },
+    ];
+
+    let mut entries = stats
+        .register(&registrations)
+        .expect("scalar registrations");
+    let StatsEntry::Gauge {
+        id: gauge_id,
+        handle: gauge,
+    } = entries.remove(0)
+    else {
+        panic!("gauge registration returned a different value kind");
+    };
+    let StatsEntry::Timestamp {
+        id: timestamp_id,
+        handle: timestamp,
+    } = entries.remove(0)
+    else {
+        panic!("timestamp registration returned a different value kind");
+    };
+    gauge.set(37.5).expect("set gauge");
+    timestamp.set(1_700_000_000).expect("set timestamp");
+
+    let listed = stats.list(&[]).expect("list");
+    assert_eq!(listed[0].id, gauge_id);
+    assert_eq!(listed[0].directory_type, DirectoryType::Gauge);
+    assert_eq!(listed[1].id, timestamp_id);
+    assert_eq!(listed[1].directory_type, DirectoryType::ScalarIndex);
+
+    let dumped = stats.dump(&[gauge_id, timestamp_id]).expect("dump");
+    assert_eq!(dumped[0].value, DumpValue::Gauge(37.5));
+    assert_eq!(dumped[1].value, DumpValue::Gauge(1_700_000_000.0));
+}
+
 /// Counters and timestamps are scalar directory entries; timestamps are
 /// Prometheus gauges whose value is a plain integer.
 #[test]
