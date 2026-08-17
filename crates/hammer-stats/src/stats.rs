@@ -79,6 +79,65 @@ impl std::fmt::Display for EntryId {
     }
 }
 
+/// Borrowed Prometheus metadata used by protocol-neutral registration.
+#[derive(Clone, Copy, Debug)]
+pub struct StatsDescriptor<'a> {
+    /// Fully qualified Prometheus metric name.
+    pub fq_name: &'a str,
+    /// Human-readable metric help text.
+    pub help: &'a str,
+    /// Borrowed const label pairs in registration order.
+    pub const_labels: &'a [(&'a str, &'a str)],
+}
+
+/// One protocol-neutral structural stats registration.
+#[derive(Clone, Copy, Debug)]
+pub struct StatsRegistration<'a> {
+    /// Stats Directory path.
+    pub path: &'a str,
+    /// Prometheus descriptor metadata.
+    pub descriptor: StatsDescriptor<'a>,
+    /// Concrete VPP-compatible value layout.
+    pub value: StatsValueLayout<'a>,
+}
+
+/// Value layouts accepted by [`StatsMain::register`].
+#[derive(Clone, Copy, Debug)]
+pub enum StatsValueLayout<'a> {
+    /// One monotonically increasing integer.
+    Counter,
+    /// One floating-point value.
+    Gauge,
+    /// One timestamp integer.
+    Timestamp,
+    /// Per-row, per-column simple counters.
+    CounterVectorSimple { rows: u32, columns: u32 },
+    /// Per-row, per-column combined counters.
+    CounterVectorCombined { rows: u32, columns: u32 },
+    /// Per-index strings.
+    NameVector { length: u32 },
+    /// A name resolving to a target vector column.
+    Symlink { target: &'a str, vector_index: u32 },
+    /// Per-row log2 histogram bins.
+    HistogramLog2 { rows: u32 },
+    /// Per-row ring buffers with optional schema bytes.
+    RingBuffer {
+        rows: u32,
+        capacity: u32,
+        entry_size: u32,
+        schema: &'a [u8],
+    },
+}
+
+/// A direct value handle returned by cold-path registration.
+///
+/// Workers match this enum once while installing their owner-local handle;
+/// updates thereafter call the concrete handle directly.
+pub enum StatsEntry {
+    /// Direct scalar counter handle.
+    Counter { id: EntryId, handle: Counter },
+}
+
 /// A live handle to one counter value record.
 ///
 /// Owns one reference on the value record; the record's generation is
@@ -339,6 +398,33 @@ impl StatsMain {
             names: HashMap::new(),
             collectors: Vec::new(),
         })
+    }
+
+    /// Registers a batch of protocol-neutral Stats Directory entries.
+    ///
+    /// The scalar counter branch returns its concrete direct handle; other
+    /// layouts are rejected until their matching registration slice is
+    /// implemented. Structural work remains owned by `StatsMain`.
+    pub fn register<'a>(
+        &mut self,
+        registrations: &[StatsRegistration<'a>],
+    ) -> Result<Vec<StatsEntry>, StatsError> {
+        let mut entries = Vec::with_capacity(registrations.len());
+        for registration in registrations {
+            let StatsValueLayout::Counter = registration.value else {
+                return Err(StatsError::UnsupportedLayout);
+            };
+            let mut opts = prometheus::Opts::new(
+                registration.descriptor.fq_name,
+                registration.descriptor.help,
+            );
+            for &(name, value) in registration.descriptor.const_labels {
+                opts = opts.const_label(name, value);
+            }
+            let (id, handle) = self.add_counter(registration.path, opts)?;
+            entries.push(StatsEntry::Counter { id, handle });
+        }
+        Ok(entries)
     }
 
     /// Adds a counter metric, mirroring VPP's `vlib_stats_add_counter_vector`.

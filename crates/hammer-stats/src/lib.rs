@@ -20,4 +20,7 @@ mod stats;
 pub use crate::directory::{DirectoryType, PrometheusType};
 pub use crate::error::StatsError;
 pub use crate::read::{ConstLabel, DirectoryEntry, DumpEntry, DumpValue};
-pub use crate::stats::{Counter, DEFAULT_CAPACITY, EntryId, Gauge, StatsMain, Timestamp};
+pub use crate::stats::{
+    Counter, DEFAULT_CAPACITY, EntryId, Gauge, StatsDescriptor, StatsEntry, StatsMain,
+    StatsRegistration, StatsValueLayout, Timestamp,
+};

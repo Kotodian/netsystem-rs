@@ -10,8 +10,41 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, Ordering};
 
 use hammer_stats::{
-    ConstLabel, DirectoryType, DumpValue, EntryId, PrometheusType, StatsError, StatsMain,
+    ConstLabel, DirectoryType, DumpValue, EntryId, PrometheusType, StatsDescriptor, StatsEntry,
+    StatsError, StatsMain, StatsRegistration, StatsValueLayout,
 };
+
+/// A protocol-neutral scalar registration returns a direct handle that can be
+/// updated without another `StatsMain` lookup, and the reader sees that value.
+#[test]
+fn register_counter_returns_direct_handle_for_list_and_dump() {
+    let mut stats = StatsMain::new().expect("default construction");
+    let registrations = [StatsRegistration {
+        path: "/if/rx",
+        descriptor: StatsDescriptor {
+            fq_name: "rx_bytes",
+            help: "bytes received",
+            const_labels: &[("iface", "eth0")],
+        },
+        value: StatsValueLayout::Counter,
+    }];
+
+    let mut entries = stats.register(&registrations).expect("counter registered");
+    assert_eq!(entries.len(), 1);
+    let StatsEntry::Counter { id, handle } = entries.pop().expect("entry") else {
+        panic!("counter registration returned a different value kind");
+    };
+    handle.increment_by(42).expect("direct increment");
+
+    let listed = stats.list(&[]).expect("list");
+    assert_eq!(listed[0].id, id);
+    assert_eq!(listed[0].path, "/if/rx");
+    assert_eq!(listed[0].fq_name, "rx_bytes");
+    assert_eq!(listed[0].help, "bytes received");
+
+    let dumped = stats.dump(&[id]).expect("dump");
+    assert_eq!(dumped[0].value, DumpValue::Counter(42));
+}
 
 /// Counters and timestamps are scalar directory entries; timestamps are
 /// Prometheus gauges whose value is a plain integer.

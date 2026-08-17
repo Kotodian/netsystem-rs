@@ -59,6 +59,9 @@ pub enum StatsError {
     /// A reader retried the maximum number of times while the segment was
     /// continuously being republished.
     ReadBusy,
+    /// A registration layout has not yet been implemented by the public
+    /// protocol-neutral boundary.
+    UnsupportedLayout,
     /// A directory entry carries a type combination that cannot be decoded
     /// into a `DumpValue` (internal corruption). The typed enums are already
     /// checked decodes of the mapped bytes.
@@ -114,6 +117,9 @@ impl fmt::Display for StatsError {
             }
             StatsError::ReadBusy => {
                 write!(f, "stats segment busy republishing; retry the read later")
+            }
+            StatsError::UnsupportedLayout => {
+                write!(f, "stats registration layout is not implemented")
             }
             StatsError::IncompatibleType {
                 id,
