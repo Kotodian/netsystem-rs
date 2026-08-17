@@ -38,7 +38,6 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use hammer_core::data_plane::DataPlaneBuffers;
-use hammer_runtime::node::NodeRuntimeStatsRow;
 use hammer_runtime::{TraceControlHandle, TraceRecordSink};
 
 use crate::config::Worker;
@@ -416,46 +415,6 @@ impl DataRuntimeContext {
     pub fn drain_trace_records_on_workers(&self, sink: TraceRecordSink) -> RuntimeResult<usize> {
         self.for_each_worker(move |_| sink.drain_completed())
             .map(|counts| counts.into_iter().sum())
-    }
-
-    pub fn runtime_stats_on_workers(
-        &self,
-    ) -> RuntimeResult<Vec<(usize, Vec<NodeRuntimeStatsRow>)>> {
-        self.for_each_worker(move |worker| {
-            with_data_plane_runtime(|runtime| {
-                (worker, runtime.nodes().node_runtime_stats_snapshot())
-            })
-        })
-    }
-
-    pub async fn runtime_stats_on_workers_async(
-        &self,
-    ) -> RuntimeResult<Vec<(usize, Vec<NodeRuntimeStatsRow>)>> {
-        let mut receivers = Vec::with_capacity(self.inner.workers.len());
-        for (index, worker) in self.inner.workers.iter().cloned().enumerate() {
-            let (tx, rx) = tokio::sync::oneshot::channel();
-            let context = self.clone();
-            drop(
-                worker
-                    .handle
-                    .spawn(TASK_DATA_CONTEXT.scope(context, async move {
-                        let rows = with_data_plane_runtime(|runtime| {
-                            runtime.nodes().node_runtime_stats_snapshot()
-                        });
-                        let _ = tx.send(rows);
-                    })),
-            );
-            receivers.push((index, rx));
-        }
-
-        let mut results = Vec::with_capacity(receivers.len());
-        for (worker, rx) in receivers {
-            let rows = rx
-                .await
-                .map_err(|_| RuntimeError::DataWorkerResultCanceled { worker })?;
-            results.push((worker, rows));
-        }
-        Ok(results)
     }
 
     pub(crate) fn worker_count(&self) -> usize {
@@ -1551,43 +1510,6 @@ mod tests {
             .expect("inspect workers");
 
         assert_eq!(marks, vec![false, false]);
-
-        data_runtime.shutdown_timeout(Duration::from_secs(1));
-    }
-
-    #[test]
-    fn data_context_collects_runtime_stats_on_workers() {
-        let _guard = test_lock();
-        let data_runtime =
-            DataRuntime::new(2, "spawn-test-runtime-stats", 512 * 1024, 2).expect("data runtime");
-        let context = data_runtime.context();
-
-        let stats = context
-            .runtime_stats_on_workers()
-            .expect("collect runtime stats");
-
-        assert_eq!(stats.len(), 2);
-        assert_eq!(stats[0].0, 0);
-        assert_eq!(stats[1].0, 1);
-        assert!(stats[0].1.is_empty());
-        assert!(stats[1].1.is_empty());
-
-        let driver = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .expect("build driver runtime");
-        let async_stats = driver.block_on(async {
-            context
-                .runtime_stats_on_workers_async()
-                .await
-                .expect("collect async runtime stats")
-        });
-
-        assert_eq!(async_stats.len(), 2);
-        assert_eq!(async_stats[0].0, 0);
-        assert_eq!(async_stats[1].0, 1);
-        assert!(async_stats[0].1.is_empty());
-        assert!(async_stats[1].1.is_empty());
 
         data_runtime.shutdown_timeout(Duration::from_secs(1));
     }

@@ -242,7 +242,7 @@ impl SessionTransport<Index> for TcpWorker {
                     TcpTimerAction::PersistProbe => TcpNodeError::PersistProbe,
                     TcpTimerAction::KeepaliveProbe => TcpNodeError::KeepaliveProbe,
                 };
-                let _ = runtime.record_current_node_error(counter.code());
+                let _ = runtime.record_current_node_error(counter);
             }
             if let Some(segment) = outcome.segment {
                 if segment.payload_len() == 0 {

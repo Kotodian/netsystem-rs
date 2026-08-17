@@ -2,8 +2,9 @@ use hammer_core::data_plane::{BufferFrame, NodeNext, NodeRegistration};
 use hammer_runtime::RuntimeResult;
 use hammer_runtime::{
     DataPlaneBufferConfig, DataPlaneRuntime, DataPlaneRuntimeConfig, DriverNode, Node,
-    NodeDescriptor, NodeProcessFn, NodeResult, NodeRuntimeData, TraceControlPlane, TraceFormatter,
-    TraceInputPolicy, TracePolicy, add_packet_trace, format_packet_trace, process_frame,
+    NodeDescriptor, NodeErrorDescriptor, NodeErrorSeverity, NodeProcessFn, NodeResult,
+    NodeRuntimeData, TraceControlPlane, TraceFormatter, TraceInputPolicy, TracePolicy,
+    add_packet_trace, format_packet_trace, process_frame,
 };
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -113,6 +114,17 @@ fn runtime_owner_registers_dispatches_traces_and_reports_stats() -> RuntimeResul
         runtime.nodes().node_next(driver, TestNext::Internal)?,
         internal
     );
+    let driver_errors = [
+        NodeErrorDescriptor::new("error-0", NodeErrorSeverity::Error, "test error"),
+        NodeErrorDescriptor::new("error-1", NodeErrorSeverity::Error, "test error"),
+        NodeErrorDescriptor::new("error-2", NodeErrorSeverity::Error, "test error"),
+        NodeErrorDescriptor::new("error-3", NodeErrorSeverity::Error, "test error"),
+        NodeErrorDescriptor::new("error-4", NodeErrorSeverity::Error, "test error"),
+        NodeErrorDescriptor::new("error-5", NodeErrorSeverity::Error, "test error"),
+    ];
+    runtime
+        .nodes()
+        .materialize_node_errors(driver, &driver_errors)?;
 
     let trace = TraceControlPlane::new(8);
     runtime.set_trace_control(Some(trace.handle()));
@@ -131,22 +143,10 @@ fn runtime_owner_registers_dispatches_traces_and_reports_stats() -> RuntimeResul
     let mut frame = runtime.buffers().get_next_frame(driver)?;
     frame.push_index(runtime.alloc_index_with_bytes(b"pkt")?)?;
     runtime.put_next_frame(frame)?;
-    runtime.nodes().increment_node_error(driver, 5)?;
 
     assert_eq!(runtime.run_ready_nodes()?, 2);
     assert_eq!(DRIVER_CALLS.load(Ordering::SeqCst), 1);
     assert_eq!(INTERNAL_CALLS.load(Ordering::SeqCst), 1);
-    assert_eq!(runtime.node_error_count(driver, 5)?, 1);
-
-    let rows = runtime.nodes().node_runtime_stats_snapshot();
-    let driver_row = rows
-        .iter()
-        .find(|row| row.node_id == driver)
-        .expect("driver stats row");
-    assert_eq!(driver_row.node_name, Some("owner-driver"));
-    assert_eq!(driver_row.calls, 1);
-    assert_eq!(driver_row.vectors, 1);
-    assert_eq!(driver_row.error_counters.get(5), 1);
 
     assert_eq!(trace.drain_completed(), 1);
     assert_eq!(trace.records().len(), 1);

@@ -14,7 +14,6 @@ use hammer_runtime::{
 use hammer_runtime::{RuntimeError, RuntimeResult};
 use ipnet::IpNet;
 
-use crate::data_plane::set_index_node_error_code;
 use crate::device::DeviceTxQueue;
 use crate::opaque::NetworkOpaque;
 
@@ -618,27 +617,19 @@ impl InterfaceOutputState {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum InterfaceOutputNodeError {
+/// Trace-only output diagnostics. Missing interface or TX graph state is an
+/// owner/resource failure, not a node business-error counter.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
+pub enum InterfaceOutputTraceError {
     MissingEgressInterface,
     MissingTxNode,
-}
-
-impl InterfaceOutputNodeError {
-    #[inline(always)]
-    pub const fn code(self) -> u16 {
-        match self {
-            Self::MissingEgressInterface => 1,
-            Self::MissingTxNode => 2,
-        }
-    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
 pub struct InterfaceOutputTrace {
     pub egress_interface: Option<u32>,
     pub tx_next: Option<u16>,
-    pub error: Option<u16>,
+    pub error: Option<InterfaceOutputTraceError>,
     pub next: Option<u16>,
 }
 
@@ -668,36 +659,26 @@ impl InterfaceOutputNode {
             network.sw_if_index[1]
         };
         if interface_index == u32::MAX {
-            set_index_node_error_code(
-                runtime,
-                index,
-                InterfaceOutputNodeError::MissingEgressInterface.code(),
-            )?;
             let _ = add_packet_trace!(
                 runtime,
                 index,
                 InterfaceOutputTrace {
                     egress_interface: None,
                     tx_next: None,
-                    error: Some(InterfaceOutputNodeError::MissingEgressInterface.code()),
+                    error: Some(InterfaceOutputTraceError::MissingEgressInterface),
                     next: Some(drop_next),
                 },
             );
             return Ok(drop_next);
         }
         let Some(tx) = output.tx_slot(interface_index) else {
-            set_index_node_error_code(
-                runtime,
-                index,
-                InterfaceOutputNodeError::MissingTxNode.code(),
-            )?;
             let _ = add_packet_trace!(
                 runtime,
                 index,
                 InterfaceOutputTrace {
                     egress_interface: Some(interface_index),
                     tx_next: None,
-                    error: Some(InterfaceOutputNodeError::MissingTxNode.code()),
+                    error: Some(InterfaceOutputTraceError::MissingTxNode),
                     next: Some(drop_next),
                 },
             );

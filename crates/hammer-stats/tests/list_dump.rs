@@ -47,8 +47,311 @@ fn register_counter_returns_direct_handle_for_list_and_dump() {
     assert_eq!(dumped[0].value, DumpValue::Counter(42));
 }
 
-/// Registration validates the whole batch before publishing any directory
-/// entry, matching VPP's structural publication boundary.
+#[test]
+fn register_counter_vector_simple_returns_direct_handle_for_list_and_dump() {
+    let mut stats = StatsMain::new().expect("default construction");
+    let registrations = [StatsRegistration {
+        path: "/node/errors",
+        descriptor: StatsDescriptor {
+            fq_name: "node_errors",
+            help: "per-worker node errors",
+            const_labels: &[],
+        },
+        value: StatsValueLayout::CounterVectorSimple {
+            rows: 2,
+            columns: 3,
+        },
+    }];
+
+    let mut entries = stats.register(&registrations).expect("vector registered");
+    let StatsEntry::CounterVectorSimple { id, handle } = entries.pop().expect("entry") else {
+        panic!("simple counter vector registration returned a different value kind");
+    };
+    handle
+        .increment_by(0, 1, 7)
+        .expect("first direct increment");
+    handle
+        .increment_by(1, 2, 4)
+        .expect("second direct increment");
+
+    let listed = stats.list(&[]).expect("list");
+    assert_eq!(listed[0].id, id);
+    assert_eq!(listed[0].path, "/node/errors");
+    assert_eq!(listed[0].directory_type, DirectoryType::CounterVectorSimple);
+    assert_eq!(listed[0].prometheus_type, PrometheusType::Counter);
+
+    let dumped = stats.dump(&[id]).expect("dump");
+    assert_eq!(
+        dumped[0].value,
+        DumpValue::CounterVectorSimple(vec![vec![0, 7, 0], vec![0, 0, 4]])
+    );
+}
+
+#[test]
+fn register_symlinks_keeps_generic_registration_link_free_and_resolves_replacement() {
+    let mut stats = StatsMain::new().expect("default construction");
+    let registrations = [StatsRegistration {
+        path: "/sys/node/calls",
+        descriptor: StatsDescriptor {
+            fq_name: "node_calls_total",
+            help: "node calls",
+            const_labels: &[],
+        },
+        value: StatsValueLayout::CounterVectorSimple {
+            rows: 2,
+            columns: 2,
+        },
+    }];
+    let mut entries = stats
+        .register(&registrations)
+        .expect("generic vector registration");
+    let StatsEntry::CounterVectorSimple {
+        id: vector_id,
+        handle: vector,
+    } = entries.pop().expect("vector entry")
+    else {
+        panic!("generic registration returned a different value kind");
+    };
+
+    let symlink_id = stats
+        .register_symlinks(&[(
+            "/nodes/example/calls",
+            StatsDescriptor {
+                fq_name: "node_calls_total",
+                help: "node calls",
+                const_labels: &[("node", "example")],
+            },
+            "/sys/node/calls",
+            1,
+        )])
+        .expect("link registration")
+        .into_iter()
+        .next()
+        .expect("link id");
+
+    vector.increment_by(0, 0, 7).expect("first value");
+    vector.increment_by(1, 1, 11).expect("second value");
+    let before = stats.dump(&[symlink_id]).expect("link before replacement");
+    assert_eq!(
+        before[0].value,
+        DumpValue::CounterVectorSimple(vec![vec![0], vec![11]])
+    );
+
+    let (replacement_id, replacement) = stats
+        .replace_counter_vector_simple("/sys/node/calls", 3, 4)
+        .expect("replace root vector");
+    assert_eq!(replacement_id.index(), vector_id.index());
+    assert_eq!(replacement_id.generation(), vector_id.generation() + 1);
+    assert_eq!(replacement.rows(), 3);
+    assert_eq!(replacement.columns(), 4);
+    replacement.increment_by(2, 3, 5).expect("new vector cell");
+    let after = stats.dump(&[symlink_id]).expect("link follows replacement");
+    assert_eq!(
+        after[0].value,
+        DumpValue::CounterVectorSimple(vec![vec![0], vec![11], vec![0]])
+    );
+
+    assert!(matches!(
+        vector.get(0, 0),
+        Err(StatsError::StaleEntry { id }) if id == vector_id
+    ));
+
+    let dumped = stats
+        .dump(&[replacement_id, symlink_id])
+        .expect("dump replacement and link");
+    assert_eq!(
+        dumped[0].value,
+        DumpValue::CounterVectorSimple(vec![vec![7, 0, 0, 0], vec![0, 11, 0, 0], vec![0, 0, 0, 5]])
+    );
+    assert_eq!(
+        dumped[1].value,
+        DumpValue::CounterVectorSimple(vec![vec![0], vec![11], vec![0]])
+    );
+}
+
+#[test]
+fn register_counter_vector_combined_returns_direct_handle_for_list_and_dump() {
+    let mut stats = StatsMain::new().expect("default construction");
+    let registrations = [StatsRegistration {
+        path: "/if/counters",
+        descriptor: StatsDescriptor {
+            fq_name: "interface_counters",
+            help: "per-worker packet and byte counters",
+            const_labels: &[],
+        },
+        value: StatsValueLayout::CounterVectorCombined {
+            rows: 2,
+            columns: 2,
+        },
+    }];
+
+    let mut entries = stats.register(&registrations).expect("vector registered");
+    let StatsEntry::CounterVectorCombined { id, handle } = entries.pop().expect("entry") else {
+        panic!("combined counter vector registration returned a different value kind");
+    };
+    handle
+        .increment_by(0, 1, 3, 42)
+        .expect("direct combined increment");
+    assert_eq!(handle.get(0, 1).expect("combined counter read"), (3, 42));
+
+    let listed = stats.list(&[]).expect("list");
+    assert_eq!(listed[0].id, id);
+    assert_eq!(
+        listed[0].directory_type,
+        DirectoryType::CounterVectorCombined
+    );
+
+    let dumped = stats.dump(&[id]).expect("dump");
+    assert_eq!(
+        dumped[0].value,
+        DumpValue::CounterVectorCombined(vec![vec![(0, 0), (3, 42)], vec![(0, 0), (0, 0)]])
+    );
+}
+
+#[test]
+fn register_name_vector_returns_fixed_slot_handle_and_snapshot() {
+    let mut stats = StatsMain::new().expect("default construction");
+    let registrations = [StatsRegistration {
+        path: "/names/workers",
+        descriptor: StatsDescriptor {
+            fq_name: "worker_names",
+            help: "bounded worker names",
+            const_labels: &[],
+        },
+        value: StatsValueLayout::NameVector { length: 3 },
+    }];
+
+    let mut entries = stats
+        .register(&registrations)
+        .expect("name vector registered");
+    let StatsEntry::NameVector { id, handle } = entries.pop().expect("entry") else {
+        panic!("name vector registration returned a different value kind");
+    };
+    handle.set(0, "worker-a").expect("first name");
+    handle.set(2, "worker-c").expect("third name");
+    assert_eq!(
+        handle.get(0).expect("first name read").as_deref(),
+        Some("worker-a")
+    );
+    assert_eq!(handle.get(1).expect("empty name read"), None);
+
+    let too_long = "x".repeat(256);
+    assert!(handle.set(1, &too_long).is_err());
+    assert_eq!(handle.get(1).expect("unchanged empty slot"), None);
+
+    let listed = stats.list(&[]).expect("list");
+    assert_eq!(listed[0].id, id);
+    assert_eq!(listed[0].directory_type, DirectoryType::NameVector);
+    let dumped = stats.dump(&[id]).expect("dump");
+    assert_eq!(
+        dumped[0].value,
+        DumpValue::NameVector(vec![
+            Some("worker-a".to_owned()),
+            None,
+            Some("worker-c".to_owned()),
+        ])
+    );
+}
+
+#[test]
+fn register_histogram_log2_returns_direct_handle_and_bins_snapshot() {
+    let mut stats = StatsMain::new().expect("default construction");
+    let registrations = [StatsRegistration {
+        path: "/latency/histogram",
+        descriptor: StatsDescriptor {
+            fq_name: "latency_histogram",
+            help: "bounded log2 latency bins",
+            const_labels: &[],
+        },
+        value: StatsValueLayout::HistogramLog2 { rows: 2 },
+    }];
+
+    let mut entries = stats
+        .register(&registrations)
+        .expect("histogram registered");
+    let StatsEntry::HistogramLog2 { id, handle } = entries.pop().expect("entry") else {
+        panic!("histogram registration returned a different value kind");
+    };
+    handle.increment_bin(0, 3, 2).expect("bin increment");
+    handle.increment_value(1, 8, 5).expect("value increment");
+    assert_eq!(handle.get(0, 3).expect("bin read"), 2);
+    assert_eq!(handle.get(1, 3).expect("value bin read"), 5);
+
+    let listed = stats.list(&[]).expect("list");
+    assert_eq!(listed[0].id, id);
+    assert_eq!(listed[0].directory_type, DirectoryType::HistogramLog2);
+    let dumped = stats.dump(&[id]).expect("dump");
+    let DumpValue::HistogramLog2(rows) = &dumped[0].value else {
+        panic!("histogram dump returned a different value kind");
+    };
+    assert_eq!(rows.len(), 2);
+    assert_eq!(rows[0][3], 2);
+    assert_eq!(rows[1][3], 5);
+    assert_eq!(rows[0].len(), 64);
+}
+
+#[test]
+fn register_ring_buffer_returns_fixed_row_snapshot_and_schema() {
+    let mut stats = StatsMain::new().expect("default construction");
+    let registrations = [StatsRegistration {
+        path: "/events/ring",
+        descriptor: StatsDescriptor {
+            fq_name: "event_ring",
+            help: "bounded event ring",
+            const_labels: &[],
+        },
+        value: StatsValueLayout::RingBuffer {
+            rows: 1,
+            capacity: 2,
+            entry_size: 3,
+            schema: &[1, 2, 3],
+        },
+    }];
+
+    let mut entries = stats.register(&registrations).expect("ring registered");
+    let StatsEntry::RingBuffer { id, handle } = entries.pop().expect("entry") else {
+        panic!("ring registration returned a different value kind");
+    };
+    assert_eq!(handle.schema().expect("schema read"), Some(vec![1, 2, 3]));
+    assert_eq!(handle.produce(0, b"abc").expect("first event"), 1);
+    assert_eq!(handle.produce(0, b"xyz").expect("second event"), 2);
+    assert_eq!(
+        handle.latest(0).expect("latest read"),
+        Some(b"xyz".to_vec())
+    );
+
+    let listed = stats.list(&[]).expect("list");
+    assert_eq!(listed[0].id, id);
+    assert_eq!(listed[0].directory_type, DirectoryType::RingBuffer);
+    let dumped = stats.dump(&[id]).expect("dump");
+    let DumpValue::RingBuffer(rows) = &dumped[0].value else {
+        panic!("ring dump returned a different value kind");
+    };
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].sequence, 2);
+    assert_eq!(rows[0].entries, vec![b"abc".to_vec(), b"xyz".to_vec()]);
+}
+
+#[test]
+fn dump_rejects_uninitialized_directory_tail_after_growth() {
+    let mut stats = StatsMain::new().expect("default construction");
+    for index in 0..9 {
+        let path = format!("/growth/{index}");
+        let name = format!("growth_{index}");
+        stats
+            .add_counter(&path, prometheus::Opts::new(name, "growth"))
+            .expect("counter registered");
+    }
+
+    let tail = EntryId::try_from((15, 1)).expect("valid uninitialized slot id");
+    let error = stats
+        .dump(&[tail])
+        .expect_err("uninitialized tail rejected");
+    assert!(matches!(error, StatsError::NotFound { id } if id == tail));
+}
+
+/// Invalid input is rejected during the preparation pass before any
+/// directory entry is published.
 #[test]
 fn register_batch_failure_publishes_nothing() {
     let mut stats = StatsMain::new().expect("default construction");
@@ -80,9 +383,9 @@ fn register_batch_failure_publishes_nothing() {
     assert!(stats.list(&[]).expect("list after failed batch").is_empty());
 }
 
-/// A late allocator failure also leaves no earlier registration visible.
+/// A late allocator failure preserves the entries published before it.
 #[test]
-fn register_capacity_failure_publishes_nothing() {
+fn register_capacity_failure_preserves_published_prefix() {
     let page = page_size().expect("page size must be queryable");
     let mut stats = StatsMain::with_capacity(2 * page).expect("two pages fit");
     let help = "x".repeat(1_000);
@@ -107,11 +410,14 @@ fn register_capacity_failure_publishes_nothing() {
         panic!("capacity-constrained batch unexpectedly succeeded");
     };
     assert!(matches!(error, StatsError::SegmentFull));
+    let listed = stats.list(&[]).expect("list after capacity failure");
+    assert!(!listed.is_empty(), "successful entries remain published");
     assert!(
-        stats
-            .list(&[])
-            .expect("list after capacity failure")
-            .is_empty()
+        listed
+            .iter()
+            .enumerate()
+            .all(|(index, entry)| entry.path == format!("/large/{index}")),
+        "published entries must retain registration order"
     );
 }
 
@@ -202,7 +508,7 @@ fn counters_and_timestamps_report_scalar_directory_type() {
     timestamp.set(1_700_000_000).expect("set");
     assert_eq!(timestamp.get().expect("get"), 1_700_000_000);
 
-    let clone = timestamp.try_clone().expect("clone");
+    let clone = timestamp.clone();
     clone.set(1_800_000_000).expect("clone sets");
     assert_eq!(timestamp.get().expect("read after clone"), 1_800_000_000);
 
@@ -427,7 +733,7 @@ fn collect_runs_every_collector_and_returns_the_first_error() {
     // First registered: fails with a distinct error.
     stats.register_collector(|| Err(StatsError::InvalidPath("first".to_owned())));
     // Second: healthy, updates the metric through a cloned handle.
-    let update = counter.try_clone().expect("clone");
+    let update = counter.clone();
     stats.register_collector(move || update.increment_by(10));
     // Third: fails with a different error; must not mask the first.
     stats.register_collector(|| Err(StatsError::DuplicateName("third".to_owned())));
@@ -442,13 +748,11 @@ fn collect_runs_every_collector_and_returns_the_first_error() {
     assert_eq!(counter.get().expect("value"), 10);
 }
 
-/// Removed metric blocks are reused by the arena, and a reused block must
-/// decode exactly the new occupant's strings: the shorter strings of the
-/// second metric sit in a block whose tail still holds the longer strings
-/// of the first, so every string needs its own freshly written NUL
-/// terminator rather than relying on stale bytes.
+/// A new metric after removal decodes exactly its own strings. Descriptor
+/// writers always write each NUL terminator explicitly, independent of the
+/// retired block storage kept by StatsMain.
 #[test]
-fn reused_block_after_removal_decodes_exact_strings() {
+fn new_block_after_removal_decodes_exact_strings() {
     let mut stats = StatsMain::new().expect("default construction");
 
     // Both blocks are exactly 128 bytes: header (32) plus name+help with
@@ -464,8 +768,8 @@ fn reused_block_after_removal_decodes_exact_strings() {
     assert_eq!(entries[0].fq_name, "a");
     assert_eq!(entries[0].help, "x".repeat(27));
 
-    // Removing while the handle lives puts the slot on the removed list;
-    // dropping the handle lets the next structural pass release the block.
+    // Removing returns the slot to the free list while StatsMain retains the
+    // detached block in its retired allocation set.
     stats.remove_entry(id_a).expect("remove");
     drop(counter);
 

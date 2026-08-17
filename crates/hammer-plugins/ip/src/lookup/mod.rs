@@ -23,7 +23,7 @@ use hammer_runtime::{
 };
 use hammer_runtime::{RuntimeError, RuntimeResult};
 
-use hammer_service::data_plane::set_index_node_error_code;
+use hammer_service::data_plane::set_index_node_error;
 use hammer_service::interface::InterfaceControlHandle;
 use hammer_service::opaque::{NetworkOpaque, TapEthernetMetadata};
 
@@ -692,12 +692,20 @@ impl InternalNode for IpLookupNode {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u16)]
 pub enum AdjacencyRewriteNodeError {
     MissingForwarding,
     WrongDpo,
     MissingAdjacency,
     RewriteFailed,
     MtuExceeded,
+}
+
+impl hammer_runtime::node::NodeErrorCode for AdjacencyRewriteNodeError {
+    #[inline(always)]
+    fn local_code(self) -> u16 {
+        self as u16
+    }
 }
 
 impl AdjacencyRewriteNodeError {
@@ -772,10 +780,10 @@ impl AdjacencyRewriteNode {
             opaque.forwarding
         };
         let Some(forwarding) = forwarding else {
-            set_index_node_error_code(
+            set_index_node_error(
                 runtime,
                 index,
-                AdjacencyRewriteNodeError::MissingForwarding.code(),
+                AdjacencyRewriteNodeError::MissingForwarding,
             )?;
             let _ = add_packet_trace!(
                 runtime,
@@ -791,7 +799,7 @@ impl AdjacencyRewriteNode {
             return Ok(None);
         };
         if forwarding.dpo_type != DpoType::ADJACENCY {
-            set_index_node_error_code(runtime, index, AdjacencyRewriteNodeError::WrongDpo.code())?;
+            set_index_node_error(runtime, index, AdjacencyRewriteNodeError::WrongDpo)?;
             let _ = add_packet_trace!(
                 runtime,
                 index,
@@ -809,10 +817,10 @@ impl AdjacencyRewriteNode {
             .table()
             .adjacency(AdjacencyIndex::new(forwarding.dpo_index))
         else {
-            set_index_node_error_code(
+            set_index_node_error(
                 runtime,
                 index,
-                AdjacencyRewriteNodeError::MissingAdjacency.code(),
+                AdjacencyRewriteNodeError::MissingAdjacency,
             )?;
             let _ = add_packet_trace!(
                 runtime,
@@ -831,10 +839,10 @@ impl AdjacencyRewriteNode {
         if let Some(next) =
             adjacency_mtu_divert(runtime, index, &adjacency, icmp_error_next, fragment_next)?
         {
-            set_index_node_error_code(
+            set_index_node_error(
                 runtime,
                 index,
-                AdjacencyRewriteNodeError::MtuExceeded.code(),
+                AdjacencyRewriteNodeError::MtuExceeded,
             )?;
             let _ = add_packet_trace!(
                 runtime,
@@ -854,8 +862,8 @@ impl AdjacencyRewriteNode {
         let egress_interface = adjacency.egress_interface;
         let next = adjacency.next;
         if apply_adjacency_rewrite(runtime, index, adjacency).is_err() {
-            let error = AdjacencyRewriteNodeError::RewriteFailed.code();
-            set_index_node_error_code(runtime, index, error)?;
+            let error = AdjacencyRewriteNodeError::RewriteFailed;
+            set_index_node_error(runtime, index, error)?;
             let _ = add_packet_trace!(
                 runtime,
                 index,
@@ -863,7 +871,7 @@ impl AdjacencyRewriteNode {
                     dpo_index: Some(forwarding.dpo_index),
                     egress_interface,
                     rewrite_len: 0,
-                    error: Some(error),
+                    error: Some(error.code()),
                     next: None,
                 },
             );

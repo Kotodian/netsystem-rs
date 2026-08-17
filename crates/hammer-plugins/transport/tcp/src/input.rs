@@ -14,7 +14,7 @@ use hammer_runtime::{
     TraceFormatter, add_packet_trace, format_packet_trace,
 };
 use hammer_runtime::{RuntimeError, RuntimeResult};
-use hammer_service::data_plane::set_buffer_node_error_code;
+use hammer_service::data_plane::set_buffer_node_error;
 
 use super::lookup::{
     TcpIpv4ListenerAddress, TcpIpv6ListenerAddress, TcpLookupSnapshot, TcpLookupValue,
@@ -471,7 +471,7 @@ fn resolve_error_next_with_runtime(
 ) -> RuntimeResult<Option<u16>> {
     {
         let mut buffer = runtime.get_buffer_mut(index)?;
-        set_buffer_node_error_code(runtime, &mut buffer, error as u16)?;
+        set_buffer_node_error(runtime, &mut buffer, error)?;
     }
     let slot = next_key.slot() as u16;
     if traced {

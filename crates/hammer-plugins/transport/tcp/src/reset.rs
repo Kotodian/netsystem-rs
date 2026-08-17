@@ -450,17 +450,16 @@ mod tests {
 
     use hammer_infra::checksum::{internet_checksum, internet_checksum_parts};
 
-    use hammer_core::data_plane::BufferNodeError;
+    use hammer_core::data_plane::NodeErrorIndex;
     use hammer_runtime::InternalNode;
 
     use super::*;
-    use crate::TcpResetError;
 
     #[derive(Default)]
     struct CaptureState {
         packets: Vec<Vec<u8>>,
         cursors: Vec<hammer_core::data_plane::BufferPacketCursor>,
-        node_errors: Vec<Option<BufferNodeError>>,
+        node_errors: Vec<Option<NodeErrorIndex>>,
     }
 
     struct CaptureNode {
@@ -521,9 +520,7 @@ mod tests {
             .packet_cursor();
             state.packets.push(buffer.current().to_vec().into());
             state.cursors.push(cursor);
-            state
-                .node_errors
-                .push(runtime.node_error(index).expect("node error"));
+            state.node_errors.push(buffer.node_error_index());
         }
         NodeResult::drop()
     }
@@ -571,9 +568,6 @@ mod tests {
                 )
             }
             .set_packet_cursor(buffer_packet_cursor(40));
-            let code = TcpResetError::BadTcpHeader.code();
-            buffer.set_node_error(BufferNodeError::new(NodeId::new(0), code));
-            let _ = runtime.record_current_node_error(code);
         }
         frame.push_index(index).expect("push index");
 

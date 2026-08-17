@@ -45,8 +45,6 @@ pub enum StatsError {
     InvalidState(u8),
     /// A size/align pair could not be laid out.
     InvalidLayout,
-    /// The metric reference count would overflow `u64::MAX`.
-    RefCountOverflow,
     /// The entry generation would wrap `u64::MAX`.
     GenerationOverflow,
     /// A `list` pattern could not be compiled as a regular expression.
@@ -110,7 +108,6 @@ impl fmt::Display for StatsError {
             StatsError::Misaligned => write!(f, "offset not aligned for its record"),
             StatsError::InvalidState(state) => write!(f, "invalid mapped state byte 0x{state:02x}"),
             StatsError::InvalidLayout => write!(f, "invalid size/alignment layout"),
-            StatsError::RefCountOverflow => write!(f, "metric reference count overflow"),
             StatsError::GenerationOverflow => write!(f, "metric generation overflow"),
             StatsError::InvalidPattern { pattern, source } => {
                 write!(f, "invalid stats list pattern {pattern:?}: {source}")

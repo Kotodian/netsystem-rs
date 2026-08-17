@@ -19,7 +19,7 @@ pub fn start_workers(engine: &mut Engine) -> RuntimeResult<()> {
     barrier.arm();
     engine.barrier = barrier.clone();
     engine.main_loop_exit_now.store(false, Ordering::Release);
-    engine.prepare_worker_runtime_stats(worker_config.count);
+    engine.prepare_worker_publication(worker_config.count);
 
     let handoff = DataPlaneHandoff::with_node_capacity(
         worker_config.count,

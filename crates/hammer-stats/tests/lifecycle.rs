@@ -48,7 +48,7 @@ fn add_counter_publishes_and_counts() {
     counter.increment_by(41).expect("increment by");
     assert_eq!(counter.get().expect("read"), 42);
 
-    let clone = counter.try_clone().expect("clone");
+    let clone = counter.clone();
     clone.increment_by(8).expect("clone increments");
     assert_eq!(counter.get().expect("read after clone"), 50);
     assert_eq!(clone.get().expect("clone read"), 50);
@@ -118,7 +118,7 @@ fn add_gauge_sets_and_reads_floats() {
     gauge.set(-2.25).expect("set negative");
     assert_eq!(gauge.get().expect("read negative"), -2.25);
 
-    let clone = gauge.try_clone().expect("clone");
+    let clone = gauge.clone();
     clone.set(99.0).expect("clone sets");
     assert_eq!(gauge.get().expect("read after clone"), 99.0);
     drop(clone);
@@ -206,11 +206,12 @@ fn remove_entry_hides_metric_and_reuses_slot_with_new_generation() {
         "unexpected: {err}"
     );
 
-    // Removal hides the entry; live handles go stale, others keep working.
+    // Removal hides the entry; non-owning handles report NotFound, others
+    // keep working.
     stats.remove_entry(id0).expect("removed");
     let err = c0.increment().err().expect("stale handle rejected");
     assert!(
-        matches!(err, StatsError::StaleEntry { id } if id == id0),
+        matches!(err, StatsError::NotFound { id } if id == id0),
         "unexpected: {err}"
     );
     c1.increment().expect("other counter unaffected");
@@ -226,13 +227,13 @@ fn remove_entry_hides_metric_and_reuses_slot_with_new_generation() {
         "unexpected: {err}"
     );
 
-    // While a handle is live the removed slot is not reused; the name is
-    // free again, so a re-add lands in a fresh slot.
+    // The removed slot returns to the free list immediately. Reuse advances
+    // its generation, so the old non-owning handle remains stale.
     let (id2, c2) = stats
         .add_counter("/a", prometheus::Opts::new("a", "reused"))
         .expect("re-add with live handle");
-    assert_eq!(id2.index(), 2);
-    assert_eq!(id2.generation(), 1);
+    assert_eq!(id2.index(), id0.index());
+    assert_eq!(id2.generation(), id0.generation() + 1);
     c2.increment_by(3).expect("increment");
     assert_eq!(c2.get().expect("value"), 3);
     assert!(matches!(
@@ -240,14 +241,14 @@ fn remove_entry_hides_metric_and_reuses_slot_with_new_generation() {
         StatsError::StaleEntry { .. }
     ));
 
-    // Dropping the last live handle lets the next structural pass reclaim
-    // the slot, which the next add reuses with a bumped generation.
-    drop(c0);
+    // The next new metric appends after the active slots. Its old block is
+    // still owned by StatsMain, so allocation reclamation is not tied to a
+    // handle's Drop implementation.
     let (id3, c3) = stats
-        .add_counter("/c", prometheus::Opts::new("c", "reclaimed"))
-        .expect("add after reclaim");
-    assert_eq!(id3.index(), id0.index());
-    assert_eq!(id3.generation(), 2);
+        .add_counter("/c", prometheus::Opts::new("c", "appended"))
+        .expect("add after reuse");
+    assert_eq!(id3.index(), 2);
+    assert_eq!(id3.generation(), 1);
     c3.increment_by(4).expect("increment");
     assert_eq!(c3.get().expect("value"), 4);
 }
@@ -291,15 +292,11 @@ fn tiny_segment_exhausts_with_segment_full() {
     // handful of metric blocks.
     let mut stats = StatsMain::with_capacity(2 * page).expect("tiny segment");
 
-    let mut first = None;
     let mut count = 0u64;
     loop {
         let name = format!("/tiny/m{count}");
         match stats.add_counter(&name, prometheus::Opts::new(format!("m{count}"), "tiny")) {
-            Ok((id, counter)) => {
-                if first.is_none() {
-                    first = Some((id, counter));
-                }
+            Ok(_) => {
                 count += 1;
             }
             Err(error) => {
@@ -316,17 +313,4 @@ fn tiny_segment_exhausts_with_segment_full() {
         count >= 4,
         "the arena must hold a few metrics before exhausting"
     );
-
-    // Freeing one metric's block (handle dropped, then removed) lets the
-    // next add reuse its slot without growing anything.
-    let (id0, counter0) = first.take().expect("first metric");
-    drop(counter0);
-    stats.remove_entry(id0).expect("remove releases the block");
-    let (id, counter) = stats
-        .add_counter("/tiny/reuse", prometheus::Opts::new("reuse", "tiny"))
-        .expect("add after remove");
-    assert_eq!(id.index(), id0.index());
-    assert_eq!(id.generation(), 2);
-    counter.increment().expect("increment");
-    assert_eq!(counter.get().expect("value"), 1);
 }

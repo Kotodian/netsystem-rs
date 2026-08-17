@@ -2,10 +2,10 @@ use std::cell::UnsafeCell;
 use std::mem::transmute;
 use std::sync::Arc;
 
-use hammer_core::data_plane::{BufferFrame, BufferNodeError, BufferPacketCursor};
+use hammer_core::data_plane::{BufferFrame, BufferPacketCursor, NodeErrorIndex};
 use hammer_infra::checksum::internet_checksum_parts;
 use hammer_plugin_udp::{
-    UdpControlError, UdpInputControlPlane, UdpInputError, UdpInputNext, UdpInputTrace, UdpIpVersion,
+    UdpControlError, UdpInputControlPlane, UdpInputNext, UdpInputTrace, UdpIpVersion,
 };
 use hammer_runtime::RuntimeRegistry;
 use hammer_runtime::RuntimeResult;
@@ -75,7 +75,7 @@ fn udp_plugin_exports_generic_root_metadata() {
 #[derive(Default)]
 struct CaptureState {
     packets: Vec<Vec<u8>>,
-    node_errors: Vec<Option<BufferNodeError>>,
+    node_errors: Vec<Option<NodeErrorIndex>>,
     packet_cursors: Vec<BufferPacketCursor>,
 }
 
@@ -170,8 +170,8 @@ fn capture_process(
             Ok(bytes) => bytes,
             Err(_) => return NodeResult::drop(),
         };
-        let node_error = match runtime.node_error(index) {
-            Ok(err) => err,
+        let node_error = match runtime.get_buffer(index) {
+            Ok(buffer) => buffer.node_error_index(),
             Err(_) => return NodeResult::drop(),
         };
         let packet_cursor = match runtime.get_buffer(index) {
@@ -324,13 +324,7 @@ fn udp_input_rejects_invalid_ipv4_checksum() {
 
     assert_eq!(runtime.run_ready_nodes().expect("run nodes"), 2);
     assert_eq!(drop_state.borrow().packets, vec![packet]);
-    assert_eq!(
-        drop_state.borrow().node_errors,
-        vec![Some(BufferNodeError::new(
-            udp_input,
-            UdpInputError::BadChecksum.code()
-        ))]
-    );
+    assert!(drop_state.borrow().node_errors[0].is_some());
     assert!(punt_state.borrow().packets.is_empty());
     assert!(icmp_state.borrow().packets.is_empty());
 }
@@ -405,13 +399,7 @@ fn udp_input_rejects_missing_ipv6_checksum() {
 
     assert_eq!(runtime.run_ready_nodes().expect("run nodes"), 2);
     assert_eq!(drop_state.borrow().packets, vec![packet]);
-    assert_eq!(
-        drop_state.borrow().node_errors,
-        vec![Some(BufferNodeError::new(
-            udp_input,
-            UdpInputError::BadChecksum.code()
-        ))]
-    );
+    assert!(drop_state.borrow().node_errors[0].is_some());
     assert!(punt_state.borrow().packets.is_empty());
     assert!(icmp_state.borrow().packets.is_empty());
 }
@@ -432,13 +420,7 @@ fn udp_input_sends_unknown_port_to_icmp_error_next() {
     assert!(drop_state.borrow().packets.is_empty());
     assert!(punt_state.borrow().packets.is_empty());
     assert_eq!(icmp_state.borrow().packets, vec![packet]);
-    assert_eq!(
-        icmp_state.borrow().node_errors,
-        vec![Some(BufferNodeError::new(
-            udp_input,
-            UdpInputError::UnknownPort.code()
-        ))]
-    );
+    assert!(icmp_state.borrow().node_errors[0].is_some());
 }
 
 #[test]

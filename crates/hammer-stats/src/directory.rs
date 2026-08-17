@@ -14,7 +14,7 @@ use crate::offset::Offset;
 pub(crate) const SLOT_SIZE: usize = 256;
 /// Maximum directory name length including the NUL terminator.
 pub(crate) const ENTRY_NAME_LEN: usize = 128;
-/// Sentinel for empty free/removed list heads.
+/// Sentinel for an empty free-list head.
 pub(crate) const NULL_INDEX: u64 = u64::MAX;
 
 /// Slot lifecycle states.
@@ -24,7 +24,7 @@ pub(crate) enum EntryState {
     Free,
     /// Live metric, indexed by `EntryId`.
     Active,
-    /// Hidden after removal; awaits deferred reclamation.
+    /// Hidden slot state reserved for mapped-state validation.
     Removed,
 }
 
@@ -197,7 +197,7 @@ pub(crate) struct DirectorySlot {
     /// Raw `PrometheusType` byte.
     prometheus_type: u8,
     reserved: [u8; 5],
-    /// Next slot index on the free or removed list (`NULL_INDEX` tail).
+    /// Next slot index on the free list (`NULL_INDEX` tail).
     link: u64,
     /// Mapping-relative offset of the metric block (never zero).
     descriptor_offset: u64,
@@ -229,6 +229,51 @@ impl DirectorySlot {
             value_offset: value_offset.get(),
             reserved_words: [0; 11],
         }
+    }
+
+    pub(crate) fn new_symlink(
+        name: [u8; ENTRY_NAME_LEN],
+        generation: u64,
+        prometheus_type: PrometheusType,
+        descriptor_offset: Offset,
+        value_offset: Offset,
+        target_index: u32,
+        target_generation: u64,
+        vector_index: u32,
+    ) -> DirectorySlot {
+        let mut slot = Self::new_active(
+            name,
+            generation,
+            DirectoryType::Symlink,
+            prometheus_type,
+            descriptor_offset,
+            value_offset,
+        );
+        slot.set_symlink_target(target_index, target_generation, vector_index);
+        slot
+    }
+
+    pub(crate) fn set_symlink_target(
+        &mut self,
+        target_index: u32,
+        target_generation: u64,
+        vector_index: u32,
+    ) {
+        self.reserved_words[0] = u64::from(target_index);
+        self.reserved_words[1] = target_generation;
+        self.reserved_words[2] = u64::from(vector_index);
+    }
+
+    pub(crate) fn symlink_target_index(&self) -> Result<u32, StatsError> {
+        u32::try_from(self.reserved_words[0]).map_err(|_| StatsError::OutOfBounds)
+    }
+
+    pub(crate) fn symlink_target_generation(&self) -> u64 {
+        self.reserved_words[1]
+    }
+
+    pub(crate) fn symlink_vector_index(&self) -> Result<u32, StatsError> {
+        u32::try_from(self.reserved_words[2]).map_err(|_| StatsError::OutOfBounds)
     }
 
     /// The name field up to (excluding) its NUL terminator.

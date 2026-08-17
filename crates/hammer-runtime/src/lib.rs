@@ -75,9 +75,9 @@ pub use metrics::{
 };
 pub use network::{Network, SocksAddr};
 pub use node::{
-    DriverNode, InternalNode, Node, NodeDescriptor, NodeEntry, NodeErrorCounters, NodeProcessFn,
-    NodeResult, NodeRuntime, NodeRuntimeData, NodeRuntimeReady, NodeRuntimeStatsRow, NoopNode,
-    default_prefetch_indices,
+    DriverNode, InternalNode, Node, NodeDescriptor, NodeEntry, NodeErrorCode, NodeErrorDescriptor,
+    NodeErrorSeverity, NodeProcessFn, NodeResult, NodeRuntime, NodeRuntimeData, NodeRuntimeReady,
+    NoopNode, default_prefetch_indices,
 };
 pub use plugin::{
     PluginError, PluginMain, PluginMetadata, PluginModule, PluginModuleRef,

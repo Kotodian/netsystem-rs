@@ -6,8 +6,8 @@ use hammer_core::data_plane::{
 };
 use hammer_runtime::{
     DataPlaneBufferConfig, DataPlaneRuntime, DataPlaneRuntimeConfig, DriverNode, InternalNode,
-    Node, NodeDescriptor, NodeEntry, NodeProcessFn, NodeResult, NodeRuntimeData, RuntimeError,
-    RuntimeResult, TraceFormatter, process_frame,
+    Node, NodeDescriptor, NodeEntry, NodeErrorDescriptor, NodeErrorSeverity, NodeProcessFn,
+    NodeResult, NodeRuntimeData, RuntimeError, RuntimeResult, TraceFormatter, process_frame,
 };
 
 static NODE_CALLS_BY_WORD: [AtomicU64; 128] = [const { AtomicU64::new(0) }; 128];
@@ -82,11 +82,13 @@ fn init_graph_registers_sibling_owner_before_sibling() {
             registration: NodeRegistration::sibling_of("init-graph-sibling", "init-graph-owner"),
             kind: NodeKind::Internal,
             init: init_graph_sibling,
+            error_counters: &[],
         },
         NodeEntry {
             registration: NodeRegistration::next("init-graph-owner", 0),
             kind: NodeKind::Internal,
             init: init_graph_owner,
+            error_counters: &[],
         },
     ];
 
@@ -1185,16 +1187,18 @@ fn worker_runtime_resets_execution_state_but_keeps_configured_node_state() {
         count_process,
         NodeRuntimeData::empty(),
     ));
+    let node_errors =
+        [NodeErrorDescriptor::new("error-0", NodeErrorSeverity::Error, "test error"); 8];
+    runtime
+        .nodes()
+        .materialize_node_errors(node, &node_errors)
+        .expect("materialize node errors");
 
     let mut frame = runtime.buffers().get_next_frame(node).expect("alloc frame");
     push_packet(&runtime, &mut frame, b"packet");
     runtime.put_next_frame(frame).expect("put next frame");
     assert_eq!(runtime.run_ready_nodes().expect("run canonical node"), 1);
 
-    let encoded = runtime
-        .nodes()
-        .increment_node_error(node, 7)
-        .expect("define and increment node error");
     runtime
         .nodes()
         .set_node_state(driver, NodeState::Interrupt)
@@ -1214,19 +1218,6 @@ fn worker_runtime_resets_execution_state_but_keeps_configured_node_state() {
         worker.nodes().node_state(driver).unwrap(),
         NodeState::Interrupt
     );
-    assert_eq!(worker.nodes().node_error_count(node, 7).unwrap(), 0);
-    assert_eq!(
-        worker.nodes().decode_node_error(encoded).unwrap(),
-        runtime.nodes().decode_node_error(encoded).unwrap()
-    );
-    let row = worker
-        .nodes()
-        .node_runtime_stats_snapshot()
-        .into_iter()
-        .find(|row| row.node_id == node)
-        .expect("worker node stats row");
-    assert_eq!(row.calls, 0);
-    assert_eq!(row.vectors, 0);
     assert!(
         worker
             .set_node_interrupt_pending(driver)

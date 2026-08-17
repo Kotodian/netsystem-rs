@@ -12,7 +12,6 @@
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, SystemTimeError, UNIX_EPOCH};
 
-use hammer_infra::thread_owned::{ThreadOwned, ThreadOwnedError};
 use hammer_ipc::stats::wire;
 use hammer_runtime::{Engine, ProcessContext, ProcessWake, RuntimeError, RuntimeResult};
 use hammer_stats::{
@@ -74,10 +73,9 @@ enum StatsServiceError {
     /// A stats segment operation failed.
     #[error(transparent)]
     Stats(#[from] StatsError),
-    /// The ThreadOwned access gate rejected a caller (`with_mut` access
-    /// failures that carry a real reason).
-    #[error("stats ThreadOwned access failed")]
-    ThreadOwned(#[source] ThreadOwnedError),
+    /// The main Engine does not have its installed stats segment.
+    #[error("the Main Thread stats segment is unavailable")]
+    StatsMainUnavailable,
     /// The Main Thread stats capability could not be installed. Zero-data: a
     /// failed claim on a fresh slot carries no deeper reason.
     #[error("the Main Thread stats capability could not be installed")]
@@ -87,16 +85,12 @@ enum StatsServiceError {
     SystemTime(#[source] SystemTimeError),
 }
 
-/// Owning access to the engine's stats segment.
+/// Service-side stats configuration and scalar handles.
 ///
-/// The `StatsMain` is installed into a `ThreadOwned` on the Main Thread
-/// (where init runs). Both the collector Process Node (also the Main Thread:
-/// `ProcessMain` polls process futures on a main-thread `LocalSet`,
-/// process.rs:4) and the read-only Binary API handlers reach it through the
-/// closure API, which keeps the capability `Send + Sync` for the registry
-/// without any lock.
+/// The structural `StatsMain` owner lives on the main [`Engine`]. This
+/// capability remains registry-safe because it retains only the cadence and
+/// direct shared-segment scalar handles used by the collector.
 struct StatsCapability {
-    stats: ThreadOwned<StatsMain>,
     /// Collector cadence from `[stats]`.
     update_interval: Duration,
     /// `/sys/boottime` handle, set once at Process Node start.
@@ -104,10 +98,10 @@ struct StatsCapability {
 }
 
 impl StatsCapability {
-    /// Builds the segment, registers the VPP system scalars and the
-    /// heartbeat collector, installs the segment on the calling (Main)
-    /// thread, and returns the capability to be registered.
-    fn install(config: &StatsConfig) -> Result<Arc<Self>, StatsServiceError> {
+    /// Builds the segment, registers the VPP system scalars and the heartbeat
+    /// collector, installs the segment on the main Engine, and returns the
+    /// service capability to be registered.
+    fn install(engine: &mut Engine, config: &StatsConfig) -> Result<Arc<Self>, StatsServiceError> {
         let mut stats =
             StatsMain::with_capacity(config.segment_capacity).map_err(StatsServiceError::Stats)?;
         // VPP heartbeat: a scalar bumped once per collector pass
@@ -146,16 +140,10 @@ impl StatsCapability {
             .map_err(StatsServiceError::Stats)?;
         drop(last_stats_clear);
 
-        // The instance is fresh, so the claim can only fail if the slot was
-        // already bound — impossible here, so it maps to a dedicated
-        // zero-data error rather than a fabricated gate reason.
-        let owned = ThreadOwned::new();
-        match owned.install(stats) {
-            Ok(()) => {}
-            Err(_stats) => return Err(StatsServiceError::InstallFailed),
-        }
+        engine
+            .install_stats_main(stats)
+            .map_err(|_| StatsServiceError::InstallFailed)?;
         Ok(Arc::new(Self {
-            stats: owned,
             update_interval: config.update_interval,
             boottime,
         }))
@@ -164,23 +152,6 @@ impl StatsCapability {
     /// Collector cadence for the Process Node loop.
     fn update_interval(&self) -> Duration {
         self.update_interval
-    }
-
-    /// Runs a read-only stats operation through the ThreadOwned gate. The
-    /// outer result is the gate error, the inner one the operation's own.
-    fn with_stats<R>(
-        &self,
-        operation: impl FnOnce(&StatsMain) -> Result<R, StatsError>,
-    ) -> Result<Result<R, StatsError>, ThreadOwnedError> {
-        self.stats.with_mut(|stats| operation(stats))
-    }
-
-    /// Same gate for a mutating operation; `collect` is the only user.
-    fn with_stats_mut<R>(
-        &self,
-        operation: impl FnOnce(&mut StatsMain) -> Result<R, StatsError>,
-    ) -> Result<Result<R, StatsError>, ThreadOwnedError> {
-        self.stats.with_mut(operation)
     }
 
     /// One-shot boottime publication at Process Node start (VPP
@@ -200,8 +171,11 @@ fn configure(config: StatsConfig) -> RuntimeResult<Arc<StatsConfig>> {
 
 /// Builds and registers the engine's [`StatsCapability`].
 #[hammer_component_macros::init_function(name = "stats_init")]
-fn init(config: Arc<StatsConfig>) -> RuntimeResult<Option<Arc<StatsCapability>>> {
-    Ok(Some(StatsCapability::install(&config)?))
+fn init(
+    engine: &mut Engine,
+    config: Arc<StatsConfig>,
+) -> RuntimeResult<Option<Arc<StatsCapability>>> {
+    Ok(Some(StatsCapability::install(engine, &config)?))
 }
 
 /// Collector Process Node, mirroring VPP's `stat_segment_collector_process`
@@ -218,7 +192,7 @@ async fn stats_collector(mut context: ProcessContext) -> RuntimeResult<()> {
     capability
         .set_boottime(boottime)
         .map_err(StatsServiceError::Stats)?;
-    run_collect_pass(&capability)?;
+    run_collect_pass()?;
     loop {
         match context
             .wait_for_event_or_clock(capability.update_interval())
@@ -230,21 +204,34 @@ async fn stats_collector(mut context: ProcessContext) -> RuntimeResult<()> {
                 "stats-collector woke on an unexpected event; collecting anyway"
             ),
         }
-        run_collect_pass(&capability)?;
+        run_collect_pass()?;
     }
+}
+
+/// Runs one operation against the main Engine's structural stats owner.
+///
+/// The current-thread Engine pointer already identifies the owner; this path
+/// deliberately does not synchronize through the Worker Barrier.
+fn with_current_stats<R>(
+    operation: impl FnOnce(&mut StatsMain) -> Result<R, StatsError>,
+) -> Result<R, StatsServiceError> {
+    Engine::with_current(|engine| engine.with_stats_main(operation))
+        .flatten()
+        .ok_or(StatsServiceError::StatsMainUnavailable)?
+        .map_err(StatsServiceError::Stats)
 }
 
 /// One collector pass (VPP `do_stat_segment_updates`, collector.c:132-151):
 /// a failing collector is logged at error level and the pass continues; only
 /// an access failure (owner gone) is fatal for the node.
-fn run_collect_pass(capability: &StatsCapability) -> RuntimeResult<()> {
-    match capability.with_stats_mut(|stats| stats.collect()) {
-        Ok(Ok(())) => Ok(()),
-        Ok(Err(error)) => {
+fn run_collect_pass() -> RuntimeResult<()> {
+    match with_current_stats(|stats| stats.collect()) {
+        Ok(()) => Ok(()),
+        Err(StatsServiceError::Stats(error)) => {
             tracing::error!(%error, "stats collector pass reported an error; continuing");
             Ok(())
         }
-        Err(error) => Err(RuntimeError::from(StatsServiceError::ThreadOwned(error))),
+        Err(error) => Err(RuntimeError::from(error)),
     }
 }
 
@@ -255,27 +242,17 @@ fn unix_seconds_now() -> Result<u64, SystemTimeError> {
         .map(|elapsed| elapsed.as_secs())
 }
 
-/// The engine's [`StatsCapability`], registered at init. Absent only when
-/// the engine is not current or the capability was never registered — both
-/// impossible in a running engine.
-fn capability() -> Option<Arc<StatsCapability>> {
-    Engine::with_current(|engine| engine.registry.get::<StatsCapability>()).flatten()
-}
-
 /// `stats.list`: returns the directory entries matching any pattern (empty
 /// selects all), in ascending directory-index order.
 #[hammer_component_macros::binary_api(name = "stats.list", mp_safe)]
 fn stats_list(request: wire::ListRequest) -> wire::ListReply {
-    let Some(capability) = capability() else {
-        return list_internal_error();
-    };
-    match capability.with_stats(|stats| stats.list(&request.patterns)) {
-        Ok(Ok(entries)) => wire::ListReply {
+    match with_current_stats(|stats| stats.list(&request.patterns)) {
+        Ok(entries) => wire::ListReply {
             result: Some(wire::list_reply::Result::Entries(wire::ListEntries {
                 entries: entries.into_iter().map(to_wire_list_entry).collect(),
             })),
         },
-        Ok(Err(error)) => list_error(error),
+        Err(StatsServiceError::Stats(error)) => list_error(error),
         Err(_) => list_internal_error(),
     }
 }
@@ -295,16 +272,13 @@ fn stats_dump(request: wire::DumpRequest) -> wire::DumpReply {
         Ok(ids) => ids,
         Err(error) => return dump_error(error),
     };
-    let Some(capability) = capability() else {
-        return dump_internal_error();
-    };
-    match capability.with_stats(|stats| stats.dump(&ids)) {
-        Ok(Ok(entries)) => wire::DumpReply {
+    match with_current_stats(|stats| stats.dump(&ids)) {
+        Ok(entries) => wire::DumpReply {
             result: Some(wire::dump_reply::Result::Entries(wire::DumpEntries {
                 entries: entries.into_iter().map(to_wire_dump_entry).collect(),
             })),
         },
-        Ok(Err(error)) => dump_error(error),
+        Err(StatsServiceError::Stats(error)) => dump_error(error),
         Err(_) => dump_internal_error(),
     }
 }
@@ -433,15 +407,73 @@ fn to_wire_list_entry(entry: hammer_stats::DirectoryEntry) -> wire::ListEntry {
 }
 
 fn to_wire_dump_entry(entry: hammer_stats::DumpEntry) -> wire::DumpEntry {
-    let value = match entry.value {
+    let hammer_stats::DumpEntry {
+        id,
+        path,
+        directory_type,
+        prometheus_type,
+        value,
+    } = entry;
+    let value = match value {
         hammer_stats::DumpValue::Counter(value) => wire::value::Value::Counter(value),
         hammer_stats::DumpValue::Gauge(value) => wire::value::Value::Gauge(value),
+        hammer_stats::DumpValue::CounterVectorSimple(rows) => {
+            wire::value::Value::CounterVectorSimple(wire::CounterVectorSimple {
+                rows: rows
+                    .into_iter()
+                    .map(|values| wire::CounterVectorSimpleRow { values })
+                    .collect(),
+            })
+        }
+        hammer_stats::DumpValue::CounterVectorCombined(rows) => {
+            wire::value::Value::CounterVectorCombined(wire::CounterVectorCombined {
+                rows: rows
+                    .into_iter()
+                    .map(|values| wire::CounterVectorCombinedRow {
+                        values: values
+                            .into_iter()
+                            .map(|(packets, bytes)| wire::CounterVectorCombinedValue {
+                                packets,
+                                bytes,
+                            })
+                            .collect(),
+                    })
+                    .collect(),
+            })
+        }
+        hammer_stats::DumpValue::NameVector(slots) => {
+            wire::value::Value::NameVector(wire::NameVector {
+                slots: slots
+                    .into_iter()
+                    .map(|name| wire::NameVectorSlot { name })
+                    .collect(),
+            })
+        }
+        hammer_stats::DumpValue::HistogramLog2(rows) => {
+            wire::value::Value::HistogramLog2(wire::HistogramLog2 {
+                rows: rows
+                    .into_iter()
+                    .map(|bins| wire::HistogramLog2Row { bins })
+                    .collect(),
+            })
+        }
+        hammer_stats::DumpValue::RingBuffer(snapshots) => {
+            wire::value::Value::RingBuffer(wire::RingBuffer {
+                snapshots: snapshots
+                    .into_iter()
+                    .map(|snapshot| wire::RingBufferSnapshot {
+                        sequence: snapshot.sequence,
+                        entries: snapshot.entries,
+                    })
+                    .collect(),
+            })
+        }
     };
     wire::DumpEntry {
-        id: Some(to_wire_id(entry.id)),
-        path: entry.path,
-        directory_type: wire_directory_type(entry.directory_type),
-        prometheus_type: wire_prometheus_type(entry.prometheus_type),
+        id: Some(to_wire_id(id)),
+        path,
+        directory_type: wire_directory_type(directory_type),
+        prometheus_type: wire_prometheus_type(prometheus_type),
         value: Some(wire::Value { value: Some(value) }),
     }
 }
@@ -451,6 +483,7 @@ mod tests {
     use std::error::Error as _;
 
     use super::*;
+    use hammer_runtime::{DataPlaneRuntime, DataPlaneRuntimeConfig, RuntimeRegistry};
     use hammer_stats::{DirectoryType, DumpValue};
 
     /// A small but valid capacity for capability tests: well above the
@@ -462,6 +495,29 @@ mod tests {
             segment_capacity: TEST_CAPACITY,
             ..StatsConfig::default()
         }
+    }
+
+    fn test_engine() -> Engine {
+        Engine::new(
+            DataPlaneRuntime::new(DataPlaneRuntimeConfig::default()),
+            RuntimeRegistry::new(),
+        )
+    }
+
+    fn install_for_test() -> (Engine, Arc<StatsCapability>) {
+        let mut engine = test_engine();
+        let capability =
+            StatsCapability::install(&mut engine, &test_config()).expect("install capability");
+        (engine, capability)
+    }
+
+    fn with_stats<R>(
+        engine: &mut Engine,
+        operation: impl FnOnce(&mut StatsMain) -> Result<R, StatsError>,
+    ) -> Result<R, StatsError> {
+        engine
+            .with_stats_main(operation)
+            .expect("stats main must be installed")
     }
 
     /// Parses a document like the one the `config_function` macro produces
@@ -533,7 +589,8 @@ mod tests {
             segment_capacity: 0,
             ..test_config()
         };
-        let error = match StatsCapability::install(&config) {
+        let mut engine = test_engine();
+        let error = match StatsCapability::install(&mut engine, &config) {
             Err(error) => error,
             Ok(_) => panic!("zero capacity must be rejected"),
         };
@@ -567,11 +624,8 @@ mod tests {
     /// stats.c:281).
     #[test]
     fn system_metrics_are_published_before_the_node_starts() {
-        let capability = StatsCapability::install(&test_config()).expect("install capability");
-        let entries = capability
-            .with_stats(|stats| stats.list(&[]))
-            .expect("access stats")
-            .expect("list");
+        let (mut engine, _capability) = install_for_test();
+        let entries = with_stats(&mut engine, |stats| stats.list(&[])).expect("list");
         assert_eq!(entries.len(), 3);
         assert_eq!(entries[0].path, SYS_HEARTBEAT_PATH);
         assert_eq!(entries[0].fq_name, "hammer_sys_heartbeat_total");
@@ -587,10 +641,7 @@ mod tests {
         assert_eq!(entries[2].prometheus_type, PrometheusType::Gauge);
 
         let ids: Vec<EntryId> = entries.iter().map(|entry| entry.id).collect();
-        let dump = capability
-            .with_stats(|stats| stats.dump(&ids))
-            .expect("access stats")
-            .expect("dump");
+        let dump = with_stats(&mut engine, |stats| stats.dump(&ids)).expect("dump");
         assert_eq!(dump[0].value, DumpValue::Counter(0));
         assert_eq!(dump[1].value, DumpValue::Gauge(0.0));
         assert_eq!(dump[2].value, DumpValue::Gauge(0.0));
@@ -601,26 +652,18 @@ mod tests {
     /// while last-stats-clear stays 0 (VPP collector.c:149-150, 172).
     #[test]
     fn boottime_set_and_one_collect_publishes_system_values() {
-        let capability = StatsCapability::install(&test_config()).expect("install capability");
+        let (mut engine, capability) = install_for_test();
         capability
             .set_boottime(1_700_000_000)
             .expect("set boottime");
-        capability
-            .with_stats_mut(|stats| stats.collect())
-            .expect("access stats")
-            .expect("collect");
+        with_stats(&mut engine, |stats| stats.collect()).expect("collect");
 
-        let ids: Vec<EntryId> = capability
-            .with_stats(|stats| stats.list(&[]))
-            .expect("access stats")
+        let ids: Vec<EntryId> = with_stats(&mut engine, |stats| stats.list(&[]))
             .expect("list")
             .into_iter()
             .map(|entry| entry.id)
             .collect();
-        let dump = capability
-            .with_stats(|stats| stats.dump(&ids))
-            .expect("access stats")
-            .expect("dump");
+        let dump = with_stats(&mut engine, |stats| stats.dump(&ids)).expect("dump");
         assert_eq!(dump[0].value, DumpValue::Counter(1));
         assert!(
             matches!(dump[1].value, DumpValue::Gauge(value) if value > 0.0),
@@ -631,44 +674,34 @@ mod tests {
     }
 
     /// A failing collector must not stop the system heartbeat collector or
-    /// the capability's access gate (VPP runs every collector even when one
+    /// the main Engine's stats owner (VPP runs every collector even when one
     /// fails; collector.c:137-147).
     #[test]
     fn failing_collector_still_runs_the_system_collector() {
-        let capability = StatsCapability::install(&test_config()).expect("install capability");
-        capability
-            .with_stats_mut(|stats| {
-                stats.register_collector(|| Err(StatsError::InvalidPath("boom".to_owned())));
-                Ok(())
-            })
-            .expect("access stats")
-            .expect("register");
+        let (mut engine, _capability) = install_for_test();
+        with_stats(&mut engine, |stats| {
+            stats.register_collector(|| Err(StatsError::InvalidPath("boom".to_owned())));
+            Ok(())
+        })
+        .expect("register");
 
         // The first error in registration order surfaces from the pass.
-        let pass = capability
-            .with_stats_mut(|stats| stats.collect())
-            .expect("access stats");
+        let pass = with_stats(&mut engine, |stats| stats.collect());
         assert!(
             matches!(pass, Err(StatsError::InvalidPath(_))),
             "unexpected pass result: {pass:?}"
         );
 
         // The heartbeat collector still ran before the failing one.
-        let heartbeat = capability
-            .with_stats(|stats| stats.list(&[SYS_HEARTBEAT_PATH.to_owned()]))
-            .expect("access stats")
-            .expect("list");
-        let dump = capability
-            .with_stats(|stats| stats.dump(&[heartbeat[0].id]))
-            .expect("access stats")
-            .expect("dump");
+        let heartbeat = with_stats(&mut engine, |stats| {
+            stats.list(&[SYS_HEARTBEAT_PATH.to_owned()])
+        })
+        .expect("list");
+        let dump = with_stats(&mut engine, |stats| stats.dump(&[heartbeat[0].id])).expect("dump");
         assert_eq!(dump[0].value, DumpValue::Counter(1));
 
-        // The gate still serves the next operation.
-        capability
-            .with_stats(|stats| stats.list(&[]))
-            .expect("access stats")
-            .expect("list");
+        // The owner still serves the next operation.
+        with_stats(&mut engine, |stats| stats.list(&[])).expect("list");
     }
 
     #[test]
@@ -777,16 +810,174 @@ mod tests {
     }
 
     #[test]
+    fn wire_dump_converts_owned_values_and_preserves_symlink_identity() {
+        use hammer_stats::{DumpEntry, RingBufferSnapshot};
+
+        let entries = vec![
+            DumpEntry {
+                id: EntryId::try_from((0, 1)).expect("id"),
+                path: "/counter".to_owned(),
+                directory_type: DirectoryType::ScalarIndex,
+                prometheus_type: PrometheusType::Counter,
+                value: DumpValue::Counter(7),
+            },
+            DumpEntry {
+                id: EntryId::try_from((1, 2)).expect("id"),
+                path: "/gauge".to_owned(),
+                directory_type: DirectoryType::Gauge,
+                prometheus_type: PrometheusType::Gauge,
+                value: DumpValue::Gauge(1.5),
+            },
+            DumpEntry {
+                id: EntryId::try_from((2, 3)).expect("id"),
+                path: "/simple".to_owned(),
+                directory_type: DirectoryType::CounterVectorSimple,
+                prometheus_type: PrometheusType::Counter,
+                value: DumpValue::CounterVectorSimple(vec![vec![1, 2], vec![3]]),
+            },
+            DumpEntry {
+                id: EntryId::try_from((3, 4)).expect("id"),
+                path: "/combined".to_owned(),
+                directory_type: DirectoryType::CounterVectorCombined,
+                prometheus_type: PrometheusType::Counter,
+                value: DumpValue::CounterVectorCombined(vec![vec![(1, 2)], vec![(3, 4)]]),
+            },
+            DumpEntry {
+                id: EntryId::try_from((4, 5)).expect("id"),
+                path: "/names".to_owned(),
+                directory_type: DirectoryType::NameVector,
+                prometheus_type: PrometheusType::Gauge,
+                value: DumpValue::NameVector(vec![Some("eth0".to_owned()), None]),
+            },
+            DumpEntry {
+                id: EntryId::try_from((5, 6)).expect("id"),
+                path: "/histogram".to_owned(),
+                directory_type: DirectoryType::HistogramLog2,
+                prometheus_type: PrometheusType::Counter,
+                value: DumpValue::HistogramLog2(vec![vec![2, 4], vec![8]]),
+            },
+            DumpEntry {
+                id: EntryId::try_from((6, 7)).expect("id"),
+                path: "/ring".to_owned(),
+                directory_type: DirectoryType::RingBuffer,
+                prometheus_type: PrometheusType::Counter,
+                value: DumpValue::RingBuffer(vec![RingBufferSnapshot {
+                    sequence: 9,
+                    entries: vec![b"old".to_vec(), b"new".to_vec()],
+                }]),
+            },
+            DumpEntry {
+                id: EntryId::try_from((7, 8)).expect("id"),
+                path: "/symlink".to_owned(),
+                directory_type: DirectoryType::Symlink,
+                prometheus_type: PrometheusType::Counter,
+                value: DumpValue::CounterVectorSimple(vec![vec![11]]),
+            },
+        ];
+
+        let wire_dumps: Vec<wire::DumpEntry> =
+            entries.into_iter().map(to_wire_dump_entry).collect();
+
+        assert_eq!(
+            wire_dumps[0].value.as_ref().unwrap().value,
+            Some(wire::value::Value::Counter(7))
+        );
+        assert_eq!(
+            wire_dumps[1].value.as_ref().unwrap().value,
+            Some(wire::value::Value::Gauge(1.5))
+        );
+        assert_eq!(
+            wire_dumps[2].value.as_ref().unwrap().value,
+            Some(wire::value::Value::CounterVectorSimple(
+                wire::CounterVectorSimple {
+                    rows: vec![
+                        wire::CounterVectorSimpleRow { values: vec![1, 2] },
+                        wire::CounterVectorSimpleRow { values: vec![3] },
+                    ],
+                }
+            ))
+        );
+        assert_eq!(
+            wire_dumps[3].value.as_ref().unwrap().value,
+            Some(wire::value::Value::CounterVectorCombined(
+                wire::CounterVectorCombined {
+                    rows: vec![
+                        wire::CounterVectorCombinedRow {
+                            values: vec![wire::CounterVectorCombinedValue {
+                                packets: 1,
+                                bytes: 2,
+                            }],
+                        },
+                        wire::CounterVectorCombinedRow {
+                            values: vec![wire::CounterVectorCombinedValue {
+                                packets: 3,
+                                bytes: 4,
+                            }],
+                        },
+                    ],
+                }
+            ))
+        );
+        assert_eq!(
+            wire_dumps[4].value.as_ref().unwrap().value,
+            Some(wire::value::Value::NameVector(wire::NameVector {
+                slots: vec![
+                    wire::NameVectorSlot {
+                        name: Some("eth0".to_owned()),
+                    },
+                    wire::NameVectorSlot { name: None },
+                ],
+            }))
+        );
+        assert_eq!(
+            wire_dumps[5].value.as_ref().unwrap().value,
+            Some(wire::value::Value::HistogramLog2(wire::HistogramLog2 {
+                rows: vec![
+                    wire::HistogramLog2Row { bins: vec![2, 4] },
+                    wire::HistogramLog2Row { bins: vec![8] },
+                ],
+            }))
+        );
+        assert_eq!(
+            wire_dumps[6].value.as_ref().unwrap().value,
+            Some(wire::value::Value::RingBuffer(wire::RingBuffer {
+                snapshots: vec![wire::RingBufferSnapshot {
+                    sequence: 9,
+                    entries: vec![b"old".to_vec(), b"new".to_vec()],
+                }],
+            }))
+        );
+        assert_eq!(
+            wire_dumps[7].id,
+            Some(wire::EntryId {
+                index: 7,
+                generation: 8,
+            })
+        );
+        assert_eq!(wire_dumps[7].path, "/symlink");
+        assert_eq!(
+            wire_dumps[7].directory_type,
+            wire::DirectoryType::Symlink as i32
+        );
+        assert_eq!(
+            wire_dumps[7].value.as_ref().unwrap().value,
+            Some(wire::value::Value::CounterVectorSimple(
+                wire::CounterVectorSimple {
+                    rows: vec![wire::CounterVectorSimpleRow { values: vec![11] }],
+                }
+            ))
+        );
+    }
+
+    #[test]
     fn wire_error_mapping_is_exact() {
         use wire::error_oneof::Error as WireError;
 
-        let capability = StatsCapability::install(&test_config()).expect("install capability");
+        let (mut engine, _capability) = install_for_test();
         let id = EntryId::try_from((4, 9)).expect("id");
 
         // InvalidPattern carries exactly the pattern, never the regex source.
-        let pattern_error = capability
-            .with_stats(|stats| stats.list(&["(".to_owned()]))
-            .expect("access stats")
+        let pattern_error = with_stats(&mut engine, |stats| stats.list(&["(".to_owned()]))
             .expect_err("invalid pattern");
         match wire_error(pattern_error) {
             WireError::InvalidPattern(inner) => assert_eq!(inner.pattern, "("),

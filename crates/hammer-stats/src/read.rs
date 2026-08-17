@@ -54,10 +54,29 @@ pub struct DumpEntry {
 /// A dumped value, mirroring VPP's scalar `copy_data` result for
 /// `STAT_DIR_TYPE_SCALAR_INDEX` and `STAT_DIR_TYPE_GAUGE`
 /// (stat_client.c:230-235).
-#[derive(Clone, Copy, PartialEq, Debug)]
+#[derive(Clone, PartialEq, Debug)]
 pub enum DumpValue {
     /// Integer value.
     Counter(u64),
     /// Floating-point value.
     Gauge(f64),
+    /// Row-major simple counter-vector values.
+    CounterVectorSimple(Vec<Vec<u64>>),
+    /// Row-major packet/byte counter-vector values.
+    CounterVectorCombined(Vec<Vec<(u64, u64)>>),
+    /// Fixed-slot names, with `None` for an unset slot.
+    NameVector(Vec<Option<String>>),
+    /// Row-major histogram bins.
+    HistogramLog2(Vec<Vec<u64>>),
+    /// One owned physical-ring snapshot per row.
+    RingBuffer(Vec<RingBufferSnapshot>),
+}
+
+/// One owned row snapshot from a fixed ring buffer.
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub struct RingBufferSnapshot {
+    /// Release-published producer sequence observed for this row.
+    pub sequence: u64,
+    /// Physical slots in ring order, oldest-to-newest by slot index.
+    pub entries: Vec<Vec<u8>>,
 }

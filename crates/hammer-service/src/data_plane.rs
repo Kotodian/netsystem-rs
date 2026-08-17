@@ -1,7 +1,7 @@
 use hammer_core::data_plane::{Buffer, BufferFrame, Index, NodeId, NodeRegistration};
 use hammer_runtime::RuntimeResult;
 use hammer_runtime::{
-    DataPlaneRuntime, InternalNode, Node, NodeProcessFn, NodeResult, add_packet_trace,
+    add_packet_trace, DataPlaneRuntime, InternalNode, Node, NodeErrorCode, NodeProcessFn, NodeResult,
 };
 
 pub use crate::feature_arc::{
@@ -9,32 +9,36 @@ pub use crate::feature_arc::{
     FeatureArcStartNode, FeatureArcStartSlot, next_feature_frame, next_feature_slot_for_index,
 };
 
+/// Record a generated node-local error and store its preinstalled global
+/// index in a packet buffer.
 #[inline(always)]
-pub fn set_buffer_node_error_code(
+pub fn set_buffer_node_error<E>(
     runtime: &DataPlaneRuntime,
     buffer: &mut Buffer,
-    code: u16,
-) -> RuntimeResult<()> {
-    let error = runtime.record_current_node_error(code)?;
-    buffer.set_node_error(hammer_core::data_plane::BufferNodeError::new(
-        NodeId::new(0),
-        error,
-    ));
+    error: E,
+) -> RuntimeResult<()>
+where
+    E: NodeErrorCode,
+{
+    let error = runtime.record_current_node_error(error)?;
+    buffer.set_node_error_index(error);
     Ok(())
 }
 
+/// Record a generated node-local error and store its preinstalled global
+/// index in the packet buffer identified by `index`.
 #[inline(always)]
-pub fn set_index_node_error_code(
+pub fn set_index_node_error<E>(
     runtime: &DataPlaneRuntime,
     index: Index,
-    code: u16,
-) -> RuntimeResult<()> {
-    let error = runtime.record_current_node_error(code)?;
+    error: E,
+) -> RuntimeResult<()>
+where
+    E: NodeErrorCode,
+{
+    let error = runtime.record_current_node_error(error)?;
     let mut buffer = runtime.get_buffer_mut(index)?;
-    buffer.set_node_error(hammer_core::data_plane::BufferNodeError::new(
-        NodeId::new(0),
-        error,
-    ));
+    buffer.set_node_error_index(error);
     Ok(())
 }
 

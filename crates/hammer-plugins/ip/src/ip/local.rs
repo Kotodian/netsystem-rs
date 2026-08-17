@@ -15,7 +15,7 @@ use hammer_runtime::{
 use hammer_runtime::{RuntimeError, RuntimeResult};
 
 use crate::forwarding::{DpoType, FibLookupResult, FibTableHandle};
-use hammer_service::data_plane::{FeatureArcStartHandle, set_index_node_error_code};
+use hammer_service::data_plane::{FeatureArcStartHandle, set_index_node_error};
 use hammer_service::opaque::NetworkOpaque;
 
 use super::{IpInputError, IpInputTarget, IpProtocol, IpVersion, ParsedIpPacket, ip_header};
@@ -46,12 +46,20 @@ pub enum IpLocalNext {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u16)]
 pub enum IpLocalError {
     BadLength,
     BadTransportHeader,
     BadChecksum,
     SourceCheckFailed,
     UnknownProtocol,
+}
+
+impl hammer_runtime::node::NodeErrorCode for IpLocalError {
+    #[inline(always)]
+    fn local_code(self) -> u16 {
+        self as u16
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
@@ -492,7 +500,7 @@ fn process_index(
         Ok(parsed) => parsed,
         Err(_) => {
             drop(buffer);
-            set_index_node_error_code(runtime, index, IpLocalError::BadLength.code())?;
+            set_index_node_error(runtime, index, IpLocalError::BadLength)?;
             let resolved = state.drop_slot();
             let _ = add_packet_trace!(
                 runtime,
@@ -511,9 +519,9 @@ fn process_index(
     };
     match parsed.input_target {
         IpInputTarget::Drop | IpInputTarget::IcmpError | IpInputTarget::Options => {
-            let error = error_for_input(parsed.input_error).code();
+            let error = error_for_input(parsed.input_error);
             drop(buffer);
-            set_index_node_error_code(runtime, index, error)?;
+            set_index_node_error(runtime, index, error)?;
             let resolved = state.drop_slot();
             let _ = add_packet_trace!(
                 runtime,
@@ -523,7 +531,7 @@ fn process_index(
                     version: Some(parsed.version),
                     protocol: Some(parsed.protocol),
                     transport_header_len: parsed.transport_header_len,
-                    error: Some(error),
+                    error: Some(error.code()),
                     next: resolved,
                 },
             );
@@ -558,7 +566,7 @@ fn process_index(
         Some(transport) => transport,
         None => {
             drop(buffer);
-            set_index_node_error_code(runtime, index, IpLocalError::BadLength.code())?;
+            set_index_node_error(runtime, index, IpLocalError::BadLength)?;
             let resolved = state.drop_slot();
             let _ = add_packet_trace!(
                 runtime,
@@ -580,7 +588,7 @@ fn process_index(
         Ok(transport_len) => transport_len,
         Err(error) => {
             drop(buffer);
-            set_index_node_error_code(runtime, index, error.code())?;
+            set_index_node_error(runtime, index, error)?;
             let resolved = state.drop_slot();
             let _ = add_packet_trace!(
                 runtime,
@@ -602,7 +610,7 @@ fn process_index(
 
     if stage.is_head_of_feature_arc() {
         if !source_check_passes(state, &parsed) {
-            set_index_node_error_code(runtime, index, IpLocalError::SourceCheckFailed.code())?;
+            set_index_node_error(runtime, index, IpLocalError::SourceCheckFailed)?;
             let resolved = state.drop_slot();
             let _ = add_packet_trace!(
                 runtime,
@@ -649,7 +657,7 @@ fn process_index(
     let resolved = state.protocol_next_slot(parsed.protocol);
     let error = if resolved == state.punt_slot() && matches!(parsed.protocol, IpProtocol::Other(_))
     {
-        set_index_node_error_code(runtime, index, IpLocalError::UnknownProtocol.code())?;
+        set_index_node_error(runtime, index, IpLocalError::UnknownProtocol)?;
         Some(IpLocalError::UnknownProtocol.code())
     } else {
         None

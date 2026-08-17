@@ -4,9 +4,12 @@ use core::slice;
 use core::sync::atomic::{AtomicU64, Ordering};
 use std::cell::RefCell;
 use std::fmt;
+use std::num::NonZeroU16;
 use std::ops::{Deref, DerefMut};
+
 use std::rc::Rc;
 use std::sync::Arc;
+use thiserror::Error;
 
 use crate::data_plane::NodeId;
 use crate::error::{BufferInvariant, DataPlaneError, DataPlaneResult};
@@ -189,12 +192,14 @@ struct BufferHeaderCacheline0 {
     pub flow_id: u32,
     pub ref_count: u8,
     pub buffer_pool_index: u8,
-    pub error: u16,
+    pub error: Option<NodeErrorIndex>,
     pub next_buffer: u32,
     pub current_config_or_punt: u32,
     pub opaque: PrimaryOpaque,
 }
 
+const _: () =
+    assert!(core::mem::size_of::<Option<NodeErrorIndex>>() == core::mem::size_of::<u16>());
 const _: () = assert!(core::mem::size_of::<BufferHeaderCacheline0>() == 64);
 const _: () = assert!(core::mem::align_of::<BufferHeaderCacheline0>() == 64);
 
@@ -207,7 +212,7 @@ impl Default for BufferHeaderCacheline0 {
             flow_id: 0,
             ref_count: 0,
             buffer_pool_index: 0,
-            error: 0,
+            error: None,
             next_buffer: BUFFER_INVALID_INDEX,
             current_config_or_punt: 0,
             opaque: PrimaryOpaque::default(),
@@ -340,26 +345,57 @@ impl BufferPacketCursor {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct BufferNodeError {
-    node: NodeId,
-    code: u16,
+/// Mirrors VPP's `vlib_error_t`: a global node error index where zero means no error.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[repr(transparent)]
+pub struct NodeErrorIndex(NonZeroU16);
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Error)]
+#[error("node error index must be non-zero")]
+pub struct NodeErrorIndexError;
+
+impl NodeErrorIndex {
+    #[inline]
+    pub const fn new(encoded: u16) -> Option<Self> {
+        match NonZeroU16::new(encoded) {
+            Some(encoded) => Some(Self(encoded)),
+            None => None,
+        }
+    }
+
+    #[inline(always)]
+    pub const fn get(self) -> u16 {
+        self.0.get()
+    }
 }
 
-impl BufferNodeError {
-    #[inline(always)]
-    pub const fn new(node: NodeId, code: u16) -> Self {
-        Self { node, code }
-    }
+impl TryFrom<u16> for NodeErrorIndex {
+    type Error = NodeErrorIndexError;
 
-    #[inline(always)]
-    pub const fn node(self) -> NodeId {
-        self.node
+    #[inline]
+    fn try_from(encoded: u16) -> Result<Self, Self::Error> {
+        Self::new(encoded).ok_or(NodeErrorIndexError)
     }
+}
 
+impl From<NonZeroU16> for NodeErrorIndex {
     #[inline(always)]
-    pub const fn code(self) -> u16 {
-        self.code
+    fn from(encoded: NonZeroU16) -> Self {
+        Self(encoded)
+    }
+}
+
+impl From<NodeErrorIndex> for NonZeroU16 {
+    #[inline(always)]
+    fn from(index: NodeErrorIndex) -> Self {
+        index.0
+    }
+}
+
+impl From<NodeErrorIndex> for u16 {
+    #[inline(always)]
+    fn from(index: NodeErrorIndex) -> Self {
+        index.get()
     }
 }
 
@@ -482,8 +518,8 @@ impl Buffer {
     }
 
     #[inline]
-    pub fn node_error_code(&self) -> Option<u16> {
-        (self.cacheline0.error != 0).then_some(self.cacheline0.error)
+    pub fn node_error_index(&self) -> Option<NodeErrorIndex> {
+        self.cacheline0.error
     }
 
     #[inline]
@@ -514,13 +550,13 @@ impl Buffer {
     }
 
     #[inline]
-    pub fn set_node_error(&mut self, error: BufferNodeError) {
-        self.cacheline0.error = error.code();
+    pub fn set_node_error_index(&mut self, error: NodeErrorIndex) {
+        self.cacheline0.error = Some(error);
     }
 
     #[inline]
     pub fn clear_node_error(&mut self) {
-        self.cacheline0.error = 0;
+        self.cacheline0.error = None;
     }
 
     #[inline]
@@ -1382,8 +1418,8 @@ impl DataPlaneBuffers {
     }
 
     #[inline]
-    pub fn node_error_code(&self, index: Index) -> DataPlaneResult<Option<u16>> {
-        self.try_buffers()?.node_error_code(index)
+    pub fn node_error_index(&self, index: Index) -> DataPlaneResult<Option<NodeErrorIndex>> {
+        self.try_buffers()?.node_error_index(index)
     }
 
     #[inline]
@@ -1684,8 +1720,8 @@ impl BufferPool {
     }
 
     #[inline]
-    fn node_error_code(&self, index: Index) -> DataPlaneResult<Option<u16>> {
-        Ok(self.arena.inner.read().buffer(index)?.node_error_code())
+    fn node_error_index(&self, index: Index) -> DataPlaneResult<Option<NodeErrorIndex>> {
+        Ok(self.arena.inner.read().buffer(index)?.node_error_index())
     }
 
     #[inline]

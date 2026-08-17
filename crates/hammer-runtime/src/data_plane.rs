@@ -4,9 +4,9 @@ use std::rc::Rc;
 
 use crate::error::{RuntimeError, RuntimeResult};
 use hammer_core::data_plane::{
-    BUFFER_CACHE_LINE_SIZE, BufferFrame, BufferNodeError, BufferPoolArena, BufferRef, BufferRefMut,
+    BUFFER_CACHE_LINE_SIZE, BufferFrame, BufferPoolArena, BufferRef, BufferRefMut,
     DEFAULT_BUFFER_FRAME_POOL_SIZE, DataPlaneBuffers, Frame, FrameBatchWidth, Index, Next,
-    NodeHandle, NodeId, NodeKind, NodeNext, NodeRegistration, Pending,
+    NodeErrorIndex, NodeHandle, NodeId, NodeKind, NodeNext, NodeRegistration, Pending,
 };
 use hammer_core::error::{DataPlaneError, DataPlaneResult};
 use hammer_infra::PageSize;
@@ -14,7 +14,9 @@ use hammer_infra::PageSize;
 use crate::config::Worker;
 use crate::file::FileMain;
 use crate::handoff::{DataPlaneHandoffWorker, DataWorkerId, HANDOFF_SLOT_CAPACITY, HandoffSlot};
-use crate::node::{NodeEntry, NodeFunctionRegistration, NodeRuntime, NodeRuntimeInner};
+use crate::node::{
+    NodeEntry, NodeErrorCode, NodeFunctionRegistration, NodeRuntime, NodeRuntimeInner,
+};
 use crate::runtime_simd::{native_simd_bytes, preferred_frame_batch_width};
 use crate::trace::{DataPlaneTrace, PacketTrace, TraceControlHandle};
 
@@ -443,12 +445,18 @@ impl DataPlaneRuntime {
         let siblings = entries
             .iter()
             .filter(|entry| matches!(entry.registration, NodeRegistration::Sibling { .. }));
+        let mut nodes = Vec::with_capacity(entries.len());
         for entry in owners.chain(siblings) {
             let node =
                 (entry.init)(self).map_err(|source| RuntimeError::GraphNodeInitialization {
                     node: entry.registration.name().unwrap_or("?"),
                     source: Box::new(source),
                 })?;
+            nodes.push((node, entry.error_counters));
+        }
+        self.nodes.validate_node_error_batch(&nodes)?;
+        for (node, error_counters) in nodes {
+            self.nodes.materialize_node_errors(node, error_counters)?;
             self.nodes
                 .install_node_function(node, self.simd_bytes, node_functions)?;
         }
@@ -460,6 +468,7 @@ impl DataPlaneRuntime {
         entries: &[NodeEntry],
         node_functions: &[NodeFunctionRegistration],
     ) -> RuntimeResult<()> {
+        let mut nodes = Vec::with_capacity(entries.len());
         for register_siblings in [false, true] {
             for entry in entries {
                 let is_sibling = matches!(entry.registration, NodeRegistration::Sibling { .. });
@@ -474,9 +483,14 @@ impl DataPlaneRuntime {
                     continue;
                 }
                 let node = (entry.init)(self)?;
-                self.nodes
-                    .install_node_function(node, self.simd_bytes, node_functions)?;
+                nodes.push((node, entry.error_counters));
             }
+        }
+        self.nodes.validate_node_error_batch(&nodes)?;
+        for (node, error_counters) in nodes {
+            self.nodes.materialize_node_errors(node, error_counters)?;
+            self.nodes
+                .install_node_function(node, self.simd_bytes, node_functions)?;
         }
         self.nodes.resolve_named_next_nodes()?;
         Ok(())
@@ -584,26 +598,17 @@ impl DataPlaneRuntime {
         ))
     }
 
+    /// Record the current node's generated local error and return its global index.
     #[inline]
-    pub fn record_current_node_error(&self, code: u16) -> RuntimeResult<u16> {
+    pub fn record_current_node_error<E: NodeErrorCode>(
+        &self,
+        error: E,
+    ) -> RuntimeResult<NodeErrorIndex> {
         let node = self
             .current_node()
             .ok_or(RuntimeError::NodeDispatchContextMissing)?;
-        self.nodes.increment_node_error(node, code)
-    }
-
-    #[inline]
-    pub fn node_error_count(&self, node: NodeId, code: u16) -> RuntimeResult<u64> {
-        self.nodes.node_error_count(node, code)
-    }
-
-    #[inline]
-    pub fn node_error(&self, index: Index) -> RuntimeResult<Option<BufferNodeError>> {
-        let code = self.buffers.node_error_code(index)?;
-        match code {
-            Some(code) => self.nodes.decode_node_error(code),
-            None => Ok(None),
-        }
+        self.nodes
+            .record_node_error(self.thread_index(), node, error.local_code())
     }
 
     #[inline]

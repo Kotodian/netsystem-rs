@@ -7,6 +7,8 @@
 //! immediately by the infallible publication tail; no raw pointer is stored
 //! or reused across structural operations.
 
+use std::sync::atomic::AtomicU64;
+
 use hammer_infra::segment::Segment;
 
 use crate::descriptor::{
@@ -243,6 +245,79 @@ impl Mapping {
                 .add(value_offset.get() as usize)
                 .cast::<MetricValue>()
         })
+    }
+
+    /// Bounds- and alignment-checked access to one atomic vector cell.
+    /// Returns a checked byte-copy destination for a mapped payload span.
+    ///
+    /// The pointer is ephemeral: it is consumed immediately by the caller's
+    /// publication/write operation and is never stored across structural work.
+    pub(crate) fn byte_write_target(
+        &self,
+        offset: Offset,
+        length: usize,
+    ) -> Result<*mut u8, StatsError> {
+        if offset.is_null() {
+            return Err(StatsError::OutOfBounds);
+        }
+        let end = offset
+            .checked_add(u64::try_from(length).map_err(|_| StatsError::OutOfBounds)?)
+            .ok_or(StatsError::OutOfBounds)?;
+        if end.get() > self.size as u64 {
+            return Err(StatsError::OutOfBounds);
+        }
+        // SAFETY: the complete byte span was checked against the mapping.
+        Ok(unsafe { self.base.add(offset.get() as usize) })
+    }
+
+    /// Reads an exact byte span from the mapping into owned storage.
+    pub(crate) fn read_bytes(&self, offset: Offset, length: usize) -> Result<Vec<u8>, StatsError> {
+        if offset.is_null() {
+            return Err(StatsError::OutOfBounds);
+        }
+        let end = offset
+            .checked_add(u64::try_from(length).map_err(|_| StatsError::OutOfBounds)?)
+            .ok_or(StatsError::OutOfBounds)?;
+        if end.get() > self.size as u64 {
+            return Err(StatsError::OutOfBounds);
+        }
+        let mut bytes = vec![0u8; length];
+        // SAFETY: both spans are valid for `length` bytes; the destination is
+        // owned and the source is a raw mapped byte region.
+        unsafe {
+            std::ptr::copy_nonoverlapping(
+                self.base.add(offset.get() as usize),
+                bytes.as_mut_ptr(),
+                length,
+            );
+        }
+        Ok(bytes)
+    }
+
+    /// Writes bytes through a destination prepared by [`byte_write_target`].
+    ///
+    /// # Safety
+    ///
+    /// `target` must be returned by `byte_write_target` for a span at least as
+    /// large as `bytes`, and must be consumed while the mapping is alive.
+    pub(crate) unsafe fn write_bytes(target: *mut u8, bytes: &[u8]) {
+        // SAFETY: guaranteed by the caller's `byte_write_target` check.
+        unsafe { std::ptr::copy_nonoverlapping(bytes.as_ptr(), target, bytes.len()) };
+    }
+
+    pub(crate) fn atomic_u64(&self, offset: Offset) -> Result<&AtomicU64, StatsError> {
+        if offset.is_null() || offset.get() % std::mem::align_of::<AtomicU64>() as u64 != 0 {
+            return Err(StatsError::Misaligned);
+        }
+        let end = offset
+            .checked_add(std::mem::size_of::<AtomicU64>() as u64)
+            .ok_or(StatsError::OutOfBounds)?;
+        if end.get() > self.size as u64 {
+            return Err(StatsError::OutOfBounds);
+        }
+        // SAFETY: the offset and one-cell span were checked against the
+        // mapping; vector cells are initialized as AtomicU64 records.
+        Ok(unsafe { &*self.base.add(offset.get() as usize).cast::<AtomicU64>() })
     }
 }
 

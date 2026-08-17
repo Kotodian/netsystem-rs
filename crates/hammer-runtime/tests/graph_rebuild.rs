@@ -79,6 +79,7 @@ fn entry(name: &'static str) -> NodeEntry {
         registration: NodeRegistration::next(name, 0),
         kind: NodeKind::Internal,
         init: init_named(name),
+        error_counters: &[],
     }
 }
 
