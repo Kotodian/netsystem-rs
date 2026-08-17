@@ -492,11 +492,12 @@ impl StatsMain {
                 if free_head >= old_directory_capacity {
                     return Err(StatsError::InvalidState(0xFF));
                 }
-                let free_entry = mapping.entry(old_directory_offset, free_head as u32)?;
+                let free_index = u32::try_from(free_head).map_err(|_| StatsError::OutOfBounds)?;
+                let free_entry = mapping.entry(old_directory_offset, free_index)?;
                 if free_entry.state()? != EntryState::Free {
                     return Err(StatsError::InvalidState(free_entry.state_byte()));
                 }
-                slots.push((free_head as u32, free_entry.generation()));
+                slots.push((free_index, free_entry.generation()));
                 free_head = free_entry.link();
                 continue;
             }
@@ -594,17 +595,42 @@ impl StatsMain {
         for metric in &staged {
             targets.push(mapping.entry_write_target(directory_offset, metric.id.index())?);
         }
+        let old_directory_allocation = if directory_grew {
+            let old_layout = Layout::from_size_align(old_directory_bytes, 64)
+                .map_err(|_| StatsError::InvalidLayout)?;
+            Some(unsafe {
+                SegmentAllocation::from_raw_offset(
+                    self.segment.clone(),
+                    old_directory_offset.get(),
+                    old_layout,
+                )?
+            })
+        } else {
+            None
+        };
         let mut entries = Vec::with_capacity(staged.len());
+
+        if directory_grew {
+            // The replacement directory is unreachable until the header switch;
+            // populate its new slots before readers can observe its offset.
+            for (target, metric) in targets.iter().zip(&staged) {
+                // SAFETY: every target was bounds-checked for this slot above
+                // and the replacement directory is not yet published.
+                unsafe { mapping.write_entry(*target, metric.entry) };
+            }
+        }
 
         header.mark_in_progress();
         if directory_grew {
             header.store_directory_offset(directory_offset);
             header.store_directory_capacity(planned_capacity);
         }
-        for (target, metric) in targets.iter().zip(&staged) {
-            // SAFETY: every target was bounds-checked for this slot above and
-            // is consumed before the publication marker is cleared.
-            unsafe { mapping.write_entry(*target, metric.entry) };
+        if !directory_grew {
+            for (target, metric) in targets.iter().zip(&staged) {
+                // SAFETY: every target was bounds-checked for this slot above
+                // and is consumed before the publication marker is cleared.
+                unsafe { mapping.write_entry(*target, metric.entry) };
+            }
         }
         header.store_free_list_head(free_head);
         header.store_initialized_len(planned_initialized);
@@ -613,8 +639,7 @@ impl StatsMain {
 
         if let Some(allocation) = directory_allocation {
             let _ = allocation.into_raw_offset();
-            self.segment
-                .free(old_directory_offset.get(), old_directory_bytes);
+            drop(old_directory_allocation);
         }
 
         let segment = self.segment.clone();
