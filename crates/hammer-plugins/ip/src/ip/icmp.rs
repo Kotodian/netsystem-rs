@@ -17,7 +17,7 @@ use hammer_runtime::{
     add_packet_trace, format_packet_trace,
 };
 
-use hammer_service::data_plane::set_index_node_error_code;
+use hammer_service::data_plane::set_index_node_error;
 use hammer_service::opaque::NetworkOpaque;
 
 use super::{IpInputError, IpProtocol, IpVersion, ip_header};
@@ -39,6 +39,7 @@ struct IcmpErrorOpaque {
 const _: () = assert!(size_of::<IcmpErrorOpaque>() == size_of::<SecondaryOpaque>());
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u16)]
 pub enum IcmpInputError {
     BadLength,
     WrongProtocol,
@@ -46,6 +47,13 @@ pub enum IcmpInputError {
     BadCode,
     TooShort,
     HopLimit,
+}
+
+impl hammer_runtime::node::NodeErrorCode for IcmpInputError {
+    #[inline(always)]
+    fn local_code(self) -> u16 {
+        self as u16
+    }
 }
 
 impl IcmpInputError {
@@ -56,6 +64,7 @@ impl IcmpInputError {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u16)]
 pub enum IcmpNodeError {
     BadLength,
     WrongProtocol,
@@ -67,6 +76,13 @@ pub enum IcmpNodeError {
     MissingIngressInterface,
     MissingSource,
     UnsupportedFamily,
+}
+
+impl hammer_runtime::node::NodeErrorCode for IcmpNodeError {
+    #[inline(always)]
+    fn local_code(self) -> u16 {
+        self as u16
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
@@ -892,8 +908,8 @@ fn next_slot_for_index(
         Ok(parsed) => parsed,
         Err(_) => {
             drop(buffer);
-            let error = IcmpInputError::BadLength.code();
-            set_index_node_error_code(runtime, index, error)?;
+            let error = IcmpInputError::BadLength;
+            set_index_node_error(runtime, index, error)?;
             let next = snapshot.default_next(IpVersion::V4);
             let _ = add_packet_trace!(
                 runtime,
@@ -902,7 +918,7 @@ fn next_slot_for_index(
                     version: None,
                     icmp_type: None,
                     code: None,
-                    error: Some(error),
+                    error: Some(error.code()),
                     next,
                 },
             );
@@ -913,8 +929,8 @@ fn next_slot_for_index(
     let default_next = snapshot.default_next(version);
     if parsed.input_error != IpInputError::None {
         drop(buffer);
-        let error = IcmpInputError::BadLength.code();
-        set_index_node_error_code(runtime, index, error)?;
+        let error = IcmpInputError::BadLength;
+        set_index_node_error(runtime, index, error)?;
         let _ = add_packet_trace!(
             runtime,
             index,
@@ -922,7 +938,7 @@ fn next_slot_for_index(
                 version: Some(version),
                 icmp_type: None,
                 code: None,
-                error: Some(error),
+                error: Some(error.code()),
                 next: default_next,
             },
         );
@@ -932,8 +948,8 @@ fn next_slot_for_index(
         IpProtocol::Icmpv4 | IpProtocol::Icmpv6 => {}
         IpProtocol::Tcp | IpProtocol::Udp | IpProtocol::Other(_) => {
             drop(buffer);
-            let error = IcmpInputError::WrongProtocol.code();
-            set_index_node_error_code(runtime, index, error)?;
+            let error = IcmpInputError::WrongProtocol;
+            set_index_node_error(runtime, index, error)?;
             let _ = add_packet_trace!(
                 runtime,
                 index,
@@ -941,7 +957,7 @@ fn next_slot_for_index(
                     version: Some(version),
                     icmp_type: None,
                     code: None,
-                    error: Some(error),
+                    error: Some(error.code()),
                     next: default_next,
                 },
             );
@@ -952,8 +968,8 @@ fn next_slot_for_index(
         current.get(parsed.transport_header_offset..parsed.packet_len.min(current.len()))
     else {
         drop(buffer);
-        let error = IcmpInputError::BadLength.code();
-        set_index_node_error_code(runtime, index, error)?;
+        let error = IcmpInputError::BadLength;
+        set_index_node_error(runtime, index, error)?;
         let _ = add_packet_trace!(
             runtime,
             index,
@@ -961,7 +977,7 @@ fn next_slot_for_index(
                 version: Some(version),
                 icmp_type: None,
                 code: None,
-                error: Some(error),
+                error: Some(error.code()),
                 next: default_next,
             },
         );
@@ -971,8 +987,8 @@ fn next_slot_for_index(
         Ok(header) => header,
         Err(_) => {
             drop(buffer);
-            let error = IcmpInputError::BadLength.code();
-            set_index_node_error_code(runtime, index, error)?;
+            let error = IcmpInputError::BadLength;
+            set_index_node_error(runtime, index, error)?;
             let _ = add_packet_trace!(
                 runtime,
                 index,
@@ -980,7 +996,7 @@ fn next_slot_for_index(
                     version: Some(version),
                     icmp_type: None,
                     code: None,
-                    error: Some(error),
+                    error: Some(error.code()),
                     next: default_next,
                 },
             );
@@ -989,8 +1005,8 @@ fn next_slot_for_index(
     };
     if icmp.len() < ICMP_HEADER_MIN_LEN {
         drop(buffer);
-        let error = IcmpInputError::BadLength.code();
-        set_index_node_error_code(runtime, index, error)?;
+        let error = IcmpInputError::BadLength;
+        set_index_node_error(runtime, index, error)?;
         let _ = add_packet_trace!(
             runtime,
             index,
@@ -998,7 +1014,7 @@ fn next_slot_for_index(
                 version: Some(version),
                 icmp_type: None,
                 code: None,
-                error: Some(error),
+                error: Some(error.code()),
                 next: default_next,
             },
         );
@@ -1009,8 +1025,8 @@ fn next_slot_for_index(
     let code = header.code();
     if snapshot.next_for_type(version, icmp_type).is_none() {
         drop(buffer);
-        let error = IcmpInputError::UnknownType.code();
-        set_index_node_error_code(runtime, index, error)?;
+        let error = IcmpInputError::UnknownType;
+        set_index_node_error(runtime, index, error)?;
         let next = snapshot.slot_for(version, icmp_type);
         let _ = add_packet_trace!(
             runtime,
@@ -1019,7 +1035,7 @@ fn next_slot_for_index(
                 version: Some(version),
                 icmp_type: Some(icmp_type),
                 code: Some(code),
-                error: Some(error),
+                error: Some(error.code()),
                 next,
             },
         );
@@ -1028,8 +1044,8 @@ fn next_slot_for_index(
     let spec = snapshot.spec(version, icmp_type);
     if code > spec.max_code {
         drop(buffer);
-        let error = IcmpInputError::BadCode.code();
-        set_index_node_error_code(runtime, index, error)?;
+        let error = IcmpInputError::BadCode;
+        set_index_node_error(runtime, index, error)?;
         let _ = add_packet_trace!(
             runtime,
             index,
@@ -1037,7 +1053,7 @@ fn next_slot_for_index(
                 version: Some(version),
                 icmp_type: Some(icmp_type),
                 code: Some(code),
-                error: Some(error),
+                error: Some(error.code()),
                 next: default_next,
             },
         );
@@ -1045,8 +1061,8 @@ fn next_slot_for_index(
     }
     if icmp.len() < spec.min_len {
         drop(buffer);
-        let error = IcmpInputError::TooShort.code();
-        set_index_node_error_code(runtime, index, error)?;
+        let error = IcmpInputError::TooShort;
+        set_index_node_error(runtime, index, error)?;
         let _ = add_packet_trace!(
             runtime,
             index,
@@ -1054,7 +1070,7 @@ fn next_slot_for_index(
                 version: Some(version),
                 icmp_type: Some(icmp_type),
                 code: Some(code),
-                error: Some(error),
+                error: Some(error.code()),
                 next: default_next,
             },
         );
@@ -1066,8 +1082,8 @@ fn next_slot_for_index(
             .is_some_and(|hop_limit| *hop_limit < spec.min_hop_limit)
     {
         drop(buffer);
-        let error = IcmpInputError::HopLimit.code();
-        set_index_node_error_code(runtime, index, error)?;
+        let error = IcmpInputError::HopLimit;
+        set_index_node_error(runtime, index, error)?;
         let _ = add_packet_trace!(
             runtime,
             index,
@@ -1075,7 +1091,7 @@ fn next_slot_for_index(
                 version: Some(version),
                 icmp_type: Some(icmp_type),
                 code: Some(code),
-                error: Some(error),
+                error: Some(error.code()),
                 next: default_next,
             },
         );
@@ -1129,15 +1145,15 @@ fn next_for_echo_request_index(
             Ok(next)
         }
         Err(error) => {
-            let error = IcmpNodeError::from(error).code();
-            set_index_node_error_code(runtime, index, error)?;
+            let error = IcmpNodeError::from(error);
+            set_index_node_error(runtime, index, error)?;
             let next = IcmpEchoRequestNext::Drop;
             let _ = add_packet_trace!(
                 runtime,
                 index,
                 IcmpEchoRequestTrace {
                     generated_len: None,
-                    error: Some(error),
+                    error: Some(error.code()),
                     next: NodeNext::slot(next),
                 },
             );
@@ -1155,8 +1171,8 @@ fn next_for_icmp_error_index(
     let buffer = runtime.get_buffer(index)?;
     let opaque = unsafe { transmute::<_, &IcmpErrorOpaque>(buffer.opaque2()) };
     let Some(metadata) = opaque.icmp_error else {
-        let error = IcmpNodeError::MissingMetadata.code();
-        set_index_node_error_code(runtime, index, error)?;
+        let error = IcmpNodeError::MissingMetadata;
+        set_index_node_error(runtime, index, error)?;
         let next = IcmpErrorNext::Drop;
         let _ = add_packet_trace!(
             runtime,
@@ -1166,7 +1182,7 @@ fn next_for_icmp_error_index(
                 ingress_interface: None,
                 local_source_present: false,
                 generated_len: None,
-                error: Some(error),
+                error: Some(error.code()),
                 next: NodeNext::slot(next),
             },
         );
@@ -1175,8 +1191,8 @@ fn next_for_icmp_error_index(
     let network = unsafe { transmute::<_, &NetworkOpaque>(buffer.opaque()) };
     let interface_index = network.sw_if_index[0];
     if interface_index == u32::MAX {
-        let error = IcmpNodeError::MissingIngressInterface.code();
-        set_index_node_error_code(runtime, index, error)?;
+        let error = IcmpNodeError::MissingIngressInterface;
+        set_index_node_error(runtime, index, error)?;
         let next = IcmpErrorNext::Drop;
         let _ = add_packet_trace!(
             runtime,
@@ -1186,7 +1202,7 @@ fn next_for_icmp_error_index(
                 ingress_interface: None,
                 local_source_present: false,
                 generated_len: None,
-                error: Some(error),
+                error: Some(error.code()),
                 next: NodeNext::slot(next),
             },
         );
@@ -1195,8 +1211,8 @@ fn next_for_icmp_error_index(
     let Some(local_source) = source_table.and_then(|source_table| {
         source_table.lookup(interface_index, version_for_family(metadata.family()))
     }) else {
-        let error = IcmpNodeError::MissingSource.code();
-        set_index_node_error_code(runtime, index, error)?;
+        let error = IcmpNodeError::MissingSource;
+        set_index_node_error(runtime, index, error)?;
         let next = IcmpErrorNext::Drop;
         let _ = add_packet_trace!(
             runtime,
@@ -1206,7 +1222,7 @@ fn next_for_icmp_error_index(
                 ingress_interface: Some(interface_index),
                 local_source_present: false,
                 generated_len: None,
-                error: Some(error),
+                error: Some(error.code()),
                 next: NodeNext::slot(next),
             },
         );
@@ -1240,8 +1256,8 @@ fn next_for_icmp_error_index(
             Ok(next)
         }
         Err(error) => {
-            let error = IcmpNodeError::from(error).code();
-            set_index_node_error_code(runtime, index, error)?;
+            let error = IcmpNodeError::from(error);
+            set_index_node_error(runtime, index, error)?;
             let next = IcmpErrorNext::Drop;
             let _ = add_packet_trace!(
                 runtime,
@@ -1251,7 +1267,7 @@ fn next_for_icmp_error_index(
                     ingress_interface: Some(interface_index),
                     local_source_present: true,
                     generated_len: None,
-                    error: Some(error),
+                    error: Some(error.code()),
                     next: NodeNext::slot(next),
                 },
             );

@@ -2519,6 +2519,7 @@ fn expand_graph_node(args: GraphNodeArgs, ident: &Ident, item: Item) -> Result<T
             registration: #node_registration,
             kind: #node_kind,
             init: #init,
+            error_counters: &[],
         };
     };
 
@@ -4219,6 +4220,24 @@ mod tests {
             !expanded.contains("MAX_NODE_NEXT_SLOTS"),
             "obsolete 16-next macro guard must be gone: {expanded}"
         );
+    }
+
+    #[test]
+    fn graph_node_without_error_counters_emits_empty_slice() {
+        let args = syn::parse_str::<GraphNodeArgs>(
+            r#"init = crate::register_output, name = "output", role = internal"#,
+        )
+        .expect("parse graph node");
+        let item = syn::parse_str::<Item>("pub struct OutputNode;").expect("parse graph node item");
+        let ident = match &item {
+            Item::Struct(item) => item.ident.clone(),
+            _ => unreachable!(),
+        };
+        let expanded = expand_graph_node(args, &ident, item)
+            .expect("expand graph node")
+            .to_string();
+
+        assert!(expanded.contains("error_counters : & []"));
     }
 
     #[test]

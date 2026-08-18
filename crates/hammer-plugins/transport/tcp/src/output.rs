@@ -102,7 +102,7 @@ fn tcp_output_next_for_index<const SIMD_BYTES: usize>(
     let buffer = runtime.get_buffer(index)?;
     let header = buffer.current();
     if tcp_header(header).is_err() {
-        let _ = runtime.record_current_node_error(TcpOutputError::NoTcpHeader.code());
+        let _ = runtime.record_current_node_error(TcpOutputError::NoTcpHeader);
         return Ok(TcpOutputNext::Drop);
     }
     let tcp_len = buffer
@@ -112,12 +112,12 @@ fn tcp_output_next_for_index<const SIMD_BYTES: usize>(
     drop(buffer);
 
     let Some(tcp_len) = tcp_len else {
-        let _ = runtime.record_current_node_error(TcpOutputError::SegmentTooLong.code());
+        let _ = runtime.record_current_node_error(TcpOutputError::SegmentTooLong);
         return Ok(TcpOutputNext::Drop);
     };
 
     let Some((local, remote)) = endpoints else {
-        let _ = runtime.record_current_node_error(TcpOutputError::MissingEgressEndpoints.code());
+        let _ = runtime.record_current_node_error(TcpOutputError::MissingEgressEndpoints);
         return Ok(TcpOutputNext::Drop);
     };
 
@@ -127,7 +127,7 @@ fn tcp_output_next_for_index<const SIMD_BYTES: usize>(
                 .checked_add(20)
                 .and_then(|length| u16::try_from(length).ok())
             else {
-                let _ = runtime.record_current_node_error(TcpOutputError::SegmentTooLong.code());
+                let _ = runtime.record_current_node_error(TcpOutputError::SegmentTooLong);
                 return Ok(TcpOutputNext::Drop);
             };
             tcp_output_push_ipv4::<SIMD_BYTES>(runtime, index, src, dst, total_len)?;
@@ -135,14 +135,14 @@ fn tcp_output_next_for_index<const SIMD_BYTES: usize>(
         }
         (IpAddr::V6(src), IpAddr::V6(dst)) => {
             let Ok(payload_len) = u16::try_from(tcp_len) else {
-                let _ = runtime.record_current_node_error(TcpOutputError::SegmentTooLong.code());
+                let _ = runtime.record_current_node_error(TcpOutputError::SegmentTooLong);
                 return Ok(TcpOutputNext::Drop);
             };
             tcp_output_push_ipv6::<SIMD_BYTES>(runtime, index, src, dst, payload_len)?;
             Ok(TcpOutputNext::Lookup)
         }
         _ => {
-            let _ = runtime.record_current_node_error(TcpOutputError::UnsupportedEgress.code());
+            let _ = runtime.record_current_node_error(TcpOutputError::UnsupportedEgress);
             Ok(TcpOutputNext::Drop)
         }
     }

@@ -19,5 +19,11 @@ mod stats;
 
 pub use crate::directory::{DirectoryType, PrometheusType};
 pub use crate::error::StatsError;
-pub use crate::read::{ConstLabel, DirectoryEntry, DumpEntry, DumpValue};
-pub use crate::stats::{Counter, DEFAULT_CAPACITY, EntryId, Gauge, StatsMain, Timestamp};
+pub use crate::read::{ConstLabel, DirectoryEntry, DumpEntry, DumpValue, RingBufferSnapshot};
+pub use crate::stats::{
+    Counter, CounterLayout, CounterVectorCombined, CounterVectorCombinedLayout,
+    CounterVectorSimple, CounterVectorSimpleLayout, DEFAULT_CAPACITY, EntryId, Gauge, GaugeLayout,
+    HistogramLog2, HistogramLog2Layout, MetricHandle, NameVector, NameVectorLayout, RingBuffer,
+    RingBufferLayout, StatsDescriptor, StatsEntry, StatsMain, StatsRegistration, StatsValueLayout,
+    Timestamp, TimestampLayout,
+};

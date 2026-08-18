@@ -78,6 +78,7 @@ fn stats_commands_list_and_dump_system_metrics() {
                 socket.clone(),
                 "stats".to_owned(),
                 "list".to_owned(),
+                "^/sys/(heartbeat|boottime|last_stats_clear)$".to_owned(),
             ])
             .await;
             assert!(
@@ -104,6 +105,7 @@ fn stats_commands_list_and_dump_system_metrics() {
                     "dump".to_owned(),
                     "--socket".to_owned(),
                     socket.clone(),
+                    "^/sys/(heartbeat|boottime|last_stats_clear)$".to_owned(),
                 ])
                 .await;
                 assert!(
@@ -146,6 +148,7 @@ fn stats_commands_list_and_dump_system_metrics() {
                 "dump".to_owned(),
                 "--socket".to_owned(),
                 socket.clone(),
+                "^/sys/(heartbeat|boottime|last_stats_clear)$".to_owned(),
             ])
             .await;
             assert!(

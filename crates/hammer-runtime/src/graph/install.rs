@@ -19,5 +19,6 @@ pub fn install_packet_graph(engine: &mut Engine) -> RuntimeResult<()> {
     engine
         .runtime
         .init_graph_with_node_functions(&entries, &functions)?;
+    engine.install_graph_stats()?;
     Ok(())
 }

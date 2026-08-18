@@ -6,7 +6,7 @@
 //! or worker-barrier interaction: `list` runs the server's transient list
 //! once; `dump` lists once and, only when entries exist, dumps exactly once.
 
-use std::io::{self, Write};
+use std::io;
 use std::path::Path;
 
 use clap::Subcommand;
@@ -32,6 +32,20 @@ pub(crate) enum StatsCommand {
     },
 }
 
+/// `hammerctl show` subcommands.
+#[derive(Subcommand, Debug)]
+pub(crate) enum ShowCommand {
+    /// Show node business-error counters
+    Errors {
+        /// Print one row per worker and a totals section
+        #[arg(long)]
+        verbose: bool,
+        /// Include descriptors whose value is zero
+        #[arg(long = "include-zero")]
+        include_zero: bool,
+    },
+}
+
 /// Connects once and executes `command`, writing one output line per record
 /// to `output`. A broken pipe ends the run quietly with success, matching
 /// the Unix filter convention for a consumer that went away early (as with
@@ -50,12 +64,39 @@ pub(crate) fn run(
     write_lines(output, &lines)
 }
 
-/// Errors from running a stats command: the client call, or writing the
-/// result lines. A broken pipe is deliberately not an error.
+/// Reads `/err/...` symlinks with the two public stats calls. The symlink dump
+/// is already resolved to the target counter-vector rows by the stats server.
+pub(crate) fn run_errors(
+    socket: &Path,
+    verbose: bool,
+    include_zero: bool,
+    output: &mut dyn io::Write,
+) -> Result<(), RunError> {
+    let mut client = StatsClient::connect(socket)?;
+    let entries = client.list(&["/err/.*".to_owned()])?;
+    let ids: Vec<EntryId> = entries
+        .iter()
+        .filter(|entry| entry.directory_type == DirectoryType::Symlink)
+        .map(|entry| entry.id)
+        .collect();
+    let values = if ids.is_empty() {
+        Vec::new()
+    } else {
+        client.dump(&ids)?
+    };
+    let lines = format_error_lines(&entries, &values, verbose, include_zero)?;
+    write_lines(output, &lines)
+}
+
+/// Errors from running a stats command: the client call, output, or a
+/// malformed/incompatible error entry. A broken pipe is deliberately not an
+/// error.
 #[derive(Debug)]
 pub(crate) enum RunError {
     Client(StatsClientError),
     Output(io::Error),
+    MissingDump { id: EntryId },
+    UnsupportedDumpValue { path: String },
 }
 
 impl From<StatsClientError> for RunError {
@@ -69,6 +110,10 @@ impl std::fmt::Display for RunError {
         match self {
             RunError::Client(error) => std::fmt::Display::fmt(error, f),
             RunError::Output(error) => std::fmt::Display::fmt(error, f),
+            RunError::MissingDump { id } => write!(f, "stats dump omitted error entry {id}"),
+            RunError::UnsupportedDumpValue { path } => {
+                write!(f, "stats dump entry `{path}` is not a counter")
+            }
         }
     }
 }
@@ -78,6 +123,7 @@ impl std::error::Error for RunError {
         match self {
             RunError::Client(error) => Some(error),
             RunError::Output(error) => Some(error),
+            RunError::MissingDump { .. } | RunError::UnsupportedDumpValue { .. } => None,
         }
     }
 }
@@ -114,6 +160,147 @@ fn dump(client: &mut StatsClient, patterns: &[String]) -> Result<Vec<String>, St
     Ok(values.iter().map(format_dump_entry).collect())
 }
 
+#[derive(Debug)]
+struct ErrorRecord {
+    node: String,
+    reason: String,
+    severity: String,
+    index: Option<u32>,
+    workers: Vec<u64>,
+}
+
+fn format_error_lines(
+    entries: &[DirectoryEntry],
+    dumps: &[DumpEntry],
+    verbose: bool,
+    include_zero: bool,
+) -> Result<Vec<String>, RunError> {
+    let records = collect_error_records(entries, dumps)?;
+    let mut lines = vec![if verbose {
+        "Count\tNode\tReason\tSeverity\tIndex".to_owned()
+    } else {
+        "Count\tNode\tReason\tSeverity".to_owned()
+    }];
+
+    if verbose {
+        let worker_count = records
+            .iter()
+            .map(|record| record.workers.len())
+            .max()
+            .unwrap_or(0);
+        for worker in 0..worker_count {
+            lines.push(format!("Thread {worker}:"));
+            for record in &records {
+                let count = record.workers.get(worker).copied().unwrap_or(0);
+                if include_zero || count != 0 {
+                    lines.push(format_error_row(record, count, true));
+                }
+            }
+        }
+        lines.push("Total:".to_owned());
+        for record in &records {
+            let count = sum_worker_counts(&record.workers);
+            if include_zero || count != 0 {
+                lines.push(format_error_row(record, count, true));
+            }
+        }
+    } else {
+        for record in &records {
+            let count = sum_worker_counts(&record.workers);
+            if include_zero || count != 0 {
+                lines.push(format_error_row(record, count, false));
+            }
+        }
+    }
+
+    Ok(lines)
+}
+
+fn collect_error_records(
+    entries: &[DirectoryEntry],
+    dumps: &[DumpEntry],
+) -> Result<Vec<ErrorRecord>, RunError> {
+    entries
+        .iter()
+        .filter(|entry| entry.directory_type == DirectoryType::Symlink)
+        .map(|entry| {
+            let dump = dumps
+                .iter()
+                .find(|dump| dump.id == entry.id)
+                .ok_or(RunError::MissingDump { id: entry.id })?;
+            let workers = error_worker_counts(dump)?;
+            let (node, reason) = error_path_parts(&entry.path);
+            let severity = label_value(&entry.const_labels, &["severity"])
+                .filter(|value| !value.is_empty())
+                .unwrap_or("error")
+                .to_owned();
+            let index = parse_error_index(&entry.const_labels);
+            Ok(ErrorRecord {
+                node,
+                reason,
+                severity,
+                index,
+                workers,
+            })
+        })
+        .collect()
+}
+
+fn error_worker_counts(dump: &DumpEntry) -> Result<Vec<u64>, RunError> {
+    match &dump.value {
+        DumpValue::CounterVectorSimple(rows) => Ok(rows
+            .iter()
+            .map(|row| row.first().copied().unwrap_or(0))
+            .collect()),
+        DumpValue::Counter(value) => Ok(vec![*value]),
+        _ => Err(RunError::UnsupportedDumpValue {
+            path: dump.path.clone(),
+        }),
+    }
+}
+
+fn error_path_parts(path: &str) -> (String, String) {
+    let path = path.strip_prefix("/err/").unwrap_or(path);
+    match path.split_once('/') {
+        Some((node, reason)) => (node.to_owned(), reason.to_owned()),
+        None => (path.to_owned(), String::new()),
+    }
+}
+
+fn label_value<'a>(labels: &'a [ConstLabel], names: &[&str]) -> Option<&'a str> {
+    labels
+        .iter()
+        .find(|label| names.iter().any(|name| label.name == *name))
+        .map(|label| label.value.as_str())
+}
+
+fn parse_error_index(labels: &[ConstLabel]) -> Option<u32> {
+    ["index", "global_index", "error_index"]
+        .iter()
+        .find_map(|name| label_value(labels, &[*name]).and_then(|value| value.trim().parse().ok()))
+}
+
+fn sum_worker_counts(counts: &[u64]) -> u64 {
+    counts.iter().copied().fold(0_u64, u64::saturating_add)
+}
+
+fn format_error_row(record: &ErrorRecord, count: u64, verbose: bool) -> String {
+    let mut row = format!(
+        "{count}\t{}\t{}\t{}",
+        escape_free_text(&record.node),
+        escape_free_text(&record.reason),
+        escape_free_text(&record.severity),
+    );
+    if verbose {
+        let index = record
+            .index
+            .map_or_else(|| "?".to_owned(), |index| index.to_string());
+        row.push('\t');
+        row.push_str(&index);
+    }
+    row
+}
+
 fn format_list_entry(entry: &DirectoryEntry) -> String {
     format!(
         "{}:{}\t{}\t{}\t{}\t{}\t{}\t{}",
@@ -129,10 +316,7 @@ fn format_list_entry(entry: &DirectoryEntry) -> String {
 }
 
 fn format_dump_entry(entry: &DumpEntry) -> String {
-    let value = match entry.value {
-        DumpValue::Counter(value) => format!("counter:{value}"),
-        DumpValue::Gauge(value) => format!("gauge:{value}"),
-    };
+    let value = format_dump_value(&entry.value);
     format!(
         "{}:{}\t{}\t{}\t{}\t{}",
         entry.id.index(),
@@ -142,6 +326,22 @@ fn format_dump_entry(entry: &DumpEntry) -> String {
         prometheus_spelling(entry.prometheus_type),
         value,
     )
+}
+
+fn format_dump_value(value: &DumpValue) -> String {
+    match value {
+        DumpValue::Counter(value) => format!("counter:{value}"),
+        DumpValue::Gauge(value) => format!("gauge:{value}"),
+        DumpValue::CounterVectorSimple(rows) => {
+            format!("counter-vector-simple:{rows:?}")
+        }
+        DumpValue::CounterVectorCombined(rows) => {
+            format!("counter-vector-combined:{rows:?}")
+        }
+        DumpValue::NameVector(slots) => format!("name-vector:{slots:?}"),
+        DumpValue::HistogramLog2(rows) => format!("histogram-log2:{rows:?}"),
+        DumpValue::RingBuffer(snapshots) => format!("ring-buffer:{snapshots:?}"),
+    }
 }
 
 /// Stable lowercase spellings of the VPP directory types (shared.h).
@@ -366,6 +566,112 @@ mod tests {
             prometheus_type: prometheus_type as i32,
             value: Some(wire::Value { value: Some(value) }),
         }
+    }
+
+    fn wire_error_entry(
+        index: u32,
+        generation: u64,
+        path: &str,
+        labels: &[(&str, &str)],
+    ) -> wire::ListEntry {
+        let mut entry = wire_entry(
+            index,
+            generation,
+            path,
+            "",
+            wire::DirectoryType::Symlink,
+            wire::PrometheusType::Counter,
+        );
+        entry.const_labels = labels
+            .iter()
+            .map(|(name, value)| wire::ConstLabel {
+                name: (*name).to_owned(),
+                value: (*value).to_owned(),
+            })
+            .collect();
+        entry
+    }
+
+    fn wire_error_dump(
+        index: u32,
+        generation: u64,
+        path: &str,
+        rows: Vec<Vec<u64>>,
+    ) -> wire::DumpEntry {
+        wire_dump(
+            index,
+            generation,
+            path,
+            wire::DirectoryType::Symlink,
+            wire::PrometheusType::Counter,
+            wire::value::Value::CounterVectorSimple(wire::CounterVectorSimple {
+                rows: rows
+                    .into_iter()
+                    .map(|values| wire::CounterVectorSimpleRow { values })
+                    .collect(),
+            }),
+        )
+    }
+
+    #[test]
+    fn show_errors_default_sums_workers_and_omits_zero() {
+        let server = FakeStatsServer::new(
+            vec![
+                wire_error_entry(
+                    10,
+                    1,
+                    "/err/ip4-input/bad-checksum",
+                    &[("severity", "warn"), ("index", "7")],
+                ),
+                wire_error_entry(
+                    11,
+                    1,
+                    "/err/ip4-input/expired",
+                    &[("severity", "info"), ("index", "8")],
+                ),
+            ],
+            vec![
+                wire_error_dump(10, 1, "/err/ip4-input/bad-checksum", vec![vec![1], vec![2]]),
+                wire_error_dump(11, 1, "/err/ip4-input/expired", vec![vec![0], vec![0]]),
+            ],
+        );
+        server.start();
+        let mut output = Vec::new();
+        run_errors(&server.path, false, false, &mut output).expect("show errors");
+
+        assert_eq!(
+            String::from_utf8(output).expect("utf8 output"),
+            "Count\tNode\tReason\tSeverity\n3\tip4-input\tbad-checksum\twarn\n"
+        );
+        assert_eq!(server.calls(), vec!["stats.list", "stats.dump"]);
+    }
+
+    #[test]
+    fn show_errors_verbose_includes_zero_and_totals() {
+        let server = FakeStatsServer::new(
+            vec![
+                wire_error_entry(
+                    10,
+                    1,
+                    "/err/ip4-input/bad-checksum",
+                    &[("severity", "warn"), ("index", "7")],
+                ),
+                wire_error_entry(11, 1, "/err/ip4-input/expired", &[("severity", "info")]),
+            ],
+            vec![
+                wire_error_dump(10, 1, "/err/ip4-input/bad-checksum", vec![vec![1], vec![0]]),
+                wire_error_dump(11, 1, "/err/ip4-input/expired", vec![vec![0], vec![2]]),
+            ],
+        );
+        server.start();
+        let mut output = Vec::new();
+        run_errors(&server.path, true, true, &mut output).expect("show errors");
+
+        assert_eq!(
+            String::from_utf8(output).expect("utf8 output"),
+            "Count\tNode\tReason\tSeverity\tIndex\nThread 0:\n1\tip4-input\tbad-checksum\twarn\t7\n0\tip4-input\texpired\tinfo\t?\nThread 1:\n0\tip4-input\tbad-checksum\twarn\t7\n2\tip4-input\texpired\tinfo\t?\nTotal:\n1\tip4-input\tbad-checksum\twarn\t7\n2\tip4-input\texpired\tinfo\t?\n"
+        );
+        assert_eq!(server.calls(), vec!["stats.list", "stats.dump"]);
     }
 
     #[test]

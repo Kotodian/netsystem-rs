@@ -68,7 +68,6 @@ pub fn engine_main_loop(
 
         // Step 1: Barrier check — VPP threads.c:296
         if engine.barrier.is_pending() {
-            engine.publish_worker_runtime_stats();
             engine.barrier.check();
             if !engine.refork_worker_graph() {
                 return 1;

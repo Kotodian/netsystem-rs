@@ -45,8 +45,6 @@ pub enum StatsError {
     InvalidState(u8),
     /// A size/align pair could not be laid out.
     InvalidLayout,
-    /// The metric reference count would overflow `u64::MAX`.
-    RefCountOverflow,
     /// The entry generation would wrap `u64::MAX`.
     GenerationOverflow,
     /// A `list` pattern could not be compiled as a regular expression.
@@ -59,6 +57,9 @@ pub enum StatsError {
     /// A reader retried the maximum number of times while the segment was
     /// continuously being republished.
     ReadBusy,
+    /// A registration layout has not yet been implemented by the public
+    /// protocol-neutral boundary.
+    UnsupportedLayout,
     /// A directory entry carries a type combination that cannot be decoded
     /// into a `DumpValue` (internal corruption). The typed enums are already
     /// checked decodes of the mapped bytes.
@@ -107,13 +108,15 @@ impl fmt::Display for StatsError {
             StatsError::Misaligned => write!(f, "offset not aligned for its record"),
             StatsError::InvalidState(state) => write!(f, "invalid mapped state byte 0x{state:02x}"),
             StatsError::InvalidLayout => write!(f, "invalid size/alignment layout"),
-            StatsError::RefCountOverflow => write!(f, "metric reference count overflow"),
             StatsError::GenerationOverflow => write!(f, "metric generation overflow"),
             StatsError::InvalidPattern { pattern, source } => {
                 write!(f, "invalid stats list pattern {pattern:?}: {source}")
             }
             StatsError::ReadBusy => {
                 write!(f, "stats segment busy republishing; retry the read later")
+            }
+            StatsError::UnsupportedLayout => {
+                write!(f, "stats registration layout is not implemented")
             }
             StatsError::IncompatibleType {
                 id,

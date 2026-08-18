@@ -41,9 +41,7 @@ pub(crate) struct StatsHeader {
     initialized_len: AtomicU64,
     /// Head of the free-slot list (u32 index or `NULL_INDEX`).
     free_list_head: AtomicU64,
-    /// Head of the deferred-reclamation list (u32 index or `NULL_INDEX`).
-    removed_list_head: AtomicU64,
-    reserved2: [u64; 3],
+    reserved2: [u64; 4],
 }
 
 const _: () = assert!(std::mem::size_of::<StatsHeader>() == 128);
@@ -66,8 +64,7 @@ impl StatsHeader {
             directory_capacity: AtomicU64::new(directory_capacity),
             initialized_len: AtomicU64::new(0),
             free_list_head: AtomicU64::new(NULL_INDEX),
-            removed_list_head: AtomicU64::new(NULL_INDEX),
-            reserved2: [0; 3],
+            reserved2: [0; 4],
         }
     }
 
@@ -85,10 +82,6 @@ impl StatsHeader {
 
     pub(crate) fn free_list_head(&self) -> u64 {
         self.free_list_head.load(Ordering::Relaxed)
-    }
-
-    pub(crate) fn removed_list_head(&self) -> u64 {
-        self.removed_list_head.load(Ordering::Relaxed)
     }
 
     /// VPP sequence marker: set to 1 before prevalidated publication writes,
@@ -143,10 +136,6 @@ impl StatsHeader {
 
     pub(crate) fn store_free_list_head(&self, head: u64) {
         self.free_list_head.store(head, Ordering::Relaxed);
-    }
-
-    pub(crate) fn store_removed_list_head(&self, head: u64) {
-        self.removed_list_head.store(head, Ordering::Relaxed);
     }
 }
 

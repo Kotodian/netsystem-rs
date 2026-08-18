@@ -643,6 +643,13 @@ pub enum TcpNodeError {
     KeepaliveProbe,
 }
 
+impl hammer_runtime::node::NodeErrorCode for TcpNodeError {
+    #[inline(always)]
+    fn local_code(self) -> u16 {
+        self as u16
+    }
+}
+
 impl TcpNodeError {
     #[inline(always)]
     pub const fn code(self) -> u16 {
@@ -700,6 +707,13 @@ pub enum TcpOutputError {
     SegmentTooLong,
 }
 
+impl hammer_runtime::node::NodeErrorCode for TcpOutputError {
+    #[inline(always)]
+    fn local_code(self) -> u16 {
+        self as u16
+    }
+}
+
 impl TcpOutputError {
     #[inline(always)]
     pub const fn code(self) -> u16 {
@@ -712,6 +726,13 @@ impl TcpOutputError {
 pub enum TcpResetError {
     #[error("bad TCP header")]
     BadTcpHeader,
+}
+
+impl hammer_runtime::node::NodeErrorCode for TcpResetError {
+    #[inline(always)]
+    fn local_code(self) -> u16 {
+        self as u16
+    }
 }
 
 impl TcpResetError {

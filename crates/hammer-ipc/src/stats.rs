@@ -110,12 +110,83 @@ pub mod wire {
         pub ids: Vec<EntryId>,
     }
 
-    /// One value read by `stats.dump`. A message wrapper keeps the
-    /// counter/gauge oneof at tags 1/2 while `DumpEntry.value` occupies tag 5.
+    /// One value read by `stats.dump`. A message wrapper keeps the scalar
+    /// counter/gauge tags stable while allowing the vector-shaped values to
+    /// grow additively.
     #[derive(Clone, PartialEq, ::prost::Message)]
     pub struct Value {
-        #[prost(oneof = "value::Value", tags = "1, 2")]
+        #[prost(oneof = "value::Value", tags = "1, 2, 3, 4, 5, 6, 7")]
         pub value: Option<value::Value>,
+    }
+
+    #[derive(Clone, PartialEq, ::prost::Message)]
+    pub struct CounterVectorSimple {
+        #[prost(message, repeated, tag = "1")]
+        pub rows: Vec<CounterVectorSimpleRow>,
+    }
+
+    #[derive(Clone, PartialEq, ::prost::Message)]
+    pub struct CounterVectorSimpleRow {
+        #[prost(uint64, repeated, tag = "1")]
+        pub values: Vec<u64>,
+    }
+
+    #[derive(Clone, PartialEq, ::prost::Message)]
+    pub struct CounterVectorCombined {
+        #[prost(message, repeated, tag = "1")]
+        pub rows: Vec<CounterVectorCombinedRow>,
+    }
+
+    #[derive(Clone, PartialEq, ::prost::Message)]
+    pub struct CounterVectorCombinedRow {
+        #[prost(message, repeated, tag = "1")]
+        pub values: Vec<CounterVectorCombinedValue>,
+    }
+
+    #[derive(Clone, Copy, PartialEq, ::prost::Message)]
+    pub struct CounterVectorCombinedValue {
+        #[prost(uint64, tag = "1")]
+        pub packets: u64,
+        #[prost(uint64, tag = "2")]
+        pub bytes: u64,
+    }
+
+    #[derive(Clone, PartialEq, ::prost::Message)]
+    pub struct NameVector {
+        #[prost(message, repeated, tag = "1")]
+        pub slots: Vec<NameVectorSlot>,
+    }
+
+    #[derive(Clone, PartialEq, ::prost::Message)]
+    pub struct NameVectorSlot {
+        #[prost(string, optional, tag = "1")]
+        pub name: Option<String>,
+    }
+
+    #[derive(Clone, PartialEq, ::prost::Message)]
+    pub struct HistogramLog2 {
+        #[prost(message, repeated, tag = "1")]
+        pub rows: Vec<HistogramLog2Row>,
+    }
+
+    #[derive(Clone, PartialEq, ::prost::Message)]
+    pub struct HistogramLog2Row {
+        #[prost(uint64, repeated, tag = "1")]
+        pub bins: Vec<u64>,
+    }
+
+    #[derive(Clone, PartialEq, ::prost::Message)]
+    pub struct RingBuffer {
+        #[prost(message, repeated, tag = "1")]
+        pub snapshots: Vec<RingBufferSnapshot>,
+    }
+
+    #[derive(Clone, PartialEq, ::prost::Message)]
+    pub struct RingBufferSnapshot {
+        #[prost(uint64, tag = "1")]
+        pub sequence: u64,
+        #[prost(bytes = "vec", repeated, tag = "2")]
+        pub entries: Vec<Vec<u8>>,
     }
 
     pub mod value {
@@ -125,6 +196,16 @@ pub mod wire {
             Counter(u64),
             #[prost(double, tag = "2")]
             Gauge(f64),
+            #[prost(message, tag = "3")]
+            CounterVectorSimple(super::CounterVectorSimple),
+            #[prost(message, tag = "4")]
+            CounterVectorCombined(super::CounterVectorCombined),
+            #[prost(message, tag = "5")]
+            NameVector(super::NameVector),
+            #[prost(message, tag = "6")]
+            HistogramLog2(super::HistogramLog2),
+            #[prost(message, tag = "7")]
+            RingBuffer(super::RingBuffer),
         }
     }
 
@@ -408,10 +489,136 @@ pub struct DirectoryEntry {
 }
 
 /// One value read by `stats.dump`.
-#[derive(Debug, Clone, Copy, PartialEq)]
+///
+/// The vector-shaped variants mirror the owned values returned by the stats
+/// segment reader. A dump may retain `directory_type = Symlink` while carrying
+/// the resolved target shape, just as VPP's `copy_data` does.
+#[derive(Debug, Clone, PartialEq)]
 pub enum DumpValue {
     Counter(u64),
     Gauge(f64),
+    CounterVectorSimple(Vec<Vec<u64>>),
+    CounterVectorCombined(Vec<Vec<(u64, u64)>>),
+    NameVector(Vec<Option<String>>),
+    HistogramLog2(Vec<Vec<u64>>),
+    RingBuffer(Vec<RingBufferSnapshot>),
+}
+
+/// One owned ring-buffer row snapshot returned by `stats.dump`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RingBufferSnapshot {
+    pub sequence: u64,
+    pub entries: Vec<Vec<u8>>,
+}
+
+impl From<wire::value::Value> for DumpValue {
+    fn from(value: wire::value::Value) -> Self {
+        match value {
+            wire::value::Value::Counter(value) => Self::Counter(value),
+            wire::value::Value::Gauge(value) => Self::Gauge(value),
+            wire::value::Value::CounterVectorSimple(value) => {
+                Self::CounterVectorSimple(value.rows.into_iter().map(|row| row.values).collect())
+            }
+            wire::value::Value::CounterVectorCombined(value) => Self::CounterVectorCombined(
+                value
+                    .rows
+                    .into_iter()
+                    .map(|row| {
+                        row.values
+                            .into_iter()
+                            .map(|value| (value.packets, value.bytes))
+                            .collect()
+                    })
+                    .collect(),
+            ),
+            wire::value::Value::NameVector(value) => {
+                Self::NameVector(value.slots.into_iter().map(|slot| slot.name).collect())
+            }
+            wire::value::Value::HistogramLog2(value) => {
+                Self::HistogramLog2(value.rows.into_iter().map(|row| row.bins).collect())
+            }
+            wire::value::Value::RingBuffer(value) => Self::RingBuffer(
+                value
+                    .snapshots
+                    .into_iter()
+                    .map(|snapshot| RingBufferSnapshot {
+                        sequence: snapshot.sequence,
+                        entries: snapshot.entries,
+                    })
+                    .collect(),
+            ),
+        }
+    }
+}
+
+impl From<DumpValue> for wire::Value {
+    fn from(value: DumpValue) -> Self {
+        let value = match value {
+            DumpValue::Counter(value) => wire::value::Value::Counter(value),
+            DumpValue::Gauge(value) => wire::value::Value::Gauge(value),
+            DumpValue::CounterVectorSimple(rows) => {
+                wire::value::Value::CounterVectorSimple(wire::CounterVectorSimple {
+                    rows: rows
+                        .into_iter()
+                        .map(|values| wire::CounterVectorSimpleRow { values })
+                        .collect(),
+                })
+            }
+            DumpValue::CounterVectorCombined(rows) => {
+                wire::value::Value::CounterVectorCombined(wire::CounterVectorCombined {
+                    rows: rows
+                        .into_iter()
+                        .map(|values| wire::CounterVectorCombinedRow {
+                            values: values
+                                .into_iter()
+                                .map(|(packets, bytes)| wire::CounterVectorCombinedValue {
+                                    packets,
+                                    bytes,
+                                })
+                                .collect(),
+                        })
+                        .collect(),
+                })
+            }
+            DumpValue::NameVector(slots) => wire::value::Value::NameVector(wire::NameVector {
+                slots: slots
+                    .into_iter()
+                    .map(|name| wire::NameVectorSlot { name })
+                    .collect(),
+            }),
+            DumpValue::HistogramLog2(rows) => {
+                wire::value::Value::HistogramLog2(wire::HistogramLog2 {
+                    rows: rows
+                        .into_iter()
+                        .map(|bins| wire::HistogramLog2Row { bins })
+                        .collect(),
+                })
+            }
+            DumpValue::RingBuffer(snapshots) => wire::value::Value::RingBuffer(wire::RingBuffer {
+                snapshots: snapshots
+                    .into_iter()
+                    .map(|snapshot| wire::RingBufferSnapshot {
+                        sequence: snapshot.sequence,
+                        entries: snapshot.entries,
+                    })
+                    .collect(),
+            }),
+        };
+        Self { value: Some(value) }
+    }
+}
+
+impl TryFrom<wire::Value> for DumpValue {
+    type Error = StatsClientError;
+
+    fn try_from(value: wire::Value) -> Result<Self, Self::Error> {
+        value
+            .value
+            .map(Self::from)
+            .ok_or(StatsClientError::MissingValue {
+                method: STATS_DUMP_METHOD,
+            })
+    }
 }
 
 /// One stats directory entry value from `stats.dump`, in the requested order
@@ -543,12 +750,8 @@ fn convert_dump_entry(
     let prometheus_type = PrometheusType::try_from(entry.prometheus_type)?;
     let value = entry
         .value
-        .and_then(|value| value.value)
         .ok_or(StatsClientError::MissingValue { method })?;
-    let value = match value {
-        wire::value::Value::Counter(counter) => DumpValue::Counter(counter),
-        wire::value::Value::Gauge(gauge) => DumpValue::Gauge(gauge),
-    };
+    let value = DumpValue::try_from(value)?;
     Ok(DumpEntry {
         id: checked_entry_id(entry.id, method)?,
         path: entry.path,
@@ -869,6 +1072,58 @@ mod tests {
         let decoded =
             wire::DumpReply::decode(reply.encode_to_vec().as_slice()).expect("decode dump reply");
         assert_eq!(decoded, reply);
+    }
+
+    #[test]
+    fn dump_value_variants_round_trip_through_wire() {
+        let values = [
+            DumpValue::Counter(42),
+            DumpValue::Gauge(3.5),
+            DumpValue::CounterVectorSimple(vec![vec![0, 7, 0], vec![0, 0, 4]]),
+            DumpValue::CounterVectorCombined(vec![vec![(0, 0), (3, 42)], vec![(0, 0), (0, 0)]]),
+            DumpValue::NameVector(vec![Some("worker-0".to_owned()), None, Some(String::new())]),
+            DumpValue::HistogramLog2(vec![vec![1, 2, 3], vec![4, 5, 6]]),
+            DumpValue::RingBuffer(vec![RingBufferSnapshot {
+                sequence: 9,
+                entries: vec![vec![1, 2, 3], Vec::new()],
+            }]),
+        ];
+
+        for expected in values {
+            let wire_value: wire::Value = expected.clone().into();
+            let decoded = wire::Value::decode(wire_value.encode_to_vec().as_slice())
+                .expect("decode dump value");
+            assert_eq!(
+                DumpValue::try_from(decoded).expect("convert dump value"),
+                expected
+            );
+        }
+    }
+
+    #[test]
+    fn dump_reply_preserves_symlink_identity_with_resolved_vector_value() {
+        let reply = wire::DumpReply {
+            result: Some(wire::dump_reply::Result::Entries(wire::DumpEntries {
+                entries: vec![dump_entry_wire(
+                    8,
+                    "/err/ip/version",
+                    wire::DirectoryType::Symlink as i32,
+                    wire::PrometheusType::Counter as i32,
+                    Some(wire::value::Value::CounterVectorSimple(
+                        wire::CounterVectorSimple {
+                            rows: vec![wire::CounterVectorSimpleRow { values: vec![17] }],
+                        },
+                    )),
+                )],
+            })),
+        };
+
+        let entries = convert_dump_reply(reply, STATS_DUMP_METHOD).expect("convert dump reply");
+        assert_eq!(entries[0].directory_type, DirectoryType::Symlink);
+        assert_eq!(
+            entries[0].value,
+            DumpValue::CounterVectorSimple(vec![vec![17]])
+        );
     }
 
     fn list_entry_wire(

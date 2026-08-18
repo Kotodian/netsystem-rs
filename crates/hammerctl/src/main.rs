@@ -41,6 +41,9 @@ enum Command {
     /// Inspect the daemon's live stats segment
     #[command(subcommand)]
     Stats(stats::StatsCommand),
+    /// Show human-readable daemon measurements
+    #[command(subcommand)]
+    Show(stats::ShowCommand),
 }
 
 fn main() -> ExitCode {
@@ -81,6 +84,16 @@ fn main() -> ExitCode {
             Ok(()) => ExitCode::SUCCESS,
             Err(error) => {
                 eprintln!("stats command failed: {error}");
+                ExitCode::FAILURE
+            }
+        },
+        Command::Show(stats::ShowCommand::Errors {
+            verbose,
+            include_zero,
+        }) => match stats::run_errors(&cli.socket, *verbose, *include_zero, &mut io::stdout()) {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(error) => {
+                eprintln!("show errors command failed: {error}");
                 ExitCode::FAILURE
             }
         },
@@ -170,6 +183,35 @@ mod tests {
                 assert_eq!(patterns, vec!["a", "b", "c"])
             }
             other => panic!("expected stats list, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parses_show_errors_flags() {
+        let bare = Cli::try_parse_from(["hammerctl", "show", "errors"]).expect("show errors");
+        match bare.cmd {
+            Command::Show(stats::ShowCommand::Errors {
+                verbose,
+                include_zero,
+            }) => {
+                assert!(!verbose);
+                assert!(!include_zero);
+            }
+            other => panic!("expected show errors, got {other:?}"),
+        }
+
+        let verbose =
+            Cli::try_parse_from(["hammerctl", "show", "errors", "--verbose", "--include-zero"])
+                .expect("show errors flags");
+        match verbose.cmd {
+            Command::Show(stats::ShowCommand::Errors {
+                verbose,
+                include_zero,
+            }) => {
+                assert!(verbose);
+                assert!(include_zero);
+            }
+            other => panic!("expected show errors, got {other:?}"),
         }
     }
 

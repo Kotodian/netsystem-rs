@@ -14,7 +14,7 @@ use hammer_runtime::{
     DataPlaneRuntime, Engine, Node, NodeProcessFn, NodeResult, NodeRuntimeData, RuntimeError,
     TraceFormatter, add_packet_trace, format_packet_trace,
 };
-use hammer_service::data_plane::set_index_node_error_code;
+use hammer_service::data_plane::set_index_node_error;
 use hammer_service::opaque::NetworkOpaque;
 
 use crate::UdpIpVersion;
@@ -42,6 +42,7 @@ pub enum UdpInputNext {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u16)]
 pub enum UdpInputError {
     BadLength,
     WrongProtocol,
@@ -51,6 +52,13 @@ pub enum UdpInputError {
     FifoFull,
     FifoNoMemory,
     WrongWorker,
+}
+
+impl hammer_runtime::node::NodeErrorCode for UdpInputError {
+    #[inline(always)]
+    fn local_code(self) -> u16 {
+        self as u16
+    }
 }
 
 impl UdpInputError {
@@ -1028,7 +1036,7 @@ fn resolve_drop_error(
     source_port: Option<u16>,
     destination_port: Option<u16>,
 ) -> RuntimeResult<Option<u16>> {
-    set_index_node_error_code(runtime, index, error.code())?;
+    set_index_node_error(runtime, index, error)?;
     let slot = UdpInputNext::Drop.slot() as u16;
     add_packet_trace!(
         runtime,
@@ -1085,7 +1093,7 @@ fn resolve_unknown_port(
     source_port: u16,
     destination_port: u16,
 ) -> RuntimeResult<Option<u16>> {
-    set_index_node_error_code(runtime, index, UdpInputError::UnknownPort.code())?;
+    set_index_node_error(runtime, index, UdpInputError::UnknownPort)?;
     {
         let mut buffer = runtime.get_buffer_mut(index)?;
         let opaque = unsafe { transmute::<_, &mut IcmpErrorOpaque>(buffer.opaque2_mut()) };

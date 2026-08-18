@@ -37,6 +37,7 @@ pub enum IpInputTarget {
 #[derive(
     Debug, Clone, Copy, PartialEq, Eq, serde::Deserialize, serde::Serialize, thiserror::Error,
 )]
+#[repr(u16)]
 pub enum IpInputError {
     #[error("no IP input error")]
     None,
@@ -56,6 +57,13 @@ pub enum IpInputError {
     TooShort,
     #[error("inconsistent IP packet length")]
     BadLength,
+}
+
+impl hammer_runtime::node::NodeErrorCode for IpInputError {
+    #[inline(always)]
+    fn local_code(self) -> u16 {
+        self as u16
+    }
 }
 
 impl IpInputError {

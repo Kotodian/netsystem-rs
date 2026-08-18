@@ -4,11 +4,11 @@ mod buffer;
 mod memory;
 
 pub use buffer::{
-    BUFFER_CACHE_LINE_SIZE, Buffer, BufferFlags, BufferFrame, BufferNodeError, BufferPacketCursor,
-    BufferPoolArena, BufferRef, BufferRefMut, DEFAULT_BUFFER_FRAME_CAPACITY,
-    DEFAULT_BUFFER_FRAME_POOL_SIZE, DEFAULT_PACKET_HEADROOM, DataPlaneBuffers, Frame,
-    FrameBatchWidth, Index, Next, PRIMARY_OPAQUE_ALIGN, PRIMARY_OPAQUE_BYTES, Pending,
-    PrimaryOpaque, SecondaryOpaque,
+    BUFFER_CACHE_LINE_SIZE, Buffer, BufferFlags, BufferFrame, BufferPacketCursor, BufferPoolArena,
+    BufferRef, BufferRefMut, DEFAULT_BUFFER_FRAME_CAPACITY, DEFAULT_BUFFER_FRAME_POOL_SIZE,
+    DEFAULT_PACKET_HEADROOM, DataPlaneBuffers, Frame, FrameBatchWidth, Index, Next, NodeErrorIndex,
+    NodeErrorIndexError, PRIMARY_OPAQUE_ALIGN, PRIMARY_OPAQUE_BYTES, Pending, PrimaryOpaque,
+    SecondaryOpaque,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, StableAbi)]

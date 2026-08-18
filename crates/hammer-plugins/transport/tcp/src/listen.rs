@@ -138,7 +138,7 @@ fn tcp_listen_index(
         .control()
         .lookup_listener(packet.local)
         .ok_or_else(|| {
-            let _ = runtime.record_current_node_error(TcpNodeError::NoListener.code());
+            let _ = runtime.record_current_node_error(TcpNodeError::NoListener);
             TcpError::NoListener
         })?;
     let (control_segment, established_session) = main.with_worker(runtime, |sessions, tcp| {

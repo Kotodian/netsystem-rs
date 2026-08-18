@@ -1,7 +1,7 @@
 //! The public stats segment API.
 
 use std::alloc::Layout;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use regex::Regex;
@@ -79,33 +79,937 @@ impl std::fmt::Display for EntryId {
     }
 }
 
-/// A live handle to one counter value record.
-///
-/// Owns one reference on the value record; the record's generation is
-/// checked on every operation so a handle outliving `remove_entry` fails
-/// with [`StatsError::StaleEntry`] instead of writing into a reused block.
-pub struct Counter {
-    segment: Segment,
-    value_offset: Offset,
-    /// The entry id captured at add time; a generation mismatch on any
-    /// operation means the entry was removed and its slot possibly reused.
-    id: EntryId,
+/// Borrowed Prometheus metadata used by protocol-neutral registration.
+#[derive(Clone, Copy, Debug)]
+pub struct StatsDescriptor<'a> {
+    /// Fully qualified Prometheus metric name.
+    pub fq_name: &'a str,
+    /// Human-readable metric help text.
+    pub help: &'a str,
+    /// Borrowed const label pairs in registration order.
+    pub const_labels: &'a [(&'a str, &'a str)],
 }
 
-impl Counter {
-    /// Duplicates the handle; both handles update the same value record.
-    pub fn try_clone(&self) -> Result<Counter, StatsError> {
-        self.with_value(MetricValue::try_add_ref)?;
-        Ok(Counter {
-            segment: self.segment.clone(),
-            value_offset: self.value_offset,
-            id: self.id,
+/// One protocol-neutral structural stats registration.
+#[derive(Clone, Copy, Debug)]
+pub struct StatsRegistration<'a> {
+    /// Stats Directory path.
+    pub path: &'a str,
+    /// Prometheus descriptor metadata.
+    pub descriptor: StatsDescriptor<'a>,
+    /// Concrete VPP-compatible value layout.
+    pub value: StatsValueLayout<'a>,
+}
+
+/// Value layouts accepted by [`StatsMain::register`].
+#[derive(Clone, Copy, Debug)]
+pub enum StatsValueLayout<'a> {
+    /// One monotonically increasing integer.
+    Counter,
+    /// One floating-point value.
+    Gauge,
+    /// One timestamp integer.
+    Timestamp,
+    /// Per-row, per-column simple counters.
+    CounterVectorSimple { rows: u32, columns: u32 },
+    /// Per-row, per-column combined counters.
+    CounterVectorCombined { rows: u32, columns: u32 },
+    /// Per-index strings.
+    NameVector { length: u32 },
+    /// Per-row log2 histogram bins.
+    HistogramLog2 { rows: u32 },
+    /// Per-row ring buffers with optional schema bytes.
+    RingBuffer {
+        rows: u32,
+        capacity: u32,
+        entry_size: u32,
+        schema: &'a [u8],
+    },
+}
+
+/// A direct value handle returned by cold-path registration.
+///
+/// Workers match this enum once while installing their owner-local handle;
+/// updates thereafter call the concrete handle directly.
+pub enum StatsEntry {
+    /// Direct scalar counter handle.
+    Counter { id: EntryId, handle: Counter },
+    /// Direct scalar gauge handle.
+    Gauge { id: EntryId, handle: Gauge },
+    /// Direct scalar timestamp handle.
+    Timestamp { id: EntryId, handle: Timestamp },
+    /// Direct row/column simple counter-vector handle.
+    CounterVectorSimple {
+        id: EntryId,
+        handle: CounterVectorSimple,
+    },
+    /// Direct row/column combined packet/byte counter-vector handle.
+    CounterVectorCombined {
+        id: EntryId,
+        handle: CounterVectorCombined,
+    },
+    /// Direct fixed-slot string vector handle.
+    NameVector { id: EntryId, handle: NameVector },
+    /// Direct fixed-bin log2 histogram handle.
+    HistogramLog2 { id: EntryId, handle: HistogramLog2 },
+    /// Direct fixed-size per-row ring-buffer handle.
+    RingBuffer { id: EntryId, handle: RingBuffer },
+}
+
+#[derive(Clone, Copy)]
+enum RegistrationKind<'a> {
+    Value(StatsValueLayout<'a>),
+    Symlink { target: EntryId, vector_index: u32 },
+}
+
+struct TargetRuntimeInfo {
+    id: EntryId,
+    prometheus_type: PrometheusType,
+}
+
+enum RegisteredEntry {
+    Handle(StatsEntry),
+    Symlink(EntryId),
+}
+
+/// Layout marker for [`Counter`].
+#[derive(Clone, Copy, Debug, Default)]
+pub struct CounterLayout;
+
+/// Layout marker for [`Gauge`].
+#[derive(Clone, Copy, Debug, Default)]
+pub struct GaugeLayout;
+
+/// Layout marker for [`Timestamp`].
+#[derive(Clone, Copy, Debug, Default)]
+pub struct TimestampLayout;
+
+/// Mapped layout for a simple counter vector.
+#[derive(Clone, Copy, Debug)]
+pub struct CounterVectorSimpleLayout {
+    data_offset: Offset,
+    row_stride: u64,
+    rows: u32,
+    columns: u32,
+}
+
+/// Mapped layout for a combined packet-and-byte counter vector.
+#[derive(Clone, Copy, Debug)]
+pub struct CounterVectorCombinedLayout {
+    data_offset: Offset,
+    row_stride: u64,
+    rows: u32,
+    columns: u32,
+}
+
+/// Mapped layout for a bounded name vector.
+#[derive(Clone, Copy, Debug)]
+pub struct NameVectorLayout {
+    data_offset: Offset,
+    length: u32,
+}
+
+/// Mapped layout for a log2 histogram.
+#[derive(Clone, Copy, Debug)]
+pub struct HistogramLog2Layout {
+    data_offset: Offset,
+    row_stride: u64,
+    rows: u32,
+}
+
+/// Mapped layout for a fixed-size ring buffer.
+#[derive(Clone, Copy, Debug)]
+pub struct RingBufferLayout {
+    data_offset: Offset,
+    metadata_offset: Offset,
+    schema_offset: Option<Offset>,
+    schema_size: usize,
+    slot_stride: u64,
+    rows: u32,
+    capacity: u32,
+    entry_size: u32,
+}
+
+struct LayoutBlock<L> {
+    allocation: SegmentAllocation,
+    value_offset: Offset,
+    layout: L,
+}
+
+trait MetricLayout: Copy + 'static {
+    const DIRECTORY_TYPE: DirectoryType;
+    const PROMETHEUS_TYPE: PrometheusType;
+
+    fn allocate<'a>(
+        segment: &Segment,
+        descriptor: &crate::descriptor::NormalizedDescriptor,
+        generation: u64,
+        value: StatsValueLayout<'a>,
+    ) -> Result<LayoutBlock<Self>, StatsError>;
+
+    fn register<'a>(
+        segment: &Segment,
+        path: &str,
+        id: EntryId,
+        descriptor: &crate::descriptor::NormalizedDescriptor,
+        value: StatsValueLayout<'a>,
+    ) -> Result<(DirectorySlot, RegisteredEntry, SegmentAllocation), StatsError> {
+        let block = Self::allocate(segment, descriptor, id.generation, value)?;
+        let block_offset = block_offset(&block.allocation, 0)?;
+        let entry = DirectorySlot::new_active(
+            encode_name(path)?,
+            id.generation,
+            Self::DIRECTORY_TYPE,
+            Self::PROMETHEUS_TYPE,
+            block_offset,
+            block.value_offset,
+        );
+        let registered =
+            RegisteredEntry::Handle(Self::registered(segment.clone(), id, block.layout));
+        Ok((entry, registered, block.allocation))
+    }
+
+    fn decode(mapping: &Mapping, slot: &DirectorySlot) -> Result<Self, StatsError>;
+
+    fn dump(
+        &self,
+        mapping: &Mapping,
+        id: EntryId,
+        slot: &DirectorySlot,
+        vector_index: Option<u32>,
+    ) -> Result<DumpValue, StatsError>;
+
+    fn registered(segment: Segment, id: EntryId, layout: Self) -> StatsEntry;
+}
+
+/// Shared validation core for every public stats handle.
+///
+/// `L` contains only operation-specific offsets and dimensions. The handle
+/// keeps the segment mapping and directory identity; the current value offset
+/// is read from the published directory slot after generation validation.
+/// Dispatch remains static after monomorphization.
+#[derive(Clone)]
+pub struct MetricHandle<L> {
+    segment: Segment,
+    id: EntryId,
+    layout: L,
+}
+
+/// Counter handle alias retained for the public API.
+pub type Counter = MetricHandle<CounterLayout>;
+/// Gauge handle alias retained for the public API.
+pub type Gauge = MetricHandle<GaugeLayout>;
+/// Timestamp handle alias retained for the public API.
+pub type Timestamp = MetricHandle<TimestampLayout>;
+/// Simple counter-vector handle alias retained for the public API.
+pub type CounterVectorSimple = MetricHandle<CounterVectorSimpleLayout>;
+/// Combined counter-vector handle alias retained for the public API.
+pub type CounterVectorCombined = MetricHandle<CounterVectorCombinedLayout>;
+/// Name-vector handle alias retained for the public API.
+pub type NameVector = MetricHandle<NameVectorLayout>;
+/// Log2 histogram handle alias retained for the public API.
+pub type HistogramLog2 = MetricHandle<HistogramLog2Layout>;
+/// Ring-buffer handle alias retained for the public API.
+pub type RingBuffer = MetricHandle<RingBufferLayout>;
+
+impl<L> MetricHandle<L> {
+    fn new(segment: Segment, id: EntryId, layout: L) -> Self {
+        Self {
+            segment,
+            id,
+            layout,
+        }
+    }
+
+    /// Runs an operation after validating the current directory slot.
+    ///
+    /// The slot index is stable across directory relocation. Looking up the
+    /// current slot before reading the value also lets a stale handle report a
+    /// typed error after its old metric block has been retired.
+    fn with_mapping_value<T>(
+        &self,
+        op: impl FnOnce(&Mapping, &MetricValue) -> Result<T, StatsError>,
+    ) -> Result<T, StatsError> {
+        let mapping = Mapping::new(&self.segment);
+        let header = mapping.header();
+        if u64::from(self.id.index) >= header.initialized_len() {
+            return Err(StatsError::NotFound { id: self.id });
+        }
+        let slot = mapping.entry(header.directory_offset(), self.id.index)?;
+        match slot.state()? {
+            EntryState::Active => {}
+            EntryState::Free | EntryState::Removed => {
+                return Err(StatsError::NotFound { id: self.id });
+            }
+        }
+        if slot.generation() != self.id.generation {
+            return Err(StatsError::StaleEntry { id: self.id });
+        }
+        let value = mapping.metric_value(slot.value_offset())?;
+        if value.generation() != self.id.generation {
+            return Err(StatsError::StaleEntry { id: self.id });
+        }
+        op(&mapping, value)
+    }
+}
+
+fn block_offset(allocation: &SegmentAllocation, relative: u64) -> Result<Offset, StatsError> {
+    Offset::new(allocation.offset())
+        .checked_add(relative)
+        .ok_or(StatsError::OutOfBounds)
+}
+
+fn relative_offset(base: Offset, relative: usize) -> Result<Offset, StatsError> {
+    base.checked_add(u64::try_from(relative).map_err(|_| StatsError::OutOfBounds)?)
+        .ok_or(StatsError::OutOfBounds)
+}
+
+trait ScalarMetricLayout: Copy + Default + 'static {
+    const DIRECTORY_TYPE: DirectoryType;
+    const PROMETHEUS_TYPE: PrometheusType;
+
+    fn accepts(value: StatsValueLayout<'_>) -> bool;
+    fn dump_value(value: u64) -> DumpValue;
+    fn registered(segment: Segment, id: EntryId, layout: Self) -> StatsEntry;
+}
+
+impl<L: ScalarMetricLayout> MetricLayout for L {
+    const DIRECTORY_TYPE: DirectoryType = L::DIRECTORY_TYPE;
+    const PROMETHEUS_TYPE: PrometheusType = L::PROMETHEUS_TYPE;
+
+    fn allocate<'a>(
+        segment: &Segment,
+        descriptor: &crate::descriptor::NormalizedDescriptor,
+        generation: u64,
+        value: StatsValueLayout<'a>,
+    ) -> Result<LayoutBlock<Self>, StatsError> {
+        if !L::accepts(value) {
+            return Err(StatsError::UnsupportedLayout);
+        }
+        let layout = crate::descriptor::block_layout(descriptor)?;
+        let mut allocation = segment.allocate(layout)?;
+        let value_offset =
+            crate::descriptor::write_block(&mut allocation.bytes_mut(), descriptor, generation)?;
+        Ok(LayoutBlock {
+            value_offset: block_offset(&allocation, value_offset)?,
+            allocation,
+            layout: L::default(),
         })
     }
 
+    fn decode(mapping: &Mapping, slot: &DirectorySlot) -> Result<Self, StatsError> {
+        mapping.metric_value(slot.value_offset())?;
+        Ok(L::default())
+    }
+
+    fn dump(
+        &self,
+        mapping: &Mapping,
+        _id: EntryId,
+        slot: &DirectorySlot,
+        _vector_index: Option<u32>,
+    ) -> Result<DumpValue, StatsError> {
+        Ok(L::dump_value(
+            mapping.metric_value(slot.value_offset())?.load_value(),
+        ))
+    }
+
+    fn registered(segment: Segment, id: EntryId, layout: Self) -> StatsEntry {
+        L::registered(segment, id, layout)
+    }
+}
+
+impl ScalarMetricLayout for CounterLayout {
+    const DIRECTORY_TYPE: DirectoryType = DirectoryType::ScalarIndex;
+    const PROMETHEUS_TYPE: PrometheusType = PrometheusType::Counter;
+
+    fn accepts(value: StatsValueLayout<'_>) -> bool {
+        matches!(value, StatsValueLayout::Counter)
+    }
+
+    fn dump_value(value: u64) -> DumpValue {
+        DumpValue::Counter(value)
+    }
+
+    fn registered(segment: Segment, id: EntryId, layout: Self) -> StatsEntry {
+        StatsEntry::Counter {
+            id,
+            handle: MetricHandle::new(segment, id, layout),
+        }
+    }
+}
+
+impl ScalarMetricLayout for GaugeLayout {
+    const DIRECTORY_TYPE: DirectoryType = DirectoryType::Gauge;
+    const PROMETHEUS_TYPE: PrometheusType = PrometheusType::Gauge;
+
+    fn accepts(value: StatsValueLayout<'_>) -> bool {
+        matches!(value, StatsValueLayout::Gauge)
+    }
+
+    fn dump_value(value: u64) -> DumpValue {
+        DumpValue::Gauge(f64::from_bits(value))
+    }
+
+    fn registered(segment: Segment, id: EntryId, layout: Self) -> StatsEntry {
+        StatsEntry::Gauge {
+            id,
+            handle: MetricHandle::new(segment, id, layout),
+        }
+    }
+}
+
+impl ScalarMetricLayout for TimestampLayout {
+    const DIRECTORY_TYPE: DirectoryType = DirectoryType::ScalarIndex;
+    const PROMETHEUS_TYPE: PrometheusType = PrometheusType::Gauge;
+
+    fn accepts(value: StatsValueLayout<'_>) -> bool {
+        matches!(value, StatsValueLayout::Timestamp)
+    }
+
+    fn dump_value(value: u64) -> DumpValue {
+        DumpValue::Gauge(value as f64)
+    }
+
+    fn registered(segment: Segment, id: EntryId, layout: Self) -> StatsEntry {
+        StatsEntry::Timestamp {
+            id,
+            handle: MetricHandle::new(segment, id, layout),
+        }
+    }
+}
+
+impl MetricLayout for CounterVectorSimpleLayout {
+    const DIRECTORY_TYPE: DirectoryType = DirectoryType::CounterVectorSimple;
+    const PROMETHEUS_TYPE: PrometheusType = PrometheusType::Counter;
+
+    fn allocate<'a>(
+        segment: &Segment,
+        descriptor: &crate::descriptor::NormalizedDescriptor,
+        generation: u64,
+        value: StatsValueLayout<'a>,
+    ) -> Result<LayoutBlock<Self>, StatsError> {
+        let StatsValueLayout::CounterVectorSimple { rows, columns } = value else {
+            return Err(StatsError::UnsupportedLayout);
+        };
+        let layout =
+            crate::descriptor::counter_vector_simple_block_layout(descriptor, rows, columns)?;
+        let mut allocation = segment.allocate(layout)?;
+        let (value_offset, data_offset) = crate::descriptor::write_counter_vector_simple_block(
+            &mut allocation.bytes_mut(),
+            descriptor,
+            generation,
+            rows,
+            columns,
+        )?;
+        let row_stride = u64::try_from(crate::descriptor::counter_vector_row_stride(
+            columns,
+            std::mem::size_of::<AtomicU64>(),
+        )?)
+        .map_err(|_| StatsError::OutOfBounds)?;
+        Ok(LayoutBlock {
+            value_offset: block_offset(&allocation, value_offset)?,
+            layout: Self {
+                data_offset: block_offset(&allocation, data_offset)?,
+                row_stride,
+                rows,
+                columns,
+            },
+            allocation,
+        })
+    }
+
+    fn decode(mapping: &Mapping, slot: &DirectorySlot) -> Result<Self, StatsError> {
+        let block = mapping.descriptor_block(slot.descriptor_offset())?;
+        let layout = crate::descriptor::decode_counter_vector_simple_layout(block)?;
+        Ok(Self {
+            data_offset: relative_offset(slot.descriptor_offset(), layout.data_offset)?,
+            row_stride: u64::try_from(layout.row_stride).map_err(|_| StatsError::OutOfBounds)?,
+            rows: layout.rows,
+            columns: layout.columns,
+        })
+    }
+
+    fn dump(
+        &self,
+        mapping: &Mapping,
+        id: EntryId,
+        _slot: &DirectorySlot,
+        vector_index: Option<u32>,
+    ) -> Result<DumpValue, StatsError> {
+        let selected = vector_index.unwrap_or(0);
+        if self.rows != 0 && selected >= self.columns {
+            return Err(StatsError::IncompatibleType {
+                id,
+                prometheus_type: Self::PROMETHEUS_TYPE,
+                directory_type: Self::DIRECTORY_TYPE,
+            });
+        }
+        let columns = vector_index.map_or(self.columns, |_| 1);
+        let mut rows = Vec::with_capacity(self.rows as usize);
+        for row in 0..self.rows {
+            let mut values = Vec::with_capacity(columns as usize);
+            for column in 0..columns {
+                let actual = vector_index.map_or(column, |_| selected);
+                let offset = self
+                    .data_offset
+                    .get()
+                    .checked_add(
+                        u64::from(row)
+                            .checked_mul(self.row_stride)
+                            .and_then(|base| {
+                                u64::from(actual)
+                                    .checked_mul(std::mem::size_of::<AtomicU64>() as u64)
+                                    .and_then(|column_offset| base.checked_add(column_offset))
+                            })
+                            .ok_or(StatsError::OutOfBounds)?,
+                    )
+                    .ok_or(StatsError::OutOfBounds)?;
+                values.push(
+                    mapping
+                        .atomic_u64(Offset::new(offset))?
+                        .load(Ordering::Relaxed),
+                );
+            }
+            rows.push(values);
+        }
+        Ok(DumpValue::CounterVectorSimple(rows))
+    }
+
+    fn registered(segment: Segment, id: EntryId, layout: Self) -> StatsEntry {
+        StatsEntry::CounterVectorSimple {
+            id,
+            handle: MetricHandle::new(segment, id, layout),
+        }
+    }
+}
+
+impl MetricLayout for CounterVectorCombinedLayout {
+    const DIRECTORY_TYPE: DirectoryType = DirectoryType::CounterVectorCombined;
+    const PROMETHEUS_TYPE: PrometheusType = PrometheusType::Counter;
+
+    fn allocate<'a>(
+        segment: &Segment,
+        descriptor: &crate::descriptor::NormalizedDescriptor,
+        generation: u64,
+        value: StatsValueLayout<'a>,
+    ) -> Result<LayoutBlock<Self>, StatsError> {
+        let StatsValueLayout::CounterVectorCombined { rows, columns } = value else {
+            return Err(StatsError::UnsupportedLayout);
+        };
+        let layout =
+            crate::descriptor::counter_vector_combined_block_layout(descriptor, rows, columns)?;
+        let mut allocation = segment.allocate(layout)?;
+        let (value_offset, data_offset) = crate::descriptor::write_counter_vector_combined_block(
+            &mut allocation.bytes_mut(),
+            descriptor,
+            generation,
+            rows,
+            columns,
+        )?;
+        let row_stride = u64::try_from(crate::descriptor::counter_vector_row_stride(
+            columns,
+            2 * std::mem::size_of::<AtomicU64>(),
+        )?)
+        .map_err(|_| StatsError::OutOfBounds)?;
+        Ok(LayoutBlock {
+            value_offset: block_offset(&allocation, value_offset)?,
+            layout: Self {
+                data_offset: block_offset(&allocation, data_offset)?,
+                row_stride,
+                rows,
+                columns,
+            },
+            allocation,
+        })
+    }
+
+    fn decode(mapping: &Mapping, slot: &DirectorySlot) -> Result<Self, StatsError> {
+        let block = mapping.descriptor_block(slot.descriptor_offset())?;
+        let layout = crate::descriptor::decode_counter_vector_combined_layout(block)?;
+        Ok(Self {
+            data_offset: relative_offset(slot.descriptor_offset(), layout.data_offset)?,
+            row_stride: u64::try_from(layout.row_stride).map_err(|_| StatsError::OutOfBounds)?,
+            rows: layout.rows,
+            columns: layout.columns,
+        })
+    }
+
+    fn dump(
+        &self,
+        mapping: &Mapping,
+        id: EntryId,
+        _slot: &DirectorySlot,
+        vector_index: Option<u32>,
+    ) -> Result<DumpValue, StatsError> {
+        let selected = vector_index.unwrap_or(0);
+        if selected >= self.columns {
+            return Err(StatsError::IncompatibleType {
+                id,
+                prometheus_type: Self::PROMETHEUS_TYPE,
+                directory_type: Self::DIRECTORY_TYPE,
+            });
+        }
+        let columns = vector_index.map_or(self.columns, |_| 1);
+        let mut rows = Vec::with_capacity(self.rows as usize);
+        for row in 0..self.rows {
+            let mut values = Vec::with_capacity(columns as usize);
+            for column in 0..columns {
+                let actual = vector_index.map_or(column, |_| selected);
+                let offset = self
+                    .data_offset
+                    .get()
+                    .checked_add(
+                        u64::from(row)
+                            .checked_mul(self.row_stride)
+                            .and_then(|base| {
+                                u64::from(actual)
+                                    .checked_mul(2 * std::mem::size_of::<AtomicU64>() as u64)
+                                    .and_then(|column_offset| base.checked_add(column_offset))
+                            })
+                            .ok_or(StatsError::OutOfBounds)?,
+                    )
+                    .ok_or(StatsError::OutOfBounds)?;
+                let packets = mapping
+                    .atomic_u64(Offset::new(offset))?
+                    .load(Ordering::Relaxed);
+                let bytes = mapping
+                    .atomic_u64(Offset::new(
+                        offset
+                            .checked_add(std::mem::size_of::<AtomicU64>() as u64)
+                            .ok_or(StatsError::OutOfBounds)?,
+                    ))?
+                    .load(Ordering::Relaxed);
+                values.push((packets, bytes));
+            }
+            rows.push(values);
+        }
+        Ok(DumpValue::CounterVectorCombined(rows))
+    }
+
+    fn registered(segment: Segment, id: EntryId, layout: Self) -> StatsEntry {
+        StatsEntry::CounterVectorCombined {
+            id,
+            handle: MetricHandle::new(segment, id, layout),
+        }
+    }
+}
+
+impl MetricLayout for NameVectorLayout {
+    const DIRECTORY_TYPE: DirectoryType = DirectoryType::NameVector;
+    const PROMETHEUS_TYPE: PrometheusType = PrometheusType::Gauge;
+
+    fn allocate<'a>(
+        segment: &Segment,
+        descriptor: &crate::descriptor::NormalizedDescriptor,
+        generation: u64,
+        value: StatsValueLayout<'a>,
+    ) -> Result<LayoutBlock<Self>, StatsError> {
+        let StatsValueLayout::NameVector { length } = value else {
+            return Err(StatsError::UnsupportedLayout);
+        };
+        let layout = crate::descriptor::name_vector_block_layout(descriptor, length)?;
+        let mut allocation = segment.allocate(layout)?;
+        let (value_offset, data_offset) = crate::descriptor::write_name_vector_block(
+            &mut allocation.bytes_mut(),
+            descriptor,
+            generation,
+            length,
+        )?;
+        Ok(LayoutBlock {
+            value_offset: block_offset(&allocation, value_offset)?,
+            layout: Self {
+                data_offset: block_offset(&allocation, data_offset)?,
+                length,
+            },
+            allocation,
+        })
+    }
+
+    fn decode(mapping: &Mapping, slot: &DirectorySlot) -> Result<Self, StatsError> {
+        let block = mapping.descriptor_block(slot.descriptor_offset())?;
+        let layout = crate::descriptor::decode_name_vector_layout(block)?;
+        Ok(Self {
+            data_offset: relative_offset(slot.descriptor_offset(), layout.data_offset)?,
+            length: layout.length,
+        })
+    }
+
+    fn dump(
+        &self,
+        mapping: &Mapping,
+        _id: EntryId,
+        _slot: &DirectorySlot,
+        _vector_index: Option<u32>,
+    ) -> Result<DumpValue, StatsError> {
+        let mut names = Vec::with_capacity(self.length as usize);
+        for index in 0..self.length {
+            names.push(read_name_slot_at(
+                mapping,
+                self.data_offset,
+                self.length,
+                index,
+            )?);
+        }
+        Ok(DumpValue::NameVector(names))
+    }
+
+    fn registered(segment: Segment, id: EntryId, layout: Self) -> StatsEntry {
+        StatsEntry::NameVector {
+            id,
+            handle: MetricHandle::new(segment, id, layout),
+        }
+    }
+}
+
+impl MetricLayout for HistogramLog2Layout {
+    const DIRECTORY_TYPE: DirectoryType = DirectoryType::HistogramLog2;
+    const PROMETHEUS_TYPE: PrometheusType = PrometheusType::Counter;
+
+    fn allocate<'a>(
+        segment: &Segment,
+        descriptor: &crate::descriptor::NormalizedDescriptor,
+        generation: u64,
+        value: StatsValueLayout<'a>,
+    ) -> Result<LayoutBlock<Self>, StatsError> {
+        let StatsValueLayout::HistogramLog2 { rows } = value else {
+            return Err(StatsError::UnsupportedLayout);
+        };
+        let layout = crate::descriptor::histogram_log2_block_layout(descriptor, rows)?;
+        let mut allocation = segment.allocate(layout)?;
+        let (value_offset, data_offset) = crate::descriptor::write_histogram_log2_block(
+            &mut allocation.bytes_mut(),
+            descriptor,
+            generation,
+            rows,
+        )?;
+        let row_stride = u64::try_from(crate::descriptor::counter_vector_row_stride(
+            crate::descriptor::HISTOGRAM_BIN_COUNT,
+            std::mem::size_of::<AtomicU64>(),
+        )?)
+        .map_err(|_| StatsError::OutOfBounds)?;
+        Ok(LayoutBlock {
+            value_offset: block_offset(&allocation, value_offset)?,
+            layout: Self {
+                data_offset: block_offset(&allocation, data_offset)?,
+                row_stride,
+                rows,
+            },
+            allocation,
+        })
+    }
+
+    fn decode(mapping: &Mapping, slot: &DirectorySlot) -> Result<Self, StatsError> {
+        let block = mapping.descriptor_block(slot.descriptor_offset())?;
+        let layout = crate::descriptor::decode_histogram_log2_layout(block)?;
+        Ok(Self {
+            data_offset: relative_offset(slot.descriptor_offset(), layout.data_offset)?,
+            row_stride: u64::try_from(layout.row_stride).map_err(|_| StatsError::OutOfBounds)?,
+            rows: layout.rows,
+        })
+    }
+
+    fn dump(
+        &self,
+        mapping: &Mapping,
+        _id: EntryId,
+        _slot: &DirectorySlot,
+        _vector_index: Option<u32>,
+    ) -> Result<DumpValue, StatsError> {
+        let mut rows = Vec::with_capacity(self.rows as usize);
+        for row in 0..self.rows {
+            let mut bins = Vec::with_capacity(crate::descriptor::HISTOGRAM_BIN_COUNT as usize);
+            for bin in 0..crate::descriptor::HISTOGRAM_BIN_COUNT {
+                let offset = self
+                    .data_offset
+                    .get()
+                    .checked_add(
+                        u64::from(row)
+                            .checked_mul(self.row_stride)
+                            .and_then(|base| {
+                                base.checked_add(
+                                    u64::from(bin) * std::mem::size_of::<AtomicU64>() as u64,
+                                )
+                            })
+                            .ok_or(StatsError::OutOfBounds)?,
+                    )
+                    .ok_or(StatsError::OutOfBounds)?;
+                bins.push(
+                    mapping
+                        .atomic_u64(Offset::new(offset))?
+                        .load(Ordering::Relaxed),
+                );
+            }
+            rows.push(bins);
+        }
+        Ok(DumpValue::HistogramLog2(rows))
+    }
+
+    fn registered(segment: Segment, id: EntryId, layout: Self) -> StatsEntry {
+        StatsEntry::HistogramLog2 {
+            id,
+            handle: MetricHandle::new(segment, id, layout),
+        }
+    }
+}
+
+impl MetricLayout for RingBufferLayout {
+    const DIRECTORY_TYPE: DirectoryType = DirectoryType::RingBuffer;
+    const PROMETHEUS_TYPE: PrometheusType = PrometheusType::Counter;
+
+    fn allocate<'a>(
+        segment: &Segment,
+        descriptor: &crate::descriptor::NormalizedDescriptor,
+        generation: u64,
+        value: StatsValueLayout<'a>,
+    ) -> Result<LayoutBlock<Self>, StatsError> {
+        let StatsValueLayout::RingBuffer {
+            rows,
+            capacity,
+            entry_size,
+            schema,
+        } = value
+        else {
+            return Err(StatsError::UnsupportedLayout);
+        };
+        let layout = crate::descriptor::ring_buffer_block_layout(
+            descriptor,
+            rows,
+            capacity,
+            entry_size,
+            schema.len(),
+        )?;
+        let mut allocation = segment.allocate(layout)?;
+        let (value_offset, data_offset, metadata_offset, schema_offset, slot_stride) =
+            crate::descriptor::write_ring_buffer_block(
+                &mut allocation.bytes_mut(),
+                descriptor,
+                generation,
+                rows,
+                capacity,
+                entry_size,
+                schema,
+            )?;
+        Ok(LayoutBlock {
+            value_offset: block_offset(&allocation, value_offset)?,
+            layout: Self {
+                data_offset: block_offset(&allocation, data_offset)?,
+                metadata_offset: block_offset(&allocation, metadata_offset)?,
+                schema_offset: schema_offset
+                    .map(|offset| block_offset(&allocation, offset))
+                    .transpose()?,
+                schema_size: schema.len(),
+                slot_stride,
+                rows,
+                capacity,
+                entry_size,
+            },
+            allocation,
+        })
+    }
+
+    fn decode(mapping: &Mapping, slot: &DirectorySlot) -> Result<Self, StatsError> {
+        let block = mapping.descriptor_block(slot.descriptor_offset())?;
+        let layout = crate::descriptor::decode_ring_buffer_layout(block)?;
+        Ok(Self {
+            data_offset: relative_offset(slot.descriptor_offset(), layout.data_offset)?,
+            metadata_offset: relative_offset(slot.descriptor_offset(), layout.metadata_offset)?,
+            schema_offset: layout
+                .schema_offset
+                .map(|offset| relative_offset(slot.descriptor_offset(), offset))
+                .transpose()?,
+            schema_size: layout.schema_size,
+            slot_stride: u64::try_from(layout.slot_stride).map_err(|_| StatsError::OutOfBounds)?,
+            rows: layout.rows,
+            capacity: layout.capacity,
+            entry_size: layout.entry_size,
+        })
+    }
+
+    fn dump(
+        &self,
+        mapping: &Mapping,
+        _id: EntryId,
+        _slot: &DirectorySlot,
+        _vector_index: Option<u32>,
+    ) -> Result<DumpValue, StatsError> {
+        let mut snapshots = Vec::with_capacity(self.rows as usize);
+        for row in 0..self.rows {
+            let metadata = self
+                .metadata_offset
+                .checked_add(
+                    u64::from(row)
+                        .checked_mul(crate::descriptor::RING_METADATA_BYTES as u64)
+                        .ok_or(StatsError::OutOfBounds)?,
+                )
+                .ok_or(StatsError::OutOfBounds)?;
+            let sequence_cell = mapping.atomic_u64(Offset::new(
+                metadata
+                    .get()
+                    .checked_add(8)
+                    .ok_or(StatsError::OutOfBounds)?,
+            ))?;
+            let publication_cell = mapping.atomic_u64(Offset::new(
+                metadata
+                    .get()
+                    .checked_add(24)
+                    .ok_or(StatsError::OutOfBounds)?,
+            ))?;
+            let snapshot = {
+                let mut snapshot = None;
+                for _ in 0..MAX_READ_ATTEMPTS {
+                    let publication = publication_cell.load(Ordering::Acquire);
+                    if publication & 1 != 0 {
+                        std::hint::spin_loop();
+                        continue;
+                    }
+                    let sequence = sequence_cell.load(Ordering::Acquire);
+                    let mut entries = Vec::with_capacity(self.capacity as usize);
+                    for slot_index in 0..self.capacity {
+                        let offset = ring_slot_offset(
+                            self.data_offset,
+                            self.slot_stride,
+                            self.rows,
+                            self.capacity,
+                            row,
+                            slot_index,
+                        )?;
+                        entries.push(read_ring_slot_bytes(
+                            mapping,
+                            offset,
+                            self.entry_size as usize,
+                        )?);
+                    }
+                    let after_publication = publication_cell.load(Ordering::Acquire);
+                    let after_sequence = sequence_cell.load(Ordering::Acquire);
+                    if publication == after_publication
+                        && after_publication & 1 == 0
+                        && sequence == after_sequence
+                    {
+                        snapshot = Some(crate::read::RingBufferSnapshot { sequence, entries });
+                        break;
+                    }
+                    std::hint::spin_loop();
+                }
+                snapshot.ok_or(StatsError::ReadBusy)?
+            };
+            snapshots.push(snapshot);
+        }
+        Ok(DumpValue::RingBuffer(snapshots))
+    }
+
+    fn registered(segment: Segment, id: EntryId, layout: Self) -> StatsEntry {
+        StatsEntry::RingBuffer {
+            id,
+            handle: MetricHandle::new(segment, id, layout),
+        }
+    }
+}
+
+impl MetricHandle<CounterLayout> {
     /// Increments the value by one.
     pub fn increment(&self) -> Result<(), StatsError> {
-        self.with_value(|value| {
+        self.with_mapping_value(|_, value| {
             value.add_value(1);
             Ok(())
         })
@@ -113,7 +1017,7 @@ impl Counter {
 
     /// Increments the value by `delta`.
     pub fn increment_by(&self, delta: u64) -> Result<(), StatsError> {
-        self.with_value(|value| {
+        self.with_mapping_value(|_, value| {
             value.add_value(delta);
             Ok(())
         })
@@ -121,59 +1025,14 @@ impl Counter {
 
     /// Reads the current value.
     pub fn get(&self) -> Result<u64, StatsError> {
-        self.with_value(|value| Ok(value.load_value()))
-    }
-
-    /// Runs `op` on the value record after a generation check that rejects
-    /// stale handles. The record outlives directory relocation, so handles
-    /// are never invalidated by directory growth. `op` is inlined; there is
-    /// no dynamic dispatch.
-    fn with_value<T>(
-        &self,
-        op: impl FnOnce(&MetricValue) -> Result<T, StatsError>,
-    ) -> Result<T, StatsError> {
-        let mapping = Mapping::new(&self.segment);
-        let value = mapping.metric_value(self.value_offset)?;
-        if value.generation() != self.id.generation {
-            return Err(StatsError::StaleEntry { id: self.id });
-        }
-        op(value)
+        self.with_mapping_value(|_, value| Ok(value.load_value()))
     }
 }
 
-impl Drop for Counter {
-    fn drop(&mut self) {
-        if let Ok(value) = Mapping::new(&self.segment).metric_value(self.value_offset) {
-            value.release_ref();
-        }
-    }
-}
-
-/// A live handle to one gauge value record.
-///
-/// Same lifetime and staleness rules as [`Counter`]; the value is stored as
-/// its IEEE-754 bit pattern.
-pub struct Gauge {
-    segment: Segment,
-    value_offset: Offset,
-    /// The entry id captured at add time; see [`Counter`].
-    id: EntryId,
-}
-
-impl Gauge {
-    /// Duplicates the handle; both handles update the same value record.
-    pub fn try_clone(&self) -> Result<Gauge, StatsError> {
-        self.with_value(MetricValue::try_add_ref)?;
-        Ok(Gauge {
-            segment: self.segment.clone(),
-            value_offset: self.value_offset,
-            id: self.id,
-        })
-    }
-
+impl MetricHandle<GaugeLayout> {
     /// Sets the value.
     pub fn set(&self, value: f64) -> Result<(), StatsError> {
-        self.with_value(|record| {
+        self.with_mapping_value(|_, record| {
             record.store_value(value.to_bits());
             Ok(())
         })
@@ -181,59 +1040,14 @@ impl Gauge {
 
     /// Reads the current value.
     pub fn get(&self) -> Result<f64, StatsError> {
-        self.with_value(|record| Ok(f64::from_bits(record.load_value())))
-    }
-
-    /// Runs `op` on the value record after a generation check; see
-    /// [`Counter::with_value`].
-    fn with_value<T>(
-        &self,
-        op: impl FnOnce(&MetricValue) -> Result<T, StatsError>,
-    ) -> Result<T, StatsError> {
-        let mapping = Mapping::new(&self.segment);
-        let value = mapping.metric_value(self.value_offset)?;
-        if value.generation() != self.id.generation {
-            return Err(StatsError::StaleEntry { id: self.id });
-        }
-        op(value)
+        self.with_mapping_value(|_, record| Ok(f64::from_bits(record.load_value())))
     }
 }
 
-impl Drop for Gauge {
-    fn drop(&mut self) {
-        if let Ok(value) = Mapping::new(&self.segment).metric_value(self.value_offset) {
-            value.release_ref();
-        }
-    }
-}
-
-/// A live handle to one timestamp value record.
-///
-/// VPP exposes its `/sys` boot time, heartbeat, and last-stats-clear as
-/// scalar entries (stats.h:29-31); Hammer models such a scalar metric as a
-/// Prometheus gauge whose value is a plain integer, recorded as
-/// [`PrometheusType::Gauge`] with [`DirectoryType::ScalarIndex`].
-pub struct Timestamp {
-    segment: Segment,
-    value_offset: Offset,
-    /// The entry id captured at add time; see [`Counter`].
-    id: EntryId,
-}
-
-impl Timestamp {
-    /// Duplicates the handle; both handles update the same value record.
-    pub fn try_clone(&self) -> Result<Timestamp, StatsError> {
-        self.with_value(MetricValue::try_add_ref)?;
-        Ok(Timestamp {
-            segment: self.segment.clone(),
-            value_offset: self.value_offset,
-            id: self.id,
-        })
-    }
-
+impl MetricHandle<TimestampLayout> {
     /// Sets the value (e.g. a `SystemTime` epoch second).
     pub fn set(&self, value: u64) -> Result<(), StatsError> {
-        self.with_value(|record| {
+        self.with_mapping_value(|_, record| {
             record.store_value(value);
             Ok(())
         })
@@ -241,29 +1055,543 @@ impl Timestamp {
 
     /// Reads the current value.
     pub fn get(&self) -> Result<u64, StatsError> {
-        self.with_value(|record| Ok(record.load_value()))
-    }
-
-    /// Runs `op` on the value record after a generation check; see
-    /// [`Counter::with_value`].
-    fn with_value<T>(
-        &self,
-        op: impl FnOnce(&MetricValue) -> Result<T, StatsError>,
-    ) -> Result<T, StatsError> {
-        let mapping = Mapping::new(&self.segment);
-        let value = mapping.metric_value(self.value_offset)?;
-        if value.generation() != self.id.generation {
-            return Err(StatsError::StaleEntry { id: self.id });
-        }
-        op(value)
+        self.with_mapping_value(|_, record| Ok(record.load_value()))
     }
 }
 
-impl Drop for Timestamp {
-    fn drop(&mut self) {
-        if let Ok(value) = Mapping::new(&self.segment).metric_value(self.value_offset) {
-            value.release_ref();
+/// A direct handle to a fixed-size row/column simple counter vector.
+///
+/// Updates perform one generation check and one atomic cell operation. They do
+/// not look up the directory, allocate, resize, or acquire a lock.
+impl MetricHandle<CounterVectorSimpleLayout> {
+    /// Number of rows allocated for this vector.
+    pub const fn rows(&self) -> u32 {
+        self.layout.rows
+    }
+
+    /// Number of columns allocated for this vector.
+    pub const fn columns(&self) -> u32 {
+        self.layout.columns
+    }
+
+    /// Increments one row/column cell by one.
+    pub fn increment(&self, row: u32, column: u32) -> Result<(), StatsError> {
+        self.increment_by(row, column, 1)
+    }
+
+    /// Increments one row/column cell by `delta`.
+    pub fn increment_by(&self, row: u32, column: u32, delta: u64) -> Result<(), StatsError> {
+        self.with_cell(row, column, |cell| {
+            cell.fetch_add(delta, Ordering::Relaxed);
+            Ok(())
+        })
+    }
+
+    /// Reads one row/column cell.
+    pub fn get(&self, row: u32, column: u32) -> Result<u64, StatsError> {
+        self.with_cell(row, column, |cell| Ok(cell.load(Ordering::Relaxed)))
+    }
+
+    fn with_cell<T>(
+        &self,
+        row: u32,
+        column: u32,
+        op: impl FnOnce(&AtomicU64) -> Result<T, StatsError>,
+    ) -> Result<T, StatsError> {
+        if row >= self.layout.rows || column >= self.layout.columns {
+            return Err(StatsError::OutOfBounds);
         }
+        let row_offset = u64::from(row)
+            .checked_mul(self.layout.row_stride)
+            .ok_or(StatsError::OutOfBounds)?;
+        let cell_offset = row_offset
+            .checked_add(
+                u64::from(column)
+                    .checked_mul(std::mem::size_of::<AtomicU64>() as u64)
+                    .ok_or(StatsError::OutOfBounds)?,
+            )
+            .and_then(|relative| self.layout.data_offset.get().checked_add(relative))
+            .ok_or(StatsError::OutOfBounds)?;
+        self.with_mapping_value(|mapping, _| op(mapping.atomic_u64(Offset::new(cell_offset))?))
+    }
+}
+
+/// A direct handle to a fixed-size row/column packet-and-byte counter vector.
+///
+/// Each cell contains two independent relaxed atomics, matching VPP's
+/// `vlib_counter_t { packets, bytes }`; a row starts on its own 64-byte
+/// boundary to preserve worker ownership and cache separation.
+impl MetricHandle<CounterVectorCombinedLayout> {
+    /// Number of rows allocated for this vector.
+    pub const fn rows(&self) -> u32 {
+        self.layout.rows
+    }
+
+    /// Number of columns allocated for this vector.
+    pub const fn columns(&self) -> u32 {
+        self.layout.columns
+    }
+
+    /// Increments one packet/byte cell by one pair.
+    pub fn increment(&self, row: u32, column: u32) -> Result<(), StatsError> {
+        self.increment_by(row, column, 1, 1)
+    }
+
+    /// Increments one cell by packet and byte deltas.
+    pub fn increment_by(
+        &self,
+        row: u32,
+        column: u32,
+        packets: u64,
+        bytes: u64,
+    ) -> Result<(), StatsError> {
+        self.with_cell(row, column, |packets_cell, bytes_cell| {
+            packets_cell.fetch_add(packets, Ordering::Relaxed);
+            bytes_cell.fetch_add(bytes, Ordering::Relaxed);
+            Ok(())
+        })
+    }
+
+    /// Reads one packet/byte cell.
+    pub fn get(&self, row: u32, column: u32) -> Result<(u64, u64), StatsError> {
+        self.with_cell(row, column, |packets_cell, bytes_cell| {
+            Ok((
+                packets_cell.load(Ordering::Relaxed),
+                bytes_cell.load(Ordering::Relaxed),
+            ))
+        })
+    }
+
+    fn with_cell<T>(
+        &self,
+        row: u32,
+        column: u32,
+        op: impl FnOnce(&AtomicU64, &AtomicU64) -> Result<T, StatsError>,
+    ) -> Result<T, StatsError> {
+        if row >= self.layout.rows || column >= self.layout.columns {
+            return Err(StatsError::OutOfBounds);
+        }
+        let row_offset = u64::from(row)
+            .checked_mul(self.layout.row_stride)
+            .ok_or(StatsError::OutOfBounds)?;
+        let cell_offset = row_offset
+            .checked_add(
+                u64::from(column)
+                    .checked_mul(2 * std::mem::size_of::<AtomicU64>() as u64)
+                    .ok_or(StatsError::OutOfBounds)?,
+            )
+            .and_then(|relative| self.layout.data_offset.get().checked_add(relative))
+            .ok_or(StatsError::OutOfBounds)?;
+        let bytes_offset = cell_offset
+            .checked_add(std::mem::size_of::<AtomicU64>() as u64)
+            .ok_or(StatsError::OutOfBounds)?;
+        self.with_mapping_value(|mapping, _| {
+            op(
+                mapping.atomic_u64(Offset::new(cell_offset))?,
+                mapping.atomic_u64(Offset::new(bytes_offset))?,
+            )
+        })
+    }
+}
+
+/// A direct handle to a bounded fixed-slot name vector.
+impl MetricHandle<NameVectorLayout> {
+    pub const fn len(&self) -> u32 {
+        self.layout.length
+    }
+
+    /// Stores one bounded UTF-8 name without allocating after registration.
+    pub fn set(&self, index: u32, name: &str) -> Result<(), StatsError> {
+        let bytes = name.as_bytes();
+        if bytes.len() > crate::descriptor::NAME_VECTOR_MAX_BYTES {
+            return Err(StatsError::InvalidDescriptor(format!(
+                "name vector value exceeds {} bytes",
+                crate::descriptor::NAME_VECTOR_MAX_BYTES
+            )));
+        }
+        self.write_slot(index, Some(bytes))
+    }
+
+    /// Clears one name slot.
+    pub fn clear(&self, index: u32) -> Result<(), StatsError> {
+        self.write_slot(index, None)
+    }
+
+    /// Reads one name slot into an owned string.
+    pub fn get(&self, index: u32) -> Result<Option<String>, StatsError> {
+        if index >= self.layout.length {
+            return Err(StatsError::OutOfBounds);
+        }
+        self.with_mapping_value(|mapping, _| {
+            read_name_slot_at(mapping, self.layout.data_offset, self.layout.length, index)
+        })
+    }
+
+    fn write_slot(&self, index: u32, bytes: Option<&[u8]>) -> Result<(), StatsError> {
+        if index >= self.layout.length {
+            return Err(StatsError::OutOfBounds);
+        }
+        let slot = self
+            .layout
+            .data_offset
+            .get()
+            .checked_add(
+                u64::from(index)
+                    .checked_mul(crate::descriptor::NAME_VECTOR_SLOT_BYTES as u64)
+                    .ok_or(StatsError::OutOfBounds)?,
+            )
+            .ok_or(StatsError::OutOfBounds)?;
+        self.with_mapping_value(|mapping, _| {
+            let sequence = mapping.atomic_u64(Offset::new(slot))?;
+            let length = mapping.atomic_u64(Offset::new(
+                slot.checked_add(8).ok_or(StatsError::OutOfBounds)?,
+            ))?;
+            let current = sequence.load(Ordering::Acquire);
+            if current & 1 != 0 {
+                std::hint::spin_loop();
+            }
+            let next = current
+                .checked_add(2)
+                .ok_or(StatsError::GenerationOverflow)?;
+            sequence.store(current | 1, Ordering::Relaxed);
+            for word in 0..(crate::descriptor::NAME_VECTOR_MAX_BYTES / 8) {
+                let start = word * 8;
+                let mut bytes_word = [0u8; 8];
+                if let Some(bytes) = bytes {
+                    let end = (start + 8).min(bytes.len());
+                    if start < end {
+                        bytes_word[..end - start].copy_from_slice(&bytes[start..end]);
+                    }
+                }
+                mapping
+                    .atomic_u64(Offset::new(
+                        slot.checked_add(16 + (word * 8) as u64)
+                            .ok_or(StatsError::OutOfBounds)?,
+                    ))?
+                    .store(u64::from_le_bytes(bytes_word), Ordering::Relaxed);
+            }
+            length.store(
+                bytes.map_or(0, |value| value.len() as u64),
+                Ordering::Release,
+            );
+            sequence.store(next, Ordering::Release);
+            Ok(())
+        })
+    }
+}
+
+fn read_name_slot_at(
+    mapping: &Mapping,
+    data_offset: Offset,
+    length: u32,
+    index: u32,
+) -> Result<Option<String>, StatsError> {
+    if index >= length {
+        return Err(StatsError::OutOfBounds);
+    }
+    let slot = data_offset
+        .get()
+        .checked_add(
+            u64::from(index)
+                .checked_mul(crate::descriptor::NAME_VECTOR_SLOT_BYTES as u64)
+                .ok_or(StatsError::OutOfBounds)?,
+        )
+        .ok_or(StatsError::OutOfBounds)?;
+    for _ in 0..MAX_READ_ATTEMPTS {
+        let sequence = mapping
+            .atomic_u64(Offset::new(slot))?
+            .load(Ordering::Acquire);
+        if sequence & 1 != 0 {
+            std::hint::spin_loop();
+            continue;
+        }
+        let value_len = mapping
+            .atomic_u64(Offset::new(
+                slot.checked_add(8).ok_or(StatsError::OutOfBounds)?,
+            ))?
+            .load(Ordering::Acquire);
+        if value_len as usize > crate::descriptor::NAME_VECTOR_MAX_BYTES {
+            return Err(StatsError::InvalidDescriptor(
+                "name vector slot length is invalid".to_owned(),
+            ));
+        }
+        let mut bytes = Vec::with_capacity(value_len as usize);
+        for word in 0..(crate::descriptor::NAME_VECTOR_MAX_BYTES / 8) {
+            bytes.extend_from_slice(
+                &mapping
+                    .atomic_u64(Offset::new(
+                        slot.checked_add(16 + (word * 8) as u64)
+                            .ok_or(StatsError::OutOfBounds)?,
+                    ))?
+                    .load(Ordering::Relaxed)
+                    .to_le_bytes(),
+            );
+        }
+        let end = mapping
+            .atomic_u64(Offset::new(slot))?
+            .load(Ordering::Acquire);
+        if end != sequence || end & 1 != 0 {
+            std::hint::spin_loop();
+            continue;
+        }
+        bytes.truncate(value_len as usize);
+        if bytes.is_empty() {
+            return Ok(None);
+        }
+        return String::from_utf8(bytes).map(Some).map_err(|_| {
+            StatsError::InvalidDescriptor("name vector slot is not UTF-8".to_owned())
+        });
+    }
+    Err(StatsError::ReadBusy)
+}
+
+/// A direct handle to a fixed 64-bin per-row log2 histogram.
+impl MetricHandle<HistogramLog2Layout> {
+    pub const fn rows(&self) -> u32 {
+        self.layout.rows
+    }
+
+    pub const fn bins(&self) -> u32 {
+        crate::descriptor::HISTOGRAM_BIN_COUNT
+    }
+
+    pub fn increment_bin(&self, row: u32, bin: u32, delta: u64) -> Result<(), StatsError> {
+        self.with_bin(row, bin, |cell| {
+            cell.fetch_add(delta, Ordering::Relaxed);
+            Ok(())
+        })
+    }
+
+    /// Increments the clamped log2 bin for `value`.
+    pub fn increment_value(&self, row: u32, value: u32, delta: u64) -> Result<(), StatsError> {
+        let bin = if value == 0 {
+            0
+        } else {
+            (u32::BITS - 1 - value.leading_zeros()).min(crate::descriptor::HISTOGRAM_BIN_COUNT - 1)
+        };
+        self.increment_bin(row, bin, delta)
+    }
+
+    pub fn get(&self, row: u32, bin: u32) -> Result<u64, StatsError> {
+        self.with_bin(row, bin, |cell| Ok(cell.load(Ordering::Relaxed)))
+    }
+
+    fn with_bin<T>(
+        &self,
+        row: u32,
+        bin: u32,
+        op: impl FnOnce(&AtomicU64) -> Result<T, StatsError>,
+    ) -> Result<T, StatsError> {
+        if row >= self.layout.rows || bin >= crate::descriptor::HISTOGRAM_BIN_COUNT {
+            return Err(StatsError::OutOfBounds);
+        }
+        let offset = self
+            .layout
+            .data_offset
+            .get()
+            .checked_add(
+                u64::from(row)
+                    .checked_mul(self.layout.row_stride)
+                    .and_then(|base| base.checked_add(u64::from(bin) * 8))
+                    .ok_or(StatsError::OutOfBounds)?,
+            )
+            .ok_or(StatsError::OutOfBounds)?;
+        self.with_mapping_value(|mapping, _| op(mapping.atomic_u64(Offset::new(offset))?))
+    }
+}
+
+/// A direct fixed-size per-row overwrite ring buffer.
+impl MetricHandle<RingBufferLayout> {
+    pub const fn rows(&self) -> u32 {
+        self.layout.rows
+    }
+
+    pub const fn capacity(&self) -> u32 {
+        self.layout.capacity
+    }
+
+    pub const fn entry_size(&self) -> u32 {
+        self.layout.entry_size
+    }
+
+    /// Copies one exact-size entry into the current producer slot and returns
+    /// the newly published row sequence.
+    pub fn produce(&self, row: u32, data: &[u8]) -> Result<u64, StatsError> {
+        if row >= self.layout.rows || data.len() != self.layout.entry_size as usize {
+            return Err(StatsError::OutOfBounds);
+        }
+        let metadata = self.metadata_offset_for(row)?;
+        self.with_mapping_value(|mapping, _| {
+            let head_cell = mapping.atomic_u64(metadata)?;
+            let sequence_cell = mapping.atomic_u64(Offset::new(
+                metadata
+                    .get()
+                    .checked_add(8)
+                    .ok_or(StatsError::OutOfBounds)?,
+            ))?;
+            let publication_cell = mapping.atomic_u64(Offset::new(
+                metadata
+                    .get()
+                    .checked_add(24)
+                    .ok_or(StatsError::OutOfBounds)?,
+            ))?;
+            let head_word = head_cell.load(Ordering::Relaxed);
+            let head = (head_word & u64::from(u32::MAX)) % u64::from(self.layout.capacity);
+            let sequence = sequence_cell.load(Ordering::Relaxed);
+            let publication = publication_cell.load(Ordering::Relaxed);
+            if publication & 1 != 0 {
+                return Err(StatsError::ReadBusy);
+            }
+            let next_sequence = sequence
+                .checked_add(1)
+                .ok_or(StatsError::GenerationOverflow)?;
+            let next_publication = publication
+                .checked_add(2)
+                .ok_or(StatsError::GenerationOverflow)?;
+            let slot = self.slot_offset(row, head as u32)?;
+            let target = mapping.byte_write_target(slot, data.len())?;
+            publication_cell.store(
+                publication
+                    .checked_add(1)
+                    .ok_or(StatsError::GenerationOverflow)?,
+                Ordering::Relaxed,
+            );
+            // SAFETY: `target` was bounds-checked before the publication
+            // marker was set and the marker excludes stable readers.
+            unsafe { Mapping::write_bytes(target, data) };
+            let next_head = (head + 1) % u64::from(self.layout.capacity);
+            head_cell.store(
+                (head_word & !u64::from(u32::MAX)) | next_head,
+                Ordering::Relaxed,
+            );
+            sequence_cell.store(next_sequence, Ordering::Release);
+            publication_cell.store(next_publication, Ordering::Release);
+            Ok(next_sequence)
+        })
+    }
+
+    /// Reads one physical slot into owned bytes.
+    pub fn get(&self, row: u32, slot: u32) -> Result<Vec<u8>, StatsError> {
+        self.with_mapping_value(|mapping, _| self.read_slot(mapping, row, slot))
+    }
+
+    /// Reads the newest committed slot for a row, or `None` before its first
+    /// publication.
+    pub fn latest(&self, row: u32) -> Result<Option<Vec<u8>>, StatsError> {
+        if row >= self.layout.rows {
+            return Err(StatsError::OutOfBounds);
+        }
+        let metadata = self.metadata_offset_for(row)?;
+        self.with_mapping_value(|mapping, _| {
+            let head_cell = mapping.atomic_u64(metadata)?;
+            let sequence_cell = mapping.atomic_u64(Offset::new(metadata.get() + 8))?;
+            let publication_cell = mapping.atomic_u64(Offset::new(metadata.get() + 24))?;
+            for _ in 0..MAX_READ_ATTEMPTS {
+                let publication = publication_cell.load(Ordering::Acquire);
+                if publication & 1 != 0 {
+                    std::hint::spin_loop();
+                    continue;
+                }
+                let sequence = sequence_cell.load(Ordering::Acquire);
+                if sequence == 0 {
+                    return Ok(None);
+                }
+                let head = (head_cell.load(Ordering::Acquire) & u64::from(u32::MAX))
+                    % u64::from(self.layout.capacity);
+                let slot = if head == 0 {
+                    self.layout.capacity - 1
+                } else {
+                    head as u32 - 1
+                };
+                let value = self.read_slot(mapping, row, slot)?;
+                let after_publication = publication_cell.load(Ordering::Acquire);
+                let after_sequence = sequence_cell.load(Ordering::Acquire);
+                if publication == after_publication
+                    && after_publication & 1 == 0
+                    && sequence == after_sequence
+                {
+                    return Ok(Some(value));
+                }
+                std::hint::spin_loop();
+            }
+            Err(StatsError::ReadBusy)
+        })
+    }
+
+    /// Captures all physical slots for one row with a stable sequence.
+    pub fn snapshot(&self, row: u32) -> Result<crate::read::RingBufferSnapshot, StatsError> {
+        if row >= self.layout.rows {
+            return Err(StatsError::OutOfBounds);
+        }
+        let metadata = self.metadata_offset_for(row)?;
+        self.with_mapping_value(|mapping, _| {
+            let sequence_cell = mapping.atomic_u64(Offset::new(metadata.get() + 8))?;
+            let publication_cell = mapping.atomic_u64(Offset::new(metadata.get() + 24))?;
+            for _ in 0..MAX_READ_ATTEMPTS {
+                let before_publication = publication_cell.load(Ordering::Acquire);
+                if before_publication & 1 != 0 {
+                    std::hint::spin_loop();
+                    continue;
+                }
+                let before_sequence = sequence_cell.load(Ordering::Acquire);
+                let mut entries = Vec::with_capacity(self.layout.capacity as usize);
+                for slot in 0..self.layout.capacity {
+                    entries.push(self.read_slot(mapping, row, slot)?);
+                }
+                let after_publication = publication_cell.load(Ordering::Acquire);
+                let after_sequence = sequence_cell.load(Ordering::Acquire);
+                if before_publication == after_publication
+                    && after_publication & 1 == 0
+                    && before_sequence == after_sequence
+                {
+                    return Ok(crate::read::RingBufferSnapshot {
+                        sequence: after_sequence,
+                        entries,
+                    });
+                }
+                std::hint::spin_loop();
+            }
+            Err(StatsError::ReadBusy)
+        })
+    }
+
+    /// Copies the immutable registration schema, if one was supplied.
+    pub fn schema(&self) -> Result<Option<Vec<u8>>, StatsError> {
+        let Some(schema_offset) = self.layout.schema_offset else {
+            return self.with_mapping_value(|_, _| Ok(None));
+        };
+        self.with_mapping_value(|mapping, _| {
+            Ok(Some(
+                mapping.read_bytes(schema_offset, self.layout.schema_size)?,
+            ))
+        })
+    }
+
+    fn metadata_offset_for(&self, row: u32) -> Result<Offset, StatsError> {
+        self.layout
+            .metadata_offset
+            .checked_add(
+                u64::from(row)
+                    .checked_mul(crate::descriptor::RING_METADATA_BYTES as u64)
+                    .ok_or(StatsError::OutOfBounds)?,
+            )
+            .ok_or(StatsError::OutOfBounds)
+    }
+
+    fn slot_offset(&self, row: u32, slot: u32) -> Result<Offset, StatsError> {
+        ring_slot_offset(
+            self.layout.data_offset,
+            self.layout.slot_stride,
+            self.layout.rows,
+            self.layout.capacity,
+            row,
+            slot,
+        )
+    }
+
+    fn read_slot(&self, mapping: &Mapping, row: u32, slot: u32) -> Result<Vec<u8>, StatsError> {
+        let offset = self.slot_offset(row, slot)?;
+        read_ring_slot_bytes(mapping, offset, self.layout.entry_size as usize)
     }
 }
 
@@ -294,6 +1622,21 @@ pub struct StatsMain {
     /// handle is the sole structural writer of its segment, so any reader
     /// is an alias within one thread and needs no cross-thread locking.
     collectors: Vec<Box<dyn FnMut() -> Result<(), StatsError> + Send + 'static>>,
+    /// The currently published directory allocation. It is kept in a vector
+    /// so directory-vector replacement and retirement use the same process-
+    /// local ownership discipline as metric blocks.
+    directory_blocks: Vec<SegmentAllocation>,
+    /// Old directory blocks stay owned for the lifetime of the segment. A
+    /// reader may have captured the previous offset before it observes the
+    /// publication epoch, so freeing immediately after the header switch
+    /// would permit a use-after-free during that reader's re-check window.
+    retired_directories: Vec<SegmentAllocation>,
+    /// Active metric allocations indexed by the VPP-compatible directory slot.
+    metric_blocks: Vec<Option<SegmentAllocation>>,
+    /// Replaced or removed metric blocks stay owned until this StatsMain is
+    /// dropped. This protects readers that began before a publication and
+    /// keeps direct handles free of allocation ownership and refcounts.
+    retired_metric_blocks: Vec<SegmentAllocation>,
 }
 
 impl StatsMain {
@@ -316,7 +1659,12 @@ impl StatsMain {
                 requested: capacity,
             });
         }
-        let total = align_up(capacity, page).ok_or(StatsError::OutOfBounds)?;
+        if page == 0 || !page.is_power_of_two() {
+            return Err(StatsError::InvalidLayout);
+        }
+        let total = capacity
+            .checked_next_multiple_of(page)
+            .ok_or(StatsError::OutOfBounds)?;
         let segment = Segment::shared_with_reserved_prefix(&unique_segment_name(), total, page)?;
 
         // The initial directory is the first arena allocation, so it lands
@@ -325,7 +1673,7 @@ impl StatsMain {
             Layout::from_size_align((INITIAL_DIRECTORY_SLOTS as usize) * SLOT_SIZE, 64)
                 .map_err(|_| StatsError::InvalidLayout)?;
         let directory = segment.allocate(directory_layout)?;
-        let directory_offset = Offset::new(directory.into_raw_offset());
+        let directory_offset = Offset::new(directory.offset());
 
         let mapping = Mapping::new(&segment);
         mapping.write_header(StatsHeader::new(
@@ -338,13 +1686,599 @@ impl StatsMain {
             segment,
             names: HashMap::new(),
             collectors: Vec::new(),
+            directory_blocks: vec![directory],
+            retired_directories: Vec::new(),
+            metric_blocks: Vec::new(),
+            retired_metric_blocks: Vec::new(),
         })
+    }
+
+    /// Registers a batch of protocol-neutral Stats Directory entries.
+    ///
+    /// Each descriptor, directory slot, and value block is published through
+    /// one VPP-style registration boundary. A failed allocation leaves the
+    /// current directory and header unchanged for that entry.
+    pub fn register<'a>(
+        &mut self,
+        registrations: &[StatsRegistration<'a>],
+    ) -> Result<Vec<StatsEntry>, StatsError> {
+        let mut seen_paths = HashSet::with_capacity(registrations.len());
+        let mut prepared = Vec::with_capacity(registrations.len());
+        for registration in registrations {
+            let kind = RegistrationKind::Value(registration.value);
+            encode_name(registration.path)?;
+            if self.names.contains_key(registration.path) || !seen_paths.insert(registration.path) {
+                return Err(StatsError::DuplicateName(registration.path.to_owned()));
+            }
+            let prometheus_type = match registration.value {
+                StatsValueLayout::Counter
+                | StatsValueLayout::CounterVectorSimple { .. }
+                | StatsValueLayout::CounterVectorCombined { .. }
+                | StatsValueLayout::HistogramLog2 { .. }
+                | StatsValueLayout::RingBuffer { .. } => PrometheusType::Counter,
+                StatsValueLayout::Gauge
+                | StatsValueLayout::Timestamp
+                | StatsValueLayout::NameVector { .. } => PrometheusType::Gauge,
+            };
+            let mut opts = prometheus::Opts::new(
+                registration.descriptor.fq_name,
+                registration.descriptor.help,
+            );
+            for &(name, value) in registration.descriptor.const_labels {
+                opts = opts.const_label(name, value);
+            }
+            let descriptor = crate::descriptor::normalize(&opts, prometheus_type)?;
+            prepared.push((registration.path, kind, descriptor));
+        }
+
+        self.register_batch(prepared)?
+            .into_iter()
+            .map(|entry| match entry {
+                RegisteredEntry::Handle(handle) => Ok(handle),
+                RegisteredEntry::Symlink(_) => {
+                    Err(StatsError::InvalidState(DirectoryType::SYMLINK))
+                }
+            })
+            .collect()
+    }
+
+    /// Registers VPP-compatible directory symlinks in one publication batch.
+    ///
+    /// Each tuple contains `(path, descriptor, target, vector_index)`. Links
+    /// have no public value handle; callers retain only the returned entry ids
+    /// for list/dump operations. The target must already be an active fixed
+    /// vector value, matching VPP's `vlib_stats_add_symlink` contract.
+    pub fn register_symlinks<'a>(
+        &mut self,
+        registrations: &[(&'a str, StatsDescriptor<'a>, &'a str, u32)],
+    ) -> Result<Vec<EntryId>, StatsError> {
+        let mut seen_paths = HashSet::with_capacity(registrations.len());
+        let mapping = Mapping::new(&self.segment);
+        let mut prepared = Vec::with_capacity(registrations.len());
+        for &(path, descriptor, target, vector_index) in registrations {
+            encode_name(path)?;
+            if self.names.contains_key(path) || !seen_paths.insert(path) {
+                return Err(StatsError::DuplicateName(path.to_owned()));
+            }
+            let target_runtime = self.resolve_target_runtime(&mapping, target, vector_index)?;
+            let mut opts = prometheus::Opts::new(descriptor.fq_name, descriptor.help);
+            for &(name, value) in descriptor.const_labels {
+                opts = opts.const_label(name, value);
+            }
+            let descriptor = crate::descriptor::normalize(&opts, target_runtime.prometheus_type)?;
+            prepared.push((
+                path,
+                RegistrationKind::Symlink {
+                    target: target_runtime.id,
+                    vector_index,
+                },
+                descriptor,
+            ));
+        }
+
+        self.register_batch(prepared)?
+            .into_iter()
+            .map(|entry| match entry {
+                RegisteredEntry::Symlink(id) => Ok(id),
+                RegisteredEntry::Handle(_) => Err(StatsError::InvalidState(DirectoryType::SYMLINK)),
+            })
+            .collect()
+    }
+
+    fn resolve_target_runtime(
+        &self,
+        mapping: &Mapping,
+        target: &str,
+        vector_index: u32,
+    ) -> Result<TargetRuntimeInfo, StatsError> {
+        let id = *self.names.get(target).ok_or_else(|| {
+            StatsError::InvalidDescriptor(format!("symlink target {target:?} was not found"))
+        })?;
+        let header = mapping.header();
+        let slot = mapping.entry(header.directory_offset(), id.index)?;
+        if slot.state()? != EntryState::Active || slot.generation() != id.generation {
+            return Err(StatsError::InvalidDescriptor(format!(
+                "symlink target {target:?} is not active"
+            )));
+        }
+        let directory_type = slot.directory_type()?;
+        let prometheus_type = slot.prometheus_type()?;
+        let block = mapping.descriptor_block(slot.descriptor_offset())?;
+        let columns = match directory_type {
+            DirectoryType::ScalarIndex | DirectoryType::Gauge => 1,
+            DirectoryType::CounterVectorSimple => {
+                crate::descriptor::decode_counter_vector_simple_layout(block)?.columns
+            }
+            DirectoryType::CounterVectorCombined => {
+                crate::descriptor::decode_counter_vector_combined_layout(block)?.columns
+            }
+            DirectoryType::NameVector => {
+                crate::descriptor::decode_name_vector_layout(block)?.length
+            }
+            DirectoryType::HistogramLog2 => {
+                crate::descriptor::decode_histogram_log2_layout(block)?.bins
+            }
+            DirectoryType::Symlink | DirectoryType::RingBuffer | DirectoryType::Empty => {
+                return Err(StatsError::InvalidDescriptor(
+                    "symlink target must be a fixed vector value".to_owned(),
+                ));
+            }
+            DirectoryType::Illegal => return Err(StatsError::InvalidState(DirectoryType::ILLEGAL)),
+        };
+        if vector_index >= columns {
+            return Err(StatsError::InvalidDescriptor(format!(
+                "symlink target {target:?} index {vector_index} is outside 0..{columns}"
+            )));
+        }
+        Ok(TargetRuntimeInfo {
+            id,
+            prometheus_type,
+        })
+    }
+
+    fn register_batch<'a>(
+        &mut self,
+        prepared: Vec<(
+            &'a str,
+            RegistrationKind<'a>,
+            crate::descriptor::NormalizedDescriptor,
+        )>,
+    ) -> Result<Vec<RegisteredEntry>, StatsError> {
+        if prepared.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let mut registered_entries = Vec::with_capacity(prepared.len());
+
+        for (path, kind, descriptor) in prepared {
+            let mapping = Mapping::new(&self.segment);
+            let header = mapping.header();
+            let old_directory_offset = header.directory_offset();
+            let old_directory_capacity = header.directory_capacity();
+            let initialized = header.initialized_len();
+            if old_directory_capacity == 0 || initialized > old_directory_capacity {
+                return Err(StatsError::InvalidState(0xFF));
+            }
+
+            let current_free_head = header.free_list_head();
+            let (index, generation, free_head, next_initialized, next_capacity) =
+                if current_free_head != NULL_INDEX {
+                    if current_free_head >= old_directory_capacity {
+                        return Err(StatsError::InvalidState(0xFF));
+                    }
+                    let free_index =
+                        u32::try_from(current_free_head).map_err(|_| StatsError::OutOfBounds)?;
+                    let free_entry = mapping.entry(old_directory_offset, free_index)?;
+                    if free_entry.state()? != EntryState::Free {
+                        return Err(StatsError::InvalidState(free_entry.state_byte()));
+                    }
+                    (
+                        free_index,
+                        free_entry.generation(),
+                        free_entry.link(),
+                        initialized,
+                        old_directory_capacity,
+                    )
+                } else {
+                    if initialized >= u64::from(u32::MAX) {
+                        return Err(StatsError::OutOfBounds);
+                    }
+                    let next_initialized =
+                        initialized.checked_add(1).ok_or(StatsError::OutOfBounds)?;
+                    let next_capacity = if initialized >= old_directory_capacity {
+                        old_directory_capacity
+                            .checked_mul(2)
+                            .ok_or(StatsError::OutOfBounds)?
+                    } else {
+                        old_directory_capacity
+                    };
+                    (
+                        initialized as u32,
+                        1,
+                        NULL_INDEX,
+                        next_initialized,
+                        next_capacity,
+                    )
+                };
+
+            let directory_grew = next_capacity != old_directory_capacity;
+            let directory_allocation = if directory_grew {
+                let new_capacity =
+                    usize::try_from(next_capacity).map_err(|_| StatsError::OutOfBounds)?;
+                let new_bytes = new_capacity
+                    .checked_mul(SLOT_SIZE)
+                    .ok_or(StatsError::OutOfBounds)?;
+                let layout = Layout::from_size_align(new_bytes, 64)
+                    .map_err(|_| StatsError::InvalidLayout)?;
+                Some(self.segment.allocate(layout)?)
+            } else {
+                None
+            };
+            let directory_offset = directory_allocation
+                .as_ref()
+                .map(|allocation| Offset::new(allocation.offset()))
+                .unwrap_or(old_directory_offset);
+
+            if let Some(allocation) = directory_allocation.as_ref() {
+                let initialized_count =
+                    u32::try_from(initialized).map_err(|_| StatsError::OutOfBounds)?;
+                let mut old_entries = Vec::with_capacity(initialized_count as usize);
+                for old_index in 0..initialized_count {
+                    old_entries.push(mapping.entry(old_directory_offset, old_index)?);
+                }
+                mapping.write_directory_entries(Offset::new(allocation.offset()), &old_entries)?;
+            }
+
+            let id = EntryId { index, generation };
+            let (entry, registered, allocation) = match kind {
+                RegistrationKind::Value(value) => match value {
+                    StatsValueLayout::Counter => {
+                        CounterLayout::register(&self.segment, path, id, &descriptor, value)?
+                    }
+                    StatsValueLayout::Gauge => {
+                        GaugeLayout::register(&self.segment, path, id, &descriptor, value)?
+                    }
+                    StatsValueLayout::Timestamp => {
+                        TimestampLayout::register(&self.segment, path, id, &descriptor, value)?
+                    }
+                    StatsValueLayout::CounterVectorSimple { .. } => {
+                        CounterVectorSimpleLayout::register(
+                            &self.segment,
+                            path,
+                            id,
+                            &descriptor,
+                            value,
+                        )?
+                    }
+                    StatsValueLayout::CounterVectorCombined { .. } => {
+                        CounterVectorCombinedLayout::register(
+                            &self.segment,
+                            path,
+                            id,
+                            &descriptor,
+                            value,
+                        )?
+                    }
+                    StatsValueLayout::NameVector { .. } => {
+                        NameVectorLayout::register(&self.segment, path, id, &descriptor, value)?
+                    }
+                    StatsValueLayout::HistogramLog2 { .. } => {
+                        HistogramLog2Layout::register(&self.segment, path, id, &descriptor, value)?
+                    }
+                    StatsValueLayout::RingBuffer { .. } => {
+                        RingBufferLayout::register(&self.segment, path, id, &descriptor, value)?
+                    }
+                },
+                RegistrationKind::Symlink {
+                    target,
+                    vector_index,
+                } => {
+                    let layout = crate::descriptor::block_layout(&descriptor)?;
+                    let mut allocation = self.segment.allocate(layout)?;
+                    let value_offset_in_block = crate::descriptor::write_block(
+                        &mut allocation.bytes_mut(),
+                        &descriptor,
+                        id.generation,
+                    )?;
+                    let value_offset = block_offset(&allocation, value_offset_in_block)?;
+                    let entry = DirectorySlot::new_symlink(
+                        encode_name(path)?,
+                        id.generation,
+                        descriptor.kind,
+                        Offset::new(allocation.offset()),
+                        value_offset,
+                        target.index,
+                        target.generation,
+                        vector_index,
+                    );
+                    (entry, RegisteredEntry::Symlink(id), allocation)
+                }
+            };
+
+            let target = mapping.entry_write_target(directory_offset, index)?;
+            if directory_grew {
+                let old_directory = self
+                    .directory_blocks
+                    .last()
+                    .ok_or(StatsError::InvalidState(0xFF))?;
+                if old_directory.offset() != old_directory_offset.get() {
+                    return Err(StatsError::InvalidState(0xFF));
+                }
+            }
+            let planned_len =
+                usize::try_from(next_initialized).map_err(|_| StatsError::OutOfBounds)?;
+            if self.metric_blocks.len() < planned_len {
+                self.metric_blocks.resize_with(planned_len, || None);
+            }
+            if self
+                .metric_blocks
+                .get(index as usize)
+                .ok_or(StatsError::OutOfBounds)?
+                .is_some()
+            {
+                return Err(StatsError::InvalidState(0xFF));
+            }
+
+            let old_directory_allocation = if directory_grew {
+                match self.directory_blocks.pop() {
+                    Some(allocation) => Some(allocation),
+                    None => return Err(StatsError::InvalidState(0xFF)),
+                }
+            } else {
+                None
+            };
+
+            if directory_grew {
+                // The replacement directory is unreachable until the header
+                // switches to its offset, so its new slot can be populated now.
+                unsafe { mapping.write_entry(target, entry) };
+            }
+
+            if directory_grew {
+                let new_directory = match directory_allocation {
+                    Some(allocation) => allocation,
+                    None => return Err(StatsError::InvalidState(0xFF)),
+                };
+                self.directory_blocks.push(new_directory);
+                if let Some(old_directory) = old_directory_allocation {
+                    self.retired_directories.push(old_directory);
+                }
+            }
+            self.names.insert(path.into(), id);
+            self.metric_blocks[index as usize] = Some(allocation);
+
+            header.mark_in_progress();
+            if directory_grew {
+                header.store_directory_offset(directory_offset);
+                header.store_directory_capacity(next_capacity);
+            } else {
+                // SAFETY: the slot target was bounds-checked immediately
+                // before this publication tail.
+                unsafe { mapping.write_entry(target, entry) };
+            }
+            header.store_free_list_head(free_head);
+            header.store_initialized_len(next_initialized);
+            header.bump_epoch();
+            header.clear_in_progress();
+
+            registered_entries.push(registered);
+        }
+
+        Ok(registered_entries)
+    }
+
+    /// Replaces an existing simple counter vector with a checked layout of
+    /// `rows × columns`, preserving the overlap of the old values. The slot
+    /// remains at the same directory index, while its generation advances so
+    /// older direct handles become stale when VPP-style vector replacement
+    /// repoints the entry to the new block.
+    ///
+    /// StatsMain retains the old allocation until it is dropped. This keeps
+    /// the non-owning handle and reader paths independent of block ownership
+    /// while matching VPP's validate-and-repoint directory boundary.
+    pub fn replace_counter_vector_simple(
+        &mut self,
+        path: &str,
+        rows: u32,
+        columns: u32,
+    ) -> Result<(EntryId, CounterVectorSimple), StatsError> {
+        if rows == 0 || columns == 0 {
+            return Err(StatsError::InvalidDescriptor(
+                "counter vector dimensions must be non-zero".to_owned(),
+            ));
+        }
+        let id = *self.names.get(path).ok_or_else(|| {
+            StatsError::InvalidDescriptor(format!("counter vector path {path:?} was not found"))
+        })?;
+        let name = encode_name(path)?;
+        let mapping = Mapping::new(&self.segment);
+        let header = mapping.header();
+        if u64::from(id.index) >= header.initialized_len() {
+            return Err(StatsError::NotFound { id });
+        }
+        let directory_offset = header.directory_offset();
+        let slot = mapping.entry(directory_offset, id.index)?;
+        if slot.state()? != EntryState::Active || slot.generation() != id.generation {
+            return Err(StatsError::StaleEntry { id });
+        }
+        let directory_type = slot.directory_type()?;
+        let prometheus_type = slot.prometheus_type()?;
+        if directory_type != DirectoryType::CounterVectorSimple
+            || prometheus_type != PrometheusType::Counter
+        {
+            return Err(StatsError::IncompatibleType {
+                id,
+                prometheus_type,
+                directory_type,
+            });
+        }
+
+        let active_block = self
+            .metric_blocks
+            .get(id.index as usize)
+            .and_then(Option::as_ref)
+            .ok_or(StatsError::InvalidState(0xFF))?;
+        if active_block.offset() != slot.descriptor_offset().get() {
+            return Err(StatsError::InvalidState(0xFF));
+        }
+        let next_generation = id
+            .generation
+            .checked_add(1)
+            .ok_or(StatsError::GenerationOverflow)?;
+        let old_layout = CounterVectorSimpleLayout::decode(&mapping, &slot)?;
+        let decoded = crate::descriptor::decode_descriptor(
+            mapping.descriptor_block(slot.descriptor_offset())?,
+        )?;
+        let descriptor = crate::descriptor::NormalizedDescriptor {
+            kind: PrometheusType::Counter,
+            fq_name: decoded.fq_name,
+            help: decoded.help,
+            labels: decoded
+                .const_labels
+                .into_iter()
+                .map(|label| (label.name, label.value))
+                .collect(),
+        };
+        let new_layout =
+            crate::descriptor::counter_vector_simple_block_layout(&descriptor, rows, columns)?;
+        let mut allocation = self.segment.allocate(new_layout)?;
+        let (value_offset_in_block, data_offset_in_block) =
+            crate::descriptor::write_counter_vector_simple_block(
+                &mut allocation.bytes_mut(),
+                &descriptor,
+                next_generation,
+                rows,
+                columns,
+            )?;
+        let block_offset = Offset::new(allocation.offset());
+        let value_offset = block_offset
+            .checked_add(value_offset_in_block)
+            .ok_or(StatsError::OutOfBounds)?;
+        let data_offset = block_offset
+            .checked_add(data_offset_in_block)
+            .ok_or(StatsError::OutOfBounds)?;
+        let new_row_stride = u64::try_from(crate::descriptor::counter_vector_row_stride(
+            columns,
+            std::mem::size_of::<AtomicU64>(),
+        )?)
+        .map_err(|_| StatsError::OutOfBounds)?;
+        let old_data_offset = old_layout.data_offset;
+        let overlap_rows = rows.min(old_layout.rows);
+        let overlap_columns = columns.min(old_layout.columns);
+        for row in 0..overlap_rows {
+            for column in 0..overlap_columns {
+                let old_offset = old_data_offset
+                    .get()
+                    .checked_add(
+                        u64::from(row)
+                            .checked_mul(old_layout.row_stride as u64)
+                            .and_then(|base| base.checked_add(u64::from(column) * 8))
+                            .ok_or(StatsError::OutOfBounds)?,
+                    )
+                    .ok_or(StatsError::OutOfBounds)?;
+                let new_offset = data_offset
+                    .get()
+                    .checked_add(
+                        u64::from(row)
+                            .checked_mul(new_row_stride)
+                            .and_then(|base| base.checked_add(u64::from(column) * 8))
+                            .ok_or(StatsError::OutOfBounds)?,
+                    )
+                    .ok_or(StatsError::OutOfBounds)?;
+                let value = mapping
+                    .atomic_u64(Offset::new(old_offset))?
+                    .load(Ordering::Relaxed);
+                mapping
+                    .atomic_u64(Offset::new(new_offset))?
+                    .store(value, Ordering::Relaxed);
+            }
+        }
+
+        let new_id = EntryId {
+            index: id.index,
+            generation: next_generation,
+        };
+        let new_entry = DirectorySlot::new_active(
+            name,
+            next_generation,
+            DirectoryType::CounterVectorSimple,
+            PrometheusType::Counter,
+            block_offset,
+            value_offset,
+        );
+        let vector_target = mapping.entry_write_target(directory_offset, id.index)?;
+        let initialized = u32::try_from(header.initialized_len().min(u64::from(u32::MAX)))
+            .map_err(|_| StatsError::OutOfBounds)?;
+        let mut symlink_targets = Vec::new();
+        for index in 0..initialized {
+            let candidate = mapping.entry(directory_offset, index)?;
+            if candidate.state()? != EntryState::Active
+                || candidate.directory_type()? != DirectoryType::Symlink
+                || candidate.symlink_target_index()? != id.index
+                || candidate.symlink_target_generation() != id.generation
+            {
+                continue;
+            }
+            let vector_index = candidate.symlink_vector_index()?;
+            if vector_index >= columns {
+                return Err(StatsError::InvalidDescriptor(format!(
+                    "symlink target {path:?} index {vector_index} is outside 0..{columns}"
+                )));
+            }
+            let mut updated = candidate;
+            updated.set_symlink_target(id.index, next_generation, vector_index);
+            symlink_targets.push((
+                mapping.entry_write_target(directory_offset, index)?,
+                updated,
+            ));
+        }
+
+        // Move the old block to the retired set and install the new active
+        // owner before publication, so every published block remains owned by
+        // StatsMain throughout the directory switch.
+        let old_allocation = {
+            let owner = self
+                .metric_blocks
+                .get_mut(id.index as usize)
+                .ok_or(StatsError::OutOfBounds)?;
+            let old = owner.take().ok_or(StatsError::InvalidState(0xFF))?;
+            *owner = Some(allocation);
+            old
+        };
+
+        // VPP's stats publication uses one structural sequence around the
+        // directory writes; all checked and fallible work is complete above.
+        header.mark_in_progress();
+        // SAFETY: both write targets were bounds-checked before publication.
+        unsafe { mapping.write_entry(vector_target, new_entry) };
+        for (target, entry) in symlink_targets {
+            // SAFETY: each target was bounds-checked before publication.
+            unsafe { mapping.write_entry(target, entry) };
+        }
+        header.bump_epoch();
+        header.clear_in_progress();
+
+        self.names.insert(path.into(), new_id);
+        self.retired_metric_blocks.push(old_allocation);
+        Ok((
+            new_id,
+            MetricHandle::new(
+                self.segment.clone(),
+                new_id,
+                CounterVectorSimpleLayout {
+                    data_offset,
+                    row_stride: new_row_stride,
+                    rows,
+                    columns,
+                },
+            ),
+        ))
     }
 
     /// Adds a counter metric, mirroring VPP's `vlib_stats_add_counter_vector`.
     ///
     /// Publishes a directory entry and returns an [`EntryId`] plus a
-    /// [`Counter`] handle owning the value record. The `Opts` must carry a
+    /// direct [`Counter`] handle. The `Opts` must carry a
     /// valid fq name and help; variable labels are rejected. The entry is a
     /// scalar (`DirectoryType::ScalarIndex`), as are VPP's `/sys` heartbeat,
     /// boottime, and last-stats-clear metrics (stats.h:29-31, stats.c:281).
@@ -353,7 +2287,7 @@ impl StatsMain {
         path: &str,
         opts: prometheus::Opts,
     ) -> Result<(EntryId, Counter), StatsError> {
-        let (id, value_offset) = self.add_metric(
+        let id = self.add_metric(
             path,
             &opts,
             PrometheusType::Counter,
@@ -361,11 +2295,7 @@ impl StatsMain {
         )?;
         Ok((
             id,
-            Counter {
-                segment: self.segment.clone(),
-                value_offset,
-                id,
-            },
+            MetricHandle::new(self.segment.clone(), id, CounterLayout),
         ))
     }
 
@@ -378,16 +2308,8 @@ impl StatsMain {
         path: &str,
         opts: prometheus::Opts,
     ) -> Result<(EntryId, Gauge), StatsError> {
-        let (id, value_offset) =
-            self.add_metric(path, &opts, PrometheusType::Gauge, DirectoryType::Gauge)?;
-        Ok((
-            id,
-            Gauge {
-                segment: self.segment.clone(),
-                value_offset,
-                id,
-            },
-        ))
+        let id = self.add_metric(path, &opts, PrometheusType::Gauge, DirectoryType::Gauge)?;
+        Ok((id, MetricHandle::new(self.segment.clone(), id, GaugeLayout)))
     }
 
     /// Adds a timestamp scalar, mirroring VPP's `/sys` boottime, heartbeat,
@@ -400,7 +2322,7 @@ impl StatsMain {
         path: &str,
         opts: prometheus::Opts,
     ) -> Result<(EntryId, Timestamp), StatsError> {
-        let (id, value_offset) = self.add_metric(
+        let id = self.add_metric(
             path,
             &opts,
             PrometheusType::Gauge,
@@ -408,11 +2330,7 @@ impl StatsMain {
         )?;
         Ok((
             id,
-            Timestamp {
-                segment: self.segment.clone(),
-                value_offset,
-                id,
-            },
+            MetricHandle::new(self.segment.clone(), id, TimestampLayout),
         ))
     }
 
@@ -500,7 +2418,12 @@ impl StatsMain {
             }
 
             let directory_offset = header.directory_offset();
-            let initialized = header.initialized_len().min(u64::from(u32::MAX)) as u32;
+            let initialized_len = header.initialized_len();
+            if initialized_len > header.directory_capacity() {
+                return Err(StatsError::InvalidState(0xFF));
+            }
+            let initialized =
+                u32::try_from(initialized_len).map_err(|_| StatsError::OutOfBounds)?;
             result.clear();
             for index in 0..initialized {
                 let slot = mapping.entry(directory_offset, index)?;
@@ -587,10 +2510,13 @@ impl StatsMain {
             }
 
             let directory_offset = header.directory_offset();
-            let capacity = header.directory_capacity();
+            let initialized = header.initialized_len();
+            if initialized > header.directory_capacity() {
+                return Err(StatsError::InvalidState(0xFF));
+            }
             result.clear();
             for &id in ids {
-                if u64::from(id.index) >= capacity {
+                if u64::from(id.index) >= initialized {
                     return Err(StatsError::NotFound { id });
                 }
                 let slot = mapping.entry(directory_offset, id.index)?;
@@ -611,24 +2537,55 @@ impl StatsMain {
                 }
                 let prometheus_type = slot.prometheus_type()?;
                 let directory_type = slot.directory_type()?;
-                let dump_value = match (prometheus_type, directory_type) {
-                    (PrometheusType::Counter, DirectoryType::ScalarIndex) => {
-                        DumpValue::Counter(record.load_value())
+                let (value_slot, value_directory_type, value_prometheus_type, vector_index) =
+                    if directory_type == DirectoryType::Symlink {
+                        let target_index = slot.symlink_target_index()?;
+                        if u64::from(target_index) >= initialized {
+                            return Err(StatsError::NotFound {
+                                id: EntryId {
+                                    index: target_index,
+                                    generation: slot.symlink_target_generation(),
+                                },
+                            });
+                        }
+                        let target = mapping.entry(directory_offset, target_index)?;
+                        if target.state()? != EntryState::Active
+                            || target.generation() != slot.symlink_target_generation()
+                        {
+                            return Err(StatsError::StaleEntry {
+                                id: EntryId {
+                                    index: target_index,
+                                    generation: slot.symlink_target_generation(),
+                                },
+                            });
+                        }
+                        (
+                            target,
+                            target.directory_type()?,
+                            target.prometheus_type()?,
+                            Some(slot.symlink_vector_index()?),
+                        )
+                    } else {
+                        (slot, directory_type, prometheus_type, None)
+                    };
+                let target_record = mapping.metric_value(value_slot.value_offset())?;
+                if target_record.generation()
+                    != if directory_type == DirectoryType::Symlink {
+                        value_slot.generation()
+                    } else {
+                        id.generation
                     }
-                    (PrometheusType::Gauge, DirectoryType::ScalarIndex) => {
-                        DumpValue::Gauge(record.load_value() as f64)
-                    }
-                    (PrometheusType::Gauge, DirectoryType::Gauge) => {
-                        DumpValue::Gauge(f64::from_bits(record.load_value()))
-                    }
-                    _ => {
-                        return Err(StatsError::IncompatibleType {
-                            id,
-                            prometheus_type,
-                            directory_type,
-                        });
-                    }
-                };
+                {
+                    return Err(StatsError::StaleEntry { id });
+                }
+                let dump_value = read_dump_value(
+                    &mapping,
+                    id,
+                    &value_slot,
+                    value_prometheus_type,
+                    value_directory_type,
+                    vector_index,
+                )?;
                 result.push(DumpEntry {
                     id,
                     path: std::str::from_utf8(slot.name())
@@ -658,15 +2615,10 @@ impl StatsMain {
     /// Removes the entry identified by `id`, mirroring VPP's
     /// `vlib_stats_remove_entry`.
     ///
-    /// The entry is hidden (it no longer participates in duplicate-name
-    /// checks or slot reuse) and every live handle to its value record is
-    /// invalidated via a generation bump. If no handle survives, the metric
-    /// block is released and the slot joins the free list immediately;
-    /// otherwise the slot joins the removed list and is reclaimed by the
-    /// next structural pass once its handles are gone.
+    /// The entry is hidden, its generation advances, and the slot joins the
+    /// free list. The detached metric block remains in the retired allocation
+    /// set until `StatsMain` drops, protecting readers and offset-free handles.
     pub fn remove_entry(&mut self, id: EntryId) -> Result<(), StatsError> {
-        self.release_removed_entries()?;
-
         let mapping = Mapping::new(&self.segment);
         let header = mapping.header();
         let directory_offset = header.directory_offset();
@@ -684,17 +2636,21 @@ impl StatsMain {
         if entry.generation() != id.generation {
             return Err(StatsError::StaleEntry { id });
         }
+        let active_block = self
+            .metric_blocks
+            .get(id.index as usize)
+            .and_then(Option::as_ref)
+            .ok_or(StatsError::InvalidState(0xFF))?;
+        if active_block.offset() != entry.descriptor_offset().get() {
+            return Err(StatsError::InvalidState(0xFF));
+        }
 
-        // Preparation: the one checked generation increment, applied to the
-        // value record (which staleness-invalidates direct handles) and to
-        // the slot metadata, so a later free-list reuse publishes the
-        // already-advanced generation without a second increment. Also
-        // decide whether the block can be released in this pass and prepare
-        // the checked write target and the name key. All checked work
-        // happens before the publication tail.
-        let value = mapping.metric_value(entry.value_offset())?;
-        let next_generation = value.next_generation()?;
-        let release_now = value.refs() == 0;
+        // Preparation: compute the next slot generation and every checked
+        // write target before the publication tail.
+        let next_generation = entry
+            .generation()
+            .checked_add(1)
+            .ok_or(StatsError::GenerationOverflow)?;
         let target = mapping.entry_write_target(directory_offset, id.index)?;
         // The segment name is always NUL-terminated UTF-8 written from a
         // `&str`; a decode failure can only mean a corrupt slot.
@@ -704,13 +2660,8 @@ impl StatsMain {
 
         let mut removed = entry;
         removed.set_generation(next_generation);
-        if release_now {
-            removed.set_state(EntryState::Free);
-            removed.set_link(header.free_list_head());
-        } else {
-            removed.set_state(EntryState::Removed);
-            removed.set_link(header.removed_list_head());
-        }
+        removed.set_state(EntryState::Free);
+        removed.set_link(header.free_list_head());
 
         // Publication: VPP header sequence stores (stats.c:27,48-49) — set
         // `in_progress`, prevalidated infallible writes, bump `epoch`, clear
@@ -719,12 +2670,7 @@ impl StatsMain {
         // SAFETY: `target` was computed by `entry_write_target` for this
         // exact slot during this preparation phase.
         unsafe { mapping.write_entry(target, removed) };
-        value.store_generation(next_generation);
-        if release_now {
-            header.store_free_list_head(u64::from(id.index));
-        } else {
-            header.store_removed_list_head(u64::from(id.index));
-        }
+        header.store_free_list_head(u64::from(id.index));
         header.bump_epoch();
         header.clear_in_progress();
 
@@ -732,9 +2678,12 @@ impl StatsMain {
         // not outlive the entry it names.
         self.names.remove(&removed_name);
 
-        if release_now {
-            self.release_metric_storage(&mapping, &entry)?;
-        }
+        let allocation = self
+            .metric_blocks
+            .get_mut(id.index as usize)
+            .and_then(Option::take)
+            .ok_or(StatsError::InvalidState(0xFF))?;
+        self.retired_metric_blocks.push(allocation);
         Ok(())
     }
 
@@ -752,9 +2701,7 @@ impl StatsMain {
         opts: &prometheus::Opts,
         kind: PrometheusType,
         directory_type: DirectoryType,
-    ) -> Result<(EntryId, Offset), StatsError> {
-        // Release blocks whose handles are gone before adding.
-        self.release_removed_entries()?;
+    ) -> Result<EntryId, StatsError> {
         let descriptor = crate::descriptor::normalize(opts, kind)?;
         let name_key: Box<str> = path.into();
         let name = encode_name(&name_key)?;
@@ -820,7 +2767,7 @@ impl StatsMain {
         let mut block = self.segment.allocate(layout)?;
         let value_offset =
             crate::descriptor::write_block(&mut block.bytes_mut(), &descriptor, generation)?;
-        let block_offset = Offset::new(block.into_raw_offset());
+        let block_offset = Offset::new(block.offset());
         // The entry and every handle use the mapping-relative value offset.
         let value_offset = block_offset
             .checked_add(value_offset)
@@ -839,6 +2786,13 @@ impl StatsMain {
         );
         let target = mapping.entry_write_target(directory_offset, index)?;
         let next_initialized = initialized.checked_add(1).ok_or(StatsError::OutOfBounds)?;
+        let index_usize = index as usize;
+        if self.metric_blocks.len() <= index_usize {
+            self.metric_blocks.resize_with(index_usize + 1, || None);
+        }
+        if self.metric_blocks[index_usize].is_some() {
+            return Err(StatsError::InvalidState(0xFF));
+        }
 
         // Publication: VPP header sequence stores (stats.c:27,48-49) — set
         // `in_progress`, prevalidated infallible writes, bump `epoch`, clear
@@ -860,10 +2814,9 @@ impl StatsMain {
         // index in step here keeps it a pure cache of the segment state.
         let id = EntryId { index, generation };
         self.names.insert(name_key, id);
+        self.metric_blocks[index_usize] = Some(block);
 
-        // The handle expectation is the entry generation, so slot, id,
-        // handle, and value record stay exactly equal while active.
-        Ok((id, value_offset))
+        Ok(id)
     }
 
     /// Grows the directory to twice its slot count, copying every
@@ -879,9 +2832,6 @@ impl StatsMain {
         let old_capacity = header.directory_capacity();
         let initialized = header.initialized_len();
         let new_capacity = old_capacity.checked_mul(2).ok_or(StatsError::OutOfBounds)?;
-        let old_bytes = (old_capacity as usize)
-            .checked_mul(SLOT_SIZE)
-            .ok_or(StatsError::OutOfBounds)?;
         let new_bytes = (new_capacity as usize)
             .checked_mul(SLOT_SIZE)
             .ok_or(StatsError::OutOfBounds)?;
@@ -898,14 +2848,18 @@ impl StatsMain {
         let new_allocation = self.segment.allocate(new_layout)?;
         mapping.write_directory_entries(Offset::new(new_allocation.offset()), &entries)?;
 
-        // Reconstruct the old block's ownership before publication so the
-        // fallible work is complete; the drop itself is infallible.
-        let old_layout =
-            Layout::from_size_align(old_bytes, 64).map_err(|_| StatsError::InvalidLayout)?;
-        let old_allocation = unsafe {
-            SegmentAllocation::from_raw_offset(self.segment.clone(), old_offset.get(), old_layout)?
-        };
-        let new_offset = Offset::new(new_allocation.into_raw_offset());
+        let old_directory = self
+            .directory_blocks
+            .last()
+            .ok_or(StatsError::InvalidState(0xFF))?;
+        if old_directory.offset() != old_offset.get() {
+            return Err(StatsError::InvalidState(0xFF));
+        }
+        let old_allocation = self
+            .directory_blocks
+            .pop()
+            .ok_or(StatsError::InvalidState(0xFF))?;
+        let new_offset = Offset::new(new_allocation.offset());
 
         // Publication: VPP header sequence stores (stats.c:27,48-49) around
         // the directory switch — set `in_progress`, swap offset and
@@ -916,138 +2870,90 @@ impl StatsMain {
         header.store_directory_capacity(new_capacity);
         header.bump_epoch();
         header.clear_in_progress();
-        drop(old_allocation);
-        Ok(())
-    }
-
-    /// Cold structural pass: walks the removed list and releases every
-    /// metric block whose live-handle count reached zero, moving those
-    /// slots onto the free list and re-chaining the surviving removed
-    /// entries. One publication wraps the whole pass.
-    fn release_removed_entries(&mut self) -> Result<(), StatsError> {
-        let mapping = Mapping::new(&self.segment);
-        let header = mapping.header();
-        let directory_offset = header.directory_offset();
-        let capacity = header.directory_capacity();
-
-        // Walk the removed chain; every read bounds-validates its slot.
-        let mut head = header.removed_list_head();
-        let mut chain: Vec<(u32, DirectorySlot)> = Vec::new();
-        let mut visited: u64 = 0;
-        while head != NULL_INDEX {
-            visited += 1;
-            if head >= capacity || visited > capacity {
-                return Err(StatsError::InvalidState(0xFF));
-            }
-            let entry = mapping.entry(directory_offset, head as u32)?;
-            if entry.state()? != EntryState::Removed {
-                return Err(StatsError::InvalidState(entry.state_byte()));
-            }
-            chain.push((head as u32, entry));
-            head = entry.link();
-        }
-        if chain.is_empty() {
-            return Ok(());
-        }
-
-        // Partition on live-handle count and precompute every write target;
-        // all checked work happens before the publication tail.
-        let mut released: Vec<(u32, DirectorySlot)> = Vec::new();
-        let mut release_now: Vec<bool> = Vec::with_capacity(chain.len());
-        let mut targets: Vec<*mut DirectorySlot> = Vec::with_capacity(chain.len());
-        for (index, entry) in &chain {
-            let value = mapping.metric_value(entry.value_offset())?;
-            let frees = value.refs() == 0;
-            if frees {
-                released.push((*index, *entry));
-            }
-            release_now.push(frees);
-            targets.push(mapping.entry_write_target(directory_offset, *index)?);
-        }
-        if released.is_empty() {
-            return Ok(());
-        }
-
-        // Publication: VPP header sequence stores (stats.c:27,48-49)
-        // wrapping the chain rewrite — set `in_progress`, write each chain
-        // slot exactly once (released slots join the free list, surviving
-        // ones are re-chained), update both list heads, bump `epoch`, clear
-        // `in_progress`. Writes go through the prepared targets; no
-        // arithmetic and no fallible work.
-        let free_head = header.free_list_head();
-        header.mark_in_progress();
-        let mut next_kept = NULL_INDEX;
-        let mut next_free = free_head;
-        for (((index, entry), target), frees) in
-            chain.iter().zip(&targets).zip(release_now.iter()).rev()
-        {
-            let mut changed = *entry;
-            if *frees {
-                changed.set_state(EntryState::Free);
-                changed.set_link(next_free);
-                next_free = u64::from(*index);
-            } else {
-                changed.set_link(next_kept);
-                next_kept = u64::from(*index);
-            }
-            // SAFETY: `target` was computed by `entry_write_target` for
-            // this exact slot during this preparation phase.
-            unsafe { mapping.write_entry(*target, changed) };
-        }
-        header.store_removed_list_head(next_kept);
-        header.store_free_list_head(next_free);
-        header.bump_epoch();
-        header.clear_in_progress();
-
-        // Release the reclaimed blocks after publication; an error here
-        // surfaces corruption (the slots are already free, so the caller's
-        // structural change still holds).
-        for (_, entry) in released {
-            self.release_metric_storage(&mapping, &entry)?;
-        }
-        Ok(())
-    }
-
-    /// Releases a metric block back to the segment arena, reconstructing
-    /// its exact layout from the versioned descriptor header.
-    fn release_metric_storage(
-        &self,
-        mapping: &Mapping,
-        entry: &DirectorySlot,
-    ) -> Result<(), StatsError> {
-        let descriptor = mapping.descriptor(entry.descriptor_offset())?;
-        if descriptor.version() != crate::descriptor::DESCRIPTOR_VERSION {
-            return Err(StatsError::InvalidDescriptor(
-                "corrupt metric block version".to_owned(),
-            ));
-        }
-        let total_size = descriptor.total_size();
-        if total_size < crate::descriptor::MIN_BLOCK_BYTES
-            || total_size > crate::descriptor::MAX_BLOCK_BYTES as u64
-            || total_size % 64 != 0
-        {
-            return Err(StatsError::InvalidDescriptor(
-                "corrupt metric block size".to_owned(),
-            ));
-        }
-        let layout = Layout::from_size_align(total_size as usize, 64)
-            .map_err(|_| StatsError::InvalidLayout)?;
-        let allocation = unsafe {
-            SegmentAllocation::from_raw_offset(
-                self.segment.clone(),
-                entry.descriptor_offset().get(),
-                layout,
-            )?
-        };
-        drop(allocation);
+        self.directory_blocks.push(new_allocation);
+        // Retain the old directory while any reader can still be finishing
+        // its pre-publication offset read; reclaim at StatsMain drop.
+        self.retired_directories.push(old_allocation);
         Ok(())
     }
 }
 
-/// Rounds `value` up to a multiple of `align` (a power of two), or `None`
-/// if the rounding would overflow `usize`.
-fn align_up(value: usize, align: usize) -> Option<usize> {
-    value.checked_add(align - 1).map(|v| v & !(align - 1))
+fn read_dump_value(
+    mapping: &Mapping,
+    id: EntryId,
+    slot: &DirectorySlot,
+    prometheus_type: PrometheusType,
+    directory_type: DirectoryType,
+    vector_index: Option<u32>,
+) -> Result<DumpValue, StatsError> {
+    match (prometheus_type, directory_type) {
+        (PrometheusType::Counter, DirectoryType::ScalarIndex) => {
+            CounterLayout::default().dump(mapping, id, slot, vector_index)
+        }
+        (PrometheusType::Gauge, DirectoryType::ScalarIndex) => {
+            TimestampLayout::default().dump(mapping, id, slot, vector_index)
+        }
+        (PrometheusType::Gauge, DirectoryType::Gauge) => {
+            GaugeLayout::default().dump(mapping, id, slot, vector_index)
+        }
+        (PrometheusType::Counter, DirectoryType::CounterVectorSimple) => {
+            CounterVectorSimpleLayout::decode(mapping, slot)?.dump(mapping, id, slot, vector_index)
+        }
+        (PrometheusType::Counter, DirectoryType::CounterVectorCombined) => {
+            CounterVectorCombinedLayout::decode(mapping, slot)?.dump(
+                mapping,
+                id,
+                slot,
+                vector_index,
+            )
+        }
+        (PrometheusType::Gauge, DirectoryType::NameVector) => {
+            NameVectorLayout::decode(mapping, slot)?.dump(mapping, id, slot, vector_index)
+        }
+        (PrometheusType::Counter, DirectoryType::HistogramLog2) => {
+            HistogramLog2Layout::decode(mapping, slot)?.dump(mapping, id, slot, vector_index)
+        }
+        (PrometheusType::Counter, DirectoryType::RingBuffer) => {
+            RingBufferLayout::decode(mapping, slot)?.dump(mapping, id, slot, vector_index)
+        }
+        _ => Err(StatsError::IncompatibleType {
+            id,
+            prometheus_type,
+            directory_type,
+        }),
+    }
+}
+
+fn ring_slot_offset(
+    data_offset: Offset,
+    slot_stride: u64,
+    rows: u32,
+    capacity: u32,
+    row: u32,
+    slot: u32,
+) -> Result<Offset, StatsError> {
+    if row >= rows || slot >= capacity {
+        return Err(StatsError::OutOfBounds);
+    }
+    let physical = u64::from(row)
+        .checked_mul(u64::from(capacity))
+        .and_then(|base| base.checked_add(u64::from(slot)))
+        .ok_or(StatsError::OutOfBounds)?;
+    data_offset
+        .checked_add(
+            physical
+                .checked_mul(slot_stride)
+                .ok_or(StatsError::OutOfBounds)?,
+        )
+        .ok_or(StatsError::OutOfBounds)
+}
+
+fn read_ring_slot_bytes(
+    mapping: &Mapping,
+    offset: Offset,
+    entry_size: usize,
+) -> Result<Vec<u8>, StatsError> {
+    mapping.read_bytes(offset, entry_size)
 }
 
 /// A per-instance unique shared-memory name, so concurrent `StatsMain`
@@ -1076,7 +2982,6 @@ mod tests {
         assert_eq!(header.directory_capacity(), INITIAL_DIRECTORY_SLOTS);
         assert_eq!(header.initialized_len(), 0);
         assert_eq!(header.free_list_head(), NULL_INDEX);
-        assert_eq!(header.removed_list_head(), NULL_INDEX);
         let directory_offset = header.directory_offset();
         assert_eq!(
             directory_offset.get() % 64,
@@ -1087,6 +2992,55 @@ mod tests {
             directory_offset.get() >= page as u64,
             "directory must start after the reserved first page"
         );
+    }
+
+    #[test]
+    fn register_uses_free_slot_before_capacity_failure() {
+        let page = hammer_infra::page_size().expect("page size must be queryable");
+        let mut stats = StatsMain::with_capacity(2 * page).expect("two pages construct");
+        let (id, handle) = stats
+            .add_counter("/removed", prometheus::Opts::new("removed", "removed"))
+            .expect("counter");
+        stats.remove_entry(id).expect("remove");
+        drop(handle);
+
+        let before = {
+            let mapping = Mapping::new(&stats.segment);
+            let header = mapping.header();
+            (header.epoch(), header.free_list_head())
+        };
+
+        let help = "x".repeat(1_000);
+        let count = page / 256 + 32;
+        let paths: Vec<String> = (0..count).map(|index| format!("/large/{index}")).collect();
+        let names: Vec<String> = (0..count).map(|index| format!("large_{index}")).collect();
+        let registrations: Vec<StatsRegistration<'_>> = paths
+            .iter()
+            .zip(&names)
+            .map(|(path, name)| StatsRegistration {
+                path,
+                descriptor: StatsDescriptor {
+                    fq_name: name,
+                    help: &help,
+                    const_labels: &[],
+                },
+                value: StatsValueLayout::Counter,
+            })
+            .collect();
+
+        let Err(error) = stats.register(&registrations) else {
+            panic!("capacity-constrained batch unexpectedly succeeded");
+        };
+        assert!(matches!(error, StatsError::SegmentFull));
+
+        let after = {
+            let mapping = Mapping::new(&stats.segment);
+            let header = mapping.header();
+            (header.epoch(), header.free_list_head())
+        };
+        assert_eq!(before.1, u64::from(id.index()));
+        assert!(after.0 > before.0, "registration must publish entries");
+        assert_eq!(after.1, NULL_INDEX, "the free slot must be consumed first");
     }
 
     /// Internal-corruption probe: a slot whose raw type bytes are each
@@ -1162,9 +3116,9 @@ mod tests {
 
     /// Active-generation invariant: for every active entry, the slot, the
     /// `EntryId`, the handle expectation, and the value record all carry
-    /// exactly one generation; removal advances slot and record together by
-    /// exactly one, and free-list reuse publishes that advanced generation
-    /// without a second increment.
+    /// exactly one generation; removal advances the slot exactly once, and
+    /// free-list reuse publishes that advanced generation without a second
+    /// increment.
     #[test]
     fn active_entry_generations_are_equal() {
         let mut stats = StatsMain::new().expect("default construction");
@@ -1185,22 +3139,14 @@ mod tests {
         assert_eq!(record.generation(), id0.generation);
         assert_eq!(counter.get().expect("live value"), 0);
 
-        // Remove while the handle is live: the slot joins the removed list
-        // and the record keeps its storage, so both stay safe to read. Both
-        // advanced by exactly one.
+        // Removal advances the directory slot once and makes the non-owning
+        // handle fail before it can touch the retired value block.
         stats.remove_entry(id0).expect("remove");
         let removed = mapping
             .entry(directory_offset, id0.index)
             .expect("removed slot");
         assert_eq!(removed.generation(), id0.generation + 1);
-        let removed_record = mapping
-            .metric_value(removed.value_offset())
-            .expect("removed record");
-        assert_eq!(removed_record.generation(), id0.generation + 1);
-        assert!(
-            counter.get().is_err(),
-            "the advanced record must stale direct handles"
-        );
+        assert!(counter.get().is_err(), "removed handles must be rejected");
 
         // Reuse publishes the slot's advanced generation as-is: no second
         // increment, and the fresh value record matches it.

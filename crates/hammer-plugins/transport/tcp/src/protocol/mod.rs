@@ -2,6 +2,7 @@ use std::cmp::Ordering;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 
 use hammer_infra::bihash::BihashKey;
+use hammer_runtime::node::NodeErrorCode;
 use thiserror::Error;
 
 pub mod options;
@@ -102,6 +103,13 @@ pub enum TcpError {
     Paws,
     #[error("segment not in receive window")]
     RcvWnd,
+}
+
+impl NodeErrorCode for TcpError {
+    #[inline(always)]
+    fn local_code(self) -> u16 {
+        self as u16
+    }
 }
 
 #[derive(Debug, Error, Clone, Copy, PartialEq, Eq)]

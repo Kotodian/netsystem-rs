@@ -83,24 +83,6 @@ enum TunError {
     WouldBlock,
 }
 
-impl TunError {
-    const fn code(&self) -> u16 {
-        match self {
-            Self::Runtime(_) => 1,
-            Self::TxQueueUnavailable { .. } => 2,
-            Self::WouldBlock => 3,
-            Self::EmptyPacket
-            | Self::EmptyTxPacket
-            | Self::UnsupportedIpVersion { .. }
-            | Self::PartialWrite { .. } => 4,
-            #[cfg(target_os = "macos")]
-            Self::UnsupportedAddressFamily { .. } | Self::AddressFamilyMismatch { .. } => 4,
-            Self::Io { .. } => 5,
-            _ => 6,
-        }
-    }
-}
-
 /// TUN-owned configuration under `[plugin.tun]`.
 #[derive(Debug, Clone, Default, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
 #[serde(deny_unknown_fields, default)]
@@ -502,10 +484,6 @@ impl TunWorkerRuntime {
 
     fn process_input(&mut self, runtime: &DataPlaneRuntime, frame: &mut BufferFrame) -> NodeResult {
         if let Err(error) = self.receive_packets(runtime, frame) {
-            let code = error.code();
-            if let Err(source) = runtime.record_current_node_error(code) {
-                tracing::error!(%source, code, "failed to record TUN input error");
-            }
             tracing::error!(%error, "TUN receive failed");
         }
         fanout_tun_input(runtime, frame);
@@ -521,10 +499,6 @@ impl TunWorkerRuntime {
         for index in frame.pending_indices() {
             let _ = add_packet_trace!(runtime, *index, TunOutputTrace { pending },);
             if let Err(error) = self.send_packet(runtime, *index) {
-                let code = error.code();
-                if let Err(source) = runtime.record_current_node_error(code) {
-                    tracing::error!(%source, code, "failed to record TUN output error");
-                }
                 tracing::error!(%error, ?index, "TUN transmit failed");
             }
         }

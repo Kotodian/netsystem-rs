@@ -1238,6 +1238,7 @@ dependencies = [
  "hammer-core",
  "hammer-infra",
  "hammer-service",
+ "hammer-stats",
  "humantime-serde",
  "indoc",
  "io-uring",

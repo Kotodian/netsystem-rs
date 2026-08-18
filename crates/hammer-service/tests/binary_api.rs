@@ -830,8 +830,10 @@ fn stats_list_and_dump_roundtrip_system_metrics() {
             run_client(move || {
                 let mut client = StatsClient::connect(client_path).expect("connect stats client");
 
-                // Roundtrip: the three system scalars in directory order.
-                let entries = client.list(&[]).expect("list all");
+                // Roundtrip: the three service system scalars in directory order.
+                let entries = client
+                    .list(&["^/sys/(heartbeat|boottime|last_stats_clear)$".to_owned()])
+                    .expect("list system scalars");
                 assert_eq!(entries.len(), 3);
                 assert_eq!(entries[0].path, "/sys/heartbeat");
                 assert_eq!(entries[1].path, "/sys/boottime");
@@ -872,7 +874,7 @@ fn stats_list_and_dump_roundtrip_system_metrics() {
                 // The collector bumps the heartbeat once per 50 ms interval:
                 // wait for a strictly newer value than the first snapshot
                 // (bounded eventual check; no wall-clock value asserts).
-                let first_heartbeat = dump[1].value;
+                let first_heartbeat = dump[1].value.clone();
                 let deadline = std::time::Instant::now() + Duration::from_secs(5);
                 loop {
                     std::thread::sleep(Duration::from_millis(25));

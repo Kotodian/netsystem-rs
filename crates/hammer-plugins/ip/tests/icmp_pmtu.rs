@@ -248,7 +248,6 @@ fn capture_process(
             Ok(bytes) => bytes,
             Err(_) => return NodeResult::drop(),
         };
-        let _ = runtime.node_error(index);
         match state.lock() {
             Ok(mut guard) => guard.packets.push(packet.to_vec()),
             Err(_) => return NodeResult::drop(),

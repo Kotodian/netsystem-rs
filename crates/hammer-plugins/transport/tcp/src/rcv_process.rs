@@ -125,7 +125,7 @@ fn tcp_rcv_process_index(
     let control = main.with_worker(runtime, |sessions, tcp| {
         let session_id = read_session_id(runtime, index)?.ok_or_else(|| {
             let _ = runtime
-                .record_current_node_error(TcpNodeError::RcvProcessSessionRouteMissing.code());
+                .record_current_node_error(TcpNodeError::RcvProcessSessionRouteMissing);
             TcpNodeError::RcvProcessSessionRouteMissing
         })?;
         // Warm the session pool slot cacheline before the `session_mut`
@@ -143,7 +143,7 @@ fn tcp_rcv_process_index(
             } = tcp;
             let connection = connections.get_mut(connection_index).ok_or_else(|| {
                 let _ = runtime
-                    .record_current_node_error(TcpNodeError::RcvProcessSessionMissing.code());
+                    .record_current_node_error(TcpNodeError::RcvProcessSessionMissing);
                 TcpNodeError::RcvProcessSessionMissing
             })?;
             let previous_state = connection.state();

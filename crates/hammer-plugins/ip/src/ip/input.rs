@@ -13,7 +13,7 @@ use crate::ip::{
 };
 use crate::protocol::ip_ecn::IpEcnCodepoint;
 use hammer_service::data_plane::{
-    FeatureArcSpec, FeatureArcStartHandle, set_buffer_node_error_code,
+    FeatureArcSpec, FeatureArcStartHandle, set_buffer_node_error,
 };
 use hammer_service::opaque::NetworkOpaque;
 
@@ -206,7 +206,7 @@ fn next_slot_for_index(
         let traced = buffer.trace_handle().is_some();
         match parse_ip_header(buffer.current()) {
             Err(_) => {
-                set_buffer_node_error_code(runtime, &mut buffer, IpInputError::BadLength.code())?;
+                set_buffer_node_error(runtime, &mut buffer, IpInputError::BadLength)?;
                 let resolved = IpInputNext::Drop.slot() as u16;
                 drop(buffer);
                 if unlikely(traced) {
@@ -229,7 +229,7 @@ fn next_slot_for_index(
                 if parsed.input_error == IpInputError::None {
                     buffer.clear_node_error();
                 } else {
-                    set_buffer_node_error_code(runtime, &mut buffer, parsed.input_error.code())?;
+                    set_buffer_node_error(runtime, &mut buffer, parsed.input_error)?;
                 }
                 let network = network_for_protocol(parsed.protocol);
                 let cursor = if network.is_some() {

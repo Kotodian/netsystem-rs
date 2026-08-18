@@ -265,18 +265,6 @@ pub struct FileMain {
     deadlines: Pool<Deadline>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct FileRuntimeStatsRow {
-    pub index: Index,
-    pub fd: RawFd,
-    pub description: String,
-    pub read_enabled: bool,
-    pub write_enabled: bool,
-    pub read_events: u64,
-    pub write_events: u64,
-    pub error_events: u64,
-}
-
 impl FileMain {
     /// Creates the platform poller and empty File registry for one Data Worker.
     pub fn new() -> RuntimeResult<Self> {
@@ -383,22 +371,6 @@ impl FileMain {
     /// Looks up a live File, rejecting stale generations.
     pub fn get(&self, index: Index) -> Option<&File> {
         self.files.get(index)
-    }
-
-    pub fn runtime_stats_snapshot(&self) -> Vec<FileRuntimeStatsRow> {
-        self.files
-            .iter()
-            .map(|(index, file)| FileRuntimeStatsRow {
-                index,
-                fd: file.fd(),
-                description: file.description.clone(),
-                read_enabled: file.functions.read.is_some() || file.functions.error.is_some(),
-                write_enabled: file.write_enabled,
-                read_events: file.read_events,
-                write_events: file.write_events,
-                error_events: file.error_events,
-            })
-            .collect()
     }
 
     /// Reads into vectors through the live File selected by its Index.

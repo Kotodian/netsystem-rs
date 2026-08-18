@@ -1,11 +1,11 @@
 use std::mem::{align_of, size_of};
+use std::num::NonZeroU16;
 
 use hammer_core::data_plane::{
-    BUFFER_CACHE_LINE_SIZE, Buffer, BufferFlags, BufferFrame, BufferNodeError, BufferPacketCursor,
-    BufferPoolArena, BufferRef, BufferRefMut, DEFAULT_BUFFER_FRAME_CAPACITY,
-    DEFAULT_BUFFER_FRAME_POOL_SIZE, DEFAULT_PACKET_HEADROOM, DataPlaneBuffers, Frame,
-    FrameBatchWidth, Index, Next, NodeId, PRIMARY_OPAQUE_ALIGN, PRIMARY_OPAQUE_BYTES, Pending,
-    PrimaryOpaque, SecondaryOpaque,
+    BUFFER_CACHE_LINE_SIZE, Buffer, BufferFlags, BufferFrame, BufferPacketCursor, BufferPoolArena,
+    BufferRef, BufferRefMut, DEFAULT_BUFFER_FRAME_CAPACITY, DEFAULT_BUFFER_FRAME_POOL_SIZE,
+    DEFAULT_PACKET_HEADROOM, DataPlaneBuffers, Frame, FrameBatchWidth, Index, Next, NodeErrorIndex,
+    NodeId, PRIMARY_OPAQUE_ALIGN, PRIMARY_OPAQUE_BYTES, Pending, PrimaryOpaque, SecondaryOpaque,
 };
 use hammer_core::error::{BufferInvariant, DataPlaneError, DataPlaneResult};
 
@@ -19,6 +19,39 @@ fn test_buffers(buffer_slot_capacity: usize, buffer_slots: usize) -> DataPlaneBu
         0,
         0,
     )
+}
+
+#[test]
+fn node_error_index_rejects_zero() {
+    assert!(NodeErrorIndex::new(0).is_none());
+    assert!(NodeErrorIndex::try_from(0u16).is_err());
+}
+
+#[test]
+fn node_error_index_round_trips_nonzero_encoding() {
+    let encoded = 0x1234;
+    let index = NodeErrorIndex::try_from(encoded).expect("nonzero index");
+    let nonzero = NonZeroU16::new(encoded).expect("nonzero encoding");
+
+    assert_eq!(index.get(), encoded);
+    assert_eq!(NonZeroU16::from(index), nonzero);
+    assert_eq!(u16::from(index), encoded);
+    assert_eq!(NodeErrorIndex::from(nonzero), index);
+    assert_eq!(size_of::<Option<NodeErrorIndex>>(), size_of::<u16>());
+}
+
+#[test]
+fn buffer_node_error_index_set_and_clear() {
+    let buffers = test_buffers(64, 1);
+    let buffer_index = buffers.alloc_index().expect("buffer");
+    let error_index = NodeErrorIndex::try_from(7).expect("nonzero index");
+    let mut buffer = buffers.get_buffer_mut(buffer_index).expect("buffer");
+
+    assert_eq!(buffer.node_error_index(), None);
+    buffer.set_node_error_index(error_index);
+    assert_eq!(buffer.node_error_index(), Some(error_index));
+    buffer.clear_node_error();
+    assert_eq!(buffer.node_error_index(), None);
 }
 
 fn chain_bytes(buffers: &DataPlaneBuffers, index: Index) -> Vec<u8> {
@@ -110,10 +143,6 @@ fn core_buffer_cursor_chain_and_error_metadata_behave_as_data_plane_primitives()
     assert_eq!(cursor.transport_header_offset(), 34);
     assert_eq!(cursor.transport_header_len(), 20);
     assert_eq!(cursor.transport_payload_offset(), 54);
-
-    let error = BufferNodeError::new(NodeId::new(9), 3);
-    assert_eq!(error.node(), NodeId::new(9));
-    assert_eq!(error.code(), 3);
 
     let buffers = test_buffers(4, 4);
     let head = buffers

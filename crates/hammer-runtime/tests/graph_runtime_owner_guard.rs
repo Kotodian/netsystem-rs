@@ -17,9 +17,7 @@ const ROOT_BANNED_RUNTIME_IMPORTS: &[&str] = &[
     "NodeResult",
     "NodeRuntime",
     "NodeRuntimeData",
-    "NodeErrorCounters",
     "NodeRuntimeReady",
-    "NodeRuntimeStatsRow",
     "NoopNode",
     "default_prefetch_indices",
     "PacketTrace",
@@ -69,9 +67,7 @@ const DIRECT_BANNED_RUNTIME_OWNER_PATHS: &[&str] = &[
     "hammer_adapter::NodeResult",
     "hammer_adapter::NodeRuntime",
     "hammer_adapter::NodeRuntimeData",
-    "hammer_adapter::NodeErrorCounters",
     "hammer_adapter::NodeRuntimeReady",
-    "hammer_adapter::NodeRuntimeStatsRow",
     "hammer_adapter::NoopNode",
     "hammer_adapter::default_prefetch_indices",
     "hammer_adapter::DataPlaneTrace",
@@ -132,7 +128,7 @@ fn graph_runtime_owner_paths_do_not_point_at_adapter() {
 #[test]
 fn grouped_adapter_runtime_and_retired_contract_imports_are_rejected() {
     let source = r#"
-        use hammer_adapter::{DataPlaneRuntime, DataPlaneTrace, NodeRuntimeStatsRow, PlatformInterface};
+        use hammer_adapter::{DataPlaneRuntime, DataPlaneTrace, PlatformInterface};
         pub use hammer_adapter::{NodeEntry, TracePolicy};
     "#;
 
@@ -154,12 +150,6 @@ fn grouped_adapter_runtime_and_retired_contract_imports_are_rejected() {
             .iter()
             .any(|violation| violation.contains("NodeEntry")),
         "expected grouped pub use to be rejected: {violations:#?}"
-    );
-    assert!(
-        violations
-            .iter()
-            .any(|violation| violation.contains("NodeRuntimeStatsRow")),
-        "expected grouped stats import to be rejected: {violations:#?}"
     );
     assert!(
         violations
