@@ -13,92 +13,14 @@ use hammer_runtime::RuntimeRegistry;
 use crate::config::Worker;
 use crate::data_plane::{DataPlaneRuntimeWorkerConfig, DataPlaneRuntimeWorkerSeed};
 use crate::init::InitFunction;
-use crate::node::{NodeRuntimeData, NodeRuntimeInner, NodeStatsHandles};
+use crate::node::{NodeRuntimeData, NodeRuntimeInner};
 use crate::process::ProcessMain;
 use crate::spawn::{DataRemoteLocalQueue, DataRemoteLocalQueueError};
 use crate::{DataPlaneHandoffWorker, DataWorkerId, FileMain, PluginMain, ProcessHandle};
-use hammer_stats::{StatsDescriptor, StatsEntry, StatsMain, StatsRegistration, StatsValueLayout};
 
 thread_local! {
     static CURRENT_ENGINE: RefCell<Option<*mut Engine>> = const { RefCell::new(None) };
 }
-
-#[repr(usize)]
-#[derive(Clone, Copy, PartialEq, Eq)]
-pub(crate) enum NodeStatsRoot {
-    Clocks,
-    Vectors,
-    Calls,
-    Suspends,
-    Errors,
-}
-
-impl NodeStatsRoot {
-    pub(crate) const COUNT: usize = 5;
-    pub(crate) const ALL: [Self; Self::COUNT] = [
-        Self::Clocks,
-        Self::Vectors,
-        Self::Calls,
-        Self::Suspends,
-        Self::Errors,
-    ];
-
-    #[inline]
-    pub(crate) const fn index(self) -> usize {
-        self as usize
-    }
-
-    #[inline]
-    pub(crate) const fn is_error(self) -> bool {
-        self.index() == Self::Errors.index()
-    }
-
-    #[inline]
-    pub(crate) const fn name(self) -> &'static str {
-        ["clocks", "vectors", "calls", "suspends", "errors"][self.index()]
-    }
-}
-
-#[derive(Clone, Copy)]
-struct NodeStatsRootSpec {
-    root: NodeStatsRoot,
-    path: &'static str,
-    fq_name: &'static str,
-    help: &'static str,
-}
-
-const NODE_STATS_ROOTS: [NodeStatsRootSpec; NodeStatsRoot::COUNT] = [
-    NodeStatsRootSpec {
-        root: NodeStatsRoot::Clocks,
-        path: "/sys/node/clocks",
-        fq_name: "hammer_node_clocks_total",
-        help: "node execution clocks in nanoseconds",
-    },
-    NodeStatsRootSpec {
-        root: NodeStatsRoot::Vectors,
-        path: "/sys/node/vectors",
-        fq_name: "hammer_node_vectors_total",
-        help: "vectors processed by node executions",
-    },
-    NodeStatsRootSpec {
-        root: NodeStatsRoot::Calls,
-        path: "/sys/node/calls",
-        fq_name: "hammer_node_calls_total",
-        help: "node execution calls",
-    },
-    NodeStatsRootSpec {
-        root: NodeStatsRoot::Suspends,
-        path: "/sys/node/suspends",
-        fq_name: "hammer_node_suspends_total",
-        help: "node process suspends",
-    },
-    NodeStatsRootSpec {
-        root: NodeStatsRoot::Errors,
-        path: "/node/errors",
-        fq_name: "hammer_node_errors_total",
-        help: "node error counters",
-    },
-];
 
 pub(crate) struct EngineWorkerSeed {
     runtime_seed: DataPlaneRuntimeWorkerSeed,
@@ -197,7 +119,6 @@ impl WorkerPublication {
         // zero.
         unsafe { (*slot.get()).take() }
     }
-
 }
 
 // SAFETY: all shared access to these UnsafeCell values follows the ownership
@@ -227,12 +148,6 @@ pub struct Engine {
     pub(crate) called_main_loop_exit_functions: HashSet<&'static str>,
     pub(crate) main_loop_entered: bool,
     materialized_registration_generation: u64,
-    /// The sole structural stats owner. Only the main Engine installs it;
-    /// worker Engines leave this slot empty.
-    stats_main: Option<StatsMain>,
-    /// Main-thread direct roots used to rebuild the immutable worker bundle
-    /// when graph dimensions grow.
-    stats_roots: Option<NodeStatsHandles>,
     publication: Arc<WorkerPublication>,
     pub(crate) workers_updating_graph: Arc<AtomicU32>,
     // VPP `need_vlib_worker_thread_node_runtime_update`: set when a graph
@@ -246,33 +161,6 @@ pub struct Engine {
     // images themselves remain mapped for the full process lifetime.
     plugin_main: PluginMain,
 }
-
-const NODE_STATS_SYMLINKS: [(&str, &str, &str, &str); 4] = [
-    (
-        "clocks",
-        "hammer_node_clocks_total",
-        "node clocks",
-        "/sys/node/clocks",
-    ),
-    (
-        "vectors",
-        "hammer_node_vectors_total",
-        "node vectors",
-        "/sys/node/vectors",
-    ),
-    (
-        "calls",
-        "hammer_node_calls_total",
-        "node calls",
-        "/sys/node/calls",
-    ),
-    (
-        "suspends",
-        "hammer_node_suspends_total",
-        "node suspends",
-        "/sys/node/suspends",
-    ),
-];
 
 impl Engine {
     #[inline]
@@ -311,8 +199,6 @@ impl Engine {
             called_main_loop_exit_functions: HashSet::new(),
             main_loop_entered: false,
             materialized_registration_generation: 0,
-            stats_main: None,
-            stats_roots: None,
             publication,
             workers_updating_graph,
             deferred_finish_pending: AtomicBool::new(false),
@@ -347,8 +233,6 @@ impl Engine {
             called_main_loop_exit_functions: HashSet::new(),
             main_loop_entered: false,
             materialized_registration_generation: 0,
-            stats_main: None,
-            stats_roots: None,
             publication: Arc::new(WorkerPublication::new(0)),
             workers_updating_graph: Arc::new(AtomicU32::new(0)),
             deferred_finish_pending: AtomicBool::new(false),
@@ -366,285 +250,6 @@ impl Engine {
         engine.worker_config = worker;
         engine.memory_initialized = true;
         Ok(engine)
-    }
-
-    /// Installs the main-thread-owned stats segment exactly once.
-    ///
-    /// Stats registration is structural main-thread work. Data Worker Engines
-    /// cannot install a segment, and a second installation leaves the new
-    /// value with the caller.
-    pub fn install_stats_main(&mut self, stats: StatsMain) -> Result<(), StatsMain> {
-        if self.thread_index != 0 || self.stats_main.is_some() {
-            return Err(stats);
-        }
-        self.stats_main = Some(stats);
-        Ok(())
-    }
-
-    /// Runs an operation against the main Engine's stats segment directly.
-    ///
-    /// This intentionally does not acquire the Worker Barrier: callers are
-    /// main-thread control-plane code, while workers have no stats segment.
-    pub fn with_stats_main<R>(&mut self, operation: impl FnOnce(&mut StatsMain) -> R) -> Option<R> {
-        if self.thread_index != 0 {
-            return None;
-        }
-        self.stats_main.as_mut().map(operation)
-    }
-
-    /// Installs or grows the VPP-shaped graph statistics roots and directory
-    /// links. All structural work stays on the main thread and completes
-    /// before the worker graph snapshot is published.
-    pub(crate) fn install_graph_stats(&mut self) -> RuntimeResult<()> {
-        if self.thread_index != 0 {
-            return Err(RuntimeError::ControlRequiresMainThread);
-        }
-        if self.stats_main.is_none() {
-            return Ok(());
-        }
-        let rows = self.configured_worker_count().checked_add(1).ok_or(
-            RuntimeError::WorkerCountOverflow {
-                count: self.configured_worker_count(),
-            },
-        )?;
-        let rows = u32::try_from(rows).map_err(|_| RuntimeError::WorkerCountOverflow {
-            count: self.configured_worker_count(),
-        })?;
-        let node_columns = u32::try_from(self.runtime.nodes().node_count())
-            .map_err(|_| RuntimeError::NodeIdOverflow {
-                slot: self.runtime.nodes().node_count(),
-            })?
-            .max(1);
-        let error_columns = self.runtime.nodes().stats_error_column_count();
-        let mut roots = self.stats_roots.take();
-
-        {
-            let stats = self
-                .stats_main
-                .as_mut()
-                .ok_or(RuntimeError::lifecycle(
-                    "install graph stats",
-                    "StatsMain disappeared from the main Engine",
-                ))?;
-            if let Some(installed) = roots.as_mut() {
-                for spec in NODE_STATS_ROOTS {
-                    let minimum_columns = if spec.root.is_error() {
-                        error_columns.max(1)
-                    } else {
-                        node_columns.max(1)
-                    };
-                    let handle = &installed.roots[spec.root.index()];
-                    if handle.rows() != rows || handle.columns() < minimum_columns {
-                        let columns = handle.columns().max(minimum_columns);
-                        let (_, replacement) =
-                            stats.replace_counter_vector_simple(spec.path, rows, columns)?;
-                        installed.roots[spec.root.index()] = Arc::new(replacement);
-                    }
-                }
-            } else {
-                let active_paths: HashSet<String> = stats
-                    .list(&[])?
-                    .into_iter()
-                    .map(|entry| entry.path)
-                    .collect();
-                let mut handles: [Option<hammer_stats::CounterVectorSimple>; NodeStatsRoot::COUNT] =
-                    std::array::from_fn(|_| None);
-                let mut missing = Vec::new();
-                for spec in NODE_STATS_ROOTS {
-                    let columns = if spec.root.is_error() {
-                        error_columns.max(1)
-                    } else {
-                        node_columns.max(1)
-                    };
-                    if active_paths.contains(spec.path) {
-                        let (_, handle) =
-                            stats.replace_counter_vector_simple(spec.path, rows, columns)?;
-                        handles[spec.root.index()] = Some(handle);
-                    } else {
-                        missing.push(spec);
-                    }
-                }
-                if !missing.is_empty() {
-                    let registrations: Vec<StatsRegistration<'static>> = missing
-                        .iter()
-                        .copied()
-                        .map(|spec| StatsRegistration {
-                            path: spec.path,
-                            descriptor: StatsDescriptor {
-                                fq_name: spec.fq_name,
-                                help: spec.help,
-                                const_labels: &[],
-                            },
-                            value: StatsValueLayout::CounterVectorSimple {
-                                rows,
-                                columns: if spec.root.is_error() {
-                                    error_columns.max(1)
-                                } else {
-                                    node_columns.max(1)
-                                },
-                            },
-                        })
-                        .collect();
-                    let entries = stats.register(&registrations)?;
-                    if entries.len() != missing.len() {
-                        return Err(RuntimeError::lifecycle(
-                            "install graph stats",
-                            "root registration returned an unexpected entry count",
-                        ));
-                    }
-                    for (spec, entry) in missing.iter().zip(entries) {
-                        let StatsEntry::CounterVectorSimple { handle, .. } = entry else {
-                            return Err(RuntimeError::NodeStatsEntryKind {
-                                path: spec.path.to_owned(),
-                            });
-                        };
-                        handles[spec.root.index()] = Some(handle);
-                    }
-                }
-                let root_handles: [Arc<hammer_stats::CounterVectorSimple>;
-                    NodeStatsRoot::COUNT] = handles
-                    .into_iter()
-                    .map(|handle| {
-                        handle
-                            .map(Arc::new)
-                            .ok_or_else(|| RuntimeError::lifecycle(
-                                "install graph stats",
-                                "root registration did not return all five vectors",
-                            ))
-                    })
-                    .collect::<RuntimeResult<Vec<_>>>()?
-                    .try_into()
-                    .map_err(|_| {
-                        RuntimeError::lifecycle(
-                            "install graph stats",
-                            "root registration did not return all five vectors",
-                        )
-                    })?;
-                roots = Some(NodeStatsHandles {
-                    roots: root_handles,
-                });
-            }
-        }
-        self.stats_roots = roots;
-
-        let roots = self.stats_roots.as_ref().ok_or(RuntimeError::lifecycle(
-            "install graph stats",
-            "graph statistics roots were not installed",
-        ))?;
-        self.runtime
-            .nodes()
-            .install_stats_handles(Arc::new(roots.clone()), rows)?;
-
-        let entries = self.plugin_main.graph_nodes();
-        let stats = self
-            .stats_main
-            .as_mut()
-            .ok_or(RuntimeError::lifecycle(
-                "install graph stats",
-                "StatsMain disappeared from the main Engine",
-            ))?;
-        let active_paths: HashSet<String> = stats
-            .list(&[])?
-            .into_iter()
-            .map(|entry| entry.path)
-            .collect();
-        let mut pending_paths = HashSet::new();
-        let mut pending: Vec<(
-            String,
-            String,
-            String,
-            Vec<(&'static str, String)>,
-            &'static str,
-            u32,
-        )> = Vec::new();
-        for entry in entries {
-            let Some(node_name) = entry.registration.name() else {
-                continue;
-            };
-            let node = self
-                .runtime
-                .node_by_name(node_name)
-                .ok_or(RuntimeError::lifecycle(
-                    "install graph stats",
-                    format!("named graph node `{node_name}` is not materialized"),
-                ))?;
-            for &(metric, fq_name, help, target) in &NODE_STATS_SYMLINKS {
-                let path = format!("/nodes/{node_name}/{metric}");
-                if active_paths.contains(&path) || !pending_paths.insert(path.clone()) {
-                    continue;
-                }
-                pending.push((
-                    path,
-                    fq_name.to_owned(),
-                    help.to_owned(),
-                    vec![("node", node_name.to_owned())],
-                    target,
-                    node.slot(),
-                ));
-            }
-            for (local_code, descriptor) in entry.error_counters.iter().enumerate() {
-                let local_code =
-                    u16::try_from(local_code).map_err(|_| RuntimeError::NodeErrorSlotOverflow)?;
-                let index = self.runtime.nodes().node_error_index(node, local_code)?;
-                let global_index = index.get();
-                let severity = match descriptor.severity {
-                    crate::node::NodeErrorSeverity::Error => "error",
-                    crate::node::NodeErrorSeverity::Warn => "warn",
-                    crate::node::NodeErrorSeverity::Info => "info",
-                };
-                let path = format!("/err/{node_name}/{}", descriptor.name);
-                if active_paths.contains(&path) || !pending_paths.insert(path.clone()) {
-                    continue;
-                }
-                pending.push((
-                    path,
-                    "hammer_node_error_total".to_owned(),
-                    if descriptor.description.is_empty() {
-                        "node error counter".to_owned()
-                    } else {
-                        descriptor.description.to_owned()
-                    },
-                    vec![
-                        ("node", node_name.to_owned()),
-                        ("reason", descriptor.name.to_owned()),
-                        ("severity", severity.to_owned()),
-                        ("index", global_index.to_string()),
-                    ],
-                    "/node/errors",
-                    u32::from(global_index),
-                ));
-            }
-        }
-        if pending.is_empty() {
-            return Ok(());
-        }
-        let label_refs: Vec<Vec<(&str, &str)>> = pending
-            .iter()
-            .map(|(_, _, _, labels, _, _)| {
-                labels
-                    .iter()
-                    .map(|(name, value)| (*name, value.as_str()))
-                    .collect()
-            })
-            .collect();
-        let registrations: Vec<(&str, StatsDescriptor<'_>, &str, u32)> = pending
-            .iter()
-            .zip(&label_refs)
-            .map(|((path, fq_name, help, _, target, vector_index), labels)| {
-                (
-                    path.as_str(),
-                    StatsDescriptor {
-                        fq_name,
-                        help,
-                        const_labels: labels,
-                    },
-                    *target,
-                    *vector_index,
-                )
-            })
-            .collect();
-        stats.register_symlinks(&registrations)?;
-        Ok(())
     }
 
     pub fn loaded_plugins(&self) -> Vec<String> {
@@ -717,7 +322,6 @@ impl Engine {
             let functions = self.plugin_main.node_functions();
             self.runtime
                 .extend_graph_with_node_functions(&entries, &functions)?;
-            self.install_graph_stats()?;
             crate::init::run_config_functions(self, false, config)?;
             if worker_count != 0 {
                 self.publish_worker_graph(worker_count)?;

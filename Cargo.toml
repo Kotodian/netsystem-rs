@@ -2,7 +2,6 @@
 resolver = "3"
 members = [
     "crates/hammer-infra",
-    "crates/hammer-stats",
     "crates/hammer-core",
     "crates/hammer-component-macros",
     "crates/hammer-runtime",

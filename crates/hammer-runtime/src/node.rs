@@ -3,21 +3,16 @@ use std::collections::HashMap;
 use std::future::Future;
 use std::pin::Pin;
 use std::rc::Rc;
-use std::sync::Arc;
 use std::task::{Context, Poll, Waker};
-use std::time::Instant;
 
 use crate::error::{RuntimeError, RuntimeResult};
+use crate::trace::TraceFormatter;
+use crate::{DataPlaneRuntime, Simd};
 use hammer_core::data_plane::{
     BufferFrame, Frame, NodeErrorIndex, NodeErrorIndexError, NodeHandle, NodeId, NodeKind,
     NodeNext, NodeRegistration, NodeState, Pending,
 };
 use hammer_core::error::DataPlaneError;
-use hammer_stats::CounterVectorSimple;
-
-use crate::engine::NodeStatsRoot;
-use crate::trace::TraceFormatter;
-use crate::{DataPlaneRuntime, Simd};
 
 pub mod next;
 
@@ -252,7 +247,7 @@ fn missing_node_process(
         })
         .unwrap_or_else(|| "current node".to_owned());
     // Programming error: node descriptor missing a process function. Drop
-    // the frame silently; the error is logged in the runtime stats.
+    // the frame silently.
     _ = current;
     NodeResult::drop()
 }
@@ -465,14 +460,6 @@ impl NodeReadiness {
     }
 }
 
-/// Direct StatsMain handles installed with a graph snapshot. The bundle is
-/// immutable after installation; each worker graph clone shares the handles'
-/// atomic cells without a lock or a fallible clone operation.
-#[derive(Clone)]
-pub(crate) struct NodeStatsHandles {
-    pub(crate) roots: [Arc<CounterVectorSimple>; NodeStatsRoot::COUNT],
-}
-
 pub(crate) struct NodeRuntimeInner {
     nodes: Vec<NodeRuntimeSlot>,
     node_states: Vec<NodeState>,
@@ -481,7 +468,6 @@ pub(crate) struct NodeRuntimeInner {
     error_indices: Vec<Box<[NodeErrorIndex]>>,
     next_error_index: u32,
     error_tables_installed: Vec<bool>,
-    stats_handles: Option<Arc<NodeStatsHandles>>,
     scheduled_frame_queue_capacity: usize,
     handles: HashMap<NodeHandle, NodeId>,
     declared_nodes: HashMap<&'static str, NodeId>,
@@ -504,7 +490,6 @@ impl Clone for NodeRuntimeInner {
             error_indices: self.error_indices.clone(),
             next_error_index: self.next_error_index,
             error_tables_installed: self.error_tables_installed.clone(),
-            stats_handles: self.stats_handles.as_ref().map(Arc::clone),
             scheduled_frame_queue_capacity: self.scheduled_frame_queue_capacity,
             handles: self.handles.clone(),
             declared_nodes: self.declared_nodes.clone(),
@@ -698,43 +683,6 @@ impl NodeRuntimeInner {
         self.next_error_index = end;
         self.error_tables_installed[slot] = true;
         Ok(())
-    }
-
-    fn install_stats_handles(
-        &mut self,
-        handles: Arc<NodeStatsHandles>,
-        expected_rows: u32,
-    ) -> RuntimeResult<()> {
-        let minimum_node_columns = u32::try_from(self.nodes.len())
-            .map_err(|_| RuntimeError::NodeIdOverflow {
-                slot: self.nodes.len(),
-            })?
-            .max(1);
-        let minimum_error_columns = self.next_error_index.max(1);
-        for root in NodeStatsRoot::ALL {
-            let handle = &handles.roots[root.index()];
-            let minimum_columns = if root.is_error() {
-                minimum_error_columns
-            } else {
-                minimum_node_columns
-            };
-            if handle.rows() != expected_rows || handle.columns() < minimum_columns {
-                return Err(RuntimeError::NodeStatsLayout {
-                    metric: root.name(),
-                    rows: handle.rows(),
-                    columns: handle.columns(),
-                    expected_rows,
-                    minimum_columns,
-                });
-            }
-        }
-        self.stats_handles = Some(handles);
-        Ok(())
-    }
-
-    #[inline]
-    fn error_column_count(&self) -> u32 {
-        self.next_error_index.max(1)
     }
 
     fn validate_node_error_batch(
@@ -1117,7 +1065,6 @@ mod local_next_slot_tests {
             error_indices: vec![Box::default(); 3],
             next_error_index: 1,
             error_tables_installed: vec![false; 3],
-            stats_handles: None,
             scheduled_frame_queue_capacity: 4,
             handles: HashMap::new(),
             declared_nodes: HashMap::new(),
@@ -1221,7 +1168,6 @@ impl Default for NodeRuntime {
                 error_indices: Vec::new(),
                 next_error_index: 1,
                 error_tables_installed: Vec::new(),
-                    stats_handles: None,
                 scheduled_frame_queue_capacity: DEFAULT_SCHEDULED_FRAME_QUEUE_CAPACITY,
                 handles: HashMap::new(),
                 declared_nodes: HashMap::new(),
@@ -1530,22 +1476,6 @@ impl NodeRuntime {
             .materialize_node_errors(node, descriptors)
     }
 
-    pub(crate) fn install_stats_handles(
-        &self,
-        handles: Arc<NodeStatsHandles>,
-        expected_rows: u32,
-    ) -> RuntimeResult<()> {
-        self.ensure_topology_owner()?;
-        self.inner
-            .borrow_mut()
-            .install_stats_handles(handles, expected_rows)
-    }
-
-    #[inline]
-    pub(crate) fn stats_error_column_count(&self) -> u32 {
-        self.inner.borrow().error_column_count()
-    }
-
     /// Drain scheduled frames and clear topology so `init_graph` can renumber.
     ///
     /// VPP analogue: barrier-held main-thread graph mutation before workers
@@ -1570,7 +1500,6 @@ impl NodeRuntime {
             error_indices: Vec::new(),
             next_error_index: 1,
             error_tables_installed: Vec::new(),
-            stats_handles: None,
             scheduled_frame_queue_capacity: capacity,
             handles: HashMap::new(),
             declared_nodes: HashMap::new(),
@@ -2083,22 +2012,15 @@ impl NodeRuntime {
         self.inner.borrow().node_error_index(node, code)
     }
 
-    /// Increment the preinstalled global error counter for a node-local code.
+    /// Return the preinstalled global index for a node-local error code.
     #[inline]
     pub(crate) fn record_node_error(
         &self,
-        thread_index: u32,
         node: NodeId,
         code: u16,
     ) -> RuntimeResult<NodeErrorIndex> {
         let inner = self.inner.borrow();
-        let index = inner.node_error_index(node, code)?;
-        if let Some(handles) = inner.stats_handles.as_ref() {
-            handles.roots[NodeStatsRoot::Errors.index()]
-                .increment(thread_index, u32::from(index.get()))
-                .map_err(RuntimeError::from)?;
-        }
-        Ok(index)
+        inner.node_error_index(node, code)
     }
 
     #[inline]
@@ -2186,43 +2108,13 @@ impl NodeRuntime {
             self.clear_interrupt_pending(node)?;
 
             runtime.set_current_node(Some(node));
-            let vectors = frame.pending_len();
-            let start = Instant::now();
             let frame = slot.dispatch(runtime, frame);
-            let elapsed_ns = elapsed_ns(start);
             runtime.flush_fanout_appendable();
             runtime.set_current_node(None);
-            let _ = self.record_runtime_stats(node, runtime.thread_index(), vectors, elapsed_ns);
             processed += 1;
             runtime.drop_pending_frame_owned(frame);
         }
         Ok(processed)
-    }
-
-    fn record_runtime_stats(
-        &self,
-        node: NodeId,
-        thread_index: u32,
-        vectors: usize,
-        elapsed_ns: u64,
-    ) -> RuntimeResult<()> {
-        let inner = self.inner.borrow();
-        let node_slot = node.slot();
-        let vector_count = u64::try_from(vectors).unwrap_or(u64::MAX);
-        if let Some(handles) = inner.stats_handles.as_ref() {
-            handles.roots[NodeStatsRoot::Calls.index()]
-                .increment(thread_index, node_slot)
-                .map_err(RuntimeError::from)?;
-            handles.roots[NodeStatsRoot::Vectors.index()]
-                .increment_by(thread_index, node_slot, vector_count)
-                .map_err(RuntimeError::from)?;
-            handles.roots[NodeStatsRoot::Clocks.index()]
-                .increment_by(thread_index, node_slot, elapsed_ns)
-                .map_err(RuntimeError::from)?;
-            // Suspends remain zero until an explicit process-suspend transition
-            // exists, matching VPP's process-sync accounting boundary.
-        }
-        Ok(())
     }
 
     fn validate_node(&self, node: NodeId) -> RuntimeResult<()> {
@@ -2246,10 +2138,6 @@ impl NodeRuntime {
         }
         scheduled
     }
-}
-
-fn elapsed_ns(start: Instant) -> u64 {
-    u64::try_from(start.elapsed().as_nanos()).unwrap_or(u64::MAX)
 }
 
 pub struct NodeRuntimeReady {
@@ -2365,11 +2253,11 @@ mod tests {
             .expect("materialize bounded error table");
 
         let index = runtime
-            .record_node_error(0, node, 0)
+            .record_node_error(node, 0)
             .expect("record valid error");
         assert_eq!(index.get(), 1);
         assert!(matches!(
-            runtime.record_node_error(0, node, 1),
+            runtime.record_node_error(node, 1),
             Err(RuntimeError::NodeErrorSlotOverflow)
         ));
     }
@@ -2387,7 +2275,7 @@ mod tests {
             .expect("materialize existing node errors");
         let worker = NodeRuntime::from(main.snapshot());
         worker
-            .record_node_error(0, existing, 0)
+            .record_node_error(existing, 0)
             .expect("record worker error");
 
         let added = register_error_test_node(&main, "added-errors");

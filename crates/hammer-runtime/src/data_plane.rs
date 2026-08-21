@@ -607,8 +607,7 @@ impl DataPlaneRuntime {
         let node = self
             .current_node()
             .ok_or(RuntimeError::NodeDispatchContextMissing)?;
-        self.nodes
-            .record_node_error(self.thread_index(), node, error.local_code())
+        self.nodes.record_node_error(node, error.local_code())
     }
 
     #[inline]
