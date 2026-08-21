@@ -16,7 +16,6 @@ macos-platform = []
 [dependencies]
 hammer-core = { path = "../hammer-core" }
 hammer-infra = { path = "../hammer-infra" }
-hammer-stats = { path = "../hammer-stats" }
 hammer-component-macros = { path = "../hammer-component-macros" }
 linkme = { workspace = true }
 petgraph = { workspace = true }

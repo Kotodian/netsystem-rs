@@ -18,10 +18,8 @@ crossbeam-utils = { workspace = true }
 hammer-core = { path = "../hammer-core" }
 hammer-infra = { path = "../hammer-infra" }
 hammer-ipc = { path = "../hammer-ipc" }
-hammer-stats = { path = "../hammer-stats" }
 hammer-component-macros = { path = "../hammer-component-macros" }
 hammer-runtime = { path = "../hammer-runtime", default-features = false }
-prometheus = { version = "0.14", default-features = false }
 ipnet = { workspace = true }
 nom = { workspace = true }
 prost = { workspace = true }

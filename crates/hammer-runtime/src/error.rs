@@ -6,20 +6,6 @@ use thiserror::Error;
 pub enum RuntimeError {
     #[error(transparent)]
     DataPlane(#[from] DataPlaneError),
-    #[error(transparent)]
-    Stats(#[from] hammer_stats::StatsError),
-    #[error(
-        "node stats vector `{metric}` has rows {rows}, columns {columns}; expected rows {expected_rows} and at least {minimum_columns} columns"
-    )]
-    NodeStatsLayout {
-        metric: &'static str,
-        rows: u32,
-        columns: u32,
-        expected_rows: u32,
-        minimum_columns: u32,
-    },
-    #[error("stats registration for `{path}` returned an unexpected entry kind")]
-    NodeStatsEntryKind { path: String },
     #[error("parse TOML: {message}")]
     ConfigParse { message: String },
     #[error("invalid runtime configuration: {message}")]

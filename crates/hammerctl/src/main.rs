@@ -1,13 +1,10 @@
 //! hammerctl — CLI client for hammer daemon
 
-use std::io;
 use std::path::PathBuf;
 use std::process::ExitCode;
 
 use clap::{Parser, Subcommand};
 use hammer_ipc::binary_api::BinaryApiClient;
-
-mod stats;
 
 /// Default Binary API Unix socket path, matching the convention documented
 /// in the example daemon config (`examples/tun-tcp-echo.toml`).
@@ -38,12 +35,6 @@ enum Command {
         #[arg(default_value = "")]
         payload_hex: String,
     },
-    /// Inspect the daemon's live stats segment
-    #[command(subcommand)]
-    Stats(stats::StatsCommand),
-    /// Show human-readable daemon measurements
-    #[command(subcommand)]
-    Show(stats::ShowCommand),
 }
 
 fn main() -> ExitCode {
@@ -80,23 +71,6 @@ fn main() -> ExitCode {
             }
             ExitCode::SUCCESS
         }
-        Command::Stats(command) => match stats::run(&cli.socket, command, &mut io::stdout()) {
-            Ok(()) => ExitCode::SUCCESS,
-            Err(error) => {
-                eprintln!("stats command failed: {error}");
-                ExitCode::FAILURE
-            }
-        },
-        Command::Show(stats::ShowCommand::Errors {
-            verbose,
-            include_zero,
-        }) => match stats::run_errors(&cli.socket, *verbose, *include_zero, &mut io::stdout()) {
-            Ok(()) => ExitCode::SUCCESS,
-            Err(error) => {
-                eprintln!("show errors command failed: {error}");
-                ExitCode::FAILURE
-            }
-        },
     }
 }
 
@@ -154,78 +128,6 @@ mod tests {
         assert_eq!(after.socket, PathBuf::from("/tmp/b.sock"));
 
         let default = Cli::try_parse_from(["hammerctl", "send", "m"]).expect("default socket");
-        assert_eq!(default.socket, PathBuf::from(DEFAULT_SOCKET));
-    }
-
-    #[test]
-    fn parses_stats_list_and_dump_with_zero_or_many_patterns() {
-        let bare = Cli::try_parse_from(["hammerctl", "stats", "list"]).expect("stats list");
-        match bare.cmd {
-            Command::Stats(stats::StatsCommand::List { patterns }) => {
-                assert!(patterns.is_empty(), "no patterns selects all entries")
-            }
-            other => panic!("expected stats list, got {other:?}"),
-        }
-
-        let one = Cli::try_parse_from(["hammerctl", "stats", "dump", "/sys/.*"])
-            .expect("stats dump with one pattern");
-        match one.cmd {
-            Command::Stats(stats::StatsCommand::Dump { patterns }) => {
-                assert_eq!(patterns, vec!["/sys/.*"])
-            }
-            other => panic!("expected stats dump, got {other:?}"),
-        }
-
-        let many = Cli::try_parse_from(["hammerctl", "stats", "list", "a", "b", "c"])
-            .expect("stats list with patterns");
-        match many.cmd {
-            Command::Stats(stats::StatsCommand::List { patterns }) => {
-                assert_eq!(patterns, vec!["a", "b", "c"])
-            }
-            other => panic!("expected stats list, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn parses_show_errors_flags() {
-        let bare = Cli::try_parse_from(["hammerctl", "show", "errors"]).expect("show errors");
-        match bare.cmd {
-            Command::Show(stats::ShowCommand::Errors {
-                verbose,
-                include_zero,
-            }) => {
-                assert!(!verbose);
-                assert!(!include_zero);
-            }
-            other => panic!("expected show errors, got {other:?}"),
-        }
-
-        let verbose =
-            Cli::try_parse_from(["hammerctl", "show", "errors", "--verbose", "--include-zero"])
-                .expect("show errors flags");
-        match verbose.cmd {
-            Command::Show(stats::ShowCommand::Errors {
-                verbose,
-                include_zero,
-            }) => {
-                assert!(verbose);
-                assert!(include_zero);
-            }
-            other => panic!("expected show errors, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn socket_flag_is_global_across_nested_stats_subcommands() {
-        let before = Cli::try_parse_from(["hammerctl", "--socket", "/tmp/a.sock", "stats", "list"])
-            .expect("socket before nested subcommand");
-        assert_eq!(before.socket, PathBuf::from("/tmp/a.sock"));
-
-        let after = Cli::try_parse_from(["hammerctl", "stats", "dump", "--socket", "/tmp/b.sock"])
-            .expect("socket after nested subcommand");
-        assert_eq!(after.socket, PathBuf::from("/tmp/b.sock"));
-
-        let default = Cli::try_parse_from(["hammerctl", "stats", "list"]).expect("default socket");
         assert_eq!(default.socket, PathBuf::from(DEFAULT_SOCKET));
     }
 

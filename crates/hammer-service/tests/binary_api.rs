@@ -6,7 +6,6 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::time::Duration;
 
-use hammer_ipc::stats::{DumpValue, EntryId, StatsClient, StatsClientError, StatsServerError};
 use hammer_runtime::RuntimeRegistry;
 use hammer_runtime::config::Worker;
 use hammer_runtime::{Engine, EnginePool, PluginError, PluginMain};
@@ -145,12 +144,6 @@ fn socket_path() -> PathBuf {
 /// cleanup is asserted directly by
 /// `bind_reclaims_a_stale_socket_and_drop_removes_its_own_path`.
 fn engine_with_binary_api(path: &Path, max_frame_bytes: usize) -> Engine {
-    engine_with_sections(path, max_frame_bytes, "")
-}
-
-/// Like `engine_with_binary_api`, but appends `extra_sections` to the TOML
-/// configuration (e.g. a `[stats]` section for the collector cadence).
-fn engine_with_sections(path: &Path, max_frame_bytes: usize, extra_sections: &str) -> Engine {
     let mut engine = Engine::new_configured(RuntimeRegistry::new(), Worker::default())
         .expect("configure test engine");
     engine
@@ -160,10 +153,9 @@ fn engine_with_sections(path: &Path, max_frame_bytes: usize, extra_sections: &st
         .plugin_main_mut()
         .register_builtin_image(hammer_service::registration_image());
     let config = format!(
-        "[binary_api]\nsocket_path = \"{}\"\nmax_frame_bytes = {}\n{}\n",
+        "[binary_api]\nsocket_path = \"{}\"\nmax_frame_bytes = {}\n",
         path.display(),
-        max_frame_bytes,
-        extra_sections
+        max_frame_bytes
     );
     EnginePool::main_loop_enter(&mut engine, &[], &config).expect("enter main loop");
     engine
@@ -806,243 +798,6 @@ fn process_node_shutdown_closes_the_listener_and_stops_dispatch() {
         "shutdown must close the Binary API listener"
     );
 
-    drop(engine);
-    drop(_engine_guard);
-}
-
-/// `stats.list` / `stats.dump` roundtrip the system metrics through the
-/// wire: directory order, filtering, order/duplicate-preserving dumps, and
-/// the collector cadence advancing the heartbeat.
-#[test]
-fn stats_list_and_dump_roundtrip_system_metrics() {
-    let path = socket_path();
-    let mut engine = engine_with_sections(
-        &path,
-        DEFAULT_MAX_FRAME_BYTES,
-        "[stats]\nupdate_interval = \"50ms\"\n",
-    );
-    let _engine_guard = CurrentEngine::install(&mut engine);
-    let runtime = main_runtime();
-
-    engine.run_processes_until(&runtime, async {
-        tokio::time::timeout(Duration::from_secs(10), async {
-            let client_path = path.clone();
-            run_client(move || {
-                let mut client = StatsClient::connect(client_path).expect("connect stats client");
-
-                // Roundtrip: the three service system scalars in directory order.
-                let entries = client
-                    .list(&["^/sys/(heartbeat|boottime|last_stats_clear)$".to_owned()])
-                    .expect("list system scalars");
-                assert_eq!(entries.len(), 3);
-                assert_eq!(entries[0].path, "/sys/heartbeat");
-                assert_eq!(entries[1].path, "/sys/boottime");
-                assert_eq!(entries[2].path, "/sys/last_stats_clear");
-                assert_eq!(entries[0].fq_name, "hammer_sys_heartbeat_total");
-                assert_eq!(entries[1].fq_name, "hammer_sys_boottime_seconds");
-                assert_eq!(entries[2].fq_name, "hammer_sys_last_stats_clear_seconds");
-                assert_eq!(
-                    entries[0].directory_type,
-                    hammer_ipc::stats::DirectoryType::ScalarIndex
-                );
-                assert_eq!(
-                    entries[0].prometheus_type,
-                    hammer_ipc::stats::PrometheusType::Counter
-                );
-                assert_eq!(
-                    entries[1].prometheus_type,
-                    hammer_ipc::stats::PrometheusType::Gauge
-                );
-
-                // Filtering with a single pattern.
-                let filtered = client
-                    .list(&["^/sys/heartbeat$".to_owned()])
-                    .expect("filter");
-                assert_eq!(filtered.len(), 1);
-                assert_eq!(filtered[0].path, "/sys/heartbeat");
-
-                // Dump preserves input order and duplicates.
-                let ids = [entries[2].id, entries[0].id, entries[2].id];
-                let dump = client.dump(&ids).expect("dump");
-                assert_eq!(dump.len(), 3);
-                assert_eq!(dump[0].id, entries[2].id);
-                assert_eq!(dump[1].id, entries[0].id);
-                assert_eq!(dump[2].id, entries[2].id);
-                // last-stats-clear stays 0 (no clear command in #246).
-                assert_eq!(dump[0].value, DumpValue::Gauge(0.0));
-
-                // The collector bumps the heartbeat once per 50 ms interval:
-                // wait for a strictly newer value than the first snapshot
-                // (bounded eventual check; no wall-clock value asserts).
-                let first_heartbeat = dump[1].value.clone();
-                let deadline = std::time::Instant::now() + Duration::from_secs(5);
-                loop {
-                    std::thread::sleep(Duration::from_millis(25));
-                    let fresh = client.dump(&[entries[0].id]).expect("heartbeat dump");
-                    if fresh[0].value != first_heartbeat {
-                        assert!(
-                            matches!(fresh[0].value, DumpValue::Counter(_)),
-                            "heartbeat must be a counter: {:?}",
-                            fresh[0].value
-                        );
-                        break;
-                    }
-                    assert!(
-                        std::time::Instant::now() < deadline,
-                        "heartbeat never advanced"
-                    );
-                }
-            })
-            .await;
-        })
-        .await
-        .expect("stats roundtrip completed within the deadline");
-    });
-
-    engine
-        .shutdown_process_nodes(&runtime)
-        .expect("shutdown Process Nodes");
-    drop(engine);
-    drop(_engine_guard);
-}
-
-/// Two dumps inside the collector's idle window return the same heartbeat:
-/// `list`/`dump` never collect, and the default 10 s interval keeps the
-/// collector dormant between passes.
-#[test]
-fn stats_reads_within_the_idle_window_are_unchanged() {
-    let path = socket_path();
-    let mut engine = engine_with_binary_api(&path, DEFAULT_MAX_FRAME_BYTES);
-    let _engine_guard = CurrentEngine::install(&mut engine);
-    let runtime = main_runtime();
-
-    engine.run_processes_until(&runtime, async {
-        tokio::time::timeout(Duration::from_secs(10), async {
-            let client_path = path.clone();
-            run_client(move || {
-                let mut client = StatsClient::connect(client_path).expect("connect stats client");
-                let entries = client.list(&[]).expect("list");
-                let heartbeat = entries
-                    .iter()
-                    .find(|entry| entry.path == "/sys/heartbeat")
-                    .expect("heartbeat entry");
-                let first = client.dump(&[heartbeat.id]).expect("first dump");
-                std::thread::sleep(Duration::from_millis(250));
-                let second = client.dump(&[heartbeat.id]).expect("second dump");
-                assert_eq!(
-                    second[0].value, first[0].value,
-                    "idle-window dumps must not run a collector"
-                );
-            })
-            .await;
-        })
-        .await
-        .expect("idle-window reads completed within the deadline");
-    });
-
-    engine
-        .shutdown_process_nodes(&runtime)
-        .expect("shutdown Process Nodes");
-    drop(engine);
-    drop(_engine_guard);
-}
-
-/// In-band errors: stale ids (same index, newer generation), missing ids
-/// (high index), and invalid regex patterns arrive as typed server errors.
-#[test]
-fn stats_errors_arrive_typed_in_band() {
-    let path = socket_path();
-    let mut engine = engine_with_binary_api(&path, DEFAULT_MAX_FRAME_BYTES);
-    let _engine_guard = CurrentEngine::install(&mut engine);
-    let runtime = main_runtime();
-
-    engine.run_processes_until(&runtime, async {
-        tokio::time::timeout(Duration::from_secs(10), async {
-            let client_path = path.clone();
-            run_client(move || {
-                let mut client = StatsClient::connect(client_path).expect("connect stats client");
-                let entries = client.list(&[]).expect("list");
-                let heartbeat = entries
-                    .iter()
-                    .find(|entry| entry.path == "/sys/heartbeat")
-                    .expect("heartbeat entry");
-
-                // Same index, a newer non-zero generation: the entry lives at
-                // generation 1 and is never removed, so generation 2 is stale.
-                let stale = EntryId::new(heartbeat.id.index(), heartbeat.id.generation() + 1)
-                    .expect("stale id");
-                match client.dump(&[stale]) {
-                    Err(StatsClientError::Server {
-                        method: "stats.dump",
-                        source: StatsServerError::StaleEntry { id },
-                    }) if id == stale => {}
-                    other => panic!("expected stale error, got: {other:?}"),
-                }
-
-                // An index beyond every published entry is not found.
-                let missing = EntryId::new(999, 1).expect("missing id");
-                match client.dump(&[missing]) {
-                    Err(StatsClientError::Server {
-                        method: "stats.dump",
-                        source: StatsServerError::NotFound { id },
-                    }) if id == missing => {}
-                    other => panic!("expected not-found error, got: {other:?}"),
-                }
-
-                // An invalid regex arrives in-band with the exact pattern.
-                match client.list(&["(".to_owned()]) {
-                    Err(StatsClientError::Server {
-                        method: "stats.list",
-                        source: StatsServerError::InvalidPattern { pattern },
-                    }) if pattern == "(" => {}
-                    other => panic!("expected invalid-pattern error, got: {other:?}"),
-                }
-            })
-            .await;
-        })
-        .await
-        .expect("typed stats errors completed within the deadline");
-    });
-
-    engine
-        .shutdown_process_nodes(&runtime)
-        .expect("shutdown Process Nodes");
-    drop(engine);
-    drop(_engine_guard);
-}
-
-/// A malformed `stats.list` payload is a transport `InvalidRequest`, exactly
-/// like any other method: the adapter rejects it before the handler.
-#[test]
-fn stats_malformed_payload_is_a_transport_invalid_request() {
-    let path = socket_path();
-    let mut engine = engine_with_binary_api(&path, DEFAULT_MAX_FRAME_BYTES);
-    let _engine_guard = CurrentEngine::install(&mut engine);
-    let runtime = main_runtime();
-
-    engine.run_processes_until(&runtime, async {
-        tokio::time::timeout(Duration::from_secs(10), async {
-            let client_path = path.clone();
-            run_client(move || {
-                let mut raw = raw_client(&client_path).expect("connect raw client");
-                write_frame(&mut raw, "stats.list", &[0xFF; 64]).expect("write malformed payload");
-                let reply = read_reply(&mut raw).expect("read reply");
-                assert_eq!(
-                    reply.status,
-                    BinaryApiStatus::InvalidRequest as i32,
-                    "malformed stats payload must be a transport InvalidRequest"
-                );
-                assert_eq!(reply.context, 1);
-            })
-            .await;
-        })
-        .await
-        .expect("malformed stats payload rejected within the deadline");
-    });
-
-    engine
-        .shutdown_process_nodes(&runtime)
-        .expect("shutdown Process Nodes");
     drop(engine);
     drop(_engine_guard);
 }
