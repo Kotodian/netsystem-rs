@@ -1,5 +1,4 @@
 use std::ffi::CStr;
-
 pub(crate) const MAX_NAME_BYTES: usize = 128;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -242,17 +241,78 @@ pub(crate) struct SymlinkIndex {
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub(crate) struct DirectoryIndex(u32);
 
+impl DirectoryIndex {
+    #[inline]
+    pub(crate) const fn new(value: u32) -> Self {
+        Self(value)
+    }
+
+    #[inline]
+    pub(crate) const fn raw(self) -> u32 {
+        self.0
+    }
+}
+
+impl From<u32> for DirectoryIndex {
+    #[inline]
+    fn from(value: u32) -> Self {
+        Self::new(value)
+    }
+}
+
+impl From<DirectoryIndex> for u32 {
+    #[inline]
+    fn from(value: DirectoryIndex) -> Self {
+        value.raw()
+    }
+}
+
 #[repr(transparent)]
-#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+#[derive(Clone, Copy, Debug, Default, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub(crate) struct Gauge(u64);
+
+impl From<u64> for Gauge {
+    #[inline]
+    fn from(value: u64) -> Self {
+        Self(value)
+    }
+}
 
 #[repr(transparent)]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct DirectoryDataPointer(*mut core::ffi::c_void);
 
+impl DirectoryDataPointer {
+    #[inline]
+    pub(crate) const fn as_ptr(self) -> *mut core::ffi::c_void {
+        self.0
+    }
+}
+
+impl From<*mut core::ffi::c_void> for DirectoryDataPointer {
+    #[inline]
+    fn from(value: *mut core::ffi::c_void) -> Self {
+        Self(value)
+    }
+}
+
 #[repr(transparent)]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct StringVectorPointer(*mut *mut u8);
+
+impl From<*mut *mut u8> for StringVectorPointer {
+    #[inline]
+    fn from(value: *mut *mut u8) -> Self {
+        Self(value)
+    }
+}
+
+impl StringVectorPointer {
+    #[inline]
+    pub(crate) const fn as_ptr(self) -> *mut *mut u8 {
+        self.0
+    }
+}
 
 #[repr(C)]
 #[derive(Clone, Copy)]
@@ -265,6 +325,7 @@ pub(crate) union DirectoryData {
 }
 
 #[repr(C)]
+#[derive(Clone, Copy)]
 pub(crate) struct DirectoryEntry {
     directory_type: TypeCode,
     data: DirectoryData,
@@ -336,6 +397,12 @@ impl DirectoryEntry {
         let checked = NameBytes(self.name);
         checked.as_c_str()?;
         CStr::from_bytes_until_nul(&self.name).map_err(|_| Error::MissingNameTerminator)
+    }
+
+    pub(crate) fn name_bytes(&self) -> Result<NameBytes, Error> {
+        let name = NameBytes(self.name);
+        name.as_c_str()?;
+        Ok(name)
     }
 
     #[inline]
@@ -518,7 +585,8 @@ pub(crate) fn vector_element_offset(
         return Err(Error::InvalidVectorHeader);
     }
     let vector_alignment = 1usize << log2_align;
-    if !header_offset.is_multiple_of(VEC_MIN_ALIGN)
+    if vector_alignment < VEC_MIN_ALIGN
+        || !header_offset.is_multiple_of(VEC_MIN_ALIGN)
         || !vector_offset.is_multiple_of(vector_alignment)
     {
         return Err(Error::InvalidVectorHeader);
@@ -585,7 +653,7 @@ pub(crate) fn vector_element_offset(
 }
 
 #[repr(C, packed)]
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug)]
 pub(crate) struct RingConfig {
     entry_size: u32,
     ring_size: u32,
@@ -692,6 +760,15 @@ pub(crate) struct RingBufferHeader {
 }
 
 impl RingBufferHeader {
+    #[inline]
+    pub(crate) const fn new(config: RingConfig, metadata_offset: u32, data_offset: u32) -> Self {
+        Self {
+            config,
+            metadata_offset,
+            data_offset,
+        }
+    }
+
     #[inline]
     pub(crate) fn config(&self) -> RingConfig {
         // SAFETY: `config` is a field of a live packed record; the copy is
@@ -894,15 +971,27 @@ pub(crate) const STAT_COUNTER_LAST_STATS_CLEAR: u32 = 1;
 pub(crate) const STAT_COUNTER_BOOTTIME: u32 = 2;
 
 #[repr(C)]
+#[derive(Clone, Copy)]
 pub(crate) struct SharedHeader {
     version: u64,
     base: *mut core::ffi::c_void,
     epoch: u64,
-    in_progress: u64,
+    pub(super) in_progress: u64,
     directory_vector: *mut DirectoryEntry,
 }
 
 impl SharedHeader {
+    #[inline]
+    pub(crate) const fn new(base: *mut core::ffi::c_void) -> Self {
+        Self {
+            version: STAT_SEGMENT_VERSION,
+            base,
+            epoch: 1,
+            in_progress: 0,
+            directory_vector: core::ptr::null_mut(),
+        }
+    }
+
     #[inline]
     pub(crate) fn validate_version(&self) -> Result<(), Error> {
         if self.version == STAT_SEGMENT_VERSION {
@@ -922,6 +1011,21 @@ impl SharedHeader {
     #[inline]
     pub(crate) fn epoch(&self) -> u64 {
         self.epoch
+    }
+
+    #[inline]
+    pub(crate) fn set_directory_vector(&mut self, value: *mut DirectoryEntry) {
+        self.directory_vector = value;
+    }
+
+    #[inline]
+    pub(crate) fn set_in_progress(&mut self, writing: bool) {
+        self.in_progress = u64::from(writing);
+    }
+
+    #[inline]
+    pub(crate) fn set_epoch(&mut self, value: u64) {
+        self.epoch = value;
     }
 }
 
@@ -1089,6 +1193,8 @@ mod tests {
         assert_eq!(bytes[7], 0);
         let over_aligned = vec_header_bytes(3, 1, 4, true, 0, 0);
         assert!(vector_element_offset(0, 8, &over_aligned, 0, 4, 20).is_err());
+        let under_aligned = vec_header_bytes(3, 1, 2, true, 0, 0);
+        assert!(vector_element_offset(0, 8, &under_aligned, 0, 4, 20).is_err());
         let invalid_alignment = vec_header_bytes(3, 1, 0x7f, true, 0, 0);
         assert!(vector_element_offset(0, 8, &invalid_alignment, 0, 4, 20).is_err());
         assert_eq!(vec_len(None), 0);

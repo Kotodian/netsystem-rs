@@ -1285,6 +1285,10 @@ dependencies = [
 [[package]]
 name = "hammer-stats"
 version = "0.1.0"
+dependencies = [
+ "hammer-infra",
+ "hammer-runtime",
+]
 
 [[package]]
 name = "hammer-vcl"
