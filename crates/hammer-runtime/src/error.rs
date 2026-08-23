@@ -57,6 +57,8 @@ pub enum RuntimeError {
     MainHeap(#[from] hammer_infra::main_heap::MainHeapError),
     #[error(transparent)]
     Plugin(#[from] crate::plugin::PluginError),
+    #[error(transparent)]
+    Stats(#[from] hammer_stats::StatsError),
     #[error("worker count {count} does not fit u32")]
     WorkerCountOverflow { count: usize },
     #[error("a worker graph update is already pending")]

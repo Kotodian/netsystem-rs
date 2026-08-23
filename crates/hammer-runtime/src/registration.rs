@@ -11,6 +11,14 @@ use crate::node::{NodeEntry, NodeFunctionRegistration};
 use crate::process::ProcessEntry;
 use crate::session::SessionTransportRegistration;
 use abi_stable::StableAbi;
+use hammer_stats::{StatsMain, StatsResult};
+
+/// One static aggregate registration in a link image's stats catalog.
+#[derive(Clone, Copy)]
+pub struct StatsRegistration {
+    pub name: &'static str,
+    pub register: fn(&StatsMain) -> StatsResult<()>,
+}
 
 /// The existing registration catalog for one link image.
 ///
@@ -33,6 +41,7 @@ pub struct RegistrationImage {
     session_transports: &'static [SessionTransportRegistration],
     session_apps: &'static [SessionAppRegistration],
     binary_api_methods: &'static [BinaryApiMethodEntry],
+    stats_registrations: &'static [StatsRegistration],
 }
 
 impl RegistrationImage {
@@ -52,6 +61,40 @@ impl RegistrationImage {
         session_apps: &'static [SessionAppRegistration],
         binary_api_methods: &'static [BinaryApiMethodEntry],
     ) -> Self {
+        Self::new_with_stats(
+            init_functions,
+            config_functions,
+            early_config_functions,
+            main_loop_enter_functions,
+            main_loop_exit_functions,
+            worker_init_functions,
+            graph_nodes,
+            node_functions,
+            process_nodes,
+            session_transports,
+            session_apps,
+            binary_api_methods,
+            &[],
+        )
+    }
+
+    #[doc(hidden)]
+    #[allow(clippy::too_many_arguments)]
+    pub const fn new_with_stats(
+        init_functions: &'static [InitFunction],
+        config_functions: &'static [ConfigFunction],
+        early_config_functions: &'static [ConfigFunction],
+        main_loop_enter_functions: &'static [InitFunction],
+        main_loop_exit_functions: &'static [InitFunction],
+        worker_init_functions: &'static [InitFunction],
+        graph_nodes: &'static [NodeEntry],
+        node_functions: &'static [NodeFunctionRegistration],
+        process_nodes: &'static [ProcessEntry],
+        session_transports: &'static [SessionTransportRegistration],
+        session_apps: &'static [SessionAppRegistration],
+        binary_api_methods: &'static [BinaryApiMethodEntry],
+        stats_registrations: &'static [StatsRegistration],
+    ) -> Self {
         Self {
             init_functions,
             config_functions,
@@ -65,6 +108,7 @@ impl RegistrationImage {
             session_transports,
             session_apps,
             binary_api_methods,
+            stats_registrations,
         }
     }
 
@@ -126,6 +170,11 @@ impl RegistrationImage {
     pub(crate) fn binary_api_methods(&self) -> &'static [BinaryApiMethodEntry] {
         self.binary_api_methods
     }
+
+    #[inline]
+    pub(crate) fn stats_registrations(&self) -> &'static [StatsRegistration] {
+        self.stats_registrations
+    }
 }
 
 #[doc(hidden)]
@@ -145,6 +194,7 @@ macro_rules! __declare_registration_image {
             session_transports = [];
             session_apps = [];
             binary_api_methods = [];
+            stats_registrations = [];
         );
     };
     (
@@ -160,9 +210,10 @@ macro_rules! __declare_registration_image {
         session_transports = [$($session_transport:path),* $(,)?];
         session_apps = [$($session_app:path),* $(,)?];
         binary_api_methods = [$($binary_api_method:path),* $(,)?];
+        stats_registrations = [$($stats_registration:path),* $(,)?];
     ) => {
         static __HAMMER_REGISTRATION_IMAGE: $crate::__private::RegistrationImage =
-            $crate::__private::RegistrationImage::new(
+            $crate::__private::RegistrationImage::new_with_stats(
                 &[$($init),*],
                 &[$($config),*],
                 &[$($early_config),*],
@@ -175,6 +226,37 @@ macro_rules! __declare_registration_image {
                 &[$($session_transport),*],
                 &[$($session_app),*],
                 &[$($binary_api_method),*],
+                &[$($stats_registration),*],
             );
+    };
+    (
+        init_functions = [$($init:path),* $(,)?];
+        config_functions = [$($config:path),* $(,)?];
+        early_config_functions = [$($early_config:path),* $(,)?];
+        main_loop_enter_functions = [$($enter:path),* $(,)?];
+        main_loop_exit_functions = [$($exit:path),* $(,)?];
+        worker_init_functions = [$($worker_init:path),* $(,)?];
+        graph_nodes = [$($graph_node:path),* $(,)?];
+        node_functions = [$($node_function:path),* $(,)?];
+        process_nodes = [$($process_node:path),* $(,)?];
+        session_transports = [$($session_transport:path),* $(,)?];
+        session_apps = [$($session_app:path),* $(,)?];
+        binary_api_methods = [$($binary_api_method:path),* $(,)?];
+    ) => {
+        $crate::__declare_registration_image!(
+            init_functions = [$($init),*];
+            config_functions = [$($config),*];
+            early_config_functions = [$($early_config),*];
+            main_loop_enter_functions = [$($enter),*];
+            main_loop_exit_functions = [$($exit),*];
+            worker_init_functions = [$($worker_init),*];
+            graph_nodes = [$($graph_node),*];
+            node_functions = [$($node_function),*];
+            process_nodes = [$($process_node),*];
+            session_transports = [$($session_transport),*];
+            session_apps = [$($session_app),*];
+            binary_api_methods = [$($binary_api_method),*];
+            stats_registrations = [];
+        );
     };
 }

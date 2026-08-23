@@ -654,7 +654,7 @@ pub(crate) fn vector_element_offset(
 
 #[repr(C, packed)]
 #[derive(Clone, Copy, Debug)]
-pub(crate) struct RingConfig {
+pub struct RingConfig {
     entry_size: u32,
     ring_size: u32,
     n_threads: u32,
@@ -664,7 +664,7 @@ pub(crate) struct RingConfig {
 
 impl RingConfig {
     #[inline]
-    pub(crate) const fn new(
+    pub const fn new(
         entry_size: u32,
         ring_size: u32,
         n_threads: u32,

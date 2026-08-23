@@ -8,19 +8,18 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use hammer_infra::page_size;
 use hammer_infra::segment::{Segment, SegmentAllocation};
-use hammer_runtime::sync::SpinLock;
+use hammer_infra::sync::SpinLock;
 
 use crate::metric::RecordKind;
 use crate::protocol::{
     Counter, DirectoryData, DirectoryDataPointer, DirectoryEntry, DirectoryIndex, DirectoryType,
-    NameBytes, STAT_SEGMENT_INDEX_INVALID, ScalarBits, SharedHeader, VEC_MIN_ALIGN,
-    vec_header_bytes, vec_len, vector_element_offset,
+    NameBytes, STAT_SEGMENT_INDEX_INVALID, SharedHeader, VEC_MIN_ALIGN, vec_header_bytes, vec_len,
+    vector_element_offset,
 };
 use crate::{StatsError, StatsResult};
 
 const VECTOR_HEADER_SIZE: usize = 8;
 const VECTOR_DATA_ALIGNMENT: usize = 64;
-const INITIAL_DIRECTORY_LENGTH: usize = 3;
 
 pub(super) struct StatsSegmentState {
     mapping: Segment,
@@ -307,7 +306,12 @@ impl StatsSegmentState {
             .and_then(|address| address.checked_add(VECTOR_HEADER_SIZE))
             .ok_or(StatsError::PublicationFailed)?;
         let pointer_end = VECTOR_HEADER_SIZE
-            .checked_add(size_of::<DirectoryEntry>())
+            .checked_add(
+                candidate
+                    .len()
+                    .checked_mul(size_of::<DirectoryEntry>())
+                    .ok_or(StatsError::PublicationFailed)?,
+            )
             .ok_or(StatsError::PublicationFailed)?;
         if pointer_end > new_block.len()
             || !pointer_address.is_multiple_of(align_of::<DirectoryEntry>())
@@ -364,7 +368,7 @@ impl StatsSegment {
     pub(crate) fn create(name: &str, size: usize) -> StatsResult<Self> {
         let page = page_size()?;
         let minimum = page
-            .checked_add(directory_layout(INITIAL_DIRECTORY_LENGTH)?.size())
+            .checked_add(directory_layout(0)?.size())
             .ok_or(StatsError::PublicationFailed)?;
         if size < minimum {
             return Err(StatsError::CapacityTooSmall {
@@ -374,17 +378,8 @@ impl StatsSegment {
         }
 
         let mapping = Segment::shared_with_reserved_prefix(name, size, page)?;
-        let directory_vector = initial_directory()?;
-        let mut names = HashMap::new();
-        names
-            .try_reserve(INITIAL_DIRECTORY_LENGTH)
-            .map_err(|_| StatsError::CollectionCapacity)?;
-        for (raw_index, entry) in directory_vector.iter().enumerate() {
-            let index = DirectoryIndex::new(
-                u32::try_from(raw_index).map_err(|_| StatsError::PublicationFailed)?,
-            );
-            names.insert(entry.name_bytes()?, index);
-        }
+        let directory_vector = Vec::new();
+        let names = HashMap::new();
 
         let header = SharedHeader::new(mapping.base().cast::<c_void>());
         let bootstrap_layout =
@@ -395,11 +390,7 @@ impl StatsSegment {
             header,
             directory_vector,
             directory_block: bootstrap_block,
-            payloads: {
-                let mut payloads = Vec::with_capacity(INITIAL_DIRECTORY_LENGTH);
-                payloads.resize_with(INITIAL_DIRECTORY_LENGTH, Vec::new);
-                payloads
-            },
+            payloads: Vec::new(),
             names,
             first_free: None,
             tearing_down: false,
@@ -413,15 +404,21 @@ impl StatsSegment {
             .and_then(|address| address.checked_add(VECTOR_HEADER_SIZE))
             .ok_or(StatsError::PublicationFailed)?;
         let initial_vector_end = VECTOR_HEADER_SIZE
-            .checked_add(size_of::<DirectoryEntry>())
+            .checked_add(
+                state
+                    .directory_vector
+                    .len()
+                    .checked_mul(size_of::<DirectoryEntry>())
+                    .ok_or(StatsError::PublicationFailed)?,
+            )
             .ok_or(StatsError::PublicationFailed)?;
         if initial_vector_end > directory_block.len()
             || !initial_vector_address.is_multiple_of(align_of::<DirectoryEntry>())
         {
             return Err(StatsError::PublicationFailed);
         }
-        let initial_directory_vector = initial_vector_address as *mut DirectoryEntry;
-        state.header.set_directory_vector(initial_directory_vector);
+        let directory_vector_pointer = initial_vector_address as *mut DirectoryEntry;
+        state.header.set_directory_vector(directory_vector_pointer);
         state.directory_block = directory_block;
         state.header.set_in_progress(true);
         state.write_shared_header(Ordering::Relaxed);
@@ -458,7 +455,7 @@ impl StatsSegment {
             return Err(StatsError::Teardown);
         }
         if state.names.contains_key(&name) {
-            return Err(StatsError::DuplicateName(name));
+            return Err(StatsError::DuplicateName);
         }
         let (index, next_free, is_new_slot) = match state.first_free {
             Some(index) => {
@@ -598,8 +595,8 @@ impl StatsSegment {
             if state.tearing_down {
                 return Err(StatsError::Teardown);
             }
-            let raw_index = usize::try_from(index.raw())
-                .map_err(|_| StatsError::PublicationFailed)?;
+            let raw_index =
+                usize::try_from(index.raw()).map_err(|_| StatsError::PublicationFailed)?;
             let Some(entry) = state.directory_vector.get(raw_index).copied() else {
                 return Err(StatsError::DirectoryIndexOutOfBounds {
                     index: index.raw(),
@@ -913,29 +910,6 @@ impl Drop for StatsSegment {
     }
 }
 
-fn initial_directory() -> StatsResult<Vec<DirectoryEntry>> {
-    let heartbeat = NameBytes::try_from("/sys/heartbeat")?;
-    let last_stats_clear = NameBytes::try_from("/sys/last_stats_clear")?;
-    let boottime = NameBytes::try_from("/sys/boottime")?;
-    Ok(vec![
-        DirectoryEntry::new(
-            DirectoryType::ScalarIndex.into(),
-            heartbeat,
-            DirectoryData::from(ScalarBits::from(0_u64)),
-        ),
-        DirectoryEntry::new(
-            DirectoryType::ScalarIndex.into(),
-            last_stats_clear,
-            DirectoryData::from(ScalarBits::from(0_u64)),
-        ),
-        DirectoryEntry::new(
-            DirectoryType::ScalarIndex.into(),
-            boottime,
-            DirectoryData::from(ScalarBits::from(0_u64)),
-        ),
-    ])
-}
-
 fn directory_layout(length: usize) -> StatsResult<Layout> {
     let element_bytes = length
         .checked_mul(size_of::<DirectoryEntry>())
@@ -973,23 +947,23 @@ mod tests {
     }
 
     #[test]
-    fn create_publishes_fixed_directory_and_shared_mapping() {
+    fn create_publishes_empty_directory_and_shared_mapping() {
         let segment = create_segment("st-fixed");
 
-        assert_eq!(segment.directory_vector_len(), 3);
+        assert_eq!(segment.directory_vector_len(), 0);
         assert!(segment.shared_fd().is_some());
     }
 
     #[test]
-    fn created_segment_exposes_shared_mapping_and_fixed_directory_length() -> StatsResult<()> {
+    fn created_segment_exposes_shared_mapping_and_empty_directory() -> StatsResult<()> {
         let segment = StatsSegment::create("st-owner", 2 * 1024 * 1024)?;
         assert!(segment.shared_fd().is_some());
-        assert_eq!(segment.directory_vector_len(), 3);
+        assert_eq!(segment.directory_vector_len(), 0);
         Ok(())
     }
 
     #[test]
-    fn registration_remove_and_reuse_use_fixed_directory_indices() -> StatsResult<()> {
+    fn registration_remove_and_reuse_start_at_zero() -> StatsResult<()> {
         let segment = create_segment("st-registration");
         let _target = segment.register::<layout::Scalar<ProtocolGauge>>(
             MetricGauge {
@@ -1003,17 +977,17 @@ mod tests {
             }
             .try_into()?,
         )?;
-        assert_eq!(segment.directory_vector_len(), 5);
+        assert_eq!(segment.directory_vector_len(), 2);
 
-        segment.remove(DirectoryIndex::new(4))?;
-        assert_eq!(segment.directory_vector_len(), 5);
+        segment.remove(DirectoryIndex::new(1))?;
+        assert_eq!(segment.directory_vector_len(), 2);
         segment.register::<layout::Scalar<ProtocolGauge>>(
             MetricGauge {
                 name: "/replacement".to_owned(),
             }
             .try_into()?,
         )?;
-        segment.remove(DirectoryIndex::new(4))?;
+        segment.remove(DirectoryIndex::new(1))?;
         Ok(())
     }
 
@@ -1027,10 +1001,10 @@ mod tests {
             .try_into()?,
         )?;
 
-        segment.validate(DirectoryIndex::new(3), 2, 2)?;
-        segment.remove(DirectoryIndex::new(3))?;
+        segment.validate(DirectoryIndex::new(0), 2, 2)?;
+        segment.remove(DirectoryIndex::new(0))?;
         assert!(matches!(
-            segment.validate(DirectoryIndex::new(3), 0, 0),
+            segment.validate(DirectoryIndex::new(0), 0, 0),
             Err(StatsError::InvalidShape | StatsError::DirectoryEntryUnavailable { .. })
         ));
         Ok(())
@@ -1046,9 +1020,9 @@ mod tests {
             .try_into()?,
         )?;
 
-        segment.validate(DirectoryIndex::new(3), 0, 2)?;
-        segment.validate(DirectoryIndex::new(3), 1, 2)?;
-        segment.remove(DirectoryIndex::new(3))?;
+        segment.validate(DirectoryIndex::new(0), 0, 2)?;
+        segment.validate(DirectoryIndex::new(0), 1, 2)?;
+        segment.remove(DirectoryIndex::new(0))?;
         Ok(())
     }
 
@@ -1063,7 +1037,7 @@ mod tests {
             .try_into()?,
         )?;
         let state = segment.state.lock();
-        let entry = state.directory_vector[3];
+        let entry = state.directory_vector[0];
         let vector = StringVectorPointer::try_from(&entry)?.as_ptr() as usize;
         let base = state.mapping.base() as usize;
         let private_header = vector
@@ -1071,10 +1045,10 @@ mod tests {
             .ok_or(StatsError::PublicationFailed)?;
         assert_eq!(
             private_header,
-            base + state.payloads[3][0].offset() as usize
+            base + state.payloads[0][0].offset() as usize
         );
         let entry_index = unsafe { ptr::read_unaligned(private_header as *const u32) };
-        assert_eq!(entry_index, 3);
+        assert_eq!(entry_index, 0);
         Ok(())
     }
 
@@ -1087,13 +1061,13 @@ mod tests {
             }
             .try_into()?,
         )?;
-        let initial_payloads = segment.state.lock().payloads[3].len();
-        segment.validate(DirectoryIndex::new(3), 2, 2)?;
+        let initial_payloads = segment.state.lock().payloads[0].len();
+        segment.validate(DirectoryIndex::new(0), 2, 2)?;
         {
             let state = segment.state.lock();
-            assert!(state.payloads[3].len() > initial_payloads);
+            assert!(state.payloads[0].len() > initial_payloads);
         }
-        segment.remove(DirectoryIndex::new(3))?;
+        segment.remove(DirectoryIndex::new(0))?;
         segment.teardown()?;
         Ok(())
     }
@@ -1122,10 +1096,10 @@ mod tests {
             }
             .try_into()?,
         )?;
-        segment.remove(DirectoryIndex::new(3))?;
+        segment.remove(DirectoryIndex::new(0))?;
         assert!(matches!(
-            segment.remove(DirectoryIndex::new(3)),
-            Err(StatsError::DirectoryEntryUnavailable { index: 3 })
+            segment.remove(DirectoryIndex::new(0)),
+            Err(StatsError::DirectoryEntryUnavailable { index: 0 })
         ));
         segment.register::<layout::Scalar<ProtocolGauge>>(
             MetricGauge {
@@ -1133,7 +1107,7 @@ mod tests {
             }
             .try_into()?,
         )?;
-        assert_eq!(segment.directory_vector_len(), 4);
+        assert_eq!(segment.directory_vector_len(), 1);
         Ok(())
     }
 

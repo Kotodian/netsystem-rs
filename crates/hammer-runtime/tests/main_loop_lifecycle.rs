@@ -40,7 +40,7 @@ fn engine_pool() -> EnginePool {
     engine
         .plugin_main_mut()
         .register_builtin_image(&__HAMMER_REGISTRATION_IMAGE);
-    EnginePool::new(engine)
+    EnginePool::new(engine).expect("engine pool")
 }
 
 #[test]

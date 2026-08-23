@@ -21,7 +21,7 @@ use crate::init::{ConfigFunction, InitFunction};
 use crate::node::{NodeEntry, NodeFunctionRegistration};
 use crate::plugin_loader::{PluginLibrary, read_plugin_module};
 use crate::process::ProcessEntry;
-use crate::registration::RegistrationImage;
+use crate::registration::{RegistrationImage, StatsRegistration};
 use crate::session::SessionTransportRegistration;
 
 /// Metadata owned by one dynamically loaded plugin module.
@@ -463,6 +463,10 @@ impl PluginMain {
         self.collect_registrations(|image| image.config_functions(early))
     }
 
+    pub(crate) fn stats_registrations(&self) -> Vec<StatsRegistration> {
+        self.collect_registrations(RegistrationImage::stats_registrations)
+    }
+
     pub(crate) fn worker_init_functions(&self) -> Vec<InitFunction> {
         self.collect_registrations(RegistrationImage::worker_init_functions)
     }
@@ -572,5 +576,48 @@ pub fn host_meets_plugin_requirement(
         Ok(())
     } else {
         Err(PluginError::SemVerMismatch { host, required })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn test_stats_register(_: &hammer_stats::StatsMain) -> hammer_stats::StatsResult<()> {
+        Ok(())
+    }
+
+    static TEST_STATS_REGISTRATION: StatsRegistration = StatsRegistration {
+        name: "TestStats",
+        register: test_stats_register,
+    };
+
+    crate::__declare_registration_image!(
+        init_functions = [];
+        config_functions = [];
+        early_config_functions = [];
+        main_loop_enter_functions = [];
+        main_loop_exit_functions = [];
+        worker_init_functions = [];
+        graph_nodes = [];
+        node_functions = [];
+        process_nodes = [];
+        session_transports = [];
+        session_apps = [];
+        binary_api_methods = [];
+        stats_registrations = [TEST_STATS_REGISTRATION];
+    );
+
+    #[test]
+    fn collects_complete_stats_catalog_in_image_order() {
+        let mut plugins = PluginMain::default();
+        plugins.register_builtin_image(&__HAMMER_REGISTRATION_IMAGE);
+
+        let names: Vec<_> = plugins
+            .stats_registrations()
+            .into_iter()
+            .map(|registration| registration.name)
+            .collect();
+        assert_eq!(names, ["Sys", "TestStats"]);
     }
 }

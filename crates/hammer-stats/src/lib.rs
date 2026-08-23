@@ -9,70 +9,72 @@ mod segment;
 
 use segment::StatsSegment;
 
-pub(crate) struct StatsMain {
+pub use metric::{
+    CombinedCounter, Gauge, Histogram, NameVector, Ring, RingSchema, SimpleCounter, Timestamp,
+};
+pub use protocol::RingConfig;
+
+pub struct StatsMain {
     segment: StatsSegment,
 }
 
 impl StatsMain {
-    pub(crate) fn create(name: &str, size: usize) -> StatsResult<Self> {
+    pub fn create(name: &str, size: usize) -> StatsResult<Self> {
         Ok(Self {
             segment: StatsSegment::create(name, size)?,
         })
     }
 
-    pub(crate) fn add_gauge(&self, descriptor: metric::Gauge) -> StatsResult<()> {
+    pub fn add_gauge(&self, descriptor: Gauge) -> StatsResult<()> {
         let layout = metric::layout::Scalar::<protocol::Gauge>::try_from(descriptor)?;
         self.segment.register(layout).map(|_| ())
     }
 
-    pub(crate) fn add_timestamp(&self, descriptor: metric::Timestamp) -> StatsResult<()> {
+    pub fn add_timestamp(&self, descriptor: Timestamp) -> StatsResult<()> {
         let layout = metric::layout::Scalar::<protocol::ScalarBits>::try_from(descriptor)?;
         self.segment.register(layout).map(|_| ())
     }
 
-    pub(crate) fn add_simple_counter(&self, descriptor: metric::SimpleCounter) -> StatsResult<()> {
+    pub fn add_simple_counter(&self, descriptor: SimpleCounter) -> StatsResult<()> {
         let layout = metric::layout::Simple::<protocol::Counter>::try_from(descriptor)?;
         self.segment.register(layout).map(|_| ())
     }
 
-    pub(crate) fn add_combined_counter(
-        &self,
-        descriptor: metric::CombinedCounter,
-    ) -> StatsResult<()> {
+    pub fn add_combined_counter(&self, descriptor: CombinedCounter) -> StatsResult<()> {
         let layout = metric::layout::Combined::<protocol::Counter>::try_from(descriptor)?;
         self.segment.register(layout).map(|_| ())
     }
 
-    pub(crate) fn add_name_vector(&self, descriptor: metric::NameVector) -> StatsResult<()> {
+    pub fn add_name_vector(&self, descriptor: NameVector) -> StatsResult<()> {
         let layout = metric::layout::NameVector::try_from(descriptor)?;
         self.segment.register(layout).map(|_| ())
     }
 
-    pub(crate) fn add_histogram(&self, descriptor: metric::Histogram) -> StatsResult<()> {
+    pub fn add_histogram(&self, descriptor: Histogram) -> StatsResult<()> {
         let layout = metric::layout::Histogram::<protocol::Counter>::try_from(descriptor)?;
         self.segment.register(layout).map(|_| ())
     }
 
-    pub(crate) fn add_ring<T>(&self, descriptor: metric::Ring<T>) -> StatsResult<()>
+    pub fn add_ring<T>(&self, descriptor: Ring<T>) -> StatsResult<()>
     where
-        T: metric::RingSchema,
+        T: RingSchema,
     {
         let layout = metric::layout::Ring::<T>::try_from(descriptor)?;
         self.segment.register(layout).map(|_| ())
     }
 }
 
-pub(crate) type StatsResult<T> = Result<T, StatsError>;
+pub type StatsResult<T> = Result<T, StatsError>;
 
 #[derive(Debug)]
-pub(crate) enum StatsError {
-    Protocol(protocol::Error),
+pub enum StatsError {
+    Protocol,
     Io(io::Error),
     Allocation(SegmentAllocationError),
     CapacityTooSmall { requested: usize, minimum: usize },
     InvalidLayout,
     CollectionCapacity,
-    DuplicateName(protocol::NameBytes),
+    DuplicateName,
     DirectoryIndexOutOfBounds { index: u32, length: usize },
     DirectoryEntryUnavailable { index: u32 },
     Teardown,
@@ -85,7 +87,7 @@ pub(crate) enum StatsError {
 impl fmt::Display for StatsError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::Protocol(error) => write!(formatter, "stats protocol error: {error:?}"),
+            Self::Protocol => formatter.write_str("stats protocol error"),
             Self::Io(error) => write!(formatter, "stats mapping I/O error: {error}"),
             Self::Allocation(error) => write!(formatter, "stats allocation error: {error}"),
             Self::CapacityTooSmall { requested, minimum } => write!(
@@ -96,7 +98,7 @@ impl fmt::Display for StatsError {
             Self::CollectionCapacity => {
                 formatter.write_str("stats owner collection capacity failed")
             }
-            Self::DuplicateName(_) => formatter.write_str("duplicate stats directory name"),
+            Self::DuplicateName => formatter.write_str("duplicate stats directory name"),
             Self::DirectoryIndexOutOfBounds { index, length } => write!(
                 formatter,
                 "stats directory index {index} is outside length {length}"
@@ -119,8 +121,8 @@ impl fmt::Display for StatsError {
 impl std::error::Error for StatsError {}
 
 impl From<protocol::Error> for StatsError {
-    fn from(error: protocol::Error) -> Self {
-        Self::Protocol(error)
+    fn from(_error: protocol::Error) -> Self {
+        Self::Protocol
     }
 }
 
@@ -200,12 +202,12 @@ mod tests {
             <TestRingEntry as metric::RingSchema>::schema().into(),
         ))?;
 
-        assert_eq!(stats.segment.directory_vector_len(), 10);
+        assert_eq!(stats.segment.directory_vector_len(), 7);
         assert!(matches!(
             stats.add_gauge(metric::Gauge {
                 name: "/facade/gauge".to_owned(),
             }),
-            Err(StatsError::DuplicateName(_))
+            Err(StatsError::DuplicateName)
         ));
         Ok(())
     }

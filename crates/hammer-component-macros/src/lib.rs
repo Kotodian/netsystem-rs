@@ -1,3 +1,5 @@
+use std::collections::HashSet;
+
 use proc_macro::TokenStream;
 use proc_macro2::{Span, TokenStream as TokenStream2};
 use quote::{format_ident, quote};
@@ -8,6 +10,496 @@ use syn::{
     PathArguments, Result, ReturnType, Token, Type, bracketed, parse_macro_input, parse_quote,
     spanned::Spanned,
 };
+
+#[derive(Default)]
+struct StatsFieldArgs {
+    path: Option<LitStr>,
+}
+
+impl Parse for StatsFieldArgs {
+    fn parse(input: ParseStream<'_>) -> Result<Self> {
+        let mut args = Self::default();
+        while !input.is_empty() {
+            let key: Ident = input.parse()?;
+            input.parse::<Token![=]>()?;
+            match key.to_string().as_str() {
+                "path" => {
+                    if args.path.is_some() {
+                        return Err(Error::new(key.span(), "duplicate `path` stats argument"));
+                    }
+                    args.path = Some(input.parse()?);
+                }
+                other => {
+                    return Err(Error::new(
+                        key.span(),
+                        format!("unknown `stats` argument `{other}`; expected `path`"),
+                    ));
+                }
+            }
+            if !input.is_empty() {
+                input.parse::<Token![,]>()?;
+            }
+        }
+        Ok(args)
+    }
+}
+
+enum StatsMetricBase {
+    Gauge,
+    Timestamp,
+    SimpleCounter,
+    CombinedCounter,
+    NameVector,
+    Histogram,
+    Ring,
+}
+
+enum StatsMetric {
+    Gauge,
+    Timestamp,
+    SimpleCounter,
+    CombinedCounter,
+    Histogram,
+}
+
+struct StatsField {
+    ident: Ident,
+    ty: Type,
+    path: LitStr,
+    metric: StatsMetric,
+}
+
+fn stats_metric_base(field: &Field) -> Result<StatsMetricBase> {
+    let type_path = match &field.ty {
+        Type::Path(type_path) if type_path.qself.is_none() => type_path,
+        _ => {
+            return Err(Error::new_spanned(
+                &field.ty,
+                "`Stats` fields must use a supported hammer_stats descriptor type",
+            ));
+        }
+    };
+    let segment = type_path
+        .path
+        .segments
+        .last()
+        .ok_or_else(|| Error::new_spanned(&field.ty, "stats field type is missing"))?;
+    let name = segment.ident.to_string();
+    match name.as_str() {
+        "Gauge" => {
+            if !matches!(segment.arguments, PathArguments::None) {
+                return Err(Error::new_spanned(
+                    &segment.arguments,
+                    "`Gauge` does not accept generic arguments",
+                ));
+            }
+            Ok(StatsMetricBase::Gauge)
+        }
+        "Timestamp" => {
+            if !matches!(segment.arguments, PathArguments::None) {
+                return Err(Error::new_spanned(
+                    &segment.arguments,
+                    "`Timestamp` does not accept generic arguments",
+                ));
+            }
+            Ok(StatsMetricBase::Timestamp)
+        }
+        "SimpleCounter" => {
+            if !matches!(segment.arguments, PathArguments::None) {
+                return Err(Error::new_spanned(
+                    &segment.arguments,
+                    "`SimpleCounter` does not accept generic arguments",
+                ));
+            }
+            Ok(StatsMetricBase::SimpleCounter)
+        }
+        "CombinedCounter" => {
+            if !matches!(segment.arguments, PathArguments::None) {
+                return Err(Error::new_spanned(
+                    &segment.arguments,
+                    "`CombinedCounter` does not accept generic arguments",
+                ));
+            }
+            Ok(StatsMetricBase::CombinedCounter)
+        }
+        "NameVector" => {
+            if !matches!(segment.arguments, PathArguments::None) {
+                return Err(Error::new_spanned(
+                    &segment.arguments,
+                    "`NameVector` does not accept generic arguments",
+                ));
+            }
+            Ok(StatsMetricBase::NameVector)
+        }
+        "Histogram" => {
+            if !matches!(segment.arguments, PathArguments::None) {
+                return Err(Error::new_spanned(
+                    &segment.arguments,
+                    "`Histogram` does not accept generic arguments",
+                ));
+            }
+            Ok(StatsMetricBase::Histogram)
+        }
+        "Ring" => {
+            let PathArguments::AngleBracketed(arguments) = &segment.arguments else {
+                return Err(Error::new_spanned(
+                    &segment.arguments,
+                    "`Ring` requires exactly one entry type",
+                ));
+            };
+            let Some(GenericArgument::Type(_item)) = arguments.args.first() else {
+                return Err(Error::new_spanned(
+                    &segment.arguments,
+                    "`Ring` requires exactly one entry type",
+                ));
+            };
+            if arguments.args.len() != 1 {
+                return Err(Error::new_spanned(
+                    &segment.arguments,
+                    "`Ring` requires exactly one entry type",
+                ));
+            }
+            Ok(StatsMetricBase::Ring)
+        }
+        _ => Err(Error::new_spanned(
+            &field.ty,
+            "unsupported `Stats` field type; expected Gauge, Timestamp, SimpleCounter, CombinedCounter, NameVector, Histogram, or Ring<T>",
+        )),
+    }
+}
+
+fn stats_field(field: &Field, namespace: &str) -> Result<StatsField> {
+    let ident = field
+        .ident
+        .as_ref()
+        .ok_or_else(|| Error::new(field.span(), "`Stats` requires named fields"))?;
+    let mut args = StatsFieldArgs::default();
+    for attribute in &field.attrs {
+        if attribute.path().is_ident("stats") {
+            let parsed = attribute.parse_args::<StatsFieldArgs>()?;
+            if args.path.is_some() && parsed.path.is_some() {
+                return Err(Error::new(
+                    attribute.span(),
+                    "duplicate `stats` field argument",
+                ));
+            }
+            if parsed.path.is_some() {
+                args.path = parsed.path;
+            }
+        }
+    }
+
+    let leaf = args
+        .path
+        .as_ref()
+        .map(LitStr::value)
+        .unwrap_or_else(|| ident.to_string());
+    let path_span = args
+        .path
+        .as_ref()
+        .map_or_else(|| ident.span(), Spanned::span);
+    if leaf.is_empty() {
+        return Err(Error::new(path_span, "stats paths must not be empty"));
+    }
+    if leaf.starts_with('/') || leaf.ends_with('/') || leaf.contains("//") {
+        return Err(Error::new(
+            path_span,
+            "stats paths must not contain duplicate separators",
+        ));
+    }
+    if leaf
+        .bytes()
+        .any(|byte| byte == 0 || byte.is_ascii_control())
+    {
+        return Err(Error::new(path_span, "stats paths contain an invalid byte"));
+    }
+    let path = format!("/{namespace}/{leaf}");
+    if path.len() > 126 {
+        return Err(Error::new(
+            path_span,
+            "stats paths must fit within the VPP name limit",
+        ));
+    }
+
+    let metric = match stats_metric_base(field)? {
+        StatsMetricBase::Gauge => StatsMetric::Gauge,
+        StatsMetricBase::Timestamp => StatsMetric::Timestamp,
+        StatsMetricBase::SimpleCounter => StatsMetric::SimpleCounter,
+        StatsMetricBase::CombinedCounter => StatsMetric::CombinedCounter,
+        StatsMetricBase::NameVector => {
+            return Err(Error::new_spanned(
+                &field.ty,
+                "`NameVector` requires a typed length input and is not supported by `Stats`",
+            ));
+        }
+        StatsMetricBase::Histogram => StatsMetric::Histogram,
+        StatsMetricBase::Ring => {
+            return Err(Error::new_spanned(
+                &field.ty,
+                "`Ring<T>` requires typed config and schema inputs and is not supported by `Stats`",
+            ));
+        }
+    };
+
+    Ok(StatsField {
+        ident: ident.clone(),
+        ty: field.ty.clone(),
+        path: LitStr::new(&path, path_span),
+        metric,
+    })
+}
+
+fn expand_stats_descriptor(field: &StatsField) -> TokenStream2 {
+    let ident = &field.ident;
+    let ty = &field.ty;
+    let path = &field.path;
+    quote! {
+        #ident: #ty::new(#path),
+    }
+}
+
+fn expand_stats_registration(field: &StatsField) -> TokenStream2 {
+    let ident = &field.ident;
+    match &field.metric {
+        StatsMetric::Gauge => quote! {
+            stats_main.add_gauge(stats.#ident)?;
+        },
+        StatsMetric::Timestamp => quote! {
+            stats_main.add_timestamp(stats.#ident)?;
+        },
+        StatsMetric::SimpleCounter => quote! {
+            stats_main.add_simple_counter(stats.#ident)?;
+        },
+        StatsMetric::CombinedCounter => quote! {
+            stats_main.add_combined_counter(stats.#ident)?;
+        },
+        StatsMetric::Histogram => quote! {
+            stats_main.add_histogram(stats.#ident)?;
+        },
+    }
+}
+
+#[proc_macro_derive(Stats, attributes(stats))]
+pub fn stats(input: TokenStream) -> TokenStream {
+    let item = parse_macro_input!(input as ItemStruct);
+    expand_stats(item)
+        .unwrap_or_else(Error::into_compile_error)
+        .into()
+}
+
+fn expand_stats(item: ItemStruct) -> Result<TokenStream2> {
+    if let Some(attribute) = item
+        .attrs
+        .iter()
+        .find(|attribute| attribute.path().is_ident("stats"))
+    {
+        return Err(Error::new(
+            attribute.span(),
+            "`stats` path overrides are only valid on fields",
+        ));
+    }
+    if !item.generics.params.is_empty() || item.generics.where_clause.is_some() {
+        return Err(Error::new_spanned(
+            &item.generics,
+            "`Stats` aggregates must not be generic",
+        ));
+    }
+    let fields = match &item.fields {
+        Fields::Named(fields) => fields,
+        _ => {
+            return Err(Error::new_spanned(
+                &item.fields,
+                "`Stats` requires a struct with named fields",
+            ));
+        }
+    };
+    let aggregate = &item.ident;
+    let namespace = aggregate.to_string().to_ascii_lowercase();
+    let mut paths = HashSet::with_capacity(fields.named.len());
+    let mut stats_fields = Vec::with_capacity(fields.named.len());
+    for field in &fields.named {
+        let stats_field = stats_field(field, &namespace)?;
+        if !paths.insert(stats_field.path.value()) {
+            return Err(Error::new_spanned(field, "duplicate final stats path"));
+        }
+        stats_fields.push(stats_field);
+    }
+
+    let registration_name = format_ident!(
+        "__STATS_REGISTRATION_{}",
+        aggregate
+    );
+    let aggregate_name = LitStr::new(&aggregate.to_string(), aggregate.span());
+    let descriptors = stats_fields.iter().map(expand_stats_descriptor);
+    let registrations = stats_fields.iter().map(expand_stats_registration);
+    Ok(quote! {
+        impl #aggregate {
+            pub(crate) fn register(
+                stats_main: &::hammer_stats::StatsMain,
+            ) -> ::hammer_stats::StatsResult<()> {
+                let stats = Self {
+                    #(#descriptors)*
+                };
+                #(#registrations)*
+                Ok(())
+            }
+        }
+
+        #[doc(hidden)]
+        #[allow(non_upper_case_globals)]
+        pub(crate) static #registration_name:
+            ::hammer_runtime::registration::StatsRegistration =
+            ::hammer_runtime::registration::StatsRegistration {
+                name: #aggregate_name,
+                register: #aggregate::register,
+            };
+    })
+}
+
+#[cfg(test)]
+mod stats_derive_tests {
+    use super::*;
+
+    fn expand(input: &str) -> String {
+        expand_stats(syn::parse_str(input).expect("parse stats item"))
+            .expect("expand stats item")
+            .to_string()
+    }
+
+    #[test]
+    fn derives_type_namespace_and_field_paths() {
+        let expanded = expand(
+            r#"pub struct Sys {
+                heartbeat: Timestamp,
+                last_stats_clear: Timestamp,
+                #[stats(path = "boot_time")]
+                boottime: Timestamp,
+            }"#,
+        );
+        assert!(expanded.contains("add_timestamp"));
+        assert!(expanded.contains("/sys/heartbeat"));
+        assert!(expanded.contains("/sys/last_stats_clear"));
+        assert!(expanded.contains("/sys/boot_time"));
+        assert!(expanded.contains("__STATS_REGISTRATION_Sys"));
+        assert!(expanded.contains("StatsRegistration"));
+        assert!(expanded.contains("name : \"Sys\""));
+    }
+
+    #[test]
+    fn preserves_aggregate_case_in_registration_symbol() {
+        let sys = expand("struct Sys { value: Timestamp }");
+        let upper_sys = expand("struct SYS { value: Timestamp }");
+
+        assert!(sys.contains("__STATS_REGISTRATION_Sys"));
+        assert!(upper_sys.contains("__STATS_REGISTRATION_SYS"));
+    }
+
+    #[test]
+    fn derives_concrete_add_methods_for_name_only_descriptors() {
+        let expanded = expand(
+            r#"pub struct Metrics {
+                gauge: Gauge,
+                timestamp: Timestamp,
+                simple: SimpleCounter,
+                combined: CombinedCounter,
+                histogram: Histogram,
+            }"#,
+        );
+        for method in [
+            "add_gauge",
+            "add_timestamp",
+            "add_simple_counter",
+            "add_combined_counter",
+            "add_histogram",
+        ] {
+            assert!(expanded.contains(method), "missing {method}: {expanded}");
+        }
+    }
+
+    #[test]
+    fn registers_declared_descriptors_in_field_order() {
+        let expanded = expand(
+            r#"pub struct Sys {
+                heartbeat: Timestamp,
+                #[stats(path = "clear")]
+                last_stats_clear: Timestamp,
+                boottime: Timestamp,
+            }"#,
+        );
+
+        assert!(expanded.contains("Self { heartbeat : Timestamp :: new (\"/sys/heartbeat\")"));
+        assert!(expanded.contains("last_stats_clear : Timestamp :: new (\"/sys/clear\")"));
+        assert!(expanded.contains("boottime : Timestamp :: new (\"/sys/boottime\")"));
+
+        let heartbeat = expanded
+            .find("stats_main . add_timestamp (stats . heartbeat)")
+            .expect("heartbeat descriptor must be moved into StatsMain");
+        let last_stats_clear = expanded
+            .find("stats_main . add_timestamp (stats . last_stats_clear)")
+            .expect("last_stats_clear descriptor must be moved into StatsMain");
+        let boottime = expanded
+            .find("stats_main . add_timestamp (stats . boottime)")
+            .expect("boottime descriptor must be moved into StatsMain");
+        assert!(heartbeat < last_stats_clear);
+        assert!(last_stats_clear < boottime);
+    }
+
+    #[test]
+    fn rejects_descriptor_families_without_declaration_inputs() {
+        let name_vector = expand_stats(
+            syn::parse_str("struct Metrics { names: NameVector }")
+                .expect("parse name vector stats item"),
+        )
+        .expect_err("name vectors need a typed length input")
+        .to_string();
+        assert!(name_vector.contains("typed length input"));
+
+        let ring = expand_stats(
+            syn::parse_str("struct Metrics { ring: Ring<Entry> }").expect("parse ring stats item"),
+        )
+        .expect_err("rings need typed config and schema inputs")
+        .to_string();
+        assert!(ring.contains("typed config and schema inputs"));
+    }
+
+    #[test]
+    fn rejects_duplicate_and_malformed_paths() {
+        let duplicate = expand_stats(
+            syn::parse_str(
+                r#"struct Sys {
+                    first: Timestamp,
+                    #[stats(path = "first")]
+                    second: Timestamp,
+                }"#,
+            )
+            .expect("parse duplicate stats item"),
+        )
+        .expect_err("duplicate paths must be rejected")
+        .to_string();
+        assert!(duplicate.contains("duplicate final stats path"));
+
+        let malformed = expand_stats(
+            syn::parse_str(
+                r#"struct Sys {
+                    #[stats(path = "bad//path")]
+                    value: Timestamp,
+                }"#,
+            )
+            .expect("parse malformed stats item"),
+        )
+        .expect_err("duplicate separators must be rejected")
+        .to_string();
+        assert!(malformed.contains("duplicate separators"));
+
+        let aggregate_attribute = expand_stats(
+            syn::parse_str(r#"#[stats(namespace = "wrong")] struct Sys { value: Timestamp }"#)
+                .expect("parse aggregate stats item"),
+        )
+        .expect_err("aggregate stats attributes must be rejected")
+        .to_string();
+        assert!(aggregate_attribute.contains("only valid on fields"));
+    }
+}
 
 struct NodeFunctionArgs {
     node: Path,
@@ -3440,6 +3932,7 @@ struct PluginArgs {
     session_transports: Vec<Path>,
     session_apps: Vec<Path>,
     binary_api_methods: Vec<Path>,
+    stats_registrations: Vec<Path>,
 }
 
 impl Parse for PluginArgs {
@@ -3458,6 +3951,7 @@ impl Parse for PluginArgs {
         let mut session_transports = Vec::new();
         let mut session_apps = Vec::new();
         let mut binary_api_methods = Vec::new();
+        let mut stats_registrations = Vec::new();
         while !input.is_empty() {
             let key: Ident = input.parse()?;
             input.parse::<Token![=]>()?;
@@ -3485,6 +3979,7 @@ impl Parse for PluginArgs {
                 "session_transports" => session_transports = parse_path_array(input)?,
                 "session_apps" => session_apps = parse_path_array(input)?,
                 "binary_api_methods" => binary_api_methods = parse_path_array(input)?,
+                "stats_registrations" => stats_registrations = parse_path_array(input)?,
                 other => {
                     return Err(Error::new(
                         key.span(),
@@ -3511,6 +4006,7 @@ impl Parse for PluginArgs {
             session_transports,
             session_apps,
             binary_api_methods,
+            stats_registrations,
         })
     }
 }
@@ -3571,6 +4067,7 @@ fn plugin_registration_tokens(args: &PluginArgs) -> TokenStream2 {
     let session_transports = &args.session_transports;
     let session_apps = &args.session_apps;
     let binary_api_methods = &args.binary_api_methods;
+    let stats_registrations = &args.stats_registrations;
     let dependencies_ident = format_ident!(
         "__PLUGIN_LOAD_AFTER_{}",
         name.value().to_ascii_uppercase().replace('-', "_")
@@ -3589,6 +4086,7 @@ fn plugin_registration_tokens(args: &PluginArgs) -> TokenStream2 {
             session_transports = [#(#session_transports),*];
             session_apps = [#(#session_apps),*];
             binary_api_methods = [#(#binary_api_methods),*];
+            stats_registrations = [#(#stats_registrations),*];
         );
 
         // This is deliberately plain TOML data, not an executable entrypoint.

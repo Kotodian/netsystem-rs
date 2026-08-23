@@ -1,11 +1,11 @@
 extern crate self as hammer_runtime;
 
-mod registration;
+pub mod registration;
 
 #[doc(hidden)]
 pub mod __private {
     pub use crate::binary_api::{BinaryApiMethodEntry, BinaryApiMethodReply};
-    pub use crate::registration::RegistrationImage;
+    pub use crate::registration::{RegistrationImage, StatsRegistration};
     pub use abi_stable::RRef;
     pub use abi_stable::export_root_module;
     pub use abi_stable::prefix_type::PrefixTypeTrait;
@@ -25,6 +25,7 @@ crate::__declare_registration_image!(
     session_transports = [];
     session_apps = [];
     binary_api_methods = [];
+    stats_registrations = [engine::__STATS_REGISTRATION_Sys];
 );
 
 pub(crate) fn builtin_registration_image() -> &'static registration::RegistrationImage {

@@ -11,42 +11,81 @@ use std::marker::PhantomData;
 use std::mem::size_of;
 use std::ptr;
 
-pub(super) struct Gauge {
+pub struct Gauge {
     pub(crate) name: String,
 }
 
-pub(super) struct Timestamp {
+pub struct Timestamp {
     pub(crate) name: String,
 }
 
-pub(super) struct SimpleCounter {
+pub struct SimpleCounter {
     pub(crate) name: String,
 }
 
-pub(super) struct CombinedCounter {
+pub struct CombinedCounter {
     pub(crate) name: String,
 }
 
-pub(super) struct NameVector {
+pub struct NameVector {
     pub(crate) name: String,
     pub(crate) length: u32,
 }
 
-pub(super) struct Histogram {
+pub struct Histogram {
     pub(crate) name: String,
 }
 
-pub(super) struct Ring<T> {
+pub struct Ring<T> {
     pub(crate) name: String,
     pub(crate) config: RingConfig,
     pub(crate) schema: Box<[u8]>,
     marker: PhantomData<fn() -> T>,
 }
 
-impl<T> Ring<T> {
-    pub(super) fn new(name: String, config: RingConfig, schema: Box<[u8]>) -> Self {
+impl Gauge {
+    pub fn new(name: impl Into<String>) -> Self {
+        Self { name: name.into() }
+    }
+}
+
+impl Timestamp {
+    pub fn new(name: impl Into<String>) -> Self {
+        Self { name: name.into() }
+    }
+}
+
+impl SimpleCounter {
+    pub fn new(name: impl Into<String>) -> Self {
+        Self { name: name.into() }
+    }
+}
+
+impl CombinedCounter {
+    pub fn new(name: impl Into<String>) -> Self {
+        Self { name: name.into() }
+    }
+}
+
+impl NameVector {
+    pub fn new(name: impl Into<String>, length: u32) -> Self {
         Self {
-            name,
+            name: name.into(),
+            length,
+        }
+    }
+}
+
+impl Histogram {
+    pub fn new(name: impl Into<String>) -> Self {
+        Self { name: name.into() }
+    }
+}
+
+impl<T> Ring<T> {
+    pub fn new(name: impl Into<String>, config: RingConfig, schema: Box<[u8]>) -> Self {
+        Self {
+            name: name.into(),
             config,
             schema,
             marker: PhantomData,
@@ -54,7 +93,7 @@ impl<T> Ring<T> {
     }
 }
 
-pub(super) trait RingSchema: Sized {
+pub trait RingSchema: Sized {
     const ENTRY_SIZE: u32;
     const SCHEMA_VERSION: u32;
 
