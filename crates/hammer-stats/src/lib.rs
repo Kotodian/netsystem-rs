@@ -3,8 +3,64 @@ use std::io;
 
 use hammer_infra::segment::SegmentAllocationError;
 
+mod metric;
 mod protocol;
 mod segment;
+
+use segment::StatsSegment;
+
+pub(crate) struct StatsMain {
+    segment: StatsSegment,
+}
+
+impl StatsMain {
+    pub(crate) fn create(name: &str, size: usize) -> StatsResult<Self> {
+        Ok(Self {
+            segment: StatsSegment::create(name, size)?,
+        })
+    }
+
+    pub(crate) fn add_gauge(&self, descriptor: metric::Gauge) -> StatsResult<()> {
+        let layout = metric::layout::Scalar::<protocol::Gauge>::try_from(descriptor)?;
+        self.segment.register(layout).map(|_| ())
+    }
+
+    pub(crate) fn add_timestamp(&self, descriptor: metric::Timestamp) -> StatsResult<()> {
+        let layout = metric::layout::Scalar::<protocol::ScalarBits>::try_from(descriptor)?;
+        self.segment.register(layout).map(|_| ())
+    }
+
+    pub(crate) fn add_simple_counter(&self, descriptor: metric::SimpleCounter) -> StatsResult<()> {
+        let layout = metric::layout::Simple::<protocol::Counter>::try_from(descriptor)?;
+        self.segment.register(layout).map(|_| ())
+    }
+
+    pub(crate) fn add_combined_counter(
+        &self,
+        descriptor: metric::CombinedCounter,
+    ) -> StatsResult<()> {
+        let layout = metric::layout::Combined::<protocol::Counter>::try_from(descriptor)?;
+        self.segment.register(layout).map(|_| ())
+    }
+
+    pub(crate) fn add_name_vector(&self, descriptor: metric::NameVector) -> StatsResult<()> {
+        let layout = metric::layout::NameVector::try_from(descriptor)?;
+        self.segment.register(layout).map(|_| ())
+    }
+
+    pub(crate) fn add_histogram(&self, descriptor: metric::Histogram) -> StatsResult<()> {
+        let layout = metric::layout::Histogram::<protocol::Counter>::try_from(descriptor)?;
+        self.segment.register(layout).map(|_| ())
+    }
+
+    pub(crate) fn add_ring<T>(&self, descriptor: metric::Ring<T>) -> StatsResult<()>
+    where
+        T: metric::RingSchema,
+    {
+        let layout = metric::layout::Ring::<T>::try_from(descriptor)?;
+        self.segment.register(layout).map(|_| ())
+    }
+}
 
 pub(crate) type StatsResult<T> = Result<T, StatsError>;
 
@@ -77,5 +133,80 @@ impl From<io::Error> for StatsError {
 impl From<SegmentAllocationError> for StatsError {
     fn from(error: SegmentAllocationError) -> Self {
         Self::Allocation(error)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    struct TestRingEntry;
+
+    impl metric::RingSchema for TestRingEntry {
+        const ENTRY_SIZE: u32 = 4;
+        const SCHEMA_VERSION: u32 = 1;
+
+        fn schema() -> &'static [u8] {
+            &[1, 2]
+        }
+
+        fn encode(&self, destination: &mut [u8]) -> StatsResult<()> {
+            if destination.len() != Self::ENTRY_SIZE as usize {
+                return Err(StatsError::InvalidShape);
+            }
+            destination.fill(0);
+            Ok(())
+        }
+
+        fn decode(source: &[u8]) -> StatsResult<Self> {
+            if source.len() != Self::ENTRY_SIZE as usize {
+                return Err(StatsError::InvalidShape);
+            }
+            Ok(Self)
+        }
+    }
+
+    #[test]
+    fn add_boundaries_convert_and_delegate_all_metric_families() -> StatsResult<()> {
+        let stats = StatsMain::create("st-facade", 2 * 1024 * 1024)?;
+        stats.add_gauge(metric::Gauge {
+            name: "/facade/gauge".to_owned(),
+        })?;
+        stats.add_timestamp(metric::Timestamp {
+            name: "/facade/timestamp".to_owned(),
+        })?;
+        stats.add_simple_counter(metric::SimpleCounter {
+            name: "/facade/simple".to_owned(),
+        })?;
+        stats.add_combined_counter(metric::CombinedCounter {
+            name: "/facade/combined".to_owned(),
+        })?;
+        stats.add_name_vector(metric::NameVector {
+            name: "/facade/names".to_owned(),
+            length: 2,
+        })?;
+        stats.add_histogram(metric::Histogram {
+            name: "/facade/histogram".to_owned(),
+        })?;
+        stats.add_ring(metric::Ring::<TestRingEntry>::new(
+            "/facade/ring".to_owned(),
+            protocol::RingConfig::new(
+                <TestRingEntry as metric::RingSchema>::ENTRY_SIZE,
+                2,
+                1,
+                <TestRingEntry as metric::RingSchema>::schema().len() as u32,
+                <TestRingEntry as metric::RingSchema>::SCHEMA_VERSION,
+            ),
+            <TestRingEntry as metric::RingSchema>::schema().into(),
+        ))?;
+
+        assert_eq!(stats.segment.directory_vector_len(), 10);
+        assert!(matches!(
+            stats.add_gauge(metric::Gauge {
+                name: "/facade/gauge".to_owned(),
+            }),
+            Err(StatsError::DuplicateName(_))
+        ));
+        Ok(())
     }
 }
