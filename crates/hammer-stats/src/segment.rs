@@ -1,7 +1,6 @@
 use std::alloc::Layout;
 use std::collections::HashMap;
 use std::ffi::c_void;
-use std::marker::PhantomData;
 use std::mem::{align_of, replace, size_of};
 use std::ptr;
 use std::sync::Arc;
@@ -11,11 +10,11 @@ use hammer_infra::page_size;
 use hammer_infra::segment::{Segment, SegmentAllocation};
 use hammer_runtime::sync::SpinLock;
 
+use crate::metric::RecordKind;
 use crate::protocol::{
-    Counter as WireCounter, DirectoryData, DirectoryDataPointer, DirectoryEntry, DirectoryIndex,
-    DirectoryType, Gauge as WireGauge, NameBytes, RingBufferHeader, RingConfig, RingMetadata,
-    STAT_SEGMENT_INDEX_INVALID, ScalarBits, SharedHeader, StringVectorPointer, SymlinkIndex,
-    VEC_MIN_ALIGN, ring_layout, vec_header_bytes, vec_len, vector_element_offset,
+    Counter, DirectoryData, DirectoryDataPointer, DirectoryEntry, DirectoryIndex, DirectoryType,
+    NameBytes, STAT_SEGMENT_INDEX_INVALID, ScalarBits, SharedHeader, VEC_MIN_ALIGN,
+    vec_header_bytes, vec_len, vector_element_offset,
 };
 use crate::{StatsError, StatsResult};
 
@@ -23,495 +22,19 @@ const VECTOR_HEADER_SIZE: usize = 8;
 const VECTOR_DATA_ALIGNMENT: usize = 64;
 const INITIAL_DIRECTORY_LENGTH: usize = 3;
 
-#[derive(Clone, Copy, Debug, Default, Eq, Hash, PartialEq)]
-pub(crate) struct Gauge;
-
-#[derive(Clone, Copy, Debug, Default, Eq, Hash, PartialEq)]
-pub(crate) struct Counter;
-
-#[derive(Clone, Copy, Debug, Default, Eq, Hash, PartialEq)]
-pub(crate) struct Timestamp;
-
-#[derive(Clone)]
-pub(crate) struct Scalar<M> {
-    index: DirectoryIndex,
-    state: Arc<SpinLock<StatsSegmentState>>,
-    marker: PhantomData<fn() -> M>,
-}
-
-#[derive(Clone)]
-pub(crate) struct Simple<M> {
-    index: DirectoryIndex,
-    state: Arc<SpinLock<StatsSegmentState>>,
-    marker: PhantomData<fn() -> M>,
-}
-
-#[derive(Clone)]
-pub(crate) struct Combined<M> {
-    index: DirectoryIndex,
-    state: Arc<SpinLock<StatsSegmentState>>,
-    marker: PhantomData<fn() -> M>,
-}
-
-#[derive(Clone)]
-pub(crate) struct NameVector {
-    index: DirectoryIndex,
-    state: Arc<SpinLock<StatsSegmentState>>,
-}
-
-#[derive(Clone)]
-pub(crate) struct Symlink {
-    index: DirectoryIndex,
-    state: Arc<SpinLock<StatsSegmentState>>,
-}
-
-#[derive(Clone)]
-pub(crate) struct Histogram<M> {
-    index: DirectoryIndex,
-    state: Arc<SpinLock<StatsSegmentState>>,
-    marker: PhantomData<fn() -> M>,
-}
-
-#[derive(Clone)]
-pub(crate) struct RingShape {
-    config: RingConfig,
-    schema: Box<[u8]>,
-}
-
-impl RingShape {
-    pub(crate) fn new(config: RingConfig, schema: &[u8]) -> StatsResult<Self> {
-        let expected =
-            usize::try_from(config.schema_size()).map_err(|_| StatsError::PublicationFailed)?;
-        if expected != schema.len() {
-            return Err(StatsError::InvalidRingSchema {
-                expected,
-                actual: schema.len(),
-            });
-        }
-        if config.n_threads() == 0 {
-            return Err(StatsError::InvalidShape);
-        }
-        Ok(Self {
-            config,
-            schema: schema.into(),
-        })
-    }
-}
-
-#[derive(Clone)]
-pub(crate) struct Ring<T> {
-    index: DirectoryIndex,
-    state: Arc<SpinLock<StatsSegmentState>>,
-    marker: PhantomData<fn() -> T>,
-}
-
-trait RecordKind: Sized {
-    type Shape;
-    type Storage: IntoIterator<Item = SegmentAllocation>;
-    type Handle;
-
-    fn prepare(
-        state: &StatsSegmentState,
-        capability: &Arc<SpinLock<StatsSegmentState>>,
-        index: DirectoryIndex,
-        name: NameBytes,
-        shape: Self::Shape,
-    ) -> StatsResult<(DirectoryEntry, Self::Storage, Self::Handle)>;
-}
-
-impl RecordKind for Scalar<Gauge> {
-    type Shape = ();
-    type Storage = [SegmentAllocation; 0];
-    type Handle = Self;
-
-    fn prepare(
-        _state: &StatsSegmentState,
-        capability: &Arc<SpinLock<StatsSegmentState>>,
-        index: DirectoryIndex,
-        name: NameBytes,
-        (): Self::Shape,
-    ) -> StatsResult<(DirectoryEntry, Self::Storage, Self::Handle)> {
-        Ok((
-            DirectoryEntry::new(
-                DirectoryType::Gauge.into(),
-                name,
-                DirectoryData::from(WireGauge::from(0)),
-            ),
-            [],
-            Self {
-                index,
-                state: Arc::clone(capability),
-                marker: PhantomData,
-            },
-        ))
-    }
-}
-
-impl RecordKind for Scalar<Timestamp> {
-    type Shape = ();
-    type Storage = [SegmentAllocation; 0];
-    type Handle = Self;
-
-    fn prepare(
-        _state: &StatsSegmentState,
-        capability: &Arc<SpinLock<StatsSegmentState>>,
-        index: DirectoryIndex,
-        name: NameBytes,
-        (): Self::Shape,
-    ) -> StatsResult<(DirectoryEntry, Self::Storage, Self::Handle)> {
-        Ok((
-            DirectoryEntry::new(
-                DirectoryType::ScalarIndex.into(),
-                name,
-                DirectoryData::from(ScalarBits::from(0_u64)),
-            ),
-            [],
-            Self {
-                index,
-                state: Arc::clone(capability),
-                marker: PhantomData,
-            },
-        ))
-    }
-}
-
-impl RecordKind for Simple<Counter> {
-    type Shape = (u32, u32);
-    type Storage = Vec<SegmentAllocation>;
-    type Handle = Self;
-
-    fn prepare(
-        state: &StatsSegmentState,
-        capability: &Arc<SpinLock<StatsSegmentState>>,
-        index: DirectoryIndex,
-        name: NameBytes,
-        shape: Self::Shape,
-    ) -> StatsResult<(DirectoryEntry, Self::Storage, Self::Handle)> {
-        let rows = usize::try_from(shape.0).map_err(|_| StatsError::PublicationFailed)?;
-        let length = usize::try_from(shape.1).map_err(|_| StatsError::PublicationFailed)?;
-        if rows == 0 || length == 0 {
-            return Err(StatsError::InvalidShape);
-        }
-        let (outer, outer_data) = state.allocate_vector::<*mut u8>(rows, None, ptr::null_mut())?;
-        let mut storage = Vec::new();
-        storage
-            .try_reserve(rows.checked_add(1).ok_or(StatsError::CollectionCapacity)?)
-            .map_err(|_| StatsError::CollectionCapacity)?;
-        for row in 0..rows {
-            let (inner, inner_data) = state.allocate_vector::<u64>(length, None, 0_u64)?;
-            unsafe {
-                ptr::write(outer_data.add(row), inner_data.cast::<u8>());
-            }
-            storage.push(inner);
-        }
-        let entry = DirectoryEntry::new(
-            DirectoryType::CounterVectorSimple.into(),
-            name,
-            DirectoryData::from(DirectoryDataPointer::from(outer_data.cast::<c_void>())),
-        );
-        storage.push(outer);
-        Ok((
-            entry,
-            storage,
-            Self {
-                index,
-                state: Arc::clone(capability),
-                marker: PhantomData,
-            },
-        ))
-    }
-}
-
-impl RecordKind for Combined<Counter> {
-    type Shape = (u32, u32);
-    type Storage = Vec<SegmentAllocation>;
-    type Handle = Self;
-
-    fn prepare(
-        state: &StatsSegmentState,
-        capability: &Arc<SpinLock<StatsSegmentState>>,
-        index: DirectoryIndex,
-        name: NameBytes,
-        shape: Self::Shape,
-    ) -> StatsResult<(DirectoryEntry, Self::Storage, Self::Handle)> {
-        let rows = usize::try_from(shape.0).map_err(|_| StatsError::PublicationFailed)?;
-        let length = usize::try_from(shape.1).map_err(|_| StatsError::PublicationFailed)?;
-        if rows == 0 || length == 0 {
-            return Err(StatsError::InvalidShape);
-        }
-        let (outer, outer_data) = state.allocate_vector::<*mut u8>(rows, None, ptr::null_mut())?;
-        let mut storage = Vec::new();
-        storage
-            .try_reserve(rows.checked_add(1).ok_or(StatsError::CollectionCapacity)?)
-            .map_err(|_| StatsError::CollectionCapacity)?;
-        for row in 0..rows {
-            let (inner, inner_data) =
-                state.allocate_vector::<WireCounter>(length, None, WireCounter::default())?;
-            unsafe {
-                ptr::write(outer_data.add(row), inner_data.cast::<u8>());
-            }
-            storage.push(inner);
-        }
-        let entry = DirectoryEntry::new(
-            DirectoryType::CounterVectorCombined.into(),
-            name,
-            DirectoryData::from(DirectoryDataPointer::from(outer_data.cast::<c_void>())),
-        );
-        storage.push(outer);
-        Ok((
-            entry,
-            storage,
-            Self {
-                index,
-                state: Arc::clone(capability),
-                marker: PhantomData,
-            },
-        ))
-    }
-}
-
-impl RecordKind for NameVector {
-    type Shape = u32;
-    type Storage = [SegmentAllocation; 1];
-    type Handle = Self;
-
-    fn prepare(
-        state: &StatsSegmentState,
-        capability: &Arc<SpinLock<StatsSegmentState>>,
-        index: DirectoryIndex,
-        name: NameBytes,
-        length: Self::Shape,
-    ) -> StatsResult<(DirectoryEntry, Self::Storage, Self::Handle)> {
-        let length = usize::try_from(length).map_err(|_| StatsError::PublicationFailed)?;
-        if length == 0 {
-            return Err(StatsError::InvalidShape);
-        }
-        let (allocation, pointer) =
-            state.allocate_vector::<*mut u8>(length, Some(index), ptr::null_mut())?;
-        let entry = DirectoryEntry::new(
-            DirectoryType::NameVector.into(),
-            name,
-            DirectoryData::from(StringVectorPointer::from(pointer)),
-        );
-        Ok((
-            entry,
-            [allocation],
-            Self {
-                index,
-                state: Arc::clone(capability),
-            },
-        ))
-    }
-}
-
-impl RecordKind for Symlink {
-    type Shape = SymlinkIndex;
-    type Storage = [SegmentAllocation; 0];
-    type Handle = Self;
-
-    fn prepare(
-        state: &StatsSegmentState,
-        capability: &Arc<SpinLock<StatsSegmentState>>,
-        index: DirectoryIndex,
-        name: NameBytes,
-        target: Self::Shape,
-    ) -> StatsResult<(DirectoryEntry, Self::Storage, Self::Handle)> {
-        let target_index =
-            usize::try_from(target.entry_index).map_err(|_| StatsError::PublicationFailed)?;
-        let Some(entry) = state.directory_vector.get(target_index) else {
-            return Err(StatsError::DirectoryIndexOutOfBounds {
-                index: target.entry_index,
-                length: state.directory_vector.len(),
-            });
-        };
-        let kind = DirectoryType::try_from(entry.kind())?;
-        if matches!(kind, DirectoryType::Empty | DirectoryType::Illegal) {
-            return Err(StatsError::DirectoryEntryUnavailable {
-                index: target.entry_index,
-            });
-        }
-        Ok((
-            DirectoryEntry::new(
-                DirectoryType::Symlink.into(),
-                name,
-                DirectoryData::from(target),
-            ),
-            [],
-            Self {
-                index,
-                state: Arc::clone(capability),
-            },
-        ))
-    }
-}
-
-impl RecordKind for Histogram<Counter> {
-    type Shape = (u32, u32);
-    type Storage = Vec<SegmentAllocation>;
-    type Handle = Self;
-
-    fn prepare(
-        state: &StatsSegmentState,
-        capability: &Arc<SpinLock<StatsSegmentState>>,
-        index: DirectoryIndex,
-        name: NameBytes,
-        shape: Self::Shape,
-    ) -> StatsResult<(DirectoryEntry, Self::Storage, Self::Handle)> {
-        let rows = usize::try_from(shape.0).map_err(|_| StatsError::PublicationFailed)?;
-        let length = usize::try_from(shape.1).map_err(|_| StatsError::PublicationFailed)?;
-        if rows == 0 || length == 0 {
-            return Err(StatsError::InvalidShape);
-        }
-        let (outer, outer_data) = state.allocate_vector::<*mut u8>(rows, None, ptr::null_mut())?;
-        let mut storage = Vec::new();
-        storage
-            .try_reserve(rows.checked_add(1).ok_or(StatsError::CollectionCapacity)?)
-            .map_err(|_| StatsError::CollectionCapacity)?;
-        for row in 0..rows {
-            let (inner, inner_data) = state.allocate_vector::<u64>(length, None, 0_u64)?;
-            unsafe {
-                ptr::write(outer_data.add(row), inner_data.cast::<u8>());
-            }
-            storage.push(inner);
-        }
-        let entry = DirectoryEntry::new(
-            DirectoryType::HistogramLog2.into(),
-            name,
-            DirectoryData::from(DirectoryDataPointer::from(outer_data.cast::<c_void>())),
-        );
-        storage.push(outer);
-        Ok((
-            entry,
-            storage,
-            Self {
-                index,
-                state: Arc::clone(capability),
-                marker: PhantomData,
-            },
-        ))
-    }
-}
-
-impl<T> RecordKind for Ring<T> {
-    type Shape = RingShape;
-    type Storage = [SegmentAllocation; 1];
-    type Handle = Self;
-
-    fn prepare(
-        state: &StatsSegmentState,
-        capability: &Arc<SpinLock<StatsSegmentState>>,
-        index: DirectoryIndex,
-        name: NameBytes,
-        shape: Self::Shape,
-    ) -> StatsResult<(DirectoryEntry, Self::Storage, Self::Handle)> {
-        let expected = usize::try_from(shape.config.schema_size())
-            .map_err(|_| StatsError::PublicationFailed)?;
-        if expected != shape.schema.len() {
-            return Err(StatsError::InvalidRingSchema {
-                expected,
-                actual: shape.schema.len(),
-            });
-        }
-        let (header, total) =
-            ring_layout(shape.config, VECTOR_DATA_ALIGNMENT, state.mapping.size())?;
-        let layout = Layout::from_size_align(total, VECTOR_DATA_ALIGNMENT)
-            .map_err(|_| StatsError::InvalidLayout)?;
-        let allocation = state.mapping.allocate(layout)?;
-        let base_address = (state.mapping.base() as usize)
-            .checked_add(
-                usize::try_from(allocation.offset()).map_err(|_| StatsError::PublicationFailed)?,
-            )
-            .ok_or(StatsError::PublicationFailed)?;
-        let allocation_end = base_address
-            .checked_add(allocation.len())
-            .ok_or(StatsError::PublicationFailed)?;
-        let data_end = base_address
-            .checked_add(total)
-            .ok_or(StatsError::PublicationFailed)?;
-        if data_end > allocation_end || !base_address.is_multiple_of(VECTOR_DATA_ALIGNMENT) {
-            return Err(StatsError::PublicationFailed);
-        }
-        let base = base_address as *mut u8;
-        let config = header.config();
-        let metadata_offset =
-            usize::try_from(header.metadata_offset()).map_err(|_| StatsError::PublicationFailed)?;
-        let n_threads =
-            usize::try_from(config.n_threads()).map_err(|_| StatsError::PublicationFailed)?;
-        let metadata_size = n_threads
-            .checked_mul(size_of::<RingMetadata>())
-            .ok_or(StatsError::PublicationFailed)?;
-        let schema_offset = if expected == 0 {
-            0
-        } else {
-            metadata_offset
-                .checked_add(metadata_size)
-                .ok_or(StatsError::PublicationFailed)?
-        };
-        let schema_offset =
-            u32::try_from(schema_offset).map_err(|_| StatsError::PublicationFailed)?;
-        unsafe {
-            ptr::write_bytes(base, 0, total);
-            ptr::write(base.cast::<RingBufferHeader>(), header);
-        }
-        for thread_index in 0..n_threads {
-            let offset = metadata_offset
-                .checked_add(
-                    thread_index
-                        .checked_mul(size_of::<RingMetadata>())
-                        .ok_or(StatsError::PublicationFailed)?,
-                )
-                .ok_or(StatsError::PublicationFailed)?;
-            if expected != 0 {
-                let metadata =
-                    RingMetadata::new(config.schema_version(), schema_offset, config.schema_size());
-                unsafe {
-                    ptr::write(base.add(offset).cast::<RingMetadata>(), metadata);
-                }
-            }
-        }
-        if expected != 0 {
-            unsafe {
-                ptr::copy_nonoverlapping(
-                    shape.schema.as_ptr(),
-                    base.add(
-                        usize::try_from(schema_offset)
-                            .map_err(|_| StatsError::PublicationFailed)?,
-                    ),
-                    shape.schema.len(),
-                );
-            }
-        }
-        let entry = DirectoryEntry::new(
-            DirectoryType::RingBuffer.into(),
-            name,
-            DirectoryData::from(DirectoryDataPointer::from(base.cast::<c_void>())),
-        );
-        Ok((
-            entry,
-            [allocation],
-            Self {
-                index,
-                state: Arc::clone(capability),
-                marker: PhantomData,
-            },
-        ))
-    }
-}
-
-pub(crate) struct StatsSegmentState {
+pub(super) struct StatsSegmentState {
     mapping: Segment,
     header: SharedHeader,
     directory_vector: Vec<DirectoryEntry>,
     directory_block: SegmentAllocation,
     payloads: Vec<Vec<SegmentAllocation>>,
-    retired: Vec<SegmentAllocation>,
     names: HashMap<NameBytes, DirectoryIndex>,
     first_free: Option<DirectoryIndex>,
     tearing_down: bool,
 }
 
 impl StatsSegmentState {
-    fn allocate_vector<T>(
+    pub(super) fn allocate_vector<T>(
         &self,
         count: usize,
         entry_index: Option<DirectoryIndex>,
@@ -536,7 +59,6 @@ impl StatsSegmentState {
         let layout =
             Layout::from_size_align(bytes, data_align).map_err(|_| StatsError::InvalidLayout)?;
         let allocation = self.mapping.allocate(layout)?;
-        let private_header_offset: usize = 0;
         let header = vec_header_bytes(
             u32::try_from(count).map_err(|_| StatsError::PublicationFailed)?,
             u8::try_from(data_align / VEC_MIN_ALIGN).map_err(|_| StatsError::PublicationFailed)?,
@@ -545,11 +67,7 @@ impl StatsSegmentState {
             0,
             0,
         );
-        let allocation_base = (self.mapping.base() as usize)
-            .checked_add(
-                usize::try_from(allocation.offset()).map_err(|_| StatsError::PublicationFailed)?,
-            )
-            .ok_or(StatsError::PublicationFailed)?;
+        let allocation_base = self.allocation_address(&allocation)?;
         let header_end = header_offset
             .checked_add(size_of::<[u8; VECTOR_HEADER_SIZE]>())
             .ok_or(StatsError::PublicationFailed)?;
@@ -577,15 +95,11 @@ impl StatsSegmentState {
         }
         let data_pointer = data_address as *mut T;
         if let Some(index) = entry_index {
-            let private_end = private_header_offset
-                .checked_add(size_of::<u32>())
-                .ok_or(StatsError::PublicationFailed)?;
+            let private_end = size_of::<u32>();
             if private_end > allocation.len() {
                 return Err(StatsError::PublicationFailed);
             }
-            let private_address = allocation_base
-                .checked_add(private_header_offset)
-                .ok_or(StatsError::PublicationFailed)?;
+            let private_address = allocation_base;
             if !private_address.is_multiple_of(align_of::<u32>()) {
                 return Err(StatsError::PublicationFailed);
             }
@@ -601,6 +115,22 @@ impl StatsSegmentState {
             }
         }
         Ok((allocation, data_pointer))
+    }
+
+    pub(super) fn mapping_size(&self) -> usize {
+        self.mapping.size()
+    }
+
+    pub(super) fn allocation_address(&self, allocation: &SegmentAllocation) -> StatsResult<usize> {
+        (self.mapping.base() as usize)
+            .checked_add(
+                usize::try_from(allocation.offset()).map_err(|_| StatsError::PublicationFailed)?,
+            )
+            .ok_or(StatsError::PublicationFailed)
+    }
+
+    pub(super) fn allocate_block(&self, layout: Layout) -> StatsResult<SegmentAllocation> {
+        Ok(self.mapping.allocate(layout)?)
     }
 
     fn vector_len<T>(&self, pointer: *mut u8) -> StatsResult<usize> {
@@ -728,11 +258,7 @@ impl StatsSegmentState {
         let layout = directory_layout(entries.len())?;
         let allocation = self.mapping.allocate(layout)?;
         let header = vec_header_bytes(length, 1, 3, false, 0, 0);
-        let allocation_base = (self.mapping.base() as usize)
-            .checked_add(
-                usize::try_from(allocation.offset()).map_err(|_| StatsError::PublicationFailed)?,
-            )
-            .ok_or(StatsError::PublicationFailed)?;
+        let allocation_base = self.allocation_address(&allocation)?;
         let header_end = VECTOR_HEADER_SIZE;
         if header_end > allocation.len() {
             return Err(StatsError::PublicationFailed);
@@ -789,9 +315,6 @@ impl StatsSegmentState {
             return Err(StatsError::PublicationFailed);
         }
         let pointer = pointer_address as *mut DirectoryEntry;
-        self.retired
-            .try_reserve(1)
-            .map_err(|_| StatsError::CollectionCapacity)?;
         let old_block = replace(&mut self.directory_block, new_block);
         self.directory_vector = candidate;
         self.header.set_in_progress(true);
@@ -801,7 +324,7 @@ impl StatsSegmentState {
         self.write_shared_header(Ordering::Relaxed);
         self.header.set_in_progress(false);
         self.write_shared_header(Ordering::Release);
-        self.retired.push(old_block);
+        drop(old_block);
         Ok(())
     }
 
@@ -877,7 +400,6 @@ impl StatsSegment {
                 payloads.resize_with(INITIAL_DIRECTORY_LENGTH, Vec::new);
                 payloads
             },
-            retired: Vec::new(),
             names,
             first_free: None,
             tearing_down: false,
@@ -926,11 +448,11 @@ impl StatsSegment {
         }
     }
 
-    fn register<K>(&self, name: &str, shape: K::Shape) -> StatsResult<K::Handle>
+    pub(super) fn register<K>(&self, layout: K) -> StatsResult<K::Handle>
     where
         K: RecordKind,
     {
-        let name = NameBytes::try_from(name)?;
+        let name = K::name(&layout);
         let mut state = self.state.lock();
         if state.tearing_down {
             return Err(StatsError::Teardown);
@@ -964,7 +486,7 @@ impl StatsSegment {
             }
         };
 
-        let (entry, storage, handle) = K::prepare(&state, &self.state, index, name, shape)?;
+        let (entry, storage, handle) = K::prepare(&state, index, layout)?;
         let mut allocations = Vec::new();
         let storage = storage.into_iter();
         let (lower, upper) = storage.size_hint();
@@ -1001,16 +523,10 @@ impl StatsSegment {
             .names
             .try_reserve(1)
             .map_err(|_| StatsError::CollectionCapacity)?;
-        let raw_index = usize::try_from(index.raw()).map_err(|_| StatsError::PublicationFailed)?;
         if raw_index == state.payloads.len() {
             state
                 .payloads
                 .try_reserve(1)
-                .map_err(|_| StatsError::CollectionCapacity)?;
-        }
-        if let Some(payloads) = state.payloads.get_mut(raw_index) {
-            payloads
-                .try_reserve(allocations.len())
                 .map_err(|_| StatsError::CollectionCapacity)?;
         }
         let new_block = state.allocate_directory(&candidate)?;
@@ -1020,7 +536,9 @@ impl StatsSegment {
         if raw_index == state.payloads.len() {
             state.payloads.push(allocations);
         } else if let Some(payloads) = state.payloads.get_mut(raw_index) {
-            payloads.extend(allocations);
+            *payloads = allocations;
+        } else {
+            return Err(StatsError::PublicationFailed);
         }
         Ok(handle)
     }
@@ -1042,6 +560,9 @@ impl StatsSegment {
             return Err(StatsError::DirectoryEntryUnavailable { index: index.raw() });
         }
         let name = entry.name_bytes()?;
+        if raw_index >= state.payloads.len() {
+            return Err(StatsError::PublicationFailed);
+        }
         let next_free = state
             .first_free
             .map(DirectoryIndex::raw)
@@ -1064,12 +585,84 @@ impl StatsSegment {
         );
         let new_block = state.allocate_directory(&candidate)?;
         state.publish(candidate, new_block)?;
+        let old_payloads = replace(&mut state.payloads[raw_index], Vec::new());
+        drop(old_payloads);
         state.names.remove(&name);
         state.first_free = Some(index);
         Ok(())
     }
 
     pub(crate) fn validate(&self, index: DirectoryIndex, row: u32, column: u32) -> StatsResult<()> {
+        let needs_growth = {
+            let state = self.state.lock();
+            if state.tearing_down {
+                return Err(StatsError::Teardown);
+            }
+            let raw_index = usize::try_from(index.raw())
+                .map_err(|_| StatsError::PublicationFailed)?;
+            let Some(entry) = state.directory_vector.get(raw_index).copied() else {
+                return Err(StatsError::DirectoryIndexOutOfBounds {
+                    index: index.raw(),
+                    length: state.directory_vector.len(),
+                });
+            };
+            let kind = DirectoryType::try_from(entry.kind())?;
+            if !matches!(
+                kind,
+                DirectoryType::CounterVectorSimple
+                    | DirectoryType::CounterVectorCombined
+                    | DirectoryType::HistogramLog2
+            ) {
+                return Err(StatsError::InvalidShape);
+            }
+
+            let row_count = usize::try_from(row)
+                .map_err(|_| StatsError::PublicationFailed)?
+                .checked_add(1)
+                .ok_or(StatsError::PublicationFailed)?;
+            let column_count = usize::try_from(column)
+                .map_err(|_| StatsError::PublicationFailed)?
+                .checked_add(1)
+                .ok_or(StatsError::PublicationFailed)?;
+            let outer_pointer = DirectoryDataPointer::try_from(&entry)?
+                .as_ptr()
+                .cast::<u8>();
+            let old_outer_length = if outer_pointer.is_null() {
+                0
+            } else {
+                state.vector_len::<*mut u8>(outer_pointer)?
+            };
+            let mut needs_growth = row_count > old_outer_length;
+            if !needs_growth {
+                for row_index in 0..row_count {
+                    let inner_pointer = unsafe {
+                        ptr::read(state.vector_element::<*mut u8>(outer_pointer, row_index)?)
+                    };
+                    let inner_length = if inner_pointer.is_null() {
+                        0
+                    } else {
+                        match kind {
+                            DirectoryType::CounterVectorSimple | DirectoryType::HistogramLog2 => {
+                                state.vector_len::<u64>(inner_pointer)?
+                            }
+                            DirectoryType::CounterVectorCombined => {
+                                state.vector_len::<Counter>(inner_pointer)?
+                            }
+                            _ => return Err(StatsError::InvalidShape),
+                        }
+                    };
+                    if inner_length < column_count {
+                        needs_growth = true;
+                        break;
+                    }
+                }
+            }
+            needs_growth
+        };
+        if !needs_growth {
+            return Ok(());
+        }
+
         let mut state = self.state.lock();
         if state.tearing_down {
             return Err(StatsError::Teardown);
@@ -1102,10 +695,11 @@ impl StatsSegment {
         let outer_pointer = DirectoryDataPointer::try_from(&entry)?
             .as_ptr()
             .cast::<u8>();
-        if outer_pointer.is_null() {
-            return Err(StatsError::PublicationFailed);
-        }
-        let old_outer_length = state.vector_len::<*mut u8>(outer_pointer)?;
+        let old_outer_length = if outer_pointer.is_null() {
+            0
+        } else {
+            state.vector_len::<*mut u8>(outer_pointer)?
+        };
         let mut needs_growth = row_count > old_outer_length;
         if !needs_growth {
             for row_index in 0..row_count {
@@ -1120,7 +714,7 @@ impl StatsSegment {
                             state.vector_len::<u64>(inner_pointer)?
                         }
                         DirectoryType::CounterVectorCombined => {
-                            state.vector_len::<WireCounter>(inner_pointer)?
+                            state.vector_len::<Counter>(inner_pointer)?
                         }
                         _ => return Err(StatsError::InvalidShape),
                     }
@@ -1137,7 +731,7 @@ impl StatsSegment {
 
         let outer_length = old_outer_length.max(row_count);
         let owner_count = old_outer_length
-            .checked_add(1)
+            .checked_add(usize::from(!outer_pointer.is_null()))
             .ok_or(StatsError::CollectionCapacity)?;
         let Some(payloads) = state.payloads.get(raw_index) else {
             return Err(StatsError::PublicationFailed);
@@ -1145,16 +739,6 @@ impl StatsSegment {
         if payloads.len() < owner_count {
             return Err(StatsError::PublicationFailed);
         }
-        let Some(payloads) = state.payloads.get_mut(raw_index) else {
-            return Err(StatsError::PublicationFailed);
-        };
-        payloads
-            .try_reserve(
-                outer_length
-                    .checked_add(1)
-                    .ok_or(StatsError::CollectionCapacity)?,
-            )
-            .map_err(|_| StatsError::CollectionCapacity)?;
 
         let mut staged = Vec::new();
         staged
@@ -1166,15 +750,17 @@ impl StatsSegment {
             .map_err(|_| StatsError::CollectionCapacity)?;
         let (new_outer, new_outer_data) =
             state.allocate_vector::<*mut u8>(outer_length, None, ptr::null_mut())?;
-        unsafe {
-            ptr::copy_nonoverlapping(
-                outer_pointer.cast::<*mut u8>(),
-                new_outer_data,
-                old_outer_length,
-            );
+        if old_outer_length != 0 {
+            unsafe {
+                ptr::copy_nonoverlapping(
+                    outer_pointer.cast::<*mut u8>(),
+                    new_outer_data,
+                    old_outer_length,
+                );
+            }
         }
 
-        for row_index in 0..row_count {
+        for row_index in 0..outer_length {
             let old_inner = if row_index < old_outer_length {
                 unsafe { ptr::read(state.vector_element::<*mut u8>(outer_pointer, row_index)?) }
             } else {
@@ -1188,12 +774,12 @@ impl StatsSegment {
                         state.vector_len::<u64>(old_inner)?
                     }
                     DirectoryType::CounterVectorCombined => {
-                        state.vector_len::<WireCounter>(old_inner)?
+                        state.vector_len::<Counter>(old_inner)?
                     }
                     _ => return Err(StatsError::InvalidShape),
                 }
             };
-            if old_length >= column_count {
+            if row_index >= row_count || old_length >= column_count {
                 continue;
             }
 
@@ -1213,15 +799,12 @@ impl StatsSegment {
                     (inner, inner_data.cast::<u8>())
                 }
                 DirectoryType::CounterVectorCombined => {
-                    let (inner, inner_data) = state.allocate_vector::<WireCounter>(
-                        column_count,
-                        None,
-                        WireCounter::default(),
-                    )?;
+                    let (inner, inner_data) =
+                        state.allocate_vector::<Counter>(column_count, None, Counter::default())?;
                     if old_length != 0 {
                         unsafe {
                             ptr::copy_nonoverlapping(
-                                old_inner.cast::<WireCounter>(),
+                                old_inner.cast::<Counter>(),
                                 inner_data,
                                 old_length,
                             );
@@ -1255,13 +838,48 @@ impl StatsSegment {
         );
 
         let new_block = state.allocate_directory(&candidate)?;
+        let mut replacement_payloads = Vec::new();
+        replacement_payloads
+            .try_reserve(
+                outer_length
+                    .checked_add(1)
+                    .ok_or(StatsError::CollectionCapacity)?,
+            )
+            .map_err(|_| StatsError::CollectionCapacity)?;
         state.publish(candidate, new_block)?;
 
-        let Some(payloads) = state.payloads.get_mut(raw_index) else {
-            return Err(StatsError::PublicationFailed);
-        };
-        payloads.extend(staged);
-        payloads.push(new_outer);
+        let old_payloads = replace(&mut state.payloads[raw_index], Vec::new());
+        let mut old_payloads = old_payloads.into_iter();
+        let mut staged = staged.into_iter();
+        // The published outer vector identifies which row pointers still own old allocations.
+        for row_index in 0..outer_length {
+            let old_pointer = if row_index < old_outer_length {
+                unsafe { ptr::read(outer_pointer.cast::<*mut u8>().add(row_index)) }
+            } else {
+                ptr::null_mut()
+            };
+            let new_pointer = unsafe { ptr::read(new_outer_data.add(row_index)) };
+            let old_inner = (row_index < old_outer_length)
+                .then(|| old_payloads.next())
+                .flatten();
+            let retain_old =
+                new_pointer == old_pointer && (row_index >= row_count || !old_pointer.is_null());
+            if retain_old {
+                if let Some(old_inner) = old_inner {
+                    replacement_payloads.push(old_inner);
+                }
+            } else {
+                drop(old_inner);
+                if let Some(inner) = staged.next() {
+                    replacement_payloads.push(inner);
+                }
+            }
+        }
+        drop(old_payloads.next());
+        drop(old_payloads);
+        drop(staged);
+        replacement_payloads.push(new_outer);
+        state.payloads[raw_index] = replacement_payloads;
         Ok(())
     }
 
@@ -1283,7 +901,6 @@ impl StatsSegment {
         state.names.clear();
         state.first_free = None;
         state.payloads.clear();
-        state.retired.clear();
         state.header.set_in_progress(false);
         state.write_shared_header(Ordering::Release);
         Ok(())
@@ -1343,6 +960,10 @@ fn vector_log2_alignment(align: usize) -> StatsResult<u8> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::metric::{
+        Gauge as MetricGauge, NameVector as MetricNameVector, SimpleCounter, layout,
+    };
+    use crate::protocol::{Gauge as ProtocolGauge, StringVectorPointer};
 
     fn create_segment(name: &str) -> StatsSegment {
         match StatsSegment::create(name, 2 * 1024 * 1024) {
@@ -1369,30 +990,29 @@ mod tests {
 
     #[test]
     fn registration_remove_and_reuse_use_fixed_directory_indices() -> StatsResult<()> {
-        let segment = create_segment("st-link");
-        let _target = segment.register::<Scalar<Gauge>>("/target", ())?;
-        segment.register::<Symlink>(
-            "/link",
-            SymlinkIndex {
-                entry_index: 3,
-                vector_index: 7,
-            },
+        let segment = create_segment("st-registration");
+        let _target = segment.register::<layout::Scalar<ProtocolGauge>>(
+            MetricGauge {
+                name: "/target".to_owned(),
+            }
+            .try_into()?,
+        )?;
+        segment.register::<layout::Scalar<ProtocolGauge>>(
+            MetricGauge {
+                name: "/second".to_owned(),
+            }
+            .try_into()?,
         )?;
         assert_eq!(segment.directory_vector_len(), 5);
-        assert!(matches!(
-            segment.register::<Symlink>(
-                "/bad-link",
-                SymlinkIndex {
-                    entry_index: 99,
-                    vector_index: 0,
-                },
-            ),
-            Err(StatsError::DirectoryIndexOutOfBounds { index: 99, .. })
-        ));
 
         segment.remove(DirectoryIndex::new(4))?;
         assert_eq!(segment.directory_vector_len(), 5);
-        segment.register::<Scalar<Gauge>>("/replacement", ())?;
+        segment.register::<layout::Scalar<ProtocolGauge>>(
+            MetricGauge {
+                name: "/replacement".to_owned(),
+            }
+            .try_into()?,
+        )?;
         segment.remove(DirectoryIndex::new(4))?;
         Ok(())
     }
@@ -1400,7 +1020,12 @@ mod tests {
     #[test]
     fn validation_grows_registered_matrix() -> StatsResult<()> {
         let segment = create_segment("st-retain");
-        segment.register::<Simple<Counter>>("/retain/simple", (1, 1))?;
+        segment.register::<layout::Simple<Counter>>(
+            SimpleCounter {
+                name: "/retain/simple".to_owned(),
+            }
+            .try_into()?,
+        )?;
 
         segment.validate(DirectoryIndex::new(3), 2, 2)?;
         segment.remove(DirectoryIndex::new(3))?;
@@ -1414,7 +1039,12 @@ mod tests {
     #[test]
     fn validation_preserves_retained_rows_during_mixed_growth() -> StatsResult<()> {
         let segment = create_segment("st-mixed-growth");
-        segment.register::<Simple<Counter>>("/mixed/simple", (2, 1))?;
+        segment.register::<layout::Simple<Counter>>(
+            SimpleCounter {
+                name: "/mixed/simple".to_owned(),
+            }
+            .try_into()?,
+        )?;
 
         segment.validate(DirectoryIndex::new(3), 0, 2)?;
         segment.validate(DirectoryIndex::new(3), 1, 2)?;
@@ -1425,7 +1055,13 @@ mod tests {
     #[test]
     fn name_vector_private_header_stores_directory_index_at_vec_header() -> StatsResult<()> {
         let segment = create_segment("st-name-header");
-        let _handle = segment.register::<NameVector>("/names", 2)?;
+        let _handle = segment.register::<layout::NameVector>(
+            MetricNameVector {
+                name: "/names".to_owned(),
+                length: 2,
+            }
+            .try_into()?,
+        )?;
         let state = segment.state.lock();
         let entry = state.directory_vector[3];
         let vector = StringVectorPointer::try_from(&entry)?.as_ptr() as usize;
@@ -1443,22 +1079,21 @@ mod tests {
     }
 
     #[test]
-    fn retired_allocations_and_handles_survive_publication_until_quiescence() -> StatsResult<()> {
-        let mut segment = StatsSegment::create("st-retired", 2 * 1024 * 1024)?;
-        let handle = segment.register::<Simple<Counter>>("/retired", (1, 1))?;
+    fn growth_reclaims_superseded_payloads_after_publication() -> StatsResult<()> {
+        let mut segment = StatsSegment::create("st-growth-reclaim", 2 * 1024 * 1024)?;
+        segment.register::<layout::Simple<Counter>>(
+            SimpleCounter {
+                name: "/growth/reclaim".to_owned(),
+            }
+            .try_into()?,
+        )?;
         let initial_payloads = segment.state.lock().payloads[3].len();
         segment.validate(DirectoryIndex::new(3), 2, 2)?;
         {
             let state = segment.state.lock();
             assert!(state.payloads[3].len() > initial_payloads);
-            assert!(!state.retired.is_empty());
         }
         segment.remove(DirectoryIndex::new(3))?;
-        assert!(matches!(
-            segment.teardown(),
-            Err(StatsError::WorkerNotQuiescent)
-        ));
-        drop(handle);
         segment.teardown()?;
         Ok(())
     }
@@ -1481,13 +1116,23 @@ mod tests {
     #[test]
     fn remove_rejects_repeated_removal_and_reuses_slot() -> StatsResult<()> {
         let segment = create_segment("st-remove");
-        segment.register::<Scalar<Gauge>>("/remove/me", ())?;
+        segment.register::<layout::Scalar<ProtocolGauge>>(
+            MetricGauge {
+                name: "/remove/me".to_owned(),
+            }
+            .try_into()?,
+        )?;
         segment.remove(DirectoryIndex::new(3))?;
         assert!(matches!(
             segment.remove(DirectoryIndex::new(3)),
             Err(StatsError::DirectoryEntryUnavailable { index: 3 })
         ));
-        segment.register::<Scalar<Gauge>>("/remove/replacement", ())?;
+        segment.register::<layout::Scalar<ProtocolGauge>>(
+            MetricGauge {
+                name: "/remove/replacement".to_owned(),
+            }
+            .try_into()?,
+        )?;
         assert_eq!(segment.directory_vector_len(), 4);
         Ok(())
     }
