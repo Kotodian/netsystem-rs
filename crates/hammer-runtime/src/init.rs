@@ -6,6 +6,7 @@ use std::panic::{AssertUnwindSafe, catch_unwind};
 use crate::error::RuntimeResult;
 
 use crate::engine::Engine;
+use hammer_stats::StatsMain;
 
 #[derive(Debug, thiserror::Error)]
 pub enum InitError {
@@ -152,6 +153,13 @@ pub fn run_init_functions(engine: &mut Engine) -> RuntimeResult<()> {
     let result = dispatch_init(functions, &mut called, engine);
     engine.called_init_functions = called;
     result
+}
+
+pub fn run_stats_registrations(engine: &Engine, stats_main: &StatsMain) -> RuntimeResult<()> {
+    for registration in engine.plugin_main().stats_registrations() {
+        (registration.register)(stats_main)?;
+    }
+    Ok(())
 }
 
 pub fn run_worker_init_functions(engine: &mut Engine) -> RuntimeResult<()> {

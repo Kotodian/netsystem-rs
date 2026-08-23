@@ -1232,6 +1232,7 @@ dependencies = [
  "hammer-core",
  "hammer-infra",
  "hammer-service",
+ "hammer-stats",
  "humantime-serde",
  "indoc",
  "io-uring",
@@ -1287,7 +1288,6 @@ name = "hammer-stats"
 version = "0.1.0"
 dependencies = [
  "hammer-infra",
- "hammer-runtime",
 ]
 
 [[package]]

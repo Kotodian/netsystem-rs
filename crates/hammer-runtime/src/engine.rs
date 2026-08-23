@@ -17,9 +17,18 @@ use crate::node::{NodeRuntimeData, NodeRuntimeInner};
 use crate::process::ProcessMain;
 use crate::spawn::{DataRemoteLocalQueue, DataRemoteLocalQueueError};
 use crate::{DataPlaneHandoffWorker, DataWorkerId, FileMain, PluginMain, ProcessHandle};
+use hammer_component_macros::Stats;
+use hammer_stats::{StatsMain, Timestamp};
 
 thread_local! {
     static CURRENT_ENGINE: RefCell<Option<*mut Engine>> = const { RefCell::new(None) };
+}
+
+#[derive(Stats)]
+pub(crate) struct Sys {
+    heartbeat: Timestamp,
+    last_stats_clear: Timestamp,
+    boottime: Timestamp,
 }
 
 pub(crate) struct EngineWorkerSeed {
@@ -772,27 +781,32 @@ impl EngineWorkerSeed {
     }
 }
 
+const STATS_SEGMENT_SIZE: usize = 32 << 20;
+
 pub struct EnginePool {
     pub engines: Vec<Engine>,
     pub name: String,
     pub exec_path: String,
     pub argv: Vec<String>,
     pub startup_config: String,
+    stats_main: StatsMain,
     ipc_listener: Option<tokio::net::TcpListener>,
 }
 
 impl EnginePool {
-    pub fn new(main: Engine) -> Self {
+    pub fn new(main: Engine) -> RuntimeResult<Self> {
+        let stats_main = StatsMain::create("stat segment", STATS_SEGMENT_SIZE)?;
         let mut engines = Vec::new();
         engines.push(main);
-        Self {
+        Ok(Self {
             engines,
             name: String::new(),
             exec_path: String::new(),
             argv: Vec::new(),
             startup_config: String::new(),
+            stats_main,
             ipc_listener: None,
-        }
+        })
     }
 
     pub fn main_engine(&self) -> &Engine {
@@ -823,14 +837,13 @@ impl EnginePool {
         self.ipc_listener.take()
     }
 
-    pub fn main_loop_enter(
-        engine: &mut Engine,
-        roots: &[String],
-        config: &str,
-    ) -> RuntimeResult<()> {
+    pub fn main_loop_enter(&mut self, roots: &[String], config: &str) -> RuntimeResult<()> {
+        let (engines, stats_main) = (&mut self.engines, &self.stats_main);
+        let engine = &mut engines[0];
         engine.install_current();
         engine.configure_early(config)?;
         engine.load_plugins(roots, config)?;
+        crate::init::run_stats_registrations(engine, stats_main)?;
         crate::init::run_main_loop_enter(engine)?;
         engine.start_process_nodes()?;
         Ok(())
@@ -1006,7 +1019,7 @@ mod tests {
     #[test]
     fn engine_pool_main_engine_at_index_zero() {
         let main = test_engine();
-        let pool = EnginePool::new(main);
+        let pool = EnginePool::new(main).expect("engine pool");
         assert_eq!(pool.worker_count(), 0);
         assert!(pool.engine(0).is_some());
         assert!(pool.engine(1).is_none());
@@ -1091,6 +1104,7 @@ mod tests {
         EnginePool::new(
             Engine::new_configured(RuntimeRegistry::new(), worker).expect("configured main engine"),
         )
+        .expect("engine pool")
     }
 
     #[test]

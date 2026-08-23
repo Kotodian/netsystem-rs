@@ -143,13 +143,14 @@ fn socket_path() -> PathBuf {
 /// its lifetime, so the capability drops only at process exit. Capability-drop
 /// cleanup is asserted directly by
 /// `bind_reclaims_a_stale_socket_and_drop_removes_its_own_path`.
-fn engine_with_binary_api(path: &Path, max_frame_bytes: usize) -> Engine {
-    let mut engine = Engine::new_configured(RuntimeRegistry::new(), Worker::default())
+fn engine_with_binary_api(path: &Path, max_frame_bytes: usize) -> EnginePool {
+    let engine = Engine::new_configured(RuntimeRegistry::new(), Worker::default())
         .expect("configure test engine");
-    engine
+    let mut pool = EnginePool::new(engine).expect("engine pool");
+    pool.main_engine_mut()
         .plugin_main_mut()
         .register_builtin_image(&__HAMMER_REGISTRATION_IMAGE);
-    engine
+    pool.main_engine_mut()
         .plugin_main_mut()
         .register_builtin_image(hammer_service::registration_image());
     let config = format!(
@@ -157,8 +158,8 @@ fn engine_with_binary_api(path: &Path, max_frame_bytes: usize) -> Engine {
         path.display(),
         max_frame_bytes
     );
-    EnginePool::main_loop_enter(&mut engine, &[], &config).expect("enter main loop");
-    engine
+    pool.main_loop_enter(&[], &config).expect("enter main loop");
+    pool
 }
 
 /// Uninstalls the current Engine before the test's engine drops, so the
@@ -243,8 +244,9 @@ fn read_reply(stream: &mut std::os::unix::net::UnixStream) -> io::Result<BinaryA
 #[test]
 fn binary_api_process_node_serves_one_request() {
     let path = socket_path();
-    let mut engine = engine_with_binary_api(&path, DEFAULT_MAX_FRAME_BYTES);
-    let _engine_guard = CurrentEngine::install(&mut engine);
+    let mut pool = engine_with_binary_api(&path, DEFAULT_MAX_FRAME_BYTES);
+    let engine = pool.main_engine_mut();
+    let _engine_guard = CurrentEngine::install(engine);
     let expected_thread = format!("{:?}", std::thread::current().id());
     let runtime = main_runtime();
 
@@ -313,8 +315,9 @@ fn duplicate_method_registration_is_rejected() {
 #[test]
 fn blocked_server_write_re_arms_when_the_client_resumes_reading() {
     let path = socket_path();
-    let mut engine = engine_with_binary_api(&path, DEFAULT_MAX_FRAME_BYTES);
-    let _engine_guard = CurrentEngine::install(&mut engine);
+    let mut pool = engine_with_binary_api(&path, DEFAULT_MAX_FRAME_BYTES);
+    let engine = pool.main_engine_mut();
+    let _engine_guard = CurrentEngine::install(engine);
     let runtime = main_runtime();
 
     engine.run_processes_until(&runtime, async {
@@ -350,8 +353,9 @@ fn blocked_server_write_re_arms_when_the_client_resumes_reading() {
 #[test]
 fn partial_frames_are_held_and_complete_frames_dispatch_in_order() {
     let path = socket_path();
-    let mut engine = engine_with_binary_api(&path, DEFAULT_MAX_FRAME_BYTES);
-    let _engine_guard = CurrentEngine::install(&mut engine);
+    let mut pool = engine_with_binary_api(&path, DEFAULT_MAX_FRAME_BYTES);
+    let engine = pool.main_engine_mut();
+    let _engine_guard = CurrentEngine::install(engine);
     let runtime = main_runtime();
 
     engine.run_processes_until(&runtime, async {
@@ -434,8 +438,9 @@ fn partial_frames_are_held_and_complete_frames_dispatch_in_order() {
 #[test]
 fn oversize_declared_frame_closes_the_client_and_releases_the_slot() {
     let path = socket_path();
-    let mut engine = engine_with_binary_api(&path, 64 * 1024);
-    let _engine_guard = CurrentEngine::install(&mut engine);
+    let mut pool = engine_with_binary_api(&path, 64 * 1024);
+    let engine = pool.main_engine_mut();
+    let _engine_guard = CurrentEngine::install(engine);
     let runtime = main_runtime();
 
     engine.run_processes_until(&runtime, async {
@@ -489,8 +494,9 @@ fn oversize_declared_frame_closes_the_client_and_releases_the_slot() {
 #[test]
 fn partial_frame_then_disconnect_releases_the_slot() {
     let path = socket_path();
-    let mut engine = engine_with_binary_api(&path, DEFAULT_MAX_FRAME_BYTES);
-    let _engine_guard = CurrentEngine::install(&mut engine);
+    let mut pool = engine_with_binary_api(&path, DEFAULT_MAX_FRAME_BYTES);
+    let engine = pool.main_engine_mut();
+    let _engine_guard = CurrentEngine::install(engine);
     let runtime = main_runtime();
 
     engine.run_processes_until(&runtime, async {
@@ -548,8 +554,9 @@ fn partial_frame_then_disconnect_releases_the_slot() {
 #[test]
 fn stalled_client_backpressure_does_not_starve_a_second_client() {
     let path = socket_path();
-    let mut engine = engine_with_binary_api(&path, DEFAULT_MAX_FRAME_BYTES);
-    let _engine_guard = CurrentEngine::install(&mut engine);
+    let mut pool = engine_with_binary_api(&path, DEFAULT_MAX_FRAME_BYTES);
+    let engine = pool.main_engine_mut();
+    let _engine_guard = CurrentEngine::install(engine);
     let runtime = main_runtime();
 
     engine.run_processes_until(&runtime, async {
@@ -618,8 +625,9 @@ fn stalled_client_backpressure_does_not_starve_a_second_client() {
 #[test]
 fn mp_safe_method_runs_on_the_main_thread_without_the_worker_barrier() {
     let path = socket_path();
-    let mut engine = engine_with_binary_api(&path, DEFAULT_MAX_FRAME_BYTES);
-    let _engine_guard = CurrentEngine::install(&mut engine);
+    let mut pool = engine_with_binary_api(&path, DEFAULT_MAX_FRAME_BYTES);
+    let engine = pool.main_engine_mut();
+    let _engine_guard = CurrentEngine::install(engine);
     let expected_thread = format!("{:?}", std::thread::current().id());
     let runtime = main_runtime();
 
@@ -695,8 +703,9 @@ fn mp_safe_method_runs_on_the_main_thread_without_the_worker_barrier() {
 #[test]
 fn unknown_method_keeps_the_legacy_barriered_reply_and_dispatch_path() {
     let path = socket_path();
-    let mut engine = engine_with_binary_api(&path, DEFAULT_MAX_FRAME_BYTES);
-    let _engine_guard = CurrentEngine::install(&mut engine);
+    let mut pool = engine_with_binary_api(&path, DEFAULT_MAX_FRAME_BYTES);
+    let engine = pool.main_engine_mut();
+    let _engine_guard = CurrentEngine::install(engine);
     let runtime = main_runtime();
 
     engine.run_processes_until(&runtime, async {
@@ -752,8 +761,9 @@ fn unknown_method_keeps_the_legacy_barriered_reply_and_dispatch_path() {
 #[test]
 fn process_node_shutdown_closes_the_listener_and_stops_dispatch() {
     let path = socket_path();
-    let mut engine = engine_with_binary_api(&path, DEFAULT_MAX_FRAME_BYTES);
-    let _engine_guard = CurrentEngine::install(&mut engine);
+    let mut pool = engine_with_binary_api(&path, DEFAULT_MAX_FRAME_BYTES);
+    let engine = pool.main_engine_mut();
+    let _engine_guard = CurrentEngine::install(engine);
     let runtime = main_runtime();
 
     // Serve one request so the node is running and owns the FileMain.

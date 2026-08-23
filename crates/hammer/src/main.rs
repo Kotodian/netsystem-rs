@@ -166,7 +166,13 @@ fn run(config: String, roots: Vec<String>, worker: Worker) {
         eprintln!("Failed to construct configured runtime: {error}");
         std::process::exit(1);
     });
-    let mut pool = EnginePool::new(engine);
+    let mut pool = match EnginePool::new(engine) {
+        Ok(pool) => pool,
+        Err(error) => {
+            eprintln!("Failed to construct stats-enabled runtime: {error}");
+            std::process::exit(1);
+        }
+    };
 
     let rt = tokio::runtime::Builder::new_current_thread()
         .enable_io()
@@ -174,11 +180,10 @@ fn run(config: String, roots: Vec<String>, worker: Worker) {
         .build()
         .expect("build tokio runtime");
 
-    let pool_engine = pool.main_engine_mut();
-    pool_engine
+    pool.main_engine_mut()
         .plugin_main_mut()
         .register_builtin_image(hammer_service::registration_image());
-    EnginePool::main_loop_enter(pool_engine, &roots, &config).unwrap_or_else(|e| {
+    pool.main_loop_enter(&roots, &config).unwrap_or_else(|e| {
         eprintln!("main_loop_enter failed: {e}");
         std::process::exit(1);
     });

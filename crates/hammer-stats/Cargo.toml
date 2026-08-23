@@ -6,4 +6,3 @@ publish.workspace = true
 
 [dependencies]
 hammer-infra = { path = "../hammer-infra" }
-hammer-runtime = { path = "../hammer-runtime" }
