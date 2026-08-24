@@ -279,6 +279,15 @@ fn expand_stats_registration(field: &StatsField) -> TokenStream2 {
     }
 }
 
+fn expand_stats_bind(field: &StatsField) -> TokenStream2 {
+    let ident = &field.ident;
+    let ty = &field.ty;
+    let path = &field.path;
+    quote! {
+        #ident: #ty::bind(stats_main, #path)?,
+    }
+}
+
 #[proc_macro_derive(Stats, attributes(stats))]
 pub fn stats(input: TokenStream) -> TokenStream {
     let item = parse_macro_input!(input as ItemStruct);
@@ -332,6 +341,7 @@ fn expand_stats(item: ItemStruct) -> Result<TokenStream2> {
     let aggregate_name = LitStr::new(&aggregate.to_string(), aggregate.span());
     let descriptors = stats_fields.iter().map(expand_stats_descriptor);
     let registrations = stats_fields.iter().map(expand_stats_registration);
+    let bindings = stats_fields.iter().map(expand_stats_bind);
     Ok(quote! {
         impl #aggregate {
             pub(crate) fn register(
@@ -342,6 +352,14 @@ fn expand_stats(item: ItemStruct) -> Result<TokenStream2> {
                 };
                 #(#registrations)*
                 Ok(())
+            }
+
+            pub(crate) fn bind(
+                stats_main: &::hammer_stats::StatsMain,
+            ) -> ::hammer_stats::StatsResult<Self> {
+                Ok(Self {
+                    #(#bindings)*
+                })
             }
         }
 
@@ -442,6 +460,31 @@ mod stats_derive_tests {
             .expect("boottime descriptor must be moved into StatsMain");
         assert!(heartbeat < last_stats_clear);
         assert!(last_stats_clear < boottime);
+    }
+
+    #[test]
+    fn derives_bind_for_all_supported_metric_families() {
+        let expanded = expand(
+            r#"struct Metrics {
+                gauge: Gauge,
+                timestamp: Timestamp,
+                simple: SimpleCounter,
+                combined: CombinedCounter,
+                histogram: Histogram,
+            }"#,
+        );
+
+        assert!(expanded.contains("pub (crate) fn bind"));
+        for (metric, path) in [
+            ("Gauge :: bind", "/metrics/gauge"),
+            ("Timestamp :: bind", "/metrics/timestamp"),
+            ("SimpleCounter :: bind", "/metrics/simple"),
+            ("CombinedCounter :: bind", "/metrics/combined"),
+            ("Histogram :: bind", "/metrics/histogram"),
+        ] {
+            assert!(expanded.contains(metric), "missing {metric}: {expanded}");
+            assert!(expanded.contains(path), "missing {path}: {expanded}");
+        }
     }
 
     #[test]

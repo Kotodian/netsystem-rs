@@ -14,14 +14,17 @@ pub mod __private {
 
 crate::__declare_registration_image!(
     init_functions = [graph::install::__INIT_FN_INSTALL_PACKET_GRAPH];
-    config_functions = [trace::__CONFIG_FN_RUNTIME_TRACE_CONFIG];
+    config_functions = [
+        trace::__CONFIG_FN_RUNTIME_TRACE_CONFIG,
+        config::stats::__CONFIG_FN_RUNTIME_STATS_CONFIG,
+    ];
     early_config_functions = [memory::__CONFIG_FN_RUNTIME_WORKER_CONFIG];
     main_loop_enter_functions = [start_workers::__INIT_FN_START_WORKERS];
     main_loop_exit_functions = [];
     worker_init_functions = [];
     graph_nodes = [];
     node_functions = [];
-    process_nodes = [];
+    process_nodes = [engine::__PROCESS_NODE_STATSEG_COLLECTOR_PROCESS];
     session_transports = [];
     session_apps = [];
     binary_api_methods = [];
