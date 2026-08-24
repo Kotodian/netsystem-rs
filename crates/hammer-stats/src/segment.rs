@@ -364,6 +364,93 @@ pub(crate) struct StatsSegment {
     state: Arc<SpinLock<StatsSegmentState>>,
 }
 
+fn directory_entries_for_write<'a>(
+    state: &'a mut StatsSegmentState,
+    index: DirectoryIndex,
+    expected: DirectoryType,
+) -> StatsResult<(&'a mut DirectoryEntry, &'a mut DirectoryEntry)> {
+    if state.tearing_down {
+        return Err(StatsError::Teardown);
+    }
+    let raw_index = usize::try_from(index.raw()).map_err(|_| StatsError::PublicationFailed)?;
+    let published_pointer = state.header.directory_vector();
+    if published_pointer.is_null() {
+        return Err(StatsError::Teardown);
+    }
+    let length = state.directory_vector.len();
+    let Some(private_entry) = state.directory_vector.get_mut(raw_index) else {
+        return Err(StatsError::DirectoryIndexOutOfBounds {
+            index: index.raw(),
+            length,
+        });
+    };
+    let actual = DirectoryType::try_from(private_entry.kind())?;
+    if actual != expected {
+        return Err(StatsError::MetricTypeMismatch {
+            expected: expected.into(),
+            actual: actual.into(),
+        });
+    }
+    // SAFETY: publish and create set this pointer to an allocation containing
+    // exactly `state.directory_vector.len()` entries. The state lock excludes
+    // replacement while the temporary reference is used.
+    let published_entry = unsafe { &mut *published_pointer.add(raw_index) };
+    let actual = DirectoryType::try_from(published_entry.kind())?;
+    if actual != expected {
+        return Err(StatsError::MetricTypeMismatch {
+            expected: expected.into(),
+            actual: actual.into(),
+        });
+    }
+    Ok((private_entry, published_entry))
+}
+
+fn counter_cell<T>(
+    state: &StatsSegmentState,
+    index: DirectoryIndex,
+    row: u32,
+    column: u32,
+    expected: DirectoryType,
+) -> StatsResult<*mut T> {
+    if state.tearing_down {
+        return Err(StatsError::Teardown);
+    }
+    let raw_index = usize::try_from(index.raw()).map_err(|_| StatsError::PublicationFailed)?;
+    let Some(entry) = state.directory_vector.get(raw_index).copied() else {
+        return Err(StatsError::DirectoryIndexOutOfBounds {
+            index: index.raw(),
+            length: state.directory_vector.len(),
+        });
+    };
+    let actual = DirectoryType::try_from(entry.kind())?;
+    if actual != expected {
+        return Err(StatsError::MetricTypeMismatch {
+            expected: expected.into(),
+            actual: actual.into(),
+        });
+    }
+    let outer = DirectoryDataPointer::try_from(&entry)?.as_ptr().cast::<u8>();
+    if outer.is_null() {
+        return Err(StatsError::InvalidShape);
+    }
+    let row = usize::try_from(row).map_err(|_| StatsError::PublicationFailed)?;
+    let outer_length = state.vector_len::<*mut u8>(outer)?;
+    if row >= outer_length {
+        return Err(StatsError::InvalidShape);
+    }
+    // SAFETY: the outer vector and row were validated while the state lock is held.
+    let inner = unsafe { ptr::read(state.vector_element::<*mut u8>(outer, row)?) };
+    if inner.is_null() {
+        return Err(StatsError::InvalidShape);
+    }
+    let column = usize::try_from(column).map_err(|_| StatsError::PublicationFailed)?;
+    let inner_length = state.vector_len::<T>(inner)?;
+    if column >= inner_length {
+        return Err(StatsError::InvalidShape);
+    }
+    state.vector_element::<T>(inner, column)
+}
+
 impl StatsSegment {
     pub(crate) fn create(name: &str, size: usize) -> StatsResult<Self> {
         let page = page_size()?;
@@ -443,6 +530,143 @@ impl StatsSegment {
         } else {
             state.directory_vector.len()
         }
+    }
+
+    pub(super) fn find(
+        &self,
+        name: NameBytes,
+        path: &str,
+        expected: DirectoryType,
+    ) -> StatsResult<DirectoryIndex> {
+        let state = self.state.lock();
+        if state.tearing_down {
+            return Err(StatsError::Teardown);
+        }
+        let Some(index) = state.names.get(&name).copied() else {
+            return Err(StatsError::MetricNotFound {
+                name: path.to_owned(),
+            });
+        };
+        let raw_index = usize::try_from(index.raw()).map_err(|_| StatsError::PublicationFailed)?;
+        let Some(entry) = state.directory_vector.get(raw_index) else {
+            return Err(StatsError::DirectoryIndexOutOfBounds {
+                index: index.raw(),
+                length: state.directory_vector.len(),
+            });
+        };
+        let actual = DirectoryType::try_from(entry.kind())?;
+        if actual != expected {
+            return Err(StatsError::MetricTypeMismatch {
+                expected: expected.into(),
+                actual: actual.into(),
+            });
+        }
+        Ok(index)
+    }
+
+    pub(super) fn store_timestamp(
+        &self,
+        index: DirectoryIndex,
+        value: u64,
+    ) -> StatsResult<()> {
+        let mut state = self.state.lock();
+        let (private_entry, published_entry) =
+            directory_entries_for_write(&mut state, index, DirectoryType::ScalarIndex)?;
+        private_entry.set_scalar_value(value);
+        published_entry.set_scalar_value(value);
+        Ok(())
+    }
+
+    pub(super) fn increment_timestamp(&self, index: DirectoryIndex) -> StatsResult<()> {
+        let mut state = self.state.lock();
+        let (private_entry, published_entry) =
+            directory_entries_for_write(&mut state, index, DirectoryType::ScalarIndex)?;
+        let value = private_entry.scalar_value().wrapping_add(1);
+        private_entry.set_scalar_value(value);
+        published_entry.set_scalar_value(value);
+        Ok(())
+    }
+
+    pub(super) fn store_gauge(&self, index: DirectoryIndex, value: f64) -> StatsResult<()> {
+        let mut state = self.state.lock();
+        let (private_entry, published_entry) =
+            directory_entries_for_write(&mut state, index, DirectoryType::Gauge)?;
+        let value = value.to_bits();
+        private_entry.set_scalar_value(value);
+        published_entry.set_scalar_value(value);
+        Ok(())
+    }
+
+    pub(super) fn add_simple_counter(
+        &self,
+        index: DirectoryIndex,
+        row: u32,
+        column: u32,
+        value: u64,
+    ) -> StatsResult<()> {
+        let state = self.state.lock();
+        let cell = counter_cell::<u64>(
+            &state,
+            index,
+            row,
+            column,
+            DirectoryType::CounterVectorSimple,
+        )?;
+        // SAFETY: counter_cell validated the family, row, and column, and the
+        // state lock prevents payload publication or growth while this pointer is used.
+        unsafe {
+            let current = ptr::read(cell);
+            ptr::write(cell, current.wrapping_add(value));
+        }
+        Ok(())
+    }
+
+    pub(super) fn add_combined_counter(
+        &self,
+        index: DirectoryIndex,
+        row: u32,
+        column: u32,
+        value: Counter,
+    ) -> StatsResult<()> {
+        let state = self.state.lock();
+        let cell = counter_cell::<Counter>(
+            &state,
+            index,
+            row,
+            column,
+            DirectoryType::CounterVectorCombined,
+        )?;
+        // SAFETY: counter_cell validated the family, row, and column, and the
+        // state lock prevents payload publication or growth while this pointer is used.
+        unsafe {
+            let current = ptr::read(cell);
+            ptr::write(cell, current.wrapping_add(value));
+        }
+        Ok(())
+    }
+
+    pub(super) fn add_histogram(
+        &self,
+        index: DirectoryIndex,
+        row: u32,
+        bucket: u32,
+        value: u64,
+    ) -> StatsResult<()> {
+        let state = self.state.lock();
+        let cell = counter_cell::<u64>(
+            &state,
+            index,
+            row,
+            bucket,
+            DirectoryType::HistogramLog2,
+        )?;
+        // SAFETY: counter_cell validated the family, row, and column, and the
+        // state lock prevents payload publication or growth while this pointer is used.
+        unsafe {
+            let current = ptr::read(cell);
+            ptr::write(cell, current.wrapping_add(value));
+        }
+        Ok(())
     }
 
     pub(super) fn register<K>(&self, layout: K) -> StatsResult<K::Handle>
@@ -937,7 +1161,7 @@ mod tests {
     use crate::metric::{
         Gauge as MetricGauge, NameVector as MetricNameVector, SimpleCounter, layout,
     };
-    use crate::protocol::{Gauge as ProtocolGauge, StringVectorPointer};
+    use crate::protocol::{Gauge as ProtocolGauge, ScalarBits, StringVectorPointer};
 
     fn create_segment(name: &str) -> StatsSegment {
         match StatsSegment::create(name, 2 * 1024 * 1024) {
@@ -955,6 +1179,134 @@ mod tests {
     }
 
     #[test]
+    fn bound_timestamp_stores_and_increments_by_directory_index() -> StatsResult<()> {
+        let stats = crate::StatsMain::create("st-timestamp-owner", 2 * 1024 * 1024)?;
+        stats.add_timestamp(crate::Timestamp::new("/sys/heartbeat"))?;
+
+        let heartbeat = crate::Timestamp::bind(&stats, "/sys/heartbeat")?;
+        heartbeat.store(&stats, 41)?;
+        heartbeat.increment(&stats)?;
+
+        let state = stats.segment.state.lock();
+        let mapped_header = unsafe { &*state.mapping.base().cast::<SharedHeader>() };
+        let published_directory = mapped_header.directory_vector();
+        assert!(!published_directory.is_null());
+        // SAFETY: the mapped header points to the current published directory
+        // allocation, which contains the registered timestamp at index zero.
+        let value = unsafe { ScalarBits::try_from(&*published_directory)? };
+        assert_eq!(u64::from(value), 42);
+        drop(state);
+
+        stats.add_timestamp(crate::Timestamp::new("/sys/after-heartbeat"))?;
+        let state = stats.segment.state.lock();
+        let mapped_header = unsafe { &*state.mapping.base().cast::<SharedHeader>() };
+        let published_directory = mapped_header.directory_vector();
+        let value = unsafe { ScalarBits::try_from(&*published_directory)? };
+        assert_eq!(u64::from(value), 42);
+        Ok(())
+    }
+
+    #[test]
+    fn sys_scalar_metrics_keep_vpp_positions_zero_one_two() -> StatsResult<()> {
+        let stats = crate::StatsMain::create("st-sys-order", 2 * 1024 * 1024)?;
+        for path in [
+            "/sys/heartbeat",
+            "/sys/last_stats_clear",
+            "/sys/boottime",
+        ] {
+            stats.add_timestamp(crate::Timestamp::new(path))?;
+        }
+
+        let heartbeat = crate::Timestamp::bind(&stats, "/sys/heartbeat")?;
+        let last_stats_clear = crate::Timestamp::bind(&stats, "/sys/last_stats_clear")?;
+        let boottime = crate::Timestamp::bind(&stats, "/sys/boottime")?;
+        heartbeat.store(&stats, 11)?;
+        last_stats_clear.store(&stats, 22)?;
+        boottime.store(&stats, 33)?;
+
+        let state = stats.segment.state.lock();
+        for (index, (path, value)) in [
+            ("/sys/heartbeat", 11),
+            ("/sys/last_stats_clear", 22),
+            ("/sys/boottime", 33),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            assert_eq!(
+                state.directory_vector[index].name_bytes()?.as_c_str()?.to_bytes(),
+                path.as_bytes()
+            );
+            assert_eq!(u64::from(ScalarBits::try_from(&state.directory_vector[index])?), value);
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn bound_gauge_stores_f64_bits_by_directory_index() -> StatsResult<()> {
+        let stats = crate::StatsMain::create("st-gauge-owner", 2 * 1024 * 1024)?;
+        stats.add_gauge(crate::Gauge::new("/sys/load"))?;
+
+        let load = crate::Gauge::bind(&stats, "/sys/load")?;
+        load.store(&stats, 3.5)?;
+
+        let state = stats.segment.state.lock();
+        assert_eq!(state.directory_vector[0].scalar_value(), 3.5_f64.to_bits());
+        Ok(())
+    }
+
+    #[test]
+    fn simple_counter_validates_then_adds_at_saved_directory_index() -> StatsResult<()> {
+        let stats = crate::StatsMain::create("st-simple-owner", 2 * 1024 * 1024)?;
+        stats.add_simple_counter(crate::SimpleCounter::new("/workers/requests"))?;
+
+        let requests = crate::SimpleCounter::bind(&stats, "/workers/requests")?;
+        requests.validate(&stats, 1, 2)?;
+        requests.add(&stats, 1, 2, 7)?;
+
+        let state = stats.segment.state.lock();
+        let outer = DirectoryDataPointer::try_from(&state.directory_vector[0])?.as_ptr();
+        let inner = unsafe { ptr::read(state.vector_element::<*mut u8>(outer.cast(), 1)?) };
+        let value = state.vector_element::<u64>(inner, 2)?;
+        assert_eq!(unsafe { ptr::read(value) }, 7);
+        Ok(())
+    }
+
+    #[test]
+    fn combined_counter_validates_then_adds_counter_pair_at_saved_index() -> StatsResult<()> {
+        let stats = crate::StatsMain::create("st-combined-owner", 2 * 1024 * 1024)?;
+        stats.add_combined_counter(crate::CombinedCounter::new("/workers/traffic"))?;
+
+        let traffic = crate::CombinedCounter::bind(&stats, "/workers/traffic")?;
+        traffic.validate(&stats, 0, 1)?;
+        traffic.add(&stats, 0, 1, Counter { packets: 3, bytes: 5 })?;
+
+        let state = stats.segment.state.lock();
+        let outer = DirectoryDataPointer::try_from(&state.directory_vector[0])?.as_ptr();
+        let inner = unsafe { ptr::read(state.vector_element::<*mut u8>(outer.cast(), 0)?) };
+        let value = state.vector_element::<Counter>(inner, 1)?;
+        assert_eq!(unsafe { ptr::read(value) }, Counter { packets: 3, bytes: 5 });
+        Ok(())
+    }
+
+    #[test]
+    fn histogram_validates_then_adds_at_saved_directory_index() -> StatsResult<()> {
+        let stats = crate::StatsMain::create("st-histogram-owner", 2 * 1024 * 1024)?;
+        stats.add_histogram(crate::Histogram::new("/workers/latency"))?;
+
+        let latency = crate::Histogram::bind(&stats, "/workers/latency")?;
+        latency.validate(&stats, 0, 4)?;
+        latency.add(&stats, 0, 4, 9)?;
+
+        let state = stats.segment.state.lock();
+        let outer = DirectoryDataPointer::try_from(&state.directory_vector[0])?.as_ptr();
+        let inner = unsafe { ptr::read(state.vector_element::<*mut u8>(outer.cast(), 0)?) };
+        let value = state.vector_element::<u64>(inner, 4)?;
+        assert_eq!(unsafe { ptr::read(value) }, 9);
+        Ok(())
+    }
+
+    #[test]
     fn created_segment_exposes_shared_mapping_and_empty_directory() -> StatsResult<()> {
         let segment = StatsSegment::create("st-owner", 2 * 1024 * 1024)?;
         assert!(segment.shared_fd().is_some());
@@ -966,26 +1318,17 @@ mod tests {
     fn registration_remove_and_reuse_start_at_zero() -> StatsResult<()> {
         let segment = create_segment("st-registration");
         let _target = segment.register::<layout::Scalar<ProtocolGauge>>(
-            MetricGauge {
-                name: "/target".to_owned(),
-            }
-            .try_into()?,
+            MetricGauge::new("/target").try_into()?,
         )?;
         segment.register::<layout::Scalar<ProtocolGauge>>(
-            MetricGauge {
-                name: "/second".to_owned(),
-            }
-            .try_into()?,
+            MetricGauge::new("/second").try_into()?,
         )?;
         assert_eq!(segment.directory_vector_len(), 2);
 
         segment.remove(DirectoryIndex::new(1))?;
         assert_eq!(segment.directory_vector_len(), 2);
         segment.register::<layout::Scalar<ProtocolGauge>>(
-            MetricGauge {
-                name: "/replacement".to_owned(),
-            }
-            .try_into()?,
+            MetricGauge::new("/replacement").try_into()?,
         )?;
         segment.remove(DirectoryIndex::new(1))?;
         Ok(())
@@ -995,10 +1338,7 @@ mod tests {
     fn validation_grows_registered_matrix() -> StatsResult<()> {
         let segment = create_segment("st-retain");
         segment.register::<layout::Simple<Counter>>(
-            SimpleCounter {
-                name: "/retain/simple".to_owned(),
-            }
-            .try_into()?,
+            SimpleCounter::new("/retain/simple").try_into()?,
         )?;
 
         segment.validate(DirectoryIndex::new(0), 2, 2)?;
@@ -1014,10 +1354,7 @@ mod tests {
     fn validation_preserves_retained_rows_during_mixed_growth() -> StatsResult<()> {
         let segment = create_segment("st-mixed-growth");
         segment.register::<layout::Simple<Counter>>(
-            SimpleCounter {
-                name: "/mixed/simple".to_owned(),
-            }
-            .try_into()?,
+            SimpleCounter::new("/mixed/simple").try_into()?,
         )?;
 
         segment.validate(DirectoryIndex::new(0), 0, 2)?;
@@ -1056,10 +1393,7 @@ mod tests {
     fn growth_reclaims_superseded_payloads_after_publication() -> StatsResult<()> {
         let mut segment = StatsSegment::create("st-growth-reclaim", 2 * 1024 * 1024)?;
         segment.register::<layout::Simple<Counter>>(
-            SimpleCounter {
-                name: "/growth/reclaim".to_owned(),
-            }
-            .try_into()?,
+            SimpleCounter::new("/growth/reclaim").try_into()?,
         )?;
         let initial_payloads = segment.state.lock().payloads[0].len();
         segment.validate(DirectoryIndex::new(0), 2, 2)?;
@@ -1091,10 +1425,7 @@ mod tests {
     fn remove_rejects_repeated_removal_and_reuses_slot() -> StatsResult<()> {
         let segment = create_segment("st-remove");
         segment.register::<layout::Scalar<ProtocolGauge>>(
-            MetricGauge {
-                name: "/remove/me".to_owned(),
-            }
-            .try_into()?,
+            MetricGauge::new("/remove/me").try_into()?,
         )?;
         segment.remove(DirectoryIndex::new(0))?;
         assert!(matches!(
@@ -1102,10 +1433,7 @@ mod tests {
             Err(StatsError::DirectoryEntryUnavailable { index: 0 })
         ));
         segment.register::<layout::Scalar<ProtocolGauge>>(
-            MetricGauge {
-                name: "/remove/replacement".to_owned(),
-            }
-            .try_into()?,
+            MetricGauge::new("/remove/replacement").try_into()?,
         )?;
         assert_eq!(segment.directory_vector_len(), 1);
         Ok(())

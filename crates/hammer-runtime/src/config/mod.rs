@@ -4,10 +4,12 @@
 //! runtime aggregate configuration object and no parsed document is retained.
 
 pub mod memory;
+pub mod stats;
 pub mod trace;
 pub mod worker;
 
 pub use memory::Memory;
+pub use stats::StatsConfig;
 pub use trace::{Trace, TraceInput};
 #[cfg(target_os = "macos")]
 pub use worker::QosClass;

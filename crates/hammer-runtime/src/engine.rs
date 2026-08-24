@@ -4,17 +4,18 @@ use std::collections::HashSet;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::error::{RuntimeError, RuntimeResult};
 use hammer_core::data_plane::NodeId;
 use hammer_runtime::DataPlaneRuntime;
 use hammer_runtime::RuntimeRegistry;
 
-use crate::config::Worker;
+use crate::config::{StatsConfig, Worker};
 use crate::data_plane::{DataPlaneRuntimeWorkerConfig, DataPlaneRuntimeWorkerSeed};
 use crate::init::InitFunction;
 use crate::node::{NodeRuntimeData, NodeRuntimeInner};
-use crate::process::ProcessMain;
+use crate::process::{ProcessContext, ProcessMain};
 use crate::spawn::{DataRemoteLocalQueue, DataRemoteLocalQueueError};
 use crate::{DataPlaneHandoffWorker, DataWorkerId, FileMain, PluginMain, ProcessHandle};
 use hammer_component_macros::Stats;
@@ -29,6 +30,31 @@ pub(crate) struct Sys {
     heartbeat: Timestamp,
     last_stats_clear: Timestamp,
     boottime: Timestamp,
+}
+
+#[hammer_component_macros::process_node(name = "statseg-collector-process")]
+async fn stat_segment_collector_process(mut context: ProcessContext) -> RuntimeResult<()> {
+    let sys = context.require::<Sys>()?;
+    let stats_main = context.require::<StatsMain>()?;
+    let config = context.require::<StatsConfig>()?;
+
+    // VPP `stat_segment_collector_process` writes boottime once before its
+    // immediate update pass and interval suspend loop.
+    let boottime = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_err(|error| RuntimeError::Lifecycle {
+            stage: "stats collector".to_owned(),
+            message: format!("read Unix epoch time: {error}"),
+        })?
+        .as_secs();
+    sys.boottime.store(&stats_main, boottime)?;
+
+    loop {
+        sys.heartbeat.increment(&stats_main)?;
+        let _ = context
+            .wait_for_event_or_clock(config.update_interval)
+            .await;
+    }
 }
 
 pub(crate) struct EngineWorkerSeed {
@@ -789,13 +815,14 @@ pub struct EnginePool {
     pub exec_path: String,
     pub argv: Vec<String>,
     pub startup_config: String,
-    stats_main: StatsMain,
+    stats_main: Arc<StatsMain>,
     ipc_listener: Option<tokio::net::TcpListener>,
 }
 
 impl EnginePool {
     pub fn new(main: Engine) -> RuntimeResult<Self> {
-        let stats_main = StatsMain::create("stat segment", STATS_SEGMENT_SIZE)?;
+        let stats_main = Arc::new(StatsMain::create("stat segment", STATS_SEGMENT_SIZE)?);
+        main.registry.set(Arc::clone(&stats_main));
         let mut engines = Vec::new();
         engines.push(main);
         Ok(Self {
@@ -844,6 +871,8 @@ impl EnginePool {
         engine.configure_early(config)?;
         engine.load_plugins(roots, config)?;
         crate::init::run_stats_registrations(engine, stats_main)?;
+        let sys = Arc::new(Sys::bind(stats_main)?);
+        engine.registry.set(sys);
         crate::init::run_main_loop_enter(engine)?;
         engine.start_process_nodes()?;
         Ok(())
@@ -1023,6 +1052,40 @@ mod tests {
         assert_eq!(pool.worker_count(), 0);
         assert!(pool.engine(0).is_some());
         assert!(pool.engine(1).is_none());
+    }
+
+    #[test]
+    fn engine_pool_publishes_owned_stats_main_capability() {
+        let registry = RuntimeRegistry::new();
+        let main = Engine::new(test_runtime(), Arc::clone(&registry));
+        let pool = EnginePool::new(main).expect("engine pool");
+
+        let published = registry
+            .get::<StatsMain>()
+            .expect("EnginePool must publish StatsMain");
+        assert!(Arc::ptr_eq(&published, &pool.stats_main));
+    }
+
+    #[test]
+    fn main_loop_enter_binds_sys_after_static_stats_registration() {
+        let registry = RuntimeRegistry::new();
+        let main = Engine::new_configured(Arc::clone(&registry), Worker::default())
+            .expect("configured engine");
+        let mut pool = EnginePool::new(main).expect("engine pool");
+
+        pool.main_loop_enter(&[], "")
+            .expect("main loop enter with builtin stats");
+
+        let stats = registry
+            .get::<StatsMain>()
+            .expect("EnginePool must publish StatsMain");
+        assert!(Arc::ptr_eq(&stats, &pool.stats_main));
+        assert!(registry.get::<Sys>().is_some());
+        assert!(
+            pool.main_engine()
+                .process_handle("statseg-collector-process")
+                .is_some()
+        );
     }
 
     #[test]

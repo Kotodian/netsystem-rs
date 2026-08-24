@@ -4,7 +4,7 @@ use crate::protocol::{
     StringVectorPointer, ring_layout,
 };
 use crate::segment::StatsSegmentState;
-use crate::{StatsError, StatsResult};
+use crate::{StatsError, StatsMain, StatsResult};
 use hammer_infra::segment::SegmentAllocation;
 use std::ffi::c_void;
 use std::marker::PhantomData;
@@ -13,18 +13,22 @@ use std::ptr;
 
 pub struct Gauge {
     pub(crate) name: String,
+    index: Option<DirectoryIndex>,
 }
 
 pub struct Timestamp {
     pub(crate) name: String,
+    index: Option<DirectoryIndex>,
 }
 
 pub struct SimpleCounter {
     pub(crate) name: String,
+    index: Option<DirectoryIndex>,
 }
 
 pub struct CombinedCounter {
     pub(crate) name: String,
+    index: Option<DirectoryIndex>,
 }
 
 pub struct NameVector {
@@ -34,6 +38,7 @@ pub struct NameVector {
 
 pub struct Histogram {
     pub(crate) name: String,
+    index: Option<DirectoryIndex>,
 }
 
 pub struct Ring<T> {
@@ -45,25 +50,133 @@ pub struct Ring<T> {
 
 impl Gauge {
     pub fn new(name: impl Into<String>) -> Self {
-        Self { name: name.into() }
+        Self {
+            name: name.into(),
+            index: None,
+        }
+    }
+
+    pub fn bind(stats_main: &StatsMain, name: impl Into<String>) -> StatsResult<Self> {
+        let name = name.into();
+        let index = stats_main.bind_index(&name, DirectoryType::Gauge)?;
+        Ok(Self {
+            name,
+            index: Some(index),
+        })
+    }
+
+    pub fn store(&self, stats_main: &StatsMain, value: f64) -> StatsResult<()> {
+        stats_main.store_gauge(self.index.ok_or(StatsError::MetricUnbound)?, value)
     }
 }
 
 impl Timestamp {
     pub fn new(name: impl Into<String>) -> Self {
-        Self { name: name.into() }
+        Self {
+            name: name.into(),
+            index: None,
+        }
+    }
+
+    pub fn bind(stats_main: &StatsMain, name: impl Into<String>) -> StatsResult<Self> {
+        let name = name.into();
+        let index = stats_main.bind_index(&name, DirectoryType::ScalarIndex)?;
+        Ok(Self {
+            name,
+            index: Some(index),
+        })
+    }
+
+    pub fn store(&self, stats_main: &StatsMain, value: u64) -> StatsResult<()> {
+        stats_main.store_timestamp(self.index.ok_or(StatsError::MetricUnbound)?, value)
+    }
+
+    pub fn increment(&self, stats_main: &StatsMain) -> StatsResult<()> {
+        stats_main.increment_timestamp(self.index.ok_or(StatsError::MetricUnbound)?)
     }
 }
 
 impl SimpleCounter {
     pub fn new(name: impl Into<String>) -> Self {
-        Self { name: name.into() }
+        Self {
+            name: name.into(),
+            index: None,
+        }
+    }
+
+    pub fn bind(stats_main: &StatsMain, name: impl Into<String>) -> StatsResult<Self> {
+        let name = name.into();
+        let index = stats_main.bind_index(&name, DirectoryType::CounterVectorSimple)?;
+        Ok(Self {
+            name,
+            index: Some(index),
+        })
+    }
+
+    pub fn validate(
+        &self,
+        stats_main: &StatsMain,
+        row: u32,
+        column: u32,
+    ) -> StatsResult<()> {
+        stats_main.validate_counter(self.index.ok_or(StatsError::MetricUnbound)?, row, column)
+    }
+
+    pub fn add(
+        &self,
+        stats_main: &StatsMain,
+        row: u32,
+        column: u32,
+        value: u64,
+    ) -> StatsResult<()> {
+        stats_main.write_simple_counter(
+            self.index.ok_or(StatsError::MetricUnbound)?,
+            row,
+            column,
+            value,
+        )
     }
 }
 
 impl CombinedCounter {
     pub fn new(name: impl Into<String>) -> Self {
-        Self { name: name.into() }
+        Self {
+            name: name.into(),
+            index: None,
+        }
+    }
+
+    pub fn bind(stats_main: &StatsMain, name: impl Into<String>) -> StatsResult<Self> {
+        let name = name.into();
+        let index = stats_main.bind_index(&name, DirectoryType::CounterVectorCombined)?;
+        Ok(Self {
+            name,
+            index: Some(index),
+        })
+    }
+
+    pub fn validate(
+        &self,
+        stats_main: &StatsMain,
+        row: u32,
+        column: u32,
+    ) -> StatsResult<()> {
+        stats_main.validate_counter(self.index.ok_or(StatsError::MetricUnbound)?, row, column)
+    }
+
+    pub fn add(
+        &self,
+        stats_main: &StatsMain,
+        row: u32,
+        column: u32,
+        value: Counter,
+    ) -> StatsResult<()> {
+        stats_main.write_combined_counter(
+            self.index.ok_or(StatsError::MetricUnbound)?,
+            row,
+            column,
+            value,
+        )
     }
 }
 
@@ -78,7 +191,43 @@ impl NameVector {
 
 impl Histogram {
     pub fn new(name: impl Into<String>) -> Self {
-        Self { name: name.into() }
+        Self {
+            name: name.into(),
+            index: None,
+        }
+    }
+
+    pub fn bind(stats_main: &StatsMain, name: impl Into<String>) -> StatsResult<Self> {
+        let name = name.into();
+        let index = stats_main.bind_index(&name, DirectoryType::HistogramLog2)?;
+        Ok(Self {
+            name,
+            index: Some(index),
+        })
+    }
+
+    pub fn validate(
+        &self,
+        stats_main: &StatsMain,
+        row: u32,
+        bucket: u32,
+    ) -> StatsResult<()> {
+        stats_main.validate_counter(self.index.ok_or(StatsError::MetricUnbound)?, row, bucket)
+    }
+
+    pub fn add(
+        &self,
+        stats_main: &StatsMain,
+        row: u32,
+        bucket: u32,
+        value: u64,
+    ) -> StatsResult<()> {
+        stats_main.write_histogram(
+            self.index.ok_or(StatsError::MetricUnbound)?,
+            row,
+            bucket,
+            value,
+        )
     }
 }
 
@@ -117,31 +266,26 @@ pub(crate) mod layout {
 
     pub(crate) struct Scalar<M> {
         pub(super) name: NameBytes,
-        pub(super) index: DirectoryIndex,
         pub(super) marker: PhantomData<fn() -> M>,
     }
 
     pub(crate) struct Simple<M> {
         pub(super) name: NameBytes,
-        pub(super) index: DirectoryIndex,
         pub(super) marker: PhantomData<fn() -> M>,
     }
 
     pub(crate) struct Combined<M> {
         pub(super) name: NameBytes,
-        pub(super) index: DirectoryIndex,
         pub(super) marker: PhantomData<fn() -> M>,
     }
 
     pub(crate) struct NameVector {
         pub(super) name: NameBytes,
         pub(super) length: u32,
-        pub(super) index: DirectoryIndex,
     }
 
     pub(crate) struct Histogram<M> {
         pub(super) name: NameBytes,
-        pub(super) index: DirectoryIndex,
         pub(super) marker: PhantomData<fn() -> M>,
     }
 
@@ -149,7 +293,6 @@ pub(crate) mod layout {
         pub(super) name: NameBytes,
         pub(super) config: RingConfig,
         pub(super) schema: Box<[u8]>,
-        pub(super) index: DirectoryIndex,
         pub(super) marker: PhantomData<fn() -> T>,
     }
 }
@@ -160,7 +303,6 @@ impl TryFrom<Gauge> for layout::Scalar<ProtocolGauge> {
     fn try_from(metric: Gauge) -> StatsResult<Self> {
         Ok(Self {
             name: NameBytes::try_from(metric.name.as_str())?,
-            index: DirectoryIndex::new(0),
             marker: PhantomData,
         })
     }
@@ -172,7 +314,6 @@ impl TryFrom<Timestamp> for layout::Scalar<ScalarBits> {
     fn try_from(metric: Timestamp) -> StatsResult<Self> {
         Ok(Self {
             name: NameBytes::try_from(metric.name.as_str())?,
-            index: DirectoryIndex::new(0),
             marker: PhantomData,
         })
     }
@@ -184,7 +325,6 @@ impl TryFrom<SimpleCounter> for layout::Simple<Counter> {
     fn try_from(metric: SimpleCounter) -> StatsResult<Self> {
         Ok(Self {
             name: NameBytes::try_from(metric.name.as_str())?,
-            index: DirectoryIndex::new(0),
             marker: PhantomData,
         })
     }
@@ -196,7 +336,6 @@ impl TryFrom<CombinedCounter> for layout::Combined<Counter> {
     fn try_from(metric: CombinedCounter) -> StatsResult<Self> {
         Ok(Self {
             name: NameBytes::try_from(metric.name.as_str())?,
-            index: DirectoryIndex::new(0),
             marker: PhantomData,
         })
     }
@@ -209,7 +348,6 @@ impl TryFrom<NameVector> for layout::NameVector {
         Ok(Self {
             name: NameBytes::try_from(metric.name.as_str())?,
             length: metric.length,
-            index: DirectoryIndex::new(0),
         })
     }
 }
@@ -220,7 +358,6 @@ impl TryFrom<Histogram> for layout::Histogram<Counter> {
     fn try_from(metric: Histogram) -> StatsResult<Self> {
         Ok(Self {
             name: NameBytes::try_from(metric.name.as_str())?,
-            index: DirectoryIndex::new(0),
             marker: PhantomData,
         })
     }
@@ -267,7 +404,6 @@ where
             name: NameBytes::try_from(metric.name.as_str())?,
             config: metric.config,
             schema: metric.schema,
-            index: DirectoryIndex::new(0),
             marker: PhantomData,
         })
     }
@@ -295,10 +431,9 @@ impl RecordKind for layout::Scalar<ProtocolGauge> {
 
     fn prepare(
         _state: &StatsSegmentState,
-        index: DirectoryIndex,
-        mut layout: Self,
+        _index: DirectoryIndex,
+        layout: Self,
     ) -> StatsResult<(DirectoryEntry, Self::Storage, Self::Handle)> {
-        layout.index = index;
         Ok((
             DirectoryEntry::new(
                 DirectoryType::Gauge.into(),
@@ -321,10 +456,9 @@ impl RecordKind for layout::Scalar<ScalarBits> {
 
     fn prepare(
         _state: &StatsSegmentState,
-        index: DirectoryIndex,
-        mut layout: Self,
+        _index: DirectoryIndex,
+        layout: Self,
     ) -> StatsResult<(DirectoryEntry, Self::Storage, Self::Handle)> {
-        layout.index = index;
         Ok((
             DirectoryEntry::new(
                 DirectoryType::ScalarIndex.into(),
@@ -347,10 +481,9 @@ impl RecordKind for layout::Simple<Counter> {
 
     fn prepare(
         _state: &StatsSegmentState,
-        index: DirectoryIndex,
-        mut layout: Self,
+        _index: DirectoryIndex,
+        layout: Self,
     ) -> StatsResult<(DirectoryEntry, Self::Storage, Self::Handle)> {
-        layout.index = index;
         let entry = DirectoryEntry::new(
             DirectoryType::CounterVectorSimple.into(),
             layout.name,
@@ -370,10 +503,9 @@ impl RecordKind for layout::Combined<Counter> {
 
     fn prepare(
         _state: &StatsSegmentState,
-        index: DirectoryIndex,
-        mut layout: Self,
+        _index: DirectoryIndex,
+        layout: Self,
     ) -> StatsResult<(DirectoryEntry, Self::Storage, Self::Handle)> {
-        layout.index = index;
         let entry = DirectoryEntry::new(
             DirectoryType::CounterVectorCombined.into(),
             layout.name,
@@ -393,16 +525,15 @@ impl RecordKind for layout::NameVector {
 
     fn prepare(
         state: &StatsSegmentState,
-        index: DirectoryIndex,
-        mut layout: Self,
+        _index: DirectoryIndex,
+        layout: Self,
     ) -> StatsResult<(DirectoryEntry, Self::Storage, Self::Handle)> {
         let length = usize::try_from(layout.length).map_err(|_| StatsError::PublicationFailed)?;
         if length == 0 {
             return Err(StatsError::InvalidShape);
         }
         let (allocation, pointer) =
-            state.allocate_vector::<*mut u8>(length, Some(index), ptr::null_mut())?;
-        layout.index = index;
+            state.allocate_vector::<*mut u8>(length, Some(_index), ptr::null_mut())?;
         let entry = DirectoryEntry::new(
             DirectoryType::NameVector.into(),
             layout.name,
@@ -422,10 +553,9 @@ impl RecordKind for layout::Histogram<Counter> {
 
     fn prepare(
         _state: &StatsSegmentState,
-        index: DirectoryIndex,
-        mut layout: Self,
+        _index: DirectoryIndex,
+        layout: Self,
     ) -> StatsResult<(DirectoryEntry, Self::Storage, Self::Handle)> {
-        layout.index = index;
         let entry = DirectoryEntry::new(
             DirectoryType::HistogramLog2.into(),
             layout.name,
@@ -448,8 +578,8 @@ where
 
     fn prepare(
         state: &StatsSegmentState,
-        index: DirectoryIndex,
-        mut layout: Self,
+        _index: DirectoryIndex,
+        layout: Self,
     ) -> StatsResult<(DirectoryEntry, Self::Storage, Self::Handle)> {
         let expected = usize::try_from(layout.config.schema_size())
             .map_err(|_| StatsError::PublicationFailed)?;
@@ -515,7 +645,6 @@ where
                 );
             }
         }
-        layout.index = index;
         let entry = DirectoryEntry::new(
             DirectoryType::RingBuffer.into(),
             layout.name,

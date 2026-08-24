@@ -8,21 +8,91 @@ mod protocol;
 mod segment;
 
 use segment::StatsSegment;
+use protocol::{DirectoryIndex, DirectoryType, NameBytes};
 
 pub use metric::{
     CombinedCounter, Gauge, Histogram, NameVector, Ring, RingSchema, SimpleCounter, Timestamp,
 };
-pub use protocol::RingConfig;
+pub use protocol::{Counter, RingConfig};
 
 pub struct StatsMain {
     segment: StatsSegment,
 }
+
+// SAFETY: StatsSegmentState contains mapped raw pointers, but every access to
+// the directory and payload ownership is serialized by its SpinLock. Public
+// StatsMain operations never expose those pointers and teardown requires the
+// last segment owner, so sharing the owner through RuntimeRegistry preserves
+// the mapping and publication invariants.
+unsafe impl Send for StatsMain {}
+unsafe impl Sync for StatsMain {}
 
 impl StatsMain {
     pub fn create(name: &str, size: usize) -> StatsResult<Self> {
         Ok(Self {
             segment: StatsSegment::create(name, size)?,
         })
+    }
+
+    pub(crate) fn bind_index(
+        &self,
+        path: &str,
+        expected: DirectoryType,
+    ) -> StatsResult<DirectoryIndex> {
+        let name = NameBytes::try_from(path)?;
+        self.segment.find(name, path, expected)
+    }
+
+    pub(crate) fn store_timestamp(&self, index: DirectoryIndex, value: u64) -> StatsResult<()> {
+        self.segment.store_timestamp(index, value)
+    }
+
+    pub(crate) fn increment_timestamp(&self, index: DirectoryIndex) -> StatsResult<()> {
+        self.segment.increment_timestamp(index)
+    }
+
+    pub(crate) fn store_gauge(&self, index: DirectoryIndex, value: f64) -> StatsResult<()> {
+        self.segment.store_gauge(index, value)
+    }
+
+    pub(crate) fn validate_counter(
+        &self,
+        index: DirectoryIndex,
+        row: u32,
+        column: u32,
+    ) -> StatsResult<()> {
+        self.segment.validate(index, row, column)
+    }
+
+    pub(crate) fn write_simple_counter(
+        &self,
+        index: DirectoryIndex,
+        row: u32,
+        column: u32,
+        value: u64,
+    ) -> StatsResult<()> {
+        self.segment.add_simple_counter(index, row, column, value)
+    }
+
+    pub(crate) fn write_combined_counter(
+        &self,
+        index: DirectoryIndex,
+        row: u32,
+        column: u32,
+        value: Counter,
+    ) -> StatsResult<()> {
+        self.segment
+            .add_combined_counter(index, row, column, value)
+    }
+
+    pub(crate) fn write_histogram(
+        &self,
+        index: DirectoryIndex,
+        row: u32,
+        bucket: u32,
+        value: u64,
+    ) -> StatsResult<()> {
+        self.segment.add_histogram(index, row, bucket, value)
     }
 
     pub fn add_gauge(&self, descriptor: Gauge) -> StatsResult<()> {
@@ -75,6 +145,12 @@ pub enum StatsError {
     InvalidLayout,
     CollectionCapacity,
     DuplicateName,
+    MetricNotFound { name: String },
+    MetricTypeMismatch {
+        expected: &'static str,
+        actual: &'static str,
+    },
+    MetricUnbound,
     DirectoryIndexOutOfBounds { index: u32, length: usize },
     DirectoryEntryUnavailable { index: u32 },
     Teardown,
@@ -99,6 +175,14 @@ impl fmt::Display for StatsError {
                 formatter.write_str("stats owner collection capacity failed")
             }
             Self::DuplicateName => formatter.write_str("duplicate stats directory name"),
+            Self::MetricNotFound { name } => {
+                write!(formatter, "stats metric `{name}` is not registered")
+            }
+            Self::MetricTypeMismatch { expected, actual } => write!(
+                formatter,
+                "stats metric has type `{actual}`, expected `{expected}`"
+            ),
+            Self::MetricUnbound => formatter.write_str("stats metric is not bound to a directory entry"),
             Self::DirectoryIndexOutOfBounds { index, length } => write!(
                 formatter,
                 "stats directory index {index} is outside length {length}"
@@ -171,25 +255,15 @@ mod tests {
     #[test]
     fn add_boundaries_convert_and_delegate_all_metric_families() -> StatsResult<()> {
         let stats = StatsMain::create("st-facade", 2 * 1024 * 1024)?;
-        stats.add_gauge(metric::Gauge {
-            name: "/facade/gauge".to_owned(),
-        })?;
-        stats.add_timestamp(metric::Timestamp {
-            name: "/facade/timestamp".to_owned(),
-        })?;
-        stats.add_simple_counter(metric::SimpleCounter {
-            name: "/facade/simple".to_owned(),
-        })?;
-        stats.add_combined_counter(metric::CombinedCounter {
-            name: "/facade/combined".to_owned(),
-        })?;
+        stats.add_gauge(metric::Gauge::new("/facade/gauge"))?;
+        stats.add_timestamp(metric::Timestamp::new("/facade/timestamp"))?;
+        stats.add_simple_counter(metric::SimpleCounter::new("/facade/simple"))?;
+        stats.add_combined_counter(metric::CombinedCounter::new("/facade/combined"))?;
         stats.add_name_vector(metric::NameVector {
             name: "/facade/names".to_owned(),
             length: 2,
         })?;
-        stats.add_histogram(metric::Histogram {
-            name: "/facade/histogram".to_owned(),
-        })?;
+        stats.add_histogram(metric::Histogram::new("/facade/histogram"))?;
         stats.add_ring(metric::Ring::<TestRingEntry>::new(
             "/facade/ring".to_owned(),
             protocol::RingConfig::new(
@@ -204,11 +278,10 @@ mod tests {
 
         assert_eq!(stats.segment.directory_vector_len(), 7);
         assert!(matches!(
-            stats.add_gauge(metric::Gauge {
-                name: "/facade/gauge".to_owned(),
-            }),
+            stats.add_gauge(metric::Gauge::new("/facade/gauge")),
             Err(StatsError::DuplicateName)
         ));
         Ok(())
     }
+
 }

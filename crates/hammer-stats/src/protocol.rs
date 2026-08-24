@@ -409,6 +409,18 @@ impl DirectoryEntry {
     pub(crate) fn set_name(&mut self, name: NameBytes) {
         self.name = name.0;
     }
+
+    #[inline]
+    pub(crate) fn scalar_value(&self) -> u64 {
+        // SAFETY: Scalar owners call this accessor only after validating the
+        // directory family and selecting the scalar value arm.
+        unsafe { self.data.value }
+    }
+
+    #[inline]
+    pub(crate) fn set_scalar_value(&mut self, value: u64) {
+        self.data.value = value;
+    }
 }
 
 fn require_directory_type(entry: &DirectoryEntry, expected: DirectoryType) -> Result<(), Error> {
@@ -1014,6 +1026,11 @@ impl SharedHeader {
     }
 
     #[inline]
+    pub(crate) fn directory_vector(&self) -> *mut DirectoryEntry {
+        self.directory_vector
+    }
+
+    #[inline]
     pub(crate) fn set_directory_vector(&mut self, value: *mut DirectoryEntry) {
         self.directory_vector = value;
     }
@@ -1031,9 +1048,9 @@ impl SharedHeader {
 
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
-pub(crate) struct Counter {
-    pub(crate) packets: u64,
-    pub(crate) bytes: u64,
+pub struct Counter {
+    pub packets: u64,
+    pub bytes: u64,
 }
 
 impl Counter {
