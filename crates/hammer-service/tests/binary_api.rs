@@ -3,12 +3,13 @@
 
 use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
+use std::sync::{Mutex, MutexGuard, PoisonError};
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::time::Duration;
 
 use hammer_runtime::RuntimeRegistry;
 use hammer_runtime::config::Worker;
-use hammer_runtime::{Engine, EnginePool, PluginError, PluginMain};
+use hammer_runtime::{Engine, EnginePool, FILE_MAIN, FileMain, PluginError, PluginMain};
 use hammer_service::binary_api::{
     BinaryApiClient, BinaryApiError, BinaryApiReply, BinaryApiRequest, BinaryApiStatus,
     DEFAULT_MAX_FRAME_BYTES,
@@ -16,7 +17,14 @@ use hammer_service::binary_api::{
 use prost::Message;
 
 static SOCKET_SEQUENCE: AtomicU64 = AtomicU64::new(0);
+static BINARY_API_SERIAL: Mutex<()> = Mutex::new(());
 static ECHO_BARRIER_SEEN: AtomicBool = AtomicBool::new(false);
+
+fn binary_api_serial() -> MutexGuard<'static, ()> {
+    BINARY_API_SERIAL
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+}
 
 #[derive(Clone, PartialEq, Message)]
 struct EchoRequest {
@@ -134,6 +142,10 @@ fn socket_path() -> PathBuf {
     ))
 }
 
+fn stats_socket_path() -> PathBuf {
+    std::env::temp_dir().join(format!("hammer-stats-runtime-{}.sock", std::process::id()))
+}
+
 /// Builds an engine whose main loop has entered: the `binary_api_init`
 /// function bound the socket at `path`, and the `binary-api` Process Node is
 /// started with the given maximum frame size.
@@ -143,23 +155,30 @@ fn socket_path() -> PathBuf {
 /// its lifetime, so the capability drops only at process exit. Capability-drop
 /// cleanup is asserted directly by
 /// `bind_reclaims_a_stale_socket_and_drop_removes_its_own_path`.
-fn engine_with_binary_api(path: &Path, max_frame_bytes: usize) -> EnginePool {
+fn engine_with_binary_api(
+    path: &Path,
+    max_frame_bytes: usize,
+) -> (EnginePool, tokio::runtime::Runtime) {
     let engine = Engine::new_configured(RuntimeRegistry::new(), Worker::default())
         .expect("configure test engine");
-    let mut pool = EnginePool::new(engine).expect("engine pool");
+    let runtime = main_runtime();
+    let mut pool = EnginePool::new(engine, &runtime).expect("engine pool");
     pool.main_engine_mut()
         .plugin_main_mut()
         .register_builtin_image(&__HAMMER_REGISTRATION_IMAGE);
     pool.main_engine_mut()
         .plugin_main_mut()
         .register_builtin_image(hammer_service::registration_image());
+    let stats_path = stats_socket_path();
     let config = format!(
-        "[binary_api]\nsocket_path = \"{}\"\nmax_frame_bytes = {}\n",
+        "[stats]\nsocket_path = \"{}\"\n\n[binary_api]\nsocket_path = \"{}\"\nmax_frame_bytes = {}\n",
+        stats_path.display(),
         path.display(),
         max_frame_bytes
     );
-    pool.main_loop_enter(&[], &config).expect("enter main loop");
-    pool
+    pool.main_loop_enter(&[], &config, &runtime)
+        .expect("enter main loop");
+    (pool, runtime)
 }
 
 /// Uninstalls the current Engine before the test's engine drops, so the
@@ -243,14 +262,12 @@ fn read_reply(stream: &mut std::os::unix::net::UnixStream) -> io::Result<BinaryA
 
 #[test]
 fn binary_api_process_node_serves_one_request() {
+    let _serial = binary_api_serial();
     let path = socket_path();
-    let mut pool = engine_with_binary_api(&path, DEFAULT_MAX_FRAME_BYTES);
-    let engine = pool.main_engine_mut();
-    let _engine_guard = CurrentEngine::install(engine);
+    let (mut pool, runtime) = engine_with_binary_api(&path, DEFAULT_MAX_FRAME_BYTES);
+    let _engine_guard = CurrentEngine::install(pool.main_engine_mut());
     let expected_thread = format!("{:?}", std::thread::current().id());
-    let runtime = main_runtime();
-
-    engine.run_processes_until(&runtime, async {
+    pool.run_processes_until(&runtime, async {
         tokio::time::timeout(Duration::from_secs(10), async {
             let client_path = path.clone();
             let (reply, barrier_seen) = run_client(move || {
@@ -278,17 +295,19 @@ fn binary_api_process_node_serves_one_request() {
         })
         .await
         .expect("Binary API request completed within the deadline");
-    });
+    })
+    .expect("run process and control dispatchers");
 
-    engine
+    pool.main_engine_mut()
         .shutdown_process_nodes(&runtime)
         .expect("shutdown Process Nodes");
-    drop(engine);
     drop(_engine_guard);
 }
 
 #[test]
 fn bind_reclaims_a_stale_socket_and_drop_removes_its_own_path() {
+    let _serial = binary_api_serial();
+    FILE_MAIN.get_or_init(|| FileMain::new().expect("create global FileMain"));
     let path = socket_path();
     let stale = std::os::unix::net::UnixListener::bind(&path).expect("bind stale socket");
     drop(stale);
@@ -314,13 +333,11 @@ fn duplicate_method_registration_is_rejected() {
 
 #[test]
 fn blocked_server_write_re_arms_when_the_client_resumes_reading() {
+    let _serial = binary_api_serial();
     let path = socket_path();
-    let mut pool = engine_with_binary_api(&path, DEFAULT_MAX_FRAME_BYTES);
-    let engine = pool.main_engine_mut();
-    let _engine_guard = CurrentEngine::install(engine);
-    let runtime = main_runtime();
-
-    engine.run_processes_until(&runtime, async {
+    let (mut pool, runtime) = engine_with_binary_api(&path, DEFAULT_MAX_FRAME_BYTES);
+    let _engine_guard = CurrentEngine::install(pool.main_engine_mut());
+    pool.run_processes_until(&runtime, async {
         tokio::time::timeout(Duration::from_secs(30), async {
             let client_path = path.clone();
             let reply = run_client(move || {
@@ -341,24 +358,22 @@ fn blocked_server_write_re_arms_when_the_client_resumes_reading() {
         })
         .await
         .expect("blocked write re-armed within the deadline");
-    });
+    })
+    .expect("run process and control dispatchers");
 
-    engine
+    pool.main_engine_mut()
         .shutdown_process_nodes(&runtime)
         .expect("shutdown Process Nodes");
-    drop(engine);
     drop(_engine_guard);
 }
 
 #[test]
 fn partial_frames_are_held_and_complete_frames_dispatch_in_order() {
+    let _serial = binary_api_serial();
     let path = socket_path();
-    let mut pool = engine_with_binary_api(&path, DEFAULT_MAX_FRAME_BYTES);
-    let engine = pool.main_engine_mut();
-    let _engine_guard = CurrentEngine::install(engine);
-    let runtime = main_runtime();
-
-    engine.run_processes_until(&runtime, async {
+    let (mut pool, runtime) = engine_with_binary_api(&path, DEFAULT_MAX_FRAME_BYTES);
+    let _engine_guard = CurrentEngine::install(pool.main_engine_mut());
+    pool.run_processes_until(&runtime, async {
         tokio::time::timeout(Duration::from_secs(10), async {
             let long_text = format!("three{}", "x".repeat(8 * 1024));
             let expected_text = long_text.clone();
@@ -426,24 +441,22 @@ fn partial_frames_are_held_and_complete_frames_dispatch_in_order() {
         })
         .await
         .expect("partial and burst frames completed within the deadline");
-    });
+    })
+    .expect("run process and control dispatchers");
 
-    engine
+    pool.main_engine_mut()
         .shutdown_process_nodes(&runtime)
         .expect("shutdown Process Nodes");
-    drop(engine);
     drop(_engine_guard);
 }
 
 #[test]
 fn oversize_declared_frame_closes_the_client_and_releases_the_slot() {
+    let _serial = binary_api_serial();
     let path = socket_path();
-    let mut pool = engine_with_binary_api(&path, 64 * 1024);
-    let engine = pool.main_engine_mut();
-    let _engine_guard = CurrentEngine::install(engine);
-    let runtime = main_runtime();
-
-    engine.run_processes_until(&runtime, async {
+    let (mut pool, runtime) = engine_with_binary_api(&path, 64 * 1024);
+    let _engine_guard = CurrentEngine::install(pool.main_engine_mut());
+    pool.run_processes_until(&runtime, async {
         tokio::time::timeout(Duration::from_secs(10), async {
             let client_path = path.clone();
             let text = run_client(move || {
@@ -482,24 +495,22 @@ fn oversize_declared_frame_closes_the_client_and_releases_the_slot() {
         })
         .await
         .expect("oversize close and slot release completed within the deadline");
-    });
+    })
+    .expect("run process and control dispatchers");
 
-    engine
+    pool.main_engine_mut()
         .shutdown_process_nodes(&runtime)
         .expect("shutdown Process Nodes");
-    drop(engine);
     drop(_engine_guard);
 }
 
 #[test]
 fn partial_frame_then_disconnect_releases_the_slot() {
+    let _serial = binary_api_serial();
     let path = socket_path();
-    let mut pool = engine_with_binary_api(&path, DEFAULT_MAX_FRAME_BYTES);
-    let engine = pool.main_engine_mut();
-    let _engine_guard = CurrentEngine::install(engine);
-    let runtime = main_runtime();
-
-    engine.run_processes_until(&runtime, async {
+    let (mut pool, runtime) = engine_with_binary_api(&path, DEFAULT_MAX_FRAME_BYTES);
+    let _engine_guard = CurrentEngine::install(pool.main_engine_mut());
+    pool.run_processes_until(&runtime, async {
         tokio::time::timeout(Duration::from_secs(10), async {
             let client_path = path.clone();
             let text = run_client(move || {
@@ -542,24 +553,22 @@ fn partial_frame_then_disconnect_releases_the_slot() {
         })
         .await
         .expect("disconnect cleanup completed within the deadline");
-    });
+    })
+    .expect("run process and control dispatchers");
 
-    engine
+    pool.main_engine_mut()
         .shutdown_process_nodes(&runtime)
         .expect("shutdown Process Nodes");
-    drop(engine);
     drop(_engine_guard);
 }
 
 #[test]
 fn stalled_client_backpressure_does_not_starve_a_second_client() {
+    let _serial = binary_api_serial();
     let path = socket_path();
-    let mut pool = engine_with_binary_api(&path, DEFAULT_MAX_FRAME_BYTES);
-    let engine = pool.main_engine_mut();
-    let _engine_guard = CurrentEngine::install(engine);
-    let runtime = main_runtime();
-
-    engine.run_processes_until(&runtime, async {
+    let (mut pool, runtime) = engine_with_binary_api(&path, DEFAULT_MAX_FRAME_BYTES);
+    let _engine_guard = CurrentEngine::install(pool.main_engine_mut());
+    pool.run_processes_until(&runtime, async {
         tokio::time::timeout(Duration::from_secs(60), async {
             // Client A stops reading: six 8 MiB replies saturate the bounded
             // output budget (2 * max_frame_bytes per client) and the server's
@@ -613,25 +622,23 @@ fn stalled_client_backpressure_does_not_starve_a_second_client() {
         })
         .await
         .expect("stalled client drained within the deadline");
-    });
+    })
+    .expect("run process and control dispatchers");
 
-    engine
+    pool.main_engine_mut()
         .shutdown_process_nodes(&runtime)
         .expect("shutdown Process Nodes");
-    drop(engine);
     drop(_engine_guard);
 }
 
 #[test]
 fn mp_safe_method_runs_on_the_main_thread_without_the_worker_barrier() {
+    let _serial = binary_api_serial();
     let path = socket_path();
-    let mut pool = engine_with_binary_api(&path, DEFAULT_MAX_FRAME_BYTES);
-    let engine = pool.main_engine_mut();
-    let _engine_guard = CurrentEngine::install(engine);
+    let (mut pool, runtime) = engine_with_binary_api(&path, DEFAULT_MAX_FRAME_BYTES);
+    let _engine_guard = CurrentEngine::install(pool.main_engine_mut());
     let expected_thread = format!("{:?}", std::thread::current().id());
-    let runtime = main_runtime();
-
-    engine.run_processes_until(&runtime, async {
+    pool.run_processes_until(&runtime, async {
         tokio::time::timeout(Duration::from_secs(10), async {
             let client_path = path.clone();
             let (mp_safe, echo, mp_safe_barrier_seen, echo_barrier_seen) = run_client(move || {
@@ -691,24 +698,22 @@ fn mp_safe_method_runs_on_the_main_thread_without_the_worker_barrier() {
         })
         .await
         .expect("read-only and barriered requests completed within the deadline");
-    });
+    })
+    .expect("run process and control dispatchers");
 
-    engine
+    pool.main_engine_mut()
         .shutdown_process_nodes(&runtime)
         .expect("shutdown Process Nodes");
-    drop(engine);
     drop(_engine_guard);
 }
 
 #[test]
 fn unknown_method_keeps_the_legacy_barriered_reply_and_dispatch_path() {
+    let _serial = binary_api_serial();
     let path = socket_path();
-    let mut pool = engine_with_binary_api(&path, DEFAULT_MAX_FRAME_BYTES);
-    let engine = pool.main_engine_mut();
-    let _engine_guard = CurrentEngine::install(engine);
-    let runtime = main_runtime();
-
-    engine.run_processes_until(&runtime, async {
+    let (mut pool, runtime) = engine_with_binary_api(&path, DEFAULT_MAX_FRAME_BYTES);
+    let _engine_guard = CurrentEngine::install(pool.main_engine_mut());
+    pool.run_processes_until(&runtime, async {
         tokio::time::timeout(Duration::from_secs(10), async {
             let client_path = path.clone();
             let echo_barrier_seen = run_client(move || {
@@ -749,25 +754,24 @@ fn unknown_method_keeps_the_legacy_barriered_reply_and_dispatch_path() {
         })
         .await
         .expect("unknown method and follow-up completed within the deadline");
-    });
+    })
+    .expect("run process and control dispatchers");
 
-    engine
+    pool.main_engine_mut()
         .shutdown_process_nodes(&runtime)
         .expect("shutdown Process Nodes");
-    drop(engine);
     drop(_engine_guard);
 }
 
 #[test]
 fn process_node_shutdown_closes_the_listener_and_stops_dispatch() {
+    let _serial = binary_api_serial();
     let path = socket_path();
-    let mut pool = engine_with_binary_api(&path, DEFAULT_MAX_FRAME_BYTES);
-    let engine = pool.main_engine_mut();
-    let _engine_guard = CurrentEngine::install(engine);
-    let runtime = main_runtime();
+    let (mut pool, runtime) = engine_with_binary_api(&path, DEFAULT_MAX_FRAME_BYTES);
+    let _engine_guard = CurrentEngine::install(pool.main_engine_mut());
 
     // Serve one request so the node is running and owns the FileMain.
-    engine.run_processes_until(&runtime, async {
+    pool.run_processes_until(&runtime, async {
         tokio::time::timeout(Duration::from_secs(10), async {
             let client_path = path.clone();
             let text = run_client(move || {
@@ -790,24 +794,27 @@ fn process_node_shutdown_closes_the_listener_and_stops_dispatch() {
         })
         .await
         .expect("warmup request completed within the deadline");
-    });
+    })
+    .expect("run process and control dispatchers");
 
-    engine
+    pool.main_engine_mut()
         .shutdown_process_nodes(&runtime)
         .expect("shutdown Process Nodes");
 
-    // The Process Node owned the FileMain: exiting it drops the listener and
-    // every client descriptor, so no dispatch can happen and new connections
-    // are refused.
+    // The listener is a process-global FileMain registration. Process Node
+    // shutdown stops event consumption; Engine/capability teardown releases
+    // the listener and its client descriptors.
+    drop(_engine_guard);
+    pool.close().expect("close Binary API engine pool");
+    drop(pool);
     let client_path = path.clone();
     let error = std::os::unix::net::UnixStream::connect(&client_path)
         .expect_err("listener must close with the Process Node");
-    assert_eq!(
-        error.kind(),
-        io::ErrorKind::ConnectionRefused,
-        "shutdown must close the Binary API listener"
+    assert!(
+        matches!(
+            error.kind(),
+            io::ErrorKind::ConnectionRefused | io::ErrorKind::NotFound
+        ),
+        "engine teardown must close the Binary API listener: {error}"
     );
-
-    drop(engine);
-    drop(_engine_guard);
 }

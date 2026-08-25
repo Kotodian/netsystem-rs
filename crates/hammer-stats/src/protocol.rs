@@ -2,7 +2,7 @@ use std::ffi::CStr;
 pub(crate) const MAX_NAME_BYTES: usize = 128;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum Error {
+pub enum Error {
     UnknownDirectoryType {
         raw: u32,
     },
@@ -136,7 +136,7 @@ pub(crate) struct TypeCode(u32);
 
 #[repr(u32)]
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
-pub(crate) enum DirectoryType {
+pub enum DirectoryType {
     Illegal = 0,
     ScalarIndex = 1,
     CounterVectorSimple = 2,
@@ -167,6 +167,13 @@ impl From<DirectoryType> for TypeCode {
     #[inline]
     fn from(kind: DirectoryType) -> Self {
         Self(kind as u32)
+    }
+}
+
+impl From<DirectoryType> for u32 {
+    #[inline]
+    fn from(kind: DirectoryType) -> Self {
+        kind as u32
     }
 }
 
@@ -269,7 +276,7 @@ impl From<DirectoryIndex> for u32 {
 
 #[repr(transparent)]
 #[derive(Clone, Copy, Debug, Default, Eq, Hash, Ord, PartialEq, PartialOrd)]
-pub(crate) struct Gauge(u64);
+pub struct Gauge(u64);
 
 impl From<u64> for Gauge {
     #[inline]
@@ -280,11 +287,11 @@ impl From<u64> for Gauge {
 
 #[repr(transparent)]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) struct DirectoryDataPointer(*mut core::ffi::c_void);
+pub struct DirectoryDataPointer(*mut core::ffi::c_void);
 
 impl DirectoryDataPointer {
     #[inline]
-    pub(crate) const fn as_ptr(self) -> *mut core::ffi::c_void {
+    pub const fn as_ptr(self) -> *mut core::ffi::c_void {
         self.0
     }
 }
@@ -298,7 +305,7 @@ impl From<*mut core::ffi::c_void> for DirectoryDataPointer {
 
 #[repr(transparent)]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) struct StringVectorPointer(*mut *mut u8);
+pub struct StringVectorPointer(*mut *mut u8);
 
 impl From<*mut *mut u8> for StringVectorPointer {
     #[inline]
@@ -309,7 +316,7 @@ impl From<*mut *mut u8> for StringVectorPointer {
 
 impl StringVectorPointer {
     #[inline]
-    pub(crate) const fn as_ptr(self) -> *mut *mut u8 {
+    pub const fn as_ptr(self) -> *mut *mut u8 {
         self.0
     }
 }
@@ -326,7 +333,7 @@ pub(crate) union DirectoryData {
 
 #[repr(C)]
 #[derive(Clone, Copy)]
-pub(crate) struct DirectoryEntry {
+pub struct DirectoryEntry {
     directory_type: TypeCode,
     data: DirectoryData,
     name: [u8; MAX_NAME_BYTES],
@@ -389,11 +396,11 @@ impl DirectoryEntry {
     }
 
     #[inline]
-    pub(crate) fn kind(&self) -> TypeCode {
-        self.directory_type
+    pub fn kind(&self) -> u32 {
+        self.directory_type.raw()
     }
 
-    pub(crate) fn name(&self) -> Result<&CStr, Error> {
+    pub fn name(&self) -> Result<&CStr, Error> {
         let checked = NameBytes(self.name);
         checked.as_c_str()?;
         CStr::from_bytes_until_nul(&self.name).map_err(|_| Error::MissingNameTerminator)
@@ -521,7 +528,7 @@ impl TryFrom<&DirectoryEntry> for StringVectorPointer {
 
 #[repr(transparent)]
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
-pub(crate) struct ScalarBits(u64);
+pub struct ScalarBits(u64);
 
 impl From<f64> for ScalarBits {
     #[inline]
@@ -577,14 +584,14 @@ pub(crate) const fn vec_header_bytes(
 }
 
 #[inline]
-pub(crate) fn vec_len(header: Option<&[u8; 8]>) -> u32 {
+pub fn vec_len(header: Option<&[u8; 8]>) -> u32 {
     match header {
         Some(header) => u32::from_ne_bytes([header[0], header[1], header[2], header[3]]),
         None => 0,
     }
 }
 
-pub(crate) fn vector_element_offset(
+pub fn vector_element_offset(
     header_offset: usize,
     vector_offset: usize,
     header: &[u8; 8],
@@ -693,7 +700,7 @@ impl RingConfig {
     }
 
     #[inline]
-    pub(crate) fn entry_size(&self) -> u32 {
+    pub fn entry_size(&self) -> u32 {
         // SAFETY: `entry_size` is a field of a live packed record; the copy is
         // explicitly unaligned and does not create a field reference.
         unsafe { core::ptr::addr_of!(self.entry_size).read_unaligned() }
@@ -707,7 +714,7 @@ impl RingConfig {
     }
 
     #[inline]
-    pub(crate) fn ring_size(&self) -> u32 {
+    pub fn ring_size(&self) -> u32 {
         // SAFETY: `ring_size` is a field of a live packed record; the copy is
         // explicitly unaligned and does not create a field reference.
         unsafe { core::ptr::addr_of!(self.ring_size).read_unaligned() }
@@ -721,7 +728,7 @@ impl RingConfig {
     }
 
     #[inline]
-    pub(crate) fn n_threads(&self) -> u32 {
+    pub fn n_threads(&self) -> u32 {
         // SAFETY: `n_threads` is a field of a live packed record; the copy is
         // explicitly unaligned and does not create a field reference.
         unsafe { core::ptr::addr_of!(self.n_threads).read_unaligned() }
@@ -735,7 +742,7 @@ impl RingConfig {
     }
 
     #[inline]
-    pub(crate) fn schema_size(&self) -> u32 {
+    pub fn schema_size(&self) -> u32 {
         // SAFETY: `schema_size` is a field of a live packed record; the copy is
         // explicitly unaligned and does not create a field reference.
         unsafe { core::ptr::addr_of!(self.schema_size).read_unaligned() }
@@ -765,7 +772,7 @@ impl RingConfig {
 
 #[repr(C, packed)]
 #[derive(Clone, Copy)]
-pub(crate) struct RingBufferHeader {
+pub struct RingBufferHeader {
     config: RingConfig,
     metadata_offset: u32,
     data_offset: u32,
@@ -782,7 +789,7 @@ impl RingBufferHeader {
     }
 
     #[inline]
-    pub(crate) fn config(&self) -> RingConfig {
+    pub fn config(&self) -> RingConfig {
         // SAFETY: `config` is a field of a live packed record; the copy is
         // explicitly unaligned and does not create a field reference.
         unsafe { core::ptr::addr_of!(self.config).read_unaligned() }
@@ -810,7 +817,7 @@ impl RingBufferHeader {
     }
 
     #[inline]
-    pub(crate) fn data_offset(&self) -> u32 {
+    pub fn data_offset(&self) -> u32 {
         // SAFETY: `data_offset` is a field of a live packed record; the copy is
         // explicitly unaligned and does not create a field reference.
         unsafe { core::ptr::addr_of!(self.data_offset).read_unaligned() }
@@ -898,7 +905,7 @@ impl RingMetadata {
     }
 }
 
-pub(crate) fn ring_layout(
+pub fn ring_layout(
     config: RingConfig,
     cache_line_bytes: usize,
     mapping_capacity: usize,
@@ -984,7 +991,7 @@ pub(crate) const STAT_COUNTER_BOOTTIME: u32 = 2;
 
 #[repr(C)]
 #[derive(Clone, Copy)]
-pub(crate) struct SharedHeader {
+pub struct SharedHeader {
     version: u64,
     base: *mut core::ffi::c_void,
     epoch: u64,
@@ -1005,7 +1012,7 @@ impl SharedHeader {
     }
 
     #[inline]
-    pub(crate) fn validate_version(&self) -> Result<(), Error> {
+    pub fn validate_version(&self) -> Result<(), Error> {
         if self.version == STAT_SEGMENT_VERSION {
             Ok(())
         } else {
@@ -1016,17 +1023,22 @@ impl SharedHeader {
     }
 
     #[inline]
-    pub(crate) fn is_write_in_progress(&self) -> bool {
+    pub fn is_write_in_progress(&self) -> bool {
         self.in_progress != 0
     }
 
     #[inline]
-    pub(crate) fn epoch(&self) -> u64 {
+    pub fn epoch(&self) -> u64 {
         self.epoch
     }
 
     #[inline]
-    pub(crate) fn directory_vector(&self) -> *mut DirectoryEntry {
+    pub fn base(&self) -> *mut core::ffi::c_void {
+        self.base
+    }
+
+    #[inline]
+    pub fn directory_vector(&self) -> *mut DirectoryEntry {
         self.directory_vector
     }
 

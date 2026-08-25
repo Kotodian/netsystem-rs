@@ -13,12 +13,16 @@ pub mod __private {
 }
 
 crate::__declare_registration_image!(
-    init_functions = [graph::install::__INIT_FN_INSTALL_PACKET_GRAPH];
-    config_functions = [
-        trace::__CONFIG_FN_RUNTIME_TRACE_CONFIG,
+    init_functions = [
+        graph::install::__INIT_FN_INSTALL_PACKET_GRAPH,
+        file::__INIT_FN_FILE_MAIN_INIT,
+        config::stats::__INIT_FN_STATS_MAIN_INIT,
+    ];
+    config_functions = [trace::__CONFIG_FN_RUNTIME_TRACE_CONFIG];
+    early_config_functions = [
+        memory::__CONFIG_FN_RUNTIME_WORKER_CONFIG,
         config::stats::__CONFIG_FN_RUNTIME_STATS_CONFIG,
     ];
-    early_config_functions = [memory::__CONFIG_FN_RUNTIME_WORKER_CONFIG];
     main_loop_enter_functions = [start_workers::__INIT_FN_START_WORKERS];
     main_loop_exit_functions = [];
     worker_init_functions = [];
@@ -42,7 +46,9 @@ pub mod config;
 pub mod file;
 pub use file::{
     AsyncFileMain, Deadline, DeadlineFunction, File, FileFunction, FileFunctions, FileMain,
+    FILE_MAIN,
 };
+
 pub mod barrier;
 pub mod binary_api;
 pub mod init;

@@ -2,7 +2,7 @@ use std::collections::HashSet;
 
 use proc_macro::TokenStream;
 use proc_macro2::{Span, TokenStream as TokenStream2};
-use quote::{format_ident, quote};
+use quote::{ToTokens, format_ident, quote};
 use syn::parse::{Parse, ParseStream};
 use syn::{
     Attribute, Error, Expr, Field, Fields, FieldsNamed, FnArg, GenericArgument, GenericParam,
@@ -260,22 +260,22 @@ fn expand_stats_descriptor(field: &StatsField) -> TokenStream2 {
 
 fn expand_stats_registration(field: &StatsField) -> TokenStream2 {
     let ident = &field.ident;
-    match &field.metric {
-        StatsMetric::Gauge => quote! {
-            stats_main.add_gauge(stats.#ident)?;
-        },
-        StatsMetric::Timestamp => quote! {
-            stats_main.add_timestamp(stats.#ident)?;
-        },
-        StatsMetric::SimpleCounter => quote! {
-            stats_main.add_simple_counter(stats.#ident)?;
-        },
-        StatsMetric::CombinedCounter => quote! {
-            stats_main.add_combined_counter(stats.#ident)?;
-        },
-        StatsMetric::Histogram => quote! {
-            stats_main.add_histogram(stats.#ident)?;
-        },
+    let ty = &field.ty;
+    let path = &field.path;
+    let register = match &field.metric {
+        StatsMetric::Gauge => quote!(stats_main.add_gauge(stats.#ident)),
+        StatsMetric::Timestamp => quote!(stats_main.add_timestamp(stats.#ident)),
+        StatsMetric::SimpleCounter => quote!(stats_main.add_simple_counter(stats.#ident)),
+        StatsMetric::CombinedCounter => quote!(stats_main.add_combined_counter(stats.#ident)),
+        StatsMetric::Histogram => quote!(stats_main.add_histogram(stats.#ident)),
+    };
+    quote! {
+        if let Err(error) = #register {
+            if !matches!(error, ::hammer_stats::StatsError::DuplicateName) {
+                return Err(error);
+            }
+            #ty::bind(stats_main, #path)?;
+        }
     }
 }
 
@@ -334,10 +334,7 @@ fn expand_stats(item: ItemStruct) -> Result<TokenStream2> {
         stats_fields.push(stats_field);
     }
 
-    let registration_name = format_ident!(
-        "__STATS_REGISTRATION_{}",
-        aggregate
-    );
+    let registration_name = format_ident!("__STATS_REGISTRATION_{}", aggregate);
     let aggregate_name = LitStr::new(&aggregate.to_string(), aggregate.span());
     let descriptors = stats_fields.iter().map(expand_stats_descriptor);
     let registrations = stats_fields.iter().map(expand_stats_registration);
@@ -361,6 +358,15 @@ fn expand_stats(item: ItemStruct) -> Result<TokenStream2> {
                     #(#bindings)*
                 })
             }
+
+            fn bind_to_registry(
+                stats_main: &::hammer_stats::StatsMain,
+                registry: &::hammer_runtime::RuntimeRegistry,
+            ) -> ::hammer_runtime::RuntimeResult<()> {
+                let stats = ::std::sync::Arc::new(Self::bind(stats_main)?);
+                registry.set(stats);
+                Ok(())
+            }
         }
 
         #[doc(hidden)]
@@ -370,6 +376,7 @@ fn expand_stats(item: ItemStruct) -> Result<TokenStream2> {
             ::hammer_runtime::registration::StatsRegistration {
                 name: #aggregate_name,
                 register: #aggregate::register,
+                bind: #aggregate::bind_to_registry,
             };
     })
 }
@@ -475,6 +482,8 @@ mod stats_derive_tests {
         );
 
         assert!(expanded.contains("pub (crate) fn bind"));
+        assert!(expanded.contains("fn bind_to_registry"));
+        assert!(expanded.contains("registry . set"));
         for (metric, path) in [
             ("Gauge :: bind", "/metrics/gauge"),
             ("Timestamp :: bind", "/metrics/timestamp"),
@@ -3231,6 +3240,218 @@ fn expand_process_node(args: ProcessFnArgs, function: ItemFn) -> Result<TokenStr
     })
 }
 
+struct FileArgs;
+
+impl Parse for FileArgs {
+    fn parse(input: ParseStream<'_>) -> Result<Self> {
+        if input.is_empty() {
+            Ok(Self)
+        } else {
+            Err(input.error("`file` does not accept arguments"))
+        }
+    }
+}
+
+/// Associates an inline module's generic `read` and `error` callbacks with
+/// one complete `hammer_core::file::FileFunctions` value.
+#[proc_macro_attribute]
+pub fn file(args: TokenStream, input: TokenStream) -> TokenStream {
+    let _ = parse_macro_input!(args as FileArgs);
+    let module = parse_macro_input!(input as ItemMod);
+    expand_file(module)
+        .unwrap_or_else(Error::into_compile_error)
+        .into()
+}
+
+fn expand_file(mut module: ItemMod) -> Result<TokenStream2> {
+    let Some((_, items)) = module.content.as_ref() else {
+        return Err(Error::new_spanned(
+            &module,
+            "`file` requires an inline module containing `read` and `error` callbacks",
+        ));
+    };
+    let read = items
+        .iter()
+        .find_map(|item| match item {
+            Item::Fn(function) if function.sig.ident == "read" => Some(function),
+            _ => None,
+        })
+        .ok_or_else(|| {
+            Error::new_spanned(&module, "`file` module must provide a `read` callback")
+        })?;
+    let error = items
+        .iter()
+        .find_map(|item| match item {
+            Item::Fn(function) if function.sig.ident == "error" => Some(function),
+            _ => None,
+        })
+        .ok_or_else(|| {
+            Error::new_spanned(&module, "`file` module must provide an `error` callback")
+        })?;
+    let write = items.iter().find_map(|item| match item {
+        Item::Fn(function) if function.sig.ident == "write" => Some(function),
+        _ => None,
+    });
+
+    let read_parameters: Vec<String> = read
+        .sig
+        .generics
+        .params
+        .iter()
+        .map(ToTokens::to_token_stream)
+        .map(|tokens| tokens.to_string())
+        .collect();
+    let error_parameters: Vec<String> = error
+        .sig
+        .generics
+        .params
+        .iter()
+        .map(ToTokens::to_token_stream)
+        .map(|tokens| tokens.to_string())
+        .collect();
+    if read_parameters != error_parameters {
+        return Err(Error::new_spanned(
+            &error.sig.generics,
+            "`read` and `error` callbacks must share generic parameters",
+        ));
+    }
+    if let Some(write) = write {
+        let write_parameters: Vec<String> = write
+            .sig
+            .generics
+            .params
+            .iter()
+            .map(ToTokens::to_token_stream)
+            .map(|tokens| tokens.to_string())
+            .collect();
+        if read_parameters != write_parameters {
+            return Err(Error::new_spanned(
+                &write.sig.generics,
+                "`read` and `write` callbacks must share generic parameters",
+            ));
+        }
+    }
+    if read.sig.generics.params.len() != 2
+        || read
+            .sig
+            .generics
+            .params
+            .iter()
+            .any(|parameter| !matches!(parameter, GenericParam::Type(_)))
+    {
+        return Err(Error::new_spanned(
+            &read.sig.generics,
+            "`file` callbacks must declare exactly two type parameters for Context and Error",
+        ));
+    }
+    let Some(GenericParam::Type(context)) = read.sig.generics.params.first() else {
+        return Err(Error::new_spanned(
+            &read.sig.generics,
+            "`file` callbacks must declare a Context type parameter",
+        ));
+    };
+    let Some(GenericParam::Type(error_type)) = read.sig.generics.params.get(1) else {
+        return Err(Error::new_spanned(
+            &read.sig.generics,
+            "`file` callbacks must declare an Error type parameter",
+        ));
+    };
+
+    let mut constructor_generics = read.sig.generics.clone();
+    for callback in [Some(error), write].into_iter().flatten() {
+        let Some(callback_where) = &callback.sig.generics.where_clause else {
+            continue;
+        };
+        let constructor_where = constructor_generics
+            .where_clause
+            .get_or_insert_with(|| parse_quote!(where));
+        for predicate in &callback_where.predicates {
+            let predicate_tokens = predicate.to_token_stream().to_string();
+            if !constructor_where
+                .predicates
+                .iter()
+                .any(|existing| existing.to_token_stream().to_string() == predicate_tokens)
+            {
+                constructor_where.predicates.push(predicate.clone());
+            }
+        }
+    }
+    let generic_params = &constructor_generics.params;
+    let where_clause = &constructor_generics.where_clause;
+    let context_ident = &context.ident;
+    let error_ident = &error_type.ident;
+    let write_constructor = write.map_or_else(
+        || quote!(None),
+        |_| quote!(Some(write::<#context_ident, #error_ident>)),
+    );
+    let constructor = quote! {
+        pub fn file_functions<#generic_params>()
+            -> ::hammer_core::file::FileFunctions<#context_ident, #error_ident>
+            #where_clause
+        {
+            ::hammer_core::file::FileFunctions {
+                read: Some(read::<#context_ident, #error_ident>),
+                write: #write_constructor,
+                error: Some(error::<#context_ident, #error_ident>),
+            }
+        }
+    };
+    let Some((_, items)) = module.content.as_mut() else {
+        return Err(Error::new_spanned(
+            &module,
+            "`file` requires an inline module",
+        ));
+    };
+    if items
+        .iter()
+        .any(|item| matches!(item, Item::Fn(function) if function.sig.ident == "file_functions"))
+    {
+        return Err(Error::new_spanned(
+            &module,
+            "`file` module cannot define `file_functions`; it is generated by the macro",
+        ));
+    }
+    items.push(Item::Verbatim(constructor));
+    Ok(quote!(#module))
+}
+
+#[cfg(test)]
+mod file_macro_tests {
+    use super::*;
+
+    #[test]
+    fn file_macro_requires_both_callbacks() {
+        let module = syn::parse_str::<ItemMod>("mod socket { fn read() {} }").expect("module");
+        let error = expand_file(module).expect_err("missing error callback must fail");
+        assert!(error.to_string().contains("`error` callback"));
+    }
+
+    #[test]
+    fn file_macro_generates_read_write_error_set() {
+        let module = syn::parse_str::<ItemMod>(
+            "mod socket { fn read<C, E>(_: &C, _: &mut hammer_core::file::File<C, E>) -> Result<(), E> where E: From<std::convert::Infallible> { Ok(()) } fn error<C, E>(_: &C, _: &mut hammer_core::file::File<C, E>) -> Result<(), E> where E: From<std::convert::Infallible> { Ok(()) } }",
+        )
+        .expect("module");
+        let expanded = expand_file(module).expect("file expansion").to_string();
+        assert!(expanded.contains("file_functions"));
+        assert!(expanded.contains("write : None"));
+        assert!(expanded.contains("read :: < C , E >"));
+        assert!(expanded.contains("error :: < C , E >"));
+        assert!(expanded.contains("From < std :: convert :: Infallible >"));
+    }
+
+    #[test]
+    fn file_macro_generates_optional_write_callback() {
+        let module = syn::parse_str::<ItemMod>(
+            "mod socket { fn read<C, E>(_: &C, _: &mut hammer_core::file::File<C, E>) -> Result<(), E> where E: From<std::convert::Infallible> { Ok(()) } fn write<C, E>(_: &C, _: &mut hammer_core::file::File<C, E>) -> Result<(), E> where E: From<std::convert::Infallible> { Ok(()) } fn error<C, E>(_: &C, _: &mut hammer_core::file::File<C, E>) -> Result<(), E> { Ok(()) } }",
+        )
+        .expect("module");
+        let expanded = expand_file(module).expect("file expansion").to_string();
+        assert!(expanded.contains("write : Some (write :: < C , E >)"));
+        assert!(expanded.contains("From < std :: convert :: Infallible >"));
+    }
+}
+
 // ── Init / Config function macros (VPP VLIB_INIT_FUNCTION / VLIB_CONFIG_FUNCTION) ──
 
 struct InitFnArgs {
@@ -3281,6 +3502,7 @@ struct ConfigFnArgs {
     init: InitFnArgs,
     section: LitStr,
     early: bool,
+    required: bool,
 }
 
 impl Parse for ConfigFnArgs {
@@ -3288,6 +3510,7 @@ impl Parse for ConfigFnArgs {
         let mut name = None;
         let mut section = None;
         let mut early = None;
+        let mut required = None;
         let mut runs_before = Vec::new();
         let mut runs_after = Vec::new();
         while !input.is_empty() {
@@ -3314,11 +3537,17 @@ impl Parse for ConfigFnArgs {
                     }
                     early = Some(input.parse::<LitBool>()?.value());
                 }
+                "required" => {
+                    if required.is_some() {
+                        return Err(Error::new(key.span(), "duplicate `required` argument"));
+                    }
+                    required = Some(input.parse::<LitBool>()?.value());
+                }
                 other => {
                     return Err(Error::new(
                         key.span(),
                         format!(
-                            "unknown argument `{other}`; expected `name`, `section`, `early`, `runs_before`, or `runs_after`"
+                            "unknown argument `{other}`; expected `name`, `section`, `early`, `required`, `runs_before`, or `runs_after`"
                         ),
                     ));
                 }
@@ -3337,6 +3566,7 @@ impl Parse for ConfigFnArgs {
             section: section
                 .ok_or_else(|| Error::new(Span::call_site(), "missing `section` argument"))?,
             early: early.unwrap_or(false),
+            required: required.unwrap_or(false),
         })
     }
 }
@@ -3664,6 +3894,9 @@ fn init_output(function: &ItemFn) -> Result<InitOutput> {
 /// ```ignore
 /// #[config_function(name = "tcp_config", section = "plugin.tcp", early = true)]
 /// fn configure_tcp(config: TcpPluginConfig, engine: &mut Engine) -> RuntimeResult<()> { ... }
+///
+/// Use `required = true` when the section and all of its fields must be
+/// present instead of defaulting through a generated wrapper.
 /// ```
 #[proc_macro_attribute]
 pub fn config_function(args: TokenStream, input: TokenStream) -> TokenStream {
@@ -3747,6 +3980,7 @@ fn expand_config_function(args: ConfigFnArgs, mut function: ItemFn) -> Result<To
     let adapter_name = format_ident!("__hammer_config_adapter_{}", function_name);
     let name = args.init.name;
     let section = args.section;
+    let required = args.required;
     let runs_before = args.init.runs_before;
     let runs_after = args.init.runs_after;
     let static_ident = config_function_static_name(&name);
@@ -3796,12 +4030,30 @@ fn expand_config_function(args: ConfigFnArgs, mut function: ItemFn) -> Result<To
                     let wrapper = &wrapper_idents[index];
                     let field = &field_idents[index];
                     let key = &section_keys[index];
+                    let wrapper_attributes = if required {
+                        quote! {
+                            #[derive(::serde::Deserialize)]
+                        }
+                    } else {
+                        quote! {
+                            #[derive(::serde::Deserialize, Default)]
+                            #[serde(default)]
+                        }
+                    };
+                    let field_attributes = if required {
+                        quote! {
+                            #[serde(rename = #key)]
+                        }
+                    } else {
+                        quote! {
+                            #[serde(default, rename = #key)]
+                        }
+                    };
                     wrapper_definitions.push(quote! {
                         #[allow(non_camel_case_types)]
-                        #[derive(::serde::Deserialize, Default)]
-                        #[serde(default)]
+                        #wrapper_attributes
                         struct #wrapper {
-                            #[serde(default, rename = #key)]
+                            #field_attributes
                             #field: #child,
                         }
                     });
@@ -4425,10 +4677,20 @@ mod tests {
         .expect("parse config arguments");
 
         assert!(arguments.early);
+        assert!(!arguments.required);
         assert_eq!(arguments.init.name.value(), "session");
         assert_eq!(arguments.section.value(), "network");
         assert_eq!(arguments.init.runs_before[0].value(), "tcp");
         assert_eq!(arguments.init.runs_after[0].value(), "device");
+    }
+
+    #[test]
+    fn config_function_arguments_support_required_sections() {
+        let arguments =
+            syn::parse_str::<ConfigFnArgs>(r#"name = "stats", section = "stats", required = true"#)
+                .expect("parse required config arguments");
+
+        assert!(arguments.required);
     }
 
     #[test]

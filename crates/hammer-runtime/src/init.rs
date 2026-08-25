@@ -3,9 +3,8 @@ use petgraph::graphmap::DiGraphMap;
 use std::collections::HashSet;
 use std::panic::{AssertUnwindSafe, catch_unwind};
 
-use crate::error::RuntimeResult;
-
 use crate::engine::Engine;
+use crate::error::RuntimeResult;
 use hammer_stats::StatsMain;
 
 #[derive(Debug, thiserror::Error)]
@@ -155,9 +154,11 @@ pub fn run_init_functions(engine: &mut Engine) -> RuntimeResult<()> {
     result
 }
 
-pub fn run_stats_registrations(engine: &Engine, stats_main: &StatsMain) -> RuntimeResult<()> {
+pub fn run_stats_registrations(engine: &Engine) -> RuntimeResult<()> {
+    let stats_main = StatsMain::global()?;
     for registration in engine.plugin_main().stats_registrations() {
         (registration.register)(stats_main)?;
+        (registration.bind)(stats_main, &engine.registry)?;
     }
     Ok(())
 }

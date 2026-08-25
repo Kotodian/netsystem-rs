@@ -433,11 +433,6 @@ impl PluginMain {
         self.load_order.clone()
     }
 
-    #[inline]
-    pub(crate) fn registration_generation(&self) -> u64 {
-        (self.load_order.len() + 1) as u64
-    }
-
     fn collect_registrations<T: Copy + 'static>(
         &self,
         inventory: impl Fn(&RegistrationImage) -> &'static [T],
@@ -587,9 +582,17 @@ mod tests {
         Ok(())
     }
 
+    fn test_stats_bind(
+        _: &hammer_stats::StatsMain,
+        _: &crate::RuntimeRegistry,
+    ) -> crate::RuntimeResult<()> {
+        Ok(())
+    }
+
     static TEST_STATS_REGISTRATION: StatsRegistration = StatsRegistration {
         name: "TestStats",
         register: test_stats_register,
+        bind: test_stats_bind,
     };
 
     crate::__declare_registration_image!(

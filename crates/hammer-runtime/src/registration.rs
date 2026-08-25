@@ -6,9 +6,11 @@
 
 use crate::app::SessionAppRegistration;
 use crate::binary_api::BinaryApiMethodEntry;
+use crate::error::RuntimeResult;
 use crate::init::{ConfigFunction, InitFunction};
 use crate::node::{NodeEntry, NodeFunctionRegistration};
 use crate::process::ProcessEntry;
+use crate::registry::RuntimeRegistry;
 use crate::session::SessionTransportRegistration;
 use abi_stable::StableAbi;
 use hammer_stats::{StatsMain, StatsResult};
@@ -18,6 +20,7 @@ use hammer_stats::{StatsMain, StatsResult};
 pub struct StatsRegistration {
     pub name: &'static str,
     pub register: fn(&StatsMain) -> StatsResult<()>,
+    pub bind: fn(&StatsMain, &RuntimeRegistry) -> RuntimeResult<()>,
 }
 
 /// The existing registration catalog for one link image.

@@ -138,6 +138,22 @@ impl ProcessContext {
         let Some(first) = first else {
             return ProcessWake::Clock;
         };
+        self.collect_signals(first)
+    }
+
+    /// Suspend until the next FileMain readiness signal, matching VPP's
+    /// event-driven Process Node loop without a periodic clock wake.
+    pub async fn wait_for_event(&mut self) -> ProcessWake {
+        if !self.pending.is_empty() {
+            return ProcessWake::Event(self.pending.remove(0));
+        }
+        let Some(first) = self.events.recv().await else {
+            return ProcessWake::Clock;
+        };
+        self.collect_signals(first)
+    }
+
+    fn collect_signals(&mut self, first: ProcessSignal) -> ProcessWake {
         self.push_signal(first);
         while let Ok(signal) = self.events.try_recv() {
             self.push_signal(signal);
@@ -268,11 +284,11 @@ impl ProcessMain {
             .map(|running| running.handle.clone())
     }
 
-    pub(crate) fn run_until<F>(&self, runtime: &tokio::runtime::Runtime, future: F) -> F::Output
+    pub(crate) fn run_until<'a, F>(&'a self, future: F) -> impl Future<Output = F::Output> + 'a
     where
-        F: Future,
+        F: Future + 'a,
     {
-        self.local.block_on(runtime, future)
+        self.local.run_until(future)
     }
 
     pub(crate) fn shutdown(&mut self, runtime: &tokio::runtime::Runtime) -> RuntimeResult<()> {

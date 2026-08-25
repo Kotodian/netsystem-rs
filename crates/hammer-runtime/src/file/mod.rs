@@ -4,20 +4,28 @@
 //! This module owns descriptors, readiness dispatch, and indexed synchronous
 //! descriptor I/O. Device queues own packet and queue semantics.
 
+use std::cell::UnsafeCell;
 use std::fmt;
 use std::io::{self, Read};
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 use std::os::unix::net::{UnixListener, UnixStream};
+use std::sync::OnceLock;
 use std::time::Duration;
 
 use tokio::io::Interest;
 use tokio::io::unix::AsyncFd;
 use tokio::runtime::Handle;
 
-use crate::error::{RuntimeError, RuntimeResult};
 use hammer_infra::pool::{Index, Pool};
+use hammer_infra::sync::{SpinLock, SpinLockGuard};
 
 use crate::NodeRuntime;
+use crate::engine::Engine;
+use crate::error::{RuntimeError, RuntimeResult};
+use hammer_component_macros::init_function;
+use hammer_core::file::{
+    File as CoreFile, FileFunction as CoreFileFunction, FileFunctions as CoreFileFunctions,
+};
 
 #[cfg(target_os = "macos")]
 mod macos;
@@ -28,18 +36,20 @@ mod linux;
 #[cfg(target_os = "linux")]
 use linux::Poller;
 
-/// Worker-local callback invoked for one ready descriptor event.
-pub type FileFunction = fn(&NodeRuntime, &mut File) -> RuntimeResult<()>;
+/// The runtime's concrete specialization of the shared File ABI.
+pub type File = CoreFile<NodeRuntime, RuntimeError>;
+pub type FileFunction = CoreFileFunction<NodeRuntime, RuntimeError>;
+pub type FileFunctions = CoreFileFunctions<NodeRuntime, RuntimeError>;
 
-/// Worker-local callback invoked when a registered deadline expires.
-pub type DeadlineFunction = fn(&NodeRuntime, &mut Deadline) -> RuntimeResult<()>;
-
-/// Functions dispatched for one File's read, write, and error readiness.
-#[derive(Clone, Copy, Debug, Default)]
-pub struct FileFunctions {
-    pub read: Option<FileFunction>,
-    pub write: Option<FileFunction>,
-    pub error: Option<FileFunction>,
+fn duplicate_file_descriptor(file: &File) -> io::Result<OwnedFd> {
+    // SAFETY: `F_DUPFD_CLOEXEC` returns a fresh descriptor referencing the
+    // same socket; the registered descriptor stays FileMain-owned.
+    let duplicated = unsafe { libc::fcntl(file.fd(), libc::F_DUPFD_CLOEXEC, 0) };
+    if duplicated < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    // SAFETY: `duplicated` is a valid owned descriptor from fcntl.
+    Ok(unsafe { OwnedFd::from_raw_fd(duplicated) })
 }
 
 /// Outcome of one safe nonblocking socket operation on a FileMain-owned
@@ -54,142 +64,15 @@ pub enum FileIoStatus {
     Closed,
 }
 
-/// Readiness metadata, callback state, and ownership for one descriptor.
-pub struct File {
-    fd: OwnedFd,
-    description: String,
-    private_data: u64,
-    functions: FileFunctions,
-    write_enabled: bool,
-    read_events: u64,
-    write_events: u64,
-    error_events: u64,
-}
-
-impl File {
-    /// Creates one inactive-write File record.
-    ///
-    /// Read interest is derived from the read and error functions.
-    /// Write interest is enabled later through
-    /// [`FileMain::set_data_available_to_write`].
-    pub fn new(
-        fd: OwnedFd,
-        description: String,
-        private_data: u64,
-        functions: FileFunctions,
-    ) -> Self {
-        Self {
-            fd,
-            description,
-            private_data,
-            functions,
-            write_enabled: false,
-            read_events: 0,
-            write_events: 0,
-            error_events: 0,
-        }
-    }
-
-    #[inline]
-    /// Returns the registered descriptor without transferring ownership.
-    pub fn fd(&self) -> RawFd {
-        self.fd.as_raw_fd()
-    }
-
-    /// Duplicates the owned descriptor so a synchronous socket call never
-    /// races with the platform backend's poll registration or consumes its
-    /// readiness.
-    fn try_clone(&self) -> io::Result<OwnedFd> {
-        // SAFETY: `F_DUPFD_CLOEXEC` returns a fresh descriptor referencing
-        // the same socket; the registered descriptor stays FileMain-owned.
-        let duplicated = unsafe { libc::fcntl(self.fd(), libc::F_DUPFD_CLOEXEC, 0) };
-        if duplicated < 0 {
-            return Err(io::Error::last_os_error());
-        }
-        // SAFETY: `duplicated` is a valid owned descriptor from fcntl.
-        Ok(unsafe { OwnedFd::from_raw_fd(duplicated) })
-    }
-
-    #[inline]
-    /// Returns the operator-facing File description.
-    pub fn description(&self) -> &str {
-        &self.description
-    }
-
-    #[inline]
-    /// Returns callback-owned opaque data.
-    pub fn private_data(&self) -> u64 {
-        self.private_data
-    }
-
-    #[inline]
-    /// Replaces callback-owned opaque data.
-    pub fn set_private_data(&mut self, private_data: u64) {
-        self.private_data = private_data;
-    }
-
-    #[inline]
-    /// Returns the number of dispatched read callbacks.
-    pub fn read_events(&self) -> u64 {
-        self.read_events
-    }
-
-    #[inline]
-    /// Returns the number of dispatched write callbacks.
-    pub fn write_events(&self) -> u64 {
-        self.write_events
-    }
-
-    #[inline]
-    /// Returns the number of dispatched error callbacks.
-    pub fn error_events(&self) -> u64 {
-        self.error_events
-    }
-
-    #[inline]
-    fn poll_spec(&self, index: Index) -> PollSpec {
-        PollSpec {
-            index,
-            fd: self.fd(),
-            read: self.functions.read.is_some() || self.functions.error.is_some(),
-            write: self.write_enabled,
-        }
-    }
-
-    fn dispatch(&mut self, graph: &NodeRuntime, readiness: Readiness) -> RuntimeResult<usize> {
-        if readiness.contains(Readiness::ERROR)
-            && let Some(function) = self.functions.error
-        {
-            self.error_events += 1;
-            function(graph, self)?;
-            return Ok(1);
-        }
-
-        let mut dispatched = 0;
-        if readiness.contains(Readiness::READ)
-            && let Some(function) = self.functions.read
-        {
-            self.read_events += 1;
-            function(graph, self)?;
-            dispatched += 1;
-        }
-        if readiness.contains(Readiness::WRITE)
-            && self.write_enabled
-            && let Some(function) = self.functions.write
-        {
-            self.write_events += 1;
-            function(graph, self)?;
-            dispatched += 1;
-        }
-        Ok(dispatched)
-    }
-}
+/// Worker-local callback invoked when a registered deadline expires.
+pub type DeadlineFunction = fn(&NodeRuntime, &mut Deadline) -> RuntimeResult<()>;
 
 /// A worker-local deadline registration owned by [`FileMain`].
 pub struct Deadline {
     description: String,
     private_data: u64,
     function: DeadlineFunction,
+    polling_thread_index: u32,
     duration: Option<Duration>,
     expiry_events: u64,
 }
@@ -205,9 +88,20 @@ impl Deadline {
             description: description.into(),
             private_data,
             function,
+            polling_thread_index: 0,
             duration: None,
             expiry_events: 0,
         }
+    }
+
+    #[inline]
+    pub fn set_polling_thread_index(&mut self, thread_index: u32) {
+        self.polling_thread_index = thread_index;
+    }
+
+    #[inline]
+    pub fn polling_thread_index(&self) -> u32 {
+        self.polling_thread_index
     }
 
     #[inline]
@@ -243,42 +137,144 @@ impl fmt::Debug for Deadline {
     }
 }
 
-impl fmt::Debug for File {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter
-            .debug_struct("File")
-            .field("fd", &self.fd())
-            .field("description", &self.description)
-            .field("private_data", &self.private_data)
-            .field("write_enabled", &self.write_enabled)
-            .field("read_events", &self.read_events)
-            .field("write_events", &self.write_events)
-            .field("error_events", &self.error_events)
-            .finish()
-    }
+/// Generation-safe global File registry and readiness dispatcher.
+///
+/// The registry follows VPP's single `clib_file_main_t` lock and one
+/// `pending_free` owner queue. Pollers remain owned by their polling thread.
+pub struct FileMain {
+    pollers: Vec<UnsafeCell<Poller>>,
+    state: SpinLock<(
+        Pool<Box<File>>,
+        Pool<Box<Deadline>>,
+        Vec<Box<File>>,
+        Vec<Box<Deadline>>,
+    )>,
 }
 
-/// Generation-safe File registry and readiness dispatcher for one Data Worker.
-pub struct FileMain {
-    poller: Poller,
-    files: Pool<File>,
-    deadlines: Pool<Deadline>,
+// SAFETY: the state lock protects all pools and pending-free ownership. Each
+// poller is accessed only by the thread selected by polling_thread_index.
+unsafe impl Sync for FileMain {}
+
+pub static FILE_MAIN: OnceLock<FileMain> = OnceLock::new();
+
+#[init_function(name = "file_main_init")]
+pub fn init_file_main(engine: &mut Engine) -> RuntimeResult<()> {
+    if FILE_MAIN.get().is_none() {
+        let poller_count = engine.configured_worker_count().saturating_add(1);
+        let file_main = FileMain::with_worker_count(poller_count)?;
+        let _ = FILE_MAIN.set(file_main);
+    }
+    Ok(())
+}
+
+fn dispatch_file(
+    file: &mut File,
+    graph: &NodeRuntime,
+    readiness: Readiness,
+) -> RuntimeResult<usize> {
+    let functions = file.functions();
+    if readiness.contains(Readiness::ERROR)
+        && let Some(function) = functions.error
+    {
+        file.record_error_event();
+        function(graph, file)?;
+        return Ok(1);
+    }
+
+    let mut dispatched = 0;
+    if readiness.contains(Readiness::READ)
+        && let Some(function) = functions.read
+    {
+        file.record_read_event();
+        function(graph, file)?;
+        dispatched += 1;
+    }
+    if readiness.contains(Readiness::WRITE)
+        && file.write_enabled()
+        && let Some(function) = functions.write
+    {
+        file.record_write_event();
+        function(graph, file)?;
+        dispatched += 1;
+    }
+    Ok(dispatched)
 }
 
 impl FileMain {
-    /// Creates the platform poller and empty File registry for one Data Worker.
+    /// Creates a File registry with one main poller for standalone callers.
     pub fn new() -> RuntimeResult<Self> {
+        Self::with_worker_count(1)
+    }
+
+    pub(crate) fn with_worker_count(worker_count: usize) -> RuntimeResult<Self> {
+        let pollers = (0..worker_count)
+            .map(|_| Poller::new().map(UnsafeCell::new))
+            .collect::<RuntimeResult<Vec<_>>>()?;
         Ok(Self {
-            poller: Poller::new()?,
-            files: Pool::with_capacity(FILE_POOL_CAPACITY),
-            deadlines: Pool::with_capacity(FILE_POOL_CAPACITY),
+            pollers,
+            state: SpinLock::new((
+                Pool::with_capacity(FILE_POOL_CAPACITY),
+                Pool::with_capacity(FILE_POOL_CAPACITY),
+                Vec::new(),
+                Vec::new(),
+            )),
         })
     }
 
-    /// Descriptor that becomes readable when File readiness is pending, so an
-    /// idle main loop can sleep in the tokio reactor yet wake for I/O.
-    pub(crate) fn io_wake_fd(&self) -> RuntimeResult<OwnedFd> {
-        self.poller
+    fn poller_mut(&self, thread_index: u32) -> RuntimeResult<&mut Poller> {
+        let poller =
+            self.pollers
+                .get(thread_index as usize)
+                .ok_or_else(|| RuntimeError::Lifecycle {
+                    stage: "FileMain".to_owned(),
+                    message: format!("polling thread {thread_index} is not configured"),
+                })?;
+        // SAFETY: the caller owns the poller selected by the File's
+        // polling_thread_index and the lifecycle barrier excludes teardown.
+        Ok(unsafe { &mut *poller.get() })
+    }
+
+    fn state(
+        &self,
+    ) -> SpinLockGuard<
+        '_,
+        (
+            Pool<Box<File>>,
+            Pool<Box<Deadline>>,
+            Vec<Box<File>>,
+            Vec<Box<Deadline>>,
+        ),
+    > {
+        self.state.lock()
+    }
+
+    fn file_ptr(&self, index: Index) -> Option<*mut File> {
+        let state = self.state();
+        let file = state.0.get(index)?;
+        file.is_active()
+            .then(|| std::ptr::from_ref(file.as_ref()).cast_mut())
+    }
+
+    fn deadline_ptr(&self, index: Index) -> Option<*mut Deadline> {
+        let state = self.state();
+        state
+            .1
+            .get(index)
+            .map(|deadline| std::ptr::from_ref(deadline.as_ref()).cast_mut())
+    }
+
+    fn release_pending(&self, thread_index: u32) {
+        let mut state = self.state();
+        state
+            .2
+            .retain(|file| file.polling_thread_index() != thread_index);
+        state
+            .3
+            .retain(|deadline| deadline.polling_thread_index() != thread_index);
+    }
+
+    pub(crate) fn io_wake_fd_for_worker(&self, thread_index: u32) -> RuntimeResult<OwnedFd> {
+        self.poller_mut(thread_index)?
             .try_clone_wake()
             .map_err(|source| RuntimeError::FilePollerIo {
                 operation: "duplicate worker File wake descriptor",
@@ -286,22 +282,26 @@ impl FileMain {
             })
     }
 
-    /// Consumes the wake signal after an idle wake-up; the next [`Self::poll`]
-    /// collects the readiness that raised it.
-    pub(crate) fn clear_io_wake(&self) {
-        self.poller.clear_wake();
+    pub(crate) fn clear_io_wake_for_worker(&self, thread_index: u32) -> RuntimeResult<()> {
+        self.poller_mut(thread_index)?.clear_wake();
+        Ok(())
     }
 
     /// Registers a File and returns its existing `hammer-infra` Pool Index.
-    pub fn add(&mut self, file: File) -> RuntimeResult<Index> {
-        let index = self.files.insert(file).ok_or(RuntimeError::FilePoolFull)?;
+    pub fn add(&self, file: File) -> RuntimeResult<Index> {
+        let thread_index = file.polling_thread_index();
+        let index = {
+            let mut state = self.state();
+            state
+                .0
+                .insert(Box::new(file))
+                .ok_or(RuntimeError::FilePoolFull)?
+        };
         let spec = self
-            .files
-            .get(index)
-            .map(|file| file.poll_spec(index))
+            .poll_spec(index)
             .expect("newly inserted File must resolve");
-        if let Err(error) = self.poller.add(spec) {
-            self.files.remove(index);
+        if let Err(error) = self.poller_mut(thread_index)?.add(spec) {
+            self.state().0.remove(index);
             return Err(error);
         }
         Ok(index)
@@ -309,13 +309,17 @@ impl FileMain {
 
     /// Registers a disarmed worker deadline and returns its generation-safe
     /// `hammer-infra` Pool Index.
-    pub fn add_deadline(&mut self, deadline: Deadline) -> RuntimeResult<Index> {
-        let index = self
-            .deadlines
-            .insert(deadline)
-            .ok_or(RuntimeError::DeadlinePoolFull)?;
-        if let Err(error) = self.poller.add_deadline(index) {
-            self.deadlines.remove(index);
+    pub fn add_deadline(&self, deadline: Deadline) -> RuntimeResult<Index> {
+        let thread_index = deadline.polling_thread_index();
+        let index = {
+            let mut state = self.state();
+            state
+                .1
+                .insert(Box::new(deadline))
+                .ok_or(RuntimeError::DeadlinePoolFull)?
+        };
+        if let Err(error) = self.poller_mut(thread_index)?.add_deadline(index) {
+            self.state().1.remove(index);
             return Err(error);
         }
         Ok(index)
@@ -323,54 +327,85 @@ impl FileMain {
 
     /// Returns the currently armed duration, if the deadline is registered.
     pub fn deadline(&self, index: Index) -> RuntimeResult<Option<Duration>> {
-        self.deadlines
-            .get(index)
-            .map(|deadline| deadline.duration)
-            .ok_or(RuntimeError::DeadlineIndexInvalid { index })
+        let deadline = self
+            .deadline_ptr(index)
+            .ok_or(RuntimeError::DeadlineIndexInvalid { index })?;
+        Ok(unsafe { (*deadline).duration })
     }
 
     /// Arms or disarms a registered deadline.
-    pub fn set_deadline(&mut self, index: Index, duration: Option<Duration>) -> RuntimeResult<()> {
-        if self.deadlines.get(index).is_none() {
-            return Err(RuntimeError::DeadlineIndexInvalid { index });
-        }
-        let previous_duration = self
-            .deadlines
-            .get(index)
-            .map(|deadline| deadline.duration)
-            .expect("validated deadline remains registered");
-        if let Err(error) = self.poller.set_deadline(index, duration) {
-            if let Err(cleanup_error) = self.poller.set_deadline(index, previous_duration) {
+    pub fn set_deadline(&self, index: Index, duration: Option<Duration>) -> RuntimeResult<()> {
+        let deadline = self
+            .deadline_ptr(index)
+            .ok_or(RuntimeError::DeadlineIndexInvalid { index })?;
+        let (thread_index, previous_duration) =
+            unsafe { ((*deadline).polling_thread_index(), (*deadline).duration) };
+        let poller = self.poller_mut(thread_index)?;
+        if let Err(error) = poller.set_deadline(index, duration) {
+            if poller.set_deadline(index, previous_duration).is_err() {
                 tracing::error!(
-                    %cleanup_error,
                     ?index,
                     "failed to restore File deadline after update failed"
                 );
             }
             return Err(error);
         }
-        let deadline = self
-            .deadlines
+        let mut state = self.state();
+        let deadline = state
+            .1
             .get_mut(index)
-            .expect("validated deadline remains registered");
+            .ok_or(RuntimeError::DeadlineIndexInvalid { index })?;
         deadline.duration = duration;
         Ok(())
     }
 
     /// Removes a deadline after canceling its platform registration.
-    pub fn delete_deadline(&mut self, index: Index) -> RuntimeResult<bool> {
-        if self.deadlines.get(index).is_none() {
+    pub fn delete_deadline(&self, index: Index) -> RuntimeResult<bool> {
+        let Some(deadline) = self.deadline_ptr(index) else {
             return Ok(false);
-        }
-        self.poller.delete_deadline(index)?;
-        self.deadlines.remove(index);
+        };
+        let thread_index = unsafe { (*deadline).polling_thread_index() };
+        self.poller_mut(thread_index)?.delete_deadline(index)?;
+        let mut state = self.state();
+        let Some(deadline) = state.1.remove(index) else {
+            return Ok(false);
+        };
+        state.3.push(deadline);
         Ok(true)
     }
 
-    #[inline]
-    /// Looks up a live File, rejecting stale generations.
-    pub fn get(&self, index: Index) -> Option<&File> {
-        self.files.get(index)
+    /// Returns whether the generation-safe File index is currently registered.
+    pub fn is_registered(&self, index: Index) -> bool {
+        self.file_ptr(index).is_some()
+    }
+
+    /// Returns a registered File's description without exposing its record.
+    pub fn file_description(&self, index: Index) -> Option<String> {
+        let file = self.file_ptr(index)?;
+        Some(unsafe { (*file).description().to_owned() })
+    }
+
+    /// Returns a registered File's callback-owned private data.
+    pub fn file_private_data(&self, index: Index) -> Option<u64> {
+        let file = self.file_ptr(index)?;
+        Some(unsafe { (*file).private_data() })
+    }
+
+    /// Returns the read, write, and error callback counts for a registered File.
+    pub fn file_event_counts(&self, index: Index) -> Option<(u64, u64, u64)> {
+        let file = self.file_ptr(index)?;
+        Some(unsafe {
+            (
+                (*file).read_events(),
+                (*file).write_events(),
+                (*file).error_events(),
+            )
+        })
+    }
+
+    fn poll_spec(&self, index: Index) -> Option<PollSpec> {
+        let file = self.file_ptr(index)?;
+        Some(unsafe { PollSpec::new(index, &*file) })
     }
 
     /// Reads into vectors through the live File selected by its Index.
@@ -384,15 +419,15 @@ impl FileMain {
         vectors: &mut [libc::iovec],
     ) -> RuntimeResult<Option<usize>> {
         let file = self
-            .files
-            .get(index)
+            .file_ptr(index)
             .ok_or(RuntimeError::FileIndexInvalid { index })?;
+        let fd = unsafe { (*file).fd() };
         let count = libc::c_int::try_from(vectors.len())
             .expect("File iovec count is bounded by data-plane capacity");
         loop {
             // SAFETY: the caller upholds the iovec validity contract and File
             // owns the descriptor for the duration of this synchronous call.
-            let read = unsafe { libc::readv(file.fd(), vectors.as_ptr(), count) };
+            let read = unsafe { libc::readv(fd, vectors.as_ptr(), count) };
             if read >= 0 {
                 return Ok(Some(read as usize));
             }
@@ -400,7 +435,7 @@ impl FileMain {
             match source.kind() {
                 io::ErrorKind::Interrupted => continue,
                 io::ErrorKind::WouldBlock => return Ok(None),
-                _ => return Err(RuntimeError::FileRead { source }),
+                _ => return Err(RuntimeError::FileRead { source }.into()),
             }
         }
     }
@@ -416,15 +451,15 @@ impl FileMain {
         vectors: &[libc::iovec],
     ) -> RuntimeResult<Option<usize>> {
         let file = self
-            .files
-            .get(index)
+            .file_ptr(index)
             .ok_or(RuntimeError::FileIndexInvalid { index })?;
+        let fd = unsafe { (*file).fd() };
         let count = libc::c_int::try_from(vectors.len())
             .expect("File iovec count is bounded by data-plane capacity");
         loop {
             // SAFETY: the caller upholds the iovec validity contract and File
             // owns the descriptor for the duration of this synchronous call.
-            let written = unsafe { libc::writev(file.fd(), vectors.as_ptr(), count) };
+            let written = unsafe { libc::writev(fd, vectors.as_ptr(), count) };
             if written >= 0 {
                 return Ok(Some(written as usize));
             }
@@ -432,42 +467,63 @@ impl FileMain {
             match source.kind() {
                 io::ErrorKind::Interrupted => continue,
                 io::ErrorKind::WouldBlock => return Ok(None),
-                _ => return Err(RuntimeError::FileWrite { source }),
+                _ => return Err(RuntimeError::FileWrite { source }.into()),
             }
         }
     }
 
-    /// Removes backend interest before releasing the File record.
-    pub fn delete(&mut self, index: Index) -> RuntimeResult<bool> {
-        let Some(spec) = self.files.get(index).map(|file| file.poll_spec(index)) else {
+    /// Removes backend interest, closes the descriptor, and defers record free.
+    pub fn delete(&self, index: Index) -> RuntimeResult<bool> {
+        let file = {
+            let state = self.state();
+            let Some(file) = state.0.get(index) else {
+                return Ok(false);
+            };
+            if !file.is_active() {
+                return Ok(false);
+            }
+            std::ptr::from_ref(file.as_ref()).cast_mut()
+        };
+        let (thread_index, spec) =
+            unsafe { ((*file).polling_thread_index(), PollSpec::new(index, &*file)) };
+        self.poller_mut(thread_index)?.delete(spec)?;
+        let mut state = self.state();
+        let Some(mut file) = state.0.remove(index) else {
             return Ok(false);
         };
-        self.poller.delete(spec)?;
-        self.files.remove(index);
+        file.set_active(false);
+        file.close();
+        state.2.push(file);
         Ok(true)
     }
 
     /// Changes write interest without replacing the File Index.
     pub fn set_data_available_to_write(
-        &mut self,
+        &self,
         index: Index,
         available: bool,
     ) -> RuntimeResult<bool> {
-        let Some(file) = self.files.get(index) else {
-            return Err(RuntimeError::FileIndexInvalid { index });
+        let file = self
+            .file_ptr(index)
+            .ok_or(RuntimeError::FileIndexInvalid { index })?;
+        let (thread_index, previous, before) = unsafe {
+            (
+                (*file).polling_thread_index(),
+                (*file).write_enabled(),
+                PollSpec::new(index, &*file),
+            )
         };
-        let previous = file.write_enabled;
         if previous == available {
             return Ok(previous);
         }
-        let before = file.poll_spec(index);
         let mut after = before;
         after.write = available;
-        self.poller.modify(before, after)?;
-        let Some(file) = self.files.get_mut(index) else {
-            return Err(RuntimeError::FileIndexInvalid { index });
+        self.poller_mut(thread_index)?.modify(before, after)?;
+        let mut state = self.state();
+        let Some(file) = state.0.get_mut(index) else {
+            return Err(RuntimeError::FileIndexInvalid { index }.into());
         };
-        file.write_enabled = available;
+        file.set_write_enabled(available);
         Ok(previous)
     }
 
@@ -475,7 +531,7 @@ impl FileMain {
     /// `clib_file_main_add_socket`. Pending connections are pulled through
     /// [`Self::accept`].
     pub fn add_listener(
-        &mut self,
+        &self,
         listener: UnixListener,
         description: impl Into<String>,
         private_data: u64,
@@ -501,26 +557,25 @@ impl FileMain {
     /// registered with read interest. The listener registration is untouched:
     /// accept runs on a duplicated descriptor.
     pub fn accept(
-        &mut self,
+        &self,
         listener: Index,
         description: impl Into<String>,
         private_data: u64,
         functions: FileFunctions,
     ) -> RuntimeResult<Option<Index>> {
         let file = self
-            .files
-            .get(listener)
+            .file_ptr(listener)
             .ok_or(RuntimeError::FileIndexInvalid { index: listener })?;
-        let duplicated = file
-            .try_clone()
-            .map_err(|source| RuntimeError::FilePollerIo {
+        let duplicated = unsafe { duplicate_file_descriptor(&*file) }.map_err(|source| {
+            RuntimeError::FilePollerIo {
                 operation: "duplicate listener for accept",
                 source,
-            })?;
+            }
+        })?;
         let stream = match UnixListener::from(duplicated).accept() {
             Ok((stream, _)) => stream,
             Err(source) if source.kind() == io::ErrorKind::WouldBlock => return Ok(None),
-            Err(source) => return Err(RuntimeError::FileAccept { source }),
+            Err(source) => return Err(RuntimeError::FileAccept { source }.into()),
         };
         stream
             .set_nonblocking(true)
@@ -569,15 +624,14 @@ impl FileMain {
     /// readiness.
     pub fn read_some(&self, index: Index, buffer: &mut [u8]) -> RuntimeResult<FileIoStatus> {
         let file = self
-            .files
-            .get(index)
+            .file_ptr(index)
             .ok_or(RuntimeError::FileIndexInvalid { index })?;
-        let duplicated = file
-            .try_clone()
-            .map_err(|source| RuntimeError::FilePollerIo {
+        let duplicated = unsafe { duplicate_file_descriptor(&*file) }.map_err(|source| {
+            RuntimeError::FilePollerIo {
                 operation: "duplicate descriptor for read",
                 source,
-            })?;
+            }
+        })?;
         let mut stream = UnixStream::from(duplicated);
         match stream.read(buffer) {
             Ok(0) => Ok(FileIoStatus::Closed),
@@ -586,7 +640,7 @@ impl FileMain {
             Err(source) if source.kind() == io::ErrorKind::WouldBlock => {
                 Ok(FileIoStatus::WouldBlock)
             }
-            Err(source) => Err(RuntimeError::FileRead { source }),
+            Err(source) => Err(RuntimeError::FileRead { source }.into()),
         }
     }
 
@@ -595,15 +649,14 @@ impl FileMain {
     /// flush.
     pub fn write_some(&self, index: Index, buffer: &[u8]) -> RuntimeResult<FileIoStatus> {
         let file = self
-            .files
-            .get(index)
+            .file_ptr(index)
             .ok_or(RuntimeError::FileIndexInvalid { index })?;
-        let duplicated = file
-            .try_clone()
-            .map_err(|source| RuntimeError::FilePollerIo {
+        let duplicated = unsafe { duplicate_file_descriptor(&*file) }.map_err(|source| {
+            RuntimeError::FilePollerIo {
                 operation: "duplicate descriptor for write",
                 source,
-            })?;
+            }
+        })?;
         // A vanished client must surface as `Closed`, not kill the daemon
         // with SIGPIPE. Linux honors MSG_NOSIGNAL per send; macOS sets
         // SO_NOSIGPIPE once on the socket in [`Self::accept`] (per-write
@@ -632,50 +685,66 @@ impl FileMain {
         match source.kind() {
             _ if peer_closed(&source) => Ok(FileIoStatus::Closed),
             io::ErrorKind::WouldBlock => Ok(FileIoStatus::WouldBlock),
-            _ => Err(RuntimeError::FileWrite { source }),
+            _ => Err(RuntimeError::FileWrite { source }.into()),
         }
     }
 
-    /// Performs one nonblocking readiness poll and dispatches live callbacks.
-    pub fn poll(&mut self, graph: &NodeRuntime) -> RuntimeResult<usize> {
+    /// Performs one nonblocking readiness poll and dispatches main-thread callbacks.
+    pub fn poll(&self, graph: &NodeRuntime) -> RuntimeResult<usize> {
+        self.poll_for_worker(0, graph)
+    }
+
+    /// Performs one nonblocking readiness poll for the selected owner thread.
+    pub(crate) fn poll_for_worker(
+        &self,
+        thread_index: u32,
+        graph: &NodeRuntime,
+    ) -> RuntimeResult<usize> {
+        self.release_pending(thread_index);
         let mut events = [PollEvent::default(); POLL_BATCH_SIZE];
-        let count = self.poller.poll(&mut events)?;
+        let count = self.poller_mut(thread_index)?.poll(&mut events)?;
         let mut dispatched = 0;
         for event in &events[..count] {
             match event.target {
                 Some(PollTarget::File(index)) => {
-                    let Some(file) = self.files.get_mut(index) else {
+                    let Some(file) = self.file_ptr(index) else {
                         continue;
                     };
-                    if event.readiness.contains(Readiness::ERROR) && file.functions.error.is_none()
-                    {
+                    let remove = unsafe {
+                        if event.readiness.contains(Readiness::ERROR)
+                            && (*file).functions().error.is_none()
+                        {
+                            true
+                        } else {
+                            dispatched += dispatch_file(&mut *file, graph, event.readiness)?;
+                            false
+                        }
+                    };
+                    if remove {
                         self.delete(index)?;
                         continue;
                     }
-                    dispatched += file.dispatch(graph, event.readiness)?;
                     if event.rearm {
-                        let spec = self
-                            .files
-                            .get(index)
-                            .map(|file| file.poll_spec(index))
-                            .expect("callback dispatch cannot remove its File");
-                        self.poller.add(spec)?;
+                        let Some(spec) = self.poll_spec(index) else {
+                            continue;
+                        };
+                        self.poller_mut(thread_index)?.add(spec)?;
                     }
                 }
                 Some(PollTarget::Deadline(index)) => {
-                    if self.deadlines.get(index).is_none() {
+                    let Some(deadline) = self.deadline_ptr(index) else {
                         continue;
-                    }
-                    self.poller.consume_deadline(index)?;
-                    let deadline = self
-                        .deadlines
-                        .get_mut(index)
-                        .expect("validated deadline remains registered");
+                    };
+                    self.poller_mut(thread_index)?.consume_deadline(index)?;
+                    let deadline = unsafe { &mut *deadline };
                     deadline.expiry_events += 1;
-                    (deadline.function)(graph, deadline)?;
+                    let function = deadline.function;
+                    function(graph, deadline)?;
                     dispatched += 1;
                     if event.rearm {
-                        self.poller.rearm_deadline(index)?;
+                        if self.deadline_ptr(index).is_some() {
+                            self.poller_mut(thread_index)?.rearm_deadline(index)?;
+                        }
                     }
                 }
                 None => {}
@@ -683,16 +752,23 @@ impl FileMain {
         }
         Ok(dispatched)
     }
+}
 
-    /// Converts this FileMain into an owned [`AsyncFileMain`], the
-    /// control-plane counterpart of the data-worker FileMain path.
-    ///
-    /// Only the platform poller's duplicated wake descriptor is wrapped in a
-    /// Tokio `AsyncFd`; managed sockets remain FileMain-owned descriptors
-    /// registered exclusively with the platform backend. A current Tokio
-    /// runtime context is required; its absence fails rather than panics.
-    pub fn into_async(self) -> RuntimeResult<AsyncFileMain> {
-        let duplicate = self.io_wake_fd()?;
+/// Control-plane readiness adapter for the main shard in [`FILE_MAIN`].
+///
+/// The adapter owns only a duplicated wake descriptor. The global `FileMain`
+/// remains the sole owner of files, pollers, worker delivery, and reclamation.
+pub struct AsyncFileMain {
+    wake: AsyncFd<OwnedFd>,
+}
+
+impl AsyncFileMain {
+    /// Creates the Tokio adapter for the main-thread shard.
+    pub fn new() -> RuntimeResult<Self> {
+        let duplicate = FILE_MAIN
+            .get()
+            .expect("FileMain is initialized before runtime services start")
+            .io_wake_fd_for_worker(0)?;
         let handle = Handle::try_current().map_err(|source| RuntimeError::FilePollerIo {
             operation: "enter Tokio reactor for AsyncFileMain",
             source: io::Error::other(source),
@@ -704,34 +780,10 @@ impl FileMain {
                 source,
             }
         })?;
-        Ok(AsyncFileMain {
-            file_main: self,
-            wake,
-        })
+        Ok(Self { wake })
     }
-}
 
-/// Control-plane FileMain owned by one Tokio task.
-///
-/// `AsyncFileMain` is the single-owner control-plane counterpart to the
-/// data-worker FileMain path: it owns a plain [`FileMain`] and the Tokio
-/// `AsyncFd` created from only that FileMain's duplicated backend wake
-/// descriptor. Managed sockets remain FileMain-owned descriptors registered
-/// exclusively with the platform backend and are never dual-registered with
-/// Tokio. It is `!Sync` and therefore never registry-shared; one control
-/// ProcessNode owns it for its lifetime.
-pub struct AsyncFileMain {
-    file_main: FileMain,
-    wake: AsyncFd<OwnedFd>,
-}
-
-impl AsyncFileMain {
-    /// Awaits FileMain readiness and performs one nonblocking poll.
-    ///
-    /// Mirrors the data-worker wake order: the backend wake is cleared
-    /// before the reactor readiness is acknowledged, then
-    /// [`FileMain::poll`] dispatches live callbacks. Callback and poller
-    /// errors propagate to the awaiting control ProcessNode.
+    /// Awaits main-shard readiness and performs one nonblocking poll.
     pub async fn next_ready(&mut self, graph: &NodeRuntime) -> RuntimeResult<usize> {
         let mut guard =
             self.wake
@@ -741,19 +793,19 @@ impl AsyncFileMain {
                     operation: "await AsyncFileMain wake readiness",
                     source,
                 })?;
-        self.file_main.clear_io_wake();
+        let file_main = FILE_MAIN
+            .get()
+            .expect("FileMain is initialized before runtime services start");
+        file_main.clear_io_wake_for_worker(0)?;
         guard.clear_ready();
-        self.file_main.poll(graph)
+        file_main.poll_for_worker(0, graph)
     }
 
-    /// Returns the owned FileMain for descriptor registration and lookup.
-    pub fn file_main(&self) -> &FileMain {
-        &self.file_main
-    }
-
-    /// Returns the owned FileMain mutably for descriptor registration.
-    pub fn file_main_mut(&mut self) -> &mut FileMain {
-        &mut self.file_main
+    /// Returns the direct global FileMain registry.
+    pub fn file_main(&self) -> &'static FileMain {
+        FILE_MAIN
+            .get()
+            .expect("FileMain is initialized before runtime services start")
     }
 }
 
@@ -766,6 +818,19 @@ pub(super) struct PollSpec {
     pub(super) fd: RawFd,
     pub(super) read: bool,
     pub(super) write: bool,
+}
+
+impl PollSpec {
+    #[inline]
+    pub(super) fn new(index: Index, file: &File) -> Self {
+        let functions = file.functions();
+        Self {
+            index,
+            fd: file.fd(),
+            read: functions.read.is_some() || functions.error.is_some(),
+            write: file.write_enabled(),
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug)]

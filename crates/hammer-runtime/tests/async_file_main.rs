@@ -14,7 +14,10 @@ use std::thread::ThreadId;
 use std::time::Duration;
 
 use hammer_infra::pool::Index;
-use hammer_runtime::{File, FileFunctions, FileMain, NodeRuntime, RuntimeError, RuntimeResult};
+use hammer_runtime::{
+    AsyncFileMain, FILE_MAIN, File, FileFunctions, FileMain, NodeRuntime, RuntimeError,
+    RuntimeResult,
+};
 
 /// Thread that observed each readiness dispatch, and the drained byte count.
 static CALLBACK_TX: Mutex<Option<std::sync::mpsc::Sender<(ThreadId, u64)>>> = Mutex::new(None);
@@ -74,10 +77,14 @@ fn control_runtime() -> tokio::runtime::Runtime {
         .expect("control-plane Tokio runtime")
 }
 
+fn test_file_main() -> &'static FileMain {
+    FILE_MAIN.get_or_init(|| FileMain::new().expect("create global FileMain"))
+}
+
 /// Registers one readiness File on a socketpair and returns its Index and the
 /// write end, which the caller keeps alive for the whole test.
 fn register_readiness_file(
-    file_main: &mut FileMain,
+    file_main: &FileMain,
     description: &str,
     functions: FileFunctions,
 ) -> (Index, UnixStream) {
@@ -101,9 +108,9 @@ fn next_ready_dispatches_registered_files_on_the_tokio_main_thread() {
     let (tx, rx) = std::sync::mpsc::channel();
     *CALLBACK_TX.lock().expect("callback transmitter") = Some(tx);
 
-    let mut file_main = FileMain::new().expect("create FileMain");
+    let file_main = test_file_main();
     let (index, mut write_end) = register_readiness_file(
-        &mut file_main,
+        file_main,
         "AsyncFileMain readiness test",
         FileFunctions {
             read: Some(report_callback),
@@ -117,9 +124,7 @@ fn next_ready_dispatches_registered_files_on_the_tokio_main_thread() {
     // and deletes without dispatch.
     let runtime = control_runtime();
     let (async_file_main, dispatched) = runtime.block_on(async move {
-        let mut async_file_main = file_main
-            .into_async()
-            .expect("convert FileMain into AsyncFileMain");
+        let mut async_file_main = AsyncFileMain::new().expect("create AsyncFileMain");
         let dispatched = async_file_main
             .next_ready(&NodeRuntime::default())
             .await
@@ -137,12 +142,8 @@ fn next_ready_dispatches_registered_files_on_the_tokio_main_thread() {
     );
     assert_eq!(drained, 1, "readiness byte was drained by the callback");
     assert_eq!(
-        async_file_main
-            .file_main()
-            .get(index)
-            .expect("registered File")
-            .read_events(),
-        1,
+        async_file_main.file_main().file_event_counts(index),
+        Some((1, 0, 0)),
         "File read callback dispatched exactly once"
     );
 }
@@ -150,9 +151,9 @@ fn next_ready_dispatches_registered_files_on_the_tokio_main_thread() {
 #[test]
 fn next_ready_dispatches_repeated_wakes_without_reregistration() {
     let _serial = TEST_SERIAL.lock().expect("serialize runtime tests");
-    let mut file_main = FileMain::new().expect("create FileMain");
+    let file_main = test_file_main();
     let (_index, mut write_end) = register_readiness_file(
-        &mut file_main,
+        file_main,
         "repeated AsyncFileMain readiness test",
         FileFunctions {
             read: Some(report_callback),
@@ -165,9 +166,7 @@ fn next_ready_dispatches_repeated_wakes_without_reregistration() {
 
     let runtime = control_runtime();
     let dispatched = runtime.block_on(async move {
-        let mut async_file_main = file_main
-            .into_async()
-            .expect("convert FileMain into AsyncFileMain");
+        let mut async_file_main = AsyncFileMain::new().expect("create AsyncFileMain");
         let first = async_file_main
             .next_ready(&NodeRuntime::default())
             .await
@@ -192,9 +191,9 @@ fn next_ready_dispatches_repeated_wakes_without_reregistration() {
 #[test]
 fn next_ready_propagates_callback_errors() {
     let _serial = TEST_SERIAL.lock().expect("serialize runtime tests");
-    let mut file_main = FileMain::new().expect("create FileMain");
+    let file_main = test_file_main();
     let (_index, mut write_end) = register_readiness_file(
-        &mut file_main,
+        file_main,
         "failing AsyncFileMain readiness test",
         FileFunctions {
             read: Some(failing_callback),
@@ -205,9 +204,7 @@ fn next_ready_propagates_callback_errors() {
 
     let runtime = control_runtime();
     let error = runtime.block_on(async move {
-        let mut async_file_main = file_main
-            .into_async()
-            .expect("convert FileMain into AsyncFileMain");
+        let mut async_file_main = AsyncFileMain::new().expect("create AsyncFileMain");
         async_file_main.next_ready(&NodeRuntime::default()).await
     });
 
@@ -222,13 +219,13 @@ fn next_ready_propagates_callback_errors() {
 }
 
 #[test]
-fn into_async_fails_outside_a_tokio_context() {
+fn async_file_main_requires_tokio_context() {
     let _serial = TEST_SERIAL.lock().expect("serialize runtime tests");
-    let mut file_main = FileMain::new().expect("create FileMain");
-    // No Tokio runtime context on this test thread: conversion must fail
-    // rather than panic, so a control ProcessNode can surface the error.
+    let _ = test_file_main();
+    // No Tokio runtime context on this test thread: adapter construction must
+    // return an error rather than panic.
     assert!(
-        file_main.into_async().is_err(),
-        "into_async outside a Tokio runtime returns an error"
+        AsyncFileMain::new().is_err(),
+        "AsyncFileMain requires a Tokio runtime"
     );
 }

@@ -1,36 +1,222 @@
 use std::fmt;
 use std::io;
+use std::os::fd::{AsFd, AsRawFd, FromRawFd, IntoRawFd, OwnedFd, RawFd};
+use std::path::{Path, PathBuf};
+use std::sync::OnceLock;
 
 use hammer_infra::segment::SegmentAllocationError;
+use socket2::{Domain, SockAddr, Socket, Type};
 
 mod metric;
 mod protocol;
 mod segment;
+#[path = "stats_segment_socket.rs"]
+mod stats_segment_socket_source;
 
-use segment::StatsSegment;
-use protocol::{DirectoryIndex, DirectoryType, NameBytes};
+pub use stats_segment_socket_source::stats_segment_socket;
 
 pub use metric::{
-    CombinedCounter, Gauge, Histogram, NameVector, Ring, RingSchema, SimpleCounter, Timestamp,
+    CombinedCounter, Gauge, Histogram, MetricValue, NameVector, Ring, RingSchema, SimpleCounter,
+    Timestamp,
 };
-pub use protocol::{Counter, RingConfig};
+pub use protocol::{
+    Counter, DirectoryDataPointer, DirectoryEntry, DirectoryType, Gauge as GaugeValue,
+    RingBufferHeader, RingConfig, ScalarBits, SharedHeader, StringVectorPointer, ring_layout,
+    vec_len, vector_element_offset,
+};
+use protocol::{DirectoryIndex, NameBytes};
+use segment::StatsSegment;
 
 pub struct StatsMain {
     segment: StatsSegment,
+    socket_path: PathBuf,
 }
 
+static STATS_MAIN: OnceLock<StatsMain> = OnceLock::new();
+const STATS_SOCKET_BACKLOG: i32 = 5;
+
 // SAFETY: StatsSegmentState contains mapped raw pointers, but every access to
-// the directory and payload ownership is serialized by its SpinLock. Public
-// StatsMain operations never expose those pointers and teardown requires the
-// last segment owner, so sharing the owner through RuntimeRegistry preserves
-// the mapping and publication invariants.
+// the directory and payload ownership is serialized by its SpinLock. StatsMain
+// never exposes mapped pointers.
 unsafe impl Send for StatsMain {}
 unsafe impl Sync for StatsMain {}
 
 impl StatsMain {
-    pub fn create(name: &str, size: usize) -> StatsResult<Self> {
+    pub fn init(name: &str, size: usize, socket_path: &Path) -> StatsResult<OwnedFd> {
+        if STATS_MAIN.get().is_some() {
+            return Err(StatsError::AlreadyInitialized);
+        }
+        if socket_path.as_os_str().is_empty() {
+            return Err(StatsError::InvalidSocketPath);
+        }
+        let socket_path = socket_path.to_owned();
+        let segment = StatsSegment::create(name, size)?;
+        if let Err(source) = std::fs::remove_file(&socket_path)
+            && source.kind() != io::ErrorKind::NotFound
+        {
+            return Err(StatsError::Io(source));
+        }
+        #[cfg(target_os = "linux")]
+        let socket = Socket::new(Domain::UNIX, Type::SEQPACKET, None);
+        #[cfg(not(target_os = "linux"))]
+        let socket = Socket::new(Domain::UNIX, Type::STREAM, None);
+        let socket = socket.map_err(StatsError::Io)?;
+        socket.set_nonblocking(true).map_err(StatsError::Io)?;
+        socket.set_cloexec(true).map_err(StatsError::Io)?;
+        let address = SockAddr::unix(&socket_path).map_err(StatsError::Io)?;
+        #[cfg(target_os = "linux")]
+        {
+            let enabled: libc::c_int = 1;
+            // SAFETY: `socket` is a live Unix socket and `enabled` points to a
+            // valid integer for the duration of this setsockopt call.
+            let result = unsafe {
+                libc::setsockopt(
+                    socket.as_raw_fd(),
+                    libc::SOL_SOCKET,
+                    libc::SO_PASSCRED,
+                    std::ptr::from_ref(&enabled).cast(),
+                    std::mem::size_of_val(&enabled) as libc::socklen_t,
+                )
+            };
+            if result < 0 {
+                return Err(StatsError::Io(io::Error::last_os_error()));
+            }
+        }
+        // Match VPP's allow-group-write bind: preserve the process umask while
+        // preventing other-write during creation so the group-write bit remains.
+        #[cfg(unix)]
+        let previous_umask = unsafe { libc::umask(libc::S_IWOTH) };
+        let bind_result = socket.bind(&address).map_err(StatsError::Io);
+        #[cfg(unix)]
+        {
+            // SAFETY: restore the exact value returned by the preceding umask.
+            unsafe { libc::umask(previous_umask) };
+        }
+        bind_result?;
+        if let Err(error) = socket.listen(STATS_SOCKET_BACKLOG).map_err(StatsError::Io) {
+            drop(socket);
+            if let Err(source) = std::fs::remove_file(&socket_path)
+                && source.kind() != io::ErrorKind::NotFound
+            {
+                return Err(StatsError::Io(source));
+            }
+            return Err(error);
+        }
+        let raw_listener = socket.into_raw_fd();
+        // SAFETY: `raw_listener` is transferred from `socket` and is not used
+        // again after ownership moves into `OwnedFd`.
+        let listener = unsafe { OwnedFd::from_raw_fd(raw_listener) };
+        let cleanup_path = socket_path.clone();
+        if STATS_MAIN
+            .set(Self {
+                segment,
+                socket_path,
+            })
+            .is_err()
+        {
+            drop(listener);
+            if let Err(source) = std::fs::remove_file(cleanup_path)
+                && source.kind() != io::ErrorKind::NotFound
+            {
+                return Err(StatsError::Io(source));
+            }
+            return Err(StatsError::AlreadyInitialized);
+        }
+        Ok(listener)
+    }
+
+    pub fn global() -> StatsResult<&'static Self> {
+        STATS_MAIN.get().ok_or(StatsError::NotInitialized)
+    }
+
+    pub fn unlink_socket_path(&self) -> StatsResult<()> {
+        match std::fs::remove_file(&self.socket_path) {
+            Ok(()) => Ok(()),
+            Err(source) if source.kind() == io::ErrorKind::NotFound => Ok(()),
+            Err(source) => Err(StatsError::Io(source)),
+        }
+    }
+
+    pub fn accept(&self, listener_fd: RawFd) -> StatsResult<()> {
+        let accepted = loop {
+            #[cfg(target_os = "linux")]
+            let raw_fd = unsafe {
+                libc::accept4(
+                    listener_fd,
+                    std::ptr::null_mut(),
+                    std::ptr::null_mut(),
+                    libc::SOCK_NONBLOCK | libc::SOCK_CLOEXEC,
+                )
+            };
+            #[cfg(not(target_os = "linux"))]
+            let raw_fd =
+                unsafe { libc::accept(listener_fd, std::ptr::null_mut(), std::ptr::null_mut()) };
+            if raw_fd >= 0 {
+                #[cfg(not(target_os = "linux"))]
+                {
+                    let flags = unsafe { libc::fcntl(raw_fd, libc::F_GETFL) };
+                    if flags < 0
+                        || unsafe { libc::fcntl(raw_fd, libc::F_SETFL, flags | libc::O_NONBLOCK) }
+                            < 0
+                        || unsafe { libc::fcntl(raw_fd, libc::F_SETFD, libc::FD_CLOEXEC) } < 0
+                    {
+                        // SAFETY: `raw_fd` is the descriptor returned by accept.
+                        unsafe { libc::close(raw_fd) };
+                        return Err(StatsError::Io(io::Error::last_os_error()));
+                    }
+                }
+                // SAFETY: `raw_fd` is a newly accepted descriptor.
+                break unsafe { OwnedFd::from_raw_fd(raw_fd) };
+            }
+            let source = io::Error::last_os_error();
+            match source.kind() {
+                io::ErrorKind::Interrupted => continue,
+                io::ErrorKind::WouldBlock => return Ok(()),
+                _ => return Err(StatsError::Io(source)),
+            }
+        };
+        #[cfg(target_os = "macos")]
+        {
+            let one: libc::c_int = 1;
+            // SAFETY: `accepted` is a live Unix socket owned for this call.
+            let result = unsafe {
+                libc::setsockopt(
+                    accepted.as_raw_fd(),
+                    libc::SOL_SOCKET,
+                    libc::SO_NOSIGPIPE,
+                    std::ptr::from_ref(&one).cast(),
+                    std::mem::size_of_val(&one) as libc::socklen_t,
+                )
+            };
+            if result < 0 {
+                let source = io::Error::last_os_error();
+                if source.kind() == io::ErrorKind::InvalidInput {
+                    return Ok(());
+                }
+                return Err(StatsError::Io(source));
+            }
+        }
+        match self.segment.send_to(accepted.as_fd()) {
+            Err(StatsError::Io(source))
+                if matches!(
+                    source.kind(),
+                    io::ErrorKind::BrokenPipe
+                        | io::ErrorKind::ConnectionReset
+                        | io::ErrorKind::ConnectionAborted
+                        | io::ErrorKind::NotConnected
+                ) =>
+            {
+                Ok(())
+            }
+            result => result,
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn create(name: &str, size: usize) -> StatsResult<Self> {
         Ok(Self {
             segment: StatsSegment::create(name, size)?,
+            socket_path: PathBuf::from("/dev/null"),
         })
     }
 
@@ -81,8 +267,7 @@ impl StatsMain {
         column: u32,
         value: Counter,
     ) -> StatsResult<()> {
-        self.segment
-            .add_combined_counter(index, row, column, value)
+        self.segment.add_combined_counter(index, row, column, value)
     }
 
     pub(crate) fn write_histogram(
@@ -141,23 +326,59 @@ pub enum StatsError {
     Protocol,
     Io(io::Error),
     Allocation(SegmentAllocationError),
-    CapacityTooSmall { requested: usize, minimum: usize },
+    CapacityTooSmall {
+        requested: usize,
+        minimum: usize,
+    },
     InvalidLayout,
     CollectionCapacity,
     DuplicateName,
-    MetricNotFound { name: String },
+    MetricNotFound {
+        name: String,
+    },
     MetricTypeMismatch {
         expected: &'static str,
         actual: &'static str,
     },
     MetricUnbound,
-    DirectoryIndexOutOfBounds { index: u32, length: usize },
-    DirectoryEntryUnavailable { index: u32 },
+    DirectoryIndexOutOfBounds {
+        index: u32,
+        length: usize,
+    },
+    DirectoryEntryUnavailable {
+        index: u32,
+    },
     Teardown,
     WorkerNotQuiescent,
     InvalidShape,
-    InvalidRingSchema { expected: usize, actual: usize },
+    InvalidRingSchema {
+        expected: usize,
+        actual: usize,
+    },
     PublicationFailed,
+    InvalidSocketPath,
+    AlreadyInitialized,
+    NotInitialized,
+    ClientConnect {
+        path: PathBuf,
+        source: io::Error,
+    },
+    ClientReceive {
+        source: io::Error,
+    },
+    ClientAncillaryData {
+        received_fds: usize,
+        malformed: bool,
+    },
+    ClientFstat {
+        source: io::Error,
+    },
+    ClientMapping {
+        source: io::Error,
+    },
+    ClientRetryExhausted {
+        operation: &'static str,
+    },
 }
 
 impl fmt::Display for StatsError {
@@ -182,7 +403,9 @@ impl fmt::Display for StatsError {
                 formatter,
                 "stats metric has type `{actual}`, expected `{expected}`"
             ),
-            Self::MetricUnbound => formatter.write_str("stats metric is not bound to a directory entry"),
+            Self::MetricUnbound => {
+                formatter.write_str("stats metric is not bound to a directory entry")
+            }
             Self::DirectoryIndexOutOfBounds { index, length } => write!(
                 formatter,
                 "stats directory index {index} is outside length {length}"
@@ -198,6 +421,36 @@ impl fmt::Display for StatsError {
                 "invalid stats ring schema: expected {expected} bytes, got {actual} bytes"
             ),
             Self::PublicationFailed => formatter.write_str("stats publication failed"),
+            Self::InvalidSocketPath => formatter.write_str("stats socket path is required"),
+            Self::AlreadyInitialized => formatter.write_str("stats main is already initialized"),
+            Self::NotInitialized => formatter.write_str("stats main is not initialized"),
+            Self::ClientConnect { path, source } => {
+                write!(
+                    formatter,
+                    "connect to stats socket `{}`: {source}",
+                    path.display()
+                )
+            }
+            Self::ClientReceive { source } => {
+                write!(formatter, "receive stats segment fd: {source}")
+            }
+            Self::ClientAncillaryData {
+                received_fds,
+                malformed,
+            } => write!(
+                formatter,
+                "invalid stats ancillary data: received {received_fds} fd(s), malformed={malformed}"
+            ),
+            Self::ClientFstat { source } => write!(formatter, "stat stats segment fd: {source}"),
+            Self::ClientMapping { source } => {
+                write!(formatter, "map stats segment read-only: {source}")
+            }
+            Self::ClientRetryExhausted { operation } => {
+                write!(
+                    formatter,
+                    "stats client retry limit exhausted during {operation}"
+                )
+            }
         }
     }
 }
@@ -283,5 +536,4 @@ mod tests {
         ));
         Ok(())
     }
-
 }

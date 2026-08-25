@@ -1,7 +1,9 @@
 use std::alloc::Layout;
 use std::collections::HashMap;
 use std::ffi::c_void;
+use std::io;
 use std::mem::{align_of, replace, size_of};
+use std::os::fd::{AsRawFd, BorrowedFd};
 use std::ptr;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -429,7 +431,9 @@ fn counter_cell<T>(
             actual: actual.into(),
         });
     }
-    let outer = DirectoryDataPointer::try_from(&entry)?.as_ptr().cast::<u8>();
+    let outer = DirectoryDataPointer::try_from(&entry)?
+        .as_ptr()
+        .cast::<u8>();
     if outer.is_null() {
         return Err(StatsError::InvalidShape);
     }
@@ -516,11 +520,69 @@ impl StatsSegment {
         })
     }
 
-    pub(crate) fn shared_fd(&self) -> Option<std::os::fd::RawFd> {
+    pub(crate) fn send_to(&self, socket: BorrowedFd<'_>) -> StatsResult<()> {
         let state = self.state.lock();
-        (!state.tearing_down)
-            .then(|| state.mapping.shared_fd())
-            .flatten()
+        let segment_fd = state.mapping.shared_fd().ok_or(StatsError::Teardown)?;
+        let control_size = unsafe { libc::CMSG_SPACE(size_of::<i32>() as u32) as usize };
+        let mut control = vec![0_u8; control_size];
+        #[cfg(not(target_os = "linux"))]
+        let handoff = [1_u8];
+        #[cfg(not(target_os = "linux"))]
+        let mut iovec = libc::iovec {
+            iov_base: handoff.as_ptr().cast_mut().cast(),
+            iov_len: handoff.len(),
+        };
+        #[cfg(target_os = "linux")]
+        let (iov_base, iov_len) = (std::ptr::null_mut(), 0);
+        #[cfg(not(target_os = "linux"))]
+        let (iov_base, iov_len) = (&mut iovec as *mut libc::iovec, 1);
+        let message = libc::msghdr {
+            msg_name: std::ptr::null_mut(),
+            msg_namelen: 0,
+            msg_iov: iov_base,
+            msg_iovlen: iov_len,
+            msg_control: control.as_mut_ptr().cast(),
+            msg_controllen: control.len().try_into().map_err(|_| StatsError::Protocol)?,
+            msg_flags: 0,
+        };
+        // SAFETY: `message` points at the live control buffer and the segment
+        // descriptor remains valid while the state lock is held.
+        unsafe {
+            let control_message = libc::CMSG_FIRSTHDR(&message);
+            if control_message.is_null() {
+                return Err(StatsError::Protocol);
+            }
+            (*control_message).cmsg_level = libc::SOL_SOCKET;
+            (*control_message).cmsg_type = libc::SCM_RIGHTS;
+            (*control_message).cmsg_len = libc::CMSG_LEN(size_of::<i32>() as u32) as _;
+            std::ptr::write_unaligned(libc::CMSG_DATA(control_message).cast::<i32>(), segment_fd);
+        }
+        #[cfg(target_os = "linux")]
+        let flags = libc::MSG_NOSIGNAL;
+        #[cfg(not(target_os = "linux"))]
+        let flags = 0;
+        loop {
+            // SAFETY: `message` and its buffers remain live for this call; the
+            // borrowed socket and segment descriptor are both valid.
+            let sent = unsafe { libc::sendmsg(socket.as_raw_fd(), &message, flags) };
+            #[cfg(not(target_os = "linux"))]
+            if sent == 1 {
+                return Ok(());
+            }
+            #[cfg(target_os = "linux")]
+            if sent >= 0 {
+                return Ok(());
+            }
+            #[cfg(not(target_os = "linux"))]
+            if sent >= 0 {
+                return Err(StatsError::Protocol);
+            }
+            let source = io::Error::last_os_error();
+            if source.kind() == io::ErrorKind::Interrupted {
+                continue;
+            }
+            return Err(StatsError::Io(source));
+        }
     }
 
     pub(crate) fn directory_vector_len(&self) -> usize {
@@ -564,11 +626,7 @@ impl StatsSegment {
         Ok(index)
     }
 
-    pub(super) fn store_timestamp(
-        &self,
-        index: DirectoryIndex,
-        value: u64,
-    ) -> StatsResult<()> {
+    pub(super) fn store_timestamp(&self, index: DirectoryIndex, value: u64) -> StatsResult<()> {
         let mut state = self.state.lock();
         let (private_entry, published_entry) =
             directory_entries_for_write(&mut state, index, DirectoryType::ScalarIndex)?;
@@ -653,13 +711,7 @@ impl StatsSegment {
         value: u64,
     ) -> StatsResult<()> {
         let state = self.state.lock();
-        let cell = counter_cell::<u64>(
-            &state,
-            index,
-            row,
-            bucket,
-            DirectoryType::HistogramLog2,
-        )?;
+        let cell = counter_cell::<u64>(&state, index, row, bucket, DirectoryType::HistogramLog2)?;
         // SAFETY: counter_cell validated the family, row, and column, and the
         // state lock prevents payload publication or growth while this pointer is used.
         unsafe {
@@ -1053,7 +1105,7 @@ impl StatsSegment {
             });
         };
         *slot = DirectoryEntry::new(
-            entry.kind(),
+            entry.kind().into(),
             entry.name_bytes()?,
             DirectoryData::from(DirectoryDataPointer::from(new_outer_data.cast::<c_void>())),
         );
@@ -1175,7 +1227,47 @@ mod tests {
         let segment = create_segment("st-fixed");
 
         assert_eq!(segment.directory_vector_len(), 0);
-        assert!(segment.shared_fd().is_some());
+        assert!(segment.state.lock().mapping.size() > 0);
+    }
+
+    #[test]
+    fn send_to_reports_peer_disconnect_without_sigpipe() -> StatsResult<()> {
+        use std::os::fd::{AsFd, FromRawFd, OwnedFd};
+
+        let mut sockets = [0; 2];
+        // SAFETY: `sockets` points to writable storage for two descriptors.
+        let result =
+            unsafe { libc::socketpair(libc::AF_UNIX, libc::SOCK_STREAM, 0, sockets.as_mut_ptr()) };
+        if result < 0 {
+            return Err(StatsError::Io(std::io::Error::last_os_error()));
+        }
+        // SAFETY: `socketpair` initialized both descriptors on success.
+        let sender = unsafe { OwnedFd::from_raw_fd(sockets[0]) };
+        // SAFETY: `socketpair` initialized both descriptors on success.
+        let peer = unsafe { OwnedFd::from_raw_fd(sockets[1]) };
+        #[cfg(target_os = "macos")]
+        {
+            let one: libc::c_int = 1;
+            // SAFETY: `sender` is a live Unix socket for this test.
+            let result = unsafe {
+                libc::setsockopt(
+                    sender.as_raw_fd(),
+                    libc::SOL_SOCKET,
+                    libc::SO_NOSIGPIPE,
+                    std::ptr::from_ref(&one).cast(),
+                    std::mem::size_of_val(&one) as libc::socklen_t,
+                )
+            };
+            if result < 0 {
+                return Err(StatsError::Io(std::io::Error::last_os_error()));
+            }
+        }
+        drop(peer);
+
+        let segment = create_segment("st-peer-disconnect");
+        let result = segment.send_to(sender.as_fd());
+        assert!(matches!(result, Err(StatsError::Io(_))));
+        Ok(())
     }
 
     #[test]
@@ -1209,11 +1301,7 @@ mod tests {
     #[test]
     fn sys_scalar_metrics_keep_vpp_positions_zero_one_two() -> StatsResult<()> {
         let stats = crate::StatsMain::create("st-sys-order", 2 * 1024 * 1024)?;
-        for path in [
-            "/sys/heartbeat",
-            "/sys/last_stats_clear",
-            "/sys/boottime",
-        ] {
+        for path in ["/sys/heartbeat", "/sys/last_stats_clear", "/sys/boottime"] {
             stats.add_timestamp(crate::Timestamp::new(path))?;
         }
 
@@ -1234,10 +1322,16 @@ mod tests {
         .enumerate()
         {
             assert_eq!(
-                state.directory_vector[index].name_bytes()?.as_c_str()?.to_bytes(),
+                state.directory_vector[index]
+                    .name_bytes()?
+                    .as_c_str()?
+                    .to_bytes(),
                 path.as_bytes()
             );
-            assert_eq!(u64::from(ScalarBits::try_from(&state.directory_vector[index])?), value);
+            assert_eq!(
+                u64::from(ScalarBits::try_from(&state.directory_vector[index])?),
+                value
+            );
         }
         Ok(())
     }
@@ -1279,13 +1373,27 @@ mod tests {
 
         let traffic = crate::CombinedCounter::bind(&stats, "/workers/traffic")?;
         traffic.validate(&stats, 0, 1)?;
-        traffic.add(&stats, 0, 1, Counter { packets: 3, bytes: 5 })?;
+        traffic.add(
+            &stats,
+            0,
+            1,
+            Counter {
+                packets: 3,
+                bytes: 5,
+            },
+        )?;
 
         let state = stats.segment.state.lock();
         let outer = DirectoryDataPointer::try_from(&state.directory_vector[0])?.as_ptr();
         let inner = unsafe { ptr::read(state.vector_element::<*mut u8>(outer.cast(), 0)?) };
         let value = state.vector_element::<Counter>(inner, 1)?;
-        assert_eq!(unsafe { ptr::read(value) }, Counter { packets: 3, bytes: 5 });
+        assert_eq!(
+            unsafe { ptr::read(value) },
+            Counter {
+                packets: 3,
+                bytes: 5
+            }
+        );
         Ok(())
     }
 
@@ -1309,7 +1417,7 @@ mod tests {
     #[test]
     fn created_segment_exposes_shared_mapping_and_empty_directory() -> StatsResult<()> {
         let segment = StatsSegment::create("st-owner", 2 * 1024 * 1024)?;
-        assert!(segment.shared_fd().is_some());
+        assert!(segment.state.lock().mapping.size() > 0);
         assert_eq!(segment.directory_vector_len(), 0);
         Ok(())
     }
@@ -1317,12 +1425,10 @@ mod tests {
     #[test]
     fn registration_remove_and_reuse_start_at_zero() -> StatsResult<()> {
         let segment = create_segment("st-registration");
-        let _target = segment.register::<layout::Scalar<ProtocolGauge>>(
-            MetricGauge::new("/target").try_into()?,
-        )?;
-        segment.register::<layout::Scalar<ProtocolGauge>>(
-            MetricGauge::new("/second").try_into()?,
-        )?;
+        let _target = segment
+            .register::<layout::Scalar<ProtocolGauge>>(MetricGauge::new("/target").try_into()?)?;
+        segment
+            .register::<layout::Scalar<ProtocolGauge>>(MetricGauge::new("/second").try_into()?)?;
         assert_eq!(segment.directory_vector_len(), 2);
 
         segment.remove(DirectoryIndex::new(1))?;
@@ -1353,9 +1459,8 @@ mod tests {
     #[test]
     fn validation_preserves_retained_rows_during_mixed_growth() -> StatsResult<()> {
         let segment = create_segment("st-mixed-growth");
-        segment.register::<layout::Simple<Counter>>(
-            SimpleCounter::new("/mixed/simple").try_into()?,
-        )?;
+        segment
+            .register::<layout::Simple<Counter>>(SimpleCounter::new("/mixed/simple").try_into()?)?;
 
         segment.validate(DirectoryIndex::new(0), 0, 2)?;
         segment.validate(DirectoryIndex::new(0), 1, 2)?;
@@ -1444,7 +1549,7 @@ mod tests {
         let mut segment = create_segment("st-teardown");
         segment.teardown()?;
         assert_eq!(segment.directory_vector_len(), 0);
-        assert!(segment.shared_fd().is_none());
+        assert!(segment.state.lock().mapping.size() > 0);
         assert!(matches!(
             segment.remove(DirectoryIndex::new(2)),
             Err(StatsError::Teardown)

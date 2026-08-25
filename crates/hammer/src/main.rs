@@ -166,7 +166,13 @@ fn run(config: String, roots: Vec<String>, worker: Worker) {
         eprintln!("Failed to construct configured runtime: {error}");
         std::process::exit(1);
     });
-    let mut pool = match EnginePool::new(engine) {
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_io()
+        .enable_time()
+        .build()
+        .expect("build tokio runtime");
+
+    let mut pool = match EnginePool::new(engine, &rt) {
         Ok(pool) => pool,
         Err(error) => {
             eprintln!("Failed to construct stats-enabled runtime: {error}");
@@ -174,19 +180,14 @@ fn run(config: String, roots: Vec<String>, worker: Worker) {
         }
     };
 
-    let rt = tokio::runtime::Builder::new_current_thread()
-        .enable_io()
-        .enable_time()
-        .build()
-        .expect("build tokio runtime");
-
     pool.main_engine_mut()
         .plugin_main_mut()
         .register_builtin_image(hammer_service::registration_image());
-    pool.main_loop_enter(&roots, &config).unwrap_or_else(|e| {
-        eprintln!("main_loop_enter failed: {e}");
-        std::process::exit(1);
-    });
+    pool.main_loop_enter(&roots, &config, &rt)
+        .unwrap_or_else(|e| {
+            eprintln!("main_loop_enter failed: {e}");
+            std::process::exit(1);
+        });
     drop(config);
 
     let attach_server = registry.get::<AppServer>();
@@ -197,7 +198,7 @@ fn run(config: String, roots: Vec<String>, worker: Worker) {
 
     // The `binary-api` Process Node serves the Binary API socket; it runs as
     // a registered Process Node, not as a control-loop select arm.
-    pool.main_engine().run_processes_until(&rt, async move {
+    if let Err(error) = pool.run_processes_until(&rt, async move {
         match attach_server {
             Some(attach) => {
                 let attach_applications = applications
@@ -238,16 +239,17 @@ fn run(config: String, roots: Vec<String>, worker: Worker) {
             }
             None => std::future::pending::<()>().await,
         }
-    });
+    }) {
+        tracing::error!(%error, "main control dispatch failed");
+    }
 
+    // `close` first drops the top-level control dispatcher and its registered
+    // listener, unlinks the stats path, then stops and joins Data Workers.
+    pool.close()
+        .unwrap_or_else(|error| tracing::error!(%error, "Main-loop exit hook failed"));
     pool.main_engine_mut()
         .shutdown_process_nodes(&rt)
         .unwrap_or_else(|error| tracing::error!(%error, "Process Node shutdown failed"));
-    // VPP ordering: `close` syncs the worker barrier first, runs the main-loop
-    // exit functions while the workers are held, then sets the exit flag that
-    // lets them leave and be joined. The exit flag must not be set beforehand.
-    pool.close()
-        .unwrap_or_else(|error| tracing::error!(%error, "Main-loop exit hook failed"));
     Engine::uninstall_current();
 }
 

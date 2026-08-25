@@ -54,7 +54,9 @@ impl Poller {
             ("poll-remove", opcode::PollRemove::CODE),
         ] {
             if !probe.is_supported(code) {
-                return Err(RuntimeError::FilePollerOperationUnsupported { operation: name });
+                return Err(
+                    RuntimeError::FilePollerOperationUnsupported { operation: name }.into(),
+                );
             }
         }
 
@@ -187,7 +189,7 @@ impl Poller {
             .and_then(Option::as_ref)
             .is_none()
         {
-            return Err(RuntimeError::DeadlineIndexInvalid { index });
+            return Err(RuntimeError::DeadlineIndexInvalid { index }.into());
         }
         self.cancel_deadline(index)?;
         self.deadline_fds[slot] = None;
@@ -223,7 +225,7 @@ impl Poller {
                 if source.kind() == io::ErrorKind::WouldBlock {
                     return Ok(());
                 }
-                return Err(RuntimeError::FileRead { source });
+                return Err(RuntimeError::FileRead { source }.into());
             }
             return Err(io_error(
                 "consume File deadline timerfd",
@@ -298,7 +300,8 @@ impl Poller {
             } else if pending.try_push(completion).is_err() {
                 return Err(RuntimeError::FileCompletionQueueFull {
                     operation: "collecting readiness",
-                });
+                }
+                .into());
             }
         }
         Ok(count)
@@ -344,7 +347,8 @@ impl Poller {
                 } else if completion.user_data != token && pending.try_push(completion).is_err() {
                     return Err(RuntimeError::FileCompletionQueueFull {
                         operation: "canceling readiness",
-                    });
+                    }
+                    .into());
                 }
             }
             drop(completions);
@@ -579,7 +583,7 @@ fn set_timerfd(fd: i32, duration: Option<Duration>) -> RuntimeResult<()> {
 fn push(ring: &mut IoUring, entry: squeue::Entry) -> RuntimeResult<()> {
     let mut submissions = ring.submission();
     // SAFETY: probe entries contain no borrowed userspace buffer.
-    unsafe { submissions.push(&entry) }.map_err(|_| RuntimeError::FileSubmissionQueueFull)
+    unsafe { submissions.push(&entry) }.map_err(|_| RuntimeError::FileSubmissionQueueFull.into())
 }
 
 fn submit(ring: &IoUring) -> RuntimeResult<usize> {
