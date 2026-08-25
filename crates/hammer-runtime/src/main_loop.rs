@@ -40,7 +40,10 @@ pub fn engine_main_loop(
 
     let io_wake = {
         let _reactor = runtime.enter();
-        match engine.file_main().io_wake_fd() {
+        match engine
+            .file_main()
+            .io_wake_fd_for_worker(engine.thread_index)
+        {
             Ok(wake_fd) => match AsyncFd::with_interest(wake_fd, Interest::READABLE) {
                 Ok(wake) => Some(wake),
                 Err(error) => {
@@ -124,7 +127,9 @@ pub fn engine_main_loop(
                     Some(wake) => tokio::select! {
                         guard = wake.readable() => match guard {
                             Ok(mut guard) => {
-                                engine.file_main().clear_io_wake();
+                                let _ = engine
+                                    .file_main()
+                                    .clear_io_wake_for_worker(engine.thread_index);
                                 guard.clear_ready();
                             }
                             Err(_) => tokio::time::sleep(idle_slice).await,
@@ -258,13 +263,6 @@ mod tests {
             super::engine_main_loop(&mut engine, &tokio_rt, &remote_local),
             0
         );
-        assert_eq!(
-            engine
-                .file_main()
-                .get(index)
-                .expect("registered file")
-                .private_data(),
-            1
-        );
+        assert_eq!(engine.file_main().file_private_data(index), Some(1));
     }
 }

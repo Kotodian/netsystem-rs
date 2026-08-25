@@ -1,4 +1,7 @@
 {
+  "env": {
+    "CLAUDE_CODE_SUBAGENT_MODEL": "gpt-5.6-luna-max"
+  },
   "permissions": {
     "allow": [
       "Read(//home/lqk/go/src/github.com/Kotodian/**)",
@@ -240,7 +243,35 @@
       "Bash(sed -i '' '24s/BinaryApiServerError/BinaryApiError/' crates/hammer-service/src/binary_api.rs)",
       "Bash(sed -i '' '26s/BinaryApiServerError/BinaryApiError/' crates/hammer-service/src/binary_api.rs)",
       "Bash(rustfmt --edition 2021 /Users/linqiankai/rust/src/github.com/Kotodian/hammer-ios-rs/crates/hammer-runtime/src/file/mod.rs /Users/linqiankai/rust/src/github.com/Kotodian/hammer-ios-rs/crates/hammer-runtime/src/lib.rs /Users/linqiankai/rust/src/github.com/Kotodian/hammer-ios-rs/crates/hammer-runtime/tests/async_file_main.rs)",
-      "Bash(rustfmt --edition 2024 /Users/linqiankai/rust/src/github.com/Kotodian/hammer-ios-rs/crates/hammer-runtime/src/file/mod.rs /Users/linqiankai/rust/src/github.com/Kotodian/hammer-ios-rs/crates/hammer-runtime/src/lib.rs)"
+      "Bash(rustfmt --edition 2024 /Users/linqiankai/rust/src/github.com/Kotodian/hammer-ios-rs/crates/hammer-runtime/src/file/mod.rs /Users/linqiankai/rust/src/github.com/Kotodian/hammer-ios-rs/crates/hammer-runtime/src/lib.rs)",
+      "Bash(Vec)",
+      "Bash(rustfmt *)",
+      "Bash(command -v tdd)",
+      "Bash(command -v rust-best-practices)",
+      "Bash(command -v rust-testing)",
+      "Bash(command -v vpp-error-handling)",
+      "Bash(command -v simplify)",
+      "Bash(command -v claude)",
+      "Bash(ps -Ao pid=,etime=,command=)",
+      "Bash(ps -axo pid,etime,command)",
+      "Bash(ps *)",
+      "Bash(cargo *)",
+      "WebFetch(domain:github.com)",
+      "Bash(RUSTFLAGS='-Awarnings' cargo test *)",
+      "Bash(command -v npx)",
+      "Bash(command -v cargo)",
+      "Bash(/Users/linqiankai/.local/bin/claude --help)",
+      "Bash(gh *)",
+      "Bash(curl -fsSL https://raw.githubusercontent.com/Kotodian/netsystem-rs/main/third_party/vpp/src/vlib/stats/init.c)",
+      "Bash(command -v unslop)",
+      "Bash(npm install *)",
+      "Bash(unslop *)",
+      "Bash(curl -fsSL https://raw.githubusercontent.com/FDio/vpp/master/src/vlib/stats/init.c)",
+      "mcp__plugin_context7_context7__resolve-library-id",
+      "mcp__plugin_context7_context7__query-docs",
+      "Bash(rustup target *)",
+      "Bash(perl *)"
     ]
-  }
+  },
+  "model": "gpt-5.6-luna-max"
 }

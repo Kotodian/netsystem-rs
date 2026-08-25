@@ -183,7 +183,7 @@ fn verify_worker_startup_contract(engine: &mut Engine) -> RuntimeResult<()> {
     Ok(())
 }
 
-fn engine_pool() -> EnginePool {
+fn engine_pool() -> (EnginePool, tokio::runtime::Runtime) {
     let mut worker = Worker::default();
     worker.count = 2;
     worker.buffer.slot_bytes = 128;
@@ -238,7 +238,13 @@ fn engine_pool() -> EnginePool {
     engine
         .plugin_main_mut()
         .register_builtin_image(&__HAMMER_REGISTRATION_IMAGE);
-    EnginePool::new(engine).expect("engine pool")
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_io()
+        .enable_time()
+        .build()
+        .expect("control runtime");
+    let pool = EnginePool::new(engine, &runtime).expect("engine pool");
+    (pool, runtime)
 }
 
 fn reset(case: usize) {
@@ -257,7 +263,7 @@ fn stop_workers(pool: &mut EnginePool) {
 fn data_worker_startup_is_transactional() {
     let _serial = serialize_test();
     reset(READY);
-    let mut pool = engine_pool();
+    let (mut pool, _runtime) = engine_pool();
     start_workers(pool.main_engine_mut()).expect("transactional worker startup");
     assert_eq!(INITIALIZED.load(Ordering::Acquire), 0b11);
     assert_eq!(DISPATCHED.load(Ordering::Acquire), 0b11);
@@ -272,7 +278,7 @@ fn data_worker_startup_is_transactional() {
     stop_workers(&mut pool);
 
     reset(INIT_FAILURE);
-    let mut pool = engine_pool();
+    let (mut pool, _runtime) = engine_pool();
     let error = start_workers(pool.main_engine_mut()).expect_err("worker init must fail startup");
     assert!(matches!(
         error,
@@ -283,7 +289,7 @@ fn data_worker_startup_is_transactional() {
     stop_workers(&mut pool);
 
     reset(PANIC);
-    let mut pool = engine_pool();
+    let (mut pool, _runtime) = engine_pool();
     let panic = catch_unwind(AssertUnwindSafe(|| start_workers(pool.main_engine_mut())))
         .expect_err("worker panic must unwind startup");
     assert_eq!(
@@ -294,7 +300,7 @@ fn data_worker_startup_is_transactional() {
     stop_workers(&mut pool);
 
     reset(EARLY_EXIT);
-    let mut pool = engine_pool();
+    let (mut pool, _runtime) = engine_pool();
     let error = start_workers(pool.main_engine_mut()).expect_err("early exit must fail startup");
     assert!(matches!(
         error,
@@ -308,7 +314,7 @@ fn data_worker_startup_is_transactional() {
 fn runtime_main_loop_enter_catalog_starts_workers() {
     let _serial = serialize_test();
     reset(READY);
-    let mut pool = engine_pool();
+    let (mut pool, _runtime) = engine_pool();
 
     hammer_runtime::init::run_main_loop_enter(pool.main_engine_mut())
         .expect("run runtime main-loop-enter catalog");
@@ -322,7 +328,7 @@ fn runtime_main_loop_enter_catalog_starts_workers() {
 fn main_engine_schedules_bounded_control_work_on_the_selected_worker() {
     let _serial = serialize_test();
     reset(READY);
-    let mut pool = engine_pool();
+    let (mut pool, _runtime) = engine_pool();
     let error = pool
         .main_engine()
         .schedule_on_worker(DataWorkerId::new(0), || {})

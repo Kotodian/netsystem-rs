@@ -1500,11 +1500,13 @@ impl<Index: Copy + Eq> SessionWorker<Index> {
         if self.state_deadline_file.is_some() {
             return Ok(());
         }
-        let index = runtime.file_main_mut().add_deadline(Deadline::new(
+        let mut deadline = Deadline::new(
             "session queue adaptive deadline",
             u64::from(session_queue.slot()),
             schedule_session_queue_deadline,
-        ))?;
+        );
+        deadline.set_polling_thread_index(runtime.thread_index());
+        let index = runtime.file_main_mut().add_deadline(deadline)?;
         self.state_deadline_file = Some(index);
         self.session_queue = Some(session_queue);
         Ok(())
@@ -2329,7 +2331,7 @@ impl<Index: Copy + Eq> SessionWorker<Index> {
             postponed: false,
         });
         let entry_ptr = Box::into_raw(entry);
-        let file = match runtime.file_main_mut().add(File::new(
+        let mut file = File::new(
             signal_read,
             format!("app rx mq {:?}", application.raw()),
             entry_ptr as usize as u64,
@@ -2337,7 +2339,9 @@ impl<Index: Copy + Eq> SessionWorker<Index> {
                 read: Some(schedule_app_mq_pending),
                 ..FileFunctions::default()
             },
-        )) {
+        );
+        file.set_polling_thread_index(runtime.thread_index());
+        let file = match runtime.file_main_mut().add(file) {
             Ok(file) => file,
             Err(error) => {
                 // SAFETY: `entry_ptr` still owns the entry until FileMain add

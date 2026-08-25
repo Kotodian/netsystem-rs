@@ -244,7 +244,7 @@ impl TunControl {
                     worker: worker.slot() as u32,
                 })?;
             let queue_index = worker_rx_queues.len();
-            let file_index = engine.file_main_mut().add(File::new(
+            let mut file = File::new(
                 fd,
                 format!(
                     "TUN interface {} (logical {}, kernel {})",
@@ -263,7 +263,9 @@ impl TunControl {
                     },
                     ..FileFunctions::default()
                 },
-            ))?;
+            );
+            file.set_polling_thread_index(engine.runtime.thread_index());
+            let file_index = engine.file_main_mut().add(file)?;
             if let Some(rx_queue) = rx_queue {
                 worker_rx_queues.push(TunRxQueue {
                     queue: rx_queue,
