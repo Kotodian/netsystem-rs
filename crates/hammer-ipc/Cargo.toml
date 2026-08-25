@@ -5,5 +5,9 @@ edition = "2024"
 publish = false
 
 [dependencies]
-thiserror = { workspace = true }
+hammer-stats = { path = "../hammer-stats" }
+libc = { workspace = true }
+memmap2 = { workspace = true }
 prost = { workspace = true }
+socket2 = { workspace = true, features = ["all"] }
+thiserror = { workspace = true }

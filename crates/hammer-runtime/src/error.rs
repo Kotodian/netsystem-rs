@@ -18,6 +18,12 @@ pub enum RuntimeError {
     MemoryNotInitialized,
     #[error("File registry is full")]
     FilePoolFull,
+    #[error("global FileMain is already initialized")]
+    FileMainAlreadyInitialized,
+    #[error("global FileMain is not initialized")]
+    FileMainNotInitialized,
+    #[error("global FileMain has already been taken")]
+    FileMainAlreadyTaken,
     #[error("File index {index:?} is stale or not registered")]
     FileIndexInvalid { index: hammer_infra::pool::Index },
     #[error("deadline registry is full")]

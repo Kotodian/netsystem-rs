@@ -73,19 +73,18 @@ fn deleted_file_index_does_not_resolve_after_pool_slot_reuse() {
     let first = RegisteredSocket::register(&mut files, "first", 0, FileFunctions::default());
 
     assert!(files.delete(first.index).expect("delete first file"));
-    assert!(files.get(first.index).is_none());
+    assert!(!files.is_registered(first.index));
 
     let replacement =
         RegisteredSocket::register(&mut files, "replacement", 0, FileFunctions::default());
 
     assert_eq!(replacement.index.slot(), first.index.slot());
     assert_ne!(replacement.index.generation(), first.index.generation());
-    assert!(files.get(first.index).is_none());
+    assert!(!files.is_registered(first.index));
     assert_eq!(
         files
-            .get(replacement.index)
-            .expect("current file")
-            .description(),
+            .file_description(replacement.index)
+            .expect("current file"),
         "replacement"
     );
 }
@@ -112,12 +111,8 @@ fn readable_file_dispatches_callback() {
         1
     );
 
-    let file = files.get(socket.index).expect("registered file");
-    assert_eq!(file.private_data(), 42);
-    assert_eq!(file.read_events(), 1);
-    assert_eq!(file.write_events(), 0);
-    assert_eq!(file.error_events(), 0);
-
+    assert_eq!(files.file_private_data(socket.index), Some(42));
+    assert_eq!(files.file_event_counts(socket.index), Some((1, 0, 0)));
 }
 
 #[test]
@@ -162,9 +157,8 @@ fn readable_file_dispatches_across_repeated_readiness_cycles() {
         1
     );
 
-    let file = files.get(socket.index).expect("registered file");
-    assert_eq!(file.private_data(), 2);
-    assert_eq!(file.read_events(), 2);
+    assert_eq!(files.file_private_data(socket.index), Some(2));
+    assert_eq!(files.file_event_counts(socket.index), Some((2, 0, 0)));
 }
 
 #[cfg(target_os = "linux")]
@@ -223,9 +217,8 @@ fn linux_eventfd_readiness_dispatches_through_file_main() {
         1
     );
 
-    let file = files.get(index).expect("registered eventfd");
-    assert_eq!(file.private_data(), value);
-    assert_eq!(file.read_events(), 1);
+    assert_eq!(files.file_private_data(index), Some(value));
+    assert_eq!(files.file_event_counts(index), Some((1, 0, 0)));
 }
 
 #[test]
@@ -254,9 +247,8 @@ fn write_interest_changes_without_replacing_file_index() {
         1
     );
 
-    let file = files.get(socket.index).expect("same registered file");
-    assert_eq!(file.private_data(), 7);
-    assert_eq!(file.write_events(), 1);
+    assert_eq!(files.file_private_data(socket.index), Some(7));
+    assert_eq!(files.file_event_counts(socket.index), Some((0, 1, 0)));
 }
 
 #[test]
@@ -285,9 +277,8 @@ fn error_callback_runs_before_delete_closes_the_descriptor() {
             .expect("poll peer close"),
         1
     );
-    let file = files.get(socket.index).expect("registered file");
-    assert_eq!(file.private_data(), 1);
-    assert_eq!(file.error_events(), 1);
+    assert_eq!(files.file_private_data(socket.index), Some(1));
+    assert_eq!(files.file_event_counts(socket.index), Some((0, 0, 1)));
 
     let identity = descriptor_identity(socket.raw_fd).expect("live descriptor identity");
     assert!(files.delete(socket.index).expect("delete file"));
@@ -334,9 +325,8 @@ fn queued_event_for_deleted_generation_does_not_reach_reused_slot() {
         files.poll(&NodeRuntime::default()).expect("poll FileMain"),
         0
     );
-    let file = files.get(current.index).expect("replacement file");
-    assert_eq!(file.private_data(), 0);
-    assert_eq!(file.read_events(), 0);
+    assert_eq!(files.file_private_data(current.index), Some(0));
+    assert_eq!(files.file_event_counts(current.index), Some((0, 0, 0)));
 }
 
 #[test]
@@ -359,7 +349,7 @@ fn unhandled_error_deletes_file_and_closes_descriptor() {
             .expect("poll peer close"),
         0
     );
-    assert!(files.get(socket.index).is_none());
+    assert!(!files.is_registered(socket.index));
     // SAFETY: F_GETFD only queries the descriptor number.
     assert_eq!(unsafe { libc::fcntl(socket.raw_fd, libc::F_GETFD) }, -1);
     assert_eq!(
@@ -370,7 +360,7 @@ fn unhandled_error_deletes_file_and_closes_descriptor() {
 
 #[test]
 fn deadline_registration_tracks_state_derived_duration_without_sleeping() {
-    let mut files = FileMain::new().expect("create FileMain");
+    let files = FileMain::new().expect("create FileMain");
     let index = files
         .add_deadline(Deadline::new("session worker deadline", 0, |_, _| Ok(())))
         .expect("register deadline");
@@ -394,7 +384,7 @@ fn deadline_registration_tracks_state_derived_duration_without_sleeping() {
 
 #[test]
 fn deleted_deadline_index_does_not_resolve_after_pool_slot_reuse() {
-    let mut files = FileMain::new().expect("create FileMain");
+    let files = FileMain::new().expect("create FileMain");
     let stale = files
         .add_deadline(Deadline::new("stale deadline", 0, |_, _| Ok(())))
         .expect("register first deadline");
@@ -415,7 +405,7 @@ fn deleted_deadline_index_does_not_resolve_after_pool_slot_reuse() {
 
 #[test]
 fn armed_deadline_dispatches_and_can_be_disarmed_after_expiry() {
-    let mut files = FileMain::new().expect("create FileMain");
+    let files = FileMain::new().expect("create FileMain");
     let index = files
         .add_deadline(Deadline::new("one-shot deadline", 0, |_, _| Ok(())))
         .expect("register deadline");

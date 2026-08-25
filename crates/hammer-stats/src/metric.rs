@@ -113,12 +113,7 @@ impl SimpleCounter {
         })
     }
 
-    pub fn validate(
-        &self,
-        stats_main: &StatsMain,
-        row: u32,
-        column: u32,
-    ) -> StatsResult<()> {
+    pub fn validate(&self, stats_main: &StatsMain, row: u32, column: u32) -> StatsResult<()> {
         stats_main.validate_counter(self.index.ok_or(StatsError::MetricUnbound)?, row, column)
     }
 
@@ -155,12 +150,7 @@ impl CombinedCounter {
         })
     }
 
-    pub fn validate(
-        &self,
-        stats_main: &StatsMain,
-        row: u32,
-        column: u32,
-    ) -> StatsResult<()> {
+    pub fn validate(&self, stats_main: &StatsMain, row: u32, column: u32) -> StatsResult<()> {
         stats_main.validate_counter(self.index.ok_or(StatsError::MetricUnbound)?, row, column)
     }
 
@@ -206,12 +196,7 @@ impl Histogram {
         })
     }
 
-    pub fn validate(
-        &self,
-        stats_main: &StatsMain,
-        row: u32,
-        bucket: u32,
-    ) -> StatsResult<()> {
+    pub fn validate(&self, stats_main: &StatsMain, row: u32, bucket: u32) -> StatsResult<()> {
         stats_main.validate_counter(self.index.ok_or(StatsError::MetricUnbound)?, row, bucket)
     }
 
@@ -252,13 +237,14 @@ pub trait RingSchema: Sized {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) enum MetricValue {
+pub enum MetricValue {
     Scalar(ScalarBits),
     Gauge(ProtocolGauge),
     Simple(Vec<Vec<u64>>),
     Combined(Vec<Vec<Counter>>),
     Names(Vec<String>),
     Histogram(Vec<Vec<u64>>),
+    Ring(Vec<Vec<u8>>),
 }
 
 pub(crate) mod layout {

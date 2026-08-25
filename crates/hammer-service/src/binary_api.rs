@@ -12,12 +12,11 @@ use std::os::unix::net::UnixListener as StdUnixListener;
 use std::os::unix::net::UnixStream as StdUnixStream;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::time::Duration;
 
 use hammer_infra::pool::Index;
-use hammer_infra::thread_owned::ThreadOwned;
+use hammer_runtime::FILE_MAIN;
 use hammer_runtime::binary_api::{BinaryApiMethodEntry, BinaryApiMethodStatus};
-use hammer_runtime::file::{File, FileFunctions, FileIoStatus, FileMain};
+use hammer_runtime::file::{FileIoStatus, FileMain};
 use hammer_runtime::{
     Engine, NodeRuntime, PluginError, ProcessContext, ProcessWake, RuntimeError, RuntimeResult,
 };
@@ -117,9 +116,9 @@ impl Default for ClientSlot {
     }
 }
 
-/// The socket-api client table: VPP's bounded `client_table`, keyed by
-/// generation-safe tokens.
-struct ClientTable {
+/// VPP `socket_main.registration_pool`, keyed by generation-safe client
+/// registration tokens.
+struct SocketApiRegistrationPool {
     listener: Index,
     slots: Vec<ClientSlot>,
     /// Monotonic generation source: a recycled slot's new token never matches
@@ -127,7 +126,7 @@ struct ClientTable {
     next_generation: u32,
 }
 
-impl ClientTable {
+impl SocketApiRegistrationPool {
     fn new(listener: Index) -> Self {
         Self {
             listener,
@@ -169,7 +168,7 @@ impl ClientTable {
     /// Consumes one event batch signalled by FileMain readiness callbacks.
     fn process_event(
         &mut self,
-        file_main: &mut FileMain,
+        file_main: &FileMain,
         event_type: u64,
         data: &[u64],
         max_frame_bytes: usize,
@@ -199,7 +198,7 @@ impl ClientTable {
 
     /// VPP `vl_api_socket_accept`: pulls one pending connection per call; the
     /// per-event loop bounds the count.
-    fn accept_ready(&mut self, file_main: &mut FileMain) -> RuntimeResult<bool> {
+    fn accept_ready(&mut self, file_main: &FileMain) -> RuntimeResult<bool> {
         let Some(token) = self.reserve() else {
             return Ok(false); // table full: the kernel backlog holds connects
         };
@@ -207,7 +206,7 @@ impl ClientTable {
             self.listener,
             "binary-api client",
             token.0,
-            CLIENT_FUNCTIONS,
+            client_file::file_functions::<NodeRuntime, RuntimeError>(),
         ) {
             Ok(Some(index)) => {
                 match self.slot_mut(token) {
@@ -241,12 +240,7 @@ impl ClientTable {
 
     /// VPP `vl_api_socket_read`: one bounded chunk per readiness event into
     /// `unprocessed_input`, then every complete frame in it.
-    fn client_read(
-        &mut self,
-        file_main: &mut FileMain,
-        token: SocketToken,
-        max_frame_bytes: usize,
-    ) {
+    fn client_read(&mut self, file_main: &FileMain, token: SocketToken, max_frame_bytes: usize) {
         let Some(slot) = self.slot(token) else {
             return; // stale event for a closed or recycled slot
         };
@@ -273,12 +267,7 @@ impl ClientTable {
     /// VPP `vl_api_socket_write`: flush the reply buffer; EAGAIN (WouldBlock)
     /// keeps write interest armed so the next write readiness drains it, and
     /// a complete drain clears it.
-    fn client_flush(
-        &mut self,
-        file_main: &mut FileMain,
-        token: SocketToken,
-        max_frame_bytes: usize,
-    ) {
+    fn client_flush(&mut self, file_main: &FileMain, token: SocketToken, max_frame_bytes: usize) {
         loop {
             // Resume frames stalled by a saturated output buffer first.
             self.parse_frames(file_main, token, max_frame_bytes);
@@ -318,12 +307,7 @@ impl ClientTable {
     /// each under the worker barrier and enqueueing the reply. Stops when the
     /// frame budget for this event is spent, the output buffer saturates, or
     /// the buffer holds only a partial frame.
-    fn parse_frames(
-        &mut self,
-        file_main: &mut FileMain,
-        token: SocketToken,
-        max_frame_bytes: usize,
-    ) {
+    fn parse_frames(&mut self, file_main: &FileMain, token: SocketToken, max_frame_bytes: usize) {
         for _ in 0..MAX_FRAMES_PER_READ_EVENT {
             let Some(slot) = self.slot(token) else {
                 return;
@@ -364,7 +348,8 @@ impl ClientTable {
             };
             // Saturate rather than grow: parsing stalls until a flush drains
             // below the budget, and TCP backpressure limits the client.
-            if slot.output.len() + size_of::<u32>() + declared > output_budget(max_frame_bytes) {
+            if slot.output.len() + size_of::<u32>() + encoded.len() > output_budget(max_frame_bytes)
+            {
                 return;
             }
             let arm_write = slot.output.is_empty();
@@ -382,7 +367,7 @@ impl ClientTable {
 
     /// Closes one client: removes backend interest and the File record, then
     /// frees the slot for reuse.
-    fn close(&mut self, file_main: &mut FileMain, token: SocketToken) {
+    fn close(&mut self, file_main: &FileMain, token: SocketToken) {
         if let Some(index) = self.slot(token).and_then(|slot| slot.index) {
             let _ = file_main.delete(index);
         }
@@ -390,12 +375,26 @@ impl ClientTable {
     }
 }
 
-/// Main Thread owner of the Binary API Unix listener and frame policy. The
-/// listener's readiness is owned by a FileMain; the `binary-api` Process
-/// Node takes the FileMain over when it starts and drives it with
-/// `AsyncFileMain::next_ready`.
+impl Drop for SocketApiRegistrationPool {
+    fn drop(&mut self) {
+        let Some(file_main) = FILE_MAIN.get() else {
+            return;
+        };
+        for slot in &mut self.slots {
+            if let Some(index) = slot.index.take() {
+                let _ = file_main.delete(index);
+            }
+            slot.read_buf.clear();
+            slot.output.clear();
+            slot.generation = 0;
+        }
+    }
+}
+
+/// Main-thread owner of the Binary API Unix listener and frame policy. The
+/// listener is registered in the process-global `FILE_MAIN`; EnginePool's main
+/// loop polls that table and the `binary-api` Process Node consumes its events.
 pub struct BinaryApiMain {
-    file_main: ThreadOwned<Option<FileMain>>,
     listener: Index,
     socket_path: PathBuf,
     socket_device: u64,
@@ -426,22 +425,18 @@ impl BinaryApiMain {
                 path: path.to_path_buf(),
                 source,
             })?;
-        let mut file_main =
-            FileMain::new().map_err(|source| BinaryApiServerError::FileMainCreate { source })?;
+        let file_main = FILE_MAIN
+            .get()
+            .ok_or(BinaryApiServerError::FileMainNotReady)?;
         let listener_index = file_main
             .add_listener(
                 listener,
                 "binary-api listener",
                 LISTENER_TOKEN,
-                LISTENER_FUNCTIONS,
+                listener_file::file_functions::<NodeRuntime, RuntimeError>(),
             )
             .map_err(|source| BinaryApiServerError::ListenerRegistration { source })?;
-        let owned = ThreadOwned::new();
-        owned
-            .install(Some(file_main))
-            .map_err(|_| BinaryApiServerError::FileMainNotReady)?;
         Ok(Self {
-            file_main: owned,
             listener: listener_index,
             socket_path: path.to_path_buf(),
             socket_device: metadata.dev(),
@@ -449,19 +444,13 @@ impl BinaryApiMain {
             max_frame_bytes,
         })
     }
-
-    /// Hands the FileMain to the Process Node exactly once. The slot empties,
-    /// so a second node start fails instead of racing.
-    fn take_file_main(&self) -> Result<FileMain, BinaryApiServerError> {
-        self.file_main
-            .with_mut(|slot| slot.take())
-            .map_err(|_| BinaryApiServerError::FileMainNotReady)?
-            .ok_or(BinaryApiServerError::FileMainNotReady)
-    }
 }
 
 impl Drop for BinaryApiMain {
     fn drop(&mut self) {
+        if let Some(file_main) = FILE_MAIN.get() {
+            let _ = file_main.delete(self.listener);
+        }
         let metadata = match std::fs::metadata(&self.socket_path) {
             Ok(metadata) => metadata,
             Err(source) if source.kind() == io::ErrorKind::NotFound => return,
@@ -487,43 +476,72 @@ impl Drop for BinaryApiMain {
     }
 }
 
-/// Readiness callback for the listener File: signals the Process Node to
-/// accept. One signal is enough regardless of how many connects are pending.
-fn listener_ready(_graph: &NodeRuntime, file: &mut File) -> RuntimeResult<()> {
-    signal_ready(EVENT_ACCEPT_READY, file)
-}
-
-/// Readiness callback for a client File with readable data or a closed peer.
-fn client_read_ready(_graph: &NodeRuntime, file: &mut File) -> RuntimeResult<()> {
-    signal_ready(EVENT_CLIENT_READ_READY, file)
-}
-
-/// Readiness callback for a client File whose output buffer freed space.
-fn client_write_ready(_graph: &NodeRuntime, file: &mut File) -> RuntimeResult<()> {
-    signal_ready(EVENT_CLIENT_WRITE_READY, file)
-}
-
 /// VPP's `vl_api_clnt_node` signal path: the callback never touches the
-/// client table; it only hands the File's token to the node. Without a live
-/// node (main process shutdown) the readiness is dropped.
-fn signal_ready(event_type: u64, file: &File) -> RuntimeResult<()> {
+/// socket registration pool; it only hands the File's token to the node.
+/// Without a live node (main process shutdown) the readiness is dropped.
+fn signal_ready(event_type: u64, token: u64) -> RuntimeResult<()> {
     match Engine::with_current(|engine| engine.process_handle(PROCESS_NODE_NAME)) {
-        Some(Some(handle)) => handle.signal(event_type, file.private_data()),
+        Some(Some(handle)) => handle.signal(event_type, token),
         _ => Ok(()),
     }
 }
 
-const LISTENER_FUNCTIONS: FileFunctions = FileFunctions {
-    read: Some(listener_ready),
-    write: None,
-    error: Some(listener_ready),
-};
+#[hammer_component_macros::file]
+mod listener_file {
+    fn read<Context, Error>(
+        _graph: &Context,
+        file: &mut hammer_core::file::File<Context, Error>,
+    ) -> Result<(), Error>
+    where
+        Error: From<super::RuntimeError>,
+    {
+        super::signal_ready(super::EVENT_ACCEPT_READY, file.private_data()).map_err(Into::into)
+    }
 
-const CLIENT_FUNCTIONS: FileFunctions = FileFunctions {
-    read: Some(client_read_ready),
-    write: Some(client_write_ready),
-    error: Some(client_read_ready),
-};
+    fn error<Context, Error>(
+        _graph: &Context,
+        file: &mut hammer_core::file::File<Context, Error>,
+    ) -> Result<(), Error>
+    where
+        Error: From<super::RuntimeError>,
+    {
+        super::signal_ready(super::EVENT_ACCEPT_READY, file.private_data()).map_err(Into::into)
+    }
+}
+
+#[hammer_component_macros::file]
+mod client_file {
+    fn read<Context, Error>(
+        _graph: &Context,
+        file: &mut hammer_core::file::File<Context, Error>,
+    ) -> Result<(), Error>
+    where
+        Error: From<super::RuntimeError>,
+    {
+        super::signal_ready(super::EVENT_CLIENT_READ_READY, file.private_data()).map_err(Into::into)
+    }
+
+    fn write<Context, Error>(
+        _graph: &Context,
+        file: &mut hammer_core::file::File<Context, Error>,
+    ) -> Result<(), Error>
+    where
+        Error: From<super::RuntimeError>,
+    {
+        super::signal_ready(super::EVENT_CLIENT_WRITE_READY, file.private_data())
+            .map_err(Into::into)
+    }
+
+    fn error<Context, Error>(
+        _graph: &Context,
+        file: &mut hammer_core::file::File<Context, Error>,
+    ) -> Result<(), Error>
+    where
+        Error: From<super::RuntimeError>,
+    {
+        super::signal_ready(super::EVENT_CLIENT_READ_READY, file.private_data()).map_err(Into::into)
+    }
+}
 
 #[inline]
 fn output_budget(max_frame_bytes: usize) -> usize {
@@ -707,32 +725,24 @@ impl Config {
 
 #[hammer_component_macros::process_node(name = "binary-api")]
 async fn binary_api_clnt(mut context: ProcessContext) -> RuntimeResult<()> {
-    // VPP `vl_api_clnt_node`: FileMain readiness callbacks signal this node;
-    // the node consumes the batches and performs accept/read/write/dispatch.
+    // VPP `vl_api_clnt_node`: FileMain callbacks signal this node; the main
+    // FileMain poll loop owns readiness and this node consumes its event batch.
     let capability = context.require::<BinaryApiMain>()?;
-    let file_main = capability.take_file_main()?;
-    let graph = context.data_plane_runtime().nodes().clone();
-    let mut async_file_main = file_main.into_async()?;
-    let mut table = ClientTable::new(capability.listener);
+    let file_main = FILE_MAIN
+        .get()
+        .expect("FileMain is initialized before Binary API startup");
+    let mut table = SocketApiRegistrationPool::new(capability.listener);
     let max_frame_bytes = capability.max_frame_bytes;
     loop {
-        // One poll per iteration (VPP `vl_api_clnt_node` polls once per main
-        // loop turn): readiness is level-triggered, so re-polling until zero
-        // would re-dispatch a pending listener forever and starve the drain
-        // below. The drain empties every batch the callbacks signalled.
-        let _ = async_file_main.next_ready(&graph).await?;
-        // Drain every event batch signalled by the callback round.
-        loop {
-            match context.wait_for_event_or_clock(Duration::ZERO).await {
-                ProcessWake::Clock => break,
-                ProcessWake::Event(batch) => {
-                    table.process_event(
-                        async_file_main.file_main_mut(),
-                        batch.event_type(),
-                        batch.data(),
-                        max_frame_bytes,
-                    )?;
-                }
+        match context.wait_for_event().await {
+            ProcessWake::Clock => return Ok(()),
+            ProcessWake::Event(batch) => {
+                table.process_event(
+                    file_main,
+                    batch.event_type(),
+                    batch.data(),
+                    max_frame_bytes,
+                )?;
             }
         }
     }

@@ -1,5 +1,5 @@
 use core::hint::spin_loop;
-use std::cell::{Ref, RefCell, RefMut, UnsafeCell};
+use std::cell::{RefCell, UnsafeCell};
 use std::collections::HashSet;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
@@ -17,7 +17,10 @@ use crate::init::InitFunction;
 use crate::node::{NodeRuntimeData, NodeRuntimeInner};
 use crate::process::{ProcessContext, ProcessMain};
 use crate::spawn::{DataRemoteLocalQueue, DataRemoteLocalQueueError};
-use crate::{DataPlaneHandoffWorker, DataWorkerId, FileMain, PluginMain, ProcessHandle};
+use crate::{
+    AsyncFileMain, DataPlaneHandoffWorker, DataWorkerId, FileMain, NodeRuntime, PluginMain,
+    ProcessHandle,
+};
 use hammer_component_macros::Stats;
 use hammer_stats::{StatsMain, Timestamp};
 
@@ -35,7 +38,7 @@ pub(crate) struct Sys {
 #[hammer_component_macros::process_node(name = "statseg-collector-process")]
 async fn stat_segment_collector_process(mut context: ProcessContext) -> RuntimeResult<()> {
     let sys = context.require::<Sys>()?;
-    let stats_main = context.require::<StatsMain>()?;
+    let stats_main = StatsMain::global()?;
     let config = context.require::<StatsConfig>()?;
 
     // VPP `stat_segment_collector_process` writes boottime once before its
@@ -182,7 +185,6 @@ pub struct Engine {
     pub(crate) called_main_loop_enter_functions: HashSet<&'static str>,
     pub(crate) called_main_loop_exit_functions: HashSet<&'static str>,
     pub(crate) main_loop_entered: bool,
-    materialized_registration_generation: u64,
     publication: Arc<WorkerPublication>,
     pub(crate) workers_updating_graph: Arc<AtomicU32>,
     // VPP `need_vlib_worker_thread_node_runtime_update`: set when a graph
@@ -233,7 +235,6 @@ impl Engine {
             called_main_loop_enter_functions: HashSet::new(),
             called_main_loop_exit_functions: HashSet::new(),
             main_loop_entered: false,
-            materialized_registration_generation: 0,
             publication,
             workers_updating_graph,
             deferred_finish_pending: AtomicBool::new(false),
@@ -267,7 +268,6 @@ impl Engine {
             called_main_loop_enter_functions: HashSet::new(),
             called_main_loop_exit_functions: HashSet::new(),
             main_loop_entered: false,
-            materialized_registration_generation: 0,
             publication: Arc::new(WorkerPublication::new(0)),
             workers_updating_graph: Arc::new(AtomicU32::new(0)),
             deferred_finish_pending: AtomicBool::new(false),
@@ -338,9 +338,9 @@ impl Engine {
 
         let resume_main_loop = self.main_loop_entered;
         let resume_processes = self.processes.is_started();
+        let loaded_plugin_count = self.plugin_main.loaded_plugins().len();
         self.plugin_main.load(env!("CARGO_PKG_VERSION"), roots)?;
-        let registration_generation = self.plugin_main.registration_generation();
-        if registration_generation == self.materialized_registration_generation {
+        if self.plugin_main.loaded_plugins().len() == loaded_plugin_count {
             return Ok(());
         }
 
@@ -366,8 +366,8 @@ impl Engine {
         if worker_count != 0 {
             self.finish_worker_graph_update()?;
         }
-        self.materialized_registration_generation = registration_generation;
         if resume_main_loop {
+            crate::init::run_stats_registrations(self)?;
             crate::init::run_main_loop_enter(self)?;
         }
         if resume_processes {
@@ -619,17 +619,24 @@ impl Engine {
         self.runtime.nodes().set_node_runtime_data(node, data)
     }
 
-    pub fn file_main(&self) -> Ref<'_, FileMain> {
-        self.runtime.file_main()
+    pub fn file_main(&self) -> &'static FileMain {
+        crate::file::FILE_MAIN
+            .get()
+            .expect("FileMain is initialized before engine use")
     }
 
-    pub fn file_main_mut(&self) -> RefMut<'_, FileMain> {
-        self.runtime.file_main_mut()
+    pub fn file_main_mut(&self) -> &'static FileMain {
+        crate::file::FILE_MAIN
+            .get()
+            .expect("FileMain is initialized before engine use")
     }
 
     pub(crate) fn poll_file_readiness(&mut self) -> RuntimeResult<usize> {
         let graph = self.runtime.nodes();
-        self.file_main_mut().poll(graph)
+        crate::file::FILE_MAIN
+            .get()
+            .expect("FileMain is initialized before engine use")
+            .poll_for_worker(self.thread_index, graph)
     }
 
     pub(crate) fn worker_seed(&self) -> EngineWorkerSeed {
@@ -680,7 +687,7 @@ impl Engine {
     where
         F: std::future::Future,
     {
-        self.processes.run_until(runtime, future)
+        runtime.block_on(self.processes.run_until(future))
     }
 
     pub fn shutdown_process_nodes(
@@ -807,22 +814,22 @@ impl EngineWorkerSeed {
     }
 }
 
-const STATS_SEGMENT_SIZE: usize = 32 << 20;
-
 pub struct EnginePool {
     pub engines: Vec<Engine>,
     pub name: String,
     pub exec_path: String,
     pub argv: Vec<String>,
     pub startup_config: String,
-    stats_main: Arc<StatsMain>,
+    control_file_main: AsyncFileMain,
     ipc_listener: Option<tokio::net::TcpListener>,
+    closed: bool,
 }
 
 impl EnginePool {
-    pub fn new(main: Engine) -> RuntimeResult<Self> {
-        let stats_main = Arc::new(StatsMain::create("stat segment", STATS_SEGMENT_SIZE)?);
-        main.registry.set(Arc::clone(&stats_main));
+    pub fn new(mut main: Engine, runtime: &tokio::runtime::Runtime) -> RuntimeResult<Self> {
+        crate::file::init_file_main(&mut main)?;
+        let _entered = runtime.enter();
+        let control_file_main = AsyncFileMain::new()?;
         let mut engines = Vec::new();
         engines.push(main);
         Ok(Self {
@@ -831,8 +838,9 @@ impl EnginePool {
             exec_path: String::new(),
             argv: Vec::new(),
             startup_config: String::new(),
-            stats_main,
+            control_file_main,
             ipc_listener: None,
+            closed: false,
         })
     }
 
@@ -864,18 +872,50 @@ impl EnginePool {
         self.ipc_listener.take()
     }
 
-    pub fn main_loop_enter(&mut self, roots: &[String], config: &str) -> RuntimeResult<()> {
-        let (engines, stats_main) = (&mut self.engines, &self.stats_main);
+    pub fn main_loop_enter(
+        &mut self,
+        roots: &[String],
+        config: &str,
+        _runtime: &tokio::runtime::Runtime,
+    ) -> RuntimeResult<()> {
+        let engines = &mut self.engines;
         let engine = &mut engines[0];
         engine.install_current();
         engine.configure_early(config)?;
         engine.load_plugins(roots, config)?;
-        crate::init::run_stats_registrations(engine, stats_main)?;
-        let sys = Arc::new(Sys::bind(stats_main)?);
-        engine.registry.set(sys);
+        crate::init::run_config_functions(engine, false, config)?;
+        crate::init::run_init_functions(engine)?;
+        StatsMain::global()?;
+        crate::init::run_stats_registrations(engine)?;
+
         crate::init::run_main_loop_enter(engine)?;
         engine.start_process_nodes()?;
         Ok(())
+    }
+
+    pub fn run_processes_until<F>(
+        &mut self,
+        runtime: &tokio::runtime::Runtime,
+        future: F,
+    ) -> RuntimeResult<F::Output>
+    where
+        F: std::future::Future,
+    {
+        let engine = &self.engines[0];
+        let control_file_main = &mut self.control_file_main;
+        let graph = NodeRuntime::default();
+        runtime.block_on(async move {
+            let process_future = engine.processes.run_until(future);
+            tokio::pin!(process_future);
+            loop {
+                tokio::select! {
+                    output = &mut process_future => return Ok(output),
+                    result = control_file_main.next_ready(&graph) => {
+                        result?;
+                    }
+                }
+            }
+        })
     }
 
     pub fn main_loop_exit(engine: &Engine) {
@@ -885,6 +925,11 @@ impl EnginePool {
     }
 
     pub fn close(&mut self) -> RuntimeResult<()> {
+        if self.closed {
+            return Ok(());
+        }
+        self.closed = true;
+
         let barrier = self.main_engine().barrier.clone();
         let exit_result = barrier.sync(|| {
             let result = {
@@ -903,7 +948,27 @@ impl EnginePool {
         if let Some(listener) = self.ipc_listener.take() {
             drop(listener);
         }
-        worker_result.and(exit_result)
+        let unlink_result = match StatsMain::global() {
+            Ok(stats_main) => stats_main.unlink_socket_path().map_err(RuntimeError::from),
+            Err(hammer_stats::StatsError::NotInitialized) => Ok(()),
+            Err(error) => Err(RuntimeError::from(error)),
+        };
+
+        let mut first_error = None;
+        for result in [exit_result, worker_result, unlink_result] {
+            if let Err(error) = result
+                && first_error.is_none()
+            {
+                first_error = Some(error);
+            }
+        }
+        first_error.map_or(Ok(()), Err)
+    }
+}
+
+impl Drop for EnginePool {
+    fn drop(&mut self) {
+        let _ = self.close();
     }
 }
 
@@ -1048,44 +1113,15 @@ mod tests {
     #[test]
     fn engine_pool_main_engine_at_index_zero() {
         let main = test_engine();
-        let pool = EnginePool::new(main).expect("engine pool");
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_io()
+            .enable_time()
+            .build()
+            .expect("control runtime");
+        let pool = EnginePool::new(main, &runtime).expect("engine pool");
         assert_eq!(pool.worker_count(), 0);
         assert!(pool.engine(0).is_some());
         assert!(pool.engine(1).is_none());
-    }
-
-    #[test]
-    fn engine_pool_publishes_owned_stats_main_capability() {
-        let registry = RuntimeRegistry::new();
-        let main = Engine::new(test_runtime(), Arc::clone(&registry));
-        let pool = EnginePool::new(main).expect("engine pool");
-
-        let published = registry
-            .get::<StatsMain>()
-            .expect("EnginePool must publish StatsMain");
-        assert!(Arc::ptr_eq(&published, &pool.stats_main));
-    }
-
-    #[test]
-    fn main_loop_enter_binds_sys_after_static_stats_registration() {
-        let registry = RuntimeRegistry::new();
-        let main = Engine::new_configured(Arc::clone(&registry), Worker::default())
-            .expect("configured engine");
-        let mut pool = EnginePool::new(main).expect("engine pool");
-
-        pool.main_loop_enter(&[], "")
-            .expect("main loop enter with builtin stats");
-
-        let stats = registry
-            .get::<StatsMain>()
-            .expect("EnginePool must publish StatsMain");
-        assert!(Arc::ptr_eq(&stats, &pool.stats_main));
-        assert!(registry.get::<Sys>().is_some());
-        assert!(
-            pool.main_engine()
-                .process_handle("statseg-collector-process")
-                .is_some()
-        );
     }
 
     #[test]
@@ -1157,17 +1193,24 @@ mod tests {
         binary_api_methods = [];
     );
 
-    fn deferred_finish_pool() -> EnginePool {
+    fn deferred_finish_pool() -> (EnginePool, tokio::runtime::Runtime) {
         let mut worker = Worker::default();
         worker.count = 2;
         worker.buffer.slot_bytes = 128;
         worker.buffer.slots_per_numa = 64;
         worker.buffer.frame_pool_size = 5;
         worker.buffer.page_size = Some(hammer_infra::PageSize::Default);
-        EnginePool::new(
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_io()
+            .enable_time()
+            .build()
+            .expect("control runtime");
+        let pool = EnginePool::new(
             Engine::new_configured(RuntimeRegistry::new(), worker).expect("configured main engine"),
+            &runtime,
         )
-        .expect("engine pool")
+        .expect("engine pool");
+        (pool, runtime)
     }
 
     #[test]
@@ -1175,7 +1218,7 @@ mod tests {
         let _serial = DEFERRED_FINISH_SERIAL
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        let mut pool = deferred_finish_pool();
+        let (mut pool, _runtime) = deferred_finish_pool();
         start_workers(pool.main_engine_mut()).expect("worker startup");
 
         let engine = pool.main_engine();
@@ -1213,7 +1256,7 @@ mod tests {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         FAIL_WORKER_REFORK.store(false, Ordering::Release);
-        let mut pool = deferred_finish_pool();
+        let (mut pool, _runtime) = deferred_finish_pool();
         start_workers(pool.main_engine_mut()).expect("worker startup");
         // Register the failing init only after startup, so each worker's
         // already-called set does not skip it during the deferred refork.

@@ -49,6 +49,7 @@ thread-priority = { workspace = true }
 [dev-dependencies]
 criterion = { workspace = true }
 indoc = { workspace = true }
+hammer-ipc = { path = "../hammer-ipc" }
 hammer-service = { path = "../hammer-service" }
 tracing-subscriber = { workspace = true }
 # `test-util` enables `tokio::time::pause()` / `advance()` so timeout-based

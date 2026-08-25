@@ -73,6 +73,7 @@ socket2 = "0.6"
 lru = { version = "0.18", default-features = false }
 ipnet = { version = "2", features = ["serde"] }
 libc = "0.2"
+memmap2 = "0.9"
 core_affinity = "0.8"
 thread-priority = "1.2"
 rustc-hash = "2"

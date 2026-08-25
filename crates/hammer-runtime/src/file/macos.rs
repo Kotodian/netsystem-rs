@@ -70,7 +70,7 @@ impl Poller {
     ) -> RuntimeResult<()> {
         let slot = index.slot() as usize;
         if self.deadline_durations.get(slot).is_none() {
-            return Err(crate::error::RuntimeError::DeadlineIndexInvalid { index });
+            return Err(RuntimeError::DeadlineIndexInvalid { index }.into());
         }
         if self.deadline_armed[slot] {
             self.delete_timer(index)?;
@@ -87,7 +87,7 @@ impl Poller {
     pub(super) fn delete_deadline(&mut self, index: super::Index) -> RuntimeResult<()> {
         let slot = index.slot() as usize;
         if self.deadline_durations.get(slot).is_none() {
-            return Err(crate::error::RuntimeError::DeadlineIndexInvalid { index });
+            return Err(RuntimeError::DeadlineIndexInvalid { index }.into());
         }
         if self.deadline_armed[slot] {
             self.delete_timer(index)?;
@@ -99,7 +99,7 @@ impl Poller {
 
     pub(super) fn consume_deadline(&mut self, index: super::Index) -> RuntimeResult<()> {
         if self.deadline_durations.get(index.slot() as usize).is_none() {
-            return Err(crate::error::RuntimeError::DeadlineIndexInvalid { index });
+            return Err(RuntimeError::DeadlineIndexInvalid { index }.into());
         }
         self.deadline_armed[index.slot() as usize] = false;
         Ok(())
