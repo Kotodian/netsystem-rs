@@ -28,7 +28,7 @@ fn observe_main_loop_exit(_: &mut Engine) -> RuntimeResult<()> {
     Ok(())
 }
 
-fn engine_pool() -> EnginePool {
+fn engine_pool() -> (EnginePool, tokio::runtime::Runtime) {
     let buffers = DataPlaneBufferConfig {
         buffer_slot_capacity: 64,
         buffer_slots: 4,
@@ -40,13 +40,19 @@ fn engine_pool() -> EnginePool {
     engine
         .plugin_main_mut()
         .register_builtin_image(&__HAMMER_REGISTRATION_IMAGE);
-    EnginePool::new(engine).expect("engine pool")
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_io()
+        .enable_time()
+        .build()
+        .expect("control runtime");
+    let pool = EnginePool::new(engine, &runtime).expect("engine pool");
+    (pool, runtime)
 }
 
 #[test]
 fn engine_pool_close_dispatches_main_loop_exit_hooks_once() {
     EXIT_CALLS.store(0, Ordering::Relaxed);
-    let mut pool = engine_pool();
+    let (mut pool, _runtime) = engine_pool();
 
     pool.close().expect("close engine pool");
     pool.close().expect("repeat close is idempotent");

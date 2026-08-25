@@ -3,6 +3,7 @@ use std::fmt;
 use std::rc::Rc;
 
 use crate::error::{RuntimeError, RuntimeResult};
+use crate::file::{FILE_MAIN, FileMain};
 use hammer_core::data_plane::{
     BUFFER_CACHE_LINE_SIZE, BufferFrame, BufferPoolArena, BufferRef, BufferRefMut,
     DEFAULT_BUFFER_FRAME_POOL_SIZE, DataPlaneBuffers, Frame, FrameBatchWidth, Index, Next,
@@ -12,7 +13,6 @@ use hammer_core::error::{DataPlaneError, DataPlaneResult};
 use hammer_infra::PageSize;
 
 use crate::config::Worker;
-use crate::file::FileMain;
 use crate::handoff::{DataPlaneHandoffWorker, DataWorkerId, HANDOFF_SLOT_CAPACITY, HandoffSlot};
 use crate::node::{
     NodeEntry, NodeErrorCode, NodeFunctionRegistration, NodeRuntime, NodeRuntimeInner,
@@ -99,7 +99,6 @@ pub struct DataPlaneRuntime {
     active_numa_node: u32,
     trace: DataPlaneTrace,
     simd_bytes: usize,
-    file_main: Rc<RefCell<FileMain>>,
 }
 
 impl fmt::Debug for DataPlaneRuntime {
@@ -198,7 +197,6 @@ impl Clone for DataPlaneRuntime {
             active_numa_node: self.active_numa_node,
             trace: self.trace.clone(),
             simd_bytes: self.simd_bytes,
-            file_main: self.file_main.clone(),
         }
     }
 }
@@ -279,7 +277,6 @@ impl DataPlaneRuntime {
             handoff_node_handle: None,
             trace: DataPlaneTrace::default(),
             simd_bytes,
-            file_main: Rc::new(RefCell::new(FileMain::new()?)),
         })
     }
 
@@ -419,12 +416,16 @@ impl DataPlaneRuntime {
         &self.nodes
     }
 
-    pub fn file_main(&self) -> std::cell::Ref<'_, FileMain> {
-        self.file_main.borrow()
+    pub fn file_main(&self) -> &'static FileMain {
+        FILE_MAIN
+            .get()
+            .expect("FileMain is initialized before data-plane use")
     }
 
-    pub fn file_main_mut(&self) -> std::cell::RefMut<'_, FileMain> {
-        self.file_main.borrow_mut()
+    pub fn file_main_mut(&self) -> &'static FileMain {
+        FILE_MAIN
+            .get()
+            .expect("FileMain is initialized before data-plane use")
     }
 
     pub fn init_graph(&self, entries: &[NodeEntry]) -> RuntimeResult<()> {

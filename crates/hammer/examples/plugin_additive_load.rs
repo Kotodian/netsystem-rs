@@ -132,7 +132,10 @@ fn main() -> Result<(), ExampleError> {
         .map_err(|source| ExampleError::ProcessRuntime { source })?;
 
     let runtime = DataPlaneRuntime::new(DataPlaneRuntimeConfig::default());
-    let mut pool = EnginePool::new(Engine::new(runtime, RuntimeRegistry::new()))?;
+    let mut pool = EnginePool::new(
+        Engine::new(runtime, RuntimeRegistry::new()),
+        &process_runtime,
+    )?;
     pool.main_engine_mut()
         .plugin_main_mut()
         .register_builtin_image(hammer_service::registration_image());
