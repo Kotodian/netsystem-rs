@@ -238,7 +238,9 @@ impl AppClient {
         if words[1] != ATTACH_STATUS_ACCEPTED {
             return Err(AppClientError::AttachRejected);
         }
-        let application = ApplicationId::from_raw(words[2]);
+        let application = ApplicationId::from_raw(
+            u32::try_from(words[2]).map_err(|_| AppClientError::InvalidDescriptorPayload)?,
+        );
         let (mut metadata, descriptors) =
             descriptor::receive(&stream, APPLICATION_MQ_METADATA_BYTES)?;
         let words = descriptor::words_prefix::<APPLICATION_MQ_METADATA_WORDS>(&metadata)?;

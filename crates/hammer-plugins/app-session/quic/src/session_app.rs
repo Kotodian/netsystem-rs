@@ -1,6 +1,5 @@
 use std::time::Instant;
 
-use hammer_infra::pool::Index;
 use hammer_runtime::app::{SessionAppContext, SessionAppRegistration};
 use hammer_runtime::{DataWorkerId, Engine, RuntimeError, RuntimeResult};
 use hammer_service::session::SessionId;
@@ -25,7 +24,7 @@ enum QuicSessionError {
 }
 
 fn with_quic_worker<R>(
-    worker: &mut SessionWorker<Index>,
+    worker: &mut SessionWorker<u32>,
     operation: impl FnOnce(&mut crate::worker::QuicWorker) -> RuntimeResult<R>,
 ) -> RuntimeResult<R> {
     QUIC_MAIN
@@ -35,7 +34,7 @@ fn with_quic_worker<R>(
 }
 
 fn publish_context(
-    worker: &mut SessionWorker<Index>,
+    worker: &mut SessionWorker<u32>,
     session: SessionId,
     context: ContextId,
 ) -> RuntimeResult<()> {
@@ -49,7 +48,7 @@ fn publish_context(
 }
 
 fn accept(
-    worker: &mut SessionWorker<Index>,
+    worker: &mut SessionWorker<u32>,
     session: SessionId,
     context: SessionAppContext,
 ) -> RuntimeResult<()> {
@@ -74,7 +73,7 @@ fn accept(
 }
 
 fn connected(
-    worker: &mut SessionWorker<Index>,
+    worker: &mut SessionWorker<u32>,
     session: SessionId,
     _: SessionAppContext,
 ) -> RuntimeResult<()> {
@@ -104,7 +103,7 @@ fn connected(
 }
 
 fn builtin_rx(
-    worker: &mut SessionWorker<Index>,
+    worker: &mut SessionWorker<u32>,
     session: SessionId,
     context: SessionAppContext,
 ) -> RuntimeResult<()> {
@@ -133,7 +132,7 @@ fn builtin_rx(
 }
 
 fn builtin_tx(
-    worker: &mut SessionWorker<Index>,
+    worker: &mut SessionWorker<u32>,
     session: SessionId,
     context: SessionAppContext,
 ) -> RuntimeResult<()> {
@@ -150,7 +149,7 @@ fn builtin_tx(
 }
 
 fn close_lower_connection(
-    worker: &mut SessionWorker<Index>,
+    worker: &mut SessionWorker<u32>,
     session: SessionId,
     context: SessionAppContext,
 ) -> RuntimeResult<()> {
@@ -232,7 +231,7 @@ mod tests {
         // QUIC_MAIN is unset in this unit test, so this also proves the
         // zero-context path succeeds without requiring QUIC_MAIN.
         let applications = hammer_service::session::ApplicationMain::new(4);
-        let mut sessions = SessionWorker::<Index>::new(
+        let mut sessions = SessionWorker::<u32>::new(
             DataWorkerId::new(0),
             1,
             hammer_runtime::app::AppSessionConfig::default(),
@@ -253,7 +252,7 @@ mod tests {
         // the rollback path cannot reach QUIC_MAIN, so publish_context must
         // return the original set_app_session error instead of panicking.
         let applications = hammer_service::session::ApplicationMain::new(4);
-        let mut sessions = SessionWorker::<Index>::new(
+        let mut sessions = SessionWorker::<u32>::new(
             DataWorkerId::new(0),
             1,
             hammer_runtime::app::AppSessionConfig::default(),

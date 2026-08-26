@@ -360,7 +360,7 @@ pub(crate) fn validate_request_field_section(
 /// variants carry the same connection-error mapping as the sibling
 /// [`validate_request_field_section`]; `Publish` passes a FIFO-level failure
 /// (capacity, reservation, or commit) through.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, PartialEq, Eq)]
 pub(crate) enum RequestPublishError {
     /// QPACK decompression of the encoded field section failed.
     QpackDecompressionFailed,

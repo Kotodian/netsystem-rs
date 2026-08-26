@@ -12,9 +12,7 @@ use crate::ip::{
     IpInputError, IpInputTarget, IpProtocol, IpVersion, network_for_protocol, parse_ip_header,
 };
 use crate::protocol::ip_ecn::IpEcnCodepoint;
-use hammer_service::data_plane::{
-    FeatureArcSpec, FeatureArcStartHandle, set_buffer_node_error,
-};
+use hammer_service::data_plane::{FeatureArcSpec, FeatureArcStartHandle, set_buffer_node_error};
 use hammer_service::opaque::NetworkOpaque;
 
 #[hammer_component_macros::feature_arc]

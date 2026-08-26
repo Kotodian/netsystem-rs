@@ -16,8 +16,6 @@ pub enum RuntimeError {
     ServiceClosed,
     #[error("memory initialization has not completed")]
     MemoryNotInitialized,
-    #[error("File registry is full")]
-    FilePoolFull,
     #[error("global FileMain is already initialized")]
     FileMainAlreadyInitialized,
     #[error("global FileMain is not initialized")]
@@ -25,11 +23,11 @@ pub enum RuntimeError {
     #[error("global FileMain has already been taken")]
     FileMainAlreadyTaken,
     #[error("File index {index:?} is stale or not registered")]
-    FileIndexInvalid { index: hammer_infra::pool::Index },
+    FileIndexInvalid { index: u32 },
     #[error("deadline registry is full")]
     DeadlinePoolFull,
     #[error("deadline index {index:?} is stale or not registered")]
-    DeadlineIndexInvalid { index: hammer_infra::pool::Index },
+    DeadlineIndexInvalid { index: u32 },
     #[error("read File descriptor")]
     FileRead {
         #[source]

@@ -254,7 +254,7 @@ impl SegmentManager {
             return;
         };
         if allocation.session.strong_count() == 0 {
-            self.deallocate(allocation);
+            let _ = self.deallocate(allocation);
         } else {
             self.retired.push(allocation);
         }
@@ -311,7 +311,7 @@ impl AppWorker {
     }
 
     pub(crate) fn attach_session(&mut self, session_id: SessionId, app_session: Arc<AppSession>) {
-        let slot = session_id.pool_index().slot() as usize;
+        let slot = session_id.pool_index() as usize;
         self.session_slots[slot] = Some(SessionSlot {
             session_id,
             app_session,
@@ -319,7 +319,7 @@ impl AppWorker {
     }
 
     pub(crate) fn detach_session(&mut self, session_id: SessionId) -> Option<Arc<AppSession>> {
-        let index = session_id.pool_index().slot() as usize;
+        let index = session_id.pool_index() as usize;
         let entry = self.session_slots.get_mut(index)?;
         if entry
             .as_ref()
@@ -351,13 +351,13 @@ impl AppWorker {
     #[inline(always)]
     pub(crate) fn app_session(&self, session_id: SessionId) -> Option<&Arc<AppSession>> {
         self.session_slots
-            .get(session_id.pool_index().slot() as usize)?
+            .get(session_id.pool_index() as usize)?
             .as_ref()
             .and_then(|slot| (slot.session_id == session_id).then_some(&slot.app_session))
     }
 
-    /// Generation-safe lookup of the AppSession's allocation owner from its
-    /// AttachSlot, used to inherit the parent worker for peer-opened children.
+    /// Lookup of the AppSession's allocation owner from its AttachSlot,
+    /// used to inherit the parent worker for peer-opened children.
     #[inline(always)]
     pub(crate) fn session_allocation_owner(&self, session_id: SessionId) -> Option<u64> {
         let session = self.app_session(session_id)?;
@@ -641,7 +641,6 @@ impl AppWorker {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use hammer_infra::pool::Index as PoolIndex;
     use hammer_runtime::app::{AppSessionConfig, SessionFlags, SessionHandle, SessionMsgQueue};
     use std::error::Error;
 
@@ -652,7 +651,7 @@ mod tests {
     #[test]
     fn accepted_session_notifies_application_once() {
         let mut app = AppWorker::new(1024, 0, None);
-        let session_id = SessionId::from(PoolIndex::new(0, 1));
+        let session_id = SessionId::from(0u32);
         let session = app
             .create_app_session(
                 7,
@@ -682,7 +681,7 @@ mod tests {
         let mut app = AppWorker::new(1024, 0, None);
         let config = AppSessionConfig::new(64, 4);
         (0..2).for_each(|slot| {
-            let session_id = SessionId::from(PoolIndex::new(slot, 1));
+            let session_id = SessionId::from(slot);
             let handle = SessionHandle::new(slot, 0);
             let session = app
                 .create_app_session(7, None, handle, config, app_rx_mq())
@@ -699,7 +698,7 @@ mod tests {
         let mut app = AppWorker::new(1024, 0, None);
         let config = AppSessionConfig::new(64, 4);
         [(0, 7), (1, 9)].into_iter().for_each(|(slot, listener)| {
-            let session_id = SessionId::from(PoolIndex::new(slot, 1));
+            let session_id = SessionId::from(slot);
             let handle = SessionHandle::new(slot, 0);
             let session = app
                 .create_app_session(listener, None, handle, config, app_rx_mq())
@@ -716,7 +715,7 @@ mod tests {
     fn detached_session_storage_waits_for_last_session_reference() {
         let mut app = AppWorker::new(1024, 0, None);
         let config = AppSessionConfig::new(64, 4);
-        let session_id = SessionId::from(PoolIndex::new(0, 1));
+        let session_id = SessionId::from(0u32);
         let handle = SessionHandle::new(0, 0);
         let session = app
             .create_app_session(7, None, handle, config, app_rx_mq())
@@ -807,53 +806,47 @@ mod tests {
         let session_a = app
             .create_app_session(
                 7,
-                Some(hammer_runtime::app::ApplicationId::new(0, 0)),
+                Some(hammer_runtime::app::ApplicationId::new(0)),
                 SessionHandle::new(0, 0),
                 AppSessionConfig::new(64, 4),
                 app_rx_mq(),
             )
             .expect("first accepted Application Session");
-        app.attach_session(
-            SessionId::from(PoolIndex::new(0, 1)),
-            Arc::clone(&session_a),
-        );
+        app.attach_session(SessionId::from(0u32), Arc::clone(&session_a));
         assert!(
-            app.accepted(SessionId::from(PoolIndex::new(0, 1)))
+            app.accepted(SessionId::from(0u32))
                 .expect("first accepted publication")
         );
 
         let session_b = app
             .create_app_session(
                 8,
-                Some(hammer_runtime::app::ApplicationId::new(0, 0)),
+                Some(hammer_runtime::app::ApplicationId::new(0)),
                 SessionHandle::new(1, 0),
                 AppSessionConfig::new(64, 4),
                 app_rx_mq(),
             )
             .expect("second accepted Application Session");
-        app.attach_session(
-            SessionId::from(PoolIndex::new(1, 1)),
-            Arc::clone(&session_b),
-        );
+        app.attach_session(SessionId::from(1u32), Arc::clone(&session_b));
         // The single publication slot is occupied by session A, so session B
         // is re-queued, and a retry round re-queues it again while the queue
         // stays full.
         assert!(
-            !app.accepted(SessionId::from(PoolIndex::new(1, 1)))
+            !app.accepted(SessionId::from(1u32))
                 .expect("second publication blocked")
         );
         assert!(app.has_pending_accepted_sessions());
         let pending = app
             .next_pending_accepted()
             .expect("pending accepted Session");
-        assert_eq!(pending, SessionId::from(PoolIndex::new(1, 1)));
+        assert_eq!(pending, SessionId::from(1u32));
         assert!(
             !app.retry_pending_accepted(pending)
                 .expect("retry stays blocked")
         );
         assert!(app.has_pending_accepted_sessions());
         let requeued = app.next_pending_accepted().expect("re-queued Session");
-        assert_eq!(requeued, SessionId::from(PoolIndex::new(1, 1)));
+        assert_eq!(requeued, SessionId::from(1u32));
     }
 
     #[test]
@@ -866,11 +859,11 @@ mod tests {
             .expect("bind App server with a single publication slot");
         let mut app = AppWorker::new(8, 0, Some(server.publisher()));
         let handle = SessionHandle::new(0, 0);
-        let session_id = SessionId::from(PoolIndex::new(0, 1));
+        let session_id = SessionId::from(0u32);
         let session = app
             .create_app_session(
                 0x17,
-                Some(hammer_runtime::app::ApplicationId::new(0, 0)),
+                Some(hammer_runtime::app::ApplicationId::new(0)),
                 handle,
                 AppSessionConfig::new(64, 4),
                 app_rx_mq(),
@@ -938,18 +931,15 @@ mod tests {
         let session_a = app
             .create_app_session(
                 0x18,
-                Some(hammer_runtime::app::ApplicationId::new(0, 0)),
+                Some(hammer_runtime::app::ApplicationId::new(0)),
                 SessionHandle::new(0, 0),
                 AppSessionConfig::new(64, 4),
                 app_rx_mq(),
             )
             .expect("first accepted Application Session");
-        app.attach_session(
-            SessionId::from(PoolIndex::new(0, 1)),
-            Arc::clone(&session_a),
-        );
+        app.attach_session(SessionId::from(0u32), Arc::clone(&session_a));
         assert!(
-            app.accepted(SessionId::from(PoolIndex::new(0, 1)))
+            app.accepted(SessionId::from(0u32))
                 .expect("first accepted publication")
         );
 
@@ -957,11 +947,11 @@ mod tests {
         // pool slot (3): accepted_retry_queued must be tracked under the
         // session handle index, as VPP keys events by session index.
         let handle = SessionHandle::new(5, 0);
-        let session_id = SessionId::from(PoolIndex::new(3, 1));
+        let session_id = SessionId::from(3u32);
         let session = app
             .create_app_session(
                 0x18,
-                Some(hammer_runtime::app::ApplicationId::new(0, 0)),
+                Some(hammer_runtime::app::ApplicationId::new(0)),
                 handle,
                 AppSessionConfig::new(64, 4),
                 app_rx_mq(),
@@ -995,12 +985,12 @@ mod tests {
     #[test]
     fn set_connected_and_accepted_unavailable_without_publisher() {
         let mut app = AppWorker::new(8, 0, None);
-        let session_id = SessionId::from(PoolIndex::new(0, 1));
+        let session_id = SessionId::from(0u32);
         let handle = SessionHandle::new(0, 0);
         let session = app
             .create_app_session(
                 7,
-                Some(hammer_runtime::app::ApplicationId::new(0, 0)),
+                Some(hammer_runtime::app::ApplicationId::new(0)),
                 handle,
                 AppSessionConfig::new(64, 4),
                 app_rx_mq(),
@@ -1037,7 +1027,7 @@ mod tests {
         let server =
             hammer_runtime::attach::AppServer::bind(&socket_path, 1).expect("bind App server");
         let mut app = AppWorker::new(8, 0, Some(server.publisher()));
-        let session_id = SessionId::from(PoolIndex::new(0, 1));
+        let session_id = SessionId::from(0u32);
         let handle = SessionHandle::new(0, 0);
         let session = app
             .create_app_session(7, None, handle, AppSessionConfig::new(64, 4), app_rx_mq())
@@ -1073,12 +1063,12 @@ mod tests {
         let server =
             hammer_runtime::attach::AppServer::bind(&socket_path, 1).expect("bind App server");
         let mut app = AppWorker::new(8, 0, Some(server.publisher()));
-        let session_id = SessionId::from(PoolIndex::new(0, 1));
+        let session_id = SessionId::from(0u32);
         let handle = SessionHandle::new(0, 0);
         let session = app
             .create_app_session(
                 7,
-                Some(hammer_runtime::app::ApplicationId::new(0, 0)),
+                Some(hammer_runtime::app::ApplicationId::new(0)),
                 handle,
                 AppSessionConfig::new(64, 4),
                 app_rx_mq(),

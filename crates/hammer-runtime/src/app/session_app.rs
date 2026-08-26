@@ -1,4 +1,4 @@
-use hammer_infra::pool::{Index, Pool};
+use hammer_infra::pool::Pool;
 use hammer_infra::thread_owned::{ThreadOwned, ThreadOwnedError};
 use thiserror::Error;
 
@@ -85,8 +85,6 @@ enum SessionAppContextError {
     WorkerOutOfRange { worker: usize, worker_count: usize },
     #[error("Session App context storage was initialized for {actual} workers, not {expected}")]
     WorkerCountMismatch { expected: usize, actual: usize },
-    #[error("Session App context capacity {capacity} is exhausted on worker {worker}")]
-    CapacityExhausted { worker: usize, capacity: usize },
     #[error("Session App context {context:#x} is not owned by worker {worker}")]
     Missing {
         worker: usize,
@@ -141,18 +139,9 @@ where
             }
             Err(source) => return Err(context_worker_access(worker, source)),
         }
-        contexts
-            .with_mut(|contexts| {
-                contexts
-                    .insert(SessionAppContextSlot { app })
-                    .map(context_id)
-                    .ok_or(SessionAppContextError::CapacityExhausted {
-                        worker: worker.slot(),
-                        capacity: contexts.capacity(),
-                    })
-            })
-            .map_err(|source| context_worker_access(worker, source))?
-            .map_err(RuntimeError::from)
+        Ok(contexts
+            .with_mut(|contexts| u64::from(contexts.insert(SessionAppContextSlot { app })))
+            .map_err(|source| context_worker_access(worker, source))?)
     }
 
     pub fn with_mut<R>(
@@ -164,30 +153,46 @@ where
         let contexts = self.worker(worker, self.workers.len())?;
         Ok(contexts
             .with_mut(|contexts| {
-                let app = contexts.get_mut(context_index(context)).ok_or(
-                    SessionAppContextError::Missing {
+                let index = context_index(context).ok_or(SessionAppContextError::Missing {
+                    worker: worker.slot(),
+                    context,
+                })?;
+                let app = contexts
+                    .get_mut(index)
+                    .ok_or(SessionAppContextError::Missing {
                         worker: worker.slot(),
                         context,
-                    },
-                )?;
+                    })?;
                 operation(&mut app.app).map_err(SessionAppContextOperationError::Operation)
             })
             .map_err(|source| context_worker_access(worker, source))??)
     }
 
     pub fn remove(&self, worker: DataWorkerId, context: SessionAppContext) {
-        let contexts = self
-            .workers
-            .get(worker.slot())
-            .expect("Session App context worker exists");
-        contexts
-            .with_mut(|contexts| {
-                contexts
-                    .remove(context_index(context))
-                    .map(drop)
-                    .expect("Session App context is removed exactly once");
-            })
-            .expect("Session App context is removed by its owning Data Worker");
+        let Some(contexts) = self.workers.get(worker.slot()) else {
+            tracing::error!(
+                worker = worker.slot(),
+                ?context,
+                "Session App context worker is missing"
+            );
+            return;
+        };
+        let Some(index) = context_index(context) else {
+            tracing::error!(
+                worker = worker.slot(),
+                ?context,
+                "Session App context index is invalid"
+            );
+            return;
+        };
+        match contexts.with_mut(|contexts| {
+            drop(contexts.remove(index));
+        }) {
+            Ok(()) => {}
+            Err(source) => {
+                tracing::error!(worker = worker.slot(), ?context, %source, "failed to access Session App context worker");
+            }
+        }
     }
 
     fn worker(
@@ -240,13 +245,8 @@ fn context_worker_access(worker: DataWorkerId, source: ThreadOwnedError) -> Runt
 }
 
 #[inline]
-fn context_id(index: Index) -> SessionAppContext {
-    (index.slot() as u64) | ((index.generation() as u64) << 32)
-}
-
-#[inline]
-fn context_index(context: SessionAppContext) -> Index {
-    Index::new(context as u32, (context >> 32) as u32)
+fn context_index(context: SessionAppContext) -> Option<u32> {
+    u32::try_from(context).ok()
 }
 
 #[cfg(test)]

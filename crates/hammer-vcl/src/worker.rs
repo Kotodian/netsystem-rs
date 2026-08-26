@@ -7,7 +7,7 @@ use hammer_runtime::app::{
     ApplicationConnectionId, SessionAcceptedMsg, SessionAcceptedReplyMsg, SessionConnectError,
     SessionConnectedMsg, SessionControlError, SessionFlags, SessionHandle, TransportProtocol,
 };
-use hammer_runtime::{SessionListenEndpoint, SessionListenerId};
+use hammer_runtime::{SessionListenEndpoint, SessionHandle};
 
 use crate::pool::{SessionPool, VclSessionHandle};
 use crate::session::{VclInitiator, VclSession, VclSessionAttributes, VclSessionState};
@@ -636,7 +636,7 @@ impl VclWorker {
                 .wire_handle
                 .ok_or(VclError::SessionNotReady { session: handle })?;
             self.client
-                .unlisten(SessionListenerId::from_raw(wire.raw()))
+                .unlisten(SessionHandle::from_raw(wire.raw()))
                 .map_err(app_error)?;
         }
         self.store.close_cascade(handle)?;
@@ -1043,7 +1043,7 @@ mod tests {
     fn register_connect_tracks_and_resolve_clears() {
         let mut store = store();
         let session = store.create(TransportProtocol::Http, true).expect("create");
-        let connection = ApplicationConnectionId::new(1, 0);
+        let connection = ApplicationConnectionId::new(1);
         store.register_connect(session, connection);
         assert_eq!(store.pending_connects.get(&connection), Some(&session));
         assert_eq!(store.pending_by_handle.get(&session), Some(&connection));
@@ -1064,7 +1064,7 @@ mod tests {
         let mut store = store();
         let session = store.create(TransportProtocol::Http, true).expect("create");
         store.begin_connect(session).expect("begin connect");
-        let connection = ApplicationConnectionId::new(1, 0);
+        let connection = ApplicationConnectionId::new(1);
         store.register_connect(session, connection);
         assert!(store.pending_connects.contains_key(&connection));
         assert!(store.pending_by_handle.contains_key(&session));

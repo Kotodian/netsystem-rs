@@ -535,7 +535,7 @@ struct ListenWire {
     ip: [u8; 16],
     port: u16,
     worker: u32,
-    application: u64,
+    application: u32,
     app: u32,
     flags: u16,
     opaque: u64,
@@ -581,7 +581,7 @@ struct ConnectWire {
     local_is_ip4: u8,
     local_ip: [u8; 16],
     local_port: u16,
-    application: u64,
+    application: u32,
     app: u32,
     /// `SESSION_INVALID_HANDLE` (u64::MAX) when none; VPP session_types.h:52.
     parent_handle: u64,

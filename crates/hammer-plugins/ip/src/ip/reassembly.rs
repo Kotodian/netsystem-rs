@@ -8,7 +8,7 @@ use hammer_core::data_plane::{
 };
 use hammer_infra::bihash::{Bihash, FREE_U64};
 use hammer_infra::checksum::internet_checksum;
-use hammer_infra::pool::{Index as PoolIndex, Pool};
+use hammer_infra::pool::Pool;
 use hammer_runtime::sync::SpinLock;
 use hammer_runtime::{
     DataPlaneRuntime, DataWorkerId, Node, NodeProcessFn, NodeResult, NodeRuntimeData,
@@ -37,22 +37,18 @@ const DEFAULT_MAX_REASSEMBLIES: usize = 1024;
 const DEFAULT_MAX_FRAGMENTS_PER_REASSEMBLY: usize = 64;
 
 #[inline]
-pub fn pack_fragment_owner_value(index: PoolIndex, owner: DataWorkerId) -> u64 {
+pub fn pack_fragment_owner_value(index: u32, owner: DataWorkerId) -> u64 {
     debug_assert!(owner.slot() <= u16::MAX as usize);
-    debug_assert!(index.generation() <= u16::MAX as u32);
-    let value = u64::from(index.slot())
-        | (u64::from(index.generation() as u16) << 32)
-        | (u64::from(owner.slot() as u16) << 48);
+    let value = u64::from(index) | (u64::from(owner.slot() as u16) << 48);
     debug_assert_ne!(value, FREE_U64);
     value
 }
 
 #[inline]
-pub fn unpack_fragment_owner_value(value: u64) -> (PoolIndex, DataWorkerId) {
-    let slot = value as u32;
-    let generation = ((value >> 32) as u16) as u32;
+pub fn unpack_fragment_owner_value(value: u64) -> (u32, DataWorkerId) {
+    let index = value as u32;
     let owner = DataWorkerId::new(u32::from((value >> 48) as u16));
-    (PoolIndex::new(slot, generation), owner)
+    (index, owner)
 }
 
 #[hammer_component_macros::node_next]
@@ -98,7 +94,7 @@ impl IpReassemblyDirectory {
     pub fn claim_or_lookup(
         &self,
         key: IpFragmentKey,
-        index: PoolIndex,
+        index: u32,
         worker: DataWorkerId,
     ) -> (DataWorkerId, bool) {
         let value = pack_fragment_owner_value(index, worker);
@@ -112,7 +108,7 @@ impl IpReassemblyDirectory {
     }
 
     #[inline]
-    pub fn lookup(&self, key: IpFragmentKey) -> Option<(PoolIndex, DataWorkerId)> {
+    pub fn lookup(&self, key: IpFragmentKey) -> Option<(u32, DataWorkerId)> {
         self.inner.lookup(&key).map(unpack_fragment_owner_value)
     }
 
@@ -369,8 +365,11 @@ impl IpReassemblyWorker {
         self.last_id = if end == capacity { 0 } else { end };
         let mut expired_keys = Vec::new();
         for (index, context) in self.contexts.iter() {
-            let slot = index.slot() as usize;
-            if slot >= begin && slot < end && now.duration_since(context.updated_at) > timeout {
+            let position = index as usize;
+            if position >= begin
+                && position < end
+                && now.duration_since(context.updated_at) > timeout
+            {
                 expired_keys.push((index, context.key));
             }
         }
@@ -633,29 +632,30 @@ impl IpReassemblyWorker {
         if let Some(failed_index) = failed {
             let drop_next = IpReassemblyNext::Drop;
             let drop_slot = NodeNext::slot(drop_next);
-            if let Some(context) = self.contexts.remove(pool_index) {
-                let sendout = context.sendout_worker.unwrap_or(current_worker);
-                for fragment in context.fragments {
-                    let _ = add_packet_trace!(
-                        runtime,
-                        fragment.index,
-                        IpReassemblyTrace {
-                            key: Some(key),
-                            action: IpReassemblyTraceAction::Failed,
-                            current_worker,
-                            owner_worker: Some(sendout),
-                            next: Some(drop_slot),
-                        },
-                    );
-                    Self::emit_local(
-                        runtime,
-                        out_frame,
-                        nexts,
-                        out_len,
-                        drop_next,
-                        fragment.index,
-                    )?;
-                }
+            let Some(context) = self.contexts.remove(pool_index) else {
+                return Err(IpReassemblyError::FragmentContextMissing.into());
+            };
+            let sendout = context.sendout_worker.unwrap_or(current_worker);
+            for fragment in context.fragments {
+                let _ = add_packet_trace!(
+                    runtime,
+                    fragment.index,
+                    IpReassemblyTrace {
+                        key: Some(key),
+                        action: IpReassemblyTraceAction::Failed,
+                        current_worker,
+                        owner_worker: Some(sendout),
+                        next: Some(drop_slot),
+                    },
+                );
+                Self::emit_local(
+                    runtime,
+                    out_frame,
+                    nexts,
+                    out_len,
+                    drop_next,
+                    fragment.index,
+                )?;
             }
             let _ = add_packet_trace!(
                 runtime,
@@ -683,7 +683,10 @@ impl IpReassemblyWorker {
                 .get(pool_index)
                 .and_then(|context| context.sendout_worker)
                 .unwrap_or(current_worker);
-            let _ = self.contexts.remove(pool_index);
+            let _ = self
+                .contexts
+                .remove(pool_index)
+                .ok_or(IpReassemblyError::FragmentContextMissing)?;
             if let Some(directory) = &self.directory {
                 directory.remove(key);
             } else if let Some(handoff) = &self.handoff {

@@ -35,7 +35,6 @@ use std::cell::Cell;
 use std::sync::Arc;
 
 use hammer_infra::fifo::{Fifo, FifoError};
-use hammer_infra::pool::Index;
 use hammer_infra::segment::Segment;
 use hammer_runtime::app::{
     AppSessionConfig, ApplicationId, SessionAppContext, SessionAppId, SessionFlags,
@@ -74,7 +73,7 @@ use crate::worker::{
 /// exactly as the listener tests do.
 fn test_harness() -> (
     Arc<HttpMain>,
-    SessionWorker<Index>,
+    SessionWorker<u32>,
     ApplicationId,
     SessionAppId,
 ) {
@@ -83,7 +82,7 @@ fn test_harness() -> (
     let session_app = applications
         .session_app_id(NAME)
         .expect("test Application registry registers the builtin HTTP Session App");
-    let mut sessions = SessionWorker::<Index>::new(
+    let mut sessions = SessionWorker::<u32>::new(
         DataWorkerId::new(0),
         1,
         AppSessionConfig::default(),
@@ -138,7 +137,7 @@ thread_local! {
 }
 
 fn fake_open_stream(
-    _sessions: &mut SessionWorker<Index>,
+    _sessions: &mut SessionWorker<u32>,
     parent: SessionId,
     direction: SessionStreamDirection,
     app_context: SessionAppContext,
@@ -157,7 +156,7 @@ fn fake_open_stream(
 }
 
 fn fake_reset_stream(
-    _sessions: &mut SessionWorker<Index>,
+    _sessions: &mut SessionWorker<u32>,
     session_id: SessionId,
     code: SessionApplicationErrorCode,
 ) -> RuntimeResult<()> {
@@ -168,7 +167,7 @@ fn fake_reset_stream(
 }
 
 fn fake_stop_sending(
-    _sessions: &mut SessionWorker<Index>,
+    _sessions: &mut SessionWorker<u32>,
     _session_id: SessionId,
     _code: SessionApplicationErrorCode,
 ) -> RuntimeResult<()> {
@@ -176,7 +175,7 @@ fn fake_stop_sending(
 }
 
 fn fake_close_connection(
-    _sessions: &mut SessionWorker<Index>,
+    _sessions: &mut SessionWorker<u32>,
     session_id: SessionId,
     code: SessionApplicationErrorCode,
     reason: &[u8],
@@ -196,7 +195,7 @@ fn fake_close_connection(
 
 /// One Session App transport session owned by the test SessionWorker.
 fn construct_session(
-    sessions: &mut SessionWorker<Index>,
+    sessions: &mut SessionWorker<u32>,
     application: ApplicationId,
     session_app: SessionAppId,
     transport_slot: u32,
@@ -204,7 +203,7 @@ fn construct_session(
     sessions
         .construct_transport_session(
             HttpMain::TRANSPORT_ID,
-            Index::new(transport_slot, 0),
+            transport_slot,
             0,
             application,
             Some(session_app),
@@ -219,7 +218,7 @@ fn construct_session(
 /// metadata reports `Server` (runtime.rs `endpoint_role`), exactly like a
 /// lower QUIC connection the transport accepted.
 fn construct_accepted_root(
-    sessions: &mut SessionWorker<Index>,
+    sessions: &mut SessionWorker<u32>,
     application: ApplicationId,
     session_app: SessionAppId,
     transport_slot: u32,
@@ -227,7 +226,7 @@ fn construct_accepted_root(
     sessions
         .construct_transport_session(
             HttpMain::TRANSPORT_ID,
-            Index::new(transport_slot, 0),
+            transport_slot,
             0,
             application,
             Some(session_app),
@@ -269,7 +268,7 @@ fn worker_len(main: &HttpMain) -> usize {
 /// performs; returns the live `ContextId` for assertions.
 fn construct_parent(
     main: &HttpMain,
-    sessions: &mut SessionWorker<Index>,
+    sessions: &mut SessionWorker<u32>,
     application: ApplicationId,
     session_app: SessionAppId,
     transport_slot: u32,
@@ -289,7 +288,7 @@ fn construct_parent(
 /// A stream child of `parent` with the QUIC-derived flags and its listener
 /// handle pinned to the parent, as `quic_quicly_on_stream_open` does.
 fn construct_stream(
-    sessions: &mut SessionWorker<Index>,
+    sessions: &mut SessionWorker<u32>,
     application: ApplicationId,
     session_app: SessionAppId,
     transport_slot: u32,
@@ -313,10 +312,10 @@ fn construct_stream(
 
 /// A peer uni stream child of `parent`, accepted through `accept_on`; in the
 /// fresh stream pool the first allocation's `StreamContextId` is the
-/// deterministic `Index::new(0, 1)`.
+/// deterministic `0u32`.
 fn accept_peer_uni_stream(
     main: &HttpMain,
-    sessions: &mut SessionWorker<Index>,
+    sessions: &mut SessionWorker<u32>,
     application: ApplicationId,
     session_app: SessionAppId,
     transport_slot: u32,
@@ -336,10 +335,10 @@ fn accept_peer_uni_stream(
 
 /// One live parent connection and one accepted peer uni stream child, with
 /// the parent connection context. In a fresh stream pool the single stream's
-/// `StreamContextId` is the deterministic `Index::new(0, 1)`.
+/// `StreamContextId` is the deterministic `0u32`.
 fn construct_reset_stream(
     main: &HttpMain,
-    sessions: &mut SessionWorker<Index>,
+    sessions: &mut SessionWorker<u32>,
     application: ApplicationId,
     session_app: SessionAppId,
     transport_slot: u32,
@@ -354,20 +353,15 @@ fn construct_reset_stream(
         transport_slot + 1,
         parent,
     );
-    (
-        parent,
-        parent_context,
-        child,
-        StreamContextId::from(Index::new(0, 1)),
-    )
+    (parent, parent_context, child, StreamContextId::from(0u32))
 }
 
 /// One live parent connection and one accepted bidi request stream child,
 /// with the parent connection context. In a fresh stream pool the single
-/// stream's `StreamContextId` is the deterministic `Index::new(0, 1)`.
+/// stream's `StreamContextId` is the deterministic `0u32`.
 fn construct_bidi_request_stream(
     main: &HttpMain,
-    sessions: &mut SessionWorker<Index>,
+    sessions: &mut SessionWorker<u32>,
     application: ApplicationId,
     session_app: SessionAppId,
     transport_slot: u32,
@@ -383,12 +377,7 @@ fn construct_bidi_request_stream(
         false,
     );
     accept_on(main, sessions, child, 0).expect("accept bidi request stream");
-    (
-        parent,
-        parent_context,
-        child,
-        StreamContextId::from(Index::new(0, 1)),
-    )
+    (parent, parent_context, child, StreamContextId::from(0u32))
 }
 
 /// A complete zero-body HEADERS frame: a QPACK-encoded GET field section of
@@ -533,7 +522,7 @@ fn accept_root_records_server_role_from_accept_metadata() {
 
     // Fresh connection pool: the first allocation occupies slot 0 with
     // generation 1, so its identity is deterministic.
-    let context = ContextId::from(Index::new(0, 1));
+    let context = ContextId::from(0u32);
     main.with_worker(DataWorkerId::new(0), |http| {
         let connection = http.get(context).map_err(RuntimeError::from)?;
         assert_eq!(
@@ -567,7 +556,7 @@ fn connection_accept_bootstraps_control_stream_exactly_once() {
     let session = construct_session(&mut sessions, application, session_app, 1);
     // Fresh connection pool: the first allocation occupies slot 0 with
     // generation 1, so its identity is deterministic.
-    let context = ContextId::from(Index::new(0, 1));
+    let context = ContextId::from(0u32);
     OPEN_CALLS.with(|calls| calls.set(0));
     OPEN_CONTEXT.with(|seen| seen.set(0));
 
@@ -603,7 +592,7 @@ fn connection_accept_rolls_back_and_closes_lower_connection_when_bootstrap_fails
     let session = construct_session(&mut sessions, application, session_app, 1);
     // Fresh connection pool: the first allocation occupies slot 0 with
     // generation 1, so its identity is deterministic.
-    let context = ContextId::from(Index::new(0, 1));
+    let context = ContextId::from(0u32);
     OPEN_CALLS.with(|calls| calls.set(0));
     OPEN_FAIL.with(|fail| fail.set(true));
     CLOSE_CALLS.with(|calls| calls.set(0));
@@ -645,7 +634,7 @@ fn connection_accept_rolls_back_and_closes_lower_connection_when_bootstrap_fails
     OPEN_CONTEXT.with(|seen| {
         assert_eq!(
             seen.get(),
-            u64::from(ContextId::from(Index::new(0, 2))),
+            u64::from(ContextId::from(0u32)),
             "retry re-publishes a fresh context generation"
         )
     });
@@ -711,7 +700,7 @@ fn accept_without_published_authority_is_typed_plugin_error() {
     if HTTP_MAIN.get().is_some() {
         return;
     }
-    let mut sessions = SessionWorker::<Index>::new(
+    let mut sessions = SessionWorker::<u32>::new(
         DataWorkerId::new(0),
         1,
         AppSessionConfig::default(),
@@ -747,7 +736,7 @@ fn accept_stream_allocates_bidi_stream_bound_to_parent_and_direction() {
         // Fresh stream pool: the first allocation occupies slot 0 with
         // generation 1, so its identity is deterministic.
         let stream = http
-            .get_stream_for_session(StreamContextId::from(Index::new(0, 1)), child)
+            .get_stream_for_session(StreamContextId::from(0u32), child)
             .map_err(RuntimeError::from)?;
         assert_eq!(
             stream.parent, parent_context,
@@ -776,7 +765,7 @@ fn accept_stream_allocates_uni_stream_bound_to_parent_and_direction() {
     assert_eq!(worker_len(&main), 1, "parent connection context only");
     main.with_worker(DataWorkerId::new(0), |http| {
         let stream = http
-            .get_stream_for_session(StreamContextId::from(Index::new(0, 1)), child)
+            .get_stream_for_session(StreamContextId::from(0u32), child)
             .map_err(RuntimeError::from)?;
         assert_eq!(
             stream.parent, parent_context,
@@ -803,7 +792,7 @@ fn accept_stream_is_idempotent_when_context_is_already_published() {
     accept_on(&main, &mut sessions, child, 0).expect("first stream accept");
     // The dispatch layer passes the published StreamContextId back on a
     // duplicate accept; it must allocate nothing further.
-    let published = u64::from(StreamContextId::from(Index::new(0, 1)));
+    let published = u64::from(StreamContextId::from(0u32));
     accept_on(&main, &mut sessions, child, published).expect("duplicate accept is a no-op");
     main.with_worker(DataWorkerId::new(0), |http| {
         assert_eq!(http.stream_len(), 1, "no second stream allocated");
@@ -938,7 +927,7 @@ fn disconnect_finishes_peer_control_stream_clearing_slot_and_reader() {
     let (parent, parent_context) =
         construct_parent(&main, &mut sessions, application, session_app, 1);
     let child = accept_peer_uni_stream(&main, &mut sessions, application, session_app, 2, parent);
-    let stream = StreamContextId::from(Index::new(0, 1));
+    let stream = StreamContextId::from(0u32);
     main.with_worker(DataWorkerId::new(0), |http| {
         http.register_peer_uni_stream(stream, PeerUniStreamRole::Control)
             .map_err(RuntimeError::from)?;
@@ -987,8 +976,8 @@ fn disconnect_finishes_only_the_matching_peer_qpack_stream() {
         accept_peer_uni_stream(&main, &mut sessions, application, session_app, 2, parent);
     let decoder_child =
         accept_peer_uni_stream(&main, &mut sessions, application, session_app, 3, parent);
-    let encoder = StreamContextId::from(Index::new(0, 1));
-    let decoder = StreamContextId::from(Index::new(1, 1));
+    let encoder = StreamContextId::from(0u32);
+    let decoder = StreamContextId::from(1u32);
     main.with_worker(DataWorkerId::new(0), |http| {
         http.register_peer_uni_stream(encoder, PeerUniStreamRole::QpackEncoder)
             .map_err(RuntimeError::from)?;
@@ -1034,7 +1023,7 @@ fn disconnect_removes_unknown_peer_uni_stream_owning_no_slot() {
     let (parent, parent_context) =
         construct_parent(&main, &mut sessions, application, session_app, 1);
     let child = accept_peer_uni_stream(&main, &mut sessions, application, session_app, 2, parent);
-    let stream = StreamContextId::from(Index::new(0, 1));
+    let stream = StreamContextId::from(0u32);
     main.with_worker(DataWorkerId::new(0), |http| {
         http.register_peer_uni_stream(stream, PeerUniStreamRole::Unknown)
             .map_err(RuntimeError::from)?;
@@ -1083,7 +1072,7 @@ fn disconnect_with_stale_stream_context_is_typed_error() {
     let (parent, _parent_context) =
         construct_parent(&main, &mut sessions, application, session_app, 1);
     let child = accept_peer_uni_stream(&main, &mut sessions, application, session_app, 2, parent);
-    let stream = StreamContextId::from(Index::new(0, 1));
+    let stream = StreamContextId::from(0u32);
     main.with_worker(DataWorkerId::new(0), |http| {
         http.remove_stream(stream).map_err(RuntimeError::from)
     })
@@ -1145,7 +1134,7 @@ fn disconnect_for_root_connection_with_colliding_stream_context_id_is_a_noop() {
     // Fresh connection and stream pools both place their first allocation
     // at slot 0 with generation 1, so the root ConnectionContextId
     // numerically equals the live StreamContextId.
-    let stream = StreamContextId::from(Index::new(0, 1));
+    let stream = StreamContextId::from(0u32);
     assert_eq!(
         u64::from(parent_context),
         u64::from(stream),
@@ -1371,7 +1360,7 @@ fn reset_closes_the_connection_for_every_peer_uni_role() {
             session_app,
             transport_slot,
         );
-        let stream = StreamContextId::from(Index::new(index as u32, 1));
+        let stream = StreamContextId::from(index as u32);
         main.with_worker(DataWorkerId::new(0), |http| {
             http.register_peer_uni_stream(stream, role)
                 .map_err(RuntimeError::from)?;
@@ -1498,7 +1487,7 @@ fn cleanup_removes_root_http_context_and_clears_app_session() {
     accept_on(&main, &mut sessions, root, 0).expect("accept root");
     // Fresh connection pool: the first allocation occupies slot 0 with
     // generation 1, so its identity is deterministic.
-    let context = ContextId::from(Index::new(0, 1));
+    let context = ContextId::from(0u32);
     // A live stream child's accept metadata reports the parent's published
     // app session (runtime.rs `accept_metadata`), the observable side of the
     // root's `set_app_session` publication and of its cleanup clearing.
@@ -1624,7 +1613,7 @@ fn reset_on_root_connection_with_colliding_stream_context_id_is_a_noop() {
     // Fresh connection and stream pools both place their first allocation
     // at slot 0 with generation 1, so the root ConnectionContextId
     // numerically equals the live StreamContextId.
-    let stream = StreamContextId::from(Index::new(0, 1));
+    let stream = StreamContextId::from(0u32);
     assert_eq!(
         u64::from(parent_context),
         u64::from(stream),
@@ -1744,7 +1733,7 @@ fn cleanup_releases_peer_uni_stream_context_at_teardown() {
     let (parent, parent_context) =
         construct_parent(&main, &mut sessions, application, session_app, 1);
     let child = accept_peer_uni_stream(&main, &mut sessions, application, session_app, 2, parent);
-    let stream = StreamContextId::from(Index::new(0, 1));
+    let stream = StreamContextId::from(0u32);
     main.with_worker(DataWorkerId::new(0), |http| {
         http.register_peer_uni_stream(stream, PeerUniStreamRole::Control)
             .map_err(RuntimeError::from)?;
@@ -1791,7 +1780,7 @@ fn cleanup_after_peer_uni_fin_is_a_noop() {
     let (parent, parent_context) =
         construct_parent(&main, &mut sessions, application, session_app, 1);
     let child = accept_peer_uni_stream(&main, &mut sessions, application, session_app, 2, parent);
-    let stream = StreamContextId::from(Index::new(0, 1));
+    let stream = StreamContextId::from(0u32);
     main.with_worker(DataWorkerId::new(0), |http| {
         http.register_peer_uni_stream(stream, PeerUniStreamRole::Control)
             .map_err(RuntimeError::from)?;
@@ -1918,7 +1907,7 @@ fn builtin_rx_routes_only_bidi_request_streams() {
     // A peer uni stream dispatch is a no-op too: no upper Session, the uni
     // RX bytes stay readable, nothing resets.
     let uni = accept_peer_uni_stream(&main, &mut sessions, application, session_app, 2, parent);
-    let uni_stream = StreamContextId::from(Index::new(0, 1));
+    let uni_stream = StreamContextId::from(0u32);
     {
         let (uni_rx, _) = sessions.fifo_pair(uni).expect("uni RX fifo");
         uni_rx.enqueue(b"ignored");
@@ -1935,7 +1924,7 @@ fn builtin_rx_routes_only_bidi_request_streams() {
     // A bidi request stream dispatch feeds and publishes.
     let child = construct_stream(&mut sessions, application, session_app, 3, parent, false);
     accept_on(&main, &mut sessions, child, 0).expect("accept bidi request stream");
-    let stream = StreamContextId::from(Index::new(1, 1));
+    let stream = StreamContextId::from(1u32);
     let frame = zero_body_headers_frame();
     sessions
         .fifo_pair(child)

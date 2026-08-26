@@ -5,7 +5,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU8, Ordering};
 use std::thread::{self, ThreadId};
 
-use hammer_infra::pool::{Index, Pool};
+use hammer_infra::pool::Pool;
 use hammer_infra::segment::Segment;
 use hammer_runtime::Engine;
 use hammer_runtime::app::{
@@ -273,13 +273,7 @@ impl ApplicationMain {
     }
 
     pub fn attach(&self) -> Result<ApplicationId, ApplicationError> {
-        self.with_state_mut(|state| {
-            state.applications.insert(()).map(application_id).ok_or(
-                ApplicationError::CapacityExhausted {
-                    capacity: state.applications.capacity(),
-                },
-            )
-        })?
+        self.with_state_mut(|state| application_id(state.applications.insert(())))
     }
 
     /// Attaches an external Application and creates one private Session
@@ -315,14 +309,15 @@ impl ApplicationMain {
     }
 
     fn attach_with_runtime(&self, shared: bool) -> Result<ApplicationId, ApplicationError> {
-        let (worker_count, mq_capacity) = Engine::with_current(|engine| {
-            let session = engine
-                .registry
-                .get::<Session>()
-                .ok_or(ApplicationError::SessionMainMissing)?;
-            Ok((engine.configured_worker_count(), session.app_mq_capacity))
-        })
-        .ok_or(ApplicationError::SessionMainMissing)??;
+        let (worker_count, mq_capacity) =
+            Engine::with_current(|engine| -> Result<(usize, usize), ApplicationError> {
+                let session = engine
+                    .registry
+                    .get::<Session>()
+                    .ok_or(ApplicationError::SessionMainMissing)?;
+                Ok((engine.configured_worker_count(), session.app_mq_capacity))
+            })
+            .ok_or(ApplicationError::SessionMainMissing)??;
         self.attach_with_mq(worker_count, mq_capacity, shared)
     }
 
@@ -425,18 +420,16 @@ impl ApplicationMain {
         Ok(self
             .state()?
             .applications
-            .get(application_index(application))
-            .is_some())
+            .contains_key(application_index(application)))
     }
 
     pub fn detach(&self, application: ApplicationId) -> Result<(), ApplicationError> {
         self.ensure_main_thread()?;
         let index = application_index(application);
-        self.with_state_mut(|state| {
-            state
-                .applications
-                .get(index)
-                .ok_or(ApplicationError::Missing { application })?;
+        self.with_state_mut(|state| -> Result<(), ApplicationError> {
+            if !state.applications.contains_key(index) {
+                return Err(ApplicationError::Missing { application });
+            }
             Ok(())
         })??;
 
@@ -453,7 +446,7 @@ impl ApplicationMain {
             None => Ok(()),
         }?;
 
-        self.with_state_mut(|state| {
+        self.with_state_mut(|state| -> Result<(), ApplicationError> {
             if let Some(slot) = state.mq_resources.get_mut(application.slot() as usize)
                 && slot
                     .as_ref()
@@ -469,10 +462,7 @@ impl ApplicationMain {
                 })
                 .collect::<Vec<_>>();
             for index in listener_indexes {
-                state
-                    .listeners
-                    .remove(index)
-                    .expect("selected Application listener remains present until removal");
+                state.listeners.remove(index);
             }
             let connection_indexes = state
                 .connections
@@ -482,15 +472,9 @@ impl ApplicationMain {
                 })
                 .collect::<Vec<_>>();
             for index in connection_indexes {
-                state
-                    .connections
-                    .remove(index)
-                    .expect("selected Application connection remains present until removal");
+                state.connections.remove(index);
             }
-            state
-                .applications
-                .remove(index)
-                .expect("detaching Application remains allocated until removal");
+            state.applications.remove(index);
             Ok(())
         })??;
 
@@ -510,15 +494,7 @@ impl ApplicationMain {
             app,
             opaque,
         };
-        self.with_state_mut(|state| {
-            state
-                .listeners
-                .insert(listener)
-                .map(application_listener_id)
-                .ok_or(ApplicationError::ListenerCapacityExhausted {
-                    capacity: state.listeners.capacity(),
-                })
-        })?
+        self.with_state_mut(|state| application_listener_id(state.listeners.insert(listener)))
     }
 
     pub fn register_connection(
@@ -552,20 +528,10 @@ impl ApplicationMain {
                 })
                 .collect::<Vec<_>>();
             for index in connected {
-                if state.connections.remove(index).is_none() {
-                    tracing::warn!(
-                        ?index,
-                        "connected Application connection vanished before reap"
-                    );
-                }
+                drop(state.connections.remove(index));
             }
-            state
-                .connections
-                .insert(connection)
-                .map(application_connection_id)
-                .ok_or(ApplicationError::ConnectionCapacityExhausted {
-                    capacity: state.connections.capacity(),
-                })
+            let index = state.connections.insert(connection);
+            ApplicationConnectionId::new(index)
         })?
     }
 
@@ -577,9 +543,10 @@ impl ApplicationMain {
         // SAFETY: workers only read published entries. Main Thread mutation is
         // synchronized by the worker barrier.
         let state = unsafe { &*self.state.get() };
+        let index = application_connection_index(connection);
         state
             .connections
-            .get(application_connection_index(connection))
+            .get(index)
             .map(operation)
             .ok_or(ApplicationError::ConnectionMissing { connection })
     }
@@ -612,9 +579,10 @@ impl ApplicationMain {
     ) -> Result<(), ApplicationError> {
         self.ensure_active(application)?;
         self.with_state_mut(|state| {
+            let index = application_connection_index(connection);
             let entry = state
                 .connections
-                .get(application_connection_index(connection))
+                .get(index)
                 .ok_or(ApplicationError::ConnectionMissing { connection })?;
             if entry.application != application {
                 return Err(ApplicationError::ConnectionNotOwned {
@@ -624,7 +592,7 @@ impl ApplicationMain {
             }
             state
                 .connections
-                .remove(application_connection_index(connection))
+                .remove(index)
                 .ok_or(ApplicationError::ConnectionMissing { connection })?;
             Ok(())
         })?
@@ -637,9 +605,10 @@ impl ApplicationMain {
     ) -> Result<(), ApplicationError> {
         self.ensure_active(application)?;
         self.with_state_mut(|state| {
+            let index = application_connection_index(connection);
             let entry = state
                 .connections
-                .get(application_connection_index(connection))
+                .get(index)
                 .ok_or(ApplicationError::ConnectionMissing { connection })?;
             if entry.application != application {
                 return Err(ApplicationError::ConnectionNotOwned {
@@ -652,7 +621,7 @@ impl ApplicationMain {
             }
             state
                 .connections
-                .remove(application_connection_index(connection))
+                .remove(index)
                 .ok_or(ApplicationError::ConnectionMissing { connection })?;
             Ok(())
         })?
@@ -674,9 +643,15 @@ impl ApplicationMain {
             Ok(())
         })??;
         self.with_state_mut(|state| {
+            let index = application_listener_index(listener_id);
+            if !state.listeners.contains_key(index) {
+                return Err(ApplicationError::ListenerMissing {
+                    listener: listener_id,
+                });
+            }
             let entry = state
                 .listeners
-                .get(application_listener_index(listener_id))
+                .get(index)
                 .ok_or(ApplicationError::ListenerMissing {
                     listener: listener_id,
                 })?;
@@ -686,10 +661,7 @@ impl ApplicationMain {
                     listener: listener_id,
                 });
             }
-            state
-                .listeners
-                .remove(application_listener_index(listener_id))
-                .expect("validated Application listener remains present until removal");
+            drop(state.listeners.remove(index));
             Ok(())
         })?
     }
@@ -704,12 +676,19 @@ impl ApplicationMain {
     ) -> Result<(), ApplicationError> {
         self.ensure_active(application)?;
         self.with_state_mut(|state| {
-            let listener = state
-                .listeners
-                .get_mut(application_listener_index(listener_id))
-                .ok_or(ApplicationError::ListenerMissing {
+            let index = application_listener_index(listener_id);
+            if !state.listeners.contains_key(index) {
+                return Err(ApplicationError::ListenerMissing {
                     listener: listener_id,
-                })?;
+                });
+            }
+            let listener =
+                state
+                    .listeners
+                    .get_mut(index)
+                    .ok_or(ApplicationError::ListenerMissing {
+                        listener: listener_id,
+                    })?;
             if listener.application != application {
                 return Err(ApplicationError::ListenerNotOwned {
                     application,
@@ -729,11 +708,16 @@ impl ApplicationMain {
         // SAFETY: production callers are the Main Thread or a Data Worker that
         // participates in `barrier`; listener mutation stops every Data Worker.
         let state = unsafe { &*self.state.get() };
-        state
-            .listeners
-            .get(application_listener_index(listener))
-            .map(operation)
-            .ok_or(ApplicationError::ListenerMissing { listener })
+        let index = application_listener_index(listener);
+        if !state.listeners.contains_key(index) {
+            return Err(ApplicationError::ListenerMissing { listener });
+        }
+        Ok(operation(
+            state
+                .listeners
+                .get(index)
+                .ok_or(ApplicationError::ListenerMissing { listener })?,
+        ))
     }
 
     pub(crate) fn session_app(
@@ -789,8 +773,7 @@ impl ApplicationMain {
         if self
             .state()?
             .applications
-            .get(application_index(application))
-            .is_some()
+            .contains_key(application_index(application))
         {
             Ok(())
         } else {
@@ -867,8 +850,6 @@ impl Drop for ApplicationRegistration {
 #[hammer_component_macros::runtime_error(subsystem = "application")]
 #[derive(Debug, Error)]
 pub enum ApplicationError {
-    #[error("Application capacity {capacity} is exhausted")]
-    CapacityExhausted { capacity: usize },
     #[error("Application {application:?} is not attached")]
     Missing { application: ApplicationId },
     #[error("Application state is owned by another thread")]
@@ -921,10 +902,6 @@ pub enum ApplicationError {
     SessionAppDuplicate { name: String },
     #[error("Session App id {app:?} is not registered")]
     SessionAppUnregistered { app: SessionAppId },
-    #[error("Application listener capacity {capacity} is exhausted")]
-    ListenerCapacityExhausted { capacity: usize },
-    #[error("Application connection capacity {capacity} is exhausted")]
-    ConnectionCapacityExhausted { capacity: usize },
     #[error("Application listener {listener:?} is not registered")]
     ListenerMissing { listener: ApplicationListenerId },
     #[error("Application listener {listener:?} is not owned by Application {application:?}")]
@@ -946,33 +923,28 @@ pub enum ApplicationError {
 }
 
 #[inline]
-fn application_id(index: Index) -> ApplicationId {
-    ApplicationId::new(index.slot(), index.generation())
+fn application_id(index: u32) -> ApplicationId {
+    ApplicationId::new(index)
 }
 
 #[inline]
-fn application_index(application: ApplicationId) -> Index {
-    Index::new(application.slot(), application.generation())
+fn application_index(application: ApplicationId) -> u32 {
+    application.slot()
 }
 
 #[inline]
-fn application_listener_id(index: Index) -> ApplicationListenerId {
-    ApplicationListenerId::new(index.slot(), index.generation())
+fn application_listener_id(index: u32) -> ApplicationListenerId {
+    ApplicationListenerId::new(index)
 }
 
 #[inline]
-fn application_listener_index(listener: ApplicationListenerId) -> Index {
-    Index::new(listener.slot(), listener.generation())
+fn application_listener_index(listener: ApplicationListenerId) -> u32 {
+    listener.slot()
 }
 
 #[inline]
-fn application_connection_id(index: Index) -> ApplicationConnectionId {
-    ApplicationConnectionId::new(index.slot(), index.generation())
-}
-
-#[inline]
-fn application_connection_index(connection: ApplicationConnectionId) -> Index {
-    Index::new(connection.slot(), connection.generation())
+fn application_connection_index(connection: ApplicationConnectionId) -> u32 {
+    connection.slot()
 }
 
 #[cfg(test)]
@@ -1034,7 +1006,7 @@ mod tests {
     }
 
     #[test]
-    fn connected_connection_reclaims_exact_identity_without_later_connect() {
+    fn reclaimed_connection_slot_is_reused_by_next_connection() {
         let main = ApplicationMain::new(1);
         let application = main.attach().expect("attach Application");
         let connection = register_connection(&main, application);
@@ -1052,11 +1024,11 @@ mod tests {
             0
         );
         let replacement = register_connection(&main, application);
-        assert_ne!(connection, replacement);
+        assert_eq!(connection, replacement);
     }
 
     #[test]
-    fn register_connection_reclaims_connected_connections_before_capacity_check() {
+    fn register_connection_reclaims_connected_slot_before_next_insert() {
         let main = ApplicationMain::new(1);
         let application = main.attach().expect("attach Application");
         let connected = register_connection(&main, application);
@@ -1065,12 +1037,8 @@ mod tests {
             .expect("mark Application connection connected");
         let replacement = register_connection(&main, application);
 
-        assert_ne!(connected, replacement);
-        assert!(matches!(
-            main.with_connection(connected, |_| ()),
-            Err(ApplicationError::ConnectionMissing { connection }) if connection == connected
-        ));
-        assert!(main.with_connection(replacement, |_| ()).is_ok());
+        assert_eq!(connected, replacement);
+        assert!(main.with_connection(connected, |_| ()).is_ok());
     }
 
     #[test]
@@ -1115,7 +1083,7 @@ mod tests {
     }
 
     #[test]
-    fn stale_connection_identity_cannot_reclaim_replacement() {
+    fn reused_connection_index_refers_to_replacement() {
         let main = ApplicationMain::new(1);
         let application = main.attach().expect("attach Application");
         let first = register_connection(&main, application);
@@ -1125,14 +1093,14 @@ mod tests {
         main.reclaim_connection(application, first)
             .expect("reclaim first Application connection");
         let replacement = register_connection(&main, application);
-        assert_ne!(first, replacement);
+        assert_eq!(first, replacement);
 
         let error = main
             .reclaim_connection(application, first)
-            .expect_err("stale Application connection identity is rejected");
+            .expect_err("replacement Application connection is still connecting");
         assert!(matches!(
             error,
-            ApplicationError::ConnectionMissing { connection: rejected }
+            ApplicationError::ConnectionNotConnected { connection: rejected }
                 if rejected == first
         ));
     }

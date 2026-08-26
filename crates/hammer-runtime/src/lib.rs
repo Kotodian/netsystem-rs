@@ -45,8 +45,8 @@ pub use engine::{Engine, EnginePool, ensure_main_thread_with_barrier};
 pub mod config;
 pub mod file;
 pub use file::{
-    AsyncFileMain, Deadline, DeadlineFunction, File, FileFunction, FileFunctions, FileMain,
-    FILE_MAIN,
+    AsyncFileMain, Deadline, DeadlineFunction, FILE_MAIN, File, FileFunction, FileFunctions,
+    FileMain,
 };
 
 pub mod barrier;
@@ -98,7 +98,7 @@ pub use process::{
 };
 pub use registry::RuntimeRegistry;
 pub use session::{
-    SessionConnectEndpoint, SessionConnectionId, SessionListenEndpoint, SessionListenerId,
+    SessionConnectEndpoint, SessionConnectionId, SessionListenEndpoint,
     SessionTransportRegistration, SessionTransportStartListen, SessionTransportStopListen,
 };
 pub use trace::{

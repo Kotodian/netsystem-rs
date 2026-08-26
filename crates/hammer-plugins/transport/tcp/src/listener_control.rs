@@ -9,7 +9,7 @@ use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
 
 use crate::TcpCapabilities;
-use hammer_runtime::{DataWorkerId, RuntimeResult, SessionListenerId};
+use hammer_runtime::{DataWorkerId, RuntimeResult, SessionHandle};
 
 use super::TcpInputControlPlane;
 use super::lookup::{
@@ -25,7 +25,7 @@ pub enum TcpListenerControlError {
     #[error("tcp listener {lookup_id} is not registered")]
     NotRegistered { lookup_id: TcpLookupId },
     #[error("session listener {listener:?} is not registered by tcp")]
-    SessionListenerNotRegistered { listener: SessionListenerId },
+    SessionListenerNotRegistered { listener: SessionHandle },
     #[error("tcp lookup id space is exhausted")]
     LookupIdExhausted,
 }
@@ -33,7 +33,7 @@ pub enum TcpListenerControlError {
 #[derive(Clone)]
 struct TcpListenerRegistration {
     lookup_id: TcpLookupId,
-    session_listener: SessionListenerId,
+    session_listener: SessionHandle,
     owner_worker: DataWorkerId,
     bind: SocketAddr,
     capabilities: TcpCapabilities,
@@ -99,7 +99,7 @@ impl TcpListenerControlState {
         bind: SocketAddr,
         owner_worker: DataWorkerId,
         capabilities: TcpCapabilities,
-        session_listener: SessionListenerId,
+        session_listener: SessionHandle,
     ) -> RuntimeResult<TcpLookupId> {
         if self
             .tcp_listeners
@@ -137,7 +137,7 @@ impl TcpListenerControlState {
         self.publish_tcp_lookup()
     }
 
-    fn close_session_listener(&mut self, listener: SessionListenerId) -> RuntimeResult<()> {
+    fn close_session_listener(&mut self, listener: SessionHandle) -> RuntimeResult<()> {
         let lookup_id = self
             .tcp_listeners
             .iter()
@@ -226,13 +226,13 @@ impl TcpListenerControlHandle {
         bind: SocketAddr,
         owner_worker: DataWorkerId,
         capabilities: TcpCapabilities,
-        session_listener: SessionListenerId,
+        session_listener: SessionHandle,
     ) -> RuntimeResult<TcpLookupId> {
         let state = unsafe { self.state.get_mut() };
         state.bind_tcp_listener(bind, owner_worker, capabilities, session_listener)
     }
 
-    pub(super) fn close_session_listener(&self, listener: SessionListenerId) -> RuntimeResult<()> {
+    pub(super) fn close_session_listener(&self, listener: SessionHandle) -> RuntimeResult<()> {
         let state = unsafe { self.state.get_mut() };
         state.close_session_listener(listener)
     }
@@ -268,7 +268,7 @@ mod tests {
                 bind,
                 DataWorkerId::new(0),
                 TcpCapabilities::default(),
-                SessionListenerId::new(7, 3),
+                SessionHandle::new(7, 3),
             )
             .expect("bind tcp listener");
 
@@ -287,11 +287,11 @@ mod tests {
         assert_eq!(lookup_entry.unwrap().id, lookup_id);
         assert_eq!(
             lookup_entry.unwrap().session_listener,
-            SessionListenerId::new(7, 3)
+            SessionHandle::new(7, 3)
         );
 
         handle
-            .close_session_listener(SessionListenerId::new(7, 3))
+            .close_session_listener(SessionHandle::new(7, 3))
             .expect("close tcp listener");
         let snapshot = handle.snapshot_for_test();
         assert!(
@@ -316,7 +316,7 @@ mod tests {
         let control = TcpInputControlPlane::new();
         let handle = TcpListenerControlHandle::new(control);
         let bind = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 7301);
-        let listener = SessionListenerId::new(7, 3);
+        let listener = SessionHandle::new(7, 3);
         let lookup_id = handle
             .bind(
                 bind,
@@ -332,7 +332,7 @@ mod tests {
                     bind,
                     DataWorkerId::new(1),
                     TcpCapabilities::default(),
-                    SessionListenerId::new(8, 4),
+                    SessionHandle::new(8, 4),
                 )
                 .is_err(),
             "duplicate endpoint must be rejected"
@@ -360,7 +360,7 @@ mod tests {
 
         assert!(
             handle
-                .close_session_listener(SessionListenerId::new(999, 1))
+                .close_session_listener(SessionHandle::new(999, 1))
                 .is_err(),
             "missing Session listener is rejected"
         );
@@ -371,7 +371,7 @@ mod tests {
         let control = TcpInputControlPlane::new();
         let handle = TcpListenerControlHandle::new(control);
         let bind = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 7302);
-        let listener = SessionListenerId::new(9, 2);
+        let listener = SessionHandle::new(9, 2);
         handle
             .bind(
                 bind,

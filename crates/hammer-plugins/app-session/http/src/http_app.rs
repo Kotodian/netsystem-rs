@@ -39,7 +39,6 @@
 //! forwarding DATA to the app FIFO, http3.c:1184-1263), while every other
 //! callback still waits on lifecycle state its owning slice has not landed.
 
-use hammer_infra::pool::Index;
 use hammer_runtime::app::{SessionAppContext, SessionAppRegistration, SessionFlags};
 use hammer_runtime::session::{SessionApplicationErrorCode, SessionStreamDirection};
 use hammer_runtime::{DataWorkerId, Engine, RuntimeError, RuntimeResult};
@@ -117,7 +116,7 @@ pub(crate) static CALLBACKS: SessionAppCallbacks = SessionAppCallbacks {
 /// metadata carries no parent connection context, so no `ContextId` exists to
 /// name in `HttpWorkerError::ParentContextMissing`.
 #[hammer_component_macros::runtime_error(subsystem = "http")]
-#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+#[derive(Debug, PartialEq, Eq, thiserror::Error)]
 pub(crate) enum HttpAppError {
     #[error(
         "http stream accept requires a live parent connection context, session {session:?} has none"
@@ -214,7 +213,7 @@ pub(crate) fn request_publish_error_action(error: RequestPublishError) -> Reques
 /// aborts the app-visible request.
 fn execute_request_error_action(
     main: &HttpMain,
-    worker: &mut SessionWorker<Index>,
+    worker: &mut SessionWorker<u32>,
     stream: StreamContextId,
     session: SessionId,
     action: RequestErrorAction,
@@ -282,7 +281,7 @@ fn execute_request_error_action(
 /// context removed directly when publication fails so the primary typed
 /// error is preserved (QUIC publish rollback, quic session_app.rs:37-49).
 pub(crate) fn accept(
-    worker: &mut SessionWorker<Index>,
+    worker: &mut SessionWorker<u32>,
     session: SessionId,
     context: SessionAppContext,
 ) -> RuntimeResult<()> {
@@ -297,7 +296,7 @@ pub(crate) fn accept(
 /// tests bypass it (listener.rs:1071).
 pub(crate) fn accept_on(
     main: &HttpMain,
-    worker: &mut SessionWorker<Index>,
+    worker: &mut SessionWorker<u32>,
     session: SessionId,
     context: SessionAppContext,
 ) -> RuntimeResult<()> {
@@ -335,7 +334,7 @@ pub(crate) fn accept_on(
 /// `allocate_with_role`); the missing-metadata fallback passes `None`.
 fn accept_connection(
     main: &HttpMain,
-    worker: &mut SessionWorker<Index>,
+    worker: &mut SessionWorker<u32>,
     session: SessionId,
     role: Option<SessionEndpointRole>,
 ) -> RuntimeResult<()> {
@@ -393,7 +392,7 @@ fn accept_connection(
 /// as the connection path does.
 fn accept_stream(
     main: &HttpMain,
-    worker: &mut SessionWorker<Index>,
+    worker: &mut SessionWorker<u32>,
     session: SessionId,
     metadata: SessionAcceptMetadata,
 ) -> RuntimeResult<()> {
@@ -461,7 +460,7 @@ fn accept_stream(
 /// the existing `RuntimeError` conversion; there is no connection-close
 /// action here.
 pub(crate) fn disconnect(
-    worker: &mut SessionWorker<Index>,
+    worker: &mut SessionWorker<u32>,
     session: SessionId,
     context: SessionAppContext,
 ) -> RuntimeResult<()> {
@@ -476,7 +475,7 @@ pub(crate) fn disconnect(
 /// `accept_on` bypasses it (listener.rs:1071).
 pub(crate) fn disconnect_on(
     main: &HttpMain,
-    worker: &mut SessionWorker<Index>,
+    worker: &mut SessionWorker<u32>,
     session: SessionId,
     context: SessionAppContext,
 ) -> RuntimeResult<()> {
@@ -631,7 +630,7 @@ pub(crate) fn disconnect_on(
 /// `RuntimeError` conversion. The whole path is O(1) with no scan,
 /// allocation, lock, channel, or async work.
 pub(crate) fn reset(
-    worker: &mut SessionWorker<Index>,
+    worker: &mut SessionWorker<u32>,
     session: SessionId,
     context: SessionAppContext,
 ) -> RuntimeResult<()> {
@@ -650,7 +649,7 @@ pub(crate) fn reset(
 /// typed.
 fn stream_direction(
     main: &HttpMain,
-    worker: &mut SessionWorker<Index>,
+    worker: &mut SessionWorker<u32>,
     stream: StreamContextId,
     session: SessionId,
 ) -> RuntimeResult<Option<SessionStreamDirection>> {
@@ -669,7 +668,7 @@ fn stream_direction(
 /// bypasses it (listener.rs:1071).
 pub(crate) fn reset_on(
     main: &HttpMain,
-    worker: &mut SessionWorker<Index>,
+    worker: &mut SessionWorker<u32>,
     session: SessionId,
     context: SessionAppContext,
 ) -> RuntimeResult<()> {
@@ -763,7 +762,7 @@ pub(crate) fn reset_on(
 /// falling through to `http3_stream_free_req`, http3.c:59-78). The whole
 /// path is O(1) with no scan, allocation, lock, channel, or async work.
 pub(crate) fn cleanup(
-    worker: &mut SessionWorker<Index>,
+    worker: &mut SessionWorker<u32>,
     session: SessionId,
     context: SessionAppContext,
 ) -> RuntimeResult<()> {
@@ -778,7 +777,7 @@ pub(crate) fn cleanup(
 /// `accept_on` bypasses it (listener.rs:1071).
 pub(crate) fn cleanup_on(
     main: &HttpMain,
-    worker: &mut SessionWorker<Index>,
+    worker: &mut SessionWorker<u32>,
     session: SessionId,
     context: SessionAppContext,
 ) -> RuntimeResult<()> {
@@ -873,7 +872,7 @@ struct FeedOutcome {
 /// the generation-checked `StreamContextId`, exactly like `disconnect` and
 /// `reset` resolve their contexts.
 pub(crate) fn builtin_rx(
-    worker: &mut SessionWorker<Index>,
+    worker: &mut SessionWorker<u32>,
     session: SessionId,
     context: SessionAppContext,
 ) -> RuntimeResult<()> {
@@ -921,7 +920,7 @@ pub(crate) fn builtin_rx(
 /// the single bounded HEADERS capture, or async work.
 pub(crate) fn builtin_rx_on(
     main: &HttpMain,
-    worker: &mut SessionWorker<Index>,
+    worker: &mut SessionWorker<u32>,
     session: SessionId,
     context: SessionAppContext,
 ) -> RuntimeResult<()> {

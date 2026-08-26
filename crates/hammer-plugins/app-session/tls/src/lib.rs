@@ -237,7 +237,7 @@ impl SessionApp for Connection {
 
     fn accept(
         &mut self,
-        worker: &mut SessionWorker<hammer_infra::pool::Index>,
+        worker: &mut SessionWorker<u32>,
         session: SessionId,
         context: SessionAppContext,
     ) -> RuntimeResult<()> {
@@ -249,7 +249,7 @@ impl SessionApp for Connection {
 
     fn connected(
         &mut self,
-        worker: &mut SessionWorker<hammer_infra::pool::Index>,
+        worker: &mut SessionWorker<u32>,
         session: SessionId,
         context: SessionAppContext,
     ) -> RuntimeResult<()> {
@@ -261,7 +261,7 @@ impl SessionApp for Connection {
 
     fn builtin_rx(
         &mut self,
-        worker: &mut SessionWorker<hammer_infra::pool::Index>,
+        worker: &mut SessionWorker<u32>,
         _: SessionId,
         _: SessionAppContext,
     ) -> RuntimeResult<()> {
@@ -277,7 +277,7 @@ impl SessionApp for Connection {
 
     fn builtin_tx(
         &mut self,
-        worker: &mut SessionWorker<hammer_infra::pool::Index>,
+        worker: &mut SessionWorker<u32>,
         _: SessionId,
         _: SessionAppContext,
     ) -> RuntimeResult<()> {
@@ -293,7 +293,7 @@ impl SessionApp for Connection {
 
     fn disconnect(
         &mut self,
-        _: &mut SessionWorker<hammer_infra::pool::Index>,
+        _: &mut SessionWorker<u32>,
         _: SessionId,
         _: SessionAppContext,
     ) -> RuntimeResult<()> {
@@ -303,7 +303,7 @@ impl SessionApp for Connection {
 
     fn transport_closed(
         &mut self,
-        _: &mut SessionWorker<hammer_infra::pool::Index>,
+        _: &mut SessionWorker<u32>,
         _: SessionId,
         _: SessionAppContext,
     ) -> RuntimeResult<()> {

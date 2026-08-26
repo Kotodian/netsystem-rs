@@ -10,7 +10,7 @@ use bytes::Bytes;
 use hammer_core::data_plane::BufferFrame;
 use hammer_infra::bytes::BytesBuffer;
 use hammer_infra::fifo::{Fifo, FifoError};
-use hammer_infra::pool::{Index, Pool};
+use hammer_infra::pool::Pool;
 use hammer_infra::thread_owned::ThreadOwnedError;
 use hammer_infra::timer_wheel::TimerWheel1t2w2048sl;
 use hammer_runtime::app::{
@@ -20,7 +20,7 @@ use hammer_runtime::app::{
 use hammer_runtime::session::{SessionApplicationErrorCode, SessionStreamDirection};
 use hammer_runtime::{
     DataPlaneRuntime, DataWorkerId, NodeRuntimeData, RuntimeError, RuntimeResult,
-    SessionConnectionId, SessionListenerId,
+    SessionConnectionId, SessionHandle,
 };
 use hammer_service::session::ApplicationMain;
 use hammer_service::session::SessionId;
@@ -200,17 +200,17 @@ impl From<ContextId> for u64 {
     }
 }
 
-impl From<Index> for ContextId {
+impl From<u32> for ContextId {
     #[inline]
-    fn from(index: Index) -> Self {
-        Self(u64::from(index.slot()) | (u64::from(index.generation()) << 32))
+    fn from(index: u32) -> Self {
+        Self(u64::from(index))
     }
 }
 
-impl From<ContextId> for Index {
+impl From<ContextId> for u32 {
     #[inline]
     fn from(context: ContextId) -> Self {
-        Self::new(context.0 as u32, (context.0 >> 32) as u32)
+        context.0 as u32
     }
 }
 
@@ -218,10 +218,10 @@ impl From<ContextId> for Index {
 #[repr(C)]
 #[derive(Debug, Clone)]
 pub(super) struct ListenerContext {
-    pub(crate) outer_listener: SessionListenerId,
+    pub(crate) outer_listener: SessionHandle,
     pub(crate) outer_application: ApplicationId,
     pub(crate) inner_application_listener: hammer_runtime::app::ApplicationListenerId,
-    pub(crate) inner_session_listener: SessionListenerId,
+    pub(crate) inner_session_listener: SessionHandle,
     pub(crate) configuration: ConfigId,
     pub(crate) connection_timeout: u32,
     pub(crate) server_config: Option<Arc<quinn_proto::ServerConfig>>,
@@ -254,7 +254,7 @@ struct EngineConnection {
     /// correlation retained through the handshake.
     client_opaque: Option<SessionConnectionId>,
     /// Outer Session listener retained through a passive handshake.
-    outer_listener: Option<SessionListenerId>,
+    outer_listener: Option<SessionHandle>,
     pending_connect_error: Option<SessionConnectError>,
     client_config: Option<Arc<quinn_proto::ClientConfig>>,
     client_server_name: Option<String>,
@@ -270,7 +270,7 @@ impl EngineConnection {
         app: Option<SessionAppId>,
         app_opaque: Option<u64>,
         client_opaque: Option<SessionConnectionId>,
-        outer_listener: Option<SessionListenerId>,
+        outer_listener: Option<SessionHandle>,
     ) -> Self {
         Self {
             handle: None,
@@ -342,7 +342,7 @@ struct ConnectionContext {
 
 #[repr(C)]
 struct StreamContext {
-    parent: Index,
+    parent: u32,
     session: SessionId,
     stream: quinn_proto::StreamId,
     bytes_written: u64,
@@ -366,10 +366,10 @@ pub(super) struct Context {
 
 impl Context {
     pub(super) fn listener(
-        outer_listener: SessionListenerId,
+        outer_listener: SessionHandle,
         outer_application: ApplicationId,
         inner_application_listener: hammer_runtime::app::ApplicationListenerId,
-        inner_session_listener: SessionListenerId,
+        inner_session_listener: SessionHandle,
         configuration: ConfigId,
         connection_timeout: u32,
         server_config: Option<Arc<quinn_proto::ServerConfig>>,
@@ -456,7 +456,7 @@ impl Context {
         }
     }
 
-    fn stream(parent: Index, session: SessionId, stream: quinn_proto::StreamId) -> Self {
+    fn stream(parent: u32, session: SessionId, stream: quinn_proto::StreamId) -> Self {
         Self {
             role: ContextRole::Stream(StreamContext {
                 parent,
@@ -485,7 +485,7 @@ impl Context {
         }
     }
 
-    fn connection_index(&self, index: Index) -> Option<Index> {
+    fn connection_index(&self, index: u32) -> Option<u32> {
         match &self.role {
             ContextRole::Connection(_) => Some(index),
             ContextRole::Stream(stream) => Some(stream.parent),
@@ -588,7 +588,7 @@ impl QuicTimers {
         self.wheel
             .arm_timer(
                 context.0 as u32,
-                (context.0 >> 32) as u32,
+                0,
                 kind.id(),
                 self.duration_ticks(interval),
             )
@@ -596,9 +596,7 @@ impl QuicTimers {
     }
 
     fn stop(&mut self, context: ContextId, kind: QuicTimerKind) {
-        let _ = self
-            .wheel
-            .cancel_timer(context.0 as u32, (context.0 >> 32) as u32, kind.id());
+        let _ = self.wheel.cancel_timer(context.0 as u32, 0, kind.id());
     }
 
     fn advance(&mut self, now: Instant) {
@@ -622,14 +620,14 @@ impl QuicTimers {
         let consumed_ticks = consumed_ticks as u32;
         self.last_update += TIMER_RESOLUTION * consumed_ticks;
         for payload in self.expired.as_slice() {
-            let Some((slot, generation, kind_id)) = self.wheel.take_expired_timer(*payload) else {
+            let Some((index, _, kind_id)) = self.wheel.take_expired_timer(*payload) else {
                 continue;
             };
             let Some(kind) = QuicTimerKind::from_id(kind_id) else {
                 continue;
             };
             self.pending.push_back(QuicTimerToken {
-                context: ContextId(u64::from(slot) | (u64::from(generation) << 32)),
+                context: ContextId::from(index),
                 kind,
             });
         }
@@ -714,20 +712,14 @@ impl QuicWorker {
         listener_id: ContextId,
         listener: &ListenerContext,
     ) -> RuntimeResult<ContextId> {
-        let context = self
-            .contexts
-            .insert(Context::connection_with_listener(
-                lower_session,
-                Some(listener_id),
-                listener.outer_application,
-                Some(listener),
-                None,
-                None,
-            ))
-            .map(ContextId::from)
-            .ok_or_else(|| QuicWorkerError::ContextCapacityExhausted {
-                capacity: self.contexts.capacity(),
-            })?;
+        let context = ContextId::from(self.contexts.insert(Context::connection_with_listener(
+            lower_session,
+            Some(listener_id),
+            listener.outer_application,
+            Some(listener),
+            None,
+            None,
+        )));
         if let Err(timer) = self.timers.set(
             context,
             QuicTimerKind::Handshake,
@@ -782,29 +774,17 @@ impl QuicWorker {
         application_connection: SessionConnectionId,
         connection_timeout: u32,
     ) -> RuntimeResult<ContextId> {
-        if self.contexts.len() == self.contexts.capacity() {
-            return Err(QuicWorkerError::ContextCapacityExhausted {
-                capacity: self.contexts.capacity(),
-            }
-            .into());
-        }
-        let context = self
-            .contexts
-            .insert(Context::connection_with_client(
-                SessionId::from_raw(0),
-                application_connection,
-                application,
-                app,
-                app_opaque,
-                config,
-                server_name,
-                local,
-                remote,
-            ))
-            .map(ContextId::from)
-            .ok_or_else(|| QuicWorkerError::ContextCapacityExhausted {
-                capacity: self.contexts.capacity(),
-            })?;
+        let context = ContextId::from(self.contexts.insert(Context::connection_with_client(
+            SessionId::from_raw(0),
+            application_connection,
+            application,
+            app,
+            app_opaque,
+            config,
+            server_name,
+            local,
+            remote,
+        )));
         if let Err(error) = self.timers.set(
             context,
             QuicTimerKind::Handshake,
@@ -901,7 +881,7 @@ impl QuicWorker {
 
     pub(super) fn connect_stream(
         &mut self,
-        sessions: &mut SessionWorker<Index>,
+        sessions: &mut SessionWorker<u32>,
         parent: SessionHandle,
         connection: SessionConnectionId,
         flags: SessionFlags,
@@ -921,16 +901,11 @@ impl QuicWorker {
             return Err(QuicWorkerError::ParentSessionInvalid { parent }.into());
         }
 
-        let child_index = self
-            .contexts
-            .insert(Context::stream(
-                parent_index,
-                SessionId::from_raw(0),
-                quinn_proto::StreamId::new(quinn_proto::Side::Client, quinn_proto::Dir::Bi, 0),
-            ))
-            .ok_or_else(|| QuicWorkerError::ContextCapacityExhausted {
-                capacity: self.contexts.capacity(),
-            })?;
+        let child_index = self.contexts.insert(Context::stream(
+            parent_index,
+            SessionId::from_raw(0),
+            quinn_proto::StreamId::new(quinn_proto::Side::Client, quinn_proto::Dir::Bi, 0),
+        ));
         let child_session = match sessions.stream_connect_pending(Self::ID, child_index, connection)
         {
             Ok(session) => session,
@@ -1066,7 +1041,7 @@ impl QuicWorker {
     pub(super) fn open_stream(
         &mut self,
         applications: &ApplicationMain,
-        sessions: &mut SessionWorker<Index>,
+        sessions: &mut SessionWorker<u32>,
         parent: SessionId,
         direction: SessionStreamDirection,
         app_context: SessionAppContext,
@@ -1185,7 +1160,7 @@ impl QuicWorker {
     /// or connection context.
     fn session_context(
         &self,
-        sessions: &SessionWorker<Index>,
+        sessions: &SessionWorker<u32>,
         session: SessionId,
     ) -> Result<ContextId, QuicWorkerError> {
         let (transport, index) = sessions
@@ -1236,7 +1211,7 @@ impl QuicWorker {
     /// quinn call, so a rejection never mutates transport state.
     pub(super) fn reset_stream(
         &mut self,
-        sessions: &mut SessionWorker<Index>,
+        sessions: &mut SessionWorker<u32>,
         session: SessionId,
         code: SessionApplicationErrorCode,
     ) -> RuntimeResult<()> {
@@ -1314,7 +1289,7 @@ impl QuicWorker {
     /// never mutates transport state.
     pub(super) fn stop_sending(
         &mut self,
-        sessions: &mut SessionWorker<Index>,
+        sessions: &mut SessionWorker<u32>,
         session: SessionId,
         code: SessionApplicationErrorCode,
     ) -> RuntimeResult<()> {
@@ -1384,7 +1359,7 @@ impl QuicWorker {
     /// connection state itself makes repeated dispatch a no-op.
     pub(super) fn close_connection_action(
         &mut self,
-        sessions: &mut SessionWorker<Index>,
+        sessions: &mut SessionWorker<u32>,
         session: SessionId,
         code: SessionApplicationErrorCode,
         reason: &[u8],
@@ -1450,7 +1425,7 @@ impl QuicWorker {
             .and_then(|connection| connection.listener)
     }
 
-    pub(super) fn connection_index(&self, index: Index) -> RuntimeResult<Index> {
+    pub(super) fn connection_index(&self, index: u32) -> RuntimeResult<u32> {
         self.contexts
             .get(index)
             .and_then(|context| context.connection_index(index))
@@ -1465,15 +1440,13 @@ impl QuicWorker {
     pub(super) fn remove_context(&mut self, context: ContextId) -> RuntimeResult<()> {
         self.timers.stop(context, QuicTimerKind::Handshake);
         self.timers.stop(context, QuicTimerKind::Transmit);
-        self.contexts
-            .remove(context.into())
-            .map(drop)
-            .ok_or_else(|| QuicWorkerError::ContextMissing { context }.into())
+        self.contexts.remove(u32::from(context));
+        Ok(())
     }
 
     pub(super) fn process_udp_rx(
         &mut self,
-        sessions: &mut SessionWorker<Index>,
+        sessions: &mut SessionWorker<u32>,
         lower_session: SessionId,
         context: ContextId,
         now: Instant,
@@ -1593,7 +1566,7 @@ impl QuicWorker {
 
     fn process_one_datagram(
         &mut self,
-        sessions: &mut SessionWorker<Index>,
+        sessions: &mut SessionWorker<u32>,
         context: ContextId,
         local: SocketAddr,
         remote: SocketAddr,
@@ -1677,7 +1650,7 @@ impl QuicWorker {
 
     fn handle_stream_data_error(
         &mut self,
-        sessions: &mut SessionWorker<Index>,
+        sessions: &mut SessionWorker<u32>,
         context: ContextId,
         error: quinn_proto::StreamDataError,
     ) -> RuntimeResult<()> {
@@ -1692,7 +1665,7 @@ impl QuicWorker {
 
     fn accept_first_datagram(
         &mut self,
-        sessions: &mut SessionWorker<Index>,
+        sessions: &mut SessionWorker<u32>,
         context: ContextId,
         local: SocketAddr,
         remote: SocketAddr,
@@ -1776,7 +1749,7 @@ impl QuicWorker {
 
     fn drain_connection_events(
         &mut self,
-        sessions: &mut SessionWorker<Index>,
+        sessions: &mut SessionWorker<u32>,
         context: ContextId,
         now: Instant,
     ) -> RuntimeResult<()> {
@@ -1786,7 +1759,7 @@ impl QuicWorker {
 
     fn drain_connection_events_inner(
         &mut self,
-        sessions: &mut SessionWorker<Index>,
+        sessions: &mut SessionWorker<u32>,
         context: ContextId,
         now: Instant,
     ) -> RuntimeResult<()> {
@@ -1842,7 +1815,7 @@ impl QuicWorker {
 
     fn handle_connection_event(
         &mut self,
-        sessions: &mut SessionWorker<Index>,
+        sessions: &mut SessionWorker<u32>,
         context: ContextId,
         event: Event,
     ) -> RuntimeResult<()> {
@@ -1960,7 +1933,7 @@ impl QuicWorker {
 
     fn handle_stream_event(
         &mut self,
-        sessions: &mut SessionWorker<Index>,
+        sessions: &mut SessionWorker<u32>,
         context: ContextId,
         event: StreamEvent,
     ) -> RuntimeResult<()> {
@@ -2059,7 +2032,7 @@ impl QuicWorker {
     /// Session stay live; only the notification is deduplicated.
     fn notify_stream_receive_closed(
         &mut self,
-        sessions: &mut SessionWorker<Index>,
+        sessions: &mut SessionWorker<u32>,
         context: ContextId,
         stream: quinn_proto::StreamId,
     ) -> RuntimeResult<()> {
@@ -2103,7 +2076,7 @@ impl QuicWorker {
 
     fn close_stream_context(
         &mut self,
-        sessions: &mut SessionWorker<Index>,
+        sessions: &mut SessionWorker<u32>,
         context: ContextId,
         stream: quinn_proto::StreamId,
         reset: bool,
@@ -2119,7 +2092,7 @@ impl QuicWorker {
                     .iter()
                     .find_map(|(index, value)| match &value.role {
                         ContextRole::Stream(stream_context)
-                            if stream_context.parent == context.into()
+                            if stream_context.parent == u32::from(context)
                                 && stream_context.stream == stream =>
                         {
                             Some(index)
@@ -2178,7 +2151,7 @@ impl QuicWorker {
 
     fn create_stream_context(
         &mut self,
-        sessions: &mut SessionWorker<Index>,
+        sessions: &mut SessionWorker<u32>,
         context: ContextId,
         stream: quinn_proto::StreamId,
         accepted: bool,
@@ -2202,7 +2175,7 @@ impl QuicWorker {
             .engine
             .as_ref()
             .map(|engine| (engine.application, engine.app, engine.app_opaque))
-            .unwrap_or((ApplicationId::new(0, 0), None, None));
+            .unwrap_or((ApplicationId::new(0), None, None));
         let (stream_context, session_id, rx_fifo, tx_fifo, app_tx_data_len) = self
             .allocate_stream_context(
                 sessions,
@@ -2232,7 +2205,7 @@ impl QuicWorker {
 
     fn create_stream_context_with_io(
         &mut self,
-        sessions: &mut SessionWorker<Index>,
+        sessions: &mut SessionWorker<u32>,
         context: ContextId,
         stream: quinn_proto::StreamId,
         accepted: bool,
@@ -2268,14 +2241,14 @@ impl QuicWorker {
 
     fn allocate_stream_context(
         &mut self,
-        sessions: &mut SessionWorker<Index>,
+        sessions: &mut SessionWorker<u32>,
         context: ContextId,
         stream: quinn_proto::StreamId,
         accepted: bool,
         application: ApplicationId,
         app: Option<SessionAppId>,
         opaque: Option<u64>,
-    ) -> RuntimeResult<(Index, SessionId, Arc<Fifo>, Arc<Fifo>, u64)> {
+    ) -> RuntimeResult<(u32, SessionId, Arc<Fifo>, Arc<Fifo>, u64)> {
         let parent = context.into();
         let parent_session = self
             .contexts
@@ -2322,15 +2295,9 @@ impl QuicWorker {
         // VPP `quic_quicly_on_stream_open` allocates the stream transport
         // context first (`quic_ctx_alloc`), then binds the stream Session to
         // it (`stream_session->connection_index = sctx->c_c_index`).
-        let Some(stream_context) =
+        let stream_context =
             self.contexts
-                .insert(Context::stream(parent, SessionId::from_raw(0), stream))
-        else {
-            return Err(QuicWorkerError::ContextCapacityExhausted {
-                capacity: self.contexts.capacity(),
-            }
-            .into());
-        };
+                .insert(Context::stream(parent, SessionId::from_raw(0), stream));
         let session_id = match sessions.construct_transport_session(
             QuicWorker::ID,
             stream_context,
@@ -2429,7 +2396,7 @@ impl QuicWorker {
 
     fn drain_io_events(
         &mut self,
-        sessions: &mut SessionWorker<Index>,
+        sessions: &mut SessionWorker<u32>,
         context: ContextId,
     ) -> RuntimeResult<()> {
         {
@@ -2464,7 +2431,7 @@ impl QuicWorker {
 
     fn schedule_connection_outputs(
         &mut self,
-        sessions: &mut SessionWorker<Index>,
+        sessions: &mut SessionWorker<u32>,
         now: Instant,
     ) -> RuntimeResult<()> {
         std::mem::swap(
@@ -2543,7 +2510,7 @@ impl QuicWorker {
 
     pub(super) fn send_packets(
         &mut self,
-        sessions: &mut SessionWorker<Index>,
+        sessions: &mut SessionWorker<u32>,
         context: ContextId,
         now: Instant,
     ) -> RuntimeResult<()> {
@@ -2684,7 +2651,7 @@ impl QuicWorker {
 
     fn send_response(
         &mut self,
-        sessions: &mut SessionWorker<Index>,
+        sessions: &mut SessionWorker<u32>,
         context: ContextId,
         local: SocketAddr,
         remote: SocketAddr,
@@ -2742,7 +2709,7 @@ impl QuicWorker {
         Ok(())
     }
 
-    pub(super) fn app_rx_evt(&mut self, index: Index, rx_available: usize) -> RuntimeResult<bool> {
+    pub(super) fn app_rx_evt(&mut self, index: u32, rx_available: usize) -> RuntimeResult<bool> {
         let context = ContextId::from(index);
         let (stream_id, parent) = {
             let stream = self
@@ -2795,7 +2762,7 @@ impl QuicWorker {
 
     fn update_time(
         &mut self,
-        sessions: &mut SessionWorker<Index>,
+        sessions: &mut SessionWorker<u32>,
         now: Instant,
     ) -> RuntimeResult<()> {
         self.timers.advance(now);
@@ -2827,8 +2794,8 @@ impl QuicWorker {
         self.schedule_connection_outputs(sessions, now)
     }
 
-    fn stream_contexts(&self, parent: ContextId) -> Vec<(Index, SessionId)> {
-        let parent = parent.into();
+    fn stream_contexts(&self, parent: ContextId) -> Vec<(u32, SessionId)> {
+        let parent = u32::from(parent);
         self.contexts
             .iter()
             .filter_map(|(index, value)| match &value.role {
@@ -2869,7 +2836,7 @@ impl QuicWorker {
 
     fn notify_streams_reset(
         &self,
-        sessions: &mut SessionWorker<Index>,
+        sessions: &mut SessionWorker<u32>,
         context: ContextId,
     ) -> RuntimeResult<()> {
         for (index, session) in self.stream_contexts(context) {
@@ -2882,7 +2849,7 @@ impl QuicWorker {
 
     fn notify_streams_closing(
         &self,
-        sessions: &mut SessionWorker<Index>,
+        sessions: &mut SessionWorker<u32>,
         context: ContextId,
     ) -> RuntimeResult<()> {
         for (index, session) in self.stream_contexts(context) {
@@ -2895,7 +2862,7 @@ impl QuicWorker {
 
     fn finalize_connection(
         &mut self,
-        sessions: &mut SessionWorker<Index>,
+        sessions: &mut SessionWorker<u32>,
         context: ContextId,
     ) -> RuntimeResult<()> {
         let stream_contexts = self.stream_contexts(context);
@@ -2948,7 +2915,7 @@ impl QuicWorker {
 
     fn maybe_finalize_connection(
         &mut self,
-        sessions: &mut SessionWorker<Index>,
+        sessions: &mut SessionWorker<u32>,
         context: ContextId,
     ) -> RuntimeResult<()> {
         let (state, connection_session) = self
@@ -2973,7 +2940,7 @@ impl QuicWorker {
 
     fn begin_connection_close(
         &mut self,
-        sessions: &mut SessionWorker<Index>,
+        sessions: &mut SessionWorker<u32>,
         context: ContextId,
         now: Instant,
     ) -> RuntimeResult<()> {
@@ -3022,7 +2989,7 @@ impl QuicWorker {
 
     pub(super) fn transport_closed(
         &mut self,
-        sessions: &mut SessionWorker<Index>,
+        sessions: &mut SessionWorker<u32>,
         context: ContextId,
     ) -> RuntimeResult<()> {
         let (application_connection, state) = self
@@ -3078,7 +3045,7 @@ impl QuicWorker {
 
     pub(super) fn close_connection(
         &mut self,
-        sessions: &mut SessionWorker<Index>,
+        sessions: &mut SessionWorker<u32>,
         context: ContextId,
         reason: Option<SessionConnectError>,
     ) -> RuntimeResult<()> {
@@ -3161,9 +3128,9 @@ impl QuicWorker {
 
     pub(super) fn stream_tx_event(
         &mut self,
-        sessions: &mut SessionWorker<Index>,
+        sessions: &mut SessionWorker<u32>,
         session_id: SessionId,
-        index: Index,
+        index: u32,
         now: Instant,
     ) -> RuntimeResult<()> {
         let (stream_id, parent, bytes_written, app_close_pending) = {
@@ -3271,7 +3238,7 @@ impl QuicWorker {
 
 pub(crate) fn quic_session_queue_update_time(
     _runtime: &DataPlaneRuntime,
-    sessions: &mut SessionWorker<Index>,
+    sessions: &mut SessionWorker<u32>,
     _: NodeRuntimeData,
     _: SessionQueueNext,
     now: Instant,
@@ -3286,7 +3253,7 @@ pub(crate) fn quic_session_queue_update_time(
 
 pub(crate) fn quic_session_queue_dispatch(
     runtime: &DataPlaneRuntime,
-    sessions: &mut SessionWorker<Index>,
+    sessions: &mut SessionWorker<u32>,
     _: NodeRuntimeData,
     output_next: SessionQueueNext,
     now: Instant,
@@ -3312,7 +3279,7 @@ pub(crate) fn quic_session_queue_dispatch(
 /// authority) comes from the same QUIC_MAIN channel the session queue
 /// entry points use. No scan, allocation, or lock on the dispatch path.
 pub(crate) fn quic_transport_open_stream(
-    sessions: &mut SessionWorker<Index>,
+    sessions: &mut SessionWorker<u32>,
     parent: SessionId,
     direction: SessionStreamDirection,
     app_context: SessionAppContext,
@@ -3333,7 +3300,7 @@ pub(crate) fn quic_transport_open_stream(
 /// resolving it from the session entry's transport proto
 /// (session.c:1422, transport.c:500-505).
 ///
-pub(crate) fn quic_transport_actions() -> SessionTransportWorkerActions<Index> {
+pub(crate) fn quic_transport_actions() -> SessionTransportWorkerActions<u32> {
     SessionTransportWorkerActions::new(
         quic_transport_open_stream,
         quic_transport_reset_stream,
@@ -3351,7 +3318,7 @@ pub(crate) fn quic_transport_actions() -> SessionTransportWorkerActions<Index> {
 /// QUIC_MAIN channel the session queue entry points use. No scan,
 /// allocation, or lock on the dispatch path.
 pub(crate) fn quic_transport_reset_stream(
-    sessions: &mut SessionWorker<Index>,
+    sessions: &mut SessionWorker<u32>,
     session: SessionId,
     code: SessionApplicationErrorCode,
 ) -> RuntimeResult<()> {
@@ -3373,7 +3340,7 @@ pub(crate) fn quic_transport_reset_stream(
 /// QUIC_MAIN channel the session queue entry points use. No scan, allocation,
 /// or lock on the dispatch path.
 pub(crate) fn quic_transport_stop_sending(
-    sessions: &mut SessionWorker<Index>,
+    sessions: &mut SessionWorker<u32>,
     session: SessionId,
     code: SessionApplicationErrorCode,
 ) -> RuntimeResult<()> {
@@ -3396,7 +3363,7 @@ pub(crate) fn quic_transport_stop_sending(
 /// on the dispatch path; the reason copy and the quinn close happen on the
 /// owning worker inside `close_connection_action`.
 pub(crate) fn quic_transport_close_connection(
-    sessions: &mut SessionWorker<Index>,
+    sessions: &mut SessionWorker<u32>,
     connection: SessionId,
     code: SessionApplicationErrorCode,
     reason: &[u8],
@@ -3412,7 +3379,7 @@ pub(crate) fn quic_transport_close_connection(
 impl QuicWorker {
     fn begin_stream_close(
         &mut self,
-        sessions: &mut SessionWorker<Index>,
+        sessions: &mut SessionWorker<u32>,
         context: ContextId,
         now: Instant,
     ) -> RuntimeResult<()> {
@@ -3521,18 +3488,18 @@ impl QuicWorker {
     }
 }
 
-impl SessionTransport<Index> for QuicWorker {
+impl SessionTransport<u32> for QuicWorker {
     type Tx = TransportInternalTx;
 
     const ID: SessionTransportId = SessionTransportId::new(3);
 
-    fn connection_index(&self, index: Index) -> RuntimeResult<Index> {
+    fn connection_index(&self, index: u32) -> RuntimeResult<u32> {
         self.connection_index(index)
     }
 
     fn update_time(
         &mut self,
-        sessions: &mut SessionWorker<Index>,
+        sessions: &mut SessionWorker<u32>,
         _: &DataPlaneRuntime,
         _: SessionQueueNext,
         _: &mut BufferFrame,
@@ -3544,7 +3511,7 @@ impl SessionTransport<Index> for QuicWorker {
 
     fn app_rx_evt(
         &mut self,
-        index: Index,
+        index: u32,
         rx_available: usize,
         _: usize,
         _: &DataPlaneRuntime,
@@ -3557,8 +3524,8 @@ impl SessionTransport<Index> for QuicWorker {
 
     fn disconnect(
         &mut self,
-        sessions: &mut SessionWorker<Index>,
-        index: Index,
+        sessions: &mut SessionWorker<u32>,
+        index: u32,
         _: &DataPlaneRuntime,
         _: SessionQueueNext,
         _: &mut BufferFrame,
@@ -3600,8 +3567,8 @@ impl SessionTransport<Index> for QuicWorker {
 
     fn reset(
         &mut self,
-        sessions: &mut SessionWorker<Index>,
-        index: Index,
+        sessions: &mut SessionWorker<u32>,
+        index: u32,
         _: &DataPlaneRuntime,
         _: SessionQueueNext,
         _: &mut BufferFrame,
@@ -3683,12 +3650,12 @@ impl SessionTransport<Index> for QuicWorker {
     }
 }
 
-impl TransportInternalTransport<Index> for QuicWorker {
+impl TransportInternalTransport<u32> for QuicWorker {
     fn internal_tx(
         &mut self,
-        sessions: &mut SessionWorker<Index>,
+        sessions: &mut SessionWorker<u32>,
         session_id: SessionId,
-        index: Index,
+        index: u32,
         _: &DataPlaneRuntime,
         _: SessionQueueNext,
         _: &mut BufferFrame,
@@ -4137,7 +4104,7 @@ mod tests {
     }
 
     fn test_listener_start(
-        _: SessionListenerId,
+        _: SessionHandle,
         _: ApplicationId,
         _: Option<u64>,
         _: hammer_runtime::SessionListenEndpoint,
@@ -4148,17 +4115,17 @@ mod tests {
     fn register_test_outer_listener(
         applications: &Arc<hammer_service::session::ApplicationMain>,
         application: ApplicationId,
-        sessions: &mut SessionWorker<Index>,
-    ) -> RuntimeResult<SessionListenerId> {
+        sessions: &mut SessionWorker<u32>,
+    ) -> RuntimeResult<SessionHandle> {
         register_test_outer_listener_with_app(applications, application, sessions, None)
     }
 
     fn register_test_outer_listener_with_app(
         applications: &Arc<hammer_service::session::ApplicationMain>,
         application: ApplicationId,
-        sessions: &mut SessionWorker<Index>,
+        sessions: &mut SessionWorker<u32>,
         app: Option<hammer_runtime::app::SessionAppId>,
-    ) -> RuntimeResult<SessionListenerId> {
+    ) -> RuntimeResult<SessionHandle> {
         let main = Arc::new(hammer_service::session::runtime::SessionMain::new(
             1,
             Arc::clone(applications),
@@ -4183,12 +4150,12 @@ mod tests {
         Ok(listener)
     }
 
-    fn test_lower_session() -> RuntimeResult<(SessionWorker<Index>, SessionId)> {
+    fn test_lower_session() -> RuntimeResult<(SessionWorker<u32>, SessionId)> {
         let applications = hammer_service::session::ApplicationMain::new(4);
         let application = applications
             .attach()
             .map_err(hammer_runtime::RuntimeError::from)?;
-        let mut sessions = hammer_service::session::SessionWorker::<Index>::new(
+        let mut sessions = hammer_service::session::SessionWorker::<u32>::new(
             DataWorkerId::new(0),
             1,
             hammer_runtime::app::AppSessionConfig::default(),
@@ -4199,7 +4166,7 @@ mod tests {
         sessions.install_application_mq_for_test(application)?;
         let lower = sessions.construct_transport_session(
             SessionTransportId::new(1),
-            Index::new(1, 1),
+            1,
             1,
             application,
             Some(hammer_runtime::app::SessionAppId::new(0)),
@@ -4219,12 +4186,10 @@ mod tests {
         let first = contexts
             .insert(Context {
                 role: ContextRole::Listener(ListenerContext {
-                    outer_listener: SessionListenerId::new(1, 1),
-                    outer_application: ApplicationId::new(1, 1),
-                    inner_application_listener: hammer_runtime::app::ApplicationListenerId::new(
-                        2, 1,
-                    ),
-                    inner_session_listener: SessionListenerId::new(3, 1),
+                    outer_listener: SessionHandle::new(1, 1),
+                    outer_application: ApplicationId::new(1),
+                    inner_application_listener: hammer_runtime::app::ApplicationListenerId::new(2),
+                    inner_session_listener: SessionHandle::new(3, 1),
                     configuration: ConfigId::from_raw(5),
                     connection_timeout: crate::config::DEFAULT_CONNECTION_TIMEOUT,
                     server_config: None,
@@ -4238,7 +4203,7 @@ mod tests {
         let replacement = contexts
             .insert(Context {
                 role: ContextRole::Stream(StreamContext {
-                    parent: Index::new(5, 1),
+                    parent: 5,
                     session: SessionId::from_raw(6),
                     stream: quinn_proto::StreamId::new(
                         quinn_proto::Side::Client,
@@ -4268,10 +4233,10 @@ mod tests {
         let mut worker = QuicWorker::new(DataWorkerId::new(0));
         let listener_id = ContextId::from(0x1234u64);
         let listener = ListenerContext {
-            outer_listener: SessionListenerId::new(1, 1),
-            outer_application: ApplicationId::new(1, 1),
-            inner_application_listener: hammer_runtime::app::ApplicationListenerId::new(2, 1),
-            inner_session_listener: SessionListenerId::new(3, 1),
+            outer_listener: SessionHandle::new(1, 1),
+            outer_application: ApplicationId::new(1),
+            inner_application_listener: hammer_runtime::app::ApplicationListenerId::new(2),
+            inner_session_listener: SessionHandle::new(3, 1),
             configuration: ConfigId::from_raw(4),
             connection_timeout: crate::config::DEFAULT_CONNECTION_TIMEOUT,
             server_config: None,
@@ -4288,10 +4253,10 @@ mod tests {
     fn accepted_connection_uses_listener_timeout() -> RuntimeResult<()> {
         let mut worker = QuicWorker::new(DataWorkerId::new(0));
         let listener = ListenerContext {
-            outer_listener: SessionListenerId::new(1, 1),
-            outer_application: ApplicationId::new(1, 1),
-            inner_application_listener: hammer_runtime::app::ApplicationListenerId::new(2, 1),
-            inner_session_listener: SessionListenerId::new(3, 1),
+            outer_listener: SessionHandle::new(1, 1),
+            outer_application: ApplicationId::new(1),
+            inner_application_listener: hammer_runtime::app::ApplicationListenerId::new(2),
+            inner_session_listener: SessionHandle::new(3, 1),
             configuration: ConfigId::from_raw(4),
             connection_timeout: 5,
             server_config: None,
@@ -4317,7 +4282,7 @@ mod tests {
     #[test]
     fn timers_dispatch_exact_context_and_kind() {
         let mut timers = QuicTimers::new(Instant::now());
-        let context = ContextId::from(Index::new(7, 11));
+        let context = ContextId::from(7);
         timers
             .set(context, QuicTimerKind::Transmit, Duration::from_millis(1))
             .expect("arm timer");
@@ -4337,7 +4302,7 @@ mod tests {
             .insert(Context::connection_with_listener(
                 SessionId::from_raw(1),
                 None,
-                ApplicationId::new(1, 1),
+                ApplicationId::new(1),
                 None,
                 None,
                 None,
@@ -4363,7 +4328,7 @@ mod tests {
             "localhost".to_owned(),
             local,
             remote,
-            ApplicationId::new(7, 1),
+            ApplicationId::new(7),
             None,
             None,
             SessionConnectionId::from_raw(7),
@@ -4434,7 +4399,7 @@ mod tests {
                 "localhost".to_owned(),
                 local,
                 remote,
-                ApplicationId::new(7, 1),
+                ApplicationId::new(7),
                 None,
                 Some(ConfigId::from_raw(9).raw()),
                 SessionConnectionId::from_raw(7),
@@ -4480,7 +4445,7 @@ mod tests {
         let socket_path = unique_socket_path("hammer-quic-local-bidi");
         let server =
             hammer_runtime::attach::AppServer::bind(&socket_path, 1).expect("bind App server");
-        let mut sessions = hammer_service::session::SessionWorker::<Index>::new(
+        let mut sessions = hammer_service::session::SessionWorker::<u32>::new(
             DataWorkerId::new(0),
             1,
             hammer_runtime::app::AppSessionConfig::default(),
@@ -4549,7 +4514,7 @@ mod tests {
 
         let child = worker.connect_stream(
             &mut sessions,
-            hammer_runtime::app::SessionHandle::new(parent.pool_index().slot(), 0),
+            hammer_runtime::app::SessionHandle::new(parent.pool_index(), 0),
             SessionConnectionId::from_raw(application_connection.raw()),
             hammer_runtime::app::SessionFlags::STREAM,
         )?;
@@ -4584,7 +4549,7 @@ mod tests {
         let socket_path = unique_socket_path("hammer-quic-local-uni");
         let server =
             hammer_runtime::attach::AppServer::bind(&socket_path, 1).expect("bind App server");
-        let mut sessions = hammer_service::session::SessionWorker::<Index>::new(
+        let mut sessions = hammer_service::session::SessionWorker::<u32>::new(
             DataWorkerId::new(0),
             1,
             hammer_runtime::app::AppSessionConfig::default(),
@@ -4649,7 +4614,7 @@ mod tests {
 
         let child = worker.connect_stream(
             &mut sessions,
-            hammer_runtime::app::SessionHandle::new(parent.pool_index().slot(), 0),
+            hammer_runtime::app::SessionHandle::new(parent.pool_index(), 0),
             SessionConnectionId::from_raw(application_connection.raw()),
             hammer_runtime::app::SessionFlags::STREAM
                 | hammer_runtime::app::SessionFlags::UNIDIRECTIONAL,
@@ -4686,7 +4651,7 @@ mod tests {
         let socket_path = unique_socket_path("hammer-quic-open-stream");
         let server =
             hammer_runtime::attach::AppServer::bind(&socket_path, 1).expect("bind App server");
-        let mut sessions = hammer_service::session::SessionWorker::<Index>::new(
+        let mut sessions = hammer_service::session::SessionWorker::<u32>::new(
             DataWorkerId::new(0),
             1,
             hammer_runtime::app::AppSessionConfig::default(),
@@ -4931,7 +4896,7 @@ mod tests {
         let socket_path = unique_socket_path("hammer-quic-open-stream-owner");
         let server =
             hammer_runtime::attach::AppServer::bind(&socket_path, 1).expect("bind App server");
-        let mut sessions = hammer_service::session::SessionWorker::<Index>::new(
+        let mut sessions = hammer_service::session::SessionWorker::<u32>::new(
             DataWorkerId::new(0),
             1,
             hammer_runtime::app::AppSessionConfig::default(),
@@ -5040,7 +5005,7 @@ mod tests {
         let socket_path = unique_socket_path("hammer-quic-open-stream-rollback");
         let server =
             hammer_runtime::attach::AppServer::bind(&socket_path, 1).expect("bind App server");
-        let mut sessions = hammer_service::session::SessionWorker::<Index>::new(
+        let mut sessions = hammer_service::session::SessionWorker::<u32>::new(
             DataWorkerId::new(0),
             1,
             hammer_runtime::app::AppSessionConfig::default(),
@@ -5159,7 +5124,7 @@ mod tests {
             "localhost".to_owned(),
             local,
             remote,
-            ApplicationId::new(7, 1),
+            ApplicationId::new(7),
             None,
             None,
             SessionConnectionId::from_raw(7),
@@ -5198,7 +5163,7 @@ mod tests {
         let application = applications
             .attach()
             .map_err(hammer_runtime::RuntimeError::from)?;
-        let mut sessions = hammer_service::session::SessionWorker::<Index>::new(
+        let mut sessions = hammer_service::session::SessionWorker::<u32>::new(
             DataWorkerId::new(0),
             1,
             hammer_runtime::app::AppSessionConfig::default(),
@@ -5209,7 +5174,7 @@ mod tests {
         sessions.install_application_mq_for_test(application)?;
         let lower = sessions.construct_transport_session(
             SessionTransportId::new(1),
-            Index::new(1, 1),
+            1,
             1,
             application,
             Some(hammer_runtime::app::SessionAppId::new(0)),
@@ -5225,8 +5190,8 @@ mod tests {
         let listener = ListenerContext {
             outer_listener,
             outer_application: application,
-            inner_application_listener: hammer_runtime::app::ApplicationListenerId::new(2, 1),
-            inner_session_listener: SessionListenerId::new(3, 1),
+            inner_application_listener: hammer_runtime::app::ApplicationListenerId::new(2),
+            inner_session_listener: SessionHandle::new(3, 1),
             configuration: ConfigId::from_raw(4),
             connection_timeout: crate::config::DEFAULT_CONNECTION_TIMEOUT,
             server_config: Some(server_config()),
@@ -5253,7 +5218,7 @@ mod tests {
         let application = applications
             .attach()
             .map_err(hammer_runtime::RuntimeError::from)?;
-        let mut sessions = hammer_service::session::SessionWorker::<Index>::new(
+        let mut sessions = hammer_service::session::SessionWorker::<u32>::new(
             DataWorkerId::new(0),
             1,
             hammer_runtime::app::AppSessionConfig::default(),
@@ -5264,7 +5229,7 @@ mod tests {
         sessions.install_application_mq_for_test(application)?;
         let lower = sessions.construct_transport_session(
             SessionTransportId::new(1),
-            Index::new(1, 1),
+            1,
             1,
             application,
             Some(hammer_runtime::app::SessionAppId::new(0)),
@@ -5278,8 +5243,8 @@ mod tests {
         let listener = ListenerContext {
             outer_listener,
             outer_application: application,
-            inner_application_listener: hammer_runtime::app::ApplicationListenerId::new(2, 1),
-            inner_session_listener: SessionListenerId::new(3, 1),
+            inner_application_listener: hammer_runtime::app::ApplicationListenerId::new(2),
+            inner_session_listener: SessionHandle::new(3, 1),
             configuration: ConfigId::from_raw(4),
             connection_timeout: crate::config::DEFAULT_CONNECTION_TIMEOUT,
             server_config: Some(server_config()),
@@ -5292,7 +5257,7 @@ mod tests {
             .and_then(Context::connection)
             .and_then(|connection| connection.connection_session)
             .ok_or(QuicWorkerError::ContextMissing { context })?;
-        let child_session = sessions.insert_session_for_test(QuicWorker::ID, Index::new(1, 1));
+        let child_session = sessions.insert_session_for_test(QuicWorker::ID, 1);
         let child_stream =
             quinn_proto::StreamId::new(quinn_proto::Side::Client, quinn_proto::Dir::Bi, 0);
         let child_context = worker
@@ -5353,7 +5318,7 @@ mod tests {
             .insert(Context::connection_with_listener(
                 lower,
                 None,
-                ApplicationId::new(1, 1),
+                ApplicationId::new(1),
                 None,
                 None,
                 None,
@@ -5412,7 +5377,7 @@ mod tests {
             .insert(Context::connection_with_listener(
                 lower,
                 None,
-                ApplicationId::new(1, 1),
+                ApplicationId::new(1),
                 None,
                 None,
                 None,
@@ -5464,7 +5429,7 @@ mod tests {
             .insert(Context::connection_with_listener(
                 lower,
                 None,
-                ApplicationId::new(1, 1),
+                ApplicationId::new(1),
                 None,
                 None,
                 None,
@@ -5532,7 +5497,7 @@ mod tests {
             "localhost".to_owned(),
             local,
             remote,
-            ApplicationId::new(7, 1),
+            ApplicationId::new(7),
             None,
             None,
             SessionConnectionId::from_raw(7),
@@ -5608,7 +5573,7 @@ mod tests {
             .insert(Context::connection_with_listener(
                 lower,
                 None,
-                ApplicationId::new(1, 1),
+                ApplicationId::new(1),
                 None,
                 None,
                 None,
@@ -5645,14 +5610,14 @@ mod tests {
             "localhost".to_owned(),
             local,
             remote,
-            ApplicationId::new(7, 1),
+            ApplicationId::new(7),
             None,
             None,
             SessionConnectionId::from_raw(7),
         )?;
         let now = Instant::now();
         worker.connect_connection(parent, lower, now)?;
-        let stream_session = sessions.insert_session_for_test(QuicWorker::ID, Index::new(1, 1));
+        let stream_session = sessions.insert_session_for_test(QuicWorker::ID, 1);
         let stream =
             quinn_proto::StreamId::new(quinn_proto::Side::Server, quinn_proto::Dir::Uni, 0);
         let stream_context = worker
@@ -5687,14 +5652,14 @@ mod tests {
             "localhost".to_owned(),
             local,
             remote,
-            ApplicationId::new(7, 1),
+            ApplicationId::new(7),
             None,
             None,
             SessionConnectionId::from_raw(7),
         )?;
         let now = Instant::now();
         worker.connect_connection(parent, lower, now)?;
-        let stream_session = sessions.insert_session_for_test(QuicWorker::ID, Index::new(1, 1));
+        let stream_session = sessions.insert_session_for_test(QuicWorker::ID, 1);
         let stream = quinn_proto::StreamId::new(quinn_proto::Side::Client, quinn_proto::Dir::Bi, 0);
         let stream_context = worker
             .contexts
@@ -5917,7 +5882,7 @@ mod tests {
             .insert(Context::connection_with_listener(
                 lower,
                 None,
-                ApplicationId::new(1, 1),
+                ApplicationId::new(1),
                 None,
                 None,
                 None,
@@ -5928,7 +5893,7 @@ mod tests {
             })?;
         let stream_id =
             quinn_proto::StreamId::new(quinn_proto::Side::Client, quinn_proto::Dir::Bi, 0);
-        let stream_session = sessions.insert_session_for_test(QuicWorker::ID, Index::new(1, 1));
+        let stream_session = sessions.insert_session_for_test(QuicWorker::ID, 1);
         let stream_context = worker
             .contexts
             .insert(Context::stream(context.into(), stream_session, stream_id))
@@ -5982,14 +5947,14 @@ mod tests {
     #[test]
     fn finished_stream_context_waits_for_application_confirmation() -> RuntimeResult<()> {
         let (mut sessions, lower) = test_lower_session()?;
-        let stream_session = sessions.insert_session_for_test(QuicWorker::ID, Index::new(1, 1));
+        let stream_session = sessions.insert_session_for_test(QuicWorker::ID, 1);
         let mut worker = QuicWorker::new(DataWorkerId::new(0));
         let parent = worker
             .contexts
             .insert(Context::connection_with_listener(
                 lower,
                 None,
-                ApplicationId::new(1, 1),
+                ApplicationId::new(1),
                 None,
                 None,
                 None,
@@ -6082,7 +6047,7 @@ mod tests {
         let application = applications
             .attach()
             .map_err(hammer_runtime::RuntimeError::from)?;
-        let mut sessions = hammer_service::session::SessionWorker::<Index>::new(
+        let mut sessions = hammer_service::session::SessionWorker::<u32>::new(
             DataWorkerId::new(0),
             1,
             hammer_runtime::app::AppSessionConfig::default(),
@@ -6094,7 +6059,7 @@ mod tests {
 
         let published = sessions.construct_transport_session(
             SessionTransportId::new(1),
-            Index::new(1, 1),
+            1,
             unique_allocation_owner(),
             application,
             None,
@@ -6107,7 +6072,7 @@ mod tests {
 
         let lower = sessions.construct_transport_session(
             SessionTransportId::new(1),
-            Index::new(2, 1),
+            2,
             2,
             application,
             None,
@@ -6164,10 +6129,10 @@ mod tests {
         let mut worker = QuicWorker::new(DataWorkerId::new(0));
         let listener_id = ContextId::from(0x1234u64);
         let listener = ListenerContext {
-            outer_listener: SessionListenerId::new(1, 1),
-            outer_application: ApplicationId::new(1, 1),
-            inner_application_listener: hammer_runtime::app::ApplicationListenerId::new(2, 1),
-            inner_session_listener: SessionListenerId::new(3, 1),
+            outer_listener: SessionHandle::new(1, 1),
+            outer_application: ApplicationId::new(1),
+            inner_application_listener: hammer_runtime::app::ApplicationListenerId::new(2),
+            inner_session_listener: SessionHandle::new(3, 1),
             configuration: ConfigId::from_raw(4),
             connection_timeout: crate::config::DEFAULT_CONNECTION_TIMEOUT,
             server_config: None,
@@ -6239,7 +6204,7 @@ mod tests {
         let application = applications
             .attach()
             .map_err(hammer_runtime::RuntimeError::from)?;
-        let mut sessions = hammer_service::session::SessionWorker::<Index>::new(
+        let mut sessions = hammer_service::session::SessionWorker::<u32>::new(
             DataWorkerId::new(0),
             1,
             hammer_runtime::app::AppSessionConfig::default(),
@@ -6250,7 +6215,7 @@ mod tests {
         sessions.install_application_mq_for_test(application)?;
         let lower = sessions.construct_transport_session(
             SessionTransportId::new(1),
-            Index::new(1, 1),
+            1,
             1,
             application,
             Some(hammer_runtime::app::SessionAppId::new(0)),
@@ -6266,8 +6231,8 @@ mod tests {
         let listener = ListenerContext {
             outer_listener,
             outer_application: application,
-            inner_application_listener: hammer_runtime::app::ApplicationListenerId::new(2, 1),
-            inner_session_listener: SessionListenerId::new(3, 1),
+            inner_application_listener: hammer_runtime::app::ApplicationListenerId::new(2),
+            inner_session_listener: SessionHandle::new(3, 1),
             configuration: ConfigId::from_raw(4),
             connection_timeout: crate::config::DEFAULT_CONNECTION_TIMEOUT,
             server_config: Some(Arc::new(server_config)),
@@ -6411,7 +6376,7 @@ mod tests {
     /// `server_handshake_publishes_upper_connection_session_through_real_session_fifos`.
     struct PeerRelay {
         worker: QuicWorker,
-        sessions: SessionWorker<Index>,
+        sessions: SessionWorker<u32>,
         // Owns the AppServer whose publisher `sessions` holds as a weak
         // reference; dropping it would make `set_accepted` fail with
         // PublicationQueueClosed.
@@ -6559,8 +6524,8 @@ mod tests {
     fn relay_stream_session(
         relay: &mut PeerRelay,
         stream: quinn_proto::StreamId,
-    ) -> RuntimeResult<(Index, SessionId)> {
-        let context: Index = relay
+    ) -> RuntimeResult<(u32, SessionId)> {
+        let context: u32 = relay
             .worker
             .contexts
             .insert(Context::stream(
@@ -6605,7 +6570,7 @@ mod tests {
     /// it as the parent endpoint (VPP `quic_quicly_on_stream_open`).
     fn peer_relay_established_with(
         listener_app: Option<hammer_runtime::app::SessionAppId>,
-        callbacks: hammer_service::session::SessionAppCallbacks<Index>,
+        callbacks: hammer_service::session::SessionAppCallbacks<u32>,
     ) -> RuntimeResult<PeerRelay> {
         let certified = rcgen::generate_simple_self_signed(vec!["localhost".to_owned()])
             .expect("generate QUIC test certificate");
@@ -6659,7 +6624,7 @@ mod tests {
         let socket_path = unique_socket_path("hammer-quic-peer-relay");
         let server =
             hammer_runtime::attach::AppServer::bind(&socket_path, 1).expect("bind App server");
-        let mut sessions = hammer_service::session::SessionWorker::<Index>::new(
+        let mut sessions = hammer_service::session::SessionWorker::<u32>::new(
             DataWorkerId::new(0),
             1,
             hammer_runtime::app::AppSessionConfig::default(),
@@ -6670,7 +6635,7 @@ mod tests {
         sessions.install_application_mq_for_test(application)?;
         let lower = sessions.construct_transport_session(
             SessionTransportId::new(1),
-            Index::new(1, 1),
+            1,
             unique_allocation_owner(),
             application,
             Some(hammer_runtime::app::SessionAppId::new(0)),
@@ -6697,8 +6662,8 @@ mod tests {
         let listener = ListenerContext {
             outer_listener,
             outer_application: application,
-            inner_application_listener: hammer_runtime::app::ApplicationListenerId::new(2, 1),
-            inner_session_listener: SessionListenerId::new(3, 1),
+            inner_application_listener: hammer_runtime::app::ApplicationListenerId::new(2),
+            inner_session_listener: SessionHandle::new(3, 1),
             configuration: ConfigId::from_raw(4),
             connection_timeout: crate::config::DEFAULT_CONNECTION_TIMEOUT,
             server_config: Some(Arc::new(server_config)),
@@ -6835,12 +6800,9 @@ mod tests {
             .expect("peer-open child carries a retained ACCEPTED message");
         assert_eq!(
             accepted.listener,
-            SessionHandle::new(relay.connection_session.pool_index().slot(), 0)
+            SessionHandle::new(relay.connection_session.pool_index(), 0)
         );
-        assert_eq!(
-            accepted.session,
-            SessionHandle::new(child.pool_index().slot(), 0)
-        );
+        assert_eq!(accepted.session, SessionHandle::new(child.pool_index(), 0));
         assert_eq!(accepted.flags, SessionFlags::STREAM);
         Ok(())
     }
@@ -6856,7 +6818,7 @@ mod tests {
     }
 
     fn session_app_accept_callback(
-        _: &mut SessionWorker<Index>,
+        _: &mut SessionWorker<u32>,
         session: SessionId,
         _: SessionAppContext,
     ) -> RuntimeResult<()> {
@@ -6872,7 +6834,7 @@ mod tests {
     /// that rejects the accepted child (VPP `app_worker_accept_notify`
     /// failure).
     fn session_app_accept_callback_failing(
-        _: &mut SessionWorker<Index>,
+        _: &mut SessionWorker<u32>,
         session: SessionId,
         _: SessionAppContext,
     ) -> RuntimeResult<()> {
@@ -7301,12 +7263,9 @@ mod tests {
             .expect("peer-open uni child carries a retained ACCEPTED message");
         assert_eq!(
             accepted.listener,
-            SessionHandle::new(relay.connection_session.pool_index().slot(), 0)
+            SessionHandle::new(relay.connection_session.pool_index(), 0)
         );
-        assert_eq!(
-            accepted.session,
-            SessionHandle::new(child.pool_index().slot(), 0)
-        );
+        assert_eq!(accepted.session, SessionHandle::new(child.pool_index(), 0));
         assert_eq!(accepted.flags, flags);
         Ok(())
     }
@@ -7330,7 +7289,7 @@ mod tests {
         // connection, matching
         // `remote_close_retains_context_until_application_confirmation`, so a
         // FIN notification is immediately observable on its event queue.
-        let child_context: Index = relay
+        let child_context: u32 = relay
             .worker
             .contexts
             .insert(Context::stream(
@@ -7423,7 +7382,7 @@ mod tests {
             .expect("open peer bidirectional stream");
         // Pre-create the child AppSession (Active) under the parent
         // connection so FIN notifications are observable on its event queue.
-        let child_context: Index = relay
+        let child_context: u32 = relay
             .worker
             .contexts
             .insert(Context::stream(
@@ -7589,17 +7548,17 @@ mod tests {
 
     fn test_quic_session() -> RuntimeResult<(
         QuicWorker,
-        SessionWorker<Index>,
+        SessionWorker<u32>,
         ApplicationId,
         SessionId,
         ContextId,
-        Index,
+        u32,
     )> {
         let applications = hammer_service::session::ApplicationMain::new(4);
         let application = applications
             .attach()
             .map_err(hammer_runtime::RuntimeError::from)?;
-        let mut sessions = SessionWorker::<Index>::new(
+        let mut sessions = SessionWorker::<u32>::new(
             DataWorkerId::new(0),
             1,
             hammer_runtime::app::AppSessionConfig::default(),
@@ -7610,10 +7569,10 @@ mod tests {
         sessions.install_application_mq_for_test(application)?;
         let mut worker = QuicWorker::new(DataWorkerId::new(0));
         let listener = ListenerContext {
-            outer_listener: SessionListenerId::new(1, 1),
-            outer_application: ApplicationId::new(1, 1),
-            inner_application_listener: hammer_runtime::app::ApplicationListenerId::new(2, 1),
-            inner_session_listener: SessionListenerId::new(3, 1),
+            outer_listener: SessionHandle::new(1, 1),
+            outer_application: ApplicationId::new(1),
+            inner_application_listener: hammer_runtime::app::ApplicationListenerId::new(2),
+            inner_session_listener: SessionHandle::new(3, 1),
             configuration: ConfigId::from_raw(4),
             connection_timeout: 5,
             server_config: None,
@@ -7625,7 +7584,7 @@ mod tests {
                 &listener,
             )
             .expect("accept connection");
-        let connection_index = Index::from(context);
+        let connection_index = u32::from(context);
         let session = sessions.construct_transport_session(
             QuicWorker::ID,
             connection_index,
@@ -7639,10 +7598,10 @@ mod tests {
         let listener_index = worker
             .contexts
             .insert(Context::listener(
-                SessionListenerId::new(1, 1),
-                ApplicationId::new(1, 1),
-                hammer_runtime::app::ApplicationListenerId::new(2, 1),
-                SessionListenerId::new(3, 1),
+                SessionHandle::new(1, 1),
+                ApplicationId::new(1),
+                hammer_runtime::app::ApplicationListenerId::new(2),
+                SessionHandle::new(3, 1),
                 ConfigId::from_raw(4),
                 5,
                 None,
@@ -7719,13 +7678,13 @@ mod tests {
     /// Session/index/StreamId.
     fn test_established_stream() -> RuntimeResult<(
         QuicWorker,
-        SessionWorker<Index>,
+        SessionWorker<u32>,
         Arc<hammer_service::session::ApplicationMain>,
         hammer_runtime::attach::AppServer,
         ContextId,
         SessionId,
         SessionId,
-        Index,
+        u32,
         quinn_proto::StreamId,
     )> {
         let applications = hammer_service::session::ApplicationMain::new(4);
@@ -7735,7 +7694,7 @@ mod tests {
         let socket_path = unique_socket_path("hammer-quic-reset-stream");
         let server =
             hammer_runtime::attach::AppServer::bind(&socket_path, 1).expect("bind App server");
-        let mut sessions = hammer_service::session::SessionWorker::<Index>::new(
+        let mut sessions = hammer_service::session::SessionWorker::<u32>::new(
             DataWorkerId::new(0),
             1,
             hammer_runtime::app::AppSessionConfig::default(),
@@ -8890,7 +8849,7 @@ mod tests {
             .insert(Context::connection_with_listener(
                 lower,
                 None,
-                ApplicationId::new(1, 1),
+                ApplicationId::new(1),
                 None,
                 None,
                 None,

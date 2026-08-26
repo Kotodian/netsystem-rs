@@ -4,9 +4,10 @@ use crate::{
 use hammer_core::data_plane::{
     BufferFrame, DEFAULT_BUFFER_FRAME_CAPACITY, Index, NodeId, NodeNext,
 };
-use hammer_infra::pool::Index as PoolIndex;
 use hammer_runtime::RuntimeResult;
-use hammer_runtime::{DataPlaneRuntime, Node, NodeProcessFn, NodeResult, NodeRuntimeData};
+use hammer_runtime::{
+    DataPlaneRuntime, Node, NodeProcessFn, NodeResult, NodeRuntimeData, RuntimeError,
+};
 
 use super::connection::TcpConnection;
 use super::segment::{TcpSegment, tcp_packet};
@@ -189,19 +190,19 @@ fn tcp_listen_index(
 }
 
 struct TcpListener<'a> {
-    sessions: &'a mut SessionWorker<PoolIndex>,
+    sessions: &'a mut SessionWorker<u32>,
     tcp: &'a mut crate::TcpWorker,
     id: u32,
-    session_listener: hammer_runtime::SessionListenerId,
+    session_listener: hammer_runtime::app::SessionHandle,
     capabilities: TcpCapabilities,
 }
 
 impl<'a> TcpListener<'a> {
     fn new(
-        sessions: &'a mut SessionWorker<PoolIndex>,
+        sessions: &'a mut SessionWorker<u32>,
         tcp: &'a mut crate::TcpWorker,
         id: u32,
-        session_listener: hammer_runtime::SessionListenerId,
+        session_listener: hammer_runtime::app::SessionHandle,
         capabilities: TcpCapabilities,
     ) -> Self {
         Self {
@@ -462,27 +463,21 @@ impl<'a> TcpListener<'a> {
         C: FnOnce() -> TcpConnection,
         P: FnOnce(
             SessionId,
-            PoolIndex,
-            &mut SessionWorker<PoolIndex>,
+            u32,
+            &mut SessionWorker<u32>,
             &mut crate::TcpWorker,
         ) -> RuntimeResult<R>,
     {
-        let connection_index = match self.tcp.insert_connection(create()) {
-            Ok(index) => index,
-            Err(error) => {
-                self.finish_pending(packet);
-                return Err(error);
-            }
-        };
+        let connection_index = self.tcp.insert_connection(create());
         let listener = self.session_listener;
         let session_id = match self.sessions.stream_accept(
-            <crate::TcpWorker as SessionTransport<PoolIndex>>::ID,
+            <crate::TcpWorker as SessionTransport<u32>>::ID,
             connection_index,
             listener,
         ) {
             Ok(session_id) => session_id,
             Err(error) => {
-                let _ = self.tcp.remove_connection(connection_index);
+                self.tcp.remove_connection(connection_index);
                 self.finish_pending(packet);
                 return Err(error);
             }
@@ -523,18 +518,17 @@ impl<'a> TcpListener<'a> {
     fn rollback_session(
         &mut self,
         session_id: SessionId,
-        connection_index: PoolIndex,
+        connection_index: u32,
     ) -> RuntimeResult<()> {
         self.tcp.lookup.forget_session(session_id);
         self.tcp.lookup.forget_pending_open(session_id);
         let session_cleanup = self.sessions.rollback_session_creation(session_id);
-        let connection_cleanup = self.tcp.remove_connection(connection_index);
+        self.tcp.remove_connection(connection_index);
         match session_cleanup {
             Err(error) => Err(error),
             Ok(Some(index)) if index != connection_index => {
                 Err(TcpNodeError::SessionMissing.into())
             }
-            Ok(_) if connection_cleanup.is_none() => Err(TcpNodeError::SessionMissing.into()),
             Ok(_) => Ok(()),
         }
     }

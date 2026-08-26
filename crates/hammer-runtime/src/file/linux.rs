@@ -3,19 +3,13 @@ use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 use std::time::Duration;
 
 use crate::error::{RuntimeError, RuntimeResult};
-use hammer_infra::pool::Index;
 use hammer_infra::ring::LocalRing;
 use io_uring::{IoUring, Probe, cqueue, opcode, squeue, types};
 
 use super::{FILE_POOL_CAPACITY, POLL_BATCH_SIZE, PollEvent, PollSpec, PollTarget, Readiness};
 
-const CONTROL_TOKEN: u64 = 0;
+const CONTROL_TOKEN: u64 = u64::MAX - 1;
 const PROBE_TOKEN: u64 = u64::MAX;
-const SLOT_BITS: u32 = FILE_POOL_CAPACITY.trailing_zeros();
-const SLOT_MASK: u64 = (1 << SLOT_BITS) - 1;
-const INDEX_GENERATION_BITS: u32 = 32;
-const REQUEST_SEQUENCE_SHIFT: u32 = SLOT_BITS + INDEX_GENERATION_BITS;
-const REQUEST_SEQUENCE_MASK: u32 = (1 << (63 - REQUEST_SEQUENCE_SHIFT)) - 1;
 const DEADLINE_TOKEN_BIT: u64 = 1 << 63;
 
 #[derive(Clone, Copy)]
@@ -32,7 +26,6 @@ pub(super) struct Poller {
     deadline_tokens: [u64; FILE_POOL_CAPACITY],
     deadline_fds: [Option<OwnedFd>; FILE_POOL_CAPACITY],
     deadline_durations: [Option<Duration>; FILE_POOL_CAPACITY],
-    request_sequence: u32,
     multishot: bool,
     wake: OwnedFd,
 }
@@ -80,11 +73,10 @@ impl Poller {
         Ok(Self {
             ring,
             pending: LocalRing::with_capacity(pending_capacity),
-            current_tokens: [0; FILE_POOL_CAPACITY],
-            deadline_tokens: [0; FILE_POOL_CAPACITY],
+            current_tokens: [CONTROL_TOKEN; FILE_POOL_CAPACITY],
+            deadline_tokens: [CONTROL_TOKEN; FILE_POOL_CAPACITY],
             deadline_fds: std::array::from_fn(|_| None),
             deadline_durations: [None; FILE_POOL_CAPACITY],
-            request_sequence: 0,
             multishot,
             wake,
         })
@@ -106,7 +98,7 @@ impl Poller {
 
     pub(super) fn add(&mut self, spec: PollSpec) -> RuntimeResult<()> {
         if !spec.read && !spec.write {
-            self.current_tokens[spec.index.slot() as usize] = CONTROL_TOKEN;
+            self.current_tokens[spec.index as usize] = CONTROL_TOKEN;
             return Ok(());
         }
 
@@ -122,8 +114,8 @@ impl Poller {
         self.cancel(spec.index)
     }
 
-    pub(super) fn add_deadline(&mut self, index: Index) -> RuntimeResult<()> {
-        let slot = index.slot() as usize;
+    pub(super) fn add_deadline(&mut self, index: u32) -> RuntimeResult<()> {
+        let slot = index as usize;
         // SAFETY: timerfd_create returns a fresh descriptor or -1 with errno.
         let fd = unsafe {
             libc::timerfd_create(
@@ -146,16 +138,16 @@ impl Poller {
 
     pub(super) fn set_deadline(
         &mut self,
-        index: Index,
+        index: u32,
         duration: Option<Duration>,
     ) -> RuntimeResult<()> {
-        let slot = index.slot() as usize;
+        let slot = index as usize;
         let deadline_fd = self
             .deadline_fds
             .get(slot)
             .and_then(Option::as_ref)
             .map(|fd| fd.as_raw_fd())
-            .ok_or(RuntimeError::DeadlineIndexInvalid { index })?;
+            .ok_or(RuntimeError::Deadlineu32Invalid { index })?;
         match duration {
             Some(duration) => {
                 set_timerfd(deadline_fd, Some(duration))?;
@@ -181,15 +173,15 @@ impl Poller {
         Ok(())
     }
 
-    pub(super) fn delete_deadline(&mut self, index: Index) -> RuntimeResult<()> {
-        let slot = index.slot() as usize;
+    pub(super) fn delete_deadline(&mut self, index: u32) -> RuntimeResult<()> {
+        let slot = index as usize;
         if self
             .deadline_fds
             .get(slot)
             .and_then(Option::as_ref)
             .is_none()
         {
-            return Err(RuntimeError::DeadlineIndexInvalid { index }.into());
+            return Err(RuntimeError::Deadlineu32Invalid { index }.into());
         }
         self.cancel_deadline(index)?;
         self.deadline_fds[slot] = None;
@@ -197,12 +189,12 @@ impl Poller {
         Ok(())
     }
 
-    pub(super) fn consume_deadline(&mut self, index: Index) -> RuntimeResult<()> {
+    pub(super) fn consume_deadline(&mut self, index: u32) -> RuntimeResult<()> {
         let fd = self
             .deadline_fds
-            .get(index.slot() as usize)
+            .get(index as usize)
             .and_then(Option::as_ref)
-            .ok_or(RuntimeError::DeadlineIndexInvalid { index })?;
+            .ok_or(RuntimeError::Deadlineu32Invalid { index })?;
         let mut expirations = 0_u64;
         loop {
             // SAFETY: `expirations` is writable for one timerfd counter and the
@@ -234,8 +226,8 @@ impl Poller {
         }
     }
 
-    pub(super) fn rearm_deadline(&mut self, index: Index) -> RuntimeResult<()> {
-        let slot = index.slot() as usize;
+    pub(super) fn rearm_deadline(&mut self, index: u32) -> RuntimeResult<()> {
+        let slot = index as usize;
         let Some(duration) = self.deadline_durations[slot] else {
             return Ok(());
         };
@@ -244,7 +236,7 @@ impl Poller {
             .get(slot)
             .and_then(Option::as_ref)
             .map(|fd| fd.as_raw_fd())
-            .ok_or(RuntimeError::DeadlineIndexInvalid { index })?;
+            .ok_or(RuntimeError::Deadlineu32Invalid { index })?;
         self.deadline_tokens[slot] = CONTROL_TOKEN;
         set_timerfd(deadline_fd, Some(duration))?;
         if let Err(error) = self.add_deadline_poll(index, deadline_fd) {
@@ -307,16 +299,16 @@ impl Poller {
         Ok(count)
     }
 
-    fn cancel(&mut self, index: Index) -> RuntimeResult<()> {
+    fn cancel(&mut self, index: u32) -> RuntimeResult<()> {
         self.cancel_token(index, false)
     }
 
-    fn cancel_deadline(&mut self, index: Index) -> RuntimeResult<()> {
+    fn cancel_deadline(&mut self, index: u32) -> RuntimeResult<()> {
         self.cancel_token(index, true)
     }
 
-    fn cancel_token(&mut self, index: Index, deadline: bool) -> RuntimeResult<()> {
-        let slot = index.slot() as usize;
+    fn cancel_token(&mut self, index: u32, deadline: bool) -> RuntimeResult<()> {
+        let slot = index as usize;
         let token = if deadline {
             self.deadline_tokens[slot]
         } else {
@@ -374,31 +366,27 @@ impl Poller {
         }
     }
 
-    fn add_deadline_poll(&mut self, index: Index, fd: i32) -> RuntimeResult<()> {
+    fn add_deadline_poll(&mut self, index: u32, fd: i32) -> RuntimeResult<()> {
         self.add_poll(index, fd, libc::POLLIN as u32, true)
     }
 
-    fn add_poll(&mut self, index: Index, fd: i32, flags: u32, deadline: bool) -> RuntimeResult<()> {
-        let token = self.next_token(index, deadline);
+    fn add_poll(&mut self, index: u32, fd: i32, flags: u32, deadline: bool) -> RuntimeResult<()> {
+        let token = Self::next_token(index, deadline);
         let entry = opcode::PollAdd::new(types::Fd(fd), flags)
             .multi(!deadline && self.multishot)
             .build()
             .user_data(token);
         self.submit(entry)?;
         if deadline {
-            self.deadline_tokens[index.slot() as usize] = token;
+            self.deadline_tokens[index as usize] = token;
         } else {
-            self.current_tokens[index.slot() as usize] = token;
+            self.current_tokens[index as usize] = token;
         }
         Ok(())
     }
 
-    fn next_token(&mut self, index: Index, deadline: bool) -> u64 {
-        self.request_sequence = self.request_sequence.wrapping_add(1) & REQUEST_SEQUENCE_MASK;
-        (if deadline { DEADLINE_TOKEN_BIT } else { 0 })
-            | (u64::from(self.request_sequence) << REQUEST_SEQUENCE_SHIFT)
-            | (u64::from(index.generation()) << SLOT_BITS)
-            | u64::from(index.slot())
+    fn next_token(index: u32, deadline: bool) -> u64 {
+        (if deadline { DEADLINE_TOKEN_BIT } else { 0 }) | u64::from(index)
     }
 
     fn submit(&mut self, entry: squeue::Entry) -> RuntimeResult<()> {
@@ -492,7 +480,7 @@ fn completion_event(
     } else {
         current_tokens
     };
-    if tokens[index.slot() as usize] != completion.user_data {
+    if tokens[index as usize] != completion.user_data {
         return Ok(None);
     }
     if completion.result == -libc::ECANCELED || completion.result == -libc::ENOENT {
@@ -539,10 +527,9 @@ fn poll_flags(spec: PollSpec) -> u32 {
     flags as u32
 }
 
-fn decode_poll_token(token: u64) -> Option<Index> {
-    let slot = (token & SLOT_MASK) as u32;
-    let generation = ((token >> SLOT_BITS) & u64::from(u32::MAX)) as u32;
-    (generation != 0 && slot < FILE_POOL_CAPACITY as u32).then(|| Index::new(slot, generation))
+fn decode_poll_token(token: u64) -> Option<u32> {
+    let index = u32::try_from(token & !DEADLINE_TOKEN_BIT).ok()?;
+    (index < FILE_POOL_CAPACITY as u32).then_some(index)
 }
 
 fn set_timerfd(fd: i32, duration: Option<Duration>) -> RuntimeResult<()> {

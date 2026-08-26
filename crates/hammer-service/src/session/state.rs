@@ -197,13 +197,11 @@ impl<Index: Copy + Eq> SessionState<Index> {
 
 #[cfg(test)]
 mod tests {
-    use hammer_infra::pool::Index;
-
     use super::SessionState;
 
     #[test]
     fn session_lifecycle_app_first_close_retains_index_until_transport_deleted() {
-        let index = Index::new(4, 7);
+        let index = 4u32;
         let mut state = active_state(index);
 
         assert!(!state.on_app_close());
@@ -217,7 +215,7 @@ mod tests {
 
     #[test]
     fn session_lifecycle_transport_first_close_retains_index_until_cleanup() {
-        let index = Index::new(5, 11);
+        let index = 5u32;
         let mut state = active_state(index);
         let mut app_close_notifications = 0;
 
@@ -238,8 +236,8 @@ mod tests {
 
     #[test]
     fn stale_transport_deleted_notification_preserves_the_current_index() {
-        let stale = Index::new(8, 1);
-        let current = Index::new(8, 2);
+        let stale = 7u32;
+        let current = 8u32;
         let mut state = active_state(current);
 
         assert!(!state.on_transport_deleted(stale));
@@ -249,7 +247,7 @@ mod tests {
 
     #[test]
     fn transport_deleted_then_app_close_removes_session() {
-        let index = Index::new(3, 9);
+        let index = 3u32;
         let mut state = active_state(index);
 
         assert!(!state.on_transport_deleted(index));
@@ -259,7 +257,7 @@ mod tests {
 
     #[test]
     fn accepted_session_transitions_create_publish_notify_in_order() {
-        let index = Index::new(7, 13);
+        let index = 7u32;
         let creating = SessionState::creating();
         assert!(creating.on_connection_published().is_none());
         assert!(creating.on_connected().is_none());
@@ -285,7 +283,7 @@ mod tests {
         // ACCEPTED. A transport close during that wait is recorded without
         // notifying (VPP session_node.c:556-563 resends it when the reply
         // arrives); a plain Active session still notifies immediately.
-        let index = Index::new(2, 5);
+        let index = 2u32;
         let mut state = SessionState::creating()
             .finish_creation(index)
             .expect("created session")
@@ -304,7 +302,7 @@ mod tests {
         assert!(state.on_transport_deleted(index));
     }
 
-    fn active_state(index: Index) -> SessionState<Index> {
+    fn active_state(index: u32) -> SessionState<u32> {
         SessionState::creating()
             .finish_creation(index)
             .expect("created session")

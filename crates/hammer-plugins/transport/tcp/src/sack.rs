@@ -28,7 +28,7 @@ impl From<TcpSackRange> for TcpSackBlock {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 struct TcpSackBlockState {
     right: TcpSeq,
     prev_recent: Option<TcpSeq>,
@@ -62,12 +62,8 @@ pub(crate) struct TcpSackState {
 
 impl Clone for TcpSackState {
     fn clone(&self) -> Self {
-        let mut blocks = RbTree::with_capacity(self.blocks.len().max(1));
-        for (left, state) in self.blocks.iter() {
-            let _ = blocks.insert(*left, *state);
-        }
         Self {
-            blocks,
+            blocks: self.blocks.clone(),
             recent_head: self.recent_head,
             recent_tail: self.recent_tail,
             pending_dsack: self.pending_dsack,
@@ -135,9 +131,9 @@ impl TcpSackState {
         if let Some(existing) = self.blocks.get(&merged.left).copied()
             && ranges_overlap_or_touch(merged, existing.range(merged.left))
         {
-            let removed = self
-                .remove_block(merged.left)
-                .expect("tcp sack block should exist");
+            let Some(removed) = self.remove_block(merged.left) else {
+                return;
+            };
             merged.left = merged.left.min(removed.left);
             merged.right = merged.right.max(removed.right);
         }
@@ -148,9 +144,9 @@ impl TcpSackState {
             .map(|(block_left, block_state)| (*block_left, *block_state))
             && ranges_overlap_or_touch(merged, block_state.range(block_left))
         {
-            let removed = self
-                .remove_block(block_left)
-                .expect("tcp sack predecessor should exist");
+            let Some(removed) = self.remove_block(block_left) else {
+                return;
+            };
             merged.left = merged.left.min(removed.left);
             merged.right = merged.right.max(removed.right);
         }
@@ -166,9 +162,9 @@ impl TcpSackState {
             if !ranges_overlap_or_touch(merged, block_state.range(block_left)) {
                 break;
             }
-            let removed = self
-                .remove_block(block_left)
-                .expect("tcp sack successor should exist");
+            let Some(removed) = self.remove_block(block_left) else {
+                return;
+            };
             merged.left = merged.left.min(removed.left);
             merged.right = merged.right.max(removed.right);
         }
@@ -227,10 +223,7 @@ impl TcpSackState {
                 cursor = self.recent_head;
                 break;
             };
-            let state = *self
-                .blocks
-                .get(&left)
-                .expect("tcp sack recency link should point to existing block");
+            let state = *self.blocks.get(&left)?;
             cursor = state.next_recent;
             skipped += 1;
         }
@@ -240,10 +233,7 @@ impl TcpSackState {
             if emitted == limit || count == output.len() {
                 break;
             }
-            let state = *self
-                .blocks
-                .get(&left)
-                .expect("tcp sack recency link should point to existing block");
+            let state = *self.blocks.get(&left)?;
             output[count] = state.range(left).into();
             count += 1;
             emitted += 1;
@@ -295,17 +285,12 @@ impl TcpSackState {
         let mut state = TcpSackBlockState::new(block.right);
         state.next_recent = self.recent_head;
         let previous_head = self.recent_head;
-        let replaced = self.blocks.insert(block.left, state);
-        debug_assert!(
-            replaced.is_none(),
-            "tcp sack block key should remain unique"
-        );
+        let _ = self.blocks.insert(block.left, state);
 
         if let Some(head) = previous_head {
-            self.blocks
-                .get_mut(&head)
-                .expect("tcp sack recent head should exist")
-                .prev_recent = Some(block.left);
+            if let Some(head_state) = self.blocks.get_mut(&head) {
+                head_state.prev_recent = Some(block.left);
+            }
         } else {
             self.recent_tail = Some(block.left);
         }
@@ -326,65 +311,53 @@ impl TcpSackState {
     }
 
     fn remove_block(&mut self, left: TcpSeq) -> Option<TcpSackRange> {
-        let state = *self.blocks.get(&left)?;
-        self.detach_recent(left, state);
-        let state = self
-            .blocks
-            .remove(&left)
-            .expect("tcp sack block should exist while removing");
+        let state = self.blocks.get(&left).copied()?;
+        self.detach_recent(state);
+        let state = self.blocks.remove(&left)?;
         Some(state.range(left))
     }
 
     fn rename_block_left(&mut self, old_left: TcpSeq, new_left: TcpSeq) {
-        if old_left >= new_left {
+        if old_left >= new_left || self.blocks.contains_key(&new_left) {
             return;
         }
         let Some(state) = self.blocks.remove(&old_left) else {
             return;
         };
-        let replaced = self.blocks.insert(new_left, state);
-        debug_assert!(
-            replaced.is_none(),
-            "tcp sack block left edge rename should remain unique"
-        );
+        let _ = self.blocks.insert(new_left, state);
         if let Some(prev) = state.prev_recent {
-            self.blocks
-                .get_mut(&prev)
-                .expect("tcp sack recent predecessor should exist")
-                .next_recent = Some(new_left);
+            if let Some(previous) = self.blocks.get_mut(&prev) {
+                previous.next_recent = Some(new_left);
+            }
         } else {
             self.recent_head = Some(new_left);
         }
         if let Some(next) = state.next_recent {
-            self.blocks
-                .get_mut(&next)
-                .expect("tcp sack recent successor should exist")
-                .prev_recent = Some(new_left);
+            if let Some(successor) = self.blocks.get_mut(&next) {
+                successor.prev_recent = Some(new_left);
+            }
         } else {
             self.recent_tail = Some(new_left);
         }
     }
 
-    fn detach_recent(&mut self, left: TcpSeq, state: TcpSackBlockState) {
+    fn detach_recent(&mut self, state: TcpSackBlockState) {
         if let Some(prev) = state.prev_recent {
-            self.blocks
-                .get_mut(&prev)
-                .expect("tcp sack recent predecessor should exist")
-                .next_recent = state.next_recent;
+            if let Some(previous) = self.blocks.get_mut(&prev) {
+                previous.next_recent = state.next_recent;
+            }
         } else {
             self.recent_head = state.next_recent;
         }
 
         if let Some(next) = state.next_recent {
-            self.blocks
-                .get_mut(&next)
-                .expect("tcp sack recent successor should exist")
-                .prev_recent = state.prev_recent;
+            if let Some(successor) = self.blocks.get_mut(&next) {
+                successor.prev_recent = state.prev_recent;
+            }
         } else {
             self.recent_tail = state.prev_recent;
         }
 
-        let _ = left;
         if self.output_pos > self.blocks.len() {
             self.output_pos = 0;
         }
@@ -410,10 +383,9 @@ impl TcpSackState {
         let mut blocks = Vec::new();
         let mut cursor = self.recent_head;
         while let Some(left) = cursor {
-            let state = *self
-                .blocks
-                .get(&left)
-                .expect("tcp sack recency link should point to existing block");
+            let Some(state) = self.blocks.get(&left).copied() else {
+                break;
+            };
             blocks.push(state.range(left).into());
             cursor = state.next_recent;
         }
@@ -438,14 +410,25 @@ fn ranges_overlap_or_touch(left: TcpSackRange, right: TcpSackRange) -> bool {
 mod tests {
     use super::*;
 
+    fn update_range_for_test(
+        sack: &mut TcpSackState,
+        enabled: bool,
+        rcv_nxt: TcpSeq,
+        left: TcpSeq,
+        right: TcpSeq,
+    ) {
+        update_range_for_test(&mut sack, enabled, rcv_nxt, left, right)
+            .expect("TCP SACK range update");
+    }
+
     #[test]
     fn tcp_update_sack_block_merges_and_drops_delivered_ranges() {
         let mut sack = TcpSackState::default();
         let mut rcv_nxt: TcpSeq = 1_000u32.into();
 
-        sack.update_range(true, rcv_nxt, 1_020u32.into(), 1_030u32.into());
-        sack.update_range(true, rcv_nxt, 1_040u32.into(), 1_050u32.into());
-        sack.update_range(true, rcv_nxt, 1_028u32.into(), 1_045u32.into());
+        update_range_for_test(&mut sack, true, rcv_nxt, 1_020u32.into(), 1_030u32.into());
+        update_range_for_test(&mut sack, true, rcv_nxt, 1_040u32.into(), 1_050u32.into());
+        update_range_for_test(&mut sack, true, rcv_nxt, 1_028u32.into(), 1_045u32.into());
 
         assert_eq!(sack.block_count(), 1);
         assert_eq!(
@@ -457,7 +440,7 @@ mod tests {
         );
 
         rcv_nxt = 1_050u32.into();
-        sack.update_range(true, rcv_nxt, rcv_nxt, rcv_nxt);
+        update_range_for_test(&mut sack, true, rcv_nxt, rcv_nxt, rcv_nxt);
 
         assert_eq!(sack.block_count(), 0);
     }
@@ -465,7 +448,13 @@ mod tests {
     #[test]
     fn tcp_output_sack_blocks_emits_pending_dsack_first() {
         let mut sack = TcpSackState::default();
-        sack.update_range(true, 0u32.into(), 8_000u32.into(), 8_100u32.into());
+        update_range_for_test(
+            &mut sack,
+            true,
+            0u32.into(),
+            8_000u32.into(),
+            8_100u32.into(),
+        );
         sack.set_duplicate(true, 6_500u32.into(), 6_550u32.into());
 
         let (blocks, count) = sack
@@ -496,7 +485,7 @@ mod tests {
         let rcv_nxt: TcpSeq = 100u32.into();
 
         sack.set_duplicate(true, 90u32.into(), rcv_nxt);
-        sack.update_range(true, rcv_nxt, rcv_nxt, 110u32.into());
+        update_range_for_test(&mut sack, true, rcv_nxt, rcv_nxt, 110u32.into());
 
         assert_eq!(
             sack.pending_dsack(),
@@ -519,9 +508,9 @@ mod tests {
         let mut sack = TcpSackState::default();
         let rcv_nxt: TcpSeq = 1_000u32.into();
 
-        sack.update_range(true, rcv_nxt, 1_400u32.into(), 1_450u32.into());
-        sack.update_range(true, rcv_nxt, 1_200u32.into(), 1_260u32.into());
-        sack.update_range(true, rcv_nxt, 1_300u32.into(), 1_340u32.into());
+        update_range_for_test(&mut sack, true, rcv_nxt, 1_400u32.into(), 1_450u32.into());
+        update_range_for_test(&mut sack, true, rcv_nxt, 1_200u32.into(), 1_260u32.into());
+        update_range_for_test(&mut sack, true, rcv_nxt, 1_300u32.into(), 1_340u32.into());
 
         assert_eq!(sack.block_count(), 3);
         assert_eq!(
@@ -552,10 +541,10 @@ mod tests {
         let mut sack = TcpSackState::default();
         let rcv_nxt: TcpSeq = 5_000u32.into();
 
-        sack.update_range(true, rcv_nxt, 5_500u32.into(), 5_550u32.into());
-        sack.update_range(true, rcv_nxt, 5_600u32.into(), 5_650u32.into());
-        sack.update_range(true, rcv_nxt, 5_700u32.into(), 5_750u32.into());
-        sack.update_range(true, rcv_nxt, 5_800u32.into(), 5_850u32.into());
+        update_range_for_test(&mut sack, true, rcv_nxt, 5_500u32.into(), 5_550u32.into());
+        update_range_for_test(&mut sack, true, rcv_nxt, 5_600u32.into(), 5_650u32.into());
+        update_range_for_test(&mut sack, true, rcv_nxt, 5_700u32.into(), 5_750u32.into());
+        update_range_for_test(&mut sack, true, rcv_nxt, 5_800u32.into(), 5_850u32.into());
         sack.set_duplicate(true, 4_920u32.into(), 4_980u32.into());
 
         let (blocks, count) = sack
@@ -598,9 +587,9 @@ mod tests {
         let mut sack = TcpSackState::default();
         let rcv_nxt: TcpSeq = 10_000u32.into();
 
-        sack.update_range(true, rcv_nxt, 10_200u32.into(), 10_240u32.into());
-        sack.update_range(true, rcv_nxt, 10_300u32.into(), 10_340u32.into());
-        sack.update_range(true, rcv_nxt, 10_220u32.into(), 10_320u32.into());
+        update_range_for_test(&mut sack, true, rcv_nxt, 10_200u32.into(), 10_240u32.into());
+        update_range_for_test(&mut sack, true, rcv_nxt, 10_300u32.into(), 10_340u32.into());
+        update_range_for_test(&mut sack, true, rcv_nxt, 10_220u32.into(), 10_320u32.into());
 
         assert_eq!(sack.block_count(), 1);
         assert_eq!(
@@ -617,8 +606,14 @@ mod tests {
         let mut sack = TcpSackState::default();
         let rcv_nxt: TcpSeq = 20_000u32.into();
 
-        sack.update_range(true, rcv_nxt, 20_100u32.into(), 20_180u32.into());
-        sack.update_range(true, 20_140u32.into(), 20_140u32.into(), 20_140u32.into());
+        update_range_for_test(&mut sack, true, rcv_nxt, 20_100u32.into(), 20_180u32.into());
+        update_range_for_test(
+            &mut sack,
+            true,
+            20_140u32.into(),
+            20_140u32.into(),
+            20_140u32.into(),
+        );
 
         assert_eq!(sack.block_count(), 1);
         assert_eq!(

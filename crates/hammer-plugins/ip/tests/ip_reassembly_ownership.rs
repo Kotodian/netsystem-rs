@@ -5,7 +5,6 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use hammer_core::data_plane::{NodeHandle, NodeNext};
-use hammer_infra::pool::Index as PoolIndex;
 use hammer_plugin_ip::protocol::ip::IpFragmentKey;
 use hammer_plugin_ip::{
     IpReassemblyDirectory, IpReassemblyHandoff, IpReassemblyNext, IpReassemblyNode,
@@ -29,7 +28,7 @@ fn test_runtime() -> DataPlaneRuntime {
 
 #[test]
 fn fragment_owner_bihash_value_packs_context_index_and_memory_owner() {
-    let index = PoolIndex::new(17, 3);
+    let index = 17u32;
     let owner = DataWorkerId::new(5);
     let packed = pack_fragment_owner_value(index, owner);
     let (got_index, got_owner) = unpack_fragment_owner_value(packed);
@@ -54,14 +53,13 @@ fn fragment_owner_directory_first_writer_wins_on_shared_bihash() {
     };
     let worker0 = DataWorkerId::new(0);
     let worker1 = DataWorkerId::new(1);
-    let index = PoolIndex::new(1, 1);
+    let index = 1u32;
 
     let (owner, created) = directory.claim_or_lookup(key, index, worker0);
     assert!(created);
     assert_eq!(owner, worker0);
 
-    let (owner_again, created_again) =
-        directory.claim_or_lookup(key, PoolIndex::new(2, 1), worker1);
+    let (owner_again, created_again) = directory.claim_or_lookup(key, 2u32, worker1);
     assert!(!created_again);
     assert_eq!(owner_again, worker0);
 
@@ -92,9 +90,9 @@ fn failed_reassembly_does_not_sticky_deny_same_key() {
         identification: 1,
     };
     let worker = DataWorkerId::new(0);
-    let _ = directory.claim_or_lookup(key, PoolIndex::new(1, 1), worker);
+    let _ = directory.claim_or_lookup(key, 1u32, worker);
     directory.remove(key);
-    let (owner, created) = directory.claim_or_lookup(key, PoolIndex::new(3, 1), worker);
+    let (owner, created) = directory.claim_or_lookup(key, 3u32, worker);
     assert!(created);
     assert_eq!(owner, worker);
 }

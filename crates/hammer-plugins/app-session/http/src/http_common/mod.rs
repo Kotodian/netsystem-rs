@@ -370,7 +370,7 @@ impl WireLayout {
 /// Why a FIFO publish failed. `Encode` and `Capacity` leave the FIFO
 /// unchanged; `Fifo` covers reservation/copy/commit failures, which roll
 /// back so nothing becomes visible.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, PartialEq, Eq)]
 #[allow(dead_code)] // exercised from tests; wired to the app publisher later
 pub(crate) enum PublishError {
     /// The request is not encodable (wire-width or flag violations).

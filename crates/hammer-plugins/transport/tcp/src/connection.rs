@@ -18,7 +18,6 @@ use crate::{
     TcpTimestampOption,
 };
 use crossbeam_utils::CachePadded;
-use hammer_infra::pool::Index as PoolIndex;
 use hammer_runtime::DataWorkerId;
 use hammer_runtime::{RuntimeError, RuntimeResult};
 use hammer_service::session::runtime::RxDelivery;
@@ -64,8 +63,6 @@ enum TcpConnectionError {
     MissingLocalAddress,
     #[error("dispatch error")]
     PayloadLengthOverflow,
-    #[error("dispatch error")]
-    RecoverySampleExhausted,
 }
 
 impl From<TcpConnectionError> for TcpError {
@@ -75,8 +72,7 @@ impl From<TcpConnectionError> for TcpError {
             TcpConnectionError::InvalidState | TcpConnectionError::MissingLocalAddress => {
                 TcpError::InvalidConnection
             }
-            TcpConnectionError::PayloadLengthOverflow
-            | TcpConnectionError::RecoverySampleExhausted => TcpError::Dispatch,
+            TcpConnectionError::PayloadLengthOverflow => TcpError::Dispatch,
         }
     }
 }
@@ -676,14 +672,8 @@ impl TcpConnection {
         let end = sequence.advance(bytes);
         self.snd_nxt = end;
         let packet_number = self.recovery.next_packet_number();
-        assert!(self.recovery.record_sent(
-            packet_number,
-            sequence,
-            end,
-            bytes,
-            bytes,
-            Instant::now()
-        ));
+        self.recovery
+            .record_sent(packet_number, sequence, end, bytes, bytes, Instant::now());
         self.refresh_bytes_in_flight_cached();
     }
 
@@ -700,10 +690,6 @@ impl TcpConnection {
     #[inline]
     pub fn recovery(&self) -> &TcpRecoveryState {
         &self.recovery
-    }
-
-    pub(crate) fn reserve_payload_tx_samples(&mut self, additional: usize) -> bool {
-        self.recovery.ensure_sample_capacity(additional)
     }
 
     #[inline]
@@ -726,7 +712,7 @@ impl TcpConnection {
     #[inline]
     fn observe_activity(
         &mut self,
-        index: PoolIndex,
+        index: u32,
         timers: &mut TcpTimers,
         now: Instant,
     ) -> RuntimeResult<()> {
@@ -756,7 +742,7 @@ impl TcpConnection {
 
     fn sync_recovery_timers(
         &mut self,
-        index: PoolIndex,
+        index: u32,
         timers: &mut TcpTimers,
         now: Instant,
         recovery_timing_changed: bool,
@@ -945,9 +931,9 @@ impl TcpConnection {
         packet: &TcpPacket,
         acknowledgment: TcpSeq,
         sack_blocks: &[TcpSackBlock],
-    ) -> Option<Duration> {
+    ) -> RuntimeResult<Option<Duration>> {
         if !self.accepts_ack(acknowledgment) {
-            return None;
+            return Ok(None);
         }
         let advanced = acknowledgment > self.snd_una;
         let recovery_ack = self.recovery_ack(acknowledgment);
@@ -973,7 +959,7 @@ impl TcpConnection {
             self.ecn.pending_ce_feedback = 0;
         }
         self.refresh_bytes_in_flight_cached();
-        latest_rtt
+        Ok(latest_rtt)
     }
 
     #[inline]
@@ -1069,7 +1055,7 @@ impl TcpConnection {
     #[inline]
     pub(super) fn on_clean_in_order_payload(
         &mut self,
-        index: PoolIndex,
+        index: u32,
         timers: &mut TcpTimers,
     ) -> RuntimeResult<bool> {
         if self.timers.is_active(TcpTimerKind::DelayedAck) {
@@ -1255,7 +1241,7 @@ impl TcpConnection {
 
     pub(super) fn receive_open_reply(
         &mut self,
-        index: PoolIndex,
+        index: u32,
         timers: &mut TcpTimers,
         packet: &TcpPacket,
         local_capabilities: TcpCapabilities,
@@ -1366,7 +1352,7 @@ impl TcpConnection {
 
     pub(super) fn receive_final_ack(
         &mut self,
-        index: PoolIndex,
+        index: u32,
         timers: &mut TcpTimers,
         packet: &TcpPacket,
         now: Instant,
@@ -1550,16 +1536,14 @@ impl TcpConnection {
                 .raw();
             let bytes_in_flight = self.bytes_in_flight_cached;
             let packet_number = self.recovery.next_packet_number();
-            if !self.recovery.record_sent(
+            self.recovery.record_sent(
                 packet_number,
                 TcpSeq::from(sequence),
                 TcpSeq::from(end_sequence),
                 payload_len,
                 payload_len,
                 now,
-            ) {
-                return Err(TcpConnectionError::RecoverySampleExhausted.into());
-            }
+            );
             self.refresh_bytes_in_flight_cached();
             self.congestion.on_packet_sent(
                 packet_number,
@@ -1591,16 +1575,14 @@ impl TcpConnection {
         let end_sequence = TcpSeq::from(sequence).advance(payload_len).raw();
         let bytes_in_flight = self.bytes_in_flight_cached;
         let packet_number = self.recovery.next_packet_number();
-        if !self.recovery.record_sent(
+        let _ = self.recovery.record_sent(
             packet_number,
             TcpSeq::from(sequence),
             TcpSeq::from(end_sequence),
             payload_len,
             payload_len,
             now,
-        ) {
-            return Err(TcpConnectionError::RecoverySampleExhausted.into());
-        }
+        );
         self.recovery.on_new_data_sent(payload_len);
         self.refresh_bytes_in_flight_cached();
         self.congestion
@@ -1614,7 +1596,7 @@ impl TcpConnection {
 
     pub(super) fn sync_payload_tx_timers(
         &mut self,
-        index: PoolIndex,
+        index: u32,
         timers: &mut TcpTimers,
         now: Instant,
     ) -> RuntimeResult<()> {
@@ -1675,7 +1657,7 @@ impl TcpConnection {
 
     pub(super) fn receive_ack_with_timers(
         &mut self,
-        index: PoolIndex,
+        index: u32,
         timers: &mut TcpTimers,
         packet: &TcpPacket,
         acknowledgment: u32,
@@ -1689,7 +1671,7 @@ impl TcpConnection {
         let bytes_in_flight_before = self.recovery.bytes_in_flight();
         let rack_timeout_before = self.recovery.rack_timeout(now);
         let zero_window_before = self.snd_wnd == 0;
-        let _ = self.observe_ack_progress(packet, acknowledgment, sack_blocks);
+        self.observe_ack_progress(packet, acknowledgment, sack_blocks)?;
         self.apply_ack(acknowledgment, advertised_window);
         let recovery_progress = ack_accepted
             && (self.snd_una != snd_una_before
@@ -1714,7 +1696,7 @@ impl TcpConnection {
 
     pub(super) fn receive_established_with_timers(
         &mut self,
-        index: PoolIndex,
+        index: u32,
         timers: &mut TcpTimers,
         packet: &TcpPacket,
         now: Instant,
@@ -1769,7 +1751,7 @@ impl TcpConnection {
 
     pub(super) fn receive_close_side(
         &mut self,
-        index: PoolIndex,
+        index: u32,
         timers: &mut TcpTimers,
         packet: &TcpPacket,
         now: Instant,
@@ -1922,7 +1904,12 @@ impl TcpConnection {
     }
 
     #[inline]
-    pub(crate) fn receive_payload(&mut self, sequence: TcpSeq, trim: u32, delivery: RxDelivery) {
+    pub(crate) fn receive_payload(
+        &mut self,
+        sequence: TcpSeq,
+        trim: u32,
+        delivery: RxDelivery,
+    ) -> RuntimeResult<()> {
         if trim != 0 {
             self.sack
                 .set_duplicate(self.negotiated_options().sack, sequence, self.rcv_nxt);
@@ -1941,7 +1928,7 @@ impl TcpConnection {
                 let right = left.advance(newest.len().get());
                 self.sack
                     .update_range(self.negotiated_options().sack, self.rcv_nxt, left, right);
-                return;
+                return Ok(());
             }
         }
         self.sack.update_range(
@@ -1950,6 +1937,7 @@ impl TcpConnection {
             self.rcv_nxt,
             self.rcv_nxt,
         );
+        Ok(())
     }
 
     #[inline]
@@ -2044,7 +2032,7 @@ impl TcpConnection {
 
     pub(super) fn on_tcp_ready(
         &mut self,
-        index: PoolIndex,
+        index: u32,
         timers: &mut TcpTimers,
         has_pending_tx: bool,
         local_capabilities: TcpCapabilities,
@@ -2096,7 +2084,7 @@ impl TcpConnection {
     }
 
     #[inline]
-    pub(super) fn on_session_close(&mut self, index: PoolIndex, timers: &mut TcpTimers) {
+    pub(super) fn on_session_close(&mut self, index: u32, timers: &mut TcpTimers) {
         match self.state {
             TcpState::Established => {
                 self.cacheline1.close_reason = Some(TcpCloseReason::LocalRequest);
@@ -2116,7 +2104,7 @@ impl TcpConnection {
 
     pub(super) fn on_typed_timer_expiry(
         &mut self,
-        index: PoolIndex,
+        index: u32,
         timers: &mut TcpTimers,
         kind: TcpTimerKind,
         local_capabilities: TcpCapabilities,
@@ -2126,9 +2114,9 @@ impl TcpConnection {
             return Ok(TcpTimerOutcome::none());
         }
         let outcome = match kind {
-            TcpTimerKind::Retransmit => self.on_retransmit_timer_expiry(local_capabilities),
-            TcpTimerKind::Rack => self.on_rack_timer_expiry(),
-            TcpTimerKind::Tlp => self.on_tlp_timer_expiry(),
+            TcpTimerKind::Retransmit => self.on_retransmit_timer_expiry(local_capabilities)?,
+            TcpTimerKind::Rack => self.on_rack_timer_expiry()?,
+            TcpTimerKind::Tlp => self.on_tlp_timer_expiry()?,
             TcpTimerKind::DelayedAck => {
                 TcpTimerOutcome::segment(self.on_delayed_ack_timer_expiry())
             }
@@ -2213,11 +2201,11 @@ impl TcpConnection {
     fn on_retransmit_timer_expiry(
         &mut self,
         local_capabilities: TcpCapabilities,
-    ) -> TcpTimerOutcome {
+    ) -> RuntimeResult<TcpTimerOutcome> {
         if self.state == TcpState::SynSent {
             self.observe_retransmit_timeout();
             let Some(local) = self.local else {
-                return TcpTimerOutcome::none();
+                return Ok(TcpTimerOutcome::none());
             };
             let capabilities = normalize_tcp_capabilities(local_capabilities);
             let flags = if capabilities.ecn {
@@ -2226,7 +2214,7 @@ impl TcpConnection {
                 TcpSegmentFlags::SYN
             };
             let advertised_window = self.output_receive_window(flags);
-            return TcpTimerOutcome::acted(
+            return Ok(TcpTimerOutcome::acted(
                 TcpTimerAction::RtoRetransmit,
                 Some(TcpSegment::new(
                     local,
@@ -2242,7 +2230,7 @@ impl TcpConnection {
                     None,
                     self.fast_open_syn_payload_len as usize,
                 )),
-            );
+            ));
         }
         match self.state {
             TcpState::Established => {
@@ -2252,22 +2240,22 @@ impl TcpConnection {
                     self.snd_nxt,
                     &mut self.congestion,
                 ) else {
-                    return TcpTimerOutcome::none();
+                    return Ok(TcpTimerOutcome::none());
                 };
                 self.observe_retransmit_timeout();
                 self.tx_intent_sequence = Some(sample.sequence);
                 self.tx_intent_payload_len = sample.payload_len;
                 self.pacing_ready = true;
-                TcpTimerOutcome::acted(TcpTimerAction::RtoRetransmit, None)
+                Ok(TcpTimerOutcome::acted(TcpTimerAction::RtoRetransmit, None))
             }
             TcpState::FinWait1 | TcpState::Closing | TcpState::LastAck => {
                 self.observe_retransmit_timeout();
                 let Some(local) = self.local else {
-                    return TcpTimerOutcome::none();
+                    return Ok(TcpTimerOutcome::none());
                 };
                 let flags = TcpSegmentFlags::ACK | TcpSegmentFlags::FIN;
                 let advertised_window = self.output_receive_window(flags);
-                TcpTimerOutcome::acted(
+                Ok(TcpTimerOutcome::acted(
                     TcpTimerAction::RtoRetransmit,
                     Some(TcpSegment::new(
                         local,
@@ -2283,35 +2271,35 @@ impl TcpConnection {
                         None,
                         0,
                     )),
-                )
+                ))
             }
-            _ => TcpTimerOutcome::none(),
+            _ => Ok(TcpTimerOutcome::none()),
         }
     }
 
-    fn on_rack_timer_expiry(&mut self) -> TcpTimerOutcome {
+    fn on_rack_timer_expiry(&mut self) -> RuntimeResult<TcpTimerOutcome> {
         if self.ensure_state(TcpState::Established).is_err() {
-            return TcpTimerOutcome::none();
+            return Ok(TcpTimerOutcome::none());
         }
         let now = Instant::now();
         self.recovery
             .on_rack_timeout(now, self.snd_nxt, &mut self.congestion);
         let Some(sample) = self.recovery.take_rack_retransmit() else {
-            return TcpTimerOutcome::none();
+            return Ok(TcpTimerOutcome::none());
         };
         self.recovery.on_retransmit_sent(sample.bytes);
         self.tx_intent_sequence = Some(sample.sequence);
         self.tx_intent_payload_len = sample.payload_len;
         self.pacing_ready = true;
-        TcpTimerOutcome::acted(TcpTimerAction::RackRetransmit, None)
+        Ok(TcpTimerOutcome::acted(TcpTimerAction::RackRetransmit, None))
     }
 
-    fn on_tlp_timer_expiry(&mut self) -> TcpTimerOutcome {
+    fn on_tlp_timer_expiry(&mut self) -> RuntimeResult<TcpTimerOutcome> {
         if self.ensure_state(TcpState::Established).is_err() {
-            return TcpTimerOutcome::none();
+            return Ok(TcpTimerOutcome::none());
         }
         let Some(sample) = self.recovery.take_tlp_probe() else {
-            return TcpTimerOutcome::none();
+            return Ok(TcpTimerOutcome::none());
         };
         if self.recovery.in_recovery() {
             self.recovery.on_retransmit_sent(sample.bytes);
@@ -2319,7 +2307,7 @@ impl TcpConnection {
         self.tx_intent_sequence = Some(sample.sequence);
         self.tx_intent_payload_len = sample.payload_len;
         self.pacing_ready = true;
-        TcpTimerOutcome::acted(TcpTimerAction::TlpProbe, None)
+        Ok(TcpTimerOutcome::acted(TcpTimerAction::TlpProbe, None))
     }
 
     fn on_delayed_ack_timer_expiry(&mut self) -> Option<TcpSegment> {
@@ -2466,7 +2454,7 @@ impl TcpConnection {
         let now = Instant::now();
         let mut timers = TcpTimers::new(now, Duration::from_millis(10));
         let _ = connection
-            .receive_final_ack(PoolIndex::new(0, 0), &mut timers, &final_packet, now)
+            .receive_final_ack(0u32, &mut timers, &final_packet, now)
             .expect("accept final ack");
         connection
     }
@@ -2656,17 +2644,10 @@ mod tests {
         )
     }
 
-    fn timer_policy_connection() -> (
-        Pool<TcpConnection>,
-        hammer_infra::pool::Index,
-        TcpTimers,
-        Instant,
-    ) {
+    fn timer_policy_connection() -> (Pool<TcpConnection>, u32, TcpTimers, Instant) {
         let now = Instant::now();
         let mut connections = Pool::with_capacity(1);
-        let index = connections
-            .insert(established_connection())
-            .expect("insert TCP connection");
+        let index = connections.insert(established_connection());
         (
             connections,
             index,
@@ -2680,12 +2661,12 @@ mod tests {
         packet: &TcpPacket,
     ) -> RuntimeResult<Option<TcpSegment>> {
         let mut timers = TcpTimers::new(Instant::now(), Duration::from_millis(10));
-        connection.receive_close_side(PoolIndex::new(0, 0), &mut timers, packet, Instant::now())
+        connection.receive_close_side(0u32, &mut timers, packet, Instant::now())
     }
 
     fn start_local_close_for_test(connection: &mut TcpConnection) -> TcpSegment {
         let now = Instant::now();
-        let index = PoolIndex::new(0, 0);
+        let index = 0u32;
         let mut timers = TcpTimers::new(now, Duration::from_millis(10));
         connection.on_session_close(index, &mut timers);
         connection
@@ -2925,9 +2906,7 @@ mod tests {
     fn tcp_pacing_expiry_schedules_only_when_pacing_is_active() {
         let now = Instant::now();
         let mut connections = Pool::with_capacity(1);
-        let index = connections
-            .insert(established_connection_with_pacing_controller())
-            .expect("insert TCP connection");
+        let index = connections.insert(established_connection_with_pacing_controller());
         let mut timers = TcpTimers::new(now, Duration::from_millis(10));
         {
             let connection = connections.get_mut(index).expect("connection");
@@ -2966,14 +2945,14 @@ mod tests {
         let (mut connections, index, mut timers, now) = timer_policy_connection();
         let packet = {
             let connection = connections.get_mut(index).expect("connection");
-            assert!(connection.recovery.record_sent(
+            connection.recovery.record_sent(
                 1,
                 TcpSeq::from(connection.snd_una()),
                 TcpSeq::from(connection.snd_una()).advance(1),
                 1,
                 1,
                 now,
-            ));
+            );
             connection.snd_nxt = TcpSeq::from(connection.snd_una()).advance(1);
             timers
                 .update(
@@ -3030,19 +3009,12 @@ mod tests {
             let connection = connections.get_mut(index).expect("connection");
             let snd_una = TcpSeq::from(connection.snd_una());
             connection.snd_nxt = snd_una.advance(2);
-            assert!(
-                connection
-                    .recovery
-                    .record_sent(1, snd_una, snd_una.advance(1), 1, 1, now)
-            );
-            assert!(connection.recovery.record_sent(
-                2,
-                snd_una.advance(1),
-                snd_una.advance(2),
-                1,
-                1,
-                now
-            ));
+            connection
+                .recovery
+                .record_sent(1, snd_una, snd_una.advance(1), 1, 1, now);
+            connection
+                .recovery
+                .record_sent(2, snd_una.advance(1), snd_una.advance(2), 1, 1, now);
             let rto = connection.retransmit_timeout().retransmit_timeout();
             timers
                 .update(
@@ -3120,11 +3092,9 @@ mod tests {
             let connection = connections.get_mut(index).expect("connection");
             let snd_una = TcpSeq::from(connection.snd_una());
             connection.snd_nxt = snd_una.advance(1);
-            assert!(
-                connection
-                    .recovery
-                    .record_sent(1, snd_una, snd_una.advance(1), 1, 1, now)
-            );
+            connection
+                .recovery
+                .record_sent(1, snd_una, snd_una.advance(1), 1, 1, now);
             connection.keepalive.config.idle = Duration::from_secs(24 * 60 * 60);
             timers
                 .update(
@@ -3164,23 +3134,23 @@ mod tests {
             let connection = connections.get_mut(index).expect("connection");
             let snd_una = TcpSeq::from(connection.snd_una());
             connection.snd_nxt = snd_una.advance(2_000);
-            assert!(connection.recovery.record_sent(
+            connection.recovery.record_sent(
                 1,
                 snd_una,
                 snd_una.advance(1_000),
                 1_000,
                 1_000,
                 now - Duration::from_secs(2),
-            ));
-            assert!(connection.recovery.record_sent(
+            );
+            connection.recovery.record_sent(
                 2,
                 snd_una.advance(1_000),
                 snd_una.advance(2_000),
                 1_000,
                 1_000,
                 now - Duration::from_secs(1),
-            ));
-            connection.recovery.on_sack_blocks(
+            );
+            connection.recovery.on_sack_blocks_for_test(
                 TcpRecoveryAck {
                     acknowledgment: snd_una,
                     now,
@@ -3257,11 +3227,9 @@ mod tests {
             let connection = connections.get_mut(index).expect("connection");
             let snd_una = TcpSeq::from(connection.snd_una());
             connection.snd_nxt = snd_una.advance(1);
-            assert!(
-                connection
-                    .recovery
-                    .record_sent(1, snd_una, snd_una.advance(1), 1, 1, now)
-            );
+            connection
+                .recovery
+                .record_sent(1, snd_una, snd_una.advance(1), 1, 1, now);
             timers
                 .update(
                     index,
@@ -3323,23 +3291,23 @@ mod tests {
         let mut rack_connection = established_connection_with_test_controller();
         rack_connection.snd_una = TcpSeq::from(1_000);
         rack_connection.snd_nxt = TcpSeq::from(3_000);
-        assert!(rack_connection.recovery.record_sent(
+        rack_connection.recovery.record_sent(
             1,
             TcpSeq::from(1_000),
             TcpSeq::from(2_000),
             1_000,
             1_000,
             now - Duration::from_secs(2),
-        ));
-        assert!(rack_connection.recovery.record_sent(
+        );
+        rack_connection.recovery.record_sent(
             2,
             TcpSeq::from(2_000),
             TcpSeq::from(3_000),
             1_000,
             1_000,
             now - Duration::from_secs(1),
-        ));
-        rack_connection.recovery.on_sack_blocks(
+        );
+        rack_connection.recovery.on_sack_blocks_for_test(
             TcpRecoveryAck {
                 acknowledgment: TcpSeq::from(1_000),
                 now: now - Duration::from_millis(100),
@@ -3353,24 +3321,20 @@ mod tests {
             }],
             &mut rack_connection.congestion,
         );
-        let rack_index = connections
-            .insert(rack_connection)
-            .expect("insert RACK connection");
+        let rack_index = connections.insert(rack_connection);
 
         let mut tlp_connection = established_connection_with_test_controller();
         let tlp_sequence = TcpSeq::from(tlp_connection.snd_nxt());
         tlp_connection.snd_nxt = tlp_sequence.advance(1_000);
-        assert!(tlp_connection.recovery.record_sent(
+        tlp_connection.recovery.record_sent(
             1,
             tlp_sequence,
             tlp_sequence.advance(1_000),
             1_000,
             1_000,
             now,
-        ));
-        let tlp_index = connections
-            .insert(tlp_connection)
-            .expect("insert TLP connection");
+        );
+        let tlp_index = connections.insert(tlp_connection);
         let mut timers = TcpTimers::new(now, Duration::from_millis(10));
         timers
             .update(
@@ -3730,7 +3694,7 @@ mod tests {
         let now = Instant::now();
         let mut timers = TcpTimers::new(now, Duration::from_millis(10));
         let segment = connection
-            .on_tcp_ready(PoolIndex::new(0, 0), &mut timers, false, local_caps, now)
+            .on_tcp_ready(0u32, &mut timers, false, local_caps, now)
             .expect("prepare syn")
             .expect("initial syn should be emitted");
         let mut header = [0u8; 64];
@@ -3769,7 +3733,7 @@ mod tests {
         let _ = connection
             .commit_payload_tx(5, now)
             .expect("commit syn payload");
-        let index = PoolIndex::new(0, 0);
+        let index = 0u32;
         let mut timers = TcpTimers::new(now, Duration::from_millis(10));
         connection
             .sync_payload_tx_timers(index, &mut timers, now)
@@ -4313,14 +4277,9 @@ mod tests {
         let mut connection = established_connection();
         let baseline = connection.retransmit_timeout().retransmit_timeout();
 
-        assert!(connection.recovery.record_sent(
-            1,
-            TcpSeq::from(1_000),
-            TcpSeq::from(2_000),
-            1_000,
-            0,
-            now
-        ));
+        connection
+            .recovery
+            .record_sent(1, TcpSeq::from(1_000), TcpSeq::from(2_000), 1_000, 0, now);
         let _ = connection.recovery.take_tlp_probe().expect("tlp probe");
         let packet = TcpPacket {
             local: connection.remote(),
@@ -4366,14 +4325,14 @@ mod tests {
         let sent = connection
             .next_local_timestamp(true)
             .expect("local timestamp for outbound packet");
-        assert!(connection.recovery.record_sent(
+        connection.recovery.record_sent(
             1,
             TcpSeq::from(sequence),
             TcpSeq::from(end_sequence),
             1,
             0,
             now,
-        ));
+        );
         let _ = connection.recovery.take_tlp_probe().expect("tlp probe");
         let packet = TcpPacket {
             local: connection.remote(),
@@ -4420,7 +4379,7 @@ mod tests {
         connection.snd_nxt = TcpSeq::from(1_000);
 
         let now = Instant::now();
-        let index = PoolIndex::new(0, 0);
+        let index = 0u32;
         let mut timers = TcpTimers::new(now, Duration::from_millis(10));
         for i in 0..5u32 {
             let _ = connection
@@ -4558,7 +4517,7 @@ mod tests {
         connection.snd_nxt = TcpSeq::from(1_000);
 
         let now = Instant::now();
-        let index = PoolIndex::new(0, 0);
+        let index = 0u32;
         let mut timers = TcpTimers::new(now, Duration::from_millis(10));
         for i in 0..5u32 {
             let _ = connection
@@ -4601,7 +4560,7 @@ mod tests {
         assert_eq!(connection.recovery.bytes_in_flight(), 4_000);
         assert_eq!(connection.bytes_in_flight_cached, 4_000);
 
-        connection.recovery.on_rack_timeout(
+        connection.recovery.on_rack_timeout_for_test(
             now + Duration::from_secs(60),
             TcpSeq::from(connection.snd_nxt),
             &mut connection.congestion,
@@ -4875,12 +4834,11 @@ mod tests {
     }
 
     use crate::{TcpWorker, closing_session_for_test};
-    use hammer_infra::pool::Index as PoolIndex;
     use hammer_service::session::SessionId;
     use hammer_service::session::SessionWorker;
 
     fn session<'a>(
-        sessions: &SessionWorker<PoolIndex>,
+        sessions: &SessionWorker<u32>,
         tcp: &'a TcpWorker,
         session_id: SessionId,
     ) -> Option<&'a TcpConnection> {
@@ -4889,7 +4847,7 @@ mod tests {
     }
 
     fn session_mut<'a>(
-        sessions: &SessionWorker<PoolIndex>,
+        sessions: &SessionWorker<u32>,
         tcp: &'a mut TcpWorker,
         session_id: SessionId,
     ) -> Option<&'a mut TcpConnection> {
@@ -4921,7 +4879,7 @@ mod tests {
     }
 
     fn drive_fin_ack_to_time_wait(
-        sessions: &SessionWorker<PoolIndex>,
+        sessions: &SessionWorker<u32>,
         tcp: &mut TcpWorker,
         session_id: SessionId,
         local: SocketAddr,
@@ -4968,7 +4926,7 @@ mod tests {
     }
 
     fn enter_close_wait_for_passive_close_test(
-        sessions: &SessionWorker<PoolIndex>,
+        sessions: &SessionWorker<u32>,
         tcp: &mut TcpWorker,
         session_id: SessionId,
         local: SocketAddr,

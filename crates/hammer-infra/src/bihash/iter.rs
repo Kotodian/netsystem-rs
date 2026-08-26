@@ -29,7 +29,7 @@ impl<'a, K: BihashKey + Default, const KVP: usize> BihashIter<'a, K, KVP> {
     }
 }
 
-impl<K: BihashKey + Default, const KVP: usize> Iterator for BihashIter<'_, K, KVP> {
+impl<'a, K: BihashKey + Default, const KVP: usize> Iterator for BihashIter<'a, K, KVP> {
     type Item = (K, u64);
 
     fn next(&mut self) -> Option<Self::Item> {

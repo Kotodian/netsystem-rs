@@ -7,7 +7,6 @@ use crate::{
     TcpCapabilities, TcpPacket, TcpSegmentFlags, TcpSeq, TcpState, publish_tcp_connection,
 };
 use hammer_core::data_plane::{BufferFrame, NodeId};
-use hammer_infra::pool::Index;
 use hammer_runtime::app::{
     AppSessionConfig, AppSessionError, ApplicationId, SessionAppId, SessionEvt, SessionEvtType,
 };
@@ -26,7 +25,7 @@ use crate::timers::{TcpTimerKind, TcpTimers};
 use crate::{TcpConnection, TcpWorker};
 
 fn tcp_session<'a>(
-    sessions: &SessionWorker<Index>,
+    sessions: &SessionWorker<u32>,
     tcp: &'a TcpWorker,
     session_id: SessionId,
 ) -> Option<&'a TcpConnection> {
@@ -46,7 +45,7 @@ fn established_connection() -> TcpConnection {
     )
 }
 
-fn worker_state() -> (SessionWorker<Index>, TcpWorker, Arc<ApplicationMain>) {
+fn worker_state() -> (SessionWorker<u32>, TcpWorker, Arc<ApplicationMain>) {
     let worker = DataWorkerId::new(0);
     let applications = ApplicationMain::with_session_apps(
         1024,
@@ -65,10 +64,10 @@ fn worker_state() -> (SessionWorker<Index>, TcpWorker, Arc<ApplicationMain>) {
 }
 
 fn attach_protocol_session(
-    sessions: &mut SessionWorker<Index>,
+    sessions: &mut SessionWorker<u32>,
     applications: &Arc<ApplicationMain>,
     tcp: &mut TcpWorker,
-    connection_index: Index,
+    connection_index: u32,
     app: SessionAppId,
     callbacks: SessionAppCallbacks,
 ) -> SessionId {
@@ -128,7 +127,7 @@ fn session_queue(runtime: &DataPlaneRuntime) -> (NodeId, SessionQueueNext) {
 
 fn dispatch_session_queue(
     runtime: &DataPlaneRuntime,
-    sessions: &mut SessionWorker<Index>,
+    sessions: &mut SessionWorker<u32>,
     tcp: &mut TcpWorker,
     owner: NodeId,
     output_next: SessionQueueNext,
@@ -144,11 +143,9 @@ fn session_queue_dispatch_advances_tcp_timers_without_session_events() {
     let now = Instant::now();
     let resolution = Duration::from_millis(10);
     tcp.timers = TcpTimers::new(now, resolution);
-    let connection_index = tcp
-        .insert_connection(established_connection())
-        .expect("insert TCP connection");
+    let connection_index = tcp.insert_connection(established_connection());
     let session_id = sessions
-        .insert_session_for_test(<TcpWorker as SessionTransport<Index>>::ID, connection_index);
+        .insert_session_for_test(<TcpWorker as SessionTransport<u32>>::ID, connection_index);
     tcp.connection_mut(connection_index)
         .expect("TCP connection")
         .attach_session(session_id)
@@ -198,11 +195,9 @@ fn session_queue_dispatch_advances_tcp_timers_without_session_events() {
 fn app_close_is_recorded_before_tcp_disconnect() {
     let runtime = DataPlaneRuntime::new(DataPlaneRuntimeConfig::default());
     let (mut sessions, mut tcp, _) = worker_state();
-    let connection_index = tcp
-        .insert_connection(established_connection())
-        .expect("insert TCP connection");
+    let connection_index = tcp.insert_connection(established_connection());
     let session_id = sessions
-        .insert_session_for_test(<TcpWorker as SessionTransport<Index>>::ID, connection_index);
+        .insert_session_for_test(<TcpWorker as SessionTransport<u32>>::ID, connection_index);
     tcp.connection_mut(connection_index)
         .expect("TCP connection")
         .attach_session(session_id)
@@ -225,11 +220,9 @@ fn app_close_is_recorded_before_tcp_disconnect() {
 fn tcp_closed_publication_notifies_app_once_before_cleanup() {
     let runtime = DataPlaneRuntime::new(DataPlaneRuntimeConfig::default());
     let (mut sessions, mut tcp, _) = worker_state();
-    let connection_index = tcp
-        .insert_connection(established_connection())
-        .expect("insert TCP connection");
+    let connection_index = tcp.insert_connection(established_connection());
     let session_id = sessions
-        .insert_session_for_test(<TcpWorker as SessionTransport<Index>>::ID, connection_index);
+        .insert_session_for_test(<TcpWorker as SessionTransport<u32>>::ID, connection_index);
     tcp.connection_mut(connection_index)
         .expect("TCP connection")
         .attach_session(session_id)
@@ -280,9 +273,7 @@ fn tcp_closed_publication_notifies_app_once_before_cleanup() {
 #[test]
 fn rollback_discards_unpublished_session_without_close_notification() {
     let (mut sessions, mut tcp, applications) = worker_state();
-    let connection_index = tcp
-        .insert_connection(established_connection())
-        .expect("insert TCP connection");
+    let connection_index = tcp.insert_connection(established_connection());
     let application = applications.attach().expect("attach test Application");
     sessions
         .install_application_mq_for_test(application)
@@ -312,7 +303,7 @@ fn rollback_discards_unpublished_session_without_close_notification() {
         .expect("register test Session listener");
     let session_id = sessions
         .stream_accept(
-            <TcpWorker as SessionTransport<Index>>::ID,
+            <TcpWorker as SessionTransport<u32>>::ID,
             connection_index,
             listener,
         )
@@ -325,10 +316,9 @@ fn rollback_discards_unpublished_session_without_close_notification() {
         .rollback_session_creation(session_id)
         .expect("rollback session")
         .expect("TCP connection index");
-    let removed = tcp.remove_connection(connection_index);
+    tcp.remove_connection(connection_index);
 
     assert!(!sessions.has_session(session_id));
-    assert!(removed.is_some());
     assert!(tcp.connection(connection_index).is_none());
 }
 
@@ -340,9 +330,7 @@ fn active_open_commits_session_after_full_connection_publication() {
     let remote: std::net::SocketAddr = "198.51.100.20:50001".parse().expect("remote address");
     let mut connection = TcpConnection::new(None, worker, local.port(), Some(local), remote);
     connection.connect_state(100);
-    let connection_index = tcp
-        .insert_connection(connection)
-        .expect("insert active-open TCP connection");
+    let connection_index = tcp.insert_connection(connection);
     let application = applications.attach().expect("attach test Application");
     sessions
         .install_application_mq_for_test(application)
@@ -412,9 +400,7 @@ fn passive_open_app_notification_failure_rolls_back_all_owner_state() {
     let connection = established_connection();
     let local = connection.local().expect("local address");
     let remote = connection.remote();
-    let connection_index = tcp
-        .insert_connection(connection)
-        .expect("insert passive-open TCP connection");
+    let connection_index = tcp.insert_connection(connection);
     let session_id = attach_protocol_session(
         &mut sessions,
         &applications,
@@ -448,9 +434,7 @@ fn active_open_app_notification_failure_rolls_back_all_owner_state() {
     let remote: std::net::SocketAddr = "198.51.100.20:50001".parse().expect("remote address");
     let mut connection = TcpConnection::new(None, worker, local.port(), Some(local), remote);
     connection.connect_state(100);
-    let connection_index = tcp
-        .insert_connection(connection)
-        .expect("insert active-open TCP connection");
+    let connection_index = tcp.insert_connection(connection);
     let session_id = attach_protocol_session(
         &mut sessions,
         &applications,
@@ -488,16 +472,14 @@ fn active_open_app_notification_failure_rolls_back_all_owner_state() {
 fn app_rx_event_refreshes_window_before_zero_window_is_advertised() {
     let runtime = DataPlaneRuntime::new(DataPlaneRuntimeConfig::default());
     let (_, mut tcp, _) = worker_state();
-    let connection_index = tcp
-        .insert_connection(established_connection())
-        .expect("insert TCP connection");
+    let connection_index = tcp.insert_connection(established_connection());
     tcp.connection_mut(connection_index)
         .expect("TCP connection")
         .set_rcv_wnd(0);
     let mut frame = BufferFrame::with_capacity(1);
     let mut output = SessionQueueOutput::default();
 
-    let request_notification = <TcpWorker as SessionTransport<Index>>::app_rx_evt(
+    let request_notification = <TcpWorker as SessionTransport<u32>>::app_rx_evt(
         &mut tcp,
         connection_index,
         8 << 10,
@@ -522,9 +504,7 @@ fn app_rx_event_refreshes_window_before_zero_window_is_advertised() {
 fn app_rx_event_refreshes_window_before_rearming_dequeue_notification() {
     let runtime = DataPlaneRuntime::new(DataPlaneRuntimeConfig::default());
     let (_, mut tcp, _) = worker_state();
-    let connection_index = tcp
-        .insert_connection(established_connection())
-        .expect("insert TCP connection");
+    let connection_index = tcp.insert_connection(established_connection());
     let connection = tcp
         .connection_mut(connection_index)
         .expect("TCP connection");
@@ -541,7 +521,7 @@ fn app_rx_event_refreshes_window_before_rearming_dequeue_notification() {
     let mut frame = BufferFrame::with_capacity(1);
     let mut output = SessionQueueOutput::default();
 
-    let request_notification = <TcpWorker as SessionTransport<Index>>::app_rx_evt(
+    let request_notification = <TcpWorker as SessionTransport<u32>>::app_rx_evt(
         &mut tcp,
         connection_index,
         1 << 10,
@@ -566,11 +546,9 @@ fn app_rx_event_refreshes_window_before_rearming_dequeue_notification() {
 fn fin_with_payload_is_processed_after_rx_enqueue_and_notifies_app_once() {
     let runtime = DataPlaneRuntime::new(DataPlaneRuntimeConfig::default());
     let (mut sessions, mut tcp, _) = worker_state();
-    let connection_index = tcp
-        .insert_connection(established_connection())
-        .expect("insert TCP connection");
+    let connection_index = tcp.insert_connection(established_connection());
     let session_id = sessions
-        .insert_session_for_test(<TcpWorker as SessionTransport<Index>>::ID, connection_index);
+        .insert_session_for_test(<TcpWorker as SessionTransport<u32>>::ID, connection_index);
     tcp.connection_mut(connection_index)
         .expect("TCP connection")
         .attach_session(session_id)
@@ -655,11 +633,9 @@ fn fin_with_payload_is_processed_after_rx_enqueue_and_notifies_app_once() {
 fn app_half_close_sends_fin_without_closing_session_state() {
     let runtime = DataPlaneRuntime::new(DataPlaneRuntimeConfig::default());
     let (mut sessions, mut tcp, _) = worker_state();
-    let connection_index = tcp
-        .insert_connection(established_connection())
-        .expect("insert TCP connection");
+    let connection_index = tcp.insert_connection(established_connection());
     let session_id = sessions
-        .insert_session_for_test(<TcpWorker as SessionTransport<Index>>::ID, connection_index);
+        .insert_session_for_test(<TcpWorker as SessionTransport<u32>>::ID, connection_index);
     tcp.connection_mut(connection_index)
         .expect("TCP connection")
         .attach_session(session_id)
@@ -688,11 +664,9 @@ fn app_half_close_sends_fin_without_closing_session_state() {
 fn app_full_close_sends_fin_and_keeps_session_until_transport_cleanup() {
     let runtime = DataPlaneRuntime::new(DataPlaneRuntimeConfig::default());
     let (mut sessions, mut tcp, _) = worker_state();
-    let connection_index = tcp
-        .insert_connection(established_connection())
-        .expect("insert TCP connection");
+    let connection_index = tcp.insert_connection(established_connection());
     let session_id = sessions
-        .insert_session_for_test(<TcpWorker as SessionTransport<Index>>::ID, connection_index);
+        .insert_session_for_test(<TcpWorker as SessionTransport<u32>>::ID, connection_index);
     tcp.connection_mut(connection_index)
         .expect("TCP connection")
         .attach_session(session_id)
@@ -721,11 +695,9 @@ fn app_full_close_sends_fin_and_keeps_session_until_transport_cleanup() {
 fn tcp_reset_delivers_distinct_reset_event_to_app() {
     let runtime = DataPlaneRuntime::new(DataPlaneRuntimeConfig::default());
     let (mut sessions, mut tcp, _) = worker_state();
-    let connection_index = tcp
-        .insert_connection(established_connection())
-        .expect("insert TCP connection");
+    let connection_index = tcp.insert_connection(established_connection());
     let session_id = sessions
-        .insert_session_for_test(<TcpWorker as SessionTransport<Index>>::ID, connection_index);
+        .insert_session_for_test(<TcpWorker as SessionTransport<u32>>::ID, connection_index);
     tcp.connection_mut(connection_index)
         .expect("TCP connection")
         .attach_session(session_id)
@@ -771,17 +743,15 @@ fn tcp_send_params_deschedules_when_peer_window_is_zero() {
     let (mut sessions, mut tcp, _) = worker_state();
     let mut connection = established_connection();
     connection.set_peer_window_for_test(0);
-    let connection_index = tcp
-        .insert_connection(connection)
-        .expect("insert TCP connection");
+    let connection_index = tcp.insert_connection(connection);
     let session_id = sessions
-        .insert_session_for_test(<TcpWorker as SessionTransport<Index>>::ID, connection_index);
+        .insert_session_for_test(<TcpWorker as SessionTransport<u32>>::ID, connection_index);
     tcp.connection_mut(connection_index)
         .expect("TCP connection")
         .attach_session(session_id)
         .expect("attach stream session");
 
-    let params = <TcpWorker as SessionPacketizedTransport<Index>>::send_params(
+    let params = <TcpWorker as SessionPacketizedTransport<u32>>::send_params(
         &mut tcp,
         &mut sessions,
         connection_index,
@@ -808,7 +778,7 @@ impl SessionApp for TlsProtocol {
 
     fn connected(
         &mut self,
-        _: &mut hammer_service::session::runtime::SessionWorker<Index>,
+        _: &mut hammer_service::session::runtime::SessionWorker<u32>,
         _: SessionId,
         _: u64,
     ) -> hammer_runtime::RuntimeResult<()> {
@@ -821,7 +791,7 @@ impl SessionApp for TlsProtocol {
 
     fn accept(
         &mut self,
-        _: &mut hammer_service::session::runtime::SessionWorker<Index>,
+        _: &mut hammer_service::session::runtime::SessionWorker<u32>,
         _: SessionId,
         _: u64,
     ) -> hammer_runtime::RuntimeResult<()> {
@@ -848,7 +818,7 @@ impl SessionApp for HttpProtocol {
 
     fn connected(
         &mut self,
-        _: &mut hammer_service::session::runtime::SessionWorker<Index>,
+        _: &mut hammer_service::session::runtime::SessionWorker<u32>,
         _: SessionId,
         _: u64,
     ) -> hammer_runtime::RuntimeResult<()> {
@@ -861,7 +831,7 @@ impl SessionApp for HttpProtocol {
 
     fn accept(
         &mut self,
-        _: &mut hammer_service::session::runtime::SessionWorker<Index>,
+        _: &mut hammer_service::session::runtime::SessionWorker<u32>,
         _: SessionId,
         _: u64,
     ) -> hammer_runtime::RuntimeResult<()> {

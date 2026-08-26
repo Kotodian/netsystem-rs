@@ -2,7 +2,7 @@ use std::cell::UnsafeCell;
 use std::sync::{Arc, OnceLock};
 use std::thread::{self, ThreadId};
 
-use hammer_infra::pool::{Index, Pool};
+use hammer_infra::pool::Pool;
 use hammer_runtime::app::ApplicationId;
 use hammer_runtime::{Engine, RuntimeResult};
 use hammer_service::session::{ApplicationMain, ApplicationRegistration};
@@ -95,13 +95,8 @@ impl ConfigId {
     }
 
     #[inline]
-    const fn slot(self) -> u32 {
+    const fn index(self) -> u32 {
         self.0 as u32
-    }
-
-    #[inline]
-    const fn generation(self) -> u32 {
-        (self.0 >> 32) as u32
     }
 }
 
@@ -189,10 +184,7 @@ impl TlsMain {
     ) -> Result<(), ConfigError> {
         self.with_state_mut(|state| {
             config_entry(&state.configs, application, config)?;
-            state
-                .configs
-                .remove(config_index(config))
-                .expect("validated TLS configuration remains present until removal");
+            state.configs.remove(config_index(config));
             Ok(())
         })?
     }
@@ -203,16 +195,10 @@ impl TlsMain {
         config: ConnectionConfig,
     ) -> Result<ConfigId, ConfigError> {
         self.with_state_mut(|state| {
-            state
-                .configs
-                .insert(ConfigEntry {
-                    application,
-                    config,
-                })
-                .map(config_id)
-                .ok_or(ConfigError::CapacityExhausted {
-                    capacity: state.configs.capacity(),
-                })
+            config_id(state.configs.insert(ConfigEntry {
+                application,
+                config,
+            }))
         })?
     }
 
@@ -431,13 +417,13 @@ fn validate_alpn(protocols: &[Vec<u8>]) -> Result<(), ConfigError> {
 }
 
 #[inline]
-fn config_id(index: Index) -> ConfigId {
-    ConfigId((index.slot() as u64) | ((index.generation() as u64) << 32))
+fn config_id(index: u32) -> ConfigId {
+    ConfigId(u64::from(index))
 }
 
 #[inline]
-fn config_index(config: ConfigId) -> Index {
-    Index::new(config.slot(), config.generation())
+fn config_index(config: ConfigId) -> u32 {
+    config.index()
 }
 
 fn config_entry(
@@ -445,9 +431,11 @@ fn config_entry(
     application: ApplicationId,
     config: ConfigId,
 ) -> Result<&ConfigEntry, ConfigError> {
-    let entry = configs
-        .get(config_index(config))
-        .ok_or(ConfigError::Missing { config })?;
+    let index = config_index(config);
+    if !configs.contains_key(index) {
+        return Err(ConfigError::Missing { config });
+    }
+    let entry = configs.get(index);
     if entry.application != application {
         return Err(ConfigError::NotOwned {
             application,
