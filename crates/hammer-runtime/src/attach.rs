@@ -529,7 +529,7 @@ async fn send_attach_reply(
     let words = [
         ATTACH_PROTOCOL_VERSION,
         status,
-        application.map_or(0, ApplicationId::raw),
+        application.map_or(0, |application| u64::from(application.raw())),
     ];
     let mut reply = [0_u8; ATTACH_REPLY_BYTES];
     for (chunk, word) in reply.chunks_exact_mut(size_of::<u64>()).zip(words) {

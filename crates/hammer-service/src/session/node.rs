@@ -1,7 +1,6 @@
 use std::time::Instant;
 
 use hammer_core::data_plane::{BufferFrame, Index, NodeId, NodeRegistration};
-use hammer_infra::pool::Index as PoolIndex;
 use hammer_runtime::{
     DataPlaneRuntime, DriverNode, Node, NodeProcessFn, NodeResult, NodeRuntimeData,
 };
@@ -106,7 +105,7 @@ impl SessionQueueNext {
 
 pub type SessionQueueDispatchFn = fn(
     &DataPlaneRuntime,
-    &mut SessionWorker<PoolIndex>,
+    &mut SessionWorker<u32>,
     NodeRuntimeData,
     SessionQueueNext,
     Instant,
@@ -116,7 +115,7 @@ pub type SessionQueueDispatchFn = fn(
 
 pub type SessionQueueUpdateTimeFn = fn(
     &DataPlaneRuntime,
-    &mut SessionWorker<PoolIndex>,
+    &mut SessionWorker<u32>,
     NodeRuntimeData,
     SessionQueueNext,
     Instant,

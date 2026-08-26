@@ -1,12 +1,12 @@
 use std::net::SocketAddr;
 
 use hammer_runtime::app::{
-    SessionAcceptedMsg, SessionAcceptedReplyMsg, SessionAppId, SessionBoundMsg, SessionConnectMsg,
-    SessionConnectedMsg, SessionControlItem, SessionControlPayload, SessionEvtType, SessionFlags,
-    SessionHandle, SessionListenMsg, SessionUnlistenMsg, SessionUnlistenReplyMsg,
-    TransportProtocol,
+    ApplicationConnectionId, SessionAcceptedMsg, SessionAcceptedReplyMsg, SessionAppId,
+    SessionBoundMsg, SessionConnectMsg, SessionConnectedMsg, SessionControlItem,
+    SessionControlPayload, SessionEvtType, SessionFlags, SessionHandle, SessionListenMsg,
+    SessionUnlistenMsg, SessionUnlistenReplyMsg, TransportProtocol,
 };
-use hammer_runtime::{SessionListenEndpoint, SessionListenerId, app::ApplicationConnectionId};
+use hammer_runtime::SessionListenEndpoint;
 
 use crate::attach::{AppClient, AppClientError, ControlReply, ControlReplyKind};
 
@@ -22,7 +22,7 @@ impl AppClient {
         endpoint: SessionListenEndpoint,
         app: Option<SessionAppId>,
         opaque: Option<u64>,
-    ) -> Result<SessionListenerId, AppClientError> {
+    ) -> Result<SessionHandle, AppClientError> {
         let context = self.next_context();
         let request = SessionListenMsg {
             context,
@@ -41,7 +41,6 @@ impl AppClient {
             if let Some(reply) = self.take_bound(context) {
                 return reply
                     .result
-                    .map(|handle| SessionListenerId::from_raw(handle.raw()))
                     .map_err(|error| AppClientError::SessionRejected { error });
             }
             if !self.receive_control_event()? {
@@ -73,7 +72,7 @@ impl AppClient {
         server_name: Option<&str>,
     ) -> Result<ApplicationConnectionId, AppClientError> {
         let context = self.next_context();
-        let connection = ApplicationConnectionId::from_raw(context);
+        let connection = ApplicationConnectionId::from_raw(context as u32);
         let mut request = SessionConnectMsg::connect(
             context,
             transport,
@@ -148,7 +147,7 @@ impl AppClient {
             .borrow_mut()
             .enqueue_control(&request)
             .map_err(|source| AppClientError::SessionControl { source })?;
-        Ok(ApplicationConnectionId::from_raw(context))
+        Ok(ApplicationConnectionId::from_raw(context as u32))
     }
 
     /// Returns the next buffered Session control reply, or `None` when the
@@ -185,12 +184,9 @@ impl AppClient {
 
     /// Removes a listener (VPP `session_unlisten_msg_t`). Blocks until the
     /// UNLISTEN_REPLY message.
-    pub fn unlisten(&mut self, listener: SessionListenerId) -> Result<(), AppClientError> {
+    pub fn unlisten(&mut self, listener: SessionHandle) -> Result<(), AppClientError> {
         let context = self.next_context();
-        let request = SessionUnlistenMsg {
-            context,
-            listener: SessionHandle::from(listener.raw()),
-        };
+        let request = SessionUnlistenMsg { context, listener };
         self.session_requests
             .borrow_mut()
             .enqueue_control(&request)
@@ -250,7 +246,7 @@ impl AppClient {
                     .map_err(|source| AppClientError::SessionReplyWait { source })?;
             }
         }
-        let reply = SessionAcceptedReplyMsg::new(self.application().raw(), handle, Ok(()));
+        let reply = SessionAcceptedReplyMsg::new(u64::from(self.application().raw()), handle, Ok(()));
         self.accepted_reply(&reply)?;
         Ok(session)
     }
@@ -332,7 +328,7 @@ impl AppClient {
         &self,
         connection: ApplicationConnectionId,
     ) -> Option<SessionConnectedMsg> {
-        match self.take_reply(ControlReplyKind::Connected, connection.raw()) {
+        match self.take_reply(ControlReplyKind::Connected, u64::from(connection.raw())) {
             Some(ControlReply::Connected(reply)) => Some(reply),
             _ => None,
         }

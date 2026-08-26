@@ -1341,7 +1341,7 @@ mod tests {
             Ok(string_pointer)
         );
 
-        assert_eq!(string_entry.kind(), DirectoryType::NameVector.into());
+        assert_eq!(string_entry.kind(), u32::from(DirectoryType::NameVector));
         assert_eq!(
             string_entry
                 .name()

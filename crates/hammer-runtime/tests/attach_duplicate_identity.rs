@@ -20,8 +20,8 @@ use hammer_runtime::attach::{
     ATTACH_STATUS_REJECTED, AppServer, ApplicationMqPublication,
 };
 
-const FIRST_APPLICATION: ApplicationId = ApplicationId::new(3, 0);
-const SECOND_APPLICATION: ApplicationId = ApplicationId::new(4, 0);
+const FIRST_APPLICATION: ApplicationId = ApplicationId::new(3);
+const SECOND_APPLICATION: ApplicationId = ApplicationId::new(4);
 
 const MQ_SEGMENT_BYTES: usize = 1024 * 1024;
 const MQ_QUEUE_ITEMS: u32 = 32;

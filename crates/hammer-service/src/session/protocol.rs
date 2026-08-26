@@ -1,6 +1,5 @@
 //! VPP-shaped Session App callback surface.
 
-use hammer_infra::pool::Index;
 use hammer_runtime::RuntimeResult;
 use hammer_runtime::app::{ApplicationId, SessionAppContext, SessionAppId, SessionHandle};
 
@@ -8,15 +7,15 @@ use super::SessionId;
 use super::runtime::SessionWorker;
 
 /// One Session App callback that operates on an exact Session.
-pub type SessionAppCallback<Index = hammer_infra::pool::Index> =
+pub type SessionAppCallback<Index = u32> =
     fn(&mut SessionWorker<Index>, SessionId, SessionAppContext) -> RuntimeResult<()>;
 
 /// One Session App callback that carries a segment handle instead of a Session.
-pub type SessionAppSegmentCallback<Index = hammer_infra::pool::Index> =
+pub type SessionAppSegmentCallback<Index = u32> =
     fn(&mut SessionWorker<Index>, u64, SessionAppContext) -> RuntimeResult<()>;
 
 /// VPP `session_cb_vft_t.migrate` callback with the old and new handles.
-pub type SessionAppMigrateCallback<Index = hammer_infra::pool::Index> =
+pub type SessionAppMigrateCallback<Index = u32> =
     fn(&mut SessionWorker<Index>, SessionId, SessionHandle, SessionAppContext) -> RuntimeResult<()>;
 
 /// Concrete static callback table matching VPP `session_cb_vft_t`.
@@ -24,7 +23,7 @@ pub type SessionAppMigrateCallback<Index = hammer_infra::pool::Index> =
 /// All 19 VPP callbacks are present. Unimplemented callbacks remain `None`;
 /// the plugin-facing [`SessionApp`] trait supplies no-op defaults for them.
 #[derive(Debug, Clone, Copy)]
-pub struct SessionAppCallbacks<Index = hammer_infra::pool::Index> {
+pub struct SessionAppCallbacks<Index = u32> {
     pub add_segment: Option<SessionAppSegmentCallback<Index>>,
     pub del_segment: Option<SessionAppSegmentCallback<Index>>,
     pub accept: Option<SessionAppCallback<Index>>,
@@ -91,17 +90,17 @@ pub trait SessionApp: Sized + Send + 'static {
         Err(super::SessionQueueError::SessionAppContextCreateUnsupported.into())
     }
 
-    fn add_segment(&mut self, _: &mut SessionWorker<Index>, _: u64) -> RuntimeResult<()> {
+    fn add_segment(&mut self, _: &mut SessionWorker<u32>, _: u64) -> RuntimeResult<()> {
         Ok(())
     }
 
-    fn del_segment(&mut self, _: &mut SessionWorker<Index>, _: u64) -> RuntimeResult<()> {
+    fn del_segment(&mut self, _: &mut SessionWorker<u32>, _: u64) -> RuntimeResult<()> {
         Ok(())
     }
 
     fn accept(
         &mut self,
-        _: &mut SessionWorker<Index>,
+        _: &mut SessionWorker<u32>,
         _: SessionId,
         _: SessionAppContext,
     ) -> RuntimeResult<()> {
@@ -110,7 +109,7 @@ pub trait SessionApp: Sized + Send + 'static {
 
     fn connected(
         &mut self,
-        _: &mut SessionWorker<Index>,
+        _: &mut SessionWorker<u32>,
         _: SessionId,
         _: SessionAppContext,
     ) -> RuntimeResult<()> {
@@ -119,7 +118,7 @@ pub trait SessionApp: Sized + Send + 'static {
 
     fn disconnect(
         &mut self,
-        _: &mut SessionWorker<Index>,
+        _: &mut SessionWorker<u32>,
         _: SessionId,
         _: SessionAppContext,
     ) -> RuntimeResult<()> {
@@ -128,7 +127,7 @@ pub trait SessionApp: Sized + Send + 'static {
 
     fn reset(
         &mut self,
-        _: &mut SessionWorker<Index>,
+        _: &mut SessionWorker<u32>,
         _: SessionId,
         _: SessionAppContext,
     ) -> RuntimeResult<()> {
@@ -137,7 +136,7 @@ pub trait SessionApp: Sized + Send + 'static {
 
     fn transport_closed(
         &mut self,
-        _: &mut SessionWorker<Index>,
+        _: &mut SessionWorker<u32>,
         _: SessionId,
         _: SessionAppContext,
     ) -> RuntimeResult<()> {
@@ -146,7 +145,7 @@ pub trait SessionApp: Sized + Send + 'static {
 
     fn cleanup(
         &mut self,
-        _: &mut SessionWorker<Index>,
+        _: &mut SessionWorker<u32>,
         _: SessionId,
         _: SessionAppContext,
     ) -> RuntimeResult<()> {
@@ -155,7 +154,7 @@ pub trait SessionApp: Sized + Send + 'static {
 
     fn half_open_cleanup(
         &mut self,
-        _: &mut SessionWorker<Index>,
+        _: &mut SessionWorker<u32>,
         _: SessionId,
         _: SessionAppContext,
     ) -> RuntimeResult<()> {
@@ -164,7 +163,7 @@ pub trait SessionApp: Sized + Send + 'static {
 
     fn migrate(
         &mut self,
-        _: &mut SessionWorker<Index>,
+        _: &mut SessionWorker<u32>,
         _: SessionId,
         _: SessionHandle,
         _: SessionAppContext,
@@ -174,7 +173,7 @@ pub trait SessionApp: Sized + Send + 'static {
 
     fn listened(
         &mut self,
-        _: &mut SessionWorker<Index>,
+        _: &mut SessionWorker<u32>,
         _: SessionId,
         _: SessionAppContext,
     ) -> RuntimeResult<()> {
@@ -183,7 +182,7 @@ pub trait SessionApp: Sized + Send + 'static {
 
     fn unlistened(
         &mut self,
-        _: &mut SessionWorker<Index>,
+        _: &mut SessionWorker<u32>,
         _: SessionId,
         _: SessionAppContext,
     ) -> RuntimeResult<()> {
@@ -192,7 +191,7 @@ pub trait SessionApp: Sized + Send + 'static {
 
     fn builtin_rx(
         &mut self,
-        _: &mut SessionWorker<Index>,
+        _: &mut SessionWorker<u32>,
         _: SessionId,
         _: SessionAppContext,
     ) -> RuntimeResult<()> {
@@ -201,7 +200,7 @@ pub trait SessionApp: Sized + Send + 'static {
 
     fn builtin_tx(
         &mut self,
-        _: &mut SessionWorker<Index>,
+        _: &mut SessionWorker<u32>,
         _: SessionId,
         _: SessionAppContext,
     ) -> RuntimeResult<()> {
@@ -210,7 +209,7 @@ pub trait SessionApp: Sized + Send + 'static {
 
     fn fifo_tuning(
         &mut self,
-        _: &mut SessionWorker<Index>,
+        _: &mut SessionWorker<u32>,
         _: SessionId,
         _: SessionAppContext,
     ) -> RuntimeResult<()> {
@@ -219,7 +218,7 @@ pub trait SessionApp: Sized + Send + 'static {
 
     fn proxy_alloc_fifos(
         &mut self,
-        _: &mut SessionWorker<Index>,
+        _: &mut SessionWorker<u32>,
         _: SessionId,
         _: SessionAppContext,
     ) -> RuntimeResult<()> {
@@ -228,7 +227,7 @@ pub trait SessionApp: Sized + Send + 'static {
 
     fn proxy_write_early_data(
         &mut self,
-        _: &mut SessionWorker<Index>,
+        _: &mut SessionWorker<u32>,
         _: SessionId,
         _: SessionAppContext,
     ) -> RuntimeResult<()> {
@@ -237,7 +236,7 @@ pub trait SessionApp: Sized + Send + 'static {
 
     fn app_evt(
         &mut self,
-        _: &mut SessionWorker<Index>,
+        _: &mut SessionWorker<u32>,
         _: SessionId,
         _: SessionAppContext,
     ) -> RuntimeResult<()> {
@@ -246,7 +245,7 @@ pub trait SessionApp: Sized + Send + 'static {
 
     fn crypto_async(
         &mut self,
-        _: &mut SessionWorker<Index>,
+        _: &mut SessionWorker<u32>,
         _: SessionId,
         _: SessionAppContext,
     ) -> RuntimeResult<()> {

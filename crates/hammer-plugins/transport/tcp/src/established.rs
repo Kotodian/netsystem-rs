@@ -123,8 +123,7 @@ fn tcp_established_index(
         .ok_or(RuntimeError::PluginStateNotInitialized { plugin: "tcp" })?;
     let tx_segment = main.with_worker(runtime, |sessions, tcp| {
         let session_id = read_session_id(runtime, index)?.ok_or_else(|| {
-            let _ = runtime
-                .record_current_node_error(TcpNodeError::EstablishedSessionRouteMissing);
+            let _ = runtime.record_current_node_error(TcpNodeError::EstablishedSessionRouteMissing);
             TcpNodeError::EstablishedSessionRouteMissing
         })?;
         // Warm the session pool slot cacheline before the `session_mut`
@@ -148,8 +147,7 @@ fn tcp_established_index(
                 ..
             } = tcp;
             let connection = connections.get_mut(connection_index).ok_or_else(|| {
-                let _ = runtime
-                    .record_current_node_error(TcpNodeError::EstablishedSessionMissing);
+                let _ = runtime.record_current_node_error(TcpNodeError::EstablishedSessionMissing);
                 TcpNodeError::EstablishedSessionMissing
             })?;
             let previous_snd_una = connection.snd_una();
@@ -213,11 +211,11 @@ fn tcp_established_index(
                     ..
                 } = tcp;
                 let connection = connections.get_mut(connection_index).ok_or_else(|| {
-                    let _ = runtime
-                        .record_current_node_error(TcpNodeError::EstablishedSessionMissing);
+                    let _ =
+                        runtime.record_current_node_error(TcpNodeError::EstablishedSessionMissing);
                     TcpNodeError::EstablishedSessionMissing
                 })?;
-                connection.receive_payload(accepted_sequence, trim as u32, delivery);
+                connection.receive_payload(accepted_sequence, trim as u32, delivery)?;
                 if clean_in_order {
                     connection.on_clean_in_order_payload(connection_index, timers)?
                 } else {
@@ -243,15 +241,13 @@ fn tcp_established_index(
                 }
             }
             let connection = tcp.connection_mut(connection_index).ok_or_else(|| {
-                let _ = runtime
-                    .record_current_node_error(TcpNodeError::EstablishedSessionMissing);
+                let _ = runtime.record_current_node_error(TcpNodeError::EstablishedSessionMissing);
                 TcpNodeError::EstablishedSessionMissing
             })?;
             connection.set_rcv_wnd(rx_available);
         } else if duplicate_payload {
             let connection = tcp.connection_mut(connection_index).ok_or_else(|| {
-                let _ = runtime
-                    .record_current_node_error(TcpNodeError::EstablishedSessionMissing);
+                let _ = runtime.record_current_node_error(TcpNodeError::EstablishedSessionMissing);
                 TcpNodeError::EstablishedSessionMissing
             })?;
             let sequence = packet.sequence;
@@ -262,8 +258,7 @@ fn tcp_established_index(
 
         let fin_control = {
             let connection = tcp.connection_mut(connection_index).ok_or_else(|| {
-                let _ = runtime
-                    .record_current_node_error(TcpNodeError::EstablishedSessionMissing);
+                let _ = runtime.record_current_node_error(TcpNodeError::EstablishedSessionMissing);
                 TcpNodeError::EstablishedSessionMissing
             })?;
             connection.process_fin_after_payload(&packet)?
@@ -274,8 +269,7 @@ fn tcp_established_index(
 
         let tx_segment = if immediate_ack {
             let connection = tcp.connection_mut(connection_index).ok_or_else(|| {
-                let _ = runtime
-                    .record_current_node_error(TcpNodeError::EstablishedSessionMissing);
+                let _ = runtime.record_current_node_error(TcpNodeError::EstablishedSessionMissing);
                 TcpNodeError::EstablishedSessionMissing
             })?;
             Some(connection.control_segment(

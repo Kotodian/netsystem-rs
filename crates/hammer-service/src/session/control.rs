@@ -5,9 +5,10 @@ use hammer_runtime::app::{
     SessionUnlistenReplyMsg, SingleProducer,
 };
 use hammer_runtime::plugin::PluginError;
+use hammer_runtime::app::{SessionHandle, SessionListenMsg, SessionUnlistenMsg};
 use hammer_runtime::{
-    DataWorkerId, Engine, RuntimeError, RuntimeResult, SessionConnectEndpoint, SessionConnectionId,
-    SessionListenerId,
+    DataWorkerId, Engine, RuntimeError, RuntimeResult, SessionConnectEndpoint,
+    SessionConnectionId,
 };
 use std::sync::Arc;
 
@@ -263,7 +264,7 @@ impl SessionMain {
         application: ApplicationId,
         request: SessionUnlistenMsg,
     ) -> SessionUnlistenReplyMsg {
-        let listener = SessionListenerId::from_raw(request.listener.raw());
+        let listener = request.listener;
         let result = self
             .with_control_barrier(|| {
                 match self.applications().contains(application) {
@@ -357,11 +358,9 @@ fn session_transport(
 impl From<ApplicationError> for SessionControlError {
     fn from(error: ApplicationError) -> Self {
         match error {
-            ApplicationError::CapacityExhausted { .. }
-            | ApplicationError::ListenerCapacityExhausted { .. }
-            | ApplicationError::ConnectionCapacityExhausted { .. }
-            | ApplicationError::MqCapacityInvalid { .. }
-            | ApplicationError::MqWorkerCountZero => Self::CapacityExhausted,
+            ApplicationError::MqCapacityInvalid { .. } | ApplicationError::MqWorkerCountZero => {
+                Self::TransportFailed
+            }
             ApplicationError::Missing { .. } => Self::ApplicationMissing,
             ApplicationError::WrongThread => Self::ApplicationControlWrongThread,
             ApplicationError::SessionAppMissing { .. }
@@ -382,7 +381,7 @@ impl From<ApplicationError> for SessionControlError {
             | ApplicationError::MqDetachFailed { .. }
             | ApplicationError::MqPublication { .. } => Self::TransportFailed,
             ApplicationError::SessionMainMissing => Self::SessionMainUnavailable,
-            ApplicationError::MqAlreadyAttached { .. } => Self::CapacityExhausted,
+            ApplicationError::MqAlreadyAttached { .. } => Self::TransportFailed,
         }
     }
 }
@@ -526,15 +525,15 @@ mod tests {
         use hammer_runtime::app::ApplicationConnectionId;
 
         let missing = ApplicationError::ConnectionMissing {
-            connection: ApplicationConnectionId::new(1, 1),
+            connection: ApplicationConnectionId::new(1),
         };
         assert_eq!(
             SessionControlError::from(missing),
             SessionControlError::ConnectionMissing
         );
         let not_owned = ApplicationError::ConnectionNotOwned {
-            application: ApplicationId::new(1, 1),
-            connection: ApplicationConnectionId::new(2, 1),
+            application: ApplicationId::new(1),
+            connection: ApplicationConnectionId::new(2),
         };
         assert_eq!(
             SessionControlError::from(not_owned),

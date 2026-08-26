@@ -1,20 +1,20 @@
 use std::net::SocketAddr;
 
 use hammer_infra::bihash::{Bihash, BihashKey};
-use hammer_infra::pool::{Index, Pool};
+use hammer_infra::pool::Pool;
 
 use crate::connection::UdpConnection;
 
 const UDP_TUPLE_CAPACITY: u32 = 1024;
 
 #[inline(always)]
-fn pool_index_value(index: Index) -> u64 {
-    (u64::from(index.generation()) << 32) | u64::from(index.slot())
+fn pool_index_value(index: u32) -> u64 {
+    u64::from(index)
 }
 
 #[inline(always)]
-fn pool_index_from_value(value: u64) -> Index {
-    Index::new(value as u32, (value >> 32) as u32)
+fn pool_index_from_value(value: u64) -> u32 {
+    value as u32
 }
 
 #[inline(always)]
@@ -81,7 +81,7 @@ impl UdpLookup {
     }
 
     #[inline]
-    pub(crate) fn insert_tuple(&self, index: Index, local: SocketAddr, remote: SocketAddr) -> bool {
+    pub(crate) fn insert_tuple(&self, index: u32, local: SocketAddr, remote: SocketAddr) -> bool {
         let Some(key) = UdpTupleKey::new(local, remote) else {
             return false;
         };
@@ -102,7 +102,7 @@ impl UdpLookup {
         connections: &Pool<UdpConnection>,
         local: SocketAddr,
         remote: SocketAddr,
-    ) -> Option<Index> {
+    ) -> Option<u32> {
         let key = UdpTupleKey::new(local, remote)?;
         let index = pool_index_from_value(self.tuples.lookup(&key)?);
         connections.contains_key(index).then_some(index)

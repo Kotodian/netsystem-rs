@@ -37,12 +37,11 @@ use hammer_core::data_plane::{BufferPacketCursor, NodeId, NodeState, SecondaryOp
 use hammer_runtime::{
     DataPlaneRuntime, DataWorkerId, Engine, Node, NodeProcessFn, NodeRuntimeData, RuntimeError,
     RuntimeResult, SessionConnectEndpoint, SessionConnectionId, SessionListenEndpoint,
-    SessionListenerId, with_data_plane_runtime,
+    SessionHandle, with_data_plane_runtime,
 };
 use thiserror::Error;
 
 use hammer_infra::align::CacheLine;
-use hammer_infra::pool::Index as PoolIndex;
 use hammer_infra::thread_owned::{ThreadOwned, ThreadOwnedError};
 use hammer_service::session::node::{SessionQueueNode, SessionQueueOutput};
 use hammer_service::session::runtime::{
@@ -112,7 +111,7 @@ enum TcpWorkerError {
 }
 
 pub(crate) fn publish_tcp_connection(
-    sessions: &mut SessionWorker<PoolIndex>,
+    sessions: &mut SessionWorker<u32>,
     tcp: &mut TcpWorker,
     session_id: SessionId,
 ) -> RuntimeResult<()> {
@@ -134,17 +133,16 @@ pub(crate) fn publish_tcp_connection(
     if half_open {
         return Ok(());
     }
-    let rollback = |sessions: &mut SessionWorker<PoolIndex>, tcp: &mut TcpWorker| {
+    let rollback = |sessions: &mut SessionWorker<u32>, tcp: &mut TcpWorker| {
         tcp.lookup.forget_session(session_id);
         tcp.lookup.forget_pending_open(session_id);
         let session_cleanup = sessions.rollback_session_creation(session_id);
-        let connection_cleanup = tcp.remove_connection(index);
+        tcp.remove_connection(index);
         match session_cleanup {
             Err(error) => Err(error),
             Ok(Some(rollback_index)) if rollback_index != index => {
                 Err(TcpNodeError::SessionMissing.into())
             }
-            Ok(_) if connection_cleanup.is_none() => Err(TcpNodeError::SessionMissing.into()),
             Ok(_) => Ok(()),
         }
     };
@@ -179,7 +177,7 @@ pub(crate) fn publish_tcp_connection(
         } else {
             sessions.notify_transport_closed(session_id, index)?;
         }
-        let _ = tcp.remove_connection(index);
+        tcp.remove_connection(index);
         sessions.notify_transport_deleted(session_id, index)?;
     } else if let Err(error) = sessions.complete_stream_connect(session_id) {
         if let Err(cleanup_error) = rollback(sessions, tcp) {
@@ -240,7 +238,7 @@ impl TcpMain {
     fn with_worker<R>(
         &self,
         runtime: &DataPlaneRuntime,
-        operation: impl FnOnce(&mut SessionWorker<PoolIndex>, &mut TcpWorker) -> RuntimeResult<R>,
+        operation: impl FnOnce(&mut SessionWorker<u32>, &mut TcpWorker) -> RuntimeResult<R>,
     ) -> RuntimeResult<R> {
         self.sessions.with_worker_mut(runtime, |sessions| {
             self.with_tcp_worker(runtime, |tcp| operation(sessions, tcp))
@@ -274,7 +272,7 @@ impl TcpMain {
         bind: SocketAddr,
         owner_worker: DataWorkerId,
         capabilities: TcpCapabilities,
-        session_listener: SessionListenerId,
+        session_listener: SessionHandle,
     ) -> RuntimeResult<lookup::TcpLookupId> {
         self.listeners
             .bind(bind, owner_worker, capabilities, session_listener)
@@ -287,7 +285,7 @@ impl TcpMain {
 pub static TCP_MAIN: ArcSwapOption<TcpMain> = ArcSwapOption::const_empty();
 
 pub(crate) fn start_listen(
-    listener: SessionListenerId,
+    listener: SessionHandle,
     _: hammer_runtime::app::ApplicationId,
     _: Option<u64>,
     endpoint: SessionListenEndpoint,
@@ -305,7 +303,7 @@ pub(crate) fn start_listen(
     .map(drop)
 }
 
-pub(crate) fn stop_listen(listener: SessionListenerId) -> RuntimeResult<()> {
+pub(crate) fn stop_listen(listener: SessionHandle) -> RuntimeResult<()> {
     hammer_runtime::ensure_main_thread_with_barrier()?;
     let main = TCP_MAIN
         .load_full()
@@ -345,7 +343,7 @@ pub(crate) fn connect(endpoint: SessionConnectEndpoint) -> RuntimeResult<()> {
 }
 
 fn start_connect(
-    sessions: &mut SessionWorker<PoolIndex>,
+    sessions: &mut SessionWorker<u32>,
     tcp: &mut TcpWorker,
     connection: SessionConnectionId,
     local: SocketAddr,
@@ -355,21 +353,19 @@ fn start_connect(
     let mut transport =
         TcpConnection::new(None, sessions.worker(), local.port(), Some(local), remote);
     transport.connect_state(initial_sequence);
-    let connection_index = tcp.insert_connection(transport)?;
+    let connection_index = tcp.insert_connection(transport);
     let session_id =
         match sessions.stream_connect_pending(TcpWorker::ID, connection_index, connection) {
             Ok(session_id) => session_id,
             Err(error) => {
-                tcp.remove_connection(connection_index).expect(
-                    "new TCP connection remains installed until Session construction completes",
-                );
+                let _ = tcp.remove_connection(connection_index);
                 return Err(error);
             }
         };
-    tcp.connection_mut(connection_index)
-        .expect("new TCP connection remains installed until it binds its Session")
-        .attach_session(session_id)
-        .expect("active-open TCP connection has no Session before binding");
+    let connection = tcp
+        .connection_mut(connection_index)
+        .ok_or(TcpNodeError::SessionMissing)?;
+    connection.attach_session(session_id)?;
     publish_tcp_connection(sessions, tcp, session_id)?;
     sessions.mark_ready(session_id);
     Ok(())
@@ -560,7 +556,7 @@ fn init_tcp_worker(engine: &mut Engine) -> RuntimeResult<()> {
 
 fn tcp_session_queue_update_time(
     runtime: &DataPlaneRuntime,
-    sessions: &mut SessionWorker<PoolIndex>,
+    sessions: &mut SessionWorker<u32>,
     _: NodeRuntimeData,
     output_next: SessionQueueNext,
     now: std::time::Instant,
@@ -578,7 +574,7 @@ fn tcp_session_queue_update_time(
 
 fn tcp_session_queue_dispatch(
     runtime: &DataPlaneRuntime,
-    sessions: &mut SessionWorker<PoolIndex>,
+    sessions: &mut SessionWorker<u32>,
     _: NodeRuntimeData,
     output_next: SessionQueueNext,
     now: std::time::Instant,
@@ -964,7 +960,7 @@ fn enqueue_tcp_segment(
 #[cfg(test)]
 #[doc(hidden)]
 pub(crate) fn closing_session_for_test() -> (
-    SessionWorker<PoolIndex>,
+    SessionWorker<u32>,
     TcpWorker,
     SessionId,
     std::net::SocketAddr,
@@ -991,9 +987,7 @@ pub(crate) fn closing_session_for_test() -> (
         Some(local),
         remote,
     );
-    let connection_index = tcp
-        .insert_connection(connection)
-        .expect("insert TCP connection");
+    let connection_index = tcp.insert_connection(connection);
     let application = applications.attach().expect("attach test Application");
     sessions
         .install_application_mq_for_test(application)

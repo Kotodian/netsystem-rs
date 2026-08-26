@@ -2,7 +2,6 @@ use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Instant;
 
 use hammer_core::data_plane::{BufferFrame, DataPlaneBuffers, NodeRegistration};
-use hammer_infra::pool::Index;
 use hammer_runtime::{
     DataPlaneRuntime, DataPlaneRuntimeConfig, DataWorkerId, InternalNode, Node, NodeProcessFn,
     NodeResult, NodeRuntimeData,
@@ -55,17 +54,17 @@ fn test_session_queue_next(
 struct RecordingTransport {
     events: Vec<&'static str>,
     sampled_times: Vec<Instant>,
-    tx_indexes: Vec<Index>,
+    tx_indexes: Vec<u32>,
 }
 
-impl SessionTransport<Index> for RecordingTransport {
+impl SessionTransport<u32> for RecordingTransport {
     type Tx = TransportInternalTx;
 
     const ID: SessionTransportId = SessionTransportId::new(1);
 
     fn app_rx_evt(
         &mut self,
-        _: Index,
+        _: u32,
         _: usize,
         _: usize,
         _: &DataPlaneRuntime,
@@ -79,7 +78,7 @@ impl SessionTransport<Index> for RecordingTransport {
 
     fn update_time(
         &mut self,
-        _: &mut SessionWorker<Index>,
+        _: &mut SessionWorker<u32>,
         _: &DataPlaneRuntime,
         _: SessionQueueNext,
         _: &mut BufferFrame,
@@ -93,8 +92,8 @@ impl SessionTransport<Index> for RecordingTransport {
 
     fn disconnect(
         &mut self,
-        _: &mut SessionWorker<Index>,
-        _: Index,
+        _: &mut SessionWorker<u32>,
+        _: u32,
         _: &DataPlaneRuntime,
         _: SessionQueueNext,
         _: &mut BufferFrame,
@@ -107,8 +106,8 @@ impl SessionTransport<Index> for RecordingTransport {
 
     fn reset(
         &mut self,
-        _: &mut SessionWorker<Index>,
-        _: Index,
+        _: &mut SessionWorker<u32>,
+        _: u32,
         _: &DataPlaneRuntime,
         _: SessionQueueNext,
         _: &mut BufferFrame,
@@ -120,7 +119,7 @@ impl SessionTransport<Index> for RecordingTransport {
     }
 }
 
-fn session_worker_for_test() -> SessionWorker<Index> {
+fn session_worker_for_test() -> SessionWorker<u32> {
     SessionWorker::new(
         DataWorkerId::new(0),
         1,
@@ -132,12 +131,12 @@ fn session_worker_for_test() -> SessionWorker<Index> {
     .expect("session worker for test")
 }
 
-impl TransportInternalTransport<Index> for RecordingTransport {
+impl TransportInternalTransport<u32> for RecordingTransport {
     fn internal_tx(
         &mut self,
-        _: &mut SessionWorker<Index>,
+        _: &mut SessionWorker<u32>,
         _: crate::session::SessionId,
-        index: Index,
+        index: u32,
         _: &DataPlaneRuntime,
         _: SessionQueueNext,
         _: &mut BufferFrame,
@@ -152,17 +151,17 @@ impl TransportInternalTransport<Index> for RecordingTransport {
 
 #[derive(Default)]
 struct TcpTransport {
-    tx_actions: Vec<Index>,
+    tx_actions: Vec<u32>,
 }
 
-impl SessionTransport<Index> for TcpTransport {
+impl SessionTransport<u32> for TcpTransport {
     type Tx = SessionPacketizedTx;
 
     const ID: SessionTransportId = SessionTransportId::new(10);
 
     fn update_time(
         &mut self,
-        _: &mut SessionWorker<Index>,
+        _: &mut SessionWorker<u32>,
         _: &DataPlaneRuntime,
         _: SessionQueueNext,
         _: &mut BufferFrame,
@@ -174,8 +173,8 @@ impl SessionTransport<Index> for TcpTransport {
 
     fn disconnect(
         &mut self,
-        _: &mut SessionWorker<Index>,
-        _: Index,
+        _: &mut SessionWorker<u32>,
+        _: u32,
         _: &DataPlaneRuntime,
         _: SessionQueueNext,
         _: &mut BufferFrame,
@@ -186,11 +185,11 @@ impl SessionTransport<Index> for TcpTransport {
     }
 }
 
-impl SessionPacketizedTransport<Index> for TcpTransport {
+impl SessionPacketizedTransport<u32> for TcpTransport {
     fn control_tx(
         &mut self,
-        _: &mut SessionWorker<Index>,
-        _: Index,
+        _: &mut SessionWorker<u32>,
+        _: u32,
         _: &DataPlaneRuntime,
         _: SessionQueueNext,
         _: &mut BufferFrame,
@@ -202,8 +201,8 @@ impl SessionPacketizedTransport<Index> for TcpTransport {
 
     fn send_params(
         &mut self,
-        _: &mut SessionWorker<Index>,
-        _: Index,
+        _: &mut SessionWorker<u32>,
+        _: u32,
         _: usize,
         _: Instant,
     ) -> RuntimeResult<TransportSendParams> {
@@ -217,7 +216,7 @@ impl SessionPacketizedTransport<Index> for TcpTransport {
 
     fn tx_action(
         &mut self,
-        index: Index,
+        index: u32,
         _: &[TxBatchBuffer],
         _: &DataPlaneBuffers,
         _: Instant,
@@ -232,7 +231,7 @@ fn app_reset_dispatch_invokes_transport_reset_distinct_from_close() -> RuntimeRe
     let runtime = DataPlaneRuntime::new(DataPlaneRuntimeConfig::default());
     let mut sessions = session_worker_for_test();
     let mut transport = RecordingTransport::default();
-    let session_id = sessions.insert_session_for_test(RecordingTransport::ID, Index::new(4, 1));
+    let session_id = sessions.insert_session_for_test(RecordingTransport::ID, 4u32);
     let app = attach_local_app_session(&mut sessions, session_id);
     app.app_rx_mq()
         .enqueue_ctrl(SessionEvt::ctrl(
@@ -259,7 +258,7 @@ fn session_queue_updates_transport_before_control_and_io_and_without_events() {
     let worker = DataWorkerId::new(0);
     let mut sessions = session_worker_for_test();
     let mut transport = RecordingTransport::default();
-    let session_id = sessions.insert_session_for_test(RecordingTransport::ID, Index::new(9, 3));
+    let session_id = sessions.insert_session_for_test(RecordingTransport::ID, 9u32);
     let app = attach_local_app_session(&mut sessions, session_id);
     let session_rx_fifo = Arc::clone(sessions.session_fifos(session_id).expect("Session FIFOs").0);
     assert_eq!(session_rx_fifo.enqueue(b"x"), 1);
@@ -295,8 +294,8 @@ fn session_queue_dispatches_new_io_before_old_io() {
     let runtime = DataPlaneRuntime::new(DataPlaneRuntimeConfig::default());
     let mut sessions = session_worker_for_test();
     let mut transport = TcpTransport::default();
-    let old_index = Index::new(1, 1);
-    let new_index = Index::new(2, 1);
+    let old_index = 1u32;
+    let new_index = 2u32;
     let old_session = sessions.insert_session_for_test(TcpTransport::ID, old_index);
     let new_session = sessions.insert_session_for_test(TcpTransport::ID, new_index);
     let old_app = attach_local_app_session(&mut sessions, old_session);
@@ -309,7 +308,7 @@ fn session_queue_dispatches_new_io_before_old_io() {
     sessions.new_io_events.clear();
     sessions.old_io_events.clear();
     sessions.old_io_events.push_back(SessionEvt::io(
-        old_session.pool_index().slot(),
+        old_session.pool_index(),
         SessionEvtType::TxEnq,
     ));
     dispatch_session_queue_once(&runtime, owner, &mut sessions, &mut transport, next)
@@ -318,7 +317,7 @@ fn session_queue_dispatches_new_io_before_old_io() {
     sessions.poll_app().expect("stage new TX event");
     sessions.new_io_events.clear();
     sessions.new_io_events.push_back(SessionEvt::io(
-        new_session.pool_index().slot(),
+        new_session.pool_index(),
         SessionEvtType::TxEnq,
     ));
     dispatch_session_queue_once(&runtime, owner, &mut sessions, &mut transport, next)
@@ -329,7 +328,7 @@ fn session_queue_dispatches_new_io_before_old_io() {
 
 #[test]
 fn default_connection_index_returns_exact_transport_index() {
-    let index = Index::new(2, 9);
+    let index = 2u32;
     let transport = TcpTransport::default();
 
     assert_eq!(
@@ -341,7 +340,7 @@ fn default_connection_index_returns_exact_transport_index() {
 }
 
 fn attach_local_app_session(
-    sessions: &mut SessionWorker<Index>,
+    sessions: &mut SessionWorker<u32>,
     session_id: crate::session::SessionId,
 ) -> Arc<AppSession> {
     let app = sessions
@@ -358,7 +357,7 @@ fn attach_local_app_session(
 #[test]
 fn session_queue_connects_transport_session_directly_to_application() {
     let runtime = DataPlaneRuntime::new(DataPlaneRuntimeConfig::default());
-    let mut sessions = SessionWorker::<Index>::new(
+    let mut sessions = SessionWorker::<u32>::new(
         DataWorkerId::new(0),
         1,
         hammer_runtime::app::AppSessionConfig::new(8, 16),
@@ -368,7 +367,7 @@ fn session_queue_connects_transport_session_directly_to_application() {
     )
     .expect("session worker");
     let mut transport = RecordingTransport::default();
-    let session_id = sessions.insert_session_for_test(RecordingTransport::ID, Index::new(10, 1));
+    let session_id = sessions.insert_session_for_test(RecordingTransport::ID, 10u32);
     let application = attach_local_app_session(&mut sessions, session_id);
     let (session_rx_fifo, session_tx_fifo) = {
         let (rx_fifo, tx_fifo) = sessions.session_fifos(session_id).expect("Session FIFOs");
@@ -408,7 +407,7 @@ fn session_queue_connects_transport_session_directly_to_application() {
 
 #[test]
 fn direct_session_notifies_application_after_tx_space_opens() {
-    let mut sessions = SessionWorker::<Index>::new(
+    let mut sessions = SessionWorker::<u32>::new(
         DataWorkerId::new(0),
         1,
         hammer_runtime::app::AppSessionConfig::new(8, 16),
@@ -417,7 +416,7 @@ fn direct_session_notifies_application_after_tx_space_opens() {
         None,
     )
     .expect("session worker");
-    let session_id = sessions.insert_session_for_test(RecordingTransport::ID, Index::new(11, 1));
+    let session_id = sessions.insert_session_for_test(RecordingTransport::ID, 11u32);
     let application = attach_local_app_session(&mut sessions, session_id);
     let session_tx_fifo = Arc::clone(sessions.session_fifos(session_id).expect("Session FIFOs").1);
 
@@ -525,14 +524,14 @@ struct QuicShapedTransport {
     observed_fifo_lengths: Arc<Mutex<Vec<usize>>>,
 }
 
-impl SessionTransport<Index> for QuicShapedTransport {
+impl SessionTransport<u32> for QuicShapedTransport {
     type Tx = TransportInternalTx;
 
     const ID: SessionTransportId = SessionTransportId::new(7);
 
     fn update_time(
         &mut self,
-        _: &mut SessionWorker<Index>,
+        _: &mut SessionWorker<u32>,
         _: &DataPlaneRuntime,
         _: SessionQueueNext,
         _: &mut BufferFrame,
@@ -544,8 +543,8 @@ impl SessionTransport<Index> for QuicShapedTransport {
 
     fn disconnect(
         &mut self,
-        _: &mut SessionWorker<Index>,
-        _: Index,
+        _: &mut SessionWorker<u32>,
+        _: u32,
         _: &DataPlaneRuntime,
         _: SessionQueueNext,
         _: &mut BufferFrame,
@@ -556,12 +555,12 @@ impl SessionTransport<Index> for QuicShapedTransport {
     }
 }
 
-impl TransportInternalTransport<Index> for QuicShapedTransport {
+impl TransportInternalTransport<u32> for QuicShapedTransport {
     fn internal_tx(
         &mut self,
-        sessions: &mut SessionWorker<Index>,
+        sessions: &mut SessionWorker<u32>,
         session_id: crate::session::SessionId,
-        index: Index,
+        index: u32,
         runtime: &DataPlaneRuntime,
         output_next: SessionQueueNext,
         frame: &mut BufferFrame,
@@ -592,7 +591,7 @@ fn internal_tx_dispatches_each_session_sharing_a_transport_connection_once() {
     let output = runtime
         .nodes()
         .register_internal(PayloadCaptureNode::new(Arc::clone(&captured_payloads)));
-    let transport_index = Index::new(12, 4);
+    let transport_index = 12u32;
     let mut sessions = session_worker_for_test();
     let mut transport = QuicShapedTransport {
         observed_fifo_lengths: Arc::clone(&observed_fifo_lengths),
@@ -637,14 +636,14 @@ fn internal_tx_dispatches_each_session_sharing_a_transport_connection_once() {
 
 struct FailingPacketizedTransport;
 
-impl SessionTransport<Index> for FailingPacketizedTransport {
+impl SessionTransport<u32> for FailingPacketizedTransport {
     type Tx = SessionPacketizedTx;
 
     const ID: SessionTransportId = SessionTransportId::new(8);
 
     fn update_time(
         &mut self,
-        _: &mut SessionWorker<Index>,
+        _: &mut SessionWorker<u32>,
         _: &DataPlaneRuntime,
         _: SessionQueueNext,
         _: &mut BufferFrame,
@@ -656,8 +655,8 @@ impl SessionTransport<Index> for FailingPacketizedTransport {
 
     fn disconnect(
         &mut self,
-        _: &mut SessionWorker<Index>,
-        _: Index,
+        _: &mut SessionWorker<u32>,
+        _: u32,
         _: &DataPlaneRuntime,
         _: SessionQueueNext,
         _: &mut BufferFrame,
@@ -668,11 +667,11 @@ impl SessionTransport<Index> for FailingPacketizedTransport {
     }
 }
 
-impl SessionPacketizedTransport<Index> for FailingPacketizedTransport {
+impl SessionPacketizedTransport<u32> for FailingPacketizedTransport {
     fn control_tx(
         &mut self,
-        _: &mut SessionWorker<Index>,
-        _: Index,
+        _: &mut SessionWorker<u32>,
+        _: u32,
         _: &DataPlaneRuntime,
         _: SessionQueueNext,
         _: &mut BufferFrame,
@@ -684,8 +683,8 @@ impl SessionPacketizedTransport<Index> for FailingPacketizedTransport {
 
     fn send_params(
         &mut self,
-        _: &mut SessionWorker<Index>,
-        _: Index,
+        _: &mut SessionWorker<u32>,
+        _: u32,
         pending_len: usize,
         _: Instant,
     ) -> RuntimeResult<TransportSendParams> {
@@ -699,13 +698,13 @@ impl SessionPacketizedTransport<Index> for FailingPacketizedTransport {
 
     fn tx_action(
         &mut self,
-        _: Index,
+        _: u32,
         _: &[TxBatchBuffer],
         _: &DataPlaneBuffers,
         _: Instant,
     ) -> RuntimeResult<()> {
         Err(SessionError::TxOffsetOutOfRange {
-            session_id: crate::session::SessionId::from(Index::new(2, 1)),
+            session_id: crate::session::SessionId::from(2u32),
             tx_offset: 1,
             available: 0,
         }
@@ -722,14 +721,14 @@ struct RecordingPacketizedTransport {
     batches: Vec<Vec<(usize, usize)>>,
 }
 
-impl SessionTransport<Index> for RecordingPacketizedTransport {
+impl SessionTransport<u32> for RecordingPacketizedTransport {
     type Tx = SessionPacketizedTx;
 
     const ID: SessionTransportId = SessionTransportId::new(9);
 
     fn update_time(
         &mut self,
-        _: &mut SessionWorker<Index>,
+        _: &mut SessionWorker<u32>,
         _: &DataPlaneRuntime,
         _: SessionQueueNext,
         _: &mut BufferFrame,
@@ -741,8 +740,8 @@ impl SessionTransport<Index> for RecordingPacketizedTransport {
 
     fn disconnect(
         &mut self,
-        _: &mut SessionWorker<Index>,
-        _: Index,
+        _: &mut SessionWorker<u32>,
+        _: u32,
         _: &DataPlaneRuntime,
         _: SessionQueueNext,
         _: &mut BufferFrame,
@@ -753,11 +752,11 @@ impl SessionTransport<Index> for RecordingPacketizedTransport {
     }
 }
 
-impl SessionPacketizedTransport<Index> for RecordingPacketizedTransport {
+impl SessionPacketizedTransport<u32> for RecordingPacketizedTransport {
     fn control_tx(
         &mut self,
-        _: &mut SessionWorker<Index>,
-        _: Index,
+        _: &mut SessionWorker<u32>,
+        _: u32,
         _: &DataPlaneRuntime,
         _: SessionQueueNext,
         _: &mut BufferFrame,
@@ -769,8 +768,8 @@ impl SessionPacketizedTransport<Index> for RecordingPacketizedTransport {
 
     fn send_params(
         &mut self,
-        _: &mut SessionWorker<Index>,
-        _: Index,
+        _: &mut SessionWorker<u32>,
+        _: u32,
         _: usize,
         _: Instant,
     ) -> RuntimeResult<TransportSendParams> {
@@ -780,7 +779,7 @@ impl SessionPacketizedTransport<Index> for RecordingPacketizedTransport {
 
     fn tx_action(
         &mut self,
-        _: Index,
+        _: u32,
         batch: &[TxBatchBuffer],
         _: &DataPlaneBuffers,
         _: Instant,
@@ -883,8 +882,7 @@ fn session_tx_dispatch_commits_batch_before_graph_visibility() {
     };
     let mut sessions = session_worker_for_test();
     let mut transport = transport;
-    let session_id =
-        sessions.insert_session_for_test(RecordingPacketizedTransport::ID, Index::new(5, 1));
+    let session_id = sessions.insert_session_for_test(RecordingPacketizedTransport::ID, 5u32);
     let app = attach_local_app_session(&mut sessions, session_id);
     app.send_bytes(&[0xab; 16]).expect("send bytes");
     let output_node = runtime
@@ -935,8 +933,7 @@ fn session_tx_deschedules_without_tx_action_when_send_space_is_zero() {
     };
     let mut sessions = session_worker_for_test();
     let mut transport = transport;
-    let session_id =
-        sessions.insert_session_for_test(RecordingPacketizedTransport::ID, Index::new(6, 1));
+    let session_id = sessions.insert_session_for_test(RecordingPacketizedTransport::ID, 6u32);
     let app = attach_local_app_session(&mut sessions, session_id);
     app.send_bytes(&[0xab; 8]).expect("send bytes");
     let sink = runtime.nodes().register_internal(BlackholeNode);
@@ -964,8 +961,7 @@ fn failed_session_packetized_tx_action_keeps_fifo_and_graph_unchanged() {
     let runtime = DataPlaneRuntime::new(DataPlaneRuntimeConfig::default());
     let mut sessions = session_worker_for_test();
     let mut transport = FailingPacketizedTransport;
-    let session_id =
-        sessions.insert_session_for_test(FailingPacketizedTransport::ID, Index::new(2, 1));
+    let session_id = sessions.insert_session_for_test(FailingPacketizedTransport::ID, 2u32);
     let app = attach_local_app_session(&mut sessions, session_id);
     app.send_bytes(b"stay").expect("send bytes");
     sessions.mark_ready(session_id);
@@ -991,7 +987,7 @@ fn failed_session_packetized_tx_action_keeps_fifo_and_graph_unchanged() {
 #[test]
 fn transport_deleted_then_queued_app_close_releases_the_session_slot() {
     let runtime = DataPlaneRuntime::new(DataPlaneRuntimeConfig::default());
-    let transport_index = Index::new(3, 9);
+    let transport_index = 3u32;
     let mut sessions = session_worker_for_test();
     let mut transport = FailingPacketizedTransport;
     let session_id =
@@ -1014,16 +1010,8 @@ fn transport_deleted_then_queued_app_close_releases_the_session_slot() {
         .expect("dispatch app close");
 
     assert!(!sessions.has_session(session_id));
-    let replacement =
-        sessions.insert_session_for_test(FailingPacketizedTransport::ID, Index::new(4, 10));
-    assert_eq!(
-        replacement.pool_index().slot(),
-        session_id.pool_index().slot()
-    );
-    assert_ne!(
-        replacement.pool_index().generation(),
-        session_id.pool_index().generation()
-    );
+    let replacement = sessions.insert_session_for_test(FailingPacketizedTransport::ID, 4u32);
+    assert_eq!(replacement.pool_index(), session_id.pool_index());
 }
 
 #[test]

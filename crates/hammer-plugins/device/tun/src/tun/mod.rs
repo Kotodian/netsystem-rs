@@ -126,13 +126,13 @@ struct TunWorkerRuntime {
 struct TunRxQueue {
     queue: DeviceRxQueue,
     interface_index: u32,
-    file_index: hammer_infra::pool::Index,
+    file_index: u32,
     pending: bool,
 }
 
 struct TunTxQueue {
     queue: DeviceTxQueue,
-    file_index: hammer_infra::pool::Index,
+    file_index: u32,
     tx_lock: Arc<SpinLock<()>>,
     tx_iovecs: Vec<libc::iovec>,
 }

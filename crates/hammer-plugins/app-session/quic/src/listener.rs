@@ -4,13 +4,12 @@ use std::thread::{self, ThreadId};
 
 use hammer_core::data_plane::NodeState;
 use hammer_infra::align::CacheLine;
-use hammer_infra::pool::Index;
 use hammer_infra::pool::Pool;
 use hammer_infra::thread_owned::ThreadOwned;
 use hammer_runtime::app::{ApplicationId, SessionAppId};
 use hammer_runtime::{
     DataWorkerId, Engine, RuntimeError, RuntimeResult, SessionConnectEndpoint, SessionConnectionId,
-    SessionListenEndpoint, SessionListenerId, SessionTransportRegistration,
+    SessionListenEndpoint, SessionHandle, SessionTransportRegistration,
 };
 use hammer_service::session::ApplicationMain;
 use hammer_service::session::node::SessionQueueNode;
@@ -26,7 +25,7 @@ pub(crate) enum QuicListenerError {
     #[error("required graph node `{name}` is not registered")]
     NodeMissing { name: &'static str },
     #[error("QUIC listener {listener:?} is not registered")]
-    ListenerMissing { listener: SessionListenerId },
+    ListenerMissing { listener: SessionHandle },
     #[error("QUIC listener capacity {capacity} is exhausted")]
     ListenerCapacityExhausted { capacity: usize },
     #[error("QUIC active connect requires an explicit local endpoint")]
@@ -45,7 +44,7 @@ pub(crate) enum QuicListenerError {
 /// Main Thread-owned QUIC listener authority.
 ///
 /// The inner Application Listener is deliberately generic: its `config` is
-/// updated to the outer `SessionListenerId` while the same WorkerBarrier
+/// updated to the outer `SessionHandle` while the same WorkerBarrier
 /// transaction is active. QUIC interprets that opaque fact later; service and
 /// runtime do not know its type.
 pub struct QuicMain {
@@ -118,7 +117,7 @@ impl QuicMain {
 
     pub(crate) fn start_listen(
         &self,
-        outer_listener: SessionListenerId,
+        outer_listener: SessionHandle,
         outer_application: ApplicationId,
         outer_config: Option<u64>,
         endpoint: SessionListenEndpoint,
@@ -188,7 +187,7 @@ impl QuicMain {
         Ok(())
     }
 
-    pub(crate) fn stop_listen(&self, outer_listener: SessionListenerId) -> RuntimeResult<()> {
+    pub(crate) fn stop_listen(&self, outer_listener: SessionHandle) -> RuntimeResult<()> {
         let (index, listener) = self
             .with_contexts(|contexts| {
                 contexts.iter().find_map(|(index, context)| {
@@ -266,8 +265,8 @@ impl QuicMain {
 
     pub(crate) fn with_worker_and_sessions<R>(
         &self,
-        sessions: &mut SessionWorker<Index>,
-        operation: impl FnOnce(&mut SessionWorker<Index>, &mut QuicWorker) -> RuntimeResult<R>,
+        sessions: &mut SessionWorker<u32>,
+        operation: impl FnOnce(&mut SessionWorker<u32>, &mut QuicWorker) -> RuntimeResult<R>,
     ) -> RuntimeResult<R> {
         let worker = sessions.worker();
         let slot = self.workers.get(worker.slot()).ok_or_else(|| {
@@ -302,7 +301,7 @@ impl QuicMain {
     }
 
     #[cfg(test)]
-    fn listener(&self, outer_listener: SessionListenerId) -> Option<ListenerContext> {
+    fn listener(&self, outer_listener: SessionHandle) -> Option<ListenerContext> {
         self.with_contexts(|contexts| {
             contexts.iter().find_map(|(_, context)| {
                 context.listener_context().and_then(|listener| {
@@ -469,7 +468,7 @@ pub(crate) fn connect_stream(endpoint: SessionConnectEndpoint) -> RuntimeResult<
 }
 
 pub(crate) fn start_listen(
-    listener: SessionListenerId,
+    listener: SessionHandle,
     application: ApplicationId,
     config: Option<u64>,
     endpoint: SessionListenEndpoint,
@@ -481,7 +480,7 @@ pub(crate) fn start_listen(
         .start_listen(listener, application, config, endpoint)
 }
 
-pub(crate) fn stop_listen(listener: SessionListenerId) -> RuntimeResult<()> {
+pub(crate) fn stop_listen(listener: SessionHandle) -> RuntimeResult<()> {
     hammer_runtime::ensure_main_thread_with_barrier()?;
     QUIC_MAIN
         .get()
@@ -651,7 +650,7 @@ mod tests {
 
         // Owning-worker Session receives exactly the registration
         // `bind_worker_graph` performs at the bind point.
-        let mut worker_sessions = SessionWorker::<Index>::new(
+        let mut worker_sessions = SessionWorker::<u32>::new(
             DataWorkerId::new(0),
             1,
             hammer_runtime::app::AppSessionConfig::default(),
@@ -684,7 +683,7 @@ mod tests {
     fn destroy_session_app(_: DataWorkerId, _: u64) {}
 
     fn record_start(
-        listener: SessionListenerId,
+        listener: SessionHandle,
         application: ApplicationId,
         opaque: Option<u64>,
         _: SessionListenEndpoint,
@@ -699,13 +698,13 @@ mod tests {
         Ok(())
     }
 
-    fn record_stop(listener: SessionListenerId) -> RuntimeResult<()> {
+    fn record_stop(listener: SessionHandle) -> RuntimeResult<()> {
         STOP_LISTENER.store(listener.raw(), Ordering::SeqCst);
         Ok(())
     }
 
     fn fail_start(
-        _: SessionListenerId,
+        _: SessionHandle,
         _: ApplicationId,
         _: Option<u64>,
         _: SessionListenEndpoint,
@@ -809,7 +808,7 @@ mod tests {
         // wrapper installed at the bind point, under this test's single
         // QUIC_MAIN owner; `MissingRegistration` would prove the bind never
         // installed the table.
-        let mut worker_sessions = SessionWorker::<Index>::new(
+        let mut worker_sessions = SessionWorker::<u32>::new(
             DataWorkerId::new(0),
             1,
             hammer_runtime::app::AppSessionConfig::default(),
@@ -822,7 +821,7 @@ mod tests {
             .install_transport_actions(QuicWorker::ID, crate::worker::quic_transport_actions())?;
         let parent = worker_sessions.construct_transport_session(
             QuicWorker::ID,
-            Index::new(1, 1),
+            1,
             1,
             inner_application,
             Some(SessionAppId::new(0)),
@@ -874,7 +873,7 @@ mod tests {
             .map_err(RuntimeError::from)?;
 
         let result = main.start_listen(
-            SessionListenerId::new(23, 8),
+            SessionHandle::new(23, 8),
             outer_application,
             Some(config.raw()),
             SessionListenEndpoint::new(

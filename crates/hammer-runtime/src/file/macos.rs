@@ -4,10 +4,7 @@ use std::time::Duration;
 
 use crate::error::{RuntimeError, RuntimeResult};
 
-use super::{
-    FILE_POOL_CAPACITY, POLL_BATCH_SIZE, PollEvent, PollSpec, PollTarget, Readiness, decode_index,
-    encode_index,
-};
+use super::{FILE_POOL_CAPACITY, POLL_BATCH_SIZE, PollEvent, PollSpec, PollTarget, Readiness};
 
 const DEADLINE_TOKEN_BIT: u64 = 1 << 63;
 
@@ -57,18 +54,18 @@ impl Poller {
         self.update(Some(spec), None)
     }
 
-    pub(super) fn add_deadline(&mut self, index: super::Index) -> RuntimeResult<()> {
-        self.deadline_durations[index.slot() as usize] = None;
-        self.deadline_armed[index.slot() as usize] = false;
+    pub(super) fn add_deadline(&mut self, index: u32) -> RuntimeResult<()> {
+        self.deadline_durations[index as usize] = None;
+        self.deadline_armed[index as usize] = false;
         Ok(())
     }
 
     pub(super) fn set_deadline(
         &mut self,
-        index: super::Index,
+        index: u32,
         duration: Option<Duration>,
     ) -> RuntimeResult<()> {
-        let slot = index.slot() as usize;
+        let slot = index as usize;
         if self.deadline_durations.get(slot).is_none() {
             return Err(RuntimeError::DeadlineIndexInvalid { index }.into());
         }
@@ -84,8 +81,8 @@ impl Poller {
         Ok(())
     }
 
-    pub(super) fn delete_deadline(&mut self, index: super::Index) -> RuntimeResult<()> {
-        let slot = index.slot() as usize;
+    pub(super) fn delete_deadline(&mut self, index: u32) -> RuntimeResult<()> {
+        let slot = index as usize;
         if self.deadline_durations.get(slot).is_none() {
             return Err(RuntimeError::DeadlineIndexInvalid { index }.into());
         }
@@ -97,16 +94,16 @@ impl Poller {
         Ok(())
     }
 
-    pub(super) fn consume_deadline(&mut self, index: super::Index) -> RuntimeResult<()> {
-        if self.deadline_durations.get(index.slot() as usize).is_none() {
+    pub(super) fn consume_deadline(&mut self, index: u32) -> RuntimeResult<()> {
+        if self.deadline_durations.get(index as usize).is_none() {
             return Err(RuntimeError::DeadlineIndexInvalid { index }.into());
         }
-        self.deadline_armed[index.slot() as usize] = false;
+        self.deadline_armed[index as usize] = false;
         Ok(())
     }
 
-    pub(super) fn rearm_deadline(&mut self, index: super::Index) -> RuntimeResult<()> {
-        let slot = index.slot() as usize;
+    pub(super) fn rearm_deadline(&mut self, index: u32) -> RuntimeResult<()> {
+        let slot = index as usize;
         let Some(duration) = self.deadline_durations[slot] else {
             return Ok(());
         };
@@ -158,9 +155,11 @@ impl Poller {
             }
             let token = event.udata as usize as u64;
             let target = if token & DEADLINE_TOKEN_BIT != 0 {
-                decode_index(token & !DEADLINE_TOKEN_BIT).map(PollTarget::Deadline)
+                u32::try_from(token & !DEADLINE_TOKEN_BIT)
+                    .ok()
+                    .map(PollTarget::Deadline)
             } else {
-                decode_index(token).map(PollTarget::File)
+                u32::try_from(token).ok().map(PollTarget::File)
             };
             *ready = PollEvent {
                 target,
@@ -213,7 +212,7 @@ impl Poller {
         Ok(())
     }
 
-    fn add_timer(&self, index: super::Index, duration: Duration) -> RuntimeResult<()> {
+    fn add_timer(&self, index: u32, duration: Duration) -> RuntimeResult<()> {
         let event = timer_event(index, duration)?;
         // SAFETY: `event` is initialized and kqueue only reads the change
         // record during this synchronous call.
@@ -233,7 +232,7 @@ impl Poller {
         Ok(())
     }
 
-    fn delete_timer(&self, index: super::Index) -> RuntimeResult<()> {
+    fn delete_timer(&self, index: u32) -> RuntimeResult<()> {
         let event = timer_delete_event(index);
         // SAFETY: `event` is initialized and kqueue only reads the change
         // record during this synchronous call.
@@ -272,11 +271,11 @@ fn change_event(spec: PollSpec, filter: i16, enable: bool) -> libc::kevent {
         },
         fflags: 0,
         data: 0,
-        udata: encode_index(spec.index) as usize as *mut libc::c_void,
+        udata: u64::from(spec.index) as usize as *mut libc::c_void,
     }
 }
 
-fn timer_event(index: super::Index, duration: Duration) -> RuntimeResult<libc::kevent> {
+fn timer_event(index: u32, duration: Duration) -> RuntimeResult<libc::kevent> {
     let nanoseconds = duration.as_nanos().max(1);
     let nanoseconds = isize::try_from(nanoseconds).map_err(|_| RuntimeError::FilePollerIo {
         operation: "arm kqueue File deadline",
@@ -288,11 +287,11 @@ fn timer_event(index: super::Index, duration: Duration) -> RuntimeResult<libc::k
         flags: libc::EV_ADD | libc::EV_ENABLE | libc::EV_ONESHOT,
         fflags: libc::NOTE_NSECONDS,
         data: nanoseconds,
-        udata: (DEADLINE_TOKEN_BIT | encode_index(index)) as usize as *mut libc::c_void,
+        udata: (DEADLINE_TOKEN_BIT | u64::from(index)) as usize as *mut libc::c_void,
     })
 }
 
-fn timer_delete_event(index: super::Index) -> libc::kevent {
+fn timer_delete_event(index: u32) -> libc::kevent {
     libc::kevent {
         ident: deadline_ident(index),
         filter: libc::EVFILT_TIMER,
@@ -303,8 +302,8 @@ fn timer_delete_event(index: super::Index) -> libc::kevent {
     }
 }
 
-fn deadline_ident(index: super::Index) -> libc::uintptr_t {
-    usize::MAX - index.slot() as usize
+fn deadline_ident(index: u32) -> libc::uintptr_t {
+    usize::MAX - index as usize
 }
 
 const fn empty_event() -> libc::kevent {

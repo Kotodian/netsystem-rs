@@ -1,7 +1,7 @@
 use std::time::{Duration, Instant};
 
 use hammer_infra::fifo_queue::FifoQueue;
-use hammer_infra::pool::{Index as PoolIndex, Pool};
+use hammer_infra::pool::Pool;
 use hammer_infra::timer_wheel::TimerWheel1t2w2048sl;
 use hammer_runtime::RuntimeResult;
 
@@ -104,7 +104,7 @@ impl TcpTimerState {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) struct TcpTimerToken {
-    pub(super) index: PoolIndex,
+    pub(super) index: u32,
     pub(super) kind: TcpTimerKind,
 }
 
@@ -136,7 +136,7 @@ impl TcpTimers {
 
     pub(super) fn set(
         &mut self,
-        index: PoolIndex,
+        index: u32,
         state: &mut TcpTimerState,
         kind: TcpTimerKind,
         interval: Duration,
@@ -145,12 +145,7 @@ impl TcpTimers {
             return Ok(());
         }
         self.wheel
-            .arm_timer(
-                index.slot(),
-                index.generation(),
-                kind.id(),
-                self.duration_ticks(interval),
-            )
+            .arm_timer(index, 0, kind.id(), self.duration_ticks(interval))
             .map_err(|_| TcpNodeError::TimerUpdateFailed)?;
         state.arm(kind);
         Ok(())
@@ -166,32 +161,20 @@ impl TcpTimers {
         Ok(())
     }
 
-    pub(super) fn reset(
-        &mut self,
-        index: PoolIndex,
-        state: &mut TcpTimerState,
-        kind: TcpTimerKind,
-    ) {
-        let _ = self
-            .wheel
-            .cancel_timer(index.slot(), index.generation(), kind.id());
+    pub(super) fn reset(&mut self, index: u32, state: &mut TcpTimerState, kind: TcpTimerKind) {
+        let _ = self.wheel.cancel_timer(index, 0, kind.id());
         state.reset(kind);
     }
 
     pub(super) fn update(
         &mut self,
-        index: PoolIndex,
+        index: u32,
         state: &mut TcpTimerState,
         kind: TcpTimerKind,
         interval: Duration,
     ) -> RuntimeResult<()> {
         self.wheel
-            .update_timer(
-                index.slot(),
-                index.generation(),
-                kind.id(),
-                self.duration_ticks(interval),
-            )
+            .update_timer(index, 0, kind.id(), self.duration_ticks(interval))
             .map_err(|_| TcpNodeError::TimerUpdateFailed)?;
         state.arm(kind);
         Ok(())
@@ -214,13 +197,12 @@ impl TcpTimers {
             .expect("TCP timer wheel consumes no more than the requested u32 ticks");
         self.last_update += self.resolution * consumed_ticks;
         for payload in self.expired.as_slice() {
-            let Some((slot, generation, kind_id)) = self.wheel.take_expired_timer(*payload) else {
+            let Some((index, _, kind_id)) = self.wheel.take_expired_timer(*payload) else {
                 continue;
             };
             let Some(kind) = TcpTimerKind::from_id(kind_id) else {
                 continue;
             };
-            let index = PoolIndex::new(slot, generation);
             let Some(connection) = connections.get_mut(index) else {
                 continue;
             };
@@ -283,7 +265,7 @@ mod tests {
     use std::net::SocketAddr;
     use std::time::{Duration, Instant};
 
-    use hammer_infra::pool::{Index, Pool};
+    use hammer_infra::pool::Pool;
     use hammer_runtime::DataWorkerId;
 
     use super::{
@@ -296,15 +278,13 @@ mod tests {
         TcpConnection::new(None, DataWorkerId::new(0), 0, None, remote)
     }
 
-    fn test_connections() -> (Pool<TcpConnection>, Index) {
+    fn test_connections() -> (Pool<TcpConnection>, u32) {
         let mut connections = Pool::with_capacity(1);
-        let index = connections
-            .insert(test_connection())
-            .expect("insert test connection");
+        let index = connections.insert(test_connection());
         (connections, index)
     }
 
-    fn test_timer_state(connections: &Pool<TcpConnection>, index: Index) -> TcpTimerState {
+    fn test_timer_state(connections: &Pool<TcpConnection>, index: u32) -> TcpTimerState {
         *connections
             .get(index)
             .expect("test connection")
@@ -458,22 +438,17 @@ mod tests {
                 )
                 .expect("arm old connection timer");
         }
-        let _ = connections
-            .remove(old_index)
-            .expect("remove old connection");
-        let new_index = connections
-            .insert(test_connection())
-            .expect("insert replacement connection");
+        connections.remove(old_index);
+        let new_index = connections.insert(test_connection());
         timers.advance(now + Duration::from_millis(10), &mut connections);
 
         assert_eq!(
             (
-                new_index.slot(),
-                new_index.generation() != old_index.generation(),
+                new_index,
                 test_timer_state(&connections, new_index).is_active(TcpTimerKind::Retransmit),
                 timers.take_pending(&mut connections),
             ),
-            (old_index.slot(), true, false, None),
+            (old_index, false, None),
         );
     }
 
@@ -709,9 +684,7 @@ mod tests {
         let mut last_index = None;
 
         for offset in 0..connection_count {
-            let index = connections
-                .insert(test_connection())
-                .expect("insert test connection");
+            let index = connections.insert(test_connection());
             let state = connections
                 .get_mut(index)
                 .expect("test connection")
@@ -785,12 +758,8 @@ mod tests {
                 .expect("arm old connection timer");
         }
         timers.advance(now + Duration::from_millis(10), &mut connections);
-        let _ = connections
-            .remove(old_index)
-            .expect("remove old connection");
-        let new_index = connections
-            .insert(test_connection())
-            .expect("insert replacement connection");
+        connections.remove(old_index);
+        let new_index = connections.insert(test_connection());
         {
             let state = connections
                 .get_mut(new_index)

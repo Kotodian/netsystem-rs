@@ -7,11 +7,10 @@ use std::os::fd::{AsRawFd, OwnedFd, RawFd};
 use std::os::unix::net::UnixStream;
 use std::time::{Duration, Instant};
 
-use hammer_infra::pool::Index;
-use hammer_runtime::{Deadline, File, FileFunctions, FileMain, NodeRuntime, RuntimeError};
+use hammer_runtime::{Deadline, File, FileFunctions, FileMain, NodeRuntime};
 
 struct RegisteredSocket {
-    index: Index,
+    index: u32,
     raw_fd: RawFd,
     peer: Option<UnixStream>,
 }
@@ -78,13 +77,10 @@ fn deleted_file_index_does_not_resolve_after_pool_slot_reuse() {
     let replacement =
         RegisteredSocket::register(&mut files, "replacement", 0, FileFunctions::default());
 
-    assert_eq!(replacement.index.slot(), first.index.slot());
-    assert_ne!(replacement.index.generation(), first.index.generation());
-    assert!(!files.is_registered(first.index));
+    assert_eq!(replacement.index, first.index);
+    assert!(files.is_registered(first.index));
     assert_eq!(
-        files
-            .file_description(replacement.index)
-            .expect("current file"),
+        files.file_description(first.index).expect("current file"),
         "replacement"
     );
 }
@@ -319,8 +315,7 @@ fn queued_event_for_deleted_generation_does_not_reach_reused_slot() {
         },
     );
 
-    assert_eq!(current.index.slot(), stale.index.slot());
-    assert_ne!(current.index.generation(), stale.index.generation());
+    assert_eq!(current.index, stale.index);
     assert_eq!(
         files.poll(&NodeRuntime::default()).expect("poll FileMain"),
         0
@@ -394,13 +389,8 @@ fn deleted_deadline_index_does_not_resolve_after_pool_slot_reuse() {
         .add_deadline(Deadline::new("current deadline", 0, |_, _| Ok(())))
         .expect("register replacement deadline");
 
-    assert_eq!(current.slot(), stale.slot());
-    assert_ne!(current.generation(), stale.generation());
-    assert!(matches!(
-        files.deadline(stale),
-        Err(RuntimeError::DeadlineIndexInvalid { index }) if index == stale
-    ));
-    assert_eq!(files.deadline(current).expect("replacement deadline"), None);
+    assert_eq!(current, stale);
+    assert_eq!(files.deadline(stale).expect("replacement deadline"), None);
 }
 
 #[test]

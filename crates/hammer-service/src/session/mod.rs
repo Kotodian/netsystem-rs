@@ -3,7 +3,6 @@
 use std::sync::Arc;
 
 use hammer_core::data_plane::NodeState;
-use hammer_infra::pool::Index as PoolIndex;
 use hammer_runtime::app::AppSessionConfig;
 use hammer_runtime::attach::AppServer;
 use hammer_runtime::{Engine, RuntimeResult};
@@ -107,7 +106,7 @@ fn init_session_worker(
         .registry
         .get::<AppServer>()
         .map(|server| server.publisher());
-    let mut sessions = SessionWorker::<PoolIndex>::new(
+    let mut sessions = SessionWorker::<u32>::new(
         worker,
         engine.configured_worker_count(),
         AppSessionConfig::default(),

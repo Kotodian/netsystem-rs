@@ -13,7 +13,6 @@ use std::sync::Mutex;
 use std::thread::ThreadId;
 use std::time::Duration;
 
-use hammer_infra::pool::Index;
 use hammer_runtime::{
     AsyncFileMain, FILE_MAIN, File, FileFunctions, FileMain, NodeRuntime, RuntimeError,
     RuntimeResult,
@@ -87,7 +86,7 @@ fn register_readiness_file(
     file_main: &FileMain,
     description: &str,
     functions: FileFunctions,
-) -> (Index, UnixStream) {
+) -> (u32, UnixStream) {
     let (read_end, write_end) = UnixStream::pair().expect("socketpair");
     set_nonblocking(read_end.as_raw_fd());
     let index = file_main

@@ -13,7 +13,6 @@ use std::os::unix::net::UnixStream as StdUnixStream;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use hammer_infra::pool::Index;
 use hammer_runtime::FILE_MAIN;
 use hammer_runtime::binary_api::{BinaryApiMethodEntry, BinaryApiMethodStatus};
 use hammer_runtime::file::{FileIoStatus, FileMain};
@@ -100,7 +99,7 @@ impl SocketToken {
 /// backpressure.
 struct ClientSlot {
     generation: u32,
-    index: Option<Index>,
+    index: Option<u32>,
     read_buf: Vec<u8>,
     output: Vec<u8>,
 }
@@ -119,7 +118,7 @@ impl Default for ClientSlot {
 /// VPP `socket_main.registration_pool`, keyed by generation-safe client
 /// registration tokens.
 struct SocketApiRegistrationPool {
-    listener: Index,
+    listener: u32,
     slots: Vec<ClientSlot>,
     /// Monotonic generation source: a recycled slot's new token never matches
     /// a stale token held by the previous occupant.
@@ -127,7 +126,7 @@ struct SocketApiRegistrationPool {
 }
 
 impl SocketApiRegistrationPool {
-    fn new(listener: Index) -> Self {
+    fn new(listener: u32) -> Self {
         Self {
             listener,
             slots: (0..MAX_CLIENTS).map(|_| ClientSlot::default()).collect(),
@@ -395,7 +394,7 @@ impl Drop for SocketApiRegistrationPool {
 /// listener is registered in the process-global `FILE_MAIN`; EnginePool's main
 /// loop polls that table and the `binary-api` Process Node consumes its events.
 pub struct BinaryApiMain {
-    listener: Index,
+    listener: u32,
     socket_path: PathBuf,
     socket_device: u64,
     socket_inode: u64,

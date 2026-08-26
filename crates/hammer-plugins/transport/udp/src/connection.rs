@@ -1,6 +1,5 @@
 use std::net::SocketAddr;
-
-use hammer_runtime::{DataWorkerId, SessionListenerId};
+use hammer_runtime::{DataWorkerId, SessionHandle};
 use hammer_service::session::SessionId;
 
 use crate::UdpIpVersion;
@@ -11,7 +10,7 @@ use crate::UdpIpVersion;
 pub struct UdpListener {
     local: SocketAddr,
     version: UdpIpVersion,
-    session_listener: SessionListenerId,
+    session_listener: SessionHandle,
     owner_worker: DataWorkerId,
 }
 
@@ -19,7 +18,7 @@ impl UdpListener {
     #[inline]
     pub const fn new(
         local: SocketAddr,
-        session_listener: SessionListenerId,
+        session_listener: SessionHandle,
         owner_worker: DataWorkerId,
     ) -> Option<Self> {
         let version = match local {
@@ -40,7 +39,7 @@ impl UdpListener {
     }
 
     #[inline]
-    pub const fn session_listener(self) -> SessionListenerId {
+    pub const fn session_listener(self) -> SessionHandle {
         self.session_listener
     }
 

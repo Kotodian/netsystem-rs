@@ -780,11 +780,7 @@ impl AdjacencyRewriteNode {
             opaque.forwarding
         };
         let Some(forwarding) = forwarding else {
-            set_index_node_error(
-                runtime,
-                index,
-                AdjacencyRewriteNodeError::MissingForwarding,
-            )?;
+            set_index_node_error(runtime, index, AdjacencyRewriteNodeError::MissingForwarding)?;
             let _ = add_packet_trace!(
                 runtime,
                 index,
@@ -817,11 +813,7 @@ impl AdjacencyRewriteNode {
             .table()
             .adjacency(AdjacencyIndex::new(forwarding.dpo_index))
         else {
-            set_index_node_error(
-                runtime,
-                index,
-                AdjacencyRewriteNodeError::MissingAdjacency,
-            )?;
+            set_index_node_error(runtime, index, AdjacencyRewriteNodeError::MissingAdjacency)?;
             let _ = add_packet_trace!(
                 runtime,
                 index,
@@ -839,11 +831,7 @@ impl AdjacencyRewriteNode {
         if let Some(next) =
             adjacency_mtu_divert(runtime, index, &adjacency, icmp_error_next, fragment_next)?
         {
-            set_index_node_error(
-                runtime,
-                index,
-                AdjacencyRewriteNodeError::MtuExceeded,
-            )?;
+            set_index_node_error(runtime, index, AdjacencyRewriteNodeError::MtuExceeded)?;
             let _ = add_packet_trace!(
                 runtime,
                 index,

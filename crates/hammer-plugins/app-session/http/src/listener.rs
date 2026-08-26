@@ -44,9 +44,9 @@ use std::thread::{self, ThreadId};
 
 use hammer_infra::align::CacheLine;
 use hammer_infra::thread_owned::ThreadOwned;
-use hammer_runtime::app::{ApplicationId, ApplicationListenerId, SessionAppId};
+use hammer_runtime::app::{ApplicationId, ApplicationListenerId, SessionAppId, SessionHandle};
 use hammer_runtime::{
-    DataWorkerId, Engine, RuntimeError, RuntimeResult, SessionListenEndpoint, SessionListenerId,
+    DataWorkerId, Engine, RuntimeError, RuntimeResult, SessionListenEndpoint,
     SessionTransportRegistration,
 };
 use hammer_service::session::runtime::{SessionMain, SessionTransportId};
@@ -56,10 +56,10 @@ use crate::worker::{HttpWorker, HttpWorkerError};
 
 /// Bounds the HTTP listener-context table.
 ///
-/// The table is indexed by the outer `SessionListenerId`'s session-pool slot,
+/// The table is indexed by the outer `SessionHandle`'s session-pool slot,
 /// and the session pool is bounded by `DEFAULT_SESSION_POOL_CAPACITY`
 /// (session/runtime.rs:49), so every live outer listener's slot fits. A
-/// listener whose slot exceeds the bound is rejected by the capacity
+/// listener whose slot exceeds the bound is rejected by the capacity preflight.
 /// preflight before any side effect.
 const HTTP_LISTENER_CONTEXT_CAPACITY: usize = 1024;
 
@@ -69,7 +69,7 @@ pub(crate) enum HttpListenerError {
     #[error("HTTP listener context capacity {capacity} is exhausted")]
     ListenerCapacityExhausted { capacity: usize },
     #[error("HTTP listener {listener:?} is not registered")]
-    ListenerMissing { listener: SessionListenerId },
+    ListenerMissing { listener: SessionHandle },
     #[error(
         "HTTP listen requires a QUIC server config, but QUIC config registration \
          is not installed in this slice"
@@ -85,19 +85,18 @@ pub(crate) enum HttpListenerError {
 /// tears down the nested identities by value.
 #[derive(Clone, Copy)]
 struct ListenerContext {
-    outer_listener: SessionListenerId,
+    outer_listener: SessionHandle,
     outer_application: ApplicationId,
     outer_config: Option<u64>,
     inner_application_listener: ApplicationListenerId,
-    inner_session_listener: SessionListenerId,
+    inner_session_listener: SessionHandle,
 }
 
 /// Bounded O(1) outer-listener to listener-context table.
 ///
-/// Indexed by the outer `SessionListenerId`'s session-pool slot: live
-/// listeners own their pool slot, so a slot index resolves the context in
-/// O(1) with no pool scan, unlike QUIC's context `Pool`, whose `stop_listen`
-/// must scan for the outer listener (quic listener.rs:190-201). The table is
+/// Indexed by the outer `SessionHandle`'s session-pool slot: live listeners
+/// own their pool slot, so a slot index resolves the context in O(1) with no
+/// pool scan, unlike QUIC's context `Pool`.
 /// a fixed contiguous `Vec` of `Option` slots, allocated up front; capacity
 /// is preflighted before any Session state is published.
 struct HttpListenerContexts {
@@ -196,7 +195,7 @@ impl HttpMain {
     /// to the worker-graph slice).
     pub(crate) fn start_listen(
         &self,
-        outer_listener: SessionListenerId,
+        outer_listener: SessionHandle,
         outer_application: ApplicationId,
         outer_config: Option<u64>,
         endpoint: SessionListenEndpoint,
@@ -208,7 +207,7 @@ impl HttpMain {
 
         // Capacity preflight before any Session state is published: a single
         // O(1) bounds check on the outer listener's session-pool slot.
-        if outer_listener.slot() as usize >= HTTP_LISTENER_CONTEXT_CAPACITY {
+        if outer_listener.session_index() as usize >= HTTP_LISTENER_CONTEXT_CAPACITY {
             return Err(HttpListenerError::ListenerCapacityExhausted {
                 capacity: HTTP_LISTENER_CONTEXT_CAPACITY,
             }
@@ -242,7 +241,7 @@ impl HttpMain {
         self.with_contexts(|slots| {
             // Capacity was checked before any Session state was published, so
             // a failed store would be an impossible table invariant violation.
-            slots[outer_listener.slot() as usize] = Some(ListenerContext {
+            slots[outer_listener.session_index() as usize] = Some(ListenerContext {
                 outer_listener,
                 outer_application,
                 outer_config,
@@ -277,11 +276,11 @@ impl HttpMain {
     /// listener.rs:204-209); the context is then still cleared only after
     /// both lower teardown steps succeeded, so the final slot store is an
     /// infallible indexed write into the slot the lookup already validated.
-    pub(crate) fn stop_listen(&self, outer_listener: SessionListenerId) -> RuntimeResult<()> {
+    pub(crate) fn stop_listen(&self, outer_listener: SessionHandle) -> RuntimeResult<()> {
         let context = self
             .with_contexts(|slots| {
                 slots
-                    .get(outer_listener.slot() as usize)
+                    .get(outer_listener.session_index() as usize)
                     .and_then(Option::as_ref)
                     .filter(|context| context.outer_listener == outer_listener)
                     .copied()
@@ -303,7 +302,7 @@ impl HttpMain {
         // Outer HTTP context clear last, after both lower teardowns
         // succeeded. The lookup validated the slot, so the indexed store is
         // infallible.
-        self.with_contexts(|slots| slots[outer_listener.slot() as usize] = None)?;
+        self.with_contexts(|slots| slots[outer_listener.session_index() as usize] = None)?;
         Ok(())
     }
 
@@ -374,7 +373,7 @@ pub(crate) static HTTP_MAIN: OnceLock<Arc<HttpMain>> = OnceLock::new();
 /// returning typed errors before any side effect. Mirrors the QUIC transport
 /// callback gate (quic listener.rs:466-477).
 pub(crate) fn start_listen(
-    listener: SessionListenerId,
+    listener: SessionHandle,
     application: ApplicationId,
     config: Option<u64>,
     endpoint: SessionListenEndpoint,
@@ -391,8 +390,8 @@ pub(crate) fn start_listen(
 /// Mirrors the `start_listen` gate: checks the main thread and worker
 /// barrier, then the authority, returning typed errors before any side
 /// effect. `SessionMain::unlisten` dispatches here with the outer
-/// `SessionListenerId` (session/runtime.rs:939-956).
-pub(crate) fn stop_listen(listener: SessionListenerId) -> RuntimeResult<()> {
+/// `SessionHandle` (session/runtime.rs:939-956).
+pub(crate) fn stop_listen(listener: SessionHandle) -> RuntimeResult<()> {
     hammer_runtime::ensure_main_thread_with_barrier()?;
     HTTP_MAIN
         .get()
@@ -480,7 +479,6 @@ mod tests {
     use std::sync::mpsc;
     use std::thread;
 
-    use hammer_infra::pool::Index;
     use hammer_infra::thread_owned::ThreadOwnedError;
     use hammer_runtime::app::SessionAppId;
     use hammer_runtime::{
@@ -555,7 +553,7 @@ mod tests {
     /// Recording stub lower QUIC transport: succeeds and records the exact
     /// nested identities the session layer handed it.
     fn record_start(
-        listener: SessionListenerId,
+        listener: SessionHandle,
         application: ApplicationId,
         opaque: Option<u64>,
         _: SessionListenEndpoint,
@@ -572,7 +570,7 @@ mod tests {
 
     /// Failing stub lower QUIC transport: exercises the reverse-order rollback.
     fn fail_start(
-        _: SessionListenerId,
+        _: SessionHandle,
         _: ApplicationId,
         _: Option<u64>,
         _: SessionListenEndpoint,
@@ -584,7 +582,7 @@ mod tests {
 
     /// Recording stub lower QUIC unlisten: succeeds and records the exact
     /// inner Session listener the session layer handed to the QUIC transport.
-    fn record_stop(listener: SessionListenerId) -> RuntimeResult<()> {
+    fn record_stop(listener: SessionHandle) -> RuntimeResult<()> {
         STOP_LISTENED.with(|recorded| recorded.set(listener.raw()));
         Ok(())
     }
@@ -593,17 +591,14 @@ mod tests {
     /// must succeed without touching the shared `LISTEN_*` recording statics
     /// (owned exclusively by `http_listener_init_publishes_...`).
     fn noop_start(
-        _: SessionListenerId,
-        _: ApplicationId,
-        _: Option<u64>,
-        _: SessionListenEndpoint,
+        _: SessionHandle,
     ) -> RuntimeResult<()> {
         Ok(())
     }
 
     /// Failing stub lower QUIC unlisten: exercises the preserve-on-failure
     /// stop path.
-    fn fail_stop(_: SessionListenerId) -> RuntimeResult<()> {
+    fn fail_stop(_: SessionHandle) -> RuntimeResult<()> {
         Err(RuntimeError::config_validation(
             "test QUIC lower unlisten failure",
         ))
@@ -735,7 +730,7 @@ mod tests {
         // outer listener's session slot with the exact nested identities:
         // outer listener/application/config, inner Application listener, and
         // the lower QUIC SessionListener the session layer returned.
-        let slot = outer_listener.slot() as usize;
+        let slot = outer_listener.session_index() as usize;
         let context = main
             .contexts
             .get()
@@ -798,7 +793,7 @@ mod tests {
         LISTEN_APPLICATION.store(0, Ordering::SeqCst);
 
         let error = start_error(main.start_listen(
-            SessionListenerId::new(0, 0),
+            SessionHandle::new(0, 0),
             sessions.applications().attach().expect("outer attach"),
             None,
             test_endpoint(),
@@ -842,7 +837,7 @@ mod tests {
         // error.
         for cycle in 0..5 {
             let error = start_error(main.start_listen(
-                SessionListenerId::new(cycle, 0),
+                SessionHandle::new(cycle, 0),
                 outer_application,
                 Some(42),
                 test_endpoint(),
@@ -863,8 +858,8 @@ mod tests {
         let endpoint = test_endpoint();
         let error = thread::spawn(move || {
             start_error(super::start_listen(
-                SessionListenerId::new(2, 0),
-                ApplicationId::new(0, 0),
+                SessionHandle::new(2, 0),
+                ApplicationId::new(0),
                 None,
                 endpoint,
             ))
@@ -886,8 +881,8 @@ mod tests {
         ));
         let error = thread::spawn(move || {
             start_error(main.start_listen(
-                SessionListenerId::new(3, 0),
-                ApplicationId::new(0, 0),
+                SessionHandle::new(3, 0),
+                ApplicationId::new(0),
                 None,
                 test_endpoint(),
             ))
@@ -914,8 +909,8 @@ mod tests {
             0,
         ));
         let endpoint = test_endpoint();
-        let first = SessionListenerId::new(0, 0);
-        let second = SessionListenerId::new(1, 0);
+        let first = SessionHandle::new(0, 0);
+        let second = SessionHandle::new(1, 0);
         main.start_listen(first, outer_application, Some(42), endpoint)?;
         main.start_listen(second, outer_application, Some(43), endpoint)?;
         let first_inner = main
@@ -942,7 +937,7 @@ mod tests {
         // missing-context error before any side effect; the live context in
         // that slot is untouched.
         STOP_LISTENED.with(|recorded| recorded.set(0));
-        let error = start_error(main.stop_listen(SessionListenerId::new(1, 1)));
+        let error = start_error(main.stop_listen(SessionHandle::new(1, 1)));
         assert!(causes_contain(&error, "not registered"));
         assert_eq!(STOP_LISTENED.with(|recorded| recorded.get()), 0);
         assert!(main.contexts.get()[1].is_some());
@@ -994,7 +989,7 @@ mod tests {
             0,
         ));
 
-        let error = start_error(main.stop_listen(SessionListenerId::new(0, 0)));
+        let error = start_error(main.stop_listen(SessionHandle::new(0, 0)));
         assert!(matches!(
             error,
             RuntimeError::Subsystem { subsystem, .. } if subsystem == "http"
@@ -1021,7 +1016,7 @@ mod tests {
             sessions.applications().attach().expect("inner attach"),
             0,
         ));
-        let outer = SessionListenerId::new(0, 0);
+        let outer = SessionHandle::new(0, 0);
         main.start_listen(outer, outer_application, Some(42), test_endpoint())?;
 
         let error = start_error(main.stop_listen(outer));
@@ -1050,7 +1045,7 @@ mod tests {
 
     #[test]
     fn http_listener_stop_listen_requires_main_thread() {
-        let error = thread::spawn(|| start_error(super::stop_listen(SessionListenerId::new(4, 0))))
+        let error = thread::spawn(|| start_error(super::stop_listen(SessionHandle::new(4, 0))))
             .join()
             .expect("stop_listen thread completes");
         assert!(matches!(error, RuntimeError::ControlRequiresMainThread));
@@ -1067,7 +1062,7 @@ mod tests {
             0,
         ));
         let error =
-            thread::spawn(move || start_error(main.stop_listen(SessionListenerId::new(5, 0))))
+            thread::spawn(move || start_error(main.stop_listen(SessionHandle::new(5, 0))))
                 .join()
                 .expect("authority stop_listen thread completes");
         assert!(matches!(error, RuntimeError::ControlRequiresMainThread));
@@ -1113,7 +1108,7 @@ mod tests {
                     .map_err(RuntimeError::from)
             })
             .expect("exact worker lookup runs on the installing thread");
-        assert_eq!(Index::from(context).slot(), 0);
+        assert_eq!(u32::from(context), 0);
         main.with_worker(DataWorkerId::new(1), |worker| {
             assert_eq!(worker.len(), 1);
             assert_eq!(worker.capacity(), crate::worker::HTTP_CONTEXT_CAPACITY);

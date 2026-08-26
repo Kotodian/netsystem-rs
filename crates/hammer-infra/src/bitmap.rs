@@ -51,6 +51,22 @@ impl<I> Bitmap<I> {
         self.words.len()
     }
 
+    pub(crate) fn try_reserve_bits(
+        &mut self,
+        bits: usize,
+    ) -> Result<(), std::collections::TryReserveError> {
+        let required = words_for(bits);
+        if required <= self.words.len() {
+            return Ok(());
+        }
+        let additional = required - self.words.len();
+        self.words.try_reserve(additional)?;
+        for _ in 0..additional {
+            self.words.push(0);
+        }
+        Ok(())
+    }
+
     fn ensure_bit(&mut self, bit: usize) {
         let required = bit / u64::BITS as usize + 1;
         if required <= self.words.len() {
@@ -101,6 +117,38 @@ impl<I: Into<usize>> Bitmap<I> {
 }
 
 impl Bitmap<usize> {
+    pub(crate) fn first_clear_from(&self, start: usize, limit: usize) -> Option<usize> {
+        if start >= limit {
+            return None;
+        }
+
+        let bits_per_word = u64::BITS as usize;
+        let mut word_index = start / bits_per_word;
+        let bit_in_word = start % bits_per_word;
+        let mut available = !self.words.get(word_index).copied().unwrap_or(0);
+        available &= !0_u64 << bit_in_word;
+
+        loop {
+            if available != 0 {
+                let position = word_index
+                    .saturating_mul(bits_per_word)
+                    .saturating_add(available.trailing_zeros() as usize);
+                if position < limit {
+                    return Some(position);
+                }
+                return None;
+            }
+            word_index = word_index.checked_add(1)?;
+            available = !self.words.get(word_index).copied().unwrap_or(0);
+        }
+    }
+
+    pub(crate) fn next_clear_after(&self, index: usize, limit: usize) -> Option<usize> {
+        index
+            .checked_add(1)
+            .and_then(|start| self.first_clear_from(start, limit))
+    }
+
     #[inline]
     pub fn first_set(&self) -> Option<usize> {
         self.next_set_from(0)

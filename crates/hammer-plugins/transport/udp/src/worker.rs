@@ -5,12 +5,12 @@ use std::sync::{Arc, OnceLock, mpsc};
 
 use hammer_core::data_plane::{BufferFrame, Index as BufferIndex, NodeHandle, NodeId, NodeState};
 use hammer_infra::align::CacheLine;
-use hammer_infra::pool::{Index as PoolIndex, Pool};
+use hammer_infra::pool::Pool;
 use hammer_infra::thread_owned::{ThreadOwned, ThreadOwnedError};
 use hammer_runtime::app::SessionDgramHeader;
 use hammer_runtime::{
     DataPlaneRuntime, DataWorkerId, Engine, NodeRuntimeData, RuntimeError, RuntimeResult,
-    SessionConnectEndpoint, SessionConnectionId, SessionListenEndpoint, SessionListenerId,
+    SessionConnectEndpoint, SessionConnectionId, SessionListenEndpoint, SessionHandle,
     with_data_plane_runtime,
 };
 use hammer_service::session::node::{SessionQueueNode, SessionQueueOutput};
@@ -52,9 +52,8 @@ pub(crate) enum UdpTransportError {
     #[error("UDP connection pool capacity {capacity} is exhausted")]
     ConnectionCapacityExhausted { capacity: usize },
     #[error("UDP connection {index:?} is missing")]
-    ConnectionMissing { index: PoolIndex },
-    #[error("UDP listener {listener:?} is not registered")]
-    ListenerMissing { listener: SessionListenerId },
+    ConnectionMissing { index: u32 },
+    ListenerMissing { listener: SessionHandle },
     #[error("UDP endpoint {endpoint} is already in use")]
     EndpointInUse { endpoint: SocketAddr },
     #[error("UDP session {session_id:?} is missing")]
@@ -140,7 +139,7 @@ impl UdpMain {
     fn with_worker<R>(
         &self,
         runtime: &DataPlaneRuntime,
-        operation: impl FnOnce(&mut SessionWorker<PoolIndex>, &mut UdpWorker) -> RuntimeResult<R>,
+        operation: impl FnOnce(&mut SessionWorker<u32>, &mut UdpWorker) -> RuntimeResult<R>,
     ) -> RuntimeResult<R> {
         self.sessions.with_worker_mut(runtime, |sessions| {
             let worker = runtime
@@ -217,34 +216,34 @@ impl UdpWorker {
         }
     }
 
-    fn insert_connection(&mut self, connection: UdpConnection) -> RuntimeResult<PoolIndex> {
-        self.connections.insert(connection).ok_or_else(|| {
-            UdpTransportError::ConnectionCapacityExhausted {
+    fn insert_connection(&mut self, connection: UdpConnection) -> RuntimeResult<u32> {
+        self.connections
+            .insert(connection)
+            .ok_or(UdpTransportError::ConnectionCapacityExhausted {
                 capacity: self.connections.capacity(),
-            }
-            .into()
-        })
+            })
+            .map_err(RuntimeError::from)
     }
 
-    fn connection(&self, index: PoolIndex) -> Option<&UdpConnection> {
+    fn connection(&self, index: u32) -> Option<&UdpConnection> {
         self.connections.get(index)
     }
 
-    fn connection_mut(&mut self, index: PoolIndex) -> Option<&mut UdpConnection> {
+    fn connection_mut(&mut self, index: u32) -> Option<&mut UdpConnection> {
         self.connections.get_mut(index)
     }
 
-    fn remove_connection(&mut self, index: PoolIndex) -> Option<UdpConnection> {
+    fn remove_connection(&mut self, index: u32) -> Option<UdpConnection> {
         self.connections.remove(index)
     }
 
     fn accept_datagram(
         &mut self,
-        sessions: &mut SessionWorker<PoolIndex>,
+        sessions: &mut SessionWorker<u32>,
         listener: UdpListener,
         local: SocketAddr,
         remote: SocketAddr,
-    ) -> RuntimeResult<(PoolIndex, SessionId)> {
+    ) -> RuntimeResult<(u32, SessionId)> {
         let connection = UdpConnection::connected(self.worker, local, remote)
             .ok_or(UdpTransportError::InvalidConnection)?;
         let index = self.insert_connection(connection)?;
@@ -256,11 +255,10 @@ impl UdpWorker {
                     return Err(error);
                 }
             };
-        if !self
+        let connection = self
             .connection_mut(index)
-            .expect("new UDP connection remains installed")
-            .attach_session(session_id)
-        {
+            .ok_or(UdpTransportError::ConnectionMissing { index })?;
+        if !connection.attach_session(session_id) {
             self.rollback_accept(sessions, session_id, index, local, remote)?;
             return Err(UdpTransportError::InvalidConnection.into());
         }
@@ -269,7 +267,7 @@ impl UdpWorker {
             self.rollback_accept(sessions, session_id, index, local, remote)?;
             return Err(UdpTransportError::EndpointInUse { endpoint: local }.into());
         }
-        let rollback = |sessions: &mut SessionWorker<PoolIndex>,
+        let rollback = |sessions: &mut SessionWorker<u32>,
                         udp: &mut UdpWorker,
                         session_id,
                         index,
@@ -293,7 +291,7 @@ impl UdpWorker {
 
     fn active_connect(
         &mut self,
-        sessions: &mut SessionWorker<PoolIndex>,
+        sessions: &mut SessionWorker<u32>,
         connection: SessionConnectionId,
         local: SocketAddr,
         remote: SocketAddr,
@@ -316,11 +314,10 @@ impl UdpWorker {
                 return Err(error);
             }
         };
-        if !self
+        let connection = self
             .connection_mut(index)
-            .expect("new UDP connection remains installed")
-            .attach_session(session_id)
-        {
+            .ok_or(UdpTransportError::ConnectionMissing { index })?;
+        if !connection.attach_session(session_id) {
             self.rollback_accept(sessions, session_id, index, local, remote)?;
             return Err(UdpTransportError::InvalidConnection.into());
         }
@@ -346,9 +343,9 @@ impl UdpWorker {
 
     fn rollback_accept(
         &mut self,
-        sessions: &mut SessionWorker<PoolIndex>,
+        sessions: &mut SessionWorker<u32>,
         session_id: SessionId,
-        index: PoolIndex,
+        index: u32,
         local: SocketAddr,
         remote: SocketAddr,
     ) -> RuntimeResult<()> {
@@ -361,7 +358,7 @@ impl UdpWorker {
 
     fn deliver_datagram(
         &mut self,
-        sessions: &mut SessionWorker<PoolIndex>,
+        sessions: &mut SessionWorker<u32>,
         runtime: &DataPlaneRuntime,
         index: BufferIndex,
         local: SocketAddr,
@@ -457,7 +454,7 @@ impl UdpWorker {
 
     fn migration_request_is_current(
         &self,
-        sessions: &SessionWorker<PoolIndex>,
+        sessions: &SessionWorker<u32>,
         args: &SessionSwitchPoolArgs,
     ) -> bool {
         let Some(session_id) = sessions.session_id_from_handle(args.old_sh) else {
@@ -477,7 +474,7 @@ impl UdpWorker {
 
     fn rejected_migration_reply(
         &self,
-        sessions: &SessionWorker<PoolIndex>,
+        sessions: &SessionWorker<u32>,
         mut reply: SessionSwitchPoolReply,
     ) -> SessionSwitchPoolReply {
         let _ = sessions.cancel_thread_migration(reply.old_sh, reply.tuple);
@@ -489,7 +486,7 @@ impl UdpWorker {
 
     fn prepared_migration_reply(
         &self,
-        sessions: &SessionWorker<PoolIndex>,
+        sessions: &SessionWorker<u32>,
         args: SessionSwitchPoolArgs,
     ) -> Option<SessionSwitchPoolReply> {
         let session_id = sessions.session_id_from_handle(args.old_sh)?;
@@ -508,7 +505,7 @@ impl UdpWorker {
 
     fn publish_migration_reply(
         &mut self,
-        sessions: &SessionWorker<PoolIndex>,
+        sessions: &SessionWorker<u32>,
         runtime: &DataPlaneRuntime,
         reply: SessionSwitchPoolReply,
     ) {
@@ -519,7 +516,7 @@ impl UdpWorker {
 
     fn publish_migration_completion(
         &mut self,
-        sessions: &SessionWorker<PoolIndex>,
+        sessions: &SessionWorker<u32>,
         runtime: &DataPlaneRuntime,
         completion: SessionSwitchPoolCompletion,
     ) {
@@ -530,7 +527,7 @@ impl UdpWorker {
 
     fn publish_migration_closed(
         &mut self,
-        sessions: &SessionWorker<PoolIndex>,
+        sessions: &SessionWorker<u32>,
         runtime: &DataPlaneRuntime,
         closed: SessionSwitchPoolClosed,
     ) {
@@ -574,7 +571,7 @@ impl UdpWorker {
 
     fn process_migration_reply(
         &mut self,
-        sessions: &mut SessionWorker<PoolIndex>,
+        sessions: &mut SessionWorker<u32>,
         runtime: &DataPlaneRuntime,
         mut reply: SessionSwitchPoolReply,
     ) -> Result<(), SessionSwitchPoolReply> {
@@ -657,7 +654,7 @@ impl UdpWorker {
 
     fn process_migration_completion(
         &mut self,
-        sessions: &mut SessionWorker<PoolIndex>,
+        sessions: &mut SessionWorker<u32>,
         runtime: &DataPlaneRuntime,
         completion: SessionSwitchPoolCompletion,
     ) -> bool {
@@ -702,7 +699,7 @@ impl UdpWorker {
 
     fn process_migration_closed(
         &mut self,
-        sessions: &mut SessionWorker<PoolIndex>,
+        sessions: &mut SessionWorker<u32>,
         closed: SessionSwitchPoolClosed,
     ) -> bool {
         let Some(session_id) = sessions.session_id_from_handle(closed.new_sh) else {
@@ -734,7 +731,7 @@ impl UdpWorker {
 
     fn drain_migration_closed(
         &mut self,
-        sessions: &mut SessionWorker<PoolIndex>,
+        sessions: &mut SessionWorker<u32>,
         runtime: &DataPlaneRuntime,
     ) {
         while let Some(closed) = self.session_switch_pool_closed.pop_front() {
@@ -759,7 +756,7 @@ impl UdpWorker {
 
     fn drain_migration_shutdown_requests(
         &mut self,
-        sessions: &SessionWorker<PoolIndex>,
+        sessions: &SessionWorker<u32>,
         runtime: &DataPlaneRuntime,
     ) {
         while let Some(args) = sessions.pop_session_migrate_request() {
@@ -770,7 +767,7 @@ impl UdpWorker {
 
     fn drain_migration_shutdown_replies(
         &mut self,
-        sessions: &SessionWorker<PoolIndex>,
+        sessions: &SessionWorker<u32>,
         runtime: &DataPlaneRuntime,
     ) {
         while let Some(reply) = self.session_switch_pool_replies.pop_front() {
@@ -785,7 +782,7 @@ impl UdpWorker {
 
     fn drain_migration_shutdown(
         &mut self,
-        sessions: &mut SessionWorker<PoolIndex>,
+        sessions: &mut SessionWorker<u32>,
         runtime: &DataPlaneRuntime,
     ) {
         sessions.wait_session_migration_shutdown_phase();
@@ -805,7 +802,7 @@ impl UdpWorker {
 
     fn drain_migration_completions(
         &mut self,
-        sessions: &mut SessionWorker<PoolIndex>,
+        sessions: &mut SessionWorker<u32>,
         runtime: &DataPlaneRuntime,
     ) {
         let local_count = self.session_switch_pool_completions.len();
@@ -826,7 +823,7 @@ impl UdpWorker {
 
     fn drain_migration_replies(
         &mut self,
-        sessions: &mut SessionWorker<PoolIndex>,
+        sessions: &mut SessionWorker<u32>,
         runtime: &DataPlaneRuntime,
     ) {
         while let Some(reply) = self.session_switch_pool_replies.pop_front() {
@@ -845,7 +842,7 @@ impl UdpWorker {
 
     fn drain_migration_requests(
         &mut self,
-        sessions: &mut SessionWorker<PoolIndex>,
+        sessions: &mut SessionWorker<u32>,
         runtime: &DataPlaneRuntime,
     ) {
         while let Some(args) = sessions.pop_session_migrate_request() {
@@ -887,7 +884,7 @@ impl UdpWorker {
 }
 
 pub(crate) fn start_listen(
-    listener: SessionListenerId,
+    listener: SessionHandle,
     _: hammer_runtime::app::ApplicationId,
     _: Option<u64>,
     endpoint: SessionListenEndpoint,
@@ -937,7 +934,7 @@ fn find_udp_listener(listeners: &[UdpListener], local: SocketAddr) -> Option<Udp
     wildcard
 }
 
-pub(crate) fn stop_listen(listener: SessionListenerId) -> RuntimeResult<()> {
+pub(crate) fn stop_listen(listener: SessionHandle) -> RuntimeResult<()> {
     hammer_runtime::ensure_main_thread_with_barrier()?;
     let main = UDP_MAIN
         .get()
@@ -1067,7 +1064,7 @@ fn udp_worker_exit(engine: &mut Engine) -> RuntimeResult<()> {
 
 fn udp_session_queue_update_time(
     runtime: &DataPlaneRuntime,
-    _: &mut SessionWorker<PoolIndex>,
+    _: &mut SessionWorker<u32>,
     _: NodeRuntimeData,
     output_next: SessionQueueNext,
     now: std::time::Instant,
@@ -1084,7 +1081,7 @@ fn udp_session_queue_update_time(
 
 fn udp_session_queue_dispatch(
     runtime: &DataPlaneRuntime,
-    _: &mut SessionWorker<PoolIndex>,
+    _: &mut SessionWorker<u32>,
     _: NodeRuntimeData,
     output_next: SessionQueueNext,
     now: std::time::Instant,
@@ -1100,14 +1097,14 @@ fn udp_session_queue_dispatch(
     })
 }
 
-impl SessionTransport<PoolIndex> for UdpWorker {
+impl SessionTransport<u32> for UdpWorker {
     type Tx = TransportInternalTx;
 
     const ID: SessionTransportId = SessionTransportId::new(2);
 
     fn update_time(
         &mut self,
-        sessions: &mut SessionWorker<PoolIndex>,
+        sessions: &mut SessionWorker<u32>,
         runtime: &DataPlaneRuntime,
         _: SessionQueueNext,
         _: &mut BufferFrame,
@@ -1123,8 +1120,8 @@ impl SessionTransport<PoolIndex> for UdpWorker {
 
     fn disconnect(
         &mut self,
-        sessions: &mut SessionWorker<PoolIndex>,
-        index: PoolIndex,
+        sessions: &mut SessionWorker<u32>,
+        index: u32,
         _: &DataPlaneRuntime,
         _: SessionQueueNext,
         _: &mut BufferFrame,
@@ -1151,12 +1148,12 @@ impl SessionTransport<PoolIndex> for UdpWorker {
     }
 }
 
-impl TransportInternalTransport<PoolIndex> for UdpWorker {
+impl TransportInternalTransport<u32> for UdpWorker {
     fn internal_tx(
         &mut self,
-        sessions: &mut SessionWorker<PoolIndex>,
+        sessions: &mut SessionWorker<u32>,
         session_id: SessionId,
-        index: PoolIndex,
+        index: u32,
         runtime: &DataPlaneRuntime,
         output_next: SessionQueueNext,
         frame: &mut BufferFrame,
@@ -1230,7 +1227,7 @@ mod tests {
     use super::*;
 
     fn noop_start_listen(
-        _: SessionListenerId,
+        _: SessionHandle,
         _: hammer_runtime::app::ApplicationId,
         _: Option<u64>,
         _: SessionListenEndpoint,
@@ -1238,7 +1235,7 @@ mod tests {
         Ok(())
     }
 
-    fn noop_stop_listen(_: SessionListenerId) -> RuntimeResult<()> {
+    fn noop_stop_listen(_: SessionHandle) -> RuntimeResult<()> {
         Ok(())
     }
 
@@ -1262,7 +1259,7 @@ mod tests {
     }
 
     fn worker_state() -> (
-        SessionWorker<PoolIndex>,
+        SessionWorker<u32>,
         UdpWorker,
         Arc<ApplicationMain>,
         Arc<SessionMain>,
@@ -1271,7 +1268,7 @@ mod tests {
         let applications = ApplicationMain::new(1024);
         let main = Arc::new(SessionMain::new(1, Arc::clone(&applications)));
         let (server, publisher) = test_publisher();
-        let mut sessions = SessionWorker::<PoolIndex>::new(
+        let mut sessions = SessionWorker::<u32>::new(
             DataWorkerId::new(0),
             1,
             AppSessionConfig::default(),
@@ -1352,14 +1349,14 @@ mod tests {
         let local = "127.0.0.1:9000".parse().expect("local endpoint");
         let wildcard = UdpListener::new(
             "0.0.0.0:9000".parse().expect("wildcard endpoint"),
-            SessionListenerId::new(1, 1),
+            SessionHandle::new(1, 1),
             DataWorkerId::new(0),
         )
         .expect("wildcard listener");
-        let exact = UdpListener::new(local, SessionListenerId::new(2, 1), DataWorkerId::new(0))
+        let exact = UdpListener::new(local, SessionHandle::new(2, 1), DataWorkerId::new(0))
             .expect("exact listener");
         let found = find_udp_listener(&[wildcard, exact], local).expect("listener");
-        assert_eq!(found.session_listener(), SessionListenerId::new(2, 1));
+        assert_eq!(found.session_listener(), SessionHandle::new(2, 1));
     }
 
     #[test]
@@ -1477,7 +1474,7 @@ mod tests {
         let applications = ApplicationMain::new(1024);
         let main = Arc::new(SessionMain::new(2, Arc::clone(&applications)));
         let (_server, publisher) = test_publisher();
-        let mut sessions = SessionWorker::<PoolIndex>::new(
+        let mut sessions = SessionWorker::<u32>::new(
             DataWorkerId::new(0),
             2,
             AppSessionConfig::default(),
@@ -1524,7 +1521,7 @@ mod tests {
         let applications = ApplicationMain::new(1024);
         let main = Arc::new(SessionMain::new(2, Arc::clone(&applications)));
         let (_server, publisher) = test_publisher();
-        let mut sessions = SessionWorker::<PoolIndex>::new(
+        let mut sessions = SessionWorker::<u32>::new(
             DataWorkerId::new(0),
             2,
             AppSessionConfig::default(),
@@ -1589,7 +1586,7 @@ mod tests {
     -> Result<(), Box<dyn std::error::Error>> {
         let applications = ApplicationMain::new(1024);
         let main = Arc::new(SessionMain::new(2, Arc::clone(&applications)));
-        let mut sessions = SessionWorker::<PoolIndex>::new(
+        let mut sessions = SessionWorker::<u32>::new(
             DataWorkerId::new(0),
             2,
             AppSessionConfig::default(),
@@ -1642,7 +1639,7 @@ mod tests {
         let applications = ApplicationMain::new(1024);
         let main = Arc::new(SessionMain::new(2, Arc::clone(&applications)));
         let (_server, publisher) = test_publisher();
-        let mut sessions = SessionWorker::<PoolIndex>::new(
+        let mut sessions = SessionWorker::<u32>::new(
             DataWorkerId::new(0),
             2,
             AppSessionConfig::default(),
@@ -1796,7 +1793,7 @@ mod tests {
         let applications = ApplicationMain::new(1024);
         let main = Arc::new(SessionMain::new(2, Arc::clone(&applications)));
         let (_server, publisher) = test_publisher();
-        let mut sessions = SessionWorker::<PoolIndex>::new(
+        let mut sessions = SessionWorker::<u32>::new(
             DataWorkerId::new(0),
             2,
             AppSessionConfig::default(),
@@ -1840,7 +1837,7 @@ mod tests {
             DataPlaneRuntime::new(DataPlaneRuntimeConfig::default()).for_worker(2, 0)?;
         let mut frame = BufferFrame::with_capacity(8);
         let mut output = SessionQueueOutput::default();
-        <UdpWorker as SessionTransport<PoolIndex>>::update_time(
+        <UdpWorker as SessionTransport<u32>>::update_time(
             &mut udp,
             &mut sessions,
             &source_runtime,
@@ -1867,7 +1864,7 @@ mod tests {
     -> Result<(), Box<dyn std::error::Error>> {
         let applications = ApplicationMain::new(1024);
         let main = Arc::new(SessionMain::new(2, Arc::clone(&applications)));
-        let mut source_sessions = SessionWorker::<PoolIndex>::new(
+        let mut source_sessions = SessionWorker::<u32>::new(
             DataWorkerId::new(0),
             2,
             AppSessionConfig::default(),
@@ -1875,7 +1872,7 @@ mod tests {
             Arc::clone(&applications),
             None,
         )?;
-        let mut target_sessions = SessionWorker::<PoolIndex>::new(
+        let mut target_sessions = SessionWorker::<u32>::new(
             DataWorkerId::new(1),
             2,
             AppSessionConfig::default(),
@@ -1933,7 +1930,7 @@ mod tests {
             DataPlaneRuntime::new(DataPlaneRuntimeConfig::default()).for_worker(2, 0)?;
         let mut frame = BufferFrame::with_capacity(8);
         let mut output = SessionQueueOutput::default();
-        <UdpWorker as SessionTransport<PoolIndex>>::update_time(
+        <UdpWorker as SessionTransport<u32>>::update_time(
             &mut source_udp,
             &mut source_sessions,
             &source_runtime,
@@ -1942,7 +1939,7 @@ mod tests {
             &mut output,
             Instant::now(),
         )?;
-        <UdpWorker as SessionTransport<PoolIndex>>::update_time(
+        <UdpWorker as SessionTransport<u32>>::update_time(
             &mut target_udp,
             &mut target_sessions,
             &target_runtime,
@@ -1978,7 +1975,7 @@ mod tests {
     -> Result<(), Box<dyn std::error::Error>> {
         let applications = ApplicationMain::new(1024);
         let main = Arc::new(SessionMain::new(2, Arc::clone(&applications)));
-        let mut source_sessions = SessionWorker::<PoolIndex>::new(
+        let mut source_sessions = SessionWorker::<u32>::new(
             DataWorkerId::new(0),
             2,
             AppSessionConfig::default(),
@@ -1986,7 +1983,7 @@ mod tests {
             Arc::clone(&applications),
             None,
         )?;
-        let mut target_sessions = SessionWorker::<PoolIndex>::new(
+        let mut target_sessions = SessionWorker::<u32>::new(
             DataWorkerId::new(1),
             2,
             AppSessionConfig::default(),
@@ -2044,7 +2041,7 @@ mod tests {
             DataPlaneRuntime::new(DataPlaneRuntimeConfig::default()).for_worker(2, 0)?;
         let mut frame = BufferFrame::with_capacity(8);
         let mut output = SessionQueueOutput::default();
-        <UdpWorker as SessionTransport<PoolIndex>>::update_time(
+        <UdpWorker as SessionTransport<u32>>::update_time(
             &mut source_udp,
             &mut source_sessions,
             &source_runtime,
@@ -2053,7 +2050,7 @@ mod tests {
             &mut output,
             Instant::now(),
         )?;
-        <UdpWorker as SessionTransport<PoolIndex>>::update_time(
+        <UdpWorker as SessionTransport<u32>>::update_time(
             &mut target_udp,
             &mut target_sessions,
             &target_runtime,
@@ -2094,7 +2091,7 @@ mod tests {
                 .is_none()
         );
 
-        <UdpWorker as SessionTransport<PoolIndex>>::update_time(
+        <UdpWorker as SessionTransport<u32>>::update_time(
             &mut source_udp,
             &mut source_sessions,
             &source_runtime,
@@ -2110,7 +2107,7 @@ mod tests {
             main.push_session_switch_pool_closed(&target_runtime, closed)
                 .is_ok()
         );
-        <UdpWorker as SessionTransport<PoolIndex>>::update_time(
+        <UdpWorker as SessionTransport<u32>>::update_time(
             &mut target_udp,
             &mut target_sessions,
             &target_runtime,
@@ -2135,7 +2132,7 @@ mod tests {
             )
             .is_ok()
         );
-        <UdpWorker as SessionTransport<PoolIndex>>::update_time(
+        <UdpWorker as SessionTransport<u32>>::update_time(
             &mut target_udp,
             &mut target_sessions,
             &target_runtime,
@@ -2154,7 +2151,7 @@ mod tests {
     -> Result<(), Box<dyn std::error::Error>> {
         let applications = ApplicationMain::new(1024);
         let main = Arc::new(SessionMain::new(2, Arc::clone(&applications)));
-        let mut sessions = SessionWorker::<PoolIndex>::new(
+        let mut sessions = SessionWorker::<u32>::new(
             DataWorkerId::new(0),
             2,
             AppSessionConfig::default(),
@@ -2248,7 +2245,7 @@ mod tests {
     {
         let applications = ApplicationMain::new(1024);
         let main = Arc::new(SessionMain::new(2, Arc::clone(&applications)));
-        let mut source_sessions = SessionWorker::<PoolIndex>::new(
+        let mut source_sessions = SessionWorker::<u32>::new(
             DataWorkerId::new(0),
             2,
             AppSessionConfig::default(),
@@ -2373,7 +2370,7 @@ mod tests {
             .expect("worker runtime");
         let mut frame = BufferFrame::with_capacity(8);
         let mut output = SessionQueueOutput::default();
-        <UdpWorker as SessionTransport<PoolIndex>>::disconnect(
+        <UdpWorker as SessionTransport<u32>>::disconnect(
             &mut udp,
             &mut sessions,
             index,

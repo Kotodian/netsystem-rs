@@ -1,13 +1,11 @@
-use hammer_infra::pool::Index as PoolIndex;
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 #[repr(transparent)]
-pub struct SessionId(PoolIndex);
+pub struct SessionId(u64);
 
 impl SessionId {
     #[inline(always)]
     pub const fn from_raw(value: u64) -> Self {
-        Self(PoolIndex::new(value as u32, (value >> 32) as u32))
+        Self(value)
     }
 
     #[inline(always)]
@@ -16,19 +14,19 @@ impl SessionId {
     }
 
     #[inline(always)]
-    pub const fn pool_index(self) -> PoolIndex {
-        self.0
+    pub const fn pool_index(self) -> u32 {
+        self.0 as u32
     }
 
     #[inline(always)]
     pub const fn get(self) -> u64 {
-        ((self.0.generation() as u64) << 32) | self.0.slot() as u64
+        self.0
     }
 }
 
-impl From<PoolIndex> for SessionId {
+impl From<u32> for SessionId {
     #[inline(always)]
-    fn from(index: PoolIndex) -> Self {
-        Self(index)
+    fn from(index: u32) -> Self {
+        Self(u64::from(index))
     }
 }

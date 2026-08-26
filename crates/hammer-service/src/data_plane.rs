@@ -1,7 +1,8 @@
 use hammer_core::data_plane::{Buffer, BufferFrame, Index, NodeId, NodeRegistration};
 use hammer_runtime::RuntimeResult;
 use hammer_runtime::{
-    add_packet_trace, DataPlaneRuntime, InternalNode, Node, NodeErrorCode, NodeProcessFn, NodeResult,
+    DataPlaneRuntime, InternalNode, Node, NodeErrorCode, NodeProcessFn, NodeResult,
+    add_packet_trace,
 };
 
 pub use crate::feature_arc::{

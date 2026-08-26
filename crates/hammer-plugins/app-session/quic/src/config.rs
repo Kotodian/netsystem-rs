@@ -2,7 +2,7 @@ use std::cell::UnsafeCell;
 use std::sync::Arc;
 use std::thread::{self, ThreadId};
 
-use hammer_infra::pool::{Index, Pool};
+use hammer_infra::pool::Pool;
 use hammer_runtime::Engine;
 use hammer_runtime::app::{AppSessionConfig, ApplicationId};
 use prost::Message;
@@ -19,7 +19,7 @@ pub(crate) const MAX_CONNECTION_TIMEOUT: u32 = 2_048 * 2_048 - 1;
 const DEFAULT_MAX_STREAMS_BIDI: u32 = 100;
 const DEFAULT_MAX_STREAMS_UNI: u32 = 100;
 
-/// Generation-checked identity for one QUIC client or server configuration.
+/// Domain identity for one QUIC client or server configuration.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 #[repr(transparent)]
 pub struct ConfigId(u64);
@@ -36,13 +36,8 @@ impl ConfigId {
     }
 
     #[inline]
-    const fn slot(self) -> u32 {
+    const fn index(self) -> u32 {
         self.0 as u32
-    }
-
-    #[inline]
-    const fn generation(self) -> u32 {
-        (self.0 >> 32) as u32
     }
 }
 
@@ -256,9 +251,7 @@ impl QuicConfigRegistry {
     ) -> Result<(), ConfigError> {
         self.with_state_mut(|state| {
             config_entry(state, application, config)?;
-            state
-                .remove(config_index(config))
-                .expect("validated QUIC configuration remains present until removal");
+            state.remove(config_index(config));
             Ok(())
         })?
     }
@@ -269,15 +262,10 @@ impl QuicConfigRegistry {
         config: ConnectionConfig,
     ) -> Result<ConfigId, ConfigError> {
         self.with_state_mut(|state| {
-            state
-                .insert(ConfigEntry {
-                    application,
-                    config,
-                })
-                .map(config_id)
-                .ok_or(ConfigError::CapacityExhausted {
-                    capacity: state.capacity(),
-                })
+            config_id(state.insert(ConfigEntry {
+                application,
+                config,
+            }))
         })?
     }
 
@@ -610,13 +598,13 @@ fn validate_alpn(protocols: &[Vec<u8>]) -> Result<(), ConfigError> {
 }
 
 #[inline]
-fn config_id(index: Index) -> ConfigId {
-    ConfigId((index.slot() as u64) | ((index.generation() as u64) << 32))
+fn config_id(index: u32) -> ConfigId {
+    ConfigId(u64::from(index))
 }
 
 #[inline]
-fn config_index(config: ConfigId) -> Index {
-    Index::new(config.slot(), config.generation())
+fn config_index(config: ConfigId) -> u32 {
+    config.index()
 }
 
 fn config_entry(
@@ -624,9 +612,11 @@ fn config_entry(
     application: ApplicationId,
     config: ConfigId,
 ) -> Result<&ConfigEntry, ConfigError> {
-    let entry = configs
-        .get(config_index(config))
-        .ok_or(ConfigError::Missing { config })?;
+    let index = config_index(config);
+    if !configs.contains_key(index) {
+        return Err(ConfigError::Missing { config });
+    }
+    let entry = configs.get(index);
     if entry.application != application {
         return Err(ConfigError::NotOwned {
             application,
@@ -638,8 +628,8 @@ fn config_entry(
 
 #[derive(Clone, PartialEq, Message)]
 pub struct RegisterServerConfigRequest {
-    #[prost(uint64, tag = "1")]
-    pub application_id: u64,
+    #[prost(uint32, tag = "1")]
+    pub application_id: u32,
     #[prost(bytes = "vec", repeated, tag = "2")]
     pub certificate_der: Vec<Vec<u8>>,
     #[prost(bytes = "vec", tag = "3")]
@@ -658,8 +648,8 @@ pub struct RegisterServerConfigRequest {
 
 #[derive(Clone, PartialEq, Message)]
 pub struct RegisterClientConfigRequest {
-    #[prost(uint64, tag = "1")]
-    pub application_id: u64,
+    #[prost(uint32, tag = "1")]
+    pub application_id: u32,
     #[prost(bytes = "vec", repeated, tag = "2")]
     pub trust_anchor_der: Vec<Vec<u8>>,
     #[prost(bytes = "vec", repeated, tag = "3")]
@@ -694,8 +684,8 @@ pub struct RegisterClientConfigReply {
 
 #[derive(Clone, PartialEq, Message)]
 pub struct RemoveConfigRequest {
-    #[prost(uint64, tag = "1")]
-    pub application_id: u64,
+    #[prost(uint32, tag = "1")]
+    pub application_id: u32,
     #[prost(uint64, tag = "2")]
     pub config_id: u64,
 }
@@ -807,7 +797,7 @@ fn api_transport(
     )
 }
 
-fn binary_application(application: u64) -> Result<ApplicationId, QuicApiStatus> {
+fn binary_application(application: u32) -> Result<ApplicationId, QuicApiStatus> {
     let application = ApplicationId::from_raw(application);
     let Some(attached) = Engine::with_current(|engine| {
         let applications = engine

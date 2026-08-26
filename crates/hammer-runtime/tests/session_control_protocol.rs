@@ -112,7 +112,7 @@ fn connect_round_trips_through_control_queue() {
         TransportProtocol::Quic,
         SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 4433),
         Some(SocketAddr::new(IpAddr::V6(Ipv6Addr::LOCALHOST), 0)),
-        ApplicationId::new(9, 2),
+        ApplicationId::new(9),
         Some(77),
     );
     producer.enqueue_control(&message).expect("enqueue");
@@ -135,7 +135,7 @@ fn connect_stream_selects_connect_stream_event_and_pins_parent() {
         TransportProtocol::Quic,
         SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 4433),
         None,
-        ApplicationId::new(9, 2),
+        ApplicationId::new(9),
         parent,
         SessionFlags::UNIDIRECTIONAL,
         Some(77),
@@ -158,7 +158,7 @@ fn ordinary_connect_carries_no_parent_handle() {
         TransportProtocol::Tcp,
         SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 8080),
         None,
-        ApplicationId::new(9, 2),
+        ApplicationId::new(9),
         None,
     );
 
@@ -275,7 +275,7 @@ fn listen_round_trip_preserves_endpoint_transport_and_flags() {
         context: 51,
         transport: TransportProtocol::Quic,
         endpoint,
-        application: ApplicationId::new(9, 2),
+        application: ApplicationId::new(9),
         app: None,
         flags: SessionFlags::UNIDIRECTIONAL,
         opaque: Some(9),

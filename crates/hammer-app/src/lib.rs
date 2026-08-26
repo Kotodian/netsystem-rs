@@ -11,4 +11,4 @@ pub use hammer_runtime::app::{
     AppSession, AppSessionConfig, AppSessionError, ApplicationId, ApplicationListenerId,
     SessionAppId, SessionHandle,
 };
-pub use hammer_runtime::{DataWorkerId, SessionListenEndpoint, SessionListenerId};
+pub use hammer_runtime::{DataWorkerId, SessionListenEndpoint};

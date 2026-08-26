@@ -3,37 +3,6 @@ use std::net::SocketAddr;
 use crate::app::{ApplicationId, SessionFlags, SessionHandle};
 use crate::{DataWorkerId, RuntimeResult};
 
-/// Opaque Session-layer listener identity supplied to one selected transport.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Deserialize, serde::Serialize)]
-#[repr(transparent)]
-pub struct SessionListenerId(u64);
-
-impl SessionListenerId {
-    #[inline]
-    pub const fn new(slot: u32, generation: u32) -> Self {
-        Self((slot as u64) | ((generation as u64) << 32))
-    }
-
-    #[inline]
-    pub const fn from_raw(raw: u64) -> Self {
-        Self(raw)
-    }
-
-    #[inline]
-    pub const fn slot(self) -> u32 {
-        self.0 as u32
-    }
-
-    #[inline]
-    pub const fn generation(self) -> u32 {
-        (self.0 >> 32) as u32
-    }
-
-    #[inline]
-    pub const fn raw(self) -> u64 {
-        self.0
-    }
-}
 
 /// Opaque Session-layer identity for one active-open request.
 ///
@@ -182,12 +151,12 @@ pub enum SessionStreamDirection {
 }
 
 pub type SessionTransportStartListen = fn(
-    SessionListenerId,
+    SessionHandle,
     crate::app::ApplicationId,
     Option<u64>,
     SessionListenEndpoint,
 ) -> RuntimeResult<()>;
-pub type SessionTransportStopListen = fn(SessionListenerId) -> RuntimeResult<()>;
+pub type SessionTransportStopListen = fn(SessionHandle) -> RuntimeResult<()>;
 pub type SessionTransportConnect = fn(SessionConnectEndpoint) -> RuntimeResult<()>;
 pub type SessionTransportConnectStream = fn(SessionConnectEndpoint) -> RuntimeResult<()>;
 

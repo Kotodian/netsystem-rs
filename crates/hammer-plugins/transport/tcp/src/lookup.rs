@@ -7,8 +7,8 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use crate::{TcpCapabilities, TcpConnectionId, TcpFastOpenCookie, TcpTimestampOption};
 use crossbeam_utils::CachePadded;
 use hammer_infra::bihash::{Bihash, BihashKey, FREE_U64};
-use hammer_infra::pool::{Index as PoolIndex, Pool};
-use hammer_runtime::{DataWorkerId, SessionListenerId};
+use hammer_infra::pool::Pool;
+use hammer_runtime::{DataWorkerId, SessionHandle};
 
 use crate::{TcpConnection, TcpInputNext, TcpState, TransportConnectionKey};
 use hammer_service::session::SessionId;
@@ -151,7 +151,7 @@ impl TcpPendingRouteEntry {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct TcpLookupValue {
     pub id: TcpLookupId,
-    pub session_listener: SessionListenerId,
+    pub session_listener: hammer_runtime::app::SessionHandle,
     pub owner_worker: DataWorkerId,
     pub capabilities: TcpCapabilities,
 }
@@ -201,15 +201,15 @@ const TCP_LISTENER_PENDING_BUCKET_COUNT: usize =
 const TCP_LISTENER_PENDING_CAPACITY: usize = 1024;
 
 #[inline(always)]
-fn pool_index_to_bihash_value(index: PoolIndex) -> u64 {
-    let value = (u64::from(index.generation()) << 32) | u64::from(index.slot());
+fn pool_index_to_bihash_value(index: u32) -> u64 {
+    let value = u64::from(index);
     debug_assert_ne!(value, FREE_U64);
     value
 }
 
 #[inline(always)]
-fn pool_index_from_bihash_value(value: u64) -> PoolIndex {
-    PoolIndex::new(value as u32, (value >> 32) as u32)
+fn pool_index_from_bihash_value(value: u64) -> u32 {
+    value as u32
 }
 
 struct TcpListenerPendingTable {
@@ -217,7 +217,7 @@ struct TcpListenerPendingTable {
     tuple_index_v4: Bihash<TransportConnectionKey<Ipv4Addr>, 3>,
     tuple_index_v6: Bihash<TransportConnectionKey<Ipv6Addr>, 1>,
     listener_counts: Bihash<u32, 5>,
-    epoch_buckets: [Vec<PoolIndex>; TCP_LISTENER_PENDING_BUCKET_COUNT],
+    epoch_buckets: [Vec<u32>; TCP_LISTENER_PENDING_BUCKET_COUNT],
     bucket_epochs: [u32; TCP_LISTENER_PENDING_BUCKET_COUNT],
     pruned_epoch: Option<u32>,
 }
@@ -275,7 +275,7 @@ impl TcpListenerPendingTable {
         if used >= limit {
             return false;
         }
-        let Some(index) = self.entries.insert(TcpListenerPendingEntry {
+        let Ok(index) = self.entries.insert(TcpListenerPendingEntry {
             listener_id,
             local,
             remote,
@@ -412,7 +412,7 @@ impl TcpListenerPendingTable {
     }
 
     #[inline]
-    fn push_epoch_bucket(&mut self, epoch: u32, index: PoolIndex) {
+    fn push_epoch_bucket(&mut self, epoch: u32, index: u32) {
         let bucket = epoch as usize % TCP_LISTENER_PENDING_BUCKET_COUNT;
         if self.bucket_epochs[bucket] != epoch {
             self.prune_bucket(bucket);
@@ -423,7 +423,7 @@ impl TcpListenerPendingTable {
     }
 
     #[inline]
-    fn remove_index(&mut self, index: PoolIndex, listener_id: TcpLookupId) {
+    fn remove_index(&mut self, index: u32, listener_id: TcpLookupId) {
         if let Some(entry) = self.entries.get(index).copied() {
             self.remove_tuple_index(entry.local, entry.remote);
         }
@@ -456,7 +456,7 @@ impl TcpListenerPendingTable {
     }
 
     #[inline]
-    fn lookup_tuple_index(&self, local: SocketAddr, remote: SocketAddr) -> Option<PoolIndex> {
+    fn lookup_tuple_index(&self, local: SocketAddr, remote: SocketAddr) -> Option<u32> {
         match (local, remote) {
             (SocketAddr::V4(local), SocketAddr::V4(remote)) => self
                 .tuple_index_v4
@@ -483,12 +483,7 @@ impl TcpListenerPendingTable {
     }
 
     #[inline]
-    fn insert_tuple_index(
-        &mut self,
-        local: SocketAddr,
-        remote: SocketAddr,
-        index: PoolIndex,
-    ) -> bool {
+    fn insert_tuple_index(&mut self, local: SocketAddr, remote: SocketAddr, index: u32) -> bool {
         let value = pool_index_to_bihash_value(index);
         match (local, remote) {
             (SocketAddr::V4(local), SocketAddr::V4(remote)) => {
@@ -875,7 +870,7 @@ impl TcpConnectionRouteIndex {
     }
 
     #[inline]
-    fn index_entry(&mut self, entry_index: PoolIndex, entry: TcpConnectionRouteEntry) {
+    fn index_entry(&mut self, entry_index: u32, entry: TcpConnectionRouteEntry) {
         self.session_slots.insert(
             entry.session_id.get(),
             pool_index_to_bihash_value(entry_index),
@@ -894,7 +889,7 @@ impl TcpConnectionRouteIndex {
     }
 
     #[inline]
-    fn unindex_entry(&mut self, entry_index: PoolIndex, entry: TcpConnectionRouteEntry) {
+    fn unindex_entry(&mut self, entry_index: u32, entry: TcpConnectionRouteEntry) {
         let value = pool_index_to_bihash_value(entry_index);
         if self.session_slots.lookup(&entry.session_id.get()) == Some(value) {
             self.session_slots.remove(&entry.session_id.get());
@@ -1072,7 +1067,7 @@ impl TcpPendingRouteIndex {
     }
 
     #[inline]
-    fn index_entry(&mut self, entry_index: PoolIndex, entry: TcpPendingRouteEntry) {
+    fn index_entry(&mut self, entry_index: u32, entry: TcpPendingRouteEntry) {
         self.session_slots.insert(
             entry.session_id.get(),
             pool_index_to_bihash_value(entry_index),
@@ -1087,7 +1082,7 @@ impl TcpPendingRouteIndex {
     }
 
     #[inline]
-    fn unindex_entry(&mut self, entry_index: PoolIndex, entry: TcpPendingRouteEntry) {
+    fn unindex_entry(&mut self, entry_index: u32, entry: TcpPendingRouteEntry) {
         let value = pool_index_to_bihash_value(entry_index);
         if self.session_slots.lookup(&entry.session_id.get()) == Some(value) {
             self.session_slots.remove(&entry.session_id.get());
@@ -1287,7 +1282,7 @@ impl TcpLookupState {
         key: A::Key,
         id: TcpLookupId,
         capabilities: TcpCapabilities,
-        session_listener: SessionListenerId,
+        session_listener: hammer_runtime::app::SessionHandle,
     ) where
         TcpLookupSnapshot: TcpListenerLookupAccess<A>,
     {
@@ -1839,7 +1834,7 @@ impl TcpLookupState {
         &self,
         id: TcpLookupId,
         capabilities: TcpCapabilities,
-        session_listener: SessionListenerId,
+        session_listener: hammer_runtime::app::SessionHandle,
     ) -> TcpLookupValue {
         TcpLookupValue {
             id,
@@ -2047,8 +2042,7 @@ mod tests {
     };
     use crate::{TcpCapabilities, TcpFastOpenCookie};
     use hammer_infra::bihash::Bihash;
-    use hammer_infra::pool::Index as PoolIndex;
-    use hammer_runtime::{DataWorkerId, SessionListenerId};
+    use hammer_runtime::{DataWorkerId, SessionHandle};
     use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 
     use hammer_service::session::SessionId;
@@ -2076,7 +2070,7 @@ mod tests {
 
     #[test]
     fn pool_index_bihash_value_round_trip() {
-        let index = PoolIndex::new(17, 23);
+        let index = 17u32;
         let value = pool_index_to_bihash_value(index);
 
         assert_eq!(pool_index_from_bihash_value(value), index);
@@ -2096,8 +2090,8 @@ mod tests {
     fn tcp_connection_route_index_bihash_keeps_v4_and_v6_routes() {
         let mut index = TcpConnectionRouteIndex::empty();
         let owner = DataWorkerId::new(0);
-        let v4_session = SessionId::from(PoolIndex::new(1, 1));
-        let v6_session = SessionId::from(PoolIndex::new(2, 1));
+        let v4_session = SessionId::from(1u32);
+        let v6_session = SessionId::from(2u32);
         let v4_local = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)), 1000);
         let v4_remote = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 2)), 2000);
         let v6_local = SocketAddr::new(IpAddr::V6(Ipv6Addr::LOCALHOST), 1001);
@@ -2135,7 +2129,7 @@ mod tests {
         let key = TcpV4ListenerKey::new(0, Ipv4Addr::new(127, 0, 0, 1), 7300);
         let value = TcpLookupValue {
             id: 7,
-            session_listener: SessionListenerId::new(7, 3),
+            session_listener: SessionHandle::new(7, 3),
             owner_worker: DataWorkerId::new(2),
             capabilities: TcpCapabilities {
                 max_segment_size: Some(1200),

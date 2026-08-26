@@ -5,7 +5,7 @@ use hammer_plugin_tcp::lookup::{
     TcpIpv4ListenerAddress, TcpIpv6ListenerAddress, TcpListenerLookupAccess, TcpLookupSnapshot,
     TcpLookupValue, TcpV4ListenerKey, TcpV6ListenerKey,
 };
-use hammer_runtime::{DataWorkerId, SessionListenerId};
+use hammer_runtime::{DataWorkerId, SessionHandle};
 
 #[test]
 fn tcp_lookup_returns_owner_worker_for_ipv4_listener() {
@@ -18,7 +18,7 @@ fn tcp_lookup_returns_owner_worker_for_ipv4_listener() {
         listener_key,
         TcpLookupValue {
             id: 10,
-            session_listener: SessionListenerId::new(10, 1),
+            session_listener: SessionHandle::new(10, 1),
             owner_worker: DataWorkerId::new(3),
             capabilities: TcpCapabilities::default(),
         },
@@ -42,7 +42,7 @@ fn tcp_lookup_returns_owner_worker_for_ipv6_listener() {
         listener_key,
         TcpLookupValue {
             id: 101,
-            session_listener: SessionListenerId::new(101, 1),
+            session_listener: SessionHandle::new(101, 1),
             owner_worker: DataWorkerId::new(11),
             capabilities: TcpCapabilities::default(),
         },
@@ -69,7 +69,7 @@ fn tcp_lookup_listener_table_grows_beyond_initial_listener_count() {
                 TcpV4ListenerKey::new(0, Ipv4Addr::new(192, 0, 2, 10), 10_000 + id as u16),
                 TcpLookupValue {
                     id,
-                    session_listener: SessionListenerId::new(id, 1),
+                    session_listener: SessionHandle::new(id, 1),
                     owner_worker: DataWorkerId::new(id),
                     capabilities: TcpCapabilities::default(),
                 },

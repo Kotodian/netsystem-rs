@@ -139,8 +139,7 @@ fn tcp_syn_sent_index(
     let (keep_current, control_segment) = main.with_worker(runtime, |sessions, tcp| {
         let mut keep_current = true;
         let session_id = read_session_id(runtime, index)?.ok_or_else(|| {
-            let _ =
-                runtime.record_current_node_error(TcpNodeError::SynSentSessionRouteMissing);
+            let _ = runtime.record_current_node_error(TcpNodeError::SynSentSessionRouteMissing);
             TcpNodeError::SynSentSessionRouteMissing
         })?;
         let (_, connection_index) = sessions
@@ -156,8 +155,7 @@ fn tcp_syn_sent_index(
                 .pending_open_capabilities(session_id)
                 .unwrap_or_default();
             let connection = connections.get_mut(connection_index).ok_or_else(|| {
-                let _ =
-                    runtime.record_current_node_error(TcpNodeError::SynSentSessionMissing);
+                let _ = runtime.record_current_node_error(TcpNodeError::SynSentSessionMissing);
                 TcpNodeError::SynSentSessionMissing
             })?;
             let previous_snd_una = connection.snd_una();

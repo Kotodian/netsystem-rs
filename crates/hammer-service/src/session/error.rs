@@ -1,7 +1,7 @@
 use hammer_core::data_plane::NodeId;
 use hammer_infra::fifo::FifoError;
 use hammer_runtime::app::{ApplicationId, SessionControlError, SessionHandle};
-use hammer_runtime::{DataWorkerId, RuntimeError, SessionListenerId};
+use hammer_runtime::{DataWorkerId, RuntimeError};
 use thiserror::Error;
 
 use super::SessionId;
@@ -93,8 +93,6 @@ pub use hammer_runtime::app::SessionConnectError;
 #[hammer_component_macros::runtime_error(subsystem = "session")]
 #[derive(Debug, Error)]
 pub enum SessionError {
-    #[error("session pool capacity {capacity} is exhausted")]
-    CapacityExhausted { capacity: usize },
     #[error("session {session_id:?} is not in the session pool")]
     SessionMissing { session_id: SessionId },
     #[error("session {lower:?} already has an upper Session attached")]
@@ -161,9 +159,7 @@ pub enum SessionError {
     #[error("Session has no data workers configured")]
     NoDataWorkers,
     #[error("Session listener {listener:?} is not registered")]
-    ListenerMissing { listener: SessionListenerId },
-    #[error("Session listener capacity {capacity} is exhausted")]
-    ListenerCapacityExhausted { capacity: usize },
+    ListenerMissing { listener: SessionHandle },
     #[error("Session listener control is owned by another thread")]
     ListenerControlWrongThread,
     #[error("Session transport `{transport}` does not register listener operations")]
@@ -206,10 +202,8 @@ pub enum SessionError {
 impl From<SessionError> for SessionControlError {
     fn from(error: SessionError) -> Self {
         match error {
-            SessionError::CapacityExhausted { .. } => Self::CapacityExhausted,
             SessionError::ListenerMainMissing => Self::SessionMainUnavailable,
             SessionError::ListenerMissing { .. } => Self::ListenerMissing,
-            SessionError::ListenerCapacityExhausted { .. } => Self::ListenerCapacityExhausted,
             SessionError::ListenerControlWrongThread => Self::ApplicationControlWrongThread,
             SessionError::TransportListenUnsupported { .. } => Self::TransportListenUnsupported,
             SessionError::TransportConnectUnsupported { .. } => Self::TransportConnectUnsupported,

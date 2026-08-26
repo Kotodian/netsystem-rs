@@ -3,7 +3,7 @@ use std::io::{self, BufRead, Read, Write};
 use std::os::fd::RawFd;
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 
-use crate::pool::{Index as PoolIndex, Pool};
+use crate::pool::Pool;
 use crate::rbtree::RbTree;
 use crate::segment::Segment;
 
@@ -56,8 +56,6 @@ pub enum FifoError {
     OutOfOrderOffsetOverflow { offset: u32, length: u32 },
     #[error("out-of-order FIFO end offset {end_offset} exceeds available capacity {available}")]
     OutOfOrderCapacityExceeded { end_offset: u32, available: usize },
-    #[error("out-of-order FIFO segment storage exhausted at {entries} entries")]
-    OutOfOrderStorageExhausted { entries: usize },
 }
 
 pub struct OooResult {
@@ -75,7 +73,7 @@ struct OooSegment {
 struct OooBookkeeping {
     base: u32,
     entries: Pool<OooSegment>,
-    index: RbTree<u32, PoolIndex>,
+    index: RbTree<u32, u32>,
 }
 
 #[derive(Clone, Copy)]
@@ -99,41 +97,9 @@ pub struct FifoWriteReservation<'a> {
 
 impl OooBookkeeping {
     fn remove_ooo_entry(&mut self, offset: u32) -> Option<OooSegment> {
-        let idx = self.index.remove(&offset)?;
-        self.entries.remove(idx)
-    }
-
-    /// Grows segment storage before an enqueue can exhaust it, mirroring VPP
-    /// `svm_fifo` whose ooo segment pool grows on demand (`pool_get`). Both
-    /// containers are rebuilt, so callers must not hold pool indices across
-    /// this call.
-    fn ensure_capacity(&mut self, needed: usize) -> Result<(), FifoError> {
-        if self.entries.capacity() >= needed && self.index.capacity() >= needed {
-            return Ok(());
-        }
-        let new_capacity = self
-            .entries
-            .capacity()
-            .saturating_mul(2)
-            .max(needed)
-            .next_power_of_two();
-        let mut entries = Pool::with_capacity(new_capacity);
-        let mut index = RbTree::with_capacity(new_capacity);
-        while let Some((&offset, &idx)) = self.index.first() {
-            self.index.remove(&offset);
-            let Some(segment) = self.entries.remove(idx) else {
-                continue;
-            };
-            let Some(new_idx) = entries.insert(segment) else {
-                return Err(FifoError::OutOfOrderStorageExhausted {
-                    entries: entries.capacity(),
-                });
-            };
-            index.insert(offset, new_idx);
-        }
-        self.entries = entries;
-        self.index = index;
-        Ok(())
+        self.index
+            .remove(&offset)
+            .and_then(|index| self.entries.remove(index))
     }
 }
 
@@ -365,7 +331,10 @@ impl Write for &Fifo {
         let mut reservation = match self.reserve_write(requested) {
             Ok(reservation) => reservation,
             Err(FifoError::ReservationTooLong { max_len, .. }) => {
-                self.reserve_write(max_len).map_err(io::Error::other)?
+                match self.reserve_write(max_len) {
+                    Ok(reservation) => reservation,
+                    Err(error) => return Err(io::Error::other(error)),
+                }
             }
             Err(error) => return Err(io::Error::other(error)),
         };
@@ -374,7 +343,10 @@ impl Write for &Fifo {
         let first_len = first.len();
         first.copy_from_slice(&buf[..first_len]);
         second.copy_from_slice(&buf[first_len..written]);
-        reservation.commit(written).map_err(io::Error::other)
+        match reservation.commit(written) {
+            Ok(written) => Ok(written),
+            Err(error) => Err(io::Error::other(error)),
+        }
     }
 
     fn flush(&mut self) -> io::Result<()> {
@@ -1265,10 +1237,8 @@ impl Fifo {
 
 impl Fifo {
     pub fn enable_ooo(&mut self) {
-        // VPP's `svm_fifo` starts with no configured OOO segment limit and
-        // grows `ooo_segments` through `pool_get` as segments arrive. Hammer's
-        // fixed-capacity Pool is rebuilt on demand by `ensure_capacity`, so
-        // this is only the first slab size, not a session policy.
+        // VPP starts with no configured OOO segment limit and grows its
+        // `ooo_segments` pool through `pool_get` as segments arrive.
         const INITIAL_OOO_SEGMENTS: usize = 4;
         *self.ooo.get_mut() = Some(Box::new(OooBookkeeping {
             base: 0,
@@ -1280,12 +1250,13 @@ impl Fifo {
     pub fn enqueue_ooo(&self, offset: u32, src: &[u8]) -> Result<OooResult, FifoError> {
         let ooo = unsafe { &mut *self.ooo.get() };
         let bk = ooo.as_mut().ok_or(FifoError::OutOfOrderDisabled)?;
-        // One call nets at most one new segment (the split site removes before
-        // inserting); +2 keeps a slot of headroom in both containers.
-        bk.ensure_capacity(bk.entries.len().saturating_add(2))?;
 
-        let total_len = u32::try_from(src.len())
-            .map_err(|_| FifoError::OutOfOrderLengthOutOfRange { length: src.len() })?;
+        let total_len = match u32::try_from(src.len()) {
+            Ok(length) => length,
+            Err(_) => {
+                return Err(FifoError::OutOfOrderLengthOutOfRange { length: src.len() });
+            }
+        };
         let end_offset =
             offset
                 .checked_add(total_len)
@@ -1324,14 +1295,11 @@ impl Fifo {
         let mut retained_end = seg_end_full;
 
         // Predecessor check
-        let pred_info = bk
-            .index
-            .predecessor(&seg_start)
-            .and_then(|(_, &idx)| bk.entries.get(idx))
-            .map(|s| {
-                let end = s.offset.wrapping_add(s.len);
-                (s.offset, end, end >= seg_end_full)
-            });
+        let pred_info = bk.index.predecessor(&seg_start).and_then(|(_, &idx)| {
+            let s = bk.entries.get(idx)?;
+            let end = s.offset.wrapping_add(s.len);
+            Some((s.offset, end, end >= seg_end_full))
+        });
 
         if let Some((pred_start, pred_end, skip)) = pred_info {
             if skip {
@@ -1364,9 +1332,8 @@ impl Fifo {
         loop {
             let overlap_info = bk.index.successor(&overlap_cursor).and_then(|(key, &idx)| {
                 if *key < seg_end_full {
-                    bk.entries
-                        .get(idx)
-                        .map(|segment| (*key, segment.offset.wrapping_add(segment.len)))
+                    let segment = bk.entries.get(idx)?;
+                    Some((*key, segment.offset.wrapping_add(segment.len)))
                 } else {
                     None
                 }
@@ -1397,9 +1364,8 @@ impl Fifo {
                     .successor(&(seg_start.wrapping_sub(1)))
                     .and_then(|(k, &idx)| {
                         if *k < seg_end_full {
-                            bk.entries
-                                .get(idx)
-                                .map(|s| (*k, s.offset.wrapping_add(s.len)))
+                            let s = bk.entries.get(idx)?;
+                            Some((*k, s.offset.wrapping_add(s.len)))
                         } else {
                             None
                         }
@@ -1412,21 +1378,19 @@ impl Fifo {
 
             retained_end = retained_end.max(succ_end);
             if succ_end <= seg_end_full {
-                bk.remove_ooo_entry(succ_key);
+                let _ = bk.remove_ooo_entry(succ_key);
             } else {
-                bk.remove_ooo_entry(succ_key);
+                let _ = bk.remove_ooo_entry(succ_key);
                 let new_key = seg_end_full;
                 let new_len = succ_end.wrapping_sub(new_key);
                 if new_len > 0 {
-                    let Some(new_idx) = bk.entries.insert(OooSegment {
+                    let new_index = bk.entries.insert(OooSegment {
                         offset: new_key,
                         len: new_len,
-                    }) else {
-                        return Err(FifoError::OutOfOrderStorageExhausted {
-                            entries: bk.entries.capacity(),
-                        });
-                    };
-                    bk.index.insert(new_key, new_idx);
+                    });
+                    if let Some(replaced_index) = bk.index.insert(new_key, new_index) {
+                        bk.entries.remove(replaced_index);
+                    }
                 }
                 break;
             }
@@ -1434,15 +1398,13 @@ impl Fifo {
 
         // Insert our segment
         let seg_len = seg_end_full.wrapping_sub(seg_start);
-        let Some(idx) = bk.entries.insert(OooSegment {
+        let index = bk.entries.insert(OooSegment {
             offset: seg_start,
             len: seg_len,
-        }) else {
-            return Err(FifoError::OutOfOrderStorageExhausted {
-                entries: bk.entries.capacity(),
-            });
-        };
-        bk.index.insert(seg_start, idx);
+        });
+        if let Some(replaced_index) = bk.index.insert(seg_start, index) {
+            bk.entries.remove(replaced_index);
+        }
 
         // Contiguous check
         let delivered = if seg_start == bk.base {
@@ -1462,31 +1424,31 @@ impl Fifo {
     fn promote_contiguous_inner(bk: &mut OooBookkeeping) -> u32 {
         let mut delivered: u32 = 0;
         loop {
-            let first = bk.index.first().map(|(&k, &v)| (k, v));
-            match first {
-                Some((first_key, first_idx)) if first_key == bk.base => {
-                    bk.index.remove(&first_key);
-                    let Some(seg) = bk.entries.remove(first_idx) else {
-                        break;
-                    };
-                    bk.base = bk.base.wrapping_add(seg.len);
-                    delivered = delivered.wrapping_add(seg.len);
-                }
-                _ => break,
+            let Some((&first_key, _)) = bk.index.first() else {
+                break;
+            };
+            if first_key != bk.base {
+                break;
             }
+            let Some(first_index) = bk.index.remove(&first_key) else {
+                break;
+            };
+            let Some(segment) = bk.entries.remove(first_index) else {
+                break;
+            };
+            bk.base = bk.base.wrapping_add(segment.len);
+            delivered = delivered.wrapping_add(segment.len);
         }
         delivered
     }
 
     fn promote_contiguous_from(&self, base: u32) -> u32 {
         let ooo = unsafe { &mut *self.ooo.get() };
-        match ooo.as_mut() {
-            Some(bk) => {
-                bk.base = base;
-                Self::promote_contiguous_inner(bk)
-            }
-            None => 0,
-        }
+        let Some(bookkeeping) = ooo.as_mut() else {
+            return 0;
+        };
+        bookkeeping.base = base;
+        Self::promote_contiguous_inner(bookkeeping)
     }
 
     pub fn promote_contiguous(&self) -> u32 {

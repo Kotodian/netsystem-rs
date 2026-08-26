@@ -16,7 +16,7 @@ use tokio::io::Interest;
 use tokio::io::unix::AsyncFd;
 use tokio::runtime::Handle;
 
-use hammer_infra::pool::{Index, Pool};
+use hammer_infra::pool::Pool;
 use hammer_infra::sync::{SpinLock, SpinLockGuard};
 
 use crate::NodeRuntime;
@@ -248,19 +248,17 @@ impl FileMain {
         self.state.lock()
     }
 
-    fn file_ptr(&self, index: Index) -> Option<*mut File> {
+    fn file_ptr(&self, index: u32) -> Option<*mut File> {
         let state = self.state();
         let file = state.0.get(index)?;
         file.is_active()
             .then(|| std::ptr::from_ref(file.as_ref()).cast_mut())
     }
 
-    fn deadline_ptr(&self, index: Index) -> Option<*mut Deadline> {
+    fn deadline_ptr(&self, index: u32) -> Option<*mut Deadline> {
         let state = self.state();
-        state
-            .1
-            .get(index)
-            .map(|deadline| std::ptr::from_ref(deadline.as_ref()).cast_mut())
+        let deadline = state.1.get(index)?;
+        Some(std::ptr::from_ref(deadline.as_ref()).cast_mut())
     }
 
     fn release_pending(&self, thread_index: u32) {
@@ -288,20 +286,17 @@ impl FileMain {
     }
 
     /// Registers a File and returns its existing `hammer-infra` Pool Index.
-    pub fn add(&self, file: File) -> RuntimeResult<Index> {
+    pub fn add(&self, file: File) -> RuntimeResult<u32> {
         let thread_index = file.polling_thread_index();
         let index = {
             let mut state = self.state();
-            state
-                .0
-                .insert(Box::new(file))
-                .ok_or(RuntimeError::FilePoolFull)?
+            state.0.insert(Box::new(file))
         };
         let spec = self
             .poll_spec(index)
-            .expect("newly inserted File must resolve");
+            .ok_or(RuntimeError::FileIndexInvalid { index })?;
         if let Err(error) = self.poller_mut(thread_index)?.add(spec) {
-            self.state().0.remove(index);
+            let _ = self.state().0.remove(index);
             return Err(error);
         }
         Ok(index)
@@ -309,24 +304,21 @@ impl FileMain {
 
     /// Registers a disarmed worker deadline and returns its generation-safe
     /// `hammer-infra` Pool Index.
-    pub fn add_deadline(&self, deadline: Deadline) -> RuntimeResult<Index> {
+    pub fn add_deadline(&self, deadline: Deadline) -> RuntimeResult<u32> {
         let thread_index = deadline.polling_thread_index();
         let index = {
             let mut state = self.state();
-            state
-                .1
-                .insert(Box::new(deadline))
-                .ok_or(RuntimeError::DeadlinePoolFull)?
+            state.1.insert(Box::new(deadline))
         };
         if let Err(error) = self.poller_mut(thread_index)?.add_deadline(index) {
-            self.state().1.remove(index);
+            let _ = self.state().1.remove(index);
             return Err(error);
         }
         Ok(index)
     }
 
     /// Returns the currently armed duration, if the deadline is registered.
-    pub fn deadline(&self, index: Index) -> RuntimeResult<Option<Duration>> {
+    pub fn deadline(&self, index: u32) -> RuntimeResult<Option<Duration>> {
         let deadline = self
             .deadline_ptr(index)
             .ok_or(RuntimeError::DeadlineIndexInvalid { index })?;
@@ -334,7 +326,7 @@ impl FileMain {
     }
 
     /// Arms or disarms a registered deadline.
-    pub fn set_deadline(&self, index: Index, duration: Option<Duration>) -> RuntimeResult<()> {
+    pub fn set_deadline(&self, index: u32, duration: Option<Duration>) -> RuntimeResult<()> {
         let deadline = self
             .deadline_ptr(index)
             .ok_or(RuntimeError::DeadlineIndexInvalid { index })?;
@@ -354,13 +346,13 @@ impl FileMain {
         let deadline = state
             .1
             .get_mut(index)
-            .ok_or(RuntimeError::DeadlineIndexInvalid { index })?;
+            .ok_or(RuntimeError::FileIndexInvalid { index })?;
         deadline.duration = duration;
         Ok(())
     }
 
     /// Removes a deadline after canceling its platform registration.
-    pub fn delete_deadline(&self, index: Index) -> RuntimeResult<bool> {
+    pub fn delete_deadline(&self, index: u32) -> RuntimeResult<bool> {
         let Some(deadline) = self.deadline_ptr(index) else {
             return Ok(false);
         };
@@ -375,24 +367,24 @@ impl FileMain {
     }
 
     /// Returns whether the generation-safe File index is currently registered.
-    pub fn is_registered(&self, index: Index) -> bool {
+    pub fn is_registered(&self, index: u32) -> bool {
         self.file_ptr(index).is_some()
     }
 
     /// Returns a registered File's description without exposing its record.
-    pub fn file_description(&self, index: Index) -> Option<String> {
+    pub fn file_description(&self, index: u32) -> Option<String> {
         let file = self.file_ptr(index)?;
         Some(unsafe { (*file).description().to_owned() })
     }
 
     /// Returns a registered File's callback-owned private data.
-    pub fn file_private_data(&self, index: Index) -> Option<u64> {
+    pub fn file_private_data(&self, index: u32) -> Option<u64> {
         let file = self.file_ptr(index)?;
         Some(unsafe { (*file).private_data() })
     }
 
     /// Returns the read, write, and error callback counts for a registered File.
-    pub fn file_event_counts(&self, index: Index) -> Option<(u64, u64, u64)> {
+    pub fn file_event_counts(&self, index: u32) -> Option<(u64, u64, u64)> {
         let file = self.file_ptr(index)?;
         Some(unsafe {
             (
@@ -403,7 +395,7 @@ impl FileMain {
         })
     }
 
-    fn poll_spec(&self, index: Index) -> Option<PollSpec> {
+    fn poll_spec(&self, index: u32) -> Option<PollSpec> {
         let file = self.file_ptr(index)?;
         Some(unsafe { PollSpec::new(index, &*file) })
     }
@@ -415,7 +407,7 @@ impl FileMain {
     /// remain valid until this synchronous call returns.
     pub unsafe fn readv(
         &self,
-        index: Index,
+        index: u32,
         vectors: &mut [libc::iovec],
     ) -> RuntimeResult<Option<usize>> {
         let file = self
@@ -447,7 +439,7 @@ impl FileMain {
     /// remain valid and unmodified until this synchronous call returns.
     pub unsafe fn writev(
         &self,
-        index: Index,
+        index: u32,
         vectors: &[libc::iovec],
     ) -> RuntimeResult<Option<usize>> {
         let file = self
@@ -473,9 +465,12 @@ impl FileMain {
     }
 
     /// Removes backend interest, closes the descriptor, and defers record free.
-    pub fn delete(&self, index: Index) -> RuntimeResult<bool> {
+    pub fn delete(&self, index: u32) -> RuntimeResult<bool> {
         let file = {
             let state = self.state();
+            if !state.0.contains_key(index) {
+                return Ok(false);
+            }
             let Some(file) = state.0.get(index) else {
                 return Ok(false);
             };
@@ -498,11 +493,7 @@ impl FileMain {
     }
 
     /// Changes write interest without replacing the File Index.
-    pub fn set_data_available_to_write(
-        &self,
-        index: Index,
-        available: bool,
-    ) -> RuntimeResult<bool> {
+    pub fn set_data_available_to_write(&self, index: u32, available: bool) -> RuntimeResult<bool> {
         let file = self
             .file_ptr(index)
             .ok_or(RuntimeError::FileIndexInvalid { index })?;
@@ -520,9 +511,10 @@ impl FileMain {
         after.write = available;
         self.poller_mut(thread_index)?.modify(before, after)?;
         let mut state = self.state();
-        let Some(file) = state.0.get_mut(index) else {
-            return Err(RuntimeError::FileIndexInvalid { index }.into());
-        };
+        let file = state
+            .0
+            .get_mut(index)
+            .ok_or(RuntimeError::FileIndexInvalid { index })?;
         file.set_write_enabled(available);
         Ok(previous)
     }
@@ -536,7 +528,7 @@ impl FileMain {
         description: impl Into<String>,
         private_data: u64,
         functions: FileFunctions,
-    ) -> RuntimeResult<Index> {
+    ) -> RuntimeResult<u32> {
         listener
             .set_nonblocking(true)
             .map_err(|source| RuntimeError::FilePollerIo {
@@ -558,11 +550,11 @@ impl FileMain {
     /// accept runs on a duplicated descriptor.
     pub fn accept(
         &self,
-        listener: Index,
+        listener: u32,
         description: impl Into<String>,
         private_data: u64,
         functions: FileFunctions,
-    ) -> RuntimeResult<Option<Index>> {
+    ) -> RuntimeResult<Option<u32>> {
         let file = self
             .file_ptr(listener)
             .ok_or(RuntimeError::FileIndexInvalid { index: listener })?;
@@ -622,7 +614,7 @@ impl FileMain {
     /// Performs one synchronous nonblocking read through a duplicated
     /// descriptor, so the poll registration never consumes data or
     /// readiness.
-    pub fn read_some(&self, index: Index, buffer: &mut [u8]) -> RuntimeResult<FileIoStatus> {
+    pub fn read_some(&self, index: u32, buffer: &mut [u8]) -> RuntimeResult<FileIoStatus> {
         let file = self
             .file_ptr(index)
             .ok_or(RuntimeError::FileIndexInvalid { index })?;
@@ -647,7 +639,7 @@ impl FileMain {
     /// Performs one synchronous nonblocking write through a duplicated
     /// descriptor, so the poll registration is never consumed by a partial
     /// flush.
-    pub fn write_some(&self, index: Index, buffer: &[u8]) -> RuntimeResult<FileIoStatus> {
+    pub fn write_some(&self, index: u32, buffer: &[u8]) -> RuntimeResult<FileIoStatus> {
         let file = self
             .file_ptr(index)
             .ok_or(RuntimeError::FileIndexInvalid { index })?;
@@ -814,7 +806,7 @@ pub(super) const FILE_POOL_CAPACITY: usize = 1024;
 
 #[derive(Clone, Copy, Debug)]
 pub(super) struct PollSpec {
-    pub(super) index: Index,
+    pub(super) index: u32,
     pub(super) fd: RawFd,
     pub(super) read: bool,
     pub(super) write: bool,
@@ -822,7 +814,7 @@ pub(super) struct PollSpec {
 
 impl PollSpec {
     #[inline]
-    pub(super) fn new(index: Index, file: &File) -> Self {
+    pub(super) fn new(index: u32, file: &File) -> Self {
         let functions = file.functions();
         Self {
             index,
@@ -835,8 +827,8 @@ impl PollSpec {
 
 #[derive(Clone, Copy, Debug)]
 pub(super) enum PollTarget {
-    File(Index),
-    Deadline(Index),
+    File(u32),
+    Deadline(u32),
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -885,15 +877,4 @@ fn peer_closed(source: &io::Error) -> bool {
             | io::ErrorKind::ConnectionAborted
             | io::ErrorKind::NotConnected
     )
-}
-
-#[inline]
-pub(super) fn encode_index(index: Index) -> u64 {
-    (u64::from(index.generation()) << 32) | u64::from(index.slot())
-}
-
-#[inline]
-pub(super) fn decode_index(token: u64) -> Option<Index> {
-    let generation = (token >> 32) as u32;
-    (generation != 0).then(|| Index::new(token as u32, generation))
 }

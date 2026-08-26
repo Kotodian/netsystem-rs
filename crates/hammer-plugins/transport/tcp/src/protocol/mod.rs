@@ -390,7 +390,7 @@ pub enum TcpCloseReason {
     ProtocolError,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash)]
 #[repr(transparent)]
 pub struct TcpSeq(u32);
 
