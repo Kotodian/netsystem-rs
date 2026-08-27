@@ -5,34 +5,21 @@
 //! through the bucket word, and retires old offsets only after no lookup
 //! hazard protects them.
 
-use std::alloc::{GlobalAlloc, Layout, handle_alloc_error};
-use std::cell::{Cell, RefCell, UnsafeCell};
+use std::alloc::{handle_alloc_error, GlobalAlloc, Layout};
+use std::cell::UnsafeCell;
 use std::ptr::NonNull;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicPtr, AtomicU64, Ordering};
+use std::sync::Arc;
 
 use crossbeam_utils::CachePadded;
 
 use crate::align::CACHE_LINE;
 use crate::bihash::value::ValuePage;
 use crate::heap::Heap;
-use crate::heap_boxed::{Slice, allocate_in, deallocate_in};
+use crate::heap_boxed::{allocate_in, deallocate_in, Slice};
 
 const MAX_LOG2_PAGES: usize = 8;
 const NO_OFFSET: u64 = 0;
-
-static NEXT_HAZARD_DOMAIN: AtomicU64 = AtomicU64::new(1);
-
-#[derive(Clone, Copy)]
-struct HazardBinding {
-    domain: u64,
-    slot: NonNull<CachePadded<AtomicU64>>,
-}
-
-thread_local! {
-    static BIHASH_HAZARDS: RefCell<Vec<HazardBinding>> = const { RefCell::new(Vec::new()) };
-    static LAST_BIHASH_HAZARD: Cell<Option<HazardBinding>> = const { Cell::new(None) };
-}
 
 struct PageBlock<K, const KVP: usize> {
     pages: NonNull<ValuePage<K, KVP>>,
@@ -187,7 +174,6 @@ pub(crate) struct PageAlloc<K, const KVP: usize> {
     state: UnsafeCell<PageAllocState<K, KVP>>,
     busy: AtomicBool,
     directory: AtomicPtr<usize>,
-    hazard_domain: u64,
 }
 
 // SAFETY: all PageAllocState mutation is serialized by `busy`; readers only
@@ -202,7 +188,6 @@ impl<K: Copy + Default, const KVP: usize> PageAlloc<K, KVP> {
             state: UnsafeCell::new(PageAllocState::new(heap)),
             busy: AtomicBool::new(false),
             directory: AtomicPtr::new(std::ptr::null_mut()),
-            hazard_domain: NEXT_HAZARD_DOMAIN.fetch_add(1, Ordering::Relaxed),
         }
     }
 
@@ -289,9 +274,7 @@ impl<K: Copy + Default, const KVP: usize> PageAlloc<K, KVP> {
         mut still_published: impl FnMut() -> bool,
         read: impl FnOnce(&[ValuePage<K, KVP>]) -> R,
     ) -> Option<R> {
-        let slot = self.hazard_slot();
-        // SeqCst supplies the store-load ordering required by hazard publication.
-        unsafe { slot.as_ref() }.store(offset, Ordering::SeqCst);
+        let slot = self.claim_hazard(offset);
         let hazard = HazardGuard { slot };
         if !still_published() {
             return None;
@@ -319,54 +302,34 @@ impl<K: Copy + Default, const KVP: usize> PageAlloc<K, KVP> {
     }
 
     #[inline(always)]
-    fn hazard_slot(&self) -> NonNull<CachePadded<AtomicU64>> {
-        let cached = LAST_BIHASH_HAZARD.with(|last| {
-            let binding = last.get()?;
-            let available = binding.domain == self.hazard_domain
-                // SAFETY: PageAlloc owns stable hazard slots until it is dropped,
-                // and hazard domains are never reused by another PageAlloc.
-                && unsafe { binding.slot.as_ref() }.load(Ordering::Relaxed) == NO_OFFSET;
-            available.then_some(binding.slot)
-        });
-        if let Some(slot) = cached {
-            return slot;
-        }
-
-        let existing = BIHASH_HAZARDS.with(|bindings| {
-            bindings
-                .borrow()
-                .iter()
-                .find(|binding| {
-                    binding.domain == self.hazard_domain
-                        // SAFETY: this thread alone publishes through its slots.
-                        && unsafe { binding.slot.as_ref() }.load(Ordering::Relaxed) == NO_OFFSET
+    fn claim_hazard(&self, offset: u64) -> NonNull<CachePadded<AtomicU64>> {
+        loop {
+            let existing = self.with_state(|state| {
+                state.hazards.iter().find_map(|slot| {
+                    // SAFETY: slots are allocated and owned by this PageAlloc.
+                    let atomic = unsafe { slot.as_ref() };
+                    atomic
+                        .compare_exchange(NO_OFFSET, offset, Ordering::SeqCst, Ordering::Relaxed)
+                        .is_ok()
+                        .then_some(*slot)
                 })
-                .map(|binding| binding.slot)
-        });
-        if let Some(slot) = existing {
-            LAST_BIHASH_HAZARD.with(|last| {
-                last.set(Some(HazardBinding {
-                    domain: self.hazard_domain,
-                    slot,
-                }));
             });
-            return slot;
+            if let Some(slot) = existing {
+                return slot;
+            }
+            let slot = self.with_state(PageAllocState::allocate_hazard);
+            // The new slot is exclusively owned until it is published in the
+            // hazard vector, so this CAS cannot fail.
+            let claimed = unsafe { slot.as_ref() }.compare_exchange(
+                NO_OFFSET,
+                offset,
+                Ordering::SeqCst,
+                Ordering::Relaxed,
+            );
+            if claimed.is_ok() {
+                return slot;
+            }
         }
-
-        let slot = self.with_state(PageAllocState::allocate_hazard);
-        BIHASH_HAZARDS.with(|bindings| {
-            bindings.borrow_mut().push(HazardBinding {
-                domain: self.hazard_domain,
-                slot,
-            });
-        });
-        LAST_BIHASH_HAZARD.with(|last| {
-            last.set(Some(HazardBinding {
-                domain: self.hazard_domain,
-                slot,
-            }));
-        });
-        slot
     }
 
     fn with_state<R>(&self, operation: impl FnOnce(&mut PageAllocState<K, KVP>) -> R) -> R {

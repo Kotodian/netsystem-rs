@@ -1,7 +1,7 @@
 use std::sync::Arc;
 
 use hammer_infra::bihash::bucket::Bucket;
-use hammer_infra::bihash::{Bihash, Bihash8x8, BihashKey};
+use hammer_infra::bihash::{Bihash, Bihash16x8, Bihash24x8, Bihash48x8, Bihash8x8, BihashKey};
 
 #[test]
 fn bihash_key_u64_hashes_deterministically() {
@@ -17,6 +17,27 @@ fn bihash_skeleton_constructs_with_zero_entries() {
     assert_eq!(t.len(), 0);
     assert!(t.is_empty());
     assert_eq!(t.nbuckets(), 64);
+}
+
+#[test]
+fn vpp_value_page_aliases_support_full_lifecycle() {
+    let table16: Bihash16x8 = Bihash::new(2);
+    for key in 0..64u128 {
+        table16.insert(key, key as u64);
+    }
+    assert_eq!(table16.lookup(&17), Some(17));
+
+    let table24: Bihash24x8 = Bihash::new(2);
+    for key in 0..64u64 {
+        table24.insert([key, key ^ 1, key ^ 2], key);
+    }
+    assert_eq!(table24.lookup(&[17, 16, 19]), Some(17));
+
+    let table48: Bihash48x8 = Bihash::new(2);
+    for key in 0..64u64 {
+        table48.insert([key, key + 1, key + 2, key + 3, key + 4, key + 5], key);
+    }
+    assert_eq!(table48.lookup(&[17, 18, 19, 20, 21, 22]), Some(17));
 }
 
 #[test]
@@ -94,7 +115,7 @@ fn bihash_prefetch_accepts_empty_and_present_keys() {
 
 // ── ValuePage / Kv / FREE_U64 ──────────────────────────────────────────
 
-use hammer_infra::bihash::value::{FREE_U64, Kv, ValuePage};
+use hammer_infra::bihash::value::{Kv, ValuePage, FREE_U64};
 
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 struct FixedHashKey {

@@ -4,18 +4,14 @@
 
 use crate::bihash::Bihash;
 
-/// 8-byte key + 8-byte value -> 16 bytes per KV pair.
-/// 7 per page -> 112 bytes (1.75 cache lines; 4 -> exactly 64 bytes).
+/// VPP `clib_bihash_8_8`: 7 KV pairs per value page.
 pub type Bihash8x8 = Bihash<u64, 7>;
 
-/// 16-byte key + 8-byte value -> 24 bytes per KV pair.
-/// 3 per page -> 72 bytes (1.125 cache lines).
-pub type Bihash16x8 = Bihash<u128, 3>;
+/// VPP `clib_bihash_16_8`: 4 KV pairs per value page.
+pub type Bihash16x8 = Bihash<u128, 4>;
 
-/// 24-byte key + 8-byte value -> 32 bytes per KV pair.
-/// 2 per page -> 64 bytes (exactly 1 cache line).
-pub type Bihash24x8 = Bihash<[u64; 3], 2>;
+/// VPP `clib_bihash_24_8`: 4 KV pairs per value page.
+pub type Bihash24x8 = Bihash<[u64; 3], 4>;
 
-/// 48-byte key + 8-byte value -> 56 bytes per KV pair.
-/// 1 per page -> 56 bytes (fits 1 cache line).
-pub type Bihash48x8 = Bihash<[u64; 6], 1>;
+/// VPP `clib_bihash_48_8`: 4 KV pairs per value page.
+pub type Bihash48x8 = Bihash<[u64; 6], 4>;
