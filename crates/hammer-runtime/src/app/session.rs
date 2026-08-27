@@ -3,6 +3,7 @@ use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::os::fd::{BorrowedFd, OwnedFd, RawFd};
 use std::sync::Arc;
 
+use hammer_core::session::{SessionEvt, SessionEvtType};
 use hammer_infra::fifo::{Fifo, FifoError};
 use hammer_infra::segment::Segment;
 use thiserror::Error;
@@ -11,10 +12,7 @@ use tokio::sync::OnceCell;
 
 use crate::app::SessionHandle;
 use crate::app::SessionOffsets;
-use crate::app::session_msg_queue::{
-    SessionEventQueue, SessionEvt, SessionEvtFlags, SessionEvtType, SessionMsgQueue,
-    SessionMsgQueueError,
-};
+use crate::app::session_msg_queue::{SessionEventQueue, SessionMsgQueue, SessionMsgQueueError};
 
 /// VPP-style app/session object: per-session byte FIFOs plus event queue.
 ///
@@ -35,14 +33,23 @@ pub struct AppSession {
 /// Failures owned by the app/session boundary.
 #[derive(Debug, Error)]
 pub enum AppSessionError {
-    #[error("app worker {app_worker} already has session {session}")]
-    AlreadyAttached { app_worker: usize, session: u64 },
-    #[error("app worker {app_worker} has no session {session}")]
-    NotFound { app_worker: usize, session: u64 },
-    #[error("app session {session} event queue is full for {event:?}")]
-    EventQueueFull { session: u64, event: SessionEvtType },
-    #[error("app session {session} Application Rx MQ is full")]
-    ApplicationMqFull { session: u64 },
+    #[error("app worker {app_worker} already has session slot {session_index}")]
+    AlreadyAttached {
+        app_worker: usize,
+        session_index: u32,
+    },
+    #[error("app worker {app_worker} has no session slot {session_index}")]
+    NotFound {
+        app_worker: usize,
+        session_index: u32,
+    },
+    #[error("app session {session:?} event queue is full for {event:?}")]
+    EventQueueFull {
+        session: SessionHandle,
+        event: SessionEvtType,
+    },
+    #[error("app session {session:?} Application Rx MQ is full")]
+    ApplicationMqFull { session: SessionHandle },
     #[error("app session RX FIFO capacity {capacity} is invalid")]
     RxFifoCapacityInvalid { capacity: usize },
     #[error("app session TX FIFO capacity {capacity} is invalid")]
@@ -262,7 +269,7 @@ impl AppSession {
     }
     #[inline]
     pub const fn session_index(&self) -> u32 {
-        self.handle.session_index()
+        self.handle.session_index
     }
 
     #[inline]
@@ -494,20 +501,8 @@ impl AppSession {
     /// `SESSION_F_RX_EVT` with `svm_fifo_unset_event` on the consumer side.
     #[inline]
     pub fn enqueue_rx(&self, bytes: &[u8]) -> Result<usize, AppSessionError> {
-        self.enqueue_rx_with_flags(bytes, SessionEvtFlags::empty())
-    }
-
-    /// Like [`Self::enqueue_rx`], but attaches [`SessionEvtFlags`] on the RxEnq
-    /// event. Urgent delivery always posts an event so the app observes the
-    /// mark even when a coalesced RxEnq is already pending.
-    #[inline]
-    pub fn enqueue_rx_with_flags(
-        &self,
-        bytes: &[u8],
-        flags: SessionEvtFlags,
-    ) -> Result<usize, AppSessionError> {
         let wrote = self.rx_fifo.enqueue(bytes);
-        self.publish_rx_enqueue_with_flags(wrote, flags)?;
+        self.publish_rx_enqueue(wrote)?;
         Ok(wrote)
     }
 
@@ -515,21 +510,11 @@ impl AppSession {
     /// `produced` is the number of newly visible FIFO elements.
     #[inline]
     pub fn publish_rx_enqueue(&self, produced: usize) -> Result<(), AppSessionError> {
-        self.publish_rx_enqueue_with_flags(produced, SessionEvtFlags::empty())
-    }
-
-    #[inline]
-    fn publish_rx_enqueue_with_flags(
-        &self,
-        produced: usize,
-        flags: SessionEvtFlags,
-    ) -> Result<(), AppSessionError> {
         if produced == 0 {
             return Ok(());
         }
-        let urgent = flags.contains(SessionEvtFlags::URGENT);
-        if self.rx_fifo.set_event() || urgent {
-            if let Err(error) = self.push_io_event_with_flags(SessionEvtType::RxEnq, flags) {
+        if self.rx_fifo.set_event() {
+            if let Err(error) = self.push_io_event(SessionEvtType::RxEnq) {
                 self.rx_fifo.unset_event();
                 return Err(error);
             }
@@ -568,7 +553,13 @@ impl AppSession {
     /// producer classification intact.
     #[inline]
     pub fn push_io_event(&self, evt_type: SessionEvtType) -> Result<(), AppSessionError> {
-        self.push_io_event_with_flags(evt_type, SessionEvtFlags::empty())
+        let event = SessionEvt::io(self.handle.session_index, evt_type);
+        self.evt_q
+            .enqueue_io(event)
+            .map_err(|_| AppSessionError::EventQueueFull {
+                session: self.handle,
+                event: evt_type,
+            })
     }
 
     /// Transport-side convenience: post a control event to the app's queue.
@@ -577,15 +568,11 @@ impl AppSession {
     /// Control identity carries the full VPP-shaped Session Handle.
     #[inline]
     pub fn push_control_event(&self, evt_type: SessionEvtType) -> Result<(), AppSessionError> {
-        let event = SessionEvt::ctrl(
-            self.handle.session_index(),
-            self.handle.worker_index(),
-            evt_type,
-        );
+        let event = SessionEvt::ctrl(self.handle, evt_type);
         self.evt_q
             .enqueue_ctrl(event)
             .map_err(|_| AppSessionError::EventQueueFull {
-                session: self.handle.raw(),
+                session: self.handle,
                 event: evt_type,
             })
     }
@@ -615,33 +602,15 @@ impl AppSession {
     }
 
     fn enqueue_app_control(&self, evt_type: SessionEvtType) -> Result<(), AppSessionError> {
-        let evt = SessionEvt::ctrl(
-            self.handle.session_index(),
-            self.handle.worker_index(),
-            evt_type,
-        );
+        let evt = SessionEvt::ctrl(self.handle, evt_type);
         self.app_rx_mq
             .enqueue_ctrl(evt)
             .map_err(|_| AppSessionError::ApplicationMqFull {
-                session: self.handle.raw(),
+                session: self.handle,
             })
     }
 
     #[inline]
-    pub fn push_io_event_with_flags(
-        &self,
-        evt_type: SessionEvtType,
-        flags: SessionEvtFlags,
-    ) -> Result<(), AppSessionError> {
-        let event = SessionEvt::io_with_flags(self.handle.session_index(), evt_type, flags);
-        self.evt_q
-            .enqueue_io(event)
-            .map_err(|_| AppSessionError::EventQueueFull {
-                session: self.handle.raw(),
-                event: evt_type,
-            })
-    }
-
     /// Publishes a TX enqueue already committed directly to [`Self::tx_fifo`].
     /// `produced` is the number of newly visible FIFO elements.
     #[inline]
@@ -652,14 +621,14 @@ impl AppSession {
         if self
             .app_rx_mq
             .enqueue_io(SessionEvt::io(
-                self.handle.session_index(),
+                self.handle.session_index,
                 SessionEvtType::TxEnq,
             ))
             .is_err()
         {
             self.tx_fifo.unset_event();
             return Err(AppSessionError::ApplicationMqFull {
-                session: self.handle.raw(),
+                session: self.handle,
             });
         }
         Ok(())
@@ -672,7 +641,7 @@ impl AppSession {
         if !self.rx_fifo.needs_deq_notification(consumed) {
             return;
         }
-        let event = SessionEvt::io(self.handle.session_index(), SessionEvtType::RxDeq);
+        let event = SessionEvt::io(self.handle.session_index, SessionEvtType::RxDeq);
         loop {
             match self.app_rx_mq.enqueue_io(event) {
                 Ok(()) => return,
@@ -791,7 +760,7 @@ impl AppSession {
 
 impl AppSession {
     /// Reconstruct an app session from a shared session segment and the
-    /// per-Application Rx MQ selected by `handle.worker_index()`.
+    /// per-Application Rx MQ selected by `handle.thread_index`.
     ///
     /// # Safety
     /// The session segment and all offsets must refer to initialized objects
@@ -884,8 +853,7 @@ impl AppSession {
 impl fmt::Debug for AppSession {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("AppSession")
-            .field("session_index", &self.handle.session_index())
-            .field("worker_index", &self.handle.worker_index())
+            .field("handle", &self.handle)
             .finish_non_exhaustive()
     }
 }
@@ -954,7 +922,7 @@ mod tests {
         assert!(matches!(
             error,
             AppSessionError::ApplicationMqFull { session }
-                if session == SessionHandle::new(1, 0).raw()
+                if session == SessionHandle::new(1, 0)
         ));
         assert!(!session.tx_fifo().has_event());
 
@@ -966,7 +934,7 @@ mod tests {
             .expect("dequeue")
             .expect("tx enqueue after retry");
         assert_eq!(evt.evt_type, SessionEvtType::TxEnq);
-        assert_eq!(evt.session_index(), 1);
+        assert_eq!(evt.session_index, 1);
     }
 
     #[test]
@@ -1001,7 +969,7 @@ mod tests {
             .expect("dequeue")
             .expect("rx dequeue event");
         assert_eq!(event.evt_type, SessionEvtType::RxDeq);
-        assert_eq!(event.session_index(), 7);
+        assert_eq!(event.session_index, 7);
 
         assert_eq!(session.consume_rx(1), 1);
         assert!(session.app_rx_mq().dequeue().expect("dequeue").is_none());
@@ -1037,26 +1005,6 @@ mod tests {
     }
 
     #[test]
-    fn app_session_enqueue_rx_urgent_bypasses_coalescing() {
-        use crate::app::SessionEvtFlags;
-
-        let session = new_session(AppSessionConfig::new(64, 4), 1);
-        assert_eq!(session.enqueue_rx(b"abc").expect("enqueue rx"), 3);
-        assert_eq!(
-            session
-                .enqueue_rx_with_flags(b"urg", SessionEvtFlags::URGENT)
-                .expect("enqueue urgent"),
-            3
-        );
-        let mut out = [SessionEvt::io(0, SessionEvtType::Close); 4];
-        assert_eq!(session.poll_events(&mut out), 2);
-        assert_eq!(out[0].evt_type, SessionEvtType::RxEnq);
-        assert!(out[0].flags().is_empty());
-        assert_eq!(out[1].evt_type, SessionEvtType::RxEnq);
-        assert!(out[1].flags().contains(SessionEvtFlags::URGENT));
-    }
-
-    #[test]
     fn app_session_enqueue_rx_clears_event_when_evt_q_full() {
         let session = new_session(AppSessionConfig::new(64, 4), 1);
         std::iter::repeat_with(|| session.push_io_event(SessionEvtType::RxEnq))
@@ -1082,9 +1030,9 @@ mod tests {
             .expect("push connect");
         let mut out = [SessionEvt::io(0, SessionEvtType::RxEnq); 4];
         assert_eq!(session.poll_events(&mut out), 1);
-        assert_eq!(out[0].session_index(), 1);
+        assert_eq!(out[0].session_index, 1);
         assert_eq!(out[0].evt_type, SessionEvtType::Connect);
-        assert_eq!(out[0].worker_index(), 0);
+        assert_eq!(out[0].thread_index, 0);
     }
 
     #[test]
@@ -1098,8 +1046,8 @@ mod tests {
             .expect("dequeue")
             .expect("half close event");
         assert_eq!(event.evt_type, SessionEvtType::HalfClose);
-        assert_eq!(event.session_index(), 3);
-        assert_eq!(event.worker_index(), 0);
+        assert_eq!(event.session_index, 3);
+        assert_eq!(event.thread_index, 0);
     }
 
     #[test]
@@ -1113,8 +1061,8 @@ mod tests {
             .expect("dequeue")
             .expect("close event");
         assert_eq!(event.evt_type, SessionEvtType::Close);
-        assert_eq!(event.session_index(), 3);
-        assert_eq!(event.worker_index(), 0);
+        assert_eq!(event.session_index, 3);
+        assert_eq!(event.thread_index, 0);
     }
 
     #[test]
@@ -1128,8 +1076,8 @@ mod tests {
             .expect("dequeue")
             .expect("reset event");
         assert_eq!(event.evt_type, SessionEvtType::Reset);
-        assert_eq!(event.session_index(), 3);
-        assert_eq!(event.worker_index(), 0);
+        assert_eq!(event.session_index, 3);
+        assert_eq!(event.thread_index, 0);
     }
 
     #[test]
@@ -1150,8 +1098,8 @@ mod tests {
         let mut out = [SessionEvt::io(0, SessionEvtType::RxEnq)];
         assert_eq!(session.poll_events(&mut out), 1);
         assert_eq!(out[0].evt_type, SessionEvtType::Disconnected);
-        assert_eq!(out[0].session_index(), 11);
-        assert_eq!(out[0].worker_index(), 7);
+        assert_eq!(out[0].session_index, 11);
+        assert_eq!(out[0].thread_index, 7);
     }
 
     #[test]

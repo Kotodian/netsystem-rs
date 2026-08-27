@@ -6,10 +6,10 @@ use hammer_core::data_plane::NodeState;
 use hammer_infra::align::CacheLine;
 use hammer_infra::pool::Pool;
 use hammer_infra::thread_owned::ThreadOwned;
-use hammer_runtime::app::{ApplicationId, SessionAppId};
+use hammer_runtime::app::SessionHandle;
 use hammer_runtime::{
-    DataWorkerId, Engine, RuntimeError, RuntimeResult, SessionConnectEndpoint, SessionConnectionId,
-    SessionListenEndpoint, SessionHandle, SessionTransportRegistration,
+    DataWorkerId, Engine, RuntimeError, RuntimeResult, SessionConnectEndpoint,
+    SessionListenEndpoint, SessionTransportRegistration,
 };
 use hammer_service::session::ApplicationMain;
 use hammer_service::session::node::SessionQueueNode;
@@ -50,8 +50,8 @@ pub(crate) enum QuicListenerError {
 pub struct QuicMain {
     owner: ThreadId,
     sessions: Arc<SessionMain>,
-    inner_application: ApplicationId,
-    session_app: SessionAppId,
+    inner_application: u32,
+    session_app: u32,
     udp_transport: SessionTransportRegistration,
     pub(crate) configs: QuicConfigRegistry,
     contexts: Arc<QuicListenerContexts>,
@@ -95,8 +95,8 @@ unsafe impl Sync for QuicListenerContexts {}
 impl QuicMain {
     pub(crate) fn new(
         sessions: Arc<SessionMain>,
-        inner_application: ApplicationId,
-        session_app: SessionAppId,
+        inner_application: u32,
+        session_app: u32,
         udp_transport: SessionTransportRegistration,
         worker_count: usize,
     ) -> Self {
@@ -118,7 +118,7 @@ impl QuicMain {
     pub(crate) fn start_listen(
         &self,
         outer_listener: SessionHandle,
-        outer_application: ApplicationId,
+        outer_application: u32,
         outer_config: Option<u64>,
         endpoint: SessionListenEndpoint,
     ) -> RuntimeResult<()> {
@@ -159,18 +159,15 @@ impl QuicMain {
         let context = self.with_contexts(|contexts| {
             // Capacity was checked before any Session state was published, so
             // a failed insert would be an impossible pool invariant violation.
-            contexts
-                .insert(Context::listener(
-                    outer_listener,
-                    outer_application,
-                    inner_application_listener,
-                    inner_session_listener,
-                    config,
-                    transport_config.connection_timeout,
-                    Some(server_config),
-                ))
-                .map(ContextId::from)
-                .expect("QUIC listener pool capacity remains after preflight")
+            contexts.insert(Context::listener(
+                outer_listener,
+                outer_application,
+                inner_application_listener,
+                inner_session_listener,
+                config,
+                transport_config.connection_timeout,
+                Some(server_config),
+            ))
         })?;
 
         // The lower UDP Session Listener must exist before its Application
@@ -289,7 +286,7 @@ impl QuicMain {
 
     pub(crate) fn application_is_attached(
         &self,
-        application: ApplicationId,
+        application: u32,
     ) -> Result<bool, hammer_service::session::ApplicationError> {
         self.sessions.applications().contains(application)
     }
@@ -380,7 +377,7 @@ pub(crate) fn connect(endpoint: SessionConnectEndpoint) -> RuntimeResult<()> {
         .applications()
         .register_connection(
             main.inner_application,
-            endpoint.connection.raw(),
+            endpoint.connection.into(),
             None,
             Some(main.session_app),
             Some(context.into()),
@@ -392,7 +389,7 @@ pub(crate) fn connect(endpoint: SessionConnectEndpoint) -> RuntimeResult<()> {
             endpoint.remote,
             endpoint.local,
             endpoint.worker,
-            SessionConnectionId::from_raw(inner_connection.raw()),
+            inner_connection,
             main.inner_application,
             Some(context.into()),
             None,
@@ -469,7 +466,7 @@ pub(crate) fn connect_stream(endpoint: SessionConnectEndpoint) -> RuntimeResult<
 
 pub(crate) fn start_listen(
     listener: SessionHandle,
-    application: ApplicationId,
+    application: u32,
     config: Option<u64>,
     endpoint: SessionListenEndpoint,
 ) -> RuntimeResult<()> {
@@ -642,7 +639,7 @@ mod tests {
         let main = QuicMain::new(
             Arc::clone(&sessions),
             inner_application,
-            SessionAppId::new(0),
+            0,
             SessionTransportRegistration::new("udp-test", None, None, None),
             1,
         );
@@ -684,28 +681,28 @@ mod tests {
 
     fn record_start(
         listener: SessionHandle,
-        application: ApplicationId,
+        application: u32,
         opaque: Option<u64>,
         _: SessionListenEndpoint,
     ) -> RuntimeResult<()> {
-        LISTEN_APPLICATION.store(application.raw(), Ordering::SeqCst);
+        LISTEN_APPLICATION.store(application, Ordering::SeqCst);
         LISTEN_OPAQUE.store(opaque.unwrap_or_default(), Ordering::SeqCst);
         LISTEN_BARRIER.store(
             Engine::with_current(|engine| engine.worker_barrier().is_pending()).unwrap_or(false),
             Ordering::SeqCst,
         );
-        assert_ne!(listener.raw(), 0);
+        assert_ne!(u64::from(listener), 0);
         Ok(())
     }
 
     fn record_stop(listener: SessionHandle) -> RuntimeResult<()> {
-        STOP_LISTENER.store(listener.raw(), Ordering::SeqCst);
+        STOP_LISTENER.store(u64::from(listener), Ordering::SeqCst);
         Ok(())
     }
 
     fn fail_start(
         _: SessionHandle,
-        _: ApplicationId,
+        _: u32,
         _: Option<u64>,
         _: SessionListenEndpoint,
     ) -> RuntimeResult<()> {
@@ -758,7 +755,7 @@ mod tests {
         let main = Arc::new(QuicMain::new(
             Arc::clone(&sessions),
             inner_application,
-            SessionAppId::new(0),
+            0,
             transport,
             1,
         ));
@@ -797,10 +794,7 @@ mod tests {
             outer_application_listener
         );
         assert_ne!(stored.inner_session_listener, outer_listener);
-        assert_eq!(
-            LISTEN_APPLICATION.load(Ordering::SeqCst),
-            inner_application.raw()
-        );
+        assert_eq!(LISTEN_APPLICATION.load(Ordering::SeqCst), inner_application);
         assert_eq!(LISTEN_OPAQUE.load(Ordering::SeqCst), 0);
         assert!(LISTEN_BARRIER.load(Ordering::SeqCst));
 
@@ -824,7 +818,7 @@ mod tests {
             1,
             1,
             inner_application,
-            Some(SessionAppId::new(0)),
+            Some(0),
             None,
             None,
             false,
@@ -864,7 +858,7 @@ mod tests {
         let main = QuicMain::new(
             Arc::clone(&sessions),
             inner_application,
-            SessionAppId::new(0),
+            0,
             SessionTransportRegistration::new("udp-failure", Some(fail_start), None, None),
             1,
         );
@@ -884,7 +878,7 @@ mod tests {
         assert!(result.is_err());
         assert_eq!(main.listener_count(), 0);
         let probe = applications
-            .register_listener(inner_application, Some(SessionAppId::new(0)), None)
+            .register_listener(inner_application, Some(0), None)
             .map_err(RuntimeError::from)?;
         assert_eq!(probe.slot(), 0, "failed inner listener was rolled back");
         applications

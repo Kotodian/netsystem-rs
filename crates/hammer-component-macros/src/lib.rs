@@ -2047,8 +2047,8 @@ pub fn session_app(args: TokenStream, input: TokenStream) -> TokenStream {
         fn #create_ident(
             __hammer_worker: ::hammer_runtime::DataWorkerId,
             __hammer_worker_count: usize,
-            __hammer_application: ::std::option::Option<::hammer_runtime::app::ApplicationId>,
-            __hammer_app: ::std::option::Option<::hammer_runtime::app::SessionAppId>,
+            __hammer_application: ::std::option::Option<u32>,
+            __hammer_app: ::std::option::Option<u32>,
             __hammer_opaque: ::std::option::Option<u64>,
             __hammer_server_name: ::std::option::Option<&str>,
         ) -> ::hammer_runtime::RuntimeResult<::hammer_runtime::app::SessionAppContext> {
@@ -2133,7 +2133,7 @@ pub fn session_app(args: TokenStream, input: TokenStream) -> TokenStream {
             __hammer_worker: &mut ::hammer_service::session::runtime::SessionWorker<
                 u32,
             >,
-            __hammer_session: ::hammer_service::session::SessionId,
+            __hammer_session: u32,
             __hammer_context: ::hammer_runtime::app::SessionAppContext,
         ) -> ::hammer_runtime::RuntimeResult<()> {
             let __hammer_context = if __hammer_context == 0 {
@@ -2186,7 +2186,7 @@ pub fn session_app(args: TokenStream, input: TokenStream) -> TokenStream {
             __hammer_worker: &mut ::hammer_service::session::runtime::SessionWorker<
                 u32,
             >,
-            __hammer_session: ::hammer_service::session::SessionId,
+            __hammer_session: u32,
             __hammer_context: ::hammer_runtime::app::SessionAppContext,
         ) -> ::hammer_runtime::RuntimeResult<()> {
             let __hammer_context = if __hammer_context == 0 {
@@ -2239,7 +2239,7 @@ pub fn session_app(args: TokenStream, input: TokenStream) -> TokenStream {
             __hammer_worker: &mut ::hammer_service::session::runtime::SessionWorker<
                 u32,
             >,
-            __hammer_session: ::hammer_service::session::SessionId,
+            __hammer_session: u32,
             __hammer_context: ::hammer_runtime::app::SessionAppContext,
         ) -> ::hammer_runtime::RuntimeResult<()> {
             #contexts_ident
@@ -2263,7 +2263,7 @@ pub fn session_app(args: TokenStream, input: TokenStream) -> TokenStream {
             __hammer_worker: &mut ::hammer_service::session::runtime::SessionWorker<
                 u32,
             >,
-            __hammer_session: ::hammer_service::session::SessionId,
+            __hammer_session: u32,
             __hammer_context: ::hammer_runtime::app::SessionAppContext,
         ) -> ::hammer_runtime::RuntimeResult<()> {
             #contexts_ident
@@ -2287,7 +2287,7 @@ pub fn session_app(args: TokenStream, input: TokenStream) -> TokenStream {
             __hammer_worker: &mut ::hammer_service::session::runtime::SessionWorker<
                 u32,
             >,
-            __hammer_session: ::hammer_service::session::SessionId,
+            __hammer_session: u32,
             __hammer_context: ::hammer_runtime::app::SessionAppContext,
         ) -> ::hammer_runtime::RuntimeResult<()> {
             #contexts_ident
@@ -2311,7 +2311,7 @@ pub fn session_app(args: TokenStream, input: TokenStream) -> TokenStream {
             __hammer_worker: &mut ::hammer_service::session::runtime::SessionWorker<
                 u32,
             >,
-            __hammer_session: ::hammer_service::session::SessionId,
+            __hammer_session: u32,
             __hammer_context: ::hammer_runtime::app::SessionAppContext,
         ) -> ::hammer_runtime::RuntimeResult<()> {
             #contexts_ident
@@ -2335,7 +2335,7 @@ pub fn session_app(args: TokenStream, input: TokenStream) -> TokenStream {
             __hammer_worker: &mut ::hammer_service::session::runtime::SessionWorker<
                 u32,
             >,
-            __hammer_session: ::hammer_service::session::SessionId,
+            __hammer_session: u32,
             __hammer_context: ::hammer_runtime::app::SessionAppContext,
         ) -> ::hammer_runtime::RuntimeResult<()> {
             #contexts_ident
@@ -2359,7 +2359,7 @@ pub fn session_app(args: TokenStream, input: TokenStream) -> TokenStream {
             __hammer_worker: &mut ::hammer_service::session::runtime::SessionWorker<
                 u32,
             >,
-            __hammer_session: ::hammer_service::session::SessionId,
+            __hammer_session: u32,
             __hammer_new_handle: ::hammer_runtime::app::SessionHandle,
             __hammer_context: ::hammer_runtime::app::SessionAppContext,
         ) -> ::hammer_runtime::RuntimeResult<()> {
@@ -2385,7 +2385,7 @@ pub fn session_app(args: TokenStream, input: TokenStream) -> TokenStream {
             __hammer_worker: &mut ::hammer_service::session::runtime::SessionWorker<
                 u32,
             >,
-            __hammer_session: ::hammer_service::session::SessionId,
+            __hammer_session: u32,
             __hammer_context: ::hammer_runtime::app::SessionAppContext,
         ) -> ::hammer_runtime::RuntimeResult<()> {
             #contexts_ident
@@ -2409,7 +2409,7 @@ pub fn session_app(args: TokenStream, input: TokenStream) -> TokenStream {
             __hammer_worker: &mut ::hammer_service::session::runtime::SessionWorker<
                 u32,
             >,
-            __hammer_session: ::hammer_service::session::SessionId,
+            __hammer_session: u32,
             __hammer_context: ::hammer_runtime::app::SessionAppContext,
         ) -> ::hammer_runtime::RuntimeResult<()> {
             #contexts_ident
@@ -2433,7 +2433,7 @@ pub fn session_app(args: TokenStream, input: TokenStream) -> TokenStream {
             __hammer_worker: &mut ::hammer_service::session::runtime::SessionWorker<
                 u32,
             >,
-            __hammer_session: ::hammer_service::session::SessionId,
+            __hammer_session: u32,
             __hammer_context: ::hammer_runtime::app::SessionAppContext,
         ) -> ::hammer_runtime::RuntimeResult<()> {
             #contexts_ident
@@ -2457,7 +2457,7 @@ pub fn session_app(args: TokenStream, input: TokenStream) -> TokenStream {
             __hammer_worker: &mut ::hammer_service::session::runtime::SessionWorker<
                 u32,
             >,
-            __hammer_session: ::hammer_service::session::SessionId,
+            __hammer_session: u32,
             __hammer_context: ::hammer_runtime::app::SessionAppContext,
         ) -> ::hammer_runtime::RuntimeResult<()> {
             #contexts_ident
@@ -2481,7 +2481,7 @@ pub fn session_app(args: TokenStream, input: TokenStream) -> TokenStream {
             __hammer_worker: &mut ::hammer_service::session::runtime::SessionWorker<
                 u32,
             >,
-            __hammer_session: ::hammer_service::session::SessionId,
+            __hammer_session: u32,
             __hammer_context: ::hammer_runtime::app::SessionAppContext,
         ) -> ::hammer_runtime::RuntimeResult<()> {
             #contexts_ident
@@ -2505,7 +2505,7 @@ pub fn session_app(args: TokenStream, input: TokenStream) -> TokenStream {
             __hammer_worker: &mut ::hammer_service::session::runtime::SessionWorker<
                 u32,
             >,
-            __hammer_session: ::hammer_service::session::SessionId,
+            __hammer_session: u32,
             __hammer_context: ::hammer_runtime::app::SessionAppContext,
         ) -> ::hammer_runtime::RuntimeResult<()> {
             #contexts_ident
@@ -2529,7 +2529,7 @@ pub fn session_app(args: TokenStream, input: TokenStream) -> TokenStream {
             __hammer_worker: &mut ::hammer_service::session::runtime::SessionWorker<
                 u32,
             >,
-            __hammer_session: ::hammer_service::session::SessionId,
+            __hammer_session: u32,
             __hammer_context: ::hammer_runtime::app::SessionAppContext,
         ) -> ::hammer_runtime::RuntimeResult<()> {
             #contexts_ident
@@ -2553,7 +2553,7 @@ pub fn session_app(args: TokenStream, input: TokenStream) -> TokenStream {
             __hammer_worker: &mut ::hammer_service::session::runtime::SessionWorker<
                 u32,
             >,
-            __hammer_session: ::hammer_service::session::SessionId,
+            __hammer_session: u32,
             __hammer_context: ::hammer_runtime::app::SessionAppContext,
         ) -> ::hammer_runtime::RuntimeResult<()> {
             #contexts_ident

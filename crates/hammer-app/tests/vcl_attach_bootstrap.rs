@@ -2,14 +2,14 @@
 //! path, independent of QUIC.
 //!
 //! The daemon side is a real `AppServer::serve` on a temp Unix socket: it
-//! allocates the real `ApplicationId`, builds the real
+//! allocates the real `u32`, builds the real
 //! `ApplicationMqPublication` (per-worker Application Rx MQ set and
 //! ext-config store in a shared segment), and delivers them over the real
 //! attach descriptors (metadata words + SCM_RIGHTS). Established Sessions
 //! arrive through the real `AppSessionPublisher::try_publish` as
 //! `AppSessionPublication`s carrying descriptors and concrete ACCEPTED /
 //! CONNECTED control messages; the client attaches through the public
-//! `VclWorker::attach`.
+//! `Worker::attach`.
 //!
 //! `application_session_control` is the only scripted request -> reply seam:
 //! it consumes the client's real control requests (LISTEN, CONNECT_STREAM,
@@ -26,18 +26,18 @@ use std::sync::mpsc;
 use std::thread;
 use std::time::{Duration, Instant};
 
+use hammer_app::vcl::{Event, Initiator, SessionState, Worker};
 use hammer_infra::fifo::Fifo;
 use hammer_infra::segment::Segment;
 use hammer_runtime::app::{
-    AppSession, ApplicationId, SessionAcceptedMsg, SessionAcceptedReplyMsg, SessionBoundMsg,
-    SessionConnectMsg, SessionConnectedMsg, SessionEvtType, SessionFlags, SessionHandle,
-    SessionListenMsg, SessionMsgQueue, SessionOffsets, TransportProtocol,
+    AppSession, SessionAcceptedMsg, SessionAcceptedReplyMsg, SessionBoundMsg, SessionConnectMsg,
+    SessionConnectedMsg, SessionEvtType, SessionFlags, SessionHandle, SessionListenMsg,
+    SessionMsgQueue, SessionOffsets,
 };
 use hammer_runtime::attach::{
     AppServer, AppSessionPublication, ApplicationMqPublication, ExtConfigStore,
 };
 use hammer_runtime::{DataWorkerId, SessionListenEndpoint};
-use hammer_vcl::{VclEvent, VclInitiator, VclSessionState, VclWorker};
 
 const FIFO_CAPACITY: usize = 4096;
 const EVT_Q_CAPACITY: usize = 16;
@@ -126,7 +126,7 @@ struct PublishedSession {
 }
 
 fn build_publication(
-    application: ApplicationId,
+    application: u32,
     handle: SessionHandle,
     application_mqs: &ApplicationMqs,
 ) -> PublishedSession {
@@ -163,7 +163,7 @@ fn build_publication(
         .expect("event queue"),
     );
 
-    let worker_queue = application_mqs.queues[handle.worker_index() as usize].clone();
+    let worker_queue = application_mqs.queues[handle.thread_index as usize].clone();
     let session = Arc::new(AppSession::from_parts(
         Arc::new(rx_fifo),
         Arc::new(tx_fifo),
@@ -218,7 +218,7 @@ fn spawn_serve(
             move || {
                 let raw = next_application.fetch_add(1, Ordering::Relaxed);
                 allocated.store(raw, Ordering::Relaxed);
-                Ok::<ApplicationId, Infallible>(ApplicationId::from_raw(raw))
+                Ok::<u32, Infallible>(raw as u32)
             },
             move |_| {
                 Ok::<ApplicationMqPublication, Infallible>(application_mqs.publication.clone())
@@ -275,7 +275,7 @@ fn spawn_serve(
 /// event-queue signal): the daemon delivers publications asynchronously
 /// through the serve loop, so the test pumps until the expected events land
 /// or the deadline expires.
-fn pump_events(worker: &mut VclWorker) -> Vec<VclEvent> {
+fn pump_events(worker: &mut Worker) -> Vec<Event> {
     let deadline = Instant::now() + EVENT_TIMEOUT;
     let mut events = Vec::new();
     loop {
@@ -292,7 +292,7 @@ fn next_seam(seam: &mpsc::Receiver<SeamEvent>) -> SeamEvent {
     seam.recv_timeout(EVENT_TIMEOUT).expect("seam event")
 }
 
-/// One full real attach/bootstrap flow: `VclWorker::attach` over a real
+/// One full real attach/bootstrap flow: `Worker::attach` over a real
 /// `AppServer::serve`; listen resolved by the scripted control seam; a
 /// peer-open parent delivered as a real ACCEPTED `AppSessionPublication`;
 /// and a child stream-connect completed by a real CONNECTED
@@ -306,7 +306,7 @@ fn attach_bootstrap_connects_through_real_server_and_publication() {
     let publisher = server.publisher();
     let application_mqs = build_application_mqs();
     // The daemon's attach closure fetch_adds: the first allocation is
-    // ApplicationId(1), not 0 (ApplicationId(0) is no real identity).
+    // u32(1), not 0 (u32(0) is no real identity).
     let allocated = Arc::new(AtomicU64::new(1));
     let detached = Arc::new(AtomicU64::new(0));
     let (seam_tx, seam_rx) = mpsc::channel();
@@ -318,22 +318,18 @@ fn attach_bootstrap_connects_through_real_server_and_publication() {
         seam_tx,
     );
 
-    // Public attach: the daemon allocated a real ApplicationId and delivered
+    // Public attach: the daemon allocated a real u32 and delivered
     // the real ApplicationMqPublication resources over the attach protocol.
-    let mut worker = VclWorker::attach(&path_text, 8).expect("VCL attach");
-    let application = ApplicationId::from_raw(allocated.load(Ordering::Relaxed));
-    assert_ne!(
-        application,
-        ApplicationId::from_raw(0),
-        "real ApplicationId"
-    );
+    let mut worker = Worker::attach(&path_text).expect("VCL attach");
+    let application = allocated.load(Ordering::Relaxed) as u32;
+    assert_ne!(application, (0), "real u32");
 
     // Listen: the scripted control seam consumes the real LISTEN request and
     // replies BOUND on the real reply queue; the listener itself needs no
     // Session publication.
     let listener = worker
         .session_listen(
-            TransportProtocol::Quic,
+            4,
             SessionListenEndpoint::new(LOCAL, DataWorkerId::new(0)),
             None,
         )
@@ -341,15 +337,12 @@ fn attach_bootstrap_connects_through_real_server_and_publication() {
     let SeamEvent::Listen(request, bound) = next_seam(&seam_rx) else {
         panic!("expected Listen seam event")
     };
-    assert_eq!(request.transport, TransportProtocol::Quic);
-    assert_eq!(
-        request.application, application,
-        "real ApplicationId on the wire"
-    );
+    assert_eq!(request.transport, 4);
+    assert_eq!(request.application, application, "real u32 on the wire");
     assert_eq!(bound.result, Ok(LISTENER_WIRE));
     assert_eq!(
         worker.session_state(listener).expect("listener state"),
-        VclSessionState::Listen
+        SessionState::Listen
     );
 
     // Peer-open parent: one real ACCEPTED publication with descriptors.
@@ -357,7 +350,7 @@ fn attach_bootstrap_connects_through_real_server_and_publication() {
     let mut parent_publication = parent_published.publication;
     parent_publication
         .set_accepted(SessionAcceptedMsg::new(
-            application.raw(),
+            application.into(),
             LISTENER_WIRE,
             PEER_WIRE,
             SessionFlags::STREAM | SessionFlags::UNIDIRECTIONAL,
@@ -368,7 +361,7 @@ fn attach_bootstrap_connects_through_real_server_and_publication() {
         .expect("publish parent");
     let events = pump_events(&mut worker);
     assert_eq!(events.len(), 1, "one Accepted event, got {events:?}");
-    let VclEvent::Accepted {
+    let Event::Accepted {
         session: parent,
         parent: accepted_parent,
     } = events[0]
@@ -379,38 +372,36 @@ fn attach_bootstrap_connects_through_real_server_and_publication() {
     assert_ne!(parent, listener);
     assert_eq!(
         worker.session_state(parent).expect("parent state"),
-        VclSessionState::Ready
+        SessionState::Ready
     );
     let parent_attributes = worker
         .session_attributes(parent)
         .expect("parent attributes");
     assert!(parent_attributes.stream);
     assert!(parent_attributes.unidirectional);
-    assert_eq!(parent_attributes.initiator, VclInitiator::Peer);
+    assert_eq!(parent_attributes.initiator, Initiator::Peer);
     let SeamEvent::AcceptedReply(accepted_reply) = next_seam(&seam_rx) else {
         panic!("expected AcceptedReply seam event")
     };
-    assert_eq!(accepted_reply.context, application.raw());
+    assert_eq!(accepted_reply.context, application as u64);
     assert_eq!(accepted_reply.session, PEER_WIRE);
     assert!(accepted_reply.result.is_ok());
 
     // Child stream-connect: the real CONNECT_STREAM request is consumed by
     // the scripted control seam; the child leaves the call in Connecting.
-    let child = worker
-        .session_create(TransportProtocol::Quic, true)
-        .expect("create");
+    let child = worker.session_create(4, true).expect("create");
     worker
         .session_stream_connect(child, parent, REMOTE, None, SessionFlags::empty())
         .expect("nonblocking connect returns immediately");
     assert_eq!(
         worker.session_state(child).expect("child state"),
-        VclSessionState::Connecting
+        SessionState::Connecting
     );
     let SeamEvent::Connect(request) = next_seam(&seam_rx) else {
         panic!("expected Connect seam event")
     };
-    assert_eq!(request.context, child.raw());
-    assert_eq!(request.transport, TransportProtocol::Quic);
+    assert_eq!(request.context, child as u64);
+    assert_eq!(request.transport, 4);
     assert_eq!(request.remote, REMOTE);
     assert_eq!(request.parent_handle, Some(PEER_WIRE));
     assert!(request.flags.contains(SessionFlags::STREAM));
@@ -421,7 +412,7 @@ fn attach_bootstrap_connects_through_real_server_and_publication() {
     let child_published = build_publication(application, CHILD_WIRE, &application_mqs);
     let mut child_publication = child_published.publication;
     child_publication.set_connected(SessionConnectedMsg {
-        context: child.raw(),
+        context: child.into(),
         result: Ok(CHILD_WIRE),
         local: Some(LOCAL),
         remote: Some(REMOTE),
@@ -432,15 +423,15 @@ fn attach_bootstrap_connects_through_real_server_and_publication() {
         .try_publish(&child_publication)
         .expect("publish child");
     let events = pump_events(&mut worker);
-    assert_eq!(events, vec![VclEvent::Connected { session: child }]);
+    assert_eq!(events, vec![Event::Connected { session: child }]);
     assert_eq!(
         worker.session_state(child).expect("child state"),
-        VclSessionState::Ready
+        SessionState::Ready
     );
     let attributes = worker.session_attributes(child).expect("child attributes");
     assert!(attributes.stream);
     assert!(!attributes.unidirectional);
-    assert_eq!(attributes.initiator, VclInitiator::Local);
+    assert_eq!(attributes.initiator, Initiator::Local);
     assert!(attributes.readable());
     assert!(attributes.writable());
 
@@ -489,11 +480,9 @@ fn attach_bootstrap_generic_connect_forwards_server_name_and_opaque() {
         Arc::clone(&detached),
         seam_tx,
     );
-    let mut worker = VclWorker::attach(&path_text, 8).expect("VCL attach");
+    let mut worker = Worker::attach(&path_text).expect("VCL attach");
 
-    let session = worker
-        .session_create(TransportProtocol::Http, true)
-        .expect("create");
+    let session = worker.session_create(7, true).expect("create");
     worker
         .session_connect(
             session,
@@ -505,7 +494,7 @@ fn attach_bootstrap_generic_connect_forwards_server_name_and_opaque() {
         .expect("nonblocking connect returns immediately");
     assert_eq!(
         worker.session_state(session).expect("session state"),
-        VclSessionState::Connecting
+        SessionState::Connecting
     );
 
     // The scripted control seam consumed the real CONNECT: create-time
@@ -515,7 +504,7 @@ fn attach_bootstrap_generic_connect_forwards_server_name_and_opaque() {
     let SeamEvent::Connect(request) = next_seam(&seam_rx) else {
         panic!("expected Connect seam event")
     };
-    assert_eq!(request.transport, TransportProtocol::Http);
+    assert_eq!(request.transport, 7);
     assert_eq!(request.remote, REMOTE);
     assert_eq!(request.local, Some(LOCAL));
     assert_eq!(request.opaque, Some(0xCAFE));
@@ -531,7 +520,7 @@ fn attach_bootstrap_generic_connect_forwards_server_name_and_opaque() {
 
     // The real CONNECTED publication with descriptors completes the Session
     // through `session_poll`.
-    let application = ApplicationId::from_raw(allocated.load(Ordering::Relaxed));
+    let application = allocated.load(Ordering::Relaxed) as u32;
     let child_published = build_publication(application, CHILD_WIRE, &application_mqs);
     let mut child_publication = child_published.publication;
     child_publication.set_connected(SessionConnectedMsg {
@@ -546,18 +535,15 @@ fn attach_bootstrap_generic_connect_forwards_server_name_and_opaque() {
         .try_publish(&child_publication)
         .expect("publish child");
     let events = pump_events(&mut worker);
-    assert_eq!(events, vec![VclEvent::Connected { session }]);
+    assert_eq!(events, vec![Event::Connected { session }]);
     assert_eq!(
         worker.session_state(session).expect("session state"),
-        VclSessionState::Ready
+        SessionState::Ready
     );
     let attributes = worker.session_attributes(session).expect("attributes");
     assert!(attributes.stream);
-    assert_eq!(attributes.initiator, VclInitiator::Local);
-    assert_eq!(
-        worker.session_proto(session).expect("session proto"),
-        TransportProtocol::Http
-    );
+    assert_eq!(attributes.initiator, Initiator::Local);
+    assert_eq!(worker.session_proto(session).expect("session proto"), 7);
 
     assert_eq!(detached.load(Ordering::Relaxed), 0, "no detach observed");
     drop(worker);

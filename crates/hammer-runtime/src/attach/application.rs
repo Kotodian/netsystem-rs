@@ -6,7 +6,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use hammer_infra::segment::Segment;
 use tokio::io::unix::AsyncFd;
 
-use crate::app::{ApplicationId, SessionMsgQueue, SessionProducer, SingleProducer};
+use crate::app::{SessionMsgQueue, SessionProducer, SingleProducer};
 use crate::{AttachError, RuntimeResult};
 
 use super::{ATTACH_PROTOCOL_VERSION, MAX_ATTACH_DESCRIPTORS, descriptor};
@@ -124,7 +124,7 @@ pub(super) struct ApplicationAttachment {
 
 impl ApplicationAttachment {
     pub(super) fn create(
-        application: ApplicationId,
+        application: u32,
         application_mqs: ApplicationMqPublication,
     ) -> RuntimeResult<Self> {
         let sequence = SEGMENT_SEQUENCE.fetch_add(1, Ordering::Relaxed);
@@ -132,7 +132,7 @@ impl ApplicationAttachment {
             &format!(
                 "hammer-app-mq-{}-{}-{sequence}",
                 std::process::id(),
-                application.raw()
+                application
             ),
             SEGMENT_BYTES,
         )
@@ -236,9 +236,9 @@ impl ApplicationAttachment {
 }
 
 pub(super) async fn monitor(
-    application: ApplicationId,
+    application: u32,
     signal: OwnedFd,
-    ready: tokio::sync::mpsc::Sender<ApplicationId>,
+    ready: tokio::sync::mpsc::Sender<u32>,
 ) -> RuntimeResult<()> {
     let signal =
         AsyncFd::new(signal).map_err(|source| AttachError::ControlSignalRegistration { source })?;

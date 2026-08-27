@@ -8,11 +8,10 @@ use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use hammer_infra::segment::Segment;
 
 use hammer_runtime::app::{
-    ApplicationId, SessionAcceptedMsg, SessionAcceptedReplyMsg, SessionBoundMsg,
-    SessionConnectError, SessionConnectMsg, SessionConnectedMsg, SessionControlError,
-    SessionControlItem, SessionEvtType, SessionFlags, SessionHandle, SessionListenMsg,
-    SessionMsgQueue, SessionProducer, SessionUnlistenMsg, SessionUnlistenReplyMsg, SingleProducer,
-    TransportProtocol,
+    SessionAcceptedMsg, SessionAcceptedReplyMsg, SessionBoundMsg, SessionConnectError,
+    SessionConnectMsg, SessionConnectedMsg, SessionControlError, SessionControlItem,
+    SessionEvtType, SessionFlags, SessionHandle, SessionListenMsg, SessionMsgQueue,
+    SessionProducer, SessionUnlistenMsg, SessionUnlistenReplyMsg, SingleProducer,
 };
 use hammer_runtime::attach::{EXT_CONFIG_CHUNK_BYTES, EXT_CONFIG_CHUNK_COUNT, ExtConfigStore};
 use hammer_runtime::{
@@ -24,50 +23,6 @@ fn control_queue() -> (SessionMsgQueue<SingleProducer>, SessionProducer) {
     let queue = SessionMsgQueue::<SingleProducer>::with_control_defaults().expect("control queue");
     let producer = queue.claim_producer().expect("claim producer");
     (queue, producer)
-}
-
-#[test]
-fn transport_protocol_stable_values_and_names() {
-    assert_eq!(TransportProtocol::Tcp as u8, 0);
-    assert_eq!(TransportProtocol::Udp as u8, 1);
-    assert_eq!(TransportProtocol::Ct as u8, 2);
-    assert_eq!(TransportProtocol::Tls as u8, 3);
-    assert_eq!(TransportProtocol::Quic as u8, 4);
-    assert_eq!(TransportProtocol::Dtls as u8, 5);
-    assert_eq!(TransportProtocol::Srtp as u8, 6);
-    assert_eq!(TransportProtocol::Http as u8, 7);
-
-    assert_eq!(TransportProtocol::Tcp.name(), "tcp");
-    assert_eq!(TransportProtocol::Udp.name(), "udp");
-    assert_eq!(TransportProtocol::Quic.name(), "quic");
-    assert_eq!(TransportProtocol::Tls.name(), "tls");
-    assert_eq!(TransportProtocol::Ct.name(), "ct");
-    assert_eq!(TransportProtocol::Dtls.name(), "dtls");
-    assert_eq!(TransportProtocol::Srtp.name(), "srtp");
-    assert_eq!(TransportProtocol::Http.name(), "http");
-
-    assert_eq!(
-        TransportProtocol::try_from("tcp"),
-        Ok(TransportProtocol::Tcp)
-    );
-    assert_eq!(
-        TransportProtocol::try_from("quic"),
-        Ok(TransportProtocol::Quic)
-    );
-    assert_eq!(
-        TransportProtocol::try_from("http"),
-        Ok(TransportProtocol::Http)
-    );
-    assert!(TransportProtocol::try_from("sctp").is_err());
-    assert_eq!(
-        TransportProtocol::try_from(4_u8),
-        Ok(TransportProtocol::Quic)
-    );
-    assert_eq!(
-        TransportProtocol::try_from(7_u8),
-        Ok(TransportProtocol::Http)
-    );
-    assert!(TransportProtocol::try_from(8_u8).is_err());
 }
 
 #[test]
@@ -109,10 +64,10 @@ fn connect_round_trips_through_control_queue() {
     let (mut queue, mut producer) = control_queue();
     let message = SessionConnectMsg::connect(
         41,
-        TransportProtocol::Quic,
+        4,
         SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 4433),
         Some(SocketAddr::new(IpAddr::V6(Ipv6Addr::LOCALHOST), 0)),
-        ApplicationId::new(9),
+        (9),
         Some(77),
     );
     producer.enqueue_control(&message).expect("enqueue");
@@ -132,10 +87,10 @@ fn connect_stream_selects_connect_stream_event_and_pins_parent() {
     let parent = SessionHandle::new(17, 3);
     let message = SessionConnectMsg::connect_stream(
         41,
-        TransportProtocol::Quic,
+        4,
         SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 4433),
         None,
-        ApplicationId::new(9),
+        (9),
         parent,
         SessionFlags::UNIDIRECTIONAL,
         Some(77),
@@ -155,10 +110,10 @@ fn connect_stream_selects_connect_stream_event_and_pins_parent() {
 fn ordinary_connect_carries_no_parent_handle() {
     let message = SessionConnectMsg::connect(
         41,
-        TransportProtocol::Tcp,
+        0,
         SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 8080),
         None,
-        ApplicationId::new(9),
+        (9),
         None,
     );
 
@@ -273,9 +228,9 @@ fn listen_round_trip_preserves_endpoint_transport_and_flags() {
     );
     let message = SessionListenMsg {
         context: 51,
-        transport: TransportProtocol::Quic,
+        transport: 4,
         endpoint,
-        application: ApplicationId::new(9),
+        application: (9),
         app: None,
         flags: SessionFlags::UNIDIRECTIONAL,
         opaque: Some(9),

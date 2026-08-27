@@ -6,12 +6,11 @@ use std::sync::Arc;
 
 use bytes::BytesMut;
 use hammer_infra::fifo::Fifo;
-use hammer_service::session::SessionId;
 use quinn_proto::{StreamDataError, StreamDataIo, StreamId};
 
 pub(super) struct StreamIoEntry {
     pub(super) context: u32,
-    pub(super) session: SessionId,
+    pub(super) session: u32,
     pub(super) rx_fifo: Arc<Fifo>,
     pub(super) tx_fifo: Arc<Fifo>,
     pub(super) bytes_written: u64,
@@ -25,7 +24,7 @@ pub(super) struct StreamIoEntry {
 #[derive(Debug)]
 pub(super) struct StreamIoEvent {
     pub(super) context: u32,
-    pub(super) session: SessionId,
+    pub(super) session: u32,
     pub(super) rx: u64,
     pub(super) tx_deq: u64,
     pub(super) bytes_written: u64,
@@ -48,7 +47,7 @@ impl StreamIoTable {
         &mut self,
         stream: StreamId,
         context: u32,
-        session: SessionId,
+        session: u32,
         rx_fifo: Arc<Fifo>,
         tx_fifo: Arc<Fifo>,
         bytes_written: u64,
@@ -80,7 +79,7 @@ impl StreamIoTable {
         assert!(previous.is_none(), "stream Session installed exactly once");
     }
 
-    pub(super) fn stream_session(&self, stream: StreamId) -> Option<SessionId> {
+    pub(super) fn stream_session(&self, stream: StreamId) -> Option<u32> {
         self.streams.get(&stream).map(|entry| entry.session)
     }
 
@@ -304,7 +303,6 @@ mod tests {
     use std::sync::Arc;
 
     use hammer_infra::fifo::Fifo;
-    use hammer_service::session::SessionId;
     use quinn_proto::{Dir, Side, StreamId};
 
     use super::*;
@@ -325,22 +323,14 @@ mod tests {
         let (rx, tx) = test_fifos();
         let stream = test_stream();
         let mut table = StreamIoTable::new();
-        table.install_stream(
-            stream,
-            7,
-            SessionId::from_raw(9),
-            Arc::clone(&rx),
-            Arc::clone(&tx),
-            0,
-            0,
-        );
+        table.install_stream(stream, 7, 9, Arc::clone(&rx), Arc::clone(&tx), 0, 0);
 
         assert_eq!(table.receive(stream, 0, b"abc").expect("receive"), 3);
         assert_eq!(rx.max_dequeue(), 3);
         let mut events = Vec::new();
         table.take_events(&mut events);
         assert_eq!(events.len(), 1);
-        assert_eq!(events[0].session, SessionId::from_raw(9));
+        assert_eq!(events[0].session, 9);
         assert_eq!(events[0].rx, 3);
 
         tx.enqueue(b"abc");
@@ -368,7 +358,7 @@ mod tests {
         table.install_stream(
             stream,
             8,
-            SessionId::from_raw(10),
+            10,
             Arc::clone(&rx),
             Arc::new(Fifo::with_capacity(1024).expect("tx FIFO")),
             0,
@@ -393,26 +383,10 @@ mod tests {
         let (rx, tx) = test_fifos();
         let stream = test_stream();
         let mut table = StreamIoTable::new();
-        table.install_stream(
-            stream,
-            7,
-            SessionId::from_raw(9),
-            Arc::clone(&rx),
-            Arc::clone(&tx),
-            0,
-            0,
-        );
-        table.install_stream(
-            stream,
-            7,
-            SessionId::from_raw(9),
-            Arc::clone(&rx),
-            Arc::clone(&tx),
-            0,
-            0,
-        );
+        table.install_stream(stream, 7, 9, Arc::clone(&rx), Arc::clone(&tx), 0, 0);
+        table.install_stream(stream, 7, 9, Arc::clone(&rx), Arc::clone(&tx), 0, 0);
 
-        assert_eq!(table.stream_session(stream), Some(SessionId::from_raw(9)));
+        assert_eq!(table.stream_session(stream), Some(9));
         assert_eq!(table.stream_context(stream), Some(7));
         assert_eq!(table.receive(stream, 0, b"abc").expect("receive"), 3);
         assert_eq!(rx.max_dequeue(), 3);
@@ -427,15 +401,7 @@ mod tests {
         let tx = Fifo::with_capacity(1024).expect("tx FIFO");
         let stream = test_stream();
         let mut table = StreamIoTable::new();
-        table.install_stream(
-            stream,
-            7,
-            SessionId::from_raw(9),
-            Arc::clone(&rx),
-            Arc::new(tx),
-            0,
-            0,
-        );
+        table.install_stream(stream, 7, 9, Arc::clone(&rx), Arc::new(tx), 0, 0);
 
         let error = table
             .receive(stream, 0, b"abcdef")
@@ -457,15 +423,7 @@ mod tests {
         let (rx, tx) = test_fifos();
         let stream = test_stream();
         let mut table = StreamIoTable::new();
-        table.install_stream(
-            stream,
-            7,
-            SessionId::from_raw(9),
-            Arc::clone(&rx),
-            Arc::clone(&tx),
-            0,
-            0,
-        );
+        table.install_stream(stream, 7, 9, Arc::clone(&rx), Arc::clone(&tx), 0, 0);
 
         assert_eq!(table.receive(stream, 0, b"abc").expect("receive"), 3);
         assert_eq!(rx.dequeue_drop(1), 1);

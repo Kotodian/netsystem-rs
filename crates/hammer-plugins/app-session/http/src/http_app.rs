@@ -40,12 +40,12 @@
 //! callback still waits on lifecycle state its owning slice has not landed.
 
 use hammer_runtime::app::{SessionAppContext, SessionAppRegistration, SessionFlags};
-use hammer_runtime::session::{SessionApplicationErrorCode, SessionStreamDirection};
+use hammer_runtime::session::SessionStreamDirection;
 use hammer_runtime::{DataWorkerId, Engine, RuntimeError, RuntimeResult};
+use hammer_service::session::SessionEndpointRole;
 use hammer_service::session::error::SessionError;
 use hammer_service::session::protocol::SessionAppCallbacks;
 use hammer_service::session::runtime::{SessionAcceptMetadata, SessionWorker};
-use hammer_service::session::{SessionEndpointRole, SessionId};
 
 use crate::http_common::PublishError;
 use crate::http3::proto::error::ErrorCode;
@@ -121,7 +121,7 @@ pub(crate) enum HttpAppError {
     #[error(
         "http stream accept requires a live parent connection context, session {session:?} has none"
     )]
-    StreamParentMissing { session: SessionId },
+    StreamParentMissing { session: u32 },
     #[error(
         "peer control stream finish reported a SETTINGS protocol error, which is structurally impossible; HTTP/3 code {code:?}"
     )]
@@ -215,19 +215,15 @@ fn execute_request_error_action(
     main: &HttpMain,
     worker: &mut SessionWorker<u32>,
     stream: StreamContextId,
-    session: SessionId,
+    session: u32,
     action: RequestErrorAction,
 ) -> RuntimeResult<()> {
     match action {
         RequestErrorAction::CloseConnection { code } => worker
-            .close_connection(
-                session,
-                SessionApplicationErrorCode::from(code.value()),
-                &[],
-            )
+            .close_connection(session, u64::from(code.value()), &[])
             .map_err(RuntimeError::from),
         RequestErrorAction::ResetStream { code } => worker
-            .reset_stream(session, SessionApplicationErrorCode::from(code.value()))
+            .reset_stream(session, u64::from(code.value()))
             .map_err(RuntimeError::from),
         RequestErrorAction::ResetStreamAbortRequest { code } => {
             // VPP `http3_stream_terminate` (http3.c:140-149) notifies the
@@ -255,7 +251,7 @@ fn execute_request_error_action(
                     .map_err(RuntimeError::from)
             })?;
             worker
-                .reset_stream(session, SessionApplicationErrorCode::from(code.value()))
+                .reset_stream(session, u64::from(code.value()))
                 .map_err(RuntimeError::from)
         }
         RequestErrorAction::Retry => Ok(()),
@@ -282,7 +278,7 @@ fn execute_request_error_action(
 /// error is preserved (QUIC publish rollback, quic session_app.rs:37-49).
 pub(crate) fn accept(
     worker: &mut SessionWorker<u32>,
-    session: SessionId,
+    session: u32,
     context: SessionAppContext,
 ) -> RuntimeResult<()> {
     let main = HTTP_MAIN
@@ -297,7 +293,7 @@ pub(crate) fn accept(
 pub(crate) fn accept_on(
     main: &HttpMain,
     worker: &mut SessionWorker<u32>,
-    session: SessionId,
+    session: u32,
     context: SessionAppContext,
 ) -> RuntimeResult<()> {
     if context != 0 {
@@ -335,7 +331,7 @@ pub(crate) fn accept_on(
 fn accept_connection(
     main: &HttpMain,
     worker: &mut SessionWorker<u32>,
-    session: SessionId,
+    session: u32,
     role: Option<SessionEndpointRole>,
 ) -> RuntimeResult<()> {
     let context = main.with_worker(worker.worker(), |http| {
@@ -369,11 +365,7 @@ fn accept_connection(
         let _ = main.with_worker(worker.worker(), |http| {
             http.remove(context).map_err(RuntimeError::from)
         });
-        let _ = worker.close_connection(
-            session,
-            SessionApplicationErrorCode::from(H3_INTERNAL_ERROR),
-            &[],
-        );
+        let _ = worker.close_connection(session, H3_INTERNAL_ERROR, &[]);
         return Err(error);
     }
     Ok(())
@@ -393,7 +385,7 @@ fn accept_connection(
 fn accept_stream(
     main: &HttpMain,
     worker: &mut SessionWorker<u32>,
-    session: SessionId,
+    session: u32,
     metadata: SessionAcceptMetadata,
 ) -> RuntimeResult<()> {
     let parent = ContextId::from(
@@ -461,7 +453,7 @@ fn accept_stream(
 /// action here.
 pub(crate) fn disconnect(
     worker: &mut SessionWorker<u32>,
-    session: SessionId,
+    session: u32,
     context: SessionAppContext,
 ) -> RuntimeResult<()> {
     let main = HTTP_MAIN
@@ -476,7 +468,7 @@ pub(crate) fn disconnect(
 pub(crate) fn disconnect_on(
     main: &HttpMain,
     worker: &mut SessionWorker<u32>,
-    session: SessionId,
+    session: u32,
     context: SessionAppContext,
 ) -> RuntimeResult<()> {
     if context == 0 {
@@ -631,7 +623,7 @@ pub(crate) fn disconnect_on(
 /// allocation, lock, channel, or async work.
 pub(crate) fn reset(
     worker: &mut SessionWorker<u32>,
-    session: SessionId,
+    session: u32,
     context: SessionAppContext,
 ) -> RuntimeResult<()> {
     let main = HTTP_MAIN
@@ -651,7 +643,7 @@ fn stream_direction(
     main: &HttpMain,
     worker: &mut SessionWorker<u32>,
     stream: StreamContextId,
-    session: SessionId,
+    session: u32,
 ) -> RuntimeResult<Option<SessionStreamDirection>> {
     main.with_worker(worker.worker(), |http| {
         http.get_stream_for_session(stream, session)
@@ -669,7 +661,7 @@ fn stream_direction(
 pub(crate) fn reset_on(
     main: &HttpMain,
     worker: &mut SessionWorker<u32>,
-    session: SessionId,
+    session: u32,
     context: SessionAppContext,
 ) -> RuntimeResult<()> {
     if context == 0 {
@@ -727,11 +719,7 @@ pub(crate) fn reset_on(
             Err(error) => return Err(RuntimeError::from(error)),
         };
         worker
-            .close_connection(
-                reset.session,
-                SessionApplicationErrorCode::from(reset.error_code.value()),
-                &[],
-            )
+            .close_connection(reset.session, u64::from(reset.error_code.value()), &[])
             .map_err(RuntimeError::from)?;
         Ok(())
     })
@@ -763,7 +751,7 @@ pub(crate) fn reset_on(
 /// path is O(1) with no scan, allocation, lock, channel, or async work.
 pub(crate) fn cleanup(
     worker: &mut SessionWorker<u32>,
-    session: SessionId,
+    session: u32,
     context: SessionAppContext,
 ) -> RuntimeResult<()> {
     let main = HTTP_MAIN
@@ -778,7 +766,7 @@ pub(crate) fn cleanup(
 pub(crate) fn cleanup_on(
     main: &HttpMain,
     worker: &mut SessionWorker<u32>,
-    session: SessionId,
+    session: u32,
     context: SessionAppContext,
 ) -> RuntimeResult<()> {
     if context == 0 {
@@ -873,7 +861,7 @@ struct FeedOutcome {
 /// `reset` resolve their contexts.
 pub(crate) fn builtin_rx(
     worker: &mut SessionWorker<u32>,
-    session: SessionId,
+    session: u32,
     context: SessionAppContext,
 ) -> RuntimeResult<()> {
     let main = HTTP_MAIN
@@ -921,7 +909,7 @@ pub(crate) fn builtin_rx(
 pub(crate) fn builtin_rx_on(
     main: &HttpMain,
     worker: &mut SessionWorker<u32>,
-    session: SessionId,
+    session: u32,
     context: SessionAppContext,
 ) -> RuntimeResult<()> {
     if context == 0 {

@@ -221,9 +221,7 @@ The following are explicitly retained because they have independent resource, pr
 - `NodeErrorIndex`;
 - `SessionId`;
 - `SessionHandle`;
-- `ApplicationId`;
-- `ApplicationListenerId`;
-- `ApplicationConnectionId`;
+- application, listener, and connection identity wrapper types;
 - `VclSessionHandle`;
 - stats `DirectoryIndex` and `SymlinkIndex`;
 - `AdjacencyIndex`, `LoadBalanceIndex`, and other forwarding-domain indexes;

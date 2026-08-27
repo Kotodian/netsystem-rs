@@ -2,7 +2,6 @@ use std::time::Instant;
 
 use hammer_runtime::app::{SessionAppContext, SessionAppRegistration};
 use hammer_runtime::{DataWorkerId, Engine, RuntimeError, RuntimeResult};
-use hammer_service::session::SessionId;
 use hammer_service::session::protocol::SessionAppCallbacks;
 use hammer_service::session::runtime::SessionWorker;
 
@@ -15,12 +14,9 @@ pub(crate) const NAME: &str = "quic";
 #[derive(Debug, thiserror::Error)]
 enum QuicSessionError {
     #[error("QUIC Session App context {context:?} does not own Session {session:?}")]
-    ContextSessionMismatch {
-        context: ContextId,
-        session: SessionId,
-    },
+    ContextSessionMismatch { context: ContextId, session: u32 },
     #[error("QUIC Session App context is missing for Session {session:?}")]
-    ContextMissing { session: SessionId },
+    ContextMissing { session: u32 },
 }
 
 fn with_quic_worker<R>(
@@ -35,7 +31,7 @@ fn with_quic_worker<R>(
 
 fn publish_context(
     worker: &mut SessionWorker<u32>,
-    session: SessionId,
+    session: u32,
     context: ContextId,
 ) -> RuntimeResult<()> {
     if let Err(error) = worker.set_app_session(session, context.into()) {
@@ -49,7 +45,7 @@ fn publish_context(
 
 fn accept(
     worker: &mut SessionWorker<u32>,
-    session: SessionId,
+    session: u32,
     context: SessionAppContext,
 ) -> RuntimeResult<()> {
     let listener = if context == 0 {
@@ -74,7 +70,7 @@ fn accept(
 
 fn connected(
     worker: &mut SessionWorker<u32>,
-    session: SessionId,
+    session: u32,
     _: SessionAppContext,
 ) -> RuntimeResult<()> {
     let (_, _, opaque, _) = worker
@@ -104,7 +100,7 @@ fn connected(
 
 fn builtin_rx(
     worker: &mut SessionWorker<u32>,
-    session: SessionId,
+    session: u32,
     context: SessionAppContext,
 ) -> RuntimeResult<()> {
     if context == 0 {
@@ -133,7 +129,7 @@ fn builtin_rx(
 
 fn builtin_tx(
     worker: &mut SessionWorker<u32>,
-    session: SessionId,
+    session: u32,
     context: SessionAppContext,
 ) -> RuntimeResult<()> {
     if context == 0 {
@@ -150,7 +146,7 @@ fn builtin_tx(
 
 fn close_lower_connection(
     worker: &mut SessionWorker<u32>,
-    session: SessionId,
+    session: u32,
     context: SessionAppContext,
 ) -> RuntimeResult<()> {
     if context == 0 {
@@ -243,7 +239,7 @@ mod tests {
         let close = CALLBACKS
             .transport_closed
             .expect("transport_closed callback");
-        close(&mut sessions, SessionId::from_raw(123), 0).expect("zero-context close succeeds");
+        close(&mut sessions, 123, 0).expect("zero-context close succeeds");
     }
 
     #[test]
@@ -261,12 +257,8 @@ mod tests {
             None,
         )
         .expect("test SessionWorker");
-        let error = publish_context(
-            &mut sessions,
-            SessionId::from_raw(123),
-            ContextId::from(1u64),
-        )
-        .expect_err("set_app_session fails for an unknown session");
+        let error = publish_context(&mut sessions, 123, ContextId::from(1u64))
+            .expect_err("set_app_session fails for an unknown session");
         assert!(
             matches!(
                 error,

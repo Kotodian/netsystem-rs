@@ -35,7 +35,7 @@ impl AppSessionInputNode {
     ) -> NodeRuntimeData {
         NodeRuntimeData::from_words([
             session_queue_data.word(0),
-            u64::from(session_queue.slot()),
+            session_queue.slot().into(),
             0,
             0,
         ])

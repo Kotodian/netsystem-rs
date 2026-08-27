@@ -9,7 +9,8 @@ use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
 
 use crate::TcpCapabilities;
-use hammer_runtime::{DataWorkerId, RuntimeResult, SessionHandle};
+use hammer_runtime::app::SessionHandle;
+use hammer_runtime::{DataWorkerId, RuntimeResult};
 
 use super::TcpInputControlPlane;
 use super::lookup::{

@@ -34,10 +34,10 @@ use std::sync::{Arc, mpsc};
 
 use arc_swap::ArcSwapOption;
 use hammer_core::data_plane::{BufferPacketCursor, NodeId, NodeState, SecondaryOpaque};
+use hammer_runtime::app::SessionHandle;
 use hammer_runtime::{
     DataPlaneRuntime, DataWorkerId, Engine, Node, NodeProcessFn, NodeRuntimeData, RuntimeError,
-    RuntimeResult, SessionConnectEndpoint, SessionConnectionId, SessionListenEndpoint,
-    SessionHandle, with_data_plane_runtime,
+    RuntimeResult, SessionConnectEndpoint, SessionListenEndpoint, with_data_plane_runtime,
 };
 use thiserror::Error;
 
@@ -47,7 +47,7 @@ use hammer_service::session::node::{SessionQueueNode, SessionQueueOutput};
 use hammer_service::session::runtime::{
     SessionMain, SessionTransport, SessionWorker, dispatch_session_queue_events,
 };
-use hammer_service::session::{SessionId, SessionQueueNext};
+use hammer_service::session::{SessionQueueNext, u32};
 
 pub mod config;
 pub mod congestion;
@@ -113,7 +113,7 @@ enum TcpWorkerError {
 pub(crate) fn publish_tcp_connection(
     sessions: &mut SessionWorker<u32>,
     tcp: &mut TcpWorker,
-    session_id: SessionId,
+    session_id: u32,
 ) -> RuntimeResult<()> {
     let (_, index) = sessions
         .session_transport(session_id)
@@ -286,7 +286,7 @@ pub static TCP_MAIN: ArcSwapOption<TcpMain> = ArcSwapOption::const_empty();
 
 pub(crate) fn start_listen(
     listener: SessionHandle,
-    _: hammer_runtime::app::ApplicationId,
+    _: u32,
     _: Option<u64>,
     endpoint: SessionListenEndpoint,
 ) -> RuntimeResult<()> {
@@ -345,7 +345,7 @@ pub(crate) fn connect(endpoint: SessionConnectEndpoint) -> RuntimeResult<()> {
 fn start_connect(
     sessions: &mut SessionWorker<u32>,
     tcp: &mut TcpWorker,
-    connection: SessionConnectionId,
+    connection: u32,
     local: SocketAddr,
     remote: SocketAddr,
 ) -> RuntimeResult<()> {
@@ -858,7 +858,7 @@ pub(crate) fn tcp_bytes_after_l3(packet: &[u8]) -> &[u8] {
 #[inline(always)]
 pub(crate) fn write_session_route_opaque(
     opaque: &mut SecondaryOpaque,
-    session_id: SessionId,
+    session_id: u32,
     owner: DataWorkerId,
     next: TcpInputNext,
 ) {
@@ -875,13 +875,13 @@ pub(crate) fn write_session_route_opaque(
 #[inline(always)]
 pub(crate) fn read_session_route_opaque(
     opaque: &SecondaryOpaque,
-) -> Option<(SessionId, DataWorkerId, TcpInputNext)> {
+) -> Option<(u32, DataWorkerId, TcpInputNext)> {
     let route = unsafe { *transmute::<&SecondaryOpaque, &TcpRouteOpaque>(opaque) };
     if route.present == 0 {
         return None;
     }
     Some((
-        SessionId::from_raw(route.session_raw),
+        route.session_raw,
         DataWorkerId::new(route.owner_worker),
         match route.next {
             value if value == TcpInputNext::Listen as u8 => TcpInputNext::Listen,
@@ -898,7 +898,7 @@ pub(crate) fn read_session_route_opaque(
 pub(crate) fn read_session_id(
     runtime: &DataPlaneRuntime,
     index: hammer_core::data_plane::Index,
-) -> RuntimeResult<Option<SessionId>> {
+) -> RuntimeResult<Option<u32>> {
     let buffer = runtime.get_buffer(index)?;
     Ok(read_session_route_opaque(buffer.opaque2()).map(|(session_id, _, _)| session_id))
 }
@@ -962,7 +962,7 @@ fn enqueue_tcp_segment(
 pub(crate) fn closing_session_for_test() -> (
     SessionWorker<u32>,
     TcpWorker,
-    SessionId,
+    u32,
     std::net::SocketAddr,
     std::net::SocketAddr,
 ) {

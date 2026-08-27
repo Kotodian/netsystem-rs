@@ -12,7 +12,6 @@ pub mod application;
 pub mod config;
 mod control;
 pub mod error;
-pub mod id;
 mod lookup;
 pub mod node;
 pub mod protocol;
@@ -25,7 +24,6 @@ pub use application::{
 };
 pub use config::Session;
 pub use error::{SessionConnectError, SessionQueueError};
-pub use id::SessionId;
 pub use node::{AppSessionInputNode, SESSION_QUEUE_IO_BUDGET, SessionQueueNext, SessionQueueNode};
 pub use protocol::{
     SessionApp, SessionAppCallback, SessionAppCallbacks, SessionAppSegmentCallback,

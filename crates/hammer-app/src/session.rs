@@ -1,26 +1,25 @@
 use std::net::SocketAddr;
 
-use hammer_runtime::app::{
-    ApplicationConnectionId, SessionAcceptedMsg, SessionAcceptedReplyMsg, SessionAppId,
-    SessionBoundMsg, SessionConnectMsg, SessionConnectedMsg, SessionControlItem,
-    SessionControlPayload, SessionEvtType, SessionFlags, SessionHandle, SessionListenMsg,
-    SessionUnlistenMsg, SessionUnlistenReplyMsg, TransportProtocol,
-};
 use hammer_runtime::SessionListenEndpoint;
+use hammer_runtime::app::{
+    SessionAcceptedMsg, SessionAcceptedReplyMsg, SessionBoundMsg, SessionConnectMsg,
+    SessionConnectedMsg, SessionControlItem, SessionControlPayload, SessionEvtType, SessionFlags,
+    SessionHandle, SessionListenMsg, SessionUnlistenMsg, SessionUnlistenReplyMsg,
+};
 
 use crate::attach::{AppClient, AppClientError, ControlReply, ControlReplyKind};
 
 impl AppClient {
     /// Registers a transport listener (VPP `session_listen_msg_t`).
     ///
-    /// The request carries the stable [`TransportProtocol`] and a
+    /// The request carries the stable [`u8`] and a
     /// Session-owned listen endpoint; the Session control plane selects the
     /// transport and owning worker. Blocks until the BOUND message.
     pub fn listen(
         &mut self,
-        transport: TransportProtocol,
+        transport: u8,
         endpoint: SessionListenEndpoint,
-        app: Option<SessionAppId>,
+        app: Option<u32>,
         opaque: Option<u64>,
     ) -> Result<SessionHandle, AppClientError> {
         let context = self.next_context();
@@ -55,7 +54,7 @@ impl AppClient {
     /// Opens one ordinary transport connection (VPP `session_connect_msg_t`).
     ///
     /// The Session owns the data-worker choice, so no external worker
-    /// identity is accepted; the returned [`ApplicationConnectionId`] selects
+    /// identity is accepted; the returned [`u32`] selects
     /// the CONNECTED message on [`Self::wait_connection`].
     /// Starts an active-open connect. `server_name` (SNI / QUIC-TLS server
     /// name) is stored in one bounded ext-config chunk in the shared
@@ -64,15 +63,15 @@ impl AppClient {
     /// daemon reads, validates, and frees the chunk exactly once.
     pub fn connect(
         &mut self,
-        transport: TransportProtocol,
+        transport: u8,
         remote: SocketAddr,
         local: Option<SocketAddr>,
-        app: Option<SessionAppId>,
+        app: Option<u32>,
         opaque: Option<u64>,
         server_name: Option<&str>,
-    ) -> Result<ApplicationConnectionId, AppClientError> {
+    ) -> Result<u32, AppClientError> {
         let context = self.next_context();
-        let connection = ApplicationConnectionId::from_raw(context as u32);
+        let connection = context as u32;
         let mut request = SessionConnectMsg::connect(
             context,
             transport,
@@ -126,13 +125,13 @@ impl AppClient {
     pub fn connect_stream(
         &mut self,
         context: u64,
-        transport: TransportProtocol,
+        transport: u8,
         remote: SocketAddr,
         local: Option<SocketAddr>,
         opaque: Option<u64>,
         parent: SessionHandle,
         flags: SessionFlags,
-    ) -> Result<ApplicationConnectionId, AppClientError> {
+    ) -> Result<u32, AppClientError> {
         let request = SessionConnectMsg::connect_stream(
             context,
             transport,
@@ -147,7 +146,7 @@ impl AppClient {
             .borrow_mut()
             .enqueue_control(&request)
             .map_err(|source| AppClientError::SessionControl { source })?;
-        Ok(ApplicationConnectionId::from_raw(context as u32))
+        Ok(context as u32)
     }
 
     /// Returns the next buffered Session control reply, or `None` when the
@@ -208,10 +207,7 @@ impl AppClient {
 
     /// Waits for the CONNECTED message of one active-open
     /// ([`Self::connect`]) and returns the established Session.
-    pub fn wait_connection(
-        &self,
-        connection: ApplicationConnectionId,
-    ) -> Result<crate::AppSession, AppClientError> {
+    pub fn wait_connection(&self, connection: u32) -> Result<crate::AppSession, AppClientError> {
         loop {
             if let Some(reply) = self.take_connection_reply(connection) {
                 return self.finish_connection(connection, reply);
@@ -246,7 +242,7 @@ impl AppClient {
                     .map_err(|source| AppClientError::SessionReplyWait { source })?;
             }
         }
-        let reply = SessionAcceptedReplyMsg::new(u64::from(self.application().raw()), handle, Ok(()));
+        let reply = SessionAcceptedReplyMsg::new(self.application().into(), handle, Ok(()));
         self.accepted_reply(&reply)?;
         Ok(session)
     }
@@ -259,7 +255,7 @@ impl AppClient {
 
     fn finish_connection(
         &self,
-        connection: ApplicationConnectionId,
+        connection: u32,
         connected: SessionConnectedMsg,
     ) -> Result<crate::AppSession, AppClientError> {
         match connected.result {
@@ -324,11 +320,8 @@ impl AppClient {
         }
     }
 
-    fn take_connection_reply(
-        &self,
-        connection: ApplicationConnectionId,
-    ) -> Option<SessionConnectedMsg> {
-        match self.take_reply(ControlReplyKind::Connected, u64::from(connection.raw())) {
+    fn take_connection_reply(&self, connection: u32) -> Option<SessionConnectedMsg> {
+        match self.take_reply(ControlReplyKind::Connected, connection.into()) {
             Some(ControlReply::Connected(reply)) => Some(reply),
             _ => None,
         }

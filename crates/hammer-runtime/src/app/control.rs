@@ -13,78 +13,7 @@ use thiserror::Error;
 use crate::{DataWorkerId, SessionListenEndpoint};
 
 use super::session_msg_queue::SESSION_CTRL_MSG_MAX_SIZE;
-use super::{ApplicationId, SessionAppId, SessionConnectError, SessionEvtType, SessionHandle};
-
-/// Stable Session transport protocol identifier.
-///
-/// Discriminants mirror VPP `transport_proto_t`
-/// (third_party/vpp/src/vnet/session/transport_types.h:165-180); names match
-/// the transport registration domain used by the Session transport plugins
-/// ("tcp", "udp", "ct", "tls", "quic", "dtls", "srtp", "http").
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-#[repr(u8)]
-pub enum TransportProtocol {
-    Tcp = 0,
-    Udp = 1,
-    Ct = 2,
-    Tls = 3,
-    Quic = 4,
-    Dtls = 5,
-    Srtp = 6,
-    Http = 7,
-}
-
-impl TransportProtocol {
-    /// Registration-domain name of this transport protocol.
-    pub const fn name(self) -> &'static str {
-        match self {
-            Self::Tcp => "tcp",
-            Self::Udp => "udp",
-            Self::Ct => "ct",
-            Self::Tls => "tls",
-            Self::Quic => "quic",
-            Self::Dtls => "dtls",
-            Self::Srtp => "srtp",
-            Self::Http => "http",
-        }
-    }
-}
-
-impl TryFrom<u8> for TransportProtocol {
-    type Error = u8;
-
-    fn try_from(value: u8) -> Result<Self, Self::Error> {
-        match value {
-            0 => Ok(Self::Tcp),
-            1 => Ok(Self::Udp),
-            2 => Ok(Self::Ct),
-            3 => Ok(Self::Tls),
-            4 => Ok(Self::Quic),
-            5 => Ok(Self::Dtls),
-            6 => Ok(Self::Srtp),
-            7 => Ok(Self::Http),
-            value => Err(value),
-        }
-    }
-}
-
-impl TryFrom<&str> for TransportProtocol {
-    type Error = ();
-
-    fn try_from(name: &str) -> Result<Self, Self::Error> {
-        match name {
-            "tcp" => Ok(Self::Tcp),
-            "udp" => Ok(Self::Udp),
-            "ct" => Ok(Self::Ct),
-            "tls" => Ok(Self::Tls),
-            "quic" => Ok(Self::Quic),
-            "dtls" => Ok(Self::Dtls),
-            "srtp" => Ok(Self::Srtp),
-            "http" => Ok(Self::Http),
-            _ => Err(()),
-        }
-    }
-}
+use super::{SessionConnectError, SessionEvtType, SessionHandle};
 
 bitflags::bitflags! {
     /// VPP Session flags carried by concrete control payloads.
@@ -282,8 +211,6 @@ pub enum SessionControlDecodeError {
         "Session control payload is truncated: {wire} wire bytes in a {available}-byte slot payload"
     )]
     Truncated { wire: usize, available: usize },
-    #[error("Session control payload carries unknown transport protocol {value}")]
-    UnknownTransportProtocol { value: u8 },
     #[error("Session control payload carries unknown error code {code}")]
     UnknownErrorCode { code: i32 },
 }
@@ -292,10 +219,10 @@ pub enum SessionControlDecodeError {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SessionListenMsg {
     pub context: u64,
-    pub transport: TransportProtocol,
+    pub transport: u8,
     pub endpoint: SessionListenEndpoint,
-    pub application: ApplicationId,
-    pub app: Option<SessionAppId>,
+    pub application: u32,
+    pub app: Option<u32>,
     pub flags: SessionFlags,
     pub opaque: Option<u64>,
 }
@@ -408,11 +335,11 @@ impl SessionAcceptedReplyMsg {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SessionConnectMsg {
     pub context: u64,
-    pub transport: TransportProtocol,
+    pub transport: u8,
     pub remote: SocketAddr,
     pub local: Option<SocketAddr>,
-    pub application: ApplicationId,
-    pub app: Option<SessionAppId>,
+    pub application: u32,
+    pub app: Option<u32>,
     /// Parent Session for a stream open; `None` for an ordinary CONNECT.
     ///
     /// CONNECT_STREAM is parent-handle pinned (VPP
@@ -434,10 +361,10 @@ impl SessionConnectMsg {
     #[allow(clippy::too_many_arguments)]
     pub fn connect(
         context: u64,
-        transport: TransportProtocol,
+        transport: u8,
         remote: SocketAddr,
         local: Option<SocketAddr>,
-        application: ApplicationId,
+        application: u32,
         opaque: Option<u64>,
     ) -> Self {
         Self {
@@ -457,10 +384,10 @@ impl SessionConnectMsg {
     #[allow(clippy::too_many_arguments)]
     pub fn connect_stream(
         context: u64,
-        transport: TransportProtocol,
+        transport: u8,
         remote: SocketAddr,
         local: Option<SocketAddr>,
-        application: ApplicationId,
+        application: u32,
         parent_handle: SessionHandle,
         flags: SessionFlags,
         opaque: Option<u64>,
@@ -548,7 +475,8 @@ struct ListenWire {
 struct BoundWire {
     context: u64,
     retval: i32,
-    handle: u64,
+    session_index: u32,
+    thread_index: u32,
     local_is_ip4: u8,
     local_ip: [u8; 16],
     local_port: u16,
@@ -559,14 +487,16 @@ struct BoundWire {
 #[derive(Clone, Copy)]
 struct UnlistenWire {
     context: u64,
-    listener: u64,
+    listener_session_index: u32,
+    listener_thread_index: u32,
 }
 
 #[repr(C, packed)]
 #[derive(Clone, Copy)]
 struct UnlistenReplyWire {
     context: u64,
-    listener: u64,
+    listener_session_index: u32,
+    listener_thread_index: u32,
     retval: i32,
 }
 
@@ -583,8 +513,9 @@ struct ConnectWire {
     local_port: u16,
     application: u32,
     app: u32,
-    /// `SESSION_INVALID_HANDLE` (u64::MAX) when none; VPP session_types.h:52.
-    parent_handle: u64,
+    /// `u32::MAX` fields identify an absent stream parent.
+    parent_session_index: u32,
+    parent_thread_index: u32,
     flags: u16,
     opaque: u64,
     /// VPP `session_connect_msg_t.ext_config` (uword offset; 0 = none).
@@ -596,7 +527,9 @@ struct ConnectWire {
 struct ConnectedWire {
     context: u64,
     retval: i32,
-    handle: u64,
+    session_index: u32,
+    thread_index: u32,
+    error_payload: u64,
     local_is_ip4: u8,
     local_ip: [u8; 16],
     local_port: u16,
@@ -611,8 +544,10 @@ struct ConnectedWire {
 #[derive(Clone, Copy)]
 struct AcceptedWire {
     context: u64,
-    listener: u64,
-    session: u64,
+    listener_session_index: u32,
+    listener_thread_index: u32,
+    session_index: u32,
+    session_thread_index: u32,
     flags: u16,
     local_is_ip4: u8,
     local_ip: [u8; 16],
@@ -627,7 +562,8 @@ struct AcceptedWire {
 #[derive(Clone, Copy)]
 struct AcceptedReplyWire {
     context: u64,
-    session: u64,
+    session_index: u32,
+    thread_index: u32,
     retval: i32,
 }
 
@@ -717,8 +653,8 @@ impl SessionControlPayload for SessionListenMsg {
                 ip,
                 port,
                 worker: self.endpoint.worker().slot() as u32,
-                application: self.application.raw(),
-                app: self.app.map_or(u32::MAX, SessionAppId::raw),
+                application: self.application,
+                app: self.app.map_or(u32::MAX, |app| app),
                 flags: self.flags.bits(),
                 opaque: self.opaque.unwrap_or(u64::MAX),
                 ext_config: 0,
@@ -729,8 +665,7 @@ impl SessionControlPayload for SessionListenMsg {
 
     fn decode_wire(payload: &[u8]) -> Result<Self, SessionControlDecodeError> {
         let wire = read_wire::<ListenWire>(payload)?;
-        let transport = TransportProtocol::try_from(wire.transport_proto)
-            .map_err(|value| SessionControlDecodeError::UnknownTransportProtocol { value })?;
+        let transport = wire.transport_proto;
         let endpoint = SessionListenEndpoint::new(
             decode_endpoint(wire.is_ip4, wire.ip, wire.port),
             DataWorkerId::new(wire.worker),
@@ -739,8 +674,8 @@ impl SessionControlPayload for SessionListenMsg {
             context: wire.context,
             transport,
             endpoint,
-            application: ApplicationId::from_raw(wire.application),
-            app: (wire.app != u32::MAX).then(|| SessionAppId::from_raw(wire.app)),
+            application: wire.application,
+            app: (wire.app != u32::MAX).then(|| wire.app),
             flags: SessionFlags::from_bits_retain(wire.flags),
             opaque: (wire.opaque != u64::MAX).then_some(wire.opaque),
         })
@@ -759,16 +694,17 @@ impl SessionControlPayload for SessionBoundMsg {
     const WIRE_BYTES: usize = size_of::<BoundWire>();
 
     fn encode_wire(&self, payload: &mut [u8]) {
-        let (retval, handle) = match self.result {
-            Ok(handle) => (0, handle.raw()),
-            Err(error) => (error.retval(), 0),
+        let (retval, session_index, thread_index) = match self.result {
+            Ok(handle) => (0, handle.session_index, handle.thread_index),
+            Err(error) => (error.retval(), 0, 0),
         };
         let (local_is_ip4, local_ip, local_port) = encode_optional_endpoint(self.local);
         write_wire(
             BoundWire {
                 context: self.context,
                 retval,
-                handle,
+                session_index,
+                thread_index,
                 local_is_ip4,
                 local_ip,
                 local_port,
@@ -781,7 +717,7 @@ impl SessionControlPayload for SessionBoundMsg {
     fn decode_wire(payload: &[u8]) -> Result<Self, SessionControlDecodeError> {
         let wire = read_wire::<BoundWire>(payload)?;
         let result = if wire.retval == 0 {
-            Ok(SessionHandle::from(wire.handle))
+            Ok(SessionHandle::new(wire.session_index, wire.thread_index))
         } else {
             Err(SessionControlError::from_retval(wire.retval)
                 .ok_or(SessionControlDecodeError::UnknownErrorCode { code: wire.retval })?)
@@ -810,7 +746,8 @@ impl SessionControlPayload for SessionUnlistenMsg {
         write_wire(
             UnlistenWire {
                 context: self.context,
-                listener: self.listener.raw(),
+                listener_session_index: self.listener.session_index,
+                listener_thread_index: self.listener.thread_index,
             },
             payload,
         );
@@ -820,7 +757,7 @@ impl SessionControlPayload for SessionUnlistenMsg {
         let wire = read_wire::<UnlistenWire>(payload)?;
         Ok(Self {
             context: wire.context,
-            listener: SessionHandle::from(wire.listener),
+            listener: SessionHandle::new(wire.listener_session_index, wire.listener_thread_index),
         })
     }
 }
@@ -844,7 +781,8 @@ impl SessionControlPayload for SessionUnlistenReplyMsg {
         write_wire(
             UnlistenReplyWire {
                 context: self.context,
-                listener: self.listener.raw(),
+                listener_session_index: self.listener.session_index,
+                listener_thread_index: self.listener.thread_index,
                 retval,
             },
             payload,
@@ -861,7 +799,7 @@ impl SessionControlPayload for SessionUnlistenReplyMsg {
         };
         Ok(Self {
             context: wire.context,
-            listener: SessionHandle::from(wire.listener),
+            listener: SessionHandle::new(wire.listener_session_index, wire.listener_thread_index),
             result,
         })
     }
@@ -898,9 +836,14 @@ impl SessionControlPayload for SessionConnectMsg {
                 local_is_ip4,
                 local_ip,
                 local_port,
-                application: self.application.raw(),
-                app: self.app.map_or(u32::MAX, SessionAppId::raw),
-                parent_handle: self.parent_handle.map_or(u64::MAX, SessionHandle::raw),
+                application: self.application,
+                app: self.app.map_or(u32::MAX, |app| app),
+                parent_session_index: self
+                    .parent_handle
+                    .map_or(u32::MAX, |handle| handle.session_index),
+                parent_thread_index: self
+                    .parent_handle
+                    .map_or(u32::MAX, |handle| handle.thread_index),
                 flags: self.flags.bits(),
                 opaque: self.opaque.unwrap_or(u64::MAX),
                 ext_config: self.ext_config.unwrap_or(0),
@@ -911,17 +854,20 @@ impl SessionControlPayload for SessionConnectMsg {
 
     fn decode_wire(payload: &[u8]) -> Result<Self, SessionControlDecodeError> {
         let wire = read_wire::<ConnectWire>(payload)?;
-        let transport = TransportProtocol::try_from(wire.transport_proto)
-            .map_err(|value| SessionControlDecodeError::UnknownTransportProtocol { value })?;
+        let transport = wire.transport_proto;
         Ok(Self {
             context: wire.context,
             transport,
             remote: decode_endpoint(wire.remote_is_ip4, wire.remote_ip, wire.remote_port),
             local: decode_optional_endpoint(wire.local_is_ip4, wire.local_ip, wire.local_port),
-            application: ApplicationId::from_raw(wire.application),
-            app: (wire.app != u32::MAX).then(|| SessionAppId::from_raw(wire.app)),
-            parent_handle: (wire.parent_handle != u64::MAX)
-                .then(|| SessionHandle::from(wire.parent_handle)),
+            application: wire.application,
+            app: (wire.app != u32::MAX).then(|| wire.app),
+            parent_handle: (wire.parent_session_index != u32::MAX
+                && wire.parent_thread_index != u32::MAX)
+                .then_some(SessionHandle::new(
+                    wire.parent_session_index,
+                    wire.parent_thread_index,
+                )),
             flags: SessionFlags::from_bits_retain(wire.flags),
             opaque: (wire.opaque != u64::MAX).then_some(wire.opaque),
             ext_config: (wire.ext_config != 0).then_some(wire.ext_config),
@@ -943,10 +889,12 @@ impl SessionControlPayload for SessionConnectedMsg {
     fn encode_wire(&self, payload: &mut [u8]) {
         // On error the handle field carries the full error payload (unused in
         // VPP's connected reply when `retval < 0`).
-        let (retval, handle) = match self.result {
-            Ok(handle) => (0, handle.raw()),
+        let (retval, session_index, thread_index, error_payload) = match self.result {
+            Ok(handle) => (0, handle.session_index, handle.thread_index, 0),
             Err(error) => (
                 session_connect_error_retval(error),
+                0,
+                0,
                 session_connect_error_code(error),
             ),
         };
@@ -956,7 +904,9 @@ impl SessionControlPayload for SessionConnectedMsg {
             ConnectedWire {
                 context: self.context,
                 retval,
-                handle,
+                session_index,
+                thread_index,
+                error_payload,
                 local_is_ip4,
                 local_ip,
                 local_port,
@@ -973,10 +923,12 @@ impl SessionControlPayload for SessionConnectedMsg {
     fn decode_wire(payload: &[u8]) -> Result<Self, SessionControlDecodeError> {
         let wire = read_wire::<ConnectedWire>(payload)?;
         let result = if wire.retval == 0 {
-            Ok(SessionHandle::from(wire.handle))
+            Ok(SessionHandle::new(wire.session_index, wire.thread_index))
         } else {
-            Err(session_connect_error_from_retval(wire.retval, wire.handle)
-                .ok_or(SessionControlDecodeError::UnknownErrorCode { code: wire.retval })?)
+            Err(
+                session_connect_error_from_retval(wire.retval, wire.error_payload)
+                    .ok_or(SessionControlDecodeError::UnknownErrorCode { code: wire.retval })?,
+            )
         };
         Ok(Self {
             context: wire.context,
@@ -1006,8 +958,10 @@ impl SessionControlPayload for SessionAcceptedMsg {
         write_wire(
             AcceptedWire {
                 context: self.context,
-                listener: self.listener.raw(),
-                session: self.session.raw(),
+                listener_session_index: self.listener.session_index,
+                listener_thread_index: self.listener.thread_index,
+                session_index: self.session.session_index,
+                session_thread_index: self.session.thread_index,
                 flags: self.flags.bits(),
                 local_is_ip4,
                 local_ip,
@@ -1025,8 +979,8 @@ impl SessionControlPayload for SessionAcceptedMsg {
         let wire = read_wire::<AcceptedWire>(payload)?;
         Ok(Self {
             context: wire.context,
-            listener: SessionHandle::from(wire.listener),
-            session: SessionHandle::from(wire.session),
+            listener: SessionHandle::new(wire.listener_session_index, wire.listener_thread_index),
+            session: SessionHandle::new(wire.session_index, wire.session_thread_index),
             flags: SessionFlags::from_bits_retain(wire.flags),
             local: decode_optional_endpoint(wire.local_is_ip4, wire.local_ip, wire.local_port),
             remote: decode_optional_endpoint(wire.remote_is_ip4, wire.remote_ip, wire.remote_port),
@@ -1054,7 +1008,8 @@ impl SessionControlPayload for SessionAcceptedReplyMsg {
         write_wire(
             AcceptedReplyWire {
                 context: self.context,
-                session: self.session.raw(),
+                session_index: self.session.session_index,
+                thread_index: self.session.thread_index,
                 retval,
             },
             payload,
@@ -1071,7 +1026,7 @@ impl SessionControlPayload for SessionAcceptedReplyMsg {
         };
         Ok(Self {
             context: wire.context,
-            session: SessionHandle::from(wire.session),
+            session: SessionHandle::new(wire.session_index, wire.thread_index),
             result,
         })
     }

@@ -182,13 +182,7 @@ fn tcp_established_index(
                 buffer.advance(packet.payload_offset.saturating_add(trim) as isize)?;
                 buffer.truncate(accepted_len as usize)?;
             }
-            let delivery = sessions.enqueue_rx(
-                runtime.buffers(),
-                session_id,
-                index,
-                offset,
-                packet.flags.contains(crate::TcpSegmentFlags::URG),
-            )?;
+            let delivery = sessions.enqueue_rx(runtime.buffers(), session_id, index, offset)?;
             let rx_available = match delivery {
                 RxDelivery::NotAccepted { rx_available }
                 | RxDelivery::InOrder { rx_available, .. }

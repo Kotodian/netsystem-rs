@@ -5,18 +5,18 @@
 //! through the bucket word, and retires old offsets only after no lookup
 //! hazard protects them.
 
-use std::alloc::{handle_alloc_error, GlobalAlloc, Layout};
+use std::alloc::{GlobalAlloc, Layout, handle_alloc_error};
 use std::cell::UnsafeCell;
 use std::ptr::NonNull;
-use std::sync::atomic::{AtomicBool, AtomicPtr, AtomicU64, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicPtr, AtomicU64, Ordering};
 
 use crossbeam_utils::CachePadded;
 
 use crate::align::CACHE_LINE;
 use crate::bihash::value::ValuePage;
 use crate::heap::Heap;
-use crate::heap_boxed::{allocate_in, deallocate_in, Slice};
+use crate::heap_boxed::{Slice, allocate_in, deallocate_in};
 
 const MAX_LOG2_PAGES: usize = 8;
 const NO_OFFSET: u64 = 0;

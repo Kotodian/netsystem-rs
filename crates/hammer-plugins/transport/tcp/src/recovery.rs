@@ -968,7 +968,7 @@ impl TcpRecoveryState {
         } else {
             self.sample_tail = sample.prev;
         }
-        let sample = self.sent_samples.remove(index);
+        let sample = self.sent_samples.remove(index)?;
         self.bytes_in_flight = self.bytes_in_flight.saturating_sub(sample.bytes);
         self.rack_invalidate_cleared(cleared);
         Some(sample)

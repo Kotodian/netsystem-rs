@@ -8,10 +8,7 @@ use std::thread::{self, ThreadId};
 use hammer_infra::pool::Pool;
 use hammer_infra::segment::Segment;
 use hammer_runtime::Engine;
-use hammer_runtime::app::{
-    ApplicationConnectionId, ApplicationId, ApplicationListenerId, SessionAppId,
-    SessionAppRegistration, SessionMsgQueue, SessionMsgQueueError,
-};
+use hammer_runtime::app::{SessionAppRegistration, SessionMsgQueue, SessionMsgQueueError};
 use hammer_runtime::attach::{ApplicationMqPublication, ExtConfigStore};
 use hammer_runtime::{AttachError, DataWorkerId, RuntimeError};
 use thiserror::Error;
@@ -26,15 +23,15 @@ struct ApplicationState {
 }
 
 pub(crate) struct ApplicationListener {
-    application: ApplicationId,
-    app: Option<SessionAppId>,
+    application: u32,
+    app: Option<u32>,
     opaque: Option<u64>,
 }
 
 pub(crate) struct ApplicationConnection {
-    application: ApplicationId,
+    application: u32,
     context: u64,
-    app: Option<SessionAppId>,
+    app: Option<u32>,
     opaque: Option<u64>,
     server_name: Option<String>,
     connect_state: AtomicU8,
@@ -42,12 +39,12 @@ pub(crate) struct ApplicationConnection {
 
 impl ApplicationListener {
     #[inline]
-    pub(crate) const fn application(&self) -> ApplicationId {
+    pub(crate) const fn application(&self) -> u32 {
         self.application
     }
 
     #[inline]
-    pub(crate) const fn app(&self) -> Option<SessionAppId> {
+    pub(crate) const fn app(&self) -> Option<u32> {
         self.app
     }
 
@@ -59,7 +56,7 @@ impl ApplicationListener {
 
 impl ApplicationConnection {
     #[inline]
-    pub(crate) const fn application(&self) -> ApplicationId {
+    pub(crate) const fn application(&self) -> u32 {
         self.application
     }
 
@@ -69,7 +66,7 @@ impl ApplicationConnection {
     }
 
     #[inline]
-    pub(crate) const fn app(&self) -> Option<SessionAppId> {
+    pub(crate) const fn app(&self) -> Option<u32> {
         self.app
     }
 
@@ -90,7 +87,7 @@ impl ApplicationConnection {
 /// Workers at attach time. Every app-to-session event uses the queue selected
 /// by its Application and Data Worker; there is no shared worker fallback.
 pub struct ApplicationMqResources {
-    application: ApplicationId,
+    application: u32,
     segment: Segment,
     queues: Box<[Arc<SessionMsgQueue>]>,
     offsets: Box<[u64]>,
@@ -99,7 +96,7 @@ pub struct ApplicationMqResources {
 
 impl ApplicationMqResources {
     pub(crate) fn create_local(
-        application: ApplicationId,
+        application: u32,
         worker_count: usize,
         capacity: usize,
     ) -> Result<Self, ApplicationError> {
@@ -107,7 +104,7 @@ impl ApplicationMqResources {
     }
 
     pub(crate) fn create_external(
-        application: ApplicationId,
+        application: u32,
         worker_count: usize,
         capacity: usize,
     ) -> Result<Self, ApplicationError> {
@@ -115,7 +112,7 @@ impl ApplicationMqResources {
     }
 
     fn create(
-        application: ApplicationId,
+        application: u32,
         worker_count: usize,
         capacity: usize,
         shared: bool,
@@ -135,11 +132,7 @@ impl ApplicationMqResources {
             .and_then(|bytes| bytes.checked_add(APP_MQ_SEGMENT_HEADROOM))
             .ok_or(ApplicationError::MqLayoutOverflow)?;
         let segment = if shared {
-            let name = format!(
-                "hammer-app-rx-mq-{}-{}",
-                std::process::id(),
-                application.raw()
-            );
+            let name = format!("hammer-app-rx-mq-{}-{}", std::process::id(), application);
             Segment::shared(&name, segment_bytes)
                 .map_err(|source| ApplicationError::MqSegmentCreate { source })?
         } else {
@@ -272,8 +265,8 @@ impl ApplicationMain {
         })
     }
 
-    pub fn attach(&self) -> Result<ApplicationId, ApplicationError> {
-        self.with_state_mut(|state| application_id(state.applications.insert(())))
+    pub fn attach(&self) -> Result<u32, ApplicationError> {
+        self.with_state_mut(|state| state.applications.insert(()))
     }
 
     /// Attaches an external Application and creates one private Session
@@ -282,7 +275,7 @@ impl ApplicationMain {
         &self,
         worker_count: usize,
         mq_capacity: usize,
-    ) -> Result<ApplicationId, ApplicationError> {
+    ) -> Result<u32, ApplicationError> {
         self.attach_with_mq(worker_count, mq_capacity, true)
     }
 
@@ -292,23 +285,23 @@ impl ApplicationMain {
         &self,
         worker_count: usize,
         mq_capacity: usize,
-    ) -> Result<ApplicationId, ApplicationError> {
+    ) -> Result<u32, ApplicationError> {
         self.attach_with_mq(worker_count, mq_capacity, false)
     }
 
     /// Attaches an external Application using the current runtime Session
     /// configuration.
-    pub fn attach_external_with_runtime(&self) -> Result<ApplicationId, ApplicationError> {
+    pub fn attach_external_with_runtime(&self) -> Result<u32, ApplicationError> {
         self.attach_with_runtime(true)
     }
 
     /// Attaches a local Application using the current runtime Session
     /// configuration.
-    pub fn attach_local_with_runtime(&self) -> Result<ApplicationId, ApplicationError> {
+    pub fn attach_local_with_runtime(&self) -> Result<u32, ApplicationError> {
         self.attach_with_runtime(false)
     }
 
-    fn attach_with_runtime(&self, shared: bool) -> Result<ApplicationId, ApplicationError> {
+    fn attach_with_runtime(&self, shared: bool) -> Result<u32, ApplicationError> {
         let (worker_count, mq_capacity) =
             Engine::with_current(|engine| -> Result<(usize, usize), ApplicationError> {
                 let session = engine
@@ -326,7 +319,7 @@ impl ApplicationMain {
         &self,
         worker_count: usize,
         mq_capacity: usize,
-    ) -> Result<ApplicationId, ApplicationError> {
+    ) -> Result<u32, ApplicationError> {
         let application = self.attach()?;
         let resources =
             ApplicationMqResources::create_local(application, worker_count, mq_capacity)?;
@@ -339,7 +332,7 @@ impl ApplicationMain {
         worker_count: usize,
         mq_capacity: usize,
         shared: bool,
-    ) -> Result<ApplicationId, ApplicationError> {
+    ) -> Result<u32, ApplicationError> {
         let application = self.attach()?;
         let resources = if shared {
             ApplicationMqResources::create_external(application, worker_count, mq_capacity)
@@ -366,11 +359,11 @@ impl ApplicationMain {
 
     fn store_mq_resources(
         &self,
-        application: ApplicationId,
+        application: u32,
         resources: ApplicationMqResources,
     ) -> Result<(), ApplicationError> {
         self.with_state_mut(|state| {
-            let slot = application.slot() as usize;
+            let slot = application as usize;
             if slot >= state.mq_resources.len() {
                 state.mq_resources.resize_with(slot + 1, || None);
             }
@@ -385,12 +378,12 @@ impl ApplicationMain {
     /// Returns the runtime-neutral MQ publication used by the attach server.
     pub fn application_mq_publication(
         &self,
-        application: ApplicationId,
+        application: u32,
     ) -> Result<ApplicationMqPublication, ApplicationError> {
         let resources = self
             .state()?
             .mq_resources
-            .get(application.slot() as usize)
+            .get(application as usize)
             .and_then(Option::as_ref)
             .filter(|resources| resources.application == application)
             .ok_or(ApplicationError::Missing { application })?;
@@ -403,31 +396,27 @@ impl ApplicationMain {
     /// owned by the Application (see `ExtConfigStore`).
     pub(crate) fn with_application_mq<R>(
         &self,
-        application: ApplicationId,
+        application: u32,
         operation: impl FnOnce(&ApplicationMqResources) -> Result<R, ApplicationError>,
     ) -> Result<R, ApplicationError> {
         let resources = self
             .state()?
             .mq_resources
-            .get(application.slot() as usize)
+            .get(application as usize)
             .and_then(Option::as_ref)
             .filter(|resources| resources.application == application)
             .ok_or(ApplicationError::Missing { application })?;
         operation(resources)
     }
 
-    pub fn contains(&self, application: ApplicationId) -> Result<bool, ApplicationError> {
-        Ok(self
-            .state()?
-            .applications
-            .contains_key(application_index(application)))
+    pub fn contains(&self, application: u32) -> Result<bool, ApplicationError> {
+        Ok(self.state()?.applications.contains_key(application))
     }
 
-    pub fn detach(&self, application: ApplicationId) -> Result<(), ApplicationError> {
+    pub fn detach(&self, application: u32) -> Result<(), ApplicationError> {
         self.ensure_main_thread()?;
-        let index = application_index(application);
         self.with_state_mut(|state| -> Result<(), ApplicationError> {
-            if !state.applications.contains_key(index) {
+            if !state.applications.contains_key(application) {
                 return Err(ApplicationError::Missing { application });
             }
             Ok(())
@@ -447,7 +436,7 @@ impl ApplicationMain {
         }?;
 
         self.with_state_mut(|state| -> Result<(), ApplicationError> {
-            if let Some(slot) = state.mq_resources.get_mut(application.slot() as usize)
+            if let Some(slot) = state.mq_resources.get_mut(application as usize)
                 && slot
                     .as_ref()
                     .is_some_and(|resources| resources.application == application)
@@ -474,7 +463,7 @@ impl ApplicationMain {
             for index in connection_indexes {
                 state.connections.remove(index);
             }
-            state.applications.remove(index);
+            state.applications.remove(application);
             Ok(())
         })??;
 
@@ -483,10 +472,10 @@ impl ApplicationMain {
 
     pub fn register_listener(
         &self,
-        application: ApplicationId,
-        app: Option<SessionAppId>,
+        application: u32,
+        app: Option<u32>,
         opaque: Option<u64>,
-    ) -> Result<ApplicationListenerId, ApplicationError> {
+    ) -> Result<u32, ApplicationError> {
         self.ensure_active(application)?;
         self.validate_session_app(app)?;
         let listener = ApplicationListener {
@@ -494,17 +483,17 @@ impl ApplicationMain {
             app,
             opaque,
         };
-        self.with_state_mut(|state| application_listener_id(state.listeners.insert(listener)))
+        self.with_state_mut(|state| state.listeners.insert(listener))
     }
 
     pub fn register_connection(
         &self,
-        application: ApplicationId,
+        application: u32,
         context: u64,
         server_name: Option<String>,
-        app: Option<SessionAppId>,
+        app: Option<u32>,
         opaque: Option<u64>,
-    ) -> Result<ApplicationConnectionId, ApplicationError> {
+    ) -> Result<u32, ApplicationError> {
         self.ensure_active(application)?;
         self.validate_session_app(app)?;
         let connection = ApplicationConnection {
@@ -531,19 +520,19 @@ impl ApplicationMain {
                 drop(state.connections.remove(index));
             }
             let index = state.connections.insert(connection);
-            ApplicationConnectionId::new(index)
-        })?
+            index
+        })
     }
 
     pub(crate) fn with_connection<R>(
         &self,
-        connection: ApplicationConnectionId,
+        connection: u32,
         operation: impl FnOnce(&ApplicationConnection) -> R,
     ) -> Result<R, ApplicationError> {
         // SAFETY: workers only read published entries. Main Thread mutation is
         // synchronized by the worker barrier.
         let state = unsafe { &*self.state.get() };
-        let index = application_connection_index(connection);
+        let index = connection;
         state
             .connections
             .get(index)
@@ -551,10 +540,7 @@ impl ApplicationMain {
             .ok_or(ApplicationError::ConnectionMissing { connection })
     }
 
-    pub(crate) fn mark_connected(
-        &self,
-        connection: ApplicationConnectionId,
-    ) -> Result<(), ApplicationError> {
+    pub(crate) fn mark_connected(&self, connection: u32) -> Result<(), ApplicationError> {
         let entry =
             self.with_connection(connection, |entry| entry as *const ApplicationConnection)?;
         // SAFETY: the entry remains published until Main Thread observes the
@@ -574,12 +560,12 @@ impl ApplicationMain {
 
     pub fn remove_connection(
         &self,
-        application: ApplicationId,
-        connection: ApplicationConnectionId,
+        application: u32,
+        connection: u32,
     ) -> Result<(), ApplicationError> {
         self.ensure_active(application)?;
         self.with_state_mut(|state| {
-            let index = application_connection_index(connection);
+            let index = connection;
             let entry = state
                 .connections
                 .get(index)
@@ -600,12 +586,12 @@ impl ApplicationMain {
 
     pub fn reclaim_connection(
         &self,
-        application: ApplicationId,
-        connection: ApplicationConnectionId,
+        application: u32,
+        connection: u32,
     ) -> Result<(), ApplicationError> {
         self.ensure_active(application)?;
         self.with_state_mut(|state| {
-            let index = application_connection_index(connection);
+            let index = connection;
             let entry = state
                 .connections
                 .get(index)
@@ -629,8 +615,8 @@ impl ApplicationMain {
 
     pub fn remove_listener(
         &self,
-        application: ApplicationId,
-        listener_id: ApplicationListenerId,
+        application: u32,
+        listener_id: u32,
     ) -> Result<(), ApplicationError> {
         self.ensure_active(application)?;
         self.with_listener(listener_id, |listener| {
@@ -643,7 +629,7 @@ impl ApplicationMain {
             Ok(())
         })??;
         self.with_state_mut(|state| {
-            let index = application_listener_index(listener_id);
+            let index = listener_id;
             if !state.listeners.contains_key(index) {
                 return Err(ApplicationError::ListenerMissing {
                     listener: listener_id,
@@ -670,13 +656,13 @@ impl ApplicationMain {
     /// owning Main Thread holds the worker barrier.
     pub fn update_listener_opaque(
         &self,
-        application: ApplicationId,
-        listener_id: ApplicationListenerId,
+        application: u32,
+        listener_id: u32,
         opaque: Option<u64>,
     ) -> Result<(), ApplicationError> {
         self.ensure_active(application)?;
         self.with_state_mut(|state| {
-            let index = application_listener_index(listener_id);
+            let index = listener_id;
             if !state.listeners.contains_key(index) {
                 return Err(ApplicationError::ListenerMissing {
                     listener: listener_id,
@@ -702,13 +688,13 @@ impl ApplicationMain {
 
     pub(crate) fn with_listener<R>(
         &self,
-        listener: ApplicationListenerId,
+        listener: u32,
         operation: impl FnOnce(&ApplicationListener) -> R,
     ) -> Result<R, ApplicationError> {
         // SAFETY: production callers are the Main Thread or a Data Worker that
         // participates in `barrier`; listener mutation stops every Data Worker.
         let state = unsafe { &*self.state.get() };
-        let index = application_listener_index(listener);
+        let index = listener;
         if !state.listeners.contains_key(index) {
             return Err(ApplicationError::ListenerMissing { listener });
         }
@@ -741,40 +727,33 @@ impl ApplicationMain {
         })
     }
 
-    pub fn session_app_id(&self, name: &str) -> Result<SessionAppId, ApplicationError> {
+    pub fn session_app_id(&self, name: &str) -> Result<u32, ApplicationError> {
         self.session_app(name).map(|_| {
             self.session_apps
                 .iter()
                 .position(|entry| entry.name() == name)
-                .map(|index| SessionAppId::new(index as u32))
+                .map(|index| index as u32)
                 .expect("resolved Session App remains in the registration list")
         })
     }
 
-    pub(crate) fn session_app_registration(
-        &self,
-        app: SessionAppId,
-    ) -> Option<SessionAppRegistration> {
-        self.session_apps.get(app.raw() as usize).copied()
+    pub(crate) fn session_app_registration(&self, app: u32) -> Option<SessionAppRegistration> {
+        self.session_apps.get(app as usize).copied()
     }
 
-    fn validate_session_app(&self, app: Option<SessionAppId>) -> Result<(), ApplicationError> {
+    fn validate_session_app(&self, app: Option<u32>) -> Result<(), ApplicationError> {
         let Some(app) = app else {
             return Ok(());
         };
-        if (app.raw() as usize) < self.session_apps.len() {
+        if (app as usize) < self.session_apps.len() {
             Ok(())
         } else {
             Err(ApplicationError::SessionAppUnregistered { app })
         }
     }
 
-    fn ensure_active(&self, application: ApplicationId) -> Result<(), ApplicationError> {
-        if self
-            .state()?
-            .applications
-            .contains_key(application_index(application))
-        {
+    fn ensure_active(&self, application: u32) -> Result<(), ApplicationError> {
+        if self.state()?.applications.contains_key(application) {
             Ok(())
         } else {
             Err(ApplicationError::Missing { application })
@@ -816,13 +795,13 @@ impl ApplicationMain {
 /// Local Application capability. Dropping it detaches the Application.
 pub struct ApplicationRegistration {
     main: Arc<ApplicationMain>,
-    application: Option<ApplicationId>,
+    application: Option<u32>,
     thread_bound: PhantomData<Rc<()>>,
 }
 
 impl ApplicationRegistration {
     #[inline]
-    pub fn application(&self) -> ApplicationId {
+    pub fn application(&self) -> u32 {
         self.application
             .expect("live Application registration retains its identity")
     }
@@ -851,7 +830,7 @@ impl Drop for ApplicationRegistration {
 #[derive(Debug, Error)]
 pub enum ApplicationError {
     #[error("Application {application:?} is not attached")]
-    Missing { application: ApplicationId },
+    Missing { application: u32 },
     #[error("Application state is owned by another thread")]
     WrongThread,
     #[error("per-Application MQ capacity {capacity} is below the minimum 128")]
@@ -895,71 +874,34 @@ pub enum ApplicationError {
         source: AttachError,
     },
     #[error("Application {application:?} already owns per-Application MQ resources")]
-    MqAlreadyAttached { application: ApplicationId },
+    MqAlreadyAttached { application: u32 },
     #[error("Session App `{name}` is not registered")]
     SessionAppMissing { name: String },
     #[error("Session App `{name}` is registered more than once")]
     SessionAppDuplicate { name: String },
     #[error("Session App id {app:?} is not registered")]
-    SessionAppUnregistered { app: SessionAppId },
+    SessionAppUnregistered { app: u32 },
     #[error("Application listener {listener:?} is not registered")]
-    ListenerMissing { listener: ApplicationListenerId },
+    ListenerMissing { listener: u32 },
     #[error("Application listener {listener:?} is not owned by Application {application:?}")]
-    ListenerNotOwned {
-        application: ApplicationId,
-        listener: ApplicationListenerId,
-    },
+    ListenerNotOwned { application: u32, listener: u32 },
     #[error("Application connection {connection:?} is not registered")]
-    ConnectionMissing { connection: ApplicationConnectionId },
+    ConnectionMissing { connection: u32 },
     #[error("Application connection {connection:?} is not owned by Application {application:?}")]
-    ConnectionNotOwned {
-        application: ApplicationId,
-        connection: ApplicationConnectionId,
-    },
+    ConnectionNotOwned { application: u32, connection: u32 },
     #[error("Application connection {connection:?} was already connected")]
-    ConnectionAlreadyConnected { connection: ApplicationConnectionId },
+    ConnectionAlreadyConnected { connection: u32 },
     #[error("Application connection {connection:?} is not connected")]
-    ConnectionNotConnected { connection: ApplicationConnectionId },
-}
-
-#[inline]
-fn application_id(index: u32) -> ApplicationId {
-    ApplicationId::new(index)
-}
-
-#[inline]
-fn application_index(application: ApplicationId) -> u32 {
-    application.slot()
-}
-
-#[inline]
-fn application_listener_id(index: u32) -> ApplicationListenerId {
-    ApplicationListenerId::new(index)
-}
-
-#[inline]
-fn application_listener_index(listener: ApplicationListenerId) -> u32 {
-    listener.slot()
-}
-
-#[inline]
-fn application_connection_index(connection: ApplicationConnectionId) -> u32 {
-    connection.slot()
+    ConnectionNotConnected { connection: u32 },
 }
 
 #[cfg(test)]
 mod tests {
     use hammer_runtime::DataWorkerId;
 
-    use super::{
-        ApplicationConnectionId, ApplicationError, ApplicationId, ApplicationMain,
-        ApplicationMqResources,
-    };
+    use super::{ApplicationError, ApplicationMain, ApplicationMqResources};
 
-    fn register_connection(
-        main: &ApplicationMain,
-        application: ApplicationId,
-    ) -> ApplicationConnectionId {
+    fn register_connection(main: &ApplicationMain, application: u32) -> u32 {
         main.register_connection(application, 0, None, None, None)
             .expect("register Application connection")
     }

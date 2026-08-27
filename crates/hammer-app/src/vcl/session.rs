@@ -1,19 +1,17 @@
-use hammer_app::AppSession;
-use hammer_runtime::app::{SessionConnectError, SessionFlags, SessionHandle, TransportProtocol};
-
-use crate::VclSessionHandle;
+use crate::AppSession;
+use hammer_runtime::app::{SessionConnectError, SessionFlags, SessionHandle};
 
 /// Which side initiated a Session: the local application (active open,
 /// CONNECT_STREAM) or the peer (ACCEPTED).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum VclInitiator {
+pub enum Initiator {
     Local,
     Peer,
 }
 
 /// Direction of a capability-checked operation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum VclDirection {
+pub enum Direction {
     Read,
     Write,
 }
@@ -23,7 +21,7 @@ pub enum VclDirection {
 /// Maps `vcl_session_state_t` (vcl_private.h) plus the active-open interim
 /// `SESSION_STATE_CONNECTING` (vnet/session/session.h).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum VclSessionState {
+pub enum SessionState {
     /// VCL_STATE_CLOSED: created, no wire handle yet.
     Closed,
     /// VCL_STATE_LISTEN: registered listener.
@@ -34,7 +32,7 @@ pub enum VclSessionState {
     /// VCL_STATE_READY: established; data FIFOs attached.
     Ready,
     /// VCL_STATE_VPP_CLOSING: wire close in flight.
-    VppClosing,
+    Closing,
     /// VCL_STATE_DISCONNECT: closing; no further operations.
     Disconnect,
     /// VCL_STATE_DETACHED: connect failed; VPP retains `vpp_error`.
@@ -46,83 +44,83 @@ pub enum VclSessionState {
 /// Derived Session attributes: VPP `SESSION_F_STREAM` /
 /// `SESSION_F_UNIDIRECTIONAL` plus the creation-path initiator.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct VclSessionAttributes {
+pub struct SessionAttributes {
     pub stream: bool,
     pub unidirectional: bool,
-    pub initiator: VclInitiator,
+    pub initiator: Initiator,
 }
 
-impl VclSessionAttributes {
+impl SessionAttributes {
     /// Read capability, derived as VPP derives it: a unidirectional Session
     /// is readable only when peer-initiated; bidirectional Sessions are
     /// always readable.
     pub fn readable(self) -> bool {
-        !self.unidirectional || self.initiator == VclInitiator::Peer
+        !self.unidirectional || self.initiator == Initiator::Peer
     }
 
     /// Write capability, derived as VPP derives it: a unidirectional Session
     /// is writable only when locally initiated; bidirectional Sessions are
     /// always writable.
     pub fn writable(self) -> bool {
-        !self.unidirectional || self.initiator == VclInitiator::Local
+        !self.unidirectional || self.initiator == Initiator::Local
     }
 }
 
 /// One client-local VCL Session (VPP `vcl_session_t`).
 ///
 /// The struct is public so callers can read attributes, but all fields are
-/// private: sessions are created and mutated only through [`VclWorker`].
+/// private: sessions are created and mutated only through [`Worker`].
 ///
-/// [`VclWorker`]: crate::VclWorker
-pub struct VclSession {
-    pub(crate) state: VclSessionState,
-    pub(crate) proto: TransportProtocol,
+/// [`Worker`]: crate::Worker
+pub(super) struct Session {
+    pub(super) state: SessionState,
+    pub(crate) proto: u8,
     /// Wire Session attributes preserved from CONNECTED / ACCEPTED.
     pub(crate) flags: SessionFlags,
-    pub(crate) initiator: VclInitiator,
+    pub(super) initiator: Initiator,
     /// Local parent Session handle (stream parent or listener).
-    pub(crate) parent: Option<VclSessionHandle>,
+    pub(crate) parent: Option<u32>,
     /// Local child Session handles, for exactly-once parent cascade.
-    pub(crate) children: Vec<VclSessionHandle>,
+    pub(crate) children: Vec<u32>,
     /// VPP-shaped wire Session handle once established.
     pub(crate) wire_handle: Option<SessionHandle>,
     pub(crate) nonblocking: bool,
     /// Established data path (FIFO / MQ / event consumption).
     pub(crate) app: Option<AppSession>,
     /// Connect error retained on `Detached` (VPP `vpp_error`).
-    pub(crate) vpp_error: Option<SessionConnectError>,
+    pub(crate) connect_error: Option<SessionConnectError>,
 }
 
-impl VclSession {
+impl Session {
     /// Fresh CLOSED session (VPP `vppcom_session_create`).
-    pub(crate) fn new(proto: TransportProtocol, nonblocking: bool) -> Self {
+    pub(crate) fn new(proto: u8, nonblocking: bool) -> Self {
         Self {
-            state: VclSessionState::Closed,
+            state: SessionState::Closed,
             proto,
             flags: SessionFlags::empty(),
-            initiator: VclInitiator::Local,
+            initiator: Initiator::Local,
             parent: None,
             children: Vec::new(),
             wire_handle: None,
             nonblocking,
             app: None,
-            vpp_error: None,
+            connect_error: None,
         }
     }
 
     /// LISTEN session bound to a wire listener handle (set by the worker).
-    pub(crate) fn listener(proto: TransportProtocol) -> Self {
+    pub(crate) fn listener(proto: u8) -> Self {
         Self {
-            state: VclSessionState::Listen,
+            state: SessionState::Listen,
             proto,
             flags: SessionFlags::empty(),
-            initiator: VclInitiator::Local,
+            initiator: Initiator::Local,
             parent: None,
             children: Vec::new(),
             wire_handle: None,
             nonblocking: false,
             app: None,
-            vpp_error: None,
+            connect_error: None,
         }
     }
 
@@ -130,45 +128,33 @@ impl VclSession {
     /// transport is the listener's, inherited at allocation (VPP
     /// `vcl_session_accepted_handler`: `session->session_type =
     /// listen_session->session_type`, vppcom.c:365).
-    pub(crate) fn peer_child(proto: TransportProtocol, flags: SessionFlags) -> Self {
+    pub(crate) fn peer_child(proto: u8, flags: SessionFlags) -> Self {
         Self {
-            state: VclSessionState::Ready,
+            state: SessionState::Ready,
             proto,
             flags,
-            initiator: VclInitiator::Peer,
+            initiator: Initiator::Peer,
             parent: None,
             children: Vec::new(),
             wire_handle: None,
             nonblocking: false,
             app: None,
-            vpp_error: None,
+            connect_error: None,
         }
     }
 
     /// VPP-shaped local state.
-    pub fn state(&self) -> VclSessionState {
+    pub fn state(&self) -> SessionState {
         self.state
     }
 
     /// Derived stream / unidirectional / initiator attributes and the
     /// readable / writable capability derived from them.
-    pub fn attributes(&self) -> VclSessionAttributes {
-        VclSessionAttributes {
+    pub fn attributes(&self) -> SessionAttributes {
+        SessionAttributes {
             stream: self.flags.contains(SessionFlags::STREAM),
             unidirectional: self.flags.contains(SessionFlags::UNIDIRECTIONAL),
             initiator: self.initiator,
         }
-    }
-
-    /// Local parent Session handle, when this Session is a stream child or
-    /// an accepted peer child.
-    pub fn parent(&self) -> Option<VclSessionHandle> {
-        self.parent
-    }
-
-    /// The wire Session handle (VPP-shaped `session_handle_t`), when
-    /// established. The QUIC stream ID is never exposed.
-    pub fn wire_handle(&self) -> Option<SessionHandle> {
-        self.wire_handle
     }
 }

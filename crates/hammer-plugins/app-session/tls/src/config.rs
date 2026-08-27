@@ -3,7 +3,6 @@ use std::sync::{Arc, OnceLock};
 use std::thread::{self, ThreadId};
 
 use hammer_infra::pool::Pool;
-use hammer_runtime::app::ApplicationId;
 use hammer_runtime::{Engine, RuntimeResult};
 use hammer_service::session::{ApplicationMain, ApplicationRegistration};
 use prost::Message;
@@ -106,7 +105,7 @@ enum ConnectionConfig {
 }
 
 struct ConfigEntry {
-    application: ApplicationId,
+    application: u32,
     config: ConnectionConfig,
 }
 
@@ -139,7 +138,7 @@ impl TlsMain {
 
     pub fn register_server_config(
         &self,
-        application: ApplicationId,
+        application: u32,
         config: ServerConfig,
     ) -> Result<ConfigId, ConfigError> {
         let config = build_server_config(config)?;
@@ -148,7 +147,7 @@ impl TlsMain {
 
     pub fn register_client_config(
         &self,
-        application: ApplicationId,
+        application: u32,
         config: ClientConfig,
     ) -> Result<ConfigId, ConfigError> {
         let config = build_client_config(config)?;
@@ -157,7 +156,7 @@ impl TlsMain {
 
     pub fn server_config(
         &self,
-        application: ApplicationId,
+        application: u32,
         config: ConfigId,
     ) -> Result<Arc<RustlsServerConfig>, ConfigError> {
         match &self.entry(application, config)?.config {
@@ -168,7 +167,7 @@ impl TlsMain {
 
     pub fn client_config(
         &self,
-        application: ApplicationId,
+        application: u32,
         config: ConfigId,
     ) -> Result<Arc<RustlsClientConfig>, ConfigError> {
         match &self.entry(application, config)?.config {
@@ -177,11 +176,7 @@ impl TlsMain {
         }
     }
 
-    pub fn remove_config(
-        &self,
-        application: ApplicationId,
-        config: ConfigId,
-    ) -> Result<(), ConfigError> {
+    pub fn remove_config(&self, application: u32, config: ConfigId) -> Result<(), ConfigError> {
         self.with_state_mut(|state| {
             config_entry(&state.configs, application, config)?;
             state.configs.remove(config_index(config));
@@ -189,24 +184,16 @@ impl TlsMain {
         })?
     }
 
-    fn insert(
-        &self,
-        application: ApplicationId,
-        config: ConnectionConfig,
-    ) -> Result<ConfigId, ConfigError> {
+    fn insert(&self, application: u32, config: ConnectionConfig) -> Result<ConfigId, ConfigError> {
         self.with_state_mut(|state| {
             config_id(state.configs.insert(ConfigEntry {
                 application,
                 config,
             }))
-        })?
+        })
     }
 
-    fn entry(
-        &self,
-        application: ApplicationId,
-        config: ConfigId,
-    ) -> Result<&ConfigEntry, ConfigError> {
+    fn entry(&self, application: u32, config: ConfigId) -> Result<&ConfigEntry, ConfigError> {
         config_entry(&self.state().configs, application, config)
     }
 
@@ -252,10 +239,7 @@ pub enum ConfigError {
     #[error("TLS configuration {config:?} is not registered")]
     Missing { config: ConfigId },
     #[error("TLS configuration {config:?} is not owned by Application {application:?}")]
-    NotOwned {
-        application: ApplicationId,
-        config: ConfigId,
-    },
+    NotOwned { application: u32, config: ConfigId },
     #[error("TLS configuration {config:?} has the wrong connection role")]
     RoleMismatch { config: ConfigId },
     #[error("TLS connection construction requires an attached Application")]
@@ -428,14 +412,14 @@ fn config_index(config: ConfigId) -> u32 {
 
 fn config_entry(
     configs: &Pool<ConfigEntry>,
-    application: ApplicationId,
+    application: u32,
     config: ConfigId,
 ) -> Result<&ConfigEntry, ConfigError> {
     let index = config_index(config);
     if !configs.contains_key(index) {
         return Err(ConfigError::Missing { config });
     }
-    let entry = configs.get(index);
+    let entry = configs.get(index).ok_or(ConfigError::Missing { config })?;
     if entry.application != application {
         return Err(ConfigError::NotOwned {
             application,
@@ -569,8 +553,8 @@ fn remove_config_api(request: RemoveConfigRequest) -> RemoveConfigReply {
     }
 }
 
-fn binary_application(application: u64) -> Result<ApplicationId, TlsApiStatus> {
-    let application = ApplicationId::from_raw(application);
+fn binary_application(application: u64) -> Result<u32, TlsApiStatus> {
+    let application = (application as u32);
     let Some(attached) = Engine::with_current(|engine| {
         engine
             .registry

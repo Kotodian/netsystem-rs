@@ -12,7 +12,6 @@ use hammer_runtime::{
 use super::connection::TcpConnection;
 use super::segment::{TcpSegment, tcp_packet};
 use super::{TcpInputNext, TcpNodeError, write_session_route_opaque};
-use hammer_service::session::SessionId;
 use hammer_service::session::runtime::{RxDelivery, SessionTransport, SessionWorker};
 
 const TCP_LISTENER_BACKLOG: usize = 128;
@@ -219,7 +218,7 @@ impl<'a> TcpListener<'a> {
         runtime: &DataPlaneRuntime,
         index: Index,
         packet: &TcpPacket,
-    ) -> RuntimeResult<(Option<TcpSegment>, Option<SessionId>)> {
+    ) -> RuntimeResult<(Option<TcpSegment>, Option<u32>)> {
         if packet.flags == TcpSegmentFlags::SYN {
             return self.issue_challenge(runtime, index, packet);
         }
@@ -236,7 +235,7 @@ impl<'a> TcpListener<'a> {
         runtime: &DataPlaneRuntime,
         index: Index,
         packet: &TcpPacket,
-    ) -> RuntimeResult<(Option<TcpSegment>, Option<SessionId>)> {
+    ) -> RuntimeResult<(Option<TcpSegment>, Option<u32>)> {
         let fast_open_valid = packet.payload_len != 0
             && self.capabilities.fast_open
             && packet.fast_open_cookie.as_ref().is_some_and(|cookie| {
@@ -326,7 +325,7 @@ impl<'a> TcpListener<'a> {
         runtime: &DataPlaneRuntime,
         index: Index,
         packet: &TcpPacket,
-    ) -> RuntimeResult<(Option<TcpSegment>, Option<SessionId>)> {
+    ) -> RuntimeResult<(Option<TcpSegment>, Option<u32>)> {
         let worker_id = self.sessions.worker();
         let capabilities = self.capabilities;
         let (control, session_id) = self.accept_session(
@@ -362,8 +361,7 @@ impl<'a> TcpListener<'a> {
                     buffer.advance(packet.payload_offset as isize)?;
                     buffer.truncate(packet.payload_len)?;
                 }
-                let enqueue =
-                    sessions.enqueue_rx(runtime.buffers(), session_id, index, 0, false)?;
+                let enqueue = sessions.enqueue_rx(runtime.buffers(), session_id, index, 0)?;
                 if matches!(enqueue, RxDelivery::InOrder { .. }) {
                     sessions.mark_ready(session_id);
                 }
@@ -376,7 +374,7 @@ impl<'a> TcpListener<'a> {
     fn complete_open(
         &mut self,
         packet: &TcpPacket,
-    ) -> RuntimeResult<(Option<TcpSegment>, Option<SessionId>)> {
+    ) -> RuntimeResult<(Option<TcpSegment>, Option<u32>)> {
         let Some(acknowledgment) = packet.acknowledgment else {
             return Ok((None, None));
         };
@@ -458,15 +456,10 @@ impl<'a> TcpListener<'a> {
         packet: &TcpPacket,
         create: C,
         prepare: P,
-    ) -> RuntimeResult<(R, SessionId)>
+    ) -> RuntimeResult<(R, u32)>
     where
         C: FnOnce() -> TcpConnection,
-        P: FnOnce(
-            SessionId,
-            u32,
-            &mut SessionWorker<u32>,
-            &mut crate::TcpWorker,
-        ) -> RuntimeResult<R>,
+        P: FnOnce(u32, u32, &mut SessionWorker<u32>, &mut crate::TcpWorker) -> RuntimeResult<R>,
     {
         let connection_index = self.tcp.insert_connection(create());
         let listener = self.session_listener;
@@ -515,11 +508,7 @@ impl<'a> TcpListener<'a> {
         Ok((output, session_id))
     }
 
-    fn rollback_session(
-        &mut self,
-        session_id: SessionId,
-        connection_index: u32,
-    ) -> RuntimeResult<()> {
+    fn rollback_session(&mut self, session_id: u32, connection_index: u32) -> RuntimeResult<()> {
         self.tcp.lookup.forget_session(session_id);
         self.tcp.lookup.forget_pending_open(session_id);
         let session_cleanup = self.sessions.rollback_session_creation(session_id);

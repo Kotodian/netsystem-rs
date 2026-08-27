@@ -8,10 +8,10 @@ use crate::{TcpCapabilities, TcpConnectionId, TcpFastOpenCookie, TcpTimestampOpt
 use crossbeam_utils::CachePadded;
 use hammer_infra::bihash::{Bihash, BihashKey, FREE_U64};
 use hammer_infra::pool::Pool;
-use hammer_runtime::{DataWorkerId, SessionHandle};
+use hammer_runtime::DataWorkerId;
+use hammer_runtime::app::SessionHandle;
 
 use crate::{TcpConnection, TcpInputNext, TcpState, TransportConnectionKey};
-use hammer_service::session::SessionId;
 
 pub type TcpLookupId = u32;
 
@@ -32,7 +32,7 @@ struct TcpPendingRouteIndex {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct TcpPendingRouteEntry {
-    session_id: SessionId,
+    session_id: u32,
     local: Option<SocketAddr>,
     remote: SocketAddr,
     owner: DataWorkerId,
@@ -42,7 +42,7 @@ struct TcpPendingRouteEntry {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct TcpConnectionRouteEntry {
-    session_id: SessionId,
+    session_id: u32,
     connection_id: Option<TcpConnectionId>,
     local: Option<SocketAddr>,
     remote: SocketAddr,
@@ -53,7 +53,7 @@ struct TcpConnectionRouteEntry {
 impl TcpConnectionRouteEntry {
     #[inline]
     fn new(
-        session_id: SessionId,
+        session_id: u32,
         connection_id: Option<TcpConnectionId>,
         local: Option<SocketAddr>,
         remote: SocketAddr,
@@ -102,7 +102,7 @@ impl TcpConnectionRouteEntry {
 impl TcpPendingRouteEntry {
     #[inline]
     fn new(
-        session_id: SessionId,
+        session_id: u32,
         local: Option<SocketAddr>,
         remote: SocketAddr,
         owner: DataWorkerId,
@@ -275,7 +275,7 @@ impl TcpListenerPendingTable {
         if used >= limit {
             return false;
         }
-        let Ok(index) = self.entries.insert(TcpListenerPendingEntry {
+        let index = self.entries.insert(TcpListenerPendingEntry {
             listener_id,
             local,
             remote,
@@ -284,9 +284,7 @@ impl TcpListenerPendingTable {
             capabilities,
             timestamp,
             created_epoch: current_epoch,
-        }) else {
-            return false;
-        };
+        });
         if !self.insert_tuple_index(local, remote, index) {
             let _ = self.entries.remove(index);
             return false;
@@ -832,7 +830,7 @@ impl TcpConnectionRouteIndex {
     #[inline]
     fn upsert(
         &mut self,
-        session_id: SessionId,
+        session_id: u32,
         connection_id: Option<TcpConnectionId>,
         local: Option<SocketAddr>,
         remote: SocketAddr,
@@ -846,10 +844,7 @@ impl TcpConnectionRouteIndex {
             let entry_index = pool_index_from_bihash_value(raw);
             let Some(old_entry) = self.entries.get(entry_index).copied() else {
                 self.session_slots.remove(&key);
-                let entry_index = self
-                    .entries
-                    .insert(entry)
-                    .expect("tcp connection route entry pool exhausted");
+                let entry_index = self.entries.insert(entry);
                 self.index_entry(entry_index, entry);
                 return;
             };
@@ -862,10 +857,7 @@ impl TcpConnectionRouteIndex {
             self.index_entry(entry_index, entry);
             return;
         }
-        let entry_index = self
-            .entries
-            .insert(entry)
-            .expect("tcp connection route entry pool exhausted");
+        let entry_index = self.entries.insert(entry);
         self.index_entry(entry_index, entry);
     }
 
@@ -914,7 +906,7 @@ impl TcpConnectionRouteIndex {
 
     #[cfg(test)]
     #[inline]
-    fn lookup_by_connection_id(&self, connection_id: TcpConnectionId) -> Option<SessionId> {
+    fn lookup_by_connection_id(&self, connection_id: TcpConnectionId) -> Option<u32> {
         let entry_index =
             pool_index_from_bihash_value(self.connection_slots.lookup(&connection_id.get())?);
         self.entries.get(entry_index).map(|entry| entry.session_id)
@@ -950,7 +942,7 @@ impl TcpConnectionRouteIndex {
         &self,
         local: SocketAddr,
         remote: SocketAddr,
-    ) -> Option<(SessionId, DataWorkerId, TcpInputNext)> {
+    ) -> Option<(u32, DataWorkerId, TcpInputNext)> {
         let entry_index = match (local, remote) {
             (SocketAddr::V4(local), SocketAddr::V4(remote)) => {
                 self.tuple_slots_v4.lookup(&TransportConnectionKey::new(
@@ -977,7 +969,7 @@ impl TcpConnectionRouteIndex {
         Some((entry.session_id, entry.owner, entry.next))
     }
 
-    fn forget_session(&mut self, session_id: SessionId) {
+    fn forget_session(&mut self, session_id: u32) {
         let key = session_id.get();
         let Some(raw) = self.session_slots.lookup(&key) else {
             return;
@@ -1030,7 +1022,7 @@ impl TcpPendingRouteIndex {
     #[inline]
     fn upsert(
         &mut self,
-        session_id: SessionId,
+        session_id: u32,
         local: Option<SocketAddr>,
         remote: SocketAddr,
         owner: DataWorkerId,
@@ -1043,10 +1035,7 @@ impl TcpPendingRouteIndex {
             let entry_index = pool_index_from_bihash_value(raw);
             let Some(old_entry) = self.entries.get(entry_index).copied() else {
                 self.session_slots.remove(&key);
-                let entry_index = self
-                    .entries
-                    .insert(entry)
-                    .expect("tcp pending route entry pool exhausted");
+                let entry_index = self.entries.insert(entry);
                 self.index_entry(entry_index, entry);
                 return;
             };
@@ -1059,10 +1048,7 @@ impl TcpPendingRouteIndex {
             self.index_entry(entry_index, entry);
             return;
         }
-        let entry_index = self
-            .entries
-            .insert(entry)
-            .expect("tcp pending route entry pool exhausted");
+        let entry_index = self.entries.insert(entry);
         self.index_entry(entry_index, entry);
     }
 
@@ -1103,7 +1089,7 @@ impl TcpPendingRouteIndex {
         &self,
         local: SocketAddr,
         remote: SocketAddr,
-    ) -> Option<(SessionId, DataWorkerId, TcpInputNext)> {
+    ) -> Option<(u32, DataWorkerId, TcpInputNext)> {
         let entry_index = match (local, remote) {
             (SocketAddr::V4(local), SocketAddr::V4(remote)) => {
                 self.tuple_slots_v4.lookup(&TransportConnectionKey::new(
@@ -1131,7 +1117,7 @@ impl TcpPendingRouteIndex {
     }
 
     #[inline]
-    fn capabilities_by_session(&self, session_id: SessionId) -> Option<TcpCapabilities> {
+    fn capabilities_by_session(&self, session_id: u32) -> Option<TcpCapabilities> {
         let entry_index =
             pool_index_from_bihash_value(self.session_slots.lookup(&session_id.get())?);
         self.entries
@@ -1164,7 +1150,7 @@ impl TcpPendingRouteIndex {
         }
     }
 
-    fn forget_session(&mut self, session_id: SessionId) {
+    fn forget_session(&mut self, session_id: u32) {
         let key = session_id.get();
         let Some(raw) = self.session_slots.lookup(&key) else {
             return;
@@ -1299,7 +1285,7 @@ impl TcpLookupState {
     #[inline]
     pub(crate) fn remember_session(
         &mut self,
-        session_id: SessionId,
+        session_id: u32,
         connection_id: Option<TcpConnectionId>,
         local: Option<SocketAddr>,
         remote: SocketAddr,
@@ -1313,7 +1299,7 @@ impl TcpLookupState {
     #[inline]
     pub(crate) fn remember_pending_open(
         &mut self,
-        session_id: SessionId,
+        session_id: u32,
         local: Option<SocketAddr>,
         remote: SocketAddr,
         owner: DataWorkerId,
@@ -1330,7 +1316,7 @@ impl TcpLookupState {
         &self,
         local: SocketAddr,
         remote: SocketAddr,
-    ) -> Option<(SessionId, DataWorkerId, TcpInputNext)> {
+    ) -> Option<(u32, DataWorkerId, TcpInputNext)> {
         self.connections.lookup_by_tuple(local, remote)
     }
 
@@ -1340,7 +1326,7 @@ impl TcpLookupState {
         &self,
         local: SocketAddr,
         remote: SocketAddr,
-    ) -> Option<(SessionId, DataWorkerId, TcpInputNext)> {
+    ) -> Option<(u32, DataWorkerId, TcpInputNext)> {
         self.pending.lookup_by_tuple(local, remote)
     }
 
@@ -1350,7 +1336,7 @@ impl TcpLookupState {
         local: SocketAddr,
         remote: SocketAddr,
         check_listener_pending: bool,
-    ) -> (Option<(SessionId, DataWorkerId, TcpInputNext)>, bool) {
+    ) -> (Option<(u32, DataWorkerId, TcpInputNext)>, bool) {
         let route = self
             .connections
             .lookup_by_tuple(local, remote)
@@ -1377,32 +1363,29 @@ impl TcpLookupState {
     pub(crate) fn session_id_by_connection_id(
         &self,
         connection_id: TcpConnectionId,
-    ) -> Option<SessionId> {
+    ) -> Option<u32> {
         self.connections.lookup_by_connection_id(connection_id)
     }
 
     #[inline]
-    pub(crate) fn forget_session(&mut self, session_id: SessionId) {
+    pub(crate) fn forget_session(&mut self, session_id: u32) {
         self.connections.forget_session(session_id);
     }
 
     #[inline]
-    pub(crate) fn forget_pending_open(&mut self, session_id: SessionId) {
+    pub(crate) fn forget_pending_open(&mut self, session_id: u32) {
         self.pending.forget_session(session_id);
     }
 
     #[inline]
-    pub(crate) fn pending_open_capabilities(
-        &self,
-        session_id: SessionId,
-    ) -> Option<TcpCapabilities> {
+    pub(crate) fn pending_open_capabilities(&self, session_id: u32) -> Option<TcpCapabilities> {
         self.pending.capabilities_by_session(session_id)
     }
 
     #[inline]
     pub(crate) fn publish_connection(
         &mut self,
-        session_id: SessionId,
+        session_id: u32,
         connection: &TcpConnection,
     ) -> bool {
         let pending_capabilities = self.pending.capabilities_by_session(session_id);
@@ -2042,10 +2025,9 @@ mod tests {
     };
     use crate::{TcpCapabilities, TcpFastOpenCookie};
     use hammer_infra::bihash::Bihash;
-    use hammer_runtime::{DataWorkerId, SessionHandle};
+    use hammer_runtime::DataWorkerId;
+    use hammer_runtime::app::SessionHandle;
     use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
-
-    use hammer_service::session::SessionId;
 
     fn worker_state() -> TcpLookupState {
         TcpLookupState::new(DataWorkerId::new(0))
@@ -2090,8 +2072,8 @@ mod tests {
     fn tcp_connection_route_index_bihash_keeps_v4_and_v6_routes() {
         let mut index = TcpConnectionRouteIndex::empty();
         let owner = DataWorkerId::new(0);
-        let v4_session = SessionId::from(1u32);
-        let v6_session = SessionId::from(2u32);
+        let v4_session = u32::from(1u32);
+        let v6_session = u32::from(2u32);
         let v4_local = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)), 1000);
         let v4_remote = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 2)), 2000);
         let v6_local = SocketAddr::new(IpAddr::V6(Ipv6Addr::LOCALHOST), 1001);

@@ -19,11 +19,11 @@
 //! type; there is no `[event][length][payload]` envelope and no heap
 //! allocation in the hot path.
 
-use std::mem::size_of;
 use std::os::fd::{AsRawFd, FromRawFd, IntoRawFd, OwnedFd, RawFd};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
+use hammer_core::session::{SessionEvt, SessionEvtType};
 use hammer_infra::multi_ring_msg_queue::{
     MultiProducer, MultiRingMsgQueue, MultiRingMsgQueueCfg, MultiRingMsgQueueError, ProducerMode,
     RingCfg, RingMsg, SingleProducer,
@@ -46,193 +46,48 @@ pub enum SessionMqRing {
 /// The slot is `[event_type: u8][payload: 85]`.
 pub const SESSION_CTRL_MSG_MAX_SIZE: usize = 86;
 
-/// App↔session message-queue event aligned with VPP `session_event_t`.
-///
-/// # Identity rules (VPP / ADR-0010)
-///
-/// - **IO events** (`RxEnq`, `RxDeq`, `TxEnq`, `TxDeq`, `ProtocolOutput`): construct with
-///   [`SessionEvt::io`]. Only the session index is significant; worker bits are zero.
-/// - **Control events** (`Connect`, `Close`, `HalfClose`, `Reset`,
-///   `Disconnected`, `TransportClosed`): construct with [`SessionEvt::ctrl`].
-///   Identity is the VPP-shaped Session Handle packing
-///   `(session_index as u64) | ((worker_index as u64) << 32)`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[repr(C)]
-pub struct SessionEvt {
-    pub evt_type: SessionEvtType,
-    /// VPP `session_event_t.postponed`; unused by Hammer producers today.
-    pub postponed: u8,
-    /// Session/app event flags (e.g. urgent RX). Occupies VPP-aligned pad space.
-    flags: SessionEvtFlags,
-    _pad: u8,
-    identity: u64,
+/// Fixed shared-memory Session event codec size. VPP keeps event type and
+/// postponed state before a target union; Hammer preserves the fixed slot,
+/// explicit Session identity fields, and its own event metadata.
+const SESSION_EVT_BYTES: usize = 16;
+
+fn encode_session_evt(event: SessionEvt) -> [u8; SESSION_EVT_BYTES] {
+    let mut bytes = [0_u8; SESSION_EVT_BYTES];
+    bytes[0] = event.evt_type as u8;
+    bytes[1] = u8::from(event.postponed);
+    bytes[2..6].copy_from_slice(&event.session_index.to_le_bytes());
+    bytes[6..10].copy_from_slice(&event.thread_index.to_le_bytes());
+    bytes
 }
 
-/// Flags carried on [`SessionEvt`] (no separate OOB/MSG_OOB channel).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-#[repr(transparent)]
-pub struct SessionEvtFlags(u8);
-
-impl SessionEvtFlags {
-    /// TCP URG / urgent pointer marked this RX delivery.
-    pub const URGENT: Self = Self(0x01);
-
-    #[inline]
-    pub const fn empty() -> Self {
-        Self(0)
+fn decode_session_evt(bytes: &[u8]) -> Result<SessionEvt, SessionEvtDecodeError> {
+    if bytes.len() != SESSION_EVT_BYTES {
+        return Err(SessionEvtDecodeError::InvalidLength { bytes: bytes.len() });
     }
-
-    #[inline]
-    pub const fn is_empty(self) -> bool {
-        self.0 == 0
+    let evt_type = SessionEvtType::try_from(bytes[0])
+        .map_err(|value| SessionEvtDecodeError::InvalidType { value })?;
+    let postponed = match bytes[1] {
+        0 => false,
+        1 => true,
+        value => return Err(SessionEvtDecodeError::InvalidPostponed { value }),
+    };
+    if bytes[10..].iter().any(|byte| *byte != 0) {
+        return Err(SessionEvtDecodeError::ReservedBytes);
     }
-
-    #[inline]
-    pub const fn contains(self, other: Self) -> bool {
-        self.0 & other.0 == other.0
-    }
-
-    #[inline]
-    pub const fn union(self, other: Self) -> Self {
-        Self(self.0 | other.0)
-    }
+    Ok(SessionEvt {
+        evt_type,
+        postponed,
+        session_index: u32::from_le_bytes(bytes[2..6].try_into().expect("four byte index")),
+        thread_index: u32::from_le_bytes(bytes[6..10].try_into().expect("four byte index")),
+    })
 }
-
-impl SessionEvt {
-    #[inline]
-    pub const fn io(session_index: u32, evt_type: SessionEvtType) -> Self {
-        Self::io_with_flags(session_index, evt_type, SessionEvtFlags::empty())
-    }
-
-    #[inline]
-    pub const fn io_with_flags(
-        session_index: u32,
-        evt_type: SessionEvtType,
-        flags: SessionEvtFlags,
-    ) -> Self {
-        Self {
-            evt_type,
-            postponed: 0,
-            flags,
-            _pad: 0,
-            identity: session_index as u64,
-        }
-    }
-
-    #[inline]
-    pub const fn ctrl(session_index: u32, worker_index: u32, evt_type: SessionEvtType) -> Self {
-        Self {
-            evt_type,
-            postponed: 0,
-            flags: SessionEvtFlags::empty(),
-            _pad: 0,
-            identity: (session_index as u64) | ((worker_index as u64) << 32),
-        }
-    }
-
-    #[inline]
-    pub const fn session_index(self) -> u32 {
-        self.identity as u32
-    }
-
-    #[inline]
-    pub const fn worker_index(self) -> u32 {
-        (self.identity >> 32) as u32
-    }
-
-    #[inline]
-    pub const fn session_handle_raw(self) -> u64 {
-        self.identity
-    }
-
-    #[inline]
-    pub const fn flags(self) -> SessionEvtFlags {
-        self.flags
-    }
-
-    pub(crate) fn as_bytes(self) -> [u8; SESSION_EVT_BYTES] {
-        // SAFETY: repr(C) SessionEvt is exactly SESSION_EVT_BYTES with no padding gaps
-        // beyond the explicit `_pad` field.
-        unsafe { std::mem::transmute::<Self, [u8; SESSION_EVT_BYTES]>(self) }
-    }
-
-    pub(crate) fn decode_bytes(bytes: &[u8]) -> Result<Self, SessionEvtDecodeError> {
-        if bytes.len() != SESSION_EVT_BYTES {
-            return Err(SessionEvtDecodeError::InvalidLength { bytes: bytes.len() });
-        }
-        let mut arr = [0_u8; SESSION_EVT_BYTES];
-        arr.copy_from_slice(bytes);
-        SessionEvtType::try_from(arr[0])
-            .map_err(|value| SessionEvtDecodeError::InvalidType { value })?;
-        // SAFETY: the event discriminant was validated above and every other field
-        // is represented by initialized bytes in the fixed-size event frame.
-        Ok(unsafe { std::mem::transmute::<[u8; SESSION_EVT_BYTES], Self>(arr) })
-    }
-
-    pub(crate) fn from_bytes(bytes: &[u8]) -> Option<Self> {
-        Self::decode_bytes(bytes).ok()
-    }
-}
-
-const SESSION_EVT_BYTES: usize = size_of::<SessionEvt>();
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum SessionEvtDecodeError {
     InvalidLength { bytes: usize },
     InvalidType { value: u8 },
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[repr(u8)]
-pub enum SessionEvtType {
-    RxEnq = 0,
-    TxDeq = 1,
-    Connect = 2,
-    Close = 3,
-    RxDeq = 4,
-    TxEnq = 5,
-    ProtocolOutput = 6,
-    HalfClose = 7,
-    Reset = 8,
-    Disconnected = 9,
-    TransportClosed = 10,
-    Bound = 11,
-    UnlistenReply = 12,
-    Accepted = 13,
-    AcceptedReply = 14,
-    Connected = 15,
-    Listen = 16,
-    Unlisten = 17,
-    ConnectStream = 18,
-}
-
-impl TryFrom<u8> for SessionEvtType {
-    type Error = u8;
-
-    fn try_from(value: u8) -> Result<Self, Self::Error> {
-        match value {
-            0 => Ok(Self::RxEnq),
-            1 => Ok(Self::TxDeq),
-            2 => Ok(Self::Connect),
-            3 => Ok(Self::Close),
-            4 => Ok(Self::RxDeq),
-            5 => Ok(Self::TxEnq),
-            6 => Ok(Self::ProtocolOutput),
-            7 => Ok(Self::HalfClose),
-            8 => Ok(Self::Reset),
-            9 => Ok(Self::Disconnected),
-            10 => Ok(Self::TransportClosed),
-            11 => Ok(Self::Bound),
-            12 => Ok(Self::UnlistenReply),
-            13 => Ok(Self::Accepted),
-            14 => Ok(Self::AcceptedReply),
-            15 => Ok(Self::Connected),
-            16 => Ok(Self::Listen),
-            17 => Ok(Self::Unlisten),
-            18 => Ok(Self::ConnectStream),
-            value => Err(value),
-        }
-    }
+    InvalidPostponed { value: u8 },
+    ReservedBytes,
 }
 
 #[hammer_component_macros::runtime_error(subsystem = "application session MQ")]
@@ -675,8 +530,8 @@ impl SessionMsgQueue<MultiProducer> {
         let Some(message) = self.inner.sub() else {
             return Ok(None);
         };
-        let event = SessionEvt::from_bytes(message.as_slice())
-            .ok_or(SessionMsgQueueError::InvalidConfig)?;
+        let event = decode_session_evt(message.as_slice())
+            .map_err(|_| SessionMsgQueueError::InvalidConfig)?;
         let ring = if message.ring_index() == SessionMqRing::Io as u32 {
             SessionMqRing::Io
         } else {
@@ -687,7 +542,7 @@ impl SessionMsgQueue<MultiProducer> {
     }
 
     fn enqueue_on(&self, ring: SessionMqRing, evt: SessionEvt) -> Result<(), SessionMsgQueueError> {
-        let bytes = evt.as_bytes();
+        let bytes = encode_session_evt(evt);
         let mut guard = self.inner.lock();
         let mut slot = match guard.alloc(ring as u32) {
             Ok(slot) => slot,
@@ -729,7 +584,7 @@ impl SessionEventQueue for SessionMsgQueue<MultiProducer> {
             return Ok(None);
         };
         let evt =
-            SessionEvt::from_bytes(msg.as_slice()).ok_or(SessionMsgQueueError::InvalidConfig)?;
+            decode_session_evt(msg.as_slice()).map_err(|_| SessionMsgQueueError::InvalidConfig)?;
         drop(msg);
         Ok(Some(evt))
     }

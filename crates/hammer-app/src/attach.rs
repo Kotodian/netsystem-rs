@@ -8,10 +8,10 @@ use std::sync::Arc;
 
 use hammer_infra::segment::Segment;
 use hammer_runtime::app::{
-    AppSession, AppSessionError, ApplicationId, SessionAcceptedMsg, SessionBoundMsg,
-    SessionConnectError, SessionConnectedMsg, SessionControlDecodeError, SessionControlError,
-    SessionEvtType, SessionHandle, SessionMsgQueue, SessionMsgQueueError, SessionOffsets,
-    SessionProducer, SessionUnlistenReplyMsg, SingleProducer,
+    AppSession, AppSessionError, SessionAcceptedMsg, SessionBoundMsg, SessionConnectError,
+    SessionConnectedMsg, SessionControlDecodeError, SessionControlError, SessionEvtType,
+    SessionHandle, SessionMsgQueue, SessionMsgQueueError, SessionOffsets, SessionProducer,
+    SessionUnlistenReplyMsg, SingleProducer,
 };
 use hammer_runtime::attach::{
     APPLICATION_MQ_BASE_DESCRIPTOR_COUNT, APPLICATION_MQ_METADATA_BYTES,
@@ -137,7 +137,7 @@ pub enum AppClientError {
     SessionRejected { error: SessionControlError },
     #[error("Application connection {connection:?} failed: {error}")]
     SessionConnectFailed {
-        connection: hammer_runtime::app::ApplicationConnectionId,
+        connection: u32,
         error: SessionConnectError,
     },
     #[error("Application Session emitted unexpected event {event:?}")]
@@ -195,7 +195,7 @@ impl ControlReply {
 
 pub struct AppClient {
     stream: UnixStream,
-    application: ApplicationId,
+    application: u32,
     /// The Application-owned single-producer capability for Session control
     /// requests. The daemon maps the same queue as a consumer only; it never
     /// claims the producer.
@@ -238,9 +238,8 @@ impl AppClient {
         if words[1] != ATTACH_STATUS_ACCEPTED {
             return Err(AppClientError::AttachRejected);
         }
-        let application = ApplicationId::from_raw(
-            u32::try_from(words[2]).map_err(|_| AppClientError::InvalidDescriptorPayload)?,
-        );
+        let application =
+            u32::try_from(words[2]).map_err(|_| AppClientError::InvalidDescriptorPayload)?;
         let (mut metadata, descriptors) =
             descriptor::receive(&stream, APPLICATION_MQ_METADATA_BYTES)?;
         let words = descriptor::words_prefix::<APPLICATION_MQ_METADATA_WORDS>(&metadata)?;
@@ -393,17 +392,17 @@ impl AppClient {
         })
     }
 
-    /// Control-queue seam for hammer-vcl MQ protocol tests: builds a client
+    /// Control-queue seam for client MQ protocol tests: builds a client
     /// over an existing Session control request/reply queue pair, without the
     /// attach handshake. `stream` is the descriptor stream: established-Session
     /// methods (`accept` / `accept_with_handle`) read the production attach
     /// metadata and SCM_RIGHTS descriptors from it, so the test must deliver
     /// them in the daemon format (or avoid those methods). `rx_mqs` is the
     /// per-worker Application Rx MQ set selected by
-    /// `handle.worker_index()`; no ext-config store is attached.
+    /// `handle.thread_index`; no ext-config store is attached.
     pub fn with_queues(
         stream: UnixStream,
-        application: ApplicationId,
+        application: u32,
         requests: SessionProducer,
         replies: SessionMsgQueue<SingleProducer>,
         rx_mqs: Box<[Arc<SessionMsgQueue>]>,
@@ -421,7 +420,7 @@ impl AppClient {
     }
 
     #[inline]
-    pub const fn application(&self) -> ApplicationId {
+    pub const fn application(&self) -> u32 {
         self.application
     }
 
@@ -433,7 +432,8 @@ impl AppClient {
     /// descriptors, verifying the received Session handle against
     /// `expected_handle` when given.
     ///
-    /// This is the established-session seam consumed by `hammer-vcl`: the
+    /// This is the established-session seam consumed by the client Session
+    /// layer: the
     /// CONNECTED/ACCEPTED control message carries the Session handle and
     /// flags, and the descriptors arrive on the attach stream; the caller
     /// preserves the flags from the control message itself.
@@ -452,7 +452,11 @@ impl AppClient {
                 actual: descriptors.len(),
             });
         }
-        let handle = SessionHandle::from(words[1]);
+        let session_index =
+            u32::try_from(words[1]).map_err(|_| AppClientError::InvalidDescriptorPayload)?;
+        let thread_index =
+            u32::try_from(words[2]).map_err(|_| AppClientError::InvalidDescriptorPayload)?;
+        let handle = SessionHandle::new(session_index, thread_index);
         if let Some(expected) = expected_handle
             && expected != handle
         {
@@ -462,14 +466,14 @@ impl AppClient {
             });
         }
         let session_segment_size =
-            usize::try_from(words[2]).map_err(|_| AppClientError::OffsetOverflow)?;
+            usize::try_from(words[3]).map_err(|_| AppClientError::OffsetOverflow)?;
         if session_segment_size == 0 || session_segment_size > isize::MAX as usize {
             return Err(AppClientError::OffsetOverflow);
         }
         let offsets = SessionOffsets {
-            rx_fifo_off: words[3],
-            tx_fifo_off: words[4],
-            evt_q_off: words[5],
+            rx_fifo_off: words[4],
+            tx_fifo_off: words[5],
+            evt_q_off: words[6],
         };
         if [offsets.rx_fifo_off, offsets.tx_fifo_off, offsets.evt_q_off]
             .into_iter()
@@ -487,7 +491,7 @@ impl AppClient {
             session_segment_size,
         )
         .map_err(|source| AppClientError::SessionSegmentMap { source })?;
-        let worker = handle.worker_index() as usize;
+        let worker = handle.thread_index as usize;
         let worker_queue =
             self.rx_mqs
                 .get(worker)

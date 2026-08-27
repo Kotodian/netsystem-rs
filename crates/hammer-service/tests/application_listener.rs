@@ -1,4 +1,4 @@
-use hammer_runtime::app::{SessionAppId, SessionAppRegistration};
+use hammer_runtime::app::{SessionAppRegistration, u32};
 use hammer_service::session::{ApplicationError, ApplicationMain};
 
 fn install_quic_session_app(_: &mut hammer_runtime::Engine) -> hammer_runtime::RuntimeResult<()> {
@@ -12,7 +12,7 @@ fn application_listener_owns_a_validated_session_app_endpoint() {
     let applications = ApplicationMain::new(4);
     let application = applications.attach().expect("attach Application");
     let listener = applications
-        .register_listener(application, None::<SessionAppId>, None)
+        .register_listener(application, None::<u32>, None)
         .expect("register Application listener");
 
     applications
@@ -29,7 +29,7 @@ fn application_listener_identity_is_owned_and_generation_checked() {
     let applications = ApplicationMain::new(4);
     let first = applications.attach().expect("attach first Application");
     let listener = applications
-        .register_listener(first, None::<SessionAppId>, None)
+        .register_listener(first, None::<u32>, None)
         .expect("register Application listener");
     let second_application = applications.attach().expect("attach second Application");
 
@@ -43,7 +43,7 @@ fn application_listener_identity_is_owned_and_generation_checked() {
         .remove_listener(first, listener)
         .expect("remove first listener");
     let replacement = applications
-        .register_listener(first, None::<SessionAppId>, None)
+        .register_listener(first, None::<u32>, None)
         .expect("register replacement listener");
     assert_ne!(listener, replacement);
 }
@@ -63,7 +63,7 @@ fn application_resolves_registered_session_app_identity() {
         applications
             .session_app_id("quic")
             .expect("resolve registered Session App"),
-        SessionAppId::new(0)
+        0
     );
     assert!(matches!(
         applications.session_app_id("missing"),

@@ -82,11 +82,11 @@ fn svm_session_multi_ring_evt_q_io_and_ctrl_round_trip() {
     let mut out = [SessionEvt::io(0, SessionEvtType::Close); 4];
     assert_eq!(session.poll_events(&mut out), 2);
     assert_eq!(out[0].evt_type, SessionEvtType::Connect);
-    assert_eq!(out[0].session_index(), 3);
-    assert_eq!(out[0].worker_index(), 2);
+    assert_eq!(out[0].session_index, 3);
+    assert_eq!(out[0].thread_index, 2);
     assert_eq!(out[1].evt_type, SessionEvtType::RxEnq);
-    assert_eq!(out[1].session_index(), 3);
-    assert_eq!(out[1].worker_index(), 0);
+    assert_eq!(out[1].session_index, 3);
+    assert_eq!(out[1].thread_index, 0);
 
     assert_eq!(session.send_bytes(b"x").expect("send"), 1);
     let tx = session
@@ -95,7 +95,7 @@ fn svm_session_multi_ring_evt_q_io_and_ctrl_round_trip() {
         .expect("dequeue")
         .expect("tx enqueue");
     assert_eq!(tx.evt_type, SessionEvtType::TxEnq);
-    assert_eq!(tx.session_index(), 3);
+    assert_eq!(tx.session_index, 3);
 }
 
 #[test]

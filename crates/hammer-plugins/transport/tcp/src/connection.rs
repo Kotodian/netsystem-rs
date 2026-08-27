@@ -24,8 +24,6 @@ use hammer_service::session::runtime::RxDelivery;
 use hammer_service::transport::congestion::{CongestionController, CongestionMetrics};
 use thiserror::Error;
 
-use hammer_service::session::SessionId;
-
 pub(crate) const TCP_MAX_WINDOW_SCALE: u8 = 14;
 const DEFAULT_TCP_WINDOW: u32 = u16::MAX as u32;
 const DEFAULT_TCP_MAX_SEGMENT_SIZE: u32 = DEFAULT_TCP_OUTPUT_PAYLOAD_LEN as u32;
@@ -284,7 +282,7 @@ pub struct TcpConnectionCacheline0 {
 
 #[derive(Debug, Clone)]
 struct TcpConnectionCacheline1 {
-    session_id: SessionId,
+    session_id: u32,
     connection_id: Option<TcpConnectionId>,
     owner_worker: DataWorkerId,
     close_reason: Option<TcpCloseReason>,
@@ -349,7 +347,7 @@ impl TcpConnection {
     ) -> Self {
         let policy = crate::active_tcp_policy();
         let mss = policy.mss as u32;
-        let session_id = SessionId::new(connection_id.map_or(0, TcpConnectionId::get));
+        let session_id = connection_id.map_or(0, TcpConnectionId::get);
         Self {
             cacheline0: CachePadded::new(TcpConnectionCacheline0 {
                 state: TcpState::Closed,
@@ -418,11 +416,11 @@ impl TcpConnection {
     }
 
     #[inline]
-    pub(crate) fn session_id(&self) -> SessionId {
+    pub(crate) fn session_id(&self) -> u32 {
         self.cacheline1.session_id
     }
 
-    pub(crate) fn attach_session(&mut self, session_id: SessionId) -> RuntimeResult<()> {
+    pub(crate) fn attach_session(&mut self, session_id: u32) -> RuntimeResult<()> {
         if self.cacheline1.connection_id.is_some() {
             return Err(TcpConnectionError::InvalidState.into());
         }
@@ -4834,13 +4832,12 @@ mod tests {
     }
 
     use crate::{TcpWorker, closing_session_for_test};
-    use hammer_service::session::SessionId;
     use hammer_service::session::SessionWorker;
 
     fn session<'a>(
         sessions: &SessionWorker<u32>,
         tcp: &'a TcpWorker,
-        session_id: SessionId,
+        session_id: u32,
     ) -> Option<&'a TcpConnection> {
         let (_, index) = sessions.session_transport(session_id)?;
         tcp.connections.get(index)
@@ -4849,7 +4846,7 @@ mod tests {
     fn session_mut<'a>(
         sessions: &SessionWorker<u32>,
         tcp: &'a mut TcpWorker,
-        session_id: SessionId,
+        session_id: u32,
     ) -> Option<&'a mut TcpConnection> {
         let (_, index) = sessions.session_transport(session_id)?;
         tcp.connections.get_mut(index)
@@ -4881,7 +4878,7 @@ mod tests {
     fn drive_fin_ack_to_time_wait(
         sessions: &SessionWorker<u32>,
         tcp: &mut TcpWorker,
-        session_id: SessionId,
+        session_id: u32,
         local: SocketAddr,
         remote: SocketAddr,
     ) {
@@ -4928,7 +4925,7 @@ mod tests {
     fn enter_close_wait_for_passive_close_test(
         sessions: &SessionWorker<u32>,
         tcp: &mut TcpWorker,
-        session_id: SessionId,
+        session_id: u32,
         local: SocketAddr,
         remote: SocketAddr,
     ) {

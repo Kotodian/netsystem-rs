@@ -1301,18 +1301,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "hammer-vcl"
-version = "0.1.0"
-dependencies = [
- "hammer-app",
- "hammer-infra",
- "hammer-runtime",
- "libc",
- "thiserror 2.0.18",
- "tokio",
-]
-
-[[package]]
 name = "hammerctl"
 version = "0.1.0"
 dependencies = [

@@ -28,7 +28,7 @@
 //!
 //! Identities follow the Hammer QUIC conventions: `ContextId` packs
 //! `slot | generation << 32` exactly like the QUIC `ContextId`
-//! (quic worker.rs:178-205) and `SessionId` (hammer-service
+//! (quic worker.rs:178-205) and `u32` (hammer-service
 //! session/id.rs:6-25), with standard `From` conversions to and from `u32`
 //! and the packed `u64`. The underlying `Pool` (hammer-infra pool.rs) keeps
 //! allocate/get/remove O(1) and generation-checked, with slots aligned to
@@ -42,7 +42,7 @@ use hammer_runtime::DataWorkerId;
 use hammer_runtime::app::SessionAppContext;
 use hammer_runtime::error::RuntimeError;
 use hammer_runtime::session::SessionStreamDirection;
-use hammer_service::session::{SessionEndpointRole, SessionId, SessionWorker};
+use hammer_service::session::{SessionEndpointRole, SessionWorker};
 
 use crate::http_common::{BodyAccumulator, PublishError, publish_body_chunk};
 use crate::http3::preface::encode_control_preface;
@@ -147,13 +147,13 @@ impl From<StreamContextId> for u32 {
 
 /// Cold per-connection state bound to one data-worker context slot.
 ///
-/// Holds the lower QUIC `SessionId` the context was allocated for plus the
+/// Holds the lower QUIC `u32` the context was allocated for plus the
 /// HTTP/3 bootstrap state of the local control stream; hot HTTP/3 connection
 /// state (frames, QPACK, streams) belongs to later slices.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct ConnectionContext {
     /// Lower QUIC session this connection context is bound to.
-    pub(crate) session: SessionId,
+    pub(crate) session: u32,
     /// Endpoint role of the underlying Session: `Server` for
     /// listener-accepted connections, `Client` for outbound connects;
     /// `None` when accept-time role metadata is absent. Cold, read-only
@@ -162,7 +162,7 @@ pub(crate) struct ConnectionContext {
     /// Local control stream child Session, recorded only after the bootstrap
     /// action succeeds; `None` until then. Mirrors VPP recording the opened
     /// control stream in `http_ctx_t::our_ctrl_stream_index` (http3.c:234).
-    pub(crate) local_control: Option<SessionId>,
+    pub(crate) local_control: Option<u32>,
     /// Peer control stream context, registered exactly once when the decoded
     /// peer uni stream type is Control; `None` until then. Mirrors VPP
     /// `http_ctx_t::peer_ctrl_stream_index` (http3.c:1683-1691).
@@ -196,7 +196,7 @@ pub(crate) struct ConnectionContext {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct StreamContext {
     /// Child QUIC session this stream context is bound to.
-    pub(crate) session: SessionId,
+    pub(crate) session: u32,
     /// Parent connection context this stream belongs to.
     pub(crate) parent: ContextId,
     /// Peer stream direction: uni- or bidirectional.
@@ -407,8 +407,8 @@ pub(crate) enum HttpWorkerError {
     )]
     SessionMismatch {
         context: ContextId,
-        expected: SessionId,
-        actual: SessionId,
+        expected: u32,
+        actual: u32,
     },
     #[error("http connection context {context:?} already opened its control stream")]
     ControlStreamAlreadyOpen { context: ContextId },
@@ -419,10 +419,7 @@ pub(crate) enum HttpWorkerError {
     #[error(
         "http connection context {context:?} cannot find the Session FIFO of local control child {child:?}"
     )]
-    ControlStreamFifoMissing {
-        context: ContextId,
-        child: SessionId,
-    },
+    ControlStreamFifoMissing { context: ContextId, child: u32 },
     #[error("local control preface for connection context {context:?} does not encode")]
     ControlPrefaceEncodeFailed { context: ContextId },
     #[error(
@@ -544,8 +541,8 @@ pub(crate) enum HttpWorkerError {
     #[error("http stream context {stream:?} is bound to session {actual:?}, expected {expected:?}")]
     StreamSessionMismatch {
         stream: StreamContextId,
-        expected: SessionId,
-        actual: SessionId,
+        expected: u32,
+        actual: u32,
     },
     #[error(
         "http stream context {stream:?} is not a bidirectional request stream (direction {direction:?})"
@@ -592,7 +589,7 @@ pub(crate) struct PeerUniStreamReset {
     pub(crate) context: ContextId,
     /// Root QUIC session of the parent connection, which the generic
     /// `SessionWorker::close_connection` action targets.
-    pub(crate) session: SessionId,
+    pub(crate) session: u32,
     /// HTTP/3 error code terminating the connection: always
     /// `ErrorCode::ClosedCriticalStream` (0x0104).
     pub(crate) error_code: ErrorCode,
@@ -726,7 +723,7 @@ impl HttpWorker {
     /// without role metadata (`None`).
     ///
     /// O(1); fails with `ContextCapacityExhausted` when the pool is full.
-    pub(crate) fn allocate(&mut self, session: SessionId) -> Result<ContextId, HttpWorkerError> {
+    pub(crate) fn allocate(&mut self, session: u32) -> Result<ContextId, HttpWorkerError> {
         self.allocate_with_role(session, None)
     }
 
@@ -737,7 +734,7 @@ impl HttpWorker {
     /// O(1); fails with `ContextCapacityExhausted` when the pool is full.
     pub(crate) fn allocate_with_role(
         &mut self,
-        session: SessionId,
+        session: u32,
         role: Option<SessionEndpointRole>,
     ) -> Result<ContextId, HttpWorkerError> {
         Ok(ContextId::from(self.contexts.insert(ConnectionContext {
@@ -760,7 +757,9 @@ impl HttpWorker {
         if !self.contexts.contains_key(context.into()) {
             return Err(HttpWorkerError::ContextMissing { context });
         }
-        Ok(self.contexts.get(context.into()))
+        self.contexts
+            .get(context.into())
+            .ok_or(HttpWorkerError::ContextMissing { context })
     }
 
     /// Resolves a context and verifies it is bound to the exact `session`.
@@ -770,7 +769,7 @@ impl HttpWorker {
     pub(crate) fn get_for_session(
         &self,
         context: ContextId,
-        session: SessionId,
+        session: u32,
     ) -> Result<&ConnectionContext, HttpWorkerError> {
         let connection = self.get(context)?;
         if connection.session != session {
@@ -799,7 +798,7 @@ impl HttpWorker {
         context: ContextId,
         sessions: &mut SessionWorker<u32>,
         app_context: SessionAppContext,
-    ) -> Result<SessionId, HttpWorkerError> {
+    ) -> Result<u32, HttpWorkerError> {
         if !self.contexts.contains_key(context.into()) {
             return Err(HttpWorkerError::ContextMissing { context });
         }
@@ -919,7 +918,7 @@ impl HttpWorker {
     /// stale parent identity can never attach a new stream.
     pub(crate) fn allocate_stream(
         &mut self,
-        session: SessionId,
+        session: u32,
         parent: ContextId,
         direction: SessionStreamDirection,
     ) -> Result<StreamContextId, HttpWorkerError> {
@@ -949,7 +948,9 @@ impl HttpWorker {
         if !self.streams.contains_key(stream.into()) {
             return Err(HttpWorkerError::StreamMissing { stream });
         }
-        Ok(self.streams.get(stream.into()))
+        self.streams
+            .get(stream.into())
+            .ok_or(HttpWorkerError::StreamMissing { stream })
     }
 
     /// Resolves a stream context and verifies it is bound to the exact
@@ -960,7 +961,7 @@ impl HttpWorker {
     pub(crate) fn get_stream_for_session(
         &self,
         stream: StreamContextId,
-        session: SessionId,
+        session: u32,
     ) -> Result<&StreamContext, HttpWorkerError> {
         let stream_context = self.get_stream(stream)?;
         if stream_context.session != session {
@@ -1091,7 +1092,7 @@ impl HttpWorker {
     /// (0x0104). This method is read-only classification: it generation-
     /// checks the stream context and its parent connection, and returns
     /// copied stream/parent identities plus the parent connection's root
-    /// lower session (the `SessionId` the generic `close_connection` action
+    /// lower session (the `u32` the generic `close_connection` action
     /// targets) and the constant error code, mutating nothing. It must not
     /// dispatch the close or clean up yet —
     /// VPP records and dispatches the connection error before any stream
@@ -1240,7 +1241,7 @@ impl HttpWorker {
     pub(crate) fn process_request_bytes<'a>(
         &mut self,
         stream: StreamContextId,
-        session: SessionId,
+        session: u32,
         bytes: &'a [u8],
     ) -> Result<(RequestFrameRead<'a>, usize), RequestReadError> {
         if !self.streams.contains_key(stream.into()) {
@@ -1307,7 +1308,7 @@ impl HttpWorker {
     pub(crate) fn install_request_body_length(
         &mut self,
         stream: StreamContextId,
-        session: SessionId,
+        session: u32,
         declared: Option<u64>,
     ) -> Result<(), HttpWorkerError> {
         if !self.streams.contains_key(stream.into()) {
@@ -1346,7 +1347,7 @@ impl HttpWorker {
     pub(crate) fn abort_request_stream(
         &mut self,
         stream: StreamContextId,
-        session: SessionId,
+        session: u32,
     ) -> Result<(), HttpWorkerError> {
         if !self.streams.contains_key(stream.into()) {
             return Err(HttpWorkerError::StreamMissing { stream });
@@ -1390,7 +1391,7 @@ impl HttpWorker {
     pub(crate) fn process_request_data(
         &mut self,
         stream: StreamContextId,
-        session: SessionId,
+        session: u32,
         upper_rx: &Fifo,
         chunk: &[u8],
     ) -> Result<(), RequestReadError> {
@@ -1449,7 +1450,7 @@ impl HttpWorker {
     pub(crate) fn validate_request_finish(
         &self,
         stream: StreamContextId,
-        session: SessionId,
+        session: u32,
     ) -> Result<(), RequestReadError> {
         if !self.streams.contains_key(stream.into()) {
             return Err(RequestReadError::Worker(HttpWorkerError::StreamMissing {
@@ -1500,7 +1501,7 @@ impl HttpWorker {
     pub(crate) fn retain_pending_field_section(
         &mut self,
         stream: StreamContextId,
-        session: SessionId,
+        session: u32,
         section: PendingFieldSection,
     ) -> Result<(), HttpWorkerError> {
         if !self.streams.contains_key(stream.into()) {
@@ -1558,7 +1559,7 @@ impl HttpWorker {
     pub(crate) fn pending_field_section(
         &self,
         stream: StreamContextId,
-        session: SessionId,
+        session: u32,
     ) -> Result<Option<&PendingFieldSection>, HttpWorkerError> {
         if !self.streams.contains_key(stream.into()) {
             return Err(HttpWorkerError::StreamMissing { stream });
@@ -1599,7 +1600,7 @@ impl HttpWorker {
     pub(crate) fn clear_pending_field_section(
         &mut self,
         stream: StreamContextId,
-        session: SessionId,
+        session: u32,
     ) -> Result<(), HttpWorkerError> {
         if !self.streams.contains_key(stream.into()) {
             return Err(HttpWorkerError::StreamMissing { stream });
@@ -1722,7 +1723,7 @@ impl HttpWorker {
     pub(crate) fn release_request_stream(
         &mut self,
         stream: StreamContextId,
-        session: SessionId,
+        session: u32,
     ) -> Result<(), HttpWorkerError> {
         let direction = self.get_stream_for_session(stream, session)?.direction;
         if direction != SessionStreamDirection::Bidi {
@@ -1948,21 +1949,21 @@ fn feed_control_reader(
 mod tests {
     use super::*;
 
-    fn session(slot: u32, generation: u32) -> SessionId {
-        SessionId::from_raw(u64::from(slot) | (u64::from(generation) << 32))
+    fn session(slot: u32) -> u32 {
+        slot
     }
 
     use std::cell::Cell;
 
     use hammer_runtime::app::{AppSessionConfig, SessionAppContext};
-    use hammer_runtime::session::{SessionApplicationErrorCode, SessionStreamDirection};
+    use hammer_runtime::session::SessionStreamDirection;
     use hammer_runtime::{RuntimeError, RuntimeResult};
     use hammer_service::session::application::ApplicationMain;
-    use hammer_service::session::runtime::{SessionTransportId, SessionTransportWorkerActions};
+    use hammer_service::session::runtime::SessionTransportWorkerActions;
 
     use crate::http3::proto::frame::FrameType;
 
-    const ACTION_TRANSPORT: SessionTransportId = SessionTransportId::new(0);
+    const ACTION_TRANSPORT: u8 = 0;
 
     /// Per-thread observation of the fake `open_stream` action: invocation
     /// count, the passed `app_context`, and whether the next call fails.
@@ -1974,39 +1975,39 @@ mod tests {
 
     fn fake_open_stream(
         _sessions: &mut SessionWorker<u32>,
-        parent: SessionId,
+        parent: u32,
         direction: SessionStreamDirection,
         app_context: SessionAppContext,
-    ) -> RuntimeResult<SessionId> {
+    ) -> RuntimeResult<u32> {
         OPEN_CALLS.with(|calls| calls.set(calls.get() + 1));
         OPEN_CONTEXT.with(|seen| seen.set(app_context));
         assert_eq!(direction, SessionStreamDirection::Uni);
         if OPEN_FAIL.with(|fail| fail.get()) {
             return Err(RuntimeError::ServiceClosed);
         }
-        Ok(SessionId::from_raw(parent.get() + 1))
+        Ok(parent + 1)
     }
 
     fn fake_reset_stream(
         _sessions: &mut SessionWorker<u32>,
-        _session_id: SessionId,
-        _code: SessionApplicationErrorCode,
+        _session_id: u32,
+        _code: u64,
     ) -> RuntimeResult<()> {
         Ok(())
     }
 
     fn fake_stop_sending(
         _sessions: &mut SessionWorker<u32>,
-        _session_id: SessionId,
-        _code: SessionApplicationErrorCode,
+        _session_id: u32,
+        _code: u64,
     ) -> RuntimeResult<()> {
         Ok(())
     }
 
     fn fake_close_connection(
         _sessions: &mut SessionWorker<u32>,
-        _session_id: SessionId,
-        _code: SessionApplicationErrorCode,
+        _session_id: u32,
+        _code: u64,
         _reason: &[u8],
     ) -> RuntimeResult<()> {
         Ok(())
@@ -2014,7 +2015,7 @@ mod tests {
 
     /// An `HttpWorker` with one context allocated for a real Session-worker
     /// parent Session whose transport has the fake action table installed.
-    fn harness() -> (HttpWorker, SessionWorker<u32>, ContextId, SessionId) {
+    fn harness() -> (HttpWorker, SessionWorker<u32>, ContextId, u32) {
         let applications = ApplicationMain::new(4);
         let application = applications.attach().expect("attach test Application");
         let mut sessions = SessionWorker::<u32>::new(
@@ -2060,7 +2061,7 @@ mod tests {
     #[test]
     fn allocate_returns_direct_id_bound_to_exact_session() {
         let mut worker = HttpWorker::with_capacity(4);
-        let lower = session(3, 1);
+        let lower = session(3);
         let context = worker.allocate(lower).expect("allocate succeeds");
         assert_eq!(worker.get(context).expect("live context").session, lower);
         assert_eq!(ContextId::from(u32::from(context)), context);
@@ -2075,44 +2076,38 @@ mod tests {
     #[test]
     fn distinct_allocations_keep_distinct_bindings() {
         let mut worker = HttpWorker::with_capacity(4);
-        let first = worker.allocate(session(1, 1)).expect("allocate first");
-        let second = worker.allocate(session(2, 1)).expect("allocate second");
+        let first = worker.allocate(session(1)).expect("allocate first");
+        let second = worker.allocate(session(2)).expect("allocate second");
         assert_ne!(first, second);
-        assert_eq!(
-            worker.get(first).expect("first live").session,
-            session(1, 1)
-        );
-        assert_eq!(
-            worker.get(second).expect("second live").session,
-            session(2, 1)
-        );
+        assert_eq!(worker.get(first).expect("first live").session, session(1));
+        assert_eq!(worker.get(second).expect("second live").session, session(2));
     }
 
     #[test]
     fn direct_id_reuses_after_remove_and_reuse() {
         let mut worker = HttpWorker::with_capacity(4);
-        let first = worker.allocate(session(5, 1)).expect("allocate");
+        let first = worker.allocate(session(5)).expect("allocate");
         worker.remove(first).expect("remove");
-        let second = worker.allocate(session(7, 2)).expect("reuse index");
+        let second = worker.allocate(session(7)).expect("reuse index");
         assert_eq!(first, second);
         assert_eq!(
             worker.get(first).expect("reused identity live").session,
-            session(7, 2)
+            session(7)
         );
     }
 
     #[test]
     fn capacity_exhaustion_is_typed_error() {
         let mut worker = HttpWorker::with_capacity(1);
-        worker.allocate(session(1, 1)).expect("first slot");
+        worker.allocate(session(1)).expect("first slot");
         assert!(matches!(
-            worker.allocate(session(2, 1)),
+            worker.allocate(session(2)),
             Err(HttpWorkerError::ContextCapacityExhausted { capacity: 1 })
         ));
         let mut empty = HttpWorker::with_capacity(0);
         assert!(empty.is_empty());
         assert!(matches!(
-            empty.allocate(session(3, 1)),
+            empty.allocate(session(3)),
             Err(HttpWorkerError::ContextCapacityExhausted { capacity: 0 })
         ));
     }
@@ -2120,8 +2115,8 @@ mod tests {
     #[test]
     fn session_mismatch_rejected_by_direct_id_lookup() {
         let mut worker = HttpWorker::with_capacity(2);
-        let bound = session(1, 1);
-        let other = session(2, 1);
+        let bound = session(1);
+        let other = session(2);
         let context = worker.allocate(bound).expect("allocate");
         assert!(matches!(
             worker.get_for_session(context, other),
@@ -2148,7 +2143,7 @@ mod tests {
             worker.remove(bogus),
             Err(HttpWorkerError::ContextMissing { context: c }) if c == bogus
         ));
-        let context = worker.allocate(session(1, 1)).expect("allocate");
+        let context = worker.allocate(session(1)).expect("allocate");
         worker.remove(context).expect("remove");
         assert!(matches!(
             worker.remove(context),
@@ -2159,7 +2154,7 @@ mod tests {
     #[test]
     fn fresh_context_has_no_local_control_and_awaits_peer_settings() {
         let mut worker = HttpWorker::with_capacity(4);
-        let lower = session(3, 1);
+        let lower = session(3);
         let context = worker.allocate(lower).expect("allocate context");
         let connection = worker.get(context).expect("live context");
         assert_eq!(connection.local_control, None);
@@ -2179,7 +2174,7 @@ mod tests {
             .expect("bootstrap succeeds");
         assert_eq!(
             child,
-            SessionId::from_raw(parent.get() + 1),
+            parent + 1,
             "the returned child is the one the action produced"
         );
         assert_eq!(
@@ -2262,7 +2257,7 @@ mod tests {
     /// A bootstrapped context whose child control stream Session has a real
     /// TX FIFO: the parent at slot 3 and the control child at slot 4, exactly
     /// the child `fake_open_stream` returns (`parent + 1`).
-    fn preface_harness() -> (HttpWorker, SessionWorker<u32>, ContextId, SessionId) {
+    fn preface_harness() -> (HttpWorker, SessionWorker<u32>, ContextId, u32) {
         let applications = ApplicationMain::new(4);
         let application = applications.attach().expect("attach test Application");
         let mut sessions = SessionWorker::<u32>::new(
@@ -2418,8 +2413,8 @@ mod tests {
     #[test]
     fn stream_allocate_binds_parent_session_and_direction() {
         let mut worker = HttpWorker::with_capacities(4, 4);
-        let parent = worker.allocate(session(1, 1)).expect("parent context");
-        let child = session(2, 1);
+        let parent = worker.allocate(session(1)).expect("parent context");
+        let child = session(2);
         let stream = worker
             .allocate_stream(child, parent, SessionStreamDirection::Bidi)
             .expect("allocate stream");
@@ -2443,13 +2438,13 @@ mod tests {
         let mut worker = HttpWorker::with_capacities(4, 4);
         let bogus = ContextId::from(u64::MAX);
         assert!(matches!(
-            worker.allocate_stream(session(1, 1), bogus, SessionStreamDirection::Bidi),
+            worker.allocate_stream(session(1), bogus, SessionStreamDirection::Bidi),
             Err(HttpWorkerError::ParentContextMissing { parent: p }) if p == bogus
         ));
-        let parent = worker.allocate(session(1, 1)).expect("parent context");
+        let parent = worker.allocate(session(1)).expect("parent context");
         worker.remove(parent).expect("remove parent");
         assert!(matches!(
-            worker.allocate_stream(session(2, 1), parent, SessionStreamDirection::Bidi),
+            worker.allocate_stream(session(2), parent, SessionStreamDirection::Bidi),
             Err(HttpWorkerError::ParentContextMissing { parent: p }) if p == parent
         ));
         assert_eq!(worker.stream_len(), 0, "failed allocation leaves no stream");
@@ -2458,13 +2453,13 @@ mod tests {
     #[test]
     fn stream_id_reuses_after_remove_and_slot_reuse() {
         let mut worker = HttpWorker::with_capacities(4, 4);
-        let parent = worker.allocate(session(1, 1)).expect("parent");
+        let parent = worker.allocate(session(1)).expect("parent");
         let first = worker
-            .allocate_stream(session(2, 1), parent, SessionStreamDirection::Bidi)
+            .allocate_stream(session(2), parent, SessionStreamDirection::Bidi)
             .expect("allocate first stream");
         worker.remove_stream(first).expect("remove stream");
         let second = worker
-            .allocate_stream(session(3, 1), parent, SessionStreamDirection::Uni)
+            .allocate_stream(session(3), parent, SessionStreamDirection::Uni)
             .expect("reuse index");
         assert_eq!(first, second);
         assert_eq!(
@@ -2472,16 +2467,16 @@ mod tests {
                 .get_stream(first)
                 .expect("reused identity live")
                 .session,
-            session(3, 1)
+            session(3)
         );
     }
 
     #[test]
     fn stream_session_mismatch_is_typed_error() {
         let mut worker = HttpWorker::with_capacities(4, 4);
-        let parent = worker.allocate(session(1, 1)).expect("parent");
-        let child = session(2, 1);
-        let other = session(3, 1);
+        let parent = worker.allocate(session(1)).expect("parent");
+        let child = session(2);
+        let other = session(3);
         let stream = worker
             .allocate_stream(child, parent, SessionStreamDirection::Bidi)
             .expect("allocate stream");
@@ -2505,20 +2500,20 @@ mod tests {
     #[test]
     fn stream_and_connection_capacities_are_independent() {
         let mut worker = HttpWorker::with_capacities(1, 2);
-        let parent = worker.allocate(session(1, 1)).expect("only connection");
+        let parent = worker.allocate(session(1)).expect("only connection");
         assert!(matches!(
-            worker.allocate(session(2, 1)),
+            worker.allocate(session(2)),
             Err(HttpWorkerError::ContextCapacityExhausted { capacity: 1 })
         ));
         // Stream pool still has headroom despite connection pool exhaustion.
         let first = worker
-            .allocate_stream(session(2, 1), parent, SessionStreamDirection::Bidi)
+            .allocate_stream(session(2), parent, SessionStreamDirection::Bidi)
             .expect("first stream");
         let second = worker
-            .allocate_stream(session(3, 1), parent, SessionStreamDirection::Uni)
+            .allocate_stream(session(3), parent, SessionStreamDirection::Uni)
             .expect("second stream");
         assert!(matches!(
-            worker.allocate_stream(session(4, 1), parent, SessionStreamDirection::Bidi),
+            worker.allocate_stream(session(4), parent, SessionStreamDirection::Bidi),
             Err(HttpWorkerError::StreamCapacityExhausted { capacity: 2 })
         ));
         // Removing streams leaves the connection pool untouched.
@@ -2539,9 +2534,9 @@ mod tests {
             worker.remove_stream(bogus),
             Err(HttpWorkerError::StreamMissing { stream: s }) if s == bogus
         ));
-        let parent = worker.allocate(session(1, 1)).expect("parent");
+        let parent = worker.allocate(session(1)).expect("parent");
         let stream = worker
-            .allocate_stream(session(2, 1), parent, SessionStreamDirection::Bidi)
+            .allocate_stream(session(2), parent, SessionStreamDirection::Bidi)
             .expect("allocate stream");
         worker.remove_stream(stream).expect("remove stream");
         assert!(matches!(
@@ -2553,7 +2548,7 @@ mod tests {
     /// A live parent connection context and one live peer uni stream child of
     /// it.
     fn peer_uni_pair(worker: &mut HttpWorker) -> (ContextId, StreamContextId) {
-        let parent = worker.allocate(session(1, 1)).expect("allocate parent");
+        let parent = worker.allocate(session(1)).expect("allocate parent");
         let stream = peer_stream(worker, parent);
         (parent, stream)
     }
@@ -2562,7 +2557,7 @@ mod tests {
     /// child of the same parent.
     fn peer_stream(worker: &mut HttpWorker, parent: ContextId) -> StreamContextId {
         worker
-            .allocate_stream(session(2, 1), parent, SessionStreamDirection::Uni)
+            .allocate_stream(session(2), parent, SessionStreamDirection::Uni)
             .expect("allocate peer uni stream")
     }
 
@@ -2605,7 +2600,7 @@ mod tests {
     #[test]
     fn duplicate_control_registration_is_stream_creation_error_and_changes_nothing() {
         let mut worker = HttpWorker::with_capacity(4);
-        let parent = worker.allocate(session(1, 1)).expect("allocate parent");
+        let parent = worker.allocate(session(1)).expect("allocate parent");
         let first = peer_stream(&mut worker, parent);
         let second = peer_stream(&mut worker, parent);
         worker
@@ -2637,7 +2632,7 @@ mod tests {
     #[test]
     fn first_encoder_and_decoder_registrations_fill_distinct_slots() {
         let mut worker = HttpWorker::with_capacity(4);
-        let parent = worker.allocate(session(1, 1)).expect("allocate parent");
+        let parent = worker.allocate(session(1)).expect("allocate parent");
         let encoder = peer_stream(&mut worker, parent);
         let decoder = peer_stream(&mut worker, parent);
         worker
@@ -2663,7 +2658,7 @@ mod tests {
     #[test]
     fn duplicate_encoder_registration_is_stream_creation_error_and_changes_nothing() {
         let mut worker = HttpWorker::with_capacity(4);
-        let parent = worker.allocate(session(1, 1)).expect("allocate parent");
+        let parent = worker.allocate(session(1)).expect("allocate parent");
         let first = peer_stream(&mut worker, parent);
         let second = peer_stream(&mut worker, parent);
         worker
@@ -2695,7 +2690,7 @@ mod tests {
     #[test]
     fn duplicate_decoder_registration_is_stream_creation_error_and_changes_nothing() {
         let mut worker = HttpWorker::with_capacity(4);
-        let parent = worker.allocate(session(1, 1)).expect("allocate parent");
+        let parent = worker.allocate(session(1)).expect("allocate parent");
         let first = peer_stream(&mut worker, parent);
         let second = peer_stream(&mut worker, parent);
         worker
@@ -2746,20 +2741,20 @@ mod tests {
     fn allocate_with_role_records_endpoint_role_metadata() {
         let mut worker = HttpWorker::with_capacity(4);
         let server = worker
-            .allocate_with_role(session(1, 1), Some(SessionEndpointRole::Server))
+            .allocate_with_role(session(1), Some(SessionEndpointRole::Server))
             .expect("allocate server connection");
         assert_eq!(
             worker.get(server).expect("live").role,
             Some(SessionEndpointRole::Server)
         );
         let client = worker
-            .allocate_with_role(session(2, 1), Some(SessionEndpointRole::Client))
+            .allocate_with_role(session(2), Some(SessionEndpointRole::Client))
             .expect("allocate client connection");
         assert_eq!(
             worker.get(client).expect("live").role,
             Some(SessionEndpointRole::Client)
         );
-        let unclassified = worker.allocate(session(3, 1)).expect("allocate");
+        let unclassified = worker.allocate(session(3)).expect("allocate");
         assert_eq!(
             worker.get(unclassified).expect("live").role,
             None,
@@ -2784,7 +2779,7 @@ mod tests {
     fn push_registration_on_server_connection_is_stream_creation_error() {
         let mut worker = HttpWorker::with_capacity(4);
         let parent = worker
-            .allocate_with_role(session(1, 1), Some(SessionEndpointRole::Server))
+            .allocate_with_role(session(1), Some(SessionEndpointRole::Server))
             .expect("allocate server connection");
         let stream = peer_stream(&mut worker, parent);
         let push = worker.register_peer_uni_stream(stream, PeerUniStreamRole::Push);
@@ -2803,7 +2798,7 @@ mod tests {
     fn push_registration_on_client_connection_is_id_error() {
         let mut worker = HttpWorker::with_capacity(4);
         let parent = worker
-            .allocate_with_role(session(1, 1), Some(SessionEndpointRole::Client))
+            .allocate_with_role(session(1), Some(SessionEndpointRole::Client))
             .expect("allocate client connection");
         let stream = peer_stream(&mut worker, parent);
         let push = worker.register_peer_uni_stream(stream, PeerUniStreamRole::Push);
@@ -2862,7 +2857,7 @@ mod tests {
         let expected = PeerUniStreamReset {
             stream,
             context: parent,
-            session: session(1, 1),
+            session: session(1),
             error_code: ErrorCode::ClosedCriticalStream,
         };
         assert_eq!(expected.error_code.value(), 0x0104);
@@ -2906,18 +2901,18 @@ mod tests {
             PeerUniStreamReset {
                 stream,
                 context: parent,
-                session: session(1, 1),
+                session: session(1),
                 error_code: ErrorCode::ClosedCriticalStream,
             }
         );
         assert_eq!(reset.error_code.value(), 0x0104);
         // The returned session is the parent connection's root session, not
         // the child stream's own lower session: `close_connection` targets
-        // the root connection SessionId.
+        // the root connection u32.
         assert_ne!(
             worker.get(parent).expect("live connection").session,
             worker.get_stream(stream).expect("live stream").session,
-            "child stream SessionId differs from its parent root SessionId"
+            "child stream u32 differs from its parent root u32"
         );
         // &self classification leaves every pool and registered slot as is.
         assert_eq!(worker.len(), connections);
@@ -2953,7 +2948,7 @@ mod tests {
     #[test]
     fn classify_peer_uni_stream_reset_rejects_missing_parent_without_mutation() {
         let mut worker = HttpWorker::with_capacity(4);
-        let parent = worker.allocate(session(1, 1)).expect("allocate parent");
+        let parent = worker.allocate(session(1)).expect("allocate parent");
         let stream = peer_stream(&mut worker, parent);
         worker.remove(parent).expect("remove parent");
         assert!(matches!(
@@ -3191,7 +3186,7 @@ mod tests {
     #[test]
     fn drain_peer_stream_bytes_returns_the_whole_slice_for_drain_only_roles() {
         let mut worker = HttpWorker::with_capacity(4);
-        let parent = worker.allocate(session(1, 1)).expect("allocate parent");
+        let parent = worker.allocate(session(1)).expect("allocate parent");
         for role in [
             PeerUniStreamRole::QpackEncoder,
             PeerUniStreamRole::QpackDecoder,
@@ -3258,7 +3253,7 @@ mod tests {
     #[test]
     fn releasing_the_connection_frees_the_reader_and_stales_identities() {
         let mut worker = HttpWorker::with_capacity(4);
-        let parent = worker.allocate(session(1, 1)).expect("allocate parent");
+        let parent = worker.allocate(session(1)).expect("allocate parent");
         let control = peer_stream(&mut worker, parent);
         worker
             .register_peer_uni_stream(control, PeerUniStreamRole::Control)
@@ -3292,7 +3287,7 @@ mod tests {
         );
         // The next allocation reuses the connection slot at a new generation
         // with no reader, and a fresh reader starts over on the first feed.
-        let parent2 = worker.allocate(session(1, 1)).expect("reallocate");
+        let parent2 = worker.allocate(session(1)).expect("reallocate");
         assert!(
             worker
                 .get(parent2)
@@ -3720,7 +3715,7 @@ mod tests {
         // A live non-QPACK stream is a typed mismatch that changes nothing;
         // use a fresh parent so the removed stream's stale control slot does
         // not interfere.
-        let other_parent = worker.allocate(session(1, 1)).expect("allocate parent");
+        let other_parent = worker.allocate(session(1)).expect("allocate parent");
         let control = peer_stream(&mut worker, other_parent);
         worker
             .register_peer_uni_stream(control, PeerUniStreamRole::Control)
@@ -3850,7 +3845,7 @@ mod tests {
     #[test]
     fn finish_then_re_registered_unknown_stream_finishes_again() {
         let mut worker = HttpWorker::with_capacity(4);
-        let parent = worker.allocate(session(1, 1)).expect("allocate parent");
+        let parent = worker.allocate(session(1)).expect("allocate parent");
         let first = peer_stream(&mut worker, parent);
         worker
             .register_peer_uni_stream(first, PeerUniStreamRole::Unknown)
@@ -3882,10 +3877,10 @@ mod tests {
     }
 
     /// A small worker with one bidirectional request stream bound to
-    /// `session(1, 0)` under a live parent connection context.
-    fn worker_with_request_stream() -> (HttpWorker, StreamContextId, SessionId) {
+    /// `session(1)` under a live parent connection context.
+    fn worker_with_request_stream() -> (HttpWorker, StreamContextId, u32) {
         let mut worker = HttpWorker::with_capacities(4, 4);
-        let session = session(1, 0);
+        let session = session(1);
         let parent = worker.allocate(session).expect("allocate parent context");
         let stream = worker
             .allocate_stream(session, parent, SessionStreamDirection::Bidi)
@@ -3936,12 +3931,12 @@ mod tests {
     #[test]
     fn request_bytes_reader_freed_on_stream_removal_and_slot_reused() {
         let mut worker = HttpWorker::with_capacities(4, 4);
-        let parent = worker.allocate(session(1, 0)).expect("allocate parent");
+        let parent = worker.allocate(session(1)).expect("allocate parent");
         let first = worker
-            .allocate_stream(session(1, 1), parent, SessionStreamDirection::Bidi)
+            .allocate_stream(session(1), parent, SessionStreamDirection::Bidi)
             .expect("allocate first request stream");
         worker
-            .process_request_bytes(first, session(1, 1), &[0x01, 0x00])
+            .process_request_bytes(first, session(1), &[0x01, 0x00])
             .expect("feed headers");
         let first_reader = worker
             .get_stream(first)
@@ -3958,10 +3953,10 @@ mod tests {
         // The next request stream reuses the freed numeric index: feeding it
         // succeeds and the direct reader identity resolves to the replacement.
         let second = worker
-            .allocate_stream(session(2, 1), parent, SessionStreamDirection::Bidi)
+            .allocate_stream(session(2), parent, SessionStreamDirection::Bidi)
             .expect("allocate second request stream");
         let (read, consumed) = worker
-            .process_request_bytes(second, session(2, 1), &[0x01, 0x02, b'h', b'i'])
+            .process_request_bytes(second, session(2), &[0x01, 0x02, b'h', b'i'])
             .expect("feed headers on second stream");
         assert_eq!(read, RequestFrameRead::Headers(b"hi".to_vec()));
         assert_eq!(consumed, 4);
@@ -3984,12 +3979,12 @@ mod tests {
     #[test]
     fn remove_stream_stale_identity_leaves_live_reader_untouched() {
         let mut worker = HttpWorker::with_capacities(4, 4);
-        let parent = worker.allocate(session(1, 0)).expect("allocate parent");
+        let parent = worker.allocate(session(1)).expect("allocate parent");
         let first = worker
-            .allocate_stream(session(1, 1), parent, SessionStreamDirection::Bidi)
+            .allocate_stream(session(1), parent, SessionStreamDirection::Bidi)
             .expect("allocate first request stream");
         worker
-            .process_request_bytes(first, session(1, 1), &[0x01, 0x00])
+            .process_request_bytes(first, session(1), &[0x01, 0x00])
             .expect("feed headers");
         worker.remove_stream(first).expect("remove first stream");
         // A stale removal of the same identity fails before touching the
@@ -4002,10 +3997,10 @@ mod tests {
         // A replacement stream reuses the reader slot; removing the stale
         // stream identity must not free the live reader of the replacement.
         let second = worker
-            .allocate_stream(session(2, 1), parent, SessionStreamDirection::Bidi)
+            .allocate_stream(session(2), parent, SessionStreamDirection::Bidi)
             .expect("allocate second request stream");
         worker
-            .process_request_bytes(second, session(2, 1), &[0x01, 0x00])
+            .process_request_bytes(second, session(2), &[0x01, 0x00])
             .expect("feed headers on second stream");
         let live_reader = worker
             .get_stream(second)
@@ -4098,7 +4093,7 @@ mod tests {
     #[test]
     fn request_bytes_foreign_session_is_typed_error() {
         let (mut worker, stream, bound) = worker_with_request_stream();
-        let foreign = session(2, 1);
+        let foreign = session(2);
         assert!(matches!(
             worker.process_request_bytes(stream, foreign, &[0x01, 0x00]),
             Err(RequestReadError::Worker(HttpWorkerError::StreamSessionMismatch {
@@ -4112,12 +4107,12 @@ mod tests {
     #[test]
     fn request_bytes_uni_stream_rejected() {
         let mut worker = HttpWorker::with_capacities(4, 4);
-        let parent = worker.allocate(session(1, 0)).expect("parent context");
+        let parent = worker.allocate(session(1)).expect("parent context");
         let uni = worker
-            .allocate_stream(session(2, 0), parent, SessionStreamDirection::Uni)
+            .allocate_stream(session(2), parent, SessionStreamDirection::Uni)
             .expect("allocate uni stream");
         assert!(matches!(
-            worker.process_request_bytes(uni, session(2, 0), &[0x01, 0x00]),
+            worker.process_request_bytes(uni, session(2), &[0x01, 0x00]),
             Err(RequestReadError::Worker(HttpWorkerError::RequestStreamNotBidi {
                 stream: s,
                 direction,

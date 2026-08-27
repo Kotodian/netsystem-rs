@@ -1,15 +1,9 @@
 use hammer_runtime::app::{
-    ApplicationId, SessionAcceptedReplyMsg, SessionBoundMsg, SessionConnectError,
-    SessionConnectMsg, SessionConnectedMsg, SessionControlError, SessionEvtType, SessionHandle,
-    SessionListenMsg, SessionMsgQueue, SessionProducer, SessionUnlistenMsg,
-    SessionUnlistenReplyMsg, SingleProducer,
+    SessionAcceptedReplyMsg, SessionBoundMsg, SessionConnectError, SessionConnectMsg,
+    SessionConnectedMsg, SessionControlError, SessionEvtType, SessionListenMsg, SessionMsgQueue,
+    SessionProducer, SessionUnlistenMsg, SessionUnlistenReplyMsg, SingleProducer,
 };
-use hammer_runtime::plugin::PluginError;
-use hammer_runtime::app::{SessionHandle, SessionListenMsg, SessionUnlistenMsg};
-use hammer_runtime::{
-    DataWorkerId, Engine, RuntimeError, RuntimeResult, SessionConnectEndpoint,
-    SessionConnectionId,
-};
+use hammer_runtime::{DataWorkerId, Engine, RuntimeError, RuntimeResult, SessionConnectEndpoint};
 use std::sync::Arc;
 
 use super::application::ApplicationError;
@@ -18,7 +12,7 @@ use super::runtime::{SessionMain, schedule_worker_task};
 impl SessionMain {
     pub fn dispatch_application_session_mq(
         self: &Arc<Self>,
-        application: ApplicationId,
+        application: u32,
         requests: &mut SessionMsgQueue<SingleProducer>,
         replies: &mut SessionProducer,
     ) -> RuntimeResult<()> {
@@ -104,14 +98,10 @@ impl SessionMain {
         Ok(())
     }
 
-    fn application_listen(
-        &self,
-        application: ApplicationId,
-        request: SessionListenMsg,
-    ) -> SessionBoundMsg {
+    fn application_listen(&self, application: u32, request: SessionListenMsg) -> SessionBoundMsg {
         let result = self
             .with_control_barrier(|| {
-                let transport = session_transport(request.transport.name())?;
+                let transport = session_transport(request.transport)?;
                 if transport.start_listen().is_none() {
                     return Err(SessionControlError::TransportListenUnsupported);
                 }
@@ -120,7 +110,7 @@ impl SessionMain {
                     .register_listener(application, request.app, request.opaque)
                     .map_err(SessionControlError::from)?;
                 match self.listen(application_listener, transport, request.endpoint) {
-                    Ok(listener) => Ok(SessionHandle::from(listener.raw())),
+                    Ok(listener) => Ok(listener),
                     Err(error) => {
                         let _ = self
                             .applications()
@@ -141,11 +131,11 @@ impl SessionMain {
 
     fn application_connect(
         &self,
-        application: ApplicationId,
+        application: u32,
         request: SessionConnectMsg,
         stream: bool,
     ) -> Result<(), SessionControlError> {
-        let transport = session_transport(request.transport.name())?;
+        let transport = session_transport(request.transport)?;
         let server_name = self.application_server_name(application, request.ext_config)?;
         if stream {
             if transport.connect_stream().is_none() {
@@ -167,8 +157,8 @@ impl SessionMain {
             let endpoint = SessionConnectEndpoint {
                 remote: request.remote,
                 local: request.local,
-                worker: DataWorkerId::new(parent.worker_index()),
-                connection: SessionConnectionId::from_raw(application_connection.raw()),
+                worker: DataWorkerId::new(parent.thread_index),
+                connection: application_connection,
                 application,
                 parent_handle: Some(parent),
                 flags: request.flags,
@@ -204,7 +194,7 @@ impl SessionMain {
                 request.remote,
                 request.local,
                 DataWorkerId::new(0),
-                SessionConnectionId::from_raw(application_connection.raw()),
+                application_connection,
                 application,
                 request.opaque,
                 server_name,
@@ -230,7 +220,7 @@ impl SessionMain {
     /// state.
     fn application_server_name(
         &self,
-        application: ApplicationId,
+        application: u32,
         ext_config: Option<u64>,
     ) -> Result<Option<String>, SessionControlError> {
         let Some(offset) = ext_config else {
@@ -261,7 +251,7 @@ impl SessionMain {
 
     fn application_unlisten(
         &self,
-        application: ApplicationId,
+        application: u32,
         request: SessionUnlistenMsg,
     ) -> SessionUnlistenReplyMsg {
         let listener = request.listener;
@@ -308,10 +298,10 @@ impl SessionMain {
     /// fail the request drain, so later replies are still processed.
     fn accepted_reply(
         self: &Arc<Self>,
-        application: ApplicationId,
+        application: u32,
         request: SessionAcceptedReplyMsg,
     ) -> RuntimeResult<()> {
-        let worker = DataWorkerId::new(request.session.worker_index());
+        let worker = DataWorkerId::new(request.session.thread_index);
         let main = Arc::clone(self);
         let result = Engine::with_current(|engine| {
             schedule_worker_task(engine, worker, move || {
@@ -340,17 +330,17 @@ impl SessionMain {
 }
 
 fn session_transport(
-    name: &str,
+    index: u8,
 ) -> Result<hammer_runtime::SessionTransportRegistration, SessionControlError> {
-    match Engine::with_current(|engine| engine.plugin_main().session_transport(name)) {
-        Some(Ok(transport)) => Ok(transport),
-        Some(Err(PluginError::SessionTransportMissing { .. })) => {
-            Err(SessionControlError::TransportMissing)
-        }
-        Some(Err(PluginError::SessionTransportDuplicate { .. })) => {
-            Err(SessionControlError::TransportDuplicate)
-        }
-        Some(Err(_)) => Err(SessionControlError::TransportFailed),
+    match Engine::with_current(|engine| {
+        engine
+            .plugin_main()
+            .session_transports()
+            .get(index as usize)
+            .copied()
+    }) {
+        Some(Some(transport)) => Ok(transport),
+        Some(None) => Err(SessionControlError::TransportMissing),
         None => Err(SessionControlError::ApplicationControlWrongThread),
     }
 }
@@ -394,7 +384,7 @@ mod tests {
 
     /// One SessionMain with an attached Application whose bounded ext-config
     /// store is handed back for direct inspection.
-    fn ext_config_fixture() -> (Arc<SessionMain>, ApplicationId, ExtConfigStore) {
+    fn ext_config_fixture() -> (Arc<SessionMain>, u32, ExtConfigStore) {
         let applications = ApplicationMain::new(2);
         let application = applications
             .attach_local_for_test(1, 128)
@@ -522,18 +512,14 @@ mod tests {
     /// the same way the listener flow maps `ListenerMissing`/`ListenerNotOwned`.
     #[test]
     fn application_connection_errors_map_like_listener_errors() {
-        use hammer_runtime::app::ApplicationConnectionId;
-
-        let missing = ApplicationError::ConnectionMissing {
-            connection: ApplicationConnectionId::new(1),
-        };
+        let missing = ApplicationError::ConnectionMissing { connection: 1 };
         assert_eq!(
             SessionControlError::from(missing),
             SessionControlError::ConnectionMissing
         );
         let not_owned = ApplicationError::ConnectionNotOwned {
-            application: ApplicationId::new(1),
-            connection: ApplicationConnectionId::new(2),
+            application: (1),
+            connection: 2,
         };
         assert_eq!(
             SessionControlError::from(not_owned),

@@ -44,12 +44,12 @@ use std::thread::{self, ThreadId};
 
 use hammer_infra::align::CacheLine;
 use hammer_infra::thread_owned::ThreadOwned;
-use hammer_runtime::app::{ApplicationId, ApplicationListenerId, SessionAppId, SessionHandle};
+use hammer_runtime::app::SessionHandle;
 use hammer_runtime::{
     DataWorkerId, Engine, RuntimeError, RuntimeResult, SessionListenEndpoint,
     SessionTransportRegistration,
 };
-use hammer_service::session::runtime::{SessionMain, SessionTransportId};
+use hammer_service::session::runtime::SessionMain;
 
 use crate::http_app;
 use crate::worker::{HttpWorker, HttpWorkerError};
@@ -86,9 +86,9 @@ pub(crate) enum HttpListenerError {
 #[derive(Clone, Copy)]
 struct ListenerContext {
     outer_listener: SessionHandle,
-    outer_application: ApplicationId,
+    outer_application: u32,
     outer_config: Option<u64>,
-    inner_application_listener: ApplicationListenerId,
+    inner_application_listener: u32,
     inner_session_listener: SessionHandle,
 }
 
@@ -143,8 +143,8 @@ pub struct HttpMain {
     owner: ThreadId,
     sessions: Arc<SessionMain>,
     quic_transport: SessionTransportRegistration,
-    session_app: SessionAppId,
-    inner_application: ApplicationId,
+    session_app: u32,
+    inner_application: u32,
     contexts: HttpListenerContexts,
     /// One cache-line-aligned, thread-owned `HttpWorker` per configured data
     /// worker, mirroring `QuicMain.workers` (quic listener.rs:58).
@@ -153,13 +153,13 @@ pub struct HttpMain {
 
 impl HttpMain {
     /// Session-layer transport identity for HTTP.
-    pub const TRANSPORT_ID: SessionTransportId = SessionTransportId::new(4);
+    pub const TRANSPORT_ID: u8 = 4;
 
     pub(crate) fn new(
         sessions: Arc<SessionMain>,
         quic_transport: SessionTransportRegistration,
-        session_app: SessionAppId,
-        inner_application: ApplicationId,
+        session_app: u32,
+        inner_application: u32,
         worker_count: usize,
     ) -> Self {
         Self {
@@ -196,7 +196,7 @@ impl HttpMain {
     pub(crate) fn start_listen(
         &self,
         outer_listener: SessionHandle,
-        outer_application: ApplicationId,
+        outer_application: u32,
         outer_config: Option<u64>,
         endpoint: SessionListenEndpoint,
     ) -> RuntimeResult<()> {
@@ -207,7 +207,7 @@ impl HttpMain {
 
         // Capacity preflight before any Session state is published: a single
         // O(1) bounds check on the outer listener's session-pool slot.
-        if outer_listener.session_index() as usize >= HTTP_LISTENER_CONTEXT_CAPACITY {
+        if outer_listener.session_index as usize >= HTTP_LISTENER_CONTEXT_CAPACITY {
             return Err(HttpListenerError::ListenerCapacityExhausted {
                 capacity: HTTP_LISTENER_CONTEXT_CAPACITY,
             }
@@ -241,7 +241,7 @@ impl HttpMain {
         self.with_contexts(|slots| {
             // Capacity was checked before any Session state was published, so
             // a failed store would be an impossible table invariant violation.
-            slots[outer_listener.session_index() as usize] = Some(ListenerContext {
+            slots[outer_listener.session_index as usize] = Some(ListenerContext {
                 outer_listener,
                 outer_application,
                 outer_config,
@@ -280,7 +280,7 @@ impl HttpMain {
         let context = self
             .with_contexts(|slots| {
                 slots
-                    .get(outer_listener.session_index() as usize)
+                    .get(outer_listener.session_index as usize)
                     .and_then(Option::as_ref)
                     .filter(|context| context.outer_listener == outer_listener)
                     .copied()
@@ -302,7 +302,7 @@ impl HttpMain {
         // Outer HTTP context clear last, after both lower teardowns
         // succeeded. The lookup validated the slot, so the indexed store is
         // infallible.
-        self.with_contexts(|slots| slots[outer_listener.session_index() as usize] = None)?;
+        self.with_contexts(|slots| slots[outer_listener.session_index as usize] = None)?;
         Ok(())
     }
 
@@ -374,7 +374,7 @@ pub(crate) static HTTP_MAIN: OnceLock<Arc<HttpMain>> = OnceLock::new();
 /// callback gate (quic listener.rs:466-477).
 pub(crate) fn start_listen(
     listener: SessionHandle,
-    application: ApplicationId,
+    application: u32,
     config: Option<u64>,
     endpoint: SessionListenEndpoint,
 ) -> RuntimeResult<()> {
@@ -480,13 +480,11 @@ mod tests {
     use std::thread;
 
     use hammer_infra::thread_owned::ThreadOwnedError;
-    use hammer_runtime::app::SessionAppId;
     use hammer_runtime::{
         DataPlaneRuntime, DataPlaneRuntimeConfig, DataWorkerId, Engine, PluginError, PluginMain,
         RuntimeRegistry,
     };
     use hammer_service::session::ApplicationMain;
-    use hammer_service::session::SessionId;
 
     use super::*;
 
@@ -554,12 +552,12 @@ mod tests {
     /// nested identities the session layer handed it.
     fn record_start(
         listener: SessionHandle,
-        application: ApplicationId,
+        application: u32,
         opaque: Option<u64>,
         _: SessionListenEndpoint,
     ) -> RuntimeResult<()> {
-        LISTEN_LISTENER.store(listener.raw(), Ordering::SeqCst);
-        LISTEN_APPLICATION.store(application.raw(), Ordering::SeqCst);
+        LISTEN_LISTENER.store(u64::from(listener), Ordering::SeqCst);
+        LISTEN_APPLICATION.store(application, Ordering::SeqCst);
         LISTEN_OPAQUE.store(opaque.unwrap_or_default(), Ordering::SeqCst);
         LISTEN_BARRIER.store(
             Engine::with_current(|engine| engine.worker_barrier().is_pending()).unwrap_or(false),
@@ -571,7 +569,7 @@ mod tests {
     /// Failing stub lower QUIC transport: exercises the reverse-order rollback.
     fn fail_start(
         _: SessionHandle,
-        _: ApplicationId,
+        _: u32,
         _: Option<u64>,
         _: SessionListenEndpoint,
     ) -> RuntimeResult<()> {
@@ -583,16 +581,14 @@ mod tests {
     /// Recording stub lower QUIC unlisten: succeeds and records the exact
     /// inner Session listener the session layer handed to the QUIC transport.
     fn record_stop(listener: SessionHandle) -> RuntimeResult<()> {
-        STOP_LISTENED.with(|recorded| recorded.set(listener.raw()));
+        STOP_LISTENED.with(|recorded| recorded.set(u64::from(listener)));
         Ok(())
     }
 
     /// Success-only stub lower QUIC transport for stop tests whose start path
     /// must succeed without touching the shared `LISTEN_*` recording statics
     /// (owned exclusively by `http_listener_init_publishes_...`).
-    fn noop_start(
-        _: SessionHandle,
-    ) -> RuntimeResult<()> {
+    fn noop_start(_: SessionHandle) -> RuntimeResult<()> {
         Ok(())
     }
 
@@ -629,7 +625,7 @@ mod tests {
         assert!(registration.start_listen().is_some());
         assert!(registration.stop_listen().is_some());
         assert!(registration.connect().is_none());
-        assert_eq!(HttpMain::TRANSPORT_ID, SessionTransportId::new(4));
+        assert_eq!(HttpMain::TRANSPORT_ID, 4);
 
         // The plugin descriptor's registration image must resolve the HTTP
         // transport through PluginMain, exactly as `init_quic` resolves the
@@ -721,7 +717,7 @@ mod tests {
         // config (quic listener.rs:135-139).
         assert_eq!(
             LISTEN_APPLICATION.load(Ordering::SeqCst),
-            main.inner_application.raw()
+            main.inner_application
         );
         assert_eq!(LISTEN_OPAQUE.load(Ordering::SeqCst), config);
         assert!(LISTEN_BARRIER.load(Ordering::SeqCst));
@@ -730,7 +726,7 @@ mod tests {
         // outer listener's session slot with the exact nested identities:
         // outer listener/application/config, inner Application listener, and
         // the lower QUIC SessionListener the session layer returned.
-        let slot = outer_listener.session_index() as usize;
+        let slot = outer_listener.session_index as usize;
         let context = main
             .contexts
             .get()
@@ -786,7 +782,7 @@ mod tests {
         let main = Arc::new(HttpMain::new(
             Arc::clone(&sessions),
             SessionTransportRegistration::new("quic", Some(record_start), None, None),
-            SessionAppId::new(0),
+            0,
             sessions.applications().attach().expect("inner attach"),
             0,
         ));
@@ -825,7 +821,7 @@ mod tests {
         let main = Arc::new(HttpMain::new(
             Arc::clone(&sessions),
             SessionTransportRegistration::new("quic", Some(fail_start), None, None),
-            SessionAppId::new(0),
+            0,
             sessions.applications().attach().expect("inner attach"),
             0,
         ));
@@ -859,7 +855,7 @@ mod tests {
         let error = thread::spawn(move || {
             start_error(super::start_listen(
                 SessionHandle::new(2, 0),
-                ApplicationId::new(0),
+                (0),
                 None,
                 endpoint,
             ))
@@ -875,17 +871,12 @@ mod tests {
         let main = Arc::new(HttpMain::new(
             Arc::clone(&sessions),
             SessionTransportRegistration::new("quic", Some(record_start), None, None),
-            SessionAppId::new(0),
+            0,
             sessions.applications().attach().expect("inner attach"),
             0,
         ));
         let error = thread::spawn(move || {
-            start_error(main.start_listen(
-                SessionHandle::new(3, 0),
-                ApplicationId::new(0),
-                None,
-                test_endpoint(),
-            ))
+            start_error(main.start_listen(SessionHandle::new(3, 0), (0), None, test_endpoint()))
         })
         .join()
         .expect("authority start_listen thread completes");
@@ -904,7 +895,7 @@ mod tests {
         let main = Arc::new(HttpMain::new(
             Arc::clone(&sessions),
             SessionTransportRegistration::new("quic", Some(noop_start), Some(record_stop), None),
-            SessionAppId::new(0),
+            0,
             sessions.applications().attach().expect("inner attach"),
             0,
         ));
@@ -984,7 +975,7 @@ mod tests {
         let main = Arc::new(HttpMain::new(
             Arc::clone(&sessions),
             SessionTransportRegistration::new("quic", Some(noop_start), Some(record_stop), None),
-            SessionAppId::new(0),
+            0,
             sessions.applications().attach().expect("inner attach"),
             0,
         ));
@@ -1012,7 +1003,7 @@ mod tests {
         let main = Arc::new(HttpMain::new(
             Arc::clone(&sessions),
             SessionTransportRegistration::new("quic", Some(noop_start), Some(fail_stop), None),
-            SessionAppId::new(0),
+            0,
             sessions.applications().attach().expect("inner attach"),
             0,
         ));
@@ -1057,14 +1048,13 @@ mod tests {
         let main = Arc::new(HttpMain::new(
             Arc::clone(&sessions),
             SessionTransportRegistration::new("quic", Some(noop_start), Some(record_stop), None),
-            SessionAppId::new(0),
+            0,
             sessions.applications().attach().expect("inner attach"),
             0,
         ));
-        let error =
-            thread::spawn(move || start_error(main.stop_listen(SessionHandle::new(5, 0))))
-                .join()
-                .expect("authority stop_listen thread completes");
+        let error = thread::spawn(move || start_error(main.stop_listen(SessionHandle::new(5, 0))))
+            .join()
+            .expect("authority stop_listen thread completes");
         assert!(matches!(error, RuntimeError::ControlRequiresMainThread));
     }
 
@@ -1103,9 +1093,7 @@ mod tests {
             .expect("worker 1 installs");
         let context = main
             .with_worker(DataWorkerId::new(1), |worker| {
-                worker
-                    .allocate(SessionId::from_raw(1))
-                    .map_err(RuntimeError::from)
+                worker.allocate(1).map_err(RuntimeError::from)
             })
             .expect("exact worker lookup runs on the installing thread");
         assert_eq!(u32::from(context), 0);
@@ -1190,9 +1178,7 @@ mod tests {
             .expect("worker 0 installs on this thread");
         let worker0 = main
             .with_worker(DataWorkerId::new(0), |worker| {
-                worker
-                    .allocate(SessionId::from_raw(10))
-                    .map_err(RuntimeError::from)
+                worker.allocate(10).map_err(RuntimeError::from)
             })
             .expect("worker 0 allocates");
         let (sender, receiver) = mpsc::channel();
@@ -1204,14 +1190,9 @@ mod tests {
             // Worker 1 sees exactly its own binding, never worker 0's.
             let (context, len) = worker1_main
                 .with_worker(DataWorkerId::new(1), |worker| {
-                    let context = worker
-                        .allocate(SessionId::from_raw(20))
-                        .map_err(RuntimeError::from)?;
+                    let context = worker.allocate(20).map_err(RuntimeError::from)?;
                     assert_eq!(worker.len(), 1);
-                    assert_eq!(
-                        worker.get(context).expect("live context").session,
-                        SessionId::from_raw(20)
-                    );
+                    assert_eq!(worker.get(context).expect("live context").session, 20);
                     Ok((context, worker.len()))
                 })
                 .expect("worker 1 allocates its own context");
@@ -1226,10 +1207,7 @@ mod tests {
         // always goes through `with_worker`.)
         main.with_worker(DataWorkerId::new(0), |worker| {
             assert_eq!(worker.len(), 1);
-            assert_eq!(
-                worker.get(worker0).expect("worker 0 context").session,
-                SessionId::from_raw(10)
-            );
+            assert_eq!(worker.get(worker0).expect("worker 0 context").session, 10);
             Ok(())
         })
         .expect("worker 0 pool untouched by worker 1");

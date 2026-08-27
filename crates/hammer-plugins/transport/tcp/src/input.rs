@@ -23,7 +23,6 @@ use super::lookup::{
 use super::{TcpInputNext, write_session_route_opaque};
 use crate::protocol::{TcpIpProtocol, TcpIpVersion};
 use hammer_service::opaque::NetworkOpaque;
-use hammer_service::session::SessionId;
 
 #[derive(Clone, Copy, Default)]
 #[repr(C)]
@@ -498,7 +497,7 @@ fn session_or_listener_pending_input_entry(
     local: SocketAddr,
     remote: SocketAddr,
     flags: TcpInputFlags,
-) -> RuntimeResult<(Option<(SessionId, DataWorkerId, TcpInputNext)>, bool)> {
+) -> RuntimeResult<(Option<(u32, DataWorkerId, TcpInputNext)>, bool)> {
     crate::TCP_MAIN
         .load_full()
         .ok_or(RuntimeError::PluginStateNotInitialized { plugin: "tcp" })?
@@ -533,7 +532,7 @@ fn tcp_listener_input_entry(flags: TcpInputFlags) -> (TcpInputNext, Option<TcpEr
 pub(crate) fn stamp_session_route_for_test(
     runtime: &DataPlaneRuntime,
     index: Index,
-    session_id: SessionId,
+    session_id: u32,
     owner: DataWorkerId,
     next: TcpInputNext,
 ) -> RuntimeResult<()> {

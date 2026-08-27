@@ -4,28 +4,6 @@ use thiserror::Error;
 
 use crate::{DataWorkerId, Engine, RuntimeError, RuntimeResult};
 
-/// Compact identity for a registered Session App in one link image.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Deserialize, serde::Serialize)]
-#[repr(transparent)]
-pub struct SessionAppId(u32);
-
-impl SessionAppId {
-    #[inline]
-    pub const fn new(value: u32) -> Self {
-        Self(value)
-    }
-
-    #[inline]
-    pub const fn from_raw(raw: u32) -> Self {
-        Self(raw)
-    }
-
-    #[inline]
-    pub const fn raw(self) -> u32 {
-        self.0
-    }
-}
-
 /// Plugin-owned opaque Session App context identity.
 pub type SessionAppContext = u64;
 
@@ -140,7 +118,7 @@ where
             Err(source) => return Err(context_worker_access(worker, source)),
         }
         Ok(contexts
-            .with_mut(|contexts| u64::from(contexts.insert(SessionAppContextSlot { app })))
+            .with_mut(|contexts| contexts.insert(SessionAppContextSlot { app }).into())
             .map_err(|source| context_worker_access(worker, source))?)
     }
 

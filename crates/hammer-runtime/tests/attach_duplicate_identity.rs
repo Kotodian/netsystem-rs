@@ -14,14 +14,14 @@ use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::time::Duration;
 
 use hammer_infra::segment::Segment;
-use hammer_runtime::app::{ApplicationId, SessionMsgQueue};
+use hammer_runtime::app::SessionMsgQueue;
 use hammer_runtime::attach::{
     ATTACH_PROTOCOL_VERSION, ATTACH_REPLY_BYTES, ATTACH_REPLY_WORDS, ATTACH_STATUS_ACCEPTED,
     ATTACH_STATUS_REJECTED, AppServer, ApplicationMqPublication,
 };
 
-const FIRST_APPLICATION: ApplicationId = ApplicationId::new(3);
-const SECOND_APPLICATION: ApplicationId = ApplicationId::new(4);
+const FIRST_APPLICATION: u32 = (3);
+const SECOND_APPLICATION: u32 = (4);
 
 const MQ_SEGMENT_BYTES: usize = 1024 * 1024;
 const MQ_QUEUE_ITEMS: u32 = 32;
@@ -126,7 +126,7 @@ fn spawn_serve(
                         1 => FIRST_APPLICATION, // duplicate: rejected at the attach seam
                         _ => SECOND_APPLICATION,
                     };
-                    Ok::<ApplicationId, Infallible>(application)
+                    Ok::<Infallible>(application)
                 },
                 move |_| Ok::<ApplicationMqPublication, Infallible>(application_mqs.clone()),
                 |_, _, _| Ok(()),

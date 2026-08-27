@@ -1,4 +1,4 @@
-//! Real-queue harness for the hammer-vcl MQ protocol tests.
+//! Real-queue harness for the hammer-app VCL MQ protocol tests.
 //!
 //! No closure replaces the dispatcher and no reply is fabricated through an
 //! injected handler: the daemon side owns the real reply `SessionProducer`
@@ -16,8 +16,8 @@ use hammer_app::attach::AppClient;
 use hammer_infra::fifo::Fifo;
 use hammer_infra::segment::Segment;
 use hammer_runtime::app::{
-    AppSessionConfig, ApplicationId, SessionControlPayload, SessionHandle, SessionMsgQueue,
-    SessionOffsets, SessionProducer, SingleProducer,
+    AppSessionConfig, SessionControlPayload, SessionHandle, SessionMsgQueue, SessionOffsets,
+    SessionProducer, SingleProducer,
 };
 use hammer_runtime::attach::{
     ATTACH_METADATA_BYTES, ATTACH_METADATA_WORDS, ATTACH_PROTOCOL_VERSION,
@@ -31,7 +31,7 @@ use hammer_runtime::attach::{
 /// reply producer. Replies enqueued through `enqueue` signal the client
 /// through the real queue signal pair.
 pub struct TestControlPair {
-    pub application: ApplicationId,
+    pub application: u32,
     /// Daemon-side consumer of the client's Session control requests.
     pub requests: SessionMsgQueue<SingleProducer>,
     /// Daemon-side producer of Session control replies.
@@ -81,7 +81,7 @@ fn init_control_queue(seg: &Segment, offset: u64) -> SessionMsgQueue<SingleProdu
 /// Builds one client/daemon control pair over a real shared control segment
 /// with the production queue shape (fixed control slots, signal pair).
 pub fn control_pair() -> (AppClient, TestControlPair) {
-    let application = ApplicationId::from_raw(7);
+    let application = 7;
     let control = Segment::shared_default();
     let layout = SessionMsgQueue::<SingleProducer>::layout_bytes_with_control(32, 32)
         .expect("control queue layout");
@@ -170,7 +170,8 @@ fn send_session_descriptors(
     debug_assert_eq!(ATTACH_METADATA_WORDS * size_of::<u64>(), payload.len());
     let words = [
         ATTACH_PROTOCOL_VERSION,
-        handle.raw(),
+        handle.session_index as u64,
+        handle.thread_index as u64,
         segment.size() as u64,
         offsets.rx_fifo_off,
         offsets.tx_fifo_off,

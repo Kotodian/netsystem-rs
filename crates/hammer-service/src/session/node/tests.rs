@@ -12,9 +12,9 @@ use super::{SessionQueueNext, SessionQueueNode};
 use crate::session::ApplicationMain;
 use crate::session::error::SessionError;
 use crate::session::runtime::{
-    SessionPacketizedTransport, SessionPacketizedTx, SessionTransport, SessionTransportId,
-    SessionWorker, TransportInternalTransport, TransportInternalTx, TransportSendFlags,
-    TransportSendParams, TxBatchBuffer, dispatch_session_queue_once,
+    SessionPacketizedTransport, SessionPacketizedTx, SessionTransport, SessionWorker,
+    TransportInternalTransport, TransportInternalTx, TransportSendFlags, TransportSendParams,
+    TxBatchBuffer, dispatch_session_queue_once,
 };
 use hammer_runtime::app::AppSession;
 use hammer_runtime::app::{SessionEvt, SessionEvtType};
@@ -60,7 +60,7 @@ struct RecordingTransport {
 impl SessionTransport<u32> for RecordingTransport {
     type Tx = TransportInternalTx;
 
-    const ID: SessionTransportId = SessionTransportId::new(1);
+    const ID: u8 = 1;
 
     fn app_rx_evt(
         &mut self,
@@ -135,7 +135,7 @@ impl TransportInternalTransport<u32> for RecordingTransport {
     fn internal_tx(
         &mut self,
         _: &mut SessionWorker<u32>,
-        _: crate::session::SessionId,
+        _: u32,
         index: u32,
         _: &DataPlaneRuntime,
         _: SessionQueueNext,
@@ -157,7 +157,7 @@ struct TcpTransport {
 impl SessionTransport<u32> for TcpTransport {
     type Tx = SessionPacketizedTx;
 
-    const ID: SessionTransportId = SessionTransportId::new(10);
+    const ID: u8 = 10;
 
     fn update_time(
         &mut self,
@@ -235,8 +235,7 @@ fn app_reset_dispatch_invokes_transport_reset_distinct_from_close() -> RuntimeRe
     let app = attach_local_app_session(&mut sessions, session_id);
     app.app_rx_mq()
         .enqueue_ctrl(SessionEvt::ctrl(
-            app.session_index(),
-            0,
+            SessionHandle::new(app.session_index(), 0),
             SessionEvtType::Reset,
         ))
         .expect("enqueue app reset");
@@ -307,19 +306,17 @@ fn session_queue_dispatches_new_io_before_old_io() {
     sessions.poll_app().expect("stage old TX event");
     sessions.new_io_events.clear();
     sessions.old_io_events.clear();
-    sessions.old_io_events.push_back(SessionEvt::io(
-        old_session.pool_index(),
-        SessionEvtType::TxEnq,
-    ));
+    sessions
+        .old_io_events
+        .push_back(SessionEvt::io(old_session, SessionEvtType::TxEnq));
     dispatch_session_queue_once(&runtime, owner, &mut sessions, &mut transport, next)
         .expect("dispatch old IO once");
     new_app.send_bytes(b"n").expect("enqueue new TX byte");
     sessions.poll_app().expect("stage new TX event");
     sessions.new_io_events.clear();
-    sessions.new_io_events.push_back(SessionEvt::io(
-        new_session.pool_index(),
-        SessionEvtType::TxEnq,
-    ));
+    sessions
+        .new_io_events
+        .push_back(SessionEvt::io(new_session, SessionEvtType::TxEnq));
     dispatch_session_queue_once(&runtime, owner, &mut sessions, &mut transport, next)
         .expect("dispatch new before old IO");
 
@@ -339,10 +336,7 @@ fn default_connection_index_returns_exact_transport_index() {
     );
 }
 
-fn attach_local_app_session(
-    sessions: &mut SessionWorker<u32>,
-    session_id: crate::session::SessionId,
-) -> Arc<AppSession> {
+fn attach_local_app_session(sessions: &mut SessionWorker<u32>, session_id: u32) -> Arc<AppSession> {
     let app = sessions
         .local_app()
         .app_session(session_id)
@@ -382,7 +376,7 @@ fn session_queue_connects_transport_session_directly_to_application() {
         .alloc_index_with_bytes(b"request")
         .expect("transport RX buffer");
     sessions
-        .enqueue_rx(runtime.buffers(), session_id, ingress, 0, false)
+        .enqueue_rx(runtime.buffers(), session_id, ingress, 0)
         .expect("transport RX enqueue");
     dispatch_session_queue_once(&runtime, owner, &mut sessions, &mut transport, next)
         .expect("ingress dispatch");
@@ -527,7 +521,7 @@ struct QuicShapedTransport {
 impl SessionTransport<u32> for QuicShapedTransport {
     type Tx = TransportInternalTx;
 
-    const ID: SessionTransportId = SessionTransportId::new(7);
+    const ID: u8 = 7;
 
     fn update_time(
         &mut self,
@@ -559,7 +553,7 @@ impl TransportInternalTransport<u32> for QuicShapedTransport {
     fn internal_tx(
         &mut self,
         sessions: &mut SessionWorker<u32>,
-        session_id: crate::session::SessionId,
+        session_id: u32,
         index: u32,
         runtime: &DataPlaneRuntime,
         output_next: SessionQueueNext,
@@ -639,7 +633,7 @@ struct FailingPacketizedTransport;
 impl SessionTransport<u32> for FailingPacketizedTransport {
     type Tx = SessionPacketizedTx;
 
-    const ID: SessionTransportId = SessionTransportId::new(8);
+    const ID: u8 = 8;
 
     fn update_time(
         &mut self,
@@ -704,7 +698,7 @@ impl SessionPacketizedTransport<u32> for FailingPacketizedTransport {
         _: Instant,
     ) -> RuntimeResult<()> {
         Err(SessionError::TxOffsetOutOfRange {
-            session_id: crate::session::SessionId::from(2u32),
+            session_id: u32::from(2u32),
             tx_offset: 1,
             available: 0,
         }
@@ -724,7 +718,7 @@ struct RecordingPacketizedTransport {
 impl SessionTransport<u32> for RecordingPacketizedTransport {
     type Tx = SessionPacketizedTx;
 
-    const ID: SessionTransportId = SessionTransportId::new(9);
+    const ID: u8 = 9;
 
     fn update_time(
         &mut self,
@@ -998,8 +992,7 @@ fn transport_deleted_then_queued_app_close_releases_the_session_slot() {
         .expect("delete transport Session");
     app.app_rx_mq()
         .enqueue_ctrl(SessionEvt::ctrl(
-            app.session_index(),
-            0,
+            SessionHandle::new(app.session_index(), 0),
             SessionEvtType::Close,
         ))
         .expect("queue app close");
@@ -1011,7 +1004,7 @@ fn transport_deleted_then_queued_app_close_releases_the_session_slot() {
 
     assert!(!sessions.has_session(session_id));
     let replacement = sessions.insert_session_for_test(FailingPacketizedTransport::ID, 4u32);
-    assert_eq!(replacement.pool_index(), session_id.pool_index());
+    assert_eq!(replacement, session_id);
 }
 
 #[test]

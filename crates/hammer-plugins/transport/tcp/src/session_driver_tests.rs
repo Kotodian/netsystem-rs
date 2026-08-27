@@ -7,9 +7,7 @@ use crate::{
     TcpCapabilities, TcpPacket, TcpSegmentFlags, TcpSeq, TcpState, publish_tcp_connection,
 };
 use hammer_core::data_plane::{BufferFrame, NodeId};
-use hammer_runtime::app::{
-    AppSessionConfig, AppSessionError, ApplicationId, SessionAppId, SessionEvt, SessionEvtType,
-};
+use hammer_runtime::app::{AppSessionConfig, AppSessionError, SessionEvt, SessionEvtType};
 use hammer_runtime::{DataPlaneRuntime, DataPlaneRuntimeConfig, DataWorkerId, RuntimeError};
 
 use hammer_service::data_plane::DropNode;
@@ -19,7 +17,7 @@ use hammer_service::session::runtime::{
     SessionPacketizedTransport, SessionTransport, SessionWorker, TransportSendFlags,
     dispatch_session_queue_once, dispatch_session_queue_pending,
 };
-use hammer_service::session::{ApplicationMain, SessionId};
+use hammer_service::session::{ApplicationMain, u32};
 
 use crate::timers::{TcpTimerKind, TcpTimers};
 use crate::{TcpConnection, TcpWorker};
@@ -27,7 +25,7 @@ use crate::{TcpConnection, TcpWorker};
 fn tcp_session<'a>(
     sessions: &SessionWorker<u32>,
     tcp: &'a TcpWorker,
-    session_id: SessionId,
+    session_id: u32,
 ) -> Option<&'a TcpConnection> {
     let (_, index) = sessions.session_transport(session_id)?;
     tcp.connections.get(index)
@@ -68,9 +66,9 @@ fn attach_protocol_session(
     applications: &Arc<ApplicationMain>,
     tcp: &mut TcpWorker,
     connection_index: u32,
-    app: SessionAppId,
+    app: u32,
     callbacks: SessionAppCallbacks,
-) -> SessionId {
+) -> u32 {
     let application = applications.attach().expect("attach test Application");
     sessions
         .install_application_mq_for_test(application)
@@ -406,7 +404,7 @@ fn passive_open_app_notification_failure_rolls_back_all_owner_state() {
         &applications,
         &mut tcp,
         connection_index,
-        SessionAppId::new(0),
+        0,
         __SESSION_APP_TLS_PROTOCOL_CALLBACKS,
     );
 
@@ -440,7 +438,7 @@ fn active_open_app_notification_failure_rolls_back_all_owner_state() {
         &applications,
         &mut tcp,
         connection_index,
-        SessionAppId::new(1),
+        1,
         __SESSION_APP_HTTP_PROTOCOL_CALLBACKS,
     );
     publish_tcp_connection(&mut sessions, &mut tcp, session_id)
@@ -603,7 +601,7 @@ fn fin_with_payload_is_processed_after_rx_enqueue_and_notifies_app_once() {
             .alloc_index_with_bytes(b"hello")
             .expect("ingress buffer");
         let delivery = sessions
-            .enqueue_rx(runtime.buffers(), session_id, ingress, 0, false)
+            .enqueue_rx(runtime.buffers(), session_id, ingress, 0)
             .expect("enqueue payload");
         connection.receive_payload(packet.sequence, 0, delivery);
         let fin = connection
@@ -768,8 +766,8 @@ struct TlsProtocol;
 
 impl SessionApp for TlsProtocol {
     fn create(
-        _: Option<ApplicationId>,
-        _: Option<SessionAppId>,
+        _: Option<u32>,
+        _: Option<u32>,
         _: Option<u64>,
         _: Option<&str>,
     ) -> hammer_runtime::RuntimeResult<Self> {
@@ -779,7 +777,7 @@ impl SessionApp for TlsProtocol {
     fn connected(
         &mut self,
         _: &mut hammer_service::session::runtime::SessionWorker<u32>,
-        _: SessionId,
+        _: u32,
         _: u64,
     ) -> hammer_runtime::RuntimeResult<()> {
         Err(AppSessionError::EventQueueFull {
@@ -792,7 +790,7 @@ impl SessionApp for TlsProtocol {
     fn accept(
         &mut self,
         _: &mut hammer_service::session::runtime::SessionWorker<u32>,
-        _: SessionId,
+        _: u32,
         _: u64,
     ) -> hammer_runtime::RuntimeResult<()> {
         Err(AppSessionError::EventQueueFull {
@@ -808,8 +806,8 @@ struct HttpProtocol;
 
 impl SessionApp for HttpProtocol {
     fn create(
-        _: Option<ApplicationId>,
-        _: Option<SessionAppId>,
+        _: Option<u32>,
+        _: Option<u32>,
         _: Option<u64>,
         _: Option<&str>,
     ) -> hammer_runtime::RuntimeResult<Self> {
@@ -819,7 +817,7 @@ impl SessionApp for HttpProtocol {
     fn connected(
         &mut self,
         _: &mut hammer_service::session::runtime::SessionWorker<u32>,
-        _: SessionId,
+        _: u32,
         _: u64,
     ) -> hammer_runtime::RuntimeResult<()> {
         Err(AppSessionError::EventQueueFull {
@@ -832,7 +830,7 @@ impl SessionApp for HttpProtocol {
     fn accept(
         &mut self,
         _: &mut hammer_service::session::runtime::SessionWorker<u32>,
-        _: SessionId,
+        _: u32,
         _: u64,
     ) -> hammer_runtime::RuntimeResult<()> {
         Err(AppSessionError::EventQueueFull {

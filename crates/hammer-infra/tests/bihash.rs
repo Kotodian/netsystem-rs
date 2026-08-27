@@ -1,7 +1,7 @@
 use std::sync::Arc;
 
 use hammer_infra::bihash::bucket::Bucket;
-use hammer_infra::bihash::{Bihash, Bihash16x8, Bihash24x8, Bihash48x8, Bihash8x8, BihashKey};
+use hammer_infra::bihash::{Bihash, Bihash8x8, Bihash16x8, Bihash24x8, Bihash48x8, BihashKey};
 
 #[test]
 fn bihash_key_u64_hashes_deterministically() {
@@ -115,7 +115,7 @@ fn bihash_prefetch_accepts_empty_and_present_keys() {
 
 // ── ValuePage / Kv / FREE_U64 ──────────────────────────────────────────
 
-use hammer_infra::bihash::value::{Kv, ValuePage, FREE_U64};
+use hammer_infra::bihash::value::{FREE_U64, Kv, ValuePage};
 
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 struct FixedHashKey {

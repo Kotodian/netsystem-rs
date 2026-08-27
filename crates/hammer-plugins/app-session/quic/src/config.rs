@@ -4,7 +4,7 @@ use std::thread::{self, ThreadId};
 
 use hammer_infra::pool::Pool;
 use hammer_runtime::Engine;
-use hammer_runtime::app::{AppSessionConfig, ApplicationId};
+use hammer_runtime::app::AppSessionConfig;
 use prost::Message;
 use quinn_proto::rustls::pki_types::{CertificateDer, PrivateKeyDer};
 use quinn_proto::rustls::server::WebPkiClientVerifier;
@@ -166,7 +166,7 @@ enum ConnectionConfig {
 }
 
 struct ConfigEntry {
-    application: ApplicationId,
+    application: u32,
     config: ConnectionConfig,
 }
 
@@ -191,7 +191,7 @@ impl QuicConfigRegistry {
 
     fn register_server_config(
         &self,
-        application: ApplicationId,
+        application: u32,
         config: ServerConfig,
         fifo_capacity: usize,
     ) -> Result<ConfigId, ConfigError> {
@@ -202,7 +202,7 @@ impl QuicConfigRegistry {
 
     fn register_client_config(
         &self,
-        application: ApplicationId,
+        application: u32,
         config: ClientConfig,
         fifo_capacity: usize,
     ) -> Result<ConfigId, ConfigError> {
@@ -213,7 +213,7 @@ impl QuicConfigRegistry {
 
     pub(crate) fn server_config(
         &self,
-        application: ApplicationId,
+        application: u32,
         config: ConfigId,
     ) -> Result<Arc<quinn_proto::ServerConfig>, ConfigError> {
         self.with_entry(application, config, |entry| match &entry.config {
@@ -224,7 +224,7 @@ impl QuicConfigRegistry {
 
     pub(crate) fn client_config(
         &self,
-        application: ApplicationId,
+        application: u32,
         config: ConfigId,
     ) -> Result<Arc<quinn_proto::ClientConfig>, ConfigError> {
         self.with_entry(application, config, |entry| match &entry.config {
@@ -235,7 +235,7 @@ impl QuicConfigRegistry {
 
     pub(crate) fn transport_config(
         &self,
-        application: ApplicationId,
+        application: u32,
         config: ConfigId,
     ) -> Result<TransportConfig, ConfigError> {
         self.with_entry(application, config, |entry| match &entry.config {
@@ -246,7 +246,7 @@ impl QuicConfigRegistry {
 
     pub(crate) fn remove_config(
         &self,
-        application: ApplicationId,
+        application: u32,
         config: ConfigId,
     ) -> Result<(), ConfigError> {
         self.with_state_mut(|state| {
@@ -256,22 +256,18 @@ impl QuicConfigRegistry {
         })?
     }
 
-    fn insert(
-        &self,
-        application: ApplicationId,
-        config: ConnectionConfig,
-    ) -> Result<ConfigId, ConfigError> {
+    fn insert(&self, application: u32, config: ConnectionConfig) -> Result<ConfigId, ConfigError> {
         self.with_state_mut(|state| {
             config_id(state.insert(ConfigEntry {
                 application,
                 config,
             }))
-        })?
+        })
     }
 
     fn with_entry<R>(
         &self,
-        application: ApplicationId,
+        application: u32,
         config: ConfigId,
         operation: impl FnOnce(&ConfigEntry) -> Result<R, ConfigError>,
     ) -> Result<R, ConfigError> {
@@ -327,10 +323,7 @@ pub enum ConfigError {
     #[error("QUIC configuration {config:?} is not registered")]
     Missing { config: ConfigId },
     #[error("QUIC configuration {config:?} is not owned by Application {application:?}")]
-    NotOwned {
-        application: ApplicationId,
-        config: ConfigId,
-    },
+    NotOwned { application: u32, config: ConfigId },
     #[error("QUIC configuration {config:?} has the wrong connection role")]
     RoleMismatch { config: ConfigId },
     #[error("QUIC server configuration requires a certificate chain")]
@@ -385,7 +378,7 @@ pub enum ConfigError {
 impl QuicMain {
     pub fn register_server_config(
         &self,
-        application: ApplicationId,
+        application: u32,
         config: ServerConfig,
     ) -> Result<ConfigId, ConfigError> {
         self.ensure_application(application)?;
@@ -398,7 +391,7 @@ impl QuicMain {
 
     pub fn register_client_config(
         &self,
-        application: ApplicationId,
+        application: u32,
         config: ClientConfig,
     ) -> Result<ConfigId, ConfigError> {
         self.ensure_application(application)?;
@@ -411,7 +404,7 @@ impl QuicMain {
 
     pub fn server_config(
         &self,
-        application: ApplicationId,
+        application: u32,
         config: ConfigId,
     ) -> Result<Arc<quinn_proto::ServerConfig>, ConfigError> {
         self.ensure_application(application)?;
@@ -420,23 +413,19 @@ impl QuicMain {
 
     pub fn client_config(
         &self,
-        application: ApplicationId,
+        application: u32,
         config: ConfigId,
     ) -> Result<Arc<quinn_proto::ClientConfig>, ConfigError> {
         self.ensure_application(application)?;
         self.configs.client_config(application, config)
     }
 
-    pub fn remove_config(
-        &self,
-        application: ApplicationId,
-        config: ConfigId,
-    ) -> Result<(), ConfigError> {
+    pub fn remove_config(&self, application: u32, config: ConfigId) -> Result<(), ConfigError> {
         self.ensure_application(application)?;
         self.configs.remove_config(application, config)
     }
 
-    fn ensure_application(&self, application: ApplicationId) -> Result<(), ConfigError> {
+    fn ensure_application(&self, application: u32) -> Result<(), ConfigError> {
         match self.application_is_attached(application) {
             Ok(true) => Ok(()),
             Ok(false) => Err(ConfigError::ApplicationRequired),
@@ -449,20 +438,20 @@ impl QuicMain {
 }
 
 pub fn register_server_config(
-    application: ApplicationId,
+    application: u32,
     config: ServerConfig,
 ) -> Result<ConfigId, ConfigError> {
     main()?.register_server_config(application, config)
 }
 
 pub fn register_client_config(
-    application: ApplicationId,
+    application: u32,
     config: ClientConfig,
 ) -> Result<ConfigId, ConfigError> {
     main()?.register_client_config(application, config)
 }
 
-pub fn remove_config(application: ApplicationId, config: ConfigId) -> Result<(), ConfigError> {
+pub fn remove_config(application: u32, config: ConfigId) -> Result<(), ConfigError> {
     main()?.remove_config(application, config)
 }
 
@@ -609,14 +598,14 @@ fn config_index(config: ConfigId) -> u32 {
 
 fn config_entry(
     configs: &Pool<ConfigEntry>,
-    application: ApplicationId,
+    application: u32,
     config: ConfigId,
 ) -> Result<&ConfigEntry, ConfigError> {
     let index = config_index(config);
     if !configs.contains_key(index) {
         return Err(ConfigError::Missing { config });
     }
-    let entry = configs.get(index);
+    let entry = configs.get(index).ok_or(ConfigError::Missing { config })?;
     if entry.application != application {
         return Err(ConfigError::NotOwned {
             application,
@@ -797,8 +786,7 @@ fn api_transport(
     )
 }
 
-fn binary_application(application: u32) -> Result<ApplicationId, QuicApiStatus> {
-    let application = ApplicationId::from_raw(application);
+fn binary_application(application: u32) -> Result<u32, QuicApiStatus> {
     let Some(attached) = Engine::with_current(|engine| {
         let applications = engine
             .registry
@@ -886,7 +874,7 @@ mod tests {
         )
     }
 
-    fn test_main() -> (Arc<QuicMain>, ApplicationId, ApplicationId) {
+    fn test_main() -> (Arc<QuicMain>) {
         let applications = hammer_service::session::ApplicationMain::new(4);
         let first = applications.attach().expect("attach first Application");
         let second = applications.attach().expect("attach second Application");
@@ -898,7 +886,7 @@ mod tests {
         let main = Arc::new(QuicMain::new(
             sessions,
             inner_application,
-            hammer_runtime::app::SessionAppId::new(0),
+            0,
             SessionTransportRegistration::new("udp", None, None, None),
             1,
         ));

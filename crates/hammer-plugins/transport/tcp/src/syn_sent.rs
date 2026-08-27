@@ -193,7 +193,7 @@ fn tcp_syn_sent_index(
                 buffer.advance(packet.payload_offset as isize)?;
                 buffer.truncate(packet.payload_len)?;
             }
-            let enqueue = sessions.enqueue_rx(runtime.buffers(), session_id, index, 0, false)?;
+            let enqueue = sessions.enqueue_rx(runtime.buffers(), session_id, index, 0)?;
             if matches!(enqueue, RxDelivery::InOrder { .. }) {
                 sessions.mark_ready(session_id);
             }

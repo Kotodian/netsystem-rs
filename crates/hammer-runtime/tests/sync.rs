@@ -60,7 +60,7 @@ fn rw_lock_allows_readers_and_serializes_writers() {
 }
 
 #[test]
-fn vpp_memory_barriers_are_callable() {
+fn memory_barriers_are_callable() {
     compiler_barrier();
     release_fence();
     store_barrier();

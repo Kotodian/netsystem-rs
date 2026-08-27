@@ -7,20 +7,19 @@ use hammer_core::data_plane::{BufferFrame, Index as BufferIndex, NodeHandle, Nod
 use hammer_infra::align::CacheLine;
 use hammer_infra::pool::Pool;
 use hammer_infra::thread_owned::{ThreadOwned, ThreadOwnedError};
-use hammer_runtime::app::SessionDgramHeader;
+use hammer_runtime::app::{SessionDgramHeader, SessionHandle};
 use hammer_runtime::{
     DataPlaneRuntime, DataWorkerId, Engine, NodeRuntimeData, RuntimeError, RuntimeResult,
-    SessionConnectEndpoint, SessionConnectionId, SessionListenEndpoint, SessionHandle,
-    with_data_plane_runtime,
+    SessionConnectEndpoint, SessionListenEndpoint, with_data_plane_runtime,
 };
 use hammer_service::session::node::{SessionQueueNode, SessionQueueOutput};
 use hammer_service::session::runtime::{
     SessionDgramArgs, SessionMain, SessionMigrateResult, SessionSwitchPoolArgs,
     SessionSwitchPoolClosed, SessionSwitchPoolCompletion, SessionSwitchPoolCompletionStatus,
-    SessionSwitchPoolReply, SessionSwitchPoolStatus, SessionTransport, SessionTransportId,
-    SessionWorker, TransportInternalTransport, TransportInternalTx, dispatch_session_queue_events,
+    SessionSwitchPoolReply, SessionSwitchPoolStatus, SessionTransport, SessionWorker,
+    TransportInternalTransport, TransportInternalTx, dispatch_session_queue_events,
 };
-use hammer_service::session::{SessionId, SessionQueueNext};
+use hammer_service::session::{SessionQueueNext, u32};
 
 use crate::UdpIpVersion;
 use crate::connection::{UdpConnection, UdpListener};
@@ -53,11 +52,12 @@ pub(crate) enum UdpTransportError {
     ConnectionCapacityExhausted { capacity: usize },
     #[error("UDP connection {index:?} is missing")]
     ConnectionMissing { index: u32 },
+    #[error("UDP listener {listener:?} is missing")]
     ListenerMissing { listener: SessionHandle },
     #[error("UDP endpoint {endpoint} is already in use")]
     EndpointInUse { endpoint: SocketAddr },
     #[error("UDP session {session_id:?} is missing")]
-    SessionMissing { session_id: SessionId },
+    SessionMissing { session_id: u32 },
     #[error("UDP connection requires compatible IPv4 or IPv6 endpoints")]
     InvalidConnection,
     #[error("UDP output header could not be written")]
@@ -217,12 +217,7 @@ impl UdpWorker {
     }
 
     fn insert_connection(&mut self, connection: UdpConnection) -> RuntimeResult<u32> {
-        self.connections
-            .insert(connection)
-            .ok_or(UdpTransportError::ConnectionCapacityExhausted {
-                capacity: self.connections.capacity(),
-            })
-            .map_err(RuntimeError::from)
+        Ok(self.connections.insert(connection))
     }
 
     fn connection(&self, index: u32) -> Option<&UdpConnection> {
@@ -243,7 +238,7 @@ impl UdpWorker {
         listener: UdpListener,
         local: SocketAddr,
         remote: SocketAddr,
-    ) -> RuntimeResult<(u32, SessionId)> {
+    ) -> RuntimeResult<(u32, u32)> {
         let connection = UdpConnection::connected(self.worker, local, remote)
             .ok_or(UdpTransportError::InvalidConnection)?;
         let index = self.insert_connection(connection)?;
@@ -285,17 +280,16 @@ impl UdpWorker {
             }
             return Err(error);
         }
-        let _ = sessions.mark_session_endpoint_ready(session_id, UdpWorker::ID, local, remote)?;
         Ok((index, session_id))
     }
 
     fn active_connect(
         &mut self,
         sessions: &mut SessionWorker<u32>,
-        connection: SessionConnectionId,
+        connection: u32,
         local: SocketAddr,
         remote: SocketAddr,
-    ) -> RuntimeResult<SessionId> {
+    ) -> RuntimeResult<u32> {
         if self
             .lookup
             .find_tuple(&self.connections, local, remote)
@@ -344,13 +338,13 @@ impl UdpWorker {
     fn rollback_accept(
         &mut self,
         sessions: &mut SessionWorker<u32>,
-        session_id: SessionId,
+        session_id: u32,
         index: u32,
         local: SocketAddr,
         remote: SocketAddr,
     ) -> RuntimeResult<()> {
         self.lookup.remove_tuple(local, remote);
-        let _ = sessions.remove_session_endpoint(session_id, UdpWorker::ID, local, remote)?;
+        let _ = sessions.remove_session_endpoint(UdpWorker::ID, local, remote)?;
         self.remove_connection(index);
         sessions.rollback_session_creation(session_id)?;
         Ok(())
@@ -370,25 +364,16 @@ impl UdpWorker {
         return_node: NodeId,
     ) -> RuntimeResult<UdpDelivery> {
         let endpoint = sessions.lookup_session_endpoint(UdpWorker::ID, local, remote)?;
-        if endpoint.is_some()
-            && sessions.session_endpoint_is_migrating(UdpWorker::ID, local, remote)?
-        {
-            // VPP's wrong-thread path does not enqueue on the old owner while
-            // migration is outstanding; the input node accounts and drops it.
-            return Ok(UdpDelivery::WrongWorker);
-        }
         if let Some(connection_index) = self.lookup.find_tuple(&self.connections, local, remote) {
-            if endpoint.is_some_and(|handle| handle.worker_index() != self.worker.slot() as u32) {
+            if endpoint.is_some_and(|handle| handle.thread_index != self.worker.slot() as u32) {
                 return Ok(UdpDelivery::WrongWorker);
             }
             let session_id = self
                 .connection(connection_index)
                 .and_then(|connection| connection.session())
                 .ok_or(UdpTransportError::SessionMissing {
-                    session_id: SessionId::from(connection_index),
+                    session_id: u32::from(connection_index),
                 })?;
-            let _ =
-                sessions.mark_session_endpoint_ready(session_id, UdpWorker::ID, local, remote)?;
             let header = SessionDgramHeader::new(local, remote, payload_len)
                 .ok_or(UdpTransportError::InvalidConnection)?;
             let written = sessions.enqueue_datagram_rx_from_buffer_at(
@@ -397,7 +382,6 @@ impl UdpWorker {
                 index,
                 payload_offset,
                 header,
-                urgent,
             )?;
             return Ok(if written == 0 {
                 UdpDelivery::FifoFull
@@ -406,7 +390,7 @@ impl UdpWorker {
             });
         }
         if let Some(handle) = sessions.lookup_session_endpoint(UdpWorker::ID, local, remote)? {
-            if handle.worker_index() != self.worker.slot() as u32 {
+            if handle.thread_index != self.worker.slot() as u32 {
                 let result = sessions.program_thread_migration(
                     runtime,
                     self.worker,
@@ -443,7 +427,6 @@ impl UdpWorker {
             index,
             payload_offset,
             header,
-            urgent,
         )?;
         Ok(if written == 0 {
             UdpDelivery::FifoFull
@@ -611,18 +594,13 @@ impl UdpWorker {
             let inserted = attached && self.lookup.insert_tuple(connection_index, local, remote);
             let published = inserted
                 && sessions
-                    .publish_session_migration(reply.old_sh, new_handle, transport, local, remote)
+                    .publish_session_migration(new_handle, transport, local, remote)
                     .unwrap_or(false);
             let accepted = published && sessions.accept_migrated_session(session_id).is_ok();
             if !accepted {
                 if published {
-                    let _ = sessions.replace_session_endpoint(
-                        new_handle,
-                        reply.old_sh,
-                        transport,
-                        local,
-                        remote,
-                    );
+                    let _ =
+                        sessions.replace_session_endpoint(reply.old_sh, transport, local, remote);
                 }
                 self.lookup.remove_tuple(local, remote);
                 let _ = self.remove_connection(connection_index);
@@ -687,7 +665,7 @@ impl UdpWorker {
             .is_err()
             || sessions.remove_migrated_session(session_id).is_err()
             || sessions
-                .remove_session_endpoint(session_id, transport, local, remote)
+                .remove_session_endpoint(transport, local, remote)
                 .is_err()
         {
             return false;
@@ -719,7 +697,7 @@ impl UdpWorker {
             return true;
         }
         if sessions
-            .remove_session_endpoint(session_id, transport, local, remote)
+            .remove_session_endpoint(transport, local, remote)
             .is_err()
         {
             return false;
@@ -885,7 +863,7 @@ impl UdpWorker {
 
 pub(crate) fn start_listen(
     listener: SessionHandle,
-    _: hammer_runtime::app::ApplicationId,
+    _: u32,
     _: Option<u64>,
     endpoint: SessionListenEndpoint,
 ) -> RuntimeResult<()> {
@@ -1100,7 +1078,7 @@ fn udp_session_queue_dispatch(
 impl SessionTransport<u32> for UdpWorker {
     type Tx = TransportInternalTx;
 
-    const ID: SessionTransportId = SessionTransportId::new(2);
+    const ID: u8 = 2;
 
     fn update_time(
         &mut self,
@@ -1137,7 +1115,6 @@ impl SessionTransport<u32> for UdpWorker {
         self.lookup
             .remove_tuple(connection.local(), connection.remote());
         let _ = sessions.remove_session_endpoint(
-            session_id,
             UdpWorker::ID,
             connection.local(),
             connection.remote(),
@@ -1152,7 +1129,7 @@ impl TransportInternalTransport<u32> for UdpWorker {
     fn internal_tx(
         &mut self,
         sessions: &mut SessionWorker<u32>,
-        session_id: SessionId,
+        session_id: u32,
         index: u32,
         runtime: &DataPlaneRuntime,
         output_next: SessionQueueNext,
@@ -1228,7 +1205,7 @@ mod tests {
 
     fn noop_start_listen(
         _: SessionHandle,
-        _: hammer_runtime::app::ApplicationId,
+        _: u32,
         _: Option<u64>,
         _: SessionListenEndpoint,
     ) -> RuntimeResult<()> {
@@ -1421,8 +1398,7 @@ mod tests {
         let application_connection =
             applications.register_connection(application, 0, None, None, None)?;
         let (local, remote) = test_endpoints();
-        let connection_id =
-            hammer_runtime::SessionConnectionId::from_raw(application_connection.raw());
+        let connection_id = application_connection;
 
         let session_id = udp.active_connect(&mut sessions, connection_id, local, remote)?;
 
@@ -1444,8 +1420,7 @@ mod tests {
         let application_connection =
             applications.register_connection(application, 0, None, None, None)?;
         let (local, remote) = test_endpoints();
-        let connection_id =
-            hammer_runtime::SessionConnectionId::from_raw(application_connection.raw());
+        let connection_id = application_connection;
         udp.active_connect(&mut sessions, connection_id, local, remote)?;
 
         let runtime = DataPlaneRuntime::new(DataPlaneRuntimeConfig::default())
@@ -1490,8 +1465,7 @@ mod tests {
         let application_connection =
             applications.register_connection(application, 0, None, None, None)?;
         let (local, remote) = test_endpoints();
-        let connection_id =
-            hammer_runtime::SessionConnectionId::from_raw(application_connection.raw());
+        let connection_id = application_connection;
         udp.active_connect(&mut sessions, connection_id, local, remote)?;
 
         let runtime = DataPlaneRuntime::new(DataPlaneRuntimeConfig::default())
@@ -1537,8 +1511,7 @@ mod tests {
         let application_connection =
             applications.register_connection(application, 0, None, None, None)?;
         let (local, remote) = test_endpoints();
-        let connection_id =
-            hammer_runtime::SessionConnectionId::from_raw(application_connection.raw());
+        let connection_id = application_connection;
         source_udp.active_connect(&mut sessions, connection_id, local, remote)?;
 
         let source_runtime =
@@ -1655,8 +1628,7 @@ mod tests {
         let application_connection =
             applications.register_connection(application, 0, None, None, None)?;
         let (local, remote) = test_endpoints();
-        let connection_id =
-            hammer_runtime::SessionConnectionId::from_raw(application_connection.raw());
+        let connection_id = application_connection;
         source_udp.active_connect(&mut sessions, connection_id, local, remote)?;
 
         let target_runtime =
@@ -1720,8 +1692,7 @@ mod tests {
         let application_connection =
             applications.register_connection(application, 0, None, None, None)?;
         let (local, first_remote) = test_endpoints();
-        let connection_id =
-            hammer_runtime::SessionConnectionId::from_raw(application_connection.raw());
+        let connection_id = application_connection;
         let first_session =
             udp.active_connect(&mut sessions, connection_id, local, first_remote)?;
         let first_handle = main
@@ -1809,8 +1780,7 @@ mod tests {
         let application_connection =
             applications.register_connection(application, 0, None, None, None)?;
         let (local, remote) = test_endpoints();
-        let connection_id =
-            hammer_runtime::SessionConnectionId::from_raw(application_connection.raw());
+        let connection_id = application_connection;
         udp.active_connect(&mut sessions, connection_id, local, remote)?;
         let old_handle = main
             .lookup_endpoint(local, remote, UdpWorker::ID)
@@ -1953,7 +1923,7 @@ mod tests {
             .lookup_endpoint(local, remote, UdpWorker::ID)
             .ok_or("missing target UDP Session route")?;
         assert_ne!(new_handle, old_handle);
-        assert_eq!(new_handle.worker_index(), 1);
+        assert_eq!(new_handle.thread_index, 1);
         assert!(source_sessions.session_id_from_handle(old_handle).is_some());
         let target_session = target_sessions
             .session_id_from_handle(new_handle)
@@ -2064,7 +2034,7 @@ mod tests {
             .lookup_endpoint(local, remote, UdpWorker::ID)
             .ok_or("missing target UDP Session route")?;
         assert_ne!(new_handle, old_handle);
-        assert_eq!(new_handle.worker_index(), 1);
+        assert_eq!(new_handle.thread_index, 1);
         assert!(target_sessions.session_id_from_handle(new_handle).is_some());
         assert!(
             target_udp
@@ -2357,8 +2327,7 @@ mod tests {
         let application_connection =
             applications.register_connection(application, 0, None, None, None)?;
         let (local, remote) = test_endpoints();
-        let connection_id =
-            hammer_runtime::SessionConnectionId::from_raw(application_connection.raw());
+        let connection_id = application_connection;
         let session_id = udp.active_connect(&mut sessions, connection_id, local, remote)?;
         let (transport_id, index) = sessions
             .session_transport(session_id)

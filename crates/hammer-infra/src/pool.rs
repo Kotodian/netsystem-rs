@@ -19,6 +19,13 @@ pub struct Pool<T> {
     opaque: u32,
 }
 
+impl<T> Default for Pool<T> {
+    #[inline]
+    fn default() -> Self {
+        Self::with_capacity(0)
+    }
+}
+
 impl<T> Pool<T> {
     /// Creates a dynamic pool with an initial backing allocation capacity.
     #[inline]

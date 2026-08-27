@@ -10,9 +10,8 @@ use std::io::{self, BufRead, Write};
 use std::sync::Arc;
 
 use hammer_infra::fifo::Fifo;
-use hammer_runtime::app::{ApplicationId, SessionAppContext, SessionAppId};
+use hammer_runtime::app::SessionAppContext;
 use hammer_runtime::{RuntimeError, RuntimeResult};
-use hammer_service::session::SessionId;
 use hammer_service::session::protocol::SessionApp;
 use hammer_service::session::runtime::SessionWorker;
 use rustls::pki_types::ServerName;
@@ -74,8 +73,8 @@ enum Error {
 pub struct Connection {
     connection: rustls::Connection,
     peer_closed: bool,
-    lower_session: Option<SessionId>,
-    upper_session: Option<SessionId>,
+    lower_session: Option<u32>,
+    upper_session: Option<u32>,
 }
 
 impl Connection {
@@ -210,8 +209,8 @@ impl Connection {
 
 impl SessionApp for Connection {
     fn create(
-        application: Option<ApplicationId>,
-        _: Option<SessionAppId>,
+        application: Option<u32>,
+        _: Option<u32>,
         opaque: Option<u64>,
         server_name: Option<&str>,
     ) -> RuntimeResult<Self> {
@@ -238,7 +237,7 @@ impl SessionApp for Connection {
     fn accept(
         &mut self,
         worker: &mut SessionWorker<u32>,
-        session: SessionId,
+        session: u32,
         context: SessionAppContext,
     ) -> RuntimeResult<()> {
         let upper = worker.create_upper_session(session, context)?;
@@ -250,7 +249,7 @@ impl SessionApp for Connection {
     fn connected(
         &mut self,
         worker: &mut SessionWorker<u32>,
-        session: SessionId,
+        session: u32,
         context: SessionAppContext,
     ) -> RuntimeResult<()> {
         let upper = worker.create_upper_session(session, context)?;
@@ -262,7 +261,7 @@ impl SessionApp for Connection {
     fn builtin_rx(
         &mut self,
         worker: &mut SessionWorker<u32>,
-        _: SessionId,
+        _: u32,
         _: SessionAppContext,
     ) -> RuntimeResult<()> {
         let lower = self.lower_session.ok_or(Error::UpperSessionMissing)?;
@@ -278,7 +277,7 @@ impl SessionApp for Connection {
     fn builtin_tx(
         &mut self,
         worker: &mut SessionWorker<u32>,
-        _: SessionId,
+        _: u32,
         _: SessionAppContext,
     ) -> RuntimeResult<()> {
         let lower = self.lower_session.ok_or(Error::UpperSessionMissing)?;
@@ -294,7 +293,7 @@ impl SessionApp for Connection {
     fn disconnect(
         &mut self,
         _: &mut SessionWorker<u32>,
-        _: SessionId,
+        _: u32,
         _: SessionAppContext,
     ) -> RuntimeResult<()> {
         self.send_close_notify();
@@ -304,7 +303,7 @@ impl SessionApp for Connection {
     fn transport_closed(
         &mut self,
         _: &mut SessionWorker<u32>,
-        _: SessionId,
+        _: u32,
         _: SessionAppContext,
     ) -> RuntimeResult<()> {
         self.peer_closed = true;

@@ -1,14 +1,13 @@
 //! VPP-shaped Session App callback surface.
 
 use hammer_runtime::RuntimeResult;
-use hammer_runtime::app::{ApplicationId, SessionAppContext, SessionAppId, SessionHandle};
+use hammer_runtime::app::{SessionAppContext, SessionHandle};
 
-use super::SessionId;
 use super::runtime::SessionWorker;
 
 /// One Session App callback that operates on an exact Session.
 pub type SessionAppCallback<Index = u32> =
-    fn(&mut SessionWorker<Index>, SessionId, SessionAppContext) -> RuntimeResult<()>;
+    fn(&mut SessionWorker<Index>, u32, SessionAppContext) -> RuntimeResult<()>;
 
 /// One Session App callback that carries a segment handle instead of a Session.
 pub type SessionAppSegmentCallback<Index = u32> =
@@ -16,7 +15,7 @@ pub type SessionAppSegmentCallback<Index = u32> =
 
 /// VPP `session_cb_vft_t.migrate` callback with the old and new handles.
 pub type SessionAppMigrateCallback<Index = u32> =
-    fn(&mut SessionWorker<Index>, SessionId, SessionHandle, SessionAppContext) -> RuntimeResult<()>;
+    fn(&mut SessionWorker<Index>, u32, SessionHandle, SessionAppContext) -> RuntimeResult<()>;
 
 /// Concrete static callback table matching VPP `session_cb_vft_t`.
 ///
@@ -82,8 +81,8 @@ pub trait SessionApp: Sized + Send + 'static {
     const CONTEXT_CAPACITY: usize = 1_024;
 
     fn create(
-        _: Option<ApplicationId>,
-        _: Option<SessionAppId>,
+        _: Option<u32>,
+        _: Option<u32>,
         _: Option<u64>,
         _: Option<&str>,
     ) -> RuntimeResult<Self> {
@@ -101,7 +100,7 @@ pub trait SessionApp: Sized + Send + 'static {
     fn accept(
         &mut self,
         _: &mut SessionWorker<u32>,
-        _: SessionId,
+        _: u32,
         _: SessionAppContext,
     ) -> RuntimeResult<()> {
         Ok(())
@@ -110,7 +109,7 @@ pub trait SessionApp: Sized + Send + 'static {
     fn connected(
         &mut self,
         _: &mut SessionWorker<u32>,
-        _: SessionId,
+        _: u32,
         _: SessionAppContext,
     ) -> RuntimeResult<()> {
         Ok(())
@@ -119,7 +118,7 @@ pub trait SessionApp: Sized + Send + 'static {
     fn disconnect(
         &mut self,
         _: &mut SessionWorker<u32>,
-        _: SessionId,
+        _: u32,
         _: SessionAppContext,
     ) -> RuntimeResult<()> {
         Ok(())
@@ -128,7 +127,7 @@ pub trait SessionApp: Sized + Send + 'static {
     fn reset(
         &mut self,
         _: &mut SessionWorker<u32>,
-        _: SessionId,
+        _: u32,
         _: SessionAppContext,
     ) -> RuntimeResult<()> {
         Ok(())
@@ -137,7 +136,7 @@ pub trait SessionApp: Sized + Send + 'static {
     fn transport_closed(
         &mut self,
         _: &mut SessionWorker<u32>,
-        _: SessionId,
+        _: u32,
         _: SessionAppContext,
     ) -> RuntimeResult<()> {
         Ok(())
@@ -146,7 +145,7 @@ pub trait SessionApp: Sized + Send + 'static {
     fn cleanup(
         &mut self,
         _: &mut SessionWorker<u32>,
-        _: SessionId,
+        _: u32,
         _: SessionAppContext,
     ) -> RuntimeResult<()> {
         Ok(())
@@ -155,7 +154,7 @@ pub trait SessionApp: Sized + Send + 'static {
     fn half_open_cleanup(
         &mut self,
         _: &mut SessionWorker<u32>,
-        _: SessionId,
+        _: u32,
         _: SessionAppContext,
     ) -> RuntimeResult<()> {
         Ok(())
@@ -164,7 +163,7 @@ pub trait SessionApp: Sized + Send + 'static {
     fn migrate(
         &mut self,
         _: &mut SessionWorker<u32>,
-        _: SessionId,
+        _: u32,
         _: SessionHandle,
         _: SessionAppContext,
     ) -> RuntimeResult<()> {
@@ -174,7 +173,7 @@ pub trait SessionApp: Sized + Send + 'static {
     fn listened(
         &mut self,
         _: &mut SessionWorker<u32>,
-        _: SessionId,
+        _: u32,
         _: SessionAppContext,
     ) -> RuntimeResult<()> {
         Ok(())
@@ -183,7 +182,7 @@ pub trait SessionApp: Sized + Send + 'static {
     fn unlistened(
         &mut self,
         _: &mut SessionWorker<u32>,
-        _: SessionId,
+        _: u32,
         _: SessionAppContext,
     ) -> RuntimeResult<()> {
         Ok(())
@@ -192,7 +191,7 @@ pub trait SessionApp: Sized + Send + 'static {
     fn builtin_rx(
         &mut self,
         _: &mut SessionWorker<u32>,
-        _: SessionId,
+        _: u32,
         _: SessionAppContext,
     ) -> RuntimeResult<()> {
         Ok(())
@@ -201,7 +200,7 @@ pub trait SessionApp: Sized + Send + 'static {
     fn builtin_tx(
         &mut self,
         _: &mut SessionWorker<u32>,
-        _: SessionId,
+        _: u32,
         _: SessionAppContext,
     ) -> RuntimeResult<()> {
         Ok(())
@@ -210,7 +209,7 @@ pub trait SessionApp: Sized + Send + 'static {
     fn fifo_tuning(
         &mut self,
         _: &mut SessionWorker<u32>,
-        _: SessionId,
+        _: u32,
         _: SessionAppContext,
     ) -> RuntimeResult<()> {
         Ok(())
@@ -219,7 +218,7 @@ pub trait SessionApp: Sized + Send + 'static {
     fn proxy_alloc_fifos(
         &mut self,
         _: &mut SessionWorker<u32>,
-        _: SessionId,
+        _: u32,
         _: SessionAppContext,
     ) -> RuntimeResult<()> {
         Ok(())
@@ -228,7 +227,7 @@ pub trait SessionApp: Sized + Send + 'static {
     fn proxy_write_early_data(
         &mut self,
         _: &mut SessionWorker<u32>,
-        _: SessionId,
+        _: u32,
         _: SessionAppContext,
     ) -> RuntimeResult<()> {
         Ok(())
@@ -237,7 +236,7 @@ pub trait SessionApp: Sized + Send + 'static {
     fn app_evt(
         &mut self,
         _: &mut SessionWorker<u32>,
-        _: SessionId,
+        _: u32,
         _: SessionAppContext,
     ) -> RuntimeResult<()> {
         Ok(())
@@ -246,7 +245,7 @@ pub trait SessionApp: Sized + Send + 'static {
     fn crypto_async(
         &mut self,
         _: &mut SessionWorker<u32>,
-        _: SessionId,
+        _: u32,
         _: SessionAppContext,
     ) -> RuntimeResult<()> {
         Ok(())

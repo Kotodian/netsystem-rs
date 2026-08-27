@@ -169,6 +169,13 @@ Use Rust 2024 conventions and rustfmt defaults: 4-space indentation, `snake_case
 
 ### Naming rules
 
+- Hammer-owned identifiers must never use `vpp`/`Vpp` as a naming component:
+  this includes types, traits, fields, variables, functions, modules, constants,
+  test names, and error variants. `VPP` is an external reference name and may
+  appear in documentation, comments, source citations, or literal protocol
+  symbols only; the Hammer identifier itself must state the corresponding
+  domain role (for example, `session_handles`, `session_handle`, or
+  `external_handle`).
 - Every word in an identifier must express a domain role, fact, operation,
   state, policy, protocol, or invariant at the layer that owns it. This rule
   applies equally to production code, tests, benchmarks, examples, and test
@@ -406,3 +413,89 @@ Do not commit real VPN credentials, server addresses, certificates, or generated
 - Keep hot paths allocation-free and lock-free where the surrounding design requires it. Do not add synchronization merely for convenience, do not hold synchronous guards across `.await`, and do not move data-plane ownership into control-plane tasks.
 - Do not use `/tmp` or another temporary directory as a Cargo target directory. Run focused verification for the changed scope, then run the `simplify` skill only for the coherent business-code batch. Do not run prohibited local checks for workflow-only changes.
 - The review handoff must compare the complete diff against the issue line by line, delete every unjustified change, check tests and error paths, and report remaining gaps. Delivery may commit, push, open/merge the PR, close the issue, and clean the branch only after review has no unresolved scope or correctness findings.
+
+### Whole-Issue Execution Protocol
+
+For a multi-crate issue, the issue is an executable contract, not a source of
+general suggestions. Before implementation, create a surface map for every
+requirement:
+
+```text
+issue requirement -> current symbol/caller -> approved replacement -> proof
+```
+
+The map covers definitions, exports, constructors, conversions, fields, error
+variants, macros, registrations, tests, docs, manifests, and lifecycle edges.
+Work is complete only when every row has an approved replacement or an explicit
+deletion and proof at the same scope as the requirement.
+
+The following rules are mandatory:
+
+- Use the issue body and its latest correction/approval record as the only
+  specification. When records conflict, the newest explicit correction wins;
+  do not silently combine incompatible versions.
+- Implement only symbols and behavior named by the issue or required by an
+  approved replacement. A compiler error is evidence of a missing migration,
+  not permission to invent a wrapper, alias, compatibility method, error type,
+  registry, trait, or conversion.
+- A replacement must use the issue's stated domain value and owner. Renaming
+  an old symbol while preserving its old ownership, representation, lifecycle,
+  or boundary does not count as migration.
+- Do not widen a crate boundary to make a call compile. If a caller cannot use
+  the approved boundary, stop that slice and record the missing requirement
+  instead of exporting internal state.
+- Keep a change ledger while editing. Every changed file and symbol must map to
+  one issue row; unmapped edits are removed before review. Existing unrelated
+  dirty-worktree changes are preserved but are not claimed as issue work.
+- Verify each completed row with behavior and cleanup evidence: tests at the
+  owning seam, plus repository-wide searches for forbidden definitions,
+  imports, exports, calls, macro arguments, manifests, and documentation.
+  A narrow test or one search hit cannot prove a whole-issue requirement.
+- Before claiming completion, perform a requirement-by-requirement audit and
+  report missing, contradictory, or weak evidence. Never declare completion
+  from a passing subset of tests or a renamed legacy surface.
+- Verification is scoped to a coherent issue slice, not to an individual edit:
+  finish the complete definition/caller/test/cleanup set for that slice before
+  running `cargo check`, `cargo test`, or equivalent commands. Do not run a
+  check after each file or symbol change, and do not treat a check of a
+  half-migrated slice as evidence that the issue requirement is complete.
+
+### Design Review And Rule Capture
+
+Before changing a non-trivial issue, write the design in the issue's required
+format and make the boundary explicit:
+
+- list the source-of-truth symbol or VPP semantic, the current Hammer surface,
+  the approved replacement or deletion, the owning crate, callers, lifecycle,
+  and the proof required for that row;
+- identify the complete migration closure before editing: definitions,
+  exports, constructors, conversions, macros, registrations, callers, tests,
+  manifests, documentation, cleanup, and thread/worker ownership;
+- mark every statement as `project fact`, `issue requirement`, `explicit
+  approval`, or `inference requiring verification`. Inferences are not
+  implementation authority until verified against the issue, repository
+  contract, or vendored source;
+- include listener creation/deletion, connect/listen/accept/close/reset,
+  local-endpoint reference counting, deferred reclamation, event delivery,
+  migration, and main/worker initialization whenever those lifecycle edges
+  are in scope. Do not stop at the structs named in the issue summary;
+- state the thread model explicitly. The main/control thread must not acquire
+  ownership of data-plane worker state merely to make an API convenient.
+
+Do not implement one complained-about symbol at a time. Complete one coherent
+scope, including its callers and deletion audit, then run one scope-level
+verification. A failed check may identify migration work still missing, but it
+does not authorize adding an unapproved type, wrapper, alias, conversion,
+registry, or compatibility surface.
+
+Repeated corrections are candidates for repository skills only when the rule
+has a stable trigger, a bounded input/output contract, and a repeatable proof.
+Record the candidate in the issue or design review with its trigger, required
+inputs, produced artifact, and verification command before creating a new
+`SKILL.md`. Prefer extending an existing skill when the behavior belongs to an
+existing domain; do not create a skill as a substitute for reading the issue.
+
+At the end of a design review, report three categories separately: facts
+verified in the current repository, requirements taken from the tracked issue
+or its latest approval, and hypotheses that still require historical or
+vendored-source verification. Do not present an inference as a project fact.

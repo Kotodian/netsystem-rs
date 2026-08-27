@@ -14,8 +14,8 @@ use super::timers::{TcpTimerKind, TcpTimers};
 use super::{TcpConnection, TcpNodeError, enqueue_tcp_segment};
 use hammer_service::session::node::{SessionQueueNext, SessionQueueOutput};
 use hammer_service::session::runtime::{
-    SessionPacketizedTransport, SessionPacketizedTx, SessionTransport, SessionTransportId,
-    SessionWorker, TransportSendFlags, TransportSendParams, TxBatchBuffer,
+    SessionPacketizedTransport, SessionPacketizedTx, SessionTransport, SessionWorker,
+    TransportSendFlags, TransportSendParams, TxBatchBuffer,
 };
 const DEFAULT_TCP_CONNECTION_CAPACITY: usize = 1024;
 const TCP_APP_RX_MIN_FREE: usize = 4 << 10;
@@ -65,7 +65,9 @@ impl TcpWorker {
 
     #[inline]
     pub(crate) fn remove_connection(&mut self, index: u32) -> TcpConnection {
-        self.connections.remove(index)
+        self.connections
+            .remove(index)
+            .expect("TCP connection index remains live during removal")
     }
 
     #[cfg(test)]
@@ -158,7 +160,7 @@ impl TcpWorker {
 impl SessionTransport<u32> for TcpWorker {
     type Tx = SessionPacketizedTx;
 
-    const ID: SessionTransportId = SessionTransportId::new(1);
+    const ID: u8 = 1;
 
     fn app_rx_evt(
         &mut self,
