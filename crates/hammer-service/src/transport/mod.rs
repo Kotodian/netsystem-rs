@@ -10,7 +10,7 @@ use hammer_runtime::session::{
     SessionConnectEndpoint, SessionListenEndpoint, SessionStreamDirection,
 };
 use hammer_runtime::sync::SpinLock;
-use hammer_runtime::{Engine, RuntimeError, RuntimeResult};
+use hammer_runtime::{GlobalMain, RuntimeError, RuntimeResult};
 use thiserror::Error;
 
 pub mod congestion;
@@ -516,6 +516,6 @@ pub fn transport_vft(protocol: u8) -> Option<TransportVft> {
 }
 
 #[hammer_component_macros::init_function(name = "transport_main_init")]
-fn init_transport_main(_: &mut Engine) -> RuntimeResult<()> {
+fn init_transport_main(_: &mut GlobalMain) -> RuntimeResult<()> {
     TransportMain::init()
 }

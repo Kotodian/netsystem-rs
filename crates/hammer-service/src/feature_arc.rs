@@ -12,7 +12,7 @@ use arc_swap::ArcSwap;
 use hammer_core::data_plane::{BufferFrame, Index, NodeId};
 use hammer_runtime::RuntimeError;
 use hammer_runtime::node::NodeRuntime;
-use hammer_runtime::{DataPlaneRuntime, NodeResult, WorkerBarrier};
+use hammer_runtime::{DataPlaneMain, WorkerBarrier};
 
 use crate::opaque::NetworkOpaque;
 
@@ -234,7 +234,7 @@ impl FeatureArcStartHandle {
     #[inline]
     pub fn start_for_interface_or(
         &self,
-        runtime: &DataPlaneRuntime,
+        runtime: &DataPlaneMain,
         index: Index,
         interface_index: u32,
         default_next: u16,
@@ -246,7 +246,7 @@ impl FeatureArcStartHandle {
     #[inline]
     pub fn start_for_interface_or_with_result(
         &self,
-        runtime: &DataPlaneRuntime,
+        runtime: &DataPlaneMain,
         index: Index,
         interface_index: u32,
         default_next: u16,
@@ -274,7 +274,7 @@ impl FeatureArcStartHandle {
 
     /// Advance Feature configuration progress exactly once for this Index.
     #[inline]
-    pub fn next_feature_slot(&self, runtime: &DataPlaneRuntime, index: Index) -> u16 {
+    pub fn next_feature_slot(&self, runtime: &DataPlaneMain, index: Index) -> u16 {
         let state = self.inner.load();
         let config_index = feature_config_index(runtime, index);
         let entry = state
@@ -287,14 +287,14 @@ impl FeatureArcStartHandle {
 }
 
 #[inline(always)]
-fn feature_config_index(runtime: &DataPlaneRuntime, index: Index) -> u32 {
+fn feature_config_index(runtime: &DataPlaneMain, index: Index) -> u32 {
     let buffer = runtime.get_buffer(index).expect("buffer");
     let network = unsafe { transmute::<_, &NetworkOpaque>(buffer.opaque()) };
     network.feature_config_index()
 }
 
 #[inline(always)]
-fn set_feature_config_index(runtime: &DataPlaneRuntime, index: Index, config: u32) {
+fn set_feature_config_index(runtime: &DataPlaneMain, index: Index, config: u32) {
     let mut buffer = runtime.get_buffer_mut(index).expect("buffer mut");
     let network = unsafe { transmute::<_, &mut NetworkOpaque>(buffer.opaque_mut()) };
     network.set_feature_config_index(config);
@@ -303,7 +303,7 @@ fn set_feature_config_index(runtime: &DataPlaneRuntime, index: Index, config: u3
 #[inline(always)]
 pub fn next_feature_slot_for_index(
     handle: &FeatureArcStartHandle,
-    runtime: &DataPlaneRuntime,
+    runtime: &DataPlaneMain,
     index: Index,
 ) -> u16 {
     handle.next_feature_slot(runtime, index)
@@ -312,15 +312,15 @@ pub fn next_feature_slot_for_index(
 #[inline(always)]
 pub fn next_feature_frame(
     handle: &FeatureArcStartHandle,
-    runtime: &DataPlaneRuntime,
+    runtime: &DataPlaneMain,
     frame: &mut BufferFrame,
-) -> NodeResult {
+) -> () {
     let mut nexts = Vec::with_capacity(frame.len());
-    for index in frame.iter_indices() {
+    for index in frame.indices() {
         nexts.push(handle.next_feature_slot(runtime, *index));
     }
     runtime.enqueue_to_next(frame, nexts.as_slice());
-    NodeResult::drop()
+    ()
 }
 
 impl<A: FeatureArcSpec> Default for FeatureArcControl<A> {

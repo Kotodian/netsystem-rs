@@ -11,8 +11,8 @@ use hammer_infra::checksum::internet_checksum;
 use hammer_infra::pool::Pool;
 use hammer_runtime::sync::SpinLock;
 use hammer_runtime::{
-    DataPlaneRuntime, DataWorkerId, Node, NodeProcessFn, NodeResult, NodeRuntimeData,
-    TraceFormatter, add_packet_trace, format_packet_trace,
+    DataPlaneMain, DataWorkerId, Node, NodeProcessFn, NodeRuntimeData, TraceFormatter,
+    add_packet_trace, format_packet_trace,
 };
 use hammer_runtime::{RuntimeError, RuntimeResult};
 
@@ -201,27 +201,27 @@ impl IpReassemblyMain {
         Arc::new(Self { per_thread_data })
     }
 
-    fn worker_slot(runtime: &DataPlaneRuntime) -> usize {
+    fn worker_slot(runtime: &DataPlaneMain) -> usize {
         runtime.thread_index().saturating_sub(1) as usize
     }
 
-    fn expire_all(&self, runtime: &DataPlaneRuntime, now: Instant) -> usize {
+    fn expire_all(&self, runtime: &DataPlaneMain, now: Instant) -> usize {
         self.per_thread_data
             .iter()
             .map(|worker| worker.lock().expire(runtime, now))
             .sum()
     }
 
-    fn expire_worker(&self, runtime: &DataPlaneRuntime, now: Instant) -> usize {
+    fn expire_worker(&self, runtime: &DataPlaneMain, now: Instant) -> usize {
         self.per_thread_data
             .get(Self::worker_slot(runtime))
             .map(|worker| worker.lock().expire(runtime, now))
             .unwrap_or(0)
     }
 
-    fn process_frame(&self, runtime: &DataPlaneRuntime, frame: &mut BufferFrame) -> NodeResult {
+    fn process_frame(&self, runtime: &DataPlaneMain, frame: &mut BufferFrame) -> () {
         let Some(worker) = self.per_thread_data.get(Self::worker_slot(runtime)) else {
-            return NodeResult::drop();
+            return ();
         };
         worker.lock().process_frame(runtime, frame, Instant::now())
     }
@@ -235,7 +235,7 @@ impl IpReassemblyMain {
 )]
 fn configure_ip_reassembly(
     config: NetworkIpConfig,
-    engine: &mut hammer_runtime::Engine,
+    engine: &mut hammer_runtime::GlobalMain,
 ) -> RuntimeResult<()> {
     config.ip.reassembly.validate()?;
     let main = IpReassemblyMain::new(engine.configured_worker_count(), &config.ip.reassembly);
@@ -319,7 +319,7 @@ impl IpReassemblyNode {
     }
 
     #[inline]
-    pub fn expire(&mut self, runtime: &DataPlaneRuntime, now: Instant) -> usize {
+    pub fn expire(&mut self, runtime: &DataPlaneMain, now: Instant) -> usize {
         IP_REASSEMBLY_MAIN
             .load_full()
             .map(|main| main.expire_worker(runtime, now))
@@ -327,7 +327,7 @@ impl IpReassemblyNode {
     }
 }
 
-fn register_ip_reassembly(runtime: &DataPlaneRuntime) -> RuntimeResult<NodeId> {
+fn register_ip_reassembly(runtime: &DataPlaneMain) -> RuntimeResult<NodeId> {
     runtime.nodes().try_register_internal_with_next_names(
         IpReassemblyNode::new(),
         &IpReassemblyNext::NEXT_NAMES,
@@ -347,12 +347,12 @@ async fn ip_reassembly_expire_process(
         let _ = context
             .wait_for_event_or_clock(REASSEMBLY_EXPIRE_WALK_INTERVAL)
             .await;
-        let _ = main.expire_all(context.data_plane_runtime(), Instant::now());
+        let _ = main.expire_all(context.data_plane_main(), Instant::now());
     }
 }
 
 impl IpReassemblyWorker {
-    fn expire(&mut self, runtime: &DataPlaneRuntime, now: Instant) -> usize {
+    fn expire(&mut self, runtime: &DataPlaneMain, now: Instant) -> usize {
         let timeout = self.timeout;
         let capacity = self.contexts.capacity();
         let walk_len = self
@@ -389,10 +389,10 @@ impl IpReassemblyWorker {
 
     fn process_frame(
         &mut self,
-        runtime: &DataPlaneRuntime,
+        runtime: &DataPlaneMain,
         frame: &mut BufferFrame,
         now: Instant,
-    ) -> NodeResult {
+    ) -> () {
         let input_len = frame.len();
         debug_assert!(input_len <= DEFAULT_BUFFER_FRAME_CAPACITY);
         let mut inputs = [core::mem::MaybeUninit::<Index>::uninit(); DEFAULT_BUFFER_FRAME_CAPACITY];
@@ -410,12 +410,12 @@ impl IpReassemblyWorker {
         if out_len != 0 {
             runtime.enqueue_to_next(frame, &nexts[..out_len]);
         }
-        NodeResult::drop()
+        ()
     }
 
     #[inline]
     fn emit_local(
-        runtime: &DataPlaneRuntime,
+        runtime: &DataPlaneMain,
         frame: &mut BufferFrame,
         nexts: &mut [u16; DEFAULT_BUFFER_FRAME_CAPACITY],
         out_len: &mut usize,
@@ -434,7 +434,7 @@ impl IpReassemblyWorker {
 
     fn process_index(
         &mut self,
-        runtime: &DataPlaneRuntime,
+        runtime: &DataPlaneMain,
         index: Index,
         now: Instant,
         out_frame: &mut BufferFrame,
@@ -729,8 +729,8 @@ impl IpReassemblyWorker {
 
 impl Node for IpReassemblyNode {
     #[inline(always)]
-    fn process(&mut self, _runtime: &DataPlaneRuntime, _frame: &mut BufferFrame) -> NodeResult {
-        NodeResult::drop()
+    fn process(&mut self, _runtime: &DataPlaneMain, _frame: &mut BufferFrame) -> () {
+        ()
     }
 
     #[inline]
@@ -750,14 +750,14 @@ impl Node for IpReassemblyNode {
 }
 
 fn ip_reassembly_process(
-    runtime: &DataPlaneRuntime,
+    runtime: &DataPlaneMain,
     _data: NodeRuntimeData,
     frame: &mut BufferFrame,
-) -> NodeResult {
+) -> () {
     IP_REASSEMBLY_MAIN
         .load_full()
         .map(|main| main.process_frame(runtime, frame))
-        .unwrap_or_else(NodeResult::drop)
+        .unwrap_or(())
 }
 
 struct FragmentContext {
@@ -785,7 +785,7 @@ impl FragmentContext {
     #[inline]
     fn insert_fragment(
         &mut self,
-        runtime: &DataPlaneRuntime,
+        runtime: &DataPlaneMain,
         index: Index,
         fragment: ParsedIpFragment,
         now: Instant,
@@ -862,7 +862,7 @@ impl FragmentContext {
     #[inline]
     fn assemble(
         &mut self,
-        runtime: &DataPlaneRuntime,
+        runtime: &DataPlaneMain,
         total_payload_len: usize,
     ) -> RuntimeResult<ReassemblyInsert> {
         match self.version {
@@ -874,7 +874,7 @@ impl FragmentContext {
     #[inline]
     fn assemble_ipv4_chain(
         &mut self,
-        runtime: &DataPlaneRuntime,
+        runtime: &DataPlaneMain,
         total_payload_len: usize,
     ) -> RuntimeResult<ReassemblyInsert> {
         let first_offset = self.first_fragment_offset()?;
@@ -923,7 +923,7 @@ impl FragmentContext {
     #[inline]
     fn assemble_ipv6_chain(
         &mut self,
-        runtime: &DataPlaneRuntime,
+        runtime: &DataPlaneMain,
         total_payload_len: usize,
     ) -> RuntimeResult<ReassemblyInsert> {
         let first_offset = self.first_fragment_offset()?;
@@ -982,7 +982,7 @@ impl FragmentContext {
     }
 
     #[inline]
-    fn drop_fragments(self, runtime: &DataPlaneRuntime) -> RuntimeResult<()> {
+    fn drop_fragments(self, runtime: &DataPlaneMain) -> RuntimeResult<()> {
         let mut owner = runtime.buffers().get_next_frame(NodeId::new(0))?;
         for fragment in self.fragments {
             if owner.push_index(fragment.index).is_err() {
@@ -1010,7 +1010,7 @@ enum ReassemblyInsert {
 }
 
 #[inline(always)]
-fn refresh_metadata(runtime: &DataPlaneRuntime, index: Index) -> RuntimeResult<()> {
+fn refresh_metadata(runtime: &DataPlaneMain, index: Index) -> RuntimeResult<()> {
     let buffer = runtime.get_buffer(index)?;
     let network = unsafe { transmute::<_, &NetworkOpaque>(buffer.opaque()) };
     let parsed = ip_header(buffer.current(), network.packet_cursor())?;
@@ -1032,7 +1032,7 @@ fn refresh_metadata(runtime: &DataPlaneRuntime, index: Index) -> RuntimeResult<(
 
 #[inline(always)]
 fn trim_fragment_payload_chain(
-    runtime: &DataPlaneRuntime,
+    runtime: &DataPlaneMain,
     fragment: ReassemblyFragment,
 ) -> RuntimeResult<()> {
     let payload_len = fragment.end - fragment.start;

@@ -5,9 +5,7 @@ use hammer_core::data_plane::{
     BufferFrame, DEFAULT_BUFFER_FRAME_CAPACITY, Index, NodeId, NodeNext,
 };
 use hammer_runtime::RuntimeResult;
-use hammer_runtime::{
-    DataPlaneRuntime, Node, NodeProcessFn, NodeResult, NodeRuntimeData, RuntimeError,
-};
+use hammer_runtime::{DataPlaneMain, Node, NodeProcessFn, NodeRuntimeData};
 
 use super::connection::TcpConnection;
 use super::segment::{TcpSegment, tcp_packet};
@@ -36,7 +34,7 @@ pub struct TcpListenNode {
     process: NodeProcessFn,
 }
 
-pub fn register_tcp_listen(runtime: &DataPlaneRuntime) -> RuntimeResult<NodeId> {
+pub fn register_tcp_listen(runtime: &DataPlaneMain) -> RuntimeResult<NodeId> {
     if let Some(node) = runtime.nodes().node_by_name("tcp-listen") {
         return Ok(node);
     }
@@ -48,7 +46,7 @@ pub fn register_tcp_listen(runtime: &DataPlaneRuntime) -> RuntimeResult<NodeId> 
 
 impl Node for TcpListenNode {
     #[inline(always)]
-    fn process(&mut self, runtime: &DataPlaneRuntime, frame: &mut BufferFrame) -> NodeResult {
+    fn process(&mut self, runtime: &DataPlaneMain, frame: &mut BufferFrame) -> () {
         (self.process)(runtime, NodeRuntimeData::empty(), frame)
     }
 
@@ -59,22 +57,22 @@ impl Node for TcpListenNode {
 }
 
 pub(crate) fn tcp_listen_process(
-    runtime: &DataPlaneRuntime,
+    runtime: &DataPlaneMain,
     _: NodeRuntimeData,
     frame: &mut BufferFrame,
-) -> NodeResult {
+) -> () {
     let Some(main) = crate::TCP_MAIN.get() else {
-        return NodeResult::drop();
+        return ();
     };
     tcp_listen_process_frame(runtime, frame, main)
 }
 
 #[inline]
 fn tcp_listen_process_frame(
-    runtime: &DataPlaneRuntime,
+    runtime: &DataPlaneMain,
     frame: &mut BufferFrame,
     main: &crate::TcpMain,
-) -> NodeResult {
+) -> () {
     let input_len = frame.len();
     debug_assert!(input_len <= DEFAULT_BUFFER_FRAME_CAPACITY);
     let mut inputs = [core::mem::MaybeUninit::<Index>::uninit(); DEFAULT_BUFFER_FRAME_CAPACITY];
@@ -101,12 +99,12 @@ fn tcp_listen_process_frame(
     if out_len != 0 {
         runtime.enqueue_to_next(frame, &nexts[..out_len]);
     }
-    NodeResult::drop()
+    ()
 }
 
 #[inline]
 fn emit_local(
-    runtime: &DataPlaneRuntime,
+    runtime: &DataPlaneMain,
     frame: &mut BufferFrame,
     nexts: &mut [u16; DEFAULT_BUFFER_FRAME_CAPACITY],
     out_len: &mut usize,
@@ -125,7 +123,7 @@ fn emit_local(
 }
 
 fn tcp_listen_index(
-    runtime: &DataPlaneRuntime,
+    runtime: &DataPlaneMain,
     index: Index,
     main: &crate::TcpMain,
     out_frame: &mut BufferFrame,
@@ -214,7 +212,7 @@ impl<'a> TcpListener<'a> {
 
     fn handle_packet(
         &mut self,
-        runtime: &DataPlaneRuntime,
+        runtime: &DataPlaneMain,
         index: Index,
         packet: &TcpPacket,
     ) -> RuntimeResult<(Option<TcpSegment>, Option<u32>)> {
@@ -231,7 +229,7 @@ impl<'a> TcpListener<'a> {
 
     fn issue_challenge(
         &mut self,
-        runtime: &DataPlaneRuntime,
+        runtime: &DataPlaneMain,
         index: Index,
         packet: &TcpPacket,
     ) -> RuntimeResult<(Option<TcpSegment>, Option<u32>)> {
@@ -321,7 +319,7 @@ impl<'a> TcpListener<'a> {
 
     fn accept_fast_open(
         &mut self,
-        runtime: &DataPlaneRuntime,
+        runtime: &DataPlaneMain,
         index: Index,
         packet: &TcpPacket,
     ) -> RuntimeResult<(Option<TcpSegment>, Option<u32>)> {

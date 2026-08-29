@@ -3,7 +3,7 @@ use core::hash::Hasher;
 use hammer_core::data_plane::{BufferFrame, BufferPacketCursor, Index, NodeId, NodeState};
 use hammer_infra::checksum::InternetChecksum;
 use hammer_runtime::RuntimeResult;
-use hammer_runtime::{DataPlaneRuntime, Node, NodeProcessFn, NodeResult, NodeRuntimeData};
+use hammer_runtime::{DataPlaneMain, Node, NodeProcessFn, NodeRuntimeData};
 use hammer_service::session::node::SessionQueueNode;
 
 use super::{TcpOutputError, read_tcp_egress_endpoints};
@@ -30,7 +30,7 @@ pub enum TcpOutputNext {
 #[derive(Clone, Copy)]
 pub struct TcpOutputNode;
 
-pub fn register_tcp_output(runtime: &DataPlaneRuntime) -> RuntimeResult<NodeId> {
+pub fn register_tcp_output(runtime: &DataPlaneMain) -> RuntimeResult<NodeId> {
     if let Some(node) = runtime.nodes().node_by_name(TcpOutputNode::NODE_NAME) {
         return Ok(node);
     }
@@ -50,7 +50,7 @@ pub fn register_tcp_output(runtime: &DataPlaneRuntime) -> RuntimeResult<NodeId> 
 
 impl Node for TcpOutputNode {
     #[inline(always)]
-    fn process(&mut self, runtime: &DataPlaneRuntime, frame: &mut BufferFrame) -> NodeResult {
+    fn process(&mut self, runtime: &DataPlaneMain, frame: &mut BufferFrame) -> () {
         tcp_output_node_process_frame::<1>(runtime, frame)
     }
 
@@ -66,33 +66,33 @@ impl Node for TcpOutputNode {
 }
 
 fn tcp_output_node_process(
-    runtime: &DataPlaneRuntime,
+    runtime: &DataPlaneMain,
     _: NodeRuntimeData,
     frame: &mut BufferFrame,
-) -> NodeResult {
+) -> () {
     tcp_output_node_process_frame::<1>(runtime, frame)
 }
 
 #[hammer_component_macros::node_function(node = TcpOutputNode)]
 fn tcp_output_node_process_simd<const SIMD_BYTES: usize>(
-    runtime: &DataPlaneRuntime,
+    runtime: &DataPlaneMain,
     _: NodeRuntimeData,
     frame: &mut BufferFrame,
-) -> NodeResult {
+) -> () {
     tcp_output_node_process_frame::<SIMD_BYTES>(runtime, frame)
 }
 
 fn tcp_output_node_process_frame<const SIMD_BYTES: usize>(
-    runtime: &DataPlaneRuntime,
+    runtime: &DataPlaneMain,
     frame: &mut BufferFrame,
-) -> NodeResult {
+) -> () {
     hammer_runtime::process_frame!(runtime, frame, |index| {
         tcp_output_next_for_index::<SIMD_BYTES>(runtime, index).unwrap_or(TcpOutputNext::Drop)
     })
 }
 
 fn tcp_output_next_for_index<const SIMD_BYTES: usize>(
-    runtime: &DataPlaneRuntime,
+    runtime: &DataPlaneMain,
     index: Index,
 ) -> RuntimeResult<TcpOutputNext> {
     let buffer = runtime.get_buffer(index)?;
@@ -146,7 +146,7 @@ fn tcp_output_next_for_index<const SIMD_BYTES: usize>(
 
 /// VPP `tcp_output_push_ip` → `vlib_buffer_push_ip4(..., is_df=1)`.
 fn tcp_output_push_ipv4<const SIMD_BYTES: usize>(
-    runtime: &DataPlaneRuntime,
+    runtime: &DataPlaneMain,
     index: Index,
     src: Ipv4Addr,
     dst: Ipv4Addr,
@@ -186,7 +186,7 @@ fn tcp_output_push_ipv4<const SIMD_BYTES: usize>(
 
 /// VPP `tcp_output_push_ip` IPv6 path (`vlib_buffer_push_ip6_custom`).
 fn tcp_output_push_ipv6<const SIMD_BYTES: usize>(
-    runtime: &DataPlaneRuntime,
+    runtime: &DataPlaneMain,
     index: Index,
     src: Ipv6Addr,
     dst: Ipv6Addr,
@@ -224,7 +224,7 @@ fn tcp_output_push_ipv6<const SIMD_BYTES: usize>(
 }
 
 fn set_tcp_checksum<const SIMD_BYTES: usize>(
-    runtime: &DataPlaneRuntime,
+    runtime: &DataPlaneMain,
     index: Index,
     mut checksum: InternetChecksum<SIMD_BYTES>,
 ) -> RuntimeResult<()> {

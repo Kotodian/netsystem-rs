@@ -7,8 +7,8 @@ use std::sync::{Arc, Mutex};
 use hammer_core::data_plane::{BufferFrame, DEFAULT_BUFFER_FRAME_CAPACITY, NodeId, NodeState};
 use hammer_runtime::sync::SpinLock;
 use hammer_runtime::{
-    DataPlaneRuntime, DataWorkerId, File, FileFunctions, Node, NodeProcessFn, NodeResult,
-    NodeRuntimeData, TraceFormatter, add_packet_trace, format_packet_trace,
+    DataPlaneMain, DataWorkerId, File, FileFunctions, Node, NodeProcessFn, NodeRuntimeData,
+    TraceFormatter, add_packet_trace, format_packet_trace,
 };
 use hammer_runtime::{RuntimeError, RuntimeResult};
 
@@ -211,7 +211,7 @@ impl TunControl {
 
     fn take_worker_runtime(
         &self,
-        engine: &mut hammer_runtime::Engine,
+        engine: &mut hammer_runtime::DataPlaneMain,
         worker: DataWorkerId,
         tun_input: NodeId,
     ) -> Result<TunWorkerRuntime, TunError> {
@@ -264,8 +264,8 @@ impl TunControl {
                     ..FileFunctions::default()
                 },
             );
-            file.set_polling_thread_index(engine.runtime.thread_index());
-            let file_index = engine.file_main_mut().add(file)?;
+            file.set_polling_thread_index(engine.thread_index());
+            let file_index = engine.file_main().add(file)?;
             if let Some(rx_queue) = rx_queue {
                 worker_rx_queues.push(TunRxQueue {
                     queue: rx_queue,
@@ -307,20 +307,22 @@ fn configure_tun_interfaces(tun_cfg: TunPluginConfig) -> RuntimeResult<Arc<Inter
 #[hammer_component_macros::config_function(name = "tun_config", section = "plugin.tun")]
 fn configure_tun(
     tun_cfg: TunPluginConfig,
-    engine: &mut hammer_runtime::Engine,
+    engine: &mut hammer_runtime::GlobalMain,
     device_main: Arc<DeviceMain>,
     interface_main: Arc<InterfaceControlPlane>,
 ) -> RuntimeResult<Arc<TunControl>> {
     (|| -> Result<Arc<TunControl>, TunError> {
         let control = TunControl::new(device_main);
         let tun_input = engine
-            .runtime
+            .data_plane_main()
+            .nodes()
             .node_by_name(TunInputDriverNode::NODE_NAME)
             .ok_or(TunError::GraphNodeMissing {
                 name: TunInputDriverNode::NODE_NAME,
             })?;
         let tun_output = engine
-            .runtime
+            .data_plane_main()
+            .nodes()
             .node_by_name(TunOutputDriverNode::NODE_NAME)
             .ok_or(TunError::GraphNodeMissing {
                 name: TunOutputDriverNode::NODE_NAME,
@@ -353,20 +355,19 @@ fn configure_tun(
 
 #[hammer_component_macros::worker_init_function(name = "tun_worker_init")]
 fn configure_tun_worker(
-    engine: &mut hammer_runtime::Engine,
+    engine: &mut hammer_runtime::DataPlaneMain,
     control: Arc<TunControl>,
 ) -> RuntimeResult<()> {
     (|| -> Result<(), TunError> {
         let worker = engine.data_worker_id()?;
-        let tun_input = engine
-            .runtime
-            .node_by_name(TunInputDriverNode::NODE_NAME)
-            .ok_or(TunError::GraphNodeMissing {
+        let tun_input = engine.node_by_name(TunInputDriverNode::NODE_NAME).ok_or(
+            TunError::GraphNodeMissing {
                 name: TunInputDriverNode::NODE_NAME,
-            })?;
+            },
+        )?;
         control.device_main.install_worker_output_runtime(worker);
         let runtime = control.take_worker_runtime(engine, worker, tun_input)?;
-        engine.runtime.nodes().set_node_state(
+        engine.nodes().set_node_state(
             tun_input,
             if runtime.has_rx_queues() {
                 NodeState::Interrupt
@@ -410,8 +411,8 @@ pub struct TunInputDriverNode;
 
 impl Node for TunInputDriverNode {
     #[inline(always)]
-    fn process(&mut self, _: &DataPlaneRuntime, _: &mut BufferFrame) -> NodeResult {
-        NodeResult::drop()
+    fn process(&mut self, _: &DataPlaneMain, _: &mut BufferFrame) -> () {
+        ()
     }
 
     #[inline]
@@ -435,8 +436,8 @@ pub struct TunOutputDriverNode;
 
 impl Node for TunOutputDriverNode {
     #[inline(always)]
-    fn process(&mut self, _: &DataPlaneRuntime, _: &mut BufferFrame) -> NodeResult {
-        NodeResult::drop()
+    fn process(&mut self, _: &DataPlaneMain, _: &mut BufferFrame) -> () {
+        ()
     }
 
     #[inline]
@@ -450,11 +451,7 @@ impl Node for TunOutputDriverNode {
     }
 }
 
-fn tun_input_process(
-    runtime: &DataPlaneRuntime,
-    _: NodeRuntimeData,
-    frame: &mut BufferFrame,
-) -> NodeResult {
+fn tun_input_process(runtime: &DataPlaneMain, _: NodeRuntimeData, frame: &mut BufferFrame) -> () {
     TUN_WORKER_RUNTIME.with(|worker| {
         let mut worker = worker.borrow_mut();
         let worker = worker
@@ -464,11 +461,7 @@ fn tun_input_process(
     })
 }
 
-fn tun_output_process(
-    runtime: &DataPlaneRuntime,
-    _: NodeRuntimeData,
-    frame: &mut BufferFrame,
-) -> NodeResult {
+fn tun_output_process(runtime: &DataPlaneMain, _: NodeRuntimeData, frame: &mut BufferFrame) -> () {
     TUN_WORKER_RUNTIME.with(|worker| {
         let mut worker = worker.borrow_mut();
         let worker = worker
@@ -484,32 +477,28 @@ impl TunWorkerRuntime {
         !self.rx_queues.is_empty()
     }
 
-    fn process_input(&mut self, runtime: &DataPlaneRuntime, frame: &mut BufferFrame) -> NodeResult {
+    fn process_input(&mut self, runtime: &DataPlaneMain, frame: &mut BufferFrame) -> () {
         if let Err(error) = self.receive_packets(runtime, frame) {
             tracing::error!(%error, "TUN receive failed");
         }
         fanout_tun_input(runtime, frame);
-        NodeResult::drop()
+        ()
     }
 
-    fn process_output(
-        &mut self,
-        runtime: &DataPlaneRuntime,
-        frame: &mut BufferFrame,
-    ) -> NodeResult {
-        let pending = frame.pending_len();
-        for index in frame.pending_indices() {
+    fn process_output(&mut self, runtime: &DataPlaneMain, frame: &mut BufferFrame) -> () {
+        let pending = frame.len();
+        for index in frame.indices() {
             let _ = add_packet_trace!(runtime, *index, TunOutputTrace { pending },);
             if let Err(error) = self.send_packet(runtime, *index) {
                 tracing::error!(%error, ?index, "TUN transmit failed");
             }
         }
-        NodeResult::drop()
+        ()
     }
 
     fn receive_packets(
         &mut self,
-        runtime: &DataPlaneRuntime,
+        runtime: &DataPlaneMain,
         frame: &mut BufferFrame,
     ) -> Result<(), TunError> {
         let mut refill_pending = false;
@@ -519,7 +508,7 @@ impl TunWorkerRuntime {
             }
             queue.pending = false;
             let mut drained = false;
-            while frame.remaining_capacity() > 0 {
+            while frame.len() < frame.capacity() {
                 let index = runtime.alloc_index()?;
                 let received = (|| {
                     let mut buffer = runtime.get_buffer_mut(index)?;
@@ -648,7 +637,7 @@ impl TunWorkerRuntime {
 
     fn send_packet(
         &mut self,
-        runtime: &DataPlaneRuntime,
+        runtime: &DataPlaneMain,
         index: hammer_core::data_plane::Index,
     ) -> Result<(), TunError> {
         let interface_index = runtime.get_buffer(index).map(|buffer| {
@@ -729,14 +718,14 @@ impl TunWorkerRuntime {
     }
 }
 
-fn fanout_tun_input(runtime: &DataPlaneRuntime, frame: &mut BufferFrame) {
-    let count = frame.pending_len();
+fn fanout_tun_input(runtime: &DataPlaneMain, frame: &mut BufferFrame) {
+    let count = frame.len();
     if count == 0 {
         return;
     }
     debug_assert!(count <= DEFAULT_BUFFER_FRAME_CAPACITY);
     let mut nexts = [DeviceInputNext::Drop; DEFAULT_BUFFER_FRAME_CAPACITY];
-    for (next, index) in nexts.iter_mut().zip(frame.pending_indices()) {
+    for (next, index) in nexts.iter_mut().zip(frame.indices()) {
         *next = match runtime
             .get_buffer(*index)
             .ok()

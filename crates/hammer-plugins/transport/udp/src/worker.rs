@@ -9,8 +9,8 @@ use hammer_infra::pool::Pool;
 use hammer_infra::thread_owned::{ThreadOwned, ThreadOwnedError};
 use hammer_runtime::app::{SessionDgramHeader, SessionHandle};
 use hammer_runtime::{
-    DataPlaneRuntime, DataWorkerId, Engine, NodeRuntimeData, RuntimeError, RuntimeResult,
-    SessionConnectEndpoint, SessionListenEndpoint, with_data_plane_runtime,
+    DataPlaneMain, DataWorkerId, GlobalMain, NodeRuntimeData, RuntimeError, RuntimeResult,
+    SessionConnectEndpoint, SessionListenEndpoint, with_data_plane_main,
 };
 use hammer_service::session::SessionQueueNext;
 use hammer_service::session::node::{SessionQueueNode, SessionQueueOutput};
@@ -143,7 +143,7 @@ impl UdpMain {
 
     fn with_worker<R>(
         &self,
-        runtime: &DataPlaneRuntime,
+        runtime: &DataPlaneMain,
         operation: impl FnOnce(&mut SessionWorker, &mut UdpWorker) -> RuntimeResult<R>,
     ) -> RuntimeResult<R> {
         session_main().with_worker_mut(runtime, |sessions| {
@@ -161,7 +161,7 @@ impl UdpMain {
 
     pub(crate) fn deliver_datagram(
         &self,
-        runtime: &DataPlaneRuntime,
+        runtime: &DataPlaneMain,
         index: BufferIndex,
         local: SocketAddr,
         remote: SocketAddr,
@@ -357,7 +357,7 @@ impl UdpWorker {
     fn deliver_datagram(
         &mut self,
         sessions: &mut SessionWorker,
-        runtime: &DataPlaneRuntime,
+        runtime: &DataPlaneMain,
         index: BufferIndex,
         local: SocketAddr,
         remote: SocketAddr,
@@ -492,7 +492,7 @@ impl UdpWorker {
     fn publish_migration_reply(
         &mut self,
         sessions: &SessionWorker,
-        runtime: &DataPlaneRuntime,
+        runtime: &DataPlaneMain,
         reply: SessionSwitchPoolReply,
     ) {
         if let Err(reply) = sessions.push_session_switch_pool_reply(runtime, reply) {
@@ -503,7 +503,7 @@ impl UdpWorker {
     fn publish_migration_completion(
         &mut self,
         sessions: &SessionWorker,
-        runtime: &DataPlaneRuntime,
+        runtime: &DataPlaneMain,
         completion: SessionSwitchPoolCompletion,
     ) {
         if let Err(completion) = sessions.push_session_switch_pool_completion(runtime, completion) {
@@ -514,7 +514,7 @@ impl UdpWorker {
     fn publish_migration_closed(
         &mut self,
         sessions: &SessionWorker,
-        runtime: &DataPlaneRuntime,
+        runtime: &DataPlaneMain,
         closed: SessionSwitchPoolClosed,
     ) {
         if let Err(closed) = sessions.push_session_switch_pool_closed(runtime, closed) {
@@ -524,7 +524,7 @@ impl UdpWorker {
 
     fn handoff_migration_datagram(
         &self,
-        runtime: &DataPlaneRuntime,
+        runtime: &DataPlaneMain,
         reply: SessionSwitchPoolReply,
     ) -> Result<(), SessionSwitchPoolReply> {
         let worker = if reply.status == SessionSwitchPoolStatus::Rejected {
@@ -545,7 +545,7 @@ impl UdpWorker {
 
     fn handoff_migration_datagram_or_drop(
         &self,
-        runtime: &DataPlaneRuntime,
+        runtime: &DataPlaneMain,
         reply: SessionSwitchPoolReply,
     ) {
         if let Err(reply) = self.handoff_migration_datagram(runtime, reply) {
@@ -558,7 +558,7 @@ impl UdpWorker {
     fn process_migration_reply(
         &mut self,
         sessions: &mut SessionWorker,
-        runtime: &DataPlaneRuntime,
+        runtime: &DataPlaneMain,
         mut reply: SessionSwitchPoolReply,
     ) -> Result<(), SessionSwitchPoolReply> {
         if reply.status == SessionSwitchPoolStatus::Rejected {
@@ -636,7 +636,7 @@ impl UdpWorker {
     fn process_migration_completion(
         &mut self,
         sessions: &mut SessionWorker,
-        runtime: &DataPlaneRuntime,
+        runtime: &DataPlaneMain,
         completion: SessionSwitchPoolCompletion,
     ) -> bool {
         if completion.status != SessionSwitchPoolCompletionStatus::Accepted {
@@ -711,7 +711,7 @@ impl UdpWorker {
         sessions.remove_migrated_session(session_id).is_ok()
     }
 
-    fn drain_migration_closed(&mut self, sessions: &mut SessionWorker, runtime: &DataPlaneRuntime) {
+    fn drain_migration_closed(&mut self, sessions: &mut SessionWorker, runtime: &DataPlaneMain) {
         while let Some(closed) = self.session_switch_pool_closed.pop_front() {
             if let Err(closed) = sessions.push_session_switch_pool_closed(runtime, closed) {
                 self.session_switch_pool_closed.push_front(closed);
@@ -726,7 +726,7 @@ impl UdpWorker {
         }
     }
 
-    fn drop_migration_datagram(runtime: &DataPlaneRuntime, dgram: SessionDgramArgs) {
+    fn drop_migration_datagram(runtime: &DataPlaneMain, dgram: SessionDgramArgs) {
         runtime
             .buffers()
             .drop_index_owned_with_trace(dgram.index, |_| {});
@@ -735,7 +735,7 @@ impl UdpWorker {
     fn drain_migration_shutdown_requests(
         &mut self,
         sessions: &SessionWorker,
-        runtime: &DataPlaneRuntime,
+        runtime: &DataPlaneMain,
     ) {
         while let Some(args) = sessions.pop_session_migrate_request() {
             let _ = sessions.cancel_thread_migration(args.old_sh, args.tuple);
@@ -746,7 +746,7 @@ impl UdpWorker {
     fn drain_migration_shutdown_replies(
         &mut self,
         sessions: &SessionWorker,
-        runtime: &DataPlaneRuntime,
+        runtime: &DataPlaneMain,
     ) {
         while let Some(reply) = self.session_switch_pool_replies.pop_front() {
             let _ = sessions.cancel_thread_migration(reply.old_sh, reply.tuple);
@@ -758,11 +758,7 @@ impl UdpWorker {
         }
     }
 
-    fn drain_migration_shutdown(
-        &mut self,
-        sessions: &mut SessionWorker,
-        runtime: &DataPlaneRuntime,
-    ) {
+    fn drain_migration_shutdown(&mut self, sessions: &mut SessionWorker, runtime: &DataPlaneMain) {
         sessions.wait_session_migration_shutdown_phase();
         self.drain_migration_shutdown_requests(sessions, runtime);
         self.drain_migration_shutdown_replies(sessions, runtime);
@@ -781,7 +777,7 @@ impl UdpWorker {
     fn drain_migration_completions(
         &mut self,
         sessions: &mut SessionWorker,
-        runtime: &DataPlaneRuntime,
+        runtime: &DataPlaneMain,
     ) {
         let local_count = self.session_switch_pool_completions.len();
         for _ in 0..local_count {
@@ -799,11 +795,7 @@ impl UdpWorker {
         }
     }
 
-    fn drain_migration_replies(
-        &mut self,
-        sessions: &mut SessionWorker,
-        runtime: &DataPlaneRuntime,
-    ) {
+    fn drain_migration_replies(&mut self, sessions: &mut SessionWorker, runtime: &DataPlaneMain) {
         while let Some(reply) = self.session_switch_pool_replies.pop_front() {
             if let Err(reply) = sessions.push_session_switch_pool_reply(runtime, reply) {
                 self.session_switch_pool_replies.push_front(reply);
@@ -818,11 +810,7 @@ impl UdpWorker {
         }
     }
 
-    fn drain_migration_requests(
-        &mut self,
-        sessions: &mut SessionWorker,
-        runtime: &DataPlaneRuntime,
-    ) {
+    fn drain_migration_requests(&mut self, sessions: &mut SessionWorker, runtime: &DataPlaneMain) {
         while let Some(args) = sessions.pop_session_migrate_request() {
             let reply = if self.migration_request_is_current(sessions, &args) {
                 self.prepared_migration_reply(sessions, args)
@@ -940,9 +928,9 @@ pub(crate) fn connect(endpoint: SessionConnectEndpoint) -> RuntimeResult<()> {
     let worker = endpoint.worker;
     let worker_slot = worker.slot();
     let (completion, completed) = mpsc::sync_channel(1);
-    Engine::with_current(|engine| {
+    GlobalMain::with_current(|engine| {
         engine.schedule_on_worker(worker, move || {
-            let result = with_data_plane_runtime(|runtime| {
+            let result = with_data_plane_main(|runtime| {
                 main.with_worker(runtime, |sessions, udp| {
                     udp.active_connect(sessions, endpoint.connection, local, endpoint.remote)
                 })
@@ -952,7 +940,7 @@ pub(crate) fn connect(endpoint: SessionConnectEndpoint) -> RuntimeResult<()> {
             }
         })
     })
-    .ok_or(RuntimeError::WorkerControlRequiresMainEngine)??;
+    .ok_or(RuntimeError::WorkerControlRequiresGlobalMain)??;
     let _ = completed
         .recv()
         .map_err(|_| RuntimeError::DataWorkerCallCanceled {
@@ -966,7 +954,7 @@ pub(crate) fn connect(endpoint: SessionConnectEndpoint) -> RuntimeResult<()> {
     runs_after = ["transport_main_init", "session_init"],
     runs_before = ["install_packet_graph"]
 )]
-fn init_udp(engine: &mut Engine) -> RuntimeResult<()> {
+fn init_udp(engine: &mut GlobalMain) -> RuntimeResult<()> {
     if UDP_MAIN.get().is_some() {
         return Err(RuntimeError::PluginStateNotInitialized { plugin: "udp" });
     }
@@ -988,26 +976,25 @@ fn init_udp(engine: &mut Engine) -> RuntimeResult<()> {
     Ok(())
 }
 
-fn bind_worker_graph(engine: &mut Engine) -> RuntimeResult<()> {
+fn bind_worker_graph(engine: &mut DataPlaneMain) -> RuntimeResult<()> {
     let worker = engine.data_worker_id()?;
     let session_queue =
         engine
-            .runtime
             .node_by_name("session-queue")
             .ok_or(UdpTransportError::NodeMissing {
                 name: "session-queue",
             })?;
-    let udp_output = engine
-        .runtime
-        .node_by_name(UdpOutputNode::NODE_NAME)
-        .ok_or(UdpTransportError::NodeMissing {
-            name: UdpOutputNode::NODE_NAME,
-        })?;
-    let session_queue_data = engine.runtime.nodes().node_runtime_data(session_queue)?;
+    let udp_output =
+        engine
+            .node_by_name(UdpOutputNode::NODE_NAME)
+            .ok_or(UdpTransportError::NodeMissing {
+                name: UdpOutputNode::NODE_NAME,
+            })?;
+    let session_queue_data = engine.nodes().node_runtime_data(session_queue)?;
     let session_queue_output =
-        SessionQueueNode::existing_output_next(&engine.runtime, session_queue, udp_output)?;
+        SessionQueueNode::existing_output_next(engine, session_queue, udp_output)?;
     SessionQueueNode::install_worker_attachment(
-        &engine.runtime,
+        engine,
         session_queue_data,
         session_queue_output,
         udp_session_queue_update_time,
@@ -1027,7 +1014,6 @@ fn bind_worker_graph(engine: &mut Engine) -> RuntimeResult<()> {
         .into());
     }
     engine
-        .runtime
         .nodes()
         .set_node_state(session_queue, NodeState::Polling)?;
     Ok(())
@@ -1037,7 +1023,7 @@ fn bind_worker_graph(engine: &mut Engine) -> RuntimeResult<()> {
     name = "udp_worker_init",
     runs_after = ["session_worker_init"]
 )]
-fn init_udp_worker(engine: &mut Engine) -> RuntimeResult<()> {
+fn init_udp_worker(engine: &mut DataPlaneMain) -> RuntimeResult<()> {
     UDP_MAIN
         .get()
         .ok_or(RuntimeError::PluginStateNotInitialized { plugin: "udp" })?;
@@ -1046,11 +1032,11 @@ fn init_udp_worker(engine: &mut Engine) -> RuntimeResult<()> {
     Ok(())
 }
 
-fn udp_worker_exit(engine: &mut Engine) -> RuntimeResult<()> {
+fn udp_worker_exit(engine: &mut DataPlaneMain) -> RuntimeResult<()> {
     let main = UDP_MAIN
         .get()
         .ok_or(RuntimeError::PluginStateNotInitialized { plugin: "udp" })?;
-    let runtime = engine.runtime.clone();
+    let runtime = engine.clone();
     main.with_worker(&runtime, |sessions, udp| {
         udp.drain_migration_shutdown(sessions, &runtime);
         Ok(())
@@ -1058,7 +1044,7 @@ fn udp_worker_exit(engine: &mut Engine) -> RuntimeResult<()> {
 }
 
 fn udp_session_queue_update_time(
-    runtime: &DataPlaneRuntime,
+    runtime: &DataPlaneMain,
     _: &mut SessionWorker,
     _: NodeRuntimeData,
     output_next: SessionQueueNext,
@@ -1075,7 +1061,7 @@ fn udp_session_queue_update_time(
 }
 
 fn udp_session_queue_dispatch(
-    runtime: &DataPlaneRuntime,
+    runtime: &DataPlaneMain,
     _: &mut SessionWorker,
     _: NodeRuntimeData,
     output_next: SessionQueueNext,
@@ -1103,7 +1089,7 @@ impl SessionTransport for UdpWorker {
     fn update_time(
         &mut self,
         sessions: &mut SessionWorker,
-        runtime: &DataPlaneRuntime,
+        runtime: &DataPlaneMain,
         _: SessionQueueNext,
         _: &mut BufferFrame,
         _: &mut SessionQueueOutput,
@@ -1120,7 +1106,7 @@ impl SessionTransport for UdpWorker {
         &mut self,
         sessions: &mut SessionWorker,
         index: u32,
-        _: &DataPlaneRuntime,
+        _: &DataPlaneMain,
         _: SessionQueueNext,
         _: &mut BufferFrame,
         _: &mut SessionQueueOutput,
@@ -1151,7 +1137,7 @@ impl TransportInternalTransport for UdpWorker {
         sessions: &mut SessionWorker,
         session_id: u32,
         index: u32,
-        runtime: &DataPlaneRuntime,
+        runtime: &DataPlaneMain,
         output_next: SessionQueueNext,
         frame: &mut BufferFrame,
         output: &mut SessionQueueOutput,

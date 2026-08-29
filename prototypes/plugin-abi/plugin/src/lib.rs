@@ -7,7 +7,6 @@ use hammer_core::data_plane::{
     BufferFrame, BufferHeaderCacheline0, BufferHeaderCacheline1, Index,
 };
 use hammer_runtime::node::NodeRuntimeData;
-use hammer_runtime::DataPlaneRuntime;
 
 #[unsafe(no_mangle)]
 pub extern "C" fn hammer_plugin_index_size() -> usize {
@@ -33,7 +32,6 @@ pub extern "C" fn hammer_plugin_buffer_header_cl1_size() -> usize {
 /// payload bytes or allocating. Returns `frame.len()`.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn hammer_plugin_node_process(
-    _runtime: *const DataPlaneRuntime,
     runtime_data_words: *const u64,
     frame: *mut BufferFrame,
 ) -> usize {

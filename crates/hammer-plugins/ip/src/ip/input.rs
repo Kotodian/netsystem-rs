@@ -4,8 +4,8 @@ use std::sync::{Mutex, OnceLock};
 use hammer_core::data_plane::{BufferFrame, BufferPacketCursor, Index, NodeId};
 use hammer_runtime::RuntimeResult;
 use hammer_runtime::{
-    DataPlaneRuntime, Node, NodeProcessFn, NodeResult, NodeRuntimeData, TraceFormatter,
-    add_packet_trace, format_packet_trace, unlikely,
+    DataPlaneMain, Node, NodeProcessFn, NodeRuntimeData, TraceFormatter, add_packet_trace,
+    format_packet_trace, unlikely,
 };
 
 use crate::ip::{
@@ -50,7 +50,7 @@ pub struct IpInputNode<A: FeatureArcSpec = IpUnicastArc> {
     runtime_data: NodeRuntimeData,
 }
 
-fn register_ip_input(runtime: &DataPlaneRuntime) -> RuntimeResult<NodeId> {
+fn register_ip_input(runtime: &DataPlaneMain) -> RuntimeResult<NodeId> {
     runtime.nodes().try_register_internal_with_next_names(
         IpInputNode::<IpUnicastArc>::new(),
         &IpInputNext::NEXT_NAMES,
@@ -72,7 +72,7 @@ where
     A: FeatureArcSpec,
 {
     #[inline(always)]
-    fn process(&mut self, runtime: &DataPlaneRuntime, frame: &mut BufferFrame) -> NodeResult {
+    fn process(&mut self, runtime: &DataPlaneMain, frame: &mut BufferFrame) -> () {
         let feature_arc = self.feature_arc.as_ref().map(|arc| arc.start_handle());
         ip_input_process_frame(runtime, frame, feature_arc.as_ref())
     }
@@ -97,13 +97,13 @@ where
 
 #[inline(always)]
 fn ip_input_process_frame(
-    runtime: &DataPlaneRuntime,
+    runtime: &DataPlaneMain,
     frame: &mut BufferFrame,
     feature_arc: Option<&FeatureArcStartHandle>,
-) -> NodeResult {
+) -> () {
     let mut nexts = Vec::with_capacity(frame.len());
     let drop_slot = IpInputNext::Drop.slot() as u16;
-    for index in frame.iter_indices() {
+    for index in frame.indices() {
         let slot = match next_slot_for_index(runtime, *index, feature_arc) {
             Ok(slot) => slot,
             Err(_) => drop_slot,
@@ -111,7 +111,7 @@ fn ip_input_process_frame(
         nexts.push(slot);
     }
     runtime.enqueue_to_next(frame, nexts.as_slice());
-    NodeResult::drop()
+    ()
 }
 
 /// Per-instance state held in the global IP input registry. Mirrors the
@@ -181,13 +181,13 @@ fn ip_input_runtime(data: NodeRuntimeData) -> RuntimeResult<IpInputRuntime> {
 }
 
 fn ip_input_process<A: FeatureArcSpec>(
-    runtime: &DataPlaneRuntime,
+    runtime: &DataPlaneMain,
     data: NodeRuntimeData,
     frame: &mut BufferFrame,
-) -> NodeResult {
+) -> () {
     let state = match ip_input_runtime(data) {
         Ok(state) => state,
-        Err(_) => return NodeResult::drop(),
+        Err(_) => return (),
     };
     let feature_arc = state.feature_arc.as_ref();
     ip_input_process_frame(runtime, frame, feature_arc)
@@ -195,7 +195,7 @@ fn ip_input_process<A: FeatureArcSpec>(
 
 #[inline(always)]
 fn next_slot_for_index(
-    runtime: &DataPlaneRuntime,
+    runtime: &DataPlaneMain,
     index: Index,
     feature_arc: Option<&FeatureArcStartHandle>,
 ) -> RuntimeResult<u16> {

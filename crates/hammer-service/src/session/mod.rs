@@ -5,7 +5,7 @@ use std::sync::Arc;
 use hammer_core::data_plane::NodeState;
 use hammer_runtime::app::AppSessionConfig;
 use hammer_runtime::attach::AppServer;
-use hammer_runtime::{Engine, RuntimeResult};
+use hammer_runtime::{DataPlaneMain, GlobalMain, RuntimeResult};
 
 pub mod app;
 pub mod application;
@@ -46,13 +46,13 @@ fn configure_session(config: config::NetworkSessionConfig) -> RuntimeResult<Arc<
     name = "session_init",
     runs_after = ["transport_main_init", "application_init"]
 )]
-fn init_session(engine: &mut Engine, session: Arc<Session>) -> RuntimeResult<()> {
+fn init_session(engine: &mut GlobalMain, session: Arc<Session>) -> RuntimeResult<()> {
     engine.registry.set(Arc::clone(&session));
     runtime::SessionMain::init(engine.configured_worker_count())
 }
 
 #[hammer_component_macros::main_loop_exit_function]
-fn exit_session(_engine: &mut Engine) -> RuntimeResult<()> {
+fn exit_session(_engine: &mut GlobalMain) -> RuntimeResult<()> {
     session_main().begin_session_migration_shutdown();
     Ok(())
 }
@@ -61,31 +61,27 @@ fn exit_session(_engine: &mut Engine) -> RuntimeResult<()> {
     name = "application_init",
     runs_after = ["transport_main_init"]
 )]
-fn init_application(_: &mut Engine, session: Arc<Session>) -> RuntimeResult<()> {
+fn init_application(_: &mut GlobalMain, _: Arc<Session>) -> RuntimeResult<()> {
     ApplicationMain::init()
 }
 
 #[hammer_component_macros::worker_init_function(name = "session_worker_init")]
-fn init_session_worker(engine: &mut Engine, session: Arc<Session>) -> RuntimeResult<()> {
+fn init_session_worker(engine: &mut DataPlaneMain, session: Arc<Session>) -> RuntimeResult<()> {
     let worker = engine.data_worker_id()?;
     let session_queue = engine
-        .runtime
         .node_by_name("session-queue")
         .ok_or(error::SessionQueueError::NodeMissing)?;
     engine
-        .runtime
         .nodes()
         .set_node_state(session_queue, NodeState::Disabled)?;
     let app_session_input = engine
-        .runtime
         .node_by_name("appsl-rx-mqs-input")
         .ok_or(error::SessionQueueError::NodeMissing)?;
     engine
-        .runtime
         .nodes()
         .set_node_state(app_session_input, NodeState::Disabled)?;
     let publisher = engine
-        .registry
+        .registry()
         .get::<AppServer>()
         .map(|server| server.publisher());
     let sessions = SessionWorker::new(

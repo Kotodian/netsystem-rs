@@ -10,8 +10,8 @@ use hammer_core::data_plane::{
     BufferFrame, BufferPacketCursor, Index, NodeHandle, SecondaryOpaque,
 };
 use hammer_runtime::{
-    DataPlaneRuntime, DataWorkerId, Node, NodeProcessFn, NodeResult, NodeRuntimeData,
-    TraceFormatter, add_packet_trace, format_packet_trace,
+    DataPlaneMain, DataWorkerId, Node, NodeProcessFn, NodeRuntimeData, TraceFormatter,
+    add_packet_trace, format_packet_trace,
 };
 use hammer_runtime::{RuntimeError, RuntimeResult};
 use hammer_service::data_plane::set_buffer_node_error;
@@ -110,9 +110,9 @@ pub struct TcpInputNode {
 
 impl Node for TcpInputNode {
     #[inline(always)]
-    fn process(&mut self, runtime: &DataPlaneRuntime, frame: &mut BufferFrame) -> NodeResult {
+    fn process(&mut self, runtime: &DataPlaneMain, frame: &mut BufferFrame) -> () {
         if sync_tcp_input_runtime(self.runtime_data, self.handoff, self.handoff_worker).is_err() {
-            return NodeResult::drop();
+            return ();
         }
         (self.process)(runtime, self.runtime_data, frame)
     }
@@ -195,13 +195,13 @@ fn sync_tcp_input_runtime(
 }
 
 pub(crate) fn tcp_input_process(
-    runtime: &DataPlaneRuntime,
+    runtime: &DataPlaneMain,
     data: NodeRuntimeData,
     frame: &mut BufferFrame,
-) -> NodeResult {
+) -> () {
     let state = match tcp_input_runtime(data) {
         Ok(state) => state,
-        Err(_) => return NodeResult::drop(),
+        Err(_) => return (),
     };
     let snapshot = state.snapshot.load();
     tcp_input_process_frame(
@@ -214,12 +214,12 @@ pub(crate) fn tcp_input_process(
 }
 
 fn tcp_input_process_frame(
-    runtime: &DataPlaneRuntime,
+    runtime: &DataPlaneMain,
     frame: &mut BufferFrame,
     snapshot: &TcpLookupSnapshot,
     handoff: Option<NodeHandle>,
     handoff_worker: Option<DataWorkerId>,
-) -> NodeResult {
+) -> () {
     let width = runtime.preferred_frame_batch_width();
     let mut nexts = Vec::with_capacity(frame.len());
     let _ = frame.rewrite_indices_batched(width, |index| {
@@ -239,12 +239,12 @@ fn tcp_input_process_frame(
     if !nexts.is_empty() {
         runtime.enqueue_to_next(frame, nexts.as_slice());
     }
-    NodeResult::drop()
+    ()
 }
 
 #[inline(always)]
 fn tcp_input_local_next_for_index(
-    runtime: &DataPlaneRuntime,
+    runtime: &DataPlaneMain,
     index: Index,
     snapshot: &TcpLookupSnapshot,
     handoff: Option<NodeHandle>,
@@ -267,7 +267,7 @@ enum TcpInputError {
 
 #[inline(always)]
 fn next_slot_for_index_with_runtime(
-    runtime: &DataPlaneRuntime,
+    runtime: &DataPlaneMain,
     index: Index,
     parsed: Result<
         (
@@ -428,7 +428,7 @@ fn next_slot_for_index_with_runtime(
 
 #[inline(always)]
 fn resolve_success_next_with_trace(
-    runtime: &DataPlaneRuntime,
+    runtime: &DataPlaneMain,
     index: Index,
     next_key: TcpInputNext,
     version: TcpIpVersion,
@@ -459,7 +459,7 @@ fn resolve_success_next_with_trace(
 
 #[inline(always)]
 fn resolve_error_next_with_runtime(
-    runtime: &DataPlaneRuntime,
+    runtime: &DataPlaneMain,
     index: Index,
     next_key: TcpInputNext,
     error: TcpError,
@@ -493,7 +493,7 @@ fn resolve_error_next_with_runtime(
 
 #[inline(always)]
 fn session_or_listener_pending_input_entry(
-    runtime: &DataPlaneRuntime,
+    runtime: &DataPlaneMain,
     local: SocketAddr,
     remote: SocketAddr,
     flags: TcpInputFlags,
@@ -549,7 +549,7 @@ fn tcp_input_buffer(
 }
 
 #[inline(always)]
-fn prefetch_tcp_input(runtime: &DataPlaneRuntime, indices: &[Index], lookup: &TcpLookupSnapshot) {
+fn prefetch_tcp_input(runtime: &DataPlaneMain, indices: &[Index], lookup: &TcpLookupSnapshot) {
     let mut read = 0usize;
     while read < indices.len() {
         let index = indices[read];
@@ -784,7 +784,7 @@ fn prefetch_lookup_for_buffer(
 
 #[inline(always)]
 fn prefetch_session_route_for_buffer(
-    runtime: &DataPlaneRuntime,
+    runtime: &DataPlaneMain,
     buffer: &hammer_core::data_plane::Buffer,
 ) {
     let network = unsafe { transmute::<_, &NetworkOpaque>(buffer.opaque()) };

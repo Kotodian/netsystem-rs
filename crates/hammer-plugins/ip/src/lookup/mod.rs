@@ -18,8 +18,8 @@ use hammer_core::data_plane::{
 };
 use hammer_runtime::{ControlThreadHandle, WorkerBarrier};
 use hammer_runtime::{
-    DataPlaneRuntime, InternalNode, Node, NodeProcessFn, NodeResult, NodeRuntimeData,
-    TraceFormatter, add_packet_trace, format_packet_trace, unlikely,
+    DataPlaneMain, InternalNode, Node, NodeProcessFn, NodeRuntimeData, TraceFormatter,
+    add_packet_trace, format_packet_trace, unlikely,
 };
 use hammer_runtime::{RuntimeError, RuntimeResult};
 
@@ -465,7 +465,7 @@ impl IpMain {
         Ok(control)
     }
 
-    pub fn register_node(&self, rt: &DataPlaneRuntime) -> RuntimeResult<NodeId> {
+    pub fn register_node(&self, rt: &DataPlaneMain) -> RuntimeResult<NodeId> {
         let control = self.control_plane()?;
         rt.nodes()
             .try_register_internal_with_next_names(control.node(), &IpLookupNext::NEXT_NAMES)
@@ -526,7 +526,10 @@ pub static IP_MAIN: ArcSwapOption<IpMain> = ArcSwapOption::const_empty();
     early = true,
     runs_after = ["runtime_worker_config"]
 )]
-fn configure_ip(config: NetworkIpConfig, engine: &mut hammer_runtime::Engine) -> RuntimeResult<()> {
+fn configure_ip(
+    config: NetworkIpConfig,
+    engine: &mut hammer_runtime::GlobalMain,
+) -> RuntimeResult<()> {
     config.validate()?;
     let routes = Arc::<[_]>::from(config.route);
     let interfaces = engine
@@ -552,7 +555,7 @@ fn init_ip() -> RuntimeResult<()> {
     Ok(())
 }
 
-pub fn register_ip_lookup(runtime: &DataPlaneRuntime) -> RuntimeResult<NodeId> {
+pub fn register_ip_lookup(runtime: &DataPlaneMain) -> RuntimeResult<NodeId> {
     IP_MAIN
         .load()
         .as_deref()
@@ -573,7 +576,7 @@ pub struct IpLookupNode {
 
 impl IpLookupNode {
     #[inline(always)]
-    fn cached_packet_for_index(runtime: &DataPlaneRuntime, index: Index) -> Option<ParsedIpPacket> {
+    fn cached_packet_for_index(runtime: &DataPlaneMain, index: Index) -> Option<ParsedIpPacket> {
         let buffer = runtime.get_buffer(index).ok()?;
         packet_from_cached_metadata(
             unsafe { transmute::<_, &NetworkOpaque>(buffer.opaque()) },
@@ -585,7 +588,7 @@ impl IpLookupNode {
     }
 
     #[inline(always)]
-    fn process_index(runtime: &DataPlaneRuntime, table: &FibTable<u16>, index: Index) -> u16 {
+    fn process_index(runtime: &DataPlaneMain, table: &FibTable<u16>, index: Index) -> u16 {
         let parsed = Self::cached_packet_for_index(runtime, index);
         let traced = runtime
             .get_buffer(index)
@@ -656,7 +659,7 @@ impl IpLookupNode {
 
 impl Node for IpLookupNode {
     #[inline(always)]
-    fn process(&mut self, runtime: &DataPlaneRuntime, frame: &mut BufferFrame) -> NodeResult {
+    fn process(&mut self, runtime: &DataPlaneMain, frame: &mut BufferFrame) -> () {
         let table = self.table.table();
         ip_lookup_process_frame(runtime, frame, &table)
     }
@@ -679,11 +682,11 @@ impl Node for IpLookupNode {
 
 impl InternalNode for IpLookupNode {
     #[inline]
-    fn node_registration(&self) -> NodeRegistration
+    fn node_registration(&self) -> Option<NodeRegistration>
     where
         Self: Sized,
     {
-        NodeRegistration::next(Self::NODE_NAME, IpLookupNext::COUNT)
+        Some(NodeRegistration::next(Self::NODE_NAME, IpLookupNext::COUNT))
     }
 }
 
@@ -767,7 +770,7 @@ impl AdjacencyRewriteNode {
         table: &FibTableHandle,
         icmp_error_next: Option<u16>,
         fragment_next: Option<u16>,
-        runtime: &DataPlaneRuntime,
+        runtime: &DataPlaneMain,
         index: Index,
     ) -> RuntimeResult<Option<u16>> {
         let forwarding = {
@@ -878,7 +881,7 @@ impl AdjacencyRewriteNode {
 
 impl Node for AdjacencyRewriteNode {
     #[inline(always)]
-    fn process(&mut self, runtime: &DataPlaneRuntime, frame: &mut BufferFrame) -> NodeResult {
+    fn process(&mut self, runtime: &DataPlaneMain, frame: &mut BufferFrame) -> () {
         let state =
             adjacency_rewrite_runtime(self.runtime_data).expect("adjacency rewrite runtime");
         adjacency_rewrite_process_frame(
@@ -906,7 +909,7 @@ impl Node for AdjacencyRewriteNode {
     }
 }
 
-pub fn register_adjacency_rewrite(runtime: &DataPlaneRuntime) -> RuntimeResult<NodeId> {
+pub fn register_adjacency_rewrite(runtime: &DataPlaneMain) -> RuntimeResult<NodeId> {
     let main_guard = IP_MAIN.load();
     let main = main_guard
         .as_ref()
@@ -1003,37 +1006,37 @@ fn adjacency_rewrite_runtime(data: NodeRuntimeData) -> RuntimeResult<AdjacencyRe
 }
 
 fn ip_lookup_process(
-    runtime: &DataPlaneRuntime,
+    runtime: &DataPlaneMain,
     data: NodeRuntimeData,
     frame: &mut BufferFrame,
-) -> NodeResult {
+) -> () {
     let state = ip_lookup_runtime(data).expect("IP lookup runtime");
     let table = state.table.table();
     ip_lookup_process_frame(runtime, frame, &table)
 }
 
 fn ip_lookup_process_frame(
-    runtime: &DataPlaneRuntime,
+    runtime: &DataPlaneMain,
     frame: &mut BufferFrame,
     table: &FibTable<u16>,
-) -> NodeResult {
+) -> () {
     let count = frame.len();
     if count == 0 {
-        return NodeResult::drop();
+        return ();
     }
     let mut nexts = Vec::with_capacity(count);
     for &index in frame.indices() {
         nexts.push(IpLookupNode::process_index(runtime, table, index));
     }
     runtime.enqueue_to_next(frame, nexts.as_slice());
-    NodeResult::drop()
+    ()
 }
 
 fn adjacency_rewrite_process(
-    runtime: &DataPlaneRuntime,
+    runtime: &DataPlaneMain,
     data: NodeRuntimeData,
     frame: &mut BufferFrame,
-) -> NodeResult {
+) -> () {
     let state = adjacency_rewrite_runtime(data).expect("adjacency rewrite runtime");
     adjacency_rewrite_process_frame(
         runtime,
@@ -1045,12 +1048,12 @@ fn adjacency_rewrite_process(
 }
 
 fn adjacency_rewrite_process_frame(
-    runtime: &DataPlaneRuntime,
+    runtime: &DataPlaneMain,
     frame: &mut BufferFrame,
     table: &FibTableHandle,
     icmp_error_next: Option<u16>,
     fragment_next: Option<u16>,
-) -> NodeResult {
+) -> () {
     hammer_runtime::process_frame!(runtime, frame, |index| {
         match AdjacencyRewriteNode::next_for_index(
             table,
@@ -1072,7 +1075,7 @@ fn adjacency_rewrite_process_frame(
 /// Returns `Some(next)` when the packet is diverted (no rewrite applied).
 #[inline(always)]
 fn adjacency_mtu_divert(
-    runtime: &DataPlaneRuntime,
+    runtime: &DataPlaneMain,
     index: Index,
     adjacency: &Adjacency<u16>,
     icmp_error_next: Option<u16>,
@@ -1120,7 +1123,7 @@ fn adjacency_mtu_divert(
 
 #[inline(always)]
 fn apply_adjacency_rewrite(
-    runtime: &DataPlaneRuntime,
+    runtime: &DataPlaneMain,
     index: Index,
     adjacency: Adjacency<u16>,
 ) -> RuntimeResult<()> {

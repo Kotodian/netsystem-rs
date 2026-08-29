@@ -13,8 +13,8 @@ use hammer_core::data_plane::{
 };
 use hammer_runtime::RuntimeResult;
 use hammer_runtime::{
-    DataPlaneRuntime, Node, NodeProcessFn, NodeResult, NodeRuntimeData, TraceFormatter,
-    add_packet_trace, format_packet_trace,
+    DataPlaneMain, Node, NodeProcessFn, NodeRuntimeData, TraceFormatter, add_packet_trace,
+    format_packet_trace,
 };
 
 use hammer_service::data_plane::set_index_node_error;
@@ -549,7 +549,7 @@ pub struct IcmpInputNode {
     snapshot: IcmpInputSnapshotHandle,
 }
 
-fn register_icmp_input(runtime: &DataPlaneRuntime) -> RuntimeResult<NodeId> {
+fn register_icmp_input(runtime: &DataPlaneMain) -> RuntimeResult<NodeId> {
     let drop_slot = NodeNext::slot(IcmpInputNext::Drop);
     let snapshot = IcmpInputSnapshotHandle::new(Arc::new(ArcSwap::from_pointee(
         IcmpInputSnapshot::new(drop_slot, drop_slot),
@@ -562,7 +562,7 @@ fn register_icmp_input(runtime: &DataPlaneRuntime) -> RuntimeResult<NodeId> {
 
 impl Node for IcmpInputNode {
     #[inline(always)]
-    fn process(&mut self, runtime: &DataPlaneRuntime, frame: &mut BufferFrame) -> NodeResult {
+    fn process(&mut self, runtime: &DataPlaneMain, frame: &mut BufferFrame) -> () {
         let snapshot = self.snapshot.load();
         icmp_input_process_frame(runtime, frame, &snapshot)
     }
@@ -600,7 +600,7 @@ pub struct IcmpEchoRequestNode;
 
 impl Node for IcmpEchoRequestNode {
     #[inline(always)]
-    fn process(&mut self, runtime: &DataPlaneRuntime, frame: &mut BufferFrame) -> NodeResult {
+    fn process(&mut self, runtime: &DataPlaneMain, frame: &mut BufferFrame) -> () {
         icmp_echo_request_process_frame(runtime, frame)
     }
 
@@ -622,7 +622,7 @@ pub struct IcmpPathMtuNode;
 
 impl Node for IcmpPathMtuNode {
     #[inline(always)]
-    fn process(&mut self, runtime: &DataPlaneRuntime, frame: &mut BufferFrame) -> NodeResult {
+    fn process(&mut self, runtime: &DataPlaneMain, frame: &mut BufferFrame) -> () {
         icmp_path_mtu_process_frame(runtime, frame)
     }
 
@@ -670,42 +670,42 @@ fn icmp_input_runtime(data: NodeRuntimeData) -> RuntimeResult<IcmpInputRuntime> 
 }
 
 fn icmp_input_process(
-    runtime: &DataPlaneRuntime,
+    runtime: &DataPlaneMain,
     data: NodeRuntimeData,
     frame: &mut BufferFrame,
-) -> NodeResult {
+) -> () {
     let state = match icmp_input_runtime(data) {
         Ok(state) => state,
-        Err(_) => return NodeResult::drop(),
+        Err(_) => return (),
     };
     let snapshot = state.snapshot.load();
     icmp_input_process_frame(runtime, frame, &snapshot)
 }
 
 fn icmp_echo_request_process(
-    runtime: &DataPlaneRuntime,
+    runtime: &DataPlaneMain,
     _: NodeRuntimeData,
     frame: &mut BufferFrame,
-) -> NodeResult {
+) -> () {
     icmp_echo_request_process_frame(runtime, frame)
 }
 
 fn icmp_path_mtu_process(
-    runtime: &DataPlaneRuntime,
+    runtime: &DataPlaneMain,
     _: NodeRuntimeData,
     frame: &mut BufferFrame,
-) -> NodeResult {
+) -> () {
     icmp_path_mtu_process_frame(runtime, frame)
 }
 
-fn icmp_path_mtu_process_frame(runtime: &DataPlaneRuntime, frame: &mut BufferFrame) -> NodeResult {
-    for index in frame.iter_indices() {
+fn icmp_path_mtu_process_frame(runtime: &DataPlaneMain, frame: &mut BufferFrame) -> () {
+    for index in frame.indices() {
         let _ = update_path_mtu_from_index(runtime, *index);
     }
-    NodeResult::drop()
+    ()
 }
 
-fn update_path_mtu_from_index(runtime: &DataPlaneRuntime, index: Index) -> RuntimeResult<()> {
+fn update_path_mtu_from_index(runtime: &DataPlaneMain, index: Index) -> RuntimeResult<()> {
     let packet = collect_current_chain_for_icmp_generation(runtime, index)?;
     let _ = hammer_service::net::pmtu::process_ipv4_icmp_path_mtu_packet(packet.as_ref());
     Ok(())
@@ -732,7 +732,7 @@ pub struct IcmpErrorNode {
     source_table: Option<IcmpErrorSourceTableHandle>,
 }
 
-fn register_icmp_error(runtime: &DataPlaneRuntime) -> RuntimeResult<NodeId> {
+fn register_icmp_error(runtime: &DataPlaneMain) -> RuntimeResult<NodeId> {
     runtime
         .nodes()
         .try_register_internal_with_next_names(IcmpErrorNode::new(), &IcmpErrorNext::NEXT_NAMES)
@@ -750,7 +750,7 @@ impl IcmpErrorNode {
 
 impl Node for IcmpErrorNode {
     #[inline(always)]
-    fn process(&mut self, runtime: &DataPlaneRuntime, frame: &mut BufferFrame) -> NodeResult {
+    fn process(&mut self, runtime: &DataPlaneMain, frame: &mut BufferFrame) -> () {
         let source_table = self
             .source_table
             .as_ref()
@@ -836,13 +836,13 @@ fn icmp_error_runtime(data: NodeRuntimeData) -> RuntimeResult<IcmpErrorRuntime> 
 }
 
 fn icmp_error_process(
-    runtime: &DataPlaneRuntime,
+    runtime: &DataPlaneMain,
     data: NodeRuntimeData,
     frame: &mut BufferFrame,
-) -> NodeResult {
+) -> () {
     let state = match icmp_error_runtime(data) {
         Ok(state) => state,
-        Err(_) => return NodeResult::drop(),
+        Err(_) => return (),
     };
     let source_table = state
         .source_table
@@ -853,13 +853,13 @@ fn icmp_error_process(
 }
 
 fn icmp_input_process_frame(
-    runtime: &DataPlaneRuntime,
+    runtime: &DataPlaneMain,
     frame: &mut BufferFrame,
     snapshot: &IcmpInputSnapshot,
-) -> NodeResult {
+) -> () {
     let drop_slot = snapshot.default_next(IpVersion::V4);
     let mut nexts = Vec::with_capacity(frame.len());
-    for index in frame.iter_indices() {
+    for index in frame.indices() {
         let slot = match next_slot_for_index(runtime, *index, snapshot) {
             Ok(slot) => slot,
             Err(_) => drop_slot,
@@ -867,13 +867,10 @@ fn icmp_input_process_frame(
         nexts.push(slot);
     }
     runtime.enqueue_to_next(frame, nexts.as_slice());
-    NodeResult::drop()
+    ()
 }
 
-fn icmp_echo_request_process_frame(
-    runtime: &DataPlaneRuntime,
-    frame: &mut BufferFrame,
-) -> NodeResult {
+fn icmp_echo_request_process_frame(runtime: &DataPlaneMain, frame: &mut BufferFrame) -> () {
     hammer_runtime::process_frame!(runtime, frame, |index| {
         match next_for_echo_request_index(runtime, index) {
             Ok(next) => next,
@@ -883,10 +880,10 @@ fn icmp_echo_request_process_frame(
 }
 
 fn icmp_error_process_frame(
-    runtime: &DataPlaneRuntime,
+    runtime: &DataPlaneMain,
     frame: &mut BufferFrame,
     source_table: Option<&IcmpErrorSourceSnapshot>,
-) -> NodeResult {
+) -> () {
     hammer_runtime::process_frame!(runtime, frame, |index| {
         match next_for_icmp_error_index(runtime, index, source_table) {
             Ok(next) => next,
@@ -897,7 +894,7 @@ fn icmp_error_process_frame(
 
 #[inline(always)]
 fn next_slot_for_index(
-    runtime: &DataPlaneRuntime,
+    runtime: &DataPlaneMain,
     index: Index,
     snapshot: &IcmpInputSnapshot,
 ) -> RuntimeResult<u16> {
@@ -1117,7 +1114,7 @@ fn next_slot_for_index(
 
 #[inline(always)]
 fn next_for_echo_request_index(
-    runtime: &DataPlaneRuntime,
+    runtime: &DataPlaneMain,
     index: Index,
 ) -> RuntimeResult<IcmpEchoRequestNext> {
     let packet = collect_current_chain_for_icmp_generation(runtime, index)?;
@@ -1164,7 +1161,7 @@ fn next_for_echo_request_index(
 
 #[inline(always)]
 fn next_for_icmp_error_index(
-    runtime: &DataPlaneRuntime,
+    runtime: &DataPlaneMain,
     index: Index,
     source_table: Option<&IcmpErrorSourceSnapshot>,
 ) -> RuntimeResult<IcmpErrorNext> {
@@ -1278,7 +1275,7 @@ fn next_for_icmp_error_index(
 
 #[inline(always)]
 fn collect_current_chain_for_icmp_generation(
-    runtime: &DataPlaneRuntime,
+    runtime: &DataPlaneMain,
     index: Index,
 ) -> RuntimeResult<Vec<u8>> {
     let mut bytes = Vec::new();
@@ -1292,7 +1289,7 @@ fn collect_current_chain_for_icmp_generation(
 
 #[inline(always)]
 fn refresh_generated_icmp_metadata(
-    runtime: &DataPlaneRuntime,
+    runtime: &DataPlaneMain,
     index: Index,
     generated: &IcmpGeneratedPacket,
 ) -> RuntimeResult<()> {

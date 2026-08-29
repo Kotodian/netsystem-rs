@@ -1,9 +1,11 @@
 use hammer_runtime::app::{
     SessionAcceptedReplyMsg, SessionBoundMsg, SessionConnectError, SessionConnectMsg,
-    SessionConnectedMsg, SessionControlError, SessionEvtType, SessionHandle, SessionListenMsg,
-    SessionMsgQueue, SessionProducer, SessionUnlistenMsg, SessionUnlistenReplyMsg, SingleProducer,
+    SessionConnectedMsg, SessionControlError, SessionEvtType, SessionListenMsg, SessionMsgQueue,
+    SessionProducer, SessionUnlistenMsg, SessionUnlistenReplyMsg, SingleProducer,
 };
-use hammer_runtime::{DataWorkerId, Engine, RuntimeError, RuntimeResult, SessionConnectEndpoint};
+use hammer_runtime::{
+    DataWorkerId, GlobalMain, RuntimeError, RuntimeResult, SessionConnectEndpoint,
+};
 
 use super::application::{ApplicationError, application_main};
 use super::runtime::{SessionMain, schedule_worker_task};
@@ -299,18 +301,17 @@ impl SessionMain {
     ) -> RuntimeResult<()> {
         let worker = DataWorkerId::try_from(request.session.thread_index)?;
         let main = SessionMain::global()?;
-        let result = Engine::with_current(|engine| {
+        let result = GlobalMain::with_current(|engine| {
             schedule_worker_task(engine, worker, move || {
-                Engine::with_current(|engine| {
-                    let runtime = &mut engine.runtime;
+                hammer_runtime::with_data_plane_main(|runtime| {
                     main.with_worker_mut(runtime, |sessions| {
                         sessions.accept_reply(application, request.session, request.result)
                     })
                 })
-                .ok_or(RuntimeError::WorkerControlRequiresMainEngine)
             })
         });
-        result.ok_or(RuntimeError::WorkerControlRequiresMainEngine)??
+        result.ok_or(RuntimeError::WorkerControlRequiresGlobalMain)??;
+        Ok(())
     }
 }
 

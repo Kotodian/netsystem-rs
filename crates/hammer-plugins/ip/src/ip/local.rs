@@ -9,8 +9,8 @@ use arc_swap::ArcSwap;
 use hammer_core::data_plane::{BufferFrame, BufferPacketCursor, Index, NodeId, NodeNext};
 use hammer_infra::checksum::{internet_checksum, internet_checksum_parts};
 use hammer_runtime::{
-    DataPlaneRuntime, Node, NodeProcessFn, NodeResult, NodeRuntimeData, TraceFormatter,
-    add_packet_trace, format_packet_trace,
+    DataPlaneMain, Node, NodeProcessFn, NodeRuntimeData, TraceFormatter, add_packet_trace,
+    format_packet_trace,
 };
 use hammer_runtime::{RuntimeError, RuntimeResult};
 
@@ -260,7 +260,7 @@ pub(crate) fn register_protocol(protocol: u8, node: NodeId) -> RuntimeResult<()>
     })
 }
 
-fn register_ip_local(runtime: &DataPlaneRuntime) -> RuntimeResult<NodeId> {
+fn register_ip_local(runtime: &DataPlaneMain) -> RuntimeResult<NodeId> {
     let control = IpLocalControlPlane::new();
     let node = runtime
         .nodes()
@@ -274,7 +274,7 @@ fn register_ip_local(runtime: &DataPlaneRuntime) -> RuntimeResult<NodeId> {
     Ok(node)
 }
 
-fn register_ip_receive(runtime: &DataPlaneRuntime) -> RuntimeResult<NodeId> {
+fn register_ip_receive(runtime: &DataPlaneMain) -> RuntimeResult<NodeId> {
     let control = PENDING_IP_LOCAL_CONTROL
         .with(|pending| pending.borrow_mut().take())
         .ok_or(crate::ip::IpControlError::NodeRuntimeUnavailable {
@@ -287,7 +287,7 @@ fn register_ip_receive(runtime: &DataPlaneRuntime) -> RuntimeResult<NodeId> {
 
 impl Node for IpLocalNode {
     #[inline(always)]
-    fn process(&mut self, runtime: &DataPlaneRuntime, frame: &mut BufferFrame) -> NodeResult {
+    fn process(&mut self, runtime: &DataPlaneMain, frame: &mut BufferFrame) -> () {
         let state = self.state.load();
         let feature_arc = self.feature_arc.as_ref().map(|arc| arc.start_handle());
         process_frame(
@@ -319,7 +319,7 @@ impl Node for IpLocalNode {
 
 impl Node for IpReceiveNode {
     #[inline(always)]
-    fn process(&mut self, runtime: &DataPlaneRuntime, frame: &mut BufferFrame) -> NodeResult {
+    fn process(&mut self, runtime: &DataPlaneMain, frame: &mut BufferFrame) -> () {
         let state = self.state.load();
         let feature_arc = self.feature_arc.as_ref().map(|arc| arc.start_handle());
         process_frame(
@@ -420,14 +420,10 @@ fn ip_local_runtime(data: NodeRuntimeData) -> RuntimeResult<IpLocalRuntime> {
         })
 }
 
-fn ip_local_process(
-    runtime: &DataPlaneRuntime,
-    data: NodeRuntimeData,
-    frame: &mut BufferFrame,
-) -> NodeResult {
+fn ip_local_process(runtime: &DataPlaneMain, data: NodeRuntimeData, frame: &mut BufferFrame) -> () {
     let state = match ip_local_runtime(data) {
         Ok(state) => state,
-        Err(_) => return NodeResult::drop(),
+        Err(_) => return (),
     };
     let snapshot = state.state.load();
     let feature_arc = state.feature_arc.as_ref();
@@ -435,13 +431,13 @@ fn ip_local_process(
 }
 
 fn ip_receive_process(
-    runtime: &DataPlaneRuntime,
+    runtime: &DataPlaneMain,
     data: NodeRuntimeData,
     frame: &mut BufferFrame,
-) -> NodeResult {
+) -> () {
     let state = match ip_local_runtime(data) {
         Ok(state) => state,
-        Err(_) => return NodeResult::drop(),
+        Err(_) => return (),
     };
     let snapshot = state.state.load();
     let feature_arc = state.feature_arc.as_ref();
@@ -471,12 +467,12 @@ impl LocalStage {
 
 #[inline(always)]
 fn process_frame(
-    runtime: &DataPlaneRuntime,
+    runtime: &DataPlaneMain,
     frame: &mut BufferFrame,
     state: &IpLocalState,
     stage: LocalStage,
     feature_arc: Option<&FeatureArcStartHandle>,
-) -> NodeResult {
+) -> () {
     hammer_runtime::process_frame!(runtime, frame, |index| {
         match process_index(runtime, index, state, stage, feature_arc) {
             Ok(slot) => slot,
@@ -487,7 +483,7 @@ fn process_frame(
 
 #[inline(always)]
 fn process_index(
-    runtime: &DataPlaneRuntime,
+    runtime: &DataPlaneMain,
     index: Index,
     state: &IpLocalState,
     stage: LocalStage,
@@ -731,7 +727,7 @@ fn tcp_header_len(transport: &[u8]) -> Result<usize, IpLocalError> {
 
 #[inline(always)]
 fn refresh_basic_metadata(
-    runtime: &DataPlaneRuntime,
+    runtime: &DataPlaneMain,
     index: Index,
     parsed: &ParsedIpPacket,
     transport_header_len: Option<usize>,

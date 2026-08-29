@@ -8,12 +8,12 @@ use hammer_infra::pool::Pool;
 use hammer_infra::thread_owned::ThreadOwned;
 use hammer_runtime::app::SessionHandle;
 use hammer_runtime::{
-    DataWorkerId, Engine, RuntimeError, RuntimeResult, SessionConnectEndpoint,
+    DataPlaneMain, DataWorkerId, GlobalMain, RuntimeError, RuntimeResult, SessionConnectEndpoint,
     SessionListenEndpoint,
 };
 use hammer_service::session::application_main;
 use hammer_service::session::node::SessionQueueNode;
-use hammer_service::session::runtime::{SessionTransport, SessionWorker, session_main};
+use hammer_service::session::runtime::{SessionWorker, session_main};
 use hammer_service::transport::{TransportVft, register_transport};
 
 use crate::config::{ConfigId, QUIC_CONFIG_CAPACITY, QuicConfigRegistry};
@@ -369,7 +369,7 @@ pub(crate) fn connect(endpoint: SessionConnectEndpoint) -> RuntimeResult<()> {
     let worker = endpoint.worker;
 
     let (completion, completed) = mpsc::sync_channel(1);
-    Engine::with_current(|engine| {
+    GlobalMain::with_current(|engine| {
         engine.schedule_on_worker(worker, {
             let main = main;
             let client_config = Arc::clone(&client_config);
@@ -396,7 +396,7 @@ pub(crate) fn connect(endpoint: SessionConnectEndpoint) -> RuntimeResult<()> {
             }
         })
     })
-    .ok_or(RuntimeError::WorkerControlRequiresMainEngine)??;
+    .ok_or(RuntimeError::WorkerControlRequiresGlobalMain)??;
     let context = completed
         .recv()
         .map_err(|_| RuntimeError::DataWorkerCallCanceled {
@@ -427,7 +427,7 @@ pub(crate) fn connect(endpoint: SessionConnectEndpoint) -> RuntimeResult<()> {
     ) {
         let _ = application_main().remove_connection(main.inner_application, inner_connection);
         let (completion, completed) = mpsc::sync_channel(1);
-        Engine::with_current(|engine| {
+        GlobalMain::with_current(|engine| {
             engine.schedule_on_worker(worker, {
                 let main = main;
                 move || {
@@ -438,7 +438,7 @@ pub(crate) fn connect(endpoint: SessionConnectEndpoint) -> RuntimeResult<()> {
                 }
             })
         })
-        .ok_or(RuntimeError::WorkerControlRequiresMainEngine)??;
+        .ok_or(RuntimeError::WorkerControlRequiresGlobalMain)??;
         let _ = completed
             .recv()
             .map_err(|_| RuntimeError::DataWorkerCallCanceled {
@@ -464,11 +464,11 @@ pub(crate) fn connect_stream(endpoint: SessionConnectEndpoint) -> RuntimeResult<
     let flags = endpoint.flags;
     let (completion, completed) = mpsc::sync_channel(1);
 
-    Engine::with_current(|engine| {
+    GlobalMain::with_current(|engine| {
         engine.schedule_on_worker(worker, {
             let main = main;
             move || {
-                let result = hammer_runtime::with_data_plane_runtime(|runtime| {
+                let result = hammer_runtime::with_data_plane_main(|runtime| {
                     session_main().with_worker_mut(runtime, |sessions| {
                         main.with_worker_and_sessions(sessions, |sessions, quic| {
                             quic.connect_stream(sessions, parent, connection, flags)
@@ -480,7 +480,7 @@ pub(crate) fn connect_stream(endpoint: SessionConnectEndpoint) -> RuntimeResult<
             }
         })
     })
-    .ok_or(RuntimeError::WorkerControlRequiresMainEngine)??;
+    .ok_or(RuntimeError::WorkerControlRequiresGlobalMain)??;
 
     completed
         .recv()
@@ -516,11 +516,10 @@ pub(crate) fn stop_listen(connection_index: u32) -> RuntimeResult<()> {
     runs_after = ["transport_main_init", "session_init", "udp_init"],
     runs_before = ["install_packet_graph"]
 )]
-fn init_quic(engine: &mut Engine) -> RuntimeResult<()> {
+fn init_quic(engine: &mut GlobalMain) -> RuntimeResult<()> {
     if QUIC_MAIN.get().is_some() {
         return Err(RuntimeError::PluginStateNotInitialized { plugin: "quic" });
     }
-    let udp_protocol = hammer_plugin_udp::protocol()?;
     let inner_application = application_main().attach().map_err(RuntimeError::from)?;
     let session_app = match hammer_service::session::register_session_app(
         inner_application,
@@ -567,24 +566,22 @@ fn init_quic(engine: &mut Engine) -> RuntimeResult<()> {
     Ok(())
 }
 
-fn bind_worker_graph(engine: &mut Engine, main: &QuicMain) -> RuntimeResult<()> {
+fn bind_worker_graph(engine: &mut DataPlaneMain, main: &QuicMain) -> RuntimeResult<()> {
     let worker = engine.data_worker_id()?;
     let session_queue =
         engine
-            .runtime
             .node_by_name("session-queue")
             .ok_or(QuicListenerError::NodeMissing {
                 name: "session-queue",
             })?;
     let udp_output = engine
-        .runtime
         .node_by_name("udp-output")
         .ok_or(QuicListenerError::NodeMissing { name: "udp-output" })?;
-    let session_queue_data = engine.runtime.nodes().node_runtime_data(session_queue)?;
+    let session_queue_data = engine.nodes().node_runtime_data(session_queue)?;
     let session_queue_output =
-        SessionQueueNode::existing_output_next(&engine.runtime, session_queue, udp_output)?;
+        SessionQueueNode::existing_output_next(engine, session_queue, udp_output)?;
     let attachment_installed = SessionQueueNode::install_worker_attachment(
-        &engine.runtime,
+        engine,
         session_queue_data,
         session_queue_output,
         crate::worker::quic_session_queue_update_time,
@@ -592,14 +589,13 @@ fn bind_worker_graph(engine: &mut Engine, main: &QuicMain) -> RuntimeResult<()> 
     )?;
     let setup = main.install_worker(worker).and_then(|()| {
         engine
-            .runtime
             .nodes()
             .set_node_state(session_queue, NodeState::Polling)
     });
     if let Err(setup) = setup {
         if attachment_installed {
             if let Err(cleanup) = SessionQueueNode::remove_worker_attachment(
-                &engine.runtime,
+                engine,
                 session_queue_data,
                 session_queue_output,
                 crate::worker::quic_session_queue_update_time,
@@ -617,7 +613,7 @@ fn bind_worker_graph(engine: &mut Engine, main: &QuicMain) -> RuntimeResult<()> 
     name = "quic_worker_init",
     runs_after = ["session_worker_init", "udp_worker_init"]
 )]
-fn init_quic_worker(engine: &mut Engine) -> RuntimeResult<()> {
+fn init_quic_worker(engine: &mut DataPlaneMain) -> RuntimeResult<()> {
     let main = QUIC_MAIN
         .get()
         .ok_or(RuntimeError::PluginStateNotInitialized { plugin: "quic" })?;

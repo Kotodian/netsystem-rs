@@ -16,8 +16,8 @@ use std::sync::Arc;
 use hammer_core::data_plane::NodeId;
 use hammer_runtime::RuntimeRegistry;
 use hammer_runtime::config::Memory;
-use hammer_runtime::engine::{Engine, EnginePool};
-use hammer_runtime::{DataPlaneRuntime, DataPlaneRuntimeConfig};
+use hammer_runtime::global_main::GlobalMain;
+use hammer_runtime::{DataPlaneBufferConfig, DataPlaneMain};
 use hammer_runtime::{PluginError, RuntimeError};
 
 // Shared device/interface/transport/session registrations remain host-owned.
@@ -131,27 +131,18 @@ fn main() -> Result<(), ExampleError> {
         .build()
         .map_err(|source| ExampleError::ProcessRuntime { source })?;
 
-    let runtime = DataPlaneRuntime::new(DataPlaneRuntimeConfig::default());
-    let mut pool = EnginePool::new(
-        Engine::new(runtime, RuntimeRegistry::new()),
-        &process_runtime,
-    )?;
-    pool.main_engine_mut()
+    let runtime = DataPlaneMain::new(DataPlaneBufferConfig::default());
+    let mut engine = GlobalMain::new(runtime, RuntimeRegistry::new());
+    engine.init_control(&process_runtime)?;
+    engine
         .plugin_main_mut()
         .register_builtin_image(hammer_service::registration_image());
-    pool.main_engine_mut().install_current();
+    engine.install_current();
 
-    let example_result = run_example(
-        pool.main_engine_mut(),
-        main_heap_capacity,
-        &roots,
-        EXAMPLE_CONFIG,
-    );
-    let process_shutdown = pool
-        .main_engine_mut()
-        .shutdown_process_nodes(&process_runtime);
-    let close_result = pool.close();
-    Engine::uninstall_current();
+    let example_result = run_example(&mut engine, main_heap_capacity, &roots, EXAMPLE_CONFIG);
+    let process_shutdown = engine.shutdown_process_nodes(&process_runtime);
+    let close_result = engine.close();
+    GlobalMain::uninstall_current();
 
     example_result?;
     process_shutdown?;
@@ -160,7 +151,7 @@ fn main() -> Result<(), ExampleError> {
 }
 
 fn run_example(
-    engine: &mut Engine,
+    engine: &mut GlobalMain,
     main_heap_capacity: usize,
     roots: &[String],
     config_document: &str,
@@ -181,7 +172,7 @@ fn run_example(
         return Err(ExampleError::StartupPluginSetNotEmpty);
     }
     let drop_before = engine
-        .runtime
+        .data_plane_main()
         .node_by_name("drop")
         .ok_or(ExampleError::HostDropNodeMissing)?;
     // This call performs real dlopen, incremental lifecycle/config dispatch,
@@ -195,11 +186,11 @@ fn run_example(
         });
     }
     for name in ["tun-input", "ip-input", "tcp-input", "udp-input"] {
-        if engine.runtime.node_by_name(name).is_none() {
+        if engine.data_plane_main().node_by_name(name).is_none() {
             return Err(ExampleError::PluginNodeMissing { name });
         }
     }
-    let drop_after_load = engine.runtime.node_by_name("drop");
+    let drop_after_load = engine.data_plane_main().node_by_name("drop");
     if drop_after_load != Some(drop_before) {
         return Err(ExampleError::DropNodeChanged {
             before: drop_before,
@@ -224,7 +215,7 @@ fn run_example(
     if engine.loaded_plugins().as_slice() != PLUGIN_NAMES {
         return Err(ExampleError::FailedTransactionChangedPluginSet);
     }
-    if engine.runtime.node_by_name("drop") != Some(drop_before) {
+    if engine.data_plane_main().node_by_name("drop") != Some(drop_before) {
         return Err(ExampleError::FailedTransactionChangedDropNode);
     }
 

@@ -8,7 +8,7 @@ use arc_swap::ArcSwapOption;
 use hammer_core::data_plane::{BufferFrame, Index, NodeId, NodeRegistration};
 use hammer_runtime::WorkerBarrier;
 use hammer_runtime::{
-    DataPlaneRuntime, DataWorkerId, InternalNode, Node, NodeProcessFn, NodeResult, NodeRuntimeData,
+    DataPlaneMain, DataWorkerId, InternalNode, Node, NodeProcessFn, NodeRuntimeData,
     add_packet_trace,
 };
 use hammer_runtime::{RuntimeError, RuntimeResult};
@@ -637,7 +637,7 @@ pub struct InterfaceOutputTrace {
 #[derive(Debug, Clone, Copy)]
 pub struct InterfaceOutputNode;
 
-fn register_interface_output_graph(runtime: &DataPlaneRuntime) -> RuntimeResult<NodeId> {
+fn register_interface_output_graph(runtime: &DataPlaneMain) -> RuntimeResult<NodeId> {
     runtime.nodes().try_register_internal(InterfaceOutputNode)
 }
 
@@ -645,7 +645,7 @@ impl InterfaceOutputNode {
     #[inline(always)]
     fn tx_for_index(
         output: &InterfaceOutputState,
-        runtime: &DataPlaneRuntime,
+        runtime: &DataPlaneMain,
         index: Index,
         drop_next: u16,
     ) -> RuntimeResult<u16> {
@@ -696,7 +696,7 @@ impl InterfaceOutputNode {
 
 impl Node for InterfaceOutputNode {
     #[inline(always)]
-    fn process(&mut self, runtime: &DataPlaneRuntime, frame: &mut BufferFrame) -> NodeResult {
+    fn process(&mut self, runtime: &DataPlaneMain, frame: &mut BufferFrame) -> () {
         INTERFACE_OUTPUT_STATE.with(|state| {
             let state = state.borrow();
             interface_output_process_frame(runtime, frame, &state)
@@ -711,19 +711,19 @@ impl Node for InterfaceOutputNode {
 
 impl InternalNode for InterfaceOutputNode {
     #[inline]
-    fn node_registration(&self) -> NodeRegistration
+    fn node_registration(&self) -> Option<NodeRegistration>
     where
         Self: Sized,
     {
-        NodeRegistration::next("interface-output", 0)
+        Some(NodeRegistration::next("interface-output", 0))
     }
 }
 
 fn interface_output_process(
-    runtime: &DataPlaneRuntime,
+    runtime: &DataPlaneMain,
     _: NodeRuntimeData,
     frame: &mut BufferFrame,
-) -> NodeResult {
+) -> () {
     INTERFACE_OUTPUT_STATE.with(|state| {
         let state = state.borrow();
         interface_output_process_frame(runtime, frame, &state)
@@ -732,12 +732,12 @@ fn interface_output_process(
 
 #[inline(always)]
 fn interface_output_process_frame(
-    runtime: &DataPlaneRuntime,
+    runtime: &DataPlaneMain,
     frame: &mut BufferFrame,
     output: &InterfaceOutputState,
-) -> NodeResult {
+) -> () {
     let Some(drop_next) = output.drop_slot else {
-        return NodeResult::drop();
+        return ();
     };
     hammer_runtime::process_frame!(runtime, frame, |index| {
         match InterfaceOutputNode::tx_for_index(output, runtime, index, drop_next) {

@@ -17,7 +17,7 @@ use hammer_runtime::FILE_MAIN;
 use hammer_runtime::binary_api::{BinaryApiMethodEntry, BinaryApiMethodStatus};
 use hammer_runtime::file::{FileIoStatus, FileMain};
 use hammer_runtime::{
-    Engine, NodeRuntime, PluginError, ProcessContext, ProcessWake, RuntimeError, RuntimeResult,
+    GlobalMain, NodeRuntime, PluginError, ProcessContext, ProcessWake, RuntimeError, RuntimeResult,
 };
 use prost::Message;
 
@@ -391,8 +391,8 @@ impl Drop for SocketApiRegistrationPool {
 }
 
 /// Main-thread owner of the Binary API Unix listener and frame policy. The
-/// listener is registered in the process-global `FILE_MAIN`; EnginePool's main
-/// loop polls that table and the `binary-api` Process Node consumes its events.
+/// listener is registered in the process-global `FILE_MAIN`; `GlobalMain` owns
+/// the control loop and the `binary-api` Process Node consumes its events.
 pub struct BinaryApiMain {
     listener: u32,
     socket_path: PathBuf,
@@ -479,7 +479,7 @@ impl Drop for BinaryApiMain {
 /// socket registration pool; it only hands the File's token to the node.
 /// Without a live node (main process shutdown) the readiness is dropped.
 fn signal_ready(event_type: u64, token: u64) -> RuntimeResult<()> {
-    match Engine::with_current(|engine| engine.process_handle(PROCESS_NODE_NAME)) {
+    match GlobalMain::with_current(|engine| engine.process_handle(PROCESS_NODE_NAME)) {
         Some(Some(handle)) => handle.signal(event_type, token),
         _ => Ok(()),
     }
@@ -554,23 +554,24 @@ fn output_budget(max_frame_bytes: usize) -> usize {
 /// branches and run the same deferred graph-update finish.
 fn dispatch(request: BinaryApiRequest) -> BinaryApiReply {
     let context = request.context;
-    let resolved: Result<BinaryApiMethodEntry, BinaryApiReply> = match Engine::with_current(
-        |engine| engine.plugin_main().binary_api_method(&request.method),
-    ) {
-        None => Err(reply(
-            context,
-            BinaryApiStatus::MainThreadUnavailable,
-            Vec::new(),
-        )),
-        Some(Err(PluginError::BinaryApiMethodMissing { .. })) => {
-            Err(reply(context, BinaryApiStatus::MethodMissing, Vec::new()))
-        }
-        Some(Err(PluginError::BinaryApiMethodDuplicate { .. })) => {
-            Err(reply(context, BinaryApiStatus::MethodDuplicate, Vec::new()))
-        }
-        Some(Err(_)) => Err(reply(context, BinaryApiStatus::Internal, Vec::new())),
-        Some(Ok(method)) => Ok(method),
-    };
+    let resolved: Result<BinaryApiMethodEntry, BinaryApiReply> =
+        match GlobalMain::with_current(|engine| {
+            engine.plugin_main().binary_api_method(&request.method)
+        }) {
+            None => Err(reply(
+                context,
+                BinaryApiStatus::MainThreadUnavailable,
+                Vec::new(),
+            )),
+            Some(Err(PluginError::BinaryApiMethodMissing { .. })) => {
+                Err(reply(context, BinaryApiStatus::MethodMissing, Vec::new()))
+            }
+            Some(Err(PluginError::BinaryApiMethodDuplicate { .. })) => {
+                Err(reply(context, BinaryApiStatus::MethodDuplicate, Vec::new()))
+            }
+            Some(Err(_)) => Err(reply(context, BinaryApiStatus::Internal, Vec::new())),
+            Some(Ok(method)) => Ok(method),
+        };
     match resolved {
         // VPP's `msg_handler_internal` takes the worker barrier only when
         // `!m->is_mp_safe` (api_shared.c:545, 564): an mp-safe method runs
@@ -606,7 +607,7 @@ fn dispatch_barriered(
     resolved: Result<BinaryApiMethodEntry, BinaryApiReply>,
 ) -> BinaryApiReply {
     let context = request.context;
-    let Some(barrier) = Engine::with_current(|engine| engine.worker_barrier()) else {
+    let Some(barrier) = GlobalMain::with_current(|engine| engine.worker_barrier()) else {
         // Legacy unlocked path: no barrier authority; the already-resolved
         // handler or the resolution error reply runs with no barrier and no
         // deferred finish.
@@ -632,7 +633,7 @@ fn dispatch_barriered(
     // inside this barrier is drained here, after the workers refork and
     // before the reply completes. A deferred finish failure crosses the typed
     // reply/status boundary instead of logging.
-    let deferred = Engine::with_current(|engine| engine.finish_deferred_worker_graph_update());
+    let deferred = GlobalMain::with_current(|engine| engine.finish_deferred_worker_graph_update());
     match deferred {
         Some(Err(_)) => reply(context, BinaryApiStatus::Internal, Vec::new()),
         _ => method_reply,

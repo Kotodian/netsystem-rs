@@ -3,12 +3,10 @@ use std::process::Command;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use hammer_core::data_plane::{
-    BufferFrame, BufferHeaderCacheline0, BufferHeaderCacheline1, BufferPool, DataPlaneBufferConfig,
-    Index,
+    BufferFrame, BufferHeaderCacheline0, BufferHeaderCacheline1, BufferPool, Index,
 };
 use hammer_plugin_abi_host::{load_plugin, plugin_cdylib_path, PluginNodeProcess};
 use hammer_runtime::node::NodeRuntimeData;
-use hammer_runtime::{DataPlaneRuntime, DataPlaneRuntimeConfig};
 use libloading::Symbol;
 
 #[global_allocator]
@@ -36,16 +34,6 @@ fn build_cdylib(package: &str) {
         .status()
         .expect("spawn cargo build");
     assert!(status.success(), "cargo build -p {package} failed");
-}
-
-fn test_runtime() -> DataPlaneRuntime {
-    DataPlaneRuntime::new(DataPlaneRuntimeConfig {
-        buffers: DataPlaneBufferConfig {
-            buffer_slot_capacity: 64,
-            buffer_slots: 4,
-            ..DataPlaneBufferConfig::default()
-        },
-    })
 }
 
 #[test]
@@ -81,7 +69,6 @@ fn plugin_node_process_uses_host_buffer_frame_without_hot_path_alloc() {
             .expect("dlsym node process")
     };
 
-    let runtime = test_runtime();
     let mut frame = BufferFrame::with_capacity(256);
     let pool = BufferPool::with_capacity(64, 4);
     let index = pool.alloc_index_with_bytes(b"x").expect("alloc");
@@ -96,7 +83,7 @@ fn plugin_node_process_uses_host_buffer_frame_without_hot_path_alloc() {
         runtime_data.word(3),
     ];
     let before = ALLOC_COUNT.load(Ordering::SeqCst);
-    let observed = unsafe { process(&runtime, words.as_ptr(), &mut frame) };
+    let observed = unsafe { process(words.as_ptr(), &mut frame) };
     let after = ALLOC_COUNT.load(Ordering::SeqCst);
 
     assert_eq!(observed, 1);
