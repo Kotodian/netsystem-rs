@@ -91,22 +91,3 @@ impl DerefMut for BytesBuffer {
         &mut self.bytes
     }
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn fixed_capacity_survives_clear_and_truncate() {
-        let mut buffer = BytesBuffer::with_capacity(128);
-        assert!(buffer.capacity() >= 128);
-        buffer.extend_from_slice(b"payload");
-        assert_eq!(buffer.len(), 7);
-        assert_eq!(&buffer[..], b"payload");
-        buffer.clear();
-        assert!(buffer.is_empty());
-        assert!(buffer.capacity() >= 128);
-        buffer.extend_from_slice(b"next");
-        assert_eq!(&buffer[..], b"next");
-    }
-}

@@ -239,6 +239,7 @@ impl<K: Copy + Default, const KVP: usize> PageAlloc<K, KVP> {
     /// VPP reads and writes the live bucket value while `bucket.lock` is set;
     /// readers wait on that bit and cannot race this exclusive access.
     #[inline(always)]
+    #[allow(clippy::mut_from_ref)]
     pub(crate) fn live_pages_mut(
         &self,
         offset: u64,

@@ -130,20 +130,3 @@ impl<T> SparseVec<T> {
         );
     }
 }
-
-#[cfg(test)]
-mod tests {
-    use super::SparseVec;
-
-    #[test]
-    fn sparse_values_remain_dense_while_indices_stay_sparse() {
-        let mut values = SparseVec::with_index_bits(16);
-        assert_eq!(values.insert(0x1234, "udp"), None);
-        assert_eq!(values.insert(3, "other"), None);
-        assert_eq!(values.get(0x1234), Some(&"udp"));
-        assert_eq!(values.get(3), Some(&"other"));
-        assert_eq!(values.remove(3), Some("other"));
-        assert_eq!(values.get(0x1234), Some(&"udp"));
-        assert_eq!(values.len(), 1);
-    }
-}

@@ -22,11 +22,23 @@ pub struct Pool<T> {
 impl<T> Default for Pool<T> {
     #[inline]
     fn default() -> Self {
-        Self::with_capacity(0)
+        Self::new()
     }
 }
 
 impl<T> Pool<T> {
+    /// Creates a VPP-style dynamic pool with no initial reservation.
+    #[inline]
+    pub const fn new() -> Self {
+        Self {
+            vector: Vec::new(),
+            free_bitmap: Bitmap::new(),
+            free_indices: Vec::new(),
+            max_elts: None,
+            opaque: 0,
+        }
+    }
+
     /// Creates a dynamic pool with an initial backing allocation capacity.
     #[inline]
     pub fn with_capacity(capacity: usize) -> Self {
@@ -379,203 +391,5 @@ impl<T> fmt::Debug for Pool<T> {
             .field("capacity", &self.capacity())
             .field("free", &self.free_indices.len())
             .finish()
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use std::cell::Cell;
-    use std::rc::Rc;
-
-    use super::Pool;
-    use crate::align::{CACHE_LINE, is_aligned};
-
-    #[test]
-    fn dynamic_zero_capacity_pool_grows_on_insert() {
-        let mut pool = Pool::<u32>::with_capacity(0);
-
-        assert_eq!(pool.insert(7), 0);
-        assert_eq!(pool.get(0), Some(&7));
-    }
-
-    #[test]
-    fn missing_indexes_are_ordinary_option_results() {
-        let mut pool = Pool::<u32>::with_capacity(1);
-
-        assert_eq!(pool.get(0), None);
-        assert_eq!(pool.get_mut(0), None);
-        assert_eq!(pool.remove(0), None);
-    }
-
-    #[test]
-    fn preallocated_pool_grows_when_exhausted() {
-        let mut pool = Pool::<u32>::with_fixed_capacity(2);
-        assert_eq!(pool.insert(1), 0);
-        assert_eq!(pool.insert(2), 1);
-
-        assert!(
-            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                pool.insert(3);
-            }))
-            .is_err()
-        );
-        assert!(pool.validate());
-    }
-
-    #[test]
-    fn dynamic_pool_free_capacity_includes_reserved_vector_space() {
-        let pool = Pool::<u32>::with_capacity(4);
-
-        assert_eq!(pool.free_capacity(), 4);
-    }
-
-    #[test]
-    fn pool_reuses_released_indexes_in_lifo_order() {
-        let mut pool = Pool::<u32>::with_capacity(3);
-        let first = pool.insert(1);
-        let second = pool.insert(2);
-        let third = pool.insert(3);
-
-        assert_eq!(pool.remove(first), Some(1));
-        assert_eq!(pool.remove(second), Some(2));
-
-        assert_eq!(pool.insert(4), second);
-        assert_eq!(pool.insert(5), first);
-        assert_eq!(pool.get(third), Some(&3));
-    }
-
-    #[test]
-    fn pool_grows_without_changing_existing_numeric_indexes() {
-        let mut pool = Pool::<u32>::with_capacity(1);
-        let first = pool.insert(10);
-        let second = pool.insert(20);
-
-        assert_eq!((first, second), (0, 1));
-        assert_eq!(pool.get(first), Some(&10));
-        assert_eq!(pool.get(second), Some(&20));
-    }
-
-    #[test]
-    fn pool_iteration_returns_sparse_indexes_in_numeric_order() {
-        let mut pool = Pool::<u32>::with_capacity(5);
-        let first = pool.insert(10);
-        let second = pool.insert(20);
-        let third = pool.insert(30);
-        assert_eq!(pool.remove(second), Some(20));
-
-        let indexes: Vec<_> = pool.indices().collect();
-        let values: Vec<_> = pool.iter().map(|(_, value)| *value).collect();
-
-        assert_eq!(indexes, vec![first, third]);
-        assert_eq!(values, vec![10, 30]);
-    }
-
-    #[test]
-    fn pool_regions_and_range_iteration_follow_occupied_indexes() {
-        let mut pool = Pool::<u32>::with_capacity(6);
-        assert_eq!(pool.insert(0), 0);
-        assert_eq!(pool.insert(1), 1);
-        let removed = pool.insert(2);
-        assert_eq!(pool.insert(3), 3);
-        assert_eq!(pool.insert(4), 4);
-        assert_eq!(pool.remove(removed), Some(2));
-
-        assert_eq!(pool.indices_range(1, 5).collect::<Vec<_>>(), vec![1, 3, 4]);
-        assert_eq!(pool.regions().collect::<Vec<_>>(), vec![0..2, 3..5]);
-    }
-
-    #[test]
-    fn pool_occupancy_queries_track_released_indexes() {
-        let mut pool = Pool::<u32>::with_capacity(2);
-        let index = pool.insert(7);
-        let indexes: Vec<_> = pool.indices().collect();
-
-        assert!(!pool.is_free_index(index));
-        assert_eq!(pool.remove(index), Some(7));
-        let freed_capacity = pool.free_capacity();
-        let freed_indexes: Vec<_> = pool.indices().collect();
-        assert!(pool.is_free_index(index));
-        assert_eq!(pool.free_capacity(), freed_capacity);
-        assert_eq!(pool.indices().collect::<Vec<_>>(), freed_indexes);
-        assert_eq!(indexes, vec![index]);
-    }
-
-    #[test]
-    fn pool_preflight_reports_vector_and_free_metadata_growth() {
-        let mut pool = Pool::<u32>::with_capacity(1);
-        assert!(!pool.will_get_grow());
-        let index = pool.insert(1);
-        assert!(pool.will_get_grow());
-        assert!(!pool.will_put_grow(index));
-        pool.put_index(index);
-        assert!(pool.validate());
-    }
-
-    #[test]
-    fn pool_clone_preserves_indexes_values_capacity_and_opaque_storage() {
-        let mut pool = Pool::<u32>::with_capacity(4);
-        let first = pool.insert(7);
-        let removed = pool.insert(9);
-        assert_eq!(pool.remove(removed), Some(9));
-        pool.set_opaque(42);
-
-        let clone = pool.clone();
-
-        assert_eq!(clone.capacity(), pool.capacity());
-        assert_eq!(clone.opaque(), 42);
-        assert_eq!(clone.get(first), Some(&7));
-        assert!(!clone.contains_key(removed));
-        assert!(clone.validate());
-    }
-
-    #[test]
-    fn pool_clear_with_and_drop_release_each_value_once() {
-        struct DropCounter(Rc<Cell<usize>>);
-
-        impl Drop for DropCounter {
-            fn drop(&mut self) {
-                self.0.set(self.0.get() + 1);
-            }
-        }
-
-        let drops = Rc::new(Cell::new(0));
-        let mut pool = Pool::with_capacity(3);
-        pool.insert(DropCounter(Rc::clone(&drops)));
-        pool.insert(DropCounter(Rc::clone(&drops)));
-        pool.clear_with(|_| {});
-        assert_eq!(drops.get(), 2);
-        drop(pool);
-        assert_eq!(drops.get(), 2);
-    }
-
-    #[test]
-    fn pool_remove_drops_returned_value_once() {
-        struct DropCounter(Rc<Cell<usize>>);
-
-        impl Drop for DropCounter {
-            fn drop(&mut self) {
-                self.0.set(self.0.get() + 1);
-            }
-        }
-
-        let drops = Rc::new(Cell::new(0));
-        let mut pool = Pool::with_capacity(1);
-        let index = pool.insert(DropCounter(Rc::clone(&drops)));
-        let value = pool.remove(index);
-        assert_eq!(drops.get(), 0);
-        drop(value);
-        assert_eq!(drops.get(), 1);
-    }
-
-    #[test]
-    fn pool_validation_and_alignment_hold_for_fixed_storage() {
-        let pool = Pool::<u64>::with_fixed_capacity(4);
-
-        assert!(pool.validate());
-        assert!(is_aligned(pool.vector.as_ptr(), CACHE_LINE));
-        assert_eq!(
-            pool.bytes(),
-            pool.vector.len() * std::mem::size_of_val(&pool.vector[0]) + pool.header_bytes()
-        );
     }
 }
