@@ -63,8 +63,7 @@ pub(crate) fn tcp_listen_process(
     _: NodeRuntimeData,
     frame: &mut BufferFrame,
 ) -> NodeResult {
-    let main = crate::TCP_MAIN.load();
-    let Some(main) = main.as_deref() else {
+    let Some(main) = crate::TCP_MAIN.get() else {
         return NodeResult::drop();
     };
     tcp_listen_process_frame(runtime, frame, main)
@@ -189,7 +188,7 @@ fn tcp_listen_index(
 }
 
 struct TcpListener<'a> {
-    sessions: &'a mut SessionWorker<u32>,
+    sessions: &'a mut SessionWorker,
     tcp: &'a mut crate::TcpWorker,
     id: u32,
     session_listener: hammer_runtime::app::SessionHandle,
@@ -198,7 +197,7 @@ struct TcpListener<'a> {
 
 impl<'a> TcpListener<'a> {
     fn new(
-        sessions: &'a mut SessionWorker<u32>,
+        sessions: &'a mut SessionWorker,
         tcp: &'a mut crate::TcpWorker,
         id: u32,
         session_listener: hammer_runtime::app::SessionHandle,
@@ -459,22 +458,22 @@ impl<'a> TcpListener<'a> {
     ) -> RuntimeResult<(R, u32)>
     where
         C: FnOnce() -> TcpConnection,
-        P: FnOnce(u32, u32, &mut SessionWorker<u32>, &mut crate::TcpWorker) -> RuntimeResult<R>,
+        P: FnOnce(u32, u32, &mut SessionWorker, &mut crate::TcpWorker) -> RuntimeResult<R>,
     {
         let connection_index = self.tcp.insert_connection(create());
         let listener = self.session_listener;
-        let session_id = match self.sessions.stream_accept(
-            <crate::TcpWorker as SessionTransport<u32>>::ID,
-            connection_index,
-            listener,
-        ) {
-            Ok(session_id) => session_id,
-            Err(error) => {
-                self.tcp.remove_connection(connection_index);
-                self.finish_pending(packet);
-                return Err(error);
-            }
-        };
+        let session_id =
+            match self
+                .sessions
+                .stream_accept(self.tcp.protocol(), connection_index, listener)
+            {
+                Ok(session_id) => session_id,
+                Err(error) => {
+                    self.tcp.remove_connection(connection_index);
+                    self.finish_pending(packet);
+                    return Err(error);
+                }
+            };
         let attached = match self.tcp.connection_mut(connection_index) {
             Some(connection) => connection.attach_session(session_id),
             None => Err(TcpNodeError::SessionMissing.into()),

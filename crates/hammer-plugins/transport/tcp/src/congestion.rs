@@ -98,14 +98,6 @@ impl Algorithm {
             next_send_delay: next_send_delay::<C>,
         }
     }
-
-    #[cfg(test)]
-    pub(crate) const fn for_test<C>(name: &'static str) -> Self
-    where
-        C: CongestionController,
-    {
-        Self::new::<C>(name)
-    }
 }
 
 const BBR: Algorithm = Algorithm::new::<BbrController>("bbr");

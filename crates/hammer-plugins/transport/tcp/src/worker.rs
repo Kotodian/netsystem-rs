@@ -1,7 +1,5 @@
 use std::time::{Duration, Instant};
 
-#[cfg(test)]
-use crate::TcpPacket;
 use crate::{TcpError, TcpSeq, TcpState};
 use hammer_core::data_plane::DataPlaneBuffers;
 use hammer_infra::pool::Pool;
@@ -21,13 +19,8 @@ const DEFAULT_TCP_CONNECTION_CAPACITY: usize = 1024;
 const TCP_APP_RX_MIN_FREE: usize = 4 << 10;
 const TCP_APP_RX_MAX_FREE: usize = 128 << 10;
 
-#[hammer_component_macros::session_transport(
-    name = "tcp",
-    start_listen = crate::start_listen,
-    stop_listen = crate::stop_listen,
-    connect = crate::connect
-)]
 pub struct TcpWorker {
+    protocol: u8,
     pub(crate) connections: Pool<TcpConnection>,
     pub(crate) lookup: TcpLookupState,
     pub(super) timers: TcpTimers,
@@ -35,8 +28,9 @@ pub struct TcpWorker {
 
 impl TcpWorker {
     #[inline]
-    pub fn new(worker: DataWorkerId) -> Self {
+    pub fn new(worker: DataWorkerId, protocol: u8) -> Self {
         Self {
+            protocol,
             connections: Pool::with_capacity(DEFAULT_TCP_CONNECTION_CAPACITY),
             lookup: TcpLookupState::new(worker),
             timers: TcpTimers::new(Instant::now(), Duration::from_millis(10)),
@@ -70,27 +64,9 @@ impl TcpWorker {
             .expect("TCP connection index remains live during removal")
     }
 
-    #[cfg(test)]
-    pub(crate) fn receive_close_side_for_test(
-        &mut self,
-        index: u32,
-        packet: &TcpPacket,
-    ) -> RuntimeResult<()> {
-        let Self {
-            connections,
-            timers,
-            ..
-        } = self;
-        connections
-            .get_mut(index)
-            .ok_or(TcpNodeError::SessionMissing)?
-            .receive_close_side(index, timers, packet, Instant::now())?;
-        Ok(())
-    }
-
     fn remove_closed_connection(
         &mut self,
-        sessions: &mut SessionWorker<u32>,
+        sessions: &mut SessionWorker,
         index: u32,
     ) -> RuntimeResult<()> {
         let Some(connection) = self.connections.get(index) else {
@@ -115,7 +91,7 @@ impl TcpWorker {
 
     fn control_output(
         &mut self,
-        sessions: &mut SessionWorker<u32>,
+        sessions: &mut SessionWorker,
         index: u32,
         runtime: &DataPlaneRuntime,
         output_next: SessionQueueNext,
@@ -128,6 +104,7 @@ impl TcpWorker {
                 connections,
                 lookup,
                 timers,
+                ..
             } = self;
             let connection = connections
                 .get_mut(index)
@@ -157,10 +134,13 @@ impl TcpWorker {
     }
 }
 
-impl SessionTransport<u32> for TcpWorker {
+impl SessionTransport for TcpWorker {
     type Tx = SessionPacketizedTx;
 
-    const ID: u8 = 1;
+    #[inline]
+    fn protocol(&self) -> u8 {
+        self.protocol
+    }
 
     fn app_rx_evt(
         &mut self,
@@ -203,7 +183,7 @@ impl SessionTransport<u32> for TcpWorker {
 
     fn update_time(
         &mut self,
-        sessions: &mut SessionWorker<u32>,
+        sessions: &mut SessionWorker,
         runtime: &DataPlaneRuntime,
         output_next: SessionQueueNext,
         frame: &mut hammer_core::data_plane::BufferFrame,
@@ -217,6 +197,7 @@ impl SessionTransport<u32> for TcpWorker {
                     connections,
                     lookup,
                     timers,
+                    ..
                 } = self;
                 let connection = connections
                     .get_mut(token.index)
@@ -267,7 +248,7 @@ impl SessionTransport<u32> for TcpWorker {
 
     fn disconnect(
         &mut self,
-        sessions: &mut SessionWorker<u32>,
+        sessions: &mut SessionWorker,
         index: u32,
         runtime: &DataPlaneRuntime,
         output_next: SessionQueueNext,
@@ -286,11 +267,11 @@ impl SessionTransport<u32> for TcpWorker {
     }
 }
 
-impl SessionPacketizedTransport<u32> for TcpWorker {
+impl SessionPacketizedTransport for TcpWorker {
     #[inline]
     fn control_tx(
         &mut self,
-        sessions: &mut SessionWorker<u32>,
+        sessions: &mut SessionWorker,
         index: u32,
         runtime: &DataPlaneRuntime,
         output_next: SessionQueueNext,
@@ -303,7 +284,7 @@ impl SessionPacketizedTransport<u32> for TcpWorker {
 
     fn send_params(
         &mut self,
-        _: &mut SessionWorker<u32>,
+        _: &mut SessionWorker,
         index: u32,
         pending_len: usize,
         now: Instant,

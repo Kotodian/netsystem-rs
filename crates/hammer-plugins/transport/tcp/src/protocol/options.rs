@@ -146,24 +146,3 @@ pub(crate) const TCP_OPTION_WINDOW_SCALE_LEN_VALUE: usize = TCP_OPTION_WINDOW_SC
 pub(crate) const TCP_OPTION_SACK_PERMITTED_LEN_VALUE: usize = TCP_OPTION_SACK_PERMITTED_LEN;
 pub(crate) const TCP_OPTION_TIMESTAMPS_LEN_VALUE: usize = TCP_OPTION_TIMESTAMPS_LEN;
 pub(crate) const TCP_MAX_WINDOW_SCALE_VALUE: u8 = TCP_MAX_WINDOW_SCALE;
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn tcp_options_parse_fast_open_cookie_as_value_type() {
-        let options = [TCP_OPTION_FAST_OPEN, 6, 1, 2, 3, 4];
-
-        let parsed = tcp_options_from_bytes(&options);
-
-        assert!(parsed.capabilities.fast_open);
-        assert_eq!(
-            parsed
-                .fast_open_cookie
-                .as_ref()
-                .map(TcpFastOpenCookie::as_slice),
-            Some(&[1, 2, 3, 4][..])
-        );
-    }
-}

@@ -29,7 +29,7 @@ pub struct TcpEstablishedNode {
 
 pub fn register_tcp_established(runtime: &DataPlaneRuntime) -> RuntimeResult<NodeId> {
     let main = crate::TCP_MAIN
-        .load_full()
+        .get()
         .ok_or(RuntimeError::PluginStateNotInitialized { plugin: "tcp" })?;
     if let Some(node) = runtime.nodes().node_by_name("tcp-established") {
         return Ok(node);
@@ -119,7 +119,7 @@ fn tcp_established_index(
 ) -> RuntimeResult<()> {
     let packet = tcp_packet(runtime, index)?;
     let main = crate::TCP_MAIN
-        .load_full()
+        .get()
         .ok_or(RuntimeError::PluginStateNotInitialized { plugin: "tcp" })?;
     let tx_segment = main.with_worker(runtime, |sessions, tcp| {
         let session_id = read_session_id(runtime, index)?.ok_or_else(|| {
@@ -130,8 +130,8 @@ fn tcp_established_index(
         // borrow; the `receive_established`/`accept_payload` work below gives
         // the prefetch lead time.
         sessions.prefetch_session(session_id);
-        let (_, connection_index) = sessions
-            .session_transport(session_id)
+        let connection_index = sessions
+            .transport_connection_index(session_id)
             .ok_or(TcpNodeError::EstablishedSessionMissing)?;
         let (
             control,

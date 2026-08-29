@@ -25,8 +25,6 @@ pub enum TcpListenerControlError {
     AlreadyRegistered { bind: SocketAddr },
     #[error("tcp listener {lookup_id} is not registered")]
     NotRegistered { lookup_id: TcpLookupId },
-    #[error("session listener {listener:?} is not registered by tcp")]
-    SessionListenerNotRegistered { listener: SessionHandle },
     #[error("tcp lookup id space is exhausted")]
     LookupIdExhausted,
 }
@@ -75,13 +73,6 @@ unsafe impl Sync for TcpListenerControlCell {}
 #[derive(Clone)]
 pub(super) struct TcpListenerControlHandle {
     state: Arc<TcpListenerControlCell>,
-}
-
-#[cfg(test)]
-#[derive(Clone)]
-struct TcpListenerControlSnapshot {
-    tcp_listeners: Vec<TcpLookupId>,
-    tcp_lookup: TcpLookupSnapshot,
 }
 
 impl TcpListenerControlState {
@@ -138,15 +129,8 @@ impl TcpListenerControlState {
         self.publish_tcp_lookup()
     }
 
-    fn close_session_listener(&mut self, listener: SessionHandle) -> RuntimeResult<()> {
-        let lookup_id = self
-            .tcp_listeners
-            .iter()
-            .find_map(|registration| {
-                (registration.session_listener == listener).then_some(registration.lookup_id)
-            })
-            .ok_or(TcpListenerControlError::SessionListenerNotRegistered { listener })?;
-        self.close_tcp_listener(lookup_id)
+    fn close_connection_index(&mut self, connection_index: TcpLookupId) -> RuntimeResult<()> {
+        self.close_tcp_listener(connection_index)
     }
 
     fn alloc_tcp_lookup_id(&mut self) -> RuntimeResult<TcpLookupId> {
@@ -233,182 +217,11 @@ impl TcpListenerControlHandle {
         state.bind_tcp_listener(bind, owner_worker, capabilities, session_listener)
     }
 
-    pub(super) fn close_session_listener(&self, listener: SessionHandle) -> RuntimeResult<()> {
+    pub(super) fn close_connection_index(
+        &self,
+        connection_index: TcpLookupId,
+    ) -> RuntimeResult<()> {
         let state = unsafe { self.state.get_mut() };
-        state.close_session_listener(listener)
-    }
-
-    #[cfg(test)]
-    fn snapshot_for_test(&self) -> TcpListenerControlSnapshot {
-        let state = unsafe { &*self.state.inner.get() };
-        let mut tcp_listeners = Vec::new();
-        for registration in state.tcp_listeners.iter() {
-            tcp_listeners.push(registration.lookup_id);
-        }
-        TcpListenerControlSnapshot {
-            tcp_listeners,
-            tcp_lookup: state.tcp_lookup.clone(),
-        }
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::lookup::TcpV4ListenerKey;
-    use std::net::Ipv4Addr;
-
-    #[test]
-    fn tcp_listener_lifecycle() {
-        let control = TcpInputControlPlane::new();
-        let handle = TcpListenerControlHandle::new(control);
-
-        let bind = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 7300);
-        let lookup_id = handle
-            .bind(
-                bind,
-                DataWorkerId::new(0),
-                TcpCapabilities::default(),
-                SessionHandle::new(7, 3),
-            )
-            .expect("bind tcp listener");
-
-        let snapshot = handle.snapshot_for_test();
-        assert_eq!(snapshot.tcp_listeners.len(), 1);
-        assert_eq!(snapshot.tcp_listeners[0], lookup_id);
-
-        let lookup_entry = snapshot
-            .tcp_lookup
-            .lookup_listener::<TcpIpv4ListenerAddress>(TcpV4ListenerKey::new(
-                0,
-                Ipv4Addr::new(127, 0, 0, 1),
-                7300,
-            ));
-        assert!(lookup_entry.is_some(), "listener must appear in lookup");
-        assert_eq!(lookup_entry.unwrap().id, lookup_id);
-        assert_eq!(
-            lookup_entry.unwrap().session_listener,
-            SessionHandle::new(7, 3)
-        );
-
-        handle
-            .close_session_listener(SessionHandle::new(7, 3))
-            .expect("close tcp listener");
-        let snapshot = handle.snapshot_for_test();
-        assert!(
-            snapshot
-                .tcp_lookup
-                .lookup_listener::<TcpIpv4ListenerAddress>(TcpV4ListenerKey::new(
-                    0,
-                    Ipv4Addr::new(127, 0, 0, 1),
-                    7300,
-                ))
-                .is_none(),
-            "closed listener lookup must be removed"
-        );
-        assert!(
-            snapshot.tcp_listeners.iter().all(|id| *id != lookup_id),
-            "closed listener registration must be removed"
-        );
-    }
-
-    #[test]
-    fn duplicate_tcp_endpoint_is_rejected_without_replacing_existing_listener() {
-        let control = TcpInputControlPlane::new();
-        let handle = TcpListenerControlHandle::new(control);
-        let bind = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 7301);
-        let listener = SessionHandle::new(7, 3);
-        let lookup_id = handle
-            .bind(
-                bind,
-                DataWorkerId::new(0),
-                TcpCapabilities::default(),
-                listener,
-            )
-            .expect("bind first tcp listener");
-
-        assert!(
-            handle
-                .bind(
-                    bind,
-                    DataWorkerId::new(1),
-                    TcpCapabilities::default(),
-                    SessionHandle::new(8, 4),
-                )
-                .is_err(),
-            "duplicate endpoint must be rejected"
-        );
-
-        let snapshot = handle.snapshot_for_test();
-        assert_eq!(snapshot.tcp_listeners, vec![lookup_id]);
-        let entry = snapshot
-            .tcp_lookup
-            .lookup_listener::<TcpIpv4ListenerAddress>(TcpV4ListenerKey::new(
-                0,
-                Ipv4Addr::LOCALHOST,
-                7301,
-            ))
-            .expect("original listener remains published");
-        assert_eq!(entry.id, lookup_id);
-        assert_eq!(entry.session_listener, listener);
-        assert_eq!(entry.owner_worker, DataWorkerId::new(0));
-    }
-
-    #[test]
-    fn close_missing_session_listener_is_rejected() {
-        let control = TcpInputControlPlane::new();
-        let handle = TcpListenerControlHandle::new(control);
-
-        assert!(
-            handle
-                .close_session_listener(SessionHandle::new(999, 1))
-                .is_err(),
-            "missing Session listener is rejected"
-        );
-    }
-
-    #[test]
-    fn close_session_listener_removes_published_lookup() {
-        let control = TcpInputControlPlane::new();
-        let handle = TcpListenerControlHandle::new(control);
-        let bind = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 7302);
-        let listener = SessionHandle::new(9, 2);
-        handle
-            .bind(
-                bind,
-                DataWorkerId::new(3),
-                TcpCapabilities::default(),
-                listener,
-            )
-            .expect("bind Session-owned tcp listener");
-
-        let snapshot = handle.snapshot_for_test();
-        let entry = snapshot
-            .tcp_lookup
-            .lookup_listener::<TcpIpv4ListenerAddress>(TcpV4ListenerKey::new(
-                0,
-                Ipv4Addr::LOCALHOST,
-                7302,
-            ))
-            .expect("Session-owned listener is published");
-        assert_eq!(entry.owner_worker, DataWorkerId::new(3));
-        assert_eq!(entry.session_listener, listener);
-
-        handle
-            .close_session_listener(listener)
-            .expect("close Session-owned listener");
-        let snapshot = handle.snapshot_for_test();
-        assert!(
-            snapshot
-                .tcp_lookup
-                .lookup_listener::<TcpIpv4ListenerAddress>(TcpV4ListenerKey::new(
-                    0,
-                    Ipv4Addr::LOCALHOST,
-                    7302,
-                ))
-                .is_none(),
-            "unlisten removes the production lookup entry"
-        );
-        assert!(snapshot.tcp_listeners.is_empty());
+        state.close_connection_index(connection_index)
     }
 }

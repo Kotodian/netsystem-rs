@@ -30,7 +30,7 @@ pub struct TcpRcvProcessNode {
 
 pub fn register_tcp_rcv_process(runtime: &DataPlaneRuntime) -> RuntimeResult<NodeId> {
     let main = crate::TCP_MAIN
-        .load_full()
+        .get()
         .ok_or(RuntimeError::PluginStateNotInitialized { plugin: "tcp" })?;
     if let Some(node) = runtime.nodes().node_by_name("tcp-rcv-process") {
         return Ok(node);
@@ -120,7 +120,7 @@ fn tcp_rcv_process_index(
 ) -> RuntimeResult<()> {
     let packet = tcp_packet(runtime, index)?;
     let main = crate::TCP_MAIN
-        .load_full()
+        .get()
         .ok_or(RuntimeError::PluginStateNotInitialized { plugin: "tcp" })?;
     let control = main.with_worker(runtime, |sessions, tcp| {
         let session_id = read_session_id(runtime, index)?.ok_or_else(|| {
@@ -131,8 +131,8 @@ fn tcp_rcv_process_index(
         // borrow; the `receive_close_side` work below gives the prefetch
         // lead time.
         sessions.prefetch_session(session_id);
-        let (_, connection_index) = sessions
-            .session_transport(session_id)
+        let connection_index = sessions
+            .transport_connection_index(session_id)
             .ok_or(TcpNodeError::RcvProcessSessionMissing)?;
         let (control, ack_advanced, acked_tx_len, established_with_payload) = {
             let crate::worker::TcpWorker {

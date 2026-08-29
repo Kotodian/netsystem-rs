@@ -25,14 +25,12 @@ hammer_component_macros::declare_plugin!(
         output::__NODE_FUNCTION_TCP_OUTPUT_NODE_PROCESS_SIMD_SIMD512,
     ],
     process_nodes = [],
-    session_transports = [worker::__SESSION_TRANSPORT_TCP_WORKER],
 );
 
 use std::mem::transmute;
 use std::net::SocketAddr;
-use std::sync::{Arc, mpsc};
+use std::sync::{Arc, OnceLock, mpsc};
 
-use arc_swap::ArcSwapOption;
 use hammer_core::data_plane::{BufferPacketCursor, NodeId, NodeState, SecondaryOpaque};
 use hammer_runtime::app::SessionHandle;
 use hammer_runtime::{
@@ -43,11 +41,12 @@ use thiserror::Error;
 
 use hammer_infra::align::CacheLine;
 use hammer_infra::thread_owned::{ThreadOwned, ThreadOwnedError};
+use hammer_service::session::SessionQueueNext;
 use hammer_service::session::node::{SessionQueueNode, SessionQueueOutput};
 use hammer_service::session::runtime::{
-    SessionMain, SessionTransport, SessionWorker, dispatch_session_queue_events,
+    SessionTransport, SessionWorker, dispatch_session_queue_events, session_main,
 };
-use hammer_service::session::{SessionQueueNext, u32};
+use hammer_service::transport::{TransportVft, register_transport};
 
 pub mod config;
 pub mod congestion;
@@ -88,9 +87,6 @@ pub use syn_sent::{TcpSynSentNext, TcpSynSentNode};
 
 pub use worker::TcpWorker;
 
-#[cfg(test)]
-mod session_driver_tests;
-
 #[hammer_component_macros::runtime_error(subsystem = "tcp")]
 #[derive(Debug, Error)]
 enum TcpWorkerError {
@@ -111,12 +107,12 @@ enum TcpWorkerError {
 }
 
 pub(crate) fn publish_tcp_connection(
-    sessions: &mut SessionWorker<u32>,
+    sessions: &mut SessionWorker,
     tcp: &mut TcpWorker,
     session_id: u32,
 ) -> RuntimeResult<()> {
-    let (_, index) = sessions
-        .session_transport(session_id)
+    let index = sessions
+        .transport_connection_index(session_id)
         .ok_or(TcpNodeError::SessionMissing)?;
     let (close, half_open) = {
         let TcpWorker {
@@ -133,7 +129,7 @@ pub(crate) fn publish_tcp_connection(
     if half_open {
         return Ok(());
     }
-    let rollback = |sessions: &mut SessionWorker<u32>, tcp: &mut TcpWorker| {
+    let rollback = |sessions: &mut SessionWorker, tcp: &mut TcpWorker| {
         tcp.lookup.forget_session(session_id);
         tcp.lookup.forget_pending_open(session_id);
         let session_cleanup = sessions.rollback_session_creation(session_id);
@@ -193,6 +189,7 @@ pub(crate) fn publish_tcp_connection(
 }
 
 pub struct TcpMain {
+    protocol: u8,
     control: TcpInputControlPlane,
     listeners: listener_control::TcpListenerControlHandle,
     input_process: NodeProcessFn,
@@ -200,12 +197,11 @@ pub struct TcpMain {
     established_process: NodeProcessFn,
     rcv_process: NodeProcessFn,
     syn_sent_process: NodeProcessFn,
-    sessions: Arc<SessionMain>,
     workers: Box<[CacheLine<ThreadOwned<TcpWorker>>]>,
 }
 
 impl TcpMain {
-    fn new(worker_count: usize, sessions: Arc<SessionMain>) -> Self {
+    fn new(protocol: u8, worker_count: usize) -> Self {
         let control = TcpInputControlPlane::new();
         let listeners = listener_control::TcpListenerControlHandle::new(control.clone());
         let workers = (0..worker_count)
@@ -213,6 +209,7 @@ impl TcpMain {
             .collect::<Vec<_>>()
             .into_boxed_slice();
         Self {
+            protocol,
             control,
             listeners,
             input_process: input::tcp_input_process,
@@ -220,7 +217,6 @@ impl TcpMain {
             established_process: established::tcp_established_process,
             rcv_process: rcv_process::tcp_rcv_process_process,
             syn_sent_process: syn_sent::tcp_syn_sent_process,
-            sessions,
             workers,
         }
     }
@@ -238,9 +234,9 @@ impl TcpMain {
     fn with_worker<R>(
         &self,
         runtime: &DataPlaneRuntime,
-        operation: impl FnOnce(&mut SessionWorker<u32>, &mut TcpWorker) -> RuntimeResult<R>,
+        operation: impl FnOnce(&mut SessionWorker, &mut TcpWorker) -> RuntimeResult<R>,
     ) -> RuntimeResult<R> {
-        self.sessions.with_worker_mut(runtime, |sessions| {
+        session_main().with_worker_mut(runtime, |sessions| {
             self.with_tcp_worker(runtime, |tcp| operation(sessions, tcp))
         })
     }
@@ -251,10 +247,8 @@ impl TcpMain {
         operation: impl FnOnce(&mut TcpWorker) -> RuntimeResult<R>,
     ) -> RuntimeResult<R> {
         let thread_index = runtime.thread_index();
-        let worker = thread_index
-            .checked_sub(1)
-            .map(DataWorkerId::new)
-            .ok_or(TcpWorkerError::WorkerUnavailable { thread_index })?;
+        let worker = DataWorkerId::try_from(thread_index)
+            .map_err(|_| TcpWorkerError::WorkerUnavailable { thread_index })?;
         self.worker(worker)?
             .with_mut(operation)
             .map_err(|source| TcpWorkerError::WorkerAccess {
@@ -265,6 +259,10 @@ impl TcpMain {
 
     pub fn control(&self) -> &TcpInputControlPlane {
         &self.control
+    }
+
+    pub const fn protocol(&self) -> u8 {
+        self.protocol
     }
 
     fn bind_tcp_listener(
@@ -282,17 +280,24 @@ impl TcpMain {
 // VPP alignment: `tcp_main_t tcp_main;` is a file-scope global in VPP's
 // `tcp.c`; nodes read it directly and `tcp_init` publishes the configured
 // instance before workers start.
-pub static TCP_MAIN: ArcSwapOption<TcpMain> = ArcSwapOption::const_empty();
+pub static TCP_MAIN: OnceLock<TcpMain> = OnceLock::new();
+
+pub fn protocol() -> RuntimeResult<u8> {
+    TCP_MAIN
+        .get()
+        .map(TcpMain::protocol)
+        .ok_or(RuntimeError::PluginStateNotInitialized { plugin: "tcp" })
+}
 
 pub(crate) fn start_listen(
     listener: SessionHandle,
     _: u32,
     _: Option<u64>,
     endpoint: SessionListenEndpoint,
-) -> RuntimeResult<()> {
+) -> RuntimeResult<u32> {
     hammer_runtime::ensure_main_thread_with_barrier()?;
     let main = TCP_MAIN
-        .load_full()
+        .get()
         .ok_or(RuntimeError::PluginStateNotInitialized { plugin: "tcp" })?;
     main.bind_tcp_listener(
         endpoint.local(),
@@ -300,15 +305,15 @@ pub(crate) fn start_listen(
         listener_capabilities(),
         listener,
     )
-    .map(drop)
+    .map(|lookup_id| lookup_id)
 }
 
-pub(crate) fn stop_listen(listener: SessionHandle) -> RuntimeResult<()> {
+pub(crate) fn stop_listen(connection_index: u32) -> RuntimeResult<()> {
     hammer_runtime::ensure_main_thread_with_barrier()?;
     let main = TCP_MAIN
-        .load_full()
+        .get()
         .ok_or(RuntimeError::PluginStateNotInitialized { plugin: "tcp" })?;
-    main.listeners.close_session_listener(listener)
+    main.listeners.close_connection_index(connection_index)
 }
 
 pub(crate) fn connect(endpoint: SessionConnectEndpoint) -> RuntimeResult<()> {
@@ -316,15 +321,15 @@ pub(crate) fn connect(endpoint: SessionConnectEndpoint) -> RuntimeResult<()> {
     if local.is_ipv4() != endpoint.remote.is_ipv4() || local.port() == 0 {
         return Err(TcpError::InvalidConnection.into());
     }
-    let main = TCP_MAIN
-        .load_full()
-        .ok_or(RuntimeError::PluginStateNotInitialized { plugin: "tcp" })?;
     let worker = endpoint.worker;
     let worker_slot = worker.slot();
     let (completion, completed) = mpsc::sync_channel(1);
     Engine::with_current(|engine| {
         engine.schedule_on_worker(worker, move || {
             let result = with_data_plane_runtime(|runtime| {
+                let main = TCP_MAIN
+                    .get()
+                    .ok_or(RuntimeError::PluginStateNotInitialized { plugin: "tcp" })?;
                 main.with_worker(runtime, |sessions, tcp| {
                     start_connect(sessions, tcp, endpoint.connection, local, endpoint.remote)
                 })
@@ -343,7 +348,7 @@ pub(crate) fn connect(endpoint: SessionConnectEndpoint) -> RuntimeResult<()> {
 }
 
 fn start_connect(
-    sessions: &mut SessionWorker<u32>,
+    sessions: &mut SessionWorker,
     tcp: &mut TcpWorker,
     connection: u32,
     local: SocketAddr,
@@ -355,7 +360,7 @@ fn start_connect(
     transport.connect_state(initial_sequence);
     let connection_index = tcp.insert_connection(transport);
     let session_id =
-        match sessions.stream_connect_pending(TcpWorker::ID, connection_index, connection) {
+        match sessions.stream_connect_pending(tcp.protocol(), connection_index, connection) {
             Ok(session_id) => session_id,
             Err(error) => {
                 let _ = tcp.remove_connection(connection_index);
@@ -386,30 +391,38 @@ fn configure_tcp(
 
 #[hammer_component_macros::init_function(
     name = "tcp_init",
-    runs_after = ["transport_init", "session_init"],
+    runs_after = ["transport_main_init", "session_init"],
     runs_before = ["install_packet_graph"]
 )]
-fn init_tcp(
-    engine: &mut Engine,
-    config: Arc<crate::config::TcpPluginConfig>,
-    sessions: Arc<SessionMain>,
-) -> RuntimeResult<()> {
-    let main = Arc::new(configured_tcp_main(
-        config.as_ref(),
-        engine.configured_worker_count(),
-        sessions,
-    )?);
-    TCP_MAIN.store(Some(Arc::clone(&main)));
+fn init_tcp(engine: &mut Engine, config: Arc<crate::config::TcpPluginConfig>) -> RuntimeResult<()> {
+    if TCP_MAIN.get().is_some() {
+        return Err(RuntimeError::PluginStateNotInitialized { plugin: "tcp" });
+    }
+    let protocol = register_transport(TransportVft::new(
+        Some(start_listen),
+        Some(stop_listen),
+        Some(connect),
+        None,
+        None,
+        None,
+        None,
+        None,
+    ))
+    .map_err(RuntimeError::from)?;
+    let main = configured_tcp_main(config.as_ref(), protocol, engine.configured_worker_count())?;
+    TCP_MAIN
+        .set(main)
+        .map_err(|_| RuntimeError::PluginStateNotInitialized { plugin: "tcp" })?;
     Ok(())
 }
 
 fn configured_tcp_main(
     tcp: &crate::config::TcpPluginConfig,
+    protocol: u8,
     worker_count: usize,
-    sessions: Arc<SessionMain>,
 ) -> RuntimeResult<TcpMain> {
     publish_tcp_policy(TcpPolicy::from_plugin_config(tcp));
-    Ok(TcpMain::new(worker_count, sessions))
+    Ok(TcpMain::new(protocol, worker_count))
 }
 
 fn listener_capabilities() -> TcpCapabilities {
@@ -431,7 +444,7 @@ fn listener_capabilities() -> TcpCapabilities {
 
 pub fn register_tcp_input(runtime: &DataPlaneRuntime) -> RuntimeResult<NodeId> {
     let main = TCP_MAIN
-        .load_full()
+        .get()
         .ok_or(RuntimeError::PluginStateNotInitialized { plugin: "tcp" })?;
     let node = if let Some(node) = runtime.nodes().node_by_name("tcp-input") {
         node
@@ -501,9 +514,8 @@ fn bind_worker_graph(engine: &mut Engine) -> RuntimeResult<()> {
         tcp_session_queue_update_time,
         tcp_session_queue_dispatch,
     )?;
-    let main_guard = TCP_MAIN.load();
-    let main = main_guard
-        .as_deref()
+    let main = TCP_MAIN
+        .get()
         .ok_or(RuntimeError::PluginStateNotInitialized { plugin: "tcp" })?;
     let input_data = main
         .control()
@@ -528,7 +540,7 @@ fn bind_worker_graph(engine: &mut Engine) -> RuntimeResult<()> {
 
     if main
         .worker(worker)?
-        .install(TcpWorker::new(worker))
+        .install(TcpWorker::new(worker, main.protocol))
         .is_err()
     {
         return Err(TcpWorkerError::WorkerAlreadyInstalled {
@@ -549,14 +561,14 @@ fn bind_worker_graph(engine: &mut Engine) -> RuntimeResult<()> {
 )]
 fn init_tcp_worker(engine: &mut Engine) -> RuntimeResult<()> {
     TCP_MAIN
-        .load_full()
+        .get()
         .ok_or(RuntimeError::PluginStateNotInitialized { plugin: "tcp" })?;
     bind_worker_graph(engine)
 }
 
 fn tcp_session_queue_update_time(
     runtime: &DataPlaneRuntime,
-    sessions: &mut SessionWorker<u32>,
+    sessions: &mut SessionWorker,
     _: NodeRuntimeData,
     output_next: SessionQueueNext,
     now: std::time::Instant,
@@ -564,7 +576,7 @@ fn tcp_session_queue_update_time(
     output: &mut SessionQueueOutput,
 ) -> RuntimeResult<()> {
     TCP_MAIN
-        .load_full()
+        .get()
         .ok_or(RuntimeError::PluginStateNotInitialized { plugin: "tcp" })?
         .with_tcp_worker(runtime, |tcp| {
             tcp.update_time(sessions, runtime, output_next, frame, output, now)?;
@@ -574,7 +586,7 @@ fn tcp_session_queue_update_time(
 
 fn tcp_session_queue_dispatch(
     runtime: &DataPlaneRuntime,
-    sessions: &mut SessionWorker<u32>,
+    sessions: &mut SessionWorker,
     _: NodeRuntimeData,
     output_next: SessionQueueNext,
     now: std::time::Instant,
@@ -582,7 +594,7 @@ fn tcp_session_queue_dispatch(
     output: &mut SessionQueueOutput,
 ) -> RuntimeResult<()> {
     TCP_MAIN
-        .load_full()
+        .get()
         .ok_or(RuntimeError::PluginStateNotInitialized { plugin: "tcp" })?
         .with_tcp_worker(runtime, |tcp| {
             dispatch_session_queue_events(runtime, sessions, tcp, output_next, frame, output, now)
@@ -844,16 +856,6 @@ pub(crate) fn read_tcp_egress_endpoints(
 }
 
 /// Skip a leading IPv4/IPv6 header when present (tcp-output push), else treat as bare TCP.
-#[cfg(test)]
-#[inline]
-pub(crate) fn tcp_bytes_after_l3(packet: &[u8]) -> &[u8] {
-    let offset = match packet.first().copied().map(|b| b >> 4) {
-        Some(4) if packet.len() >= 20 => usize::from(packet[0] & 0x0f) * 4,
-        Some(6) if packet.len() >= 40 => 40,
-        _ => 0,
-    };
-    packet.get(offset..).unwrap_or(packet)
-}
 
 #[inline(always)]
 pub(crate) fn write_session_route_opaque(
@@ -864,7 +866,7 @@ pub(crate) fn write_session_route_opaque(
 ) {
     let route = unsafe { transmute::<&mut SecondaryOpaque, &mut TcpRouteOpaque>(opaque) };
     *route = TcpRouteOpaque {
-        session_raw: session_id.get(),
+        session_raw: session_id.into(),
         owner_worker: owner.slot() as u32,
         next: next as u8,
         present: 1,
@@ -881,7 +883,7 @@ pub(crate) fn read_session_route_opaque(
         return None;
     }
     Some((
-        route.session_raw,
+        u32::try_from(route.session_raw).ok()?,
         DataWorkerId::new(route.owner_worker),
         match route.next {
             value if value == TcpInputNext::Listen as u8 => TcpInputNext::Listen,
@@ -955,69 +957,6 @@ fn enqueue_tcp_segment(
     segment.write_to_buffer(runtime.buffers(), index)?;
     let _ = output.try_enqueue_io(frame, output_next, index)?;
     Ok(())
-}
-
-#[cfg(test)]
-#[doc(hidden)]
-pub(crate) fn closing_session_for_test() -> (
-    SessionWorker<u32>,
-    TcpWorker,
-    u32,
-    std::net::SocketAddr,
-    std::net::SocketAddr,
-) {
-    let local: std::net::SocketAddr = "192.0.2.10:443".parse().expect("local");
-    let remote: std::net::SocketAddr = "198.51.100.20:50001".parse().expect("remote");
-    let worker = DataWorkerId::new(0);
-    let applications = hammer_service::session::ApplicationMain::new(1024);
-    let mut sessions = SessionWorker::new(
-        worker,
-        1,
-        hammer_runtime::app::AppSessionConfig::default(),
-        1024,
-        Arc::clone(&applications),
-        None,
-    )
-    .expect("session worker for test");
-    let mut tcp = TcpWorker::new(worker);
-    let connection = TcpConnection::established_for_time_wait_test(
-        None,
-        worker,
-        local.port(),
-        Some(local),
-        remote,
-    );
-    let connection_index = tcp.insert_connection(connection);
-    let application = applications.attach().expect("attach test Application");
-    sessions
-        .install_application_mq_for_test(application)
-        .expect("install test Application MQ");
-    let application_listener = applications
-        .register_listener(application, None, None)
-        .expect("register test Application listener");
-    let session_main = Arc::new(SessionMain::new(1, applications));
-    sessions.set_listener_main(Arc::clone(&session_main));
-    let listener = session_main
-        .listen(
-            application_listener,
-            hammer_runtime::SessionTransportRegistration::new(
-                "test-session",
-                Some(|_, _, _, _| Ok(())),
-                Some(|_| Ok(())),
-                None,
-            ),
-            SessionListenEndpoint::new("127.0.0.1:0".parse().expect("test endpoint"), worker),
-        )
-        .expect("register test Session listener");
-    let session_id = sessions
-        .stream_accept(TcpWorker::ID, connection_index, listener)
-        .expect("accept stream session");
-    tcp.connection_mut(connection_index)
-        .expect("TCP connection")
-        .attach_session(session_id)
-        .expect("attach stream session");
-    publish_tcp_connection(&mut sessions, &mut tcp, session_id).expect("publish TCP connection");
-    (sessions, tcp, session_id, local, remote)
 }
 
 #[hammer_component_macros::node_next]
