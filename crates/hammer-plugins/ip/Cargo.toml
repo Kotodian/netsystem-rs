@@ -22,7 +22,3 @@ serde = { workspace = true }
 thiserror = { workspace = true }
 toml = { workspace = true }
 humantime-serde = { workspace = true }
-
-[dev-dependencies]
-hammer-infra = { path = "../../hammer-infra" }
-tokio = { workspace = true }

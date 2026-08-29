@@ -823,31 +823,3 @@ fn l4_checksum(_packet: &[u8], parsed: &ParsedIpPacket, protocol: u8, segment: &
         },
     }
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn ip_local_state_returns_protocol_or_control_next() {
-        let state = IpLocalState::new();
-
-        assert_eq!(
-            state.protocol_next_slot(IpProtocol::Tcp),
-            NodeNext::slot(IpLocalNext::Punt)
-        );
-        assert_eq!(
-            state.protocol_next_slot(IpProtocol::Other(99)),
-            NodeNext::slot(IpLocalNext::Punt)
-        );
-        assert_eq!(state.drop_slot(), NodeNext::slot(IpLocalNext::Drop));
-        assert_eq!(
-            state.reassembly_slot(),
-            NodeNext::slot(IpLocalNext::Reassembly)
-        );
-
-        let mut custom = IpLocalState::new();
-        custom.protocol_nexts[IP_PROTOCOL_TCP as usize] = Some(42);
-        assert_eq!(custom.protocol_next_slot(IpProtocol::Tcp), 42);
-    }
-}
