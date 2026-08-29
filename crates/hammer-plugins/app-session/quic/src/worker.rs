@@ -13,22 +13,17 @@ use hammer_infra::fifo::{Fifo, FifoError};
 use hammer_infra::pool::Pool;
 use hammer_infra::thread_owned::ThreadOwnedError;
 use hammer_infra::timer_wheel::TimerWheel1t2w2048sl;
-use hammer_runtime::app::{
-    ApplicationId, SessionAppContext, SessionAppId, SessionConnectError, SessionDgramHeader,
-    SessionFlags, SessionHandle,
-};
-use hammer_runtime::session::{SessionApplicationErrorCode, SessionStreamDirection};
+use hammer_runtime::app::{SessionConnectError, SessionDgramHeader, SessionFlags, SessionHandle};
+use hammer_runtime::session::SessionStreamDirection;
 use hammer_runtime::{
     DataPlaneRuntime, DataWorkerId, NodeRuntimeData, RuntimeError, RuntimeResult,
-    SessionConnectionId, SessionHandle,
 };
-use hammer_service::session::ApplicationMain;
-use hammer_service::session::SessionId;
-use hammer_service::session::error::SessionTransportActionError;
+use hammer_service::session::application::{ApplicationMain, application_main};
 use hammer_service::session::node::{SessionQueueNext, SessionQueueOutput};
+use hammer_service::session::runtime::SessionMain;
 use hammer_service::session::runtime::{
-    SessionTransport, SessionTransportId, SessionTransportWorkerActions, SessionWorker,
-    TransportInternalTransport, TransportInternalTx, dispatch_session_queue_events,
+    SessionTransport, SessionWorker, TransportInternalTransport, TransportInternalTx,
+    dispatch_session_queue_events,
 };
 
 use crate::listener::QUIC_MAIN;
@@ -55,12 +50,12 @@ const STREAM_RECV_FIN: u8 = 1 << 3;
 /// defaults to 0).
 const RESET_APP_ERROR_CODE: quinn_proto::VarInt = quinn_proto::VarInt::from_u32(0);
 
-/// QUIC-local wrapper around `SessionApplicationErrorCode` (foreign) so the
+/// QUIC-local wrapper around `u64` (foreign) so the
 /// checked `TryFrom` conversion into `VarInt` (foreign) can be implemented
 /// under the orphan rule.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 #[repr(transparent)]
-pub(super) struct QuicAppErrorCode(SessionApplicationErrorCode);
+pub(super) struct QuicAppErrorCode(u64);
 
 impl TryFrom<QuicAppErrorCode> for VarInt {
     type Error = u64;
@@ -179,48 +174,13 @@ impl Default for RxDatagramScratch {
     }
 }
 
-/// Generation-checked identity for one QUIC listener, connection, or stream
-/// context. Main Thread listener contexts and Data Worker transport contexts
-/// use the same packed pool identity, but each owner retains its own pool.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-#[repr(transparent)]
-pub(super) struct ContextId(u64);
-
-impl From<u64> for ContextId {
-    #[inline]
-    fn from(raw: u64) -> Self {
-        Self(raw)
-    }
-}
-
-impl From<ContextId> for u64 {
-    #[inline]
-    fn from(context: ContextId) -> Self {
-        context.0
-    }
-}
-
-impl From<u32> for ContextId {
-    #[inline]
-    fn from(index: u32) -> Self {
-        Self(u64::from(index))
-    }
-}
-
-impl From<ContextId> for u32 {
-    #[inline]
-    fn from(context: ContextId) -> Self {
-        context.0 as u32
-    }
-}
-
 /// Worker-local role state stored in one QUIC context slot.
 #[repr(C)]
 #[derive(Debug, Clone)]
 pub(super) struct ListenerContext {
     pub(crate) outer_listener: SessionHandle,
-    pub(crate) outer_application: ApplicationId,
-    pub(crate) inner_application_listener: hammer_runtime::app::ApplicationListenerId,
+    pub(crate) outer_application: u32,
+    pub(crate) inner_application_listener: u32,
     pub(crate) inner_session_listener: SessionHandle,
     pub(crate) configuration: ConfigId,
     pub(crate) connection_timeout: u32,
@@ -245,14 +205,14 @@ struct EngineConnection {
     remote: Option<SocketAddr>,
     local: Option<SocketAddr>,
     server_config: Option<Arc<quinn_proto::ServerConfig>>,
-    application: ApplicationId,
-    app: Option<SessionAppId>,
+    application: u32,
+    app: Option<u32>,
     /// Application-supplied opaque for child Stream Sessions. Not VPP
     /// `quic_ctx_t.client_opaque`.
     app_opaque: Option<u64>,
     /// VPP `quic_ctx_t.client_opaque`: outer active Application Connection
     /// correlation retained through the handshake.
-    client_opaque: Option<SessionConnectionId>,
+    client_opaque: Option<u32>,
     /// Outer Session listener retained through a passive handshake.
     outer_listener: Option<SessionHandle>,
     pending_connect_error: Option<SessionConnectError>,
@@ -266,10 +226,10 @@ struct EngineConnection {
 impl EngineConnection {
     fn pending(
         server_config: Option<Arc<quinn_proto::ServerConfig>>,
-        application: ApplicationId,
-        app: Option<SessionAppId>,
+        application: u32,
+        app: Option<u32>,
         app_opaque: Option<u64>,
-        client_opaque: Option<SessionConnectionId>,
+        client_opaque: Option<u32>,
         outer_listener: Option<SessionHandle>,
     ) -> Self {
         Self {
@@ -297,10 +257,10 @@ impl EngineConnection {
         server_name: String,
         local: SocketAddr,
         remote: SocketAddr,
-        application: ApplicationId,
-        app: Option<SessionAppId>,
+        application: u32,
+        app: Option<u32>,
         app_opaque: Option<u64>,
-        client_opaque: Option<SessionConnectionId>,
+        client_opaque: Option<u32>,
     ) -> Self {
         Self {
             handle: None,
@@ -332,9 +292,9 @@ impl EngineConnection {
 #[repr(C)]
 struct ConnectionContext {
     engine: Option<Box<EngineConnection>>,
-    lower_session: SessionId,
-    connection_session: Option<SessionId>,
-    listener: Option<ContextId>,
+    lower_session: u32,
+    connection_session: Option<u32>,
+    listener: Option<u32>,
     state: ConnectionState,
     flags: u8,
     reserved: [u8; 6],
@@ -343,7 +303,7 @@ struct ConnectionContext {
 #[repr(C)]
 struct StreamContext {
     parent: u32,
-    session: SessionId,
+    session: u32,
     stream: quinn_proto::StreamId,
     bytes_written: u64,
     app_tx_data_len: u64,
@@ -367,8 +327,8 @@ pub(super) struct Context {
 impl Context {
     pub(super) fn listener(
         outer_listener: SessionHandle,
-        outer_application: ApplicationId,
-        inner_application_listener: hammer_runtime::app::ApplicationListenerId,
+        outer_application: u32,
+        inner_application_listener: u32,
         inner_session_listener: SessionHandle,
         configuration: ConfigId,
         connection_timeout: u32,
@@ -395,11 +355,11 @@ impl Context {
     }
 
     fn connection_with_listener(
-        lower_session: SessionId,
-        listener: Option<ContextId>,
-        application: ApplicationId,
+        lower_session: u32,
+        listener: Option<u32>,
+        application: u32,
         listener_context: Option<&ListenerContext>,
-        app: Option<SessionAppId>,
+        app: Option<u32>,
         app_opaque: Option<u64>,
     ) -> Self {
         let server_config = listener_context.and_then(|listener| listener.server_config.clone());
@@ -424,10 +384,10 @@ impl Context {
     }
 
     fn connection_with_client(
-        lower_session: SessionId,
-        application_connection: SessionConnectionId,
-        application: ApplicationId,
-        app: Option<SessionAppId>,
+        lower_session: u32,
+        application_connection: u32,
+        application: u32,
+        app: Option<u32>,
         app_opaque: Option<u64>,
         config: Arc<quinn_proto::ClientConfig>,
         server_name: String,
@@ -456,7 +416,7 @@ impl Context {
         }
     }
 
-    fn stream(parent: u32, session: SessionId, stream: quinn_proto::StreamId) -> Self {
+    fn stream(parent: u32, session: u32, stream: quinn_proto::StreamId) -> Self {
         Self {
             role: ContextRole::Stream(StreamContext {
                 parent,
@@ -470,14 +430,14 @@ impl Context {
         }
     }
 
-    fn lower_session(&self) -> Option<SessionId> {
+    fn lower_session(&self) -> Option<u32> {
         match &self.role {
             ContextRole::Connection(connection) => Some(connection.lower_session),
             ContextRole::Stream(_) | ContextRole::Listener(_) => None,
         }
     }
 
-    fn transport_session(&self) -> Option<SessionId> {
+    fn transport_session(&self) -> Option<u32> {
         match &self.role {
             ContextRole::Connection(connection) => connection.connection_session,
             ContextRole::Stream(stream) => Some(stream.session),
@@ -507,7 +467,7 @@ impl Context {
         }
     }
 
-    fn engine_mut(&mut self, context: ContextId) -> RuntimeResult<&mut EngineConnection> {
+    fn engine_mut(&mut self, context: u32) -> RuntimeResult<&mut EngineConnection> {
         self.connection_mut()
             .and_then(|connection| connection.engine.as_deref_mut())
             .ok_or_else(|| QuicWorkerError::EngineMissing { context }.into())
@@ -558,7 +518,7 @@ impl QuicTimerKind {
 
 #[derive(Debug, Clone, Copy)]
 struct QuicTimerToken {
-    context: ContextId,
+    context: u32,
     kind: QuicTimerKind,
 }
 
@@ -579,24 +539,14 @@ impl QuicTimers {
         }
     }
 
-    fn set(
-        &mut self,
-        context: ContextId,
-        kind: QuicTimerKind,
-        interval: Duration,
-    ) -> RuntimeResult<()> {
+    fn set(&mut self, context: u32, kind: QuicTimerKind, interval: Duration) -> RuntimeResult<()> {
         self.wheel
-            .arm_timer(
-                context.0 as u32,
-                0,
-                kind.id(),
-                self.duration_ticks(interval),
-            )
+            .arm_timer(context, 0, kind.id(), self.duration_ticks(interval))
             .map_err(|_| QuicWorkerError::TimerUpdateFailed { context }.into())
     }
 
-    fn stop(&mut self, context: ContextId, kind: QuicTimerKind) {
-        let _ = self.wheel.cancel_timer(context.0 as u32, 0, kind.id());
+    fn stop(&mut self, context: u32, kind: QuicTimerKind) {
+        let _ = self.wheel.cancel_timer(context, 0, kind.id());
     }
 
     fn advance(&mut self, now: Instant) {
@@ -627,7 +577,7 @@ impl QuicTimers {
                 continue;
             };
             self.pending.push_back(QuicTimerToken {
-                context: ContextId::from(index),
+                context: index,
                 kind,
             });
         }
@@ -666,14 +616,8 @@ enum QuicRxOutcome {
 }
 
 /// Data Worker-owned QUIC context pool and sans-I/O endpoint.
-#[hammer_component_macros::session_transport(
-    name = "quic",
-    start_listen = crate::listener::start_listen,
-    stop_listen = crate::listener::stop_listen,
-    connect = crate::listener::connect,
-    connect_stream = crate::listener::connect_stream,
-)]
 pub struct QuicWorker {
+    protocol: u8,
     endpoint: Endpoint,
     contexts: Pool<Context>,
     timers: QuicTimers,
@@ -681,16 +625,17 @@ pub struct QuicWorker {
     rx_packet_descriptors: Vec<PartialDecode>,
     stream_io_events: Vec<crate::stream_io::StreamIoEvent>,
     tx_bufs: BytesBuffer,
-    connection_tx_pending: Vec<ContextId>,
-    connection_tx_ready: Vec<ContextId>,
+    connection_tx_pending: Vec<u32>,
+    connection_tx_ready: Vec<u32>,
     rx_datagram_drops: u64,
     rx_packet_drops: u64,
     stream_data_errors: u64,
 }
 
 impl QuicWorker {
-    pub fn new(_: DataWorkerId) -> Self {
+    pub fn new(_: DataWorkerId, protocol: u8) -> Self {
         Self {
+            protocol,
             endpoint: Endpoint::new(Arc::new(EndpointConfig::default()), None, false, None),
             contexts: Pool::with_capacity(QUIC_CONTEXT_CAPACITY),
             timers: QuicTimers::new(Instant::now()),
@@ -708,18 +653,18 @@ impl QuicWorker {
 
     pub(super) fn accept_connection(
         &mut self,
-        lower_session: SessionId,
-        listener_id: ContextId,
+        lower_session: u32,
+        listener_id: u32,
         listener: &ListenerContext,
-    ) -> RuntimeResult<ContextId> {
-        let context = ContextId::from(self.contexts.insert(Context::connection_with_listener(
+    ) -> RuntimeResult<u32> {
+        let context = self.contexts.insert(Context::connection_with_listener(
             lower_session,
             Some(listener_id),
             listener.outer_application,
             Some(listener),
             None,
             None,
-        )));
+        ));
         if let Err(timer) = self.timers.set(
             context,
             QuicTimerKind::Handshake,
@@ -744,11 +689,11 @@ impl QuicWorker {
         server_name: String,
         local: SocketAddr,
         remote: SocketAddr,
-        application: ApplicationId,
-        app: Option<SessionAppId>,
+        application: u32,
+        app: Option<u32>,
         app_opaque: Option<u64>,
-        application_connection: SessionConnectionId,
-    ) -> RuntimeResult<ContextId> {
+        application_connection: u32,
+    ) -> RuntimeResult<u32> {
         self.allocate_client_connect_with_timeout(
             config,
             server_name,
@@ -768,14 +713,14 @@ impl QuicWorker {
         server_name: String,
         local: SocketAddr,
         remote: SocketAddr,
-        application: ApplicationId,
-        app: Option<SessionAppId>,
+        application: u32,
+        app: Option<u32>,
         app_opaque: Option<u64>,
-        application_connection: SessionConnectionId,
+        application_connection: u32,
         connection_timeout: u32,
-    ) -> RuntimeResult<ContextId> {
-        let context = ContextId::from(self.contexts.insert(Context::connection_with_client(
-            SessionId::from_raw(0),
+    ) -> RuntimeResult<u32> {
+        let context = self.contexts.insert(Context::connection_with_client(
+            0,
             application_connection,
             application,
             app,
@@ -784,11 +729,11 @@ impl QuicWorker {
             server_name,
             local,
             remote,
-        )));
+        ));
         if let Err(error) = self.timers.set(
             context,
             QuicTimerKind::Handshake,
-            Duration::from_millis(u64::from(connection_timeout)),
+            Duration::from_millis(connection_timeout.into()),
         ) {
             return match self.remove_context(context) {
                 Ok(()) => Err(error),
@@ -805,10 +750,10 @@ impl QuicWorker {
 
     pub(super) fn connect_connection(
         &mut self,
-        context: ContextId,
-        lower_session: SessionId,
+        context: u32,
+        lower_session: u32,
         now: Instant,
-    ) -> RuntimeResult<ContextId> {
+    ) -> RuntimeResult<u32> {
         let context_index = context.into();
         {
             let connection = self
@@ -881,18 +826,18 @@ impl QuicWorker {
 
     pub(super) fn connect_stream(
         &mut self,
-        sessions: &mut SessionWorker<u32>,
+        sessions: &mut SessionWorker,
         parent: SessionHandle,
-        connection: SessionConnectionId,
+        connection: u32,
         flags: SessionFlags,
-    ) -> RuntimeResult<SessionId> {
+    ) -> RuntimeResult<u32> {
         let parent_session = sessions
             .session_id_from_handle(parent)
             .ok_or(QuicWorkerError::ParentSessionMissing { parent })?;
-        let (transport, parent_index) = sessions
-            .session_transport(parent_session)
+        let parent_index = sessions
+            .transport_connection_index(parent_session)
             .ok_or(QuicWorkerError::ParentSessionInvalid { parent })?;
-        if transport != Self::ID
+        if !sessions.owns_transport_session(parent_session, self.protocol)
             || !self
                 .contexts
                 .get(parent_index)
@@ -903,25 +848,25 @@ impl QuicWorker {
 
         let child_index = self.contexts.insert(Context::stream(
             parent_index,
-            SessionId::from_raw(0),
+            0,
             quinn_proto::StreamId::new(quinn_proto::Side::Client, quinn_proto::Dir::Bi, 0),
         ));
-        let child_session = match sessions.stream_connect_pending(Self::ID, child_index, connection)
-        {
-            Ok(session) => session,
-            Err(error) => {
-                let cleanup = self.remove_context(ContextId::from(child_index)).err();
-                return match cleanup {
-                    Some(cleanup) => Err(QuicWorkerError::StreamConnectCleanupFailed {
-                        context: ContextId::from(child_index),
-                        primary: error,
-                        cleanup,
-                    }
-                    .into()),
-                    None => Err(error),
-                };
-            }
-        };
+        let child_session =
+            match sessions.stream_connect_pending(self.protocol, child_index, connection) {
+                Ok(session) => session,
+                Err(error) => {
+                    let cleanup = self.remove_context(child_index).err();
+                    return match cleanup {
+                        Some(cleanup) => Err(QuicWorkerError::StreamConnectCleanupFailed {
+                            context: child_index,
+                            primary: error,
+                            cleanup,
+                        }
+                        .into()),
+                        None => Err(error),
+                    };
+                }
+            };
         let direction = if flags.contains(SessionFlags::UNIDIRECTIONAL) {
             quinn_proto::Dir::Uni
         } else {
@@ -932,18 +877,18 @@ impl QuicWorker {
             .get_mut(parent_index)
             .and_then(Context::connection_mut)
             .ok_or_else(|| QuicWorkerError::ContextMissing {
-                context: ContextId::from(parent_index),
+                context: parent_index,
             })?
             .engine
             .as_mut()
             .ok_or_else(|| QuicWorkerError::EngineMissing {
-                context: ContextId::from(parent_index),
+                context: parent_index,
             })?
             .connection_mut()?
             .streams()
             .open(direction)
             .ok_or_else(|| QuicWorkerError::StreamLimitReached {
-                context: ContextId::from(parent_index),
+                context: parent_index,
                 direction,
             })
             .map_err(RuntimeError::from);
@@ -951,11 +896,11 @@ impl QuicWorker {
             Ok(stream) => stream,
             Err(error) => {
                 let session_cleanup = sessions.rollback_session_creation(child_session).err();
-                let context_cleanup = self.remove_context(ContextId::from(child_index)).err();
+                let context_cleanup = self.remove_context(child_index).err();
                 let cleanup = session_cleanup.or(context_cleanup);
                 return match cleanup {
                     Some(cleanup) => Err(QuicWorkerError::StreamConnectCleanupFailed {
-                        context: ContextId::from(child_index),
+                        context: child_index,
                         primary: error,
                         cleanup,
                     }
@@ -978,26 +923,26 @@ impl QuicWorker {
             .get_mut(child_index)
             .and_then(Context::stream_mut)
             .ok_or_else(|| QuicWorkerError::ContextMissing {
-                context: ContextId::from(child_index),
+                context: child_index,
             })?
             .stream = stream;
         self.contexts
             .get_mut(child_index)
             .and_then(Context::stream_mut)
             .ok_or_else(|| QuicWorkerError::ContextMissing {
-                context: ContextId::from(child_index),
+                context: child_index,
             })?
             .session = child_session;
         self.contexts
             .get_mut(parent_index)
             .and_then(Context::connection_mut)
             .ok_or_else(|| QuicWorkerError::ContextMissing {
-                context: ContextId::from(parent_index),
+                context: parent_index,
             })?
             .engine
             .as_mut()
             .ok_or_else(|| QuicWorkerError::EngineMissing {
-                context: ContextId::from(parent_index),
+                context: parent_index,
             })?
             .io_table
             .install_stream(
@@ -1016,7 +961,7 @@ impl QuicWorker {
                 .and_then(Context::connection_mut)
                 .and_then(|connection| connection.engine.as_mut())
                 .map(|engine| engine.io_table.remove_stream(stream));
-            let _ = self.remove_context(ContextId::from(child_index));
+            let _ = self.remove_context(child_index);
             return Err(error);
         }
         Ok(child_session)
@@ -1041,19 +986,18 @@ impl QuicWorker {
     pub(super) fn open_stream(
         &mut self,
         applications: &ApplicationMain,
-        sessions: &mut SessionWorker<u32>,
-        parent: SessionId,
+        sessions: &mut SessionWorker,
+        parent: u32,
         direction: SessionStreamDirection,
-        app_context: SessionAppContext,
-    ) -> RuntimeResult<SessionId> {
+        app_context: u64,
+    ) -> RuntimeResult<u32> {
         let parent_handle = sessions.session_handle(parent);
-        let (transport, parent_index) =
-            sessions
-                .session_transport(parent)
-                .ok_or(QuicWorkerError::ParentSessionMissing {
-                    parent: parent_handle,
-                })?;
-        if transport != Self::ID
+        let parent_index = sessions.transport_connection_index(parent).ok_or(
+            QuicWorkerError::ParentSessionMissing {
+                parent: parent_handle,
+            },
+        )?;
+        if !sessions.owns_transport_session(parent, self.protocol)
             || !self.contexts.get(parent_index).is_some_and(|context| {
                 context.connection().is_some_and(|connection| {
                     connection
@@ -1092,12 +1036,7 @@ impl QuicWorker {
             SessionStreamDirection::Bidi => SessionFlags::STREAM,
             SessionStreamDirection::Uni => SessionFlags::STREAM | SessionFlags::UNIDIRECTIONAL,
         };
-        let child = match self.connect_stream(
-            sessions,
-            parent_handle,
-            SessionConnectionId::from_raw(connection.raw()),
-            flags,
-        ) {
+        let child = match self.connect_stream(sessions, parent_handle, connection, flags) {
             Ok(child) => child,
             Err(primary) => {
                 // VPP session.c:1425-1433: when the transport fails to open
@@ -1130,10 +1069,10 @@ impl QuicWorker {
             // context index is resolved up front O(1) so context removal
             // runs even when the Session rollback itself fails; the
             // aggregation matches connect_stream's rollback path above.
-            let child_index = sessions.session_transport(child).map(|(_, index)| index);
+            let child_index = sessions.transport_connection_index(child);
             let session_cleanup = sessions.rollback_session_creation(child).err();
             let context_cleanup = match child_index {
-                Some(index) => self.remove_context(ContextId::from(index)).err(),
+                Some(index) => self.remove_context(index).err(),
                 None => None,
             };
             let connection_cleanup = applications
@@ -1160,16 +1099,16 @@ impl QuicWorker {
     /// or connection context.
     fn session_context(
         &self,
-        sessions: &SessionWorker<u32>,
-        session: SessionId,
-    ) -> Result<ContextId, QuicWorkerError> {
-        let (transport, index) = sessions
-            .session_transport(session)
+        sessions: &SessionWorker,
+        session: u32,
+    ) -> Result<u32, QuicWorkerError> {
+        let index = sessions
+            .transport_connection_index(session)
             .ok_or(QuicWorkerError::SessionMissing { session })?;
-        if transport != Self::ID {
+        if !sessions.owns_transport_session(session, self.protocol) {
             return Err(QuicWorkerError::SessionNotQuic { session });
         }
-        let context = ContextId::from(index);
+        let context = index;
         if !self
             .contexts
             .get(index)
@@ -1185,10 +1124,7 @@ impl QuicWorker {
     /// quic.h:128) and encodes it as a varint through
     /// `QUICLY_ERROR_FROM_APPLICATION_ERROR_CODE`; the varint range is
     /// `0..2^62-1`, so anything at or above `2^62` is rejected.
-    fn app_error_code_varint(
-        session: SessionId,
-        code: SessionApplicationErrorCode,
-    ) -> Result<VarInt, QuicWorkerError> {
+    fn app_error_code_varint(session: u32, code: u64) -> Result<VarInt, QuicWorkerError> {
         VarInt::try_from(QuicAppErrorCode(code)).map_err(|invalid| {
             QuicWorkerError::ApplicationErrorCodeInvalid {
                 session,
@@ -1211,9 +1147,9 @@ impl QuicWorker {
     /// quinn call, so a rejection never mutates transport state.
     pub(super) fn reset_stream(
         &mut self,
-        sessions: &mut SessionWorker<u32>,
-        session: SessionId,
-        code: SessionApplicationErrorCode,
+        sessions: &mut SessionWorker,
+        session: u32,
+        code: u64,
     ) -> RuntimeResult<()> {
         let context = self.session_context(sessions, session)?;
         let (stream_id, parent, engine_closed) = self
@@ -1236,14 +1172,10 @@ impl QuicWorker {
             .contexts
             .get_mut(parent)
             .and_then(Context::connection_mut)
-            .ok_or_else(|| QuicWorkerError::ContextMissing {
-                context: ContextId::from(parent),
-            })?
+            .ok_or_else(|| QuicWorkerError::ContextMissing { context: parent })?
             .engine
             .as_mut()
-            .ok_or_else(|| QuicWorkerError::EngineMissing {
-                context: ContextId::from(parent),
-            })?
+            .ok_or_else(|| QuicWorkerError::EngineMissing { context: parent })?
             .connection_mut()?;
         if !stream_has_send_side(connection, stream_id) {
             return Err(QuicWorkerError::StreamSendSideMissing { stream: stream_id }.into());
@@ -1256,7 +1188,7 @@ impl QuicWorker {
                 stream: stream_id,
                 source,
             })?;
-        self.queue_connection_output(ContextId::from(parent))?;
+        self.queue_connection_output(parent)?;
         Ok(())
     }
 
@@ -1289,9 +1221,9 @@ impl QuicWorker {
     /// never mutates transport state.
     pub(super) fn stop_sending(
         &mut self,
-        sessions: &mut SessionWorker<u32>,
-        session: SessionId,
-        code: SessionApplicationErrorCode,
+        sessions: &mut SessionWorker,
+        session: u32,
+        code: u64,
     ) -> RuntimeResult<()> {
         let context = self.session_context(sessions, session)?;
         let (stream_id, parent, engine_closed) = self
@@ -1314,14 +1246,10 @@ impl QuicWorker {
             .contexts
             .get_mut(parent)
             .and_then(Context::connection_mut)
-            .ok_or_else(|| QuicWorkerError::ContextMissing {
-                context: ContextId::from(parent),
-            })?
+            .ok_or_else(|| QuicWorkerError::ContextMissing { context: parent })?
             .engine
             .as_mut()
-            .ok_or_else(|| QuicWorkerError::EngineMissing {
-                context: ContextId::from(parent),
-            })?
+            .ok_or_else(|| QuicWorkerError::EngineMissing { context: parent })?
             .connection_mut()?;
         if !stream_has_receive_side(connection, stream_id) {
             return Err(QuicWorkerError::StreamReceiveSideMissing { stream: stream_id }.into());
@@ -1336,7 +1264,7 @@ impl QuicWorker {
                 stream: stream_id,
                 source,
             })?;
-        self.queue_connection_output(ContextId::from(parent))?;
+        self.queue_connection_output(parent)?;
         Ok(())
     }
 
@@ -1359,9 +1287,9 @@ impl QuicWorker {
     /// connection state itself makes repeated dispatch a no-op.
     pub(super) fn close_connection_action(
         &mut self,
-        sessions: &mut SessionWorker<u32>,
-        session: SessionId,
-        code: SessionApplicationErrorCode,
+        sessions: &mut SessionWorker,
+        session: u32,
+        code: u64,
         reason: &[u8],
     ) -> RuntimeResult<()> {
         let context = self.session_context(sessions, session)?;
@@ -1405,20 +1333,20 @@ impl QuicWorker {
         }
     }
 
-    pub(super) fn lower_session(&self, context: ContextId) -> RuntimeResult<SessionId> {
+    pub(super) fn lower_session(&self, context: u32) -> RuntimeResult<u32> {
         self.contexts
             .get(context.into())
             .and_then(Context::lower_session)
             .ok_or_else(|| QuicWorkerError::ContextMissing { context }.into())
     }
 
-    pub(super) fn lower_session_if_present(&self, context: ContextId) -> Option<SessionId> {
+    pub(super) fn lower_session_if_present(&self, context: u32) -> Option<u32> {
         self.contexts
             .get(context.into())
             .and_then(Context::lower_session)
     }
 
-    pub(super) fn listener_context_id(&self, context: ContextId) -> Option<ContextId> {
+    pub(super) fn listener_context_id(&self, context: u32) -> Option<u32> {
         self.contexts
             .get(context.into())
             .and_then(Context::connection)
@@ -1429,26 +1357,21 @@ impl QuicWorker {
         self.contexts
             .get(index)
             .and_then(|context| context.connection_index(index))
-            .ok_or_else(|| {
-                QuicWorkerError::ContextMissing {
-                    context: ContextId::from(index),
-                }
-                .into()
-            })
+            .ok_or_else(|| QuicWorkerError::ContextMissing { context: index }.into())
     }
 
-    pub(super) fn remove_context(&mut self, context: ContextId) -> RuntimeResult<()> {
+    pub(super) fn remove_context(&mut self, context: u32) -> RuntimeResult<()> {
         self.timers.stop(context, QuicTimerKind::Handshake);
         self.timers.stop(context, QuicTimerKind::Transmit);
-        self.contexts.remove(u32::from(context));
+        self.contexts.remove(context);
         Ok(())
     }
 
     pub(super) fn process_udp_rx(
         &mut self,
-        sessions: &mut SessionWorker<u32>,
-        lower_session: SessionId,
-        context: ContextId,
+        sessions: &mut SessionWorker,
+        lower_session: u32,
+        context: u32,
         now: Instant,
     ) -> RuntimeResult<()> {
         let mut consumed = 0usize;
@@ -1566,8 +1489,8 @@ impl QuicWorker {
 
     fn process_one_datagram(
         &mut self,
-        sessions: &mut SessionWorker<u32>,
-        context: ContextId,
+        sessions: &mut SessionWorker,
+        context: u32,
         local: SocketAddr,
         remote: SocketAddr,
         data: &mut [u8],
@@ -1650,8 +1573,8 @@ impl QuicWorker {
 
     fn handle_stream_data_error(
         &mut self,
-        sessions: &mut SessionWorker<u32>,
-        context: ContextId,
+        sessions: &mut SessionWorker,
+        context: u32,
         error: quinn_proto::StreamDataError,
     ) -> RuntimeResult<()> {
         self.stream_data_errors = self.stream_data_errors.saturating_add(1);
@@ -1665,8 +1588,8 @@ impl QuicWorker {
 
     fn accept_first_datagram(
         &mut self,
-        sessions: &mut SessionWorker<u32>,
-        context: ContextId,
+        sessions: &mut SessionWorker,
+        context: u32,
         local: SocketAddr,
         remote: SocketAddr,
         data: &mut [u8],
@@ -1749,8 +1672,8 @@ impl QuicWorker {
 
     fn drain_connection_events(
         &mut self,
-        sessions: &mut SessionWorker<u32>,
-        context: ContextId,
+        sessions: &mut SessionWorker,
+        context: u32,
         now: Instant,
     ) -> RuntimeResult<()> {
         self.drain_connection_events_inner(sessions, context, now)?;
@@ -1759,8 +1682,8 @@ impl QuicWorker {
 
     fn drain_connection_events_inner(
         &mut self,
-        sessions: &mut SessionWorker<u32>,
-        context: ContextId,
+        sessions: &mut SessionWorker,
+        context: u32,
         now: Instant,
     ) -> RuntimeResult<()> {
         for _ in 0..8 {
@@ -1815,8 +1738,8 @@ impl QuicWorker {
 
     fn handle_connection_event(
         &mut self,
-        sessions: &mut SessionWorker<u32>,
-        context: ContextId,
+        sessions: &mut SessionWorker,
+        context: u32,
         event: Event,
     ) -> RuntimeResult<()> {
         let mut close_reason = None;
@@ -1847,12 +1770,12 @@ impl QuicWorker {
                     return Ok(());
                 }
                 let upper = if let Some(connection) = application_connection {
-                    sessions.stream_connect(QuicWorker::ID, context.into(), connection)?
+                    sessions.stream_connect(self.protocol, context.into(), connection)?
                 } else if listener.is_some() {
                     let outer_listener = outer_listener
                         .ok_or_else(|| QuicWorkerError::ContextMissing { context })?;
                     let upper =
-                        sessions.stream_accept(QuicWorker::ID, context.into(), outer_listener)?;
+                        sessions.stream_accept(self.protocol, context.into(), outer_listener)?;
                     sessions.complete_stream_connect(upper)?;
                     upper
                 } else {
@@ -1933,8 +1856,8 @@ impl QuicWorker {
 
     fn handle_stream_event(
         &mut self,
-        sessions: &mut SessionWorker<u32>,
-        context: ContextId,
+        sessions: &mut SessionWorker,
+        context: u32,
         event: StreamEvent,
     ) -> RuntimeResult<()> {
         let mut to_create = Vec::new();
@@ -2032,8 +1955,8 @@ impl QuicWorker {
     /// Session stay live; only the notification is deduplicated.
     fn notify_stream_receive_closed(
         &mut self,
-        sessions: &mut SessionWorker<u32>,
-        context: ContextId,
+        sessions: &mut SessionWorker,
+        context: u32,
         stream: quinn_proto::StreamId,
     ) -> RuntimeResult<()> {
         let Some(engine) = self
@@ -2076,8 +1999,8 @@ impl QuicWorker {
 
     fn close_stream_context(
         &mut self,
-        sessions: &mut SessionWorker<u32>,
-        context: ContextId,
+        sessions: &mut SessionWorker,
+        context: u32,
         stream: quinn_proto::StreamId,
         reset: bool,
     ) -> RuntimeResult<()> {
@@ -2092,7 +2015,7 @@ impl QuicWorker {
                     .iter()
                     .find_map(|(index, value)| match &value.role {
                         ContextRole::Stream(stream_context)
-                            if stream_context.parent == u32::from(context)
+                            if stream_context.parent == context
                                 && stream_context.stream == stream =>
                         {
                             Some(index)
@@ -2118,7 +2041,7 @@ impl QuicWorker {
             if sessions.session_app_closed(stream_session) {
                 sessions.notify_transport_closed(stream_session, stream_context)?;
                 sessions.notify_transport_deleted(stream_session, stream_context)?;
-                self.remove_context(ContextId::from(stream_context))?;
+                self.remove_context(stream_context)?;
             }
             return Ok(());
         }
@@ -2140,7 +2063,7 @@ impl QuicWorker {
         if sessions.session_app_closed(stream_session) {
             sessions.notify_transport_closed(stream_session, stream_context)?;
             sessions.notify_transport_deleted(stream_session, stream_context)?;
-            self.remove_context(ContextId::from(stream_context))?;
+            self.remove_context(stream_context)?;
         } else if reset {
             sessions.notify_transport_reset(stream_session, stream_context)?;
         } else {
@@ -2151,8 +2074,8 @@ impl QuicWorker {
 
     fn create_stream_context(
         &mut self,
-        sessions: &mut SessionWorker<u32>,
-        context: ContextId,
+        sessions: &mut SessionWorker,
+        context: u32,
         stream: quinn_proto::StreamId,
         accepted: bool,
     ) -> RuntimeResult<()> {
@@ -2175,7 +2098,7 @@ impl QuicWorker {
             .engine
             .as_ref()
             .map(|engine| (engine.application, engine.app, engine.app_opaque))
-            .unwrap_or((ApplicationId::new(0), None, None));
+            .unwrap_or(((0), None, None));
         let (stream_context, session_id, rx_fifo, tx_fifo, app_tx_data_len) = self
             .allocate_stream_context(
                 sessions,
@@ -2205,12 +2128,12 @@ impl QuicWorker {
 
     fn create_stream_context_with_io(
         &mut self,
-        sessions: &mut SessionWorker<u32>,
-        context: ContextId,
+        sessions: &mut SessionWorker,
+        context: u32,
         stream: quinn_proto::StreamId,
         accepted: bool,
-        application: ApplicationId,
-        app: Option<SessionAppId>,
+        application: u32,
+        app: Option<u32>,
         opaque: Option<u64>,
         io_table: &mut StreamIoTable,
     ) -> RuntimeResult<()> {
@@ -2241,14 +2164,14 @@ impl QuicWorker {
 
     fn allocate_stream_context(
         &mut self,
-        sessions: &mut SessionWorker<u32>,
-        context: ContextId,
+        sessions: &mut SessionWorker,
+        context: u32,
         stream: quinn_proto::StreamId,
         accepted: bool,
-        application: ApplicationId,
-        app: Option<SessionAppId>,
+        application: u32,
+        app: Option<u32>,
         opaque: Option<u64>,
-    ) -> RuntimeResult<(u32, SessionId, Arc<Fifo>, Arc<Fifo>, u64)> {
+    ) -> RuntimeResult<(u32, u32, Arc<Fifo>, Arc<Fifo>, u64)> {
         let parent = context.into();
         let parent_session = self
             .contexts
@@ -2295,11 +2218,9 @@ impl QuicWorker {
         // VPP `quic_quicly_on_stream_open` allocates the stream transport
         // context first (`quic_ctx_alloc`), then binds the stream Session to
         // it (`stream_session->connection_index = sctx->c_c_index`).
-        let stream_context =
-            self.contexts
-                .insert(Context::stream(parent, SessionId::from_raw(0), stream));
+        let stream_context = self.contexts.insert(Context::stream(parent, 0, stream));
         let session_id = match sessions.construct_transport_session(
-            QuicWorker::ID,
+            self.protocol,
             stream_context,
             allocation_owner,
             child_application,
@@ -2310,10 +2231,10 @@ impl QuicWorker {
         ) {
             Ok(session_id) => session_id,
             Err(primary) => {
-                let cleanup = self.remove_context(ContextId::from(stream_context)).err();
+                let cleanup = self.remove_context(stream_context).err();
                 return Err(match cleanup {
                     Some(cleanup) => QuicWorkerError::StreamConnectCleanupFailed {
-                        context: ContextId::from(stream_context),
+                        context: stream_context,
                         primary,
                         cleanup,
                     }
@@ -2326,7 +2247,7 @@ impl QuicWorker {
             .get_mut(stream_context)
             .and_then(Context::stream_mut)
             .ok_or_else(|| QuicWorkerError::ContextMissing {
-                context: ContextId::from(stream_context),
+                context: stream_context,
             })?
             .session = session_id;
         if accepted {
@@ -2362,11 +2283,11 @@ impl QuicWorker {
                 } else {
                     None
                 };
-                let context_cleanup = self.remove_context(ContextId::from(stream_context)).err();
+                let context_cleanup = self.remove_context(stream_context).err();
                 let cleanup = session_cleanup.or(context_cleanup);
                 return Err(match cleanup {
                     Some(cleanup) => QuicWorkerError::StreamConnectCleanupFailed {
-                        context: ContextId::from(stream_context),
+                        context: stream_context,
                         primary,
                         cleanup,
                     }
@@ -2394,11 +2315,7 @@ impl QuicWorker {
         ))
     }
 
-    fn drain_io_events(
-        &mut self,
-        sessions: &mut SessionWorker<u32>,
-        context: ContextId,
-    ) -> RuntimeResult<()> {
+    fn drain_io_events(&mut self, sessions: &mut SessionWorker, context: u32) -> RuntimeResult<()> {
         {
             let engine = self
                 .contexts
@@ -2431,7 +2348,7 @@ impl QuicWorker {
 
     fn schedule_connection_outputs(
         &mut self,
-        sessions: &mut SessionWorker<u32>,
+        sessions: &mut SessionWorker,
         now: Instant,
     ) -> RuntimeResult<()> {
         std::mem::swap(
@@ -2453,7 +2370,7 @@ impl QuicWorker {
 
     fn sync_connection_deadline(
         &mut self,
-        context: ContextId,
+        context: u32,
         now: Instant,
         deadline: Option<Instant>,
     ) -> RuntimeResult<bool> {
@@ -2487,7 +2404,7 @@ impl QuicWorker {
         }
     }
 
-    fn queue_connection_output(&mut self, context: ContextId) -> RuntimeResult<()> {
+    fn queue_connection_output(&mut self, context: u32) -> RuntimeResult<()> {
         let connection = self
             .contexts
             .get_mut(context.into())
@@ -2510,8 +2427,8 @@ impl QuicWorker {
 
     pub(super) fn send_packets(
         &mut self,
-        sessions: &mut SessionWorker<u32>,
-        context: ContextId,
+        sessions: &mut SessionWorker,
+        context: u32,
         now: Instant,
     ) -> RuntimeResult<()> {
         let connection_context = self
@@ -2651,8 +2568,8 @@ impl QuicWorker {
 
     fn send_response(
         &mut self,
-        sessions: &mut SessionWorker<u32>,
-        context: ContextId,
+        sessions: &mut SessionWorker,
+        context: u32,
         local: SocketAddr,
         remote: SocketAddr,
         payload: &[u8],
@@ -2710,7 +2627,7 @@ impl QuicWorker {
     }
 
     pub(super) fn app_rx_evt(&mut self, index: u32, rx_available: usize) -> RuntimeResult<bool> {
-        let context = ContextId::from(index);
+        let context = index;
         let (stream_id, parent) = {
             let stream = self
                 .contexts
@@ -2722,7 +2639,7 @@ impl QuicWorker {
                 .ok_or_else(|| QuicWorkerError::ContextMissing { context })?;
             (stream.stream, stream.parent)
         };
-        let parent_context = ContextId::from(parent);
+        let parent_context = parent;
         let consumed = self
             .contexts
             .get_mut(parent)
@@ -2760,11 +2677,7 @@ impl QuicWorker {
         Ok(rx_available == 0)
     }
 
-    fn update_time(
-        &mut self,
-        sessions: &mut SessionWorker<u32>,
-        now: Instant,
-    ) -> RuntimeResult<()> {
+    fn update_time(&mut self, sessions: &mut SessionWorker, now: Instant) -> RuntimeResult<()> {
         self.timers.advance(now);
         while let Some(token) = self.timers.take_pending() {
             match token.kind {
@@ -2794,8 +2707,8 @@ impl QuicWorker {
         self.schedule_connection_outputs(sessions, now)
     }
 
-    fn stream_contexts(&self, parent: ContextId) -> Vec<(u32, SessionId)> {
-        let parent = u32::from(parent);
+    fn stream_contexts(&self, parent: u32) -> Vec<(u32, u32)> {
+        let parent = parent;
         self.contexts
             .iter()
             .filter_map(|(index, value)| match &value.role {
@@ -2809,7 +2722,7 @@ impl QuicWorker {
             .collect()
     }
 
-    fn connection_is_drained(&self, context: ContextId) -> bool {
+    fn connection_is_drained(&self, context: u32) -> bool {
         self.contexts
             .get(context.into())
             .and_then(Context::connection)
@@ -2820,7 +2733,7 @@ impl QuicWorker {
 
     fn sync_connection_deadline_from_engine(
         &mut self,
-        context: ContextId,
+        context: u32,
         now: Instant,
     ) -> RuntimeResult<()> {
         let deadline = self
@@ -2836,8 +2749,8 @@ impl QuicWorker {
 
     fn notify_streams_reset(
         &self,
-        sessions: &mut SessionWorker<u32>,
-        context: ContextId,
+        sessions: &mut SessionWorker,
+        context: u32,
     ) -> RuntimeResult<()> {
         for (index, session) in self.stream_contexts(context) {
             if sessions.has_session(session) {
@@ -2849,8 +2762,8 @@ impl QuicWorker {
 
     fn notify_streams_closing(
         &self,
-        sessions: &mut SessionWorker<u32>,
-        context: ContextId,
+        sessions: &mut SessionWorker,
+        context: u32,
     ) -> RuntimeResult<()> {
         for (index, session) in self.stream_contexts(context) {
             if sessions.has_session(session) {
@@ -2862,8 +2775,8 @@ impl QuicWorker {
 
     fn finalize_connection(
         &mut self,
-        sessions: &mut SessionWorker<u32>,
-        context: ContextId,
+        sessions: &mut SessionWorker,
+        context: u32,
     ) -> RuntimeResult<()> {
         let stream_contexts = self.stream_contexts(context);
         for (index, session) in stream_contexts {
@@ -2871,7 +2784,7 @@ impl QuicWorker {
                 sessions.notify_transport_deleted(session, index)?;
             }
             if self.contexts.contains_key(index) {
-                self.remove_context(ContextId::from(index))?;
+                self.remove_context(index)?;
             }
         }
 
@@ -2915,8 +2828,8 @@ impl QuicWorker {
 
     fn maybe_finalize_connection(
         &mut self,
-        sessions: &mut SessionWorker<u32>,
-        context: ContextId,
+        sessions: &mut SessionWorker,
+        context: u32,
     ) -> RuntimeResult<()> {
         let (state, connection_session) = self
             .contexts
@@ -2940,8 +2853,8 @@ impl QuicWorker {
 
     fn begin_connection_close(
         &mut self,
-        sessions: &mut SessionWorker<u32>,
-        context: ContextId,
+        sessions: &mut SessionWorker,
+        context: u32,
         now: Instant,
     ) -> RuntimeResult<()> {
         let state = self
@@ -2989,8 +2902,8 @@ impl QuicWorker {
 
     pub(super) fn transport_closed(
         &mut self,
-        sessions: &mut SessionWorker<u32>,
-        context: ContextId,
+        sessions: &mut SessionWorker,
+        context: u32,
     ) -> RuntimeResult<()> {
         let (application_connection, state) = self
             .contexts
@@ -3045,8 +2958,8 @@ impl QuicWorker {
 
     pub(super) fn close_connection(
         &mut self,
-        sessions: &mut SessionWorker<u32>,
-        context: ContextId,
+        sessions: &mut SessionWorker,
+        context: u32,
         reason: Option<SessionConnectError>,
     ) -> RuntimeResult<()> {
         let (application_connection, pending_error, state) = self
@@ -3128,8 +3041,8 @@ impl QuicWorker {
 
     pub(super) fn stream_tx_event(
         &mut self,
-        sessions: &mut SessionWorker<u32>,
-        session_id: SessionId,
+        sessions: &mut SessionWorker,
+        session_id: u32,
         index: u32,
         now: Instant,
     ) -> RuntimeResult<()> {
@@ -3141,9 +3054,7 @@ impl QuicWorker {
                     ContextRole::Stream(stream) => Some(stream),
                     ContextRole::Listener(_) | ContextRole::Connection(_) => None,
                 })
-                .ok_or_else(|| QuicWorkerError::ContextMissing {
-                    context: ContextId::from(index),
-                })?;
+                .ok_or_else(|| QuicWorkerError::ContextMissing { context: index })?;
             (
                 stream.stream,
                 stream.parent,
@@ -3151,7 +3062,7 @@ impl QuicWorker {
                 stream.flags & STREAM_APP_CLOSE_PENDING != 0,
             )
         };
-        let parent_context = ContextId::from(parent);
+        let parent_context = parent;
         if !self
             .contexts
             .get(parent)
@@ -3238,7 +3149,7 @@ impl QuicWorker {
 
 pub(crate) fn quic_session_queue_update_time(
     _runtime: &DataPlaneRuntime,
-    sessions: &mut SessionWorker<u32>,
+    sessions: &mut SessionWorker,
     _: NodeRuntimeData,
     _: SessionQueueNext,
     now: Instant,
@@ -3253,7 +3164,7 @@ pub(crate) fn quic_session_queue_update_time(
 
 pub(crate) fn quic_session_queue_dispatch(
     runtime: &DataPlaneRuntime,
-    sessions: &mut SessionWorker<u32>,
+    sessions: &mut SessionWorker,
     _: NodeRuntimeData,
     output_next: SessionQueueNext,
     now: Instant,
@@ -3269,58 +3180,37 @@ pub(crate) fn quic_session_queue_dispatch(
     })
 }
 
-/// Opens one stream child of `parent` through the Session Worker's
-/// worker-local transport action table; the `open_stream` callback installed
-/// by `QuicMain::install_transport_actions` (listener.rs). Mirrors VPP
-/// resolving the transport VFT and invoking `quic_connect_stream`
-/// (transport.c:500-505, quic.c:164) from the worker-local registration:
-/// the Session Worker resolves the owning worker from its own
-/// `DataWorkerId` in O(1), and the QUIC Main (with the Application
-/// authority) comes from the same QUIC_MAIN channel the session queue
-/// entry points use. No scan, allocation, or lock on the dispatch path.
+/// Opens one stream child of `parent` through the globally registered
+/// transport VFT. Mirrors VPP resolving the transport VFT and invoking
+/// `quic_connect_stream` (transport.c:500-505, quic.c:164): the QUIC shim
+/// resolves the owning worker from the Session's `DataWorkerId` and uses the
+/// process-global QUIC authority.
 pub(crate) fn quic_transport_open_stream(
-    sessions: &mut SessionWorker<u32>,
-    parent: SessionId,
+    sessions: &mut SessionWorker,
+    parent: u32,
     direction: SessionStreamDirection,
-    app_context: SessionAppContext,
-) -> RuntimeResult<SessionId> {
+    app_context: u64,
+) -> RuntimeResult<u32> {
     let main = QUIC_MAIN
         .get()
         .ok_or(RuntimeError::PluginStateNotInitialized { plugin: "quic" })?;
-    let applications = main.applications();
+    let applications = application_main();
     main.with_worker_and_sessions(sessions, |sessions, quic| {
         quic.open_stream(applications, sessions, parent, direction, app_context)
     })
 }
 
-/// Builds the QUIC transport's worker-local action table, installed once per
-/// owning worker at the bind point (`bind_worker_graph` in listener.rs).
-/// Mirrors VPP registering the transport VFT with
-/// `.connect_stream = quic_connect_stream` (quic.c:902) and dispatch
-/// resolving it from the session entry's transport proto
-/// (session.c:1422, transport.c:500-505).
-///
-pub(crate) fn quic_transport_actions() -> SessionTransportWorkerActions<u32> {
-    SessionTransportWorkerActions::new(
-        quic_transport_open_stream,
-        quic_transport_reset_stream,
-        quic_transport_stop_sending,
-        quic_transport_close_connection,
-    )
-}
-
-/// Resets one QUIC stream Session through the Session Worker's worker-local
-/// transport action table; the `reset_stream` callback installed by
-/// `quic_transport_actions`. Mirrors VPP resolving the transport VFT and
+/// Resets one QUIC stream Session through the globally registered transport
+/// VFT. Mirrors VPP resolving the transport VFT and
 /// invoking `transport_reset` (transport.h:138) from `session_transport_reset`
 /// (session.c:1687-1703): the Session Worker resolves the owning worker from
 /// its own `DataWorkerId` in O(1), and the QUIC Main comes from the same
 /// QUIC_MAIN channel the session queue entry points use. No scan,
 /// allocation, or lock on the dispatch path.
 pub(crate) fn quic_transport_reset_stream(
-    sessions: &mut SessionWorker<u32>,
-    session: SessionId,
-    code: SessionApplicationErrorCode,
+    sessions: &mut SessionWorker,
+    session: u32,
+    code: u64,
 ) -> RuntimeResult<()> {
     let main = QUIC_MAIN
         .get()
@@ -3330,19 +3220,18 @@ pub(crate) fn quic_transport_reset_stream(
     })
 }
 
-/// Stops the receive side of one QUIC stream Session through the Session
-/// Worker's worker-local transport action table; the `stop_sending` callback
-/// installed by `quic_transport_actions`. Mirrors VPP resolving the transport
-/// VFT from `session_transport_half_close` (session.c:1637-1648) and the
+/// Stops the receive side of one QUIC stream Session through the globally
+/// registered transport VFT. Mirrors VPP resolving the transport VFT from
+/// `session_transport_half_close` (session.c:1637-1648) and the
 /// receive-side `quicly_request_stop` in `quic_quicly_on_app_reset`
 /// (quic_quicly.c:1253-1259): the Session Worker resolves the owning worker
 /// from its own `DataWorkerId` in O(1), and the QUIC Main comes from the same
 /// QUIC_MAIN channel the session queue entry points use. No scan, allocation,
 /// or lock on the dispatch path.
 pub(crate) fn quic_transport_stop_sending(
-    sessions: &mut SessionWorker<u32>,
-    session: SessionId,
-    code: SessionApplicationErrorCode,
+    sessions: &mut SessionWorker,
+    session: u32,
+    code: u64,
 ) -> RuntimeResult<()> {
     let main = QUIC_MAIN
         .get()
@@ -3352,9 +3241,8 @@ pub(crate) fn quic_transport_stop_sending(
     })
 }
 
-/// Closes one connection Session through the Session Worker's worker-local
-/// transport action table; the `close_connection` callback installed by
-/// `quic_transport_actions`. Mirrors VPP resolving the transport VFT and
+/// Closes one connection Session through the globally registered transport
+/// VFT. Mirrors VPP resolving the transport VFT and
 /// invoking `transport_close` (transport.h:131) from `session_transport_close`
 /// (session.c:1657-1682): the Session Worker resolves the owning worker from
 /// its own `DataWorkerId` in O(1), the reason stays raw `&[u8]` (never
@@ -3363,9 +3251,9 @@ pub(crate) fn quic_transport_stop_sending(
 /// on the dispatch path; the reason copy and the quinn close happen on the
 /// owning worker inside `close_connection_action`.
 pub(crate) fn quic_transport_close_connection(
-    sessions: &mut SessionWorker<u32>,
-    connection: SessionId,
-    code: SessionApplicationErrorCode,
+    sessions: &mut SessionWorker,
+    connection: u32,
+    code: u64,
     reason: &[u8],
 ) -> RuntimeResult<()> {
     let main = QUIC_MAIN
@@ -3379,8 +3267,8 @@ pub(crate) fn quic_transport_close_connection(
 impl QuicWorker {
     fn begin_stream_close(
         &mut self,
-        sessions: &mut SessionWorker<u32>,
-        context: ContextId,
+        sessions: &mut SessionWorker,
+        context: u32,
         now: Instant,
     ) -> RuntimeResult<()> {
         let (stream, parent, bytes_written, session, flags) = self
@@ -3407,7 +3295,7 @@ impl QuicWorker {
         }
         let pending = sessions.pending_send_len(session)?.unwrap_or(0);
         let end_offset = bytes_written.saturating_add(pending as u64);
-        let parent_context = ContextId::from(parent);
+        let parent_context = parent;
         let sync_result = {
             let connection = self
                 .contexts
@@ -3488,10 +3376,13 @@ impl QuicWorker {
     }
 }
 
-impl SessionTransport<u32> for QuicWorker {
+impl SessionTransport for QuicWorker {
     type Tx = TransportInternalTx;
 
-    const ID: SessionTransportId = SessionTransportId::new(3);
+    #[inline]
+    fn protocol(&self) -> u8 {
+        self.protocol
+    }
 
     fn connection_index(&self, index: u32) -> RuntimeResult<u32> {
         self.connection_index(index)
@@ -3499,7 +3390,7 @@ impl SessionTransport<u32> for QuicWorker {
 
     fn update_time(
         &mut self,
-        sessions: &mut SessionWorker<u32>,
+        sessions: &mut SessionWorker,
         _: &DataPlaneRuntime,
         _: SessionQueueNext,
         _: &mut BufferFrame,
@@ -3524,7 +3415,7 @@ impl SessionTransport<u32> for QuicWorker {
 
     fn disconnect(
         &mut self,
-        sessions: &mut SessionWorker<u32>,
+        sessions: &mut SessionWorker,
         index: u32,
         _: &DataPlaneRuntime,
         _: SessionQueueNext,
@@ -3532,7 +3423,7 @@ impl SessionTransport<u32> for QuicWorker {
         _: &mut SessionQueueOutput,
         now: Instant,
     ) -> RuntimeResult<()> {
-        let context = ContextId::from(index);
+        let context = index;
         let role = self
             .contexts
             .get(index)
@@ -3567,7 +3458,7 @@ impl SessionTransport<u32> for QuicWorker {
 
     fn reset(
         &mut self,
-        sessions: &mut SessionWorker<u32>,
+        sessions: &mut SessionWorker,
         index: u32,
         _: &DataPlaneRuntime,
         _: SessionQueueNext,
@@ -3575,7 +3466,7 @@ impl SessionTransport<u32> for QuicWorker {
         _: &mut SessionQueueOutput,
         now: Instant,
     ) -> RuntimeResult<()> {
-        let context = ContextId::from(index);
+        let context = index;
         let role = self
             .contexts
             .get(index)
@@ -3612,7 +3503,7 @@ impl SessionTransport<u32> for QuicWorker {
             sessions.notify_transport_deleted(session, context.into())?;
             return self.remove_context(context);
         }
-        let parent_context = ContextId::from(parent);
+        let parent_context = parent;
         {
             let connection = self
                 .contexts
@@ -3650,11 +3541,11 @@ impl SessionTransport<u32> for QuicWorker {
     }
 }
 
-impl TransportInternalTransport<u32> for QuicWorker {
+impl TransportInternalTransport for QuicWorker {
     fn internal_tx(
         &mut self,
-        sessions: &mut SessionWorker<u32>,
-        session_id: SessionId,
+        sessions: &mut SessionWorker,
+        session_id: u32,
         index: u32,
         _: &DataPlaneRuntime,
         _: SessionQueueNext,
@@ -3672,20 +3563,20 @@ pub(super) enum QuicWorkerError {
     #[error("QUIC worker context capacity {capacity} is exhausted")]
     ContextCapacityExhausted { capacity: usize },
     #[error("QUIC context {context:?} is not a worker connection or stream")]
-    ContextMissing { context: ContextId },
+    ContextMissing { context: u32 },
     #[error("QUIC stream {stream:?} is missing")]
     StreamMissing { stream: quinn_proto::StreamId },
     #[error("QUIC engine is not installed for context {context:?}")]
-    EngineMissing { context: ContextId },
+    EngineMissing { context: u32 },
     #[error("QUIC protocol connection is not established")]
     ConnectionMissing,
     #[error("QUIC server configuration is missing for context {context:?}")]
-    ServerConfigMissing { context: ContextId },
+    ServerConfigMissing { context: u32 },
     #[error("QUIC client configuration is missing for active connect")]
     ClientConfigurationMissing,
     #[error("QUIC client connect failed for context {context:?}: {source}")]
     ClientConnectFailed {
-        context: ContextId,
+        context: u32,
         #[source]
         source: quinn_proto::ConnectError,
     },
@@ -3693,26 +3584,26 @@ pub(super) enum QuicWorkerError {
         "QUIC client connect failed for context {context:?}: {connect}; context cleanup failed: {cleanup}"
     )]
     ClientConnectCleanupFailed {
-        context: ContextId,
+        context: u32,
         #[source]
         connect: quinn_proto::ConnectError,
         cleanup: RuntimeError,
     },
     #[error("QUIC Session {session:?} is missing")]
-    SessionMissing { session: SessionId },
+    SessionMissing { session: u32 },
     #[error("QUIC datagram for Session {session:?} has invalid length {length}")]
-    InvalidDatagram { session: SessionId, length: u32 },
+    InvalidDatagram { session: u32, length: u32 },
     #[error("QUIC RX datagram scratch slot {slot} is busy for context {context:?}")]
-    RxDatagramScratchBusy { context: ContextId, slot: usize },
+    RxDatagramScratchBusy { context: u32, slot: usize },
     #[error("QUIC context {context:?} has incompatible endpoints {local} and {remote}")]
     InvalidEndpoint {
-        context: ContextId,
+        context: u32,
         local: SocketAddr,
         remote: SocketAddr,
     },
     #[error("QUIC context {context:?} could not reserve {bytes} output bytes")]
     OutputReservationFailed {
-        context: ContextId,
+        context: u32,
         bytes: usize,
         #[source]
         source: FifoError,
@@ -3720,44 +3611,44 @@ pub(super) enum QuicWorkerError {
     #[error(
         "QUIC connection TX queue is full while scheduling context {context:?} (capacity {capacity})"
     )]
-    OutputQueueCapacityExceeded { context: ContextId, capacity: usize },
+    OutputQueueCapacityExceeded { context: u32, capacity: usize },
     #[error("QUIC engine produced an invalid packet for context {context:?}: {bytes} bytes")]
-    EnginePacketTooLarge { context: ContextId, bytes: usize },
+    EnginePacketTooLarge { context: u32, bytes: usize },
     #[error(
         "QUIC output commit length mismatch for context {context:?}: expected {expected}, got {actual}"
     )]
     OutputCommitLengthMismatch {
-        context: ContextId,
+        context: u32,
         expected: usize,
         actual: usize,
     },
     #[error("QUIC timer update failed for context {context:?}")]
-    TimerUpdateFailed { context: ContextId },
+    TimerUpdateFailed { context: u32 },
     #[error(
         "QUIC timer update failed for context {context:?}: {timer}; context cleanup failed: {cleanup}"
     )]
     TimerUpdateCleanupFailed {
-        context: ContextId,
+        context: u32,
         #[source]
         timer: RuntimeError,
         cleanup: RuntimeError,
     },
     #[error("QUIC Session FIFO stream data error: {error}")]
     StreamData {
-        context: ContextId,
+        context: u32,
         #[source]
         error: quinn_proto::StreamDataError,
     },
     #[error("QUIC stream {stream:?} write sync failed for context {context:?}: {source}")]
     StreamWrite {
-        context: ContextId,
+        context: u32,
         stream: quinn_proto::StreamId,
         #[source]
         source: quinn_proto::WriteError,
     },
     #[error("QUIC stream {stream:?} finish failed for context {context:?}: {source}")]
     StreamFinish {
-        context: ContextId,
+        context: u32,
         stream: quinn_proto::StreamId,
         #[source]
         source: quinn_proto::FinishError,
@@ -3770,14 +3661,14 @@ pub(super) enum QuicWorkerError {
     ParentAllocationOwnerMissing { parent: SessionHandle },
     #[error("QUIC {direction:?} stream limit is exhausted for parent context {context:?}")]
     StreamLimitReached {
-        context: ContextId,
+        context: u32,
         direction: quinn_proto::Dir,
     },
     #[error(
         "QUIC stream connect failed for parent context {context:?}: {primary}; context cleanup failed: {cleanup}"
     )]
     StreamConnectCleanupFailed {
-        context: ContextId,
+        context: u32,
         #[source]
         primary: RuntimeError,
         cleanup: RuntimeError,
@@ -3792,36 +3683,31 @@ pub(super) enum QuicWorkerError {
         cleanup: RuntimeError,
     },
     #[error("Session {session:?} is not owned by the QUIC worker")]
-    SessionNotQuic { session: SessionId },
+    SessionNotQuic { session: u32 },
     #[error("Session {session:?} is a QUIC connection, not a stream")]
-    SessionNotStream { session: SessionId },
+    SessionNotStream { session: u32 },
     #[error("Session {session:?} is a QUIC stream, not a connection")]
-    SessionNotConnection { session: SessionId },
+    SessionNotConnection { session: u32 },
     #[error("QUIC stream {stream:?} has no local send side to reset")]
     StreamSendSideMissing { stream: quinn_proto::StreamId },
     #[error("QUIC stream {stream:?} has no local receive side to stop")]
     StreamReceiveSideMissing { stream: quinn_proto::StreamId },
     #[error("QUIC stream {stream:?} reset failed for context {context:?}: {source}")]
     StreamReset {
-        context: ContextId,
+        context: u32,
         stream: quinn_proto::StreamId,
         #[source]
         source: quinn_proto::ClosedStream,
     },
     #[error("QUIC stream {stream:?} stop failed for context {context:?}: {source}")]
     StreamStop {
-        context: ContextId,
+        context: u32,
         stream: quinn_proto::StreamId,
         #[source]
         source: quinn_proto::ClosedStream,
     },
     #[error("QUIC application error code {code} for Session {session:?} is not a valid varint")]
-    ApplicationErrorCodeInvalid { session: SessionId, code: u64 },
-    #[error("QUIC transport action table install failed")]
-    TransportActionsInstall {
-        #[source]
-        source: SessionTransportActionError,
-    },
+    ApplicationErrorCodeInvalid { session: u32, code: u64 },
     #[error("QUIC worker {worker} is outside the configured worker range")]
     WorkerOutOfRange { worker: usize },
     #[error("QUIC worker {worker} is already installed")]
@@ -3832,5100 +3718,4 @@ pub(super) enum QuicWorkerError {
         #[source]
         source: ThreadOwnedError,
     },
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    use bytes::BytesMut;
-    use hammer_runtime::app::{SessionEvt, SessionEvtType};
-
-    fn server_config() -> Arc<quinn_proto::ServerConfig> {
-        let certified = rcgen::generate_simple_self_signed(vec!["localhost".to_owned()])
-            .expect("generate QUIC test certificate");
-        let rustls = quinn_proto::rustls::ServerConfig::builder()
-            .with_no_client_auth()
-            .with_single_cert(
-                vec![certified.cert.der().clone()],
-                quinn_proto::rustls::pki_types::PrivateKeyDer::try_from(
-                    certified.signing_key.serialize_der(),
-                )
-                .expect("encode QUIC server private key"),
-            )
-            .expect("build QUIC server rustls config");
-        let crypto = quinn_proto::crypto::rustls::QuicServerConfig::try_from(Arc::new(rustls))
-            .expect("build QUIC server crypto");
-        let mut config = quinn_proto::ServerConfig::with_crypto(Arc::new(crypto));
-        config.transport_config(Arc::new(quinn_proto::TransportConfig::default()));
-        Arc::new(config)
-    }
-
-    fn client_config() -> Arc<quinn_proto::ClientConfig> {
-        let certified = rcgen::generate_simple_self_signed(vec!["localhost".to_owned()])
-            .expect("generate QUIC test certificate");
-        let mut roots = quinn_proto::rustls::RootCertStore::empty();
-        roots
-            .add(certified.cert.der().clone())
-            .expect("add test trust anchor");
-        let builder = quinn_proto::rustls::ClientConfig::builder()
-            .with_root_certificates(roots)
-            .with_no_client_auth();
-        let crypto = quinn_proto::crypto::rustls::QuicClientConfig::try_from(Arc::new(builder))
-            .expect("build QUIC client crypto");
-        let mut config = quinn_proto::ClientConfig::new(Arc::new(crypto));
-        config.transport_config(Arc::new(quinn_proto::TransportConfig::default()));
-        Arc::new(config)
-    }
-
-    /// Unique per-test AppServer socket path. Parallel test threads share
-    /// the process PID, so a monotonic counter (not the PID) keeps paths
-    /// distinct between tests.
-    fn unique_socket_path(prefix: &str) -> String {
-        static SOCKET_SEQ: AtomicU64 = AtomicU64::new(0);
-        format!(
-            "/tmp/{prefix}-{}.sock",
-            SOCKET_SEQ.fetch_add(1, Ordering::Relaxed)
-        )
-    }
-
-    /// Unique per-test allocation owner for shared SessionSegments.
-    /// Parallel fixtures all run on the same worker slot, so a literal
-    /// owner would make every fixture derive the same `hs-w{slot}-o{owner}`
-    /// shm name; the monotonic counter (like `unique_socket_path`) keeps
-    /// each fixture's segment name distinct.
-    fn unique_allocation_owner() -> u64 {
-        static OWNER_SEQ: AtomicU64 = AtomicU64::new(0);
-        OWNER_SEQ.fetch_add(1, Ordering::Relaxed)
-    }
-
-    fn client_server_config_pair() -> (
-        Arc<quinn_proto::ClientConfig>,
-        Arc<quinn_proto::ServerConfig>,
-    ) {
-        let certified = rcgen::generate_simple_self_signed(vec!["localhost".to_owned()])
-            .expect("generate QUIC test certificate");
-        let server_tls = quinn_proto::rustls::ServerConfig::builder()
-            .with_no_client_auth()
-            .with_single_cert(
-                vec![certified.cert.der().clone()],
-                quinn_proto::rustls::pki_types::PrivateKeyDer::try_from(
-                    certified.signing_key.serialize_der(),
-                )
-                .expect("encode QUIC server private key"),
-            )
-            .expect("build QUIC server rustls config");
-        let server_crypto =
-            quinn_proto::crypto::rustls::QuicServerConfig::try_from(Arc::new(server_tls))
-                .expect("build QUIC server crypto");
-        let mut server = quinn_proto::ServerConfig::with_crypto(Arc::new(server_crypto));
-        server.transport_config(Arc::new(quinn_proto::TransportConfig::default()));
-
-        let mut roots = quinn_proto::rustls::RootCertStore::empty();
-        roots
-            .add(certified.cert.der().clone())
-            .expect("add QUIC test trust anchor");
-        let client_tls = quinn_proto::rustls::ClientConfig::builder()
-            .with_root_certificates(roots)
-            .with_no_client_auth();
-        let client_crypto =
-            quinn_proto::crypto::rustls::QuicClientConfig::try_from(Arc::new(client_tls))
-                .expect("build QUIC client crypto");
-        let mut client = quinn_proto::ClientConfig::new(Arc::new(client_crypto));
-        client.transport_config(Arc::new(quinn_proto::TransportConfig::default()));
-
-        (Arc::new(client), Arc::new(server))
-    }
-
-    fn poll_connection_packets(
-        connection: &mut Connection,
-        now: Instant,
-    ) -> (Vec<BytesMut>, Vec<quinn_proto::EndpointEvent>) {
-        let mut packets = Vec::new();
-        let mut endpoint_events = Vec::new();
-        let mut buffer = BytesMut::with_capacity(MAX_PACKET_SIZE);
-        while let Some(transmit) = connection.poll_transmit(now, 1, &mut buffer) {
-            packets.push(buffer.split_to(transmit.size));
-            buffer.reserve(MAX_PACKET_SIZE);
-        }
-        while let Some(event) = connection.poll_endpoint_events() {
-            endpoint_events.push(event);
-        }
-        (packets, endpoint_events)
-    }
-
-    fn apply_endpoint_events(
-        endpoint: &mut Endpoint,
-        handle: ConnectionHandle,
-        connection: &mut Connection,
-        events: Vec<quinn_proto::EndpointEvent>,
-    ) {
-        for event in events {
-            if let Some(event) = endpoint.handle_event(handle, event) {
-                connection.handle_event(event);
-            }
-        }
-    }
-
-    fn worker_connection_mut(
-        contexts: &mut Pool<Context>,
-        context: ContextId,
-    ) -> RuntimeResult<&mut Connection> {
-        contexts
-            .get_mut(context.into())
-            .and_then(Context::connection_mut)
-            .and_then(|connection| connection.engine.as_mut())
-            .and_then(|engine| engine.connection.as_mut())
-            .ok_or(QuicWorkerError::ContextMissing { context }.into())
-    }
-
-    fn drive_client_handshake(
-        worker: &mut QuicWorker,
-        context: ContextId,
-        server_config: Arc<quinn_proto::ServerConfig>,
-        client_addr: SocketAddr,
-        server_addr: SocketAddr,
-        now: Instant,
-    ) -> RuntimeResult<()> {
-        let mut server_endpoint = Endpoint::new(
-            Arc::new(EndpointConfig::default()),
-            Some(server_config.clone()),
-            true,
-            None,
-        );
-        let mut server_connection: Option<(ConnectionHandle, Connection)> = None;
-        let mut server_packets = Vec::new();
-        let mut client_connected = false;
-        let mut client_scratch = BytesMut::with_capacity(MAX_PACKET_SIZE);
-        let mut server_scratch = BytesMut::with_capacity(MAX_PACKET_SIZE);
-        let mut packet_descriptors = Vec::new();
-
-        for _ in 0..32 {
-            let client_handle = worker
-                .contexts
-                .get(context.into())
-                .and_then(Context::connection)
-                .and_then(|connection| connection.engine.as_ref())
-                .and_then(|engine| engine.handle)
-                .ok_or(QuicWorkerError::ContextMissing { context })?;
-            let (client_packets, client_endpoint_events) =
-                poll_connection_packets(worker_connection_mut(&mut worker.contexts, context)?, now);
-            if !client_endpoint_events.is_empty() {
-                let connection = worker_connection_mut(&mut worker.contexts, context)?;
-                apply_endpoint_events(
-                    &mut worker.endpoint,
-                    client_handle,
-                    connection,
-                    client_endpoint_events,
-                );
-            }
-
-            for mut packet in client_packets {
-                let event = server_endpoint.handle_scratch(
-                    now,
-                    client_addr,
-                    None,
-                    None,
-                    &mut packet,
-                    &mut server_scratch,
-                );
-                let Some(event) = event else {
-                    continue;
-                };
-                match event {
-                    DatagramEvent::NewConnection(incoming) => {
-                        let accepted = server_endpoint
-                            .accept(
-                                incoming,
-                                now,
-                                &mut server_scratch,
-                                Some(server_config.clone()),
-                            )
-                            .expect("accept QUIC test connection");
-                        server_connection = Some(accepted);
-                    }
-                    DatagramEvent::Response(transmit) => {
-                        server_packets.push(server_scratch.split_to(transmit.size));
-                        server_scratch.reserve(MAX_PACKET_SIZE);
-                    }
-                    DatagramEvent::ConnectionEvent(handle, event) => {
-                        if let Some((server_handle, connection)) = server_connection.as_mut()
-                            && *server_handle == handle
-                        {
-                            connection.handle_event(event);
-                        }
-                    }
-                }
-            }
-
-            if let Some((server_handle, connection)) = server_connection.as_mut() {
-                let (packets, endpoint_events) = poll_connection_packets(connection, now);
-                apply_endpoint_events(
-                    &mut server_endpoint,
-                    *server_handle,
-                    connection,
-                    endpoint_events,
-                );
-                server_packets.extend(packets);
-            }
-
-            for mut packet in server_packets.drain(..) {
-                let event = worker.endpoint.handle_scratch_with_descriptors(
-                    now,
-                    server_addr,
-                    None,
-                    None,
-                    &mut packet,
-                    &mut packet_descriptors,
-                    &mut client_scratch,
-                );
-                let Some(event) = event else {
-                    continue;
-                };
-                if let DatagramEvent::ConnectionEvent(handle, event) = event
-                    && handle == client_handle
-                {
-                    worker_connection_mut(&mut worker.contexts, context)?.handle_event(event);
-                }
-            }
-
-            let connection = worker_connection_mut(&mut worker.contexts, context)?;
-            while let Some(event) = connection.poll() {
-                if matches!(event, Event::Connected) {
-                    client_connected = true;
-                }
-            }
-            if client_connected {
-                return Ok(());
-            }
-        }
-
-        Err(QuicWorkerError::ConnectionMissing.into())
-    }
-
-    fn test_listener_start(
-        _: SessionHandle,
-        _: ApplicationId,
-        _: Option<u64>,
-        _: hammer_runtime::SessionListenEndpoint,
-    ) -> RuntimeResult<()> {
-        Ok(())
-    }
-
-    fn register_test_outer_listener(
-        applications: &Arc<hammer_service::session::ApplicationMain>,
-        application: ApplicationId,
-        sessions: &mut SessionWorker<u32>,
-    ) -> RuntimeResult<SessionHandle> {
-        register_test_outer_listener_with_app(applications, application, sessions, None)
-    }
-
-    fn register_test_outer_listener_with_app(
-        applications: &Arc<hammer_service::session::ApplicationMain>,
-        application: ApplicationId,
-        sessions: &mut SessionWorker<u32>,
-        app: Option<hammer_runtime::app::SessionAppId>,
-    ) -> RuntimeResult<SessionHandle> {
-        let main = Arc::new(hammer_service::session::runtime::SessionMain::new(
-            1,
-            Arc::clone(applications),
-        ));
-        let application_listener = applications
-            .register_listener(application, app, None)
-            .map_err(hammer_runtime::RuntimeError::from)?;
-        let listener = main.listen(
-            application_listener,
-            hammer_runtime::SessionTransportRegistration::new(
-                "quic-worker-test",
-                Some(test_listener_start),
-                None,
-                None,
-            ),
-            hammer_runtime::SessionListenEndpoint::new(
-                "127.0.0.1:0".parse().expect("test listener endpoint"),
-                DataWorkerId::new(0),
-            ),
-        )?;
-        sessions.set_listener_main(main);
-        Ok(listener)
-    }
-
-    fn test_lower_session() -> RuntimeResult<(SessionWorker<u32>, SessionId)> {
-        let applications = hammer_service::session::ApplicationMain::new(4);
-        let application = applications
-            .attach()
-            .map_err(hammer_runtime::RuntimeError::from)?;
-        let mut sessions = hammer_service::session::SessionWorker::<u32>::new(
-            DataWorkerId::new(0),
-            1,
-            hammer_runtime::app::AppSessionConfig::default(),
-            64,
-            Arc::clone(&applications),
-            None,
-        )?;
-        sessions.install_application_mq_for_test(application)?;
-        let lower = sessions.construct_transport_session(
-            SessionTransportId::new(1),
-            1,
-            1,
-            application,
-            Some(hammer_runtime::app::SessionAppId::new(0)),
-            None,
-            None,
-            false,
-        )?;
-        Ok((sessions, lower))
-    }
-
-    #[test]
-    fn context_roles_fit_one_cache_line_and_pool_identity_is_generation_checked() {
-        assert_eq!(std::mem::size_of::<Context>(), 64);
-        assert_eq!(std::mem::align_of::<Context>(), 64);
-
-        let mut contexts: Pool<Context> = Pool::with_capacity(1);
-        let first = contexts
-            .insert(Context {
-                role: ContextRole::Listener(ListenerContext {
-                    outer_listener: SessionHandle::new(1, 1),
-                    outer_application: ApplicationId::new(1),
-                    inner_application_listener: hammer_runtime::app::ApplicationListenerId::new(2),
-                    inner_session_listener: SessionHandle::new(3, 1),
-                    configuration: ConfigId::from_raw(5),
-                    connection_timeout: crate::config::DEFAULT_CONNECTION_TIMEOUT,
-                    server_config: None,
-                }),
-            })
-            .expect("listener context capacity");
-        assert!(contexts.contains_key(first));
-        let removed = contexts.remove(first).expect("remove listener context");
-        assert!(matches!(removed.role, ContextRole::Listener(_)));
-
-        let replacement = contexts
-            .insert(Context {
-                role: ContextRole::Stream(StreamContext {
-                    parent: 5,
-                    session: SessionId::from_raw(6),
-                    stream: quinn_proto::StreamId::new(
-                        quinn_proto::Side::Client,
-                        quinn_proto::Dir::Bi,
-                        0,
-                    ),
-                    bytes_written: 0,
-                    app_tx_data_len: 0,
-                    flags: 0,
-                    reserved: [0; 15],
-                }),
-            })
-            .expect("stream context capacity");
-        assert_ne!(first, replacement);
-        assert!(!contexts.contains_key(first));
-        assert!(contexts.contains_key(replacement));
-    }
-
-    #[test]
-    fn worker_owns_one_context_pool() {
-        let worker = QuicWorker::new(DataWorkerId::new(2));
-        assert_eq!(worker.contexts.capacity(), QUIC_CONTEXT_CAPACITY);
-    }
-
-    #[test]
-    fn accepted_connection_retains_listener_until_context_removal() {
-        let mut worker = QuicWorker::new(DataWorkerId::new(0));
-        let listener_id = ContextId::from(0x1234u64);
-        let listener = ListenerContext {
-            outer_listener: SessionHandle::new(1, 1),
-            outer_application: ApplicationId::new(1),
-            inner_application_listener: hammer_runtime::app::ApplicationListenerId::new(2),
-            inner_session_listener: SessionHandle::new(3, 1),
-            configuration: ConfigId::from_raw(4),
-            connection_timeout: crate::config::DEFAULT_CONNECTION_TIMEOUT,
-            server_config: None,
-        };
-        let context = worker
-            .accept_connection(SessionId::from_raw(5), listener_id, &listener)
-            .expect("accept connection");
-        assert_eq!(worker.listener_context_id(context), Some(listener_id));
-        worker.remove_context(context).expect("remove context");
-        assert_eq!(worker.listener_context_id(context), None);
-    }
-
-    #[test]
-    fn accepted_connection_uses_listener_timeout() -> RuntimeResult<()> {
-        let mut worker = QuicWorker::new(DataWorkerId::new(0));
-        let listener = ListenerContext {
-            outer_listener: SessionHandle::new(1, 1),
-            outer_application: ApplicationId::new(1),
-            inner_application_listener: hammer_runtime::app::ApplicationListenerId::new(2),
-            inner_session_listener: SessionHandle::new(3, 1),
-            configuration: ConfigId::from_raw(4),
-            connection_timeout: 5,
-            server_config: None,
-        };
-        let context = worker.accept_connection(
-            SessionId::from_raw(5),
-            ContextId::from(0x1234u64),
-            &listener,
-        )?;
-
-        worker
-            .timers
-            .advance(Instant::now() + Duration::from_millis(20));
-        let token = worker
-            .timers
-            .take_pending()
-            .expect("configured handshake timer");
-        assert_eq!(token.context, context);
-        assert_eq!(token.kind, QuicTimerKind::Handshake);
-        Ok(())
-    }
-
-    #[test]
-    fn timers_dispatch_exact_context_and_kind() {
-        let mut timers = QuicTimers::new(Instant::now());
-        let context = ContextId::from(7);
-        timers
-            .set(context, QuicTimerKind::Transmit, Duration::from_millis(1))
-            .expect("arm timer");
-        timers.advance(Instant::now() + Duration::from_millis(1));
-        let token = timers.take_pending().expect("expired timer");
-        assert_eq!(token.context, context);
-        assert_eq!(token.kind, QuicTimerKind::Transmit);
-        assert!(timers.take_pending().is_none());
-    }
-
-    #[test]
-    fn due_connection_deadline_queues_output_immediately() -> RuntimeResult<()> {
-        let now = Instant::now();
-        let mut worker = QuicWorker::new(DataWorkerId::new(0));
-        let context = worker
-            .contexts
-            .insert(Context::connection_with_listener(
-                SessionId::from_raw(1),
-                None,
-                ApplicationId::new(1),
-                None,
-                None,
-                None,
-            ))
-            .map(ContextId::from)
-            .ok_or(QuicWorkerError::ContextCapacityExhausted {
-                capacity: worker.contexts.capacity(),
-            })?;
-
-        worker.sync_connection_deadline(context, now, Some(now))?;
-
-        assert_eq!(worker.connection_tx_pending, vec![context]);
-        Ok(())
-    }
-
-    #[test]
-    fn due_connection_deadline_handles_timeout_before_rescheduling() -> RuntimeResult<()> {
-        let local = "127.0.0.1:443".parse().expect("local endpoint");
-        let remote = "127.0.0.1:444".parse().expect("remote endpoint");
-        let mut worker = QuicWorker::new(DataWorkerId::new(0));
-        let context = worker.allocate_client_connect(
-            client_config(),
-            "localhost".to_owned(),
-            local,
-            remote,
-            ApplicationId::new(7),
-            None,
-            None,
-            SessionConnectionId::from_raw(7),
-        )?;
-        let start = Instant::now();
-        worker.connect_connection(context, SessionId::from_raw(11), start)?;
-        let mut tx_bufs = BytesBuffer::with_capacity(MAX_PACKET_SIZE);
-        let _ = worker
-            .contexts
-            .get_mut(context.into())
-            .and_then(Context::connection_mut)
-            .and_then(|connection| connection.engine.as_mut())
-            .and_then(|engine| engine.connection.as_mut())
-            .and_then(|connection| connection.poll_transmit(start, 1, &mut *tx_bufs))
-            .ok_or(QuicWorkerError::ContextMissing { context })?;
-        let deadline = worker
-            .contexts
-            .get_mut(context.into())
-            .and_then(Context::connection_mut)
-            .and_then(|connection| connection.engine.as_mut())
-            .and_then(|engine| engine.connection.as_mut())
-            .and_then(|connection| connection.poll_timeout())
-            .ok_or(QuicWorkerError::ContextMissing { context })?;
-        let now = deadline + TIMER_RESOLUTION;
-
-        worker.sync_connection_deadline(context, now, Some(deadline))?;
-
-        let next_deadline = worker
-            .contexts
-            .get_mut(context.into())
-            .and_then(Context::connection_mut)
-            .and_then(|connection| connection.engine.as_mut())
-            .and_then(|engine| engine.connection.as_mut())
-            .and_then(|connection| connection.poll_timeout());
-        assert!(next_deadline.is_none_or(|deadline| deadline > now));
-        Ok(())
-    }
-
-    #[test]
-    fn session_queue_wrappers_match_worker_dispatch_contract() {
-        let _: hammer_service::session::node::SessionQueueUpdateTimeFn =
-            quic_session_queue_update_time;
-        let _: hammer_service::session::node::SessionQueueDispatchFn = quic_session_queue_dispatch;
-    }
-
-    #[test]
-    fn active_connect_allocates_context_then_builds_engine_and_first_initial() {
-        let certified = rcgen::generate_simple_self_signed(vec!["localhost".to_owned()])
-            .expect("generate QUIC test certificate");
-        let mut roots = quinn_proto::rustls::RootCertStore::empty();
-        roots
-            .add(certified.cert.der().clone())
-            .expect("add test trust anchor");
-        let builder = quinn_proto::rustls::ClientConfig::builder()
-            .with_root_certificates(roots)
-            .with_no_client_auth();
-        let crypto = quinn_proto::crypto::rustls::QuicClientConfig::try_from(Arc::new(builder))
-            .expect("build QUIC client crypto");
-        let mut config = quinn_proto::ClientConfig::new(Arc::new(crypto));
-        config.transport_config(Arc::new(quinn_proto::TransportConfig::default()));
-
-        let mut worker = QuicWorker::new(DataWorkerId::new(0));
-        let local = "127.0.0.1:443".parse().expect("local endpoint");
-        let remote = "127.0.0.1:444".parse().expect("remote endpoint");
-        let context = worker
-            .allocate_client_connect(
-                Arc::new(config),
-                "localhost".to_owned(),
-                local,
-                remote,
-                ApplicationId::new(7),
-                None,
-                Some(ConfigId::from_raw(9).raw()),
-                SessionConnectionId::from_raw(7),
-            )
-            .expect("allocate active connect context before UDP connect");
-        let now = Instant::now();
-        worker
-            .connect_connection(context, SessionId::from_raw(11), now)
-            .expect("initialize client engine from preallocated context");
-
-        let mut tx_bufs = BytesBuffer::with_capacity(1280);
-        let transmit = {
-            let engine = worker
-                .contexts
-                .get_mut(context.into())
-                .and_then(Context::connection_mut)
-                .and_then(|connection| connection.engine.as_deref_mut())
-                .expect("active connect engine");
-            assert_eq!(engine.remote, Some(remote));
-            engine
-                .connection
-                .as_mut()
-                .expect("connection")
-                .poll_transmit(now, 1, &mut *tx_bufs)
-                .expect("first client Initial")
-        };
-        assert!(transmit.size >= 1200);
-    }
-
-    #[test]
-    fn local_bidirectional_stream_open_allocates_child_on_parent_context() -> RuntimeResult<()> {
-        let applications = Arc::new(hammer_service::session::ApplicationMain::with_session_apps(
-            4,
-            [hammer_runtime::app::SessionAppRegistration::new(
-                "test-session-app",
-                |_| Ok(()),
-                |_, _| {},
-            )],
-        ));
-        let application = applications
-            .attach()
-            .map_err(hammer_runtime::RuntimeError::from)?;
-        let socket_path = unique_socket_path("hammer-quic-local-bidi");
-        let server =
-            hammer_runtime::attach::AppServer::bind(&socket_path, 1).expect("bind App server");
-        let mut sessions = hammer_service::session::SessionWorker::<u32>::new(
-            DataWorkerId::new(0),
-            1,
-            hammer_runtime::app::AppSessionConfig::default(),
-            64,
-            Arc::clone(&applications),
-            Some(server.publisher()),
-        )?;
-        sessions.install_session_app(
-            SessionAppId::new(0),
-            hammer_service::session::SessionAppCallbacks::all_none(),
-        )?;
-        sessions.install_application_mq_for_test(application)?;
-        let mut worker = QuicWorker::new(DataWorkerId::new(0));
-        let local = "127.0.0.1:443".parse().expect("local endpoint");
-        let remote = "127.0.0.1:444".parse().expect("remote endpoint");
-        let (client_config, server_config) = client_server_config_pair();
-        let parent_context = worker.allocate_client_connect(
-            client_config,
-            "localhost".to_owned(),
-            local,
-            remote,
-            application,
-            Some(SessionAppId::new(0)),
-            None,
-            SessionConnectionId::from_raw(7),
-        )?;
-        let now = Instant::now();
-        worker.connect_connection(parent_context, SessionId::from_raw(11), now)?;
-        drive_client_handshake(
-            &mut worker,
-            parent_context,
-            server_config,
-            local,
-            remote,
-            now,
-        )?;
-        let parent = sessions.construct_transport_session(
-            QuicWorker::ID,
-            parent_context.into(),
-            unique_allocation_owner(),
-            application,
-            Some(SessionAppId::new(0)),
-            None,
-            None,
-            false,
-        )?;
-        worker
-            .contexts
-            .get_mut(parent_context.into())
-            .and_then(Context::connection_mut)
-            .ok_or(QuicWorkerError::ContextMissing {
-                context: parent_context,
-            })?
-            .connection_session = Some(parent);
-        worker
-            .contexts
-            .get_mut(parent_context.into())
-            .and_then(Context::connection_mut)
-            .ok_or(QuicWorkerError::ContextMissing {
-                context: parent_context,
-            })?
-            .state = ConnectionState::Established;
-        let application_connection = applications
-            .register_connection(application, 8, None, Some(SessionAppId::new(0)), None)
-            .map_err(hammer_runtime::RuntimeError::from)?;
-
-        let child = worker.connect_stream(
-            &mut sessions,
-            hammer_runtime::app::SessionHandle::new(parent.pool_index(), 0),
-            SessionConnectionId::from_raw(application_connection.raw()),
-            hammer_runtime::app::SessionFlags::STREAM,
-        )?;
-        let (_, child_context) = sessions
-            .session_transport(child)
-            .ok_or(QuicWorkerError::SessionMissing { session: child })?;
-        let stream = worker
-            .contexts
-            .get(child_context)
-            .and_then(|context| match &context.role {
-                ContextRole::Stream(stream) => Some(stream),
-                ContextRole::Listener(_) | ContextRole::Connection(_) => None,
-            })
-            .ok_or(QuicWorkerError::ContextMissing {
-                context: ContextId::from(child_context),
-            })?;
-
-        assert_eq!(stream.parent, parent_context.into());
-        assert_eq!(stream.stream.dir(), quinn_proto::Dir::Bi);
-        assert_eq!(stream.session, child);
-        drop(server);
-        let _ = std::fs::remove_file(socket_path);
-        Ok(())
-    }
-
-    #[test]
-    fn local_unidirectional_stream_open_allocates_send_only_child() -> RuntimeResult<()> {
-        let applications = Arc::new(hammer_service::session::ApplicationMain::new(4));
-        let application = applications
-            .attach()
-            .map_err(hammer_runtime::RuntimeError::from)?;
-        let socket_path = unique_socket_path("hammer-quic-local-uni");
-        let server =
-            hammer_runtime::attach::AppServer::bind(&socket_path, 1).expect("bind App server");
-        let mut sessions = hammer_service::session::SessionWorker::<u32>::new(
-            DataWorkerId::new(0),
-            1,
-            hammer_runtime::app::AppSessionConfig::default(),
-            64,
-            Arc::clone(&applications),
-            Some(server.publisher()),
-        )?;
-        sessions.install_application_mq_for_test(application)?;
-        let mut worker = QuicWorker::new(DataWorkerId::new(0));
-        let local = "127.0.0.1:443".parse().expect("local endpoint");
-        let remote = "127.0.0.1:444".parse().expect("remote endpoint");
-        let (client_config, server_config) = client_server_config_pair();
-        let parent_context = worker.allocate_client_connect(
-            client_config,
-            "localhost".to_owned(),
-            local,
-            remote,
-            application,
-            None,
-            None,
-            SessionConnectionId::from_raw(7),
-        )?;
-        let now = Instant::now();
-        worker.connect_connection(parent_context, SessionId::from_raw(11), now)?;
-        drive_client_handshake(
-            &mut worker,
-            parent_context,
-            server_config,
-            local,
-            remote,
-            now,
-        )?;
-        let parent = sessions.construct_transport_session(
-            QuicWorker::ID,
-            parent_context.into(),
-            unique_allocation_owner(),
-            application,
-            None,
-            None,
-            None,
-            false,
-        )?;
-        worker
-            .contexts
-            .get_mut(parent_context.into())
-            .and_then(Context::connection_mut)
-            .ok_or(QuicWorkerError::ContextMissing {
-                context: parent_context,
-            })?
-            .connection_session = Some(parent);
-        worker
-            .contexts
-            .get_mut(parent_context.into())
-            .and_then(Context::connection_mut)
-            .ok_or(QuicWorkerError::ContextMissing {
-                context: parent_context,
-            })?
-            .state = ConnectionState::Established;
-        let application_connection = applications
-            .register_connection(application, 9, None, None, None)
-            .map_err(hammer_runtime::RuntimeError::from)?;
-
-        let child = worker.connect_stream(
-            &mut sessions,
-            hammer_runtime::app::SessionHandle::new(parent.pool_index(), 0),
-            SessionConnectionId::from_raw(application_connection.raw()),
-            hammer_runtime::app::SessionFlags::STREAM
-                | hammer_runtime::app::SessionFlags::UNIDIRECTIONAL,
-        )?;
-        let (_, child_context) = sessions
-            .session_transport(child)
-            .ok_or(QuicWorkerError::SessionMissing { session: child })?;
-        let stream = worker
-            .contexts
-            .get(child_context)
-            .and_then(|context| match &context.role {
-                ContextRole::Stream(stream) => Some(stream),
-                ContextRole::Listener(_) | ContextRole::Connection(_) => None,
-            })
-            .ok_or(QuicWorkerError::ContextMissing {
-                context: ContextId::from(child_context),
-            })?;
-
-        assert_eq!(stream.parent, parent_context.into());
-        assert_eq!(stream.stream.dir(), quinn_proto::Dir::Uni);
-        assert_eq!(stream.stream.initiator(), quinn_proto::Side::Client);
-        assert_eq!(stream.session, child);
-        drop(server);
-        let _ = std::fs::remove_file(socket_path);
-        Ok(())
-    }
-
-    #[test]
-    fn open_stream_creates_direction_exact_child_carrying_app_context() -> RuntimeResult<()> {
-        let applications = Arc::new(hammer_service::session::ApplicationMain::new(4));
-        let application = applications
-            .attach()
-            .map_err(hammer_runtime::RuntimeError::from)?;
-        let socket_path = unique_socket_path("hammer-quic-open-stream");
-        let server =
-            hammer_runtime::attach::AppServer::bind(&socket_path, 1).expect("bind App server");
-        let mut sessions = hammer_service::session::SessionWorker::<u32>::new(
-            DataWorkerId::new(0),
-            1,
-            hammer_runtime::app::AppSessionConfig::default(),
-            64,
-            Arc::clone(&applications),
-            Some(server.publisher()),
-        )?;
-        sessions.install_session_app(
-            SessionAppId::new(0),
-            hammer_service::session::SessionAppCallbacks::all_none(),
-        )?;
-        sessions.install_application_mq_for_test(application)?;
-        let mut worker = QuicWorker::new(DataWorkerId::new(0));
-        let local = "127.0.0.1:443".parse().expect("local endpoint");
-        let remote = "127.0.0.1:444".parse().expect("remote endpoint");
-        let (client_config, server_config) = client_server_config_pair();
-        let parent_context = worker.allocate_client_connect(
-            Arc::clone(&client_config),
-            "localhost".to_owned(),
-            local,
-            remote,
-            application,
-            Some(SessionAppId::new(0)),
-            None,
-            SessionConnectionId::from_raw(7),
-        )?;
-        let now = Instant::now();
-        worker.connect_connection(parent_context, SessionId::from_raw(11), now)?;
-        drive_client_handshake(
-            &mut worker,
-            parent_context,
-            server_config,
-            local,
-            remote,
-            now,
-        )?;
-        // The parent must be attached with an allocation owner: open_stream
-        // rejects a parent without one (VPP quic.c:230-231 inherits the
-        // parent's app worker). The attached external path is the only
-        // constructible route in these tests.
-        let parent = sessions.construct_transport_session(
-            QuicWorker::ID,
-            parent_context.into(),
-            unique_allocation_owner(),
-            application,
-            None,
-            None,
-            None,
-            false,
-        )?;
-        worker
-            .contexts
-            .get_mut(parent_context.into())
-            .and_then(Context::connection_mut)
-            .ok_or(QuicWorkerError::ContextMissing {
-                context: parent_context,
-            })?
-            .connection_session = Some(parent);
-        worker
-            .contexts
-            .get_mut(parent_context.into())
-            .and_then(Context::connection_mut)
-            .ok_or(QuicWorkerError::ContextMissing {
-                context: parent_context,
-            })?
-            .state = ConnectionState::Established;
-
-        let bidi_context = 0xCAFE_BEEFu64;
-        let bidi = worker.open_stream(
-            &applications,
-            &mut sessions,
-            parent,
-            SessionStreamDirection::Bidi,
-            bidi_context,
-        )?;
-        let (transport, bidi_index) = sessions
-            .session_transport(bidi)
-            .ok_or(QuicWorkerError::SessionMissing { session: bidi })?;
-        assert_eq!(transport, QuicWorker::ID);
-        let stream = worker
-            .contexts
-            .get(bidi_index)
-            .and_then(|context| match &context.role {
-                ContextRole::Stream(stream) => Some(stream),
-                ContextRole::Listener(_) | ContextRole::Connection(_) => None,
-            })
-            .ok_or(QuicWorkerError::ContextMissing {
-                context: ContextId::from(bidi_index),
-            })?;
-        assert_eq!(stream.parent, parent_context.into());
-        assert_eq!(stream.session, bidi);
-        assert_eq!(stream.stream.dir(), quinn_proto::Dir::Bi);
-        assert_eq!(
-            sessions.session_app_endpoint(bidi),
-            Some((application, None, Some(bidi_context), None)),
-            "the child Session carries the supplied SessionAppContext"
-        );
-
-        let uni_context = 0xDEAD_BEEFu64;
-        let uni = worker.open_stream(
-            &applications,
-            &mut sessions,
-            parent,
-            SessionStreamDirection::Uni,
-            uni_context,
-        )?;
-        let (_, uni_index) = sessions
-            .session_transport(uni)
-            .ok_or(QuicWorkerError::SessionMissing { session: uni })?;
-        let stream = worker
-            .contexts
-            .get(uni_index)
-            .and_then(|context| match &context.role {
-                ContextRole::Stream(stream) => Some(stream),
-                ContextRole::Listener(_) | ContextRole::Connection(_) => None,
-            })
-            .ok_or(QuicWorkerError::ContextMissing {
-                context: ContextId::from(uni_index),
-            })?;
-        assert_eq!(stream.parent, parent_context.into());
-        assert_eq!(stream.session, uni);
-        assert_eq!(stream.stream.dir(), quinn_proto::Dir::Uni);
-        assert_eq!(
-            sessions.session_app_endpoint(uni),
-            Some((application, None, Some(uni_context), None)),
-            "the child Session carries the supplied SessionAppContext"
-        );
-
-        // A parent Session unknown to the Session Worker is rejected before
-        // any allocation (VPP session_open_stream SESSION_E_INVALID).
-        let contexts = worker.contexts.len();
-        let missing = SessionId::from_raw(0xDEAD);
-        let error = worker
-            .open_stream(
-                &applications,
-                &mut sessions,
-                missing,
-                SessionStreamDirection::Bidi,
-                0,
-            )
-            .expect_err("unknown parent Session is rejected");
-        assert!(
-            matches!(
-                &error,
-                RuntimeError::Subsystem { source, .. }
-                    if matches!(
-                        source.downcast_ref::<QuicWorkerError>(),
-                        Some(QuicWorkerError::ParentSessionMissing { .. })
-                    )
-            ),
-            "typed ParentSessionMissing expected, got {error:?}"
-        );
-
-        // A stream child is not a valid parent (VPP quic.c:186-194 rejects a
-        // stream context) and leaves no orphaned context.
-        let error = worker
-            .open_stream(
-                &applications,
-                &mut sessions,
-                bidi,
-                SessionStreamDirection::Uni,
-                0,
-            )
-            .expect_err("stream Session parent is rejected");
-        assert!(
-            matches!(
-                &error,
-                RuntimeError::Subsystem { source, .. }
-                    if matches!(
-                        source.downcast_ref::<QuicWorkerError>(),
-                        Some(QuicWorkerError::ParentSessionInvalid { .. })
-                    )
-            ),
-            "typed ParentSessionInvalid expected, got {error:?}"
-        );
-        assert_eq!(worker.contexts.len(), contexts);
-
-        // A connection whose worker-local engine has no live connection is
-        // rejected up front (VPP quic.c:206 `if (!(conn = qctx->conn))`).
-        let idle = worker.allocate_client_connect(
-            Arc::clone(&client_config),
-            "localhost".to_owned(),
-            local,
-            remote,
-            application,
-            Some(SessionAppId::new(0)),
-            None,
-            SessionConnectionId::from_raw(8),
-        )?;
-        let idle_session = sessions.construct_transport_session(
-            QuicWorker::ID,
-            idle.into(),
-            unique_allocation_owner(),
-            application,
-            Some(SessionAppId::new(0)),
-            None,
-            None,
-            false,
-        )?;
-        // Baseline after all setup: the idle connection context above is a
-        // real allocation owned by the connection path, not by open_stream
-        // (VPP quic.c:206 returns without freeing the connection).
-        let idle_contexts = worker.contexts.len();
-        let error = worker
-            .open_stream(
-                &applications,
-                &mut sessions,
-                idle_session,
-                SessionStreamDirection::Bidi,
-                0,
-            )
-            .expect_err("connection without a live engine is rejected");
-        assert!(
-            matches!(
-                &error,
-                RuntimeError::Subsystem { source, .. }
-                    if matches!(
-                        source.downcast_ref::<QuicWorkerError>(),
-                        Some(QuicWorkerError::ParentSessionInvalid { .. })
-                    )
-            ),
-            "typed ParentSessionInvalid expected, got {error:?}"
-        );
-        assert_eq!(
-            worker.contexts.len(),
-            idle_contexts,
-            "the rejected open leaves the idle connection context and no stream context"
-        );
-
-        drop(server);
-        let _ = std::fs::remove_file(socket_path);
-        Ok(())
-    }
-
-    #[test]
-    fn open_stream_rejects_parent_without_allocation_owner_before_side_effects() -> RuntimeResult<()>
-    {
-        let applications = Arc::new(hammer_service::session::ApplicationMain::new(4));
-        let application = applications
-            .attach()
-            .map_err(hammer_runtime::RuntimeError::from)?;
-        let socket_path = unique_socket_path("hammer-quic-open-stream-owner");
-        let server =
-            hammer_runtime::attach::AppServer::bind(&socket_path, 1).expect("bind App server");
-        let mut sessions = hammer_service::session::SessionWorker::<u32>::new(
-            DataWorkerId::new(0),
-            1,
-            hammer_runtime::app::AppSessionConfig::default(),
-            64,
-            Arc::clone(&applications),
-            Some(server.publisher()),
-        )?;
-        sessions.install_session_app(
-            SessionAppId::new(0),
-            hammer_service::session::SessionAppCallbacks::all_none(),
-        )?;
-        sessions.install_application_mq_for_test(application)?;
-        let mut worker = QuicWorker::new(DataWorkerId::new(0));
-        let local = "127.0.0.1:443".parse().expect("local endpoint");
-        let remote = "127.0.0.1:444".parse().expect("remote endpoint");
-        let (client_config, server_config) = client_server_config_pair();
-        let parent_context = worker.allocate_client_connect(
-            Arc::clone(&client_config),
-            "localhost".to_owned(),
-            local,
-            remote,
-            application,
-            Some(SessionAppId::new(0)),
-            None,
-            SessionConnectionId::from_raw(7),
-        )?;
-        let now = Instant::now();
-        worker.connect_connection(parent_context, SessionId::from_raw(11), now)?;
-        drive_client_handshake(
-            &mut worker,
-            parent_context,
-            server_config,
-            local,
-            remote,
-            now,
-        )?;
-        // App-path construction never attaches the Session, so this parent
-        // has an application endpoint but no allocation owner.
-        let parent = sessions.construct_transport_session(
-            QuicWorker::ID,
-            parent_context.into(),
-            unique_allocation_owner(),
-            application,
-            Some(SessionAppId::new(0)),
-            None,
-            None,
-            false,
-        )?;
-        worker
-            .contexts
-            .get_mut(parent_context.into())
-            .and_then(Context::connection_mut)
-            .ok_or(QuicWorkerError::ContextMissing {
-                context: parent_context,
-            })?
-            .connection_session = Some(parent);
-        worker
-            .contexts
-            .get_mut(parent_context.into())
-            .and_then(Context::connection_mut)
-            .ok_or(QuicWorkerError::ContextMissing {
-                context: parent_context,
-            })?
-            .state = ConnectionState::Established;
-
-        let contexts = worker.contexts.len();
-        let error = worker
-            .open_stream(
-                &applications,
-                &mut sessions,
-                parent,
-                SessionStreamDirection::Bidi,
-                0,
-            )
-            .expect_err("parent without an allocation owner is rejected");
-        assert!(
-            matches!(
-                &error,
-                RuntimeError::Subsystem { source, .. }
-                    if matches!(
-                        source.downcast_ref::<QuicWorkerError>(),
-                        Some(QuicWorkerError::ParentAllocationOwnerMissing { .. })
-                    )
-            ),
-            "typed ParentAllocationOwnerMissing expected, got {error:?}"
-        );
-        assert_eq!(
-            worker.contexts.len(),
-            contexts,
-            "the rejected open leaves no stream context"
-        );
-
-        drop(server);
-        let _ = std::fs::remove_file(socket_path);
-        Ok(())
-    }
-
-    #[test]
-    fn open_stream_removes_application_connection_when_connect_stream_fails() -> RuntimeResult<()> {
-        // One connection slot: a leaked CONNECTING entry from a failed open
-        // would make the second attempt fail at registration instead.
-        let applications = Arc::new(hammer_service::session::ApplicationMain::new(1));
-        let application = applications
-            .attach()
-            .map_err(hammer_runtime::RuntimeError::from)?;
-        let socket_path = unique_socket_path("hammer-quic-open-stream-rollback");
-        let server =
-            hammer_runtime::attach::AppServer::bind(&socket_path, 1).expect("bind App server");
-        let mut sessions = hammer_service::session::SessionWorker::<u32>::new(
-            DataWorkerId::new(0),
-            1,
-            hammer_runtime::app::AppSessionConfig::default(),
-            64,
-            Arc::clone(&applications),
-            Some(server.publisher()),
-        )?;
-        sessions.install_session_app(
-            SessionAppId::new(0),
-            hammer_service::session::SessionAppCallbacks::all_none(),
-        )?;
-        sessions.install_application_mq_for_test(application)?;
-        let mut worker = QuicWorker::new(DataWorkerId::new(0));
-        let local = "127.0.0.1:443".parse().expect("local endpoint");
-        let remote = "127.0.0.1:444".parse().expect("remote endpoint");
-        let (client_config, server_config) = client_server_config_pair();
-        let parent_context = worker.allocate_client_connect(
-            Arc::clone(&client_config),
-            "localhost".to_owned(),
-            local,
-            remote,
-            application,
-            Some(SessionAppId::new(0)),
-            None,
-            SessionConnectionId::from_raw(7),
-        )?;
-        let now = Instant::now();
-        worker.connect_connection(parent_context, SessionId::from_raw(11), now)?;
-        drive_client_handshake(
-            &mut worker,
-            parent_context,
-            server_config,
-            local,
-            remote,
-            now,
-        )?;
-        let parent = sessions.construct_transport_session(
-            QuicWorker::ID,
-            parent_context.into(),
-            unique_allocation_owner(),
-            application,
-            None,
-            None,
-            None,
-            false,
-        )?;
-        worker
-            .contexts
-            .get_mut(parent_context.into())
-            .and_then(Context::connection_mut)
-            .ok_or(QuicWorkerError::ContextMissing {
-                context: parent_context,
-            })?
-            .connection_session = Some(parent);
-        worker
-            .contexts
-            .get_mut(parent_context.into())
-            .and_then(Context::connection_mut)
-            .ok_or(QuicWorkerError::ContextMissing {
-                context: parent_context,
-            })?
-            .state = ConnectionState::Established;
-
-        // Exhaust the context pool so connect_stream fails after the
-        // Application Connection is registered.
-        while worker.contexts.len() < QUIC_CONTEXT_CAPACITY {
-            worker
-                .contexts
-                .insert(Context::stream(
-                    parent_context.into(),
-                    SessionId::from_raw(0),
-                    quinn_proto::StreamId::new(quinn_proto::Side::Client, quinn_proto::Dir::Bi, 0),
-                ))
-                .expect("dummy stream context fits the pool");
-        }
-        assert_eq!(worker.contexts.len(), QUIC_CONTEXT_CAPACITY);
-
-        for attempt in 0..2 {
-            let error = worker
-                .open_stream(
-                    &applications,
-                    &mut sessions,
-                    parent,
-                    SessionStreamDirection::Bidi,
-                    0,
-                )
-                .expect_err("connect_stream failure propagates");
-            assert!(
-                matches!(
-                    &error,
-                    RuntimeError::Subsystem { source, .. }
-                        if matches!(
-                            source.downcast_ref::<QuicWorkerError>(),
-                            Some(QuicWorkerError::ContextCapacityExhausted { .. })
-                        )
-                ),
-                "attempt {attempt}: ContextCapacityExhausted expected, got {error:?} (a leaked \
-                 Application Connection would surface as ApplicationError::ConnectionCapacityExhausted)"
-            );
-            assert_eq!(worker.contexts.len(), QUIC_CONTEXT_CAPACITY);
-        }
-
-        drop(server);
-        let _ = std::fs::remove_file(socket_path);
-        Ok(())
-    }
-
-    #[test]
-    fn app_close_enters_active_closing_and_keeps_engine() -> RuntimeResult<()> {
-        let local = "127.0.0.1:443".parse().expect("local endpoint");
-        let remote = "127.0.0.1:444".parse().expect("remote endpoint");
-        let mut worker = QuicWorker::new(DataWorkerId::new(0));
-        let (mut sessions, _) = test_lower_session()?;
-        let context = worker.allocate_client_connect(
-            client_config(),
-            "localhost".to_owned(),
-            local,
-            remote,
-            ApplicationId::new(7),
-            None,
-            None,
-            SessionConnectionId::from_raw(7),
-        )?;
-        let now = Instant::now();
-        worker.connect_connection(context, SessionId::from_raw(11), now)?;
-        worker
-            .contexts
-            .get_mut(context.into())
-            .and_then(Context::connection_mut)
-            .ok_or(QuicWorkerError::ContextMissing { context })?
-            .state = ConnectionState::Established;
-
-        worker.begin_connection_close(&mut sessions, context, now)?;
-
-        let connection = worker
-            .contexts
-            .get(context.into())
-            .and_then(Context::connection)
-            .ok_or(QuicWorkerError::ContextMissing { context })?;
-        assert_eq!(connection.state, ConnectionState::ActiveClosing);
-        assert!(
-            connection
-                .engine
-                .as_ref()
-                .and_then(|engine| engine.connection.as_ref())
-                .is_some_and(|connection| connection.is_closed())
-        );
-        assert_eq!(worker.connection_tx_pending, vec![context]);
-        Ok(())
-    }
-
-    #[test]
-    fn connected_event_publishes_exact_upper_transport_session() -> RuntimeResult<()> {
-        let applications = hammer_service::session::ApplicationMain::new(4);
-        let application = applications
-            .attach()
-            .map_err(hammer_runtime::RuntimeError::from)?;
-        let mut sessions = hammer_service::session::SessionWorker::<u32>::new(
-            DataWorkerId::new(0),
-            1,
-            hammer_runtime::app::AppSessionConfig::default(),
-            64,
-            Arc::clone(&applications),
-            None,
-        )?;
-        sessions.install_application_mq_for_test(application)?;
-        let lower = sessions.construct_transport_session(
-            SessionTransportId::new(1),
-            1,
-            1,
-            application,
-            Some(hammer_runtime::app::SessionAppId::new(0)),
-            None,
-            None,
-            false,
-        )?;
-        let outer_listener =
-            register_test_outer_listener(&applications, application, &mut sessions)?;
-
-        let mut worker = QuicWorker::new(DataWorkerId::new(0));
-        let listener_id = ContextId::from(0x1234u64);
-        let listener = ListenerContext {
-            outer_listener,
-            outer_application: application,
-            inner_application_listener: hammer_runtime::app::ApplicationListenerId::new(2),
-            inner_session_listener: SessionHandle::new(3, 1),
-            configuration: ConfigId::from_raw(4),
-            connection_timeout: crate::config::DEFAULT_CONNECTION_TIMEOUT,
-            server_config: Some(server_config()),
-        };
-        let context = worker.accept_connection(lower, listener_id, &listener)?;
-        worker.handle_connection_event(&mut sessions, context, Event::Connected)?;
-
-        let connection_session = worker
-            .contexts
-            .get(context.into())
-            .and_then(Context::connection)
-            .and_then(|connection| connection.connection_session)
-            .expect("QUIC Connection Session is published exactly once");
-        assert_eq!(
-            sessions.session_transport(connection_session),
-            Some((QuicWorker::ID, context.into()))
-        );
-        Ok(())
-    }
-
-    #[test]
-    fn remote_close_retains_context_until_application_confirmation() -> RuntimeResult<()> {
-        let applications = hammer_service::session::ApplicationMain::new(4);
-        let application = applications
-            .attach()
-            .map_err(hammer_runtime::RuntimeError::from)?;
-        let mut sessions = hammer_service::session::SessionWorker::<u32>::new(
-            DataWorkerId::new(0),
-            1,
-            hammer_runtime::app::AppSessionConfig::default(),
-            64,
-            Arc::clone(&applications),
-            None,
-        )?;
-        sessions.install_application_mq_for_test(application)?;
-        let lower = sessions.construct_transport_session(
-            SessionTransportId::new(1),
-            1,
-            1,
-            application,
-            Some(hammer_runtime::app::SessionAppId::new(0)),
-            None,
-            None,
-            false,
-        )?;
-        let outer_listener =
-            register_test_outer_listener(&applications, application, &mut sessions)?;
-        let mut worker = QuicWorker::new(DataWorkerId::new(0));
-        let listener = ListenerContext {
-            outer_listener,
-            outer_application: application,
-            inner_application_listener: hammer_runtime::app::ApplicationListenerId::new(2),
-            inner_session_listener: SessionHandle::new(3, 1),
-            configuration: ConfigId::from_raw(4),
-            connection_timeout: crate::config::DEFAULT_CONNECTION_TIMEOUT,
-            server_config: Some(server_config()),
-        };
-        let context = worker.accept_connection(lower, ContextId::from(0x1234u64), &listener)?;
-        worker.handle_connection_event(&mut sessions, context, Event::Connected)?;
-        let connection_session = worker
-            .contexts
-            .get(context.into())
-            .and_then(Context::connection)
-            .and_then(|connection| connection.connection_session)
-            .ok_or(QuicWorkerError::ContextMissing { context })?;
-        let child_session = sessions.insert_session_for_test(QuicWorker::ID, 1);
-        let child_stream =
-            quinn_proto::StreamId::new(quinn_proto::Side::Client, quinn_proto::Dir::Bi, 0);
-        let child_context = worker
-            .contexts
-            .insert(Context::stream(context.into(), child_session, child_stream))
-            .ok_or(QuicWorkerError::ContextCapacityExhausted {
-                capacity: worker.contexts.capacity(),
-            })?;
-
-        worker.handle_connection_event(
-            &mut sessions,
-            context,
-            Event::ConnectionLost {
-                reason: ConnectionError::ApplicationClosed(quinn_proto::ApplicationClose {
-                    error_code: quinn_proto::VarInt::from_u32(0),
-                    reason: Bytes::new(),
-                }),
-            },
-        )?;
-
-        assert!(worker.contexts.contains_key(context.into()));
-        assert_eq!(
-            worker
-                .contexts
-                .get(context.into())
-                .and_then(Context::connection)
-                .map(|connection| connection.state),
-            Some(ConnectionState::PassiveClosingQuicClosed)
-        );
-        assert_eq!(
-            sessions.session_transport(connection_session),
-            Some((QuicWorker::ID, context.into()))
-        );
-        assert!(!sessions.session_app_closed(connection_session));
-        assert!(worker.contexts.contains_key(child_context));
-        let child_app =
-            sessions
-                .app_session(child_session)
-                .ok_or(QuicWorkerError::SessionMissing {
-                    session: child_session,
-                })?;
-        let mut events = [SessionEvt::io(0, SessionEvtType::Connect); 4];
-        let event_count = child_app.poll_events(&mut events);
-        assert!(
-            events[..event_count]
-                .iter()
-                .any(|event| event.evt_type == SessionEvtType::Disconnected)
-        );
-        Ok(())
-    }
-
-    #[test]
-    fn repeated_failure_close_notifies_reset_once() -> RuntimeResult<()> {
-        let (mut sessions, lower) = test_lower_session()?;
-        let mut worker = QuicWorker::new(DataWorkerId::new(0));
-        let context = worker
-            .contexts
-            .insert(Context::connection_with_listener(
-                lower,
-                None,
-                ApplicationId::new(1),
-                None,
-                None,
-                None,
-            ))
-            .map(ContextId::from)
-            .ok_or(QuicWorkerError::ContextCapacityExhausted {
-                capacity: worker.contexts.capacity(),
-            })?;
-        let connection_session = sessions.insert_session_for_test(QuicWorker::ID, context.into());
-        worker
-            .contexts
-            .get_mut(context.into())
-            .and_then(Context::connection_mut)
-            .ok_or(QuicWorkerError::ContextMissing { context })?
-            .connection_session = Some(connection_session);
-        worker
-            .contexts
-            .get_mut(context.into())
-            .and_then(Context::connection_mut)
-            .ok_or(QuicWorkerError::ContextMissing { context })?
-            .state = ConnectionState::Established;
-
-        worker.close_connection(
-            &mut sessions,
-            context,
-            Some(SessionConnectError::ConnectionReset),
-        )?;
-        worker.close_connection(
-            &mut sessions,
-            context,
-            Some(SessionConnectError::ConnectionReset),
-        )?;
-
-        assert_eq!(
-            worker
-                .contexts
-                .get(context.into())
-                .and_then(Context::connection)
-                .map(|connection| connection.state),
-            Some(ConnectionState::PassiveClosingQuicClosed)
-        );
-        assert_eq!(
-            sessions.session_transport(connection_session),
-            Some((QuicWorker::ID, context.into()))
-        );
-        assert!(!sessions.session_app_closed(connection_session));
-        Ok(())
-    }
-
-    #[test]
-    fn lower_transport_close_resets_and_deletes_connection_immediately() -> RuntimeResult<()> {
-        let (mut sessions, lower) = test_lower_session()?;
-        let mut worker = QuicWorker::new(DataWorkerId::new(0));
-        let context = worker
-            .contexts
-            .insert(Context::connection_with_listener(
-                lower,
-                None,
-                ApplicationId::new(1),
-                None,
-                None,
-                None,
-            ))
-            .map(ContextId::from)
-            .ok_or(QuicWorkerError::ContextCapacityExhausted {
-                capacity: worker.contexts.capacity(),
-            })?;
-        let connection_session = sessions.insert_session_for_test(QuicWorker::ID, context.into());
-        worker
-            .contexts
-            .get_mut(context.into())
-            .and_then(Context::connection_mut)
-            .ok_or(QuicWorkerError::ContextMissing { context })?
-            .connection_session = Some(connection_session);
-        worker
-            .contexts
-            .get_mut(context.into())
-            .and_then(Context::connection_mut)
-            .ok_or(QuicWorkerError::ContextMissing { context })?
-            .state = ConnectionState::Established;
-
-        worker.transport_closed(&mut sessions, context)?;
-
-        assert!(!worker.contexts.contains_key(context.into()));
-        assert_eq!(sessions.session_transport(connection_session), None);
-        let application =
-            sessions
-                .app_session(connection_session)
-                .ok_or(QuicWorkerError::SessionMissing {
-                    session: connection_session,
-                })?;
-        let mut events = [SessionEvt::io(0, SessionEvtType::Connect); 4];
-        let event_count = application.poll_events(&mut events);
-        assert!(
-            events[..event_count]
-                .iter()
-                .any(|event| event.evt_type == SessionEvtType::Reset)
-        );
-        Ok(())
-    }
-
-    #[test]
-    fn stream_data_error_resets_parent_and_retains_connection() -> RuntimeResult<()> {
-        let (mut sessions, lower) = test_lower_session()?;
-        let mut worker = QuicWorker::new(DataWorkerId::new(0));
-        let context = worker
-            .contexts
-            .insert(Context::connection_with_listener(
-                lower,
-                None,
-                ApplicationId::new(1),
-                None,
-                None,
-                None,
-            ))
-            .map(ContextId::from)
-            .ok_or(QuicWorkerError::ContextCapacityExhausted {
-                capacity: worker.contexts.capacity(),
-            })?;
-        let connection_session = sessions.insert_session_for_test(QuicWorker::ID, context.into());
-        worker
-            .contexts
-            .get_mut(context.into())
-            .and_then(Context::connection_mut)
-            .ok_or(QuicWorkerError::ContextMissing { context })?
-            .connection_session = Some(connection_session);
-        worker
-            .contexts
-            .get_mut(context.into())
-            .and_then(Context::connection_mut)
-            .ok_or(QuicWorkerError::ContextMissing { context })?
-            .state = ConnectionState::Established;
-
-        let stream = quinn_proto::StreamId::new(quinn_proto::Side::Server, quinn_proto::Dir::Bi, 0);
-        let result = worker.handle_stream_data_error(
-            &mut sessions,
-            context,
-            quinn_proto::StreamDataError::StreamMissing { stream },
-        );
-
-        assert!(result.is_err());
-        assert!(worker.contexts.contains_key(context.into()));
-        assert_eq!(
-            worker
-                .contexts
-                .get(context.into())
-                .and_then(Context::connection)
-                .map(|connection| connection.state),
-            Some(ConnectionState::PassiveClosingQuicClosed)
-        );
-        let application =
-            sessions
-                .app_session(connection_session)
-                .ok_or(QuicWorkerError::SessionMissing {
-                    session: connection_session,
-                })?;
-        let mut events = [SessionEvt::io(0, SessionEvtType::Connect); 4];
-        let event_count = application.poll_events(&mut events);
-        assert!(
-            events[..event_count]
-                .iter()
-                .any(|event| event.evt_type == SessionEvtType::Reset)
-        );
-        assert_eq!(worker.stream_data_errors, 1);
-        Ok(())
-    }
-
-    #[test]
-    fn drained_connection_waits_for_application_confirmation() -> RuntimeResult<()> {
-        let (mut sessions, lower) = test_lower_session()?;
-        let local = "127.0.0.1:443".parse().expect("local endpoint");
-        let remote = "127.0.0.1:444".parse().expect("remote endpoint");
-        let mut worker = QuicWorker::new(DataWorkerId::new(0));
-        let context = worker.allocate_client_connect(
-            client_config(),
-            "localhost".to_owned(),
-            local,
-            remote,
-            ApplicationId::new(7),
-            None,
-            None,
-            SessionConnectionId::from_raw(7),
-        )?;
-        let now = Instant::now();
-        worker.connect_connection(context, lower, now)?;
-        let connection_session = sessions.insert_session_for_test(QuicWorker::ID, context.into());
-        worker
-            .contexts
-            .get_mut(context.into())
-            .and_then(Context::connection_mut)
-            .ok_or(QuicWorkerError::ContextMissing { context })?
-            .connection_session = Some(connection_session);
-        worker
-            .contexts
-            .get_mut(context.into())
-            .and_then(Context::connection_mut)
-            .ok_or(QuicWorkerError::ContextMissing { context })?
-            .state = ConnectionState::PassiveClosingQuicClosed;
-
-        let close_deadline = {
-            let connection = worker
-                .contexts
-                .get_mut(context.into())
-                .and_then(Context::connection_mut)
-                .and_then(|connection| connection.engine.as_mut())
-                .and_then(|engine| engine.connection.as_mut())
-                .ok_or(QuicWorkerError::ContextMissing { context })?;
-            connection.close(now, quinn_proto::VarInt::from_u32(0), Bytes::new());
-            connection
-                .poll_timeout()
-                .ok_or(QuicWorkerError::ContextMissing { context })?
-        };
-        worker
-            .contexts
-            .get_mut(context.into())
-            .and_then(Context::connection_mut)
-            .and_then(|connection| connection.engine.as_mut())
-            .and_then(|engine| engine.connection.as_mut())
-            .ok_or(QuicWorkerError::ContextMissing { context })?
-            .handle_timeout(close_deadline);
-
-        worker.maybe_finalize_connection(&mut sessions, context)?;
-        assert!(worker.contexts.contains_key(context.into()));
-
-        let runtime = hammer_runtime::DataPlaneRuntime::new(
-            hammer_runtime::DataPlaneRuntimeConfig::default(),
-        );
-        sessions.schedule_disconnect(connection_session);
-        let mut frame = BufferFrame::with_capacity(8);
-        let mut output = SessionQueueOutput::default();
-        dispatch_session_queue_events(
-            &runtime,
-            &mut sessions,
-            &mut worker,
-            SessionQueueNext::from_slot(0),
-            &mut frame,
-            &mut output,
-            now,
-        )?;
-
-        assert!(!worker.contexts.contains_key(context.into()));
-        assert!(!sessions.has_session(connection_session));
-        Ok(())
-    }
-
-    #[test]
-    fn finalizing_connection_removes_all_child_stream_contexts() -> RuntimeResult<()> {
-        let (mut sessions, lower) = test_lower_session()?;
-        let mut worker = QuicWorker::new(DataWorkerId::new(0));
-        let parent = worker
-            .contexts
-            .insert(Context::connection_with_listener(
-                lower,
-                None,
-                ApplicationId::new(1),
-                None,
-                None,
-                None,
-            ))
-            .map(ContextId::from)
-            .ok_or(QuicWorkerError::ContextCapacityExhausted {
-                capacity: worker.contexts.capacity(),
-            })?;
-        worker
-            .contexts
-            .insert(Context::stream(
-                parent.into(),
-                SessionId::from_raw(99),
-                quinn_proto::StreamId::new(quinn_proto::Side::Client, quinn_proto::Dir::Bi, 0),
-            ))
-            .ok_or(QuicWorkerError::ContextCapacityExhausted {
-                capacity: worker.contexts.capacity(),
-            })?;
-
-        worker.finalize_connection(&mut sessions, parent)?;
-
-        assert!(worker.contexts.is_empty());
-        Ok(())
-    }
-
-    #[test]
-    fn receive_only_stream_close_and_tx_event_do_not_use_send_side() -> RuntimeResult<()> {
-        let (mut sessions, lower) = test_lower_session()?;
-        let local = "127.0.0.1:443".parse().expect("local endpoint");
-        let remote = "127.0.0.1:444".parse().expect("remote endpoint");
-        let mut worker = QuicWorker::new(DataWorkerId::new(0));
-        let parent = worker.allocate_client_connect(
-            client_config(),
-            "localhost".to_owned(),
-            local,
-            remote,
-            ApplicationId::new(7),
-            None,
-            None,
-            SessionConnectionId::from_raw(7),
-        )?;
-        let now = Instant::now();
-        worker.connect_connection(parent, lower, now)?;
-        let stream_session = sessions.insert_session_for_test(QuicWorker::ID, 1);
-        let stream =
-            quinn_proto::StreamId::new(quinn_proto::Side::Server, quinn_proto::Dir::Uni, 0);
-        let stream_context = worker
-            .contexts
-            .insert(Context::stream(parent.into(), stream_session, stream))
-            .ok_or(QuicWorkerError::ContextCapacityExhausted {
-                capacity: worker.contexts.capacity(),
-            })?;
-        let tx_fifo = sessions
-            .app_session(stream_session)
-            .ok_or(QuicWorkerError::SessionMissing {
-                session: stream_session,
-            })?
-            .tx_fifo();
-        assert_eq!(tx_fifo.enqueue(b"payload"), 7);
-
-        worker.stream_tx_event(&mut sessions, stream_session, stream_context, now)?;
-        worker.begin_stream_close(&mut sessions, ContextId::from(stream_context), now)?;
-
-        assert!(worker.connection_tx_pending.is_empty());
-        Ok(())
-    }
-
-    #[test]
-    fn blocked_stream_close_waits_for_writable_retry() -> RuntimeResult<()> {
-        let (mut sessions, lower) = test_lower_session()?;
-        let local = "127.0.0.1:443".parse().expect("local endpoint");
-        let remote = "127.0.0.1:444".parse().expect("remote endpoint");
-        let mut worker = QuicWorker::new(DataWorkerId::new(0));
-        let parent = worker.allocate_client_connect(
-            client_config(),
-            "localhost".to_owned(),
-            local,
-            remote,
-            ApplicationId::new(7),
-            None,
-            None,
-            SessionConnectionId::from_raw(7),
-        )?;
-        let now = Instant::now();
-        worker.connect_connection(parent, lower, now)?;
-        let stream_session = sessions.insert_session_for_test(QuicWorker::ID, 1);
-        let stream = quinn_proto::StreamId::new(quinn_proto::Side::Client, quinn_proto::Dir::Bi, 0);
-        let stream_context = worker
-            .contexts
-            .insert(Context::stream(parent.into(), stream_session, stream))
-            .ok_or(QuicWorkerError::ContextCapacityExhausted {
-                capacity: worker.contexts.capacity(),
-            })?;
-        let tx_fifo = sessions
-            .app_session(stream_session)
-            .ok_or(QuicWorkerError::SessionMissing {
-                session: stream_session,
-            })?
-            .tx_fifo();
-        assert_eq!(tx_fifo.enqueue(b"payload"), 7);
-        worker
-            .contexts
-            .get_mut(parent.into())
-            .and_then(Context::connection_mut)
-            .and_then(|connection| connection.engine.as_mut())
-            .and_then(|engine| engine.connection.as_mut())
-            .ok_or(QuicWorkerError::ConnectionMissing)?
-            .close(now, quinn_proto::VarInt::from_u32(0), Bytes::new());
-
-        worker.begin_stream_close(&mut sessions, ContextId::from(stream_context), now)?;
-
-        assert_ne!(
-            worker
-                .contexts
-                .get_mut(stream_context)
-                .and_then(Context::stream_mut)
-                .map(|stream| stream.flags & STREAM_APP_CLOSE_PENDING),
-            Some(0)
-        );
-        Ok(())
-    }
-
-    #[test]
-    fn local_stream_reset_sends_stop_and_reset_preserving_siblings() -> RuntimeResult<()> {
-        let mut relay = peer_relay_established()?;
-        let stream = worker_connection_mut(&mut relay.worker.contexts, relay.context)?
-            .streams()
-            .open(quinn_proto::Dir::Bi)
-            .expect("open worker bidirectional stream");
-        let sibling = worker_connection_mut(&mut relay.worker.contexts, relay.context)?
-            .streams()
-            .open(quinn_proto::Dir::Bi)
-            .expect("open sibling bidirectional stream");
-        let (stream_context, stream_session) = relay_stream_session(&mut relay, stream)?;
-        let (sibling_context, sibling_session) = relay_stream_session(&mut relay, sibling)?;
-
-        let app =
-            relay
-                .sessions
-                .app_session(stream_session)
-                .ok_or(QuicWorkerError::SessionMissing {
-                    session: stream_session,
-                })?;
-        app.app_rx_mq()
-            .enqueue_ctrl(SessionEvt::ctrl(
-                app.session_index(),
-                0,
-                SessionEvtType::Reset,
-            ))
-            .expect("enqueue app reset");
-        relay.sessions.poll_app().expect("stage app reset");
-        let runtime = DataPlaneRuntime::new(hammer_runtime::DataPlaneRuntimeConfig::default());
-        let mut frame = BufferFrame::with_capacity(8);
-        let mut output = SessionQueueOutput::default();
-        dispatch_session_queue_events(
-            &runtime,
-            &mut relay.sessions,
-            &mut relay.worker,
-            SessionQueueNext::from_slot(0),
-            &mut frame,
-            &mut output,
-            relay.now,
-        )?;
-
-        // RX open: STOP_SENDING applied (recv side stopped).
-        assert!(
-            worker_connection_mut(&mut relay.worker.contexts, relay.context)?
-                .recv_stream(stream)
-                .received_reset()
-                .is_err()
-        );
-        // TX open: RESET_STREAM applied (send side reset; a second reset errors).
-        assert!(
-            worker_connection_mut(&mut relay.worker.contexts, relay.context)?
-                .send_stream(stream)
-                .reset(quinn_proto::VarInt::from_u32(0))
-                .is_err()
-        );
-        assert_ne!(
-            relay
-                .worker
-                .contexts
-                .get(stream_context)
-                .and_then(|value| match &value.role {
-                    ContextRole::Stream(stream) => Some(stream),
-                    ContextRole::Listener(_) | ContextRole::Connection(_) => None,
-                })
-                .map(|stream| stream.flags & STREAM_APP_CLOSED_TX),
-            Some(0)
-        );
-        // The reset frames reach the real peer: STOP_SENDING stops the
-        // client's send side, RESET_STREAM resets the client's recv side.
-        let mut reset_seen = false;
-        let mut stop_seen = false;
-        for _ in 0..256 {
-            if reset_seen && stop_seen {
-                break;
-            }
-            peer_relay_exchange(&mut relay)?;
-            if relay
-                .client_connection
-                .recv_stream(stream)
-                .received_reset()
-                .is_ok_and(|code| code.is_some())
-            {
-                reset_seen = true;
-            }
-            if matches!(
-                relay.client_connection.send_stream(stream).write(&[0u8; 1]),
-                Err(quinn_proto::WriteError::Stopped(_))
-            ) {
-                stop_seen = true;
-            }
-        }
-        assert!(reset_seen, "peer RESET_STREAM did not reach the client");
-        assert!(
-            stop_seen,
-            "peer STOP_SENDING did not stop the client send side"
-        );
-        assert!(relay.sessions.session_app_closed(stream_session));
-        // The stream context and Session stay live: VPP reset keeps the
-        // context; only an engine-destroyed stream closes the child.
-        assert!(relay.worker.contexts.contains_key(stream_context));
-        assert!(relay.sessions.has_session(stream_session));
-        // Sibling and parent remain untouched.
-        assert_eq!(
-            worker_connection_mut(&mut relay.worker.contexts, relay.context)?
-                .recv_stream(sibling)
-                .received_reset(),
-            Ok(None)
-        );
-        assert!(relay.worker.contexts.contains_key(sibling_context));
-        assert!(relay.worker.contexts.contains_key(relay.context.into()));
-        assert!(relay.sessions.has_session(sibling_session));
-        assert!(!relay.sessions.session_app_closed(sibling_session));
-        Ok(())
-    }
-
-    #[test]
-    fn local_stream_reset_on_destroyed_engine_stream_cleans_child() -> RuntimeResult<()> {
-        let mut relay = peer_relay_established()?;
-        let stream = worker_connection_mut(&mut relay.worker.contexts, relay.context)?
-            .streams()
-            .open(quinn_proto::Dir::Bi)
-            .expect("open worker bidirectional stream");
-        let (stream_context, stream_session) = relay_stream_session(&mut relay, stream)?;
-        // The engine stream is already gone (VPP `!ctx->stream`): the io entry
-        // was removed and the context records the engine close.
-        relay
-            .worker
-            .contexts
-            .get_mut(relay.context.into())
-            .and_then(Context::connection_mut)
-            .and_then(|connection| connection.engine.as_mut())
-            .and_then(|engine| engine.io_table.remove_stream(stream));
-        relay
-            .worker
-            .contexts
-            .get_mut(stream_context)
-            .and_then(Context::stream_mut)
-            .ok_or(QuicWorkerError::ContextMissing {
-                context: ContextId::from(stream_context),
-            })?
-            .flags |= STREAM_ENGINE_CLOSED;
-
-        let app =
-            relay
-                .sessions
-                .app_session(stream_session)
-                .ok_or(QuicWorkerError::SessionMissing {
-                    session: stream_session,
-                })?;
-        app.app_rx_mq()
-            .enqueue_ctrl(SessionEvt::ctrl(
-                app.session_index(),
-                0,
-                SessionEvtType::Reset,
-            ))
-            .expect("enqueue app reset");
-        relay.sessions.poll_app().expect("stage app reset");
-        let runtime = DataPlaneRuntime::new(hammer_runtime::DataPlaneRuntimeConfig::default());
-        let mut frame = BufferFrame::with_capacity(8);
-        let mut output = SessionQueueOutput::default();
-        dispatch_session_queue_events(
-            &runtime,
-            &mut relay.sessions,
-            &mut relay.worker,
-            SessionQueueNext::from_slot(0),
-            &mut frame,
-            &mut output,
-            relay.now,
-        )?;
-
-        assert!(!relay.worker.contexts.contains_key(stream_context));
-        assert!(!relay.sessions.has_session(stream_session));
-        assert!(relay.worker.contexts.contains_key(relay.context.into()));
-        Ok(())
-    }
-
-    #[test]
-    fn stream_half_close_then_close_is_idempotent() -> RuntimeResult<()> {
-        let (mut sessions, lower) = test_lower_session()?;
-        let mut worker = QuicWorker::new(DataWorkerId::new(0));
-        let context = worker
-            .contexts
-            .insert(Context::connection_with_listener(
-                lower,
-                None,
-                ApplicationId::new(1),
-                None,
-                None,
-                None,
-            ))
-            .map(ContextId::from)
-            .ok_or(QuicWorkerError::ContextCapacityExhausted {
-                capacity: worker.contexts.capacity(),
-            })?;
-        let stream_id =
-            quinn_proto::StreamId::new(quinn_proto::Side::Client, quinn_proto::Dir::Bi, 0);
-        let stream_session = sessions.insert_session_for_test(QuicWorker::ID, 1);
-        let stream_context = worker
-            .contexts
-            .insert(Context::stream(context.into(), stream_session, stream_id))
-            .ok_or(QuicWorkerError::ContextCapacityExhausted {
-                capacity: worker.contexts.capacity(),
-            })?;
-        worker
-            .contexts
-            .get_mut(stream_context)
-            .and_then(Context::stream_mut)
-            .ok_or(QuicWorkerError::ContextMissing {
-                context: ContextId::from(stream_context),
-            })?
-            .flags |= STREAM_APP_CLOSED_TX;
-
-        let runtime = hammer_runtime::DataPlaneRuntime::new(
-            hammer_runtime::DataPlaneRuntimeConfig::default(),
-        );
-        sessions.schedule_half_close(stream_session);
-        let mut frame = BufferFrame::with_capacity(8);
-        let mut output = SessionQueueOutput::default();
-        dispatch_session_queue_events(
-            &runtime,
-            &mut sessions,
-            &mut worker,
-            SessionQueueNext::from_slot(0),
-            &mut frame,
-            &mut output,
-            Instant::now(),
-        )?;
-
-        sessions.schedule_disconnect(stream_session);
-        let mut frame = BufferFrame::with_capacity(8);
-        let mut output = SessionQueueOutput::default();
-        dispatch_session_queue_events(
-            &runtime,
-            &mut sessions,
-            &mut worker,
-            SessionQueueNext::from_slot(0),
-            &mut frame,
-            &mut output,
-            Instant::now(),
-        )?;
-
-        worker.close_stream_context(&mut sessions, context, stream_id, false)?;
-        assert!(!worker.contexts.contains_key(stream_context));
-        assert!(!sessions.has_session(stream_session));
-        Ok(())
-    }
-
-    #[test]
-    fn finished_stream_context_waits_for_application_confirmation() -> RuntimeResult<()> {
-        let (mut sessions, lower) = test_lower_session()?;
-        let stream_session = sessions.insert_session_for_test(QuicWorker::ID, 1);
-        let mut worker = QuicWorker::new(DataWorkerId::new(0));
-        let parent = worker
-            .contexts
-            .insert(Context::connection_with_listener(
-                lower,
-                None,
-                ApplicationId::new(1),
-                None,
-                None,
-                None,
-            ))
-            .map(ContextId::from)
-            .ok_or(QuicWorkerError::ContextCapacityExhausted {
-                capacity: worker.contexts.capacity(),
-            })?;
-        let stream = quinn_proto::StreamId::new(quinn_proto::Side::Client, quinn_proto::Dir::Bi, 0);
-        let stream_context = worker
-            .contexts
-            .insert(Context::stream(parent.into(), stream_session, stream))
-            .ok_or(QuicWorkerError::ContextCapacityExhausted {
-                capacity: worker.contexts.capacity(),
-            })?;
-        let app_session =
-            sessions
-                .app_session(stream_session)
-                .ok_or(QuicWorkerError::SessionMissing {
-                    session: stream_session,
-                })?;
-        let rx_fifo = Arc::clone(app_session.rx_fifo());
-        let tx_fifo = Arc::clone(app_session.tx_fifo());
-        worker
-            .contexts
-            .get_mut(parent.into())
-            .and_then(Context::connection_mut)
-            .and_then(|connection| connection.engine.as_mut())
-            .ok_or(QuicWorkerError::EngineMissing { context: parent })?
-            .io_table
-            .install_stream(
-                stream,
-                stream_context,
-                stream_session,
-                rx_fifo,
-                tx_fifo,
-                0,
-                0,
-            );
-
-        worker.close_stream_context(&mut sessions, parent, stream, false)?;
-
-        assert!(worker.contexts.contains_key(stream_context));
-        assert_eq!(
-            sessions.session_transport(stream_session),
-            Some((QuicWorker::ID, stream_context)),
-        );
-
-        let runtime = hammer_runtime::DataPlaneRuntime::new(
-            hammer_runtime::DataPlaneRuntimeConfig::default(),
-        );
-        sessions.schedule_disconnect(stream_session);
-        let mut frame = BufferFrame::with_capacity(8);
-        let mut output = SessionQueueOutput::default();
-        dispatch_session_queue_events(
-            &runtime,
-            &mut sessions,
-            &mut worker,
-            SessionQueueNext::from_slot(0),
-            &mut frame,
-            &mut output,
-            Instant::now(),
-        )?;
-
-        assert!(!worker.contexts.contains_key(stream_context));
-        assert!(!sessions.has_session(stream_session));
-        Ok(())
-    }
-
-    #[test]
-    fn active_failure_publication_backpressure_retains_quic_context() -> RuntimeResult<()> {
-        let certified = rcgen::generate_simple_self_signed(vec!["localhost".to_owned()])
-            .expect("generate QUIC test certificate");
-        let mut roots = quinn_proto::rustls::RootCertStore::empty();
-        roots
-            .add(certified.cert.der().clone())
-            .expect("add test trust anchor");
-        let builder = quinn_proto::rustls::ClientConfig::builder()
-            .with_root_certificates(roots)
-            .with_no_client_auth();
-        let crypto = quinn_proto::crypto::rustls::QuicClientConfig::try_from(Arc::new(builder))
-            .expect("build QUIC client crypto");
-        let mut config = quinn_proto::ClientConfig::new(Arc::new(crypto));
-        config.transport_config(Arc::new(quinn_proto::TransportConfig::default()));
-
-        let socket_path = unique_socket_path("hammer-quic-connect-failure");
-        let server =
-            hammer_runtime::attach::AppServer::bind(&socket_path, 1).expect("bind App server");
-        let applications = hammer_service::session::ApplicationMain::new(4);
-        let application = applications
-            .attach()
-            .map_err(hammer_runtime::RuntimeError::from)?;
-        let mut sessions = hammer_service::session::SessionWorker::<u32>::new(
-            DataWorkerId::new(0),
-            1,
-            hammer_runtime::app::AppSessionConfig::default(),
-            64,
-            Arc::clone(&applications),
-            Some(server.publisher()),
-        )?;
-        sessions.install_application_mq_for_test(application)?;
-
-        let published = sessions.construct_transport_session(
-            SessionTransportId::new(1),
-            1,
-            unique_allocation_owner(),
-            application,
-            None,
-            None,
-            None,
-            false,
-        )?;
-        sessions.connection_published(published)?;
-        sessions.connected(published)?;
-
-        let lower = sessions.construct_transport_session(
-            SessionTransportId::new(1),
-            2,
-            2,
-            application,
-            None,
-            None,
-            None,
-            false,
-        )?;
-        let application_connection = applications
-            .register_connection(application, 0, None, None, None)
-            .map_err(hammer_runtime::RuntimeError::from)?;
-        let outer_connection = SessionConnectionId::from_raw(application_connection.raw());
-        let local = "127.0.0.1:443".parse().expect("local endpoint");
-        let remote = "127.0.0.1:444".parse().expect("remote endpoint");
-        let mut worker = QuicWorker::new(DataWorkerId::new(0));
-        let context = worker.allocate_client_connect(
-            Arc::new(config),
-            "localhost".to_owned(),
-            local,
-            remote,
-            application,
-            None,
-            None,
-            outer_connection,
-        )?;
-        worker.connect_connection(context, lower, Instant::now())?;
-
-        worker.close_connection(&mut sessions, context, Some(SessionConnectError::TimedOut))?;
-        worker.transport_closed(&mut sessions, context)?;
-
-        assert!(worker.contexts.contains_key(context.into()));
-        let pending_error = worker
-            .contexts
-            .get(context.into())
-            .and_then(Context::connection)
-            .and_then(|connection| connection.engine.as_ref())
-            .and_then(|engine| engine.pending_connect_error);
-        assert_eq!(pending_error, Some(SessionConnectError::ConnectionReset));
-        assert_eq!(worker.lower_session(context)?, lower);
-        assert!(matches!(
-            applications.reclaim_connection(application, application_connection),
-            Err(hammer_service::session::application::ApplicationError::ConnectionNotConnected {
-                connection,
-            }) if connection == application_connection
-        ));
-
-        drop(server);
-        let _ = std::fs::remove_file(socket_path);
-        Ok(())
-    }
-
-    #[test]
-    fn oversized_datagram_is_dropped_and_consumed_once() -> RuntimeResult<()> {
-        let (mut sessions, lower) = test_lower_session()?;
-        let mut worker = QuicWorker::new(DataWorkerId::new(0));
-        let listener_id = ContextId::from(0x1234u64);
-        let listener = ListenerContext {
-            outer_listener: SessionHandle::new(1, 1),
-            outer_application: ApplicationId::new(1),
-            inner_application_listener: hammer_runtime::app::ApplicationListenerId::new(2),
-            inner_session_listener: SessionHandle::new(3, 1),
-            configuration: ConfigId::from_raw(4),
-            connection_timeout: crate::config::DEFAULT_CONNECTION_TIMEOUT,
-            server_config: None,
-        };
-        let context = worker.accept_connection(lower, listener_id, &listener)?;
-        let server_addr = "127.0.0.1:443".parse().expect("server address");
-        let client_addr = "127.0.0.1:444".parse().expect("client address");
-        let payload_len = MAX_PACKET_SIZE + 1;
-        let header = SessionDgramHeader::new(server_addr, client_addr, payload_len)
-            .expect("oversized test header");
-        {
-            let (rx_fifo, _) = sessions
-                .fifo_pair(lower)
-                .ok_or_else(|| QuicWorkerError::SessionMissing { session: lower })?;
-            // VPP-style segmented enqueue: header and payload as separate
-            // FIFO segments.
-            let header_bytes = header.to_bytes();
-            assert_eq!(rx_fifo.enqueue(&header_bytes), header_bytes.len());
-            let payload = vec![0u8; payload_len];
-            assert_eq!(rx_fifo.enqueue(&payload), payload.len());
-        }
-
-        worker.process_udp_rx(&mut sessions, lower, context, Instant::now())?;
-
-        let (rx_fifo, _) = sessions
-            .fifo_pair(lower)
-            .ok_or_else(|| QuicWorkerError::SessionMissing { session: lower })?;
-        assert_eq!(rx_fifo.max_dequeue(), 0);
-        assert_eq!(worker.rx_datagram_drops, 1);
-        assert_eq!(worker.rx_packet_drops, 0);
-        Ok(())
-    }
-
-    #[test]
-    fn server_handshake_publishes_upper_connection_session_through_real_session_fifos()
-    -> RuntimeResult<()> {
-        let certified = rcgen::generate_simple_self_signed(vec!["localhost".to_owned()])
-            .expect("generate QUIC test certificate");
-        let rustls_server = quinn_proto::rustls::ServerConfig::builder()
-            .with_no_client_auth()
-            .with_single_cert(
-                vec![certified.cert.der().clone()],
-                quinn_proto::rustls::pki_types::PrivateKeyDer::try_from(
-                    certified.signing_key.serialize_der(),
-                )
-                .expect("encode QUIC server private key"),
-            )
-            .expect("build QUIC server rustls config");
-        let crypto_server =
-            quinn_proto::crypto::rustls::QuicServerConfig::try_from(Arc::new(rustls_server))
-                .expect("build QUIC server crypto");
-        let mut server_config = quinn_proto::ServerConfig::with_crypto(Arc::new(crypto_server));
-        server_config.transport_config(Arc::new(quinn_proto::TransportConfig::default()));
-
-        let mut roots = quinn_proto::rustls::RootCertStore::empty();
-        roots
-            .add(certified.cert.der().clone())
-            .expect("add QUIC test trust anchor");
-        let rustls_client = quinn_proto::rustls::ClientConfig::builder()
-            .with_root_certificates(roots)
-            .with_no_client_auth();
-        let crypto_client =
-            quinn_proto::crypto::rustls::QuicClientConfig::try_from(Arc::new(rustls_client))
-                .expect("build QUIC client crypto");
-        let mut client_config = quinn_proto::ClientConfig::new(Arc::new(crypto_client));
-        client_config.transport_config(Arc::new(quinn_proto::TransportConfig::default()));
-
-        let applications = hammer_service::session::ApplicationMain::new(4);
-        let application = applications
-            .attach()
-            .map_err(hammer_runtime::RuntimeError::from)?;
-        let mut sessions = hammer_service::session::SessionWorker::<u32>::new(
-            DataWorkerId::new(0),
-            1,
-            hammer_runtime::app::AppSessionConfig::default(),
-            64,
-            Arc::clone(&applications),
-            None,
-        )?;
-        sessions.install_application_mq_for_test(application)?;
-        let lower = sessions.construct_transport_session(
-            SessionTransportId::new(1),
-            1,
-            1,
-            application,
-            Some(hammer_runtime::app::SessionAppId::new(0)),
-            None,
-            None,
-            false,
-        )?;
-        let outer_listener =
-            register_test_outer_listener(&applications, application, &mut sessions)?;
-
-        let mut worker = QuicWorker::new(DataWorkerId::new(0));
-        let listener_id = ContextId::from(0x1234u64);
-        let listener = ListenerContext {
-            outer_listener,
-            outer_application: application,
-            inner_application_listener: hammer_runtime::app::ApplicationListenerId::new(2),
-            inner_session_listener: SessionHandle::new(3, 1),
-            configuration: ConfigId::from_raw(4),
-            connection_timeout: crate::config::DEFAULT_CONNECTION_TIMEOUT,
-            server_config: Some(Arc::new(server_config)),
-        };
-        let context = worker.accept_connection(lower, listener_id, &listener)?;
-
-        let server_addr = "127.0.0.1:443".parse().expect("server address");
-        let client_addr = "127.0.0.1:444".parse().expect("client address");
-        let now = Instant::now();
-        let mut client_endpoint =
-            Endpoint::new(Arc::new(EndpointConfig::default()), None, true, None);
-        let (client_handle, mut client_connection) = client_endpoint
-            .connect(now, client_config, server_addr, "localhost")
-            .map_err(|source| QuicWorkerError::ClientConnectFailed { context, source })?;
-        let mut client_buf = BytesMut::with_capacity(MAX_PACKET_SIZE);
-        let initial = client_connection
-            .poll_transmit(now, 1, &mut client_buf)
-            .expect("client Initial datagram");
-        while let Some(event) = client_connection.poll_endpoint_events() {
-            client_endpoint.handle_event(client_handle, event);
-        }
-        let mut to_server = VecDeque::from([client_buf.split_to(initial.size)]);
-
-        for _ in 0..16 {
-            if worker
-                .contexts
-                .get(context.into())
-                .and_then(Context::connection)
-                .and_then(|connection| connection.connection_session)
-                .is_some()
-            {
-                break;
-            }
-            while let Some(packet) = to_server.pop_front() {
-                let (lower_rx, _) = sessions
-                    .fifo_pair(lower)
-                    .ok_or_else(|| QuicWorkerError::SessionMissing { session: lower })?;
-                let header = SessionDgramHeader::new(server_addr, client_addr, packet.len())
-                    .ok_or_else(|| QuicWorkerError::InvalidEndpoint {
-                        context,
-                        local: server_addr,
-                        remote: client_addr,
-                    })?;
-                let header_bytes = header.to_bytes();
-                assert_eq!(lower_rx.enqueue(&header_bytes), header_bytes.len());
-                assert_eq!(lower_rx.enqueue(&packet), packet.len());
-                worker.process_udp_rx(&mut sessions, lower, context, now)?;
-
-                let mut responses = Vec::new();
-                loop {
-                    let (_, lower_tx) = sessions
-                        .fifo_pair(lower)
-                        .ok_or_else(|| QuicWorkerError::SessionMissing { session: lower })?;
-                    if lower_tx.max_dequeue() < SessionDgramHeader::SIZE {
-                        break;
-                    }
-                    let mut header_bytes = [0u8; SessionDgramHeader::SIZE];
-                    assert_eq!(
-                        lower_tx.peek(0, header_bytes.len(), &mut header_bytes),
-                        header_bytes.len()
-                    );
-                    let Some(header) = SessionDgramHeader::from_bytes(&header_bytes) else {
-                        break;
-                    };
-                    let payload_len = header.data_length() as usize;
-                    let record_len =
-                        header
-                            .total_len()
-                            .ok_or_else(|| QuicWorkerError::InvalidDatagram {
-                                session: lower,
-                                length: header.data_length(),
-                            })?;
-                    if lower_tx.max_dequeue() < record_len {
-                        break;
-                    }
-                    let mut payload = vec![0; payload_len];
-                    assert_eq!(
-                        lower_tx.peek(SessionDgramHeader::SIZE, payload_len, &mut payload),
-                        payload_len
-                    );
-                    assert_eq!(lower_tx.dequeue_drop(record_len), record_len);
-                    responses.push(payload);
-                }
-                for response in responses {
-                    let mut data = response;
-                    let mut descriptors = Vec::new();
-                    let mut endpoint_buf = BytesMut::with_capacity(MAX_PACKET_SIZE);
-                    if let Some(event) = client_endpoint.handle_scratch_with_descriptors(
-                        now,
-                        server_addr,
-                        None,
-                        None,
-                        &mut data,
-                        &mut descriptors,
-                        &mut endpoint_buf,
-                    ) {
-                        match event {
-                            DatagramEvent::ConnectionEvent(handle, event)
-                                if handle == client_handle =>
-                            {
-                                client_connection.handle_event(event);
-                            }
-                            DatagramEvent::Response(transmit) => {
-                                to_server.push_back(endpoint_buf.split_to(transmit.size));
-                                endpoint_buf.reserve(MAX_PACKET_SIZE);
-                            }
-                            DatagramEvent::NewConnection(_)
-                            | DatagramEvent::ConnectionEvent(_, _) => {}
-                        }
-                    }
-                    while let Some(event) = client_connection.poll_endpoint_events() {
-                        client_endpoint.handle_event(client_handle, event);
-                    }
-                    let mut client_buf = BytesMut::with_capacity(MAX_PACKET_SIZE);
-                    while let Some(transmit) =
-                        client_connection.poll_transmit(now, 1, &mut client_buf)
-                    {
-                        to_server.push_back(client_buf.split_to(transmit.size));
-                        client_buf.reserve(MAX_PACKET_SIZE);
-                    }
-                }
-            }
-        }
-
-        let connection_session = worker
-            .contexts
-            .get(context.into())
-            .and_then(Context::connection)
-            .and_then(|connection| connection.connection_session)
-            .expect("QUIC handshake publishes one Connection Session");
-        assert_eq!(
-            sessions.session_transport(connection_session),
-            Some((QuicWorker::ID, context.into()))
-        );
-        Ok(())
-    }
-
-    /// Server-side relay fixture: a QUIC client connects to the worker's
-    /// listener through real Session FIFOs until the Connection Session is
-    /// published, mirroring
-    /// `server_handshake_publishes_upper_connection_session_through_real_session_fifos`.
-    struct PeerRelay {
-        worker: QuicWorker,
-        sessions: SessionWorker<u32>,
-        // Owns the AppServer whose publisher `sessions` holds as a weak
-        // reference; dropping it would make `set_accepted` fail with
-        // PublicationQueueClosed.
-        server: hammer_runtime::attach::AppServer,
-        lower: SessionId,
-        context: ContextId,
-        connection_session: SessionId,
-        client_endpoint: Endpoint,
-        client_handle: ConnectionHandle,
-        client_connection: Connection,
-        server_addr: SocketAddr,
-        client_addr: SocketAddr,
-        now: Instant,
-        to_server: VecDeque<BytesMut>,
-    }
-
-    /// One relay exchange round: worker -> Session FIFO -> client endpoint ->
-    /// client transmit -> back to the worker.
-    fn peer_relay_exchange(relay: &mut PeerRelay) -> RuntimeResult<()> {
-        let mut client_buf = BytesMut::with_capacity(MAX_PACKET_SIZE);
-        // Drain the client's pending transmits before processing server
-        // input: a real peer sends STREAM frames as soon as it has them,
-        // without waiting for a server datagram.
-        while let Some(transmit) =
-            relay
-                .client_connection
-                .poll_transmit(relay.now, 1, &mut client_buf)
-        {
-            relay
-                .to_server
-                .push_back(client_buf.split_to(transmit.size));
-            client_buf.reserve(MAX_PACKET_SIZE);
-        }
-        while let Some(packet) = relay.to_server.pop_front() {
-            let (lower_rx, _) = relay.sessions.fifo_pair(relay.lower).ok_or_else(|| {
-                QuicWorkerError::SessionMissing {
-                    session: relay.lower,
-                }
-            })?;
-            let header =
-                SessionDgramHeader::new(relay.server_addr, relay.client_addr, packet.len())
-                    .ok_or_else(|| QuicWorkerError::InvalidEndpoint {
-                        context: relay.context,
-                        local: relay.server_addr,
-                        remote: relay.client_addr,
-                    })?;
-            let header_bytes = header.to_bytes();
-            assert_eq!(lower_rx.enqueue(&header_bytes), header_bytes.len());
-            assert_eq!(lower_rx.enqueue(&packet), packet.len());
-            relay.worker.process_udp_rx(
-                &mut relay.sessions,
-                relay.lower,
-                relay.context,
-                relay.now,
-            )?;
-
-            let mut responses = Vec::new();
-            loop {
-                let (_, lower_tx) = relay.sessions.fifo_pair(relay.lower).ok_or_else(|| {
-                    QuicWorkerError::SessionMissing {
-                        session: relay.lower,
-                    }
-                })?;
-                if lower_tx.max_dequeue() < SessionDgramHeader::SIZE {
-                    break;
-                }
-                let mut header_bytes = [0u8; SessionDgramHeader::SIZE];
-                assert_eq!(
-                    lower_tx.peek(0, header_bytes.len(), &mut header_bytes),
-                    header_bytes.len()
-                );
-                let Some(header) = SessionDgramHeader::from_bytes(&header_bytes) else {
-                    break;
-                };
-                let payload_len = header.data_length() as usize;
-                let record_len =
-                    header
-                        .total_len()
-                        .ok_or_else(|| QuicWorkerError::InvalidDatagram {
-                            session: relay.lower,
-                            length: header.data_length(),
-                        })?;
-                if lower_tx.max_dequeue() < record_len {
-                    break;
-                }
-                let mut payload = vec![0; payload_len];
-                assert_eq!(
-                    lower_tx.peek(SessionDgramHeader::SIZE, payload_len, &mut payload),
-                    payload_len
-                );
-                assert_eq!(lower_tx.dequeue_drop(record_len), record_len);
-                responses.push(payload);
-            }
-            for response in responses {
-                let mut data = response;
-                let mut descriptors = Vec::new();
-                let mut endpoint_buf = BytesMut::with_capacity(MAX_PACKET_SIZE);
-                if let Some(event) = relay.client_endpoint.handle_scratch_with_descriptors(
-                    relay.now,
-                    relay.server_addr,
-                    None,
-                    None,
-                    &mut data,
-                    &mut descriptors,
-                    &mut endpoint_buf,
-                ) {
-                    match event {
-                        DatagramEvent::ConnectionEvent(handle, event)
-                            if handle == relay.client_handle =>
-                        {
-                            relay.client_connection.handle_event(event);
-                        }
-                        DatagramEvent::Response(transmit) => {
-                            relay
-                                .to_server
-                                .push_back(endpoint_buf.split_to(transmit.size));
-                            endpoint_buf.reserve(MAX_PACKET_SIZE);
-                        }
-                        DatagramEvent::NewConnection(_) | DatagramEvent::ConnectionEvent(_, _) => {}
-                    }
-                }
-                while let Some(event) = relay.client_connection.poll_endpoint_events() {
-                    relay
-                        .client_endpoint
-                        .handle_event(relay.client_handle, event);
-                }
-                client_buf.clear();
-                while let Some(transmit) =
-                    relay
-                        .client_connection
-                        .poll_transmit(relay.now, 1, &mut client_buf)
-                {
-                    relay
-                        .to_server
-                        .push_back(client_buf.split_to(transmit.size));
-                    client_buf.reserve(MAX_PACKET_SIZE);
-                }
-            }
-        }
-        Ok(())
-    }
-
-    /// Inserts a worker-side stream context (with a child AppSession) on the
-    /// relay connection and returns its pool slot and Session id.
-    fn relay_stream_session(
-        relay: &mut PeerRelay,
-        stream: quinn_proto::StreamId,
-    ) -> RuntimeResult<(u32, SessionId)> {
-        let context: u32 = relay
-            .worker
-            .contexts
-            .insert(Context::stream(
-                relay.context.into(),
-                SessionId::from_raw(0),
-                stream,
-            ))
-            .ok_or(QuicWorkerError::ContextCapacityExhausted {
-                capacity: relay.worker.contexts.capacity(),
-            })?;
-        let session = relay
-            .sessions
-            .insert_session_for_test(QuicWorker::ID, context);
-        relay
-            .worker
-            .contexts
-            .get_mut(context)
-            .and_then(Context::stream_mut)
-            .ok_or(QuicWorkerError::ContextMissing {
-                context: ContextId::from(context),
-            })?
-            .session = session;
-        Ok((context, session))
-    }
-
-    fn peer_relay_established() -> RuntimeResult<PeerRelay> {
-        peer_relay_established_with(
-            None,
-            hammer_service::session::SessionAppCallbacks::all_none(),
-        )
-    }
-
-    fn install_builtin_session_app(_: &mut hammer_runtime::Engine) -> RuntimeResult<()> {
-        Ok(())
-    }
-
-    fn destroy_builtin_session_app(_: hammer_runtime::DataWorkerId, _: u64) {}
-
-    /// `listener_app` names the app identity the outer listener carries into
-    /// the accepted Connection Session (`stream_accept` reads
-    /// `listener.app()`); peer streams opened over that Session then inherit
-    /// it as the parent endpoint (VPP `quic_quicly_on_stream_open`).
-    fn peer_relay_established_with(
-        listener_app: Option<hammer_runtime::app::SessionAppId>,
-        callbacks: hammer_service::session::SessionAppCallbacks<u32>,
-    ) -> RuntimeResult<PeerRelay> {
-        let certified = rcgen::generate_simple_self_signed(vec!["localhost".to_owned()])
-            .expect("generate QUIC test certificate");
-        let rustls_server = quinn_proto::rustls::ServerConfig::builder()
-            .with_no_client_auth()
-            .with_single_cert(
-                vec![certified.cert.der().clone()],
-                quinn_proto::rustls::pki_types::PrivateKeyDer::try_from(
-                    certified.signing_key.serialize_der(),
-                )
-                .expect("encode QUIC server private key"),
-            )
-            .expect("build QUIC server rustls config");
-        let crypto_server =
-            quinn_proto::crypto::rustls::QuicServerConfig::try_from(Arc::new(rustls_server))
-                .expect("build QUIC server crypto");
-        let mut server_config = quinn_proto::ServerConfig::with_crypto(Arc::new(crypto_server));
-        server_config.transport_config(Arc::new(quinn_proto::TransportConfig::default()));
-
-        let mut roots = quinn_proto::rustls::RootCertStore::empty();
-        roots
-            .add(certified.cert.der().clone())
-            .expect("add QUIC test trust anchor");
-        let rustls_client = quinn_proto::rustls::ClientConfig::builder()
-            .with_root_certificates(roots)
-            .with_no_client_auth();
-        let crypto_client =
-            quinn_proto::crypto::rustls::QuicClientConfig::try_from(Arc::new(rustls_client))
-                .expect("build QUIC client crypto");
-        let mut client_config = quinn_proto::ClientConfig::new(Arc::new(crypto_client));
-        client_config.transport_config(Arc::new(quinn_proto::TransportConfig::default()));
-
-        // A builtin listener app must be registered with the ApplicationMain
-        // (VPP `vnet_register_session_app`), which assigns its SessionAppId by
-        // registration position; `register_listener` then validates it.
-        let applications = if listener_app.is_some() {
-            hammer_service::session::ApplicationMain::with_session_apps(
-                4,
-                [hammer_runtime::app::SessionAppRegistration::new(
-                    crate::session_app::NAME,
-                    install_builtin_session_app,
-                    destroy_builtin_session_app,
-                )],
-            )
-        } else {
-            hammer_service::session::ApplicationMain::new(4)
-        };
-        let application = applications
-            .attach()
-            .map_err(hammer_runtime::RuntimeError::from)?;
-        let socket_path = unique_socket_path("hammer-quic-peer-relay");
-        let server =
-            hammer_runtime::attach::AppServer::bind(&socket_path, 1).expect("bind App server");
-        let mut sessions = hammer_service::session::SessionWorker::<u32>::new(
-            DataWorkerId::new(0),
-            1,
-            hammer_runtime::app::AppSessionConfig::default(),
-            64,
-            Arc::clone(&applications),
-            Some(server.publisher()),
-        )?;
-        sessions.install_application_mq_for_test(application)?;
-        let lower = sessions.construct_transport_session(
-            SessionTransportId::new(1),
-            1,
-            unique_allocation_owner(),
-            application,
-            Some(hammer_runtime::app::SessionAppId::new(0)),
-            None,
-            None,
-            false,
-        )?;
-        // A builtin listener app is only meaningful with its Session App
-        // callback table installed: both the accepted Connection Session and
-        // its accepted child streams dispatch the accept callback under this
-        // app id (VPP `app_worker_accept_notify`).
-        if let Some(app) = listener_app {
-            sessions.install_session_app(app, callbacks)?;
-        }
-        let outer_listener = register_test_outer_listener_with_app(
-            &applications,
-            application,
-            &mut sessions,
-            listener_app,
-        )?;
-
-        let mut worker = QuicWorker::new(DataWorkerId::new(0));
-        let listener_id = ContextId::from(0x1234u64);
-        let listener = ListenerContext {
-            outer_listener,
-            outer_application: application,
-            inner_application_listener: hammer_runtime::app::ApplicationListenerId::new(2),
-            inner_session_listener: SessionHandle::new(3, 1),
-            configuration: ConfigId::from_raw(4),
-            connection_timeout: crate::config::DEFAULT_CONNECTION_TIMEOUT,
-            server_config: Some(Arc::new(server_config)),
-        };
-        let context = worker.accept_connection(lower, listener_id, &listener)?;
-
-        let server_addr = "127.0.0.1:443".parse().expect("server address");
-        let client_addr = "127.0.0.1:444".parse().expect("client address");
-        let now = Instant::now();
-        let mut client_endpoint =
-            Endpoint::new(Arc::new(EndpointConfig::default()), None, true, None);
-        let (client_handle, mut client_connection) = client_endpoint
-            .connect(now, client_config, server_addr, "localhost")
-            .map_err(|source| QuicWorkerError::ClientConnectFailed { context, source })?;
-        let mut client_buf = BytesMut::with_capacity(MAX_PACKET_SIZE);
-        let initial = client_connection
-            .poll_transmit(now, 1, &mut client_buf)
-            .expect("client Initial datagram");
-        while let Some(event) = client_connection.poll_endpoint_events() {
-            client_endpoint.handle_event(client_handle, event);
-        }
-        let to_server = VecDeque::from([client_buf.split_to(initial.size)]);
-
-        let mut relay = PeerRelay {
-            worker,
-            sessions,
-            server,
-            lower,
-            context,
-            connection_session: SessionId::from_raw(0),
-            client_endpoint,
-            client_handle,
-            client_connection,
-            server_addr,
-            client_addr,
-            now,
-            to_server,
-        };
-        // The handshake needs only a few flights, but parallel relay
-        // fixtures on a loaded machine may take extra rounds (each round
-        // is cheap and the loop breaks early once the Session is set).
-        for _ in 0..256 {
-            if relay
-                .worker
-                .contexts
-                .get(relay.context.into())
-                .and_then(Context::connection)
-                .and_then(|connection| connection.connection_session)
-                .is_some()
-            {
-                break;
-            }
-            peer_relay_exchange(&mut relay)?;
-        }
-        let connection_session = relay
-            .worker
-            .contexts
-            .get(relay.context.into())
-            .and_then(Context::connection)
-            .and_then(|connection| connection.connection_session)
-            .ok_or(QuicWorkerError::ConnectionMissing)?;
-        relay.connection_session = connection_session;
-        Ok(relay)
-    }
-
-    /// A peer-opened bidirectional stream allocates one child Session on the
-    /// parent connection's worker with STREAM capability, a pinned accepting
-    /// listener (the parent Connection Session handle, VPP
-    /// `quic_quicly_on_stream_open` sets `stream_session->listener_handle =
-    /// listen_session_get_handle (quic_session)`), and an ACCEPTED
-    /// publication (VPP `app_worker_accept_notify`,
-    /// application_worker.c:593).
-    #[test]
-    fn peer_bidirectional_stream_open_allocates_child_on_parent_worker() -> RuntimeResult<()> {
-        let mut relay = peer_relay_established()?;
-        let stream = relay
-            .client_connection
-            .streams()
-            .open(quinn_proto::Dir::Bi)
-            .expect("open peer bidirectional stream");
-        relay
-            .client_connection
-            .send_stream(stream)
-            .finish()
-            .expect("finish peer stream data");
-        for _ in 0..16 {
-            let missing = relay
-                .worker
-                .contexts
-                .get(relay.context.into())
-                .and_then(Context::connection)
-                .and_then(|connection| connection.engine.as_ref())
-                .map(|engine| engine.io_table.stream_session(stream).is_none())
-                .unwrap_or(true);
-            if !missing {
-                break;
-            }
-            peer_relay_exchange(&mut relay)?;
-        }
-        let child = relay
-            .worker
-            .contexts
-            .get(relay.context.into())
-            .and_then(Context::connection)
-            .and_then(|connection| connection.engine.as_ref())
-            .and_then(|engine| engine.io_table.stream_session(stream))
-            .ok_or(QuicWorkerError::StreamMissing { stream })?;
-        let (_, child_context) = relay
-            .sessions
-            .session_transport(child)
-            .ok_or(QuicWorkerError::SessionMissing { session: child })?;
-        let stream_context = relay
-            .worker
-            .contexts
-            .get(child_context)
-            .and_then(|context| match &context.role {
-                ContextRole::Stream(stream) => Some(stream),
-                ContextRole::Listener(_) | ContextRole::Connection(_) => None,
-            })
-            .ok_or(QuicWorkerError::ContextMissing {
-                context: ContextId::from(child_context),
-            })?;
-
-        assert_eq!(stream_context.parent, relay.context.into());
-        assert_eq!(stream_context.stream.dir(), quinn_proto::Dir::Bi);
-        assert_eq!(stream_context.session, child);
-        assert_eq!(
-            relay.sessions.session_flags(child),
-            Some(SessionFlags::STREAM)
-        );
-        let accepted = relay
-            .sessions
-            .accepted_message(child)
-            .expect("peer-open child carries a retained ACCEPTED message");
-        assert_eq!(
-            accepted.listener,
-            SessionHandle::new(relay.connection_session.pool_index(), 0)
-        );
-        assert_eq!(accepted.session, SessionHandle::new(child.pool_index(), 0));
-        assert_eq!(accepted.flags, SessionFlags::STREAM);
-        Ok(())
-    }
-
-    // Per-thread state: `cargo test` runs these tests in parallel on separate
-    // threads and each relay drives its worker synchronously on the test
-    // thread, so thread-local counters keep the accept callback recordings of
-    // one test from leaking into another.
-    thread_local! {
-        static SESSION_APP_ACCEPT_COUNT: AtomicU64 = AtomicU64::new(0);
-        static SESSION_APP_ACCEPTED_SESSION: AtomicU64 = AtomicU64::new(u64::MAX);
-        static SESSION_APP_ACCEPT_FAIL: AtomicBool = AtomicBool::new(false);
-    }
-
-    fn session_app_accept_callback(
-        _: &mut SessionWorker<u32>,
-        session: SessionId,
-        _: SessionAppContext,
-    ) -> RuntimeResult<()> {
-        SESSION_APP_ACCEPT_COUNT.with(|count| count.fetch_add(1, Ordering::Relaxed));
-        SESSION_APP_ACCEPTED_SESSION
-            .with(|accepted| accepted.store(session.get(), Ordering::Relaxed));
-        Ok(())
-    }
-
-    /// Records the accepted Session like `session_app_accept_callback`, but
-    /// once the test-only failure flag is armed it returns a typed error
-    /// instead of succeeding, standing in for a Session App accept callback
-    /// that rejects the accepted child (VPP `app_worker_accept_notify`
-    /// failure).
-    fn session_app_accept_callback_failing(
-        _: &mut SessionWorker<u32>,
-        session: SessionId,
-        _: SessionAppContext,
-    ) -> RuntimeResult<()> {
-        SESSION_APP_ACCEPT_COUNT.with(|count| count.fetch_add(1, Ordering::Relaxed));
-        SESSION_APP_ACCEPTED_SESSION
-            .with(|accepted| accepted.store(session.get(), Ordering::Relaxed));
-        if SESSION_APP_ACCEPT_FAIL.with(|fail| fail.load(Ordering::Relaxed)) {
-            return Err(RuntimeError::subsystem(
-                "session-app-accept",
-                hammer_service::session::error::SessionError::PublicationRejected {
-                    session_id: session,
-                },
-            ));
-        }
-        Ok(())
-    }
-
-    /// A peer-opened bidirectional stream accepted under a builtin app
-    /// listener fires the Session App accept callback with the child Session
-    /// (`app_worker_accept_notify`, VPP quic_quicly.c:873) and inherits the
-    /// parent Connection Session's builtin endpoint, so the child's endpoint
-    /// equals the parent's including app and opaque. The child completes
-    /// through `complete_stream_connect` rather than the external ACCEPTED
-    /// publication, so no accepted_message is retained.
-    #[test]
-    fn builtin_peer_bidirectional_stream_accepts_with_parent_builtin_endpoint() -> RuntimeResult<()>
-    {
-        SESSION_APP_ACCEPT_COUNT.with(|count| count.store(0, Ordering::Relaxed));
-        SESSION_APP_ACCEPTED_SESSION.with(|accepted| accepted.store(u64::MAX, Ordering::Relaxed));
-        let mut relay = peer_relay_established_with(
-            Some(SessionAppId::new(0)),
-            hammer_service::session::SessionAppCallbacks {
-                accept: Some(session_app_accept_callback),
-                ..Default::default()
-            },
-        )?;
-        // The handshake accepts the root Connection Session exactly once.
-        let accept_snapshot = SESSION_APP_ACCEPT_COUNT.with(|count| count.load(Ordering::Relaxed));
-        assert_eq!(
-            accept_snapshot, 1,
-            "root Connection Session accept callback"
-        );
-        let stream = relay
-            .client_connection
-            .streams()
-            .open(quinn_proto::Dir::Bi)
-            .expect("open peer bidirectional stream");
-        relay
-            .client_connection
-            .send_stream(stream)
-            .finish()
-            .expect("finish peer stream data");
-        for _ in 0..16 {
-            let missing = relay
-                .worker
-                .contexts
-                .get(relay.context.into())
-                .and_then(Context::connection)
-                .and_then(|connection| connection.engine.as_ref())
-                .map(|engine| engine.io_table.stream_session(stream).is_none())
-                .unwrap_or(true);
-            if !missing {
-                break;
-            }
-            peer_relay_exchange(&mut relay)?;
-        }
-        let child = relay
-            .worker
-            .contexts
-            .get(relay.context.into())
-            .and_then(Context::connection)
-            .and_then(|connection| connection.engine.as_ref())
-            .and_then(|engine| engine.io_table.stream_session(stream))
-            .ok_or(QuicWorkerError::StreamMissing { stream })?;
-        let (_, child_context) = relay
-            .sessions
-            .session_transport(child)
-            .ok_or(QuicWorkerError::SessionMissing { session: child })?;
-        let stream_context = relay
-            .worker
-            .contexts
-            .get(child_context)
-            .and_then(|context| match &context.role {
-                ContextRole::Stream(stream) => Some(stream),
-                ContextRole::Listener(_) | ContextRole::Connection(_) => None,
-            })
-            .ok_or(QuicWorkerError::ContextMissing {
-                context: ContextId::from(child_context),
-            })?;
-        assert_eq!(stream_context.parent, relay.context.into());
-        assert_eq!(stream_context.stream.dir(), quinn_proto::Dir::Bi);
-        assert_eq!(stream_context.session, child);
-        assert_eq!(
-            SESSION_APP_ACCEPT_COUNT.with(|count| count.load(Ordering::Relaxed)),
-            accept_snapshot + 1,
-            "the peer stream fires exactly one more accept callback"
-        );
-        assert_eq!(
-            SESSION_APP_ACCEPTED_SESSION.with(|accepted| accepted.load(Ordering::Relaxed)),
-            child.get(),
-            "the recorded accept Session is the stream child"
-        );
-        assert_eq!(
-            relay.sessions.session_app_endpoint(child),
-            relay
-                .sessions
-                .session_app_endpoint(relay.connection_session),
-            "the child inherits the parent's builtin app endpoint"
-        );
-        assert_eq!(
-            relay.sessions.session_flags(child),
-            Some(SessionFlags::STREAM)
-        );
-        assert!(
-            relay.sessions.accepted_message(child).is_none(),
-            "builtin children publish no external ACCEPTED message"
-        );
-        Ok(())
-    }
-
-    /// A builtin child accept callback failure follows the established
-    /// StreamData path: the callback records the child then returns a typed
-    /// error; `complete_stream_connect` removes the child Session and the
-    /// worker rolls back the stream context, so the quinn stream-setup
-    /// failure surfaces as `StreamDataError` and `handle_stream_data_error`
-    /// closes the connection with LocalResourceExhausted (VPP
-    /// `app_worker_accept_notify` failure), counts `stream_data_errors`, and
-    /// leaves the connection Session/context in the VPP-aligned
-    /// PassiveClosingQuicClosed state.
-    #[test]
-    fn builtin_child_accept_callback_failure_follows_stream_data_path() -> RuntimeResult<()> {
-        SESSION_APP_ACCEPT_COUNT.with(|count| count.store(0, Ordering::Relaxed));
-        SESSION_APP_ACCEPTED_SESSION.with(|accepted| accepted.store(u64::MAX, Ordering::Relaxed));
-        SESSION_APP_ACCEPT_FAIL.with(|fail| fail.store(false, Ordering::Relaxed));
-        let mut relay = peer_relay_established_with(
-            Some(SessionAppId::new(0)),
-            hammer_service::session::SessionAppCallbacks {
-                accept: Some(session_app_accept_callback_failing),
-                ..Default::default()
-            },
-        )?;
-        assert_eq!(
-            SESSION_APP_ACCEPT_COUNT.with(|count| count.load(Ordering::Relaxed)),
-            1,
-            "the root handshake accept callback succeeds"
-        );
-        // Arm the test-only failure flag only after the root handshake
-        // accepted, so the peer child's accept callback is the first to fail.
-        SESSION_APP_ACCEPT_FAIL.with(|fail| fail.store(true, Ordering::Relaxed));
-
-        let stream = relay
-            .client_connection
-            .streams()
-            .open(quinn_proto::Dir::Bi)
-            .expect("open peer bidirectional stream");
-        relay
-            .client_connection
-            .send_stream(stream)
-            .finish()
-            .expect("finish peer stream data");
-
-        let mut error = None;
-        for _ in 0..16 {
-            match peer_relay_exchange(&mut relay) {
-                Ok(()) => {}
-                Err(returned) => {
-                    error = Some(returned);
-                    break;
-                }
-            }
-        }
-        let error = error.ok_or(QuicWorkerError::StreamMissing { stream })?;
-        assert!(
-            matches!(
-                &error,
-                RuntimeError::Subsystem { source, .. }
-                    if matches!(
-                        source.downcast_ref::<QuicWorkerError>(),
-                        Some(QuicWorkerError::StreamData { context, error })
-                            if *context == relay.context
-                                && matches!(
-                                    error,
-                                    quinn_proto::StreamDataError::StreamMissing { .. }
-                                )
-                    )
-            ),
-            "the accept callback failure surfaces as the established StreamData \
-             worker error, got {error:?}"
-        );
-
-        let child = SessionId::from_raw(
-            SESSION_APP_ACCEPTED_SESSION.with(|accepted| accepted.load(Ordering::Relaxed)),
-        );
-        assert_eq!(
-            SESSION_APP_ACCEPT_COUNT.with(|count| count.load(Ordering::Relaxed)),
-            2,
-            "the peer child fires the accept callback exactly once before failing"
-        );
-        assert!(
-            !relay.sessions.has_session(child),
-            "the failed accepted child Session is removed"
-        );
-        assert!(
-            !relay.worker.contexts.iter().any(|(_, context)| matches!(
-                &context.role,
-                ContextRole::Stream(stream_context)
-                    if stream_context.parent == relay.context.into()
-                        && stream_context.stream == stream
-            )),
-            "no stream context remains for the failed child"
-        );
-        assert!(
-            relay
-                .worker
-                .contexts
-                .get(relay.context.into())
-                .and_then(Context::connection)
-                .and_then(|connection| connection.engine.as_ref())
-                .is_none_or(|engine| engine.io_table.stream_session(stream).is_none()),
-            "no io-table entry remains for the failed child"
-        );
-        assert!(
-            relay.worker.contexts.contains_key(relay.context.into()),
-            "the connection context remains"
-        );
-        assert!(
-            relay.sessions.has_session(relay.connection_session),
-            "the connection Session remains"
-        );
-        assert_eq!(
-            relay
-                .worker
-                .contexts
-                .get(relay.context.into())
-                .and_then(Context::connection)
-                .map(|connection| connection.state),
-            Some(ConnectionState::PassiveClosingQuicClosed),
-            "the connection Session/context stays in the VPP-aligned closing state"
-        );
-        assert_eq!(relay.worker.stream_data_errors, 1);
-
-        // A follow-up exchange drains the client's remaining transmits and
-        // server responses without further errors: the StreamData close path
-        // keeps the quinn engine open (no client CONNECTION_CLOSE is
-        // emitted), so the connection stays in PassiveClosingQuicClosed.
-        peer_relay_exchange(&mut relay)?;
-        assert_eq!(relay.worker.stream_data_errors, 1);
-        assert_eq!(
-            relay
-                .worker
-                .contexts
-                .get(relay.context.into())
-                .and_then(Context::connection)
-                .map(|connection| connection.state),
-            Some(ConnectionState::PassiveClosingQuicClosed)
-        );
-        assert!(!relay.client_connection.is_closed());
-        Ok(())
-    }
-
-    /// A peer-opened unidirectional stream accepted under a builtin app
-    /// listener follows the builtin bidir path: the Session App accept
-    /// callback fires with the child Session and the child inherits the
-    /// parent Connection Session's builtin endpoint. It differs only in
-    /// capability, carrying STREAM | UNIDIRECTIONAL (VPP
-    /// `quic_quicly_on_stream_open` for a remote uni stream).
-    #[test]
-    fn builtin_peer_unidirectional_stream_accepts_with_parent_builtin_endpoint() -> RuntimeResult<()>
-    {
-        SESSION_APP_ACCEPT_COUNT.with(|count| count.store(0, Ordering::Relaxed));
-        SESSION_APP_ACCEPTED_SESSION.with(|accepted| accepted.store(u64::MAX, Ordering::Relaxed));
-        let mut relay = peer_relay_established_with(
-            Some(SessionAppId::new(0)),
-            hammer_service::session::SessionAppCallbacks {
-                accept: Some(session_app_accept_callback),
-                ..Default::default()
-            },
-        )?;
-        // The handshake accepts the root Connection Session exactly once.
-        let accept_snapshot = SESSION_APP_ACCEPT_COUNT.with(|count| count.load(Ordering::Relaxed));
-        assert_eq!(
-            accept_snapshot, 1,
-            "root Connection Session accept callback"
-        );
-        let stream = relay
-            .client_connection
-            .streams()
-            .open(quinn_proto::Dir::Uni)
-            .expect("open peer unidirectional stream");
-        relay
-            .client_connection
-            .send_stream(stream)
-            .finish()
-            .expect("finish peer stream data");
-        for _ in 0..16 {
-            let missing = relay
-                .worker
-                .contexts
-                .get(relay.context.into())
-                .and_then(Context::connection)
-                .and_then(|connection| connection.engine.as_ref())
-                .map(|engine| engine.io_table.stream_session(stream).is_none())
-                .unwrap_or(true);
-            if !missing {
-                break;
-            }
-            peer_relay_exchange(&mut relay)?;
-        }
-        let child = relay
-            .worker
-            .contexts
-            .get(relay.context.into())
-            .and_then(Context::connection)
-            .and_then(|connection| connection.engine.as_ref())
-            .and_then(|engine| engine.io_table.stream_session(stream))
-            .ok_or(QuicWorkerError::StreamMissing { stream })?;
-        let (_, child_context) = relay
-            .sessions
-            .session_transport(child)
-            .ok_or(QuicWorkerError::SessionMissing { session: child })?;
-        let stream_context = relay
-            .worker
-            .contexts
-            .get(child_context)
-            .and_then(|context| match &context.role {
-                ContextRole::Stream(stream) => Some(stream),
-                ContextRole::Listener(_) | ContextRole::Connection(_) => None,
-            })
-            .ok_or(QuicWorkerError::ContextMissing {
-                context: ContextId::from(child_context),
-            })?;
-        assert_eq!(stream_context.parent, relay.context.into());
-        assert_eq!(stream_context.stream.dir(), quinn_proto::Dir::Uni);
-        assert_eq!(stream_context.session, child);
-        assert_eq!(
-            SESSION_APP_ACCEPT_COUNT.with(|count| count.load(Ordering::Relaxed)),
-            accept_snapshot + 1,
-            "the peer stream fires exactly one more accept callback"
-        );
-        assert_eq!(
-            SESSION_APP_ACCEPTED_SESSION.with(|accepted| accepted.load(Ordering::Relaxed)),
-            child.get(),
-            "the recorded accept Session is the stream child"
-        );
-        assert_eq!(
-            relay.sessions.session_app_endpoint(child),
-            relay
-                .sessions
-                .session_app_endpoint(relay.connection_session),
-            "the child inherits the parent's builtin app endpoint"
-        );
-        assert_eq!(
-            relay.sessions.session_flags(child),
-            Some(SessionFlags::STREAM | SessionFlags::UNIDIRECTIONAL)
-        );
-        assert!(
-            relay.sessions.accepted_message(child).is_none(),
-            "builtin children publish no external ACCEPTED message"
-        );
-        Ok(())
-    }
-
-    /// A peer-opened unidirectional stream allocates a send-only child
-    /// Session carrying STREAM | UNIDIRECTIONAL capability on its ACCEPTED
-    /// publication (VPP `quic_quicly_on_stream_open` flags SESSION_F_STREAM |
-    /// SESSION_F_UNIDIRECTIONAL for a remote uni stream).
-    #[test]
-    fn peer_unidirectional_stream_open_allocates_send_only_child() -> RuntimeResult<()> {
-        let mut relay = peer_relay_established()?;
-        let stream = relay
-            .client_connection
-            .streams()
-            .open(quinn_proto::Dir::Uni)
-            .expect("open peer unidirectional stream");
-        relay
-            .client_connection
-            .send_stream(stream)
-            .finish()
-            .expect("finish peer stream data");
-        for _ in 0..16 {
-            let missing = relay
-                .worker
-                .contexts
-                .get(relay.context.into())
-                .and_then(Context::connection)
-                .and_then(|connection| connection.engine.as_ref())
-                .map(|engine| engine.io_table.stream_session(stream).is_none())
-                .unwrap_or(true);
-            if !missing {
-                break;
-            }
-            peer_relay_exchange(&mut relay)?;
-        }
-        let child = relay
-            .worker
-            .contexts
-            .get(relay.context.into())
-            .and_then(Context::connection)
-            .and_then(|connection| connection.engine.as_ref())
-            .and_then(|engine| engine.io_table.stream_session(stream))
-            .ok_or(QuicWorkerError::StreamMissing { stream })?;
-        let (_, child_context) = relay
-            .sessions
-            .session_transport(child)
-            .ok_or(QuicWorkerError::SessionMissing { session: child })?;
-        let stream_context = relay
-            .worker
-            .contexts
-            .get(child_context)
-            .and_then(|context| match &context.role {
-                ContextRole::Stream(stream) => Some(stream),
-                ContextRole::Listener(_) | ContextRole::Connection(_) => None,
-            })
-            .ok_or(QuicWorkerError::ContextMissing {
-                context: ContextId::from(child_context),
-            })?;
-
-        assert_eq!(stream_context.parent, relay.context.into());
-        assert_eq!(stream_context.stream.dir(), quinn_proto::Dir::Uni);
-        assert_eq!(stream_context.session, child);
-        let flags = SessionFlags::STREAM | SessionFlags::UNIDIRECTIONAL;
-        assert_eq!(relay.sessions.session_flags(child), Some(flags));
-        let accepted = relay
-            .sessions
-            .accepted_message(child)
-            .expect("peer-open uni child carries a retained ACCEPTED message");
-        assert_eq!(
-            accepted.listener,
-            SessionHandle::new(relay.connection_session.pool_index(), 0)
-        );
-        assert_eq!(accepted.session, SessionHandle::new(child.pool_index(), 0));
-        assert_eq!(accepted.flags, flags);
-        Ok(())
-    }
-
-    /// A peer that finishes its send side in the first frame of a stream —
-    /// Quinn reports `Opened` with no later `Readable` — must notify the child
-    /// AppSession exactly once with the transport-closing control event while
-    /// the engine stream and child Session stay live. This is RX half-close,
-    /// not stream teardown (VPP `quic_quicly_on_receive` check_eos ->
-    /// `session_transport_closing_notify`).
-    #[test]
-    fn peer_receive_fin_with_initial_opened_notifies_child_transport_closing_once()
-    -> RuntimeResult<()> {
-        let mut relay = peer_relay_established()?;
-        let stream = relay
-            .client_connection
-            .streams()
-            .open(quinn_proto::Dir::Bi)
-            .expect("open peer bidirectional stream");
-        // Pre-create the child AppSession (Active) under the parent
-        // connection, matching
-        // `remote_close_retains_context_until_application_confirmation`, so a
-        // FIN notification is immediately observable on its event queue.
-        let child_context: u32 = relay
-            .worker
-            .contexts
-            .insert(Context::stream(
-                relay.context.into(),
-                SessionId::from_raw(0),
-                stream,
-            ))
-            .ok_or(QuicWorkerError::ContextCapacityExhausted {
-                capacity: relay.worker.contexts.capacity(),
-            })?;
-        let child = relay
-            .sessions
-            .insert_session_for_test(QuicWorker::ID, child_context);
-        relay
-            .worker
-            .contexts
-            .get_mut(child_context)
-            .and_then(Context::stream_mut)
-            .ok_or(QuicWorkerError::ContextMissing {
-                context: ContextId::from(child_context),
-            })?
-            .session = child;
-        let (rx_fifo, tx_fifo) = relay
-            .sessions
-            .app_session(child)
-            .map(|session| (Arc::clone(session.rx_fifo()), Arc::clone(session.tx_fifo())))
-            .ok_or(QuicWorkerError::SessionMissing { session: child })?;
-        let engine = relay
-            .worker
-            .contexts
-            .get_mut(relay.context.into())
-            .and_then(Context::connection_mut)
-            .and_then(|connection| connection.engine.as_mut())
-            .ok_or(QuicWorkerError::ConnectionMissing)?;
-        engine
-            .io_table
-            .install_stream(stream, child_context, child, rx_fifo, tx_fifo, 0, 0);
-
-        relay
-            .client_connection
-            .send_stream(stream)
-            .finish()
-            .expect("finish peer stream data");
-        let mut notified = false;
-        for _ in 0..16 {
-            peer_relay_exchange(&mut relay)?;
-            let child_app = relay
-                .sessions
-                .app_session(child)
-                .ok_or(QuicWorkerError::SessionMissing { session: child })?;
-            let mut events = [SessionEvt::io(0, SessionEvtType::Connect); 4];
-            let event_count = child_app.poll_events(&mut events);
-            if events[..event_count]
-                .iter()
-                .any(|event| event.evt_type == SessionEvtType::Disconnected)
-            {
-                notified = true;
-                break;
-            }
-        }
-        assert!(notified, "peer RX FIN did not notify the child AppSession");
-        // Half-close only: the child Session and the engine stream stay live.
-        assert!(relay.sessions.session_transport(child).is_some());
-        assert!(
-            relay
-                .worker
-                .contexts
-                .get(relay.context.into())
-                .and_then(Context::connection)
-                .and_then(|connection| connection.engine.as_ref())
-                .map(|engine| engine.io_table.stream_session(stream).is_some())
-                .unwrap_or(false)
-        );
-        Ok(())
-    }
-
-    /// A peer FIN whose final offset arrives before an earlier range (packet
-    /// loss): the final offset is known but the receive is not contiguous, so
-    /// no transport-closing notify may fire; once the missing range fills the
-    /// hole the child AppSession is notified exactly once (VPP
-    /// `quicly_recvstate_transfer_complete` requires `data_off ==
-    /// received.end`).
-    #[test]
-    fn peer_receive_fin_out_of_order_waits_for_contiguous_fill() -> RuntimeResult<()> {
-        let mut relay = peer_relay_established()?;
-        let stream = relay
-            .client_connection
-            .streams()
-            .open(quinn_proto::Dir::Bi)
-            .expect("open peer bidirectional stream");
-        // Pre-create the child AppSession (Active) under the parent
-        // connection so FIN notifications are observable on its event queue.
-        let child_context: u32 = relay
-            .worker
-            .contexts
-            .insert(Context::stream(
-                relay.context.into(),
-                SessionId::from_raw(0),
-                stream,
-            ))
-            .ok_or(QuicWorkerError::ContextCapacityExhausted {
-                capacity: relay.worker.contexts.capacity(),
-            })?;
-        let child = relay
-            .sessions
-            .insert_session_for_test(QuicWorker::ID, child_context);
-        relay
-            .worker
-            .contexts
-            .get_mut(child_context)
-            .and_then(Context::stream_mut)
-            .ok_or(QuicWorkerError::ContextMissing {
-                context: ContextId::from(child_context),
-            })?
-            .session = child;
-        let (rx_fifo, tx_fifo) = relay
-            .sessions
-            .app_session(child)
-            .map(|session| (Arc::clone(session.rx_fifo()), Arc::clone(session.tx_fifo())))
-            .ok_or(QuicWorkerError::SessionMissing { session: child })?;
-        let engine = relay
-            .worker
-            .contexts
-            .get_mut(relay.context.into())
-            .and_then(Context::connection_mut)
-            .and_then(|connection| connection.engine.as_mut())
-            .ok_or(QuicWorkerError::ConnectionMissing)?;
-        engine
-            .io_table
-            .install_stream(stream, child_context, child, rx_fifo, tx_fifo, 0, 0);
-
-        // The peer sends bytes 0..4 in one datagram and the FIN byte 4..5 in
-        // the next; the first datagram is lost, so the FIN arrives first and
-        // the server sees the final offset with a hole before it.
-        relay
-            .client_connection
-            .send_stream(stream)
-            .write(&[0u8; 4])
-            .expect("write first peer range");
-        let mut a_buf = BytesMut::with_capacity(MAX_PACKET_SIZE);
-        let a = relay
-            .client_connection
-            .poll_transmit(relay.now, 1, &mut a_buf)
-            .expect("peer first-range datagram");
-        let a_payload = a_buf.split_to(a.size);
-        relay
-            .client_connection
-            .send_stream(stream)
-            .write(&[1u8])
-            .expect("write final peer byte");
-        relay
-            .client_connection
-            .send_stream(stream)
-            .finish()
-            .expect("finish peer stream data");
-        let mut b_buf = BytesMut::with_capacity(MAX_PACKET_SIZE);
-        let b = relay
-            .client_connection
-            .poll_transmit(relay.now, 1, &mut b_buf)
-            .expect("peer final-range datagram");
-        relay.to_server.push_back(b_buf.split_to(b.size));
-        peer_relay_exchange(&mut relay)?;
-        let child_app = relay
-            .sessions
-            .app_session(child)
-            .ok_or(QuicWorkerError::SessionMissing { session: child })?;
-        let mut events = [SessionEvt::io(0, SessionEvtType::Connect); 4];
-        let event_count = child_app.poll_events(&mut events);
-        assert!(
-            !events[..event_count]
-                .iter()
-                .any(|event| event.evt_type == SessionEvtType::Disconnected),
-            "a known final offset with a missing earlier range must not notify"
-        );
-
-        // The lost first-range datagram arrives and fills the hole.
-        relay.to_server.push_back(a_payload);
-        peer_relay_exchange(&mut relay)?;
-        let child_app = relay
-            .sessions
-            .app_session(child)
-            .ok_or(QuicWorkerError::SessionMissing { session: child })?;
-        let mut events = [SessionEvt::io(0, SessionEvtType::Connect); 4];
-        let event_count = child_app.poll_events(&mut events);
-        assert_eq!(
-            events[..event_count]
-                .iter()
-                .filter(|event| event.evt_type == SessionEvtType::Disconnected)
-                .count(),
-            1,
-            "filling the hole notifies the child AppSession exactly once"
-        );
-        // Half-close only: the child Session and the engine stream stay live.
-        assert!(relay.sessions.session_transport(child).is_some());
-        assert!(
-            relay
-                .worker
-                .contexts
-                .get(relay.context.into())
-                .and_then(Context::connection)
-                .and_then(|connection| connection.engine.as_ref())
-                .map(|engine| engine.io_table.stream_session(stream).is_some())
-                .unwrap_or(false)
-        );
-        Ok(())
-    }
-
-    #[test]
-    fn app_error_code_varint_conversion_is_checked() {
-        let legal_min = QuicAppErrorCode(SessionApplicationErrorCode::from(0));
-        assert_eq!(
-            VarInt::try_from(legal_min),
-            Ok(VarInt::from_u32(0)),
-            "zero is the minimum legal application error code"
-        );
-        let legal_max = (1u64 << 62) - 1;
-        assert_eq!(
-            VarInt::try_from(QuicAppErrorCode(SessionApplicationErrorCode::from(
-                legal_max
-            ))),
-            Ok(VarInt::try_from(legal_max).expect("max legal varint")),
-            "2^62 - 1 is the maximum legal application error code"
-        );
-        let out_of_range = SessionApplicationErrorCode::from(1u64 << 62);
-        assert_eq!(
-            VarInt::try_from(QuicAppErrorCode(out_of_range)),
-            Err(1u64 << 62),
-            "1 << 62 exceeds the varint range and returns the original code"
-        );
-        assert_eq!(
-            u64::from(out_of_range),
-            1u64 << 62,
-            "failed conversion leaves the input unchanged"
-        );
-    }
-
-    #[test]
-    fn app_error_code_varint_rejects_out_of_range_with_session_error() {
-        let session = SessionId::from_raw(7);
-        let error = QuicWorker::app_error_code_varint(
-            session,
-            SessionApplicationErrorCode::from(1u64 << 62),
-        )
-        .expect_err("1 << 62 exceeds the varint range");
-        match error {
-            QuicWorkerError::ApplicationErrorCodeInvalid {
-                session: rejected,
-                code,
-            } => {
-                assert_eq!(rejected, session);
-                assert_eq!(code, 1u64 << 62, "original code is preserved");
-            }
-            other => panic!("unexpected error: {other:?}"),
-        }
-    }
-
-    fn test_quic_session() -> RuntimeResult<(
-        QuicWorker,
-        SessionWorker<u32>,
-        ApplicationId,
-        SessionId,
-        ContextId,
-        u32,
-    )> {
-        let applications = hammer_service::session::ApplicationMain::new(4);
-        let application = applications
-            .attach()
-            .map_err(hammer_runtime::RuntimeError::from)?;
-        let mut sessions = SessionWorker::<u32>::new(
-            DataWorkerId::new(0),
-            1,
-            hammer_runtime::app::AppSessionConfig::default(),
-            64,
-            Arc::clone(&applications),
-            None,
-        )?;
-        sessions.install_application_mq_for_test(application)?;
-        let mut worker = QuicWorker::new(DataWorkerId::new(0));
-        let listener = ListenerContext {
-            outer_listener: SessionHandle::new(1, 1),
-            outer_application: ApplicationId::new(1),
-            inner_application_listener: hammer_runtime::app::ApplicationListenerId::new(2),
-            inner_session_listener: SessionHandle::new(3, 1),
-            configuration: ConfigId::from_raw(4),
-            connection_timeout: 5,
-            server_config: None,
-        };
-        let context = worker
-            .accept_connection(
-                SessionId::from_raw(5),
-                ContextId::from(0x1234u64),
-                &listener,
-            )
-            .expect("accept connection");
-        let connection_index = u32::from(context);
-        let session = sessions.construct_transport_session(
-            QuicWorker::ID,
-            connection_index,
-            1,
-            application,
-            Some(hammer_runtime::app::SessionAppId::new(0)),
-            None,
-            None,
-            false,
-        )?;
-        let listener_index = worker
-            .contexts
-            .insert(Context::listener(
-                SessionHandle::new(1, 1),
-                ApplicationId::new(1),
-                hammer_runtime::app::ApplicationListenerId::new(2),
-                SessionHandle::new(3, 1),
-                ConfigId::from_raw(4),
-                5,
-                None,
-            ))
-            .expect("listener context capacity");
-        Ok((
-            worker,
-            sessions,
-            application,
-            session,
-            context,
-            listener_index,
-        ))
-    }
-
-    #[test]
-    fn session_context_resolves_quic_session_to_exact_context() -> RuntimeResult<()> {
-        let (worker, sessions, _, session, context, _) = test_quic_session()?;
-        let resolved = worker
-            .session_context(&sessions, session)
-            .expect("QUIC Session resolves");
-        assert_eq!(resolved, context);
-        Ok(())
-    }
-
-    #[test]
-    fn session_context_rejects_missing_session() -> RuntimeResult<()> {
-        let (worker, sessions, _, _, _, _) = test_quic_session()?;
-        let missing = SessionId::from_raw(0xDEAD);
-        assert!(matches!(
-            worker.session_context(&sessions, missing),
-            Err(QuicWorkerError::SessionMissing { session }) if session == missing
-        ));
-        Ok(())
-    }
-
-    #[test]
-    fn session_context_rejects_foreign_transport_session() -> RuntimeResult<()> {
-        let worker = QuicWorker::new(DataWorkerId::new(0));
-        let (sessions, foreign) = test_lower_session()?;
-        assert!(matches!(
-            worker.session_context(&sessions, foreign),
-            Err(QuicWorkerError::SessionNotQuic { session }) if session == foreign
-        ));
-        Ok(())
-    }
-
-    #[test]
-    fn session_context_rejects_non_stream_connection_context() -> RuntimeResult<()> {
-        let (worker, mut sessions, application, _, _, listener_index) = test_quic_session()?;
-        let non_quic = sessions.construct_transport_session(
-            QuicWorker::ID,
-            listener_index,
-            1,
-            application,
-            Some(hammer_runtime::app::SessionAppId::new(0)),
-            None,
-            None,
-            false,
-        )?;
-        assert!(matches!(
-            worker.session_context(&sessions, non_quic),
-            Err(QuicWorkerError::ContextMissing { context })
-                if context == ContextId::from(listener_index)
-        ));
-        Ok(())
-    }
-
-    /// Establishes a client QUIC connection and opens one stream child,
-    /// mirroring `open_stream_creates_direction_exact_child_carrying_app_context`;
-    /// returns the worker, sessions, application main, the bound AppServer
-    /// (kept alive so later stream opens can attach through its publisher),
-    /// parent connection context/Session, and the open stream
-    /// Session/index/StreamId.
-    fn test_established_stream() -> RuntimeResult<(
-        QuicWorker,
-        SessionWorker<u32>,
-        Arc<hammer_service::session::ApplicationMain>,
-        hammer_runtime::attach::AppServer,
-        ContextId,
-        SessionId,
-        SessionId,
-        u32,
-        quinn_proto::StreamId,
-    )> {
-        let applications = hammer_service::session::ApplicationMain::new(4);
-        let application = applications
-            .attach()
-            .map_err(hammer_runtime::RuntimeError::from)?;
-        let socket_path = unique_socket_path("hammer-quic-reset-stream");
-        let server =
-            hammer_runtime::attach::AppServer::bind(&socket_path, 1).expect("bind App server");
-        let mut sessions = hammer_service::session::SessionWorker::<u32>::new(
-            DataWorkerId::new(0),
-            1,
-            hammer_runtime::app::AppSessionConfig::default(),
-            64,
-            Arc::clone(&applications),
-            Some(server.publisher()),
-        )?;
-        sessions.install_session_app(
-            SessionAppId::new(0),
-            hammer_service::session::SessionAppCallbacks::all_none(),
-        )?;
-        sessions.install_application_mq_for_test(application)?;
-        let mut worker = QuicWorker::new(DataWorkerId::new(0));
-        let local = "127.0.0.1:443".parse().expect("local endpoint");
-        let remote = "127.0.0.1:444".parse().expect("remote endpoint");
-        let (client_config, server_config) = client_server_config_pair();
-        let parent_context = worker.allocate_client_connect(
-            Arc::clone(&client_config),
-            "localhost".to_owned(),
-            local,
-            remote,
-            application,
-            Some(SessionAppId::new(0)),
-            None,
-            SessionConnectionId::from_raw(7),
-        )?;
-        let now = Instant::now();
-        worker.connect_connection(parent_context, SessionId::from_raw(11), now)?;
-        drive_client_handshake(
-            &mut worker,
-            parent_context,
-            server_config,
-            local,
-            remote,
-            now,
-        )?;
-        let parent = sessions.construct_transport_session(
-            QuicWorker::ID,
-            parent_context.into(),
-            unique_allocation_owner(),
-            application,
-            None,
-            None,
-            None,
-            false,
-        )?;
-        worker
-            .contexts
-            .get_mut(parent_context.into())
-            .and_then(Context::connection_mut)
-            .ok_or(QuicWorkerError::ContextMissing {
-                context: parent_context,
-            })?
-            .connection_session = Some(parent);
-        worker
-            .contexts
-            .get_mut(parent_context.into())
-            .and_then(Context::connection_mut)
-            .ok_or(QuicWorkerError::ContextMissing {
-                context: parent_context,
-            })?
-            .state = ConnectionState::Established;
-        let bidi = worker.open_stream(
-            &applications,
-            &mut sessions,
-            parent,
-            SessionStreamDirection::Bidi,
-            0xB1D1,
-        )?;
-        let (_, bidi_index) = sessions
-            .session_transport(bidi)
-            .ok_or(QuicWorkerError::SessionMissing { session: bidi })?;
-        let bidi_id = worker
-            .contexts
-            .get(bidi_index)
-            .and_then(Context::stream_ref)
-            .ok_or(QuicWorkerError::ContextMissing {
-                context: ContextId::from(bidi_index),
-            })?
-            .stream;
-        let _ = std::fs::remove_file(socket_path);
-        Ok((
-            worker,
-            sessions,
-            applications,
-            server,
-            parent_context,
-            parent,
-            bidi,
-            bidi_index,
-            bidi_id,
-        ))
-    }
-
-    /// Probes the quinn send stream pinned by `stream`: true when it is
-    /// already in the terminal reset state (a redundant `reset` returns
-    /// `ClosedStream`). Probing itself resets an untouched stream, so it is
-    /// only used as the final assertion on a stream.
-    fn stream_already_reset(
-        worker: &mut QuicWorker,
-        parent: ContextId,
-        stream: quinn_proto::StreamId,
-    ) -> bool {
-        worker
-            .contexts
-            .get_mut(parent.into())
-            .and_then(Context::connection_mut)
-            .and_then(|connection| connection.engine.as_mut())
-            .and_then(|engine| engine.connection.as_mut())
-            .map(|connection| {
-                connection
-                    .send_stream(stream)
-                    .reset(quinn_proto::VarInt::from_u32(0))
-                    .is_err()
-            })
-            .unwrap_or(false)
-    }
-
-    /// Probes the quinn receive stream pinned by `stream`: true when it is
-    /// already stopped (a redundant `stop` returns `ClosedStream`, quinn
-    /// streams/recv.rs `Recv::stop`). Probing itself stops an untouched
-    /// stream, so it is only used as the final assertion on a stream.
-    fn stream_already_stopped(
-        worker: &mut QuicWorker,
-        parent: ContextId,
-        stream: quinn_proto::StreamId,
-    ) -> bool {
-        worker
-            .contexts
-            .get_mut(parent.into())
-            .and_then(Context::connection_mut)
-            .and_then(|connection| connection.engine.as_mut())
-            .and_then(|engine| engine.connection.as_mut())
-            .map(|connection| {
-                connection
-                    .recv_stream(stream)
-                    .stop(quinn_proto::VarInt::from_u32(0))
-                    .is_err()
-            })
-            .unwrap_or(false)
-    }
-
-    /// True when the worker-local quinn connection for `context` is closed.
-    fn connection_is_closed(worker: &QuicWorker, context: ContextId) -> bool {
-        worker
-            .contexts
-            .get(context.into())
-            .and_then(Context::connection)
-            .and_then(|connection| connection.engine.as_ref())
-            .and_then(|engine| engine.connection.as_ref())
-            .is_some_and(Connection::is_closed)
-    }
-
-    #[test]
-    fn reset_stream_resets_exact_stream_and_leaves_connection_untouched() -> RuntimeResult<()> {
-        let (
-            mut worker,
-            mut sessions,
-            applications,
-            _server,
-            parent_context,
-            parent,
-            bidi,
-            bidi_index,
-            bidi_id,
-        ) = test_established_stream()?;
-        let uni = worker.open_stream(
-            &applications,
-            &mut sessions,
-            parent,
-            SessionStreamDirection::Uni,
-            0x55,
-        )?;
-        let (_, uni_index) = sessions
-            .session_transport(uni)
-            .ok_or(QuicWorkerError::SessionMissing { session: uni })?;
-        let uni_id = worker
-            .contexts
-            .get(uni_index)
-            .and_then(Context::stream_ref)
-            .ok_or(QuicWorkerError::ContextMissing {
-                context: ContextId::from(uni_index),
-            })?
-            .stream;
-
-        worker.reset_stream(&mut sessions, bidi, SessionApplicationErrorCode::from(42))?;
-
-        assert!(
-            stream_already_reset(&mut worker, parent_context, bidi_id),
-            "the exact stream pinned by the Session is reset at the quinn level"
-        );
-        assert!(
-            !stream_already_reset(&mut worker, parent_context, uni_id),
-            "the sibling stream is untouched"
-        );
-        assert!(
-            sessions.session_transport(bidi).is_some(),
-            "the stream Session survives the reset"
-        );
-        assert!(
-            worker
-                .contexts
-                .get(bidi_index)
-                .and_then(Context::stream_ref)
-                .is_some(),
-            "the stream context survives the reset"
-        );
-        let state = worker
-            .contexts
-            .get(parent_context.into())
-            .and_then(Context::connection)
-            .map(|connection| connection.state)
-            .ok_or(QuicWorkerError::ContextMissing {
-                context: parent_context,
-            })?;
-        assert_eq!(
-            state,
-            ConnectionState::Established,
-            "the parent connection is untouched by the stream reset"
-        );
-        let after = worker.open_stream(
-            &applications,
-            &mut sessions,
-            parent,
-            SessionStreamDirection::Bidi,
-            0xA5,
-        )?;
-        worker.reset_stream(&mut sessions, after, SessionApplicationErrorCode::from(0))?;
-        Ok(())
-    }
-
-    #[test]
-    fn reset_stream_rejects_out_of_range_code_before_any_side_effect() -> RuntimeResult<()> {
-        let (
-            mut worker,
-            mut sessions,
-            applications,
-            _server,
-            parent_context,
-            parent,
-            bidi,
-            _,
-            bidi_id,
-        ) = test_established_stream()?;
-        let error = worker
-            .reset_stream(
-                &mut sessions,
-                bidi,
-                SessionApplicationErrorCode::from(1u64 << 62),
-            )
-            .expect_err("code beyond the varint range is rejected");
-        assert!(
-            matches!(
-                &error,
-                RuntimeError::Subsystem { source, .. }
-                    if matches!(
-                        source.downcast_ref::<QuicWorkerError>(),
-                        Some(QuicWorkerError::ApplicationErrorCodeInvalid { session, .. })
-                            if session == &bidi
-                    )
-            ),
-            "typed ApplicationErrorCodeInvalid expected, got {error:?}"
-        );
-        assert!(
-            !stream_already_reset(&mut worker, parent_context, bidi_id),
-            "the rejected code performed no transport side effect"
-        );
-        // The probe above consumed the pinned stream (its final assertion
-        // resets it), so a valid code is proven on a fresh sibling stream.
-        let after = worker.open_stream(
-            &applications,
-            &mut sessions,
-            parent,
-            SessionStreamDirection::Bidi,
-            0xB1D2,
-        )?;
-        worker.reset_stream(&mut sessions, after, SessionApplicationErrorCode::from(0))?;
-        Ok(())
-    }
-
-    #[test]
-    fn reset_stream_rejects_engine_closed_stream_before_side_effects() -> RuntimeResult<()> {
-        let (mut worker, mut sessions, _, _server, parent_context, _, bidi, bidi_index, bidi_id) =
-            test_established_stream()?;
-        worker
-            .contexts
-            .get_mut(bidi_index)
-            .and_then(Context::stream_mut)
-            .expect("stream context")
-            .flags |= STREAM_ENGINE_CLOSED;
-        let error = worker
-            .reset_stream(&mut sessions, bidi, SessionApplicationErrorCode::from(0))
-            .expect_err("an engine-closed stream is stale");
-        assert!(
-            matches!(
-                &error,
-                RuntimeError::Subsystem { source, .. }
-                    if matches!(
-                        source.downcast_ref::<QuicWorkerError>(),
-                        Some(QuicWorkerError::StreamMissing { stream }) if stream == &bidi_id
-                    )
-            ),
-            "typed StreamMissing expected, got {error:?}"
-        );
-        assert!(
-            !stream_already_reset(&mut worker, parent_context, bidi_id),
-            "the stale rejection performed no transport side effect"
-        );
-        Ok(())
-    }
-
-    #[test]
-    fn reset_stream_rejects_connection_session_without_side_effects() -> RuntimeResult<()> {
-        let (mut worker, mut sessions, _, session, context, _) = test_quic_session()?;
-        let error = worker
-            .reset_stream(&mut sessions, session, SessionApplicationErrorCode::from(0))
-            .expect_err("a connection Session is not a stream");
-        assert!(
-            matches!(
-                &error,
-                RuntimeError::Subsystem { source, .. }
-                    if matches!(
-                        source.downcast_ref::<QuicWorkerError>(),
-                        Some(QuicWorkerError::SessionNotStream { session: rejected })
-                            if rejected == &session
-                    )
-            ),
-            "typed SessionNotStream expected, got {error:?}"
-        );
-        assert!(
-            worker
-                .contexts
-                .get(context.into())
-                .and_then(Context::connection)
-                .is_some(),
-            "the connection context is untouched"
-        );
-        Ok(())
-    }
-
-    #[test]
-    fn reset_stream_rejects_missing_session() -> RuntimeResult<()> {
-        let (mut worker, mut sessions, _, _, _, _) = test_quic_session()?;
-        let missing = SessionId::from_raw(0xDEAD);
-        assert!(matches!(
-            worker.reset_stream(&mut sessions, missing, SessionApplicationErrorCode::from(0)),
-            Err(RuntimeError::Subsystem { source, .. })
-                if matches!(source.downcast_ref::<QuicWorkerError>(), Some(QuicWorkerError::SessionMissing { .. }))
-        ));
-        Ok(())
-    }
-
-    #[test]
-    fn reset_stream_rejects_foreign_transport_session() -> RuntimeResult<()> {
-        let mut worker = QuicWorker::new(DataWorkerId::new(0));
-        let (mut sessions, foreign) = test_lower_session()?;
-        assert!(matches!(
-            worker.reset_stream(&mut sessions, foreign, SessionApplicationErrorCode::from(0)),
-            Err(RuntimeError::Subsystem { source, .. })
-                if matches!(source.downcast_ref::<QuicWorkerError>(), Some(QuicWorkerError::SessionNotQuic { .. }))
-        ));
-        Ok(())
-    }
-
-    #[test]
-    fn reset_stream_dispatch_reaches_transport_then_app_close_suppresses_repeats()
-    -> RuntimeResult<()> {
-        let (worker, mut sessions, _, _server, _, _, bidi, bidi_index, _) =
-            test_established_stream()?;
-        sessions.install_transport_actions(QuicWorker::ID, quic_transport_actions())?;
-        // Generic dispatch rejects a Session unknown to the Session Worker
-        // before any transport work (session.c:1675).
-        assert!(matches!(
-            sessions.reset_stream(
-                SessionId::from_raw(0xDEAD),
-                SessionApplicationErrorCode::from(0)
-            ),
-            Err(SessionTransportActionError::InvalidSession { .. })
-        ));
-        // A live stream dispatches through the AppClose guard to the QUIC
-        // action wrapper. The wrapper needs the process-global QUIC_MAIN
-        // worker channel, which unit tests do not own, so it fails typed
-        // without touching any worker state.
-        assert!(matches!(
-            &sessions.reset_stream(bidi, SessionApplicationErrorCode::from(7)),
-            Err(SessionTransportActionError::TransportActionFailed { action, .. })
-                if *action == "reset_stream"
-        ));
-        assert!(
-            sessions.session_app_closed(bidi),
-            "the dispatch guard records AppClosed before the transport is notified"
-        );
-        // Repeated dispatch is suppressed by Session state: Ok(()) with no
-        // transport work, even for a code the transport would reject.
-        assert!(matches!(
-            sessions.reset_stream(bidi, SessionApplicationErrorCode::from(1u64 << 62)),
-            Ok(())
-        ));
-        assert!(
-            worker
-                .contexts
-                .get(bidi_index)
-                .and_then(Context::stream_ref)
-                .is_some(),
-            "the suppressed dispatch leaves the stream context untouched"
-        );
-        Ok(())
-    }
-
-    #[test]
-    fn stop_sending_stops_exact_recv_stream_and_leaves_others_untouched() -> RuntimeResult<()> {
-        let (
-            mut worker,
-            mut sessions,
-            applications,
-            _server,
-            parent_context,
-            parent,
-            bidi,
-            bidi_index,
-            bidi_id,
-        ) = test_established_stream()?;
-        let sibling = worker.open_stream(
-            &applications,
-            &mut sessions,
-            parent,
-            SessionStreamDirection::Bidi,
-            0x55,
-        )?;
-        let (_, sibling_index) = sessions
-            .session_transport(sibling)
-            .ok_or(QuicWorkerError::SessionMissing { session: sibling })?;
-        let sibling_id = worker
-            .contexts
-            .get(sibling_index)
-            .and_then(Context::stream_ref)
-            .ok_or(QuicWorkerError::ContextMissing {
-                context: ContextId::from(sibling_index),
-            })?
-            .stream;
-        let queued = worker.connection_tx_pending.len();
-
-        worker.stop_sending(&mut sessions, bidi, SessionApplicationErrorCode::from(42))?;
-
-        assert_eq!(
-            worker.connection_tx_pending.len(),
-            queued + 1,
-            "the STOP_SENDING frame queues the parent connection for output"
-        );
-        assert_eq!(
-            worker.connection_tx_pending.last(),
-            Some(&parent_context),
-            "the queued output is the parent connection of the stopped stream"
-        );
-        assert!(
-            stream_already_stopped(&mut worker, parent_context, bidi_id),
-            "the exact receive stream pinned by the Session is stopped at the quinn level"
-        );
-        assert!(
-            !stream_already_reset(&mut worker, parent_context, bidi_id),
-            "the send side of the stopped stream is untouched"
-        );
-        assert!(
-            !stream_already_stopped(&mut worker, parent_context, sibling_id),
-            "the sibling receive stream is untouched"
-        );
-        assert!(
-            sessions.session_transport(bidi).is_some(),
-            "the stream Session survives the stop"
-        );
-        assert!(
-            worker
-                .contexts
-                .get(bidi_index)
-                .and_then(Context::stream_ref)
-                .is_some(),
-            "the stream context survives the stop"
-        );
-        let state = worker
-            .contexts
-            .get(parent_context.into())
-            .and_then(Context::connection)
-            .map(|connection| connection.state)
-            .ok_or(QuicWorkerError::ContextMissing {
-                context: parent_context,
-            })?;
-        assert_eq!(
-            state,
-            ConnectionState::Established,
-            "the parent connection is untouched by the stream stop"
-        );
-        Ok(())
-    }
-
-    #[test]
-    fn stop_sending_skips_completed_receive_before_any_frame() -> RuntimeResult<()> {
-        let mut relay = peer_relay_established()?;
-        let stream = relay
-            .client_connection
-            .streams()
-            .open(quinn_proto::Dir::Bi)
-            .expect("open peer bidirectional stream");
-        relay
-            .client_connection
-            .send_stream(stream)
-            .write(&[0x5A; 3])
-            .expect("peer writes stream data");
-        relay
-            .client_connection
-            .send_stream(stream)
-            .finish()
-            .expect("finish peer stream data");
-        // The auto-accepted child Session appears on the worker once the
-        // peer's STREAM frame is processed; the FIN and every byte then sit
-        // unread in the recv buffer (transfer complete, still `Recv` state).
-        let child = loop {
-            let child = relay
-                .worker
-                .contexts
-                .get(relay.context.into())
-                .and_then(Context::connection)
-                .and_then(|connection| connection.engine.as_ref())
-                .and_then(|engine| engine.io_table.stream_session(stream));
-            if let Some(child) = child {
-                break child;
-            }
-            peer_relay_exchange(&mut relay)?;
-        };
-        assert!(
-            worker_connection_mut(&mut relay.worker.contexts, relay.context)?
-                .recv_stream(stream)
-                .receive_transfer_complete(),
-            "the peer FIN and every byte are fully received"
-        );
-        let queued = relay.worker.connection_tx_pending.len();
-        relay.worker.stop_sending(
-            &mut relay.sessions,
-            child,
-            SessionApplicationErrorCode::from(42),
-        )?;
-        assert_eq!(
-            relay.worker.connection_tx_pending.len(),
-            queued,
-            "a completed receive side queues no STOP_SENDING output"
-        );
-        assert!(
-            worker_connection_mut(&mut relay.worker.contexts, relay.context)?
-                .recv_stream(stream)
-                .received_reset()
-                .is_ok(),
-            "the completed receive stream is not stopped"
-        );
-        Ok(())
-    }
-
-    #[test]
-    fn stop_sending_rejects_out_of_range_code_before_any_side_effect() -> RuntimeResult<()> {
-        let (
-            mut worker,
-            mut sessions,
-            applications,
-            _server,
-            parent_context,
-            parent,
-            bidi,
-            _,
-            bidi_id,
-        ) = test_established_stream()?;
-        let queued = worker.connection_tx_pending.len();
-        let error = worker
-            .stop_sending(
-                &mut sessions,
-                bidi,
-                SessionApplicationErrorCode::from(1u64 << 62),
-            )
-            .expect_err("code beyond the varint range is rejected");
-        assert!(
-            matches!(
-                &error,
-                RuntimeError::Subsystem { source, .. }
-                    if matches!(
-                        source.downcast_ref::<QuicWorkerError>(),
-                        Some(QuicWorkerError::ApplicationErrorCodeInvalid { session, .. })
-                            if session == &bidi
-                    )
-            ),
-            "typed ApplicationErrorCodeInvalid expected, got {error:?}"
-        );
-        assert_eq!(
-            worker.connection_tx_pending.len(),
-            queued,
-            "the rejected code performed no transport side effect"
-        );
-        assert!(
-            !stream_already_stopped(&mut worker, parent_context, bidi_id),
-            "the receive stream is untouched by the rejected code"
-        );
-        // The probe above stopped the pinned stream, so a valid code is
-        // proven on a fresh sibling stream.
-        let after = worker.open_stream(
-            &applications,
-            &mut sessions,
-            parent,
-            SessionStreamDirection::Bidi,
-            0xB1D2,
-        )?;
-        worker.stop_sending(&mut sessions, after, SessionApplicationErrorCode::from(0))?;
-        Ok(())
-    }
-
-    #[test]
-    fn stop_sending_rejects_engine_closed_stream_before_side_effects() -> RuntimeResult<()> {
-        let (mut worker, mut sessions, _, _server, parent_context, _, bidi, bidi_index, bidi_id) =
-            test_established_stream()?;
-        worker
-            .contexts
-            .get_mut(bidi_index)
-            .and_then(Context::stream_mut)
-            .expect("stream context")
-            .flags |= STREAM_ENGINE_CLOSED;
-        let queued = worker.connection_tx_pending.len();
-        let error = worker
-            .stop_sending(&mut sessions, bidi, SessionApplicationErrorCode::from(0))
-            .expect_err("an engine-closed stream is stale");
-        assert!(
-            matches!(
-                &error,
-                RuntimeError::Subsystem { source, .. }
-                    if matches!(
-                        source.downcast_ref::<QuicWorkerError>(),
-                        Some(QuicWorkerError::StreamMissing { stream }) if stream == &bidi_id
-                    )
-            ),
-            "typed StreamMissing expected, got {error:?}"
-        );
-        assert_eq!(
-            worker.connection_tx_pending.len(),
-            queued,
-            "the stale rejection performed no transport side effect"
-        );
-        assert!(
-            !stream_already_stopped(&mut worker, parent_context, bidi_id),
-            "the stale rejection performed no transport side effect"
-        );
-        Ok(())
-    }
-
-    #[test]
-    fn stop_sending_rejects_uni_send_only_stream_before_side_effects() -> RuntimeResult<()> {
-        let (mut worker, mut sessions, applications, _server, parent_context, parent, _, _, _) =
-            test_established_stream()?;
-        let uni = worker.open_stream(
-            &applications,
-            &mut sessions,
-            parent,
-            SessionStreamDirection::Uni,
-            0x11,
-        )?;
-        let (_, uni_index) = sessions
-            .session_transport(uni)
-            .ok_or(QuicWorkerError::SessionMissing { session: uni })?;
-        let uni_id = worker
-            .contexts
-            .get(uni_index)
-            .and_then(Context::stream_ref)
-            .ok_or(QuicWorkerError::ContextMissing {
-                context: ContextId::from(uni_index),
-            })?
-            .stream;
-        let queued = worker.connection_tx_pending.len();
-        let error = worker
-            .stop_sending(&mut sessions, uni, SessionApplicationErrorCode::from(0))
-            .expect_err("a client-initiated uni stream has no receive side");
-        assert!(
-            matches!(
-                &error,
-                RuntimeError::Subsystem { source, .. }
-                    if matches!(
-                        source.downcast_ref::<QuicWorkerError>(),
-                        Some(QuicWorkerError::StreamReceiveSideMissing { stream })
-                            if stream == &uni_id
-                    )
-            ),
-            "typed StreamReceiveSideMissing expected, got {error:?}"
-        );
-        assert_eq!(
-            worker.connection_tx_pending.len(),
-            queued,
-            "the rejected stream performed no transport side effect"
-        );
-        assert!(
-            worker
-                .contexts
-                .get(parent_context.into())
-                .and_then(Context::connection)
-                .is_some(),
-            "the connection context is untouched"
-        );
-        Ok(())
-    }
-
-    #[test]
-    fn stop_sending_rejects_connection_session_without_side_effects() -> RuntimeResult<()> {
-        let (mut worker, mut sessions, _, session, context, _) = test_quic_session()?;
-        let error = worker
-            .stop_sending(&mut sessions, session, SessionApplicationErrorCode::from(0))
-            .expect_err("a connection Session is not a stream");
-        assert!(
-            matches!(
-                &error,
-                RuntimeError::Subsystem { source, .. }
-                    if matches!(
-                        source.downcast_ref::<QuicWorkerError>(),
-                        Some(QuicWorkerError::SessionNotStream { session: rejected })
-                            if rejected == &session
-                    )
-            ),
-            "typed SessionNotStream expected, got {error:?}"
-        );
-        assert!(
-            worker
-                .contexts
-                .get(context.into())
-                .and_then(Context::connection)
-                .is_some(),
-            "the connection context is untouched"
-        );
-        Ok(())
-    }
-
-    #[test]
-    fn stop_sending_rejects_missing_session() -> RuntimeResult<()> {
-        let (mut worker, mut sessions, _, _, _, _) = test_quic_session()?;
-        let missing = SessionId::from_raw(0xDEAD);
-        assert!(matches!(
-            worker.stop_sending(&mut sessions, missing, SessionApplicationErrorCode::from(0)),
-            Err(RuntimeError::Subsystem { source, .. })
-                if matches!(source.downcast_ref::<QuicWorkerError>(), Some(QuicWorkerError::SessionMissing { .. }))
-        ));
-        Ok(())
-    }
-
-    #[test]
-    fn stop_sending_rejects_foreign_transport_session() -> RuntimeResult<()> {
-        let mut worker = QuicWorker::new(DataWorkerId::new(0));
-        let (mut sessions, foreign) = test_lower_session()?;
-        assert!(matches!(
-            worker.stop_sending(&mut sessions, foreign, SessionApplicationErrorCode::from(0)),
-            Err(RuntimeError::Subsystem { source, .. })
-                if matches!(source.downcast_ref::<QuicWorkerError>(), Some(QuicWorkerError::SessionNotQuic { .. }))
-        ));
-        Ok(())
-    }
-
-    #[test]
-    fn stop_sending_repeated_active_call_follows_quinn_semantics() -> RuntimeResult<()> {
-        let (mut worker, mut sessions, _, _server, parent_context, _, bidi, _, bidi_id) =
-            test_established_stream()?;
-        worker.stop_sending(&mut sessions, bidi, SessionApplicationErrorCode::from(9))?;
-        let queued = worker.connection_tx_pending.len();
-        let error = worker
-            .stop_sending(&mut sessions, bidi, SessionApplicationErrorCode::from(9))
-            .expect_err("a second stop on the same receive stream is ClosedStream");
-        assert!(
-            matches!(
-                &error,
-                RuntimeError::Subsystem { source, .. }
-                    if matches!(
-                        source.downcast_ref::<QuicWorkerError>(),
-                        Some(QuicWorkerError::StreamStop { stream, .. })
-                            if stream == &bidi_id
-                    )
-            ),
-            "typed StreamStop expected, got {error:?}"
-        );
-        assert_eq!(
-            worker.connection_tx_pending.len(),
-            queued,
-            "the repeated stop queues no additional output"
-        );
-        assert!(
-            stream_already_stopped(&mut worker, parent_context, bidi_id),
-            "the receive stream remains stopped"
-        );
-        assert!(
-            sessions.session_transport(bidi).is_some(),
-            "the stream Session stays active after the repeated stop"
-        );
-        Ok(())
-    }
-
-    #[test]
-    fn stop_sending_dispatch_reaches_transport_without_app_close() -> RuntimeResult<()> {
-        let (worker, mut sessions, _, _server, _, _, bidi, bidi_index, _) =
-            test_established_stream()?;
-        sessions.install_transport_actions(QuicWorker::ID, quic_transport_actions())?;
-        // Generic dispatch rejects a Session unknown to the Session Worker
-        // before any transport work (session.c:1675).
-        assert!(matches!(
-            sessions.stop_sending(
-                SessionId::from_raw(0xDEAD),
-                SessionApplicationErrorCode::from(0)
-            ),
-            Err(SessionTransportActionError::InvalidSession { .. })
-        ));
-        // A live stream dispatches through the Active-only guard to the QUIC
-        // action wrapper, which needs the process-global QUIC_MAIN worker
-        // channel that unit tests do not own, so it fails typed without
-        // touching any worker state.
-        assert!(matches!(
-            &sessions.stop_sending(bidi, SessionApplicationErrorCode::from(7)),
-            Err(SessionTransportActionError::TransportActionFailed { action, .. })
-                if *action == "stop_sending"
-        ));
-        assert!(
-            !sessions.session_app_closed(bidi),
-            "stop_sending is half-close: it never records AppClosed"
-        );
-        // Unlike reset, half-close leaves the Session Active, so repeated
-        // dispatch keeps reaching the transport instead of being suppressed
-        // by the AppClosed guard.
-        assert!(matches!(
-            &sessions.stop_sending(bidi, SessionApplicationErrorCode::from(7)),
-            Err(SessionTransportActionError::TransportActionFailed { action, .. })
-                if *action == "stop_sending"
-        ));
-        assert!(
-            !sessions.session_app_closed(bidi),
-            "repeated stop_sending still records no AppClosed"
-        );
-        assert!(
-            worker
-                .contexts
-                .get(bidi_index)
-                .and_then(Context::stream_ref)
-                .is_some(),
-            "the dispatch failure leaves the stream context untouched"
-        );
-        Ok(())
-    }
-
-    #[test]
-    fn close_connection_rejects_stream_session_before_any_side_effect() -> RuntimeResult<()> {
-        let (mut worker, mut sessions, _, _server, parent_context, _, bidi, _, _) =
-            test_established_stream()?;
-        let queued = worker.connection_tx_pending.len();
-
-        let error = worker
-            .close_connection_action(
-                &mut sessions,
-                bidi,
-                SessionApplicationErrorCode::from(0),
-                b"",
-            )
-            .expect_err("a stream Session is not a connection Session");
-
-        assert!(
-            matches!(
-                &error,
-                RuntimeError::Subsystem { source, .. }
-                    if matches!(
-                        source.downcast_ref::<QuicWorkerError>(),
-                        Some(QuicWorkerError::SessionNotConnection { session })
-                            if session == &bidi
-                    )
-            ),
-            "typed SessionNotConnection expected, got {error:?}"
-        );
-        assert_eq!(
-            worker.connection_tx_pending.len(),
-            queued,
-            "no output is queued for the rejected close"
-        );
-        assert!(
-            !connection_is_closed(&worker, parent_context),
-            "the parent connection is untouched"
-        );
-        assert_eq!(
-            worker
-                .contexts
-                .get(parent_context.into())
-                .and_then(Context::connection)
-                .map(|connection| connection.state),
-            Some(ConnectionState::Established)
-        );
-        Ok(())
-    }
-
-    #[test]
-    fn close_connection_rejects_out_of_range_code_before_any_side_effect() -> RuntimeResult<()> {
-        let mut relay = peer_relay_established()?;
-        peer_relay_exchange(&mut relay)?;
-        relay
-            .worker
-            .schedule_connection_outputs(&mut relay.sessions, relay.now)?;
-        let queued = relay.worker.connection_tx_pending.len();
-
-        let error = relay
-            .worker
-            .close_connection_action(
-                &mut relay.sessions,
-                relay.connection_session,
-                SessionApplicationErrorCode::from(u64::MAX),
-                b"overflow",
-            )
-            .expect_err("2^64-1 is outside the varint range");
-
-        assert!(
-            matches!(
-                &error,
-                RuntimeError::Subsystem { source, .. }
-                    if matches!(
-                        source.downcast_ref::<QuicWorkerError>(),
-                        Some(QuicWorkerError::ApplicationErrorCodeInvalid { .. })
-                    )
-            ),
-            "typed ApplicationErrorCodeInvalid expected, got {error:?}"
-        );
-        assert_eq!(
-            relay.worker.connection_tx_pending.len(),
-            queued,
-            "no output is queued for the rejected close"
-        );
-        assert!(
-            !connection_is_closed(&relay.worker, relay.context),
-            "the connection is not closed before the code is validated"
-        );
-        assert_eq!(
-            relay
-                .worker
-                .contexts
-                .get(relay.context.into())
-                .and_then(Context::connection)
-                .map(|connection| connection.state),
-            Some(ConnectionState::Established)
-        );
-        Ok(())
-    }
-
-    #[test]
-    fn close_connection_closes_established_connection_and_transmits_to_peer() -> RuntimeResult<()> {
-        let mut relay = peer_relay_established()?;
-        peer_relay_exchange(&mut relay)?;
-        relay
-            .worker
-            .schedule_connection_outputs(&mut relay.sessions, relay.now)?;
-        let queued = relay.worker.connection_tx_pending.len();
-
-        relay
-            .worker
-            .close_connection_action(
-                &mut relay.sessions,
-                relay.connection_session,
-                SessionApplicationErrorCode::from(42),
-                b"shutting down",
-            )
-            .expect("close an established connection");
-
-        assert_eq!(
-            relay
-                .worker
-                .contexts
-                .get(relay.context.into())
-                .and_then(Context::connection)
-                .map(|connection| connection.state),
-            Some(ConnectionState::ActiveClosing),
-            "VPP OPENED/HANDSHAKE/READY -> ACTIVE_CLOSING (quic_quicly.c:1150-1162)"
-        );
-        assert_eq!(
-            relay.worker.connection_tx_pending.len(),
-            queued + 1,
-            "the close queues the connection for output"
-        );
-        assert_eq!(
-            relay.worker.connection_tx_pending.last(),
-            Some(&relay.context),
-            "the queued output is the closed connection"
-        );
-        assert!(
-            connection_is_closed(&relay.worker, relay.context),
-            "the worker-local quinn connection is closed with the app code and reason"
-        );
-
-        // Drive the queued CONNECTION_CLOSE datagram and hand it to the peer.
-        relay
-            .worker
-            .schedule_connection_outputs(&mut relay.sessions, relay.now)?;
-        let (_, lower_tx) = relay.sessions.fifo_pair(relay.lower).ok_or_else(|| {
-            QuicWorkerError::SessionMissing {
-                session: relay.lower,
-            }
-        })?;
-        let mut responses = Vec::new();
-        loop {
-            if lower_tx.max_dequeue() < SessionDgramHeader::SIZE {
-                break;
-            }
-            let mut header_bytes = [0u8; SessionDgramHeader::SIZE];
-            assert_eq!(
-                lower_tx.peek(0, header_bytes.len(), &mut header_bytes),
-                header_bytes.len()
-            );
-            let Some(header) = SessionDgramHeader::from_bytes(&header_bytes) else {
-                break;
-            };
-            let payload_len = header.data_length() as usize;
-            let record_len =
-                header
-                    .total_len()
-                    .ok_or_else(|| QuicWorkerError::InvalidDatagram {
-                        session: relay.lower,
-                        length: header.data_length(),
-                    })?;
-            if lower_tx.max_dequeue() < record_len {
-                break;
-            }
-            let mut payload = vec![0; payload_len];
-            assert_eq!(
-                lower_tx.peek(SessionDgramHeader::SIZE, payload_len, &mut payload),
-                payload_len
-            );
-            assert_eq!(lower_tx.dequeue_drop(record_len), record_len);
-            responses.push(payload);
-        }
-        for mut data in responses {
-            let mut descriptors = Vec::new();
-            let mut endpoint_buf = BytesMut::with_capacity(MAX_PACKET_SIZE);
-            if let Some(event) = relay.client_endpoint.handle_scratch_with_descriptors(
-                relay.now,
-                relay.server_addr,
-                None,
-                None,
-                &mut data,
-                &mut descriptors,
-                &mut endpoint_buf,
-            ) {
-                match event {
-                    DatagramEvent::ConnectionEvent(handle, event)
-                        if handle == relay.client_handle =>
-                    {
-                        relay.client_connection.handle_event(event);
-                    }
-                    DatagramEvent::Response(transmit) => {
-                        relay
-                            .to_server
-                            .push_back(endpoint_buf.split_to(transmit.size));
-                        endpoint_buf.reserve(MAX_PACKET_SIZE);
-                    }
-                    DatagramEvent::NewConnection(_) | DatagramEvent::ConnectionEvent(_, _) => {}
-                }
-            }
-        }
-        assert!(
-            relay.client_connection.is_closed(),
-            "the peer observes the transmitted CONNECTION_CLOSE"
-        );
-        Ok(())
-    }
-
-    #[test]
-    fn close_connection_during_handshake_starts_active_closing() -> RuntimeResult<()> {
-        let mut relay = peer_relay_established()?;
-        relay
-            .worker
-            .contexts
-            .get_mut(relay.context.into())
-            .and_then(Context::connection_mut)
-            .ok_or_else(|| QuicWorkerError::ContextMissing {
-                context: relay.context,
-            })?
-            .state = ConnectionState::Handshaking;
-        let queued = relay.worker.connection_tx_pending.len();
-
-        relay
-            .worker
-            .close_connection_action(
-                &mut relay.sessions,
-                relay.connection_session,
-                SessionApplicationErrorCode::from(1),
-                b"abort",
-            )
-            .expect("closing a handshaking connection is allowed");
-
-        assert_eq!(
-            relay
-                .worker
-                .contexts
-                .get(relay.context.into())
-                .and_then(Context::connection)
-                .map(|connection| connection.state),
-            Some(ConnectionState::ActiveClosing),
-            "VPP HANDSHAKE -> ACTIVE_CLOSING (quic_quicly.c:1150-1162)"
-        );
-        assert_eq!(
-            relay.worker.connection_tx_pending.len(),
-            queued + 1,
-            "the close queues the connection for output"
-        );
-        assert!(connection_is_closed(&relay.worker, relay.context));
-        Ok(())
-    }
-
-    #[test]
-    fn close_connection_repeats_are_idempotent_after_active_closing() -> RuntimeResult<()> {
-        let mut relay = peer_relay_established()?;
-        relay
-            .worker
-            .close_connection_action(
-                &mut relay.sessions,
-                relay.connection_session,
-                SessionApplicationErrorCode::from(42),
-                b"shutting down",
-            )
-            .expect("first close");
-        let queued = relay.worker.connection_tx_pending.len();
-
-        relay
-            .worker
-            .close_connection_action(
-                &mut relay.sessions,
-                relay.connection_session,
-                SessionApplicationErrorCode::from(7),
-                b"again",
-            )
-            .expect("repeated close on an ActiveClosing connection is a no-op");
-
-        assert_eq!(
-            relay
-                .worker
-                .contexts
-                .get(relay.context.into())
-                .and_then(Context::connection)
-                .map(|connection| connection.state),
-            Some(ConnectionState::ActiveClosing),
-            "VPP ACTIVE_CLOSING is left alone (quic_quicly.c:1171-1172)"
-        );
-        assert_eq!(
-            relay.worker.connection_tx_pending.len(),
-            queued,
-            "the repeated close queues no additional output"
-        );
-        assert!(connection_is_closed(&relay.worker, relay.context));
-        Ok(())
-    }
-
-    #[test]
-    fn close_connection_passive_closing_marks_app_closed() -> RuntimeResult<()> {
-        let (mut sessions, lower) = test_lower_session()?;
-        let mut worker = QuicWorker::new(DataWorkerId::new(0));
-        let context = worker
-            .contexts
-            .insert(Context::connection_with_listener(
-                lower,
-                None,
-                ApplicationId::new(1),
-                None,
-                None,
-                None,
-            ))
-            .map(ContextId::from)
-            .ok_or(QuicWorkerError::ContextCapacityExhausted {
-                capacity: worker.contexts.capacity(),
-            })?;
-        let connection_session = sessions.insert_session_for_test(QuicWorker::ID, context.into());
-        worker
-            .contexts
-            .get_mut(context.into())
-            .and_then(Context::connection_mut)
-            .ok_or(QuicWorkerError::ContextMissing { context })?
-            .connection_session = Some(connection_session);
-        worker
-            .contexts
-            .get_mut(context.into())
-            .and_then(Context::connection_mut)
-            .ok_or(QuicWorkerError::ContextMissing { context })?
-            .state = ConnectionState::PassiveClosing;
-
-        worker.close_connection_action(
-            &mut sessions,
-            connection_session,
-            SessionApplicationErrorCode::from(0),
-            b"",
-        )?;
-
-        assert_eq!(
-            worker
-                .contexts
-                .get(context.into())
-                .and_then(Context::connection)
-                .map(|connection| connection.state),
-            Some(ConnectionState::PassiveClosingAppClosed),
-            "VPP PASSIVE_CLOSING -> PASSIVE_CLOSING_APP_CLOSED (quic_quicly.c:1163-1167)"
-        );
-        Ok(())
-    }
-
-    #[test]
-    fn close_connection_dispatch_records_app_closed_and_suppresses_repeat() -> RuntimeResult<()> {
-        let (worker, mut sessions, _, _server, _, _, bidi, bidi_index, _) =
-            test_established_stream()?;
-        sessions.install_transport_actions(QuicWorker::ID, quic_transport_actions())?;
-        // The first dispatch passes the pre-close guard (AppClosed recorded)
-        // and reaches the QUIC action wrapper, which needs the process-global
-        // QUIC_MAIN worker channel that unit tests do not own, so it fails
-        // typed without touching any worker state (mirrors the stop_sending
-        // dispatch test).
-        assert!(matches!(
-            &sessions.close_connection(bidi, SessionApplicationErrorCode::from(3), b"shutting down"),
-            Err(SessionTransportActionError::TransportActionFailed { action, .. })
-                if *action == "close_connection"
-        ));
-        assert!(
-            sessions.session_app_closed(bidi),
-            "close_connection records AppClosed before dispatch (session.c:1657-1682)"
-        );
-        // A repeated dispatch is suppressed by the AppClosed guard with Ok,
-        // matching VPP pre-close-only dispatch.
-        assert!(
-            sessions
-                .close_connection(bidi, SessionApplicationErrorCode::from(3), b"shutting down")
-                .is_ok()
-        );
-        assert!(sessions.session_app_closed(bidi));
-        assert!(
-            worker
-                .contexts
-                .get(bidi_index)
-                .and_then(Context::stream_ref)
-                .is_some(),
-            "the dispatch leaves the worker context untouched"
-        );
-        Ok(())
-    }
 }

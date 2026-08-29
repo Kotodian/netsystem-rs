@@ -13,9 +13,3 @@ hammer-ipc = { path = "../hammer-ipc" }
 hammer-infra = { path = "../hammer-infra" }
 clap = { workspace = true, features = ["derive"] }
 hex = "0.4"
-
-[dev-dependencies]
-hammer-runtime = { path = "../hammer-runtime" }
-hammer-service = { path = "../hammer-service" }
-prost = { workspace = true }
-tokio = { workspace = true }

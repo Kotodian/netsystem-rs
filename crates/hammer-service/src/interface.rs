@@ -408,10 +408,6 @@ impl InterfaceControlPlane {
 /// supply their own configuration sections; service owns the generic state.
 pub static INTERFACE_MAIN: ArcSwapOption<InterfaceControlPlane> = ArcSwapOption::const_empty();
 
-pub fn reset_interface_main_for_test() {
-    INTERFACE_MAIN.store(None);
-}
-
 struct InterfaceStateSlot {
     state: UnsafeCell<InterfaceState>,
 }

@@ -13,7 +13,7 @@
 //! one O(1) context — a `ConnectionContext` for a root
 //! (`http_ts_accept_connection`, http.c:586-673) or a `StreamContext` bound
 //! to its parent connection for a stream child (`http_ts_accept_stream`,
-//! http.c:675-721) — then publishes its `ContextId`/`StreamContextId`
+//! http.c:675-721) — then publishes its `u32`/`u32`
 //! through `SessionWorker::set_app_session`. A root connection additionally
 //! bootstraps its local uni control stream exactly once
 //! (`HttpWorker::bootstrap_control_stream`, mirroring `http3_conn_init`,
@@ -39,13 +39,13 @@
 //! forwarding DATA to the app FIFO, http3.c:1184-1263), while every other
 //! callback still waits on lifecycle state its owning slice has not landed.
 
-use hammer_runtime::app::{SessionAppContext, SessionAppRegistration, SessionFlags};
-use hammer_runtime::session::{SessionApplicationErrorCode, SessionStreamDirection};
-use hammer_runtime::{DataWorkerId, Engine, RuntimeError, RuntimeResult};
+use hammer_runtime::app::SessionFlags;
+use hammer_runtime::session::SessionStreamDirection;
+use hammer_runtime::{DataWorkerId, RuntimeError, RuntimeResult};
+use hammer_service::session::SessionEndpointRole;
 use hammer_service::session::error::SessionError;
-use hammer_service::session::protocol::SessionAppCallbacks;
+use hammer_service::session::protocol::SessionAppVft;
 use hammer_service::session::runtime::{SessionAcceptMetadata, SessionWorker};
-use hammer_service::session::{SessionEndpointRole, SessionId};
 
 use crate::http_common::PublishError;
 use crate::http3::proto::error::ErrorCode;
@@ -53,8 +53,7 @@ use crate::http3::request::{RequestPublishError, publish_request_field_section};
 use crate::http3::request_frame_reader::{RequestFrameError, RequestFrameRead};
 use crate::listener::{HTTP_MAIN, HttpMain};
 use crate::worker::{
-    ContextId, HttpWorkerError, PeerControlError, PeerUniStreamRole, PendingFieldSection,
-    RequestReadError, StreamContextId,
+    HttpWorkerError, PeerControlError, PeerUniStreamRole, PendingFieldSection, RequestReadError,
 };
 
 pub(crate) const NAME: &str = "http";
@@ -64,7 +63,7 @@ pub(crate) const NAME: &str = "http";
 /// failed control-stream open (http3.c:228).
 const H3_INTERNAL_ERROR: u64 = 0x0102;
 
-/// Static callback table passed to `SessionMain::install_session_app`,
+/// Owner-defined callback table published through the Application authority,
 /// mirroring VPP's static `http_app_cb_vft` (http.c:1004-1017).
 ///
 /// `accept` is wired: it needs nothing beyond the per-worker context pools
@@ -101,19 +100,21 @@ const H3_INTERNAL_ERROR: u64 = 0x0102;
 /// `half_open_cleanup`, `builtin_tx`. `add_segment` /
 /// `del_segment` stay `None` too: VPP's builtin entries are no-ops that are
 /// never invoked without shared-memory segments (http.c:997-1003), so the
-/// `SessionApp` trait's `Ok(())` default is behaviorally identical.
-pub(crate) static CALLBACKS: SessionAppCallbacks = SessionAppCallbacks {
+/// The VPP builtin entry leaves these callbacks unset because no shared-memory
+/// segment is involved.
+pub(crate) const VFT: SessionAppVft = SessionAppVft {
+    name: NAME,
     accept: Some(accept),
     disconnect: Some(disconnect),
     reset: Some(reset),
     cleanup: Some(cleanup),
     builtin_rx: Some(builtin_rx),
-    ..SessionAppCallbacks::all_none()
+    ..SessionAppVft::all_none(NAME)
 };
 
 /// Typed errors of the builtin HTTP Session App accept path that the Session
 /// Worker and `HttpWorker` errors cannot express: a stream child whose accept
-/// metadata carries no parent connection context, so no `ContextId` exists to
+/// metadata carries no parent connection context, so no `u32` exists to
 /// name in `HttpWorkerError::ParentContextMissing`.
 #[hammer_component_macros::runtime_error(subsystem = "http")]
 #[derive(Debug, PartialEq, Eq, thiserror::Error)]
@@ -121,7 +122,9 @@ pub(crate) enum HttpAppError {
     #[error(
         "http stream accept requires a live parent connection context, session {session:?} has none"
     )]
-    StreamParentMissing { session: SessionId },
+    StreamParentMissing { session: u32 },
+    #[error("HTTP Session App context {context:?} does not fit a Pool index")]
+    ContextOutOfRange { context: u64 },
     #[error(
         "peer control stream finish reported a SETTINGS protocol error, which is structurally impossible; HTTP/3 code {code:?}"
     )]
@@ -137,7 +140,7 @@ pub(crate) enum HttpAppError {
     #[error(
         "retained request field section missing from its worker slot; request stream {stream:?}"
     )]
-    PendingFieldSectionLost { stream: StreamContextId },
+    PendingFieldSectionLost { stream: u32 },
 }
 
 impl From<RequestPublishError> for HttpAppError {
@@ -213,21 +216,17 @@ pub(crate) fn request_publish_error_action(error: RequestPublishError) -> Reques
 /// aborts the app-visible request.
 fn execute_request_error_action(
     main: &HttpMain,
-    worker: &mut SessionWorker<u32>,
-    stream: StreamContextId,
-    session: SessionId,
+    worker: &mut SessionWorker,
+    stream: u32,
+    session: u32,
     action: RequestErrorAction,
 ) -> RuntimeResult<()> {
     match action {
         RequestErrorAction::CloseConnection { code } => worker
-            .close_connection(
-                session,
-                SessionApplicationErrorCode::from(code.value()),
-                &[],
-            )
+            .close_connection(session, u64::from(code.value()), &[])
             .map_err(RuntimeError::from),
         RequestErrorAction::ResetStream { code } => worker
-            .reset_stream(session, SessionApplicationErrorCode::from(code.value()))
+            .reset_stream(session, u64::from(code.value()))
             .map_err(RuntimeError::from),
         RequestErrorAction::ResetStreamAbortRequest { code } => {
             // VPP `http3_stream_terminate` (http3.c:140-149) notifies the
@@ -255,7 +254,7 @@ fn execute_request_error_action(
                     .map_err(RuntimeError::from)
             })?;
             worker
-                .reset_stream(session, SessionApplicationErrorCode::from(code.value()))
+                .reset_stream(session, u64::from(code.value()))
                 .map_err(RuntimeError::from)
         }
         RequestErrorAction::Retry => Ok(()),
@@ -280,11 +279,7 @@ fn execute_request_error_action(
 /// is the Session worker's opaque `set_app_session`, with the allocated
 /// context removed directly when publication fails so the primary typed
 /// error is preserved (QUIC publish rollback, quic session_app.rs:37-49).
-pub(crate) fn accept(
-    worker: &mut SessionWorker<u32>,
-    session: SessionId,
-    context: SessionAppContext,
-) -> RuntimeResult<()> {
+pub(crate) fn accept(worker: &mut SessionWorker, session: u32, context: u64) -> RuntimeResult<()> {
     let main = HTTP_MAIN
         .get()
         .ok_or(RuntimeError::PluginStateNotInitialized { plugin: NAME })?;
@@ -296,9 +291,9 @@ pub(crate) fn accept(
 /// tests bypass it (listener.rs:1071).
 pub(crate) fn accept_on(
     main: &HttpMain,
-    worker: &mut SessionWorker<u32>,
-    session: SessionId,
-    context: SessionAppContext,
+    worker: &mut SessionWorker,
+    session: u32,
+    context: u64,
 ) -> RuntimeResult<()> {
     if context != 0 {
         // A previous accept already published this Session's context; the
@@ -334,8 +329,8 @@ pub(crate) fn accept_on(
 /// `allocate_with_role`); the missing-metadata fallback passes `None`.
 fn accept_connection(
     main: &HttpMain,
-    worker: &mut SessionWorker<u32>,
-    session: SessionId,
+    worker: &mut SessionWorker,
+    session: u32,
     role: Option<SessionEndpointRole>,
 ) -> RuntimeResult<()> {
     let context = main.with_worker(worker.worker(), |http| {
@@ -353,7 +348,7 @@ fn accept_connection(
     }
     if let Err(error) = main.with_worker(worker.worker(), |http| {
         // The local uni control stream is opened exactly once per accepted
-        // connection, with the published `ContextId` as its app context,
+        // connection, with the published `u32` as its app context,
         // mirroring `http3_conn_init`'s first stream (http3.c:223-234).
         http.bootstrap_control_stream(context, worker, u64::from(context))
             .map_err(RuntimeError::from)
@@ -369,11 +364,7 @@ fn accept_connection(
         let _ = main.with_worker(worker.worker(), |http| {
             http.remove(context).map_err(RuntimeError::from)
         });
-        let _ = worker.close_connection(
-            session,
-            SessionApplicationErrorCode::from(H3_INTERNAL_ERROR),
-            &[],
-        );
+        let _ = worker.close_connection(session, H3_INTERNAL_ERROR, &[]);
         return Err(error);
     }
     Ok(())
@@ -381,10 +372,10 @@ fn accept_connection(
 
 /// `accept` dispatch for one stream child, mirroring VPP
 /// `http_ts_accept_stream` (http.c:675-721): the parent connection context is
-/// required and converted to a generation-checked `ContextId`, then one
+/// required and converted to a generation-checked `u32`, then one
 /// `StreamContext` is allocated in the worker's stream pool bound to the
 /// child Session with the direction derived from `SESSION_F_UNIDIRECTIONAL`
-/// (http.c:688-690), and finally the `StreamContextId` is published through
+/// (http.c:688-690), and finally the `u32` is published through
 /// `set_app_session`. Parent liveness lives in `HttpWorker::allocate_stream`
 /// (worker.rs), which rejects stale or foreign parent identities with
 /// `ParentContextMissing`; on publication failure the allocated stream
@@ -392,15 +383,15 @@ fn accept_connection(
 /// as the connection path does.
 fn accept_stream(
     main: &HttpMain,
-    worker: &mut SessionWorker<u32>,
-    session: SessionId,
+    worker: &mut SessionWorker,
+    session: u32,
     metadata: SessionAcceptMetadata,
 ) -> RuntimeResult<()> {
-    let parent = ContextId::from(
-        metadata
-            .parent_app_context
-            .ok_or(HttpAppError::StreamParentMissing { session })?,
-    );
+    let parent = metadata
+        .parent_app_context
+        .ok_or(HttpAppError::StreamParentMissing { session })?;
+    let parent =
+        u32::try_from(parent).map_err(|_| HttpAppError::ContextOutOfRange { context: parent })?;
     let direction = if metadata.flags.contains(SessionFlags::UNIDIRECTIONAL) {
         SessionStreamDirection::Uni
     } else {
@@ -425,8 +416,8 @@ fn accept_stream(
 /// Session App `disconnect` for a peer HTTP/3 unidirectional stream FIN.
 ///
 /// The lower QUIC transport dispatches a received FIN synchronously as this
-/// callback with the Session's published `SessionAppContext` naming the
-/// generation-checked `StreamContextId`; a RESET is dispatched separately
+/// callback with the Session's published app-state identity naming the
+/// generation-checked `u32`; a RESET is dispatched separately
 /// through the `reset` callback. The owning `HttpWorker`
 /// is resolved by the Session worker id (`HttpMain::with_worker`,
 /// listener.rs) and the stream context is generation/session-checked with
@@ -452,17 +443,16 @@ fn accept_stream(
 /// (http3.c:2312-2319) — but still releases the live context. The
 /// root connection's own Disconnected callback is a clean no-op: only a
 /// stream child carries `SessionFlags::STREAM` in its accept metadata, and
-/// the root's published `ConnectionContextId` shares the packed
-/// slot|generation layout with a `StreamContextId` in an unrelated pool, so
-/// it is never interpreted as a stream. No FIFO is drained — the peer's
+/// the connection and stream pools have separate direct `u32` index spaces.
+/// The root index is therefore never interpreted as a stream index. No FIFO is drained — the peer's
 /// final bytes stay readable — and the whole path is O(1) with no scan,
 /// allocation, lock, channel, or async work. Errors propagate typed through
 /// the existing `RuntimeError` conversion; there is no connection-close
 /// action here.
 pub(crate) fn disconnect(
-    worker: &mut SessionWorker<u32>,
-    session: SessionId,
-    context: SessionAppContext,
+    worker: &mut SessionWorker,
+    session: u32,
+    context: u64,
 ) -> RuntimeResult<()> {
     let main = HTTP_MAIN
         .get()
@@ -475,9 +465,9 @@ pub(crate) fn disconnect(
 /// `accept_on` bypasses it (listener.rs:1071).
 pub(crate) fn disconnect_on(
     main: &HttpMain,
-    worker: &mut SessionWorker<u32>,
-    session: SessionId,
-    context: SessionAppContext,
+    worker: &mut SessionWorker,
+    session: u32,
+    context: u64,
 ) -> RuntimeResult<()> {
     if context == 0 {
         // A zero context names no published stream; the callback is a
@@ -485,10 +475,8 @@ pub(crate) fn disconnect_on(
         // fallbacks.
         return Ok(());
     }
-    // The root HTTP/3 connection's Disconnected callback carries the
-    // published `ConnectionContextId`, which shares the packed
-    // slot|generation layout with a `StreamContextId` in an unrelated pool;
-    // the raw value is never a stream identity by itself. The accept
+    // The root HTTP/3 connection's Disconnected callback carries its direct
+    // connection-pool index. The accept
     // metadata distinguishes the roles exactly as VPP
     // `http_ts_accept_callback` branches on `SESSION_F_STREAM`
     // (http.c:733-740): only a stream child carries
@@ -501,7 +489,7 @@ pub(crate) fn disconnect_on(
     if !metadata.flags.contains(SessionFlags::STREAM) {
         return Ok(());
     }
-    let stream = StreamContextId::from(context);
+    let stream = u32::try_from(context).map_err(|_| HttpAppError::ContextOutOfRange { context })?;
     let (direction, aborted) = main.with_worker(worker.worker(), |http| {
         let stream_context = http
             .get_stream_for_session(stream, session)
@@ -598,8 +586,8 @@ pub(crate) fn disconnect_on(
 /// Session App `reset` for a peer HTTP/3 unidirectional stream RESET.
 ///
 /// The lower QUIC transport dispatches a received RESET synchronously as
-/// this callback with the Session's published `SessionAppContext` naming the
-/// generation-checked `StreamContextId`, and the owning `HttpWorker` is
+/// this callback with the Session's published app-state identity naming the
+/// generation-checked `u32`, and the owning `HttpWorker` is
 /// resolved by the Session worker id exactly as `disconnect` does. The
 /// stream context is generation/session-checked with
 /// `HttpWorker::get_stream_for_session` before anything else; a bidi/request
@@ -629,11 +617,7 @@ pub(crate) fn disconnect_on(
 /// and the transport action propagate typed through the existing
 /// `RuntimeError` conversion. The whole path is O(1) with no scan,
 /// allocation, lock, channel, or async work.
-pub(crate) fn reset(
-    worker: &mut SessionWorker<u32>,
-    session: SessionId,
-    context: SessionAppContext,
-) -> RuntimeResult<()> {
+pub(crate) fn reset(worker: &mut SessionWorker, session: u32, context: u64) -> RuntimeResult<()> {
     let main = HTTP_MAIN
         .get()
         .ok_or(RuntimeError::PluginStateNotInitialized { plugin: NAME })?;
@@ -649,9 +633,9 @@ pub(crate) fn reset(
 /// typed.
 fn stream_direction(
     main: &HttpMain,
-    worker: &mut SessionWorker<u32>,
-    stream: StreamContextId,
-    session: SessionId,
+    worker: &mut SessionWorker,
+    stream: u32,
+    session: u32,
 ) -> RuntimeResult<Option<SessionStreamDirection>> {
     main.with_worker(worker.worker(), |http| {
         http.get_stream_for_session(stream, session)
@@ -668,9 +652,9 @@ fn stream_direction(
 /// bypasses it (listener.rs:1071).
 pub(crate) fn reset_on(
     main: &HttpMain,
-    worker: &mut SessionWorker<u32>,
-    session: SessionId,
-    context: SessionAppContext,
+    worker: &mut SessionWorker,
+    session: u32,
+    context: u64,
 ) -> RuntimeResult<()> {
     if context == 0 {
         // A zero context names no published stream; the callback is a
@@ -692,7 +676,7 @@ pub(crate) fn reset_on(
     if !metadata.flags.contains(SessionFlags::STREAM) {
         return Ok(());
     }
-    let stream = StreamContextId::from(context);
+    let stream = u32::try_from(context).map_err(|_| HttpAppError::ContextOutOfRange { context })?;
     // An identity a sibling seam (cleanup, disconnect) already released is a
     // no-op (`stream_direction`); all other resolution errors stay typed.
     let Some(direction) = stream_direction(main, worker, stream, session)? else {
@@ -727,11 +711,7 @@ pub(crate) fn reset_on(
             Err(error) => return Err(RuntimeError::from(error)),
         };
         worker
-            .close_connection(
-                reset.session,
-                SessionApplicationErrorCode::from(reset.error_code.value()),
-                &[],
-            )
+            .close_connection(reset.session, u64::from(reset.error_code.value()), &[])
             .map_err(RuntimeError::from)?;
         Ok(())
     })
@@ -743,16 +723,15 @@ pub(crate) fn reset_on(
 /// delete-notify-before-free order (`session_cleanup_notify`,
 /// session.c:304-318). The owning `HttpWorker` is resolved by the Session
 /// worker id exactly as `disconnect` does. The dispatch passes the Session's
-/// published `SessionAppContext`: a `ConnectionContextId` for a root
-/// connection, a `StreamContextId` for a stream child. The root context is
+/// published app-state identity: a direct connection-pool `u32` for a root
+/// connection or a direct stream-pool `u32` for a stream child. The root context is
 /// removed before the published app session is cleared (delete-before-free),
 /// and a bidi request stream's upper request Session is removed before the
 /// request stream context is released, matching VPP
 /// `http3_conn_cleanup_callback` (http3.c:2425-2436) and
 /// `http3_stream_cleanup_callback` (http3.c:2440-2462); the Session entry
 /// itself is freed by the SessionWorker after the callback. An upper request
-/// Session (identified by its owner link, since it shares the packed stream
-/// context of its lower), a Session without live role metadata, and a stream
+/// Session (identified by its owner link), a Session without live role metadata, and a stream
 /// context the reset or disconnect seam already released are no-ops
 /// (VPP's reset path frees nothing either, http3.c:2336-2361, so its
 /// cleanup always finds live request state; Hammer's seams release eagerly,
@@ -761,11 +740,7 @@ pub(crate) fn reset_on(
 /// freeing the uni stream's request state at cleanup (http3.c:2440-2462,
 /// falling through to `http3_stream_free_req`, http3.c:59-78). The whole
 /// path is O(1) with no scan, allocation, lock, channel, or async work.
-pub(crate) fn cleanup(
-    worker: &mut SessionWorker<u32>,
-    session: SessionId,
-    context: SessionAppContext,
-) -> RuntimeResult<()> {
+pub(crate) fn cleanup(worker: &mut SessionWorker, session: u32, context: u64) -> RuntimeResult<()> {
     let main = HTTP_MAIN
         .get()
         .ok_or(RuntimeError::PluginStateNotInitialized { plugin: NAME })?;
@@ -777,9 +752,9 @@ pub(crate) fn cleanup(
 /// `accept_on` bypasses it (listener.rs:1071).
 pub(crate) fn cleanup_on(
     main: &HttpMain,
-    worker: &mut SessionWorker<u32>,
-    session: SessionId,
-    context: SessionAppContext,
+    worker: &mut SessionWorker,
+    session: u32,
+    context: u64,
 ) -> RuntimeResult<()> {
     if context == 0 {
         // A zero context names no published HTTP context; the callback is a
@@ -789,7 +764,7 @@ pub(crate) fn cleanup_on(
     }
     // An upper request Session is never a lower transport Session: its
     // removal is owned by `remove_upper_session`, which runs this callback
-    // reentrantly on the upper with the same packed stream context, and the
+    // reentrantly on the upper while the stream context remains owned by the lower, and the
     // stream context is bound to the lower Session, so this path is a no-op.
     if worker.lower_session(session).is_some() {
         return Ok(());
@@ -808,7 +783,8 @@ pub(crate) fn cleanup_on(
         // disconnect seam has already aborted or finished the stream; the
         // stream context may therefore already be released, which
         // `stream_direction` tolerates as a no-op.
-        let stream = StreamContextId::from(context);
+        let stream =
+            u32::try_from(context).map_err(|_| HttpAppError::ContextOutOfRange { context })?;
         let Some(direction) = stream_direction(main, worker, stream, session)? else {
             return Ok(());
         };
@@ -847,8 +823,9 @@ pub(crate) fn cleanup_on(
     // a later dispatch a no-op. The Session entry itself is freed by the
     // SessionWorker after the callback.
     main.with_worker(worker.worker(), |http| {
-        http.remove(ContextId::from(context))
-            .map_err(RuntimeError::from)
+        let context =
+            u32::try_from(context).map_err(|_| HttpAppError::ContextOutOfRange { context })?;
+        http.remove(context).map_err(RuntimeError::from)
     })?;
     worker.set_app_session(session, 0)
 }
@@ -868,13 +845,13 @@ struct FeedOutcome {
 /// Session App `builtin_rx` for readable bytes on a lower Session.
 ///
 /// The lower QUIC transport dispatches newly readable RX bytes synchronously
-/// as this callback with the Session's published `SessionAppContext` naming
-/// the generation-checked `StreamContextId`, exactly like `disconnect` and
+/// as this callback with the Session's published app-state identity naming
+/// the generation-checked `u32`, exactly like `disconnect` and
 /// `reset` resolve their contexts.
 pub(crate) fn builtin_rx(
-    worker: &mut SessionWorker<u32>,
-    session: SessionId,
-    context: SessionAppContext,
+    worker: &mut SessionWorker,
+    session: u32,
+    context: u64,
 ) -> RuntimeResult<()> {
     let main = HTTP_MAIN
         .get()
@@ -920,9 +897,9 @@ pub(crate) fn builtin_rx(
 /// the single bounded HEADERS capture, or async work.
 pub(crate) fn builtin_rx_on(
     main: &HttpMain,
-    worker: &mut SessionWorker<u32>,
-    session: SessionId,
-    context: SessionAppContext,
+    worker: &mut SessionWorker,
+    session: u32,
+    context: u64,
 ) -> RuntimeResult<()> {
     if context == 0 {
         // A zero context names no published stream; the callback is a
@@ -946,7 +923,7 @@ pub(crate) fn builtin_rx_on(
     {
         return Ok(());
     }
-    let stream = StreamContextId::from(context);
+    let stream = u32::try_from(context).map_err(|_| HttpAppError::ContextOutOfRange { context })?;
     // The upper request Session a previous HEADERS publication attached, or
     // none before the first completed section: DATA publication needs its
     // FIFO before the feed borrows end, but the upper is created exactly
@@ -1337,23 +1314,8 @@ pub(crate) fn builtin_rx_on(
     Ok(())
 }
 
-/// Installs the builtin HTTP Session App on every worker; mirrors VPP
-/// `vnet_application_attach` of the builtin "http" app (http.c:1049-1062).
-/// Errors are the typed `RuntimeError` values of the registry and the
-/// Session App installer, propagated unchanged.
-pub(crate) fn install(engine: &mut Engine) -> RuntimeResult<()> {
-    let main = engine
-        .registry
-        .require::<hammer_service::session::runtime::SessionMain>()?;
-    main.install_session_app(&engine.runtime, NAME, &CALLBACKS)
+/// Registers the concrete HTTP app VFT in the process-global Session
+/// authority during HTTP owner initialization.
+pub(crate) fn register(application: u32) -> RuntimeResult<u32> {
+    hammer_service::session::protocol::register_session_app(application, VFT)
 }
-
-/// Teardown hook for the registration image. Per-Session context removal is
-/// owned by the `cleanup` callback, which removes the HTTP context before
-/// the SessionWorker frees the entry; the registration-level hook fires only
-/// for the lower-most Session after that removal, carries neither the
-/// Session id nor an error channel, and stays a no-op.
-pub(crate) fn destroy(_worker: DataWorkerId, _context: SessionAppContext) {}
-
-pub(crate) static HTTP_SESSION_APP: SessionAppRegistration =
-    SessionAppRegistration::new(NAME, install, destroy);

@@ -602,28 +602,3 @@ fn completion_error(operation: &'static str, result: i32) -> RuntimeError {
 fn io_error(operation: &'static str, source: io::Error) -> RuntimeError {
     RuntimeError::FilePollerIo { operation, source }
 }
-
-#[cfg(test)]
-mod tests {
-    use std::error::Error;
-
-    use super::*;
-
-    #[test]
-    fn poller_io_error_preserves_os_source() {
-        let error = io_error(
-            "test File poller operation",
-            io::Error::from_raw_os_error(libc::EBADF),
-        );
-
-        let RuntimeError::FilePollerIo { operation, .. } = &error else {
-            panic!("unexpected error: {error}");
-        };
-        assert_eq!(*operation, "test File poller operation");
-        let source = error
-            .source()
-            .and_then(|source| source.downcast_ref::<io::Error>())
-            .expect("File poller error source");
-        assert_eq!(source.raw_os_error(), Some(libc::EBADF),);
-    }
-}

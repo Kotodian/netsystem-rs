@@ -23,7 +23,6 @@ use super::lookup::{
 use super::{TcpInputNext, write_session_route_opaque};
 use crate::protocol::{TcpIpProtocol, TcpIpVersion};
 use hammer_service::opaque::NetworkOpaque;
-use hammer_service::session::SessionId;
 
 #[derive(Clone, Copy, Default)]
 #[repr(C)]
@@ -498,9 +497,9 @@ fn session_or_listener_pending_input_entry(
     local: SocketAddr,
     remote: SocketAddr,
     flags: TcpInputFlags,
-) -> RuntimeResult<(Option<(SessionId, DataWorkerId, TcpInputNext)>, bool)> {
+) -> RuntimeResult<(Option<(u32, DataWorkerId, TcpInputNext)>, bool)> {
     crate::TCP_MAIN
-        .load_full()
+        .get()
         .ok_or(RuntimeError::PluginStateNotInitialized { plugin: "tcp" })?
         .with_worker(runtime, |_, worker| {
             let (route, listener_pending) = worker.lookup.input_route(
@@ -527,19 +526,6 @@ fn tcp_listener_input_entry(flags: TcpInputFlags) -> (TcpInputNext, Option<TcpEr
         return (TcpInputNext::Reset, Some(TcpError::AckInvalid));
     }
     (TcpInputNext::Reset, Some(TcpError::ConnectionClosed))
-}
-
-#[cfg(test)]
-pub(crate) fn stamp_session_route_for_test(
-    runtime: &DataPlaneRuntime,
-    index: Index,
-    session_id: SessionId,
-    owner: DataWorkerId,
-    next: TcpInputNext,
-) -> RuntimeResult<()> {
-    let mut buffer = runtime.get_buffer_mut(index)?;
-    write_session_route_opaque(buffer.opaque2_mut(), session_id, owner, next);
-    Ok(())
 }
 
 #[inline(always)]
@@ -828,7 +814,7 @@ fn prefetch_session_route_for_buffer(
     };
     let local = SocketAddr::new(destination_ip, tcp_destination_port(buffer));
     let remote = SocketAddr::new(source_ip, tcp_source_port(buffer));
-    let Some(main) = crate::TCP_MAIN.load_full() else {
+    let Some(main) = crate::TCP_MAIN.get() else {
         return;
     };
     let _ = main.with_worker(runtime, |_, worker| {

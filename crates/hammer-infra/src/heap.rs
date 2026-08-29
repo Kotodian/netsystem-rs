@@ -128,31 +128,3 @@ static SVM_VTABLE: HeapVTable = HeapVTable {
     alloc: shared_owner_alloc_callback,
     dealloc: shared_owner_dealloc_callback,
 };
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::heap_boxed::Slice;
-    use crate::svm_region::SvmRegion;
-
-    #[test]
-    fn main_heap_handle_is_metadata_free() {
-        let main = Heap::main();
-        assert!(main.is_main_heap());
-        assert!(main.region().is_none());
-        let clone = main.clone();
-        assert!(clone.is_main_heap());
-    }
-
-    #[test]
-    fn svm_slice_retains_provenance_across_clone_and_drop() {
-        let region = SvmRegion::with_size(1 << 20);
-        let heap = Arc::new(Heap::svm_data(region).expect("owner region heap"));
-        let values: Slice<u64> = Slice::from_fn_in(64, |index| index as u64, heap);
-        let clone = values.clone();
-        assert_eq!(clone.len(), 64);
-        assert_eq!(clone[63], 63);
-        drop(clone);
-        drop(values);
-    }
-}

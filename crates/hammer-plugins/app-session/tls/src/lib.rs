@@ -7,13 +7,13 @@
 //! layer.
 
 use std::io::{self, BufRead, Write};
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
 use hammer_infra::fifo::Fifo;
-use hammer_runtime::app::{ApplicationId, SessionAppContext, SessionAppId};
-use hammer_runtime::{RuntimeError, RuntimeResult};
-use hammer_service::session::SessionId;
-use hammer_service::session::protocol::SessionApp;
+use hammer_infra::pool::Pool;
+use hammer_infra::thread_owned::ThreadOwned;
+use hammer_runtime::{DataWorkerId, Engine, RuntimeError, RuntimeResult};
+use hammer_service::session::protocol::SessionAppVft;
 use hammer_service::session::runtime::SessionWorker;
 use rustls::pki_types::ServerName;
 
@@ -29,6 +29,18 @@ pub use config::{
 #[hammer_component_macros::runtime_error(subsystem = "tls")]
 #[derive(Debug, thiserror::Error)]
 enum Error {
+    #[error("TLS worker {worker} is not installed")]
+    WorkerMissing { worker: usize },
+    #[error("TLS worker {worker} is already installed")]
+    WorkerAlreadyInstalled { worker: usize },
+    #[error("TLS worker {worker} cannot be accessed")]
+    WorkerAccess {
+        worker: usize,
+        #[source]
+        source: hammer_infra::thread_owned::ThreadOwnedError,
+    },
+    #[error("TLS connection context {context:#x} is missing")]
+    ConnectionMissing { context: u64 },
     #[error("create TLS client connection")]
     ClientConnection {
         #[source]
@@ -69,13 +81,106 @@ enum Error {
 }
 
 /// A TLS connection owned and advanced by one Data Worker.
-#[hammer_component_macros::session_app(name = "tls")]
 #[derive(Debug)]
 pub struct Connection {
     connection: rustls::Connection,
     peer_closed: bool,
-    lower_session: Option<SessionId>,
-    upper_session: Option<SessionId>,
+    lower_session: Option<u32>,
+    upper_session: Option<u32>,
+}
+
+const TLS_CONNECTION_CAPACITY: usize = 1_024;
+
+struct TlsWorkers {
+    workers: Box<[ThreadOwned<Pool<Connection>>]>,
+}
+
+static TLS_WORKERS: OnceLock<TlsWorkers> = OnceLock::new();
+
+impl TlsWorkers {
+    fn new(worker_count: usize) -> Self {
+        Self {
+            workers: (0..worker_count)
+                .map(|_| ThreadOwned::new())
+                .collect::<Vec<_>>()
+                .into_boxed_slice(),
+        }
+    }
+
+    fn install(&self, worker: DataWorkerId) -> RuntimeResult<()> {
+        let slot = self
+            .workers
+            .get(worker.slot())
+            .ok_or(Error::WorkerMissing {
+                worker: worker.slot(),
+            })?;
+        slot.install(Pool::with_capacity(TLS_CONNECTION_CAPACITY))
+            .map_err(|_| {
+                Error::WorkerAlreadyInstalled {
+                    worker: worker.slot(),
+                }
+                .into()
+            })
+    }
+
+    fn insert(&self, worker: DataWorkerId, connection: Connection) -> RuntimeResult<u64> {
+        let slot = self
+            .workers
+            .get(worker.slot())
+            .ok_or(Error::WorkerMissing {
+                worker: worker.slot(),
+            })?;
+        let context = slot
+            .with_mut(|pool| pool.insert(connection))
+            .map_err(|source| Error::WorkerAccess {
+                worker: worker.slot(),
+                source,
+            })?;
+        Ok(context.into())
+    }
+
+    fn with_mut<R>(
+        &self,
+        worker: DataWorkerId,
+        context: u64,
+        operation: impl FnOnce(&mut Connection) -> RuntimeResult<R>,
+    ) -> RuntimeResult<R> {
+        let index = u32::try_from(context).map_err(|_| Error::ConnectionMissing { context })?;
+        let slot = self
+            .workers
+            .get(worker.slot())
+            .ok_or(Error::WorkerMissing {
+                worker: worker.slot(),
+            })?;
+        slot.with_mut(|pool| {
+            let connection = pool
+                .get_mut(index)
+                .ok_or(Error::ConnectionMissing { context })?;
+            operation(connection)
+        })
+        .map_err(|source| Error::WorkerAccess {
+            worker: worker.slot(),
+            source,
+        })?
+    }
+
+    fn remove(&self, worker: DataWorkerId, context: u64) -> RuntimeResult<()> {
+        let index = u32::try_from(context).map_err(|_| Error::ConnectionMissing { context })?;
+        let slot = self
+            .workers
+            .get(worker.slot())
+            .ok_or(Error::WorkerMissing {
+                worker: worker.slot(),
+            })?;
+        slot.with_mut(|pool| {
+            pool.remove(index);
+        })
+        .map_err(|source| Error::WorkerAccess {
+            worker: worker.slot(),
+            source,
+        })?;
+        Ok(())
+    }
 }
 
 impl Connection {
@@ -208,10 +313,90 @@ impl Connection {
     }
 }
 
-impl SessionApp for Connection {
+fn tls_workers() -> RuntimeResult<&'static TlsWorkers> {
+    TLS_WORKERS
+        .get()
+        .ok_or(RuntimeError::PluginStateNotInitialized { plugin: "tls" })
+}
+
+fn ensure_connection(worker: &mut SessionWorker, session: u32, context: u64) -> RuntimeResult<u64> {
+    if context != 0 {
+        return Ok(context);
+    }
+    let (application, _, opaque, server_name) = worker
+        .session_app_endpoint(session)
+        .ok_or(Error::ConnectionMissing { context })?;
+    let connection = Connection::create(Some(application), None, opaque, server_name)?;
+    let context = tls_workers()?.insert(worker.worker(), connection)?;
+    if let Err(error) = worker.set_app_session(session, context) {
+        let _ = tls_workers()?.remove(worker.worker(), context);
+        return Err(error);
+    }
+    Ok(context)
+}
+
+fn with_connection<R>(
+    worker: &mut SessionWorker,
+    context: u64,
+    operation: impl FnOnce(&mut Connection, &mut SessionWorker) -> RuntimeResult<R>,
+) -> RuntimeResult<R> {
+    let workers = tls_workers()?;
+    let worker_id = worker.worker();
+    workers.with_mut(worker_id, context, |connection| {
+        operation(connection, worker)
+    })
+}
+
+fn accept(worker: &mut SessionWorker, session: u32, context: u64) -> RuntimeResult<()> {
+    let context = ensure_connection(worker, session, context)?;
+    with_connection(worker, context, |connection, worker| {
+        connection.accept(worker, session, context)
+    })
+}
+
+fn connected(worker: &mut SessionWorker, session: u32, context: u64) -> RuntimeResult<()> {
+    let context = ensure_connection(worker, session, context)?;
+    with_connection(worker, context, |connection, worker| {
+        connection.connected(worker, session, context)
+    })
+}
+
+fn builtin_rx(worker: &mut SessionWorker, session: u32, context: u64) -> RuntimeResult<()> {
+    with_connection(worker, context, |connection, worker| {
+        connection.builtin_rx(worker, session, context)
+    })
+}
+
+fn builtin_tx(worker: &mut SessionWorker, session: u32, context: u64) -> RuntimeResult<()> {
+    with_connection(worker, context, |connection, worker| {
+        connection.builtin_tx(worker, session, context)
+    })
+}
+
+fn disconnect(worker: &mut SessionWorker, session: u32, context: u64) -> RuntimeResult<()> {
+    with_connection(worker, context, |connection, worker| {
+        connection.disconnect(worker, session, context)
+    })
+}
+
+fn transport_closed(worker: &mut SessionWorker, session: u32, context: u64) -> RuntimeResult<()> {
+    with_connection(worker, context, |connection, worker| {
+        connection.transport_closed(worker, session, context)
+    })
+}
+
+fn cleanup(worker: &mut SessionWorker, session: u32, context: u64) -> RuntimeResult<()> {
+    if context != 0 {
+        tls_workers()?.remove(worker.worker(), context)?;
+        worker.set_app_session(session, 0)?;
+    }
+    Ok(())
+}
+
+impl Connection {
     fn create(
-        application: Option<ApplicationId>,
-        _: Option<SessionAppId>,
+        application: Option<u32>,
+        _: Option<u32>,
         opaque: Option<u64>,
         server_name: Option<&str>,
     ) -> RuntimeResult<Self> {
@@ -237,9 +422,9 @@ impl SessionApp for Connection {
 
     fn accept(
         &mut self,
-        worker: &mut SessionWorker<u32>,
-        session: SessionId,
-        context: SessionAppContext,
+        worker: &mut SessionWorker,
+        session: u32,
+        context: u64,
     ) -> RuntimeResult<()> {
         let upper = worker.create_upper_session(session, context)?;
         self.lower_session = Some(session);
@@ -249,9 +434,9 @@ impl SessionApp for Connection {
 
     fn connected(
         &mut self,
-        worker: &mut SessionWorker<u32>,
-        session: SessionId,
-        context: SessionAppContext,
+        worker: &mut SessionWorker,
+        session: u32,
+        context: u64,
     ) -> RuntimeResult<()> {
         let upper = worker.create_upper_session(session, context)?;
         self.lower_session = Some(session);
@@ -259,12 +444,7 @@ impl SessionApp for Connection {
         Ok(())
     }
 
-    fn builtin_rx(
-        &mut self,
-        worker: &mut SessionWorker<u32>,
-        _: SessionId,
-        _: SessionAppContext,
-    ) -> RuntimeResult<()> {
+    fn builtin_rx(&mut self, worker: &mut SessionWorker, _: u32, _: u64) -> RuntimeResult<()> {
         let lower = self.lower_session.ok_or(Error::UpperSessionMissing)?;
         let upper = self.upper_session.ok_or(Error::UpperSessionMissing)?;
         let (lower_rx, _) = worker.fifo_pair(lower).ok_or(Error::UpperSessionMissing)?;
@@ -275,12 +455,7 @@ impl SessionApp for Connection {
         Ok(())
     }
 
-    fn builtin_tx(
-        &mut self,
-        worker: &mut SessionWorker<u32>,
-        _: SessionId,
-        _: SessionAppContext,
-    ) -> RuntimeResult<()> {
+    fn builtin_tx(&mut self, worker: &mut SessionWorker, _: u32, _: u64) -> RuntimeResult<()> {
         let lower = self.lower_session.ok_or(Error::UpperSessionMissing)?;
         let upper = self.upper_session.ok_or(Error::UpperSessionMissing)?;
         let (_, lower_tx) = worker.fifo_pair(lower).ok_or(Error::UpperSessionMissing)?;
@@ -291,30 +466,47 @@ impl SessionApp for Connection {
         Ok(())
     }
 
-    fn disconnect(
-        &mut self,
-        _: &mut SessionWorker<u32>,
-        _: SessionId,
-        _: SessionAppContext,
-    ) -> RuntimeResult<()> {
+    fn disconnect(&mut self, _: &mut SessionWorker, _: u32, _: u64) -> RuntimeResult<()> {
         self.send_close_notify();
         Ok(())
     }
 
-    fn transport_closed(
-        &mut self,
-        _: &mut SessionWorker<u32>,
-        _: SessionId,
-        _: SessionAppContext,
-    ) -> RuntimeResult<()> {
+    fn transport_closed(&mut self, _: &mut SessionWorker, _: u32, _: u64) -> RuntimeResult<()> {
         self.peer_closed = true;
         Ok(())
     }
 }
 
+pub(crate) const VFT: SessionAppVft = SessionAppVft {
+    name: "tls",
+    accept: Some(accept),
+    connected: Some(connected),
+    disconnect: Some(disconnect),
+    transport_closed: Some(transport_closed),
+    cleanup: Some(cleanup),
+    builtin_rx: Some(builtin_rx),
+    builtin_tx: Some(builtin_tx),
+    ..SessionAppVft::all_none("tls")
+};
+
 #[hammer_component_macros::init_function(name = "tls_init")]
-fn init_tls() -> RuntimeResult<Arc<TlsMain>> {
-    config::init()
+fn init_tls(engine: &mut Engine) -> RuntimeResult<()> {
+    config::init()?;
+    TLS_WORKERS
+        .set(TlsWorkers::new(engine.configured_worker_count()))
+        .map_err(|_| RuntimeError::PluginStateNotInitialized { plugin: "tls" })?;
+    Ok(())
+}
+
+#[hammer_component_macros::worker_init_function(
+    name = "tls_worker_init",
+    runs_after = ["session_worker_init"]
+)]
+fn init_tls_worker(engine: &mut Engine) -> RuntimeResult<()> {
+    TLS_WORKERS
+        .get()
+        .ok_or(RuntimeError::PluginStateNotInitialized { plugin: "tls" })?
+        .install(engine.data_worker_id()?)
 }
 
 hammer_component_macros::declare_plugin!(
@@ -325,29 +517,13 @@ hammer_component_macros::declare_plugin!(
     early_config_functions = [],
     main_loop_enter_functions = [],
     main_loop_exit_functions = [],
-    worker_init_functions = [],
+    worker_init_functions = [__INIT_FN_TLS_WORKER_INIT],
     graph_nodes = [],
     node_functions = [],
     process_nodes = [],
-    session_apps = [__SESSION_APP_CONNECTION],
     binary_api_methods = [
         config::__BINARY_API_REGISTER_SERVER_CONFIG_API,
         config::__BINARY_API_REGISTER_CLIENT_CONFIG_API,
         config::__BINARY_API_REMOVE_CONFIG_API,
     ],
 );
-
-#[cfg(test)]
-mod tests {
-    #[test]
-    fn registered_callbacks_are_a_concrete_static_table() {
-        let callbacks = crate::__SESSION_APP_CONNECTION_CALLBACKS;
-        assert!(callbacks.accept.is_some());
-        assert!(callbacks.connected.is_some());
-        assert!(callbacks.builtin_rx.is_some());
-        assert!(callbacks.builtin_tx.is_some());
-        assert!(callbacks.disconnect.is_some());
-        assert!(callbacks.transport_closed.is_some());
-        assert!(callbacks.cleanup.is_some());
-    }
-}

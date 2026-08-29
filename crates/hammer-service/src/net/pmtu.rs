@@ -75,11 +75,6 @@ pub fn path_mtu_cache() -> Option<Arc<PathMtuCache>> {
     PATH_MTU_CACHE.load_full()
 }
 
-/// Clear the published path MTU cache (tests / subsystem reset).
-pub fn reset_path_mtu_cache_for_test() {
-    PATH_MTU_CACHE.store(None);
-}
-
 const ICMP4_DEST_UNREACH: u8 = 3;
 const ICMP4_FRAG_NEEDED: u8 = 4;
 const ICMP_HEADER_LEN: usize = 8;

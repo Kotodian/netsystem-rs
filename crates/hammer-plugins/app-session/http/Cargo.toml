@@ -16,4 +16,5 @@ hammer-component-macros = { path = "../../../hammer-component-macros" }
 hammer-infra = { path = "../../../hammer-infra" }
 hammer-runtime = { path = "../../../hammer-runtime", default-features = false }
 hammer-service = { path = "../../../hammer-service", default-features = false }
+hammer-plugin-quic = { path = "../quic" }
 thiserror = { workspace = true }

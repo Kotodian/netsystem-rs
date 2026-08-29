@@ -17,6 +17,3 @@ hammer-service = { path = "../../../hammer-service", default-features = false }
 prost = { workspace = true }
 rustls = { workspace = true }
 thiserror = { workspace = true }
-
-[dev-dependencies]
-rcgen = { workspace = true }

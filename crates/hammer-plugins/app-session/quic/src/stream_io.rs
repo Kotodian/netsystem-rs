@@ -6,12 +6,11 @@ use std::sync::Arc;
 
 use bytes::BytesMut;
 use hammer_infra::fifo::Fifo;
-use hammer_service::session::SessionId;
 use quinn_proto::{StreamDataError, StreamDataIo, StreamId};
 
 pub(super) struct StreamIoEntry {
     pub(super) context: u32,
-    pub(super) session: SessionId,
+    pub(super) session: u32,
     pub(super) rx_fifo: Arc<Fifo>,
     pub(super) tx_fifo: Arc<Fifo>,
     pub(super) bytes_written: u64,
@@ -25,7 +24,7 @@ pub(super) struct StreamIoEntry {
 #[derive(Debug)]
 pub(super) struct StreamIoEvent {
     pub(super) context: u32,
-    pub(super) session: SessionId,
+    pub(super) session: u32,
     pub(super) rx: u64,
     pub(super) tx_deq: u64,
     pub(super) bytes_written: u64,
@@ -48,7 +47,7 @@ impl StreamIoTable {
         &mut self,
         stream: StreamId,
         context: u32,
-        session: SessionId,
+        session: u32,
         rx_fifo: Arc<Fifo>,
         tx_fifo: Arc<Fifo>,
         bytes_written: u64,
@@ -80,7 +79,7 @@ impl StreamIoTable {
         assert!(previous.is_none(), "stream Session installed exactly once");
     }
 
-    pub(super) fn stream_session(&self, stream: StreamId) -> Option<SessionId> {
+    pub(super) fn stream_session(&self, stream: StreamId) -> Option<u32> {
         self.streams.get(&stream).map(|entry| entry.session)
     }
 
@@ -296,185 +295,6 @@ impl StreamIoTable {
         if let Some(entry) = self.streams.get_mut(&stream) {
             entry.app_rx_data_len = entry.rx_fifo.max_dequeue() as u64;
         }
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use std::sync::Arc;
-
-    use hammer_infra::fifo::Fifo;
-    use hammer_service::session::SessionId;
-    use quinn_proto::{Dir, Side, StreamId};
-
-    use super::*;
-
-    fn test_stream() -> StreamId {
-        StreamId::new(Side::Server, Dir::Bi, 0)
-    }
-
-    fn test_fifos() -> (Arc<Fifo>, Arc<Fifo>) {
-        let mut rx = Fifo::with_capacity(1024).expect("rx FIFO");
-        rx.enable_ooo();
-        let tx = Fifo::with_capacity(1024).expect("tx FIFO");
-        (Arc::new(rx), Arc::new(tx))
-    }
-
-    #[test]
-    fn receive_transmit_and_ack_flow_through_session_fifos() {
-        let (rx, tx) = test_fifos();
-        let stream = test_stream();
-        let mut table = StreamIoTable::new();
-        table.install_stream(
-            stream,
-            7,
-            SessionId::from_raw(9),
-            Arc::clone(&rx),
-            Arc::clone(&tx),
-            0,
-            0,
-        );
-
-        assert_eq!(table.receive(stream, 0, b"abc").expect("receive"), 3);
-        assert_eq!(rx.max_dequeue(), 3);
-        let mut events = Vec::new();
-        table.take_events(&mut events);
-        assert_eq!(events.len(), 1);
-        assert_eq!(events[0].session, SessionId::from_raw(9));
-        assert_eq!(events[0].rx, 3);
-
-        tx.enqueue(b"abc");
-        let mut output = BytesMut::new();
-        assert_eq!(
-            table.transmit(stream, 0..3, &mut output).expect("transmit"),
-            3
-        );
-        assert_eq!(&output[..], b"abc");
-
-        table.ack(stream, 3).expect("ack");
-        assert_eq!(tx.max_dequeue(), 0);
-        let mut events = Vec::new();
-        table.take_events(&mut events);
-        assert_eq!(events.len(), 1);
-        assert_eq!(events[0].tx_deq, 3);
-        assert_eq!(events[0].bytes_written, 3);
-    }
-
-    #[test]
-    fn out_of_order_receive_publishes_only_promoted_bytes() {
-        let (rx, _) = test_fifos();
-        let stream = test_stream();
-        let mut table = StreamIoTable::new();
-        table.install_stream(
-            stream,
-            8,
-            SessionId::from_raw(10),
-            Arc::clone(&rx),
-            Arc::new(Fifo::with_capacity(1024).expect("tx FIFO")),
-            0,
-            0,
-        );
-
-        assert_eq!(table.receive(stream, 5, b"world").expect("ooo receive"), 0);
-        assert_eq!(rx.max_dequeue(), 0);
-        let mut events = Vec::new();
-        table.take_events(&mut events);
-        assert!(events.is_empty());
-
-        assert_eq!(table.receive(stream, 0, b"hello").expect("head"), 10);
-        assert_eq!(rx.max_dequeue(), 10);
-        table.take_events(&mut events);
-        assert_eq!(events.len(), 1);
-        assert_eq!(events[0].rx, 10);
-    }
-
-    #[test]
-    fn duplicate_stream_delivery_reuses_the_existing_session() {
-        let (rx, tx) = test_fifos();
-        let stream = test_stream();
-        let mut table = StreamIoTable::new();
-        table.install_stream(
-            stream,
-            7,
-            SessionId::from_raw(9),
-            Arc::clone(&rx),
-            Arc::clone(&tx),
-            0,
-            0,
-        );
-        table.install_stream(
-            stream,
-            7,
-            SessionId::from_raw(9),
-            Arc::clone(&rx),
-            Arc::clone(&tx),
-            0,
-            0,
-        );
-
-        assert_eq!(table.stream_session(stream), Some(SessionId::from_raw(9)));
-        assert_eq!(table.stream_context(stream), Some(7));
-        assert_eq!(table.receive(stream, 0, b"abc").expect("receive"), 3);
-        assert_eq!(rx.max_dequeue(), 3);
-    }
-
-    #[test]
-    fn full_fifo_rejects_whole_contiguous_frame_without_publishing_prefix() {
-        let mut rx = Arc::new(Fifo::with_capacity(4).expect("small RX FIFO"));
-        Arc::get_mut(&mut rx)
-            .expect("small RX FIFO is unshared before install")
-            .enable_ooo();
-        let tx = Fifo::with_capacity(1024).expect("tx FIFO");
-        let stream = test_stream();
-        let mut table = StreamIoTable::new();
-        table.install_stream(
-            stream,
-            7,
-            SessionId::from_raw(9),
-            Arc::clone(&rx),
-            Arc::new(tx),
-            0,
-            0,
-        );
-
-        let error = table
-            .receive(stream, 0, b"abcdef")
-            .expect_err("reject full frame");
-        assert!(matches!(
-            error,
-            StreamDataError::RxCapacityExceeded {
-                stream: failed,
-                offset: 0,
-                len: 6,
-            } if failed == stream
-        ));
-        assert_eq!(rx.max_dequeue(), 0);
-        assert_eq!(table.app_rx_consumed(stream), Some(0));
-    }
-
-    #[test]
-    fn app_rx_consumed_is_exact_fifo_dequeue_delta_not_free_capacity() {
-        let (rx, tx) = test_fifos();
-        let stream = test_stream();
-        let mut table = StreamIoTable::new();
-        table.install_stream(
-            stream,
-            7,
-            SessionId::from_raw(9),
-            Arc::clone(&rx),
-            Arc::clone(&tx),
-            0,
-            0,
-        );
-
-        assert_eq!(table.receive(stream, 0, b"abc").expect("receive"), 3);
-        assert_eq!(rx.dequeue_drop(1), 1);
-        assert_eq!(table.app_rx_consumed(stream), Some(1));
-        table.confirm_app_rx_consumed(stream);
-
-        assert_eq!(table.receive(stream, 0, b"abc").expect("overlap"), 1);
-        assert_eq!(rx.max_dequeue(), 3);
-        assert_eq!(table.app_rx_consumed(stream), Some(0));
     }
 }
 

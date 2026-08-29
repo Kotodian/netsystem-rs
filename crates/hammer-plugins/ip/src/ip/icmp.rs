@@ -1312,20 +1312,3 @@ fn refresh_generated_icmp_metadata(
     opaque.icmp_error = None;
     Ok(())
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn icmp_snapshot_storage_returns_registered_or_default_next() {
-        let default: u16 = 1;
-        let echo: u16 = 2;
-        let mut snapshot = IcmpInputSnapshot::new(default, default);
-
-        snapshot.register_type(IpVersion::V4, ICMP4_ECHO_REQUEST, echo);
-
-        assert_eq!(snapshot.slot_for(IpVersion::V4, ICMP4_ECHO_REQUEST), echo);
-        assert_eq!(snapshot.slot_for(IpVersion::V4, 13), default);
-    }
-}

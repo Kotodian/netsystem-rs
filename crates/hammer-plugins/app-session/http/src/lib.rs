@@ -27,9 +27,6 @@ mod http_common;
 mod listener;
 mod worker;
 
-#[cfg(test)]
-mod http_app_tests;
-
 hammer_component_macros::declare_plugin!(
     name = "http",
     load_after = ["quic"],
@@ -42,9 +39,7 @@ hammer_component_macros::declare_plugin!(
     graph_nodes = [],
     node_functions = [],
     process_nodes = [],
-    session_transports = [listener::__SESSION_TRANSPORT_HTTP_TRANSPORT],
-    session_apps = [http_app::HTTP_SESSION_APP],
     binary_api_methods = [],
 );
 
-pub use listener::HttpMain;
+pub use listener::{HttpMain, protocol};

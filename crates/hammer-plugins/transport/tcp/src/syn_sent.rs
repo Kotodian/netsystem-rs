@@ -30,7 +30,7 @@ pub struct TcpSynSentNode {
 
 pub fn register_tcp_syn_sent(runtime: &DataPlaneRuntime) -> RuntimeResult<NodeId> {
     let main = crate::TCP_MAIN
-        .load_full()
+        .get()
         .ok_or(RuntimeError::PluginStateNotInitialized { plugin: "tcp" })?;
     if let Some(node) = runtime.nodes().node_by_name("tcp-syn-sent") {
         return Ok(node);
@@ -134,7 +134,7 @@ fn tcp_syn_sent_index(
 ) -> RuntimeResult<bool> {
     let packet = tcp_packet(runtime, index)?;
     let main = crate::TCP_MAIN
-        .load_full()
+        .get()
         .ok_or(RuntimeError::PluginStateNotInitialized { plugin: "tcp" })?;
     let (keep_current, control_segment) = main.with_worker(runtime, |sessions, tcp| {
         let mut keep_current = true;
@@ -142,14 +142,15 @@ fn tcp_syn_sent_index(
             let _ = runtime.record_current_node_error(TcpNodeError::SynSentSessionRouteMissing);
             TcpNodeError::SynSentSessionRouteMissing
         })?;
-        let (_, connection_index) = sessions
-            .session_transport(session_id)
+        let connection_index = sessions
+            .transport_connection_index(session_id)
             .ok_or(TcpNodeError::SynSentSessionMissing)?;
         let (control, acked_tx_len, established_with_payload) = {
             let crate::worker::TcpWorker {
                 connections,
                 lookup,
                 timers,
+                ..
             } = tcp;
             let local_capabilities = lookup
                 .pending_open_capabilities(session_id)
@@ -193,7 +194,7 @@ fn tcp_syn_sent_index(
                 buffer.advance(packet.payload_offset as isize)?;
                 buffer.truncate(packet.payload_len)?;
             }
-            let enqueue = sessions.enqueue_rx(runtime.buffers(), session_id, index, 0, false)?;
+            let enqueue = sessions.enqueue_rx(runtime.buffers(), session_id, index, 0)?;
             if matches!(enqueue, RxDelivery::InOrder { .. }) {
                 sessions.mark_ready(session_id);
             }

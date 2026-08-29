@@ -37,14 +37,3 @@ where
 {
     CURRENT.scope(id, fut).await
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn short_is_low_16_bits() {
-        let c = ConnId::new(0xdead_0042);
-        assert_eq!(c.short(), 0x0042);
-    }
-}

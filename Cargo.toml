@@ -15,7 +15,6 @@ members = [
     "crates/hammer-plugins/app-session/http",
     "crates/hammer-app",
     "crates/hammer-stats",
-    "crates/hammer-vcl",
     "crates/hammer-ipc",
     "crates/hammer",
     "crates/hammerctl",

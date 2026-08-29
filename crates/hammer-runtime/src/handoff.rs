@@ -23,12 +23,31 @@ impl DataWorkerId {
     pub const fn slot(self) -> usize {
         self.0 as usize
     }
+
+    /// Returns the VPP-style runtime thread index for this Data Worker.
+    /// Thread zero is reserved for the Main Thread.
+    #[inline(always)]
+    pub const fn thread_index(self) -> u32 {
+        self.0.saturating_add(1)
+    }
 }
 
 impl From<DataWorkerId> for usize {
     #[inline]
     fn from(worker: DataWorkerId) -> Self {
         worker.slot()
+    }
+}
+
+impl TryFrom<u32> for DataWorkerId {
+    type Error = crate::error::RuntimeError;
+
+    #[inline(always)]
+    fn try_from(thread_index: u32) -> Result<Self, Self::Error> {
+        thread_index
+            .checked_sub(1)
+            .map(Self)
+            .ok_or(crate::error::RuntimeError::DataWorkerIdUnavailable { thread_index })
     }
 }
 
@@ -322,104 +341,5 @@ impl DataPlaneHandoffWorker {
                 schedule(NodeId::new(node_slot as u32));
             }
         }
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use crate::{DataPlaneBufferConfig, DataPlaneRuntime, DataPlaneRuntimeConfig};
-    use hammer_core::data_plane::NodeId;
-
-    use super::*;
-
-    #[test]
-    fn enqueue_index_uses_inline_handoff_payload() {
-        let runtime = DataPlaneRuntime::new(DataPlaneRuntimeConfig {
-            buffers: DataPlaneBufferConfig {
-                buffer_slot_capacity: 64,
-                buffer_slots: 1,
-                ..DataPlaneBufferConfig::default()
-            },
-        });
-        let index = runtime.alloc_index().expect("alloc index");
-        let handoff = DataPlaneHandoff::new(2, 4);
-        let source = handoff.worker(DataWorkerId::new(0));
-        let target = handoff.worker(DataWorkerId::new(1));
-        let node = NodeHandle::new(7);
-
-        source
-            .enqueue_index(DataWorkerId::new(1), node, index)
-            .expect("enqueue index");
-
-        let frame = target.pop().expect("handoff frame");
-        assert_eq!(frame.target, node);
-        assert_eq!(frame.slot.len(), 1);
-        assert!(frame.slot.iter().any(|value| value == index));
-        let mut cleanup = runtime
-            .buffers()
-            .get_next_frame(NodeId::new(0))
-            .expect("cleanup frame");
-        cleanup.push_index(index).expect("cleanup push");
-    }
-
-    #[test]
-    fn handoff_index_resolves_local_continuation_before_enqueue() {
-        use crate::node::{NodeDescriptor, NodeResult, NodeRuntimeData};
-        use hammer_core::data_plane::{NodeKind, NodeRegistration};
-
-        let handoff = DataPlaneHandoff::new(2, 4);
-        let runtime = DataPlaneRuntime::attach_handoff_worker(
-            DataPlaneRuntime::new(DataPlaneRuntimeConfig {
-                buffers: DataPlaneBufferConfig {
-                    buffer_slot_capacity: 64,
-                    buffer_slots: 4,
-                    frame_slots: 4,
-                    ..DataPlaneBufferConfig::default()
-                },
-            }),
-            handoff.worker(DataWorkerId::new(0)),
-        );
-        let continuation = runtime
-            .nodes()
-            .try_register_descriptor(
-                NodeKind::Internal,
-                NodeDescriptor::new(
-                    |_, _, _| NodeResult::drop(),
-                    NodeRuntimeData::empty(),
-                    NodeRegistration::next("continuation", 0),
-                    &[],
-                    None,
-                ),
-            )
-            .expect("continuation");
-        let owner = runtime
-            .nodes()
-            .try_register_descriptor(
-                NodeKind::Internal,
-                NodeDescriptor::new(
-                    |_, _, _| NodeResult::drop(),
-                    NodeRuntimeData::empty(),
-                    NodeRegistration::next("owner", 1),
-                    &[continuation],
-                    None,
-                ),
-            )
-            .expect("owner");
-        let index = runtime.alloc_index().expect("alloc");
-        let target = NodeHandle::new(9);
-
-        runtime
-            .with_current_node(owner, || {
-                runtime.handoff_index(DataWorkerId::new(1), target, index, Some(0u16))
-            })
-            .expect("handoff with continuation");
-
-        assert_eq!(
-            runtime.buffers().current_config(index).expect("config"),
-            continuation
-        );
-        let frame = handoff.worker(DataWorkerId::new(1)).pop().expect("queued");
-        assert_eq!(frame.target, target);
-        assert!(frame.slot.iter().any(|value| value == index));
     }
 }

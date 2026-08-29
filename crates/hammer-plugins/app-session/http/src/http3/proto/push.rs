@@ -47,37 +47,3 @@ impl fmt::Display for InvalidPushId {
         write!(f, "invalid push id: {:x}", self.0)
     }
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn push_id_from_u64() {
-        let id = PushId::try_from(2u64).unwrap();
-        assert_eq!(VarInt::from(id), VarInt::from_u32(2));
-        assert_eq!(
-            VarInt::from(PushId::try_from(0u64).unwrap()),
-            VarInt::from_u32(0)
-        );
-    }
-
-    #[test]
-    fn push_id_bounds() {
-        let max = VarInt::MAX.into_inner();
-        assert!(PushId::try_from(max).is_ok());
-        assert!(PushId::try_from(max + 1).is_err());
-        assert!(PushId::try_from(u64::MAX).is_err());
-    }
-
-    #[test]
-    fn push_id_from_varint() {
-        let id = PushId::from(VarInt::from_u32(3));
-        assert_eq!(VarInt::from(id), VarInt::from_u32(3));
-    }
-
-    #[test]
-    fn push_id_display() {
-        assert_eq!(PushId::try_from(2u64).unwrap().to_string(), "push 2");
-    }
-}

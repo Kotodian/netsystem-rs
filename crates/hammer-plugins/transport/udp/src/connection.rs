@@ -1,6 +1,6 @@
+use hammer_runtime::DataWorkerId;
+use hammer_runtime::app::SessionHandle;
 use std::net::SocketAddr;
-use hammer_runtime::{DataWorkerId, SessionHandle};
-use hammer_service::session::SessionId;
 
 use crate::UdpIpVersion;
 
@@ -69,7 +69,7 @@ pub struct UdpConnection {
     owner_worker: DataWorkerId,
     local: SocketAddr,
     remote: SocketAddr,
-    session: Option<SessionId>,
+    session: Option<u32>,
     listener: bool,
     closing: bool,
 }
@@ -105,12 +105,12 @@ impl UdpConnection {
     }
 
     #[inline]
-    pub const fn session(self) -> Option<SessionId> {
+    pub const fn session(self) -> Option<u32> {
         self.session
     }
 
     #[inline]
-    pub fn attach_session(&mut self, session: SessionId) -> bool {
+    pub fn attach_session(&mut self, session: u32) -> bool {
         if self.session.is_some() {
             return false;
         }

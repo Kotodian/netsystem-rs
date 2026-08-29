@@ -48,14 +48,6 @@ thread-priority = { workspace = true }
 
 [dev-dependencies]
 criterion = { workspace = true }
-indoc = { workspace = true }
-hammer-ipc = { path = "../hammer-ipc" }
-hammer-service = { path = "../hammer-service" }
-tracing-subscriber = { workspace = true }
-# `test-util` enables `tokio::time::pause()` / `advance()` so timeout-based
-# behaviour (TCP bridge drain idle, idle-keepalive backstop, etc.) can be
-# verified without sleeping for real seconds. Test-only.
-tokio = { workspace = true, features = ["test-util"] }
 
 [[bench]]
 name = "buffer_alloc_free"

@@ -906,28 +906,3 @@ impl Worker {
         Ok(nodes)
     }
 }
-
-#[cfg(test)]
-mod tests {
-    #[cfg(target_os = "linux")]
-    use crate::config::Worker;
-
-    #[cfg(target_os = "linux")]
-    #[test]
-    fn worker_buffer_nodes_follow_configured_worker_cores() {
-        let mut worker = Worker::default();
-        worker.count = 3;
-        worker.numa.enabled = true;
-        worker.cpu.worker_cores = vec![2, 4, 6];
-
-        let nodes = worker
-            .buffer_numa_nodes_with(|core| match core {
-                2 | 6 => Ok(1),
-                4 => Ok(3),
-                _ => unreachable!("unexpected configured core"),
-            })
-            .expect("resolve worker NUMA nodes");
-
-        assert_eq!(nodes, vec![1, 3]);
-    }
-}

@@ -15,14 +15,12 @@ use object::{Object, ObjectSection};
 use semver::Version;
 use serde::Deserialize;
 
-use crate::app::SessionAppRegistration;
 use crate::binary_api::BinaryApiMethodEntry;
 use crate::init::{ConfigFunction, InitFunction};
 use crate::node::{NodeEntry, NodeFunctionRegistration};
 use crate::plugin_loader::{PluginLibrary, read_plugin_module};
 use crate::process::ProcessEntry;
 use crate::registration::{RegistrationImage, StatsRegistration};
-use crate::session::SessionTransportRegistration;
 
 /// Metadata owned by one dynamically loaded plugin module.
 #[repr(C)]
@@ -123,14 +121,6 @@ impl RootModule for PluginModuleRef {
 pub enum PluginError {
     #[error("plugin `{name}` is not loaded")]
     NotLoaded { name: String },
-    #[error("Session App `{name}` is not registered")]
-    SessionAppMissing { name: String },
-    #[error("Session App `{name}` is registered more than once")]
-    SessionAppDuplicate { name: String },
-    #[error("Session Transport `{name}` is not registered")]
-    SessionTransportMissing { name: String },
-    #[error("Session Transport `{name}` is registered more than once")]
-    SessionTransportDuplicate { name: String },
     #[error("Binary API method `{name}` is not registered")]
     BinaryApiMethodMissing { name: String },
     #[error("Binary API method `{name}` is registered more than once")]
@@ -486,53 +476,6 @@ impl PluginMain {
         self.collect_registrations(RegistrationImage::process_nodes)
     }
 
-    pub fn session_transports(&self) -> Vec<SessionTransportRegistration> {
-        self.collect_registrations(RegistrationImage::session_transports)
-    }
-
-    pub fn session_transport(
-        &self,
-        name: &str,
-    ) -> Result<SessionTransportRegistration, PluginError> {
-        let mut found = None;
-        for transport in self.session_transports() {
-            if transport.name() != name {
-                continue;
-            }
-            if found.is_some() {
-                return Err(PluginError::SessionTransportDuplicate {
-                    name: name.to_owned(),
-                });
-            }
-            found = Some(transport);
-        }
-        found.ok_or_else(|| PluginError::SessionTransportMissing {
-            name: name.to_owned(),
-        })
-    }
-
-    pub fn session_apps(&self) -> Vec<SessionAppRegistration> {
-        self.collect_registrations(RegistrationImage::session_apps)
-    }
-
-    pub fn session_app(&self, name: &str) -> Result<SessionAppRegistration, PluginError> {
-        let mut found = None;
-        for entry in self.session_apps() {
-            if entry.name() != name {
-                continue;
-            }
-            if found.is_some() {
-                return Err(PluginError::SessionAppDuplicate {
-                    name: name.to_owned(),
-                });
-            }
-            found = Some(entry);
-        }
-        found.ok_or_else(|| PluginError::SessionAppMissing {
-            name: name.to_owned(),
-        })
-    }
-
     pub fn binary_api_methods(&self) -> Vec<BinaryApiMethodEntry> {
         self.collect_registrations(RegistrationImage::binary_api_methods)
     }
@@ -571,56 +514,5 @@ pub fn host_meets_plugin_requirement(
         Ok(())
     } else {
         Err(PluginError::SemVerMismatch { host, required })
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn test_stats_register(_: &hammer_stats::StatsMain) -> hammer_stats::StatsResult<()> {
-        Ok(())
-    }
-
-    fn test_stats_bind(
-        _: &hammer_stats::StatsMain,
-        _: &crate::RuntimeRegistry,
-    ) -> crate::RuntimeResult<()> {
-        Ok(())
-    }
-
-    static TEST_STATS_REGISTRATION: StatsRegistration = StatsRegistration {
-        name: "TestStats",
-        register: test_stats_register,
-        bind: test_stats_bind,
-    };
-
-    crate::__declare_registration_image!(
-        init_functions = [];
-        config_functions = [];
-        early_config_functions = [];
-        main_loop_enter_functions = [];
-        main_loop_exit_functions = [];
-        worker_init_functions = [];
-        graph_nodes = [];
-        node_functions = [];
-        process_nodes = [];
-        session_transports = [];
-        session_apps = [];
-        binary_api_methods = [];
-        stats_registrations = [TEST_STATS_REGISTRATION];
-    );
-
-    #[test]
-    fn collects_complete_stats_catalog_in_image_order() {
-        let mut plugins = PluginMain::default();
-        plugins.register_builtin_image(&__HAMMER_REGISTRATION_IMAGE);
-
-        let names: Vec<_> = plugins
-            .stats_registrations()
-            .into_iter()
-            .map(|registration| registration.name)
-            .collect();
-        assert_eq!(names, ["Sys", "TestStats"]);
     }
 }

@@ -59,7 +59,3 @@ pub use lookup::{
     IpLookupControlPlane, IpLookupNext, IpLookupNode, IpLookupTrace,
 };
 pub use protocol::ip::{write_ipv4_push_header, write_ipv6_push_header};
-pub fn reset_ip_main_for_test() {
-    lookup::reset_for_test();
-    hammer_service::net::pmtu::reset_path_mtu_cache_for_test();
-}

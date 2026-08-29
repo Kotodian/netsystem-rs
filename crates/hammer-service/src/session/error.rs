@@ -1,11 +1,8 @@
 use hammer_core::data_plane::NodeId;
 use hammer_infra::fifo::FifoError;
-use hammer_runtime::app::{ApplicationId, SessionControlError, SessionHandle};
+use hammer_runtime::app::{SessionControlError, SessionHandle};
 use hammer_runtime::{DataWorkerId, RuntimeError};
 use thiserror::Error;
-
-use super::SessionId;
-use super::runtime::SessionTransportId;
 
 #[hammer_component_macros::runtime_error(subsystem = "session queue")]
 #[derive(Debug, Error)]
@@ -31,19 +28,9 @@ pub enum SessionQueueError {
         output_node: NodeId,
     },
     #[error("Application {application:?} already has a per-worker MQ registration")]
-    ApplicationMqAlreadyRegistered { application: ApplicationId },
+    ApplicationMqAlreadyRegistered { application: u32 },
     #[error("Application {application:?} has no per-worker MQ registration")]
-    ApplicationMqMissing { application: ApplicationId },
-    #[error("Session App does not provide registered context construction")]
-    SessionAppContextCreateUnsupported,
-    #[error("Session App {app:?} is already installed on this worker")]
-    SessionAppAlreadyInstalled {
-        app: hammer_runtime::app::SessionAppId,
-    },
-    #[error("Session App {app:?} is not installed on this worker")]
-    SessionAppNotInstalled {
-        app: hammer_runtime::app::SessionAppId,
-    },
+    ApplicationMqMissing { application: u32 },
 }
 
 impl SessionQueueError {
@@ -58,34 +45,8 @@ impl SessionQueueError {
             Self::OutputMissing { .. } => 5,
             Self::ApplicationMqAlreadyRegistered { .. } => 6,
             Self::ApplicationMqMissing { .. } => 7,
-            Self::SessionAppContextCreateUnsupported => 8,
-            Self::SessionAppAlreadyInstalled { .. } => 9,
-            Self::SessionAppNotInstalled { .. } => 10,
         }
     }
-}
-
-/// Worker-local transport action dispatch error, returned to the transport
-/// calling through the Session Worker rather than to the Application control
-/// plane. The Session entry is the transport authority; dispatch derives the
-/// transport from it, so the remaining failures are a missing worker table and
-/// an absent or non-transport Session (mirroring VPP's transport VFT dispatch
-/// guards, session.c:1658-1712).
-#[hammer_component_macros::runtime_error(subsystem = "session transport action")]
-#[derive(Debug, Error)]
-pub enum SessionTransportActionError {
-    #[error("transport {transport:?} has no worker action table installed")]
-    MissingRegistration { transport: SessionTransportId },
-    #[error("transport {transport:?} already has a worker action table installed")]
-    AlreadyRegistered { transport: SessionTransportId },
-    #[error("session {session_id:?} is not present on this worker")]
-    InvalidSession { session_id: SessionId },
-    #[error("transport worker action `{action}` failed")]
-    TransportActionFailed {
-        action: &'static str,
-        #[source]
-        source: RuntimeError,
-    },
 }
 
 pub use hammer_runtime::app::SessionConnectError;
@@ -94,28 +55,30 @@ pub use hammer_runtime::app::SessionConnectError;
 #[derive(Debug, Error)]
 pub enum SessionError {
     #[error("session {session_id:?} is not in the session pool")]
-    SessionMissing { session_id: SessionId },
+    SessionMissing { session_id: u32 },
+    #[error("Session App {app:?} is not registered")]
+    SessionAppNotRegistered { app: u32 },
     #[error("session {lower:?} already has an upper Session attached")]
-    UpperSessionAlreadyAttached { lower: SessionId },
+    UpperSessionAlreadyAttached { lower: u32 },
     #[error("session {session_id:?} cannot publish its connection in its current state")]
-    PublicationRejected { session_id: SessionId },
+    PublicationRejected { session_id: u32 },
     #[error("session {session_id:?} is active and cannot be rolled back")]
-    RollbackRejected { session_id: SessionId },
+    RollbackRejected { session_id: u32 },
     #[error("transport Session {session_id:?} construction did not complete")]
-    TransportSessionCreateIncomplete { session_id: SessionId },
+    TransportSessionCreateIncomplete { session_id: u32 },
     #[error("session {session_id:?} connection is not published")]
-    NotPublished { session_id: SessionId },
+    NotPublished { session_id: u32 },
     #[error(
         "session {session_id:?} out-of-order RX offset {offset} plus buffered length {buffered_len} overflows u32"
     )]
     RxOutOfOrderOffsetOverflow {
-        session_id: SessionId,
+        session_id: u32,
         offset: u32,
         buffered_len: u32,
     },
     #[error("session {session_id:?} out-of-order RX enqueue failed at offset {offset}")]
     RxOutOfOrderEnqueue {
-        session_id: SessionId,
+        session_id: u32,
         offset: u32,
         #[source]
         source: FifoError,
@@ -124,50 +87,48 @@ pub enum SessionError {
         "session {session_id:?} transport TX offset {tx_offset} exceeds pending length {available}"
     )]
     TxOffsetOutOfRange {
-        session_id: SessionId,
+        session_id: u32,
         tx_offset: usize,
         available: usize,
     },
     #[error("session {session_id:?} TX FIFO has no {payload_len} bytes at offset {tx_offset}")]
     TxFifoRangeInvalid {
-        session_id: SessionId,
+        session_id: u32,
         tx_offset: usize,
         payload_len: usize,
     },
     #[error("session {session_id:?} RX accounting exceeds u32")]
-    RxLengthOverflow { session_id: SessionId },
+    RxLengthOverflow { session_id: u32 },
     #[error(
         "session {session_id:?} datagram payload length {payload_len} does not match header length {header_len}"
     )]
     DatagramLengthMismatch {
-        session_id: SessionId,
+        session_id: u32,
         payload_len: usize,
         header_len: u32,
     },
     #[error("session {session_id:?} datagram FIFO reservation failed")]
     DatagramFifo {
-        session_id: SessionId,
+        session_id: u32,
         #[source]
         source: FifoError,
     },
     #[error("session {session_id:?} accepted OOO delivery reported no retained span")]
-    OooSpanMissing { session_id: SessionId },
+    OooSpanMissing { session_id: u32 },
     #[error("session {session_id:?} accepted OOO delivery reported an invalid span")]
-    OooSpanInvalid { session_id: SessionId },
-    #[error("Session listener state is unavailable on this Data Worker")]
-    ListenerMainMissing,
+    OooSpanInvalid { session_id: u32 },
     #[error("Session has no data workers configured")]
     NoDataWorkers,
     #[error("Session listener {listener:?} is not registered")]
     ListenerMissing { listener: SessionHandle },
     #[error("Session listener control is owned by another thread")]
     ListenerControlWrongThread,
-    #[error("Session transport `{transport}` does not register listener operations")]
-    TransportListenUnsupported { transport: &'static str },
-    #[error("Session transport `{transport}` does not register active-open")]
-    TransportConnectUnsupported { transport: &'static str },
-    #[error("Session transport `{transport}` does not register stream active-open")]
-    TransportConnectStreamUnsupported { transport: &'static str },
+    #[error("Session transport does not register listener operations")]
+    TransportListenUnsupported,
+    #[error("Session transport does not register active-open")]
+    TransportConnectUnsupported,
+    #[error("Session transport does not register stream active-open")]
+    TransportConnectStreamUnsupported,
     #[error("Session transport operation failed")]
     TransportOpFailed {
         #[source]
@@ -185,7 +146,7 @@ pub enum SessionError {
     },
     #[error("Session {session_id:?} connect publication failed and its cleanup failed")]
     ConnectPublicationCleanup {
-        session_id: SessionId,
+        session_id: u32,
         #[source]
         publication: RuntimeError,
         cleanup: RuntimeError,
@@ -202,7 +163,6 @@ pub enum SessionError {
 impl From<SessionError> for SessionControlError {
     fn from(error: SessionError) -> Self {
         match error {
-            SessionError::ListenerMainMissing => Self::SessionMainUnavailable,
             SessionError::ListenerMissing { .. } => Self::ListenerMissing,
             SessionError::ListenerControlWrongThread => Self::ApplicationControlWrongThread,
             SessionError::TransportListenUnsupported { .. } => Self::TransportListenUnsupported,
@@ -218,6 +178,7 @@ impl From<SessionError> for SessionControlError {
             // concrete error stays in the source chain for diagnostics while
             // the wire reports the generic transport failure.
             SessionError::SessionMissing { .. }
+            | SessionError::SessionAppNotRegistered { .. }
             | SessionError::UpperSessionAlreadyAttached { .. }
             | SessionError::PublicationRejected { .. }
             | SessionError::RollbackRejected { .. }

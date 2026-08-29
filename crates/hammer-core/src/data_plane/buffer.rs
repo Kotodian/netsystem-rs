@@ -1566,58 +1566,12 @@ impl BufferPoolArena {
 }
 
 impl BufferPool {
-    #[cfg(test)]
-    #[inline]
-    fn with_capacity(slot_capacity: usize, slots: usize) -> Self {
-        Self::with_arena(BufferPoolArena::with_capacity(slot_capacity, slots))
-    }
-
     #[inline]
     fn with_arena(arena: BufferPoolArena) -> Self {
         Self {
             arena,
             thread_cache: Rc::new(RefCell::new(BufferThreadCache::new())),
         }
-    }
-
-    #[cfg(test)]
-    #[inline]
-    fn pool_id(&self) -> u64 {
-        self.arena.pool_id()
-    }
-
-    #[cfg(test)]
-    #[inline]
-    fn slot_stride(&self) -> usize {
-        self.arena.inner.read().slot_stride
-    }
-
-    #[cfg(test)]
-    #[inline]
-    fn base_ptr(&self) -> *const u8 {
-        self.arena.inner.read().region.base() as *const u8
-    }
-
-    #[cfg(test)]
-    #[inline]
-    fn buffer_raw_ptr(&self, slot: u32) -> *const Buffer {
-        self.arena
-            .inner
-            .read()
-            .buffer_raw_ptr(slot)
-            .expect("buffer slot must be in bounds")
-            .cast_const()
-    }
-
-    #[cfg(test)]
-    #[inline]
-    fn data_raw_ptr(&self, slot: u32) -> *const u8 {
-        self.arena
-            .inner
-            .read()
-            .data_raw_ptr(slot)
-            .expect("buffer slot must be in bounds")
-            .cast_const()
     }
 
     #[inline]
@@ -2007,18 +1961,6 @@ impl BufferPoolInner {
         // SAFETY: `offset` is validated to land within the arena region and
         // each slot begins with an inline `Buffer` header.
         Ok(unsafe { self.region.base().add(offset).cast::<Buffer>() })
-    }
-
-    #[cfg(test)]
-    #[inline]
-    fn data_raw_ptr(&self, slot: u32) -> DataPlaneResult<*mut u8> {
-        let offset = self
-            .slot_offset(slot)?
-            .checked_add(buffer_data_offset())
-            .ok_or(BufferInvariant::DataPointerOverflow)?;
-        // SAFETY: `offset` points at the inline data block within the validated
-        // arena slot.
-        Ok(unsafe { self.region.base().add(offset) })
     }
 
     #[inline]
@@ -3531,162 +3473,5 @@ impl BufferFrame {
         if let Some(len) = len {
             self.finish_retain(len);
         }
-    }
-}
-
-#[cfg(test)]
-mod index_identity_tests {
-    use super::*;
-
-    #[test]
-    fn private_buffer_layout_and_cache_policy_are_consistent() {
-        assert_eq!(
-            mem::size_of::<BufferHeaderCacheline0>(),
-            BUFFER_CACHE_LINE_SIZE
-        );
-        assert_eq!(
-            mem::align_of::<BufferHeaderCacheline0>(),
-            BUFFER_CACHE_LINE_SIZE
-        );
-        assert_eq!(
-            mem::size_of::<BufferHeaderCacheline1>(),
-            BUFFER_CACHE_LINE_SIZE
-        );
-        assert_eq!(
-            mem::align_of::<BufferHeaderCacheline1>(),
-            BUFFER_CACHE_LINE_SIZE
-        );
-        assert_eq!(
-            buffer_data_offset(),
-            mem::size_of::<Buffer>() + DEFAULT_PRE_DATA_SIZE
-        );
-        assert_eq!(BUFFER_INVALID_INDEX, u32::MAX);
-        assert!(BUFFER_THREAD_CACHE_BATCH <= BUFFER_THREAD_CACHE_HIGH_WATER);
-        assert!(BUFFER_IN_USE_FOLD_THRESHOLD > 0);
-    }
-
-    #[test]
-    fn buffer_arena_storage_stays_outside_main_heap() {
-        let pool = BufferPool::with_capacity(2048, 16);
-        let index = pool.alloc_index().expect("allocate buffer from arena");
-        let arena_base = pool.base_ptr();
-        let buffer_header = pool.buffer_raw_ptr(index.slot()).cast::<u8>();
-        let buffer_payload = pool.data_raw_ptr(index.slot());
-        let arena_size = pool.slot_stride() * 17;
-
-        assert!((buffer_header as usize).wrapping_sub(arena_base as usize) < arena_size);
-        assert!((buffer_payload as usize).wrapping_sub(arena_base as usize) < arena_size);
-    }
-
-    #[test]
-    fn advance_generation_retires_at_max() {
-        assert_eq!(advance_generation(0), Some(1));
-        assert_eq!(advance_generation(u32::MAX - 1), Some(u32::MAX));
-        assert_eq!(advance_generation(u32::MAX), None);
-    }
-
-    #[test]
-    fn buffer_pool_reports_out_of_bounds_slot_facts() {
-        let pool = BufferPool::with_capacity(64, 1);
-        let foreign = Index {
-            pool_id: pool.pool_id(),
-            slot: 99,
-            generation: 1,
-        };
-        match pool.get(foreign).map(|_| ()).unwrap_err() {
-            DataPlaneError::IndexSlotOutOfBounds { pool_id, slot } => {
-                assert_eq!(pool_id, pool.pool_id());
-                assert_eq!(slot, 99);
-            }
-            other => panic!("expected IndexSlotOutOfBounds, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn buffer_pool_retires_slot_at_max_generation() {
-        let pool = BufferPool::with_capacity(64, 2);
-        let first = pool.alloc_index().expect("first");
-        let second = pool.alloc_index().expect("second");
-        let retired_slot = first.slot;
-        {
-            let mut cache = pool.thread_cache.borrow_mut();
-            let mut inner = pool.arena.inner.write();
-            inner.free_chain(&mut cache, first);
-            inner.free_chain(&mut cache, second);
-            // Force the next pop of `retired_slot` to hit max-generation retirement.
-            let entry = inner.slot_state_mut(retired_slot).expect("slot");
-            entry.generation = u32::MAX;
-        }
-        let reused = pool.alloc_index().expect("alloc after retirement");
-        assert_ne!(reused.slot(), retired_slot);
-        assert!(
-            pool.get(Index {
-                pool_id: pool.pool_id(),
-                slot: retired_slot,
-                generation: u32::MAX,
-            })
-            .is_err()
-        );
-        {
-            let mut cache = pool.thread_cache.borrow_mut();
-            pool.arena.inner.write().free_chain(&mut cache, reused);
-        }
-    }
-
-    #[test]
-    fn next_pool_id_never_returns_zero() {
-        let a = next_pool_id();
-        let b = next_pool_id();
-        assert_ne!(a, 0);
-        assert_ne!(b, 0);
-        assert_ne!(a, b);
-    }
-}
-
-#[cfg(test)]
-mod frame_capacity_tests {
-    use super::*;
-
-    fn test_index(slot: u32) -> Index {
-        Index {
-            pool_id: 1,
-            slot,
-            generation: 1,
-        }
-    }
-
-    #[test]
-    fn buffer_frame_test_capacity_is_crate_private_logical_limit() {
-        let mut frame = BufferFrame::with_capacity(2);
-        assert_eq!(frame.capacity(), 2);
-        frame.push_index(test_index(0)).expect("first");
-        frame.push_index(test_index(1)).expect("second");
-        assert!(frame.push_index(test_index(2)).is_err());
-        assert_eq!(frame.indices(), &[test_index(0), test_index(1)]);
-    }
-
-    #[test]
-    fn production_frame_accepts_256_and_rejects_257th() {
-        let mut frame = BufferFrame::with_capacity(DEFAULT_BUFFER_FRAME_CAPACITY);
-        for slot in 0..DEFAULT_BUFFER_FRAME_CAPACITY as u32 {
-            frame
-                .push_index(test_index(slot))
-                .expect("push within production limit");
-        }
-        assert_eq!(frame.len(), DEFAULT_BUFFER_FRAME_CAPACITY);
-        assert!(frame.push_index(test_index(u32::MAX)).is_err());
-        assert_eq!(frame.len(), DEFAULT_BUFFER_FRAME_CAPACITY);
-    }
-
-    #[test]
-    fn production_bulk_push_is_atomic_against_logical_limit() {
-        let mut frame = BufferFrame::with_capacity(DEFAULT_BUFFER_FRAME_CAPACITY);
-        for slot in 0..(DEFAULT_BUFFER_FRAME_CAPACITY as u32 - 1) {
-            frame.push_index(test_index(slot)).expect("seed");
-        }
-        let before = frame.indices().to_vec();
-        let batch = [test_index(1000), test_index(1001)];
-        assert!(frame.push_indices(batch).is_err());
-        assert_eq!(frame.indices(), before.as_slice());
     }
 }

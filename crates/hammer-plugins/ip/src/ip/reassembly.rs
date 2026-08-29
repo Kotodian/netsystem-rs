@@ -260,7 +260,7 @@ pub(crate) enum IpReassemblyError {
     #[error("IP fragments have no zero-offset first fragment")]
     FirstFragmentMissing,
     #[error("reassembled IP packet carries unsupported transport protocol {protocol}")]
-    UnsupportedTransportProtocol { protocol: u8 },
+    Unsupportedu8 { protocol: u8 },
 }
 
 #[hammer_component_macros::init_function(
@@ -521,10 +521,9 @@ impl IpReassemblyWorker {
                     Self::emit_local(runtime, out_frame, nexts, out_len, drop_next, index)?;
                     return Ok(());
                 }
-                let ctx_index = self
-                    .contexts
-                    .insert(FragmentContext::new(key, fragment.version, now))
-                    .ok_or(IpReassemblyError::ContextPoolExhausted)?;
+                let ctx_index =
+                    self.contexts
+                        .insert(FragmentContext::new(key, fragment.version, now));
                 if let Some(directory) = directory {
                     let (owner, created) =
                         directory.claim_or_lookup(key, ctx_index, current_worker);
@@ -1026,7 +1025,7 @@ fn refresh_metadata(runtime: &DataPlaneRuntime, index: Index) -> RuntimeResult<(
                 IpProtocol::Udp => 17,
                 IpProtocol::Icmpv6 => 58,
             };
-            Err(IpReassemblyError::UnsupportedTransportProtocol { protocol }.into())
+            Err(IpReassemblyError::Unsupportedu8 { protocol }.into())
         }
     }
 }

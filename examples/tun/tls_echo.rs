@@ -12,8 +12,8 @@ use std::path::PathBuf;
 use clap::Parser;
 use hammer_app::attach::{AppClient, AppClientError};
 use hammer_app::echo::run_echo_loop;
-use hammer_app::{AppSession, AppSessionError, DataWorkerId, SessionAppId, SessionListenEndpoint};
-use hammer_runtime::app::{SessionEvtType, TransportProtocol};
+use hammer_app::{AppSession, AppSessionError, DataWorkerId, SessionListenEndpoint};
+use hammer_runtime::app::SessionEvtType;
 use hammer_service::binary_api::{BinaryApiClient, BinaryApiError};
 use prost::Message;
 
@@ -92,6 +92,8 @@ struct Arguments {
     private_key_der: PathBuf,
     #[arg(long, default_value = "1")]
     connections: NonZeroUsize,
+    #[arg(long)]
+    transport: u8,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -160,16 +162,16 @@ fn main() -> Result<(), EchoError> {
     let mut binary_api = BinaryApiClient::connect(&arguments.binary_api_socket)?;
     let config = register_server_config(
         &mut binary_api,
-        application.application().raw(),
+        u64::from(application.application()),
         certificate_der,
         private_key_der,
     )?;
     eprintln!("registered TLS server configuration {config}");
 
     let listener = application.listen(
-        TransportProtocol::Tcp,
+        arguments.transport,
         SessionListenEndpoint::new(arguments.listen, DataWorkerId::new(0)),
-        Some(SessionAppId::new(0)),
+        Some(0),
         Some(config),
     )?;
     eprintln!(
@@ -189,7 +191,11 @@ fn main() -> Result<(), EchoError> {
     }
 
     application.unlisten(listener)?;
-    remove_config(&mut binary_api, application.application().raw(), config)?;
+    remove_config(
+        &mut binary_api,
+        u64::from(application.application()),
+        config,
+    )?;
     eprintln!("removed TLS server configuration {config}");
     Ok(())
 }
@@ -261,7 +267,7 @@ async fn run_echo(session: &AppSession) -> Result<(), EchoError> {
     let mut buffer = vec![0; ECHO_BUFFER_BYTES];
     loop {
         let event = session.next_event().await?;
-        if event.session_index() != session.session_index() {
+        if event.session_index != session.session_index() {
             continue;
         }
         match event.evt_type {

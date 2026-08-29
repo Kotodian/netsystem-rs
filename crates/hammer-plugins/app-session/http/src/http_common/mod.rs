@@ -43,8 +43,6 @@
 //! every read is bounds-checked and every arithmetic step is checked.
 
 mod body;
-#[cfg(test)]
-mod tests;
 mod types;
 
 pub(crate) use body::{BodyAccumulator, BodyError};

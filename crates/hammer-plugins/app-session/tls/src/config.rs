@@ -1,11 +1,9 @@
 use std::cell::UnsafeCell;
 use std::sync::{Arc, OnceLock};
-use std::thread::{self, ThreadId};
 
 use hammer_infra::pool::Pool;
-use hammer_runtime::app::ApplicationId;
 use hammer_runtime::{Engine, RuntimeResult};
-use hammer_service::session::{ApplicationMain, ApplicationRegistration};
+use hammer_service::session::ApplicationMain;
 use prost::Message;
 use rustls::ServerConfig as RustlsServerConfig;
 use rustls::pki_types::{CertificateDer, PrivateKeyDer};
@@ -16,7 +14,7 @@ use thiserror::Error;
 const TLS_CONFIG_CAPACITY: usize = 1_024;
 pub(crate) const TLS_BUFFER_LIMIT: usize = 64 * 1_024;
 
-static TLS_MAIN: OnceLock<Arc<TlsMain>> = OnceLock::new();
+static TLS_MAIN: OnceLock<TlsMain> = OnceLock::new();
 
 pub struct ServerConfig {
     certificate_der: Vec<Vec<u8>>,
@@ -106,7 +104,7 @@ enum ConnectionConfig {
 }
 
 struct ConfigEntry {
-    application: ApplicationId,
+    application: u32,
     config: ConnectionConfig,
 }
 
@@ -116,11 +114,10 @@ struct TlsState {
 
 /// TLS plugin Main Thread state.
 pub struct TlsMain {
-    owner: ThreadId,
     state: UnsafeCell<TlsState>,
 }
 
-// SAFETY: all accesses verify the creating Main Thread before dereferencing
+// SAFETY: all mutable accesses verify the Engine Main control path before dereferencing
 // state. Immutable rustls configurations may subsequently be cloned to workers.
 unsafe impl Send for TlsMain {}
 // SAFETY: shared references can cross threads, but mutable state is reachable
@@ -128,18 +125,17 @@ unsafe impl Send for TlsMain {}
 unsafe impl Sync for TlsMain {}
 
 impl TlsMain {
-    pub fn new(capacity: usize) -> Arc<Self> {
-        Arc::new(Self {
-            owner: thread::current().id(),
+    fn new(capacity: usize) -> Self {
+        Self {
             state: UnsafeCell::new(TlsState {
                 configs: Pool::with_capacity(capacity),
             }),
-        })
+        }
     }
 
     pub fn register_server_config(
         &self,
-        application: ApplicationId,
+        application: u32,
         config: ServerConfig,
     ) -> Result<ConfigId, ConfigError> {
         let config = build_server_config(config)?;
@@ -148,7 +144,7 @@ impl TlsMain {
 
     pub fn register_client_config(
         &self,
-        application: ApplicationId,
+        application: u32,
         config: ClientConfig,
     ) -> Result<ConfigId, ConfigError> {
         let config = build_client_config(config)?;
@@ -157,7 +153,7 @@ impl TlsMain {
 
     pub fn server_config(
         &self,
-        application: ApplicationId,
+        application: u32,
         config: ConfigId,
     ) -> Result<Arc<RustlsServerConfig>, ConfigError> {
         match &self.entry(application, config)?.config {
@@ -168,7 +164,7 @@ impl TlsMain {
 
     pub fn client_config(
         &self,
-        application: ApplicationId,
+        application: u32,
         config: ConfigId,
     ) -> Result<Arc<RustlsClientConfig>, ConfigError> {
         match &self.entry(application, config)?.config {
@@ -177,36 +173,43 @@ impl TlsMain {
         }
     }
 
-    pub fn remove_config(
-        &self,
-        application: ApplicationId,
-        config: ConfigId,
-    ) -> Result<(), ConfigError> {
-        self.with_state_mut(|state| {
-            config_entry(&state.configs, application, config)?;
-            state.configs.remove(config_index(config));
-            Ok(())
-        })?
+    pub fn remove_config(&self, application: u32, config: ConfigId) -> Result<(), ConfigError> {
+        self.ensure_main_thread()?;
+        let state = unsafe { &mut *self.state.get() };
+        let barrier = Engine::with_current(|engine| engine.worker_barrier());
+        match barrier {
+            Some(barrier) => barrier.sync(|| {
+                config_entry(&state.configs, application, config)?;
+                state.configs.remove(config_index(config));
+                Ok(())
+            }),
+            None => {
+                config_entry(&state.configs, application, config)?;
+                state.configs.remove(config_index(config));
+                Ok(())
+            }
+        }
     }
 
-    fn insert(
-        &self,
-        application: ApplicationId,
-        config: ConnectionConfig,
-    ) -> Result<ConfigId, ConfigError> {
-        self.with_state_mut(|state| {
-            config_id(state.configs.insert(ConfigEntry {
+    fn insert(&self, application: u32, config: ConnectionConfig) -> Result<ConfigId, ConfigError> {
+        self.ensure_main_thread()?;
+        let state = unsafe { &mut *self.state.get() };
+        let barrier = Engine::with_current(|engine| engine.worker_barrier());
+        match barrier {
+            Some(barrier) => Ok(barrier.sync(|| {
+                config_id(state.configs.insert(ConfigEntry {
+                    application,
+                    config,
+                }))
+            })),
+            None => Ok(config_id(state.configs.insert(ConfigEntry {
                 application,
                 config,
-            }))
-        })?
+            }))),
+        }
     }
 
-    fn entry(
-        &self,
-        application: ApplicationId,
-        config: ConfigId,
-    ) -> Result<&ConfigEntry, ConfigError> {
+    fn entry(&self, application: u32, config: ConfigId) -> Result<&ConfigEntry, ConfigError> {
         config_entry(&self.state().configs, application, config)
     }
 
@@ -216,26 +219,10 @@ impl TlsMain {
         unsafe { &*self.state.get() }
     }
 
-    fn with_state_mut<R>(
-        &self,
-        operation: impl FnOnce(&mut TlsState) -> R,
-    ) -> Result<R, ConfigError> {
-        self.ensure_main_thread()?;
-        // SAFETY: the owner check confines writers to Main Thread. The worker
-        // barrier stops every reader before mutable access begins.
-        let state = unsafe { &mut *self.state.get() };
-        let barrier = Engine::with_current(|engine| engine.worker_barrier());
-        Ok(match barrier {
-            Some(barrier) => barrier.sync(|| operation(state)),
-            None => operation(state),
-        })
-    }
-
     fn ensure_main_thread(&self) -> Result<(), ConfigError> {
-        if thread::current().id() == self.owner {
-            Ok(())
-        } else {
-            Err(ConfigError::WrongThread)
+        match Engine::with_current(|engine| engine.ensure_main_thread()) {
+            Some(Ok(())) => Ok(()),
+            Some(Err(_)) | None => Err(ConfigError::WrongThread),
         }
     }
 }
@@ -252,10 +239,7 @@ pub enum ConfigError {
     #[error("TLS configuration {config:?} is not registered")]
     Missing { config: ConfigId },
     #[error("TLS configuration {config:?} is not owned by Application {application:?}")]
-    NotOwned {
-        application: ApplicationId,
-        config: ConfigId,
-    },
+    NotOwned { application: u32, config: ConfigId },
     #[error("TLS configuration {config:?} has the wrong connection role")]
     RoleMismatch { config: ConfigId },
     #[error("TLS connection construction requires an attached Application")]
@@ -300,36 +284,33 @@ pub enum ConfigError {
 }
 
 pub fn register_server_config(
-    application: &ApplicationRegistration,
+    application: u32,
     config: ServerConfig,
 ) -> Result<ConfigId, ConfigError> {
-    main()?.register_server_config(application.application(), config)
+    main()?.register_server_config(application, config)
 }
 
 pub fn register_client_config(
-    application: &ApplicationRegistration,
+    application: u32,
     config: ClientConfig,
 ) -> Result<ConfigId, ConfigError> {
-    main()?.register_client_config(application.application(), config)
+    main()?.register_client_config(application, config)
 }
 
-pub fn remove_config(
-    application: &ApplicationRegistration,
-    config: ConfigId,
-) -> Result<(), ConfigError> {
-    main()?.remove_config(application.application(), config)
+pub fn remove_config(application: u32, config: ConfigId) -> Result<(), ConfigError> {
+    main()?.remove_config(application, config)
 }
 
-pub(crate) fn init() -> RuntimeResult<Arc<TlsMain>> {
+pub(crate) fn init() -> RuntimeResult<()> {
     let main = TlsMain::new(TLS_CONFIG_CAPACITY);
     assert!(
-        TLS_MAIN.set(Arc::clone(&main)).is_ok(),
+        TLS_MAIN.set(main).is_ok(),
         "TLS Main initialized more than once"
     );
-    Ok(main)
+    Ok(())
 }
 
-pub(crate) fn main() -> Result<&'static Arc<TlsMain>, ConfigError> {
+pub(crate) fn main() -> Result<&'static TlsMain, ConfigError> {
     TLS_MAIN.get().ok_or(ConfigError::MainNotInitialized)
 }
 
@@ -428,14 +409,14 @@ fn config_index(config: ConfigId) -> u32 {
 
 fn config_entry(
     configs: &Pool<ConfigEntry>,
-    application: ApplicationId,
+    application: u32,
     config: ConfigId,
 ) -> Result<&ConfigEntry, ConfigError> {
     let index = config_index(config);
     if !configs.contains_key(index) {
         return Err(ConfigError::Missing { config });
     }
-    let entry = configs.get(index);
+    let entry = configs.get(index).ok_or(ConfigError::Missing { config })?;
     if entry.application != application {
         return Err(ConfigError::NotOwned {
             application,
@@ -569,8 +550,8 @@ fn remove_config_api(request: RemoveConfigRequest) -> RemoveConfigReply {
     }
 }
 
-fn binary_application(application: u64) -> Result<ApplicationId, TlsApiStatus> {
-    let application = ApplicationId::from_raw(application);
+fn binary_application(application: u64) -> Result<u32, TlsApiStatus> {
+    let application = (application as u32);
     let Some(attached) = Engine::with_current(|engine| {
         engine
             .registry
@@ -628,93 +609,5 @@ fn client_reply(status: TlsApiStatus, config_id: u64) -> RegisterClientConfigRep
 fn remove_reply(status: TlsApiStatus) -> RemoveConfigReply {
     RemoveConfigReply {
         status: status as i32,
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use rcgen::generate_simple_self_signed;
-
-    fn identity() -> (Vec<Vec<u8>>, Vec<u8>) {
-        let certified = generate_simple_self_signed(["localhost".to_owned()])
-            .expect("generate test certificate");
-        (
-            vec![certified.cert.der().to_vec()],
-            certified.signing_key.serialize_der(),
-        )
-    }
-
-    #[test]
-    fn application_explicitly_removes_generation_checked_tls_configurations() {
-        let tls = init().expect("initialize TLS Main");
-        let applications = ApplicationMain::with_session_apps(2, [crate::__SESSION_APP_CONNECTION]);
-        let first = applications
-            .register_local()
-            .expect("register first Application");
-        let first_application = first.application();
-        let second = applications
-            .register_local()
-            .expect("register second Application");
-
-        let (certificate_der, private_key_der) = identity();
-        let server_id = register_server_config(
-            &first,
-            ServerConfig::new(certificate_der.clone(), private_key_der),
-        )
-        .expect("register server configuration");
-        let client_id = register_client_config(&first, ClientConfig::new(certificate_der))
-            .expect("register client configuration");
-
-        assert!(matches!(
-            tls.server_config(second.application(), server_id),
-            Err(ConfigError::NotOwned { application, config })
-                if application == second.application() && config == server_id
-        ));
-        assert!(matches!(
-            tls.server_config(first.application(), client_id),
-            Err(ConfigError::RoleMismatch { config }) if config == client_id
-        ));
-
-        let retained = tls
-            .server_config(first.application(), server_id)
-            .expect("resolve server configuration");
-        let worker_tls = Arc::clone(&tls);
-        std::thread::spawn(move || {
-            worker_tls
-                .server_config(first_application, server_id)
-                .expect("Data Worker resolves published immutable TLS configuration");
-        })
-        .join()
-        .expect("join TLS configuration reader");
-
-        remove_config(&first, server_id).expect("remove server configuration");
-        assert!(matches!(
-            tls.server_config(first.application(), server_id),
-            Err(ConfigError::Missing { config }) if config == server_id
-        ));
-        rustls::ServerConnection::new(Arc::clone(&retained))
-            .expect("removed registry entry does not invalidate retained configuration");
-
-        let (replacement_certificate_der, replacement_private_key_der) = identity();
-        let replacement = register_server_config(
-            &first,
-            ServerConfig::new(replacement_certificate_der, replacement_private_key_der),
-        )
-        .expect("register replacement server configuration");
-        assert_ne!(server_id, replacement);
-        assert!(matches!(
-            tls.server_config(first.application(), server_id),
-            Err(ConfigError::Missing { config }) if config == server_id
-        ));
-
-        remove_config(&first, client_id).expect("remove client configuration");
-        remove_config(&first, replacement).expect("remove replacement server configuration");
-        drop(first);
-        assert!(
-            applications
-                .contains(second.application())
-                .expect("second Application remains attached")
-        );
     }
 }

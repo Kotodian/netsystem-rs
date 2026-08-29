@@ -10,8 +10,8 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::Notify;
 
 use crate::app::{
-    AppSession, ApplicationId, SessionAcceptedMsg, SessionConnectedMsg, SessionControlPayload,
-    SessionMsgQueue, SessionMsgQueueError, SessionOffsets, SessionProducer, SingleProducer,
+    AppSession, SessionAcceptedMsg, SessionConnectedMsg, SessionControlPayload, SessionMsgQueue,
+    SessionMsgQueueError, SessionOffsets, SessionProducer, SingleProducer,
 };
 use crate::{AttachError, RuntimeError, RuntimeResult};
 
@@ -34,14 +34,14 @@ pub const ATTACH_REPLY_BYTES: usize = ATTACH_REPLY_WORDS * size_of::<u64>();
 pub const ATTACH_STATUS_ACCEPTED: u64 = 0;
 pub const ATTACH_STATUS_REJECTED: u64 = 1;
 pub const ATTACH_DESCRIPTOR_COUNT: usize = 2;
-pub const ATTACH_METADATA_WORDS: usize = 6;
+pub const ATTACH_METADATA_WORDS: usize = 7;
 pub const ATTACH_METADATA_BYTES: usize = ATTACH_METADATA_WORDS * size_of::<u64>();
 pub const MAX_ATTACH_DESCRIPTORS: usize = 128;
 
 #[derive(Clone)]
 pub struct AppSessionPublication {
     session: Arc<AppSession>,
-    application: ApplicationId,
+    application: u32,
     session_segment: Segment,
     offsets: SessionOffsets,
     connected: Option<SessionConnectedMsg>,
@@ -52,7 +52,7 @@ pub struct AppSessionPublication {
 impl AppSessionPublication {
     pub fn new(
         session: Arc<AppSession>,
-        application: ApplicationId,
+        application: u32,
         session_segment: Segment,
         offsets: SessionOffsets,
     ) -> RuntimeResult<Self> {
@@ -100,7 +100,7 @@ impl AppSessionPublication {
 enum AppPublication {
     Session(AppSessionPublication),
     ConnectFailed {
-        application: ApplicationId,
+        application: u32,
         message: SessionConnectedMsg,
     },
 }
@@ -138,7 +138,7 @@ impl AppSessionPublisher {
     /// publication queue. No Session descriptors are sent.
     pub fn try_publish_connect_failure(
         &self,
-        application: ApplicationId,
+        application: u32,
         reply: SessionConnectedMsg,
     ) -> RuntimeResult<()> {
         let queue = self
@@ -202,14 +202,14 @@ impl AppServer {
         application_detached: Detached,
     ) -> RuntimeResult<()>
     where
-        Attach: Fn() -> Result<ApplicationId, ApplicationError>,
-        Mq: Fn(ApplicationId) -> Result<ApplicationMqPublication, ApplicationError>,
+        Attach: Fn() -> Result<u32, ApplicationError>,
+        Mq: Fn(u32) -> Result<ApplicationMqPublication, ApplicationError>,
         Control: Fn(
-            ApplicationId,
+            u32,
             &mut SessionMsgQueue<SingleProducer>,
             &mut SessionProducer,
         ) -> RuntimeResult<()>,
-        Detached: Fn(ApplicationId),
+        Detached: Fn(u32),
         ApplicationError: std::fmt::Display,
     {
         let listener = self
@@ -222,8 +222,8 @@ impl AppServer {
             tokio::sync::mpsc::channel::<RuntimeResult<tokio::net::UnixStream>>(self.capacity);
         let (detached_tx, mut detached_rx) = tokio::sync::mpsc::channel(self.capacity);
         let (control_tx, mut control_rx) = tokio::sync::mpsc::channel(self.capacity);
-        let mut clients = HashMap::<ApplicationId, AttachedApplication>::new();
-        let mut publications = HashMap::<ApplicationId, VecDeque<AppPublication>>::new();
+        let mut clients = HashMap::<u32, AttachedApplication>::new();
+        let mut publications = HashMap::<u32, VecDeque<AppPublication>>::new();
         let mut retry_tick = tokio::time::interval(Duration::from_millis(1));
         retry_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
@@ -524,12 +524,12 @@ impl AppServer {
 async fn send_attach_reply(
     client: &mut tokio::net::UnixStream,
     status: u64,
-    application: Option<ApplicationId>,
+    application: Option<u32>,
 ) -> RuntimeResult<()> {
     let words = [
         ATTACH_PROTOCOL_VERSION,
         status,
-        application.map_or(0, |application| u64::from(application.raw())),
+        application.map_or(0, |application| application.into()),
     ];
     let mut reply = [0_u8; ATTACH_REPLY_BYTES];
     for (chunk, word) in reply.chunks_exact_mut(size_of::<u64>()).zip(words) {
@@ -567,7 +567,8 @@ async fn send_publication(
                 ];
                 let words = [
                     ATTACH_PROTOCOL_VERSION,
-                    current.session.session_handle().raw(),
+                    current.session.session_handle().session_index as u64,
+                    current.session.session_handle().thread_index as u64,
                     current.session_segment.size() as u64,
                     current.offsets.rx_fifo_off,
                     current.offsets.tx_fifo_off,
