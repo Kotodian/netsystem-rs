@@ -12,14 +12,15 @@ use hammer_runtime::{
     DataPlaneRuntime, DataWorkerId, Engine, NodeRuntimeData, RuntimeError, RuntimeResult,
     SessionConnectEndpoint, SessionListenEndpoint, with_data_plane_runtime,
 };
+use hammer_service::session::SessionQueueNext;
 use hammer_service::session::node::{SessionQueueNode, SessionQueueOutput};
 use hammer_service::session::runtime::{
-    SessionDgramArgs, SessionMain, SessionMigrateResult, SessionSwitchPoolArgs,
-    SessionSwitchPoolClosed, SessionSwitchPoolCompletion, SessionSwitchPoolCompletionStatus,
-    SessionSwitchPoolReply, SessionSwitchPoolStatus, SessionTransport, SessionWorker,
-    TransportInternalTransport, TransportInternalTx, dispatch_session_queue_events,
+    SessionDgramArgs, SessionMigrateResult, SessionSwitchPoolArgs, SessionSwitchPoolClosed,
+    SessionSwitchPoolCompletion, SessionSwitchPoolCompletionStatus, SessionSwitchPoolReply,
+    SessionSwitchPoolStatus, SessionTransport, SessionWorker, TransportInternalTransport,
+    TransportInternalTx, dispatch_session_queue_events, session_main,
 };
-use hammer_service::session::{SessionQueueNext, u32};
+use hammer_service::transport::{TransportVft, register_transport};
 
 use crate::UdpIpVersion;
 use crate::connection::{UdpConnection, UdpListener};
@@ -106,22 +107,26 @@ unsafe impl Send for UdpListenerCell {}
 unsafe impl Sync for UdpListenerCell {}
 
 pub struct UdpMain {
+    protocol: u8,
     listeners: Arc<UdpListenerCell>,
-    sessions: Arc<SessionMain>,
     workers: Box<[CacheLine<ThreadOwned<UdpWorker>>]>,
 }
 
 impl UdpMain {
-    fn new(worker_count: usize, sessions: Arc<SessionMain>) -> Self {
+    fn new(protocol: u8, worker_count: usize) -> Self {
         let workers = (0..worker_count)
             .map(|_| CacheLine::new(ThreadOwned::new()))
             .collect::<Vec<_>>()
             .into_boxed_slice();
         Self {
+            protocol,
             listeners: Arc::new(UdpListenerCell::new()),
-            sessions,
             workers,
         }
+    }
+
+    pub const fn protocol(&self) -> u8 {
+        self.protocol
     }
 
     fn worker(&self, worker: DataWorkerId) -> RuntimeResult<&ThreadOwned<UdpWorker>> {
@@ -139,16 +144,12 @@ impl UdpMain {
     fn with_worker<R>(
         &self,
         runtime: &DataPlaneRuntime,
-        operation: impl FnOnce(&mut SessionWorker<u32>, &mut UdpWorker) -> RuntimeResult<R>,
+        operation: impl FnOnce(&mut SessionWorker, &mut UdpWorker) -> RuntimeResult<R>,
     ) -> RuntimeResult<R> {
-        self.sessions.with_worker_mut(runtime, |sessions| {
-            let worker = runtime
-                .thread_index()
-                .checked_sub(1)
-                .map(DataWorkerId::new)
-                .ok_or(UdpTransportError::WorkerUnavailable {
-                    thread_index: runtime.thread_index(),
-                })?;
+        session_main().with_worker_mut(runtime, |sessions| {
+            let thread_index = runtime.thread_index();
+            let worker = DataWorkerId::try_from(thread_index)
+                .map_err(|_| UdpTransportError::WorkerUnavailable { thread_index })?;
             self.worker(worker)?
                 .with_mut(|udp| operation(sessions, udp))
                 .map_err(|source| UdpTransportError::WorkerAccess {
@@ -187,15 +188,17 @@ impl UdpMain {
     }
 }
 
-pub(crate) static UDP_MAIN: OnceLock<Arc<UdpMain>> = OnceLock::new();
+pub(crate) static UDP_MAIN: OnceLock<UdpMain> = OnceLock::new();
 
-#[hammer_component_macros::session_transport(
-    name = "udp",
-    start_listen = crate::worker::start_listen,
-    stop_listen = crate::worker::stop_listen,
-    connect = crate::worker::connect
-)]
+pub fn protocol() -> RuntimeResult<u8> {
+    UDP_MAIN
+        .get()
+        .map(UdpMain::protocol)
+        .ok_or(RuntimeError::PluginStateNotInitialized { plugin: "udp" })
+}
+
 pub struct UdpWorker {
+    protocol: u8,
     worker: DataWorkerId,
     connections: Pool<UdpConnection>,
     lookup: UdpLookup,
@@ -205,8 +208,9 @@ pub struct UdpWorker {
 }
 
 impl UdpWorker {
-    pub(crate) fn new(worker: DataWorkerId) -> Self {
+    pub(crate) fn new(worker: DataWorkerId, protocol: u8) -> Self {
         Self {
+            protocol,
             worker,
             connections: Pool::with_capacity(UDP_CONNECTION_CAPACITY),
             lookup: UdpLookup::new(),
@@ -234,7 +238,7 @@ impl UdpWorker {
 
     fn accept_datagram(
         &mut self,
-        sessions: &mut SessionWorker<u32>,
+        sessions: &mut SessionWorker,
         listener: UdpListener,
         local: SocketAddr,
         remote: SocketAddr,
@@ -243,7 +247,7 @@ impl UdpWorker {
             .ok_or(UdpTransportError::InvalidConnection)?;
         let index = self.insert_connection(connection)?;
         let session_id =
-            match sessions.stream_accept(UdpWorker::ID, index, listener.session_listener()) {
+            match sessions.stream_accept(self.protocol, index, listener.session_listener()) {
                 Ok(session_id) => session_id,
                 Err(error) => {
                     self.remove_connection(index);
@@ -258,11 +262,11 @@ impl UdpWorker {
             return Err(UdpTransportError::InvalidConnection.into());
         }
         self.lookup.insert_tuple(index, local, remote);
-        if !sessions.insert_session_endpoint(session_id, UdpWorker::ID, local, remote)? {
+        if !sessions.insert_session_endpoint(session_id, self.protocol, local, remote)? {
             self.rollback_accept(sessions, session_id, index, local, remote)?;
             return Err(UdpTransportError::EndpointInUse { endpoint: local }.into());
         }
-        let rollback = |sessions: &mut SessionWorker<u32>,
+        let rollback = |sessions: &mut SessionWorker,
                         udp: &mut UdpWorker,
                         session_id,
                         index,
@@ -285,7 +289,7 @@ impl UdpWorker {
 
     fn active_connect(
         &mut self,
-        sessions: &mut SessionWorker<u32>,
+        sessions: &mut SessionWorker,
         connection: u32,
         local: SocketAddr,
         remote: SocketAddr,
@@ -301,7 +305,7 @@ impl UdpWorker {
         let connection_state = UdpConnection::connected(self.worker, local, remote)
             .ok_or(UdpTransportError::InvalidConnection)?;
         let index = self.insert_connection(connection_state)?;
-        let session_id = match sessions.stream_connect_pending(UdpWorker::ID, index, connection) {
+        let session_id = match sessions.stream_connect_pending(self.protocol, index, connection) {
             Ok(session_id) => session_id,
             Err(error) => {
                 self.remove_connection(index);
@@ -316,7 +320,7 @@ impl UdpWorker {
             return Err(UdpTransportError::InvalidConnection.into());
         }
         self.lookup.insert_tuple(index, local, remote);
-        if !sessions.insert_session_endpoint(session_id, UdpWorker::ID, local, remote)? {
+        if !sessions.insert_session_endpoint(session_id, self.protocol, local, remote)? {
             self.rollback_accept(sessions, session_id, index, local, remote)?;
             return Err(UdpTransportError::EndpointInUse { endpoint: local }.into());
         }
@@ -337,14 +341,14 @@ impl UdpWorker {
 
     fn rollback_accept(
         &mut self,
-        sessions: &mut SessionWorker<u32>,
+        sessions: &mut SessionWorker,
         session_id: u32,
         index: u32,
         local: SocketAddr,
         remote: SocketAddr,
     ) -> RuntimeResult<()> {
         self.lookup.remove_tuple(local, remote);
-        let _ = sessions.remove_session_endpoint(UdpWorker::ID, local, remote)?;
+        let _ = sessions.remove_session_endpoint(self.protocol, local, remote)?;
         self.remove_connection(index);
         sessions.rollback_session_creation(session_id)?;
         Ok(())
@@ -352,7 +356,7 @@ impl UdpWorker {
 
     fn deliver_datagram(
         &mut self,
-        sessions: &mut SessionWorker<u32>,
+        sessions: &mut SessionWorker,
         runtime: &DataPlaneRuntime,
         index: BufferIndex,
         local: SocketAddr,
@@ -363,9 +367,9 @@ impl UdpWorker {
         listener: Option<UdpListener>,
         return_node: NodeId,
     ) -> RuntimeResult<UdpDelivery> {
-        let endpoint = sessions.lookup_session_endpoint(UdpWorker::ID, local, remote)?;
+        let endpoint = sessions.lookup_session_endpoint(self.protocol, local, remote)?;
         if let Some(connection_index) = self.lookup.find_tuple(&self.connections, local, remote) {
-            if endpoint.is_some_and(|handle| handle.thread_index != self.worker.slot() as u32) {
+            if endpoint.is_some_and(|handle| handle.thread_index != self.worker.thread_index()) {
                 return Ok(UdpDelivery::WrongWorker);
             }
             let session_id = self
@@ -389,13 +393,13 @@ impl UdpWorker {
                 UdpDelivery::Delivered
             });
         }
-        if let Some(handle) = sessions.lookup_session_endpoint(UdpWorker::ID, local, remote)? {
-            if handle.thread_index != self.worker.slot() as u32 {
+        if let Some(handle) = sessions.lookup_session_endpoint(self.protocol, local, remote)? {
+            if handle.thread_index != self.worker.thread_index() {
                 let result = sessions.program_thread_migration(
                     runtime,
                     self.worker,
                     handle,
-                    (UdpWorker::ID, local, remote),
+                    (self.protocol, local, remote),
                     SessionDgramArgs {
                         index,
                         payload_offset,
@@ -437,18 +441,17 @@ impl UdpWorker {
 
     fn migration_request_is_current(
         &self,
-        sessions: &SessionWorker<u32>,
+        sessions: &SessionWorker,
         args: &SessionSwitchPoolArgs,
     ) -> bool {
         let Some(session_id) = sessions.session_id_from_handle(args.old_sh) else {
             return false;
         };
-        let Some((transport, index)) = sessions.session_transport(session_id) else {
+        let Some(index) = sessions.transport_connection_index(session_id) else {
             return false;
         };
         let (tuple_transport, local, remote) = args.tuple;
-        transport == tuple_transport
-            && transport == UdpWorker::ID
+        tuple_transport == self.protocol
             && self.lookup.find_tuple(&self.connections, local, remote) == Some(index)
             && self
                 .connection(index)
@@ -457,7 +460,7 @@ impl UdpWorker {
 
     fn rejected_migration_reply(
         &self,
-        sessions: &SessionWorker<u32>,
+        sessions: &SessionWorker,
         mut reply: SessionSwitchPoolReply,
     ) -> SessionSwitchPoolReply {
         let _ = sessions.cancel_thread_migration(reply.old_sh, reply.tuple);
@@ -469,7 +472,7 @@ impl UdpWorker {
 
     fn prepared_migration_reply(
         &self,
-        sessions: &SessionWorker<u32>,
+        sessions: &SessionWorker,
         args: SessionSwitchPoolArgs,
     ) -> Option<SessionSwitchPoolReply> {
         let session_id = sessions.session_id_from_handle(args.old_sh)?;
@@ -488,7 +491,7 @@ impl UdpWorker {
 
     fn publish_migration_reply(
         &mut self,
-        sessions: &SessionWorker<u32>,
+        sessions: &SessionWorker,
         runtime: &DataPlaneRuntime,
         reply: SessionSwitchPoolReply,
     ) {
@@ -499,7 +502,7 @@ impl UdpWorker {
 
     fn publish_migration_completion(
         &mut self,
-        sessions: &SessionWorker<u32>,
+        sessions: &SessionWorker,
         runtime: &DataPlaneRuntime,
         completion: SessionSwitchPoolCompletion,
     ) {
@@ -510,7 +513,7 @@ impl UdpWorker {
 
     fn publish_migration_closed(
         &mut self,
-        sessions: &SessionWorker<u32>,
+        sessions: &SessionWorker,
         runtime: &DataPlaneRuntime,
         closed: SessionSwitchPoolClosed,
     ) {
@@ -554,7 +557,7 @@ impl UdpWorker {
 
     fn process_migration_reply(
         &mut self,
-        sessions: &mut SessionWorker<u32>,
+        sessions: &mut SessionWorker,
         runtime: &DataPlaneRuntime,
         mut reply: SessionSwitchPoolReply,
     ) -> Result<(), SessionSwitchPoolReply> {
@@ -632,7 +635,7 @@ impl UdpWorker {
 
     fn process_migration_completion(
         &mut self,
-        sessions: &mut SessionWorker<u32>,
+        sessions: &mut SessionWorker,
         runtime: &DataPlaneRuntime,
         completion: SessionSwitchPoolCompletion,
     ) -> bool {
@@ -647,11 +650,12 @@ impl UdpWorker {
             self.publish_migration_closed(sessions, runtime, closed);
             return true;
         };
-        let Some((transport, index)) = sessions.session_transport(session_id) else {
+        let Some(index) = sessions.transport_connection_index(session_id) else {
             self.publish_migration_closed(sessions, runtime, closed);
             return true;
         };
-        if transport != tuple_transport
+        if tuple_transport != self.protocol
+            || !sessions.owns_transport_session(session_id, self.protocol)
             || self.lookup.find_tuple(&self.connections, local, remote) != Some(index)
             || !self
                 .connection(index)
@@ -665,7 +669,7 @@ impl UdpWorker {
             .is_err()
             || sessions.remove_migrated_session(session_id).is_err()
             || sessions
-                .remove_session_endpoint(transport, local, remote)
+                .remove_session_endpoint(self.protocol, local, remote)
                 .is_err()
         {
             return false;
@@ -677,13 +681,13 @@ impl UdpWorker {
 
     fn process_migration_closed(
         &mut self,
-        sessions: &mut SessionWorker<u32>,
+        sessions: &mut SessionWorker,
         closed: SessionSwitchPoolClosed,
     ) -> bool {
         let Some(session_id) = sessions.session_id_from_handle(closed.new_sh) else {
             return true;
         };
-        let Some((transport, index)) = sessions.session_transport(session_id) else {
+        let Some(index) = sessions.transport_connection_index(session_id) else {
             return true;
         };
         let Some(connection) = self.connection(index) else {
@@ -697,7 +701,7 @@ impl UdpWorker {
             return true;
         }
         if sessions
-            .remove_session_endpoint(transport, local, remote)
+            .remove_session_endpoint(self.protocol, local, remote)
             .is_err()
         {
             return false;
@@ -707,11 +711,7 @@ impl UdpWorker {
         sessions.remove_migrated_session(session_id).is_ok()
     }
 
-    fn drain_migration_closed(
-        &mut self,
-        sessions: &mut SessionWorker<u32>,
-        runtime: &DataPlaneRuntime,
-    ) {
+    fn drain_migration_closed(&mut self, sessions: &mut SessionWorker, runtime: &DataPlaneRuntime) {
         while let Some(closed) = self.session_switch_pool_closed.pop_front() {
             if let Err(closed) = sessions.push_session_switch_pool_closed(runtime, closed) {
                 self.session_switch_pool_closed.push_front(closed);
@@ -734,7 +734,7 @@ impl UdpWorker {
 
     fn drain_migration_shutdown_requests(
         &mut self,
-        sessions: &SessionWorker<u32>,
+        sessions: &SessionWorker,
         runtime: &DataPlaneRuntime,
     ) {
         while let Some(args) = sessions.pop_session_migrate_request() {
@@ -745,7 +745,7 @@ impl UdpWorker {
 
     fn drain_migration_shutdown_replies(
         &mut self,
-        sessions: &SessionWorker<u32>,
+        sessions: &SessionWorker,
         runtime: &DataPlaneRuntime,
     ) {
         while let Some(reply) = self.session_switch_pool_replies.pop_front() {
@@ -760,7 +760,7 @@ impl UdpWorker {
 
     fn drain_migration_shutdown(
         &mut self,
-        sessions: &mut SessionWorker<u32>,
+        sessions: &mut SessionWorker,
         runtime: &DataPlaneRuntime,
     ) {
         sessions.wait_session_migration_shutdown_phase();
@@ -780,7 +780,7 @@ impl UdpWorker {
 
     fn drain_migration_completions(
         &mut self,
-        sessions: &mut SessionWorker<u32>,
+        sessions: &mut SessionWorker,
         runtime: &DataPlaneRuntime,
     ) {
         let local_count = self.session_switch_pool_completions.len();
@@ -801,7 +801,7 @@ impl UdpWorker {
 
     fn drain_migration_replies(
         &mut self,
-        sessions: &mut SessionWorker<u32>,
+        sessions: &mut SessionWorker,
         runtime: &DataPlaneRuntime,
     ) {
         while let Some(reply) = self.session_switch_pool_replies.pop_front() {
@@ -820,7 +820,7 @@ impl UdpWorker {
 
     fn drain_migration_requests(
         &mut self,
-        sessions: &mut SessionWorker<u32>,
+        sessions: &mut SessionWorker,
         runtime: &DataPlaneRuntime,
     ) {
         while let Some(args) = sessions.pop_session_migrate_request() {
@@ -866,7 +866,7 @@ pub(crate) fn start_listen(
     _: u32,
     _: Option<u64>,
     endpoint: SessionListenEndpoint,
-) -> RuntimeResult<()> {
+) -> RuntimeResult<u32> {
     hammer_runtime::ensure_main_thread_with_barrier()?;
     let main = UDP_MAIN
         .get()
@@ -893,8 +893,9 @@ pub(crate) fn start_listen(
         }
         .into());
     }
+    let connection_index = listener.session_index;
     main.listeners.get_mut().push(udp_listener);
-    Ok(())
+    Ok(connection_index)
 }
 
 fn find_udp_listener(listeners: &[UdpListener], local: SocketAddr) -> Option<UdpListener> {
@@ -912,7 +913,7 @@ fn find_udp_listener(listeners: &[UdpListener], local: SocketAddr) -> Option<Udp
     wildcard
 }
 
-pub(crate) fn stop_listen(listener: SessionHandle) -> RuntimeResult<()> {
+pub(crate) fn stop_listen(connection_index: u32) -> RuntimeResult<()> {
     hammer_runtime::ensure_main_thread_with_barrier()?;
     let main = UDP_MAIN
         .get()
@@ -920,8 +921,10 @@ pub(crate) fn stop_listen(listener: SessionHandle) -> RuntimeResult<()> {
     let listeners = main.listeners.get_mut();
     let slot = listeners
         .iter()
-        .position(|candidate| candidate.session_listener() == listener)
-        .ok_or(UdpTransportError::ListenerMissing { listener })?;
+        .position(|candidate| candidate.session_listener().session_index == connection_index)
+        .ok_or(UdpTransportError::ListenerMissing {
+            listener: SessionHandle::new(connection_index, 0),
+        })?;
     listeners.remove(slot);
     Ok(())
 }
@@ -960,13 +963,27 @@ pub(crate) fn connect(endpoint: SessionConnectEndpoint) -> RuntimeResult<()> {
 
 #[hammer_component_macros::init_function(
     name = "udp_init",
-    runs_after = ["session_init"],
+    runs_after = ["transport_main_init", "session_init"],
     runs_before = ["install_packet_graph"]
 )]
-fn init_udp(engine: &mut Engine, sessions: Arc<SessionMain>) -> RuntimeResult<()> {
-    let main = Arc::new(UdpMain::new(engine.configured_worker_count(), sessions));
+fn init_udp(engine: &mut Engine) -> RuntimeResult<()> {
+    if UDP_MAIN.get().is_some() {
+        return Err(RuntimeError::PluginStateNotInitialized { plugin: "udp" });
+    }
+    let protocol = register_transport(TransportVft::new(
+        Some(start_listen),
+        Some(stop_listen),
+        Some(connect),
+        None,
+        None,
+        None,
+        None,
+        None,
+    ))
+    .map_err(RuntimeError::from)?;
+    let main = UdpMain::new(protocol, engine.configured_worker_count());
     UDP_MAIN
-        .set(Arc::clone(&main))
+        .set(main)
         .map_err(|_| RuntimeError::PluginStateNotInitialized { plugin: "udp" })?;
     Ok(())
 }
@@ -1001,7 +1018,7 @@ fn bind_worker_graph(engine: &mut Engine) -> RuntimeResult<()> {
         .ok_or(RuntimeError::PluginStateNotInitialized { plugin: "udp" })?;
     if main
         .worker(worker)?
-        .install(UdpWorker::new(worker))
+        .install(UdpWorker::new(worker, main.protocol))
         .is_err()
     {
         return Err(UdpTransportError::WorkerAlreadyInstalled {
@@ -1042,7 +1059,7 @@ fn udp_worker_exit(engine: &mut Engine) -> RuntimeResult<()> {
 
 fn udp_session_queue_update_time(
     runtime: &DataPlaneRuntime,
-    _: &mut SessionWorker<u32>,
+    _: &mut SessionWorker,
     _: NodeRuntimeData,
     output_next: SessionQueueNext,
     now: std::time::Instant,
@@ -1059,7 +1076,7 @@ fn udp_session_queue_update_time(
 
 fn udp_session_queue_dispatch(
     runtime: &DataPlaneRuntime,
-    _: &mut SessionWorker<u32>,
+    _: &mut SessionWorker,
     _: NodeRuntimeData,
     output_next: SessionQueueNext,
     now: std::time::Instant,
@@ -1075,14 +1092,17 @@ fn udp_session_queue_dispatch(
     })
 }
 
-impl SessionTransport<u32> for UdpWorker {
+impl SessionTransport for UdpWorker {
     type Tx = TransportInternalTx;
 
-    const ID: u8 = 2;
+    #[inline]
+    fn protocol(&self) -> u8 {
+        self.protocol
+    }
 
     fn update_time(
         &mut self,
-        sessions: &mut SessionWorker<u32>,
+        sessions: &mut SessionWorker,
         runtime: &DataPlaneRuntime,
         _: SessionQueueNext,
         _: &mut BufferFrame,
@@ -1098,7 +1118,7 @@ impl SessionTransport<u32> for UdpWorker {
 
     fn disconnect(
         &mut self,
-        sessions: &mut SessionWorker<u32>,
+        sessions: &mut SessionWorker,
         index: u32,
         _: &DataPlaneRuntime,
         _: SessionQueueNext,
@@ -1115,7 +1135,7 @@ impl SessionTransport<u32> for UdpWorker {
         self.lookup
             .remove_tuple(connection.local(), connection.remote());
         let _ = sessions.remove_session_endpoint(
-            UdpWorker::ID,
+            self.protocol,
             connection.local(),
             connection.remote(),
         )?;
@@ -1125,10 +1145,10 @@ impl SessionTransport<u32> for UdpWorker {
     }
 }
 
-impl TransportInternalTransport<u32> for UdpWorker {
+impl TransportInternalTransport for UdpWorker {
     fn internal_tx(
         &mut self,
-        sessions: &mut SessionWorker<u32>,
+        sessions: &mut SessionWorker,
         session_id: u32,
         index: u32,
         runtime: &DataPlaneRuntime,
@@ -1185,1240 +1205,6 @@ impl TransportInternalTransport<u32> for UdpWorker {
             }
             sessions.dequeue_tx_datagram(session_id, header)?;
         }
-        Ok(())
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use std::time::Instant;
-
-    use hammer_core::data_plane::BufferFrame;
-    use hammer_runtime::app::AppSessionConfig;
-    use hammer_runtime::{
-        DataPlaneRuntime, DataPlaneRuntimeConfig, Engine, RuntimeRegistry, SessionListenEndpoint,
-        SessionTransportRegistration,
-    };
-    use hammer_service::session::ApplicationMain;
-
-    use super::*;
-
-    fn noop_start_listen(
-        _: SessionHandle,
-        _: u32,
-        _: Option<u64>,
-        _: SessionListenEndpoint,
-    ) -> RuntimeResult<()> {
-        Ok(())
-    }
-
-    fn noop_stop_listen(_: SessionHandle) -> RuntimeResult<()> {
-        Ok(())
-    }
-
-    /// Binds a publication server for the external App Session CONNECTED
-    /// publication and keeps the server alive for the worker's lifetime.
-    fn test_publisher() -> (
-        hammer_runtime::attach::AppServer,
-        hammer_runtime::attach::AppSessionPublisher,
-    ) {
-        static PUBLISHER_SEQUENCE: std::sync::atomic::AtomicUsize =
-            std::sync::atomic::AtomicUsize::new(0);
-        let socket_path = format!(
-            "/tmp/hammer-udp-test-{}-{}.sock",
-            std::process::id(),
-            PUBLISHER_SEQUENCE.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
-        );
-        let server =
-            hammer_runtime::attach::AppServer::bind(&socket_path, 4).expect("bind test server");
-        let publisher = server.publisher();
-        (server, publisher)
-    }
-
-    fn worker_state() -> (
-        SessionWorker<u32>,
-        UdpWorker,
-        Arc<ApplicationMain>,
-        Arc<SessionMain>,
-        hammer_runtime::attach::AppServer,
-    ) {
-        let applications = ApplicationMain::new(1024);
-        let main = Arc::new(SessionMain::new(1, Arc::clone(&applications)));
-        let (server, publisher) = test_publisher();
-        let mut sessions = SessionWorker::<u32>::new(
-            DataWorkerId::new(0),
-            1,
-            AppSessionConfig::default(),
-            1024,
-            Arc::clone(&applications),
-            Some(publisher),
-        )
-        .expect("Session worker");
-        sessions.set_listener_main(Arc::clone(&main));
-        (
-            sessions,
-            UdpWorker::new(DataWorkerId::new(0)),
-            applications,
-            main,
-            server,
-        )
-    }
-
-    fn test_endpoints() -> (std::net::SocketAddr, std::net::SocketAddr) {
-        (
-            "127.0.0.1:9000".parse().expect("local UDP endpoint"),
-            "127.0.0.1:50000".parse().expect("remote UDP endpoint"),
-        )
-    }
-
-    #[test]
-    fn udp_transport_registration_has_callable_vft() {
-        let registration = super::__SESSION_TRANSPORT_UDP_WORKER;
-        assert_eq!(registration.name(), "udp");
-        assert!(registration.start_listen().is_some());
-        assert!(registration.stop_listen().is_some());
-        assert!(registration.connect().is_some());
-    }
-
-    #[test]
-    fn udp_session_control_path_registers_and_unregisters_listener() -> RuntimeResult<()> {
-        let mut engine = Engine::new(
-            DataPlaneRuntime::new(DataPlaneRuntimeConfig::default()),
-            RuntimeRegistry::new(),
-        );
-        engine.install_current();
-        let applications = ApplicationMain::new(1);
-        let application = applications.attach().expect("attach test Application");
-        let application_listener = applications
-            .register_listener(application, None, Some(0xfeed))
-            .expect("register test listener");
-        let session_main = Arc::new(SessionMain::new(1, Arc::clone(&applications)));
-        let udp_main = Arc::new(UdpMain::new(1, Arc::clone(&session_main)));
-        if UDP_MAIN.set(udp_main).is_err() {
-            panic!("UDP test main is set more than once");
-        }
-        let (local, _remote) = test_endpoints();
-
-        let listener = session_main.listen(
-            application_listener,
-            super::__SESSION_TRANSPORT_UDP_WORKER,
-            SessionListenEndpoint::new(local, DataWorkerId::new(0)),
-        )?;
-        assert_eq!(
-            UDP_MAIN.get().expect("UDP test main").listeners.get().len(),
-            1
-        );
-        session_main.unlisten(listener)?;
-        assert!(
-            UDP_MAIN
-                .get()
-                .expect("UDP test main")
-                .listeners
-                .get()
-                .is_empty()
-        );
-        Engine::uninstall_current();
-        Ok(())
-    }
-
-    #[test]
-    fn udp_listener_lookup_prefers_exact_address_over_wildcard() {
-        let local = "127.0.0.1:9000".parse().expect("local endpoint");
-        let wildcard = UdpListener::new(
-            "0.0.0.0:9000".parse().expect("wildcard endpoint"),
-            SessionHandle::new(1, 1),
-            DataWorkerId::new(0),
-        )
-        .expect("wildcard listener");
-        let exact = UdpListener::new(local, SessionHandle::new(2, 1), DataWorkerId::new(0))
-            .expect("exact listener");
-        let found = find_udp_listener(&[wildcard, exact], local).expect("listener");
-        assert_eq!(found.session_listener(), SessionHandle::new(2, 1));
-    }
-
-    #[test]
-    fn udp_accept_delivers_datagram_into_exact_session_fifo()
-    -> Result<(), Box<dyn std::error::Error>> {
-        let (mut sessions, mut udp, applications, main, _server) = worker_state();
-        let application = applications.attach()?;
-        sessions.install_application_mq_for_test(application)?;
-        let application_listener = applications.register_listener(application, None, None)?;
-        let (local, remote) = test_endpoints();
-        let listener = main.listen(
-            application_listener,
-            SessionTransportRegistration::new(
-                "udp-test",
-                Some(noop_start_listen),
-                Some(noop_stop_listen),
-                None,
-            ),
-            SessionListenEndpoint::new(local, DataWorkerId::new(0)),
-        )?;
-        let udp_listener =
-            UdpListener::new(local, listener, DataWorkerId::new(0)).expect("UDP listener");
-        let (_index, session_id) =
-            udp.accept_datagram(&mut sessions, udp_listener, local, remote)?;
-
-        let runtime = DataPlaneRuntime::new(DataPlaneRuntimeConfig::default())
-            .for_worker(1, 0)
-            .expect("worker runtime");
-        let buffer = runtime.alloc_index_with_bytes(b"hello")?;
-        udp.deliver_datagram(
-            &mut sessions,
-            &runtime,
-            buffer,
-            local,
-            remote,
-            0,
-            5,
-            false,
-            None,
-            NodeId::new(0),
-        )?;
-
-        let app = sessions
-            .app_session(session_id)
-            .expect("UDP Session owns an AppSession")
-            .clone();
-        let mut out = [0_u8; 16];
-        let (header, copied) = app.recv_datagram(&mut out)?.expect("received datagram");
-        assert_eq!(copied, 5);
-        assert_eq!(&out[..5], b"hello");
-        assert_eq!(header.local(), local);
-        assert_eq!(header.remote(), remote);
-        Ok(())
-    }
-
-    #[test]
-    fn udp_active_connect_registers_exact_tuple_session() -> Result<(), Box<dyn std::error::Error>>
-    {
-        let (mut sessions, mut udp, applications, _main, _server) = worker_state();
-        let application = applications.attach()?;
-        sessions.install_application_mq_for_test(application)?;
-        let application_connection =
-            applications.register_connection(application, 0, None, None, None)?;
-        let (local, remote) = test_endpoints();
-        let connection_id = application_connection;
-
-        let session_id = udp.active_connect(&mut sessions, connection_id, local, remote)?;
-
-        assert!(sessions.has_session(session_id));
-        assert!(
-            udp.lookup
-                .find_tuple(&udp.connections, local, remote)
-                .is_some()
-        );
-        Ok(())
-    }
-
-    #[test]
-    fn udp_wrong_worker_classifies_connected_tuple() -> Result<(), Box<dyn std::error::Error>> {
-        let (mut sessions, mut udp, applications, _main, _server) = worker_state();
-        let mut udp_other = UdpWorker::new(DataWorkerId::new(1));
-        let application = applications.attach()?;
-        sessions.install_application_mq_for_test(application)?;
-        let application_connection =
-            applications.register_connection(application, 0, None, None, None)?;
-        let (local, remote) = test_endpoints();
-        let connection_id = application_connection;
-        udp.active_connect(&mut sessions, connection_id, local, remote)?;
-
-        let runtime = DataPlaneRuntime::new(DataPlaneRuntimeConfig::default())
-            .for_worker(2, 1)
-            .expect("worker runtime");
-        let buffer = runtime.alloc_index_with_bytes(b"x")?;
-        let delivery = udp_other.deliver_datagram(
-            &mut sessions,
-            &runtime,
-            buffer,
-            local,
-            remote,
-            0,
-            1,
-            false,
-            None,
-            NodeId::new(0),
-        )?;
-        assert_eq!(delivery, UdpDelivery::WrongWorker);
-        Ok(())
-    }
-
-    #[test]
-    fn udp_foreign_opened_tuple_queues_first_datagram_for_migration()
-    -> Result<(), Box<dyn std::error::Error>> {
-        let applications = ApplicationMain::new(1024);
-        let main = Arc::new(SessionMain::new(2, Arc::clone(&applications)));
-        let (_server, publisher) = test_publisher();
-        let mut sessions = SessionWorker::<u32>::new(
-            DataWorkerId::new(0),
-            2,
-            AppSessionConfig::default(),
-            1024,
-            Arc::clone(&applications),
-            Some(publisher),
-        )?;
-        sessions.set_listener_main(Arc::clone(&main));
-        let mut udp = UdpWorker::new(DataWorkerId::new(0));
-        let mut udp_other = UdpWorker::new(DataWorkerId::new(1));
-        let application = applications.attach()?;
-        sessions.install_application_mq_for_test(application)?;
-        let application_connection =
-            applications.register_connection(application, 0, None, None, None)?;
-        let (local, remote) = test_endpoints();
-        let connection_id = application_connection;
-        udp.active_connect(&mut sessions, connection_id, local, remote)?;
-
-        let runtime = DataPlaneRuntime::new(DataPlaneRuntimeConfig::default())
-            .for_worker(2, 1)
-            .expect("worker runtime");
-        let buffer = runtime.alloc_index_with_bytes(b"x")?;
-        let delivery = udp_other.deliver_datagram(
-            &mut sessions,
-            &runtime,
-            buffer,
-            local,
-            remote,
-            0,
-            1,
-            false,
-            None,
-            NodeId::new(0),
-        )?;
-
-        assert_eq!(delivery, UdpDelivery::MigrationQueued);
-        Ok(())
-    }
-
-    #[test]
-    fn udp_owner_first_datagram_prevents_later_foreign_migration()
-    -> Result<(), Box<dyn std::error::Error>> {
-        let applications = ApplicationMain::new(1024);
-        let main = Arc::new(SessionMain::new(2, Arc::clone(&applications)));
-        let (_server, publisher) = test_publisher();
-        let mut sessions = SessionWorker::<u32>::new(
-            DataWorkerId::new(0),
-            2,
-            AppSessionConfig::default(),
-            1024,
-            Arc::clone(&applications),
-            Some(publisher),
-        )?;
-        sessions.set_listener_main(Arc::clone(&main));
-        let mut source_udp = UdpWorker::new(DataWorkerId::new(0));
-        let mut target_udp = UdpWorker::new(DataWorkerId::new(1));
-        let application = applications.attach()?;
-        sessions.install_application_mq_for_test(application)?;
-        let application_connection =
-            applications.register_connection(application, 0, None, None, None)?;
-        let (local, remote) = test_endpoints();
-        let connection_id = application_connection;
-        source_udp.active_connect(&mut sessions, connection_id, local, remote)?;
-
-        let source_runtime =
-            DataPlaneRuntime::new(DataPlaneRuntimeConfig::default()).for_worker(2, 0)?;
-        let first = source_runtime.alloc_index_with_bytes(b"x")?;
-        assert_eq!(
-            source_udp.deliver_datagram(
-                &mut sessions,
-                &source_runtime,
-                first,
-                local,
-                remote,
-                0,
-                1,
-                false,
-                None,
-                NodeId::new(0),
-            )?,
-            UdpDelivery::Delivered
-        );
-
-        let target_runtime =
-            DataPlaneRuntime::new(DataPlaneRuntimeConfig::default()).for_worker(2, 1)?;
-        let second = target_runtime.alloc_index_with_bytes(b"y")?;
-        assert_eq!(
-            target_udp.deliver_datagram(
-                &mut sessions,
-                &target_runtime,
-                second,
-                local,
-                remote,
-                0,
-                1,
-                false,
-                None,
-                NodeId::new(0),
-            )?,
-            UdpDelivery::WrongWorker
-        );
-        Ok(())
-    }
-
-    #[test]
-    fn udp_accepted_session_does_not_migrate_on_foreign_worker()
-    -> Result<(), Box<dyn std::error::Error>> {
-        let applications = ApplicationMain::new(1024);
-        let main = Arc::new(SessionMain::new(2, Arc::clone(&applications)));
-        let mut sessions = SessionWorker::<u32>::new(
-            DataWorkerId::new(0),
-            2,
-            AppSessionConfig::default(),
-            1024,
-            Arc::clone(&applications),
-            None,
-        )?;
-        sessions.set_listener_main(Arc::clone(&main));
-        let mut source_udp = UdpWorker::new(DataWorkerId::new(0));
-        let mut target_udp = UdpWorker::new(DataWorkerId::new(1));
-        let application = applications.attach()?;
-        sessions.install_application_mq_for_test(application)?;
-        let application_listener = applications.register_listener(application, None, None)?;
-        let (local, remote) = test_endpoints();
-        let listener = main.listen(
-            application_listener,
-            SessionTransportRegistration::new(
-                "udp-test",
-                Some(noop_start_listen),
-                Some(noop_stop_listen),
-                None,
-            ),
-            SessionListenEndpoint::new(local, DataWorkerId::new(0)),
-        )?;
-        let udp_listener =
-            UdpListener::new(local, listener, DataWorkerId::new(0)).ok_or("invalid listener")?;
-        source_udp.accept_datagram(&mut sessions, udp_listener, local, remote)?;
-
-        let runtime = DataPlaneRuntime::new(DataPlaneRuntimeConfig::default()).for_worker(2, 1)?;
-        let buffer = runtime.alloc_index_with_bytes(b"x")?;
-        let delivery = target_udp.deliver_datagram(
-            &mut sessions,
-            &runtime,
-            buffer,
-            local,
-            remote,
-            0,
-            1,
-            false,
-            None,
-            NodeId::new(0),
-        )?;
-        assert_eq!(delivery, UdpDelivery::WrongWorker);
-        Ok(())
-    }
-
-    #[test]
-    fn udp_old_owner_does_not_process_packet_while_migration_is_pending()
-    -> Result<(), Box<dyn std::error::Error>> {
-        let applications = ApplicationMain::new(1024);
-        let main = Arc::new(SessionMain::new(2, Arc::clone(&applications)));
-        let (_server, publisher) = test_publisher();
-        let mut sessions = SessionWorker::<u32>::new(
-            DataWorkerId::new(0),
-            2,
-            AppSessionConfig::default(),
-            1024,
-            Arc::clone(&applications),
-            Some(publisher),
-        )?;
-        sessions.set_listener_main(Arc::clone(&main));
-        let mut source_udp = UdpWorker::new(DataWorkerId::new(0));
-        let mut target_udp = UdpWorker::new(DataWorkerId::new(1));
-        let application = applications.attach()?;
-        sessions.install_application_mq_for_test(application)?;
-        let application_connection =
-            applications.register_connection(application, 0, None, None, None)?;
-        let (local, remote) = test_endpoints();
-        let connection_id = application_connection;
-        source_udp.active_connect(&mut sessions, connection_id, local, remote)?;
-
-        let target_runtime =
-            DataPlaneRuntime::new(DataPlaneRuntimeConfig::default()).for_worker(2, 1)?;
-        let first = target_runtime.alloc_index_with_bytes(b"x")?;
-        assert_eq!(
-            target_udp.deliver_datagram(
-                &mut sessions,
-                &target_runtime,
-                first,
-                local,
-                remote,
-                0,
-                1,
-                false,
-                None,
-                NodeId::new(0),
-            )?,
-            UdpDelivery::MigrationQueued
-        );
-
-        let source_runtime =
-            DataPlaneRuntime::new(DataPlaneRuntimeConfig::default()).for_worker(2, 0)?;
-        let second = source_runtime.alloc_index_with_bytes(b"y")?;
-        assert_eq!(
-            source_udp.deliver_datagram(
-                &mut sessions,
-                &source_runtime,
-                second,
-                local,
-                remote,
-                0,
-                1,
-                false,
-                None,
-                NodeId::new(0),
-            )?,
-            UdpDelivery::WrongWorker
-        );
-        let source_session = sessions
-            .lookup_session_endpoint(UdpWorker::ID, local, remote)?
-            .and_then(|handle| sessions.session_id_from_handle(handle))
-            .ok_or("missing source UDP Session")?;
-        assert_eq!(
-            sessions
-                .fifo_pair(source_session)
-                .ok_or("missing source FIFO pair")?
-                .0
-                .max_dequeue(),
-            0
-        );
-        Ok(())
-    }
-
-    #[test]
-    fn udp_completion_retry_does_not_block_later_completion()
-    -> Result<(), Box<dyn std::error::Error>> {
-        let (mut sessions, mut udp, applications, main, _server) = worker_state();
-        let application = applications.attach()?;
-        sessions.install_application_mq_for_test(application)?;
-        let application_connection =
-            applications.register_connection(application, 0, None, None, None)?;
-        let (local, first_remote) = test_endpoints();
-        let connection_id = application_connection;
-        let first_session =
-            udp.active_connect(&mut sessions, connection_id, local, first_remote)?;
-        let first_handle = main
-            .lookup_endpoint(local, first_remote, UdpWorker::ID)
-            .ok_or("missing application Session route")?;
-
-        let second_remote: std::net::SocketAddr = "127.0.0.1:50001".parse()?;
-        let second_connection =
-            UdpConnection::connected(DataWorkerId::new(0), local, second_remote)
-                .ok_or("bare UDP connection")?;
-        let second_index = udp.insert_connection(second_connection)?;
-        let second_session =
-            sessions.insert_unbound_transport_session_for_test(UdpWorker::ID, second_index)?;
-        if !udp
-            .connection_mut(second_index)
-            .is_some_and(|connection| connection.attach_session(second_session))
-        {
-            return Err("bare UDP Session attachment failed".into());
-        }
-        assert!(udp.lookup.insert_tuple(second_index, local, second_remote));
-        assert!(sessions.insert_session_endpoint(
-            second_session,
-            UdpWorker::ID,
-            local,
-            second_remote,
-        )?);
-        let second_handle = main
-            .lookup_endpoint(local, second_remote, UdpWorker::ID)
-            .ok_or("missing bare Session route")?;
-
-        udp.session_switch_pool_completions
-            .push_back(SessionSwitchPoolCompletion {
-                old_sh: first_handle,
-                new_sh: second_handle,
-                old_thread: DataWorkerId::new(0),
-                new_thread: DataWorkerId::new(0),
-                tuple: (UdpWorker::ID, local, first_remote),
-                status: SessionSwitchPoolCompletionStatus::Accepted,
-            });
-        udp.session_switch_pool_completions
-            .push_back(SessionSwitchPoolCompletion {
-                old_sh: second_handle,
-                new_sh: first_handle,
-                old_thread: DataWorkerId::new(0),
-                new_thread: DataWorkerId::new(0),
-                tuple: (UdpWorker::ID, local, second_remote),
-                status: SessionSwitchPoolCompletionStatus::Accepted,
-            });
-
-        let runtime = DataPlaneRuntime::new(DataPlaneRuntimeConfig::default()).for_worker(1, 0)?;
-        udp.drain_migration_completions(&mut sessions, &runtime);
-
-        assert_eq!(
-            main.lookup_endpoint(local, first_remote, UdpWorker::ID),
-            Some(first_handle)
-        );
-        assert!(
-            main.lookup_endpoint(local, second_remote, UdpWorker::ID)
-                .is_none()
-        );
-        assert!(sessions.has_session(first_session));
-        assert!(!sessions.has_session(second_session));
-        Ok(())
-    }
-
-    #[test]
-    fn udp_source_migration_processing_rejects_external_application_without_losing_route()
-    -> Result<(), Box<dyn std::error::Error>> {
-        let applications = ApplicationMain::new(1024);
-        let main = Arc::new(SessionMain::new(2, Arc::clone(&applications)));
-        let (_server, publisher) = test_publisher();
-        let mut sessions = SessionWorker::<u32>::new(
-            DataWorkerId::new(0),
-            2,
-            AppSessionConfig::default(),
-            1024,
-            Arc::clone(&applications),
-            Some(publisher),
-        )?;
-        sessions.set_listener_main(Arc::clone(&main));
-        let mut udp = UdpWorker::new(DataWorkerId::new(0));
-        let mut udp_other = UdpWorker::new(DataWorkerId::new(1));
-        let application = applications.attach()?;
-        sessions.install_application_mq_for_test(application)?;
-        let application_connection =
-            applications.register_connection(application, 0, None, None, None)?;
-        let (local, remote) = test_endpoints();
-        let connection_id = application_connection;
-        udp.active_connect(&mut sessions, connection_id, local, remote)?;
-        let old_handle = main
-            .lookup_endpoint(local, remote, UdpWorker::ID)
-            .ok_or("missing UDP Session route")?;
-
-        let target_runtime =
-            DataPlaneRuntime::new(DataPlaneRuntimeConfig::default()).for_worker(2, 1)?;
-        let buffer = target_runtime.alloc_index_with_bytes(b"x")?;
-        let delivery = udp_other.deliver_datagram(
-            &mut sessions,
-            &target_runtime,
-            buffer,
-            local,
-            remote,
-            0,
-            1,
-            false,
-            None,
-            NodeId::new(0),
-        )?;
-        assert_eq!(delivery, UdpDelivery::MigrationQueued);
-
-        let source_runtime =
-            DataPlaneRuntime::new(DataPlaneRuntimeConfig::default()).for_worker(2, 0)?;
-        let mut frame = BufferFrame::with_capacity(8);
-        let mut output = SessionQueueOutput::default();
-        <UdpWorker as SessionTransport<u32>>::update_time(
-            &mut udp,
-            &mut sessions,
-            &source_runtime,
-            SessionQueueNext::from_slot(0),
-            &mut frame,
-            &mut output,
-            Instant::now(),
-        )?;
-
-        assert_eq!(
-            main.lookup_endpoint(local, remote, UdpWorker::ID),
-            Some(old_handle)
-        );
-        let reply = main
-            .pop_session_switch_pool_reply(DataWorkerId::new(1))
-            .ok_or("missing migration rejection")?;
-        assert_eq!(reply.old_sh, old_handle);
-        assert_eq!(reply.status, SessionSwitchPoolStatus::Rejected);
-        Ok(())
-    }
-
-    #[test]
-    fn udp_target_migration_installs_session_before_pending_datagram_handoff()
-    -> Result<(), Box<dyn std::error::Error>> {
-        let applications = ApplicationMain::new(1024);
-        let main = Arc::new(SessionMain::new(2, Arc::clone(&applications)));
-        let mut source_sessions = SessionWorker::<u32>::new(
-            DataWorkerId::new(0),
-            2,
-            AppSessionConfig::default(),
-            1024,
-            Arc::clone(&applications),
-            None,
-        )?;
-        let mut target_sessions = SessionWorker::<u32>::new(
-            DataWorkerId::new(1),
-            2,
-            AppSessionConfig::default(),
-            1024,
-            Arc::clone(&applications),
-            None,
-        )?;
-        source_sessions.set_listener_main(Arc::clone(&main));
-        target_sessions.set_listener_main(Arc::clone(&main));
-        let mut source_udp = UdpWorker::new(DataWorkerId::new(0));
-        let mut target_udp = UdpWorker::new(DataWorkerId::new(1));
-        let (local, remote) = test_endpoints();
-        let source_connection = UdpConnection::connected(DataWorkerId::new(0), local, remote)
-            .ok_or("source UDP connection")?;
-        let source_index = source_udp.insert_connection(source_connection)?;
-        let source_session = source_sessions
-            .insert_unbound_transport_session_for_test(UdpWorker::ID, source_index)?;
-        if !source_udp
-            .connection_mut(source_index)
-            .is_some_and(|connection| connection.attach_session(source_session))
-        {
-            return Err("source UDP Session attachment failed".into());
-        }
-        assert!(source_udp.lookup.insert_tuple(source_index, local, remote));
-        assert!(source_sessions.insert_session_endpoint(
-            source_session,
-            UdpWorker::ID,
-            local,
-            remote,
-        )?);
-        let old_handle = main
-            .lookup_endpoint(local, remote, UdpWorker::ID)
-            .ok_or("missing source UDP Session route")?;
-
-        let target_runtime =
-            DataPlaneRuntime::new(DataPlaneRuntimeConfig::default()).for_worker(2, 1)?;
-        let buffer = target_runtime.alloc_index_with_bytes(b"x")?;
-        assert_eq!(
-            target_udp.deliver_datagram(
-                &mut target_sessions,
-                &target_runtime,
-                buffer,
-                local,
-                remote,
-                0,
-                1,
-                false,
-                None,
-                NodeId::new(0),
-            )?,
-            UdpDelivery::MigrationQueued
-        );
-
-        let source_runtime =
-            DataPlaneRuntime::new(DataPlaneRuntimeConfig::default()).for_worker(2, 0)?;
-        let mut frame = BufferFrame::with_capacity(8);
-        let mut output = SessionQueueOutput::default();
-        <UdpWorker as SessionTransport<u32>>::update_time(
-            &mut source_udp,
-            &mut source_sessions,
-            &source_runtime,
-            SessionQueueNext::from_slot(0),
-            &mut frame,
-            &mut output,
-            Instant::now(),
-        )?;
-        <UdpWorker as SessionTransport<u32>>::update_time(
-            &mut target_udp,
-            &mut target_sessions,
-            &target_runtime,
-            SessionQueueNext::from_slot(0),
-            &mut frame,
-            &mut output,
-            Instant::now(),
-        )?;
-
-        let new_handle = main
-            .lookup_endpoint(local, remote, UdpWorker::ID)
-            .ok_or("missing target UDP Session route")?;
-        assert_ne!(new_handle, old_handle);
-        assert_eq!(new_handle.thread_index, 1);
-        assert!(source_sessions.session_id_from_handle(old_handle).is_some());
-        let target_session = target_sessions
-            .session_id_from_handle(new_handle)
-            .ok_or("target Session was not installed")?;
-        assert!(
-            target_udp
-                .lookup
-                .find_tuple(&target_udp.connections, local, remote)
-                .is_some()
-        );
-        assert!(target_sessions.has_session(target_session));
-        assert_eq!(target_udp.session_switch_pool_replies.len(), 0);
-        assert!(target_runtime.get_buffer(buffer).is_err());
-        Ok(())
-    }
-
-    #[test]
-    fn udp_source_close_after_publication_cleans_target_clone_idempotently()
-    -> Result<(), Box<dyn std::error::Error>> {
-        let applications = ApplicationMain::new(1024);
-        let main = Arc::new(SessionMain::new(2, Arc::clone(&applications)));
-        let mut source_sessions = SessionWorker::<u32>::new(
-            DataWorkerId::new(0),
-            2,
-            AppSessionConfig::default(),
-            1024,
-            Arc::clone(&applications),
-            None,
-        )?;
-        let mut target_sessions = SessionWorker::<u32>::new(
-            DataWorkerId::new(1),
-            2,
-            AppSessionConfig::default(),
-            1024,
-            Arc::clone(&applications),
-            None,
-        )?;
-        source_sessions.set_listener_main(Arc::clone(&main));
-        target_sessions.set_listener_main(Arc::clone(&main));
-        let mut source_udp = UdpWorker::new(DataWorkerId::new(0));
-        let mut target_udp = UdpWorker::new(DataWorkerId::new(1));
-        let (local, remote) = test_endpoints();
-        let source_connection = UdpConnection::connected(DataWorkerId::new(0), local, remote)
-            .ok_or("source UDP connection")?;
-        let source_index = source_udp.insert_connection(source_connection)?;
-        let source_session = source_sessions
-            .insert_unbound_transport_session_for_test(UdpWorker::ID, source_index)?;
-        if !source_udp
-            .connection_mut(source_index)
-            .is_some_and(|connection| connection.attach_session(source_session))
-        {
-            return Err("source UDP Session attachment failed".into());
-        }
-        assert!(source_udp.lookup.insert_tuple(source_index, local, remote));
-        assert!(source_sessions.insert_session_endpoint(
-            source_session,
-            UdpWorker::ID,
-            local,
-            remote,
-        )?);
-        let old_handle = main
-            .lookup_endpoint(local, remote, UdpWorker::ID)
-            .ok_or("missing source UDP Session route")?;
-
-        let target_runtime =
-            DataPlaneRuntime::new(DataPlaneRuntimeConfig::default()).for_worker(2, 1)?;
-        let buffer = target_runtime.alloc_index_with_bytes(b"x")?;
-        assert_eq!(
-            target_udp.deliver_datagram(
-                &mut target_sessions,
-                &target_runtime,
-                buffer,
-                local,
-                remote,
-                0,
-                1,
-                false,
-                None,
-                NodeId::new(0),
-            )?,
-            UdpDelivery::MigrationQueued
-        );
-
-        let source_runtime =
-            DataPlaneRuntime::new(DataPlaneRuntimeConfig::default()).for_worker(2, 0)?;
-        let mut frame = BufferFrame::with_capacity(8);
-        let mut output = SessionQueueOutput::default();
-        <UdpWorker as SessionTransport<u32>>::update_time(
-            &mut source_udp,
-            &mut source_sessions,
-            &source_runtime,
-            SessionQueueNext::from_slot(0),
-            &mut frame,
-            &mut output,
-            Instant::now(),
-        )?;
-        <UdpWorker as SessionTransport<u32>>::update_time(
-            &mut target_udp,
-            &mut target_sessions,
-            &target_runtime,
-            SessionQueueNext::from_slot(0),
-            &mut frame,
-            &mut output,
-            Instant::now(),
-        )?;
-
-        let new_handle = main
-            .lookup_endpoint(local, remote, UdpWorker::ID)
-            .ok_or("missing target UDP Session route")?;
-        assert_ne!(new_handle, old_handle);
-        assert_eq!(new_handle.thread_index, 1);
-        assert!(target_sessions.session_id_from_handle(new_handle).is_some());
-        assert!(
-            target_udp
-                .lookup
-                .find_tuple(&target_udp.connections, local, remote)
-                .is_some()
-        );
-
-        source_sessions.schedule_disconnect(source_session);
-        dispatch_session_queue_events(
-            &source_runtime,
-            &mut source_sessions,
-            &mut source_udp,
-            SessionQueueNext::from_slot(0),
-            &mut frame,
-            &mut output,
-            Instant::now(),
-        )?;
-        assert!(source_sessions.session_id_from_handle(old_handle).is_none());
-        assert!(
-            source_udp
-                .lookup
-                .find_tuple(&source_udp.connections, local, remote)
-                .is_none()
-        );
-
-        <UdpWorker as SessionTransport<u32>>::update_time(
-            &mut source_udp,
-            &mut source_sessions,
-            &source_runtime,
-            SessionQueueNext::from_slot(0),
-            &mut frame,
-            &mut output,
-            Instant::now(),
-        )?;
-        let closed = main
-            .pop_session_switch_pool_closed(DataWorkerId::new(1))
-            .ok_or("missing closed notification")?;
-        assert!(
-            main.push_session_switch_pool_closed(&target_runtime, closed)
-                .is_ok()
-        );
-        <UdpWorker as SessionTransport<u32>>::update_time(
-            &mut target_udp,
-            &mut target_sessions,
-            &target_runtime,
-            SessionQueueNext::from_slot(0),
-            &mut frame,
-            &mut output,
-            Instant::now(),
-        )?;
-        assert!(main.lookup_endpoint(local, remote, UdpWorker::ID).is_none());
-        assert!(target_sessions.session_id_from_handle(new_handle).is_none());
-        assert!(
-            target_udp
-                .lookup
-                .find_tuple(&target_udp.connections, local, remote)
-                .is_none()
-        );
-
-        assert!(
-            main.push_session_switch_pool_closed(
-                &target_runtime,
-                SessionSwitchPoolClosed { new_sh: new_handle },
-            )
-            .is_ok()
-        );
-        <UdpWorker as SessionTransport<u32>>::update_time(
-            &mut target_udp,
-            &mut target_sessions,
-            &target_runtime,
-            SessionQueueNext::from_slot(0),
-            &mut frame,
-            &mut output,
-            Instant::now(),
-        )?;
-        assert!(main.lookup_endpoint(local, remote, UdpWorker::ID).is_none());
-        assert!(target_sessions.session_id_from_handle(new_handle).is_none());
-        Ok(())
-    }
-
-    #[test]
-    fn udp_worker_shutdown_drops_pending_migration_datagrams_and_clears_route()
-    -> Result<(), Box<dyn std::error::Error>> {
-        let applications = ApplicationMain::new(1024);
-        let main = Arc::new(SessionMain::new(2, Arc::clone(&applications)));
-        let mut sessions = SessionWorker::<u32>::new(
-            DataWorkerId::new(0),
-            2,
-            AppSessionConfig::default(),
-            1024,
-            Arc::clone(&applications),
-            None,
-        )?;
-        sessions.set_listener_main(Arc::clone(&main));
-        let mut udp = UdpWorker::new(DataWorkerId::new(0));
-        let (local, remote) = test_endpoints();
-        let connection = UdpConnection::connected(DataWorkerId::new(0), local, remote)
-            .ok_or("source UDP connection")?;
-        let connection_index = udp.insert_connection(connection)?;
-        let session_id =
-            sessions.insert_unbound_transport_session_for_test(UdpWorker::ID, connection_index)?;
-        if !udp
-            .connection_mut(connection_index)
-            .is_some_and(|connection| connection.attach_session(session_id))
-        {
-            return Err("source UDP Session attachment failed".into());
-        }
-        assert!(udp.lookup.insert_tuple(connection_index, local, remote));
-        assert!(sessions.insert_session_endpoint(session_id, UdpWorker::ID, local, remote,)?);
-        let old_handle = main
-            .lookup_endpoint(local, remote, UdpWorker::ID)
-            .ok_or("missing source UDP Session route")?;
-        let runtime = DataPlaneRuntime::new(DataPlaneRuntimeConfig::default()).for_worker(2, 0)?;
-        let request_buffer = runtime.alloc_index_with_bytes(b"request")?;
-        assert_eq!(
-            sessions.program_thread_migration(
-                &runtime,
-                DataWorkerId::new(1),
-                old_handle,
-                (UdpWorker::ID, local, remote),
-                SessionDgramArgs {
-                    index: request_buffer,
-                    payload_offset: 0,
-                    payload_len: 7,
-                    urgent: false,
-                    return_node: NodeId::new(0),
-                },
-            ),
-            SessionMigrateResult::Queued
-        );
-        let reply_buffer = runtime.alloc_index_with_bytes(b"reply")?;
-        assert!(
-            main.push_session_switch_pool_reply(
-                &runtime,
-                SessionSwitchPoolReply {
-                    old_sh: old_handle,
-                    new_sh: None,
-                    old_thread: DataWorkerId::new(0),
-                    new_thread: DataWorkerId::new(0),
-                    tuple: (UdpWorker::ID, local, remote),
-                    status: SessionSwitchPoolStatus::Rejected,
-                    state: None,
-                    dgram: SessionDgramArgs {
-                        index: reply_buffer,
-                        payload_offset: 0,
-                        payload_len: 5,
-                        urgent: false,
-                        return_node: NodeId::new(0),
-                    },
-                },
-            )
-            .is_ok()
-        );
-
-        main.begin_session_migration_shutdown();
-        let rendezvous_main = Arc::clone(&main);
-        let rendezvous = std::thread::spawn(move || {
-            for _ in 0..4 {
-                rendezvous_main.wait_session_migration_shutdown_phase();
-            }
-        });
-        udp.drain_migration_shutdown(&mut sessions, &runtime);
-        rendezvous.join().expect("shutdown phase rendezvous");
-
-        assert!(!main.endpoint_is_migrating(local, remote, UdpWorker::ID));
-        assert_eq!(
-            main.lookup_endpoint(local, remote, UdpWorker::ID),
-            Some(old_handle)
-        );
-        assert!(runtime.get_buffer(request_buffer).is_err());
-        assert!(runtime.get_buffer(reply_buffer).is_err());
-        Ok(())
-    }
-
-    #[test]
-    fn udp_source_reply_retry_republishes_to_target_queue() -> Result<(), Box<dyn std::error::Error>>
-    {
-        let applications = ApplicationMain::new(1024);
-        let main = Arc::new(SessionMain::new(2, Arc::clone(&applications)));
-        let mut source_sessions = SessionWorker::<u32>::new(
-            DataWorkerId::new(0),
-            2,
-            AppSessionConfig::default(),
-            1024,
-            Arc::clone(&applications),
-            None,
-        )?;
-        source_sessions.set_listener_main(Arc::clone(&main));
-        let mut source_udp = UdpWorker::new(DataWorkerId::new(0));
-        let (local, remote) = test_endpoints();
-        let source_connection = UdpConnection::connected(DataWorkerId::new(0), local, remote)
-            .ok_or("source UDP connection")?;
-        let source_index = source_udp.insert_connection(source_connection)?;
-        let source_session = source_sessions
-            .insert_unbound_transport_session_for_test(UdpWorker::ID, source_index)?;
-        if !source_udp
-            .connection_mut(source_index)
-            .is_some_and(|connection| connection.attach_session(source_session))
-        {
-            return Err("source UDP Session attachment failed".into());
-        }
-        assert!(source_udp.lookup.insert_tuple(source_index, local, remote));
-        assert!(source_sessions.insert_session_endpoint(
-            source_session,
-            UdpWorker::ID,
-            local,
-            remote,
-        )?);
-        let old_handle = main
-            .lookup_endpoint(local, remote, UdpWorker::ID)
-            .ok_or("missing source UDP Session route")?;
-        let source_runtime =
-            DataPlaneRuntime::new(DataPlaneRuntimeConfig::default()).for_worker(2, 0)?;
-        let buffer = source_runtime.alloc_index_with_bytes(b"x")?;
-        assert_eq!(
-            source_sessions.program_thread_migration(
-                &source_runtime,
-                DataWorkerId::new(1),
-                old_handle,
-                (UdpWorker::ID, local, remote),
-                SessionDgramArgs {
-                    index: buffer,
-                    payload_offset: 0,
-                    payload_len: 1,
-                    urgent: false,
-                    return_node: NodeId::new(0),
-                },
-            ),
-            SessionMigrateResult::Queued
-        );
-        assert!(source_sessions.pop_session_migrate_request().is_some());
-        let state = source_sessions
-            .migration_snapshot(source_session)
-            .ok_or("missing source migration state")?;
-        let dgram = SessionDgramArgs {
-            index: buffer,
-            payload_offset: 0,
-            payload_len: 1,
-            urgent: false,
-            return_node: NodeId::new(0),
-        };
-        for _ in 0..1024 {
-            assert!(
-                main.push_session_switch_pool_reply(
-                    &source_runtime,
-                    SessionSwitchPoolReply {
-                        old_sh: old_handle,
-                        new_sh: None,
-                        old_thread: DataWorkerId::new(0),
-                        new_thread: DataWorkerId::new(1),
-                        tuple: (UdpWorker::ID, local, remote),
-                        status: SessionSwitchPoolStatus::Rejected,
-                        state: None,
-                        dgram,
-                    },
-                )
-                .is_ok()
-            );
-        }
-        source_udp
-            .session_switch_pool_replies
-            .push_back(SessionSwitchPoolReply {
-                old_sh: old_handle,
-                new_sh: None,
-                old_thread: DataWorkerId::new(0),
-                new_thread: DataWorkerId::new(1),
-                tuple: (UdpWorker::ID, local, remote),
-                status: SessionSwitchPoolStatus::Prepared,
-                state: Some(state),
-                dgram,
-            });
-
-        source_udp.drain_migration_replies(&mut source_sessions, &source_runtime);
-
-        assert_eq!(source_udp.session_switch_pool_replies.len(), 1);
-        assert_eq!(
-            main.lookup_endpoint(local, remote, UdpWorker::ID),
-            Some(old_handle)
-        );
-        Ok(())
-    }
-
-    #[test]
-    fn udp_disconnect_removes_connection_and_session_lookup()
-    -> Result<(), Box<dyn std::error::Error>> {
-        let (mut sessions, mut udp, applications, _main, _server) = worker_state();
-        let application = applications.attach()?;
-        sessions.install_application_mq_for_test(application)?;
-        let application_connection =
-            applications.register_connection(application, 0, None, None, None)?;
-        let (local, remote) = test_endpoints();
-        let connection_id = application_connection;
-        let session_id = udp.active_connect(&mut sessions, connection_id, local, remote)?;
-        let (transport_id, index) = sessions
-            .session_transport(session_id)
-            .expect("UDP Session transport");
-        assert_eq!(transport_id, UdpWorker::ID);
-
-        let runtime = DataPlaneRuntime::new(DataPlaneRuntimeConfig::default())
-            .for_worker(1, 0)
-            .expect("worker runtime");
-        let mut frame = BufferFrame::with_capacity(8);
-        let mut output = SessionQueueOutput::default();
-        <UdpWorker as SessionTransport<u32>>::disconnect(
-            &mut udp,
-            &mut sessions,
-            index,
-            &runtime,
-            SessionQueueNext::from_slot(0),
-            &mut frame,
-            &mut output,
-            Instant::now(),
-        )?;
-
-        assert!(udp.connections.get(index).is_none());
-        assert!(
-            sessions
-                .lookup_session_endpoint(UdpWorker::ID, local, remote)?
-                .is_none()
-        );
-        Ok(())
-    }
-
-    #[test]
-    fn udp_tx_writes_datagram_buffer_without_consuming_untill_output_commit()
-    -> Result<(), Box<dyn std::error::Error>> {
-        let (mut sessions, mut udp, applications, main, _server) = worker_state();
-        let application = applications.attach()?;
-        sessions.install_application_mq_for_test(application)?;
-        let application_listener = applications.register_listener(application, None, None)?;
-        let (local, remote) = test_endpoints();
-        let listener = main.listen(
-            application_listener,
-            SessionTransportRegistration::new(
-                "udp-test",
-                Some(noop_start_listen),
-                Some(noop_stop_listen),
-                None,
-            ),
-            SessionListenEndpoint::new(local, DataWorkerId::new(0)),
-        )?;
-        let udp_listener =
-            UdpListener::new(local, listener, DataWorkerId::new(0)).expect("UDP listener");
-        let (index, session_id) =
-            udp.accept_datagram(&mut sessions, udp_listener, local, remote)?;
-        let app = sessions
-            .app_session(session_id)
-            .expect("UDP Session owns an AppSession")
-            .clone();
-        app.send_datagram_to(local, remote, b"reply")?;
-
-        let runtime = DataPlaneRuntime::new(DataPlaneRuntimeConfig::default())
-            .for_worker(1, 0)
-            .expect("worker runtime");
-        let mut frame = BufferFrame::with_capacity(8);
-        let mut output = SessionQueueOutput::default();
-        udp.internal_tx(
-            &mut sessions,
-            session_id,
-            index,
-            &runtime,
-            SessionQueueNext::from_slot(0),
-            &mut frame,
-            &mut output,
-            Instant::now(),
-        )?;
-
-        let buffer = frame
-            .pending_indices()
-            .iter()
-            .copied()
-            .next()
-            .expect("UDP TX buffer");
-        let packet = runtime.buffers().get_buffer(buffer)?.current().to_vec();
-        assert_eq!(packet.len(), 13);
-        assert_eq!(&packet[..2], &9000_u16.to_be_bytes());
-        assert_eq!(&packet[2..4], &50000_u16.to_be_bytes());
-        assert_eq!(&packet[4..6], &13_u16.to_be_bytes());
-        assert_eq!(&packet[8..], b"reply");
-        assert!(
-            sessions.peek_tx_datagram(session_id)?.is_none(),
-            "UDP TX FIFO is consumed after output enqueue"
-        );
         Ok(())
     }
 }

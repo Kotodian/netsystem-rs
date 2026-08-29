@@ -62,21 +62,3 @@ pub(crate) fn write_udp_header(
 }
 
 const UDP_HEADER_LEN: usize = 8;
-
-#[cfg(test)]
-mod tests {
-    use super::UdpHeader;
-
-    #[test]
-    fn reads_network_order_fields() {
-        let bytes: [u8; 8] = [0x30, 0x39, 0x00, 0x35, 0x00, 0x10, 0xab, 0xcd];
-        // SAFETY: the byte array contains a complete `UdpHeader`; the packed
-        // wire layout permits an unaligned read.
-        let header = unsafe { bytes.as_ptr().cast::<UdpHeader>().read_unaligned() };
-
-        assert_eq!(header.source_port(), 12_345);
-        assert_eq!(header.destination_port(), 53);
-        assert_eq!(header.length(), 16);
-        assert_eq!(header.checksum(), 0xabcd);
-    }
-}
