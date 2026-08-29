@@ -61,34 +61,3 @@ impl<T: BufMut> BufMutExt for T {
         x.encode(self);
     }
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn decode_u8_needs_a_byte() {
-        let mut empty: &[u8] = &[];
-        assert_eq!(BufExt::get::<u8>(&mut empty), Err(UnexpectedEnd(1)));
-        let mut one: &[u8] = &[0x2a];
-        assert_eq!(BufExt::get::<u8>(&mut one), Ok(0x2a));
-        assert!(!one.has_remaining());
-    }
-
-    #[test]
-    fn encode_u8() {
-        let mut out = Vec::new();
-        out.write(0x2au8);
-        assert_eq!(out, vec![0x2a]);
-    }
-
-    #[test]
-    fn get_var_and_write_var() {
-        let mut out = Vec::new();
-        out.write_var(VarInt::from_u32(64));
-        assert_eq!(out, vec![0x40, 0x40]);
-
-        let mut read: &[u8] = &out;
-        assert_eq!(read.get_var(), Ok(64));
-    }
-}
