@@ -3,6 +3,13 @@ use std::mem;
 
 pub const CACHE_LINE: usize = 64;
 
+/// VPP's minimum backing alignment for ordinary vectors and pools.
+///
+/// This is the Rust equivalent of `VEC_MIN_ALIGN` in the vendored VPP
+/// `vec_bootstrap.h`. It controls the allocation base only; it does not alter
+/// an element's stride or add cache-line padding.
+pub const VEC_MIN_ALIGN: usize = 8;
+
 /// Zero-sized field marker corresponding to VPP's
 /// `CLIB_CACHE_LINE_ALIGN_MARK(mark)`.
 ///
@@ -33,7 +40,7 @@ pub fn is_aligned<T>(ptr: *const T, alignment: usize) -> bool {
 
 #[inline(always)]
 pub(crate) fn allocation_align<T, const ALIGN: usize>() -> usize {
-    let requested = if ALIGN == 0 { 1 } else { ALIGN };
+    let requested = if ALIGN == 0 { VEC_MIN_ALIGN } else { ALIGN };
     assert!(
         requested.is_power_of_two(),
         "alignment must be a power of two"
