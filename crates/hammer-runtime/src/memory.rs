@@ -1,6 +1,6 @@
 use crate::config::{Memory, Worker};
-use crate::engine::Engine;
 use crate::error::RuntimeResult;
+use crate::global_main::GlobalMain;
 use hammer_component_macros::config_function;
 
 impl Memory {
@@ -15,6 +15,6 @@ impl Memory {
 }
 
 #[config_function(name = "runtime_worker_config", section = "worker", early = true)]
-fn configure_worker(worker: Worker, engine: &mut Engine) -> RuntimeResult<()> {
+fn configure_worker(worker: Worker, engine: &mut GlobalMain) -> RuntimeResult<()> {
     engine.apply_worker_config(worker)
 }

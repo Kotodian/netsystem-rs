@@ -1127,7 +1127,7 @@ fn expand_node(
     let registration_impl = if args.role.is_some() {
         quote! {
             #[inline]
-            pub fn node_registration(&self) -> ::hammer_core::data_plane::NodeRegistration {
+            pub fn node_registration(&self) -> Option<::hammer_core::data_plane::NodeRegistration> {
                 #registration_tokens
             }
         }
@@ -1174,7 +1174,7 @@ fn expand_node(
                     for #ident #ty_generics #role_where_clause
                 {
                     #[inline]
-                    fn node_registration(&self) -> ::hammer_core::data_plane::NodeRegistration {
+                    fn node_registration(&self) -> Option<::hammer_core::data_plane::NodeRegistration> {
                         self.node_registration()
                     }
 
@@ -1198,7 +1198,7 @@ fn expand_node(
                     for #ident #ty_generics #role_where_clause
                 {
                     #[inline]
-                    fn node_registration(&self) -> ::hammer_core::data_plane::NodeRegistration {
+                    fn node_registration(&self) -> Option<::hammer_core::data_plane::NodeRegistration> {
                         self.node_registration()
                     }
 
@@ -1246,21 +1246,21 @@ fn node_registration_tokens(
         quote!(Self::NODE_NAME)
     };
     if let Some(next) = next {
-        quote!(::hammer_core::data_plane::NodeRegistration::next(#name, #next::COUNT))
+        quote!(Some(::hammer_core::data_plane::NodeRegistration::next(#name, #next::COUNT)))
     } else if let Some(sibling_of) = sibling_of {
-        quote!(::hammer_core::data_plane::NodeRegistration::sibling_of(
+        quote!(Some(::hammer_core::data_plane::NodeRegistration::sibling_of(
             #name,
             #sibling_of::NODE_NAME
-        ))
+        )))
     } else {
         let _ = ident;
         if allow_name_override {
-            quote!(::hammer_core::data_plane::NodeRegistration::Plain)
+            quote!(None)
         } else {
-            quote!(::hammer_core::data_plane::NodeRegistration::next(
+            quote!(Some(::hammer_core::data_plane::NodeRegistration::next(
                 Self::NODE_NAME,
                 0,
-            ))
+            )))
         }
     }
 }
@@ -1640,15 +1640,15 @@ fn graph_node_registration(
 ) -> TokenStream2 {
     match (next, sibling_of) {
         (Some(next), None) => {
-            quote!(::hammer_core::data_plane::NodeRegistration::next(#name, #next::COUNT))
+            quote!(Some(::hammer_core::data_plane::NodeRegistration::next(#name, #next::COUNT)))
         }
-        (None, Some(sibling_of)) => quote!(
+        (None, Some(sibling_of)) => quote!(Some(
             ::hammer_core::data_plane::NodeRegistration::sibling_of(
                 #name,
                 #sibling_of::NODE_NAME,
             )
-        ),
-        (None, None) => quote!(::hammer_core::data_plane::NodeRegistration::next(#name, 0)),
+        )),
+        (None, None) => quote!(Some(::hammer_core::data_plane::NodeRegistration::next(#name, 0))),
         (Some(_), Some(_)) => unreachable!("graph node args reject next with sibling_of"),
     }
 }
@@ -1750,7 +1750,7 @@ fn generated_graph_node_init(
         .map(|state| quote!(runtime.nodes().set_node_state(node_id, #state)?;));
     let generated = quote! {
         fn #init_ident(
-            runtime: &::hammer_runtime::DataPlaneRuntime,
+            runtime: &::hammer_runtime::DataPlaneMain,
         ) -> ::hammer_runtime::RuntimeResult<::hammer_core::data_plane::NodeId> {
             let node = #constructor;
             let node_id = #register;
@@ -1765,7 +1765,7 @@ fn generated_graph_node_init(
 ///
 /// Emits a `NodeEntry` into the current link image's private catalog.
 /// A zero-state `kind = driver|internal` unit node receives a generated init.
-/// Nodes with business state supply `init = path`. `DataPlaneRuntime::init_graph`
+/// Nodes with business state supply `init = path`. `DataPlaneMain::init_graph`
 /// walks the filtered catalog and resolves named next-node arcs after registration.
 /// ```ignore
 /// #[hammer_component_macros::graph_node(kind = driver, name = "device-input", next = DeviceInputNext)]
@@ -2628,19 +2628,20 @@ fn config_function_static_name(fn_name: &LitStr) -> Ident {
 /// Example:
 /// ```ignore
 /// #[init_function(name = "tcp_init", runs_after = ["buffer_main_init"], runs_before = ["session_init"])]
-/// fn tcp_init(vm: &mut Engine, config: Arc<Config>) -> RuntimeResult<Arc<TcpMain>> { ... }
+/// fn tcp_init(vm: &mut GlobalMain, config: Arc<Config>) -> RuntimeResult<Arc<TcpMain>> { ... }
 /// ```
 #[proc_macro_attribute]
 pub fn init_function(args: TokenStream, input: TokenStream) -> TokenStream {
     let args = parse_macro_input!(args as InitFnArgs);
     let fn_item = parse_macro_input!(input as syn::ItemFn);
-    expand_registered_function(args, fn_item)
+    expand_registered_function(args, fn_item, false)
         .unwrap_or_else(Error::into_compile_error)
         .into()
 }
 
 enum InitArgument {
-    Engine,
+    GlobalMain,
+    DataPlaneMain,
     Required { binding: Ident, ty: Type },
     Optional { binding: Ident, ty: Type },
 }
@@ -2651,9 +2652,13 @@ enum InitOutput {
     OptionalArc,
 }
 
-fn expand_registered_function(args: InitFnArgs, mut function: ItemFn) -> Result<TokenStream2> {
+fn expand_registered_function(
+    args: InitFnArgs,
+    mut function: ItemFn,
+    worker: bool,
+) -> Result<TokenStream2> {
     validate_init_function_qualifiers(&function)?;
-    let arguments = init_arguments(&mut function)?;
+    let arguments = init_arguments(&mut function, worker)?;
     let output = init_output(&function)?;
     let function_name = &function.sig.ident;
     let adapter_name = format_ident!("__hammer_init_adapter_{}", function_name);
@@ -2675,16 +2680,18 @@ fn expand_registered_function(args: InitFnArgs, mut function: ItemFn) -> Result<
     let mut call_arguments = Vec::with_capacity(arguments.len());
     for argument in arguments {
         match argument {
-            InitArgument::Engine => call_arguments.push(quote!(__hammer_engine)),
+            InitArgument::GlobalMain | InitArgument::DataPlaneMain => {
+                call_arguments.push(quote!(__hammer_main))
+            }
             InitArgument::Required { binding, ty } => {
                 injections.push(quote! {
-                    let #binding = __hammer_engine.registry.require::<#ty>()?;
+                    let #binding = __hammer_main.registry().require::<#ty>()?;
                 });
                 call_arguments.push(quote!(#binding));
             }
             InitArgument::Optional { binding, ty } => {
                 injections.push(quote! {
-                    let Some(#binding) = __hammer_engine.registry.get::<#ty>() else {
+                    let Some(#binding) = __hammer_main.registry().get::<#ty>() else {
                         return Ok(());
                     };
                 });
@@ -2696,15 +2703,26 @@ fn expand_registered_function(args: InitFnArgs, mut function: ItemFn) -> Result<
         InitOutput::Unit => quote!(#function_name(#(#call_arguments),*)),
         InitOutput::Arc => quote! {
             let __hammer_produced = #function_name(#(#call_arguments),*)?;
-            __hammer_engine.registry.set(__hammer_produced);
+            __hammer_main.registry().set(__hammer_produced);
             Ok(())
         },
         InitOutput::OptionalArc => quote! {
             if let Some(__hammer_produced) = #function_name(#(#call_arguments),*)? {
-                __hammer_engine.registry.set(__hammer_produced);
+                __hammer_main.registry().set(__hammer_produced);
             }
             Ok(())
         },
+    };
+
+    let main_type = if worker {
+        quote!(::hammer_runtime::DataPlaneMain)
+    } else {
+        quote!(::hammer_runtime::GlobalMain)
+    };
+    let registration_type = if worker {
+        quote!(::hammer_runtime::init::WorkerInitFunction)
+    } else {
+        quote!(::hammer_runtime::init::InitFunction)
     };
 
     Ok(quote! {
@@ -2712,15 +2730,15 @@ fn expand_registered_function(args: InitFnArgs, mut function: ItemFn) -> Result<
 
         #(#adapter_attributes)*
         fn #adapter_name(
-            __hammer_engine: &mut ::hammer_runtime::Engine,
+            __hammer_main: &mut #main_type,
         ) -> ::hammer_runtime::RuntimeResult<()> {
             #(#injections)*
             #invoke
         }
 
         #(#registration_attributes)*
-        pub(crate) static #static_ident: ::hammer_runtime::init::InitFunction =
-            ::hammer_runtime::init::InitFunction {
+        pub(crate) static #static_ident: #registration_type =
+            #registration_type {
             name: #name,
             runs_before: &[#(#runs_before),*],
             runs_after: &[#(#runs_after),*],
@@ -2747,9 +2765,9 @@ fn validate_init_function_qualifiers(function: &ItemFn) -> Result<()> {
     Ok(())
 }
 
-fn init_arguments(function: &mut ItemFn) -> Result<Vec<InitArgument>> {
+fn init_arguments(function: &mut ItemFn, worker: bool) -> Result<Vec<InitArgument>> {
     let mut arguments = Vec::with_capacity(function.sig.inputs.len());
-    let mut engine_count = 0usize;
+    let mut main_count = 0usize;
     for (index, argument) in function.sig.inputs.iter_mut().enumerate() {
         let FnArg::Typed(argument) = argument else {
             return Err(Error::new(
@@ -2758,21 +2776,29 @@ fn init_arguments(function: &mut ItemFn) -> Result<Vec<InitArgument>> {
             ));
         };
         let optional = take_optional_injection(&mut argument.attrs)?;
-        if is_mut_engine_reference(&argument.ty) {
+        if is_mut_main_reference(&argument.ty, worker) {
             if optional {
                 return Err(Error::new(
                     argument.span(),
-                    "the Engine parameter cannot use #[inject(optional)]",
+                    "the main parameter cannot use #[inject(optional)]",
                 ));
             }
-            engine_count += 1;
-            arguments.push(InitArgument::Engine);
+            main_count += 1;
+            arguments.push(if worker {
+                InitArgument::DataPlaneMain
+            } else {
+                InitArgument::GlobalMain
+            });
             continue;
         }
         let Some(ty) = wrapped_type(&argument.ty, "Arc") else {
             return Err(Error::new(
                 argument.ty.span(),
-                "init parameters must be `&mut Engine` or `Arc<T>`",
+                if worker {
+                    "worker init parameters must be `&mut DataPlaneMain` or `Arc<T>`"
+                } else {
+                    "init parameters must be `&mut GlobalMain` or `Arc<T>`"
+                },
             ));
         };
         let binding = format_ident!("__hammer_injected_{index}");
@@ -2782,10 +2808,14 @@ fn init_arguments(function: &mut ItemFn) -> Result<Vec<InitArgument>> {
             InitArgument::Required { binding, ty }
         });
     }
-    if engine_count > 1 {
+    if main_count > 1 {
         return Err(Error::new(
             function.sig.inputs.span(),
-            "init functions can have at most one `&mut Engine` parameter",
+            if worker {
+                "worker init functions can have at most one `&mut DataPlaneMain` parameter"
+            } else {
+                "init functions can have at most one `&mut GlobalMain` parameter"
+            },
         ));
     }
     Ok(arguments)
@@ -2815,11 +2845,19 @@ fn take_optional_injection(attributes: &mut Vec<Attribute>) -> Result<bool> {
     Ok(optional)
 }
 
-fn is_mut_engine_reference(ty: &Type) -> bool {
+fn is_mut_main_reference(ty: &Type, worker: bool) -> bool {
     let Type::Reference(reference) = ty else {
         return false;
     };
-    reference.mutability.is_some() && type_path_ends_with(&reference.elem, "Engine")
+    reference.mutability.is_some()
+        && type_path_ends_with(
+            &reference.elem,
+            if worker {
+                "DataPlaneMain"
+            } else {
+                "GlobalMain"
+            },
+        )
 }
 
 fn type_path_ends_with(ty: &Type, expected: &str) -> bool {
@@ -2889,7 +2927,7 @@ fn init_output(function: &ItemFn) -> Result<InitOutput> {
 /// Example:
 /// ```ignore
 /// #[config_function(name = "tcp_config", section = "plugin.tcp", early = true)]
-/// fn configure_tcp(config: TcpPluginConfig, engine: &mut Engine) -> RuntimeResult<()> { ... }
+/// fn configure_tcp(config: TcpPluginConfig, engine: &mut GlobalMain) -> RuntimeResult<()> { ... }
 ///
 /// Use `required = true` when the section and all of its fields must be
 /// present instead of defaulting through a generated wrapper.
@@ -2905,7 +2943,7 @@ pub fn config_function(args: TokenStream, input: TokenStream) -> TokenStream {
 
 enum ConfigArgument {
     Section { ty: Type },
-    Engine,
+    GlobalMain,
     Required { binding: Ident, ty: Type },
     Optional { binding: Ident, ty: Type },
 }
@@ -2922,15 +2960,15 @@ fn config_arguments(function: &mut ItemFn) -> Result<Vec<ConfigArgument>> {
             ));
         };
         let optional = take_optional_injection(&mut argument.attrs)?;
-        if is_mut_engine_reference(&argument.ty) {
+        if is_mut_main_reference(&argument.ty, false) {
             if optional {
                 return Err(Error::new(
                     argument.span(),
-                    "the Engine parameter cannot use #[inject(optional)]",
+                    "the GlobalMain parameter cannot use #[inject(optional)]",
                 ));
             }
             engine_count += 1;
-            arguments.push(ConfigArgument::Engine);
+            arguments.push(ConfigArgument::GlobalMain);
             continue;
         }
         if let Some(ty) = wrapped_type(&argument.ty, "Arc") {
@@ -2962,7 +3000,7 @@ fn config_arguments(function: &mut ItemFn) -> Result<Vec<ConfigArgument>> {
     if engine_count > 1 {
         return Err(Error::new(
             function.sig.inputs.span(),
-            "config functions can have at most one `&mut Engine` parameter",
+            "config functions can have at most one `&mut GlobalMain` parameter",
         ));
     }
     Ok(arguments)
@@ -3073,7 +3111,7 @@ fn expand_config_function(args: ConfigFnArgs, mut function: ItemFn) -> Result<To
                 });
                 call_arguments.push(quote!(__hammer_config));
             }
-            ConfigArgument::Engine => call_arguments.push(quote!(__hammer_engine)),
+            ConfigArgument::GlobalMain => call_arguments.push(quote!(__hammer_engine)),
             ConfigArgument::Required { binding, ty } => {
                 injections.push(quote! {
                     let #binding = __hammer_engine.registry.require::<#ty>()?;
@@ -3111,7 +3149,7 @@ fn expand_config_function(args: ConfigFnArgs, mut function: ItemFn) -> Result<To
         #(#adapter_attributes)*
         fn #adapter_name(
             __hammer_document: &str,
-            __hammer_engine: &mut ::hammer_runtime::Engine,
+            __hammer_engine: &mut ::hammer_runtime::GlobalMain,
         ) -> ::hammer_runtime::RuntimeResult<()> {
             #(#injections)*
             #invoke
@@ -3145,7 +3183,7 @@ pub fn early_config_function(args: TokenStream, input: TokenStream) -> TokenStre
 /// Example:
 /// ```ignore
 /// #[main_loop_enter_function]
-/// fn start_workers(vm: &mut Engine, config: Arc<Config>) -> RuntimeResult<()> { ... }
+/// fn start_workers(vm: &mut GlobalMain, config: Arc<Config>) -> RuntimeResult<()> { ... }
 /// ```
 #[proc_macro_attribute]
 pub fn main_loop_enter_function(args: TokenStream, input: TokenStream) -> TokenStream {
@@ -3189,6 +3227,7 @@ fn expand_main_loop_function(function: ItemFn) -> Result<TokenStream2> {
             runs_after: Vec::new(),
         },
         function,
+        false,
     )
 }
 
@@ -3197,13 +3236,13 @@ fn expand_main_loop_function(function: ItemFn) -> Result<TokenStream2> {
 /// Example:
 /// ```ignore
 /// #[worker_init_function(name = "tcp_worker_init", runs_after = ["generic_worker_init"])]
-/// fn tcp_worker_init(vm: &mut Engine, tcp: Arc<TcpMain>) -> RuntimeResult<()> { ... }
+/// fn tcp_worker_init(vm: &mut DataPlaneMain, tcp: Arc<TcpMain>) -> RuntimeResult<()> { ... }
 /// ```
 #[proc_macro_attribute]
 pub fn worker_init_function(args: TokenStream, input: TokenStream) -> TokenStream {
     let args = parse_macro_input!(args as InitFnArgs);
     let fn_item = parse_macro_input!(input as syn::ItemFn);
-    expand_registered_function(args, fn_item)
+    expand_registered_function(args, fn_item, true)
         .unwrap_or_else(Error::into_compile_error)
         .into()
 }

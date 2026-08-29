@@ -1,8 +1,7 @@
 use hammer_core::data_plane::{Buffer, BufferFrame, Index, NodeId, NodeRegistration};
 use hammer_runtime::RuntimeResult;
 use hammer_runtime::{
-    DataPlaneRuntime, InternalNode, Node, NodeErrorCode, NodeProcessFn, NodeResult,
-    add_packet_trace,
+    DataPlaneMain, InternalNode, Node, NodeErrorCode, NodeProcessFn, add_packet_trace,
 };
 
 pub use crate::feature_arc::{
@@ -14,7 +13,7 @@ pub use crate::feature_arc::{
 /// index in a packet buffer.
 #[inline(always)]
 pub fn set_buffer_node_error<E>(
-    runtime: &DataPlaneRuntime,
+    runtime: &DataPlaneMain,
     buffer: &mut Buffer,
     error: E,
 ) -> RuntimeResult<()>
@@ -29,11 +28,7 @@ where
 /// Record a generated node-local error and store its preinstalled global
 /// index in the packet buffer identified by `index`.
 #[inline(always)]
-pub fn set_index_node_error<E>(
-    runtime: &DataPlaneRuntime,
-    index: Index,
-    error: E,
-) -> RuntimeResult<()>
+pub fn set_index_node_error<E>(runtime: &DataPlaneMain, index: Index, error: E) -> RuntimeResult<()>
 where
     E: NodeErrorCode,
 {
@@ -75,11 +70,11 @@ impl HandoffNode {
     }
 }
 
-pub fn register_drop(runtime: &DataPlaneRuntime) -> RuntimeResult<NodeId> {
+pub fn register_drop(runtime: &DataPlaneMain) -> RuntimeResult<NodeId> {
     runtime.nodes().try_register_internal(DropNode)
 }
 
-pub fn register_handoff(runtime: &DataPlaneRuntime) -> RuntimeResult<NodeId> {
+pub fn register_handoff(runtime: &DataPlaneMain) -> RuntimeResult<NodeId> {
     runtime
         .nodes()
         .register_internal_with_handle(runtime.handoff_node_handle()?, HandoffNode)
@@ -92,8 +87,8 @@ pub struct DropTrace {
 
 impl Node for DropNode {
     #[inline(always)]
-    fn process(&mut self, _runtime: &DataPlaneRuntime, _frame: &mut BufferFrame) -> NodeResult {
-        NodeResult::drop()
+    fn process(&mut self, _runtime: &DataPlaneMain, _frame: &mut BufferFrame) -> () {
+        ()
     }
 
     #[inline]
@@ -103,12 +98,12 @@ impl Node for DropNode {
 }
 
 fn drop_node_process(
-    runtime: &DataPlaneRuntime,
+    runtime: &DataPlaneMain,
     _data: hammer_runtime::node::NodeRuntimeData,
     frame: &mut BufferFrame,
-) -> NodeResult {
-    let dropped = frame.pending_len();
-    let indices = frame.pending_indices();
+) -> () {
+    let dropped = frame.len();
+    let indices = frame.indices();
     let len = indices.len();
     let mut read = 0usize;
     while read + 4 <= len {
@@ -155,23 +150,23 @@ fn drop_node_process(
         let _ = add_packet_trace!(runtime, index0, DropTrace { dropped });
         read += 1;
     }
-    NodeResult::drop()
+    ()
 }
 
 impl InternalNode for DropNode {
     #[inline]
-    fn node_registration(&self) -> NodeRegistration
+    fn node_registration(&self) -> Option<NodeRegistration>
     where
         Self: Sized,
     {
-        NodeRegistration::next(Self::NODE_NAME, 0)
+        Some(NodeRegistration::next(Self::NODE_NAME, 0))
     }
 }
 
 impl Node for HandoffNode {
     #[inline(always)]
-    fn process(&mut self, _runtime: &DataPlaneRuntime, _frame: &mut BufferFrame) -> NodeResult {
-        NodeResult::drop()
+    fn process(&mut self, _runtime: &DataPlaneMain, _frame: &mut BufferFrame) -> () {
+        ()
     }
 
     #[inline]
@@ -181,10 +176,10 @@ impl Node for HandoffNode {
 }
 
 fn handoff_node_process(
-    runtime: &DataPlaneRuntime,
+    runtime: &DataPlaneMain,
     _data: hammer_runtime::node::NodeRuntimeData,
     frame: &mut BufferFrame,
-) -> NodeResult {
+) -> () {
     // Handoff continuation stores the destination as NodeId in current_config.
     // Direct get/push/put is allowed for Handoff; Graph Fanout stays worker-local
     // and does not resolve cross-worker continuation identities.
@@ -205,15 +200,15 @@ fn handoff_node_process(
             .put_next_frame(next_frame)
             .expect("handoff continuation put");
     }
-    NodeResult::drop()
+    ()
 }
 
 impl InternalNode for HandoffNode {
     #[inline]
-    fn node_registration(&self) -> NodeRegistration
+    fn node_registration(&self) -> Option<NodeRegistration>
     where
         Self: Sized,
     {
-        NodeRegistration::next(Self::NODE_NAME, 0)
+        Some(NodeRegistration::next(Self::NODE_NAME, 0))
     }
 }

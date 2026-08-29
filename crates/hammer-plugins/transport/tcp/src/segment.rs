@@ -8,7 +8,7 @@ use crate::{
     tcp_options_from_bytes,
 };
 use hammer_core::data_plane::{BufferPacketCursor, Index};
-use hammer_runtime::DataPlaneRuntime;
+use hammer_runtime::DataPlaneMain;
 use hammer_runtime::RuntimeResult;
 use hammer_service::opaque::NetworkOpaque;
 
@@ -120,7 +120,7 @@ impl TcpSegment {
     }
 }
 
-pub(crate) fn tcp_packet(runtime: &DataPlaneRuntime, index: Index) -> RuntimeResult<TcpPacket> {
+pub(crate) fn tcp_packet(runtime: &DataPlaneMain, index: Index) -> RuntimeResult<TcpPacket> {
     let buffer = runtime.get_buffer(index)?;
     let network = unsafe { transmute::<_, &NetworkOpaque>(buffer.opaque()) };
     let cursor = network.packet_cursor();

@@ -7,7 +7,7 @@ use std::sync::OnceLock;
 use hammer_runtime::RuntimeRegistry;
 use hammer_runtime::attach::AppServer;
 use hammer_runtime::config::{Memory, Worker};
-use hammer_runtime::engine::{Engine, EnginePool};
+use hammer_runtime::global_main::GlobalMain;
 use hammer_runtime::log::Level;
 use hammer_runtime::{RuntimeError, RuntimeResult};
 
@@ -162,32 +162,30 @@ fn config_path_from_args() -> PathBuf {
 
 fn run(config: String, roots: Vec<String>, worker: Worker) {
     let registry = RuntimeRegistry::new();
-    let engine = Engine::new_configured(Arc::clone(&registry), worker).unwrap_or_else(|error| {
-        eprintln!("Failed to construct configured runtime: {error}");
-        std::process::exit(1);
-    });
+    let engine =
+        GlobalMain::new_configured(Arc::clone(&registry), worker).unwrap_or_else(|error| {
+            eprintln!("Failed to construct configured runtime: {error}");
+            std::process::exit(1);
+        });
     let rt = tokio::runtime::Builder::new_current_thread()
         .enable_io()
         .enable_time()
         .build()
         .expect("build tokio runtime");
 
-    let mut pool = match EnginePool::new(engine, &rt) {
-        Ok(pool) => pool,
-        Err(error) => {
-            eprintln!("Failed to construct stats-enabled runtime: {error}");
-            std::process::exit(1);
-        }
-    };
+    let mut engine = engine;
+    if let Err(error) = engine.init_control(&rt) {
+        eprintln!("Failed to construct stats-enabled runtime: {error}");
+        std::process::exit(1);
+    }
 
-    pool.main_engine_mut()
+    engine
         .plugin_main_mut()
         .register_builtin_image(hammer_service::registration_image());
-    pool.main_loop_enter(&roots, &config, &rt)
-        .unwrap_or_else(|e| {
-            eprintln!("main_loop_enter failed: {e}");
-            std::process::exit(1);
-        });
+    engine.main_loop_enter(&roots, &config).unwrap_or_else(|e| {
+        eprintln!("main_loop_enter failed: {e}");
+        std::process::exit(1);
+    });
     drop(config);
 
     let attach_server = registry.get::<AppServer>();
@@ -197,7 +195,7 @@ fn run(config: String, roots: Vec<String>, worker: Worker) {
 
     // The `binary-api` Process Node serves the Binary API socket; it runs as
     // a registered Process Node, not as a control-loop select arm.
-    if let Err(error) = pool.run_processes_until(&rt, async move {
+    if let Err(error) = engine.run_processes_until(&rt, async move {
         match attach_server {
             Some(attach) => {
                 let attach_applications = applications
@@ -240,12 +238,13 @@ fn run(config: String, roots: Vec<String>, worker: Worker) {
 
     // `close` first drops the top-level control dispatcher and its registered
     // listener, unlinks the stats path, then stops and joins Data Workers.
-    pool.close()
+    engine
+        .close()
         .unwrap_or_else(|error| tracing::error!(%error, "Main-loop exit hook failed"));
-    pool.main_engine_mut()
+    engine
         .shutdown_process_nodes(&rt)
         .unwrap_or_else(|error| tracing::error!(%error, "Process Node shutdown failed"));
-    Engine::uninstall_current();
+    GlobalMain::uninstall_current();
 }
 
 fn read_config(path: &Path) -> std::io::Result<String> {

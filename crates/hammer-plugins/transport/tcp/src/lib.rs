@@ -34,8 +34,8 @@ use std::sync::{Arc, OnceLock, mpsc};
 use hammer_core::data_plane::{BufferPacketCursor, NodeId, NodeState, SecondaryOpaque};
 use hammer_runtime::app::SessionHandle;
 use hammer_runtime::{
-    DataPlaneRuntime, DataWorkerId, Engine, Node, NodeProcessFn, NodeRuntimeData, RuntimeError,
-    RuntimeResult, SessionConnectEndpoint, SessionListenEndpoint, with_data_plane_runtime,
+    DataPlaneMain, DataWorkerId, GlobalMain, Node, NodeProcessFn, NodeRuntimeData, RuntimeError,
+    RuntimeResult, SessionConnectEndpoint, SessionListenEndpoint, with_data_plane_main,
 };
 use thiserror::Error;
 
@@ -233,7 +233,7 @@ impl TcpMain {
 
     fn with_worker<R>(
         &self,
-        runtime: &DataPlaneRuntime,
+        runtime: &DataPlaneMain,
         operation: impl FnOnce(&mut SessionWorker, &mut TcpWorker) -> RuntimeResult<R>,
     ) -> RuntimeResult<R> {
         session_main().with_worker_mut(runtime, |sessions| {
@@ -243,7 +243,7 @@ impl TcpMain {
 
     fn with_tcp_worker<R>(
         &self,
-        runtime: &DataPlaneRuntime,
+        runtime: &DataPlaneMain,
         operation: impl FnOnce(&mut TcpWorker) -> RuntimeResult<R>,
     ) -> RuntimeResult<R> {
         let thread_index = runtime.thread_index();
@@ -324,9 +324,9 @@ pub(crate) fn connect(endpoint: SessionConnectEndpoint) -> RuntimeResult<()> {
     let worker = endpoint.worker;
     let worker_slot = worker.slot();
     let (completion, completed) = mpsc::sync_channel(1);
-    Engine::with_current(|engine| {
+    GlobalMain::with_current(|engine| {
         engine.schedule_on_worker(worker, move || {
-            let result = with_data_plane_runtime(|runtime| {
+            let result = with_data_plane_main(|runtime| {
                 let main = TCP_MAIN
                     .get()
                     .ok_or(RuntimeError::PluginStateNotInitialized { plugin: "tcp" })?;
@@ -339,7 +339,7 @@ pub(crate) fn connect(endpoint: SessionConnectEndpoint) -> RuntimeResult<()> {
             }
         })
     })
-    .ok_or(RuntimeError::WorkerControlRequiresMainEngine)??;
+    .ok_or(RuntimeError::WorkerControlRequiresGlobalMain)??;
     completed
         .recv()
         .map_err(|_| RuntimeError::DataWorkerCallCanceled {
@@ -394,7 +394,10 @@ fn configure_tcp(
     runs_after = ["transport_main_init", "session_init"],
     runs_before = ["install_packet_graph"]
 )]
-fn init_tcp(engine: &mut Engine, config: Arc<crate::config::TcpPluginConfig>) -> RuntimeResult<()> {
+fn init_tcp(
+    engine: &mut GlobalMain,
+    config: Arc<crate::config::TcpPluginConfig>,
+) -> RuntimeResult<()> {
     if TCP_MAIN.get().is_some() {
         return Err(RuntimeError::PluginStateNotInitialized { plugin: "tcp" });
     }
@@ -442,7 +445,7 @@ fn listener_capabilities() -> TcpCapabilities {
     }
 }
 
-pub fn register_tcp_input(runtime: &DataPlaneRuntime) -> RuntimeResult<NodeId> {
+pub fn register_tcp_input(runtime: &DataPlaneMain) -> RuntimeResult<NodeId> {
     let main = TCP_MAIN
         .get()
         .ok_or(RuntimeError::PluginStateNotInitialized { plugin: "tcp" })?;
@@ -458,57 +461,51 @@ pub fn register_tcp_input(runtime: &DataPlaneRuntime) -> RuntimeResult<NodeId> {
     Ok(node)
 }
 
-fn bind_worker_graph(engine: &mut Engine) -> RuntimeResult<()> {
+fn bind_worker_graph(engine: &mut DataPlaneMain) -> RuntimeResult<()> {
     let worker = engine.data_worker_id()?;
-    let handoff = engine.runtime.handoff_node_handle()?;
+    let handoff = engine.handoff_node_handle()?;
     let session_queue =
         engine
-            .runtime
             .node_by_name("session-queue")
             .ok_or(TcpWorkerError::NodeMissing {
                 name: "session-queue",
             })?;
-    let tcp_output = engine
-        .runtime
-        .node_by_name(TcpOutputNode::NODE_NAME)
-        .ok_or(TcpWorkerError::NodeMissing {
-            name: TcpOutputNode::NODE_NAME,
-        })?;
+    let tcp_output =
+        engine
+            .node_by_name(TcpOutputNode::NODE_NAME)
+            .ok_or(TcpWorkerError::NodeMissing {
+                name: TcpOutputNode::NODE_NAME,
+            })?;
     let tcp_input = engine
-        .runtime
         .node_by_name("tcp-input")
         .ok_or_else(|| TcpWorkerError::NodeMissing { name: "tcp-input" })?;
     let tcp_listen = engine
-        .runtime
         .node_by_name("tcp-listen")
         .ok_or_else(|| TcpWorkerError::NodeMissing { name: "tcp-listen" })?;
     let tcp_established =
         engine
-            .runtime
             .node_by_name("tcp-established")
             .ok_or(TcpWorkerError::NodeMissing {
                 name: "tcp-established",
             })?;
     let tcp_rcv_process =
         engine
-            .runtime
             .node_by_name("tcp-rcv-process")
             .ok_or(TcpWorkerError::NodeMissing {
                 name: "tcp-rcv-process",
             })?;
     let tcp_syn_sent =
         engine
-            .runtime
             .node_by_name("tcp-syn-sent")
             .ok_or_else(|| TcpWorkerError::NodeMissing {
                 name: "tcp-syn-sent",
             })?;
 
-    let session_queue_data = engine.runtime.nodes().node_runtime_data(session_queue)?;
+    let session_queue_data = engine.nodes().node_runtime_data(session_queue)?;
     let session_queue_output =
-        SessionQueueNode::existing_output_next(&engine.runtime, session_queue, tcp_output)?;
+        SessionQueueNode::existing_output_next(engine, session_queue, tcp_output)?;
     SessionQueueNode::install_worker_attachment(
-        &engine.runtime,
+        engine,
         session_queue_data,
         session_queue_output,
         tcp_session_queue_update_time,
@@ -529,7 +526,6 @@ fn bind_worker_graph(engine: &mut Engine) -> RuntimeResult<()> {
     // A worker graph clone can retain the old polling state. Keep the node
     // dormant until its replacement SessionWorker owns a live readiness file.
     engine
-        .runtime
         .nodes()
         .set_node_state(session_queue, NodeState::Disabled)?;
     engine.set_worker_node_runtime_data(tcp_input, input_data)?;
@@ -549,7 +545,6 @@ fn bind_worker_graph(engine: &mut Engine) -> RuntimeResult<()> {
         .into());
     }
     engine
-        .runtime
         .nodes()
         .set_node_state(session_queue, NodeState::Polling)?;
     Ok(())
@@ -559,7 +554,7 @@ fn bind_worker_graph(engine: &mut Engine) -> RuntimeResult<()> {
     name = "tcp_worker_init",
     runs_after = ["session_worker_init"]
 )]
-fn init_tcp_worker(engine: &mut Engine) -> RuntimeResult<()> {
+fn init_tcp_worker(engine: &mut DataPlaneMain) -> RuntimeResult<()> {
     TCP_MAIN
         .get()
         .ok_or(RuntimeError::PluginStateNotInitialized { plugin: "tcp" })?;
@@ -567,7 +562,7 @@ fn init_tcp_worker(engine: &mut Engine) -> RuntimeResult<()> {
 }
 
 fn tcp_session_queue_update_time(
-    runtime: &DataPlaneRuntime,
+    runtime: &DataPlaneMain,
     sessions: &mut SessionWorker,
     _: NodeRuntimeData,
     output_next: SessionQueueNext,
@@ -585,7 +580,7 @@ fn tcp_session_queue_update_time(
 }
 
 fn tcp_session_queue_dispatch(
-    runtime: &DataPlaneRuntime,
+    runtime: &DataPlaneMain,
     sessions: &mut SessionWorker,
     _: NodeRuntimeData,
     output_next: SessionQueueNext,
@@ -898,7 +893,7 @@ pub(crate) fn read_session_route_opaque(
 
 #[inline(always)]
 pub(crate) fn read_session_id(
-    runtime: &DataPlaneRuntime,
+    runtime: &DataPlaneMain,
     index: hammer_core::data_plane::Index,
 ) -> RuntimeResult<Option<u32>> {
     let buffer = runtime.get_buffer(index)?;
@@ -944,7 +939,7 @@ pub fn tcp_control_cursor(packet: &[u8]) -> Result<BufferPacketCursor, TcpContro
 }
 
 fn enqueue_tcp_segment(
-    runtime: &DataPlaneRuntime,
+    runtime: &DataPlaneMain,
     frame: &mut hammer_core::data_plane::BufferFrame,
     output_next: SessionQueueNext,
     output: &mut SessionQueueOutput,

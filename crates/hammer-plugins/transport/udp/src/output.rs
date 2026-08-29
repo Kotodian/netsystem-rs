@@ -5,9 +5,7 @@ use hammer_core::data_plane::{
     BufferFrame, BufferPacketCursor, Index, NodeId, NodeState, SecondaryOpaque,
 };
 use hammer_infra::checksum::internet_checksum_parts;
-use hammer_runtime::{
-    DataPlaneRuntime, Node, NodeProcessFn, NodeResult, NodeRuntimeData, RuntimeResult,
-};
+use hammer_runtime::{DataPlaneMain, Node, NodeProcessFn, NodeRuntimeData, RuntimeResult};
 use hammer_service::opaque::NetworkOpaque;
 use hammer_service::session::node::SessionQueueNode;
 
@@ -104,7 +102,7 @@ pub enum UdpOutputNext {
 #[derive(Clone, Copy)]
 pub struct UdpOutputNode;
 
-pub fn register_udp_output(runtime: &DataPlaneRuntime) -> RuntimeResult<NodeId> {
+pub fn register_udp_output(runtime: &DataPlaneMain) -> RuntimeResult<NodeId> {
     if let Some(node) = runtime.nodes().node_by_name(UdpOutputNode::NODE_NAME) {
         return Ok(node);
     }
@@ -124,7 +122,7 @@ pub fn register_udp_output(runtime: &DataPlaneRuntime) -> RuntimeResult<NodeId> 
 
 impl Node for UdpOutputNode {
     #[inline(always)]
-    fn process(&mut self, runtime: &DataPlaneRuntime, frame: &mut BufferFrame) -> NodeResult {
+    fn process(&mut self, runtime: &DataPlaneMain, frame: &mut BufferFrame) -> () {
         udp_output_process_frame(runtime, frame)
     }
 
@@ -139,22 +137,18 @@ impl Node for UdpOutputNode {
     }
 }
 
-fn udp_output_process(
-    runtime: &DataPlaneRuntime,
-    _: NodeRuntimeData,
-    frame: &mut BufferFrame,
-) -> NodeResult {
+fn udp_output_process(runtime: &DataPlaneMain, _: NodeRuntimeData, frame: &mut BufferFrame) -> () {
     udp_output_process_frame(runtime, frame)
 }
 
-fn udp_output_process_frame(runtime: &DataPlaneRuntime, frame: &mut BufferFrame) -> NodeResult {
+fn udp_output_process_frame(runtime: &DataPlaneMain, frame: &mut BufferFrame) -> () {
     hammer_runtime::process_frame!(runtime, frame, |index| {
         udp_output_next_for_index(runtime, index).unwrap_or(UdpOutputNext::Drop)
     })
 }
 
 fn udp_output_next_for_index(
-    runtime: &DataPlaneRuntime,
+    runtime: &DataPlaneMain,
     index: Index,
 ) -> RuntimeResult<UdpOutputNext> {
     let buffer = runtime.get_buffer(index)?;
@@ -194,7 +188,7 @@ fn udp_output_next_for_index(
 }
 
 fn udp_output_push_ipv4(
-    runtime: &DataPlaneRuntime,
+    runtime: &DataPlaneMain,
     index: Index,
     src: Ipv4Addr,
     dst: Ipv4Addr,
@@ -239,7 +233,7 @@ fn udp_output_push_ipv4(
 }
 
 fn udp_output_push_ipv6(
-    runtime: &DataPlaneRuntime,
+    runtime: &DataPlaneMain,
     index: Index,
     src: Ipv6Addr,
     dst: Ipv6Addr,

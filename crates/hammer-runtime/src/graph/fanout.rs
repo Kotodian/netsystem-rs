@@ -1,6 +1,6 @@
 //! VPP `vlib_buffer_enqueue_to_next` / `enqueue_one`.
 
-use crate::DataPlaneRuntime;
+use crate::DataPlaneMain;
 use hammer_core::data_plane::{
     BufferFrame, DEFAULT_BUFFER_FRAME_CAPACITY, Frame, Index, Next, NodeId, NodeNext,
 };
@@ -29,7 +29,7 @@ fn first_unhandled(nexts: &[u16], used: &[u64]) -> u16 {
     abort_fanout("used bitmap covered every next before n_left reached zero");
 }
 
-impl DataPlaneRuntime {
+impl DataPlaneMain {
     /// Enqueue every Index in `frame` to its parallel current-node-local next.
     ///
     /// Shape matches VPP `vlib_buffer_enqueue_to_next`: walk first-unhandled
@@ -101,7 +101,7 @@ impl DataPlaneRuntime {
             if !mask_bit(&match_bmp, offset) {
                 continue;
             }
-            if out.remaining_capacity() == 0 {
+            if out.capacity() == out.len() {
                 if self.put_next_frame(out).is_err() {
                     abort_fanout("failed to put full next frame");
                 }
@@ -121,7 +121,7 @@ impl DataPlaneRuntime {
 
         if out.is_empty() {
             drop(out);
-        } else if out.remaining_capacity() == 0 {
+        } else if out.capacity() == out.len() {
             if self.put_next_frame(out).is_err() {
                 abort_fanout("failed to put next frame");
             }

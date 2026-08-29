@@ -2,7 +2,7 @@ use std::cell::UnsafeCell;
 use std::sync::{Arc, OnceLock};
 
 use hammer_infra::pool::Pool;
-use hammer_runtime::{Engine, RuntimeResult};
+use hammer_runtime::{GlobalMain, RuntimeResult};
 use hammer_service::session::ApplicationMain;
 use prost::Message;
 use rustls::ServerConfig as RustlsServerConfig;
@@ -117,7 +117,7 @@ pub struct TlsMain {
     state: UnsafeCell<TlsState>,
 }
 
-// SAFETY: all mutable accesses verify the Engine Main control path before dereferencing
+// SAFETY: all mutable accesses verify the GlobalMain Main control path before dereferencing
 // state. Immutable rustls configurations may subsequently be cloned to workers.
 unsafe impl Send for TlsMain {}
 // SAFETY: shared references can cross threads, but mutable state is reachable
@@ -176,7 +176,7 @@ impl TlsMain {
     pub fn remove_config(&self, application: u32, config: ConfigId) -> Result<(), ConfigError> {
         self.ensure_main_thread()?;
         let state = unsafe { &mut *self.state.get() };
-        let barrier = Engine::with_current(|engine| engine.worker_barrier());
+        let barrier = GlobalMain::with_current(|engine| engine.worker_barrier());
         match barrier {
             Some(barrier) => barrier.sync(|| {
                 config_entry(&state.configs, application, config)?;
@@ -194,7 +194,7 @@ impl TlsMain {
     fn insert(&self, application: u32, config: ConnectionConfig) -> Result<ConfigId, ConfigError> {
         self.ensure_main_thread()?;
         let state = unsafe { &mut *self.state.get() };
-        let barrier = Engine::with_current(|engine| engine.worker_barrier());
+        let barrier = GlobalMain::with_current(|engine| engine.worker_barrier());
         match barrier {
             Some(barrier) => Ok(barrier.sync(|| {
                 config_id(state.configs.insert(ConfigEntry {
@@ -220,7 +220,7 @@ impl TlsMain {
     }
 
     fn ensure_main_thread(&self) -> Result<(), ConfigError> {
-        match Engine::with_current(|engine| engine.ensure_main_thread()) {
+        match GlobalMain::with_current(|engine| engine.ensure_main_thread()) {
             Some(Ok(())) => Ok(()),
             Some(Err(_)) | None => Err(ConfigError::WrongThread),
         }
@@ -551,8 +551,8 @@ fn remove_config_api(request: RemoveConfigRequest) -> RemoveConfigReply {
 }
 
 fn binary_application(application: u64) -> Result<u32, TlsApiStatus> {
-    let application = (application as u32);
-    let Some(attached) = Engine::with_current(|engine| {
+    let application = application as u32;
+    let Some(attached) = GlobalMain::with_current(|engine| {
         engine
             .registry
             .require::<ApplicationMain>()

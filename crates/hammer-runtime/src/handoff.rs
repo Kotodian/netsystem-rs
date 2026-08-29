@@ -140,11 +140,6 @@ impl HandoffSlot {
     }
 
     #[inline]
-    pub(crate) fn is_empty(&self) -> bool {
-        self.len == 0
-    }
-
-    #[inline]
     pub(crate) fn iter(&self) -> impl Iterator<Item = Index> + '_ {
         self.indices[..self.len].iter().filter_map(|index| *index)
     }

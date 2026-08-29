@@ -20,7 +20,7 @@ use hammer_core::data_plane::{BufferFrame, NodeId};
 use hammer_infra::bitmap::Bitmap;
 use hammer_runtime::RuntimeResult;
 use hammer_runtime::{
-    DataPlaneRuntime, DataWorkerId, Engine, Node, NodeProcessFn, NodeResult, NodeRuntimeData,
+    DataPlaneMain, DataWorkerId, GlobalMain, Node, NodeProcessFn, NodeRuntimeData,
 };
 
 use crate::interface::InterfaceOutputNode;
@@ -49,8 +49,8 @@ pub struct DeviceInputNode;
 
 impl Node for DeviceInputNode {
     #[inline(always)]
-    fn process(&mut self, _: &DataPlaneRuntime, _: &mut BufferFrame) -> NodeResult {
-        NodeResult::drop()
+    fn process(&mut self, _: &DataPlaneMain, _: &mut BufferFrame) -> () {
+        ()
     }
 
     #[inline]
@@ -59,12 +59,8 @@ impl Node for DeviceInputNode {
     }
 }
 
-fn device_input_process(
-    _: &DataPlaneRuntime,
-    _: NodeRuntimeData,
-    _: &mut BufferFrame,
-) -> NodeResult {
-    NodeResult::drop()
+fn device_input_process(_: &DataPlaneMain, _: NodeRuntimeData, _: &mut BufferFrame) -> () {
+    ()
 }
 
 /// Hardware interface RX/TX queue schedule mode.
@@ -328,6 +324,6 @@ impl DeviceMain {
     }
 }
 #[hammer_component_macros::init_function(name = "device_init")]
-fn init_device(engine: &mut Engine) -> RuntimeResult<Arc<DeviceMain>> {
-    Ok(DeviceMain::new(engine.runtime.nodes().clone()))
+fn init_device(engine: &mut GlobalMain) -> RuntimeResult<Arc<DeviceMain>> {
+    Ok(DeviceMain::new(engine.data_plane_main().nodes().clone()))
 }

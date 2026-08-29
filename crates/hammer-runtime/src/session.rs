@@ -1,7 +1,7 @@
 use std::net::SocketAddr;
 
+use crate::DataWorkerId;
 use crate::app::{SessionFlags, SessionHandle};
-use crate::{DataWorkerId, RuntimeResult};
 
 /// Endpoint selected by the Session control plane for one transport listener.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Deserialize, serde::Serialize)]

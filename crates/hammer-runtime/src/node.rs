@@ -7,7 +7,7 @@ use std::task::{Context, Poll, Waker};
 
 use crate::error::{RuntimeError, RuntimeResult};
 use crate::trace::TraceFormatter;
-use crate::{DataPlaneRuntime, Simd};
+use crate::{DataPlaneMain, Simd};
 use hammer_core::data_plane::{
     BufferFrame, Frame, NodeErrorIndex, NodeErrorIndexError, NodeHandle, NodeId, NodeKind,
     NodeNext, NodeRegistration, NodeState, Pending,
@@ -58,12 +58,12 @@ macro_rules! process_frame {
             n += 1;
         }
         $runtime.enqueue_to_next($frame, &next_slots[..n]);
-        $crate::node::NodeResult::drop()
+        ()
     }};
 }
 
 pub trait Node {
-    fn process(&mut self, runtime: &DataPlaneRuntime, frame: &mut BufferFrame) -> NodeResult;
+    fn process(&mut self, runtime: &DataPlaneMain, frame: &mut BufferFrame) -> ();
 
     #[inline]
     fn node_process(&self) -> NodeProcessFn {
@@ -76,11 +76,11 @@ pub trait Node {
     }
 
     #[inline]
-    fn node_registration(&self) -> NodeRegistration
+    fn node_registration(&self) -> Option<NodeRegistration>
     where
         Self: Sized,
     {
-        NodeRegistration::Plain
+        None
     }
 
     #[inline]
@@ -147,9 +147,9 @@ impl NodeRuntimeData {
     }
 }
 
-pub type NodeProcessFn = fn(&DataPlaneRuntime, NodeRuntimeData, &mut BufferFrame) -> NodeResult;
+pub type NodeProcessFn = fn(&DataPlaneMain, NodeRuntimeData, &mut BufferFrame) -> ();
 
-type NodeFunction = unsafe fn(&DataPlaneRuntime, NodeRuntimeData, &mut BufferFrame) -> NodeResult;
+type NodeFunction = unsafe fn(&DataPlaneMain, NodeRuntimeData, &mut BufferFrame) -> ();
 
 /// One platform-compiled process-function candidate for an existing Graph Node.
 #[derive(Clone, Copy)]
@@ -170,7 +170,7 @@ impl NodeFunctionRegistration {
     pub const unsafe fn new<const LANES: usize>(
         node_name: &'static str,
         _: Simd<u8, LANES>,
-        function: unsafe fn(&DataPlaneRuntime, NodeRuntimeData, &mut BufferFrame) -> NodeResult,
+        function: unsafe fn(&DataPlaneMain, NodeRuntimeData, &mut BufferFrame) -> (),
     ) -> Self {
         assert!(matches!(LANES, 1 | 16 | 32 | 64));
         Self {
@@ -185,7 +185,7 @@ impl NodeFunctionRegistration {
 pub struct NodeDescriptor<'a> {
     process: NodeProcessFn,
     runtime_data: NodeRuntimeData,
-    registration: NodeRegistration,
+    registration: Option<NodeRegistration>,
     initial_nexts: &'a [NodeId],
     trace_formatter: Option<TraceFormatter>,
 }
@@ -195,7 +195,7 @@ impl<'a> NodeDescriptor<'a> {
     pub fn new(
         process: NodeProcessFn,
         runtime_data: NodeRuntimeData,
-        registration: NodeRegistration,
+        registration: Option<NodeRegistration>,
         initial_nexts: &'a [NodeId],
         trace_formatter: Option<TraceFormatter>,
     ) -> Self {
@@ -219,7 +219,7 @@ impl<'a> NodeDescriptor<'a> {
     }
 
     #[inline]
-    pub fn registration(self) -> NodeRegistration {
+    pub fn registration(self) -> Option<NodeRegistration> {
         self.registration
     }
 
@@ -235,10 +235,10 @@ impl<'a> NodeDescriptor<'a> {
 }
 
 fn missing_node_process(
-    runtime: &DataPlaneRuntime,
+    runtime: &DataPlaneMain,
     _data: NodeRuntimeData,
     _frame: &mut BufferFrame,
-) -> NodeResult {
+) -> () {
     let current = runtime
         .current_node()
         .map(|node| match runtime.nodes().node_name(node) {
@@ -249,7 +249,7 @@ fn missing_node_process(
     // Programming error: node descriptor missing a process function. Drop
     // the frame silently.
     _ = current;
-    NodeResult::drop()
+    ()
 }
 
 /// Packet graph node that drives an external input boundary.
@@ -259,11 +259,11 @@ fn missing_node_process(
 /// protocol roles.
 pub trait DriverNode {
     #[inline]
-    fn node_registration(&self) -> NodeRegistration
+    fn node_registration(&self) -> Option<NodeRegistration>
     where
         Self: Sized,
     {
-        NodeRegistration::Plain
+        None
     }
 
     #[inline]
@@ -279,11 +279,11 @@ pub trait DriverNode {
 /// the current data worker.
 pub trait InternalNode {
     #[inline]
-    fn node_registration(&self) -> NodeRegistration
+    fn node_registration(&self) -> Option<NodeRegistration>
     where
         Self: Sized,
     {
-        NodeRegistration::Plain
+        None
     }
 
     #[inline]
@@ -336,18 +336,18 @@ impl NodeErrorDescriptor {
 ///
 #[derive(Clone, Copy)]
 pub struct NodeEntry {
-    pub registration: NodeRegistration,
+    pub registration: Option<NodeRegistration>,
     pub kind: NodeKind,
-    pub init: fn(&DataPlaneRuntime) -> RuntimeResult<NodeId>,
+    pub init: fn(&DataPlaneMain) -> RuntimeResult<NodeId>,
     pub error_counters: &'static [NodeErrorDescriptor],
 }
 
 impl NodeEntry {
     #[inline]
     pub const fn new(
-        registration: NodeRegistration,
+        registration: Option<NodeRegistration>,
         kind: NodeKind,
-        init: fn(&DataPlaneRuntime) -> RuntimeResult<NodeId>,
+        init: fn(&DataPlaneMain) -> RuntimeResult<NodeId>,
     ) -> Self {
         Self {
             registration,
@@ -355,30 +355,6 @@ impl NodeEntry {
             init,
             error_counters: &[],
         }
-    }
-}
-
-#[derive(Debug, Clone, Copy)]
-pub enum NoopNode {}
-
-impl Node for NoopNode {
-    #[inline(always)]
-    fn process(&mut self, _runtime: &DataPlaneRuntime, _frame: &mut BufferFrame) -> NodeResult {
-        match *self {}
-    }
-}
-
-pub struct NodeResult;
-
-impl Default for NodeResult {
-    fn default() -> Self {
-        Self::drop()
-    }
-}
-
-impl NodeResult {
-    pub fn drop() -> Self {
-        Self
     }
 }
 
@@ -530,7 +506,7 @@ impl std::fmt::Debug for NodeRuntimeSlot {
 
 impl NodeRuntimeSlot {
     #[inline]
-    fn dispatch(self, runtime: &DataPlaneRuntime, frame: Frame<Pending>) -> Frame<Pending> {
+    fn dispatch(self, runtime: &DataPlaneMain, frame: Frame<Pending>) -> Frame<Pending> {
         let mut frame = frame;
         // SAFETY: graph initialization installs specialized functions only
         // after validating their instruction set against the current CPU.
@@ -754,7 +730,7 @@ impl NodeRuntimeInner {
         kind: NodeKind,
         process: NodeProcessFn,
         runtime_data: NodeRuntimeData,
-        registration: NodeRegistration,
+        registration: Option<NodeRegistration>,
         initial_nexts: &[NodeId],
         trace_formatter: Option<TraceFormatter>,
         handle: Option<NodeHandle>,
@@ -769,7 +745,7 @@ impl NodeRuntimeInner {
             if !initial_nexts.is_empty() {
                 return Err(RuntimeError::NamedNextWithResolvedTargets);
             }
-            let NodeRegistration::Next { next_count, .. } = registration else {
+            let Some(NodeRegistration::Next { next_count, .. }) = registration else {
                 return Err(RuntimeError::NamedNextRegistrationKindInvalid);
             };
             if next_names.len() != next_count {
@@ -785,19 +761,21 @@ impl NodeRuntimeInner {
                 index += 1;
             }
         }
-        if matches!(registration, NodeRegistration::Plain) && !initial_nexts.is_empty() {
-            return Err(RuntimeError::PlainNodeHasInitialNexts {
+        if registration.is_none() && !initial_nexts.is_empty() {
+            return Err(RuntimeError::UnregisteredNodeHasInitialNexts {
                 count: initial_nexts.len(),
             });
         }
-        if matches!(registration, NodeRegistration::Sibling { .. }) && !initial_nexts.is_empty() {
+        if matches!(registration, Some(NodeRegistration::Sibling { .. }))
+            && !initial_nexts.is_empty()
+        {
             return Err(RuntimeError::SiblingNodeHasInitialNexts {
                 count: initial_nexts.len(),
             });
         }
         if next_names.is_none()
             && !initial_nexts.is_empty()
-            && let NodeRegistration::Next { next_count, .. } = registration
+            && let Some(NodeRegistration::Next { next_count, .. }) = registration
             && next_count != initial_nexts.len()
         {
             return Err(RuntimeError::InitialNextCountMismatch {
@@ -805,14 +783,14 @@ impl NodeRuntimeInner {
                 actual: initial_nexts.len(),
             });
         }
-        if let Some(name) = registration.name()
+        if let Some(name) = registration.map(NodeRegistration::name)
             && self.declared_nodes.contains_key(name)
         {
             return Err(RuntimeError::NodeNameAlreadyRegistered { name });
         }
 
         match registration {
-            NodeRegistration::Plain => {
+            None => {
                 let id = self.push_function_node(kind, process, runtime_data);
                 self.node_trace_formatters[id.slot() as usize] = trace_formatter;
                 if let Some(handle) = handle {
@@ -820,7 +798,7 @@ impl NodeRuntimeInner {
                 }
                 Ok(id)
             }
-            NodeRegistration::Next { name, next_count } => {
+            Some(NodeRegistration::Next { name, next_count }) => {
                 let id = self.push_function_node(kind, process, runtime_data);
                 self.node_names[id.slot() as usize] = Some(name);
                 self.node_trace_formatters[id.slot() as usize] = trace_formatter;
@@ -844,7 +822,7 @@ impl NodeRuntimeInner {
                 }
                 Ok(id)
             }
-            NodeRegistration::Sibling { name, sibling_of } => {
+            Some(NodeRegistration::Sibling { name, sibling_of }) => {
                 let owner = self.declared_nodes.get(sibling_of).copied().ok_or(
                     RuntimeError::SiblingOwnerNotRegistered {
                         node: name,
@@ -1138,7 +1116,7 @@ impl NodeRuntime {
 
     /// Install a node's ordered error descriptors on the topology owner.
     ///
-    /// Normal graph construction calls this from [`DataPlaneRuntime::init_graph`]
+    /// Normal graph construction calls this from [`DataPlaneMain::init_graph`]
     /// using [`NodeEntry::error_counters`]. The explicit method is retained as
     /// a structural hook for callers that register nodes directly.
     pub fn materialize_node_errors(
@@ -1390,7 +1368,7 @@ impl NodeRuntime {
         kind: NodeKind,
         process: NodeProcessFn,
         runtime_data: NodeRuntimeData,
-        registration: NodeRegistration,
+        registration: Option<NodeRegistration>,
         initial_nexts: &[NodeId],
         trace_formatter: Option<TraceFormatter>,
     ) -> RuntimeResult<NodeId> {
@@ -1668,24 +1646,10 @@ impl NodeRuntime {
             .flatten())
     }
 
-    pub fn has_pending(&self) -> bool {
-        !self.queue.borrow().is_empty()
-    }
-
     pub fn ready(&self) -> NodeRuntimeReady {
         NodeRuntimeReady {
             readiness: Rc::clone(&self.readiness),
         }
-    }
-
-    /// Return the preinstalled global index for a node-local error code.
-    #[inline]
-    pub(crate) fn node_error_index(
-        &self,
-        node: NodeId,
-        code: u16,
-    ) -> RuntimeResult<NodeErrorIndex> {
-        self.inner.borrow().node_error_index(node, code)
     }
 
     /// Return the preinstalled global index for a node-local error code.
@@ -1762,10 +1726,7 @@ impl NodeRuntime {
         Ok(())
     }
 
-    pub(crate) fn run_ready_function_nodes(
-        &self,
-        runtime: &DataPlaneRuntime,
-    ) -> RuntimeResult<usize> {
+    pub(crate) fn run_ready_function_nodes(&self, runtime: &DataPlaneMain) -> RuntimeResult<usize> {
         let mut processed = 0usize;
         while let Some(scheduled) = self.pop_scheduled() {
             let ScheduledFrame {
@@ -1778,7 +1739,7 @@ impl NodeRuntime {
                 self.clear_interrupt_pending(node)?;
                 continue;
             }
-            if !allow_empty && !frame.has_pending() {
+            if !allow_empty && frame.is_empty() {
                 continue;
             }
             self.clear_interrupt_pending(node)?;

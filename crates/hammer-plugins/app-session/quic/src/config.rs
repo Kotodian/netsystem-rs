@@ -1,8 +1,8 @@
 use std::cell::UnsafeCell;
-use std::sync::{Arc, OnceLock};
+use std::sync::Arc;
 
 use hammer_infra::pool::Pool;
-use hammer_runtime::Engine;
+use hammer_runtime::GlobalMain;
 use hammer_runtime::app::AppSessionConfig;
 use prost::Message;
 use quinn_proto::rustls::pki_types::{CertificateDer, PrivateKeyDer};
@@ -180,7 +180,7 @@ pub(crate) struct QuicConfigRegistry {
     state: UnsafeCell<Pool<ConfigEntry>>,
 }
 
-// SAFETY: every state access first verifies the Engine Main control path. When Data
+// SAFETY: every state access first verifies the GlobalMain Main control path. When Data
 // Workers exist, the Main Thread performs the access while WorkerBarrier holds
 // them stopped; worker protocol state retains only immutable Arc configurations
 // after this registry lookup.
@@ -289,7 +289,7 @@ impl QuicConfigRegistry {
         operation: impl FnOnce(&Pool<ConfigEntry>) -> Result<R, ConfigError>,
     ) -> Result<R, ConfigError> {
         self.with_control_barrier(|| {
-            // SAFETY: `with_control_barrier` confines access to the Engine Main
+            // SAFETY: `with_control_barrier` confines access to the GlobalMain Main
             // control path and either holds WorkerBarrier or runs before Data
             // Workers exist.
             unsafe { operation(&*self.state.get()) }
@@ -297,7 +297,7 @@ impl QuicConfigRegistry {
     }
 
     fn with_control_barrier<R>(&self, operation: impl FnOnce() -> R) -> Result<R, ConfigError> {
-        let barrier = match Engine::with_current(|engine| {
+        let barrier = match GlobalMain::with_current(|engine| {
             engine
                 .ensure_main_thread()
                 .map(|()| engine.worker_barrier())
@@ -793,7 +793,7 @@ fn api_transport(
 }
 
 fn binary_application(application: u32) -> Result<u32, QuicApiStatus> {
-    let Some(attached) = Engine::with_current(|engine| {
+    let Some(attached) = GlobalMain::with_current(|engine| {
         let applications = engine
             .registry
             .require::<hammer_service::session::ApplicationMain>()

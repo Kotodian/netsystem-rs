@@ -45,7 +45,9 @@ use std::sync::{Arc, OnceLock};
 use hammer_infra::align::CacheLine;
 use hammer_infra::thread_owned::ThreadOwned;
 use hammer_runtime::app::SessionHandle;
-use hammer_runtime::{DataWorkerId, Engine, RuntimeError, RuntimeResult, SessionListenEndpoint};
+use hammer_runtime::{
+    DataPlaneMain, DataWorkerId, GlobalMain, RuntimeError, RuntimeResult, SessionListenEndpoint,
+};
 use hammer_service::session::application_main;
 use hammer_service::session::runtime::session_main;
 use hammer_service::transport::{TransportVft, register_transport};
@@ -429,7 +431,7 @@ pub(crate) fn stop_listen(connection_index: u32) -> RuntimeResult<()> {
     name = "http_transport_init",
     runs_after = ["quic_init", "session_init"]
 )]
-fn init_http_transport(engine: &mut Engine) -> RuntimeResult<()> {
+fn init_http_transport(engine: &mut GlobalMain) -> RuntimeResult<()> {
     if HTTP_MAIN.get().is_some() {
         return Err(RuntimeError::PluginStateNotInitialized { plugin: "http" });
     }
@@ -487,7 +489,7 @@ fn init_http_transport(engine: &mut Engine) -> RuntimeResult<()> {
     name = "http_worker_init",
     runs_after = ["session_worker_init", "quic_worker_init"]
 )]
-fn init_http_worker(engine: &mut Engine) -> RuntimeResult<()> {
+fn init_http_worker(engine: &mut DataPlaneMain) -> RuntimeResult<()> {
     let main = HTTP_MAIN
         .get()
         .ok_or(RuntimeError::PluginStateNotInitialized { plugin: "http" })?;

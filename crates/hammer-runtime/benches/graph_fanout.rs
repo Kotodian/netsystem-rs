@@ -13,43 +13,41 @@ use hammer_infra::mask_compare::{
     mask_compare_u16_arch, mask_compare_u16_scalar, mask_compare_u16_words,
 };
 use hammer_runtime::RuntimeResult;
-use hammer_runtime::node::{NodeDescriptor, NodeResult, NodeRuntimeData};
-use hammer_runtime::{DataPlaneBufferConfig, DataPlaneRuntime, DataPlaneRuntimeConfig};
+use hammer_runtime::node::{NodeDescriptor, NodeRuntimeData};
+use hammer_runtime::{DataPlaneBufferConfig, DataPlaneMain};
 
-fn test_runtime(frame_slots: usize, buffer_slots: usize) -> DataPlaneRuntime {
-    DataPlaneRuntime::new(DataPlaneRuntimeConfig {
-        buffers: DataPlaneBufferConfig {
-            buffer_slot_capacity: 64,
-            buffer_slots,
-            frame_slots,
-            ..DataPlaneBufferConfig::default()
-        },
+fn test_runtime(frame_slots: usize, buffer_slots: usize) -> DataPlaneMain {
+    DataPlaneMain::new(DataPlaneBufferConfig {
+        buffer_slot_capacity: 64,
+        buffer_slots,
+        frame_slots,
+        ..DataPlaneBufferConfig::default()
     })
 }
 
-fn register_sink(runtime: &DataPlaneRuntime, name: &'static str) -> RuntimeResult<NodeId> {
+fn register_sink(runtime: &DataPlaneMain, name: &'static str) -> RuntimeResult<NodeId> {
     runtime.nodes().try_register_descriptor(
         NodeKind::Internal,
         NodeDescriptor::new(
             |_, _, frame: &mut BufferFrame| {
                 frame.discard_prefix(frame.len());
-                NodeResult::drop()
+                ()
             },
             NodeRuntimeData::empty(),
-            NodeRegistration::next(name, 0),
+            Some(NodeRegistration::next(name, 0)),
             &[],
             None,
         ),
     )
 }
 
-fn register_owner(runtime: &DataPlaneRuntime, nexts: &[NodeId]) -> RuntimeResult<NodeId> {
+fn register_owner(runtime: &DataPlaneMain, nexts: &[NodeId]) -> RuntimeResult<NodeId> {
     runtime.nodes().try_register_descriptor(
         NodeKind::Internal,
         NodeDescriptor::new(
-            |_, _, _| NodeResult::drop(),
+            |_, _, _| (),
             NodeRuntimeData::empty(),
-            NodeRegistration::next("fanout-owner", nexts.len()),
+            Some(NodeRegistration::next("fanout-owner", nexts.len())),
             nexts,
             None,
         ),
@@ -57,7 +55,7 @@ fn register_owner(runtime: &DataPlaneRuntime, nexts: &[NodeId]) -> RuntimeResult
 }
 
 struct FanoutFixture {
-    runtime: DataPlaneRuntime,
+    runtime: DataPlaneMain,
     owner: NodeId,
     frame: Frame<Next>,
     nexts: [u16; DEFAULT_BUFFER_FRAME_CAPACITY],

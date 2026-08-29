@@ -3,8 +3,9 @@ use petgraph::graphmap::DiGraphMap;
 use std::collections::HashSet;
 use std::panic::{AssertUnwindSafe, catch_unwind};
 
-use crate::engine::Engine;
+use crate::data_plane::DataPlaneMain;
 use crate::error::RuntimeResult;
+use crate::global_main::GlobalMain;
 use hammer_stats::StatsMain;
 
 #[derive(Debug, thiserror::Error)]
@@ -36,7 +37,31 @@ pub struct InitFunction {
     pub name: &'static str,
     pub runs_before: &'static [&'static str],
     pub runs_after: &'static [&'static str],
-    pub func: fn(&mut Engine) -> RuntimeResult<()>,
+    pub func: fn(&mut GlobalMain) -> RuntimeResult<()>,
+}
+
+/// Lifecycle registration executed once on each Data Worker.
+///
+/// Worker callbacks receive the owning [`DataPlaneMain`] directly. Global
+/// registration and control authority remain with [`GlobalMain`].
+#[derive(Clone, Copy)]
+pub struct WorkerInitFunction {
+    pub name: &'static str,
+    pub runs_before: &'static [&'static str],
+    pub runs_after: &'static [&'static str],
+    pub func: fn(&mut DataPlaneMain) -> RuntimeResult<()>,
+}
+
+impl Ordered for WorkerInitFunction {
+    fn name(&self) -> &'static str {
+        self.name
+    }
+    fn runs_before(&self) -> &'static [&'static str] {
+        self.runs_before
+    }
+    fn runs_after(&self) -> &'static [&'static str] {
+        self.runs_after
+    }
 }
 
 impl Ordered for InitFunction {
@@ -61,7 +86,7 @@ pub struct ConfigFunction {
     pub section: &'static str,
     pub runs_before: &'static [&'static str],
     pub runs_after: &'static [&'static str],
-    pub func: fn(&str, &mut Engine) -> RuntimeResult<()>,
+    pub func: fn(&str, &mut GlobalMain) -> RuntimeResult<()>,
 }
 
 impl Ordered for ConfigFunction {
@@ -129,7 +154,7 @@ pub fn topological_order<T: Ordered>(items: &[T]) -> Result<Vec<usize>, InitErro
 fn dispatch_init(
     items: Vec<InitFunction>,
     called: &mut HashSet<&'static str>,
-    engine: &mut Engine,
+    engine: &mut GlobalMain,
 ) -> RuntimeResult<()> {
     let order = topological_order(&items)?;
     for index in order {
@@ -146,7 +171,27 @@ fn dispatch_init(
     Ok(())
 }
 
-pub fn run_init_functions(engine: &mut Engine) -> RuntimeResult<()> {
+fn dispatch_worker_init(
+    items: Vec<WorkerInitFunction>,
+    called: &mut HashSet<&'static str>,
+    main: &mut DataPlaneMain,
+) -> RuntimeResult<()> {
+    let order = topological_order(&items)?;
+    for index in order {
+        let function = items[index];
+        if called.contains(function.name) {
+            continue;
+        }
+        called.insert(function.name);
+        match catch_unwind(AssertUnwindSafe(|| (function.func)(main))) {
+            Ok(result) => result?,
+            Err(payload) => std::panic::resume_unwind(payload),
+        }
+    }
+    Ok(())
+}
+
+pub fn run_init_functions(engine: &mut GlobalMain) -> RuntimeResult<()> {
     let functions = engine.plugin_main().init_functions();
     let mut called = std::mem::take(&mut engine.called_init_functions);
     let result = dispatch_init(functions, &mut called, engine);
@@ -154,7 +199,7 @@ pub fn run_init_functions(engine: &mut Engine) -> RuntimeResult<()> {
     result
 }
 
-pub fn run_stats_registrations(engine: &Engine) -> RuntimeResult<()> {
+pub fn run_stats_registrations(engine: &GlobalMain) -> RuntimeResult<()> {
     let stats_main = StatsMain::global()?;
     for registration in engine.plugin_main().stats_registrations() {
         (registration.register)(stats_main)?;
@@ -163,19 +208,22 @@ pub fn run_stats_registrations(engine: &Engine) -> RuntimeResult<()> {
     Ok(())
 }
 
-pub fn run_worker_init_functions(engine: &mut Engine) -> RuntimeResult<()> {
-    let functions = engine.worker_init_functions();
-    let mut called = std::mem::take(&mut engine.called_worker_init_functions);
-    let result = dispatch_init(functions, &mut called, engine);
-    engine.called_worker_init_functions = called;
+pub fn run_worker_init_functions(
+    main: &mut DataPlaneMain,
+    functions: Vec<WorkerInitFunction>,
+) -> RuntimeResult<()> {
+    let functions = functions;
+    let mut called = main.take_called_worker_init_functions();
+    let result = dispatch_worker_init(functions, &mut called, main);
+    main.restore_called_worker_init_functions(called);
     result
 }
 
-pub fn run_worker_exit_functions(engine: &mut Engine) -> RuntimeResult<()> {
-    let functions = engine.take_worker_exit_functions();
+pub fn run_worker_exit_functions(main: &mut DataPlaneMain) -> RuntimeResult<()> {
+    let functions = main.take_worker_exit_functions();
     let mut first_error = None;
     for function in functions {
-        match catch_unwind(AssertUnwindSafe(|| function(engine))) {
+        match catch_unwind(AssertUnwindSafe(|| function(main))) {
             Ok(Ok(())) => {}
             Ok(Err(error)) => {
                 if first_error.is_none() {
@@ -188,7 +236,7 @@ pub fn run_worker_exit_functions(engine: &mut Engine) -> RuntimeResult<()> {
     first_error.map_or(Ok(()), Err)
 }
 
-pub fn run_main_loop_enter(engine: &mut Engine) -> RuntimeResult<()> {
+pub fn run_main_loop_enter(engine: &mut GlobalMain) -> RuntimeResult<()> {
     let functions = engine.plugin_main().main_loop_enter_functions();
     let mut called = std::mem::take(&mut engine.called_main_loop_enter_functions);
     let result = dispatch_init(functions, &mut called, engine);
@@ -198,7 +246,7 @@ pub fn run_main_loop_enter(engine: &mut Engine) -> RuntimeResult<()> {
     Ok(())
 }
 
-pub fn run_main_loop_exit(engine: &mut Engine) -> RuntimeResult<()> {
+pub fn run_main_loop_exit(engine: &mut GlobalMain) -> RuntimeResult<()> {
     let functions = engine.plugin_main().main_loop_exit_functions();
     let mut called = std::mem::take(&mut engine.called_main_loop_exit_functions);
     let result = dispatch_init(functions, &mut called, engine);
@@ -209,7 +257,7 @@ pub fn run_main_loop_exit(engine: &mut Engine) -> RuntimeResult<()> {
 fn dispatch_config(
     items: Vec<ConfigFunction>,
     called: &mut HashSet<&'static str>,
-    engine: &mut Engine,
+    engine: &mut GlobalMain,
     document: &str,
 ) -> RuntimeResult<()> {
     let order = topological_order(&items)?;
@@ -227,7 +275,11 @@ fn dispatch_config(
     Ok(())
 }
 
-pub fn run_config_functions(engine: &mut Engine, early: bool, document: &str) -> RuntimeResult<()> {
+pub fn run_config_functions(
+    engine: &mut GlobalMain,
+    early: bool,
+    document: &str,
+) -> RuntimeResult<()> {
     let functions = engine.plugin_main().config_functions(early);
     if early {
         let mut called = std::mem::take(&mut engine.called_early_config_functions);

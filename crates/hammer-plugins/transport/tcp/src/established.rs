@@ -2,7 +2,7 @@ use crate::{publish_tcp_connection, read_session_id};
 use hammer_core::data_plane::{
     BufferFrame, DEFAULT_BUFFER_FRAME_CAPACITY, Index, NodeId, NodeNext,
 };
-use hammer_runtime::{DataPlaneRuntime, Node, NodeProcessFn, NodeResult, NodeRuntimeData};
+use hammer_runtime::{DataPlaneMain, Node, NodeProcessFn, NodeRuntimeData};
 use hammer_runtime::{RuntimeError, RuntimeResult};
 use hammer_service::session::runtime::RxDelivery;
 
@@ -27,7 +27,7 @@ pub struct TcpEstablishedNode {
     process: NodeProcessFn,
 }
 
-pub fn register_tcp_established(runtime: &DataPlaneRuntime) -> RuntimeResult<NodeId> {
+pub fn register_tcp_established(runtime: &DataPlaneMain) -> RuntimeResult<NodeId> {
     let main = crate::TCP_MAIN
         .get()
         .ok_or(RuntimeError::PluginStateNotInitialized { plugin: "tcp" })?;
@@ -42,7 +42,7 @@ pub fn register_tcp_established(runtime: &DataPlaneRuntime) -> RuntimeResult<Nod
 
 impl Node for TcpEstablishedNode {
     #[inline(always)]
-    fn process(&mut self, runtime: &DataPlaneRuntime, frame: &mut BufferFrame) -> NodeResult {
+    fn process(&mut self, runtime: &DataPlaneMain, frame: &mut BufferFrame) -> () {
         (self.process)(runtime, NodeRuntimeData::empty(), frame)
     }
 
@@ -53,14 +53,14 @@ impl Node for TcpEstablishedNode {
 }
 
 pub(crate) fn tcp_established_process(
-    runtime: &DataPlaneRuntime,
+    runtime: &DataPlaneMain,
     _: NodeRuntimeData,
     frame: &mut BufferFrame,
-) -> NodeResult {
+) -> () {
     tcp_established_frame(runtime, frame)
 }
 
-fn tcp_established_frame(runtime: &DataPlaneRuntime, frame: &mut BufferFrame) -> NodeResult {
+fn tcp_established_frame(runtime: &DataPlaneMain, frame: &mut BufferFrame) -> () {
     let input_len = frame.len();
     debug_assert!(input_len <= DEFAULT_BUFFER_FRAME_CAPACITY);
     let mut inputs = [core::mem::MaybeUninit::<Index>::uninit(); DEFAULT_BUFFER_FRAME_CAPACITY];
@@ -87,12 +87,12 @@ fn tcp_established_frame(runtime: &DataPlaneRuntime, frame: &mut BufferFrame) ->
     if out_len != 0 {
         runtime.enqueue_to_next(frame, &nexts[..out_len]);
     }
-    NodeResult::drop()
+    ()
 }
 
 #[inline]
 fn emit_local(
-    runtime: &DataPlaneRuntime,
+    runtime: &DataPlaneMain,
     frame: &mut BufferFrame,
     nexts: &mut [u16; DEFAULT_BUFFER_FRAME_CAPACITY],
     out_len: &mut usize,
@@ -111,7 +111,7 @@ fn emit_local(
 }
 
 fn tcp_established_index(
-    runtime: &DataPlaneRuntime,
+    runtime: &DataPlaneMain,
     index: Index,
     out_frame: &mut BufferFrame,
     nexts: &mut [u16; DEFAULT_BUFFER_FRAME_CAPACITY],

@@ -30,7 +30,7 @@ use hammer_runtime::{
     AttachError, RuntimeError, RuntimeResult, SessionConnectEndpoint, SessionListenEndpoint,
 };
 use hammer_runtime::{
-    DataPlaneRuntime, DataWorkerId, Deadline, Engine, File, FileFunctions, NodeRuntime,
+    DataPlaneMain, DataWorkerId, Deadline, File, FileFunctions, GlobalMain, NodeRuntime,
     NodeRuntimeData,
 };
 
@@ -608,7 +608,7 @@ impl SessionListener {
 // SAFETY: Main Thread publishes listener state under the worker barrier; Data
 // Workers only read the immutable entry selected by their transport callback.
 unsafe impl Send for SessionMain {}
-// SAFETY: `listeners` mutation is confined to the Engine Main control path and
+// SAFETY: `listeners` mutation is confined to the GlobalMain Main control path and
 // synchronized by the worker barrier before a Data Worker may observe it.
 unsafe impl Sync for SessionMain {}
 
@@ -706,7 +706,7 @@ impl SessionMain {
 
     pub fn program_thread_migration(
         &self,
-        runtime: &DataPlaneRuntime,
+        runtime: &DataPlaneMain,
         target_worker: DataWorkerId,
         old_handle: SessionHandle,
         tuple: SessionTuple,
@@ -759,7 +759,7 @@ impl SessionMain {
             == Some(old_handle)
     }
 
-    fn wake_worker(&self, runtime: &DataPlaneRuntime, worker: DataWorkerId) {
+    fn wake_worker(&self, runtime: &DataPlaneMain, worker: DataWorkerId) {
         if let Some(session_queue) = runtime.node_by_name("session-queue") {
             runtime.set_worker_node_interrupt_pending(worker, session_queue);
         }
@@ -767,7 +767,7 @@ impl SessionMain {
 
     pub fn push_session_switch_pool_reply(
         &self,
-        runtime: &DataPlaneRuntime,
+        runtime: &DataPlaneMain,
         reply: SessionSwitchPoolReply,
     ) -> Result<(), SessionSwitchPoolReply> {
         let target_worker = reply.new_thread;
@@ -781,7 +781,7 @@ impl SessionMain {
 
     pub fn push_session_switch_pool_completion(
         &self,
-        runtime: &DataPlaneRuntime,
+        runtime: &DataPlaneMain,
         completion: SessionSwitchPoolCompletion,
     ) -> Result<(), SessionSwitchPoolCompletion> {
         let source_worker = completion.old_thread;
@@ -795,7 +795,7 @@ impl SessionMain {
 
     pub fn push_session_switch_pool_closed(
         &self,
-        runtime: &DataPlaneRuntime,
+        runtime: &DataPlaneMain,
         closed: SessionSwitchPoolClosed,
     ) -> Result<(), SessionSwitchPoolClosed> {
         let Ok(target_worker) = DataWorkerId::try_from(closed.new_sh.thread_index) else {
@@ -956,7 +956,7 @@ impl SessionMain {
         &self,
         operation: impl FnOnce() -> R,
     ) -> RuntimeResult<R> {
-        let barrier = match Engine::with_current(|engine| {
+        let barrier = match GlobalMain::with_current(|engine| {
             engine
                 .ensure_main_thread()
                 .map(|()| engine.worker_barrier())
@@ -1054,7 +1054,7 @@ impl SessionMain {
         // SAFETY: only the Main Thread mutates this pool while Data Workers
         // are stopped by the barrier below.
         let listeners = unsafe { &mut *self.listeners.get() };
-        let barrier = Engine::with_current(|engine| engine.worker_barrier());
+        let barrier = GlobalMain::with_current(|engine| engine.worker_barrier());
         Ok(match barrier {
             Some(barrier) if barrier.is_pending() => operation(listeners),
             Some(barrier) => barrier.sync(|| operation(listeners)),
@@ -1072,7 +1072,7 @@ impl SessionMain {
 
     pub fn with_worker_mut<R>(
         &self,
-        runtime: &DataPlaneRuntime,
+        runtime: &DataPlaneMain,
         operation: impl FnOnce(&mut SessionWorker) -> RuntimeResult<R>,
     ) -> RuntimeResult<R> {
         let thread_index = runtime.thread_index();
@@ -1088,7 +1088,7 @@ impl SessionMain {
 
     pub(crate) fn session_queue_is_interrupt(
         &self,
-        runtime: &DataPlaneRuntime,
+        runtime: &DataPlaneMain,
     ) -> RuntimeResult<bool> {
         self.with_worker_mut(runtime, |sessions| {
             Ok(sessions.state == SessionWorkerState::Interrupt)
@@ -1097,7 +1097,7 @@ impl SessionMain {
 
     pub(crate) fn application_detached(
         self: &'static Self,
-        engine: &Engine,
+        engine: &GlobalMain,
         application: u32,
     ) -> RuntimeResult<()> {
         self.remove_application_mqs(engine, application)?;
@@ -1124,10 +1124,9 @@ impl SessionMain {
                         .expect("scheduled Application detach targets an existing Session worker")
                         .with_mut(|sessions| {
                             sessions.application_detached(application);
-                            Engine::with_current(|engine| {
-                                sessions.wake_session_queue(&engine.runtime)
-                            })
-                            .ok_or(RuntimeError::WorkerControlRequiresMainEngine)??;
+                            hammer_runtime::with_data_plane_main(|main| {
+                                sessions.wake_session_queue(main)
+                            })?;
                             Ok::<(), RuntimeError>(())
                         })
                         .expect("scheduled Application detach runs on its Session worker")
@@ -1151,15 +1150,15 @@ impl SessionMain {
 
     pub fn install_application_mqs(
         self: &'static Self,
-        engine: &Engine,
+        engine: &GlobalMain,
         application: u32,
         resources: &ApplicationMqResources,
     ) -> RuntimeResult<()> {
-        if engine.thread_index != 0 {
-            return Err(RuntimeError::WorkerControlRequiresMainEngine);
+        if engine.thread_index() != 0 {
+            return Err(RuntimeError::WorkerControlRequiresGlobalMain);
         }
         let app_session_input = engine
-            .runtime
+            .data_plane_main()
             .nodes()
             .node_by_name("appsl-rx-mqs-input")
             .ok_or(SessionQueueError::NodeMissing)?;
@@ -1171,8 +1170,7 @@ impl SessionMain {
                 .clone();
             let main = self;
             schedule_worker_task(engine, worker, move || {
-                Engine::with_current(|engine| {
-                    let runtime = &mut engine.runtime;
+                hammer_runtime::with_data_plane_main_mut(|runtime| {
                     main.worker(worker)?
                         .with_mut(|sessions| {
                             sessions.install_app_mq(application, queue, app_session_input, runtime)
@@ -1182,7 +1180,6 @@ impl SessionMain {
                             source,
                         })?
                 })
-                .ok_or(RuntimeError::WorkerControlRequiresMainEngine)?
             })?;
             Ok::<(), RuntimeError>(())
         })?;
@@ -1191,25 +1188,22 @@ impl SessionMain {
 
     pub(crate) fn remove_application_mqs(
         self: &'static Self,
-        engine: &Engine,
+        engine: &GlobalMain,
         application: u32,
     ) -> RuntimeResult<()> {
         (0..self.workers.len()).try_for_each(|worker_slot| {
             let worker = DataWorkerId::new(worker_slot as u32);
             let main = self;
             schedule_worker_task(engine, worker, move || {
-                Engine::with_current(|_| {
-                    main.worker(worker)?
-                        .with_mut(|sessions| {
-                            sessions.drain_app_mq(application)?;
-                            Ok(())
-                        })
-                        .map_err(|source| SessionQueueError::WorkerAccess {
-                            worker: worker.slot(),
-                            source,
-                        })?
-                })
-                .ok_or(RuntimeError::WorkerControlRequiresMainEngine)?
+                main.worker(worker)?
+                    .with_mut(|sessions| {
+                        sessions.drain_app_mq(application)?;
+                        Ok(())
+                    })
+                    .map_err(|source| SessionQueueError::WorkerAccess {
+                        worker: worker.slot(),
+                        source,
+                    })?
             })?;
             Ok::<(), RuntimeError>(())
         })?;
@@ -1219,8 +1213,7 @@ impl SessionMain {
             let worker = DataWorkerId::new(worker_slot as u32);
             let main = self;
             if let Err(error) = schedule_worker_task(engine, worker, move || {
-                Engine::with_current(|engine| {
-                    let runtime = &mut engine.runtime;
+                hammer_runtime::with_data_plane_main_mut(|runtime| {
                     main.worker(worker)?
                         .with_mut(|sessions| sessions.remove_app_mq(application, runtime))
                         .map_err(|source| SessionQueueError::WorkerAccess {
@@ -1228,7 +1221,6 @@ impl SessionMain {
                             source,
                         })?
                 })
-                .ok_or(RuntimeError::WorkerControlRequiresMainEngine)?
             }) {
                 first_error.get_or_insert(error);
             }
@@ -1241,7 +1233,7 @@ impl SessionMain {
 }
 
 pub(super) fn schedule_worker_task<R: Send + 'static>(
-    engine: &Engine,
+    engine: &GlobalMain,
     worker: DataWorkerId,
     task: impl FnOnce() -> RuntimeResult<R> + Send + 'static,
 ) -> RuntimeResult<R> {
@@ -1254,7 +1246,7 @@ pub(super) fn schedule_worker_task<R: Send + 'static>(
 }
 
 pub fn install_session_worker(
-    engine: &mut Engine,
+    engine: &mut DataPlaneMain,
     app_session_input: hammer_core::data_plane::NodeId,
     session_queue: hammer_core::data_plane::NodeId,
     mut worker: SessionWorker,
@@ -1267,26 +1259,21 @@ pub fn install_session_worker(
     let input_data = AppSessionInputNode::worker_runtime_data(session_queue_data, session_queue);
     let worker_id = worker.worker();
     let slot = main.worker(worker_id)?;
-    let previous_app_session_input_data = engine
-        .runtime
-        .nodes()
-        .node_runtime_data(app_session_input)?;
-    let previous_session_queue_data = engine.runtime.nodes().node_runtime_data(session_queue)?;
-    let previous_app_session_input_state = engine.runtime.nodes().node_state(app_session_input)?;
-    let previous_session_queue_state = engine.runtime.nodes().node_state(session_queue)?;
+    let previous_app_session_input_data = engine.nodes().node_runtime_data(app_session_input)?;
+    let previous_session_queue_data = engine.nodes().node_runtime_data(session_queue)?;
+    let previous_app_session_input_state = engine.nodes().node_state(app_session_input)?;
+    let previous_session_queue_state = engine.nodes().node_state(session_queue)?;
 
     let setup = (|| -> RuntimeResult<()> {
         engine.set_worker_node_runtime_data(app_session_input, input_data)?;
         engine.set_worker_node_runtime_data(session_queue, session_queue_data)?;
         engine
-            .runtime
             .nodes()
             .set_node_state(session_queue, NodeState::Polling)?;
         engine
-            .runtime
             .nodes()
             .set_node_state(app_session_input, NodeState::Interrupt)?;
-        worker.install_state_deadline(&engine.runtime, session_queue)
+        worker.install_state_deadline(engine, session_queue)
     })();
     if let Err(error) = setup {
         cleanup_session_worker_install(&mut worker, engine);
@@ -1321,14 +1308,14 @@ pub fn install_session_worker(
     Ok(())
 }
 
-fn cleanup_session_worker_install(worker: &mut SessionWorker, engine: &mut Engine) {
-    if let Err(error) = worker.remove_state_deadline(&engine.runtime) {
+fn cleanup_session_worker_install(worker: &mut SessionWorker, engine: &mut DataPlaneMain) {
+    if let Err(error) = worker.remove_state_deadline(engine) {
         tracing::error!(%error, "failed to remove Session Worker deadline during install rollback");
     }
 }
 
 fn rollback_session_worker_graph(
-    engine: &mut Engine,
+    engine: &mut DataPlaneMain,
     app_session_input: hammer_core::data_plane::NodeId,
     previous_app_session_input_data: NodeRuntimeData,
     previous_app_session_input_state: NodeState,
@@ -1337,7 +1324,6 @@ fn rollback_session_worker_graph(
     previous_session_queue_state: NodeState,
 ) {
     if let Err(error) = engine
-        .runtime
         .nodes()
         .set_node_state(session_queue, previous_session_queue_state)
     {
@@ -1348,7 +1334,6 @@ fn rollback_session_worker_graph(
         );
     }
     if let Err(error) = engine
-        .runtime
         .nodes()
         .set_node_state(app_session_input, previous_app_session_input_state)
     {
@@ -1418,7 +1403,7 @@ impl SessionWorker {
     /// remains owned by this worker and is updated after queue dispatch.
     pub(crate) fn install_state_deadline(
         &mut self,
-        runtime: &DataPlaneRuntime,
+        runtime: &DataPlaneMain,
         session_queue: NodeId,
     ) -> RuntimeResult<()> {
         if self.state_deadline_file.is_some() {
@@ -1430,20 +1415,17 @@ impl SessionWorker {
             schedule_session_queue_deadline,
         );
         deadline.set_polling_thread_index(runtime.thread_index());
-        let index = runtime.file_main_mut().add_deadline(deadline)?;
+        let index = runtime.file_main().add_deadline(deadline)?;
         self.state_deadline_file = Some(index);
         self.session_queue = Some(session_queue);
         Ok(())
     }
 
-    pub(crate) fn remove_state_deadline(
-        &mut self,
-        runtime: &DataPlaneRuntime,
-    ) -> RuntimeResult<()> {
+    pub(crate) fn remove_state_deadline(&mut self, runtime: &DataPlaneMain) -> RuntimeResult<()> {
         let Some(index) = self.state_deadline_file else {
             return Ok(());
         };
-        if !runtime.file_main_mut().delete_deadline(index)? {
+        if !runtime.file_main().delete_deadline(index)? {
             return Err(RuntimeError::DeadlineIndexInvalid { index });
         }
         self.state_deadline_file = None;
@@ -1456,7 +1438,7 @@ impl SessionWorker {
     /// the state machine itself does not own transport timers.
     pub fn update_state(
         &mut self,
-        runtime: &DataPlaneRuntime,
+        runtime: &DataPlaneMain,
         last_vectors_per_loop: usize,
     ) -> RuntimeResult<()> {
         let pending_events = self.pending_event_count() != 0;
@@ -1487,7 +1469,7 @@ impl SessionWorker {
 
     fn apply_state(
         &mut self,
-        runtime: &DataPlaneRuntime,
+        runtime: &DataPlaneMain,
         next: SessionWorkerState,
     ) -> RuntimeResult<()> {
         if self.state == next {
@@ -1500,7 +1482,7 @@ impl SessionWorker {
                 .set_node_state(session_queue, next.node_state())?;
         }
         if let Some(index) = self.state_deadline_file
-            && let Err(error) = runtime.file_main_mut().set_deadline(index, next.deadline())
+            && let Err(error) = runtime.file_main().set_deadline(index, next.deadline())
         {
             if let Some(session_queue) = self.session_queue
                 && let Err(cleanup_error) = runtime
@@ -1518,7 +1500,7 @@ impl SessionWorker {
         Ok(())
     }
 
-    pub(crate) fn wake_session_queue(&self, runtime: &DataPlaneRuntime) -> RuntimeResult<()> {
+    pub(crate) fn wake_session_queue(&self, runtime: &DataPlaneMain) -> RuntimeResult<()> {
         if let Some(session_queue) = self.session_queue {
             let _ = runtime.set_node_interrupt_pending(session_queue)?;
         }
@@ -2150,7 +2132,7 @@ impl SessionWorker {
         application: u32,
         queue: Arc<SessionMsgQueue>,
         app_session_input: hammer_core::data_plane::NodeId,
-        runtime: &mut DataPlaneRuntime,
+        runtime: &mut DataPlaneMain,
     ) -> RuntimeResult<()> {
         let slot = application as usize;
         if slot >= self.app_rx_mqs.len() {
@@ -2190,7 +2172,7 @@ impl SessionWorker {
             },
         );
         file.set_polling_thread_index(runtime.thread_index());
-        let file = match runtime.file_main_mut().add(file) {
+        let file = match runtime.file_main().add(file) {
             Ok(file) => file,
             Err(error) => {
                 // SAFETY: `entry_ptr` still owns the entry until FileMain add
@@ -2214,7 +2196,7 @@ impl SessionWorker {
     pub(crate) fn remove_app_mq(
         &mut self,
         application: u32,
-        runtime: &mut DataPlaneRuntime,
+        runtime: &mut DataPlaneMain,
     ) -> RuntimeResult<()> {
         let slot = application as usize;
         let Some(entry) = self.app_rx_mqs.get_mut(slot).and_then(|entry| {
@@ -2232,7 +2214,7 @@ impl SessionWorker {
         self.app_rx_mq_pending
             .retain(|candidate| *candidate != application);
         if let Some(file) = entry.file {
-            match runtime.file_main_mut().delete(file) {
+            match runtime.file_main().delete(file) {
                 Ok(true) => {}
                 Ok(false) => {
                     if entry.pending {
@@ -2844,7 +2826,7 @@ impl SessionWorker {
 
     pub fn program_thread_migration(
         &self,
-        runtime: &DataPlaneRuntime,
+        runtime: &DataPlaneMain,
         target_worker: DataWorkerId,
         old_handle: SessionHandle,
         tuple: SessionTuple,
@@ -2865,7 +2847,7 @@ impl SessionWorker {
 
     pub fn push_session_switch_pool_reply(
         &self,
-        runtime: &DataPlaneRuntime,
+        runtime: &DataPlaneMain,
         reply: SessionSwitchPoolReply,
     ) -> Result<(), SessionSwitchPoolReply> {
         let target_worker = reply.new_thread;
@@ -2888,7 +2870,7 @@ impl SessionWorker {
 
     pub fn push_session_switch_pool_completion(
         &self,
-        runtime: &DataPlaneRuntime,
+        runtime: &DataPlaneMain,
         completion: SessionSwitchPoolCompletion,
     ) -> Result<(), SessionSwitchPoolCompletion> {
         let source_worker = completion.old_thread;
@@ -2908,7 +2890,7 @@ impl SessionWorker {
 
     pub fn push_session_switch_pool_closed(
         &self,
-        runtime: &DataPlaneRuntime,
+        runtime: &DataPlaneMain,
         closed: SessionSwitchPoolClosed,
     ) -> Result<(), SessionSwitchPoolClosed> {
         let Ok(target_worker) = DataWorkerId::try_from(closed.new_sh.thread_index) else {
@@ -3198,7 +3180,7 @@ impl SessionWorker {
 
     pub fn notify_transport_closing(
         &mut self,
-        runtime: Option<&DataPlaneRuntime>,
+        runtime: Option<&DataPlaneMain>,
         session_id: u32,
         index: u32,
     ) -> RuntimeResult<()> {
@@ -4149,7 +4131,7 @@ impl SessionWorker {
 
 impl SessionWorker {
     #[inline]
-    fn wake_worker(&self, runtime: &DataPlaneRuntime, worker: DataWorkerId) {
+    fn wake_worker(&self, runtime: &DataPlaneMain, worker: DataWorkerId) {
         if let Some(session_queue) = runtime.node_by_name("session-queue") {
             runtime.set_worker_node_interrupt_pending(worker, session_queue);
         }
@@ -4244,7 +4226,7 @@ pub trait SessionTransport: Sized {
         _: u32,
         _: usize,
         _: usize,
-        _: &DataPlaneRuntime,
+        _: &DataPlaneMain,
         _: SessionQueueNext,
         _: &mut BufferFrame,
         _: &mut crate::session::node::SessionQueueOutput,
@@ -4255,7 +4237,7 @@ pub trait SessionTransport: Sized {
     fn update_time(
         &mut self,
         sessions: &mut SessionWorker,
-        runtime: &DataPlaneRuntime,
+        runtime: &DataPlaneMain,
         output_next: SessionQueueNext,
         frame: &mut BufferFrame,
         output: &mut crate::session::node::SessionQueueOutput,
@@ -4266,7 +4248,7 @@ pub trait SessionTransport: Sized {
         &mut self,
         sessions: &mut SessionWorker,
         index: u32,
-        runtime: &DataPlaneRuntime,
+        runtime: &DataPlaneMain,
         output_next: SessionQueueNext,
         frame: &mut BufferFrame,
         output: &mut crate::session::node::SessionQueueOutput,
@@ -4284,7 +4266,7 @@ pub trait SessionTransport: Sized {
         &mut self,
         sessions: &mut SessionWorker,
         index: u32,
-        runtime: &DataPlaneRuntime,
+        runtime: &DataPlaneMain,
         output_next: SessionQueueNext,
         frame: &mut BufferFrame,
         output: &mut crate::session::node::SessionQueueOutput,
@@ -4299,7 +4281,7 @@ pub trait SessionPacketizedTransport: SessionTransport {
         &mut self,
         sessions: &mut SessionWorker,
         index: u32,
-        runtime: &DataPlaneRuntime,
+        runtime: &DataPlaneMain,
         output_next: SessionQueueNext,
         frame: &mut BufferFrame,
         output: &mut crate::session::node::SessionQueueOutput,
@@ -4329,7 +4311,7 @@ pub trait TransportInternalTransport: SessionTransport {
         sessions: &mut SessionWorker,
         session_id: u32,
         index: u32,
-        runtime: &DataPlaneRuntime,
+        runtime: &DataPlaneMain,
         output_next: SessionQueueNext,
         frame: &mut BufferFrame,
         output: &mut crate::session::node::SessionQueueOutput,
@@ -4346,7 +4328,7 @@ where
         sessions: &mut SessionWorker,
         index: u32,
         session_id: u32,
-        runtime: &DataPlaneRuntime,
+        runtime: &DataPlaneMain,
         output_next: SessionQueueNext,
         frame: &mut BufferFrame,
         output: &mut crate::session::node::SessionQueueOutput,
@@ -4366,7 +4348,7 @@ where
         sessions: &mut SessionWorker,
         index: u32,
         session_id: u32,
-        runtime: &DataPlaneRuntime,
+        runtime: &DataPlaneMain,
         output_next: SessionQueueNext,
         frame: &mut BufferFrame,
         output: &mut crate::session::node::SessionQueueOutput,
@@ -4390,7 +4372,7 @@ where
         let io_budget = output
             .remaining_io_budget()
             .min(DEFAULT_TX_DISPATCH_BUDGET)
-            .min(frame.remaining_capacity());
+            .min(frame.capacity().saturating_sub(frame.len()));
         if batch_offset < total_len
             && remaining_space != 0
             && params.send_goal_size != 0
@@ -4450,7 +4432,7 @@ where
         sessions: &mut SessionWorker,
         index: u32,
         session_id: u32,
-        runtime: &DataPlaneRuntime,
+        runtime: &DataPlaneMain,
         output_next: SessionQueueNext,
         frame: &mut BufferFrame,
         output: &mut crate::session::node::SessionQueueOutput,
@@ -4470,7 +4452,7 @@ where
 }
 
 pub fn dispatch_session_queue_once<T>(
-    runtime: &DataPlaneRuntime,
+    runtime: &DataPlaneMain,
     owner: hammer_core::data_plane::NodeId,
     sessions: &mut SessionWorker,
     transport: &mut T,
@@ -4498,7 +4480,7 @@ where
 }
 
 pub fn dispatch_session_queue_pending<T>(
-    runtime: &DataPlaneRuntime,
+    runtime: &DataPlaneMain,
     sessions: &mut SessionWorker,
     transport: &mut T,
     output_next: SessionQueueNext,
@@ -4525,7 +4507,7 @@ where
 }
 
 pub fn dispatch_session_queue_events<T>(
-    runtime: &DataPlaneRuntime,
+    runtime: &DataPlaneMain,
     sessions: &mut SessionWorker,
     transport: &mut T,
     output_next: SessionQueueNext,
@@ -4717,7 +4699,7 @@ where
 fn dispatch_io_event<T>(
     sessions: &mut SessionWorker,
     transport: &mut T,
-    runtime: &DataPlaneRuntime,
+    runtime: &DataPlaneMain,
     output_next: SessionQueueNext,
     frame: &mut BufferFrame,
     output: &mut crate::session::node::SessionQueueOutput,

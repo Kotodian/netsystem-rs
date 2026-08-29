@@ -2,7 +2,7 @@ use crate::{TcpError, TcpSegmentFlags, tcp_header};
 use hammer_core::data_plane::{BufferFrame, BufferPacketCursor, Index, NodeId};
 use hammer_infra::checksum::{internet_checksum, internet_checksum_parts};
 use hammer_runtime::RuntimeResult;
-use hammer_runtime::{DataPlaneRuntime, Node, NodeProcessFn, NodeResult, NodeRuntimeData};
+use hammer_runtime::{DataPlaneMain, Node, NodeProcessFn, NodeRuntimeData};
 
 #[hammer_component_macros::node_next]
 pub enum TcpResetNext {
@@ -20,7 +20,7 @@ pub enum TcpResetNext {
 #[derive(Clone, Copy)]
 pub struct TcpResetNode;
 
-pub fn register_tcp_reset(runtime: &DataPlaneRuntime) -> RuntimeResult<NodeId> {
+pub fn register_tcp_reset(runtime: &DataPlaneMain) -> RuntimeResult<NodeId> {
     runtime
         .nodes()
         .try_register_internal_with_next_names(TcpResetNode::new(), &TcpResetNext::NEXT_NAMES)
@@ -28,7 +28,7 @@ pub fn register_tcp_reset(runtime: &DataPlaneRuntime) -> RuntimeResult<NodeId> {
 
 impl Node for TcpResetNode {
     #[inline(always)]
-    fn process(&mut self, runtime: &DataPlaneRuntime, frame: &mut BufferFrame) -> NodeResult {
+    fn process(&mut self, runtime: &DataPlaneMain, frame: &mut BufferFrame) -> () {
         tcp_reset_process_frame(runtime, frame)
     }
 
@@ -43,25 +43,18 @@ impl Node for TcpResetNode {
     }
 }
 
-fn tcp_reset_process(
-    runtime: &DataPlaneRuntime,
-    _: NodeRuntimeData,
-    frame: &mut BufferFrame,
-) -> NodeResult {
+fn tcp_reset_process(runtime: &DataPlaneMain, _: NodeRuntimeData, frame: &mut BufferFrame) -> () {
     tcp_reset_process_frame(runtime, frame)
 }
 
-fn tcp_reset_process_frame(runtime: &DataPlaneRuntime, frame: &mut BufferFrame) -> NodeResult {
+fn tcp_reset_process_frame(runtime: &DataPlaneMain, frame: &mut BufferFrame) -> () {
     hammer_runtime::process_frame!(runtime, frame, |index| {
         tcp_reset_next_for_index(runtime, index).unwrap_or(TcpResetNext::Drop)
     })
 }
 
 #[inline(always)]
-fn tcp_reset_next_for_index(
-    runtime: &DataPlaneRuntime,
-    index: Index,
-) -> RuntimeResult<TcpResetNext> {
+fn tcp_reset_next_for_index(runtime: &DataPlaneMain, index: Index) -> RuntimeResult<TcpResetNext> {
     let reset = {
         let buffer = runtime.get_buffer(index)?;
         tcp_reset_prepare_from_current(
@@ -81,7 +74,7 @@ fn tcp_reset_next_for_index(
 
 #[inline(always)]
 fn tcp_reset_write_reply(
-    runtime: &DataPlaneRuntime,
+    runtime: &DataPlaneMain,
     index: Index,
     reset: Option<([u8; 16], [u8; 16], u16, u16, u32, u32, u8, u8)>,
 ) -> RuntimeResult<Option<usize>> {
@@ -418,7 +411,7 @@ fn be_u32(value: u32) -> [u8; 4] {
 }
 
 fn refresh_reset_metadata(
-    runtime: &DataPlaneRuntime,
+    runtime: &DataPlaneMain,
     index: Index,
     packet_len: usize,
 ) -> RuntimeResult<()> {

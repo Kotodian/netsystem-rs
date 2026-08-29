@@ -11,12 +11,12 @@ use hammer_core::data_plane::NodeId;
 #[hammer_component_macros::config_function(name = "runtime_trace_config", section = "trace")]
 fn configure_trace(
     trace: Trace,
-    engine: &mut crate::Engine,
+    engine: &mut crate::GlobalMain,
 ) -> RuntimeResult<Arc<TraceControlPlane>> {
     trace.validate()?;
     let control = Arc::new(TraceControlPlane::new(trace.record_capacity));
-    control.publish_options(&trace, |name| engine.runtime.node_by_name(name))?;
-    engine.runtime.set_trace_control(Some(control.handle()));
+    control.publish_options(&trace, |name| engine.main.node_by_name(name))?;
+    engine.main.set_trace_control(Some(control.handle()));
     Ok(control)
 }
 

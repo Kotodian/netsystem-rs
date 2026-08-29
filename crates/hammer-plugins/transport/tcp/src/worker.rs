@@ -3,7 +3,7 @@ use std::time::{Duration, Instant};
 use crate::{TcpError, TcpSeq, TcpState};
 use hammer_core::data_plane::DataPlaneBuffers;
 use hammer_infra::pool::Pool;
-use hammer_runtime::{DataPlaneRuntime, DataWorkerId};
+use hammer_runtime::{DataPlaneMain, DataWorkerId};
 use hammer_runtime::{RuntimeError, RuntimeResult};
 
 use super::connection::TcpTimerAction;
@@ -93,7 +93,7 @@ impl TcpWorker {
         &mut self,
         sessions: &mut SessionWorker,
         index: u32,
-        runtime: &DataPlaneRuntime,
+        runtime: &DataPlaneMain,
         output_next: SessionQueueNext,
         frame: &mut hammer_core::data_plane::BufferFrame,
         output: &mut SessionQueueOutput,
@@ -147,7 +147,7 @@ impl SessionTransport for TcpWorker {
         index: u32,
         rx_available: usize,
         rx_capacity: usize,
-        runtime: &DataPlaneRuntime,
+        runtime: &DataPlaneMain,
         output_next: SessionQueueNext,
         frame: &mut hammer_core::data_plane::BufferFrame,
         output: &mut SessionQueueOutput,
@@ -184,7 +184,7 @@ impl SessionTransport for TcpWorker {
     fn update_time(
         &mut self,
         sessions: &mut SessionWorker,
-        runtime: &DataPlaneRuntime,
+        runtime: &DataPlaneMain,
         output_next: SessionQueueNext,
         frame: &mut hammer_core::data_plane::BufferFrame,
         output: &mut SessionQueueOutput,
@@ -250,7 +250,7 @@ impl SessionTransport for TcpWorker {
         &mut self,
         sessions: &mut SessionWorker,
         index: u32,
-        runtime: &DataPlaneRuntime,
+        runtime: &DataPlaneMain,
         output_next: SessionQueueNext,
         frame: &mut hammer_core::data_plane::BufferFrame,
         output: &mut SessionQueueOutput,
@@ -273,7 +273,7 @@ impl SessionPacketizedTransport for TcpWorker {
         &mut self,
         sessions: &mut SessionWorker,
         index: u32,
-        runtime: &DataPlaneRuntime,
+        runtime: &DataPlaneMain,
         output_next: SessionQueueNext,
         frame: &mut hammer_core::data_plane::BufferFrame,
         output: &mut SessionQueueOutput,

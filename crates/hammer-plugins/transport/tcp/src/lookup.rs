@@ -9,7 +9,6 @@ use crossbeam_utils::CachePadded;
 use hammer_infra::bihash::{Bihash, BihashKey, FREE_U64};
 use hammer_infra::pool::Pool;
 use hammer_runtime::DataWorkerId;
-use hammer_runtime::app::SessionHandle;
 
 use crate::{TcpConnection, TcpInputNext, TcpState, TransportConnectionKey};
 

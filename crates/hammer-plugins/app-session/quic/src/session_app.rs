@@ -1,6 +1,6 @@
 use std::time::Instant;
 
-use hammer_runtime::{DataWorkerId, RuntimeError, RuntimeResult};
+use hammer_runtime::{RuntimeError, RuntimeResult};
 use hammer_service::session::protocol::SessionAppVft;
 use hammer_service::session::runtime::SessionWorker;
 

@@ -1,9 +1,7 @@
 use std::time::Instant;
 
 use hammer_core::data_plane::{BufferFrame, Index, NodeId, NodeRegistration};
-use hammer_runtime::{
-    DataPlaneRuntime, DriverNode, Node, NodeProcessFn, NodeResult, NodeRuntimeData,
-};
+use hammer_runtime::{DataPlaneMain, DriverNode, Node, NodeProcessFn, NodeRuntimeData};
 use hammer_runtime::{RuntimeError, RuntimeResult};
 
 use crate::session::SessionQueueError;
@@ -21,7 +19,7 @@ pub const SESSION_QUEUE_IO_BUDGET: usize = 128;
 #[derive(Clone, Copy, Default)]
 pub struct AppSessionInputNode;
 
-pub fn register_app_session_input_node(runtime: &DataPlaneRuntime) -> RuntimeResult<NodeId> {
+pub fn register_app_session_input_node(runtime: &DataPlaneMain) -> RuntimeResult<NodeId> {
     if let Some(node) = runtime.nodes().node_by_name("appsl-rx-mqs-input") {
         return Ok(node);
     }
@@ -43,7 +41,7 @@ impl AppSessionInputNode {
 }
 
 impl Node for AppSessionInputNode {
-    fn process(&mut self, runtime: &DataPlaneRuntime, frame: &mut BufferFrame) -> NodeResult {
+    fn process(&mut self, runtime: &DataPlaneMain, frame: &mut BufferFrame) -> () {
         app_session_input_node_process(runtime, NodeRuntimeData::empty(), frame)
     }
 
@@ -55,19 +53,19 @@ impl Node for AppSessionInputNode {
 
 impl DriverNode for AppSessionInputNode {
     #[inline]
-    fn node_registration(&self) -> NodeRegistration
+    fn node_registration(&self) -> Option<NodeRegistration>
     where
         Self: Sized,
     {
-        NodeRegistration::next("appsl-rx-mqs-input", 0)
+        Some(NodeRegistration::next("appsl-rx-mqs-input", 0))
     }
 }
 
 fn app_session_input_node_process(
-    runtime: &DataPlaneRuntime,
+    runtime: &DataPlaneMain,
     data: NodeRuntimeData,
     _: &mut BufferFrame,
-) -> NodeResult {
+) -> () {
     let _ = (|| {
         let handled = SessionQueueNode::poll_app(runtime, data)?;
         if handled != 0 && SessionQueueNode::session_queue_is_interrupt(runtime, data)? {
@@ -84,7 +82,7 @@ fn app_session_input_node_process(
         }
         Ok::<(), RuntimeError>(())
     })();
-    NodeResult::drop()
+    ()
 }
 
 /// Current-node-local next slot for Session Queue generated output.
@@ -104,7 +102,7 @@ impl SessionQueueNext {
 }
 
 pub type SessionQueueDispatchFn = fn(
-    &DataPlaneRuntime,
+    &DataPlaneMain,
     &mut SessionWorker,
     NodeRuntimeData,
     SessionQueueNext,
@@ -114,7 +112,7 @@ pub type SessionQueueDispatchFn = fn(
 ) -> RuntimeResult<()>;
 
 pub type SessionQueueUpdateTimeFn = fn(
-    &DataPlaneRuntime,
+    &DataPlaneMain,
     &mut SessionWorker,
     NodeRuntimeData,
     SessionQueueNext,
@@ -178,7 +176,7 @@ impl SessionQueueOutput {
 
     /// One Graph Fanout flush for every index recorded on `frame` this dispatch.
     #[inline]
-    pub fn flush(self, runtime: &DataPlaneRuntime, frame: &mut BufferFrame) {
+    pub fn flush(self, runtime: &DataPlaneMain, frame: &mut BufferFrame) {
         debug_assert_eq!(frame.len(), self.nexts.len());
         if self.nexts.is_empty() {
             return;
@@ -207,7 +205,7 @@ pub struct SessionQueueNode {
     runtime_data: NodeRuntimeData,
 }
 
-pub fn register_session_queue_node(runtime: &DataPlaneRuntime) -> RuntimeResult<NodeId> {
+pub fn register_session_queue_node(runtime: &DataPlaneMain) -> RuntimeResult<NodeId> {
     if let Some(node) = runtime.nodes().node_by_name("session-queue") {
         return Ok(node);
     }
@@ -222,7 +220,7 @@ impl SessionQueueNode {
         })
     }
 
-    fn poll_app(runtime: &DataPlaneRuntime, runtime_data: NodeRuntimeData) -> RuntimeResult<usize> {
+    fn poll_app(runtime: &DataPlaneMain, runtime_data: NodeRuntimeData) -> RuntimeResult<usize> {
         let ptr = runtime_data.word(0) as usize as *const SessionMain;
         if ptr.is_null() {
             return Err(RuntimeError::RuntimeCapabilityMissing {
@@ -236,7 +234,7 @@ impl SessionQueueNode {
     }
 
     fn has_pending_app_mqs(
-        runtime: &DataPlaneRuntime,
+        runtime: &DataPlaneMain,
         runtime_data: NodeRuntimeData,
     ) -> RuntimeResult<bool> {
         let ptr = runtime_data.word(0) as usize as *const SessionMain;
@@ -252,7 +250,7 @@ impl SessionQueueNode {
     }
 
     fn session_queue_is_interrupt(
-        runtime: &DataPlaneRuntime,
+        runtime: &DataPlaneMain,
         runtime_data: NodeRuntimeData,
     ) -> RuntimeResult<bool> {
         let ptr = runtime_data.word(0) as usize as *const SessionMain;
@@ -269,7 +267,7 @@ impl SessionQueueNode {
 
     /// Compiles the session queue's output edge in the main graph.
     pub fn compile_output_next(
-        runtime: &DataPlaneRuntime,
+        runtime: &DataPlaneMain,
         consumer: NodeId,
         output_node: NodeId,
     ) -> RuntimeResult<SessionQueueNext> {
@@ -282,7 +280,7 @@ impl SessionQueueNode {
     /// This only observes graph identity. Worker initialization must never add
     /// or change a next arc.
     pub fn existing_output_next(
-        runtime: &DataPlaneRuntime,
+        runtime: &DataPlaneMain,
         consumer: NodeId,
         output_node: NodeId,
     ) -> RuntimeResult<SessionQueueNext> {
@@ -313,7 +311,7 @@ impl SessionQueueNode {
     /// The graph edge is compiled by [`Self::compile_output_next`] on the main
     /// thread. This method owns only the worker's dispatch table.
     pub fn install_worker_attachment(
-        runtime: &DataPlaneRuntime,
+        runtime: &DataPlaneMain,
         runtime_data: NodeRuntimeData,
         output_next: SessionQueueNext,
         update_time: SessionQueueUpdateTimeFn,
@@ -349,7 +347,7 @@ impl SessionQueueNode {
 
     /// Removes one exact worker-local transport dispatch attachment.
     pub fn remove_worker_attachment(
-        runtime: &DataPlaneRuntime,
+        runtime: &DataPlaneMain,
         runtime_data: NodeRuntimeData,
         output_next: SessionQueueNext,
         update_time: SessionQueueUpdateTimeFn,
@@ -379,7 +377,7 @@ impl SessionQueueNode {
 }
 
 impl Node for SessionQueueNode {
-    fn process(&mut self, runtime: &DataPlaneRuntime, frame: &mut BufferFrame) -> NodeResult {
+    fn process(&mut self, runtime: &DataPlaneMain, frame: &mut BufferFrame) -> () {
         session_queue_node_process(runtime, self.runtime_data, frame)
     }
 
@@ -396,24 +394,24 @@ impl Node for SessionQueueNode {
 
 impl DriverNode for SessionQueueNode {
     #[inline]
-    fn node_registration(&self) -> NodeRegistration
+    fn node_registration(&self) -> Option<NodeRegistration>
     where
         Self: Sized,
     {
-        NodeRegistration::next("session-queue", 0)
+        Some(NodeRegistration::next("session-queue", 0))
     }
 }
 
 fn session_queue_node_process(
-    runtime: &DataPlaneRuntime,
+    runtime: &DataPlaneMain,
     data: NodeRuntimeData,
     frame: &mut BufferFrame,
-) -> NodeResult {
+) -> () {
     let now = Instant::now();
     let mut output = SessionQueueOutput::default();
     let ptr = data.word(0) as usize as *const SessionMain;
     if ptr.is_null() {
-        return NodeResult::drop();
+        return ();
     }
     // SAFETY: worker NodeRuntimeData is installed by the owning Data Worker and
     // points at the process-global SessionMain for its lifetime.
@@ -462,5 +460,5 @@ fn session_queue_node_process(
         Ok(false)
     });
     output.flush(runtime, frame);
-    NodeResult::drop()
+    ()
 }

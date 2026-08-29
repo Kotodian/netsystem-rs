@@ -8,7 +8,7 @@
 
 use crate::binary_api::BinaryApiMethodEntry;
 use crate::error::RuntimeResult;
-use crate::init::{ConfigFunction, InitFunction};
+use crate::init::{ConfigFunction, InitFunction, WorkerInitFunction};
 use crate::node::{NodeEntry, NodeFunctionRegistration};
 use crate::process::ProcessEntry;
 use crate::registry::RuntimeRegistry;
@@ -38,7 +38,7 @@ pub struct RegistrationImage {
     early_config_functions: &'static [ConfigFunction],
     main_loop_enter_functions: &'static [InitFunction],
     main_loop_exit_functions: &'static [InitFunction],
-    worker_init_functions: &'static [InitFunction],
+    worker_init_functions: &'static [WorkerInitFunction],
     graph_nodes: &'static [NodeEntry],
     node_functions: &'static [NodeFunctionRegistration],
     process_nodes: &'static [ProcessEntry],
@@ -55,7 +55,7 @@ impl RegistrationImage {
         early_config_functions: &'static [ConfigFunction],
         main_loop_enter_functions: &'static [InitFunction],
         main_loop_exit_functions: &'static [InitFunction],
-        worker_init_functions: &'static [InitFunction],
+        worker_init_functions: &'static [WorkerInitFunction],
         graph_nodes: &'static [NodeEntry],
         node_functions: &'static [NodeFunctionRegistration],
         process_nodes: &'static [ProcessEntry],
@@ -84,7 +84,7 @@ impl RegistrationImage {
         early_config_functions: &'static [ConfigFunction],
         main_loop_enter_functions: &'static [InitFunction],
         main_loop_exit_functions: &'static [InitFunction],
-        worker_init_functions: &'static [InitFunction],
+        worker_init_functions: &'static [WorkerInitFunction],
         graph_nodes: &'static [NodeEntry],
         node_functions: &'static [NodeFunctionRegistration],
         process_nodes: &'static [ProcessEntry],
@@ -121,7 +121,7 @@ impl RegistrationImage {
     }
 
     #[inline]
-    pub(crate) fn worker_init_functions(&self) -> &'static [InitFunction] {
+    pub(crate) fn worker_init_functions(&self) -> &'static [WorkerInitFunction] {
         self.worker_init_functions
     }
 

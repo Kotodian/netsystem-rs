@@ -24,10 +24,9 @@ pub fn load_plugin(path: &Path) -> Result<Library, libloading::Error> {
     unsafe { Library::new(path) }
 }
 
-/// Node-shaped `dlsym` process: same roles as `NodeProcessFn`
-/// (`DataPlaneRuntime`, `NodeRuntimeData` words, host-owned `BufferFrame`).
+/// Node-shaped `dlsym` process: runtime-data words plus a host-owned
+/// `BufferFrame`, matching the prototype's cross-DSO ownership boundary.
 pub type PluginNodeProcess = unsafe extern "C" fn(
-    *const hammer_runtime::DataPlaneRuntime,
     *const u64,
     *mut hammer_core::data_plane::BufferFrame,
 ) -> usize;

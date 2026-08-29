@@ -1,54 +1,38 @@
-use std::sync::Arc;
-use std::sync::atomic::Ordering;
-use std::task::Context;
-use std::thread;
-
 use tokio::io::Interest;
 use tokio::io::unix::AsyncFd;
 
-use crate::engine::Engine;
+use crate::DataPlaneMain;
 use crate::spawn;
-use crate::spawn::{DATA_LOCAL_DRIVER_WAKER, DATA_WORKER_IDLE_SLICE, with_data_plane_runtime};
+use crate::spawn::DATA_WORKER_IDLE_SLICE;
 
-/// VPP-style fixed-schedule engine main loop.
+/// VPP-style fixed-schedule data-plane main loop.
 ///
 /// Step order mirrors VPP `main.c:1442-1693`:
 /// 1. Barrier check (workers_at_barrier / wait_at_barrier)
 /// 2. Poll worker-local File readiness
-/// 3. Drain handoff + run ready nodes, poll remote-local queue, poll DataLocalTask futures
+/// 3. Drain handoff, run ready nodes, and poll the worker control queue
 /// 4. Tokio reactor tick — drive transport/session futures
 /// 5. Schedule polling-state driver nodes (periodically)
 /// 6. Run ready nodes (handles interrupt frames + newly-scheduled polling frames)
 /// 7. Dispatch timer nodes (no timer wheel in data-plane yet)
 /// 8. Advance timers, increment main_loop_count and check exit
-pub fn engine_main_loop(
-    engine: &mut Engine,
+pub fn data_plane_main_loop(
+    main: &mut DataPlaneMain,
     runtime: &tokio::runtime::Runtime,
     remote_local: &spawn::DataRemoteLocalQueue,
 ) -> i32 {
     let idle_slice = DATA_WORKER_IDLE_SLICE.with(|s| s.get());
 
-    let worker_waker = Arc::new(spawn::DataWorkerThreadWake {
-        thread: thread::current(),
-    })
-    .into();
-    let mut cx = Context::from_waker(&worker_waker);
-    DATA_LOCAL_DRIVER_WAKER.with(|slot| {
-        *slot.borrow_mut() = Some(worker_waker.clone());
-    });
-    engine.runtime.attach_worker_interrupt_thread();
+    main.attach_worker_interrupt_thread();
 
     let io_wake = {
         let _reactor = runtime.enter();
-        match engine
-            .file_main()
-            .io_wake_fd_for_worker(engine.thread_index)
-        {
+        match main.file_main().io_wake_fd_for_worker(main.thread_index()) {
             Ok(wake_fd) => match AsyncFd::with_interest(wake_fd, Interest::READABLE) {
                 Ok(wake) => Some(wake),
                 Err(error) => {
                     tracing::warn!(
-                        worker = engine.thread_index,
+                        worker = main.thread_index(),
                         %error,
                         "File wake fd registration failed; idle sleep is fixed-slice"
                     );
@@ -57,7 +41,7 @@ pub fn engine_main_loop(
             },
             Err(error) => {
                 tracing::warn!(
-                    worker = engine.thread_index,
+                        worker = main.thread_index(),
                     %error,
                     "File wake fd duplication failed; idle sleep is fixed-slice"
                 );
@@ -70,48 +54,41 @@ pub fn engine_main_loop(
         let mut progress = false;
 
         // Step 1: Barrier check — VPP threads.c:296
-        if engine.barrier.is_pending() {
-            engine.barrier.check();
-            if !engine.refork_worker_graph() {
+        if main.worker_barrier().is_pending() {
+            main.worker_barrier().check();
+            if !main.refork_worker_graph() {
                 return 1;
             }
         }
 
         // Step 2: Poll worker-local File readiness before graph dispatch.
-        match engine.poll_file_readiness() {
+        match main.poll_file_readiness() {
             Ok(dispatched) => progress |= dispatched != 0,
             Err(error) => {
-                tracing::error!(worker = engine.thread_index, %error, "File poll failed");
+                tracing::error!(worker = main.thread_index(), %error, "File poll failed");
                 return 1;
             }
         }
-        with_data_plane_runtime(|rt| {
-            if let Ok(scheduled) = rt.schedule_remote_interrupts() {
-                progress |= scheduled != 0;
-            }
-            if let Ok(scheduled) = rt.schedule_polling_pre_input_nodes() {
-                progress |= scheduled != 0;
-            }
-            if let Ok(scheduled) = rt.schedule_interrupt_pre_input_nodes() {
-                progress |= scheduled != 0;
-            }
-            if let Ok(scheduled) = rt.schedule_polling_driver_nodes() {
-                progress |= scheduled != 0;
-            }
-            if let Ok(scheduled) = rt.schedule_interrupt_driver_nodes() {
-                progress |= scheduled != 0;
-            }
-        });
+        if let Ok(scheduled) = main.schedule_remote_interrupts() {
+            progress |= scheduled != 0;
+        }
+        if let Ok(scheduled) = main.schedule_polling_pre_input_nodes() {
+            progress |= scheduled != 0;
+        }
+        if let Ok(scheduled) = main.schedule_interrupt_pre_input_nodes() {
+            progress |= scheduled != 0;
+        }
+        if let Ok(scheduled) = main.schedule_polling_driver_nodes() {
+            progress |= scheduled != 0;
+        }
+        if let Ok(scheduled) = main.schedule_interrupt_driver_nodes() {
+            progress |= scheduled != 0;
+        }
 
         // Step 3: Drain handoff queues, run ready nodes, poll remote/local tasks
-        with_data_plane_runtime(|rt| {
-            let _ = rt.run_ready_nodes();
-        });
+        let _ = main.run_ready_nodes();
         progress |= spawn::poll_remote_local_tasks(remote_local);
-        progress |= spawn::poll_data_local_tasks(&mut cx);
-        with_data_plane_runtime(|rt| {
-            let _ = rt.run_ready_nodes();
-        });
+        let _ = main.run_ready_nodes();
 
         // Step 4: Tokio reactor tick. VPP sleeps inside `epoll_wait`
         // (`vlib_file_poll`) so device readiness ends the idle wait
@@ -127,9 +104,9 @@ pub fn engine_main_loop(
                     Some(wake) => tokio::select! {
                         guard = wake.readable() => match guard {
                             Ok(mut guard) => {
-                                let _ = engine
+                                let _ = main
                                     .file_main()
-                                    .clear_io_wake_for_worker(engine.thread_index);
+                                    .clear_io_wake_for_worker(main.thread_index());
                                 guard.clear_ready();
                             }
                             Err(_) => tokio::time::sleep(idle_slice).await,
@@ -142,32 +119,25 @@ pub fn engine_main_loop(
         }
 
         // Step 5: Run any newly-scheduled frames (pre-input + input)
-        with_data_plane_runtime(|rt| {
-            let _ = rt.run_ready_nodes();
-        });
+        let _ = main.run_ready_nodes();
 
         // Step 6: Dispatch timer nodes (no data-plane timer wheel yet)
 
         // Step 7: Advance timers — deferred (no data-plane timer wheel yet).
         // VPP dispatches timer-wheel-expired sched nodes here.
         // Increment loop count.
-        engine.main_loop_count.fetch_add(1, Ordering::Relaxed);
+        main.increment_main_loop_count();
 
         // Step 8: Exit check
-        if let Some(status) = requested_exit_status(engine) {
+        if let Some(status) = requested_exit_status(main) {
             return status;
         }
     }
 }
 
-fn requested_exit_status(engine: &Engine) -> Option<i32> {
-    if !engine.main_loop_exit_now.load(Ordering::Acquire) {
+fn requested_exit_status(main: &DataPlaneMain) -> Option<i32> {
+    if !main.main_loop_exit_requested() {
         return None;
     }
-    Some(
-        *engine
-            .main_loop_exit_status
-            .lock()
-            .expect("engine_main_loop: poisoned exit status mutex"),
-    )
+    Some(main.main_loop_exit_status())
 }

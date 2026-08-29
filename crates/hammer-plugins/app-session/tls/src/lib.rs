@@ -12,7 +12,7 @@ use std::sync::{Arc, OnceLock};
 use hammer_infra::fifo::Fifo;
 use hammer_infra::pool::Pool;
 use hammer_infra::thread_owned::ThreadOwned;
-use hammer_runtime::{DataWorkerId, Engine, RuntimeError, RuntimeResult};
+use hammer_runtime::{DataPlaneMain, DataWorkerId, GlobalMain, RuntimeError, RuntimeResult};
 use hammer_service::session::protocol::SessionAppVft;
 use hammer_service::session::runtime::SessionWorker;
 use rustls::pki_types::ServerName;
@@ -490,7 +490,7 @@ pub(crate) const VFT: SessionAppVft = SessionAppVft {
 };
 
 #[hammer_component_macros::init_function(name = "tls_init")]
-fn init_tls(engine: &mut Engine) -> RuntimeResult<()> {
+fn init_tls(engine: &mut GlobalMain) -> RuntimeResult<()> {
     config::init()?;
     TLS_WORKERS
         .set(TlsWorkers::new(engine.configured_worker_count()))
@@ -502,7 +502,7 @@ fn init_tls(engine: &mut Engine) -> RuntimeResult<()> {
     name = "tls_worker_init",
     runs_after = ["session_worker_init"]
 )]
-fn init_tls_worker(engine: &mut Engine) -> RuntimeResult<()> {
+fn init_tls_worker(engine: &mut DataPlaneMain) -> RuntimeResult<()> {
     TLS_WORKERS
         .get()
         .ok_or(RuntimeError::PluginStateNotInitialized { plugin: "tls" })?
