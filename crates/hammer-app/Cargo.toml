@@ -12,7 +12,3 @@ hammer-infra = { path = "../hammer-infra" }
 hammer-runtime = { path = "../hammer-runtime" }
 libc = { workspace = true }
 thiserror = { workspace = true }
-
-[dev-dependencies]
-hammer-infra = { path = "../hammer-infra" }
-tokio = { workspace = true }
