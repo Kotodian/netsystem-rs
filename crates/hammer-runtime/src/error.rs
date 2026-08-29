@@ -81,9 +81,9 @@ pub enum RuntimeError {
     PluginStateNotInitialized { plugin: &'static str },
     #[error("thread {thread_index} is not a data worker")]
     DataWorkerIdUnavailable { thread_index: u32 },
-    #[error("only the main Runtime Engine can schedule worker control work")]
-    WorkerControlRequiresMainEngine,
-    #[error("control operation must run on the main Runtime Engine")]
+    #[error("only GlobalMain can schedule worker control work")]
+    WorkerControlRequiresGlobalMain,
+    #[error("control operation must run on GlobalMain")]
     ControlRequiresMainThread,
     #[error("control operation requires the worker barrier while Data Workers are running")]
     ControlRequiresWorkerBarrier,
@@ -97,36 +97,12 @@ pub enum RuntimeError {
         #[source]
         source: Box<RuntimeError>,
     },
-    #[error("data worker {worker} data-plane runtime initialization failed")]
-    DataWorkerRuntimeInitialization {
-        worker: usize,
-        #[source]
-        source: Box<RuntimeError>,
-    },
     #[error("failed to spawn data worker {worker} thread")]
     DataWorkerThreadSpawn {
         worker: usize,
         #[source]
         source: std::io::Error,
     },
-    #[error("failed to build async runtime for data worker {worker}")]
-    DataWorkerRuntimeBuild {
-        worker: usize,
-        #[source]
-        source: std::io::Error,
-    },
-    #[error("data worker {worker} exited before publishing its runtime handle")]
-    DataWorkerStartupCanceled { worker: usize },
-    #[error("data worker {worker} exited without returning its result")]
-    DataWorkerResultCanceled { worker: usize },
-    #[error("data worker {worker} local task failed")]
-    DataWorkerLocalTask {
-        worker: usize,
-        #[source]
-        source: crate::spawn::DataLocalJoinError,
-    },
-    #[error("data worker {worker} control call panicked")]
-    DataWorkerCallPanicked { worker: usize },
     #[error("data worker {worker} control call was canceled")]
     DataWorkerCallCanceled { worker: usize },
     #[error("data worker index {worker} is outside configured worker count {worker_count}")]
@@ -140,8 +116,8 @@ pub enum RuntimeError {
         worker: crate::DataWorkerId,
         capacity: usize,
     },
-    #[error("Process Nodes can only start on the main Runtime Engine")]
-    ProcessNodesRequireMainEngine,
+    #[error("Process Nodes can only start on GlobalMain")]
+    ProcessNodesRequireGlobalMain,
     #[error("Process Nodes must be controlled by their owner thread")]
     ProcessControlWrongThread,
     #[error("control timer interval must be non-zero")]
@@ -206,8 +182,8 @@ pub enum RuntimeError {
     NamedNextRegistrationKindInvalid,
     #[error("named-next count {actual} does not match declared count {declared}")]
     NamedNextCountMismatch { declared: usize, actual: usize },
-    #[error("plain node registration cannot declare {count} initial next nodes")]
-    PlainNodeHasInitialNexts { count: usize },
+    #[error("unregistered node cannot declare {count} initial next nodes")]
+    UnregisteredNodeHasInitialNexts { count: usize },
     #[error("sibling node registration cannot declare {count} initial next nodes")]
     SiblingNodeHasInitialNexts { count: usize },
     #[error("initial next count {actual} does not match declared count {declared}")]

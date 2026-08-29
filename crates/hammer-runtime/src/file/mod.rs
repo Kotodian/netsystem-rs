@@ -20,8 +20,8 @@ use hammer_infra::pool::Pool;
 use hammer_infra::sync::{SpinLock, SpinLockGuard};
 
 use crate::NodeRuntime;
-use crate::engine::Engine;
 use crate::error::{RuntimeError, RuntimeResult};
+use crate::global_main::GlobalMain;
 use hammer_component_macros::init_function;
 use hammer_core::file::{
     File as CoreFile, FileFunction as CoreFileFunction, FileFunctions as CoreFileFunctions,
@@ -158,7 +158,7 @@ unsafe impl Sync for FileMain {}
 pub static FILE_MAIN: OnceLock<FileMain> = OnceLock::new();
 
 #[init_function(name = "file_main_init")]
-pub fn init_file_main(engine: &mut Engine) -> RuntimeResult<()> {
+pub fn init_file_main(engine: &mut GlobalMain) -> RuntimeResult<()> {
     if FILE_MAIN.get().is_none() {
         let poller_count = engine.configured_worker_count().saturating_add(1);
         let file_main = FileMain::with_worker_count(poller_count)?;

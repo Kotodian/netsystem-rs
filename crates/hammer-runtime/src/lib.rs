@@ -28,18 +28,18 @@ crate::__declare_registration_image!(
     worker_init_functions = [];
     graph_nodes = [];
     node_functions = [];
-    process_nodes = [engine::__PROCESS_NODE_STATSEG_COLLECTOR_PROCESS];
+    process_nodes = [global_main::__PROCESS_NODE_STATSEG_COLLECTOR_PROCESS];
     binary_api_methods = [];
-    stats_registrations = [engine::__STATS_REGISTRATION_Sys];
+    stats_registrations = [global_main::__STATS_REGISTRATION_Sys];
 );
 
 pub(crate) fn builtin_registration_image() -> &'static registration::RegistrationImage {
     &__HAMMER_REGISTRATION_IMAGE
 }
 
-pub mod engine;
 pub mod error;
-pub use engine::{Engine, EnginePool, ensure_main_thread, ensure_main_thread_with_barrier};
+pub mod global_main;
+pub use global_main::{GlobalMain, ensure_main_thread, ensure_main_thread_with_barrier};
 pub mod config;
 pub mod file;
 pub use file::{
@@ -74,9 +74,10 @@ pub mod network;
 pub mod node;
 mod runtime_simd;
 pub mod trace;
-pub use data_plane::{DataPlaneBufferConfig, DataPlaneRuntime, DataPlaneRuntimeConfig};
+pub use data_plane::{DataPlaneBufferConfig, DataPlaneMain};
 pub use hammer_core::data_plane::FrameBatchWidth;
 pub use handoff::{DataPlaneHandoff, DataPlaneHandoffWorker, DataWorkerId};
+pub use init::WorkerInitFunction;
 pub use metrics::{
     MetricCounter, MetricGauge, MetricKind, MetricLabel, MetricSample, MetricsRegistry,
     MetricsScope, RegistryRecorder,
@@ -84,8 +85,8 @@ pub use metrics::{
 pub use network::{Network, SocksAddr};
 pub use node::{
     DriverNode, InternalNode, Node, NodeDescriptor, NodeEntry, NodeErrorCode, NodeErrorDescriptor,
-    NodeErrorSeverity, NodeProcessFn, NodeResult, NodeRuntime, NodeRuntimeData, NodeRuntimeReady,
-    NoopNode, default_prefetch_indices,
+    NodeErrorSeverity, NodeProcessFn, NodeRuntime, NodeRuntimeData, NodeRuntimeReady,
+    default_prefetch_indices,
 };
 pub use plugin::{
     PluginError, PluginMain, PluginMetadata, PluginModule, PluginModuleRef,
@@ -109,4 +110,4 @@ mod worker_thread;
 
 pub use barrier::WorkerBarrier;
 pub use control_thread::{ControlThread, ControlThreadHandle, ControlTimerHandle};
-pub use spawn::with_data_plane_runtime;
+pub use spawn::{with_data_plane_main, with_data_plane_main_mut};

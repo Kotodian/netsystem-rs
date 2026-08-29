@@ -16,7 +16,7 @@ use semver::Version;
 use serde::Deserialize;
 
 use crate::binary_api::BinaryApiMethodEntry;
-use crate::init::{ConfigFunction, InitFunction};
+use crate::init::{ConfigFunction, InitFunction, WorkerInitFunction};
 use crate::node::{NodeEntry, NodeFunctionRegistration};
 use crate::plugin_loader::{PluginLibrary, read_plugin_module};
 use crate::process::ProcessEntry;
@@ -452,7 +452,7 @@ impl PluginMain {
         self.collect_registrations(RegistrationImage::stats_registrations)
     }
 
-    pub(crate) fn worker_init_functions(&self) -> Vec<InitFunction> {
+    pub(crate) fn worker_init_functions(&self) -> Vec<WorkerInitFunction> {
         self.collect_registrations(RegistrationImage::worker_init_functions)
     }
 

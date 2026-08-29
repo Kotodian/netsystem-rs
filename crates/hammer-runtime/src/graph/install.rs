@@ -7,17 +7,17 @@ use crate::error::RuntimeResult;
 use hammer_component_macros::init_function;
 use hammer_core::data_plane::NodeHandle;
 
-use crate::engine::Engine;
+use crate::global_main::GlobalMain;
 
 #[init_function(name = "install_packet_graph")]
-pub fn install_packet_graph(engine: &mut Engine) -> RuntimeResult<()> {
+pub fn install_packet_graph(engine: &mut GlobalMain) -> RuntimeResult<()> {
     let handle = NodeHandle::new(engine.worker_config().handoff.node_handle);
-    engine.runtime.set_handoff_node_handle(handle);
+    engine.main.set_handoff_node_handle(handle);
 
     let entries = engine.plugin_main().graph_nodes();
     let functions = engine.plugin_main().node_functions();
     engine
-        .runtime
+        .main
         .init_graph_with_node_functions(&entries, &functions)?;
     Ok(())
 }

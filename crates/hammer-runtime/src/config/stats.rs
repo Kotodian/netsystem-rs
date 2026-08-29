@@ -6,7 +6,7 @@ use std::time::Duration;
 
 use crate::error::RuntimeResult;
 use crate::file::FILE_MAIN;
-use crate::{Engine, File};
+use crate::{File, GlobalMain};
 use hammer_stats::{StatsMain, stats_segment_socket};
 
 pub const DEFAULT_UPDATE_INTERVAL: Duration = Duration::from_secs(10);
@@ -42,7 +42,7 @@ pub struct StatsConfig {
     early = true,
     required = true
 )]
-fn configure_stats(config: StatsConfig, engine: &mut Engine) -> RuntimeResult<()> {
+fn configure_stats(config: StatsConfig, engine: &mut GlobalMain) -> RuntimeResult<()> {
     engine.registry.set(Arc::new(config));
     Ok(())
 }

@@ -18,7 +18,7 @@ use hammer_runtime::RuntimeRegistry;
 use tokio::sync::mpsc;
 use tokio::task::{JoinHandle, LocalSet};
 
-use crate::DataPlaneRuntime;
+use crate::DataPlaneMain;
 
 pub type ProcessFuture = Pin<Box<dyn Future<Output = RuntimeResult<()>> + 'static>>;
 
@@ -79,7 +79,7 @@ struct ProcessSignal {
 pub struct ProcessContext {
     name: &'static str,
     registry: Arc<RuntimeRegistry>,
-    runtime: DataPlaneRuntime,
+    runtime: DataPlaneMain,
     events: mpsc::UnboundedReceiver<ProcessSignal>,
     pending: Vec<ProcessEventBatch>,
 }
@@ -88,7 +88,7 @@ impl ProcessContext {
     fn new(
         name: &'static str,
         registry: Arc<RuntimeRegistry>,
-        runtime: DataPlaneRuntime,
+        runtime: DataPlaneMain,
         events: mpsc::UnboundedReceiver<ProcessSignal>,
     ) -> Self {
         Self {
@@ -116,7 +116,7 @@ impl ProcessContext {
     /// Main-thread data-plane view, equivalent to the process node's
     /// `vlib_main_t`. It is never a Data Worker runtime.
     #[inline]
-    pub fn data_plane_runtime(&self) -> &DataPlaneRuntime {
+    pub fn data_plane_main(&self) -> &DataPlaneMain {
         &self.runtime
     }
 
@@ -234,7 +234,7 @@ impl ProcessMain {
     pub(crate) fn start(
         &mut self,
         registry: Arc<RuntimeRegistry>,
-        runtime: DataPlaneRuntime,
+        runtime: DataPlaneMain,
         entries: Vec<ProcessEntry>,
     ) -> RuntimeResult<()> {
         self.ensure_owner()?;

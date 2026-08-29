@@ -2,22 +2,20 @@ use criterion::{BenchmarkId, Criterion, criterion_group, criterion_main};
 use hammer_core::data_plane::{
     BufferPoolArena, DEFAULT_BUFFER_FRAME_CAPACITY, DataPlaneBuffers, Index, NodeId,
 };
-use hammer_runtime::{DataPlaneBufferConfig, DataPlaneRuntime, DataPlaneRuntimeConfig};
+use hammer_runtime::{DataPlaneBufferConfig, DataPlaneMain};
 
 fn test_runtime(
     buffer_slot_capacity: usize,
     buffer_slots: usize,
     frame_slots: usize,
-) -> DataPlaneRuntime {
-    let config = DataPlaneRuntimeConfig {
-        buffers: DataPlaneBufferConfig {
-            buffer_slot_capacity,
-            buffer_slots,
-            frame_slots,
-            ..DataPlaneBufferConfig::default()
-        },
+) -> DataPlaneMain {
+    let config = DataPlaneBufferConfig {
+        buffer_slot_capacity,
+        buffer_slots,
+        frame_slots,
+        ..DataPlaneBufferConfig::default()
     };
-    DataPlaneRuntime::new(config)
+    DataPlaneMain::new(config)
 }
 
 fn test_buffers(buffer_slot_capacity: usize, buffer_slots: usize) -> DataPlaneBuffers {

@@ -7,13 +7,14 @@ use std::time::Instant;
 
 use crate::error::{RuntimeError, RuntimeResult};
 
+use crate::DataPlaneMain;
 use crate::config::Worker;
-use crate::engine::Engine;
+use crate::global_main::GlobalMain;
 use crate::spawn;
 use crate::{DataPlaneHandoff, DataWorkerId, barrier};
 
 #[hammer_component_macros::main_loop_enter_function]
-pub fn start_workers(engine: &mut Engine) -> RuntimeResult<()> {
+pub fn start_workers(engine: &mut GlobalMain) -> RuntimeResult<()> {
     let (worker_config, worker_count) = resolve_worker_startup(engine)?;
     let barrier = barrier::WorkerBarrier::new(worker_count);
     barrier.arm();
@@ -24,22 +25,41 @@ pub fn start_workers(engine: &mut Engine) -> RuntimeResult<()> {
     let handoff = DataPlaneHandoff::with_node_capacity(
         worker_config.count,
         worker_config.handoff.queue_capacity,
-        engine.runtime.nodes().node_count(),
+        engine.main.nodes().node_count(),
     );
     let worker_control_queues: std::sync::Arc<[spawn::DataRemoteLocalQueue]> = (0..worker_count)
         .map(|_| spawn::DataRemoteLocalQueue::new(worker_config.control.queue_capacity))
         .collect::<Vec<_>>()
         .into();
     engine.install_worker_control_queues(std::sync::Arc::clone(&worker_control_queues));
+    engine.main.install_global_control(
+        std::sync::Arc::clone(&engine.registry),
+        barrier.clone(),
+        std::sync::Arc::clone(&engine.main_loop_exit_now),
+        std::sync::Arc::clone(&engine.main_loop_exit_status),
+        std::sync::Arc::clone(&engine.publication),
+        std::sync::Arc::clone(&engine.workers_updating_graph),
+        worker_config.clone(),
+        Vec::new(),
+        std::sync::Arc::clone(&worker_control_queues),
+    );
     let mut threads = Vec::with_capacity(worker_config.count);
 
     for worker_slot in 0..worker_count {
         let worker = DataWorkerId::new(worker_slot);
         let thread_index = worker_slot + 1;
-        let worker_seed = engine.worker_seed();
+        let runtime_parts = engine.main.worker_parts();
+        let registry = std::sync::Arc::clone(&engine.registry);
+        let publication = std::sync::Arc::clone(&engine.publication);
+        let workers_updating_graph = std::sync::Arc::clone(&engine.workers_updating_graph);
+        let worker_init_functions = engine.plugin_main().worker_init_functions();
+        let main_loop_exit_now = std::sync::Arc::clone(&engine.main_loop_exit_now);
+        let main_loop_exit_status = std::sync::Arc::clone(&engine.main_loop_exit_status);
+        let worker_config_template = engine.worker_config.clone();
         let worker_config = worker_config.clone();
         let handoff = handoff.worker(worker);
         let remote_local = worker_control_queues[worker.slot()].clone();
+        let worker_control_queues_for_thread = std::sync::Arc::clone(&worker_control_queues);
         let worker_barrier = barrier.clone();
         let worker_exit = std::sync::Arc::clone(&engine.main_loop_exit_now);
         let launched = thread::Builder::new()
@@ -55,11 +75,41 @@ pub fn start_workers(engine: &mut Engine) -> RuntimeResult<()> {
                     }
 
                     let numa_node = worker_config.apply_current_thread_setup(worker.slot())?;
-                    let mut engine = worker_seed.spawn_on_numa(thread_index, numa_node, handoff)?;
-                    engine.install_current();
-                    spawn::set_data_plane_runtime(engine.runtime.clone());
+                    let (
+                        buffer_arenas,
+                        frame_slots,
+                        nodes,
+                        simd_bytes,
+                        _,
+                        handoff_node_handle,
+                        trace_control,
+                    ) = runtime_parts;
+                    let runtime = DataPlaneMain::from_worker_parts(
+                        buffer_arenas,
+                        frame_slots,
+                        nodes,
+                        simd_bytes,
+                        Some(handoff),
+                        handoff_node_handle,
+                        trace_control,
+                        thread_index,
+                        numa_node,
+                    )?;
+                    let mut main = runtime;
+                    main.install_global_control(
+                        registry,
+                        worker_barrier.clone(),
+                        main_loop_exit_now,
+                        main_loop_exit_status,
+                        publication,
+                        workers_updating_graph,
+                        worker_config_template,
+                        worker_init_functions.clone(),
+                        worker_control_queues_for_thread,
+                    );
+                    spawn::set_data_plane_main(&mut main);
                     spawn::apply_worker_idle_slice(worker_config.idle_slice);
-                    crate::init::run_worker_init_functions(&mut engine)?;
+                    crate::init::run_worker_init_functions(&mut main, worker_init_functions)?;
                     if worker_exit.load(Ordering::Acquire) {
                         return Ok(());
                     }
@@ -76,7 +126,7 @@ pub fn start_workers(engine: &mut Engine) -> RuntimeResult<()> {
                         })?;
                     remote_local.attach_current_thread();
                     let exit_status =
-                        crate::main_loop::engine_main_loop(&mut engine, &tokio, &remote_local);
+                        crate::main_loop::data_plane_main_loop(&mut main, &tokio, &remote_local);
                     tracing::debug!(worker = thread_index, exit_status, "worker exited");
                     let loop_result = if exit_status == 0 {
                         Ok(())
@@ -86,7 +136,7 @@ pub fn start_workers(engine: &mut Engine) -> RuntimeResult<()> {
                             format!("exited with status {exit_status}"),
                         ))
                     };
-                    let exit_result = crate::init::run_worker_exit_functions(&mut engine);
+                    let exit_result = crate::init::run_worker_exit_functions(&mut main);
                     match (loop_result, exit_result) {
                         (Ok(()), result) => result,
                         (Err(loop_error), Ok(())) => Err(loop_error),
@@ -167,7 +217,7 @@ pub fn start_workers(engine: &mut Engine) -> RuntimeResult<()> {
     Ok(())
 }
 
-fn resolve_worker_startup(engine: &Engine) -> RuntimeResult<(Worker, u32)> {
+fn resolve_worker_startup(engine: &GlobalMain) -> RuntimeResult<(Worker, u32)> {
     let worker = engine.worker_config().clone();
     worker.validate()?;
     let count = u32::try_from(worker.count).map_err(|_| RuntimeError::WorkerCountOverflow {
@@ -216,7 +266,7 @@ fn abort_workers(
             Err(payload) if unwind_payload.is_none() => unwind_payload = Some(payload),
             Err(payload) => tracing::error!(
                 worker,
-                panic = %crate::engine::thread_panic_message(payload),
+                panic = %crate::global_main::thread_panic_message(payload),
                 "data worker panicked while startup aborted"
             ),
         }
