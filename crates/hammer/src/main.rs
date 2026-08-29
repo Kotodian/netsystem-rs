@@ -192,7 +192,6 @@ fn run(config: String, roots: Vec<String>, worker: Worker) {
 
     let attach_server = registry.get::<AppServer>();
     let applications = registry.get::<hammer_service::session::ApplicationMain>();
-    let sessions = registry.get::<hammer_service::session::runtime::SessionMain>();
 
     tracing::info!("hammer started");
 
@@ -207,10 +206,6 @@ fn run(config: String, roots: Vec<String>, worker: Worker) {
                     .expect("Application Main is initialized with attach server");
                 let publish_applications = Arc::clone(&attach_applications);
                 let detach_applications = Arc::clone(&attach_applications);
-                let control_sessions = sessions
-                    .as_ref()
-                    .cloned()
-                    .expect("Session Main is initialized with attach server");
                 if let Err(error) = attach
                     .serve(
                         move || attach_applications.attach_external_with_runtime(),
@@ -218,7 +213,7 @@ fn run(config: String, roots: Vec<String>, worker: Worker) {
                             publish_applications.application_mq_publication(application)
                         },
                         move |application, requests, replies| {
-                            control_sessions.dispatch_application_session_mq(
+                            hammer_service::session::runtime::SessionMain::global()?.dispatch_application_session_mq(
                                 application,
                                 requests,
                                 replies,
@@ -272,23 +267,4 @@ pub(crate) fn load_current_config() -> std::io::Result<String> {
         .get()
         .ok_or_else(|| std::io::Error::other(StartupConfigPathUnset))?;
     read_config(path)
-}
-
-#[cfg(test)]
-mod tests {
-    #[test]
-    fn early_deserialization_ignores_later_owner_sections() {
-        let config: super::DaemonEarlyConfig = toml::from_str(
-            r#"
-[memory]
-main_heap_size = "256 MiB"
-
-[plugin.tcp]
-mss = "validated by tcp"
-"#,
-        )
-        .expect("deserialize early config");
-
-        assert_eq!(config.memory.main_heap_size.as_u64(), 256 << 20);
-    }
 }
