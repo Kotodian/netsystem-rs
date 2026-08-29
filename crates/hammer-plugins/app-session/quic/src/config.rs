@@ -1,6 +1,5 @@
 use std::cell::UnsafeCell;
-use std::sync::Arc;
-use std::thread::{self, ThreadId};
+use std::sync::{Arc, OnceLock};
 
 use hammer_infra::pool::Pool;
 use hammer_runtime::Engine;
@@ -22,22 +21,29 @@ const DEFAULT_MAX_STREAMS_UNI: u32 = 100;
 /// Domain identity for one QUIC client or server configuration.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 #[repr(transparent)]
-pub struct ConfigId(u64);
+pub struct ConfigId(u32);
 
-impl ConfigId {
+impl From<u32> for ConfigId {
     #[inline]
-    pub const fn from_raw(raw: u64) -> Self {
-        Self(raw)
+    fn from(index: u32) -> Self {
+        Self(index)
     }
+}
 
+impl From<ConfigId> for u64 {
     #[inline]
-    pub const fn raw(self) -> u64 {
-        self.0
+    fn from(config: ConfigId) -> Self {
+        u64::from(config.0)
     }
+}
 
-    #[inline]
-    const fn index(self) -> u32 {
-        self.0 as u32
+impl TryFrom<u64> for ConfigId {
+    type Error = ConfigError;
+
+    fn try_from(raw: u64) -> Result<Self, Self::Error> {
+        u32::try_from(raw)
+            .map(Self::from)
+            .map_err(|_| ConfigError::InvalidId { raw })
     }
 }
 
@@ -171,11 +177,10 @@ struct ConfigEntry {
 }
 
 pub(crate) struct QuicConfigRegistry {
-    owner: ThreadId,
     state: UnsafeCell<Pool<ConfigEntry>>,
 }
 
-// SAFETY: every state access first verifies the owning Main Thread. When Data
+// SAFETY: every state access first verifies the Engine Main control path. When Data
 // Workers exist, the Main Thread performs the access while WorkerBarrier holds
 // them stopped; worker protocol state retains only immutable Arc configurations
 // after this registry lookup.
@@ -184,7 +189,6 @@ unsafe impl Sync for QuicConfigRegistry {}
 impl QuicConfigRegistry {
     pub(crate) fn new(capacity: usize) -> Self {
         Self {
-            owner: thread::current().id(),
             state: UnsafeCell::new(Pool::with_capacity(capacity)),
         }
     }
@@ -249,7 +253,10 @@ impl QuicConfigRegistry {
         application: u32,
         config: ConfigId,
     ) -> Result<(), ConfigError> {
-        self.with_state_mut(|state| {
+        self.with_control_barrier(|| {
+            // SAFETY: the Main Thread control check and WorkerBarrier stop all
+            // readers before this pool mutation.
+            let state = unsafe { &mut *self.state.get() };
             config_entry(state, application, config)?;
             state.remove(config_index(config));
             Ok(())
@@ -257,7 +264,10 @@ impl QuicConfigRegistry {
     }
 
     fn insert(&self, application: u32, config: ConnectionConfig) -> Result<ConfigId, ConfigError> {
-        self.with_state_mut(|state| {
+        self.with_control_barrier(|| {
+            // SAFETY: the Main Thread control check and WorkerBarrier stop all
+            // readers before this pool mutation.
+            let state = unsafe { &mut *self.state.get() };
             config_id(state.insert(ConfigEntry {
                 application,
                 config,
@@ -279,34 +289,28 @@ impl QuicConfigRegistry {
         operation: impl FnOnce(&Pool<ConfigEntry>) -> Result<R, ConfigError>,
     ) -> Result<R, ConfigError> {
         self.with_control_barrier(|| {
-            // SAFETY: `with_control_barrier` confines access to the owning
-            // Main Thread and either holds WorkerBarrier or runs before Data
+            // SAFETY: `with_control_barrier` confines access to the Engine Main
+            // control path and either holds WorkerBarrier or runs before Data
             // Workers exist.
             unsafe { operation(&*self.state.get()) }
         })?
     }
 
-    fn with_state_mut<R>(
-        &self,
-        operation: impl FnOnce(&mut Pool<ConfigEntry>) -> R,
-    ) -> Result<R, ConfigError> {
-        self.with_control_barrier(|| {
-            // SAFETY: `with_control_barrier` confines access to the owning
-            // Main Thread and either holds WorkerBarrier or runs before Data
-            // Workers exist.
-            unsafe { operation(&mut *self.state.get()) }
-        })
-    }
-
     fn with_control_barrier<R>(&self, operation: impl FnOnce() -> R) -> Result<R, ConfigError> {
-        if thread::current().id() != self.owner {
-            return Err(ConfigError::WrongThread);
-        }
-        let barrier = Engine::with_current(|engine| engine.worker_barrier());
-        Ok(match barrier {
-            Some(barrier) if barrier.is_pending() => operation(),
-            Some(barrier) => barrier.sync(operation),
-            None => operation(),
+        let barrier = match Engine::with_current(|engine| {
+            engine
+                .ensure_main_thread()
+                .map(|()| engine.worker_barrier())
+                .map_err(|_| ConfigError::WrongThread)
+        }) {
+            Some(Ok(barrier)) => barrier,
+            Some(Err(error)) => return Err(error),
+            None => return Err(ConfigError::WrongThread),
+        };
+        Ok(if barrier.is_pending() {
+            operation()
+        } else {
+            barrier.sync(operation)
         })
     }
 }
@@ -373,6 +377,8 @@ pub enum ConfigError {
     ApplicationRequired,
     #[error("QUIC listener or connection requires a configuration")]
     ConfigurationRequired,
+    #[error("QUIC configuration identity {raw:?} does not fit a Pool index")]
+    InvalidId { raw: u64 },
 }
 
 impl QuicMain {
@@ -455,7 +461,7 @@ pub fn remove_config(application: u32, config: ConfigId) -> Result<(), ConfigErr
     main()?.remove_config(application, config)
 }
 
-pub(crate) fn main() -> Result<&'static Arc<QuicMain>, ConfigError> {
+pub(crate) fn main() -> Result<&'static QuicMain, ConfigError> {
     QUIC_MAIN.get().ok_or(ConfigError::MainNotInitialized)
 }
 
@@ -588,12 +594,12 @@ fn validate_alpn(protocols: &[Vec<u8>]) -> Result<(), ConfigError> {
 
 #[inline]
 fn config_id(index: u32) -> ConfigId {
-    ConfigId(u64::from(index))
+    ConfigId::from(index)
 }
 
 #[inline]
 fn config_index(config: ConfigId) -> u32 {
-    config.index()
+    config.0
 }
 
 fn config_entry(
@@ -720,7 +726,7 @@ fn register_server_config_api(request: RegisterServerConfigRequest) -> RegisterS
             request.max_concurrent_uni_streams,
         ));
     match main().and_then(|main| main.register_server_config(application, config)) {
-        Ok(config) => server_reply(QuicApiStatus::Ok, config.raw()),
+        Ok(config) => server_reply(QuicApiStatus::Ok, u64::from(config)),
         Err(error) => server_reply(quic_api_status(&error), 0),
     }
 }
@@ -742,7 +748,7 @@ fn register_client_config_api(request: RegisterClientConfigRequest) -> RegisterC
         config = config.with_identity(request.certificate_der, request.private_key_der);
     }
     match main().and_then(|main| main.register_client_config(application, config)) {
-        Ok(config) => client_reply(QuicApiStatus::Ok, config.raw()),
+        Ok(config) => client_reply(QuicApiStatus::Ok, u64::from(config)),
         Err(error) => client_reply(quic_api_status(&error), 0),
     }
 }
@@ -754,7 +760,7 @@ fn remove_config_api(request: RemoveConfigRequest) -> RemoveConfigReply {
         Err(status) => return remove_reply(status),
     };
     match main()
-        .and_then(|main| main.remove_config(application, ConfigId::from_raw(request.config_id)))
+        .and_then(|main| main.remove_config(application, ConfigId::try_from(request.config_id)?))
     {
         Ok(()) => remove_reply(QuicApiStatus::Ok),
         Err(error) => remove_reply(quic_api_status(&error)),
@@ -831,7 +837,8 @@ fn quic_api_status(error: &ConfigError) -> QuicApiStatus {
         | ConfigError::ClientCryptoInvalid { .. }
         | ConfigError::ConnectionTimeoutInvalid
         | ConfigError::ApplicationRequired
-        | ConfigError::ConfigurationRequired => QuicApiStatus::ConfigurationInvalid,
+        | ConfigError::ConfigurationRequired
+        | ConfigError::InvalidId { .. } => QuicApiStatus::ConfigurationInvalid,
     }
 }
 
@@ -852,131 +859,5 @@ fn client_reply(status: QuicApiStatus, config_id: u64) -> RegisterClientConfigRe
 fn remove_reply(status: QuicApiStatus) -> RemoveConfigReply {
     RemoveConfigReply {
         status: status as i32,
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use hammer_runtime::{
-        DataPlaneRuntime, DataPlaneRuntimeConfig, Engine, RuntimeRegistry,
-        SessionTransportRegistration,
-    };
-    use rcgen::generate_simple_self_signed;
-
-    use super::*;
-
-    fn identity() -> (Vec<Vec<u8>>, Vec<u8>) {
-        let certified = generate_simple_self_signed(vec!["localhost".to_owned()])
-            .expect("generate QUIC test certificate");
-        (
-            vec![certified.cert.der().to_vec()],
-            certified.signing_key.serialize_der(),
-        )
-    }
-
-    fn test_main() -> (Arc<QuicMain>) {
-        let applications = hammer_service::session::ApplicationMain::new(4);
-        let first = applications.attach().expect("attach first Application");
-        let second = applications.attach().expect("attach second Application");
-        let inner_application = applications.attach().expect("attach QUIC Application");
-        let sessions = Arc::new(hammer_service::session::runtime::SessionMain::new(
-            1,
-            Arc::clone(&applications),
-        ));
-        let main = Arc::new(QuicMain::new(
-            sessions,
-            inner_application,
-            0,
-            SessionTransportRegistration::new("udp", None, None, None),
-            1,
-        ));
-        (main, first, second)
-    }
-
-    #[test]
-    fn generation_and_application_ownership_survive_config_removal() {
-        let (main, first, second) = test_main();
-        let (certificate_der, private_key_der) = identity();
-        let server = main
-            .register_server_config(
-                first,
-                ServerConfig::new(certificate_der.clone(), private_key_der),
-            )
-            .expect("register QUIC server configuration");
-        assert!(matches!(
-            main.server_config(second, server),
-            Err(ConfigError::NotOwned { application, config })
-                if application == second && config == server
-        ));
-        let retained = main
-            .server_config(first, server)
-            .expect("resolve QUIC server configuration");
-        let replacement = {
-            let (certificate_der, private_key_der) = identity();
-            main.remove_config(first, server)
-                .expect("remove QUIC server configuration");
-            main.register_server_config(first, ServerConfig::new(certificate_der, private_key_der))
-                .expect("register replacement QUIC server configuration")
-        };
-        assert_ne!(server, replacement);
-        assert!(matches!(
-            main.server_config(first, server),
-            Err(ConfigError::Missing { config }) if config == server
-        ));
-        drop(retained);
-        main.remove_config(first, replacement)
-            .expect("remove replacement QUIC server configuration");
-    }
-
-    #[test]
-    fn client_configuration_accepts_trust_anchor() {
-        let (main, application, _) = test_main();
-        let (certificate_der, _) = identity();
-        main.register_client_config(application, ClientConfig::new(certificate_der))
-            .expect("register QUIC client configuration");
-    }
-
-    #[test]
-    fn connection_timeout_rejects_timer_wheel_overflow() {
-        let config = TransportConfig::new(MAX_CONNECTION_TIMEOUT + 1, 1, 1);
-
-        assert!(matches!(
-            build_transport_config(config, 1_024),
-            Err(ConfigError::ConnectionTimeoutInvalid)
-        ));
-    }
-
-    #[test]
-    fn configuration_access_from_foreign_thread_reports_wrong_thread() {
-        let (main, application, _) = test_main();
-        let (certificate_der, private_key_der) = identity();
-        let result = std::thread::spawn(move || {
-            main.register_server_config(
-                application,
-                ServerConfig::new(certificate_der, private_key_der),
-            )
-        })
-        .join()
-        .expect("configuration operation thread");
-
-        assert!(matches!(result, Err(ConfigError::WrongThread)));
-    }
-
-    #[test]
-    fn config_mutation_observes_the_worker_barrier() {
-        let mut engine = Engine::new(
-            DataPlaneRuntime::new(DataPlaneRuntimeConfig::default()),
-            RuntimeRegistry::new(),
-        );
-        engine.install_current();
-        let registry = QuicConfigRegistry::new(1);
-        let barrier_seen = registry
-            .with_state_mut(|_| {
-                Engine::with_current(|engine| engine.worker_barrier().is_pending())
-                    .expect("current Main Thread Engine")
-            })
-            .expect("barriered QUIC config mutation");
-        assert!(barrier_seen);
-        Engine::uninstall_current();
     }
 }

@@ -23,8 +23,6 @@ hammer_component_macros::declare_plugin!(
     graph_nodes = [],
     node_functions = [],
     process_nodes = [],
-    session_transports = [worker::__SESSION_TRANSPORT_QUIC_WORKER],
-    session_apps = [session_app::QUIC_SESSION_APP],
     binary_api_methods = [
         config::__BINARY_API_REGISTER_SERVER_CONFIG_API,
         config::__BINARY_API_REGISTER_CLIENT_CONFIG_API,
@@ -36,4 +34,4 @@ pub use config::{
     ClientConfig, ConfigError, ConfigId, ServerConfig, TransportConfig, register_client_config,
     register_server_config, remove_config,
 };
-pub use listener::QuicMain;
+pub use listener::{QuicMain, protocol};

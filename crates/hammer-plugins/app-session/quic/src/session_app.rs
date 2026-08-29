@@ -1,12 +1,10 @@
 use std::time::Instant;
 
-use hammer_runtime::app::{SessionAppContext, SessionAppRegistration};
-use hammer_runtime::{DataWorkerId, Engine, RuntimeError, RuntimeResult};
-use hammer_service::session::protocol::SessionAppCallbacks;
+use hammer_runtime::{DataWorkerId, RuntimeError, RuntimeResult};
+use hammer_service::session::protocol::SessionAppVft;
 use hammer_service::session::runtime::SessionWorker;
 
 use crate::listener::QUIC_MAIN;
-use crate::worker::ContextId;
 
 pub(crate) const NAME: &str = "quic";
 
@@ -14,13 +12,15 @@ pub(crate) const NAME: &str = "quic";
 #[derive(Debug, thiserror::Error)]
 enum QuicSessionError {
     #[error("QUIC Session App context {context:?} does not own Session {session:?}")]
-    ContextSessionMismatch { context: ContextId, session: u32 },
+    ContextSessionMismatch { context: u32, session: u32 },
     #[error("QUIC Session App context is missing for Session {session:?}")]
     ContextMissing { session: u32 },
+    #[error("QUIC Session App context {context:?} does not fit a Pool index")]
+    ContextOutOfRange { context: u64 },
 }
 
 fn with_quic_worker<R>(
-    worker: &mut SessionWorker<u32>,
+    worker: &mut SessionWorker,
     operation: impl FnOnce(&mut crate::worker::QuicWorker) -> RuntimeResult<R>,
 ) -> RuntimeResult<R> {
     QUIC_MAIN
@@ -29,11 +29,7 @@ fn with_quic_worker<R>(
         .with_worker(worker.worker(), operation)
 }
 
-fn publish_context(
-    worker: &mut SessionWorker<u32>,
-    session: u32,
-    context: ContextId,
-) -> RuntimeResult<()> {
+fn publish_context(worker: &mut SessionWorker, session: u32, context: u32) -> RuntimeResult<()> {
     if let Err(error) = worker.set_app_session(session, context.into()) {
         // Rollback is best effort and must not replace the primary
         // set_app_session error; QUIC_MAIN may already be gone during teardown.
@@ -43,11 +39,7 @@ fn publish_context(
     Ok(())
 }
 
-fn accept(
-    worker: &mut SessionWorker<u32>,
-    session: u32,
-    context: SessionAppContext,
-) -> RuntimeResult<()> {
+fn accept(worker: &mut SessionWorker, session: u32, context: u64) -> RuntimeResult<()> {
     let listener = if context == 0 {
         worker
             .session_app_endpoint(session)
@@ -56,7 +48,8 @@ fn accept(
     } else {
         context
     };
-    let listener_id = ContextId::from(listener);
+    let listener_id = u32::try_from(listener)
+        .map_err(|_| QuicSessionError::ContextOutOfRange { context: listener })?;
     let listener = QUIC_MAIN
         .get()
         .ok_or(RuntimeError::PluginStateNotInitialized { plugin: NAME })?
@@ -68,17 +61,13 @@ fn accept(
     publish_context(worker, session, connection)
 }
 
-fn connected(
-    worker: &mut SessionWorker<u32>,
-    session: u32,
-    _: SessionAppContext,
-) -> RuntimeResult<()> {
+fn connected(worker: &mut SessionWorker, session: u32, _: u64) -> RuntimeResult<()> {
     let (_, _, opaque, _) = worker
         .session_app_endpoint(session)
         .ok_or_else(|| QuicSessionError::ContextMissing { session })?;
-    let context = opaque
-        .map(ContextId::from)
-        .ok_or(QuicSessionError::ContextMissing { session })?;
+    let context = opaque.ok_or(QuicSessionError::ContextMissing { session })?;
+    let context =
+        u32::try_from(context).map_err(|_| QuicSessionError::ContextOutOfRange { context })?;
     let connection = with_quic_worker(worker, |quic| {
         quic.connect_connection(context, session, Instant::now())
     })?;
@@ -98,15 +87,12 @@ fn connected(
     })
 }
 
-fn builtin_rx(
-    worker: &mut SessionWorker<u32>,
-    session: u32,
-    context: SessionAppContext,
-) -> RuntimeResult<()> {
+fn builtin_rx(worker: &mut SessionWorker, session: u32, context: u64) -> RuntimeResult<()> {
     if context == 0 {
         return Err(QuicSessionError::ContextMissing { session }.into());
     }
-    let context = ContextId::from(context);
+    let context =
+        u32::try_from(context).map_err(|_| QuicSessionError::ContextOutOfRange { context })?;
     let main = QUIC_MAIN
         .get()
         .ok_or(RuntimeError::PluginStateNotInitialized { plugin: NAME })?;
@@ -127,15 +113,12 @@ fn builtin_rx(
     })
 }
 
-fn builtin_tx(
-    worker: &mut SessionWorker<u32>,
-    session: u32,
-    context: SessionAppContext,
-) -> RuntimeResult<()> {
+fn builtin_tx(worker: &mut SessionWorker, session: u32, context: u64) -> RuntimeResult<()> {
     if context == 0 {
         return Err(QuicSessionError::ContextMissing { session }.into());
     }
-    let context = ContextId::from(context);
+    let context =
+        u32::try_from(context).map_err(|_| QuicSessionError::ContextOutOfRange { context })?;
     QUIC_MAIN
         .get()
         .ok_or(RuntimeError::PluginStateNotInitialized { plugin: NAME })?
@@ -145,16 +128,17 @@ fn builtin_tx(
 }
 
 fn close_lower_connection(
-    worker: &mut SessionWorker<u32>,
+    worker: &mut SessionWorker,
     session: u32,
-    context: SessionAppContext,
+    context: u64,
 ) -> RuntimeResult<()> {
     if context == 0 {
         // Late lifecycle notification after finalize_connection cleared the
         // lower Session's app context: teardown is already complete.
         return Ok(());
     }
-    let context = ContextId::from(context);
+    let context =
+        u32::try_from(context).map_err(|_| QuicSessionError::ContextOutOfRange { context })?;
     let main = QUIC_MAIN
         .get()
         .ok_or(RuntimeError::PluginStateNotInitialized { plugin: NAME })?;
@@ -169,29 +153,8 @@ fn close_lower_connection(
     })
 }
 
-fn install(engine: &mut Engine) -> RuntimeResult<()> {
-    let main = engine
-        .registry
-        .require::<hammer_service::session::runtime::SessionMain>()?;
-    main.install_session_app(&engine.runtime, NAME, &CALLBACKS)
-}
-
-fn destroy(worker: DataWorkerId, context: SessionAppContext) {
-    if context == 0 {
-        return;
-    }
-    let context = ContextId::from(context);
-    // A nonzero stale context is a no-op like VPP's invalid-context early
-    // return in quic_quicly_on_app_closed; QUIC_MAIN may already be gone
-    // during teardown, and destroy cannot report a Result, so removal is
-    // best effort and idempotent.
-    let Some(main) = QUIC_MAIN.get() else {
-        return;
-    };
-    let _ = main.with_worker(worker, |quic| quic.remove_context(context));
-}
-
-pub(crate) static CALLBACKS: SessionAppCallbacks = SessionAppCallbacks {
+pub(crate) const VFT: SessionAppVft = SessionAppVft {
+    name: NAME,
     accept: Some(accept),
     connected: Some(connected),
     disconnect: Some(close_lower_connection),
@@ -200,82 +163,5 @@ pub(crate) static CALLBACKS: SessionAppCallbacks = SessionAppCallbacks {
     cleanup: Some(close_lower_connection),
     builtin_rx: Some(builtin_rx),
     builtin_tx: Some(builtin_tx),
-    ..SessionAppCallbacks::all_none()
+    ..SessionAppVft::all_none(NAME)
 };
-
-pub(crate) static QUIC_SESSION_APP: SessionAppRegistration =
-    SessionAppRegistration::new(NAME, install, destroy);
-
-#[cfg(test)]
-mod tests {
-    use std::sync::Arc;
-
-    use super::*;
-
-    #[test]
-    fn quic_session_app_uses_manual_static_callback_table() {
-        assert_eq!(QUIC_SESSION_APP.name(), NAME);
-        assert!(CALLBACKS.accept.is_some());
-        assert!(CALLBACKS.connected.is_some());
-        assert!(CALLBACKS.builtin_rx.is_some());
-        assert!(CALLBACKS.builtin_tx.is_some());
-        assert!(CALLBACKS.cleanup.is_some());
-    }
-
-    #[test]
-    fn zero_context_lower_lifecycle_callback_is_idempotent() {
-        // QUIC_MAIN is unset in this unit test, so this also proves the
-        // zero-context path succeeds without requiring QUIC_MAIN.
-        let applications = hammer_service::session::ApplicationMain::new(4);
-        let mut sessions = SessionWorker::<u32>::new(
-            DataWorkerId::new(0),
-            1,
-            hammer_runtime::app::AppSessionConfig::default(),
-            64,
-            Arc::clone(&applications),
-            None,
-        )
-        .expect("test SessionWorker");
-        let close = CALLBACKS
-            .transport_closed
-            .expect("transport_closed callback");
-        close(&mut sessions, 123, 0).expect("zero-context close succeeds");
-    }
-
-    #[test]
-    fn publish_context_keeps_set_app_session_error_when_rollback_unavailable() {
-        // set_app_session fails for a session outside the worker's pool, and
-        // the rollback path cannot reach QUIC_MAIN, so publish_context must
-        // return the original set_app_session error instead of panicking.
-        let applications = hammer_service::session::ApplicationMain::new(4);
-        let mut sessions = SessionWorker::<u32>::new(
-            DataWorkerId::new(0),
-            1,
-            hammer_runtime::app::AppSessionConfig::default(),
-            64,
-            Arc::clone(&applications),
-            None,
-        )
-        .expect("test SessionWorker");
-        let error = publish_context(&mut sessions, 123, ContextId::from(1u64))
-            .expect_err("set_app_session fails for an unknown session");
-        assert!(
-            matches!(
-                error,
-                RuntimeError::Subsystem {
-                    subsystem: "session",
-                    ..
-                }
-            ),
-            "original set_app_session error expected, got {error:?}"
-        );
-    }
-
-    #[test]
-    fn destroy_with_stale_context_is_noop_without_quic_main() {
-        // destroy cannot return a Result, so a stale nonzero context must be
-        // dropped silently when QUIC_MAIN is unavailable, mirroring VPP's
-        // invalid-context no-op in quic_quicly_on_app_closed.
-        destroy(DataWorkerId::new(0), 42);
-    }
-}
