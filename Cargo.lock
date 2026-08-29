@@ -1009,20 +1009,12 @@ version = "0.1.0"
 dependencies = [
  "clap",
  "core_affinity",
- "hammer-app",
  "hammer-component-macros",
  "hammer-core",
  "hammer-infra",
- "hammer-plugin-ip",
- "hammer-plugin-tcp",
- "hammer-plugin-tun",
- "hammer-plugin-udp",
  "hammer-runtime",
  "hammer-service",
- "ipnet",
- "libc",
  "libloading 0.8.9",
- "prost",
  "serde",
  "thiserror 2.0.18",
  "tokio",
@@ -1039,14 +1031,12 @@ dependencies = [
  "hammer-runtime",
  "libc",
  "thiserror 2.0.18",
- "tokio",
 ]
 
 [[package]]
 name = "hammer-component-macros"
 version = "0.1.0"
 dependencies = [
- "hammer-core",
  "proc-macro2",
  "quote",
  "syn 2.0.119",
@@ -1101,6 +1091,7 @@ dependencies = [
  "bytes",
  "hammer-component-macros",
  "hammer-infra",
+ "hammer-plugin-quic",
  "hammer-runtime",
  "hammer-service",
  "thiserror 2.0.18",
@@ -1122,7 +1113,6 @@ dependencies = [
  "linkme",
  "serde",
  "thiserror 2.0.18",
- "tokio",
  "toml",
 ]
 
@@ -1135,12 +1125,12 @@ dependencies = [
  "hammer-component-macros",
  "hammer-core",
  "hammer-infra",
+ "hammer-plugin-udp",
  "hammer-runtime",
  "hammer-service",
  "linkme",
  "prost",
  "quinn-proto",
- "rcgen",
  "thiserror 2.0.18",
 ]
 
@@ -1165,7 +1155,6 @@ dependencies = [
  "linkme",
  "serde",
  "thiserror 2.0.18",
- "tokio",
  "toml",
  "tracing",
 ]
@@ -1180,7 +1169,6 @@ dependencies = [
  "hammer-runtime",
  "hammer-service",
  "prost",
- "rcgen",
  "rustls",
  "thiserror 2.0.18",
 ]
@@ -1236,11 +1224,8 @@ dependencies = [
  "hammer-component-macros",
  "hammer-core",
  "hammer-infra",
- "hammer-ipc",
- "hammer-service",
  "hammer-stats",
  "humantime-serde",
- "indoc",
  "io-uring",
  "ipnet",
  "libc",
@@ -1257,7 +1242,6 @@ dependencies = [
  "tokio",
  "toml",
  "tracing",
- "tracing-subscriber",
 ]
 
 [[package]]
@@ -1307,11 +1291,7 @@ dependencies = [
  "clap",
  "hammer-infra",
  "hammer-ipc",
- "hammer-runtime",
- "hammer-service",
  "hex",
- "prost",
- "tokio",
 ]
 
 [[package]]
@@ -1402,15 +1382,6 @@ checksum = "d466e9454f08e4a911e14806c24e16fba1b4c121d1ea474396f396069cf949d9"
 dependencies = [
  "equivalent",
  "hashbrown 0.17.0",
-]
-
-[[package]]
-name = "indoc"
-version = "2.0.7"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "79cf5c93f93228cf8efb3ba362535fb11199ac548a09ce117c9b1adc3030d706"
-dependencies = [
- "rustversion",
 ]
 
 [[package]]
