@@ -3,8 +3,9 @@ use core::{mem, ptr, slice};
 use super::*;
 
 #[derive(Debug, Clone, Copy)]
-#[repr(C, align(64))]
+#[repr(C)]
 pub(super) struct BufferHeaderCacheline0 {
+    pub(super) cacheline0: hammer_infra::align::CacheLineAlignMark,
     pub(super) current_data: i16,
     pub(super) current_length: u16,
     pub(super) flags: BufferFlags,
@@ -25,6 +26,7 @@ const _: () = assert!(core::mem::align_of::<BufferHeaderCacheline0>() == 64);
 impl Default for BufferHeaderCacheline0 {
     fn default() -> Self {
         Self {
+            cacheline0: hammer_infra::align::CacheLineAlignMark,
             current_data: 0,
             current_length: 0,
             flags: BufferFlags::empty(),
@@ -40,8 +42,9 @@ impl Default for BufferHeaderCacheline0 {
 }
 
 #[derive(Debug, Clone, Copy)]
-#[repr(C, align(64))]
+#[repr(C)]
 pub(super) struct BufferHeaderCacheline1 {
+    pub(super) cacheline1: hammer_infra::align::CacheLineAlignMark,
     pub(super) trace_handle: u32,
     pub(super) total_length_not_including_first: u32,
     pub(super) opaque2: SecondaryOpaque,
@@ -53,6 +56,7 @@ const _: () = assert!(core::mem::align_of::<BufferHeaderCacheline1>() == 64);
 impl Default for BufferHeaderCacheline1 {
     fn default() -> Self {
         Self {
+            cacheline1: hammer_infra::align::CacheLineAlignMark,
             trace_handle: 0,
             total_length_not_including_first: 0,
             opaque2: SecondaryOpaque::default(),
@@ -61,7 +65,7 @@ impl Default for BufferHeaderCacheline1 {
 }
 
 #[derive(Debug)]
-#[repr(C, align(64))]
+#[repr(C)]
 pub struct Buffer {
     pub(super) cacheline0: BufferHeaderCacheline0,
     pub(super) cacheline1: BufferHeaderCacheline1,

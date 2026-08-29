@@ -3,14 +3,18 @@
 //! These locks busy-wait and do not poison. They are not substitutes for the
 //! worker barrier, worker-owned state, channels, or sleeping locks.
 
+use crate::align::CacheLineAlignMark;
 use core::cell::UnsafeCell;
 use core::hint::spin_loop;
 use core::marker::PhantomData;
 use core::ops::{Deref, DerefMut};
 use core::sync::atomic::{AtomicBool, Ordering};
 
-#[repr(align(64))]
-struct SpinState(AtomicBool);
+#[repr(C)]
+struct SpinState {
+    cacheline0: CacheLineAlignMark,
+    value: AtomicBool,
+}
 
 /// A cache-line-isolated, non-poisoning mutual-exclusion spin lock.
 ///
@@ -27,7 +31,10 @@ impl<T> SpinLock<T> {
     #[inline]
     pub const fn new(value: T) -> Self {
         Self {
-            state: SpinState(AtomicBool::new(false)),
+            state: SpinState {
+                cacheline0: CacheLineAlignMark,
+                value: AtomicBool::new(false),
+            },
             value: UnsafeCell::new(value),
         }
     }
@@ -39,11 +46,11 @@ impl<T: ?Sized> SpinLock<T> {
     pub fn lock(&self) -> SpinLockGuard<'_, T> {
         while self
             .state
-            .0
+            .value
             .compare_exchange_weak(false, true, Ordering::Acquire, Ordering::Relaxed)
             .is_err()
         {
-            while self.state.0.load(Ordering::Relaxed) {
+            while self.state.value.load(Ordering::Relaxed) {
                 spin_loop();
             }
         }
@@ -57,7 +64,7 @@ impl<T: ?Sized> SpinLock<T> {
     #[inline]
     pub fn try_lock(&self) -> Option<SpinLockGuard<'_, T>> {
         self.state
-            .0
+            .value
             .compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
             .is_ok()
             .then(|| SpinLockGuard {
@@ -101,6 +108,6 @@ impl<T: ?Sized> DerefMut for SpinLockGuard<'_, T> {
 impl<T: ?Sized> Drop for SpinLockGuard<'_, T> {
     #[inline]
     fn drop(&mut self) {
-        self.lock.state.0.store(false, Ordering::Release);
+        self.lock.state.value.store(false, Ordering::Release);
     }
 }

@@ -2,17 +2,16 @@ use std::fmt;
 use std::mem::MaybeUninit;
 use std::ops::Range;
 
-use crate::align::CacheLine;
 use crate::bitmap::Bitmap;
 
-/// A VPP-style index-addressed pool with cache-line-aligned storage.
+/// A VPP-style index-addressed pool with natural `T` element layout.
 ///
 /// Dynamic pools grow their vector as values are inserted. Fixed pools
 /// preallocate their vector and reuse released indexes without growing.
 /// Index zero has no special meaning to this container; consumers such as
 /// the RB-tree may reserve it for their own sentinel.
 pub struct Pool<T> {
-    vector: Vec<CacheLine<MaybeUninit<T>>>,
+    vector: Vec<MaybeUninit<T>>,
     free_bitmap: Bitmap,
     free_indices: Vec<u32>,
     max_elts: Option<u32>,
@@ -56,7 +55,7 @@ impl<T> Pool<T> {
     pub fn with_fixed_capacity(max_elts: u32) -> Self {
         let capacity = max_elts as usize;
         let mut vector = Vec::with_capacity(capacity);
-        vector.resize_with(capacity, || CacheLine::new(MaybeUninit::uninit()));
+        vector.resize_with(capacity, MaybeUninit::uninit);
 
         let mut free_bitmap = Bitmap::with_capacity(capacity);
         for position in 0..capacity {
@@ -103,7 +102,7 @@ impl<T> Pool<T> {
                 panic!("fixed Pool exhausted at {max_elts} elements");
             }
             let index = self.vector.len() as u32;
-            self.vector.push(CacheLine::new(MaybeUninit::uninit()));
+            self.vector.push(MaybeUninit::uninit());
             self.free_bitmap.clear(index as usize);
             index
         } else {
@@ -190,7 +189,7 @@ impl<T> Pool<T> {
     pub(crate) fn bytes(&self) -> usize {
         self.vector
             .len()
-            .saturating_mul(std::mem::size_of::<CacheLine<MaybeUninit<T>>>())
+            .saturating_mul(std::mem::size_of::<MaybeUninit<T>>())
             .saturating_add(self.header_bytes())
     }
 
@@ -342,7 +341,7 @@ impl<T: Clone> Clone for Pool<T> {
                 let value = unsafe { self.vector[position].assume_init_ref() };
                 MaybeUninit::new(value.clone())
             };
-            vector.push(CacheLine::new(value));
+            vector.push(value);
         }
 
         Self {

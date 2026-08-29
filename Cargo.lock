@@ -1058,7 +1058,6 @@ version = "0.1.0"
 dependencies = [
  "byte-unit",
  "bytes",
- "crossbeam-utils",
  "libc",
  "libmimalloc-sys",
  "parse-display",
@@ -1141,7 +1140,6 @@ dependencies = [
  "abi_stable",
  "arc-swap",
  "bitflags 2.11.1",
- "crossbeam-utils",
  "etherparse",
  "hammer-component-macros",
  "hammer-core",
@@ -1252,7 +1250,6 @@ dependencies = [
  "async-trait",
  "bitflags 2.11.1",
  "crossbeam-queue",
- "crossbeam-utils",
  "etherparse",
  "hammer-component-macros",
  "hammer-core",

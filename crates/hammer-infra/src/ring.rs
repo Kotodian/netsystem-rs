@@ -3,8 +3,7 @@ use std::fmt;
 use std::mem::MaybeUninit;
 use std::sync::atomic::{AtomicU32, Ordering};
 
-use crossbeam_utils::CachePadded;
-
+use crate::align::CacheLineAlignMark;
 use crate::heap_boxed::Slice;
 use crate::prefetch::prefetch_read_l1;
 
@@ -447,7 +446,9 @@ pub enum RingError<T = ()> {
     Full(T),
 }
 
+#[repr(C)]
 pub struct LockFreeRingHeadTail {
+    cacheline0: CacheLineAlignMark,
     head: AtomicU32,
     tail: AtomicU32,
 }
@@ -456,6 +457,7 @@ impl LockFreeRingHeadTail {
     #[inline]
     pub const fn new() -> Self {
         Self {
+            cacheline0: CacheLineAlignMark,
             head: AtomicU32::new(0),
             tail: AtomicU32::new(0),
         }
@@ -490,20 +492,19 @@ impl fmt::Debug for LockFreeRingHeadTail {
 
 #[repr(C)]
 pub struct LockFreeRingCursors {
-    producer: CachePadded<LockFreeRingHeadTail>,
-    consumer: CachePadded<LockFreeRingHeadTail>,
+    producer: LockFreeRingHeadTail,
+    consumer: LockFreeRingHeadTail,
 }
 
 impl LockFreeRingCursors {
     pub const PRODUCER_CACHELINE_OFFSET: usize = 0;
-    pub const CONSUMER_CACHELINE_OFFSET: usize =
-        std::mem::size_of::<CachePadded<LockFreeRingHeadTail>>();
+    pub const CONSUMER_CACHELINE_OFFSET: usize = std::mem::size_of::<LockFreeRingHeadTail>();
 
     #[inline]
     pub const fn new() -> Self {
         Self {
-            producer: CachePadded::new(LockFreeRingHeadTail::new()),
-            consumer: CachePadded::new(LockFreeRingHeadTail::new()),
+            producer: LockFreeRingHeadTail::new(),
+            consumer: LockFreeRingHeadTail::new(),
         }
     }
 }

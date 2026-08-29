@@ -9,10 +9,14 @@ use core::marker::PhantomData;
 use core::ops::{Deref, DerefMut};
 use core::sync::atomic::{AtomicI32, Ordering, compiler_fence, fence};
 
+use hammer_infra::align::CacheLineAlignMark;
 pub use hammer_infra::sync::{SpinLock, SpinLockGuard};
 
-#[repr(align(64))]
-struct RwState(AtomicI32);
+#[repr(C)]
+struct RwState {
+    cacheline0: CacheLineAlignMark,
+    value: AtomicI32,
+}
 
 /// Prevents the compiler from moving memory accesses across this point.
 ///
@@ -83,7 +87,10 @@ impl<T> RwLock<T> {
     #[inline]
     pub const fn new(value: T) -> Self {
         Self {
-            state: RwState(AtomicI32::new(0)),
+            state: RwState {
+                cacheline0: CacheLineAlignMark,
+                value: AtomicI32::new(0),
+            },
             value: UnsafeCell::new(value),
         }
     }
@@ -94,15 +101,15 @@ impl<T: ?Sized> RwLock<T> {
     #[inline]
     pub fn read(&self) -> RwLockReadGuard<'_, T> {
         loop {
-            let mut readers = self.state.0.load(Ordering::Relaxed);
+            let mut readers = self.state.value.load(Ordering::Relaxed);
             while readers < 0 {
                 spin_loop();
-                readers = self.state.0.load(Ordering::Relaxed);
+                readers = self.state.value.load(Ordering::Relaxed);
             }
             assert_ne!(readers, i32::MAX, "rw lock reader count overflow");
             if self
                 .state
-                .0
+                .value
                 .compare_exchange_weak(readers, readers + 1, Ordering::Acquire, Ordering::Relaxed)
                 .is_ok()
             {
@@ -119,11 +126,11 @@ impl<T: ?Sized> RwLock<T> {
     pub fn write(&self) -> RwLockWriteGuard<'_, T> {
         while self
             .state
-            .0
+            .value
             .compare_exchange_weak(0, -1, Ordering::Acquire, Ordering::Relaxed)
             .is_err()
         {
-            while self.state.0.load(Ordering::Relaxed) != 0 {
+            while self.state.value.load(Ordering::Relaxed) != 0 {
                 spin_loop();
             }
         }
@@ -159,7 +166,7 @@ impl<T: ?Sized> Deref for RwLockReadGuard<'_, T> {
 impl<T: ?Sized> Drop for RwLockReadGuard<'_, T> {
     #[inline]
     fn drop(&mut self) {
-        let readers = self.lock.state.0.fetch_sub(1, Ordering::Release);
+        let readers = self.lock.state.value.fetch_sub(1, Ordering::Release);
         debug_assert!(readers > 0, "rw lock reader count underflow");
     }
 }
@@ -192,7 +199,7 @@ impl<T: ?Sized> DerefMut for RwLockWriteGuard<'_, T> {
 impl<T: ?Sized> Drop for RwLockWriteGuard<'_, T> {
     #[inline]
     fn drop(&mut self) {
-        debug_assert_eq!(self.lock.state.0.load(Ordering::Relaxed), -1);
-        self.lock.state.0.store(0, Ordering::Release);
+        debug_assert_eq!(self.lock.state.value.load(Ordering::Relaxed), -1);
+        self.lock.state.value.store(0, Ordering::Release);
     }
 }

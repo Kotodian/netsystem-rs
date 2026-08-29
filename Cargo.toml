@@ -63,7 +63,6 @@ serde_with = { version = "3.21.0", default-features = false, features = ["macros
 bytes = "1.11"
 bitflags = "2.10"
 crossbeam-queue = "0.3"
-crossbeam-utils = "0.8.21"
 etherparse = "0.20.1"
 arc-swap = "1"
 smoltcp = { version = "0.12", default-features = false, features = ["std", "alloc", "log", "medium-ip", "proto-ipv4", "socket-tcp", "socket-tcp-reno", "socket-tcp-cubic"] }

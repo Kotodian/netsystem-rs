@@ -5,7 +5,7 @@ use std::ops::{Deref, DerefMut};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::{TcpCapabilities, TcpConnectionId, TcpFastOpenCookie, TcpTimestampOption};
-use crossbeam_utils::CachePadded;
+use hammer_infra::align::CacheLineAlignMark;
 use hammer_infra::bihash::{Bihash, BihashKey, FREE_U64};
 use hammer_infra::pool::Pool;
 use hammer_runtime::DataWorkerId;
@@ -1139,13 +1139,17 @@ impl Clone for TcpPendingRouteIndex {
     }
 }
 
+#[repr(C)]
 pub struct TcpLookupStateCacheline0 {
+    cacheline0: CacheLineAlignMark,
     connections: TcpConnectionRouteIndex,
     pending: TcpPendingRouteIndex,
     next_iss: u32,
 }
 
+#[repr(C)]
 struct TcpLookupStateCacheline1 {
+    cacheline1: CacheLineAlignMark,
     fast_open_cache: Vec<TcpFastOpenCacheEntry>,
     fast_open_cache_index_v4: Bihash<TransportConnectionKey<Ipv4Addr>, 3>,
     fast_open_cache_index_v6: Bihash<TransportConnectionKey<Ipv6Addr>, 1>,
@@ -1155,8 +1159,8 @@ struct TcpLookupStateCacheline1 {
 }
 
 pub struct TcpLookupState {
-    cacheline0: CachePadded<TcpLookupStateCacheline0>,
-    cacheline1: CachePadded<TcpLookupStateCacheline1>,
+    cacheline0: TcpLookupStateCacheline0,
+    cacheline1: TcpLookupStateCacheline1,
 }
 
 impl Deref for TcpLookupState {
@@ -1179,19 +1183,21 @@ impl TcpLookupState {
     #[inline]
     pub(crate) fn new(_: DataWorkerId) -> Self {
         Self {
-            cacheline0: CachePadded::new(TcpLookupStateCacheline0 {
+            cacheline0: TcpLookupStateCacheline0 {
+                cacheline0: CacheLineAlignMark,
                 connections: TcpConnectionRouteIndex::empty(),
                 pending: TcpPendingRouteIndex::empty(),
                 next_iss: 81_000,
-            }),
-            cacheline1: CachePadded::new(TcpLookupStateCacheline1 {
+            },
+            cacheline1: TcpLookupStateCacheline1 {
+                cacheline1: CacheLineAlignMark,
                 fast_open_cache: Vec::new(),
                 fast_open_cache_index_v4: Bihash::new(64),
                 fast_open_cache_index_v6: Bihash::new(64),
                 fast_open_secrets: Vec::new(),
                 listener_pending: TcpListenerPendingTable::default(),
                 listener_cookie_secrets: Vec::new(),
-            }),
+            },
         }
     }
 

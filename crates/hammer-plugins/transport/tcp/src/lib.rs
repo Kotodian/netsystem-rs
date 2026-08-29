@@ -29,6 +29,7 @@ hammer_component_macros::declare_plugin!(
 
 use std::mem::transmute;
 use std::net::SocketAddr;
+use std::ops::Deref;
 use std::sync::{Arc, OnceLock, mpsc};
 
 use hammer_core::data_plane::{BufferPacketCursor, NodeId, NodeState, SecondaryOpaque};
@@ -39,7 +40,7 @@ use hammer_runtime::{
 };
 use thiserror::Error;
 
-use hammer_infra::align::CacheLine;
+use hammer_infra::align::CacheLineAlignMark;
 use hammer_infra::thread_owned::{ThreadOwned, ThreadOwnedError};
 use hammer_service::session::SessionQueueNext;
 use hammer_service::session::node::{SessionQueueNode, SessionQueueOutput};
@@ -188,6 +189,29 @@ pub(crate) fn publish_tcp_connection(
     Ok(())
 }
 
+#[repr(C)]
+struct TcpWorkerSlot {
+    cacheline0: CacheLineAlignMark,
+    owner: ThreadOwned<TcpWorker>,
+}
+
+impl TcpWorkerSlot {
+    fn new() -> Self {
+        Self {
+            cacheline0: CacheLineAlignMark,
+            owner: ThreadOwned::new(),
+        }
+    }
+}
+
+impl Deref for TcpWorkerSlot {
+    type Target = ThreadOwned<TcpWorker>;
+
+    fn deref(&self) -> &Self::Target {
+        &self.owner
+    }
+}
+
 pub struct TcpMain {
     protocol: u8,
     control: TcpInputControlPlane,
@@ -197,7 +221,7 @@ pub struct TcpMain {
     established_process: NodeProcessFn,
     rcv_process: NodeProcessFn,
     syn_sent_process: NodeProcessFn,
-    workers: Box<[CacheLine<ThreadOwned<TcpWorker>>]>,
+    workers: Box<[TcpWorkerSlot]>,
 }
 
 impl TcpMain {
@@ -205,7 +229,7 @@ impl TcpMain {
         let control = TcpInputControlPlane::new();
         let listeners = listener_control::TcpListenerControlHandle::new(control.clone());
         let workers = (0..worker_count)
-            .map(|_| CacheLine::new(ThreadOwned::new()))
+            .map(|_| TcpWorkerSlot::new())
             .collect::<Vec<_>>()
             .into_boxed_slice();
         Self {

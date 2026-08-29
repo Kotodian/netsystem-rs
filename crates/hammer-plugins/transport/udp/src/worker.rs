@@ -1,10 +1,11 @@
 use std::cell::UnsafeCell;
 use std::collections::VecDeque;
 use std::net::SocketAddr;
+use std::ops::Deref;
 use std::sync::{Arc, OnceLock, mpsc};
 
 use hammer_core::data_plane::{BufferFrame, Index as BufferIndex, NodeHandle, NodeId, NodeState};
-use hammer_infra::align::CacheLine;
+use hammer_infra::align::CacheLineAlignMark;
 use hammer_infra::pool::Pool;
 use hammer_infra::thread_owned::{ThreadOwned, ThreadOwnedError};
 use hammer_runtime::app::{SessionDgramHeader, SessionHandle};
@@ -106,16 +107,39 @@ impl UdpListenerCell {
 unsafe impl Send for UdpListenerCell {}
 unsafe impl Sync for UdpListenerCell {}
 
+#[repr(C)]
+struct UdpWorkerSlot {
+    cacheline0: CacheLineAlignMark,
+    owner: ThreadOwned<UdpWorker>,
+}
+
+impl UdpWorkerSlot {
+    fn new() -> Self {
+        Self {
+            cacheline0: CacheLineAlignMark,
+            owner: ThreadOwned::new(),
+        }
+    }
+}
+
+impl Deref for UdpWorkerSlot {
+    type Target = ThreadOwned<UdpWorker>;
+
+    fn deref(&self) -> &Self::Target {
+        &self.owner
+    }
+}
+
 pub struct UdpMain {
     protocol: u8,
     listeners: Arc<UdpListenerCell>,
-    workers: Box<[CacheLine<ThreadOwned<UdpWorker>>]>,
+    workers: Box<[UdpWorkerSlot]>,
 }
 
 impl UdpMain {
     fn new(protocol: u8, worker_count: usize) -> Self {
         let workers = (0..worker_count)
-            .map(|_| CacheLine::new(ThreadOwned::new()))
+            .map(|_| UdpWorkerSlot::new())
             .collect::<Vec<_>>()
             .into_boxed_slice();
         Self {

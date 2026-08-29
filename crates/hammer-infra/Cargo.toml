@@ -10,7 +10,6 @@ crate-type = ["dylib", "rlib"]
 
 [dependencies]
 bytes = { workspace = true }
-crossbeam-utils = { workspace = true }
 byte-unit = { workspace = true }
 libc = { workspace = true }
 libmimalloc-sys = { workspace = true }
