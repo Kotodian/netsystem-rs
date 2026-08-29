@@ -5,13 +5,13 @@
 //! next session.
 //!
 //! ```text
-//! cargo run -p hammer --example tun_tcp_echo -- /tmp/hammer-tcp-integration.attach.sock
+//! cargo run -p hammer --example tun_tcp_echo -- /tmp/hammer-tcp-integration.attach.sock 1 1
 //! ```
 
 use hammer_app::attach::{AppClient, AppClientError};
 use hammer_app::echo::run_echo_loop;
 use hammer_app::{AppSession, AppSessionError, DataWorkerId, SessionListenEndpoint};
-use hammer_runtime::app::{SessionEvtType, TransportProtocol};
+use hammer_runtime::app::SessionEvtType;
 
 const DEFAULT_ATTACH_SOCKET: &str = "/tmp/hammer-tcp-integration.attach.sock";
 const DEFAULT_LISTEN_ADDRESS: &str = "10.66.77.1:7300";
@@ -34,6 +34,10 @@ enum EchoError {
         #[source]
         source: std::io::Error,
     },
+    #[error("a transport protocol slot must be supplied after the listen address")]
+    TransportProtocolMissing,
+    #[error("the transport protocol slot is not a valid u8")]
+    TransportProtocolInvalid,
 }
 
 fn main() -> Result<(), EchoError> {
@@ -44,6 +48,11 @@ fn main() -> Result<(), EchoError> {
     let listen_address = arguments
         .next()
         .unwrap_or_else(|| DEFAULT_LISTEN_ADDRESS.to_owned());
+    let transport = arguments
+        .next()
+        .ok_or(EchoError::TransportProtocolMissing)?
+        .parse()
+        .map_err(|_| EchoError::TransportProtocolInvalid)?;
     let listen_address = listen_address
         .parse()
         .map_err(|source| EchoError::ListenAddress {
@@ -56,7 +65,7 @@ fn main() -> Result<(), EchoError> {
         .map_err(|source| EchoError::TokioRuntime { source })?;
     let mut client = AppClient::attach(&socket_path)?;
     let listener = client.listen(
-        TransportProtocol::Tcp,
+        transport,
         SessionListenEndpoint::new(listen_address, DataWorkerId::new(0)),
         None,
         None,
@@ -80,7 +89,7 @@ async fn run_echo(session: &AppSession) -> Result<(), EchoError> {
     let mut buffer = vec![0; ECHO_BUFFER_BYTES];
     loop {
         let event = session.next_event().await?;
-        if event.session_index() != session.session_index() {
+        if event.session_index != session.session_index() {
             continue;
         }
         match event.evt_type {
