@@ -1,0 +1,4 @@
+interface:
+  display_name: "Rust Conversion Design"
+  short_description: "Choose From, Into, TryFrom, and TryInto idiomatically"
+  default_prompt: "Use $rust-conversion-design to design or review Rust conversions."
