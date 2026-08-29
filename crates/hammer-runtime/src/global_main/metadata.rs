@@ -51,6 +51,7 @@ impl GlobalMain {
             Arc::clone(&worker_control_queues),
         );
         Self {
+            cacheline0: hammer_infra::align::CacheLineAlignMark,
             main,
             registry,
             barrier,

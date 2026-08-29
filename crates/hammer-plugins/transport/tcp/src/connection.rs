@@ -17,7 +17,7 @@ use crate::{
     TcpNegotiatedOptions, TcpPacket, TcpSackBlock, TcpSegmentFlags, TcpSeq, TcpState,
     TcpTimestampOption,
 };
-use crossbeam_utils::CachePadded;
+use hammer_infra::align::CacheLineAlignMark;
 use hammer_runtime::DataWorkerId;
 use hammer_runtime::{RuntimeError, RuntimeResult};
 use hammer_service::session::runtime::RxDelivery;
@@ -259,7 +259,9 @@ impl Default for TcpRetransmitTimeoutState {
 }
 
 #[derive(Debug, Clone)]
+#[repr(C)]
 pub struct TcpConnectionCacheline0 {
+    cacheline0: CacheLineAlignMark,
     state: TcpState,
     timers: TcpTimerState,
     pacing_ready: bool,
@@ -281,7 +283,9 @@ pub struct TcpConnectionCacheline0 {
 }
 
 #[derive(Debug, Clone)]
+#[repr(C)]
 struct TcpConnectionCacheline1 {
+    cacheline1: CacheLineAlignMark,
     session_id: u32,
     connection_id: Option<TcpConnectionId>,
     owner_worker: DataWorkerId,
@@ -293,8 +297,8 @@ struct TcpConnectionCacheline1 {
 
 #[derive(Debug, Clone)]
 pub struct TcpConnection {
-    cacheline0: CachePadded<TcpConnectionCacheline0>,
-    cacheline1: CachePadded<TcpConnectionCacheline1>,
+    cacheline0: TcpConnectionCacheline0,
+    cacheline1: TcpConnectionCacheline1,
     retransmit_timeout: TcpRetransmitTimeoutState,
     timestamps: TcpTimestampState,
     keepalive: TcpKeepaliveState,
@@ -343,7 +347,8 @@ impl TcpConnection {
         let mss = policy.mss as u32;
         let session_id = 0;
         Self {
-            cacheline0: CachePadded::new(TcpConnectionCacheline0 {
+            cacheline0: TcpConnectionCacheline0 {
+                cacheline0: CacheLineAlignMark,
                 state: TcpState::Closed,
                 timers: TcpTimerState::default(),
                 pacing_ready: false,
@@ -362,8 +367,9 @@ impl TcpConnection {
                 tx_intent_payload_len: 0,
                 fast_open_syn_payload_len: 0,
                 bytes_in_flight_cached: 0,
-            }),
-            cacheline1: CachePadded::new(TcpConnectionCacheline1 {
+            },
+            cacheline1: TcpConnectionCacheline1 {
+                cacheline1: CacheLineAlignMark,
                 session_id,
                 connection_id,
                 owner_worker,
@@ -371,7 +377,7 @@ impl TcpConnection {
                 local_port,
                 fast_open_cookie: None,
                 persist_attempts: 0,
-            }),
+            },
             retransmit_timeout: TcpRetransmitTimeoutState::new(),
             timestamps: TcpTimestampState::default(),
             keepalive: TcpKeepaliveState::new(Instant::now()),

@@ -3,6 +3,7 @@ use std::collections::VecDeque;
 use std::hint::spin_loop;
 use std::net::SocketAddr;
 use std::num::NonZeroU32;
+use std::ops::Deref;
 use std::os::fd::BorrowedFd;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{Arc, OnceLock};
@@ -12,7 +13,7 @@ use crossbeam_queue::ArrayQueue;
 use hammer_core::data_plane::{
     BufferFrame, DataPlaneBuffers, Index as BufferIndex, NodeId, NodeState,
 };
-use hammer_infra::align::{CacheLine, align_up};
+use hammer_infra::align::{CacheLineAlignMark, align_up};
 use hammer_infra::fifo::Fifo;
 use hammer_infra::linked_list::LinkedList;
 use hammer_infra::pool::Pool;
@@ -539,8 +540,31 @@ impl AppRxMqEntry {
     }
 }
 
+#[repr(C)]
+struct SessionWorkerSlot {
+    cacheline0: CacheLineAlignMark,
+    owner: ThreadOwned<SessionWorker>,
+}
+
+impl SessionWorkerSlot {
+    fn new() -> Self {
+        Self {
+            cacheline0: CacheLineAlignMark,
+            owner: ThreadOwned::new(),
+        }
+    }
+}
+
+impl Deref for SessionWorkerSlot {
+    type Target = ThreadOwned<SessionWorker>;
+
+    fn deref(&self) -> &Self::Target {
+        &self.owner
+    }
+}
+
 pub struct SessionMain {
-    workers: Box<[CacheLine<ThreadOwned<SessionWorker>>]>,
+    workers: Box<[SessionWorkerSlot]>,
     listeners: UnsafeCell<Pool<SessionListener>>,
     endpoint_lookup: SessionEndpointLookup,
 }
@@ -552,7 +576,7 @@ impl SessionMain {
     /// Initializes and publishes the process-global Session authority.
     pub fn init(worker_count: usize) -> RuntimeResult<()> {
         let workers = (0..worker_count)
-            .map(|_| CacheLine::new(ThreadOwned::new()))
+            .map(|_| SessionWorkerSlot::new())
             .collect::<Vec<_>>()
             .into_boxed_slice();
         let _ = publish_session_migrate_queues(worker_count);

@@ -1,47 +1,23 @@
 use std::alloc::Layout;
-use std::fmt;
 use std::mem;
-use std::ops::{Deref, DerefMut};
 
 pub const CACHE_LINE: usize = 64;
 
+/// VPP's minimum backing alignment for ordinary vectors and pools.
+///
+/// This is the Rust equivalent of `VEC_MIN_ALIGN` in the vendored VPP
+/// `vec_bootstrap.h`. It controls the allocation base only; it does not alter
+/// an element's stride or add cache-line padding.
+pub const VEC_MIN_ALIGN: usize = 8;
+
+/// Zero-sized field marker corresponding to VPP's
+/// `CLIB_CACHE_LINE_ALIGN_MARK(mark)`.
+///
+/// The marker owns no data. In a `repr(C)` record it aligns the record itself
+/// or the field group that follows it to a cache-line boundary.
 #[repr(C, align(64))]
-#[derive(Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub struct CacheLine<T>(T);
-
-impl<T> CacheLine<T> {
-    #[inline(always)]
-    pub const fn new(value: T) -> Self {
-        Self(value)
-    }
-
-    #[inline(always)]
-    pub fn into_inner(self) -> T {
-        self.0
-    }
-}
-
-impl<T> Deref for CacheLine<T> {
-    type Target = T;
-
-    #[inline(always)]
-    fn deref(&self) -> &Self::Target {
-        &self.0
-    }
-}
-
-impl<T> DerefMut for CacheLine<T> {
-    #[inline(always)]
-    fn deref_mut(&mut self) -> &mut Self::Target {
-        &mut self.0
-    }
-}
-
-impl<T: fmt::Debug> fmt::Debug for CacheLine<T> {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_tuple("CacheLine").field(&self.0).finish()
-    }
-}
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+pub struct CacheLineAlignMark;
 
 #[inline(always)]
 pub const fn align_up(value: usize, alignment: usize) -> usize {
@@ -53,7 +29,6 @@ pub const fn align_up(value: usize, alignment: usize) -> usize {
     (value + alignment - 1) & !(alignment - 1)
 }
 
-#[inline(always)]
 pub fn is_aligned<T>(ptr: *const T, alignment: usize) -> bool {
     assert!(alignment != 0, "alignment must be non-zero");
     assert!(
@@ -65,9 +40,12 @@ pub fn is_aligned<T>(ptr: *const T, alignment: usize) -> bool {
 
 #[inline(always)]
 pub(crate) fn allocation_align<T, const ALIGN: usize>() -> usize {
-    assert!(ALIGN != 0, "alignment must be non-zero");
-    assert!(ALIGN.is_power_of_two(), "alignment must be a power of two");
-    ALIGN.max(mem::align_of::<T>())
+    let requested = if ALIGN == 0 { VEC_MIN_ALIGN } else { ALIGN };
+    assert!(
+        requested.is_power_of_two(),
+        "alignment must be a power of two"
+    );
+    requested.max(mem::align_of::<T>())
 }
 
 #[inline]
@@ -82,9 +60,4 @@ pub(crate) fn array_layout<T, const ALIGN: usize>(capacity: usize) -> Layout {
             .max(1)
     };
     Layout::from_size_align(size, alignment).expect("valid aligned array layout")
-}
-
-#[inline(always)]
-pub(crate) fn slot_stride<T, const ALIGN: usize>() -> usize {
-    align_up(mem::size_of::<T>().max(1), allocation_align::<T, ALIGN>())
 }

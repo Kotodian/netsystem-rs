@@ -11,9 +11,7 @@ use std::ptr::NonNull;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicPtr, AtomicU64, Ordering};
 
-use crossbeam_utils::CachePadded;
-
-use crate::align::CACHE_LINE;
+use crate::align::{CACHE_LINE, CacheLineAlignMark};
 use crate::bihash::value::ValuePage;
 use crate::heap::Heap;
 use crate::heap_boxed::{Slice, allocate_in, deallocate_in};
@@ -35,7 +33,7 @@ struct RetiredOffset {
 struct PageAllocState<K, const KVP: usize> {
     blocks: Vec<PageBlock<K, KVP>>,
     directories: Vec<Slice<usize>>,
-    hazards: Vec<NonNull<CachePadded<AtomicU64>>>,
+    hazards: Vec<NonNull<HazardSlot>>,
     freelists: [Vec<u64>; MAX_LOG2_PAGES + 1],
     retired: Vec<RetiredOffset>,
     heap: Arc<Heap>,
@@ -92,18 +90,15 @@ impl<K: Copy + Default, const KVP: usize> PageAllocState<K, KVP> {
         published
     }
 
-    fn allocate_hazard(&mut self) -> NonNull<CachePadded<AtomicU64>> {
-        let layout = Layout::new::<CachePadded<AtomicU64>>();
+    fn allocate_hazard(&mut self) -> NonNull<HazardSlot> {
+        let layout = Layout::new::<HazardSlot>();
         let raw = self
             .heap
             .alloc(layout)
             .unwrap_or_else(|| handle_alloc_error(layout));
-        let slot = raw.cast::<CachePadded<AtomicU64>>();
+        let slot = raw.cast::<HazardSlot>();
         // SAFETY: `slot` points to one suitably aligned writable allocation.
-        unsafe {
-            slot.as_ptr()
-                .write(CachePadded::new(AtomicU64::new(NO_OFFSET)))
-        };
+        unsafe { slot.as_ptr().write(HazardSlot::new()) };
         self.hazards.push(slot);
         slot
     }
@@ -159,7 +154,7 @@ impl<K, const KVP: usize> Drop for PageAllocState<K, KVP> {
             }
         }
         for slot in &self.hazards {
-            let layout = Layout::new::<CachePadded<AtomicU64>>();
+            let layout = Layout::new::<HazardSlot>();
             // SAFETY: every slot was allocated with this layout from `self.heap`.
             unsafe {
                 std::ptr::drop_in_place(slot.as_ptr());
@@ -303,7 +298,7 @@ impl<K: Copy + Default, const KVP: usize> PageAlloc<K, KVP> {
     }
 
     #[inline(always)]
-    fn claim_hazard(&self, offset: u64) -> NonNull<CachePadded<AtomicU64>> {
+    fn claim_hazard(&self, offset: u64) -> NonNull<HazardSlot> {
         loop {
             let existing = self.with_state(|state| {
                 state.hazards.iter().find_map(|slot| {
@@ -359,8 +354,41 @@ impl Drop for AllocLock<'_> {
     }
 }
 
+#[repr(C)]
+struct HazardSlot {
+    cacheline0: CacheLineAlignMark,
+    value: AtomicU64,
+}
+
+impl HazardSlot {
+    const fn new() -> Self {
+        Self {
+            cacheline0: CacheLineAlignMark,
+            value: AtomicU64::new(NO_OFFSET),
+        }
+    }
+
+    fn load(&self, ordering: Ordering) -> u64 {
+        self.value.load(ordering)
+    }
+
+    fn store(&self, value: u64, ordering: Ordering) {
+        self.value.store(value, ordering);
+    }
+
+    fn compare_exchange(
+        &self,
+        current: u64,
+        new: u64,
+        success: Ordering,
+        failure: Ordering,
+    ) -> Result<u64, u64> {
+        self.value.compare_exchange(current, new, success, failure)
+    }
+}
+
 struct HazardGuard {
-    slot: NonNull<CachePadded<AtomicU64>>,
+    slot: NonNull<HazardSlot>,
 }
 
 impl Drop for HazardGuard {

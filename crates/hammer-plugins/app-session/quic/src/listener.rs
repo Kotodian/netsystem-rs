@@ -1,9 +1,10 @@
 use std::cell::UnsafeCell;
 use std::collections::HashMap;
+use std::ops::Deref;
 use std::sync::{Arc, OnceLock, mpsc};
 
 use hammer_core::data_plane::NodeState;
-use hammer_infra::align::CacheLine;
+use hammer_infra::align::CacheLineAlignMark;
 use hammer_infra::pool::Pool;
 use hammer_infra::thread_owned::ThreadOwned;
 use hammer_runtime::app::SessionHandle;
@@ -48,13 +49,36 @@ pub(crate) enum QuicListenerError {
 /// updated to the outer `SessionHandle` while the same WorkerBarrier
 /// transaction is active. QUIC interprets that opaque fact later; service and
 /// runtime do not know its type.
+#[repr(C)]
+struct QuicWorkerSlot {
+    cacheline0: CacheLineAlignMark,
+    owner: ThreadOwned<QuicWorker>,
+}
+
+impl QuicWorkerSlot {
+    fn new() -> Self {
+        Self {
+            cacheline0: CacheLineAlignMark,
+            owner: ThreadOwned::new(),
+        }
+    }
+}
+
+impl Deref for QuicWorkerSlot {
+    type Target = ThreadOwned<QuicWorker>;
+
+    fn deref(&self) -> &Self::Target {
+        &self.owner
+    }
+}
+
 pub struct QuicMain {
     protocol: u8,
     inner_application: u32,
     session_app: u32,
     pub(crate) configs: QuicConfigRegistry,
     contexts: Arc<QuicListenerContexts>,
-    workers: Box<[CacheLine<ThreadOwned<QuicWorker>>]>,
+    workers: Box<[QuicWorkerSlot]>,
 }
 
 struct QuicListenerContexts {
@@ -153,7 +177,7 @@ impl QuicMain {
             configs: QuicConfigRegistry::new(QUIC_CONFIG_CAPACITY),
             contexts: Arc::new(QuicListenerContexts::new(QUIC_CONTEXT_CAPACITY)),
             workers: (0..worker_count)
-                .map(|_| CacheLine::new(ThreadOwned::new()))
+                .map(|_| QuicWorkerSlot::new())
                 .collect::<Vec<_>>()
                 .into_boxed_slice(),
         }

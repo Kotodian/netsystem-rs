@@ -6,10 +6,10 @@ use std::ops::{Deref, DerefMut};
 use std::ptr::{self, NonNull};
 use std::sync::Arc;
 
-use crate::align::{self, CACHE_LINE};
+use crate::align;
 use crate::heap::Heap;
 
-pub(crate) struct Slice<T, const ALIGN: usize = CACHE_LINE> {
+pub(crate) struct Slice<T, const ALIGN: usize = 0> {
     ptr: NonNull<T>,
     len: usize,
     /// `None` selects the main heap. `Some` retains an explicit non-main heap.

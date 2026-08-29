@@ -5,6 +5,7 @@
 //! deadlock, not a recoverable runtime error.
 
 use core::hint::spin_loop;
+use hammer_infra::align::CacheLineAlignMark;
 use std::panic::Location;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, Ordering};
@@ -15,28 +16,34 @@ pub(crate) const BARRIER_SYNC_TIMEOUT: Duration = Duration::from_millis(600_100)
 #[cfg(not(debug_assertions))]
 pub(crate) const BARRIER_SYNC_TIMEOUT: Duration = Duration::from_secs(1);
 
-#[repr(align(64))]
-struct BarrierCounter(AtomicU32);
+#[repr(C)]
+struct BarrierCounter {
+    cacheline0: CacheLineAlignMark,
+    value: AtomicU32,
+}
 
 impl BarrierCounter {
     #[inline]
     const fn new(value: u32) -> Self {
-        Self(AtomicU32::new(value))
+        Self {
+            cacheline0: CacheLineAlignMark,
+            value: AtomicU32::new(value),
+        }
     }
 
     #[inline]
     fn fetch_add(&self, value: u32, ordering: Ordering) -> u32 {
-        self.0.fetch_add(value, ordering)
+        self.value.fetch_add(value, ordering)
     }
 
     #[inline]
     fn fetch_sub(&self, value: u32, ordering: Ordering) -> u32 {
-        self.0.fetch_sub(value, ordering)
+        self.value.fetch_sub(value, ordering)
     }
 
     #[inline]
     fn load(&self, ordering: Ordering) -> u32 {
-        self.0.load(ordering)
+        self.value.load(ordering)
     }
 }
 

@@ -14,7 +14,6 @@ arc-swap = { workspace = true }
 async-trait = { workspace = true }
 bitflags = "2.10"
 crossbeam-queue = { workspace = true }
-crossbeam-utils = { workspace = true }
 hammer-core = { path = "../hammer-core" }
 hammer-infra = { path = "../hammer-infra" }
 hammer-ipc = { path = "../hammer-ipc" }

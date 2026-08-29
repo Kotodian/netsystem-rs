@@ -13,7 +13,7 @@
 //! connection context index and worker (http3.c:35-48).
 //!
 //! `HttpMain` owns one `HttpWorker` per data worker in a
-//! `CacheLine<ThreadOwned<HttpWorker>>` slot, mirroring `QuicMain.workers`
+//! A cache-line-isolated concrete worker slot, mirroring `QuicMain.workers`
 //! (quic listener.rs:58) and VPP's `http_main.wrk`, a fixed array sized by
 //! thread count and indexed per thread by `http_worker_get` (http.c:1073,
 //! http_private.h:1275-1278). Each worker installs itself once via the

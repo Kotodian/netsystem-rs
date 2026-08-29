@@ -22,6 +22,7 @@ use libmimalloc_sys::{
     mi_option_set_enabled, mi_realloc_aligned, mi_reserve_os_memory_ex, mi_zalloc_aligned,
 };
 
+use crate::align::VEC_MIN_ALIGN;
 use crate::physmem::PhysmemError;
 #[cfg(target_os = "linux")]
 use crate::physmem::map_hugetlb;
@@ -542,6 +543,7 @@ fn main_heap_is_allocation_authority() -> bool {
 
 #[inline]
 pub(crate) unsafe fn allocate(layout: Layout) -> *mut u8 {
+    let layout = normalized_layout(layout);
     if !main_heap_is_allocation_authority() {
         // SAFETY: bootstrap allocation is paired with provenance-aware
         // deallocation below.
@@ -554,6 +556,7 @@ pub(crate) unsafe fn allocate(layout: Layout) -> *mut u8 {
 
 #[inline]
 pub(crate) unsafe fn allocate_zeroed(layout: Layout) -> *mut u8 {
+    let layout = normalized_layout(layout);
     if !main_heap_is_allocation_authority() {
         // SAFETY: bootstrap allocation is paired with provenance-aware
         // deallocation below.
@@ -569,6 +572,7 @@ pub(crate) unsafe fn deallocate(pointer: *mut u8, layout: Layout) {
     if pointer.is_null() {
         return;
     }
+    let layout = normalized_layout(layout);
     if contains_main_heap(pointer) {
         // SAFETY: the GlobalAlloc contract says `pointer` came from this
         // allocator, and the range check identifies its mimalloc provenance.
@@ -582,6 +586,7 @@ pub(crate) unsafe fn deallocate(pointer: *mut u8, layout: Layout) {
 
 #[inline]
 unsafe fn reallocate(pointer: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
+    let layout = normalized_layout(layout);
     if !main_heap_is_allocation_authority() {
         // SAFETY: before main-heap initialization, ordinary allocations use
         // System with the supplied original layout.
@@ -614,6 +619,12 @@ unsafe fn reallocate(pointer: *mut u8, layout: Layout, new_size: usize) -> *mut 
         System.dealloc(pointer, layout);
     }
     replacement
+}
+
+#[inline]
+fn normalized_layout(layout: Layout) -> Layout {
+    Layout::from_size_align(layout.size(), layout.align().max(VEC_MIN_ALIGN))
+        .expect("valid vector minimum alignment")
 }
 
 // SAFETY: every operation preserves the GlobalAlloc layout contract and routes

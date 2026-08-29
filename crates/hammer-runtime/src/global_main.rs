@@ -1,3 +1,4 @@
+use hammer_infra::align::CacheLineAlignMark;
 use std::cell::RefCell;
 use std::collections::HashSet;
 use std::sync::atomic::{AtomicBool, AtomicU32};
@@ -49,8 +50,9 @@ async fn stat_segment_collector_process(mut context: ProcessContext) -> RuntimeR
     }
 }
 
-#[repr(align(64))]
+#[repr(C)]
 pub struct GlobalMain {
+    cacheline0: CacheLineAlignMark,
     pub(crate) main: DataPlaneMain,
     pub registry: Arc<RuntimeRegistry>,
     pub(crate) barrier: crate::barrier::WorkerBarrier,

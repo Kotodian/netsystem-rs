@@ -40,9 +40,10 @@
 
 use std::cell::UnsafeCell;
 use std::collections::HashMap;
+use std::ops::Deref;
 use std::sync::{Arc, OnceLock};
 
-use hammer_infra::align::CacheLine;
+use hammer_infra::align::CacheLineAlignMark;
 use hammer_infra::thread_owned::ThreadOwned;
 use hammer_runtime::app::SessionHandle;
 use hammer_runtime::{
@@ -163,6 +164,29 @@ unsafe impl Sync for HttpListenerContexts {}
 /// plus the inner Application attached at init and the builtin HTTP Session
 /// App id. The lower QUIC VFT remains owned by the process-global transport
 /// slot table and is resolved by protocol at each Session operation.
+#[repr(C)]
+struct HttpWorkerSlot {
+    cacheline0: CacheLineAlignMark,
+    owner: ThreadOwned<HttpWorker>,
+}
+
+impl HttpWorkerSlot {
+    fn new() -> Self {
+        Self {
+            cacheline0: CacheLineAlignMark,
+            owner: ThreadOwned::new(),
+        }
+    }
+}
+
+impl Deref for HttpWorkerSlot {
+    type Target = ThreadOwned<HttpWorker>;
+
+    fn deref(&self) -> &Self::Target {
+        &self.owner
+    }
+}
+
 pub struct HttpMain {
     protocol: u8,
     session_app: u32,
@@ -170,7 +194,7 @@ pub struct HttpMain {
     contexts: HttpListenerContexts,
     /// One cache-line-aligned, thread-owned `HttpWorker` per configured data
     /// worker, mirroring `QuicMain.workers` (quic listener.rs:58).
-    workers: Box<[CacheLine<ThreadOwned<HttpWorker>>]>,
+    workers: Box<[HttpWorkerSlot]>,
 }
 
 impl HttpMain {
@@ -187,7 +211,7 @@ impl HttpMain {
             inner_application,
             contexts: HttpListenerContexts::new(),
             workers: (0..worker_count)
-                .map(|_| CacheLine::new(ThreadOwned::new()))
+                .map(|_| HttpWorkerSlot::new())
                 .collect::<Vec<_>>()
                 .into_boxed_slice(),
         }

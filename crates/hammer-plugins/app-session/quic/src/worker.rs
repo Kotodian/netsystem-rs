@@ -315,8 +315,9 @@ enum ContextRole {
 }
 
 /// Cache-line-aligned QUIC worker context.
-#[repr(align(64))]
+#[repr(C)]
 pub(super) struct Context {
+    cacheline0: hammer_infra::align::CacheLineAlignMark,
     role: ContextRole,
 }
 
@@ -331,6 +332,7 @@ impl Context {
         server_config: Option<Arc<quinn_proto::ServerConfig>>,
     ) -> Self {
         Self {
+            cacheline0: hammer_infra::align::CacheLineAlignMark,
             role: ContextRole::Listener(ListenerContext {
                 outer_listener,
                 outer_application,
@@ -360,6 +362,7 @@ impl Context {
     ) -> Self {
         let server_config = listener_context.and_then(|listener| listener.server_config.clone());
         Self {
+            cacheline0: hammer_infra::align::CacheLineAlignMark,
             role: ContextRole::Connection(ConnectionContext {
                 engine: Some(Box::new(EngineConnection::pending(
                     server_config,
@@ -391,6 +394,7 @@ impl Context {
         remote: SocketAddr,
     ) -> Self {
         Self {
+            cacheline0: hammer_infra::align::CacheLineAlignMark,
             role: ContextRole::Connection(ConnectionContext {
                 engine: Some(Box::new(EngineConnection::client(
                     config,
@@ -414,6 +418,7 @@ impl Context {
 
     fn stream(parent: u32, session: u32, stream: quinn_proto::StreamId) -> Self {
         Self {
+            cacheline0: hammer_infra::align::CacheLineAlignMark,
             role: ContextRole::Stream(StreamContext {
                 parent,
                 session,
