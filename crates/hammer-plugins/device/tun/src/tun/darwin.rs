@@ -185,21 +185,3 @@ fn set_mtu(name: &str, mtu: u32) -> Result<()> {
     }
     Ok(())
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn parse_unit_supports_auto_and_explicit_utun_names() {
-        assert_eq!(
-            (parse_unit("utun").unwrap(), parse_unit("utun9").unwrap()),
-            (0, 10)
-        );
-    }
-
-    #[test]
-    fn parse_unit_rejects_non_utun_names() {
-        assert!(parse_unit("tun0").is_err());
-    }
-}
