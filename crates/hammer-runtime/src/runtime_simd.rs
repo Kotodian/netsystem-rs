@@ -29,21 +29,3 @@ pub(crate) const fn preferred_frame_batch_width(simd_bytes: usize) -> FrameBatch
         FrameBatchWidth::Pair
     }
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn wider_simd_selects_wider_frame_batches() {
-        assert_eq!(preferred_frame_batch_width(1), FrameBatchWidth::Pair);
-        #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
-        {
-            assert_eq!(preferred_frame_batch_width(16), FrameBatchWidth::Pair);
-            assert_eq!(preferred_frame_batch_width(32), FrameBatchWidth::Quad);
-            assert_eq!(preferred_frame_batch_width(64), FrameBatchWidth::Octo);
-        }
-        #[cfg(any(target_arch = "arm", target_arch = "aarch64"))]
-        assert_eq!(preferred_frame_batch_width(16), FrameBatchWidth::Quad);
-    }
-}

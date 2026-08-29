@@ -54,12 +54,6 @@ pub enum SessionControlError {
     TransportFailed,
     #[error("the Session resource capacity is exhausted")]
     CapacityExhausted,
-    #[error("the Session Application callback is missing")]
-    SessionAppMissing,
-    #[error("the Session Application callback is registered more than once")]
-    SessionAppDuplicate,
-    #[error("the Session Main control plane is unavailable")]
-    SessionMainUnavailable,
     #[error("no bounded ext-config storage is published for the Application")]
     ExtConfigUnavailable,
     #[error("the ext-config chunk payload is not a valid server name")]
@@ -95,9 +89,6 @@ impl SessionControlError {
             Self::TransportConnectUnsupported => -11,
             Self::TransportFailed => -12,
             Self::CapacityExhausted => -13,
-            Self::SessionAppMissing => -14,
-            Self::SessionAppDuplicate => -15,
-            Self::SessionMainUnavailable => -16,
             Self::ExtConfigUnavailable => -17,
             Self::ExtConfigInvalid => -18,
             Self::ExtConfigFailed => -19,
@@ -124,9 +115,6 @@ impl SessionControlError {
             -11 => Some(Self::TransportConnectUnsupported),
             -12 => Some(Self::TransportFailed),
             -13 => Some(Self::CapacityExhausted),
-            -14 => Some(Self::SessionAppMissing),
-            -15 => Some(Self::SessionAppDuplicate),
-            -16 => Some(Self::SessionMainUnavailable),
             -17 => Some(Self::ExtConfigUnavailable),
             -18 => Some(Self::ExtConfigInvalid),
             -19 => Some(Self::ExtConfigFailed),

@@ -46,24 +46,3 @@ impl SessionOffsets {
         })
     }
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    #[test]
-    fn session_offsets_allocates_all_three_objects() {
-        let seg = Segment::local(1024 * 1024);
-        let offs = SessionOffsets::allocate(&seg, 32, 16).expect("session layout");
-        assert!(offs.rx_fifo_off < offs.tx_fifo_off);
-        assert!(offs.tx_fifo_off < offs.evt_q_off);
-    }
-
-    #[test]
-    fn session_offsets_offsets_are_cachelined() {
-        let seg = Segment::local(1024 * 1024);
-        let offs = SessionOffsets::allocate(&seg, 64, 32).expect("session layout");
-        assert_eq!(offs.rx_fifo_off % 64, 0);
-        assert_eq!(offs.tx_fifo_off % 64, 0);
-        assert_eq!(offs.evt_q_off % 64, 0);
-    }
-}

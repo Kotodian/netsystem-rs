@@ -1,17 +1,17 @@
 //! Immutable executable registrations owned by one link image.
 //!
 //! `PluginMain` retains each image through the ABI-stable plugin root and
-//! collects its registrations after dependency-ordered loading. No DSO load
-//! constructor, destructor, global registry, or synchronization is involved.
+//! collects its runtime registrations after dependency-ordered loading. No DSO
+//! load constructor, destructor, global registry, or synchronization is
+//! involved. Session App and transport protocol capabilities are intentionally
+//! absent: those are registered by their owning service/plugin authorities.
 
-use crate::app::SessionAppRegistration;
 use crate::binary_api::BinaryApiMethodEntry;
 use crate::error::RuntimeResult;
 use crate::init::{ConfigFunction, InitFunction};
 use crate::node::{NodeEntry, NodeFunctionRegistration};
 use crate::process::ProcessEntry;
 use crate::registry::RuntimeRegistry;
-use crate::session::SessionTransportRegistration;
 use abi_stable::StableAbi;
 use hammer_stats::{StatsMain, StatsResult};
 
@@ -25,8 +25,9 @@ pub struct StatsRegistration {
 
 /// The existing registration catalog for one link image.
 ///
-/// This is deliberately the only registration carrier. It is opaque at the
-/// root ABI boundary; only runtime's `PluginMain` accesses its inventories.
+/// This is deliberately the only runtime registration carrier. It is opaque at
+/// the root ABI boundary; only runtime's `PluginMain` accesses its inventories.
+/// Session App and transport protocol registrations do not cross this boundary.
 #[doc(hidden)]
 #[repr(C)]
 #[derive(StableAbi)]
@@ -41,8 +42,6 @@ pub struct RegistrationImage {
     graph_nodes: &'static [NodeEntry],
     node_functions: &'static [NodeFunctionRegistration],
     process_nodes: &'static [ProcessEntry],
-    session_transports: &'static [SessionTransportRegistration],
-    session_apps: &'static [SessionAppRegistration],
     binary_api_methods: &'static [BinaryApiMethodEntry],
     stats_registrations: &'static [StatsRegistration],
 }
@@ -60,8 +59,6 @@ impl RegistrationImage {
         graph_nodes: &'static [NodeEntry],
         node_functions: &'static [NodeFunctionRegistration],
         process_nodes: &'static [ProcessEntry],
-        session_transports: &'static [SessionTransportRegistration],
-        session_apps: &'static [SessionAppRegistration],
         binary_api_methods: &'static [BinaryApiMethodEntry],
     ) -> Self {
         Self::new_with_stats(
@@ -74,8 +71,6 @@ impl RegistrationImage {
             graph_nodes,
             node_functions,
             process_nodes,
-            session_transports,
-            session_apps,
             binary_api_methods,
             &[],
         )
@@ -93,8 +88,6 @@ impl RegistrationImage {
         graph_nodes: &'static [NodeEntry],
         node_functions: &'static [NodeFunctionRegistration],
         process_nodes: &'static [ProcessEntry],
-        session_transports: &'static [SessionTransportRegistration],
-        session_apps: &'static [SessionAppRegistration],
         binary_api_methods: &'static [BinaryApiMethodEntry],
         stats_registrations: &'static [StatsRegistration],
     ) -> Self {
@@ -108,8 +101,6 @@ impl RegistrationImage {
             graph_nodes,
             node_functions,
             process_nodes,
-            session_transports,
-            session_apps,
             binary_api_methods,
             stats_registrations,
         }
@@ -160,16 +151,6 @@ impl RegistrationImage {
     }
 
     #[inline]
-    pub(crate) fn session_transports(&self) -> &'static [SessionTransportRegistration] {
-        self.session_transports
-    }
-
-    #[inline]
-    pub(crate) fn session_apps(&self) -> &'static [SessionAppRegistration] {
-        self.session_apps
-    }
-
-    #[inline]
     pub(crate) fn binary_api_methods(&self) -> &'static [BinaryApiMethodEntry] {
         self.binary_api_methods
     }
@@ -194,8 +175,6 @@ macro_rules! __declare_registration_image {
             graph_nodes = [];
             node_functions = [];
             process_nodes = [];
-            session_transports = [];
-            session_apps = [];
             binary_api_methods = [];
             stats_registrations = [];
         );
@@ -210,8 +189,6 @@ macro_rules! __declare_registration_image {
         graph_nodes = [$($graph_node:path),* $(,)?];
         node_functions = [$($node_function:path),* $(,)?];
         process_nodes = [$($process_node:path),* $(,)?];
-        session_transports = [$($session_transport:path),* $(,)?];
-        session_apps = [$($session_app:path),* $(,)?];
         binary_api_methods = [$($binary_api_method:path),* $(,)?];
         stats_registrations = [$($stats_registration:path),* $(,)?];
     ) => {
@@ -226,8 +203,6 @@ macro_rules! __declare_registration_image {
                 &[$($graph_node),*],
                 &[$($node_function),*],
                 &[$($process_node),*],
-                &[$($session_transport),*],
-                &[$($session_app),*],
                 &[$($binary_api_method),*],
                 &[$($stats_registration),*],
             );
@@ -242,8 +217,6 @@ macro_rules! __declare_registration_image {
         graph_nodes = [$($graph_node:path),* $(,)?];
         node_functions = [$($node_function:path),* $(,)?];
         process_nodes = [$($process_node:path),* $(,)?];
-        session_transports = [$($session_transport:path),* $(,)?];
-        session_apps = [$($session_app:path),* $(,)?];
         binary_api_methods = [$($binary_api_method:path),* $(,)?];
     ) => {
         $crate::__declare_registration_image!(
@@ -256,8 +229,6 @@ macro_rules! __declare_registration_image {
             graph_nodes = [$($graph_node),*];
             node_functions = [$($node_function),*];
             process_nodes = [$($process_node),*];
-            session_transports = [$($session_transport),*];
-            session_apps = [$($session_app),*];
             binary_api_methods = [$($binary_api_method),*];
             stats_registrations = [];
         );

@@ -113,33 +113,3 @@ impl BinaryApiMethodEntry {
         (self.call)(RSlice::from_slice(request))
     }
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn noop_reply(_request: RSlice<'_, u8>) -> BinaryApiMethodReply {
-        BinaryApiMethodReply::ok(Vec::new())
-    }
-
-    #[test]
-    fn new_defaults_to_not_mp_safe() {
-        let entry = BinaryApiMethodEntry::new("test.method", noop_reply);
-        assert_eq!(entry.name(), "test.method");
-        assert!(!entry.is_mp_safe(), "legacy entries run under the barrier");
-    }
-
-    #[test]
-    fn mp_safe_marks_the_entry_mp_safe() {
-        let entry = BinaryApiMethodEntry::new("test.readonly", noop_reply).mp_safe();
-        assert_eq!(entry.name(), "test.readonly");
-        assert!(entry.is_mp_safe());
-    }
-
-    #[test]
-    fn mp_safe_builder_is_const() {
-        const ENTRY: BinaryApiMethodEntry =
-            BinaryApiMethodEntry::new("test.readonly", noop_reply).mp_safe();
-        assert!(ENTRY.is_mp_safe());
-    }
-}

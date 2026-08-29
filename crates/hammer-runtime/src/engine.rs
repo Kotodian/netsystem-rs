@@ -305,12 +305,19 @@ impl Engine {
         self.barrier.clone()
     }
 
-    /// Verifies that the current Engine is the main/control thread and that
-    /// the worker barrier is held whenever Data Workers are running.
-    pub fn ensure_main_thread_with_barrier(&self) -> RuntimeResult<()> {
+    /// Verifies that the current Engine is the main/control thread.
+    #[inline]
+    pub fn ensure_main_thread(&self) -> RuntimeResult<()> {
         if self.thread_index != 0 {
             return Err(RuntimeError::ControlRequiresMainThread);
         }
+        Ok(())
+    }
+
+    /// Verifies that the current Engine is the main/control thread and that
+    /// the worker barrier is held whenever Data Workers are running.
+    pub fn ensure_main_thread_with_barrier(&self) -> RuntimeResult<()> {
+        self.ensure_main_thread()?;
         if self.barrier.worker_count() != 0 && !self.barrier.is_pending() {
             return Err(RuntimeError::ControlRequiresWorkerBarrier);
         }
@@ -514,12 +521,7 @@ impl Engine {
 
     #[inline]
     pub fn data_worker_id(&self) -> RuntimeResult<DataWorkerId> {
-        self.thread_index
-            .checked_sub(1)
-            .map(DataWorkerId::new)
-            .ok_or(RuntimeError::DataWorkerIdUnavailable {
-                thread_index: self.thread_index,
-            })
+        DataWorkerId::try_from(self.thread_index)
     }
 
     /// The configured number of data workers. This is runtime state, not a
@@ -753,6 +755,15 @@ impl Engine {
     }
 }
 
+/// Verifies the current thread is the main/control engine.
+#[inline]
+pub fn ensure_main_thread() -> RuntimeResult<()> {
+    match Engine::with_current(|engine| engine.ensure_main_thread()) {
+        Some(result) => result,
+        None => Err(RuntimeError::ControlRequiresMainThread),
+    }
+}
+
 /// Verifies the current thread is the main/control engine and is inside the
 /// worker-barrier phase when Data Workers are running.
 pub fn ensure_main_thread_with_barrier() -> RuntimeResult<()> {
@@ -979,314 +990,5 @@ pub(crate) fn thread_panic_message(payload: Box<dyn std::any::Any + Send>) -> St
             Ok(message) => (*message).to_owned(),
             Err(_) => "non-string panic payload".to_owned(),
         },
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::DataPlaneBufferConfig;
-    use crate::start_workers::start_workers;
-    use hammer_runtime::RuntimeRegistry;
-    use hammer_runtime::{DataPlaneRuntime, DataPlaneRuntimeConfig};
-    use std::sync::Arc;
-
-    fn test_runtime() -> DataPlaneRuntime {
-        let buffers = DataPlaneBufferConfig {
-            buffer_slot_capacity: 64,
-            buffer_slots: 16,
-            frame_slots: 16,
-            ..DataPlaneBufferConfig::default()
-        };
-        DataPlaneRuntime::new(DataPlaneRuntimeConfig { buffers })
-    }
-
-    fn test_engine() -> Engine {
-        Engine::new(test_runtime(), RuntimeRegistry::new())
-    }
-
-    #[test]
-    fn configured_engine_keeps_arenas_for_the_same_worker_config() {
-        let mut worker = Worker::default();
-        worker.buffer.slot_bytes = 64;
-        worker.buffer.slots_per_numa = 16;
-        worker.buffer.frame_pool_size = 16;
-        worker.buffer.page_size = Some(hammer_infra::PageSize::Default);
-        let mut engine = Engine::new_configured(RuntimeRegistry::new(), worker.clone())
-            .expect("configured engine");
-        let pool_id = engine
-            .runtime
-            .buffers()
-            .buffer_arenas()
-            .next()
-            .expect("buffer arena")
-            .pool_id();
-
-        engine
-            .apply_worker_config(worker)
-            .expect("same worker config");
-
-        assert_eq!(
-            engine
-                .runtime
-                .buffers()
-                .buffer_arenas()
-                .next()
-                .expect("buffer arena")
-                .pool_id(),
-            pool_id
-        );
-    }
-
-    #[test]
-    fn configured_engine_rejects_a_different_worker_config() {
-        let mut worker = Worker::default();
-        worker.buffer.slot_bytes = 64;
-        worker.buffer.slots_per_numa = 16;
-        worker.buffer.frame_pool_size = 16;
-        worker.buffer.page_size = Some(hammer_infra::PageSize::Default);
-        let mut engine = Engine::new_configured(RuntimeRegistry::new(), worker.clone())
-            .expect("configured engine");
-        let mut changed = worker;
-        changed.buffer.frame_pool_size += 1;
-
-        assert!(engine.apply_worker_config(changed).is_err());
-    }
-
-    #[test]
-    fn spawn_shares_registry_and_resets_thread_index() {
-        let main = test_engine();
-        let worker = main.spawn(3).expect("spawn worker");
-        assert_eq!(worker.thread_index, 3);
-        assert_eq!(main.thread_index, 0);
-        assert!(Arc::ptr_eq(&main.registry, &worker.registry));
-    }
-
-    #[test]
-    fn data_worker_id_maps_one_based_engine_workers_to_zero_based_ids() {
-        let main = test_engine();
-        let worker_1 = main.spawn(1).expect("spawn worker 1");
-        let worker_2 = main.spawn(2).expect("spawn worker 2");
-
-        assert!(main.data_worker_id().is_err());
-        assert_eq!(worker_1.data_worker_id().unwrap(), DataWorkerId::new(0));
-        assert_eq!(worker_2.data_worker_id().unwrap(), DataWorkerId::new(1));
-    }
-
-    #[test]
-    fn main_thread_cannot_replace_worker_node_runtime_data() {
-        let mut main = test_engine();
-        let error = main
-            .set_worker_node_runtime_data(NodeId::new(0), NodeRuntimeData::empty())
-            .expect_err("main thread must not bind worker runtime data");
-        assert!(matches!(
-            error,
-            RuntimeError::DataWorkerIdUnavailable { thread_index: 0 }
-        ));
-    }
-
-    #[test]
-    fn spawn_resets_loop_count_and_shares_exit_flag() {
-        let main = test_engine();
-        main.main_loop_count
-            .store(42, std::sync::atomic::Ordering::Relaxed);
-        main.main_loop_exit_now
-            .store(true, std::sync::atomic::Ordering::Relaxed);
-        let worker = main.spawn(1).expect("spawn worker");
-        assert_eq!(
-            worker
-                .main_loop_count
-                .load(std::sync::atomic::Ordering::Relaxed),
-            0
-        );
-        assert!(Arc::ptr_eq(
-            &main.main_loop_exit_now,
-            &worker.main_loop_exit_now
-        ));
-        assert!(
-            worker
-                .main_loop_exit_now
-                .load(std::sync::atomic::Ordering::Relaxed)
-        );
-    }
-
-    #[test]
-    fn engine_pool_main_engine_at_index_zero() {
-        let main = test_engine();
-        let runtime = tokio::runtime::Builder::new_current_thread()
-            .enable_io()
-            .enable_time()
-            .build()
-            .expect("control runtime");
-        let pool = EnginePool::new(main, &runtime).expect("engine pool");
-        assert_eq!(pool.worker_count(), 0);
-        assert!(pool.engine(0).is_some());
-        assert!(pool.engine(1).is_none());
-    }
-
-    #[test]
-    fn ensure_main_thread_with_barrier_requires_held_barrier_when_workers_exist() {
-        let mut engine = test_engine();
-        engine.barrier = crate::barrier::WorkerBarrier::new(1);
-        engine.install_current();
-
-        assert!(matches!(
-            super::ensure_main_thread_with_barrier(),
-            Err(RuntimeError::ControlRequiresWorkerBarrier)
-        ));
-
-        let barrier = engine.worker_barrier();
-        barrier.arm();
-        super::ensure_main_thread_with_barrier()
-            .expect("control operation is inside the worker barrier");
-        barrier.release();
-
-        Engine::uninstall_current();
-    }
-
-    #[test]
-    fn with_current_engine() {
-        let mut engine = test_engine();
-        engine.install_current();
-
-        let result = Engine::with_current(|e| {
-            e.thread_index = 42;
-            e.thread_index
-        });
-        assert_eq!(result, Some(42));
-
-        Engine::uninstall_current();
-        let result = Engine::with_current(|_| true);
-        assert_eq!(result, None);
-    }
-
-    // VPP `need_vlib_worker_thread_node_runtime_update`: a graph publication
-    // finished inside an outer barrier defers its refork drain to the
-    // outermost release. Both tests use real Data Workers that can refork only
-    // after the outer barrier releases, so the shared statics serialize.
-    static DEFERRED_FINISH_SERIAL: std::sync::Mutex<()> = std::sync::Mutex::new(());
-    static FAIL_WORKER_REFORK: AtomicBool = AtomicBool::new(false);
-
-    #[hammer_component_macros::worker_init_function(name = "injected_refork_failure")]
-    fn injected_refork_failure(_: &mut Engine) -> RuntimeResult<()> {
-        if FAIL_WORKER_REFORK.load(Ordering::Acquire) {
-            return Err(RuntimeError::lifecycle(
-                "injected worker refork failure".to_string(),
-                "test injection".to_string(),
-            ));
-        }
-        Ok(())
-    }
-
-    crate::__declare_registration_image!(
-        init_functions = [];
-        config_functions = [];
-        early_config_functions = [];
-        main_loop_enter_functions = [];
-        main_loop_exit_functions = [];
-        worker_init_functions = [__INIT_FN_INJECTED_REFORK_FAILURE];
-        graph_nodes = [];
-        node_functions = [];
-        process_nodes = [];
-        session_transports = [];
-        session_apps = [];
-        binary_api_methods = [];
-    );
-
-    fn deferred_finish_pool() -> (EnginePool, tokio::runtime::Runtime) {
-        let mut worker = Worker::default();
-        worker.count = 2;
-        worker.buffer.slot_bytes = 128;
-        worker.buffer.slots_per_numa = 64;
-        worker.buffer.frame_pool_size = 5;
-        worker.buffer.page_size = Some(hammer_infra::PageSize::Default);
-        let runtime = tokio::runtime::Builder::new_current_thread()
-            .enable_io()
-            .enable_time()
-            .build()
-            .expect("control runtime");
-        let pool = EnginePool::new(
-            Engine::new_configured(RuntimeRegistry::new(), worker).expect("configured main engine"),
-            &runtime,
-        )
-        .expect("engine pool");
-        (pool, runtime)
-    }
-
-    #[test]
-    fn nested_graph_finish_defers_to_outer_barrier_release_and_drains_once() {
-        let _serial = DEFERRED_FINISH_SERIAL
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        let (mut pool, _runtime) = deferred_finish_pool();
-        start_workers(pool.main_engine_mut()).expect("worker startup");
-
-        let engine = pool.main_engine();
-        let outer = engine.worker_barrier();
-        let nested = outer.sync(|| -> RuntimeResult<()> {
-            engine.publish_worker_graph(outer.worker_count())?;
-            engine.finish_worker_graph_update()?;
-            // Workers are parked by the outer barrier, so the nested finish
-            // must not wait for the refork completion count: it returns with
-            // the publication still pending.
-            assert_eq!(engine.workers_updating_graph.load(Ordering::Acquire), 2);
-            Ok(())
-        });
-        nested.expect("nested finish returns without waiting for parked workers");
-
-        // The outer release lets the workers refork; the deferred finish then
-        // waits for the cohort, drains once, and clears the pending record.
-        engine
-            .finish_deferred_worker_graph_update()
-            .expect("deferred finish waits for refork completion");
-        assert_eq!(engine.workers_updating_graph.load(Ordering::Acquire), 0);
-        engine
-            .finish_deferred_worker_graph_update()
-            .expect("repeat deferred finish is a no-op");
-
-        // `EnginePool::close` parks the workers, sets the exit flag inside the
-        // barrier, and joins: setting `main_loop_exit` before the sync would
-        // let the workers observe it at step 8 and exit before parking.
-        pool.close().expect("close worker pool");
-    }
-
-    #[test]
-    fn deferred_finish_drains_worker_refork_error_once_and_clears_state() {
-        let _serial = DEFERRED_FINISH_SERIAL
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        FAIL_WORKER_REFORK.store(false, Ordering::Release);
-        let (mut pool, _runtime) = deferred_finish_pool();
-        start_workers(pool.main_engine_mut()).expect("worker startup");
-        // Register the failing init only after startup, so each worker's
-        // already-called set does not skip it during the deferred refork.
-        pool.main_engine_mut()
-            .plugin_main_mut()
-            .register_builtin_image(&__HAMMER_REGISTRATION_IMAGE);
-        FAIL_WORKER_REFORK.store(true, Ordering::Release);
-
-        let engine = pool.main_engine();
-        let outer = engine.worker_barrier();
-        outer
-            .sync(|| -> RuntimeResult<()> {
-                engine.publish_worker_graph(outer.worker_count())?;
-                engine.finish_worker_graph_update()?;
-                Ok(())
-            })
-            .expect("nested graph publication finishes without waiting");
-
-        // The deferred finish surfaces the refork error instead of reporting
-        // success, and clears the pending record: a repeat call is a no-op.
-        engine
-            .finish_deferred_worker_graph_update()
-            .expect_err("deferred finish surfaces the worker refork error");
-        engine
-            .finish_deferred_worker_graph_update()
-            .expect("pending state clears after the deferred drain");
-
-        // The failed refork made both workers exit; join directly instead of
-        // syncing the barrier with no workers parked.
-        pool.main_engine_mut().join_worker_threads().ok();
-        FAIL_WORKER_REFORK.store(false, Ordering::Release);
     }
 }

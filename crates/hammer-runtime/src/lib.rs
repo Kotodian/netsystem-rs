@@ -29,8 +29,6 @@ crate::__declare_registration_image!(
     graph_nodes = [];
     node_functions = [];
     process_nodes = [engine::__PROCESS_NODE_STATSEG_COLLECTOR_PROCESS];
-    session_transports = [];
-    session_apps = [];
     binary_api_methods = [];
     stats_registrations = [engine::__STATS_REGISTRATION_Sys];
 );
@@ -41,7 +39,7 @@ pub(crate) fn builtin_registration_image() -> &'static registration::Registratio
 
 pub mod engine;
 pub mod error;
-pub use engine::{Engine, EnginePool, ensure_main_thread_with_barrier};
+pub use engine::{Engine, EnginePool, ensure_main_thread, ensure_main_thread_with_barrier};
 pub mod config;
 pub mod file;
 pub use file::{
@@ -97,10 +95,7 @@ pub use process::{
     ProcessContext, ProcessEntry, ProcessEventBatch, ProcessFuture, ProcessHandle, ProcessWake,
 };
 pub use registry::RuntimeRegistry;
-pub use session::{
-    SessionConnectEndpoint, SessionListenEndpoint, SessionTransportRegistration,
-    SessionTransportStartListen, SessionTransportStopListen,
-};
+pub use session::{SessionConnectEndpoint, SessionListenEndpoint};
 pub use trace::{
     PacketTrace, TraceControlHandle, TraceControlPlane, TraceEntry, TraceFormatter,
     TraceInputPolicy, TracePolicy, TraceRecord, TraceRecordSink,

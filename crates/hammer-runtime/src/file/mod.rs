@@ -221,6 +221,7 @@ impl FileMain {
         })
     }
 
+    #[allow(clippy::mut_from_ref)]
     fn poller_mut(&self, thread_index: u32) -> RuntimeResult<&mut Poller> {
         let poller =
             self.pollers
