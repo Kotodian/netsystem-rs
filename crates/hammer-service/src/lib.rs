@@ -7,7 +7,7 @@ hammer_runtime::__declare_registration_image!(
         device::__INIT_FN_DEVICE_INIT,
         session::__INIT_FN_SESSION_INIT,
         session::__INIT_FN_SESSION_ATTACH_SERVER,
-        transport::__INIT_FN_TRANSPORT_INIT,
+        transport::__INIT_FN_TRANSPORT_MAIN_INIT,
     ];
     config_functions = [];
     early_config_functions = [
@@ -31,8 +31,6 @@ hammer_runtime::__declare_registration_image!(
     process_nodes = [
         binary_api::__PROCESS_NODE_BINARY_API,
     ];
-    session_transports = [];
-    session_apps = [];
     binary_api_methods = [];
 );
 
@@ -57,14 +55,3 @@ pub mod session;
 pub mod transport;
 
 pub use hammer_runtime::{AttachError, RuntimeError, RuntimeResult};
-
-#[cfg(test)]
-pub fn reset_subsystem_mains_for_test() {
-    reset_subsystem_mains_for_plugin_test();
-}
-
-/// Test helper for plugin crates that cannot see `#[cfg(test)]` items on this crate.
-pub fn reset_subsystem_mains_for_plugin_test() {
-    crate::net::pmtu::reset_path_mtu_cache_for_test();
-    crate::interface::reset_interface_main_for_test();
-}

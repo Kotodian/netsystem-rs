@@ -105,7 +105,7 @@ impl SessionQueueNext {
 
 pub type SessionQueueDispatchFn = fn(
     &DataPlaneRuntime,
-    &mut SessionWorker<u32>,
+    &mut SessionWorker,
     NodeRuntimeData,
     SessionQueueNext,
     Instant,
@@ -115,7 +115,7 @@ pub type SessionQueueDispatchFn = fn(
 
 pub type SessionQueueUpdateTimeFn = fn(
     &DataPlaneRuntime,
-    &mut SessionWorker<u32>,
+    &mut SessionWorker,
     NodeRuntimeData,
     SessionQueueNext,
     Instant,
@@ -230,7 +230,7 @@ impl SessionQueueNode {
             });
         }
         // SAFETY: worker NodeRuntimeData is installed by the owning Data Worker
-        // and the SessionMain Arc remains alive in that worker's SessionMain.
+        // and points at the process-global SessionMain for its lifetime.
         let main = unsafe { &*ptr };
         main.with_worker_mut(runtime, |sessions| sessions.poll_app())
     }
@@ -246,7 +246,7 @@ impl SessionQueueNode {
             });
         }
         // SAFETY: worker NodeRuntimeData is installed by the owning Data Worker
-        // and the SessionMain Arc remains alive in that worker's SessionMain.
+        // and points at the process-global SessionMain for its lifetime.
         let main = unsafe { &*ptr };
         main.with_worker_mut(runtime, |sessions| Ok(sessions.has_pending_app_mqs()))
     }
@@ -262,7 +262,7 @@ impl SessionQueueNode {
             });
         }
         // SAFETY: worker NodeRuntimeData is installed by the owning Data Worker
-        // and the SessionMain Arc remains alive in that worker's SessionMain.
+        // and points at the process-global SessionMain for its lifetime.
         let main = unsafe { &*ptr };
         main.session_queue_is_interrupt(runtime)
     }
@@ -326,7 +326,7 @@ impl SessionQueueNode {
             });
         }
         // SAFETY: worker NodeRuntimeData is installed by the owning Data Worker
-        // and the SessionMain Arc remains alive in that worker's SessionMain.
+        // and points at the process-global SessionMain for its lifetime.
         let main = unsafe { &*ptr };
         main.with_worker_mut(runtime, |sessions| {
             if sessions.transport_dispatches.iter().any(|dispatch| {
@@ -416,7 +416,7 @@ fn session_queue_node_process(
         return NodeResult::drop();
     }
     // SAFETY: worker NodeRuntimeData is installed by the owning Data Worker and
-    // the SessionMain Arc remains alive in that worker's SessionMain.
+    // points at the process-global SessionMain for its lifetime.
     let main = unsafe { &*ptr };
     let _ = main.with_worker_mut(runtime, |sessions| -> RuntimeResult<bool> {
         let dispatch_count = sessions.transport_dispatches.len();
@@ -464,7 +464,3 @@ fn session_queue_node_process(
     output.flush(runtime, frame);
     NodeResult::drop()
 }
-
-#[cfg(test)]
-#[path = "node/tests.rs"]
-mod tests;

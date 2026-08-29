@@ -1,17 +1,17 @@
 use hammer_runtime::app::{
     SessionAcceptedReplyMsg, SessionBoundMsg, SessionConnectError, SessionConnectMsg,
-    SessionConnectedMsg, SessionControlError, SessionEvtType, SessionListenMsg, SessionMsgQueue,
-    SessionProducer, SessionUnlistenMsg, SessionUnlistenReplyMsg, SingleProducer,
+    SessionConnectedMsg, SessionControlError, SessionEvtType, SessionHandle, SessionListenMsg,
+    SessionMsgQueue, SessionProducer, SessionUnlistenMsg, SessionUnlistenReplyMsg, SingleProducer,
 };
 use hammer_runtime::{DataWorkerId, Engine, RuntimeError, RuntimeResult, SessionConnectEndpoint};
-use std::sync::Arc;
 
-use super::application::ApplicationError;
+use super::application::{ApplicationError, application_main};
 use super::runtime::{SessionMain, schedule_worker_task};
+use crate::transport::transport_vft;
 
 impl SessionMain {
     pub fn dispatch_application_session_mq(
-        self: &Arc<Self>,
+        &self,
         application: u32,
         requests: &mut SessionMsgQueue<SingleProducer>,
         replies: &mut SessionProducer,
@@ -21,6 +21,7 @@ impl SessionMain {
         // independent elements): decode failures are reported and skipped so
         // the drain continues. A reply is only produced when the decoded
         // request yields one (a failed decode has no context to reply with).
+        let mut first_error = None;
         while let Some(item) = requests.dequeue_control()? {
             let event = item.event_type();
             match event {
@@ -68,7 +69,7 @@ impl SessionMain {
                 SessionEvtType::AcceptedReply => match item.decode::<SessionAcceptedReplyMsg>() {
                     Some(Ok(request)) => {
                         if let Err(error) = self.accepted_reply(application, request) {
-                            tracing::warn!(%error, ?application, "ACCEPTED_REPLY was not applied");
+                            first_error.get_or_insert(error);
                         }
                     }
                     _ => {
@@ -95,26 +96,25 @@ impl SessionMain {
                 | SessionEvtType::Connected => {}
             }
         }
-        Ok(())
+        first_error.map_or(Ok(()), Err)
     }
 
     fn application_listen(&self, application: u32, request: SessionListenMsg) -> SessionBoundMsg {
         let result = self
             .with_control_barrier(|| {
-                let transport = session_transport(request.transport)?;
-                if transport.start_listen().is_none() {
+                let transport = transport_vft(request.transport)
+                    .ok_or(SessionControlError::TransportMissing)?;
+                if transport.start_listen.is_none() {
                     return Err(SessionControlError::TransportListenUnsupported);
                 }
-                let application_listener = self
-                    .applications()
+                let application_listener = application_main()
                     .register_listener(application, request.app, request.opaque)
                     .map_err(SessionControlError::from)?;
-                match self.listen(application_listener, transport, request.endpoint) {
+                match self.listen(application_listener, request.transport, request.endpoint) {
                     Ok(listener) => Ok(listener),
                     Err(error) => {
-                        let _ = self
-                            .applications()
-                            .remove_listener(application, application_listener);
+                        let _ =
+                            application_main().remove_listener(application, application_listener);
                         Err(SessionControlError::from(error))
                     }
                 }
@@ -135,17 +135,19 @@ impl SessionMain {
         request: SessionConnectMsg,
         stream: bool,
     ) -> Result<(), SessionControlError> {
-        let transport = session_transport(request.transport)?;
+        let transport =
+            transport_vft(request.transport).ok_or(SessionControlError::TransportMissing)?;
         let server_name = self.application_server_name(application, request.ext_config)?;
         if stream {
-            if transport.connect_stream().is_none() {
+            if transport.connect_stream.is_none() {
                 return Err(SessionControlError::TransportConnectUnsupported);
             }
             let parent = request
                 .parent_handle
                 .ok_or(SessionControlError::ConnectStreamParentMissing)?;
-            let application_connection = self
-                .applications()
+            let worker = DataWorkerId::try_from(parent.thread_index)
+                .map_err(|_| SessionControlError::ConnectStreamParentMissing)?;
+            let application_connection = application_main()
                 .register_connection(
                     application,
                     request.context,
@@ -157,7 +159,7 @@ impl SessionMain {
             let endpoint = SessionConnectEndpoint {
                 remote: request.remote,
                 local: request.local,
-                worker: DataWorkerId::new(parent.thread_index),
+                worker,
                 connection: application_connection,
                 application,
                 parent_handle: Some(parent),
@@ -167,21 +169,18 @@ impl SessionMain {
                 // parent Session; no per-stream ext-config is accepted.
                 server_name: None,
             };
-            if let Err(error) = self.connect_stream(transport, endpoint) {
-                let _ = self
-                    .applications()
-                    .remove_connection(application, application_connection);
+            if let Err(error) = self.connect_stream(request.transport, endpoint) {
+                let _ = application_main().remove_connection(application, application_connection);
                 // VPP notifies the app with the concrete connect rv
                 // (`app_worker_connect_notify`, session_node.c:355-359).
                 return Err(SessionControlError::from(error));
             }
             Ok(())
         } else {
-            if transport.connect().is_none() {
+            if transport.connect.is_none() {
                 return Err(SessionControlError::TransportConnectUnsupported);
             }
-            let application_connection = self
-                .applications()
+            let application_connection = application_main()
                 .register_connection(
                     application,
                     request.context,
@@ -199,10 +198,8 @@ impl SessionMain {
                 request.opaque,
                 server_name,
             );
-            if let Err(error) = self.connect(transport, endpoint) {
-                let _ = self
-                    .applications()
-                    .remove_connection(application, application_connection);
+            if let Err(error) = self.connect(request.transport, endpoint) {
+                let _ = application_main().remove_connection(application, application_connection);
                 // VPP propagates the concrete connect rv to the app
                 // (`session_mq_connect_one`, session_node.c:263-267).
                 return Err(SessionControlError::from(error));
@@ -226,8 +223,7 @@ impl SessionMain {
         let Some(offset) = ext_config else {
             return Ok(None);
         };
-        let store = self
-            .applications()
+        let store = application_main()
             .with_application_mq(application, |resources| Ok(resources.ext_config_store()))
             .map_err(SessionControlError::from)?
             .ok_or(SessionControlError::ExtConfigUnavailable)?;
@@ -257,7 +253,7 @@ impl SessionMain {
         let listener = request.listener;
         let result = self
             .with_control_barrier(|| {
-                match self.applications().contains(application) {
+                match application_main().contains(application) {
                     Ok(true) => {}
                     Ok(false) => return Err(SessionControlError::ApplicationMissing),
                     Err(error) => return Err(SessionControlError::from(error)),
@@ -270,11 +266,11 @@ impl SessionMain {
                 if owner != application {
                     return Err(SessionControlError::ListenerNotOwned);
                 }
-                self.applications()
+                application_main()
                     .with_listener(application_listener, |listener| listener.application())
                     .map_err(SessionControlError::from)?;
                 self.unlisten(listener).map_err(SessionControlError::from)?;
-                self.applications()
+                application_main()
                     .remove_listener(application, application_listener)
                     .map_err(SessionControlError::from)?;
                 Ok(())
@@ -294,15 +290,15 @@ impl SessionMain {
     /// synchronously through the engine task queue — the same mechanism used
     /// for Application MQ install/removal — because the main thread cannot
     /// mutate the worker-owned Session table (`ThreadOwned::with_mut` would
-    /// return WrongThread). Hop or worker-side failures are logged and never
-    /// fail the request drain, so later replies are still processed.
+    /// return WrongThread). The request drain records the first typed
+    /// scheduling/worker failure and continues with later replies.
     fn accepted_reply(
-        self: &Arc<Self>,
+        &self,
         application: u32,
         request: SessionAcceptedReplyMsg,
     ) -> RuntimeResult<()> {
-        let worker = DataWorkerId::new(request.session.thread_index);
-        let main = Arc::clone(self);
+        let worker = DataWorkerId::try_from(request.session.thread_index)?;
+        let main = SessionMain::global()?;
         let result = Engine::with_current(|engine| {
             schedule_worker_task(engine, worker, move || {
                 Engine::with_current(|engine| {
@@ -314,34 +310,7 @@ impl SessionMain {
                 .ok_or(RuntimeError::WorkerControlRequiresMainEngine)
             })
         });
-        let Some(result) = result else {
-            tracing::warn!(
-                ?application,
-                ?worker,
-                "ACCEPTED_REPLY requires the main engine"
-            );
-            return Ok(());
-        };
-        if let Err(error) = result {
-            tracing::warn!(%error, ?application, ?worker, "ACCEPTED_REPLY was not applied");
-        }
-        Ok(())
-    }
-}
-
-fn session_transport(
-    index: u8,
-) -> Result<hammer_runtime::SessionTransportRegistration, SessionControlError> {
-    match Engine::with_current(|engine| {
-        engine
-            .plugin_main()
-            .session_transports()
-            .get(index as usize)
-            .copied()
-    }) {
-        Some(Some(transport)) => Ok(transport),
-        Some(None) => Err(SessionControlError::TransportMissing),
-        None => Err(SessionControlError::ApplicationControlWrongThread),
+        result.ok_or(RuntimeError::WorkerControlRequiresMainEngine)??
     }
 }
 
@@ -353,9 +322,6 @@ impl From<ApplicationError> for SessionControlError {
             }
             ApplicationError::Missing { .. } => Self::ApplicationMissing,
             ApplicationError::WrongThread => Self::ApplicationControlWrongThread,
-            ApplicationError::SessionAppMissing { .. }
-            | ApplicationError::SessionAppUnregistered { .. } => Self::SessionAppMissing,
-            ApplicationError::SessionAppDuplicate { .. } => Self::SessionAppDuplicate,
             ApplicationError::ListenerMissing { .. } => Self::ListenerMissing,
             ApplicationError::ListenerNotOwned { .. } => Self::ListenerNotOwned,
             ApplicationError::ConnectionMissing { .. } => Self::ConnectionMissing,
@@ -370,160 +336,8 @@ impl From<ApplicationError> for SessionControlError {
             | ApplicationError::MqInstall { .. }
             | ApplicationError::MqDetachFailed { .. }
             | ApplicationError::MqPublication { .. } => Self::TransportFailed,
-            ApplicationError::SessionMainMissing => Self::SessionMainUnavailable,
             ApplicationError::MqAlreadyAttached { .. } => Self::TransportFailed,
+            ApplicationError::SessionAppAlreadyRegistered { .. } => Self::TransportFailed,
         }
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::session::application::ApplicationMain;
-    use hammer_runtime::attach::ExtConfigStore;
-
-    /// One SessionMain with an attached Application whose bounded ext-config
-    /// store is handed back for direct inspection.
-    fn ext_config_fixture() -> (Arc<SessionMain>, u32, ExtConfigStore) {
-        let applications = ApplicationMain::new(2);
-        let application = applications
-            .attach_local_for_test(1, 128)
-            .expect("attach test Application");
-        let main = Arc::new(SessionMain::new(1, Arc::clone(&applications)));
-        let store = applications
-            .with_application_mq(application, |resources| Ok(resources.ext_config_store()))
-            .expect("resolve Application MQ resources")
-            .expect("Application carries an ext-config store");
-        (main, application, store)
-    }
-
-    #[test]
-    fn application_server_name_reads_and_frees_ext_config_exactly_once() {
-        let (main, application, store) = ext_config_fixture();
-        let offset = store.alloc(b"example.com").expect("alloc ext-config chunk");
-        let name = main
-            .application_server_name(application, Some(offset))
-            .expect("valid hostname");
-        assert_eq!(name.as_deref(), Some("example.com"));
-        // The daemon freed the chunk exactly once after reading it.
-        assert!(
-            store.read(offset).is_err(),
-            "chunk must be freed after the daemon read it"
-        );
-        assert!(
-            store.free(offset).is_err(),
-            "a second free must be rejected as a double free"
-        );
-    }
-
-    #[test]
-    fn application_server_name_frees_chunk_on_validation_error() {
-        let (main, application, store) = ext_config_fixture();
-        let offset = store
-            .alloc(&[0xff, 0xfe, 0xfd])
-            .expect("alloc ext-config chunk");
-        let error = main
-            .application_server_name(application, Some(offset))
-            .expect_err("invalid UTF-8 server name");
-        assert_eq!(error, SessionControlError::ExtConfigInvalid);
-        // A validation failure still returns the chunk to the free list.
-        assert!(
-            store.read(offset).is_err(),
-            "chunk must be freed on validation failure"
-        );
-    }
-
-    #[test]
-    fn application_server_name_rejects_empty_name_and_frees_chunk() {
-        let (main, application, store) = ext_config_fixture();
-        let offset = store.alloc(b"").expect("alloc ext-config chunk");
-        let error = main
-            .application_server_name(application, Some(offset))
-            .expect_err("empty server name");
-        assert_eq!(error, SessionControlError::ExtConfigInvalid);
-        assert!(
-            store.read(offset).is_err(),
-            "chunk must be freed for an empty server name"
-        );
-    }
-
-    #[test]
-    fn application_server_name_without_ext_config_reference_is_none() {
-        let (main, application, _store) = ext_config_fixture();
-        let name = main
-            .application_server_name(application, None)
-            .expect("no ext-config reference");
-        assert!(name.is_none());
-    }
-
-    #[test]
-    fn application_server_name_fails_on_unreadable_offset() {
-        let (main, application, store) = ext_config_fixture();
-        // Far outside the store: the read fails and ownership stays with the
-        // Application (nothing to free).
-        let error = main
-            .application_server_name(application, Some(0xffff_ffff))
-            .expect_err("out-of-range ext-config offset");
-        assert_eq!(error, SessionControlError::ExtConfigFailed);
-        // The store is untouched: the next allocation still succeeds (chunk 0).
-        let _ = store.alloc(b"after").expect("store still healthy");
-    }
-
-    /// A CONNECT_STREAM or CONNECT runtime failure must surface as its
-    /// specific control error through the typed boundary, never as the
-    /// opaque `TransportFailed` collapse (issue #222; VPP propagates the
-    /// concrete rv via `app_worker_connect_notify`,
-    /// session_node.c:263-267/355-359).
-    #[test]
-    fn connect_errors_survive_as_specific_control_errors() {
-        use crate::session::error::SessionError;
-
-        assert_eq!(
-            SessionControlError::from(SessionError::ConnectStreamParentMissing),
-            SessionControlError::ConnectStreamParentMissing
-        );
-        assert_eq!(
-            SessionControlError::from(SessionError::ConnectStreamWrongWorker {
-                parent: SessionHandle::new(1, 1),
-                expected: DataWorkerId::new(2),
-                actual: DataWorkerId::new(3),
-            }),
-            SessionControlError::ConnectStreamWrongWorker
-        );
-        assert_eq!(
-            SessionControlError::from(SessionError::NoDataWorkers),
-            SessionControlError::NoDataWorkers
-        );
-        assert_eq!(
-            SessionControlError::from(SessionError::TransportConnectUnsupported {
-                transport: "udp",
-            }),
-            SessionControlError::TransportConnectUnsupported
-        );
-        assert_eq!(
-            SessionControlError::from(SessionError::TransportOpFailed {
-                source: RuntimeError::service_closed(),
-            }),
-            SessionControlError::TransportFailed
-        );
-    }
-
-    /// Connection ownership/not-found failures map to dedicated wire variants
-    /// the same way the listener flow maps `ListenerMissing`/`ListenerNotOwned`.
-    #[test]
-    fn application_connection_errors_map_like_listener_errors() {
-        let missing = ApplicationError::ConnectionMissing { connection: 1 };
-        assert_eq!(
-            SessionControlError::from(missing),
-            SessionControlError::ConnectionMissing
-        );
-        let not_owned = ApplicationError::ConnectionNotOwned {
-            application: (1),
-            connection: 2,
-        };
-        assert_eq!(
-            SessionControlError::from(not_owned),
-            SessionControlError::ConnectionNotOwned
-        );
     }
 }

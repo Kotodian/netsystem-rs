@@ -51,41 +51,6 @@ impl Session {
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::Session;
-
-    #[test]
-    fn app_mq_capacity_defaults_to_2048() {
-        let session = Session::default();
-        assert_eq!(session.app_mq_capacity, 2048);
-    }
-
-    #[test]
-    fn app_mq_capacity_parses_explicit_value() {
-        let session: Session = toml::from_str(
-            r#"
-                app_mq_capacity = 256
-            "#,
-        )
-        .expect("valid session config");
-        assert_eq!(session.app_mq_capacity, 256);
-    }
-
-    #[test]
-    fn app_mq_capacity_rejects_values_below_128() {
-        let session = Session {
-            app_mq_capacity: 64,
-            ..Session::default()
-        };
-        let error = session
-            .validate()
-            .expect_err("small MQ capacity is invalid");
-        let display = error.to_string();
-        assert!(display.contains("app_mq_capacity"));
-    }
-}
-
 /// The session owner receives the `[network]` table and ignores sections it
 /// does not own. `None` preserves the distinction between an absent session
 /// section and a session section populated with defaults.

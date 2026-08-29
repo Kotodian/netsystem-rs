@@ -35,14 +35,16 @@ impl BihashKey for SessionEndpointKey {
 }
 
 pub(crate) struct SessionEndpointLookup {
-    connections: Bihash<SessionEndpointKey, 8>,
+    session_indices: Bihash<SessionEndpointKey, 8>,
+    thread_indices: Bihash<SessionEndpointKey, 8>,
 }
 
 impl SessionEndpointLookup {
     #[inline]
     pub(crate) fn new() -> Self {
         Self {
-            connections: Bihash::new(SESSION_ENDPOINT_CAPACITY),
+            session_indices: Bihash::new(SESSION_ENDPOINT_CAPACITY),
+            thread_indices: Bihash::new(SESSION_ENDPOINT_CAPACITY),
         }
     }
 
@@ -57,9 +59,22 @@ impl SessionEndpointLookup {
         let Some(key) = SessionEndpointKey::new(local, remote, transport) else {
             return false;
         };
-        self.connections
-            .insert_if_absent(key, session.into())
-            .is_ok()
+        if self
+            .session_indices
+            .insert_if_absent(key, session.session_index.into())
+            .is_err()
+        {
+            return false;
+        }
+        if self
+            .thread_indices
+            .insert_if_absent(key, session.thread_index.into())
+            .is_err()
+        {
+            self.session_indices.remove(&key);
+            return false;
+        }
+        true
     }
 
     #[inline]
@@ -72,7 +87,10 @@ impl SessionEndpointLookup {
         let Some(key) = SessionEndpointKey::new(local, remote, transport) else {
             return false;
         };
-        self.connections.remove(&key)
+        let removed = self.session_indices.remove(&key);
+        let thread_removed = self.thread_indices.remove(&key);
+        debug_assert_eq!(removed, thread_removed);
+        removed
     }
 
     #[inline]
@@ -83,7 +101,12 @@ impl SessionEndpointLookup {
         transport: u8,
     ) -> Option<SessionHandle> {
         let key = SessionEndpointKey::new(local, remote, transport)?;
-        self.connections.lookup(&key).map(SessionHandle::from)
+        let session_index = self.session_indices.lookup(&key)?;
+        let thread_index = self.thread_indices.lookup(&key)?;
+        Some(SessionHandle::new(
+            u32::try_from(session_index).expect("Session index fits u32"),
+            u32::try_from(thread_index).expect("Session thread index fits u32"),
+        ))
     }
 }
 

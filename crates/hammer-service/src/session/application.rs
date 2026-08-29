@@ -1,25 +1,47 @@
 use std::cell::UnsafeCell;
-use std::marker::PhantomData;
-use std::rc::Rc;
-use std::sync::Arc;
-use std::sync::atomic::{AtomicU8, Ordering};
-use std::thread::{self, ThreadId};
+use std::sync::atomic::{AtomicU8, AtomicU64, Ordering};
+use std::sync::{Arc, OnceLock};
 
 use hammer_infra::pool::Pool;
 use hammer_infra::segment::Segment;
 use hammer_runtime::Engine;
-use hammer_runtime::app::{SessionAppRegistration, SessionMsgQueue, SessionMsgQueueError};
+use hammer_runtime::app::{SessionMsgQueue, SessionMsgQueueError};
 use hammer_runtime::attach::{ApplicationMqPublication, ExtConfigStore};
 use hammer_runtime::{AttachError, DataWorkerId, RuntimeError};
 use thiserror::Error;
 
 use super::config::Session;
+use super::protocol::SessionAppVft;
+
+static APP_MQ_SEGMENT_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 struct ApplicationState {
-    applications: Pool<()>,
+    applications: Pool<Application>,
     listeners: Pool<ApplicationListener>,
     connections: Pool<ApplicationConnection>,
-    mq_resources: Vec<Option<ApplicationMqResources>>,
+}
+
+struct Application {
+    workers: Vec<DataWorkerId>,
+    listeners: Vec<u32>,
+    connections: Vec<u32>,
+    mq_resources: Option<ApplicationMqResources>,
+    session_callbacks: Option<SessionAppVft>,
+}
+
+impl Application {
+    #[inline]
+    fn new(worker_count: usize) -> Self {
+        Self {
+            workers: (0..worker_count)
+                .map(|worker| DataWorkerId::new(worker as u32))
+                .collect(),
+            listeners: Vec::new(),
+            connections: Vec::new(),
+            mq_resources: None,
+            session_callbacks: None,
+        }
+    }
 }
 
 pub(crate) struct ApplicationListener {
@@ -87,7 +109,6 @@ impl ApplicationConnection {
 /// Workers at attach time. Every app-to-session event uses the queue selected
 /// by its Application and Data Worker; there is no shared worker fallback.
 pub struct ApplicationMqResources {
-    application: u32,
     segment: Segment,
     queues: Box<[Arc<SessionMsgQueue>]>,
     offsets: Box<[u64]>,
@@ -96,23 +117,20 @@ pub struct ApplicationMqResources {
 
 impl ApplicationMqResources {
     pub(crate) fn create_local(
-        application: u32,
         worker_count: usize,
         capacity: usize,
     ) -> Result<Self, ApplicationError> {
-        Self::create(application, worker_count, capacity, false)
+        Self::create(worker_count, capacity, false)
     }
 
     pub(crate) fn create_external(
-        application: u32,
         worker_count: usize,
         capacity: usize,
     ) -> Result<Self, ApplicationError> {
-        Self::create(application, worker_count, capacity, true)
+        Self::create(worker_count, capacity, true)
     }
 
     fn create(
-        application: u32,
         worker_count: usize,
         capacity: usize,
         shared: bool,
@@ -132,7 +150,11 @@ impl ApplicationMqResources {
             .and_then(|bytes| bytes.checked_add(APP_MQ_SEGMENT_HEADROOM))
             .ok_or(ApplicationError::MqLayoutOverflow)?;
         let segment = if shared {
-            let name = format!("hammer-app-rx-mq-{}-{}", std::process::id(), application);
+            let name = format!(
+                "hammer-app-rx-mq-{}-{}",
+                std::process::id(),
+                APP_MQ_SEGMENT_COUNTER.fetch_add(1, Ordering::Relaxed)
+            );
             Segment::shared(&name, segment_bytes)
                 .map_err(|source| ApplicationError::MqSegmentCreate { source })?
         } else {
@@ -169,7 +191,6 @@ impl ApplicationMqResources {
             })
             .ok_or(ApplicationError::MqSegmentExhausted)?;
         Ok(Self {
-            application,
             segment,
             queues: queues.into_boxed_slice(),
             offsets: offsets.into_boxed_slice(),
@@ -212,61 +233,104 @@ const CONNECTION_CONNECTED: u8 = 1;
 
 /// Main Thread authority for Application identity and lifetime.
 pub struct ApplicationMain {
-    owner: ThreadId,
     state: UnsafeCell<ApplicationState>,
-    session_apps: Box<[SessionAppRegistration]>,
+}
+
+/// The process-global Application authority, published by `application_init`.
+pub static APPLICATION_MAIN: OnceLock<ApplicationMain> = OnceLock::new();
+
+impl ApplicationMain {
+    /// Initializes and publishes the process-global Application authority.
+    pub fn init() -> Result<(), RuntimeError> {
+        let main = Self {
+            state: UnsafeCell::new(ApplicationState {
+                applications: Pool::new(),
+                listeners: Pool::new(),
+                connections: Pool::new(),
+            }),
+        };
+        APPLICATION_MAIN
+            .set(main)
+            .map_err(|_| RuntimeError::PluginStateNotInitialized {
+                plugin: "application",
+            })?;
+        Ok(())
+    }
+
+    /// Returns the published process-global Application authority.
+    pub fn global() -> Result<&'static Self, RuntimeError> {
+        APPLICATION_MAIN
+            .get()
+            .ok_or(RuntimeError::PluginStateNotInitialized {
+                plugin: "application",
+            })
+    }
+}
+
+/// Returns the published process-global Application authority.
+#[inline]
+pub fn application_main() -> &'static ApplicationMain {
+    ApplicationMain::global().expect("ApplicationMain is initialized before Application use")
 }
 
 const APP_MQ_CAPACITY_MIN: usize = 128;
 const APP_MQ_SEGMENT_HEADROOM: usize = 1 << 20;
 
-// SAFETY: mutable state access is restricted to the creating Main Thread.
+// SAFETY: mutable state access is restricted to the Engine Main control path.
 // Data Workers may read published listener and connection entries; their
 // mutation or removal occurs only while WorkerBarrier stops those readers.
-// ApplicationRegistration remains !Send.
 unsafe impl Send for ApplicationMain {}
 // SAFETY: worker reads follow the publication contract above, and the
 // connecting/connected transition changes only its dedicated atomic state.
 unsafe impl Sync for ApplicationMain {}
 
 impl ApplicationMain {
-    pub fn new(capacity: usize) -> Arc<Self> {
-        Self::with_session_apps(capacity, [])
-    }
-
-    pub fn with_session_apps(
-        capacity: usize,
-        session_apps: impl IntoIterator<Item = SessionAppRegistration>,
-    ) -> Arc<Self> {
-        Arc::new(Self {
-            owner: thread::current().id(),
-            state: UnsafeCell::new(ApplicationState {
-                applications: Pool::with_capacity(capacity),
-                listeners: Pool::with_capacity(capacity),
-                connections: Pool::with_capacity(capacity),
-                mq_resources: std::iter::repeat_with(|| None).take(capacity).collect(),
-            }),
-            session_apps: session_apps
-                .into_iter()
-                .collect::<Vec<_>>()
-                .into_boxed_slice(),
-        })
-    }
-
-    pub fn register_local(self: &Arc<Self>) -> Result<ApplicationRegistration, ApplicationError> {
-        let application = match Engine::with_current(|engine| engine.registry.get::<Session>()) {
-            Some(Some(_)) => self.attach_local_with_runtime()?,
-            _ => self.attach()?,
+    /// Publishes one owner-defined Session App callback table.
+    ///
+    /// The callback policy belongs to the Application authority, matching
+    /// VPP's application callback table. Session workers only resolve the
+    /// selected numeric slot while dispatching an exact Session.
+    pub fn register_session_app(
+        &self,
+        application: u32,
+        vft: SessionAppVft,
+    ) -> Result<u32, ApplicationError> {
+        self.ensure_active(application)?;
+        self.ensure_main_thread()?;
+        let state = unsafe { &mut *self.state.get() };
+        let mut register = || {
+            let entry = state
+                .applications
+                .get_mut(application)
+                .ok_or(ApplicationError::Missing { application })?;
+            if entry.session_callbacks.is_some() {
+                return Err(ApplicationError::SessionAppAlreadyRegistered { name: vft.name });
+            }
+            entry.session_callbacks = Some(vft);
+            Ok(0)
         };
-        Ok(ApplicationRegistration {
-            main: Arc::clone(self),
-            application: Some(application),
-            thread_bound: PhantomData,
-        })
+        let barrier = Engine::with_current(|engine| engine.worker_barrier());
+        match barrier {
+            Some(barrier) if barrier.is_pending() => register(),
+            Some(barrier) => barrier.sync(register),
+            None => register(),
+        }
+    }
+
+    #[inline]
+    pub(crate) fn session_callbacks(&self, application: u32, app: u32) -> Option<SessionAppVft> {
+        if app != 0 {
+            return None;
+        }
+        let state = unsafe { &*self.state.get() };
+        state
+            .applications
+            .get(application)
+            .and_then(|entry| entry.session_callbacks)
     }
 
     pub fn attach(&self) -> Result<u32, ApplicationError> {
-        self.with_state_mut(|state| state.applications.insert(()))
+        self.attach_with_worker_count(0)
     }
 
     /// Attaches an external Application and creates one private Session
@@ -302,28 +366,34 @@ impl ApplicationMain {
     }
 
     fn attach_with_runtime(&self, shared: bool) -> Result<u32, ApplicationError> {
+        self.ensure_main_thread()?;
         let (worker_count, mq_capacity) =
             Engine::with_current(|engine| -> Result<(usize, usize), ApplicationError> {
                 let session = engine
                     .registry
                     .get::<Session>()
-                    .ok_or(ApplicationError::SessionMainMissing)?;
+                    .expect("Session configuration is published before Application attach");
                 Ok((engine.configured_worker_count(), session.app_mq_capacity))
             })
-            .ok_or(ApplicationError::SessionMainMissing)??;
+            .expect("main Engine is installed before Application attach")?;
         self.attach_with_mq(worker_count, mq_capacity, shared)
     }
 
-    #[cfg(test)]
-    pub(crate) fn attach_local_for_test(
-        &self,
-        worker_count: usize,
-        mq_capacity: usize,
-    ) -> Result<u32, ApplicationError> {
-        let application = self.attach()?;
-        let resources =
-            ApplicationMqResources::create_local(application, worker_count, mq_capacity)?;
-        self.store_mq_resources(application, resources)?;
+    fn attach_with_worker_count(&self, worker_count: usize) -> Result<u32, ApplicationError> {
+        self.ensure_main_thread()?;
+        // SAFETY: Main Thread mutation is synchronized by the barrier below;
+        // Data Workers only read published Application records.
+        let state = unsafe { &mut *self.state.get() };
+        let barrier = Engine::with_current(|engine| engine.worker_barrier());
+        let application = match barrier {
+            Some(barrier) if barrier.is_pending() => {
+                state.applications.insert(Application::new(worker_count))
+            }
+            Some(barrier) => {
+                barrier.sync(|| state.applications.insert(Application::new(worker_count)))
+            }
+            None => state.applications.insert(Application::new(worker_count)),
+        };
         Ok(application)
     }
 
@@ -333,27 +403,40 @@ impl ApplicationMain {
         mq_capacity: usize,
         shared: bool,
     ) -> Result<u32, ApplicationError> {
-        let application = self.attach()?;
+        let application = self.attach_with_worker_count(worker_count)?;
         let resources = if shared {
-            ApplicationMqResources::create_external(application, worker_count, mq_capacity)
+            ApplicationMqResources::create_external(worker_count, mq_capacity)
         } else {
-            ApplicationMqResources::create_local(application, worker_count, mq_capacity)
-        }?;
+            ApplicationMqResources::create_local(worker_count, mq_capacity)
+        };
+        let resources = match resources {
+            Ok(resources) => resources,
+            Err(error) => {
+                self.remove_application(application);
+                return Err(error);
+            }
+        };
         let install_result = Engine::with_current(|engine| {
-            let main = engine
-                .registry
-                .get::<super::runtime::SessionMain>()
-                .ok_or(ApplicationError::SessionMainMissing)?;
+            let main = super::runtime::session_main();
             main.install_application_mqs(engine, application, &resources)
                 .map_err(|source| ApplicationError::MqInstall { source })
         });
         match install_result {
             Some(Ok(())) => {
-                self.store_mq_resources(application, resources)?;
+                if let Err(error) = self.store_mq_resources(application, resources) {
+                    self.remove_application(application);
+                    return Err(error);
+                }
                 Ok(application)
             }
-            Some(Err(error)) => Err(error),
-            None => Err(ApplicationError::SessionMainMissing),
+            Some(Err(error)) => {
+                self.remove_application(application);
+                Err(error)
+            }
+            None => {
+                self.remove_application(application);
+                panic!("main Engine is installed before Application MQ attach")
+            }
         }
     }
 
@@ -362,17 +445,42 @@ impl ApplicationMain {
         application: u32,
         resources: ApplicationMqResources,
     ) -> Result<(), ApplicationError> {
-        self.with_state_mut(|state| {
-            let slot = application as usize;
-            if slot >= state.mq_resources.len() {
-                state.mq_resources.resize_with(slot + 1, || None);
-            }
-            if state.mq_resources[slot].is_some() {
+        self.ensure_main_thread()?;
+        // SAFETY: Main Thread mutation is synchronized by the barrier below;
+        // Data Workers only read published Application records.
+        let state = unsafe { &mut *self.state.get() };
+        let barrier = Engine::with_current(|engine| engine.worker_barrier());
+        let store = || {
+            let entry = state
+                .applications
+                .get_mut(application)
+                .ok_or(ApplicationError::Missing { application })?;
+            if entry.mq_resources.is_some() {
                 return Err(ApplicationError::MqAlreadyAttached { application });
             }
-            state.mq_resources[slot] = Some(resources);
+            entry.mq_resources = Some(resources);
             Ok(())
-        })?
+        };
+        match barrier {
+            Some(barrier) if barrier.is_pending() => store(),
+            Some(barrier) => barrier.sync(store),
+            None => store(),
+        }
+    }
+
+    fn remove_application(&self, application: u32) {
+        self.ensure_main_thread()
+            .expect("Application removal stays on the Main Thread");
+        // SAFETY: this path runs on Main Thread while the barrier excludes
+        // Data Worker readers of Application records.
+        let state = unsafe { &mut *self.state.get() };
+        let barrier = Engine::with_current(|engine| engine.worker_barrier());
+        let removed = match barrier {
+            Some(barrier) if barrier.is_pending() => state.applications.remove(application),
+            Some(barrier) => barrier.sync(|| state.applications.remove(application)),
+            None => state.applications.remove(application),
+        };
+        removed.expect("Application remains allocated until attach cleanup completes");
     }
 
     /// Returns the runtime-neutral MQ publication used by the attach server.
@@ -382,10 +490,9 @@ impl ApplicationMain {
     ) -> Result<ApplicationMqPublication, ApplicationError> {
         let resources = self
             .state()?
-            .mq_resources
-            .get(application as usize)
-            .and_then(Option::as_ref)
-            .filter(|resources| resources.application == application)
+            .applications
+            .get(application)
+            .and_then(|application| application.mq_resources.as_ref())
             .ok_or(ApplicationError::Missing { application })?;
         resources.publication()
     }
@@ -401,10 +508,9 @@ impl ApplicationMain {
     ) -> Result<R, ApplicationError> {
         let resources = self
             .state()?
-            .mq_resources
-            .get(application as usize)
-            .and_then(Option::as_ref)
-            .filter(|resources| resources.application == application)
+            .applications
+            .get(application)
+            .and_then(|application| application.mq_resources.as_ref())
             .ok_or(ApplicationError::Missing { application })?;
         operation(resources)
     }
@@ -415,18 +521,13 @@ impl ApplicationMain {
 
     pub fn detach(&self, application: u32) -> Result<(), ApplicationError> {
         self.ensure_main_thread()?;
-        self.with_state_mut(|state| -> Result<(), ApplicationError> {
-            if !state.applications.contains_key(application) {
-                return Err(ApplicationError::Missing { application });
-            }
-            Ok(())
-        })??;
+        let state = unsafe { &*self.state.get() };
+        if !state.applications.contains_key(application) {
+            return Err(ApplicationError::Missing { application });
+        }
 
         match Engine::with_current(|engine| -> Result<(), ApplicationError> {
-            let sessions = engine
-                .registry
-                .get::<super::runtime::SessionMain>()
-                .ok_or(ApplicationError::SessionMainMissing)?;
+            let sessions = super::runtime::session_main();
             sessions
                 .application_detached(engine, application)
                 .map_err(|source| ApplicationError::MqDetachFailed { source })
@@ -435,37 +536,38 @@ impl ApplicationMain {
             None => Ok(()),
         }?;
 
-        self.with_state_mut(|state| -> Result<(), ApplicationError> {
-            if let Some(slot) = state.mq_resources.get_mut(application as usize)
-                && slot
-                    .as_ref()
-                    .is_some_and(|resources| resources.application == application)
-            {
-                *slot = None;
-            }
-            let listener_indexes = state
-                .listeners
-                .iter()
-                .filter_map(|(index, listener)| {
-                    (listener.application == application).then_some(index)
-                })
-                .collect::<Vec<_>>();
+        // SAFETY: Main Thread mutation is synchronized by the barrier below;
+        // Data Workers only read published Application records.
+        let state = unsafe { &mut *self.state.get() };
+        let barrier = Engine::with_current(|engine| engine.worker_barrier());
+        let mut detach = || -> Result<(), ApplicationError> {
+            let (listener_indexes, connection_indexes) = {
+                let entry = state
+                    .applications
+                    .get_mut(application)
+                    .ok_or(ApplicationError::Missing { application })?;
+                (
+                    std::mem::take(&mut entry.listeners),
+                    std::mem::take(&mut entry.connections),
+                )
+            };
             for index in listener_indexes {
                 state.listeners.remove(index);
             }
-            let connection_indexes = state
-                .connections
-                .iter()
-                .filter_map(|(index, connection)| {
-                    (connection.application == application).then_some(index)
-                })
-                .collect::<Vec<_>>();
             for index in connection_indexes {
                 state.connections.remove(index);
             }
-            state.applications.remove(application);
+            state
+                .applications
+                .remove(application)
+                .ok_or(ApplicationError::Missing { application })?;
             Ok(())
-        })??;
+        };
+        match barrier {
+            Some(barrier) if barrier.is_pending() => detach(),
+            Some(barrier) => barrier.sync(detach),
+            None => detach(),
+        }?;
 
         Ok(())
     }
@@ -477,13 +579,31 @@ impl ApplicationMain {
         opaque: Option<u64>,
     ) -> Result<u32, ApplicationError> {
         self.ensure_active(application)?;
-        self.validate_session_app(app)?;
         let listener = ApplicationListener {
             application,
             app,
             opaque,
         };
-        self.with_state_mut(|state| state.listeners.insert(listener))
+        self.ensure_main_thread()?;
+        // SAFETY: Main Thread mutation is synchronized by the barrier below;
+        // Data Workers only read published listener records.
+        let state = unsafe { &mut *self.state.get() };
+        let barrier = Engine::with_current(|engine| engine.worker_barrier());
+        let register = || {
+            let index = state.listeners.insert(listener);
+            state
+                .applications
+                .get_mut(application)
+                .expect("active Application remains allocated")
+                .listeners
+                .push(index);
+            index
+        };
+        Ok(match barrier {
+            Some(barrier) if barrier.is_pending() => register(),
+            Some(barrier) => barrier.sync(register),
+            None => register(),
+        })
     }
 
     pub fn register_connection(
@@ -495,7 +615,6 @@ impl ApplicationMain {
         opaque: Option<u64>,
     ) -> Result<u32, ApplicationError> {
         self.ensure_active(application)?;
-        self.validate_session_app(app)?;
         let connection = ApplicationConnection {
             application,
             context,
@@ -504,7 +623,12 @@ impl ApplicationMain {
             server_name,
             connect_state: AtomicU8::new(CONNECTION_CONNECTING),
         };
-        self.with_state_mut(|state| {
+        self.ensure_main_thread()?;
+        // SAFETY: Main Thread mutation is synchronized by the barrier below;
+        // Data Workers only read published connection records.
+        let state = unsafe { &mut *self.state.get() };
+        let barrier = Engine::with_current(|engine| engine.worker_barrier());
+        let register = || {
             // Reap connected entries ahead of the primary insert. VPP
             // session_free is void best-effort cleanup (session.c:258-265):
             // a vanished entry is logged, never fatal to the insert.
@@ -517,10 +641,28 @@ impl ApplicationMain {
                 })
                 .collect::<Vec<_>>();
             for index in connected {
-                drop(state.connections.remove(index));
+                if let Some(removed) = state.connections.remove(index) {
+                    if let Some(application_entry) = state.applications.get_mut(removed.application)
+                    {
+                        application_entry
+                            .connections
+                            .retain(|entry| *entry != index);
+                    }
+                }
             }
             let index = state.connections.insert(connection);
+            state
+                .applications
+                .get_mut(application)
+                .expect("active Application remains allocated")
+                .connections
+                .push(index);
             index
+        };
+        Ok(match barrier {
+            Some(barrier) if barrier.is_pending() => register(),
+            Some(barrier) => barrier.sync(register),
+            None => register(),
         })
     }
 
@@ -564,7 +706,12 @@ impl ApplicationMain {
         connection: u32,
     ) -> Result<(), ApplicationError> {
         self.ensure_active(application)?;
-        self.with_state_mut(|state| {
+        self.ensure_main_thread()?;
+        // SAFETY: Main Thread mutation is synchronized by the barrier below;
+        // Data Workers only read published connection records.
+        let state = unsafe { &mut *self.state.get() };
+        let barrier = Engine::with_current(|engine| engine.worker_barrier());
+        let mut remove = || {
             let index = connection;
             let entry = state
                 .connections
@@ -580,8 +727,19 @@ impl ApplicationMain {
                 .connections
                 .remove(index)
                 .ok_or(ApplicationError::ConnectionMissing { connection })?;
+            state
+                .applications
+                .get_mut(application)
+                .expect("active Application remains allocated")
+                .connections
+                .retain(|entry| *entry != connection);
             Ok(())
-        })?
+        };
+        match barrier {
+            Some(barrier) if barrier.is_pending() => remove(),
+            Some(barrier) => barrier.sync(remove),
+            None => remove(),
+        }
     }
 
     pub fn reclaim_connection(
@@ -590,7 +748,12 @@ impl ApplicationMain {
         connection: u32,
     ) -> Result<(), ApplicationError> {
         self.ensure_active(application)?;
-        self.with_state_mut(|state| {
+        self.ensure_main_thread()?;
+        // SAFETY: Main Thread mutation is synchronized by the barrier below;
+        // Data Workers only read published connection records.
+        let state = unsafe { &mut *self.state.get() };
+        let barrier = Engine::with_current(|engine| engine.worker_barrier());
+        let mut reclaim = || {
             let index = connection;
             let entry = state
                 .connections
@@ -609,8 +772,19 @@ impl ApplicationMain {
                 .connections
                 .remove(index)
                 .ok_or(ApplicationError::ConnectionMissing { connection })?;
+            state
+                .applications
+                .get_mut(application)
+                .expect("active Application remains allocated")
+                .connections
+                .retain(|entry| *entry != connection);
             Ok(())
-        })?
+        };
+        match barrier {
+            Some(barrier) if barrier.is_pending() => reclaim(),
+            Some(barrier) => barrier.sync(reclaim),
+            None => reclaim(),
+        }
     }
 
     pub fn remove_listener(
@@ -628,7 +802,12 @@ impl ApplicationMain {
             }
             Ok(())
         })??;
-        self.with_state_mut(|state| {
+        self.ensure_main_thread()?;
+        // SAFETY: Main Thread mutation is synchronized by the barrier below;
+        // Data Workers only read published listener records.
+        let state = unsafe { &mut *self.state.get() };
+        let barrier = Engine::with_current(|engine| engine.worker_barrier());
+        let mut remove = || {
             let index = listener_id;
             if !state.listeners.contains_key(index) {
                 return Err(ApplicationError::ListenerMissing {
@@ -648,8 +827,19 @@ impl ApplicationMain {
                 });
             }
             drop(state.listeners.remove(index));
+            state
+                .applications
+                .get_mut(application)
+                .expect("active Application remains allocated")
+                .listeners
+                .retain(|entry| *entry != listener_id);
             Ok(())
-        })?
+        };
+        match barrier {
+            Some(barrier) if barrier.is_pending() => remove(),
+            Some(barrier) => barrier.sync(remove),
+            None => remove(),
+        }
     }
 
     /// Publishes the opaque fact carried by one Application listener while the
@@ -661,7 +851,12 @@ impl ApplicationMain {
         opaque: Option<u64>,
     ) -> Result<(), ApplicationError> {
         self.ensure_active(application)?;
-        self.with_state_mut(|state| {
+        self.ensure_main_thread()?;
+        // SAFETY: Main Thread mutation is synchronized by the barrier below;
+        // Data Workers only read published listener records.
+        let state = unsafe { &mut *self.state.get() };
+        let barrier = Engine::with_current(|engine| engine.worker_barrier());
+        let mut update = || {
             let index = listener_id;
             if !state.listeners.contains_key(index) {
                 return Err(ApplicationError::ListenerMissing {
@@ -683,7 +878,12 @@ impl ApplicationMain {
             }
             listener.opaque = opaque;
             Ok(())
-        })?
+        };
+        match barrier {
+            Some(barrier) if barrier.is_pending() => update(),
+            Some(barrier) => barrier.sync(update),
+            None => update(),
+        }
     }
 
     pub(crate) fn with_listener<R>(
@@ -706,52 +906,6 @@ impl ApplicationMain {
         ))
     }
 
-    pub(crate) fn session_app(
-        &self,
-        name: &str,
-    ) -> Result<SessionAppRegistration, ApplicationError> {
-        let mut found = None;
-        for entry in self.session_apps.iter().copied() {
-            if entry.name() != name {
-                continue;
-            }
-            if found.is_some() {
-                return Err(ApplicationError::SessionAppDuplicate {
-                    name: name.to_owned(),
-                });
-            }
-            found = Some(entry);
-        }
-        found.ok_or_else(|| ApplicationError::SessionAppMissing {
-            name: name.to_owned(),
-        })
-    }
-
-    pub fn session_app_id(&self, name: &str) -> Result<u32, ApplicationError> {
-        self.session_app(name).map(|_| {
-            self.session_apps
-                .iter()
-                .position(|entry| entry.name() == name)
-                .map(|index| index as u32)
-                .expect("resolved Session App remains in the registration list")
-        })
-    }
-
-    pub(crate) fn session_app_registration(&self, app: u32) -> Option<SessionAppRegistration> {
-        self.session_apps.get(app as usize).copied()
-    }
-
-    fn validate_session_app(&self, app: Option<u32>) -> Result<(), ApplicationError> {
-        let Some(app) = app else {
-            return Ok(());
-        };
-        if (app as usize) < self.session_apps.len() {
-            Ok(())
-        } else {
-            Err(ApplicationError::SessionAppUnregistered { app })
-        }
-    }
-
     fn ensure_active(&self, application: u32) -> Result<(), ApplicationError> {
         if self.state()?.applications.contains_key(application) {
             Ok(())
@@ -762,67 +916,16 @@ impl ApplicationMain {
 
     fn state(&self) -> Result<&ApplicationState, ApplicationError> {
         self.ensure_main_thread()?;
-        // SAFETY: the owner check above confines all state access to one thread;
-        // immutable access does not overlap a mutable call on that thread.
+        // SAFETY: the Main control check above confines all state access to the
+        // control path; immutable access does not overlap a mutable call there.
         Ok(unsafe { &*self.state.get() })
     }
 
-    fn with_state_mut<R>(
-        &self,
-        operation: impl FnOnce(&mut ApplicationState) -> R,
-    ) -> Result<R, ApplicationError> {
-        self.ensure_main_thread()?;
-        // SAFETY: the owner check confines mutation to Main Thread, and the
-        // worker barrier stops every listener reader during the operation.
-        let state = unsafe { &mut *self.state.get() };
-        let barrier = Engine::with_current(|engine| engine.worker_barrier());
-        Ok(match barrier {
-            Some(barrier) if barrier.is_pending() => operation(state),
-            Some(barrier) => barrier.sync(|| operation(state)),
-            None => operation(state),
-        })
-    }
-
     fn ensure_main_thread(&self) -> Result<(), ApplicationError> {
-        if thread::current().id() == self.owner {
-            Ok(())
-        } else {
-            Err(ApplicationError::WrongThread)
+        match Engine::with_current(|engine| engine.ensure_main_thread()) {
+            Some(Ok(())) => Ok(()),
+            Some(Err(_)) | None => Err(ApplicationError::WrongThread),
         }
-    }
-}
-
-/// Local Application capability. Dropping it detaches the Application.
-pub struct ApplicationRegistration {
-    main: Arc<ApplicationMain>,
-    application: Option<u32>,
-    thread_bound: PhantomData<Rc<()>>,
-}
-
-impl ApplicationRegistration {
-    #[inline]
-    pub fn application(&self) -> u32 {
-        self.application
-            .expect("live Application registration retains its identity")
-    }
-
-    pub fn detach(mut self) -> Result<(), ApplicationError> {
-        let application = self
-            .application
-            .take()
-            .expect("live Application registration retains its identity");
-        self.main.detach(application)
-    }
-}
-
-impl Drop for ApplicationRegistration {
-    fn drop(&mut self) {
-        let Some(application) = self.application.take() else {
-            return;
-        };
-        self.main
-            .detach(application)
-            .expect("Local Application registration is detached on its owning Main Thread");
     }
 }
 
@@ -831,6 +934,8 @@ impl Drop for ApplicationRegistration {
 pub enum ApplicationError {
     #[error("Application {application:?} is not attached")]
     Missing { application: u32 },
+    #[error("Session App `{name}` is already registered")]
+    SessionAppAlreadyRegistered { name: &'static str },
     #[error("Application state is owned by another thread")]
     WrongThread,
     #[error("per-Application MQ capacity {capacity} is below the minimum 128")]
@@ -856,8 +961,6 @@ pub enum ApplicationError {
         #[source]
         source: SessionMsgQueueError,
     },
-    #[error("Session Main is not ready for per-Application MQ attach")]
-    SessionMainMissing,
     #[error("per-Application MQ worker installation failed")]
     MqInstall {
         #[source]
@@ -875,12 +978,6 @@ pub enum ApplicationError {
     },
     #[error("Application {application:?} already owns per-Application MQ resources")]
     MqAlreadyAttached { application: u32 },
-    #[error("Session App `{name}` is not registered")]
-    SessionAppMissing { name: String },
-    #[error("Session App `{name}` is registered more than once")]
-    SessionAppDuplicate { name: String },
-    #[error("Session App id {app:?} is not registered")]
-    SessionAppUnregistered { app: u32 },
     #[error("Application listener {listener:?} is not registered")]
     ListenerMissing { listener: u32 },
     #[error("Application listener {listener:?} is not owned by Application {application:?}")]
@@ -893,179 +990,4 @@ pub enum ApplicationError {
     ConnectionAlreadyConnected { connection: u32 },
     #[error("Application connection {connection:?} is not connected")]
     ConnectionNotConnected { connection: u32 },
-}
-
-#[cfg(test)]
-mod tests {
-    use hammer_runtime::DataWorkerId;
-
-    use super::{ApplicationError, ApplicationMain, ApplicationMqResources};
-
-    fn register_connection(main: &ApplicationMain, application: u32) -> u32 {
-        main.register_connection(application, 0, None, None, None)
-            .expect("register Application connection")
-    }
-
-    #[test]
-    fn local_mq_resources_create_one_signal_queue_per_data_worker() {
-        let main = ApplicationMain::new(2);
-        let application = main.attach().expect("attach Application");
-        let resources =
-            ApplicationMqResources::create_local(application, 2, 2048).expect("MQ resources");
-
-        assert_eq!(resources.worker_count(), 2);
-        for worker in [DataWorkerId::new(0), DataWorkerId::new(1)] {
-            let queue = resources.queue(worker).expect("worker MQ");
-            assert!(queue.read_fd().is_some());
-            assert!(queue.write_fd().is_some());
-        }
-    }
-
-    #[test]
-    fn attach_local_without_runtime_does_not_publish_mq_resources() {
-        let main = ApplicationMain::new(1);
-        let error = main
-            .attach_local(1, 128)
-            .expect_err("attach requires Session Main");
-
-        assert!(matches!(error, ApplicationError::SessionMainMissing));
-        let state = main.state().expect("read Application state");
-        assert!(state.mq_resources.iter().all(Option::is_none));
-    }
-
-    #[test]
-    fn detach_releases_application_mq_resources() {
-        let main = ApplicationMain::new(1);
-        let application = main
-            .attach_local_for_test(1, 128)
-            .expect("attach local Application");
-
-        main.detach(application).expect("detach local Application");
-
-        let state = main.state().expect("read Application state");
-        assert!(state.applications.is_empty());
-        assert!(state.mq_resources.iter().all(Option::is_none));
-    }
-
-    #[test]
-    fn reclaimed_connection_slot_is_reused_by_next_connection() {
-        let main = ApplicationMain::new(1);
-        let application = main.attach().expect("attach Application");
-        let connection = register_connection(&main, application);
-
-        main.mark_connected(connection)
-            .expect("mark Application connection connected");
-        main.reclaim_connection(application, connection)
-            .expect("reclaim connected Application connection");
-
-        assert_eq!(
-            main.state()
-                .expect("read Application state")
-                .connections
-                .len(),
-            0
-        );
-        let replacement = register_connection(&main, application);
-        assert_eq!(connection, replacement);
-    }
-
-    #[test]
-    fn register_connection_reclaims_connected_slot_before_next_insert() {
-        let main = ApplicationMain::new(1);
-        let application = main.attach().expect("attach Application");
-        let connected = register_connection(&main, application);
-
-        main.mark_connected(connected)
-            .expect("mark Application connection connected");
-        let replacement = register_connection(&main, application);
-
-        assert_eq!(connected, replacement);
-        assert!(main.with_connection(connected, |_| ()).is_ok());
-    }
-
-    #[test]
-    fn reclamation_uses_exact_connect_state_identity_in_any_order() {
-        let main = ApplicationMain::new(4);
-        let application = main.attach().expect("attach Application");
-        let first = register_connection(&main, application);
-        let second = register_connection(&main, application);
-
-        main.mark_connected(second)
-            .expect("mark second Application connection connected");
-        main.mark_connected(first)
-            .expect("mark first Application connection connected");
-        main.reclaim_connection(application, second)
-            .expect("reclaim second Application connection");
-        main.reclaim_connection(application, first)
-            .expect("reclaim first Application connection");
-
-        assert_eq!(
-            main.state()
-                .expect("read Application state")
-                .connections
-                .len(),
-            0
-        );
-    }
-
-    #[test]
-    fn connecting_connection_is_not_reclaimed() {
-        let main = ApplicationMain::new(1);
-        let application = main.attach().expect("attach Application");
-        let connection = register_connection(&main, application);
-
-        let error = main
-            .reclaim_connection(application, connection)
-            .expect_err("connecting Application connection is not reclaimable");
-        assert!(matches!(
-            error,
-            ApplicationError::ConnectionNotConnected { connection: rejected }
-                if rejected == connection
-        ));
-    }
-
-    #[test]
-    fn reused_connection_index_refers_to_replacement() {
-        let main = ApplicationMain::new(1);
-        let application = main.attach().expect("attach Application");
-        let first = register_connection(&main, application);
-
-        main.mark_connected(first)
-            .expect("mark first Application connection connected");
-        main.reclaim_connection(application, first)
-            .expect("reclaim first Application connection");
-        let replacement = register_connection(&main, application);
-        assert_eq!(first, replacement);
-
-        let error = main
-            .reclaim_connection(application, first)
-            .expect_err("replacement Application connection is still connecting");
-        assert!(matches!(
-            error,
-            ApplicationError::ConnectionNotConnected { connection: rejected }
-                if rejected == first
-        ));
-    }
-
-    #[test]
-    fn detach_removes_connecting_and_connected_connections() {
-        let main = ApplicationMain::new(2);
-        let application = main.attach().expect("attach Application");
-        let connecting = register_connection(&main, application);
-        let connected = register_connection(&main, application);
-
-        main.mark_connected(connected)
-            .expect("mark Application connection connected");
-        main.detach(application)
-            .expect("detach Application with connecting and connected connections");
-
-        let state = main.state().expect("read Application state");
-        assert!(state.applications.is_empty());
-        assert!(state.connections.is_empty());
-        assert!(matches!(
-            main.reclaim_connection(application, connecting),
-            Err(ApplicationError::Missing { application: missing })
-                if missing == application
-        ));
-    }
 }

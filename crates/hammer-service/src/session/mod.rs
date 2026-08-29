@@ -20,15 +20,15 @@ pub mod state;
 
 pub use app::AppWorker;
 pub use application::{
-    ApplicationError, ApplicationMain, ApplicationMqResources, ApplicationRegistration,
+    APPLICATION_MAIN, ApplicationError, ApplicationMain, ApplicationMqResources, application_main,
 };
 pub use config::Session;
 pub use error::{SessionConnectError, SessionQueueError};
 pub use node::{AppSessionInputNode, SESSION_QUEUE_IO_BUDGET, SessionQueueNext, SessionQueueNode};
-pub use protocol::{
-    SessionApp, SessionAppCallback, SessionAppCallbacks, SessionAppSegmentCallback,
+pub use protocol::{SessionAppVft, register_session_app};
+pub use runtime::{
+    SESSION_MAIN, SessionAcceptMetadata, SessionEndpointRole, SessionWorker, session_main,
 };
-pub use runtime::{SessionAcceptMetadata, SessionEndpointRole, SessionWorker};
 
 #[hammer_component_macros::config_function(
     name = "session_config",
@@ -44,45 +44,29 @@ fn configure_session(config: config::NetworkSessionConfig) -> RuntimeResult<Arc<
 
 #[hammer_component_macros::init_function(
     name = "session_init",
-    runs_after = ["application_init"]
+    runs_after = ["transport_main_init", "application_init"]
 )]
-fn init_session(
-    engine: &mut Engine,
-    applications: Arc<ApplicationMain>,
-    session: Arc<Session>,
-) -> RuntimeResult<Arc<runtime::SessionMain>> {
+fn init_session(engine: &mut Engine, session: Arc<Session>) -> RuntimeResult<()> {
     engine.registry.set(Arc::clone(&session));
-    Ok(Arc::new(runtime::SessionMain::with_pool_capacity(
-        engine.configured_worker_count(),
-        applications,
-        session.pool_capacity,
-    )))
+    runtime::SessionMain::init(engine.configured_worker_count())
 }
 
 #[hammer_component_macros::main_loop_exit_function]
-fn exit_session(_engine: &mut Engine, main: Arc<runtime::SessionMain>) -> RuntimeResult<()> {
-    main.begin_session_migration_shutdown();
+fn exit_session(_engine: &mut Engine) -> RuntimeResult<()> {
+    session_main().begin_session_migration_shutdown();
     Ok(())
 }
 
-#[hammer_component_macros::init_function(name = "application_init")]
-fn init_application(
-    engine: &mut Engine,
-    session: Arc<Session>,
-) -> RuntimeResult<Arc<ApplicationMain>> {
-    Ok(ApplicationMain::with_session_apps(
-        session.app_session_capacity,
-        engine.plugin_main().session_apps(),
-    ))
+#[hammer_component_macros::init_function(
+    name = "application_init",
+    runs_after = ["transport_main_init"]
+)]
+fn init_application(_: &mut Engine, session: Arc<Session>) -> RuntimeResult<()> {
+    ApplicationMain::init()
 }
 
 #[hammer_component_macros::worker_init_function(name = "session_worker_init")]
-fn init_session_worker(
-    engine: &mut Engine,
-    main: Arc<runtime::SessionMain>,
-    applications: Arc<ApplicationMain>,
-    session: Arc<Session>,
-) -> RuntimeResult<()> {
+fn init_session_worker(engine: &mut Engine, session: Arc<Session>) -> RuntimeResult<()> {
     let worker = engine.data_worker_id()?;
     let session_queue = engine
         .runtime
@@ -104,19 +88,14 @@ fn init_session_worker(
         .registry
         .get::<AppServer>()
         .map(|server| server.publisher());
-    let mut sessions = SessionWorker::<u32>::new(
+    let sessions = SessionWorker::new(
         worker,
         engine.configured_worker_count(),
         AppSessionConfig::default(),
         session.pool_capacity,
-        applications,
         publisher,
     )?;
-    sessions.set_listener_main(Arc::clone(&main));
-    runtime::install_session_worker(&main, engine, app_session_input, session_queue, sessions)?;
-    for registration in engine.plugin_main().session_apps() {
-        registration.install(engine)?;
-    }
+    runtime::install_session_worker(engine, app_session_input, session_queue, sessions)?;
     Ok(())
 }
 
@@ -129,23 +108,4 @@ fn configure_attach_server(
     };
     let server = Arc::new(AppServer::bind(path, session.app_session_capacity)?);
     Ok(Some(server))
-}
-
-#[cfg(test)]
-mod tests {
-    use hammer_runtime::init::topological_order;
-
-    use super::{__INIT_FN_APPLICATION_INIT, __INIT_FN_SESSION_INIT};
-
-    #[test]
-    fn application_initializes_before_session() {
-        let functions = [__INIT_FN_APPLICATION_INIT, __INIT_FN_SESSION_INIT];
-        let order = topological_order(&functions).expect("session init order");
-        let names = order
-            .into_iter()
-            .map(|index| functions[index].name)
-            .collect::<Vec<_>>();
-
-        assert_eq!(names, ["application_init", "session_init"]);
-    }
 }
