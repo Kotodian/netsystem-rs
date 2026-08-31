@@ -11,6 +11,11 @@ use crate::{DataPlaneMain, RuntimeRegistry};
 
 impl GlobalMain {
     #[inline]
+    pub fn control_thread(&self) -> &crate::ControlThread {
+        &self.control_thread
+    }
+
+    #[inline]
     pub fn data_plane_main(&self) -> &DataPlaneMain {
         &self.main
     }
@@ -53,6 +58,10 @@ impl GlobalMain {
         Self {
             cacheline0: hammer_infra::align::CacheLineAlignMark,
             main,
+            control_thread: crate::ControlThread::new(
+                std::time::Instant::now(),
+                crate::log::Level::Info,
+            ),
             registry,
             barrier,
             main_loop_exit_now,

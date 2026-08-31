@@ -10,7 +10,7 @@ use crate::config::{StatsConfig, Worker};
 use crate::error::{RuntimeError, RuntimeResult};
 use crate::process::{ProcessContext, ProcessMain};
 use crate::spawn::DataRemoteLocalQueue;
-use crate::{AsyncFileMain, DataPlaneMain, PluginMain, RuntimeRegistry};
+use crate::{AsyncFileMain, ControlThread, DataPlaneMain, PluginMain, RuntimeRegistry};
 use hammer_component_macros::Stats;
 use hammer_stats::{StatsMain, Timestamp};
 
@@ -54,6 +54,7 @@ async fn stat_segment_collector_process(mut context: ProcessContext) -> RuntimeR
 pub struct GlobalMain {
     cacheline0: CacheLineAlignMark,
     pub(crate) main: DataPlaneMain,
+    control_thread: ControlThread,
     pub registry: Arc<RuntimeRegistry>,
     pub(crate) barrier: crate::barrier::WorkerBarrier,
     pub(crate) main_loop_exit_now: Arc<AtomicBool>,
