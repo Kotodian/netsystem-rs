@@ -1,6 +1,6 @@
 use std::cell::UnsafeCell;
 use std::fmt;
-use std::panic::{AssertUnwindSafe, catch_unwind};
+use std::ops::{Deref, DerefMut};
 use std::sync::atomic::{AtomicU8, Ordering};
 use std::thread::{self, ThreadId};
 
@@ -82,7 +82,7 @@ impl<T> ThreadOwned<T> {
     }
 
     #[inline]
-    pub fn with_mut<R>(&self, operation: impl FnOnce(&mut T) -> R) -> Result<R, ThreadOwnedError> {
+    pub fn borrow_mut(&self) -> Result<ThreadOwnedBorrow<'_, T>, ThreadOwnedError> {
         if self.state.load(Ordering::Acquire) != INSTALLED {
             return Err(ThreadOwnedError::NotInstalled);
         }
@@ -102,77 +102,30 @@ impl<T> ThreadOwned<T> {
             return Err(ThreadOwnedError::AlreadyBorrowed);
         }
         *borrowed = true;
-        let guard = ThreadOwnedBorrow { slot: self };
-
-        // SAFETY: the owner and reentrancy checks above establish exclusive
-        // access until `guard` resets the borrow flag, including during unwind.
-        let value = unsafe { &mut *self.value.get() }
-            .as_mut()
-            .ok_or(ThreadOwnedError::NotInstalled)?;
-        let result = operation(value);
-        drop(guard);
-        Ok(result)
+        Ok(ThreadOwnedBorrow { slot: self })
     }
 
-    /// Temporarily binds an installed value to the current thread, restores
-    /// the previous owner on normal return and unwind, and grants one `&mut T`.
-    ///
-    /// # Safety
-    /// The caller must prove for the complete scope that:
-    /// - the installed value and its storage remain alive;
-    /// - the previous owner is quiescent and cannot call `install`, `with_mut`,
-    ///   `migrate`, or otherwise access `T`;
-    /// - no mutable or shared borrow into `T` is alive when migration begins;
-    /// - no other thread can start an access until the previous owner is restored;
-    /// - transferring temporary exclusive access to the current thread is valid
-    ///   for `T: Send`.
-    pub unsafe fn migrate<R>(
-        &self,
-        operation: impl FnOnce(&mut T) -> R,
-    ) -> Result<R, ThreadOwnedError>
-    where
-        T: Send,
-    {
+    /// Clears an installed value on its owner thread before the slot is dropped.
+    pub fn clear(&self) -> Result<T, ThreadOwnedError> {
         if self.state.load(Ordering::Acquire) != INSTALLED {
             return Err(ThreadOwnedError::NotInstalled);
         }
-
-        // SAFETY: the caller has proven that no source-thread access is alive
-        // for the complete migration scope.
-        let borrowed = unsafe { &mut *self.borrowed.get() };
-        if *borrowed {
+        if thread::current().id()
+            != unsafe { (*self.owner.get()).ok_or(ThreadOwnedError::NotInstalled)? }
+        {
+            return Err(ThreadOwnedError::WrongThread);
+        }
+        if unsafe { *self.borrowed.get() } {
             return Err(ThreadOwnedError::AlreadyBorrowed);
         }
-        let previous = unsafe { &mut *self.owner.get() }
+        let value = unsafe { &mut *self.value.get() }
             .take()
             .ok_or(ThreadOwnedError::NotInstalled)?;
-
-        // SAFETY: source access is quiescent and the value remains installed.
-        // The borrow flag prevents nested migration from the current thread.
-        *borrowed = true;
         unsafe {
-            *self.owner.get() = Some(thread::current().id());
+            *self.owner.get() = None;
         }
-
-        let result = catch_unwind(AssertUnwindSafe(|| -> Result<R, ThreadOwnedError> {
-            // SAFETY: the owner now matches the current thread and the borrow
-            // flag is set until the caller restores it below.
-            let value = unsafe { &mut *self.value.get() }
-                .as_mut()
-                .ok_or(ThreadOwnedError::NotInstalled)?;
-            Ok(operation(value))
-        }));
-
-        // SAFETY: this migration scope is the only active writer. Restoring
-        // the previous owner releases the temporary current-thread binding.
-        unsafe {
-            *self.owner.get() = Some(previous);
-            *self.borrowed.get() = false;
-        }
-        match result {
-            Ok(result) => result,
-            Err(payload) => std::panic::resume_unwind(payload),
-        }
+        self.state.store(UNINSTALLED, Ordering::Release);
+        Ok(value)
     }
 }
 
@@ -195,8 +148,30 @@ impl<T> fmt::Debug for ThreadOwned<T> {
     }
 }
 
-struct ThreadOwnedBorrow<'a, T> {
+pub struct ThreadOwnedBorrow<'a, T> {
     slot: &'a ThreadOwned<T>,
+}
+
+impl<T> Deref for ThreadOwnedBorrow<'_, T> {
+    type Target = T;
+
+    fn deref(&self) -> &Self::Target {
+        unsafe {
+            (*self.slot.value.get())
+                .as_ref()
+                .expect("installed ThreadOwned value is missing")
+        }
+    }
+}
+
+impl<T> DerefMut for ThreadOwnedBorrow<'_, T> {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        unsafe {
+            (*self.slot.value.get())
+                .as_mut()
+                .expect("installed ThreadOwned value is missing")
+        }
+    }
 }
 
 impl<T> Drop for ThreadOwnedBorrow<'_, T> {
@@ -208,10 +183,6 @@ impl<T> Drop for ThreadOwnedBorrow<'_, T> {
         }
     }
 }
-
-// SAFETY: `T` enters the slot on its owner thread and can be dropped after the
-// container moves only when `T: Send`.
-unsafe impl<T: Send> Send for ThreadOwned<T> {}
 
 // SAFETY: shared cross-thread access checks the installing ThreadId before
 // touching either UnsafeCell. Only the owner can create a mutable reference,
