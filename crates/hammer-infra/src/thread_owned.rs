@@ -177,6 +177,9 @@ mod tests {
         })
         .join()
         .expect("worker exits");
-        assert_eq!(result, (ThreadOwnedError::WrongThread, ThreadOwnedError::WrongThread));
+        assert_eq!(
+            result,
+            (ThreadOwnedError::WrongThread, ThreadOwnedError::WrongThread)
+        );
     }
 }
