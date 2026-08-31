@@ -130,12 +130,11 @@ impl TlsWorkers {
             .ok_or(Error::WorkerMissing {
                 worker: worker.slot(),
             })?;
-        let context = slot
-            .with_mut(|pool| pool.insert(connection))
-            .map_err(|source| Error::WorkerAccess {
-                worker: worker.slot(),
-                source,
-            })?;
+        let mut slot = slot.borrow_mut().map_err(|source| Error::WorkerAccess {
+            worker: worker.slot(),
+            source,
+        })?;
+        let context = slot.insert(connection);
         Ok(context.into())
     }
 
@@ -152,16 +151,14 @@ impl TlsWorkers {
             .ok_or(Error::WorkerMissing {
                 worker: worker.slot(),
             })?;
-        slot.with_mut(|pool| {
-            let connection = pool
-                .get_mut(index)
-                .ok_or(Error::ConnectionMissing { context })?;
-            operation(connection)
-        })
-        .map_err(|source| Error::WorkerAccess {
+        let mut slot = slot.borrow_mut().map_err(|source| Error::WorkerAccess {
             worker: worker.slot(),
             source,
-        })?
+        })?;
+        let connection = slot
+            .get_mut(index)
+            .ok_or(Error::ConnectionMissing { context })?;
+        operation(connection)
     }
 
     fn remove(&self, worker: DataWorkerId, context: u64) -> RuntimeResult<()> {
@@ -172,13 +169,11 @@ impl TlsWorkers {
             .ok_or(Error::WorkerMissing {
                 worker: worker.slot(),
             })?;
-        slot.with_mut(|pool| {
-            pool.remove(index);
-        })
-        .map_err(|source| Error::WorkerAccess {
+        let mut slot = slot.borrow_mut().map_err(|source| Error::WorkerAccess {
             worker: worker.slot(),
             source,
         })?;
+        slot.remove(index);
         Ok(())
     }
 }
