@@ -174,12 +174,13 @@ impl UdpMain {
             let thread_index = runtime.thread_index();
             let worker = DataWorkerId::try_from(thread_index)
                 .map_err(|_| UdpTransportError::WorkerUnavailable { thread_index })?;
-            self.worker(worker)?
-                .with_mut(|udp| operation(sessions, udp))
-                .map_err(|source| UdpTransportError::WorkerAccess {
+            let mut slot = self.worker(worker)?.borrow_mut().map_err(|source| {
+                UdpTransportError::WorkerAccess {
                     worker: worker.slot(),
                     source,
-                })?
+                }
+            })?;
+            operation(sessions, &mut slot)
         })
     }
 
