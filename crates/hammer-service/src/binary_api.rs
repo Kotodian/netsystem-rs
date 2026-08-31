@@ -13,6 +13,7 @@ use std::os::unix::net::UnixStream as StdUnixStream;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
+use hammer_infra::pool::Pool;
 use hammer_runtime::FILE_MAIN;
 use hammer_runtime::binary_api::{BinaryApiMethodEntry, BinaryApiMethodStatus};
 use hammer_runtime::file::{FileIoStatus, FileMain};
@@ -61,7 +62,7 @@ pub enum BinaryApiServerError {
 // VPP `VL_API_CLNT_NODE` budgets: bounded work per readiness event so one
 // chatty client or a burst of connects cannot monopolize the main thread.
 const PROCESS_NODE_NAME: &str = "binary-api";
-const MAX_CLIENTS: usize = 1024;
+const MAX_CLIENTS: u32 = 1024;
 const MAX_ACCEPTS_PER_EVENT: usize = 16;
 const MAX_FRAMES_PER_READ_EVENT: usize = 16;
 const READ_CHUNK_BYTES: usize = 4096;
@@ -70,100 +71,68 @@ const EVENT_ACCEPT_READY: u64 = 1;
 const EVENT_CLIENT_READ_READY: u64 = 2;
 const EVENT_CLIENT_WRITE_READY: u64 = 3;
 
-/// Generation-safe client identity carried in each client File's private
-/// data: `(generation << 32) | slot`. A stale event for a closed or recycled
-/// slot decodes to the wrong generation and is ignored.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct SocketToken(u64);
-
-impl SocketToken {
-    #[inline]
-    fn encode(slot: usize, generation: u32) -> Self {
-        Self(((generation as u64) << 32) | slot as u64)
-    }
-
-    #[inline]
-    fn slot(self) -> Option<usize> {
-        let slot = (self.0 & u32::MAX as u64) as usize;
-        (slot < MAX_CLIENTS).then_some(slot)
-    }
-
-    #[inline]
-    fn generation(self) -> u32 {
-        (self.0 >> 32) as u32
-    }
-}
-
-/// One accepted Binary API connection: the FileMain index, the frame buffer
-/// (VPP `unprocessed_input`), and the reply buffer flushed with TCP
-/// backpressure.
-struct ClientSlot {
-    generation: u32,
-    index: Option<u32>,
+/// One accepted Binary API connection stored directly in the existing index
+/// pool. File private data is the pool index; FileMain deletion precedes pool
+/// removal so a pending readiness event cannot target a recycled value.
+struct BinaryApiConnection {
+    file_index: Option<u32>,
     read_buf: Vec<u8>,
     output: Vec<u8>,
 }
 
-impl Default for ClientSlot {
-    fn default() -> Self {
+impl BinaryApiConnection {
+    fn new() -> Self {
         Self {
-            generation: 0,
-            index: None,
+            file_index: None,
             read_buf: Vec::new(),
             output: Vec::new(),
         }
     }
+
+    fn bind_file(&mut self, index: u32) {
+        self.file_index = Some(index);
+    }
+
+    fn clear(&mut self) {
+        self.file_index = None;
+        self.read_buf.clear();
+        self.output.clear();
+    }
 }
 
-/// VPP `socket_main.registration_pool`, keyed by generation-safe client
-/// registration tokens.
-struct SocketApiRegistrationPool {
+/// Main-thread connection pool for Binary API Process Node state.
+struct BinaryApiConnections {
     listener: u32,
-    slots: Vec<ClientSlot>,
-    /// Monotonic generation source: a recycled slot's new token never matches
-    /// a stale token held by the previous occupant.
-    next_generation: u32,
+    clients: Pool<BinaryApiConnection>,
 }
 
-impl SocketApiRegistrationPool {
+impl BinaryApiConnections {
     fn new(listener: u32) -> Self {
         Self {
             listener,
-            slots: (0..MAX_CLIENTS).map(|_| ClientSlot::default()).collect(),
-            next_generation: 0,
+            clients: Pool::with_fixed_capacity(MAX_CLIENTS),
         }
     }
 
-    #[inline]
-    fn slot(&self, token: SocketToken) -> Option<&ClientSlot> {
-        let slot = self.slots.get(token.slot()?)?;
-        (slot.generation == token.generation()).then_some(slot)
+    fn reserve(&mut self) -> Option<u32> {
+        (self.clients.len() < MAX_CLIENTS as usize)
+            .then(|| self.clients.insert(BinaryApiConnection::new()))
     }
 
-    #[inline]
-    fn slot_mut(&mut self, token: SocketToken) -> Option<&mut ClientSlot> {
-        let slot = self.slots.get_mut(token.slot()?)?;
-        (slot.generation == token.generation()).then_some(slot)
-    }
-
-    fn reserve(&mut self) -> Option<SocketToken> {
-        self.next_generation = self.next_generation.wrapping_add(1).max(1);
-        let generation = self.next_generation;
-        for (slot_index, slot) in self.slots.iter_mut().enumerate() {
-            if slot.generation == 0 {
-                slot.generation = generation;
-                return Some(SocketToken::encode(slot_index, generation));
-            }
-        }
-        None
-    }
-
-    fn release(&mut self, token: SocketToken) {
-        if let Some(slot) = self.slot_mut(token) {
-            slot.generation = 0;
+    fn release(&mut self, index: u32) {
+        if let Some(mut connection) = self.clients.remove(index) {
+            connection.clear();
         }
     }
+}
 
+impl Default for BinaryApiConnection {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl BinaryApiConnections {
     /// Consumes one event batch signalled by FileMain readiness callbacks.
     fn process_event(
         &mut self,
@@ -182,12 +151,16 @@ impl SocketApiRegistrationPool {
             }
             EVENT_CLIENT_READ_READY => {
                 for raw in data {
-                    self.client_read(file_main, SocketToken(*raw), max_frame_bytes);
+                    if let Ok(index) = u32::try_from(*raw) {
+                        self.client_read(file_main, index, max_frame_bytes);
+                    }
                 }
             }
             EVENT_CLIENT_WRITE_READY => {
                 for raw in data {
-                    self.client_flush(file_main, SocketToken(*raw), max_frame_bytes);
+                    if let Ok(index) = u32::try_from(*raw) {
+                        self.client_flush(file_main, index, max_frame_bytes);
+                    }
                 }
             }
             _ => {}
@@ -198,32 +171,31 @@ impl SocketApiRegistrationPool {
     /// VPP `vl_api_socket_accept`: pulls one pending connection per call; the
     /// per-event loop bounds the count.
     fn accept_ready(&mut self, file_main: &FileMain) -> RuntimeResult<bool> {
-        let Some(token) = self.reserve() else {
+        let Some(connection_index) = self.reserve() else {
             return Ok(false); // table full: the kernel backlog holds connects
         };
         match file_main.accept(
             self.listener,
             "binary-api client",
-            token.0,
+            connection_index as u64,
             client_file::file_functions::<NodeRuntime, RuntimeError>(),
         ) {
             Ok(Some(index)) => {
-                match self.slot_mut(token) {
-                    Some(slot) => {
-                        slot.index = Some(index);
-                        slot.read_buf.clear();
-                        slot.output.clear();
+                match self.clients.get_mut(connection_index) {
+                    Some(connection) => {
+                        connection.bind_file(index);
                     }
                     None => {
                         // Unreachable: the token was just reserved. Drop the
                         // registered File rather than leak it.
                         let _ = file_main.delete(index);
+                        self.release(connection_index);
                     }
                 }
                 Ok(true)
             }
             Ok(None) => {
-                self.release(token);
+                self.release(connection_index);
                 Ok(false)
             }
             Err(error) => {
@@ -231,7 +203,7 @@ impl SocketApiRegistrationPool {
                 // logs and keeps polling. The dropped socket closes with the
                 // error path; the next listener readiness pulls a new one.
                 tracing::warn!(%error, "Binary API accept failed; dropping connection");
-                self.release(token);
+                self.release(connection_index);
                 Ok(false)
             }
         }
@@ -239,26 +211,26 @@ impl SocketApiRegistrationPool {
 
     /// VPP `vl_api_socket_read`: one bounded chunk per readiness event into
     /// `unprocessed_input`, then every complete frame in it.
-    fn client_read(&mut self, file_main: &FileMain, token: SocketToken, max_frame_bytes: usize) {
-        let Some(slot) = self.slot(token) else {
+    fn client_read(&mut self, file_main: &FileMain, connection_index: u32, max_frame_bytes: usize) {
+        let Some(connection) = self.clients.get(connection_index) else {
             return; // stale event for a closed or recycled slot
         };
-        let Some(index) = slot.index else {
+        let Some(index) = connection.file_index else {
             return;
         };
         let mut chunk = [0_u8; READ_CHUNK_BYTES];
         match file_main.read_some(index, &mut chunk) {
             Ok(FileIoStatus::Progress(n)) => {
-                if let Some(slot) = self.slot_mut(token) {
-                    slot.read_buf.extend_from_slice(&chunk[..n]);
+                if let Some(connection) = self.clients.get_mut(connection_index) {
+                    connection.read_buf.extend_from_slice(&chunk[..n]);
                 }
-                self.parse_frames(file_main, token, max_frame_bytes);
+                self.parse_frames(file_main, connection_index, max_frame_bytes);
             }
             Ok(FileIoStatus::WouldBlock) => {}
-            Ok(FileIoStatus::Closed) => self.close(file_main, token),
+            Ok(FileIoStatus::Closed) => self.close(file_main, connection_index),
             Err(error) => {
                 tracing::warn!(%error, "Binary API read failed; closing client");
-                self.close(file_main, token);
+                self.close(file_main, connection_index);
             }
         }
     }
@@ -266,36 +238,41 @@ impl SocketApiRegistrationPool {
     /// VPP `vl_api_socket_write`: flush the reply buffer; EAGAIN (WouldBlock)
     /// keeps write interest armed so the next write readiness drains it, and
     /// a complete drain clears it.
-    fn client_flush(&mut self, file_main: &FileMain, token: SocketToken, max_frame_bytes: usize) {
+    fn client_flush(
+        &mut self,
+        file_main: &FileMain,
+        connection_index: u32,
+        max_frame_bytes: usize,
+    ) {
         loop {
             // Resume frames stalled by a saturated output buffer first.
-            self.parse_frames(file_main, token, max_frame_bytes);
-            let Some(slot) = self.slot(token) else {
+            self.parse_frames(file_main, connection_index, max_frame_bytes);
+            let Some(connection) = self.clients.get(connection_index) else {
                 return;
             };
-            if slot.output.is_empty() {
-                if let Some(index) = slot.index {
+            if connection.output.is_empty() {
+                if let Some(index) = connection.file_index {
                     let _ = file_main.set_data_available_to_write(index, false);
                 }
                 return;
             }
-            let Some(index) = slot.index else {
+            let Some(index) = connection.file_index else {
                 return;
             };
-            match file_main.write_some(index, &slot.output) {
+            match file_main.write_some(index, &connection.output) {
                 Ok(FileIoStatus::Progress(n)) => {
-                    if let Some(slot) = self.slot_mut(token) {
-                        slot.output.drain(..n);
+                    if let Some(connection) = self.clients.get_mut(connection_index) {
+                        connection.output.drain(..n);
                     }
                 }
                 Ok(FileIoStatus::WouldBlock) => return,
                 Ok(FileIoStatus::Closed) => {
-                    self.close(file_main, token);
+                    self.close(file_main, connection_index);
                     return;
                 }
                 Err(error) => {
                     tracing::warn!(%error, "Binary API write failed; closing client");
-                    self.close(file_main, token);
+                    self.close(file_main, connection_index);
                     return;
                 }
             }
@@ -306,29 +283,35 @@ impl SocketApiRegistrationPool {
     /// each under the worker barrier and enqueueing the reply. Stops when the
     /// frame budget for this event is spent, the output buffer saturates, or
     /// the buffer holds only a partial frame.
-    fn parse_frames(&mut self, file_main: &FileMain, token: SocketToken, max_frame_bytes: usize) {
+    fn parse_frames(
+        &mut self,
+        file_main: &FileMain,
+        connection_index: u32,
+        max_frame_bytes: usize,
+    ) {
         for _ in 0..MAX_FRAMES_PER_READ_EVENT {
-            let Some(slot) = self.slot(token) else {
+            let Some(connection) = self.clients.get(connection_index) else {
                 return;
             };
-            if slot.read_buf.len() < size_of::<u32>() {
+            if connection.read_buf.len() < size_of::<u32>() {
                 return;
             }
             let declared = u32::from_be_bytes(
-                slot.read_buf[..size_of::<u32>()]
+                connection.read_buf[..size_of::<u32>()]
                     .try_into()
                     .expect("four-byte length prefix"),
             ) as usize;
             if declared > max_frame_bytes {
                 tracing::warn!(declared, "Binary API frame exceeds maximum; closing client");
-                self.close(file_main, token);
+                self.close(file_main, connection_index);
                 return;
             }
             let frame_len = size_of::<u32>() + declared;
-            if slot.read_buf.len() < frame_len {
+            if connection.read_buf.len() < frame_len {
                 return; // partial frame: VPP keeps it in unprocessed_input
             }
-            let request = BinaryApiRequest::decode(&slot.read_buf[size_of::<u32>()..frame_len]);
+            let request =
+                BinaryApiRequest::decode(&connection.read_buf[size_of::<u32>()..frame_len]);
             let reply = match request {
                 Ok(request) => dispatch(request),
                 Err(_) => reply(0, BinaryApiStatus::InvalidRequest, Vec::new()),
@@ -339,25 +322,27 @@ impl SocketApiRegistrationPool {
                     bytes = encoded.len(),
                     "Binary API reply exceeds maximum; closing client"
                 );
-                self.close(file_main, token);
+                self.close(file_main, connection_index);
                 return;
             }
-            let Some(slot) = self.slot_mut(token) else {
+            let Some(connection) = self.clients.get_mut(connection_index) else {
                 return;
             };
             // Saturate rather than grow: parsing stalls until a flush drains
             // below the budget, and TCP backpressure limits the client.
-            if slot.output.len() + size_of::<u32>() + encoded.len() > output_budget(max_frame_bytes)
+            if connection.output.len() + size_of::<u32>() + encoded.len()
+                > output_budget(max_frame_bytes)
             {
                 return;
             }
-            let arm_write = slot.output.is_empty();
-            slot.output
+            let arm_write = connection.output.is_empty();
+            connection
+                .output
                 .extend_from_slice(&(encoded.len() as u32).to_be_bytes());
-            slot.output.extend_from_slice(&encoded);
-            slot.read_buf.drain(..frame_len);
+            connection.output.extend_from_slice(&encoded);
+            connection.read_buf.drain(..frame_len);
             if arm_write {
-                if let Some(index) = slot.index {
+                if let Some(index) = connection.file_index {
                     let _ = file_main.set_data_available_to_write(index, true);
                 }
             }
@@ -366,26 +351,37 @@ impl SocketApiRegistrationPool {
 
     /// Closes one client: removes backend interest and the File record, then
     /// frees the slot for reuse.
-    fn close(&mut self, file_main: &FileMain, token: SocketToken) {
-        if let Some(index) = self.slot(token).and_then(|slot| slot.index) {
+    fn close(&mut self, file_main: &FileMain, connection_index: u32) {
+        if let Some(index) = self
+            .clients
+            .get(connection_index)
+            .and_then(|connection| connection.file_index)
+        {
             let _ = file_main.delete(index);
         }
-        self.release(token);
+        self.release(connection_index);
     }
 }
 
-impl Drop for SocketApiRegistrationPool {
+impl Drop for BinaryApiConnections {
     fn drop(&mut self) {
         let Some(file_main) = FILE_MAIN.get() else {
             return;
         };
-        for slot in &mut self.slots {
-            if let Some(index) = slot.index.take() {
-                let _ = file_main.delete(index);
+        for connection_index in self
+            .clients
+            .iter()
+            .map(|(index, _)| index)
+            .collect::<Vec<_>>()
+        {
+            if let Some(connection) = self.clients.get(connection_index) {
+                if let Some(index) = connection.file_index {
+                    let _ = file_main.delete(index);
+                }
             }
-            slot.read_buf.clear();
-            slot.output.clear();
-            slot.generation = 0;
+            if let Some(mut connection) = self.clients.remove(connection_index) {
+                connection.clear();
+            }
         }
     }
 }
@@ -731,7 +727,7 @@ async fn binary_api_clnt(mut context: ProcessContext) -> RuntimeResult<()> {
     let file_main = FILE_MAIN
         .get()
         .expect("FileMain is initialized before Binary API startup");
-    let mut table = SocketApiRegistrationPool::new(capability.listener);
+    let mut table = BinaryApiConnections::new(capability.listener);
     let max_frame_bytes = capability.max_frame_bytes;
     loop {
         match context.wait_for_event().await {
