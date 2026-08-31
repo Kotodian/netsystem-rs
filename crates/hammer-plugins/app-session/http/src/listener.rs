@@ -389,12 +389,13 @@ impl HttpMain {
                 worker: worker.slot(),
             })
         })?;
-        slot.with_mut(operation).map_err(|source| {
+        let mut slot = slot.borrow_mut().map_err(|source| {
             RuntimeError::from(HttpWorkerError::WorkerAccess {
                 worker: worker.slot(),
                 source,
             })
-        })?
+        })?;
+        operation(&mut slot)
     }
 }
 

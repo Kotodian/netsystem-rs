@@ -321,12 +321,13 @@ impl QuicMain {
                 worker: worker.slot(),
             })
         })?;
-        slot.with_mut(operation).map_err(|source| {
+        let mut slot = slot.borrow_mut().map_err(|source| {
             RuntimeError::from(QuicWorkerError::WorkerAccess {
                 worker: worker.slot(),
                 source,
             })
-        })?
+        })?;
+        operation(&mut slot)
     }
 
     pub(crate) fn with_worker_and_sessions<R>(
@@ -340,13 +341,13 @@ impl QuicMain {
                 worker: worker.slot(),
             })
         })?;
-        slot.with_mut(|quic| operation(sessions, quic))
-            .map_err(|source| {
-                RuntimeError::from(QuicWorkerError::WorkerAccess {
-                    worker: worker.slot(),
-                    source,
-                })
-            })?
+        let mut slot = slot.borrow_mut().map_err(|source| {
+            RuntimeError::from(QuicWorkerError::WorkerAccess {
+                worker: worker.slot(),
+                source,
+            })
+        })?;
+        operation(sessions, &mut slot)
     }
 
     pub(crate) fn application_is_attached(

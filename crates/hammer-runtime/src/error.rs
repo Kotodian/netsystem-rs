@@ -120,16 +120,6 @@ pub enum RuntimeError {
     ProcessNodesRequireGlobalMain,
     #[error("Process Nodes must be controlled by their owner thread")]
     ProcessControlWrongThread,
-    #[error("control timer interval must be non-zero")]
-    ControlTimerIntervalZero,
-    #[error("control thread is stopped")]
-    ControlThreadStopped,
-    #[error("control command panicked")]
-    ControlCommandPanicked,
-    #[error("control command was canceled")]
-    ControlCommandCanceled,
-    #[error("control command timed out")]
-    ControlCommandTimedOut,
     #[error(transparent)]
     AppSession(#[from] crate::app::AppSessionError),
     #[error("Application Session control operation failed")]

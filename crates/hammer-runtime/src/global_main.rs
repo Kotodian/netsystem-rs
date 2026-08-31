@@ -8,9 +8,9 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::config::{StatsConfig, Worker};
 use crate::error::{RuntimeError, RuntimeResult};
-use crate::process::{ProcessContext, ProcessMain};
+use crate::process::ProcessContext;
 use crate::spawn::DataRemoteLocalQueue;
-use crate::{AsyncFileMain, DataPlaneMain, PluginMain, RuntimeRegistry};
+use crate::{AsyncFileMain, ControlThread, DataPlaneMain, PluginMain, RuntimeRegistry};
 use hammer_component_macros::Stats;
 use hammer_stats::{StatsMain, Timestamp};
 
@@ -54,12 +54,12 @@ async fn stat_segment_collector_process(mut context: ProcessContext) -> RuntimeR
 pub struct GlobalMain {
     cacheline0: CacheLineAlignMark,
     pub(crate) main: DataPlaneMain,
+    control_thread: ControlThread,
     pub registry: Arc<RuntimeRegistry>,
     pub(crate) barrier: crate::barrier::WorkerBarrier,
     pub(crate) main_loop_exit_now: Arc<AtomicBool>,
     pub main_loop_exit_status: Arc<Mutex<i32>>,
     pub(crate) memory_initialized: bool,
-    processes: ProcessMain,
     pub(crate) worker_config: Worker,
     pub(crate) called_init_functions: HashSet<&'static str>,
     pub(crate) called_early_config_functions: HashSet<&'static str>,

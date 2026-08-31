@@ -273,12 +273,14 @@ impl TcpMain {
         let thread_index = runtime.thread_index();
         let worker = DataWorkerId::try_from(thread_index)
             .map_err(|_| TcpWorkerError::WorkerUnavailable { thread_index })?;
-        self.worker(worker)?
-            .with_mut(operation)
-            .map_err(|source| TcpWorkerError::WorkerAccess {
-                worker: worker.slot(),
-                source,
-            })?
+        let mut slot =
+            self.worker(worker)?
+                .borrow_mut()
+                .map_err(|source| TcpWorkerError::WorkerAccess {
+                    worker: worker.slot(),
+                    source,
+                })?;
+        operation(&mut slot)
     }
 
     pub fn control(&self) -> &TcpInputControlPlane {

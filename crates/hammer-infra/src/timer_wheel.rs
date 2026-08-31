@@ -5,18 +5,12 @@ const INVALID_INDEX: u32 = u32::MAX;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct TimerHandle {
     slot: u32,
-    generation: u32,
 }
 
 impl TimerHandle {
     #[inline(always)]
     pub const fn slot(self) -> u32 {
         self.slot
-    }
-
-    #[inline(always)]
-    pub const fn generation(self) -> u32 {
-        self.generation
     }
 }
 
@@ -34,7 +28,6 @@ where
     next: u32,
     prev: u32,
     payload: Option<T>,
-    generation: u32,
     live: bool,
     fast_ring_offset: u32,
     slow_ring_offset: u32,
@@ -51,7 +44,6 @@ where
             next: index,
             prev: index,
             payload: None,
-            generation: 0,
             live: false,
             fast_ring_offset: 0,
             slow_ring_offset: 0,
@@ -60,12 +52,11 @@ where
     }
 
     #[inline]
-    fn timer(generation: u32, payload: T, expiration_tick: u64) -> Self {
+    fn timer(payload: T, expiration_tick: u64) -> Self {
         Self {
             next: INVALID_INDEX,
             prev: INVALID_INDEX,
             payload: Some(payload),
-            generation,
             live: true,
             fast_ring_offset: 0,
             slow_ring_offset: 0,
@@ -93,7 +84,6 @@ pub struct TimerWheel<
     fast_slot_bitmap: Bitmap,
     slot_generations: Vec<u32>,
     timer_slots: Vec<u32>,
-    timer_entry_generations: Vec<u32>,
     timer_bitmap: Bitmap,
     timers_per_slot: usize,
     len: usize,
@@ -148,7 +138,6 @@ where
             fast_slot_bitmap,
             slot_generations: Vec::new(),
             timer_slots: Vec::new(),
-            timer_entry_generations: Vec::new(),
             timer_bitmap: Bitmap::new(),
             timers_per_slot: 0,
             len: 0,
@@ -179,8 +168,7 @@ where
             .ok_or(TimerStartError::IntervalOutOfRange)?;
         let slot = self.allocate_timer(payload, expiration_tick);
         self.place_timer(slot, interval);
-        let generation = self.entries[slot as usize].generation;
-        Ok(TimerHandle { slot, generation })
+        Ok(TimerHandle { slot })
     }
 
     pub fn stop(&mut self, handle: TimerHandle) -> bool {
@@ -386,8 +374,7 @@ where
     fn allocate_timer(&mut self, payload: T, expiration_tick: u64) -> u32 {
         if let Some(slot) = self.free.pop() {
             let entry = &mut self.entries[slot as usize];
-            let generation = entry.generation.wrapping_add(1).max(1);
-            *entry = TimerEntry::timer(generation, payload, expiration_tick);
+            *entry = TimerEntry::timer(payload, expiration_tick);
             self.len += 1;
             return slot;
         }
@@ -398,7 +385,7 @@ where
             "timer wheel entry index overflow"
         );
         self.entries
-            .push(TimerEntry::timer(1, payload, expiration_tick));
+            .push(TimerEntry::timer(payload, expiration_tick));
         self.len += 1;
         slot as u32
     }
@@ -541,7 +528,7 @@ where
         }
 
         let entry = self.entries[slot];
-        (entry.live && entry.generation == handle.generation).then_some(slot)
+        entry.live.then_some(slot)
     }
 
     fn validate_interval(&self, interval: u64) -> Result<(), TimerStartError> {
@@ -631,7 +618,6 @@ impl<
         let _ = self.cancel_timer(slot, generation, timer_id);
         let handle = self.start(flat as u32, interval)?;
         self.timer_slots[flat] = handle.slot();
-        self.timer_entry_generations[flat] = handle.generation();
         self.timer_bitmap.set(flat);
         Ok(())
     }
@@ -650,7 +636,6 @@ impl<
         }
         let handle = TimerHandle {
             slot: self.timer_slots[flat],
-            generation: self.timer_entry_generations[flat],
         };
         self.clear_timer_slot(flat);
         self.stop(handle)
@@ -668,7 +653,6 @@ impl<
         if self.timer_bitmap.is_set(flat) {
             let handle = TimerHandle {
                 slot: self.timer_slots[flat],
-                generation: self.timer_entry_generations[flat],
             };
             if self.update(handle, interval)? {
                 return Ok(());
@@ -708,10 +692,8 @@ impl<
             let required = (slot + 1) * self.timers_per_slot;
             let additional = required.saturating_sub(self.timer_slots.len());
             self.timer_slots.reserve(additional);
-            self.timer_entry_generations.reserve(additional);
             while self.timer_slots.len() < required {
                 self.timer_slots.push(INVALID_INDEX);
-                self.timer_entry_generations.push(0);
             }
         }
         if self.slot_generations[slot] == generation {
@@ -736,7 +718,6 @@ impl<
             }
             let handle = TimerHandle {
                 slot: self.timer_slots[flat],
-                generation: self.timer_entry_generations[flat],
             };
             self.clear_timer_slot(flat);
             let _ = self.stop(handle);
@@ -761,7 +742,6 @@ impl<
     fn clear_timer_slot(&mut self, flat: usize) {
         self.timer_bitmap.clear(flat);
         self.timer_slots[flat] = INVALID_INDEX;
-        self.timer_entry_generations[flat] = 0;
     }
 }
 

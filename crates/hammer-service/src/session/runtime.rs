@@ -1102,12 +1102,13 @@ impl SessionMain {
         let thread_index = runtime.thread_index();
         let worker = DataWorkerId::try_from(thread_index)
             .map_err(|_| SessionQueueError::WorkerUnavailable { thread_index })?;
-        self.worker(worker)?.with_mut(operation).map_err(|source| {
+        let mut slot = self.worker(worker)?.borrow_mut().map_err(|source| {
             SessionQueueError::WorkerAccess {
                 worker: worker.slot(),
                 source,
             }
-        })?
+        })?;
+        operation(&mut slot)
     }
 
     pub(crate) fn session_queue_is_interrupt(
@@ -1144,16 +1145,13 @@ impl SessionMain {
             loop {
                 let main = self;
                 match engine.schedule_on_worker(worker, move || {
-                    main.worker(worker)
+                    let mut sessions = main
+                        .worker(worker)
                         .expect("scheduled Application detach targets an existing Session worker")
-                        .with_mut(|sessions| {
-                            sessions.application_detached(application);
-                            hammer_runtime::with_data_plane_main(|main| {
-                                sessions.wake_session_queue(main)
-                            })?;
-                            Ok::<(), RuntimeError>(())
-                        })
-                        .expect("scheduled Application detach runs on its Session worker")
+                        .borrow_mut()
+                        .expect("scheduled Application detach runs on its Session worker");
+                    sessions.application_detached(application);
+                    hammer_runtime::with_data_plane_main(|main| sessions.wake_session_queue(main))
                         .expect("Application detach operation failed on its Session worker");
                 }) {
                     Ok(()) => break,
@@ -1195,14 +1193,13 @@ impl SessionMain {
             let main = self;
             schedule_worker_task(engine, worker, move || {
                 hammer_runtime::with_data_plane_main_mut(|runtime| {
-                    main.worker(worker)?
-                        .with_mut(|sessions| {
-                            sessions.install_app_mq(application, queue, app_session_input, runtime)
-                        })
-                        .map_err(|source| SessionQueueError::WorkerAccess {
+                    let mut sessions = main.worker(worker)?.borrow_mut().map_err(|source| {
+                        SessionQueueError::WorkerAccess {
                             worker: worker.slot(),
                             source,
-                        })?
+                        }
+                    })?;
+                    sessions.install_app_mq(application, queue, app_session_input, runtime)
                 })
             })?;
             Ok::<(), RuntimeError>(())
@@ -1219,15 +1216,14 @@ impl SessionMain {
             let worker = DataWorkerId::new(worker_slot as u32);
             let main = self;
             schedule_worker_task(engine, worker, move || {
-                main.worker(worker)?
-                    .with_mut(|sessions| {
-                        sessions.drain_app_mq(application)?;
-                        Ok(())
-                    })
-                    .map_err(|source| SessionQueueError::WorkerAccess {
+                let mut sessions = main.worker(worker)?.borrow_mut().map_err(|source| {
+                    SessionQueueError::WorkerAccess {
                         worker: worker.slot(),
                         source,
-                    })?
+                    }
+                })?;
+                sessions.drain_app_mq(application)?;
+                Ok::<(), RuntimeError>(())
             })?;
             Ok::<(), RuntimeError>(())
         })?;
@@ -1238,12 +1234,13 @@ impl SessionMain {
             let main = self;
             if let Err(error) = schedule_worker_task(engine, worker, move || {
                 hammer_runtime::with_data_plane_main_mut(|runtime| {
-                    main.worker(worker)?
-                        .with_mut(|sessions| sessions.remove_app_mq(application, runtime))
-                        .map_err(|source| SessionQueueError::WorkerAccess {
+                    let mut sessions = main.worker(worker)?.borrow_mut().map_err(|source| {
+                        SessionQueueError::WorkerAccess {
                             worker: worker.slot(),
                             source,
-                        })?
+                        }
+                    })?;
+                    sessions.remove_app_mq(application, runtime)
                 })
             }) {
                 first_error.get_or_insert(error);
