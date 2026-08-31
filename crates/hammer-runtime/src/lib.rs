@@ -109,5 +109,5 @@ pub mod start_workers;
 mod worker_thread;
 
 pub use barrier::WorkerBarrier;
-pub use control_thread::{ControlThread, ControlThreadHandle, ControlTimerHandle};
+pub use control_thread::ControlThread;
 pub use spawn::{with_data_plane_main, with_data_plane_main_mut};
