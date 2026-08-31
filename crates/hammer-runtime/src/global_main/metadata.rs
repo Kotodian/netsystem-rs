@@ -6,7 +6,6 @@ use crate::PluginMain;
 use crate::config::Worker;
 use crate::error::{RuntimeError, RuntimeResult};
 use crate::global_main::{GlobalMain, WorkerPublication};
-use crate::process::ProcessMain;
 use crate::{DataPlaneMain, RuntimeRegistry};
 
 impl GlobalMain {
@@ -84,7 +83,6 @@ impl GlobalMain {
             control_file_main: None,
             ipc_listener: None,
             closed: false,
-            processes: ProcessMain::new(),
         }
     }
 

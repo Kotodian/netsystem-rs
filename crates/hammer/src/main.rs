@@ -167,14 +167,8 @@ fn run(config: String, roots: Vec<String>, worker: Worker) {
             eprintln!("Failed to construct configured runtime: {error}");
             std::process::exit(1);
         });
-    let rt = tokio::runtime::Builder::new_current_thread()
-        .enable_io()
-        .enable_time()
-        .build()
-        .expect("build tokio runtime");
-
     let mut engine = engine;
-    if let Err(error) = engine.init_control(&rt) {
+    if let Err(error) = engine.init_control() {
         eprintln!("Failed to construct stats-enabled runtime: {error}");
         std::process::exit(1);
     }
@@ -195,7 +189,7 @@ fn run(config: String, roots: Vec<String>, worker: Worker) {
 
     // The `binary-api` Process Node serves the Binary API socket; it runs as
     // a registered Process Node, not as a control-loop select arm.
-    if let Err(error) = engine.run_processes_until(&rt, async move {
+    if let Err(error) = engine.run_processes_until(async move {
         match attach_server {
             Some(attach) => {
                 let attach_applications = applications
@@ -242,7 +236,7 @@ fn run(config: String, roots: Vec<String>, worker: Worker) {
         .close()
         .unwrap_or_else(|error| tracing::error!(%error, "Main-loop exit hook failed"));
     engine
-        .shutdown_process_nodes(&rt)
+        .shutdown_process_nodes()
         .unwrap_or_else(|error| tracing::error!(%error, "Process Node shutdown failed"));
     GlobalMain::uninstall_current();
 }

@@ -11,7 +11,7 @@ use hammer_infra::checksum::internet_checksum;
 use hammer_infra::pool::Pool;
 use hammer_runtime::sync::SpinLock;
 use hammer_runtime::{
-    DataPlaneMain, DataWorkerId, Node, NodeProcessFn, NodeRuntimeData, TraceFormatter,
+    DataPlaneMain, DataWorkerId, GlobalMain, Node, NodeProcessFn, NodeRuntimeData, TraceFormatter,
     add_packet_trace, format_packet_trace,
 };
 use hammer_runtime::{RuntimeError, RuntimeResult};
@@ -347,7 +347,9 @@ async fn ip_reassembly_expire_process(
         let _ = context
             .wait_for_event_or_clock(REASSEMBLY_EXPIRE_WALK_INTERVAL)
             .await;
-        let _ = main.expire_all(context.data_plane_main(), Instant::now());
+        let _ = GlobalMain::with_current(|engine| {
+            main.expire_all(engine.data_plane_main(), Instant::now())
+        });
     }
 }
 

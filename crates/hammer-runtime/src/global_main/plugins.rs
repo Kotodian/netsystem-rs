@@ -22,7 +22,7 @@ impl GlobalMain {
         }
 
         let resume_main_loop = self.main_loop_entered;
-        let resume_processes = self.processes.is_started();
+        let resume_processes = self.control_thread.is_started();
         let loaded_plugin_count = self.plugin_main.loaded_plugins().len();
         self.plugin_main.load(env!("CARGO_PKG_VERSION"), roots)?;
         if self.plugin_main.loaded_plugins().len() == loaded_plugin_count {

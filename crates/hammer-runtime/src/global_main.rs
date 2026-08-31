@@ -8,7 +8,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::config::{StatsConfig, Worker};
 use crate::error::{RuntimeError, RuntimeResult};
-use crate::process::{ProcessContext, ProcessMain};
+use crate::process::ProcessContext;
 use crate::spawn::DataRemoteLocalQueue;
 use crate::{AsyncFileMain, ControlThread, DataPlaneMain, PluginMain, RuntimeRegistry};
 use hammer_component_macros::Stats;
@@ -60,7 +60,6 @@ pub struct GlobalMain {
     pub(crate) main_loop_exit_now: Arc<AtomicBool>,
     pub main_loop_exit_status: Arc<Mutex<i32>>,
     pub(crate) memory_initialized: bool,
-    processes: ProcessMain,
     pub(crate) worker_config: Worker,
     pub(crate) called_init_functions: HashSet<&'static str>,
     pub(crate) called_early_config_functions: HashSet<&'static str>,

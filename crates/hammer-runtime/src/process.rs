@@ -7,18 +7,13 @@
 //! mapped for the process lifetime.
 
 use std::future::Future;
-use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::pin::Pin;
 use std::sync::Arc;
-use std::thread::{self, ThreadId};
 use std::time::Duration;
 
+use crate::RuntimeRegistry;
 use crate::error::{RuntimeError, RuntimeResult};
-use hammer_runtime::RuntimeRegistry;
 use tokio::sync::mpsc;
-use tokio::task::{JoinHandle, LocalSet};
-
-use crate::DataPlaneMain;
 
 pub type ProcessFuture = Pin<Box<dyn Future<Output = RuntimeResult<()>> + 'static>>;
 
@@ -71,7 +66,7 @@ impl ProcessWake {
 }
 
 #[derive(Debug, Clone, Copy)]
-struct ProcessSignal {
+pub(crate) struct ProcessSignal {
     event_type: u64,
     data: u64,
 }
@@ -79,22 +74,19 @@ struct ProcessSignal {
 pub struct ProcessContext {
     name: &'static str,
     registry: Arc<RuntimeRegistry>,
-    runtime: DataPlaneMain,
     events: mpsc::UnboundedReceiver<ProcessSignal>,
     pending: Vec<ProcessEventBatch>,
 }
 
 impl ProcessContext {
-    fn new(
+    pub(crate) fn new(
         name: &'static str,
         registry: Arc<RuntimeRegistry>,
-        runtime: DataPlaneMain,
         events: mpsc::UnboundedReceiver<ProcessSignal>,
     ) -> Self {
         Self {
             name,
             registry,
-            runtime,
             events,
             pending: Vec::new(),
         }
@@ -111,13 +103,6 @@ impl ProcessContext {
         T: Send + Sync + 'static,
     {
         self.registry.require::<T>()
-    }
-
-    /// Main-thread data-plane view, equivalent to the process node's
-    /// `vlib_main_t`. It is never a Data Worker runtime.
-    #[inline]
-    pub fn data_plane_main(&self) -> &DataPlaneMain {
-        &self.runtime
     }
 
     /// Suspend until a signal arrives or `duration` elapses.
@@ -184,6 +169,10 @@ pub struct ProcessHandle {
 }
 
 impl ProcessHandle {
+    pub(crate) fn new(name: &'static str, events: mpsc::UnboundedSender<ProcessSignal>) -> Self {
+        Self { name, events }
+    }
+
     #[inline]
     pub fn name(&self) -> &'static str {
         self.name
@@ -193,124 +182,5 @@ impl ProcessHandle {
         self.events
             .send(ProcessSignal { event_type, data })
             .map_err(|_| RuntimeError::service_closed())
-    }
-}
-
-struct RunningProcess {
-    handle: ProcessHandle,
-    task: JoinHandle<RuntimeResult<()>>,
-}
-
-pub(crate) struct ProcessMain {
-    owner: ThreadId,
-    local: LocalSet,
-    running: Vec<RunningProcess>,
-    started: bool,
-}
-
-impl ProcessMain {
-    pub(crate) fn new() -> Self {
-        Self {
-            owner: thread::current().id(),
-            local: LocalSet::new(),
-            running: Vec::new(),
-            started: false,
-        }
-    }
-
-    #[inline]
-    pub(crate) fn is_started(&self) -> bool {
-        self.started
-    }
-
-    fn ensure_owner(&self) -> RuntimeResult<()> {
-        if thread::current().id() == self.owner {
-            Ok(())
-        } else {
-            Err(RuntimeError::ProcessControlWrongThread)
-        }
-    }
-
-    pub(crate) fn start(
-        &mut self,
-        registry: Arc<RuntimeRegistry>,
-        runtime: DataPlaneMain,
-        entries: Vec<ProcessEntry>,
-    ) -> RuntimeResult<()> {
-        self.ensure_owner()?;
-        let mut names = Vec::with_capacity(entries.len());
-        for entry in &entries {
-            if names.contains(&entry.name) {
-                return Err(RuntimeError::DuplicateProcessNode { name: entry.name });
-            }
-            names.push(entry.name);
-        }
-        let mut prepared = Vec::with_capacity(entries.len());
-        for entry in entries {
-            if self
-                .running
-                .iter()
-                .any(|running| running.handle.name == entry.name)
-            {
-                continue;
-            }
-            let (events, receiver) = mpsc::unbounded_channel();
-            let context =
-                ProcessContext::new(entry.name, Arc::clone(&registry), runtime.clone(), receiver);
-            let future = match catch_unwind(AssertUnwindSafe(|| (entry.start)(context))) {
-                Ok(future) => future,
-                Err(payload) => std::panic::resume_unwind(payload),
-            };
-            prepared.push((entry, events, future));
-        }
-        for (entry, events, future) in prepared {
-            let task = self.local.spawn_local(future);
-            self.running.push(RunningProcess {
-                handle: ProcessHandle {
-                    name: entry.name,
-                    events,
-                },
-                task,
-            });
-        }
-        self.started = true;
-        Ok(())
-    }
-
-    pub(crate) fn handle(&self, name: &str) -> Option<ProcessHandle> {
-        self.running
-            .iter()
-            .find(|running| running.handle.name == name)
-            .map(|running| running.handle.clone())
-    }
-
-    pub(crate) fn run_until<'a, F>(&'a self, future: F) -> impl Future<Output = F::Output> + 'a
-    where
-        F: Future + 'a,
-    {
-        self.local.run_until(future)
-    }
-
-    pub(crate) fn shutdown(&mut self, runtime: &tokio::runtime::Runtime) -> RuntimeResult<()> {
-        self.ensure_owner()?;
-        let mut running = core::mem::take(&mut self.running);
-        for process in &running {
-            process.task.abort();
-        }
-        self.local.block_on(runtime, async move {
-            for process in running.drain(..) {
-                match process.task.await {
-                    Ok(Ok(())) => {}
-                    Err(error) if error.is_cancelled() => {}
-                    Ok(Err(error)) => {
-                        tracing::error!(process = process.handle.name, %error, "Process Node failed");
-                    }
-                    Err(error) => {
-                        tracing::error!(process = process.handle.name, %error, "Process Node panicked");
-                    }
-                }
-            }
-        });
-        Ok(())
     }
 }

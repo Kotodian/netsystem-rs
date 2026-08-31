@@ -13,29 +13,22 @@ impl GlobalMain {
         if self.main.thread_index() != 0 {
             return Err(RuntimeError::ProcessNodesRequireGlobalMain);
         }
-        self.processes.start(
-            Arc::clone(&self.registry),
-            self.main.clone(),
-            self.plugin_main.process_nodes(),
-        )
+        self.control_thread
+            .start_processes(Arc::clone(&self.registry), self.plugin_main.process_nodes())
     }
 
     pub fn process_handle(&self, name: &str) -> Option<ProcessHandle> {
-        self.processes.handle(name)
+        self.control_thread.process_handle(name)
     }
 
-    pub fn init_control(&mut self, runtime: &tokio::runtime::Runtime) -> RuntimeResult<()> {
+    pub fn init_control(&mut self) -> RuntimeResult<()> {
         crate::file::init_file_main(self)?;
-        let _entered = runtime.enter();
+        let _entered = self.control_thread.runtime().enter();
         self.control_file_main = Some(AsyncFileMain::new()?);
         Ok(())
     }
 
-    pub fn run_processes_until<F>(
-        &mut self,
-        runtime: &tokio::runtime::Runtime,
-        future: F,
-    ) -> RuntimeResult<F::Output>
+    pub fn run_processes_until<F>(&mut self, future: F) -> RuntimeResult<F::Output>
     where
         F: std::future::Future,
     {
@@ -46,8 +39,8 @@ impl GlobalMain {
             )
         })?;
         let graph = NodeRuntime::default();
-        runtime.block_on(async {
-            let process_future = self.processes.run_until(future);
+        self.control_thread.run(async {
+            let process_future = self.control_thread.run_processes_until(future);
             tokio::pin!(process_future);
             loop {
                 tokio::select! {
@@ -57,14 +50,11 @@ impl GlobalMain {
                     },
                 }
             }
-        })
+        })?
     }
 
-    pub fn shutdown_process_nodes(
-        &mut self,
-        runtime: &tokio::runtime::Runtime,
-    ) -> RuntimeResult<()> {
-        self.processes.shutdown(runtime)
+    pub fn shutdown_process_nodes(&mut self) -> RuntimeResult<()> {
+        self.control_thread.shutdown_processes()
     }
 
     pub fn main_loop_enter(&mut self, roots: &[String], config: &str) -> RuntimeResult<()> {

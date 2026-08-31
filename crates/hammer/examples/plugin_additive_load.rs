@@ -79,11 +79,6 @@ enum ExampleError {
     #[cfg(not(any(target_os = "macos", target_os = "linux")))]
     #[error("image inspection is unsupported on this platform")]
     ImageInspectionUnsupported,
-    #[error("failed to build the Process Node runtime")]
-    ProcessRuntime {
-        #[source]
-        source: std::io::Error,
-    },
     #[error("the host graph did not publish the drop node")]
     HostDropNodeMissing,
     #[error("an empty startup root set activated a plugin")]
@@ -126,21 +121,16 @@ fn main() -> Result<(), ExampleError> {
         .plugins;
     exercise_post_ready_allocations(&roots)?;
 
-    let process_runtime = tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-        .map_err(|source| ExampleError::ProcessRuntime { source })?;
-
     let runtime = DataPlaneMain::new(DataPlaneBufferConfig::default());
     let mut engine = GlobalMain::new(runtime, RuntimeRegistry::new());
-    engine.init_control(&process_runtime)?;
+    engine.init_control()?;
     engine
         .plugin_main_mut()
         .register_builtin_image(hammer_service::registration_image());
     engine.install_current();
 
     let example_result = run_example(&mut engine, main_heap_capacity, &roots, EXAMPLE_CONFIG);
-    let process_shutdown = engine.shutdown_process_nodes(&process_runtime);
+    let process_shutdown = engine.shutdown_process_nodes();
     let close_result = engine.close();
     GlobalMain::uninstall_current();
 
