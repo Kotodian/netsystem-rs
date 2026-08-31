@@ -16,7 +16,7 @@ use arc_swap::ArcSwapOption;
 use hammer_core::data_plane::{
     BufferFrame, BufferPacketCursor, Index, NodeId, NodeNext, NodeRegistration, SecondaryOpaque,
 };
-use hammer_runtime::{ControlThreadHandle, WorkerBarrier};
+use hammer_runtime::WorkerBarrier;
 use hammer_runtime::{
     DataPlaneMain, InternalNode, Node, NodeProcessFn, NodeRuntimeData, TraceFormatter,
     add_packet_trace, format_packet_trace, unlikely,
@@ -62,7 +62,6 @@ pub struct AdjacencyRewriteTrace {
 
 pub struct IpLookupControlPlane {
     table: FibTableHandle,
-    control_handle: Option<Arc<ControlThreadHandle>>,
     barrier: Option<WorkerBarrier>,
 }
 
@@ -71,7 +70,6 @@ impl IpLookupControlPlane {
     pub fn new(table: FibTable<u16>) -> Self {
         Self {
             table: FibTableHandle::new(table),
-            control_handle: None,
             barrier: None,
         }
     }
@@ -80,15 +78,8 @@ impl IpLookupControlPlane {
     pub fn from_handle(table: FibTableHandle) -> Self {
         Self {
             table,
-            control_handle: None,
             barrier: None,
         }
-    }
-
-    #[inline]
-    pub fn with_control_handle(mut self, control_handle: Arc<ControlThreadHandle>) -> Self {
-        self.control_handle = Some(control_handle);
-        self
     }
 
     #[inline]
@@ -119,11 +110,7 @@ impl IpLookupControlPlane {
             }
             RuntimeResult::Ok(())
         };
-        if let Some(control_handle) = &self.control_handle {
-            control_handle.call(publish)??;
-        } else {
-            publish()?;
-        }
+        publish()?;
         Ok(())
     }
 }
