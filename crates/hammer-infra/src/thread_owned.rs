@@ -1,6 +1,5 @@
-use std::cell::UnsafeCell;
+use std::cell::{RefCell, RefMut, UnsafeCell};
 use std::fmt;
-use std::ops::{Deref, DerefMut};
 use std::sync::atomic::{AtomicU8, Ordering};
 use std::thread::{self, ThreadId};
 
@@ -31,8 +30,7 @@ impl std::error::Error for ThreadOwnedError {}
 pub struct ThreadOwned<T> {
     state: AtomicU8,
     owner: UnsafeCell<Option<ThreadId>>,
-    value: UnsafeCell<Option<T>>,
-    borrowed: UnsafeCell<bool>,
+    value: RefCell<Option<T>>,
 }
 
 const UNINSTALLED: u8 = 0;
@@ -45,8 +43,7 @@ impl<T> ThreadOwned<T> {
         Self {
             state: AtomicU8::new(UNINSTALLED),
             owner: UnsafeCell::new(None),
-            value: UnsafeCell::new(None),
-            borrowed: UnsafeCell::new(false),
+            value: RefCell::new(None),
         }
     }
 
@@ -74,7 +71,7 @@ impl<T> ThreadOwned<T> {
         // release publication below.
         let owner = unsafe { &mut *self.owner.get() };
         *owner = Some(current);
-        let slot = unsafe { &mut *self.value.get() };
+        let slot = unsafe { &mut *self.value.as_ptr() };
         debug_assert!(slot.is_none(), "claimed ThreadOwned slot is empty");
         *slot = Some(value);
         self.state.store(INSTALLED, Ordering::Release);
@@ -82,7 +79,7 @@ impl<T> ThreadOwned<T> {
     }
 
     #[inline]
-    pub fn borrow_mut(&self) -> Result<ThreadOwnedBorrow<'_, T>, ThreadOwnedError> {
+    pub fn borrow_mut(&self) -> Result<RefMut<'_, T>, ThreadOwnedError> {
         if self.state.load(Ordering::Acquire) != INSTALLED {
             return Err(ThreadOwnedError::NotInstalled);
         }
@@ -94,15 +91,13 @@ impl<T> ThreadOwned<T> {
             Some(_) => {}
         }
 
-        // SAFETY: `owner` matches the current thread, so no other live thread
-        // can access these cells. The flag rejects reentrant mutable access on
-        // that owner thread.
-        let borrowed = unsafe { &mut *self.borrowed.get() };
-        if *borrowed {
-            return Err(ThreadOwnedError::AlreadyBorrowed);
-        }
-        *borrowed = true;
-        Ok(ThreadOwnedBorrow { slot: self })
+        RefMut::filter_map(
+            self.value
+                .try_borrow_mut()
+                .map_err(|_| ThreadOwnedError::AlreadyBorrowed)?,
+            |value| value.as_mut(),
+        )
+        .map_err(|_| ThreadOwnedError::NotInstalled)
     }
 
     /// Clears an installed value on its owner thread before the slot is dropped.
@@ -115,10 +110,10 @@ impl<T> ThreadOwned<T> {
         {
             return Err(ThreadOwnedError::WrongThread);
         }
-        if unsafe { *self.borrowed.get() } {
-            return Err(ThreadOwnedError::AlreadyBorrowed);
-        }
-        let value = unsafe { &mut *self.value.get() }
+        let value = self
+            .value
+            .try_borrow_mut()
+            .map_err(|_| ThreadOwnedError::AlreadyBorrowed)?
             .take()
             .ok_or(ThreadOwnedError::NotInstalled)?;
         unsafe {
@@ -148,43 +143,40 @@ impl<T> fmt::Debug for ThreadOwned<T> {
     }
 }
 
-pub struct ThreadOwnedBorrow<'a, T> {
-    slot: &'a ThreadOwned<T>,
-}
-
-impl<T> Deref for ThreadOwnedBorrow<'_, T> {
-    type Target = T;
-
-    fn deref(&self) -> &Self::Target {
-        unsafe {
-            (*self.slot.value.get())
-                .as_ref()
-                .expect("installed ThreadOwned value is missing")
-        }
-    }
-}
-
-impl<T> DerefMut for ThreadOwnedBorrow<'_, T> {
-    fn deref_mut(&mut self) -> &mut Self::Target {
-        unsafe {
-            (*self.slot.value.get())
-                .as_mut()
-                .expect("installed ThreadOwned value is missing")
-        }
-    }
-}
-
-impl<T> Drop for ThreadOwnedBorrow<'_, T> {
-    fn drop(&mut self) {
-        // SAFETY: a guard exists only on the bound owner thread while this
-        // borrow is active. Dropping the guard ends that exclusive borrow.
-        unsafe {
-            *self.slot.borrowed.get() = false;
-        }
-    }
-}
-
 // SAFETY: shared cross-thread access checks the installing ThreadId before
-// touching either UnsafeCell. Only the owner can create a mutable reference,
-// and the borrow flag rejects reentrant owner access.
+// touching the owner-only value. `RefCell` rejects reentrant owner access.
 unsafe impl<T: Send> Sync for ThreadOwned<T> {}
+
+#[cfg(test)]
+mod tests {
+    use super::{ThreadOwned, ThreadOwnedError};
+
+    #[test]
+    fn owner_can_borrow_and_clear() {
+        let slot = ThreadOwned::new();
+        slot.install(7_u32).expect("first install succeeds");
+        *slot.borrow_mut().expect("owner borrow succeeds") = 9;
+        assert_eq!(*slot.borrow_mut().expect("second borrow succeeds"), 9);
+        assert_eq!(slot.clear().expect("owner clear succeeds"), 9);
+        assert!(matches!(
+            slot.borrow_mut(),
+            Err(ThreadOwnedError::NotInstalled)
+        ));
+    }
+
+    #[test]
+    fn non_owner_cannot_borrow_or_clear() {
+        let slot = std::sync::Arc::new(ThreadOwned::new());
+        slot.install(7_u32).expect("first install succeeds");
+        let worker = std::sync::Arc::clone(&slot);
+        let result = std::thread::spawn(move || {
+            (
+                worker.borrow_mut().unwrap_err(),
+                worker.clear().unwrap_err(),
+            )
+        })
+        .join()
+        .expect("worker exits");
+        assert_eq!(result, (ThreadOwnedError::WrongThread, ThreadOwnedError::WrongThread));
+    }
+}
