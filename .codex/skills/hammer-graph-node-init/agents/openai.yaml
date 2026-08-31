@@ -1,0 +1,4 @@
+interface:
+  display_name: "Hammer Graph Node Init"
+  short_description: "Initialize graph nodes with existing macros"
+  default_prompt: "Use $hammer-graph-node-init to align this node registration with Hammer macros."

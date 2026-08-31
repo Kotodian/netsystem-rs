@@ -1,0 +1,3 @@
+interface:
+  display_name: "VPP IP/FIB + Sync Alignment"
+  short_description: "Align IP forwarding ownership and synchronization with VPP"

@@ -1,0 +1,4 @@
+interface:
+  display_name: "Hammer Init Function"
+  short_description: "Initialize plugin Main state with existing macros"
+  default_prompt: "Use $hammer-init-function to design this plugin initialization without changing hammer-runtime."

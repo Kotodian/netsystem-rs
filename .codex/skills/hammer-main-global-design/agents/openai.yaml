@@ -1,0 +1,4 @@
+interface:
+  display_name: "Hammer Main Global Design"
+  short_description: "Design plugin Main globals with existing init macros"
+  default_prompt: "Use $hammer-main-global-design to design this plugin Main as a global owner without changing hammer-runtime."
