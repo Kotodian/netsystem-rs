@@ -48,6 +48,7 @@ pub use file::{
 };
 
 pub mod barrier;
+pub use barrier::WorkerBarrier;
 pub mod binary_api;
 pub mod init;
 pub mod log;
@@ -108,6 +109,14 @@ pub mod spawn;
 pub mod start_workers;
 mod worker_thread;
 
-pub use barrier::WorkerBarrier;
+#[macro_export]
+macro_rules! worker_thread_barrier_sync {
+    ($main:expr, $body:block) => {{
+        let __worker_barrier_guard = $crate::barrier::__sync_guard($main);
+        let __worker_barrier_result = $body;
+        drop(__worker_barrier_guard);
+        __worker_barrier_result
+    }};
+}
 pub use control_thread::ControlThread;
 pub use spawn::{with_data_plane_main, with_data_plane_main_mut};

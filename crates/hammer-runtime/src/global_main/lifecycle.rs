@@ -75,8 +75,7 @@ impl GlobalMain {
         }
         self.closed = true;
 
-        let barrier = self.barrier.clone();
-        let exit_result = barrier.sync(|| {
+        let mut exit = || {
             let result = if self.main_loop_exit_functions_called {
                 Ok(())
             } else {
@@ -85,8 +84,12 @@ impl GlobalMain {
             };
             self.main_loop_exit_now.store(true, Ordering::Release);
             result
-        });
-        let worker_result = self.join_worker_threads();
+        };
+        let exit_result = match crate::barrier::global() {
+            Some(barrier) => barrier.final_sync(exit),
+            None => exit(),
+        };
+        let worker_result = Ok(());
         drop(self.ipc_listener.take());
         let unlink_result = match StatsMain::global() {
             Ok(stats_main) => stats_main.unlink_socket_path().map_err(RuntimeError::from),

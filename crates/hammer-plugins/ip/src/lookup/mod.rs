@@ -16,7 +16,6 @@ use arc_swap::ArcSwapOption;
 use hammer_core::data_plane::{
     BufferFrame, BufferPacketCursor, Index, NodeId, NodeNext, NodeRegistration, SecondaryOpaque,
 };
-use hammer_runtime::WorkerBarrier;
 use hammer_runtime::{
     DataPlaneMain, InternalNode, Node, NodeProcessFn, NodeRuntimeData, TraceFormatter,
     add_packet_trace, format_packet_trace, unlikely,
@@ -62,7 +61,6 @@ pub struct AdjacencyRewriteTrace {
 
 pub struct IpLookupControlPlane {
     table: FibTableHandle,
-    barrier: Option<WorkerBarrier>,
 }
 
 impl IpLookupControlPlane {
@@ -70,24 +68,15 @@ impl IpLookupControlPlane {
     pub fn new(table: FibTable<u16>) -> Self {
         Self {
             table: FibTableHandle::new(table),
-            barrier: None,
         }
     }
 
     #[inline]
     pub fn from_handle(table: FibTableHandle) -> Self {
-        Self {
-            table,
-            barrier: None,
-        }
+        Self { table }
     }
 
     #[inline]
-    pub fn with_barrier(mut self, barrier: WorkerBarrier) -> Self {
-        self.barrier = Some(barrier);
-        self
-    }
-
     #[inline]
     pub fn table_handle(&self) -> FibTableHandle {
         self.table.clone()
@@ -101,9 +90,8 @@ impl IpLookupControlPlane {
     #[inline]
     pub fn publish(&self, table: FibTable<u16>) -> RuntimeResult<()> {
         let table_handle = self.table.clone();
-        let barrier = self.barrier.clone();
         let publish = move || {
-            if let Some(barrier) = barrier {
+            if let Some(barrier) = hammer_runtime::barrier::global() {
                 barrier.sync(|| table_handle.publish(table));
             } else {
                 table_handle.publish(table);

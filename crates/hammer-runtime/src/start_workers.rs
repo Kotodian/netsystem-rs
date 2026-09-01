@@ -16,9 +16,8 @@ use crate::{DataPlaneHandoff, DataWorkerId, barrier};
 #[hammer_component_macros::main_loop_enter_function]
 pub fn start_workers(engine: &mut GlobalMain) -> RuntimeResult<()> {
     let (worker_config, worker_count) = resolve_worker_startup(engine)?;
-    let barrier = barrier::WorkerBarrier::new(worker_count);
+    let barrier = barrier::install(worker_count);
     barrier.arm();
-    engine.barrier = barrier.clone();
     engine.main_loop_exit_now.store(false, Ordering::Release);
     engine.prepare_worker_publication();
 
@@ -34,7 +33,6 @@ pub fn start_workers(engine: &mut GlobalMain) -> RuntimeResult<()> {
     engine.install_worker_control_queues(std::sync::Arc::clone(&worker_control_queues));
     engine.main.install_global_control(
         std::sync::Arc::clone(&engine.registry),
-        barrier.clone(),
         std::sync::Arc::clone(&engine.main_loop_exit_now),
         std::sync::Arc::clone(&engine.main_loop_exit_status),
         std::sync::Arc::clone(&engine.publication),
@@ -59,7 +57,6 @@ pub fn start_workers(engine: &mut GlobalMain) -> RuntimeResult<()> {
         let handoff = handoff.worker(worker);
         let remote_local = worker_control_queues[worker.slot()].clone();
         let worker_control_queues_for_thread = std::sync::Arc::clone(&worker_control_queues);
-        let worker_barrier = barrier.clone();
         let worker_exit = std::sync::Arc::clone(&engine.main_loop_exit_now);
         let launched = thread::Builder::new()
             .name(format!("hammer-worker-{thread_index}"))
@@ -68,7 +65,9 @@ pub fn start_workers(engine: &mut GlobalMain) -> RuntimeResult<()> {
                 let result = catch_unwind(AssertUnwindSafe(|| -> RuntimeResult<()> {
                     // VPP workers stop at the launch barrier before constructing
                     // any thread-local runtime state.
-                    worker_barrier.check();
+                    crate::barrier::global()
+                        .expect("worker barrier is installed")
+                        .check();
                     if worker_exit.load(Ordering::Acquire) {
                         return Ok(());
                     }
@@ -97,7 +96,6 @@ pub fn start_workers(engine: &mut GlobalMain) -> RuntimeResult<()> {
                     let mut main = runtime;
                     main.install_global_control(
                         registry,
-                        worker_barrier.clone(),
                         main_loop_exit_now,
                         main_loop_exit_status,
                         publication,

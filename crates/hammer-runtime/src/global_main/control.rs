@@ -13,7 +13,11 @@ impl GlobalMain {
 
     pub fn ensure_main_thread_with_barrier(&self) -> RuntimeResult<()> {
         self.ensure_main_thread()?;
-        if self.barrier.worker_count() != 0 && !self.barrier.is_pending() {
+        let barrier = crate::barrier::global();
+        if barrier
+            .as_ref()
+            .is_some_and(|barrier| barrier.worker_count() != 0 && !barrier.is_pending())
+        {
             return Err(RuntimeError::ControlRequiresWorkerBarrier);
         }
         Ok(())

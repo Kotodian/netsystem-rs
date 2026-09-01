@@ -70,7 +70,7 @@ impl GlobalMain {
     }
 
     pub(crate) fn wait_for_worker_graph_refork(&self) {
-        if self.barrier.recursion_level() != 0 {
+        if crate::barrier::global().is_some_and(|barrier| barrier.recursion_level() != 0) {
             return;
         }
         let deadline = std::time::Instant::now() + crate::barrier::BARRIER_SYNC_TIMEOUT;

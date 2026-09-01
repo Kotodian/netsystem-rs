@@ -10,9 +10,9 @@ use std::sync::Arc;
 
 use arc_swap::ArcSwap;
 use hammer_core::data_plane::{BufferFrame, Index, NodeId};
+use hammer_runtime::DataPlaneMain;
 use hammer_runtime::RuntimeError;
 use hammer_runtime::node::NodeRuntime;
-use hammer_runtime::{DataPlaneMain, WorkerBarrier};
 
 use crate::opaque::NetworkOpaque;
 
@@ -33,7 +33,6 @@ pub struct FeatureArcStartSlot<A: FeatureArcSpec> {
 pub struct FeatureArcControl<A: FeatureArcSpec> {
     inner: Arc<FeatureArcInner<A>>,
     state: FeatureArcState<A>,
-    barrier: Option<WorkerBarrier>,
     nodes: Option<NodeRuntime>,
     start_nodes: Vec<NodeId>,
     default_end: Option<NodeId>,
@@ -337,7 +336,6 @@ impl<A: FeatureArcSpec> FeatureArcControl<A> {
         Self {
             inner,
             state: FeatureArcState::default(),
-            barrier: None,
             nodes: None,
             start_nodes: Vec::new(),
             default_end: None,
@@ -347,11 +345,6 @@ impl<A: FeatureArcSpec> FeatureArcControl<A> {
     }
 
     #[inline]
-    pub fn with_barrier(mut self, barrier: WorkerBarrier) -> Self {
-        self.barrier = Some(barrier);
-        self
-    }
-
     #[inline]
     pub fn with_nodes(mut self, nodes: NodeRuntime) -> Self {
         self.nodes = Some(nodes);
@@ -511,13 +504,13 @@ impl<A: FeatureArcSpec> FeatureArcControl<A> {
             .nodes
             .as_ref()
             .ok_or(FeatureArcError::NodeRuntimeUnavailable)?;
-        let barrier = self
-            .barrier
-            .as_ref()
-            .ok_or(FeatureArcError::BarrierUnavailable)?;
         state.rebuild(nodes)?;
         self.state = state.clone();
-        barrier.sync(|| inner.publish(state));
+        if let Some(barrier) = hammer_runtime::barrier::global() {
+            barrier.sync(|| inner.publish(state));
+        } else {
+            inner.publish(state);
+        }
         Ok(())
     }
 }

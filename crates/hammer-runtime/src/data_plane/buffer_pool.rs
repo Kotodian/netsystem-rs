@@ -28,7 +28,6 @@ impl DataPlaneMain {
             trace: DataPlaneTrace::default(),
             simd_bytes,
             registry: crate::RuntimeRegistry::new(),
-            barrier: crate::barrier::WorkerBarrier::new(0),
             main_loop_exit_now: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
             main_loop_exit_status: std::sync::Arc::new(std::sync::Mutex::new(0)),
             publication: std::sync::Arc::new(crate::global_main::WorkerPublication::new()),

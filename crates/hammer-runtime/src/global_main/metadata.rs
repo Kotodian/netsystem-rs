@@ -35,7 +35,6 @@ impl GlobalMain {
     }
 
     pub fn new(runtime: DataPlaneMain, registry: Arc<RuntimeRegistry>) -> Self {
-        let barrier = crate::barrier::WorkerBarrier::new(0);
         let main_loop_exit_now = Arc::new(AtomicBool::new(false));
         let main_loop_exit_status = Arc::new(Mutex::new(0));
         let publication = Arc::new(WorkerPublication::new());
@@ -45,7 +44,6 @@ impl GlobalMain {
         let mut main = runtime;
         main.install_global_control(
             Arc::clone(&registry),
-            barrier.clone(),
             Arc::clone(&main_loop_exit_now),
             Arc::clone(&main_loop_exit_status),
             Arc::clone(&publication),
@@ -61,7 +59,6 @@ impl GlobalMain {
                 crate::log::Level::Info,
             ),
             registry,
-            barrier,
             main_loop_exit_now,
             main_loop_exit_status,
             memory_initialized: false,
@@ -97,7 +94,7 @@ impl GlobalMain {
 
     #[inline]
     pub fn worker_barrier(&self) -> crate::barrier::WorkerBarrier {
-        self.barrier.clone()
+        crate::barrier::global().expect("worker barrier is not installed")
     }
 
     pub(crate) fn apply_worker_config(&mut self, worker: Worker) -> RuntimeResult<()> {
@@ -113,7 +110,6 @@ impl GlobalMain {
         self.main.set_worker_config(worker.clone());
         self.main.install_global_control(
             Arc::clone(&self.registry),
-            self.barrier.clone(),
             Arc::clone(&self.main_loop_exit_now),
             Arc::clone(&self.main_loop_exit_status),
             Arc::clone(&self.publication),

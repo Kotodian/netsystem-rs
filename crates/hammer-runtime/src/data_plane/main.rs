@@ -15,7 +15,6 @@ use hammer_core::data_plane::{
 use hammer_core::error::{DataPlaneError, DataPlaneResult};
 use hammer_infra::PageSize;
 
-use crate::barrier::WorkerBarrier;
 use crate::config::Worker;
 use crate::global_main::WorkerPublication;
 use crate::handoff::{DataPlaneHandoffWorker, DataWorkerId, HANDOFF_SLOT_CAPACITY, HandoffSlot};
@@ -50,7 +49,6 @@ pub struct DataPlaneMain {
     trace: DataPlaneTrace,
     simd_bytes: usize,
     registry: Arc<RuntimeRegistry>,
-    barrier: WorkerBarrier,
     main_loop_exit_now: Arc<AtomicBool>,
     main_loop_exit_status: Arc<Mutex<i32>>,
     publication: Arc<WorkerPublication>,
@@ -131,7 +129,6 @@ impl Clone for DataPlaneMain {
             trace: self.trace.clone(),
             simd_bytes: self.simd_bytes,
             registry: Arc::clone(&self.registry),
-            barrier: self.barrier.clone(),
             main_loop_exit_now: Arc::clone(&self.main_loop_exit_now),
             main_loop_exit_status: Arc::clone(&self.main_loop_exit_status),
             publication: Arc::clone(&self.publication),
