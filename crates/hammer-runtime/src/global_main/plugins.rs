@@ -30,13 +30,14 @@ impl GlobalMain {
         }
 
         let worker_count = if resume_main_loop {
-            self.barrier.worker_count()
+            crate::barrier::global()
+                .expect("worker barrier is installed")
+                .worker_count()
         } else {
             0
         };
-        let barrier = self.barrier.clone();
         let mut published_refork = false;
-        barrier.sync(|| -> RuntimeResult<()> {
+        let mut load = || -> RuntimeResult<()> {
             crate::init::run_config_functions(self, true, config)?;
             crate::init::run_init_functions(self)?;
             let entries = self.plugin_main.graph_nodes();
@@ -49,7 +50,14 @@ impl GlobalMain {
                 published_refork = self.publish_worker_graph_refork(worker_count);
             }
             Ok(())
-        })?;
+        };
+        if resume_main_loop {
+            crate::barrier::global()
+                .expect("worker barrier is installed")
+                .sync(load)?;
+        } else {
+            load()?;
+        }
         if published_refork {
             self.wait_for_worker_graph_refork();
         }

@@ -56,7 +56,6 @@ pub struct GlobalMain {
     pub(crate) main: DataPlaneMain,
     control_thread: ControlThread,
     pub registry: Arc<RuntimeRegistry>,
-    pub(crate) barrier: crate::barrier::WorkerBarrier,
     pub(crate) main_loop_exit_now: Arc<AtomicBool>,
     pub main_loop_exit_status: Arc<Mutex<i32>>,
     pub(crate) memory_initialized: bool,

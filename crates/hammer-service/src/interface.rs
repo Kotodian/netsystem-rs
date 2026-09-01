@@ -6,7 +6,6 @@ use std::sync::Arc;
 
 use arc_swap::ArcSwapOption;
 use hammer_core::data_plane::{BufferFrame, Index, NodeId, NodeRegistration};
-use hammer_runtime::WorkerBarrier;
 use hammer_runtime::{
     DataPlaneMain, DataWorkerId, InternalNode, Node, NodeProcessFn, NodeRuntimeData,
     add_packet_trace,
@@ -246,7 +245,6 @@ impl InterfaceControlHandle {
 
 pub struct InterfaceControlPlane {
     inner: Arc<InterfaceStateSlot>,
-    barrier: Option<WorkerBarrier>,
 }
 
 impl Default for InterfaceControlPlane {
@@ -261,14 +259,7 @@ impl InterfaceControlPlane {
     pub fn new() -> Self {
         Self {
             inner: Arc::new(InterfaceStateSlot::new(InterfaceState::default())),
-            barrier: None,
         }
-    }
-
-    #[inline]
-    pub fn with_barrier(mut self, barrier: WorkerBarrier) -> Self {
-        self.barrier = Some(barrier);
-        self
     }
 
     #[inline]
@@ -395,7 +386,7 @@ impl InterfaceControlPlane {
 
     #[inline]
     fn publish(&self, state: InterfaceState) {
-        if let Some(barrier) = &self.barrier {
+        if let Some(barrier) = hammer_runtime::barrier::global() {
             let inner = Arc::clone(&self.inner);
             barrier.sync(|| inner.publish(state));
         } else {

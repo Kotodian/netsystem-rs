@@ -598,27 +598,26 @@ fn dispatch_barriered(
     request: BinaryApiRequest,
     resolved: Result<BinaryApiMethodEntry, BinaryApiReply>,
 ) -> BinaryApiReply {
-    let Some(barrier) = GlobalMain::with_current(|engine| engine.worker_barrier()) else {
-        // Legacy unlocked path: no barrier authority; the already-resolved
-        // handler or the resolution error reply runs with no barrier.
-        return resolved.map_or_else(
-            |error_reply| error_reply,
-            |entry| invoke_method(request, entry),
+    let entry = match resolved {
+        Ok(entry) => entry,
+        Err(reply) => return reply,
+    };
+    let mut request = Some(request);
+    let Some(reply) = GlobalMain::with_current(|engine| {
+        let main = engine.data_plane_main_mut();
+        let request = request.take().expect("binary request is invoked once");
+        if hammer_runtime::barrier::__is_pending() {
+            invoke_method(request, entry)
+        } else {
+            hammer_runtime::worker_thread_barrier_sync!(main, { invoke_method(request, entry) })
+        }
+    }) else {
+        return invoke_method(
+            request.take().expect("binary request is invoked once"),
+            entry,
         );
     };
-    if barrier.is_pending() {
-        return resolved.map_or_else(
-            |error_reply| error_reply,
-            |entry| invoke_method(request, entry),
-        );
-    }
-    let method_reply = barrier.sync(|| {
-        resolved.map_or_else(
-            |error_reply| error_reply,
-            |entry| invoke_method(request, entry),
-        )
-    });
-    method_reply
+    reply
 }
 
 fn reply(context: u64, status: BinaryApiStatus, payload: Vec<u8>) -> BinaryApiReply {

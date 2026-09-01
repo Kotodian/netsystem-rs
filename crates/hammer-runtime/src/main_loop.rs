@@ -54,8 +54,10 @@ pub fn data_plane_main_loop(
         let mut progress = false;
 
         // Step 1: Barrier check — VPP threads.c:296
-        if main.worker_barrier().is_pending() {
-            main.worker_barrier().check();
+        if let Some(barrier) = crate::barrier::global()
+            && barrier.is_pending()
+        {
+            barrier.check();
             main.refork_worker_graph();
         }
 

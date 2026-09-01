@@ -8,7 +8,6 @@ impl DataPlaneMain {
     pub(crate) fn install_global_control(
         &mut self,
         registry: Arc<RuntimeRegistry>,
-        barrier: WorkerBarrier,
         main_loop_exit_now: Arc<AtomicBool>,
         main_loop_exit_status: Arc<Mutex<i32>>,
         publication: Arc<WorkerPublication>,
@@ -17,7 +16,6 @@ impl DataPlaneMain {
         worker_control_queues: Arc<[DataRemoteLocalQueue]>,
     ) {
         self.registry = registry;
-        self.barrier = barrier;
         self.main_loop_exit_now = main_loop_exit_now;
         self.main_loop_exit_status = main_loop_exit_status;
         self.publication = publication;
@@ -32,8 +30,8 @@ impl DataPlaneMain {
     }
 
     #[inline]
-    pub fn worker_barrier(&self) -> WorkerBarrier {
-        self.barrier.clone()
+    pub fn worker_barrier(&self) -> crate::barrier::WorkerBarrier {
+        crate::barrier::global().expect("worker barrier is not installed")
     }
 
     #[inline]
