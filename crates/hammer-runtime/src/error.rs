@@ -65,18 +65,6 @@ pub enum RuntimeError {
     Stats(#[from] hammer_stats::StatsError),
     #[error("worker count {count} does not fit u32")]
     WorkerCountOverflow { count: usize },
-    #[error("a worker graph update is already pending")]
-    WorkerGraphUpdateAlreadyPending,
-    #[error("the pending worker graph is missing")]
-    WorkerGraphUpdateMissing,
-    #[error("worker graph update state is poisoned")]
-    WorkerGraphUpdateStatePoisoned,
-    #[error("worker graph update is not additive")]
-    WorkerGraphUpdateNotAdditive,
-    #[error("worker graph update failed for {failures:?}")]
-    WorkerGraphUpdate {
-        failures: Vec<(usize, RuntimeError)>,
-    },
     #[error("plugin `{plugin}` state is not initialized")]
     PluginStateNotInitialized { plugin: &'static str },
     #[error("thread {thread_index} is not a data worker")]

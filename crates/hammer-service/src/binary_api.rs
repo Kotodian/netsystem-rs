@@ -544,10 +544,8 @@ fn output_budget(max_frame_bytes: usize) -> usize {
 }
 
 /// Resolves the method exactly once and routes it by `is_mp_safe`. Only a
-/// successfully resolved mp-safe entry can bypass the barrier; every
-/// resolution failure keeps the legacy reply and the legacy barriered path,
-/// so method-not-found and internal errors still enter the barrier/pending
-/// branches and run the same deferred graph-update finish.
+/// successfully resolved mp-safe entry can bypass the barrier; resolution
+/// failures keep the legacy reply and barriered dispatch path.
 fn dispatch(request: BinaryApiRequest) -> BinaryApiReply {
     let context = request.context;
     let resolved: Result<BinaryApiMethodEntry, BinaryApiReply> =
@@ -572,7 +570,7 @@ fn dispatch(request: BinaryApiRequest) -> BinaryApiReply {
         // VPP's `msg_handler_internal` takes the worker barrier only when
         // `!m->is_mp_safe` (api_shared.c:545, 564): an mp-safe method runs
         // directly on the serial Main Thread and never fetches the barrier
-        // nor finishes deferred graph updates.
+        // and does not acquire the worker barrier.
         Ok(method) if method.is_mp_safe() => invoke_method(request, method),
         _ => dispatch_barriered(request, resolved),
     }
@@ -580,8 +578,7 @@ fn dispatch(request: BinaryApiRequest) -> BinaryApiReply {
 
 /// Calls an already-resolved handler exactly once and maps its status to the
 /// reply. Resolution happens once in `dispatch` before the mp-safe branch, so
-/// this helper never resolves and never touches the worker barrier or the
-/// deferred graph-update finish path.
+/// this helper never resolves and never touches the worker barrier.
 fn invoke_method(request: BinaryApiRequest, entry: BinaryApiMethodEntry) -> BinaryApiReply {
     let method_reply = entry.call(&request.payload);
     let status = match method_reply.status() {
@@ -596,17 +593,14 @@ fn invoke_method(request: BinaryApiRequest, entry: BinaryApiMethodEntry) -> Bina
 /// a pending barrier dispatches unlocked (VPP `msg_handler_internal` skips
 /// the barrier while one is already pending), otherwise the handler runs
 /// inside `barrier.sync` with no await while held. Resolution failures arrive
-/// as the `Err` reply and run the same branches and the same deferred
-/// graph-update finish as the previous resolution-inside-dispatch code.
+/// as the `Err` reply and run the same branches as successful handlers.
 fn dispatch_barriered(
     request: BinaryApiRequest,
     resolved: Result<BinaryApiMethodEntry, BinaryApiReply>,
 ) -> BinaryApiReply {
-    let context = request.context;
     let Some(barrier) = GlobalMain::with_current(|engine| engine.worker_barrier()) else {
         // Legacy unlocked path: no barrier authority; the already-resolved
-        // handler or the resolution error reply runs with no barrier and no
-        // deferred finish.
+        // handler or the resolution error reply runs with no barrier.
         return resolved.map_or_else(
             |error_reply| error_reply,
             |entry| invoke_method(request, entry),
@@ -624,16 +618,7 @@ fn dispatch_barriered(
             |entry| invoke_method(request, entry),
         )
     });
-    // VPP `vlib_worker_thread_barrier_release` waits for the refork cohort at
-    // the outermost release (threads.c:1497): a graph publication finished
-    // inside this barrier is drained here, after the workers refork and
-    // before the reply completes. A deferred finish failure crosses the typed
-    // reply/status boundary instead of logging.
-    let deferred = GlobalMain::with_current(|engine| engine.finish_deferred_worker_graph_update());
-    match deferred {
-        Some(Err(_)) => reply(context, BinaryApiStatus::Internal, Vec::new()),
-        _ => method_reply,
-    }
+    method_reply
 }
 
 fn reply(context: u64, status: BinaryApiStatus, payload: Vec<u8>) -> BinaryApiReply {

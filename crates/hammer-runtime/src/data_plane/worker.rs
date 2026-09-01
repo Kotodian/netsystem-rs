@@ -14,7 +14,6 @@ impl DataPlaneMain {
         publication: Arc<WorkerPublication>,
         workers_updating_graph: Arc<AtomicU32>,
         worker_config: Worker,
-        worker_init_functions: Vec<WorkerInitFunction>,
         worker_control_queues: Arc<[DataRemoteLocalQueue]>,
     ) {
         self.registry = registry;
@@ -24,7 +23,6 @@ impl DataPlaneMain {
         self.publication = publication;
         self.workers_updating_graph = workers_updating_graph;
         self.worker_config = worker_config;
-        self.worker_init_functions = worker_init_functions;
         self.worker_control_queues = worker_control_queues;
     }
 
@@ -109,42 +107,26 @@ impl DataPlaneMain {
         self.nodes.set_node_runtime_data(node, data)
     }
 
-    pub(crate) fn refork_worker_graph(&mut self) -> bool {
+    pub(crate) fn refork_worker_graph(&mut self) {
         use std::sync::atomic::Ordering;
 
         if self.workers_updating_graph.load(Ordering::Acquire) == 0 {
-            return true;
+            return;
         }
 
         // SAFETY: GlobalMain publishes this value before releasing the worker
         // barrier and retains it until every worker completes the refork.
-        let update = unsafe { self.publication.graph() }
+        let graph = unsafe { self.publication.graph() }
             .as_ref()
             .expect("published worker graph must be present")
             .clone();
-        let result = self
-            .nodes
-            .replace_graph_preserving_worker_state(update.graph)
-            .and_then(|()| {
-                crate::init::run_worker_init_functions(self, update.worker_init_functions)
-            });
-        let succeeded = result.is_ok();
-        if let Err(error) = result {
-            self.main_loop_exit_now.store(true, Ordering::Release);
-            let worker = self
-                .data_worker_id()
-                .expect("worker graph update runs only on a Data Worker");
-            // SAFETY: each Data Worker owns exactly one error slot throughout
-            // the refork; GlobalMain reads it only after completion.
-            unsafe { self.publication.set_graph_error(worker.slot(), error) };
-        }
+        self.nodes.refork(graph);
 
         let updating = self.workers_updating_graph.fetch_sub(1, Ordering::AcqRel);
         assert_ne!(updating, 0, "worker graph completion count underflow");
         while self.workers_updating_graph.load(Ordering::Acquire) != 0 {
             core::hint::spin_loop();
         }
-        succeeded && !self.main_loop_exit_now.load(Ordering::Acquire)
     }
 }
 
