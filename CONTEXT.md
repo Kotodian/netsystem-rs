@@ -8,10 +8,21 @@ Workers.
 
 **GlobalMain**:
 The process-wide runtime authority corresponding to VPP's
-`vlib_global_main_t`. It owns worker coordination, barrier publication,
+`vlib_global_main_t`. It owns worker lifecycle, graph publication and refork,
 registrations, plugin lifetime, and process-wide lifecycle state; it does not
-execute packet graph work.
+own Worker Barrier synchronization or execute packet graph work.
 _Avoid_: MainThread, DataPlaneMain, engine
+
+**Worker Barrier**:
+A main-thread synchronization interval that pauses every Data Worker while
+control code mutates worker-visible state. It is distinct from process-wide
+worker lifecycle, graph publication, and refork authority.
+_Avoid_: GlobalMain barrier, worker lock
+
+**Graph Refork**:
+Rebuilding each Data Worker's node/runtime clone from the published main graph
+while retaining that worker's existing runtime state.
+_Avoid_: graph replacement, worker reinitialization
 
 **ControlThread**:
 The scheduler running on the main operating-system thread. It uses a
