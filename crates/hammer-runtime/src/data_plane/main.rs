@@ -19,7 +19,6 @@ use crate::barrier::WorkerBarrier;
 use crate::config::Worker;
 use crate::global_main::WorkerPublication;
 use crate::handoff::{DataPlaneHandoffWorker, DataWorkerId, HANDOFF_SLOT_CAPACITY, HandoffSlot};
-use crate::init::WorkerInitFunction;
 use crate::node::{
     NodeEntry, NodeErrorCode, NodeFunctionRegistration, NodeRuntime, NodeRuntimeData,
     NodeRuntimeInner,
@@ -57,7 +56,6 @@ pub struct DataPlaneMain {
     publication: Arc<WorkerPublication>,
     workers_updating_graph: Arc<AtomicU32>,
     worker_config: Worker,
-    worker_init_functions: Vec<WorkerInitFunction>,
     worker_exit_functions: Vec<fn(&mut DataPlaneMain) -> RuntimeResult<()>>,
     called_worker_init_functions: HashSet<&'static str>,
     main_loop_count: AtomicU32,
@@ -139,7 +137,6 @@ impl Clone for DataPlaneMain {
             publication: Arc::clone(&self.publication),
             workers_updating_graph: Arc::clone(&self.workers_updating_graph),
             worker_config: self.worker_config.clone(),
-            worker_init_functions: self.worker_init_functions.clone(),
             worker_exit_functions: self.worker_exit_functions.clone(),
             called_worker_init_functions: self.called_worker_init_functions.clone(),
             main_loop_count: AtomicU32::new(

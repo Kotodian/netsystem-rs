@@ -69,10 +69,9 @@ pub struct GlobalMain {
     pub(crate) main_loop_entered: bool,
     pub(crate) publication: Arc<WorkerPublication>,
     pub(crate) workers_updating_graph: Arc<AtomicU32>,
-    // VPP `need_vlib_worker_thread_node_runtime_update`: set when a graph
-    // publication finishes inside an outer barrier and the refork drain is
-    // deferred to the outermost barrier owner (Binary API dispatch).
-    deferred_finish_pending: AtomicBool,
+    // VPP `need_vlib_worker_thread_node_runtime_update`: one coalescing graph
+    // refork fact consumed by the outermost barrier release.
+    worker_graph_refork_pending: AtomicBool,
     main_loop_exit_functions_called: bool,
     worker_threads: Vec<JoinHandle<RuntimeResult<()>>>,
     worker_control_queues: Arc<[DataRemoteLocalQueue]>,

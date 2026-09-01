@@ -38,7 +38,7 @@ impl GlobalMain {
         let barrier = crate::barrier::WorkerBarrier::new(0);
         let main_loop_exit_now = Arc::new(AtomicBool::new(false));
         let main_loop_exit_status = Arc::new(Mutex::new(0));
-        let publication = Arc::new(WorkerPublication::new(0));
+        let publication = Arc::new(WorkerPublication::new());
         let workers_updating_graph = Arc::new(AtomicU32::new(0));
         let worker_config = Worker::default();
         let worker_control_queues = Arc::from([]);
@@ -51,7 +51,6 @@ impl GlobalMain {
             Arc::clone(&publication),
             Arc::clone(&workers_updating_graph),
             worker_config.clone(),
-            Vec::new(),
             Arc::clone(&worker_control_queues),
         );
         Self {
@@ -76,7 +75,7 @@ impl GlobalMain {
             main_loop_entered: false,
             publication,
             workers_updating_graph,
-            deferred_finish_pending: AtomicBool::new(false),
+            worker_graph_refork_pending: AtomicBool::new(false),
             main_loop_exit_functions_called: false,
             worker_threads: Vec::new(),
             worker_control_queues,
@@ -120,7 +119,6 @@ impl GlobalMain {
             Arc::clone(&self.publication),
             Arc::clone(&self.workers_updating_graph),
             worker.clone(),
-            Vec::new(),
             Arc::clone(&self.worker_control_queues),
         );
         self.worker_config = worker;

@@ -598,18 +598,25 @@ impl ScheduledFrameQueue {
 }
 
 impl NodeRuntimeInner {
-    fn inherit_worker_state(&mut self, current: &Self) -> RuntimeResult<()> {
-        if self.nodes.len() < current.nodes.len() {
-            return Err(RuntimeError::WorkerGraphUpdateNotAdditive);
-        }
+    fn inherit_worker_state(&mut self, current: &Self) {
+        assert!(
+            self.nodes.len() >= current.nodes.len(),
+            "published worker graph must be additive"
+        );
 
         for slot in 0..current.nodes.len() {
-            if self.node_names[slot] != current.node_names[slot]
-                || self.nodes[slot].kind != current.nodes[slot].kind
-                || self.error_indices[slot] != current.error_indices[slot]
-            {
-                return Err(RuntimeError::WorkerGraphUpdateNotAdditive);
-            }
+            assert_eq!(
+                self.node_names[slot], current.node_names[slot],
+                "published worker graph changed node identity"
+            );
+            assert_eq!(
+                self.nodes[slot].kind, current.nodes[slot].kind,
+                "published worker graph changed node role"
+            );
+            assert_eq!(
+                self.error_indices[slot], current.error_indices[slot],
+                "published worker graph changed node error layout"
+            );
 
             // The main thread publishes topology and process functions. The
             // worker retains only state owned by its established node instance.
@@ -617,7 +624,6 @@ impl NodeRuntimeInner {
             self.node_states[slot] = current.node_states[slot];
             self.input_main_loops_per_call[slot] = current.input_main_loops_per_call[slot];
         }
-        Ok(())
     }
 
     fn materialize_node_errors(
@@ -1177,13 +1183,9 @@ impl NodeRuntime {
         *self.inner.borrow_mut() = graph;
     }
 
-    pub(crate) fn replace_graph_preserving_worker_state(
-        &self,
-        mut graph: NodeRuntimeInner,
-    ) -> RuntimeResult<()> {
-        graph.inherit_worker_state(&self.inner.borrow())?;
+    pub(crate) fn refork(&self, mut graph: NodeRuntimeInner) {
+        graph.inherit_worker_state(&self.inner.borrow());
         self.replace_graph(graph);
-        Ok(())
     }
 
     pub(crate) fn install_node_function(
@@ -1786,5 +1788,66 @@ impl Future for NodeRuntimeReady {
 
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         self.readiness.poll_pending(cx)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn process(_: &DataPlaneMain, _: NodeRuntimeData, _: &mut BufferFrame) {}
+
+    #[test]
+    fn refork_preserves_existing_worker_state_and_initializes_new_nodes() {
+        let main = NodeRuntime::default();
+        let existing = main
+            .try_register_descriptor(
+                NodeKind::Internal,
+                NodeDescriptor::new(
+                    process,
+                    NodeRuntimeData::from_words([1, 0, 0, 0]),
+                    None,
+                    &[],
+                    None,
+                ),
+            )
+            .expect("register existing node");
+        let worker = NodeRuntime::from(main.snapshot());
+        let worker_data = NodeRuntimeData::from_words([9, 8, 7, 6]);
+        worker
+            .set_node_runtime_data(existing, worker_data)
+            .expect("set worker runtime data");
+        worker
+            .set_node_state(existing, NodeState::Interrupt)
+            .expect("set worker node state");
+        worker
+            .set_input_main_loops_per_call(existing, 4)
+            .expect("set worker input cadence");
+
+        let added = main
+            .try_register_descriptor(
+                NodeKind::Internal,
+                NodeDescriptor::new(
+                    process,
+                    NodeRuntimeData::from_words([2, 3, 4, 5]),
+                    None,
+                    &[],
+                    None,
+                ),
+            )
+            .expect("register added node");
+        worker.refork(main.snapshot());
+
+        assert_eq!(worker.node_runtime_data(existing).unwrap(), worker_data);
+        assert_eq!(worker.node_state(existing).unwrap(), NodeState::Interrupt);
+        assert_eq!(
+            worker.inner.borrow().input_main_loops_per_call[existing.slot() as usize],
+            4
+        );
+        assert_eq!(
+            worker.node_runtime_data(added).unwrap(),
+            NodeRuntimeData::from_words([2, 3, 4, 5])
+        );
+        assert_eq!(worker.node_state(added).unwrap(), NodeState::Polling);
     }
 }

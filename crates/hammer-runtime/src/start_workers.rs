@@ -20,7 +20,7 @@ pub fn start_workers(engine: &mut GlobalMain) -> RuntimeResult<()> {
     barrier.arm();
     engine.barrier = barrier.clone();
     engine.main_loop_exit_now.store(false, Ordering::Release);
-    engine.prepare_worker_publication(worker_config.count);
+    engine.prepare_worker_publication();
 
     let handoff = DataPlaneHandoff::with_node_capacity(
         worker_config.count,
@@ -40,7 +40,6 @@ pub fn start_workers(engine: &mut GlobalMain) -> RuntimeResult<()> {
         std::sync::Arc::clone(&engine.publication),
         std::sync::Arc::clone(&engine.workers_updating_graph),
         worker_config.clone(),
-        Vec::new(),
         std::sync::Arc::clone(&worker_control_queues),
     );
     let mut threads = Vec::with_capacity(worker_config.count);
@@ -104,7 +103,6 @@ pub fn start_workers(engine: &mut GlobalMain) -> RuntimeResult<()> {
                         publication,
                         workers_updating_graph,
                         worker_config_template,
-                        worker_init_functions.clone(),
                         worker_control_queues_for_thread,
                     );
                     spawn::set_data_plane_main(&mut main);

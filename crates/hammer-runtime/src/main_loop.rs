@@ -56,9 +56,7 @@ pub fn data_plane_main_loop(
         // Step 1: Barrier check — VPP threads.c:296
         if main.worker_barrier().is_pending() {
             main.worker_barrier().check();
-            if !main.refork_worker_graph() {
-                return 1;
-            }
+            main.refork_worker_graph();
         }
 
         // Step 2: Poll worker-local File readiness before graph dispatch.
