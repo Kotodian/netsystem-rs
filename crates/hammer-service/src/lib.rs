@@ -4,7 +4,9 @@ hammer_runtime::__declare_registration_image!(
     init_functions = [
         binary_api::__INIT_FN_BINARY_API_INIT,
         session::__INIT_FN_APPLICATION_INIT,
-        device::__INIT_FN_DEVICE_INIT,
+        interface_model::__INIT_FN_INTERFACE_MAIN_INIT,
+        net::__INIT_FN_NET_MAIN_INIT,
+        device::__INIT_FN_DEVICE_MAIN_INIT,
         session::__INIT_FN_SESSION_INIT,
         session::__INIT_FN_SESSION_ATTACH_SERVER,
         transport::__INIT_FN_TRANSPORT_MAIN_INIT,
@@ -47,6 +49,8 @@ pub mod device;
 pub mod feature_arc;
 /// Interface / adjacency control plane — shared infrastructure, not a plugin.
 pub mod interface;
+mod interface_model;
+pub use interface_model::InterfaceRegistrationImage;
 pub mod net;
 pub mod opaque;
 /// Session layer — shared infrastructure, not a plugin.

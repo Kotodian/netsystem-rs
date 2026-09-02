@@ -1,10 +1,10 @@
-use std::cell::RefCell;
 use std::io;
 use std::mem::transmute;
 use std::os::fd::OwnedFd;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, OnceLock};
 
 use hammer_core::data_plane::{BufferFrame, DEFAULT_BUFFER_FRAME_CAPACITY, NodeId, NodeState};
+use hammer_infra::thread_owned::ThreadOwned;
 use hammer_runtime::sync::SpinLock;
 use hammer_runtime::{
     DataPlaneMain, DataWorkerId, File, FileFunctions, Node, NodeProcessFn, NodeRuntimeData,
@@ -12,11 +12,10 @@ use hammer_runtime::{
 };
 use hammer_runtime::{RuntimeError, RuntimeResult};
 
-use hammer_service::device::{
-    DeviceError, DeviceInputNext, DeviceInputNode, DeviceMain, DeviceRxQueue, DeviceTxQueue,
-    DriverScheduleMode,
+use hammer_service::device::{DeviceError, DeviceInputNext, DeviceInputNode};
+use hammer_service::interface::{
+    DriverScheduleMode, InterfaceConfig, InterfaceMain, InterfaceMtu, RxQueue, TxQueue,
 };
-use hammer_service::interface::{InterfaceConfig, InterfaceControlPlane, configure_interfaces};
 use hammer_service::opaque::NetworkOpaque;
 
 #[hammer_component_macros::runtime_error(subsystem = "tun")]
@@ -61,10 +60,10 @@ enum TunError {
     WorkerCountOutOfRange,
     #[error("a TUN interface requires at least one data worker")]
     NoDataWorkers,
-    #[error("TUN control device registry is poisoned")]
-    ControlRegistryPoisoned,
     #[error(transparent)]
     Device(#[from] DeviceError),
+    #[error(transparent)]
+    Interface(#[from] hammer_service::interface::InterfaceError),
     #[error("TUN File for device {device_instance} is unavailable on worker {worker}")]
     WorkerFileUnavailable { device_instance: u32, worker: u32 },
     #[error(transparent)]
@@ -99,16 +98,9 @@ mod linux;
 #[cfg(target_os = "linux")]
 use linux as platform;
 
-thread_local! {
-    static TUN_WORKER_RUNTIME: RefCell<Option<TunWorkerRuntime>> = const { RefCell::new(None) };
-}
+static TUN_WORKER_RUNTIME: OnceLock<Vec<ThreadOwned<TunWorkerRuntime>>> = OnceLock::new();
 
-struct TunControl {
-    device_main: Arc<DeviceMain>,
-    devices: Mutex<Vec<TunControlDevice>>,
-}
-
-struct TunControlDevice {
+struct TunDevice {
     device_instance: u32,
     interface_index: u32,
     requested_name: String,
@@ -117,238 +109,234 @@ struct TunControlDevice {
     tx_lock: Arc<SpinLock<()>>,
 }
 
+struct TunDevices {
+    devices: Vec<TunDevice>,
+}
+
 struct TunWorkerRuntime {
     input_node: NodeId,
     rx_queues: Vec<TunRxQueue>,
     tx_queues: Vec<TunTxQueue>,
 }
 
+// The runtime is installed and accessed only by its owning worker slot.
+unsafe impl Send for TunWorkerRuntime {}
+
 struct TunRxQueue {
-    queue: DeviceRxQueue,
+    queue: RxQueue,
     interface_index: u32,
     file_index: u32,
     pending: bool,
 }
 
 struct TunTxQueue {
-    queue: DeviceTxQueue,
+    queue: TxQueue,
     file_index: u32,
     tx_lock: Arc<SpinLock<()>>,
     tx_iovecs: Vec<libc::iovec>,
 }
 
-impl TunControl {
-    fn new(device_main: Arc<DeviceMain>) -> Arc<Self> {
-        Arc::new(Self {
-            device_main,
-            devices: Mutex::new(Vec::new()),
-        })
+fn add_interface(
+    devices: &mut Vec<TunDevice>,
+    interface_main: &InterfaceMain,
+    interface_name: &str,
+    mtu: u32,
+    interface_index: u32,
+    worker_count: usize,
+) -> Result<(), TunError> {
+    let worker_count = u32::try_from(worker_count).map_err(|_| TunError::WorkerCountOutOfRange)?;
+    if worker_count == 0 {
+        return Err(TunError::NoDataWorkers);
     }
-
-    fn add_interface(
-        &self,
-        interface_name: &str,
-        mtu: u32,
-        interface_index: u32,
-        worker_count: usize,
-        input_node: NodeId,
-        output_node: NodeId,
-    ) -> Result<(), TunError> {
-        let worker_count =
-            u32::try_from(worker_count).map_err(|_| TunError::WorkerCountOutOfRange)?;
-        if worker_count == 0 {
-            return Err(TunError::NoDataWorkers);
-        }
-        let (fd, kernel_name) = platform::open(interface_name, mtu)?;
-        let mut worker_files = Vec::with_capacity(worker_count as usize);
-        for _ in 1..worker_count {
-            let duplicate = fd.try_clone().map_err(|source| TunError::Io {
-                operation: "duplicate TUN descriptor for data worker",
-                source,
-            })?;
-            worker_files.push(Some(duplicate));
-        }
-        worker_files.insert(0, Some(fd));
-        tracing::info!(
-            logical_name = %interface_name,
-            %kernel_name,
-            "opened TUN interface"
-        );
-        let mut devices = self
-            .devices
-            .lock()
-            .map_err(|_| TunError::ControlRegistryPoisoned)?;
-        let device = self
-            .device_main
-            .register_device(interface_index, input_node, output_node)?;
-        let device_instance = device.instance;
-        let owner = DataWorkerId::new(device_instance % worker_count);
-        self.device_main.register_rx_queue(
-            device_instance,
-            0,
-            owner,
-            DriverScheduleMode::Interrupt,
-        )?;
-        self.device_main
-            .register_tx_queue(device_instance, 0, owner)?;
-        for worker in 0..worker_count {
-            self.device_main.assign_tx_queue_to_worker(
-                device_instance,
-                0,
-                DataWorkerId::new(worker),
-            )?;
-        }
-        devices.push(TunControlDevice {
-            device_instance,
-            interface_index,
-            requested_name: interface_name.to_owned(),
-            kernel_name,
-            worker_files,
-            tx_lock: Arc::new(SpinLock::new(())),
-        });
-        Ok(())
+    let (fd, kernel_name) = platform::open(interface_name, mtu)?;
+    let mut worker_files = Vec::with_capacity(worker_count as usize);
+    for _ in 1..worker_count {
+        let duplicate = fd.try_clone().map_err(|source| TunError::Io {
+            operation: "duplicate TUN descriptor for data worker",
+            source,
+        })?;
+        worker_files.push(Some(duplicate));
     }
-
-    fn take_worker_runtime(
-        &self,
-        engine: &mut hammer_runtime::DataPlaneMain,
-        worker: DataWorkerId,
-        tun_input: NodeId,
-    ) -> Result<TunWorkerRuntime, TunError> {
-        let rx_queues = self.device_main.rx_poll_vector(worker);
-        let assigned_tx_queues = self.device_main.tx_queues_for_worker(worker);
-
-        let mut control_devices = self
-            .devices
-            .lock()
-            .map_err(|_| TunError::ControlRegistryPoisoned)?;
-        let mut worker_rx_queues = Vec::with_capacity(rx_queues.len());
-        let mut worker_tx_queues = Vec::with_capacity(assigned_tx_queues.len());
-        for device in control_devices.iter_mut() {
-            let rx_queue = rx_queues
-                .iter()
-                .find(|queue| queue.device_instance == device.device_instance)
-                .copied();
-            let has_tx_queue = assigned_tx_queues
-                .iter()
-                .any(|queue| queue.device_instance == device.device_instance);
-            if rx_queue.is_none() && !has_tx_queue {
-                continue;
-            }
-            let fd = device
-                .worker_files
-                .get_mut(worker.slot())
-                .and_then(Option::take)
-                .ok_or(TunError::WorkerFileUnavailable {
-                    device_instance: device.device_instance,
-                    worker: worker.slot() as u32,
-                })?;
-            let queue_index = worker_rx_queues.len();
-            let mut file = File::new(
-                fd,
-                format!(
-                    "TUN interface {} (logical {}, kernel {})",
-                    device.interface_index, device.requested_name, device.kernel_name
-                ),
-                if rx_queue.is_some() {
-                    queue_index as u64
-                } else {
-                    0
-                },
-                FileFunctions {
-                    read: if rx_queue.is_some() {
-                        Some(schedule_tun_input)
-                    } else {
-                        None
-                    },
-                    ..FileFunctions::default()
-                },
-            );
-            file.set_polling_thread_index(engine.thread_index());
-            let file_index = engine.file_main().add(file)?;
-            if let Some(rx_queue) = rx_queue {
-                worker_rx_queues.push(TunRxQueue {
-                    queue: rx_queue,
-                    interface_index: device.interface_index,
-                    file_index,
-                    pending: false,
-                });
-            }
-            for queue in assigned_tx_queues
-                .iter()
-                .filter(|queue| queue.device_instance == device.device_instance)
-            {
-                worker_tx_queues.push(TunTxQueue {
-                    queue: queue.clone(),
-                    file_index,
-                    tx_lock: Arc::clone(&device.tx_lock),
-                    tx_iovecs: Vec::new(),
-                });
-            }
-        }
-        Ok(TunWorkerRuntime {
-            input_node: tun_input,
-            rx_queues: worker_rx_queues,
-            tx_queues: worker_tx_queues,
-        })
+    worker_files.insert(0, Some(fd));
+    tracing::info!(
+        logical_name = %interface_name,
+        %kernel_name,
+        "opened TUN interface"
+    );
+    let device_instance = interface_index;
+    let owner = DataWorkerId::new(device_instance % worker_count);
+    interface_main.register_rx_queue(
+        interface_index,
+        0,
+        owner,
+        0,
+        DriverScheduleMode::Interrupt,
+    )?;
+    let tx_queue = interface_main.register_tx_queue(interface_index, 0, false)?;
+    for worker in 0..worker_count {
+        interface_main.assign_tx_queue_to_worker(tx_queue, DataWorkerId::new(worker))?;
     }
+    devices.push(TunDevice {
+        device_instance,
+        interface_index,
+        requested_name: interface_name.to_owned(),
+        kernel_name,
+        worker_files,
+        tx_lock: Arc::new(SpinLock::new(())),
+    });
+    Ok(())
 }
 
-#[hammer_component_macros::config_function(
-    name = "tun_interfaces_config",
-    section = "plugin.tun",
-    early = true,
-    runs_before = ["ip_config"]
-)]
-fn configure_tun_interfaces(tun_cfg: TunPluginConfig) -> RuntimeResult<Arc<InterfaceControlPlane>> {
-    configure_interfaces(&tun_cfg.interfaces)
+fn take_worker_runtime(
+    devices: &TunDevices,
+    interface_main: &InterfaceMain,
+    engine: &mut hammer_runtime::DataPlaneMain,
+    worker: DataWorkerId,
+    tun_input: NodeId,
+) -> Result<TunWorkerRuntime, TunError> {
+    let rx_queues = interface_main.rx_queues_for_worker(worker);
+    let assigned_tx_queues = interface_main.tx_queues_for_worker(worker);
+
+    let mut worker_rx_queues = Vec::with_capacity(rx_queues.len());
+    let mut worker_tx_queues = Vec::with_capacity(assigned_tx_queues.len());
+    for device in &devices.devices {
+        let rx_queue = rx_queues
+            .iter()
+            .find(|queue| queue.device_instance == device.device_instance)
+            .copied();
+        let has_tx_queue = assigned_tx_queues
+            .iter()
+            .any(|queue| queue.device_instance == device.device_instance);
+        if rx_queue.is_none() && !has_tx_queue {
+            continue;
+        }
+        let fd = device
+            .worker_files
+            .get(worker.slot())
+            .and_then(Option::as_ref)
+            .map(OwnedFd::try_clone)
+            .transpose()
+            .map_err(|source| TunError::Io {
+                operation: "duplicate TUN descriptor for worker",
+                source,
+            })?
+            .ok_or(TunError::WorkerFileUnavailable {
+                device_instance: device.device_instance,
+                worker: worker.slot() as u32,
+            })?;
+        let queue_index = worker_rx_queues.len();
+        let mut file = File::new(
+            fd,
+            format!(
+                "TUN interface {} (logical {}, kernel {})",
+                device.interface_index, device.requested_name, device.kernel_name
+            ),
+            if rx_queue.is_some() {
+                queue_index as u64
+            } else {
+                0
+            },
+            FileFunctions {
+                read: if rx_queue.is_some() {
+                    Some(schedule_tun_input)
+                } else {
+                    None
+                },
+                ..FileFunctions::default()
+            },
+        );
+        file.set_polling_thread_index(engine.thread_index());
+        let file_index = engine.file_main().add(file)?;
+        if let Some(rx_queue) = rx_queue {
+            worker_rx_queues.push(TunRxQueue {
+                queue: rx_queue,
+                interface_index: device.interface_index,
+                file_index,
+                pending: false,
+            });
+        }
+        for queue in assigned_tx_queues
+            .iter()
+            .filter(|queue| queue.device_instance == device.device_instance)
+        {
+            worker_tx_queues.push(TunTxQueue {
+                queue: queue.clone(),
+                file_index,
+                tx_lock: Arc::clone(&device.tx_lock),
+                tx_iovecs: Vec::new(),
+            });
+        }
+    }
+    Ok(TunWorkerRuntime {
+        input_node: tun_input,
+        rx_queues: worker_rx_queues,
+        tx_queues: worker_tx_queues,
+    })
 }
 
 #[hammer_component_macros::config_function(name = "tun_config", section = "plugin.tun")]
 fn configure_tun(
     tun_cfg: TunPluginConfig,
     engine: &mut hammer_runtime::GlobalMain,
-    device_main: Arc<DeviceMain>,
-    interface_main: Arc<InterfaceControlPlane>,
-) -> RuntimeResult<Arc<TunControl>> {
-    (|| -> Result<Arc<TunControl>, TunError> {
-        let control = TunControl::new(device_main);
-        let tun_input = engine
-            .data_plane_main()
-            .nodes()
-            .node_by_name(TunInputDriverNode::NODE_NAME)
-            .ok_or(TunError::GraphNodeMissing {
-                name: TunInputDriverNode::NODE_NAME,
-            })?;
-        let tun_output = engine
-            .data_plane_main()
-            .nodes()
-            .node_by_name(TunOutputDriverNode::NODE_NAME)
-            .ok_or(TunError::GraphNodeMissing {
-                name: TunOutputDriverNode::NODE_NAME,
-            })?;
+    interface_main: Arc<InterfaceMain>,
+) -> RuntimeResult<Arc<TunDevices>> {
+    (|| -> Result<Arc<TunDevices>, TunError> {
+        let mut devices = Vec::with_capacity(tun_cfg.interfaces.len());
+        let _ = TUN_WORKER_RUNTIME.set(
+            (0..engine.configured_worker_count())
+                .map(|_| ThreadOwned::new())
+                .collect(),
+        );
         for interface in &tun_cfg.interfaces {
             let interface_index = interface_main
-                .handle()
-                .interface_index(&interface.name)
+                .register_hardware_interface(
+                    0,
+                    interface_main
+                        .hardware_interface(0)
+                        .map_or(0, |hw| hw.dev_instance + 1),
+                    0,
+                    0,
+                )
+                .map_err(TunError::from)?;
+            interface_main
+                .set_interface_name(interface_index, interface.name.clone())
+                .map_err(TunError::from)?;
+            let sw_if_index = interface_main
+                .hardware_interface(interface_index)
+                .map(|hw| hw.sw_if_index)
                 .ok_or_else(|| TunError::InterfaceNotRegistered {
                     name: interface.name.clone(),
                 })?;
+            interface_main
+                .set_mtu(
+                    sw_if_index,
+                    InterfaceMtu::new(
+                        interface.mtu.l3,
+                        interface.mtu.ip4,
+                        interface.mtu.ip6,
+                        interface.mtu.mpls,
+                    ),
+                )
+                .map_err(TunError::from)?;
+            for address in &interface.address {
+                interface_main
+                    .add_address(sw_if_index, *address)
+                    .map_err(TunError::from)?;
+            }
             let mtu = interface_main
-                .handle()
                 .interface_mtu(interface_index)
                 .ok_or(TunError::InterfaceMtuMissing { interface_index })?
                 .l3();
-            control.add_interface(
+            add_interface(
+                &mut devices,
+                &interface_main,
                 &interface.name,
                 mtu,
                 interface_index,
                 engine.configured_worker_count(),
-                tun_input,
-                tun_output,
             )?;
         }
-        Ok(control)
+        Ok(Arc::new(TunDevices { devices }))
     })()
     .map_err(RuntimeError::from)
 }
@@ -356,7 +344,8 @@ fn configure_tun(
 #[hammer_component_macros::worker_init_function(name = "tun_worker_init")]
 fn configure_tun_worker(
     engine: &mut hammer_runtime::DataPlaneMain,
-    control: Arc<TunControl>,
+    devices: Arc<TunDevices>,
+    interface_main: Arc<InterfaceMain>,
 ) -> RuntimeResult<()> {
     (|| -> Result<(), TunError> {
         let worker = engine.data_worker_id()?;
@@ -365,8 +354,7 @@ fn configure_tun_worker(
                 name: TunInputDriverNode::NODE_NAME,
             },
         )?;
-        control.device_main.install_worker_output_runtime(worker);
-        let runtime = control.take_worker_runtime(engine, worker, tun_input)?;
+        let runtime = take_worker_runtime(&devices, &interface_main, engine, worker, tun_input)?;
         engine.nodes().set_node_state(
             tun_input,
             if runtime.has_rx_queues() {
@@ -375,9 +363,18 @@ fn configure_tun_worker(
                 NodeState::Disabled
             },
         )?;
-        TUN_WORKER_RUNTIME.with(|slot| {
-            slot.replace(Some(runtime));
-        });
+        let slot = TUN_WORKER_RUNTIME
+            .get()
+            .and_then(|slots| slots.get(worker.slot()))
+            .ok_or(TunError::WorkerFileUnavailable {
+                device_instance: 0,
+                worker: worker.slot() as u32,
+            })?;
+        slot.install(runtime)
+            .map_err(|_| TunError::WorkerFileUnavailable {
+                device_instance: 0,
+                worker: worker.slot() as u32,
+            })?;
         Ok(())
     })()
     .map_err(RuntimeError::from)
@@ -385,18 +382,24 @@ fn configure_tun_worker(
 
 fn schedule_tun_input(graph: &hammer_runtime::NodeRuntime, file: &mut File) -> RuntimeResult<()> {
     let queue_index = usize::try_from(file.private_data()).expect("RX queue index fits usize");
-    TUN_WORKER_RUNTIME.with(|runtime| {
-        let mut runtime = runtime.borrow_mut();
-        let runtime = runtime
-            .as_mut()
-            .expect("registered TUN File requires worker runtime");
-        runtime
-            .rx_queues
-            .get_mut(queue_index)
-            .expect("TUN File references a live RX queue")
-            .pending = true;
-        graph.mark_interrupt_pending(runtime.input_node).map(|_| ())
-    })
+    let worker = DataWorkerId::try_from(file.polling_thread_index())?;
+    let slot = TUN_WORKER_RUNTIME
+        .get()
+        .and_then(|slots| slots.get(worker.slot()))
+        .ok_or(RuntimeError::RuntimeCapabilityMissing {
+            type_name: "tun worker runtime",
+        })?;
+    let mut runtime = slot
+        .borrow_mut()
+        .map_err(|error| RuntimeError::subsystem("tun", error))?;
+    runtime
+        .rx_queues
+        .get_mut(queue_index)
+        .ok_or(RuntimeError::RuntimeCapabilityMissing {
+            type_name: "tun RX queue",
+        })?
+        .pending = true;
+    graph.mark_interrupt_pending(runtime.input_node).map(|_| ())
 }
 
 #[hammer_component_macros::graph_node(
@@ -452,23 +455,31 @@ impl Node for TunOutputDriverNode {
 }
 
 fn tun_input_process(runtime: &DataPlaneMain, _: NodeRuntimeData, frame: &mut BufferFrame) -> () {
-    TUN_WORKER_RUNTIME.with(|worker| {
-        let mut worker = worker.borrow_mut();
-        let worker = worker
-            .as_mut()
-            .expect("enabled TUN input node requires worker runtime");
-        worker.process_input(runtime, frame)
-    })
+    let worker = runtime
+        .data_worker_id()
+        .expect("TUN input executes on a data worker");
+    let slot = TUN_WORKER_RUNTIME
+        .get()
+        .and_then(|slots| slots.get(worker.slot()))
+        .expect("TUN input worker runtime is installed");
+    let mut worker = slot
+        .borrow_mut()
+        .expect("TUN input worker runtime belongs to this worker");
+    worker.process_input(runtime, frame)
 }
 
 fn tun_output_process(runtime: &DataPlaneMain, _: NodeRuntimeData, frame: &mut BufferFrame) -> () {
-    TUN_WORKER_RUNTIME.with(|worker| {
-        let mut worker = worker.borrow_mut();
-        let worker = worker
-            .as_mut()
-            .expect("TUN output node requires worker runtime");
-        worker.process_output(runtime, frame)
-    })
+    let worker = runtime
+        .data_worker_id()
+        .expect("TUN output executes on a data worker");
+    let slot = TUN_WORKER_RUNTIME
+        .get()
+        .and_then(|slots| slots.get(worker.slot()))
+        .expect("TUN output worker runtime is installed");
+    let mut worker = slot
+        .borrow_mut()
+        .expect("TUN output worker runtime belongs to this worker");
+    worker.process_output(runtime, frame)
 }
 
 impl TunWorkerRuntime {
@@ -649,7 +660,7 @@ impl TunWorkerRuntime {
         let queue = self
             .tx_queues
             .iter_mut()
-            .find(|queue| queue.queue.interface_index == interface_index)
+            .find(|queue| queue.queue.hw_if_index == interface_index)
             .ok_or(TunError::TxQueueUnavailable { interface_index })?;
         queue.tx_iovecs.clear();
         #[cfg(target_os = "macos")]

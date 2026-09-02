@@ -121,6 +121,13 @@ impl RootModule for PluginModuleRef {
 pub enum PluginError {
     #[error("plugin `{name}` is not loaded")]
     NotLoaded { name: String },
+    #[error("plugin `{plugin}` symbol `{symbol}` lookup failed")]
+    SymbolLookup {
+        plugin: String,
+        symbol: String,
+        #[source]
+        source: libloading::Error,
+    },
     #[error("Binary API method `{name}` is not registered")]
     BinaryApiMethodMissing { name: String },
     #[error("Binary API method `{name}` is registered more than once")]
@@ -219,6 +226,34 @@ impl std::fmt::Debug for PluginMain {
 }
 
 impl PluginMain {
+    pub fn get_plugin_symbol<T>(
+        &self,
+        plugin: &str,
+        symbol: &str,
+    ) -> Result<*const T, PluginError> {
+        let index = self
+            .library_index_by_name
+            .get(plugin)
+            .copied()
+            .ok_or_else(|| PluginError::NotLoaded {
+                name: plugin.to_owned(),
+            })?;
+        let library = self
+            .libraries
+            .get(index)
+            .expect("plugin library index remains valid");
+        let mut name = symbol.as_bytes().to_vec();
+        if !name.ends_with(&[0]) {
+            name.push(0);
+        }
+        library
+            .symbol::<T>(&name)
+            .map_err(|source| PluginError::SymbolLookup {
+                plugin: plugin.to_owned(),
+                symbol: symbol.to_owned(),
+                source,
+            })
+    }
     /// Adds one host-owned registration image before plugin lifecycle starts.
     pub fn register_builtin_image(&mut self, image: &'static RegistrationImage) {
         self.builtin_registration_images.push(image);
