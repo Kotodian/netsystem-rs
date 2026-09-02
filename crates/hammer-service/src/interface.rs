@@ -43,6 +43,7 @@ impl Default for InterfaceConfigMtu {
     }
 }
 
+#[hammer_component_macros::runtime_error(subsystem = "interface")]
 #[derive(Debug, thiserror::Error)]
 pub enum InterfaceError {
     #[error("interface name is empty")]
@@ -56,15 +57,6 @@ pub enum InterfaceError {
 }
 
 pub type InterfaceResult<T> = Result<T, InterfaceError>;
-
-impl From<InterfaceError> for RuntimeError {
-    fn from(error: InterfaceError) -> Self {
-        match error {
-            InterfaceError::Runtime(error) => error,
-            other => Self::subsystem("interface", other),
-        }
-    }
-}
 
 impl InterfaceConfig {
     pub fn validate(&self) -> RuntimeResult<()> {
