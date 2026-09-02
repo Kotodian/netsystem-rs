@@ -5,7 +5,6 @@ use std::sync::{Arc, OnceLock};
 
 use hammer_core::data_plane::{BufferFrame, DEFAULT_BUFFER_FRAME_CAPACITY, NodeId, NodeState};
 use hammer_infra::thread_owned::ThreadOwned;
-use hammer_runtime::sync::SpinLock;
 use hammer_runtime::{
     DataPlaneMain, DataWorkerId, File, FileFunctions, Node, NodeProcessFn, NodeRuntimeData,
     TraceFormatter, add_packet_trace, format_packet_trace,
@@ -106,7 +105,6 @@ struct TunDevice {
     requested_name: String,
     kernel_name: String,
     worker_files: Vec<Option<OwnedFd>>,
-    tx_lock: Arc<SpinLock<()>>,
 }
 
 struct TunDevices {
@@ -132,7 +130,6 @@ struct TunRxQueue {
 struct TunTxQueue {
     queue: TxQueue,
     file_index: u32,
-    tx_lock: Arc<SpinLock<()>>,
     tx_iovecs: Vec<libc::iovec>,
 }
 
@@ -182,7 +179,6 @@ fn add_interface(
         requested_name: interface_name.to_owned(),
         kernel_name,
         worker_files,
-        tx_lock: Arc::new(SpinLock::new(())),
     });
     Ok(())
 }
@@ -262,7 +258,6 @@ fn take_worker_runtime(
             worker_tx_queues.push(TunTxQueue {
                 queue: queue.clone(),
                 file_index,
-                tx_lock: Arc::clone(&device.tx_lock),
                 tx_iovecs: Vec::new(),
             });
         }
@@ -712,12 +707,10 @@ impl TunWorkerRuntime {
             .try_fold(0usize, |length, vector| length.checked_add(vector.iov_len))
             .ok_or(TunError::PacketLengthOutOfRange)?;
         let files = runtime.file_main();
-        let tx_guard = queue.queue.is_shared().then(|| queue.tx_lock.lock());
         // SAFETY: every payload iovec points into a live data-plane buffer
         // chain, the optional Darwin header remains live, and FileMain writes
         // synchronously before this function can release or mutate either.
         let written = unsafe { files.writev(queue.file_index, &queue.tx_iovecs)? };
-        drop(tx_guard);
         match written {
             Some(written) if written == expected => Ok(()),
             Some(written) => Err(TunError::PartialWrite {
