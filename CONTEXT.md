@@ -109,3 +109,90 @@ hardware-interface class, or interface callback. It registers the driver's
 network behavior with the owning network authority and is distinct from a
 runtime software-interface or hardware-interface instance.
 _Avoid_: interface record, interface helper
+
+## Network/IP Language
+
+**Independent Plugin**:
+A plugin that owns its lifecycle and network behavior. Independence does not
+prohibit an explicit dependency on another plugin's owner-defined interface.
+_Avoid_: zero-dependency plugin, isolated plugin
+
+**ICMP Plugin**:
+The independent plugin that owns ICMP behavior while consuming the IP plugin's
+explicit IPv4 and IPv6 interfaces.
+_Avoid_: IP plugin ICMP module, generic network plugin
+
+**IPv4/IPv6 Implementation**:
+The concrete IPv4 or IPv6 behavior inside the single IP plugin. They share the
+network forwarding model but are not one selectable protocol-family object.
+_Avoid_: ip4 plugin, ip6 plugin, family DSO
+
+**Net Registration Image**:
+A declaration of FIB sources and DPO classes contributed by network-capable
+plugins and consumed by the network owner during initialization.
+_Avoid_: network registry, generic registration hook
+
+**Net Component**:
+A plugin declaration for one concrete network registration face, analogous to
+an Interface Component.
+_Avoid_: net helper, erased network object
+
+**FIB Source**:
+A concrete authority that contributes route semantics for a prefix under a
+defined precedence and merge contract.
+_Avoid_: route table, source registry entry
+
+**DPO Class**:
+A forwarding behavior class identified independently from any concrete DPO
+instance. Several classes may describe different behaviors of one object form.
+_Avoid_: DPO object, DPO registry entry
+
+**DPO Instance**:
+A concrete forwarding object owned by the module that understands its state.
+Its compact identity is a dispatch fact, not the object itself.
+_Avoid_: DPO class, forwarding object
+
+**DPO Ownership Reference**:
+A control-plane ownership claim that keeps one DPO instance alive while its
+identity is published elsewhere.
+_Avoid_: copied DPO identity, manual unlock
+
+**DPO Data-Path Protocol**:
+The discriminator that selects a DPO's packet-graph/link behavior. It is not an
+IP wire protocol number and does not select ICMP, TCP, or UDP local dispatch.
+_Avoid_: DPO protocol number, IP protocol selector
+
+**IP Feature Arc**:
+A concrete IP packet-processing chain for one protocol and location, such as
+IPv4 local input or IPv6 output.
+_Avoid_: generic IP family arc, DPO protocol dispatch
+
+**Path MTU DPO**:
+An IP-owned forwarding object that applies a path MTU constraint while
+preserving the underlying forwarding decision.
+_Avoid_: service PMTU cache, ICMP parser in net
+
+**Local0 Interface**:
+The always-present network interface used as a reserved sentinel rather than
+an addressable endpoint.
+_Avoid_: loopback interface, ordinary local route interface
+
+**Device RX Node**:
+A graph node owned by a device plugin that receives ingress packets and chooses
+their next graph target.
+_Avoid_: fixed device input path, service-owned protocol input
+
+**IP/Device Data-Path Seam**:
+The packet-graph seam where device and IP plugins exchange node identity and
+RX/TX interface facts without a fixed protocol path.
+_Avoid_: device-to-IP hardwire, generic protocol dispatcher
+
+**Interface RX Redirect**:
+An interface-owner request for a device class to redirect one hardware
+interface's receive stream to a concrete graph node.
+_Avoid_: global input next, fixed IP input redirect
+
+**Binary API Route Publication**:
+The control-plane command surface used to request runtime route and forwarding
+changes from the plugin that owns them.
+_Avoid_: direct route publish handle, config-only route mutation
