@@ -1,6 +1,6 @@
 use std::sync::{Arc, OnceLock};
 
-use hammer_runtime::{GlobalMain, RuntimeError, RuntimeResult};
+use hammer_runtime::{RuntimeError, RuntimeResult};
 
 use crate::interface::InterfaceMain;
 
@@ -13,14 +13,6 @@ pub struct NetMain {
 }
 
 impl NetMain {
-    pub fn new(interface_main: Arc<InterfaceMain>) -> Self {
-        Self {
-            interface_main,
-            local_interface_hw_index: u32::MAX,
-            local_interface_sw_index: u32::MAX,
-        }
-    }
-
     pub fn global() -> RuntimeResult<&'static NetMain> {
         NET_MAIN
             .get()
@@ -30,14 +22,7 @@ impl NetMain {
             })
     }
 
-    pub fn init(
-        _: &mut GlobalMain,
-        interface_main: Arc<InterfaceMain>,
-    ) -> RuntimeResult<Arc<NetMain>> {
-        Self::init_with_interface(interface_main)
-    }
-
-    fn init_with_interface(interface_main: Arc<InterfaceMain>) -> RuntimeResult<Arc<NetMain>> {
+    pub fn init(interface_main: Arc<InterfaceMain>) -> RuntimeResult<Arc<NetMain>> {
         let local_hw = interface_main
             .register_hardware_interface(0, 0, 0, 0)
             .map_err(RuntimeError::from)?;
@@ -50,10 +35,11 @@ impl NetMain {
             .ok_or(RuntimeError::RuntimeCapabilityMissing {
                 type_name: "local0",
             })?;
-        let mut value = NetMain::new(interface_main);
-        value.local_interface_hw_index = local_hw;
-        value.local_interface_sw_index = local_sw;
-        let main = Arc::new(value);
+        let main = Arc::new(NetMain {
+            interface_main,
+            local_interface_hw_index: local_hw,
+            local_interface_sw_index: local_sw,
+        });
         let _ = NET_MAIN.set(Arc::clone(&main));
         Ok(main)
     }
@@ -75,9 +61,6 @@ impl NetMain {
 pub static NET_MAIN: OnceLock<Arc<NetMain>> = OnceLock::new();
 
 #[hammer_component_macros::init_function(name = "net_main_init", runs_after = ["interface_main_init"])]
-fn init_net_main(
-    _: &mut GlobalMain,
-    interface_main: Arc<InterfaceMain>,
-) -> RuntimeResult<Arc<NetMain>> {
-    NetMain::init_with_interface(interface_main)
+fn init_net_main(interface_main: Arc<InterfaceMain>) -> RuntimeResult<Arc<NetMain>> {
+    NetMain::init(interface_main)
 }
