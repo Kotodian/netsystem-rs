@@ -1,0 +1,4 @@
+interface:
+  display_name: "Worker Barrier"
+  short_description: "Design and review Hammer WorkerBarrier usage"
+  default_prompt: "Use $barrier to review or implement a Hammer WorkerBarrier synchronization change."
