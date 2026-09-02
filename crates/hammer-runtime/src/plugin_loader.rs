@@ -82,6 +82,27 @@ impl PluginLibrary {
             })
         }
     }
+
+    pub(crate) fn symbol<T>(&self, name: &[u8]) -> Result<*const T, libloading::Error> {
+        #[cfg(unix)]
+        {
+            use libloading::os::unix::Library as UnixLibrary;
+            // SAFETY: `self.handle` is a live RTLD_NODELETE handle retained for
+            // the process lifetime; the temporary owner is converted back below.
+            let temporary = unsafe { UnixLibrary::from_raw(self.handle.as_ptr()) };
+            // SAFETY: the caller supplies the ABI type for the named symbol;
+            // the returned address remains valid while this library is mapped.
+            let pointer = unsafe { temporary.get::<*const T>(name).map(|symbol| *symbol) };
+            let handle = temporary.into_raw();
+            debug_assert_eq!(handle, self.handle.as_ptr());
+            pointer
+        }
+        #[cfg(not(unix))]
+        {
+            // SAFETY: the retained process-lifetime library owns the symbol.
+            unsafe { self.library.get::<*const T>(name).map(|symbol| *symbol) }
+        }
+    }
 }
 
 /// Loads the sole `abi_stable` root module while its process-lifetime image

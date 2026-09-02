@@ -4,12 +4,16 @@ mod tun;
 
 pub use tun::*;
 
+#[unsafe(no_mangle)]
+pub static HAMMER_INTERFACE_REGISTRATION_IMAGE: hammer_service::InterfaceRegistrationImage =
+    hammer_service::InterfaceRegistrationImage::new(&[], &[], &[], &[]);
+
 hammer_component_macros::declare_plugin!(
     name = "tun",
     load_after = ["ip"],
     init_functions = [],
     config_functions = [tun::__CONFIG_FN_TUN_CONFIG],
-    early_config_functions = [tun::__CONFIG_FN_TUN_INTERFACES_CONFIG],
+    early_config_functions = [],
     main_loop_enter_functions = [],
     main_loop_exit_functions = [],
     worker_init_functions = [tun::__INIT_FN_TUN_WORKER_INIT],

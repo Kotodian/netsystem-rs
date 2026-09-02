@@ -23,7 +23,7 @@ use hammer_runtime::{
 use hammer_runtime::{RuntimeError, RuntimeResult};
 
 use hammer_service::data_plane::set_index_node_error;
-use hammer_service::interface::InterfaceControlHandle;
+use hammer_service::interface::InterfaceMain;
 use hammer_service::opaque::{NetworkOpaque, TapEthernetMetadata};
 
 use crate::config::{NetworkIpConfig, Route, RouteAction};
@@ -191,17 +191,14 @@ impl FibContributions {
 }
 
 impl IpMain {
-    pub fn new(
-        routes: Arc<[Route]>,
-        interfaces: Option<InterfaceControlHandle>,
-    ) -> RuntimeResult<Self> {
+    pub fn new(routes: Arc<[Route]>, interfaces: Option<&InterfaceMain>) -> RuntimeResult<Self> {
         let mut contributions = FibContributions::default();
         for route in routes.iter() {
             let action = match route.action()? {
                 RouteAction::Drop => FibContribution::Drop,
                 RouteAction::Adjacency { via, interface } => {
                     let interface_index = Self::configured_interface_index(
-                        interfaces.as_ref(),
+                        interfaces,
                         route.prefix,
                         interface.as_str(),
                     )?;
@@ -221,7 +218,7 @@ impl IpMain {
                 }
                 RouteAction::LoadBalance { via, interface } => {
                     let interface_index = Self::configured_interface_index(
-                        interfaces.as_ref(),
+                        interfaces,
                         route.prefix,
                         interface.as_str(),
                     )?;
@@ -240,7 +237,7 @@ impl IpMain {
             };
             contributions.insert(route.prefix, FibSource::Api, action)?;
         }
-        if let Some(interfaces) = interfaces.as_ref() {
+        if let Some(interfaces) = interfaces {
             Self::add_interface_contributions(&mut contributions, interfaces)?;
         }
         Ok(Self {
@@ -294,7 +291,7 @@ impl IpMain {
     }
 
     fn configured_interface_index(
-        interfaces: Option<&InterfaceControlHandle>,
+        interfaces: Option<&InterfaceMain>,
         prefix: ipnet::IpNet,
         interface: &str,
     ) -> RuntimeResult<u32> {
@@ -376,7 +373,7 @@ impl IpMain {
 
     fn add_interface_contributions(
         contributions: &mut FibContributions,
-        interfaces: &InterfaceControlHandle,
+        interfaces: &InterfaceMain,
     ) -> RuntimeResult<()> {
         let mut interface_index = 0u32;
         while interfaces.interface_name(interface_index).is_some() {
@@ -503,14 +500,12 @@ pub static IP_MAIN: ArcSwapOption<IpMain> = ArcSwapOption::const_empty();
 )]
 fn configure_ip(
     config: NetworkIpConfig,
-    engine: &mut hammer_runtime::GlobalMain,
+    _: &mut hammer_runtime::GlobalMain,
+    net_main: Arc<hammer_service::net::NetMain>,
 ) -> RuntimeResult<()> {
     config.validate()?;
     let routes = Arc::<[_]>::from(config.route);
-    let interfaces = engine
-        .registry
-        .get::<hammer_service::interface::InterfaceControlPlane>()
-        .map(|plane| plane.handle());
+    let interfaces = Some(net_main.interface_main());
     let main = Arc::new(IpMain::new(routes, interfaces)?);
     IP_MAIN.store(Some(main));
     hammer_service::net::pmtu::publish_path_mtu_cache(

@@ -3373,6 +3373,77 @@ pub fn plugin(args: TokenStream, input: TokenStream) -> TokenStream {
         .into()
 }
 
+#[proc_macro_derive(DeviceClass, attributes(device_class))]
+pub fn derive_device_class(input: TokenStream) -> TokenStream {
+    derive_class(input, true)
+        .unwrap_or_else(Error::into_compile_error)
+        .into()
+}
+
+#[proc_macro_derive(HwClass, attributes(hw_class))]
+pub fn derive_hw_class(input: TokenStream) -> TokenStream {
+    derive_class(input, false)
+        .unwrap_or_else(Error::into_compile_error)
+        .into()
+}
+
+fn derive_class(input: TokenStream, device: bool) -> Result<TokenStream2> {
+    let item: ItemStruct = syn::parse(input)?;
+    let ident = item.ident;
+    let attribute_name = if device { "device_class" } else { "hw_class" };
+    let name = item
+        .attrs
+        .iter()
+        .find(|attribute| attribute.path().is_ident(attribute_name))
+        .and_then(|attribute| {
+            attribute
+                .parse_args_with(|input: ParseStream<'_>| {
+                    let key: Ident = input.parse()?;
+                    input.parse::<Token![=]>()?;
+                    let value: LitStr = input.parse()?;
+                    Ok((key, value))
+                })
+                .ok()
+        })
+        .filter(|(key, _)| key == "name")
+        .map(|(_, value)| value)
+        .unwrap_or_else(|| LitStr::new(&ident.to_string(), ident.span()));
+    let ty = if device {
+        quote!(::hammer_service::device::DeviceClass)
+    } else {
+        quote!(::hammer_service::device::HwClass)
+    };
+    Ok(quote! {
+        impl #ident {
+            pub const fn registration() -> #ty { #ty::new(#name) }
+        }
+    })
+}
+
+#[proc_macro_derive(HwInterfaceCallback, attributes(interface_callback))]
+pub fn derive_hw_interface_callback(input: TokenStream) -> TokenStream {
+    derive_interface_callback(input).into()
+}
+
+#[proc_macro_derive(SwInterfaceCallback, attributes(interface_callback))]
+pub fn derive_sw_interface_callback(input: TokenStream) -> TokenStream {
+    derive_interface_callback(input).into()
+}
+
+fn derive_interface_callback(input: TokenStream) -> TokenStream {
+    let item: ItemStruct = match syn::parse(input) {
+        Ok(item) => item,
+        Err(error) => return error.into_compile_error().into(),
+    };
+    let ident = item.ident;
+    quote! {
+        impl #ident {
+            pub const PRIORITY: u8 = 0;
+        }
+    }
+    .into()
+}
+
 fn plugin_registration_tokens(args: &PluginArgs) -> TokenStream2 {
     let name = &args.name;
     let load_after = &args.load_after;
