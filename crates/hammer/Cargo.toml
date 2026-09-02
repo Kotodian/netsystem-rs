@@ -8,14 +8,6 @@ publish = false
 name = "hammer"
 path = "src/main.rs"
 
-[[example]]
-name = "tun_tcp_echo"
-path = "../../examples/tun/tcp_echo.rs"
-
-[[example]]
-name = "tun_tls_echo"
-path = "../../examples/tun/tls_echo.rs"
-
 [dependencies]
 hammer-runtime = { path = "../hammer-runtime" }
 hammer-infra = { path = "../hammer-infra" }

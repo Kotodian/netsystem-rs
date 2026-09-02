@@ -6,9 +6,8 @@ use std::process::ExitCode;
 use clap::{Parser, Subcommand};
 use hammer_ipc::binary_api::BinaryApiClient;
 
-/// Default Binary API Unix socket path, matching the convention documented
-/// in the example daemon config (`examples/tun-tcp-echo.toml`).
-const DEFAULT_SOCKET: &str = "/tmp/hammer-tcp-integration.binary-api.sock";
+/// Default Binary API Unix socket path for a local daemon.
+const DEFAULT_SOCKET: &str = "/tmp/hammer.binary-api.sock";
 
 #[derive(Parser, Debug)]
 #[command(

@@ -1172,24 +1172,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "hammer-plugin-tun"
-version = "0.1.0"
-dependencies = [
- "abi_stable",
- "hammer-component-macros",
- "hammer-core",
- "hammer-infra",
- "hammer-runtime",
- "hammer-service",
- "libc",
- "linkme",
- "serde",
- "thiserror 2.0.18",
- "toml",
- "tracing",
-]
-
-[[package]]
 name = "hammer-plugin-udp"
 version = "0.1.0"
 dependencies = [

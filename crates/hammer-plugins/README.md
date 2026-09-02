@@ -4,8 +4,6 @@ Layout follows domain ownership — **not** a flat list of every name:
 
 ```text
 hammer-plugins/
-  device/          # device-class drivers (abstraction stays in hammer-service::device)
-    tun/           # hammer-plugin-tun
   ip/              # hammer-plugin-ip
   transport/       # L4 protocols (abstraction stays in hammer-service::transport)
     tcp/           # hammer-plugin-tcp

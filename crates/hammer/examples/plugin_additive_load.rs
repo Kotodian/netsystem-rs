@@ -24,7 +24,7 @@ use hammer_runtime::{PluginError, RuntimeError};
 use hammer_service as _;
 
 const EXAMPLE_CONFIG: &str = r#"
-plugins = ["tun", "ip", "tcp", "udp"]
+plugins = ["ip", "tcp", "udp"]
 
 [memory]
 main_heap_size = "256 MiB"
@@ -36,7 +36,7 @@ count = 1
 slots_per_numa = 256
 frame_pool_size = 32
 "#;
-const PLUGIN_NAMES: [&str; 4] = ["ip", "tun", "tcp", "udp"];
+const PLUGIN_NAMES: [&str; 3] = ["ip", "tcp", "udp"];
 
 #[derive(Debug, Default, serde::Deserialize)]
 #[serde(default)]
@@ -175,7 +175,7 @@ fn run_example(
             actual: loaded_plugins,
         });
     }
-    for name in ["tun-input", "ip-input", "tcp-input", "udp-input"] {
+    for name in ["ip-input", "tcp-input", "udp-input"] {
         if engine.data_plane_main().node_by_name(name).is_none() {
             return Err(ExampleError::PluginNodeMissing { name });
         }
@@ -210,7 +210,7 @@ fn run_example(
     }
 
     println!("fixed main heap: {main_heap_capacity} bytes");
-    println!("loaded plugins: ip, tun, tcp, udp");
+    println!("loaded plugins: ip, tcp, udp");
     println!("host and plugin images share libhammer_infra allocator authority");
     println!("main graph and live worker update completed");
     Ok(())
