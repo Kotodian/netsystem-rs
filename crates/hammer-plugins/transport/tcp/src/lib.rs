@@ -483,7 +483,8 @@ pub fn register_tcp_input(runtime: &DataPlaneMain) -> RuntimeResult<NodeId> {
             &TcpInputNext::NEXT_NAMES,
         )?
     };
-    hammer_plugin_ip::register_protocol(6, node)?;
+    hammer_plugin_ip::register_ip4_protocol(runtime.nodes(), 6, node)?;
+    hammer_plugin_ip::register_ip6_protocol(runtime.nodes(), 6, node)?;
     Ok(node)
 }
 

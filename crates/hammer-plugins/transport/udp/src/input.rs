@@ -614,7 +614,8 @@ fn register_udp_input(runtime: &DataPlaneMain) -> RuntimeResult<NodeId> {
     let node = runtime
         .nodes()
         .try_register_internal_with_next_names(control.node(), &UdpInputNext::NEXT_NAMES)?;
-    hammer_plugin_ip::register_protocol(17, node)?;
+    hammer_plugin_ip::register_ip4_protocol(runtime.nodes(), 17, node)?;
+    hammer_plugin_ip::register_ip6_protocol(runtime.nodes(), 17, node)?;
     UDP_LOCAL_REGISTRATION
         .set(UdpLocalRegistration {
             inner: Arc::clone(&control.inner),
