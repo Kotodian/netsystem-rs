@@ -3387,6 +3387,138 @@ pub fn derive_hw_class(input: TokenStream) -> TokenStream {
         .into()
 }
 
+struct DpoNodeBinding {
+    proto: Expr,
+    argument: Ident,
+}
+
+impl Parse for DpoNodeBinding {
+    fn parse(input: ParseStream<'_>) -> Result<Self> {
+        let content;
+        syn::parenthesized!(content in input);
+        Ok(Self {
+            proto: content.parse()?,
+            argument: {
+                content.parse::<Token![,]>()?;
+                content.parse()?
+            },
+        })
+    }
+}
+
+#[proc_macro_derive(DpoClass, attributes(dpo_class))]
+pub fn derive_dpo_class(input: TokenStream) -> TokenStream {
+    let item: ItemStruct = match syn::parse(input) {
+        Ok(item) => item,
+        Err(error) => return error.into_compile_error().into(),
+    };
+    let ident = item.ident;
+    let (impl_generics, ty_generics, where_clause) = item.generics.split_for_impl();
+    let mut nodes = Vec::<DpoNodeBinding>::new();
+    for attribute in item
+        .attrs
+        .iter()
+        .filter(|attribute| attribute.path().is_ident("dpo_class"))
+    {
+        let parsed = attribute.parse_args_with(|input: ParseStream<'_>| {
+            let key: Ident = input.parse()?;
+            if key != "nodes" {
+                return Err(Error::new(key.span(), "expected `nodes`"));
+            }
+            input.parse::<Token![=]>()?;
+            let content;
+            bracketed!(content in input);
+            let mut bindings = Vec::new();
+            while !content.is_empty() {
+                bindings.push(content.parse::<DpoNodeBinding>()?);
+                if content.parse::<Option<Token![,]>>()?.is_none() {
+                    break;
+                }
+            }
+            Ok(bindings)
+        });
+        match parsed {
+            Ok(bindings) => nodes.extend(bindings),
+            Err(error) => return error.into_compile_error().into(),
+        }
+    }
+    if nodes.is_empty() {
+        return Error::new(ident.span(), "DpoClass requires a non-empty `nodes` list")
+            .into_compile_error()
+            .into();
+    }
+    let arguments: Vec<_> = nodes.iter().map(|node| &node.argument).collect();
+    let protocols: Vec<_> = nodes.iter().map(|node| &node.proto).collect();
+    quote! {
+        impl #impl_generics #ident #ty_generics #where_clause {
+            pub fn register_dpo_class(
+                dpo_main: &mut ::hammer_service::net::dpo::DpoMain,
+                #(#arguments: ::hammer_core::data_plane::NodeId),*
+            ) -> Result<::hammer_service::net::dpo::DpoType, ::hammer_service::net::dpo::DpoError> {
+                dpo_main.register_new_type(&[#((#protocols, #arguments)),*])
+            }
+        }
+    }
+    .into()
+}
+
+#[proc_macro_derive(FibSource, attributes(fib_source))]
+pub fn derive_fib_source(input: TokenStream) -> TokenStream {
+    let item: ItemStruct = match syn::parse(input) {
+        Ok(item) => item,
+        Err(error) => return error.into_compile_error().into(),
+    };
+    let ident = item.ident;
+    let mut name = LitStr::new(&ident.to_string(), ident.span());
+    let mut priority = quote!(0u8);
+    let mut behavior = quote!(::hammer_service::net::FibSourceBehavior::Api);
+    for attribute in item
+        .attrs
+        .iter()
+        .filter(|attribute| attribute.path().is_ident("fib_source"))
+    {
+        let parsed = attribute.parse_args_with(|input: ParseStream<'_>| {
+            let mut result = (None, None, None);
+            while !input.is_empty() {
+                let key: Ident = input.parse()?;
+                input.parse::<Token![=]>()?;
+                match key.to_string().as_str() {
+                    "name" => result.0 = Some(input.parse::<LitStr>()?),
+                    "priority" => result.1 = Some(input.parse::<syn::LitInt>()?),
+                    "behavior" => result.2 = Some(input.parse::<Ident>()?),
+                    _ => return Err(Error::new(key.span(), "unknown `fib_source` argument")),
+                }
+                if !input.is_empty() {
+                    input.parse::<Token![,]>()?;
+                }
+            }
+            Ok(result)
+        });
+        match parsed {
+            Ok((parsed_name, parsed_priority, parsed_behavior)) => {
+                if let Some(value) = parsed_name {
+                    name = value;
+                }
+                if let Some(value) = parsed_priority {
+                    priority = quote!(#value);
+                }
+                if let Some(value) = parsed_behavior {
+                    behavior = quote!(::hammer_service::net::FibSourceBehavior::#value);
+                }
+            }
+            Err(error) => return error.into_compile_error().into(),
+        }
+    }
+    quote! {
+        impl #ident {
+            pub const NAME: &'static str = #name;
+            pub const PRIORITY: u8 = #priority;
+            pub const BEHAVIOR: ::hammer_service::net::FibSourceBehavior = #behavior;
+        }
+    }
+    .into()
+}
+
 fn derive_class(input: TokenStream, device: bool) -> Result<TokenStream2> {
     let item: ItemStruct = syn::parse(input)?;
     let ident = item.ident;
