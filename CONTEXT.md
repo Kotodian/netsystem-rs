@@ -127,35 +127,70 @@ The concrete IPv4 or IPv6 behavior inside the single IP plugin. They share the
 network forwarding model but are not one selectable protocol-family object.
 _Avoid_: ip4 plugin, ip6 plugin, family DSO
 
-**Net Registration Image**:
-A declaration of FIB sources and DPO classes contributed by network-capable
-plugins and consumed by the network owner during initialization.
-_Avoid_: network registry, generic registration hook
-
-**Net Component**:
-A plugin declaration for one concrete network registration face, analogous to
-an Interface Component.
-_Avoid_: net helper, erased network object
-
 **FIB Source**:
 A concrete authority that contributes route semantics for a prefix under a
 defined precedence and merge contract.
 _Avoid_: route table, source registry entry
 
+**FIB Graph Node**:
+A source, entry, path list, path, or tracker identified by `(node_type, index)`
+and connected through child/sibling links for recursive resolution and
+back-walk.
+_Avoid_: raw pointer node, route snapshot
+
+**FIB Entry Source**:
+The per-entry, embedded contribution record for one `FIB Source`, not an
+independent graph node. It retains the source's path-extension list, path-list
+link, entry/source flags, source identity, repeated-add count, common
+cover/interpose relation facts, and one concrete owner-supplied source-data
+payload. Service net does not enumerate protocol-specific source branches.
+_Avoid_: independent graph index, source registration metadata, callback table,
+erased source payload
+
+**Path Extension**:
+Per-source path state associated with `(entry, source, path_index)` that carries
+facts outside the shared FIB path. Its concrete payload and lifecycle are
+selected by the source or table owner.
+_Avoid_: universal path field, label stack in `FibPath`
+
+**Entry Delegate**:
+An optional FIB entry relation created only when needed for an additional
+forwarding chain, covered-entry list, tracker, BFD state, or attached
+import/export relationship.
+_Avoid_: fixed chain array, generic delegate object
+
+**Midchain Adjacency**:
+An adjacency subtype that stacks a child DPO on a recursive target entry and
+restacks or un-stacks to drop as target state changes.
+_Avoid_: separate midchain pool, tunnel callback in service net
+
+**Load-Balance Map**:
+A supporting weighted-bucket remapping object shared by load-balance instances;
+it is not a DPO class and is rebuilt when path state changes.
+_Avoid_: load-balance DPO type, forwarding-chain walk for uRPF
+
+**MFIB**:
+The multicast FIB authority with its own table/entry/path state and replicate
+DPO projection, separate from the unicast `FibTable` implementation.
+_Avoid_: multicast fields in unicast FIB, shared family table
+
 **DPO Class**:
-A forwarding behavior class identified independently from any concrete DPO
-instance. Several classes may describe different behaviors of one object form.
-_Avoid_: DPO object, DPO registry entry
+A forwarding behavior key with per-data-path node metadata, bound to a concrete
+object pool by its owning module. Several classes may describe different
+behaviors of one object form.
+_Avoid_: DPO instance, forwarding object
 
 **DPO Instance**:
 A concrete forwarding object owned by the module that understands its state.
 Its compact identity is a dispatch fact, not the object itself.
 _Avoid_: DPO class, forwarding object
 
-**DPO Ownership Reference**:
-A control-plane ownership claim that keeps one DPO instance alive while its
-identity is published elsewhere.
-_Avoid_: copied DPO identity, manual unlock
+**Network Address**:
+A producer-owned concrete value stored directly in a generic DPO layout. Net
+borrows or moves that value but does not define an address trait, canonicalisation
+method, byte representation, family enum, or wire interpretation.
+_Avoid_: `Box<[u8]>` address erasure, `dyn` address, `IpFamily`, IP address type
+in service net
 
 **DPO Data-Path Protocol**:
 The discriminator that selects a DPO's packet-graph/link behavior. It is not an
