@@ -1097,11 +1097,23 @@ dependencies = [
 ]
 
 [[package]]
+name = "hammer-plugin-icmp"
+version = "0.1.0"
+dependencies = [
+ "abi_stable",
+ "hammer-component-macros",
+ "hammer-core",
+ "hammer-plugin-ip",
+ "hammer-runtime",
+]
+
+[[package]]
 name = "hammer-plugin-ip"
 version = "0.1.0"
 dependencies = [
  "abi_stable",
  "arc-swap",
+ "bitflags 2.11.1",
  "hammer-component-macros",
  "hammer-core",
  "hammer-infra",

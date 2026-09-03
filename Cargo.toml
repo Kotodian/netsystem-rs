@@ -7,6 +7,7 @@ members = [
     "crates/hammer-runtime",
     "crates/hammer-service",
     "crates/hammer-plugins/ip",
+    "crates/hammer-plugins/net/icmp",
     "crates/hammer-plugins/transport/tcp",
     "crates/hammer-plugins/transport/udp",
     "crates/hammer-plugins/app-session/quic",
