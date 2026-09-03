@@ -11,6 +11,7 @@ crate-type = ["dylib", "rlib"]
 [dependencies]
 abi_stable = { workspace = true }
 arc-swap = { workspace = true }
+bitflags = { workspace = true }
 hammer-core = { path = "../../hammer-core" }
 hammer-infra = { path = "../../hammer-infra" }
 hammer-runtime = { path = "../../hammer-runtime", default-features = false }

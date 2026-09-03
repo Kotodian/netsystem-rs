@@ -707,7 +707,7 @@ fn icmp_path_mtu_process_frame(runtime: &DataPlaneMain, frame: &mut BufferFrame)
 
 fn update_path_mtu_from_index(runtime: &DataPlaneMain, index: Index) -> RuntimeResult<()> {
     let packet = collect_current_chain_for_icmp_generation(runtime, index)?;
-    let _ = hammer_service::net::pmtu::process_ipv4_icmp_path_mtu_packet(packet.as_ref());
+    let _ = crate::pmtu::process_ipv4_icmp_path_mtu_packet(packet.as_ref());
     Ok(())
 }
 

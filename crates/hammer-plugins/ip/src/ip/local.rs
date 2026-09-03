@@ -1,4 +1,3 @@
-use std::cell::RefCell;
 use std::mem::transmute;
 use std::net::IpAddr;
 use std::sync::{Arc, Mutex, OnceLock};
@@ -236,28 +235,39 @@ pub struct IpReceiveNode {
     state: IpLocalStateHandle,
 }
 
-std::thread_local! {
-    static PENDING_IP_LOCAL_CONTROL: RefCell<Option<IpLocalControlPlane>> = const {
-        RefCell::new(None)
+static PENDING_IP_LOCAL_CONTROL: OnceLock<IpLocalControlPlane> = OnceLock::new();
+static IP_LOCAL_PROTOCOL_REGISTRATION: OnceLock<(IpLocalControlPlane, NodeId)> = OnceLock::new();
+
+pub(crate) fn register_protocol(
+    nodes: &hammer_runtime::node::NodeRuntime,
+    protocol: u8,
+    node: NodeId,
+) -> RuntimeResult<()> {
+    let Some((control, consumer)) = IP_LOCAL_PROTOCOL_REGISTRATION.get() else {
+        return Err(crate::ip::IpControlError::NodeRuntimeUnavailable {
+            operation: crate::ip::IpControlOperation::IpProtocolRegistration,
+        }
+        .into());
     };
-    static IP_LOCAL_PROTOCOL_REGISTRATION: RefCell<
-        Option<(IpLocalControlPlane, hammer_runtime::node::NodeRuntime, NodeId)>,
-    > = const { RefCell::new(None) };
+    let slot = nodes.add_node_next_slot(*consumer, node)?;
+    control.publish_protocol_slot(protocol, slot);
+    Ok(())
 }
 
-pub(crate) fn register_protocol(protocol: u8, node: NodeId) -> RuntimeResult<()> {
-    IP_LOCAL_PROTOCOL_REGISTRATION.with(|registration| {
-        let registration = registration.borrow();
-        let (control, nodes, consumer) =
-            registration
-                .as_ref()
-                .ok_or(crate::ip::IpControlError::NodeRuntimeUnavailable {
-                    operation: crate::ip::IpControlOperation::IpProtocolRegistration,
-                })?;
-        let slot = nodes.add_node_next_slot(*consumer, node)?;
-        control.publish_protocol_slot(protocol, slot);
-        Ok(())
-    })
+pub(crate) fn register_ip4_protocol(
+    nodes: &hammer_runtime::node::NodeRuntime,
+    protocol: u8,
+    node: NodeId,
+) -> RuntimeResult<()> {
+    register_protocol(nodes, protocol, node)
+}
+
+pub(crate) fn register_ip6_protocol(
+    nodes: &hammer_runtime::node::NodeRuntime,
+    protocol: u8,
+    node: NodeId,
+) -> RuntimeResult<()> {
+    register_protocol(nodes, protocol, node)
 }
 
 fn register_ip_local(runtime: &DataPlaneMain) -> RuntimeResult<NodeId> {
@@ -265,21 +275,24 @@ fn register_ip_local(runtime: &DataPlaneMain) -> RuntimeResult<NodeId> {
     let node = runtime
         .nodes()
         .try_register_internal_with_next_names(control.node(), &IpLocalNext::NEXT_NAMES)?;
-    IP_LOCAL_PROTOCOL_REGISTRATION.with(|registration| {
-        *registration.borrow_mut() = Some((control.clone(), runtime.nodes().clone(), node));
-    });
-    PENDING_IP_LOCAL_CONTROL.with(|pending| {
-        *pending.borrow_mut() = Some(control);
-    });
+    if IP_LOCAL_PROTOCOL_REGISTRATION
+        .set((control.clone(), node))
+        .is_err()
+    {
+        panic!("IP local protocol registration initialized twice");
+    }
+    if PENDING_IP_LOCAL_CONTROL.set(control).is_err() {
+        panic!("IP local control initialized twice");
+    }
     Ok(node)
 }
 
 fn register_ip_receive(runtime: &DataPlaneMain) -> RuntimeResult<NodeId> {
-    let control = PENDING_IP_LOCAL_CONTROL
-        .with(|pending| pending.borrow_mut().take())
-        .ok_or(crate::ip::IpControlError::NodeRuntimeUnavailable {
+    let control = PENDING_IP_LOCAL_CONTROL.get().cloned().ok_or(
+        crate::ip::IpControlError::NodeRuntimeUnavailable {
             operation: crate::ip::IpControlOperation::IpReceiveRegistration,
-        })?;
+        },
+    )?;
     runtime
         .nodes()
         .try_register_internal(control.receive_node())

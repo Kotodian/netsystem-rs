@@ -12,17 +12,7 @@ use super::ip4_mtrie::{Ip4Mtrie, Ip4MtrieRoute, Ip4MtrieValue};
 use super::ip6_fib::Ip6Fib;
 use super::load_balance::{LoadBalance, LoadBalanceError, LoadBalanceIndex};
 
-/// Control-plane owner of a FIB contribution.
-///
-/// The numeric values match VPP's source priority classes. Lower values win;
-/// losing sources remain control-plane state and can become active after the
-/// current winner is withdrawn.
-#[repr(u8)]
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub enum FibSource {
-    Interface = 0x03,
-    Api = 0x80,
-}
+pub use hammer_service::net::FibSource;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct FibEntry<N> {

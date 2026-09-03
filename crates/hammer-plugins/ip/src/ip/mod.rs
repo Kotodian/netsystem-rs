@@ -3,6 +3,44 @@ pub mod input;
 pub mod local;
 pub mod reassembly;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum IpRoutePathBehavior {
+    ResolveViaHost,
+    ResolveViaAttached,
+    Local,
+    Drop,
+    UdpEncap,
+    IcmpUnreachable,
+    IcmpProhibit,
+    SourceLookup,
+    Dvr,
+    InterfaceRx,
+    Classify,
+}
+
+bitflags::bitflags! {
+    #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+    #[repr(transparent)]
+    pub struct IpPathFlags: u32 {
+        const RESOLVE_VIA_HOST = 1 << 0;
+        const RESOLVE_VIA_ATTACHED = 1 << 1;
+        const LOCAL = 1 << 2;
+        const ATTACHED = 1 << 3;
+        const DROP = 1 << 4;
+        const EXCLUSIVE = 1 << 5;
+        const INTF_RX = 1 << 6;
+        const RPF_ID = 1 << 7;
+        const SOURCE_LOOKUP = 1 << 8;
+        const UDP_ENCAP = 1 << 9;
+        const DEAG = 1 << 13;
+        const DVR = 1 << 14;
+        const ICMP_UNREACH = 1 << 15;
+        const ICMP_PROHIBIT = 1 << 16;
+        const CLASSIFY = 1 << 17;
+        const GLEAN = 1 << 19;
+    }
+}
+
 use std::net::IpAddr;
 
 use crate::protocol::ip::{

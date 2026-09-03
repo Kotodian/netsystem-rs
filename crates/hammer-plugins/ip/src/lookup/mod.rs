@@ -235,7 +235,7 @@ impl IpMain {
                     )
                 }
             };
-            contributions.insert(route.prefix, FibSource::Api, action)?;
+            contributions.insert(route.prefix, FibSource::API, action)?;
         }
         if let Some(interfaces) = interfaces {
             Self::add_interface_contributions(&mut contributions, interfaces)?;
@@ -379,7 +379,7 @@ impl IpMain {
         while interfaces.interface_name(interface_index).is_some() {
             for address in interfaces.interface_addresses(interface_index) {
                 let host = host_prefix(address)?;
-                contributions.insert(host, FibSource::Interface, FibContribution::Receive)?;
+                contributions.insert(host, FibSource::INTERFACE, FibContribution::Receive)?;
 
                 if address.prefix_len() == address.max_prefix_len() {
                     continue;
@@ -387,7 +387,7 @@ impl IpMain {
                 let connected = address.trunc();
                 contributions.insert(
                     connected,
-                    FibSource::Interface,
+                    FibSource::INTERFACE,
                     FibContribution::Paths(vec![FibPath {
                         interface_index,
                         next_hop: None,
@@ -504,13 +504,11 @@ fn configure_ip(
     net_main: Arc<hammer_service::net::NetMain>,
 ) -> RuntimeResult<()> {
     config.validate()?;
-    let routes = Arc::<[_]>::from(config.route);
+    let routes: Arc<[_]> = Arc::from([] as [Route; 0]);
     let interfaces = Some(net_main.interface_main());
     let main = Arc::new(IpMain::new(routes, interfaces)?);
     IP_MAIN.store(Some(main));
-    hammer_service::net::pmtu::publish_path_mtu_cache(
-        hammer_service::net::pmtu::PathMtuCache::new(),
-    );
+    crate::pmtu::init_path_mtu();
     Ok(())
 }
 

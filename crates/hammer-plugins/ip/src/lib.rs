@@ -2,6 +2,29 @@
 
 use hammer_core::data_plane::NodeId;
 use hammer_runtime::RuntimeResult;
+use hammer_service::net::{DpoId, DpoProto};
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum IpNullAction {
+    Drop,
+    IcmpUnreachable,
+    IcmpProhibit,
+}
+
+#[derive(Debug, Clone, Copy, hammer_component_macros::DpoClass)]
+#[dpo_class(nodes = [(DpoProto::IP4, ip4_null_node), (DpoProto::IP6, ip6_null_node)])]
+pub struct IpNullDpo {
+    pub action: IpNullAction,
+}
+
+#[derive(Debug, Clone, Copy, hammer_component_macros::DpoClass)]
+#[dpo_class(nodes = [(DpoProto::IP4, ip4_pmtu_node), (DpoProto::IP6, ip6_pmtu_node)])]
+pub struct IpPmtuDpo {
+    pub proto: DpoProto,
+    pub pmtu: u16,
+    pub published_roots: u16,
+    pub stacked: DpoId,
+}
 
 hammer_component_macros::declare_plugin!(
     name = "ip",
@@ -38,10 +61,27 @@ mod config;
 pub mod forwarding;
 pub mod ip;
 mod lookup;
+pub mod pmtu;
 pub mod protocol;
 
-pub fn register_protocol(protocol: u8, node: NodeId) -> RuntimeResult<()> {
-    ip::local::register_protocol(protocol, node)
+pub fn register_ip4_protocol(
+    nodes: &hammer_runtime::node::NodeRuntime,
+    protocol: u8,
+    node: NodeId,
+) -> RuntimeResult<()> {
+    ip::local::register_ip4_protocol(nodes, protocol, node)
+}
+
+pub fn register_ip6_protocol(
+    nodes: &hammer_runtime::node::NodeRuntime,
+    protocol: u8,
+    node: NodeId,
+) -> RuntimeResult<()> {
+    ip::local::register_ip6_protocol(nodes, protocol, node)
+}
+
+pub fn path_mtu() -> Option<&'static pmtu::IpPathMtu> {
+    pmtu::path_mtu()
 }
 
 pub use ip::{
@@ -54,6 +94,7 @@ pub use ip::{
     IpReassemblyTrace, IpReassemblyTraceAction, IpReceiveNode, IpUnicastArc,
     pack_fragment_owner_value, unpack_fragment_owner_value,
 };
+pub use ip::{IpPathFlags, IpRoutePathBehavior};
 pub use lookup::{
     AdjacencyRewriteNext, AdjacencyRewriteNode, AdjacencyRewriteNodeError, AdjacencyRewriteTrace,
     IpLookupControlPlane, IpLookupNext, IpLookupNode, IpLookupTrace,
