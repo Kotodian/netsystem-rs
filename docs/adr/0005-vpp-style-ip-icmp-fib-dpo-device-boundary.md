@@ -2,6 +2,11 @@
 
 Status: accepted
 
+Partial supersession: ADR-0006 replaces this ADR's IP local-delivery node,
+local protocol table, and generic Feature Arc decisions. The FIB, DPO,
+IP/ICMP DSO, device, `local0`, PMTU, and route Binary API decisions remain in
+force.
+
 Date: 2026-09-02
 
 This ADR defines the breaking source-level migration for the IP forwarding
@@ -170,24 +175,30 @@ The new owner fields are limited to the state each VPP main actually owns:
 
 ```rust
 pub struct Ip4Main {
-    local_next_by_ip_protocol: [Option<NodeId>; 256],
+    local_next_by_ip_protocol: [u16; 256],
     unicast_tables: Vec<FibTable<Ipv4Net, Ip4FibBackend>>,
     table_id_to_fib_index: BTreeMap<u32, u32>,
     fib_index_by_sw_if_index: Vec<u32>,
     mfib_index_by_sw_if_index: Vec<u32>,
-    feature_arc_indices: Vec<u16>,
+    multicast_feature_arc_index: u8,
+    unicast_feature_arc_index: u8,
+    output_feature_arc_index: u8,
+    local_feature_arc_index: u8,
     flow_hash_seed: u32,
     host_config: Ip4HostConfig,
 }
 
 pub struct Ip6Main {
-    local_next_by_ip_protocol: [Option<NodeId>; 256],
+    local_next_by_ip_protocol: [u16; 256],
     unicast_tables: Vec<FibTable<Ipv6Net, Ip6FibBackend>>,
     table_id_to_fib_index: BTreeMap<u32, u32>,
     fib_index_by_sw_if_index: Vec<u32>,
     mfib_index_by_sw_if_index: Vec<u32>,
     interface_route_adj_index_by_sw_if_index: BTreeMap<u32, u32>,
-    feature_arc_indices: Vec<u16>,
+    multicast_feature_arc_index: u8,
+    unicast_feature_arc_index: u8,
+    output_feature_arc_index: u8,
+    local_feature_arc_index: u8,
     flow_hash_seed: u32,
     host_config: Ip6HostConfig,
     hbh_enabled: bool,
@@ -1773,8 +1784,16 @@ object's `dpoi_index`. IP/ICMP dependency exists only in IP local-next and ICMP
 error registration, never in the generic DPO registry.
 
 ```rust
-pub fn register_ip4_protocol(protocol: u8, node: NodeId) -> RuntimeResult<()>;
-pub fn register_ip6_protocol(protocol: u8, node: NodeId) -> RuntimeResult<()>;
+pub fn register_ip4_protocol(
+    nodes: &NodeRuntime,
+    protocol: u8,
+    node: NodeId,
+) -> RuntimeResult<()>;
+pub fn register_ip6_protocol(
+    nodes: &NodeRuntime,
+    protocol: u8,
+    node: NodeId,
+) -> RuntimeResult<()>;
 ```
 
 The ICMP, TCP and UDP plugins call the appropriate concrete function from their
@@ -1853,39 +1872,13 @@ still registering with IP.
 
 #### IP input, local delivery, lookup and feature arcs
 
-Each concrete IP implementation owns the VPP-equivalent sequence below; the
-service feature-arc module supplies only the generic ordering and per-interface
-configuration machinery:
-
-1. The selected input node validates the concrete header and writes the packet
-   cursor, IP protocol number, ECN and `fib_index` metadata.
-2. The input node resolves the FIB through the implementation's
-   `fib_index_by_sw_if_index[NetworkOpaque.sw_if_index[RX]]` mapping. An
-   optional packet-level `fib_index_override` is a separate IP metadata fact;
-   it never reuses or overloads `NetworkOpaque.sw_if_index[TX]`, which remains
-   the concrete output interface.
-3. The input feature arc runs before lookup. The local arc classifies a local
-   destination, validates the local packet, advances its feature chain, and
-   finally selects a local-next slot by the wire IP protocol number.
-4. The local-next default is punt or drop. ICMP registers its concrete node in
-   both local tables through `register_ip4_protocol` and
-   `register_ip6_protocol`; the registration call is the only IP/ICMP local
-   dispatch seam.
-5. The concrete unicast lookup node performs LPM, obtains the entry's
-   load-balance object index, computes the configured flow hash after LPM, and
-   follows the selected child DPO. MFIB lookup is a separate IP-owned path and
-   is not implemented by this ADR. The service FIB does not parse headers or
-   choose a hash input.
-6. Output features run at the IP-owned rewrite/output seam. Interface output
-   consumes the concrete TX `sw_if_index` and delegates queue/device work to
-   `InterfaceMain` and the selected device implementation.
-
-The concrete feature-arc declarations are the VPP-shaped `ip4-unicast`,
-`ip4-multicast`, `ip4-local`, `ip4-output`, `ip4-punt`, `ip4-drop` and their
-IPv6 counterparts. They are not moved into `hammer-service` and are not
-collapsed into one family parameter. The existing generic `FeatureArc` module
-remains a graph-ordering primitive; the IP plugin owns the concrete arc names,
-feature nodes and per-protocol configuration.
+ADR-0006 completely defines IP local/receive/end-of-arc nodes, the concrete
+IPv4/IPv6 local-next tables, Feature Arc registration and numbering, the dense
+per-interface config-index tables, the shared config heap, and interface-owned
+publication. This ADR retains only the surrounding input/FIB/lookup/rewrite
+ownership decisions. Implementations must not use the superseded generic
+`FeatureArc` handle/control model described by earlier revisions of this
+section.
 
 #### Tables, addresses, interface binding and neighbors
 
@@ -1902,7 +1895,6 @@ using its owning `Ip4Main` or `Ip6Main` state:
 | IP flow-hash configuration | `ip4.table.flow_hash.set` / `ip6.table.flow_hash.set` | concrete table hash policy used after LPM |
 | neighbor/ARP/ND add/del | `ip4.neighbor.add_del` / `ip6.neighbor.add_del` | IP-owned address/neighbor interpretation requests a service adjacency update; unresolved state publishes the incomplete adjacency subtype |
 | path MTU update/get/replace | `ip4.path_mtu.*` / `ip6.path_mtu.*` where applicable | IP-owned FIB-linked PMTU tracker and PMTU DPO interposition |
-| IP feature enable/disable | `ip4.feature.*` / `ip6.feature.*` | concrete feature-arc configuration for one `sw_if_index` |
 
 The external table identifier is the API key. The internal `fib_index` is an
 owner-local pool index. An interface address is not inserted by directly
@@ -1997,8 +1989,10 @@ device class TX operation.
 
 #### Control-plane and publication contract
 
-All table, route, address, bind, neighbor, feature, PMTU and interface/device
-mutations use Binary API methods. The dispatcher owns the sequence:
+All table, route, address, bind, neighbor, PMTU and interface/device mutations
+defined by this ADR use Binary API methods. Feature Arc mutation is superseded
+by ADR-0006 and is an `InterfaceMain` operation. The dispatcher owns the
+sequence for the remaining methods:
 
 ```text
 decode envelope -> resolve owner method ->
@@ -2250,8 +2244,8 @@ Each null node executes this sequence for every buffer:
 
 The two nodes therefore have identical control flow but concrete IP header and
 ICMP metadata policies. This is the only shared implementation seam; no
-`IpFamily`, protocol selector field, dynamic node or generic DPO object is
-introduced.
+unified address-family type, protocol selector field, dynamic node, or generic
+DPO object is introduced.
 
 `IpPmtuDpo` is registered as a concrete IP-owned DPO class and retains its
 stacked child identity while the tracker updates attached adjacency limits.
@@ -2449,10 +2443,9 @@ next enum, `thread_local!` local registration, atomic FIB handle, or
 | API | `ip4.neighbor.add_del` / `ip6.neighbor.add_del` | 由 IP-owned ARP/ND adapter 解析地址并请求 service DPO owner 更新 adjacency pool 和 `FIB_SOURCE_ADJ` contribution | 新 Binary API methods；未解析邻居使用 incomplete adjacency class | neighbor-to-adjacency projection test |
 | API | `ip4.table.flow_hash.set` / `ip6.table.flow_hash.set` | 设置具体表的 flow-hash policy；只在 LPM 选定 load-balance 后执行 | 新 Binary API methods；hash fields 不进入 service FIB | post-LPM hash-selection test |
 | API | `ip4.path_mtu.*` / `ip6.path_mtu.*` | IP-owned PMTU update/get/replace operations；必要时 interpose `IpPmtuDpo` | 从 service PMTU cache 迁移；ICMP/TCP 使用 typed IP seam | PMTU control/data path test |
-| API | `ip4.feature.*` / `ip6.feature.*` | per-interface feature arc enable/disable；只操作具体 IP arc | 新 Binary API methods；service 只提供通用 arc ordering | feature-arc ordering test |
 | API | `InterfaceMain::set_input_node` | 安装 device-owned RX input node | 替代 service 固定输入节点 | interface/device integration test |
 | API | `InterfaceMain::rx_redirect_to_node` | 通过选中 `DeviceClass` callback 安装 per-interface next | 删除固定 Device-to-IP redirect | callback dispatch test |
-| API | `register_ip4_protocol` / `register_ip6_protocol` | 分离 IP4/IP6 local protocol 注册 | 替代单一 `register_protocol` | ICMP local dispatch test |
+| API | `register_ip4_protocol` / `register_ip6_protocol` | 接受 startup `&NodeRuntime` borrow，分离 IP4/IP6 local protocol 注册 | 替代单一 `register_protocol` | ICMP local dispatch test |
 | API | `register_ip4_icmp_error_node` / `register_ip6_icmp_error_node` | 安装 ICMP error output next | 未安装时使用 drop next | rewrite/error-next integration test |
 
 ### 修改
@@ -2641,11 +2634,6 @@ ADR and cannot change the interfaces or ownership decisions recorded here.
    内 `hammerctl` 是 canonical bootstrap client，按顺序提交相同的
    `ip4.route.*`/`ip6.route.*` Binary API 请求。任何外部 client 只能复用这些
    方法，不能直接写 FIB。
-
-## 未决问题
-
-无。实现阶段只验证上述约束（编译、DSO load-order、Binary API、FIB/DPO 行为和
-布局断言），不再产生新的架构选择。
 
 ## 依据
 
