@@ -310,14 +310,19 @@ pub struct AdjacencyDpo<A, R> {
     child: Option<DpoId>,
 }
 
+#[repr(C, align(64))]
 pub struct LoadBalanceDpo {
-    proto: DpoProto,
     bucket_count: u16,
     bucket_mask: u16,
-    buckets: Box<[DpoId]>,
-    hash_config: u16,
-    fib_entry_flags: u32,
+    proto: DpoProto,
+    flags: u8,
+    fib_entry_flags: u8,
+    lock_count: u32,
+    map_index: u32,
     urpf_index: u32,
+    hash_config: u16,
+    overflow_bucket_index: u32,
+    inline_buckets: [DpoId; 4],
 }
 ```
 
@@ -650,6 +655,79 @@ layouts and class operations in service net; concrete class owners instantiate
 pools for their payload types and let IP backends provide only concrete
 next-hop facts and graph-node bindings. A future non-IP plugin can instantiate
 the same layouts without importing the IP plugin.
+
+### Data layout and packet-path performance
+
+The layout contract follows VPP's cacheline decisions without turning them into
+a second abstraction layer. `hammer-infra::align::CACHE_LINE` remains 64 bytes,
+`VEC_MIN_ALIGN` remains the 8-byte minimum allocation alignment, and
+`CacheLineAlignMark` is the existing marker for a cache-aligned record or field
+group. No new alignment helper or DPO wrapper is introduced.
+
+`DpoId` is the compact exception to cacheline-sized pool objects. Its private
+`u64` representation must satisfy both `size_of::<DpoId>() == 8` and
+`align_of::<DpoId>() == 8`; its accessors, validity check and stack operation are
+small candidates for `#[inline(always)]`. It is not marked `repr(C)` and it is
+never padded to a cacheline.
+
+Concrete pool elements for `LookupDpo`, `ReceiveDpo<A>`, `LoadBalanceDpo` and
+each `AdjacencyDpo<A, R>` instantiation are allocated at a cacheline-aligned
+base. The fields read by a packet node come first; control-only fields are kept
+after the hot prefix or in owner-local side storage. A concrete instantiation
+adds compile-time `size_of`/`align_of` assertions and, where it uses explicit
+cacheline groups, offset assertions. `repr(C, align(64))` is allowed only for
+those records whose field offsets or cacheline boundaries are part of this
+contract; ordinary Rust structs and all control-plane records keep their normal
+Rust representation.
+
+`LoadBalanceDpo` follows `load_balance_t`'s one-cacheline fast form. The bucket
+count is a power of two, `bucket_mask` is `bucket_count - 1`, and the first four
+child `DpoId` values are inline. The object contains only the compact hot
+fields and a `u32::MAX`-sentinel owner-local overflow index; when more than four
+buckets are needed, the class owner keeps a contiguous overflow slice keyed by
+the existing load-balance pool index. Bucket selection is therefore a mask and
+an array access in the common case, with no division, map lookup, allocation or
+bucket reconstruction on the packet path. The owner validates the maximum
+bucket count before publication.
+
+`LookupDpo` keeps its FIB/table/input/cast facts in the first cacheline, and
+`ReceiveDpo<A>` keeps `sw_if_index` and the producer-owned address there. An
+`AdjacencyDpo<A, R>` puts the FIB-node/config/subtype facts in its hot prefix,
+rewrite state in its following cacheline group, and delegates, tracking,
+fixup/control state in a later group. The generic adjacency layout does not
+promise one size for every `A`/`R`; each concrete owner proves its own layout.
+Delegates, path extensions, back-walk records and source lists are control-plane
+state and never participate in the packet hot prefix.
+
+The packet forwarding sequence is deliberately bounded and allocation-free:
+
+```text
+dense sw_if_index[RX] -> fib_index_by_sw_if_index
+    -> concrete LPM -> entry load-balance index
+    -> post-LPM bucket mask/lookup -> child DpoId.next
+    -> concrete DPO node -> sw_if_index[TX]
+```
+
+The packet path does not traverse `FibEntrySrc` lists, delegates, path
+extensions or back-walk links; it does not allocate, acquire a control-plane
+lock, format an error, or consult a `BTreeMap`. `fib_index_by_sw_if_index` is a
+dense per-implementation mapping, while FIB graph ownership and class/index
+validation stay in the control plane. `DpoMain` resolves class/node/edge facts
+when a class or graph edge is published, so a worker follows the compact
+identity and cached `next` rather than resolving a class map for every packet.
+
+`NetworkOpaque` remains inside the existing `PrimaryOpaque` byte/alignment
+budget. RX/TX interface indices and the independently stored FIB index use
+compact scalar fields and explicit sentinels; no pointer, address object or
+control-plane collection is copied into packet metadata. A layout change is
+accepted only with compile-time size/alignment assertions and a packet-path
+behavior test.
+
+No throughput or latency number is asserted here because the repository has no
+approved forwarding SLA or release benchmark baseline. A release benchmark is
+required before claiming a measured performance improvement; until then these
+are structural invariants that prevent avoidable cache misses, indirection and
+packet-path allocation.
 
 ### Concrete DPO construction and projection
 
@@ -1910,11 +1988,12 @@ and interfaces.
 | The acceptance list mixed the whole target with one migration | The current checkout has no service FIB, split ICMP DSO, or Net proc-macro implementation, while the old `FibTableBuilder` and fixed device path remain | One issue would be unreviewable and would encourage speculative scaffolding | Phase 1 now gates only the split seams, concrete FIB/DPO identity behavior, Binary API ownership, and focused tests; later VPP surfaces are explicitly deferred |
 | A duplicate service-side DPO class/reference layer was added without a real owner | VPP keeps class/node arrays, while object pools and operations stay with each concrete class | The layer duplicates `DpoMain` state and invites a generic C-style lifetime API | Remove the duplicate layer and callbacks; `DpoMain` stores class/node/edge metadata directly and each concrete owner orders pool retirement |
 | Per-entry source contribution state was implicit | VPP `fib_entry_t` stores a vector of `fib_entry_src_t`; that record carries `fes_path_exts`, the source path-list link, entry/source flags, `fes_ref_count`, and source-specific union data | Without an explicit record, source precedence, duplicate add/remove, cover tracking, owner payload association, and extension replacement have no owner | Add service-owned `FibEntrySrc<N, SourceData, PathExt>` with the complete common fields, generic relation facts, owner-supplied source data, and per-source path-extension list; dispatch all VPP actions statically by `FibSourceBehavior` |
+| DPO/FIB layout and hot-path cost were unspecified | VPP aligns pool elements and places switch-path fields first; `load_balance_t` keeps four inline buckets and fits in one cacheline, while `ip_adjacency_t` separates hot, rewrite and control groups; Hammer already has 64-byte alignment and opaque-budget assertions | Without an explicit contract, a Rust port can add fat-pointer indirection, map lookups, packet-path allocation, or oversized metadata while still appearing ownership-correct | Reuse `CacheLineAlignMark`, keep `DpoId` at 8 bytes, inline four load-balance buckets, keep overflow storage owner-local, forbid control-plane traversal/allocation in packet lookup, and require concrete size/alignment assertions; no performance number is claimed without a release benchmark |
 
-The DPO identity, address abstraction, DSO loading, and concrete-owner lifetime
-findings are current-project/VPP-backed conclusions. The phased delivery
-decision is a project-management recommendation based on the current diff, not
-a VPP requirement.
+The DPO identity, address abstraction, DSO loading, concrete-owner lifetime and
+layout/packet-path findings are current-project/VPP-backed conclusions. The
+phased delivery decision and the absence of a numeric performance target are
+project decisions based on the current repository, not VPP requirements.
 
 ## Non-goals
 
@@ -1958,7 +2037,7 @@ next enum, `thread_local!` local registration, atomic FIB handle, or
 | 类型 | `hammer-service::net::dpo::{ReceiveDpo<A>,AdjacencyDpo<A,R>}` | 通过 producer-owned concrete `A`/`R` 形成静态 DPO layout；net 只保存并借用值，不定义 `Address` trait、canonical 方法、family tag 或 wire encoding | 新增 generic net seam；每个 class owner 以具体 `A`/`R` 实例化自己的 pool，旧 IP-owned fixed byte/address fields 删除 | compile-time generic pool/type checks and concrete producer validation tests |
 | 类型 | `hammer-service::net::fib::FibEntrySrc<N,SourceData,PathExt>` / `FibEntrySrcRelation` | per-entry/per-source embedded record；完整保存 `path_exts`、path-list link、entry/source flags、`source`、`fes_ref_count` 对应的 `ref_count`、通用 cover/interpose relation 和 owner-supplied `SourceData` | 新增 service FIB record；源操作迁移为 entry 内 source record 的增量 add/remove/update；path extensions 不再隐藏在旁路 map，而是记录字段并按 `(entry, source, path_index)` 管理 | source precedence, duplicate add/remove, relation/payload validation, extension replacement, cover/interpose, and failure-atomic lifecycle tests |
 | 类型 | `hammer-service::net::dpo::{LookupDpo,ReceiveDpo}` | concrete VPP pool layouts；`ReceiveDpo<A>` 直接保存 producer-owned `A`，class key 绑定其 monomorphized pool | 新增 service DPO class layouts；class owner/local node consume typed pool | object allocation, owner retirement, concrete type checks, and graph-next tests |
-| 类型 | `hammer-service::net::dpo::{AdjacencyDpo,LoadBalanceDpo}` | service-owned concrete DPO layouts and class rules；`AdjacencyDpo<A, R>` 的 normal/incomplete/midchain/glean/mcast 使用同一 layout 的 class keys，并保存 producer-owned `A` next-hop 与 `R` rewrite；具体 `A`/`R` pool owner 负责 midchain restack/unstack 和 child ordering；load-balance consumes baked uRPF facts and a supporting weighted-bucket map | 替代 IP-owned `Adjacency`/`LoadBalance` 构造面；不新增 `MidchainDpo` pool 或 load-balance-map DPO class | DPO pool, subtype producer, concrete address/rewrite type checks, midchain restack, uRPF/map update, and projection integration tests |
+| 类型 | `hammer-service::net::dpo::{AdjacencyDpo,LoadBalanceDpo}` | service-owned concrete DPO layouts and class rules；`AdjacencyDpo<A, R>` 的 normal/incomplete/midchain/glean/mcast 使用同一 layout 的 class keys，并保存 producer-owned `A` next-hop 与 `R` rewrite；具体 `A`/`R` pool owner 负责 midchain restack/unstack 和 child ordering；load-balance 热字段前置、四个 child `DpoId` inline、power-of-two mask，超过四个 bucket 使用按既有 pool index 寻址的 contiguous owner-local overflow storage，并保留 baked uRPF facts | 替代 IP-owned `Adjacency`/`LoadBalance` 构造面；不新增 `MidchainDpo` pool 或 load-balance-map DPO class；具体布局需通过 size/alignment/offset assertions | DPO pool, subtype producer, concrete address/rewrite type checks, midchain restack, uRPF/map update, layout and projection integration tests |
 | 类型 | `hammer-service::net::FibTableBackend` | 唯一的静态 dispatch seam：控制面 prefix 到 `fib_entry` index、packet address 到 entry `dpoi_index: u32`、cover replacement，以及 owner-specific projection；`project_forwarding` 返回 `DpoId`，trait 不接收 plugin pool 或 erased object operation | `Ip4FibBackend`/`Ip6FibBackend` 各自实现；无 `dyn`、额外 forwarding adapter 或 family facade | compile-time implementation and projection failure-atomicity checks |
 | 类型 | `hammer-plugins/ip::{Ip4RewriteNode,Ip6RewriteNode}` | 具体 IP4/IP6 adjacency rewrite graph node；消费 service-owned `AdjacencyDpo`，分别处理 checksum/TTL/IP MTU | 替代单一 `AdjacencyRewriteNode`；同一 IP DSO | graph execution and per-proto rewrite tests |
 | 类型 | `hammer-plugins/ip` 私有 `RewriteProtocol`/`process_rewrite_frame` 核心 | 静态泛型共享 adjacency 读取、MTU、TX metadata、错误分类、trace、next 编排；`Ip4Rewrite`/`Ip6Rewrite` 提供具体策略 | 不进入 service 或 DPO ABI；两个 node adapter 共享一套实现 | compile-time generic dispatch and behavior parity tests |
@@ -1985,7 +2064,7 @@ next enum, `thread_local!` local registration, atomic FIB handle, or
 
 | 类型/API | 位置或标识 | 变更内容 | 兼容性/迁移 | 验证方式 |
 | --- | --- | --- | --- | --- |
-| 类型 | `hammer-service::net::DpoProto`, `DpoType`, `DpoId` | 从 IP plugin 移入 service net；`DpoProto` 是 VPP graph protocol key，`DpoType` 是 `DpoMain` 运行时分配的 opaque class key，不是封闭 Rust enum；`DpoId` 是非泛型 Rust `Copy` identity，使用私有 `u64` 保持 VPP `{ type, proto, next, index }` 的 8-byte 形状，不使用 `repr(C)`；`DpoMain` 直接持有 class/node/edge state；移除对 `IpVersion` 的转换依赖 | 所有 callers 改为显式 class registration；源码级 breaking change | workspace compile, dynamic class allocation, identity-size assertion, and DPO behavior tests |
+| 类型 | `hammer-service::net::DpoProto`, `DpoType`, `DpoId` | 从 IP plugin 移入 service net；`DpoProto` 是 VPP graph protocol key，`DpoType` 是 `DpoMain` 运行时分配的 opaque class key，不是封闭 Rust enum；`DpoId` 是非泛型 Rust `Copy` identity，使用私有 `u64` 保持 VPP `{ type, proto, next, index }` 的 8-byte size/alignment 形状，不使用 `repr(C)`；`DpoMain` 直接持有 class/node/edge state；移除对 `IpVersion` 的转换依赖 | 所有 callers 改为显式 class registration；源码级 breaking change | workspace compile, dynamic class allocation, identity-size/alignment assertion, and DPO behavior tests |
 | 类型 | `hammer-plugins/ip::{Adjacency,AdjacencyRewrite,LoadBalance}` | 删除 IP-owned objects；以 service-owned `AdjacencyDpo`/`LoadBalanceDpo` pool 替代；Adjacency subtype 通过 class key 选择，不新增 subtype pool；IP 只保留地址验证/编码、邻居策略和 rewrite policy | 删除旧 IP forwarding 构造面；IP lookup/rewrite 改用 service DPO owner API；固定地址/重写数组不迁移 | service DPO pool, subtype producer, address/rewrite validation, and generic FIB projection integration test |
 | 类型/API | `hammer-plugins/ip::forwarding::DpoKind` 与通用 `Dpo` 构造入口 | 删除泛化 kind-to-index/通用构造路径；具体 DPO 通过 `From` 生成 `DpoId` | breaking source migration；不保留 generic alias | compile-time API removal and concrete conversion tests |
 | 类型 | `ForwardingMetadata` | 移入 service net，仅保留 DPO/FIB facts 与 TX interface contract；不携带 adjacency/load-balance对象 | IP lookup/rewrite 改用 service metadata | lookup/rewrite integration test |
@@ -2158,6 +2237,16 @@ different architecture:
 - `DpoType` is an opaque class key allocated by `DpoMain` at registration time;
   it is not a closed static Rust enum. `DpoProto` remains only the VPP graph
   protocol discriminator.
+- DPO pool elements use the existing 64-byte `CacheLineAlignMark` contract;
+  hot fields precede control-only state, and each concrete instantiation proves
+  its size, alignment and cacheline offsets at compile time. `LoadBalanceDpo`
+  keeps four inline buckets and a power-of-two mask; larger bucket storage is a
+  contiguous owner-local overflow slice.
+- The packet path is allocation-free and map-free after publication:
+  dense `sw_if_index[RX]` to `fib_index`, concrete LPM, post-LPM bucket
+  selection, cached `DpoId.next`, and `sw_if_index[TX]`. It never walks source
+  records, path extensions, delegates or back-walk state. `NetworkOpaque` must
+  stay within the existing primary opaque byte/alignment budget.
 - Address abstraction is a producer-owned concrete type parameter at the DPO
   seam. `ReceiveDpo<A>` and `AdjacencyDpo<A, R>` store `A` directly in
   monomorphized pools; net does not require an address trait, family tag, byte
@@ -2254,6 +2343,17 @@ different architecture:
   and derived edge selection; `dpo_lock` is reference-count acquisition for a
   copyable identity, not a mutex; the protocol is a data-path graph
   discriminator, distinct from local IP protocol numbers).
+- `third_party/vpp/src/vnet/dpo/load_balance.h` (`load_balance_t` hot-field
+  ordering, power-of-two bucket mask, four inline buckets and one-cacheline
+  size assertion), `lookup_dpo.h` and `receive_dpo.h` (cache-aligned pool
+  elements with lookup/receive facts in the switch-path prefix), and
+  `third_party/vpp/src/vnet/adj/adj.h` (adjacency cacheline groups and
+  hot-prefix/rewrite/delegate offsets).
+- `crates/hammer-infra/src/align.rs` and
+  `crates/hammer-core/src/buffer/header.rs` (Hammer's existing 64-byte marker,
+  allocation alignment and compile-time layout assertions), plus
+  `crates/hammer-service/src/opaque.rs` (the fixed `NetworkOpaque` primary
+  opaque budget).
 - `third_party/vpp/src/vnet/dpo/dpo.c:dpo_set` and `dpo_copy` (publish or
   atomically copy the new identity, acquire its class reference, then account
   for the previous identity; this is why the new identity must be locked before

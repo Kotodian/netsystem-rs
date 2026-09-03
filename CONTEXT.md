@@ -182,7 +182,8 @@ _Avoid_: DPO instance, forwarding object
 
 **DPO Instance**:
 A concrete forwarding object owned by the module that understands its state.
-Its compact identity is a dispatch fact, not the object itself.
+Its compact 8-byte `DpoId` identity is a dispatch fact, not the object itself;
+copies do not retain or inspect the pool value.
 _Avoid_: DPO class, forwarding object
 
 **Network Address**:
@@ -196,6 +197,22 @@ in service net
 The discriminator that selects a DPO's packet-graph/link behavior. It is not an
 IP wire protocol number and does not select ICMP, TCP, or UDP local dispatch.
 _Avoid_: DPO protocol number, IP protocol selector
+
+**DPO Hot Layout**:
+The concrete DPO object's cacheline contract: switch-path fields are placed in
+the first cacheline, control-only state is separated, and the concrete owner
+proves size, alignment and required offsets. Load-balance keeps four inline
+child identities and uses a precomputed power-of-two mask; larger buckets stay
+in contiguous owner-local storage.
+_Avoid_: cacheline padding on every type, packet-path map lookup, bucket rebuild
+
+**Packet-Path Forwarding Contract**:
+The bounded worker sequence from dense RX interface to concrete FIB LPM,
+post-LPM DPO bucket selection, cached next edge and TX interface. It performs
+no allocation, control-plane lock, source/delegate/path-extension walk or
+control-plane map lookup after publication.
+_Avoid_: packet-path FIB graph traversal, dynamic DPO dispatch, hot-path
+allocation
 
 **IP Feature Arc**:
 A concrete IP packet-processing chain for one protocol and location, such as
