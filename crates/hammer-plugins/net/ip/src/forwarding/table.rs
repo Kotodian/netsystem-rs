@@ -10,24 +10,24 @@ pub struct FibTableHandle {
 }
 
 struct FibTableSlot {
-    table: UnsafeCell<FibTable<u16>>,
+    table: UnsafeCell<FibTable>,
 }
 
 impl FibTableHandle {
     #[inline]
-    pub fn new(table: FibTable<u16>) -> Self {
+    pub fn new(table: FibTable) -> Self {
         Self {
             inner: Arc::new(FibTableSlot::new(table)),
         }
     }
 
     #[inline]
-    pub fn table(&self) -> &FibTable<u16> {
+    pub fn table(&self) -> &FibTable {
         self.inner.table()
     }
 
     #[inline]
-    pub fn publish(&self, table: FibTable<u16>) {
+    pub fn publish(&self, table: FibTable) {
         self.inner.publish(table);
     }
 }
@@ -40,14 +40,14 @@ impl fmt::Debug for FibTableHandle {
 
 impl FibTableSlot {
     #[inline]
-    fn new(table: FibTable<u16>) -> Self {
+    fn new(table: FibTable) -> Self {
         Self {
             table: UnsafeCell::new(table),
         }
     }
 
     #[inline]
-    fn table(&self) -> &FibTable<u16> {
+    fn table(&self) -> &FibTable {
         // SAFETY: FIB table writes are serialized by the runtime data-plane
         // barrier before publication. Data-plane nodes only take immutable
         // references while workers are running.
@@ -55,7 +55,7 @@ impl FibTableSlot {
     }
 
     #[inline]
-    fn publish(&self, table: FibTable<u16>) {
+    fn publish(&self, table: FibTable) {
         // SAFETY: callers replace the table either while the runtime
         // data-plane barrier is held, or during single-threaded graph setup in
         // tests before packets are processed.

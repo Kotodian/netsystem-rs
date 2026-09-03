@@ -6,23 +6,21 @@ use crate::protocol::ip::{IpProtocol, IpVersion, ParsedIpPacket};
 use hammer_infra::prefetch::prefetch_read_l1;
 
 use super::dpo::{
-    Adjacency, AdjacencyIndex, AdjacencyRewrite, DEFAULT_ADJACENCY_L3_MTU, DpoId, DpoProto,
+    Adjacency, AdjacencyIndex, AdjacencyRewrite, DEFAULT_ADJACENCY_L3_MTU, DpoId, DpoProto, DpoType,
 };
 use super::ip4_mtrie::{Ip4Mtrie, Ip4MtrieRoute, Ip4MtrieValue};
 use super::ip6_fib::Ip6Fib;
 use super::load_balance::{LoadBalance, LoadBalanceError, LoadBalanceIndex};
 
-pub use hammer_service::net::FibSource;
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct FibEntry<N> {
+pub struct FibEntry {
     pub prefix: IpNet,
-    pub dpo: DpoId<N>,
+    pub dpo: DpoId,
 }
 
-impl<N> FibEntry<N> {
+impl FibEntry {
     #[inline(always)]
-    pub const fn new(prefix: IpNet, dpo: DpoId<N>) -> Self {
+    pub const fn new(prefix: IpNet, dpo: DpoId) -> Self {
         Self { prefix, dpo }
     }
 }
@@ -78,26 +76,26 @@ impl Ip4MtrieValue for FibRouteDpoIndex {
 }
 
 #[derive(Debug, Clone)]
-pub struct FibTable<N: Copy> {
-    lookup: FibLookupTables<N>,
-    adjacencies: Box<[Adjacency<N>]>,
-    drop_next: N,
-    ip4_drop: DpoId<N>,
-    ip6_drop: DpoId<N>,
+pub struct FibTable {
+    lookup: FibLookupTables,
+    adjacencies: Box<[Adjacency]>,
+    drop_next: u16,
+    ip4_drop: DpoId,
+    ip6_drop: DpoId,
 }
 
 #[derive(Debug, Clone)]
 #[repr(C)]
-struct FibLookupTables<N: Copy> {
+struct FibLookupTables {
     ip4: Ip4Mtrie<FibRouteDpoIndex>,
     ip6: Ip6Fib<FibRouteDpoIndex>,
-    route_dpos: Box<[DpoId<N>]>,
-    load_balances: Box<[LoadBalance<N>]>,
+    route_dpos: Box<[DpoId]>,
+    load_balances: Box<[LoadBalance]>,
 }
 
-impl<N: Copy> FibTable<N> {
+impl FibTable {
     #[inline(always)]
-    pub fn lookup_packet(&self, packet: &ParsedIpPacket) -> Option<FibLookupResult<N>> {
+    pub fn lookup_packet(&self, packet: &ParsedIpPacket) -> Option<FibLookupResult> {
         let hash = flow_hash(packet);
         match packet.destination {
             IpAddr::V4(destination) => self.lookup_ip4(destination, hash),
@@ -114,13 +112,13 @@ impl<N: Copy> FibTable<N> {
     }
 
     #[inline(always)]
-    pub fn lookup_ip4(&self, destination: Ipv4Addr, hash: usize) -> Option<FibLookupResult<N>> {
+    pub fn lookup_ip4(&self, destination: Ipv4Addr, hash: usize) -> Option<FibLookupResult> {
         let route_dpo = self.lookup.ip4.lookup(destination)?;
         self.select_route_dpo(route_dpo, hash)
     }
 
     #[inline(always)]
-    pub fn lookup_ip6(&self, destination: Ipv6Addr, hash: usize) -> Option<FibLookupResult<N>> {
+    pub fn lookup_ip6(&self, destination: Ipv6Addr, hash: usize) -> Option<FibLookupResult> {
         let route_dpo = self.lookup.ip6.lookup(destination)?;
         self.select_route_dpo(route_dpo, hash)
     }
@@ -136,22 +134,22 @@ impl<N: Copy> FibTable<N> {
     }
 
     #[inline(always)]
-    pub fn load_balance(&self, index: LoadBalanceIndex) -> Option<&LoadBalance<N>> {
+    pub fn load_balance(&self, index: LoadBalanceIndex) -> Option<&LoadBalance> {
         self.lookup.load_balances.get(index.slot())
     }
 
     #[inline(always)]
-    pub fn adjacency(&self, index: AdjacencyIndex) -> Option<Adjacency<N>> {
+    pub fn adjacency(&self, index: AdjacencyIndex) -> Option<Adjacency> {
         self.adjacencies.get(index.slot()).copied()
     }
 
     #[inline(always)]
-    pub fn drop_next(&self) -> N {
+    pub fn drop_next(&self) -> u16 {
         self.drop_next
     }
 
     #[inline(always)]
-    pub fn drop_dpo(&self, version: IpVersion) -> DpoId<N> {
+    pub fn drop_dpo(&self, version: IpVersion) -> DpoId {
         match version {
             IpVersion::V4 => self.ip4_drop,
             IpVersion::V6 => self.ip6_drop,
@@ -163,16 +161,20 @@ impl<N: Copy> FibTable<N> {
         &self,
         route_dpo_index: FibRouteDpoIndex,
         hash: usize,
-    ) -> Option<FibLookupResult<N>> {
+    ) -> Option<FibLookupResult> {
         let route_dpo = *self.lookup.route_dpos.get(route_dpo_index.slot())?;
-        let Some(load_balance) = route_dpo.load_balance_index() else {
+        let Some(load_balance) = (route_dpo.class() == DpoType::LOAD_BALANCE)
+            .then(|| LoadBalanceIndex::new(route_dpo.index()))
+        else {
             return Some(FibLookupResult::terminal(route_dpo));
         };
         let load_balance_ref = self.load_balance(load_balance)?;
         prefetch_read_l1(load_balance_ref);
         load_balance_ref.prefetch_bucket(hash);
         let (bucket_index, dpo) = load_balance_ref.select_hash(hash);
-        let Some(nested_load_balance) = dpo.load_balance_index() else {
+        let Some(nested_load_balance) =
+            (dpo.class() == DpoType::LOAD_BALANCE).then(|| LoadBalanceIndex::new(dpo.index()))
+        else {
             return Some(FibLookupResult::from_load_balance(
                 route_dpo,
                 load_balance,
@@ -186,16 +188,18 @@ impl<N: Copy> FibTable<N> {
     #[inline(always)]
     fn select_nested_load_balance_dpo(
         &self,
-        route_dpo: DpoId<N>,
+        route_dpo: DpoId,
         mut load_balance: LoadBalanceIndex,
         hash: usize,
-    ) -> Option<FibLookupResult<N>> {
+    ) -> Option<FibLookupResult> {
         loop {
             let load_balance_ref = self.load_balance(load_balance)?;
             prefetch_read_l1(load_balance_ref);
             load_balance_ref.prefetch_bucket(hash);
             let (bucket_index, dpo) = load_balance_ref.select_hash(hash);
-            let Some(nested_load_balance) = dpo.load_balance_index() else {
+            let Some(nested_load_balance) =
+                (dpo.class() == DpoType::LOAD_BALANCE).then(|| LoadBalanceIndex::new(dpo.index()))
+            else {
                 return Some(FibLookupResult::from_load_balance(
                     route_dpo,
                     load_balance,
@@ -212,16 +216,16 @@ const FIB_LOOKUP_NO_LOAD_BALANCE: u32 = u32::MAX;
 const FIB_LOOKUP_NO_BUCKET: u16 = u16::MAX;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct FibLookupResult<N> {
-    pub route_dpo: DpoId<N>,
+pub struct FibLookupResult {
+    pub route_dpo: DpoId,
     load_balance: u32,
     bucket_index: u16,
-    pub dpo: DpoId<N>,
+    pub dpo: DpoId,
 }
 
-impl<N: Copy> FibLookupResult<N> {
+impl FibLookupResult {
     #[inline(always)]
-    pub fn terminal(route_dpo: DpoId<N>) -> Self {
+    pub fn terminal(route_dpo: DpoId) -> Self {
         Self {
             route_dpo,
             load_balance: FIB_LOOKUP_NO_LOAD_BALANCE,
@@ -232,10 +236,10 @@ impl<N: Copy> FibLookupResult<N> {
 
     #[inline(always)]
     pub fn from_load_balance(
-        route_dpo: DpoId<N>,
+        route_dpo: DpoId,
         load_balance: LoadBalanceIndex,
         bucket_index: u16,
-        dpo: DpoId<N>,
+        dpo: DpoId,
     ) -> Self {
         Self {
             route_dpo,
@@ -267,18 +271,18 @@ impl<N: Copy> FibLookupResult<N> {
     }
 }
 
-pub struct FibTableBuilder<N: Copy> {
-    drop_next: N,
-    load_balances: Vec<LoadBalance<N>>,
-    route_dpos: Vec<DpoId<N>>,
-    adjacencies: Vec<Adjacency<N>>,
+pub struct FibTableBuilder {
+    drop_next: u16,
+    load_balances: Vec<LoadBalance>,
+    route_dpos: Vec<DpoId>,
+    adjacencies: Vec<Adjacency>,
     ip4_routes: Vec<Ip4Route>,
     ip6_routes: Vec<Ip6Route>,
 }
 
-impl<N: Copy> FibTableBuilder<N> {
+impl FibTableBuilder {
     #[inline]
-    pub fn new(drop_next: N) -> Self {
+    pub fn new(drop_next: u16) -> Self {
         Self {
             drop_next,
             load_balances: Vec::new(),
@@ -290,18 +294,18 @@ impl<N: Copy> FibTableBuilder<N> {
     }
 
     #[inline]
-    pub fn add_adjacency(&mut self, proto: DpoProto, next: N) -> AdjacencyIndex {
+    pub fn add_adjacency(&mut self, proto: DpoProto, next: u16) -> AdjacencyIndex {
         self.add_interface_adjacency(proto, None, AdjacencyRewrite::empty(), next)
     }
 
     #[inline]
-    pub fn add_adjacency_dpo(&mut self, proto: DpoProto, next: N) -> DpoId<N> {
+    pub fn add_adjacency_dpo(&mut self, proto: DpoProto, next: u16) -> DpoId {
         let adjacency = self.add_adjacency(proto, next);
-        DpoId::adjacency(proto, adjacency, next)
+        DpoId::adjacency(proto, adjacency.get(), next)
     }
 
     #[inline]
-    pub fn adjacency_mut(&mut self, index: AdjacencyIndex) -> Option<&mut Adjacency<N>> {
+    pub fn adjacency_mut(&mut self, index: AdjacencyIndex) -> Option<&mut Adjacency> {
         self.adjacencies.get_mut(index.slot())
     }
 
@@ -311,7 +315,7 @@ impl<N: Copy> FibTableBuilder<N> {
         proto: DpoProto,
         egress_interface: impl Into<Option<u32>>,
         rewrite: AdjacencyRewrite,
-        post_rewrite_next: N,
+        post_rewrite_next: u16,
     ) -> AdjacencyIndex {
         let index = AdjacencyIndex::new(self.adjacencies.len() as u32);
         self.adjacencies.push(Adjacency {
@@ -330,7 +334,7 @@ impl<N: Copy> FibTableBuilder<N> {
         proto: DpoProto,
         egress_interface: impl Into<Option<u32>>,
         rewrite: AdjacencyRewrite,
-        post_rewrite_next: N,
+        post_rewrite_next: u16,
     ) -> Result<AdjacencyIndex, core::convert::Infallible> {
         Ok(self.add_interface_adjacency(proto, egress_interface, rewrite, post_rewrite_next))
     }
@@ -341,12 +345,12 @@ impl<N: Copy> FibTableBuilder<N> {
         proto: DpoProto,
         egress_interface: impl Into<Option<u32>>,
         rewrite: AdjacencyRewrite,
-        rewrite_next: N,
-        post_rewrite_next: N,
-    ) -> DpoId<N> {
+        rewrite_next: u16,
+        post_rewrite_next: u16,
+    ) -> DpoId {
         let adjacency =
             self.add_interface_adjacency(proto, egress_interface, rewrite, post_rewrite_next);
-        DpoId::adjacency(proto, adjacency, rewrite_next)
+        DpoId::adjacency(proto, adjacency.get(), rewrite_next)
     }
 
     #[inline]
@@ -355,9 +359,9 @@ impl<N: Copy> FibTableBuilder<N> {
         proto: DpoProto,
         egress_interface: impl Into<Option<u32>>,
         rewrite: AdjacencyRewrite,
-        rewrite_next: N,
-        post_rewrite_next: N,
-    ) -> Result<DpoId<N>, core::convert::Infallible> {
+        rewrite_next: u16,
+        post_rewrite_next: u16,
+    ) -> Result<DpoId, core::convert::Infallible> {
         Ok(self.add_interface_adjacency_dpo(
             proto,
             egress_interface,
@@ -368,7 +372,7 @@ impl<N: Copy> FibTableBuilder<N> {
     }
 
     #[inline]
-    fn add_route_dpo_entry(&mut self, dpo: DpoId<N>) -> FibRouteDpoIndex {
+    fn add_route_dpo_entry(&mut self, dpo: DpoId) -> FibRouteDpoIndex {
         let index = FibRouteDpoIndex::new(self.route_dpos.len() as u32);
         self.route_dpos.push(dpo);
         index
@@ -378,7 +382,7 @@ impl<N: Copy> FibTableBuilder<N> {
     pub fn add_load_balance(
         &mut self,
         proto: DpoProto,
-        buckets: impl Into<Vec<DpoId<N>>>,
+        buckets: impl Into<Vec<DpoId>>,
     ) -> LoadBalanceIndex {
         self.try_add_load_balance(proto, buckets)
             .expect("load-balance buckets must be non-empty, fit hot-path index, and match proto")
@@ -388,7 +392,7 @@ impl<N: Copy> FibTableBuilder<N> {
     pub fn try_add_load_balance(
         &mut self,
         proto: DpoProto,
-        buckets: impl Into<Vec<DpoId<N>>>,
+        buckets: impl Into<Vec<DpoId>>,
     ) -> Result<LoadBalanceIndex, LoadBalanceError> {
         let index = LoadBalanceIndex::new(self.load_balances.len() as u32);
         let load_balance = LoadBalance::try_new(proto, buckets)?;
@@ -398,27 +402,27 @@ impl<N: Copy> FibTableBuilder<N> {
     }
 
     #[inline]
-    pub fn add_single_path_load_balance(&mut self, proto: DpoProto, next: N) -> LoadBalanceIndex {
+    pub fn add_single_path_load_balance(&mut self, proto: DpoProto, next: u16) -> LoadBalanceIndex {
         let adjacency = self.add_adjacency_dpo(proto, next);
         self.add_load_balance(proto, [adjacency])
     }
 
     #[inline]
-    pub fn add_ip4_single_path_route(&mut self, prefix: Ipv4Net, next: N) -> LoadBalanceIndex {
+    pub fn add_ip4_single_path_route(&mut self, prefix: Ipv4Net, next: u16) -> LoadBalanceIndex {
         let load_balance = self.add_single_path_load_balance(DpoProto::IP4, next);
         self.add_ip4_route(prefix, load_balance);
         load_balance
     }
 
     #[inline]
-    pub fn add_ip6_single_path_route(&mut self, prefix: Ipv6Net, next: N) -> LoadBalanceIndex {
+    pub fn add_ip6_single_path_route(&mut self, prefix: Ipv6Net, next: u16) -> LoadBalanceIndex {
         let load_balance = self.add_single_path_load_balance(DpoProto::IP6, next);
         self.add_ip6_route(prefix, load_balance);
         load_balance
     }
 
     #[inline]
-    pub fn add_single_path_route(&mut self, prefix: IpNet, next: N) -> LoadBalanceIndex {
+    pub fn add_single_path_route(&mut self, prefix: IpNet, next: u16) -> LoadBalanceIndex {
         match prefix {
             IpNet::V4(prefix) => self.add_ip4_single_path_route(prefix, next),
             IpNet::V6(prefix) => self.add_ip6_single_path_route(prefix, next),
@@ -426,21 +430,21 @@ impl<N: Copy> FibTableBuilder<N> {
     }
 
     #[inline]
-    pub fn add_ip4_receive_route(&mut self, prefix: Ipv4Net, next: N) -> DpoId<N> {
-        let dpo = DpoId::receive(DpoProto::IP4, next);
+    pub fn add_ip4_receive_route(&mut self, prefix: Ipv4Net, next: u16) -> DpoId {
+        let dpo = DpoId::receive(DpoProto::IP4, 0, next);
         self.add_ip4_route_dpo(prefix, dpo);
         dpo
     }
 
     #[inline]
-    pub fn add_ip6_receive_route(&mut self, prefix: Ipv6Net, next: N) -> DpoId<N> {
-        let dpo = DpoId::receive(DpoProto::IP6, next);
+    pub fn add_ip6_receive_route(&mut self, prefix: Ipv6Net, next: u16) -> DpoId {
+        let dpo = DpoId::receive(DpoProto::IP6, 0, next);
         self.add_ip6_route_dpo(prefix, dpo);
         dpo
     }
 
     #[inline]
-    pub fn add_receive_route(&mut self, prefix: IpNet, next: N) -> DpoId<N> {
+    pub fn add_receive_route(&mut self, prefix: IpNet, next: u16) -> DpoId {
         match prefix {
             IpNet::V4(prefix) => self.add_ip4_receive_route(prefix, next),
             IpNet::V6(prefix) => self.add_ip6_receive_route(prefix, next),
@@ -448,21 +452,21 @@ impl<N: Copy> FibTableBuilder<N> {
     }
 
     #[inline]
-    pub fn add_ip4_punt_route(&mut self, prefix: Ipv4Net, next: N) -> DpoId<N> {
+    pub fn add_ip4_punt_route(&mut self, prefix: Ipv4Net, next: u16) -> DpoId {
         let dpo = DpoId::punt(DpoProto::IP4, next);
         self.add_ip4_route_dpo(prefix, dpo);
         dpo
     }
 
     #[inline]
-    pub fn add_ip6_punt_route(&mut self, prefix: Ipv6Net, next: N) -> DpoId<N> {
+    pub fn add_ip6_punt_route(&mut self, prefix: Ipv6Net, next: u16) -> DpoId {
         let dpo = DpoId::punt(DpoProto::IP6, next);
         self.add_ip6_route_dpo(prefix, dpo);
         dpo
     }
 
     #[inline]
-    pub fn add_punt_route(&mut self, prefix: IpNet, next: N) -> DpoId<N> {
+    pub fn add_punt_route(&mut self, prefix: IpNet, next: u16) -> DpoId {
         match prefix {
             IpNet::V4(prefix) => self.add_ip4_punt_route(prefix, next),
             IpNet::V6(prefix) => self.add_ip6_punt_route(prefix, next),
@@ -470,21 +474,21 @@ impl<N: Copy> FibTableBuilder<N> {
     }
 
     #[inline]
-    pub fn add_ip4_drop_route(&mut self, prefix: Ipv4Net) -> DpoId<N> {
+    pub fn add_ip4_drop_route(&mut self, prefix: Ipv4Net) -> DpoId {
         let dpo = DpoId::drop(DpoProto::IP4, self.drop_next);
         self.add_ip4_route_dpo(prefix, dpo);
         dpo
     }
 
     #[inline]
-    pub fn add_ip6_drop_route(&mut self, prefix: Ipv6Net) -> DpoId<N> {
+    pub fn add_ip6_drop_route(&mut self, prefix: Ipv6Net) -> DpoId {
         let dpo = DpoId::drop(DpoProto::IP6, self.drop_next);
         self.add_ip6_route_dpo(prefix, dpo);
         dpo
     }
 
     #[inline]
-    pub fn add_drop_route(&mut self, prefix: IpNet) -> DpoId<N> {
+    pub fn add_drop_route(&mut self, prefix: IpNet) -> DpoId {
         match prefix {
             IpNet::V4(prefix) => self.add_ip4_drop_route(prefix),
             IpNet::V6(prefix) => self.add_ip6_drop_route(prefix),
@@ -495,9 +499,9 @@ impl<N: Copy> FibTableBuilder<N> {
     pub fn add_load_balance_dpo(
         &mut self,
         proto: DpoProto,
-        buckets: impl Into<Vec<DpoId<N>>>,
-        next: N,
-    ) -> DpoId<N> {
+        buckets: impl Into<Vec<DpoId>>,
+        next: u16,
+    ) -> DpoId {
         self.try_add_load_balance_dpo(proto, buckets, next).expect(
             "load-balance DPO buckets must be non-empty, fit hot-path index, match proto, and have valid backing",
         )
@@ -507,11 +511,11 @@ impl<N: Copy> FibTableBuilder<N> {
     pub fn try_add_load_balance_dpo(
         &mut self,
         proto: DpoProto,
-        buckets: impl Into<Vec<DpoId<N>>>,
-        next: N,
-    ) -> Result<DpoId<N>, LoadBalanceError> {
+        buckets: impl Into<Vec<DpoId>>,
+        next: u16,
+    ) -> Result<DpoId, LoadBalanceError> {
         let load_balance = self.try_add_load_balance(proto, buckets)?;
-        Ok(DpoId::load_balance(proto, load_balance, next))
+        Ok(DpoId::load_balance(proto, load_balance.get(), next))
     }
 
     #[inline]
@@ -529,7 +533,7 @@ impl<N: Copy> FibTableBuilder<N> {
         self.validate_load_balance_proto(DpoProto::IP4, load_balance)?;
         let route_dpo = self.add_route_dpo_entry(DpoId::load_balance(
             DpoProto::IP4,
-            load_balance,
+            load_balance.get(),
             self.drop_next,
         ));
         self.ip4_routes.push(Ip4Route { prefix, route_dpo });
@@ -551,7 +555,7 @@ impl<N: Copy> FibTableBuilder<N> {
         self.validate_load_balance_proto(DpoProto::IP6, load_balance)?;
         let route_dpo = self.add_route_dpo_entry(DpoId::load_balance(
             DpoProto::IP6,
-            load_balance,
+            load_balance.get(),
             self.drop_next,
         ));
         self.ip6_routes.push(Ip6Route { prefix, route_dpo });
@@ -559,7 +563,7 @@ impl<N: Copy> FibTableBuilder<N> {
     }
 
     #[inline]
-    pub fn add_ip4_route_dpo(&mut self, prefix: Ipv4Net, dpo: DpoId<N>) {
+    pub fn add_ip4_route_dpo(&mut self, prefix: Ipv4Net, dpo: DpoId) {
         self.try_add_ip4_route_dpo(prefix, dpo)
             .expect("IPv4 route DPO must carry IPv4 proto");
     }
@@ -568,7 +572,7 @@ impl<N: Copy> FibTableBuilder<N> {
     pub fn try_add_ip4_route_dpo(
         &mut self,
         prefix: Ipv4Net,
-        dpo: DpoId<N>,
+        dpo: DpoId,
     ) -> Result<(), FibRouteDpoError> {
         self.validate_route_dpo(DpoProto::IP4, dpo)?;
         let route_dpo = self.add_route_dpo_entry(dpo);
@@ -577,7 +581,7 @@ impl<N: Copy> FibTableBuilder<N> {
     }
 
     #[inline]
-    pub fn add_ip6_route_dpo(&mut self, prefix: Ipv6Net, dpo: DpoId<N>) {
+    pub fn add_ip6_route_dpo(&mut self, prefix: Ipv6Net, dpo: DpoId) {
         self.try_add_ip6_route_dpo(prefix, dpo)
             .expect("IPv6 route DPO must carry IPv6 proto");
     }
@@ -586,7 +590,7 @@ impl<N: Copy> FibTableBuilder<N> {
     pub fn try_add_ip6_route_dpo(
         &mut self,
         prefix: Ipv6Net,
-        dpo: DpoId<N>,
+        dpo: DpoId,
     ) -> Result<(), FibRouteDpoError> {
         self.validate_route_dpo(DpoProto::IP6, dpo)?;
         let route_dpo = self.add_route_dpo_entry(dpo);
@@ -595,17 +599,13 @@ impl<N: Copy> FibTableBuilder<N> {
     }
 
     #[inline]
-    pub fn add_route_dpo(&mut self, prefix: IpNet, dpo: DpoId<N>) {
+    pub fn add_route_dpo(&mut self, prefix: IpNet, dpo: DpoId) {
         self.try_add_route_dpo(prefix, dpo)
             .expect("route DPO proto must match prefix IP version");
     }
 
     #[inline]
-    pub fn try_add_route_dpo(
-        &mut self,
-        prefix: IpNet,
-        dpo: DpoId<N>,
-    ) -> Result<(), FibRouteDpoError> {
+    pub fn try_add_route_dpo(&mut self, prefix: IpNet, dpo: DpoId) -> Result<(), FibRouteDpoError> {
         match prefix {
             IpNet::V4(prefix) => self.try_add_ip4_route_dpo(prefix, dpo),
             IpNet::V6(prefix) => self.try_add_ip6_route_dpo(prefix, dpo),
@@ -631,18 +631,18 @@ impl<N: Copy> FibTableBuilder<N> {
     }
 
     #[inline]
-    pub fn add_entry(&mut self, entry: FibEntry<N>) {
+    pub fn add_entry(&mut self, entry: FibEntry) {
         self.try_add_entry(entry)
             .expect("FIB entry DPO proto must match prefix IP version");
     }
 
     #[inline]
-    pub fn try_add_entry(&mut self, entry: FibEntry<N>) -> Result<(), FibRouteDpoError> {
+    pub fn try_add_entry(&mut self, entry: FibEntry) -> Result<(), FibRouteDpoError> {
         self.try_add_route_dpo(entry.prefix, entry.dpo)
     }
 
     #[inline]
-    pub fn build(mut self) -> FibTable<N> {
+    pub fn build(mut self) -> FibTable {
         self.ip4_routes
             .sort_by_key(|route| route.prefix.prefix_len());
         FibTable {
@@ -688,11 +688,13 @@ impl<N: Copy> FibTableBuilder<N> {
     #[inline]
     fn validate_load_balance_backing(
         &self,
-        load_balance: &LoadBalance<N>,
+        load_balance: &LoadBalance,
     ) -> Result<(), LoadBalanceError> {
         for (bucket_index, bucket) in load_balance.buckets().iter().copied().enumerate() {
             let bucket_index = bucket_index as u16;
-            if let Some(index) = bucket.adjacency_index() {
+            if let Some(index) =
+                (bucket.class() == DpoType::ADJACENCY).then(|| AdjacencyIndex::new(bucket.index()))
+            {
                 let Some(adjacency) = self.adjacencies.get(index.slot()) else {
                     return Err(LoadBalanceError::BucketAdjacencyMissing {
                         index,
@@ -710,7 +712,9 @@ impl<N: Copy> FibTableBuilder<N> {
                     });
                 }
             }
-            if let Some(index) = bucket.load_balance_index() {
+            if let Some(index) = (bucket.class() == DpoType::LOAD_BALANCE)
+                .then(|| LoadBalanceIndex::new(bucket.index()))
+            {
                 self.validate_load_balance_bucket_load_balance(
                     index,
                     bucket.proto(),
@@ -747,16 +751,16 @@ impl<N: Copy> FibTableBuilder<N> {
     }
 
     #[inline]
-    fn validate_route_dpo(
-        &self,
-        expected: DpoProto,
-        dpo: DpoId<N>,
-    ) -> Result<(), FibRouteDpoError> {
+    fn validate_route_dpo(&self, expected: DpoProto, dpo: DpoId) -> Result<(), FibRouteDpoError> {
         validate_route_dpo_proto(expected, dpo)?;
-        if let Some(index) = dpo.adjacency_index() {
+        if let Some(index) =
+            (dpo.class() == DpoType::ADJACENCY).then(|| AdjacencyIndex::new(dpo.index()))
+        {
             self.validate_route_dpo_adjacency(index, dpo.proto())?;
         }
-        if let Some(index) = dpo.load_balance_index() {
+        if let Some(index) =
+            (dpo.class() == DpoType::LOAD_BALANCE).then(|| LoadBalanceIndex::new(dpo.index()))
+        {
             self.validate_load_balance_proto(dpo.proto(), index)?;
         }
         Ok(())
@@ -796,7 +800,7 @@ struct Ip6Route {
 }
 
 #[inline(always)]
-fn validate_route_dpo_proto<N>(expected: DpoProto, dpo: DpoId<N>) -> Result<(), FibRouteDpoError> {
+fn validate_route_dpo_proto(expected: DpoProto, dpo: DpoId) -> Result<(), FibRouteDpoError> {
     let actual = dpo.proto();
     if actual == expected {
         Ok(())

@@ -59,22 +59,22 @@ pub enum LoadBalanceError {
 
 #[repr(C, align(64))]
 #[derive(Debug, Clone)]
-pub struct LoadBalance<N: Copy> {
+pub struct LoadBalance {
     proto: DpoProto,
     bucket_count: u16,
     power_of_two_mask: u16,
-    buckets: LoadBalanceBuckets<N>,
+    buckets: LoadBalanceBuckets,
 }
 
 #[derive(Debug, Clone)]
-enum LoadBalanceBuckets<N: Copy> {
-    Inline([DpoId<N>; LOAD_BALANCE_INLINE_BUCKETS]),
-    Heap(Box<[DpoId<N>]>),
+enum LoadBalanceBuckets {
+    Inline([DpoId; LOAD_BALANCE_INLINE_BUCKETS]),
+    Heap(Box<[DpoId]>),
 }
 
-impl<N: Copy> LoadBalance<N> {
+impl LoadBalance {
     #[inline]
-    pub fn new(proto: DpoProto, buckets: impl Into<Vec<DpoId<N>>>) -> Self {
+    pub fn new(proto: DpoProto, buckets: impl Into<Vec<DpoId>>) -> Self {
         Self::try_new(proto, buckets)
             .expect("load-balance buckets must be non-empty, fit hot-path index, and match proto")
     }
@@ -82,7 +82,7 @@ impl<N: Copy> LoadBalance<N> {
     #[inline]
     pub fn try_new(
         proto: DpoProto,
-        buckets: impl Into<Vec<DpoId<N>>>,
+        buckets: impl Into<Vec<DpoId>>,
     ) -> Result<Self, LoadBalanceError> {
         let buckets = buckets.into();
         let bucket_count = buckets.len();
@@ -120,7 +120,7 @@ impl<N: Copy> LoadBalance<N> {
     }
 
     #[inline(always)]
-    pub fn buckets(&self) -> &[DpoId<N>] {
+    pub fn buckets(&self) -> &[DpoId] {
         match &self.buckets {
             LoadBalanceBuckets::Inline(buckets) => &buckets[..self.bucket_count()],
             LoadBalanceBuckets::Heap(buckets) => buckets,
@@ -128,7 +128,7 @@ impl<N: Copy> LoadBalance<N> {
     }
 
     #[inline(always)]
-    pub fn select_hash(&self, hash: usize) -> (u16, DpoId<N>) {
+    pub fn select_hash(&self, hash: usize) -> (u16, DpoId) {
         let bucket = self.bucket_for_hash(hash);
         (bucket as u16, self.bucket_unchecked(bucket))
     }
@@ -152,7 +152,7 @@ impl<N: Copy> LoadBalance<N> {
     }
 
     #[inline(always)]
-    fn bucket_unchecked(&self, bucket: usize) -> DpoId<N> {
+    fn bucket_unchecked(&self, bucket: usize) -> DpoId {
         match &self.buckets {
             LoadBalanceBuckets::Inline(buckets) => buckets[bucket],
             LoadBalanceBuckets::Heap(buckets) => buckets[bucket],
@@ -172,10 +172,7 @@ fn validate_bucket_count(bucket_count: usize) -> Result<(), LoadBalanceError> {
 }
 
 #[inline(always)]
-fn validate_bucket_protos<N: Copy>(
-    expected: DpoProto,
-    buckets: &[DpoId<N>],
-) -> Result<(), LoadBalanceError> {
+fn validate_bucket_protos(expected: DpoProto, buckets: &[DpoId]) -> Result<(), LoadBalanceError> {
     for (bucket_index, bucket) in buckets.iter().enumerate() {
         let actual = bucket.proto();
         if actual != expected {
@@ -187,11 +184,4 @@ fn validate_bucket_protos<N: Copy>(
         }
     }
     Ok(())
-}
-
-impl<N: Copy> From<(DpoProto, AdjacencyIndex, N)> for DpoId<N> {
-    #[inline(always)]
-    fn from((proto, adjacency, next): (DpoProto, AdjacencyIndex, N)) -> Self {
-        Self::adjacency(proto, adjacency, next)
-    }
 }

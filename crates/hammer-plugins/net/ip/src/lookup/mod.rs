@@ -3,8 +3,8 @@ use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::sync::{Arc, Mutex, OnceLock};
 
 use crate::forwarding::{
-    Adjacency, AdjacencyIndex, DpoProto, DpoType, FibLookupResult, FibTable,
-    FibTableBuilder, FibTableHandle, ForwardingMetadata,
+    Adjacency, AdjacencyIndex, DpoProto, DpoType, FibLookupResult, FibTable, FibTableBuilder,
+    FibTableHandle, ForwardingMetadata,
 };
 use crate::protocol::icmp::IcmpErrorMetadata;
 use crate::protocol::ip::{
@@ -62,7 +62,7 @@ pub struct IpLookupControlPlane {
 
 impl IpLookupControlPlane {
     #[inline]
-    pub fn new(table: FibTable<u16>) -> Self {
+    pub fn new(table: FibTable) -> Self {
         Self {
             table: FibTableHandle::new(table),
         }
@@ -77,7 +77,6 @@ impl IpLookupControlPlane {
     pub fn node(&self) -> IpLookupNode {
         IpLookupNode::new(self.table_handle())
     }
-
 }
 
 #[hammer_component_macros::node_next]
@@ -113,7 +112,7 @@ impl IpMain {
         if let Some(control) = self.control.get() {
             return Ok(Arc::clone(control));
         }
-        let table = FibTableBuilder::<u16>::new(NodeNext::slot(IpLookupNext::Drop)).build();
+        let table = FibTableBuilder::new(NodeNext::slot(IpLookupNext::Drop)).build();
         let control = Arc::new(IpLookupControlPlane::new(table));
         if self.control.set(Arc::clone(&control)).is_err() {
             return self
@@ -150,10 +149,7 @@ pub static IP_MAIN: OnceLock<IpMain> = OnceLock::new();
     early = true,
     runs_after = ["runtime_worker_config"]
 )]
-fn configure_ip(
-    config: NetworkIpConfig,
-    _: &mut hammer_runtime::GlobalMain,
-) -> RuntimeResult<()> {
+fn configure_ip(config: NetworkIpConfig, _: &mut hammer_runtime::GlobalMain) -> RuntimeResult<()> {
     config.validate()?;
     let main = IpMain::new();
     IP_MAIN
@@ -206,7 +202,7 @@ impl IpLookupNode {
     }
 
     #[inline(always)]
-    fn process_index(runtime: &DataPlaneMain, table: &FibTable<u16>, index: Index) -> u16 {
+    fn process_index(runtime: &DataPlaneMain, table: &FibTable, index: Index) -> u16 {
         let parsed = Self::cached_packet_for_index(runtime, index);
         let traced = runtime
             .get_buffer(index)
@@ -242,17 +238,17 @@ impl IpLookupNode {
         };
         let result = table
             .lookup_packet(&parsed)
-            .unwrap_or_else(|| FibLookupResult::<u16>::terminal(table.drop_dpo(parsed.version)));
+            .unwrap_or_else(|| FibLookupResult::terminal(table.drop_dpo(parsed.version)));
         let mut buffer = runtime.get_buffer_mut(index).expect("buffer mut");
         let opaque = unsafe { transmute::<_, &mut LookupOpaque>(buffer.opaque2_mut()) };
         opaque.forwarding = Some(ForwardingMetadata {
             fib_index: 0,
-            route_dpo_type: result.route_dpo.kind(),
-            route_dpo_index: result.route_dpo.forwarding_index(),
+            route_dpo_type: result.route_dpo.class(),
+            route_dpo_index: result.route_dpo.index(),
             load_balance_index: result.forwarding_load_balance_index(),
             bucket_index: result.forwarding_bucket_index(),
-            dpo_type: result.dpo.kind(),
-            dpo_index: result.dpo.forwarding_index(),
+            dpo_type: result.dpo.class(),
+            dpo_index: result.dpo.index(),
         });
         drop(buffer);
         if unlikely(traced) {
@@ -261,12 +257,12 @@ impl IpLookupNode {
                 index,
                 IpLookupTrace {
                     fib_index: 0,
-                    route_dpo_type: Some(result.route_dpo.kind()),
-                    route_dpo_index: Some(result.route_dpo.forwarding_index()),
+                    route_dpo_type: Some(result.route_dpo.class()),
+                    route_dpo_index: Some(result.route_dpo.index()),
                     load_balance_index: Some(result.forwarding_load_balance_index()),
                     bucket_index: Some(result.forwarding_bucket_index()),
-                    dpo_type: Some(result.dpo.kind()),
-                    dpo_index: Some(result.dpo.forwarding_index()),
+                    dpo_type: Some(result.dpo.class()),
+                    dpo_index: Some(result.dpo.index()),
                     next: result.dpo.next(),
                 },
             );
@@ -635,7 +631,7 @@ fn ip_lookup_process(
 fn ip_lookup_process_frame(
     runtime: &DataPlaneMain,
     frame: &mut BufferFrame,
-    table: &FibTable<u16>,
+    table: &FibTable,
 ) -> () {
     let count = frame.len();
     if count == 0 {
@@ -694,7 +690,7 @@ fn adjacency_rewrite_process_frame(
 fn adjacency_mtu_divert(
     runtime: &DataPlaneMain,
     index: Index,
-    adjacency: &Adjacency<u16>,
+    adjacency: &Adjacency,
     icmp_error_next: Option<u16>,
     fragment_next: Option<u16>,
 ) -> RuntimeResult<Option<u16>> {
@@ -742,7 +738,7 @@ fn adjacency_mtu_divert(
 fn apply_adjacency_rewrite(
     runtime: &DataPlaneMain,
     index: Index,
-    adjacency: Adjacency<u16>,
+    adjacency: Adjacency,
 ) -> RuntimeResult<()> {
     let rewrite = adjacency.rewrite.as_slice();
     let mut buffer = runtime.get_buffer_mut(index)?;

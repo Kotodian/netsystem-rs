@@ -3,12 +3,16 @@ use std::mem::{align_of, size_of};
 use hammer_core::data_plane::NodeId;
 
 #[repr(transparent)]
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Deserialize, serde::Serialize)]
 pub struct DpoProto(u8);
 
 impl DpoProto {
     pub const IP4: Self = Self(0);
     pub const IP6: Self = Self(1);
+    pub const MPLS: Self = Self(2);
+    pub const ETHERNET: Self = Self(3);
+    pub const BIER: Self = Self(4);
+    pub const NSH: Self = Self(5);
     pub const NONE: Self = Self(u8::MAX);
 
     pub const fn new(value: u8) -> Self {
@@ -21,7 +25,7 @@ impl DpoProto {
 }
 
 #[repr(transparent)]
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Deserialize, serde::Serialize)]
 pub struct DpoType(u8);
 
 impl DpoType {
@@ -29,8 +33,9 @@ impl DpoType {
     pub const DROP: Self = Self(0);
     pub const PUNT: Self = Self(1);
     pub const RECEIVE: Self = Self(2);
-    pub const LOAD_BALANCE: Self = Self(3);
-    pub const FIRST_REGISTERED: u8 = 4;
+    pub const ADJACENCY: Self = Self(3);
+    pub const LOAD_BALANCE: Self = Self(4);
+    pub const FIRST_REGISTERED: u8 = 5;
 
     pub const fn new(value: u8) -> Self {
         Self(value)
@@ -47,7 +52,7 @@ pub struct DpoId(u64);
 
 impl DpoId {
     pub const INVALID: Self = Self::new(DpoType::INVALID, DpoProto::NONE, u32::MAX, u16::MAX);
-    pub(crate) const fn new(dpo_type: DpoType, proto: DpoProto, index: u32, next: u16) -> Self {
+    pub const fn new(dpo_type: DpoType, proto: DpoProto, index: u32, next: u16) -> Self {
         Self(
             index as u64
                 | ((next as u64) << 32)
@@ -56,19 +61,23 @@ impl DpoId {
         )
     }
 
-    pub(crate) const fn drop(proto: DpoProto, next: u16) -> Self {
+    pub const fn drop(proto: DpoProto, next: u16) -> Self {
         Self::new(DpoType::DROP, proto, 0, next)
     }
 
-    pub(crate) const fn punt(proto: DpoProto, next: u16) -> Self {
+    pub const fn punt(proto: DpoProto, next: u16) -> Self {
         Self::new(DpoType::PUNT, proto, 0, next)
     }
 
-    pub(crate) const fn receive(proto: DpoProto, index: u32, next: u16) -> Self {
+    pub const fn receive(proto: DpoProto, index: u32, next: u16) -> Self {
         Self::new(DpoType::RECEIVE, proto, index, next)
     }
 
-    pub(crate) const fn load_balance(proto: DpoProto, index: u32, next: u16) -> Self {
+    pub const fn adjacency(proto: DpoProto, index: u32, next: u16) -> Self {
+        Self::new(DpoType::ADJACENCY, proto, index, next)
+    }
+
+    pub const fn load_balance(proto: DpoProto, index: u32, next: u16) -> Self {
         Self::new(DpoType::LOAD_BALANCE, proto, index, next)
     }
 

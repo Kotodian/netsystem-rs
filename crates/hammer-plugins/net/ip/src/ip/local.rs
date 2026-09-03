@@ -771,9 +771,9 @@ fn source_check_passes(state: &IpLocalState, parsed: &ParsedIpPacket) -> bool {
 }
 
 #[inline(always)]
-fn source_lookup_result_is_usable(result: FibLookupResult<u16>) -> bool {
+fn source_lookup_result_is_usable(result: FibLookupResult) -> bool {
     !matches!(
-        result.dpo.kind(),
+        result.dpo.class(),
         DpoType::DROP | DpoType::PUNT | DpoType::RECEIVE
     )
 }

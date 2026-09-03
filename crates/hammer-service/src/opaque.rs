@@ -31,7 +31,7 @@ impl TapEthernetMetadata {
     }
 }
 
-#[derive(Clone, Copy, Default)]
+#[derive(Clone, Copy)]
 #[repr(C)]
 pub struct NetworkIpOpaque {
     packet_len: u32,
@@ -43,6 +43,24 @@ pub struct NetworkIpOpaque {
     ip_ecn: u8,
     ip_ecn_valid: u8,
     reserved: [u8; 10],
+}
+
+impl Default for NetworkIpOpaque {
+    fn default() -> Self {
+        let mut opaque = Self {
+            packet_len: 0,
+            network_header_len: 0,
+            transport_header_len: 0,
+            transport_payload_offset: 0,
+            ip_version: 0,
+            ip_protocol: 0,
+            ip_ecn: 0,
+            ip_ecn_valid: 0,
+            reserved: [0; 10],
+        };
+        opaque.set_fib_index_override(None);
+        opaque
+    }
 }
 
 impl NetworkIpOpaque {
@@ -142,19 +160,19 @@ impl NetworkIpOpaque {
     }
 
     #[inline]
-    pub fn fib_index(&self) -> u32 {
-        u32::from_le_bytes([
+    pub fn fib_index_override(&self) -> Option<u32> {
+        let index = u32::from_le_bytes([
             self.reserved[4],
             self.reserved[5],
             self.reserved[6],
             self.reserved[7],
-        ])
+        ]);
+        (index != u32::MAX).then_some(index)
     }
 
     #[inline]
-    pub fn set_fib_index(&mut self, index: u32) {
-        let bytes = index.to_le_bytes();
-        self.reserved[4..8].copy_from_slice(&bytes);
+    pub fn set_fib_index_override(&mut self, index: Option<u32>) {
+        self.reserved[4..8].copy_from_slice(&index.unwrap_or(u32::MAX).to_le_bytes());
     }
 }
 
