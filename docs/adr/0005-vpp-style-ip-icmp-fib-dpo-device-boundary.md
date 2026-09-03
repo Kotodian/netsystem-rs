@@ -879,6 +879,18 @@ packet lookup returns the concrete forwarding load-balance index and then
 follows its selected child DPO. Those are separate operations and are not
 collapsed into one result object.
 
+The current IP snapshot implementation's `FibContribution` enum and
+`FibContributions` prefix/source map are explicitly deleted by this ADR. They
+are not the Rust spelling of VPP's `fib_entry_src_t`, and they must not survive
+as a compatibility alias, private helper, API parameter, lookup result, or
+replacement central union. The enum incorrectly combines drop, receive, and
+path-list semantics in one IP-owned value, while the map makes IP own source
+merge and whole-table recompilation. The migration creates an owner-selected
+`FibEntrySrc<N, F, SourceData, PathExt>` record in the service FIB and submits
+one concrete source operation at a time: a special-DPO add/remove, a path
+add/remove/update, or a source delete. Route lookup returns the concrete IP
+route/path facts required by its Binary API; it never returns a source enum.
+
 `DpoProto` is retained only as the service-owned data-path link discriminator
 described by VPP's `dpo_proto_t`. In VPP this answers “which packet graph/link
 format does this DPO emit?”; it is not an IP protocol number, an ICMP/TCP/UDP
@@ -2469,6 +2481,7 @@ next enum, `thread_local!` local registration, atomic FIB handle, or
 | 类型/API | 位置或标识 | 变更内容 | 兼容性/迁移 | 验证方式 |
 | --- | --- | --- | --- | --- |
 | 类型/API | `hammer-plugins/net/ip::ip::icmp::*` 的 IP-owned ICMP module surface | ICMP nodes、control state、ICMP exports 移至 `hammer-plugins/net/icmp` | 无 compatibility re-export；ICMP callers 改依赖新 DSO | workspace compile and DSO export test |
+| 类型 | `hammer-plugins/ip::lookup::{FibContribution,FibContributions}` | 删除 IP-owned 的统一贡献枚举及其 prefix/source 聚合 map；它们把 Drop、Receive 和 path-list 语义混在一个值里，并驱动整表快照重编译 | 不保留 alias、私有替代名或中心 union；调用方迁移为 service FIB 的 `FibEntrySrc<N,F,SourceData,PathExt>` 与具体 special-DPO/path source 操作 | 文档 inventory、源码 API removal、concrete source/path lifecycle and failure-atomic publication tests |
 | 类型 | `hammer-service::net::fib::FibEntrySrcRelation` | 删除独立的 cover/sibling/interpose 关系枚举；cover/sibling 事实直接存放在 `FibEntrySrc.cover` 元组，interpose 事实存放在可选的 `FibEntrySrc.interpose_dpo` | 无兼容 alias；实现直接迁移到字段访问，文档和源码不得保留该类型 | 文档 inventory 检查、源码编译和 source-lifecycle 行为测试 |
 | 类型 | `hammer-service::net::fib::FibPathFlags` | 删除 service-owned 的固定路径策略位集合；路径 flags 改为 `FibPath<N, F>` 的 owner-supplied `F` | IP callers 迁移到 `hammer-plugins/net/ip::IpPathFlags`；无兼容 alias | generic FIB compile check and IP route flag tests |
 | 类型/API | `hammer-service::device::DeviceInputNext::{Ip4Input,Ip6Input}` | 删除 service 固定 IP next | device callback 选择具体 parser/next | graph inventory and RX integration test |
