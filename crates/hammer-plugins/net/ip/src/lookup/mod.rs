@@ -1,11 +1,10 @@
-use std::collections::BTreeMap;
 use std::mem::{size_of, transmute};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::sync::{Arc, Mutex, OnceLock};
 
 use crate::forwarding::{
-    Adjacency, AdjacencyIndex, AdjacencyRewrite, DpoProto, DpoType, FibLookupResult, FibSource,
-    FibTable, FibTableBuilder, FibTableHandle, ForwardingMetadata,
+    Adjacency, AdjacencyIndex, DpoProto, DpoType, FibLookupResult, FibTable,
+    FibTableBuilder, FibTableHandle, ForwardingMetadata,
 };
 use crate::protocol::icmp::IcmpErrorMetadata;
 use crate::protocol::ip::{
@@ -22,10 +21,9 @@ use hammer_runtime::{
 use hammer_runtime::{RuntimeError, RuntimeResult};
 
 use hammer_service::data_plane::set_index_node_error;
-use hammer_service::interface::InterfaceMain;
 use hammer_service::opaque::{NetworkOpaque, TapEthernetMetadata};
 
-use crate::config::{NetworkIpConfig, Route, RouteAction};
+use crate::config::NetworkIpConfig;
 
 #[derive(Clone, Copy, Default)]
 #[repr(C)]
@@ -71,12 +69,6 @@ impl IpLookupControlPlane {
     }
 
     #[inline]
-    pub fn from_handle(table: FibTableHandle) -> Self {
-        Self { table }
-    }
-
-    #[inline]
-    #[inline]
     pub fn table_handle(&self) -> FibTableHandle {
         self.table.clone()
     }
@@ -86,20 +78,6 @@ impl IpLookupControlPlane {
         IpLookupNode::new(self.table_handle())
     }
 
-    #[inline]
-    pub fn publish(&self, table: FibTable<u16>) -> RuntimeResult<()> {
-        let table_handle = self.table.clone();
-        let publish = move || {
-            if let Some(barrier) = hammer_runtime::barrier::global() {
-                barrier.sync(|| table_handle.publish(table));
-            } else {
-                table_handle.publish(table);
-            }
-            RuntimeResult::Ok(())
-        };
-        publish()?;
-        Ok(())
-    }
 }
 
 #[hammer_component_macros::node_next]
@@ -120,312 +98,23 @@ pub enum AdjacencyRewriteNext {
     Drop,
 }
 
-/// IP-lookup subsystem control-plane main (VPP `ip_main_t`).
-///
-/// Owns all FIB source contributions. FIB DPOs store `ip-lookup` local next
-/// slots; source selection and retained fallback state never enter lookup.
 pub struct IpMain {
-    contributions: Mutex<FibContributions>,
     control: OnceLock<Arc<IpLookupControlPlane>>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-enum FibContribution {
-    Drop,
-    Receive,
-    Paths(Vec<FibPath>),
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct FibPath {
-    interface_index: u32,
-    next_hop: Option<IpAddr>,
-}
-
-#[derive(Debug, Clone, Default)]
-struct FibContributions {
-    by_prefix: BTreeMap<ipnet::IpNet, BTreeMap<FibSource, FibContribution>>,
-}
-
-impl FibContributions {
-    fn insert(
-        &mut self,
-        prefix: ipnet::IpNet,
-        source: FibSource,
-        contribution: FibContribution,
-    ) -> RuntimeResult<()> {
-        if matches!(&contribution, FibContribution::Paths(paths) if paths.is_empty()) {
-            return Err(RuntimeError::config_validation(format!(
-                "FIB source {source:?} for {prefix} must contribute at least one path"
-            )));
-        }
-        let sources = self.by_prefix.entry(prefix).or_default();
-        match (sources.get_mut(&source), contribution) {
-            (None, contribution) => {
-                sources.insert(source, contribution);
-            }
-            (Some(FibContribution::Paths(current)), FibContribution::Paths(mut added)) => {
-                current.append(&mut added);
-            }
-            (Some(FibContribution::Drop), FibContribution::Drop)
-            | (Some(FibContribution::Receive), FibContribution::Receive) => {}
-            (Some(_), _) => {
-                return Err(IpLookupError::FibSourceConflict { prefix }.into());
-            }
-        }
-        Ok(())
-    }
-
-    fn remove(&mut self, prefix: ipnet::IpNet, source: FibSource) -> bool {
-        let Some(sources) = self.by_prefix.get_mut(&prefix) else {
-            return false;
-        };
-        let removed = sources.remove(&source).is_some();
-        let prefix_is_unsourced = sources.is_empty();
-        if prefix_is_unsourced {
-            self.by_prefix.remove(&prefix);
-        }
-        removed
-    }
-}
-
 impl IpMain {
-    pub fn new(routes: Arc<[Route]>, interfaces: Option<&InterfaceMain>) -> RuntimeResult<Self> {
-        let mut contributions = FibContributions::default();
-        for route in routes.iter() {
-            let action = match route.action()? {
-                RouteAction::Drop => FibContribution::Drop,
-                RouteAction::Adjacency { via, interface } => {
-                    let interface_index = Self::configured_interface_index(
-                        interfaces,
-                        route.prefix,
-                        interface.as_str(),
-                    )?;
-                    match via {
-                        Some(next_hop) => {
-                            validate_via_family(route.prefix, next_hop)?;
-                            FibContribution::Paths(vec![FibPath {
-                                interface_index,
-                                next_hop: Some(next_hop),
-                            }])
-                        }
-                        None => FibContribution::Paths(vec![FibPath {
-                            interface_index,
-                            next_hop: None,
-                        }]),
-                    }
-                }
-                RouteAction::LoadBalance { via, interface } => {
-                    let interface_index = Self::configured_interface_index(
-                        interfaces,
-                        route.prefix,
-                        interface.as_str(),
-                    )?;
-                    for next_hop in &via {
-                        validate_via_family(route.prefix, *next_hop)?;
-                    }
-                    FibContribution::Paths(
-                        via.into_iter()
-                            .map(|next_hop| FibPath {
-                                interface_index,
-                                next_hop: Some(next_hop),
-                            })
-                            .collect(),
-                    )
-                }
-            };
-            contributions.insert(route.prefix, FibSource::API, action)?;
-        }
-        if let Some(interfaces) = interfaces {
-            Self::add_interface_contributions(&mut contributions, interfaces)?;
-        }
-        Ok(Self {
-            contributions: Mutex::new(contributions),
+    pub fn new() -> Self {
+        Self {
             control: OnceLock::new(),
-        })
-    }
-
-    fn build_table(&self) -> RuntimeResult<FibTable<u16>> {
-        let contributions = self
-            .contributions
-            .lock()
-            .map_err(|_| IpLookupError::FibContributionsPoisoned)?;
-        Self::compile_contributions(&contributions)
-    }
-
-    fn compile_contributions(contributions: &FibContributions) -> RuntimeResult<FibTable<u16>> {
-        let drop_next = NodeNext::slot(IpLookupNext::Drop);
-        let receive_next = NodeNext::slot(IpLookupNext::Receive);
-        let rewrite_next = NodeNext::slot(IpLookupNext::AdjacencyRewrite);
-        let rewrite_output_next = NodeNext::slot(AdjacencyRewriteNext::Output);
-        let mut builder = FibTableBuilder::<u16>::new(drop_next);
-        for (prefix, sources) in &contributions.by_prefix {
-            let Some((_, action)) = sources.iter().next() else {
-                return Err(IpLookupError::FibPrefixEmpty { prefix: *prefix }.into());
-            };
-            match action {
-                FibContribution::Drop => {
-                    builder.add_drop_route(*prefix);
-                }
-                FibContribution::Receive => {
-                    builder.add_receive_route(*prefix, receive_next);
-                }
-                FibContribution::Paths(paths) if paths.len() == 1 => Self::add_adjacency_route(
-                    &mut builder,
-                    *prefix,
-                    paths[0],
-                    rewrite_next,
-                    rewrite_output_next,
-                )?,
-                FibContribution::Paths(paths) => Self::add_load_balance_route(
-                    &mut builder,
-                    *prefix,
-                    paths,
-                    rewrite_next,
-                    rewrite_output_next,
-                )?,
-            }
         }
-        Ok(builder.build())
-    }
-
-    fn configured_interface_index(
-        interfaces: Option<&InterfaceMain>,
-        prefix: ipnet::IpNet,
-        interface: &str,
-    ) -> RuntimeResult<u32> {
-        let interfaces = interfaces.ok_or_else(|| {
-            RuntimeError::config_validation(format!(
-                "network.route[{prefix}] requires a configured interface"
-            ))
-        })?;
-        interfaces.interface_index(interface).ok_or_else(|| {
-            RuntimeError::config_validation(format!(
-                "network.route[{prefix}] references unknown interface `{interface}`"
-            ))
-        })
-    }
-
-    fn add_adjacency_route(
-        builder: &mut FibTableBuilder<u16>,
-        prefix: ipnet::IpNet,
-        path: FibPath,
-        rewrite_next: u16,
-        rewrite_output_next: u16,
-    ) -> RuntimeResult<()> {
-        let proto = DpoProto::from(match prefix {
-            ipnet::IpNet::V4(_) => IpVersion::V4,
-            ipnet::IpNet::V6(_) => IpVersion::V6,
-        });
-        if let Some(next_hop) = path.next_hop {
-            validate_via_family(prefix, next_hop)?;
-        }
-        let dpo = builder.add_interface_adjacency_dpo(
-            proto,
-            path.interface_index,
-            AdjacencyRewrite::empty(),
-            rewrite_next,
-            rewrite_output_next,
-        );
-        builder.add_route_dpo(prefix, dpo);
-        Ok(())
-    }
-
-    fn add_load_balance_route(
-        builder: &mut FibTableBuilder<u16>,
-        prefix: ipnet::IpNet,
-        paths: &[FibPath],
-        rewrite_next: u16,
-        rewrite_output_next: u16,
-    ) -> RuntimeResult<()> {
-        for path in paths {
-            if let Some(next_hop) = path.next_hop {
-                validate_via_family(prefix, next_hop)?;
-            }
-        }
-        let proto = DpoProto::from(match prefix {
-            ipnet::IpNet::V4(_) => IpVersion::V4,
-            ipnet::IpNet::V6(_) => IpVersion::V6,
-        });
-        let buckets = paths
-            .iter()
-            .map(|path| {
-                builder.add_interface_adjacency_dpo(
-                    proto,
-                    path.interface_index,
-                    AdjacencyRewrite::empty(),
-                    rewrite_next,
-                    rewrite_output_next,
-                )
-            })
-            .collect::<Vec<_>>();
-        let load_balance = builder
-            .try_add_load_balance(proto, buckets)
-            .map_err(|error| {
-                RuntimeError::config_validation(format!(
-                    "FIB paths for {prefix} cannot form a load balance: {error:?}"
-                ))
-            })?;
-        builder.add_route(prefix, load_balance);
-        Ok(())
-    }
-
-    fn add_interface_contributions(
-        contributions: &mut FibContributions,
-        interfaces: &InterfaceMain,
-    ) -> RuntimeResult<()> {
-        let mut interface_index = 0u32;
-        while interfaces.interface_name(interface_index).is_some() {
-            for address in interfaces.interface_addresses(interface_index) {
-                let host = host_prefix(address)?;
-                contributions.insert(host, FibSource::INTERFACE, FibContribution::Receive)?;
-
-                if address.prefix_len() == address.max_prefix_len() {
-                    continue;
-                }
-                let connected = address.trunc();
-                contributions.insert(
-                    connected,
-                    FibSource::INTERFACE,
-                    FibContribution::Paths(vec![FibPath {
-                        interface_index,
-                        next_hop: None,
-                    }]),
-                )?;
-            }
-            interface_index = interface_index
-                .checked_add(1)
-                .ok_or(IpLookupError::InterfaceIndexSpaceExhausted)?;
-        }
-        Ok(())
-    }
-
-    pub fn remove_contribution(
-        &self,
-        prefix: ipnet::IpNet,
-        source: FibSource,
-    ) -> RuntimeResult<bool> {
-        let mut current = self
-            .contributions
-            .lock()
-            .map_err(|_| IpLookupError::FibContributionsPoisoned)?;
-        let mut next = current.clone();
-        if !next.remove(prefix, source) {
-            return Ok(false);
-        }
-        let table = Self::compile_contributions(&next)?;
-        if let Some(control) = self.control.get() {
-            control.publish(table)?;
-        }
-        *current = next;
-        Ok(true)
     }
 
     fn control_plane(&self) -> RuntimeResult<Arc<IpLookupControlPlane>> {
         if let Some(control) = self.control.get() {
             return Ok(Arc::clone(control));
         }
-        let control = Arc::new(IpLookupControlPlane::new(self.build_table()?));
+        let table = FibTableBuilder::<u16>::new(NodeNext::slot(IpLookupNext::Drop)).build();
+        let control = Arc::new(IpLookupControlPlane::new(table));
         if self.control.set(Arc::clone(&control)).is_err() {
             return self
                 .control
@@ -447,46 +136,10 @@ impl IpMain {
 #[hammer_component_macros::runtime_error(subsystem = "ip")]
 #[derive(Debug, thiserror::Error)]
 pub(crate) enum IpLookupError {
-    #[error("FIB prefix {prefix} received incompatible route semantics from one source")]
-    FibSourceConflict { prefix: ipnet::IpNet },
-    #[error("FIB prefix {prefix} has no source contribution")]
-    FibPrefixEmpty { prefix: ipnet::IpNet },
-    #[error("interface index space is exhausted")]
-    InterfaceIndexSpaceExhausted,
     #[error("IP lookup control plane was not installed")]
     ControlPlaneMissing,
-    #[error("FIB contribution table lock is poisoned")]
-    FibContributionsPoisoned,
-    #[error("host prefix for {address} is invalid")]
-    HostPrefixInvalid {
-        address: ipnet::IpNet,
-        #[source]
-        source: ipnet::PrefixLenError,
-    },
     #[error("adjacency rewrite length {len} exceeds isize")]
     RewriteTooLong { len: usize },
-}
-
-fn host_prefix(address: ipnet::IpNet) -> RuntimeResult<ipnet::IpNet> {
-    let host = match address {
-        ipnet::IpNet::V4(net) => ipnet::Ipv4Net::new(net.addr(), 32).map(ipnet::IpNet::V4),
-        ipnet::IpNet::V6(net) => ipnet::Ipv6Net::new(net.addr(), 128).map(ipnet::IpNet::V6),
-    };
-    host.map_err(|source| IpLookupError::HostPrefixInvalid { address, source }.into())
-}
-
-fn validate_via_family(prefix: ipnet::IpNet, via: IpAddr) -> RuntimeResult<()> {
-    let matches = matches!(
-        (prefix, via),
-        (ipnet::IpNet::V4(_), IpAddr::V4(_)) | (ipnet::IpNet::V6(_), IpAddr::V6(_))
-    );
-    if matches {
-        Ok(())
-    } else {
-        Err(RuntimeError::config_validation(format!(
-            "network.route[{prefix}] next hop `{via}` has a mismatched address family"
-        )))
-    }
 }
 
 pub static IP_MAIN: OnceLock<IpMain> = OnceLock::new();
@@ -500,12 +153,9 @@ pub static IP_MAIN: OnceLock<IpMain> = OnceLock::new();
 fn configure_ip(
     config: NetworkIpConfig,
     _: &mut hammer_runtime::GlobalMain,
-    net_main: Arc<hammer_service::net::NetMain>,
 ) -> RuntimeResult<()> {
     config.validate()?;
-    let routes: Arc<[_]> = Arc::from([] as [Route; 0]);
-    let interfaces = Some(net_main.interface_main());
-    let main = IpMain::new(routes, interfaces)?;
+    let main = IpMain::new();
     IP_MAIN
         .set(main)
         .map_err(|_| RuntimeError::PluginStateNotInitialized { plugin: "ip" })?;
