@@ -680,7 +680,8 @@ over the producer's concrete address type.
 these implementations: `DpoProto`, `DpoType`, `DpoId`, direct `DpoMain` class/
 stack registration, FIB source/entry/path relationships, and the forwarding
 projection input. A normal route path is first retained as a `FibPath` with
-its next-hop, interface, table, weight, preference, and path flags. The IP
+its next-hop, interface, table, weight, preference, and owner-defined path
+flags. The IP
 backend resolves that path when the source becomes contributing, asks the
 concrete DPO owner to create or update the adjacency/load-balance objects, and
 records the resulting `DpoId` in the generic FIB graph. The generic FIB never
@@ -859,7 +860,8 @@ The following protocol-neutral forwarding types move to
 - `DpoProto`, `DpoType`, `DpoId`, and `DpoMain`;
 - producer-supplied concrete address values retained by generic DPO layouts;
 - `FibSource`, `FibEntry`, `FibEntrySrc`, `FibPathList`, `FibPath`, source
-  precedence/merge state, and the FIB mutation/publication contract;
+  precedence/merge state, and the FIB mutation/publication contract. `FibPath`
+  is generic over the owner-supplied path flags value;
 - `ForwardingMetadata`, because it carries only DPO/FIB facts in the packet
   opaque area;
 - the protocol-neutral DPO/FIB facts consumed by a flow-hash implementation;
@@ -910,8 +912,8 @@ pub enum FibSourceBehavior {
     Adjacency,
 }
 
-pub struct FibEntrySrc<N, SourceData, PathExt> {
-    path_exts: FibPathExtList<N, PathExt>,
+pub struct FibEntrySrc<N, F, SourceData, PathExt> {
+    path_exts: FibPathExtList<N, F, PathExt>,
     path_list: Option<u32>,
     entry_flags: FibEntryFlags,
     source: FibSource,
@@ -922,18 +924,28 @@ pub struct FibEntrySrc<N, SourceData, PathExt> {
     source_data: SourceData,
 }
 
-pub struct FibPathExtList<N, E> {
-    entries: Vec<FibPathExt<N, E>>,
+pub struct FibPath<N, F> {
+    sw_if_index: u32,
+    table_id: u32,
+    rpf_id: u32,
+    weight: u8,
+    preference: u8,
+    flags: F,
+    next_hop: N,
 }
 
-pub struct FibPathExt<N, E> {
-    path: FibPath<N>,
+pub struct FibPathExtList<N, F, E> {
+    entries: Vec<FibPathExt<N, F, E>>,
+}
+
+pub struct FibPathExt<N, F, E> {
+    path: FibPath<N, F>,
     path_index: u32,
     data: E,
 }
 
-pub struct FibPathList<N> {
-    paths: Box<[FibPath<N>]>,
+pub struct FibPathList<N, F> {
+    paths: Box<[FibPath<N, F>]>,
     key_flags: FibPathListFlags,
     flags: FibPathListFlags,
     source_count: u32,
@@ -997,29 +1009,6 @@ bitflags::bitflags! {
     }
 }
 
-bitflags::bitflags! {
-    #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-    #[repr(transparent)]
-    pub struct FibPathFlags: u32 {
-        const RESOLVE_VIA_HOST = 1 << 0;
-        const RESOLVE_VIA_ATTACHED = 1 << 1;
-        const LOCAL = 1 << 2;
-        const ATTACHED = 1 << 3;
-        const DROP = 1 << 4;
-        const EXCLUSIVE = 1 << 5;
-        const INTF_RX = 1 << 6;
-        const RPF_ID = 1 << 7;
-        const SOURCE_LOOKUP = 1 << 8;
-        const UDP_ENCAP = 1 << 9;
-        const DEAG = 1 << 13;
-        const DVR = 1 << 14;
-        const ICMP_UNREACH = 1 << 15;
-        const ICMP_PROHIBIT = 1 << 16;
-        const CLASSIFY = 1 << 17;
-        const GLEAN = 1 << 19;
-    }
-}
-
 pub struct BackWalkContext {
     reason: BackWalkReason,
     depth: u8,
@@ -1064,7 +1053,7 @@ introducing a wrapper type or a protocol-specific union.
 
 VPP stores heterogeneous source payloads in a C union because every source
 record has the same physical type. Rust cannot make one `Vec` hold different
-`FibEntrySrc<N, SourceData, PathExt>` instantiations without an enum or dynamic
+`FibEntrySrc<N, F, SourceData, PathExt>` instantiations without an enum or dynamic
 erasure. Hammer therefore stores each concrete record in its behavior owner's
 typed pool and keeps only `(FibSource, u32)` source slots in the entry. The
 `u32` is an owner-local pool position, not a castable service index. The source
@@ -1077,7 +1066,7 @@ macro; adding a new behavior is an explicit service change.
 the shared `FibPathList` key. Each extension retains the complete matching
 path value, its global path index, and its concrete payload. Owner-specific
 extensions therefore use the same list seam without forcing protocol fields,
-address layouts, or tunnel state into `FibPath<N>`.
+address layouts, or tunnel state into `FibPath<N, F>`.
 
 The VPP `fib_entry_src_vft_t` actions are implemented by a static match on the
 `FibSource.behavior` tag; the function-table shape is not copied into Rust. Each
@@ -1120,8 +1109,10 @@ FIB-node lock count. The path-list and DPO dependencies have their own owner
 lifetimes and are replaced only after the source record no longer points at
 them.
 
-`FibPath<N>` is the protocol-neutral core path. `N` is supplied by the
-concrete owner and is statically dispatched; owner-specific facts use the
+`FibPath<N, F>` is the protocol-neutral core path. `N` is the concrete next-hop
+value and `F` is an owner-defined path-flags value; the service FIB stores both
+without interpreting either business type. For this migration the IP plugin
+supplies `IpPathFlags`; another business plugin supplies its own `F`. Owner-specific facts use the
 separate `PathExt` record and never become fields of this path list. The
 concrete IP next-hop values are:
 
@@ -1156,6 +1147,7 @@ pub trait FibTableBackend {
     type Prefix: Copy;
     type PacketAddress: Copy;
     type NextHop: Clone;
+    type PathFlags: Copy;
     type Error;
 
     // Non-forwarding database: prefix -> fib_entry index.
@@ -1201,7 +1193,8 @@ manual lifetime operation, or second lifecycle interface.
 `FibTable<P, B>` is statically dispatched. This means its backend call is
 monomorphized; it does not make `DpoType` static. It owns
 `FibEntry<P, B::NextHop>`, source slots, shared
-`FibPathList<B::NextHop>`, configured `FibPath<B::NextHop>` values, graph-node
+`FibPathList<B::NextHop, B::PathFlags>`, configured
+`FibPath<B::NextHop, B::PathFlags>` values, graph-node
 references, source ownership records, source route counts, and the current
 forwarding `DpoId`. `B` is the only implementation seam: it owns the concrete
 prefix stores, resolves owner-dependent paths, asks the matching concrete DPO
@@ -1386,7 +1379,7 @@ path_index)`; the extension payload is the concrete `PathExt` parameter of the
 owner pool's `FibEntrySrc`. The lifecycle is add/insert, remove/find (including
 lookup by path index), resolve, stack, and flush when the source or path list
 changes. Protocol-specific extensions use this owner-defined seam and never
-become fixed fields of `FibPath<N>`.
+become fixed fields of `FibPath<N, F>`.
 
 Path-list back-walk rebuilds its uRPF contribution, detects recursive cycles,
 and propagates to children. A small child set is walked synchronously; a
@@ -1520,6 +1513,29 @@ pub enum IpRoutePathBehavior {
     Classify,
 }
 
+bitflags::bitflags! {
+    #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+    #[repr(transparent)]
+    pub struct IpPathFlags: u32 {
+        const RESOLVE_VIA_HOST = 1 << 0;
+        const RESOLVE_VIA_ATTACHED = 1 << 1;
+        const LOCAL = 1 << 2;
+        const ATTACHED = 1 << 3;
+        const DROP = 1 << 4;
+        const EXCLUSIVE = 1 << 5;
+        const INTF_RX = 1 << 6;
+        const RPF_ID = 1 << 7;
+        const SOURCE_LOOKUP = 1 << 8;
+        const UDP_ENCAP = 1 << 9;
+        const DEAG = 1 << 13;
+        const DVR = 1 << 14;
+        const ICMP_UNREACH = 1 << 15;
+        const ICMP_PROHIBIT = 1 << 16;
+        const CLASSIFY = 1 << 17;
+        const GLEAN = 1 << 19;
+    }
+}
+
 pub struct Ip4RoutePath {
     sw_if_index: u32,
     table_id: u32,
@@ -1527,7 +1543,7 @@ pub struct Ip4RoutePath {
     weight: u8,
     preference: u8,
     behavior: IpRoutePathBehavior,
-    flags: FibPathFlags,
+    flags: IpPathFlags,
     next_hop: Ip4NextHop,
 }
 
@@ -1538,7 +1554,7 @@ pub struct Ip6RoutePath {
     weight: u8,
     preference: u8,
     behavior: IpRoutePathBehavior,
-    flags: FibPathFlags,
+    flags: IpPathFlags,
     next_hop: Ip6NextHop,
 }
 
@@ -1620,13 +1636,13 @@ The payload contract is concrete and wire-visible, but it is a Hammer
 phase-one contract rather than a claim of byte-for-byte compatibility with
 VPP's imported `fib_path` message. A future compatibility surface may expose
 VPP's wire-only extension fields, but those fields must be decoded before the
-service FIB seam and cannot change `FibPath<N>`.
+service FIB seam and cannot change `FibPath<N, F>`.
 
 | 消息 | 字段 |
 | --- | --- |
 | `Ip4RouteAddDelRequest` | `is_add: bool`, `is_multipath: bool`, `route: { table_id: u32, prefix: IPv4 prefix, paths: repeated Ip4RoutePath }` |
 | `Ip6RouteAddDelRequest` | `is_add: bool`, `is_multipath: bool`, `route: { table_id: u32, prefix: IPv6 prefix, paths: repeated Ip6RoutePath }` |
-| `Ip4RoutePath` / `Ip6RoutePath` | `sw_if_index: u32`, `table_id: u32`, `rpf_id: u32`, `weight: u8`, `preference: u8`, `behavior: IpRoutePathBehavior`, `flags: FibPathFlags`, and concrete `next_hop: Ip4NextHop` or `Ip6NextHop`; no owner-specific extension fields |
+| `Ip4RoutePath` / `Ip6RoutePath` | `sw_if_index: u32`, `table_id: u32`, `rpf_id: u32`, `weight: u8`, `preference: u8`, `behavior: IpRoutePathBehavior`, `flags: IpPathFlags`, and concrete `next_hop: Ip4NextHop` or `Ip6NextHop`; no owner-specific extension fields |
 | `Ip4RouteLookupRequest` | `table_id: u32`, `exact: bool`, `prefix: { address: bytes(4), length: u32 }` |
 | `Ip6RouteLookupRequest` | `table_id: u32`, `exact: bool`, `prefix: { address: bytes(16), length: u32 }` |
 | `*RouteAddDelReply` | `status: IpRouteStatus`, `stats_index: u32` |
@@ -1639,7 +1655,7 @@ plugin and is decoded before the service FIB seam; it is not a service FIB type,
 an ICMP/TCP/UDP protocol number, or a next-hop protocol enum. There is no
 service-level address union.
 Each concrete route method decodes its own next-hop fields into its IP-owned
-`Ip4NextHop` or `Ip6NextHop`, then supplies the core `FibPath<N>` to the
+`Ip4NextHop` or `Ip6NextHop`, then supplies the core `FibPath<N, F>` to the
 generic FIB. Owner-specific extensions are outside this phase-one payload; an
 unsupported extension is rejected as `PathInvalid` rather than silently
 retained in the core path. The IP owner resolves the supported core facts. Ordinary route
@@ -1667,9 +1683,10 @@ chooses the graph protocol while projecting its resolved concrete DPO.
 The route methods use the registered API source internally; a client cannot
 submit an arbitrary source id. `table_id` is the external table name and is
 never treated as a `fib_index`. Paths carry raw `sw_if_index`, concrete
-owner-supplied next-hop facts, weight, preference and VPP path flags. The IP
+owner-supplied next-hop facts, weight, preference and owner-defined path flags.
+The IP
 handler validates those facts and gives the generic FIB service-owned
-`FibPath<N>` values;
+`FibPath<N, F>` values;
 the IP resolver later produces concrete `DpoId` identities. No DPO message
 field contains an IP, ICMP, TCP, or UDP plugin type.
 
@@ -1756,7 +1773,7 @@ VPP C type or field layout literally.
 | `mfib_table_t`, `mfib_entry_t` | `Ip4Main` / `Ip6Main` | separate multicast table/entry/path state, RPF/interface flags and replicate-DPO projection; never fields of the unicast `FibTable` |
 | `fib_main_t`, `fib_table_t`, `fib_entry_t`, `fib_entry_src_t`, `fib_path_list_t` | `hammer-service::net::fib` | source contributions, per-entry source records, entry attributes, configured path-list sharing, recursive dependencies, back-walk and the current forwarding `DpoId`; service DPO owns generic objects and the concrete protocol owner supplies path interpretation |
 | `fib_entry_delegate_t`, cover/track, attached export/import | `hammer-service::net::fib` | lazily created optional forwarding chains, covered-entry lists, tracker siblings, BFD state and cross-table cover propagation; updates are failure-atomic |
-| `fib_path_ext_t` | source/feature owner of the extension | `(entry, source, path_index)` association and owner-specific resolve/stack/flush; extension data does not enter `FibPath<N>` |
+| `fib_path_ext_t` | source/feature owner of the extension | `(entry, source, path_index)` association and owner-specific resolve/stack/flush; extension data does not enter `FibPath<N, F>` |
 | `fib_urpf_list_t` | `hammer-service::net::fib` | baked read-only interface/adjacency facts shared by forwarding objects |
 | `dpo_vfts`, `dpo_nodes`, `dpo_edges` | `hammer-service::net::dpo` plus owner-local object operations | class slots, declared per-link nodes, derived class/proto edges, and compact identity; no plugin object bytes or generic lifecycle callbacks |
 | `ip_adjacency_t`, `adj_nbr_*` | `hammer-service::net::dpo` plus protocol-specific producers | one shared generic adjacency layout per concrete address/rewrite instantiation with normal/incomplete/midchain/glean/multicast class slots; IP/tunnel/multicast owners supply the concrete address and rewrite types, child, and policy facts |
@@ -2210,19 +2227,18 @@ open architecture choices.
 | DPO identity width was underspecified | VPP `dpo_id_t` is `{type, proto, next, index}` and is asserted to fit in one `u64`; the current Hammer `Dpo<N>` is generic and is not that ABI shape | A generic next type can silently make atomic identity publication impossible and lets callers confuse an identity with an object | The target is one non-generic `DpoId` with `u8/u8/u16/u32` fields and an 8-byte size assertion; current `Dpo<N>` is a breaking migration item |
 | Projection ownership was hidden behind a broad backend sentence | VPP FIB passes a complete DPO identity to the protocol backend, while concrete DPO pools remain class-local | A service FIB implementation could accidentally own or erase class objects, recreating the rejected object store abstraction | `project_forwarding` returns `DpoId`; layouts/class rules live in service net, the concrete instantiating owner owns each pool and its retention roots, and service FIB stores only the identity |
 | The class key was described as a closed static type | VPP reserves built-in `dpo_type_t` values but allocates plugin classes with `dpo_register_new_type()`; the key selects `dpo_vfts`/`dpo_nodes` and does not contain object bytes | A public static IP/DPO class table would prevent independent plugin DPO classes and make service net own IP knowledge | `DpoType(u8)` is opaque; `DpoMain` allocates keys monotonically for core and plugin registrations, while concrete owners retain the returned key |
-| Next-hop encoding was mixed into the service/FIB seam | VPP's API `fib_path.proto` exists only to decode a wire address union; it is converted before the FIB path is installed, while `dpo_proto_t` selects graph nodes | A service `FibPathNhProto`/`FibPathNh` would couple generic FIB and DPO to IP address representation and confuse wire decoding with graph dispatch | Wire path payloads are concrete `Ip4RoutePath`/`Ip6RoutePath`; the service stores only `FibPath<N>` with an owner-supplied next-hop value. `DpoProto` remains solely the graph protocol discriminator |
+| Next-hop and path flags were mixed into the service/FIB seam | VPP's API `fib_path.proto` exists only to decode a wire address union; it is converted before the FIB path is installed, while `dpo_proto_t` selects graph nodes | A service `FibPathNhProto`/`FibPathNh` or fixed `FibPathFlags` would couple generic FIB and DPO to IP address and route-policy representation | Wire path payloads are concrete `Ip4RoutePath`/`Ip6RoutePath`; the service stores only `FibPath<N, F>` with owner-supplied next-hop and flags values. `DpoProto` remains solely the graph protocol discriminator |
 | Address storage was reduced to an erased byte value | VPP's `receive_dpo_t` and adjacency carry address-shaped facts, but their C union is an implementation choice; a Rust service seam must preserve the producer's concrete value and interpretation | `Box<[u8]>` hides the address contract, forces runtime validation outside the type, and makes a copied DPO identity unable to state which concrete pool owns its index | Remove the empty `Address` trait. `ReceiveDpo<A>` and `AdjacencyDpo<A, R>` store producer-owned concrete values in monomorphized pools selected by `DpoType`; local pool operations add only the bounds they need. No `dyn`, byte erasure, address-family enum, or `DpoProto` conversion is added |
-| Protocol-specific path data leaked into the generic path shape | VPP keeps the core `fib_path_t` separate from `fib_path_ext_t`; protocol-specific facts are decoded or retained by their owner | A concrete extension field makes the service FIB depend on one protocol and falsely turns one extension into a universal path fact | `FibPath<N>` and the phase-one IP route payloads contain no owner-specific extension data; each future owner defines its own extension and publication lifecycle |
+| Protocol-specific path data leaked into the generic path shape | VPP keeps the core `fib_path_t` separate from `fib_path_ext_t`; protocol-specific facts are decoded or retained by their owner | A concrete extension or flag field makes the service FIB depend on one protocol and falsely turns one extension or policy set into a universal path fact | `FibPath<N, F>` and the phase-one IP route payloads contain no service-owned path-policy bits or owner-specific extension data; each owner defines its own flags and extension lifecycle |
 | DSO image loading was assigned to the wrong layer | Current symbol lookup is `GlobalMain -> PluginMain::get_plugin_symbol`; `hammer-runtime` cannot import service-owned types | `NetMain` cannot independently load a DSO without violating dependency direction | The existing `RegistrationImage` is loaded through `GlobalMain`/`PluginMain`; its ordered init functions call `NetMain` directly, and the runtime only keeps the DSO alive |
 | The acceptance list mixed the whole target with one migration | The current checkout has no service FIB, split ICMP DSO, or Net proc-macro implementation, while the old `FibTableBuilder` and fixed device path remain | One issue would be unreviewable and would encourage speculative scaffolding | Phase 1 now gates only the split seams, concrete FIB/DPO identity behavior, Binary API ownership, and focused tests; later VPP surfaces are explicitly deferred |
 | A duplicate service-side DPO class/reference layer was added without a real owner | VPP keeps class/node arrays, while object pools and operations stay with each concrete class | The layer duplicates `DpoMain` state and invites a generic C-style lifetime API | Remove the duplicate layer and callbacks; `DpoMain` stores class/node/edge metadata directly and each concrete owner orders pool retirement |
-| Per-entry source contribution state was implicit | VPP `fib_entry_t` stores a vector of `fib_entry_src_t`; that record carries `fes_path_exts`, the source path-list link, entry/source flags, `fes_ref_count`, and source-specific union data | Without an explicit record, source precedence, duplicate add/remove, cover tracking, owner payload association, and extension replacement have no owner | Add owner-instantiated `FibEntrySrc<N, SourceData, PathExt>` records with the complete common fields and direct cover tuple plus optional interpose DPO; entries retain `(FibSource, u32)` slots, and the behavior tag dispatches to the matching typed pool without a central union or `dyn` |
+| Per-entry source contribution state was implicit | VPP `fib_entry_t` stores a vector of `fib_entry_src_t`; that record carries `fes_path_exts`, the source path-list link, entry/source flags, `fes_ref_count`, and source-specific union data | Without an explicit record, source precedence, duplicate add/remove, cover tracking, owner payload association, and extension replacement have no owner | Add owner-instantiated `FibEntrySrc<N, F, SourceData, PathExt>` records with the complete common fields and direct cover tuple plus optional interpose DPO; entries retain `(FibSource, u32)` slots, and the behavior tag dispatches to the matching typed pool without a central union or `dyn` |
 | Cover/interpose facts were modeled as source behavior | VPP selects a behavior from `fib_source_get_behaviour` and separately overrides it for `FIB_ENTRY_FLAG_INTERPOSE`; cover/sibling fields are facts used by several behaviors | An enum variant made `Cover`/`Interpose` look like mutually exclusive behaviors and could discard RR/interface/adjacency-specific lifecycle rules | Delete `FibEntrySrcRelation`; `FibEntrySrc` stores the direct `cover` tuple and optional `interpose_dpo`, while `FibSource.behavior` remains the only behavior selector |
-| One table-wide payload type could not represent VPP's heterogeneous sources | VPP uses a source union and a behavior-indexed VFT; a Rust `Vec` cannot hold different `SourceData`/`PathExt` instantiations without erasure | The previous `FibTable` description was not implementable while also forbidding a central enum and `dyn` | Each behavior owner stores `FibEntrySrc<N, SourceData, PathExt>` in its typed pool; entries retain only `(FibSource, u32)` slots; a closed behavior match calls monomorphized code, and a new behavior requires an explicit service change |
 | Copyable DPO identity had no last-reference mechanism | VPP locks the new `dpo_id_t` before atomically replacing the old one and unlocks the previous identity; copies can live in FIB, buckets and child objects | `Copy` plus a worker barrier cannot discover the last copied identity, so “Drop handles it” would permit premature retirement | Every concrete pool owner counts published roots, retains the new root before replacement, releases the old root after publication, and retires only at zero after worker quiescence; no generic reference type or manual unlock API |
 | DPO pool ownership was ambiguous | VPP class/node metadata is separate from class-local object pools and operations | A service-owned pool for a generic layout would either own foreign payloads or require an erased object store | `DpoMain` owns metadata; service owns only service-valued pools such as lookup/load-balance; the module instantiating `A`/`R` owns that concrete pool, root counts and object operations |
-| FIB priority and flags were not VPP-shaped | VPP `fib_source_t` carries one `fib_source_priority_t` byte, and its entry/source/path-list/path flags are bit masks | Separate priority class/slot fields add a non-VPP ordering model; tuple/u8 flags hide width and bit-value contracts | `FibSource` now has one `priority: u8`; all target flag families use `bitflags!` with explicit underlying widths and VPP bit values; excluded MPLS/BIER/PW path bits remain out of scope |
-| IP route path behavior leaked into service FIB | Path behavior is a wire/API decode concern; service FIB stores configured path facts and owner-supplied next-hop values | `FibPathType` made service net own IP actions and mixed them with generic path data | Replace it with IP-owned `IpRoutePathBehavior`; decode special actions before constructing `FibPath<N>`, retain action data in the IP source owner, and project it through the IP-owned `IpNullDpo` class |
+| FIB priority and flags were not VPP-shaped | VPP `fib_source_t` carries one `fib_source_priority_t` byte, while graph-state flags and protocol path flags are separate bit masks | Separate priority class/slot fields add a non-VPP ordering model; tuple/u8 flags hide width and bit-value contracts; a fixed service `FibPathFlags` would couple IP policy to the FIB | `FibSource` now has one `priority: u8`; service graph flags use `bitflags!` with explicit widths, while each business owner defines its own path flags (`IpPathFlags` for IP); excluded MPLS/BIER/PW path bits remain out of scope |
+| IP route path behavior leaked into service FIB | Path behavior is a wire/API decode concern; service FIB stores configured path facts and owner-supplied next-hop and flags values | `FibPathType` or a fixed `FibPathFlags` made service net own IP actions and mixed them with generic path data | Replace them with IP-owned `IpRoutePathBehavior` and `IpPathFlags`; decode both before constructing `FibPath<N, F>`, retain action data in the IP source owner, and project it through the IP-owned `IpNullDpo` class |
 | IP-null ownership and node behavior were underspecified | VPP's `ip_null_dpo.c` combines a fixed action record with per-protocol `ip4-null`/`ip6-null` nodes, rate limiting and ICMP error nexts | Omitting the object or its node contract either loses explicit-drop semantics or leaves the ICMP/error path undefined | Keep `IpNullDpo` and its immutable action table in `hammer-plugins/net/ip`; define separate `Ip4NullNode`/`Ip6NullNode` adapters, worker-local rate limiting, exact ICMP mappings and drop fallback |
 | PMTU DPO/node shape was incomplete | VPP `ip_pmtu_dpo_t` contains protocol, PMTU, lock count and stacked DPO; `ip_pmtu_dpo_inline` rewrites TX state, traces packet size, fragments, handles IPv4 DF and enqueues generated/original buffers | A parent-only DPO sketch could lose stacked dispatch, lifecycle accounting or fragment/error ownership | `IpPmtuDpo` now names `stacked` and owner-local `published_roots` (the `ipm_locks` reason, not a mutex); `Ip4PmtuNode`/`Ip6PmtuNode` specify the complete VPP fragment, DF/ICMP, drop, trace and buffer enqueue flow |
 | DPO/FIB layout and hot-path cost were unspecified | VPP aligns pool elements and places switch-path fields first; `load_balance_t` keeps four inline buckets and fits in one cacheline, while `ip_adjacency_t` separates hot, rewrite and control groups; Hammer already has 64-byte alignment and opaque-budget assertions | Without an explicit contract, a Rust port can add fat-pointer indirection, map lookups, packet-path allocation, or oversized metadata while still appearing ownership-correct | Reuse `CacheLineAlignMark`, keep `DpoId` at 8 bytes, inline four load-balance buckets, keep overflow storage owner-local, forbid control-plane traversal/allocation in packet lookup, and require concrete size/alignment assertions; no performance number is claimed without a release benchmark |
@@ -2270,10 +2286,11 @@ next enum, `thread_local!` local registration, atomic FIB handle, or
 | --- | --- | --- | --- | --- |
 | 类型 | `hammer-plugins/net/icmp::IcmpMain` | ICMP owner-local Main，保存 ICMP 控制状态 | 新 DSO；无旧 ABI 兼容层 | DSO lifecycle and global access integration test |
 | 类型 | `hammer-plugins/net/ip::{Ip4Main,Ip6Main}` | 两个 concrete implementation Main；分别保存 lookup-main、unicast FIB、MFIB owner、table map、per-interface bind 和本地 feature/local-next 状态；本 ADR 只规定 unicast FIB | 从当前混合 `IpMain` 控制面拆出；不拆为两个 DSO | owner lifecycle and per-proto lookup tests |
+| 类型 | `hammer-plugins/net/ip::IpPathFlags` | IP-owned `bitflags!` path-policy bits (`u32`), including resolve, local/drop, interface-RX, source-lookup, encapsulation, ICMP, classify and glean actions | 从 service `FibPathFlags` 移出；Binary API 与 `FibPath<N, F>` 使用具体 `IpPathFlags` | bit-width/value and IP route decoding tests |
 | 类型 | `hammer-service::net::dpo::{DropDpo,PuntDpo}` | service-owned stateless DPO classes；per-protocol singleton IDs | 新增 concrete class surfaces；不通过统一 `DpoKind` 兼容 | singleton identity and graph-next tests |
 | 类型 | `hammer-service::net::dpo::{ReceiveDpo<A>,AdjacencyDpo<A,R>}` | 通过 producer-owned concrete `A`/`R` 形成静态 DPO layout；net 只保存并借用值，不定义 `Address` trait、canonical 方法、family tag 或 wire encoding | 新增 generic net seam；每个 class owner 以具体 `A`/`R` 实例化自己的 pool，旧 IP-owned fixed byte/address fields 删除 | compile-time generic pool/type checks and concrete producer validation tests |
-| 类型 | `hammer-service::net::fib::FibEntrySrc<N,SourceData,PathExt>` | owner-instantiated per-source record；保存 `path_exts`、path-list link、entry/source flags、`source`、重复添加 `ref_count`、直接 `cover` 元组与可选 `interpose_dpo`、owner-supplied `SourceData` | 新增 service FIB record；`FibEntry` 只保留 `(FibSource, u32)` source slots 以容纳异构具体记录；cover/sibling facts 不再由额外类型承载，也不使用中心 union 或 `dyn` | source precedence, duplicate add/remove, source-data/cover/interpose validation, extension replacement, cover/interpose, and failure-atomic lifecycle tests |
-| 类型 | `hammer-service::net::fib::{FibEntryFlags,FibEntrySrcFlags,FibPathListFlags,FibPathFlags}` 与 `hammer-service::net::dpo::LoadBalanceFlags` | 使用 `bitflags!` 的透明整数 flags；分别为 entry `u16`、source `u16`、path-list `u8`、route-path `u32`、load-balance `u8`，位值对齐 VPP；IP 阶段只保留 IPv4/IPv6 相关 path bits，MPLS/BIER/PW bits 不进入本设计 | 替代手写 tuple/裸 `u8` flags；无 wire 兼容层，Binary API 在 owner 边界解码 | compile-time width/bit-value assertions and FIB/DPO flag transition tests |
+| 类型 | `hammer-service::net::fib::FibEntrySrc<N,F,SourceData,PathExt>` | owner-instantiated per-source record；保存 `path_exts`、path-list link、entry/source flags、`source`、重复添加 `ref_count`、直接 `cover` 元组与可选 `interpose_dpo`、owner-supplied `SourceData` | 新增 service FIB record；`FibEntry` 只保留 `(FibSource, u32)` source slots 以容纳异构具体记录；cover/sibling facts 不再由额外类型承载，也不使用中心 union 或 `dyn` | source precedence, duplicate add/remove, source-data/cover/interpose validation, extension replacement, cover/interpose, and failure-atomic lifecycle tests |
+| 类型 | `hammer-service::net::fib::{FibEntryFlags,FibEntrySrcFlags,FibPathListFlags}` 与 `hammer-service::net::dpo::LoadBalanceFlags` | 使用 `bitflags!` 的透明整数 flags；分别为 entry `u16`、source `u16`、path-list `u8`、load-balance `u8`，位值对齐 VPP；路径策略位不在 service net 定义 | 替代手写 tuple/裸 flags；无 wire 兼容层，service 只处理自身图状态 | compile-time width/bit-value assertions and FIB/DPO state tests |
 | 类型 | `hammer-service::net::dpo::{LookupDpo,ReceiveDpo}` | service-owned generic layouts and class rules；`ReceiveDpo<A>` 直接保存 producer-owned `A`，具体 class owner 绑定其 monomorphized pool | 新增 service DPO class layouts；class owner/local node consume typed pool | object allocation, owner retirement, concrete type checks, and graph-next tests |
 | 类型 | `hammer-service::net::dpo::{AdjacencyDpo,LoadBalanceDpo}` | generic layouts and class rules；`AdjacencyDpo<A, R>` 的 normal/incomplete/midchain/glean/mcast 使用同一 layout 的 class keys，并保存 producer-owned `A` next-hop 与 `R` rewrite；具体 `A`/`R` pool owner 负责 midchain restack/unstack、child ordering 和 published-root retention；load-balance 热字段前置、四个 child `DpoId` inline、power-of-two mask，超过四个 bucket 使用 contiguous owner-local overflow storage，并保留 baked uRPF facts | 替代 IP-owned `Adjacency`/`LoadBalance` 构造面；不新增 subtype pool 或 load-balance-map DPO class；具体布局需通过 size/alignment/offset assertions | DPO pool, subtype producer, concrete address/rewrite type checks, midchain restack, uRPF/map update, layout and projection integration tests |
 | 类型 | `hammer-service::net::FibTableBackend` | 唯一的静态 dispatch seam：控制面 prefix 到 `fib_entry` index、packet address 到 entry `dpoi_index: u32`、cover replacement，以及 owner-specific projection；`project_forwarding` 返回 `DpoId`，trait 不接收 plugin pool 或 erased object operation | `Ip4FibBackend`/`Ip6FibBackend` 各自实现；无 `dyn`、额外 forwarding adapter 或 family facade | compile-time implementation and projection failure-atomicity checks |
@@ -2283,7 +2300,7 @@ next enum, `thread_local!` local registration, atomic FIB handle, or
 | 类型 | `hammer-plugins/net/ip::{IpPmtu,IpPmtuFlags,IpPmtuDpo,Ip4PmtuNode,Ip6PmtuNode}` | VPP `ip_pmtu_t` FIB tracker 与 `ip_pmtu_dpo_t` 实际对象池；`IpPmtuFlags` 使用 `bitflags!` 的透明 `u8`（`ATTACHED`、`REMOTE`、`STALE`）；DPO 保存 `proto`、`pmtu`、`published_roots`（对应 VPP `ipm_locks` 的生命周期计数）和 `stacked: DpoId`；两个 concrete PMTU nodes 共享私有编排，分别执行 IPv4/IPv6 fragment、DF/ICMP-error/drop 分支和 trace | 从 `hammer-service::net::pmtu::PathMtuCache` 迁移到 IP owner；ICMP/TCP 改用 typed IP seam；无手工 `unlock` 或 mutex API | PMTU DPO fields, flag width/values, root-retirement, fragment success/failure, DF ICMP and adjacency MTU/FIB back-walk tests |
 | 类型 | `hammer-plugins/net/ip::{Ip4RouteAddDelRequest,Ip6RouteAddDelRequest,Ip4RouteLookupRequest,Ip6RouteLookupRequest}` | Binary API 的具体 IPv4/IPv6 请求；包含 `is_add`/`is_multipath`、外部 `table_id`、具体 prefix/address 和 paths/exact；route add/delete 的 source 由 handler 固定为 `FIB_SOURCE_API`，不在 wire payload 暴露 | 新 Binary API payload；不引入统一 family 枚举 | prost encode/decode and invalid-field tests |
 | 类型 | `hammer-plugins/net/ip::{Ip4RouteAddDelReply,Ip6RouteAddDelReply,Ip4RouteLookupReply,Ip6RouteLookupReply}` | 返回 owner-defined status、stats 和匹配 route/path facts；不序列化 selected DPO；状态不复用 display string | 新 payload；envelope status 仍由 `hammer-ipc` 定义 | reply status and context tests |
-| 类型 | `hammer-plugins/net/ip::{Ip4RoutePath,Ip6RoutePath,IpRoutePathBehavior,IpRouteStatus}` | concrete IP-owned Binary API path payloads and phase-one path behavior; decoded into service `FibPath<Ip4NextHop>`/`FibPath<Ip6NextHop>`; no service-level path-behavior enum, next-hop protocol, address union, or owner-specific extension | 新 Binary API nested messages/enums；无旧 wire 兼容层；owner-specific extension API 另行设计 | prost schema and status mapping tests |
+| 类型 | `hammer-plugins/net/ip::{Ip4RoutePath,Ip6RoutePath,IpRoutePathBehavior,IpRouteStatus}` | concrete IP-owned Binary API path payloads and phase-one path behavior; decoded into service `FibPath<Ip4NextHop, IpPathFlags>`/`FibPath<Ip6NextHop, IpPathFlags>`; no service-level path-behavior enum, next-hop protocol, address union, or owner-specific extension | 新 Binary API nested messages/enums；无旧 wire 兼容层；owner-specific extension API 另行设计 | prost schema and status mapping tests |
 | API | `#[derive(FibSource)]` / `#[derive(DpoClass)]` | 生成直接调用 owner `InitFunction`；不生成 registration record 或 ABI image | 替代手写 forwarding registration arrays | proc-macro compile and DSO inventory test |
 | API | `ip4.route.add_del` / `ip6.route.add_del` | Binary API handler；按 VPP add/delete + multipath 语义增量修改 FIB graph 和 forwarding backend | 新方法名；客户端迁移到具体方法 | end-to-end Binary API route mutation test |
 | API | `ip4.route.lookup` / `ip6.route.lookup` | Binary API handler；按 `table_id` 和 `exact` 读取 non-forwarding FIB entry，返回匹配 route/path/stats facts；不返回 selected DPO | 新方法名；客户端迁移到具体方法 | LPM/exact and route-facts reply test |
@@ -2308,7 +2325,7 @@ next enum, `thread_local!` local registration, atomic FIB handle, or
 | 类型/API | `hammer-plugins/net/ip::forwarding::DpoKind` 与通用 `Dpo` 构造入口 | 删除泛化 kind-to-index/通用构造路径；具体 DPO 通过 `From` 生成 `DpoId` | breaking source migration；不保留 generic alias | compile-time API removal and concrete conversion tests |
 | 类型 | `ForwardingMetadata` | 移入 service net，仅保留 DPO/FIB facts 与 TX interface contract；不携带 adjacency/load-balance对象 | IP lookup/rewrite 改用 service metadata | lookup/rewrite integration test |
 | 类型 | `hammer-plugins/net/ip::AdjacencyRewriteNode` | 拆为 `Ip4RewriteNode`/`Ip6RewriteNode`；DPO class 只保存 service metadata，节点通过私有泛型核心共享编排并保留 IP-specific policy | 类型迁移为删除旧项 + 新增两项；不保留旧 node alias | per-proto graph inventory and behavior test |
-| 类型 | `FibSource`, `FibEntry`, `FibPathList`, `FibPath`, `FibTable` | 从 IP plugin 的快照 builder 改为 service-owned 增量 source/entry/path graph；`FibPath<N>` 的 `N` 由具体 IP backend 提供，service 不定义 next-hop protocol/union，也不把扩展塞进共享 path；`FibEntry` 通过 `(FibSource, u32)` slots 连接 owner-instantiated `FibEntrySrc<N,SourceData,PathExt>` records；entry delegates cover optional chains, trackers, BFD and attached import/export；`FibTable` 静态组合唯一的 `FibTableBackend` seam，entry 保存当前 forwarding-chain `DpoId`，backend 使用其 identity 更新 concrete forwarding store | IP4/IP6 backend 分别实现；无 family facade 或独立 forwarding adapter；现有 route snapshot callers 迁移为 source/path operations；异构 source payloads remain in typed owner pools, not a service union or erased map | LPM, source precedence, behavior dispatch, source-data/cover/interpose validation, path-extension replacement, delegate/cover tracking, back-walk, and DPO projection tests |
+| 类型 | `FibSource`, `FibEntry`, `FibPathList`, `FibPath`, `FibTable` | 从 IP plugin 的快照 builder 改为 service-owned 增量 source/entry/path graph；`FibPath<N, F>` 的 `N` 与 `F` 由具体 backend/业务 owner 提供，service 不定义 next-hop protocol/union/path-policy flags，也不把扩展塞进共享 path；`FibEntry` 通过 `(FibSource, u32)` slots 连接 owner-instantiated `FibEntrySrc<N,F,SourceData,PathExt>` records；entry delegates cover optional chains, trackers, BFD and attached import/export；`FibTable` 静态组合唯一的 `FibTableBackend` seam，entry 保存当前 forwarding-chain `DpoId`，backend 使用其 identity 更新 concrete forwarding store | IP4/IP6 backend 分别实现并提供 `IpPathFlags`；无 family facade 或独立 forwarding adapter；现有 route snapshot callers 迁移为 source/path operations；异构 source payloads remain in typed owner pools, not a service union or erased map | LPM, source precedence, behavior dispatch, source-data/cover/interpose validation, path-extension replacement, delegate/cover tracking, back-walk, and DPO projection tests |
 | 类型 | `IpMain` | 改为 `OnceLock<IpMain>` owner；移除 FIB contributions、table handle 和 graph publication；只持有 generic IP protocol 与 TCP/UDP port registries | 删除 `ArcSwapOption<IpMain>`；调用方迁移到 `init/global`，并按 `Ip4Main`/`Ip6Main` 访问 concrete table | initialization and owner-separation test |
 | 类型 | `hammer-service::binary_api::BinaryApiMethodEntry` dispatch contract | FIB-touching methods 保持 `mp_safe = false`；由 dispatcher 统一进入宏，handler 不再承担同步职责 | 现有 envelope/ABI 不变；方法注册迁移 | mp-safe/non-mp-safe dispatch test |
 | 类型 | `NetMain` / `DeviceMain` | 改为按值 `OnceLock<Main>`；NetMain 直接承载 DPO/FIB class metadata 和 local0 | 删除 `OnceLock<Arc<_>>` | duplicate-init and ownership compile checks |
@@ -2326,6 +2343,7 @@ next enum, `thread_local!` local registration, atomic FIB handle, or
 | --- | --- | --- | --- | --- |
 | 类型/API | `hammer-plugins/net/ip::ip::icmp::*` 的 IP-owned ICMP module surface | ICMP nodes、control state、ICMP exports 移至 `hammer-plugins/net/icmp` | 无 compatibility re-export；ICMP callers 改依赖新 DSO | workspace compile and DSO export test |
 | 类型 | `hammer-service::net::fib::FibEntrySrcRelation` | 删除独立的 cover/sibling/interpose 关系枚举；cover/sibling 事实直接存放在 `FibEntrySrc.cover` 元组，interpose 事实存放在可选的 `FibEntrySrc.interpose_dpo` | 无兼容 alias；实现直接迁移到字段访问，文档和源码不得保留该类型 | 文档 inventory 检查、源码编译和 source-lifecycle 行为测试 |
+| 类型 | `hammer-service::net::fib::FibPathFlags` | 删除 service-owned 的固定路径策略位集合；路径 flags 改为 `FibPath<N, F>` 的 owner-supplied `F` | IP callers 迁移到 `hammer-plugins/net/ip::IpPathFlags`；无兼容 alias | generic FIB compile check and IP route flag tests |
 | 类型/API | `hammer-service::device::DeviceInputNext::{Ip4Input,Ip6Input}` | 删除 service 固定 IP next | device callback 选择具体 parser/next | graph inventory and RX integration test |
 | 类型/API | service-owned `DeviceInputNode` fixed protocol path | 删除固定 service input implementation；由 device plugin 提供 RX node | TUN/device plugins migrate to own node | device DSO graph test |
 | 类型/API | `hammer-plugins/net/ip::{AdjacencyRewriteNext,register_adjacency_rewrite}` | 删除单一 adjacency rewrite 节点及其注册入口 | 迁移为 IP4/IP6 concrete node registration；DPO metadata 由 `NetMain` 消费 | graph registration compile/inventory test |
@@ -2363,7 +2381,7 @@ phased; its first phase is the only completion gate for the current migration.
    node, while RX/TX `sw_if_index` and the independent `fib_index` survive the
    IP path.
 3. The service FIB owns source/path/entry precedence, per-entry source slots
-   backed by owner-instantiated `FibEntrySrc<N, SourceData, PathExt>` records
+   backed by owner-instantiated `FibEntrySrc<N, F, SourceData, PathExt>` records
    with the complete VPP common fields, the direct cover tuple and optional interpose DPO, and owner-supplied
    source data, and back-walk state;
    concrete IPv4/IPv6 owners provide LPM storage and DPO projection through
@@ -2373,7 +2391,7 @@ phased; its first phase is the only completion gate for the current migration.
    bearing service DPOs are monomorphized over the producer's concrete address
    type; no fixed IPv4/IPv6 byte array, address trait, or erased address crosses
    that seam. Source path extensions are per-record and support add/remove/find,
-   resolve, stack, and flush without a fixed label field in `FibPath<N>`.
+   resolve, stack, and flush without a fixed label field in `FibPath<N, F>`.
 4. `DpoId` is a non-generic eight-byte `Copy + Clone` identity. `DpoMain`
    stores class/node/edge metadata directly; concrete pool-backed DPO owners
    retain published roots, create, publish, and retire their actual objects
@@ -2426,7 +2444,7 @@ different architecture:
 - The phase-one route contract deliberately excludes owner-specific path
   extensions. A future protocol owner may add a separate Binary API and
   `fib_path_ext_t`-shaped owner state, but it must not add protocol fields or an
-  extension type to service `FibPath<N>` or the IP4/IP6 core route payloads.
+  extension type to service `FibPath<N, F>` or the IP4/IP6 core route payloads.
 - The final prost tag numbers and whether the existing client needs a bounded
   multi-reply extension for route dumps must be fixed before implementation.
   The four method names, field meanings, status categories, and barrier rule
@@ -2495,9 +2513,9 @@ different architecture:
   seam. `ReceiveDpo<A>` and `AdjacencyDpo<A, R>` store `A` directly in
   monomorphized pools; net does not require an address trait, family tag, byte
   representation, or canonicalisation method.
-- Next-hop wire decoding is owned by the IP route API. The service FIB accepts
-  only `FibPath<N>` with an owner-supplied next-hop value; it has no
-  `nh_proto`/address union.
+- Next-hop wire decoding and path-flag decoding are owned by the IP route API.
+  The service FIB accepts only `FibPath<N, F>` with owner-supplied next-hop and
+  flags values; it has no `nh_proto`/address union or path-flag bit set.
 - `LookupDpo`, `ReceiveDpo`, `AdjacencyDpo`, and `LoadBalanceDpo` are
   service-net DPO layouts and class rules. The concrete class owner stores each
   monomorphized pool and its producer payload; IP, tunnel, and multicast owners
