@@ -42,7 +42,12 @@ hammer_component_macros::declare_plugin!(
     main_loop_enter_functions = [],
     main_loop_exit_functions = [],
     worker_init_functions = [],
-    graph_nodes = [],
+    graph_nodes = [
+        hammer_plugin_ip::ip::icmp::__IP_GRAPH_NODE_ICMP_INPUT_NODE,
+        hammer_plugin_ip::ip::icmp::__IP_GRAPH_NODE_ICMP_ECHO_REQUEST_NODE,
+        hammer_plugin_ip::ip::icmp::__IP_GRAPH_NODE_ICMP_PATH_MTU_NODE,
+        hammer_plugin_ip::ip::icmp::__IP_GRAPH_NODE_ICMP_ERROR_NODE,
+    ],
     node_functions = [],
     process_nodes = [],
     binary_api_methods = []

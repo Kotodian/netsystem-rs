@@ -2091,7 +2091,7 @@ fn expand_graph_node(args: GraphNodeArgs, ident: &Ident, item: Item) -> Result<T
     };
 
     let registration = quote! {
-        pub(crate) static #static_ident: ::hammer_runtime::NodeEntry =
+        pub static #static_ident: ::hammer_runtime::NodeEntry =
             ::hammer_runtime::NodeEntry {
             registration: #node_registration,
             kind: #node_kind,

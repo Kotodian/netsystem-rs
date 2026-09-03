@@ -1,8 +1,7 @@
 use std::mem::transmute;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
 
-use arc_swap::ArcSwapOption;
 use hammer_core::data_plane::{
     BufferFrame, DEFAULT_BUFFER_FRAME_CAPACITY, Index, NodeHandle, NodeId, NodeNext,
 };
@@ -178,10 +177,10 @@ struct IpReassemblyMain {
     per_thread_data: Vec<SpinLock<IpReassemblyWorker>>,
 }
 
-static IP_REASSEMBLY_MAIN: ArcSwapOption<IpReassemblyMain> = ArcSwapOption::const_empty();
+static IP_REASSEMBLY_MAIN: OnceLock<IpReassemblyMain> = OnceLock::new();
 
 impl IpReassemblyMain {
-    fn new(worker_count: usize, config: &ReassemblyConfig) -> Arc<Self> {
+    fn new(worker_count: usize, config: &ReassemblyConfig) -> Self {
         let directory = Arc::new(IpReassemblyDirectory::new(
             u32::try_from(config.max_reassemblies).unwrap_or(u32::MAX),
         ));
@@ -198,7 +197,7 @@ impl IpReassemblyMain {
                 last_id: 0,
             }));
         }
-        Arc::new(Self { per_thread_data })
+        Self { per_thread_data }
     }
 
     fn worker_slot(runtime: &DataPlaneMain) -> usize {
@@ -239,7 +238,9 @@ fn configure_ip_reassembly(
 ) -> RuntimeResult<()> {
     config.ip.reassembly.validate()?;
     let main = IpReassemblyMain::new(engine.configured_worker_count(), &config.ip.reassembly);
-    IP_REASSEMBLY_MAIN.store(Some(main));
+    IP_REASSEMBLY_MAIN
+        .set(main)
+        .map_err(|_| RuntimeError::PluginStateNotInitialized { plugin: "ip" })?;
     Ok(())
 }
 
@@ -268,7 +269,7 @@ pub(crate) enum IpReassemblyError {
     runs_before = ["install_packet_graph"]
 )]
 fn init_ip_reassembly() -> RuntimeResult<()> {
-    if IP_REASSEMBLY_MAIN.load().is_none() {
+    if IP_REASSEMBLY_MAIN.get().is_none() {
         return Err(RuntimeError::PluginStateNotInitialized { plugin: "ip" });
     }
     Ok(())
@@ -321,7 +322,7 @@ impl IpReassemblyNode {
     #[inline]
     pub fn expire(&mut self, runtime: &DataPlaneMain, now: Instant) -> usize {
         IP_REASSEMBLY_MAIN
-            .load_full()
+            .get()
             .map(|main| main.expire_worker(runtime, now))
             .unwrap_or(0)
     }
@@ -341,7 +342,7 @@ async fn ip_reassembly_expire_process(
     // VPP `ip4_full_reass_walk_expired` reads the module-global main directly;
     // the config phase stores it before Process Nodes start.
     let main = IP_REASSEMBLY_MAIN
-        .load_full()
+        .get()
         .ok_or(RuntimeError::PluginStateNotInitialized { plugin: "ip" })?;
     loop {
         let _ = context
@@ -756,10 +757,9 @@ fn ip_reassembly_process(
     _data: NodeRuntimeData,
     frame: &mut BufferFrame,
 ) -> () {
-    IP_REASSEMBLY_MAIN
-        .load_full()
-        .map(|main| main.process_frame(runtime, frame))
-        .unwrap_or(())
+    if let Some(main) = IP_REASSEMBLY_MAIN.get() {
+        main.process_frame(runtime, frame);
+    }
 }
 
 struct FragmentContext {

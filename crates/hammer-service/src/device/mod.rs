@@ -24,8 +24,9 @@ pub enum DeviceError {
     Runtime(#[from] RuntimeError),
 }
 
+#[derive(Clone)]
 pub struct DeviceMain {
-    workers: Vec<AtomicU64>,
+    workers: Arc<Vec<AtomicU64>>,
     first_worker_thread_index: usize,
     last_worker_thread_index: usize,
     next_worker_thread_index: usize,
@@ -37,7 +38,7 @@ unsafe impl Sync for DeviceMain {}
 impl DeviceMain {
     pub fn new(worker_count: usize) -> Self {
         Self {
-            workers: (0..worker_count).map(|_| AtomicU64::new(0)).collect(),
+            workers: Arc::new((0..worker_count).map(|_| AtomicU64::new(0)).collect()),
             first_worker_thread_index: 0,
             last_worker_thread_index: worker_count,
             next_worker_thread_index: 0,
@@ -47,16 +48,18 @@ impl DeviceMain {
     pub fn global() -> RuntimeResult<&'static DeviceMain> {
         DEVICE_MAIN
             .get()
-            .map(Arc::as_ref)
             .ok_or(RuntimeError::RuntimeCapabilityMissing {
                 type_name: "hammer_service::device::DeviceMain",
             })
     }
 
     pub fn init(engine: &mut GlobalMain) -> RuntimeResult<Arc<DeviceMain>> {
-        let main = Arc::new(DeviceMain::new(engine.configured_worker_count()));
-        let _ = DEVICE_MAIN.set(Arc::clone(&main));
-        Ok(main)
+        let main = DeviceMain::new(engine.configured_worker_count());
+        let shared = Arc::new(main.clone());
+        DEVICE_MAIN
+            .set(main)
+            .map_err(|_| RuntimeError::PluginStateNotInitialized { plugin: "device" })?;
+        Ok(shared)
     }
 
     pub fn worker_range(&self) -> Range<usize> {
@@ -117,7 +120,7 @@ impl DeviceMain {
     }
 }
 
-pub static DEVICE_MAIN: OnceLock<Arc<DeviceMain>> = OnceLock::new();
+pub static DEVICE_MAIN: OnceLock<DeviceMain> = OnceLock::new();
 
 #[hammer_component_macros::init_function(name = "device_main_init", runs_after = ["net_main_init"])]
 fn init_device_main(engine: &mut GlobalMain) -> RuntimeResult<Arc<DeviceMain>> {

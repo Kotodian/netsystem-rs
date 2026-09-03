@@ -43,10 +43,6 @@ hammer_component_macros::declare_plugin!(
     worker_init_functions = [],
     graph_nodes = [
         ip::input::__IP_GRAPH_NODE_IP_INPUT_NODE,
-        ip::icmp::__IP_GRAPH_NODE_ICMP_INPUT_NODE,
-        ip::icmp::__IP_GRAPH_NODE_ICMP_ECHO_REQUEST_NODE,
-        ip::icmp::__IP_GRAPH_NODE_ICMP_PATH_MTU_NODE,
-        ip::icmp::__IP_GRAPH_NODE_ICMP_ERROR_NODE,
         ip::reassembly::__IP_GRAPH_NODE_IP_REASSEMBLY_NODE,
         ip::local::__IP_GRAPH_NODE_IP_LOCAL_NODE,
         ip::local::__IP_GRAPH_NODE_IP_RECEIVE_NODE,

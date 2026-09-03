@@ -1,3 +1,4 @@
+use std::cmp::Reverse;
 use std::collections::BTreeMap;
 
 use super::dpo::DpoId;
@@ -310,8 +311,20 @@ where
             .ok_or(FibError::ReferenceCountOverflow)?;
         if *references == 1 {
             self.entries[entry as usize].sources.push((source, entry));
+            self.entries[entry as usize]
+                .sources
+                .sort_by_key(|(candidate, _)| Reverse(candidate.priority));
         }
         Ok(entry)
+    }
+
+    pub fn winner_source(&self, prefix: P) -> Option<FibSource> {
+        let entry = self.prefixes.get(&prefix).copied()?;
+        self.entries
+            .get(entry as usize)?
+            .sources
+            .first()
+            .map(|(source, _)| *source)
     }
 
     pub fn remove_source(&mut self, prefix: P, source: FibSource) -> Result<bool, FibError> {

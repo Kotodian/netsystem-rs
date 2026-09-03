@@ -12,7 +12,6 @@ use crate::protocol::ip::{
     IPV4_FLAG_DONT_FRAGMENT, IpInputError, IpInputTarget, IpProtocol, IpVersion, Ipv4MtuAction,
     ParsedIpPacket, ipv4_mtu_check, read_ipv4_flags_fragment,
 };
-use arc_swap::ArcSwapOption;
 use hammer_core::data_plane::{
     BufferFrame, BufferPacketCursor, Index, NodeId, NodeNext, NodeRegistration, SecondaryOpaque,
 };
@@ -490,7 +489,7 @@ fn validate_via_family(prefix: ipnet::IpNet, via: IpAddr) -> RuntimeResult<()> {
     }
 }
 
-pub static IP_MAIN: ArcSwapOption<IpMain> = ArcSwapOption::const_empty();
+pub static IP_MAIN: OnceLock<IpMain> = OnceLock::new();
 
 #[hammer_component_macros::config_function(
     name = "ip_config",
@@ -506,8 +505,10 @@ fn configure_ip(
     config.validate()?;
     let routes: Arc<[_]> = Arc::from([] as [Route; 0]);
     let interfaces = Some(net_main.interface_main());
-    let main = Arc::new(IpMain::new(routes, interfaces)?);
-    IP_MAIN.store(Some(main));
+    let main = IpMain::new(routes, interfaces)?;
+    IP_MAIN
+        .set(main)
+        .map_err(|_| RuntimeError::PluginStateNotInitialized { plugin: "ip" })?;
     crate::pmtu::init_path_mtu();
     Ok(())
 }
@@ -517,7 +518,7 @@ fn configure_ip(
     runs_before = ["install_packet_graph"]
 )]
 fn init_ip() -> RuntimeResult<()> {
-    if IP_MAIN.load().is_none() {
+    if IP_MAIN.get().is_none() {
         return Err(RuntimeError::PluginStateNotInitialized { plugin: "ip" });
     }
     Ok(())
@@ -525,8 +526,7 @@ fn init_ip() -> RuntimeResult<()> {
 
 pub fn register_ip_lookup(runtime: &DataPlaneMain) -> RuntimeResult<NodeId> {
     IP_MAIN
-        .load()
-        .as_deref()
+        .get()
         .ok_or(RuntimeError::PluginStateNotInitialized { plugin: "ip" })?
         .register_node(runtime)
 }
@@ -878,9 +878,8 @@ impl Node for AdjacencyRewriteNode {
 }
 
 pub fn register_adjacency_rewrite(runtime: &DataPlaneMain) -> RuntimeResult<NodeId> {
-    let main_guard = IP_MAIN.load();
-    let main = main_guard
-        .as_ref()
+    let main = IP_MAIN
+        .get()
         .ok_or(RuntimeError::PluginStateNotInitialized { plugin: "ip" })?;
     let control = main.control_plane()?;
     runtime.nodes().try_register_internal_with_next_names(

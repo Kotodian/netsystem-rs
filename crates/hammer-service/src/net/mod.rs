@@ -16,8 +16,10 @@ pub use fib::{
     FibPathList, FibPathListFlags, FibSource, FibSourceBehavior, FibTable, FibTableBackend,
 };
 
+#[derive(Clone)]
 pub struct NetMain {
     interface_main: Arc<InterfaceMain>,
+    dpo_main: DpoMain,
     local_interface_hw_index: u32,
     local_interface_sw_index: u32,
 }
@@ -26,7 +28,6 @@ impl NetMain {
     pub fn global() -> RuntimeResult<&'static NetMain> {
         NET_MAIN
             .get()
-            .map(Arc::as_ref)
             .ok_or(RuntimeError::RuntimeCapabilityMissing {
                 type_name: "hammer_service::net::NetMain",
             })
@@ -45,17 +46,24 @@ impl NetMain {
             .ok_or(RuntimeError::RuntimeCapabilityMissing {
                 type_name: "local0",
             })?;
-        let main = Arc::new(NetMain {
+        let main = NetMain {
             interface_main,
+            dpo_main: DpoMain::new(),
             local_interface_hw_index: local_hw,
             local_interface_sw_index: local_sw,
-        });
-        let _ = NET_MAIN.set(Arc::clone(&main));
-        Ok(main)
+        };
+        let shared = Arc::new(main.clone());
+        NET_MAIN
+            .set(main)
+            .map_err(|_| RuntimeError::PluginStateNotInitialized { plugin: "net" })?;
+        Ok(shared)
     }
 
     pub fn interface_main(&self) -> &InterfaceMain {
         &self.interface_main
+    }
+    pub fn dpo_main(&self) -> &DpoMain {
+        &self.dpo_main
     }
     pub fn interface_main_arc(&self) -> Arc<InterfaceMain> {
         Arc::clone(&self.interface_main)
@@ -68,7 +76,7 @@ impl NetMain {
     }
 }
 
-pub static NET_MAIN: OnceLock<Arc<NetMain>> = OnceLock::new();
+pub static NET_MAIN: OnceLock<NetMain> = OnceLock::new();
 
 #[hammer_component_macros::init_function(name = "net_main_init", runs_after = ["interface_main_init"])]
 fn init_net_main(interface_main: Arc<InterfaceMain>) -> RuntimeResult<Arc<NetMain>> {
