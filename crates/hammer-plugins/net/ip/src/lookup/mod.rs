@@ -1,12 +1,12 @@
 use std::mem::{size_of, transmute};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
+use std::num::NonZeroU64;
 use std::sync::{Arc, Mutex, OnceLock};
 
 use crate::forwarding::{
-    Adjacency, AdjacencyIndex, DpoProto, DpoType, FibLookupResult, FibTable, FibTableBuilder,
-    FibTableHandle, ForwardingMetadata,
+    Adjacency, AdjacencyIndex, DpoProto, DpoType, FibLookupResult, FibTable, FibTableHandle,
+    ForwardingMetadata,
 };
-use crate::protocol::icmp::IcmpErrorMetadata;
 use crate::protocol::ip::{
     IPV4_FLAG_DONT_FRAGMENT, IpInputError, IpInputTarget, IpProtocol, IpVersion, Ipv4MtuAction,
     ParsedIpPacket, ipv4_mtu_check, read_ipv4_flags_fragment,
@@ -31,6 +31,19 @@ struct LookupOpaque {
     tap_ethernet: Option<TapEthernetMetadata>,
     icmp_error: Option<IcmpErrorMetadata>,
     forwarding: Option<ForwardingMetadata>,
+}
+
+#[derive(Clone, Copy)]
+#[repr(transparent)]
+struct IcmpErrorMetadata(NonZeroU64);
+
+impl IcmpErrorMetadata {
+    #[inline]
+    fn ipv4_destination_unreachable(code: u8, data: u32) -> Self {
+        let packed =
+            (1u64 << 63) | (4u64 << 48) | (3u64 << 40) | (u64::from(code) << 32) | u64::from(data);
+        Self(NonZeroU64::new(packed).expect("ICMP error metadata is presence-tagged"))
+    }
 }
 
 const _: () = assert!(size_of::<LookupOpaque>() == size_of::<SecondaryOpaque>());
@@ -112,7 +125,7 @@ impl IpMain {
         if let Some(control) = self.control.get() {
             return Ok(Arc::clone(control));
         }
-        let table = FibTableBuilder::new(NodeNext::slot(IpLookupNext::Drop)).build();
+        let table = FibTable::new(NodeNext::slot(IpLookupNext::Drop));
         let control = Arc::new(IpLookupControlPlane::new(table));
         if self.control.set(Arc::clone(&control)).is_err() {
             return self
