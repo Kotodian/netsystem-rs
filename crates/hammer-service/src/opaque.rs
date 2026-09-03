@@ -140,6 +140,22 @@ impl NetworkIpOpaque {
         self.reserved[2] = bytes[2];
         self.reserved[3] = bytes[3];
     }
+
+    #[inline]
+    pub fn fib_index(&self) -> u32 {
+        u32::from_le_bytes([
+            self.reserved[4],
+            self.reserved[5],
+            self.reserved[6],
+            self.reserved[7],
+        ])
+    }
+
+    #[inline]
+    pub fn set_fib_index(&mut self, index: u32) {
+        let bytes = index.to_le_bytes();
+        self.reserved[4..8].copy_from_slice(&bytes);
+    }
 }
 
 #[derive(Clone, Copy, Default)]

@@ -6,42 +6,9 @@ use std::ops::Range;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock};
 
-use hammer_core::data_plane::{BufferFrame, NodeId};
-use hammer_runtime::{
-    DataPlaneMain, DataWorkerId, GlobalMain, Node, NodeProcessFn, NodeRuntimeData, RuntimeError,
-    RuntimeResult,
-};
+use hammer_runtime::{DataWorkerId, GlobalMain, RuntimeError, RuntimeResult};
 
 pub use crate::interface_model::{DeviceClass, HwClass, HwInterface, SwInterface};
-
-#[hammer_component_macros::node_next]
-pub enum DeviceInputNext {
-    #[next("ip-input")]
-    Ip4Input,
-    #[next("ip-input")]
-    Ip6Input,
-    #[next("drop")]
-    Drop,
-}
-
-#[hammer_component_macros::graph_node(
-    graph = service,
-    name = "device-input",
-    next = DeviceInputNext,
-    kind = driver,
-    state = disabled,
-)]
-#[derive(Debug, Clone, Copy)]
-pub struct DeviceInputNode;
-
-impl Node for DeviceInputNode {
-    fn process(&mut self, _: &DataPlaneMain, _: &mut BufferFrame) {}
-    fn node_process(&self) -> NodeProcessFn {
-        device_input_process
-    }
-}
-
-fn device_input_process(_: &DataPlaneMain, _: NodeRuntimeData, _: &mut BufferFrame) {}
 
 #[derive(Debug, thiserror::Error)]
 pub enum DeviceError {
@@ -62,20 +29,18 @@ pub struct DeviceMain {
     first_worker_thread_index: usize,
     last_worker_thread_index: usize,
     next_worker_thread_index: usize,
-    input_node: NodeId,
 }
 
 unsafe impl Send for DeviceMain {}
 unsafe impl Sync for DeviceMain {}
 
 impl DeviceMain {
-    pub fn new(worker_count: usize, input_node: NodeId) -> Self {
+    pub fn new(worker_count: usize) -> Self {
         Self {
             workers: (0..worker_count).map(|_| AtomicU64::new(0)).collect(),
             first_worker_thread_index: 0,
             last_worker_thread_index: worker_count,
             next_worker_thread_index: 0,
-            input_node,
         }
     }
 
@@ -89,14 +54,7 @@ impl DeviceMain {
     }
 
     pub fn init(engine: &mut GlobalMain) -> RuntimeResult<Arc<DeviceMain>> {
-        let node = engine
-            .data_plane_main()
-            .nodes()
-            .node_by_name(DeviceInputNode::NODE_NAME)
-            .ok_or(RuntimeError::NodeNotRegistered {
-                node: NodeId::new(u32::MAX),
-            })?;
-        let main = Arc::new(DeviceMain::new(engine.configured_worker_count(), node));
+        let main = Arc::new(DeviceMain::new(engine.configured_worker_count()));
         let _ = DEVICE_MAIN.set(Arc::clone(&main));
         Ok(main)
     }
@@ -104,10 +62,6 @@ impl DeviceMain {
     pub fn worker_range(&self) -> Range<usize> {
         self.first_worker_thread_index..self.last_worker_thread_index
     }
-    pub fn input_node(&self) -> NodeId {
-        self.input_node
-    }
-
     pub fn increment_rx_packets(
         &self,
         worker: DataWorkerId,
