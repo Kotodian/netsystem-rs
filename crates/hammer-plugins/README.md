@@ -4,7 +4,7 @@ Layout follows domain ownership — **not** a flat list of every name:
 
 ```text
 hammer-plugins/
-  ip/              # hammer-plugin-ip
+  net/ip/           # hammer-plugin-ip
   transport/       # L4 protocols (abstraction stays in hammer-service::transport)
     tcp/           # hammer-plugin-tcp
     udp/           # hammer-plugin-udp

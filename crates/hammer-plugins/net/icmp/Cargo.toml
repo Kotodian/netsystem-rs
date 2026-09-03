@@ -13,4 +13,4 @@ abi_stable = { workspace = true }
 hammer-component-macros = { path = "../../../hammer-component-macros" }
 hammer-core = { path = "../../../hammer-core" }
 hammer-runtime = { path = "../../../hammer-runtime", default-features = false }
-hammer-plugin-ip = { path = "../../ip" }
+hammer-plugin-ip = { path = "../ip" }

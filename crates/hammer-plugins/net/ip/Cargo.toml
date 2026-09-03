@@ -12,11 +12,11 @@ crate-type = ["dylib", "rlib"]
 abi_stable = { workspace = true }
 arc-swap = { workspace = true }
 bitflags = { workspace = true }
-hammer-core = { path = "../../hammer-core" }
-hammer-infra = { path = "../../hammer-infra" }
-hammer-runtime = { path = "../../hammer-runtime", default-features = false }
-hammer-service = { path = "../../hammer-service", default-features = false }
-hammer-component-macros = { path = "../../hammer-component-macros" }
+hammer-core = { path = "../../../hammer-core" }
+hammer-infra = { path = "../../../hammer-infra" }
+hammer-runtime = { path = "../../../hammer-runtime", default-features = false }
+hammer-service = { path = "../../../hammer-service", default-features = false }
+hammer-component-macros = { path = "../../../hammer-component-macros" }
 linkme = { workspace = true }
 ipnet = { workspace = true }
 serde = { workspace = true }
