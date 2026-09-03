@@ -4,7 +4,17 @@ use hammer_runtime::{RuntimeError, RuntimeResult};
 
 use crate::interface::InterfaceMain;
 
-pub mod pmtu;
+pub mod dpo;
+pub mod fib;
+
+pub use dpo::{
+    AdjacencyDpo, DpoError, DpoId, DpoMain, DpoProto, DpoType, LoadBalanceDpo, LoadBalanceFlags,
+    LookupDpo, ReceiveDpo,
+};
+pub use fib::{
+    FibEntry, FibEntryFlags, FibEntrySrc, FibEntrySrcFlags, FibPath, FibPathExt, FibPathExtList,
+    FibPathList, FibPathListFlags, FibSource, FibSourceBehavior, FibTable, FibTableBackend,
+};
 
 pub struct NetMain {
     interface_main: Arc<InterfaceMain>,
