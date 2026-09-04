@@ -202,7 +202,7 @@ impl<T> Pool<T> {
 
     /// Reports whether inserting without a free index will grow the vector.
     #[inline]
-    pub(crate) fn will_get_grow(&self) -> bool {
+    pub fn will_get_grow(&self) -> bool {
         self.free_indices.is_empty() && self.vector.len() == self.vector.capacity()
     }
 

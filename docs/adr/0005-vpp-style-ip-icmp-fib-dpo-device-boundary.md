@@ -256,10 +256,13 @@ the ownership map for the classes relevant to this design. Classes outside this
 migration use the same seam when an owning plugin is introduced; no such class
 is added by this ADR.
 
-`DpoType` has one invalid value and otherwise contains a class key allocated by
-`DpoMain`. It does not expose VPP's closed built-in enum as a Rust API. Core
-classes are registered first and plugin classes are allocated afterwards from
-the same monotonic range; a key is never reused during the process lifetime.
+`DpoType` has one invalid value, the protocol-neutral built-in class keys used
+by this service, and class keys allocated by `DpoMain` for plugin-owned
+classes. The service deliberately omits VPP classes whose payload belongs to
+MPLS, LISP, BIER, PW, or another business plugin. Plugin classes are allocated
+after the service's last built-in key and are never reused during the process
+lifetime; the registry's finite `u8` key space is an internal invariant, not a
+recoverable API error.
 `DpoProto` is the compact data-path protocol key used to select a graph
 node/edge. Its values belong to the DPO graph registration, not to an IP
 family abstraction, next-hop selector, or IP local protocol number. The key
@@ -286,13 +289,13 @@ pub struct DpoProto(u8);
 pub struct DpoId(u64);
 
 impl DpoType {
-    pub const INVALID: Self = Self(u8::MAX);
+    pub const INVALID: Self = Self(0);
 }
 
 impl DpoProto {
     pub const IP4: Self = Self(0);
     pub const IP6: Self = Self(1);
-    pub const NONE: Self = Self(u8::MAX);
+    pub const NONE: Self = Self(7);
 }
 ```
 
@@ -305,17 +308,9 @@ The fields behind the class metadata and the object-bearing classes are:
 
 ```rust
 pub struct DpoMain {
-    nodes: BTreeMap<(DpoType, DpoProto), NodeId>,
-    edges: BTreeMap<(DpoType, DpoProto, DpoType, DpoProto), u16>,
+    nodes: Vec<Vec<Vec<NodeId>>>,
+    edges: Vec<Vec<Vec<Vec<u16>>>>,
     next_type: u8,
-}
-
-pub struct DropDpo {
-    ids: Box<[DpoId]>,
-}
-
-pub struct PuntDpo {
-    ids: Box<[DpoId]>,
 }
 
 pub struct LookupDpo {
@@ -348,8 +343,8 @@ pub struct ReceiveDpo<A> {
 
 pub struct InterfaceRxDpo {
     sw_if_index: u32,
-    next_node: NodeId,
     proto: DpoProto,
+    lock_count: u32,
 }
 
 pub struct InterfaceTxDpo {
@@ -375,8 +370,8 @@ pub struct LoadBalanceDpo {
     map_index: u32,
     urpf_index: u32,
     hash_config: u16,
-    overflow_bucket_index: u32,
     inline_buckets: [DpoId; 4],
+    overflow_buckets: Box<[DpoId]>,
 }
 ```
 
@@ -402,11 +397,11 @@ facts (`rd_addr` and the adjacency next-hop union). Their C representation uses
 object ownership and class/index identity while making the address slot a
 monomorphized Rust type instead of copying that C union into service net.
 
-`LookupDpo` and `ReceiveDpo` are real pool objects, while `DropDpo` and
-`PuntDpo` are per-registered-protocol singleton holders. Their owner allocates
-one contiguous `Box<[DpoId]>` during graph initialization and indexes it only
-with a validated `DpoProto`; there is no closed `DpoProto::NUM` array or
-protocol-specific payload in service net. The adjacency subtype class keys
+`LookupDpo` and `ReceiveDpo` are real pool objects. Drop and punt are stateless
+class identities, not Rust wrapper structs; their graph nodes are registered
+by the service owner and their `DpoId` values use the fixed class/index
+convention. There is no closed `DpoProto::NUM` array or protocol-specific
+payload in service net. The adjacency subtype class keys
 share the `AdjacencyDpo` pool; `DpoType` selects normal, incomplete, midchain,
 glean, or multicast behavior. `DpoMain` stores only class/node/edge metadata;
 the matching owner stores the pool and its typed operations.
@@ -440,8 +435,8 @@ child object it needs through its own typed state.
 
 | VPP class | Object storage | Hammer owner in this design | `DpoId.index` |
 | --- | --- | --- | --- |
-| `DPO_DROP` | Per-protocol static singleton IDs; no object lifetime | `hammer-service::net` | Fixed selector; never dereferenced as a pool index |
-| `DPO_PUNT` | Per-protocol static singleton IDs; no object lifetime | `hammer-service::net` | Fixed selector; never dereferenced as a pool index |
+| `DPO_DROP` | Stateless per-protocol identity; no object lifetime | `hammer-service::net::dpo` | Fixed class/index convention; never dereferenced as a pool index |
+| `DPO_PUNT` | Stateless per-protocol identity; no object lifetime | `hammer-service::net::dpo` | Fixed class/index convention; never dereferenced as a pool index |
 | `DPO_IP_NULL` | Fixed IP action records; no per-route object allocation | `hammer-plugins/net/ip` | Index into the IP owner's immutable action table |
 | `DPO_LOAD_BALANCE` | `load_balance_t` pool; buckets contain child `dpo_id_t` values | `hammer-service::net::dpo` | Index into the service load-balance pool |
 | `DPO_REPLICATE` | `replicate_t` pool; buckets contain child `dpo_id_t` values | Future multicast/replication plugin | Index into the replicate pool |
@@ -457,8 +452,7 @@ child object it needs through its own typed state.
 | `DPO_INTERFACE_TX` | No pool; wraps an existing `sw_if_index` | `hammer-service::net::interface` | The wrapped `sw_if_index` |
 | `DPO_DVR`, `DPO_L3_PROXY` | Concrete pools | Owning bridge/IP plugin when introduced | Index into the owning pool |
 | `DPO_MFIB_ENTRY` | Concrete multicast-FIB entry object | multicast IP owner when introduced | Index into the MFIB-entry pool |
-| `DPO_IP6_LL` | One permanent link-local singleton DPO ID | IPv6 owner when introduced | Fixed singleton selector; never dereferenced as a pool index |
-| `DPO_FIRST` | Invalid/uninitialised sentinel; no object | service DPO core | `u32::MAX` invalid index |
+| `DPO_INVALID` | Invalid/uninitialised sentinel; no object | service DPO core | `u32::MAX` invalid index |
 
 VPP's Path MTU DPO is normally a dynamically registered class rather than one
 of the built-in `dpo_type_t` values. The IP plugin registers that class after
@@ -504,7 +498,7 @@ relationship. It does not fabricate an object per graph node.
 `dpo_register_new_type()` allocates a new key for a plugin class or for a
 fast-path subtype that shares an existing object pool. Hammer's proc macro
 calls `DpoMain::register_new_type` with the already resolved
-`&[(DpoProto, NodeId)]` list. The class key/node data are fields of `DpoMain`;
+`&[(DpoProto, &[NodeId])]` list. The class key/node data are fields of `DpoMain`;
 there is no declaration record or second runtime record. Explicit owner
 initialization retains the class-key-to-pool binding and all object access
 needed by its operations.
@@ -546,14 +540,41 @@ node slot, adds the graph edge, and returns a copy of the parent identity with
 that edge in `next`. Parent object lifetime remains the concrete owner's
 responsibility.
 
-Pool growth/removal follows the VPP `dpo_pool_barrier_sync` rule. A pool
-operation that can expand or recycle worker-visible storage is performed only
-inside the already-held Binary API dispatcher barrier scope (or during startup
-before workers run); the concrete owner does not enter a second barrier. The
-owner publishes the object/ID while workers are stopped and exits the scope
-after the mutation. `DpoId` remains a compact identity value; its
-worker-visible replacement is ordered by the existing barrier publication, not
-by a second pointer or completion protocol.
+Pool growth follows the VPP `dpo_pool_barrier_sync` rule. The owner checks
+whether the next insertion will grow its `Pool<T>` before mutating it. When
+growth is required after Data Workers have started, `NetMain::create_load_balance`
+enters `worker_thread_barrier_sync!` before it establishes graph edges, grows the
+pool, or inserts the new object. The same owner-level scope is required when a
+lazy DPO graph edge is missing, because `vlib_node_add_next` is also a
+worker-visible topology mutation. Startup construction, before workers exist,
+is allowed without a barrier. Reusing a released pool slot and reusing an
+already-resolved graph edge do not enter a barrier; object lifetime and DPO
+locks still govern when a slot may be released for reuse.
+
+The concrete owner never stores a barrier, calls `WorkerBarrier::sync` directly,
+or creates a second completion protocol. It enters only through the exported
+`worker_thread_barrier_sync!` macro, and only when a worker-visible mutation is
+needed. The Binary API dispatcher also uses that macro for ordinary (non
+`mp_safe`) methods. If a DPO creation request arrives through that dispatcher,
+the owner observes the already-pending scope and performs the transaction inside
+it; nested scopes retain the runtime's recursion semantics. `DpoId` remains a
+compact identity value; visibility and lifetime are provided by the existing
+barrier and owner-managed references respectively.
+
+For example, `NetMain::create_load_balance` receives the installed
+`DataPlaneMain`, validates protocol and bucket facts, checks pool growth and
+cached graph-edge state, and then uses this shape when workers are active:
+
+```rust
+worker_thread_barrier_sync!(runtime, {
+    net_main.create_load_balance(runtime, proto, load_balance)
+})
+```
+
+The outer Binary API scope is optional from the owner's perspective: the owner
+conditionally enters the same macro for direct control-plane callers, while an
+already pending dispatcher scope is reused. No DPO owner may mutate a worker-
+visible pool or graph edge after workers start without one of these scopes.
 
 The current single `AdjacencyRewriteNode` is split into two concrete IP graph
 nodes to match VPP's per-data-path node table: `Ip4RewriteNode` owns IPv4
@@ -850,7 +871,7 @@ The ownership mapping to VPP is explicit:
 | `dpo_proto_t` | `hammer-service::net::DpoProto` | data-path protocol used to choose a graph arc |
 | `dpo_type_t` | `hammer-service::net::DpoType` | class key; `DpoMain` stores its per-protocol nodes, while the matching concrete owner stores the object pool and operations |
 | `dpo_id_t` | `hammer-service::net::DpoId` | `{ type, proto, index, next }` identity produced from an owner pool object or singleton |
-| `dpo_nodes[type][proto]` | `DpoMain` class/node tables | registered `(DpoProto, NodeId)` bindings |
+| `dpo_nodes[type][proto]` | `DpoMain` class/node tables | registered `(DpoProto, &[NodeId])` bindings |
 | `dpo_edges[child][proto][parent][proto]` | `DpoMain` edge table | derived graph edge for stacking |
 | `dpo_vft_t` | owner-local typed DPO operations; `DpoMain` stores only the per-protocol node metadata | formatting, object mutation, dependency policy, MTU, uRPF and interpose remain with the concrete class owner; no erased callback table crosses the service seam |
 | `dpoi_index` + `dpoi_type` | owner-local `(class slot, Pool<T>)` lookup | index is valid only in the pool belonging to the matching class slot |
@@ -2062,15 +2083,15 @@ impl IpNullDpo {
         ip6_null_node: NodeId,
     ) -> RuntimeResult<DpoType> {
         dpo_main.register_new_type(&[
-            (DpoProto::IP4, ip4_null_node),
-            (DpoProto::IP6, ip6_null_node),
+            (DpoProto::IP4, &[ip4_null_node]),
+            (DpoProto::IP6, &[ip6_null_node]),
         ])
     }
 }
 ```
 
 `DpoMain::register_new_type` validates the node list, allocates one monotonic
-class key, stores its `(DpoProto, NodeId)` bindings, and returns that key. It
+class key, stores its `(DpoProto, &[NodeId])` bindings, and returns that key. It
 does not inspect the object fields or install a pool. The IP init function
 obtains the node IDs from the graph owner, calls
 `IpNullDpo::register_dpo_class` and `IpPmtuDpo::register_dpo_class`, then stores
@@ -2085,7 +2106,7 @@ the returned key is the only value that crosses back to the concrete owner:
 impl DpoMain {
     pub fn register_new_type(
         &mut self,
-        nodes: &[(DpoProto, NodeId)],
+        nodes: &[(DpoProto, &[NodeId])],
     ) -> RuntimeResult<DpoType>;
 }
 ```
@@ -2120,7 +2141,7 @@ first dispatch component.
 
 For a shared object layout with several VPP subtype keys, such as lookup or
 adjacency, `#[dpo_class]` without `nodes` emits the same function with one
-`&[(DpoProto, NodeId)]` argument. The owner invokes it once per subtype and
+`&[(DpoProto, &[NodeId])]` argument. The owner invokes it once per subtype and
 keeps each returned `DpoType` in its own subtype binding. This is the VPP
 `dpo_register_new_type` pattern without a marker type or a second registry
 record. The object owner still implements all typed operations and owns the
@@ -2422,7 +2443,7 @@ next enum, `thread_local!` local registration, atomic FIB handle, or
 | 类型 | `hammer-plugins/net/ip::{Ip4RouteAddDelRequest,Ip6RouteAddDelRequest,Ip4RouteLookupRequest,Ip6RouteLookupRequest}` | Binary API 的具体 IPv4/IPv6 请求；包含 `is_add`/`is_multipath`、外部 `table_id`、具体 prefix/address 和 paths/exact；route add/delete 的 source 由 handler 固定为 `FIB_SOURCE_API`，不在 wire payload 暴露 | 新 Binary API payload；不引入统一 family 枚举 | prost encode/decode and invalid-field tests |
 | 类型 | `hammer-plugins/net/ip::{Ip4RouteAddDelReply,Ip6RouteAddDelReply,Ip4RouteLookupReply,Ip6RouteLookupReply}` | 返回 owner-defined status、stats 和匹配 route/path facts；不序列化 selected DPO；状态不复用 display string | 新 payload；envelope status 仍由 `hammer-ipc` 定义 | reply status and context tests |
 | 类型 | `hammer-plugins/net/ip::{Ip4RoutePath,Ip6RoutePath,IpRoutePathBehavior,IpRouteStatus}` | concrete IP-owned Binary API path payloads and phase-one path behavior; decoded into service `FibPath<Ip4NextHop, IpPathFlags>`/`FibPath<Ip6NextHop, IpPathFlags>`; no service-level path-behavior enum, next-hop protocol, address union, or owner-specific extension | 新 Binary API nested messages/enums；无旧 wire 兼容层；本迁移不提供 owner-specific extension 字段 | prost schema and status mapping tests |
-| API | `#[derive(FibSource)]` / `#[derive(DpoClass)]` | `FibSource` 生成 owner-local source constants；`DpoClass` 只能派生在真实 DPO object layout 上，并生成 `register_dpo_class(...)`，直接把 owner 提供的 `(DpoProto, NodeId)` 参数交给 `DpoMain::register_new_type`；不生成 class name、static key、registration record、pool 或 callback table | 替代手写 forwarding registration arrays；`IpNullDpo` 和 `IpPmtuDpo` 均通过同一 derive 注册，shared layout 通过 owner 提供的 node slice 为每个 subtype 注册 | proc-macro expansion, DPO class allocation, and DSO inventory test |
+| API | `#[derive(FibSource)]` / `#[derive(DpoClass)]` | `FibSource` 生成 owner-local source constants；`DpoClass` 只能派生在真实 DPO object layout 上，并生成 `register_dpo_class(...)`，直接把 owner 提供的 `(DpoProto, &[NodeId])` 参数交给 `DpoMain::register_new_type`；不生成 class name、static key、registration record、pool 或 callback table | 替代手写 forwarding registration arrays；`IpNullDpo` 和 `IpPmtuDpo` 均通过同一 derive 注册，shared layout 通过 owner 提供的 node slice 为每个 subtype 注册 | proc-macro expansion, DPO class allocation, and DSO inventory test |
 | API | `ip4.route.add_del` / `ip6.route.add_del` | Binary API handler；按 VPP add/delete + multipath 语义增量修改 FIB graph 和 forwarding backend | 新方法名；客户端迁移到具体方法 | end-to-end Binary API route mutation test |
 | API | `ip4.route.lookup` / `ip6.route.lookup` | Binary API handler；按 `table_id` 和 `exact` 读取 non-forwarding FIB entry，返回匹配 route/path/stats facts；不返回 selected DPO | 新方法名；客户端迁移到具体方法 | LPM/exact and route-facts reply test |
 | API | `ip4.table.*` / `ip6.table.*` | table add/del/allocate/flush；维护 external `table_id` 到 concrete `fib_index` 的 owner-local map | 新 Binary API methods；不改变 Binary API envelope | table lifecycle and index-separation test |
@@ -2586,7 +2607,7 @@ ADR and cannot change the interfaces or ownership decisions recorded here.
    只有显式 owner init function 通过现有 `RegistrationImage` 收集。
    `IpNullDpo` 与 `IpPmtuDpo` 都必须通过这个 derive 注册。没有固定 node
    列表的 shared layout（例如 lookup/adjacency）使用 `#[dpo_class]`，生成
-   接收 `&[(DpoProto, NodeId)]` 的同一函数，由 owner 为每个 subtype 调用。
+   接收 `&[(DpoProto, &[NodeId])]` 的同一函数，由 owner 为每个 subtype 调用。
 3. ICMP data worker 只产生两个 concrete typed events：`Ip4PmtuUpdate` 和
    `Ip6PmtuUpdate`。Binary API Process Node 将事件转换为
    `Ip4Main::update_path_mtu` 或 `Ip6Main::update_path_mtu`，并在唯一的
@@ -2691,8 +2712,10 @@ ADR and cannot change the interfaces or ownership decisions recorded here.
 - `local0` is a reserved sentinel; `sw_if_index` and `fib_index` are distinct.
 - Main values use owner-local `OnceLock<Main>` with `init` and `global`.
 - Runtime route publication is through IP plugin-owned Binary API methods;
-  the dispatcher owns the only barrier scope and plugin handlers never call a
-  barrier entrypoint.
+  the dispatcher and DPO owners use the same `worker_thread_barrier_sync!`
+  macro. Plugin handlers do not call a barrier entrypoint directly; an owner
+  such as `NetMain::create_load_balance` conditionally enters the macro when
+  called outside an already-pending Binary API scope.
 - `Ip4RewriteNode` and `Ip6RewriteNode` are both accepted graph nodes; their
   shared packet orchestration is a private, statically dispatched generic core
   inside the IP plugin, with concrete IPv4/IPv6 policies.

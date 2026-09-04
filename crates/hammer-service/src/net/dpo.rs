@@ -1,19 +1,20 @@
 use std::mem::{align_of, size_of};
 
 use hammer_core::data_plane::NodeId;
+use hammer_runtime::RuntimeError;
+
+use super::fib::FibEntryFlags;
 
 #[repr(transparent)]
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Deserialize, serde::Serialize)]
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, serde::Deserialize, serde::Serialize,
+)]
 pub struct DpoProto(u8);
 
 impl DpoProto {
     pub const IP4: Self = Self(0);
     pub const IP6: Self = Self(1);
-    pub const MPLS: Self = Self(2);
-    pub const ETHERNET: Self = Self(3);
-    pub const BIER: Self = Self(4);
-    pub const NSH: Self = Self(5);
-    pub const NONE: Self = Self(u8::MAX);
+    pub const NONE: Self = Self(7);
 
     pub const fn new(value: u8) -> Self {
         Self(value)
@@ -25,17 +26,27 @@ impl DpoProto {
 }
 
 #[repr(transparent)]
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Deserialize, serde::Serialize)]
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, serde::Deserialize, serde::Serialize,
+)]
 pub struct DpoType(u8);
 
 impl DpoType {
-    pub const INVALID: Self = Self(u8::MAX);
-    pub const DROP: Self = Self(0);
-    pub const PUNT: Self = Self(1);
-    pub const RECEIVE: Self = Self(2);
-    pub const ADJACENCY: Self = Self(3);
+    pub const INVALID: Self = Self(0);
+    pub const DROP: Self = Self(1);
+    pub const PUNT: Self = Self(3);
     pub const LOAD_BALANCE: Self = Self(4);
-    pub const FIRST_REGISTERED: u8 = 5;
+    pub const REPLICATE: Self = Self(5);
+    pub const ADJACENCY: Self = Self(6);
+    pub const ADJACENCY_INCOMPLETE: Self = Self(7);
+    pub const ADJACENCY_MIDCHAIN: Self = Self(8);
+    pub const ADJACENCY_GLEAN: Self = Self(9);
+    pub const ADJACENCY_MCAST: Self = Self(10);
+    pub const ADJACENCY_MCAST_MIDCHAIN: Self = Self(11);
+    pub const RECEIVE: Self = Self(12);
+    pub const LOOKUP: Self = Self(13);
+    pub const INTERFACE_RX: Self = Self(14);
+    pub const INTERFACE_TX: Self = Self(15);
 
     pub const fn new(value: u8) -> Self {
         Self(value)
@@ -51,270 +62,424 @@ impl DpoType {
 pub struct DpoId(u64);
 
 impl DpoId {
-    pub const INVALID: Self = Self::new(DpoType::INVALID, DpoProto::NONE, u32::MAX, u16::MAX);
-    pub const fn new(dpo_type: DpoType, proto: DpoProto, index: u32, next: u16) -> Self {
+    pub const INVALID: Self = Self::with_next(DpoType::INVALID, DpoProto::NONE, u32::MAX, 0);
+
+    pub const fn new(dpo_type: DpoType, proto: DpoProto, index: u32) -> Self {
+        Self::with_next(dpo_type, proto, index, 0)
+    }
+
+    const fn with_next(dpo_type: DpoType, proto: DpoProto, index: u32, next: u16) -> Self {
         Self(
-            index as u64
-                | ((next as u64) << 32)
-                | ((proto.get() as u64) << 48)
-                | ((dpo_type.get() as u64) << 56),
+            dpo_type.get() as u64
+                | ((proto.get() as u64) << 8)
+                | ((next as u64) << 16)
+                | ((index as u64) << 32),
         )
     }
 
-    pub const fn drop(proto: DpoProto, next: u16) -> Self {
-        Self::new(DpoType::DROP, proto, 0, next)
+    pub const fn drop(proto: DpoProto) -> Self {
+        Self::new(DpoType::DROP, proto, proto.get() as u32)
     }
 
-    pub const fn punt(proto: DpoProto, next: u16) -> Self {
-        Self::new(DpoType::PUNT, proto, 0, next)
+    pub const fn punt(proto: DpoProto) -> Self {
+        Self::new(DpoType::PUNT, proto, 1)
     }
 
-    pub const fn receive(proto: DpoProto, index: u32, next: u16) -> Self {
-        Self::new(DpoType::RECEIVE, proto, index, next)
+    pub const fn receive(proto: DpoProto, index: u32) -> Self {
+        Self::new(DpoType::RECEIVE, proto, index)
     }
 
-    pub const fn adjacency(proto: DpoProto, index: u32, next: u16) -> Self {
-        Self::new(DpoType::ADJACENCY, proto, index, next)
+    pub const fn adjacency(proto: DpoProto, index: u32) -> Self {
+        Self::new(DpoType::ADJACENCY, proto, index)
     }
 
-    pub const fn load_balance(proto: DpoProto, index: u32, next: u16) -> Self {
-        Self::new(DpoType::LOAD_BALANCE, proto, index, next)
+    pub const fn load_balance(proto: DpoProto, index: u32) -> Self {
+        Self::new(DpoType::LOAD_BALANCE, proto, index)
+    }
+
+    pub const fn replicate(proto: DpoProto, index: u32) -> Self {
+        Self::new(DpoType::REPLICATE, proto, index)
+    }
+
+    pub const fn lookup(proto: DpoProto, index: u32) -> Self {
+        Self::new(DpoType::LOOKUP, proto, index)
+    }
+
+    pub const fn interface_rx(proto: DpoProto, index: u32) -> Self {
+        Self::new(DpoType::INTERFACE_RX, proto, index)
+    }
+
+    pub const fn interface_tx(proto: DpoProto, sw_if_index: u32) -> Self {
+        Self::new(DpoType::INTERFACE_TX, proto, sw_if_index)
     }
 
     pub const fn class(self) -> DpoType {
-        DpoType::new((self.0 >> 56) as u8)
+        DpoType::new(self.0 as u8)
     }
 
     pub const fn proto(self) -> DpoProto {
-        DpoProto::new((self.0 >> 48) as u8)
+        DpoProto::new((self.0 >> 8) as u8)
     }
 
     pub const fn index(self) -> u32 {
-        self.0 as u32
+        (self.0 >> 32) as u32
     }
 
     pub const fn next(self) -> u16 {
-        (self.0 >> 32) as u16
+        (self.0 >> 16) as u16
     }
 
-    pub const fn stack(self, next: u16) -> Self {
-        Self::new(self.class(), self.proto(), self.index(), next)
+    // The graph slot is written only after DpoMain has resolved a registered edge.
+    const fn stack(self, next: u16) -> Self {
+        Self::with_next(self.class(), self.proto(), self.index(), next)
     }
 }
 
 const _: () = assert!(size_of::<DpoId>() == 8);
 const _: () = assert!(align_of::<DpoId>() == 8);
 
-#[derive(Debug, thiserror::Error, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, thiserror::Error)]
 pub enum DpoError {
-    #[error("DPO class registration requires at least one protocol node")]
-    EmptyClass,
+    #[error(transparent)]
+    Runtime(#[from] RuntimeError),
     #[error("DPO class registration repeats protocol {proto}")]
     DuplicateProtocol { proto: u8 },
-    #[error("DPO class registry exhausted")]
-    ClassExhausted,
+    #[error("DPO class registration cannot use protocol {proto}")]
+    InvalidProtocol { proto: u8 },
     #[error("DPO class {dpo_type} has no node for protocol {proto}")]
     NodeMissing { dpo_type: u8, proto: u8 },
-    #[error("DPO stack edge is already registered with a different node")]
-    StackEdgeConflict,
+    #[error("DPO graph edge resolves to different slots for sibling nodes")]
+    GraphEdgeConflict,
+    #[error("failed to add DPO graph edge from node {child:?} to parent {parent:?}")]
+    GraphEdgeAdd {
+        child: NodeId,
+        parent: NodeId,
+        #[source]
+        source: RuntimeError,
+    },
+    #[error("load-balance protocol {actual} does not match requested protocol {expected}")]
+    ProtocolMismatch { actual: u8, expected: u8 },
     #[error("load-balance bucket count must be a non-zero power of two")]
     InvalidBucketCount,
-    #[error("load-balance pool index exceeds DPO identity capacity")]
-    LoadBalancePoolExhausted,
 }
 
 #[derive(Debug, Clone)]
-struct DpoClassState {
-    nodes: Vec<(DpoProto, NodeId)>,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct DpoStackKey {
-    child: DpoType,
-    child_proto: DpoProto,
-    parent: DpoType,
-    parent_proto: DpoProto,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct DpoStackEdge {
-    key: DpoStackKey,
-    next: u16,
-}
-
-#[derive(Debug, Clone, Default)]
 pub struct DpoMain {
-    classes: Vec<DpoClassState>,
-    builtins: Vec<(DpoType, DpoProto, NodeId)>,
-    edges: Vec<DpoStackEdge>,
-    load_balances: Vec<LoadBalanceDpo>,
+    // These tables mirror VPP's dpo_nodes[type][proto] and dpo_edges
+    // vectors. Empty node lists are valid for instance-dependent classes.
+    nodes: Vec<Vec<Vec<NodeId>>>,
+    edges: Vec<Vec<Vec<Vec<u16>>>>,
+    next_type: u8,
 }
+
+impl Default for DpoMain {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+const DYNAMIC_TYPE_START: u8 = 30;
+const NO_EDGE: u16 = u16::MAX;
 
 impl DpoMain {
     pub const fn new() -> Self {
         Self {
-            classes: Vec::new(),
-            builtins: Vec::new(),
+            nodes: Vec::new(),
             edges: Vec::new(),
-            load_balances: Vec::new(),
+            next_type: DYNAMIC_TYPE_START,
         }
     }
 
-    pub fn register_new_type(&mut self, nodes: &[(DpoProto, NodeId)]) -> Result<DpoType, DpoError> {
-        if nodes.is_empty() {
-            return Err(DpoError::EmptyClass);
+    fn node_slot_mut(&mut self, dpo_type: DpoType, proto: DpoProto) -> &mut Vec<NodeId> {
+        let type_index = usize::from(dpo_type.get());
+        let proto_index = usize::from(proto.get());
+        if self.nodes.len() <= type_index {
+            self.nodes.resize_with(type_index + 1, Vec::new);
         }
+        if self.nodes[type_index].len() <= proto_index {
+            self.nodes[type_index].resize_with(proto_index + 1, Vec::new);
+        }
+        &mut self.nodes[type_index][proto_index]
+    }
+
+    fn edge_slot_mut(
+        &mut self,
+        child: DpoType,
+        child_proto: DpoProto,
+        parent: DpoType,
+        parent_proto: DpoProto,
+    ) -> &mut u16 {
+        let child_index = usize::from(child.get());
+        let child_proto_index = usize::from(child_proto.get());
+        let parent_index = usize::from(parent.get());
+        let parent_proto_index = usize::from(parent_proto.get());
+        if self.edges.len() <= child_index {
+            self.edges.resize_with(child_index + 1, Vec::new);
+        }
+        if self.edges[child_index].len() <= child_proto_index {
+            self.edges[child_index].resize_with(child_proto_index + 1, Vec::new);
+        }
+        if self.edges[child_index][child_proto_index].len() <= parent_index {
+            self.edges[child_index][child_proto_index].resize_with(parent_index + 1, Vec::new);
+        }
+        if self.edges[child_index][child_proto_index][parent_index].len() <= parent_proto_index {
+            self.edges[child_index][child_proto_index][parent_index]
+                .resize(parent_proto_index + 1, NO_EDGE);
+        }
+        &mut self.edges[child_index][child_proto_index][parent_index][parent_proto_index]
+    }
+
+    fn edge_slot(
+        &self,
+        child: DpoType,
+        child_proto: DpoProto,
+        parent: DpoType,
+        parent_proto: DpoProto,
+    ) -> Option<u16> {
+        self.edges
+            .get(usize::from(child.get()))?
+            .get(usize::from(child_proto.get()))?
+            .get(usize::from(parent.get()))?
+            .get(usize::from(parent_proto.get()))
+            .copied()
+            .filter(|next| *next != NO_EDGE)
+    }
+
+    fn validate_protocol(proto: DpoProto) -> Result<(), DpoError> {
+        (proto != DpoProto::NONE)
+            .then_some(())
+            .ok_or(DpoError::InvalidProtocol { proto: proto.get() })
+    }
+
+    pub fn register_new_type(
+        &mut self,
+        nodes: &[(DpoProto, &[NodeId])],
+    ) -> Result<DpoType, DpoError> {
         for (position, (proto, _)) in nodes.iter().enumerate() {
+            Self::validate_protocol(*proto)?;
             if nodes[..position].iter().any(|(other, _)| other == proto) {
                 return Err(DpoError::DuplicateProtocol { proto: proto.get() });
             }
         }
-        let value = DpoType::FIRST_REGISTERED
-            .checked_add(u8::try_from(self.classes.len()).map_err(|_| DpoError::ClassExhausted)?)
-            .ok_or(DpoError::ClassExhausted)?;
-        if value == DpoType::INVALID.get() {
-            return Err(DpoError::ClassExhausted);
+        let dpo_type = DpoType::new(self.next_type);
+        self.next_type = self
+            .next_type
+            .checked_add(1)
+            .expect("DPO dynamic class space exhausted");
+        for (proto, node_ids) in nodes {
+            *self.node_slot_mut(dpo_type, *proto) = node_ids.to_vec();
         }
-        self.classes.push(DpoClassState {
-            nodes: nodes.to_vec(),
-        });
-        Ok(DpoType::new(value))
+        Ok(dpo_type)
+    }
+
+    pub fn nodes(&self, dpo_type: DpoType, proto: DpoProto) -> Option<&[NodeId]> {
+        self.nodes
+            .get(usize::from(dpo_type.get()))?
+            .get(usize::from(proto.get()))
+            .map(Vec::as_slice)
     }
 
     pub fn node(&self, dpo_type: DpoType, proto: DpoProto) -> Option<NodeId> {
-        if dpo_type.get() < DpoType::FIRST_REGISTERED {
-            return self.builtins.iter().find_map(|(class, candidate, node)| {
-                (*class == dpo_type && *candidate == proto).then_some(*node)
-            });
-        }
-        self.classes
-            .get(usize::from(dpo_type.get() - DpoType::FIRST_REGISTERED))?
-            .nodes
-            .iter()
-            .find_map(|(candidate, node)| (*candidate == proto).then_some(*node))
+        self.nodes(dpo_type, proto)
+            .and_then(|node_ids| node_ids.first().copied())
     }
 
-    pub fn register_builtin_node(
-        &mut self,
-        dpo_type: DpoType,
-        proto: DpoProto,
-        node: NodeId,
-    ) -> Result<(), DpoError> {
-        if dpo_type.get() >= DpoType::FIRST_REGISTERED || dpo_type == DpoType::INVALID {
-            return Err(DpoError::NodeMissing {
-                dpo_type: dpo_type.get(),
-                proto: proto.get(),
-            });
-        }
-        if self.node(dpo_type, proto).is_some() {
-            return Err(DpoError::DuplicateProtocol { proto: proto.get() });
-        }
-        self.builtins.push((dpo_type, proto, node));
-        Ok(())
-    }
-
-    pub fn register_stack_edge(
-        &mut self,
+    pub(crate) fn stack_requires_graph_edge(
+        &self,
         child: DpoType,
         child_proto: DpoProto,
         parent: DpoId,
-        next: u16,
+    ) -> bool {
+        self.edge_slot(child, child_proto, parent.class(), parent.proto())
+            .is_none()
+    }
+
+    pub fn register_builtin(
+        &mut self,
+        dpo_type: DpoType,
+        nodes: &[(DpoProto, &[NodeId])],
     ) -> Result<(), DpoError> {
-        if self.node(child, child_proto).is_none() {
+        if dpo_type.get() >= DYNAMIC_TYPE_START || dpo_type == DpoType::INVALID {
             return Err(DpoError::NodeMissing {
-                dpo_type: child.get(),
-                proto: child_proto.get(),
+                dpo_type: dpo_type.get(),
+                proto: DpoProto::NONE.get(),
             });
         }
-        if self.node(parent.class(), parent.proto()).is_none() {
+        for (position, (proto, _)) in nodes.iter().enumerate() {
+            Self::validate_protocol(*proto)?;
+            if nodes[..position].iter().any(|(other, _)| other == proto)
+                || self.nodes(dpo_type, *proto).is_some()
+            {
+                return Err(DpoError::DuplicateProtocol { proto: proto.get() });
+            }
+        }
+        for (proto, node_ids) in nodes {
+            *self.node_slot_mut(dpo_type, *proto) = node_ids.to_vec();
+        }
+        Ok(())
+    }
+
+    /// Equivalent to VPP's `dpo_stack`: add every child-originating node to
+    /// every parent node, cache the common edge slot, and return the parent
+    /// identity with that slot installed.
+    pub fn stack_from_node(
+        &mut self,
+        runtime_nodes: &hammer_runtime::node::NodeRuntime,
+        child_node: NodeId,
+        parent: DpoId,
+        parent_nodes: &[NodeId],
+    ) -> Result<DpoId, DpoError> {
+        if parent_nodes.is_empty() {
             return Err(DpoError::NodeMissing {
                 dpo_type: parent.class().get(),
                 proto: parent.proto().get(),
             });
         }
-        let key = DpoStackKey {
-            child,
-            child_proto,
-            parent: parent.class(),
-            parent_proto: parent.proto(),
-        };
-        if let Some(edge) = self.edges.iter_mut().find(|edge| edge.key == key) {
-            if edge.next != next {
-                return Err(DpoError::StackEdgeConflict);
+        hammer_runtime::ensure_main_thread_with_barrier()?;
+        let mut edge = None::<u16>;
+        for &parent_node in parent_nodes {
+            let next = runtime_nodes
+                .add_node_next_slot(child_node, parent_node)
+                .map_err(|source| DpoError::GraphEdgeAdd {
+                    child: child_node,
+                    parent: parent_node,
+                    source,
+                })?;
+            if edge.is_some_and(|slot| slot != next) {
+                return Err(DpoError::GraphEdgeConflict);
             }
-        } else {
-            self.edges.push(DpoStackEdge { key, next });
+            edge = Some(next);
         }
-        Ok(())
+        Ok(parent.stack(edge.expect("non-empty parent node list")))
     }
 
-    pub fn stack(&self, child: DpoType, child_proto: DpoProto, parent: DpoId) -> Option<DpoId> {
-        let key = DpoStackKey {
-            child,
-            child_proto,
-            parent: parent.class(),
-            parent_proto: parent.proto(),
-        };
-        self.edges
-            .iter()
-            .find_map(|edge| (edge.key == key).then_some(parent.stack(edge.next)))
-    }
-
-    pub fn create_load_balance(
+    pub fn stack(
         &mut self,
-        proto: DpoProto,
-        next: u16,
-        load_balance: LoadBalanceDpo,
+        runtime_nodes: &hammer_runtime::node::NodeRuntime,
+        child: DpoType,
+        child_proto: DpoProto,
+        parent: DpoId,
     ) -> Result<DpoId, DpoError> {
-        let index = u32::try_from(self.load_balances.len())
-            .map_err(|_| DpoError::LoadBalancePoolExhausted)?;
-        self.load_balances.push(load_balance);
-        Ok(DpoId::load_balance(proto, index, next))
+        let child_nodes = self
+            .nodes(child, child_proto)
+            .ok_or(DpoError::NodeMissing {
+                dpo_type: child.get(),
+                proto: child_proto.get(),
+            })?
+            .to_vec();
+        let parent_nodes = self
+            .nodes(parent.class(), parent.proto())
+            .ok_or(DpoError::NodeMissing {
+                dpo_type: parent.class().get(),
+                proto: parent.proto().get(),
+            })?
+            .to_vec();
+        if child_nodes.is_empty() || parent_nodes.is_empty() {
+            return Err(DpoError::NodeMissing {
+                dpo_type: child.get(),
+                proto: child_proto.get(),
+            });
+        }
+        if let Some(next) = self.edge_slot(child, child_proto, parent.class(), parent.proto()) {
+            return Ok(parent.stack(next));
+        }
+
+        hammer_runtime::ensure_main_thread_with_barrier()?;
+        let mut edge = None::<u16>;
+        for child_node in child_nodes {
+            for parent_node in &parent_nodes {
+                let next = runtime_nodes
+                    .add_node_next_slot(child_node, *parent_node)
+                    .map_err(|source| DpoError::GraphEdgeAdd {
+                        child: child_node,
+                        parent: *parent_node,
+                        source,
+                    })?;
+                if edge.is_some_and(|slot| slot != next) {
+                    return Err(DpoError::GraphEdgeConflict);
+                }
+                edge = Some(next);
+            }
+        }
+        let next = edge.expect("non-empty child and parent node lists");
+        *self.edge_slot_mut(child, child_proto, parent.class(), parent.proto()) = next;
+        Ok(parent.stack(next))
     }
-
-    #[inline(always)]
-    pub fn load_balance(&self, index: u32) -> Option<&LoadBalanceDpo> {
-        self.load_balances.get(index as usize)
-    }
-
-    #[inline(always)]
-    pub fn select_load_balance(&self, dpo: DpoId, hash: u32) -> Option<DpoId> {
-        (dpo.class() == DpoType::LOAD_BALANCE)
-            .then(|| self.load_balance(dpo.index()))
-            .flatten()
-            .and_then(|load_balance| load_balance.select_bucket(hash))
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct DropDpo {
-    pub id: DpoId,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct PuntDpo {
-    pub id: DpoId,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ReceiveDpo<A> {
     pub sw_if_index: u32,
     pub address: A,
+    pub lock_count: u16,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LookupInput {
+    SourceAddress,
+    DestinationAddress,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LookupTable {
+    FromInputInterface,
+    Configured,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LookupCast {
+    Unicast,
+    Multicast,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct LookupDpo {
     pub fib_index: u32,
-    pub table_id: u32,
-    pub input_sw_if_index: u32,
+    pub proto: DpoProto,
+    pub input: LookupInput,
+    pub table: LookupTable,
+    pub cast: LookupCast,
+    pub lock_count: u16,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct AdjacencyDpo<A, R> {
+    pub config_index: u32,
+    pub lock_count: u32,
     pub sw_if_index: u32,
     pub next_hop: Option<A>,
     pub rewrite: R,
     pub child: Option<DpoId>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct InterfaceRxDpo {
+    pub sw_if_index: u32,
+    pub proto: DpoProto,
+    pub lock_count: u32,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct InterfaceTxDpo {
+    pub sw_if_index: u32,
+}
+
+bitflags::bitflags! {
+    #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+    #[repr(transparent)]
+    pub struct ReplicateFlags: u8 {
+        const HAS_LOCAL = 1 << 0;
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReplicateDpo {
+    pub bucket_count: u16,
+    pub proto: DpoProto,
+    pub flags: ReplicateFlags,
+    pub lock_count: u32,
+    pub inline_buckets: [DpoId; 4],
+    overflow_buckets: Box<[DpoId]>,
 }
 
 bitflags::bitflags! {
@@ -328,66 +493,61 @@ bitflags::bitflags! {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LoadBalanceDpo {
-    pub lock_count: u16,
     pub bucket_count: u16,
     pub bucket_mask: u16,
-    pub flow_hash_config: u16,
+    pub proto: DpoProto,
     pub flags: LoadBalanceFlags,
+    pub fib_entry_flags: FibEntryFlags,
+    pub lock_count: u32,
+    pub map_index: u32,
+    pub urpf_index: u32,
+    pub flow_hash_config: u16,
     pub inline_buckets: [DpoId; 4],
-    pub overflow_index: u32,
-    overflow_buckets: Box<[DpoId]>,
+    pub(crate) overflow_buckets: Box<[DpoId]>,
 }
 
 impl LoadBalanceDpo {
     pub const INLINE_BUCKETS: usize = 4;
-    pub const NO_OVERFLOW: u32 = u32::MAX;
+    pub const MAX_BUCKETS: usize = 8192;
 
-    pub fn new(buckets: &[DpoId], flags: LoadBalanceFlags) -> Result<Self, DpoError> {
+    pub fn new(
+        proto: DpoProto,
+        buckets: &[DpoId],
+        flags: LoadBalanceFlags,
+        flow_hash_config: u16,
+    ) -> Result<Self, DpoError> {
         if buckets.is_empty()
             || !buckets.len().is_power_of_two()
-            || buckets.len() > u16::MAX as usize
+            || buckets.len() > Self::MAX_BUCKETS
         {
             return Err(DpoError::InvalidBucketCount);
         }
         let first = buckets
             .first()
             .copied()
-            .unwrap_or(DpoId::drop(DpoProto::IP4, 0));
+            .unwrap_or(DpoId::drop(DpoProto::IP4));
         let mut inline_buckets = [first; 4];
         for (slot, bucket) in buckets.iter().take(4).enumerate() {
             inline_buckets[slot] = *bucket;
         }
         let overflow_buckets: Box<[DpoId]> = if buckets.len() > Self::INLINE_BUCKETS {
-            buckets[Self::INLINE_BUCKETS..].into()
+            buckets[Self::INLINE_BUCKETS..].to_vec().into_boxed_slice()
         } else {
             Box::new([])
         };
         Ok(Self {
-            lock_count: 0,
             bucket_count: buckets.len() as u16,
             bucket_mask: (buckets.len() - 1) as u16,
-            flow_hash_config: 0,
+            proto,
             flags,
+            fib_entry_flags: FibEntryFlags::empty(),
+            lock_count: 0,
+            map_index: u32::MAX,
+            urpf_index: u32::MAX,
+            flow_hash_config,
             inline_buckets,
-            overflow_index: if buckets.len() > 4 {
-                0
-            } else {
-                Self::NO_OVERFLOW
-            },
             overflow_buckets,
         })
-    }
-
-    pub fn select_inline(&self, hash: u32) -> DpoId {
-        self.inline_buckets[(hash & u32::from(self.bucket_mask.min(3))) as usize]
-    }
-
-    pub fn select(&self, hash: u32, overflow: &[DpoId]) -> Option<DpoId> {
-        let bucket = (hash & u32::from(self.bucket_mask)) as usize;
-        if bucket < Self::INLINE_BUCKETS {
-            return Some(self.inline_buckets[bucket]);
-        }
-        overflow.get(bucket - Self::INLINE_BUCKETS).copied()
     }
 
     #[inline(always)]
@@ -402,38 +562,85 @@ impl LoadBalanceDpo {
     }
 }
 
+impl ReplicateDpo {
+    pub const INLINE_BUCKETS: usize = 4;
+    pub const MAX_BUCKETS: usize = 1024;
+
+    pub fn new(
+        proto: DpoProto,
+        buckets: &[DpoId],
+        flags: ReplicateFlags,
+    ) -> Result<Self, DpoError> {
+        if buckets.is_empty() || buckets.len() > Self::MAX_BUCKETS {
+            return Err(DpoError::InvalidBucketCount);
+        }
+        let first = buckets[0];
+        let mut inline_buckets = [first; Self::INLINE_BUCKETS];
+        for (slot, bucket) in buckets.iter().take(Self::INLINE_BUCKETS).enumerate() {
+            inline_buckets[slot] = *bucket;
+        }
+        let overflow_buckets = if buckets.len() > Self::INLINE_BUCKETS {
+            buckets[Self::INLINE_BUCKETS..].to_vec().into_boxed_slice()
+        } else {
+            Box::new([])
+        };
+        Ok(Self {
+            bucket_count: u16::try_from(buckets.len()).expect("replicate bucket count fits u16"),
+            proto,
+            flags,
+            lock_count: 0,
+            inline_buckets,
+            overflow_buckets,
+        })
+    }
+
+    #[inline(always)]
+    pub fn bucket(&self, index: u16) -> Option<DpoId> {
+        let index = usize::from(index);
+        if index >= usize::from(self.bucket_count) {
+            return None;
+        }
+        if index < Self::INLINE_BUCKETS {
+            return Some(self.inline_buckets[index]);
+        }
+        self.overflow_buckets
+            .get(index - Self::INLINE_BUCKETS)
+            .copied()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
     fn identity_round_trips_without_object_storage() {
-        let id = DpoId::new(DpoType::new(7), DpoProto::IP6, 42, 9);
+        let id = DpoId::with_next(DpoType::new(7), DpoProto::IP6, 42, 9);
         assert_eq!(size_of::<DpoId>(), 8);
         assert_eq!(align_of::<DpoId>(), 8);
         assert_eq!(id.class(), DpoType::new(7));
         assert_eq!(id.proto(), DpoProto::IP6);
         assert_eq!(id.index(), 42);
         assert_eq!(id.next(), 9);
-        assert_eq!(id.stack(11).next(), 11);
     }
 
     #[test]
     fn class_registration_and_stack_are_monotonic() {
         let mut main = DpoMain::new();
         let first = main
-            .register_new_type(&[(DpoProto::IP4, NodeId::new(10))])
+            .register_new_type(&[(DpoProto::IP4, &[NodeId::new(10)][..])])
             .expect("first class");
         let second = main
-            .register_new_type(&[(DpoProto::IP6, NodeId::new(11))])
+            .register_new_type(&[(DpoProto::IP6, &[NodeId::new(11)][..])])
             .expect("second class");
         assert_eq!(second.get(), first.get() + 1);
-        let parent = DpoId::new(first, DpoProto::IP4, 3, 4);
-        main.register_stack_edge(second, DpoProto::IP6, parent, 12)
-            .expect("stack edge");
         assert_eq!(
-            main.stack(second, DpoProto::IP6, parent).unwrap().next(),
-            12
+            main.nodes(first, DpoProto::IP4),
+            Some(&[NodeId::new(10)][..])
+        );
+        assert_eq!(
+            main.nodes(second, DpoProto::IP6),
+            Some(&[NodeId::new(11)][..])
         );
     }
 
@@ -441,16 +648,22 @@ mod tests {
     fn builtin_nodes_and_overflow_buckets_are_owner_supplied() {
         let mut main = DpoMain::new();
         let node = NodeId::new(2);
-        main.register_builtin_node(DpoType::DROP, DpoProto::IP4, node)
+        main.register_builtin(DpoType::DROP, &[(DpoProto::IP4, &[node][..])])
             .expect("builtin node");
         assert_eq!(main.node(DpoType::DROP, DpoProto::IP4), Some(node));
         let buckets: [DpoId; 8] =
-            std::array::from_fn(|index| DpoId::adjacency(DpoProto::IP4, index as u32, 0));
-        let load_balance = LoadBalanceDpo::new(&buckets, LoadBalanceFlags::empty()).unwrap();
-        assert_eq!(load_balance.select(6, &buckets[4..]), Some(buckets[6]));
+            std::array::from_fn(|index| DpoId::adjacency(DpoProto::IP4, index as u32));
+        let load_balance =
+            LoadBalanceDpo::new(DpoProto::IP4, &buckets, LoadBalanceFlags::empty(), 0x9f).unwrap();
         assert_eq!(load_balance.select_bucket(6), Some(buckets[6]));
 
-        let single = LoadBalanceDpo::new(&buckets[..1], LoadBalanceFlags::empty()).unwrap();
+        let single = LoadBalanceDpo::new(
+            DpoProto::IP4,
+            &buckets[..1],
+            LoadBalanceFlags::empty(),
+            0x9f,
+        )
+        .unwrap();
         assert_eq!(single.select_bucket(u32::MAX), Some(buckets[0]));
     }
 }
