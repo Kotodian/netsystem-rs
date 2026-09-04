@@ -260,9 +260,10 @@ is added by this ADR.
 by this service, and class keys allocated by `DpoMain` for plugin-owned
 classes. The service deliberately omits VPP classes whose payload belongs to
 MPLS, LISP, BIER, PW, or another business plugin. Plugin classes are allocated
-after the service's last built-in key and are never reused during the process
-lifetime; the registry's finite `u8` key space is an internal invariant, not a
-recoverable API error.
+from VPP's `DPO_LAST` value (30) and are never reused during the process
+lifetime. Numeric slots for omitted plugin classes remain reserved so the
+service's interface RX/TX keys retain VPP's values (19 and 20); the registry's
+finite `u8` key space is an internal invariant, not a recoverable API error.
 `DpoProto` is the compact data-path protocol key used to select a graph
 node/edge. Its values belong to the DPO graph registration, not to an IP
 family abstraction, next-hop selector, or IP local protocol number. The key
@@ -365,7 +366,6 @@ pub struct LoadBalanceDpo {
     bucket_mask: u16,
     proto: DpoProto,
     flags: LoadBalanceFlags,
-    fib_entry_flags: FibEntryFlags,
     lock_count: u32,
     map_index: u32,
     urpf_index: u32,
@@ -432,6 +432,13 @@ and a parent `DpoId`, derives the graph edge, and returns a copy of the parent
 identity with that edge in `next`. It does not retain a parent object and does
 not return a second ownership type. A concrete owner retains any parent or
 child object it needs through its own typed state.
+
+`DpoMain::next_node` is the read-only counterpart of
+`dpo_get_next_node_by_type_and_proto`; it never creates a graph edge. The
+`DpoId::is_valid` predicate follows `dpo_id_is_valid` and rejects only the
+invalid class or invalid pool-index sentinels. Adjacency classification,
+locking, reset, formatting, uRPF, MTU and interpose remain owner-local typed
+operations; no service-wide callback table or object wrapper is introduced.
 
 | VPP class | Object storage | Hammer owner in this design | `DpoId.index` |
 | --- | --- | --- | --- |

@@ -3,8 +3,6 @@ use std::mem::{align_of, size_of};
 use hammer_core::data_plane::NodeId;
 use hammer_runtime::RuntimeError;
 
-use super::fib::FibEntryFlags;
-
 #[repr(transparent)]
 #[derive(
     Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, serde::Deserialize, serde::Serialize,
@@ -45,8 +43,12 @@ impl DpoType {
     pub const ADJACENCY_MCAST_MIDCHAIN: Self = Self(11);
     pub const RECEIVE: Self = Self(12);
     pub const LOOKUP: Self = Self(13);
-    pub const INTERFACE_RX: Self = Self(14);
-    pub const INTERFACE_TX: Self = Self(15);
+    // Values 14..18 and 21..29 are reserved for plugin-owned DPO classes that
+    // are not part of protocol-neutral net service. Keep VPP's numeric layout
+    // so interface DPO identities remain interoperable with the class key
+    // space.
+    pub const INTERFACE_RX: Self = Self(19);
+    pub const INTERFACE_TX: Self = Self(20);
 
     pub const fn new(value: u8) -> Self {
         Self(value)
@@ -129,6 +131,13 @@ impl DpoId {
         (self.0 >> 16) as u16
     }
 
+    /// Returns whether this identity refers to an initialized DPO object.
+    /// The check follows VPP's `dpo_id_is_valid`: the invalid class and the
+    /// invalid pool index are both reserved sentinels.
+    pub const fn is_valid(self) -> bool {
+        self.class().get() != DpoType::INVALID.get() && self.index() != u32::MAX
+    }
+
     // The graph slot is written only after DpoMain has resolved a registered edge.
     const fn stack(self, next: u16) -> Self {
         Self::with_next(self.class(), self.proto(), self.index(), next)
@@ -148,8 +157,6 @@ pub enum DpoError {
     InvalidProtocol { proto: u8 },
     #[error("DPO class {dpo_type} has no node for protocol {proto}")]
     NodeMissing { dpo_type: u8, proto: u8 },
-    #[error("DPO graph edge resolves to different slots for sibling nodes")]
-    GraphEdgeConflict,
     #[error("failed to add DPO graph edge from node {child:?} to parent {parent:?}")]
     GraphEdgeAdd {
         child: NodeId,
@@ -178,6 +185,9 @@ impl Default for DpoMain {
     }
 }
 
+// VPP allocates plugin classes from DPO_LAST (30). The unused values below
+// are deliberately reserved; service net does not define the business classes
+// that occupy them in VPP.
 const DYNAMIC_TYPE_START: u8 = 30;
 const NO_EDGE: u16 = u16::MAX;
 
@@ -284,6 +294,19 @@ impl DpoMain {
             .and_then(|node_ids| node_ids.first().copied())
     }
 
+    /// Returns a previously resolved graph edge without creating topology.
+    /// This is the read-only counterpart of VPP's
+    /// `dpo_get_next_node_by_type_and_proto`.
+    pub fn next_node(
+        &self,
+        child: DpoType,
+        child_proto: DpoProto,
+        parent: DpoType,
+        parent_proto: DpoProto,
+    ) -> Option<u16> {
+        self.edge_slot(child, child_proto, parent, parent_proto)
+    }
+
     pub(crate) fn stack_requires_graph_edge(
         &self,
         child: DpoType,
@@ -299,12 +322,10 @@ impl DpoMain {
         dpo_type: DpoType,
         nodes: &[(DpoProto, &[NodeId])],
     ) -> Result<(), DpoError> {
-        if dpo_type.get() >= DYNAMIC_TYPE_START || dpo_type == DpoType::INVALID {
-            return Err(DpoError::NodeMissing {
-                dpo_type: dpo_type.get(),
-                proto: DpoProto::NONE.get(),
-            });
-        }
+        assert!(
+            dpo_type.get() < DYNAMIC_TYPE_START && dpo_type != DpoType::INVALID,
+            "builtin DPO class key must be in the reserved class range"
+        );
         for (position, (proto, _)) in nodes.iter().enumerate() {
             Self::validate_protocol(*proto)?;
             if nodes[..position].iter().any(|(other, _)| other == proto)
@@ -345,8 +366,11 @@ impl DpoMain {
                     parent: parent_node,
                     source,
                 })?;
-            if edge.is_some_and(|slot| slot != next) {
-                return Err(DpoError::GraphEdgeConflict);
+            if let Some(slot) = edge {
+                assert_eq!(
+                    slot, next,
+                    "DPO sibling graph edges must resolve to one slot"
+                );
             }
             edge = Some(next);
         }
@@ -395,8 +419,11 @@ impl DpoMain {
                         parent: *parent_node,
                         source,
                     })?;
-                if edge.is_some_and(|slot| slot != next) {
-                    return Err(DpoError::GraphEdgeConflict);
+                if let Some(slot) = edge {
+                    assert_eq!(
+                        slot, next,
+                        "DPO sibling graph edges must resolve to one slot"
+                    );
                 }
                 edge = Some(next);
             }
@@ -497,7 +524,6 @@ pub struct LoadBalanceDpo {
     pub bucket_mask: u16,
     pub proto: DpoProto,
     pub flags: LoadBalanceFlags,
-    pub fib_entry_flags: FibEntryFlags,
     pub lock_count: u32,
     pub map_index: u32,
     pub urpf_index: u32,
@@ -540,7 +566,6 @@ impl LoadBalanceDpo {
             bucket_mask: (buckets.len() - 1) as u16,
             proto,
             flags,
-            fib_entry_flags: FibEntryFlags::empty(),
             lock_count: 0,
             map_index: u32::MAX,
             urpf_index: u32::MAX,
@@ -622,6 +647,8 @@ mod tests {
         assert_eq!(id.proto(), DpoProto::IP6);
         assert_eq!(id.index(), 42);
         assert_eq!(id.next(), 9);
+        assert!(id.is_valid());
+        assert!(!DpoId::INVALID.is_valid());
     }
 
     #[test]
@@ -633,6 +660,7 @@ mod tests {
         let second = main
             .register_new_type(&[(DpoProto::IP6, &[NodeId::new(11)][..])])
             .expect("second class");
+        assert_eq!(first.get(), 30);
         assert_eq!(second.get(), first.get() + 1);
         assert_eq!(
             main.nodes(first, DpoProto::IP4),
