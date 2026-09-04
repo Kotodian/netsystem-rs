@@ -356,6 +356,7 @@ impl DpoMain {
         parent: DpoId,
         parent_nodes: &[NodeId],
     ) -> Result<DpoId, DpoError> {
+        hammer_runtime::ensure_main_thread()?;
         if parent_nodes.is_empty() {
             return Err(DpoError::NodeMissing {
                 dpo_type: parent.class().get(),
@@ -415,6 +416,7 @@ impl DpoMain {
         child_proto: DpoProto,
         parent: DpoId,
     ) -> Result<DpoId, DpoError> {
+        hammer_runtime::ensure_main_thread()?;
         let child_nodes = self
             .nodes(child, child_proto)
             .ok_or(DpoError::NodeMissing {
