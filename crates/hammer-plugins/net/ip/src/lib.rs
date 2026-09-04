@@ -31,13 +31,10 @@ hammer_component_macros::declare_plugin!(
     load_after = [],
     init_functions = [
         ip::reassembly::__INIT_FN_IP_REASSEMBLY_INIT,
-        lookup::__INIT_FN_IP_INIT,
+        lookup::__INIT_FN_IP_LOOKUP_INIT,
     ],
     config_functions = [],
-    early_config_functions = [
-        ip::reassembly::__CONFIG_FN_IP_REASSEMBLY_CONFIG,
-        lookup::__CONFIG_FN_IP_CONFIG,
-    ],
+    early_config_functions = [ip::reassembly::__CONFIG_FN_IP_REASSEMBLY_CONFIG,],
     main_loop_enter_functions = [],
     main_loop_exit_functions = [],
     worker_init_functions = [],
@@ -46,15 +43,17 @@ hammer_component_macros::declare_plugin!(
         ip::reassembly::__IP_GRAPH_NODE_IP_REASSEMBLY_NODE,
         ip::local::__IP_GRAPH_NODE_IP_LOCAL_NODE,
         ip::local::__IP_GRAPH_NODE_IP_RECEIVE_NODE,
-        lookup::__SERVICE_GRAPH_NODE_IP_LOOKUP_NODE,
-        lookup::__SERVICE_GRAPH_NODE_ADJACENCY_REWRITE_NODE,
+        lookup::__IP_GRAPH_NODE_IP4_LOOKUP_NODE,
+        lookup::__IP_GRAPH_NODE_IP6_LOOKUP_NODE,
+        lookup::__IP_GRAPH_NODE_IP4_LOAD_BALANCE_NODE,
+        lookup::__IP_GRAPH_NODE_IP6_LOAD_BALANCE_NODE,
     ],
     node_functions = [],
     process_nodes = [ip::reassembly::__PROCESS_NODE_IP_REASSEMBLY_EXPIRE_WALK],
 );
 
 mod config;
-pub mod forwarding;
+mod fib;
 pub mod ip;
 mod lookup;
 pub mod pmtu;
@@ -81,18 +80,11 @@ pub fn path_mtu() -> Option<&'static pmtu::IpPathMtu> {
 }
 
 pub use ip::{
-    IcmpEchoRequestNext, IcmpEchoRequestNode, IcmpEchoRequestTrace, IcmpErrorNext, IcmpErrorNode,
-    IcmpErrorSourceTable, IcmpErrorSourceTableHandle, IcmpErrorTrace, IcmpInputControlPlane,
-    IcmpInputError, IcmpInputNext, IcmpInputNode, IcmpInputTrace, IcmpNodeError, IcmpPathMtuNode,
     IpInputNext, IpInputNode, IpInputTrace, IpLocalArc, IpLocalControlPlane, IpLocalError,
-    IpLocalNext, IpLocalNode, IpLocalSourceCheck, IpLocalTrace, IpLocalTraceStage,
-    IpReassemblyDirectory, IpReassemblyHandoff, IpReassemblyNext, IpReassemblyNode,
-    IpReassemblyTrace, IpReassemblyTraceAction, IpReceiveNode, IpUnicastArc,
-    pack_fragment_owner_value, unpack_fragment_owner_value,
+    IpLocalNext, IpLocalNode, IpLocalTrace, IpLocalTraceStage, IpReassemblyDirectory,
+    IpReassemblyHandoff, IpReassemblyNext, IpReassemblyNode, IpReassemblyTrace,
+    IpReassemblyTraceAction, IpReceiveNode, IpUnicastArc, pack_fragment_owner_value,
+    unpack_fragment_owner_value,
 };
 pub use ip::{IpPathFlags, IpRoutePathBehavior};
-pub use lookup::{
-    AdjacencyRewriteNext, AdjacencyRewriteNode, AdjacencyRewriteNodeError, AdjacencyRewriteTrace,
-    IpLookupControlPlane, IpLookupNext, IpLookupNode, IpLookupTrace,
-};
 pub use protocol::ip::{write_ipv4_push_header, write_ipv6_push_header};

@@ -27,10 +27,10 @@ pub enum IpInputNext {
     Punt,
     #[next("drop")]
     Options,
-    #[next("ip-lookup")]
-    Lookup,
-    #[next("drop")]
-    LookupMulticast,
+    #[next("ip4-lookup")]
+    LookupV4,
+    #[next("ip6-lookup")]
+    LookupV6,
     #[next("icmp-error")]
     IcmpError,
     #[next("ip-reassembly")]
@@ -114,10 +114,7 @@ fn ip_input_process_frame(
     ()
 }
 
-/// Per-instance state held in the global IP input registry. Mirrors the
-/// `OnceLock<Mutex<Vec<...>>>` + `NodeRuntimeData::from_usize` pattern used by
-/// the sibling migrated nodes (`IpLookupNode`, `IcmpInputNode`,
-/// `InterfaceOutputNode`): word 0 of [`NodeRuntimeData`] is the registry slot.
+/// Per-instance state held in the global IP input registry.
 ///
 /// `feature_arc` is `None` at construction (`FeatureArcStartSlot::new()` is
 /// empty) and synced from `self.feature_arc` in [`Node::node_runtime_data`]
@@ -264,6 +261,10 @@ fn next_slot_for_index(
                     IpProtocol::Icmpv6 => 58,
                     IpProtocol::Other(value) => value,
                 }));
+                ip.set_fib_index(crate::lookup::fib_index_for(
+                    parsed.version,
+                    unsafe { transmute::<_, &NetworkOpaque>(buffer.opaque()) }.sw_if_index[0],
+                ));
                 (
                     traced.then_some(IpInputTrace {
                         version: Some(parsed.version),
@@ -284,7 +285,10 @@ fn next_slot_for_index(
         IpInputTarget::Punt => IpInputNext::Punt.slot() as u16,
         IpInputTarget::Options => IpInputNext::Options.slot() as u16,
         IpInputTarget::Lookup => {
-            let default_next = IpInputNext::Lookup.slot() as u16;
+            let default_next = match parsed.version {
+                IpVersion::V4 => IpInputNext::LookupV4.slot() as u16,
+                IpVersion::V6 => IpInputNext::LookupV6.slot() as u16,
+            };
             if let Some(arc) = feature_arc {
                 let Some(interface_index) = ({
                     let buffer = runtime.get_buffer(index)?;
@@ -299,7 +303,10 @@ fn next_slot_for_index(
                 default_next
             }
         }
-        IpInputTarget::LookupMulticast => IpInputNext::LookupMulticast.slot() as u16,
+        IpInputTarget::LookupMulticast => match parsed.version {
+            IpVersion::V4 => IpInputNext::LookupV4.slot() as u16,
+            IpVersion::V6 => IpInputNext::LookupV6.slot() as u16,
+        },
         IpInputTarget::IcmpError => IpInputNext::IcmpError.slot() as u16,
         IpInputTarget::Reassembly => IpInputNext::Reassembly.slot() as u16,
     };

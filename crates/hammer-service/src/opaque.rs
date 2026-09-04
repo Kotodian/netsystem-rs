@@ -42,7 +42,8 @@ pub struct NetworkIpOpaque {
     ip_protocol: u8,
     ip_ecn: u8,
     ip_ecn_valid: u8,
-    reserved: [u8; 10],
+    fib_index: u32,
+    reserved: [u8; 8],
 }
 
 impl Default for NetworkIpOpaque {
@@ -56,7 +57,8 @@ impl Default for NetworkIpOpaque {
             ip_protocol: 0,
             ip_ecn: 0,
             ip_ecn_valid: 0,
-            reserved: [0; 10],
+            fib_index: u32::MAX,
+            reserved: [0; 8],
         };
         opaque.set_fib_index_override(None);
         opaque
@@ -138,6 +140,16 @@ impl NetworkIpOpaque {
             self.ip_ecn = 0;
             self.ip_ecn_valid = 0;
         }
+    }
+
+    #[inline]
+    pub fn fib_index(&self) -> Option<u32> {
+        (self.fib_index != u32::MAX).then_some(self.fib_index)
+    }
+
+    #[inline]
+    pub fn set_fib_index(&mut self, index: Option<u32>) {
+        self.fib_index = index.unwrap_or(u32::MAX);
     }
 
     #[inline]
@@ -243,10 +255,7 @@ impl Default for NetworkOpaqueOverlay {
 #[repr(C)]
 pub struct NetworkOpaque {
     pub sw_if_index: [u32; 2],
-    pub l2_hdr_offset: i16,
     pub l3_hdr_offset: i16,
-    pub l4_hdr_offset: i16,
-    pub feature_arc_index: u8,
     pub oflags: u8,
     overlay: NetworkOpaqueOverlay,
 }
@@ -258,10 +267,7 @@ impl Default for NetworkOpaque {
     fn default() -> Self {
         Self {
             sw_if_index: [u32::MAX; 2],
-            l2_hdr_offset: 0,
             l3_hdr_offset: 0,
-            l4_hdr_offset: 0,
-            feature_arc_index: 0,
             oflags: 0,
             overlay: NetworkOpaqueOverlay::default(),
         }
@@ -299,7 +305,8 @@ impl NetworkOpaque {
                 usize::from(ip.network_header_len()),
             )
             .with_transport_header(
-                self.l4_hdr_offset.max(0) as usize,
+                usize::from(ip.transport_payload_offset())
+                    .saturating_sub(usize::from(ip.transport_header_len())),
                 usize::from(ip.transport_header_len()),
             )
             .with_transport_payload_offset(usize::from(ip.transport_payload_offset()))
@@ -319,9 +326,6 @@ impl NetworkOpaque {
     pub fn set_packet_cursor(&mut self, cursor: BufferPacketCursor) {
         self.l3_hdr_offset = i16::try_from(cursor.network_header_offset())
             .expect("network header offset exceeds i16");
-        self.l4_hdr_offset = i16::try_from(cursor.transport_header_offset())
-            .expect("transport header offset exceeds i16");
-
         let ip = self.ip_mut();
         ip.set_packet_len(u32::try_from(cursor.packet_len()).expect("packet length exceeds u32"));
         ip.set_network_header_len(

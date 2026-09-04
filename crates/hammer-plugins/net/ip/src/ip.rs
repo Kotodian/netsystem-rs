@@ -1,21 +1,23 @@
-pub mod icmp;
+#[path = "input.rs"]
 pub mod input;
+#[path = "local.rs"]
 pub mod local;
+#[path = "reassembly.rs"]
 pub mod reassembly;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, prost::Enumeration)]
+#[repr(i32)]
 pub enum IpRoutePathBehavior {
-    ResolveViaHost,
-    ResolveViaAttached,
-    Local,
-    Drop,
-    UdpEncap,
-    IcmpUnreachable,
-    IcmpProhibit,
-    SourceLookup,
-    Dvr,
-    InterfaceRx,
-    Classify,
+    Normal = 0,
+    Local = 1,
+    Drop = 2,
+    UdpEncap = 3,
+    IcmpUnreachable = 4,
+    IcmpProhibit = 5,
+    SourceLookup = 6,
+    Dvr = 7,
+    InterfaceRx = 8,
+    Classify = 9,
 }
 
 bitflags::bitflags! {
@@ -58,10 +60,6 @@ use hammer_runtime::Network;
 pub(crate) enum IpRuntimeRegistry {
     IpInput,
     IpLocal,
-    IpLookup,
-    IcmpInput,
-    IcmpError,
-    AdjacencyRewrite,
 }
 
 impl std::fmt::Display for IpRuntimeRegistry {
@@ -69,10 +67,6 @@ impl std::fmt::Display for IpRuntimeRegistry {
         f.write_str(match self {
             Self::IpInput => "ip-input",
             Self::IpLocal => "ip-local",
-            Self::IpLookup => "ip-lookup",
-            Self::IcmpInput => "icmp-input",
-            Self::IcmpError => "icmp-error",
-            Self::AdjacencyRewrite => "adjacency-rewrite",
         })
     }
 }
@@ -80,8 +74,6 @@ impl std::fmt::Display for IpRuntimeRegistry {
 /// Control-plane operations that require IP plugin runtime state.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum IpControlOperation {
-    IcmpConsumerAttach,
-    IcmpTypeRegistration,
     IpReceiveRegistration,
     IpProtocolRegistration,
 }
@@ -89,8 +81,6 @@ pub(crate) enum IpControlOperation {
 impl std::fmt::Display for IpControlOperation {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str(match self {
-            Self::IcmpConsumerAttach => "icmp consumer attach",
-            Self::IcmpTypeRegistration => "icmp type registration",
             Self::IpReceiveRegistration => "ip-receive registration",
             Self::IpProtocolRegistration => "ip protocol registration",
         })
@@ -111,19 +101,12 @@ pub(crate) enum IpControlError {
     },
     #[error("{operation} requires a node runtime")]
     NodeRuntimeUnavailable { operation: IpControlOperation },
-    #[error("ICMP type registration requires an attached input consumer")]
-    ConsumerNotAttached,
 }
 
-pub use icmp::{
-    IcmpEchoRequestNext, IcmpEchoRequestNode, IcmpEchoRequestTrace, IcmpErrorNext, IcmpErrorNode,
-    IcmpErrorSourceTable, IcmpErrorSourceTableHandle, IcmpErrorTrace, IcmpInputControlPlane,
-    IcmpInputError, IcmpInputNext, IcmpInputNode, IcmpInputTrace, IcmpNodeError, IcmpPathMtuNode,
-};
 pub use input::{IpInputNext, IpInputNode, IpInputTrace, IpUnicastArc};
 pub use local::{
-    IpLocalArc, IpLocalControlPlane, IpLocalError, IpLocalNext, IpLocalNode, IpLocalSourceCheck,
-    IpLocalTrace, IpLocalTraceStage, IpReceiveNode,
+    IpLocalArc, IpLocalControlPlane, IpLocalError, IpLocalNext, IpLocalNode, IpLocalTrace,
+    IpLocalTraceStage, IpReceiveNode,
 };
 pub use reassembly::{
     IpReassemblyDirectory, IpReassemblyHandoff, IpReassemblyNext, IpReassemblyNode,
@@ -142,7 +125,7 @@ pub(crate) fn network_for_protocol(protocol: IpProtocol) -> Option<Network> {
 }
 
 #[inline(always)]
-pub(crate) fn ip_header(
+pub fn ip_header(
     packet: &[u8],
     cursor: BufferPacketCursor,
 ) -> Result<ParsedIpPacket, IpInputError> {

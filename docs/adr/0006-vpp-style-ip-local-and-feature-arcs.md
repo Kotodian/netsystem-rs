@@ -1021,7 +1021,7 @@ wire, graph, failure-atomicity, and packet-path contracts remain unchanged.
   `Rc<RefCell<_>>`, so it cannot be stored in shared `InterfaceMain` state. Its
   current one-edge mutation validates before insertion but does not provide an
   all-edges atomic operation or request ADR-0003 Graph Refork itself.
-- `crates/hammer-plugins/net/ip/src/ip/local.rs` defines one shared local node,
+- `crates/hammer-plugins/net/ip/src/local.rs` defines one shared local node,
   receive node, arc, next enum, state snapshot, source-check mode, and
   process-wide runtime mutex for both wire protocols.
 - Issue #291 requires protocol-neutral service ownership, concrete IPv4/IPv6

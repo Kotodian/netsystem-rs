@@ -2,7 +2,6 @@ use std::mem::transmute;
 use std::net::IpAddr;
 use std::sync::{Arc, Mutex, OnceLock};
 
-use crate::protocol::icmp::IcmpHeader;
 use crate::protocol::wire::read_header;
 use arc_swap::ArcSwap;
 use hammer_core::data_plane::{BufferFrame, BufferPacketCursor, Index, NodeId, NodeNext};
@@ -13,7 +12,6 @@ use hammer_runtime::{
 };
 use hammer_runtime::{RuntimeError, RuntimeResult};
 
-use crate::forwarding::{DpoType, FibLookupResult, FibTableHandle};
 use hammer_service::data_plane::{FeatureArcStartHandle, set_index_node_error};
 use hammer_service::opaque::NetworkOpaque;
 
@@ -25,6 +23,14 @@ const IP_PROTOCOL_UDP: u8 = 17;
 const IP_PROTOCOL_ICMP6: u8 = 58;
 const TCP_HEADER_MIN_LEN: usize = 20;
 const ICMP_HEADER_MIN_LEN: usize = 4;
+
+#[derive(Clone, Copy)]
+#[repr(C, packed)]
+struct IcmpHeader {
+    icmp_type: u8,
+    code: u8,
+    checksum: [u8; 2],
+}
 
 #[hammer_component_macros::feature_arc]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -50,7 +56,6 @@ pub enum IpLocalError {
     BadLength,
     BadTransportHeader,
     BadChecksum,
-    SourceCheckFailed,
     UnknownProtocol,
 }
 
@@ -84,19 +89,6 @@ impl IpLocalError {
     }
 }
 
-#[derive(Debug, Clone)]
-pub enum IpLocalSourceCheck {
-    Disabled,
-    ReverseFib(FibTableHandle),
-}
-
-impl Default for IpLocalSourceCheck {
-    #[inline]
-    fn default() -> Self {
-        Self::Disabled
-    }
-}
-
 #[derive(Clone)]
 pub struct IpLocalControlPlane {
     inner: Arc<ArcSwap<IpLocalState>>,
@@ -108,12 +100,6 @@ impl IpLocalControlPlane {
         Self {
             inner: Arc::new(ArcSwap::from_pointee(IpLocalState::new())),
         }
-    }
-
-    #[inline]
-    pub fn with_source_check(self, source_check: IpLocalSourceCheck) -> Self {
-        self.publish_source_check(source_check);
-        self
     }
 
     #[inline]
@@ -144,21 +130,11 @@ impl IpLocalControlPlane {
         });
         Ok(())
     }
-
-    #[inline]
-    pub fn publish_source_check(&self, source_check: IpLocalSourceCheck) {
-        self.inner.rcu(|current| {
-            let mut next = IpLocalState::clone(current);
-            next.source_check = source_check.clone();
-            next
-        });
-    }
 }
 
 #[derive(Debug, Clone)]
 struct IpLocalState {
     protocol_nexts: Box<[Option<u16>; 256]>,
-    source_check: IpLocalSourceCheck,
 }
 
 impl IpLocalState {
@@ -166,7 +142,6 @@ impl IpLocalState {
     fn new() -> Self {
         Self {
             protocol_nexts: Box::new([None; 256]),
-            source_check: IpLocalSourceCheck::Disabled,
         }
     }
 
@@ -618,23 +593,6 @@ fn process_index(
     refresh_basic_metadata(runtime, index, &parsed, transport_len)?;
 
     if stage.is_head_of_feature_arc() {
-        if !source_check_passes(state, &parsed) {
-            set_index_node_error(runtime, index, IpLocalError::SourceCheckFailed)?;
-            let resolved = state.drop_slot();
-            let _ = add_packet_trace!(
-                runtime,
-                index,
-                IpLocalTrace {
-                    stage: stage.trace_stage(),
-                    version: Some(parsed.version),
-                    protocol: Some(parsed.protocol),
-                    transport_header_len: transport_len.unwrap_or_default(),
-                    error: Some(IpLocalError::SourceCheckFailed.code()),
-                    next: resolved,
-                },
-            );
-            return Ok(resolved);
-        }
         if let Some(feature_arc) = feature_arc {
             let default_slot = state.protocol_next_slot(parsed.protocol);
             let interface_index = {
@@ -755,27 +713,6 @@ fn refresh_basic_metadata(
             .with_transport_payload_offset(parsed.transport_header_offset + transport_header_len),
     );
     Ok(())
-}
-
-#[inline(always)]
-fn source_check_passes(state: &IpLocalState, parsed: &ParsedIpPacket) -> bool {
-    let IpLocalSourceCheck::ReverseFib(handle) = &state.source_check else {
-        return true;
-    };
-    let fib = handle.table();
-    let result = match parsed.source {
-        IpAddr::V4(source) => fib.lookup_ip4(source, 0),
-        IpAddr::V6(source) => fib.lookup_ip6(source, 0),
-    };
-    result.is_some_and(source_lookup_result_is_usable)
-}
-
-#[inline(always)]
-fn source_lookup_result_is_usable(result: FibLookupResult) -> bool {
-    !matches!(
-        result.dpo.class(),
-        DpoType::DROP | DpoType::PUNT | DpoType::RECEIVE
-    )
 }
 
 #[inline(always)]

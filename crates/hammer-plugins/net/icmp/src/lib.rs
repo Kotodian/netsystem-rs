@@ -3,6 +3,9 @@ use std::sync::OnceLock;
 use hammer_core::data_plane::NodeId;
 use hammer_runtime::{RuntimeError, RuntimeResult};
 
+mod icmp;
+mod protocol;
+
 #[derive(Debug, Clone, Copy, Default)]
 pub struct IcmpMain;
 
@@ -29,8 +32,8 @@ impl IcmpMain {
 }
 
 #[hammer_component_macros::init_function(name = "icmp_main_init", runs_after = ["ip_init"])]
-fn init_icmp_main() -> RuntimeResult<std::sync::Arc<IcmpMain>> {
-    Ok(std::sync::Arc::new(IcmpMain::init()?))
+fn init_icmp_main() -> RuntimeResult<()> {
+    IcmpMain::init().map(|_| ())
 }
 
 hammer_component_macros::declare_plugin!(
@@ -43,10 +46,10 @@ hammer_component_macros::declare_plugin!(
     main_loop_exit_functions = [],
     worker_init_functions = [],
     graph_nodes = [
-        hammer_plugin_ip::ip::icmp::__IP_GRAPH_NODE_ICMP_INPUT_NODE,
-        hammer_plugin_ip::ip::icmp::__IP_GRAPH_NODE_ICMP_ECHO_REQUEST_NODE,
-        hammer_plugin_ip::ip::icmp::__IP_GRAPH_NODE_ICMP_PATH_MTU_NODE,
-        hammer_plugin_ip::ip::icmp::__IP_GRAPH_NODE_ICMP_ERROR_NODE,
+        icmp::__IP_GRAPH_NODE_ICMP_INPUT_NODE,
+        icmp::__IP_GRAPH_NODE_ICMP_ECHO_REQUEST_NODE,
+        icmp::__IP_GRAPH_NODE_ICMP_PATH_MTU_NODE,
+        icmp::__IP_GRAPH_NODE_ICMP_ERROR_NODE,
     ],
     node_functions = [],
     process_nodes = [],

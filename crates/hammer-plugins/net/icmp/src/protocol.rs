@@ -3,8 +3,10 @@ use std::num::NonZeroU64;
 
 use hammer_infra::checksum::{internet_checksum, internet_checksum_parts};
 
-use super::ip::{IpProtocol, IpVersion, apply_ipv4_dont_fragment, parse_ip_header};
-use super::wire::read_header;
+use hammer_plugin_ip::protocol::ip::{
+    IpProtocol, IpVersion, ParsedIpPacket, apply_ipv4_dont_fragment, parse_ip_header,
+};
+use hammer_plugin_ip::protocol::wire::read_header;
 
 #[derive(Clone, Copy)]
 #[repr(C, packed)]
@@ -330,7 +332,7 @@ fn build_ipv6_icmp_error(
     })
 }
 
-fn should_suppress_icmp_error(original: &[u8], parsed: &super::ip::ParsedIpPacket) -> bool {
+fn should_suppress_icmp_error(original: &[u8], parsed: &ParsedIpPacket) -> bool {
     match (parsed.source, parsed.destination) {
         (IpAddr::V4(source), IpAddr::V4(destination)) => {
             source.is_unspecified()
@@ -352,7 +354,7 @@ fn should_suppress_icmp_error(original: &[u8], parsed: &super::ip::ParsedIpPacke
 }
 
 #[inline(always)]
-fn icmp_error_type_should_suppress(original: &[u8], parsed: &super::ip::ParsedIpPacket) -> bool {
+fn icmp_error_type_should_suppress(original: &[u8], parsed: &ParsedIpPacket) -> bool {
     let Ok(header) = read_header::<IcmpHeader>(original, parsed.transport_header_offset) else {
         return true;
     };

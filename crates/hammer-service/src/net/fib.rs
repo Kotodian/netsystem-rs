@@ -1,4 +1,3 @@
-use std::cmp::Reverse;
 use std::collections::BTreeMap;
 
 use super::dpo::DpoId;
@@ -220,10 +219,10 @@ pub trait FibTableBackend {
 
     fn lookup(&self, prefix: Self::Prefix) -> Option<u32>;
     fn lookup_exact(&self, prefix: Self::Prefix) -> Option<u32>;
-    fn less_specific(&self, prefix: Self::Prefix) -> Option<u32>;
+    fn less_specific(&self, prefix: Self::Prefix) -> Option<(Self::Prefix, u32)>;
     fn insert_entry(&mut self, prefix: Self::Prefix, entry: u32) -> Result<(), Self::Error>;
     fn remove_entry(&mut self, prefix: Self::Prefix, entry: u32) -> Result<(), Self::Error>;
-    fn forwarding_lookup(&self, address: Self::PacketAddress) -> Option<u32>;
+    fn forwarding_lookup(&self, address: Self::PacketAddress) -> Option<DpoId>;
     fn forwarding_update(&mut self, prefix: Self::Prefix, dpo: DpoId) -> Result<(), Self::Error>;
     fn forwarding_remove(
         &mut self,
@@ -238,7 +237,7 @@ pub trait FibTableBackend {
     ) -> Result<Option<DpoId>, Self::Error>;
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct FibTable<P, B>
 where
     P: Copy + Ord,
@@ -248,6 +247,7 @@ where
     entries: Vec<FibEntry>,
     prefixes: BTreeMap<P, u32>,
     source_references: BTreeMap<(u32, FibSource), u8>,
+    source_forwarding: BTreeMap<(P, FibSource), DpoId>,
 }
 
 impl<P, B> FibTable<P, B>
@@ -261,6 +261,7 @@ where
             entries: Vec::new(),
             prefixes: BTreeMap::new(),
             source_references: BTreeMap::new(),
+            source_forwarding: BTreeMap::new(),
         }
     }
 
@@ -284,11 +285,105 @@ where
         self.backend.lookup_exact(prefix)
     }
 
-    pub fn forwarding_lookup(&self, address: B::PacketAddress) -> Option<u32> {
+    pub fn forwarding_lookup(&self, address: B::PacketAddress) -> Option<DpoId> {
         self.backend.forwarding_lookup(address)
     }
 
+    pub fn add_route(
+        &mut self,
+        prefix: P,
+        source: FibSource,
+        forwarding: DpoId,
+    ) -> Result<u32, FibError>
+    where
+        B: Clone,
+    {
+        let previous = self.clone();
+        let entry = self.add_source(prefix, source)?;
+        let mut projection = self.entries[entry as usize].clone();
+        projection.forwarding = Some(forwarding);
+        let Some(forwarding) = self
+            .backend
+            .project_forwarding(&projection, source)
+            .map_err(|_| FibError::BackendRejected)?
+        else {
+            *self = previous;
+            return Err(FibError::BackendRejected);
+        };
+        if self.backend.forwarding_update(prefix, forwarding).is_err() {
+            *self = previous;
+            return Err(FibError::BackendRejected);
+        }
+        self.entries[entry as usize].forwarding = Some(forwarding);
+        self.source_forwarding.insert((prefix, source), forwarding);
+        Ok(entry)
+    }
+
+    pub fn remove_route(&mut self, prefix: P, source: FibSource) -> Result<bool, FibError>
+    where
+        B: Clone,
+    {
+        let Some(entry) = self.prefixes.get(&prefix).copied() else {
+            return Ok(false);
+        };
+        let previous = self.clone();
+        let old = self.entries[entry as usize].forwarding;
+        let removed = self.remove_source(prefix, source)?;
+        if removed {
+            let source_remains = self.source_references.contains_key(&(entry, source));
+            if source_remains {
+                return Ok(true);
+            }
+            if let Some(old) = old {
+                self.source_forwarding.remove(&(prefix, source));
+                if let Some((winner, _)) = self.entries[entry as usize].sources.first().copied() {
+                    if let Some(dpo) = self.source_forwarding.get(&(prefix, winner)).copied() {
+                        self.backend.forwarding_update(prefix, dpo).map_err(|_| {
+                            *self = previous.clone();
+                            FibError::BackendRejected
+                        })?;
+                        self.entries[entry as usize].forwarding = Some(dpo);
+                        return Ok(true);
+                    }
+                }
+                let cover =
+                    self.backend
+                        .less_specific(prefix)
+                        .and_then(|(cover_prefix, cover_entry)| {
+                            self.entries
+                                .get(cover_entry as usize)
+                                .and_then(|entry| entry.forwarding)
+                                .map(|dpo| (cover_prefix, dpo))
+                        });
+                self.backend
+                    .forwarding_remove(prefix, old, cover)
+                    .map_err(|_| {
+                        *self = previous.clone();
+                        FibError::BackendRejected
+                    })?;
+            }
+            if self.prefixes.contains_key(&prefix) {
+                self.entries[entry as usize].forwarding = None;
+            } else {
+                self.entries[entry as usize].forwarding = None;
+            }
+        }
+        Ok(removed)
+    }
+
     pub fn add_source(&mut self, prefix: P, source: FibSource) -> Result<u32, FibError> {
+        if let Some(entry) = self.prefixes.get(&prefix).copied() {
+            if self
+                .source_references
+                .get(&(entry, source))
+                .copied()
+                .unwrap_or(0)
+                .checked_add(1)
+                .is_none()
+            {
+                return Err(FibError::ReferenceCountOverflow);
+            }
+        }
         let entry = if let Some(index) = self.prefixes.get(&prefix).copied() {
             index
         } else {
@@ -306,14 +401,12 @@ where
         };
         let key = (entry, source);
         let references = self.source_references.entry(key).or_insert(0);
-        *references = references
-            .checked_add(1)
-            .ok_or(FibError::ReferenceCountOverflow)?;
+        *references += 1;
         if *references == 1 {
             self.entries[entry as usize].sources.push((source, entry));
             self.entries[entry as usize]
                 .sources
-                .sort_by_key(|(candidate, _)| Reverse(candidate.priority));
+                .sort_by_key(|(candidate, _)| candidate.priority);
         }
         Ok(entry)
     }

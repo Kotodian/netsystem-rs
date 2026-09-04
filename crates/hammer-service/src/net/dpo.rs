@@ -119,6 +119,8 @@ pub enum DpoError {
     StackEdgeConflict,
     #[error("load-balance bucket count must be a non-zero power of two")]
     InvalidBucketCount,
+    #[error("load-balance pool index exceeds DPO identity capacity")]
+    LoadBalancePoolExhausted,
 }
 
 #[derive(Debug, Clone)]
@@ -145,6 +147,7 @@ pub struct DpoMain {
     classes: Vec<DpoClassState>,
     builtins: Vec<(DpoType, DpoProto, NodeId)>,
     edges: Vec<DpoStackEdge>,
+    load_balances: Vec<LoadBalanceDpo>,
 }
 
 impl DpoMain {
@@ -153,6 +156,7 @@ impl DpoMain {
             classes: Vec::new(),
             builtins: Vec::new(),
             edges: Vec::new(),
+            load_balances: Vec::new(),
         }
     }
 
@@ -255,6 +259,31 @@ impl DpoMain {
             .iter()
             .find_map(|edge| (edge.key == key).then_some(parent.stack(edge.next)))
     }
+
+    pub fn create_load_balance(
+        &mut self,
+        proto: DpoProto,
+        next: u16,
+        load_balance: LoadBalanceDpo,
+    ) -> Result<DpoId, DpoError> {
+        let index = u32::try_from(self.load_balances.len())
+            .map_err(|_| DpoError::LoadBalancePoolExhausted)?;
+        self.load_balances.push(load_balance);
+        Ok(DpoId::load_balance(proto, index, next))
+    }
+
+    #[inline(always)]
+    pub fn load_balance(&self, index: u32) -> Option<&LoadBalanceDpo> {
+        self.load_balances.get(index as usize)
+    }
+
+    #[inline(always)]
+    pub fn select_load_balance(&self, dpo: DpoId, hash: u32) -> Option<DpoId> {
+        (dpo.class() == DpoType::LOAD_BALANCE)
+            .then(|| self.load_balance(dpo.index()))
+            .flatten()
+            .and_then(|load_balance| load_balance.select_bucket(hash))
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -297,14 +326,16 @@ bitflags::bitflags! {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LoadBalanceDpo {
     pub lock_count: u16,
     pub bucket_count: u16,
     pub bucket_mask: u16,
+    pub flow_hash_config: u16,
     pub flags: LoadBalanceFlags,
     pub inline_buckets: [DpoId; 4],
     pub overflow_index: u32,
+    overflow_buckets: Box<[DpoId]>,
 }
 
 impl LoadBalanceDpo {
@@ -326,10 +357,16 @@ impl LoadBalanceDpo {
         for (slot, bucket) in buckets.iter().take(4).enumerate() {
             inline_buckets[slot] = *bucket;
         }
+        let overflow_buckets: Box<[DpoId]> = if buckets.len() > Self::INLINE_BUCKETS {
+            buckets[Self::INLINE_BUCKETS..].into()
+        } else {
+            Box::new([])
+        };
         Ok(Self {
             lock_count: 0,
             bucket_count: buckets.len() as u16,
             bucket_mask: (buckets.len() - 1) as u16,
+            flow_hash_config: 0,
             flags,
             inline_buckets,
             overflow_index: if buckets.len() > 4 {
@@ -337,19 +374,31 @@ impl LoadBalanceDpo {
             } else {
                 Self::NO_OVERFLOW
             },
+            overflow_buckets,
         })
     }
 
-    pub fn select_inline(&self, hash: usize) -> DpoId {
-        self.inline_buckets[hash & usize::from(self.bucket_mask.min(3))]
+    pub fn select_inline(&self, hash: u32) -> DpoId {
+        self.inline_buckets[(hash & u32::from(self.bucket_mask.min(3))) as usize]
     }
 
-    pub fn select(&self, hash: usize, overflow: &[DpoId]) -> Option<DpoId> {
-        let bucket = hash & usize::from(self.bucket_mask);
+    pub fn select(&self, hash: u32, overflow: &[DpoId]) -> Option<DpoId> {
+        let bucket = (hash & u32::from(self.bucket_mask)) as usize;
         if bucket < Self::INLINE_BUCKETS {
             return Some(self.inline_buckets[bucket]);
         }
-        overflow.get(bucket).copied()
+        overflow.get(bucket - Self::INLINE_BUCKETS).copied()
+    }
+
+    #[inline(always)]
+    pub fn select_bucket(&self, hash: u32) -> Option<DpoId> {
+        let bucket = (hash & u32::from(self.bucket_mask)) as usize;
+        if bucket < Self::INLINE_BUCKETS {
+            return Some(self.inline_buckets[bucket]);
+        }
+        self.overflow_buckets
+            .get(bucket - Self::INLINE_BUCKETS)
+            .copied()
     }
 }
 
@@ -395,8 +444,13 @@ mod tests {
         main.register_builtin_node(DpoType::DROP, DpoProto::IP4, node)
             .expect("builtin node");
         assert_eq!(main.node(DpoType::DROP, DpoProto::IP4), Some(node));
-        let buckets = [DpoId::drop(DpoProto::IP4, 0); 8];
+        let buckets: [DpoId; 8] =
+            std::array::from_fn(|index| DpoId::adjacency(DpoProto::IP4, index as u32, 0));
         let load_balance = LoadBalanceDpo::new(&buckets, LoadBalanceFlags::empty()).unwrap();
-        assert_eq!(load_balance.select(6, &buckets), Some(buckets[6]));
+        assert_eq!(load_balance.select(6, &buckets[4..]), Some(buckets[6]));
+        assert_eq!(load_balance.select_bucket(6), Some(buckets[6]));
+
+        let single = LoadBalanceDpo::new(&buckets[..1], LoadBalanceFlags::empty()).unwrap();
+        assert_eq!(single.select_bucket(u32::MAX), Some(buckets[0]));
     }
 }

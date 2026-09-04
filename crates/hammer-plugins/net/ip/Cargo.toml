@@ -19,6 +19,7 @@ hammer-service = { path = "../../../hammer-service", default-features = false }
 hammer-component-macros = { path = "../../../hammer-component-macros" }
 linkme = { workspace = true }
 ipnet = { workspace = true }
+prost = { workspace = true }
 serde = { workspace = true }
 thiserror = { workspace = true }
 toml = { workspace = true }

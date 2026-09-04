@@ -1101,10 +1101,15 @@ name = "hammer-plugin-icmp"
 version = "0.1.0"
 dependencies = [
  "abi_stable",
+ "arc-swap",
  "hammer-component-macros",
  "hammer-core",
+ "hammer-infra",
  "hammer-plugin-ip",
  "hammer-runtime",
+ "hammer-service",
+ "serde",
+ "thiserror 2.0.18",
 ]
 
 [[package]]
@@ -1122,6 +1127,7 @@ dependencies = [
  "humantime-serde",
  "ipnet",
  "linkme",
+ "prost",
  "serde",
  "thiserror 2.0.18",
  "toml",
