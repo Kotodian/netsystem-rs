@@ -123,8 +123,7 @@ impl NetMain {
         }
 
         let bucket_count = usize::from(load_balance.bucket_count);
-        if bucket_count == 0
-            || !bucket_count.is_power_of_two()
+        if (bucket_count != 0 && !bucket_count.is_power_of_two())
             || bucket_count > LoadBalanceDpo::MAX_BUCKETS
         {
             return Err(DpoError::InvalidBucketCount);
@@ -155,20 +154,82 @@ impl NetMain {
         mut load_balance: LoadBalanceDpo,
     ) -> Result<DpoId, DpoError> {
         let bucket_count = usize::from(load_balance.bucket_count);
-        for bucket in
-            &mut load_balance.inline_buckets[..bucket_count.min(LoadBalanceDpo::INLINE_BUCKETS)]
-        {
-            *bucket = self
-                .dpo_main_mut()
-                .stack(runtime, DpoType::LOAD_BALANCE, proto, *bucket)?;
-        }
-        for bucket in &mut load_balance.overflow_buckets {
+        for bucket_index in 0..bucket_count {
+            let bucket = load_balance
+                .bucket_mut(bucket_index)
+                .expect("validated load-balance bucket index");
             *bucket = self
                 .dpo_main_mut()
                 .stack(runtime, DpoType::LOAD_BALANCE, proto, *bucket)?;
         }
         let index = self.load_balances_mut().insert(load_balance);
         Ok(DpoId::load_balance(proto, index))
+    }
+
+    /// Replaces all buckets of an existing load-balance object.
+    ///
+    /// VPP updates the bucket storage and the reported bucket count as one
+    /// worker-visible transaction. The detached child identities are stacked
+    /// before the pool object is changed; the barrier therefore never exposes
+    /// a count whose backing storage is incomplete.
+    pub fn update_load_balance(
+        &self,
+        runtime: &mut DataPlaneMain,
+        dpo: DpoId,
+        buckets: &[DpoId],
+    ) -> Result<(), DpoError> {
+        hammer_runtime::ensure_main_thread()?;
+        if dpo.class() != DpoType::LOAD_BALANCE {
+            return Err(DpoError::TypeMismatch {
+                actual: dpo.class().get(),
+                expected: DpoType::LOAD_BALANCE.get(),
+            });
+        }
+        LoadBalanceDpo::validate_bucket_count(buckets.len())?;
+        if self.load_balance(dpo.index()).is_none() {
+            return Err(DpoError::ObjectMissing {
+                dpo_type: dpo.class().get(),
+                index: dpo.index(),
+            });
+        }
+
+        let workers_running =
+            hammer_runtime::barrier::global().is_some_and(|barrier| barrier.worker_count() != 0);
+        if workers_running
+            && !hammer_runtime::barrier::global().is_some_and(|barrier| barrier.is_pending())
+        {
+            hammer_runtime::worker_thread_barrier_sync!(runtime, {
+                self.update_load_balance_inner(runtime, dpo, buckets)
+            })
+        } else {
+            self.update_load_balance_inner(runtime, dpo, buckets)
+        }
+    }
+
+    fn update_load_balance_inner(
+        &self,
+        runtime: &mut DataPlaneMain,
+        dpo: DpoId,
+        buckets: &[DpoId],
+    ) -> Result<(), DpoError> {
+        let proto = dpo.proto();
+        let mut stacked = Vec::with_capacity(buckets.len());
+        for &bucket in buckets {
+            stacked.push(self.dpo_main_mut().stack(
+                runtime,
+                DpoType::LOAD_BALANCE,
+                proto,
+                bucket,
+            )?);
+        }
+        let load_balance =
+            self.load_balances_mut()
+                .get_mut(dpo.index())
+                .ok_or(DpoError::ObjectMissing {
+                    dpo_type: dpo.class().get(),
+                    index: dpo.index(),
+                })?;
+        load_balance.replace_buckets(&stacked)
     }
 
     #[inline(always)]

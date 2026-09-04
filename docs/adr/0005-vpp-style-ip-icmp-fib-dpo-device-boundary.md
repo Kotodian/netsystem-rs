@@ -361,6 +361,7 @@ pub struct AdjacencyDpo<A, R> {
     child: Option<DpoId>,
 }
 
+#[repr(C, align(64))]
 pub struct LoadBalanceDpo {
     bucket_count: u16,
     bucket_mask: u16,
@@ -370,8 +371,12 @@ pub struct LoadBalanceDpo {
     map_index: u32,
     urpf_index: u32,
     hash_config: u16,
+    overflow: Option<Box<LoadBalanceOverflow>>,
     inline_buckets: [DpoId; 4],
-    overflow_buckets: Box<[DpoId]>,
+}
+
+struct LoadBalanceOverflow {
+    buckets: Box<[DpoId]>,
 }
 ```
 
@@ -781,10 +786,9 @@ by this ADR.
 ### Data layout and packet-path performance
 
 The layout contract follows VPP's cacheline decisions without turning them into
-a second abstraction layer. `hammer-infra::align::CACHE_LINE` remains 64 bytes,
-`VEC_MIN_ALIGN` remains the 8-byte minimum allocation alignment, and
-`CacheLineAlignMark` is the existing marker for a cache-aligned record or field
-group. No new alignment helper or DPO wrapper is introduced.
+a second abstraction layer. `hammer-infra::align::CACHE_LINE` remains 64 bytes
+and `VEC_MIN_ALIGN` remains the 8-byte minimum allocation alignment. No marker
+field, alignment helper, or DPO wrapper is introduced.
 
 `DpoId` is the compact exception to cacheline-sized pool objects. Its private
 `u64` representation must satisfy both `size_of::<DpoId>() == 8` and
@@ -797,25 +801,30 @@ each `AdjacencyDpo<A, R>` instantiation are allocated at a cacheline-aligned
 base. The fields read by a packet node come first; control-only fields are kept
 after the hot prefix or in owner-local side storage. A concrete instantiation
 adds compile-time `size_of`/`align_of` assertions and, where it uses explicit
-cacheline groups, offset assertions. `repr(C, align(64))` is allowed only for a
-record whose field offsets or cacheline boundaries are an actual FFI/layout
-contract. These DPO objects are Rust-owned; their concrete owners use the
-existing alignment marker and compile-time assertions instead of adding a C ABI
-merely to make a pool fast. Ordinary Rust structs and control-plane records keep
-their normal Rust representation.
+cacheline groups, offset assertions. `repr(C, align(64))` is used only on a
+Rust-owned hot DPO record whose stride is itself the layout contract; it is not
+an ABI export and does not imply C field compatibility. These DPO objects are
+Rust-owned, and ordinary Rust structs and control-plane records keep their
+normal Rust representation.
 
 `LoadBalanceDpo` follows `load_balance_t`'s one-cacheline fast form. Its
 `lock_count` is the concrete owner's published-root count corresponding to
 VPP's `lb_locks`; it is a lifetime reference count, not a mutex, and has no
-manual lock/unlock API. The bucket
-count is a power of two, `bucket_mask` is `bucket_count - 1`, and the first four
-child `DpoId` values are inline. The object contains only the compact hot
-fields and a `u32::MAX`-sentinel owner-local overflow index; when more than four
-buckets are needed, the class owner keeps a contiguous overflow slice keyed by
-the existing load-balance pool index. Bucket selection is therefore a mask and
-an array access in the common case, with no division, map lookup, allocation or
-bucket reconstruction on the packet path. The owner validates the maximum
-bucket count before publication.
+manual lock/unlock API. The bucket count is either zero (the VPP creation
+state) or a power of two; for a non-zero count, `bucket_mask` is
+`bucket_count - 1`. The first four child `DpoId` values are inline. When more
+than four buckets are needed, one owner-local pointer owns a contiguous
+overflow allocation; the object itself remains 64-byte aligned and no fat
+slice pointer is placed in the hot record. The concrete Rust layout asserts
+`size_of::<LoadBalanceDpo>() == 64` and `align_of::<LoadBalanceDpo>() == 64`,
+so a `Pool<LoadBalanceDpo>` gives every element a 64-byte stride. The same
+one-cacheline stride and single-pointer overflow rule applies to
+`ReplicateDpo`, which mirrors VPP's `replicate_t` layout.
+Bucket selection is therefore a
+mask and an array access in the common case, with no division, map lookup,
+allocation or bucket reconstruction on the packet path. The owner validates
+the maximum bucket count before publication, and a zero-bucket object returns
+no child until a later update fills it.
 
 `LookupDpo` keeps its FIB/table/input/cast facts in the first cacheline, and
 `ReceiveDpo<A>` keeps `sw_if_index` and the producer-owned address there. An
@@ -2430,7 +2439,7 @@ introduce another architecture choice.
 | IP route path behavior leaked into service FIB | Path behavior is a wire/API decode concern; service FIB stores configured path facts and owner-supplied next-hop and flags values | `FibPathType` or a fixed `FibPathFlags` made service net own IP actions and mixed them with generic path data | Replace them with IP-owned `IpRoutePathBehavior` and `IpPathFlags`; decode both before constructing `FibPath<N, F>`, retain action data in the IP source owner, and project it through the IP-owned `IpNullDpo` class |
 | IP-null ownership and node behavior were underspecified | VPP's `ip_null_dpo.c` combines a fixed action record with per-protocol `ip4-null`/`ip6-null` nodes, rate limiting and ICMP error nexts | Omitting the object or its node contract either loses explicit-drop semantics or leaves the ICMP/error path undefined | Keep `IpNullDpo` and its immutable action table in `hammer-plugins/net/ip`; define separate `Ip4NullNode`/`Ip6NullNode` adapters, worker-local rate limiting, exact ICMP mappings and drop fallback |
 | PMTU DPO/node shape was incomplete | VPP `ip_pmtu_dpo_t` contains protocol, PMTU, lock count and stacked DPO; `ip_pmtu_dpo_inline` rewrites TX state, traces packet size, fragments, handles IPv4 DF and enqueues generated/original buffers | A parent-only DPO sketch could lose stacked dispatch, lifecycle accounting or fragment/error ownership | `IpPmtuDpo` now names `stacked` and owner-local `published_roots` (the `ipm_locks` reason, not a mutex); `Ip4PmtuNode`/`Ip6PmtuNode` specify the complete VPP fragment, DF/ICMP, drop, trace and buffer enqueue flow |
-| DPO/FIB layout and hot-path cost were unspecified | VPP aligns pool elements and places switch-path fields first; `load_balance_t` keeps four inline buckets and fits in one cacheline, while `ip_adjacency_t` separates hot, rewrite and control groups; Hammer already has 64-byte alignment and opaque-budget assertions | Without an explicit contract, a Rust port can add fat-pointer indirection, map lookups, packet-path allocation, or oversized metadata while still appearing ownership-correct | Reuse `CacheLineAlignMark`, keep `DpoId` at 8 bytes, inline four load-balance buckets, keep overflow storage owner-local, forbid control-plane traversal/allocation in packet lookup, and require concrete size/alignment assertions; no performance number is claimed without a release benchmark |
+| DPO/FIB layout and hot-path cost were unspecified | VPP aligns pool elements and places switch-path fields first; `load_balance_t` and `replicate_t` keep four inline buckets and fit in one cacheline, while `ip_adjacency_t` separates hot, rewrite and control groups | Without an explicit contract, a Rust port can add a marker field, fat-pointer indirection, map lookups, packet-path allocation, or oversized metadata while still appearing ownership-correct | Use `repr(C, align(64))` only on Rust-owned hot DPO records, assert exact 64-byte size/alignment for load-balance and replicate, keep one thin overflow owner pointer plus contiguous storage, inline four buckets, forbid control-plane traversal/allocation in packet lookup, and require concrete layout assertions; this is not an exported C ABI and no performance number is claimed without a release benchmark |
 
 The DPO identity, address abstraction, DSO loading, concrete-owner lifetime and
 layout/packet-path findings are current-project/VPP-backed conclusions. The
@@ -2736,11 +2745,13 @@ ADR and cannot change the interfaces or ownership decisions recorded here.
 - `DpoType` is an opaque class key allocated by `DpoMain` at registration time;
   it is not a closed static Rust enum. `DpoProto` remains only the VPP graph
   protocol discriminator.
-- DPO pool elements use the existing 64-byte `CacheLineAlignMark` contract;
-  hot fields precede control-only state, and each concrete instantiation proves
-  its size, alignment and cacheline offsets at compile time. `LoadBalanceDpo`
-  keeps four inline buckets and a power-of-two mask; larger bucket storage is a
-  contiguous owner-local overflow slice.
+- DPO pool elements use Rust's explicit cacheline layout contract only where the
+  concrete hot object needs it; hot fields precede control-only state, and each
+  concrete instantiation proves its size, alignment and cacheline offsets at
+  compile time. `LoadBalanceDpo` and `ReplicateDpo` are `repr(C, align(64))`,
+  keep four inline buckets, and hold larger bucket storage behind one thin
+  owner pointer to a contiguous block. This is an in-process Rust layout rule,
+  not an exported C ABI.
 - The packet path is allocation-free and map-free after publication:
   dense `sw_if_index[RX]` to `fib_index`, concrete LPM, post-LPM bucket
   selection, cached `DpoId.next`, and `sw_if_index[TX]`. It never walks source

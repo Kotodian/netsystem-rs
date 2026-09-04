@@ -166,7 +166,11 @@ pub enum DpoError {
     },
     #[error("load-balance protocol {actual} does not match requested protocol {expected}")]
     ProtocolMismatch { actual: u8, expected: u8 },
-    #[error("load-balance bucket count must be a non-zero power of two")]
+    #[error("DPO class {actual} does not support operation for class {expected}")]
+    TypeMismatch { actual: u8, expected: u8 },
+    #[error("DPO object {dpo_type}:{index} is not present")]
+    ObjectMissing { dpo_type: u8, index: u32 },
+    #[error("DPO bucket count must be zero or a power of two")]
     InvalidBucketCount,
 }
 
@@ -572,15 +576,25 @@ bitflags::bitflags! {
     }
 }
 
+#[repr(C, align(64))]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ReplicateDpo {
     pub bucket_count: u16,
     pub proto: DpoProto,
     pub flags: ReplicateFlags,
     pub lock_count: u32,
+    overflow: Option<Box<ReplicateOverflow>>,
     pub inline_buckets: [DpoId; 4],
-    overflow_buckets: Box<[DpoId]>,
 }
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ReplicateOverflow {
+    buckets: Box<[DpoId]>,
+}
+
+const _: () = assert!(size_of::<ReplicateDpo>() == 64);
+const _: () = assert!(align_of::<ReplicateDpo>() == 64);
+const _: () = assert!(size_of::<Option<Box<ReplicateOverflow>>>() == size_of::<usize>());
 
 bitflags::bitflags! {
     #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -591,6 +605,7 @@ bitflags::bitflags! {
     }
 }
 
+#[repr(C, align(64))]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LoadBalanceDpo {
     pub bucket_count: u16,
@@ -601,9 +616,18 @@ pub struct LoadBalanceDpo {
     pub map_index: u32,
     pub urpf_index: u32,
     pub flow_hash_config: u16,
+    overflow: Option<Box<LoadBalanceOverflow>>,
     pub inline_buckets: [DpoId; 4],
-    pub(crate) overflow_buckets: Box<[DpoId]>,
 }
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct LoadBalanceOverflow {
+    buckets: Box<[DpoId]>,
+}
+
+const _: () = assert!(size_of::<LoadBalanceDpo>() == 64);
+const _: () = assert!(align_of::<LoadBalanceDpo>() == 64);
+const _: () = assert!(size_of::<Option<Box<LoadBalanceOverflow>>>() == size_of::<usize>());
 
 impl LoadBalanceDpo {
     pub const INLINE_BUCKETS: usize = 4;
@@ -615,25 +639,11 @@ impl LoadBalanceDpo {
         flags: LoadBalanceFlags,
         flow_hash_config: u16,
     ) -> Result<Self, DpoError> {
-        if buckets.is_empty()
-            || !buckets.len().is_power_of_two()
-            || buckets.len() > Self::MAX_BUCKETS
-        {
-            return Err(DpoError::InvalidBucketCount);
-        }
-        let first = buckets[0];
-        let mut inline_buckets = [first; 4];
-        for (slot, bucket) in buckets.iter().take(4).enumerate() {
-            inline_buckets[slot] = *bucket;
-        }
-        let overflow_buckets: Box<[DpoId]> = if buckets.len() > Self::INLINE_BUCKETS {
-            buckets[Self::INLINE_BUCKETS..].to_vec().into_boxed_slice()
-        } else {
-            Box::new([])
-        };
+        Self::validate_bucket_count(buckets.len())?;
+        let (bucket_count, bucket_mask, inline_buckets, overflow) = Self::bucket_storage(buckets);
         Ok(Self {
-            bucket_count: buckets.len() as u16,
-            bucket_mask: (buckets.len() - 1) as u16,
+            bucket_count,
+            bucket_mask,
             proto,
             flags,
             lock_count: 0,
@@ -641,19 +651,82 @@ impl LoadBalanceDpo {
             urpf_index: u32::MAX,
             flow_hash_config,
             inline_buckets,
-            overflow_buckets,
+            overflow,
         })
+    }
+
+    pub(crate) fn validate_bucket_count(count: usize) -> Result<(), DpoError> {
+        if (count != 0 && !count.is_power_of_two()) || count > Self::MAX_BUCKETS {
+            return Err(DpoError::InvalidBucketCount);
+        }
+        Ok(())
+    }
+
+    fn bucket_storage(
+        buckets: &[DpoId],
+    ) -> (
+        u16,
+        u16,
+        [DpoId; Self::INLINE_BUCKETS],
+        Option<Box<LoadBalanceOverflow>>,
+    ) {
+        let mut inline_buckets = [DpoId::INVALID; Self::INLINE_BUCKETS];
+        for (slot, bucket) in buckets.iter().take(Self::INLINE_BUCKETS).enumerate() {
+            inline_buckets[slot] = *bucket;
+        }
+        let overflow = if buckets.len() > Self::INLINE_BUCKETS {
+            Some(Box::new(LoadBalanceOverflow {
+                buckets: buckets[Self::INLINE_BUCKETS..].to_vec().into_boxed_slice(),
+            }))
+        } else {
+            None
+        };
+        (
+            buckets.len() as u16,
+            buckets.len().saturating_sub(1) as u16,
+            inline_buckets,
+            overflow,
+        )
+    }
+
+    pub(crate) fn replace_buckets(&mut self, buckets: &[DpoId]) -> Result<(), DpoError> {
+        Self::validate_bucket_count(buckets.len())?;
+        let (bucket_count, bucket_mask, inline_buckets, overflow) = Self::bucket_storage(buckets);
+        self.inline_buckets = inline_buckets;
+        self.overflow = overflow;
+        self.bucket_count = bucket_count;
+        self.bucket_mask = bucket_mask;
+        Ok(())
     }
 
     #[inline(always)]
     pub fn select_bucket(&self, hash: u32) -> Option<DpoId> {
+        if self.bucket_count == 0 {
+            return None;
+        }
         let bucket = (hash & u32::from(self.bucket_mask)) as usize;
         if bucket < Self::INLINE_BUCKETS {
             return Some(self.inline_buckets[bucket]);
         }
-        self.overflow_buckets
+        self.overflow
+            .as_ref()?
+            .buckets
             .get(bucket - Self::INLINE_BUCKETS)
             .copied()
+    }
+
+    #[inline(always)]
+    pub(crate) fn bucket_mut(&mut self, index: usize) -> Option<&mut DpoId> {
+        if index >= usize::from(self.bucket_count) {
+            return None;
+        }
+        if index < Self::INLINE_BUCKETS {
+            return Some(&mut self.inline_buckets[index]);
+        }
+        self.overflow
+            .as_mut()?
+            .buckets
+            .get_mut(index - Self::INLINE_BUCKETS)
     }
 }
 
@@ -666,18 +739,19 @@ impl ReplicateDpo {
         buckets: &[DpoId],
         flags: ReplicateFlags,
     ) -> Result<Self, DpoError> {
-        if buckets.is_empty() || buckets.len() > Self::MAX_BUCKETS {
+        if buckets.len() > Self::MAX_BUCKETS {
             return Err(DpoError::InvalidBucketCount);
         }
-        let first = buckets[0];
-        let mut inline_buckets = [first; Self::INLINE_BUCKETS];
+        let mut inline_buckets = [DpoId::INVALID; Self::INLINE_BUCKETS];
         for (slot, bucket) in buckets.iter().take(Self::INLINE_BUCKETS).enumerate() {
             inline_buckets[slot] = *bucket;
         }
-        let overflow_buckets = if buckets.len() > Self::INLINE_BUCKETS {
-            buckets[Self::INLINE_BUCKETS..].to_vec().into_boxed_slice()
+        let overflow = if buckets.len() > Self::INLINE_BUCKETS {
+            Some(Box::new(ReplicateOverflow {
+                buckets: buckets[Self::INLINE_BUCKETS..].to_vec().into_boxed_slice(),
+            }))
         } else {
-            Box::new([])
+            None
         };
         Ok(Self {
             bucket_count: u16::try_from(buckets.len()).expect("replicate bucket count fits u16"),
@@ -685,7 +759,7 @@ impl ReplicateDpo {
             flags,
             lock_count: 0,
             inline_buckets,
-            overflow_buckets,
+            overflow,
         })
     }
 
@@ -698,7 +772,9 @@ impl ReplicateDpo {
         if index < Self::INLINE_BUCKETS {
             return Some(self.inline_buckets[index]);
         }
-        self.overflow_buckets
+        self.overflow
+            .as_ref()?
+            .buckets
             .get(index - Self::INLINE_BUCKETS)
             .copied()
     }
@@ -763,5 +839,15 @@ mod tests {
         )
         .unwrap();
         assert_eq!(single.select_bucket(u32::MAX), Some(buckets[0]));
+
+        let empty =
+            LoadBalanceDpo::new(DpoProto::IP4, &[], LoadBalanceFlags::empty(), 0x9f).unwrap();
+        assert_eq!(empty.bucket_count, 0);
+        assert_eq!(empty.select_bucket(u32::MAX), None);
+
+        let empty_replicate =
+            ReplicateDpo::new(DpoProto::IP4, &[], ReplicateFlags::empty()).unwrap();
+        assert_eq!(empty_replicate.bucket_count, 0);
+        assert_eq!(empty_replicate.bucket(0), None);
     }
 }
