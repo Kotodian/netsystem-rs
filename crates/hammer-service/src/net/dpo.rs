@@ -589,7 +589,7 @@ pub struct ReplicateDpo {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct ReplicateOverflow {
-    buckets: Box<[DpoId]>,
+    buckets: Vec<DpoId>,
 }
 
 const _: () = assert!(size_of::<ReplicateDpo>() == 64);
@@ -622,7 +622,7 @@ pub struct LoadBalanceDpo {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct LoadBalanceOverflow {
-    buckets: Box<[DpoId]>,
+    buckets: Vec<DpoId>,
 }
 
 const _: () = assert!(size_of::<LoadBalanceDpo>() == 64);
@@ -676,7 +676,7 @@ impl LoadBalanceDpo {
         }
         let overflow = if buckets.len() > Self::INLINE_BUCKETS {
             Some(Box::new(LoadBalanceOverflow {
-                buckets: buckets[Self::INLINE_BUCKETS..].to_vec().into_boxed_slice(),
+                buckets: buckets[Self::INLINE_BUCKETS..].to_vec(),
             }))
         } else {
             None
@@ -748,7 +748,7 @@ impl ReplicateDpo {
         }
         let overflow = if buckets.len() > Self::INLINE_BUCKETS {
             Some(Box::new(ReplicateOverflow {
-                buckets: buckets[Self::INLINE_BUCKETS..].to_vec().into_boxed_slice(),
+                buckets: buckets[Self::INLINE_BUCKETS..].to_vec(),
             }))
         } else {
             None

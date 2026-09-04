@@ -376,7 +376,7 @@ pub struct LoadBalanceDpo {
 }
 
 struct LoadBalanceOverflow {
-    buckets: Box<[DpoId]>,
+    buckets: Vec<DpoId>,
 }
 ```
 
@@ -814,8 +814,12 @@ manual lock/unlock API. The bucket count is either zero (the VPP creation
 state) or a power of two; for a non-zero count, `bucket_mask` is
 `bucket_count - 1`. The first four child `DpoId` values are inline. When more
 than four buckets are needed, one owner-local pointer owns a contiguous
-overflow allocation; the object itself remains 64-byte aligned and no fat
-slice pointer is placed in the hot record. The concrete Rust layout asserts
+overflow allocation; the object itself remains 64-byte aligned. This is an
+`Option<Box<LoadBalanceOverflow>>`, and `Box<LoadBalanceOverflow>` is a single
+thin owning pointer. A slice box (`Box<[DpoId]>`) is deliberately not used: its
+fat pointer would carry length metadata in the hot record. The overflow block's
+`Vec<DpoId>` owns the contiguous bucket storage out of line. The concrete Rust
+layout asserts
 `size_of::<LoadBalanceDpo>() == 64` and `align_of::<LoadBalanceDpo>() == 64`,
 so a `Pool<LoadBalanceDpo>` gives every element a 64-byte stride. The same
 one-cacheline stride and single-pointer overflow rule applies to
