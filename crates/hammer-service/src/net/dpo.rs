@@ -621,10 +621,7 @@ impl LoadBalanceDpo {
         {
             return Err(DpoError::InvalidBucketCount);
         }
-        let first = buckets
-            .first()
-            .copied()
-            .unwrap_or(DpoId::drop(DpoProto::IP4));
+        let first = buckets[0];
         let mut inline_buckets = [first; 4];
         for (slot, bucket) in buckets.iter().take(4).enumerate() {
             inline_buckets[slot] = *bucket;

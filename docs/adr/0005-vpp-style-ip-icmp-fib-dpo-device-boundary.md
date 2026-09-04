@@ -580,6 +580,15 @@ no longer reads metadata mutated by insertion. Hammer has no load-balance
 combined-counter backing store yet; adding one must include its growth in the
 same creation transaction rather than inventing a separate publication path.
 
+`LoadBalanceDpo::new` is deliberately outside this synchronization rule. It
+only validates caller-owned bucket identities and constructs a detached Rust
+value, including its overflow storage; no worker can observe that value yet.
+The owner enters the barrier only when it resolves bucket graph edges and
+inserts the value into the published pool, then returns its `DpoId`. The same
+split applies to every concrete DPO owner: detached construction is ordinary
+Rust ownership, while pool insertion, root replacement, graph-edge creation,
+and retirement are worker-visible publication transactions.
+
 Graph-edge publication remains a separate decision owned by `DpoMain::stack`
 and `DpoMain::stack_from_node`: each probes the existing edge first and enters
 the macro only when `vlib_node_add_next` would add topology. Startup
