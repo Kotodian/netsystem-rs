@@ -261,10 +261,26 @@ impl DpoMain {
             .ok_or(DpoError::InvalidProtocol { proto: proto.get() })
     }
 
+    /// Class/node metadata is worker-visible after the graph starts. Startup
+    /// registration is allowed before workers exist; live registration must
+    /// already be inside the process barrier, just like VPP's dpo registry
+    /// mutation is serialized with worker graph access.
+    fn require_registration_scope() -> Result<(), DpoError> {
+        if hammer_runtime::barrier::global()
+            .is_some_and(|barrier| barrier.worker_count() != 0 && !barrier.is_pending())
+        {
+            return Err(DpoError::Runtime(
+                RuntimeError::ControlRequiresWorkerBarrier,
+            ));
+        }
+        Ok(())
+    }
+
     pub fn register_new_type(
         &mut self,
         nodes: &[(DpoProto, &[NodeId])],
     ) -> Result<DpoType, DpoError> {
+        Self::require_registration_scope()?;
         for (position, (proto, _)) in nodes.iter().enumerate() {
             Self::validate_protocol(*proto)?;
             if nodes[..position].iter().any(|(other, _)| other == proto) {
@@ -312,6 +328,7 @@ impl DpoMain {
         dpo_type: DpoType,
         nodes: &[(DpoProto, &[NodeId])],
     ) -> Result<(), DpoError> {
+        Self::require_registration_scope()?;
         assert!(
             dpo_type.get() < DYNAMIC_TYPE_START && dpo_type != DpoType::INVALID,
             "builtin DPO class key must be in the reserved class range"

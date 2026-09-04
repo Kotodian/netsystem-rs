@@ -437,6 +437,17 @@ barrier's recursion semantics. It does not retain a parent object and does not
 return a second ownership type. A concrete owner retains any parent or child
 object it needs through its own typed state.
 
+Class registration is a worker-visible graph mutation as well. `DpoMain`'s
+`register_new_type` and `register_builtin` therefore accept startup calls
+before workers exist, or calls made inside an already-held worker barrier; a
+live call outside that scope returns `ControlRequiresWorkerBarrier`. The
+owner-facing `NetMain::register_dpo_class` performs the same main-thread and
+barrier check. This guard is intentionally at `DpoMain`, so a proc-macro
+expansion or another concrete owner cannot bypass publication by calling the
+lower-level registry directly. The registry does not enter a second barrier
+itself; Binary API dispatch or the owner transaction supplies the single
+`worker_thread_barrier_sync!` scope.
+
 `DpoMain::next_node` is the read-only counterpart of
 `dpo_get_next_node_by_type_and_proto`; it never creates a graph edge. The
 `DpoId::is_valid` predicate follows `dpo_id_is_valid` and rejects only the
