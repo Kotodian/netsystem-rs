@@ -1,7 +1,7 @@
 use std::mem::{align_of, size_of};
 
 use hammer_core::data_plane::NodeId;
-use hammer_runtime::RuntimeError;
+use hammer_runtime::{DataPlaneMain, RuntimeError};
 
 #[repr(transparent)]
 #[derive(
@@ -307,16 +307,6 @@ impl DpoMain {
         self.edge_slot(child, child_proto, parent, parent_proto)
     }
 
-    pub(crate) fn stack_requires_graph_edge(
-        &self,
-        child: DpoType,
-        child_proto: DpoProto,
-        parent: DpoId,
-    ) -> bool {
-        self.edge_slot(child, child_proto, parent.class(), parent.proto())
-            .is_none()
-    }
-
     pub fn register_builtin(
         &mut self,
         dpo_type: DpoType,
@@ -345,7 +335,7 @@ impl DpoMain {
     /// identity with that slot installed.
     pub fn stack_from_node(
         &mut self,
-        runtime_nodes: &hammer_runtime::node::NodeRuntime,
+        runtime: &mut DataPlaneMain,
         child_node: NodeId,
         parent: DpoId,
         parent_nodes: &[NodeId],
@@ -356,30 +346,55 @@ impl DpoMain {
                 proto: parent.proto().get(),
             });
         }
-        hammer_runtime::ensure_main_thread_with_barrier()?;
-        let mut edge = None::<u16>;
-        for &parent_node in parent_nodes {
-            let next = runtime_nodes
-                .add_node_next_slot(child_node, parent_node)
-                .map_err(|source| DpoError::GraphEdgeAdd {
-                    child: child_node,
-                    parent: parent_node,
-                    source,
-                })?;
-            if let Some(slot) = edge {
-                assert_eq!(
-                    slot, next,
-                    "DPO sibling graph edges must resolve to one slot"
-                );
-            }
-            edge = Some(next);
+        let needs_barrier = parent_nodes.iter().any(|&parent_node| {
+            runtime
+                .nodes()
+                .node_next_slot_for_target(child_node, parent_node)
+                .expect("validated graph node lookup cannot fail")
+                .is_none()
+        });
+        let workers_running =
+            hammer_runtime::barrier::global().is_some_and(|barrier| barrier.worker_count() != 0);
+        if needs_barrier
+            && workers_running
+            && !hammer_runtime::barrier::global().is_some_and(|barrier| barrier.is_pending())
+        {
+            return hammer_runtime::worker_thread_barrier_sync!(runtime, {
+                self.stack_from_node_inner(runtime, child_node, parent, parent_nodes)
+            });
         }
-        Ok(parent.stack(edge.expect("non-empty parent node list")))
+        self.stack_from_node_inner(runtime, child_node, parent, parent_nodes)
+    }
+
+    fn stack_from_node_inner(
+        &mut self,
+        runtime: &DataPlaneMain,
+        child_node: NodeId,
+        parent: DpoId,
+        parent_nodes: &[NodeId],
+    ) -> Result<DpoId, DpoError> {
+        let edges: Vec<_> = parent_nodes
+            .iter()
+            .copied()
+            .map(|parent_node| (child_node, parent_node))
+            .collect();
+        let slots = runtime
+            .nodes()
+            .add_node_next_slots(&edges)
+            .map_err(|source| {
+                let (child, parent) = edges[0];
+                DpoError::GraphEdgeAdd {
+                    child,
+                    parent,
+                    source,
+                }
+            })?;
+        Ok(parent.stack(*slots.last().expect("non-empty parent node list")))
     }
 
     pub fn stack(
         &mut self,
-        runtime_nodes: &hammer_runtime::node::NodeRuntime,
+        runtime: &mut DataPlaneMain,
         child: DpoType,
         child_proto: DpoProto,
         parent: DpoId,
@@ -408,27 +423,67 @@ impl DpoMain {
             return Ok(parent.stack(next));
         }
 
-        hammer_runtime::ensure_main_thread_with_barrier()?;
-        let mut edge = None::<u16>;
-        for child_node in child_nodes {
-            for parent_node in &parent_nodes {
-                let next = runtime_nodes
-                    .add_node_next_slot(child_node, *parent_node)
-                    .map_err(|source| DpoError::GraphEdgeAdd {
-                        child: child_node,
-                        parent: *parent_node,
-                        source,
-                    })?;
-                if let Some(slot) = edge {
-                    assert_eq!(
-                        slot, next,
-                        "DPO sibling graph edges must resolve to one slot"
-                    );
-                }
-                edge = Some(next);
-            }
+        let workers_running =
+            hammer_runtime::barrier::global().is_some_and(|barrier| barrier.worker_count() != 0);
+        if workers_running
+            && !hammer_runtime::barrier::global().is_some_and(|barrier| barrier.is_pending())
+        {
+            return hammer_runtime::worker_thread_barrier_sync!(runtime, {
+                self.stack_inner(
+                    runtime,
+                    child,
+                    child_proto,
+                    parent,
+                    child_nodes,
+                    parent_nodes,
+                )
+            });
         }
-        let next = edge.expect("non-empty child and parent node lists");
+        self.stack_inner(
+            runtime,
+            child,
+            child_proto,
+            parent,
+            child_nodes,
+            parent_nodes,
+        )
+    }
+
+    fn stack_inner(
+        &mut self,
+        runtime: &DataPlaneMain,
+        child: DpoType,
+        child_proto: DpoProto,
+        parent: DpoId,
+        child_nodes: Vec<NodeId>,
+        parent_nodes: Vec<NodeId>,
+    ) -> Result<DpoId, DpoError> {
+        let edges: Vec<_> = child_nodes
+            .iter()
+            .flat_map(|child_node| {
+                parent_nodes
+                    .iter()
+                    .map(move |parent_node| (*child_node, *parent_node))
+            })
+            .collect();
+        let slots = runtime
+            .nodes()
+            .add_node_next_slots(&edges)
+            .map_err(|source| {
+                let (child, parent) = edges[0];
+                DpoError::GraphEdgeAdd {
+                    child,
+                    parent,
+                    source,
+                }
+            })?;
+        let next = slots[0];
+        for &slot in &slots[1..] {
+            assert_eq!(
+                next, slot,
+                "DPO sibling graph edges must resolve to one slot"
+            );
+        }
         *self.edge_slot_mut(child, child_proto, parent.class(), parent.proto()) = next;
         Ok(parent.stack(next))
     }

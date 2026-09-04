@@ -7,7 +7,7 @@ use std::task::{Context, Poll, Waker};
 
 use crate::error::{RuntimeError, RuntimeResult};
 use crate::trace::TraceFormatter;
-use crate::{DataPlaneMain, Simd};
+use crate::{DataPlaneMain, GlobalMain, Simd};
 use hammer_core::data_plane::{
     BufferFrame, Frame, NodeErrorIndex, NodeErrorIndexError, NodeHandle, NodeId, NodeKind,
     NodeNext, NodeRegistration, NodeState, Pending,
@@ -971,50 +971,100 @@ impl NodeRuntimeInner {
         Ok(())
     }
 
-    fn add_node_next_slot(&mut self, node: NodeId, next: NodeId) -> RuntimeResult<u16> {
+    fn add_node_next_slots(
+        &mut self,
+        edges: &[(NodeId, NodeId)],
+    ) -> RuntimeResult<(Vec<u16>, bool)> {
+        let mut existing_slots = Vec::with_capacity(edges.len());
+        for &(node, next) in edges {
+            self.validate_node(node)?;
+            self.validate_node(next)?;
+            existing_slots.push(
+                self.next_nodes[node.slot() as usize]
+                    .iter()
+                    .position(|target| *target == Some(next))
+                    .map(|slot| {
+                        u16::try_from(slot)
+                            .expect("registered graph next slot must fit its u16 representation")
+                    }),
+            );
+        }
+        if existing_slots.iter().all(Option::is_some) {
+            return Ok((
+                existing_slots
+                    .into_iter()
+                    .map(|slot| slot.expect("all graph edges were present"))
+                    .collect(),
+                false,
+            ));
+        }
+
+        let original_next_nodes = self.next_nodes.clone();
+        let original_pending_next_names = self.pending_next_names.clone();
+        let mut slots = Vec::with_capacity(edges.len());
+        for &(node, next) in edges {
+            let slot = if let Some(slot) = self.next_nodes[node.slot() as usize]
+                .iter()
+                .position(|target| *target == Some(next))
+            {
+                u16::try_from(slot)
+                    .expect("registered graph next slot must fit its u16 representation")
+            } else {
+                let slot = self.next_nodes[node.slot() as usize].len();
+                let slot = match u16::try_from(slot) {
+                    Ok(slot) => slot,
+                    Err(_) => {
+                        self.next_nodes = original_next_nodes;
+                        self.pending_next_names = original_pending_next_names;
+                        return Err(RuntimeError::NodeNextCountOverflow { count: slot });
+                    }
+                };
+                let mut group = self.siblings[node.slot() as usize].clone();
+                group.push(node);
+                for &sibling in &group {
+                    let sibling_slot = sibling.slot() as usize;
+                    assert_eq!(
+                        self.next_nodes[sibling_slot].len(),
+                        usize::from(slot),
+                        "graph siblings must have identical next counts"
+                    );
+                    let pending = &self.pending_next_names[sibling_slot];
+                    if !pending.is_empty() {
+                        assert_eq!(
+                            pending.len(),
+                            usize::from(slot),
+                            "pending named-next table must stay aligned with graph next slots"
+                        );
+                    }
+                }
+                for sibling in group {
+                    let sibling_slot = sibling.slot() as usize;
+                    if !self.pending_next_names[sibling_slot].is_empty() {
+                        self.pending_next_names[sibling_slot].push(None);
+                    }
+                    self.next_nodes[sibling_slot].push(Some(next));
+                }
+                slot
+            };
+            slots.push(slot);
+        }
+        let changed = self.next_nodes != original_next_nodes;
+        Ok((slots, changed))
+    }
+
+    fn node_next_slot_for_target(&self, node: NodeId, next: NodeId) -> RuntimeResult<Option<u16>> {
         self.validate_node(node)?;
         self.validate_node(next)?;
-        if let Some(slot) = self.next_nodes[node.slot() as usize]
+        match self.next_nodes[node.slot() as usize]
             .iter()
             .position(|target| *target == Some(next))
         {
-            return Ok(u16::try_from(slot)
-                .expect("registered graph next slot must fit its u16 representation"));
+            Some(slot) => Ok(Some(
+                u16::try_from(slot)
+                    .expect("registered graph next slot must fit its u16 representation"),
+            )),
+            None => Ok(None),
         }
-        let slot = self
-            .next_nodes
-            .get(node.slot() as usize)
-            .map(Vec::len)
-            .ok_or(RuntimeError::NodeNotRegistered { node })?;
-        let slot =
-            u16::try_from(slot).map_err(|_| RuntimeError::NodeNextCountOverflow { count: slot })?;
-        let mut group = self.siblings[node.slot() as usize].clone();
-        group.push(node);
-        for &sibling in &group {
-            let sibling_slot = sibling.slot() as usize;
-            let sibling_nexts = &self.next_nodes[sibling_slot];
-            assert_eq!(
-                sibling_nexts.len(),
-                usize::from(slot),
-                "graph siblings must have identical next counts"
-            );
-            let pending = &self.pending_next_names[sibling_slot];
-            if !pending.is_empty() {
-                assert_eq!(
-                    pending.len(),
-                    usize::from(slot),
-                    "pending named-next table must stay aligned with graph next slots"
-                );
-            }
-        }
-        for sibling in group {
-            let sibling_slot = sibling.slot() as usize;
-            if !self.pending_next_names[sibling_slot].is_empty() {
-                self.pending_next_names[sibling_slot].push(None);
-            }
-            self.next_nodes[sibling_slot].push(Some(next));
-        }
-        Ok(slot)
     }
 }
 
@@ -1694,9 +1744,49 @@ impl NodeRuntime {
     }
 
     pub fn add_node_next_slot(&self, node: NodeId, next: NodeId) -> RuntimeResult<u16> {
+        self.add_node_next_slots(&[(node, next)])
+            .map(|mut slots| slots.pop().expect("one edge produces one slot"))
+    }
+
+    pub fn add_node_next_slots(&self, edges: &[(NodeId, NodeId)]) -> RuntimeResult<Vec<u16>> {
         self.ensure_topology_owner()?;
+        let workers_running =
+            crate::barrier::global().is_some_and(|barrier| barrier.worker_count() != 0);
+        if workers_running {
+            let inner = self.inner.borrow();
+            for &(node, next) in edges {
+                inner.validate_node(node)?;
+                inner.validate_node(next)?;
+            }
+            let missing_edge = edges.iter().any(|&(node, next)| {
+                !inner.next_nodes[node.slot() as usize]
+                    .iter()
+                    .any(|target| *target == Some(next))
+            });
+            if missing_edge {
+                crate::barrier::__assert_held();
+            }
+        }
         let mut inner = self.inner.borrow_mut();
-        inner.add_node_next_slot(node, next)
+        let (slots, changed) = inner.add_node_next_slots(edges)?;
+        drop(inner);
+        if changed && workers_running {
+            GlobalMain::with_current(|main| main.request_worker_graph_refork())
+                .expect("main graph mutation requires the installed GlobalMain");
+        }
+        Ok(slots)
+    }
+
+    /// Returns the existing next slot for a target node without changing graph
+    /// topology. Callers use this read-only probe before deciding whether a
+    /// worker barrier is needed for a graph-edge insertion.
+    pub fn node_next_slot_for_target(
+        &self,
+        node: NodeId,
+        next: NodeId,
+    ) -> RuntimeResult<Option<u16>> {
+        let inner = self.inner.borrow();
+        inner.node_next_slot_for_target(node, next)
     }
 
     pub fn node_siblings(&self, node: NodeId) -> RuntimeResult<Vec<NodeId>> {

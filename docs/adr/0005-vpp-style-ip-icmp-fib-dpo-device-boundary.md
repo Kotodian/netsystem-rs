@@ -428,10 +428,14 @@ pointer, and there is no `DpoRef`, `DpoObjectStore`, class record, or manual
 see the matching concrete pool and its dependencies.
 
 `DpoMain::stack` mirrors VPP's `dpo_stack`: it receives the child class/proto
-and a parent `DpoId`, derives the graph edge, and returns a copy of the parent
-identity with that edge in `next`. It does not retain a parent object and does
-not return a second ownership type. A concrete owner retains any parent or
-child object it needs through its own typed state.
+and a parent `DpoId`, probes the cached type/protocol edge, and returns a copy
+of the parent identity with that edge in `next`. If the edge is missing, the
+method itself enters `worker_thread_barrier_sync!` when Data Workers are
+running, adds all child-to-parent graph arcs, and publishes the cached edge
+before releasing the scope. An already-held outer scope is reused through the
+barrier's recursion semantics. It does not retain a parent object and does not
+return a second ownership type. A concrete owner retains any parent or child
+object it needs through its own typed state.
 
 `DpoMain::next_node` is the read-only counterpart of
 `dpo_get_next_node_by_type_and_proto`; it never creates a graph edge. The
@@ -547,15 +551,25 @@ node slot, adds the graph edge, and returns a copy of the parent identity with
 that edge in `next`. Parent object lifetime remains the concrete owner's
 responsibility.
 
-Pool growth follows the VPP `dpo_pool_barrier_sync` rule. The owner checks
-whether the next insertion will grow its `Pool<T>` before mutating it. When
-growth is required after Data Workers have started, `NetMain::create_load_balance`
-enters `worker_thread_barrier_sync!` before it establishes graph edges, grows the
-pool, or inserts the new object. The same owner-level scope is required when a
-lazy DPO graph edge is missing, because `vlib_node_add_next` is also a
-worker-visible topology mutation. Startup construction, before workers exist,
-is allowed without a barrier. Reusing a released pool slot and reusing an
-already-resolved graph edge do not enter a barrier; object lifetime and DPO
+VPP's `load_balance_alloc_i` enters its worker barrier when
+`pool_get_will_expand(load_balance_pool)` or either per-index combined-counter
+store will expand. Its packet path dereferences an already-published pool index
+without consulting mutable allocation metadata. Hammer's current
+`Pool::get()` additionally reads the vector length and free bitmap, while every
+`Pool::insert()` changes that metadata even when the backing allocation does
+not move. Therefore `NetMain::create_load_balance` must enter
+`worker_thread_barrier_sync!` for every insertion after Data Workers have
+started. This is the narrowest sound rule for the current `Pool` interface;
+Hammer may adopt VPP's growth-only fast path only after published-index lookup
+no longer reads metadata mutated by insertion. Hammer has no load-balance
+combined-counter backing store yet; adding one must include its growth in the
+same creation transaction rather than inventing a separate publication path.
+
+Graph-edge publication remains a separate decision owned by `DpoMain::stack`
+and `DpoMain::stack_from_node`: each probes the existing edge first and enters
+the macro only when `vlib_node_add_next` would add topology. Startup
+construction, before workers exist, is allowed without a barrier. Reusing an
+already-resolved graph edge does not enter a barrier; object lifetime and DPO
 locks still govern when a slot may be released for reuse.
 
 The concrete owner never stores a barrier, calls `WorkerBarrier::sync` directly,
@@ -569,8 +583,8 @@ compact identity value; visibility and lifetime are provided by the existing
 barrier and owner-managed references respectively.
 
 For example, `NetMain::create_load_balance` receives the installed
-`DataPlaneMain`, validates protocol and bucket facts, checks pool growth and
-cached graph-edge state, and then uses this shape when workers are active:
+`DataPlaneMain`, validates protocol and bucket facts, and then uses this shape
+for every pool insertion while workers are active:
 
 ```rust
 worker_thread_barrier_sync!(runtime, {
@@ -580,8 +594,10 @@ worker_thread_barrier_sync!(runtime, {
 
 The outer Binary API scope is optional from the owner's perspective: the owner
 conditionally enters the same macro for direct control-plane callers, while an
-already pending dispatcher scope is reused. No DPO owner may mutate a worker-
-visible pool or graph edge after workers start without one of these scopes.
+already pending dispatcher scope is reused. `DpoMain::stack` applies the same
+conditional rule to graph edges, so a direct DPO stack call is safe without a
+caller-created barrier. No DPO owner may mutate a worker-visible pool or graph
+edge after workers start without one of these scopes.
 
 The current single `AdjacencyRewriteNode` is split into two concrete IP graph
 nodes to match VPP's per-data-path node table: `Ip4RewriteNode` owns IPv4
@@ -2451,6 +2467,8 @@ next enum, `thread_local!` local registration, atomic FIB handle, or
 | 类型 | `hammer-plugins/net/ip::{Ip4RouteAddDelReply,Ip6RouteAddDelReply,Ip4RouteLookupReply,Ip6RouteLookupReply}` | 返回 owner-defined status、stats 和匹配 route/path facts；不序列化 selected DPO；状态不复用 display string | 新 payload；envelope status 仍由 `hammer-ipc` 定义 | reply status and context tests |
 | 类型 | `hammer-plugins/net/ip::{Ip4RoutePath,Ip6RoutePath,IpRoutePathBehavior,IpRouteStatus}` | concrete IP-owned Binary API path payloads and phase-one path behavior; decoded into service `FibPath<Ip4NextHop, IpPathFlags>`/`FibPath<Ip6NextHop, IpPathFlags>`; no service-level path-behavior enum, next-hop protocol, address union, or owner-specific extension | 新 Binary API nested messages/enums；无旧 wire 兼容层；本迁移不提供 owner-specific extension 字段 | prost schema and status mapping tests |
 | API | `#[derive(FibSource)]` / `#[derive(DpoClass)]` | `FibSource` 生成 owner-local source constants；`DpoClass` 只能派生在真实 DPO object layout 上，并生成 `register_dpo_class(...)`，直接把 owner 提供的 `(DpoProto, &[NodeId])` 参数交给 `DpoMain::register_new_type`；不生成 class name、static key、registration record、pool 或 callback table | 替代手写 forwarding registration arrays；`IpNullDpo` 和 `IpPmtuDpo` 均通过同一 derive 注册，shared layout 通过 owner 提供的 node slice 为每个 subtype 注册 | proc-macro expansion, DPO class allocation, and DSO inventory test |
+| API | `NodeRuntime::node_next_slot_for_target` | 只读探测 `(node, next)` 是否已有 graph slot；不改变 topology、不触发 refork，供 `DpoMain::stack`/`stack_from_node` 决定是否需要 barrier | 新增 runtime graph probe；无 ABI 和持久化迁移 | existing-edge fast path and missing-edge behavior test |
+| API | `NodeRuntime::add_node_next_slots` | 在一个 owner/barrier 窗口内批量添加 graph edges；预验证 node、复用已有 edge、overflow 时恢复 topology；仅发生实际 mutation 且 workers 已启动时要求已持有 barrier，并合并一次 graph refork 请求 | 新增批量 runtime topology API；`add_node_next_slot` 保留为单 edge 委托面 | batch edge insertion, rollback, sibling-slot and refork tests |
 | API | `ip4.route.add_del` / `ip6.route.add_del` | Binary API handler；按 VPP add/delete + multipath 语义增量修改 FIB graph 和 forwarding backend | 新方法名；客户端迁移到具体方法 | end-to-end Binary API route mutation test |
 | API | `ip4.route.lookup` / `ip6.route.lookup` | Binary API handler；按 `table_id` 和 `exact` 读取 non-forwarding FIB entry，返回匹配 route/path/stats facts；不返回 selected DPO | 新方法名；客户端迁移到具体方法 | LPM/exact and route-facts reply test |
 | API | `ip4.table.*` / `ip6.table.*` | table add/del/allocate/flush；维护 external `table_id` 到 concrete `fib_index` 的 owner-local map | 新 Binary API methods；不改变 Binary API envelope | table lifecycle and index-separation test |
@@ -2468,7 +2486,7 @@ next enum, `thread_local!` local registration, atomic FIB handle, or
 
 | 类型/API | 位置或标识 | 变更内容 | 兼容性/迁移 | 验证方式 |
 | --- | --- | --- | --- | --- |
-| 类型 | `hammer-service::net::DpoProto`, `DpoType`, `DpoId` | 从 IP plugin 移入 service net；`DpoProto` 是 VPP graph protocol key，`DpoType` 是 `DpoMain` 运行时分配的 opaque class key，不是封闭 Rust enum；`DpoId` 是非泛型 Rust `Copy` identity，使用私有 `u64` 保持 VPP `{ type, proto, next, index }` 的 8-byte size/alignment 形状，不使用 `repr(C)`；`DpoMain` 直接持有 class/node/edge state，具体 class owner 负责 index 校验、published-root retention 和 pool retirement；移除对 `IpVersion` 的转换依赖 | 所有 callers 改为显式 class registration；源码级 breaking change | workspace compile, dynamic class allocation, identity-size/alignment assertion, and DPO behavior tests |
+| 类型 | `hammer-service::net::DpoProto`, `DpoType`, `DpoId` | 从 IP plugin 移入 service net；`DpoProto` 是 VPP graph protocol key，`DpoType` 是 `DpoMain` 运行时分配的 opaque class key，不是封闭 Rust enum；`DpoId` 是非泛型 Rust `Copy` identity，使用私有 `u64` 保持 VPP `{ type, proto, next, index }` 的 8-byte size/alignment 形状，不使用 `repr(C)`；`DpoMain` 直接持有 class/node/edge state，具体 class owner 负责 index 校验、published-root retention 和 pool retirement；`stack`/`stack_from_node` 自己对 graph-edge 缺失执行条件 barrier；移除对 `IpVersion` 的转换依赖 | 所有 callers 改为显式 class registration；源码级 breaking change | workspace compile, dynamic class allocation, identity-size/alignment assertion, DPO barrier/stack behavior tests |
 | 类型 | `hammer-plugins/net/ip::{Adjacency,AdjacencyRewrite,LoadBalance}` | 删除 IP-owned objects；以 service-owned `AdjacencyDpo`/`LoadBalanceDpo` pool 替代；Adjacency subtype 通过 class key 选择，不新增 subtype pool；IP 只保留地址验证/编码、邻居策略和 rewrite policy | 删除旧 IP forwarding 构造面；IP lookup/rewrite 改用 service DPO owner API；固定地址/重写数组不迁移 | service DPO pool, subtype producer, address/rewrite validation, and generic FIB projection integration test |
 | 类型/API | `hammer-plugins/net/ip::forwarding::DpoKind` 与通用 `Dpo` 构造入口 | 删除泛化 kind-to-index/通用构造路径；具体 DPO 通过 `From` 生成 `DpoId` | breaking source migration；不保留 generic alias | compile-time API removal and concrete conversion tests |
 | 类型 | `ForwardingMetadata` | 移入 service net，仅保留 DPO/FIB facts 与 TX interface contract；不携带 adjacency/load-balance对象 | IP lookup/rewrite 改用 service metadata | lookup/rewrite integration test |
@@ -2476,11 +2494,13 @@ next enum, `thread_local!` local registration, atomic FIB handle, or
 | 类型 | `FibSource`, `FibEntry`, `FibPathList`, `FibPath`, `FibTable` | 从 IP plugin 的快照 builder 改为 service-owned 增量 source/entry/path graph；`FibPath<N, F>` 的 `N` 与 `F` 由具体 backend/业务 owner 提供，service 不定义 next-hop protocol/union/path-policy flags，也不把扩展塞进共享 path；`FibEntry` 通过 `(FibSource, u32)` slots 连接 owner-instantiated `FibEntrySrc<N,F,SourceData,PathExt>` records；entry delegates cover optional chains, trackers, BFD and attached import/export；`FibTable` 静态组合唯一的 `FibTableBackend` seam，entry 保存当前 forwarding-chain `DpoId`，backend 使用其 identity 更新 concrete forwarding store | IP4/IP6 backend 分别实现并提供 `IpPathFlags`；无 family facade 或独立 forwarding adapter；现有 route snapshot callers 迁移为 source/path operations；异构 source payloads remain in typed owner pools, not a service union or erased map | LPM, source precedence, behavior dispatch, source-data/cover/interpose validation, path-extension replacement, delegate/cover tracking, back-walk, and DPO projection tests |
 | 类型 | `IpMain` | 改为 `OnceLock<IpMain>` owner；移除 FIB contributions、table handle 和 graph publication；只持有 generic IP protocol 与 TCP/UDP port registries | 删除 `ArcSwapOption<IpMain>`；调用方迁移到 `init/global`，并按 `Ip4Main`/`Ip6Main` 访问 concrete table | initialization and owner-separation test |
 | 类型 | `hammer-service::binary_api::BinaryApiMethodEntry` dispatch contract | FIB-touching methods 保持 `mp_safe = false`；由 dispatcher 统一进入宏，handler 不再承担同步职责 | 现有 envelope/ABI 不变；方法注册迁移 | mp-safe/non-mp-safe dispatch test |
-| 类型 | `NetMain` / `DeviceMain` | 改为按值 `OnceLock<Main>`；NetMain 直接承载 DPO/FIB class metadata 和 local0 | 删除 `OnceLock<Arc<_>>` | duplicate-init and ownership compile checks |
+| 类型 | `NetMain` / `DeviceMain` | `NetMain` 使用单一 `Arc<NetMain>` owner 发布到 `OnceLock` 与 runtime registry；其 DPO/pool state 通过 owner-local `UnsafeCell` 在主线程/barrier 规则下变更；`DeviceMain` 保持按值 `OnceLock` | 删除 NetMain 的 clone-and-publish 双 owner；调用方继续借用 `NetMain::global()` | duplicate-init, shared-owner mutation, and ownership compile checks |
 | 类型 | `hammer-service::interface::InterfaceMain` | 由 `NetMain` 按值嵌入并通过借用暴露；不再作为独立 `Arc<InterfaceMain>` ownership root | `NetMain::init`/调用方迁移为 `&InterfaceMain`；接口 pool 和 callback 语义不变 | net/interface lifecycle and borrow-ownership checks |
 | 类型/API | IP graph registration image | IP image 删除 ICMP nodes；ICMP image 单独声明自己的 nodes/Main | `load_after = ["ip"]`；所有 DSO 一次迁移 | DSO graph inventory and load-order test |
 | API | `IpMain` FIB publication | 删除直接 `publish(table)`；改由 `ip4.route.add_del`/`ip6.route.add_del` Binary API handler 调用 service FIB 增量操作 | 运行时客户端改用 Binary API；dispatcher 宏负责 barrier | Binary API mutation and worker visibility test |
 | API | `hammer-service::net::pmtu` | 删除 service-owned PMTU cache；ICMP byte parser和 PMTU policy 均移至 IP/ICMP owners | TCP caller 改为显式依赖 IP 的 typed PMTU read/update | PMTU owner and cross-plugin contract test |
+| API | `NetMain::create_load_balance` | 接收 `&mut DataPlaneMain`；workers 启动后每次向 `Pool<LoadBalanceDpo>` 插入都通过 `worker_thread_barrier_sync!` 发布，已持有 Binary API barrier 时复用；DPO graph edge 首次插入由 `DpoMain::stack` 独立决定 | 原 `&mut NetMain` 改为共享 owner 借用；调用方继续走 Binary API 或 main-thread control path | worker publication, nested barrier and pool lookup visibility test |
+| API | `DpoMain::stack` / `DpoMain::stack_from_node` | 从只接受 `NodeRuntime` 改为接收安装的 `&mut DataPlaneMain`；先探测 edge，缺失时自身进入 `worker_thread_barrier_sync!`，批量添加 topology 并请求一次 graph refork；已有 edge 不同步 | 调用方传入已安装的 DataPlaneMain；不再依赖 caller 预先调用 barrier helper | missing/existing edge, nested scope and graph refork test |
 | API | `NetworkOpaque.sw_if_index` | 明确 `[0]` 为 RX、`[1]` 为 TX；不承载 `fib_index` | device/IP/interface callers audited | RX/TX metadata path test |
 | 类型/API | `hammer-service::opaque::NetworkIpOpaque` | 增加独立 `fib_index: u32` 与可选 `fib_index_override` publication facts；不得复用 `sw_if_index[TX]` | packet opaque layout changes inside the existing fixed opaque budget; no wire migration | input lookup metadata and index-separation test |
 | API | Device class callback set | 增加 concrete `rx_redirect_to_node` callback，保留 owner validation | device plugins provide callback; no generic trait | callback order and redirect test |
@@ -2717,12 +2737,16 @@ ADR and cannot change the interfaces or ownership decisions recorded here.
 - Device RX is not fixed by service to IP; device plugins own RX nodes and
   callbacks.
 - `local0` is a reserved sentinel; `sw_if_index` and `fib_index` are distinct.
-- Main values use owner-local `OnceLock<Main>` with `init` and `global`.
+- Main values use owner-local `OnceLock`; `NetMain` publishes one shared
+  `Arc<NetMain>` to both the process-global accessor and the runtime registry,
+  while its mutable DPO/pool state remains owner-local.
 - Runtime route publication is through IP plugin-owned Binary API methods;
   the dispatcher and DPO owners use the same `worker_thread_barrier_sync!`
   macro. Plugin handlers do not call a barrier entrypoint directly; an owner
-  such as `NetMain::create_load_balance` conditionally enters the macro when
-  called outside an already-pending Binary API scope.
+  such as `NetMain::create_load_balance` conditionally enters the macro for
+  every live load-balance pool insertion, while `DpoMain::stack` and
+  `stack_from_node` independently enter it only for first-time graph-edge
+  insertion.
 - `Ip4RewriteNode` and `Ip6RewriteNode` are both accepted graph nodes; their
   shared packet orchestration is a private, statically dispatched generic core
   inside the IP plugin, with concrete IPv4/IPv6 policies.
