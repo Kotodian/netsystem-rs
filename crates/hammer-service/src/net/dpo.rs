@@ -266,14 +266,13 @@ impl DpoMain {
     /// already be inside the process barrier, just like VPP's dpo registry
     /// mutation is serialized with worker graph access.
     fn require_registration_scope() -> Result<(), DpoError> {
-        if hammer_runtime::barrier::global()
-            .is_some_and(|barrier| barrier.worker_count() != 0 && !barrier.is_pending())
-        {
-            return Err(DpoError::Runtime(
-                RuntimeError::ControlRequiresWorkerBarrier,
-            ));
+        let Some(barrier) = hammer_runtime::barrier::global() else {
+            return Ok(());
+        };
+        if barrier.worker_count() == 0 {
+            return Ok(());
         }
-        Ok(())
+        hammer_runtime::ensure_main_thread_with_barrier().map_err(DpoError::Runtime)
     }
 
     pub fn register_new_type(
