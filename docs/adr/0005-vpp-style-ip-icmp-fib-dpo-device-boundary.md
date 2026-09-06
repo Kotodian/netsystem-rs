@@ -630,6 +630,27 @@ parent DPO, and adjacency classification is based on the registered adjacency
 class slots. They are not fields on `DpoId`, are not service dispatch methods,
 and are not implemented by a generic protocol enum.
 
+MTU and uRPF queries preserve VPP's scalar default contract. MTU returns
+`u16`; when the class supplies no MTU operation, the result is `0xffff`
+(`u16::MAX`), the identity value for a minimum-MTU reduction. uRPF returns
+`u32`; when the class supplies no uRPF operation, the result is `u32::MAX`
+(C's `~0`), meaning no applicable interface. An invalid DPO returns the same
+defaults without invoking a class operation. When an operation is present
+on a valid DPO, its result is returned unchanged. These defaults match
+`third_party/vpp/src/vnet/dpo/dpo.c`'s `dpo_get_mtu` and `dpo_get_urpf`;
+neither query returns `Option` or introduces an error type, address-family
+tag or wrapper object. The uRPF default must not be used as an interface
+pool index.
+
+Separately, concrete pool queries keep `Option<&T>` / `Option<&mut T>` when
+the requested index may be absent. The generic `DpoError::ObjectMissing`
+variant is not the target contract. Internal operations on an already-owned
+reference require its occupied pool slot as an invariant; an external API
+which rejects a missing target translates absence at that API owner, not in
+the generic DPO framework. Removing the existing variant requires migrating
+its mutation callers as well as its declaration; this paragraph does not
+claim that migration has already been implemented.
+
 `dpo_get_next_node()` may be class-default or instance-dependent. The default
 path resolves `dpo_nodes[type][proto]`; `DPO_INTERFACE_TX` is the important
 instance-dependent case because its next node comes from the wrapped
@@ -2619,6 +2640,7 @@ next enum, `thread_local!` local registration, atomic FIB handle, or
 
 | 类型/API | 位置或标识 | 变更内容 | 兼容性/迁移 | 验证方式 |
 | --- | --- | --- | --- | --- |
+| API | DPO class-owner MTU / uRPF queries | MTU 返回 `u16`，无操作或无效 DPO 返回 `0xffff`；uRPF 返回 `u32`，无操作或无效 DPO 返回 `u32::MAX`（C 的 `~0`）；有效 DPO 的已提供操作结果原样返回 | 撤销此前未实现的 `Option` 返回契约；不改变对象池查询的 `Option` 语义；无 ABI 或持久化迁移，本次仅修正文档 | 实现时验证缺省操作、无效 DPO、已提供操作返回值及 MTU minimum reduction；依据 vendored `dpo_get_mtu` / `dpo_get_urpf` |
 | 类型/API | `DpoMain` reference-count slots, `register_new_type`, `NetMain::register_dpo_class`, `#[derive(DpoClass)]` | 显式批准 `unlock`：已有 registry 直接保存 `locks` / `unlocks`；注册参数增加可选成对函数 `(fn(DpoId), fn(DpoId))`；宏接受成对 `lock` / `unlock` owner paths，拒绝只声明一项；内部计数操作不返回 Result，INVALID 不计数，违约是本地不变量 | 源码级注册签名迁移；无状态 class 传 `None`，有状态 class 提供计数操作；移除本轮拟加的 `RootCountOverflow` / `RootNotPublished` 可恢复错误；不生成业务调用方手动 unlock 或 CRUD；无 wrapper、generation 或 ABI image | 验证宏展开、跨 owner 共享 child、最后引用销毁、失败回滚、同 pool 递归析构和 worker barrier；注册槽已实现不等于全部生命周期调用链已闭环 |
 | 类型 | `hammer-service::net::DpoProto`, `DpoType`, `DpoId` | 从 IP plugin 移入 service net；`DpoProto` 是 VPP graph protocol key，`DpoType` 是 `DpoMain` 运行时分配的 opaque class key，不是封闭 Rust enum；`DpoId` 是非泛型 Rust `Copy` identity，使用私有 `u64` 保持 VPP `{ type, proto, next, index }` 的 8-byte size/alignment 形状，不使用 `repr(C)`；`DpoMain` 直接持有 class/node/edge state，具体 class owner 负责 index 校验、published-root retention 和 pool retirement；`stack`/`stack_from_node` 自己对 graph-edge 缺失执行条件 barrier；移除对 `IpVersion` 的转换依赖 | 所有 callers 改为显式 class registration；源码级 breaking change | workspace compile, dynamic class allocation, identity-size/alignment assertion, DPO barrier/stack behavior tests |
 | 类型 | `hammer-plugins/net/ip::{Adjacency,AdjacencyRewrite,LoadBalance}` | 删除 IP-owned objects；以 service-owned `AdjacencyDpo`/`LoadBalanceDpo` pool 替代；Adjacency subtype 通过 class key 选择，不新增 subtype pool；IP 只保留地址验证/编码、邻居策略和 rewrite policy | 删除旧 IP forwarding 构造面；IP lookup/rewrite 改用 service DPO owner API；固定地址/重写数组不迁移 | service DPO pool, subtype producer, address/rewrite validation, and generic FIB projection integration test |
