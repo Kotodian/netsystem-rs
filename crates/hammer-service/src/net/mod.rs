@@ -8,6 +8,7 @@ use crate::interface::InterfaceMain;
 
 pub mod dpo;
 pub mod fib;
+pub mod throttle;
 
 pub use dpo::{
     AdjacencyDpo, DpoError, DpoId, DpoMain, DpoProto, DpoType, InterfaceRxDpo, LoadBalanceDpo,
