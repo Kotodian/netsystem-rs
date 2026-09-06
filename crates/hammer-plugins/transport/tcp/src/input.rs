@@ -5,7 +5,7 @@ use std::sync::Arc;
 
 use crate::{TcpError, TcpInputFlags, TcpSegmentFlags, tcp_header};
 use arc_swap::ArcSwap;
-use hammer_core::data_plane::{BufferFrame, BufferPacketCursor, Index, NodeHandle};
+use hammer_core::data_plane::{BufferFrame, BufferPacketCursor, Index};
 use hammer_runtime::{
     DataPlaneMain, DataWorkerId, Node, NodeProcessFn, NodeRuntimeData, TraceFormatter,
     add_packet_trace, format_packet_trace,
@@ -68,14 +68,11 @@ impl TcpInputControlPlane {
     pub(crate) fn node(
         &self,
         process: NodeProcessFn,
-        handoff: Option<(NodeHandle, DataWorkerId)>,
+        handoff_worker: Option<DataWorkerId>,
     ) -> TcpInputNode {
         let mut node =
             TcpInputNode::new(register_tcp_input_runtime(Arc::clone(&self.inner)), process);
-        if let Some((handoff, worker)) = handoff {
-            node.handoff = Some(handoff);
-            node.handoff_worker = Some(worker);
-        }
+        node.handoff_worker = handoff_worker;
         node
     }
 }
@@ -91,15 +88,13 @@ pub struct TcpInputNode {
     runtime_data: NodeRuntimeData,
     process: NodeProcessFn,
     #[node(default)]
-    handoff: Option<NodeHandle>,
-    #[node(default)]
     handoff_worker: Option<DataWorkerId>,
 }
 
 impl Node for TcpInputNode {
     #[inline(always)]
     fn process(&mut self, runtime: &DataPlaneMain, frame: &mut BufferFrame) -> () {
-        if sync_tcp_input_runtime(self.runtime_data, self.handoff, self.handoff_worker).is_err() {
+        if sync_tcp_input_runtime(self.runtime_data, self.handoff_worker).is_err() {
             return ();
         }
         (self.process)(runtime, self.runtime_data, frame)
@@ -117,7 +112,7 @@ impl Node for TcpInputNode {
 
     #[inline]
     fn node_runtime_data(&self) -> RuntimeResult<NodeRuntimeData> {
-        sync_tcp_input_runtime(self.runtime_data, self.handoff, self.handoff_worker)?;
+        sync_tcp_input_runtime(self.runtime_data, self.handoff_worker)?;
         Ok(self.runtime_data)
     }
 }
@@ -125,7 +120,6 @@ impl Node for TcpInputNode {
 #[derive(Clone)]
 struct TcpInputRuntime {
     snapshot: Arc<ArcSwap<TcpLookupSnapshot>>,
-    handoff: Option<NodeHandle>,
     handoff_worker: Option<DataWorkerId>,
 }
 
@@ -140,7 +134,6 @@ fn register_tcp_input_runtime(snapshot: Arc<ArcSwap<TcpLookupSnapshot>>) -> Node
         let slot = runtimes.len();
         runtimes.push(TcpInputRuntime {
             snapshot,
-            handoff: None,
             handoff_worker: None,
         });
         NodeRuntimeData::from_usize(slot).expect("TCP input runtime slot overflow")
@@ -167,7 +160,6 @@ fn tcp_input_runtime(data: NodeRuntimeData) -> RuntimeResult<TcpInputRuntime> {
 
 fn sync_tcp_input_runtime(
     data: NodeRuntimeData,
-    handoff: Option<NodeHandle>,
     handoff_worker: Option<DataWorkerId>,
 ) -> RuntimeResult<()> {
     let slot = data.usize_word(0)?;
@@ -176,7 +168,6 @@ fn sync_tcp_input_runtime(
         let runtime = runtimes
             .get_mut(slot)
             .ok_or_else(|| RuntimeError::from(TcpInputSlotInvalid { slot }))?;
-        runtime.handoff = handoff;
         runtime.handoff_worker = handoff_worker;
         Ok(())
     })
@@ -192,27 +183,20 @@ pub(crate) fn tcp_input_process(
         Err(_) => return (),
     };
     let snapshot = state.snapshot.load();
-    tcp_input_process_frame(
-        runtime,
-        frame,
-        &snapshot,
-        state.handoff,
-        state.handoff_worker,
-    )
+    tcp_input_process_frame(runtime, frame, &snapshot, state.handoff_worker)
 }
 
 fn tcp_input_process_frame(
     runtime: &DataPlaneMain,
     frame: &mut BufferFrame,
     snapshot: &TcpLookupSnapshot,
-    handoff: Option<NodeHandle>,
     handoff_worker: Option<DataWorkerId>,
 ) -> () {
     let width = runtime.preferred_frame_batch_width();
     let mut nexts = Vec::with_capacity(frame.len());
     let _ = frame.rewrite_indices_batched(width, |index| {
         prefetch_tcp_input(runtime, &[index], snapshot);
-        match tcp_input_local_next_for_index(runtime, index, snapshot, handoff, handoff_worker) {
+        match tcp_input_local_next_for_index(runtime, index, snapshot, handoff_worker) {
             Ok(Some(slot)) => {
                 nexts.push(slot);
                 Ok(Some(index))
@@ -235,13 +219,12 @@ fn tcp_input_local_next_for_index(
     runtime: &DataPlaneMain,
     index: Index,
     snapshot: &TcpLookupSnapshot,
-    handoff: Option<NodeHandle>,
     handoff_worker: Option<DataWorkerId>,
 ) -> RuntimeResult<Option<u16>> {
     let buffer = runtime.get_buffer(index)?;
     let parsed = tcp_input_buffer(&buffer)?;
     drop(buffer);
-    next_slot_for_index_with_runtime(runtime, index, parsed, snapshot, handoff, handoff_worker)
+    next_slot_for_index_with_runtime(runtime, index, parsed, snapshot, handoff_worker)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -268,7 +251,6 @@ fn next_slot_for_index_with_runtime(
         TcpInputError,
     >,
     snapshot: &TcpLookupSnapshot,
-    handoff: Option<NodeHandle>,
     handoff_worker: Option<DataWorkerId>,
 ) -> RuntimeResult<Option<u16>> {
     let traced = runtime.get_buffer(index)?.trace_handle().is_some();
@@ -310,14 +292,14 @@ fn next_slot_for_index_with_runtime(
             let mut buffer = runtime.get_buffer_mut(index)?;
             buffer.clear_node_error();
             write_session_route_opaque(buffer.opaque2_mut(), session_id, owner, session_next);
-            if let (Some(_), Some(current_worker)) = (handoff, handoff_worker)
+            if let Some(current_worker) = handoff_worker
                 && owner != current_worker
             {
                 unsafe { transmute::<_, &mut NetworkOpaque>(buffer.opaque_mut()) }
                     .set_handoff_source_worker(Some(current_worker.slot() as u16));
             }
         }
-        if let (Some(target), Some(current_worker)) = (handoff, handoff_worker)
+        if let Some(current_worker) = handoff_worker
             && owner != current_worker
         {
             if traced {
@@ -335,7 +317,11 @@ fn next_slot_for_index_with_runtime(
                     },
                 )?;
             }
-            runtime.handoff_index(owner, target, index, Some(session_next))?;
+            let node = runtime
+                .current_node()
+                .ok_or(RuntimeError::NodeDispatchContextMissing)?;
+            let target = runtime.nodes().node_next(node, session_next)?;
+            runtime.handoff_index(owner, target, index)?;
             return Ok(None);
         }
         return resolve_success_next_with_trace(
