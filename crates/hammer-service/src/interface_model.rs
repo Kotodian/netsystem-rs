@@ -1,7 +1,7 @@
-use std::cell::UnsafeCell;
+use std::cell::{RefCell, UnsafeCell};
 use std::collections::HashMap;
 use std::fmt;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
 use hammer_core::data_plane::NodeId;
 use hammer_infra::bitmap::Bitmap;
@@ -10,6 +10,7 @@ use hammer_runtime::{DataWorkerId, GlobalMain, RuntimeResult};
 use ipnet::IpNet;
 
 use crate::interface::{InterfaceError, InterfaceMtu, InterfaceMtuKind, InterfaceResult};
+use crate::net::{DpoError, DpoId, DpoProto, DpoType, InterfaceRxDpo, NetMain};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DriverScheduleMode {
@@ -190,7 +191,7 @@ pub struct HwInterface {
     pub flags: u32,
     pub caps: u32,
     pub hw_address: Vec<u8>,
-    pub output_node_index: NodeId,
+    pub output_node_index: Option<NodeId>,
     pub tx_node_index: NodeId,
     pub dev_class_index: u32,
     pub dev_instance: u32,
@@ -314,6 +315,75 @@ struct InterfaceState {
 
 pub struct InterfaceMain {
     state: UnsafeCell<InterfaceState>,
+    output_node: OnceLock<NodeId>,
+    rx_dpos: RefCell<Pool<InterfaceRxDpo>>,
+    rx_dpo_by_interface: RefCell<HashMap<(DpoProto, u32), u32>>,
+}
+
+impl InterfaceRxDpo {
+    pub fn lock(dpo: DpoId) {
+        hammer_runtime::ensure_main_thread_with_barrier()
+            .expect("RX DPO acquisition requires the publication scope");
+        let net = NetMain::global().expect("RX DPO requires its interface owner");
+        let mut pool = net.interface_main().rx_dpos.borrow_mut();
+        let object = pool
+            .get_mut(dpo.index())
+            .expect("referenced RX DPO is occupied");
+        assert_eq!(dpo.class(), DpoType::INTERFACE_RX);
+        assert_eq!(dpo.proto(), object.proto);
+        object.lock_count = object
+            .lock_count
+            .checked_add(1)
+            .expect("RX DPO reference count overflow");
+    }
+
+    pub fn unlock(dpo: DpoId) {
+        hammer_runtime::ensure_main_thread_with_barrier()
+            .expect("RX DPO retirement requires the publication scope");
+        let net = NetMain::global().expect("RX DPO requires its interface owner");
+        let interfaces = net.interface_main();
+        let mut pool = interfaces.rx_dpos.borrow_mut();
+        let object = pool
+            .get_mut(dpo.index())
+            .expect("referenced RX DPO is occupied");
+        assert_eq!(dpo.class(), DpoType::INTERFACE_RX);
+        assert_eq!(dpo.proto(), object.proto);
+        object.lock_count = object
+            .lock_count
+            .checked_sub(1)
+            .expect("RX DPO reference count underflow");
+        if object.lock_count == 0 {
+            interfaces
+                .rx_dpo_by_interface
+                .borrow_mut()
+                .remove(&(object.proto, object.sw_if_index));
+            pool.remove(dpo.index());
+        }
+    }
+
+    pub fn format(dpo: DpoId, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        hammer_runtime::ensure_main_thread().expect("RX DPO formatting requires the main thread");
+        let net = NetMain::global().expect("RX DPO requires its interface owner");
+        let pool = net.interface_main().rx_dpos.borrow();
+        match pool.get(dpo.index()) {
+            Some(object) => write!(
+                formatter,
+                "interface-rx {} interface {} proto {} locks {}",
+                dpo.index(),
+                object.sw_if_index,
+                object.proto.get(),
+                object.lock_count
+            ),
+            None => write!(formatter, "interface-rx {} absent", dpo.index()),
+        }
+    }
+
+    pub fn memory() -> (usize, usize, usize) {
+        hammer_runtime::ensure_main_thread().expect("RX DPO diagnostics require the main thread");
+        let net = NetMain::global().expect("RX DPO requires its interface owner");
+        let pool = net.interface_main().rx_dpos.borrow();
+        (size_of::<Self>(), pool.len(), pool.capacity())
+    }
 }
 
 unsafe impl Send for InterfaceMain {}
@@ -329,6 +399,9 @@ impl InterfaceMain {
     pub fn new() -> Self {
         Self {
             state: UnsafeCell::new(InterfaceState::default()),
+            output_node: OnceLock::new(),
+            rx_dpos: RefCell::new(Pool::new()),
+            rx_dpo_by_interface: RefCell::new(HashMap::new()),
         }
     }
 
@@ -386,7 +459,7 @@ impl InterfaceMain {
             flags: 0,
             caps: 0,
             hw_address: Vec::new(),
-            output_node_index: NodeId::new(0),
+            output_node_index: None,
             tx_node_index: NodeId::new(0),
             dev_class_index: device_class_index,
             dev_instance: device_instance,
@@ -428,7 +501,110 @@ impl InterfaceMain {
             .get_mut(sw_if_index)
             .expect("inserted software interface")
             .sw_if_index = sw_if_index;
+        state
+            .software_interfaces
+            .get_mut(sw_if_index)
+            .expect("inserted software interface")
+            .sup_sw_if_index = sw_if_index;
         Ok(hw_if_index)
+    }
+
+    pub(crate) fn initialize_output_node(&self, node: NodeId) {
+        hammer_runtime::ensure_main_thread_with_barrier()
+            .expect("interface output initialization requires the publication scope");
+        self.output_node
+            .set(node)
+            .expect("interface output node is initialized once");
+    }
+
+    /// Acquires one reference to the shared interface/protocol RX object.
+    /// Publication is owned by the caller's Binary API barrier scope.
+    pub fn add_or_lock_rx_dpo(
+        &self,
+        proto: DpoProto,
+        sw_if_index: u32,
+    ) -> Result<Option<DpoId>, DpoError> {
+        hammer_runtime::ensure_main_thread_with_barrier()?;
+        if self.software_interface(sw_if_index).is_none() {
+            return Ok(None);
+        }
+        NetMain::global()?
+            .dpo_main()
+            .identity(DpoType::INTERFACE_RX, proto, 0)?;
+        let mut pool = self.rx_dpos.borrow_mut();
+        let mut database = self.rx_dpo_by_interface.borrow_mut();
+        let index = match database.get(&(proto, sw_if_index)).copied() {
+            Some(index) => {
+                let object = pool
+                    .get_mut(index)
+                    .expect("RX database names an occupied slot");
+                object.lock_count = object
+                    .lock_count
+                    .checked_add(1)
+                    .expect("RX DPO reference count overflow");
+                index
+            }
+            None => {
+                let index = pool.insert(InterfaceRxDpo {
+                    sw_if_index,
+                    proto,
+                    lock_count: 1,
+                });
+                database.insert((proto, sw_if_index), index);
+                index
+            }
+        };
+        Ok(Some(DpoId::interface_rx(proto, index)))
+    }
+
+    /// Copies the RX interface fact without letting a pool borrow escape a
+    /// worker's synchronous packet operation.
+    #[inline(always)]
+    pub fn rx_dpo_interface(&self, dpo: DpoId) -> Option<u32> {
+        if dpo.class() != DpoType::INTERFACE_RX {
+            return None;
+        }
+        let interface = |pool: &Pool<InterfaceRxDpo>| {
+            let object = pool.get(dpo.index())?;
+            (object.proto == dpo.proto()).then_some(object.sw_if_index)
+        };
+        if hammer_runtime::ensure_main_thread().is_ok() {
+            return interface(&self.rx_dpos.borrow());
+        }
+        hammer_runtime::with_data_plane_main(|runtime| {
+            assert_ne!(
+                runtime.thread_index(),
+                0,
+                "RX DPO reads require a Data Worker"
+            );
+            // SAFETY: the installed worker cannot acknowledge a barrier in
+            // this synchronous read. All pool mutation requires acknowledged
+            // workers; no reference or RefCell borrow flag escapes to workers.
+            unsafe { interface(&*self.rx_dpos.as_ptr()) }
+        })
+    }
+
+    pub(crate) fn interface_tx_nodes(dpo: crate::net::DpoId) -> Vec<NodeId> {
+        let main = crate::net::NetMain::global().expect("interface DPO requires the net owner");
+        let interfaces = main.interface_main();
+        let hardware = interfaces
+            .software_interface(dpo.index())
+            .and_then(|software| {
+                software.hw_if_index.or_else(|| {
+                    interfaces
+                        .software_interface(software.sup_sw_if_index)?
+                        .hw_if_index
+                })
+            })
+            .and_then(|index| interfaces.hardware_interface(index));
+        hardware
+            .and_then(|interface| {
+                interface
+                    .output_node_index
+                    .or_else(|| interfaces.output_node.get().copied())
+            })
+            .into_iter()
+            .collect()
     }
 
     pub fn delete_hardware_interface(&self, hw_if_index: u32) -> InterfaceResult<()> {

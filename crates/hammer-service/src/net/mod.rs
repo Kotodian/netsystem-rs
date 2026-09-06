@@ -1,4 +1,4 @@
-use std::cell::UnsafeCell;
+use std::cell::{Ref, RefCell, RefMut};
 use std::sync::{Arc, OnceLock};
 
 use hammer_infra::pool::Pool;
@@ -10,30 +10,33 @@ pub mod dpo;
 pub mod fib;
 
 pub use dpo::{
-    AdjacencyDpo, DpoError, DpoId, DpoMain, DpoProto, DpoType, InterfaceRxDpo, InterfaceTxDpo,
-    LoadBalanceDpo, LoadBalanceFlags, LookupCast, LookupDpo, LookupInput, LookupTable, ReceiveDpo,
+    AdjacencyDpo, DpoError, DpoId, DpoMain, DpoProto, DpoType, InterfaceRxDpo, LoadBalanceDpo,
+    LoadBalanceFlags, LoadBalancePath, LookupCast, LookupDpo, LookupInput, LookupTable, ReceiveDpo,
     ReplicateDpo, ReplicateFlags,
 };
 pub use fib::{
     FibEntry, FibEntryFlags, FibEntrySrc, FibEntrySrcFlags, FibPath, FibPathExt, FibPathExtList,
     FibPathList, FibPathListFlags, FibSource, FibSourceBehavior, FibTable, FibTableBackend,
+    FibUrpfList,
 };
 
 pub struct NetMain {
     interface_main: Arc<InterfaceMain>,
-    dpo_main: UnsafeCell<DpoMain>,
-    load_balances: UnsafeCell<Pool<LoadBalanceDpo>>,
-    replicates: UnsafeCell<Pool<ReplicateDpo>>,
+    dpo_main: RefCell<DpoMain>,
+    load_balances: RefCell<Pool<LoadBalanceDpo>>,
+    replicates: RefCell<Pool<ReplicateDpo>>,
+    urpf_lists: RefCell<Pool<FibUrpfList>>,
     local_interface_hw_index: u32,
     local_interface_sw_index: u32,
 }
 
-// SAFETY: the control thread is the sole mutator of `state`; live mutations
-// are performed only while WorkerBarrier has stopped all Data Workers. Workers
-// read published DPO/pool values between barrier scopes.
+// SAFETY: registry access and RefCell borrow bookkeeping are main-thread-only.
+// Pool mutations additionally require all Data Workers to acknowledge the
+// WorkerBarrier. Workers read the pool payload without accessing the RefCell
+// borrow flag, only within synchronous selection which returns copied values.
 unsafe impl Send for NetMain {}
-// SAFETY: the publication and lifetime rules above prevent concurrent mutable
-// access while workers hold shared references into the state.
+// SAFETY: the scopes above exclude worker reads during mutation. Main-thread
+// guards also prevent mutation while a control-plane reference remains borrowed.
 unsafe impl Sync for NetMain {}
 
 impl NetMain {
@@ -61,9 +64,10 @@ impl NetMain {
             })?;
         let shared = Arc::new(NetMain {
             interface_main,
-            dpo_main: UnsafeCell::new(DpoMain::new()),
-            load_balances: UnsafeCell::new(Pool::new()),
-            replicates: UnsafeCell::new(Pool::new()),
+            dpo_main: RefCell::new(DpoMain::new()),
+            load_balances: RefCell::new(Pool::new()),
+            replicates: RefCell::new(Pool::new()),
+            urpf_lists: RefCell::new(Pool::new()),
             local_interface_hw_index: local_hw,
             local_interface_sw_index: local_sw,
         });
@@ -73,106 +77,133 @@ impl NetMain {
         Ok(shared)
     }
 
-    fn load_balances(&self) -> &Pool<LoadBalanceDpo> {
-        // SAFETY: workers borrow this pool only outside a barrier. Pool backing
-        // growth and reclamation stop workers before invalidating references.
-        unsafe { &*self.load_balances.get() }
+    fn load_balances(&self) -> Ref<'_, Pool<LoadBalanceDpo>> {
+        hammer_runtime::ensure_main_thread()
+            .expect("control-plane pool borrow requires the main thread");
+        self.load_balances.borrow()
     }
 
-    #[allow(clippy::mut_from_ref)]
-    fn dpo_main_mut(&self) -> &mut DpoMain {
-        // SAFETY: DPO class and edge metadata has one Main Thread writer.
-        // Graph-edge insertion enters WorkerBarrier before graph mutation.
-        unsafe { &mut *self.dpo_main.get() }
+    /// Main-thread registry access. Instance resolvers must consult their
+    /// concrete owner, not recursively mutate or borrow this registry.
+    pub fn dpo_main_mut(&self) -> RefMut<'_, DpoMain> {
+        hammer_runtime::ensure_main_thread()
+            .expect("DPO registry mutation requires the main thread");
+        self.dpo_main.borrow_mut()
     }
 
-    #[allow(clippy::mut_from_ref)]
-    fn load_balances_mut(&self) -> &mut Pool<LoadBalanceDpo> {
-        // SAFETY: callers are the Main Thread; any backing-storage growth or
-        // reclamation that can invalidate worker references holds WorkerBarrier.
-        unsafe { &mut *self.load_balances.get() }
+    fn load_balances_mut(&self) -> RefMut<'_, Pool<LoadBalanceDpo>> {
+        hammer_runtime::ensure_main_thread_with_barrier()
+            .expect("pool mutation requires the publication scope");
+        self.load_balances.borrow_mut()
     }
 
-    fn replicates(&self) -> &Pool<ReplicateDpo> {
-        // SAFETY: workers borrow this pool only outside a barrier. Pool backing
-        // growth and reclamation stop workers before invalidating references.
-        unsafe { &*self.replicates.get() }
+    fn replicates(&self) -> Ref<'_, Pool<ReplicateDpo>> {
+        hammer_runtime::ensure_main_thread()
+            .expect("control-plane pool borrow requires the main thread");
+        self.replicates.borrow()
     }
 
-    #[allow(clippy::mut_from_ref)]
-    fn replicates_mut(&self) -> &mut Pool<ReplicateDpo> {
-        // SAFETY: callers are the Main Thread; any backing-storage growth or
-        // reclamation that can invalidate worker references holds WorkerBarrier.
-        unsafe { &mut *self.replicates.get() }
+    fn replicates_mut(&self) -> RefMut<'_, Pool<ReplicateDpo>> {
+        hammer_runtime::ensure_main_thread_with_barrier()
+            .expect("pool mutation requires the publication scope");
+        self.replicates.borrow_mut()
     }
 
     fn validate_bucket_identity(&self, bucket: DpoId) -> Result<(), DpoError> {
-        if !bucket.is_valid() {
-            return Err(DpoError::ObjectMissing {
-                dpo_type: bucket.class().get(),
-                index: bucket.index(),
-            });
-        }
-        match bucket.class() {
-            DpoType::LOAD_BALANCE if self.load_balance(bucket.index()).is_none() => {
-                Err(DpoError::ObjectMissing {
-                    dpo_type: bucket.class().get(),
-                    index: bucket.index(),
-                })
-            }
-            DpoType::REPLICATE if self.replicate(bucket.index()).is_none() => {
-                Err(DpoError::ObjectMissing {
-                    dpo_type: bucket.class().get(),
-                    index: bucket.index(),
-                })
-            }
-            _ => Ok(()),
-        }
+        self.dpo_main()
+            .identity(bucket.class(), bucket.proto(), bucket.index())
+            .map(|_| ())
     }
 
     pub fn interface_main(&self) -> &InterfaceMain {
         &self.interface_main
     }
-    pub fn dpo_main(&self) -> &DpoMain {
-        // SAFETY: DPO metadata is mutated only by the Main Thread. Data Workers
-        // do not mutate it, and graph publication is barrier protected.
-        unsafe { &*self.dpo_main.get() }
+    pub fn dpo_main(&self) -> Ref<'_, DpoMain> {
+        hammer_runtime::ensure_main_thread().expect("DPO registry reads require the main thread");
+        self.dpo_main.borrow()
     }
 
-    pub fn register_dpo_class(
+    pub fn dpo_mtu(&self, dpo: DpoId) -> u16 {
+        if !dpo.is_valid() {
+            return u16::MAX;
+        }
+        let operation = self
+            .dpo_main()
+            .mtus
+            .get(usize::from(dpo.class().get()))
+            .copied()
+            .flatten();
+        operation.map_or(u16::MAX, |mtu| mtu(dpo))
+    }
+
+    pub fn dpo_urpf(&self, dpo: DpoId) -> u32 {
+        if !dpo.is_valid() {
+            return u32::MAX;
+        }
+        let operation = self
+            .dpo_main()
+            .urpfs
+            .get(usize::from(dpo.class().get()))
+            .copied()
+            .flatten();
+        operation.map_or(u32::MAX, |urpf| urpf(dpo))
+    }
+
+    /// Each row reports class, object size, occupied objects and allocated slots.
+    pub fn dpo_memory(&self) -> Vec<(DpoType, usize, usize, usize)> {
+        let operations = self.dpo_main().memory.clone();
+        operations
+            .into_iter()
+            .enumerate()
+            .filter_map(|(class, operation)| {
+                operation.map(|memory| {
+                    let (size, occupied, allocated) = memory();
+                    (DpoType::new(class as u8), size, occupied, allocated)
+                })
+            })
+            .collect()
+    }
+
+    /// Returns one owned reference. The concrete caller must eventually unlock
+    /// it; copying its identity neither acquires nor releases that reference.
+    pub fn interpose_dpo(&self, original: DpoId, parent: DpoId) -> Result<DpoId, DpoError> {
+        if !original.is_valid() {
+            return Ok(DpoId::INVALID);
+        }
+        hammer_runtime::ensure_main_thread_with_barrier()?;
+        // Do not hold a registry borrow across a callback which may stack a DPO.
+        let operation = self
+            .dpo_main()
+            .interposes
+            .get(usize::from(original.class().get()))
+            .copied()
+            .flatten();
+        match operation {
+            Some(interpose) => interpose(original, parent),
+            None => {
+                self.lock_dpo(original);
+                Ok(original)
+            }
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn register_dpo(
         &self,
+        dpo_type: Option<DpoType>,
         nodes: &[(DpoProto, &[hammer_core::data_plane::NodeId])],
         locks: Option<(fn(DpoId), fn(DpoId))>,
+        next_nodes: Option<fn(DpoId) -> Vec<hammer_core::data_plane::NodeId>>,
+        mtu: Option<fn(DpoId) -> u16>,
+        urpf: Option<fn(DpoId) -> u32>,
+        interpose: Option<fn(DpoId, DpoId) -> Result<DpoId, DpoError>>,
+        format: Option<fn(DpoId, &mut std::fmt::Formatter<'_>) -> std::fmt::Result>,
+        memory: Option<fn() -> (usize, usize, usize)>,
     ) -> Result<DpoType, DpoError> {
         hammer_runtime::ensure_main_thread_with_barrier()?;
-        self.dpo_main_mut().register_new_type(nodes, locks)
-    }
-
-    pub fn register_builtin_dpo(
-        &self,
-        dpo_type: DpoType,
-        nodes: &[(DpoProto, &[hammer_core::data_plane::NodeId])],
-    ) -> Result<(), DpoError> {
-        hammer_runtime::ensure_main_thread_with_barrier()?;
-        let main = self.dpo_main_mut();
-        main.register_builtin(dpo_type, nodes)?;
-        let index = usize::from(dpo_type.get());
-        if main.locks.len() <= index {
-            main.locks.resize(index + 1, None);
-            main.unlocks.resize(index + 1, None);
-        }
-        match dpo_type {
-            DpoType::LOAD_BALANCE => {
-                main.locks[index] = Some(Self::lock_load_balance);
-                main.unlocks[index] = Some(Self::unlock_load_balance);
-            }
-            DpoType::REPLICATE => {
-                main.locks[index] = Some(Self::lock_replicate);
-                main.unlocks[index] = Some(Self::unlock_replicate);
-            }
-            _ => {}
-        }
-        Ok(())
+        self.dpo_main_mut().register(
+            dpo_type, nodes, locks, next_nodes, mtu, urpf, interpose, format, memory,
+        )
     }
 
     /// Acquires a child reference for a concrete DPO owner. Packet-path copies
@@ -184,7 +215,9 @@ impl NetMain {
         hammer_runtime::ensure_main_thread_with_barrier()
             .expect("DPO reference acquisition requires the main-thread publication scope");
         assert!(
-            self.dpo_main().nodes(dpo.class(), dpo.proto()).is_some(),
+            self.dpo_main()
+                .identity(dpo.class(), dpo.proto(), dpo.index())
+                .is_ok(),
             "referenced DPO class/protocol must be registered: {:?}",
             dpo
         );
@@ -210,7 +243,9 @@ impl NetMain {
         hammer_runtime::ensure_main_thread_with_barrier()
             .expect("DPO retirement requires the main-thread publication scope");
         assert!(
-            self.dpo_main().nodes(dpo.class(), dpo.proto()).is_some(),
+            self.dpo_main()
+                .identity(dpo.class(), dpo.proto(), dpo.index())
+                .is_ok(),
             "referenced DPO class/protocol must be registered: {:?}",
             dpo
         );
@@ -222,48 +257,6 @@ impl NetMain {
             .flatten();
         if let Some(unlock) = unlock {
             unlock(dpo);
-        }
-    }
-
-    fn lock_load_balance(dpo: DpoId) {
-        let main = Self::global().expect("load-balance owner must be initialized");
-        main.load_balances_mut()
-            .get_mut(dpo.index())
-            .expect("referenced load-balance must exist")
-            .publish_root();
-    }
-
-    fn unlock_load_balance(dpo: DpoId) {
-        let main = Self::global().expect("load-balance owner must be initialized");
-        let remove = main
-            .load_balances_mut()
-            .get_mut(dpo.index())
-            .expect("locked load-balance must exist")
-            .withdraw_root();
-        if remove {
-            let object = main.load_balances_mut().remove(dpo.index());
-            drop(object);
-        }
-    }
-
-    fn lock_replicate(dpo: DpoId) {
-        let main = Self::global().expect("replicate owner must be initialized");
-        main.replicates_mut()
-            .get_mut(dpo.index())
-            .expect("referenced replicate must exist")
-            .publish_root();
-    }
-
-    fn unlock_replicate(dpo: DpoId) {
-        let main = Self::global().expect("replicate owner must be initialized");
-        let remove = main
-            .replicates_mut()
-            .get_mut(dpo.index())
-            .expect("locked replicate must exist")
-            .withdraw_root();
-        if remove {
-            let object = main.replicates_mut().remove(dpo.index());
-            drop(object);
         }
     }
 
@@ -329,14 +322,23 @@ impl NetMain {
         proto: DpoProto,
         mut load_balance: LoadBalanceDpo,
     ) -> Result<DpoId, DpoError> {
+        // Reject a retained control-plane borrow before graph or child changes.
+        drop(self.load_balances_mut());
         let bucket_count = usize::from(load_balance.bucket_count());
+        let mut stacked = Vec::with_capacity(bucket_count);
         for bucket_index in 0..bucket_count {
-            let bucket = load_balance
+            stacked.push(
+                *load_balance
+                    .bucket_mut(bucket_index)
+                    .ok_or(DpoError::InvalidBucketStorage)?,
+            );
+        }
+        self.dpo_main_mut()
+            .stack_buckets(runtime, DpoType::LOAD_BALANCE, proto, &mut stacked)?;
+        for (bucket_index, &bucket) in stacked.iter().enumerate() {
+            *load_balance
                 .bucket_mut(bucket_index)
-                .ok_or(DpoError::InvalidBucketStorage)?;
-            *bucket = self
-                .dpo_main_mut()
-                .stack(runtime, DpoType::LOAD_BALANCE, proto, *bucket)?;
+                .expect("validated bucket storage") = bucket;
         }
         for bucket_index in 0..bucket_count {
             let child = load_balance
@@ -350,7 +352,7 @@ impl NetMain {
         Ok(DpoId::load_balance(proto, index))
     }
 
-    /// Replaces all buckets of an existing load-balance object.
+    /// Normalizes resolved paths and replaces an existing load-balance object.
     ///
     /// VPP updates the bucket storage and the reported bucket count as one
     /// worker-visible transaction. The detached child identities are stacked
@@ -360,8 +362,8 @@ impl NetMain {
         &self,
         runtime: &mut DataPlaneMain,
         dpo: DpoId,
-        buckets: &[DpoId],
-    ) -> Result<(), DpoError> {
+        paths: &[LoadBalancePath],
+    ) -> Result<Option<()>, DpoError> {
         hammer_runtime::ensure_main_thread()?;
         if dpo.class() != DpoType::LOAD_BALANCE {
             return Err(DpoError::TypeMismatch {
@@ -369,20 +371,19 @@ impl NetMain {
                 expected: DpoType::LOAD_BALANCE.get(),
             });
         }
-        LoadBalanceDpo::validate_bucket_count(buckets.len())?;
-        if buckets.is_empty() {
-            return Err(DpoError::EmptyDpoPublication {
-                dpo_type: DpoType::LOAD_BALANCE.get(),
-            });
+        for path in paths {
+            self.validate_bucket_identity(path.dpo)?;
         }
-        for &bucket in buckets {
-            self.validate_bucket_identity(bucket)?;
-        }
-        if self.load_balance(dpo.index()).is_none() {
-            return Err(DpoError::ObjectMissing {
-                dpo_type: dpo.class().get(),
-                index: dpo.index(),
-            });
+        {
+            let Some(object) = self.load_balance(dpo.index()) else {
+                return Ok(None);
+            };
+            if object.proto != dpo.proto() {
+                return Err(DpoError::ProtocolMismatch {
+                    actual: dpo.proto().get(),
+                    expected: object.proto.get(),
+                });
+            }
         }
 
         let workers_running =
@@ -391,138 +392,109 @@ impl NetMain {
             && !hammer_runtime::barrier::global().is_some_and(|barrier| barrier.is_pending())
         {
             hammer_runtime::worker_thread_barrier_sync!(runtime, {
-                self.update_load_balance_inner(runtime, dpo, buckets)
+                self.update_load_balance_inner(runtime, dpo, paths)
             })
         } else {
-            self.update_load_balance_inner(runtime, dpo, buckets)
+            self.update_load_balance_inner(runtime, dpo, paths)
         }
-    }
-
-    /// Records another long-lived forwarding root for a load-balance object.
-    /// Plain `DpoId` copies remain non-owning; callers use this operation only
-    /// when a concrete FIB/interface slot is about to publish the identity.
-    pub fn publish_load_balance_root(
-        &self,
-        runtime: &mut DataPlaneMain,
-        dpo: DpoId,
-    ) -> Result<(), DpoError> {
-        hammer_runtime::ensure_main_thread()?;
-        if dpo.class() != DpoType::LOAD_BALANCE {
-            return Err(DpoError::TypeMismatch {
-                actual: dpo.class().get(),
-                expected: DpoType::LOAD_BALANCE.get(),
-            });
-        }
-        let operation = || {
-            let load_balance =
-                self.load_balances_mut()
-                    .get_mut(dpo.index())
-                    .ok_or(DpoError::ObjectMissing {
-                        dpo_type: dpo.class().get(),
-                        index: dpo.index(),
-                    })?;
-            load_balance.publish_root();
-            Ok(())
-        };
-        if hammer_runtime::barrier::global().is_some_and(|barrier| barrier.worker_count() != 0)
-            && !hammer_runtime::barrier::global().is_some_and(|barrier| barrier.is_pending())
-        {
-            hammer_runtime::worker_thread_barrier_sync!(runtime, { operation() })
-        } else {
-            operation()
-        }
-    }
-
-    /// Withdraws one published load-balance root. The concrete object is
-    /// retired from its owner pool only after the last root is withdrawn and
-    /// all Data Workers have acknowledged the barrier.
-    pub fn retire_load_balance_root(
-        &self,
-        runtime: &mut DataPlaneMain,
-        dpo: DpoId,
-    ) -> Result<(), DpoError> {
-        hammer_runtime::ensure_main_thread()?;
-        if dpo.class() != DpoType::LOAD_BALANCE {
-            return Err(DpoError::TypeMismatch {
-                actual: dpo.class().get(),
-                expected: DpoType::LOAD_BALANCE.get(),
-            });
-        }
-        let operation = || {
-            let load_balance =
-                self.load_balances_mut()
-                    .get_mut(dpo.index())
-                    .ok_or(DpoError::ObjectMissing {
-                        dpo_type: dpo.class().get(),
-                        index: dpo.index(),
-                    })?;
-            let should_remove = load_balance.withdraw_root();
-            if should_remove {
-                let object = self.load_balances_mut().remove(dpo.index());
-                drop(object);
-            }
-            Ok(())
-        };
-        let workers_running =
-            hammer_runtime::barrier::global().is_some_and(|barrier| barrier.worker_count() != 0);
-        if workers_running
-            && !hammer_runtime::barrier::global().is_some_and(|barrier| barrier.is_pending())
-        {
-            hammer_runtime::worker_thread_barrier_sync!(runtime, { operation() })
-        } else {
-            operation()
-        }
+        .map(Some)
     }
 
     fn update_load_balance_inner(
         &self,
         runtime: &mut DataPlaneMain,
         dpo: DpoId,
-        buckets: &[DpoId],
+        paths: &[LoadBalancePath],
     ) -> Result<(), DpoError> {
+        drop(self.load_balances_mut());
         let proto = dpo.proto();
-        let mut stacked = Vec::with_capacity(buckets.len());
-        for &bucket in buckets {
-            stacked.push(self.dpo_main_mut().stack(
-                runtime,
-                DpoType::LOAD_BALANCE,
-                proto,
-                bucket,
-            )?);
-        }
-        let load_balance =
-            self.load_balances()
-                .get(dpo.index())
-                .ok_or(DpoError::ObjectMissing {
-                    dpo_type: dpo.class().get(),
-                    index: dpo.index(),
-                })?;
+        let load_balance = self
+            .load_balance(dpo.index())
+            .expect("validated load-balance remains present during the update scope");
         let mut replacement = LoadBalanceDpo::new(
             proto,
-            &stacked,
+            paths,
             load_balance.flags,
             load_balance.flow_hash_config(),
         )?;
         replacement.lock_count = load_balance.lock_count;
         replacement.map_index = load_balance.map_index;
-        replacement.urpf_index = load_balance.urpf_index;
+        let urpf_index = load_balance.urpf_index;
         replacement.fib_entry_flags = load_balance.fib_entry_flags;
+        drop(load_balance);
+        if urpf_index != u32::MAX {
+            // Reject retained control-plane list borrows before graph changes.
+            drop(self.urpf_lists.borrow_mut());
+        }
+        let mut stacked: Vec<_> = (0..replacement.bucket_count())
+            .map(|bucket| {
+                replacement
+                    .select_bucket(u32::from(bucket))
+                    .expect("normalized bucket lies within constructed storage")
+            })
+            .collect();
+        self.dpo_main_mut()
+            .stack_buckets(runtime, DpoType::LOAD_BALANCE, proto, &mut stacked)?;
+        for (bucket, &child) in stacked.iter().enumerate() {
+            *replacement
+                .bucket_mut(bucket)
+                .expect("stacking preserves the normalized bucket count") = child;
+        }
         for &child in &stacked {
             self.lock_dpo(child);
             replacement.locked_buckets += 1;
         }
+        if urpf_index != u32::MAX {
+            self.lock_urpf_list(urpf_index);
+            replacement.urpf_index = urpf_index;
+        }
         // A child may refer to this same object; preserve counts acquired above.
-        let slot =
-            self.load_balances_mut()
-                .get_mut(dpo.index())
-                .ok_or(DpoError::ObjectMissing {
-                    dpo_type: dpo.class().get(),
-                    index: dpo.index(),
-                })?;
+        let mut pool = self.load_balances_mut();
+        let slot = pool
+            .get_mut(dpo.index())
+            .expect("child reference acquisition must not retire the update target");
         replacement.lock_count = slot.lock_count;
         let old = std::mem::replace(slot, replacement);
+        drop(pool);
         drop(old);
         Ok(())
+    }
+
+    pub fn set_load_balance_urpf(
+        &self,
+        dpo: DpoId,
+        urpf_index: u32,
+    ) -> Result<Option<()>, DpoError> {
+        hammer_runtime::ensure_main_thread_with_barrier()?;
+        if dpo.class() != DpoType::LOAD_BALANCE {
+            return Err(DpoError::TypeMismatch {
+                actual: dpo.class().get(),
+                expected: DpoType::LOAD_BALANCE.get(),
+            });
+        }
+        let mut pool = self.load_balances_mut();
+        let Some(object) = pool.get_mut(dpo.index()) else {
+            return Ok(None);
+        };
+        if object.proto != dpo.proto() {
+            return Err(DpoError::ProtocolMismatch {
+                actual: dpo.proto().get(),
+                expected: object.proto.get(),
+            });
+        }
+        if urpf_index != u32::MAX && self.urpf_list(urpf_index).is_none() {
+            return Ok(None);
+        }
+        // Clearing an association also releases the old list. Validate that
+        // borrow boundary before changing the owning field, not during unlock.
+        drop(self.urpf_lists.borrow_mut());
+        if urpf_index != u32::MAX {
+            self.lock_urpf_list(urpf_index);
+        }
+        let old = std::mem::replace(&mut object.urpf_index, urpf_index);
+        drop(pool);
+        self.unlock_urpf_list(old);
+        Ok(Some(()))
     }
 
     pub fn create_replicate(
@@ -575,16 +547,23 @@ impl NetMain {
         proto: DpoProto,
         mut replicate: ReplicateDpo,
     ) -> Result<DpoId, DpoError> {
+        drop(self.replicates_mut());
         let bucket_count = usize::from(replicate.bucket_count());
         let mut has_local = false;
+        let mut stacked = Vec::with_capacity(bucket_count);
         for bucket_index in 0..bucket_count {
             let bucket = replicate
                 .bucket_mut(bucket_index)
                 .ok_or(DpoError::InvalidBucketStorage)?;
             has_local |= bucket.class() == DpoType::RECEIVE;
-            *bucket = self
-                .dpo_main_mut()
-                .stack(runtime, DpoType::REPLICATE, proto, *bucket)?;
+            stacked.push(*bucket);
+        }
+        self.dpo_main_mut()
+            .stack_buckets(runtime, DpoType::REPLICATE, proto, &mut stacked)?;
+        for (bucket_index, &bucket) in stacked.iter().enumerate() {
+            *replicate
+                .bucket_mut(bucket_index)
+                .expect("validated bucket storage") = bucket;
         }
         replicate.flags.set(ReplicateFlags::HAS_LOCAL, has_local);
         for bucket_index in 0..bucket_count {
@@ -604,7 +583,7 @@ impl NetMain {
         runtime: &mut DataPlaneMain,
         dpo: DpoId,
         buckets: &[DpoId],
-    ) -> Result<(), DpoError> {
+    ) -> Result<Option<()>, DpoError> {
         hammer_runtime::ensure_main_thread()?;
         if dpo.class() != DpoType::REPLICATE {
             return Err(DpoError::TypeMismatch {
@@ -621,11 +600,16 @@ impl NetMain {
         for &bucket in buckets {
             self.validate_bucket_identity(bucket)?;
         }
-        if self.replicates().get(dpo.index()).is_none() {
-            return Err(DpoError::ObjectMissing {
-                dpo_type: dpo.class().get(),
-                index: dpo.index(),
-            });
+        {
+            let Some(object) = self.replicate(dpo.index()) else {
+                return Ok(None);
+            };
+            if object.proto != dpo.proto() {
+                return Err(DpoError::ProtocolMismatch {
+                    actual: dpo.proto().get(),
+                    expected: object.proto.get(),
+                });
+            }
         }
         let workers_running =
             hammer_runtime::barrier::global().is_some_and(|barrier| barrier.worker_count() != 0);
@@ -638,76 +622,7 @@ impl NetMain {
         } else {
             self.update_replicate_inner(runtime, dpo, buckets)
         }
-    }
-
-    pub fn publish_replicate_root(
-        &self,
-        runtime: &mut DataPlaneMain,
-        dpo: DpoId,
-    ) -> Result<(), DpoError> {
-        hammer_runtime::ensure_main_thread()?;
-        if dpo.class() != DpoType::REPLICATE {
-            return Err(DpoError::TypeMismatch {
-                actual: dpo.class().get(),
-                expected: DpoType::REPLICATE.get(),
-            });
-        }
-        let operation = || {
-            let replicate =
-                self.replicates_mut()
-                    .get_mut(dpo.index())
-                    .ok_or(DpoError::ObjectMissing {
-                        dpo_type: dpo.class().get(),
-                        index: dpo.index(),
-                    })?;
-            replicate.publish_root();
-            Ok(())
-        };
-        if hammer_runtime::barrier::global().is_some_and(|barrier| barrier.worker_count() != 0)
-            && !hammer_runtime::barrier::global().is_some_and(|barrier| barrier.is_pending())
-        {
-            hammer_runtime::worker_thread_barrier_sync!(runtime, { operation() })
-        } else {
-            operation()
-        }
-    }
-
-    pub fn retire_replicate_root(
-        &self,
-        runtime: &mut DataPlaneMain,
-        dpo: DpoId,
-    ) -> Result<(), DpoError> {
-        hammer_runtime::ensure_main_thread()?;
-        if dpo.class() != DpoType::REPLICATE {
-            return Err(DpoError::TypeMismatch {
-                actual: dpo.class().get(),
-                expected: DpoType::REPLICATE.get(),
-            });
-        }
-        let operation = || {
-            let replicate =
-                self.replicates_mut()
-                    .get_mut(dpo.index())
-                    .ok_or(DpoError::ObjectMissing {
-                        dpo_type: dpo.class().get(),
-                        index: dpo.index(),
-                    })?;
-            let should_remove = replicate.withdraw_root();
-            if should_remove {
-                let object = self.replicates_mut().remove(dpo.index());
-                drop(object);
-            }
-            Ok(())
-        };
-        let workers_running =
-            hammer_runtime::barrier::global().is_some_and(|barrier| barrier.worker_count() != 0);
-        if workers_running
-            && !hammer_runtime::barrier::global().is_some_and(|barrier| barrier.is_pending())
-        {
-            hammer_runtime::worker_thread_barrier_sync!(runtime, { operation() })
-        } else {
-            operation()
-        }
+        .map(Some)
     }
 
     fn update_replicate_inner(
@@ -716,21 +631,14 @@ impl NetMain {
         dpo: DpoId,
         buckets: &[DpoId],
     ) -> Result<(), DpoError> {
+        drop(self.replicates_mut());
         let proto = dpo.proto();
-        let mut stacked = Vec::with_capacity(buckets.len());
-        for &bucket in buckets {
-            stacked.push(
-                self.dpo_main_mut()
-                    .stack(runtime, DpoType::REPLICATE, proto, bucket)?,
-            );
-        }
+        let mut stacked = buckets.to_vec();
+        self.dpo_main_mut()
+            .stack_buckets(runtime, DpoType::REPLICATE, proto, &mut stacked)?;
         let replicate = self
-            .replicates()
-            .get(dpo.index())
-            .ok_or(DpoError::ObjectMissing {
-                dpo_type: dpo.class().get(),
-                index: dpo.index(),
-            })?;
+            .replicate(dpo.index())
+            .expect("validated replicate remains present during the update scope");
         let mut flags = replicate.flags;
         flags.set(
             ReplicateFlags::HAS_LOCAL,
@@ -740,39 +648,86 @@ impl NetMain {
         );
         let mut replacement = ReplicateDpo::new(proto, &stacked, flags)?;
         replacement.lock_count = replicate.lock_count;
+        drop(replicate);
         for &child in &stacked {
             self.lock_dpo(child);
             replacement.locked_buckets += 1;
         }
-        let slot = self
-            .replicates_mut()
+        let mut pool = self.replicates_mut();
+        let slot = pool
             .get_mut(dpo.index())
-            .ok_or(DpoError::ObjectMissing {
-                dpo_type: dpo.class().get(),
-                index: dpo.index(),
-            })?;
+            .expect("child reference acquisition must not retire the update target");
         replacement.lock_count = slot.lock_count;
         let old = std::mem::replace(slot, replacement);
+        drop(pool);
         drop(old);
         Ok(())
     }
 
     #[inline(always)]
-    pub fn load_balance(&self, index: u32) -> Option<&LoadBalanceDpo> {
-        self.load_balances().get(index)
+    pub fn load_balance(&self, index: u32) -> Option<Ref<'_, LoadBalanceDpo>> {
+        Ref::filter_map(self.load_balances(), |pool| pool.get(index)).ok()
     }
 
     #[inline(always)]
-    pub fn replicate(&self, index: u32) -> Option<&ReplicateDpo> {
-        self.replicates().get(index)
+    pub fn replicate(&self, index: u32) -> Option<Ref<'_, ReplicateDpo>> {
+        Ref::filter_map(self.replicates(), |pool| pool.get(index)).ok()
     }
 
     #[inline(always)]
-    pub fn select_load_balance(&self, dpo: DpoId, hash: u32) -> Option<DpoId> {
-        (dpo.class() == DpoType::LOAD_BALANCE)
-            .then(|| self.load_balance(dpo.index()))
-            .flatten()
-            .and_then(|load_balance| load_balance.select_bucket(hash))
+    pub fn select_load_balance(
+        &self,
+        dpo: DpoId,
+        hash: impl FnOnce(u16, u16) -> Option<u32>,
+    ) -> Option<DpoId> {
+        if dpo.class() != DpoType::LOAD_BALANCE {
+            return None;
+        }
+        let select = |pool: &Pool<LoadBalanceDpo>| {
+            let object = pool.get(dpo.index())?;
+            let hash = hash(object.bucket_count(), object.flow_hash_config())?;
+            object.select_bucket(hash)
+        };
+        if hammer_runtime::ensure_main_thread().is_ok() {
+            return select(&self.load_balances());
+        }
+        hammer_runtime::with_data_plane_main(|runtime| {
+            assert_ne!(
+                runtime.thread_index(),
+                0,
+                "packet selection requires an installed Data Worker"
+            );
+            // SAFETY: this worker cannot acknowledge a barrier during this
+            // synchronous selection. Only the main thread mutates the pool,
+            // after every worker acknowledges. No pool reference escapes.
+            unsafe { select(&*self.load_balances.as_ptr()) }
+        })
+    }
+
+    #[inline(always)]
+    pub fn load_balance_urpf(&self, dpo: DpoId) -> Option<u32> {
+        if dpo.class() != DpoType::LOAD_BALANCE {
+            return None;
+        }
+        let index = if hammer_runtime::ensure_main_thread().is_ok() {
+            self.load_balance(dpo.index())?.urpf_index
+        } else {
+            hammer_runtime::with_data_plane_main(|runtime| {
+                assert_ne!(
+                    runtime.thread_index(),
+                    0,
+                    "uRPF lookup requires a Data Worker"
+                );
+                // SAFETY: no barrier acknowledgement can occur during this
+                // read; only the retained list index leaves the worker scope.
+                unsafe {
+                    (&*self.load_balances.as_ptr())
+                        .get(dpo.index())
+                        .map(|object| object.urpf_index)
+                }
+            })?
+        };
+        (index != u32::MAX).then_some(index)
     }
     pub fn interface_main_arc(&self) -> Arc<InterfaceMain> {
         Arc::clone(&self.interface_main)

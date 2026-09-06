@@ -74,10 +74,24 @@ impl HandoffNode {
 
 pub fn register_drop(runtime: &DataPlaneMain) -> RuntimeResult<NodeId> {
     let node = runtime.nodes().try_register_internal(DropNode)?;
-    NetMain::global()?.register_builtin_dpo(
-        DpoType::DROP,
-        &[(DpoProto::IP4, &[node][..]), (DpoProto::IP6, &[node][..])],
-    )?;
+    NetMain::global()?
+        .register_dpo(
+            Some(DpoType::DROP),
+            &[(DpoProto::IP4, &[node][..]), (DpoProto::IP6, &[node][..])],
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+        .map_err(
+            |source| hammer_runtime::RuntimeError::GraphNodeInitialization {
+                node: DropNode::NODE_NAME,
+                source: Box::new(source),
+            },
+        )?;
     Ok(node)
 }
 

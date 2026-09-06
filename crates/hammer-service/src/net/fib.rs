@@ -1,6 +1,116 @@
+use std::cell::Ref;
 use std::collections::BTreeMap;
 
+use hammer_runtime::RuntimeResult;
+
 use super::dpo::DpoId;
+
+/// Baked reverse-path interfaces. Published lists are immutable and shared by
+/// path lists and load-balances, independently of their DPO child references.
+#[derive(Debug)]
+pub struct FibUrpfList {
+    interfaces: Vec<u32>,
+    lock_count: u32,
+}
+
+impl FibUrpfList {
+    pub fn interfaces(&self) -> &[u32] {
+        &self.interfaces
+    }
+}
+
+impl super::NetMain {
+    pub fn create_urpf_list(&self, mut interfaces: Vec<u32>) -> RuntimeResult<u32> {
+        hammer_runtime::ensure_main_thread_with_barrier()?;
+        interfaces.sort_unstable();
+        interfaces.dedup();
+        Ok(self.urpf_lists.borrow_mut().insert(FibUrpfList {
+            interfaces,
+            lock_count: 1,
+        }))
+    }
+
+    pub fn urpf_list(&self, index: u32) -> Option<Ref<'_, FibUrpfList>> {
+        hammer_runtime::ensure_main_thread()
+            .expect("uRPF control-plane borrow requires the main thread");
+        Ref::filter_map(self.urpf_lists.borrow(), |pool| pool.get(index)).ok()
+    }
+
+    pub fn lock_urpf_list(&self, index: u32) {
+        hammer_runtime::ensure_main_thread_with_barrier()
+            .expect("uRPF reference acquisition requires the publication scope");
+        let mut pool = self.urpf_lists.borrow_mut();
+        let list = pool
+            .get_mut(index)
+            .expect("referenced uRPF list must exist");
+        list.lock_count = list
+            .lock_count
+            .checked_add(1)
+            .expect("uRPF reference count must remain representable");
+    }
+
+    pub fn unlock_urpf_list(&self, index: u32) {
+        if index == u32::MAX {
+            return;
+        }
+        hammer_runtime::ensure_main_thread_with_barrier()
+            .expect("uRPF retirement requires the publication scope");
+        let mut pool = self.urpf_lists.borrow_mut();
+        let list = pool.get_mut(index).expect("owned uRPF list must exist");
+        list.lock_count = list
+            .lock_count
+            .checked_sub(1)
+            .expect("uRPF retirement requires an owned reference");
+        if list.lock_count == 0 {
+            drop(pool.remove(index));
+        }
+    }
+
+    #[inline(always)]
+    pub fn urpf_size(&self, index: u32) -> Option<usize> {
+        if hammer_runtime::ensure_main_thread().is_ok() {
+            return self.urpf_list(index).map(|list| list.interfaces.len());
+        }
+        hammer_runtime::with_data_plane_main(|runtime| {
+            assert_ne!(
+                runtime.thread_index(),
+                0,
+                "uRPF packet read requires a Data Worker"
+            );
+            // SAFETY: the worker cannot acknowledge a barrier inside this
+            // synchronous read. Main mutates only after all acknowledgements;
+            // only the interface count escapes.
+            unsafe {
+                (&*self.urpf_lists.as_ptr())
+                    .get(index)
+                    .map(|list| list.interfaces.len())
+            }
+        })
+    }
+
+    #[inline(always)]
+    pub fn urpf_check(&self, index: u32, sw_if_index: u32) -> Option<bool> {
+        if hammer_runtime::ensure_main_thread().is_ok() {
+            return self
+                .urpf_list(index)
+                .map(|list| list.interfaces.binary_search(&sw_if_index).is_ok());
+        }
+        hammer_runtime::with_data_plane_main(|runtime| {
+            assert_ne!(
+                runtime.thread_index(),
+                0,
+                "uRPF packet read requires a Data Worker"
+            );
+            // SAFETY: main cannot change or reclaim the list until this
+            // worker acknowledges its barrier. Only membership is returned.
+            unsafe {
+                (&*self.urpf_lists.as_ptr())
+                    .get(index)
+                    .map(|list| list.interfaces.binary_search(&sw_if_index).is_ok())
+            }
+        })
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum FibSourceBehavior {
@@ -192,15 +302,62 @@ impl<N, F, SourceData, PathExt> FibEntrySrc<N, F, SourceData, PathExt> {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub struct FibPathList<N, F> {
-    pub paths: Box<[FibPath<N, F>]>,
+    pub paths: Vec<FibPath<N, F>>,
     pub key_flags: FibPathListFlags,
     pub flags: FibPathListFlags,
     pub source_count: u32,
     pub child_count: u32,
     pub children: Vec<(u16, u32)>,
-    pub urpf_index: Option<u32>,
+    urpf_index: Option<u32>,
+}
+
+impl<N, F> FibPathList<N, F> {
+    pub fn new(paths: Vec<FibPath<N, F>>, key_flags: FibPathListFlags) -> Self {
+        Self {
+            paths,
+            key_flags,
+            flags: key_flags,
+            source_count: 0,
+            child_count: 0,
+            children: Vec::new(),
+            urpf_index: None,
+        }
+    }
+
+    /// Path owners supply accepting interfaces according to their path semantics,
+    /// including unresolved attached paths and non-looped recursive via entries.
+    pub fn bake_urpf(&mut self, interfaces: Vec<u32>) -> RuntimeResult<()> {
+        let net = super::NetMain::global()?;
+        if self.key_flags.contains(FibPathListFlags::NO_URPF) {
+            hammer_runtime::ensure_main_thread_with_barrier()?;
+            if let Some(old) = self.urpf_index {
+                net.unlock_urpf_list(old);
+                self.urpf_index = None;
+            }
+            return Ok(());
+        }
+        let new = net.create_urpf_list(interfaces)?;
+        if let Some(old) = self.urpf_index.replace(new) {
+            net.unlock_urpf_list(old);
+        }
+        Ok(())
+    }
+
+    pub fn urpf_index(&self) -> Option<u32> {
+        self.urpf_index
+    }
+}
+
+impl<N, F> Drop for FibPathList<N, F> {
+    fn drop(&mut self) {
+        if let Some(index) = self.urpf_index {
+            super::NetMain::global()
+                .expect("FIB owner must outlive its path lists")
+                .unlock_urpf_list(index);
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -215,7 +372,7 @@ pub trait FibTableBackend {
     type PacketAddress: Copy;
     type NextHop: Clone;
     type PathFlags: Copy;
-    type Error;
+    type Error: std::error::Error + 'static;
 
     fn lookup(&self, prefix: Self::Prefix) -> Option<u32>;
     fn lookup_exact(&self, prefix: Self::Prefix) -> Option<u32>;
@@ -230,6 +387,8 @@ pub trait FibTableBackend {
         old: DpoId,
         cover: Option<(Self::Prefix, DpoId)>,
     ) -> Result<(), Self::Error>;
+    /// Some transfers one acquired DPO reference to the FIB. None transfers
+    /// none; an error must leave any candidate references with the backend.
     fn project_forwarding(
         &mut self,
         entry: &FibEntry,
@@ -237,7 +396,7 @@ pub trait FibTableBackend {
     ) -> Result<Option<DpoId>, Self::Error>;
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub struct FibTable<P, B>
 where
     P: Copy + Ord,
@@ -269,10 +428,6 @@ where
         &self.backend
     }
 
-    pub fn backend_mut(&mut self) -> &mut B {
-        &mut self.backend
-    }
-
     pub fn entry(&self, index: u32) -> Option<&FibEntry> {
         self.entries.get(index as usize)
     }
@@ -294,58 +449,123 @@ where
         prefix: P,
         source: FibSource,
         forwarding: DpoId,
-    ) -> Result<u32, FibError>
+    ) -> Result<u32, FibError<B::Error>>
     where
         B: Clone,
     {
-        let previous = self.clone();
-        let entry = self.add_source(prefix, source)?;
-        let mut projection = self.entries[entry as usize].clone();
-        projection.forwarding = Some(forwarding);
-        let Some(forwarding) = self
-            .backend
-            .project_forwarding(&projection, source)
-            .map_err(|_| FibError::BackendRejected)?
-        else {
-            *self = previous;
-            return Err(FibError::BackendRejected);
+        hammer_runtime::ensure_main_thread_with_barrier()?;
+        let net = super::NetMain::global()?;
+        // These are non-owning projections. The source roots remain untouched
+        // until backend validation and publication have both succeeded.
+        let previous = (
+            self.backend.clone(),
+            self.entries.clone(),
+            self.prefixes.clone(),
+            self.source_references.clone(),
+        );
+        let result = (|| {
+            let entry = self.add_source(prefix, source)?;
+            let mut projection = self.entries[entry as usize].clone();
+            projection.forwarding = Some(forwarding);
+            let forwarding = self
+                .backend
+                .project_forwarding(&projection, source)
+                .map_err(FibError::Backend)?;
+            let selected =
+                self.entries[entry as usize]
+                    .sources
+                    .first()
+                    .and_then(|(candidate, _)| {
+                        if *candidate == source {
+                            forwarding
+                        } else {
+                            self.source_forwarding.get(&(prefix, *candidate)).copied()
+                        }
+                    });
+            let publication = if let Some(selected) = selected {
+                self.backend.forwarding_update(prefix, selected)
+            } else if let Some(old) = self.entries[entry as usize].forwarding {
+                let cover = self
+                    .backend
+                    .less_specific(prefix)
+                    .and_then(|(prefix, entry)| {
+                        self.entries[entry as usize]
+                            .forwarding
+                            .map(|dpo| (prefix, dpo))
+                    });
+                self.backend.forwarding_remove(prefix, old, cover)
+            } else {
+                Ok(())
+            };
+            if let Err(error) = publication {
+                if let Some(candidate) = forwarding {
+                    net.unlock_dpo(candidate);
+                }
+                return Err(FibError::Backend(error));
+            }
+            self.entries[entry as usize].forwarding = selected;
+            Ok((entry, forwarding))
+        })();
+        let (entry, forwarding) = match result {
+            Ok(result) => result,
+            Err(error) => {
+                (
+                    self.backend,
+                    self.entries,
+                    self.prefixes,
+                    self.source_references,
+                ) = previous;
+                return Err(error);
+            }
         };
-        if self.backend.forwarding_update(prefix, forwarding).is_err() {
-            *self = previous;
-            return Err(FibError::BackendRejected);
+        let old = if let Some(forwarding) = forwarding {
+            self.source_forwarding.insert((prefix, source), forwarding)
+        } else {
+            self.source_forwarding.remove(&(prefix, source))
+        };
+        if let Some(old) = old {
+            net.unlock_dpo(old);
         }
-        self.entries[entry as usize].forwarding = Some(forwarding);
-        self.source_forwarding.insert((prefix, source), forwarding);
         Ok(entry)
     }
 
-    pub fn remove_route(&mut self, prefix: P, source: FibSource) -> Result<bool, FibError>
+    pub fn remove_route(&mut self, prefix: P, source: FibSource) -> Result<bool, FibError<B::Error>>
     where
         B: Clone,
     {
         let Some(entry) = self.prefixes.get(&prefix).copied() else {
             return Ok(false);
         };
-        let previous = self.clone();
+        hammer_runtime::ensure_main_thread_with_barrier()?;
+        let net = super::NetMain::global()?;
+        let previous = (
+            self.backend.clone(),
+            self.entries.clone(),
+            self.prefixes.clone(),
+            self.source_references.clone(),
+        );
         let old = self.entries[entry as usize].forwarding;
-        let removed = self.remove_source(prefix, source)?;
-        if removed {
+        let result = (|| {
+            let removed = self.remove_source(prefix, source)?;
+            if !removed {
+                return Ok(false);
+            }
             let source_remains = self.source_references.contains_key(&(entry, source));
             if source_remains {
-                return Ok(true);
+                return Ok(false);
             }
-            if let Some(old) = old {
-                self.source_forwarding.remove(&(prefix, source));
-                if let Some((winner, _)) = self.entries[entry as usize].sources.first().copied() {
-                    if let Some(dpo) = self.source_forwarding.get(&(prefix, winner)).copied() {
-                        self.backend.forwarding_update(prefix, dpo).map_err(|_| {
-                            *self = previous.clone();
-                            FibError::BackendRejected
-                        })?;
-                        self.entries[entry as usize].forwarding = Some(dpo);
-                        return Ok(true);
-                    }
-                }
+            let selected =
+                self.entries[entry as usize]
+                    .sources
+                    .first()
+                    .and_then(|(candidate, _)| {
+                        self.source_forwarding.get(&(prefix, *candidate)).copied()
+                    });
+            if let Some(selected) = selected {
+                self.backend
+                    .forwarding_update(prefix, selected)
+                    .map_err(FibError::Backend)?;
+            } else if let Some(old) = old {
                 let cover =
                     self.backend
                         .less_specific(prefix)
@@ -357,21 +577,33 @@ where
                         });
                 self.backend
                     .forwarding_remove(prefix, old, cover)
-                    .map_err(|_| {
-                        *self = previous.clone();
-                        FibError::BackendRejected
-                    })?;
+                    .map_err(FibError::Backend)?;
             }
-            if self.prefixes.contains_key(&prefix) {
-                self.entries[entry as usize].forwarding = None;
-            } else {
-                self.entries[entry as usize].forwarding = None;
+            self.entries[entry as usize].forwarding = selected;
+            Ok(true)
+        })();
+        match result {
+            Ok(source_removed) => {
+                if source_removed {
+                    if let Some(old) = self.source_forwarding.remove(&(prefix, source)) {
+                        net.unlock_dpo(old);
+                    }
+                }
+                Ok(true)
+            }
+            Err(error) => {
+                (
+                    self.backend,
+                    self.entries,
+                    self.prefixes,
+                    self.source_references,
+                ) = previous;
+                Err(error)
             }
         }
-        Ok(removed)
     }
 
-    pub fn add_source(&mut self, prefix: P, source: FibSource) -> Result<u32, FibError> {
+    fn add_source(&mut self, prefix: P, source: FibSource) -> Result<u32, FibError<B::Error>> {
         if let Some(entry) = self.prefixes.get(&prefix).copied() {
             if self
                 .source_references
@@ -387,10 +619,13 @@ where
         let entry = if let Some(index) = self.prefixes.get(&prefix).copied() {
             index
         } else {
-            let index = u32::try_from(self.entries.len()).map_err(|_| FibError::BackendRejected)?;
+            let index =
+                u32::try_from(self.entries.len()).map_err(|_| FibError::EntryIndexOverflow {
+                    count: self.entries.len(),
+                })?;
             self.backend
                 .insert_entry(prefix, index)
-                .map_err(|_| FibError::BackendRejected)?;
+                .map_err(FibError::Backend)?;
             self.prefixes.insert(prefix, index);
             self.entries.push(FibEntry {
                 flags: FibEntryFlags::empty(),
@@ -420,7 +655,7 @@ where
             .map(|(source, _)| *source)
     }
 
-    pub fn remove_source(&mut self, prefix: P, source: FibSource) -> Result<bool, FibError> {
+    fn remove_source(&mut self, prefix: P, source: FibSource) -> Result<bool, FibError<B::Error>> {
         let Some(entry) = self.prefixes.get(&prefix).copied() else {
             return Ok(false);
         };
@@ -437,7 +672,7 @@ where
         if last_source {
             self.backend
                 .remove_entry(prefix, entry)
-                .map_err(|_| FibError::BackendRejected)?;
+                .map_err(FibError::Backend)?;
         }
         self.source_references.remove(&key);
         record.sources.retain(|(candidate, _)| *candidate != source);
@@ -448,14 +683,36 @@ where
     }
 }
 
-#[derive(Debug, thiserror::Error, Clone, Copy, PartialEq, Eq)]
-pub enum FibError {
+impl<P, B> Drop for FibTable<P, B>
+where
+    P: Copy + Ord,
+    B: FibTableBackend<Prefix = P>,
+{
+    fn drop(&mut self) {
+        if self.source_forwarding.is_empty() {
+            return;
+        }
+        let net = super::NetMain::global().expect("FIB roots must not outlive their net owner");
+        hammer_runtime::ensure_main_thread_with_barrier()
+            .expect("FIB destruction requires the main-thread publication scope");
+        for (_, forwarding) in std::mem::take(&mut self.source_forwarding) {
+            net.unlock_dpo(forwarding);
+        }
+    }
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum FibError<E: std::error::Error + 'static> {
+    #[error(transparent)]
+    Runtime(#[from] hammer_runtime::RuntimeError),
     #[error("FIB source reference count overflow")]
     ReferenceCountOverflow,
     #[error("FIB source is not registered for this entry")]
     SourceMissing,
-    #[error("FIB backend rejected the mutation")]
-    BackendRejected,
+    #[error("FIB backend mutation failed")]
+    Backend(#[source] E),
+    #[error("FIB entry count {count} exceeds the index representation")]
+    EntryIndexOverflow { count: usize },
 }
 
 #[cfg(test)]
