@@ -3,7 +3,7 @@ use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
 
 use hammer_core::data_plane::{
-    BufferFrame, DEFAULT_BUFFER_FRAME_CAPACITY, Index, NodeHandle, NodeId, NodeNext,
+    BufferFrame, DEFAULT_BUFFER_FRAME_CAPACITY, Index, NodeId, NodeNext,
 };
 use hammer_infra::bihash::{Bihash, FREE_U64};
 use hammer_infra::checksum::internet_checksum;
@@ -127,8 +127,8 @@ impl IpReassemblyDirectory {
 
 #[derive(Clone)]
 pub struct IpReassemblyHandoff {
-    reassembly: NodeHandle,
-    input: NodeHandle,
+    reassembly: NodeId,
+    input: NodeId,
     worker: DataWorkerId,
     directory: IpReassemblyDirectory,
 }
@@ -136,8 +136,8 @@ pub struct IpReassemblyHandoff {
 impl IpReassemblyHandoff {
     #[inline]
     pub fn new(
-        reassembly: NodeHandle,
-        input: NodeHandle,
+        reassembly: NodeId,
+        input: NodeId,
         worker: DataWorkerId,
         directory: IpReassemblyDirectory,
     ) -> Self {
@@ -150,12 +150,12 @@ impl IpReassemblyHandoff {
     }
 
     #[inline]
-    pub fn reassembly(&self) -> NodeHandle {
+    pub fn reassembly(&self) -> NodeId {
         self.reassembly
     }
 
     #[inline]
-    pub fn input(&self) -> NodeHandle {
+    pub fn input(&self) -> NodeId {
         self.input
     }
 
@@ -590,7 +590,7 @@ impl IpReassemblyWorker {
                             next: None,
                         },
                     );
-                    runtime.handoff_index(owner, handoff.reassembly, index, None::<u16>)?;
+                    runtime.handoff_index(owner, handoff.reassembly, index)?;
                     return Ok(());
                 }
             }
@@ -648,12 +648,7 @@ impl IpReassemblyWorker {
                                         next: None,
                                     },
                                 );
-                                runtime.handoff_index(
-                                    owner,
-                                    handoff.reassembly,
-                                    index,
-                                    None::<u16>,
-                                )?;
+                                runtime.handoff_index(owner, handoff.reassembly, index)?;
                                 return Ok(());
                             }
                         }
@@ -817,7 +812,7 @@ impl IpReassemblyWorker {
                             next: None,
                         },
                     );
-                    runtime.handoff_index(sendout, handoff.input, index, None::<u16>)?;
+                    runtime.handoff_index(sendout, handoff.input, index)?;
                     return Ok(());
                 }
             }
