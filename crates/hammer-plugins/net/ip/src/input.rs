@@ -8,9 +8,7 @@ use hammer_runtime::{
     format_packet_trace, unlikely,
 };
 
-use crate::ip::{
-    IpInputError, IpInputTarget, IpProtocol, IpVersion, network_for_protocol, parse_ip_header,
-};
+use crate::ip::{IpInputError, IpInputTarget, IpProtocol, IpVersion, parse_ip_header};
 use crate::protocol::ip_ecn::IpEcnCodepoint;
 use hammer_service::data_plane::{FeatureArcSpec, FeatureArcStartHandle, set_buffer_node_error};
 use hammer_service::opaque::NetworkOpaque;
@@ -196,7 +194,7 @@ fn next_slot_for_index(
     index: Index,
     feature_arc: Option<&FeatureArcStartHandle>,
 ) -> RuntimeResult<u16> {
-    let (trace, parsed, _) = {
+    let (trace, parsed) = {
         let mut buffer = runtime.get_buffer_mut(index)?;
         let traced = buffer.trace_handle().is_some();
         match parse_ip_header(buffer.current()) {
@@ -226,8 +224,7 @@ fn next_slot_for_index(
                 } else {
                     set_buffer_node_error(runtime, &mut buffer, parsed.input_error)?;
                 }
-                let network = network_for_protocol(parsed.protocol);
-                let cursor = if network.is_some() {
+                let cursor = if !matches!(parsed.protocol, IpProtocol::Other(_)) {
                     BufferPacketCursor::new()
                         .with_packet_len(parsed.packet_len)
                         .with_network_header(
@@ -254,13 +251,7 @@ fn next_slot_for_index(
                     IpVersion::V4 => 4,
                     IpVersion::V6 => 6,
                 }));
-                ip.set_ip_protocol(Some(match parsed.protocol {
-                    IpProtocol::Icmpv4 => 1,
-                    IpProtocol::Tcp => 6,
-                    IpProtocol::Udp => 17,
-                    IpProtocol::Icmpv6 => 58,
-                    IpProtocol::Other(value) => value,
-                }));
+                ip.set_ip_protocol(Some(u8::from(parsed.protocol)));
                 ip.set_fib_index(crate::lookup::fib_index_for(
                     parsed.version,
                     unsafe { transmute::<_, &NetworkOpaque>(buffer.opaque()) }.sw_if_index[0],
@@ -275,7 +266,6 @@ fn next_slot_for_index(
                         next: IpInputNext::Drop.slot() as u16,
                     }),
                     parsed,
-                    network,
                 )
             }
         }

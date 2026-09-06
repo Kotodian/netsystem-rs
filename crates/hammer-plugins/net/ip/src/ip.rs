@@ -46,12 +46,13 @@ bitflags::bitflags! {
 use std::net::IpAddr;
 
 use crate::protocol::ip::{
-    IpFragmentKey, IpInputError, IpInputTarget, IpProtocol, IpVersion, Ipv4Header, Ipv6Header,
+    IPV6_NEXT_HEADER_AH, IPV6_NEXT_HEADER_DESTINATION, IPV6_NEXT_HEADER_FRAGMENT,
+    IPV6_NEXT_HEADER_HOP_BY_HOP, IPV6_NEXT_HEADER_ROUTING, IpFragmentKey, IpInputError,
+    IpInputTarget, IpProtocol, IpVersion, Ipv4Header, Ipv6FragmentHeader, Ipv6Header,
     ParsedIpFragment, ParsedIpPacket, parse_ip_fragment_with_chain_len, parse_ip_header,
 };
 use crate::protocol::wire::read_header;
 use hammer_core::data_plane::BufferPacketCursor;
-use hammer_runtime::Network;
 
 /// Runtime registries owned by the IP plugin. Mirrors VPP's per-node error
 /// enumeration style: the registry identity is a typed discriminant, not a
@@ -115,16 +116,6 @@ pub use reassembly::{
 };
 
 #[inline(always)]
-pub(crate) fn network_for_protocol(protocol: IpProtocol) -> Option<Network> {
-    match protocol {
-        IpProtocol::Tcp => Some(Network::Tcp),
-        IpProtocol::Udp => Some(Network::Udp),
-        IpProtocol::Icmpv4 | IpProtocol::Icmpv6 => Some(Network::Icmp),
-        IpProtocol::Other(_) => None,
-    }
-}
-
-#[inline(always)]
 pub fn ip_header(
     packet: &[u8],
     cursor: BufferPacketCursor,
@@ -135,6 +126,7 @@ pub fn ip_header(
     let Some(version_byte) = packet.get(cursor.network_header_offset()).copied() else {
         return Err(IpInputError::HeaderTooShort);
     };
+    let mut transport_header_offset = cursor.transport_header_offset();
     let (version, protocol, source, destination) = match version_byte >> 4 {
         4 => {
             let header = read_header::<Ipv4Header>(packet, cursor.network_header_offset())?;
@@ -147,17 +139,57 @@ pub fn ip_header(
         }
         6 => {
             let header = read_header::<Ipv6Header>(packet, cursor.network_header_offset())?;
-            let protocol = if cursor.transport_header_offset()
-                == cursor.network_header_offset().saturating_add(40)
-            {
-                header.next_protocol()
+            let mut protocol = header.next_protocol();
+            let mut transport_offset = cursor.network_header_offset().saturating_add(40);
+            let mut non_initial_fragment = false;
+            loop {
+                let extension_length = match protocol {
+                    IPV6_NEXT_HEADER_FRAGMENT => {
+                        let fragment = read_header::<Ipv6FragmentHeader>(packet, transport_offset)?;
+                        non_initial_fragment |= fragment.offset_more() & 0xfff8 != 0;
+                        protocol = fragment.next_protocol();
+                        8
+                    }
+                    IPV6_NEXT_HEADER_HOP_BY_HOP
+                    | IPV6_NEXT_HEADER_ROUTING
+                    | IPV6_NEXT_HEADER_DESTINATION => {
+                        let extension_end = transport_offset
+                            .checked_add(2)
+                            .ok_or(IpInputError::BadLength)?;
+                        let Some(extension) = packet.get(transport_offset..extension_end) else {
+                            return Err(IpInputError::HeaderTooShort);
+                        };
+                        protocol = extension[0];
+                        (usize::from(extension[1]) + 1)
+                            .checked_mul(8)
+                            .ok_or(IpInputError::BadLength)?
+                    }
+                    IPV6_NEXT_HEADER_AH => {
+                        let extension_end = transport_offset
+                            .checked_add(2)
+                            .ok_or(IpInputError::BadLength)?;
+                        let Some(extension) = packet.get(transport_offset..extension_end) else {
+                            return Err(IpInputError::HeaderTooShort);
+                        };
+                        protocol = extension[0];
+                        (usize::from(extension[1]) + 2)
+                            .checked_mul(4)
+                            .ok_or(IpInputError::BadLength)?
+                    }
+                    _ => break,
+                };
+                let next_offset = transport_offset
+                    .checked_add(extension_length)
+                    .ok_or(IpInputError::BadLength)?;
+                if packet.get(transport_offset..next_offset).is_none() {
+                    return Err(IpInputError::HeaderTooShort);
+                }
+                transport_offset = next_offset;
+            }
+            transport_header_offset = if non_initial_fragment {
+                packet.len()
             } else {
-                read_header::<crate::protocol::ip::Ipv6FragmentHeader>(
-                    packet,
-                    cursor.transport_header_offset().saturating_sub(8),
-                )
-                .map(|fragment| fragment.next_protocol())
-                .unwrap_or_else(|_| header.next_protocol())
+                transport_offset
             };
             (
                 IpVersion::V6,
@@ -178,7 +210,7 @@ pub fn ip_header(
         packet_len: cursor.packet_len(),
         network_header_offset: cursor.network_header_offset(),
         network_header_len: cursor.network_header_len(),
-        transport_header_offset: cursor.transport_header_offset(),
+        transport_header_offset,
         transport_header_len: cursor.transport_header_len(),
     })
 }

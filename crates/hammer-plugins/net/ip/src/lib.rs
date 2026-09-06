@@ -47,6 +47,8 @@ hammer_component_macros::declare_plugin!(
         lookup::__IP_GRAPH_NODE_IP6_LOOKUP_NODE,
         lookup::__IP_GRAPH_NODE_IP4_LOAD_BALANCE_NODE,
         lookup::__IP_GRAPH_NODE_IP6_LOAD_BALANCE_NODE,
+        lookup::__IP_GRAPH_NODE_IP4_INTERFACE_RX_NODE,
+        lookup::__IP_GRAPH_NODE_IP6_INTERFACE_RX_NODE,
     ],
     node_functions = [],
     process_nodes = [ip::reassembly::__PROCESS_NODE_IP_REASSEMBLY_EXPIRE_WALK],

@@ -3,14 +3,13 @@ use std::sync::OnceLock;
 
 use hammer_core::data_plane::{BufferFrame, NodeId, NodeNext};
 use hammer_runtime::{DataPlaneMain, Node, NodeProcessFn, NodeRuntimeData, RuntimeResult};
-use hammer_service::net::{DpoId, DpoProto, DpoType};
+use hammer_service::net::{DpoId, DpoProto, DpoType, NetMain};
 use hammer_service::opaque::NetworkOpaque;
 
 use crate::fib::{Ip4FibTable, Ip6FibTable};
 use crate::ip::ip_header;
 use crate::protocol::ip::{IpProtocol, IpVersion, ParsedIpPacket};
 
-#[derive(Clone)]
 pub struct Ip4Main {
     unicast_tables: Vec<Ip4FibTable>,
     fib_index_by_sw_if_index: Vec<u32>,
@@ -39,7 +38,6 @@ impl Ip4Main {
     }
 }
 
-#[derive(Clone)]
 pub struct Ip6Main {
     unicast_tables: Vec<Ip6FibTable>,
     fib_index_by_sw_if_index: Vec<u32>,
@@ -103,12 +101,146 @@ enum IpLookupNext {
     LoadBalanceV6,
 }
 
+#[hammer_component_macros::node_next]
+enum InterfaceRxNext {
+    #[next("drop")]
+    Drop,
+    #[next("ip-input")]
+    Input,
+}
+
+#[hammer_component_macros::graph_node(
+    graph = ip,
+    init = register_ip4_interface_rx,
+    role = internal,
+    name = "interface-rx-dpo-ip4",
+    next = InterfaceRxNext,
+)]
+pub struct Ip4InterfaceRxNode {
+    #[node(default = NodeRuntimeData::empty())]
+    runtime_data: NodeRuntimeData,
+}
+
+#[hammer_component_macros::graph_node(
+    graph = ip,
+    init = register_ip6_interface_rx,
+    role = internal,
+    name = "interface-rx-dpo-ip6",
+    next = InterfaceRxNext,
+)]
+pub struct Ip6InterfaceRxNode {
+    #[node(default = NodeRuntimeData::empty())]
+    runtime_data: NodeRuntimeData,
+}
+
+fn register_ip4_interface_rx(runtime: &DataPlaneMain) -> RuntimeResult<NodeId> {
+    let node = runtime.nodes().try_register_internal_with_next_names(
+        Ip4InterfaceRxNode::new(),
+        &InterfaceRxNext::NEXT_NAMES,
+    )?;
+    register_interface_rx_class(DpoProto::IP4, node).map_err(|source| {
+        hammer_runtime::RuntimeError::GraphNodeInitialization {
+            node: "interface-rx-dpo-ip4",
+            source: Box::new(source),
+        }
+    })?;
+    Ok(node)
+}
+
+fn register_ip6_interface_rx(runtime: &DataPlaneMain) -> RuntimeResult<NodeId> {
+    let node = runtime.nodes().try_register_internal_with_next_names(
+        Ip6InterfaceRxNode::new(),
+        &InterfaceRxNext::NEXT_NAMES,
+    )?;
+    register_interface_rx_class(DpoProto::IP6, node).map_err(|source| {
+        hammer_runtime::RuntimeError::GraphNodeInitialization {
+            node: "interface-rx-dpo-ip6",
+            source: Box::new(source),
+        }
+    })?;
+    Ok(node)
+}
+
+fn register_interface_rx_class(
+    proto: DpoProto,
+    node: NodeId,
+) -> Result<DpoType, hammer_service::net::DpoError> {
+    use hammer_service::net::InterfaceRxDpo;
+    let net = NetMain::global()?;
+    let install_operations = [DpoProto::IP4, DpoProto::IP6]
+        .into_iter()
+        .all(|proto| net.dpo_main().nodes(DpoType::INTERFACE_RX, proto).is_none());
+    net.register_dpo(
+        Some(DpoType::INTERFACE_RX),
+        &[(proto, &[node])],
+        install_operations.then_some((InterfaceRxDpo::lock, InterfaceRxDpo::unlock)),
+        None,
+        None,
+        None,
+        None,
+        install_operations.then_some(InterfaceRxDpo::format),
+        install_operations.then_some(InterfaceRxDpo::memory),
+    )
+}
+
+impl Node for Ip4InterfaceRxNode {
+    fn process(&mut self, runtime: &DataPlaneMain, frame: &mut BufferFrame) {
+        process_interface_rx(runtime, frame, DpoProto::IP4);
+    }
+    fn node_process(&self) -> NodeProcessFn {
+        |runtime, _, frame| process_interface_rx(runtime, frame, DpoProto::IP4)
+    }
+    fn node_runtime_data(&self) -> RuntimeResult<NodeRuntimeData> {
+        Ok(self.runtime_data)
+    }
+}
+
+impl Node for Ip6InterfaceRxNode {
+    fn process(&mut self, runtime: &DataPlaneMain, frame: &mut BufferFrame) {
+        process_interface_rx(runtime, frame, DpoProto::IP6);
+    }
+    fn node_process(&self) -> NodeProcessFn {
+        |runtime, _, frame| process_interface_rx(runtime, frame, DpoProto::IP6)
+    }
+    fn node_runtime_data(&self) -> RuntimeResult<NodeRuntimeData> {
+        Ok(self.runtime_data)
+    }
+}
+
+fn process_interface_rx(runtime: &DataPlaneMain, frame: &mut BufferFrame, proto: DpoProto) {
+    let net = NetMain::global().expect("interface RX graph requires its installed owner");
+    hammer_runtime::process_frame!(runtime, frame, |index| {
+        let mut buffer = runtime
+            .get_buffer_mut(index)
+            .expect("interface RX frame owns its buffer");
+        // SAFETY: DPO lookup/stack execution initialized this IP-owned overlay;
+        // the mutable buffer borrow excludes concurrent metadata access.
+        let forwarding =
+            unsafe { &*(buffer.opaque2() as *const _ as *const LookupMetadata) }.forwarding;
+        assert_eq!(
+            forwarding.proto(),
+            proto,
+            "RX DPO reached the wrong protocol node"
+        );
+        let sw_if_index = net
+            .interface_main()
+            .rx_dpo_interface(forwarding)
+            .expect("published interface RX DPO remains retained during packet processing");
+        // SAFETY: NetworkOpaque is the asserted packet ABI overlay, and the
+        // packet is exclusively owned by this node while changing its RX fact.
+        let opaque = unsafe { &mut *(buffer.opaque_mut() as *mut _ as *mut NetworkOpaque) };
+        opaque.sw_if_index[0] = sw_if_index;
+        NodeNext::slot(InterfaceRxNext::Input)
+    });
+}
+
 #[derive(Clone, Copy)]
 #[repr(C)]
 struct LookupMetadata {
     fib_index: u32,
     forwarding: DpoId,
     flow_hash: u32,
+    lookup_count: u8,
 }
 
 impl Default for LookupMetadata {
@@ -117,6 +249,7 @@ impl Default for LookupMetadata {
             fib_index: u32::MAX,
             forwarding: DpoId::INVALID,
             flow_hash: 0,
+            lookup_count: 0,
         }
     }
 }
@@ -182,15 +315,67 @@ fn register_ip6_lookup(runtime: &DataPlaneMain) -> RuntimeResult<NodeId> {
 }
 
 fn register_ip4_load_balance(runtime: &DataPlaneMain) -> RuntimeResult<NodeId> {
-    runtime
+    let node = runtime
         .nodes()
-        .try_register_internal(Ip4LoadBalanceNode::new())
+        .try_register_internal(Ip4LoadBalanceNode::new())?;
+    let net = NetMain::global()?;
+    let install_operations = net
+        .dpo_main()
+        .nodes(DpoType::LOAD_BALANCE, DpoProto::IP6)
+        .is_none();
+    net.register_dpo(
+        Some(DpoType::LOAD_BALANCE),
+        &[(DpoProto::IP4, &[node][..])],
+        install_operations.then_some((
+            hammer_service::net::LoadBalanceDpo::lock,
+            hammer_service::net::LoadBalanceDpo::unlock,
+        )),
+        None,
+        install_operations.then_some(hammer_service::net::LoadBalanceDpo::mtu),
+        None,
+        None,
+        install_operations.then_some(hammer_service::net::LoadBalanceDpo::format),
+        install_operations.then_some(hammer_service::net::LoadBalanceDpo::memory),
+    )
+    .map_err(
+        |source| hammer_runtime::RuntimeError::GraphNodeInitialization {
+            node: "ip4-load-balance",
+            source: Box::new(source),
+        },
+    )?;
+    Ok(node)
 }
 
 fn register_ip6_load_balance(runtime: &DataPlaneMain) -> RuntimeResult<NodeId> {
-    runtime
+    let node = runtime
         .nodes()
-        .try_register_internal(Ip6LoadBalanceNode::new())
+        .try_register_internal(Ip6LoadBalanceNode::new())?;
+    let net = NetMain::global()?;
+    let install_operations = net
+        .dpo_main()
+        .nodes(DpoType::LOAD_BALANCE, DpoProto::IP4)
+        .is_none();
+    net.register_dpo(
+        Some(DpoType::LOAD_BALANCE),
+        &[(DpoProto::IP6, &[node][..])],
+        install_operations.then_some((
+            hammer_service::net::LoadBalanceDpo::lock,
+            hammer_service::net::LoadBalanceDpo::unlock,
+        )),
+        None,
+        install_operations.then_some(hammer_service::net::LoadBalanceDpo::mtu),
+        None,
+        None,
+        install_operations.then_some(hammer_service::net::LoadBalanceDpo::format),
+        install_operations.then_some(hammer_service::net::LoadBalanceDpo::memory),
+    )
+    .map_err(
+        |source| hammer_runtime::RuntimeError::GraphNodeInitialization {
+            node: "ip6-load-balance",
+            source: Box::new(source),
+        },
+    )?;
+    Ok(node)
 }
 
 impl Node for Ip4LookupNode {
@@ -388,7 +573,7 @@ fn ip4_flow_hash(packet: &[u8], parsed: ParsedIpPacket, config: u16) -> u32 {
         }
     }
     if config & IP_FLOW_HASH_PROTO != 0 {
-        b ^= protocol_number(parsed.protocol);
+        b ^= u32::from(u8::from(parsed.protocol));
     }
     let c = (u32::from(destination_port) << 16) | u32::from(source_port);
     a ^= gtp_teid;
@@ -443,7 +628,7 @@ fn ip6_flow_hash(packet: &[u8], parsed: ParsedIpPacket, config: u16) -> u32 {
         }
     }
     if config & IP_FLOW_HASH_PROTO != 0 {
-        b ^= u64::from(protocol_number(parsed.protocol));
+        b ^= u64::from(u8::from(parsed.protocol));
     }
     let mut c = (u64::from(destination_port) << 16) | u64::from(source_port);
     if config & IP_FLOW_HASH_FLOW_LABEL != 0 {
@@ -464,17 +649,6 @@ fn ip6_flow_hash(packet: &[u8], parsed: ParsedIpPacket, config: u16) -> u32 {
     }
     c = hash_mix64(a, b, c);
     c as u32
-}
-
-#[inline(always)]
-fn protocol_number(protocol: IpProtocol) -> u32 {
-    match protocol {
-        IpProtocol::Icmpv4 => 1,
-        IpProtocol::Tcp => 6,
-        IpProtocol::Udp => 17,
-        IpProtocol::Icmpv6 => 58,
-        IpProtocol::Other(value) => u32::from(value),
-    }
 }
 
 fn process_lookup_v4(runtime: &DataPlaneMain, _data: NodeRuntimeData, frame: &mut BufferFrame) {
@@ -519,6 +693,11 @@ fn load_balance_index(
     };
     let opaque = unsafe { &*(buffer.opaque() as *const _ as *const NetworkOpaque) };
     let metadata = unsafe { &mut *(buffer.opaque2_mut() as *mut _ as *mut LookupMetadata) };
+    const MAX_LOOKUPS_PER_PACKET: u8 = 4;
+    if metadata.lookup_count >= MAX_LOOKUPS_PER_PACKET {
+        return drop_next;
+    }
+    metadata.lookup_count += 1;
     let current = metadata.forwarding;
     let expected_proto = match version {
         IpVersion::V4 => DpoProto::IP4,
@@ -527,33 +706,28 @@ fn load_balance_index(
     if current.class() != DpoType::LOAD_BALANCE || current.proto() != expected_proto {
         return drop_next;
     }
-    let Some(load_balance) = hammer_service::net::NetMain::global()
-        .ok()
-        .and_then(|net| net.dpo_main().load_balance(current.index()))
-    else {
+    let Ok(net) = hammer_service::net::NetMain::global() else {
         return drop_next;
     };
     let parsed = ip_header(buffer.current(), opaque.packet_cursor()).ok();
-    let hash = if load_balance.bucket_count <= 1 {
-        0
-    } else if metadata.flow_hash != 0 {
-        metadata.flow_hash >> 1
-    } else {
-        let Some(parsed) = parsed.filter(|packet| packet.version == version) else {
-            return drop_next;
+    let selected = net.select_load_balance(current, |bucket_count, flow_hash_config| {
+        let hash = if bucket_count <= 1 {
+            0
+        } else if metadata.flow_hash != 0 {
+            metadata.flow_hash >> 1
+        } else {
+            let parsed = parsed.filter(|packet| packet.version == version)?;
+            match version {
+                IpVersion::V4 => ip4_flow_hash(buffer.current(), parsed, flow_hash_config),
+                IpVersion::V6 => ip6_flow_hash(buffer.current(), parsed, flow_hash_config),
+            }
         };
-        match version {
-            IpVersion::V4 => ip4_flow_hash(buffer.current(), parsed, load_balance.flow_hash_config),
-            IpVersion::V6 => ip6_flow_hash(buffer.current(), parsed, load_balance.flow_hash_config),
+        if bucket_count > 1 {
+            metadata.flow_hash = hash;
         }
-    };
-    if load_balance.bucket_count > 1 {
-        metadata.flow_hash = hash;
-    }
-    let Some(selected) = hammer_service::net::NetMain::global()
-        .ok()
-        .and_then(|net| net.dpo_main().select_load_balance(current, hash))
-    else {
+        Some(hash)
+    });
+    let Some(selected) = selected else {
         return drop_next;
     };
     metadata.forwarding = selected;
@@ -614,12 +788,12 @@ fn lookup_index(
         fib_index,
         forwarding: forwarding.unwrap_or(DpoId::INVALID),
         flow_hash: 0,
+        lookup_count: 0,
     };
     match forwarding {
-        Some(dpo) if dpo.class() == DpoType::LOAD_BALANCE => match version {
-            IpVersion::V4 => NodeNext::slot(IpLookupNext::LoadBalanceV4),
-            IpVersion::V6 => NodeNext::slot(IpLookupNext::LoadBalanceV6),
-        },
+        Some(dpo) if dpo.class() == DpoType::LOAD_BALANCE => {
+            load_balance_index(runtime, index, version)
+        }
         Some(dpo) => dpo.next(),
         None => drop_next,
     }

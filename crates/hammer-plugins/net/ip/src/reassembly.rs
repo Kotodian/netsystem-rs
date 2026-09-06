@@ -17,7 +17,7 @@ use hammer_runtime::{RuntimeError, RuntimeResult};
 
 use crate::config::{NetworkIpConfig, ReassemblyConfig};
 use crate::ip::{
-    IpFragmentKey, IpProtocol, IpVersion, ParsedIpFragment, ip_header, network_for_protocol,
+    IpFragmentKey, IpProtocol, IpVersion, ParsedIpFragment, ip_header,
     parse_ip_fragment_with_chain_len,
 };
 use hammer_service::opaque::NetworkOpaque;
@@ -1017,18 +1017,11 @@ fn refresh_metadata(runtime: &DataPlaneMain, index: Index) -> RuntimeResult<()> 
     let network = unsafe { transmute::<_, &NetworkOpaque>(buffer.opaque()) };
     let parsed = ip_header(buffer.current(), network.packet_cursor())?;
     drop(buffer);
-    match network_for_protocol(parsed.protocol) {
-        Some(_) => Ok(()),
-        None => {
-            let protocol = match parsed.protocol {
-                IpProtocol::Other(protocol) => protocol,
-                IpProtocol::Icmpv4 => 1,
-                IpProtocol::Tcp => 6,
-                IpProtocol::Udp => 17,
-                IpProtocol::Icmpv6 => 58,
-            };
-            Err(IpReassemblyError::Unsupportedu8 { protocol }.into())
-        }
+    if !matches!(parsed.protocol, IpProtocol::Other(_)) {
+        Ok(())
+    } else {
+        let protocol = u8::from(parsed.protocol);
+        Err(IpReassemblyError::Unsupportedu8 { protocol }.into())
     }
 }
 

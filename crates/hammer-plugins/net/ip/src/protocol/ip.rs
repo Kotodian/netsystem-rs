@@ -10,7 +10,11 @@ const IPV4_FLAG_MORE_FRAGMENTS: u16 = 0x2000;
 /// IPv4 Don't Fragment flag (RFC 791).
 pub const IPV4_FLAG_DONT_FRAGMENT: u16 = 0x4000;
 const IPV4_FRAGMENT_OFFSET_MASK: u16 = 0x1fff;
-const IPV6_NEXT_HEADER_FRAGMENT: u8 = 44;
+pub(crate) const IPV6_NEXT_HEADER_HOP_BY_HOP: u8 = 0;
+pub(crate) const IPV6_NEXT_HEADER_ROUTING: u8 = 43;
+pub(crate) const IPV6_NEXT_HEADER_FRAGMENT: u8 = 44;
+pub(crate) const IPV6_NEXT_HEADER_AH: u8 = 51;
+pub(crate) const IPV6_NEXT_HEADER_DESTINATION: u8 = 60;
 const IPV6_FRAGMENT_HEADER_LEN: usize = 8;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
@@ -88,6 +92,19 @@ impl From<u8> for IpProtocol {
             17 => Self::Udp,
             58 => Self::Icmpv6,
             other => Self::Other(other),
+        }
+    }
+}
+
+impl From<IpProtocol> for u8 {
+    #[inline(always)]
+    fn from(protocol: IpProtocol) -> Self {
+        match protocol {
+            IpProtocol::Icmpv4 => 1,
+            IpProtocol::Tcp => 6,
+            IpProtocol::Udp => 17,
+            IpProtocol::Icmpv6 => 58,
+            IpProtocol::Other(value) => value,
         }
     }
 }

@@ -13,13 +13,12 @@ use hammer_runtime::{
 use hammer_runtime::{RuntimeError, RuntimeResult};
 
 use hammer_service::data_plane::{FeatureArcStartHandle, set_index_node_error};
+use hammer_service::net::{DpoType, NetMain};
 use hammer_service::opaque::NetworkOpaque;
 
 use super::{IpInputError, IpInputTarget, IpProtocol, IpVersion, ParsedIpPacket, ip_header};
 
-const IP_PROTOCOL_ICMP: u8 = 1;
 const IP_PROTOCOL_TCP: u8 = 6;
-const IP_PROTOCOL_UDP: u8 = 17;
 const IP_PROTOCOL_ICMP6: u8 = 58;
 const TCP_HEADER_MIN_LEN: usize = 20;
 const ICMP_HEADER_MIN_LEN: usize = 4;
@@ -57,6 +56,8 @@ pub enum IpLocalError {
     BadTransportHeader,
     BadChecksum,
     UnknownProtocol,
+    SourceLookupMiss,
+    SpoofedLocalPacket,
 }
 
 impl hammer_runtime::node::NodeErrorCode for IpLocalError {
@@ -83,6 +84,38 @@ pub struct IpLocalTrace {
 }
 
 impl IpLocalError {
+    const DESCRIPTORS: [hammer_runtime::node::NodeErrorDescriptor; 6] = {
+        use hammer_runtime::node::{NodeErrorDescriptor, NodeErrorSeverity};
+        [
+            NodeErrorDescriptor::new(
+                "bad-length",
+                NodeErrorSeverity::Error,
+                "Invalid IP packet length",
+            ),
+            NodeErrorDescriptor::new(
+                "bad-transport-header",
+                NodeErrorSeverity::Error,
+                "Invalid transport header",
+            ),
+            NodeErrorDescriptor::new("bad-checksum", NodeErrorSeverity::Error, "Invalid checksum"),
+            NodeErrorDescriptor::new(
+                "unknown-protocol",
+                NodeErrorSeverity::Warn,
+                "Unknown local protocol",
+            ),
+            NodeErrorDescriptor::new(
+                "source-lookup-miss",
+                NodeErrorSeverity::Error,
+                "No accepting interface for source",
+            ),
+            NodeErrorDescriptor::new(
+                "spoofed-local-packet",
+                NodeErrorSeverity::Error,
+                "Source is a local receive address",
+            ),
+        ]
+    };
+
     #[inline(always)]
     pub const fn code(self) -> u16 {
         self as u16
@@ -147,7 +180,7 @@ impl IpLocalState {
 
     #[inline(always)]
     fn protocol_next_slot(&self, protocol: IpProtocol) -> u16 {
-        self.protocol_nexts[ip_protocol_number(protocol) as usize]
+        self.protocol_nexts[usize::from(u8::from(protocol))]
             .unwrap_or_else(|| default_protocol_slot(protocol))
     }
 
@@ -250,6 +283,9 @@ fn register_ip_local(runtime: &DataPlaneMain) -> RuntimeResult<NodeId> {
     let node = runtime
         .nodes()
         .try_register_internal_with_next_names(control.node(), &IpLocalNext::NEXT_NAMES)?;
+    runtime
+        .nodes()
+        .materialize_node_errors(node, &IpLocalError::DESCRIPTORS)?;
     if IP_LOCAL_PROTOCOL_REGISTRATION
         .set((control.clone(), node))
         .is_err()
@@ -268,9 +304,13 @@ fn register_ip_receive(runtime: &DataPlaneMain) -> RuntimeResult<NodeId> {
             operation: crate::ip::IpControlOperation::IpReceiveRegistration,
         },
     )?;
+    let node = runtime
+        .nodes()
+        .try_register_internal(control.receive_node())?;
     runtime
         .nodes()
-        .try_register_internal(control.receive_node())
+        .materialize_node_errors(node, &IpLocalError::DESCRIPTORS)?;
+    Ok(node)
 }
 
 impl Node for IpLocalNode {
@@ -589,7 +629,61 @@ fn process_index(
             return Ok(resolved);
         }
     };
+    let net = NetMain::global()?;
+    let source_error = match (parsed.source, parsed.destination) {
+        (IpAddr::V4(source), IpAddr::V4(destination)) => {
+            let source_dpo = network
+                .ip()
+                .fib_index_override()
+                .or(network.ip().fib_index())
+                .and_then(|fib| {
+                    crate::lookup::IP4_MAIN
+                        .get()
+                        .and_then(|main| main.forwarding_dpo(fib, source))
+                });
+            if source_dpo
+                .and_then(|dpo| net.select_load_balance(dpo, |_, _| Some(0)))
+                .is_some_and(|dpo| dpo.class() == DpoType::RECEIVE)
+            {
+                Some(IpLocalError::SpoofedLocalPacket)
+            } else if destination != std::net::Ipv4Addr::BROADCAST
+                && !source_dpo
+                    .and_then(|dpo| net.load_balance_urpf(dpo))
+                    .and_then(|list| net.urpf_size(list))
+                    .is_some_and(|count| count != 0)
+            {
+                Some(IpLocalError::SourceLookupMiss)
+            } else {
+                None
+            }
+        }
+        (IpAddr::V6(source), _)
+            if parsed.protocol != IpProtocol::Icmpv6 && !source.is_unicast_link_local() =>
+        {
+            let source_dpo = crate::lookup::IP6_MAIN.get().and_then(|main| {
+                network
+                    .ip()
+                    .fib_index_override()
+                    .or_else(|| main.fib_index(network.sw_if_index[0]))
+                    .and_then(|fib| main.forwarding_dpo(fib, source))
+            });
+            if source_dpo
+                .and_then(|dpo| net.load_balance_urpf(dpo))
+                .and_then(|list| net.urpf_size(list))
+                .is_some_and(|count| count != 0)
+            {
+                None
+            } else {
+                Some(IpLocalError::SourceLookupMiss)
+            }
+        }
+        _ => None,
+    };
     drop(buffer);
+    if let Some(error) = source_error {
+        set_index_node_error(runtime, index, error)?;
+        return Ok(state.drop_slot());
+    }
     refresh_basic_metadata(runtime, index, &parsed, transport_len)?;
 
     if stage.is_head_of_feature_arc() {
@@ -720,17 +814,6 @@ fn error_for_input(error: IpInputError) -> IpLocalError {
     match error {
         IpInputError::BadChecksum => IpLocalError::BadChecksum,
         _ => IpLocalError::BadLength,
-    }
-}
-
-#[inline(always)]
-fn ip_protocol_number(protocol: IpProtocol) -> u8 {
-    match protocol {
-        IpProtocol::Icmpv4 => IP_PROTOCOL_ICMP,
-        IpProtocol::Tcp => IP_PROTOCOL_TCP,
-        IpProtocol::Udp => IP_PROTOCOL_UDP,
-        IpProtocol::Icmpv6 => IP_PROTOCOL_ICMP6,
-        IpProtocol::Other(value) => value,
     }
 }
 

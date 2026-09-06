@@ -6,10 +6,13 @@ use ipnet::{Ipv4Net, Ipv6Net};
 
 use crate::ip::IpPathFlags;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
 pub enum IpFibError {
+    #[error("IP prefix already exists")]
     PrefixExists,
+    #[error("IP prefix is not present")]
     PrefixMissing,
+    #[error("IP forwarding requires a load-balance DPO")]
     ForwardingDpoRequired,
 }
 
@@ -185,6 +188,11 @@ impl FibTableBackend for Ip4FibBackend {
         entry: &FibEntry,
         _: FibSource,
     ) -> Result<Option<DpoId>, Self::Error> {
+        if let Some(dpo) = entry.forwarding {
+            hammer_service::net::NetMain::global()
+                .expect("IP FIB projection requires the initialized net owner")
+                .lock_dpo(dpo);
+        }
         Ok(entry.forwarding)
     }
 }
@@ -353,6 +361,11 @@ impl FibTableBackend for Ip6FibBackend {
         entry: &FibEntry,
         _: FibSource,
     ) -> Result<Option<DpoId>, Self::Error> {
+        if let Some(dpo) = entry.forwarding {
+            hammer_service::net::NetMain::global()
+                .expect("IP FIB projection requires the initialized net owner")
+                .lock_dpo(dpo);
+        }
         Ok(entry.forwarding)
     }
 }
@@ -363,55 +376,396 @@ pub type Ip6FibTable = FibTable<Ipv6Net, Ip6FibBackend>;
 #[cfg(test)]
 mod tests {
     use super::*;
-    use hammer_service::net::{DpoProto, DpoType};
-
-    fn dpo(index: u32) -> DpoId {
-        DpoId::new(DpoType::LOAD_BALANCE, DpoProto::IP4, index, 1)
-    }
+    use hammer_runtime::{DataPlaneBufferConfig, DataPlaneMain, GlobalMain, RuntimeRegistry};
+    use hammer_service::interface::InterfaceMain;
+    use hammer_service::net::{
+        DpoError, DpoProto, DpoType, FibPath, FibPathList, FibPathListFlags, LoadBalanceDpo,
+        LoadBalanceFlags, LoadBalancePath, NetMain,
+    };
+    use std::sync::Arc;
 
     #[test]
-    fn ipv4_lpm_selects_longest_prefix_and_restores_cover() {
+    fn route_sources_retain_forwarding_until_withdrawal() -> Result<(), DpoError> {
+        hammer_runtime::config::Memory::default().ensure_main_heap()?;
+        let mut main = GlobalMain::new(
+            DataPlaneMain::new(DataPlaneBufferConfig::default()),
+            RuntimeRegistry::new(),
+        );
+        main.install_current();
+        let net = NetMain::init(Arc::new(InterfaceMain::new()))?;
+        let runtime = main.data_plane_main_mut();
+        let terminal = hammer_service::data_plane::register_drop(runtime)?;
+        net.register_dpo(
+            Some(DpoType::LOAD_BALANCE),
+            &[(DpoProto::IP4, &[terminal]), (DpoProto::IP6, &[terminal])],
+            Some((LoadBalanceDpo::lock, LoadBalanceDpo::unlock)),
+            None,
+            Some(LoadBalanceDpo::mtu),
+            None,
+            None,
+            Some(LoadBalanceDpo::format),
+            Some(LoadBalanceDpo::memory),
+        )?;
+        let mut roots = Vec::new();
+        for proto in [
+            DpoProto::IP4,
+            DpoProto::IP4,
+            DpoProto::IP4,
+            DpoProto::IP6,
+            DpoProto::IP6,
+        ] {
+            roots.push(net.create_load_balance(
+                runtime,
+                proto,
+                LoadBalanceDpo::new(proto, &[], LoadBalanceFlags::empty(), 0x9f)?,
+            )?);
+        }
         let mut table = Ip4FibTable::new(Ip4FibBackend::default());
         let cover = Ipv4Net::new(Ipv4Addr::new(10, 0, 0, 0), 8).unwrap();
         let specific = Ipv4Net::new(Ipv4Addr::new(10, 1, 0, 0), 16).unwrap();
-        table.add_route(cover, FibSource::API, dpo(7)).unwrap();
-        table.add_route(specific, FibSource::API, dpo(9)).unwrap();
-        assert_eq!(
-            table.forwarding_lookup(Ipv4Addr::new(10, 1, 2, 3)),
-            Some(dpo(9))
-        );
-        table.remove_route(specific, FibSource::API).unwrap();
-        assert_eq!(
-            table.forwarding_lookup(Ipv4Addr::new(10, 1, 2, 3)),
-            Some(dpo(7))
-        );
-    }
-
-    #[test]
-    fn ipv6_lpm_keeps_masked_prefixes_distinct() {
-        let mut table = Ip6FibTable::new(Ip6FibBackend::default());
-        let first = Ipv6Net::new(Ipv6Addr::LOCALHOST, 128).unwrap();
-        let second = Ipv6Net::new(Ipv6Addr::from([0, 0, 0, 0, 0, 0, 0, 1]), 64).unwrap();
-        table.add_route(second, FibSource::API, dpo(3)).unwrap();
-        table.add_route(first, FibSource::API, dpo(4)).unwrap();
-        assert_eq!(table.forwarding_lookup(Ipv6Addr::LOCALHOST), Some(dpo(4)));
-        assert_eq!(table.lookup_exact(second), Some(0));
-    }
-
-    #[test]
-    fn forwarding_trie_handles_default_and_host_routes() {
-        let mut table = Ip4FibTable::new(Ip4FibBackend::default());
+        table.add_route(cover, FibSource::API, roots[0]).unwrap();
+        table.add_route(cover, FibSource::API, roots[0]).unwrap();
+        table
+            .add_route(specific, FibSource::INTERFACE, roots[2])
+            .unwrap();
+        table.add_route(specific, FibSource::API, roots[1]).unwrap();
         let default = Ipv4Net::new(Ipv4Addr::UNSPECIFIED, 0).unwrap();
         let host = Ipv4Net::new(Ipv4Addr::new(192, 0, 2, 7), 32).unwrap();
-        table.add_route(default, FibSource::API, dpo(1)).unwrap();
-        table.add_route(host, FibSource::API, dpo(2)).unwrap();
+        table.add_route(default, FibSource::API, roots[0]).unwrap();
+        table.add_route(host, FibSource::API, roots[2]).unwrap();
+        assert_eq!(table.forwarding_lookup(host.addr()), Some(roots[2]));
+        table.remove_route(host, FibSource::API).unwrap();
+        assert_eq!(table.forwarding_lookup(host.addr()), Some(roots[0]));
+        for &root in &roots[..3] {
+            net.unlock_dpo(root);
+        }
+        assert_eq!(table.winner_source(specific), Some(FibSource::INTERFACE));
         assert_eq!(
-            table.forwarding_lookup(Ipv4Addr::new(198, 51, 100, 9)),
-            Some(dpo(1))
+            table.forwarding_lookup(Ipv4Addr::new(10, 1, 2, 3)),
+            Some(roots[2])
+        );
+        let rejected = Ipv4Net::new(Ipv4Addr::new(192, 0, 2, 7), 32).unwrap();
+        let error = table
+            .add_route(rejected, FibSource::API, DpoId::drop(DpoProto::IP4))
+            .unwrap_err();
+        assert!(matches!(
+            error,
+            hammer_service::net::fib::FibError::Backend(IpFibError::ForwardingDpoRequired)
+        ));
+        assert!(
+            std::error::Error::source(&error)
+                .unwrap()
+                .is::<IpFibError>()
+        );
+        assert_eq!(table.lookup_exact(rejected), None);
+        assert_eq!(table.winner_source(rejected), None);
+        assert_eq!(
+            table.forwarding_lookup(Ipv4Addr::new(10, 1, 2, 3)),
+            Some(roots[2])
+        );
+
+        table.remove_route(specific, FibSource::INTERFACE).unwrap();
+        assert!(net.load_balance(roots[2].index()).is_none());
+        assert_eq!(
+            table.forwarding_lookup(Ipv4Addr::new(10, 1, 2, 3)),
+            Some(roots[1])
+        );
+        table.remove_route(specific, FibSource::API).unwrap();
+        assert!(net.load_balance(roots[1].index()).is_none());
+        assert_eq!(
+            table.forwarding_lookup(Ipv4Addr::new(10, 1, 2, 3)),
+            Some(roots[0])
+        );
+        table.remove_route(cover, FibSource::API).unwrap();
+        assert!(net.load_balance(roots[0].index()).is_some());
+        drop(table);
+        assert!(net.load_balance(roots[0].index()).is_none());
+
+        let mut table6 = Ip6FibTable::new(Ip6FibBackend::default());
+        let first = Ipv6Net::new(Ipv6Addr::LOCALHOST, 128).unwrap();
+        let second = Ipv6Net::new(Ipv6Addr::from([0, 0, 0, 0, 0, 0, 0, 1]), 64).unwrap();
+        table6.add_route(second, FibSource::API, roots[3]).unwrap();
+        table6.add_route(first, FibSource::API, roots[4]).unwrap();
+        for &root in &roots[3..] {
+            net.unlock_dpo(root);
+        }
+        assert_eq!(
+            table6.forwarding_lookup(Ipv6Addr::LOCALHOST),
+            Some(roots[4])
+        );
+        assert_eq!(table6.lookup_exact(second), Some(0));
+        table6.remove_route(first, FibSource::API).unwrap();
+        assert_eq!(
+            table6.forwarding_lookup(Ipv6Addr::LOCALHOST),
+            Some(roots[3])
+        );
+        drop(table6);
+        for root in roots {
+            assert!(net.load_balance(root.index()).is_none());
+        }
+        // VPP plugins/unittest/fib_test.c:9018-9054 and 9152-9170:
+        // resolve an interface-RX bucket through a route, withdraw the route,
+        // then release the independent reference and check pool reclamation.
+        // The source test uses MPLS; only its protocol-neutral DPO ownership
+        // sequence is reused here. No MPLS policy is added to Hammer.
+        (crate::lookup::__IP_GRAPH_NODE_IP4_INTERFACE_RX_NODE.init)(runtime)?;
+        (crate::lookup::__IP_GRAPH_NODE_IP6_INTERFACE_RX_NODE.init)(runtime)?;
+        let interfaces = net.interface_main();
+        let hardware = interfaces.register_hardware_interface(0, 1, 0, 0).unwrap();
+        let software = interfaces.hardware_interface(hardware).unwrap().sw_if_index;
+        let rx4 = interfaces
+            .add_or_lock_rx_dpo(DpoProto::IP4, software)?
+            .unwrap();
+        let shared = interfaces
+            .add_or_lock_rx_dpo(DpoProto::IP4, software)?
+            .unwrap();
+        assert_eq!(rx4, shared);
+        let forwarding = net.create_load_balance(
+            runtime,
+            DpoProto::IP4,
+            LoadBalanceDpo::new(
+                DpoProto::IP4,
+                &[LoadBalancePath {
+                    dpo: rx4,
+                    path_index: u32::MAX,
+                    weight: 1,
+                }],
+                LoadBalanceFlags::empty(),
+                0x9f,
+            )?,
+        )?;
+        let mut table = Ip4FibTable::new(Ip4FibBackend::default());
+        let destination = Ipv4Net::new(Ipv4Addr::new(1, 1, 1, 0), 24).unwrap();
+        table
+            .add_route(destination, FibSource::API, forwarding)
+            .unwrap();
+        net.unlock_dpo(forwarding);
+        net.unlock_dpo(shared);
+        let selected = table.forwarding_lookup(Ipv4Addr::new(1, 1, 1, 1)).unwrap();
+        assert_eq!(net.select_load_balance(selected, |_, _| Some(0)), Some(rx4));
+        table.remove_route(destination, FibSource::API).unwrap();
+        assert!(net.load_balance(forwarding.index()).is_none());
+        assert_eq!(interfaces.rx_dpo_interface(rx4), Some(software));
+        net.unlock_dpo(rx4);
+        assert_eq!(hammer_service::net::InterfaceRxDpo::memory().1, 0);
+        drop(table);
+        interfaces.delete_hardware_interface(hardware).unwrap();
+
+        // VPP plugins/unittest/fib_test.c:774-834 checks multipath buckets
+        // through a route and pool reclamation after withdrawal. Distinct RX
+        // objects also expose bucket order across inline/overflow replacement.
+        let load_balance_count = LoadBalanceDpo::memory().1;
+        let rx_count = hammer_service::net::InterfaceRxDpo::memory().1;
+        let mut hardware_interfaces = Vec::new();
+        let mut rx_paths = Vec::new();
+        for instance in 0..8 {
+            let hardware = interfaces
+                .register_hardware_interface(0, instance, 0, 0)
+                .unwrap();
+            let software = interfaces.hardware_interface(hardware).unwrap().sw_if_index;
+            hardware_interfaces.push(hardware);
+            rx_paths.push(LoadBalancePath {
+                dpo: interfaces
+                    .add_or_lock_rx_dpo(DpoProto::IP4, software)?
+                    .unwrap(),
+                path_index: instance,
+                weight: 1,
+            });
+        }
+        let forwarding = net.create_load_balance(
+            runtime,
+            DpoProto::IP4,
+            LoadBalanceDpo::new(
+                DpoProto::IP4,
+                &rx_paths[..4],
+                LoadBalanceFlags::STICKY,
+                0x9f,
+            )?,
+        )?;
+        let accepting_interfaces: Vec<_> = hardware_interfaces
+            .iter()
+            .map(|&hardware| interfaces.hardware_interface(hardware).unwrap().sw_if_index)
+            .collect();
+        let paths = accepting_interfaces
+            .iter()
+            .enumerate()
+            .map(|(index, &sw_if_index)| FibPath {
+                sw_if_index,
+                table_id: 0,
+                rpf_id: u32::MAX,
+                weight: 1,
+                preference: 0,
+                flags: IpPathFlags::empty(),
+                next_hop: Ipv4Addr::new(10, 0, 0, index as u8 + 1),
+            })
+            .collect();
+        let mut path_list = FibPathList::new(paths, FibPathListFlags::SHARED);
+        path_list.bake_urpf(accepting_interfaces.clone())?;
+        let shared_urpf = path_list.urpf_index().unwrap();
+        assert_eq!(
+            net.set_load_balance_urpf(forwarding, shared_urpf)?,
+            Some(())
+        );
+        let other_forwarding = net.create_load_balance(
+            runtime,
+            DpoProto::IP4,
+            LoadBalanceDpo::new(DpoProto::IP4, &rx_paths, LoadBalanceFlags::empty(), 0x9f)?,
+        )?;
+        assert_eq!(
+            net.set_load_balance_urpf(other_forwarding, shared_urpf)?,
+            Some(())
+        );
+        // A path-state rebuild creates a new immutable list; another entry
+        // keeps the previous accepting-interface set until its own withdrawal.
+        path_list.bake_urpf(accepting_interfaces[..4].to_vec())?;
+        let urpf = path_list.urpf_index().unwrap();
+        assert_eq!(net.set_load_balance_urpf(forwarding, urpf)?, Some(()));
+        drop(path_list);
+        assert_eq!(
+            net.urpf_check(shared_urpf, accepting_interfaces[7]),
+            Some(true)
+        );
+        assert_eq!(net.urpf_check(urpf, accepting_interfaces[7]), Some(false));
+        assert_eq!(net.urpf_check(urpf, accepting_interfaces[0]), Some(true));
+        net.unlock_dpo(other_forwarding);
+        assert!(net.urpf_list(shared_urpf).is_none());
+        let mut table = Ip4FibTable::new(Ip4FibBackend::default());
+        table
+            .add_route(destination, FibSource::API, forwarding)
+            .unwrap();
+        net.unlock_dpo(forwarding);
+        for count in [4, 8, 1, 8, 4] {
+            assert_eq!(
+                net.update_load_balance(runtime, forwarding, &rx_paths[..count])?,
+                Some(())
+            );
+            let selected = table.forwarding_lookup(destination.addr()).unwrap();
+            assert_eq!(selected, forwarding);
+            for (bucket, &expected) in rx_paths[..count].iter().enumerate() {
+                assert_eq!(
+                    net.select_load_balance(selected, |bucket_count, _| {
+                        assert_eq!(usize::from(bucket_count), count);
+                        Some(bucket as u32)
+                    }),
+                    Some(expected.dpo)
+                );
+            }
+            assert_eq!(LoadBalanceDpo::memory().1, load_balance_count + 1);
+            assert_eq!(net.load_balance_urpf(selected), Some(urpf));
+            assert_eq!(net.urpf_size(urpf), Some(4));
+        }
+        // VPP fib_test_sticky: three equal paths, one down, recovery, then
+        // weights 3:1:1. The concrete adjacency/BFD producer is not exercised
+        // here; its resolved drop projection is supplied to the LB owner.
+        for (weights, down, expected) in [
+            (
+                [1, 1, 1],
+                None,
+                [0, 0, 0, 0, 0, 0, 1, 1, 1, 1, 1, 2, 2, 2, 2, 2],
+            ),
+            (
+                [1, 1, 1],
+                Some(1),
+                [0, 0, 0, 0, 0, 0, 0, 2, 0, 2, 0, 2, 2, 2, 2, 2],
+            ),
+            (
+                [1, 1, 1],
+                None,
+                [0, 0, 0, 0, 0, 0, 1, 1, 1, 1, 1, 2, 2, 2, 2, 2],
+            ),
+            (
+                [3, 1, 1],
+                None,
+                [1, 1, 1, 2, 2, 2, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+            ),
+            (
+                [3, 1, 1],
+                Some(1),
+                [2, 0, 2, 2, 2, 2, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+            ),
+        ] {
+            let mut paths = [rx_paths[0], rx_paths[1], rx_paths[2]];
+            for (index, path) in paths.iter_mut().enumerate() {
+                path.weight = weights[index];
+                if down == Some(index) {
+                    path.dpo = DpoId::drop(DpoProto::IP4);
+                }
+            }
+            assert_eq!(
+                net.update_load_balance(runtime, forwarding, &paths)?,
+                Some(())
+            );
+            let selected = table.forwarding_lookup(destination.addr()).unwrap();
+            for (bucket, path) in expected.into_iter().enumerate() {
+                assert_eq!(
+                    net.select_load_balance(selected, |count, _| {
+                        assert_eq!(count, 16);
+                        Some(bucket as u32)
+                    }),
+                    Some(rx_paths[path].dpo)
+                );
+            }
+        }
+        assert_eq!(net.update_load_balance(runtime, forwarding, &[])?, Some(()));
+        assert_eq!(
+            net.select_load_balance(forwarding, |count, _| {
+                assert_eq!(count, 1);
+                Some(0)
+            }),
+            Some(DpoId::drop(DpoProto::IP4))
         );
         assert_eq!(
-            table.forwarding_lookup(Ipv4Addr::new(192, 0, 2, 7)),
-            Some(dpo(2))
+            net.update_load_balance(runtime, forwarding, &rx_paths[..4])?,
+            Some(())
         );
+        // Hammer rejects VPP's empty normalized-prefix corner instead of
+        // publishing uninitialized buckets or inverting the requested weights.
+        for weights in [[0, 1, 1], [1, 1, 65535]] {
+            let mut paths = [rx_paths[0], rx_paths[1], rx_paths[2]];
+            for (path, weight) in paths.iter_mut().zip(weights) {
+                path.weight = weight;
+            }
+            assert!(matches!(
+                net.update_load_balance(runtime, forwarding, &paths),
+                Err(DpoError::InvalidBucketCount)
+            ));
+            assert_eq!(
+                table.forwarding_lookup(destination.addr()),
+                Some(forwarding)
+            );
+            for (bucket, path) in rx_paths[..4].iter().enumerate() {
+                assert_eq!(
+                    net.select_load_balance(forwarding, |count, _| {
+                        assert_eq!(count, 4);
+                        Some(bucket as u32)
+                    }),
+                    Some(path.dpo)
+                );
+            }
+            assert_eq!(LoadBalanceDpo::memory().1, load_balance_count + 1);
+            assert_eq!(
+                hammer_service::net::InterfaceRxDpo::memory().1,
+                rx_count + 8
+            );
+        }
+        for &path in &rx_paths {
+            net.unlock_dpo(path.dpo);
+        }
+        assert_eq!(
+            hammer_service::net::InterfaceRxDpo::memory().1,
+            rx_count + 4
+        );
+        table.remove_route(destination, FibSource::API).unwrap();
+        assert_eq!(table.forwarding_lookup(destination.addr()), None);
+        assert_eq!(LoadBalanceDpo::memory().1, load_balance_count);
+        assert!(net.urpf_list(urpf).is_none());
+        assert_eq!(hammer_service::net::InterfaceRxDpo::memory().1, rx_count);
+        drop(table);
+        for hardware in hardware_interfaces {
+            interfaces.delete_hardware_interface(hardware).unwrap();
+        }
+        main.close()?;
+        GlobalMain::uninstall_current();
+        Ok(())
     }
 }
