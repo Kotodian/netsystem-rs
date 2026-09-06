@@ -118,9 +118,9 @@ prohibit an explicit dependency on another plugin's owner-defined interface.
 _Avoid_: zero-dependency plugin, isolated plugin
 
 **ICMP Plugin**:
-The independent plugin that owns ICMP behavior while consuming the IP plugin's
-explicit IPv4 and IPv6 interfaces.
-_Avoid_: IP plugin ICMP module, generic network plugin
+The independent plugin that owns locally delivered ICMP messages, type dispatch
+and echo replies. IP owns ICMP error generation for rejected IP packets.
+_Avoid_: error-generation plugin, generic network plugin
 
 **IPv4/IPv6 Implementation**:
 The concrete IPv4 or IPv6 behavior inside the single IP plugin. They share the

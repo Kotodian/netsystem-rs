@@ -13,6 +13,44 @@ because an implementation edit exists.
 
 ## Implementation ledger
 
+Active objective correction: delivery now targets ICMP alignment against ADR
+and vendored VPP, with VPP-derived tests, module commits, push and target
+cleanup. Other DPO findings remain recorded but are not implementation scope
+unless required by that ICMP chain. ADR/CONTEXT now place error generation in
+IP and only local input/type dispatch/echo/received PMTU parsing in ICMP.
+
+ICMP source-selection investigation: `vnet/ip/ip_sas.c:64-145` selects the
+longest common-prefix source on the offending interface, follows unnumbered
+address ownership and uses the interface link-local source for IPv6 link-local
+destinations. It is not "first matching family in a snapshot". Current
+`InterfaceMain::interface_addresses` allocates a Vec. The original
+`add_address` appended before validating the interface; `remove_address`
+shifted the shared array without repairing `SwInterface.addresses`.
+The user approved `interface_address(index) -> Option<IpNet>` and correction
+of the address index lifecycle. Commit `78415978` replaces the address Vec
+with the existing Pool, validates the software interface before insertion,
+removes the exact interface-list entry with `position`/`remove`, and reclaims
+only the removed interface's addresses. Surviving indices remain stable;
+released slots can be reused without generation or a reference wrapper.
+Independent review found no new blocker in this bounded scope; formatting,
+diff checks and `cargo test -p hammer-service --lib --tests` passed (5 tests).
+The new scenario proves storage lifetime, not route or ICMP graph behavior.
+No address-source cache or per-packet Vec fallback is approved; the existing
+InterfaceMain barrier/UnsafeCell contract has not been redesigned by this fix.
+
+ICMP verification anchors: `test_ip4.py::TestICMPEcho::test_icmp_echo` checks
+swapped addresses, echo reply type, ID, sequence and unchanged payload;
+`test_ip6.py::TestICMPv6Echo::test_icmpv6_echo` checks both global and link-local
+destinations. Error generation additionally must exercise the actual graph's
+new/original buffer disposition and 576/1280 truncation, not merely a builder
+return value. VPP's suppression primitive is `vnet/util/throttle.h`; its
+per-worker bitmap is 512 bits, with error-node periods 1e-5 (IPv4) and 1e-3
+(IPv6). No matching Hammer primitive was found. Its proposed owner is
+`hammer-service::net`, corresponding to VPP's `vnet/util`, not infra;
+IP supplies address keys and periods, while each worker owns its mutable
+suppression state. No throttle implementation has been added. Approval of
+that new shared interface remains separate from the approved address getter.
+
 Delivery checkpoint, 2026-09-06: the user explicitly requested committing
 the current non-ICMP changes before the ICMP migration. The current batch
 passed `cargo fmt --all -- --check`, `git diff --check`, and

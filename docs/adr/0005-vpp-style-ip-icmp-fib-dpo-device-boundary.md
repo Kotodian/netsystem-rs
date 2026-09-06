@@ -66,8 +66,8 @@ hammer-plugins/
 ```
 
 `hammer-plugins/net/ip` and `hammer-plugins/net/icmp` are separate DSOs. The
-IP DSO contains the concrete IPv4/IPv6 implementations; the ICMP DSO owns ICMP
-nodes and explicitly loads after IP. The existing `crates/hammer-plugins/ip`
+IP DSO contains the concrete IPv4/IPv6 implementations and ICMP error nodes;
+the ICMP DSO owns local ICMP handling and explicitly loads after IP. The existing `crates/hammer-plugins/ip`
 tree is the source being migrated, not the target layout.
 
 ### Ownership and dependency direction
@@ -91,8 +91,8 @@ pool reference, or IP policy into `hammer-runtime` or another plugin.
 | Owner | Owns | Does not own |
 | --- | --- | --- |
 | `hammer-service::net` | `NetMain`, interface/device coordination, protocol-neutral FIB source/entry/path graph, DPO class/node/edge metadata, generic DPO layouts and owner-defined class operations, source precedence, back-walk, and the generic forwarding-update seam | concrete producer payloads and their pools, IP-specific parsing and policy, ICMP parsing, device queue polling, Binary API method ownership |
-| `hammer-plugins/net/ip` | `IP_MAIN` protocol/port registry, concrete `IP4_MAIN`/`IP6_MAIN` owners for packet input/local lookup, FIB backends and per-interface table mappings, IP-null/special-route/PMTU policy, their concrete DPO pools, concrete next-hop decoding, and IP-owned Binary API handlers | ICMP nodes/Main, service-owned DPO pools, device queues, worker barrier, generic DPO class registry/stack implementation |
-| `hammer-plugins/net/icmp` | `ICMP_MAIN`, ICMP graph nodes, ICMP type tables, ICMP packet parsing/generation, ICMP registration with IP | IP FIB tables, interface queues, device polling |
+| `hammer-plugins/net/ip` | `IP_MAIN` protocol/port registry, concrete `IP4_MAIN`/`IP6_MAIN` owners for packet input/local lookup, FIB backends and per-interface table mappings, IP-null/special-route/PMTU policy, ICMP error metadata and generation nodes, their concrete DPO pools, concrete next-hop decoding, and IP-owned Binary API handlers | ICMP local Main/type dispatch, service-owned DPO pools, device queues, worker barrier, generic DPO class registry/stack implementation |
+| `hammer-plugins/net/icmp` | `ICMP_MAIN`, local ICMP input/type dispatch, echo replies, received PMTU-message parsing, registration with IP local | ICMP error generation, IP FIB tables, interface queues, device polling |
 | `hammer-plugins/transport/tcp` / `udp` | transport nodes and connections; registration with IP local-next/port tables; typed IP PMTU reads where enabled | IP FIB/DPO pools, ICMP parsing, interface/device queues |
 | Device plugin | its RX node, buffer acquisition/normalization, device headers, device-specific next-edge installation, TX implementation | IP protocol parsing and FIB lookup |
 | `hammer-service::binary_api` | Binary API framing, method lookup, reply mapping, and the single dispatcher-owned barrier scope | FIB/IP/device domain state and plugin method logic |
@@ -2199,11 +2199,11 @@ node-registration path. The existing single `register_protocol(protocol, node)`
 surface is removed so a caller cannot silently register a protocol in the
 wrong table.
 
-The ICMP error output edge is installed through explicit IP-owned concrete
-registration functions (`register_ip4_icmp_error_node` and
-`register_ip6_icmp_error_node`). If no ICMP error consumer is
-installed, the IP rewrite node uses its drop next. This is an explicit
-IP-to-ICMP dependency, not a generic callback carrier.
+IP owns and registers `ip4-icmp-error` and `ip6-icmp-error` in its graph image.
+IP input/rewrite/null/fragment and UDP select those concrete named nexts after
+writing IP-owned error metadata. Error generation works without loading the
+ICMP plugin. There is no error-consumer registration API and no IP-to-ICMP
+dependency. Local protocol registration remains independent of error output.
 
 ### Complete VPP subsystem alignment
 
@@ -2239,7 +2239,8 @@ VPP C type or field layout literally.
 | `ip4-local` / `ip6-local` | IP plugin | local feature arc, checksum/source checks and IP-protocol local-next dispatch |
 | `ip4-lookup` / `ip6-lookup` | IP plugin | concrete LPM lookup and post-LPM load-balance selection |
 | `ip4-rewrite` / `ip6-rewrite` and adjacency siblings | IP plugin | concrete IP header policy, IP MTU check, address interpretation and TX interface publication over service-owned adjacency objects |
-| `icmp4`, `icmp6`, echo/error/PMTU nodes | ICMP plugin | ICMP parsing, type tables, generated packets and explicit registration into IP local-next/error seams |
+| local ICMP input, echo and received PMTU messages | ICMP plugin | type dispatch, echo replies and explicit registration into IP local-next |
+| `ip4-icmp-error`, `ip6-icmp-error` | IP plugin | error metadata, interface source selection, worker-local suppression, generated packet and original-buffer disposition |
 | `vl_api_ip_*` handlers | owning IP/ICMP/device plugin | request validation and owner calls; publication is performed by the Binary API dispatcher under the worker barrier |
 
 The packet graph is therefore concrete at both ends and generic only at the
@@ -2578,8 +2579,9 @@ an additional network image.
 
 ### ICMP ownership and Path MTU
 
-The ICMP plugin owns ICMP wire parsing, type dispatch, echo/error generation,
-and ICMP graph nodes. The ICMP-specific parser currently living in
+The ICMP plugin owns locally delivered ICMP wire parsing, type dispatch and
+echo replies. IP owns error generation and its concrete IPv4/IPv6 graph nodes.
+This supersedes the original all-ICMP-nodes-in-ICMP split. The ICMP-specific parser currently living in
 `hammer-service::net::pmtu` moves into the ICMP plugin. The PMTU authority also
 moves to the IP plugin to match VPP's `ip_pmtu_t`/`ip_pmtu_dpo_t`: it is a
 FIB-linked forwarding policy, not a generic service cache. ICMP parses a
@@ -2589,6 +2591,21 @@ owner's `ip_path_mtu_update` operation inside the sole
 `worker_thread_barrier_sync!` scope; TCP consumes the typed IP PMTU lookup after
 that publication. `hammer-service::net` contains neither ICMP bytes nor PMTU
 policy, and no second cross-worker synchronization protocol is introduced.
+
+Error generation follows vendored `vnet/ip/icmp4.c:216-375` and
+`icmp6.c:257-409`: apply per-worker source/destination suppression, copy only
+the first original buffer into a new buffer, prepend headers, and limit the
+result to 576 bytes for IPv4 or 1280 bytes for IPv6. Use TTL/hop-limit 255,
+zero IPv4 fragment flags, and the offending interface's source-selection
+policy. Send the generated packet to concrete IP lookup, or drop it when
+source selection fails; send original buffers to drop on every branch.
+Allocation failure and suppression must still consume the original frame
+entry. No chain-to-Vec aggregation, generated-packet Vec, source snapshot,
+ArcSwap, or process-wide packet-path mutex is part of this contract.
+Echo replies instead modify the received packet in place, preserving its
+chain and updating addresses, TTL/hop-limit and checksums as the concrete
+VPP echo nodes do. ICMP type registration uses the owner Main and existing
+graph initialization/publication scope, not an erased runtime registry.
 
 The IP owner keeps the FIB-linked tracker, the interposed DPO and the
 IP-null-action table as concrete state. `IpRoutePathBehavior` remains an
@@ -2882,7 +2899,7 @@ next enum, `thread_local!` local registration, atomic FIB handle, or
 | API | `InterfaceMain::set_input_node` | 安装 device-owned RX input node | 替代 service 固定输入节点 | interface/device integration test |
 | API | `InterfaceMain::rx_redirect_to_node` | 通过选中 `DeviceClass` callback 安装 per-interface next | 删除固定 Device-to-IP redirect | callback dispatch test |
 | API | `register_ip4_protocol` / `register_ip6_protocol` | 接受 startup `&NodeRuntime` borrow，分离 IP4/IP6 local protocol 注册 | 替代单一 `register_protocol` | ICMP local dispatch test |
-| API | `register_ip4_icmp_error_node` / `register_ip6_icmp_error_node` | 安装 ICMP error output next | 未安装时使用 drop next | rewrite/error-next integration test |
+| API | IP-owned ICMP error metadata | 从 ICMP 私有定义迁移到 IP，IP/UDP producer 与 IP error node 使用同一定义 | 删除 UDP 重复位打包和 TCP 未使用的重复声明；不增加 request wrapper | producer-to-error-node packet test |
 
 ### 修改
 
@@ -2900,7 +2917,7 @@ next enum, `thread_local!` local registration, atomic FIB handle, or
 | 类型 | `hammer-service::binary_api::BinaryApiMethodEntry` dispatch contract | FIB-touching methods 保持 `mp_safe = false`；由 dispatcher 统一进入宏，handler 不再承担同步职责 | 现有 envelope/ABI 不变；方法注册迁移 | mp-safe/non-mp-safe dispatch test |
 | 类型 | `NetMain` / `DeviceMain` | `NetMain` 使用单一 `Arc<NetMain>` owner；registry/pool 的 `RefCell` 只在主线程维护借用，控制面返回标准 `Ref`/`RefMut`，worker 只在同步选择期间读 barrier-owned payload 并返回 Copy identity；`DeviceMain` 保持按值 `OnceLock` | 禁止裸 pool 引用跨越替换或删除；不增加第二同步机制；query、lookup 和递归析构一起迁移 | retained-borrow rejection, worker barrier, same-pool recursive destruction |
 | 类型 | `hammer-service::interface::InterfaceMain` | 由 `NetMain` 按值嵌入并通过借用暴露；不再作为独立 `Arc<InterfaceMain>` ownership root | `NetMain::init`/调用方迁移为 `&InterfaceMain`；接口 pool 和 callback 语义不变 | net/interface lifecycle and borrow-ownership checks |
-| 类型/API | IP graph registration image | IP image 删除 ICMP nodes；ICMP image 单独声明自己的 nodes/Main | `load_after = ["ip"]`；所有 DSO 一次迁移 | DSO graph inventory and load-order test |
+| 类型/API | IP/ICMP graph registration images | IP image 保留 error nodes；ICMP image 声明 local input、echo、received-PMTU nodes/Main | `load_after = ["ip"]`；IP 无反向依赖 | IP-only error generation and ICMP local graph tests |
 | API | `IpMain` FIB publication | 删除直接 `publish(table)`；改由 `ip4.route.add_del`/`ip6.route.add_del` Binary API handler 调用 service FIB 增量操作 | 运行时客户端改用 Binary API；dispatcher 宏负责 barrier | Binary API mutation and worker visibility test |
 | API | `hammer-service::net::pmtu` | 删除 service-owned PMTU cache；ICMP byte parser和 PMTU policy 均移至 IP/ICMP owners | TCP caller 改为显式依赖 IP 的 typed PMTU read/update | PMTU owner and cross-plugin contract test |
 | Type (新增) | `FibUrpfList` | `net::fib` 的 baked 列表：私有 `interfaces: Vec<u32>`、`lock_count: u32`；`NetMain` 保存其 Pool，接口集合发布后不可变 | 无序列化或 ABI 导出；与 DPO 单接口查询区分，不新增 DPO class | FIB 投影、去重、共享列表重建、路由撤销和 pool 回收 |
@@ -2926,7 +2943,8 @@ next enum, `thread_local!` local registration, atomic FIB handle, or
 | 类型/API | `FibTable: Clone`、`Ip4Main: Clone`、`Ip6Main: Clone`、`FibTable::backend_mut` 及公开 raw source mutation | 删除可绕过 root 引用计数的整表复制和直接 backend 修改；raw source 方法收窄为 FIB 内部 | 调用者通过 route/source owner 事务，数据面只读查询不变；无 wire 影响 | real DPO roots survive source precedence changes, rollback and repeated removal; final table destruction reclaims pools |
 | 类型 | `InterfaceTxDpo` | 删除只有 `sw_if_index` 的对象包装和 re-export；接口 TX identity 直接携带软件接口 index | 无对象 pool 或 release；现有 `DpoId::interface_tx` 保留，next 由实例 resolver 解析 | interface-owned stack integration |
 | API | `NetMain::{publish_load_balance_root,retire_load_balance_root,publish_replicate_root,retire_replicate_root}`、具体对象的 `publish_root`/`withdraw_root` | 删除额外的 root 生命周期包装 | 调用者在现有 publication scope 内使用 `lock_dpo`/`unlock_dpo`；无兼容 alias 或 wire 变化 | FIB/bucket 引用保留、撤销与 pool 回收场景 |
-| 类型/API | `hammer-plugins/net/ip::ip::icmp::*` 的 IP-owned ICMP module surface | ICMP nodes、control state、ICMP exports 移至 `hammer-plugins/net/icmp` | 无 compatibility re-export；ICMP callers 改依赖新 DSO | workspace compile and DSO export test |
+| 类型/API | ICMP-owned error node/source snapshots | error nodes、metadata、generation 移回 IP；删除 source snapshots、runtime wrapper registries、ArcSwap 发布 | 无 compatibility re-export；ICMP 只保留 local | workspace compile, packet ownership and source-selection tests |
+| API | `register_ip4_error` / `register_ip6_error`; proposed `register_ip4_icmp_error_node` / `register_ip6_icmp_error_node` | 删除错误地注册 local protocol 的接口；不实现 error-consumer registration | producer 使用 IP-owned metadata 和 concrete named next | IP-only error graph execution |
 | 类型 | `hammer-service::net::fib::FibEntrySrcRelation` | 删除独立的 cover/sibling/interpose 关系枚举；cover/sibling 事实直接存放在 `FibEntrySrc.cover` 元组，interpose 事实存放在可选的 `FibEntrySrc.interpose_dpo` | 无兼容 alias；实现直接迁移到字段访问，文档和源码不得保留该类型 | 文档 inventory 检查、源码编译和 source-lifecycle 行为测试 |
 | 类型 | `hammer-service::net::fib::FibPathFlags` | 删除 service-owned 的固定路径策略位集合；路径 flags 改为 `FibPath<N, F>` 的 owner-supplied `F` | IP callers 迁移到 `hammer-plugins/net/ip::IpPathFlags`；无兼容 alias | generic FIB compile check and IP route flag tests |
 | 类型/API | `hammer-service::device::DeviceInputNext::{Ip4Input,Ip6Input}` | 删除 service 固定 IP next | device callback 选择具体 parser/next | graph inventory and RX integration test |
@@ -2960,7 +2978,8 @@ phased; its first phase is the only completion gate for the current migration.
 ### Phase 1 implementation gate
 
 1. IP and ICMP are separate DSOs, with ICMP loading after IP and registering
-   IPv4/IPv6 local-next and ICMP-error consumers through explicit IP APIs.
+   only IPv4/IPv6 local-next consumers through explicit IP APIs. IP owns
+   ICMP error generation and must execute it without the ICMP DSO.
 2. Device RX remains device-owned: a concrete device callback selects the next
    node, while RX/TX `sw_if_index` and the independent `fib_index` survive the
    IP path.
