@@ -761,8 +761,9 @@ final-dispatch portion. The head performs this order for each packet:
 1. read the IPv4 header and wire protocol from the validated packet cursor;
 2. classify fragments first. A fragment selects `FullReassembly` and skips
    transport checksum and source checks;
-3. classify packets already marked as translated. They use their protocol
-   next and skip the same checks;
+3. no translated-packet bypass is introduced: Hammer has no NAT producer in
+   this scope. NAT metadata, branches and tests are explicitly excluded by
+   the user's correction on 2026-09-06;
 4. for ordinary TCP/UDP, respect valid hardware-offload/computed checksum
    facts; otherwise validate the IPv4 pseudo-header checksum. UDP checksum zero
    remains valid for IPv4, and UDP length must not exceed the IPv4 payload;
@@ -772,6 +773,12 @@ final-dispatch portion. The head performs this order for each packet:
 6. choose the effective local interface from `sw_if_index[RX]`. On the receive
    path, a `ReceiveDpo` with an actual interface overrides this value; a receive
    object without one leaves the packet RX interface unchanged;
+   the existing address owner `InterfaceMain` stores `Pool<ReceiveDpo<IpAddr>>`.
+   `add_or_lock_receive_dpo(sw_if_index, address)` creates one locked object
+   under the caller's barrier, registered DPO lock/unlock operations retain it
+   through forwarding references and remove it at zero. Local reads the
+   copied interface through `receive_dpo_interface(dpo)`, writes effective RX
+   into `NetworkIpOpaque::rx_sw_if_index`, and never overwrites raw RX;
 7. perform the concrete IPv4 source FIB lookup and store the resulting
    load-balance/DPO metadata required by later processing;
 8. reject a source whose selected child is receive as a spoofed local source;
@@ -925,6 +932,8 @@ protocol changes.
 | API | `InterfaceMain::{start_feature_arc,next_feature,next_feature_with_config}` | `Buffer` cursor + bitmap + dense index + shared heap; config method returns `([u32; N], u16)` without callback or borrowed return | replace count/closure arguments with `::<N>` and tuple destructuring; no compatibility overload, new type or stored-data migration | packet graph tests, config lifetime/width checks and benchmark |
 | API | `NodeRuntime::add_node_next_slots` | 对一组 `(node, next)` 先完整验证和 reserve，再 failure-atomic 地返回逐边 `u16` slot；实际新增主图边时设置一次 coalesced Graph Refork 请求 | generic runtime graph primitive；不引入 Feature-specific graph wrapper | recoverable-error atomicity, existing-edge no-op and one-refork tests |
 | graph nodes | `Ip4LocalNode`, `Ip4ReceiveNode`, `Ip4LocalEndOfArcNode`, `Ip6LocalNode`, `Ip6ReceiveNode`, `Ip6LocalEndOfArcNode` | six zero-sized concrete nodes; separate sibling sets | replace shared local/receive node | local graph registration and execution tests |
+| receive lifecycle | `InterfaceMain::{add_or_lock_receive_dpo,receive_dpo_interface}`, `ReceiveDpo<IpAddr>::{lock,unlock}` | address owner holds the concrete receive pool; barrier-protected creation/reclamation; packet reads return a copied interface | no generic object store, new Main or borrowed wrapper | real local receive and last-reference withdrawal |
+| packet facts | `NetworkFlags`, `NetworkOffloadFlags`, `NetworkIpOpaque::rx_sw_if_index` | bitflags for origin/computed/correct and TCP/UDP offload; effective RX occupies reserved bytes | opaque size/alignment and FIB override offset stay unchanged; no NAT state | packet checksum branches and effective-interface feature dispatch |
 | next enums | `Ip4LocalNext`, `Ip6LocalNext` | `Drop`, `Punt`, `FullReassembly` at fixed `u16` slots | dynamic protocol slots follow static slots | next-table and sibling tests |
 | error enums | `Ip4LocalError`, `Ip6LocalError` | exact node-local variants defined above | replace mixed `IpLocalError` | per-protocol packet error tests |
 | API | `unregister_ip4_protocol`, `unregister_ip6_protocol` | restore only the matching table entry to concrete punt | complements explicit registration APIs | registration lifecycle test |
@@ -993,7 +1002,7 @@ text.
    no local-protocol classification enum or second 256-entry classifier exists.
 7. Separate sibling tests prove local/receive/end-of-arc next-slot sharing
    inside one protocol and no sharing across protocols.
-8. IPv4 tests cover fragment and translated-packet bypass, TCP/UDP checksum,
+8. IPv4 tests cover fragment bypass and TCP/UDP checksum,
    UDP length, concrete FIB/override selection, receive actual interface,
    spoofed-local rejection, uRPF miss, and broadcast exemption.
 9. IPv6 tests cover extension-header traversal, UDP/ICMP checksum and length,

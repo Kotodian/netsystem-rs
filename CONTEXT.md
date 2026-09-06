@@ -46,6 +46,9 @@ _Avoid_: Data Worker task, Tokio request, packet dispatch
 **Data Worker**:
 A worker operating-system thread that owns one `DataPlaneMain` and executes
 packet graph nodes, frames, buffers, handoff work, and worker-local readiness.
+`DataPlaneMain` also owns the worker's non-cryptographic random stream,
+corresponding to `vlib_main_t.random_buffer`. Protocol nodes consume that
+stream; they do not install a separate per-protocol RNG lifecycle.
 _Avoid_: main thread, control thread
 
 **Worker Handoff**:

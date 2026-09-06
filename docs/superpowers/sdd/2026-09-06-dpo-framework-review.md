@@ -9,6 +9,28 @@ remain a historical baseline, not a newly verified list of open defects.
 This review does not authorize new types or APIs. Implementation and delivery
 remain incomplete; no finding is closed merely by adding a node declaration.
 
+Current four-item correction (2026-09-06): local consumes checksum/offload
+facts; InterfaceMain owns concrete receive objects with registered lock/unlock
+and final-reference reclamation; receive starts local features using effective
+RX without overwriting raw RX; echo consumes DataPlaneMain randomness for IPv4
+IDs; echo/error mark origin and clear inherited offload requests; IPv6 error
+source selection uses the original interface for link-local destinations before
+following unnumbered for ordinary destinations. No host configuration, NAT or
+trace changes are included. VPP evidence: `ip4_forward.c:1329-1408`,
+`ip6_forward.c:1503-1538,1574-1586`, `receive_dpo.c:28-104`,
+`ip_sas.c:63-103`, `ping.c:315,449-462`, and `vlib/main.h:174`.
+The IPv6 TCP local-checksum skip is intentional: VPP lookup initialization
+marks only UDP/ICMP as builtin, so TCP follows UNKNOWN at this stage.
+
+Scoped compile verification passed for IP/ICMP including test targets. Final
+pre-commit gate: runtime/IP/ICMP library tests in one build invocation and the
+service `interface_features` integration test. Tests exercise receive dispatch,
+checksum metadata decisions, final-reference removal, generated error bytes,
+source selection, origin/offload state, duplicate suppression and buffer
+reclamation. This gate does not claim completion of the broader PMTU/FIB work
+recorded in the historical findings below; issue #291 must not be closed solely
+on these focused results.
+
 ### Findings and implementation status
 
 Approved handoff migration (2026-09-06): runtime queues now carry destination
@@ -90,7 +112,7 @@ verifies chain reclamation. The test's configuration import was corrected to
 the existing `hammer_runtime::DataPlaneBufferConfig` export. The command
 `cargo check -p hammer-plugin-ip -p hammer-plugin-icmp --all-targets --message-format=short`
 now passes, including the test targets; no tests have executed.
-Concrete per-family validation/errors, offload/translated
+Concrete per-family validation/errors and existing-producer offload
 facts and receive-object integration remain open; these changes do not close
 IC04/IC05 or prove complete local graph behavior.
 
@@ -193,11 +215,11 @@ complete by this deletion. No tests have run for the deletion batch.
 | IC01 | Runtime: `crates/hammer-runtime/src/data_plane/handoff.rs:89` writes a resolved node slot to `current_config_index`; service `interface/feature.rs:337` reads that field as a shared configuration heap index. | A handoff with a continuation inside an active feature chain corrupts its cursor, allowing a wrong next or out-of-bounds access. Preserve feature configuration across handoff using the existing handoff ownership contract. ADR-0006's paragraph allowing this reinterpretation also needs correction; renaming the field does not separate the two simultaneous facts. |
 | IC02: implemented, test gate pending | Service `PuntNode` no longer registers a DPO; IP `punt.rs` registers each concrete protocol binding in its node init. | VPP `src/vnet/dpo/punt_dpo.c:65` binds `ip4-punt` and `ip6-punt`. The former bypass is removed in source; the added graph-stacking regression checks await execution. Generic terminal disposition remains separate. |
 | IC03: implemented, test gate pending | IP `local.rs` validates declared length against the chain and feeds segments to `InternetChecksum`; the odd-boundary ICMP checksum test compiles. | VPP `src/vnet/ip/ip6_forward.c:1058` onward computes over buffer chains. The implementation no longer requires the entire transport payload in the first buffer, but executable chain and full local graph evidence remain pending. |
-| IC04: partially implemented | IP `local.rs` now validates UDP length/checksum before local features, but still lacks translated/offload/computed facts and concrete family-specific paths/errors. | ADR-0006 and VPP `ip4_forward.c`/`ip6_forward.c` require those independent validation branches. The existing shared IPv4/IPv6 function remains incomplete. |
+| IC04: partially implemented | IP `local.rs` now validates UDP length/checksum before local features; concrete family-specific paths/errors remain incomplete. | NAT/translated metadata, bypass and tests are excluded by the user's 2026-09-06 correction: there is no NAT producer in scope. Only checksum facts supplied by actual in-scope producers belong to this migration. |
 | IC05: partially implemented | IPv6 source lookup now uses packet FIB plus explicit override. Local features still use raw RX interface; generic `ReceiveDpo<A>` has no connected instance lookup in this path. | ADR-0006 and VPP `ip6_forward.c:1574-1586` require effective receive-interface facts. Connect receive-object production/consumption without moving concrete address policy into service. |
 | IC06: resolved and tested | Service `next_feature_with_config::<N>` returns owned words and next without calling user code. | Approved replacement removes the borrowed-slice callback; the configuration lifecycle regression passes. IC01 remains independent. |
 | IC07: non-native extension removed | ICMP PMTU node, graph declaration and chain collector deleted; IP ICMP-byte cache parsers deleted. | Latest user instruction requires native VPP behavior. ADR-0005 now specifies IP control-plane PMTU updates, not automatic ICMP worker submission. Ordinary type dispatch/punt remains; full IP PMTU control/DPO behavior still requires its own completion evidence. |
-| IC08 | ICMP: `src/protocol.rs:85,92` fixes TTL/hop-limit at 64 and preserves the request's IPv4 fragment ID; echo processing lacks the complete origin/FIB handling. | VPP `src/plugins/ping/ping.c:303,449-462,650-665` uses host configuration, a new IPv4 fragment ID, locally-originated state and the IPv6 link-local/global reply FIB adjustment. Complete these owner-local semantics rather than treating address/type swaps as full echo alignment. |
+| IC08: implementation in progress | Echo now takes a fresh IPv4 fragment ID from `DataPlaneMain::random()` and marks locally-originated/checksum facts. TTL/hop-limit remain 64; new host configuration is explicitly excluded by the user. Origin/FIB behavior and executable coverage still need the final gate. | VPP `src/vlib/main.h:174`, `src/vlib/main.c:1906` own and initialize the random buffer; `src/plugins/ping/ping.c:315,449-462,650-665` consumes it for IDs and handles origin/FIB. Hammer owns concrete `SmallRng` in each DataPlaneMain, shares its stream only among same-worker runtime clones, and initializes independent state when constructing a worker. ICMP owns no RNG lifecycle. This preserves ownership, not ISAAC output equivalence; the stream is non-cryptographic. `cargo check -p hammer-runtime -p hammer-plugin-icmp` passed; final behavioral tests remain pending. |
 | IC09: partially implemented; trace deferred | IP `icmp_error.rs` separates sent-type counters. Locally-originated state and graph counter evidence remain missing. | VPP `src/vnet/ip/icmp4.c:286-294` and the corresponding IPv6 path mark origin. Complete non-trace metadata/counter behavior. The user explicitly deferred trace: the newly added macro and handle-transfer code are deleted and must not be restored as part of this work. |
 
 ### Headroom correction: withdrawn finding
