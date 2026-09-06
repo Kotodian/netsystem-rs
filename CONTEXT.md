@@ -164,10 +164,22 @@ An adjacency subtype that stacks a child DPO on a recursive target entry and
 restacks or un-stacks to drop as target state changes.
 _Avoid_: separate midchain pool, tunnel callback in service net
 
+**Load-Balance Path**:
+A resolved FIB path supplied to the load-balance owner, carrying its path
+identity, forwarding DPO and requested weight before bucket normalization.
+_Avoid_: pre-expanded bucket, DPO class registration
+
 **Load-Balance Map**:
 A supporting weighted-bucket remapping object shared by load-balance instances;
 it is not a DPO class and is rebuilt when path state changes.
 _Avoid_: load-balance DPO type, forwarding-chain walk for uRPF
+
+**uRPF List**:
+The immutable, unique set of accepting interfaces contributed by FIB paths
+according to their reverse-path semantics, which need not require forwarding
+resolution. It is distinct from a DPO operation that reports one interface and
+from the configured next-hop set.
+_Avoid_: DPO-chain traversal, DPO class, next-hop address list
 
 **MFIB**:
 The multicast FIB authority with its own table/entry/path state and replicate
@@ -175,15 +187,19 @@ DPO projection, separate from the unicast `FibTable` implementation.
 _Avoid_: multicast fields in unicast FIB, shared family table
 
 **DPO Class**:
-A forwarding behavior key with per-data-path node metadata, bound to a concrete
-object pool by its owning module. Several classes may describe different
-behaviors of one object form.
+A forwarding behavior key with per-data-path node metadata and owner operations
+for references, instance node resolution, MTU/uRPF, interpose and diagnostics.
+The owning module binds the key to its concrete objects; stateless classes need
+no pool, and several classes may describe different behaviors of one object form.
 _Avoid_: DPO instance, forwarding object
 
 **DPO Instance**:
 A concrete forwarding object owned by the module that understands its state.
 Its compact 8-byte `DpoId` identity is a dispatch fact, not the object itself;
-copies do not retain or inspect the pool value.
+copies do not retain or inspect the pool value. Owning fields acquire/release
+references through class lock/unlock. Control-plane pool queries retain standard
+Rust borrow guards; worker selection returns copied identities within the
+barrier-protected read scope.
 _Avoid_: DPO class, forwarding object
 
 **Network Address**:
@@ -201,9 +217,9 @@ _Avoid_: DPO protocol number, IP protocol selector
 **DPO Hot Layout**:
 The concrete DPO object's cacheline contract: switch-path fields are placed in
 the first cacheline, control-only state is separated, and the concrete owner
-proves size, alignment and required offsets. Load-balance keeps four inline
-child identities and uses a precomputed power-of-two mask; larger buckets stay
-in contiguous owner-local storage.
+proves size, alignment and required offsets. Load-balance uses a precomputed
+power-of-two mask and stores up to four child identities inline. Above that
+threshold the entire bucket array is contiguous out of line, not only its tail.
 _Avoid_: cacheline padding on every type, packet-path map lookup, bucket rebuild
 
 **Packet-Path Forwarding Contract**:
