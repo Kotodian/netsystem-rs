@@ -306,7 +306,7 @@ struct InterfaceState {
     rx_queues: Pool<RxQueue>,
     tx_queues: Pool<TxQueue>,
     names: HashMap<String, u32>,
-    addresses: Vec<(u32, IpNet)>,
+    addresses: Pool<(u32, IpNet)>,
     device_classes: Vec<DeviceClass>,
     hw_classes: Vec<HwClass>,
     hw_callbacks: Vec<InterfaceCallbackRegistration>,
@@ -635,10 +635,11 @@ impl InterfaceMain {
         for index in hw.tx_queue_indices {
             state.tx_queues.remove(index);
         }
-        state
-            .addresses
-            .retain(|(interface, _)| *interface != hw.sw_if_index);
-        state.software_interfaces.remove(hw.sw_if_index);
+        if let Some(software) = state.software_interfaces.remove(hw.sw_if_index) {
+            for address in software.addresses {
+                state.addresses.remove(address);
+            }
+        }
         state.names.retain(|_, index| *index != hw_if_index);
         state.hardware_interfaces.remove(hw_if_index);
         Ok(())
@@ -679,12 +680,24 @@ impl InterfaceMain {
         self.hardware_interface(index).map(|hw| hw.name.clone())
     }
     pub fn interface_addresses(&self, index: u32) -> Vec<IpNet> {
-        self.state()
+        let state = self.state();
+        let Some(interface) = state.software_interfaces.get(index) else {
+            return Vec::new();
+        };
+        interface
             .addresses
             .iter()
-            .filter(|(item, _)| *item == index)
+            .filter_map(|index| state.addresses.get(*index))
             .map(|(_, address)| *address)
             .collect()
+    }
+    /// Returns a copy of an occupied address slot. Removal invalidates its
+    /// index; later insertion may reuse it, without moving other live slots.
+    pub fn interface_address(&self, index: u32) -> Option<IpNet> {
+        self.state()
+            .addresses
+            .get(index)
+            .map(|(_, address)| *address)
     }
     pub fn interface_mtu(&self, index: u32) -> Option<InterfaceMtu> {
         self.hardware_interface(index)
@@ -695,8 +708,7 @@ impl InterfaceMain {
         self.state()
             .addresses
             .iter()
-            .position(|(item, value)| *item == index && *value == address)
-            .and_then(|value| u32::try_from(value).ok())
+            .find_map(|(slot, (item, value))| (*item == index && *value == address).then_some(slot))
     }
 
     pub fn register_rx_queue(
@@ -840,35 +852,36 @@ impl InterfaceMain {
     }
     pub fn add_address(&self, sw_if_index: u32, address: IpNet) -> InterfaceResult<u32> {
         let state = self.state_mut();
-        if let Some(index) = state
-            .addresses
-            .iter()
-            .position(|(item, value)| *item == sw_if_index && *value == address)
-        {
-            return Ok(index as u32);
-        }
-        let index = state.addresses.len() as u32;
-        state.addresses.push((sw_if_index, address));
-        state
-            .software_interfaces
-            .get_mut(sw_if_index)
-            .ok_or(InterfaceError::NotRegistered {
+        let software = state.software_interfaces.get_mut(sw_if_index).ok_or(
+            InterfaceError::NotRegistered {
                 interface_index: sw_if_index,
-            })?
-            .addresses
-            .push(index);
+            },
+        )?;
+        if let Some(index) = state.addresses.iter().find_map(|(index, (item, value))| {
+            (*item == sw_if_index && *value == address).then_some(index)
+        }) {
+            return Ok(index);
+        }
+        let index = state.addresses.insert((sw_if_index, address));
+        software.addresses.push(index);
         Ok(index)
     }
     pub fn remove_address(&self, sw_if_index: u32, address: IpNet) -> InterfaceResult<bool> {
         let state = self.state_mut();
-        let Some(index) = state
-            .addresses
-            .iter()
-            .position(|(item, value)| *item == sw_if_index && *value == address)
-        else {
+        let software = state.software_interfaces.get_mut(sw_if_index).ok_or(
+            InterfaceError::NotRegistered {
+                interface_index: sw_if_index,
+            },
+        )?;
+        let Some(index) = state.addresses.iter().find_map(|(index, (item, value))| {
+            (*item == sw_if_index && *value == address).then_some(index)
+        }) else {
             return Ok(false);
         };
         state.addresses.remove(index);
+        if let Some(position) = software.addresses.iter().position(|slot| *slot == index) {
+            software.addresses.remove(position);
+        }
         Ok(true)
     }
 
