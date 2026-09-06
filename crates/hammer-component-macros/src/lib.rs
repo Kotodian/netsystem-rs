@@ -3425,6 +3425,7 @@ pub fn derive_dpo_class(input: TokenStream) -> TokenStream {
     let mut shared_nodes = false;
     let mut lock = None::<syn::Path>;
     let mut unlock = None::<syn::Path>;
+    let mut operations = [None::<syn::Path>, None, None, None, None, None];
     for attribute in item
         .attrs
         .iter()
@@ -3461,10 +3462,24 @@ pub fn derive_dpo_class(input: TokenStream) -> TokenStream {
                         }
                         unlock = Some(input.parse()?);
                     }
+                    "next_nodes" | "mtu" | "urpf" | "interpose" | "format" | "memory" => {
+                        let index = match key.to_string().as_str() {
+                            "next_nodes" => 0,
+                            "mtu" => 1,
+                            "urpf" => 2,
+                            "interpose" => 3,
+                            "format" => 4,
+                            _ => 5,
+                        };
+                        if operations[index].is_some() {
+                            return Err(Error::new(key.span(), "duplicate DPO operation"));
+                        }
+                        operations[index] = Some(input.parse()?);
+                    }
                     _ => {
                         return Err(Error::new(
                             key.span(),
-                            "expected `nodes`, `lock` or `unlock`",
+                            "expected `nodes`, `lock`, `unlock`, `next_nodes`, `mtu`, `urpf`, `interpose`, `format` or `memory`",
                         ));
                     }
                 }
@@ -3487,8 +3502,16 @@ pub fn derive_dpo_class(input: TokenStream) -> TokenStream {
                 .into();
         }
     };
-    if nodes.is_empty() && !shared_nodes {
-        return Error::new(ident.span(), "DpoClass requires a non-empty `nodes` list")
+    let has_resolver = operations[0].is_some();
+    let operations: Vec<_> = operations
+        .iter()
+        .map(|operation| match operation {
+            Some(path) => quote!(Some(#path)),
+            None => quote!(None),
+        })
+        .collect();
+    if nodes.is_empty() && !shared_nodes && !has_resolver {
+        return Error::new(ident.span(), "DpoClass requires `nodes`, `next_nodes`, or caller-supplied bindings through bare `dpo_class`")
             .into_compile_error()
             .into();
     }
@@ -3504,10 +3527,10 @@ pub fn derive_dpo_class(input: TokenStream) -> TokenStream {
         return quote! {
             impl #impl_generics #ident #ty_generics #where_clause {
                 pub fn register_dpo_class(
-                    dpo_main: &mut ::hammer_service::net::dpo::DpoMain,
+                    net: &::hammer_service::net::NetMain,
                     nodes: &[(::hammer_service::net::dpo::DpoProto, &[::hammer_core::data_plane::NodeId])],
                 ) -> Result<::hammer_service::net::dpo::DpoType, ::hammer_service::net::dpo::DpoError> {
-                    dpo_main.register_new_type(nodes, #locks)
+                    net.register_dpo(None, nodes, #locks, #(#operations),*)
                 }
             }
         }
@@ -3522,10 +3545,10 @@ pub fn derive_dpo_class(input: TokenStream) -> TokenStream {
     quote! {
         impl #impl_generics #ident #ty_generics #where_clause {
             pub fn register_dpo_class(
-                dpo_main: &mut ::hammer_service::net::dpo::DpoMain,
+                net: &::hammer_service::net::NetMain,
                 #(#arguments: ::hammer_core::data_plane::NodeId),*
             ) -> Result<::hammer_service::net::dpo::DpoType, ::hammer_service::net::dpo::DpoError> {
-                dpo_main.register_new_type(&[#(#registrations),*], #locks)
+                net.register_dpo(None, &[#(#registrations),*], #locks, #(#operations),*)
             }
         }
     }
