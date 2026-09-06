@@ -140,8 +140,6 @@ pub enum RuntimeError {
     },
     #[error("node error recording requires an active Graph Node dispatch")]
     NodeDispatchContextMissing,
-    #[error("Handoff continuation requires an active Graph Node dispatch")]
-    HandoffDispatchContextMissing,
     #[error("required runtime capability `{type_name}` is not registered")]
     RuntimeCapabilityMissing { type_name: &'static str },
     #[error("data worker exited before reaching the {phase} barrier")]

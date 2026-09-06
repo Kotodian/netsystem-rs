@@ -5,7 +5,7 @@ use std::thread;
 
 use crate::error::RuntimeResult;
 use crossbeam_queue::ArrayQueue;
-use hammer_core::data_plane::{BufferPoolArena, Index, NodeHandle, NodeId};
+use hammer_core::data_plane::{BufferPoolArena, Index, NodeId};
 use hammer_core::error::DataPlaneError;
 
 pub(crate) const HANDOFF_SLOT_CAPACITY: usize = 32;
@@ -87,7 +87,7 @@ pub struct DataPlaneHandoffWorker {
 
 #[derive(Debug, Clone)]
 pub(crate) struct HandoffFrame {
-    pub(crate) target: NodeHandle,
+    pub(crate) target: NodeId,
     pub(crate) slot: HandoffSlot,
 }
 
@@ -239,7 +239,7 @@ impl DataPlaneHandoffWorker {
     pub(crate) fn enqueue_slot(
         &self,
         worker: DataWorkerId,
-        target: NodeHandle,
+        target: NodeId,
         slot: HandoffSlot,
     ) -> Result<(), HandoffEnqueueError> {
         self.enqueue_indices(worker, target, slot)
@@ -249,7 +249,7 @@ impl DataPlaneHandoffWorker {
     pub(crate) fn enqueue_index(
         &self,
         worker: DataWorkerId,
-        target: NodeHandle,
+        target: NodeId,
         index: Index,
     ) -> Result<(), HandoffEnqueueError> {
         self.enqueue_indices(worker, target, HandoffSlot::single(index))
@@ -276,7 +276,7 @@ impl DataPlaneHandoffWorker {
     pub(crate) fn enqueue_indices(
         &self,
         worker: DataWorkerId,
-        target: NodeHandle,
+        target: NodeId,
         slot: HandoffSlot,
     ) -> Result<(), HandoffEnqueueError> {
         let Some(queue) = self.inner.queues.get(worker.slot()) else {

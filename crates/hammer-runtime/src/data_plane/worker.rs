@@ -137,7 +137,6 @@ impl DataPlaneMain {
         NodeRuntimeInner,
         usize,
         Option<DataPlaneHandoffWorker>,
-        Option<NodeHandle>,
         Option<TraceControlHandle>,
     ) {
         (
@@ -146,7 +145,6 @@ impl DataPlaneMain {
             self.nodes.snapshot(),
             self.simd_bytes,
             self.handoff.clone(),
-            self.handoff_node_handle,
             self.trace.control(),
         )
     }
@@ -157,7 +155,6 @@ impl DataPlaneMain {
         nodes: NodeRuntimeInner,
         simd_bytes: usize,
         handoff: Option<DataPlaneHandoffWorker>,
-        handoff_node_handle: Option<NodeHandle>,
         trace_control: Option<TraceControlHandle>,
         thread_index: u32,
         numa_node: u32,
@@ -167,7 +164,6 @@ impl DataPlaneMain {
         let mut runtime = Self::from_buffers(buffers, simd_bytes)?;
         runtime.nodes = nodes.into();
         runtime.handoff = handoff;
-        runtime.handoff_node_handle = handoff_node_handle;
         runtime.trace.set_control(trace_control);
         if let Some(arena) = runtime
             .handoff
@@ -181,15 +177,13 @@ impl DataPlaneMain {
     }
 
     pub fn for_worker(&self, thread_index: u32, numa_node: u32) -> RuntimeResult<Self> {
-        let (arenas, frame_slots, nodes, simd_bytes, handoff, handoff_node_handle, trace_control) =
-            self.worker_parts();
+        let (arenas, frame_slots, nodes, simd_bytes, handoff, trace_control) = self.worker_parts();
         Self::from_worker_parts(
             arenas,
             frame_slots,
             nodes,
             simd_bytes,
             handoff,
-            handoff_node_handle,
             trace_control,
             thread_index,
             numa_node,
@@ -204,16 +198,5 @@ impl DataPlaneMain {
         }
         runtime.handoff = Some(handoff);
         runtime
-    }
-
-    #[inline]
-    pub fn set_handoff_node_handle(&mut self, handle: NodeHandle) {
-        self.handoff_node_handle = Some(handle);
-    }
-
-    #[inline]
-    pub fn handoff_node_handle(&self) -> RuntimeResult<NodeHandle> {
-        self.handoff_node_handle
-            .ok_or(DataPlaneError::HandoffNodeHandleMissing.into())
     }
 }

@@ -10,7 +10,7 @@ use crate::file::{FILE_MAIN, FileMain};
 use hammer_core::data_plane::{
     BUFFER_CACHE_LINE_SIZE, BufferFrame, BufferPoolArena, BufferRef, BufferRefMut,
     DEFAULT_BUFFER_FRAME_POOL_SIZE, DataPlaneBuffers, Frame, FrameBatchWidth, Index, Next,
-    NodeErrorIndex, NodeHandle, NodeId, NodeKind, NodeNext, NodeRegistration, Pending,
+    NodeErrorIndex, NodeId, NodeKind, NodeRegistration, Pending,
 };
 use hammer_core::error::{DataPlaneError, DataPlaneResult};
 use hammer_infra::PageSize;
@@ -44,7 +44,6 @@ pub struct DataPlaneMain {
     /// Worker-local appendable Next Frame per (current node × local slot).
     pub(crate) appendable_next_frames: RefCell<Vec<(NodeId, u16, Frame<Next>)>>,
     handoff: Option<DataPlaneHandoffWorker>,
-    handoff_node_handle: Option<NodeHandle>,
     active_numa_node: u32,
     trace: DataPlaneTrace,
     simd_bytes: usize,
@@ -71,7 +70,6 @@ impl fmt::Debug for DataPlaneMain {
                 &self.appendable_next_frames.borrow().len(),
             )
             .field("handoff", &self.handoff)
-            .field("handoff_node_handle", &self.handoff_node_handle)
             .field("active_numa_node", &self.active_numa_node)
             .field("trace", &self.trace)
             .field("simd_bytes", &self.simd_bytes)
@@ -124,7 +122,6 @@ impl Clone for DataPlaneMain {
                 hammer_core::data_plane::DEFAULT_BUFFER_FRAME_CAPACITY,
             )),
             handoff: self.handoff.clone(),
-            handoff_node_handle: self.handoff_node_handle,
             active_numa_node: self.active_numa_node,
             trace: self.trace.clone(),
             simd_bytes: self.simd_bytes,

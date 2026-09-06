@@ -24,7 +24,6 @@ impl DataPlaneMain {
                 hammer_core::data_plane::DEFAULT_BUFFER_FRAME_CAPACITY,
             )),
             handoff: None,
-            handoff_node_handle: None,
             trace: DataPlaneTrace::default(),
             simd_bytes,
             registry: crate::RuntimeRegistry::new(),
