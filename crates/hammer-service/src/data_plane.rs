@@ -6,11 +6,6 @@ use hammer_runtime::{
 
 use crate::net::{DpoProto, DpoType, NetMain};
 
-pub use crate::feature_arc::{
-    Feature, FeatureArc, FeatureArcControl, FeatureArcSpec, FeatureArcStart, FeatureArcStartHandle,
-    FeatureArcStartNode, FeatureArcStartSlot, next_feature_frame, next_feature_slot_for_index,
-};
-
 /// Record a generated node-local error and store its preinstalled global
 /// index in a packet buffer.
 #[inline(always)]
@@ -46,6 +41,18 @@ where
 )]
 #[derive(Debug, Clone, Copy, Default)]
 pub struct DropNode;
+
+#[hammer_component_macros::graph_node(graph = service, kind = internal, name = "punt")]
+pub struct PuntNode;
+
+impl Node for PuntNode {
+    fn process(&mut self, _: &DataPlaneMain, _: &mut BufferFrame) {}
+    fn node_process(&self) -> NodeProcessFn {
+        // VPP releases the packet frame when no OS punt consumer is installed.
+        // Leaving ownership in the incoming frame lets its owner release it.
+        |_, _, _| {}
+    }
+}
 
 impl DropNode {
     pub const NODE_NAME: &'static str = "drop";
@@ -201,15 +208,17 @@ fn handoff_node_process(
     _data: hammer_runtime::node::NodeRuntimeData,
     frame: &mut BufferFrame,
 ) -> () {
-    // Handoff continuation stores the destination as NodeId in current_config.
+    // Handoff interprets the generic cursor as its destination node slot.
     // Direct get/push/put is allowed for Handoff; Graph Fanout stays worker-local
     // and does not resolve cross-worker continuation identities.
     let indices: Vec<_> = frame.indices().iter().copied().collect();
     frame.discard_prefix(indices.len());
     for index in indices {
-        let next = runtime
-            .current_config(index)
-            .expect("handoff buffer must carry a continuation next");
+        let next = NodeId::new(
+            runtime
+                .current_config_index(index)
+                .expect("handoff buffer must carry a continuation next"),
+        );
         let mut next_frame = runtime
             .buffers()
             .get_next_frame(next)

@@ -12,6 +12,9 @@ use ipnet::IpNet;
 use crate::interface::{InterfaceError, InterfaceMtu, InterfaceMtuKind, InterfaceResult};
 use crate::net::{DpoError, DpoId, DpoProto, DpoType, InterfaceRxDpo, NetMain};
 
+#[path = "interface/feature.rs"]
+pub mod feature;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DriverScheduleMode {
     Poll,
@@ -301,6 +304,7 @@ impl TxQueue {
 
 #[derive(Default)]
 struct InterfaceState {
+    feature: feature::FeatureState,
     hardware_interfaces: Pool<HwInterface>,
     software_interfaces: Pool<SwInterface>,
     rx_queues: Pool<RxQueue>,
@@ -616,6 +620,7 @@ impl InterfaceMain {
         hw_if_index: u32,
         mut remove_file_interest: impl FnMut(u32),
     ) -> InterfaceResult<()> {
+        hammer_runtime::ensure_main_thread_with_barrier()?;
         let state = self.state_mut();
         let hw = state
             .hardware_interfaces
@@ -635,6 +640,7 @@ impl InterfaceMain {
         for index in hw.tx_queue_indices {
             state.tx_queues.remove(index);
         }
+        state.feature.remove_interface(hw.sw_if_index);
         if let Some(software) = state.software_interfaces.remove(hw.sw_if_index) {
             for address in software.addresses {
                 state.addresses.remove(address);
