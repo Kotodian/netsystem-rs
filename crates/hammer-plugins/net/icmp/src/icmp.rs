@@ -91,7 +91,6 @@ pub enum IcmpNodeError {
     BadLength,
     WrongProtocol,
     WrongType,
-    BadCode,
 }
 
 impl hammer_runtime::node::NodeErrorCode for IcmpNodeError {
@@ -118,7 +117,7 @@ pub struct IcmpEchoRequestTrace {
 }
 
 impl IcmpNodeError {
-    const DESCRIPTORS: [hammer_runtime::node::NodeErrorDescriptor; 4] = {
+    const DESCRIPTORS: [hammer_runtime::node::NodeErrorDescriptor; 3] = {
         use hammer_runtime::node::{NodeErrorDescriptor, NodeErrorSeverity};
         [
             NodeErrorDescriptor::new(
@@ -136,7 +135,6 @@ impl IcmpNodeError {
                 NodeErrorSeverity::Error,
                 "Not an echo request",
             ),
-            NodeErrorDescriptor::new("bad-code", NodeErrorSeverity::Error, "Invalid echo code"),
         ]
     };
     #[inline(always)]
@@ -152,7 +150,6 @@ impl From<IcmpBuildError> for IcmpNodeError {
             IcmpBuildError::BadLength => Self::BadLength,
             IcmpBuildError::WrongProtocol => Self::WrongProtocol,
             IcmpBuildError::WrongType => Self::WrongType,
-            IcmpBuildError::BadCode => Self::BadCode,
         }
     }
 }
@@ -686,7 +683,7 @@ mod tests {
     use hammer_runtime::{DataPlaneBufferConfig, GlobalMain, RuntimeRegistry};
 
     #[test]
-    fn ipv6_input_dispatches_echo_and_punts_type_validation_errors() -> RuntimeResult<()> {
+    fn input_dispatch_preserves_protocol_specific_validation() -> RuntimeResult<()> {
         hammer_runtime::config::Memory::default().ensure_main_heap()?;
         let mut main = GlobalMain::new(
             DataPlaneMain::new(DataPlaneBufferConfig::default()),
@@ -706,32 +703,89 @@ mod tests {
         ))?;
         hammer_runtime::init::run_init_functions(&mut main)?;
         let runtime = main.data_plane_main();
-        let input = runtime.node_by_name("icmp6-input").unwrap();
-        let punt = runtime.node_by_name("ip6-punt").unwrap();
-        let echo = runtime.node_by_name("icmp6-echo-request").unwrap();
 
         // icmp6.c::icmp6_input applies code, hop-limit, then minimum-length
         // validation. Every classified error uses punt, including registered
         // types; a valid registered echo request uses its installed graph edge.
-        for (icmp_type, code, hop_limit, length, error) in [
-            (128, 0, 64, 8, None),
-            (128, 1, 64, 8, Some(IcmpInputError::BadCode)),
-            (135, 0, 64, 24, Some(IcmpInputError::HopLimit)),
-            (135, 1, 64, 4, Some(IcmpInputError::TooShort)),
-            (200, 0, 64, 4, Some(IcmpInputError::UnknownType)),
+        // icmp4.c dispatches by type only; ping.c preserves the code while
+        // replying. The same type number must not leak across IP tables.
+        for (version, icmp_type, code, hop_limit, length, error) in [
+            (IpVersion::V4, 8, 0, 64, 8, None),
+            (IpVersion::V4, 8, 1, 64, 8, None),
+            (
+                IpVersion::V4,
+                128,
+                0,
+                64,
+                8,
+                Some(IcmpInputError::UnknownType),
+            ),
+            (
+                IpVersion::V6,
+                8,
+                0,
+                64,
+                8,
+                Some(IcmpInputError::UnknownType),
+            ),
+            (IpVersion::V6, 128, 0, 64, 8, None),
+            (IpVersion::V6, 128, 1, 64, 8, Some(IcmpInputError::BadCode)),
+            (
+                IpVersion::V6,
+                135,
+                0,
+                64,
+                24,
+                Some(IcmpInputError::HopLimit),
+            ),
+            (IpVersion::V6, 135, 1, 64, 4, Some(IcmpInputError::TooShort)),
+            (
+                IpVersion::V6,
+                200,
+                0,
+                64,
+                4,
+                Some(IcmpInputError::UnknownType),
+            ),
         ] {
+            let (input, punt, echo, header_len) = match version {
+                IpVersion::V4 => ("icmp4-input", "ip4-punt", "icmp4-echo-request", 20),
+                IpVersion::V6 => ("icmp6-input", "ip6-punt", "icmp6-echo-request", 40),
+            };
+            let input = runtime.node_by_name(input).unwrap();
+            let punt = runtime.node_by_name(punt).unwrap();
+            let echo = runtime.node_by_name(echo).unwrap();
             let mut packet = [0; 64];
-            packet[0] = 0x60;
-            packet[4..6].copy_from_slice(&(length as u16).to_be_bytes());
-            packet[6] = IpProtocol::Icmpv6.into();
-            packet[7] = hop_limit;
-            packet[8..12].copy_from_slice(&[0x20, 1, 0x0d, 0xb8]);
-            packet[23] = 2;
-            packet[24..28].copy_from_slice(&[0x20, 1, 0x0d, 0xb8]);
-            packet[39] = 1;
-            packet[40] = icmp_type;
-            packet[41] = code;
-            let packet_len = 40 + length;
+            let packet_len = header_len + length;
+            match version {
+                IpVersion::V4 => {
+                    packet[0] = 0x45;
+                    packet[2..4].copy_from_slice(&(packet_len as u16).to_be_bytes());
+                    packet[8] = hop_limit;
+                    packet[9] = IpProtocol::Icmpv4.into();
+                    packet[12..16].copy_from_slice(&[192, 0, 2, 2]);
+                    packet[16..20].copy_from_slice(&[192, 0, 2, 1]);
+                }
+                IpVersion::V6 => {
+                    packet[0] = 0x60;
+                    packet[4..6].copy_from_slice(&(length as u16).to_be_bytes());
+                    packet[6] = IpProtocol::Icmpv6.into();
+                    packet[7] = hop_limit;
+                    packet[8..12].copy_from_slice(&[0x20, 1, 0x0d, 0xb8]);
+                    packet[23] = 2;
+                    packet[24..28].copy_from_slice(&[0x20, 1, 0x0d, 0xb8]);
+                    packet[39] = 1;
+                }
+            }
+            packet[header_len] = icmp_type;
+            packet[header_len + 1] = code;
+            if version == IpVersion::V4 {
+                let checksum =
+                    hammer_infra::checksum::internet_checksum(&packet[header_len..packet_len]);
+                packet[header_len + 2..header_len + 4].copy_from_slice(&checksum.to_be_bytes());
+                let checksum = hammer_infra::checksum::internet_checksum(&packet[..header_len]);
+                packet[10..12].copy_from_slice(&checksum.to_be_bytes());
+            }
             let mut frame = runtime.buffers().get_next_frame(input)?;
             let index = runtime
                 .buffers()
@@ -747,12 +801,13 @@ mod tests {
                 network.set_packet_cursor(
                     BufferPacketCursor::new()
                         .with_packet_len(packet_len)
-                        .with_network_header(0, 40)
-                        .with_transport_header(40, 4),
+                        .with_network_header(0, header_len)
+                        .with_transport_header(header_len, 4)
+                        .with_transport_payload_offset(header_len + 4),
                 );
             }
             let next = runtime
-                .with_current_node(input, || next_slot_for_index(runtime, index, IpVersion::V6))?;
+                .with_current_node(input, || next_slot_for_index(runtime, index, version))?;
             assert_eq!(
                 runtime.nodes().node_next_slot(input, usize::from(next))?,
                 if error.is_some() { punt } else { echo },
@@ -766,6 +821,22 @@ mod tests {
                 runtime.get_buffer(index)?.node_error_index(),
                 expected_error
             );
+            if version == IpVersion::V4 && error.is_none() {
+                let next = runtime.with_current_node(echo, || {
+                    next_for_echo_request_index(runtime, index, version)
+                })?;
+                assert_eq!(
+                    runtime.nodes().node_next_slot(echo, usize::from(next))?,
+                    runtime.node_by_name("ip4-lookup").unwrap()
+                );
+                let buffer = runtime.get_buffer(index)?;
+                let reply = buffer.current();
+                assert_eq!(&reply[12..16], &packet[16..20]);
+                assert_eq!(&reply[16..20], &packet[12..16]);
+                assert_eq!(&reply[20..22], &[0, code]);
+                assert_eq!(hammer_infra::checksum::internet_checksum(&reply[..20]), 0);
+                assert_eq!(hammer_infra::checksum::internet_checksum(&reply[20..]), 0);
+            }
         }
         assert_eq!(runtime.buffers().in_use_buffers(), 0);
         main.close()?;

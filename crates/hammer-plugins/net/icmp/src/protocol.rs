@@ -32,7 +32,6 @@ pub enum IcmpBuildError {
     BadLength,
     WrongProtocol,
     WrongType,
-    BadCode,
 }
 
 /// IP local has already validated the complete message checksum. Only the
@@ -64,19 +63,16 @@ pub fn build_echo_reply(packet: &mut [u8], parsed: &ParsedIpPacket) -> Result<()
     if header.icmp_type() != request {
         return Err(IcmpBuildError::WrongType);
     }
-    if header.code() != 0 {
-        return Err(IcmpBuildError::BadCode);
-    }
-
-    // RFC 1624: replace the type/code word, retaining the payload contribution.
-    // Swapping IPv6 addresses does not change the pseudo-header checksum sum.
-    let mut sum = u32::from(!header.checksum())
-        + u32::from(!u16::from_be_bytes([request, 0]))
-        + u32::from(u16::from_be_bytes([reply, 0]));
+    // ip_csum_update updates the complemented checksum with end-around borrow.
+    // Preserve negative zero for an all-zero reply; code and payload stay intact.
+    // Swapping IPv6 addresses leaves the pseudo-header sum unchanged.
+    let sum = u32::from(header.checksum()) + (u32::from(request) << 8);
+    let (sum, borrow) = sum.overflowing_sub(u32::from(reply) << 8);
+    let mut sum = sum.wrapping_sub(u32::from(borrow));
     sum = (sum & 0xffff) + (sum >> 16);
     sum = (sum & 0xffff) + (sum >> 16);
     packet[icmp_offset] = reply;
-    packet[icmp_offset + 2..icmp_offset + 4].copy_from_slice(&(!(sum as u16)).to_be_bytes());
+    packet[icmp_offset + 2..icmp_offset + 4].copy_from_slice(&(sum as u16).to_be_bytes());
 
     let ip = &mut packet[ip_offset..ip_offset + ip_length];
     match parsed.version {
