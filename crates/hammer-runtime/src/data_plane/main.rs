@@ -1,3 +1,4 @@
+use rand::{SeedableRng, rngs::SmallRng};
 use std::cell::{Cell, RefCell};
 use std::collections::HashSet;
 use std::fmt;
@@ -38,6 +39,7 @@ mod worker;
 pub use config::DataPlaneBufferConfig;
 
 pub struct DataPlaneMain {
+    random: Rc<RefCell<SmallRng>>,
     buffers: DataPlaneBuffers,
     nodes: NodeRuntime,
     current_node: Rc<Cell<Option<NodeId>>>,
@@ -57,6 +59,15 @@ pub struct DataPlaneMain {
     called_worker_init_functions: HashSet<&'static str>,
     main_loop_count: AtomicU32,
     worker_control_queues: Arc<[DataRemoteLocalQueue]>,
+}
+
+impl DataPlaneMain {
+    /// Worker-local, non-cryptographic randomness. Runtime clones on this
+    /// worker advance the same stream; worker construction seeds a new stream.
+    #[inline]
+    pub fn random(&self) -> std::cell::RefMut<'_, SmallRng> {
+        self.random.borrow_mut()
+    }
 }
 
 impl fmt::Debug for DataPlaneMain {
@@ -115,6 +126,7 @@ impl Drop for HandoffSlotGuard<'_> {
 impl Clone for DataPlaneMain {
     fn clone(&self) -> Self {
         Self {
+            random: Rc::clone(&self.random),
             buffers: self.buffers.clone(),
             nodes: self.nodes.clone(),
             current_node: Rc::clone(&self.current_node),

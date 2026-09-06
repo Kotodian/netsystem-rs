@@ -18,3 +18,4 @@ hammer-runtime = { path = "../../../hammer-runtime", default-features = false }
 hammer-plugin-ip = { path = "../ip" }
 serde = { workspace = true }
 thiserror = { workspace = true }
+rand = { version = "0.9", default-features = false }

@@ -1107,6 +1107,7 @@ dependencies = [
  "hammer-plugin-ip",
  "hammer-runtime",
  "hammer-service",
+ "rand 0.9.5",
  "serde",
  "thiserror 2.0.18",
 ]
@@ -1232,6 +1233,7 @@ dependencies = [
  "metrics-derive",
  "object",
  "petgraph",
+ "rand 0.9.5",
  "semver",
  "serde",
  "thiserror 2.0.18",

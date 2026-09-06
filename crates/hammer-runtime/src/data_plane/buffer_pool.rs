@@ -15,7 +15,15 @@ impl DataPlaneMain {
         buffers: DataPlaneBuffers,
         simd_bytes: usize,
     ) -> RuntimeResult<Self> {
+        // Like vlib_main's clock seed, this is not cryptographic entropy.
+        // Seed once at runtime construction, never on the packet path.
+        let elapsed = match std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH) {
+            Ok(elapsed) => elapsed,
+            Err(error) => error.duration(),
+        };
+        let seed = elapsed.as_nanos() as u64 ^ u64::from(buffers.thread_index());
         Ok(Self {
+            random: Rc::new(RefCell::new(SmallRng::seed_from_u64(seed))),
             active_numa_node: buffers.active_numa_node(),
             buffers,
             nodes: NodeRuntime::default(),
