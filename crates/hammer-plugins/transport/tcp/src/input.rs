@@ -1,14 +1,11 @@
 use std::cell::RefCell;
-use std::mem::{size_of, transmute};
+use std::mem::transmute;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
-use std::num::NonZeroU64;
 use std::sync::Arc;
 
 use crate::{TcpError, TcpInputFlags, TcpSegmentFlags, tcp_header};
 use arc_swap::ArcSwap;
-use hammer_core::data_plane::{
-    BufferFrame, BufferPacketCursor, Index, NodeHandle, SecondaryOpaque,
-};
+use hammer_core::data_plane::{BufferFrame, BufferPacketCursor, Index, NodeHandle};
 use hammer_runtime::{
     DataPlaneMain, DataWorkerId, Node, NodeProcessFn, NodeRuntimeData, TraceFormatter,
     add_packet_trace, format_packet_trace,
@@ -23,15 +20,6 @@ use super::lookup::{
 use super::{TcpInputNext, write_session_route_opaque};
 use crate::protocol::{TcpIpProtocol, TcpIpVersion};
 use hammer_service::opaque::NetworkOpaque;
-
-#[derive(Clone, Copy, Default)]
-#[repr(C)]
-struct IcmpErrorOpaque {
-    icmp_error: Option<NonZeroU64>,
-    reserved: [u64; 6],
-}
-
-const _: () = assert!(size_of::<IcmpErrorOpaque>() == size_of::<SecondaryOpaque>());
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
 pub struct TcpInputTrace {

@@ -7,8 +7,10 @@ use hammer_runtime::{DataPlaneMain, Node, NodeProcessFn, NodeRuntimeData};
 #[hammer_component_macros::node_next]
 pub enum TcpResetNext {
     Drop,
-    #[next("ip-lookup")]
-    Lookup,
+    #[next("ip4-lookup")]
+    LookupV4,
+    #[next("ip6-lookup")]
+    LookupV6,
 }
 
 #[hammer_component_macros::graph_node(
@@ -65,11 +67,16 @@ fn tcp_reset_next_for_index(runtime: &DataPlaneMain, index: Index) -> RuntimeRes
             .packet_cursor(),
         )
     };
+    let next = match reset.map(|reset| reset.7) {
+        Some(4) => TcpResetNext::LookupV4,
+        Some(6) => TcpResetNext::LookupV6,
+        _ => return Ok(TcpResetNext::Drop),
+    };
     let Some(reply_len) = tcp_reset_write_reply(runtime, index, reset)? else {
         return Ok(TcpResetNext::Drop);
     };
     refresh_reset_metadata(runtime, index, reply_len)?;
-    Ok(TcpResetNext::Lookup)
+    Ok(next)
 }
 
 #[inline(always)]
