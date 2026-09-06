@@ -89,8 +89,10 @@ fn read_udp_egress_endpoints(opaque: &SecondaryOpaque) -> Option<(IpAddr, IpAddr
 #[hammer_component_macros::node_next]
 pub enum UdpOutputNext {
     Drop,
-    #[next("ip-lookup")]
-    Lookup,
+    #[next("ip4-lookup")]
+    LookupV4,
+    #[next("ip6-lookup")]
+    LookupV6,
 }
 
 #[hammer_component_macros::graph_node(
@@ -174,14 +176,14 @@ fn udp_output_next_for_index(
                 return Ok(UdpOutputNext::Drop);
             };
             udp_output_push_ipv4(runtime, index, src, dst, total_len)?;
-            Ok(UdpOutputNext::Lookup)
+            Ok(UdpOutputNext::LookupV4)
         }
         (IpAddr::V6(src), IpAddr::V6(dst)) => {
             let Some(payload_len) = u16::try_from(udp_len).ok() else {
                 return Ok(UdpOutputNext::Drop);
             };
             udp_output_push_ipv6(runtime, index, src, dst, payload_len)?;
-            Ok(UdpOutputNext::Lookup)
+            Ok(UdpOutputNext::LookupV6)
         }
         _ => Ok(UdpOutputNext::Drop),
     }
@@ -215,7 +217,7 @@ fn udp_output_push_ipv4(
     let mut buffer = runtime.get_buffer_mut(index)?;
     {
         let header = buffer.prepend_mut(IPV4_HEADER_LEN)?;
-        hammer_plugin_ip::write_ipv4_push_header(header, src, dst, UDP_PROTOCOL, total_len)?;
+        hammer_plugin_ip::write_ipv4_push_header(header, src, dst, UDP_PROTOCOL, total_len, true)?;
     }
     let packet_len = usize::from(total_len);
     let network = unsafe { transmute::<_, &mut NetworkOpaque>(buffer.opaque_mut()) };

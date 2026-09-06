@@ -46,7 +46,15 @@ _Avoid_: Data Worker task, Tokio request, packet dispatch
 **Data Worker**:
 A worker operating-system thread that owns one `DataPlaneMain` and executes
 packet graph nodes, frames, buffers, handoff work, and worker-local readiness.
+`DataPlaneMain` also owns the worker's non-cryptographic random stream,
+corresponding to `vlib_main_t.random_buffer`. Protocol nodes consume that
+stream; they do not install a separate per-protocol RNG lifecycle.
 _Avoid_: main thread, control thread
+
+**Worker Handoff**:
+Transfer of packet ownership to another Data Worker at an explicit graph
+destination, independent of the packet's current Feature Arc position.
+_Avoid_: feature continuation, intermediary handoff node
 
 **Process Node**:
 A cooperative control-plane execution context scheduled on the main operating-
@@ -109,3 +117,158 @@ hardware-interface class, or interface callback. It registers the driver's
 network behavior with the owning network authority and is distinct from a
 runtime software-interface or hardware-interface instance.
 _Avoid_: interface record, interface helper
+
+## Network/IP Language
+
+**Independent Plugin**:
+A plugin that owns its lifecycle and network behavior. Independence does not
+prohibit an explicit dependency on another plugin's owner-defined interface.
+_Avoid_: zero-dependency plugin, isolated plugin
+
+**ICMP Plugin**:
+The independent plugin that owns locally delivered ICMP messages, type dispatch
+and echo replies. IP owns ICMP error generation for rejected IP packets.
+_Avoid_: error-generation plugin, generic network plugin
+
+**IPv4/IPv6 Implementation**:
+The concrete IPv4 or IPv6 behavior inside the single IP plugin. They share the
+network forwarding model but are not one selectable protocol-family object.
+_Avoid_: ip4 plugin, ip6 plugin, family DSO
+
+**FIB Source**:
+A concrete authority that contributes route semantics for a prefix under a
+defined precedence and merge contract.
+_Avoid_: route table, source registry entry
+
+**FIB Graph Node**:
+A source, entry, path list, path, or tracker identified by `(node_type, index)`
+and connected through child/sibling links for recursive resolution and
+back-walk.
+_Avoid_: raw pointer node, route snapshot
+
+**FIB Entry Source**:
+The per-entry, embedded contribution record for one `FIB Source`, not an
+independent graph node. It retains the source's path-extension list, path-list
+link, entry/source flags, source identity, repeated-add count, common
+cover/interpose relation facts, and one concrete owner-supplied source-data
+payload. Service net does not enumerate protocol-specific source branches.
+_Avoid_: independent graph index, source registration metadata, callback table,
+erased source payload
+
+**Path Extension**:
+Per-source path state associated with `(entry, source, path_index)` that carries
+facts outside the shared FIB path. Its concrete payload and lifecycle are
+selected by the source or table owner.
+_Avoid_: universal path field, label stack in `FibPath`
+
+**Entry Delegate**:
+An optional FIB entry relation created only when needed for an additional
+forwarding chain, covered-entry list, tracker, BFD state, or attached
+import/export relationship.
+_Avoid_: fixed chain array, generic delegate object
+
+**Midchain Adjacency**:
+An adjacency subtype that stacks a child DPO on a recursive target entry and
+restacks or un-stacks to drop as target state changes.
+_Avoid_: separate midchain pool, tunnel callback in service net
+
+**Load-Balance Path**:
+A resolved FIB path supplied to the load-balance owner, carrying its path
+identity, forwarding DPO and requested weight before bucket normalization.
+_Avoid_: pre-expanded bucket, DPO class registration
+
+**Load-Balance Map**:
+A supporting weighted-bucket remapping object shared by load-balance instances;
+it is not a DPO class and is rebuilt when path state changes.
+_Avoid_: load-balance DPO type, forwarding-chain walk for uRPF
+
+**uRPF List**:
+The immutable, unique set of accepting interfaces contributed by FIB paths
+according to their reverse-path semantics, which need not require forwarding
+resolution. It is distinct from a DPO operation that reports one interface and
+from the configured next-hop set.
+_Avoid_: DPO-chain traversal, DPO class, next-hop address list
+
+**MFIB**:
+The multicast FIB authority with its own table/entry/path state and replicate
+DPO projection, separate from the unicast `FibTable` implementation.
+_Avoid_: multicast fields in unicast FIB, shared family table
+
+**DPO Class**:
+A forwarding behavior key with per-data-path node metadata and owner operations
+for references, instance node resolution, MTU/uRPF, interpose and diagnostics.
+The owning module binds the key to its concrete objects; stateless classes need
+no pool, and several classes may describe different behaviors of one object form.
+_Avoid_: DPO instance, forwarding object
+
+**DPO Instance**:
+A concrete forwarding object owned by the module that understands its state.
+Its compact 8-byte `DpoId` identity is a dispatch fact, not the object itself;
+copies do not retain or inspect the pool value. Owning fields acquire/release
+references through class lock/unlock. Control-plane pool queries retain standard
+Rust borrow guards; worker selection returns copied identities within the
+barrier-protected read scope.
+_Avoid_: DPO class, forwarding object
+
+**Network Address**:
+A producer-owned concrete value stored directly in a generic DPO layout. Net
+borrows or moves that value but does not define an address trait, canonicalisation
+method, byte representation, family enum, or wire interpretation.
+_Avoid_: `Box<[u8]>` address erasure, `dyn` address, `IpFamily`, IP address type
+in service net
+
+**DPO Data-Path Protocol**:
+The discriminator that selects a DPO's packet-graph/link behavior. It is not an
+IP wire protocol number and does not select ICMP, TCP, or UDP local dispatch.
+_Avoid_: DPO protocol number, IP protocol selector
+
+**DPO Hot Layout**:
+The concrete DPO object's cacheline contract: switch-path fields are placed in
+the first cacheline, control-only state is separated, and the concrete owner
+proves size, alignment and required offsets. Load-balance uses a precomputed
+power-of-two mask and stores up to four child identities inline. Above that
+threshold the entire bucket array is contiguous out of line, not only its tail.
+_Avoid_: cacheline padding on every type, packet-path map lookup, bucket rebuild
+
+**Packet-Path Forwarding Contract**:
+The bounded worker sequence from dense RX interface to concrete FIB LPM,
+post-LPM DPO bucket selection, cached next edge and TX interface. It performs
+no allocation, control-plane lock, source/delegate/path-extension walk or
+control-plane map lookup after publication.
+_Avoid_: packet-path FIB graph traversal, dynamic DPO dispatch, hot-path
+allocation
+
+**IP Feature Arc**:
+A concrete IP packet-processing chain for one protocol and location, such as
+IPv4 local input or IPv6 output.
+_Avoid_: generic IP family arc, DPO protocol dispatch
+
+**Path MTU DPO**:
+An IP-owned forwarding object that applies a path MTU constraint while
+preserving the underlying forwarding decision.
+_Avoid_: service PMTU cache, ICMP parser in net
+
+**Local0 Interface**:
+The always-present network interface used as a reserved sentinel rather than
+an addressable endpoint.
+_Avoid_: loopback interface, ordinary local route interface
+
+**Device RX Node**:
+A graph node owned by a device plugin that receives ingress packets and chooses
+their next graph target.
+_Avoid_: fixed device input path, service-owned protocol input
+
+**IP/Device Data-Path Seam**:
+The packet-graph seam where device and IP plugins exchange node identity and
+RX/TX interface facts without a fixed protocol path.
+_Avoid_: device-to-IP hardwire, generic protocol dispatcher
+
+**Interface RX Redirect**:
+An interface-owner request for a device class to redirect one hardware
+interface's receive stream to a concrete graph node.
+_Avoid_: global input next, fixed IP input redirect
+
+**Binary API Route Publication**:
+The control-plane command surface used to request runtime route and forwarding
+changes from the plugin that owns them.
+_Avoid_: direct route publish handle, config-only route mutation

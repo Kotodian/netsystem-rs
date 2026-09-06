@@ -1,14 +1,14 @@
 use std::cell::UnsafeCell;
 use std::mem::{size_of, transmute};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
-use std::num::NonZeroU64;
 use std::sync::{Arc, OnceLock};
 
 use crate::wire::UdpHeader;
-use hammer_core::data_plane::{BufferFrame, BufferPacketCursor, Index, NodeId, SecondaryOpaque};
+use hammer_core::data_plane::{BufferFrame, BufferPacketCursor, Index, NodeId};
 use hammer_infra::bitmap::Bitmap;
 use hammer_infra::checksum::internet_checksum_parts;
 use hammer_infra::sparse_vec::SparseVec;
+use hammer_plugin_ip::protocol::icmp::IcmpErrorMetadata;
 use hammer_runtime::RuntimeResult;
 use hammer_runtime::{
     DataPlaneMain, GlobalMain, Node, NodeProcessFn, NodeRuntimeData, RuntimeError, TraceFormatter,
@@ -22,23 +22,16 @@ use crate::UdpIpVersion;
 const UDP_HEADER_LEN: usize = 8;
 const UDP_PORT_COUNT: usize = u16::MAX as usize + 1;
 
-#[derive(Clone, Copy, Default)]
-#[repr(C)]
-struct IcmpErrorOpaque {
-    icmp_error: Option<NonZeroU64>,
-    reserved: [u64; 6],
-}
-
-const _: () = assert!(size_of::<IcmpErrorOpaque>() == size_of::<SecondaryOpaque>());
-
 #[hammer_component_macros::node_next]
 pub enum UdpInputNext {
     #[next("drop")]
     Drop,
     #[next("drop")]
     Punt,
-    #[next("drop")]
-    IcmpError,
+    #[next("ip4-icmp-error")]
+    IcmpErrorV4,
+    #[next("ip6-icmp-error")]
+    IcmpErrorV6,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -614,7 +607,8 @@ fn register_udp_input(runtime: &DataPlaneMain) -> RuntimeResult<NodeId> {
     let node = runtime
         .nodes()
         .try_register_internal_with_next_names(control.node(), &UdpInputNext::NEXT_NAMES)?;
-    hammer_plugin_ip::register_protocol(17, node)?;
+    hammer_plugin_ip::register_ip4_protocol(runtime.nodes(), 17, node)?;
+    hammer_plugin_ip::register_ip6_protocol(runtime.nodes(), 17, node)?;
     UDP_LOCAL_REGISTRATION
         .set(UdpLocalRegistration {
             inner: Arc::clone(&control.inner),
@@ -1083,10 +1077,16 @@ fn resolve_unknown_port(
     set_index_node_error(runtime, index, UdpInputError::UnknownPort)?;
     {
         let mut buffer = runtime.get_buffer_mut(index)?;
-        let opaque = unsafe { transmute::<_, &mut IcmpErrorOpaque>(buffer.opaque2_mut()) };
-        opaque.icmp_error = port_unreachable_metadata(version);
+        let metadata = match version {
+            UdpIpVersion::V4 => IcmpErrorMetadata::ipv4_destination_unreachable(3, 0),
+            UdpIpVersion::V6 => IcmpErrorMetadata::ipv6_port_unreachable(),
+        };
+        metadata.write(buffer.opaque2_mut());
     }
-    let slot = UdpInputNext::IcmpError.slot() as u16;
+    let slot = match version {
+        UdpIpVersion::V4 => UdpInputNext::IcmpErrorV4.slot() as u16,
+        UdpIpVersion::V6 => UdpInputNext::IcmpErrorV6.slot() as u16,
+    };
     add_packet_trace!(
         runtime,
         index,
@@ -1105,8 +1105,7 @@ fn resolve_unknown_port(
 fn clear_success_metadata(runtime: &DataPlaneMain, index: Index) -> RuntimeResult<()> {
     let mut buffer = runtime.get_buffer_mut(index)?;
     buffer.clear_node_error();
-    let opaque = unsafe { transmute::<_, &mut IcmpErrorOpaque>(buffer.opaque2_mut()) };
-    opaque.icmp_error = None;
+    IcmpErrorMetadata::clear(buffer.opaque2_mut());
     Ok(())
 }
 
@@ -1188,18 +1187,6 @@ fn refresh_udp_cursor(
             .with_transport_payload_offset(transport_payload_offset),
     );
     Ok(())
-}
-
-#[inline(always)]
-fn port_unreachable_metadata(version: UdpIpVersion) -> Option<NonZeroU64> {
-    match version {
-        UdpIpVersion::V4 => {
-            NonZeroU64::new((1u64 << 63) | (4u64 << 48) | (3u64 << 40) | (3u64 << 32))
-        }
-        UdpIpVersion::V6 => {
-            NonZeroU64::new((1u64 << 63) | (6u64 << 48) | (1u64 << 40) | (4u64 << 32))
-        }
-    }
 }
 
 #[inline(always)]

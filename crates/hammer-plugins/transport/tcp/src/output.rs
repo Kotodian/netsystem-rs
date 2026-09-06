@@ -17,8 +17,10 @@ const TCP_PROTOCOL: u8 = 6;
 #[hammer_component_macros::node_next]
 pub enum TcpOutputNext {
     Drop,
-    #[next("ip-lookup")]
-    Lookup,
+    #[next("ip4-lookup")]
+    LookupV4,
+    #[next("ip6-lookup")]
+    LookupV6,
 }
 
 #[hammer_component_macros::graph_node(
@@ -127,7 +129,7 @@ fn tcp_output_next_for_index<const SIMD_BYTES: usize>(
                 return Ok(TcpOutputNext::Drop);
             };
             tcp_output_push_ipv4::<SIMD_BYTES>(runtime, index, src, dst, total_len)?;
-            Ok(TcpOutputNext::Lookup)
+            Ok(TcpOutputNext::LookupV4)
         }
         (IpAddr::V6(src), IpAddr::V6(dst)) => {
             let Ok(payload_len) = u16::try_from(tcp_len) else {
@@ -135,7 +137,7 @@ fn tcp_output_next_for_index<const SIMD_BYTES: usize>(
                 return Ok(TcpOutputNext::Drop);
             };
             tcp_output_push_ipv6::<SIMD_BYTES>(runtime, index, src, dst, payload_len)?;
-            Ok(TcpOutputNext::Lookup)
+            Ok(TcpOutputNext::LookupV6)
         }
         _ => {
             let _ = runtime.record_current_node_error(TcpOutputError::UnsupportedEgress);
@@ -164,7 +166,7 @@ fn tcp_output_push_ipv4<const SIMD_BYTES: usize>(
     let mut buffer = runtime.get_buffer_mut(index)?;
     {
         let header = buffer.prepend_mut(IPV4_HEADER_LEN)?;
-        hammer_plugin_ip::write_ipv4_push_header(header, src, dst, TCP_PROTOCOL, total_len)?;
+        hammer_plugin_ip::write_ipv4_push_header(header, src, dst, TCP_PROTOCOL, total_len, true)?;
     }
     let packet_len = usize::from(total_len);
     let tcp_header_len = tcp_header(&buffer.current()[IPV4_HEADER_LEN..])

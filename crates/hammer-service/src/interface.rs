@@ -151,7 +151,25 @@ pub struct InterfaceOutputTrace {
 pub struct InterfaceOutputNode;
 
 fn register_interface_output_graph(runtime: &DataPlaneMain) -> RuntimeResult<NodeId> {
-    runtime.nodes().try_register_internal(InterfaceOutputNode)
+    let node = runtime.nodes().try_register_internal(InterfaceOutputNode)?;
+    let net = NetMain::global()?;
+    net.register_dpo(
+        Some(crate::net::DpoType::INTERFACE_TX),
+        &[],
+        None,
+        Some(InterfaceMain::interface_tx_nodes),
+        None,
+        None,
+        None,
+        None,
+        None,
+    )
+    .map_err(|source| RuntimeError::GraphNodeInitialization {
+        node: "interface-output",
+        source: Box::new(source),
+    })?;
+    net.interface_main().initialize_output_node(node);
+    Ok(node)
 }
 
 impl InterfaceOutputNode {
@@ -228,4 +246,61 @@ fn interface_output_process(runtime: &DataPlaneMain, _: NodeRuntimeData, frame: 
         runtime, index, 0
     )
     .unwrap_or(0));
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::net::{DpoError, DpoId, DpoProto, DpoType};
+    use hammer_runtime::{DataPlaneBufferConfig, GlobalMain, RuntimeRegistry};
+    use std::sync::Arc;
+
+    #[test]
+    fn interface_tx_stack_uses_the_interface_output_node() -> Result<(), DpoError> {
+        hammer_runtime::config::Memory::default().ensure_main_heap()?;
+        let mut main = GlobalMain::new(
+            DataPlaneMain::new(DataPlaneBufferConfig::default()),
+            RuntimeRegistry::new(),
+        );
+        main.install_current();
+        let net = NetMain::init(Arc::new(InterfaceMain::new()))?;
+        let runtime = main.data_plane_main_mut();
+        let child = crate::data_plane::register_drop(runtime)?;
+        let output = register_interface_output_graph(runtime)?;
+        let interfaces = net.interface_main();
+        let hardware = interfaces.register_hardware_interface(0, 1, 0, 0).unwrap();
+        let software = interfaces.hardware_interface(hardware).unwrap().sw_if_index;
+        assert_eq!(
+            interfaces
+                .software_interface(software)
+                .unwrap()
+                .sup_sw_if_index,
+            software
+        );
+        for software in [net.local_interface_sw_index(), software] {
+            let dpo = net
+                .dpo_main()
+                .identity(DpoType::INTERFACE_TX, DpoProto::IP4, software)?;
+            let stacked = net.dpo_main_mut().stack_from_node(runtime, child, dpo)?;
+            assert_eq!(stacked.index(), software);
+            assert_eq!(
+                Some(stacked.next()),
+                runtime.nodes().node_next_slot_for_target(child, output)?
+            );
+            net.lock_dpo(dpo);
+            net.unlock_dpo(dpo);
+        }
+        interfaces.delete_hardware_interface(hardware).unwrap();
+        assert!(matches!(
+            net.dpo_main_mut().stack_from_node(
+                runtime,
+                child,
+                DpoId::interface_tx(DpoProto::IP4, software)
+            ),
+            Err(DpoError::NodeMissing { .. })
+        ));
+        main.close()?;
+        GlobalMain::uninstall_current();
+        Ok(())
+    }
 }

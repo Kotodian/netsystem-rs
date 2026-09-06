@@ -483,13 +483,13 @@ pub fn register_tcp_input(runtime: &DataPlaneMain) -> RuntimeResult<NodeId> {
             &TcpInputNext::NEXT_NAMES,
         )?
     };
-    hammer_plugin_ip::register_protocol(6, node)?;
+    hammer_plugin_ip::register_ip4_protocol(runtime.nodes(), 6, node)?;
+    hammer_plugin_ip::register_ip6_protocol(runtime.nodes(), 6, node)?;
     Ok(node)
 }
 
 fn bind_worker_graph(engine: &mut DataPlaneMain) -> RuntimeResult<()> {
     let worker = engine.data_worker_id()?;
-    let handoff = engine.handoff_node_handle()?;
     let session_queue =
         engine
             .node_by_name("session-queue")
@@ -542,7 +542,7 @@ fn bind_worker_graph(engine: &mut DataPlaneMain) -> RuntimeResult<()> {
         .ok_or(RuntimeError::PluginStateNotInitialized { plugin: "tcp" })?;
     let input_data = main
         .control()
-        .node(main.input_process, Some((handoff, worker)))
+        .node(main.input_process, Some(worker))
         .node_runtime_data()?;
     let listen_data = TcpListenNode::new(main.listen_process).node_runtime_data()?;
     let established_data = TcpEstablishedNode::new(main.established_process).node_runtime_data()?;

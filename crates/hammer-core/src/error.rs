@@ -101,8 +101,6 @@ pub enum DataPlaneError {
     HandoffQueueExhausted,
     #[error("data plane handoff is not configured")]
     HandoffNotConfigured,
-    #[error("data plane handoff node handle is not configured")]
-    HandoffNodeHandleMissing,
     #[error("named next fallback node is not registered")]
     NamedNextFallbackMissing,
     #[error("duplicate node function for `{node}` at SIMD width {simd_bytes} bytes")]

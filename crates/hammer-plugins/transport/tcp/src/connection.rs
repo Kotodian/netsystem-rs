@@ -648,7 +648,7 @@ impl TcpConnection {
         let IpAddr::V4(remote) = self.remote.ip() else {
             return false;
         };
-        let Some(cache) = hammer_service::net::pmtu::path_mtu_cache() else {
+        let Some(cache) = hammer_plugin_ip::path_mtu() else {
             return false;
         };
         let Some(path_mtu) = cache.path_mtu(IpAddr::V4(remote)) else {

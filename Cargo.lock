@@ -1097,11 +1097,28 @@ dependencies = [
 ]
 
 [[package]]
+name = "hammer-plugin-icmp"
+version = "0.1.0"
+dependencies = [
+ "abi_stable",
+ "hammer-component-macros",
+ "hammer-core",
+ "hammer-infra",
+ "hammer-plugin-ip",
+ "hammer-runtime",
+ "hammer-service",
+ "rand 0.9.5",
+ "serde",
+ "thiserror 2.0.18",
+]
+
+[[package]]
 name = "hammer-plugin-ip"
 version = "0.1.0"
 dependencies = [
  "abi_stable",
  "arc-swap",
+ "bitflags 2.11.1",
  "hammer-component-macros",
  "hammer-core",
  "hammer-infra",
@@ -1110,6 +1127,7 @@ dependencies = [
  "humantime-serde",
  "ipnet",
  "linkme",
+ "prost",
  "serde",
  "thiserror 2.0.18",
  "toml",
@@ -1215,6 +1233,7 @@ dependencies = [
  "metrics-derive",
  "object",
  "petgraph",
+ "rand 0.9.5",
  "semver",
  "serde",
  "thiserror 2.0.18",

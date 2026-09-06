@@ -1,3 +1,4 @@
+use rand::{SeedableRng, rngs::SmallRng};
 use std::cell::{Cell, RefCell};
 use std::collections::HashSet;
 use std::fmt;
@@ -10,7 +11,7 @@ use crate::file::{FILE_MAIN, FileMain};
 use hammer_core::data_plane::{
     BUFFER_CACHE_LINE_SIZE, BufferFrame, BufferPoolArena, BufferRef, BufferRefMut,
     DEFAULT_BUFFER_FRAME_POOL_SIZE, DataPlaneBuffers, Frame, FrameBatchWidth, Index, Next,
-    NodeErrorIndex, NodeHandle, NodeId, NodeKind, NodeNext, NodeRegistration, Pending,
+    NodeErrorIndex, NodeId, NodeKind, NodeRegistration, Pending,
 };
 use hammer_core::error::{DataPlaneError, DataPlaneResult};
 use hammer_infra::PageSize;
@@ -38,13 +39,13 @@ mod worker;
 pub use config::DataPlaneBufferConfig;
 
 pub struct DataPlaneMain {
+    random: Rc<RefCell<SmallRng>>,
     buffers: DataPlaneBuffers,
     nodes: NodeRuntime,
     current_node: Rc<Cell<Option<NodeId>>>,
     /// Worker-local appendable Next Frame per (current node × local slot).
     pub(crate) appendable_next_frames: RefCell<Vec<(NodeId, u16, Frame<Next>)>>,
     handoff: Option<DataPlaneHandoffWorker>,
-    handoff_node_handle: Option<NodeHandle>,
     active_numa_node: u32,
     trace: DataPlaneTrace,
     simd_bytes: usize,
@@ -60,6 +61,15 @@ pub struct DataPlaneMain {
     worker_control_queues: Arc<[DataRemoteLocalQueue]>,
 }
 
+impl DataPlaneMain {
+    /// Worker-local, non-cryptographic randomness. Runtime clones on this
+    /// worker advance the same stream; worker construction seeds a new stream.
+    #[inline]
+    pub fn random(&self) -> std::cell::RefMut<'_, SmallRng> {
+        self.random.borrow_mut()
+    }
+}
+
 impl fmt::Debug for DataPlaneMain {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("DataPlaneMain")
@@ -71,7 +81,6 @@ impl fmt::Debug for DataPlaneMain {
                 &self.appendable_next_frames.borrow().len(),
             )
             .field("handoff", &self.handoff)
-            .field("handoff_node_handle", &self.handoff_node_handle)
             .field("active_numa_node", &self.active_numa_node)
             .field("trace", &self.trace)
             .field("simd_bytes", &self.simd_bytes)
@@ -117,6 +126,7 @@ impl Drop for HandoffSlotGuard<'_> {
 impl Clone for DataPlaneMain {
     fn clone(&self) -> Self {
         Self {
+            random: Rc::clone(&self.random),
             buffers: self.buffers.clone(),
             nodes: self.nodes.clone(),
             current_node: Rc::clone(&self.current_node),
@@ -124,7 +134,6 @@ impl Clone for DataPlaneMain {
                 hammer_core::data_plane::DEFAULT_BUFFER_FRAME_CAPACITY,
             )),
             handoff: self.handoff.clone(),
-            handoff_node_handle: self.handoff_node_handle,
             active_numa_node: self.active_numa_node,
             trace: self.trace.clone(),
             simd_bytes: self.simd_bytes,

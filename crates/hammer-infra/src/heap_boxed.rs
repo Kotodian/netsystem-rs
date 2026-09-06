@@ -210,6 +210,17 @@ impl<T, const ALIGN: usize> Drop for SliceInitGuard<'_, T, ALIGN> {
     }
 }
 
+/// Allocates an uninitialized contiguous array from the process Main Heap.
+///
+/// `ALIGN` controls the allocation base, not the element stride; zero uses
+/// the infrastructure vector alignment. The returned pointer owns no Rust
+/// values until the caller initializes them. A zero capacity does not allocate.
+/// Allocation failure uses the process allocation-error policy.
+#[inline]
+pub fn allocate<T, const ALIGN: usize>(capacity: usize) -> NonNull<T> {
+    allocate_in::<T, ALIGN>(capacity, &Heap::main())
+}
+
 #[inline]
 pub(crate) fn allocate_in<T, const ALIGN: usize>(capacity: usize, heap: &Heap) -> NonNull<T> {
     if capacity == 0 {
@@ -219,6 +230,19 @@ pub(crate) fn allocate_in<T, const ALIGN: usize>(capacity: usize, heap: &Heap) -
     heap.alloc(layout)
         .unwrap_or_else(|| handle_alloc_error(layout))
         .cast::<T>()
+}
+
+/// Frees array storage without dropping its elements.
+///
+/// # Safety
+/// For nonzero `capacity`, `ptr` must be a live allocation returned by
+/// `allocate::<T, ALIGN>` with the same capacity. All element
+/// references must have ended, and the caller must drop any initialized
+/// elements that require destruction before releasing their storage.
+#[inline]
+pub unsafe fn deallocate<T, const ALIGN: usize>(ptr: NonNull<T>, capacity: usize) {
+    // SAFETY: the public contract fixes provenance to the process Main Heap.
+    unsafe { deallocate_in::<T, ALIGN>(ptr, capacity, &Heap::main()) };
 }
 
 #[inline]

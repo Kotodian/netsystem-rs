@@ -131,7 +131,7 @@ pub enum RuntimeError {
     GraphNodeInitialization {
         node: &'static str,
         #[source]
-        source: Box<RuntimeError>,
+        source: Box<dyn std::error::Error + Send + Sync>,
     },
     #[error("packet trace serialization failed")]
     PacketTraceSerialization {
@@ -140,8 +140,6 @@ pub enum RuntimeError {
     },
     #[error("node error recording requires an active Graph Node dispatch")]
     NodeDispatchContextMissing,
-    #[error("Handoff continuation requires an active Graph Node dispatch")]
-    HandoffDispatchContextMissing,
     #[error("required runtime capability `{type_name}` is not registered")]
     RuntimeCapabilityMissing { type_name: &'static str },
     #[error("data worker exited before reaching the {phase} barrier")]
@@ -154,6 +152,15 @@ pub enum RuntimeError {
     NodeRuntimeDataWordOutOfRange { word: usize, value: u64 },
     #[error("graph node next count {count} does not fit a u16 slot")]
     NodeNextCountOverflow { count: usize },
+    #[error(
+        "graph edge {node:?} -> {next:?} has next slot {actual}, expected shared slot {expected}"
+    )]
+    NodeNextSlotMismatch {
+        node: hammer_core::data_plane::NodeId,
+        next: hammer_core::data_plane::NodeId,
+        actual: u16,
+        expected: u16,
+    },
     #[error("named-next registration cannot also supply resolved next nodes")]
     NamedNextWithResolvedTargets,
     #[error("named-next registration requires a declared next-node registration")]

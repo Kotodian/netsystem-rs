@@ -198,8 +198,6 @@ impl WorkerBuffer {
 pub struct WorkerHandoff {
     /// Per-worker packet handoff queue capacity.
     pub queue_capacity: usize,
-    /// Registered internal node handle for the handoff ingress node.
-    pub node_handle: u32,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
@@ -232,7 +230,6 @@ impl Default for WorkerHandoff {
     fn default() -> Self {
         Self {
             queue_capacity: HANDOFF_QUEUE_CAPACITY,
-            node_handle: 1,
         }
     }
 }

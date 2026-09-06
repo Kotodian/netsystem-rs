@@ -4,10 +4,7 @@ use hammer_runtime::{
     DataPlaneMain, InternalNode, Node, NodeErrorCode, NodeProcessFn, add_packet_trace,
 };
 
-pub use crate::feature_arc::{
-    Feature, FeatureArc, FeatureArcControl, FeatureArcSpec, FeatureArcStart, FeatureArcStartHandle,
-    FeatureArcStartNode, FeatureArcStartSlot, next_feature_frame, next_feature_slot_for_index,
-};
+use crate::net::{DpoProto, DpoType, NetMain};
 
 /// Record a generated node-local error and store its preinstalled global
 /// index in a packet buffer.
@@ -45,6 +42,18 @@ where
 #[derive(Debug, Clone, Copy, Default)]
 pub struct DropNode;
 
+#[hammer_component_macros::graph_node(graph = service, kind = internal, name = "punt")]
+pub struct PuntNode;
+
+impl Node for PuntNode {
+    fn process(&mut self, _: &DataPlaneMain, _: &mut BufferFrame) {}
+    fn node_process(&self) -> NodeProcessFn {
+        // VPP releases the packet frame when no OS punt consumer is installed.
+        // Leaving ownership in the incoming frame lets its owner release it.
+        |_, _, _| {}
+    }
+}
+
 impl DropNode {
     pub const NODE_NAME: &'static str = "drop";
 
@@ -54,30 +63,27 @@ impl DropNode {
     }
 }
 
-#[hammer_component_macros::graph_node(
-    graph = service,
-    init = crate::data_plane::register_handoff,
-)]
-#[derive(Debug, Clone, Copy, Default)]
-pub struct HandoffNode;
-
-impl HandoffNode {
-    pub const NODE_NAME: &'static str = "handoff";
-
-    #[inline]
-    pub fn new() -> Self {
-        Self
-    }
-}
-
 pub fn register_drop(runtime: &DataPlaneMain) -> RuntimeResult<NodeId> {
-    runtime.nodes().try_register_internal(DropNode)
-}
-
-pub fn register_handoff(runtime: &DataPlaneMain) -> RuntimeResult<NodeId> {
-    runtime
-        .nodes()
-        .register_internal_with_handle(runtime.handoff_node_handle()?, HandoffNode)
+    let node = runtime.nodes().try_register_internal(DropNode)?;
+    NetMain::global()?
+        .register_dpo(
+            Some(DpoType::DROP),
+            &[(DpoProto::IP4, &[node][..]), (DpoProto::IP6, &[node][..])],
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+        .map_err(
+            |source| hammer_runtime::RuntimeError::GraphNodeInitialization {
+                node: DropNode::NODE_NAME,
+                source: Box::new(source),
+            },
+        )?;
+    Ok(node)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
@@ -154,56 +160,6 @@ fn drop_node_process(
 }
 
 impl InternalNode for DropNode {
-    #[inline]
-    fn node_registration(&self) -> Option<NodeRegistration>
-    where
-        Self: Sized,
-    {
-        Some(NodeRegistration::next(Self::NODE_NAME, 0))
-    }
-}
-
-impl Node for HandoffNode {
-    #[inline(always)]
-    fn process(&mut self, _runtime: &DataPlaneMain, _frame: &mut BufferFrame) -> () {
-        ()
-    }
-
-    #[inline]
-    fn node_process(&self) -> NodeProcessFn {
-        handoff_node_process
-    }
-}
-
-fn handoff_node_process(
-    runtime: &DataPlaneMain,
-    _data: hammer_runtime::node::NodeRuntimeData,
-    frame: &mut BufferFrame,
-) -> () {
-    // Handoff continuation stores the destination as NodeId in current_config.
-    // Direct get/push/put is allowed for Handoff; Graph Fanout stays worker-local
-    // and does not resolve cross-worker continuation identities.
-    let indices: Vec<_> = frame.indices().iter().copied().collect();
-    frame.discard_prefix(indices.len());
-    for index in indices {
-        let next = runtime
-            .current_config(index)
-            .expect("handoff buffer must carry a continuation next");
-        let mut next_frame = runtime
-            .buffers()
-            .get_next_frame(next)
-            .expect("handoff continuation next frame");
-        next_frame
-            .push_index(index)
-            .expect("handoff continuation push");
-        runtime
-            .put_next_frame(next_frame)
-            .expect("handoff continuation put");
-    }
-    ()
-}
-
-impl InternalNode for HandoffNode {
     #[inline]
     fn node_registration(&self) -> Option<NodeRegistration>
     where

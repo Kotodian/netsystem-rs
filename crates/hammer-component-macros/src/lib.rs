@@ -554,9 +554,8 @@ fn expand_node_function_variant(
 
 struct FeatureArgs {
     arc: Path,
-    id: Ident,
-    runs_before: Vec<Ident>,
-    runs_after: Vec<Ident>,
+    runs_before: Vec<Path>,
+    runs_after: Vec<Path>,
 }
 
 #[derive(Default)]
@@ -565,7 +564,6 @@ struct NodeArgs {
     next_node: bool,
     sibling_of: Option<Path>,
     role: Option<NodeRole>,
-    start_arc: Option<Path>,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -591,7 +589,6 @@ struct NodeFieldArgs {
 impl Parse for FeatureArgs {
     fn parse(input: ParseStream<'_>) -> Result<Self> {
         let mut arc = None;
-        let mut id = None;
         let mut runs_before = Vec::new();
         let mut runs_after = Vec::new();
 
@@ -605,29 +602,23 @@ impl Parse for FeatureArgs {
                     }
                     arc = Some(input.parse()?);
                 }
-                "id" => {
-                    if id.is_some() {
-                        return Err(Error::new(key.span(), "duplicate `id` argument"));
-                    }
-                    id = Some(input.parse()?);
-                }
                 "runs_before" => {
                     if !runs_before.is_empty() {
                         return Err(Error::new(key.span(), "duplicate `runs_before` argument"));
                     }
-                    runs_before = parse_ident_array(input)?;
+                    runs_before = parse_path_array(input)?;
                 }
                 "runs_after" => {
                     if !runs_after.is_empty() {
                         return Err(Error::new(key.span(), "duplicate `runs_after` argument"));
                     }
-                    runs_after = parse_ident_array(input)?;
+                    runs_after = parse_path_array(input)?;
                 }
                 other => {
                     return Err(Error::new(
                         key.span(),
                         format!(
-                            "unknown argument `{other}`; expected `arc`, `id`, `runs_before`, or `runs_after`"
+                            "unknown argument `{other}`; expected `arc`, `runs_before`, or `runs_after`"
                         ),
                     ));
                 }
@@ -639,7 +630,6 @@ impl Parse for FeatureArgs {
 
         Ok(Self {
             arc: arc.ok_or_else(|| Error::new(Span::call_site(), "missing `arc` argument"))?,
-            id: id.ok_or_else(|| Error::new(Span::call_site(), "missing `id` argument"))?,
             runs_before,
             runs_after,
         })
@@ -691,18 +681,11 @@ impl Parse for NodeArgs {
                     input.parse::<Token![=]>()?;
                     args.sibling_of = Some(input.parse()?);
                 }
-                "start_arc" => {
-                    if args.start_arc.is_some() {
-                        return Err(Error::new(key.span(), "duplicate `start_arc` argument"));
-                    }
-                    input.parse::<Token![=]>()?;
-                    args.start_arc = Some(input.parse()?);
-                }
                 other => {
                     return Err(Error::new(
                         key.span(),
                         format!(
-                            "unknown argument `{other}`; expected `role`, `next`, `next_node`, `sibling_of`, or `start_arc`"
+                            "unknown argument `{other}`; expected `role`, `next`, `next_node`, `sibling_of`"
                         ),
                     ));
                 }
@@ -770,26 +753,13 @@ impl Parse for NodeFieldArgs {
     }
 }
 
-fn parse_ident_array(input: ParseStream<'_>) -> Result<Vec<Ident>> {
-    let content;
-    bracketed!(content in input);
-    let mut values = Vec::new();
-    while !content.is_empty() {
-        values.push(content.parse()?);
-        if content.parse::<Option<Token![,]>>()?.is_none() {
-            break;
-        }
-    }
-    Ok(values)
-}
-
 /// Defines a dataplane node struct, its next-node storage, and its constructor.
 ///
 /// Examples:
 ///
 /// ```ignore
-/// #[hammer_component_macros::node(next = IpInputNext, start_arc = A)]
-/// pub struct IpInputNode<A: FeatureArcSpec = IpUnicastArc>;
+/// #[hammer_component_macros::node(next = Ip4InputNext)]
+/// pub struct Ip4InputNode;
 ///
 /// #[hammer_component_macros::node(next = RouteMatchNext)]
 /// pub struct RouteMatchNode<R> {
@@ -805,121 +775,86 @@ pub fn node(args: TokenStream, input: TokenStream) -> TokenStream {
         .into()
 }
 
-/// Marks a dataplane feature arc enum.
-///
-/// Example:
-///
-/// ```ignore
-/// #[hammer_component_macros::feature_arc]
-/// pub enum IpUnicastArc {
-///     AclInput,
-/// }
-/// ```
-#[proc_macro_attribute]
-pub fn feature_arc(args: TokenStream, input: TokenStream) -> TokenStream {
-    if !args.is_empty() {
-        return Error::new(Span::call_site(), "`feature_arc` does not accept arguments")
-            .to_compile_error()
-            .into();
+struct FeatureArcArgs {
+    name: LitStr,
+    start_nodes: Vec<Path>,
+    last_in_arc: Option<Path>,
+}
+impl Parse for FeatureArcArgs {
+    fn parse(input: ParseStream<'_>) -> Result<Self> {
+        let mut name = None;
+        let mut starts = None;
+        let mut last = None;
+        while !input.is_empty() {
+            let key: Ident = input.parse()?;
+            input.parse::<Token![=]>()?;
+            match key.to_string().as_str() {
+                "name" if name.is_none() => name = Some(input.parse()?),
+                "start_nodes" if starts.is_none() => starts = Some(parse_path_array(input)?),
+                "last_in_arc" if last.is_none() => last = Some(input.parse()?),
+                _ => {
+                    return Err(Error::new(
+                        key.span(),
+                        "unknown or duplicate feature arc argument",
+                    ));
+                }
+            }
+            if input.parse::<Option<Token![,]>>()?.is_none() {
+                break;
+            }
+        }
+        Ok(Self {
+            name: name.ok_or_else(|| Error::new(Span::call_site(), "missing name"))?,
+            start_nodes: starts
+                .ok_or_else(|| Error::new(Span::call_site(), "missing start_nodes"))?,
+            last_in_arc: last,
+        })
     }
-    let item = parse_macro_input!(input as ItemEnum);
-
-    let ident = &item.ident;
-    let generics = &item.generics;
-    let (impl_generics, ty_generics, where_clause) = generics.split_for_impl();
-
-    quote! {
-        #item
-
-        impl #impl_generics ::hammer_service::data_plane::FeatureArcSpec
-            for #ident #ty_generics #where_clause
-        {}
-    }
-    .into()
 }
 
-/// Marks a dataplane node type as a feature in a specific feature arc.
-///
-/// Example:
-///
-/// ```ignore
-/// #[hammer_component_macros::feature(arc = IpUnicastArc, id = AclInput)]
-/// pub struct AclInputNode { ... }
-/// ```
+/// Declares a feature arc on its real graph head node.
+#[proc_macro_attribute]
+pub fn feature_arc(args: TokenStream, input: TokenStream) -> TokenStream {
+    let args = parse_macro_input!(args as FeatureArcArgs);
+    let item = parse_macro_input!(input as ItemStruct);
+    let ident = &item.ident;
+    let name = args.name;
+    let starts = args.start_nodes;
+    let (impl_generics, ty_generics, where_clause) = item.generics.split_for_impl();
+    let last = match args.last_in_arc {
+        Some(node) => quote!(Some(#node::NODE_NAME)),
+        None => quote!(None),
+    };
+    quote! {
+        #item
+        impl #impl_generics #ident #ty_generics #where_clause {
+            pub const FEATURE_ARC_NAME: &'static str = #name;
+            pub fn register_feature_arc(interfaces: &::hammer_service::interface::InterfaceMain, nodes: &::hammer_runtime::NodeRuntime) -> Result<u8, ::hammer_service::interface::feature::FeatureError> {
+                interfaces.register_feature_arc(Self::FEATURE_ARC_NAME, &[#(nodes.node_by_name(#starts::NODE_NAME).ok_or(::hammer_service::interface::feature::FeatureError::NodeNotFound { name: #starts::NODE_NAME })?),*], #last)
+            }
+        }
+    }.into()
+}
+
+/// Declares the ordering of a real graph node within an owning arc.
 #[proc_macro_attribute]
 pub fn feature(args: TokenStream, input: TokenStream) -> TokenStream {
     let args = parse_macro_input!(args as FeatureArgs);
-    let item = parse_macro_input!(input as Item);
-
-    let ident = match &item {
-        Item::Struct(item) => &item.ident,
-        Item::Enum(item) => &item.ident,
-        _ => {
-            return Error::new(
-                item.span(),
-                "`feature` can only be attached to a struct or enum",
-            )
-            .to_compile_error()
-            .into();
-        }
-    };
-    let generics = match &item {
-        Item::Struct(item) => &item.generics,
-        Item::Enum(item) => &item.generics,
-        _ => unreachable!(),
-    };
-    let (impl_generics, ty_generics, where_clause) = generics.split_for_impl();
+    let item = parse_macro_input!(input as ItemStruct);
+    let ident = &item.ident;
     let arc = args.arc;
-    let id = args.id;
-    let runs_before = args.runs_before;
-    let runs_after = args.runs_after;
-    let runs_before_fn = if runs_before.is_empty() {
-        quote! {
-            #[inline]
-            fn runs_before() -> ::std::vec::Vec<#arc> {
-                ::std::vec::Vec::new()
-            }
-        }
-    } else {
-        quote! {
-            #[inline]
-            fn runs_before() -> ::std::vec::Vec<#arc> {
-                ::std::vec![#(#arc::#runs_before),*]
-            }
-        }
-    };
-    let runs_after_fn = if runs_after.is_empty() {
-        quote! {
-            #[inline]
-            fn runs_after() -> ::std::vec::Vec<#arc> {
-                ::std::vec::Vec::new()
-            }
-        }
-    } else {
-        quote! {
-            #[inline]
-            fn runs_after() -> ::std::vec::Vec<#arc> {
-                ::std::vec![#(#arc::#runs_after),*]
-            }
-        }
-    };
-
+    let before = args.runs_before;
+    let after = args.runs_after;
+    let (impl_generics, ty_generics, where_clause) = item.generics.split_for_impl();
     quote! {
         #item
-
-        impl #impl_generics ::hammer_service::data_plane::Feature<#arc>
-            for #ident #ty_generics #where_clause
-        {
-            #[inline]
-            fn id() -> #arc {
-                #arc::#id
+        impl #impl_generics #ident #ty_generics #where_clause {
+            pub fn register_feature(interfaces: &::hammer_service::interface::InterfaceMain, nodes: &::hammer_runtime::NodeRuntime) -> Result<(), ::hammer_service::interface::feature::FeatureError> {
+                let node = nodes.node_by_name(Self::NODE_NAME).ok_or(::hammer_service::interface::feature::FeatureError::NodeNotFound { name: Self::NODE_NAME })?;
+                interfaces.register_feature(#arc::FEATURE_ARC_NAME, Self::NODE_NAME, node, &[#(#before::NODE_NAME),*], &[#(#after::NODE_NAME),*])
             }
-
-            #runs_before_fn
-            #runs_after_fn
         }
-    }
-    .into()
+    }.into()
 }
 
 /// Defines a dataplane node-next enum and its compact NodeId table builder.
@@ -1022,12 +957,6 @@ fn expand_node(
             "`node(next_node)` injects a `next` field; remove the field from the struct",
         ));
     }
-    if args.start_arc.is_some() && has_field(&output_fields, "feature_arc") {
-        return Err(Error::new(
-            Span::call_site(),
-            "`node(start_arc = ...)` injects a `feature_arc` field; remove the field from the struct",
-        ));
-    }
     if (args.next.is_some() || args.sibling_of.is_some()) && has_field(&output_fields, "node_name")
     {
         return Err(Error::new(
@@ -1079,36 +1008,6 @@ fn expand_node(
         constructor_params.push(quote!(next: ::hammer_core::data_plane::NodeId));
         constructor_inits.push(quote!(next));
     }
-
-    let start_impl = if let Some(start_arc) = &args.start_arc {
-        let field: Field = parse_quote! {
-            feature_arc: ::hammer_service::data_plane::FeatureArcStartSlot<#start_arc>
-        };
-        output_fields.push(field);
-        constructor_inits.push(quote!(
-            feature_arc: ::hammer_service::data_plane::FeatureArcStartSlot::new()
-        ));
-        quote! {
-            impl #impl_generics ::hammer_service::data_plane::FeatureArcStartNode<#start_arc>
-                for #ident #ty_generics #where_clause
-            {
-                #[inline]
-                fn set_feature_arc(
-                    &mut self,
-                    arc: ::hammer_service::data_plane::FeatureArc<#start_arc>,
-                ) {
-                    self.feature_arc.set(arc);
-                }
-
-                #[inline]
-                fn clear_feature_arc(&mut self) {
-                    self.feature_arc.clear();
-                }
-            }
-        }
-    } else {
-        quote!()
-    };
 
     let declared_name_impl = if declared_node && allow_name_override {
         quote! {
@@ -1229,7 +1128,6 @@ fn expand_node(
             #next_impl
         }
 
-        #start_impl
         #role_impl
     })
 }
@@ -1465,7 +1363,6 @@ struct GraphNodeArgs {
     state: Option<GraphNodeState>,
     next_node: bool,
     sibling_of: Option<Path>,
-    start_arc: Option<Path>,
 }
 
 impl Default for GraphNodeArgs {
@@ -1480,7 +1377,6 @@ impl Default for GraphNodeArgs {
             state: None,
             next_node: false,
             sibling_of: None,
-            start_arc: None,
         }
     }
 }
@@ -1565,20 +1461,11 @@ impl Parse for GraphNodeArgs {
                             }
                             args.sibling_of = Some(input.parse()?);
                         }
-                        "start_arc" => {
-                            if args.start_arc.is_some() {
-                                return Err(Error::new(
-                                    key.span(),
-                                    "duplicate `start_arc` argument",
-                                ));
-                            }
-                            args.start_arc = Some(input.parse()?);
-                        }
                         other => {
                             return Err(Error::new(
                                 key.span(),
                                 format!(
-                                    "unknown `graph_node` argument `{other}`; expected `graph`, `init`, `plugin`, `kind`, `name`, `next`, `role`, `state`, `next_node`, `sibling_of`, or `start_arc`"
+                                    "unknown `graph_node` argument `{other}`; expected `graph`, `init`, `plugin`, `kind`, `name`, `next`, `role`, `state`, `next_node`, `sibling_of`"
                                 ),
                             ));
                         }
@@ -2091,7 +1978,7 @@ fn expand_graph_node(args: GraphNodeArgs, ident: &Ident, item: Item) -> Result<T
     };
 
     let registration = quote! {
-        pub(crate) static #static_ident: ::hammer_runtime::NodeEntry =
+        pub static #static_ident: ::hammer_runtime::NodeEntry =
             ::hammer_runtime::NodeEntry {
             registration: #node_registration,
             kind: #node_kind,
@@ -2110,10 +1997,7 @@ fn expand_graph_node(args: GraphNodeArgs, ident: &Ident, item: Item) -> Result<T
             .any(|f| f.attrs.iter().any(|a| a.path().is_ident("node"))),
         _ => false,
     };
-    let needs_node_expansion = effective_role.is_some()
-        || args.next_node
-        || args.start_arc.is_some()
-        || has_field_node_attr;
+    let needs_node_expansion = effective_role.is_some() || args.next_node || has_field_node_attr;
 
     if needs_node_expansion {
         let struct_item = match item {
@@ -2130,7 +2014,6 @@ fn expand_graph_node(args: GraphNodeArgs, ident: &Ident, item: Item) -> Result<T
             next_node: args.next_node,
             sibling_of: args.sibling_of.clone(),
             role: effective_role,
-            start_arc: args.start_arc.clone(),
         };
         let node_output = expand_node(node_args, struct_item, args.name.clone(), false, false)?;
         Ok(quote! {
@@ -3385,6 +3268,231 @@ pub fn derive_hw_class(input: TokenStream) -> TokenStream {
     derive_class(input, false)
         .unwrap_or_else(Error::into_compile_error)
         .into()
+}
+
+struct DpoNodeBinding {
+    proto: Expr,
+    argument: Ident,
+}
+
+impl Parse for DpoNodeBinding {
+    fn parse(input: ParseStream<'_>) -> Result<Self> {
+        let content;
+        syn::parenthesized!(content in input);
+        Ok(Self {
+            proto: content.parse()?,
+            argument: {
+                content.parse::<Token![,]>()?;
+                let argument = content.parse()?;
+                if content.parse::<Option<Token![,]>>()?.is_some() && !content.is_empty() {
+                    return Err(Error::new(
+                        content.span(),
+                        "DpoClass node binding accepts one NodeId argument",
+                    ));
+                }
+                argument
+            },
+        })
+    }
+}
+
+#[proc_macro_derive(DpoClass, attributes(dpo_class))]
+pub fn derive_dpo_class(input: TokenStream) -> TokenStream {
+    let item: ItemStruct = match syn::parse(input) {
+        Ok(item) => item,
+        Err(error) => return error.into_compile_error().into(),
+    };
+    let ident = item.ident;
+    let (impl_generics, ty_generics, where_clause) = item.generics.split_for_impl();
+    let mut nodes = Vec::<DpoNodeBinding>::new();
+    let mut shared_nodes = false;
+    let mut lock = None::<syn::Path>;
+    let mut unlock = None::<syn::Path>;
+    let mut operations = [None::<syn::Path>, None, None, None, None, None];
+    for attribute in item
+        .attrs
+        .iter()
+        .filter(|attribute| attribute.path().is_ident("dpo_class"))
+    {
+        if matches!(&attribute.meta, syn::Meta::Path(_)) {
+            shared_nodes = true;
+            continue;
+        }
+        let parsed = attribute.parse_args_with(|input: ParseStream<'_>| {
+            while !input.is_empty() {
+                let key: Ident = input.parse()?;
+                input.parse::<Token![=]>()?;
+                match key.to_string().as_str() {
+                    "nodes" => {
+                        let content;
+                        bracketed!(content in input);
+                        while !content.is_empty() {
+                            nodes.push(content.parse::<DpoNodeBinding>()?);
+                            if content.parse::<Option<Token![,]>>()?.is_none() {
+                                break;
+                            }
+                        }
+                    }
+                    "lock" => {
+                        if lock.is_some() {
+                            return Err(Error::new(key.span(), "duplicate `lock`"));
+                        }
+                        lock = Some(input.parse()?);
+                    }
+                    "unlock" => {
+                        if unlock.is_some() {
+                            return Err(Error::new(key.span(), "duplicate `unlock`"));
+                        }
+                        unlock = Some(input.parse()?);
+                    }
+                    "next_nodes" | "mtu" | "urpf" | "interpose" | "format" | "memory" => {
+                        let index = match key.to_string().as_str() {
+                            "next_nodes" => 0,
+                            "mtu" => 1,
+                            "urpf" => 2,
+                            "interpose" => 3,
+                            "format" => 4,
+                            _ => 5,
+                        };
+                        if operations[index].is_some() {
+                            return Err(Error::new(key.span(), "duplicate DPO operation"));
+                        }
+                        operations[index] = Some(input.parse()?);
+                    }
+                    _ => {
+                        return Err(Error::new(
+                            key.span(),
+                            "expected `nodes`, `lock`, `unlock`, `next_nodes`, `mtu`, `urpf`, `interpose`, `format` or `memory`",
+                        ));
+                    }
+                }
+                if input.parse::<Option<Token![,]>>()?.is_none() {
+                    break;
+                }
+            }
+            Ok(())
+        });
+        if let Err(error) = parsed {
+            return error.into_compile_error().into();
+        }
+    }
+    let locks = match (lock, unlock) {
+        (Some(lock), Some(unlock)) => quote!(Some((#lock, #unlock))),
+        (None, None) => quote!(None),
+        _ => {
+            return Error::new(ident.span(), "DpoClass requires both `lock` and `unlock`")
+                .into_compile_error()
+                .into();
+        }
+    };
+    let has_resolver = operations[0].is_some();
+    let operations: Vec<_> = operations
+        .iter()
+        .map(|operation| match operation {
+            Some(path) => quote!(Some(#path)),
+            None => quote!(None),
+        })
+        .collect();
+    if nodes.is_empty() && !shared_nodes && !has_resolver {
+        return Error::new(ident.span(), "DpoClass requires `nodes`, `next_nodes`, or caller-supplied bindings through bare `dpo_class`")
+            .into_compile_error()
+            .into();
+    }
+    if shared_nodes && !nodes.is_empty() {
+        return Error::new(
+            ident.span(),
+            "DpoClass cannot combine `nodes` with bare `dpo_class`",
+        )
+        .into_compile_error()
+        .into();
+    }
+    if shared_nodes {
+        return quote! {
+            impl #impl_generics #ident #ty_generics #where_clause {
+                pub fn register_dpo_class(
+                    net: &::hammer_service::net::NetMain,
+                    nodes: &[(::hammer_service::net::dpo::DpoProto, &[::hammer_core::data_plane::NodeId])],
+                ) -> Result<::hammer_service::net::dpo::DpoType, ::hammer_service::net::dpo::DpoError> {
+                    net.register_dpo(None, nodes, #locks, #(#operations),*)
+                }
+            }
+        }
+        .into();
+    }
+    let arguments: Vec<_> = nodes.iter().map(|node| &node.argument).collect();
+    let registrations = nodes.iter().map(|node| {
+        let proto = &node.proto;
+        let argument = &node.argument;
+        quote!((#proto, &[#argument][..]))
+    });
+    quote! {
+        impl #impl_generics #ident #ty_generics #where_clause {
+            pub fn register_dpo_class(
+                net: &::hammer_service::net::NetMain,
+                #(#arguments: ::hammer_core::data_plane::NodeId),*
+            ) -> Result<::hammer_service::net::dpo::DpoType, ::hammer_service::net::dpo::DpoError> {
+                net.register_dpo(None, &[#(#registrations),*], #locks, #(#operations),*)
+            }
+        }
+    }
+    .into()
+}
+
+#[proc_macro_derive(FibSource, attributes(fib_source))]
+pub fn derive_fib_source(input: TokenStream) -> TokenStream {
+    let item: ItemStruct = match syn::parse(input) {
+        Ok(item) => item,
+        Err(error) => return error.into_compile_error().into(),
+    };
+    let ident = item.ident;
+    let mut name = LitStr::new(&ident.to_string(), ident.span());
+    let mut priority = quote!(0u8);
+    let mut behavior = quote!(::hammer_service::net::FibSourceBehavior::Api);
+    for attribute in item
+        .attrs
+        .iter()
+        .filter(|attribute| attribute.path().is_ident("fib_source"))
+    {
+        let parsed = attribute.parse_args_with(|input: ParseStream<'_>| {
+            let mut result = (None, None, None);
+            while !input.is_empty() {
+                let key: Ident = input.parse()?;
+                input.parse::<Token![=]>()?;
+                match key.to_string().as_str() {
+                    "name" => result.0 = Some(input.parse::<LitStr>()?),
+                    "priority" => result.1 = Some(input.parse::<syn::LitInt>()?),
+                    "behavior" => result.2 = Some(input.parse::<Ident>()?),
+                    _ => return Err(Error::new(key.span(), "unknown `fib_source` argument")),
+                }
+                if !input.is_empty() {
+                    input.parse::<Token![,]>()?;
+                }
+            }
+            Ok(result)
+        });
+        match parsed {
+            Ok((parsed_name, parsed_priority, parsed_behavior)) => {
+                if let Some(value) = parsed_name {
+                    name = value;
+                }
+                if let Some(value) = parsed_priority {
+                    priority = quote!(#value);
+                }
+                if let Some(value) = parsed_behavior {
+                    behavior = quote!(::hammer_service::net::FibSourceBehavior::#value);
+                }
+            }
+            Err(error) => return error.into_compile_error().into(),
+        }
+    }
+    quote! {
+        impl #ident {
+            pub const NAME: &'static str = #name;
+            pub const PRIORITY: u8 = #priority;
+            pub const BEHAVIOR: ::hammer_service::net::FibSourceBehavior = #behavior;
+        }
+    }
+    .into()
 }
 
 fn derive_class(input: TokenStream, device: bool) -> Result<TokenStream2> {

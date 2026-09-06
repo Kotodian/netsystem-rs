@@ -4,7 +4,7 @@ use std::net::SocketAddr;
 use std::ops::Deref;
 use std::sync::{Arc, OnceLock, mpsc};
 
-use hammer_core::data_plane::{BufferFrame, Index as BufferIndex, NodeHandle, NodeId, NodeState};
+use hammer_core::data_plane::{BufferFrame, Index as BufferIndex, NodeId, NodeState};
 use hammer_infra::align::CacheLineAlignMark;
 use hammer_infra::pool::Pool;
 use hammer_infra::thread_owned::{ThreadOwned, ThreadOwnedError};
@@ -558,13 +558,7 @@ impl UdpWorker {
             reply.new_thread
         };
         runtime
-            .handoff_index(
-                worker,
-                NodeHandle::new(reply.dgram.return_node.slot()),
-                reply.dgram.index,
-                None::<crate::input::UdpInputNext>,
-            )
-            .map(|_| ())
+            .handoff_index(worker, reply.dgram.return_node, reply.dgram.index)
             .map_err(|_| reply)
     }
 

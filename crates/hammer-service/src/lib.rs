@@ -5,6 +5,7 @@ hammer_runtime::__declare_registration_image!(
         binary_api::__INIT_FN_BINARY_API_INIT,
         session::__INIT_FN_APPLICATION_INIT,
         interface_model::__INIT_FN_INTERFACE_MAIN_INIT,
+        interface_model::feature::__INIT_FN_INTERFACE_FEATURE_INIT,
         net::__INIT_FN_NET_MAIN_INIT,
         device::__INIT_FN_DEVICE_MAIN_INIT,
         session::__INIT_FN_SESSION_INIT,
@@ -23,8 +24,7 @@ hammer_runtime::__declare_registration_image!(
     ];
     graph_nodes = [
         data_plane::__SERVICE_GRAPH_NODE_DROP_NODE,
-        data_plane::__SERVICE_GRAPH_NODE_HANDOFF_NODE,
-        device::__SERVICE_GRAPH_NODE_DEVICE_INPUT_NODE,
+        data_plane::__SERVICE_GRAPH_NODE_PUNT_NODE,
         interface::__SERVICE_GRAPH_NODE_INTERFACE_OUTPUT_NODE,
         session::node::__SESSION_GRAPH_NODE_APP_SESSION_INPUT_NODE,
         session::node::__SESSION_GRAPH_NODE_SESSION_QUEUE_NODE,
@@ -46,7 +46,6 @@ pub mod binary_api;
 pub mod data_plane;
 /// Device-class abstraction. Concrete drivers live under `hammer-plugins/device/`.
 pub mod device;
-pub mod feature_arc;
 /// Interface / adjacency control plane — shared infrastructure, not a plugin.
 pub mod interface;
 mod interface_model;

@@ -1,7 +1,8 @@
-use std::cell::UnsafeCell;
+use std::cell::{RefCell, UnsafeCell};
 use std::collections::HashMap;
 use std::fmt;
-use std::sync::Arc;
+use std::net::IpAddr;
+use std::sync::{Arc, OnceLock};
 
 use hammer_core::data_plane::NodeId;
 use hammer_infra::bitmap::Bitmap;
@@ -10,6 +11,10 @@ use hammer_runtime::{DataWorkerId, GlobalMain, RuntimeResult};
 use ipnet::IpNet;
 
 use crate::interface::{InterfaceError, InterfaceMtu, InterfaceMtuKind, InterfaceResult};
+use crate::net::{DpoError, DpoId, DpoProto, DpoType, InterfaceRxDpo, NetMain, ReceiveDpo};
+
+#[path = "interface/feature.rs"]
+pub mod feature;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DriverScheduleMode {
@@ -190,7 +195,7 @@ pub struct HwInterface {
     pub flags: u32,
     pub caps: u32,
     pub hw_address: Vec<u8>,
-    pub output_node_index: NodeId,
+    pub output_node_index: Option<NodeId>,
     pub tx_node_index: NodeId,
     pub dev_class_index: u32,
     pub dev_instance: u32,
@@ -300,12 +305,14 @@ impl TxQueue {
 
 #[derive(Default)]
 struct InterfaceState {
+    feature: feature::FeatureState,
     hardware_interfaces: Pool<HwInterface>,
     software_interfaces: Pool<SwInterface>,
     rx_queues: Pool<RxQueue>,
     tx_queues: Pool<TxQueue>,
     names: HashMap<String, u32>,
-    addresses: Vec<(u32, IpNet)>,
+    addresses: Pool<(u32, IpNet)>,
+    receive_dpos: Pool<ReceiveDpo<IpAddr>>,
     device_classes: Vec<DeviceClass>,
     hw_classes: Vec<HwClass>,
     hw_callbacks: Vec<InterfaceCallbackRegistration>,
@@ -314,6 +321,115 @@ struct InterfaceState {
 
 pub struct InterfaceMain {
     state: UnsafeCell<InterfaceState>,
+    output_node: OnceLock<NodeId>,
+    rx_dpos: RefCell<Pool<InterfaceRxDpo>>,
+    rx_dpo_by_interface: RefCell<HashMap<(DpoProto, u32), u32>>,
+}
+
+impl InterfaceRxDpo {
+    pub fn lock(dpo: DpoId) {
+        hammer_runtime::ensure_main_thread_with_barrier()
+            .expect("RX DPO acquisition requires the publication scope");
+        let net = NetMain::global().expect("RX DPO requires its interface owner");
+        let mut pool = net.interface_main().rx_dpos.borrow_mut();
+        let object = pool
+            .get_mut(dpo.index())
+            .expect("referenced RX DPO is occupied");
+        assert_eq!(dpo.class(), DpoType::INTERFACE_RX);
+        assert_eq!(dpo.proto(), object.proto);
+        object.lock_count = object
+            .lock_count
+            .checked_add(1)
+            .expect("RX DPO reference count overflow");
+    }
+
+    pub fn unlock(dpo: DpoId) {
+        hammer_runtime::ensure_main_thread_with_barrier()
+            .expect("RX DPO retirement requires the publication scope");
+        let net = NetMain::global().expect("RX DPO requires its interface owner");
+        let interfaces = net.interface_main();
+        let mut pool = interfaces.rx_dpos.borrow_mut();
+        let object = pool
+            .get_mut(dpo.index())
+            .expect("referenced RX DPO is occupied");
+        assert_eq!(dpo.class(), DpoType::INTERFACE_RX);
+        assert_eq!(dpo.proto(), object.proto);
+        object.lock_count = object
+            .lock_count
+            .checked_sub(1)
+            .expect("RX DPO reference count underflow");
+        if object.lock_count == 0 {
+            interfaces
+                .rx_dpo_by_interface
+                .borrow_mut()
+                .remove(&(object.proto, object.sw_if_index));
+            pool.remove(dpo.index());
+        }
+    }
+
+    pub fn format(dpo: DpoId, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        hammer_runtime::ensure_main_thread().expect("RX DPO formatting requires the main thread");
+        let net = NetMain::global().expect("RX DPO requires its interface owner");
+        let pool = net.interface_main().rx_dpos.borrow();
+        match pool.get(dpo.index()) {
+            Some(object) => write!(
+                formatter,
+                "interface-rx {} interface {} proto {} locks {}",
+                dpo.index(),
+                object.sw_if_index,
+                object.proto.get(),
+                object.lock_count
+            ),
+            None => write!(formatter, "interface-rx {} absent", dpo.index()),
+        }
+    }
+
+    pub fn memory() -> (usize, usize, usize) {
+        hammer_runtime::ensure_main_thread().expect("RX DPO diagnostics require the main thread");
+        let net = NetMain::global().expect("RX DPO requires its interface owner");
+        let pool = net.interface_main().rx_dpos.borrow();
+        (size_of::<Self>(), pool.len(), pool.capacity())
+    }
+}
+
+impl ReceiveDpo<IpAddr> {
+    pub fn lock(dpo: DpoId) {
+        hammer_runtime::ensure_main_thread_with_barrier()
+            .expect("receive DPO acquisition requires the publication scope");
+        assert_eq!(dpo.class(), DpoType::RECEIVE);
+        let interfaces = NetMain::global()
+            .expect("receive DPO requires its owner")
+            .interface_main();
+        let object = interfaces
+            .state_mut()
+            .receive_dpos
+            .get_mut(dpo.index())
+            .expect("referenced receive DPO is occupied");
+        object.lock_count = object
+            .lock_count
+            .checked_add(1)
+            .expect("receive DPO reference count overflow");
+    }
+
+    pub fn unlock(dpo: DpoId) {
+        hammer_runtime::ensure_main_thread_with_barrier()
+            .expect("receive DPO retirement requires the publication scope");
+        assert_eq!(dpo.class(), DpoType::RECEIVE);
+        let interfaces = NetMain::global()
+            .expect("receive DPO requires its owner")
+            .interface_main();
+        let pool = &mut interfaces.state_mut().receive_dpos;
+        let object = pool
+            .get_mut(dpo.index())
+            .expect("referenced receive DPO is occupied");
+        object.lock_count = object
+            .lock_count
+            .checked_sub(1)
+            .expect("receive DPO reference count underflow");
+        if object.lock_count == 0 {
+            pool.remove(dpo.index());
+        }
+    }
 }
 
 unsafe impl Send for InterfaceMain {}
@@ -329,7 +445,50 @@ impl InterfaceMain {
     pub fn new() -> Self {
         Self {
             state: UnsafeCell::new(InterfaceState::default()),
+            output_node: OnceLock::new(),
+            rx_dpos: RefCell::new(Pool::new()),
+            rx_dpo_by_interface: RefCell::new(HashMap::new()),
         }
+    }
+
+    /// Acquires a receive object under the caller's publication barrier.
+    /// An unspecified interface keeps the packet's original receive interface.
+    pub fn add_or_lock_receive_dpo(
+        &self,
+        sw_if_index: u32,
+        address: IpAddr,
+    ) -> Result<Option<DpoId>, DpoError> {
+        hammer_runtime::ensure_main_thread_with_barrier()?;
+        if sw_if_index != u32::MAX && self.software_interface(sw_if_index).is_none() {
+            return Ok(None);
+        }
+        let proto = match address {
+            IpAddr::V4(_) => DpoProto::IP4,
+            IpAddr::V6(_) => DpoProto::IP6,
+        };
+        NetMain::global()?
+            .dpo_main()
+            .identity(DpoType::RECEIVE, proto, 0)?;
+        let index = self.state_mut().receive_dpos.insert(ReceiveDpo {
+            sw_if_index,
+            address,
+            lock_count: 1,
+        });
+        Ok(Some(DpoId::receive(proto, index)))
+    }
+
+    /// Copies the interface fact during synchronous packet processing.
+    #[inline]
+    pub fn receive_dpo_interface(&self, dpo: DpoId) -> Option<u32> {
+        if dpo.class() != DpoType::RECEIVE {
+            return None;
+        }
+        let object = self.state().receive_dpos.get(dpo.index())?;
+        let proto = match object.address {
+            IpAddr::V4(_) => DpoProto::IP4,
+            IpAddr::V6(_) => DpoProto::IP6,
+        };
+        (proto == dpo.proto()).then_some(object.sw_if_index)
     }
 
     fn state(&self) -> &InterfaceState {
@@ -386,7 +545,7 @@ impl InterfaceMain {
             flags: 0,
             caps: 0,
             hw_address: Vec::new(),
-            output_node_index: NodeId::new(0),
+            output_node_index: None,
             tx_node_index: NodeId::new(0),
             dev_class_index: device_class_index,
             dev_instance: device_instance,
@@ -428,7 +587,110 @@ impl InterfaceMain {
             .get_mut(sw_if_index)
             .expect("inserted software interface")
             .sw_if_index = sw_if_index;
+        state
+            .software_interfaces
+            .get_mut(sw_if_index)
+            .expect("inserted software interface")
+            .sup_sw_if_index = sw_if_index;
         Ok(hw_if_index)
+    }
+
+    pub(crate) fn initialize_output_node(&self, node: NodeId) {
+        hammer_runtime::ensure_main_thread_with_barrier()
+            .expect("interface output initialization requires the publication scope");
+        self.output_node
+            .set(node)
+            .expect("interface output node is initialized once");
+    }
+
+    /// Acquires one reference to the shared interface/protocol RX object.
+    /// Publication is owned by the caller's Binary API barrier scope.
+    pub fn add_or_lock_rx_dpo(
+        &self,
+        proto: DpoProto,
+        sw_if_index: u32,
+    ) -> Result<Option<DpoId>, DpoError> {
+        hammer_runtime::ensure_main_thread_with_barrier()?;
+        if self.software_interface(sw_if_index).is_none() {
+            return Ok(None);
+        }
+        NetMain::global()?
+            .dpo_main()
+            .identity(DpoType::INTERFACE_RX, proto, 0)?;
+        let mut pool = self.rx_dpos.borrow_mut();
+        let mut database = self.rx_dpo_by_interface.borrow_mut();
+        let index = match database.get(&(proto, sw_if_index)).copied() {
+            Some(index) => {
+                let object = pool
+                    .get_mut(index)
+                    .expect("RX database names an occupied slot");
+                object.lock_count = object
+                    .lock_count
+                    .checked_add(1)
+                    .expect("RX DPO reference count overflow");
+                index
+            }
+            None => {
+                let index = pool.insert(InterfaceRxDpo {
+                    sw_if_index,
+                    proto,
+                    lock_count: 1,
+                });
+                database.insert((proto, sw_if_index), index);
+                index
+            }
+        };
+        Ok(Some(DpoId::interface_rx(proto, index)))
+    }
+
+    /// Copies the RX interface fact without letting a pool borrow escape a
+    /// worker's synchronous packet operation.
+    #[inline(always)]
+    pub fn rx_dpo_interface(&self, dpo: DpoId) -> Option<u32> {
+        if dpo.class() != DpoType::INTERFACE_RX {
+            return None;
+        }
+        let interface = |pool: &Pool<InterfaceRxDpo>| {
+            let object = pool.get(dpo.index())?;
+            (object.proto == dpo.proto()).then_some(object.sw_if_index)
+        };
+        if hammer_runtime::ensure_main_thread().is_ok() {
+            return interface(&self.rx_dpos.borrow());
+        }
+        hammer_runtime::with_data_plane_main(|runtime| {
+            assert_ne!(
+                runtime.thread_index(),
+                0,
+                "RX DPO reads require a Data Worker"
+            );
+            // SAFETY: the installed worker cannot acknowledge a barrier in
+            // this synchronous read. All pool mutation requires acknowledged
+            // workers; no reference or RefCell borrow flag escapes to workers.
+            unsafe { interface(&*self.rx_dpos.as_ptr()) }
+        })
+    }
+
+    pub(crate) fn interface_tx_nodes(dpo: crate::net::DpoId) -> Vec<NodeId> {
+        let main = crate::net::NetMain::global().expect("interface DPO requires the net owner");
+        let interfaces = main.interface_main();
+        let hardware = interfaces
+            .software_interface(dpo.index())
+            .and_then(|software| {
+                software.hw_if_index.or_else(|| {
+                    interfaces
+                        .software_interface(software.sup_sw_if_index)?
+                        .hw_if_index
+                })
+            })
+            .and_then(|index| interfaces.hardware_interface(index));
+        hardware
+            .and_then(|interface| {
+                interface
+                    .output_node_index
+                    .or_else(|| interfaces.output_node.get().copied())
+            })
+            .into_iter()
+            .collect()
     }
 
     pub fn delete_hardware_interface(&self, hw_if_index: u32) -> InterfaceResult<()> {
@@ -440,6 +702,7 @@ impl InterfaceMain {
         hw_if_index: u32,
         mut remove_file_interest: impl FnMut(u32),
     ) -> InterfaceResult<()> {
+        hammer_runtime::ensure_main_thread_with_barrier()?;
         let state = self.state_mut();
         let hw = state
             .hardware_interfaces
@@ -459,10 +722,12 @@ impl InterfaceMain {
         for index in hw.tx_queue_indices {
             state.tx_queues.remove(index);
         }
-        state
-            .addresses
-            .retain(|(interface, _)| *interface != hw.sw_if_index);
-        state.software_interfaces.remove(hw.sw_if_index);
+        state.feature.remove_interface(hw.sw_if_index);
+        if let Some(software) = state.software_interfaces.remove(hw.sw_if_index) {
+            for address in software.addresses {
+                state.addresses.remove(address);
+            }
+        }
         state.names.retain(|_, index| *index != hw_if_index);
         state.hardware_interfaces.remove(hw_if_index);
         Ok(())
@@ -503,12 +768,24 @@ impl InterfaceMain {
         self.hardware_interface(index).map(|hw| hw.name.clone())
     }
     pub fn interface_addresses(&self, index: u32) -> Vec<IpNet> {
-        self.state()
+        let state = self.state();
+        let Some(interface) = state.software_interfaces.get(index) else {
+            return Vec::new();
+        };
+        interface
             .addresses
             .iter()
-            .filter(|(item, _)| *item == index)
+            .filter_map(|index| state.addresses.get(*index))
             .map(|(_, address)| *address)
             .collect()
+    }
+    /// Returns a copy of an occupied address slot. Removal invalidates its
+    /// index; later insertion may reuse it, without moving other live slots.
+    pub fn interface_address(&self, index: u32) -> Option<IpNet> {
+        self.state()
+            .addresses
+            .get(index)
+            .map(|(_, address)| *address)
     }
     pub fn interface_mtu(&self, index: u32) -> Option<InterfaceMtu> {
         self.hardware_interface(index)
@@ -519,8 +796,7 @@ impl InterfaceMain {
         self.state()
             .addresses
             .iter()
-            .position(|(item, value)| *item == index && *value == address)
-            .and_then(|value| u32::try_from(value).ok())
+            .find_map(|(slot, (item, value))| (*item == index && *value == address).then_some(slot))
     }
 
     pub fn register_rx_queue(
@@ -664,35 +940,36 @@ impl InterfaceMain {
     }
     pub fn add_address(&self, sw_if_index: u32, address: IpNet) -> InterfaceResult<u32> {
         let state = self.state_mut();
-        if let Some(index) = state
-            .addresses
-            .iter()
-            .position(|(item, value)| *item == sw_if_index && *value == address)
-        {
-            return Ok(index as u32);
-        }
-        let index = state.addresses.len() as u32;
-        state.addresses.push((sw_if_index, address));
-        state
-            .software_interfaces
-            .get_mut(sw_if_index)
-            .ok_or(InterfaceError::NotRegistered {
+        let software = state.software_interfaces.get_mut(sw_if_index).ok_or(
+            InterfaceError::NotRegistered {
                 interface_index: sw_if_index,
-            })?
-            .addresses
-            .push(index);
+            },
+        )?;
+        if let Some(index) = state.addresses.iter().find_map(|(index, (item, value))| {
+            (*item == sw_if_index && *value == address).then_some(index)
+        }) {
+            return Ok(index);
+        }
+        let index = state.addresses.insert((sw_if_index, address));
+        software.addresses.push(index);
         Ok(index)
     }
     pub fn remove_address(&self, sw_if_index: u32, address: IpNet) -> InterfaceResult<bool> {
         let state = self.state_mut();
-        let Some(index) = state
-            .addresses
-            .iter()
-            .position(|(item, value)| *item == sw_if_index && *value == address)
-        else {
+        let software = state.software_interfaces.get_mut(sw_if_index).ok_or(
+            InterfaceError::NotRegistered {
+                interface_index: sw_if_index,
+            },
+        )?;
+        let Some(index) = state.addresses.iter().find_map(|(index, (item, value))| {
+            (*item == sw_if_index && *value == address).then_some(index)
+        }) else {
             return Ok(false);
         };
         state.addresses.remove(index);
+        if let Some(position) = software.addresses.iter().position(|slot| *slot == index) {
+            software.addresses.remove(position);
+        }
         Ok(true)
     }
 

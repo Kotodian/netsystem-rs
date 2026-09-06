@@ -40,6 +40,7 @@ byte-unit = { workspace = true }
 libc = { workspace = true }
 libloading = { workspace = true }
 object = { workspace = true }
+rand = { version = "0.9", default-features = false, features = ["small_rng"] }
 
 [target.'cfg(target_os = "linux")'.dependencies]
 core_affinity = { workspace = true }

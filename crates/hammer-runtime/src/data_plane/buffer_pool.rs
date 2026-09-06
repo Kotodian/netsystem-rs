@@ -15,7 +15,15 @@ impl DataPlaneMain {
         buffers: DataPlaneBuffers,
         simd_bytes: usize,
     ) -> RuntimeResult<Self> {
+        // Like vlib_main's clock seed, this is not cryptographic entropy.
+        // Seed once at runtime construction, never on the packet path.
+        let elapsed = match std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH) {
+            Ok(elapsed) => elapsed,
+            Err(error) => error.duration(),
+        };
+        let seed = elapsed.as_nanos() as u64 ^ u64::from(buffers.thread_index());
         Ok(Self {
+            random: Rc::new(RefCell::new(SmallRng::seed_from_u64(seed))),
             active_numa_node: buffers.active_numa_node(),
             buffers,
             nodes: NodeRuntime::default(),
@@ -24,7 +32,6 @@ impl DataPlaneMain {
                 hammer_core::data_plane::DEFAULT_BUFFER_FRAME_CAPACITY,
             )),
             handoff: None,
-            handoff_node_handle: None,
             trace: DataPlaneTrace::default(),
             simd_bytes,
             registry: crate::RuntimeRegistry::new(),
@@ -96,8 +103,8 @@ impl DataPlaneMain {
     }
 
     #[inline]
-    pub fn current_config(&self, index: Index) -> RuntimeResult<NodeId> {
-        Ok(self.buffers.current_config(index)?)
+    pub fn current_config_index(&self, index: Index) -> RuntimeResult<u32> {
+        Ok(self.buffers.current_config_index(index)?)
     }
 
     #[inline]
