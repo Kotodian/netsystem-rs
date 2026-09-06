@@ -177,13 +177,13 @@ impl Buffer {
     }
 
     #[inline]
-    pub fn current_config(&self) -> NodeId {
-        NodeId::new(self.cacheline0.current_config_or_punt)
+    pub fn current_config_index(&self) -> u32 {
+        self.cacheline0.current_config_or_punt
     }
 
     #[inline]
-    pub fn set_current_config(&mut self, next: NodeId) {
-        self.cacheline0.current_config_or_punt = next.slot();
+    pub fn set_current_config_index(&mut self, index: u32) {
+        self.cacheline0.current_config_or_punt = index;
     }
 
     #[inline]

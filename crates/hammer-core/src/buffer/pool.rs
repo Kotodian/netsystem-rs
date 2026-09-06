@@ -117,6 +117,37 @@ impl DataPlaneBuffers {
         self.try_buffers()?.alloc_index_with_bytes(bytes)
     }
 
+    /// Allocate an independent buffer containing the source's current segment
+    /// and opaque metadata. Chain links, trace ownership and errors are not inherited.
+    #[inline]
+    pub fn alloc_index_from(&self, source: Index) -> DataPlaneResult<Index> {
+        let buffers = self.try_buffers()?;
+        let mut cache = buffers.thread_cache.borrow_mut();
+        let mut arena = buffers.arena.inner.write();
+        let source = arena.buffer(source)?;
+        let offset = source.current_data_offset();
+        let length = source.current_len();
+        let bytes = source.current_ptr();
+        let opaque = *source.opaque();
+        let opaque2 = *source.opaque2();
+        arena.alloc_slot_with(&mut cache, |buffer, capacity| {
+            buffer.reset_empty(capacity, 0)?;
+            buffer.set_current_data_offset(isize::from(offset))?;
+            buffer.set_current_len(length)?;
+            *buffer.opaque_mut() = opaque;
+            *buffer.opaque2_mut() = opaque2;
+            // SAFETY: the arena write guard keeps the allocated source alive
+            // in its fixed backing. Allocation selects a distinct free slot;
+            // both current windows have the same valid offset and length.
+            unsafe {
+                buffer
+                    .current_mut_ptr()
+                    .copy_from_nonoverlapping(bytes, length);
+            }
+            Ok(())
+        })
+    }
+
     #[inline]
     fn drop_index_owned(&self, index: Index) {
         let Ok(buffers) = self.try_buffers() else {
@@ -246,13 +277,14 @@ impl DataPlaneBuffers {
     }
 
     #[inline]
-    pub fn current_config(&self, index: Index) -> DataPlaneResult<NodeId> {
-        self.try_buffers()?.current_config(index)
+    pub fn current_config_index(&self, index: Index) -> DataPlaneResult<u32> {
+        self.try_buffers()?.current_config_index(index)
     }
 
     #[inline]
-    pub fn set_current_config(&self, index: Index, next: NodeId) -> DataPlaneResult<()> {
-        self.try_buffers()?.set_current_config(index, next)
+    pub fn set_current_config_index(&self, index: Index, config_index: u32) -> DataPlaneResult<()> {
+        self.try_buffers()?
+            .set_current_config_index(index, config_index)
     }
 
     #[inline]
@@ -474,15 +506,22 @@ impl BufferPool {
     }
 
     #[inline]
-    fn current_config(&self, index: Index) -> DataPlaneResult<NodeId> {
-        Ok(self.arena.inner.read().buffer(index)?.current_config())
+    fn current_config_index(&self, index: Index) -> DataPlaneResult<u32> {
+        Ok(self
+            .arena
+            .inner
+            .read()
+            .buffer(index)?
+            .current_config_index())
     }
 
     #[inline]
-    fn set_current_config(&self, index: Index, next: NodeId) -> DataPlaneResult<()> {
+    fn set_current_config_index(&self, index: Index, config_index: u32) -> DataPlaneResult<()> {
         let mut guard = self.arena.inner.write();
         guard.ensure_header_exclusive(index)?;
-        guard.buffer_mut(index)?.set_current_config(next);
+        guard
+            .buffer_mut(index)?
+            .set_current_config_index(config_index);
         Ok(())
     }
 
