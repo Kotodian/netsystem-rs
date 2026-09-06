@@ -11,7 +11,8 @@ use hammer_runtime::{
 };
 
 use hammer_service::data_plane::set_index_node_error;
-use hammer_service::opaque::NetworkOpaque;
+use hammer_service::opaque::{NetworkFlags, NetworkOffloadFlags, NetworkOpaque};
+use rand::RngCore;
 
 #[hammer_component_macros::runtime_error(subsystem = "icmp")]
 #[derive(Debug, thiserror::Error)]
@@ -608,7 +609,11 @@ fn next_for_echo_request_index(
         if parsed.version != version {
             return Err(IcmpBuildError::WrongProtocol);
         }
-        build_echo_reply(buffer.current_mut(), &parsed)?;
+        let fragment_id = match parsed.version {
+            IpVersion::V4 => runtime.random().next_u32() as u16,
+            IpVersion::V6 => 0,
+        };
+        build_echo_reply(buffer.current_mut(), &parsed, fragment_id)?;
         Ok(parsed)
     });
     match reply {
@@ -621,6 +626,10 @@ fn next_for_echo_request_index(
             IcmpErrorMetadata::clear(buffer.opaque2_mut());
             // SAFETY: same initialized overlay; the packet remains owned by this frame.
             let network = unsafe { &mut *(buffer.opaque_mut() as *mut _ as *mut NetworkOpaque) };
+            network.flags = NetworkFlags::LOCALLY_ORIGINATED
+                | NetworkFlags::L4_CHECKSUM_COMPUTED
+                | NetworkFlags::L4_CHECKSUM_CORRECT;
+            network.oflags = NetworkOffloadFlags::empty();
             if parsed.version == IpVersion::V4 {
                 network.sw_if_index[0] = net.local_interface_sw_index();
             }
@@ -785,6 +794,14 @@ mod tests {
                 packet[header_len + 2..header_len + 4].copy_from_slice(&checksum.to_be_bytes());
                 let checksum = hammer_infra::checksum::internet_checksum(&packet[..header_len]);
                 packet[10..12].copy_from_slice(&checksum.to_be_bytes());
+            } else {
+                let checksum = hammer_infra::checksum::internet_checksum_parts(&[
+                    &packet[8..40],
+                    &(length as u32).to_be_bytes(),
+                    &[0, 0, 0, 58],
+                    &packet[40..packet_len],
+                ]);
+                packet[42..44].copy_from_slice(&checksum.to_be_bytes());
             }
             let mut frame = runtime.buffers().get_next_frame(input)?;
             let index = runtime
@@ -821,21 +838,49 @@ mod tests {
                 runtime.get_buffer(index)?.node_error_index(),
                 expected_error
             );
-            if version == IpVersion::V4 && error.is_none() {
+            if error.is_none() {
+                let mut expected_random = runtime.random().clone();
+                let fragment_id = expected_random.next_u32() as u16;
                 let next = runtime.with_current_node(echo, || {
                     next_for_echo_request_index(runtime, index, version)
                 })?;
                 assert_eq!(
                     runtime.nodes().node_next_slot(echo, usize::from(next))?,
-                    runtime.node_by_name("ip4-lookup").unwrap()
+                    runtime
+                        .node_by_name(if version == IpVersion::V4 {
+                            "ip4-lookup"
+                        } else {
+                            "ip6-lookup"
+                        })
+                        .unwrap()
                 );
                 let buffer = runtime.get_buffer(index)?;
                 let reply = buffer.current();
-                assert_eq!(&reply[12..16], &packet[16..20]);
-                assert_eq!(&reply[16..20], &packet[12..16]);
-                assert_eq!(&reply[20..22], &[0, code]);
-                assert_eq!(hammer_infra::checksum::internet_checksum(&reply[..20]), 0);
-                assert_eq!(hammer_infra::checksum::internet_checksum(&reply[20..]), 0);
+                if version == IpVersion::V4 {
+                    assert_eq!(&reply[4..6], &fragment_id.to_be_bytes());
+                    assert_eq!(reply[8], 64);
+                    assert_eq!(&reply[12..16], &packet[16..20]);
+                    assert_eq!(&reply[16..20], &packet[12..16]);
+                    assert_eq!(&reply[20..22], &[0, code]);
+                    assert_eq!(hammer_infra::checksum::internet_checksum(&reply[..20]), 0);
+                    assert_eq!(hammer_infra::checksum::internet_checksum(&reply[20..]), 0);
+                } else {
+                    assert_eq!(reply[7], 64);
+                    assert_eq!(&reply[8..24], &packet[24..40]);
+                    assert_eq!(&reply[24..40], &packet[8..24]);
+                    assert_eq!(&reply[40..42], &[129, code]);
+                    assert_eq!(
+                        hammer_infra::checksum::internet_checksum_parts(&[
+                            &reply[8..40],
+                            &(length as u32).to_be_bytes(),
+                            &[0, 0, 0, 58],
+                            &reply[40..],
+                        ]),
+                        0
+                    );
+                }
+                let network = unsafe { &*(buffer.opaque() as *const _ as *const NetworkOpaque) };
+                assert!(network.flags.contains(NetworkFlags::LOCALLY_ORIGINATED));
             }
         }
         assert_eq!(runtime.buffers().in_use_buffers(), 0);

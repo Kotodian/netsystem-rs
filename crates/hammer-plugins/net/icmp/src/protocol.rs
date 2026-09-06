@@ -36,7 +36,11 @@ pub enum IcmpBuildError {
 
 /// IP local has already validated the complete message checksum. Only the
 /// first buffer's headers change; payload and chain ownership remain untouched.
-pub fn build_echo_reply(packet: &mut [u8], parsed: &ParsedIpPacket) -> Result<(), IcmpBuildError> {
+pub fn build_echo_reply(
+    packet: &mut [u8],
+    parsed: &ParsedIpPacket,
+    fragment_id: u16,
+) -> Result<(), IcmpBuildError> {
     let ip_offset = parsed.network_header_offset;
     let icmp_offset = parsed.transport_header_offset;
     let (request, reply, ip_length) = match (parsed.version, parsed.protocol) {
@@ -78,6 +82,7 @@ pub fn build_echo_reply(packet: &mut [u8], parsed: &ParsedIpPacket) -> Result<()
     match parsed.version {
         IpVersion::V4 => {
             ip[12..20].rotate_left(4);
+            ip[4..6].copy_from_slice(&fragment_id.to_be_bytes());
             ip[8] = 64;
             ip[10..12].fill(0);
             let checksum = internet_checksum(ip);
@@ -128,7 +133,8 @@ mod tests {
 
         for first_segment_len in [request.len(), 28] {
             let mut reply = request;
-            build_echo_reply(&mut reply[..first_segment_len], &parsed).unwrap();
+            build_echo_reply(&mut reply[..first_segment_len], &parsed, 0x1234).unwrap();
+            assert_eq!(&reply[4..6], &0x1234u16.to_be_bytes());
             assert_eq!(&reply[12..16], &destination);
             assert_eq!(&reply[16..20], &source);
             assert_eq!(&reply[20..22], &[0, 0]);
@@ -170,7 +176,7 @@ mod tests {
 
             for first_segment_len in [request.len(), 48] {
                 let mut reply = request;
-                build_echo_reply(&mut reply[..first_segment_len], &parsed).unwrap();
+                build_echo_reply(&mut reply[..first_segment_len], &parsed, 0).unwrap();
                 assert_eq!(&reply[8..24], &destination);
                 assert_eq!(&reply[24..40], &source);
                 assert_eq!(&reply[40..42], &[129, 0]);
