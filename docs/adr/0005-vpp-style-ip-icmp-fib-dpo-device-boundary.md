@@ -2632,6 +2632,11 @@ Echo replies instead modify the received packet in place, preserving its
 chain and updating addresses, TTL/hop-limit and checksums as the concrete
 VPP echo nodes do. ICMP type registration uses the owner Main and existing
 graph initialization/publication scope, not an erased runtime registry.
+IPv4 input dispatches by ICMP type without imposing IPv6 code validation.
+The echo writer preserves the received code while changing the request type
+and incrementally updating the checksum, as in `plugins/ping/ping.c`.
+IPv6 code validation belongs to ICMPv6 input before echo dispatch; the shared
+writer must not add a second rejection policy.
 
 The IP owner keeps the FIB-linked tracker, the interposed DPO and the
 IP-null-action table as concrete state. `IpRoutePathBehavior` remains an
@@ -2977,6 +2982,7 @@ next enum, `thread_local!` local registration, atomic FIB handle, or
 | API | `NetMain::{publish_load_balance_root,retire_load_balance_root,publish_replicate_root,retire_replicate_root}`、具体对象的 `publish_root`/`withdraw_root` | 删除额外的 root 生命周期包装 | 调用者在现有 publication scope 内使用 `lock_dpo`/`unlock_dpo`；无兼容 alias 或 wire 变化 | FIB/bucket 引用保留、撤销与 pool 回收场景 |
 | 类型/API | ICMP-owned error node/source snapshots | error nodes、metadata、generation 移回 IP；删除 source snapshots、runtime wrapper registries、ArcSwap 发布 | 无 compatibility re-export；ICMP 只保留 local | workspace compile, packet ownership and source-selection tests |
 | 类型/API | `IcmpInputControlPlane`, `IcmpInputSnapshot`, `IcmpInputSnapshotHandle`, `IcmpInputRuntime`, `IcmpGeneratedPacket`, error builders and ICMP `arc-swap` dependency | delete duplicate publication/runtime registries and intermediate response storage | type table belongs to `IcmpMain`; error writing belongs to IP; echo borrows the original packet | native graph dispatch and buffer-chain ownership tests |
+| error variants | ICMP `IcmpBuildError::BadCode`, `IcmpNodeError::BadCode` and echo descriptor/conversion | remove the non-native echo-writer code rejection; retain `IcmpInputError::BadCode` for IPv6 input | source-breaking exhaustive-match cleanup; no wire or persisted-state migration, remaining discriminants unchanged | actual IPv4 input/echo traversal preserves code and checksum; IPv6 invalid-code still punts |
 | 类型/API | ICMP `IcmpPathMtuNode`, `icmp_path_mtu_process`, `icmp_path_mtu_process_frame`, `update_path_mtu_from_index`, `collect_current_chain_for_icmp_generation`; IP `apply_ipv4_frag_needed_icmp`, `process_ipv4_icmp_path_mtu_packet` | delete non-native automatic ICMP PMTU learning, its graph image entry and payload collection; no new replacement type/API | breaking removal without aliases; the only production parser caller was the deleted node; no persisted data or Binary API envelope migration; retain IP-owned control updates | deletion/caller audit and ordinary ICMP type dispatch; separate IP PMTU control tests |
 | API | `register_ip4_error` / `register_ip6_error`; proposed `register_ip4_icmp_error_node` / `register_ip6_icmp_error_node` | 删除错误地注册 local protocol 的接口；不实现 error-consumer registration | producer 使用 IP-owned metadata 和 concrete named next | IP-only error graph execution |
 | 类型 | `hammer-service::net::fib::FibEntrySrcRelation` | 删除独立的 cover/sibling/interpose 关系枚举；cover/sibling 事实直接存放在 `FibEntrySrc.cover` 元组，interpose 事实存放在可选的 `FibEntrySrc.interpose_dpo` | 无兼容 alias；实现直接迁移到字段访问，文档和源码不得保留该类型 | 文档 inventory 检查、源码编译和 source-lifecycle 行为测试 |

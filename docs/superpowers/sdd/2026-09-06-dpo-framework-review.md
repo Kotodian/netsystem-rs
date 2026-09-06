@@ -11,6 +11,56 @@ remain incomplete; no finding is closed merely by adding a node declaration.
 
 ### Findings and implementation status
 
+Approved handoff migration (2026-09-06): runtime queues now carry destination
+`NodeId` and receiving workers dispatch directly, matching
+`vlib/handoff.c:165-215,720-726`. Unlike VPP's destination-bound queue, Hammer's
+existing queue is per worker, so the target stays in each queued frame. Buffer
+feature cursors are untouched. IP reassembly, TCP and UDP callers migrate
+together; the service trampoline, continuation arguments, redundant batch
+overload and handoff-specific handle configuration/state/errors are deleted.
+Generic NodeHandle registration and queue release/acquire publication remain
+unchanged. Successful publication transfers ownership; failed single enqueue
+retains it, and a partially published batch leaves only unsent indices in the
+source frame. No new public type/API, field, lock or packet metadata is added.
+The runtime regression uses actual OS worker threads and graph dispatch for
+single-index/batch handoff, invalid target, full-queue retry, cursor/payload
+preservation and exact buffer reclamation. IC01 is closed by this replacement
+and its passing cross-worker regression. Other IC findings remain separately
+tracked; this does not change the whole-feature verdict.
+
+Final pre-commit gate for the handoff and echo code/checksum slice:
+
+- `cargo check -p hammer-runtime -p hammer-service -p hammer-plugin-ip -p hammer-plugin-icmp -p hammer-plugin-tcp -p hammer-plugin-udp --all-targets --message-format=short`: passed.
+- Scoped clippy on the same six packages/all targets: exit 0 with warnings;
+  not a warning-free verdict. Final checksum correction was compiled by the
+  subsequent test gate.
+- `cargo fmt --all -- --check` and `git diff --check`: passed.
+- `cargo test -p hammer-runtime -p hammer-plugin-ip -p hammer-plugin-icmp --lib`:
+  9 passed (4 runtime graph/barrier/handoff, 2 IP, 3 ICMP).
+- `cargo test -p hammer-service --test interface_features`: 1 passed.
+
+Tests required execution outside the sandbox for Buffer Arena shared-memory
+creation. An earlier runtime executable failed at dyld symbol resolution;
+cleaning only runtime build artifacts and rebuilding the related unit-test
+packages together resolved it. No workspace-wide tests or local TUN/lab ran.
+No post-commit test suite is part of this slice.
+
+Echo code-policy correction: vendored `icmp4.c::ip4_icmp_input` dispatches by
+type, and `plugins/ping/ping.c::ip4_icmp_echo_request` updates the type without
+rejecting or replacing the code. The shared writer's extra code rejection and
+its `IcmpBuildError`/`IcmpNodeError` variants are removed. ICMPv6 input retains
+its native invalid-code check. The existing registration test now checks
+IPv4/IPv6 table isolation and follows IPv4 requests with code zero/nonzero
+through the real echo node, verifying lookup next, addresses and checksums.
+No new type/API or trace change is part of this correction. This does not
+resolve the separate host TTL, IPv4 fragment-ID or origin-state gaps in IC08.
+The zero-ID/sequence/body case exposed an incremental-checksum zero boundary:
+the writer now follows `ip_packet.h::ip_csum_update_inline` by adding the old
+type to the complemented checksum, subtracting the new type with end-around
+borrow, then folding. This preserves the valid negative-zero checksum for an
+all-zero IPv4 echo reply. The graph fixture also supplies the transport payload
+offset required by the existing opaque cursor encoding.
+
 IC02 implementation update: service `PuntNode` now uses ordinary graph-node
 initialization only. IP's existing concrete punt nodes use explicit graph init
 callbacks to register PUNT/IP4 and PUNT/IP6 with their own node identities and

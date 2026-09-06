@@ -48,6 +48,11 @@ A worker operating-system thread that owns one `DataPlaneMain` and executes
 packet graph nodes, frames, buffers, handoff work, and worker-local readiness.
 _Avoid_: main thread, control thread
 
+**Worker Handoff**:
+Transfer of packet ownership to another Data Worker at an explicit graph
+destination, independent of the packet's current Feature Arc position.
+_Avoid_: feature continuation, intermediary handoff node
+
 **Process Node**:
 A cooperative control-plane execution context scheduled on the main operating-
 system thread. In Hammer it is represented by one Tokio task and may suspend

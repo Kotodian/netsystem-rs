@@ -519,10 +519,39 @@ impl Buffer {
 ```
 
 The same rename and `u32` contract propagates through `DataPlaneBuffers` and
-the buffer-pool forwarding methods. Existing handoff code stores
-`resolved_node.slot()` and reconstructs `NodeId::new(current_config_index)` at
-its own seam; the buffer header does not claim that every use of the cursor is
-a node identity. `NetworkOpaque` gains no Feature Arc field or accessor.
+the buffer-pool forwarding methods. Handoff never reads or writes this cursor.
+Its existing queued frame carries the actual destination `NodeId`; the
+receiving worker enqueues directly to that node, preserving in-progress
+Feature Arc state. `NetworkOpaque` gains no Feature Arc field or accessor.
+
+Explicit approval on 2026-09-06 replaces both existing handoff signatures:
+
+```rust
+impl DataPlaneMain {
+    pub fn handoff_index(&self, worker: DataWorkerId, target: NodeId, index: Index)
+        -> RuntimeResult<()>;
+    pub fn handoff_frame(&self, worker: DataWorkerId, target: NodeId, frame: &mut BufferFrame)
+        -> RuntimeResult<()>;
+}
+```
+
+There is no continuation argument, intermediary `HandoffNode`, handoff-specific
+handle configuration or `handoff_indices` overload. Generic `NodeHandle`
+registration remains independent and unchanged. IP reassembly carries real
+input/reassembly node identities, TCP resolves its existing session next edge,
+and UDP uses the datagram's existing return node. The graph must already be
+installed on the receiving worker before enqueue.
+
+The source owns each buffer until successful queue publication; the receiver
+then owns its dispatch and frame reclamation. A rejected single enqueue leaves
+ownership with the caller. Batch success removes only published indices from
+the source frame; queue exhaustion before publication leaves it unchanged,
+and a concurrent producer may cause a partially published batch whose remaining
+indices stay in that frame. Existing queue release/acquire publication is
+unchanged; no new synchronization primitive is added. This matches vendored
+`vlib/handoff.c` dequeue-to-`hqm->node_index` semantics; Hammer carries the
+target in each queued frame because its existing queues are per worker rather
+than per graph destination. Neither design stores the target in packet metadata.
 
 An arc index is needed only by the start node selecting an arc. After
 `start_feature_arc`, the globally shared heap index is sufficient, exactly as
@@ -907,7 +936,9 @@ protocol changes.
 | type/module | `hammer-service::feature_arc` -> private `hammer-service::interface::feature` | generic handle module becomes `InterfaceMain` implementation | source-breaking module move; no re-export alias | workspace compile and ownership test |
 | type | `InterfaceMain`/private `InterfaceState` | adds private `feature: FeatureState`; owns registration and all `sw_if_index` keyed configuration | no `NetMain::feature_main()` or separate Feature Main | initialization, interface lifecycle and access tests |
 | type | `Ip4Main`, `Ip6Main` | local-next becomes separate `[u16; 256]`; each adds only its concrete local arc index | existing other ADR-0005 fields unchanged | initialization and independent-table tests |
-| type/API | `Buffer`, `DataPlaneBuffers`, buffer-pool forwarding methods | preserve existing `current_config_or_punt: u32`; replace NodeId-typed `current_config`/`set_current_config` accessors with `current_config_index() -> u32` and `set_current_config_index(u32)` | handoff explicitly converts at its own seam; no buffer layout change | compile, header layout, handoff and feature-chain tests |
+| type/API | `Buffer`, `DataPlaneBuffers`, buffer-pool forwarding methods | preserve existing `current_config_or_punt: u32`; replace NodeId-typed `current_config`/`set_current_config` accessors with `current_config_index() -> u32` and `set_current_config_index(u32)` | handoff leaves cursor untouched; no buffer layout change | compile, header layout, handoff and feature-chain tests |
+| type/API | runtime `HandoffFrame`, `DataPlaneMain::{handoff_index,handoff_frame}` | existing target becomes `NodeId`; remove continuation argument; receiving worker directly dispatches to target | all IP/TCP/UDP callers migrate together; queue ownership and publication unchanged | cross-thread dispatch, cursor preservation, full-queue retry and frame reclamation |
+| type/API | IP `IpReassemblyHandoff::{new,reassembly,input}`, TCP `TcpInputControlPlane::node` and private input runtime, UDP worker | IP constructor/fields/getters use `NodeId`; TCP retains only worker selection and resolves session next; UDP uses existing return node | source-breaking argument changes; no replacement carrier or alias | plugin all-target compilation and runtime handoff regression |
 | proc macros | `#[feature_arc]`, `#[feature]` | attributes move from marker enum/trait generation to direct registration methods on real graph-node structs；arc/start/end/order arguments are Graph Node type paths，name 来自 `NODE_NAME`；arc head gains `FEATURE_ARC_NAME`；完整 expansion 见 Decision | invocation syntax breaking；no generated state/image/barrier | macro expansion compile and plugin init tests |
 | API | `NodeRuntime::add_node_next_slot` | one-edge call uses the batch implementation；actual main-graph insertion requests ADR-0003 refork，existing edge is a no-op | behavior change only for worker visibility | single-edge and live worker graph tests |
 | API | `register_ip4_protocol`, `register_ip6_protocol` | 接受 startup `&NodeRuntime` borrow，add next on concrete local root and update only matching table | signatures remain explicit; shared implementation removed | ICMP/TCP/UDP registration tests |
@@ -924,7 +955,9 @@ protocol changes.
 | types | `IpLocalNode`, `IpReceiveNode`, `IpLocalArc`, `IpLocalNext`, `IpLocalError`, `IpLocalControlPlane`, `IpLocalState`, `IpLocalStateHandle`, `IpLocalRuntime`, `IpLocalSourceCheck` | shared protocol node/state/snapshot/registry model | concrete IPv4/IPv6 nodes and Main fields | workspace compile and local behavior tests |
 | state | process-wide IP-local `Mutex<Vec<_>>` and all local `ArcSwap` snapshots | packet-path shared lookup and atomic publication | Main-owned tables and service feature heap | concurrency audit and packet benchmark |
 | fields/APIs | `NetworkOpaque::feature_arc_index`, `NetworkOpaque::{feature_config_index,set_feature_config_index}` | redundant arc identity and IP-private feature cursor | start node keeps arc index; generic `Buffer` keeps current config index | opaque layout and graph-chain tests |
-| APIs | NodeId-typed `Buffer`/pool/runtime `current_config` and `set_current_config` | buffer-wide claim that the generic cursor is always a node identity | generic `u32` accessors; handoff performs explicit conversion | workspace compile and handoff test |
+| APIs | NodeId-typed `Buffer`/pool/runtime `current_config` and `set_current_config` | buffer-wide claim that the generic cursor is always a node identity | generic `u32` accessors; handoff does not access cursor | scoped compile and handoff test |
+| type/registration/API | service `HandoffNode`, its process function and registration image entry; runtime `handoff_indices` | intermediary dispatch and redundant overload | direct queue destination; no compatibility trampoline | registration/caller removal audit and graph execution |
+| fields/APIs/errors | `WorkerHandoff::node_handle`, `DataPlaneMain::handoff_node_handle` and its setter/getter/startup plumbing; `HandoffDispatchContextMissing`, `HandoffNodeHandleMissing` | handoff-only handle state and obsolete dispatch errors | remove `node_handle` from worker handoff configuration; no persisted state or buffer-layout migration; generic handle registration retained | all-target compilation, configuration/caller audit |
 
 Every inventory row is a source-level change. There is no Binary API, database,
 file-format, buffer-layout, or cross-process shared-memory schema addition in
@@ -1020,9 +1053,10 @@ wire, graph, failure-atomicity, and packet-path contracts remain unchanged.
 - `crates/hammer-service/src/opaque.rs` contains both the unused
   `feature_arc_index` field and feature configuration accessors in the IP
   opaque reserve.
-- `crates/hammer-core/src/buffer/header.rs` already contains the generic
-  `current_config_or_punt: u32` field, but its current accessors reinterpret it
-  as `NodeId`; handoff is the only current consumer of that interpretation.
+- Baseline `crates/hammer-core/src/buffer/header.rs` reinterpreted the generic
+  `current_config_or_punt: u32` field as `NodeId`. The approved migration
+  removes that interpretation and removes handoff's use of the cursor;
+  runtime handoff queues carry the destination node independently.
 - `crates/hammer-runtime/src/node.rs` keeps `NodeRuntime` in
   `Rc<RefCell<_>>`, so it cannot be stored in shared `InterfaceMain` state. Its
   current one-edge mutation validates before insertion but does not provide an
