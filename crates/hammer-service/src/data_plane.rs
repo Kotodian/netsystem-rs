@@ -63,22 +63,6 @@ impl DropNode {
     }
 }
 
-#[hammer_component_macros::graph_node(
-    graph = service,
-    init = crate::data_plane::register_handoff,
-)]
-#[derive(Debug, Clone, Copy, Default)]
-pub struct HandoffNode;
-
-impl HandoffNode {
-    pub const NODE_NAME: &'static str = "handoff";
-
-    #[inline]
-    pub fn new() -> Self {
-        Self
-    }
-}
-
 pub fn register_drop(runtime: &DataPlaneMain) -> RuntimeResult<NodeId> {
     let node = runtime.nodes().try_register_internal(DropNode)?;
     NetMain::global()?
@@ -100,12 +84,6 @@ pub fn register_drop(runtime: &DataPlaneMain) -> RuntimeResult<NodeId> {
             },
         )?;
     Ok(node)
-}
-
-pub fn register_handoff(runtime: &DataPlaneMain) -> RuntimeResult<NodeId> {
-    runtime
-        .nodes()
-        .register_internal_with_handle(runtime.handoff_node_handle()?, HandoffNode)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
@@ -182,58 +160,6 @@ fn drop_node_process(
 }
 
 impl InternalNode for DropNode {
-    #[inline]
-    fn node_registration(&self) -> Option<NodeRegistration>
-    where
-        Self: Sized,
-    {
-        Some(NodeRegistration::next(Self::NODE_NAME, 0))
-    }
-}
-
-impl Node for HandoffNode {
-    #[inline(always)]
-    fn process(&mut self, _runtime: &DataPlaneMain, _frame: &mut BufferFrame) -> () {
-        ()
-    }
-
-    #[inline]
-    fn node_process(&self) -> NodeProcessFn {
-        handoff_node_process
-    }
-}
-
-fn handoff_node_process(
-    runtime: &DataPlaneMain,
-    _data: hammer_runtime::node::NodeRuntimeData,
-    frame: &mut BufferFrame,
-) -> () {
-    // Handoff interprets the generic cursor as its destination node slot.
-    // Direct get/push/put is allowed for Handoff; Graph Fanout stays worker-local
-    // and does not resolve cross-worker continuation identities.
-    let indices: Vec<_> = frame.indices().iter().copied().collect();
-    frame.discard_prefix(indices.len());
-    for index in indices {
-        let next = NodeId::new(
-            runtime
-                .current_config_index(index)
-                .expect("handoff buffer must carry a continuation next"),
-        );
-        let mut next_frame = runtime
-            .buffers()
-            .get_next_frame(next)
-            .expect("handoff continuation next frame");
-        next_frame
-            .push_index(index)
-            .expect("handoff continuation push");
-        runtime
-            .put_next_frame(next_frame)
-            .expect("handoff continuation put");
-    }
-    ()
-}
-
-impl InternalNode for HandoffNode {
     #[inline]
     fn node_registration(&self) -> Option<NodeRegistration>
     where
