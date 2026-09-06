@@ -974,7 +974,31 @@ impl NodeRuntimeInner {
     fn add_node_next_slots(
         &mut self,
         edges: &[(NodeId, NodeId)],
+        shared_slots: &[std::ops::Range<usize>],
     ) -> RuntimeResult<(Vec<u16>, bool)> {
+        for group in shared_slots {
+            assert!(
+                group.start < group.end && group.end <= edges.len(),
+                "shared-slot constraints must name nonempty ranges in the edge batch"
+            );
+        }
+        let validate_slots = |slots: &[u16]| -> RuntimeResult<()> {
+            for group in shared_slots {
+                let expected = slots[group.start];
+                for index in group.clone() {
+                    if slots[index] != expected {
+                        let (node, next) = edges[index];
+                        return Err(RuntimeError::NodeNextSlotMismatch {
+                            node,
+                            next,
+                            actual: slots[index],
+                            expected,
+                        });
+                    }
+                }
+            }
+            Ok(())
+        };
         let mut existing_slots = Vec::with_capacity(edges.len());
         for &(node, next) in edges {
             self.validate_node(node)?;
@@ -990,13 +1014,12 @@ impl NodeRuntimeInner {
             );
         }
         if existing_slots.iter().all(Option::is_some) {
-            return Ok((
-                existing_slots
-                    .into_iter()
-                    .map(|slot| slot.expect("all graph edges were present"))
-                    .collect(),
-                false,
-            ));
+            let slots = existing_slots
+                .into_iter()
+                .map(|slot| slot.expect("all graph edges were present"))
+                .collect::<Vec<_>>();
+            validate_slots(&slots)?;
+            return Ok((slots, false));
         }
 
         let original_next_nodes = self.next_nodes.clone();
@@ -1047,6 +1070,11 @@ impl NodeRuntimeInner {
                 slot
             };
             slots.push(slot);
+        }
+        if let Err(error) = validate_slots(&slots) {
+            self.next_nodes = original_next_nodes;
+            self.pending_next_names = original_pending_next_names;
+            return Err(error);
         }
         let changed = self.next_nodes != original_next_nodes;
         Ok((slots, changed))
@@ -1744,11 +1772,18 @@ impl NodeRuntime {
     }
 
     pub fn add_node_next_slot(&self, node: NodeId, next: NodeId) -> RuntimeResult<u16> {
-        self.add_node_next_slots(&[(node, next)])
+        self.add_node_next_slots(&[(node, next)], &[])
             .map(|mut slots| slots.pop().expect("one edge produces one slot"))
     }
 
-    pub fn add_node_next_slots(&self, edges: &[(NodeId, NodeId)]) -> RuntimeResult<Vec<u16>> {
+    /// Adds a batch atomically. Each nonempty range in `shared_slots` names
+    /// edges that must resolve to the same next slot; rejection changes no
+    /// topology and requests no worker refork.
+    pub fn add_node_next_slots(
+        &self,
+        edges: &[(NodeId, NodeId)],
+        shared_slots: &[std::ops::Range<usize>],
+    ) -> RuntimeResult<Vec<u16>> {
         self.ensure_topology_owner()?;
         let workers_running =
             crate::barrier::global().is_some_and(|barrier| barrier.worker_count() != 0);
@@ -1768,7 +1803,7 @@ impl NodeRuntime {
             }
         }
         let mut inner = self.inner.borrow_mut();
-        let (slots, changed) = inner.add_node_next_slots(edges)?;
+        let (slots, changed) = inner.add_node_next_slots(edges, shared_slots)?;
         drop(inner);
         if changed && workers_running {
             GlobalMain::with_current(|main| main.request_worker_graph_refork())
