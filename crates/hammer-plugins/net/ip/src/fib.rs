@@ -796,6 +796,8 @@ mod tests {
         for hardware in hardware_interfaces {
             interfaces.delete_hardware_interface(hardware).unwrap();
         }
+        crate::local::tests::receive_interface_and_checksum(runtime).unwrap();
+        crate::icmp_error::error_response_source_and_origin(runtime)?;
         main.close()?;
         GlobalMain::uninstall_current();
         Ok(())

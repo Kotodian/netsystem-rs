@@ -9,7 +9,7 @@ use hammer_runtime::{
     DataPlaneMain, Node, NodeProcessFn, NodeRuntimeData, RuntimeError, RuntimeResult,
 };
 use hammer_service::net::{NetMain, throttle::Throttle};
-use hammer_service::opaque::NetworkOpaque;
+use hammer_service::opaque::{NetworkFlags, NetworkOffloadFlags, NetworkOpaque};
 
 use crate::lookup::{IP4_MAIN, IP6_MAIN};
 use crate::protocol::icmp::{IcmpErrorFamily, IcmpErrorMetadata};
@@ -325,7 +325,11 @@ fn generate_error(
     let Some(interface) = interfaces.software_interface(rx) else {
         return Ok(IcmpError::NoSource);
     };
-    let interface = match interface.unnumbered_sw_if_index {
+    let link_local = matches!(destination, IpAddr::V6(address)
+        if address.is_unicast_link_local() || address.segments()[..2] == [0xff02, 0]);
+    // ip6_sas_by_sw_if_index uses the original interface for link scope;
+    // only ordinary address selection follows an unnumbered association.
+    let interface = match interface.unnumbered_sw_if_index.filter(|_| !link_local) {
         Some(index) => match interfaces.software_interface(index) {
             Some(interface) => interface,
             None => return Ok(IcmpError::NoSource),
@@ -344,9 +348,7 @@ fn generate_error(
                 (u32::from(address) ^ u32::from(destination)).leading_zeros()
             }
             (IpAddr::V6(address), IpAddr::V6(destination)) => {
-                if (destination.is_unicast_link_local() || destination.segments()[0] == 0xff02)
-                    && !address.is_unicast_link_local()
-                {
+                if link_local && !address.is_unicast_link_local() {
                     continue;
                 }
                 (u128::from(address) ^ u128::from(destination)).leading_zeros()
@@ -418,6 +420,10 @@ fn generate_error(
     IcmpErrorMetadata::clear(buffer.opaque2_mut());
     // SAFETY: the response inherited the initialized IP overlay from its source.
     let network = unsafe { &mut *(buffer.opaque_mut() as *mut _ as *mut NetworkOpaque) };
+    network.flags = NetworkFlags::LOCALLY_ORIGINATED
+        | NetworkFlags::L4_CHECKSUM_COMPUTED
+        | NetworkFlags::L4_CHECKSUM_CORRECT;
+    network.oflags = NetworkOffloadFlags::empty();
     network.set_packet_cursor(
         BufferPacketCursor::new()
             .with_packet_len(length)
@@ -436,4 +442,140 @@ fn generate_error(
         (IcmpErrorFamily::Ipv6, 2) => IcmpError::PacketTooBigSent,
         _ => IcmpError::BadRequest,
     })
+}
+
+#[cfg(test)]
+pub(crate) fn error_response_source_and_origin(runtime: &DataPlaneMain) -> RuntimeResult<()> {
+    use hammer_core::data_plane::NodeKind;
+    use hammer_runtime::node::NodeDescriptor;
+    let interfaces = NetMain::global()?.interface_main();
+    let hardware = interfaces.register_hardware_interface(0, 0, 0, 0)?;
+    let rx = interfaces
+        .hardware_interface(hardware)
+        .unwrap()
+        .sw_if_index();
+    for address in ["192.0.2.1/24", "2001:db8::1/64", "fe80::1/64"] {
+        interfaces.add_address(rx, address.parse().unwrap())?;
+    }
+    let output = runtime.nodes().try_register_descriptor(
+        NodeKind::Internal,
+        NodeDescriptor::new(
+            |runtime, _, frame| {
+                assert_eq!(frame.len(), 1);
+                let buffer = runtime.get_buffer(frame.indices()[0]).unwrap();
+                let packet = buffer.current();
+                let network = unsafe { &*(buffer.opaque() as *const _ as *const NetworkOpaque) };
+                assert!(network.flags.contains(NetworkFlags::LOCALLY_ORIGINATED));
+                assert!(network.flags.contains(
+                    NetworkFlags::L4_CHECKSUM_COMPUTED | NetworkFlags::L4_CHECKSUM_CORRECT
+                ));
+                assert!(network.oflags.is_empty());
+                assert!(IcmpErrorMetadata::read(buffer.opaque2()).is_none());
+                match packet[0] >> 4 {
+                    4 => {
+                        assert_eq!(&packet[12..16], &[192, 0, 2, 1]);
+                        assert_eq!(&packet[16..20], &[192, 0, 2, 2]);
+                        assert_eq!(internet_checksum(&packet[..20]), 0);
+                        assert_eq!(internet_checksum(&packet[20..]), 0);
+                        assert_eq!(&packet[20..22], &[11, 0]);
+                        assert_eq!(packet[28] >> 4, 4);
+                    }
+                    6 => {
+                        assert_eq!(
+                            &packet[8..24],
+                            &"fe80::1".parse::<std::net::Ipv6Addr>().unwrap().octets()
+                        );
+                        assert_eq!(
+                            &packet[24..40],
+                            &"fe80::2".parse::<std::net::Ipv6Addr>().unwrap().octets()
+                        );
+                        assert_eq!(
+                            internet_checksum_parts(&[
+                                &packet[8..40],
+                                &((packet.len() - 40) as u32).to_be_bytes(),
+                                &[0, 0, 0, 58],
+                                &packet[40..],
+                            ]),
+                            0
+                        );
+                        assert_eq!(&packet[40..42], &[3, 0]);
+                        assert_eq!(packet[48] >> 4, 6);
+                    }
+                    version => panic!("unexpected response IP version {version}"),
+                }
+            },
+            NodeRuntimeData::empty(),
+            None,
+            &[],
+            None,
+        ),
+    )?;
+    for (family, node, metadata) in [
+        (
+            IcmpErrorFamily::Ipv4,
+            register_ip4_icmp_error(runtime)?,
+            IcmpErrorMetadata::ipv4_time_exceeded(),
+        ),
+        (
+            IcmpErrorFamily::Ipv6,
+            register_ip6_icmp_error(runtime)?,
+            IcmpErrorMetadata::ipv6_time_exceeded(),
+        ),
+    ] {
+        runtime.nodes().set_node_next_slot(node, 1, output)?;
+        let mut packet = vec![
+            0;
+            if family == IcmpErrorFamily::Ipv4 {
+                28
+            } else {
+                48
+            }
+        ];
+        if family == IcmpErrorFamily::Ipv4 {
+            packet[0] = 0x45;
+            packet[2..4].copy_from_slice(&28u16.to_be_bytes());
+            packet[9] = 17;
+            packet[12..16].copy_from_slice(&[192, 0, 2, 2]);
+            packet[16..20].copy_from_slice(&[198, 51, 100, 1]);
+        } else {
+            packet[0] = 0x60;
+            packet[4..6].copy_from_slice(&8u16.to_be_bytes());
+            packet[6] = 17;
+            packet[8..24]
+                .copy_from_slice(&"fe80::2".parse::<std::net::Ipv6Addr>().unwrap().octets());
+            packet[24..40].copy_from_slice(
+                &"2001:db8::2"
+                    .parse::<std::net::Ipv6Addr>()
+                    .unwrap()
+                    .octets(),
+            );
+        }
+        let mut frame = runtime.buffers().get_next_frame(node)?;
+        let index = runtime.alloc_index_with_bytes(&packet)?;
+        frame.push_index(index)?;
+        {
+            let mut buffer = runtime.get_buffer_mut(index)?;
+            let mut network = NetworkOpaque::default();
+            network.sw_if_index[0] = rx;
+            network.oflags = NetworkOffloadFlags::UDP_CHECKSUM;
+            unsafe { (buffer.opaque_mut() as *mut _ as *mut NetworkOpaque).write(network) };
+            metadata.write(buffer.opaque2_mut());
+        }
+        let mut throttle = Throttle::new(Duration::from_millis(1));
+        let seed = throttle.seed(Duration::from_secs(1));
+        let error = runtime.with_current_node(node, || {
+            generate_error(runtime, index, family, &mut throttle, seed, 1)
+        })?;
+        assert!(matches!(error, IcmpError::TimeExceededSent));
+        let error = runtime.with_current_node(node, || {
+            generate_error(runtime, index, family, &mut throttle, seed, 1)
+        })?;
+        assert!(matches!(error, IcmpError::Suppressed));
+        assert_eq!(runtime.run_ready_nodes()?, 1);
+        assert_eq!(runtime.get_buffer(index)?.current(), packet);
+        drop(frame);
+        assert_eq!(runtime.buffers().in_use_buffers(), 0);
+    }
+    interfaces.delete_hardware_interface(hardware)?;
+    Ok(())
 }

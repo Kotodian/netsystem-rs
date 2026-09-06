@@ -306,9 +306,9 @@ fn process_interface_rx(runtime: &DataPlaneMain, frame: &mut BufferFrame, proto:
 
 #[derive(Clone, Copy)]
 #[repr(C)]
-struct LookupMetadata {
+pub(crate) struct LookupMetadata {
     fib_index: u32,
-    forwarding: DpoId,
+    pub(crate) forwarding: DpoId,
     flow_hash: u32,
     lookup_count: u8,
 }
