@@ -1101,7 +1101,6 @@ name = "hammer-plugin-icmp"
 version = "0.1.0"
 dependencies = [
  "abi_stable",
- "arc-swap",
  "hammer-component-macros",
  "hammer-core",
  "hammer-infra",

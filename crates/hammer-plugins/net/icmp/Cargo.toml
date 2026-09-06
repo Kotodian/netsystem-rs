@@ -10,7 +10,6 @@ crate-type = ["dylib", "rlib"]
 
 [dependencies]
 abi_stable = { workspace = true }
-arc-swap = { workspace = true }
 hammer-component-macros = { path = "../../../hammer-component-macros" }
 hammer-core = { path = "../../../hammer-core" }
 hammer-infra = { path = "../../../hammer-infra" }
