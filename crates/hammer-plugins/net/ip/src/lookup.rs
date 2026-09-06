@@ -1,5 +1,10 @@
+use std::cell::UnsafeCell;
 use std::net::{Ipv4Addr, Ipv6Addr};
 use std::sync::OnceLock;
+use std::time::Instant;
+
+use hammer_infra::thread_owned::ThreadOwned;
+use hammer_service::net::throttle::Throttle;
 
 use hammer_core::data_plane::{BufferFrame, NodeId, NodeNext};
 use hammer_runtime::{DataPlaneMain, Node, NodeProcessFn, NodeRuntimeData, RuntimeResult};
@@ -11,6 +16,13 @@ use crate::ip::ip_header;
 use crate::protocol::ip::{IpProtocol, IpVersion, ParsedIpPacket};
 
 pub struct Ip4Main {
+    pub(crate) local_feature_arc_index: UnsafeCell<u8>,
+    pub(crate) unicast_feature_arc_index: UnsafeCell<u8>,
+    pub(crate) punt_feature_arc_index: UnsafeCell<u8>,
+    pub(crate) drop_feature_arc_index: UnsafeCell<u8>,
+    pub(crate) local_next_by_ip_protocol: UnsafeCell<[u16; 256]>,
+    pub(crate) icmp_throttle: Vec<ThreadOwned<Throttle>>,
+    pub(crate) clock_origin: Instant,
     unicast_tables: Vec<Ip4FibTable>,
     fib_index_by_sw_if_index: Vec<u32>,
 }
@@ -18,6 +30,15 @@ pub struct Ip4Main {
 impl Ip4Main {
     pub fn new() -> Self {
         Self {
+            local_feature_arc_index: UnsafeCell::new(u8::MAX),
+            unicast_feature_arc_index: UnsafeCell::new(u8::MAX),
+            punt_feature_arc_index: UnsafeCell::new(u8::MAX),
+            drop_feature_arc_index: UnsafeCell::new(u8::MAX),
+            local_next_by_ip_protocol: UnsafeCell::new(
+                [NodeNext::slot(crate::local::Ip4LocalNext::Punt); 256],
+            ),
+            icmp_throttle: Vec::new(),
+            clock_origin: Instant::now(),
             unicast_tables: vec![Ip4FibTable::new(Default::default())],
             fib_index_by_sw_if_index: vec![0],
         }
@@ -39,6 +60,13 @@ impl Ip4Main {
 }
 
 pub struct Ip6Main {
+    pub(crate) local_feature_arc_index: UnsafeCell<u8>,
+    pub(crate) unicast_feature_arc_index: UnsafeCell<u8>,
+    pub(crate) punt_feature_arc_index: UnsafeCell<u8>,
+    pub(crate) drop_feature_arc_index: UnsafeCell<u8>,
+    pub(crate) local_next_by_ip_protocol: UnsafeCell<[u16; 256]>,
+    pub(crate) icmp_throttle: Vec<ThreadOwned<Throttle>>,
+    pub(crate) clock_origin: Instant,
     unicast_tables: Vec<Ip6FibTable>,
     fib_index_by_sw_if_index: Vec<u32>,
 }
@@ -46,6 +74,15 @@ pub struct Ip6Main {
 impl Ip6Main {
     pub fn new() -> Self {
         Self {
+            local_feature_arc_index: UnsafeCell::new(u8::MAX),
+            unicast_feature_arc_index: UnsafeCell::new(u8::MAX),
+            punt_feature_arc_index: UnsafeCell::new(u8::MAX),
+            drop_feature_arc_index: UnsafeCell::new(u8::MAX),
+            local_next_by_ip_protocol: UnsafeCell::new(
+                [NodeNext::slot(crate::local::Ip6LocalNext::Punt); 256],
+            ),
+            icmp_throttle: Vec::new(),
+            clock_origin: Instant::now(),
             unicast_tables: vec![Ip6FibTable::new(Default::default())],
             fib_index_by_sw_if_index: vec![0],
         }
@@ -69,6 +106,13 @@ impl Ip6Main {
 pub static IP4_MAIN: OnceLock<Ip4Main> = OnceLock::new();
 pub static IP6_MAIN: OnceLock<Ip6Main> = OnceLock::new();
 
+// SAFETY: local protocol slots are changed only by the main thread before
+// workers start or while the worker barrier is held. Workers borrow slots
+// only synchronously during a node invocation; all other state is immutable
+// or explicitly worker-owned.
+unsafe impl Sync for Ip4Main {}
+unsafe impl Sync for Ip6Main {}
+
 #[inline(always)]
 pub(crate) fn fib_index_for(version: IpVersion, sw_if_index: u32) -> Option<u32> {
     match version {
@@ -81,31 +125,53 @@ pub(crate) fn fib_index_for(version: IpVersion, sw_if_index: u32) -> Option<u32>
     name = "ip_lookup_init",
     runs_before = ["install_packet_graph"]
 )]
-fn init_lookup() -> RuntimeResult<()> {
+fn init_lookup(engine: &mut hammer_runtime::GlobalMain) -> RuntimeResult<()> {
+    let mut ip4 = Ip4Main::new();
+    let mut ip6 = Ip6Main::new();
+    ip4.icmp_throttle = (0..=engine.configured_worker_count())
+        .map(|_| ThreadOwned::new())
+        .collect();
+    ip6.icmp_throttle = (0..=engine.configured_worker_count())
+        .map(|_| ThreadOwned::new())
+        .collect();
     IP4_MAIN
-        .set(Ip4Main::new())
+        .set(ip4)
         .map_err(|_| hammer_runtime::RuntimeError::PluginStateNotInitialized { plugin: "ip" })?;
     IP6_MAIN
-        .set(Ip6Main::new())
+        .set(ip6)
         .map_err(|_| hammer_runtime::RuntimeError::PluginStateNotInitialized { plugin: "ip" })?;
     Ok(())
 }
 
 #[hammer_component_macros::node_next]
-enum IpLookupNext {
+enum Ip4LookupNext {
     #[next("drop")]
     Drop,
     #[next("ip4-load-balance")]
-    LoadBalanceV4,
-    #[next("ip6-load-balance")]
-    LoadBalanceV6,
+    LoadBalance,
 }
 
 #[hammer_component_macros::node_next]
-enum InterfaceRxNext {
+enum Ip6LookupNext {
     #[next("drop")]
     Drop,
-    #[next("ip-input")]
+    #[next("ip6-load-balance")]
+    LoadBalance,
+}
+
+#[hammer_component_macros::node_next]
+enum Ip4InterfaceRxNext {
+    #[next("drop")]
+    Drop,
+    #[next("ip4-input")]
+    Input,
+}
+
+#[hammer_component_macros::node_next]
+enum Ip6InterfaceRxNext {
+    #[next("drop")]
+    Drop,
+    #[next("ip6-input")]
     Input,
 }
 
@@ -114,7 +180,7 @@ enum InterfaceRxNext {
     init = register_ip4_interface_rx,
     role = internal,
     name = "interface-rx-dpo-ip4",
-    next = InterfaceRxNext,
+    next = Ip4InterfaceRxNext,
 )]
 pub struct Ip4InterfaceRxNode {
     #[node(default = NodeRuntimeData::empty())]
@@ -126,7 +192,7 @@ pub struct Ip4InterfaceRxNode {
     init = register_ip6_interface_rx,
     role = internal,
     name = "interface-rx-dpo-ip6",
-    next = InterfaceRxNext,
+    next = Ip6InterfaceRxNext,
 )]
 pub struct Ip6InterfaceRxNode {
     #[node(default = NodeRuntimeData::empty())]
@@ -136,7 +202,7 @@ pub struct Ip6InterfaceRxNode {
 fn register_ip4_interface_rx(runtime: &DataPlaneMain) -> RuntimeResult<NodeId> {
     let node = runtime.nodes().try_register_internal_with_next_names(
         Ip4InterfaceRxNode::new(),
-        &InterfaceRxNext::NEXT_NAMES,
+        &Ip4InterfaceRxNext::NEXT_NAMES,
     )?;
     register_interface_rx_class(DpoProto::IP4, node).map_err(|source| {
         hammer_runtime::RuntimeError::GraphNodeInitialization {
@@ -150,7 +216,7 @@ fn register_ip4_interface_rx(runtime: &DataPlaneMain) -> RuntimeResult<NodeId> {
 fn register_ip6_interface_rx(runtime: &DataPlaneMain) -> RuntimeResult<NodeId> {
     let node = runtime.nodes().try_register_internal_with_next_names(
         Ip6InterfaceRxNode::new(),
-        &InterfaceRxNext::NEXT_NAMES,
+        &Ip6InterfaceRxNext::NEXT_NAMES,
     )?;
     register_interface_rx_class(DpoProto::IP6, node).map_err(|source| {
         hammer_runtime::RuntimeError::GraphNodeInitialization {
@@ -230,7 +296,11 @@ fn process_interface_rx(runtime: &DataPlaneMain, frame: &mut BufferFrame, proto:
         // packet is exclusively owned by this node while changing its RX fact.
         let opaque = unsafe { &mut *(buffer.opaque_mut() as *mut _ as *mut NetworkOpaque) };
         opaque.sw_if_index[0] = sw_if_index;
-        NodeNext::slot(InterfaceRxNext::Input)
+        if proto == DpoProto::IP4 {
+            NodeNext::slot(Ip4InterfaceRxNext::Input)
+        } else {
+            NodeNext::slot(Ip6InterfaceRxNext::Input)
+        }
     });
 }
 
@@ -259,8 +329,9 @@ impl Default for LookupMetadata {
     init = register_ip4_lookup,
     role = internal,
     name = "ip4-lookup",
-    next = IpLookupNext,
+    next = Ip4LookupNext,
 )]
+#[hammer_component_macros::feature(arc = crate::ip::input::Ip4InputNode)]
 pub struct Ip4LookupNode {
     #[node(default = NodeRuntimeData::empty())]
     runtime_data: NodeRuntimeData,
@@ -271,8 +342,9 @@ pub struct Ip4LookupNode {
     init = register_ip6_lookup,
     role = internal,
     name = "ip6-lookup",
-    next = IpLookupNext,
+    next = Ip6LookupNext,
 )]
+#[hammer_component_macros::feature(arc = crate::ip::input::Ip6InputNode)]
 pub struct Ip6LookupNode {
     #[node(default = NodeRuntimeData::empty())]
     runtime_data: NodeRuntimeData,
@@ -305,13 +377,13 @@ pub struct Ip6LoadBalanceNode {
 fn register_ip4_lookup(runtime: &DataPlaneMain) -> RuntimeResult<NodeId> {
     runtime
         .nodes()
-        .try_register_internal_with_next_names(Ip4LookupNode::new(), &IpLookupNext::NEXT_NAMES)
+        .try_register_internal_with_next_names(Ip4LookupNode::new(), &Ip4LookupNext::NEXT_NAMES)
 }
 
 fn register_ip6_lookup(runtime: &DataPlaneMain) -> RuntimeResult<NodeId> {
     runtime
         .nodes()
-        .try_register_internal_with_next_names(Ip6LookupNode::new(), &IpLookupNext::NEXT_NAMES)
+        .try_register_internal_with_next_names(Ip6LookupNode::new(), &Ip6LookupNext::NEXT_NAMES)
 }
 
 fn register_ip4_load_balance(runtime: &DataPlaneMain) -> RuntimeResult<NodeId> {
@@ -687,7 +759,10 @@ fn load_balance_index(
     index: hammer_core::data_plane::Index,
     version: IpVersion,
 ) -> u16 {
-    let drop_next = NodeNext::slot(IpLookupNext::Drop);
+    let drop_next = match version {
+        IpVersion::V4 => NodeNext::slot(Ip4LookupNext::Drop),
+        IpVersion::V6 => NodeNext::slot(Ip6LookupNext::Drop),
+    };
     let Ok(mut buffer) = runtime.get_buffer_mut(index) else {
         return drop_next;
     };
@@ -733,8 +808,8 @@ fn load_balance_index(
     metadata.forwarding = selected;
     if selected.class() == DpoType::LOAD_BALANCE {
         match version {
-            IpVersion::V4 => NodeNext::slot(IpLookupNext::LoadBalanceV4),
-            IpVersion::V6 => NodeNext::slot(IpLookupNext::LoadBalanceV6),
+            IpVersion::V4 => NodeNext::slot(Ip4LookupNext::LoadBalance),
+            IpVersion::V6 => NodeNext::slot(Ip6LookupNext::LoadBalance),
         }
     } else {
         selected.next()
@@ -751,7 +826,10 @@ fn lookup_index(
     index: hammer_core::data_plane::Index,
     version: IpVersion,
 ) -> u16 {
-    let drop_next = NodeNext::slot(IpLookupNext::Drop);
+    let drop_next = match version {
+        IpVersion::V4 => NodeNext::slot(Ip4LookupNext::Drop),
+        IpVersion::V6 => NodeNext::slot(Ip6LookupNext::Drop),
+    };
     let Ok(mut buffer) = runtime.get_buffer_mut(index) else {
         return drop_next;
     };

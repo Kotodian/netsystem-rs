@@ -1,25 +1,22 @@
+use std::hash::Hasher;
 use std::mem::transmute;
 use std::net::IpAddr;
-use std::sync::{Arc, Mutex, OnceLock};
 
+use crate::protocol::ip::{Ipv4Header, Ipv6Header};
 use crate::protocol::wire::read_header;
-use arc_swap::ArcSwap;
 use hammer_core::data_plane::{BufferFrame, BufferPacketCursor, Index, NodeId, NodeNext};
-use hammer_infra::checksum::{internet_checksum, internet_checksum_parts};
+use hammer_infra::checksum::InternetChecksum;
 use hammer_runtime::{
-    DataPlaneMain, Node, NodeProcessFn, NodeRuntimeData, TraceFormatter, add_packet_trace,
-    format_packet_trace,
+    DataPlaneMain, Node, NodeProcessFn, TraceFormatter, add_packet_trace, format_packet_trace,
 };
 use hammer_runtime::{RuntimeError, RuntimeResult};
 
-use hammer_service::data_plane::{FeatureArcStartHandle, set_index_node_error};
+use hammer_service::data_plane::set_index_node_error;
 use hammer_service::net::{DpoType, NetMain};
 use hammer_service::opaque::NetworkOpaque;
 
 use super::{IpInputError, IpInputTarget, IpProtocol, IpVersion, ParsedIpPacket, ip_header};
 
-const IP_PROTOCOL_TCP: u8 = 6;
-const IP_PROTOCOL_ICMP6: u8 = 58;
 const TCP_HEADER_MIN_LEN: usize = 20;
 const ICMP_HEADER_MIN_LEN: usize = 4;
 
@@ -31,21 +28,23 @@ struct IcmpHeader {
     checksum: [u8; 2],
 }
 
-#[hammer_component_macros::feature_arc]
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub enum IpLocalArc {
-    LocalForward,
+#[hammer_component_macros::node_next]
+pub enum Ip4LocalNext {
+    #[next("ip4-drop")]
+    Drop,
+    #[next("ip4-punt")]
+    Punt,
+    #[next("ip4-reassembly")]
+    Reassembly,
 }
 
 #[hammer_component_macros::node_next]
-pub enum IpLocalNext {
-    #[next("drop")]
+pub enum Ip6LocalNext {
+    #[next("ip6-drop")]
     Drop,
-    #[next("drop")]
+    #[next("ip6-punt")]
     Punt,
-    #[next("icmp-input")]
-    Icmp,
-    #[next("ip-reassembly")]
+    #[next("ip6-reassembly")]
     Reassembly,
 }
 
@@ -71,6 +70,7 @@ impl hammer_runtime::node::NodeErrorCode for IpLocalError {
 pub enum IpLocalTraceStage {
     Head,
     Receive,
+    End,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
@@ -122,144 +122,81 @@ impl IpLocalError {
     }
 }
 
-#[derive(Clone)]
-pub struct IpLocalControlPlane {
-    inner: Arc<ArcSwap<IpLocalState>>,
+#[hammer_component_macros::feature_arc(name = "ip4-local", start_nodes = [Ip4LocalNode, Ip4ReceiveNode], last_in_arc = Ip4LocalEndOfArcNode)]
+#[hammer_component_macros::graph_node(graph = ip, init = register_ip4_local, role = internal, name = "ip4-local", next = Ip4LocalNext)]
+pub struct Ip4LocalNode;
+
+fn register_ip4_local(runtime: &DataPlaneMain) -> RuntimeResult<NodeId> {
+    let node = runtime
+        .nodes()
+        .try_register_internal_with_next_names(Ip4LocalNode::new(), &Ip4LocalNext::NEXT_NAMES)?;
+    runtime
+        .nodes()
+        .materialize_node_errors(node, &IpLocalError::DESCRIPTORS)?;
+    Ok(node)
 }
 
-impl IpLocalControlPlane {
-    #[inline]
-    pub fn new() -> Self {
-        Self {
-            inner: Arc::new(ArcSwap::from_pointee(IpLocalState::new())),
-        }
+impl Node for Ip4LocalNode {
+    fn process(&mut self, runtime: &DataPlaneMain, frame: &mut BufferFrame) {
+        process_frame(runtime, frame, LocalStage::Head, IpVersion::V4)
     }
-
-    #[inline]
-    pub fn node(&self) -> IpLocalNode {
-        IpLocalNode::new(IpLocalStateHandle::new(Arc::clone(&self.inner)))
+    fn node_process(&self) -> NodeProcessFn {
+        |runtime, _, frame| process_frame(runtime, frame, LocalStage::Head, IpVersion::V4)
     }
-
-    #[inline]
-    pub fn receive_node(&self) -> IpReceiveNode {
-        IpReceiveNode::new(IpLocalStateHandle::new(Arc::clone(&self.inner)))
-    }
-
-    #[inline]
-    fn publish_protocol_slot(&self, protocol: u8, slot: u16) {
-        self.inner.rcu(|current| {
-            let mut next = IpLocalState::clone(current);
-            next.protocol_nexts[protocol as usize] = Some(slot);
-            next
-        });
-    }
-
-    #[inline]
-    pub fn unregister_protocol(&self, protocol: u8) -> RuntimeResult<()> {
-        self.inner.rcu(|current| {
-            let mut next = IpLocalState::clone(current);
-            next.protocol_nexts[protocol as usize] = None;
-            next
-        });
-        Ok(())
+    fn node_trace_formatter(&self) -> Option<TraceFormatter> {
+        Some(format_packet_trace!(IpLocalTrace))
     }
 }
 
-#[derive(Debug, Clone)]
-struct IpLocalState {
-    protocol_nexts: Box<[Option<u16>; 256]>,
+#[hammer_component_macros::graph_node(graph = ip, init = register_ip4_receive, role = internal, name = "ip4-receive", sibling_of = Ip4LocalNode)]
+pub struct Ip4ReceiveNode;
+
+fn register_ip4_receive(runtime: &DataPlaneMain) -> RuntimeResult<NodeId> {
+    let node = runtime
+        .nodes()
+        .try_register_internal(Ip4ReceiveNode::new())?;
+    runtime
+        .nodes()
+        .materialize_node_errors(node, &IpLocalError::DESCRIPTORS)?;
+    Ok(node)
 }
 
-impl IpLocalState {
-    #[inline]
-    fn new() -> Self {
-        Self {
-            protocol_nexts: Box::new([None; 256]),
-        }
+impl Node for Ip4ReceiveNode {
+    fn process(&mut self, runtime: &DataPlaneMain, frame: &mut BufferFrame) {
+        process_frame(runtime, frame, LocalStage::Receive, IpVersion::V4)
     }
-
-    #[inline(always)]
-    fn protocol_next_slot(&self, protocol: IpProtocol) -> u16 {
-        self.protocol_nexts[usize::from(u8::from(protocol))]
-            .unwrap_or_else(|| default_protocol_slot(protocol))
+    fn node_process(&self) -> NodeProcessFn {
+        |runtime, _, frame| process_frame(runtime, frame, LocalStage::Receive, IpVersion::V4)
     }
-
-    #[inline(always)]
-    fn punt_slot(&self) -> u16 {
-        NodeNext::slot(IpLocalNext::Punt)
-    }
-
-    #[inline(always)]
-    fn drop_slot(&self) -> u16 {
-        NodeNext::slot(IpLocalNext::Drop)
-    }
-
-    #[inline(always)]
-    fn reassembly_slot(&self) -> u16 {
-        NodeNext::slot(IpLocalNext::Reassembly)
+    fn node_trace_formatter(&self) -> Option<TraceFormatter> {
+        Some(format_packet_trace!(IpLocalTrace))
     }
 }
 
-#[derive(Clone)]
-struct IpLocalStateHandle {
-    inner: Arc<ArcSwap<IpLocalState>>,
+#[hammer_component_macros::feature(arc = Ip4LocalNode)]
+#[hammer_component_macros::graph_node(graph = ip, init = register_ip4_local_end_of_arc, role = internal, name = "ip4-local-end-of-arc", sibling_of = Ip4LocalNode)]
+pub struct Ip4LocalEndOfArcNode;
+
+fn register_ip4_local_end_of_arc(runtime: &DataPlaneMain) -> RuntimeResult<NodeId> {
+    let node = runtime
+        .nodes()
+        .try_register_internal(Ip4LocalEndOfArcNode::new())?;
+    runtime
+        .nodes()
+        .materialize_node_errors(node, &IpLocalError::DESCRIPTORS)?;
+    Ok(node)
 }
 
-impl IpLocalStateHandle {
-    #[inline]
-    fn new(inner: Arc<ArcSwap<IpLocalState>>) -> Self {
-        Self { inner }
+impl Node for Ip4LocalEndOfArcNode {
+    fn process(&mut self, runtime: &DataPlaneMain, frame: &mut BufferFrame) {
+        process_frame(runtime, frame, LocalStage::End, IpVersion::V4)
     }
-
-    #[inline]
-    fn load(&self) -> arc_swap::Guard<Arc<IpLocalState>> {
-        self.inner.load()
+    fn node_process(&self) -> NodeProcessFn {
+        |runtime, _, frame| process_frame(runtime, frame, LocalStage::End, IpVersion::V4)
     }
-}
-
-#[hammer_component_macros::graph_node(
-    graph = ip,
-    init = register_ip_local,
-    role = internal,
-    next = IpLocalNext,
-    start_arc = IpLocalArc,
-)]
-pub struct IpLocalNode {
-    #[node(default = register_ip_local_runtime(state.clone(), None))]
-    runtime_data: NodeRuntimeData,
-    state: IpLocalStateHandle,
-}
-
-#[hammer_component_macros::graph_node(
-    graph = ip,
-    init = register_ip_receive,
-    role = internal,
-    sibling_of = IpLocalNode,
-    start_arc = IpLocalArc,
-)]
-pub struct IpReceiveNode {
-    #[node(default = register_ip_local_runtime(state.clone(), None))]
-    runtime_data: NodeRuntimeData,
-    state: IpLocalStateHandle,
-}
-
-static PENDING_IP_LOCAL_CONTROL: OnceLock<IpLocalControlPlane> = OnceLock::new();
-static IP_LOCAL_PROTOCOL_REGISTRATION: OnceLock<(IpLocalControlPlane, NodeId)> = OnceLock::new();
-
-pub(crate) fn register_protocol(
-    nodes: &hammer_runtime::node::NodeRuntime,
-    protocol: u8,
-    node: NodeId,
-) -> RuntimeResult<()> {
-    let Some((control, consumer)) = IP_LOCAL_PROTOCOL_REGISTRATION.get() else {
-        return Err(crate::ip::IpControlError::NodeRuntimeUnavailable {
-            operation: crate::ip::IpControlOperation::IpProtocolRegistration,
-        }
-        .into());
-    };
-    let slot = nodes.add_node_next_slot(*consumer, node)?;
-    control.publish_protocol_slot(protocol, slot);
-    Ok(())
+    fn node_trace_formatter(&self) -> Option<TraceFormatter> {
+        Some(format_packet_trace!(IpLocalTrace))
+    }
 }
 
 pub(crate) fn register_ip4_protocol(
@@ -267,7 +204,111 @@ pub(crate) fn register_ip4_protocol(
     protocol: u8,
     node: NodeId,
 ) -> RuntimeResult<()> {
-    register_protocol(nodes, protocol, node)
+    hammer_runtime::ensure_main_thread_with_barrier()?;
+    let main = crate::lookup::IP4_MAIN
+        .get()
+        .ok_or(RuntimeError::PluginStateNotInitialized { plugin: "ip" })?;
+    let local = nodes.node_by_name(Ip4LocalNode::NODE_NAME).ok_or(
+        crate::ip::IpControlError::NodeRuntimeUnavailable {
+            operation: crate::ip::IpControlOperation::IpProtocolRegistration,
+        },
+    )?;
+    let next = nodes.add_node_next_slot(local, node)?;
+    // SAFETY: startup or the caller's worker barrier excludes packet readers.
+    unsafe {
+        (*main.local_next_by_ip_protocol.get())[usize::from(protocol)] = next;
+    }
+    Ok(())
+}
+
+pub fn unregister_ip4_protocol(protocol: u8) -> RuntimeResult<()> {
+    hammer_runtime::ensure_main_thread_with_barrier()?;
+    let main = crate::lookup::IP4_MAIN
+        .get()
+        .ok_or(RuntimeError::PluginStateNotInitialized { plugin: "ip" })?;
+    // SAFETY: restore the owner table before the consumer retires under the barrier.
+    unsafe {
+        (*main.local_next_by_ip_protocol.get())[usize::from(protocol)] =
+            NodeNext::slot(Ip4LocalNext::Punt);
+    }
+    Ok(())
+}
+
+#[hammer_component_macros::feature_arc(name = "ip6-local", start_nodes = [Ip6LocalNode, Ip6ReceiveNode], last_in_arc = Ip6LocalEndOfArcNode)]
+#[hammer_component_macros::graph_node(graph = ip, init = register_ip6_local, role = internal, name = "ip6-local", next = Ip6LocalNext)]
+pub struct Ip6LocalNode;
+
+fn register_ip6_local(runtime: &DataPlaneMain) -> RuntimeResult<NodeId> {
+    let node = runtime
+        .nodes()
+        .try_register_internal_with_next_names(Ip6LocalNode::new(), &Ip6LocalNext::NEXT_NAMES)?;
+    runtime
+        .nodes()
+        .materialize_node_errors(node, &IpLocalError::DESCRIPTORS)?;
+    Ok(node)
+}
+
+impl Node for Ip6LocalNode {
+    fn process(&mut self, runtime: &DataPlaneMain, frame: &mut BufferFrame) {
+        process_frame(runtime, frame, LocalStage::Head, IpVersion::V6)
+    }
+    fn node_process(&self) -> NodeProcessFn {
+        |runtime, _, frame| process_frame(runtime, frame, LocalStage::Head, IpVersion::V6)
+    }
+    fn node_trace_formatter(&self) -> Option<TraceFormatter> {
+        Some(format_packet_trace!(IpLocalTrace))
+    }
+}
+
+#[hammer_component_macros::graph_node(graph = ip, init = register_ip6_receive, role = internal, name = "ip6-receive", sibling_of = Ip6LocalNode)]
+pub struct Ip6ReceiveNode;
+
+fn register_ip6_receive(runtime: &DataPlaneMain) -> RuntimeResult<NodeId> {
+    let node = runtime
+        .nodes()
+        .try_register_internal(Ip6ReceiveNode::new())?;
+    runtime
+        .nodes()
+        .materialize_node_errors(node, &IpLocalError::DESCRIPTORS)?;
+    Ok(node)
+}
+
+impl Node for Ip6ReceiveNode {
+    fn process(&mut self, runtime: &DataPlaneMain, frame: &mut BufferFrame) {
+        process_frame(runtime, frame, LocalStage::Receive, IpVersion::V6)
+    }
+    fn node_process(&self) -> NodeProcessFn {
+        |runtime, _, frame| process_frame(runtime, frame, LocalStage::Receive, IpVersion::V6)
+    }
+    fn node_trace_formatter(&self) -> Option<TraceFormatter> {
+        Some(format_packet_trace!(IpLocalTrace))
+    }
+}
+
+#[hammer_component_macros::feature(arc = Ip6LocalNode)]
+#[hammer_component_macros::graph_node(graph = ip, init = register_ip6_local_end_of_arc, role = internal, name = "ip6-local-end-of-arc", sibling_of = Ip6LocalNode)]
+pub struct Ip6LocalEndOfArcNode;
+
+fn register_ip6_local_end_of_arc(runtime: &DataPlaneMain) -> RuntimeResult<NodeId> {
+    let node = runtime
+        .nodes()
+        .try_register_internal(Ip6LocalEndOfArcNode::new())?;
+    runtime
+        .nodes()
+        .materialize_node_errors(node, &IpLocalError::DESCRIPTORS)?;
+    Ok(node)
+}
+
+impl Node for Ip6LocalEndOfArcNode {
+    fn process(&mut self, runtime: &DataPlaneMain, frame: &mut BufferFrame) {
+        process_frame(runtime, frame, LocalStage::End, IpVersion::V6)
+    }
+    fn node_process(&self) -> NodeProcessFn {
+        |runtime, _, frame| process_frame(runtime, frame, LocalStage::End, IpVersion::V6)
+    }
+    fn node_trace_formatter(&self) -> Option<TraceFormatter> {
+        Some(format_packet_trace!(IpLocalTrace))
+    }
 }
 
 pub(crate) fn register_ip6_protocol(
@@ -275,207 +316,41 @@ pub(crate) fn register_ip6_protocol(
     protocol: u8,
     node: NodeId,
 ) -> RuntimeResult<()> {
-    register_protocol(nodes, protocol, node)
-}
-
-fn register_ip_local(runtime: &DataPlaneMain) -> RuntimeResult<NodeId> {
-    let control = IpLocalControlPlane::new();
-    let node = runtime
-        .nodes()
-        .try_register_internal_with_next_names(control.node(), &IpLocalNext::NEXT_NAMES)?;
-    runtime
-        .nodes()
-        .materialize_node_errors(node, &IpLocalError::DESCRIPTORS)?;
-    if IP_LOCAL_PROTOCOL_REGISTRATION
-        .set((control.clone(), node))
-        .is_err()
-    {
-        panic!("IP local protocol registration initialized twice");
-    }
-    if PENDING_IP_LOCAL_CONTROL.set(control).is_err() {
-        panic!("IP local control initialized twice");
-    }
-    Ok(node)
-}
-
-fn register_ip_receive(runtime: &DataPlaneMain) -> RuntimeResult<NodeId> {
-    let control = PENDING_IP_LOCAL_CONTROL.get().cloned().ok_or(
+    hammer_runtime::ensure_main_thread_with_barrier()?;
+    let main = crate::lookup::IP6_MAIN
+        .get()
+        .ok_or(RuntimeError::PluginStateNotInitialized { plugin: "ip" })?;
+    let local = nodes.node_by_name(Ip6LocalNode::NODE_NAME).ok_or(
         crate::ip::IpControlError::NodeRuntimeUnavailable {
-            operation: crate::ip::IpControlOperation::IpReceiveRegistration,
+            operation: crate::ip::IpControlOperation::IpProtocolRegistration,
         },
     )?;
-    let node = runtime
-        .nodes()
-        .try_register_internal(control.receive_node())?;
-    runtime
-        .nodes()
-        .materialize_node_errors(node, &IpLocalError::DESCRIPTORS)?;
-    Ok(node)
-}
-
-impl Node for IpLocalNode {
-    #[inline(always)]
-    fn process(&mut self, runtime: &DataPlaneMain, frame: &mut BufferFrame) -> () {
-        let state = self.state.load();
-        let feature_arc = self.feature_arc.as_ref().map(|arc| arc.start_handle());
-        process_frame(
-            runtime,
-            frame,
-            &state,
-            LocalStage::Head,
-            feature_arc.as_ref(),
-        )
+    let next = nodes.add_node_next_slot(local, node)?;
+    // SAFETY: startup or the caller's worker barrier excludes packet readers.
+    unsafe {
+        (*main.local_next_by_ip_protocol.get())[usize::from(protocol)] = next;
     }
-
-    #[inline]
-    fn node_trace_formatter(&self) -> Option<TraceFormatter> {
-        Some(format_packet_trace!(IpLocalTrace))
-    }
-
-    #[inline]
-    fn node_process(&self) -> NodeProcessFn {
-        ip_local_process
-    }
-
-    #[inline]
-    fn node_runtime_data(&self) -> RuntimeResult<NodeRuntimeData> {
-        let feature_arc = self.feature_arc.as_ref().map(|arc| arc.start_handle());
-        sync_ip_local_runtime(self.runtime_data, self.state.clone(), feature_arc)?;
-        Ok(self.runtime_data)
-    }
-}
-
-impl Node for IpReceiveNode {
-    #[inline(always)]
-    fn process(&mut self, runtime: &DataPlaneMain, frame: &mut BufferFrame) -> () {
-        let state = self.state.load();
-        let feature_arc = self.feature_arc.as_ref().map(|arc| arc.start_handle());
-        process_frame(
-            runtime,
-            frame,
-            &state,
-            LocalStage::Receive,
-            feature_arc.as_ref(),
-        )
-    }
-
-    #[inline]
-    fn node_trace_formatter(&self) -> Option<TraceFormatter> {
-        Some(format_packet_trace!(IpLocalTrace))
-    }
-
-    #[inline]
-    fn node_process(&self) -> NodeProcessFn {
-        ip_receive_process
-    }
-
-    #[inline]
-    fn node_runtime_data(&self) -> RuntimeResult<NodeRuntimeData> {
-        let feature_arc = self.feature_arc.as_ref().map(|arc| arc.start_handle());
-        sync_ip_local_runtime(self.runtime_data, self.state.clone(), feature_arc)?;
-        Ok(self.runtime_data)
-    }
-}
-
-/// Per-instance state held in the global IP-local registry and shared by
-/// `IpLocalNode` (Head stage) and `IpReceiveNode` (Receive stage). The stage
-/// is a fixed constant per node and passed by each node's process fn, so the
-/// registry only stores the `IpLocalStateHandle` + feature-arc start handle.
-///
-/// Mirrors the `OnceLock<Mutex<Vec<...>>>` + `NodeRuntimeData::from_usize`
-/// pattern used by the sibling migrated nodes (`IpLookupNode`, `IcmpInputNode`,
-/// `InterfaceOutputNode`): word 0 of [`NodeRuntimeData`] is the registry slot.
-#[derive(Clone)]
-struct IpLocalRuntime {
-    state: IpLocalStateHandle,
-    feature_arc: Option<FeatureArcStartHandle>,
-}
-
-fn ip_local_runtimes() -> &'static Mutex<Vec<IpLocalRuntime>> {
-    static RUNTIMES: OnceLock<Mutex<Vec<IpLocalRuntime>>> = OnceLock::new();
-    RUNTIMES.get_or_init(|| Mutex::new(Vec::new()))
-}
-
-fn register_ip_local_runtime(
-    state: IpLocalStateHandle,
-    feature_arc: Option<FeatureArcStartHandle>,
-) -> NodeRuntimeData {
-    let mut runtimes = ip_local_runtimes()
-        .lock()
-        .expect("IP local runtime registry poisoned");
-    let slot = runtimes.len();
-    runtimes.push(IpLocalRuntime { state, feature_arc });
-    NodeRuntimeData::from_usize(slot).expect("IP local runtime slot overflow")
-}
-
-fn sync_ip_local_runtime(
-    data: NodeRuntimeData,
-    state: IpLocalStateHandle,
-    feature_arc: Option<FeatureArcStartHandle>,
-) -> RuntimeResult<()> {
-    let slot = data.usize_word(0)?;
-    let mut runtimes = ip_local_runtimes().lock().map_err(|_| {
-        crate::ip::IpControlError::RuntimeRegistryPoisoned {
-            registry: crate::ip::IpRuntimeRegistry::IpLocal,
-        }
-    })?;
-    let runtime = runtimes
-        .get_mut(slot)
-        .ok_or(crate::ip::IpControlError::RuntimeSlotInvalid {
-            registry: crate::ip::IpRuntimeRegistry::IpLocal,
-            slot,
-        })?;
-    runtime.state = state;
-    runtime.feature_arc = feature_arc;
     Ok(())
 }
 
-fn ip_local_runtime(data: NodeRuntimeData) -> RuntimeResult<IpLocalRuntime> {
-    let slot = data.usize_word(0)?;
-    ip_local_runtimes()
-        .lock()
-        .map_err(|_| crate::ip::IpControlError::RuntimeRegistryPoisoned {
-            registry: crate::ip::IpRuntimeRegistry::IpLocal,
-        })?
-        .get(slot)
-        .cloned()
-        .ok_or_else(|| {
-            crate::ip::IpControlError::RuntimeSlotInvalid {
-                registry: crate::ip::IpRuntimeRegistry::IpLocal,
-                slot,
-            }
-            .into()
-        })
-}
-
-fn ip_local_process(runtime: &DataPlaneMain, data: NodeRuntimeData, frame: &mut BufferFrame) -> () {
-    let state = match ip_local_runtime(data) {
-        Ok(state) => state,
-        Err(_) => return (),
-    };
-    let snapshot = state.state.load();
-    let feature_arc = state.feature_arc.as_ref();
-    process_frame(runtime, frame, &snapshot, LocalStage::Head, feature_arc)
-}
-
-fn ip_receive_process(
-    runtime: &DataPlaneMain,
-    data: NodeRuntimeData,
-    frame: &mut BufferFrame,
-) -> () {
-    let state = match ip_local_runtime(data) {
-        Ok(state) => state,
-        Err(_) => return (),
-    };
-    let snapshot = state.state.load();
-    let feature_arc = state.feature_arc.as_ref();
-    process_frame(runtime, frame, &snapshot, LocalStage::Receive, feature_arc)
+pub fn unregister_ip6_protocol(protocol: u8) -> RuntimeResult<()> {
+    hammer_runtime::ensure_main_thread_with_barrier()?;
+    let main = crate::lookup::IP6_MAIN
+        .get()
+        .ok_or(RuntimeError::PluginStateNotInitialized { plugin: "ip" })?;
+    // SAFETY: restore the owner table before the consumer retires under the barrier.
+    unsafe {
+        (*main.local_next_by_ip_protocol.get())[usize::from(protocol)] =
+            NodeNext::slot(Ip6LocalNext::Punt);
+    }
+    Ok(())
 }
 
 #[derive(Debug, Clone, Copy)]
 enum LocalStage {
     Head,
     Receive,
+    End,
 }
 
 impl LocalStage {
@@ -489,6 +364,7 @@ impl LocalStage {
         match self {
             Self::Head => IpLocalTraceStage::Head,
             Self::Receive => IpLocalTraceStage::Receive,
+            Self::End => IpLocalTraceStage::End,
         }
     }
 }
@@ -497,14 +373,16 @@ impl LocalStage {
 fn process_frame(
     runtime: &DataPlaneMain,
     frame: &mut BufferFrame,
-    state: &IpLocalState,
     stage: LocalStage,
-    feature_arc: Option<&FeatureArcStartHandle>,
+    version: IpVersion,
 ) -> () {
     hammer_runtime::process_frame!(runtime, frame, |index| {
-        match process_index(runtime, index, state, stage, feature_arc) {
+        match process_index(runtime, index, stage, version) {
             Ok(slot) => slot,
-            Err(_) => state.drop_slot(),
+            Err(_) => match version {
+                IpVersion::V4 => NodeNext::slot(Ip4LocalNext::Drop),
+                IpVersion::V6 => NodeNext::slot(Ip6LocalNext::Drop),
+            },
         }
     })
 }
@@ -513,19 +391,55 @@ fn process_frame(
 fn process_index(
     runtime: &DataPlaneMain,
     index: Index,
-    state: &IpLocalState,
     stage: LocalStage,
-    feature_arc: Option<&FeatureArcStartHandle>,
+    version: IpVersion,
 ) -> RuntimeResult<u16> {
     let buffer = runtime.get_buffer(index)?;
     let current = buffer.current();
-    let network = unsafe { transmute::<_, &NetworkOpaque>(buffer.opaque()) };
+    let network = *unsafe { transmute::<_, &NetworkOpaque>(buffer.opaque()) };
+    let header_offset = network.packet_cursor().network_header_offset();
+    let protocol = match version {
+        IpVersion::V4 => {
+            let header = read_header::<Ipv4Header>(current, header_offset)?;
+            if matches!(stage, LocalStage::End) && header.flags_fragment() & 0x3fff != 0 {
+                return Ok(NodeNext::slot(Ip4LocalNext::Reassembly));
+            }
+            header.protocol()
+        }
+        IpVersion::V6 => read_header::<Ipv6Header>(current, header_offset)?.next_protocol(),
+    };
+    // SAFETY: the owning main thread mutates these slots only while workers
+    // are stopped; only the copied next slot leaves this read.
+    let protocol_next = unsafe {
+        match version {
+            IpVersion::V4 => {
+                (*crate::lookup::IP4_MAIN
+                    .get()
+                    .ok_or(RuntimeError::PluginStateNotInitialized { plugin: "ip" })?
+                    .local_next_by_ip_protocol
+                    .get())[usize::from(protocol)]
+            }
+            IpVersion::V6 => {
+                (*crate::lookup::IP6_MAIN
+                    .get()
+                    .ok_or(RuntimeError::PluginStateNotInitialized { plugin: "ip" })?
+                    .local_next_by_ip_protocol
+                    .get())[usize::from(protocol)]
+            }
+        }
+    };
+    if matches!(stage, LocalStage::End) {
+        return Ok(protocol_next);
+    }
     let parsed = match ip_header(current, network.packet_cursor()) {
-        Ok(parsed) => parsed,
-        Err(_) => {
+        Ok(parsed) if parsed.version == version => parsed,
+        _ => {
             drop(buffer);
             set_index_node_error(runtime, index, IpLocalError::BadLength)?;
-            let resolved = state.drop_slot();
+            let resolved = match version {
+                IpVersion::V4 => NodeNext::slot(Ip4LocalNext::Drop),
+                IpVersion::V6 => NodeNext::slot(Ip6LocalNext::Drop),
+            };
             let _ = add_packet_trace!(
                 runtime,
                 index,
@@ -546,7 +460,10 @@ fn process_index(
             let error = error_for_input(parsed.input_error);
             drop(buffer);
             set_index_node_error(runtime, index, error)?;
-            let resolved = state.drop_slot();
+            let resolved = match version {
+                IpVersion::V4 => NodeNext::slot(Ip4LocalNext::Drop),
+                IpVersion::V6 => NodeNext::slot(Ip6LocalNext::Drop),
+            };
             let _ = add_packet_trace!(
                 runtime,
                 index,
@@ -564,7 +481,10 @@ fn process_index(
         IpInputTarget::Reassembly => {
             drop(buffer);
             refresh_basic_metadata(runtime, index, &parsed, None)?;
-            let resolved = state.reassembly_slot();
+            let resolved = match version {
+                IpVersion::V4 => NodeNext::slot(Ip4LocalNext::Reassembly),
+                IpVersion::V6 => NodeNext::slot(Ip6LocalNext::Reassembly),
+            };
             let _ = add_packet_trace!(
                 runtime,
                 index,
@@ -586,12 +506,20 @@ fn process_index(
     let packet = current
         .get(..first_len)
         .ok_or_else(|| RuntimeError::from(crate::protocol::ip::IpInputError::BadLength))?;
-    let transport = match packet.get(parsed.transport_header_offset..parsed.packet_len) {
-        Some(transport) => transport,
-        None => {
+    let transport = match packet.get(parsed.transport_header_offset..) {
+        Some(transport)
+            if parsed.packet_len
+                <= buffer.current_len() + buffer.total_len_not_including_first() =>
+        {
+            transport
+        }
+        _ => {
             drop(buffer);
             set_index_node_error(runtime, index, IpLocalError::BadLength)?;
-            let resolved = state.drop_slot();
+            let resolved = match version {
+                IpVersion::V4 => NodeNext::slot(Ip4LocalNext::Drop),
+                IpVersion::V6 => NodeNext::slot(Ip6LocalNext::Drop),
+            };
             let _ = add_packet_trace!(
                 runtime,
                 index,
@@ -608,12 +536,15 @@ fn process_index(
         }
     };
 
-    let transport_len = match validate_transport(packet, transport, &parsed, stage) {
+    let transport_len = match validate_transport(transport, &parsed) {
         Ok(transport_len) => transport_len,
         Err(error) => {
             drop(buffer);
             set_index_node_error(runtime, index, error)?;
-            let resolved = state.drop_slot();
+            let resolved = match version {
+                IpVersion::V4 => NodeNext::slot(Ip4LocalNext::Drop),
+                IpVersion::V6 => NodeNext::slot(Ip6LocalNext::Drop),
+            };
             let _ = add_packet_trace!(
                 runtime,
                 index,
@@ -629,6 +560,20 @@ fn process_index(
             return Ok(resolved);
         }
     };
+    let checksum_required = match parsed.protocol {
+        IpProtocol::Tcp => parsed.version == IpVersion::V4,
+        IpProtocol::Udp => transport[6..8] != [0, 0],
+        IpProtocol::Icmpv4 | IpProtocol::Icmpv6 => true,
+        IpProtocol::Other(_) => false,
+    };
+    drop(buffer);
+    if checksum_required && l4_checksum(runtime, index, &parsed)? != 0 {
+        set_index_node_error(runtime, index, IpLocalError::BadChecksum)?;
+        return Ok(match version {
+            IpVersion::V4 => NodeNext::slot(Ip4LocalNext::Drop),
+            IpVersion::V6 => NodeNext::slot(Ip6LocalNext::Drop),
+        });
+    }
     let net = NetMain::global()?;
     let source_error = match (parsed.source, parsed.destination) {
         (IpAddr::V4(source), IpAddr::V4(destination)) => {
@@ -664,7 +609,7 @@ fn process_index(
                 network
                     .ip()
                     .fib_index_override()
-                    .or_else(|| main.fib_index(network.sw_if_index[0]))
+                    .or(network.ip().fib_index())
                     .and_then(|fib| main.forwarding_dpo(fib, source))
             });
             if source_dpo
@@ -679,44 +624,51 @@ fn process_index(
         }
         _ => None,
     };
-    drop(buffer);
     if let Some(error) = source_error {
         set_index_node_error(runtime, index, error)?;
-        return Ok(state.drop_slot());
+        return Ok(match version {
+            IpVersion::V4 => NodeNext::slot(Ip4LocalNext::Drop),
+            IpVersion::V6 => NodeNext::slot(Ip6LocalNext::Drop),
+        });
     }
     refresh_basic_metadata(runtime, index, &parsed, transport_len)?;
 
     if stage.is_head_of_feature_arc() {
-        if let Some(feature_arc) = feature_arc {
-            let default_slot = state.protocol_next_slot(parsed.protocol);
-            let interface_index = {
-                let buffer = runtime.get_buffer(index)?;
-                let network = unsafe { transmute::<_, &NetworkOpaque>(buffer.opaque()) };
-                network.sw_if_index[0]
-            };
-            let resolved = if interface_index == u32::MAX {
-                default_slot
-            } else {
-                feature_arc.start_for_interface_or(runtime, index, interface_index, default_slot)
-            };
-            let _ = add_packet_trace!(
-                runtime,
-                index,
-                IpLocalTrace {
-                    stage: stage.trace_stage(),
-                    version: Some(parsed.version),
-                    protocol: Some(parsed.protocol),
-                    transport_header_len: transport_len.unwrap_or_default(),
-                    error: None,
-                    next: resolved,
-                },
-            );
-            return Ok(resolved);
-        }
+        // SAFETY: arc indices are installed before workers start and never change.
+        let arc_index = unsafe {
+            match version {
+                IpVersion::V4 => *crate::lookup::IP4_MAIN
+                    .get()
+                    .ok_or(RuntimeError::PluginStateNotInitialized { plugin: "ip" })?
+                    .local_feature_arc_index
+                    .get(),
+                IpVersion::V6 => *crate::lookup::IP6_MAIN
+                    .get()
+                    .ok_or(RuntimeError::PluginStateNotInitialized { plugin: "ip" })?
+                    .local_feature_arc_index
+                    .get(),
+            }
+        };
+        let net = NetMain::global()?;
+        let mut buffer = runtime.get_buffer_mut(index)?;
+        let interface_index =
+            unsafe { transmute::<_, &NetworkOpaque>(buffer.opaque()) }.sw_if_index[0];
+        let resolved = net.interface_main().start_feature_arc(
+            arc_index,
+            interface_index,
+            &mut buffer,
+            protocol_next,
+        );
+        return Ok(resolved);
     }
 
-    let resolved = state.protocol_next_slot(parsed.protocol);
-    let error = if resolved == state.punt_slot() && matches!(parsed.protocol, IpProtocol::Other(_))
+    let resolved = protocol_next;
+    let error = if resolved
+        == match version {
+            IpVersion::V4 => NodeNext::slot(Ip4LocalNext::Punt),
+            IpVersion::V6 => NodeNext::slot(Ip6LocalNext::Punt),
+        }
+        && matches!(parsed.protocol, IpProtocol::Other(_))
     {
         set_index_node_error(runtime, index, IpLocalError::UnknownProtocol)?;
         Some(IpLocalError::UnknownProtocol.code())
@@ -740,40 +692,25 @@ fn process_index(
 
 #[inline(always)]
 fn validate_transport(
-    packet: &[u8],
     transport: &[u8],
     parsed: &ParsedIpPacket,
-    stage: LocalStage,
 ) -> Result<Option<usize>, IpLocalError> {
     match parsed.protocol {
         IpProtocol::Tcp => {
             let header_len = tcp_header_len(transport)?;
-            if stage.is_head_of_feature_arc()
-                && l4_checksum(packet, parsed, IP_PROTOCOL_TCP, transport) != 0
-            {
-                return Err(IpLocalError::BadChecksum);
-            }
             Ok(Some(header_len))
         }
-        // UDP owns its header, length, and checksum validation in the UDP input
-        // node. IP establishes only the IP packet cursor before protocol dispatch.
-        IpProtocol::Udp => Ok(None),
-        IpProtocol::Icmpv4 => {
-            read_header::<IcmpHeader>(transport, 0)
-                .map_err(|_| IpLocalError::BadTransportHeader)?;
-            if matches!(stage, LocalStage::Head) && internet_checksum(transport) != 0 {
-                return Err(IpLocalError::BadChecksum);
+        IpProtocol::Udp => {
+            let header = transport.get(..8).ok_or(IpLocalError::BadTransportHeader)?;
+            let length = usize::from(u16::from_be_bytes([header[4], header[5]]));
+            if length < 8 || length > parsed.packet_len - parsed.transport_header_offset {
+                return Err(IpLocalError::BadLength);
             }
-            Ok(Some(ICMP_HEADER_MIN_LEN))
+            Ok(Some(8))
         }
-        IpProtocol::Icmpv6 => {
+        IpProtocol::Icmpv4 | IpProtocol::Icmpv6 => {
             read_header::<IcmpHeader>(transport, 0)
                 .map_err(|_| IpLocalError::BadTransportHeader)?;
-            if matches!(stage, LocalStage::Head)
-                && l4_checksum(packet, parsed, IP_PROTOCOL_ICMP6, transport) != 0
-            {
-                return Err(IpLocalError::BadChecksum);
-            }
             Ok(Some(ICMP_HEADER_MIN_LEN))
         }
         IpProtocol::Other(_) => Ok(None),
@@ -818,37 +755,87 @@ fn error_for_input(error: IpInputError) -> IpLocalError {
 }
 
 #[inline(always)]
-fn default_protocol_slot(protocol: IpProtocol) -> u16 {
-    match protocol {
-        IpProtocol::Icmpv4 | IpProtocol::Icmpv6 => NodeNext::slot(IpLocalNext::Icmp),
-        IpProtocol::Tcp | IpProtocol::Udp | IpProtocol::Other(_) => {
-            NodeNext::slot(IpLocalNext::Punt)
+fn l4_checksum(
+    runtime: &DataPlaneMain,
+    index: Index,
+    parsed: &ParsedIpPacket,
+) -> RuntimeResult<u16> {
+    let mut checksum: InternetChecksum = Default::default();
+    let mut remaining = parsed.packet_len - parsed.transport_header_offset;
+    match (parsed.source, parsed.destination) {
+        (IpAddr::V4(source), IpAddr::V4(destination)) if parsed.protocol != IpProtocol::Icmpv4 => {
+            checksum.write(&source.octets());
+            checksum.write(&destination.octets());
+            checksum.write(&[0, parsed.protocol.into()]);
+            checksum.write(&(remaining as u16).to_be_bytes());
+        }
+        (IpAddr::V6(source), IpAddr::V6(destination)) => {
+            checksum.write(&source.octets());
+            checksum.write(&destination.octets());
+            checksum.write(&(remaining as u32).to_be_bytes());
+            checksum.write(&[0, 0, 0, parsed.protocol.into()]);
+        }
+        _ => {}
+    }
+    let mut offset = parsed.transport_header_offset;
+    for segment in runtime.chain(index) {
+        let segment = segment?;
+        let bytes = segment.current();
+        if offset >= bytes.len() {
+            offset -= bytes.len();
+            continue;
+        }
+        let length = remaining.min(bytes.len() - offset);
+        checksum.write(&bytes[offset..offset + length]);
+        remaining -= length;
+        offset = 0;
+        if remaining == 0 {
+            return Ok(checksum.finish() as u16);
         }
     }
+    Err(crate::protocol::ip::IpInputError::BadLength.into())
 }
 
-#[inline(always)]
-fn l4_checksum(_packet: &[u8], parsed: &ParsedIpPacket, protocol: u8, segment: &[u8]) -> u16 {
-    match parsed.version {
-        IpVersion::V4 => match (parsed.source, parsed.destination) {
-            (IpAddr::V4(source), IpAddr::V4(destination)) => internet_checksum_parts(&[
-                &source.octets(),
-                &destination.octets(),
-                &[0, protocol],
-                &(segment.len() as u16).to_be_bytes(),
-                segment,
-            ]),
-            _ => return 1,
-        },
-        IpVersion::V6 => match (parsed.source, parsed.destination) {
-            (IpAddr::V6(source), IpAddr::V6(destination)) => internet_checksum_parts(&[
-                &source.octets(),
-                &destination.octets(),
-                &(segment.len() as u32).to_be_bytes(),
-                &[0, 0, 0, protocol],
-                segment,
-            ]),
-            _ => return 1,
-        },
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use hammer_infra::checksum::internet_checksum;
+    use hammer_runtime::DataPlaneBufferConfig;
+
+    #[test]
+    fn icmp_checksum_spans_odd_buffer_boundary() -> RuntimeResult<()> {
+        hammer_runtime::config::Memory::default().ensure_main_heap()?;
+        let runtime = DataPlaneMain::new(DataPlaneBufferConfig::default());
+        // test_ip4.py::TestICMPEcho uses ID 0xB, sequence 5 and 18 payload
+        // bytes. Split that message across buffers to exercise the chain
+        // checksum used by VPP ip_calculate_l4_checksum, including odd carry.
+        let mut packet = [0x0a; 46];
+        packet[..20].fill(0);
+        packet[0] = 0x45;
+        packet[2..4].copy_from_slice(&46u16.to_be_bytes());
+        packet[9] = IpProtocol::Icmpv4.into();
+        packet[12..16].copy_from_slice(&[192, 0, 2, 2]);
+        packet[16..20].copy_from_slice(&[192, 0, 2, 1]);
+        packet[20..28].copy_from_slice(&[8, 0, 0, 0, 0, 0x0b, 0, 5]);
+        let checksum = internet_checksum(&packet[20..]);
+        packet[22..24].copy_from_slice(&checksum.to_be_bytes());
+        let mut frame = runtime.buffers().get_next_frame(NodeId::new(0))?;
+        let head = runtime.buffers().alloc_index_with_bytes(&packet[..37])?;
+        frame.push_index(head)?;
+        let tail = runtime.buffers().alloc_index_with_bytes(&packet[37..])?;
+        runtime.buffers().chain_buffer(head, tail)?;
+        let parsed = ip_header(
+            &packet,
+            BufferPacketCursor::new()
+                .with_packet_len(packet.len())
+                .with_network_header(0, 20)
+                .with_transport_header(20, 8),
+        )?;
+        assert_eq!(l4_checksum(&runtime, head, &parsed)?, 0);
+        runtime.get_buffer_mut(tail)?.current_mut()[0] ^= 1;
+        assert_ne!(l4_checksum(&runtime, head, &parsed)?, 0);
+        drop(frame);
+        assert_eq!(runtime.buffers().in_use_buffers(), 0);
+        Ok(())
     }
 }

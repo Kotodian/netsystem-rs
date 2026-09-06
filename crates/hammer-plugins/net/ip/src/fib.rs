@@ -395,6 +395,38 @@ mod tests {
         let net = NetMain::init(Arc::new(InterfaceMain::new()))?;
         let runtime = main.data_plane_main_mut();
         let terminal = hammer_service::data_plane::register_drop(runtime)?;
+        let punt_terminal = runtime
+            .nodes()
+            .try_register_internal(hammer_service::data_plane::PuntNode::new())?;
+        // VPP punt_dpo.c binds each protocol to its punt arc entry, not the
+        // terminal disposition node. Resolve the stacked edge through the graph.
+        for (proto, entry, name) in [
+            (
+                DpoProto::IP4,
+                &crate::punt::__IP_GRAPH_NODE_IP4_PUNT_NODE,
+                "ip4-punt",
+            ),
+            (
+                DpoProto::IP6,
+                &crate::punt::__IP_GRAPH_NODE_IP6_PUNT_NODE,
+                "ip6-punt",
+            ),
+        ] {
+            let punt = (entry.init)(runtime)?;
+            runtime.nodes().resolve_named_next_nodes()?;
+            let forwarding =
+                net.dpo_main_mut()
+                    .stack_from_node(runtime, terminal, DpoId::punt(proto))?;
+            assert_eq!(
+                runtime
+                    .nodes()
+                    .node_next_slot(terminal, usize::from(forwarding.next()))?,
+                punt,
+            );
+            assert_eq!(runtime.nodes().node_by_name(name), Some(punt));
+            assert_ne!(punt, punt_terminal);
+            assert_eq!(runtime.nodes().node_next_slot(punt, 0)?, punt_terminal);
+        }
         net.register_dpo(
             Some(DpoType::LOAD_BALANCE),
             &[(DpoProto::IP4, &[terminal]), (DpoProto::IP6, &[terminal])],

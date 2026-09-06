@@ -42,27 +42,3 @@ pub fn init_path_mtu() -> &'static IpPathMtu {
 pub fn path_mtu() -> Option<&'static IpPathMtu> {
     IP_PATH_MTU.get()
 }
-
-pub fn apply_ipv4_frag_needed_icmp(cache: &IpPathMtu, icmp: &[u8]) -> Option<(Ipv4Addr, u16)> {
-    if icmp.len() < 28 || icmp[0] != 3 || icmp[1] != 4 {
-        return None;
-    }
-    let mtu = u16::from_be_bytes([icmp[6], icmp[7]]);
-    if mtu == 0 || icmp[8] >> 4 != 4 {
-        return None;
-    }
-    let destination = Ipv4Addr::new(icmp[24], icmp[25], icmp[26], icmp[27]);
-    cache.update_ipv4(destination, mtu);
-    cache
-        .path_mtu(IpAddr::V4(destination))
-        .map(|value| (destination, value))
-}
-
-pub fn process_ipv4_icmp_path_mtu_packet(packet: &[u8]) -> Option<(Ipv4Addr, u16)> {
-    if packet.len() < 28 || packet[0] >> 4 != 4 || packet[9] != 1 {
-        return None;
-    }
-    let header_len = usize::from(packet[0] & 0x0f) * 4;
-    let cache = path_mtu()?;
-    apply_ipv4_frag_needed_icmp(cache, packet.get(header_len..)?)
-}

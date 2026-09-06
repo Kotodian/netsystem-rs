@@ -1,59 +1,56 @@
 use std::mem::transmute;
-use std::sync::{Mutex, OnceLock};
 
-use hammer_core::data_plane::{BufferFrame, BufferPacketCursor, Index, NodeId};
+use hammer_core::data_plane::{BufferFrame, BufferPacketCursor, Index};
 use hammer_runtime::RuntimeResult;
 use hammer_runtime::{
-    DataPlaneMain, Node, NodeProcessFn, NodeRuntimeData, TraceFormatter, add_packet_trace,
-    format_packet_trace, unlikely,
+    DataPlaneMain, Node, NodeProcessFn, TraceFormatter, add_packet_trace, format_packet_trace,
+    unlikely,
 };
 
 use crate::ip::{IpInputError, IpInputTarget, IpProtocol, IpVersion, parse_ip_header};
 use crate::protocol::ip_ecn::IpEcnCodepoint;
-use hammer_service::data_plane::{FeatureArcSpec, FeatureArcStartHandle, set_buffer_node_error};
+use hammer_service::data_plane::set_buffer_node_error;
 use hammer_service::opaque::NetworkOpaque;
 
-#[hammer_component_macros::feature_arc]
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub enum IpUnicastArc {}
-
 #[hammer_component_macros::node_next]
-pub enum IpInputNext {
-    #[next("drop")]
+pub enum Ip4InputNext {
+    #[next("ip4-drop")]
     Drop,
-    #[next("drop")]
+    #[next("ip4-punt")]
     Punt,
-    #[next("drop")]
+    #[next("ip4-punt")]
     Options,
     #[next("ip4-lookup")]
-    LookupV4,
-    #[next("ip6-lookup")]
-    LookupV6,
-    #[next("icmp-error")]
+    Lookup,
+    #[next("ip4-icmp-error")]
     IcmpError,
-    #[next("ip-reassembly")]
+    #[next("ip4-reassembly")]
     Reassembly,
 }
 
-#[hammer_component_macros::graph_node(
-    graph = ip,
-    init = register_ip_input,
-    role = internal,
-    name = "ip-input",
-    next = IpInputNext,
-    start_arc = A,
-)]
-pub struct IpInputNode<A: FeatureArcSpec = IpUnicastArc> {
-    #[node(default = register_ip_input_runtime(None))]
-    runtime_data: NodeRuntimeData,
+#[hammer_component_macros::node_next]
+pub enum Ip6InputNext {
+    #[next("ip6-drop")]
+    Drop,
+    #[next("ip6-punt")]
+    Punt,
+    #[next("ip6-punt")]
+    Options,
+    #[next("ip6-lookup")]
+    Lookup,
+    #[next("ip6-icmp-error")]
+    IcmpError,
+    #[next("ip6-reassembly")]
+    Reassembly,
 }
 
-fn register_ip_input(runtime: &DataPlaneMain) -> RuntimeResult<NodeId> {
-    runtime.nodes().try_register_internal_with_next_names(
-        IpInputNode::<IpUnicastArc>::new(),
-        &IpInputNext::NEXT_NAMES,
-    )
-}
+#[hammer_component_macros::feature_arc(name = "ip4-unicast", start_nodes = [Ip4InputNode], last_in_arc = crate::lookup::Ip4LookupNode)]
+#[hammer_component_macros::graph_node(graph = ip, kind = internal, name = "ip4-input", next = Ip4InputNext)]
+pub struct Ip4InputNode;
+
+#[hammer_component_macros::feature_arc(name = "ip6-unicast", start_nodes = [Ip6InputNode], last_in_arc = crate::lookup::Ip6LookupNode)]
+#[hammer_component_macros::graph_node(graph = ip, kind = internal, name = "ip6-input", next = Ip6InputNext)]
+pub struct Ip6InputNode;
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
 pub struct IpInputTrace {
@@ -65,31 +62,27 @@ pub struct IpInputTrace {
     pub next: u16,
 }
 
-impl<A> Node for IpInputNode<A>
-where
-    A: FeatureArcSpec,
-{
-    #[inline(always)]
-    fn process(&mut self, runtime: &DataPlaneMain, frame: &mut BufferFrame) -> () {
-        let feature_arc = self.feature_arc.as_ref().map(|arc| arc.start_handle());
-        ip_input_process_frame(runtime, frame, feature_arc.as_ref())
+impl Node for Ip4InputNode {
+    fn process(&mut self, runtime: &DataPlaneMain, frame: &mut BufferFrame) {
+        ip_input_process_frame(runtime, frame, IpVersion::V4)
     }
-
-    #[inline]
     fn node_process(&self) -> NodeProcessFn {
-        ip_input_process::<A>
+        |runtime, _, frame| ip_input_process_frame(runtime, frame, IpVersion::V4)
     }
-
-    #[inline]
     fn node_trace_formatter(&self) -> Option<TraceFormatter> {
         Some(format_packet_trace!(IpInputTrace))
     }
+}
 
-    #[inline]
-    fn node_runtime_data(&self) -> RuntimeResult<NodeRuntimeData> {
-        let feature_arc = self.feature_arc.as_ref().map(|arc| arc.start_handle());
-        sync_ip_input_runtime(self.runtime_data, feature_arc)?;
-        Ok(self.runtime_data)
+impl Node for Ip6InputNode {
+    fn process(&mut self, runtime: &DataPlaneMain, frame: &mut BufferFrame) {
+        ip_input_process_frame(runtime, frame, IpVersion::V6)
+    }
+    fn node_process(&self) -> NodeProcessFn {
+        |runtime, _, frame| ip_input_process_frame(runtime, frame, IpVersion::V6)
+    }
+    fn node_trace_formatter(&self) -> Option<TraceFormatter> {
+        Some(format_packet_trace!(IpInputTrace))
     }
 }
 
@@ -97,12 +90,15 @@ where
 fn ip_input_process_frame(
     runtime: &DataPlaneMain,
     frame: &mut BufferFrame,
-    feature_arc: Option<&FeatureArcStartHandle>,
+    version: IpVersion,
 ) -> () {
     let mut nexts = Vec::with_capacity(frame.len());
-    let drop_slot = IpInputNext::Drop.slot() as u16;
+    let drop_slot = match version {
+        IpVersion::V4 => Ip4InputNext::Drop.slot() as u16,
+        IpVersion::V6 => Ip6InputNext::Drop.slot() as u16,
+    };
     for index in frame.indices() {
-        let slot = match next_slot_for_index(runtime, *index, feature_arc) {
+        let slot = match next_slot_for_index(runtime, *index, version) {
             Ok(slot) => slot,
             Err(_) => drop_slot,
         };
@@ -112,95 +108,23 @@ fn ip_input_process_frame(
     ()
 }
 
-/// Per-instance state held in the global IP input registry.
-///
-/// `feature_arc` is `None` at construction (`FeatureArcStartSlot::new()` is
-/// empty) and synced from `self.feature_arc` in [`Node::node_runtime_data`]
-/// when the descriptor is built, so a `set_feature_arc` call made before
-/// registration is captured.
-#[derive(Clone)]
-struct IpInputRuntime {
-    feature_arc: Option<FeatureArcStartHandle>,
-}
-
-fn ip_input_runtimes() -> &'static Mutex<Vec<IpInputRuntime>> {
-    static RUNTIMES: OnceLock<Mutex<Vec<IpInputRuntime>>> = OnceLock::new();
-    RUNTIMES.get_or_init(|| Mutex::new(Vec::new()))
-}
-
-fn register_ip_input_runtime(feature_arc: Option<FeatureArcStartHandle>) -> NodeRuntimeData {
-    let mut runtimes = ip_input_runtimes()
-        .lock()
-        .expect("IP input runtime registry poisoned");
-    let slot = runtimes.len();
-    runtimes.push(IpInputRuntime { feature_arc });
-    NodeRuntimeData::from_usize(slot).expect("IP input runtime slot overflow")
-}
-
-fn sync_ip_input_runtime(
-    data: NodeRuntimeData,
-    feature_arc: Option<FeatureArcStartHandle>,
-) -> RuntimeResult<()> {
-    let slot = data.usize_word(0)?;
-    let mut runtimes = ip_input_runtimes().lock().map_err(|_| {
-        crate::ip::IpControlError::RuntimeRegistryPoisoned {
-            registry: crate::ip::IpRuntimeRegistry::IpInput,
-        }
-    })?;
-    let runtime = runtimes
-        .get_mut(slot)
-        .ok_or(crate::ip::IpControlError::RuntimeSlotInvalid {
-            registry: crate::ip::IpRuntimeRegistry::IpInput,
-            slot,
-        })?;
-    runtime.feature_arc = feature_arc;
-    Ok(())
-}
-
-fn ip_input_runtime(data: NodeRuntimeData) -> RuntimeResult<IpInputRuntime> {
-    let slot = data.usize_word(0)?;
-    ip_input_runtimes()
-        .lock()
-        .map_err(|_| crate::ip::IpControlError::RuntimeRegistryPoisoned {
-            registry: crate::ip::IpRuntimeRegistry::IpInput,
-        })?
-        .get(slot)
-        .cloned()
-        .ok_or_else(|| {
-            crate::ip::IpControlError::RuntimeSlotInvalid {
-                registry: crate::ip::IpRuntimeRegistry::IpInput,
-                slot,
-            }
-            .into()
-        })
-}
-
-fn ip_input_process<A: FeatureArcSpec>(
-    runtime: &DataPlaneMain,
-    data: NodeRuntimeData,
-    frame: &mut BufferFrame,
-) -> () {
-    let state = match ip_input_runtime(data) {
-        Ok(state) => state,
-        Err(_) => return (),
-    };
-    let feature_arc = state.feature_arc.as_ref();
-    ip_input_process_frame(runtime, frame, feature_arc)
-}
-
 #[inline(always)]
 fn next_slot_for_index(
     runtime: &DataPlaneMain,
     index: Index,
-    feature_arc: Option<&FeatureArcStartHandle>,
+    version: IpVersion,
 ) -> RuntimeResult<u16> {
+    let drop_next = match version {
+        IpVersion::V4 => Ip4InputNext::Drop.slot() as u16,
+        IpVersion::V6 => Ip6InputNext::Drop.slot() as u16,
+    };
     let (trace, parsed) = {
         let mut buffer = runtime.get_buffer_mut(index)?;
         let traced = buffer.trace_handle().is_some();
         match parse_ip_header(buffer.current()) {
             Err(_) => {
                 set_buffer_node_error(runtime, &mut buffer, IpInputError::BadLength)?;
-                let resolved = IpInputNext::Drop.slot() as u16;
+                let resolved = drop_next;
                 drop(buffer);
                 if unlikely(traced) {
                     let _ = add_packet_trace!(
@@ -219,6 +143,10 @@ fn next_slot_for_index(
                 return Ok(resolved);
             }
             Ok(parsed) => {
+                if parsed.version != version {
+                    set_buffer_node_error(runtime, &mut buffer, IpInputError::BadLength)?;
+                    return Ok(drop_next);
+                }
                 if parsed.input_error == IpInputError::None {
                     buffer.clear_node_error();
                 } else {
@@ -263,7 +191,7 @@ fn next_slot_for_index(
                         input_target: Some(parsed.input_target),
                         input_error: Some(parsed.input_error),
                         packet_len: parsed.packet_len,
-                        next: IpInputNext::Drop.slot() as u16,
+                        next: drop_next,
                     }),
                     parsed,
                 )
@@ -271,34 +199,68 @@ fn next_slot_for_index(
         }
     };
     let resolved = match parsed.input_target {
-        IpInputTarget::Drop => IpInputNext::Drop.slot() as u16,
-        IpInputTarget::Punt => IpInputNext::Punt.slot() as u16,
-        IpInputTarget::Options => IpInputNext::Options.slot() as u16,
+        IpInputTarget::Drop => drop_next,
+        IpInputTarget::Punt => match version {
+            IpVersion::V4 => Ip4InputNext::Punt.slot() as u16,
+            IpVersion::V6 => Ip6InputNext::Punt.slot() as u16,
+        },
+        IpInputTarget::Options => match version {
+            IpVersion::V4 => Ip4InputNext::Options.slot() as u16,
+            IpVersion::V6 => Ip6InputNext::Options.slot() as u16,
+        },
         IpInputTarget::Lookup => {
             let default_next = match parsed.version {
-                IpVersion::V4 => IpInputNext::LookupV4.slot() as u16,
-                IpVersion::V6 => IpInputNext::LookupV6.slot() as u16,
+                IpVersion::V4 => Ip4InputNext::Lookup.slot() as u16,
+                IpVersion::V6 => Ip6InputNext::Lookup.slot() as u16,
             };
-            if let Some(arc) = feature_arc {
-                let Some(interface_index) = ({
-                    let buffer = runtime.get_buffer(index)?;
-                    let network = unsafe { transmute::<_, &NetworkOpaque>(buffer.opaque()) };
-                    let interface_index = network.sw_if_index[0];
-                    (interface_index != u32::MAX).then_some(interface_index)
-                }) else {
-                    return Ok(default_next);
-                };
-                arc.start_for_interface_or(runtime, index, interface_index, default_next)
-            } else {
-                default_next
-            }
+            let arc_index = unsafe {
+                match version {
+                    IpVersion::V4 => *crate::lookup::IP4_MAIN
+                        .get()
+                        .ok_or(hammer_runtime::RuntimeError::PluginStateNotInitialized {
+                            plugin: "ip",
+                        })?
+                        .unicast_feature_arc_index
+                        .get(),
+                    IpVersion::V6 => *crate::lookup::IP6_MAIN
+                        .get()
+                        .ok_or(hammer_runtime::RuntimeError::PluginStateNotInitialized {
+                            plugin: "ip",
+                        })?
+                        .unicast_feature_arc_index
+                        .get(),
+                }
+            };
+            let net = hammer_service::net::NetMain::global()?;
+            let mut buffer = runtime.get_buffer_mut(index)?;
+            let interface_index =
+                unsafe { transmute::<_, &NetworkOpaque>(buffer.opaque()) }.sw_if_index[0];
+            net.interface_main().start_feature_arc(
+                arc_index,
+                interface_index,
+                &mut buffer,
+                default_next,
+            )
         }
         IpInputTarget::LookupMulticast => match parsed.version {
-            IpVersion::V4 => IpInputNext::LookupV4.slot() as u16,
-            IpVersion::V6 => IpInputNext::LookupV6.slot() as u16,
+            IpVersion::V4 => Ip4InputNext::Lookup.slot() as u16,
+            IpVersion::V6 => Ip6InputNext::Lookup.slot() as u16,
         },
-        IpInputTarget::IcmpError => IpInputNext::IcmpError.slot() as u16,
-        IpInputTarget::Reassembly => IpInputNext::Reassembly.slot() as u16,
+        IpInputTarget::IcmpError => {
+            let metadata = match parsed.version {
+                IpVersion::V4 => crate::protocol::icmp::IcmpErrorMetadata::ipv4_time_exceeded(),
+                IpVersion::V6 => crate::protocol::icmp::IcmpErrorMetadata::ipv6_time_exceeded(),
+            };
+            metadata.write(runtime.get_buffer_mut(index)?.opaque2_mut());
+            match parsed.version {
+                IpVersion::V4 => Ip4InputNext::IcmpError.slot() as u16,
+                IpVersion::V6 => Ip6InputNext::IcmpError.slot() as u16,
+            }
+        }
+        IpInputTarget::Reassembly => match version {
+            IpVersion::V4 => Ip4InputNext::Reassembly.slot() as u16,
+            IpVersion::V6 => Ip6InputNext::Reassembly.slot() as u16,
+        },
     };
     if let Some(trace) = trace {
         let _ = add_packet_trace!(

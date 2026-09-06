@@ -75,14 +75,12 @@ impl std::fmt::Display for IpRuntimeRegistry {
 /// Control-plane operations that require IP plugin runtime state.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum IpControlOperation {
-    IpReceiveRegistration,
     IpProtocolRegistration,
 }
 
 impl std::fmt::Display for IpControlOperation {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str(match self {
-            Self::IpReceiveRegistration => "ip-receive registration",
             Self::IpProtocolRegistration => "ip protocol registration",
         })
     }
@@ -104,15 +102,15 @@ pub(crate) enum IpControlError {
     NodeRuntimeUnavailable { operation: IpControlOperation },
 }
 
-pub use input::{IpInputNext, IpInputNode, IpInputTrace, IpUnicastArc};
+pub use input::{Ip4InputNext, Ip4InputNode, Ip6InputNext, Ip6InputNode, IpInputTrace};
 pub use local::{
-    IpLocalArc, IpLocalControlPlane, IpLocalError, IpLocalNext, IpLocalNode, IpLocalTrace,
-    IpLocalTraceStage, IpReceiveNode,
+    Ip4LocalNext, Ip4LocalNode, Ip4ReceiveNode, Ip6LocalNext, Ip6LocalNode, Ip6ReceiveNode,
+    IpLocalError, IpLocalTrace, IpLocalTraceStage,
 };
 pub use reassembly::{
-    IpReassemblyDirectory, IpReassemblyHandoff, IpReassemblyNext, IpReassemblyNode,
-    IpReassemblyTrace, IpReassemblyTraceAction, pack_fragment_owner_value,
-    unpack_fragment_owner_value,
+    Ip4ReassemblyNext, Ip4ReassemblyNode, Ip6ReassemblyNext, Ip6ReassemblyNode,
+    IpReassemblyDirectory, IpReassemblyHandoff, IpReassemblyTrace, IpReassemblyTraceAction,
+    pack_fragment_owner_value, unpack_fragment_owner_value,
 };
 
 #[inline(always)]

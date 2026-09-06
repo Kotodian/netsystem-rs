@@ -51,8 +51,16 @@ pub fn unpack_fragment_owner_value(value: u64) -> (u32, DataWorkerId) {
 }
 
 #[hammer_component_macros::node_next]
-pub enum IpReassemblyNext {
-    #[next("ip-input")]
+pub enum Ip4ReassemblyNext {
+    #[next("ip4-input")]
+    Input,
+    #[next("drop")]
+    Drop,
+}
+
+#[hammer_component_macros::node_next]
+pub enum Ip6ReassemblyNext {
+    #[next("ip6-input")]
     Input,
     #[next("drop")]
     Drop,
@@ -218,11 +226,18 @@ impl IpReassemblyMain {
             .unwrap_or(0)
     }
 
-    fn process_frame(&self, runtime: &DataPlaneMain, frame: &mut BufferFrame) -> () {
+    fn process_frame(
+        &self,
+        runtime: &DataPlaneMain,
+        frame: &mut BufferFrame,
+        version: IpVersion,
+    ) -> () {
         let Some(worker) = self.per_thread_data.get(Self::worker_slot(runtime)) else {
             return ();
         };
-        worker.lock().process_frame(runtime, frame, Instant::now())
+        worker
+            .lock()
+            .process_frame(runtime, frame, Instant::now(), version)
     }
 }
 
@@ -277,12 +292,13 @@ fn init_ip_reassembly() -> RuntimeResult<()> {
 
 #[hammer_component_macros::graph_node(
     graph = ip,
-    init = register_ip_reassembly,
+    init = register_ip4_reassembly,
     role = internal,
-    next = IpReassemblyNext,
+    name = "ip4-reassembly",
+    next = Ip4ReassemblyNext,
 )]
 #[derive(Clone)]
-pub struct IpReassemblyNode {
+pub struct Ip4ReassemblyNode {
     #[node(default)]
     handoff: Option<IpReassemblyHandoff>,
     #[node(default)]
@@ -293,7 +309,7 @@ pub struct IpReassemblyNode {
     max_fragments_per_reassembly: usize,
 }
 
-impl IpReassemblyNode {
+impl Ip4ReassemblyNode {
     #[inline]
     pub fn with_handoff(mut self, handoff: IpReassemblyHandoff) -> Self {
         self.directory = Some(Arc::new(handoff.directory.clone()));
@@ -328,10 +344,71 @@ impl IpReassemblyNode {
     }
 }
 
-fn register_ip_reassembly(runtime: &DataPlaneMain) -> RuntimeResult<NodeId> {
+fn register_ip4_reassembly(runtime: &DataPlaneMain) -> RuntimeResult<NodeId> {
     runtime.nodes().try_register_internal_with_next_names(
-        IpReassemblyNode::new(),
-        &IpReassemblyNext::NEXT_NAMES,
+        Ip4ReassemblyNode::new(),
+        &Ip4ReassemblyNext::NEXT_NAMES,
+    )
+}
+
+#[hammer_component_macros::graph_node(
+    graph = ip,
+    init = register_ip6_reassembly,
+    role = internal,
+    name = "ip6-reassembly",
+    next = Ip6ReassemblyNext,
+)]
+#[derive(Clone)]
+pub struct Ip6ReassemblyNode {
+    #[node(default)]
+    handoff: Option<IpReassemblyHandoff>,
+    #[node(default)]
+    directory: Option<Arc<IpReassemblyDirectory>>,
+    #[node(default = DEFAULT_REASSEMBLY_TIMEOUT)]
+    timeout: Duration,
+    #[node(default = DEFAULT_MAX_FRAGMENTS_PER_REASSEMBLY)]
+    max_fragments_per_reassembly: usize,
+}
+
+impl Ip6ReassemblyNode {
+    #[inline]
+    pub fn with_handoff(mut self, handoff: IpReassemblyHandoff) -> Self {
+        self.directory = Some(Arc::new(handoff.directory.clone()));
+        self.handoff = Some(handoff);
+        self
+    }
+
+    #[inline]
+    pub fn with_directory(mut self, directory: Arc<IpReassemblyDirectory>) -> Self {
+        self.directory = Some(directory);
+        self
+    }
+
+    #[inline]
+    pub fn with_timeout(mut self, timeout: Duration) -> Self {
+        self.timeout = timeout;
+        self
+    }
+
+    #[inline]
+    pub fn with_max_fragments_per_reassembly(mut self, max_fragments: usize) -> Self {
+        self.max_fragments_per_reassembly = max_fragments;
+        self
+    }
+
+    #[inline]
+    pub fn expire(&mut self, runtime: &DataPlaneMain, now: Instant) -> usize {
+        IP_REASSEMBLY_MAIN
+            .get()
+            .map(|main| main.expire_worker(runtime, now))
+            .unwrap_or(0)
+    }
+}
+
+fn register_ip6_reassembly(runtime: &DataPlaneMain) -> RuntimeResult<NodeId> {
+    runtime.nodes().try_register_internal_with_next_names(
+        Ip6ReassemblyNode::new(),
+        &Ip6ReassemblyNext::NEXT_NAMES,
     )
 }
 
@@ -395,6 +472,7 @@ impl IpReassemblyWorker {
         runtime: &DataPlaneMain,
         frame: &mut BufferFrame,
         now: Instant,
+        version: IpVersion,
     ) -> () {
         let input_len = frame.len();
         debug_assert!(input_len <= DEFAULT_BUFFER_FRAME_CAPACITY);
@@ -408,7 +486,15 @@ impl IpReassemblyWorker {
         let mut out_len = 0usize;
         for offset in 0..input_len {
             let index = unsafe { inputs[offset].assume_init() };
-            let _ = self.process_index(runtime, index, now, frame, &mut nexts, &mut out_len);
+            let _ = self.process_index(
+                runtime,
+                index,
+                now,
+                frame,
+                &mut nexts,
+                &mut out_len,
+                version,
+            );
         }
         if out_len != 0 {
             runtime.enqueue_to_next(frame, &nexts[..out_len]);
@@ -422,14 +508,14 @@ impl IpReassemblyWorker {
         frame: &mut BufferFrame,
         nexts: &mut [u16; DEFAULT_BUFFER_FRAME_CAPACITY],
         out_len: &mut usize,
-        next: IpReassemblyNext,
+        next: u16,
         index: Index,
     ) -> RuntimeResult<()> {
         if *out_len == DEFAULT_BUFFER_FRAME_CAPACITY {
             runtime.enqueue_to_next(frame, &nexts[..*out_len]);
             *out_len = 0;
         }
-        nexts[*out_len] = NodeNext::slot(next);
+        nexts[*out_len] = next;
         frame.push_index(index)?;
         *out_len += 1;
         Ok(())
@@ -443,6 +529,7 @@ impl IpReassemblyWorker {
         out_frame: &mut BufferFrame,
         nexts: &mut [u16; DEFAULT_BUFFER_FRAME_CAPACITY],
         out_len: &mut usize,
+        version: IpVersion,
     ) -> RuntimeResult<()> {
         let current_worker = self.worker;
         let buffer = runtime.get_buffer(index)?;
@@ -453,7 +540,10 @@ impl IpReassemblyWorker {
             Ok(fragment) => fragment,
             Err(_) => {
                 drop(buffer);
-                let drop_next = IpReassemblyNext::Drop;
+                let drop_next = match version {
+                    IpVersion::V4 => NodeNext::slot(Ip4ReassemblyNext::Drop),
+                    IpVersion::V6 => NodeNext::slot(Ip6ReassemblyNext::Drop),
+                };
                 let _ = add_packet_trace!(
                     runtime,
                     index,
@@ -462,7 +552,7 @@ impl IpReassemblyWorker {
                         action: IpReassemblyTraceAction::Drop,
                         current_worker,
                         owner_worker: None,
-                        next: Some(NodeNext::slot(drop_next)),
+                        next: Some(drop_next),
                     },
                 );
                 Self::emit_local(runtime, out_frame, nexts, out_len, drop_next, index)?;
@@ -470,6 +560,13 @@ impl IpReassemblyWorker {
             }
         };
         drop(buffer);
+        if fragment.version != version {
+            let next = match version {
+                IpVersion::V4 => NodeNext::slot(Ip4ReassemblyNext::Drop),
+                IpVersion::V6 => NodeNext::slot(Ip6ReassemblyNext::Drop),
+            };
+            return Self::emit_local(runtime, out_frame, nexts, out_len, next, index);
+        }
 
         let key = fragment.key;
         let directory = self
@@ -503,13 +600,19 @@ impl IpReassemblyWorker {
             Some((pool_index, owner)) if owner == current_worker => pool_index,
             Some(_) => {
                 // Owned elsewhere — should have handed off above.
-                let drop_next = IpReassemblyNext::Drop;
+                let drop_next = match version {
+                    IpVersion::V4 => NodeNext::slot(Ip4ReassemblyNext::Drop),
+                    IpVersion::V6 => NodeNext::slot(Ip6ReassemblyNext::Drop),
+                };
                 Self::emit_local(runtime, out_frame, nexts, out_len, drop_next, index)?;
                 return Ok(());
             }
             None => {
                 if self.contexts.len() >= self.max_reassemblies {
-                    let drop_next = IpReassemblyNext::Drop;
+                    let drop_next = match version {
+                        IpVersion::V4 => NodeNext::slot(Ip4ReassemblyNext::Drop),
+                        IpVersion::V6 => NodeNext::slot(Ip6ReassemblyNext::Drop),
+                    };
                     let _ = add_packet_trace!(
                         runtime,
                         index,
@@ -518,7 +621,7 @@ impl IpReassemblyWorker {
                             action: IpReassemblyTraceAction::Drop,
                             current_worker,
                             owner_worker: Some(current_worker),
-                            next: Some(NodeNext::slot(drop_next)),
+                            next: Some(drop_next),
                         },
                     );
                     Self::emit_local(runtime, out_frame, nexts, out_len, drop_next, index)?;
@@ -615,7 +718,10 @@ impl IpReassemblyWorker {
         }
 
         if let Some((index, owner)) = drop_trace {
-            let drop_next = IpReassemblyNext::Drop;
+            let drop_next = match version {
+                IpVersion::V4 => NodeNext::slot(Ip4ReassemblyNext::Drop),
+                IpVersion::V6 => NodeNext::slot(Ip6ReassemblyNext::Drop),
+            };
             let _ = add_packet_trace!(
                 runtime,
                 index,
@@ -624,7 +730,7 @@ impl IpReassemblyWorker {
                     action: IpReassemblyTraceAction::Drop,
                     current_worker,
                     owner_worker: Some(owner),
-                    next: Some(NodeNext::slot(drop_next)),
+                    next: Some(drop_next),
                 },
             );
             Self::emit_local(runtime, out_frame, nexts, out_len, drop_next, index)?;
@@ -632,8 +738,11 @@ impl IpReassemblyWorker {
         }
 
         if let Some(failed_index) = failed {
-            let drop_next = IpReassemblyNext::Drop;
-            let drop_slot = NodeNext::slot(drop_next);
+            let drop_next = match version {
+                IpVersion::V4 => NodeNext::slot(Ip4ReassemblyNext::Drop),
+                IpVersion::V6 => NodeNext::slot(Ip6ReassemblyNext::Drop),
+            };
+            let drop_slot = drop_next;
             let Some(context) = self.contexts.remove(pool_index) else {
                 return Err(IpReassemblyError::FragmentContextMissing.into());
             };
@@ -712,7 +821,10 @@ impl IpReassemblyWorker {
                     return Ok(());
                 }
             }
-            let input_next = IpReassemblyNext::Input;
+            let input_next = match version {
+                IpVersion::V4 => NodeNext::slot(Ip4ReassemblyNext::Input),
+                IpVersion::V6 => NodeNext::slot(Ip6ReassemblyNext::Input),
+            };
             let _ = add_packet_trace!(
                 runtime,
                 index,
@@ -721,7 +833,7 @@ impl IpReassemblyWorker {
                     action: IpReassemblyTraceAction::Reassembled,
                     current_worker,
                     owner_worker: Some(sendout),
-                    next: Some(NodeNext::slot(input_next)),
+                    next: Some(input_next),
                 },
             );
             Self::emit_local(runtime, out_frame, nexts, out_len, input_next, index)?;
@@ -730,7 +842,7 @@ impl IpReassemblyWorker {
     }
 }
 
-impl Node for IpReassemblyNode {
+impl Node for Ip4ReassemblyNode {
     #[inline(always)]
     fn process(&mut self, _runtime: &DataPlaneMain, _frame: &mut BufferFrame) -> () {
         ()
@@ -738,7 +850,29 @@ impl Node for IpReassemblyNode {
 
     #[inline]
     fn node_process(&self) -> NodeProcessFn {
-        ip_reassembly_process
+        |runtime, data, frame| ip_reassembly_process(runtime, data, frame, IpVersion::V4)
+    }
+
+    #[inline]
+    fn node_runtime_data(&self) -> RuntimeResult<NodeRuntimeData> {
+        Ok(NodeRuntimeData::empty())
+    }
+
+    #[inline]
+    fn node_trace_formatter(&self) -> Option<TraceFormatter> {
+        Some(format_packet_trace!(IpReassemblyTrace))
+    }
+}
+
+impl Node for Ip6ReassemblyNode {
+    #[inline(always)]
+    fn process(&mut self, _runtime: &DataPlaneMain, _frame: &mut BufferFrame) -> () {
+        ()
+    }
+
+    #[inline]
+    fn node_process(&self) -> NodeProcessFn {
+        |runtime, data, frame| ip_reassembly_process(runtime, data, frame, IpVersion::V6)
     }
 
     #[inline]
@@ -756,9 +890,10 @@ fn ip_reassembly_process(
     runtime: &DataPlaneMain,
     _data: NodeRuntimeData,
     frame: &mut BufferFrame,
+    version: IpVersion,
 ) -> () {
     if let Some(main) = IP_REASSEMBLY_MAIN.get() {
-        main.process_frame(runtime, frame);
+        main.process_frame(runtime, frame, version);
     }
 }
 

@@ -601,7 +601,7 @@ pub fn apply_ipv4_dont_fragment(output: &mut [u8], enabled: bool) {
 
 /// Write a locally originated IPv4 header like VPP `vlib_buffer_push_ip4`.
 ///
-/// Always sets DF (`is_df=1`) and TTL 255. Does not support fragmentation.
+/// Sets TTL 255; the caller selects DF, including clear DF for ICMP errors.
 /// `output` must hold at least an [`Ipv4Header`]; `total_len` is the full L3
 /// packet length including this header.
 #[inline]
@@ -611,6 +611,7 @@ pub fn write_ipv4_push_header(
     dst: Ipv4Addr,
     protocol: u8,
     total_len: u16,
+    dont_fragment: bool,
 ) -> Result<(), IpInputError> {
     let ptr = header_mut_ptr::<Ipv4Header>(output, 0)?;
     // SAFETY: `header_mut_ptr` checked the range; `Ipv4Header` fields are only
@@ -621,7 +622,11 @@ pub fn write_ipv4_push_header(
             dscp_ecn: 0,
             total_len: total_len.to_be_bytes(),
             identification: [0; 2],
-            flags_fragment: IPV4_FLAG_DONT_FRAGMENT.to_be_bytes(),
+            flags_fragment: if dont_fragment {
+                IPV4_FLAG_DONT_FRAGMENT.to_be_bytes()
+            } else {
+                [0; 2]
+            },
             ttl: 255,
             protocol,
             checksum: [0; 2],
