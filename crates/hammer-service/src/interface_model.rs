@@ -1,6 +1,7 @@
 use std::cell::{RefCell, UnsafeCell};
 use std::collections::HashMap;
 use std::fmt;
+use std::net::IpAddr;
 use std::sync::{Arc, OnceLock};
 
 use hammer_core::data_plane::NodeId;
@@ -10,7 +11,7 @@ use hammer_runtime::{DataWorkerId, GlobalMain, RuntimeResult};
 use ipnet::IpNet;
 
 use crate::interface::{InterfaceError, InterfaceMtu, InterfaceMtuKind, InterfaceResult};
-use crate::net::{DpoError, DpoId, DpoProto, DpoType, InterfaceRxDpo, NetMain};
+use crate::net::{DpoError, DpoId, DpoProto, DpoType, InterfaceRxDpo, NetMain, ReceiveDpo};
 
 #[path = "interface/feature.rs"]
 pub mod feature;
@@ -311,6 +312,7 @@ struct InterfaceState {
     tx_queues: Pool<TxQueue>,
     names: HashMap<String, u32>,
     addresses: Pool<(u32, IpNet)>,
+    receive_dpos: Pool<ReceiveDpo<IpAddr>>,
     device_classes: Vec<DeviceClass>,
     hw_classes: Vec<HwClass>,
     hw_callbacks: Vec<InterfaceCallbackRegistration>,
@@ -390,6 +392,46 @@ impl InterfaceRxDpo {
     }
 }
 
+impl ReceiveDpo<IpAddr> {
+    pub fn lock(dpo: DpoId) {
+        hammer_runtime::ensure_main_thread_with_barrier()
+            .expect("receive DPO acquisition requires the publication scope");
+        assert_eq!(dpo.class(), DpoType::RECEIVE);
+        let interfaces = NetMain::global()
+            .expect("receive DPO requires its owner")
+            .interface_main();
+        let object = interfaces
+            .state_mut()
+            .receive_dpos
+            .get_mut(dpo.index())
+            .expect("referenced receive DPO is occupied");
+        object.lock_count = object
+            .lock_count
+            .checked_add(1)
+            .expect("receive DPO reference count overflow");
+    }
+
+    pub fn unlock(dpo: DpoId) {
+        hammer_runtime::ensure_main_thread_with_barrier()
+            .expect("receive DPO retirement requires the publication scope");
+        assert_eq!(dpo.class(), DpoType::RECEIVE);
+        let interfaces = NetMain::global()
+            .expect("receive DPO requires its owner")
+            .interface_main();
+        let pool = &mut interfaces.state_mut().receive_dpos;
+        let object = pool
+            .get_mut(dpo.index())
+            .expect("referenced receive DPO is occupied");
+        object.lock_count = object
+            .lock_count
+            .checked_sub(1)
+            .expect("receive DPO reference count underflow");
+        if object.lock_count == 0 {
+            pool.remove(dpo.index());
+        }
+    }
+}
+
 unsafe impl Send for InterfaceMain {}
 unsafe impl Sync for InterfaceMain {}
 
@@ -407,6 +449,46 @@ impl InterfaceMain {
             rx_dpos: RefCell::new(Pool::new()),
             rx_dpo_by_interface: RefCell::new(HashMap::new()),
         }
+    }
+
+    /// Acquires a receive object under the caller's publication barrier.
+    /// An unspecified interface keeps the packet's original receive interface.
+    pub fn add_or_lock_receive_dpo(
+        &self,
+        sw_if_index: u32,
+        address: IpAddr,
+    ) -> Result<Option<DpoId>, DpoError> {
+        hammer_runtime::ensure_main_thread_with_barrier()?;
+        if sw_if_index != u32::MAX && self.software_interface(sw_if_index).is_none() {
+            return Ok(None);
+        }
+        let proto = match address {
+            IpAddr::V4(_) => DpoProto::IP4,
+            IpAddr::V6(_) => DpoProto::IP6,
+        };
+        NetMain::global()?
+            .dpo_main()
+            .identity(DpoType::RECEIVE, proto, 0)?;
+        let index = self.state_mut().receive_dpos.insert(ReceiveDpo {
+            sw_if_index,
+            address,
+            lock_count: 1,
+        });
+        Ok(Some(DpoId::receive(proto, index)))
+    }
+
+    /// Copies the interface fact during synchronous packet processing.
+    #[inline]
+    pub fn receive_dpo_interface(&self, dpo: DpoId) -> Option<u32> {
+        if dpo.class() != DpoType::RECEIVE {
+            return None;
+        }
+        let object = self.state().receive_dpos.get(dpo.index())?;
+        let proto = match object.address {
+            IpAddr::V4(_) => DpoProto::IP4,
+            IpAddr::V6(_) => DpoProto::IP6,
+        };
+        (proto == dpo.proto()).then_some(object.sw_if_index)
     }
 
     fn state(&self) -> &InterfaceState {

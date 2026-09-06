@@ -2,6 +2,23 @@ use core::mem::{align_of, size_of, transmute};
 
 use hammer_core::data_plane::{BufferPacketCursor, PRIMARY_OPAQUE_ALIGN, PRIMARY_OPAQUE_BYTES};
 
+bitflags::bitflags! {
+    #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+    #[repr(transparent)]
+    pub struct NetworkFlags: u8 {
+        const LOCALLY_ORIGINATED = 1 << 0;
+        const L4_CHECKSUM_COMPUTED = 1 << 1;
+        const L4_CHECKSUM_CORRECT = 1 << 2;
+    }
+
+    #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+    #[repr(transparent)]
+    pub struct NetworkOffloadFlags: u8 {
+        const TCP_CHECKSUM = 1 << 0;
+        const UDP_CHECKSUM = 1 << 1;
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct TapEthernetMetadata {
     pub destination: [u8; 6],
@@ -43,7 +60,8 @@ pub struct NetworkIpOpaque {
     ip_ecn: u8,
     ip_ecn_valid: u8,
     fib_index: u32,
-    reserved: [u8; 8],
+    pub rx_sw_if_index: u32,
+    reserved: [u8; 4],
 }
 
 impl Default for NetworkIpOpaque {
@@ -58,7 +76,8 @@ impl Default for NetworkIpOpaque {
             ip_ecn: 0,
             ip_ecn_valid: 0,
             fib_index: u32::MAX,
-            reserved: [0; 8],
+            rx_sw_if_index: u32::MAX,
+            reserved: [0; 4],
         };
         opaque.set_fib_index_override(None);
         opaque
@@ -155,17 +174,18 @@ impl NetworkIpOpaque {
     #[inline]
     pub fn fib_index_override(&self) -> Option<u32> {
         let index = u32::from_le_bytes([
-            self.reserved[4],
-            self.reserved[5],
-            self.reserved[6],
-            self.reserved[7],
+            self.reserved[0],
+            self.reserved[1],
+            self.reserved[2],
+            self.reserved[3],
         ]);
         (index != u32::MAX).then_some(index)
     }
 
     #[inline]
     pub fn set_fib_index_override(&mut self, index: Option<u32>) {
-        self.reserved[4..8].copy_from_slice(&index.unwrap_or(u32::MAX).to_le_bytes());
+        self.reserved
+            .copy_from_slice(&index.unwrap_or(u32::MAX).to_le_bytes());
     }
 }
 
@@ -237,7 +257,8 @@ impl Default for NetworkOpaqueOverlay {
 pub struct NetworkOpaque {
     pub sw_if_index: [u32; 2],
     pub l3_hdr_offset: i16,
-    pub oflags: u8,
+    pub oflags: NetworkOffloadFlags,
+    pub flags: NetworkFlags,
     overlay: NetworkOpaqueOverlay,
 }
 
@@ -249,7 +270,8 @@ impl Default for NetworkOpaque {
         Self {
             sw_if_index: [u32::MAX; 2],
             l3_hdr_offset: 0,
-            oflags: 0,
+            oflags: NetworkOffloadFlags::empty(),
+            flags: NetworkFlags::empty(),
             overlay: NetworkOpaqueOverlay::default(),
         }
     }
