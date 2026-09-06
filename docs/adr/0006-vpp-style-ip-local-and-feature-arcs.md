@@ -477,12 +477,10 @@ impl InterfaceMain {
     pub fn next_feature(&self, buffer: &mut Buffer) -> u16;
 
     #[inline(always)]
-    pub fn next_feature_with_config<R>(
+    pub fn next_feature_with_config<const N: usize>(
         &self,
         buffer: &mut Buffer,
-        config_words: usize,
-        read: impl for<'a> FnOnce(&'a [u32], u16) -> R,
-    ) -> R;
+    ) -> ([u32; N], u16);
 }
 ```
 
@@ -494,11 +492,19 @@ writes `heap_index + 1` as the buffer's current configuration index, and
 returns the slot.
 
 `next_feature` reads the heap word at the current index, advances by one, and
-returns the next slot. `next_feature_with_config` lends exactly `config_words`
-preceding words and the following next slot to a non-escaping closure, then
-advances by `config_words + 1`. The closure form prevents a plugin from
-retaining a heap slice across the next worker barrier while remaining
-monomorphized and allocation-free.
+returns the next slot through the `N = 0` specialization.
+`next_feature_with_config` copies exactly `N` configuration words into an owned
+fixed array, reads the following next slot and advances by `N + 1`. The node
+must use the configuration width installed by its owner. No heap borrow or
+callback escapes the operation; a later control-plane update cannot invalidate
+the returned array. This remains monomorphized and allocation-free.
+
+The user approved this signature replacement on 2026-09-06. It supersedes the
+callback-taking signature: HRTB prevented slice escape but did not prevent
+callback reentry from invalidating its borrowed storage. Callers replace the
+word-count/closure arguments with `::<N>` and destructure `(config, next)`.
+There is no compatibility overload, new type, buffer-layout change or stored
+configuration migration.
 
 The existing generic buffer header already reserves
 `current_config_or_punt: u32`, but its Rust accessors currently reinterpret the
@@ -887,7 +893,7 @@ protocol changes.
 | error enum | `FeatureError` | 完整 variants 见 Decision；startup declaration、interface、graph、storage failure | 替代 `FeatureArcError`；packet path invariant 不返回 error | concrete-variant and failure-atomic tests |
 | API | `InterfaceMain::{register_feature_arc,register_feature,install_feature_arcs,feature_arc_index,feature_index}` | 完整签名见 Decision；startup-only register/install | plugins migrate from marker traits/control object | plugin declaration and topology tests |
 | API | `InterfaceMain::{enable_feature,disable_feature,is_feature_enabled,modify_feature_arc_end,reset_feature_arc_end}` | numeric per-interface control；live mutation在 owner 内使用 barrier 宏 | existing callers migrate；不依赖 Binary API | startup/no-op/live mutation tests |
-| API | `InterfaceMain::{start_feature_arc,next_feature,next_feature_with_config}` | `Buffer` cursor + bitmap + dense index + shared heap；config borrow不能逃逸 closure | graph nodes migrate from attached start handles | packet graph tests and benchmark |
+| API | `InterfaceMain::{start_feature_arc,next_feature,next_feature_with_config}` | `Buffer` cursor + bitmap + dense index + shared heap; config method returns `([u32; N], u16)` without callback or borrowed return | replace count/closure arguments with `::<N>` and tuple destructuring; no compatibility overload, new type or stored-data migration | packet graph tests, config lifetime/width checks and benchmark |
 | API | `NodeRuntime::add_node_next_slots` | 对一组 `(node, next)` 先完整验证和 reserve，再 failure-atomic 地返回逐边 `u16` slot；实际新增主图边时设置一次 coalesced Graph Refork 请求 | generic runtime graph primitive；不引入 Feature-specific graph wrapper | recoverable-error atomicity, existing-edge no-op and one-refork tests |
 | graph nodes | `Ip4LocalNode`, `Ip4ReceiveNode`, `Ip4LocalEndOfArcNode`, `Ip6LocalNode`, `Ip6ReceiveNode`, `Ip6LocalEndOfArcNode` | six zero-sized concrete nodes; separate sibling sets | replace shared local/receive node | local graph registration and execution tests |
 | next enums | `Ip4LocalNext`, `Ip6LocalNext` | `Drop`, `Punt`, `FullReassembly` at fixed `u16` slots | dynamic protocol slots follow static slots | next-table and sibling tests |

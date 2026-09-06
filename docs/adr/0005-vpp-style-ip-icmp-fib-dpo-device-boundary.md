@@ -2581,16 +2581,25 @@ an additional network image.
 
 The ICMP plugin owns locally delivered ICMP wire parsing, type dispatch and
 echo replies. IP owns error generation and its concrete IPv4/IPv6 graph nodes.
-This supersedes the original all-ICMP-nodes-in-ICMP split. The ICMP-specific parser currently living in
-`hammer-service::net::pmtu` moves into the ICMP plugin. The PMTU authority also
-moves to the IP plugin to match VPP's `ip_pmtu_t`/`ip_pmtu_dpo_t`: it is a
-FIB-linked forwarding policy, not a generic service cache. ICMP parses a
-Fragmentation Needed message and submits a typed PMTU update event to the
-existing control-plane Binary API dispatcher. The dispatcher invokes the IP
-owner's `ip_path_mtu_update` operation inside the sole
+This supersedes the original all-ICMP-nodes-in-ICMP split. PMTU authority
+belongs to the IP plugin to match VPP's `ip_pmtu_t`/`ip_pmtu_dpo_t`: it is a
+FIB-linked forwarding policy, not a generic service cache. Follow the native
+control path: `vnet/ip/ip_api.c:2070-2080` handles `ip_path_mtu_update`, and
+`vnet/ip/ip_path_mtu.c` owns the update and control-plane maintenance. The
+Binary API dispatcher invokes the IP owner inside its
 `worker_thread_barrier_sync!` scope; TCP consumes the typed IP PMTU lookup after
-that publication. `hammer-service::net` contains neither ICMP bytes nor PMTU
-policy, and no second cross-worker synchronization protocol is introduced.
+publication. ICMP input does not submit automatic PMTU updates in the vendored
+implementation. Fragmentation Needed and Packet Too Big use the normal ICMP
+type dispatch; an unregistered consumer follows the protocol's punt path.
+
+The user's explicit instruction to align VPP supersedes the earlier invented
+ICMP-to-Binary-API event requirement. Delete the standalone `IcmpPathMtuNode`,
+its chain-to-Vec collection and the direct ICMP-byte-to-cache update APIs.
+Do not introduce a worker submission queue to satisfy that mistaken assumption.
+`hammer-service::net` contains neither ICMP bytes nor PMTU policy, and no
+second cross-worker synchronization protocol is introduced. Removing the
+non-native receive extension does not complete the separate FIB-linked IP PMTU
+owner, DPO or Binary API implementation requirements.
 
 Error generation follows vendored `vnet/ip/icmp4.c:216-375` and
 `icmp6.c:257-409`: apply per-worker source/destination suppression, copy only
@@ -2599,9 +2608,26 @@ result to 576 bytes for IPv4 or 1280 bytes for IPv6. Use TTL/hop-limit 255,
 zero IPv4 fragment flags, and the offending interface's source-selection
 policy. Send the generated packet to concrete IP lookup, or drop it when
 source selection fails; send original buffers to drop on every branch.
+Source selection consumes the interface's current address membership; this
+migration does not add an address `stale` flag or generation mechanism.
+The existing `write_ipv4_push_header` accepts `dont_fragment: bool` after
+`total_len`: TCP/UDP pass `true`, ICMP errors pass `false`. It writes the
+complete IPv4 header and checksum for the selected flags. This signature
+change was explicitly approved; no parallel IPv4 writer is introduced.
 Allocation failure and suppression must still consume the original frame
 entry. No chain-to-Vec aggregation, generated-packet Vec, source snapshot,
 ArcSwap, or process-wide packet-path mutex is part of this contract.
+The approved independent-buffer allocation is owned by core:
+`DataPlaneBuffers::alloc_index_from(&self, source: Index) -> DataPlaneResult<Index>`.
+It allocates one distinct slot in the current arena, preserves the current
+segment offset/length and both opaque values through Copy assignment, and
+copies only that segment's bytes. It does not inherit chain links, trace
+ownership, error ownership or reference counts. The source remains unchanged
+on success and allocation failure. Allocation and content transfer occur under
+one existing arena access, without an escaping source borrow. IP uses the
+existing `runtime.buffers()` boundary, then truncates and prepends on the new
+buffer. No runtime forwarding helper, `copy_no_chain`, new identity or chain
+type is introduced; `BufferChain` remains the separate traversal operation.
 Echo replies instead modify the received packet in place, preserving its
 chain and updating addresses, TTL/hop-limit and checksums as the concrete
 VPP echo nodes do. ICMP type registration uses the owner Main and existing
@@ -2918,9 +2944,14 @@ next enum, `thread_local!` local registration, atomic FIB handle, or
 | 类型 | `hammer-service::binary_api::BinaryApiMethodEntry` dispatch contract | FIB-touching methods 保持 `mp_safe = false`；由 dispatcher 统一进入宏，handler 不再承担同步职责 | 现有 envelope/ABI 不变；方法注册迁移 | mp-safe/non-mp-safe dispatch test |
 | 类型 | `NetMain` / `DeviceMain` | `NetMain` 使用单一 `Arc<NetMain>` owner；registry/pool 的 `RefCell` 只在主线程维护借用，控制面返回标准 `Ref`/`RefMut`，worker 只在同步选择期间读 barrier-owned payload 并返回 Copy identity；`DeviceMain` 保持按值 `OnceLock` | 禁止裸 pool 引用跨越替换或删除；不增加第二同步机制；query、lookup 和递归析构一起迁移 | retained-borrow rejection, worker barrier, same-pool recursive destruction |
 | 类型 | `hammer-service::interface::InterfaceMain` | 由 `NetMain` 按值嵌入并通过借用暴露；不再作为独立 `Arc<InterfaceMain>` ownership root | `NetMain::init`/调用方迁移为 `&InterfaceMain`；接口 pool 和 callback 语义不变 | net/interface lifecycle and borrow-ownership checks |
-| 类型/API | IP/ICMP graph registration images | IP image 保留 error nodes；ICMP image 声明 local input、echo、received-PMTU nodes/Main | `load_after = ["ip"]`；IP 无反向依赖 | IP-only error generation and ICMP local graph tests |
+| 类型/API | IP/ICMP graph registration images | IP image 保留 error nodes；ICMP image 声明 local input、echo nodes/Main；删除独立 received-PMTU node | `load_after = ["ip"]`；IP 无反向依赖；PMTU messages 走普通 type dispatch | IP-only error generation and ICMP local graph tests |
+| 类型/API | `IcmpMain` / ICMP type registration | existing Main owns IPv4/IPv6 dispatch tables and input-node identity; registration mutates only inside graph initialization or the existing main-thread publication scope; worker reads copy the selected entry | no snapshot handles or second publication protocol; `init` returns `RuntimeResult<()>`, Main is not Copy | type dispatch, registration visibility and native echo graph |
+| API | `write_ipv4_push_header` | final argument `dont_fragment: bool`; writer sets flags before computing checksum | explicitly approved; TCP/UDP pass true, IP ICMP errors pass false; no compatibility alias or second writer | native response DF/TTL/checksum and transport output regressions |
+| API (新增) | core `DataPlaneBuffers::alloc_index_from(&self, source: Index) -> DataPlaneResult<Index>` | allocate one independent current segment; preserve offset, length and Copy opaque values; exclude chain/trace/error ownership | IP error uses existing runtime buffer owner; existing Index/errors and allocation rollback; no runtime wrapper or serialized change | independent mutation, chained source, opaque preservation, exhaustion atomicity and reclamation; ICMP graph tests remain required |
+| 类型/API | `IcmpErrorMetadata` / `Ip4Main` / `Ip6Main` | metadata moves to IP protocol owner; final secondary opaque word is owned by `write/read/clear`; existing IP owners hold per-worker `ThreadOwned<Throttle>` slots and monotonic clock origins | producers IP/UDP and error nodes share one encoding; worker init/exit install and clear state; no address stale/generation fields | metadata coexistence, worker suppression isolation and response/original-chain ownership |
+| 类型/API | `build_echo_reply` / `IcmpEchoRequestTrace` | mutate borrowed first-buffer bytes with parsed IP facts; no generated packet value; trace reports `packet_len` | internal callers pass `&mut [u8]` and parsed header; packet payload/chain unchanged; trace field replaces `generated_len` | VPP-derived echo type/ID/sequence/payload/checksum and chain behavior |
 | API | `IpMain` FIB publication | 删除直接 `publish(table)`；改由 `ip4.route.add_del`/`ip6.route.add_del` Binary API handler 调用 service FIB 增量操作 | 运行时客户端改用 Binary API；dispatcher 宏负责 barrier | Binary API mutation and worker visibility test |
-| API | `hammer-service::net::pmtu` | 删除 service-owned PMTU cache；ICMP byte parser和 PMTU policy 均移至 IP/ICMP owners | TCP caller 改为显式依赖 IP 的 typed PMTU read/update | PMTU owner and cross-plugin contract test |
+| API | `hammer-service::net::pmtu` | 删除 service-owned PMTU cache；PMTU policy 归 IP；删除 ICMP byte-to-cache 更新，不增加 worker Binary API ingress | TCP caller 显式依赖 IP 的 typed PMTU read；更新归 IP 控制面 | PMTU owner and cross-plugin contract test |
 | Type (新增) | `FibUrpfList` | `net::fib` 的 baked 列表：私有 `interfaces: Vec<u32>`、`lock_count: u32`；`NetMain` 保存其 Pool，接口集合发布后不可变 | 无序列化或 ABI 导出；与 DPO 单接口查询区分，不新增 DPO class | FIB 投影、去重、共享列表重建、路由撤销和 pool 回收 |
 | API (新增) | `hammer-infra::heap_boxed::{allocate,deallocate}` | `allocate<T,const ALIGN:usize>(capacity:usize)->NonNull<T>`；`unsafe deallocate<T,const ALIGN:usize>(ptr:NonNull<T>,capacity:usize)`；限定 Main Heap、复用私有数组分配/回收，回收只释放 storage | 无新类型/分配后端/ABI；`Heap` 不公开，原 infra 调用不变；DPO 删除 `allocate_bucket_storage`、`release_bucket_storage`、`bucket_layout` | infra/service 编译，64-byte DPO 断言，现有跨 inline/overflow 的 4/8/1/8/4 引用回收场景 |
 | Type/API (修改) | `FibPathList` / `LoadBalanceDpo` | path list 的 uRPF index 私有，去除 owning Clone；`new` / `bake_urpf` / `urpf_index` 和 Drop 管理 path-list 引用；`NO_URPF` 不分配列表；LB 的 index 私有，bucket 更新保留引用、Drop 释放 | path owner 按路径语义贡献，不以 resolved 状态统一过滤，也不从 configured next hop 推断；entry 豁免使用独立 local0 列表；无 wire 变更，不允许直接覆盖 owning index | unresolved attached、非 looped recursive 贡献；共享列表与前缀豁免隔离、重建后旧消费者继续读取、最终回收 |
@@ -2945,6 +2976,8 @@ next enum, `thread_local!` local registration, atomic FIB handle, or
 | 类型 | `InterfaceTxDpo` | 删除只有 `sw_if_index` 的对象包装和 re-export；接口 TX identity 直接携带软件接口 index | 无对象 pool 或 release；现有 `DpoId::interface_tx` 保留，next 由实例 resolver 解析 | interface-owned stack integration |
 | API | `NetMain::{publish_load_balance_root,retire_load_balance_root,publish_replicate_root,retire_replicate_root}`、具体对象的 `publish_root`/`withdraw_root` | 删除额外的 root 生命周期包装 | 调用者在现有 publication scope 内使用 `lock_dpo`/`unlock_dpo`；无兼容 alias 或 wire 变化 | FIB/bucket 引用保留、撤销与 pool 回收场景 |
 | 类型/API | ICMP-owned error node/source snapshots | error nodes、metadata、generation 移回 IP；删除 source snapshots、runtime wrapper registries、ArcSwap 发布 | 无 compatibility re-export；ICMP 只保留 local | workspace compile, packet ownership and source-selection tests |
+| 类型/API | `IcmpInputControlPlane`, `IcmpInputSnapshot`, `IcmpInputSnapshotHandle`, `IcmpInputRuntime`, `IcmpGeneratedPacket`, error builders and ICMP `arc-swap` dependency | delete duplicate publication/runtime registries and intermediate response storage | type table belongs to `IcmpMain`; error writing belongs to IP; echo borrows the original packet | native graph dispatch and buffer-chain ownership tests |
+| 类型/API | ICMP `IcmpPathMtuNode`, `icmp_path_mtu_process`, `icmp_path_mtu_process_frame`, `update_path_mtu_from_index`, `collect_current_chain_for_icmp_generation`; IP `apply_ipv4_frag_needed_icmp`, `process_ipv4_icmp_path_mtu_packet` | delete non-native automatic ICMP PMTU learning, its graph image entry and payload collection; no new replacement type/API | breaking removal without aliases; the only production parser caller was the deleted node; no persisted data or Binary API envelope migration; retain IP-owned control updates | deletion/caller audit and ordinary ICMP type dispatch; separate IP PMTU control tests |
 | API | `register_ip4_error` / `register_ip6_error`; proposed `register_ip4_icmp_error_node` / `register_ip6_icmp_error_node` | 删除错误地注册 local protocol 的接口；不实现 error-consumer registration | producer 使用 IP-owned metadata 和 concrete named next | IP-only error graph execution |
 | 类型 | `hammer-service::net::fib::FibEntrySrcRelation` | 删除独立的 cover/sibling/interpose 关系枚举；cover/sibling 事实直接存放在 `FibEntrySrc.cover` 元组，interpose 事实存放在可选的 `FibEntrySrc.interpose_dpo` | 无兼容 alias；实现直接迁移到字段访问，文档和源码不得保留该类型 | 文档 inventory 检查、源码编译和 source-lifecycle 行为测试 |
 | 类型 | `hammer-service::net::fib::FibPathFlags` | 删除 service-owned 的固定路径策略位集合；路径 flags 改为 `FibPath<N, F>` 的 owner-supplied `F` | IP callers 迁移到 `hammer-plugins/net/ip::IpPathFlags`；无兼容 alias | generic FIB compile check and IP route flag tests |
@@ -3013,7 +3046,8 @@ phased; its first phase is the only completion gate for the current migration.
    Each behavior is proved once at the highest owning interface; tests do not
    repeat constructor coverage or use source-text assertions.
 7. One real plugin-load test proves that the IP and ICMP DSOs load in dependency
-   order and that ICMP registration reaches the concrete IP local/error tables.
+   order and that ICMP registration reaches IP local tables. IP error nodes
+   execute with only the IP DSO loaded; ICMP registers no error consumer.
 
 ### 明确排除项
 

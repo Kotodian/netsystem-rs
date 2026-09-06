@@ -1,5 +1,238 @@
 # DPO framework alignment review
 
+## Final ICMP and Feature Arc review checkpoint
+
+Verdict: **Needs changes**. This checkpoint records the current uncommitted
+IP/ICMP, local, punt, buffer and interface Feature Arc migration. It supersedes
+earlier checkpoint statements for those paths; the older DPO findings below
+remain a historical baseline, not a newly verified list of open defects.
+This review does not authorize new types or APIs. Implementation and delivery
+remain incomplete; no finding is closed merely by adding a node declaration.
+
+### Findings and implementation status
+
+IC02 implementation update: service `PuntNode` now uses ordinary graph-node
+initialization only. IP's existing concrete punt nodes use explicit graph init
+callbacks to register PUNT/IP4 and PUNT/IP6 with their own node identities and
+preserve their named next to the generic terminal. No new public type/API was
+introduced. The existing IP FIB lifecycle test now invokes those production
+registration entries, stacks each protocol's PUNT DPO, resolves the resulting
+graph edge and checks the concrete punt node and its terminal edge. This is
+required graph-dispatch proof for issue #291 and IC02, not a constructor test.
+`cargo check -p hammer-plugin-ip --all-targets --message-format=short` passed
+after this change; tests have not run. IC02 therefore remains pending the final
+behavior-test gate, rather than a current known wrong registration.
+
+Changed paths for this slice: service `src/data_plane.rs`, IP `src/punt.rs`,
+IP `src/fib.rs` (existing test only), and this ledger. The remaining findings
+are not resolved by this registration change. Work continues in the current
+thread without sub-agents, as explicitly requested by the user.
+
+IC03/IC04/IC05 implementation update: IP `local.rs` now checks the declared
+packet length against the first segment plus chain length, validates UDP length
+before local features, releases its first-buffer borrow, and feeds chain
+segments directly to the existing `InternetChecksum` implementation. The
+checksum stops at the declared IP transport length, carries odd bytes between
+segments, and uses no collected payload. IPv6 source lookup now honors packet
+FIB plus its explicit override. A regression case uses the vendored IPv4 echo
+message split at an odd buffer boundary, checks corruption in the tail and
+verifies chain reclamation. The test's configuration import was corrected to
+the existing `hammer_runtime::DataPlaneBufferConfig` export. The command
+`cargo check -p hammer-plugin-ip -p hammer-plugin-icmp --all-targets --message-format=short`
+now passes, including the test targets; no tests have executed.
+Concrete per-family validation/errors, offload/translated
+facts and receive-object integration remain open; these changes do not close
+IC04/IC05 or prove complete local graph behavior.
+
+Local dispatch update: `local.rs` now selects the local-next entry using the
+base IPv4/IPv6 header protocol, before parsing transport or IPv6 extensions.
+The end-of-arc branch returns from that dispatch portion without calling
+`ip_header`, transport validation, source lookup or Feature Arc start. IPv4
+fragment classification still selects reassembly, matching
+`ip4_forward.c:1680-1694,1797-1818`; IPv6 uses `ip->protocol` as in
+`ip6_forward.c:1591`, not the effective upper-layer protocol. No new helper or
+public API was introduced. Full graph behavior tests remain pending.
+
+IC08 FIB update: the IPv6 echo response to a request from a non-link-local
+source to a link-local destination now clears both packet FIB selection facts.
+The existing `lookup_index` then maps the preserved RX interface to its IPv6
+FIB. This implements `ping.c:652-664` without interpreting TX interface as a
+FIB index or adding a cross-plugin API. Other replies retain their packet FIB
+facts. Host TTL policy, IPv4 fragment-ID generation and locally-originated
+metadata remain incomplete. Compilation of IP/ICMP all targets and
+`git diff --check` passed after this change; packet tests remain pending the
+final pre-commit gate.
+
+ICMP echo message tests now reproduce the ID `0xB`, sequence `5` and eighteen
+`0x0a` payload bytes from `test_ip4.py::TestICMPEcho.test_icmp_echo` and
+`test_ip6.py::TestICMPv6Echo.test_icmpv6_echo`. IPv6 covers global and link-local
+destinations. Both tests call the real in-place writer with either all bytes
+or only the IP/ICMP headers available, then check swapped addresses, reply
+type/code, preserved ID/sequence/payload and complete checksums. They do not
+claim Ethernet rewrite, graph dispatch, FIB selection, host TTL policy,
+random IPv4 ID or origin-flag coverage. These are private protocol tests, with
+no exported test API or additional dependency. `cargo check -p hammer-plugin-icmp
+--all-targets --message-format=short` passed; tests have not executed.
+
+ICMPv6 input correction: `icmp6.c:165-194` selects punt for all classified
+type/code/hop-limit/length errors. Hammer's IPv6 input default error next now
+selects `ip6-punt`, retaining its typed error assignment; IPv4 and echo nexts
+are unchanged. The new private input test installs the actual runtime,
+service, IP and ICMP registration images and invokes the input path under its
+node context. Cases cover registered echo, invalid echo code, neighbor hop
+limit, length-error precedence and unknown type; assertions resolve the next
+through the real graph and compare the buffer's preinstalled error index.
+`cargo check -p hammer-plugin-icmp --all-targets --message-format=short` passed.
+The test is not executed yet: neither successful runtime initialization nor
+end-to-end packet processing is claimed from compilation alone.
+
+Feature-chain termination update: the compiler no longer emits an outgoing
+edge/config next for the final occurrence when its node already equals the
+selected end node. This follows `vnet/config.c:84-89` and removes the previous
+end-node self edge. The end-node identity remains in the configuration sharing
+key. `crates/hammer-service/tests/interface_features.rs` uses existing concrete
+graph nodes and the public interface configuration methods to check implicit
+and explicitly enabled termination, resolved next edges, no terminal self edge,
+disable-to-default behavior and buffer reclamation. It is a configuration
+compiler regression, not a claim of complete packet graph execution.
+`cargo check -p hammer-service --test interface_features --message-format=short`
+and `git diff --check` passed; the test has not executed.
+
+IC06 replacement was approved and implemented on 2026-09-06. The const-generic
+`next_feature_with_config::<N>` returns `([u32; N], u16)`, copying configuration
+words into a fixed owned array without allocation, a new type or a callback.
+ADR-0006 records the decision. The executed `interface_features` test checks
+two-word and zero-word cursor advancement, terminal behavior, and owned words
+remaining valid after configuration removal and reuse. The callback reentry
+defect is resolved; this does not resolve the independent handoff defect IC01.
+
+IC09 implementation update: `icmp_error.rs` now selects destination-unreachable,
+time-exceeded, parameter-problem and IPv6 packet-too-big sent counters according
+to the type mappings in VPP `icmp4.c:200-214` and `icmp6.c:238-254`. Counter
+selection does not introduce an extra wire-code policy. At the user's explicit
+request, the newly added trace macro call and manual trace-handle transfer have
+been deleted. Trace handling is deferred to separate work; existing trace
+infrastructure is unchanged. Locally-originated metadata and full graph counter
+test evidence remain open. No tests have run for this batch.
+
+IC01 migration constraint: `NodeRuntime::node_for_handle` uses a registration
+map, so `NodeHandle::new(resolved_node.slot())` is not a valid replacement for
+the current continuation mechanism. TCP is the current `Some(continuation)`
+caller; reassembly and UDP migration use direct targets. Keep the feature
+cursor untouched in the eventual fix without pretending node IDs and registered
+handles are interchangeable. No handoff implementation change has been made
+at this checkpoint.
+
+IC07 corrected decision after the user's explicit VPP-alignment instruction:
+`hammer-service/src/binary_api.rs:392` gives `BinaryApiMain` only socket-listener,
+path and frame-limit state. Its request dispatch at lines 570-612 executes on
+the main/control path and owns the worker barrier. There is no existing worker
+submission method to reuse. ADR-0005's ICMP/PMTU paragraph incorrectly assumes
+that such an ingress already exists. Source call-site inspection found
+`ip_path_mtu_update` in VPP's `vnet/ip/ip_api.c:2077` and control maintenance in
+`ip_path_mtu.c:751`, not in ICMP input. The user reiterated that the design must
+align with VPP rather than add this extension. ADR-0005 now removes the mistaken
+worker-event requirement. The ICMP PMTU node/image entry, its chain collector
+and the two IP ICMP-byte parsers have been deleted. PMTU messages remain on
+ordinary ICMP type dispatch; no worker ingress is proposed. IP FIB-linked PMTU
+state, DPO behavior and control-plane API are still required and are not proved
+complete by this deletion. No tests have run for the deletion batch.
+
+| ID | Owner and current evidence | Contract, impact and required correction |
+| --- | --- | --- |
+| IC01 | Runtime: `crates/hammer-runtime/src/data_plane/handoff.rs:89` writes a resolved node slot to `current_config_index`; service `interface/feature.rs:337` reads that field as a shared configuration heap index. | A handoff with a continuation inside an active feature chain corrupts its cursor, allowing a wrong next or out-of-bounds access. Preserve feature configuration across handoff using the existing handoff ownership contract. ADR-0006's paragraph allowing this reinterpretation also needs correction; renaming the field does not separate the two simultaneous facts. |
+| IC02: implemented, test gate pending | Service `PuntNode` no longer registers a DPO; IP `punt.rs` registers each concrete protocol binding in its node init. | VPP `src/vnet/dpo/punt_dpo.c:65` binds `ip4-punt` and `ip6-punt`. The former bypass is removed in source; the added graph-stacking regression checks await execution. Generic terminal disposition remains separate. |
+| IC03: implemented, test gate pending | IP `local.rs` validates declared length against the chain and feeds segments to `InternetChecksum`; the odd-boundary ICMP checksum test compiles. | VPP `src/vnet/ip/ip6_forward.c:1058` onward computes over buffer chains. The implementation no longer requires the entire transport payload in the first buffer, but executable chain and full local graph evidence remain pending. |
+| IC04: partially implemented | IP `local.rs` now validates UDP length/checksum before local features, but still lacks translated/offload/computed facts and concrete family-specific paths/errors. | ADR-0006 and VPP `ip4_forward.c`/`ip6_forward.c` require those independent validation branches. The existing shared IPv4/IPv6 function remains incomplete. |
+| IC05: partially implemented | IPv6 source lookup now uses packet FIB plus explicit override. Local features still use raw RX interface; generic `ReceiveDpo<A>` has no connected instance lookup in this path. | ADR-0006 and VPP `ip6_forward.c:1574-1586` require effective receive-interface facts. Connect receive-object production/consumption without moving concrete address policy into service. |
+| IC06: resolved and tested | Service `next_feature_with_config::<N>` returns owned words and next without calling user code. | Approved replacement removes the borrowed-slice callback; the configuration lifecycle regression passes. IC01 remains independent. |
+| IC07: non-native extension removed | ICMP PMTU node, graph declaration and chain collector deleted; IP ICMP-byte cache parsers deleted. | Latest user instruction requires native VPP behavior. ADR-0005 now specifies IP control-plane PMTU updates, not automatic ICMP worker submission. Ordinary type dispatch/punt remains; full IP PMTU control/DPO behavior still requires its own completion evidence. |
+| IC08 | ICMP: `src/protocol.rs:85,92` fixes TTL/hop-limit at 64 and preserves the request's IPv4 fragment ID; echo processing lacks the complete origin/FIB handling. | VPP `src/plugins/ping/ping.c:303,449-462,650-665` uses host configuration, a new IPv4 fragment ID, locally-originated state and the IPv6 link-local/global reply FIB adjustment. Complete these owner-local semantics rather than treating address/type swaps as full echo alignment. |
+| IC09: partially implemented; trace deferred | IP `icmp_error.rs` separates sent-type counters. Locally-originated state and graph counter evidence remain missing. | VPP `src/vnet/ip/icmp4.c:286-294` and the corresponding IPv6 path mark origin. Complete non-trace metadata/counter behavior. The user explicitly deferred trace: the newly added macro and handle-transfer code are deleted and must not be restored as part of this work. |
+
+### Headroom correction: withdrawn finding
+
+The earlier claim that user-configured headroom must cover an IP/ICMP header,
+or that zero/small configured headroom proves a prepend panic, is withdrawn.
+Headroom is user-owned buffer policy, not an IP or ICMP configuration requirement.
+No protocol-specific minimum, allocator or automatic headroom adjustment is
+requested by this review.
+
+VPP `src/vlib/buffer.h:178-187` contains three distinct declarations:
+`CLIB_ALIGN_MARK (headroom, 64)` is an alignment marker, not writable packet
+storage; `pre_data[VLIB_BUFFER_PRE_DATA_SIZE]` is the reserved storage directly
+before `data[]`; `data[]` is the packet data origin. Backward header insertion
+uses the valid packet-storage range, including `pre_data`, with `current_data`
+locating the current packet relative to `data[0]`. It does not write into the
+alignment marker or buffer metadata.
+
+Hammer `buffer/mod.rs:53` defines 128 bytes of pre-data, and
+`buffer/header.rs:78-79` places the data origin after that reserve. The existing
+method named `available_headroom` at lines 497-500 measures writable prefix
+capacity from the end of the buffer header to the current packet start. Its
+name must not be used to equate that capacity with the user's headroom setting.
+`reset_empty` applies the configured initial data offset; `pool.rs:123-140`
+preserves the source offset in the independent response buffer. These are
+separate layout facts, not authorization for a protocol to change or require
+the user's reserved headroom.
+
+VPP `icmp4.c:274-296` copies the current first buffer and advances backward to
+prepend response headers. The Hammer comparison must follow the corresponding
+`pre_data`/`current_data` bounds and response layout. User-defined headroom is
+not an ICMP-owned resource or an ICMP configuration prerequisite.
+
+An exhausted prepend range must be demonstrated through an actual reachable
+buffer state before reporting a failure-path defect. This checkpoint makes no
+such claim and does not change buffer policy or classify that condition anew.
+
+### Verification and delivery status
+
+Current test checkpoint (2026-09-06; supersedes historical test-pending notes
+above and below): the previous workspace run failed only the ICMP stats fixture
+and interface-address main-thread fixture. Both fixtures are corrected without
+weakening production checks. At the user's direction, the rerun is limited to:
+
+- `cargo test -p hammer-plugin-icmp --lib --message-format=short`: 3 passed.
+- `cargo test -p hammer-service --test interface_address_lifetime --test interface_features --test dpo_lifetime --test packet_throttle --message-format=short`: 5 passed.
+- `cargo test -p hammer-core --test buffer_allocation -p hammer-plugin-ip --lib --message-format=short`: 3 passed.
+
+All 11 selected tests pass. The IP FIB test verifies concrete punt stacking;
+the chain test verifies odd-boundary checksum and corruption, not full local
+graph coverage. Formatting was applied only to changed Rust files, and
+`git diff --check` passes. No host TUN/TCP lab or further workspace test was run.
+Trace remains deferred. Green selected tests do not close IC01, IC04, IC05,
+IC08, IC09 or the remaining PMTU integration gap. Delivery must remain a draft
+until those acceptance gaps are resolved; issue #291 must not be marked complete.
+
+Historical review checkpoint:
+
+- Current review commands: source inspection with `rg`/`sed`/`nl`,
+  `git status --short`, `git diff --check`, and
+  `cargo fmt --all -- --check`.
+- `git diff --check` passed. Formatting check failed in the new macro,
+  interface feature and IP node changes; it did not modify files.
+- The preceding checkpoint records a successful multi-crate `cargo check
+  --all-targets`; this review did not rerun compilation and does not treat
+  compilation as packet-graph behavior evidence.
+- No test command was run during this review. Current migration lacks verified
+  graph tests for feature order/config/end/handoff, DPO punt traversal, receive
+  interface selection, chained local validation and ICMP response behavior.
+  The core allocation test alone cannot establish these contracts.
+- Test cases must derive from vendored packet behavior, including
+  `test/test_ip4.py` ICMP echo and TTL/MTU cases and `test/test_ip6.py` echo and
+  hop-limit cases. Exercise real nodes, packet contents, next arcs and owner
+  state, not source-text assertions or constructor-only next-slot assertions.
+  The concrete echo baseline is `test_ip4.py:534`,
+  `TestICMPEcho.test_icmp_echo`: request ID `0xB`, sequence `5`, eighteen
+  `0x0a` payload bytes; verify swapped addresses, reply type and preserved
+  ID/sequence/payload. `test_ip6.py:1580`,
+  `TestICMPv6Echo.test_icmpv6_echo`, applies the same message checks to both
+  global and link-local destinations with a global source. Neither reference
+  requires creating a local host TUN interface for Hammer's graph tests.
+- Run tests only at the repository's final pre-commit gate after implementation,
+  review and formatting are ready. Module commits, push and target cleanup have
+  not been completed. Do not claim full alignment or close the issue yet.
+
 ## Scope and verdict
 
 Verdict: **Needs changes**. This is a static review of the current worktree,
@@ -12,6 +245,102 @@ workspace target directory after verification. Findings are not resolved merely
 because an implementation edit exists.
 
 ## Implementation ledger
+
+Current uncommitted ICMP migration checkpoint:
+
+- IP owns `protocol::icmp::IcmpErrorMetadata` and concrete
+  `ip4-icmp-error`/`ip6-icmp-error` nodes. IP input and UDP unknown-port paths
+  write the shared metadata and select those concrete nodes; duplicate
+  TCP/UDP overlays and ICMP's error node/source snapshots/builders are removed.
+- IP error nodes attempt to use new response buffers, quote only the original
+  first buffer, bound output at 576/1280, and consume originals through drop.
+  The arena lock reentry is corrected: `generate_error` drops the source borrow
+  before calling core's `alloc_index_from`, which allocates and transfers the
+  current segment under one arena write guard. It then truncates and prepends
+  directly in the response buffer. Copy assignment preserves both opaque
+  regions, including the FIB override; only the error request and response
+  cursor are updated by IP. This is not yet executable graph proof.
+  VPP `buffer_funcs.h:1257` allocates a
+  distinct first buffer and copies both opaque regions and current bytes;
+  `icmp4.c:274` and `icmp6.c:315` consume that operation.
+  Existing `Ip4Main`/`Ip6Main` hold indexed `ThreadOwned<Throttle>` slots;
+  worker init installs them and owner-worker exit clears them. No new Main,
+  lock or pointer-publication mechanism is added.
+- Explicit user correction: no address stale flag or generation mechanism is
+  added. Current interface address membership is authoritative.
+- Explicit user approval: `write_ipv4_push_header` gains the final
+  `dont_fragment: bool` argument. TCP/UDP pass true; ICMP errors pass false.
+  The existing writer computes the checksum with the selected flags. IPv6
+  errors reuse `write_ipv6_push_header`; protocol numbers use `IpProtocol`.
+- ICMP input tables now live directly in `IcmpMain`. The legacy control-plane,
+  snapshot, handle and mutex-runtime-registry surfaces and the ICMP crate's
+  `arc-swap` dependency are removed. Type registration requires the existing
+  main-thread publication scope; packet reads copy one table entry.
+- Echo mutates the original first buffer's headers in place, incrementally
+  updates the ICMP type/checksum and preserves the chain. The generated-packet
+  Vec and echo chain aggregation are removed. Echo registers into the type
+  table and uses concrete IPv4/IPv6 lookup nexts. Node error descriptors are
+  installed for input and echo.
+- Echo now resolves its existing NetMain dependency before borrowing or
+  rewriting the packet, so failure to obtain that dependency cannot leave a
+  modified reply. This is a source-inspected ordering fix, not test evidence.
+- Registration non-finding: `NodeRuntimeInner::materialize_node_errors` and
+  `validate_node_error_batch` both skip already-installed tables
+  (`hammer-runtime/src/node.rs:629-693`). The later empty NodeEntry descriptor
+  slice therefore does not overwrite descriptors installed by the ICMP node
+  callbacks. No registration API change is warranted for this concern.
+- Explicit user correction: the proposed `copy_no_chain` API is withdrawn and
+  not approved. BufferChain already expresses chain traversal; the missing
+  capability is safe access to distinct source/destination packet storage,
+  not another chain abstraction. Index and header Copy semantics do not
+  allocate or duplicate the packet bytes stored outside the header. The user's
+  subsequent confirmation approves owner-local independent segment allocation:
+  core now exposes `alloc_index_from(Index) -> DataPlaneResult<Index>`, called
+  through existing `runtime.buffers()`. No runtime wrapper, generation,
+  intermediate payload storage or guard bypass is introduced. The new core
+  lifecycle scenario covers independent mutation, source-chain survival,
+  opaque/offset preservation, allocation exhaustion and final reclamation;
+  it has not yet run and is not a substitute for ICMP graph tests.
+- Earlier checks: focused `cargo check` for IP/ICMP/UDP/TCP, all targets, passed
+  before the independent-buffer allocation change.
+  The core allocation and IP consumer migration subsequently passed
+  `cargo check -p hammer-core -p hammer-plugin-ip -p hammer-plugin-icmp
+  -p hammer-plugin-udp -p hammer-plugin-tcp --all-targets --message-format=short`.
+  Independent read-only review found no blocker in that bounded migration;
+  its trace/error exclusion coverage note was addressed by setting nondefault
+  source values in the same lifecycle scenario. Tests remain unexecuted.
+  No tests or commits have run for this migration. These checks are not packet,
+  DSO, publication, or complete VPP-alignment proof.
+- Remaining integration work includes IP local's old ArcSwap/runtime registry,
+  trace/origin/FIB metadata equivalence, IPv4 echo fragment-ID/host policy,
+  IPv6 link-local forwarding/source-selection details, real punt behavior,
+  PMTU event publication and VPP-derived graph tests. The current PMTU consumer
+  still aggregates a chain and directly calls the old IP cache parser; it is
+  not complete. The service Binary API currently accepts socket requests only;
+  no worker-to-dispatch request ingress was found. Runtime remote-local queues
+  are main-to-worker and mutex-backed, not a substitute for this missing seam.
+- Complete-path audit correction: IP local's static `icmp-input` next and
+  ICMP-specific default dispatch are removed. Existing explicit registration
+  is the only local ICMP connection; the IP graph no longer requires that
+  foreign node by name. This fixes one dependency edge, not full IP-only graph
+  execution. Default punt still aliases drop and needs its real IP behavior.
+  Both registration entry points still mutate one shared table, contrary to
+  ADR-0006, and local requires all transport bytes in the first buffer. Thus
+  the in-place echo chain behavior cannot yet be reached for valid chained
+  input. Resolve these together with the approved concrete local nodes/tables
+  and removal of the snapshot/runtime registry, not by extending the shared
+  local model with another protocol helper.
+- Trace audit: VPP `trace_funcs.h:168` assigns the existing trace flag/handle
+  to the response; Hammer's trace state finalizes a handle when its buffer is
+  released. New-buffer allocation deliberately does not inherit that handle.
+  The ICMP path therefore still needs a verified trace-lifetime solution;
+  `try_mark_trace` is not equivalent because it consumes an independent node
+  quota. Do not simply copy the numeric handle and assume shared lifetime.
+- PMTU audit: vendored `ip_path_mtu_update` callers found in `ip_api.c`,
+  `ip_path_mtu.c` replacement handling and API test clients, not ICMP input.
+  Automatic ICMP-to-typed-PMTU publication remains an ADR extension, not proof
+  of an existing VPP receive path. The proposed generic Binary API worker
+  ingress is withdrawn, not approved by the overall alignment instruction.
 
 Active objective correction: delivery now targets ICMP alignment against ADR
 and vendored VPP, with VPP-derived tests, module commits, push and target
