@@ -3400,7 +3400,14 @@ impl Parse for DpoNodeBinding {
             proto: content.parse()?,
             argument: {
                 content.parse::<Token![,]>()?;
-                content.parse()?
+                let argument = content.parse()?;
+                if content.parse::<Option<Token![,]>>()?.is_some() && !content.is_empty() {
+                    return Err(Error::new(
+                        content.span(),
+                        "DpoClass node binding accepts one NodeId argument",
+                    ));
+                }
+                argument
             },
         })
     }
@@ -3415,47 +3422,110 @@ pub fn derive_dpo_class(input: TokenStream) -> TokenStream {
     let ident = item.ident;
     let (impl_generics, ty_generics, where_clause) = item.generics.split_for_impl();
     let mut nodes = Vec::<DpoNodeBinding>::new();
+    let mut shared_nodes = false;
+    let mut lock = None::<syn::Path>;
+    let mut unlock = None::<syn::Path>;
     for attribute in item
         .attrs
         .iter()
         .filter(|attribute| attribute.path().is_ident("dpo_class"))
     {
+        if matches!(&attribute.meta, syn::Meta::Path(_)) {
+            shared_nodes = true;
+            continue;
+        }
         let parsed = attribute.parse_args_with(|input: ParseStream<'_>| {
-            let key: Ident = input.parse()?;
-            if key != "nodes" {
-                return Err(Error::new(key.span(), "expected `nodes`"));
-            }
-            input.parse::<Token![=]>()?;
-            let content;
-            bracketed!(content in input);
-            let mut bindings = Vec::new();
-            while !content.is_empty() {
-                bindings.push(content.parse::<DpoNodeBinding>()?);
-                if content.parse::<Option<Token![,]>>()?.is_none() {
+            while !input.is_empty() {
+                let key: Ident = input.parse()?;
+                input.parse::<Token![=]>()?;
+                match key.to_string().as_str() {
+                    "nodes" => {
+                        let content;
+                        bracketed!(content in input);
+                        while !content.is_empty() {
+                            nodes.push(content.parse::<DpoNodeBinding>()?);
+                            if content.parse::<Option<Token![,]>>()?.is_none() {
+                                break;
+                            }
+                        }
+                    }
+                    "lock" => {
+                        if lock.is_some() {
+                            return Err(Error::new(key.span(), "duplicate `lock`"));
+                        }
+                        lock = Some(input.parse()?);
+                    }
+                    "unlock" => {
+                        if unlock.is_some() {
+                            return Err(Error::new(key.span(), "duplicate `unlock`"));
+                        }
+                        unlock = Some(input.parse()?);
+                    }
+                    _ => {
+                        return Err(Error::new(
+                            key.span(),
+                            "expected `nodes`, `lock` or `unlock`",
+                        ));
+                    }
+                }
+                if input.parse::<Option<Token![,]>>()?.is_none() {
                     break;
                 }
             }
-            Ok(bindings)
+            Ok(())
         });
-        match parsed {
-            Ok(bindings) => nodes.extend(bindings),
-            Err(error) => return error.into_compile_error().into(),
+        if let Err(error) = parsed {
+            return error.into_compile_error().into();
         }
     }
-    if nodes.is_empty() {
+    let locks = match (lock, unlock) {
+        (Some(lock), Some(unlock)) => quote!(Some((#lock, #unlock))),
+        (None, None) => quote!(None),
+        _ => {
+            return Error::new(ident.span(), "DpoClass requires both `lock` and `unlock`")
+                .into_compile_error()
+                .into();
+        }
+    };
+    if nodes.is_empty() && !shared_nodes {
         return Error::new(ident.span(), "DpoClass requires a non-empty `nodes` list")
             .into_compile_error()
             .into();
     }
+    if shared_nodes && !nodes.is_empty() {
+        return Error::new(
+            ident.span(),
+            "DpoClass cannot combine `nodes` with bare `dpo_class`",
+        )
+        .into_compile_error()
+        .into();
+    }
+    if shared_nodes {
+        return quote! {
+            impl #impl_generics #ident #ty_generics #where_clause {
+                pub fn register_dpo_class(
+                    dpo_main: &mut ::hammer_service::net::dpo::DpoMain,
+                    nodes: &[(::hammer_service::net::dpo::DpoProto, &[::hammer_core::data_plane::NodeId])],
+                ) -> Result<::hammer_service::net::dpo::DpoType, ::hammer_service::net::dpo::DpoError> {
+                    dpo_main.register_new_type(nodes, #locks)
+                }
+            }
+        }
+        .into();
+    }
     let arguments: Vec<_> = nodes.iter().map(|node| &node.argument).collect();
-    let protocols: Vec<_> = nodes.iter().map(|node| &node.proto).collect();
+    let registrations = nodes.iter().map(|node| {
+        let proto = &node.proto;
+        let argument = &node.argument;
+        quote!((#proto, &[#argument][..]))
+    });
     quote! {
         impl #impl_generics #ident #ty_generics #where_clause {
             pub fn register_dpo_class(
                 dpo_main: &mut ::hammer_service::net::dpo::DpoMain,
                 #(#arguments: ::hammer_core::data_plane::NodeId),*
             ) -> Result<::hammer_service::net::dpo::DpoType, ::hammer_service::net::dpo::DpoError> {
-                dpo_main.register_new_type(&[#((#protocols, #arguments)),*])
+                dpo_main.register_new_type(&[#(#registrations),*], #locks)
             }
         }
     }

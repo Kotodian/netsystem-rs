@@ -1,7 +1,12 @@
+use std::alloc::{Layout, alloc, dealloc, handle_alloc_error};
 use std::mem::{align_of, size_of};
+use std::ptr::NonNull;
+use std::slice;
 
 use hammer_core::data_plane::NodeId;
 use hammer_runtime::{DataPlaneMain, RuntimeError};
+
+use super::fib::FibEntryFlags;
 
 #[repr(transparent)]
 #[derive(
@@ -60,13 +65,28 @@ impl DpoType {
 }
 
 #[repr(transparent)]
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy)]
 pub struct DpoId(u64);
+
+impl PartialEq for DpoId {
+    fn eq(&self, other: &Self) -> bool {
+        self.class() == other.class() && self.index() == other.index()
+    }
+}
+
+impl Eq for DpoId {}
+
+impl std::hash::Hash for DpoId {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        self.class().hash(state);
+        self.index().hash(state);
+    }
+}
 
 impl DpoId {
     pub const INVALID: Self = Self::with_next(DpoType::INVALID, DpoProto::NONE, u32::MAX, 0);
 
-    pub const fn new(dpo_type: DpoType, proto: DpoProto, index: u32) -> Self {
+    const fn new(dpo_type: DpoType, proto: DpoProto, index: u32) -> Self {
         Self::with_next(dpo_type, proto, index, 0)
     }
 
@@ -172,6 +192,26 @@ pub enum DpoError {
     ObjectMissing { dpo_type: u8, index: u32 },
     #[error("DPO bucket count must be zero or a power of two")]
     InvalidBucketCount,
+    #[error("a zero-bucket DPO class {dpo_type} cannot be published")]
+    EmptyDpoPublication { dpo_type: u8 },
+    #[error("DPO bucket storage does not match its bucket count")]
+    InvalidBucketStorage,
+    #[error("DPO type key space is exhausted at {next_type}")]
+    TypeKeySpaceExhausted { next_type: u8 },
+    #[error("DPO builtin type {dpo_type} is outside the reserved range")]
+    InvalidBuiltinType { dpo_type: u8 },
+}
+
+impl From<DpoError> for RuntimeError {
+    fn from(error: DpoError) -> Self {
+        match error {
+            DpoError::Runtime(error) => error,
+            error => RuntimeError::Subsystem {
+                subsystem: "DPO",
+                source: Box::new(error),
+            },
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -180,6 +220,8 @@ pub struct DpoMain {
     // vectors. Empty node lists are valid for instance-dependent classes.
     nodes: Vec<Vec<Vec<NodeId>>>,
     edges: Vec<Vec<Vec<Vec<u16>>>>,
+    pub(super) locks: Vec<Option<fn(DpoId)>>,
+    pub(super) unlocks: Vec<Option<fn(DpoId)>>,
     next_type: u8,
 }
 
@@ -193,6 +235,7 @@ impl Default for DpoMain {
 // are deliberately reserved; service net does not define the business classes
 // that occupy them in VPP.
 const DYNAMIC_TYPE_START: u8 = 30;
+const DPO_PROTO_COUNT: u8 = 6;
 const NO_EDGE: u16 = u16::MAX;
 
 impl DpoMain {
@@ -200,6 +243,8 @@ impl DpoMain {
         Self {
             nodes: Vec::new(),
             edges: Vec::new(),
+            locks: Vec::new(),
+            unlocks: Vec::new(),
             next_type: DYNAMIC_TYPE_START,
         }
     }
@@ -260,7 +305,11 @@ impl DpoMain {
     }
 
     fn validate_protocol(proto: DpoProto) -> Result<(), DpoError> {
-        (proto != DpoProto::NONE)
+        // VPP's dpo_proto_t has six packet-graph protocols (0..=5) and
+        // reserves 7 as DPO_PROTO_NONE. Values outside that space are not
+        // extension points: they would create graph-table entries with no
+        // corresponding protocol semantics.
+        (proto.get() < DPO_PROTO_COUNT)
             .then_some(())
             .ok_or(DpoError::InvalidProtocol { proto: proto.get() })
     }
@@ -279,9 +328,13 @@ impl DpoMain {
         hammer_runtime::ensure_main_thread_with_barrier().map_err(DpoError::Runtime)
     }
 
+    /// Allocates one class key and binds the originating graph nodes for each
+    /// data-path protocol. The node list is the Rust equivalent of VPP's
+    /// NULL-terminated `dpo_nodes[type][proto]` list.
     pub fn register_new_type(
         &mut self,
         nodes: &[(DpoProto, &[NodeId])],
+        locks: Option<(fn(DpoId), fn(DpoId))>,
     ) -> Result<DpoType, DpoError> {
         Self::require_registration_scope()?;
         for (position, (proto, _)) in nodes.iter().enumerate() {
@@ -294,9 +347,18 @@ impl DpoMain {
         self.next_type = self
             .next_type
             .checked_add(1)
-            .expect("DPO dynamic class space exhausted");
+            .ok_or(DpoError::TypeKeySpaceExhausted {
+                next_type: self.next_type,
+            })?;
         for (proto, node_ids) in nodes {
             *self.node_slot_mut(dpo_type, *proto) = node_ids.to_vec();
+        }
+        let index = usize::from(dpo_type.get());
+        self.locks.resize(index + 1, None);
+        self.unlocks.resize(index + 1, None);
+        if let Some((lock, unlock)) = locks {
+            self.locks[index] = Some(lock);
+            self.unlocks[index] = Some(unlock);
         }
         Ok(dpo_type)
     }
@@ -306,6 +368,23 @@ impl DpoMain {
             .get(usize::from(dpo_type.get()))?
             .get(usize::from(proto.get()))
             .map(Vec::as_slice)
+    }
+
+    /// Builds an identity for a class/protocol that this registry has
+    /// registered. The concrete class owner still validates the pool index;
+    /// the registry only prevents an unregistered class/protocol pair from
+    /// entering a forwarding object.
+    pub fn identity(
+        &self,
+        dpo_type: DpoType,
+        proto: DpoProto,
+        index: u32,
+    ) -> Result<DpoId, DpoError> {
+        self.nodes(dpo_type, proto).ok_or(DpoError::NodeMissing {
+            dpo_type: dpo_type.get(),
+            proto: proto.get(),
+        })?;
+        Ok(DpoId::new(dpo_type, proto, index))
     }
 
     pub fn node(&self, dpo_type: DpoType, proto: DpoProto) -> Option<NodeId> {
@@ -332,10 +411,11 @@ impl DpoMain {
         nodes: &[(DpoProto, &[NodeId])],
     ) -> Result<(), DpoError> {
         Self::require_registration_scope()?;
-        assert!(
-            dpo_type.get() < DYNAMIC_TYPE_START && dpo_type != DpoType::INVALID,
-            "builtin DPO class key must be in the reserved class range"
-        );
+        if dpo_type.get() >= DYNAMIC_TYPE_START || dpo_type == DpoType::INVALID {
+            return Err(DpoError::InvalidBuiltinType {
+                dpo_type: dpo_type.get(),
+            });
+        }
         for (position, (proto, _)) in nodes.iter().enumerate() {
             Self::validate_protocol(*proto)?;
             if nodes[..position].iter().any(|(other, _)| other == proto)
@@ -350,9 +430,11 @@ impl DpoMain {
         Ok(())
     }
 
-    /// Equivalent to VPP's `dpo_stack`: add every child-originating node to
-    /// every parent node, cache the common edge slot, and return the parent
-    /// identity with that slot installed.
+    /// Stacks a concrete child node on parent nodes resolved by the concrete
+    /// parent owner. This is the instance-dependent counterpart of `stack`:
+    /// Interface TX, Interface RX, and other DPOs whose next node depends on
+    /// their object identity must supply these nodes instead of using the
+    /// class-wide `dpo_nodes[type][proto]` table.
     pub fn stack_from_node(
         &mut self,
         runtime: &mut DataPlaneMain,
@@ -361,19 +443,29 @@ impl DpoMain {
         parent_nodes: &[NodeId],
     ) -> Result<DpoId, DpoError> {
         hammer_runtime::ensure_main_thread()?;
+        if !parent.is_valid() {
+            return Err(DpoError::ObjectMissing {
+                dpo_type: parent.class().get(),
+                index: parent.index(),
+            });
+        }
         if parent_nodes.is_empty() {
             return Err(DpoError::NodeMissing {
                 dpo_type: parent.class().get(),
                 proto: parent.proto().get(),
             });
         }
-        let needs_barrier = parent_nodes.iter().any(|&parent_node| {
-            runtime
+        let mut needs_barrier = false;
+        for &parent_node in parent_nodes {
+            if runtime
                 .nodes()
                 .node_next_slot_for_target(child_node, parent_node)
-                .expect("validated graph node lookup cannot fail")
+                .map_err(DpoError::Runtime)?
                 .is_none()
-        });
+            {
+                needs_barrier = true;
+            }
+        }
         let workers_running =
             hammer_runtime::barrier::global().is_some_and(|barrier| barrier.worker_count() != 0);
         if needs_barrier
@@ -421,6 +513,12 @@ impl DpoMain {
         parent: DpoId,
     ) -> Result<DpoId, DpoError> {
         hammer_runtime::ensure_main_thread()?;
+        if !parent.is_valid() {
+            return Err(DpoError::ObjectMissing {
+                dpo_type: parent.class().get(),
+                index: parent.index(),
+            });
+        }
         let child_nodes = self
             .nodes(child, child_proto)
             .ok_or(DpoError::NodeMissing {
@@ -511,7 +609,7 @@ impl DpoMain {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ReceiveDpo<A> {
     pub sw_if_index: u32,
     pub address: A,
@@ -536,7 +634,7 @@ pub enum LookupCast {
     Multicast,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LookupDpo {
     pub fib_index: u32,
     pub proto: DpoProto,
@@ -546,7 +644,7 @@ pub struct LookupDpo {
     pub lock_count: u16,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AdjacencyDpo<A, R> {
     pub config_index: u32,
     pub lock_count: u32,
@@ -556,14 +654,14 @@ pub struct AdjacencyDpo<A, R> {
     pub child: Option<DpoId>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct InterfaceRxDpo {
     pub sw_if_index: u32,
     pub proto: DpoProto,
     pub lock_count: u32,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct InterfaceTxDpo {
     pub sw_if_index: u32,
 }
@@ -577,24 +675,19 @@ bitflags::bitflags! {
 }
 
 #[repr(C, align(64))]
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug)]
 pub struct ReplicateDpo {
-    pub bucket_count: u16,
+    bucket_count: u16,
     pub proto: DpoProto,
     pub flags: ReplicateFlags,
-    pub lock_count: u32,
-    overflow: Option<Box<ReplicateOverflow>>,
+    pub(super) lock_count: u32,
+    overflow: Option<NonNull<DpoId>>,
     pub inline_buckets: [DpoId; 4],
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct ReplicateOverflow {
-    buckets: Vec<DpoId>,
+    pub(super) locked_buckets: u16,
 }
 
 const _: () = assert!(size_of::<ReplicateDpo>() == 64);
 const _: () = assert!(align_of::<ReplicateDpo>() == 64);
-const _: () = assert!(size_of::<Option<Box<ReplicateOverflow>>>() == size_of::<usize>());
 
 bitflags::bitflags! {
     #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -606,32 +699,60 @@ bitflags::bitflags! {
 }
 
 #[repr(C, align(64))]
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug)]
 pub struct LoadBalanceDpo {
-    pub bucket_count: u16,
-    pub bucket_mask: u16,
+    bucket_count: u16,
+    bucket_mask: u16,
     pub proto: DpoProto,
     pub flags: LoadBalanceFlags,
-    pub lock_count: u32,
+    pub fib_entry_flags: FibEntryFlags,
+    pub(super) lock_count: u32,
     pub map_index: u32,
     pub urpf_index: u32,
     pub flow_hash_config: u16,
-    overflow: Option<Box<LoadBalanceOverflow>>,
+    pub(super) locked_buckets: u16,
+    overflow: Option<NonNull<DpoId>>,
     pub inline_buckets: [DpoId; 4],
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct LoadBalanceOverflow {
-    buckets: Vec<DpoId>,
 }
 
 const _: () = assert!(size_of::<LoadBalanceDpo>() == 64);
 const _: () = assert!(align_of::<LoadBalanceDpo>() == 64);
-const _: () = assert!(size_of::<Option<Box<LoadBalanceOverflow>>>() == size_of::<usize>());
 
 impl LoadBalanceDpo {
     pub const INLINE_BUCKETS: usize = 4;
     pub const MAX_BUCKETS: usize = 8192;
+
+    #[inline(always)]
+    pub const fn bucket_count(&self) -> u16 {
+        self.bucket_count
+    }
+
+    #[inline(always)]
+    pub const fn bucket_mask(&self) -> u16 {
+        self.bucket_mask
+    }
+
+    #[inline(always)]
+    pub const fn flow_hash_config(&self) -> u16 {
+        self.flow_hash_config
+    }
+
+    pub(crate) fn publish_root(&mut self) {
+        assert!(
+            self.lock_count < u32::MAX,
+            "load-balance reference count overflow"
+        );
+        self.lock_count += 1;
+    }
+
+    pub(crate) fn withdraw_root(&mut self) -> bool {
+        assert!(
+            self.lock_count != 0,
+            "load-balance reference count underflow"
+        );
+        self.lock_count -= 1;
+        self.lock_count == 0
+    }
 
     pub fn new(
         proto: DpoProto,
@@ -646,10 +767,14 @@ impl LoadBalanceDpo {
             bucket_mask,
             proto,
             flags,
+            fib_entry_flags: FibEntryFlags::empty(),
+            // Detached objects acquire their first root when the owner
+            // publishes the returned identity into forwarding state.
             lock_count: 0,
             map_index: u32::MAX,
             urpf_index: u32::MAX,
             flow_hash_config,
+            locked_buckets: 0,
             inline_buckets,
             overflow,
         })
@@ -662,22 +787,29 @@ impl LoadBalanceDpo {
         Ok(())
     }
 
+    pub(crate) fn validate_storage(&self) -> Result<(), DpoError> {
+        Self::validate_bucket_count(usize::from(self.bucket_count))?;
+        let has_overflow = self.bucket_count as usize > Self::INLINE_BUCKETS;
+        if has_overflow != self.overflow.is_some() {
+            return Err(DpoError::InvalidBucketStorage);
+        }
+        Ok(())
+    }
+
     fn bucket_storage(
         buckets: &[DpoId],
     ) -> (
         u16,
         u16,
         [DpoId; Self::INLINE_BUCKETS],
-        Option<Box<LoadBalanceOverflow>>,
+        Option<NonNull<DpoId>>,
     ) {
         let mut inline_buckets = [DpoId::INVALID; Self::INLINE_BUCKETS];
         for (slot, bucket) in buckets.iter().take(Self::INLINE_BUCKETS).enumerate() {
             inline_buckets[slot] = *bucket;
         }
         let overflow = if buckets.len() > Self::INLINE_BUCKETS {
-            Some(Box::new(LoadBalanceOverflow {
-                buckets: buckets[Self::INLINE_BUCKETS..].to_vec(),
-            }))
+            allocate_bucket_storage(&buckets[Self::INLINE_BUCKETS..])
         } else {
             None
         };
@@ -690,8 +822,13 @@ impl LoadBalanceDpo {
     }
 
     pub(crate) fn replace_buckets(&mut self, buckets: &[DpoId]) -> Result<(), DpoError> {
+        assert_eq!(
+            self.locked_buckets, 0,
+            "owning bucket replacement requires an owner transaction"
+        );
         Self::validate_bucket_count(buckets.len())?;
         let (bucket_count, bucket_mask, inline_buckets, overflow) = Self::bucket_storage(buckets);
+        self.release_overflow();
         self.inline_buckets = inline_buckets;
         self.overflow = overflow;
         self.bucket_count = bucket_count;
@@ -708,9 +845,7 @@ impl LoadBalanceDpo {
         if bucket < Self::INLINE_BUCKETS {
             return Some(self.inline_buckets[bucket]);
         }
-        self.overflow
-            .as_ref()?
-            .buckets
+        self.overflow_slice()
             .get(bucket - Self::INLINE_BUCKETS)
             .copied()
     }
@@ -723,44 +858,177 @@ impl LoadBalanceDpo {
         if index < Self::INLINE_BUCKETS {
             return Some(&mut self.inline_buckets[index]);
         }
-        self.overflow
-            .as_mut()?
-            .buckets
+        self.overflow_slice_mut()
             .get_mut(index - Self::INLINE_BUCKETS)
     }
+
+    #[inline(always)]
+    fn overflow_slice(&self) -> &[DpoId] {
+        let length = usize::from(self.bucket_count).saturating_sub(Self::INLINE_BUCKETS);
+        let Some(pointer) = self.overflow else {
+            return &[];
+        };
+        // SAFETY: `pointer` owns `length` initialized DPO identities until the
+        // next replacement or this object's Drop implementation.
+        unsafe { slice::from_raw_parts(pointer.as_ptr(), length) }
+    }
+
+    #[inline(always)]
+    fn overflow_slice_mut(&mut self) -> &mut [DpoId] {
+        let length = usize::from(self.bucket_count).saturating_sub(Self::INLINE_BUCKETS);
+        let Some(pointer) = self.overflow else {
+            return &mut [];
+        };
+        // SAFETY: `&mut self` guarantees unique access to the owned allocation.
+        unsafe { slice::from_raw_parts_mut(pointer.as_ptr(), length) }
+    }
+
+    fn release_overflow(&mut self) {
+        let length = usize::from(self.bucket_count).saturating_sub(Self::INLINE_BUCKETS);
+        if let Some(pointer) = self.overflow.take() {
+            // SAFETY: the pointer and length were created together by
+            // `allocate_bucket_storage` and have not been released before.
+            unsafe { release_bucket_storage(pointer, length) };
+        }
+    }
 }
+
+impl Drop for LoadBalanceDpo {
+    fn drop(&mut self) {
+        while self.locked_buckets != 0 {
+            self.locked_buckets -= 1;
+            let child = self
+                .select_bucket(u32::from(self.locked_buckets))
+                .expect("locked bucket must be present");
+            super::NetMain::global()
+                .expect("DPO owner must outlive its objects")
+                .unlock_dpo(child);
+        }
+        self.release_overflow();
+    }
+}
+
+impl PartialEq for LoadBalanceDpo {
+    fn eq(&self, other: &Self) -> bool {
+        self.bucket_count == other.bucket_count
+            && self.bucket_mask == other.bucket_mask
+            && self.proto == other.proto
+            && self.flags == other.flags
+            && self.fib_entry_flags == other.fib_entry_flags
+            && self.lock_count == other.lock_count
+            && self.map_index == other.map_index
+            && self.urpf_index == other.urpf_index
+            && self.flow_hash_config == other.flow_hash_config
+            && self.inline_buckets == other.inline_buckets
+            && self.overflow_slice() == other.overflow_slice()
+    }
+}
+
+impl Eq for LoadBalanceDpo {}
 
 impl ReplicateDpo {
     pub const INLINE_BUCKETS: usize = 4;
     pub const MAX_BUCKETS: usize = 1024;
+
+    #[inline(always)]
+    pub const fn bucket_count(&self) -> u16 {
+        self.bucket_count
+    }
+
+    pub(crate) fn publish_root(&mut self) {
+        assert!(
+            self.lock_count < u32::MAX,
+            "replicate reference count overflow"
+        );
+        self.lock_count += 1;
+    }
+
+    pub(crate) fn withdraw_root(&mut self) -> bool {
+        assert!(self.lock_count != 0, "replicate reference count underflow");
+        self.lock_count -= 1;
+        self.lock_count == 0
+    }
 
     pub fn new(
         proto: DpoProto,
         buckets: &[DpoId],
         flags: ReplicateFlags,
     ) -> Result<Self, DpoError> {
-        if buckets.len() > Self::MAX_BUCKETS {
-            return Err(DpoError::InvalidBucketCount);
+        Self::validate_bucket_count(buckets.len())?;
+        let (bucket_count, inline_buckets, overflow) = Self::bucket_storage(buckets);
+        Ok(Self {
+            bucket_count,
+            proto,
+            flags,
+            // Detached objects acquire their first root when the owner
+            // publishes the returned identity into forwarding state.
+            lock_count: 0,
+            inline_buckets,
+            overflow,
+            locked_buckets: 0,
+        })
+    }
+
+    pub(crate) fn validate_bucket_count(count: usize) -> Result<(), DpoError> {
+        (count <= Self::MAX_BUCKETS)
+            .then_some(())
+            .ok_or(DpoError::InvalidBucketCount)
+    }
+
+    pub(crate) fn validate_storage(&self) -> Result<(), DpoError> {
+        Self::validate_bucket_count(usize::from(self.bucket_count))?;
+        let has_overflow = self.bucket_count as usize > Self::INLINE_BUCKETS;
+        if has_overflow != self.overflow.is_some() {
+            return Err(DpoError::InvalidBucketStorage);
         }
+        Ok(())
+    }
+
+    fn bucket_storage(
+        buckets: &[DpoId],
+    ) -> (u16, [DpoId; Self::INLINE_BUCKETS], Option<NonNull<DpoId>>) {
         let mut inline_buckets = [DpoId::INVALID; Self::INLINE_BUCKETS];
         for (slot, bucket) in buckets.iter().take(Self::INLINE_BUCKETS).enumerate() {
             inline_buckets[slot] = *bucket;
         }
-        let overflow = if buckets.len() > Self::INLINE_BUCKETS {
-            Some(Box::new(ReplicateOverflow {
-                buckets: buckets[Self::INLINE_BUCKETS..].to_vec(),
-            }))
-        } else {
-            None
-        };
-        Ok(Self {
-            bucket_count: u16::try_from(buckets.len()).expect("replicate bucket count fits u16"),
-            proto,
-            flags,
-            lock_count: 0,
+        let overflow = (buckets.len() > Self::INLINE_BUCKETS)
+            .then(|| allocate_bucket_storage(&buckets[Self::INLINE_BUCKETS..]));
+        (
+            u16::try_from(buckets.len()).expect("replicate bucket count fits u16"),
             inline_buckets,
-            overflow,
-        })
+            overflow.flatten(),
+        )
+    }
+
+    pub(crate) fn replace_buckets(&mut self, buckets: &[DpoId]) -> Result<(), DpoError> {
+        assert_eq!(
+            self.locked_buckets, 0,
+            "owning bucket replacement requires an owner transaction"
+        );
+        Self::validate_bucket_count(buckets.len())?;
+        let (bucket_count, inline_buckets, overflow) = Self::bucket_storage(buckets);
+        self.flags.set(
+            ReplicateFlags::HAS_LOCAL,
+            buckets
+                .iter()
+                .any(|bucket| bucket.class() == DpoType::RECEIVE),
+        );
+        self.release_overflow();
+        self.inline_buckets = inline_buckets;
+        self.overflow = overflow;
+        self.bucket_count = bucket_count;
+        Ok(())
+    }
+
+    pub(crate) fn bucket_mut(&mut self, index: usize) -> Option<&mut DpoId> {
+        if index >= usize::from(self.bucket_count) {
+            return None;
+        }
+        if index < Self::INLINE_BUCKETS {
+            return Some(&mut self.inline_buckets[index]);
+        }
+        self.overflow_slice_mut()
+            .get_mut(index - Self::INLINE_BUCKETS)
     }
 
     #[inline(always)]
@@ -772,12 +1040,102 @@ impl ReplicateDpo {
         if index < Self::INLINE_BUCKETS {
             return Some(self.inline_buckets[index]);
         }
-        self.overflow
-            .as_ref()?
-            .buckets
+        self.overflow_slice()
             .get(index - Self::INLINE_BUCKETS)
             .copied()
     }
+
+    #[inline(always)]
+    fn overflow_slice(&self) -> &[DpoId] {
+        let length = usize::from(self.bucket_count).saturating_sub(Self::INLINE_BUCKETS);
+        let Some(pointer) = self.overflow else {
+            return &[];
+        };
+        // SAFETY: `pointer` owns `length` initialized DPO identities until the
+        // next replacement or this object's Drop implementation.
+        unsafe { slice::from_raw_parts(pointer.as_ptr(), length) }
+    }
+
+    #[inline(always)]
+    fn overflow_slice_mut(&mut self) -> &mut [DpoId] {
+        let length = usize::from(self.bucket_count).saturating_sub(Self::INLINE_BUCKETS);
+        let Some(pointer) = self.overflow else {
+            return &mut [];
+        };
+        // SAFETY: `&mut self` guarantees unique access to the owned allocation.
+        unsafe { slice::from_raw_parts_mut(pointer.as_ptr(), length) }
+    }
+
+    fn release_overflow(&mut self) {
+        let length = usize::from(self.bucket_count).saturating_sub(Self::INLINE_BUCKETS);
+        if let Some(pointer) = self.overflow.take() {
+            // SAFETY: the pointer and length were created together by
+            // `allocate_bucket_storage` and have not been released before.
+            unsafe { release_bucket_storage(pointer, length) };
+        }
+    }
+}
+
+impl Drop for ReplicateDpo {
+    fn drop(&mut self) {
+        while self.locked_buckets != 0 {
+            self.locked_buckets -= 1;
+            let child = self
+                .bucket(self.locked_buckets)
+                .expect("locked bucket must be present");
+            super::NetMain::global()
+                .expect("DPO owner must outlive its objects")
+                .unlock_dpo(child);
+        }
+        self.release_overflow();
+    }
+}
+
+impl PartialEq for ReplicateDpo {
+    fn eq(&self, other: &Self) -> bool {
+        self.bucket_count == other.bucket_count
+            && self.proto == other.proto
+            && self.flags == other.flags
+            && self.lock_count == other.lock_count
+            && self.inline_buckets == other.inline_buckets
+            && self.overflow_slice() == other.overflow_slice()
+    }
+}
+
+impl Eq for ReplicateDpo {}
+
+fn allocate_bucket_storage(buckets: &[DpoId]) -> Option<NonNull<DpoId>> {
+    if buckets.is_empty() {
+        return None;
+    }
+    let layout = bucket_layout(buckets.len());
+    // SAFETY: `layout` describes the exact contiguous allocation requested.
+    let pointer = NonNull::new(unsafe { alloc(layout).cast::<DpoId>() })
+        .unwrap_or_else(|| handle_alloc_error(layout));
+    // SAFETY: the allocation is valid for `buckets.len()` DPO identities and
+    // the source and destination do not overlap.
+    unsafe {
+        pointer
+            .as_ptr()
+            .copy_from_nonoverlapping(buckets.as_ptr(), buckets.len());
+    }
+    Some(pointer)
+}
+
+/// # Safety
+/// `pointer` must have been returned by `allocate_bucket_storage` for exactly
+/// `length` initialized `DpoId` values and must not have been released before.
+unsafe fn release_bucket_storage(pointer: NonNull<DpoId>, length: usize) {
+    let layout = bucket_layout(length);
+    // SAFETY: guaranteed by this function's safety contract.
+    unsafe { dealloc(pointer.cast::<u8>().as_ptr(), layout) };
+}
+
+fn bucket_layout(length: usize) -> Layout {
+    let size = size_of::<DpoId>()
+        .checked_mul(length)
+        .expect("bucket allocation size fits");
+    Layout::from_size_align(size, 64).expect("bucket allocation alignment is valid")
 }
 
 #[cfg(test)]
@@ -801,10 +1159,10 @@ mod tests {
     fn class_registration_and_stack_are_monotonic() {
         let mut main = DpoMain::new();
         let first = main
-            .register_new_type(&[(DpoProto::IP4, &[NodeId::new(10)][..])])
+            .register_new_type(&[(DpoProto::IP4, &[NodeId::new(10)][..])], None)
             .expect("first class");
         let second = main
-            .register_new_type(&[(DpoProto::IP6, &[NodeId::new(11)][..])])
+            .register_new_type(&[(DpoProto::IP6, &[NodeId::new(11)][..])], None)
             .expect("second class");
         assert_eq!(first.get(), 30);
         assert_eq!(second.get(), first.get() + 1);
@@ -830,6 +1188,7 @@ mod tests {
         let load_balance =
             LoadBalanceDpo::new(DpoProto::IP4, &buckets, LoadBalanceFlags::empty(), 0x9f).unwrap();
         assert_eq!(load_balance.select_bucket(6), Some(buckets[6]));
+        assert_eq!(load_balance.overflow.unwrap().as_ptr() as usize % 64, 0);
 
         let single = LoadBalanceDpo::new(
             DpoProto::IP4,
@@ -842,12 +1201,12 @@ mod tests {
 
         let empty =
             LoadBalanceDpo::new(DpoProto::IP4, &[], LoadBalanceFlags::empty(), 0x9f).unwrap();
-        assert_eq!(empty.bucket_count, 0);
+        assert_eq!(empty.bucket_count(), 0);
         assert_eq!(empty.select_bucket(u32::MAX), None);
 
         let empty_replicate =
             ReplicateDpo::new(DpoProto::IP4, &[], ReplicateFlags::empty()).unwrap();
-        assert_eq!(empty_replicate.bucket_count, 0);
+        assert_eq!(empty_replicate.bucket_count(), 0);
         assert_eq!(empty_replicate.bucket(0), None);
     }
 }

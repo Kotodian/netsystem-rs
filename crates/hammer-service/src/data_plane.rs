@@ -4,6 +4,8 @@ use hammer_runtime::{
     DataPlaneMain, InternalNode, Node, NodeErrorCode, NodeProcessFn, add_packet_trace,
 };
 
+use crate::net::{DpoProto, DpoType, NetMain};
+
 pub use crate::feature_arc::{
     Feature, FeatureArc, FeatureArcControl, FeatureArcSpec, FeatureArcStart, FeatureArcStartHandle,
     FeatureArcStartNode, FeatureArcStartSlot, next_feature_frame, next_feature_slot_for_index,
@@ -71,7 +73,12 @@ impl HandoffNode {
 }
 
 pub fn register_drop(runtime: &DataPlaneMain) -> RuntimeResult<NodeId> {
-    runtime.nodes().try_register_internal(DropNode)
+    let node = runtime.nodes().try_register_internal(DropNode)?;
+    NetMain::global()?.register_builtin_dpo(
+        DpoType::DROP,
+        &[(DpoProto::IP4, &[node][..]), (DpoProto::IP6, &[node][..])],
+    )?;
+    Ok(node)
 }
 
 pub fn register_handoff(runtime: &DataPlaneMain) -> RuntimeResult<NodeId> {
