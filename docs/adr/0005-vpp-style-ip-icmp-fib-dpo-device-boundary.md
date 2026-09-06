@@ -2869,6 +2869,7 @@ next enum, `thread_local!` local registration, atomic FIB handle, or
 | 类型/API | 位置或标识 | 变更内容 | 兼容性/迁移 | 验证方式 |
 | --- | --- | --- | --- | --- |
 | 类型 | `hammer-plugins/net/icmp::IcmpMain` | ICMP owner-local Main，保存 ICMP 控制状态 | 新 DSO；无旧 ABI 兼容层 | DSO lifecycle and global access integration test |
+| 类型/API | `hammer-service::net::throttle::Throttle` | worker-owned `bitmap: Bitmap`, `seed: u64`, `last_reset: Duration`, `period: Duration`; `new(period: Duration) -> Self`, `seed(now: Duration) -> u64`, `check(key: u64, seed: u64) -> bool` | 用户批准；无锁、无全局状态、无序列化；IP 提供键与周期，复用 infra hash，不承诺与 VPP 碰撞位置逐位一致 | 严格周期边界、重复键、worker 隔离、碰撞和重置；生产 ICMP 节点另做 packet test |
 | 类型 | `hammer-plugins/net/ip::{Ip4Main,Ip6Main}` | 两个 concrete implementation Main；分别保存 lookup-main、unicast FIB、MFIB owner、table map、per-interface bind 和本地 feature/local-next 状态；本 ADR 只规定 unicast FIB | 从当前混合 `IpMain` 控制面拆出；不拆为两个 DSO | owner lifecycle and per-proto lookup tests |
 | 类型 | `hammer-plugins/net/ip::IpPathFlags` | IP-owned `bitflags!` path-policy bits (`u32`), including resolve, local/drop, interface-RX, source-lookup, encapsulation, ICMP, classify and glean actions | 从 service `FibPathFlags` 移出；Binary API 与 `FibPath<N, F>` 使用具体 `IpPathFlags` | bit-width/value and IP route decoding tests |
 | 类型 | `hammer-service::net::dpo::{DropDpo,PuntDpo}` | service-owned stateless DPO classes；per-protocol singleton IDs | 新增 concrete class surfaces；不通过统一 `DpoKind` 兼容 | singleton identity and graph-next tests |

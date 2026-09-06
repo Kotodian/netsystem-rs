@@ -48,8 +48,17 @@ per-worker bitmap is 512 bits, with error-node periods 1e-5 (IPv4) and 1e-3
 (IPv6). No matching Hammer primitive was found. Its proposed owner is
 `hammer-service::net`, corresponding to VPP's `vnet/util`, not infra;
 IP supplies address keys and periods, while each worker owns its mutable
-suppression state. No throttle implementation has been added. Approval of
-that new shared interface remains separate from the approved address getter.
+suppression state. The user subsequently approved this service-owned
+interface. The current implementation adds only `net::throttle::Throttle`
+with `Bitmap`, seed, last reset and period; `new(Duration)`, `seed(Duration)`
+and `check(u64, u64)` implement construction, per-frame interval refresh and
+per-packet approximate suppression. It reuses infra's word hash: bucket
+collisions need not be bit-identical to VPP's `clib_xxhash`, but finite bitmap,
+strict interval expiration and repeated-key suppression semantics match.
+The primitive has no IP fields, locks, worker registry or global state.
+Two tests cover interval/worker isolation and collision/reset behavior;
+these are derived from `throttle.h` behavior, not ICMP packet test substitutes.
+IP error-node ownership, initialization and consumption are still outstanding.
 
 Delivery checkpoint, 2026-09-06: the user explicitly requested committing
 the current non-ICMP changes before the ICMP migration. The current batch
