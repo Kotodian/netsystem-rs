@@ -96,8 +96,8 @@ impl DataPlaneMain {
     }
 
     #[inline]
-    pub fn current_config(&self, index: Index) -> RuntimeResult<NodeId> {
-        Ok(self.buffers.current_config(index)?)
+    pub fn current_config_index(&self, index: Index) -> RuntimeResult<u32> {
+        Ok(self.buffers.current_config_index(index)?)
     }
 
     #[inline]

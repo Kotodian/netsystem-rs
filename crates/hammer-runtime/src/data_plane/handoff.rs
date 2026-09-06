@@ -85,7 +85,8 @@ impl DataPlaneMain {
                 .current_node()
                 .ok_or(RuntimeError::HandoffDispatchContextMissing)?;
             let resolved = self.nodes.node_next(node, next)?;
-            self.get_buffer_mut(index)?.set_current_config(resolved);
+            self.get_buffer_mut(index)?
+                .set_current_config_index(resolved.slot());
         }
         let Some(handoff) = &self.handoff else {
             return Err(DataPlaneError::HandoffNotConfigured.into());
