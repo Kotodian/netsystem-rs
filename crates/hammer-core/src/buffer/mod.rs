@@ -50,7 +50,7 @@ pub const DEFAULT_BUFFER_FRAME_CAPACITY: usize = 256;
 pub const DEFAULT_BUFFER_FRAME_POOL_SIZE: usize = 64;
 pub const BUFFER_CACHE_LINE_SIZE: usize = 64;
 pub const DEFAULT_PACKET_HEADROOM: usize = 256;
-const DEFAULT_PRE_DATA_SIZE: usize = 128;
+include!(concat!(env!("OUT_DIR"), "/buffer_config.rs"));
 const BUFFER_INVALID_INDEX: u32 = u32::MAX;
 
 /// Number of free slots moved between the per-thread cache and the arena free

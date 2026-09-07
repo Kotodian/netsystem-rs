@@ -69,14 +69,26 @@ impl Default for BufferHeaderCacheline1 {
 pub struct Buffer {
     pub(super) cacheline0: BufferHeaderCacheline0,
     pub(super) cacheline1: BufferHeaderCacheline1,
+    #[cfg(hammer_buffer_trace_trajectory)]
+    trajectory_nb: u16,
+    #[cfg(hammer_buffer_trace_trajectory)]
+    trajectory_trace: [u16; 31],
+    headroom: hammer_infra::align::CacheLineAlignMark,
+    pre_data: [u8; BUFFER_PRE_DATA_SIZE],
 }
 
 const _: () = assert!(mem::align_of::<Buffer>() == BUFFER_CACHE_LINE_SIZE);
-const _: () = assert!(mem::size_of::<Buffer>() == BUFFER_CACHE_LINE_SIZE * 2);
+const _: () = assert!(mem::size_of::<Buffer>() == BUFFER_HEADER_SIZE + BUFFER_PRE_DATA_SIZE);
+const _: () = assert!(mem::offset_of!(Buffer, headroom) == BUFFER_HEADER_SIZE);
+const _: () = assert!(mem::offset_of!(Buffer, pre_data) == BUFFER_HEADER_SIZE);
+#[cfg(hammer_buffer_trace_trajectory)]
+const _: () = assert!(mem::offset_of!(Buffer, trajectory_nb) == 128);
+#[cfg(hammer_buffer_trace_trajectory)]
+const _: () = assert!(mem::offset_of!(Buffer, trajectory_trace) == 130);
 
 #[inline]
 pub(crate) const fn buffer_data_offset() -> usize {
-    mem::size_of::<Buffer>() + DEFAULT_PRE_DATA_SIZE
+    mem::size_of::<Buffer>()
 }
 
 impl Buffer {
@@ -276,7 +288,7 @@ impl Buffer {
 
     #[inline]
     pub fn current_ptr(&self) -> *const u8 {
-        // SAFETY: the slot layout is `[Buffer][pre_data][data]`; the current
+        // SAFETY: the slot layout is `[header][pre_data][data]`; the current
         // window is always kept within that inline backing.
         unsafe {
             self.as_bytes_ptr()
@@ -303,7 +315,7 @@ impl Buffer {
         let data_size = self.data_capacity();
         let start = self.current_end_offset_from_header();
         let len = self.available_tail_with_data_size(data_size);
-        let writable_start = mem::size_of::<Buffer>();
+        let writable_start = BUFFER_HEADER_SIZE;
         let offset = start - writable_start;
         &mut self.slot_writable_region_mut(data_size)[offset..offset + len]
     }
@@ -355,7 +367,7 @@ impl Buffer {
 
     #[inline]
     pub fn current_mut_ptr(&mut self) -> *mut u8 {
-        // SAFETY: the slot layout is `[Buffer][pre_data][data]`; the current
+        // SAFETY: the slot layout is `[header][pre_data][data]`; the current
         // window is always kept within that inline backing.
         unsafe {
             self.as_mut_bytes_ptr()
@@ -406,7 +418,7 @@ impl Buffer {
         }
         let start = self.current_end_offset_from_header();
         let end = start + take;
-        let writable_start = mem::size_of::<Buffer>();
+        let writable_start = BUFFER_HEADER_SIZE;
         self.slot_writable_region_mut(data_size)[start - writable_start..end - writable_start]
             .copy_from_slice(&bytes[..take]);
         self.set_current_len(self.current_len() + take)
@@ -416,8 +428,7 @@ impl Buffer {
 
     #[inline]
     pub(crate) fn set_current_data_offset(&mut self, offset: isize) -> DataPlaneResult<()> {
-        let lower_bound =
-            -isize::try_from(DEFAULT_PRE_DATA_SIZE).expect("default pre-data size fits isize");
+        let lower_bound = -isize::try_from(BUFFER_PRE_DATA_SIZE).expect("pre-data size fits isize");
         if offset < lower_bound {
             return Err(BufferInvariant::CurrentDataExceedsPreData.into());
         }
@@ -490,13 +501,13 @@ impl Buffer {
 
     #[inline]
     pub(crate) fn slot_writable_end_offset_from_header(&self, data_size: usize) -> usize {
-        mem::size_of::<Buffer>() + DEFAULT_PRE_DATA_SIZE + data_size
+        mem::size_of::<Buffer>() + data_size
     }
 
     #[inline]
     pub(crate) fn available_headroom(&self) -> usize {
         self.current_start_offset_from_header()
-            .saturating_sub(mem::size_of::<Buffer>())
+            .saturating_sub(BUFFER_HEADER_SIZE)
     }
 
     #[inline]
@@ -514,8 +525,8 @@ impl Buffer {
         // header and spans the full `[pre_data][data]` capacity for the slot.
         unsafe {
             slice::from_raw_parts_mut(
-                self.as_mut_bytes_ptr().add(mem::size_of::<Buffer>()),
-                self.slot_writable_end_offset_from_header(data_size) - mem::size_of::<Buffer>(),
+                self.as_mut_bytes_ptr().add(BUFFER_HEADER_SIZE),
+                self.slot_writable_end_offset_from_header(data_size) - BUFFER_HEADER_SIZE,
             )
         }
     }
