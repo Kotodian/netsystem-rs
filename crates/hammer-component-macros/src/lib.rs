@@ -3622,7 +3622,9 @@ fn plugin_registration_tokens(args: &PluginArgs) -> TokenStream2 {
         #[::hammer_runtime::__private::export_root_module]
         #[doc(hidden)]
         pub fn plugin_module() -> ::hammer_runtime::PluginModuleRef {
-            let metadata = ::hammer_runtime::PluginMetadata::new(
+            // Evaluate inside this artifact: a runtime symbol resolved from
+            // the host must never substitute the host's Buffer build facts.
+            const METADATA: ::hammer_runtime::PluginMetadata = ::hammer_runtime::PluginMetadata::new(
                 ::hammer_runtime::__private::RStr::from_str(#name),
                 ::hammer_runtime::__private::RStr::from_str(env!("CARGO_PKG_VERSION")),
                 ::hammer_runtime::__private::RStr::from_str(env!("CARGO_PKG_VERSION")),
@@ -3630,7 +3632,7 @@ fn plugin_registration_tokens(args: &PluginArgs) -> TokenStream2 {
             );
             <::hammer_runtime::PluginModule as ::hammer_runtime::__private::PrefixTypeTrait>::leak_into_prefix(
                 ::hammer_runtime::PluginModule::new(
-                    metadata,
+                    METADATA,
                     ::hammer_runtime::__private::RRef::new(&__HAMMER_REGISTRATION_IMAGE),
                 )
             )
