@@ -1,17 +1,44 @@
 ---
 name: vpp-feature-review
-description: Run a mandatory post-completion review of Hammer features against vendored VPP before declaring a feature done. Use after completing or changing data-plane graph nodes, buffers, FIFOs, app/session boundaries, session events, TCP/TLS transport, runtime scheduling, barriers, IPC/plugins, or other VPP-style architecture work; use it to compare semantics, ownership, lifecycle, error handling, and tests with third_party/vpp and to produce an approval-ready review.
+description: Compare proposed or completed Hammer VPP-style changes with vendored VPP. Use when drafting or reviewing an ADR or refactor described as VPP-aligned, and after implementing data-plane graph, buffer, FIFO, session, transport, runtime, barrier, IPC, or plugin changes; produces source evidence, a semantic diff, decisions, a test matrix, and completion findings.
 ---
 
 # VPP Feature Review
 
-## Gate
+## Modes
 
-Treat this as a completion gate, not an optional audit. Do not declare a feature complete until the review is written and every blocking finding is fixed or explicitly accepted.
+- **Design diff:** Before approving a non-trivial VPP-aligned ADR or refactor,
+  read [references/design-diff.md](references/design-diff.md) and produce the
+  evidence, differences, decisions, change inventory, and test matrix it
+  requires.
+- **Completion review:** After implementation, run the completion workflow
+  below. Do not declare the feature complete until the review is written and
+  every blocking finding is fixed or explicitly accepted.
 
-Read root `CONTEXT.md`, `AGENTS.md`, and relevant `docs/adr/` before reviewing. Search `third_party/vpp/` first and use external VPP sources only when the required code is absent from the vendored tree.
+For either mode, read root `CONTEXT.md`, `AGENTS.md`, and relevant `docs/adr/`.
+Search `third_party/vpp/` first and use external VPP sources only when the
+required code is absent from the vendored tree.
 
-## Workflow
+## Shared Evidence Rules
+
+- Record exact VPP paths, symbols, and relevant call sites. A type definition
+  alone does not establish ownership, scheduling, or lifecycle semantics.
+- Record the current Hammer owner, API, call sites, and tests before judging a
+  proposal or diff.
+- Separate verified Hammer facts, verified VPP facts, design decisions,
+  inferences, and unresolved evidence. Never present an inference as source
+  behavior.
+- Support claims that VPP lacks a behavior, error branch, API, or test with a
+  scoped repository search. If VPP has no dedicated test, derive Hammer tests
+  from implementation behavior and say that explicitly.
+- Treat VPP as the semantic and ownership reference, not a 1:1 Rust API,
+  data-structure, or naming template. Record every intentional semantic
+  divergence with its reason, owner, and regression test.
+- When VPP evidence determines the design, resolve it in the document. Leave an
+  open question only when the remaining choice is Hammer product policy or the
+  evidence is genuinely incomplete.
+
+## Completion Workflow
 
 1. Define the scope. Identify the changed crates and files, the feature contract, and the closest VPP analog.
 2. Collect VPP evidence. Use `rg` to find the counterpart paths, types, functions, and call sites in `third_party/vpp/`. Record exact evidence for each comparison.
@@ -42,8 +69,6 @@ Produce a concise report with this structure:
 - Verdict: `Aligned`, `Needs changes`, or `Rejected`
 - Findings, ordered by severity
 - Commands run
-
-Treat VPP as a semantic and ownership reference, not a 1:1 API or naming template. If Hammer intentionally diverges, state the rationale explicitly in the report.
 
 Add the report to the PR or `docs/superpowers/sdd/` according to project convention.
 
