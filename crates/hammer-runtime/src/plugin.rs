@@ -11,6 +11,7 @@ use abi_stable::{
     library::RootModule,
     std_types::{RSlice, RStr},
 };
+use hammer_core::buffer::{BUFFER_PRE_DATA_SIZE, BUFFER_TRACE_TRAJECTORY_SIZE, Buffer};
 use object::{Object, ObjectSection};
 use semver::Version;
 use serde::Deserialize;
@@ -30,6 +31,10 @@ pub struct PluginMetadata {
     version: RStr<'static>,
     version_required: RStr<'static>,
     load_after: RSlice<'static, RStr<'static>>,
+    buffer_pre_data_size: u32,
+    buffer_trajectory_size: u32,
+    buffer_size: u32,
+    buffer_alignment: u32,
 }
 
 impl PluginMetadata {
@@ -45,6 +50,10 @@ impl PluginMetadata {
             version,
             version_required,
             load_after,
+            buffer_pre_data_size: BUFFER_PRE_DATA_SIZE as u32,
+            buffer_trajectory_size: BUFFER_TRACE_TRAJECTORY_SIZE as u32,
+            buffer_size: size_of::<Buffer>() as u32,
+            buffer_alignment: align_of::<Buffer>() as u32,
         }
     }
 
@@ -180,6 +189,18 @@ pub enum PluginError {
     },
     #[error("plugin root metadata does not match the manifest in `{path}`")]
     ManifestMetadataMismatch { path: PathBuf },
+    #[error("plugin Buffer layout does not match the host in `{path}`")]
+    BufferLayoutMismatch {
+        path: PathBuf,
+        host_pre_data_size: u32,
+        plugin_pre_data_size: u32,
+        host_trajectory_size: u32,
+        plugin_trajectory_size: u32,
+        host_buffer_size: u32,
+        plugin_buffer_size: u32,
+        host_buffer_alignment: u32,
+        plugin_buffer_alignment: u32,
+    },
     #[error("failed to resolve the daemon executable path")]
     ExecutablePath {
         #[source]
@@ -436,6 +457,25 @@ impl PluginMain {
             source,
         })?;
         let metadata = module.metadata();
+        // RegistrationImage is opaque to abi_stable. Check the artifact's
+        // compiled Buffer facts before any image access or table publication.
+        if metadata.buffer_pre_data_size != BUFFER_PRE_DATA_SIZE as u32
+            || metadata.buffer_trajectory_size != BUFFER_TRACE_TRAJECTORY_SIZE as u32
+            || metadata.buffer_size != size_of::<Buffer>() as u32
+            || metadata.buffer_alignment != align_of::<Buffer>() as u32
+        {
+            return Err(PluginError::BufferLayoutMismatch {
+                path,
+                host_pre_data_size: BUFFER_PRE_DATA_SIZE as u32,
+                plugin_pre_data_size: metadata.buffer_pre_data_size,
+                host_trajectory_size: BUFFER_TRACE_TRAJECTORY_SIZE as u32,
+                plugin_trajectory_size: metadata.buffer_trajectory_size,
+                host_buffer_size: size_of::<Buffer>() as u32,
+                plugin_buffer_size: metadata.buffer_size,
+                host_buffer_alignment: align_of::<Buffer>() as u32,
+                plugin_buffer_alignment: metadata.buffer_alignment,
+            });
+        }
         if metadata.name() != manifest.name
             || metadata.version() != manifest.version
             || metadata.version_required() != manifest.version_required
