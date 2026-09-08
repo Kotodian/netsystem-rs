@@ -114,7 +114,7 @@ fn build_fixture(pattern: FanoutPattern) -> FanoutFixture {
 
     // Warm grouping/transfer once so measured iterations start from a steady state.
     runtime.with_current_node(owner, |runtime| {
-        runtime.enqueue_to_next(&mut frame, &nexts);
+        runtime.enqueue_to_next(&mut NodeRuntime::empty(), &mut frame, &nexts);
     });
     runtime.run_ready_nodes().expect("warm fanout dispatch");
 
@@ -159,7 +159,11 @@ fn bench_fanout_256(c: &mut Criterion) {
                 || build_fixture(pattern),
                 |fixture| {
                     fixture.runtime.with_current_node(fixture.owner, |runtime| {
-                        runtime.enqueue_to_next(&mut fixture.frame, &fixture.nexts);
+                        runtime.enqueue_to_next(
+                            &mut NodeRuntime::empty(),
+                            &mut fixture.frame,
+                            &fixture.nexts,
+                        );
                     });
                 },
                 criterion::BatchSize::PerIteration,

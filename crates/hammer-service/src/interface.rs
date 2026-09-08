@@ -243,15 +243,14 @@ impl InternalNode for InterfaceOutputNode {
 
 fn interface_output_process(
     runtime: &mut DataPlaneMain,
-    _: &mut NodeRuntime,
+    node_runtime: &mut NodeRuntime,
     frame: &mut Frame,
 ) -> usize {
     let processed_vectors = frame.len();
     (|| {
-        process_frame!(runtime, frame, |index| InterfaceOutputNode::tx_for_index(
-            runtime, index, 0
-        )
-        .unwrap_or(0));
+        process_frame!(runtime, node_runtime, frame, |index| {
+            InterfaceOutputNode::tx_for_index(runtime, index, 0).unwrap_or(0)
+        });
     })();
     processed_vectors
 }

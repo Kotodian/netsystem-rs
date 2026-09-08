@@ -1,6 +1,6 @@
 //! VPP `vlib_buffer_enqueue_to_next` / `enqueue_one`.
 
-use crate::DataPlaneMain;
+use crate::{DataPlaneMain, NodeRuntime};
 use hammer_core::data_plane::{DEFAULT_BUFFER_FRAME_CAPACITY, Frame, NodeId, NodeNext};
 use hammer_infra::mask_compare::{mask_compare_u16, mask_compare_u16_words};
 
@@ -32,7 +32,12 @@ impl DataPlaneMain {
     ///
     /// Shape matches VPP `vlib_buffer_enqueue_to_next`: walk first-unhandled
     /// next groups via a used bitmap, and for each group run `enqueue_one`.
-    pub fn enqueue_to_next<N: NodeNext>(&mut self, frame: &mut Frame, nexts: &[N]) {
+    pub fn enqueue_to_next<N: NodeNext>(
+        &mut self,
+        node_runtime: &mut NodeRuntime,
+        frame: &mut Frame,
+        nexts: &[N],
+    ) {
         if frame.len() != nexts.len() {
             abort_fanout("nexts length must equal frame length");
         }
@@ -57,6 +62,7 @@ impl DataPlaneMain {
         while n_left > 0 {
             let next_index = first_unhandled(&next_slots[..count], &used);
             n_left = self.enqueue_one(
+                node_runtime,
                 current,
                 next_index,
                 frame.vector_args(),
@@ -71,6 +77,7 @@ impl DataPlaneMain {
     /// frame, put when full, rotate once if the group still spills.
     fn enqueue_one(
         &mut self,
+        node_runtime: &mut NodeRuntime,
         current: NodeId,
         next_index: u16,
         buffers: &[u32],
@@ -119,7 +126,7 @@ impl DataPlaneMain {
                 copied += written;
                 vectors.len() - written
             };
-            self.nodes.put_next_frame_index(frame_index, vectors_left);
+            self.put_next_frame(node_runtime, u32::from(next_index), vectors_left);
         }
         n_left - n_extracted
     }

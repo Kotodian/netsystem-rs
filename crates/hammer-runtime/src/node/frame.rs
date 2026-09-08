@@ -589,7 +589,7 @@ mod tests {
         input_frame.set_vector_count(3);
         input_frame.vector_args_mut().copy_from_slice(&[29, 31, 37]);
         runtime.with_current_node(input, |runtime| {
-            runtime.enqueue_to_next(&mut input_frame, &[0u16; 3]);
+            runtime.enqueue_to_next(&mut state, &mut input_frame, &[0u16; 3]);
         });
         assert_eq!(input_frame.vector_args(), &[29, 31, 37]);
         assert_eq!(runtime.run_ready_nodes().unwrap(), 1);
@@ -632,8 +632,22 @@ mod tests {
             );
             assert_eq!(runtime.nodes.next_frames[next].flags & (1 << 5), 0);
         }
-        // dispatch_pending_node uses the Frame trace bit for direct enqueue,
-        // where there is no associated Next Frame.
+        // Ordinary fanout follows vlib_buffer_enqueue_to_next through put_next_frame.
+        for trace in [true, false] {
+            state.flags = if trace { 1 << 5 } else { 0 };
+            state.cached_next_index = u32::MAX;
+            runtime.with_current_node(input, |runtime| {
+                runtime.enqueue_to_next(&mut state, &mut input_frame, &[0u16; 3]);
+            });
+            assert_eq!(state.cached_next_index, 0);
+            assert_eq!(input_frame.vector_args(), &[29, 31, 37]);
+            assert_eq!(runtime.run_ready_nodes().unwrap(), 1);
+            assert_eq!(
+                runtime.nodes().node_runtime_data(output).unwrap().word(3),
+                if trace { 1 << 5 } else { 0 }
+            );
+        }
+        // Direct enqueue has no associated Next Frame and uses its own trace bit.
         for trace in [true, false] {
             let frames_in_use = runtime.nodes().frames_in_use();
             let mut frame = runtime.get_frame_to_node(output).unwrap();

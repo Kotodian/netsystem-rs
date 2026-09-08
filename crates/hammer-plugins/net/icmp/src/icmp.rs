@@ -417,9 +417,9 @@ impl Node for Icmp4EchoRequestNode {
         node_runtime: &mut hammer_runtime::NodeRuntime,
         frame: &mut Frame,
     ) -> usize {
-        let process: NodeProcessFn = |runtime, _, frame| {
+        let process: NodeProcessFn = |runtime, node_runtime, frame| {
             let processed_vectors = frame.len();
-            icmp_echo_request_process_frame(runtime, frame, IpVersion::V4);
+            icmp_echo_request_process_frame(runtime, node_runtime, frame, IpVersion::V4);
             processed_vectors
         };
         process(runtime, node_runtime, frame)
@@ -468,9 +468,9 @@ impl Node for Icmp6EchoRequestNode {
         node_runtime: &mut hammer_runtime::NodeRuntime,
         frame: &mut Frame,
     ) -> usize {
-        let process: NodeProcessFn = |runtime, _, frame| {
+        let process: NodeProcessFn = |runtime, node_runtime, frame| {
             let processed_vectors = frame.len();
-            icmp_echo_request_process_frame(runtime, frame, IpVersion::V6);
+            icmp_echo_request_process_frame(runtime, node_runtime, frame, IpVersion::V6);
             processed_vectors
         };
         process(runtime, node_runtime, frame)
@@ -484,7 +484,7 @@ impl Node for Icmp6EchoRequestNode {
 
 fn icmp_input_process(
     runtime: &mut DataPlaneMain,
-    _: &mut NodeRuntime,
+    node_runtime: &mut NodeRuntime,
     frame: &mut Frame,
     version: IpVersion,
 ) -> usize {
@@ -501,7 +501,7 @@ fn icmp_input_process(
                 Err(_) => drop_slot,
             };
         }
-        runtime.enqueue_to_next(frame, &nexts[..frame.len()]);
+        runtime.enqueue_to_next(node_runtime, frame, &nexts[..frame.len()]);
         ()
     })();
     processed_vectors
@@ -509,10 +509,11 @@ fn icmp_input_process(
 
 fn icmp_echo_request_process_frame(
     runtime: &mut DataPlaneMain,
+    node_runtime: &mut hammer_runtime::NodeRuntime,
     frame: &mut Frame,
     version: IpVersion,
 ) -> () {
-    hammer_runtime::process_frame!(runtime, frame, |index| {
+    hammer_runtime::process_frame!(runtime, node_runtime, frame, |index| {
         match next_for_echo_request_index(runtime, index, version) {
             Ok(next) => next,
             Err(_) => match version {

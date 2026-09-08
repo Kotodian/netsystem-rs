@@ -226,6 +226,7 @@ impl IpReassemblyMain {
     fn process_frame(
         &self,
         runtime: &mut DataPlaneMain,
+        node_runtime: &mut hammer_runtime::NodeRuntime,
         frame: &mut Frame,
         version: IpVersion,
     ) -> () {
@@ -234,7 +235,7 @@ impl IpReassemblyMain {
         };
         worker
             .lock()
-            .process_frame(runtime, frame, Instant::now(), version)
+            .process_frame(runtime, node_runtime, frame, Instant::now(), version)
     }
 }
 
@@ -475,6 +476,7 @@ impl IpReassemblyWorker {
     fn process_frame(
         &mut self,
         runtime: &mut DataPlaneMain,
+        node_runtime: &mut hammer_runtime::NodeRuntime,
         frame: &mut Frame,
         now: Instant,
         version: IpVersion,
@@ -486,6 +488,7 @@ impl IpReassemblyWorker {
         for &index in frame.vector_args() {
             let _ = self.process_index(
                 runtime,
+                node_runtime,
                 index,
                 now,
                 &mut output,
@@ -495,7 +498,7 @@ impl IpReassemblyWorker {
             );
         }
         if out_len != 0 {
-            runtime.enqueue_to_next(&mut output, &nexts[..out_len]);
+            runtime.enqueue_to_next(node_runtime, &mut output, &nexts[..out_len]);
         }
         ()
     }
@@ -503,6 +506,7 @@ impl IpReassemblyWorker {
     #[inline]
     fn emit_local(
         runtime: &mut DataPlaneMain,
+        node_runtime: &mut hammer_runtime::NodeRuntime,
         frame: &mut Frame,
         nexts: &mut [u16; DEFAULT_BUFFER_FRAME_CAPACITY],
         out_len: &mut usize,
@@ -510,7 +514,7 @@ impl IpReassemblyWorker {
         index: u32,
     ) -> RuntimeResult<()> {
         if *out_len == DEFAULT_BUFFER_FRAME_CAPACITY {
-            runtime.enqueue_to_next(frame, &nexts[..*out_len]);
+            runtime.enqueue_to_next(node_runtime, frame, &nexts[..*out_len]);
             frame.set_vector_count(0);
             *out_len = 0;
         }
@@ -527,6 +531,7 @@ impl IpReassemblyWorker {
     fn process_index(
         &mut self,
         runtime: &mut DataPlaneMain,
+        node_runtime: &mut hammer_runtime::NodeRuntime,
         index: u32,
         now: Instant,
         out_frame: &mut Frame,
@@ -557,7 +562,15 @@ impl IpReassemblyWorker {
                         next: Some(drop_next),
                     },
                 );
-                Self::emit_local(runtime, out_frame, nexts, out_len, drop_next, index)?;
+                Self::emit_local(
+                    runtime,
+                    node_runtime,
+                    out_frame,
+                    nexts,
+                    out_len,
+                    drop_next,
+                    index,
+                )?;
                 return Ok(());
             }
         };
@@ -566,7 +579,15 @@ impl IpReassemblyWorker {
                 IpVersion::V4 => NodeNext::slot(Ip4ReassemblyNext::Drop),
                 IpVersion::V6 => NodeNext::slot(Ip6ReassemblyNext::Drop),
             };
-            return Self::emit_local(runtime, out_frame, nexts, out_len, next, index);
+            return Self::emit_local(
+                runtime,
+                node_runtime,
+                out_frame,
+                nexts,
+                out_len,
+                next,
+                index,
+            );
         }
 
         let key = fragment.key;
@@ -609,7 +630,15 @@ impl IpReassemblyWorker {
                     IpVersion::V4 => NodeNext::slot(Ip4ReassemblyNext::Drop),
                     IpVersion::V6 => NodeNext::slot(Ip6ReassemblyNext::Drop),
                 };
-                Self::emit_local(runtime, out_frame, nexts, out_len, drop_next, index)?;
+                Self::emit_local(
+                    runtime,
+                    node_runtime,
+                    out_frame,
+                    nexts,
+                    out_len,
+                    drop_next,
+                    index,
+                )?;
                 return Ok(());
             }
             None => {
@@ -629,7 +658,15 @@ impl IpReassemblyWorker {
                             next: Some(drop_next),
                         },
                     );
-                    Self::emit_local(runtime, out_frame, nexts, out_len, drop_next, index)?;
+                    Self::emit_local(
+                        runtime,
+                        node_runtime,
+                        out_frame,
+                        nexts,
+                        out_len,
+                        drop_next,
+                        index,
+                    )?;
                     return Ok(());
                 }
                 let ctx_index =
@@ -760,7 +797,15 @@ impl IpReassemblyWorker {
                     next: Some(drop_next),
                 },
             );
-            Self::emit_local(runtime, out_frame, nexts, out_len, drop_next, index)?;
+            Self::emit_local(
+                runtime,
+                node_runtime,
+                out_frame,
+                nexts,
+                out_len,
+                drop_next,
+                index,
+            )?;
             return Ok(());
         }
 
@@ -803,7 +848,15 @@ impl IpReassemblyWorker {
                     next: Some(drop_slot),
                 },
             );
-            Self::emit_local(runtime, out_frame, nexts, out_len, drop_next, failed_index)?;
+            Self::emit_local(
+                runtime,
+                node_runtime,
+                out_frame,
+                nexts,
+                out_len,
+                drop_next,
+                failed_index,
+            )?;
             if let Some(directory) = &self.directory {
                 directory.remove(key);
             } else if let Some(handoff) = &self.handoff {
@@ -867,7 +920,15 @@ impl IpReassemblyWorker {
                     next: Some(input_next),
                 },
             );
-            Self::emit_local(runtime, out_frame, nexts, out_len, input_next, index)?;
+            Self::emit_local(
+                runtime,
+                node_runtime,
+                out_frame,
+                nexts,
+                out_len,
+                input_next,
+                index,
+            )?;
         }
         Ok(())
     }
@@ -927,14 +988,14 @@ impl Node for Ip6ReassemblyNode {
 
 fn ip_reassembly_process(
     runtime: &mut DataPlaneMain,
-    _data: &mut NodeRuntime,
+    node_runtime: &mut NodeRuntime,
     frame: &mut Frame,
     version: IpVersion,
 ) -> usize {
     let processed_vectors = frame.len();
     (|| {
         if let Some(main) = IP_REASSEMBLY_MAIN.get() {
-            main.process_frame(runtime, frame, version);
+            main.process_frame(runtime, node_runtime, frame, version);
         }
     })();
     processed_vectors
@@ -1608,6 +1669,7 @@ mod tests {
         worker
             .process_index(
                 &mut runtime,
+                &mut NodeRuntime::empty(),
                 indices[0],
                 now,
                 &mut output,
@@ -1622,6 +1684,7 @@ mod tests {
         worker
             .process_index(
                 &mut runtime,
+                &mut NodeRuntime::empty(),
                 indices[1],
                 now,
                 &mut output,

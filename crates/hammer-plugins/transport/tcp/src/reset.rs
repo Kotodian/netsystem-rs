@@ -45,14 +45,22 @@ impl Node for TcpResetNode {
     }
 }
 
-fn tcp_reset_process(runtime: &mut DataPlaneMain, _: &mut NodeRuntime, frame: &mut Frame) -> usize {
+fn tcp_reset_process(
+    runtime: &mut DataPlaneMain,
+    node_runtime: &mut NodeRuntime,
+    frame: &mut Frame,
+) -> usize {
     let processed_vectors = frame.len();
-    tcp_reset_process_frame(runtime, frame);
+    tcp_reset_process_frame(runtime, node_runtime, frame);
     processed_vectors
 }
 
-fn tcp_reset_process_frame(runtime: &mut DataPlaneMain, frame: &mut Frame) -> () {
-    hammer_runtime::process_frame!(runtime, frame, |index| {
+fn tcp_reset_process_frame(
+    runtime: &mut DataPlaneMain,
+    node_runtime: &mut hammer_runtime::NodeRuntime,
+    frame: &mut Frame,
+) -> () {
+    hammer_runtime::process_frame!(runtime, node_runtime, frame, |index| {
         tcp_reset_next_for_index(runtime, index).unwrap_or(TcpResetNext::Drop)
     })
 }

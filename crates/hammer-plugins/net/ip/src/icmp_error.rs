@@ -192,7 +192,11 @@ fn init_worker(runtime: &mut DataPlaneMain) -> RuntimeResult<()> {
     Ok(())
 }
 
-fn ip4_icmp_error(runtime: &mut DataPlaneMain, _: &mut NodeRuntime, frame: &mut Frame) -> usize {
+fn ip4_icmp_error(
+    runtime: &mut DataPlaneMain,
+    node_runtime: &mut NodeRuntime,
+    frame: &mut Frame,
+) -> usize {
     let processed_vectors = frame.len();
     (|| {
         let ip = IP4_MAIN
@@ -202,7 +206,7 @@ fn ip4_icmp_error(runtime: &mut DataPlaneMain, _: &mut NodeRuntime, frame: &mut 
             .borrow_mut()
             .expect("IPv4 ICMP throttle belongs to executing worker");
         let seed = throttle.seed(ip.clock_origin.elapsed());
-        hammer_runtime::process_frame!(runtime, frame, |index| {
+        hammer_runtime::process_frame!(runtime, node_runtime, frame, |index| {
             let result = generate_error(
                 runtime,
                 index,
@@ -227,7 +231,11 @@ fn ip4_icmp_error(runtime: &mut DataPlaneMain, _: &mut NodeRuntime, frame: &mut 
     processed_vectors
 }
 
-fn ip6_icmp_error(runtime: &mut DataPlaneMain, _: &mut NodeRuntime, frame: &mut Frame) -> usize {
+fn ip6_icmp_error(
+    runtime: &mut DataPlaneMain,
+    node_runtime: &mut NodeRuntime,
+    frame: &mut Frame,
+) -> usize {
     let processed_vectors = frame.len();
     (|| {
         let ip = IP6_MAIN
@@ -237,7 +245,7 @@ fn ip6_icmp_error(runtime: &mut DataPlaneMain, _: &mut NodeRuntime, frame: &mut 
             .borrow_mut()
             .expect("IPv6 ICMP throttle belongs to executing worker");
         let seed = throttle.seed(ip.clock_origin.elapsed());
-        hammer_runtime::process_frame!(runtime, frame, |index| {
+        hammer_runtime::process_frame!(runtime, node_runtime, frame, |index| {
             let result = generate_error(
                 runtime,
                 index,
@@ -462,7 +470,7 @@ pub(crate) fn error_response_source_and_origin(runtime: &mut DataPlaneMain) -> R
     let output = runtime.nodes().try_register_descriptor(
         NodeKind::Internal,
         NodeDescriptor::new(
-            |runtime, _, frame| {
+            |runtime, node_runtime, frame| {
                 assert_eq!(frame.len(), 1);
                 let buffer = runtime.buffer(frame.vector_args()[0]);
                 let packet = buffer.current();

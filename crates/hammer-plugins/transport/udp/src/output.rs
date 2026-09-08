@@ -136,16 +136,20 @@ impl Node for UdpOutputNode {
 
 fn udp_output_process(
     runtime: &mut DataPlaneMain,
-    _: &mut NodeRuntime,
+    node_runtime: &mut NodeRuntime,
     frame: &mut Frame,
 ) -> usize {
     let processed_vectors = frame.len();
-    udp_output_process_frame(runtime, frame);
+    udp_output_process_frame(runtime, node_runtime, frame);
     processed_vectors
 }
 
-fn udp_output_process_frame(runtime: &mut DataPlaneMain, frame: &mut Frame) -> () {
-    hammer_runtime::process_frame!(runtime, frame, |index| {
+fn udp_output_process_frame(
+    runtime: &mut DataPlaneMain,
+    node_runtime: &mut hammer_runtime::NodeRuntime,
+    frame: &mut Frame,
+) -> () {
+    hammer_runtime::process_frame!(runtime, node_runtime, frame, |index| {
         udp_output_next_for_index(runtime, index).unwrap_or(UdpOutputNext::Drop)
     })
 }

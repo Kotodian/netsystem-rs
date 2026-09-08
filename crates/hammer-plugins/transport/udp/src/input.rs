@@ -588,7 +588,7 @@ fn udp_input_process(
             Ok(state) => state.get(),
             Err(_) => return (),
         };
-        udp_input_process_frame(runtime, frame, snapshot)
+        udp_input_process_frame(runtime, data, frame, snapshot)
     })();
     processed_vectors
 }
@@ -647,6 +647,7 @@ impl Node for UdpInputNode {
 #[inline(always)]
 fn udp_input_process_frame(
     runtime: &mut DataPlaneMain,
+    node_runtime: &mut hammer_runtime::NodeRuntime,
     frame: &mut Frame,
     snapshot: &UdpInputSnapshot,
 ) -> () {
@@ -667,7 +668,7 @@ fn udp_input_process_frame(
     }
     let count = output.len();
     if count != 0 {
-        runtime.enqueue_to_next(&mut output, &nexts[..count]);
+        runtime.enqueue_to_next(node_runtime, &mut output, &nexts[..count]);
     }
     ()
 }

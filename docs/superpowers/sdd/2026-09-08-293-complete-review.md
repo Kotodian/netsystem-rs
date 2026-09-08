@@ -128,3 +128,13 @@ and the affected caller migrations are implemented.
   and UDP migration passes the same exclusive runtime borrow through its caller.
 - cargo check --workspace --all-targets --offline --message-format=short passed
   for these changes. No test commands were run. S1 and B1–B4 remain open.
+
+- B3: fixed in `42c0cc28`; explicit rebuild finishes old dispatch, recycles
+  retained Next allocations through their size classes and clears old arc/owner
+  indices. The Worker refork path is unchanged.
+- B2: enqueue_to_next/process_frame! now take the actual invocation's mutable
+  NodeRuntime. Fanout uses put_next_frame for trace/cached-next propagation.
+  Migrated Session, IP, ICMP, TCP, UDP, direct callers and the existing benchmark.
+  Extended the inline dispatch unit case for fanout trace transitions,
+  cached-next selection and unchanged input vectors. Workspace all-target offline
+  compilation passed; no tests were run. S1, B1 and B4 remain open.

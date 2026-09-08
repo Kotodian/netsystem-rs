@@ -40,6 +40,7 @@ pub trait NodeErrorCode {
 macro_rules! process_frame {
     (
         $runtime:expr,
+        $node_runtime:expr,
         $frame:expr,
         |$index:pat_param| $body:expr
         $(,)?
@@ -58,7 +59,7 @@ macro_rules! process_frame {
             next_slots[n] = ::hammer_core::data_plane::NodeNext::slot(next);
             n += 1;
         }
-        $runtime.enqueue_to_next($frame, &next_slots[..n]);
+        $runtime.enqueue_to_next($node_runtime, $frame, &next_slots[..n]);
         ()
     }};
 }

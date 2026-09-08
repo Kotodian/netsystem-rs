@@ -141,9 +141,15 @@ impl Node for Ip4LocalNode {
         node_runtime: &mut hammer_runtime::NodeRuntime,
         frame: &mut Frame,
     ) -> usize {
-        let process: NodeProcessFn = |runtime, _, frame| {
+        let process: NodeProcessFn = |runtime, node_runtime, frame| {
             let processed_vectors = frame.len();
-            process_frame(runtime, frame, LocalStage::Head, IpVersion::V4);
+            process_frame(
+                runtime,
+                node_runtime,
+                frame,
+                LocalStage::Head,
+                IpVersion::V4,
+            );
             processed_vectors
         };
         process(runtime, node_runtime, frame)
@@ -198,9 +204,15 @@ impl Node for Ip4ReceiveNode {
         node_runtime: &mut hammer_runtime::NodeRuntime,
         frame: &mut Frame,
     ) -> usize {
-        let process: NodeProcessFn = |runtime, _, frame| {
+        let process: NodeProcessFn = |runtime, node_runtime, frame| {
             let processed_vectors = frame.len();
-            process_frame(runtime, frame, LocalStage::Receive, IpVersion::V4);
+            process_frame(
+                runtime,
+                node_runtime,
+                frame,
+                LocalStage::Receive,
+                IpVersion::V4,
+            );
             processed_vectors
         };
         process(runtime, node_runtime, frame)
@@ -231,9 +243,9 @@ impl Node for Ip4LocalEndOfArcNode {
         node_runtime: &mut hammer_runtime::NodeRuntime,
         frame: &mut Frame,
     ) -> usize {
-        let process: NodeProcessFn = |runtime, _, frame| {
+        let process: NodeProcessFn = |runtime, node_runtime, frame| {
             let processed_vectors = frame.len();
-            process_frame(runtime, frame, LocalStage::End, IpVersion::V4);
+            process_frame(runtime, node_runtime, frame, LocalStage::End, IpVersion::V4);
             processed_vectors
         };
         process(runtime, node_runtime, frame)
@@ -299,9 +311,15 @@ impl Node for Ip6LocalNode {
         node_runtime: &mut hammer_runtime::NodeRuntime,
         frame: &mut Frame,
     ) -> usize {
-        let process: NodeProcessFn = |runtime, _, frame| {
+        let process: NodeProcessFn = |runtime, node_runtime, frame| {
             let processed_vectors = frame.len();
-            process_frame(runtime, frame, LocalStage::Head, IpVersion::V6);
+            process_frame(
+                runtime,
+                node_runtime,
+                frame,
+                LocalStage::Head,
+                IpVersion::V6,
+            );
             processed_vectors
         };
         process(runtime, node_runtime, frame)
@@ -356,9 +374,15 @@ impl Node for Ip6ReceiveNode {
         node_runtime: &mut hammer_runtime::NodeRuntime,
         frame: &mut Frame,
     ) -> usize {
-        let process: NodeProcessFn = |runtime, _, frame| {
+        let process: NodeProcessFn = |runtime, node_runtime, frame| {
             let processed_vectors = frame.len();
-            process_frame(runtime, frame, LocalStage::Receive, IpVersion::V6);
+            process_frame(
+                runtime,
+                node_runtime,
+                frame,
+                LocalStage::Receive,
+                IpVersion::V6,
+            );
             processed_vectors
         };
         process(runtime, node_runtime, frame)
@@ -389,9 +413,9 @@ impl Node for Ip6LocalEndOfArcNode {
         node_runtime: &mut hammer_runtime::NodeRuntime,
         frame: &mut Frame,
     ) -> usize {
-        let process: NodeProcessFn = |runtime, _, frame| {
+        let process: NodeProcessFn = |runtime, node_runtime, frame| {
             let processed_vectors = frame.len();
-            process_frame(runtime, frame, LocalStage::End, IpVersion::V6);
+            process_frame(runtime, node_runtime, frame, LocalStage::End, IpVersion::V6);
             processed_vectors
         };
         process(runtime, node_runtime, frame)
@@ -463,11 +487,12 @@ impl LocalStage {
 #[inline(always)]
 fn process_frame(
     runtime: &mut DataPlaneMain,
+    node_runtime: &mut hammer_runtime::NodeRuntime,
     frame: &mut Frame,
     stage: LocalStage,
     version: IpVersion,
 ) -> () {
-    hammer_runtime::process_frame!(runtime, frame, |index| {
+    hammer_runtime::process_frame!(runtime, node_runtime, frame, |index| {
         match process_index(runtime, index, stage, version) {
             Ok(slot) => slot,
             Err(_) => match version {

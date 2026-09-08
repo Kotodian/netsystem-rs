@@ -175,13 +175,14 @@ pub(crate) fn tcp_input_process(
             Err(_) => return (),
         };
         let snapshot = state.snapshot.load();
-        tcp_input_process_frame(runtime, frame, &snapshot, state.handoff_worker)
+        tcp_input_process_frame(runtime, data, frame, &snapshot, state.handoff_worker)
     })();
     processed_vectors
 }
 
 fn tcp_input_process_frame(
     runtime: &mut DataPlaneMain,
+    node_runtime: &mut hammer_runtime::NodeRuntime,
     frame: &mut Frame,
     snapshot: &TcpLookupSnapshot,
     handoff_worker: Option<DataWorkerId>,
@@ -203,7 +204,7 @@ fn tcp_input_process_frame(
     }
     let count = output.len();
     if count != 0 {
-        runtime.enqueue_to_next(&mut output, &nexts[..count]);
+        runtime.enqueue_to_next(node_runtime, &mut output, &nexts[..count]);
     }
     ()
 }

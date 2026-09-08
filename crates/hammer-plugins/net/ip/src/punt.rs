@@ -48,7 +48,7 @@ impl Node for Ip4PuntNode {
         node_runtime: &mut hammer_runtime::NodeRuntime,
         frame: &mut Frame,
     ) -> usize {
-        let process: NodeProcessFn = |runtime, _, frame| {
+        let process: NodeProcessFn = |runtime, node_runtime, frame| {
             let processed_vectors = frame.len();
             (|| {
                 {
@@ -61,7 +61,7 @@ impl Node for Ip4PuntNode {
                             .punt_feature_arc_index
                             .get()
                     };
-                    hammer_runtime::process_frame!(runtime, frame, |index| {
+                    hammer_runtime::process_frame!(runtime, node_runtime, frame, |index| {
                         let buffer = runtime.buffer_mut(index);
                         // SAFETY: IP ingress initializes the network overlay.
                         let sw_if_index =
@@ -97,7 +97,7 @@ impl Node for Ip4DropNode {
         node_runtime: &mut hammer_runtime::NodeRuntime,
         frame: &mut Frame,
     ) -> usize {
-        let process: NodeProcessFn = |runtime, _, frame| {
+        let process: NodeProcessFn = |runtime, node_runtime, frame| {
             let processed_vectors = frame.len();
             (|| {
                 {
@@ -110,7 +110,7 @@ impl Node for Ip4DropNode {
                             .drop_feature_arc_index
                             .get()
                     };
-                    hammer_runtime::process_frame!(runtime, frame, |index| {
+                    hammer_runtime::process_frame!(runtime, node_runtime, frame, |index| {
                         let buffer = runtime.buffer_mut(index);
                         // SAFETY: IP ingress initializes the network overlay.
                         let sw_if_index =
@@ -171,7 +171,7 @@ impl Node for Ip6PuntNode {
         node_runtime: &mut hammer_runtime::NodeRuntime,
         frame: &mut Frame,
     ) -> usize {
-        let process: NodeProcessFn = |runtime, _, frame| {
+        let process: NodeProcessFn = |runtime, node_runtime, frame| {
             let processed_vectors = frame.len();
             (|| {
                 {
@@ -184,7 +184,7 @@ impl Node for Ip6PuntNode {
                             .punt_feature_arc_index
                             .get()
                     };
-                    hammer_runtime::process_frame!(runtime, frame, |index| {
+                    hammer_runtime::process_frame!(runtime, node_runtime, frame, |index| {
                         let buffer = runtime.buffer_mut(index);
                         // SAFETY: IP ingress initializes the network overlay.
                         let sw_if_index =
@@ -220,7 +220,7 @@ impl Node for Ip6DropNode {
         node_runtime: &mut hammer_runtime::NodeRuntime,
         frame: &mut Frame,
     ) -> usize {
-        let process: NodeProcessFn = |runtime, _, frame| {
+        let process: NodeProcessFn = |runtime, node_runtime, frame| {
             let processed_vectors = frame.len();
             (|| {
                 {
@@ -233,7 +233,7 @@ impl Node for Ip6DropNode {
                             .drop_feature_arc_index
                             .get()
                     };
-                    hammer_runtime::process_frame!(runtime, frame, |index| {
+                    hammer_runtime::process_frame!(runtime, node_runtime, frame, |index| {
                         let buffer = runtime.buffer_mut(index);
                         // SAFETY: IP ingress initializes the network overlay.
                         let sw_if_index =

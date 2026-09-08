@@ -68,30 +68,31 @@ impl Node for TcpOutputNode {
 
 fn tcp_output_node_process(
     runtime: &mut DataPlaneMain,
-    _: &mut NodeRuntime,
+    node_runtime: &mut NodeRuntime,
     frame: &mut Frame,
 ) -> usize {
     let processed_vectors = frame.len();
-    tcp_output_node_process_frame::<1>(runtime, frame);
+    tcp_output_node_process_frame::<1>(runtime, node_runtime, frame);
     processed_vectors
 }
 
 #[hammer_component_macros::node_function(node = TcpOutputNode)]
 fn tcp_output_node_process_simd<const SIMD_BYTES: usize>(
     runtime: &mut DataPlaneMain,
-    _: &mut NodeRuntime,
+    node_runtime: &mut NodeRuntime,
     frame: &mut Frame,
 ) -> usize {
     let processed_vectors = frame.len();
-    tcp_output_node_process_frame::<SIMD_BYTES>(runtime, frame);
+    tcp_output_node_process_frame::<SIMD_BYTES>(runtime, node_runtime, frame);
     processed_vectors
 }
 
 fn tcp_output_node_process_frame<const SIMD_BYTES: usize>(
     runtime: &mut DataPlaneMain,
+    node_runtime: &mut hammer_runtime::NodeRuntime,
     frame: &mut Frame,
 ) -> () {
-    hammer_runtime::process_frame!(runtime, frame, |index| {
+    hammer_runtime::process_frame!(runtime, node_runtime, frame, |index| {
         tcp_output_next_for_index::<SIMD_BYTES>(runtime, index).unwrap_or(TcpOutputNext::Drop)
     })
 }

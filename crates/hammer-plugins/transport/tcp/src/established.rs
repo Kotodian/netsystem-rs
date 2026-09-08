@@ -50,23 +50,37 @@ impl Node for TcpEstablishedNode {
 
 pub(crate) fn tcp_established_process(
     runtime: &mut DataPlaneMain,
-    _: &mut NodeRuntime,
+    node_runtime: &mut NodeRuntime,
     frame: &mut Frame,
 ) -> usize {
     let processed_vectors = frame.len();
-    tcp_established_frame(runtime, frame);
+    tcp_established_frame(runtime, node_runtime, frame);
     processed_vectors
 }
 
-fn tcp_established_frame(runtime: &mut DataPlaneMain, frame: &mut Frame) -> () {
+fn tcp_established_frame(
+    runtime: &mut DataPlaneMain,
+    node_runtime: &mut hammer_runtime::NodeRuntime,
+    frame: &mut Frame,
+) -> () {
     let mut output = Frame::<(), u32, ()>::new(0);
 
     let mut nexts = [0u16; DEFAULT_BUFFER_FRAME_CAPACITY];
     let mut out_len = 0usize;
     for &index in frame.vector_args() {
-        if tcp_established_index(runtime, index, &mut output, &mut nexts, &mut out_len).is_err() {
+        if tcp_established_index(
+            runtime,
+            node_runtime,
+            index,
+            &mut output,
+            &mut nexts,
+            &mut out_len,
+        )
+        .is_err()
+        {
             let _ = emit_local(
                 runtime,
+                node_runtime,
                 &mut output,
                 &mut nexts,
                 &mut out_len,
@@ -76,7 +90,7 @@ fn tcp_established_frame(runtime: &mut DataPlaneMain, frame: &mut Frame) -> () {
         }
     }
     if out_len != 0 {
-        runtime.enqueue_to_next(&mut output, &nexts[..out_len]);
+        runtime.enqueue_to_next(node_runtime, &mut output, &nexts[..out_len]);
     }
     ()
 }
@@ -84,6 +98,7 @@ fn tcp_established_frame(runtime: &mut DataPlaneMain, frame: &mut Frame) -> () {
 #[inline]
 fn emit_local(
     runtime: &mut DataPlaneMain,
+    node_runtime: &mut hammer_runtime::NodeRuntime,
     frame: &mut Frame,
     nexts: &mut [u16; DEFAULT_BUFFER_FRAME_CAPACITY],
     out_len: &mut usize,
@@ -91,7 +106,7 @@ fn emit_local(
     index: u32,
 ) -> RuntimeResult<()> {
     if *out_len == DEFAULT_BUFFER_FRAME_CAPACITY {
-        runtime.enqueue_to_next(frame, &nexts[..*out_len]);
+        runtime.enqueue_to_next(node_runtime, frame, &nexts[..*out_len]);
         frame.set_vector_count(0);
         *out_len = 0;
     }
@@ -108,6 +123,7 @@ fn emit_local(
 
 fn tcp_established_index(
     runtime: &mut DataPlaneMain,
+    node_runtime: &mut hammer_runtime::NodeRuntime,
     index: u32,
     out_frame: &mut Frame,
     nexts: &mut [u16; DEFAULT_BUFFER_FRAME_CAPACITY],
@@ -288,6 +304,7 @@ fn tcp_established_index(
         segment.write_to_buffer(&mut *runtime.buffer_mut(allocated))?;
         emit_local(
             runtime,
+            node_runtime,
             out_frame,
             nexts,
             out_len,

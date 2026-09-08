@@ -66,9 +66,9 @@ impl Node for Ip4InputNode {
         node_runtime: &mut hammer_runtime::NodeRuntime,
         frame: &mut Frame,
     ) -> usize {
-        let process: NodeProcessFn = |runtime, _, frame| {
+        let process: NodeProcessFn = |runtime, node_runtime, frame| {
             let processed_vectors = frame.len();
-            ip_input_process_frame(runtime, frame, IpVersion::V4);
+            ip_input_process_frame(runtime, node_runtime, frame, IpVersion::V4);
             processed_vectors
         };
         process(runtime, node_runtime, frame)
@@ -85,9 +85,9 @@ impl Node for Ip6InputNode {
         node_runtime: &mut hammer_runtime::NodeRuntime,
         frame: &mut Frame,
     ) -> usize {
-        let process: NodeProcessFn = |runtime, _, frame| {
+        let process: NodeProcessFn = |runtime, node_runtime, frame| {
             let processed_vectors = frame.len();
-            ip_input_process_frame(runtime, frame, IpVersion::V6);
+            ip_input_process_frame(runtime, node_runtime, frame, IpVersion::V6);
             processed_vectors
         };
         process(runtime, node_runtime, frame)
@@ -101,6 +101,7 @@ impl Node for Ip6InputNode {
 #[inline(always)]
 fn ip_input_process_frame(
     runtime: &mut DataPlaneMain,
+    node_runtime: &mut hammer_runtime::NodeRuntime,
     frame: &mut Frame,
     version: IpVersion,
 ) -> () {
@@ -116,7 +117,7 @@ fn ip_input_process_frame(
         };
         nexts.push(slot);
     }
-    runtime.enqueue_to_next(frame, nexts.as_slice());
+    runtime.enqueue_to_next(node_runtime, frame, nexts.as_slice());
     ()
 }
 

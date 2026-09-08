@@ -4435,6 +4435,7 @@ where
 
 pub fn dispatch_session_queue_once<T>(
     runtime: &mut DataPlaneMain,
+    node_runtime: &mut hammer_runtime::NodeRuntime,
     owner: hammer_core::data_plane::NodeId,
     sessions: &mut SessionWorker,
     transport: &mut T,
@@ -4456,7 +4457,9 @@ where
         &mut output,
         now,
     )?;
-    runtime.with_current_node(owner, |runtime| output.flush(runtime, &mut staging));
+    runtime.with_current_node(owner, |runtime| {
+        output.flush(runtime, node_runtime, &mut staging)
+    });
     Ok(step)
 }
 
