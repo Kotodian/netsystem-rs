@@ -1,4 +1,4 @@
-use hammer_core::buffer::BufferMain;
+use hammer_core::buffer::{BufferFlags, BufferMain};
 use hammer_core::error::DataPlaneResult;
 use hammer_core::graph::NodeErrorIndex;
 
@@ -89,10 +89,14 @@ fn independent_segment_survives_original_chain_release() -> DataPlaneResult<()> 
         let buffer = buffers.buffer_mut(&mut caches, source);
         assert_eq!(buffer.current()[0], 0x42);
         assert_eq!(buffer.current_len(), 20);
-        assert_eq!(buffer.total_len_not_including_first(), 16);
+        // vlib_buffer_add_data invalidates the cached total; inspect the
+        // retained tail itself after ending this mutable head borrow.
+        assert!(!buffer.flags().contains(BufferFlags::TOTAL_LENGTH_VALID));
         assert_eq!(buffer.node_error_index(), NodeErrorIndex::new(31));
         assert_eq!(buffer.take_trace_handle(), Some(29));
     }
+    let tail = buffers.buffer(&caches, source).next_buffer_slot().unwrap();
+    assert_eq!(buffers.buffer(&caches, tail).current(), &[0x31; 16]);
     BufferMain::global().free_buffers(&mut caches, &[source], true, |_| {});
     assert_eq!(buffers.cached_free_buffers(&caches, 0), cached_free + 2);
     // Ownership: releasing the source chain did not release the independent copy.
