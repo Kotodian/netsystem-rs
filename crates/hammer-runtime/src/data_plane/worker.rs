@@ -91,7 +91,8 @@ impl DataPlaneMain {
         self.nodes.set_node_runtime_data(node, data)
     }
 
-    pub(crate) fn refork_worker_graph(&mut self) {
+    pub(crate) fn refork_worker_graph(&mut self, barrier: &crate::barrier::WorkerBarrier) {
+        barrier.check();
         use std::sync::atomic::Ordering;
 
         if self.workers_updating_graph.load(Ordering::Acquire) == 0 {
@@ -252,12 +253,54 @@ mod tests {
                 ),
             )
             .unwrap();
-        let mut worker = DataPlaneMain::new(DataPlaneBufferConfig {
-            thread_index: 1,
-            ..Default::default()
+        let graph = main.nodes().snapshot();
+        let mut engine = crate::GlobalMain::new(main, crate::RuntimeRegistry::new());
+        engine.prepare_worker_publication();
+        let barrier = crate::barrier::WorkerBarrier::new(1);
+        barrier.arm();
+        let worker_barrier = barrier.clone();
+        let publication = Arc::clone(&engine.publication);
+        let updating = Arc::clone(&engine.workers_updating_graph);
+        let worker = std::thread::spawn(move || {
+            let mut worker = DataPlaneMain::new(DataPlaneBufferConfig {
+                thread_index: 1,
+                ..Default::default()
+            });
+            worker.nodes = graph.into();
+            worker.publication = publication;
+            worker.workers_updating_graph = updating;
+            let mut frame = worker.get_frame_to_node(input).unwrap();
+            frame.set_vector_count(1);
+            frame.vector_args_mut()[0] = 1;
+            worker.put_frame_to_node(input, frame).unwrap();
+            // The prior iteration finishes the dynamically growing Pending
+            // vector before entering the production loop-top check/refork pair.
+            assert_eq!(worker.run_ready_nodes().unwrap(), 41);
+            assert_eq!(worker.run_ready_nodes().unwrap(), 0);
+            assert_eq!(worker.nodes().node_runtime_data(input).unwrap().word(0), 1);
+            assert_eq!(
+                worker.nodes().node_runtime_data(output).unwrap().word(0),
+                40
+            );
+            assert!(worker.nodes().node_by_name("packet-added").is_none());
+            worker.refork_worker_graph(&worker_barrier);
+            assert!(worker.nodes().node_by_name("packet-added").is_some());
+            assert_eq!(worker.workers_updating_graph.load(Ordering::Acquire), 0);
+            assert_eq!(worker.run_ready_nodes().unwrap(), 0);
+            assert_eq!(worker.nodes().node_runtime_data(input).unwrap().word(0), 1);
+            assert_eq!(
+                worker.nodes().node_runtime_data(output).unwrap().word(0),
+                40
+            );
         });
-        worker.nodes = main.nodes().snapshot().into();
-        main.nodes()
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while barrier.paused_workers() != 1 {
+            assert!(Instant::now() < deadline);
+            std::thread::yield_now();
+        }
+        engine
+            .data_plane_main()
+            .nodes()
             .try_register_descriptor(
                 NodeKind::Internal,
                 NodeDescriptor::new(
@@ -269,33 +312,13 @@ mod tests {
                 ),
             )
             .unwrap();
-        // SAFETY: publication and Worker are local to this test's OS thread;
-        // no writer accesses the publication after this point.
-        unsafe { worker.publication.set_graph(main.nodes().snapshot()) };
-        worker.workers_updating_graph.store(1, Ordering::Release);
-        let mut frame = worker.get_frame_to_node(input).unwrap();
-        frame.set_vector_count(1);
-        frame.vector_args_mut()[0] = 1;
-        worker.put_frame_to_node(input, frame).unwrap();
-        // main.c dispatches until the dynamically growing Pending vector is
-        // exhausted. The loop-top refork is a separate operation afterward.
-        assert_eq!(worker.run_ready_nodes().unwrap(), 41);
-        assert_eq!(worker.run_ready_nodes().unwrap(), 0);
-        assert_eq!(worker.nodes().node_runtime_data(input).unwrap().word(0), 1);
-        assert_eq!(
-            worker.nodes().node_runtime_data(output).unwrap().word(0),
-            40
-        );
-        assert_eq!(worker.workers_updating_graph.load(Ordering::Acquire), 1);
-        worker.refork_worker_graph();
-        assert!(worker.nodes().node_by_name("packet-added").is_some());
-        assert_eq!(worker.workers_updating_graph.load(Ordering::Acquire), 0);
-        assert_eq!(worker.run_ready_nodes().unwrap(), 0);
-        assert_eq!(worker.nodes().node_runtime_data(input).unwrap().word(0), 1);
-        assert_eq!(
-            worker.nodes().node_runtime_data(output).unwrap().word(0),
-            40
-        );
+        engine.request_worker_graph_refork();
+        assert!(engine.publish_worker_graph_refork(1));
+        assert_eq!(engine.workers_updating_graph.load(Ordering::Acquire), 1);
+        barrier.release();
+        engine.wait_for_worker_graph_refork();
+        assert_eq!(engine.workers_updating_graph.load(Ordering::Acquire), 0);
+        worker.join().unwrap();
     }
 
     #[test]
@@ -352,15 +375,16 @@ mod tests {
                 ),
             )
             .unwrap();
-        // SAFETY: no Workers exist yet; publication remains unchanged until
-        // both joins. Thread creation publishes these writes to both readers.
-        unsafe { main.publication.set_graph(main.nodes().snapshot()) };
-        main.workers_updating_graph.store(2, Ordering::Release);
+        let mut engine = crate::GlobalMain::new(main, crate::RuntimeRegistry::new());
+        engine.prepare_worker_publication();
+        let barrier = crate::barrier::WorkerBarrier::new(2);
+        barrier.arm();
         let mut workers = Vec::new();
         for worker_index in 1..=2 {
             let graph = graph.clone();
-            let publication = Arc::clone(&main.publication);
-            let updating = Arc::clone(&main.workers_updating_graph);
+            let publication = Arc::clone(&engine.publication);
+            let updating = Arc::clone(&engine.workers_updating_graph);
+            let worker_barrier = barrier.clone();
             workers.push(std::thread::spawn(move || {
                 let mut worker = DataPlaneMain::new(DataPlaneBufferConfig {
                     thread_index: worker_index,
@@ -379,6 +403,7 @@ mod tests {
                     worker.get_next_frame::<u32, ()>(&mut NodeRuntime::empty(), 0);
                 });
                 assert_eq!(worker.nodes().frames_in_use(), 1);
+                worker_barrier.check();
                 if worker_index == 2 {
                     // threads.h decrements only after replacing the clone.
                     // Hold this Worker's old clone until its peer has finished
@@ -391,7 +416,7 @@ mod tests {
                     assert_eq!(worker.nodes().frames_in_use(), 1);
                     assert!(worker.nodes().node_by_name("packet-added").is_none());
                 }
-                worker.refork_worker_graph();
+                worker.refork_worker_graph(&worker_barrier);
                 assert_eq!(worker.workers_updating_graph.load(Ordering::Acquire), 0);
                 assert_eq!(worker.nodes().frames_in_use(), 0);
                 assert_eq!(
@@ -399,13 +424,22 @@ mod tests {
                     u64::from(worker_index)
                 );
                 assert_eq!(worker.nodes().node_runtime_data(added).unwrap().word(0), 29);
-                worker.refork_worker_graph();
+                worker.refork_worker_graph(&worker_barrier);
                 assert_eq!(worker.workers_updating_graph.load(Ordering::Acquire), 0);
             }));
         }
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while barrier.paused_workers() != 2 {
+            assert!(Instant::now() < deadline);
+            std::thread::yield_now();
+        }
+        engine.request_worker_graph_refork();
+        assert!(engine.publish_worker_graph_refork(2));
+        barrier.release();
+        engine.wait_for_worker_graph_refork();
+        assert_eq!(engine.workers_updating_graph.load(Ordering::Acquire), 0);
         for worker in workers {
             worker.join().unwrap();
         }
-        assert_eq!(main.workers_updating_graph.load(Ordering::Acquire), 0);
     }
 }

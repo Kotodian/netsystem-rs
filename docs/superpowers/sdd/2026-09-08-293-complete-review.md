@@ -138,3 +138,13 @@ and the affected caller migrations are implemented.
   Extended the inline dispatch unit case for fanout trace transitions,
   cached-next selection and unchanged input vectors. Workspace all-target offline
   compilation passed; no tests were run. S1, B1 and B4 remain open.
+
+- B4: the production loop-top check and refork now share the existing
+  refork_worker_graph entry point, taking the real WorkerBarrier. The two
+  existing unit cases use an armed local WorkerBarrier, OS-thread-owned Worker
+  runtimes, and GlobalMain publication/completion methods. Publication happens
+  only after actual Worker acknowledgement; main waits for the real refork
+  counter. This exercises the barrier/refork boundary without daemon execution,
+  subprocesses, mpsc or file fixtures. It is not a whole-main-loop integration
+  test. Runtime all-target offline compilation passed; no tests were run.
+  S1 and B1 remain open.
