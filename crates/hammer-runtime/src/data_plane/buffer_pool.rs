@@ -76,8 +76,21 @@ impl DataPlaneMain {
 
     #[inline]
     pub fn chain(&self, index: u32) -> impl Iterator<Item = &hammer_core::buffer::Buffer> {
-        std::iter::successors(Some(self.buffer(index)), |buffer| {
-            buffer.next_buffer_slot().map(|next| self.buffer(next))
+        // Bound malformed cyclic chains without an allocation or extra Buffer
+        // lookups. Compare against an earlier index over doubling walk spans.
+        let mut cycle_start = index;
+        let mut span = 1usize;
+        let mut traversed = 0usize;
+        std::iter::successors(Some(self.buffer(index)), move |buffer| {
+            let next = buffer.next_buffer_slot()?;
+            assert_ne!(next, cycle_start, "Buffer chain is acyclic");
+            traversed += 1;
+            if traversed == span {
+                cycle_start = next;
+                span = span.saturating_mul(2);
+                traversed = 0;
+            }
+            Some(self.buffer(next))
         })
     }
 
@@ -296,6 +309,26 @@ mod buffer_tests {
         assert_eq!(runtime.buffer(last).ref_count(), 1);
         assert_eq!(runtime.buffer(last).current(), &[1, 2, 3, 4]);
         runtime.buffer_free_one(last);
+
+        // ADR-0007's malformed-chain invariant; buffer.c's validation checks
+        // duplicate next indices. Exercise the actual borrowed chain traversal.
+        let mut indices = [0; 2];
+        assert_eq!(runtime.buffer_alloc(&mut indices), 2);
+        runtime
+            .buffer_mut(indices[0])
+            .set_next_buffer(Some(indices[1]));
+        runtime
+            .buffer_mut(indices[1])
+            .set_next_buffer(Some(indices[0]));
+        assert!(
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                runtime.chain(indices[0]).count();
+            }))
+            .is_err()
+        );
+        runtime.buffer_mut(indices[1]).set_next_buffer(None);
+        assert_eq!(runtime.chain(indices[0]).count(), 2);
+        runtime.buffer_free(&indices[..1]);
         assert_eq!(runtime.buffer_alloc(&mut []), 0);
         runtime.buffer_free(&[]);
     }
