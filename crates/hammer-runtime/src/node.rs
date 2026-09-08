@@ -1083,7 +1083,7 @@ fn preferred_node_function<'registration>(
 
 impl NodeMain {
     #[inline]
-    fn ensure_topology_owner(&self) -> RuntimeResult<()> {
+    pub(crate) fn ensure_topology_owner(&self) -> RuntimeResult<()> {
         if self.topology_owner {
             Ok(())
         } else {
@@ -1115,17 +1115,29 @@ impl NodeMain {
             .materialize_node_errors(node, descriptors)
     }
 
-    /// Drain scheduled frames and clear topology so `init_graph` can renumber.
+    /// Clear a fully dispatched topology so `init_graph` can renumber it.
     ///
     /// VPP analogue: barrier-held main-thread graph mutation before workers
     /// install a clone of the updated graph.
     /// Old `NodeId` values become unreachable after this returns.
-    pub(crate) fn detach_graph_for_rebuild(&self) -> RuntimeResult<()> {
+    pub(crate) fn detach_graph_for_rebuild(&mut self) -> RuntimeResult<()> {
         self.ensure_topology_owner()?;
-        {
-            let mut queue = self.pending_frames.borrow_mut();
-            queue.clear();
+        assert!(
+            self.pending_frames.get_mut().is_empty(),
+            "old graph finished Pending dispatch"
+        );
+        assert!(
+            self.scheduled_nodes.get_mut().is_empty(),
+            "old graph finished scheduled dispatch"
+        );
+        for next in &mut self.next_frames {
+            if let Some(frame) = next.frame.take() {
+                self.frames.get_mut().recycle(frame);
+            }
         }
+        self.next_frames.clear();
+        self.next_frame_indices.clear();
+        self.enqueue_owners.clear();
         self.readiness.clear_pending();
         *self.inner.borrow_mut() = NodeRuntimeInner {
             nodes: Vec::new(),

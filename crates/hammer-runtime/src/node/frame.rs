@@ -660,5 +660,19 @@ mod tests {
                 if trace { 1 << 5 } else { 0 }
             );
         }
+        // The explicit rebuild consumer must finish the same growing Pending
+        // dispatch before returning Next allocations through their size classes.
+        let mut frame = runtime.get_frame_to_node(input).unwrap();
+        frame.set_vector_count(1);
+        frame.vector_args_mut()[0] = 47;
+        runtime.put_frame_to_node(input, frame).unwrap();
+        runtime.rebuild_graph_with_node_functions(&[], &[]).unwrap();
+        assert_eq!(runtime.nodes().frames_in_use(), 0);
+        assert!(runtime.nodes.next_frames.is_empty());
+        assert!(runtime.nodes.next_frame_indices.is_empty());
+        assert!(runtime.nodes.enqueue_owners.is_empty());
+        assert!(runtime.nodes.pending_frames.borrow().is_empty());
+        assert!(runtime.nodes.scheduled_nodes.borrow().is_empty());
+        assert!(runtime.nodes().node_by_name("packet-input").is_none());
     }
 }

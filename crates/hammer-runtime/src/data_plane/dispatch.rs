@@ -85,7 +85,7 @@ impl DataPlaneMain {
     /// This is a graph transaction, not a plugin unload operation; it neither
     /// changes the registration authority nor releases DSO handles. Business
     /// state must rebind by name, not `NodeId`.
-    pub fn rebuild_graph(&self, entries: &[NodeEntry]) -> RuntimeResult<()> {
+    pub fn rebuild_graph(&mut self, entries: &[NodeEntry]) -> RuntimeResult<()> {
         let node_functions = crate::builtin_registration_image()
             .node_functions()
             .to_vec();
@@ -93,11 +93,16 @@ impl DataPlaneMain {
     }
 
     pub fn rebuild_graph_with_node_functions(
-        &self,
+        &mut self,
         entries: &[NodeEntry],
         node_functions: &[NodeFunctionRegistration],
     ) -> RuntimeResult<()> {
-        self.set_current_node(None);
+        self.nodes.ensure_topology_owner()?;
+        assert!(
+            self.current_node().is_none(),
+            "graph rebuild occurs outside Node dispatch"
+        );
+        while self.run_ready_nodes()? != 0 {}
         self.nodes.detach_graph_for_rebuild()?;
         self.init_graph_with_node_functions(entries, node_functions)
     }
