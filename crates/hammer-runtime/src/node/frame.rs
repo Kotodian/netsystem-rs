@@ -383,7 +383,7 @@ mod tests {
                 64,
                 1024,
                 &[0],
-                2,
+                3,
                 hammer_infra::PageSize::Default,
             )
             .unwrap();
@@ -417,14 +417,16 @@ mod tests {
                 64,
                 1024,
                 &[0],
-                2,
+                3,
                 hammer_infra::PageSize::Default,
             )
             .unwrap();
         });
         let (main, input, _) = packet_graph();
+        // Pool caches have one OS-thread owner: handoff uses Workers 1/2,
+        // while this independent refork case owns Worker 3 for its lifetime.
         let mut worker = DataPlaneMain::new(crate::DataPlaneBufferConfig {
-            thread_index: 2,
+            thread_index: 3,
             ..Default::default()
         });
         worker.nodes = NodeMain::from(main.snapshot());
@@ -485,7 +487,7 @@ mod tests {
                 64,
                 1024,
                 &[0],
-                2,
+                3,
                 hammer_infra::PageSize::Default,
             )
             .unwrap();

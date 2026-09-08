@@ -257,7 +257,7 @@ mod buffer_tests {
                 64,
                 1024,
                 &[0],
-                2,
+                3,
                 hammer_infra::PageSize::Default,
             )
             .unwrap();
