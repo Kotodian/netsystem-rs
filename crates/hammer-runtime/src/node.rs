@@ -1032,14 +1032,16 @@ impl From<NodeRuntimeInner> for NodeMain {
                 .all(|names| names.is_empty()),
             "worker graph must be resolved before installation"
         );
+        let (next_frames, next_frame_indices) = Self::next_frames_for_graph(&inner);
+        let enqueue_owners = vec![None; inner.nodes.len()];
         Self {
             inner: RefCell::new(inner),
             pending_frames: RefCell::new(Vec::with_capacity(32)),
             scheduled_nodes: RefCell::new(Vec::new()),
             frames: RefCell::new(hammer_core::buffer::frame_pool::FramePool::default()),
-            next_frames: Vec::new(),
-            next_frame_indices: Vec::new(),
-            enqueue_owners: Vec::new(),
+            next_frames,
+            next_frame_indices,
+            enqueue_owners,
             readiness: Rc::new(NodeReadiness::default()),
             topology_owner: false,
         }
@@ -1149,15 +1151,10 @@ impl NodeMain {
         self.inner.borrow().clone()
     }
 
-    pub(crate) fn replace_graph(&self, graph: NodeRuntimeInner) {
-        self.pending_frames.borrow_mut().clear();
-        self.readiness.clear_pending();
-        *self.inner.borrow_mut() = graph;
-    }
-
-    pub(crate) fn refork(&self, mut graph: NodeRuntimeInner) {
-        graph.inherit_worker_state(&self.inner.borrow());
-        self.replace_graph(graph);
+    pub(crate) fn refork(&mut self, mut graph: NodeRuntimeInner) {
+        self.refork_next_frames(&graph);
+        graph.inherit_worker_state(self.inner.get_mut());
+        *self.inner.get_mut() = graph;
     }
 
     pub(crate) fn install_node_function(
@@ -1908,7 +1905,7 @@ mod tests {
                 ),
             )
             .expect("register existing node");
-        let worker = NodeMain::from(main.snapshot());
+        let mut worker = NodeMain::from(main.snapshot());
         let worker_data = NodeRuntime::from_words([9, 8, 7, 6]);
         worker
             .set_node_runtime_data(existing, worker_data)
