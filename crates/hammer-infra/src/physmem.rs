@@ -154,11 +154,11 @@ impl fmt::Display for PhysmemError {
             ),
             Self::BackingVerification { requested, actual } => write!(
                 formatter,
-                "HugeTLB mapping reports kernel page size {actual}, requested {requested}"
+                "physmem mapping reports kernel page size {actual}, requested {requested}"
             ),
             Self::PlacementVerification { requested, actual } => write!(
                 formatter,
-                "HugeTLB mapping landed on NUMA node {actual}, requested node {requested}"
+                "physmem mapping landed on NUMA node {actual}, requested node {requested}"
             ),
         }
     }
@@ -256,7 +256,7 @@ impl PhysmemMap {
     /// `name` is retained for VPP-shaped call sites; the OS object uses a short
     /// unique token because macOS `shm_open` names are length-limited.
     pub fn create(
-        _name: &str,
+        _: &str,
         size: usize,
         requested_page_size: PageSize,
         numa_node: u32,
@@ -292,56 +292,18 @@ impl PhysmemMap {
         })?;
         #[cfg(target_os = "linux")]
         let (base, fd, fd_owned) = {
-            if hugetlb {
-                let (base, _, fd) = map_hugetlb(
-                    total,
-                    requested_page_size,
-                    page_bytes,
-                    numa_node,
-                    true,
-                    page_bytes,
-                )?
-                .into_parts();
-                return Ok(Self {
-                    base,
-                    size: total,
-                    numa_node,
-                    page_size: page_bytes,
-                    hugetlb: true,
-                    fd,
-                    fd_owned: true,
-                });
-            }
-            let counter = PHYSMEM_COUNTER.fetch_add(1, Ordering::Relaxed);
-            let label = format!("hpm{}-{counter}", std::process::id());
-            let cname = CString::new(label).expect("generated memfd name contains no NUL");
-            let fd = unsafe { libc::memfd_create(cname.as_ptr(), libc::MFD_CLOEXEC) };
-            if fd < 0 {
-                return Err(PhysmemError::Create {
-                    source: io::Error::last_os_error(),
-                });
-            }
-            if unsafe { libc::ftruncate(fd, total as libc::off_t) } != 0 {
-                let source = io::Error::last_os_error();
-                unsafe { libc::close(fd) };
-                return Err(PhysmemError::Truncate { source });
-            }
-            let base = unsafe {
-                libc::mmap(
-                    std::ptr::null_mut(),
-                    total,
-                    libc::PROT_READ | libc::PROT_WRITE,
-                    libc::MAP_SHARED,
-                    fd,
-                    0,
-                )
-            };
-            if base == libc::MAP_FAILED {
-                let source = io::Error::last_os_error();
-                unsafe { libc::close(fd) };
-                return Err(PhysmemError::Map { source });
-            }
-            (base.cast::<u8>(), fd, true)
+            // VPP's physmem shared-map path applies NUMA placement to both
+            // ordinary and huge pages before their first fault.
+            let (base, _, fd) = map_pages(
+                total,
+                requested_page_size,
+                page_bytes,
+                numa_node,
+                true,
+                page_bytes,
+            )?
+            .into_parts();
+            (base, fd, true)
         };
 
         #[cfg(not(target_os = "linux"))]
@@ -563,7 +525,7 @@ fn provision_hugepages(
 }
 
 #[cfg(target_os = "linux")]
-pub(crate) fn map_hugetlb(
+pub(crate) fn map_pages(
     size: usize,
     requested: PageSize,
     page_size: usize,
@@ -587,26 +549,37 @@ pub(crate) fn map_hugetlb(
     }
     let total =
         checked_align_up(size, alignment).ok_or(PhysmemError::PageSizeOverflow { requested })?;
-    let mut directory = PathBuf::from(format!(
-        "/sys/devices/system/node/node{numa_node}/hugepages/hugepages-{}kB",
-        page_size / 1024
-    ));
-    if numa_node == 0 && !directory.is_dir() {
-        directory = PathBuf::from(format!(
-            "/sys/kernel/mm/hugepages/hugepages-{}kB",
+    let ordinary_page_size = PageSize::Default
+        .bytes()
+        .map_err(|source| PhysmemError::PageSizeQuery { source })?;
+    let hugetlb = page_size != ordinary_page_size;
+    // Only HugeTLB mappings consume preallocated huge pages. NUMA binding,
+    // first touch, policy restoration and placement verification are shared.
+    if hugetlb {
+        let mut directory = PathBuf::from(format!(
+            "/sys/devices/system/node/node{numa_node}/hugepages/hugepages-{}kB",
             page_size / 1024
         ));
-    }
-    if !directory.is_dir() {
-        return Err(PhysmemError::HugePageUnsupported {
-            requested,
-            page_size,
-            path: directory,
-        });
-    }
+        if numa_node == 0 && !directory.is_dir() {
+            directory = PathBuf::from(format!(
+                "/sys/kernel/mm/hugepages/hugepages-{}kB",
+                page_size / 1024
+            ));
+        }
+        if !directory.is_dir() {
+            return Err(PhysmemError::HugePageUnsupported {
+                requested,
+                page_size,
+                path: directory,
+            });
+        }
 
-    let required = total / page_size;
-    provision_hugepages(&directory, requested, page_size, numa_node, required)?;
+        let required = total / page_size;
+        provision_hugepages(&directory, requested, page_size, numa_node, required)?;
+    }
+    let reserve_size = total
+        .checked_add(alignment)
+        .ok_or(PhysmemError::PageSizeOverflow { requested })?;
 
     let mut previous_mode: libc::c_int = 0;
     let mut previous_mask = [0 as libc::c_ulong; MAX_NUMA_NODES / libc::c_ulong::BITS as usize];
@@ -666,15 +639,13 @@ pub(crate) fn map_hugetlb(
             let counter = PHYSMEM_COUNTER.fetch_add(1, Ordering::Relaxed);
             let label = format!("hpm{}-{counter}", std::process::id());
             let cname = CString::new(label).expect("generated memfd name contains no NUL");
-            let log2_page_size = page_size.trailing_zeros();
-            // SAFETY: the generated name is NUL terminated and flags follow
-            // the Linux memfd HugeTLB ABI.
-            let fd = unsafe {
-                libc::memfd_create(
-                    cname.as_ptr(),
-                    libc::MFD_CLOEXEC | MFD_HUGETLB | (log2_page_size << MFD_HUGE_SHIFT),
-                )
-            };
+            let mut flags = libc::MFD_CLOEXEC;
+            if hugetlb {
+                flags |= MFD_HUGETLB | (page_size.trailing_zeros() << MFD_HUGE_SHIFT);
+            }
+            // SAFETY: the generated name is NUL terminated. Ordinary shared
+            // pages use memfd's default backing; HugeTLB explicitly selects its size.
+            let fd = unsafe { libc::memfd_create(cname.as_ptr(), flags) };
             if fd < 0 {
                 return Err(PhysmemError::Create {
                     source: io::Error::last_os_error(),
@@ -691,9 +662,6 @@ pub(crate) fn map_hugetlb(
         } else {
             -1
         };
-        let reserve_size = total
-            .checked_add(alignment)
-            .ok_or(PhysmemError::PageSizeOverflow { requested })?;
         // SAFETY: this anonymous inaccessible reservation only selects an
         // address range; MAP_FIXED below replaces its aligned middle.
         let reservation = unsafe {
@@ -727,15 +695,15 @@ pub(crate) fn map_hugetlb(
         };
         let prefix = aligned_start - reservation_start;
         let suffix = reserve_size - prefix - total;
-        let flags = if shared {
-            libc::MAP_SHARED | libc::MAP_FIXED
+        let mut flags = libc::MAP_FIXED;
+        if shared {
+            flags |= libc::MAP_SHARED;
         } else {
-            libc::MAP_PRIVATE
-                | libc::MAP_ANONYMOUS
-                | libc::MAP_HUGETLB
-                | libc::MAP_FIXED
-                | ((page_size.trailing_zeros() as libc::c_int) << 26)
-        };
+            flags |= libc::MAP_PRIVATE | libc::MAP_ANONYMOUS;
+            if hugetlb {
+                flags |= libc::MAP_HUGETLB | ((page_size.trailing_zeros() as libc::c_int) << 26);
+            }
+        }
         // SAFETY: the length and flags describe a new read/write mapping; the
         // descriptor is valid for shared mappings and ignored for anonymous.
         let base = unsafe {
@@ -773,7 +741,8 @@ pub(crate) fn map_hugetlb(
         };
         for offset in (0..total).step_by(page_size) {
             // SAFETY: each offset is inside the writable mapping and touching
-            // one byte faults in the selected HugeTLB page under MPOL_BIND.
+            // one byte faults in each selected page under MPOL_BIND, before the
+            // previous thread policy is restored.
             unsafe { region.base.add(offset).write_volatile(0) };
         }
         Ok(region)

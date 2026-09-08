@@ -25,7 +25,7 @@ use libmimalloc_sys::{
 use crate::align::VEC_MIN_ALIGN;
 use crate::physmem::PhysmemError;
 #[cfg(target_os = "linux")]
-use crate::physmem::map_hugetlb;
+use crate::physmem::map_pages;
 
 mod interpose;
 
@@ -381,7 +381,7 @@ pub fn init_with(
                         continue;
                     }
 
-                    let mapping = match map_hugetlb(
+                    let mapping = match map_pages(
                         size,
                         page_size,
                         selected_page_size,
