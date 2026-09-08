@@ -1748,8 +1748,9 @@ impl NodeMain {
         Ok(())
     }
 
-    pub(crate) fn schedule_frame(&self, node: NodeId, frame: Box<Frame>) -> RuntimeResult<()> {
+    pub(crate) fn schedule_frame(&self, node: NodeId, mut frame: Box<Frame>) -> RuntimeResult<()> {
         self.validate_node(node)?;
+        frame.frame_flags |= 1 << 2;
         self.pending_frames.borrow_mut().push(PendingFrame {
             node,
             frame: Some(frame),
@@ -1949,7 +1950,9 @@ impl DataPlaneMain {
     /// VPP vlib_get_frame_to_node: allocate this destination's Frame layout.
     pub fn get_frame_to_node(&self, node: NodeId) -> RuntimeResult<Box<Frame>> {
         let (scalar, vector, aux) = self.nodes.frame_args_size(node)?;
-        Ok(self.nodes.frames.borrow_mut().allocate(scalar, vector, aux))
+        let mut frame = self.nodes.frames.borrow_mut().allocate(scalar, vector, aux);
+        frame.frame_flags |= 1 << 3;
+        Ok(frame)
     }
 
     /// VPP vlib_put_frame_to_node: schedule a nonempty directly allocated Frame.
