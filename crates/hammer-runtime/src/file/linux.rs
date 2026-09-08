@@ -147,7 +147,7 @@ impl Poller {
             .get(slot)
             .and_then(Option::as_ref)
             .map(|fd| fd.as_raw_fd())
-            .ok_or(RuntimeError::Deadlineu32Invalid { index })?;
+            .ok_or(RuntimeError::DeadlineIndexInvalid { index })?;
         match duration {
             Some(duration) => {
                 set_timerfd(deadline_fd, Some(duration))?;
@@ -181,7 +181,7 @@ impl Poller {
             .and_then(Option::as_ref)
             .is_none()
         {
-            return Err(RuntimeError::Deadlineu32Invalid { index }.into());
+            return Err(RuntimeError::DeadlineIndexInvalid { index }.into());
         }
         self.cancel_deadline(index)?;
         self.deadline_fds[slot] = None;
@@ -194,7 +194,7 @@ impl Poller {
             .deadline_fds
             .get(index as usize)
             .and_then(Option::as_ref)
-            .ok_or(RuntimeError::Deadlineu32Invalid { index })?;
+            .ok_or(RuntimeError::DeadlineIndexInvalid { index })?;
         let mut expirations = 0_u64;
         loop {
             // SAFETY: `expirations` is writable for one timerfd counter and the
@@ -236,7 +236,7 @@ impl Poller {
             .get(slot)
             .and_then(Option::as_ref)
             .map(|fd| fd.as_raw_fd())
-            .ok_or(RuntimeError::Deadlineu32Invalid { index })?;
+            .ok_or(RuntimeError::DeadlineIndexInvalid { index })?;
         self.deadline_tokens[slot] = CONTROL_TOKEN;
         set_timerfd(deadline_fd, Some(duration))?;
         if let Err(error) = self.add_deadline_poll(index, deadline_fd) {
