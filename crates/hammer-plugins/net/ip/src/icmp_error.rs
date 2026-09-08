@@ -213,10 +213,9 @@ fn ip4_icmp_error(runtime: &mut DataPlaneMain, _: &mut NodeRuntime, frame: &mut 
             );
             let error = match result {
                 Ok(error) => error,
-                Err(RuntimeError::DataPlane(
-                    DataPlaneError::BufferInvariant(BufferInvariant::PoolExhausted)
-                    | DataPlaneError::FramePoolExhausted,
-                )) => IcmpError::NoBuffer,
+                Err(RuntimeError::DataPlane(DataPlaneError::BufferInvariant(
+                    BufferInvariant::PoolExhausted,
+                ))) => IcmpError::NoBuffer,
                 Err(error) => panic!("IPv4 ICMP graph ownership invariant: {error}"),
             };
             runtime
@@ -249,10 +248,9 @@ fn ip6_icmp_error(runtime: &mut DataPlaneMain, _: &mut NodeRuntime, frame: &mut 
             );
             let error = match result {
                 Ok(error) => error,
-                Err(RuntimeError::DataPlane(
-                    DataPlaneError::BufferInvariant(BufferInvariant::PoolExhausted)
-                    | DataPlaneError::FramePoolExhausted,
-                )) => IcmpError::NoBuffer,
+                Err(RuntimeError::DataPlane(DataPlaneError::BufferInvariant(
+                    BufferInvariant::PoolExhausted,
+                ))) => IcmpError::NoBuffer,
                 Err(error) => panic!("IPv6 ICMP graph ownership invariant: {error}"),
             };
             runtime
@@ -368,7 +366,12 @@ fn generate_error(
     )?;
     // The next frame owns the response immediately; any later failure frees it.
     let mut output = runtime.get_frame_to_node(next)?;
-    let response = runtime.buffers().alloc_index_from(index)?;
+    let response =
+        runtime
+            .buffer_copy_no_chain(index)
+            .ok_or(hammer_core::error::DataPlaneError::from(
+                hammer_core::error::BufferInvariant::PoolExhausted,
+            ))?;
     {
         let count = output.len();
         output.set_vector_count(count + 1);
@@ -555,15 +558,11 @@ pub(crate) fn error_response_source_and_origin(runtime: &mut DataPlaneMain) -> R
                     .octets(),
             );
         }
-        let mut frame = runtime
-            .buffers()
-            .get_next_frame(node, runtime.nodes().frame_args_size(node)?)?;
-        let index = runtime.alloc_index_with_bytes(&packet)?;
-        {
-            let count = frame.len();
-            frame.set_vector_count(count + 1);
-            frame.vector_args_mut()[count] = index;
-        }
+        let mut index = u32::MAX;
+        assert_eq!(
+            runtime.buffer_add_data(&mut index, &packet),
+            (&packet).len()
+        );
         {
             let mut buffer = runtime.buffer_mut(index);
             let mut network = NetworkOpaque::default();
@@ -584,8 +583,10 @@ pub(crate) fn error_response_source_and_origin(runtime: &mut DataPlaneMain) -> R
         assert!(matches!(error, IcmpError::Suppressed));
         assert_eq!(runtime.run_ready_nodes()?, 1);
         assert_eq!(runtime.buffer(index).current(), packet);
-        drop(frame);
-        assert_eq!(runtime.buffers().in_use_buffers(), 0);
+        let segments = runtime.chain(index).count();
+        let cached_free = runtime.cached_free_buffers();
+        runtime.buffer_free_one(index);
+        assert_eq!(runtime.cached_free_buffers(), cached_free + segments);
     }
     interfaces.delete_hardware_interface(hardware)?;
     Ok(())

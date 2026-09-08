@@ -133,7 +133,7 @@ impl NodeRuntime {
     #[inline]
     pub fn from_usize(value: usize) -> RuntimeResult<Self> {
         Ok(Self::from_words([
-            u64::try_from(value).map_err(|_| RuntimeError::NodeRuntimeDataOverflow { value })?,
+            u64::try_from(value).map_err(|_| RuntimeError::NodeRuntimeValueOverflow { value })?,
             0,
             0,
             0,
@@ -149,7 +149,7 @@ impl NodeRuntime {
     pub fn usize_word(self, index: usize) -> RuntimeResult<usize> {
         let value = self.word(index);
         usize::try_from(value)
-            .map_err(|_| RuntimeError::NodeRuntimeDataWordOutOfRange { word: index, value })
+            .map_err(|_| RuntimeError::NodeRuntimeWordOutOfRange { word: index, value })
     }
 }
 

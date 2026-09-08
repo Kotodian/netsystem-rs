@@ -902,7 +902,6 @@ fn l4_checksum(runtime: &DataPlaneMain, index: u32, parsed: &ParsedIpPacket) -> 
     }
     let mut offset = parsed.transport_header_offset;
     for segment in runtime.chain(index) {
-        let segment = segment?;
         let bytes = segment.current();
         if offset >= bytes.len() {
             offset -= bytes.len();
@@ -1054,15 +1053,11 @@ pub(crate) mod tests {
                 }
                 packet[header_len + 4..header_len + 6].copy_from_slice(&8u16.to_be_bytes());
                 packet[header_len + 6..header_len + 8].copy_from_slice(&1u16.to_be_bytes());
-                let mut frame = runtime
-                    .buffers()
-                    .get_next_frame(receive, runtime.nodes().frame_args_size(receive)?)?;
-                let index = runtime.alloc_index_with_bytes(&packet)?;
-                {
-                    let count = frame.len();
-                    frame.set_vector_count(count + 1);
-                    frame.vector_args_mut()[count] = index;
-                }
+                let mut index = u32::MAX;
+                assert_eq!(
+                    runtime.buffer_add_data(&mut index, &packet),
+                    (&packet).len()
+                );
                 {
                     let mut buffer = runtime.buffer_mut(index);
                     let mut network = NetworkOpaque::default();
@@ -1108,13 +1103,17 @@ pub(crate) mod tests {
                     assert!(buffer.node_error_index().is_some());
                     assert!(network.flags.contains(NetworkFlags::L4_CHECKSUM_COMPUTED));
                 }
+                let segments = runtime.chain(index).count();
+                let cached_free = runtime.cached_free_buffers();
+                runtime.buffer_free_one(index);
+                assert_eq!(runtime.cached_free_buffers(), cached_free + segments);
             }
             net.unlock_dpo(dpo);
             assert_eq!(interfaces.receive_dpo_interface(dpo), None);
             interfaces.disable_feature(runtime, arc, feature, effective_rx, &[])?;
         }
         interfaces.delete_hardware_interface(hardware)?;
-        assert_eq!(runtime.buffers().in_use_buffers(), 0);
+
         Ok(())
     }
 
@@ -1151,17 +1150,17 @@ pub(crate) mod tests {
         packet[20..28].copy_from_slice(&[8, 0, 0, 0, 0, 0x0b, 0, 5]);
         let checksum = internet_checksum(&packet[20..]);
         packet[22..24].copy_from_slice(&checksum.to_be_bytes());
-        let mut frame = runtime
-            .buffers()
-            .get_next_frame(NodeId::new(0), (0, 4, 0))?;
-        let head = runtime.buffers().alloc_index_with_bytes(&packet[..37])?;
-        {
-            let count = frame.len();
-            frame.set_vector_count(count + 1);
-            frame.vector_args_mut()[count] = head;
-        }
-        let tail = runtime.buffers().alloc_index_with_bytes(&packet[37..])?;
-        runtime.buffers().chain_buffer(head, tail)?;
+        let mut head = u32::MAX;
+        assert_eq!(
+            runtime.buffer_add_data(&mut head, &packet[..37]),
+            (&packet[..37]).len()
+        );
+        let mut tail = u32::MAX;
+        assert_eq!(
+            runtime.buffer_add_data(&mut tail, &packet[37..]),
+            (&packet[37..]).len()
+        );
+        runtime.chain_buffer(head, tail)?;
         let parsed = ip_header(
             &packet,
             BufferPacketCursor::new()
@@ -1172,8 +1171,11 @@ pub(crate) mod tests {
         assert_eq!(l4_checksum(&runtime, head, &parsed)?, 0);
         runtime.buffer_mut(tail).current_mut()[0] ^= 1;
         assert_ne!(l4_checksum(&runtime, head, &parsed)?, 0);
-        drop(frame);
-        assert_eq!(runtime.buffers().in_use_buffers(), 0);
+        let segments = runtime.chain(head).count();
+        let cached_free = runtime.cached_free_buffers();
+        runtime.buffer_free_one(head);
+        assert_eq!(runtime.cached_free_buffers(), cached_free + segments);
+
         Ok(())
     }
 }

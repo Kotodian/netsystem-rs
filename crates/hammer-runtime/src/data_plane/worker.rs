@@ -118,16 +118,12 @@ impl DataPlaneMain {
     pub(crate) fn worker_parts(
         &self,
     ) -> (
-        Vec<BufferPoolArena>,
-        usize,
         NodeRuntimeInner,
         usize,
         Option<DataPlaneHandoffWorker>,
         Option<TraceControlHandle>,
     ) {
         (
-            self.buffers.buffer_arenas().collect(),
-            self.buffers.frame_slots(),
             self.nodes.snapshot(),
             self.simd_bytes,
             self.handoff.clone(),
@@ -136,8 +132,6 @@ impl DataPlaneMain {
     }
 
     pub(crate) fn from_worker_parts(
-        buffer_arenas: Vec<BufferPoolArena>,
-        frame_slots: usize,
         nodes: NodeRuntimeInner,
         simd_bytes: usize,
         handoff: Option<DataPlaneHandoffWorker>,
@@ -145,9 +139,14 @@ impl DataPlaneMain {
         thread_index: u32,
         numa_node: u32,
     ) -> RuntimeResult<Self> {
-        let buffers =
-            DataPlaneBuffers::from_arenas(buffer_arenas, frame_slots, thread_index, numa_node);
-        let mut runtime = Self::from_buffers(buffers, simd_bytes)?;
+        let mut runtime = Self::from_config(
+            DataPlaneBufferConfig {
+                thread_index,
+                active_numa_node: numa_node,
+                ..Default::default()
+            },
+            simd_bytes,
+        )?;
         runtime.nodes = nodes.into();
         runtime.handoff = handoff;
         runtime.trace.set_control(trace_control);
@@ -155,10 +154,8 @@ impl DataPlaneMain {
     }
 
     pub fn for_worker(&self, thread_index: u32, numa_node: u32) -> RuntimeResult<Self> {
-        let (arenas, frame_slots, nodes, simd_bytes, handoff, trace_control) = self.worker_parts();
+        let (nodes, simd_bytes, handoff, trace_control) = self.worker_parts();
         Self::from_worker_parts(
-            arenas,
-            frame_slots,
             nodes,
             simd_bytes,
             handoff,

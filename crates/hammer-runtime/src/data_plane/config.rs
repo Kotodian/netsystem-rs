@@ -31,39 +31,6 @@ impl Default for DataPlaneBufferConfig {
     }
 }
 
-impl TryFrom<DataPlaneBufferConfig> for DataPlaneBuffers {
-    type Error = DataPlaneError;
-
-    fn try_from(config: DataPlaneBufferConfig) -> Result<Self, Self::Error> {
-        config.create_buffers(config.numa_nodes.iter().copied())
-    }
-}
-
-impl DataPlaneBufferConfig {
-    fn create_buffers(
-        &self,
-        numa_nodes: impl IntoIterator<Item = u32>,
-    ) -> DataPlaneResult<DataPlaneBuffers> {
-        let arenas = numa_nodes
-            .into_iter()
-            .map(|numa_node| {
-                BufferPoolArena::with_capacity_on_numa(
-                    self.buffer_slot_capacity,
-                    self.buffer_slots,
-                    self.page_size,
-                    numa_node,
-                )
-            })
-            .collect::<DataPlaneResult<Vec<_>>>()?;
-        Ok(DataPlaneBuffers::from_arenas(
-            arenas,
-            self.frame_slots,
-            self.thread_index,
-            self.active_numa_node,
-        ))
-    }
-}
-
 impl Worker {
     pub fn create_runtime(&self) -> RuntimeResult<DataPlaneMain> {
         let buffer = &self.buffer;
@@ -102,16 +69,15 @@ impl Worker {
                 }
             }
         };
-        let buffers = DataPlaneBufferConfig {
+        let config = DataPlaneBufferConfig {
             buffer_slot_capacity: buffer.slot_bytes,
             buffer_slots: buffer.slots_per_numa,
             frame_slots: buffer.frame_pool_size,
             active_numa_node: numa_nodes[0],
             page_size,
             ..DataPlaneBufferConfig::default()
-        }
-        .create_buffers(numa_nodes.iter().copied())?;
-        DataPlaneMain::from_buffers(buffers, native_simd_bytes())
+        };
+        DataPlaneMain::from_config(config, native_simd_bytes())
     }
 
     fn buffer_numa_nodes(&self) -> RuntimeResult<Vec<u32>> {

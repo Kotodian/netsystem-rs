@@ -178,7 +178,7 @@ fn tcp_established_index(
                 buffer.advance(packet.payload_offset.saturating_add(trim) as isize);
                 buffer.truncate(accepted_len as usize)?;
             }
-            let delivery = sessions.enqueue_rx(runtime.buffers(), session_id, index, offset)?;
+            let delivery = sessions.enqueue_rx(runtime, session_id, index, offset)?;
             let rx_available = match delivery {
                 RxDelivery::NotAccepted { rx_available }
                 | RxDelivery::InOrder { rx_available, .. }
@@ -278,7 +278,13 @@ fn tcp_established_index(
         Ok(tx_segment)
     })?;
     if let Some(segment) = tx_segment {
-        let allocated = runtime.buffers().alloc_index()?;
+        let mut allocated = 0;
+        if runtime.buffer_alloc(core::slice::from_mut(&mut allocated)) != 1 {
+            return Err(hammer_core::error::DataPlaneError::from(
+                hammer_core::error::BufferInvariant::PoolExhausted,
+            )
+            .into());
+        }
         segment.write_to_buffer(&mut *runtime.buffer_mut(allocated))?;
         emit_local(
             runtime,

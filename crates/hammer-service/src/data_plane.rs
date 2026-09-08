@@ -193,7 +193,7 @@ mod tests {
             let mut indices = [0; 3];
             assert_eq!(runtime.buffer_alloc(&mut indices), 3);
             runtime.buffer_chain_buffer(indices[0], indices[1]);
-            let cached_free = runtime.buffers().cached_free_buffers();
+            let cached_free = runtime.cached_free_buffers();
             let mut frame = Frame::<(), u32, ()>::new(0);
             frame.set_vector_count(2);
             frame
@@ -204,9 +204,9 @@ mod tests {
                 2
             );
             assert_eq!(frame.vector_args(), &[indices[0], indices[2]]);
-            assert_eq!(runtime.buffers().cached_free_buffers(), cached_free + 3);
+            assert_eq!(runtime.cached_free_buffers(), cached_free + 3);
             drop(frame);
-            assert_eq!(runtime.buffers().cached_free_buffers(), cached_free + 3);
+            assert_eq!(runtime.cached_free_buffers(), cached_free + 3);
         }
     }
 }

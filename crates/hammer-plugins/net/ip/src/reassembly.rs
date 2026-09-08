@@ -1082,7 +1082,7 @@ impl FragmentContext {
                 buffer.truncate(fragment.header_len + (fragment.end - fragment.start))?;
             } else {
                 trim_fragment_payload_chain(runtime, fragment)?;
-                runtime.buffers().chain_buffer(complete, fragment.index)?;
+                runtime.chain_buffer(complete, fragment.index)?;
                 // The head now owns this complete chain. Retain only roots
                 // that still carry a separate release obligation on error.
                 self.fragments.remove(position);
@@ -1152,7 +1152,7 @@ impl FragmentContext {
                     .truncate(IPV6_HEADER_LEN + (fragment.end - fragment.start))?;
             } else {
                 trim_fragment_payload_chain(runtime, fragment)?;
-                runtime.buffers().chain_buffer(complete, fragment.index)?;
+                runtime.chain_buffer(complete, fragment.index)?;
                 // The head now owns this complete chain. Retain only roots
                 // that still carry a separate release obligation on error.
                 self.fragments.remove(position);
@@ -1292,7 +1292,7 @@ mod tests {
             directory.claim_or_lookup(key, slot, worker.worker),
             (worker.worker, true)
         );
-        let cached_free = runtime.buffers().cached_free_buffers();
+        let cached_free = runtime.cached_free_buffers();
         // test_reassembly.py::test_timeout_cleanup: omit the last fragment,
         // expire the context, then deliver the last fragment too late.
         assert_eq!(
@@ -1306,12 +1306,12 @@ mod tests {
         );
         assert!(worker.contexts.is_empty());
         assert!(directory.lookup(key).is_none());
-        assert_eq!(runtime.buffers().cached_free_buffers(), cached_free + 2);
+        assert_eq!(runtime.cached_free_buffers(), cached_free + 2);
         assert_eq!(
             worker.expire(&mut runtime, now + Duration::from_millis(300)),
             0
         );
-        assert_eq!(runtime.buffers().cached_free_buffers(), cached_free + 2);
+        assert_eq!(runtime.cached_free_buffers(), cached_free + 2);
 
         let mut last = [0];
         assert_eq!(runtime.buffer_alloc(&mut last), 1);
@@ -1348,7 +1348,7 @@ mod tests {
         );
         assert!(worker.contexts.is_empty());
         assert!(directory.lookup(key).is_none());
-        assert_eq!(runtime.buffers().cached_free_buffers(), cached_free + 2);
+        assert_eq!(runtime.cached_free_buffers(), cached_free + 2);
 
         // test_reassembly.py::test_reassembly repeats successful reassembly.
         // Finalization transfers the complete chain without retaining a clone.
@@ -1363,7 +1363,7 @@ mod tests {
                 packet[9] = 17;
                 packet[20..].fill(offset as u8 + 1);
             }
-            let cached_free = runtime.buffers().cached_free_buffers();
+            let cached_free = runtime.cached_free_buffers();
             let mut context = FragmentContext::new(key, IpVersion::V4, now);
             assert!(matches!(
                 context
@@ -1413,9 +1413,9 @@ mod tests {
             assert_eq!(runtime.buffer(head).total_len_not_including_first(), 8);
             assert_eq!(runtime.buffer(head).ref_count(), 1);
             assert_eq!(runtime.buffer(indices[1]).ref_count(), 1);
-            assert_eq!(runtime.buffers().cached_free_buffers(), cached_free);
+            assert_eq!(runtime.cached_free_buffers(), cached_free);
             runtime.buffer_free(core::slice::from_ref(&head));
-            assert_eq!(runtime.buffers().cached_free_buffers(), cached_free + 2);
+            assert_eq!(runtime.cached_free_buffers(), cached_free + 2);
         }
 
         // VPP's fragment-limit path drops all retained ranges before freeing
@@ -1434,7 +1434,7 @@ mod tests {
             packet[12..16].copy_from_slice(&[192, 0, 2, 1]);
             packet[16..20].copy_from_slice(&[192, 0, 2, 2]);
         }
-        let cached_free = runtime.buffers().cached_free_buffers();
+        let cached_free = runtime.cached_free_buffers();
         let mut output = Frame::<(), u32, ()>::new(0);
         let mut nexts = [0; DEFAULT_BUFFER_FRAME_CAPACITY];
         let mut output_len = 0;
@@ -1465,12 +1465,12 @@ mod tests {
             .unwrap();
         assert!(worker.contexts.is_empty());
         assert!(directory.lookup(key).is_none());
-        assert_eq!(runtime.buffers().cached_free_buffers(), cached_free + 1);
+        assert_eq!(runtime.cached_free_buffers(), cached_free + 1);
         assert_eq!(output.vector_args(), &indices[1..]);
         assert_eq!(output_len, 1);
         assert_eq!(nexts[0], NodeNext::slot(Ip4ReassemblyNext::Drop));
         assert_eq!(runtime.buffer(indices[1]).ref_count(), 1);
         runtime.buffer_free(output.vector_args());
-        assert_eq!(runtime.buffers().cached_free_buffers(), cached_free + 2);
+        assert_eq!(runtime.cached_free_buffers(), cached_free + 2);
     }
 }

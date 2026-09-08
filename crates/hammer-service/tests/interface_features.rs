@@ -40,15 +40,11 @@ fn feature_chain_terminates_without_an_end_node_self_edge() -> Result<(), Box<dy
         if explicit_end {
             interfaces.enable_feature(runtime, arc, drop_feature, interface, &[])?;
         }
-        let mut frame = runtime
-            .buffers()
-            .get_next_frame(output, runtime.nodes().frame_args_size(output)?)?;
-        let index = runtime.buffers().alloc_index_with_bytes(&[0; 64])?;
-        {
-            let count = frame.len();
-            frame.set_vector_count(count + 1);
-            frame.vector_args_mut()[count] = index;
-        }
+        let mut index = u32::MAX;
+        assert_eq!(
+            runtime.buffer_add_data(&mut index, &[0; 64]),
+            (&[0; 64]).len()
+        );
         let buffer = runtime.buffer_mut(index);
         let first = interfaces.start_feature_arc(arc, interface, buffer, u16::MAX);
         let cursor = buffer.current_config_index();
@@ -70,21 +66,21 @@ fn feature_chain_terminates_without_an_end_node_self_edge() -> Result<(), Box<dy
                 .node_next_slot_for_target(drop_node, drop_node)?,
             None
         );
+        let segments = runtime.chain(index).count();
+        let cached_free = runtime.cached_free_buffers();
+        runtime.buffer_free_one(index);
+        assert_eq!(runtime.cached_free_buffers(), cached_free + segments);
     }
 
     interfaces.disable_feature(runtime, arc, punt_feature, interface, &config)?;
     interfaces.disable_feature(runtime, arc, drop_feature, interface, &[])?;
     interfaces.enable_feature(runtime, arc, punt_feature, interface, &[])?;
     {
-        let mut frame = runtime
-            .buffers()
-            .get_next_frame(output, runtime.nodes().frame_args_size(output)?)?;
-        let index = runtime.buffers().alloc_index_with_bytes(&[0; 64])?;
-        {
-            let count = frame.len();
-            frame.set_vector_count(count + 1);
-            frame.vector_args_mut()[count] = index;
-        }
+        let mut index = u32::MAX;
+        assert_eq!(
+            runtime.buffer_add_data(&mut index, &[0; 64]),
+            (&[0; 64]).len()
+        );
         let buffer = runtime.buffer_mut(index);
         interfaces.start_feature_arc(arc, interface, buffer, u16::MAX);
         let cursor = buffer.current_config_index();
@@ -94,24 +90,27 @@ fn feature_chain_terminates_without_an_end_node_self_edge() -> Result<(), Box<dy
             runtime.nodes().node_next_slot(punt, usize::from(next))?,
             drop_node
         );
+        let segments = runtime.chain(index).count();
+        let cached_free = runtime.cached_free_buffers();
+        runtime.buffer_free_one(index);
+        assert_eq!(runtime.cached_free_buffers(), cached_free + segments);
     }
     assert_eq!(selected_config, config);
     interfaces.disable_feature(runtime, arc, punt_feature, interface, &[])?;
-    let mut frame = runtime
-        .buffers()
-        .get_next_frame(output, runtime.nodes().frame_args_size(output)?)?;
-    let index = runtime.buffers().alloc_index_with_bytes(&[0; 64])?;
-    {
-        let count = frame.len();
-        frame.set_vector_count(count + 1);
-        frame.vector_args_mut()[count] = index;
-    }
+    let mut index = u32::MAX;
+    assert_eq!(
+        runtime.buffer_add_data(&mut index, &[0; 64]),
+        (&[0; 64]).len()
+    );
     let buffer = runtime.buffer_mut(index);
     let cursor = buffer.current_config_index();
     assert_eq!(interfaces.start_feature_arc(arc, interface, buffer, 7), 7);
     assert_eq!(buffer.current_config_index(), cursor);
-    drop(frame);
-    assert_eq!(runtime.buffers().in_use_buffers(), 0);
+    let segments = runtime.chain(index).count();
+    let cached_free = runtime.cached_free_buffers();
+    runtime.buffer_free_one(index);
+    assert_eq!(runtime.cached_free_buffers(), cached_free + segments);
+
     GlobalMain::uninstall_current();
     Ok(())
 }

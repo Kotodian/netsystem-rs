@@ -6,7 +6,7 @@
 
 use criterion::{BenchmarkId, Criterion, criterion_group, criterion_main};
 use hammer_core::data_plane::{
-    DEFAULT_BUFFER_FRAME_CAPACITY, Frame, Next, NodeId, NodeKind, NodeRegistration,
+    DEFAULT_BUFFER_FRAME_CAPACITY, Frame, NodeId, NodeKind, NodeRegistration,
 };
 use hammer_infra::mask_compare::{
     mask_compare_u16_arch, mask_compare_u16_scalar, mask_compare_u16_words,
@@ -33,7 +33,10 @@ fn register_sink(runtime: &DataPlaneMain, name: &'static str) -> RuntimeResult<N
     runtime.nodes().try_register_descriptor(
         NodeKind::Internal,
         NodeDescriptor::new(
-            |_, _, frame: &mut Frame| frame.len(),
+            |runtime, _, frame: &mut Frame| {
+                runtime.buffer_free(frame.vector_args());
+                frame.len()
+            },
             NodeRuntime::empty(),
             Some(NodeRegistration::next(name, 0)),
             &[],
@@ -58,8 +61,18 @@ fn register_owner(runtime: &DataPlaneMain, nexts: &[NodeId]) -> RuntimeResult<No
 struct FanoutFixture {
     runtime: DataPlaneMain,
     owner: NodeId,
-    frame: hammer_core::buffer::checked_out::Frame<Next>,
+    frame: Box<Frame>,
     nexts: [u16; DEFAULT_BUFFER_FRAME_CAPACITY],
+}
+
+impl Drop for FanoutFixture {
+    fn drop(&mut self) {
+        // Dispatch queued packets to the terminal nodes outside measurement;
+        // those nodes release Buffers independently of Frame storage.
+        self.runtime
+            .run_ready_nodes()
+            .expect("fanout terminal dispatch");
+    }
 }
 
 fn build_fixture(pattern: FanoutPattern) -> FanoutFixture {
@@ -71,17 +84,13 @@ fn build_fixture(pattern: FanoutPattern) -> FanoutFixture {
         register_sink(&runtime, "s3").expect("s3"),
     ];
     let owner = register_owner(&runtime, &sinks).expect("owner");
-    let mut frame = runtime
-        .buffers()
-        .get_next_frame(
-            owner,
-            runtime.nodes().frame_args_size(owner).expect("node layout"),
-        )
-        .expect("frame");
+    let mut frame = Frame::<(), u32, ()>::new(0);
     for offset in 0..DEFAULT_BUFFER_FRAME_CAPACITY {
-        let index = runtime
-            .alloc_index_with_bytes(&[(offset % 256) as u8])
-            .expect("alloc");
+        let mut index = u32::MAX;
+        assert_eq!(
+            runtime.buffer_add_data(&mut index, &[(offset % 256) as u8]),
+            1
+        );
         {
             let count = frame.len();
             frame.set_vector_count(count + 1);
@@ -107,19 +116,15 @@ fn build_fixture(pattern: FanoutPattern) -> FanoutFixture {
     runtime.with_current_node(owner, |runtime| {
         runtime.enqueue_to_next(&mut frame, &nexts);
     });
-    let _ = runtime.run_ready_nodes();
+    runtime.run_ready_nodes().expect("warm fanout dispatch");
 
-    let mut frame = runtime
-        .buffers()
-        .get_next_frame(
-            owner,
-            runtime.nodes().frame_args_size(owner).expect("node layout"),
-        )
-        .expect("measured frame");
+    let mut frame = Frame::<(), u32, ()>::new(0);
     for offset in 0..DEFAULT_BUFFER_FRAME_CAPACITY {
-        let index = runtime
-            .alloc_index_with_bytes(&[(offset % 256) as u8])
-            .expect("alloc");
+        let mut index = u32::MAX;
+        assert_eq!(
+            runtime.buffer_add_data(&mut index, &[(offset % 256) as u8]),
+            1
+        );
         {
             let count = frame.len();
             frame.set_vector_count(count + 1);

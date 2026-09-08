@@ -293,7 +293,11 @@ mod opaque_tests {
             buffer_slots: 16,
             ..Default::default()
         });
-        let index = runtime.alloc_index_with_bytes(&[0x04, 0xd2, 0x10, 0xe1, 0, 8, 0, 0])?;
+        let mut index = u32::MAX;
+        assert_eq!(
+            runtime.buffer_add_data(&mut index, &[0x04, 0xd2, 0x10, 0xe1, 0, 8, 0, 0]),
+            (&[0x04, 0xd2, 0x10, 0xe1, 0, 8, 0, 0]).len()
+        );
         write_udp_egress_endpoints(
             hammer_core::buffer_opaque!(mut runtime.buffer_mut(index) => UdpEgressOpaque),
             "192.0.2.1".parse().unwrap(),
@@ -311,7 +315,7 @@ mod opaque_tests {
             assert_eq!(network.ip().ip_protocol(), Some(17));
             assert_eq!(network.packet_cursor().transport_header_offset(), 20);
         }
-        runtime.buffers().drop_index_owned_with_trace(index, |_| {});
+        runtime.buffer_free_one(index);
         Ok(())
     }
 }

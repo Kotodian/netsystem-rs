@@ -369,3 +369,10 @@ mod tests {
         assert_eq!(mem::size_of_val(&*packet), 1088);
     }
 }
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum FrameBatchWidth {
+    Pair,
+    Quad,
+    Octo,
+}

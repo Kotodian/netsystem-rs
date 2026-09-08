@@ -7,12 +7,12 @@ impl DataPlaneMain {
 
     #[inline]
     pub fn try_new(config: DataPlaneBufferConfig) -> RuntimeResult<Self> {
-        Self::from_buffers(config.try_into()?, native_simd_bytes())
+        Self::from_config(config, native_simd_bytes())
     }
 
     #[inline]
-    pub(crate) fn from_buffers(
-        buffers: DataPlaneBuffers,
+    pub(crate) fn from_config(
+        config: DataPlaneBufferConfig,
         simd_bytes: usize,
     ) -> RuntimeResult<Self> {
         // Like vlib_main's clock seed, this is not cryptographic entropy.
@@ -21,11 +21,11 @@ impl DataPlaneMain {
             Ok(elapsed) => elapsed,
             Err(error) => error.duration(),
         };
-        let seed = elapsed.as_nanos() as u64 ^ u64::from(buffers.thread_index());
+        let seed = elapsed.as_nanos() as u64 ^ u64::from(config.thread_index);
         Ok(Self {
             random: Rc::new(RefCell::new(SmallRng::seed_from_u64(seed))),
-            active_numa_node: buffers.active_numa_node(),
-            buffers,
+            active_numa_node: config.active_numa_node,
+            thread_index: config.thread_index,
             nodes: NodeMain::default(),
             current_node: Rc::new(Cell::new(None)),
             handoff: None,
@@ -43,56 +43,44 @@ impl DataPlaneMain {
         })
     }
 
-    #[inline]
-    pub fn buffers(&self) -> &DataPlaneBuffers {
-        &self.buffers
-    }
-
-    /// VPP-style runtime thread index: zero for main, one-based for workers.
+    /// Runtime thread index: zero for main, one-based for workers.
     #[inline]
     pub fn thread_index(&self) -> u32 {
-        self.buffers.thread_index()
-    }
-
-    #[inline]
-    pub fn alloc_index(&self) -> RuntimeResult<u32> {
-        Ok(self.buffers.alloc_index()?)
-    }
-
-    #[inline]
-    pub fn alloc_index_with_bytes(&self, bytes: &[u8]) -> RuntimeResult<u32> {
-        Ok(self.buffers.alloc_index_with_bytes(bytes)?)
+        self.thread_index
     }
 
     #[inline]
     pub fn prefetch_header(&self, index: u32) {
-        self.buffers.prefetch_header(index);
+        hammer_infra::prefetch::prefetch_read_l1(
+            std::ptr::from_ref(self.buffer(index)).cast::<u8>(),
+        );
     }
 
     #[inline]
     pub fn prefetch_read(&self, index: u32) {
-        self.buffers.prefetch_read(index);
+        self.prefetch_header(index);
+        let data = self.buffer(index).current();
+        if !data.is_empty() {
+            hammer_infra::prefetch::prefetch_read_l1(data.as_ptr());
+        }
     }
 
     #[inline]
     pub fn prefetch_write(&self, index: u32) {
-        self.buffers.prefetch_write(index);
+        let buffer = self.buffer(index);
+        hammer_infra::prefetch::prefetch_write_l1(std::ptr::from_ref(buffer).cast::<u8>());
+        if !buffer.current().is_empty() {
+            hammer_infra::prefetch::prefetch_write_l1(buffer.current().as_ptr());
+        }
     }
 
     #[inline]
-    pub fn chain(
-        &self,
-        index: u32,
-    ) -> impl Iterator<Item = Result<BufferRef<'_>, DataPlaneError>> + '_ {
-        self.buffers.chain(index)
+    pub fn chain(&self, index: u32) -> impl Iterator<Item = &hammer_core::buffer::Buffer> {
+        std::iter::successors(Some(self.buffer(index)), |buffer| {
+            buffer.next_buffer_slot().map(|next| self.buffer(next))
+        })
     }
 
-    #[inline]
-    pub fn current_config_index(&self, index: u32) -> RuntimeResult<u32> {
-        Ok(self.buffers.current_config_index(index)?)
-    }
-
-    #[inline]
     #[inline]
     pub fn buffer(&self, index: u32) -> &hammer_core::data_plane::Buffer {
         // SAFETY: the graph owns this live index on the calling Worker. The
@@ -122,6 +110,15 @@ impl DataPlaneMain {
 }
 
 impl DataPlaneMain {
+    pub fn cached_free_buffers(&self) -> usize {
+        hammer_core::buffer::BufferMain::global()
+            .cached_free_buffers(self.thread_index(), self.active_numa_node)
+    }
+
+    pub fn buffer_copy_no_chain(&mut self, source: u32) -> Option<u32> {
+        hammer_core::buffer::BufferMain::global().copy_no_chain(self.thread_index(), source)
+    }
+
     pub fn buffer_alloc(&mut self, indices: &mut [u32]) -> usize {
         self.buffer_alloc_on_numa(indices, self.active_numa_node)
     }
@@ -162,6 +159,37 @@ impl DataPlaneMain {
             return allocated;
         }
         allocated + self.buffer_alloc_from_pool(&mut ring[..count - before_wrap], pool_index)
+    }
+
+    pub fn chain_buffer(&mut self, head: u32, tail: u32) -> RuntimeResult<()> {
+        let mut last = head;
+        while let Some(next) = self.buffer(last).next_buffer_slot() {
+            last = next;
+        }
+        let mut tail_last = tail;
+        while let Some(next) = self.buffer(tail_last).next_buffer_slot() {
+            tail_last = next;
+        }
+        assert_ne!(last, tail_last, "exclusive chains must not overlap");
+        for buffer in self.chain(head).chain(self.chain(tail)) {
+            assert_eq!(buffer.ref_count(), 1, "chain segments are exclusive");
+        }
+        let tail_length: usize = self.chain(tail).map(|buffer| buffer.current_len()).sum();
+        let head_length: usize = self
+            .chain(head)
+            .skip(1)
+            .map(|buffer| buffer.current_len())
+            .sum();
+        let total = head_length
+            .checked_add(tail_length)
+            .filter(|length| u32::try_from(*length).is_ok())
+            .ok_or(hammer_core::error::DataPlaneError::from(
+                hammer_core::error::BufferInvariant::ChainLengthOverflow,
+            ))?;
+        self.buffer_mut(last).set_next_buffer(Some(tail));
+        self.buffer_mut(head)
+            .set_total_len_not_including_first(total)?;
+        Ok(())
     }
 
     pub fn buffer_chain_init(&mut self, first: u32) {

@@ -9,7 +9,7 @@ use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
 
 use crossbeam_queue::ArrayQueue;
-use hammer_core::data_plane::{DataPlaneBuffers, Frame, NodeId, NodeState};
+use hammer_core::data_plane::{Frame, NodeId, NodeState};
 use hammer_infra::align::{CacheLineAlignMark, align_up};
 use hammer_infra::fifo::Fifo;
 use hammer_infra::linked_list::LinkedList;
@@ -1663,12 +1663,12 @@ impl SessionWorker {
     /// publish a partial datagram.
     pub fn enqueue_datagram_rx_from_buffer(
         &self,
-        buffers: &DataPlaneBuffers,
+        runtime: &DataPlaneMain,
         session_id: u32,
         index: u32,
         header: SessionDgramHeader,
     ) -> RuntimeResult<usize> {
-        self.enqueue_datagram_rx_from_buffer_at(buffers, session_id, index, 0, header)
+        self.enqueue_datagram_rx_from_buffer_at(runtime, session_id, index, 0, header)
     }
 
     /// Variant of [`Self::enqueue_datagram_rx_from_buffer`] for a packet
@@ -1676,7 +1676,7 @@ impl SessionWorker {
     /// Only `payload_offset..payload_offset + header.data_length` is copied.
     pub fn enqueue_datagram_rx_from_buffer_at(
         &self,
-        buffers: &DataPlaneBuffers,
+        runtime: &DataPlaneMain,
         session_id: u32,
         index: u32,
         payload_offset: usize,
@@ -1695,9 +1695,9 @@ impl SessionWorker {
             },
         )?;
         let mut source_len = 0usize;
-        for buffer in buffers.chain(index) {
+        for buffer in runtime.chain(index) {
             source_len = source_len
-                .checked_add(buffer?.current_len())
+                .checked_add(buffer.current_len())
                 .ok_or(SessionError::RxLengthOverflow { session_id })?;
         }
         if payload_end > source_len {
@@ -1745,8 +1745,7 @@ impl SessionWorker {
         }
         let mut skip = payload_offset;
         let mut remaining = payload_len;
-        for buffer in buffers.chain(index) {
-            let buffer = buffer?;
+        for buffer in runtime.chain(index) {
             if skip >= buffer.current_len() {
                 skip -= buffer.current_len();
                 continue;
@@ -1808,7 +1807,7 @@ impl SessionWorker {
     /// is called after output header construction succeeds.
     pub fn copy_tx_datagram_to_buffer(
         &self,
-        buffers: &DataPlaneBuffers,
+        runtime: &mut DataPlaneMain,
         session_id: u32,
         header: SessionDgramHeader,
         index: u32,
@@ -1831,7 +1830,7 @@ impl SessionWorker {
                 header_len: header.data_length(),
             },
         )?;
-        self.copy_tx_to_buffer(buffers, session_id, fifo_offset, payload_len, index)?;
+        self.copy_tx_to_buffer(runtime, session_id, fifo_offset, payload_len, index)?;
         Ok(payload_len)
     }
 
@@ -3699,13 +3698,13 @@ impl SessionWorker {
 
     pub fn enqueue_rx(
         &mut self,
-        buffers: &DataPlaneBuffers,
+        runtime: &DataPlaneMain,
         session_id: u32,
         index: u32,
         offset: u32,
     ) -> RuntimeResult<RxDelivery> {
         if offset == 0 {
-            let (accepted, promoted) = self.copy_rx_from_buffer(session_id, buffers, index)?;
+            let (accepted, promoted) = self.copy_rx_from_buffer(session_id, runtime, index)?;
             let rx_available = self.rx_available_u32(session_id);
             let delivery = match NonZeroU32::new(accepted) {
                 Some(accepted) => RxDelivery::InOrder {
@@ -3721,7 +3720,7 @@ impl SessionWorker {
             return Ok(delivery);
         }
         let (accepted, newest) =
-            self.copy_rx_from_buffer_ooo(session_id, buffers, index, offset)?;
+            self.copy_rx_from_buffer_ooo(session_id, runtime, index, offset)?;
         let rx_available = self.rx_available_u32(session_id);
         let delivery = match NonZeroU32::new(accepted) {
             Some(accepted) => {
@@ -3926,7 +3925,7 @@ impl SessionWorker {
 
     pub fn copy_tx_to_buffer(
         &self,
-        buffers: &DataPlaneBuffers,
+        runtime: &mut DataPlaneMain,
         session_id: u32,
         offset: usize,
         len: usize,
@@ -3939,11 +3938,19 @@ impl SessionWorker {
         let written = entry
             .tx_fifo
             .peek_segments(offset, len, |first, second| {
-                if !first.is_empty() {
-                    buffers.append(index, first)?;
+                let mut last = index;
+                while let Some(next) = runtime.buffer(last).next_buffer_slot() {
+                    last = next;
                 }
-                if !second.is_empty() {
-                    buffers.append(index, second)?;
+                for data in [first, second] {
+                    let copied =
+                        runtime.buffer_chain_append_data_with_alloc(index, &mut last, data);
+                    if copied != data.len() {
+                        return Err(hammer_core::error::DataPlaneError::from(
+                            hammer_core::error::BufferInvariant::PoolExhausted,
+                        )
+                        .into());
+                    }
                 }
                 Ok::<usize, RuntimeError>(first.len() + second.len())
             })
@@ -3980,7 +3987,7 @@ impl SessionWorker {
     fn copy_rx_from_buffer(
         &self,
         session_id: u32,
-        buffers: &DataPlaneBuffers,
+        runtime: &DataPlaneMain,
         index: u32,
     ) -> RuntimeResult<(u32, u32)> {
         let Some(entry) = self.entries.get(session_id) else {
@@ -3989,8 +3996,7 @@ impl SessionWorker {
         let mut total = 0u32;
         let mut accepted = 0u32;
         let mut promoted = 0u32;
-        for buffer in buffers.chain(index) {
-            let buffer = buffer?;
+        for buffer in runtime.chain(index) {
             let chunk = buffer.current();
             let chunk_len = u32::try_from(chunk.len())
                 .map_err(|_| SessionError::RxLengthOverflow { session_id })?;
@@ -4020,7 +4026,7 @@ impl SessionWorker {
     fn copy_rx_from_buffer_ooo(
         &self,
         session_id: u32,
-        buffers: &DataPlaneBuffers,
+        runtime: &DataPlaneMain,
         index: u32,
         offset: u32,
     ) -> RuntimeResult<(u32, Option<(u32, u32)>)> {
@@ -4032,8 +4038,7 @@ impl SessionWorker {
         let mut delivered = 0u32;
         let mut newest_start = None;
         let mut newest_end = None;
-        for buffer in buffers.chain(index) {
-            let buffer = buffer?;
+        for buffer in runtime.chain(index) {
             let current = buffer.current();
             let chunk_offset =
                 offset
@@ -4331,6 +4336,7 @@ where
             && io_budget != 0
         {
             let mut batch = Vec::with_capacity(io_budget);
+            let mut indices = [0; DEFAULT_TX_DISPATCH_BUDGET];
             while batch.len() < io_budget && remaining_space != 0 {
                 let pending_len = total_len.saturating_sub(batch_offset);
                 if pending_len == 0 {
@@ -4340,14 +4346,27 @@ where
                 if payload_len == 0 {
                     break;
                 }
-                let buffer = runtime.buffers().alloc_index()?;
-                sessions.copy_tx_to_buffer(
-                    runtime.buffers(),
+                let mut buffer = 0;
+                if runtime.buffer_alloc(core::slice::from_mut(&mut buffer)) != 1 {
+                    runtime.buffer_free(&indices[..batch.len()]);
+                    return Err(hammer_core::error::DataPlaneError::from(
+                        hammer_core::error::BufferInvariant::PoolExhausted,
+                    )
+                    .into());
+                }
+                indices[batch.len()] = buffer;
+                if let Err(error) = sessions.copy_tx_to_buffer(
+                    runtime,
                     session_id,
                     batch_offset,
                     payload_len,
                     buffer,
-                )?;
+                ) {
+                    // Chain append retains its prefix on Pool pressure. None
+                    // of these heads has transferred to the output Frame yet.
+                    runtime.buffer_free(&indices[..batch.len() + 1]);
+                    return Err(error);
+                }
                 batch.push(TxBatchBuffer {
                     index: buffer,
                     tx_offset: batch_offset,
@@ -4356,11 +4375,22 @@ where
                 batch_offset += payload_len;
                 remaining_space -= payload_len;
             }
-            transport.tx_action(index, batch.as_slice(), runtime, now)?;
-            for item in batch.as_slice() {
-                if !output.try_enqueue_io(frame, output_next, item.index)? {
-                    sessions.reschedule_old(session_id);
-                    break;
+            if let Err(error) = transport.tx_action(index, batch.as_slice(), runtime, now) {
+                runtime.buffer_free(&indices[..batch.len()]);
+                return Err(error);
+            }
+            for (position, item) in batch.iter().enumerate() {
+                match output.try_enqueue_io(frame, output_next, item.index) {
+                    Ok(true) => {}
+                    Ok(false) => {
+                        runtime.buffer_free(&indices[position..batch.len()]);
+                        sessions.reschedule_old(session_id);
+                        break;
+                    }
+                    Err(error) => {
+                        runtime.buffer_free(&indices[position..batch.len()]);
+                        return Err(error);
+                    }
                 }
             }
         }

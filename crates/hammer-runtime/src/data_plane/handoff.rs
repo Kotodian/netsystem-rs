@@ -139,9 +139,10 @@ mod tests {
             .unwrap();
         });
         hammer_infra::main_heap::init_default().unwrap();
-        let arena = BufferPoolArena::with_capacity(64, 64);
-        let buffers = DataPlaneBuffers::from_arenas([arena.clone()], 8, 1, 0);
-        let mut source = DataPlaneMain::from_buffers(buffers, native_simd_bytes()).unwrap();
+        let source = DataPlaneMain::new(DataPlaneBufferConfig {
+            thread_index: 1,
+            ..Default::default()
+        });
         source
             .nodes()
             .try_register_descriptor(
@@ -166,10 +167,8 @@ mod tests {
         let mut source =
             DataPlaneMain::attach_handoff_worker(source, handoff.worker(DataWorkerId::new(0)));
         let receiver = handoff.worker(DataWorkerId::new(1));
-        let (arenas, frame_slots, nodes, simd_bytes, _, trace_control) = source.worker_parts();
+        let (nodes, simd_bytes, _, trace_control) = source.worker_parts();
         let mut receiver = DataPlaneMain::from_worker_parts(
-            arenas,
-            frame_slots,
             nodes,
             simd_bytes,
             Some(receiver),
@@ -182,7 +181,11 @@ mod tests {
         let destination = DataWorkerId::new(1);
         let mut frame = Frame::<(), u32, ()>::new(0);
         for _ in 0..33 {
-            let index = source.alloc_index_with_bytes(&[0x45; 20]).unwrap();
+            let mut index = u32::MAX;
+            assert_eq!(
+                source.buffer_add_data(&mut index, &[0x45; 20]),
+                (&[0x45; 20]).len()
+            );
             source
                 .buffer_mut(index)
                 .set_current_config_index(0x1234_5678);
@@ -222,16 +225,20 @@ mod tests {
             ))
         ));
         assert_eq!(frame.len(), 31);
-        assert_eq!(source.current_config_index(index).unwrap(), 0x1234_5678);
+        assert_eq!(source.buffer(index).current_config_index(), 0x1234_5678);
         assert_eq!(source.buffer(index).ref_count(), 1);
-        let cached_free = receiver.buffers().cached_free_buffers();
+        let cached_free = receiver.cached_free_buffers();
         assert_eq!(receiver.run_ready_nodes().unwrap(), 2);
         assert_eq!(receiver.nodes().frames_in_use(), 0);
-        assert_eq!(receiver.buffers().cached_free_buffers(), cached_free + 2);
+        assert_eq!(receiver.cached_free_buffers(), cached_free + 2);
 
         // Retry the unchanged source frame, spanning two queue slots.
         for _ in 0..2 {
-            let index = source.alloc_index_with_bytes(&[0x45; 20]).unwrap();
+            let mut index = u32::MAX;
+            assert_eq!(
+                source.buffer_add_data(&mut index, &[0x45; 20]),
+                (&[0x45; 20]).len()
+            );
             source
                 .buffer_mut(index)
                 .set_current_config_index(0x1234_5678);
@@ -247,7 +254,7 @@ mod tests {
         assert_eq!(frame.len(), 33);
         assert_eq!(receiver.run_ready_nodes().unwrap(), 2);
         assert_eq!(receiver.nodes().frames_in_use(), 0);
-        assert_eq!(receiver.buffers().cached_free_buffers(), cached_free + 35);
+        assert_eq!(receiver.cached_free_buffers(), cached_free + 35);
         assert_eq!(receiver.run_ready_nodes().unwrap(), 0);
     }
 }

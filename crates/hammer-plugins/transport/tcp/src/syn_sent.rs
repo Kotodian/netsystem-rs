@@ -190,7 +190,7 @@ fn tcp_syn_sent_index(
                     buffer.advance(packet.payload_offset as isize);
                     buffer.truncate(packet.payload_len)?;
                 }
-                let enqueue = sessions.enqueue_rx(runtime.buffers(), session_id, index, 0)?;
+                let enqueue = sessions.enqueue_rx(runtime, session_id, index, 0)?;
                 if matches!(enqueue, RxDelivery::InOrder { .. }) {
                     sessions.mark_ready(session_id);
                 }
@@ -200,7 +200,13 @@ fn tcp_syn_sent_index(
             Ok((keep_current, control))
         })?;
     if let Some(segment) = control_segment {
-        let allocated = runtime.buffers().alloc_index()?;
+        let mut allocated = 0;
+        if runtime.buffer_alloc(core::slice::from_mut(&mut allocated)) != 1 {
+            return Err(hammer_core::error::DataPlaneError::from(
+                hammer_core::error::BufferInvariant::PoolExhausted,
+            )
+            .into());
+        }
         segment.write_to_buffer(&mut *runtime.buffer_mut(allocated))?;
         emit_local(
             runtime,

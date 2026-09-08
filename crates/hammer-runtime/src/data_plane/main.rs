@@ -9,10 +9,10 @@ use std::sync::{Arc, Mutex};
 use crate::error::{RuntimeError, RuntimeResult};
 use crate::file::{FILE_MAIN, FileMain};
 use hammer_core::data_plane::{
-    BUFFER_CACHE_LINE_SIZE, BufferPoolArena, BufferRef, DEFAULT_BUFFER_FRAME_POOL_SIZE,
-    DataPlaneBuffers, Frame, FrameBatchWidth, NodeErrorIndex, NodeId, NodeKind, NodeRegistration,
+    BUFFER_CACHE_LINE_SIZE, DEFAULT_BUFFER_FRAME_POOL_SIZE, Frame, FrameBatchWidth, NodeErrorIndex,
+    NodeId, NodeKind, NodeRegistration,
 };
-use hammer_core::error::{DataPlaneError, DataPlaneResult};
+use hammer_core::error::DataPlaneError;
 use hammer_infra::PageSize;
 
 use crate::config::Worker;
@@ -38,7 +38,7 @@ pub use config::DataPlaneBufferConfig;
 
 pub struct DataPlaneMain {
     random: Rc<RefCell<SmallRng>>,
-    buffers: DataPlaneBuffers,
+    thread_index: u32,
     pub(crate) nodes: NodeMain,
     current_node: Rc<Cell<Option<NodeId>>>,
     handoff: Option<DataPlaneHandoffWorker>,
@@ -67,7 +67,7 @@ impl DataPlaneMain {
 impl fmt::Debug for DataPlaneMain {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("DataPlaneMain")
-            .field("buffers", &self.buffers)
+            .field("thread_index", &self.thread_index)
             .field("nodes", &self.nodes)
             .field("current_node", &self.current_node.get())
             .field("handoff", &self.handoff)

@@ -342,7 +342,7 @@ impl Buffer {
     }
 
     #[inline]
-    pub(crate) fn set_next_buffer(&mut self, next: Option<u32>) {
+    pub fn set_next_buffer(&mut self, next: Option<u32>) {
         self.cacheline0.next_buffer = next.unwrap_or(BUFFER_INVALID_INDEX);
         if next.is_some() {
             self.cacheline0.flags.insert(BufferFlags::NEXT_PRESENT);
@@ -352,7 +352,7 @@ impl Buffer {
     }
 
     #[inline]
-    pub(crate) fn set_total_len_not_including_first(&mut self, len: usize) -> DataPlaneResult<()> {
+    pub fn set_total_len_not_including_first(&mut self, len: usize) -> DataPlaneResult<()> {
         let len = u32::try_from(len).map_err(|_| BufferInvariant::ChainTailLengthOutOfRange)?;
         self.total_length_not_including_first = len;
         self.cacheline0
@@ -392,7 +392,7 @@ impl Buffer {
 
 #[cfg(test)]
 mod tests {
-    use crate::buffer::{BUFFER_PRE_DATA_SIZE, BufferMain, BufferPoolArena, DataPlaneBuffers};
+    use crate::buffer::{BUFFER_PRE_DATA_SIZE, BufferMain};
     use crate::error::DataPlaneResult;
     use hammer_infra::PageSize;
 
@@ -405,11 +405,12 @@ mod tests {
     fn single_segment_operations_preserve_the_packet_window() -> DataPlaneResult<()> {
         hammer_infra::main_heap::init_default().unwrap();
         BufferMain::new(2048, 16, &[0, 1], 1, PageSize::Default)?;
-        let buffers =
-            DataPlaneBuffers::from_arenas([BufferPoolArena::with_capacity(2048, 16)], 1, 1, 0);
-        let index = buffers.alloc_index_with_bytes(&[1, 2, 3, 4])?;
+        let buffers = BufferMain::global();
+        let mut index = u32::MAX;
+        assert_eq!(buffers.add_data(1, 0, &mut index, &[1, 2, 3, 4]), 4);
         {
-            let mut buffer = buffers.get_buffer_mut(index)?;
+            // SAFETY: this test owns the allocated segment until its explicit free.
+            let buffer = unsafe { buffers.buffer_mut(index) };
             let data_start = buffer.current().as_ptr();
 
             // vlib_test.c: reset and the four zero-length operations.
@@ -484,9 +485,9 @@ mod tests {
             assert_eq!(buffer.current_len(), length - 2);
             assert_eq!(&buffer.current()[..2], &[15, 16]);
         }
-        buffers.drop_index_owned_with_trace(index, |_| {});
+        buffers.free_buffers(1, &[index], true, |_| {});
         crate::buffer::opaque::tests::metadata_copy_and_pool_recycle_preserve_secondary_storage(
-            &buffers,
+            buffers,
         )?;
         crate::buffer::operations::tests::allocation_chains_and_reference_release();
         Ok(())

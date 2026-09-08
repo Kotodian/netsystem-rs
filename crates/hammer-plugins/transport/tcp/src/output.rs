@@ -239,7 +239,7 @@ fn set_tcp_checksum<const SIMD_BYTES: usize>(
         buffer.current_mut()[TCP_CHECKSUM_OFFSET..TCP_CHECKSUM_OFFSET + 2].fill(0);
     }
     for buffer in runtime.chain(index) {
-        checksum.write(buffer?.current());
+        checksum.write(buffer.current());
     }
     let value = checksum.finish() as u16;
     let buffer = runtime.buffer_mut(index);
@@ -334,7 +334,13 @@ mod opaque_tests {
             buffer_slots: 16,
             ..Default::default()
         });
-        let index = runtime.alloc_index()?;
+        let mut index = 0;
+        if runtime.buffer_alloc(core::slice::from_mut(&mut index)) != 1 {
+            return Err(hammer_core::error::DataPlaneError::from(
+                hammer_core::error::BufferInvariant::PoolExhausted,
+            )
+            .into());
+        }
         let local = "192.0.2.1:1234".parse().unwrap();
         let remote = "192.0.2.2:4321".parse().unwrap();
         {
@@ -382,7 +388,7 @@ mod opaque_tests {
             assert_eq!(network.ip().ip_protocol(), Some(6));
             assert_eq!(network.packet_cursor().transport_header_offset(), 20);
         }
-        runtime.buffers().drop_index_owned_with_trace(index, |_| {});
+        runtime.buffer_free_one(index);
         Ok(())
     }
 }

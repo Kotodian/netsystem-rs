@@ -405,7 +405,7 @@ impl UdpWorker {
             let header = SessionDgramHeader::new(local, remote, payload_len)
                 .ok_or(UdpTransportError::InvalidConnection)?;
             let written = sessions.enqueue_datagram_rx_from_buffer_at(
-                runtime.buffers(),
+                runtime,
                 session_id,
                 index,
                 payload_offset,
@@ -450,7 +450,7 @@ impl UdpWorker {
         let header = SessionDgramHeader::new(local, remote, payload_len)
             .ok_or(UdpTransportError::InvalidConnection)?;
         let written = sessions.enqueue_datagram_rx_from_buffer_at(
-            runtime.buffers(),
+            runtime,
             session_id,
             index,
             payload_offset,
@@ -563,20 +563,18 @@ impl UdpWorker {
 
     fn handoff_migration_datagram_or_drop(
         &self,
-        runtime: &DataPlaneMain,
+        runtime: &mut DataPlaneMain,
         reply: SessionSwitchPoolReply,
     ) {
         if let Err(reply) = self.handoff_migration_datagram(runtime, reply) {
-            runtime
-                .buffers()
-                .drop_index_owned_with_trace(reply.dgram.index, |_| {});
+            runtime.buffer_free_one(reply.dgram.index);
         }
     }
 
     fn process_migration_reply(
         &mut self,
         sessions: &mut SessionWorker,
-        runtime: &DataPlaneMain,
+        runtime: &mut DataPlaneMain,
         mut reply: SessionSwitchPoolReply,
     ) -> Result<(), SessionSwitchPoolReply> {
         if reply.status == SessionSwitchPoolStatus::Rejected {
@@ -765,7 +763,11 @@ impl UdpWorker {
         }
     }
 
-    fn drain_migration_replies(&mut self, sessions: &mut SessionWorker, runtime: &DataPlaneMain) {
+    fn drain_migration_replies(
+        &mut self,
+        sessions: &mut SessionWorker,
+        runtime: &mut DataPlaneMain,
+    ) {
         while let Some(reply) = self.session_switch_pool_replies.pop_front() {
             if let Err(reply) = sessions.push_session_switch_pool_reply(runtime, reply) {
                 self.session_switch_pool_replies.push_front(reply);
@@ -1117,13 +1119,17 @@ impl TransportInternalTransport for UdpWorker {
                 (connection.local(), connection.remote())
             };
 
-            let buffer = runtime.buffers().alloc_index()?;
+            let mut buffer = 0;
+            if runtime.buffer_alloc(core::slice::from_mut(&mut buffer)) != 1 {
+                return Err(hammer_core::error::DataPlaneError::from(
+                    hammer_core::error::BufferInvariant::PoolExhausted,
+                )
+                .into());
+            }
             if let Err(error) =
-                sessions.copy_tx_datagram_to_buffer(runtime.buffers(), session_id, header, buffer)
+                sessions.copy_tx_datagram_to_buffer(runtime, session_id, header, buffer)
             {
-                runtime
-                    .buffers()
-                    .drop_index_owned_with_trace(buffer, |_| {});
+                runtime.buffer_free_one(buffer);
                 return Err(error);
             }
             {
@@ -1141,9 +1147,7 @@ impl TransportInternalTransport for UdpWorker {
                 );
             }
             if !output.try_enqueue_io(frame, output_next, buffer)? {
-                runtime
-                    .buffers()
-                    .drop_index_owned_with_trace(buffer, |_| {});
+                runtime.buffer_free_one(buffer);
                 sessions.mark_ready(session_id);
                 break;
             }

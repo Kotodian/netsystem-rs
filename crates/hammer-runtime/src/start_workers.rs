@@ -73,11 +73,8 @@ pub fn start_workers(engine: &mut GlobalMain) -> RuntimeResult<()> {
                     }
 
                     let numa_node = worker_config.apply_current_thread_setup(worker.slot())?;
-                    let (buffer_arenas, frame_slots, nodes, simd_bytes, _, trace_control) =
-                        runtime_parts;
+                    let (nodes, simd_bytes, _, trace_control) = runtime_parts;
                     let runtime = DataPlaneMain::from_worker_parts(
-                        buffer_arenas,
-                        frame_slots,
                         nodes,
                         simd_bytes,
                         Some(handoff),

@@ -1,7 +1,5 @@
 use criterion::{BenchmarkId, Criterion, criterion_group, criterion_main};
-use hammer_core::data_plane::{
-    BufferMain, BufferPoolArena, DEFAULT_BUFFER_FRAME_CAPACITY, DataPlaneBuffers, NodeId,
-};
+use hammer_core::data_plane::BufferMain;
 use hammer_runtime::{DataPlaneBufferConfig, DataPlaneMain};
 
 fn test_runtime(
@@ -22,53 +20,17 @@ fn test_runtime(
     DataPlaneMain::new(config)
 }
 
-fn test_buffers(buffer_slot_capacity: usize, buffer_slots: usize) -> DataPlaneBuffers {
-    BUFFER_MAIN_INIT.call_once(|| {
-        hammer_infra::main_heap::init_default().unwrap();
-        BufferMain::new(2048, 4096, &[0], 0, hammer_infra::PageSize::Default).unwrap();
-    });
-    DataPlaneBuffers::from_arenas(
-        [BufferPoolArena::with_capacity(
-            buffer_slot_capacity,
-            buffer_slots,
-        )],
-        1,
-        0,
-        0,
-    )
-}
-
-fn drop_owned_index(buffers: &DataPlaneBuffers, index: u32) {
-    let mut frame = buffers
-        .get_next_frame(NodeId::new(0), (0, 4, 0))
-        .expect("cleanup frame");
-    {
-        let count = frame.len();
-        frame.set_vector_count(count + 1);
-        frame.vector_args_mut()[count] = index;
-    }
-}
-
-fn drop_owned_indices(buffers: &DataPlaneBuffers, indices: Vec<u32>) {
-    for chunk in indices.chunks(DEFAULT_BUFFER_FRAME_CAPACITY) {
-        let mut frame = buffers
-            .get_next_frame(NodeId::new(0), (0, 4, 0))
-            .expect("cleanup frame");
-        frame.set_vector_count(chunk.len());
-        frame.vector_args_mut().copy_from_slice(chunk);
-    }
-}
-
 /// Allocate and free a single empty buffer, one pair per iteration. This is
 /// the per-packet cost on the hot path.
 fn bench_alloc_free_single(c: &mut Criterion) {
     let mut group = c.benchmark_group("alloc_free_single");
     group.bench_function("empty", |b| {
         b.iter_batched(
-            || test_buffers(2048, 4096),
-            |buffers| {
-                let index = buffers.alloc_index().expect("alloc");
-                drop_owned_index(&buffers, index);
+            || test_runtime(2048, 4096, 1),
+            |mut buffers| {
+                let mut index = 0;
+                assert_eq!(buffers.buffer_alloc(core::slice::from_mut(&mut index)), 1);
+                buffers.buffer_free_one(index);
             },
             criterion::BatchSize::SmallInput,
         );
@@ -76,10 +38,11 @@ fn bench_alloc_free_single(c: &mut Criterion) {
     group.bench_function("with_bytes_1500", |b| {
         let payload = [0u8; 1500];
         b.iter_batched(
-            || test_buffers(2048, 4096),
-            |buffers| {
-                let index = buffers.alloc_index_with_bytes(&payload).expect("alloc");
-                drop_owned_index(&buffers, index);
+            || test_runtime(2048, 4096, 1),
+            |mut buffers| {
+                let mut index = u32::MAX;
+                assert_eq!(buffers.buffer_add_data(&mut index, &payload), payload.len());
+                buffers.buffer_free_one(index);
             },
             criterion::BatchSize::SmallInput,
         );
@@ -95,13 +58,11 @@ fn bench_alloc_free_batch256(c: &mut Criterion) {
     for &batch in &[64usize, 256, 1024] {
         group.bench_with_input(BenchmarkId::new("empty", batch), &batch, |b, &batch| {
             b.iter_batched(
-                || test_buffers(2048, batch.max(4096)),
-                |buffers| {
-                    let mut indices = Vec::with_capacity(batch);
-                    for _ in 0..batch {
-                        indices.push(buffers.alloc_index().expect("alloc"));
-                    }
-                    drop_owned_indices(&buffers, indices);
+                || test_runtime(2048, batch.max(4096), 1),
+                |mut buffers| {
+                    let mut indices = vec![0; batch];
+                    assert_eq!(buffers.buffer_alloc(&mut indices), indices.len());
+                    buffers.buffer_free(&indices);
                 },
                 criterion::BatchSize::SmallInput,
             );
@@ -112,13 +73,17 @@ fn bench_alloc_free_batch256(c: &mut Criterion) {
             |b, &batch| {
                 let payload = [0u8; 1500];
                 b.iter_batched(
-                    || test_buffers(2048, batch.max(4096)),
-                    |buffers| {
-                        let mut indices = Vec::with_capacity(batch);
-                        for _ in 0..batch {
-                            indices.push(buffers.alloc_index_with_bytes(&payload).expect("alloc"));
+                    || test_runtime(2048, batch.max(4096), 1),
+                    |mut buffers| {
+                        let mut indices = vec![0; batch];
+                        assert_eq!(buffers.buffer_alloc(&mut indices), indices.len());
+                        for &index in &indices {
+                            buffers
+                                .buffer_mut(index)
+                                .put_uninit(payload.len() as u16)
+                                .copy_from_slice(&payload);
                         }
-                        drop_owned_indices(&buffers, indices);
+                        buffers.buffer_free(&indices);
                     },
                     criterion::BatchSize::SmallInput,
                 );
@@ -135,12 +100,11 @@ fn bench_chain_alloc_free(c: &mut Criterion) {
     let mut group = c.benchmark_group("chain_alloc_free");
     group.bench_function("9000B", |b| {
         b.iter_batched(
-            || test_buffers(2048, 4096),
-            |buffers| {
-                let index = buffers
-                    .alloc_index_with_bytes(&payload)
-                    .expect("chain alloc");
-                drop_owned_index(&buffers, index);
+            || test_runtime(2048, 4096, 1),
+            |mut buffers| {
+                let mut index = u32::MAX;
+                assert_eq!(buffers.buffer_add_data(&mut index, &payload), payload.len());
+                buffers.buffer_free_one(index);
             },
             criterion::BatchSize::SmallInput,
         );
@@ -155,9 +119,10 @@ fn bench_runtime_alloc_free(c: &mut Criterion) {
     group.bench_function("single", |b| {
         b.iter_batched(
             || test_runtime(2048, 4096, 256),
-            |runtime| {
-                let index = runtime.alloc_index().expect("alloc");
-                drop_owned_index(runtime.buffers(), index);
+            |mut runtime| {
+                let mut index = 0;
+                assert_eq!(runtime.buffer_alloc(core::slice::from_mut(&mut index)), 1);
+                runtime.buffer_free_one(index);
             },
             criterion::BatchSize::SmallInput,
         );
@@ -165,12 +130,10 @@ fn bench_runtime_alloc_free(c: &mut Criterion) {
     group.bench_function("batch_256", |b| {
         b.iter_batched(
             || test_runtime(2048, 4096, 256),
-            |runtime| {
-                let mut indices = Vec::with_capacity(256);
-                for _ in 0..256 {
-                    indices.push(runtime.alloc_index().expect("alloc"));
-                }
-                drop_owned_indices(runtime.buffers(), indices);
+            |mut runtime| {
+                let mut indices = vec![0; 256];
+                assert_eq!(runtime.buffer_alloc(&mut indices), indices.len());
+                runtime.buffer_free(&indices);
             },
             criterion::BatchSize::SmallInput,
         );

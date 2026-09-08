@@ -957,7 +957,13 @@ fn enqueue_tcp_segment(
     if output.remaining_io_budget() == 0 {
         return Ok(());
     }
-    let index = runtime.buffers().alloc_index()?;
+    let mut index = 0;
+    if runtime.buffer_alloc(core::slice::from_mut(&mut index)) != 1 {
+        return Err(hammer_core::error::DataPlaneError::from(
+            hammer_core::error::BufferInvariant::PoolExhausted,
+        )
+        .into());
+    }
     segment.write_to_buffer(&mut *runtime.buffer_mut(index))?;
     let _ = output.try_enqueue_io(frame, output_next, index)?;
     Ok(())

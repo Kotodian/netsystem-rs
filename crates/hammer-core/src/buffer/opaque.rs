@@ -12,13 +12,6 @@ pub(super) union PrimaryOpaque {
 pub const PRIMARY_OPAQUE_BYTES: usize = mem::size_of::<PrimaryOpaque>();
 pub const PRIMARY_OPAQUE_ALIGN: usize = mem::align_of::<PrimaryOpaque>();
 
-impl PrimaryOpaque {
-    #[inline]
-    pub(super) fn clear(&mut self) {
-        *self = Self { words64: [0; 5] };
-    }
-}
-
 impl Default for PrimaryOpaque {
     fn default() -> Self {
         Self { words64: [0; 5] }
@@ -40,13 +33,6 @@ pub(super) union SecondaryOpaque {
     words64: [u64; 7],
     words32: [u32; 14],
     bytes: [u8; 56],
-}
-
-impl SecondaryOpaque {
-    #[inline]
-    pub(super) fn clear(&mut self) {
-        *self = Self { words64: [0; 7] };
-    }
 }
 
 impl Default for SecondaryOpaque {
@@ -155,7 +141,7 @@ impl super::Buffer {
 
 #[cfg(test)]
 pub(super) mod tests {
-    use crate::buffer::DataPlaneBuffers;
+    use crate::buffer::BufferMain;
     use crate::error::DataPlaneResult;
 
     #[hammer_component_macros::buffer_opaque(primary)]
@@ -173,22 +159,28 @@ pub(super) mod tests {
     // Derived from vlib/buffer_funcs.h: vlib_buffer_copy metadata copies and
     // vlib_buffer_pool_put template restoration; no standalone upstream opaque test.
     pub(in crate::buffer) fn metadata_copy_and_pool_recycle_preserve_secondary_storage(
-        buffers: &DataPlaneBuffers,
+        buffers: &BufferMain,
     ) -> DataPlaneResult<()> {
-        let index = buffers.alloc_index()?;
+        let mut index = 0;
+        assert_eq!(
+            buffers.alloc_from_pool(1, core::slice::from_mut(&mut index), 0),
+            1
+        );
         {
-            let mut buffer = buffers.get_buffer_mut(index)?;
+            // SAFETY: this test retains the segment and ends this borrow before freeing it.
+            let buffer = unsafe { buffers.buffer_mut(index) };
             let address = std::ptr::from_ref(&*buffer).addr();
-            let primary = crate::buffer_opaque!(mut &mut buffer => PacketMetadata);
+            let primary = crate::buffer_opaque!(mut buffer => PacketMetadata);
             assert_eq!(std::ptr::from_ref(primary).addr(), address + 24);
             primary.words = [0x0123_4567_89ab_cdef; 5];
-            let secondary = crate::buffer_opaque!(mut &mut buffer => PacketSecondaryMetadata);
+            let secondary = crate::buffer_opaque!(mut buffer => PacketSecondaryMetadata);
             assert_eq!(std::ptr::from_ref(secondary).addr(), address + 72);
             secondary.words = [0xfedc_ba98_7654_3210; 7];
         }
-        let copied = buffers.alloc_index_from(index)?;
+        let copied = buffers.copy_no_chain(1, index).unwrap();
         {
-            let buffer = buffers.get_buffer(copied)?;
+            // SAFETY: this test retains the segment and ends this borrow before freeing it.
+            let buffer = unsafe { buffers.buffer(copied) };
             assert_eq!(
                 crate::buffer_opaque!(&buffer => PacketMetadata).words,
                 [0x0123_4567_89ab_cdef; 5]
@@ -198,11 +190,16 @@ pub(super) mod tests {
                 [0xfedc_ba98_7654_3210; 7]
             );
         }
-        buffers.drop_index_owned_with_trace(index, |_| {});
-        let recycled = buffers.alloc_index()?;
+        buffers.free_buffers(1, &[index], true, |_| {});
+        let mut recycled = 0;
+        assert_eq!(
+            buffers.alloc_from_pool(1, core::slice::from_mut(&mut recycled), 0),
+            1
+        );
         assert_eq!(recycled, index);
         {
-            let buffer = buffers.get_buffer(recycled)?;
+            // SAFETY: this test retains the segment and ends this borrow before freeing it.
+            let buffer = unsafe { buffers.buffer(recycled) };
             assert_eq!(
                 crate::buffer_opaque!(&buffer => PacketMetadata).words,
                 [0; 5]
@@ -212,8 +209,8 @@ pub(super) mod tests {
                 [0xfedc_ba98_7654_3210; 7]
             );
         }
-        buffers.drop_index_owned_with_trace(copied, |_| {});
-        buffers.drop_index_owned_with_trace(recycled, |_| {});
+        buffers.free_buffers(1, &[copied], true, |_| {});
+        buffers.free_buffers(1, &[recycled], true, |_| {});
         Ok(())
     }
 }

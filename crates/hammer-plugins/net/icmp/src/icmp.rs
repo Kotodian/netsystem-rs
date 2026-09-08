@@ -831,17 +831,11 @@ mod tests {
                 ]);
                 packet[42..44].copy_from_slice(&checksum.to_be_bytes());
             }
-            let mut frame = runtime
-                .buffers()
-                .get_next_frame(input, runtime.nodes().frame_args_size(input)?)?;
-            let index = runtime
-                .buffers()
-                .alloc_index_with_bytes(&packet[..packet_len])?;
-            {
-                let count = frame.len();
-                frame.set_vector_count(count + 1);
-                frame.vector_args_mut()[count] = index;
-            }
+            let mut index = u32::MAX;
+            assert_eq!(
+                runtime.buffer_add_data(&mut index, &packet[..packet_len]),
+                (&packet[..packet_len]).len()
+            );
             {
                 let mut buffer = runtime.buffer_mut(index);
                 // SAFETY: this fixture installs the same initialized service
@@ -915,8 +909,12 @@ mod tests {
                 let network = hammer_core::buffer_opaque!(buffer => NetworkOpaque);
                 assert!(network.flags.contains(NetworkFlags::LOCALLY_ORIGINATED));
             }
+            let segments = runtime.chain(index).count();
+            let cached_free = runtime.cached_free_buffers();
+            runtime.buffer_free_one(index);
+            assert_eq!(runtime.cached_free_buffers(), cached_free + segments);
         }
-        assert_eq!(runtime.buffers().in_use_buffers(), 0);
+
         main.close()?;
         GlobalMain::uninstall_current();
         Ok(())

@@ -431,7 +431,7 @@ mod tests {
         let mut indices = [0];
         assert_eq!(worker.buffer_alloc(&mut indices), 1);
         let index = indices[0];
-        let cached_free = worker.buffers().cached_free_buffers();
+        let cached_free = worker.cached_free_buffers();
         let references = worker.buffer(index).ref_count();
         let next = worker.nodes.prepare_next_frame(input, 0);
         let frame = worker.nodes.next_frame_mut(next);
@@ -439,7 +439,7 @@ mod tests {
         assert!(frame.is_empty());
         worker.nodes.refork(main.snapshot());
         assert_eq!(worker.buffer(index).ref_count(), references);
-        assert_eq!(worker.buffers().cached_free_buffers(), cached_free);
+        assert_eq!(worker.cached_free_buffers(), cached_free);
         assert_eq!(worker.nodes.frames_in_use(), 0);
         worker.buffer_free(&indices);
     }

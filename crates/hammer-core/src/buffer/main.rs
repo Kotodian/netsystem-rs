@@ -1,7 +1,7 @@
 use std::sync::OnceLock;
 
 use hammer_infra::{PageSize, physmem::PhysmemMap, thread_owned::ThreadOwned};
-use spinning_top::RwSpinlock;
+use spinning_top::Spinlock;
 
 use super::{BUFFER_CACHE_LINE_SIZE, BUFFER_THREAD_CACHE_HIGH_WATER, Buffer};
 use crate::error::{DataPlaneError, DataPlaneResult};
@@ -30,7 +30,7 @@ pub(super) struct BufferPool {
     pub(super) allocation_size: usize,
     pub(super) first_buffer: usize,
     pub(super) buffer_count: usize,
-    pub(super) free: RwSpinlock<(Vec<u32>, Box<[bool]>)>,
+    pub(super) free: Spinlock<Vec<u32>>,
     pub(super) workers: Box<[ThreadOwned<BufferThreadCache>]>,
     pub(super) template: super::header::BufferTemplate,
 }
@@ -177,8 +177,6 @@ impl BufferMain {
                 *default = index;
             }
             let buffer_count = indices.len();
-            let allocated =
-                vec![false; mapping.size().div_ceil(allocation_size)].into_boxed_slice();
             main.pools.push(BufferPool {
                 mapping,
                 index,
@@ -186,7 +184,7 @@ impl BufferMain {
                 allocation_size,
                 first_buffer,
                 buffer_count,
-                free: RwSpinlock::new((indices, allocated)),
+                free: Spinlock::new(indices),
                 workers: (0..thread_count).map(|_| ThreadOwned::new()).collect(),
                 template,
             });
