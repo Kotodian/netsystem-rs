@@ -2,30 +2,94 @@ use super::*;
 use hammer_infra::thread_owned::ThreadOwnedError;
 
 impl BufferMain {
+    /// Exclusively borrow the existing Pool-owned caches on their Worker thread.
+    /// The guards retain the borrow until the runtime ends; refork keeps them.
+    pub fn borrow_worker_caches(&self, thread_index: u32) -> Box<[RefMut<'_, BufferThreadCache>]> {
+        self.pools
+            .iter()
+            .map(|pool| {
+                pool.bind_worker(thread_index);
+                pool.workers[thread_index as usize]
+                    .borrow_mut()
+                    .expect("one runtime borrows this Worker's Buffer cache")
+            })
+            .collect()
+    }
+
+    pub(super) fn validate_caches(&self, caches: &[RefMut<'_, BufferThreadCache>]) {
+        assert_eq!(
+            caches.len(),
+            self.pools.len(),
+            "Worker borrows every Buffer Pool cache"
+        );
+        let thread_index = caches[0].thread_index;
+        for (pool, cache) in self.pools.iter().zip(caches) {
+            assert_eq!(
+                cache.pool_index, pool.index,
+                "cache belongs to its Buffer Pool"
+            );
+            assert_eq!(
+                cache.thread_index, thread_index,
+                "caches belong to one Worker"
+            );
+        }
+    }
+
     #[doc(hidden)]
-    pub fn cached_free_buffers(&self, thread_index: u32, numa_node: u32) -> usize {
-        let pool = &self.pools[usize::from(self.default_pool(numa_node))];
-        pool.bind_worker(thread_index);
-        pool.workers[thread_index as usize]
-            .borrow_mut()
-            .expect("Buffer cache belongs to this Worker")
-            .len
+    pub fn cached_free_buffers(
+        &self,
+        caches: &[RefMut<'_, BufferThreadCache>],
+        numa_node: u32,
+    ) -> usize {
+        self.validate_caches(caches);
+        caches[usize::from(self.default_pool(numa_node))].len
+    }
+
+    /// Borrow a live Buffer for no longer than the Worker's cache borrow.
+    #[inline]
+    pub fn buffer<'a>(
+        &'a self,
+        caches: &'a [RefMut<'_, BufferThreadCache>],
+        index: u32,
+    ) -> &'a Buffer {
+        self.validate_caches(caches);
+        // SAFETY: the complete Worker cache set is borrowed throughout access;
+        // all mutation, release and ownership transfer require its exclusive borrow.
+        unsafe { self.buffer_unchecked(index) }
+    }
+
+    /// Borrow an exclusive segment; shared clone tails are rejected first.
+    #[inline]
+    pub fn buffer_mut<'a>(
+        &'a self,
+        caches: &'a mut [RefMut<'_, BufferThreadCache>],
+        index: u32,
+    ) -> &'a mut Buffer {
+        self.validate_caches(caches);
+        // SAFETY: the exclusive cache-set borrow excludes overlapping packet
+        // accesses through this Worker; the private boundary checks shared tails.
+        unsafe { self.buffer_mut_unchecked(index) }
     }
 
     /// Copy one segment and both opaque regions, without chain or trace ownership.
     #[doc(hidden)]
-    pub fn copy_no_chain(&self, thread_index: u32, source: u32) -> Option<u32> {
+    pub fn copy_no_chain(
+        &self,
+        caches: &mut [RefMut<'_, BufferThreadCache>],
+        source: u32,
+    ) -> Option<u32> {
+        self.validate_caches(caches);
         let pool = self.pool(source);
         let mut indices = [0];
-        if pool.alloc_indices(thread_index, &mut indices) == 0 {
+        if pool.alloc_indices(&mut caches[usize::from(pool.index)], &mut indices) == 0 {
             return None;
         }
         let destination = indices[0];
         // SAFETY: allocation owns a distinct destination with the source Pool's
         // layout; the source remains borrowed until its bytes and metadata copy.
         unsafe {
-            let source = self.buffer(source);
-            let buffer = self.buffer_mut(destination);
+            let source = self.buffer_unchecked(source);
+            let buffer = self.buffer_mut_unchecked(destination);
             buffer.set_current_window(
                 isize::from(source.current_data_offset()),
                 source.current_len(),
@@ -39,44 +103,25 @@ impl BufferMain {
 }
 
 impl BufferMain {
-    /// Runtime implementation boundary for a live, Worker-owned Buffer.
-    ///
-    /// Packet Nodes use `DataPlaneMain::buffer`; this entry point exists only
-    /// because Buffer storage and the Worker runtime live in different crates.
-    ///
-    /// # Safety
-    /// The caller must retain a readable ownership obligation for `index`
-    /// throughout the returned borrow. No owner may mutate or release this
-    /// segment until the borrow ends. The runtime must bound the reference by
-    /// its own Worker borrow, not by the process lifetime of Buffer Main.
-    #[doc(hidden)]
+    // Private Index/address boundary. Public operations retain the complete
+    // Worker cache borrow and graph release obligation before entering here.
     #[inline]
-    pub unsafe fn buffer(&self, index: u32) -> &Buffer {
+    pub(super) unsafe fn buffer_unchecked(&self, index: u32) -> &Buffer {
         let pool = self.pool(index);
-        // SAFETY: the caller retains the readable slot obligation; Pool
-        // validation checks mapping bounds and slot alignment.
+        // SAFETY: caller retains the live readable segment; Pool validates its slot.
         unsafe { pool.buffer(index) }
     }
 
-    /// Runtime implementation boundary for an exclusively owned Buffer.
-    ///
-    /// # Safety
-    /// The caller must exclusively own `index` and retain that obligation for
-    /// the complete returned borrow, excluding all other Buffer references,
-    /// release, clone attachment and Worker Handoff. The runtime must bound the
-    /// reference by its exclusive Worker borrow. A shared tail is immutable.
-    #[doc(hidden)]
     #[inline]
-    pub unsafe fn buffer_mut(&self, index: u32) -> &mut Buffer {
+    pub(super) unsafe fn buffer_mut_unchecked(&self, index: u32) -> &mut Buffer {
         let pool = self.pool(index);
-        // SAFETY: the caller retains a live obligation. Inspect shared state
-        // before creating any mutable reference to a possibly shared segment.
+        // SAFETY: inspect the live shared segment before constructing &mut Buffer.
         assert_eq!(
             unsafe { pool.buffer(index) }.ref_count(),
             1,
             "shared Buffer tails are immutable"
         );
-        // SAFETY: exclusivity was checked before constructing the reference.
+        // SAFETY: caller retains the exclusive segment and no overlapping borrows.
         unsafe { pool.buffer_mut(index) }
     }
 
@@ -122,6 +167,8 @@ impl BufferPool {
             Err(ThreadOwnedError::NotInstalled) => {
                 worker
                     .install(BufferThreadCache {
+                        pool_index: self.index,
+                        thread_index,
                         indices: [0; BUFFER_THREAD_CACHE_HIGH_WATER],
                         len: 0,
                     })
@@ -184,11 +231,15 @@ impl BufferPool {
         unsafe { &mut *self.mapping.base().add(offset).cast::<Buffer>() }
     }
 
-    pub(super) fn alloc_indices(&self, thread_index: u32, indices: &mut [u32]) -> usize {
-        self.bind_worker(thread_index);
-        let mut cache = self.workers[thread_index as usize]
-            .borrow_mut()
-            .expect("Buffer cache belongs to this Worker");
+    pub(super) fn alloc_indices(
+        &self,
+        cache: &mut BufferThreadCache,
+        indices: &mut [u32],
+    ) -> usize {
+        assert_eq!(
+            cache.pool_index, self.index,
+            "allocation uses this Pool's cache"
+        );
         for (allocated, destination) in indices.iter_mut().enumerate() {
             if cache.len == 0 {
                 let mut free = self.free.lock();
@@ -221,20 +272,18 @@ impl BufferMain {
     #[doc(hidden)]
     pub fn free_buffers(
         &self,
-        thread_index: u32,
+        caches: &mut [RefMut<'_, BufferThreadCache>],
         indices: &[u32],
         follow_next: bool,
         mut release_trace: impl FnMut(u32),
     ) {
+        self.validate_caches(caches);
         for &index in indices {
             let mut current = Some(index);
             while let Some(index) = current {
                 let pool = self.pool(index);
-                pool.bind_worker(thread_index);
                 let trace = {
-                    let mut cache = pool.workers[thread_index as usize]
-                        .borrow_mut()
-                        .expect("Buffer cache belongs to this Worker");
+                    let cache = &mut caches[usize::from(pool.index)];
                     // SAFETY: the caller retains this live segment until the
                     // reference decrement transfers its last release obligation.
                     let buffer = unsafe { pool.buffer(index) };
@@ -276,7 +325,7 @@ impl BufferMain {
                     }
                 };
                 // Trace finalization may call into runtime state; never invoke it
-                // while holding the Pool lock or borrowing its Worker cache.
+                // while holding the Pool lock or a mutable reference to a cache entry.
                 if let Some(trace) = trace {
                     release_trace(trace);
                 }

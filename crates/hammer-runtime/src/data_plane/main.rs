@@ -39,6 +39,9 @@ pub use config::DataPlaneBufferConfig;
 pub struct DataPlaneMain {
     random: Rc<RefCell<SmallRng>>,
     thread_index: u32,
+    buffer_caches: std::cell::OnceCell<
+        Box<[std::cell::RefMut<'static, hammer_core::buffer::BufferThreadCache>]>,
+    >,
     pub(crate) nodes: NodeMain,
     current_node: Rc<Cell<Option<NodeId>>>,
     handoff: Option<DataPlaneHandoffWorker>,

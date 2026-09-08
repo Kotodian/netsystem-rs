@@ -40,7 +40,11 @@ pub(super) struct BufferPool {
 
 #[repr(align(64))]
 #[derive(Debug)]
-pub(super) struct BufferThreadCache {
+/// The actual per-Pool Worker cache, borrowed exclusively for a runtime lifetime.
+/// Its fields remain private; packet operations borrow the complete cache set.
+pub struct BufferThreadCache {
+    pub(super) pool_index: u8,
+    pub(super) thread_index: u32,
     pub(super) indices: [u32; BUFFER_THREAD_CACHE_HIGH_WATER],
     pub(super) len: usize,
 }

@@ -406,11 +406,24 @@ mod tests {
         hammer_infra::main_heap::init_default().unwrap();
         BufferMain::new(2048, 16, &[0, 1], 1, PageSize::Default)?;
         let buffers = BufferMain::global();
+        let mut caches = buffers.borrow_worker_caches(1);
         let mut index = u32::MAX;
-        assert_eq!(buffers.add_data(1, 0, &mut index, &[1, 2, 3, 4]), 4);
+        assert_eq!(
+            buffers.add_data(&mut caches, 0, &mut index, &[1, 2, 3, 4]),
+            4
+        );
+        let packet = buffers.buffer(&caches, index);
+        assert!(
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                buffers.borrow_worker_caches(1);
+            }))
+            .is_err()
+        );
+        assert_eq!(packet.current(), &[1, 2, 3, 4]);
+
         {
-            // SAFETY: this test owns the allocated segment until its explicit free.
-            let buffer = unsafe { buffers.buffer_mut(index) };
+            // Ownership: this test owns the allocated segment until its explicit free.
+            let buffer = buffers.buffer_mut(&mut caches, index);
             let data_start = buffer.current().as_ptr();
 
             // vlib_test.c: reset and the four zero-length operations.
@@ -485,7 +498,8 @@ mod tests {
             assert_eq!(buffer.current_len(), length - 2);
             assert_eq!(&buffer.current()[..2], &[15, 16]);
         }
-        buffers.free_buffers(1, &[index], true, |_| {});
+        buffers.free_buffers(&mut caches, &[index], true, |_| {});
+        drop(caches);
         crate::buffer::opaque::tests::metadata_copy_and_pool_recycle_preserve_secondary_storage(
             buffers,
         )?;

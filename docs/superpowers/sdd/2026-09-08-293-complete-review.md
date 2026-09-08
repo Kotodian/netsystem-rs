@@ -38,16 +38,20 @@ transfer needs an exclusive runtime boundary and caller migration.
 
 ## Specification findings
 
-### B1 — P1: Next/Pending dispatch ignores the retained no-free policy
+### B1 — withdrawn scope expansion: node-owned Frame disposal
 
-`node/frame.rs:137` unconditionally marks overflow Frames FREE_AFTER_DISPATCH.
-`node.rs:2013` and `:2053` restore or recycle Frames without considering the
-NO_FREE_AFTER_DISPATCH policy retained when topology is cloned. VPP
-`src/vlib/main.c::vlib_get_next_frame_internal` checks this policy before marking
-old Frames, and `dispatch_pending_node` checks it before restoring/recycling.
-Task 7's dispatch semantics and task 8's retained policy are not implemented by
-copying the bit alone. Do not substitute mem::forget or a leaking placeholder for
-an actual retained Frame lifecycle.
+VPP src/vlib/main.c checks NO_FREE_AFTER_DISPATCH during overflow/dispatch;
+src/vlib/drop.c's punt node supplies the corresponding explicit disposal path.
+Hammer's production NodeRuntime flags are private and no production node sets
+this bit. Its sole current setting is the task-8 refork-policy test; the shipped
+PuntNode uses the ordinary terminal drop callback and dispatcher recycling.
+
+Task 8 explicitly requires preserving this bit during refork, which is covered.
+The finding incorrectly expanded that requirement into an additional node-owned
+Frame disposal API and retained storage design. Those additions are withdrawn,
+not reported as implemented. This scope correction does not claim support for
+VPP's os_punt_frame ownership-transfer callback; no such callback is in #293's
+API inventory. Preserve the refork policy test without inventing a consumer.
 
 ### B2 — P1: ordinary fanout bypasses source runtime state propagation
 
@@ -147,39 +151,59 @@ and the affected caller migrations are implemented.
   counter. This exercises the barrier/refork boundary without daemon execution,
   subprocesses, mpsc or file fixtures. It is not a whole-main-loop integration
   test. Runtime all-target offline compilation passed; no tests were run.
-  S1 and B1 remain open.
+  S1 was still open at this correction point; B1 is corrected below.
 
-## Remaining contract decisions
+## Remaining implementation boundaries
 
-The remaining two findings require changing the currently enumerated owner/API
-contract, not another local signature visibility adjustment.
+### S1 Pool ownership must remain unchanged
 
-### S1 concrete owner change
+The earlier proposal to move BufferThreadCache storage into DataPlaneMain is
+withdrawn. Vendored src/vlib/buffer.h::vlib_buffer_pool_t owns its threads array,
+and ADR-0007 explicitly assigns per-Worker caches to each Pool. Neither source
+supports changing that owner to fix Rust visibility.
 
-Proposed result: DataPlaneMain directly owns the existing BufferThreadCache
-storage for each Pool. Move safe Buffer borrows, allocation and release entry
-points onto that real cache owner in core; retain private Index/address conversion
-there. BufferMain continues to own Physmem mappings, Pool templates and central
-free indices. It no longer owns each Worker's cache value. Runtime borrows its
-owned cache using &T/&mut T and returns lifetime-bound Buffer references.
-Remove the exposed unsafe BufferMain borrow methods and the safe process-global
-mutation entry points that could bypass the runtime borrow. This adds no Buffer
-owner wrapper, but changes ADR-0007's explicit Pool-owned cache location.
+The remaining Rust boundary is concrete: runtime needs direct Buffer borrows,
+but core owns the private Index/address conversion. Making a global &self
+mutable borrow safe by removing unsafe is invalid; making it pub(crate) alone
+breaks the cross-crate caller.
 
-### B1 concrete Frame surface
+Proposed amendment for approval: keep the existing Pool-owned caches and use
+ThreadOwned::borrow_mut's existing RefMut to lend those actual cache values to
+the Worker runtime. Core must bind Buffer access and all mutations/releases to
+shared/exclusive borrows of the same cache borrow set, respectively. Runtime
+keeps its existing public &self/&mut self Buffer API; no Buffer owner wrapper,
+new allocation backend, cache relocation, or retained-frame storage is proposed.
+The new core cache-borrow entry point and migrated operation signatures require
+an explicit API amendment; this proposal has not been implemented or verified.
 
-Proposed result: NodeMain retains no-free Frames for the destination Node after
-its callback returns, instead of restoring/recycling them automatically. Add
-DataPlaneMain::take_retained_frame(node) -> RuntimeResult<Option<Box<Frame>>> and
-DataPlaneMain::recycle_frame(frame: Box<Frame>) for explicit transfer/recycling.
-The existing put_frame_to_node transfers a taken Frame back into graph dispatch.
-Each retained allocation stays in its original Frame size class and holds no
-implicit Buffer release behavior. Refork preserves node-retained allocations;
-only explicit node ownership actions release them. This needs the two additional
-generic Frame APIs because &mut Frame cannot safely transfer its allocation by
-itself and existing get_frame_to_node means new empty allocation.
+### B1 rejected proposal and source correction
 
-These changes are not implemented. The first changes a required owner location;
-the second expands the approved public API inventory. User decision is needed
-before treating either as an accepted amendment. The existing implementation
-and previously committed corrections remain intact; no tests were run.
+The proposed NodeMain retained-frame collection and take_retained_frame /
+recycle_frame APIs are withdrawn. They were not implemented and are not part of
+issue #293's approved scope.
+
+Vendored VPP src/vlib/drop.c::process_drop_punt explicitly frees the punt Frame
+when os_punt_frame is absent; otherwise it passes the Frame to os_punt_frame.
+The error_punt_node registration sets FRAME_NO_FREE_AFTER_DISPATCH.
+src/vlib/main.c::dispatch_pending_node avoids restoring that node's Frame and
+asserts the no-free policy is absent before automatic FREE_AFTER_DISPATCH
+recycling. These are node-specific disposal semantics, not evidence for a
+NodeMain retained-frame queue. The B1 scope disposition above replaces the retained-frame proposal.
+
+The S1 borrowing proposal above is not approved or implemented. No tests were run.
+
+## Approved cache-borrow correction
+
+The user approved the core cache-borrow entry point and related internal
+signatures. Pool still owns BufferThreadCache. BufferMain::borrow_worker_caches
+lends existing RefMut guards to DataPlaneMain, which retains them across refork.
+All public core Buffer access/allocation/chain/free operations borrow that same
+complete cache set. Shared access returns a reference bounded by its borrow;
+mutation and release require an exclusive borrow. Index/address operations are
+private buffer_unchecked/buffer_mut_unchecked implementation details. S1 is fixed.
+
+The existing Buffer behavior tests now use the safe cache-bound surface. The
+single-segment case also checks that a second runtime cannot borrow the same
+cache while an existing packet borrow remains live. Workspace/all-target offline
+compilation passed; tests are reserved for the user-authorized remote run after
+commit and push. No second complete review was performed.

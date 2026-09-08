@@ -161,14 +161,15 @@ pub(super) mod tests {
     pub(in crate::buffer) fn metadata_copy_and_pool_recycle_preserve_secondary_storage(
         buffers: &BufferMain,
     ) -> DataPlaneResult<()> {
+        let mut caches = buffers.borrow_worker_caches(1);
         let mut index = 0;
         assert_eq!(
-            buffers.alloc_from_pool(1, core::slice::from_mut(&mut index), 0),
+            buffers.alloc_from_pool(&mut caches, core::slice::from_mut(&mut index), 0),
             1
         );
         {
-            // SAFETY: this test retains the segment and ends this borrow before freeing it.
-            let buffer = unsafe { buffers.buffer_mut(index) };
+            // Ownership: this test retains the segment and ends this borrow before freeing it.
+            let buffer = buffers.buffer_mut(&mut caches, index);
             let address = std::ptr::from_ref(&*buffer).addr();
             let primary = crate::buffer_opaque!(mut buffer => PacketMetadata);
             assert_eq!(std::ptr::from_ref(primary).addr(), address + 24);
@@ -180,10 +181,10 @@ pub(super) mod tests {
             buffer.push_uninit(2).copy_from_slice(&[11, 13]);
             buffer.set_trace_handle(7);
         }
-        let copied = buffers.copy_no_chain(1, index).unwrap();
+        let copied = buffers.copy_no_chain(&mut caches, index).unwrap();
         {
-            // SAFETY: this test retains the segment and ends this borrow before freeing it.
-            let buffer = unsafe { buffers.buffer(copied) };
+            // Ownership: this test retains the segment and ends this borrow before freeing it.
+            let buffer = buffers.buffer(&caches, copied);
             assert_eq!(buffer.current_data_offset(), -2);
             assert_eq!(buffer.current(), &[11, 13, 17, 19, 23, 29]);
             assert_eq!(buffer.trace_handle(), None);
@@ -197,23 +198,23 @@ pub(super) mod tests {
             );
         }
         {
-            // SAFETY: the source remains owned and is distinct from the copy.
-            let buffer = unsafe { buffers.buffer_mut(index) };
+            // Ownership: the source remains owned and is distinct from the copy.
+            let buffer = buffers.buffer_mut(&mut caches, index);
             assert_eq!(buffer.trace_handle(), Some(7));
             buffer.current_mut()[0] = 31;
         }
-        // SAFETY: both indices remain allocated; no mutation overlaps this borrow.
-        assert_eq!(unsafe { buffers.buffer(copied) }.current()[0], 11);
-        buffers.free_buffers(1, &[index], true, |_| {});
+        // Ownership: both indices remain allocated; no mutation overlaps this borrow.
+        assert_eq!(buffers.buffer(&caches, copied).current()[0], 11);
+        buffers.free_buffers(&mut caches, &[index], true, |_| {});
         let mut recycled = 0;
         assert_eq!(
-            buffers.alloc_from_pool(1, core::slice::from_mut(&mut recycled), 0),
+            buffers.alloc_from_pool(&mut caches, core::slice::from_mut(&mut recycled), 0),
             1
         );
         assert_eq!(recycled, index);
         {
-            // SAFETY: this test retains the segment and ends this borrow before freeing it.
-            let buffer = unsafe { buffers.buffer(recycled) };
+            // Ownership: this test retains the segment and ends this borrow before freeing it.
+            let buffer = buffers.buffer(&caches, recycled);
             assert_eq!(
                 crate::buffer_opaque!(&buffer => PacketMetadata).words,
                 [0; 5]
@@ -223,8 +224,8 @@ pub(super) mod tests {
                 [0xfedc_ba98_7654_3210; 7]
             );
         }
-        buffers.free_buffers(1, &[copied], true, |_| {});
-        buffers.free_buffers(1, &[recycled], true, |_| {});
+        buffers.free_buffers(&mut caches, &[copied], true, |_| {});
+        buffers.free_buffers(&mut caches, &[recycled], true, |_| {});
         Ok(())
     }
 }

@@ -21,11 +21,15 @@ fn independent_segment_survives_original_chain_release() -> DataPlaneResult<()> 
     hammer_infra::main_heap::init_default().unwrap();
     BufferMain::new(16, 3, &[0], 1, hammer_infra::PageSize::Default)?;
     let buffers = BufferMain::global();
+    let mut caches = buffers.borrow_worker_caches(1);
     let mut source = u32::MAX;
-    assert_eq!(buffers.add_data(1, 0, &mut source, &[0x31; 32]), 32);
+    assert_eq!(
+        buffers.add_data(&mut caches, 0, &mut source, &[0x31; 32]),
+        32
+    );
     {
-        // SAFETY: the fixture owns this segment until the explicit free below.
-        let buffer = unsafe { buffers.buffer_mut(source) };
+        // Ownership: the fixture owns this segment until the explicit free below.
+        let buffer = buffers.buffer_mut(&mut caches, source);
         buffer.advance(4);
         buffer.push_uninit(8).copy_from_slice(&[0x42; 8]);
         buffer.set_trace_handle(29);
@@ -33,16 +37,21 @@ fn independent_segment_survives_original_chain_release() -> DataPlaneResult<()> 
         hammer_core::buffer_opaque!(mut buffer => PacketMetadata).identity = 17;
         hammer_core::buffer_opaque!(mut buffer => PacketSecondaryMetadata).identity = 23;
     }
-    let response = buffers.copy_no_chain(1, source).unwrap();
+    let response = buffers.copy_no_chain(&mut caches, source).unwrap();
     assert_ne!(response, source);
-    // SAFETY: both allocations are retained and no mutable borrows exist.
-    unsafe {
-        assert!(buffers.buffer(source).next_buffer_slot().is_some());
-        assert!(buffers.buffer(response).next_buffer_slot().is_none());
+    // Ownership: both allocations are retained and no mutable borrows exist.
+    {
+        assert!(buffers.buffer(&caches, source).next_buffer_slot().is_some());
+        assert!(
+            buffers
+                .buffer(&caches, response)
+                .next_buffer_slot()
+                .is_none()
+        );
     }
     {
-        // SAFETY: the fixture owns this segment until the explicit free below.
-        let buffer = unsafe { buffers.buffer_mut(response) };
+        // Ownership: the fixture owns this segment until the explicit free below.
+        let buffer = buffers.buffer_mut(&mut caches, response);
         assert_eq!(buffer.current_data_offset(), -4);
         assert_eq!(buffer.current_len(), 20);
         assert_eq!(&buffer.current()[..8], &[0x42; 8]);
@@ -66,29 +75,29 @@ fn independent_segment_survives_original_chain_release() -> DataPlaneResult<()> 
     let mut retained = Vec::new();
     loop {
         let mut indices = [0; 32];
-        let count = buffers.alloc_from_pool(1, &mut indices, 0);
+        let count = buffers.alloc_from_pool(&mut caches, &mut indices, 0);
         retained.extend_from_slice(&indices[..count]);
         if count == 0 {
             break;
         }
     }
-    assert!(buffers.copy_no_chain(1, source).is_none());
-    buffers.free_buffers(1, &retained, true, |_| {});
-    let cached_free = buffers.cached_free_buffers(1, 0);
+    assert!(buffers.copy_no_chain(&mut caches, source).is_none());
+    buffers.free_buffers(&mut caches, &retained, true, |_| {});
+    let cached_free = buffers.cached_free_buffers(&caches, 0);
     {
-        // SAFETY: the fixture owns this segment until the explicit free below.
-        let buffer = unsafe { buffers.buffer_mut(source) };
+        // Ownership: the fixture owns this segment until the explicit free below.
+        let buffer = buffers.buffer_mut(&mut caches, source);
         assert_eq!(buffer.current()[0], 0x42);
         assert_eq!(buffer.current_len(), 20);
         assert_eq!(buffer.total_len_not_including_first(), 16);
         assert_eq!(buffer.node_error_index(), NodeErrorIndex::new(31));
         assert_eq!(buffer.take_trace_handle(), Some(29));
     }
-    BufferMain::global().free_buffers(1, &[source], true, |_| {});
-    assert_eq!(buffers.cached_free_buffers(1, 0), cached_free + 2);
-    // SAFETY: releasing the source chain did not release the independent copy.
-    assert_eq!(unsafe { buffers.buffer(response) }.current()[0], 0x55);
-    BufferMain::global().free_buffers(1, &[response], true, |_| {});
-    assert_eq!(buffers.cached_free_buffers(1, 0), cached_free + 3);
+    BufferMain::global().free_buffers(&mut caches, &[source], true, |_| {});
+    assert_eq!(buffers.cached_free_buffers(&caches, 0), cached_free + 2);
+    // Ownership: releasing the source chain did not release the independent copy.
+    assert_eq!(buffers.buffer(&caches, response).current()[0], 0x55);
+    BufferMain::global().free_buffers(&mut caches, &[response], true, |_| {});
+    assert_eq!(buffers.cached_free_buffers(&caches, 0), cached_free + 3);
     Ok(())
 }
