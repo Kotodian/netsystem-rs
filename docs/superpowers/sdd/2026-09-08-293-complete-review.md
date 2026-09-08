@@ -148,3 +148,38 @@ and the affected caller migrations are implemented.
   subprocesses, mpsc or file fixtures. It is not a whole-main-loop integration
   test. Runtime all-target offline compilation passed; no tests were run.
   S1 and B1 remain open.
+
+## Remaining contract decisions
+
+The remaining two findings require changing the currently enumerated owner/API
+contract, not another local signature visibility adjustment.
+
+### S1 concrete owner change
+
+Proposed result: DataPlaneMain directly owns the existing BufferThreadCache
+storage for each Pool. Move safe Buffer borrows, allocation and release entry
+points onto that real cache owner in core; retain private Index/address conversion
+there. BufferMain continues to own Physmem mappings, Pool templates and central
+free indices. It no longer owns each Worker's cache value. Runtime borrows its
+owned cache using &T/&mut T and returns lifetime-bound Buffer references.
+Remove the exposed unsafe BufferMain borrow methods and the safe process-global
+mutation entry points that could bypass the runtime borrow. This adds no Buffer
+owner wrapper, but changes ADR-0007's explicit Pool-owned cache location.
+
+### B1 concrete Frame surface
+
+Proposed result: NodeMain retains no-free Frames for the destination Node after
+its callback returns, instead of restoring/recycling them automatically. Add
+DataPlaneMain::take_retained_frame(node) -> RuntimeResult<Option<Box<Frame>>> and
+DataPlaneMain::recycle_frame(frame: Box<Frame>) for explicit transfer/recycling.
+The existing put_frame_to_node transfers a taken Frame back into graph dispatch.
+Each retained allocation stays in its original Frame size class and holds no
+implicit Buffer release behavior. Refork preserves node-retained allocations;
+only explicit node ownership actions release them. This needs the two additional
+generic Frame APIs because &mut Frame cannot safely transfer its allocation by
+itself and existing get_frame_to_node means new empty allocation.
+
+These changes are not implemented. The first changes a required owner location;
+the second expands the approved public API inventory. User decision is needed
+before treating either as an accepted amendment. The existing implementation
+and previously committed corrections remain intact; no tests were run.
