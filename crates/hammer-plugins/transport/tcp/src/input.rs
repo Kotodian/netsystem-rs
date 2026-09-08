@@ -1,5 +1,4 @@
 use std::cell::RefCell;
-use std::mem::transmute;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::sync::Arc;
 
@@ -290,11 +289,16 @@ fn next_slot_for_index_with_runtime(
         {
             let buffer = runtime.buffer_mut(index);
             buffer.clear_node_error();
-            write_session_route_opaque(buffer.opaque2_mut(), session_id, owner, session_next);
+            write_session_route_opaque(
+                hammer_core::buffer_opaque!(mut buffer => crate::TcpSecondaryOpaque).route_mut(),
+                session_id,
+                owner,
+                session_next,
+            );
             if let Some(current_worker) = handoff_worker
                 && owner != current_worker
             {
-                unsafe { transmute::<_, &mut NetworkOpaque>(buffer.opaque_mut()) }
+                hammer_core::buffer_opaque!(mut buffer => NetworkOpaque)
                     .set_handoff_source_worker(Some(current_worker.slot() as u16));
             }
         }
@@ -340,7 +344,8 @@ fn next_slot_for_index_with_runtime(
         {
             let buffer = runtime.buffer_mut(index);
             buffer.clear_node_error();
-            buffer.opaque2_mut().clear();
+            *hammer_core::buffer_opaque!(mut buffer => crate::TcpSecondaryOpaque).route_mut() =
+                Default::default();
         }
         return resolve_success_next_with_trace(
             runtime,
@@ -384,7 +389,8 @@ fn next_slot_for_index_with_runtime(
     {
         let buffer = runtime.buffer_mut(index);
         buffer.clear_node_error();
-        buffer.opaque2_mut().clear();
+        *hammer_core::buffer_opaque!(mut buffer => crate::TcpSecondaryOpaque).route_mut() =
+            Default::default();
     }
     resolve_success_next_with_trace(
         runtime,
@@ -513,9 +519,10 @@ fn tcp_input_buffer(
         TcpInputError,
     >,
 > {
-    tcp_input_parts(buffer.current(), unsafe {
-        transmute::<_, &NetworkOpaque>(buffer.opaque())
-    })
+    tcp_input_parts(
+        buffer.current(),
+        hammer_core::buffer_opaque!(buffer => NetworkOpaque),
+    )
 }
 
 #[inline(always)]
@@ -689,7 +696,7 @@ fn prefetch_lookup_for_buffer(
     snapshot: &TcpLookupSnapshot,
     buffer: &hammer_core::data_plane::Buffer,
 ) {
-    let network = unsafe { transmute::<_, &NetworkOpaque>(buffer.opaque()) };
+    let network = hammer_core::buffer_opaque!(buffer => NetworkOpaque);
     let cursor = network.packet_cursor();
     if !valid_tcp_cursor(cursor) {
         return;
@@ -756,7 +763,7 @@ fn prefetch_session_route_for_buffer(
     runtime: &DataPlaneMain,
     buffer: &hammer_core::data_plane::Buffer,
 ) {
-    let network = unsafe { transmute::<_, &NetworkOpaque>(buffer.opaque()) };
+    let network = hammer_core::buffer_opaque!(buffer => NetworkOpaque);
     let cursor = network.packet_cursor();
     if !valid_tcp_cursor(cursor) {
         return;
@@ -794,7 +801,7 @@ fn prefetch_session_route_for_buffer(
 
 #[inline(always)]
 fn tcp_source_port(buffer: &hammer_core::data_plane::Buffer) -> u16 {
-    let transport = unsafe { transmute::<_, &NetworkOpaque>(buffer.opaque()) }
+    let transport = hammer_core::buffer_opaque!(buffer => NetworkOpaque)
         .packet_cursor()
         .transport_header_offset();
     let current = buffer.current();
@@ -806,7 +813,7 @@ fn tcp_source_port(buffer: &hammer_core::data_plane::Buffer) -> u16 {
 
 #[inline(always)]
 fn tcp_destination_port(buffer: &hammer_core::data_plane::Buffer) -> u16 {
-    let transport = unsafe { transmute::<_, &NetworkOpaque>(buffer.opaque()) }
+    let transport = hammer_core::buffer_opaque!(buffer => NetworkOpaque)
         .packet_cursor()
         .transport_header_offset();
     let current = buffer.current();

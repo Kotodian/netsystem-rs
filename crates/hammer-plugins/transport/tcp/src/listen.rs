@@ -166,7 +166,7 @@ fn tcp_listen_index(
     {
         let buffer = runtime.buffer_mut(index);
         write_session_route_opaque(
-            buffer.opaque2_mut(),
+            hammer_core::buffer_opaque!(mut buffer => crate::TcpSecondaryOpaque).route_mut(),
             session_id,
             listener.owner_worker,
             TcpInputNext::Established,

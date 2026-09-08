@@ -58,7 +58,7 @@ pub struct Buffer {
     pub(super) second_half: hammer_infra::align::CacheLineAlignMark,
     trace_handle: u32,
     total_length_not_including_first: u32,
-    opaque2: SecondaryOpaque,
+    pub(super) opaque2: SecondaryOpaque,
     #[cfg(hammer_buffer_trace_trajectory)]
     trajectory: hammer_infra::align::CacheLineAlignMark,
     #[cfg(hammer_buffer_trace_trajectory)]
@@ -85,26 +85,6 @@ const _: () = assert!(mem::offset_of!(Buffer, trajectory_nb) == 128);
 const _: () = assert!(mem::offset_of!(Buffer, trajectory_trace) == 130);
 
 impl Buffer {
-    #[inline]
-    pub fn opaque(&self) -> &PrimaryOpaque {
-        &self.cacheline0.opaque
-    }
-
-    #[inline]
-    pub fn opaque_mut(&mut self) -> &mut PrimaryOpaque {
-        &mut self.cacheline0.opaque
-    }
-
-    #[inline]
-    pub fn opaque2(&self) -> &SecondaryOpaque {
-        &self.opaque2
-    }
-
-    #[inline]
-    pub fn opaque2_mut(&mut self) -> &mut SecondaryOpaque {
-        &mut self.opaque2
-    }
-
     #[inline]
     pub fn current_config_index(&self) -> u32 {
         self.cacheline0.current_config_or_punt
@@ -486,6 +466,9 @@ mod tests {
             assert_eq!(&buffer.current()[..2], &[15, 16]);
         }
         buffers.drop_index_owned_with_trace(index, |_| {});
+        crate::buffer::opaque::tests::metadata_copy_and_pool_recycle_preserve_secondary_storage(
+            &buffers,
+        )?;
         Ok(())
     }
 }

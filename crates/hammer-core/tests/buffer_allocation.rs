@@ -2,6 +2,18 @@ use hammer_core::buffer::{BufferMain, BufferPoolArena, DataPlaneBuffers};
 use hammer_core::error::{BufferInvariant, DataPlaneError, DataPlaneResult};
 use hammer_core::graph::{NodeErrorIndex, NodeId};
 
+#[hammer_component_macros::buffer_opaque(primary)]
+#[derive(Clone, Copy)]
+struct PacketMetadata {
+    identity: u64,
+}
+
+#[hammer_component_macros::buffer_opaque(secondary)]
+#[derive(Clone, Copy)]
+struct PacketSecondaryMetadata {
+    identity: u64,
+}
+
 // Derived from buffer_funcs.h's first-segment allocation used by icmp4.c and
 // icmp6.c. This verifies storage semantics, not ICMP graph forwarding.
 #[test]
@@ -19,12 +31,8 @@ fn independent_segment_survives_original_chain_release() -> DataPlaneResult<()> 
         buffer.push_uninit(8).copy_from_slice(&[0x42; 8]);
         buffer.set_trace_handle(29);
         buffer.set_node_error_index(NodeErrorIndex::new(31).unwrap());
-        // SAFETY: both opaque unions are initialized, u64-aligned storage;
-        // write only their first word while holding the exclusive buffer borrow.
-        unsafe {
-            *std::ptr::from_mut(buffer.opaque_mut()).cast::<u64>() = 17;
-            *std::ptr::from_mut(buffer.opaque2_mut()).cast::<u64>() = 23;
-        }
+        hammer_core::buffer_opaque!(mut &mut buffer => PacketMetadata).identity = 17;
+        hammer_core::buffer_opaque!(mut &mut buffer => PacketSecondaryMetadata).identity = 23;
     }
     let mut responses = buffers.get_next_frame(NodeId::new(1))?;
     let response = buffers.alloc_index_from(source)?;
@@ -42,11 +50,14 @@ fn independent_segment_survives_original_chain_release() -> DataPlaneResult<()> 
         assert_eq!(buffer.ref_count(), 1);
         assert_eq!(buffer.trace_handle(), None);
         assert_eq!(buffer.node_error_index(), None);
-        // SAFETY: the source initialized these aligned words before allocation.
-        unsafe {
-            assert_eq!(*std::ptr::from_ref(buffer.opaque()).cast::<u64>(), 17);
-            assert_eq!(*std::ptr::from_ref(buffer.opaque2()).cast::<u64>(), 23);
-        }
+        assert_eq!(
+            hammer_core::buffer_opaque!(&buffer => PacketMetadata).identity,
+            17
+        );
+        assert_eq!(
+            hammer_core::buffer_opaque!(&buffer => PacketSecondaryMetadata).identity,
+            23
+        );
         buffer.current_mut()[0] = 0x55;
     }
     // Pool capacity follows Physmem page carving rather than the requested

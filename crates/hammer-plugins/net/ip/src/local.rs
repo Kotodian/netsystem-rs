@@ -1,5 +1,4 @@
 use std::hash::Hasher;
-use std::mem::transmute;
 use std::net::IpAddr;
 
 use crate::protocol::ip::{Ipv4Header, Ipv6Header};
@@ -446,15 +445,15 @@ fn process_index(
 ) -> RuntimeResult<u16> {
     let buffer = runtime.buffer(index);
     let current = buffer.current();
-    let mut network = *unsafe { transmute::<_, &NetworkOpaque>(buffer.opaque()) };
+    let mut network = *hammer_core::buffer_opaque!(buffer => NetworkOpaque);
     if stage.is_head_of_feature_arc() {
         let mut receive_interface = network.sw_if_index[0];
         if matches!(stage, LocalStage::Receive) {
             // SAFETY: lookup and its load-balance siblings initialize this
             // identity before dispatching the receive DPO node.
-            let forwarding =
-                unsafe { &*(buffer.opaque2() as *const _ as *const crate::lookup::LookupMetadata) }
-                    .forwarding;
+            let forwarding = hammer_core::buffer_opaque!(buffer => crate::IpSecondaryOpaque)
+                .lookup
+                .forwarding;
             let interface = NetMain::global()?
                 .interface_main()
                 .receive_dpo_interface(forwarding)
@@ -643,7 +642,7 @@ fn process_index(
         checksum_correct = l4_checksum(runtime, index, &parsed)? == 0;
         let buffer = runtime.buffer_mut(index);
         // SAFETY: the frame owns the initialized network overlay exclusively.
-        let network = unsafe { &mut *(buffer.opaque_mut() as *mut _ as *mut NetworkOpaque) };
+        let network = hammer_core::buffer_opaque!(mut buffer => NetworkOpaque);
         network.flags.insert(NetworkFlags::L4_CHECKSUM_COMPUTED);
         network
             .flags
@@ -736,7 +735,7 @@ fn process_index(
         // Preserve the physical RX identity; features use the receive DPO's
         // effective interface, including when the packet arrived elsewhere.
         let interface_index = network.ip().rx_sw_if_index;
-        unsafe { &mut *(buffer.opaque_mut() as *mut _ as *mut NetworkOpaque) }
+        hammer_core::buffer_opaque!(mut buffer => NetworkOpaque)
             .ip_mut()
             .rx_sw_if_index = interface_index;
         let resolved = net.interface_main().start_feature_arc(
@@ -822,7 +821,7 @@ fn refresh_basic_metadata(
 ) -> RuntimeResult<()> {
     let buffer = runtime.buffer_mut(index);
     let transport_header_len = transport_header_len.unwrap_or_default();
-    unsafe { transmute::<_, &mut NetworkOpaque>(buffer.opaque_mut()) }.set_packet_cursor(
+    hammer_core::buffer_opaque!(mut buffer => NetworkOpaque).set_packet_cursor(
         BufferPacketCursor::new()
             .with_packet_len(parsed.packet_len)
             .with_network_header(parsed.network_header_offset, parsed.network_header_len)
@@ -1029,21 +1028,30 @@ pub(crate) mod tests {
                             .with_transport_header(header_len, 8)
                             .with_transport_payload_offset(header_len + 8),
                     );
-                    // SAFETY: the fixture initializes both packet overlays.
-                    unsafe {
-                        (buffer.opaque_mut() as *mut _ as *mut NetworkOpaque).write(network);
-                        let metadata =
-                            buffer.opaque2_mut() as *mut _ as *mut crate::lookup::LookupMetadata;
-                        metadata.write(Default::default());
-                        (*metadata).forwarding = dpo;
-                    }
+                    *hammer_core::buffer_opaque!(mut buffer => NetworkOpaque) = network;
+                    let metadata =
+                        &mut hammer_core::buffer_opaque!(mut buffer => crate::IpSecondaryOpaque)
+                            .lookup;
+                    *metadata = Default::default();
+                    metadata.forwarding = dpo;
+                    // vnet/buffer.h keeps IP lookup and ICMP request facts in
+                    // their owner's layout; advancing local processing retains
+                    // the error producer's independent secondary word.
+                    crate::protocol::icmp::IcmpErrorMetadata::ipv4_time_exceeded()
+                        .write(hammer_core::buffer_opaque!(mut buffer => crate::IpSecondaryOpaque));
                 }
-                let next = runtime.with_current_node(receive, || {
+                let next = runtime.with_current_node(receive, |runtime| {
                     process_index(runtime, index, LocalStage::Receive, version)
                 })?;
                 let buffer = runtime.buffer(index);
-                let network = unsafe { &*(buffer.opaque() as *const _ as *const NetworkOpaque) };
+                let network = hammer_core::buffer_opaque!(buffer => NetworkOpaque);
                 assert_eq!(network.sw_if_index[0], raw_rx);
+                assert_eq!(
+                    crate::protocol::icmp::IcmpErrorMetadata::read(
+                        hammer_core::buffer_opaque!(buffer => crate::IpSecondaryOpaque),
+                    ),
+                    Some(crate::protocol::icmp::IcmpErrorMetadata::ipv4_time_exceeded()),
+                );
                 if accepted {
                     assert_eq!(network.ip().rx_sw_if_index, effective_rx);
                     assert_eq!(runtime.nodes().node_next_slot(receive, next as usize)?, end);
@@ -1076,7 +1084,7 @@ pub(crate) mod tests {
             )
             .unwrap();
         });
-        let runtime = DataPlaneMain::new(DataPlaneBufferConfig {
+        let mut runtime = DataPlaneMain::new(DataPlaneBufferConfig {
             numa_nodes: &[1],
             active_numa_node: 1,
             thread_index: 1,

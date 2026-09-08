@@ -39,7 +39,8 @@ pub use cursor::BufferPacketCursor;
 pub use flags::BufferFlags;
 pub use frame::BufferFrame;
 pub use main::BufferMain;
-pub use opaque::{PRIMARY_OPAQUE_ALIGN, PRIMARY_OPAQUE_BYTES, PrimaryOpaque, SecondaryOpaque};
+pub use opaque::{BufferOpaque, BufferOpaqueRegion, PRIMARY_OPAQUE_ALIGN, PRIMARY_OPAQUE_BYTES};
+use opaque::{PrimaryOpaque, SecondaryOpaque};
 
 /// Production graph Frame logical maximum. Insertion enforces this limit even
 /// though the underlying standard vector remains growable.

@@ -1,4 +1,3 @@
-use std::mem::transmute;
 use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
 
@@ -1137,7 +1136,7 @@ enum ReassemblyInsert {
 #[inline(always)]
 fn refresh_metadata(runtime: &DataPlaneMain, index: u32) -> RuntimeResult<()> {
     let buffer = runtime.buffer(index);
-    let network = unsafe { transmute::<_, &NetworkOpaque>(buffer.opaque()) };
+    let network = hammer_core::buffer_opaque!(buffer => NetworkOpaque);
     let parsed = ip_header(buffer.current(), network.packet_cursor())?;
     if !matches!(parsed.protocol, IpProtocol::Other(_)) {
         Ok(())

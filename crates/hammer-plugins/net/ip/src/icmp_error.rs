@@ -277,7 +277,8 @@ fn generate_error(
     lookup_slot: usize,
 ) -> RuntimeResult<IcmpError> {
     let original = runtime.buffer(index);
-    let metadata = IcmpErrorMetadata::read(original.opaque2());
+    let metadata =
+        IcmpErrorMetadata::read(hammer_core::buffer_opaque!(original => crate::IpSecondaryOpaque));
     let Some(metadata) = metadata else {
         return Ok(IcmpError::BadRequest);
     };
@@ -319,7 +320,7 @@ fn generate_error(
         return Ok(IcmpError::Suppressed);
     }
     // SAFETY: the IP graph owns the initialized NetworkOpaque packet overlay.
-    let network = unsafe { &*(original.opaque() as *const _ as *const NetworkOpaque) };
+    let network = hammer_core::buffer_opaque!(original => NetworkOpaque);
     let rx = network.sw_if_index[0];
     let interfaces = NetMain::global()?.interface_main();
     let Some(interface) = interfaces.software_interface(rx) else {
@@ -418,9 +419,9 @@ fn generate_error(
         ]),
     };
     packet[header_len + 2..header_len + 4].copy_from_slice(&checksum.to_be_bytes());
-    IcmpErrorMetadata::clear(buffer.opaque2_mut());
+    IcmpErrorMetadata::clear(hammer_core::buffer_opaque!(mut buffer => crate::IpSecondaryOpaque));
     // SAFETY: the response inherited the initialized IP overlay from its source.
-    let network = unsafe { &mut *(buffer.opaque_mut() as *mut _ as *mut NetworkOpaque) };
+    let network = hammer_core::buffer_opaque!(mut buffer => NetworkOpaque);
     network.flags = NetworkFlags::LOCALLY_ORIGINATED
         | NetworkFlags::L4_CHECKSUM_COMPUTED
         | NetworkFlags::L4_CHECKSUM_CORRECT;
@@ -464,13 +465,18 @@ pub(crate) fn error_response_source_and_origin(runtime: &mut DataPlaneMain) -> R
                 assert_eq!(frame.len(), 1);
                 let buffer = runtime.buffer(frame.indices()[0]);
                 let packet = buffer.current();
-                let network = unsafe { &*(buffer.opaque() as *const _ as *const NetworkOpaque) };
+                let network = hammer_core::buffer_opaque!(buffer => NetworkOpaque);
                 assert!(network.flags.contains(NetworkFlags::LOCALLY_ORIGINATED));
                 assert!(network.flags.contains(
                     NetworkFlags::L4_CHECKSUM_COMPUTED | NetworkFlags::L4_CHECKSUM_CORRECT
                 ));
                 assert!(network.oflags.is_empty());
-                assert!(IcmpErrorMetadata::read(buffer.opaque2()).is_none());
+                assert!(
+                    IcmpErrorMetadata::read(
+                        hammer_core::buffer_opaque!(buffer => crate::IpSecondaryOpaque)
+                    )
+                    .is_none()
+                );
                 match packet[0] >> 4 {
                     4 => {
                         assert_eq!(&packet[12..16], &[192, 0, 2, 1]);
@@ -558,16 +564,16 @@ pub(crate) fn error_response_source_and_origin(runtime: &mut DataPlaneMain) -> R
             let mut network = NetworkOpaque::default();
             network.sw_if_index[0] = rx;
             network.oflags = NetworkOffloadFlags::UDP_CHECKSUM;
-            unsafe { (buffer.opaque_mut() as *mut _ as *mut NetworkOpaque).write(network) };
-            metadata.write(buffer.opaque2_mut());
+            *hammer_core::buffer_opaque!(mut buffer => NetworkOpaque) = network;
+            metadata.write(hammer_core::buffer_opaque!(mut buffer => crate::IpSecondaryOpaque));
         }
         let mut throttle = Throttle::new(Duration::from_millis(1));
         let seed = throttle.seed(Duration::from_secs(1));
-        let error = runtime.with_current_node(node, || {
+        let error = runtime.with_current_node(node, |runtime| {
             generate_error(runtime, index, family, &mut throttle, seed, 1)
         })?;
         assert!(matches!(error, IcmpError::TimeExceededSent));
-        let error = runtime.with_current_node(node, || {
+        let error = runtime.with_current_node(node, |runtime| {
             generate_error(runtime, index, family, &mut throttle, seed, 1)
         })?;
         assert!(matches!(error, IcmpError::Suppressed));

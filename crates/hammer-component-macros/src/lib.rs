@@ -288,6 +288,175 @@ fn expand_stats_bind(field: &StatsField) -> TokenStream2 {
     }
 }
 
+struct BufferOpaqueArgs {
+    region: Ident,
+}
+
+impl Parse for BufferOpaqueArgs {
+    fn parse(input: ParseStream<'_>) -> Result<Self> {
+        let region = input.parse::<Ident>()?;
+        if !input.is_empty() {
+            return Err(input.error("expected one opaque region: `primary` or `secondary`"));
+        }
+        if region != "primary" && region != "secondary" {
+            return Err(Error::new(
+                region.span(),
+                "expected `primary` or `secondary`",
+            ));
+        }
+        Ok(Self { region })
+    }
+}
+
+/// Declares a fixed-layout owner of one VPP Buffer opaque region.
+#[proc_macro_attribute]
+pub fn buffer_opaque(args: TokenStream, input: TokenStream) -> TokenStream {
+    let args = parse_macro_input!(args as BufferOpaqueArgs);
+    let mut item = parse_macro_input!(input as Item);
+    let ident = match &item {
+        Item::Struct(item) => item.ident.clone(),
+        Item::Union(item) => item.ident.clone(),
+        _ => {
+            return Error::new(
+                Span::call_site(),
+                "`buffer_opaque` requires a struct or union",
+            )
+            .into_compile_error()
+            .into();
+        }
+    };
+    let (attributes, generics) = match &mut item {
+        Item::Struct(item) => (&mut item.attrs, &item.generics),
+        Item::Union(item) => (&mut item.attrs, &item.generics),
+        _ => unreachable!(),
+    };
+    if !generics.params.is_empty() || generics.where_clause.is_some() {
+        return Error::new_spanned(
+            generics,
+            "Buffer opaque declarations must have a concrete layout",
+        )
+        .into_compile_error()
+        .into();
+    }
+    // The declaration owns representation; accepting packed/transparent or
+    // caller-selected alignment would invalidate the generated Buffer borrow.
+    for attribute in attributes
+        .iter()
+        .filter(|attribute| attribute.path().is_ident("repr"))
+    {
+        let representation = match attribute.parse_args::<Ident>() {
+            Ok(representation) => representation,
+            Err(error) => return error.into_compile_error().into(),
+        };
+        if representation != "C" {
+            return Error::new_spanned(attribute, "Buffer opaque representation is C")
+                .into_compile_error()
+                .into();
+        }
+    }
+    attributes.retain(|attribute| !attribute.path().is_ident("repr"));
+    attributes.push(parse_quote!(#[repr(C)]));
+    attributes.push(parse_quote!(#[derive(::zerocopy::FromBytes, ::zerocopy::Immutable)]));
+    let byte_representation = match &item {
+        Item::Union(declaration) => {
+            let fields: Vec<_> = declaration
+                .fields
+                .named
+                .iter()
+                .map(|field| &field.ty)
+                .collect();
+            quote! {
+                const _: () = {
+                    fn member<T: ::zerocopy::FromBytes + ::zerocopy::IntoBytes + ::zerocopy::Immutable>() {}
+                    #(let _ = member::<#fields>;)*
+                    #(assert!(::core::mem::size_of::<#fields>() == ::core::mem::size_of::<#ident>());)*
+                };
+                // SAFETY: every member has no padding and occupies the complete
+                // union, so selecting or assigning any member initializes all bytes.
+                unsafe impl ::zerocopy::IntoBytes for #ident {
+                    fn only_derive_is_allowed_to_implement_this_trait() {}
+                }
+            }
+        }
+        _ => {
+            if let Item::Struct(declaration) = &mut item {
+                declaration
+                    .attrs
+                    .push(parse_quote!(#[derive(::zerocopy::IntoBytes)]));
+            }
+            quote! {}
+        }
+    };
+    let member_accessors = match &item {
+        Item::Union(declaration) => {
+            let accessors = declaration.fields.named.iter().map(|field| {
+                let member = field.ident.as_ref().expect("union fields are named");
+                let mutable_member = format_ident!("{}_mut", member);
+                let ty = &field.ty;
+                let visibility = &declaration.vis;
+                quote! {
+                    #[inline(always)]
+                    #visibility fn #member(&self) -> &#ty {
+                        // SAFETY: opaque union members must accept all initialized
+                        // bit patterns; selection belongs to the packet graph path.
+                        unsafe { &self.#member }
+                    }
+                    #[inline(always)]
+                    #visibility fn #mutable_member(&mut self) -> &mut #ty {
+                        // SAFETY: the exclusive union borrow excludes other
+                        // member borrows for the returned reference's lifetime.
+                        unsafe { &mut self.#member }
+                    }
+                }
+            });
+            quote! { impl #ident { #(#accessors)* } }
+        }
+        _ => quote! {},
+    };
+    let region_variant = if args.region == "primary" {
+        Ident::new("Primary", args.region.span())
+    } else {
+        Ident::new("Secondary", args.region.span())
+    };
+    let (bytes, align) = if args.region == "primary" {
+        (40usize, 8usize)
+    } else {
+        (56usize, 8usize)
+    };
+    let borrow = if args.region == "primary" {
+        quote! { buffer.primary_opaque::<Self>() }
+    } else {
+        quote! { buffer.secondary_opaque::<Self>() }
+    };
+    let borrow_mut = if args.region == "primary" {
+        quote! { buffer.primary_opaque_mut::<Self>() }
+    } else {
+        quote! { buffer.secondary_opaque_mut::<Self>() }
+    };
+    quote! {
+        #item
+        #byte_representation
+        #member_accessors
+        const _: () = {
+            assert!(::core::mem::size_of::<#ident>() <= #bytes);
+            assert!(::core::mem::align_of::<#ident>() <= #align);
+        };
+        unsafe impl ::hammer_core::data_plane::BufferOpaque for #ident {
+            const REGION: ::hammer_core::data_plane::BufferOpaqueRegion =
+                ::hammer_core::data_plane::BufferOpaqueRegion::#region_variant;
+            #[inline(always)]
+            fn borrow(buffer: &::hammer_core::data_plane::Buffer) -> &Self {
+                #borrow
+            }
+            #[inline(always)]
+            fn borrow_mut(buffer: &mut ::hammer_core::data_plane::Buffer) -> &mut Self {
+                #borrow_mut
+            }
+        }
+    }
+    .into()
+}
+
 #[proc_macro_derive(Stats, attributes(stats))]
 pub fn stats(input: TokenStream) -> TokenStream {
     let item = parse_macro_input!(input as ItemStruct);

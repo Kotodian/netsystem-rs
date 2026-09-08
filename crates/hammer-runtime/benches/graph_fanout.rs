@@ -63,7 +63,7 @@ struct FanoutFixture {
 }
 
 fn build_fixture(pattern: FanoutPattern) -> FanoutFixture {
-    let runtime = test_runtime(128, DEFAULT_BUFFER_FRAME_CAPACITY * 4);
+    let mut runtime = test_runtime(128, DEFAULT_BUFFER_FRAME_CAPACITY * 4);
     let sinks = [
         register_sink(&runtime, "s0").expect("s0"),
         register_sink(&runtime, "s1").expect("s1"),
@@ -94,7 +94,7 @@ fn build_fixture(pattern: FanoutPattern) -> FanoutFixture {
     }
 
     // Warm grouping/transfer once so measured iterations start from a steady state.
-    runtime.with_current_node(owner, || {
+    runtime.with_current_node(owner, |runtime| {
         runtime.enqueue_to_next(&mut frame, &nexts);
     });
     let _ = runtime.run_ready_nodes();
@@ -136,10 +136,8 @@ fn bench_fanout_256(c: &mut Criterion) {
             b.iter_batched_ref(
                 || build_fixture(pattern),
                 |fixture| {
-                    fixture.runtime.with_current_node(fixture.owner, || {
-                        fixture
-                            .runtime
-                            .enqueue_to_next(&mut fixture.frame, &fixture.nexts);
+                    fixture.runtime.with_current_node(fixture.owner, |runtime| {
+                        runtime.enqueue_to_next(&mut fixture.frame, &fixture.nexts);
                     });
                 },
                 criterion::BatchSize::PerIteration,

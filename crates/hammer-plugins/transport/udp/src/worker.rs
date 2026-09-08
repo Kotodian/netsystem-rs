@@ -1194,7 +1194,7 @@ impl TransportInternalTransport for UdpWorker {
                     return Err(UdpTransportError::OutputHeader.into());
                 }
                 crate::output::write_udp_egress_endpoints(
-                    output_buffer.opaque2_mut(),
+                    hammer_core::buffer_opaque!(mut output_buffer => crate::output::UdpEgressOpaque),
                     local.ip(),
                     remote.ip(),
                 );

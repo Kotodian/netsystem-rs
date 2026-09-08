@@ -110,3 +110,5 @@ pub use protocol::ip::{write_ipv4_push_header, write_ipv6_push_header};
 
 #[cfg(test)]
 static BUFFER_MAIN_INIT: std::sync::Once = std::sync::Once::new();
+
+pub use lookup::IpSecondaryOpaque;

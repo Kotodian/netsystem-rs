@@ -12,7 +12,11 @@ crate-type = ["dylib", "rlib"]
 default = []
 
 [dependencies]
+zerocopy = { version = "0.8.48", features = ["derive"] }
 abi_stable = { workspace = true }
 hammer-infra = { path = "../hammer-infra" }
 thiserror = { workspace = true }
 spinning_top = { workspace = true }
+
+[dev-dependencies]
+hammer-component-macros = { path = "../hammer-component-macros" }

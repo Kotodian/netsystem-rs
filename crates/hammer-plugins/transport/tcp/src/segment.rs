@@ -1,4 +1,4 @@
-use std::mem::{size_of, transmute};
+use std::mem::size_of;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 
 use crate::protocol::TcpEcnCodepoint;
@@ -110,18 +110,22 @@ impl TcpSegment {
             buffer.push_uninit(u8::try_from(self.header_len()).expect("TCP header fits u8"));
         self.write_header(header)?;
         {
-            let network = unsafe { transmute::<_, &mut NetworkOpaque>(buffer.opaque_mut()) };
+            let network = hammer_core::buffer_opaque!(mut buffer => NetworkOpaque);
             network.ip_mut().set_ip_ecn(self.ip_ecn.map(Into::into));
         }
         // Stamp L3 endpoints for tcp-output (VPP stamps connection_index; push_ip reads c_lcl/c_rmt).
-        crate::write_tcp_egress_endpoints(buffer.opaque2_mut(), self.local.ip(), self.remote.ip());
+        crate::write_tcp_egress_endpoints(
+            hammer_core::buffer_opaque!(mut buffer => crate::TcpSecondaryOpaque).egress_mut(),
+            self.local.ip(),
+            self.remote.ip(),
+        );
         Ok(())
     }
 }
 
 pub(crate) fn tcp_packet(runtime: &DataPlaneMain, index: u32) -> RuntimeResult<TcpPacket> {
     let buffer = runtime.buffer(index);
-    let network = unsafe { transmute::<_, &NetworkOpaque>(buffer.opaque()) };
+    let network = hammer_core::buffer_opaque!(buffer => NetworkOpaque);
     let cursor = network.packet_cursor();
     let packet = buffer.current();
     let first_len = packet.len().min(cursor.packet_len());

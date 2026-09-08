@@ -279,8 +279,9 @@ fn process_interface_rx(runtime: &mut DataPlaneMain, frame: &mut BufferFrame, pr
         let buffer = runtime.buffer_mut(index);
         // SAFETY: DPO lookup/stack execution initialized this IP-owned overlay;
         // the mutable buffer borrow excludes concurrent metadata access.
-        let forwarding =
-            unsafe { &*(buffer.opaque2() as *const _ as *const LookupMetadata) }.forwarding;
+        let forwarding = hammer_core::buffer_opaque!(buffer => IpSecondaryOpaque)
+            .lookup
+            .forwarding;
         assert_eq!(
             forwarding.proto(),
             proto,
@@ -292,7 +293,7 @@ fn process_interface_rx(runtime: &mut DataPlaneMain, frame: &mut BufferFrame, pr
             .expect("published interface RX DPO remains retained during packet processing");
         // SAFETY: NetworkOpaque is the asserted packet ABI overlay, and the
         // packet is exclusively owned by this node while changing its RX fact.
-        let opaque = unsafe { &mut *(buffer.opaque_mut() as *mut _ as *mut NetworkOpaque) };
+        let opaque = hammer_core::buffer_opaque!(mut buffer => NetworkOpaque);
         opaque.sw_if_index[0] = sw_if_index;
         if proto == DpoProto::IP4 {
             NodeNext::slot(Ip4InterfaceRxNext::Input)
@@ -304,17 +305,36 @@ fn process_interface_rx(runtime: &mut DataPlaneMain, frame: &mut BufferFrame, pr
 
 #[derive(Clone, Copy)]
 #[repr(C)]
+#[derive(zerocopy::FromBytes, zerocopy::IntoBytes, zerocopy::Immutable)]
 pub(crate) struct LookupMetadata {
     fib_index: u32,
+    padding: [u8; 4],
     pub(crate) forwarding: DpoId,
     flow_hash: u32,
     lookup_count: u8,
+    reserved: [u8; 3],
 }
+
+// Lookup occupies the initial bytes; the ICMP request is the final u64,
+// matching the existing IP producer/consumer contract over opaque2[14].
+#[hammer_component_macros::buffer_opaque(secondary)]
+#[derive(Clone, Copy)]
+pub struct IpSecondaryOpaque {
+    pub(crate) lookup: LookupMetadata,
+    reserved: [u8; 48 - core::mem::size_of::<LookupMetadata>()],
+    pub(crate) icmp_error: u64,
+}
+
+const _: () = assert!(core::mem::size_of::<IpSecondaryOpaque>() == 56);
+const _: () = assert!(core::mem::offset_of!(IpSecondaryOpaque, lookup) == 0);
+const _: () = assert!(core::mem::offset_of!(IpSecondaryOpaque, icmp_error) == 48);
 
 impl Default for LookupMetadata {
     fn default() -> Self {
         Self {
             fib_index: u32::MAX,
+            padding: [0; 4],
+            reserved: [0; 3],
             forwarding: DpoId::INVALID,
             flow_hash: 0,
             lookup_count: 0,
@@ -758,14 +778,16 @@ fn load_balance_index(runtime: &mut DataPlaneMain, index: u32, version: IpVersio
         IpVersion::V6 => NodeNext::slot(Ip6LookupNext::Drop),
     };
     let buffer = runtime.buffer_mut(index);
-    let opaque = unsafe { &*(buffer.opaque() as *const _ as *const NetworkOpaque) };
-    let metadata = unsafe { &mut *(buffer.opaque2_mut() as *mut _ as *mut LookupMetadata) };
+    let opaque = hammer_core::buffer_opaque!(buffer => NetworkOpaque);
+    let cursor = opaque.packet_cursor();
+    let metadata = &mut hammer_core::buffer_opaque!(mut buffer => IpSecondaryOpaque).lookup;
     const MAX_LOOKUPS_PER_PACKET: u8 = 4;
     if metadata.lookup_count >= MAX_LOOKUPS_PER_PACKET {
         return drop_next;
     }
     metadata.lookup_count += 1;
     let current = metadata.forwarding;
+    let flow_hash = metadata.flow_hash;
     let expected_proto = match version {
         IpVersion::V4 => DpoProto::IP4,
         IpVersion::V6 => DpoProto::IP6,
@@ -776,12 +798,13 @@ fn load_balance_index(runtime: &mut DataPlaneMain, index: u32, version: IpVersio
     let Ok(net) = hammer_service::net::NetMain::global() else {
         return drop_next;
     };
-    let parsed = ip_header(buffer.current(), opaque.packet_cursor()).ok();
+    let parsed = ip_header(buffer.current(), cursor).ok();
+    let mut next_flow_hash = None;
     let selected = net.select_load_balance(current, |bucket_count, flow_hash_config| {
         let hash = if bucket_count <= 1 {
             0
-        } else if metadata.flow_hash != 0 {
-            metadata.flow_hash >> 1
+        } else if flow_hash != 0 {
+            flow_hash >> 1
         } else {
             let parsed = parsed.filter(|packet| packet.version == version)?;
             match version {
@@ -790,10 +813,14 @@ fn load_balance_index(runtime: &mut DataPlaneMain, index: u32, version: IpVersio
             }
         };
         if bucket_count > 1 {
-            metadata.flow_hash = hash;
+            next_flow_hash = Some(hash);
         }
         Some(hash)
     });
+    let metadata = &mut hammer_core::buffer_opaque!(mut buffer => IpSecondaryOpaque).lookup;
+    if let Some(hash) = next_flow_hash {
+        metadata.flow_hash = hash;
+    }
     let Some(selected) = selected else {
         return drop_next;
     };
@@ -819,7 +846,7 @@ fn lookup_index(runtime: &mut DataPlaneMain, index: u32, version: IpVersion) -> 
         IpVersion::V6 => NodeNext::slot(Ip6LookupNext::Drop),
     };
     let buffer = runtime.buffer_mut(index);
-    let opaque = unsafe { &*(buffer.opaque() as *const _ as *const NetworkOpaque) };
+    let opaque = hammer_core::buffer_opaque!(buffer => NetworkOpaque);
     let fib_index = opaque
         .ip()
         .fib_index_override()
@@ -847,9 +874,11 @@ fn lookup_index(runtime: &mut DataPlaneMain, index: u32, version: IpVersion) -> 
         },
         _ => None,
     };
-    let metadata = unsafe { &mut *(buffer.opaque2_mut() as *mut _ as *mut LookupMetadata) };
+    let metadata = &mut hammer_core::buffer_opaque!(mut buffer => IpSecondaryOpaque).lookup;
     *metadata = LookupMetadata {
         fib_index,
+        padding: [0; 4],
+        reserved: [0; 3],
         forwarding: forwarding.unwrap_or(DpoId::INVALID),
         flow_hash: 0,
         lookup_count: 0,

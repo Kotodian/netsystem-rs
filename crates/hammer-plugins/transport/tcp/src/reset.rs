@@ -68,10 +68,8 @@ fn tcp_reset_next_for_index(
         let buffer = runtime.buffer(index);
         tcp_reset_prepare_from_current(
             buffer.current(),
-            unsafe {
-                std::mem::transmute::<_, &hammer_service::opaque::NetworkOpaque>(buffer.opaque())
-            }
-            .packet_cursor(),
+            hammer_core::buffer_opaque!(buffer => hammer_service::opaque::NetworkOpaque)
+                .packet_cursor(),
         )
     };
     let next = match reset.map(|reset| reset.7) {
@@ -446,15 +444,13 @@ fn refresh_reset_metadata(
         _ => return Err(TcpError::SegmentInvalid.into()),
     };
     buffer.clear_node_error();
-    unsafe {
-        std::mem::transmute::<_, &mut hammer_service::opaque::NetworkOpaque>(buffer.opaque_mut())
-    }
-    .set_packet_cursor(
-        BufferPacketCursor::new()
-            .with_packet_len(packet_len)
-            .with_network_header(0, network_header_len)
-            .with_transport_header(network_header_len, TCP_HEADER_LEN)
-            .with_transport_payload_offset(network_header_len + TCP_HEADER_LEN),
-    );
+    hammer_core::buffer_opaque!(mut buffer => hammer_service::opaque::NetworkOpaque)
+        .set_packet_cursor(
+            BufferPacketCursor::new()
+                .with_packet_len(packet_len)
+                .with_network_header(0, network_header_len)
+                .with_transport_header(network_header_len, TCP_HEADER_LEN)
+                .with_transport_payload_offset(network_header_len + TCP_HEADER_LEN),
+        );
     Ok(())
 }

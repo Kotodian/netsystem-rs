@@ -4493,7 +4493,7 @@ where
         &mut output,
         now,
     )?;
-    runtime.with_current_node(owner, || output.flush(runtime, &mut staging));
+    runtime.with_current_node(owner, |runtime| output.flush(runtime, &mut staging));
     Ok(step)
 }
 

@@ -131,14 +131,14 @@ impl DataPlaneBuffers {
         let offset = source_buffer.current_data_offset();
         let length = source_buffer.current_len();
         let bytes = source_buffer.current_ptr();
-        let opaque = *source_buffer.opaque();
-        let opaque2 = *source_buffer.opaque2();
+        let opaque = source_buffer.cacheline0.opaque;
+        let opaque2 = source_buffer.opaque2;
         let buffer = source_pool.buffer_mut(destination, &mut state.1);
         // Source and destination use the same Pool layout; these values have
         // already been validated on the source and cannot fail here.
         buffer.set_current_window(isize::from(offset), length);
-        *buffer.opaque_mut() = opaque;
-        *buffer.opaque2_mut() = opaque2;
+        buffer.cacheline0.opaque = opaque;
+        buffer.opaque2 = opaque2;
         // SAFETY: the Pool write guard excludes any source mutation/release.
         // Allocation selected a distinct slot with the same valid window.
         unsafe {

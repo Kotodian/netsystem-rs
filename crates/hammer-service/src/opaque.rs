@@ -1,19 +1,42 @@
-use core::mem::{align_of, size_of, transmute};
+use core::mem::{align_of, size_of};
 
 use hammer_core::data_plane::{BufferPacketCursor, PRIMARY_OPAQUE_ALIGN, PRIMARY_OPAQUE_BYTES};
 
+#[derive(
+    Debug,
+    Clone,
+    Copy,
+    Default,
+    PartialEq,
+    Eq,
+    zerocopy::FromBytes,
+    zerocopy::IntoBytes,
+    zerocopy::Immutable,
+)]
+#[repr(transparent)]
+pub struct NetworkFlags(u8);
+
+#[derive(
+    Debug,
+    Clone,
+    Copy,
+    Default,
+    PartialEq,
+    Eq,
+    zerocopy::FromBytes,
+    zerocopy::IntoBytes,
+    zerocopy::Immutable,
+)]
+#[repr(transparent)]
+pub struct NetworkOffloadFlags(u8);
+
 bitflags::bitflags! {
-    #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-    #[repr(transparent)]
-    pub struct NetworkFlags: u8 {
+    impl NetworkFlags: u8 {
         const LOCALLY_ORIGINATED = 1 << 0;
         const L4_CHECKSUM_COMPUTED = 1 << 1;
         const L4_CHECKSUM_CORRECT = 1 << 2;
     }
-
-    #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-    #[repr(transparent)]
-    pub struct NetworkOffloadFlags: u8 {
+    impl NetworkOffloadFlags: u8 {
         const TCP_CHECKSUM = 1 << 0;
         const UDP_CHECKSUM = 1 << 1;
     }
@@ -48,7 +71,7 @@ impl TapEthernetMetadata {
     }
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, zerocopy::FromBytes, zerocopy::IntoBytes, zerocopy::Immutable)]
 #[repr(C)]
 pub struct NetworkIpOpaque {
     packet_len: u32,
@@ -59,6 +82,7 @@ pub struct NetworkIpOpaque {
     ip_protocol: u8,
     ip_ecn: u8,
     ip_ecn_valid: u8,
+    padding: [u8; 2],
     fib_index: u32,
     pub rx_sw_if_index: u32,
     reserved: [u8; 4],
@@ -75,6 +99,7 @@ impl Default for NetworkIpOpaque {
             ip_protocol: 0,
             ip_ecn: 0,
             ip_ecn_valid: 0,
+            padding: [0; 2],
             fib_index: u32::MAX,
             rx_sw_if_index: u32::MAX,
             reserved: [0; 4],
@@ -189,14 +214,14 @@ impl NetworkIpOpaque {
     }
 }
 
-#[derive(Clone, Copy, Default)]
+#[derive(Clone, Copy, Default, zerocopy::FromBytes, zerocopy::IntoBytes, zerocopy::Immutable)]
 #[repr(C)]
 pub struct NetworkReassemblyOpaque {
     next_index: u32,
     error_next_index: u32,
     owner_thread_index: u16,
     save_rewrite_length: u8,
-    reserved: [u8; 13],
+    reserved: [u8; 17],
 }
 
 impl NetworkReassemblyOpaque {
@@ -215,33 +240,12 @@ impl NetworkReassemblyOpaque {
     }
 }
 
+#[hammer_component_macros::buffer_opaque(primary)]
 #[derive(Clone, Copy)]
 #[repr(C)]
 pub union NetworkOpaqueOverlay {
     ip: NetworkIpOpaque,
     reass: NetworkReassemblyOpaque,
-}
-
-impl NetworkOpaqueOverlay {
-    #[inline]
-    pub fn ip(&self) -> &NetworkIpOpaque {
-        unsafe { transmute::<&NetworkOpaqueOverlay, &NetworkIpOpaque>(self) }
-    }
-
-    #[inline]
-    pub fn ip_mut(&mut self) -> &mut NetworkIpOpaque {
-        unsafe { transmute::<&mut NetworkOpaqueOverlay, &mut NetworkIpOpaque>(self) }
-    }
-
-    #[inline]
-    pub fn reass(&self) -> &NetworkReassemblyOpaque {
-        unsafe { transmute::<&NetworkOpaqueOverlay, &NetworkReassemblyOpaque>(self) }
-    }
-
-    #[inline]
-    pub fn reass_mut(&mut self) -> &mut NetworkReassemblyOpaque {
-        unsafe { transmute::<&mut NetworkOpaqueOverlay, &mut NetworkReassemblyOpaque>(self) }
-    }
 }
 
 impl Default for NetworkOpaqueOverlay {
@@ -252,6 +256,7 @@ impl Default for NetworkOpaqueOverlay {
     }
 }
 
+#[hammer_component_macros::buffer_opaque(primary)]
 #[derive(Clone, Copy)]
 #[repr(C)]
 pub struct NetworkOpaque {
@@ -342,5 +347,25 @@ impl NetworkOpaque {
     #[inline]
     pub fn set_handoff_source_worker(&mut self, worker: Option<u16>) {
         self.reassembly_mut().set_handoff_source_worker(worker);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // vnet/buffer.h: graph paths select members of vnet_buffer_opaque_t's
+    // union while interface indices outside the union remain shared facts.
+    #[test]
+    fn network_paths_borrow_one_union_and_preserve_interface_indices() {
+        let mut network = NetworkOpaque::default();
+        network.sw_if_index = [17, 23];
+        let ip_address = std::ptr::from_ref(network.ip()).addr();
+        assert_eq!(ip_address, std::ptr::from_ref(network.reassembly()).addr());
+        network.ip_mut().set_packet_len(1500);
+        assert_eq!(network.ip().packet_len(), 1500);
+        network.reassembly_mut().set_handoff_source_worker(Some(3));
+        assert_eq!(network.reassembly().handoff_source_worker(), Some(3));
+        assert_eq!(network.sw_if_index, [17, 23]);
     }
 }

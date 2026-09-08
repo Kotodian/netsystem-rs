@@ -9,6 +9,7 @@ name = "hammer_plugin_tcp"
 crate-type = ["dylib", "rlib"]
 
 [dependencies]
+zerocopy = { version = "0.8.48", features = ["derive"] }
 abi_stable = { workspace = true }
 hammer-core = { path = "../../../hammer-core" }
 hammer-infra = { path = "../../../hammer-infra" }

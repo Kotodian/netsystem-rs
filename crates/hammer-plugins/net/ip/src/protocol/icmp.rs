@@ -1,6 +1,6 @@
 use std::num::NonZeroU64;
 
-use hammer_core::data_plane::SecondaryOpaque;
+use crate::IpSecondaryOpaque;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
 pub enum IcmpErrorFamily {
@@ -80,25 +80,19 @@ impl IcmpErrorMetadata {
 impl IcmpErrorMetadata {
     /// Stores the error request in the final secondary-opaque word. The error
     /// producer writes it immediately before dispatch; lookup owns earlier words.
-    pub fn write(self, opaque: &mut SecondaryOpaque) {
-        // SAFETY: SecondaryOpaque is an aligned 56-byte union of integer arrays.
-        let words = unsafe { &mut *(opaque as *mut SecondaryOpaque).cast::<[u64; 7]>() };
-        words[6] = self.0.get();
+    pub fn write(self, opaque: &mut IpSecondaryOpaque) {
+        opaque.icmp_error = self.0.get();
     }
 
-    pub fn read(opaque: &SecondaryOpaque) -> Option<Self> {
-        // SAFETY: every bit pattern is valid for the integer-array representation.
-        let words = unsafe { &*(opaque as *const SecondaryOpaque).cast::<[u64; 7]>() };
-        let value = words[6];
+    pub fn read(opaque: &IpSecondaryOpaque) -> Option<Self> {
+        let value = opaque.icmp_error;
         if value >> 63 == 0 || !matches!((value >> 48) & 0xff, 4 | 6) {
             return None;
         }
         NonZeroU64::new(value).map(Self)
     }
 
-    pub fn clear(opaque: &mut SecondaryOpaque) {
-        // SAFETY: the same integer-array representation as write; no borrow escapes.
-        let words = unsafe { &mut *(opaque as *mut SecondaryOpaque).cast::<[u64; 7]>() };
-        words[6] = 0;
+    pub fn clear(opaque: &mut IpSecondaryOpaque) {
+        opaque.icmp_error = 0;
     }
 }

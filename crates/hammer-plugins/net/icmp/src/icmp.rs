@@ -513,7 +513,7 @@ fn next_slot_for_index(
     let buffer = runtime.buffer(index);
     let current = buffer.current();
     // SAFETY: IP local initializes the network overlay before ICMP dispatch.
-    let network = unsafe { &*(buffer.opaque() as *const _ as *const NetworkOpaque) };
+    let network = hammer_core::buffer_opaque!(buffer => NetworkOpaque);
     let default_next = match version {
         IpVersion::V4 => NodeNext::slot(Icmp4InputNext::Drop),
         IpVersion::V6 => NodeNext::slot(Icmp6InputNext::Punt),
@@ -602,7 +602,7 @@ fn next_for_echo_request_index(
     let parsed = {
         let buffer = runtime.buffer(index);
         // SAFETY: IP local initialized the packet's network overlay before dispatch.
-        let network = unsafe { &*(buffer.opaque() as *const _ as *const NetworkOpaque) };
+        let network = hammer_core::buffer_opaque!(buffer => NetworkOpaque);
         ip_header(buffer.current(), network.packet_cursor())
             .map_err(|_| IcmpBuildError::BadLength)
             .and_then(|parsed| {
@@ -629,9 +629,11 @@ fn next_for_echo_request_index(
                 IpVersion::V6 => NodeNext::slot(Icmp6EchoRequestNext::Lookup),
             };
             buffer.clear_node_error();
-            IcmpErrorMetadata::clear(buffer.opaque2_mut());
+            IcmpErrorMetadata::clear(
+                hammer_core::buffer_opaque!(mut buffer => hammer_plugin_ip::IpSecondaryOpaque),
+            );
             // SAFETY: same initialized overlay; the packet remains owned by this frame.
-            let network = unsafe { &mut *(buffer.opaque_mut() as *mut _ as *mut NetworkOpaque) };
+            let network = hammer_core::buffer_opaque!(mut buffer => NetworkOpaque);
             network.flags = NetworkFlags::LOCALLY_ORIGINATED
                 | NetworkFlags::L4_CHECKSUM_COMPUTED
                 | NetworkFlags::L4_CHECKSUM_CORRECT;
@@ -717,7 +719,7 @@ mod tests {
             std::process::id()
         ))?;
         hammer_runtime::init::run_init_functions(&mut main)?;
-        let runtime = main.data_plane_main();
+        let runtime = main.data_plane_main_mut();
 
         // icmp6.c::icmp6_input applies code, hop-limit, then minimum-length
         // validation. Every classified error uses punt, including registered
@@ -818,8 +820,7 @@ mod tests {
                 let mut buffer = runtime.buffer_mut(index);
                 // SAFETY: this fixture installs the same initialized service
                 // overlay that IP local supplies at the ICMP input boundary.
-                let network =
-                    unsafe { &mut *(buffer.opaque_mut() as *mut _ as *mut NetworkOpaque) };
+                let network = hammer_core::buffer_opaque!(mut buffer => NetworkOpaque);
                 *network = NetworkOpaque::default();
                 network.set_packet_cursor(
                     BufferPacketCursor::new()
@@ -829,22 +830,25 @@ mod tests {
                         .with_transport_payload_offset(header_len + 4),
                 );
             }
-            let next = runtime
-                .with_current_node(input, || next_slot_for_index(runtime, index, version))?;
+            let next = runtime.with_current_node(input, |runtime| {
+                next_slot_for_index(runtime, index, version)
+            })?;
             assert_eq!(
                 runtime.nodes().node_next_slot(input, usize::from(next))?,
                 if error.is_some() { punt } else { echo },
             );
             let expected_error = error
                 .map(|error| {
-                    runtime.with_current_node(input, || runtime.record_current_node_error(error))
+                    runtime.with_current_node(input, |runtime| {
+                        runtime.record_current_node_error(error)
+                    })
                 })
                 .transpose()?;
             assert_eq!(runtime.buffer(index).node_error_index(), expected_error);
             if error.is_none() {
                 let mut expected_random = runtime.random().clone();
                 let fragment_id = expected_random.next_u32() as u16;
-                let next = runtime.with_current_node(echo, || {
+                let next = runtime.with_current_node(echo, |runtime| {
                     next_for_echo_request_index(runtime, index, version)
                 })?;
                 assert_eq!(
@@ -882,7 +886,7 @@ mod tests {
                         0
                     );
                 }
-                let network = unsafe { &*(buffer.opaque() as *const _ as *const NetworkOpaque) };
+                let network = hammer_core::buffer_opaque!(buffer => NetworkOpaque);
                 assert!(network.flags.contains(NetworkFlags::LOCALLY_ORIGINATED));
             }
         }

@@ -27,12 +27,11 @@ hammer_component_macros::declare_plugin!(
     process_nodes = [],
 );
 
-use std::mem::transmute;
 use std::net::SocketAddr;
 use std::ops::Deref;
 use std::sync::{Arc, OnceLock, mpsc};
 
-use hammer_core::data_plane::{BufferPacketCursor, NodeId, NodeState, SecondaryOpaque};
+use hammer_core::data_plane::{BufferPacketCursor, NodeId, NodeState};
 use hammer_runtime::app::SessionHandle;
 use hammer_runtime::{
     DataPlaneMain, DataWorkerId, GlobalMain, Node, NodeProcessFn, NodeRuntimeData, RuntimeError,
@@ -770,6 +769,7 @@ impl TcpResetError {
     }
 }
 
+#[hammer_component_macros::buffer_opaque(secondary)]
 #[derive(Clone, Copy)]
 #[repr(C)]
 struct TcpRouteOpaque {
@@ -780,8 +780,7 @@ struct TcpRouteOpaque {
     reserved: [u8; 42],
 }
 
-const _: () =
-    assert!(std::mem::size_of::<TcpRouteOpaque>() == std::mem::size_of::<SecondaryOpaque>());
+const _: () = assert!(std::mem::size_of::<TcpRouteOpaque>() == 56);
 
 impl Default for TcpRouteOpaque {
     #[inline]
@@ -801,6 +800,7 @@ impl Default for TcpRouteOpaque {
 const TCP_EGRESS_TAG: u32 = 0x5443_5045; // "TCPE"
 
 #[derive(Clone, Copy)]
+#[hammer_component_macros::buffer_opaque(secondary)]
 #[repr(C)]
 struct TcpEgressOpaque {
     tag: u32,
@@ -811,12 +811,11 @@ struct TcpEgressOpaque {
     reserved: [u8; 16],
 }
 
-const _: () =
-    assert!(std::mem::size_of::<TcpEgressOpaque>() == std::mem::size_of::<SecondaryOpaque>());
+const _: () = assert!(std::mem::size_of::<TcpEgressOpaque>() == 56);
 
 #[inline(always)]
 pub(crate) fn write_tcp_egress_endpoints(
-    opaque: &mut SecondaryOpaque,
+    opaque: &mut TcpEgressOpaque,
     local: std::net::IpAddr,
     remote: std::net::IpAddr,
 ) {
@@ -833,8 +832,7 @@ pub(crate) fn write_tcp_egress_endpoints(
         }
         _ => return,
     };
-    let egress = unsafe { transmute::<&mut SecondaryOpaque, &mut TcpEgressOpaque>(opaque) };
-    *egress = TcpEgressOpaque {
+    *opaque = TcpEgressOpaque {
         tag: TCP_EGRESS_TAG,
         version,
         pad: [0; 3],
@@ -846,30 +844,29 @@ pub(crate) fn write_tcp_egress_endpoints(
 
 #[inline(always)]
 pub(crate) fn read_tcp_egress_endpoints(
-    opaque: &SecondaryOpaque,
+    opaque: &TcpEgressOpaque,
 ) -> Option<(std::net::IpAddr, std::net::IpAddr)> {
-    let egress = unsafe { *transmute::<&SecondaryOpaque, &TcpEgressOpaque>(opaque) };
-    if egress.tag != TCP_EGRESS_TAG {
+    if opaque.tag != TCP_EGRESS_TAG {
         return None;
     }
-    match egress.version {
+    match opaque.version {
         4 => Some((
             std::net::IpAddr::V4(std::net::Ipv4Addr::new(
-                egress.local[0],
-                egress.local[1],
-                egress.local[2],
-                egress.local[3],
+                opaque.local[0],
+                opaque.local[1],
+                opaque.local[2],
+                opaque.local[3],
             )),
             std::net::IpAddr::V4(std::net::Ipv4Addr::new(
-                egress.remote[0],
-                egress.remote[1],
-                egress.remote[2],
-                egress.remote[3],
+                opaque.remote[0],
+                opaque.remote[1],
+                opaque.remote[2],
+                opaque.remote[3],
             )),
         )),
         6 => Some((
-            std::net::IpAddr::V6(std::net::Ipv6Addr::from(egress.local)),
-            std::net::IpAddr::V6(std::net::Ipv6Addr::from(egress.remote)),
+            std::net::IpAddr::V6(std::net::Ipv6Addr::from(opaque.local)),
+            std::net::IpAddr::V6(std::net::Ipv6Addr::from(opaque.remote)),
         )),
         _ => None,
     }
@@ -879,13 +876,12 @@ pub(crate) fn read_tcp_egress_endpoints(
 
 #[inline(always)]
 pub(crate) fn write_session_route_opaque(
-    opaque: &mut SecondaryOpaque,
+    opaque: &mut TcpRouteOpaque,
     session_id: u32,
     owner: DataWorkerId,
     next: TcpInputNext,
 ) {
-    let route = unsafe { transmute::<&mut SecondaryOpaque, &mut TcpRouteOpaque>(opaque) };
-    *route = TcpRouteOpaque {
+    *opaque = TcpRouteOpaque {
         session_raw: session_id.into(),
         owner_worker: owner.slot() as u32,
         next: next as u8,
@@ -896,16 +892,15 @@ pub(crate) fn write_session_route_opaque(
 
 #[inline(always)]
 pub(crate) fn read_session_route_opaque(
-    opaque: &SecondaryOpaque,
+    opaque: &TcpRouteOpaque,
 ) -> Option<(u32, DataWorkerId, TcpInputNext)> {
-    let route = unsafe { *transmute::<&SecondaryOpaque, &TcpRouteOpaque>(opaque) };
-    if route.present == 0 {
+    if opaque.present == 0 {
         return None;
     }
     Some((
-        u32::try_from(route.session_raw).ok()?,
-        DataWorkerId::new(route.owner_worker),
-        match route.next {
+        u32::try_from(opaque.session_raw).ok()?,
+        DataWorkerId::new(opaque.owner_worker),
+        match opaque.next {
             value if value == TcpInputNext::Listen as u8 => TcpInputNext::Listen,
             value if value == TcpInputNext::RcvProcess as u8 => TcpInputNext::RcvProcess,
             value if value == TcpInputNext::SynSent as u8 => TcpInputNext::SynSent,
@@ -919,7 +914,12 @@ pub(crate) fn read_session_route_opaque(
 #[inline(always)]
 pub(crate) fn read_session_id(runtime: &DataPlaneMain, index: u32) -> RuntimeResult<Option<u32>> {
     let buffer = runtime.buffer(index);
-    Ok(read_session_route_opaque(buffer.opaque2()).map(|(session_id, _, _)| session_id))
+    Ok(
+        read_session_route_opaque(
+            hammer_core::buffer_opaque!(buffer => TcpSecondaryOpaque).route(),
+        )
+        .map(|(session_id, _, _)| session_id),
+    )
 }
 
 pub fn tcp_control_cursor(packet: &[u8]) -> Result<BufferPacketCursor, TcpControlPacketParseError> {
@@ -991,4 +991,11 @@ pub enum TcpInputNext {
     Established,
     #[next("tcp-reset")]
     Reset,
+}
+
+#[hammer_component_macros::buffer_opaque(secondary)]
+#[derive(Clone, Copy)]
+pub(crate) union TcpSecondaryOpaque {
+    route: TcpRouteOpaque,
+    egress: TcpEgressOpaque,
 }

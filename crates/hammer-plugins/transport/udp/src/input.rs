@@ -1,5 +1,5 @@
 use std::cell::UnsafeCell;
-use std::mem::{size_of, transmute};
+use std::mem::size_of;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::sync::{Arc, OnceLock};
 
@@ -678,7 +678,7 @@ fn next_slot_for_index(
     let (version, protocol, source_port, destination_port, cursor, local, remote, payload_len) = {
         let buffer = runtime.buffer(index);
         let current = buffer.current();
-        let network = unsafe { transmute::<_, &NetworkOpaque>(buffer.opaque()) };
+        let network = hammer_core::buffer_opaque!(buffer => NetworkOpaque);
         let cursor = network.packet_cursor();
         let ip = network.ip();
         let version = match ip.ip_version() {
@@ -1072,7 +1072,8 @@ fn resolve_unknown_port(
             UdpIpVersion::V4 => IcmpErrorMetadata::ipv4_destination_unreachable(3, 0),
             UdpIpVersion::V6 => IcmpErrorMetadata::ipv6_port_unreachable(),
         };
-        metadata.write(buffer.opaque2_mut());
+        metadata
+            .write(hammer_core::buffer_opaque!(mut buffer => hammer_plugin_ip::IpSecondaryOpaque));
     }
     let slot = match version {
         UdpIpVersion::V4 => UdpInputNext::IcmpErrorV4.slot() as u16,
@@ -1096,7 +1097,9 @@ fn resolve_unknown_port(
 fn clear_success_metadata(runtime: &mut DataPlaneMain, index: u32) -> RuntimeResult<()> {
     let buffer = runtime.buffer_mut(index);
     buffer.clear_node_error();
-    IcmpErrorMetadata::clear(buffer.opaque2_mut());
+    IcmpErrorMetadata::clear(
+        hammer_core::buffer_opaque!(mut buffer => hammer_plugin_ip::IpSecondaryOpaque),
+    );
     Ok(())
 }
 
@@ -1169,7 +1172,7 @@ fn refresh_udp_cursor(
         },
     )?;
     let buffer = runtime.buffer_mut(index);
-    let network = unsafe { transmute::<_, &mut NetworkOpaque>(buffer.opaque_mut()) };
+    let network = hammer_core::buffer_opaque!(mut buffer => NetworkOpaque);
     network.set_packet_cursor(
         BufferPacketCursor::new()
             .with_packet_len(cursor.packet_len())

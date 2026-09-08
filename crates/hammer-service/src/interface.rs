@@ -1,5 +1,3 @@
-use std::mem::transmute;
-
 use hammer_core::data_plane::{BufferFrame, NodeId, NodeRegistration};
 use hammer_runtime::{
     DataPlaneMain, InternalNode, Node, NodeProcessFn, NodeRuntimeData, RuntimeError, RuntimeResult,
@@ -176,7 +174,7 @@ impl InterfaceOutputNode {
     fn tx_for_index(runtime: &DataPlaneMain, index: u32, drop_next: u16) -> RuntimeResult<u16> {
         let interface_index = {
             let buffer = runtime.buffer(index);
-            let network = unsafe { transmute::<_, &NetworkOpaque>(buffer.opaque()) };
+            let network = hammer_core::buffer_opaque!(buffer => NetworkOpaque);
             network.sw_if_index[1]
         };
         if interface_index == u32::MAX {

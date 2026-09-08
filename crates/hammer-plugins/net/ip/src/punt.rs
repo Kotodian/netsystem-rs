@@ -61,8 +61,7 @@ impl Node for Ip4PuntNode {
                 let buffer = runtime.buffer_mut(index);
                 // SAFETY: IP ingress initializes the network overlay.
                 let sw_if_index =
-                    unsafe { &*(buffer.opaque() as *const _ as *const NetworkOpaque) }.sw_if_index
-                        [0];
+                    hammer_core::buffer_opaque!(buffer => NetworkOpaque).sw_if_index[0];
                 net.interface_main().start_feature_arc(
                     arc,
                     sw_if_index,
@@ -103,8 +102,7 @@ impl Node for Ip4DropNode {
                 let buffer = runtime.buffer_mut(index);
                 // SAFETY: IP ingress initializes the network overlay.
                 let sw_if_index =
-                    unsafe { &*(buffer.opaque() as *const _ as *const NetworkOpaque) }.sw_if_index
-                        [0];
+                    hammer_core::buffer_opaque!(buffer => NetworkOpaque).sw_if_index[0];
                 net.interface_main().start_feature_arc(
                     arc,
                     sw_if_index,
@@ -170,8 +168,7 @@ impl Node for Ip6PuntNode {
                 let buffer = runtime.buffer_mut(index);
                 // SAFETY: IP ingress initializes the network overlay.
                 let sw_if_index =
-                    unsafe { &*(buffer.opaque() as *const _ as *const NetworkOpaque) }.sw_if_index
-                        [0];
+                    hammer_core::buffer_opaque!(buffer => NetworkOpaque).sw_if_index[0];
                 net.interface_main().start_feature_arc(
                     arc,
                     sw_if_index,
@@ -212,8 +209,7 @@ impl Node for Ip6DropNode {
                 let buffer = runtime.buffer_mut(index);
                 // SAFETY: IP ingress initializes the network overlay.
                 let sw_if_index =
-                    unsafe { &*(buffer.opaque() as *const _ as *const NetworkOpaque) }.sw_if_index
-                        [0];
+                    hammer_core::buffer_opaque!(buffer => NetworkOpaque).sw_if_index[0];
                 net.interface_main().start_feature_arc(
                     arc,
                     sw_if_index,

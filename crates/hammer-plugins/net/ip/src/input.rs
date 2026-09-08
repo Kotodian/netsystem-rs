@@ -1,5 +1,3 @@
-use std::mem::transmute;
-
 use hammer_core::data_plane::{BufferFrame, BufferPacketCursor};
 use hammer_runtime::RuntimeResult;
 use hammer_runtime::{
@@ -175,20 +173,17 @@ fn next_slot_for_index(
         } else {
             BufferPacketCursor::new()
         };
-        unsafe { transmute::<_, &mut NetworkOpaque>(buffer.opaque_mut()) }
-            .set_packet_cursor(cursor);
+        hammer_core::buffer_opaque!(mut buffer => NetworkOpaque).set_packet_cursor(cursor);
         let ip_ecn = ip_ecn_from_packet(buffer.current(), parsed.version);
-        let ip = unsafe { transmute::<_, &mut NetworkOpaque>(buffer.opaque_mut()) }.ip_mut();
+        let sw_if_index = hammer_core::buffer_opaque!(buffer => NetworkOpaque).sw_if_index[0];
+        let ip = hammer_core::buffer_opaque!(mut buffer => NetworkOpaque).ip_mut();
         ip.set_ip_ecn(ip_ecn.map(|codepoint| codepoint as u8));
         ip.set_ip_version(Some(match parsed.version {
             IpVersion::V4 => 4,
             IpVersion::V6 => 6,
         }));
         ip.set_ip_protocol(Some(u8::from(parsed.protocol)));
-        ip.set_fib_index(crate::lookup::fib_index_for(
-            parsed.version,
-            unsafe { transmute::<_, &NetworkOpaque>(buffer.opaque()) }.sw_if_index[0],
-        ));
+        ip.set_fib_index(crate::lookup::fib_index_for(parsed.version, sw_if_index));
     }
     let trace = traced.then_some(IpInputTrace {
         version: Some(parsed.version),
@@ -234,7 +229,7 @@ fn next_slot_for_index(
             let net = hammer_service::net::NetMain::global()?;
             let mut buffer = runtime.buffer_mut(index);
             let interface_index =
-                unsafe { transmute::<_, &NetworkOpaque>(buffer.opaque()) }.sw_if_index[0];
+                hammer_core::buffer_opaque!(buffer => NetworkOpaque).sw_if_index[0];
             net.interface_main().start_feature_arc(
                 arc_index,
                 interface_index,
@@ -251,7 +246,7 @@ fn next_slot_for_index(
                 IpVersion::V4 => crate::protocol::icmp::IcmpErrorMetadata::ipv4_time_exceeded(),
                 IpVersion::V6 => crate::protocol::icmp::IcmpErrorMetadata::ipv6_time_exceeded(),
             };
-            metadata.write(runtime.buffer_mut(index).opaque2_mut());
+            metadata.write(hammer_core::buffer_opaque!(mut runtime.buffer_mut(index) => crate::IpSecondaryOpaque));
             match parsed.version {
                 IpVersion::V4 => Ip4InputNext::IcmpError.slot() as u16,
                 IpVersion::V6 => Ip6InputNext::IcmpError.slot() as u16,

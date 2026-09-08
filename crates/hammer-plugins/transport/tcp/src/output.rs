@@ -8,7 +8,6 @@ use hammer_service::session::node::SessionQueueNode;
 
 use super::{TcpOutputError, read_tcp_egress_endpoints};
 use hammer_service::opaque::NetworkOpaque;
-use std::mem::transmute;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 pub const DEFAULT_TCP_OUTPUT_PAYLOAD_LEN: usize = 1_440;
 const TCP_CHECKSUM_OFFSET: usize = 16;
@@ -106,7 +105,9 @@ fn tcp_output_next_for_index<const SIMD_BYTES: usize>(
     let tcp_len = buffer
         .current_len()
         .checked_add(buffer.total_len_not_including_first());
-    let endpoints = read_tcp_egress_endpoints(buffer.opaque2());
+    let endpoints = read_tcp_egress_endpoints(
+        hammer_core::buffer_opaque!(buffer => crate::TcpSecondaryOpaque).egress(),
+    );
 
     let Some(tcp_len) = tcp_len else {
         let _ = runtime.record_current_node_error(TcpOutputError::SegmentTooLong);
@@ -171,7 +172,7 @@ fn tcp_output_push_ipv4<const SIMD_BYTES: usize>(
     let tcp_header_len = tcp_header(&buffer.current()[IPV4_HEADER_LEN..])
         .map(|tcp| tcp.header_len())
         .unwrap_or(20);
-    let network = unsafe { transmute::<_, &mut NetworkOpaque>(buffer.opaque_mut()) };
+    let network = hammer_core::buffer_opaque!(mut buffer => NetworkOpaque);
     network.sw_if_index = [u32::MAX; 2];
     network.set_packet_cursor(
         BufferPacketCursor::new()
@@ -210,7 +211,7 @@ fn tcp_output_push_ipv6<const SIMD_BYTES: usize>(
     let tcp_header_len = tcp_header(&buffer.current()[IPV6_HEADER_LEN..])
         .map(|tcp| tcp.header_len())
         .unwrap_or(20);
-    let network = unsafe { transmute::<_, &mut NetworkOpaque>(buffer.opaque_mut()) };
+    let network = hammer_core::buffer_opaque!(mut buffer => NetworkOpaque);
     network.sw_if_index = [u32::MAX; 2];
     network.set_packet_cursor(
         BufferPacketCursor::new()
@@ -310,5 +311,74 @@ fn tcp_inflight_sequence_len(snd_una: u32, snd_nxt: u32) -> u32 {
         snd_una.distance_to(snd_nxt)
     } else {
         0
+    }
+}
+
+#[cfg(test)]
+mod opaque_tests {
+    use super::*;
+    use crate::{TcpCapabilities, TcpSecondaryOpaque, TcpSegment, TcpSegmentFlags};
+
+    // Derived from vnet/tcp/tcp_output.c: tcp_output_push_ip consumes the
+    // transport producer's packet metadata to select the IP lookup arc.
+    #[test]
+    fn segment_metadata_reaches_ip_output() -> RuntimeResult<()> {
+        hammer_infra::main_heap::init_default().unwrap();
+        hammer_core::buffer::BufferMain::new(2048, 16, &[0], 1, hammer_infra::PageSize::Default)?;
+        let mut runtime = DataPlaneMain::new(hammer_runtime::DataPlaneBufferConfig {
+            buffer_slot_capacity: 2048,
+            buffer_slots: 16,
+            ..Default::default()
+        });
+        let index = runtime.alloc_index()?;
+        let local = "192.0.2.1:1234".parse().unwrap();
+        let remote = "192.0.2.2:4321".parse().unwrap();
+        {
+            let buffer = runtime.buffer_mut(index);
+            let opaque = hammer_core::buffer_opaque!(mut buffer => TcpSecondaryOpaque);
+            crate::write_session_route_opaque(
+                opaque.route_mut(),
+                17,
+                hammer_runtime::DataWorkerId::new(0),
+                crate::TcpInputNext::Established,
+            );
+            let (session, worker, next) = crate::read_session_route_opaque(opaque.route()).unwrap();
+            assert_eq!(session, 17);
+            assert_eq!(worker.slot(), 0);
+            assert!(matches!(next, crate::TcpInputNext::Established));
+            assert_eq!(
+                std::ptr::from_ref(opaque.route()).addr(),
+                std::ptr::from_ref(opaque.egress()).addr()
+            );
+            TcpSegment::new(
+                local,
+                remote,
+                1,
+                2,
+                1024,
+                TcpSegmentFlags::ACK,
+                TcpCapabilities::default(),
+                None,
+                None,
+                None,
+                None,
+                0,
+            )
+            .write_to_buffer(buffer)?;
+        }
+        assert!(matches!(
+            tcp_output_next_for_index::<1>(&mut runtime, index)?,
+            TcpOutputNext::LookupV4
+        ));
+        {
+            let buffer = runtime.buffer(index);
+            assert_eq!(&buffer.current()[12..16], &[192, 0, 2, 1]);
+            assert_eq!(&buffer.current()[16..20], &[192, 0, 2, 2]);
+            let network = hammer_core::buffer_opaque!(buffer => NetworkOpaque);
+            assert_eq!(network.ip().ip_protocol(), Some(6));
+            assert_eq!(network.packet_cursor().transport_header_offset(), 20);
+        }
+        runtime.buffers().drop_index_owned_with_trace(index, |_| {});
+        Ok(())
     }
 }
