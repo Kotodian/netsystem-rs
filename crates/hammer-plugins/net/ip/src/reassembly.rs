@@ -1045,6 +1045,24 @@ impl FragmentContext {
         runtime: &mut DataPlaneMain,
         total_payload_len: usize,
     ) -> RuntimeResult<ReassemblyInsert> {
+        // Validate every retained range before changing any links. Both VPP
+        // full-reassembly finalizers trim against the entire sub-chain length.
+        for fragment in &self.fragments {
+            let required = fragment
+                .header_len
+                .checked_add(fragment.end - fragment.start)
+                .ok_or(IpReassemblyError::FragmentRangeOverflow)?;
+            let mut length = 0usize;
+            for buffer in runtime.chain(fragment.index) {
+                assert_eq!(buffer.ref_count(), 1, "reassembly owns exclusive fragments");
+                length = length
+                    .checked_add(buffer.current_len())
+                    .ok_or(IpReassemblyError::FragmentRangeOverflow)?;
+            }
+            if required > length {
+                return Err(IpReassemblyError::FragmentHeaderInvalid.into());
+            }
+        }
         match self.version {
             IpVersion::V4 => self.assemble_ipv4_chain(runtime, total_payload_len),
             IpVersion::V6 => self.assemble_ipv6_chain(runtime, total_payload_len),
@@ -1073,29 +1091,18 @@ impl FragmentContext {
         }
 
         let complete = first.index;
-        self.fragments.sort_by_key(|fragment| fragment.start);
-        let mut position = 0;
-        while position < self.fragments.len() {
-            let fragment = self.fragments[position];
-            if fragment.index == complete {
-                let buffer = runtime.buffer_mut(complete);
-                buffer.truncate(fragment.header_len + (fragment.end - fragment.start))?;
-            } else {
-                trim_fragment_payload_chain(runtime, fragment)?;
-                runtime.chain_buffer(complete, fragment.index)?;
-                // The head now owns this complete chain. Retain only roots
-                // that still carry a separate release obligation on error.
-                self.fragments.remove(position);
-                continue;
-            }
-            position += 1;
+        let mut last = trim_fragment_payload_chain(runtime, &mut self.fragments[0], true);
+        while self.fragments.len() > 1 {
+            let tail = trim_fragment_payload_chain(runtime, &mut self.fragments[1], false);
+            runtime
+                .buffer_mut(last)
+                .set_next_buffer(Some(self.fragments[1].index));
+            last = tail;
+            // The completed head now owns every kept segment of this range.
+            self.fragments.remove(1);
         }
         {
             let buffer = runtime.buffer_mut(complete);
-            let header = buffer.current();
-            if header.len() < header_len {
-                return Err(IpReassemblyError::FragmentHeaderInvalid.into());
-            }
             let header = &mut buffer.current_mut()[..header_len];
             header[IPV4_TOTAL_LENGTH_OFFSET..IPV4_TOTAL_LENGTH_OFFSET + 2]
                 .copy_from_slice(&(total_len as u16).to_be_bytes());
@@ -1103,6 +1110,11 @@ impl FragmentContext {
                 .copy_from_slice(&0u16.to_be_bytes());
             update_ipv4_header_checksum(header, header_len);
         }
+        let tail_len = total_len - runtime.buffer(complete).current_len();
+        runtime
+            .buffer_mut(complete)
+            .set_total_len_not_including_first(tail_len)
+            .expect("validated IPv4 packet length fits Buffer chain length");
         self.fragments.clear();
         Ok(ReassemblyInsert::Reassembled(complete))
     }
@@ -1127,39 +1139,38 @@ impl FragmentContext {
             let buffer = runtime.buffer(complete);
             buffer.current()[IPV6_HEADER_LEN]
         };
-        self.fragments.sort_by_key(|fragment| fragment.start);
-        let mut position = 0;
-        while position < self.fragments.len() {
-            let fragment = self.fragments[position];
-            if fragment.index == complete {
-                let buffer = runtime.buffer_mut(complete);
-                {
-                    let packet = buffer.current_mut();
-                    packet.copy_within(
-                        IPV6_HEADER_LEN + IPV6_FRAGMENT_HEADER_LEN
-                            ..IPV6_HEADER_LEN
-                                + (fragment.end - fragment.start)
-                                + IPV6_FRAGMENT_HEADER_LEN,
-                        IPV6_HEADER_LEN,
-                    );
-                }
-                let header = &mut buffer.current_mut()[..IPV6_HEADER_LEN];
-                header[IPV6_PAYLOAD_LENGTH_OFFSET..IPV6_PAYLOAD_LENGTH_OFFSET + 2]
-                    .copy_from_slice(&(payload_len as u16).to_be_bytes());
-                header[IPV6_NEXT_HEADER_OFFSET] = fragment_next_header;
-                runtime
-                    .buffer_mut(complete)
-                    .truncate(IPV6_HEADER_LEN + (fragment.end - fragment.start))?;
-            } else {
-                trim_fragment_payload_chain(runtime, fragment)?;
-                runtime.chain_buffer(complete, fragment.index)?;
-                // The head now owns this complete chain. Retain only roots
-                // that still carry a separate release obligation on error.
-                self.fragments.remove(position);
-                continue;
-            }
-            position += 1;
+        let mut last = trim_fragment_payload_chain(runtime, &mut self.fragments[0], true);
+        while self.fragments.len() > 1 {
+            let tail = trim_fragment_payload_chain(runtime, &mut self.fragments[1], false);
+            runtime
+                .buffer_mut(last)
+                .set_next_buffer(Some(self.fragments[1].index));
+            last = tail;
+            // The completed head now owns every kept segment of this range.
+            self.fragments.remove(1);
         }
+        {
+            let buffer = runtime.buffer_mut(complete);
+            let segment_len = buffer.current_len();
+            // ip6_full_reass_finalize moves only bytes in the first Buffer;
+            // subsequent payload segments retain their windows and storage.
+            buffer.current_mut().copy_within(
+                IPV6_HEADER_LEN + IPV6_FRAGMENT_HEADER_LEN..segment_len,
+                IPV6_HEADER_LEN,
+            );
+            buffer
+                .truncate(segment_len - IPV6_FRAGMENT_HEADER_LEN)
+                .expect("removing the Fragment Header shortens the first segment");
+            let header = &mut buffer.current_mut()[..IPV6_HEADER_LEN];
+            header[IPV6_PAYLOAD_LENGTH_OFFSET..IPV6_PAYLOAD_LENGTH_OFFSET + 2]
+                .copy_from_slice(&(payload_len as u16).to_be_bytes());
+            header[IPV6_NEXT_HEADER_OFFSET] = fragment_next_header;
+        }
+        let tail_len = IPV6_HEADER_LEN + payload_len - runtime.buffer(complete).current_len();
+        runtime
+            .buffer_mut(complete)
+            .set_total_len_not_including_first(tail_len)
+            .expect("validated IPv6 packet length fits Buffer chain length");
         self.fragments.clear();
         Ok(ReassemblyInsert::Reassembled(complete))
     }
@@ -1204,12 +1215,52 @@ fn refresh_metadata(runtime: &DataPlaneMain, index: u32) -> RuntimeResult<()> {
 #[inline(always)]
 fn trim_fragment_payload_chain(
     runtime: &mut DataPlaneMain,
-    fragment: ReassemblyFragment,
-) -> RuntimeResult<()> {
-    let payload_len = fragment.end - fragment.start;
-    let buffer = runtime.buffer_mut(fragment.index);
-    buffer.advance(fragment.header_len as isize);
-    Ok(buffer.truncate(payload_len)?)
+    fragment: &mut ReassemblyFragment,
+    keep_header: bool,
+) -> u32 {
+    let mut skip = if keep_header { 0 } else { fragment.header_len };
+    let mut remaining =
+        fragment.end - fragment.start + if keep_header { fragment.header_len } else { 0 };
+    let mut next = Some(fragment.index);
+    let mut last = None;
+    let mut discarded = [0; DEFAULT_BUFFER_FRAME_CAPACITY];
+    let mut discarded_len = 0;
+    while let Some(index) = next {
+        let buffer = runtime.buffer_mut(index);
+        next = buffer.next_buffer_slot();
+        buffer.set_next_buffer(None);
+        if skip > buffer.current_len() {
+            skip -= buffer.current_len();
+        } else if remaining != 0 {
+            buffer.advance(skip as isize);
+            skip = 0;
+            let keep = remaining.min(buffer.current_len());
+            buffer
+                .truncate(keep)
+                .expect("fragment trimming only shortens a segment");
+            remaining -= keep;
+            if let Some(last) = last {
+                runtime.buffer_mut(last).set_next_buffer(Some(index));
+            } else {
+                fragment.index = index;
+            }
+            last = Some(index);
+            continue;
+        }
+        // Full prefix/suffix segments are detached before their batch release.
+        discarded[discarded_len] = index;
+        discarded_len += 1;
+        if discarded_len == discarded.len() {
+            runtime.buffer_free_no_next(&discarded);
+            discarded_len = 0;
+        }
+    }
+    assert_eq!(
+        remaining, 0,
+        "validated fragment chain contains its entire range"
+    );
+    runtime.buffer_free_no_next(&discarded[..discarded_len]);
+    last.expect("nonempty fragment range retains a segment")
 }
 
 #[inline(always)]
@@ -1265,8 +1316,8 @@ mod tests {
         let mut indices = [0; 2];
         assert_eq!(runtime.buffer_alloc(&mut indices), 2);
         runtime.buffer_mut(indices[0]).put_uninit(28).fill(0);
-        runtime.buffer_mut(indices[1]).put_uninit(8).fill(0);
         runtime.buffer_chain_buffer(indices[0], indices[1]);
+        runtime.buffer_mut(indices[1]).put_uninit(8).fill(0);
         let mut context = FragmentContext::new(key, IpVersion::V4, now);
         assert!(matches!(
             context
@@ -1416,6 +1467,122 @@ mod tests {
             assert_eq!(runtime.cached_free_buffers(), cached_free);
             runtime.buffer_free(core::slice::from_ref(&head));
             assert_eq!(runtime.cached_free_buffers(), cached_free + 2);
+        }
+
+        // test_reassembly.py repeats complete IPv4/IPv6 packets and reverses
+        // arrival order. The physical segment/padding boundaries here derive
+        // specifically from ip4_full_reass_finalize/ip6_full_reass_finalize's
+        // trim_front/keep_data loops, not a claimed standalone upstream test.
+        for version in [IpVersion::V4, IpVersion::V6] {
+            for reversed in [false, true] {
+                let header_len = match version {
+                    IpVersion::V4 => IPV4_HEADER_MIN_LEN,
+                    IpVersion::V6 => IPV6_HEADER_LEN + IPV6_FRAGMENT_HEADER_LEN,
+                };
+                let mut indices = [0; 6];
+                assert_eq!(runtime.buffer_alloc(&mut indices), indices.len());
+                for (offset, chain) in indices.chunks_exact(3).enumerate() {
+                    let packet = runtime
+                        .buffer_mut(chain[0])
+                        .put_uninit((header_len + 4) as u16);
+                    packet.fill(0);
+                    match version {
+                        IpVersion::V4 => {
+                            packet[0] = 0x45;
+                            packet[2..4].copy_from_slice(&36u16.to_be_bytes());
+                            packet[4..6].copy_from_slice(&7u16.to_be_bytes());
+                            packet[6..8].copy_from_slice(
+                                &(if offset == 0 { 0x2000u16 } else { 2u16 }).to_be_bytes(),
+                            );
+                            packet[9] = 17;
+                            packet[12..16].copy_from_slice(&[192, 0, 2, 1]);
+                            packet[16..20].copy_from_slice(&[192, 0, 2, 2]);
+                            update_ipv4_header_checksum(packet, header_len);
+                        }
+                        IpVersion::V6 => {
+                            packet[0] = 0x60;
+                            packet[4..6].copy_from_slice(&24u16.to_be_bytes());
+                            packet[6] = 44;
+                            packet[40] = 17;
+                            packet[42..44].copy_from_slice(
+                                &(if offset == 0 { 1u16 } else { 16u16 }).to_be_bytes(),
+                            );
+                            packet[44..48].copy_from_slice(&7u32.to_be_bytes());
+                        }
+                    }
+                    packet[header_len..].fill(offset as u8 + 1);
+                    let payload = runtime.buffer_mut(chain[1]).put_uninit(16);
+                    payload[..12].fill(offset as u8 + 1);
+                    payload[12..].fill(0xee);
+                    runtime.buffer_mut(chain[2]).put_uninit(7).fill(0xee);
+                    runtime.buffer_mut(chain[0]).set_next_buffer(Some(chain[1]));
+                    runtime.buffer_mut(chain[1]).set_next_buffer(Some(chain[2]));
+                    runtime
+                        .buffer_mut(chain[0])
+                        .set_total_len_not_including_first(23)
+                        .unwrap();
+                }
+                let parsed =
+                    parse_ip_fragment_with_chain_len(runtime.buffer(indices[0]).current(), 23)
+                        .unwrap();
+                let mut context = FragmentContext::new(parsed.key, version, now);
+                let cached_free = runtime.cached_free_buffers();
+                let order = if reversed {
+                    [indices[3], indices[0]]
+                } else {
+                    [indices[0], indices[3]]
+                };
+                for (position, index) in order.into_iter().enumerate() {
+                    let parsed =
+                        parse_ip_fragment_with_chain_len(runtime.buffer(index).current(), 23)
+                            .unwrap();
+                    let result = context
+                        .insert_fragment(&mut runtime, index, parsed, now, 4)
+                        .unwrap();
+                    if position == 0 {
+                        assert!(matches!(result, ReassemblyInsert::Pending));
+                    } else {
+                        assert!(
+                            matches!(result, ReassemblyInsert::Reassembled(head) if head == indices[0])
+                        );
+                    }
+                }
+                assert!(context.fragments.is_empty());
+                let head = indices[0];
+                let packet_header_len = match version {
+                    IpVersion::V4 => IPV4_HEADER_MIN_LEN,
+                    IpVersion::V6 => IPV6_HEADER_LEN,
+                };
+                assert_eq!(runtime.chain(head).count(), 4);
+                assert!(
+                    runtime
+                        .chain(head)
+                        .flat_map(|buffer| buffer.current().iter().copied())
+                        .skip(packet_header_len)
+                        .eq(std::iter::repeat_n(1, 16).chain(std::iter::repeat_n(2, 16)))
+                );
+                assert_eq!(runtime.buffer(head).total_len_not_including_first(), 28);
+                assert_eq!(runtime.buffer(indices[1]).current_len(), 12);
+                assert_eq!(runtime.buffer(indices[4]).current_len(), 12);
+                assert_eq!(runtime.buffer(indices[1]).current_data_offset(), 0);
+                assert_eq!(runtime.buffer(indices[4]).current_data_offset(), 0);
+                assert_eq!(runtime.buffer(indices[4]).next_buffer_slot(), None);
+                assert!(runtime.chain(head).all(|buffer| buffer.ref_count() == 1));
+                match version {
+                    IpVersion::V4 => {
+                        assert_eq!(&runtime.buffer(head).current()[2..4], &52u16.to_be_bytes());
+                        assert_eq!(&runtime.buffer(head).current()[6..8], &[0, 0]);
+                        assert_eq!(internet_checksum(&runtime.buffer(head).current()[..20]), 0);
+                    }
+                    IpVersion::V6 => {
+                        assert_eq!(&runtime.buffer(head).current()[4..6], &32u16.to_be_bytes());
+                        assert_eq!(runtime.buffer(head).current()[6], 17);
+                    }
+                }
+                assert_eq!(runtime.cached_free_buffers(), cached_free + 2);
+                runtime.buffer_free_one(head);
+                assert_eq!(runtime.cached_free_buffers(), cached_free + 6);
+            }
         }
 
         // VPP's fragment-limit path drops all retained ranges before freeing

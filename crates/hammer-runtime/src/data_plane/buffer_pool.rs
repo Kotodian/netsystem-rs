@@ -161,37 +161,6 @@ impl DataPlaneMain {
         allocated + self.buffer_alloc_from_pool(&mut ring[..count - before_wrap], pool_index)
     }
 
-    pub fn chain_buffer(&mut self, head: u32, tail: u32) -> RuntimeResult<()> {
-        let mut last = head;
-        while let Some(next) = self.buffer(last).next_buffer_slot() {
-            last = next;
-        }
-        let mut tail_last = tail;
-        while let Some(next) = self.buffer(tail_last).next_buffer_slot() {
-            tail_last = next;
-        }
-        assert_ne!(last, tail_last, "exclusive chains must not overlap");
-        for buffer in self.chain(head).chain(self.chain(tail)) {
-            assert_eq!(buffer.ref_count(), 1, "chain segments are exclusive");
-        }
-        let tail_length: usize = self.chain(tail).map(|buffer| buffer.current_len()).sum();
-        let head_length: usize = self
-            .chain(head)
-            .skip(1)
-            .map(|buffer| buffer.current_len())
-            .sum();
-        let total = head_length
-            .checked_add(tail_length)
-            .filter(|length| u32::try_from(*length).is_ok())
-            .ok_or(hammer_core::error::DataPlaneError::from(
-                hammer_core::error::BufferInvariant::ChainLengthOverflow,
-            ))?;
-        self.buffer_mut(last).set_next_buffer(Some(tail));
-        self.buffer_mut(head)
-            .set_total_len_not_including_first(total)?;
-        Ok(())
-    }
-
     pub fn buffer_chain_init(&mut self, first: u32) {
         hammer_core::buffer::BufferMain::global().chain_init(first);
     }

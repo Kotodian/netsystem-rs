@@ -1160,7 +1160,11 @@ pub(crate) mod tests {
             runtime.buffer_add_data(&mut tail, &packet[37..]),
             (&packet[37..]).len()
         );
-        runtime.chain_buffer(head, tail)?;
+        let tail_len = runtime.buffer(tail).current_len();
+        runtime.buffer_mut(head).set_next_buffer(Some(tail));
+        runtime
+            .buffer_mut(head)
+            .set_total_len_not_including_first(tail_len)?;
         let parsed = ip_header(
             &packet,
             BufferPacketCursor::new()
