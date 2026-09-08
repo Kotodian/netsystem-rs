@@ -2028,7 +2028,7 @@ impl DataPlaneMain {
 
             // dispatch_pending_node transfers the enqueue trace bit once and
             // clears it for the next frame, including an untraced dispatch.
-            let trace = next_frame_index.map_or(0, |index| {
+            let trace = next_frame_index.map_or(frame.frame_flags & (1 << 5), |index| {
                 let next = &mut self.nodes.next_frames[index];
                 let trace = next.flags & (1 << 5);
                 next.flags &= !(1 << 5);

@@ -632,5 +632,21 @@ mod tests {
             );
             assert_eq!(runtime.nodes.next_frames[next].flags & (1 << 5), 0);
         }
+        // dispatch_pending_node uses the Frame trace bit for direct enqueue,
+        // where there is no associated Next Frame.
+        for trace in [true, false] {
+            let mut frame = runtime.get_frame_to_node(output).unwrap();
+            frame.set_vector_count(1);
+            frame.vector_args_mut()[0] = 43;
+            if trace {
+                frame.frame_flags |= 1 << 5;
+            }
+            runtime.put_frame_to_node(output, frame).unwrap();
+            assert_eq!(runtime.run_ready_nodes().unwrap(), 1);
+            assert_eq!(
+                runtime.nodes().node_runtime_data(output).unwrap().word(3),
+                if trace { 1 << 5 } else { 0 }
+            );
+        }
     }
 }
