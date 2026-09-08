@@ -36,7 +36,7 @@ impl DataPlaneMain {
     /// by the source. On error the Frame contains only the untransferred suffix.
     #[inline]
     pub fn handoff_frame(
-        &self,
+        &mut self,
         worker: DataWorkerId,
         target: NodeId,
         frame: &mut Frame,
@@ -74,7 +74,7 @@ impl DataPlaneMain {
 
     #[inline]
     pub fn handoff_index(
-        &self,
+        &mut self,
         worker: DataWorkerId,
         target: NodeId,
         index: u32,

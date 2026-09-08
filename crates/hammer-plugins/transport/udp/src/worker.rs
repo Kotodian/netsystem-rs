@@ -548,7 +548,7 @@ impl UdpWorker {
 
     fn handoff_migration_datagram(
         &self,
-        runtime: &DataPlaneMain,
+        runtime: &mut DataPlaneMain,
         reply: SessionSwitchPoolReply,
     ) -> Result<(), SessionSwitchPoolReply> {
         let worker = if reply.status == SessionSwitchPoolStatus::Rejected {
