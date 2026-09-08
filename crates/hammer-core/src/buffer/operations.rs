@@ -92,8 +92,7 @@ impl BufferMain {
             .min(u16::MAX as usize - tail.current_len());
         let total = if first != last {
             // SAFETY: the same validated chain retains first during this operation.
-            unsafe { self.buffer(first) }
-                .total_len_not_including_first()
+            (unsafe { self.buffer(first) }.total_length_not_including_first as usize)
                 .checked_add(count)
                 .filter(|len| u32::try_from(*len).is_ok())
                 .expect("chain length fits u32")
@@ -225,7 +224,7 @@ impl BufferMain {
         let buffer = unsafe { self.buffer(tail) };
         let total = buffer
             .current_len()
-            .checked_add(buffer.total_len_not_including_first())
+            .checked_add(buffer.total_length_not_including_first as usize)
             .filter(|len| u32::try_from(*len).is_ok())
             .expect("clone chain length fits u32");
         let length_valid = buffer.flags().contains(BufferFlags::TOTAL_LENGTH_VALID);
@@ -274,6 +273,16 @@ pub(super) mod tests {
         assert_eq!(main.chain_append(heads[0], heads[0], &[1, 2, 3, 4]), 4);
         assert_eq!(main.chain_link(heads[0], tail[0]), tail[0]);
         assert_eq!(main.chain_append(heads[0], tail[0], &[5, 6, 7, 8]), 4);
+        // vlib_buffer_add_data invalidates the cached total without clearing
+        // its retained value. Chain append still increments that field.
+        assert_eq!(main.add_data(1, 0, &mut heads[0], &[]), 0);
+        assert_eq!(main.chain_append(heads[0], tail[0], &[9]), 1);
+        // SAFETY: this test retains the exclusive chain during inspection.
+        unsafe {
+            let buffer = main.buffer(heads[0]);
+            assert_eq!(buffer.total_length_not_including_first, 5);
+            assert!(!buffer.flags().contains(BufferFlags::TOTAL_LENGTH_VALID));
+        }
         assert!(
             std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                 main.attach_clone(heads[1], tail[0]);
@@ -311,13 +320,19 @@ pub(super) mod tests {
         unsafe {
             assert_eq!(main.buffer(heads[0]).ref_count(), 2);
             assert_eq!(main.buffer(tail[0]).ref_count(), 2);
-            assert_eq!(main.buffer(heads[1]).total_len_not_including_first(), 8);
+            assert_eq!(main.buffer(heads[1]).total_length_not_including_first, 9);
+            assert!(
+                !main
+                    .buffer(heads[1])
+                    .flags()
+                    .contains(BufferFlags::TOTAL_LENGTH_VALID)
+            );
         }
         main.free_buffers(1, &heads[..1], true, |_| {});
         // SAFETY: the clone still retains both tail segments.
         unsafe {
             assert_eq!(main.buffer(heads[0]).ref_count(), 1);
-            assert_eq!(main.buffer(tail[0]).current(), &[5, 6, 7, 8]);
+            assert_eq!(main.buffer(tail[0]).current(), &[5, 6, 7, 8, 9]);
         }
         main.free_buffers(1, &heads[1..], true, |_| {});
         let mut recycled = [0];
