@@ -176,11 +176,17 @@ pub(super) mod tests {
             let secondary = crate::buffer_opaque!(mut buffer => PacketSecondaryMetadata);
             assert_eq!(std::ptr::from_ref(secondary).addr(), address + 72);
             secondary.words = [0xfedc_ba98_7654_3210; 7];
+            buffer.put_uninit(4).copy_from_slice(&[17, 19, 23, 29]);
+            buffer.push_uninit(2).copy_from_slice(&[11, 13]);
+            buffer.set_trace_handle(7);
         }
         let copied = buffers.copy_no_chain(1, index).unwrap();
         {
             // SAFETY: this test retains the segment and ends this borrow before freeing it.
             let buffer = unsafe { buffers.buffer(copied) };
+            assert_eq!(buffer.current_data_offset(), -2);
+            assert_eq!(buffer.current(), &[11, 13, 17, 19, 23, 29]);
+            assert_eq!(buffer.trace_handle(), None);
             assert_eq!(
                 crate::buffer_opaque!(&buffer => PacketMetadata).words,
                 [0x0123_4567_89ab_cdef; 5]
@@ -190,6 +196,14 @@ pub(super) mod tests {
                 [0xfedc_ba98_7654_3210; 7]
             );
         }
+        {
+            // SAFETY: the source remains owned and is distinct from the copy.
+            let buffer = unsafe { buffers.buffer_mut(index) };
+            assert_eq!(buffer.trace_handle(), Some(7));
+            buffer.current_mut()[0] = 31;
+        }
+        // SAFETY: both indices remain allocated; no mutation overlaps this borrow.
+        assert_eq!(unsafe { buffers.buffer(copied) }.current()[0], 11);
         buffers.free_buffers(1, &[index], true, |_| {});
         let mut recycled = 0;
         assert_eq!(
