@@ -57,6 +57,27 @@ impl PluginMetadata {
         }
     }
 
+    fn validate_buffer_layout(&self, path: &Path) -> Result<(), PluginError> {
+        if self.buffer_pre_data_size != BUFFER_PRE_DATA_SIZE as u32
+            || self.buffer_trajectory_size != BUFFER_TRACE_TRAJECTORY_SIZE as u32
+            || self.buffer_size != size_of::<Buffer>() as u32
+            || self.buffer_alignment != align_of::<Buffer>() as u32
+        {
+            return Err(PluginError::BufferLayoutMismatch {
+                path: path.to_owned(),
+                host_pre_data_size: BUFFER_PRE_DATA_SIZE as u32,
+                plugin_pre_data_size: self.buffer_pre_data_size,
+                host_trajectory_size: BUFFER_TRACE_TRAJECTORY_SIZE as u32,
+                plugin_trajectory_size: self.buffer_trajectory_size,
+                host_buffer_size: size_of::<Buffer>() as u32,
+                plugin_buffer_size: self.buffer_size,
+                host_buffer_alignment: align_of::<Buffer>() as u32,
+                plugin_buffer_alignment: self.buffer_alignment,
+            });
+        }
+        Ok(())
+    }
+
     #[inline]
     pub fn name(&self) -> &str {
         self.name.as_str()
@@ -459,23 +480,7 @@ impl PluginMain {
         let metadata = module.metadata();
         // RegistrationImage is opaque to abi_stable. Check the artifact's
         // compiled Buffer facts before any image access or table publication.
-        if metadata.buffer_pre_data_size != BUFFER_PRE_DATA_SIZE as u32
-            || metadata.buffer_trajectory_size != BUFFER_TRACE_TRAJECTORY_SIZE as u32
-            || metadata.buffer_size != size_of::<Buffer>() as u32
-            || metadata.buffer_alignment != align_of::<Buffer>() as u32
-        {
-            return Err(PluginError::BufferLayoutMismatch {
-                path,
-                host_pre_data_size: BUFFER_PRE_DATA_SIZE as u32,
-                plugin_pre_data_size: metadata.buffer_pre_data_size,
-                host_trajectory_size: BUFFER_TRACE_TRAJECTORY_SIZE as u32,
-                plugin_trajectory_size: metadata.buffer_trajectory_size,
-                host_buffer_size: size_of::<Buffer>() as u32,
-                plugin_buffer_size: metadata.buffer_size,
-                host_buffer_alignment: align_of::<Buffer>() as u32,
-                plugin_buffer_alignment: metadata.buffer_alignment,
-            });
-        }
+        metadata.validate_buffer_layout(&path)?;
         if metadata.name() != manifest.name
             || metadata.version() != manifest.version
             || metadata.version_required() != manifest.version_required
@@ -589,5 +594,60 @@ pub fn host_meets_plugin_requirement(
         Ok(())
     } else {
         Err(PluginError::SemVerMismatch { host, required })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // ADR-0007 extends VPP's build-wide Buffer layout contract with explicit
+    // plugin metadata validation. This case exercises only that validation.
+    #[test]
+    fn buffer_layout_rejects_each_mismatched_field() {
+        let matching = PluginMetadata::new(
+            RStr::from_str("ip"),
+            RStr::from_str("1.0.0"),
+            RStr::from_str("1.0.0"),
+            RSlice::from_slice(&[]),
+        );
+        // Diagnostic identity only: no file or library is opened by validation.
+        let path = Path::new("ip");
+        assert!(matching.validate_buffer_layout(path).is_ok());
+        for field in 0..4 {
+            let mut metadata = matching;
+            match field {
+                0 => metadata.buffer_pre_data_size += 64,
+                1 => metadata.buffer_trajectory_size ^= 64,
+                2 => metadata.buffer_size += 64,
+                3 => metadata.buffer_alignment *= 2,
+                _ => unreachable!(),
+            }
+            let error = metadata.validate_buffer_layout(path).unwrap_err();
+            let PluginError::BufferLayoutMismatch {
+                path: rejected_path,
+                host_pre_data_size,
+                plugin_pre_data_size,
+                host_trajectory_size,
+                plugin_trajectory_size,
+                host_buffer_size,
+                plugin_buffer_size,
+                host_buffer_alignment,
+                plugin_buffer_alignment,
+            } = error
+            else {
+                panic!("Buffer layout mismatch must retain its typed category");
+            };
+            assert_eq!(rejected_path, path);
+            assert_eq!(host_pre_data_size, matching.buffer_pre_data_size);
+            assert_eq!(plugin_pre_data_size, metadata.buffer_pre_data_size);
+            assert_eq!(host_trajectory_size, matching.buffer_trajectory_size);
+            assert_eq!(plugin_trajectory_size, metadata.buffer_trajectory_size);
+            assert_eq!(host_buffer_size, matching.buffer_size);
+            assert_eq!(plugin_buffer_size, metadata.buffer_size);
+            assert_eq!(host_buffer_alignment, matching.buffer_alignment);
+            assert_eq!(plugin_buffer_alignment, metadata.buffer_alignment);
+        }
+        assert!(matching.validate_buffer_layout(path).is_ok());
     }
 }
