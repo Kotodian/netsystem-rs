@@ -142,7 +142,6 @@ impl BufferMain {
         for mapping in mappings {
             let index = main.pools.len() as u8;
             let mut template = super::header::BufferTemplate::default();
-            template.ref_count = 1;
             template.buffer_pool_index = index;
             let base = mapping.base() as usize;
             let end = base + mapping.size();
@@ -161,7 +160,10 @@ impl BufferMain {
                     // this owned mapping/page; no Buffer users exist yet.
                     // Only the first-cacheline template is initialized here.
                     unsafe {
-                        std::ptr::write(address as *mut super::header::BufferTemplate, template);
+                        std::ptr::write(
+                            address as *mut super::header::BufferTemplate,
+                            template.clone(),
+                        );
                     }
                     indices.push(buffer_index);
                 }

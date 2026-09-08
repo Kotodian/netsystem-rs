@@ -31,6 +31,7 @@ mod header;
 mod main;
 mod memory;
 mod opaque;
+mod operations;
 mod pool;
 mod prefetch;
 

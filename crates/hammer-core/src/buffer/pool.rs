@@ -153,43 +153,8 @@ impl DataPlaneBuffers {
         self.drop_index_owned_with_trace(index, |_| {});
     }
 
-    pub fn drop_index_owned_with_trace(&self, index: u32, mut release_trace: impl FnMut(u32)) {
-        let mut current = Some(index);
-        while let Some(index) = current {
-            let pool = BufferMain::global().pool(index);
-            pool.bind_worker(self.thread_index);
-            let trace = {
-                let mut cache = pool.workers[self.thread_index as usize]
-                    .borrow_mut()
-                    .expect("Buffer cache belongs to this Worker");
-                let mut state = pool.free.write();
-                let buffer = pool.buffer_mut(index, &mut state.1);
-                current = buffer.next_buffer_slot();
-                assert_ne!(buffer.ref_count(), 0, "live Buffer has a reference");
-                buffer.cacheline0.ref_count -= 1;
-                if buffer.ref_count() != 0 {
-                    None
-                } else {
-                    let trace = buffer.take_trace_handle();
-                    buffer.cacheline0 = pool.template;
-                    state.1[pool.slot(index)] = false;
-                    if cache.len == BUFFER_THREAD_CACHE_HIGH_WATER {
-                        let start = cache.len - BUFFER_THREAD_CACHE_BATCH;
-                        state.0.extend_from_slice(&cache.indices[start..cache.len]);
-                        cache.len = start;
-                    }
-                    let offset = cache.len;
-                    cache.indices[offset] = index;
-                    cache.len += 1;
-                    trace
-                }
-            };
-            // Trace finalization may call into runtime state; never invoke it
-            // while holding the Pool lock or borrowing its Worker cache.
-            if let Some(trace) = trace {
-                release_trace(trace);
-            }
-        }
+    pub fn drop_index_owned_with_trace(&self, index: u32, release_trace: impl FnMut(u32)) {
+        BufferMain::global().free_buffers(self.thread_index, &[index], true, release_trace);
     }
 
     pub fn prefetch_header(&self, index: u32) {
@@ -548,31 +513,102 @@ impl BufferPool {
         unsafe { &mut *self.mapping.base().add(offset).cast::<Buffer>() }
     }
 
-    fn alloc_index(&self, thread_index: u32) -> DataPlaneResult<u32> {
+    pub(super) fn alloc_index(&self, thread_index: u32) -> DataPlaneResult<u32> {
+        let mut indices = [0];
+        if self.alloc_indices(thread_index, &mut indices) == 0 {
+            return Err(BufferInvariant::PoolExhausted.into());
+        }
+        Ok(indices[0])
+    }
+
+    pub(super) fn alloc_indices(&self, thread_index: u32, indices: &mut [u32]) -> usize {
         self.bind_worker(thread_index);
         let mut cache = self.workers[thread_index as usize]
             .borrow_mut()
             .expect("Buffer cache belongs to this Worker");
         let mut state = self.free.write();
-        if cache.len == 0 {
-            let count = state.0.len().min(BUFFER_THREAD_CACHE_BATCH);
-            let start = state.0.len() - count;
-            cache.indices[..count].copy_from_slice(&state.0[start..]);
-            state.0.truncate(start);
-            cache.len = count;
+        for (allocated, destination) in indices.iter_mut().enumerate() {
+            if cache.len == 0 {
+                let count = state.0.len().min(BUFFER_THREAD_CACHE_BATCH);
+                let start = state.0.len() - count;
+                cache.indices[..count].copy_from_slice(&state.0[start..]);
+                state.0.truncate(start);
+                cache.len = count;
+            }
+            if cache.len == 0 {
+                return allocated;
+            }
+            cache.len -= 1;
+            let index = cache.indices[cache.len];
+            let slot = self.slot(index);
+            assert!(
+                !state.1[slot],
+                "free Buffer cache cannot contain a live slot"
+            );
+            state.1[slot] = true;
+            self.buffer_mut(index, &mut state.1).cacheline0 = self.template.clone();
+            *destination = index;
         }
-        if cache.len == 0 {
-            return Err(BufferInvariant::PoolExhausted.into());
+        indices.len()
+    }
+}
+
+impl BufferMain {
+    #[doc(hidden)]
+    pub fn free_buffers(
+        &self,
+        thread_index: u32,
+        indices: &[u32],
+        follow_next: bool,
+        mut release_trace: impl FnMut(u32),
+    ) {
+        for &index in indices {
+            let mut current = Some(index);
+            while let Some(index) = current {
+                let pool = self.pool(index);
+                pool.bind_worker(thread_index);
+                let trace = {
+                    let mut cache = pool.workers[thread_index as usize]
+                        .borrow_mut()
+                        .expect("Buffer cache belongs to this Worker");
+                    let mut state = pool.free.write();
+                    let buffer = pool.buffer(index, &state.1);
+                    current = if follow_next {
+                        buffer.next_buffer_slot()
+                    } else {
+                        None
+                    };
+                    assert_ne!(buffer.ref_count(), 0, "live Buffer has a reference");
+                    // AcqRel pairs with clone retention and other releases; only
+                    // the final owner may restore the template and publish the free slot.
+                    let references = buffer
+                        .cacheline0
+                        .ref_count
+                        .fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
+                    if references != 1 {
+                        None
+                    } else {
+                        let buffer = pool.buffer_mut(index, &mut state.1);
+                        let trace = buffer.take_trace_handle();
+                        buffer.cacheline0 = pool.template.clone();
+                        state.1[pool.slot(index)] = false;
+                        if cache.len == BUFFER_THREAD_CACHE_HIGH_WATER {
+                            let start = cache.len - BUFFER_THREAD_CACHE_BATCH;
+                            state.0.extend_from_slice(&cache.indices[start..cache.len]);
+                            cache.len = start;
+                        }
+                        let offset = cache.len;
+                        cache.indices[offset] = index;
+                        cache.len += 1;
+                        trace
+                    }
+                };
+                // Trace finalization may call into runtime state; never invoke it
+                // while holding the Pool lock or borrowing its Worker cache.
+                if let Some(trace) = trace {
+                    release_trace(trace);
+                }
+            }
         }
-        cache.len -= 1;
-        let index = cache.indices[cache.len];
-        let slot = self.slot(index);
-        assert!(
-            !state.1[slot],
-            "free Buffer cache cannot contain a live slot"
-        );
-        state.1[slot] = true;
-        self.buffer_mut(index, &mut state.1).cacheline0 = self.template;
-        Ok(index)
     }
 }

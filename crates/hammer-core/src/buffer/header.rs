@@ -1,8 +1,9 @@
+use core::sync::atomic::{AtomicU8, Ordering};
 use core::{mem, ptr, slice};
 
 use super::*;
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug)]
 #[repr(C)]
 pub(super) struct BufferTemplate {
     pub(super) cacheline0: hammer_infra::align::CacheLineAlignMark,
@@ -10,7 +11,7 @@ pub(super) struct BufferTemplate {
     pub(super) current_length: u16,
     pub(super) flags: BufferFlags,
     pub(super) flow_id: u32,
-    pub(super) ref_count: u8,
+    pub(super) ref_count: AtomicU8,
     pub(super) buffer_pool_index: u8,
     pub(super) error: Option<NodeErrorIndex>,
     pub(super) next_buffer: u32,
@@ -33,6 +34,24 @@ const _: () = assert!(mem::offset_of!(BufferTemplate, next_buffer) == 16);
 const _: () = assert!(mem::offset_of!(BufferTemplate, current_config_or_punt) == 20);
 const _: () = assert!(mem::offset_of!(BufferTemplate, opaque) == 24);
 
+impl Clone for BufferTemplate {
+    fn clone(&self) -> Self {
+        Self {
+            cacheline0: hammer_infra::align::CacheLineAlignMark,
+            current_data: self.current_data,
+            current_length: self.current_length,
+            flags: self.flags,
+            flow_id: self.flow_id,
+            ref_count: AtomicU8::new(self.ref_count.load(Ordering::Relaxed)),
+            buffer_pool_index: self.buffer_pool_index,
+            error: self.error,
+            next_buffer: self.next_buffer,
+            current_config_or_punt: self.current_config_or_punt,
+            opaque: self.opaque,
+        }
+    }
+}
+
 impl Default for BufferTemplate {
     fn default() -> Self {
         Self {
@@ -41,7 +60,7 @@ impl Default for BufferTemplate {
             current_length: 0,
             flags: BufferFlags::empty(),
             flow_id: 0,
-            ref_count: 1,
+            ref_count: AtomicU8::new(1),
             buffer_pool_index: 0,
             error: None,
             next_buffer: BUFFER_INVALID_INDEX,
@@ -57,7 +76,7 @@ pub struct Buffer {
     pub(super) cacheline0: BufferTemplate,
     pub(super) second_half: hammer_infra::align::CacheLineAlignMark,
     trace_handle: u32,
-    total_length_not_including_first: u32,
+    pub(super) total_length_not_including_first: u32,
     pub(super) opaque2: SecondaryOpaque,
     #[cfg(hammer_buffer_trace_trajectory)]
     trajectory: hammer_infra::align::CacheLineAlignMark,
@@ -143,7 +162,7 @@ impl Buffer {
 
     #[inline]
     pub fn ref_count(&self) -> u8 {
-        self.cacheline0.ref_count
+        self.cacheline0.ref_count.load(Ordering::Acquire)
     }
 
     #[inline]
@@ -385,7 +404,7 @@ mod tests {
     #[test]
     fn single_segment_operations_preserve_the_packet_window() -> DataPlaneResult<()> {
         hammer_infra::main_heap::init_default().unwrap();
-        BufferMain::new(2048, 16, &[0], 1, PageSize::Default)?;
+        BufferMain::new(2048, 16, &[0, 1], 1, PageSize::Default)?;
         let buffers =
             DataPlaneBuffers::from_arenas([BufferPoolArena::with_capacity(2048, 16)], 1, 1, 0);
         let index = buffers.alloc_index_with_bytes(&[1, 2, 3, 4])?;
@@ -469,6 +488,7 @@ mod tests {
         crate::buffer::opaque::tests::metadata_copy_and_pool_recycle_preserve_secondary_storage(
             &buffers,
         )?;
+        crate::buffer::operations::tests::allocation_chains_and_reference_release();
         Ok(())
     }
 }
