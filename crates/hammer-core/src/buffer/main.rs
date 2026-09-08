@@ -31,6 +31,9 @@ pub(super) struct BufferPool {
     pub(super) first_buffer: usize,
     pub(super) buffer_count: usize,
     pub(super) free: Spinlock<Vec<u32>>,
+    // VPP buffer_known_hash equivalent: diagnostics only, never ownership.
+    #[cfg(debug_assertions)]
+    pub(super) known_allocated: Spinlock<std::collections::HashSet<u32>>,
     pub(super) workers: Box<[ThreadOwned<BufferThreadCache>]>,
     pub(super) template: super::header::BufferTemplate,
 }
@@ -185,6 +188,10 @@ impl BufferMain {
                 first_buffer,
                 buffer_count,
                 free: Spinlock::new(indices),
+                #[cfg(debug_assertions)]
+                known_allocated: Spinlock::new(std::collections::HashSet::with_capacity(
+                    buffer_count,
+                )),
                 workers: (0..thread_count).map(|_| ThreadOwned::new()).collect(),
                 template,
             });

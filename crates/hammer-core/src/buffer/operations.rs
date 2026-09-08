@@ -324,6 +324,19 @@ pub(super) mod tests {
         assert_eq!(main.alloc_from_pool(1, &mut recycled, 1), 1);
         assert_eq!(recycled, tail);
         main.free_buffers(1, &recycled, false, |_| {});
+        #[cfg(debug_assertions)]
+        {
+            // buffer.c::vlib_buffer_validate_alloc_free rejects a repeated
+            // release before publishing the same index to a free cache again.
+            let cached_free = main.cached_free_buffers(1, 1);
+            assert!(
+                std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    main.free_buffers(1, &recycled, false, |_| {});
+                }))
+                .is_err()
+            );
+            assert_eq!(main.cached_free_buffers(1, 1), cached_free);
+        }
 
         let capacity = main.pools[0].buffer_count;
         let mut retained = vec![u32::MAX; capacity + 1];

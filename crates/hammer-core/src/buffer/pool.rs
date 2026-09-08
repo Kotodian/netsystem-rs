@@ -154,6 +154,11 @@ impl BufferPool {
 
     // These borrows require the caller's live slot ownership, not a Pool lock.
     unsafe fn buffer(&self, index: u32) -> &Buffer {
+        #[cfg(debug_assertions)]
+        assert!(
+            self.known_allocated.lock().contains(&index),
+            "Buffer {index} is allocated"
+        );
         let slot = self.slot(index);
         let offset = self.first_buffer - self.mapping.base() as usize + slot * self.allocation_size;
         // SAFETY: slot validates alignment, mapping bounds and page containment;
@@ -162,6 +167,11 @@ impl BufferPool {
     }
 
     unsafe fn buffer_mut(&self, index: u32) -> &mut Buffer {
+        #[cfg(debug_assertions)]
+        assert!(
+            self.known_allocated.lock().contains(&index),
+            "Buffer {index} is allocated"
+        );
         let slot = self.slot(index);
         let offset = self.first_buffer - self.mapping.base() as usize + slot * self.allocation_size;
         // SAFETY: the same slot validation applies; the caller owns this segment
@@ -188,6 +198,11 @@ impl BufferPool {
             }
             cache.len -= 1;
             let index = cache.indices[cache.len];
+            #[cfg(debug_assertions)]
+            assert!(
+                self.known_allocated.lock().insert(index),
+                "Buffer {index} was free before allocation"
+            );
             // SAFETY: removing this index from the Worker cache transfers
             // exclusive ownership; restore only the first-cache-line template.
             unsafe { self.buffer_mut(index) }.cacheline0 = self.template.clone();
@@ -237,6 +252,11 @@ impl BufferMain {
                         let buffer = unsafe { pool.buffer_mut(index) };
                         let trace = buffer.take_trace_handle();
                         buffer.cacheline0 = pool.template.clone();
+                        #[cfg(debug_assertions)]
+                        assert!(
+                            pool.known_allocated.lock().remove(&index),
+                            "Buffer {index} is released once"
+                        );
                         if cache.len == BUFFER_THREAD_CACHE_HIGH_WATER {
                             let start = cache.len - BUFFER_THREAD_CACHE_BATCH;
                             pool.free
