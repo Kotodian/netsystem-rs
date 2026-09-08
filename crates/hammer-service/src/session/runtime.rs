@@ -10,9 +10,7 @@ use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
 
 use crossbeam_queue::ArrayQueue;
-use hammer_core::data_plane::{
-    BufferFrame, DataPlaneBuffers, Index as BufferIndex, NodeId, NodeState,
-};
+use hammer_core::data_plane::{BufferFrame, DataPlaneBuffers, NodeId, NodeState};
 use hammer_infra::align::{CacheLineAlignMark, align_up};
 use hammer_infra::fifo::Fifo;
 use hammer_infra::linked_list::LinkedList;
@@ -131,7 +129,7 @@ const DEFAULT_SESSION_MIGRATE_QUEUE_CAPACITY: usize = 1024;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SessionDgramArgs {
-    pub index: BufferIndex,
+    pub index: u32,
     pub payload_offset: usize,
     pub payload_len: usize,
     pub urgent: bool,
@@ -1096,10 +1094,9 @@ impl SessionMain {
 
     pub fn with_worker_mut<R>(
         &self,
-        runtime: &DataPlaneMain,
+        thread_index: u32,
         operation: impl FnOnce(&mut SessionWorker) -> RuntimeResult<R>,
     ) -> RuntimeResult<R> {
-        let thread_index = runtime.thread_index();
         let worker = DataWorkerId::try_from(thread_index)
             .map_err(|_| SessionQueueError::WorkerUnavailable { thread_index })?;
         let mut slot = self.worker(worker)?.borrow_mut().map_err(|source| {
@@ -1115,7 +1112,7 @@ impl SessionMain {
         &self,
         runtime: &DataPlaneMain,
     ) -> RuntimeResult<bool> {
-        self.with_worker_mut(runtime, |sessions| {
+        self.with_worker_mut(runtime.thread_index(), |sessions| {
             Ok(sessions.state == SessionWorkerState::Interrupt)
         })
     }
@@ -1703,7 +1700,7 @@ impl SessionWorker {
         &self,
         buffers: &DataPlaneBuffers,
         session_id: u32,
-        index: BufferIndex,
+        index: u32,
         header: SessionDgramHeader,
     ) -> RuntimeResult<usize> {
         self.enqueue_datagram_rx_from_buffer_at(buffers, session_id, index, 0, header)
@@ -1716,7 +1713,7 @@ impl SessionWorker {
         &self,
         buffers: &DataPlaneBuffers,
         session_id: u32,
-        index: BufferIndex,
+        index: u32,
         payload_offset: usize,
         header: SessionDgramHeader,
     ) -> RuntimeResult<usize> {
@@ -1849,7 +1846,7 @@ impl SessionWorker {
         buffers: &DataPlaneBuffers,
         session_id: u32,
         header: SessionDgramHeader,
-        index: BufferIndex,
+        index: u32,
     ) -> RuntimeResult<usize> {
         let data_offset = header.data_offset() as usize;
         let data_length = header.data_length() as usize;
@@ -3770,7 +3767,7 @@ impl SessionWorker {
         &mut self,
         buffers: &DataPlaneBuffers,
         session_id: u32,
-        index: BufferIndex,
+        index: u32,
         offset: u32,
     ) -> RuntimeResult<RxDelivery> {
         if offset == 0 {
@@ -3999,7 +3996,7 @@ impl SessionWorker {
         session_id: u32,
         offset: usize,
         len: usize,
-        index: BufferIndex,
+        index: u32,
     ) -> RuntimeResult<()> {
         let entry = self
             .entries
@@ -4050,7 +4047,7 @@ impl SessionWorker {
         &self,
         session_id: u32,
         buffers: &DataPlaneBuffers,
-        index: BufferIndex,
+        index: u32,
     ) -> RuntimeResult<(u32, u32)> {
         let Some(entry) = self.entries.get(session_id) else {
             return Ok((0, 0));
@@ -4090,7 +4087,7 @@ impl SessionWorker {
         &self,
         session_id: u32,
         buffers: &DataPlaneBuffers,
-        index: BufferIndex,
+        index: u32,
         offset: u32,
     ) -> RuntimeResult<(u32, Option<(u32, u32)>)> {
         let Some(entry) = self.entries.get(session_id) else {
@@ -4220,7 +4217,7 @@ pub struct TransportSendParams {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct TxBatchBuffer {
-    pub index: BufferIndex,
+    pub index: u32,
     pub tx_offset: usize,
     pub payload_len: usize,
 }
@@ -4247,7 +4244,7 @@ pub trait SessionTransport: Sized {
         _: u32,
         _: usize,
         _: usize,
-        _: &DataPlaneMain,
+        _: &mut DataPlaneMain,
         _: SessionQueueNext,
         _: &mut BufferFrame,
         _: &mut crate::session::node::SessionQueueOutput,
@@ -4258,7 +4255,7 @@ pub trait SessionTransport: Sized {
     fn update_time(
         &mut self,
         sessions: &mut SessionWorker,
-        runtime: &DataPlaneMain,
+        runtime: &mut DataPlaneMain,
         output_next: SessionQueueNext,
         frame: &mut BufferFrame,
         output: &mut crate::session::node::SessionQueueOutput,
@@ -4269,7 +4266,7 @@ pub trait SessionTransport: Sized {
         &mut self,
         sessions: &mut SessionWorker,
         index: u32,
-        runtime: &DataPlaneMain,
+        runtime: &mut DataPlaneMain,
         output_next: SessionQueueNext,
         frame: &mut BufferFrame,
         output: &mut crate::session::node::SessionQueueOutput,
@@ -4287,7 +4284,7 @@ pub trait SessionTransport: Sized {
         &mut self,
         sessions: &mut SessionWorker,
         index: u32,
-        runtime: &DataPlaneMain,
+        runtime: &mut DataPlaneMain,
         output_next: SessionQueueNext,
         frame: &mut BufferFrame,
         output: &mut crate::session::node::SessionQueueOutput,
@@ -4302,7 +4299,7 @@ pub trait SessionPacketizedTransport: SessionTransport {
         &mut self,
         sessions: &mut SessionWorker,
         index: u32,
-        runtime: &DataPlaneMain,
+        runtime: &mut DataPlaneMain,
         output_next: SessionQueueNext,
         frame: &mut BufferFrame,
         output: &mut crate::session::node::SessionQueueOutput,
@@ -4321,7 +4318,7 @@ pub trait SessionPacketizedTransport: SessionTransport {
         &mut self,
         index: u32,
         batch: &[TxBatchBuffer],
-        buffers: &DataPlaneBuffers,
+        runtime: &mut DataPlaneMain,
         now: Instant,
     ) -> RuntimeResult<()>;
 }
@@ -4332,7 +4329,7 @@ pub trait TransportInternalTransport: SessionTransport {
         sessions: &mut SessionWorker,
         session_id: u32,
         index: u32,
-        runtime: &DataPlaneMain,
+        runtime: &mut DataPlaneMain,
         output_next: SessionQueueNext,
         frame: &mut BufferFrame,
         output: &mut crate::session::node::SessionQueueOutput,
@@ -4349,7 +4346,7 @@ where
         sessions: &mut SessionWorker,
         index: u32,
         session_id: u32,
-        runtime: &DataPlaneMain,
+        runtime: &mut DataPlaneMain,
         output_next: SessionQueueNext,
         frame: &mut BufferFrame,
         output: &mut crate::session::node::SessionQueueOutput,
@@ -4369,7 +4366,7 @@ where
         sessions: &mut SessionWorker,
         index: u32,
         session_id: u32,
-        runtime: &DataPlaneMain,
+        runtime: &mut DataPlaneMain,
         output_next: SessionQueueNext,
         frame: &mut BufferFrame,
         output: &mut crate::session::node::SessionQueueOutput,
@@ -4425,7 +4422,7 @@ where
                 batch_offset += payload_len;
                 remaining_space -= payload_len;
             }
-            transport.tx_action(index, batch.as_slice(), runtime.buffers(), now)?;
+            transport.tx_action(index, batch.as_slice(), runtime, now)?;
             for item in batch.as_slice() {
                 if !output.try_enqueue_io(frame, output_next, item.index)? {
                     sessions.reschedule_old(session_id);
@@ -4453,7 +4450,7 @@ where
         sessions: &mut SessionWorker,
         index: u32,
         session_id: u32,
-        runtime: &DataPlaneMain,
+        runtime: &mut DataPlaneMain,
         output_next: SessionQueueNext,
         frame: &mut BufferFrame,
         output: &mut crate::session::node::SessionQueueOutput,
@@ -4473,7 +4470,7 @@ where
 }
 
 pub fn dispatch_session_queue_once<T>(
-    runtime: &DataPlaneMain,
+    runtime: &mut DataPlaneMain,
     owner: hammer_core::data_plane::NodeId,
     sessions: &mut SessionWorker,
     transport: &mut T,
@@ -4501,7 +4498,7 @@ where
 }
 
 pub fn dispatch_session_queue_pending<T>(
-    runtime: &DataPlaneMain,
+    runtime: &mut DataPlaneMain,
     sessions: &mut SessionWorker,
     transport: &mut T,
     output_next: SessionQueueNext,
@@ -4528,7 +4525,7 @@ where
 }
 
 pub fn dispatch_session_queue_events<T>(
-    runtime: &DataPlaneMain,
+    runtime: &mut DataPlaneMain,
     sessions: &mut SessionWorker,
     transport: &mut T,
     output_next: SessionQueueNext,
@@ -4720,7 +4717,7 @@ where
 fn dispatch_io_event<T>(
     sessions: &mut SessionWorker,
     transport: &mut T,
-    runtime: &DataPlaneMain,
+    runtime: &mut DataPlaneMain,
     output_next: SessionQueueNext,
     frame: &mut BufferFrame,
     output: &mut crate::session::node::SessionQueueOutput,

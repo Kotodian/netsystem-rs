@@ -2,7 +2,7 @@
 
 use crate::DataPlaneMain;
 use hammer_core::data_plane::{
-    BufferFrame, DEFAULT_BUFFER_FRAME_CAPACITY, Frame, Index, Next, NodeId, NodeNext,
+    BufferFrame, DEFAULT_BUFFER_FRAME_CAPACITY, Frame, Next, NodeId, NodeNext,
 };
 use hammer_infra::mask_compare::{mask_compare_u16, mask_compare_u16_words};
 
@@ -30,7 +30,7 @@ fn first_unhandled(nexts: &[u16], used: &[u64]) -> u16 {
 }
 
 impl DataPlaneMain {
-    /// Enqueue every Index in `frame` to its parallel current-node-local next.
+    /// Enqueue every u32 in `frame` to its parallel current-node-local next.
     ///
     /// Shape matches VPP `vlib_buffer_enqueue_to_next`: walk first-unhandled
     /// next groups via a used bitmap, and for each group run `enqueue_one`.
@@ -76,7 +76,7 @@ impl DataPlaneMain {
         &self,
         current: NodeId,
         next_index: u16,
-        buffers: &[Index],
+        buffers: &[u32],
         nexts: &[u16],
         used: &mut [u64; MASK_WORDS],
         n_left: usize,

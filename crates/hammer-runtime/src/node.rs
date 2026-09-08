@@ -26,8 +26,8 @@ pub trait NodeErrorCode {
     fn local_code(self) -> u16;
 }
 
-/// Run packet logic for every Index in `frame`, record one typed local next
-/// decision per Index, then invoke Graph Fanout once.
+/// Run packet logic for every u32 in `frame`, record one typed local next
+/// decision per u32, then invoke Graph Fanout once.
 ///
 /// The body must yield a value implementing [`NodeNext`] (typically a
 /// `node_next` enum variant or a current-node-local `u16` slot). It must not
@@ -63,7 +63,7 @@ macro_rules! process_frame {
 }
 
 pub trait Node {
-    fn process(&mut self, runtime: &DataPlaneMain, frame: &mut BufferFrame) -> ();
+    fn process(&mut self, runtime: &mut DataPlaneMain, frame: &mut BufferFrame) -> ();
 
     #[inline]
     fn node_process(&self) -> NodeProcessFn {
@@ -147,9 +147,9 @@ impl NodeRuntimeData {
     }
 }
 
-pub type NodeProcessFn = fn(&DataPlaneMain, NodeRuntimeData, &mut BufferFrame) -> ();
+pub type NodeProcessFn = fn(&mut DataPlaneMain, NodeRuntimeData, &mut BufferFrame) -> ();
 
-type NodeFunction = unsafe fn(&DataPlaneMain, NodeRuntimeData, &mut BufferFrame) -> ();
+type NodeFunction = unsafe fn(&mut DataPlaneMain, NodeRuntimeData, &mut BufferFrame) -> ();
 
 /// One platform-compiled process-function candidate for an existing Graph Node.
 #[derive(Clone, Copy)]
@@ -170,7 +170,7 @@ impl NodeFunctionRegistration {
     pub const unsafe fn new<const LANES: usize>(
         node_name: &'static str,
         _: Simd<u8, LANES>,
-        function: unsafe fn(&DataPlaneMain, NodeRuntimeData, &mut BufferFrame) -> (),
+        function: unsafe fn(&mut DataPlaneMain, NodeRuntimeData, &mut BufferFrame) -> (),
     ) -> Self {
         assert!(matches!(LANES, 1 | 16 | 32 | 64));
         Self {
@@ -235,7 +235,7 @@ impl<'a> NodeDescriptor<'a> {
 }
 
 fn missing_node_process(
-    runtime: &DataPlaneMain,
+    runtime: &mut DataPlaneMain,
     _data: NodeRuntimeData,
     _frame: &mut BufferFrame,
 ) -> () {
@@ -506,7 +506,7 @@ impl std::fmt::Debug for NodeRuntimeSlot {
 
 impl NodeRuntimeSlot {
     #[inline]
-    fn dispatch(self, runtime: &DataPlaneMain, frame: Frame<Pending>) -> Frame<Pending> {
+    fn dispatch(self, runtime: &mut DataPlaneMain, frame: Frame<Pending>) -> Frame<Pending> {
         let mut frame = frame;
         // SAFETY: graph initialization installs specialized functions only
         // after validating their instruction set against the current CPU.
@@ -643,7 +643,7 @@ impl NodeRuntimeInner {
         }
 
         // VPP `vlib_register_errors` reserves one contiguous global range per
-        // node. Index zero remains the packet-buffer "no error" sentinel.
+        // node. u32 zero remains the packet-buffer "no error" sentinel.
         let first = self.next_error_index;
         let end = first
             .checked_add(u32::try_from(count).map_err(|_| RuntimeError::NodeErrorSlotOverflow)?)
@@ -1853,7 +1853,10 @@ impl NodeRuntime {
         Ok(())
     }
 
-    pub(crate) fn run_ready_function_nodes(&self, runtime: &DataPlaneMain) -> RuntimeResult<usize> {
+    pub(crate) fn run_ready_function_nodes(
+        &self,
+        runtime: &mut DataPlaneMain,
+    ) -> RuntimeResult<usize> {
         let mut processed = 0usize;
         while let Some(scheduled) = self.pop_scheduled() {
             let ScheduledFrame {
@@ -1920,7 +1923,7 @@ impl Future for NodeRuntimeReady {
 mod tests {
     use super::*;
 
-    fn process(_: &DataPlaneMain, _: NodeRuntimeData, _: &mut BufferFrame) {}
+    fn process(_: &mut DataPlaneMain, _: NodeRuntimeData, _: &mut BufferFrame) {}
 
     #[test]
     fn refork_preserves_existing_worker_state_and_initializes_new_nodes() {

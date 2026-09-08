@@ -1,4 +1,4 @@
-use hammer_core::data_plane::{Buffer, BufferFrame, Index, NodeId, NodeRegistration};
+use hammer_core::data_plane::{BufferFrame, NodeId, NodeRegistration};
 use hammer_runtime::RuntimeResult;
 use hammer_runtime::{
     DataPlaneMain, InternalNode, Node, NodeErrorCode, NodeProcessFn, add_packet_trace,
@@ -7,30 +7,18 @@ use hammer_runtime::{
 use crate::net::{DpoProto, DpoType, NetMain};
 
 /// Record a generated node-local error and store its preinstalled global
-/// index in a packet buffer.
+/// index in the packet buffer identified by `index`.
 #[inline(always)]
-pub fn set_buffer_node_error<E>(
-    runtime: &DataPlaneMain,
-    buffer: &mut Buffer,
+pub fn set_index_node_error<E>(
+    runtime: &mut DataPlaneMain,
+    index: u32,
     error: E,
 ) -> RuntimeResult<()>
 where
     E: NodeErrorCode,
 {
     let error = runtime.record_current_node_error(error)?;
-    buffer.set_node_error_index(error);
-    Ok(())
-}
-
-/// Record a generated node-local error and store its preinstalled global
-/// index in the packet buffer identified by `index`.
-#[inline(always)]
-pub fn set_index_node_error<E>(runtime: &DataPlaneMain, index: Index, error: E) -> RuntimeResult<()>
-where
-    E: NodeErrorCode,
-{
-    let error = runtime.record_current_node_error(error)?;
-    let mut buffer = runtime.get_buffer_mut(index)?;
+    let buffer = runtime.buffer_mut(index);
     buffer.set_node_error_index(error);
     Ok(())
 }
@@ -46,7 +34,7 @@ pub struct DropNode;
 pub struct PuntNode;
 
 impl Node for PuntNode {
-    fn process(&mut self, _: &DataPlaneMain, _: &mut BufferFrame) {}
+    fn process(&mut self, _: &mut DataPlaneMain, _: &mut BufferFrame) {}
     fn node_process(&self) -> NodeProcessFn {
         // VPP releases the packet frame when no OS punt consumer is installed.
         // Leaving ownership in the incoming frame lets its owner release it.
@@ -93,7 +81,7 @@ pub struct DropTrace {
 
 impl Node for DropNode {
     #[inline(always)]
-    fn process(&mut self, _runtime: &DataPlaneMain, _frame: &mut BufferFrame) -> () {
+    fn process(&mut self, _runtime: &mut DataPlaneMain, _frame: &mut BufferFrame) -> () {
         ()
     }
 
@@ -104,7 +92,7 @@ impl Node for DropNode {
 }
 
 fn drop_node_process(
-    runtime: &DataPlaneMain,
+    runtime: &mut DataPlaneMain,
     _data: hammer_runtime::node::NodeRuntimeData,
     frame: &mut BufferFrame,
 ) -> () {

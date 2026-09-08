@@ -94,6 +94,17 @@ mod tests {
 
     #[test]
     fn graph_updates_coalesce_until_barrier_release() {
+        crate::BUFFER_MAIN_INIT.call_once(|| {
+            hammer_infra::main_heap::init_default().unwrap();
+            hammer_core::buffer::BufferMain::new(
+                64,
+                1024,
+                &[0],
+                2,
+                hammer_infra::PageSize::Default,
+            )
+            .unwrap();
+        });
         let runtime = DataPlaneMain::new(DataPlaneBufferConfig::default());
         let mut engine = GlobalMain::new(runtime, RuntimeRegistry::new());
         engine.prepare_worker_publication();

@@ -1,6 +1,6 @@
 use std::mem::transmute;
 
-use hammer_core::data_plane::{BufferFrame, Index, NodeId, NodeRegistration};
+use hammer_core::data_plane::{BufferFrame, NodeId, NodeRegistration};
 use hammer_runtime::{
     DataPlaneMain, InternalNode, Node, NodeProcessFn, NodeRuntimeData, RuntimeError, RuntimeResult,
     add_packet_trace, process_frame,
@@ -173,9 +173,9 @@ fn register_interface_output_graph(runtime: &DataPlaneMain) -> RuntimeResult<Nod
 }
 
 impl InterfaceOutputNode {
-    fn tx_for_index(runtime: &DataPlaneMain, index: Index, drop_next: u16) -> RuntimeResult<u16> {
+    fn tx_for_index(runtime: &DataPlaneMain, index: u32, drop_next: u16) -> RuntimeResult<u16> {
         let interface_index = {
-            let buffer = runtime.get_buffer(index)?;
+            let buffer = runtime.buffer(index);
             let network = unsafe { transmute::<_, &NetworkOpaque>(buffer.opaque()) };
             network.sw_if_index[1]
         };
@@ -227,7 +227,7 @@ impl InterfaceOutputNode {
 }
 
 impl Node for InterfaceOutputNode {
-    fn process(&mut self, runtime: &DataPlaneMain, frame: &mut BufferFrame) {
+    fn process(&mut self, runtime: &mut DataPlaneMain, frame: &mut BufferFrame) {
         interface_output_process(runtime, NodeRuntimeData::empty(), frame)
     }
     fn node_process(&self) -> NodeProcessFn {
@@ -241,7 +241,11 @@ impl InternalNode for InterfaceOutputNode {
     }
 }
 
-fn interface_output_process(runtime: &DataPlaneMain, _: NodeRuntimeData, frame: &mut BufferFrame) {
+fn interface_output_process(
+    runtime: &mut DataPlaneMain,
+    _: NodeRuntimeData,
+    frame: &mut BufferFrame,
+) {
     process_frame!(runtime, frame, |index| InterfaceOutputNode::tx_for_index(
         runtime, index, 0
     )
@@ -258,6 +262,8 @@ mod tests {
     #[test]
     fn interface_tx_stack_uses_the_interface_output_node() -> Result<(), DpoError> {
         hammer_runtime::config::Memory::default().ensure_main_heap()?;
+        hammer_core::buffer::BufferMain::new(64, 1024, &[0], 2, hammer_infra::PageSize::Default)
+            .unwrap();
         let mut main = GlobalMain::new(
             DataPlaneMain::new(DataPlaneBufferConfig::default()),
             RuntimeRegistry::new(),

@@ -1,9 +1,10 @@
 use super::*;
+use hammer_core::buffer::BufferMain;
 
-/// Runtime-owned buffer arena policy.
+/// Runtime Buffer Pool selection and local Frame policy.
 ///
 /// Core owns packet storage and frame ownership. Runtime selects the worker and
-/// NUMA layout that constructs those storage arenas.
+/// NUMA layout used to publish the process Buffer Main before Workers.
 #[derive(Debug, Clone)]
 pub struct DataPlaneBufferConfig {
     pub buffer_slot_capacity: usize,
@@ -67,37 +68,49 @@ impl Worker {
     pub fn create_runtime(&self) -> RuntimeResult<DataPlaneMain> {
         let buffer = &self.buffer;
         let numa_nodes = self.buffer_numa_nodes()?;
-        let create_buffers = |page_size| -> DataPlaneResult<DataPlaneBuffers> {
-            DataPlaneBufferConfig {
-                buffer_slot_capacity: buffer.slot_bytes,
-                buffer_slots: buffer.slots_per_numa,
-                frame_slots: buffer.frame_pool_size,
-                active_numa_node: numa_nodes[0],
+        let create_main = |page_size| {
+            BufferMain::new(
+                buffer.slot_bytes,
+                buffer.slots_per_numa,
+                &numa_nodes,
+                self.count,
                 page_size,
-                ..DataPlaneBufferConfig::default()
-            }
-            .create_buffers(numa_nodes.iter().copied())
+            )
         };
 
-        let buffers = match buffer.page_size {
-            Some(page_size) => create_buffers(page_size)?,
+        let page_size = match buffer.page_size {
+            Some(page_size) => {
+                create_main(page_size)?;
+                page_size
+            }
             None => {
                 #[cfg(target_os = "linux")]
                 {
-                    match create_buffers(PageSize::DefaultHuge) {
-                        Ok(buffers) => buffers,
+                    match create_main(PageSize::DefaultHuge) {
+                        Ok(_) => PageSize::DefaultHuge,
                         Err(source) => {
-                            tracing::warn!(%source, "default HugeTLB Buffer Arena unavailable; using ordinary pages");
-                            create_buffers(PageSize::Default)?
+                            tracing::warn!(%source, "default HugeTLB Buffer Pool unavailable; using ordinary pages");
+                            create_main(PageSize::Default)?;
+                            PageSize::Default
                         }
                     }
                 }
                 #[cfg(not(target_os = "linux"))]
                 {
-                    create_buffers(PageSize::Default)?
+                    create_main(PageSize::Default)?;
+                    PageSize::Default
                 }
             }
         };
+        let buffers = DataPlaneBufferConfig {
+            buffer_slot_capacity: buffer.slot_bytes,
+            buffer_slots: buffer.slots_per_numa,
+            frame_slots: buffer.frame_pool_size,
+            active_numa_node: numa_nodes[0],
+            page_size,
+            ..DataPlaneBufferConfig::default()
+        }
+        .create_buffers(numa_nodes.iter().copied())?;
         DataPlaneMain::from_buffers(buffers, native_simd_bytes())
     }
 

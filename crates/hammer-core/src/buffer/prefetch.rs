@@ -11,12 +11,12 @@ pub(crate) fn prefetch_buffer_header_write(buffer: &Buffer) {
 
 #[inline(always)]
 pub(crate) fn prefetch_buffer_cacheline1(buffer: &Buffer) {
-    prefetch_read_l1(ptr::from_ref(&buffer.cacheline1).cast::<u8>());
+    prefetch_read_l1(ptr::from_ref(&buffer.second_half).cast::<u8>());
 }
 
 #[inline(always)]
 pub(crate) fn prefetch_buffer_cacheline1_write(buffer: &Buffer) {
-    prefetch_write_l1(ptr::from_ref(&buffer.cacheline1).cast::<u8>());
+    prefetch_write_l1(ptr::from_ref(&buffer.second_half).cast::<u8>());
 }
 
 #[inline(always)]

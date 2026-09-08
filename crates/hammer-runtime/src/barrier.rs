@@ -338,6 +338,17 @@ mod tests {
             }
         });
 
+        crate::BUFFER_MAIN_INIT.call_once(|| {
+            hammer_infra::main_heap::init_default().unwrap();
+            hammer_core::buffer::BufferMain::new(
+                64,
+                1024,
+                &[0],
+                2,
+                hammer_infra::PageSize::Default,
+            )
+            .unwrap();
+        });
         let mut main = crate::DataPlaneMain::new(crate::DataPlaneBufferConfig::default());
         crate::worker_thread_barrier_sync!(&mut main, {
             assert_eq!(barrier.recursion_level(), 1);

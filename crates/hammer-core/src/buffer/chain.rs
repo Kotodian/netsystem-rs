@@ -1,100 +1,99 @@
 use super::*;
 
-pub(crate) struct BufferChain<'pool> {
-    pool: Option<&'pool BufferPool>,
-    next: Option<Index>,
-    failed: bool,
-    error: Option<DataPlaneError>,
+pub(super) struct BufferChain<'a> {
+    buffers: &'a DataPlaneBuffers,
+    next: Option<u32>,
+    remaining: usize,
 }
 
-impl<'pool> BufferChain<'pool> {
-    #[inline]
-    pub(crate) fn new(pool: DataPlaneResult<&'pool BufferPool>, index: Index) -> Self {
-        match pool {
-            Ok(pool) => Self {
-                pool: Some(pool),
-                next: Some(index),
-                failed: false,
-                error: None,
-            },
-            Err(error) => Self {
-                pool: None,
-                next: None,
-                failed: false,
-                error: Some(error),
-            },
+impl<'a> BufferChain<'a> {
+    pub(super) fn new(buffers: &'a DataPlaneBuffers, index: u32) -> Self {
+        Self {
+            buffers,
+            next: Some(index),
+            remaining: BufferMain::global()
+                .pools
+                .iter()
+                .map(|pool| pool.buffer_count)
+                .sum(),
         }
     }
 }
 
-impl<'pool> Iterator for BufferChain<'pool> {
-    type Item = DataPlaneResult<BufferRef<'pool>>;
+impl<'a> Iterator for BufferChain<'a> {
+    type Item = DataPlaneResult<BufferRef<'a>>;
 
-    #[inline]
     fn next(&mut self) -> Option<Self::Item> {
-        if let Some(error) = self.error.take() {
-            return Some(Err(error));
-        }
-        if self.failed {
-            return None;
-        }
         let current = self.next?;
-        let pool = self.pool?;
-        let guard = pool.arena.inner.read();
-        self.next = match guard.next_buffer(current) {
-            Ok(next) => next,
-            Err(err) => {
-                self.failed = true;
-                return Some(Err(err));
-            }
+        assert_ne!(self.remaining, 0, "Buffer chain is acyclic");
+        self.remaining -= 1;
+        let buffer = self.buffers.get_buffer(current);
+        self.next = match &buffer {
+            Ok(buffer) => buffer.next_buffer_slot(),
+            Err(_) => None,
         };
-        Some(Ok(BufferRef {
-            guard: spinning_top::guard::RwSpinlockReadGuard::map(guard, |pool| {
-                pool.buffer(current)
-                    .expect("buffer index was validated before mapping")
-            }),
-        }))
+        Some(buffer)
     }
 }
 
 impl DataPlaneBuffers {
-    #[inline]
-    pub fn chain_buffer(&self, head: Index, tail: Index) -> DataPlaneResult<()> {
-        self.try_buffers()?.chain_buffer(head, tail)
-    }
-}
-
-impl BufferPool {
-    #[inline]
-    fn chain_buffer(&self, head: Index, tail: Index) -> DataPlaneResult<()> {
-        self.arena.inner.write().chain_buffer(head, tail)
-    }
-}
-
-impl BufferPoolInner {
-    #[inline]
-    fn chain_buffer(&mut self, head: Index, tail: Index) -> DataPlaneResult<()> {
-        self.ensure_writable(head)?;
-        self.buffer(tail)?;
-        let tail_len = {
-            let tail_buffer = self.buffer(tail)?;
-            tail_buffer
-                .current_len()
-                .checked_add(tail_buffer.total_len_not_including_first())
-                .ok_or(BufferInvariant::ChainLengthOverflow)?
-        };
-        let mut last = head;
-        while let Some(next) = self.next_buffer(last)? {
-            self.ensure_writable(next)?;
-            last = next;
+    pub fn chain_buffer(&self, head: u32, tail: u32) -> DataPlaneResult<()> {
+        assert_ne!(head, tail, "exclusive chain requires distinct Buffers");
+        let mut tail_len = 0usize;
+        for buffer in self.chain(tail) {
+            let buffer = buffer?;
+            assert_eq!(
+                buffer.ref_count(),
+                1,
+                "exclusive chain requires exclusive tail segments"
+            );
+            tail_len = tail_len
+                .checked_add(buffer.current_len())
+                .ok_or(BufferInvariant::ChainLengthOverflow)?;
         }
-        self.buffer_mut(last)?.set_next_buffer(Some(tail));
-        let total_tail_len = self
-            .buffer(head)?
-            .total_len_not_including_first()
+        let mut last = head;
+        let mut head_tail_len = 0usize;
+        let mut remaining: usize = BufferMain::global()
+            .pools
+            .iter()
+            .map(|pool| pool.buffer_count)
+            .sum();
+        loop {
+            assert_ne!(remaining, 0, "Buffer chain is acyclic");
+            remaining -= 1;
+            assert_ne!(last, tail, "exclusive chains must not overlap");
+            let buffer = self.get_buffer(last)?;
+            assert_eq!(
+                buffer.ref_count(),
+                1,
+                "exclusive chain requires exclusive head segments"
+            );
+            if last != head {
+                head_tail_len = head_tail_len
+                    .checked_add(buffer.current_len())
+                    .ok_or(BufferInvariant::ChainLengthOverflow)?;
+            }
+            match buffer.next_buffer_slot() {
+                Some(next) => last = next,
+                None => break,
+            }
+        }
+        // If the tails overlap, their final segment is identical.
+        let mut tail_last = tail;
+        loop {
+            let next = self.get_buffer(tail_last)?.next_buffer_slot();
+            match next {
+                Some(next) => tail_last = next,
+                None => break,
+            }
+        }
+        assert_ne!(last, tail_last, "exclusive chains must not overlap");
+        let total = head_tail_len
             .checked_add(tail_len)
+            .filter(|length| u32::try_from(*length).is_ok())
             .ok_or(BufferInvariant::ChainLengthOverflow)?;
-        self.buffer_mut(head)?
-            .set_total_len_not_including_first(total_tail_len)
+        self.get_buffer_mut(last)?.set_next_buffer(Some(tail));
+        self.get_buffer_mut(head)?
+            .set_total_len_not_including_first(total)
     }
 }

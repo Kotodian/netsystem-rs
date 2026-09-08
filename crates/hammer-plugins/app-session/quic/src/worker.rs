@@ -3149,7 +3149,7 @@ impl QuicWorker {
 }
 
 pub(crate) fn quic_session_queue_update_time(
-    _runtime: &DataPlaneMain,
+    _runtime: &mut DataPlaneMain,
     sessions: &mut SessionWorker,
     _: NodeRuntimeData,
     _: SessionQueueNext,
@@ -3164,7 +3164,7 @@ pub(crate) fn quic_session_queue_update_time(
 }
 
 pub(crate) fn quic_session_queue_dispatch(
-    runtime: &DataPlaneMain,
+    runtime: &mut DataPlaneMain,
     sessions: &mut SessionWorker,
     _: NodeRuntimeData,
     output_next: SessionQueueNext,
@@ -3392,7 +3392,7 @@ impl SessionTransport for QuicWorker {
     fn update_time(
         &mut self,
         sessions: &mut SessionWorker,
-        _: &DataPlaneMain,
+        _: &mut DataPlaneMain,
         _: SessionQueueNext,
         _: &mut BufferFrame,
         _: &mut SessionQueueOutput,
@@ -3406,7 +3406,7 @@ impl SessionTransport for QuicWorker {
         index: u32,
         rx_available: usize,
         _: usize,
-        _: &DataPlaneMain,
+        _: &mut DataPlaneMain,
         _: SessionQueueNext,
         _: &mut BufferFrame,
         _: &mut SessionQueueOutput,
@@ -3418,7 +3418,7 @@ impl SessionTransport for QuicWorker {
         &mut self,
         sessions: &mut SessionWorker,
         index: u32,
-        _: &DataPlaneMain,
+        _: &mut DataPlaneMain,
         _: SessionQueueNext,
         _: &mut BufferFrame,
         _: &mut SessionQueueOutput,
@@ -3461,7 +3461,7 @@ impl SessionTransport for QuicWorker {
         &mut self,
         sessions: &mut SessionWorker,
         index: u32,
-        _: &DataPlaneMain,
+        _: &mut DataPlaneMain,
         _: SessionQueueNext,
         _: &mut BufferFrame,
         _: &mut SessionQueueOutput,
@@ -3548,7 +3548,7 @@ impl TransportInternalTransport for QuicWorker {
         sessions: &mut SessionWorker,
         session_id: u32,
         index: u32,
-        _: &DataPlaneMain,
+        _: &mut DataPlaneMain,
         _: SessionQueueNext,
         _: &mut BufferFrame,
         _: &mut SessionQueueOutput,

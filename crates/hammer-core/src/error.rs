@@ -9,24 +9,8 @@ pub enum BufferInvariant {
     BytesExceedCapacity { length: usize, capacity: usize },
     #[error("buffer headroom exceeds slot capacity")]
     HeadroomExceedsCapacity,
-    #[error("buffer commit exceeds writable tail")]
-    CommitExceedsWritableTail,
     #[error("buffer truncate extends current length")]
     TruncateExtendsCurrentLength,
-    #[error("buffer rewind exceeds headroom")]
-    RewindExceedsHeadroom,
-    #[error("buffer advance displacement is out of range")]
-    AdvanceDisplacementOutOfRange,
-    #[error("buffer advance exceeds current length")]
-    AdvanceExceedsCurrentLength,
-    #[error("buffer prepend exceeds headroom")]
-    PrependExceedsHeadroom,
-    #[error("buffer current_data exceeds pre-data headroom")]
-    CurrentDataExceedsPreData,
-    #[error("buffer current_data does not fit i16")]
-    CurrentDataOutOfRange,
-    #[error("buffer current length does not fit u16")]
-    CurrentLengthOutOfRange,
     #[error("buffer chain tail length does not fit u32")]
     ChainTailLengthOutOfRange,
     #[error("buffer slot offset overflow")]
@@ -53,6 +37,25 @@ pub enum BufferInvariant {
 
 #[derive(Debug, Error)]
 pub enum DataPlaneError {
+    #[error("Buffer allocation size overflows for data size {data_size}")]
+    BufferAllocationSizeOverflow { data_size: usize },
+    #[error("Buffer allocation {allocation_size} exceeds backing page size {page_size}")]
+    BufferAllocationExceedsPage {
+        allocation_size: usize,
+        page_size: usize,
+    },
+    #[error("requested {requested} Buffer Pools exceeds maximum {maximum}")]
+    BufferPoolCountExceeded { requested: usize, maximum: usize },
+    #[error("Buffer address span {bytes} exceeds maximum {maximum}")]
+    BufferMemorySpanExceeded { bytes: usize, maximum: usize },
+    #[error("no usable Buffer Pools were constructed")]
+    BufferPoolsUnavailable,
+    #[error("failed to create Buffer Pool mapping on NUMA node {numa_node}")]
+    BufferPoolMapping {
+        numa_node: u32,
+        #[source]
+        source: PhysmemError,
+    },
     #[error(transparent)]
     BufferInvariant(#[from] BufferInvariant),
     #[error("buffer frame capacity exceeded")]

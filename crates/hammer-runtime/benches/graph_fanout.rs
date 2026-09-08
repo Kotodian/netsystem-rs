@@ -6,8 +6,7 @@
 
 use criterion::{BenchmarkId, Criterion, criterion_group, criterion_main};
 use hammer_core::data_plane::{
-    BufferFrame, DEFAULT_BUFFER_FRAME_CAPACITY, Frame, Index, Next, NodeId, NodeKind,
-    NodeRegistration,
+    BufferFrame, DEFAULT_BUFFER_FRAME_CAPACITY, Frame, Next, NodeId, NodeKind, NodeRegistration,
 };
 use hammer_infra::mask_compare::{
     mask_compare_u16_arch, mask_compare_u16_scalar, mask_compare_u16_words,
@@ -17,6 +16,11 @@ use hammer_runtime::node::{NodeDescriptor, NodeRuntimeData};
 use hammer_runtime::{DataPlaneBufferConfig, DataPlaneMain};
 
 fn test_runtime(frame_slots: usize, buffer_slots: usize) -> DataPlaneMain {
+    BUFFER_MAIN_INIT.call_once(|| {
+        hammer_infra::main_heap::init_default().unwrap();
+        hammer_core::buffer::BufferMain::new(64, 4096, &[0], 0, hammer_infra::PageSize::Default)
+            .unwrap();
+    });
     DataPlaneMain::new(DataPlaneBufferConfig {
         buffer_slot_capacity: 64,
         buffer_slots,
@@ -29,10 +33,7 @@ fn register_sink(runtime: &DataPlaneMain, name: &'static str) -> RuntimeResult<N
     runtime.nodes().try_register_descriptor(
         NodeKind::Internal,
         NodeDescriptor::new(
-            |_, _, frame: &mut BufferFrame| {
-                frame.discard_prefix(frame.len());
-                ()
-            },
+            |_, _, _: &mut BufferFrame| (),
             NodeRuntimeData::empty(),
             Some(NodeRegistration::next(name, 0)),
             &[],
@@ -59,7 +60,6 @@ struct FanoutFixture {
     owner: NodeId,
     frame: Frame<Next>,
     nexts: [u16; DEFAULT_BUFFER_FRAME_CAPACITY],
-    _indices: Vec<Index>,
 }
 
 fn build_fixture(pattern: FanoutPattern) -> FanoutFixture {
@@ -71,14 +71,12 @@ fn build_fixture(pattern: FanoutPattern) -> FanoutFixture {
         register_sink(&runtime, "s3").expect("s3"),
     ];
     let owner = register_owner(&runtime, &sinks).expect("owner");
-    let mut indices = Vec::with_capacity(DEFAULT_BUFFER_FRAME_CAPACITY);
     let mut frame = runtime.buffers().get_next_frame(owner).expect("frame");
     for offset in 0..DEFAULT_BUFFER_FRAME_CAPACITY {
         let index = runtime
             .alloc_index_with_bytes(&[(offset % 256) as u8])
             .expect("alloc");
         frame.push_index(index).expect("push");
-        indices.push(index);
     }
     let mut nexts = [0u16; DEFAULT_BUFFER_FRAME_CAPACITY];
     match pattern {
@@ -105,13 +103,11 @@ fn build_fixture(pattern: FanoutPattern) -> FanoutFixture {
         .buffers()
         .get_next_frame(owner)
         .expect("measured frame");
-    let mut indices = Vec::with_capacity(DEFAULT_BUFFER_FRAME_CAPACITY);
     for offset in 0..DEFAULT_BUFFER_FRAME_CAPACITY {
         let index = runtime
             .alloc_index_with_bytes(&[(offset % 256) as u8])
             .expect("alloc");
         frame.push_index(index).expect("push");
-        indices.push(index);
     }
 
     FanoutFixture {
@@ -119,7 +115,6 @@ fn build_fixture(pattern: FanoutPattern) -> FanoutFixture {
         owner,
         frame,
         nexts,
-        _indices: indices,
     }
 }
 
@@ -185,3 +180,5 @@ fn bench_mask_compare_paths(c: &mut Criterion) {
 
 criterion_group!(benches, bench_fanout_256, bench_mask_compare_paths);
 criterion_main!(benches);
+
+static BUFFER_MAIN_INIT: std::sync::Once = std::sync::Once::new();

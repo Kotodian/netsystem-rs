@@ -58,7 +58,7 @@ pub enum PageSize {
 }
 
 impl PageSize {
-    pub(crate) fn bytes(self) -> io::Result<usize> {
+    pub fn bytes(self) -> io::Result<usize> {
         match self {
             Self::Default => {
                 // SAFETY: sysconf reads process-global kernel configuration.

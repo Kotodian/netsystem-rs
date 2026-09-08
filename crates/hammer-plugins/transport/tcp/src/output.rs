@@ -1,6 +1,6 @@
 use crate::{TCP_FLAG_FIN, TCP_FLAG_SYN, tcp_header};
 use core::hash::Hasher;
-use hammer_core::data_plane::{BufferFrame, BufferPacketCursor, Index, NodeId, NodeState};
+use hammer_core::data_plane::{BufferFrame, BufferPacketCursor, NodeId, NodeState};
 use hammer_infra::checksum::InternetChecksum;
 use hammer_runtime::RuntimeResult;
 use hammer_runtime::{DataPlaneMain, Node, NodeProcessFn, NodeRuntimeData};
@@ -52,7 +52,7 @@ pub fn register_tcp_output(runtime: &DataPlaneMain) -> RuntimeResult<NodeId> {
 
 impl Node for TcpOutputNode {
     #[inline(always)]
-    fn process(&mut self, runtime: &DataPlaneMain, frame: &mut BufferFrame) -> () {
+    fn process(&mut self, runtime: &mut DataPlaneMain, frame: &mut BufferFrame) -> () {
         tcp_output_node_process_frame::<1>(runtime, frame)
     }
 
@@ -68,7 +68,7 @@ impl Node for TcpOutputNode {
 }
 
 fn tcp_output_node_process(
-    runtime: &DataPlaneMain,
+    runtime: &mut DataPlaneMain,
     _: NodeRuntimeData,
     frame: &mut BufferFrame,
 ) -> () {
@@ -77,7 +77,7 @@ fn tcp_output_node_process(
 
 #[hammer_component_macros::node_function(node = TcpOutputNode)]
 fn tcp_output_node_process_simd<const SIMD_BYTES: usize>(
-    runtime: &DataPlaneMain,
+    runtime: &mut DataPlaneMain,
     _: NodeRuntimeData,
     frame: &mut BufferFrame,
 ) -> () {
@@ -85,7 +85,7 @@ fn tcp_output_node_process_simd<const SIMD_BYTES: usize>(
 }
 
 fn tcp_output_node_process_frame<const SIMD_BYTES: usize>(
-    runtime: &DataPlaneMain,
+    runtime: &mut DataPlaneMain,
     frame: &mut BufferFrame,
 ) -> () {
     hammer_runtime::process_frame!(runtime, frame, |index| {
@@ -94,10 +94,10 @@ fn tcp_output_node_process_frame<const SIMD_BYTES: usize>(
 }
 
 fn tcp_output_next_for_index<const SIMD_BYTES: usize>(
-    runtime: &DataPlaneMain,
-    index: Index,
+    runtime: &mut DataPlaneMain,
+    index: u32,
 ) -> RuntimeResult<TcpOutputNext> {
-    let buffer = runtime.get_buffer(index)?;
+    let buffer = runtime.buffer(index);
     let header = buffer.current();
     if tcp_header(header).is_err() {
         let _ = runtime.record_current_node_error(TcpOutputError::NoTcpHeader);
@@ -107,7 +107,6 @@ fn tcp_output_next_for_index<const SIMD_BYTES: usize>(
         .current_len()
         .checked_add(buffer.total_len_not_including_first());
     let endpoints = read_tcp_egress_endpoints(buffer.opaque2());
-    drop(buffer);
 
     let Some(tcp_len) = tcp_len else {
         let _ = runtime.record_current_node_error(TcpOutputError::SegmentTooLong);
@@ -148,8 +147,8 @@ fn tcp_output_next_for_index<const SIMD_BYTES: usize>(
 
 /// VPP `tcp_output_push_ip` → `vlib_buffer_push_ip4(..., is_df=1)`.
 fn tcp_output_push_ipv4<const SIMD_BYTES: usize>(
-    runtime: &DataPlaneMain,
-    index: Index,
+    runtime: &mut DataPlaneMain,
+    index: u32,
     src: Ipv4Addr,
     dst: Ipv4Addr,
     total_len: u16,
@@ -163,9 +162,9 @@ fn tcp_output_push_ipv4<const SIMD_BYTES: usize>(
     checksum.write(&tcp_len.to_be_bytes());
     set_tcp_checksum(runtime, index, checksum)?;
 
-    let mut buffer = runtime.get_buffer_mut(index)?;
+    let buffer = runtime.buffer_mut(index);
     {
-        let header = buffer.prepend_mut(IPV4_HEADER_LEN)?;
+        let header = buffer.push_uninit(IPV4_HEADER_LEN as u8);
         hammer_plugin_ip::write_ipv4_push_header(header, src, dst, TCP_PROTOCOL, total_len, true)?;
     }
     let packet_len = usize::from(total_len);
@@ -188,8 +187,8 @@ fn tcp_output_push_ipv4<const SIMD_BYTES: usize>(
 
 /// VPP `tcp_output_push_ip` IPv6 path (`vlib_buffer_push_ip6_custom`).
 fn tcp_output_push_ipv6<const SIMD_BYTES: usize>(
-    runtime: &DataPlaneMain,
-    index: Index,
+    runtime: &mut DataPlaneMain,
+    index: u32,
     src: Ipv6Addr,
     dst: Ipv6Addr,
     payload_len: u16,
@@ -202,9 +201,9 @@ fn tcp_output_push_ipv6<const SIMD_BYTES: usize>(
     checksum.write(&[0, 0, 0, TCP_PROTOCOL]);
     set_tcp_checksum(runtime, index, checksum)?;
 
-    let mut buffer = runtime.get_buffer_mut(index)?;
+    let buffer = runtime.buffer_mut(index);
     {
-        let header = buffer.prepend_mut(IPV6_HEADER_LEN)?;
+        let header = buffer.push_uninit(IPV6_HEADER_LEN as u8);
         hammer_plugin_ip::write_ipv6_push_header(header, src, dst, TCP_PROTOCOL, payload_len)?;
     }
     let packet_len = IPV6_HEADER_LEN + usize::from(payload_len);
@@ -226,19 +225,19 @@ fn tcp_output_push_ipv6<const SIMD_BYTES: usize>(
 }
 
 fn set_tcp_checksum<const SIMD_BYTES: usize>(
-    runtime: &DataPlaneMain,
-    index: Index,
+    runtime: &mut DataPlaneMain,
+    index: u32,
     mut checksum: InternetChecksum<SIMD_BYTES>,
 ) -> RuntimeResult<()> {
     {
-        let mut buffer = runtime.get_buffer_mut(index)?;
+        let buffer = runtime.buffer_mut(index);
         buffer.current_mut()[TCP_CHECKSUM_OFFSET..TCP_CHECKSUM_OFFSET + 2].fill(0);
     }
     for buffer in runtime.chain(index) {
         checksum.write(buffer?.current());
     }
     let value = checksum.finish() as u16;
-    let mut buffer = runtime.get_buffer_mut(index)?;
+    let buffer = runtime.buffer_mut(index);
     buffer.current_mut()[TCP_CHECKSUM_OFFSET..TCP_CHECKSUM_OFFSET + 2]
         .copy_from_slice(&value.to_be_bytes());
     Ok(())

@@ -2,7 +2,7 @@ use std::mem::transmute;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 
 use hammer_core::data_plane::{
-    BufferFrame, BufferPacketCursor, Index, NodeId, NodeState, SecondaryOpaque,
+    BufferFrame, BufferPacketCursor, NodeId, NodeState, SecondaryOpaque,
 };
 use hammer_infra::checksum::internet_checksum_parts;
 use hammer_runtime::{DataPlaneMain, Node, NodeProcessFn, NodeRuntimeData, RuntimeResult};
@@ -124,7 +124,7 @@ pub fn register_udp_output(runtime: &DataPlaneMain) -> RuntimeResult<NodeId> {
 
 impl Node for UdpOutputNode {
     #[inline(always)]
-    fn process(&mut self, runtime: &DataPlaneMain, frame: &mut BufferFrame) -> () {
+    fn process(&mut self, runtime: &mut DataPlaneMain, frame: &mut BufferFrame) -> () {
         udp_output_process_frame(runtime, frame)
     }
 
@@ -139,26 +139,29 @@ impl Node for UdpOutputNode {
     }
 }
 
-fn udp_output_process(runtime: &DataPlaneMain, _: NodeRuntimeData, frame: &mut BufferFrame) -> () {
+fn udp_output_process(
+    runtime: &mut DataPlaneMain,
+    _: NodeRuntimeData,
+    frame: &mut BufferFrame,
+) -> () {
     udp_output_process_frame(runtime, frame)
 }
 
-fn udp_output_process_frame(runtime: &DataPlaneMain, frame: &mut BufferFrame) -> () {
+fn udp_output_process_frame(runtime: &mut DataPlaneMain, frame: &mut BufferFrame) -> () {
     hammer_runtime::process_frame!(runtime, frame, |index| {
         udp_output_next_for_index(runtime, index).unwrap_or(UdpOutputNext::Drop)
     })
 }
 
 fn udp_output_next_for_index(
-    runtime: &DataPlaneMain,
-    index: Index,
+    runtime: &mut DataPlaneMain,
+    index: u32,
 ) -> RuntimeResult<UdpOutputNext> {
-    let buffer = runtime.get_buffer(index)?;
+    let buffer = runtime.buffer(index);
     let udp_len = buffer
         .current_len()
         .checked_add(buffer.total_len_not_including_first());
     let endpoints = read_udp_egress_endpoints(buffer.opaque2());
-    drop(buffer);
 
     let Some(udp_len) = udp_len else {
         return Ok(UdpOutputNext::Drop);
@@ -190,8 +193,8 @@ fn udp_output_next_for_index(
 }
 
 fn udp_output_push_ipv4(
-    runtime: &DataPlaneMain,
-    index: Index,
+    runtime: &mut DataPlaneMain,
+    index: u32,
     src: Ipv4Addr,
     dst: Ipv4Addr,
     total_len: u16,
@@ -199,7 +202,7 @@ fn udp_output_push_ipv4(
     let udp_len =
         u16::try_from(usize::from(total_len) - IPV4_HEADER_LEN).expect("IPv4 UDP length fits u16");
     let checksum = {
-        let buffer = runtime.get_buffer(index)?;
+        let buffer = runtime.buffer(index);
         let datagram = buffer.current();
         internet_checksum_parts(&[
             &src.octets(),
@@ -210,13 +213,13 @@ fn udp_output_push_ipv4(
         ])
     };
     {
-        let mut buffer = runtime.get_buffer_mut(index)?;
+        let buffer = runtime.buffer_mut(index);
         buffer.current_mut()[6..8].copy_from_slice(&checksum.to_be_bytes());
     }
 
-    let mut buffer = runtime.get_buffer_mut(index)?;
+    let buffer = runtime.buffer_mut(index);
     {
-        let header = buffer.prepend_mut(IPV4_HEADER_LEN)?;
+        let header = buffer.push_uninit(IPV4_HEADER_LEN as u8);
         hammer_plugin_ip::write_ipv4_push_header(header, src, dst, UDP_PROTOCOL, total_len, true)?;
     }
     let packet_len = usize::from(total_len);
@@ -235,14 +238,14 @@ fn udp_output_push_ipv4(
 }
 
 fn udp_output_push_ipv6(
-    runtime: &DataPlaneMain,
-    index: Index,
+    runtime: &mut DataPlaneMain,
+    index: u32,
     src: Ipv6Addr,
     dst: Ipv6Addr,
     payload_len: u16,
 ) -> RuntimeResult<()> {
     let checksum = {
-        let buffer = runtime.get_buffer(index)?;
+        let buffer = runtime.buffer(index);
         let datagram = buffer.current();
         internet_checksum_parts(&[
             &src.octets(),
@@ -253,13 +256,13 @@ fn udp_output_push_ipv6(
         ])
     };
     {
-        let mut buffer = runtime.get_buffer_mut(index)?;
+        let buffer = runtime.buffer_mut(index);
         buffer.current_mut()[6..8].copy_from_slice(&checksum.to_be_bytes());
     }
 
-    let mut buffer = runtime.get_buffer_mut(index)?;
+    let buffer = runtime.buffer_mut(index);
     {
-        let header = buffer.prepend_mut(IPV6_HEADER_LEN)?;
+        let header = buffer.push_uninit(IPV6_HEADER_LEN as u8);
         hammer_plugin_ip::write_ipv6_push_header(header, src, dst, UDP_PROTOCOL, payload_len)?;
     }
     let packet_len = IPV6_HEADER_LEN + usize::from(payload_len);

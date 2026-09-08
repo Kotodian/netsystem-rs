@@ -1,9 +1,7 @@
-use hammer_core::data_plane::Index;
-
 use crate::DataPlaneMain;
 
 #[inline(always)]
-pub fn default_prefetch_indices(runtime: &DataPlaneMain, indices: &[Index]) {
+pub fn default_prefetch_indices(runtime: &DataPlaneMain, indices: &[u32]) {
     let mut read = 0usize;
     let len = indices.len();
     while read < len {

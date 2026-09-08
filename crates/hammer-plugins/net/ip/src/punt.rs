@@ -43,7 +43,7 @@ fn register_ip4_punt(runtime: &DataPlaneMain) -> RuntimeResult<NodeId> {
 }
 
 impl Node for Ip4PuntNode {
-    fn process(&mut self, runtime: &DataPlaneMain, frame: &mut BufferFrame) {
+    fn process(&mut self, runtime: &mut DataPlaneMain, frame: &mut BufferFrame) {
         (self.node_process())(runtime, Default::default(), frame)
     }
     fn node_process(&self) -> NodeProcessFn {
@@ -58,7 +58,7 @@ impl Node for Ip4PuntNode {
                     .get()
             };
             hammer_runtime::process_frame!(runtime, frame, |index| {
-                let mut buffer = runtime.get_buffer_mut(index).expect("frame owns buffer");
+                let buffer = runtime.buffer_mut(index);
                 // SAFETY: IP ingress initializes the network overlay.
                 let sw_if_index =
                     unsafe { &*(buffer.opaque() as *const _ as *const NetworkOpaque) }.sw_if_index
@@ -66,7 +66,7 @@ impl Node for Ip4PuntNode {
                 net.interface_main().start_feature_arc(
                     arc,
                     sw_if_index,
-                    &mut buffer,
+                    buffer,
                     NodeNext::slot(Ip4PuntNext::Punt),
                 )
             });
@@ -85,7 +85,7 @@ pub enum Ip4DropNext {
 pub struct Ip4DropNode;
 
 impl Node for Ip4DropNode {
-    fn process(&mut self, runtime: &DataPlaneMain, frame: &mut BufferFrame) {
+    fn process(&mut self, runtime: &mut DataPlaneMain, frame: &mut BufferFrame) {
         (self.node_process())(runtime, Default::default(), frame)
     }
     fn node_process(&self) -> NodeProcessFn {
@@ -100,7 +100,7 @@ impl Node for Ip4DropNode {
                     .get()
             };
             hammer_runtime::process_frame!(runtime, frame, |index| {
-                let mut buffer = runtime.get_buffer_mut(index).expect("frame owns buffer");
+                let buffer = runtime.buffer_mut(index);
                 // SAFETY: IP ingress initializes the network overlay.
                 let sw_if_index =
                     unsafe { &*(buffer.opaque() as *const _ as *const NetworkOpaque) }.sw_if_index
@@ -108,7 +108,7 @@ impl Node for Ip4DropNode {
                 net.interface_main().start_feature_arc(
                     arc,
                     sw_if_index,
-                    &mut buffer,
+                    buffer,
                     NodeNext::slot(Ip4DropNext::Drop),
                 )
             });
@@ -152,7 +152,7 @@ fn register_ip6_punt(runtime: &DataPlaneMain) -> RuntimeResult<NodeId> {
 }
 
 impl Node for Ip6PuntNode {
-    fn process(&mut self, runtime: &DataPlaneMain, frame: &mut BufferFrame) {
+    fn process(&mut self, runtime: &mut DataPlaneMain, frame: &mut BufferFrame) {
         (self.node_process())(runtime, Default::default(), frame)
     }
     fn node_process(&self) -> NodeProcessFn {
@@ -167,7 +167,7 @@ impl Node for Ip6PuntNode {
                     .get()
             };
             hammer_runtime::process_frame!(runtime, frame, |index| {
-                let mut buffer = runtime.get_buffer_mut(index).expect("frame owns buffer");
+                let buffer = runtime.buffer_mut(index);
                 // SAFETY: IP ingress initializes the network overlay.
                 let sw_if_index =
                     unsafe { &*(buffer.opaque() as *const _ as *const NetworkOpaque) }.sw_if_index
@@ -175,7 +175,7 @@ impl Node for Ip6PuntNode {
                 net.interface_main().start_feature_arc(
                     arc,
                     sw_if_index,
-                    &mut buffer,
+                    buffer,
                     NodeNext::slot(Ip6PuntNext::Punt),
                 )
             });
@@ -194,7 +194,7 @@ pub enum Ip6DropNext {
 pub struct Ip6DropNode;
 
 impl Node for Ip6DropNode {
-    fn process(&mut self, runtime: &DataPlaneMain, frame: &mut BufferFrame) {
+    fn process(&mut self, runtime: &mut DataPlaneMain, frame: &mut BufferFrame) {
         (self.node_process())(runtime, Default::default(), frame)
     }
     fn node_process(&self) -> NodeProcessFn {
@@ -209,7 +209,7 @@ impl Node for Ip6DropNode {
                     .get()
             };
             hammer_runtime::process_frame!(runtime, frame, |index| {
-                let mut buffer = runtime.get_buffer_mut(index).expect("frame owns buffer");
+                let buffer = runtime.buffer_mut(index);
                 // SAFETY: IP ingress initializes the network overlay.
                 let sw_if_index =
                     unsafe { &*(buffer.opaque() as *const _ as *const NetworkOpaque) }.sw_if_index
@@ -217,7 +217,7 @@ impl Node for Ip6DropNode {
                 net.interface_main().start_feature_arc(
                     arc,
                     sw_if_index,
-                    &mut buffer,
+                    buffer,
                     NodeNext::slot(Ip6DropNext::Drop),
                 )
             });

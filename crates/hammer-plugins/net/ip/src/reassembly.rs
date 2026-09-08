@@ -2,9 +2,7 @@ use std::mem::transmute;
 use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
 
-use hammer_core::data_plane::{
-    BufferFrame, DEFAULT_BUFFER_FRAME_CAPACITY, Index, NodeId, NodeNext,
-};
+use hammer_core::data_plane::{BufferFrame, DEFAULT_BUFFER_FRAME_CAPACITY, NodeId, NodeNext};
 use hammer_infra::bihash::{Bihash, FREE_U64};
 use hammer_infra::checksum::internet_checksum;
 use hammer_infra::pool::Pool;
@@ -228,7 +226,7 @@ impl IpReassemblyMain {
 
     fn process_frame(
         &self,
-        runtime: &DataPlaneMain,
+        runtime: &mut DataPlaneMain,
         frame: &mut BufferFrame,
         version: IpVersion,
     ) -> () {
@@ -469,14 +467,14 @@ impl IpReassemblyWorker {
 
     fn process_frame(
         &mut self,
-        runtime: &DataPlaneMain,
+        runtime: &mut DataPlaneMain,
         frame: &mut BufferFrame,
         now: Instant,
         version: IpVersion,
     ) -> () {
         let input_len = frame.len();
         debug_assert!(input_len <= DEFAULT_BUFFER_FRAME_CAPACITY);
-        let mut inputs = [core::mem::MaybeUninit::<Index>::uninit(); DEFAULT_BUFFER_FRAME_CAPACITY];
+        let mut inputs = [core::mem::MaybeUninit::<u32>::uninit(); DEFAULT_BUFFER_FRAME_CAPACITY];
         for (offset, &index) in frame.indices().iter().enumerate() {
             inputs[offset].write(index);
         }
@@ -509,7 +507,7 @@ impl IpReassemblyWorker {
         nexts: &mut [u16; DEFAULT_BUFFER_FRAME_CAPACITY],
         out_len: &mut usize,
         next: u16,
-        index: Index,
+        index: u32,
     ) -> RuntimeResult<()> {
         if *out_len == DEFAULT_BUFFER_FRAME_CAPACITY {
             runtime.enqueue_to_next(frame, &nexts[..*out_len]);
@@ -523,8 +521,8 @@ impl IpReassemblyWorker {
 
     fn process_index(
         &mut self,
-        runtime: &DataPlaneMain,
-        index: Index,
+        runtime: &mut DataPlaneMain,
+        index: u32,
         now: Instant,
         out_frame: &mut BufferFrame,
         nexts: &mut [u16; DEFAULT_BUFFER_FRAME_CAPACITY],
@@ -532,14 +530,13 @@ impl IpReassemblyWorker {
         version: IpVersion,
     ) -> RuntimeResult<()> {
         let current_worker = self.worker;
-        let buffer = runtime.get_buffer(index)?;
+        let buffer = runtime.buffer(index);
         let fragment = match parse_ip_fragment_with_chain_len(
             buffer.current(),
             buffer.total_len_not_including_first(),
         ) {
             Ok(fragment) => fragment,
             Err(_) => {
-                drop(buffer);
                 let drop_next = match version {
                     IpVersion::V4 => NodeNext::slot(Ip4ReassemblyNext::Drop),
                     IpVersion::V6 => NodeNext::slot(Ip6ReassemblyNext::Drop),
@@ -559,7 +556,6 @@ impl IpReassemblyWorker {
                 return Ok(());
             }
         };
-        drop(buffer);
         if fragment.version != version {
             let next = match version {
                 IpVersion::V4 => NodeNext::slot(Ip4ReassemblyNext::Drop),
@@ -839,7 +835,7 @@ impl IpReassemblyWorker {
 
 impl Node for Ip4ReassemblyNode {
     #[inline(always)]
-    fn process(&mut self, _runtime: &DataPlaneMain, _frame: &mut BufferFrame) -> () {
+    fn process(&mut self, _runtime: &mut DataPlaneMain, _frame: &mut BufferFrame) -> () {
         ()
     }
 
@@ -861,7 +857,7 @@ impl Node for Ip4ReassemblyNode {
 
 impl Node for Ip6ReassemblyNode {
     #[inline(always)]
-    fn process(&mut self, _runtime: &DataPlaneMain, _frame: &mut BufferFrame) -> () {
+    fn process(&mut self, _runtime: &mut DataPlaneMain, _frame: &mut BufferFrame) -> () {
         ()
     }
 
@@ -882,7 +878,7 @@ impl Node for Ip6ReassemblyNode {
 }
 
 fn ip_reassembly_process(
-    runtime: &DataPlaneMain,
+    runtime: &mut DataPlaneMain,
     _data: NodeRuntimeData,
     frame: &mut BufferFrame,
     version: IpVersion,
@@ -917,8 +913,8 @@ impl FragmentContext {
     #[inline]
     fn insert_fragment(
         &mut self,
-        runtime: &DataPlaneMain,
-        index: Index,
+        runtime: &mut DataPlaneMain,
+        index: u32,
         fragment: ParsedIpFragment,
         now: Instant,
         max_fragments: usize,
@@ -994,7 +990,7 @@ impl FragmentContext {
     #[inline]
     fn assemble(
         &mut self,
-        runtime: &DataPlaneMain,
+        runtime: &mut DataPlaneMain,
         total_payload_len: usize,
     ) -> RuntimeResult<ReassemblyInsert> {
         match self.version {
@@ -1006,14 +1002,14 @@ impl FragmentContext {
     #[inline]
     fn assemble_ipv4_chain(
         &mut self,
-        runtime: &DataPlaneMain,
+        runtime: &mut DataPlaneMain,
         total_payload_len: usize,
     ) -> RuntimeResult<ReassemblyInsert> {
         let first_offset = self.first_fragment_offset()?;
         let first = self.fragments[first_offset];
         let header_len = first.header_len;
         if header_len < IPV4_HEADER_MIN_LEN
-            || runtime.get_buffer(first.index)?.current_len() < header_len
+            || runtime.buffer(first.index).current_len() < header_len
         {
             return Err(IpReassemblyError::FragmentHeaderInvalid.into());
         }
@@ -1029,7 +1025,7 @@ impl FragmentContext {
         fragments.sort_by_key(|fragment| fragment.start);
         for fragment in fragments.iter().copied() {
             if fragment.index == complete {
-                let mut buffer = runtime.get_buffer_mut(complete)?;
+                let buffer = runtime.buffer_mut(complete);
                 buffer.truncate(fragment.header_len + (fragment.end - fragment.start))?;
             } else {
                 trim_fragment_payload_chain(runtime, fragment)?;
@@ -1037,7 +1033,7 @@ impl FragmentContext {
             }
         }
         {
-            let mut buffer = runtime.get_buffer_mut(complete)?;
+            let buffer = runtime.buffer_mut(complete);
             let header = buffer.current();
             if header.len() < header_len {
                 return Err(IpReassemblyError::FragmentHeaderInvalid.into());
@@ -1055,14 +1051,12 @@ impl FragmentContext {
     #[inline]
     fn assemble_ipv6_chain(
         &mut self,
-        runtime: &DataPlaneMain,
+        runtime: &mut DataPlaneMain,
         total_payload_len: usize,
     ) -> RuntimeResult<ReassemblyInsert> {
         let first_offset = self.first_fragment_offset()?;
         let first = self.fragments[first_offset];
-        if runtime.get_buffer(first.index)?.current_len()
-            < IPV6_HEADER_LEN + IPV6_FRAGMENT_HEADER_LEN
-        {
+        if runtime.buffer(first.index).current_len() < IPV6_HEADER_LEN + IPV6_FRAGMENT_HEADER_LEN {
             return Err(IpReassemblyError::FragmentHeaderInvalid.into());
         }
         let payload_len = total_payload_len;
@@ -1071,14 +1065,14 @@ impl FragmentContext {
         }
         let complete = first.index;
         let fragment_next_header = {
-            let buffer = runtime.get_buffer(complete)?;
+            let buffer = runtime.buffer(complete);
             buffer.current()[IPV6_HEADER_LEN]
         };
         let mut fragments = std::mem::take(&mut self.fragments);
         fragments.sort_by_key(|fragment| fragment.start);
         for fragment in fragments.iter().copied() {
             if fragment.index == complete {
-                let mut buffer = runtime.get_buffer_mut(complete)?;
+                let buffer = runtime.buffer_mut(complete);
                 {
                     let packet = buffer.current_mut();
                     packet.copy_within(
@@ -1093,9 +1087,8 @@ impl FragmentContext {
                 header[IPV6_PAYLOAD_LENGTH_OFFSET..IPV6_PAYLOAD_LENGTH_OFFSET + 2]
                     .copy_from_slice(&(payload_len as u16).to_be_bytes());
                 header[IPV6_NEXT_HEADER_OFFSET] = fragment_next_header;
-                drop(buffer);
                 runtime
-                    .get_buffer_mut(complete)?
+                    .buffer_mut(complete)
                     .truncate(IPV6_HEADER_LEN + (fragment.end - fragment.start))?;
             } else {
                 trim_fragment_payload_chain(runtime, fragment)?;
@@ -1128,7 +1121,7 @@ impl FragmentContext {
 
 #[derive(Debug, Clone, Copy)]
 struct ReassemblyFragment {
-    index: Index,
+    index: u32,
     start: usize,
     end: usize,
     header_len: usize,
@@ -1136,17 +1129,16 @@ struct ReassemblyFragment {
 
 enum ReassemblyInsert {
     Pending,
-    Drop(Index),
-    Reassembled(Index),
-    Failed(Index),
+    Drop(u32),
+    Reassembled(u32),
+    Failed(u32),
 }
 
 #[inline(always)]
-fn refresh_metadata(runtime: &DataPlaneMain, index: Index) -> RuntimeResult<()> {
-    let buffer = runtime.get_buffer(index)?;
+fn refresh_metadata(runtime: &DataPlaneMain, index: u32) -> RuntimeResult<()> {
+    let buffer = runtime.buffer(index);
     let network = unsafe { transmute::<_, &NetworkOpaque>(buffer.opaque()) };
     let parsed = ip_header(buffer.current(), network.packet_cursor())?;
-    drop(buffer);
     if !matches!(parsed.protocol, IpProtocol::Other(_)) {
         Ok(())
     } else {
@@ -1157,12 +1149,12 @@ fn refresh_metadata(runtime: &DataPlaneMain, index: Index) -> RuntimeResult<()> 
 
 #[inline(always)]
 fn trim_fragment_payload_chain(
-    runtime: &DataPlaneMain,
+    runtime: &mut DataPlaneMain,
     fragment: ReassemblyFragment,
 ) -> RuntimeResult<()> {
     let payload_len = fragment.end - fragment.start;
-    let mut buffer = runtime.get_buffer_mut(fragment.index)?;
-    buffer.advance(fragment.header_len as isize)?;
+    let buffer = runtime.buffer_mut(fragment.index);
+    buffer.advance(fragment.header_len as isize);
     Ok(buffer.truncate(payload_len)?)
 }
 

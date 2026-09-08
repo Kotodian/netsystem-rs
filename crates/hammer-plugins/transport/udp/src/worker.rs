@@ -4,7 +4,7 @@ use std::net::SocketAddr;
 use std::ops::Deref;
 use std::sync::{Arc, OnceLock, mpsc};
 
-use hammer_core::data_plane::{BufferFrame, Index as BufferIndex, NodeId, NodeState};
+use hammer_core::data_plane::{BufferFrame, NodeId, NodeState};
 use hammer_infra::align::CacheLineAlignMark;
 use hammer_infra::pool::Pool;
 use hammer_infra::thread_owned::{ThreadOwned, ThreadOwnedError};
@@ -167,11 +167,10 @@ impl UdpMain {
 
     fn with_worker<R>(
         &self,
-        runtime: &DataPlaneMain,
+        thread_index: u32,
         operation: impl FnOnce(&mut SessionWorker, &mut UdpWorker) -> RuntimeResult<R>,
     ) -> RuntimeResult<R> {
-        session_main().with_worker_mut(runtime, |sessions| {
-            let thread_index = runtime.thread_index();
+        session_main().with_worker_mut(thread_index, |sessions| {
             let worker = DataWorkerId::try_from(thread_index)
                 .map_err(|_| UdpTransportError::WorkerUnavailable { thread_index })?;
             let mut slot = self.worker(worker)?.borrow_mut().map_err(|source| {
@@ -187,7 +186,7 @@ impl UdpMain {
     pub(crate) fn deliver_datagram(
         &self,
         runtime: &DataPlaneMain,
-        index: BufferIndex,
+        index: u32,
         local: SocketAddr,
         remote: SocketAddr,
         payload_offset: usize,
@@ -196,7 +195,7 @@ impl UdpMain {
         return_node: NodeId,
     ) -> RuntimeResult<UdpDelivery> {
         let listener = find_udp_listener(self.listeners.get(), local);
-        self.with_worker(runtime, |sessions, udp| {
+        self.with_worker(runtime.thread_index(), |sessions, udp| {
             udp.deliver_datagram(
                 sessions,
                 runtime,
@@ -383,7 +382,7 @@ impl UdpWorker {
         &mut self,
         sessions: &mut SessionWorker,
         runtime: &DataPlaneMain,
-        index: BufferIndex,
+        index: u32,
         local: SocketAddr,
         remote: SocketAddr,
         payload_offset: usize,
@@ -950,7 +949,7 @@ pub(crate) fn connect(endpoint: SessionConnectEndpoint) -> RuntimeResult<()> {
     GlobalMain::with_current(|engine| {
         engine.schedule_on_worker(worker, move || {
             let result = with_data_plane_main(|runtime| {
-                main.with_worker(runtime, |sessions, udp| {
+                main.with_worker(runtime.thread_index(), |sessions, udp| {
                     udp.active_connect(sessions, endpoint.connection, local, endpoint.remote)
                 })
             });
@@ -1055,15 +1054,14 @@ fn udp_worker_exit(engine: &mut DataPlaneMain) -> RuntimeResult<()> {
     let main = UDP_MAIN
         .get()
         .ok_or(RuntimeError::PluginStateNotInitialized { plugin: "udp" })?;
-    let runtime = engine.clone();
-    main.with_worker(&runtime, |sessions, udp| {
-        udp.drain_migration_shutdown(sessions, &runtime);
+    main.with_worker(engine.thread_index(), |sessions, udp| {
+        udp.drain_migration_shutdown(sessions, engine);
         Ok(())
     })
 }
 
 fn udp_session_queue_update_time(
-    runtime: &DataPlaneMain,
+    runtime: &mut DataPlaneMain,
     _: &mut SessionWorker,
     _: NodeRuntimeData,
     output_next: SessionQueueNext,
@@ -1074,13 +1072,13 @@ fn udp_session_queue_update_time(
     let main = UDP_MAIN
         .get()
         .ok_or(RuntimeError::PluginStateNotInitialized { plugin: "udp" })?;
-    main.with_worker(runtime, |sessions, udp| {
+    main.with_worker(runtime.thread_index(), |sessions, udp| {
         udp.update_time(sessions, runtime, output_next, frame, output, now)
     })
 }
 
 fn udp_session_queue_dispatch(
-    runtime: &DataPlaneMain,
+    runtime: &mut DataPlaneMain,
     _: &mut SessionWorker,
     _: NodeRuntimeData,
     output_next: SessionQueueNext,
@@ -1091,7 +1089,7 @@ fn udp_session_queue_dispatch(
     let main = UDP_MAIN
         .get()
         .ok_or(RuntimeError::PluginStateNotInitialized { plugin: "udp" })?;
-    main.with_worker(runtime, |sessions, udp| {
+    main.with_worker(runtime.thread_index(), |sessions, udp| {
         dispatch_session_queue_events(runtime, sessions, udp, output_next, frame, output, now)
             .map(|_| ())
     })
@@ -1108,7 +1106,7 @@ impl SessionTransport for UdpWorker {
     fn update_time(
         &mut self,
         sessions: &mut SessionWorker,
-        runtime: &DataPlaneMain,
+        runtime: &mut DataPlaneMain,
         _: SessionQueueNext,
         _: &mut BufferFrame,
         _: &mut SessionQueueOutput,
@@ -1125,7 +1123,7 @@ impl SessionTransport for UdpWorker {
         &mut self,
         sessions: &mut SessionWorker,
         index: u32,
-        _: &DataPlaneMain,
+        _: &mut DataPlaneMain,
         _: SessionQueueNext,
         _: &mut BufferFrame,
         _: &mut SessionQueueOutput,
@@ -1156,7 +1154,7 @@ impl TransportInternalTransport for UdpWorker {
         sessions: &mut SessionWorker,
         session_id: u32,
         index: u32,
-        runtime: &DataPlaneMain,
+        runtime: &mut DataPlaneMain,
         output_next: SessionQueueNext,
         frame: &mut BufferFrame,
         output: &mut SessionQueueOutput,
@@ -1188,8 +1186,8 @@ impl TransportInternalTransport for UdpWorker {
                 return Err(error);
             }
             {
-                let mut output_buffer = runtime.buffers().get_buffer_mut(buffer)?;
-                let header_slice = output_buffer.prepend_mut(UDP_HEADER_LEN)?;
+                let output_buffer = runtime.buffer_mut(buffer);
+                let header_slice = output_buffer.push_uninit(UDP_HEADER_LEN as u8);
                 if write_udp_header(header_slice, local.port(), remote.port(), payload_len)
                     .is_none()
                 {

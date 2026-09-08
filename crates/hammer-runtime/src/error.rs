@@ -14,8 +14,6 @@ pub enum RuntimeError {
     Lifecycle { stage: String, message: String },
     #[error("service closed")]
     ServiceClosed,
-    #[error("memory initialization has not completed")]
-    MemoryNotInitialized,
     #[error("global FileMain is already initialized")]
     FileMainAlreadyInitialized,
     #[error("global FileMain is not initialized")]

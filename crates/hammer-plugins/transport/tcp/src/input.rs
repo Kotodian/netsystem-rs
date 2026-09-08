@@ -5,13 +5,13 @@ use std::sync::Arc;
 
 use crate::{TcpError, TcpInputFlags, TcpSegmentFlags, tcp_header};
 use arc_swap::ArcSwap;
-use hammer_core::data_plane::{BufferFrame, BufferPacketCursor, Index};
+use hammer_core::data_plane::{BufferFrame, BufferPacketCursor};
 use hammer_runtime::{
     DataPlaneMain, DataWorkerId, Node, NodeProcessFn, NodeRuntimeData, TraceFormatter,
     add_packet_trace, format_packet_trace,
 };
 use hammer_runtime::{RuntimeError, RuntimeResult};
-use hammer_service::data_plane::set_buffer_node_error;
+use hammer_service::data_plane::set_index_node_error;
 
 use super::lookup::{
     TcpIpv4ListenerAddress, TcpIpv6ListenerAddress, TcpLookupSnapshot, TcpLookupValue,
@@ -93,7 +93,7 @@ pub struct TcpInputNode {
 
 impl Node for TcpInputNode {
     #[inline(always)]
-    fn process(&mut self, runtime: &DataPlaneMain, frame: &mut BufferFrame) -> () {
+    fn process(&mut self, runtime: &mut DataPlaneMain, frame: &mut BufferFrame) -> () {
         if sync_tcp_input_runtime(self.runtime_data, self.handoff_worker).is_err() {
             return ();
         }
@@ -174,7 +174,7 @@ fn sync_tcp_input_runtime(
 }
 
 pub(crate) fn tcp_input_process(
-    runtime: &DataPlaneMain,
+    runtime: &mut DataPlaneMain,
     data: NodeRuntimeData,
     frame: &mut BufferFrame,
 ) -> () {
@@ -187,7 +187,7 @@ pub(crate) fn tcp_input_process(
 }
 
 fn tcp_input_process_frame(
-    runtime: &DataPlaneMain,
+    runtime: &mut DataPlaneMain,
     frame: &mut BufferFrame,
     snapshot: &TcpLookupSnapshot,
     handoff_worker: Option<DataWorkerId>,
@@ -216,14 +216,13 @@ fn tcp_input_process_frame(
 
 #[inline(always)]
 fn tcp_input_local_next_for_index(
-    runtime: &DataPlaneMain,
-    index: Index,
+    runtime: &mut DataPlaneMain,
+    index: u32,
     snapshot: &TcpLookupSnapshot,
     handoff_worker: Option<DataWorkerId>,
 ) -> RuntimeResult<Option<u16>> {
-    let buffer = runtime.get_buffer(index)?;
+    let buffer = runtime.buffer(index);
     let parsed = tcp_input_buffer(&buffer)?;
-    drop(buffer);
     next_slot_for_index_with_runtime(runtime, index, parsed, snapshot, handoff_worker)
 }
 
@@ -238,8 +237,8 @@ enum TcpInputError {
 
 #[inline(always)]
 fn next_slot_for_index_with_runtime(
-    runtime: &DataPlaneMain,
-    index: Index,
+    runtime: &mut DataPlaneMain,
+    index: u32,
     parsed: Result<
         (
             TcpIpVersion,
@@ -253,7 +252,7 @@ fn next_slot_for_index_with_runtime(
     snapshot: &TcpLookupSnapshot,
     handoff_worker: Option<DataWorkerId>,
 ) -> RuntimeResult<Option<u16>> {
-    let traced = runtime.get_buffer(index)?.trace_handle().is_some();
+    let traced = runtime.buffer(index).trace_handle().is_some();
     let (version, protocol, local, remote, flags) = match parsed {
         Ok(parsed) => parsed,
         Err(TcpInputError::BadLength) => {
@@ -289,7 +288,7 @@ fn next_slot_for_index_with_runtime(
     if let Some((session_id, owner, session_next)) = session_route {
         let slot = session_next.slot() as u16;
         {
-            let mut buffer = runtime.get_buffer_mut(index)?;
+            let buffer = runtime.buffer_mut(index);
             buffer.clear_node_error();
             write_session_route_opaque(buffer.opaque2_mut(), session_id, owner, session_next);
             if let Some(current_worker) = handoff_worker
@@ -339,7 +338,7 @@ fn next_slot_for_index_with_runtime(
 
     if listener_pending {
         {
-            let mut buffer = runtime.get_buffer_mut(index)?;
+            let buffer = runtime.buffer_mut(index);
             buffer.clear_node_error();
             buffer.opaque2_mut().clear();
         }
@@ -383,7 +382,7 @@ fn next_slot_for_index_with_runtime(
         );
     };
     {
-        let mut buffer = runtime.get_buffer_mut(index)?;
+        let buffer = runtime.buffer_mut(index);
         buffer.clear_node_error();
         buffer.opaque2_mut().clear();
     }
@@ -403,7 +402,7 @@ fn next_slot_for_index_with_runtime(
 #[inline(always)]
 fn resolve_success_next_with_trace(
     runtime: &DataPlaneMain,
-    index: Index,
+    index: u32,
     next_key: TcpInputNext,
     version: TcpIpVersion,
     protocol: TcpIpProtocol,
@@ -433,8 +432,8 @@ fn resolve_success_next_with_trace(
 
 #[inline(always)]
 fn resolve_error_next_with_runtime(
-    runtime: &DataPlaneMain,
-    index: Index,
+    runtime: &mut DataPlaneMain,
+    index: u32,
     next_key: TcpInputNext,
     error: TcpError,
     version: Option<TcpIpVersion>,
@@ -442,10 +441,7 @@ fn resolve_error_next_with_runtime(
     flags: u16,
     traced: bool,
 ) -> RuntimeResult<Option<u16>> {
-    {
-        let mut buffer = runtime.get_buffer_mut(index)?;
-        set_buffer_node_error(runtime, &mut buffer, error)?;
-    }
+    set_index_node_error(runtime, index, error)?;
     let slot = next_key.slot() as u16;
     if traced {
         add_packet_trace!(
@@ -475,7 +471,7 @@ fn session_or_listener_pending_input_entry(
     crate::TCP_MAIN
         .get()
         .ok_or(RuntimeError::PluginStateNotInitialized { plugin: "tcp" })?
-        .with_worker(runtime, |_, worker| {
+        .with_worker(runtime.thread_index(), |_, worker| {
             let (route, listener_pending) = worker.lookup.input_route(
                 local,
                 remote,
@@ -523,15 +519,14 @@ fn tcp_input_buffer(
 }
 
 #[inline(always)]
-fn prefetch_tcp_input(runtime: &DataPlaneMain, indices: &[Index], lookup: &TcpLookupSnapshot) {
+fn prefetch_tcp_input(runtime: &DataPlaneMain, indices: &[u32], lookup: &TcpLookupSnapshot) {
     let mut read = 0usize;
     while read < indices.len() {
         let index = indices[read];
         runtime.prefetch_read(index);
-        if let Ok(buffer) = runtime.get_buffer(index) {
-            prefetch_lookup_for_buffer(lookup, &buffer);
-            prefetch_session_route_for_buffer(runtime, &buffer);
-        }
+        let buffer = runtime.buffer(index);
+        prefetch_lookup_for_buffer(lookup, buffer);
+        prefetch_session_route_for_buffer(runtime, buffer);
         read += 1;
     }
 }
@@ -791,7 +786,7 @@ fn prefetch_session_route_for_buffer(
     let Some(main) = crate::TCP_MAIN.get() else {
         return;
     };
-    let _ = main.with_worker(runtime, |_, worker| {
+    let _ = main.with_worker(runtime.thread_index(), |_, worker| {
         worker.lookup.prefetch_tuple(local, remote);
         Ok(())
     });

@@ -1,5 +1,5 @@
 use crate::protocol::{IcmpBuildError, IcmpHeader, build_echo_reply};
-use hammer_core::data_plane::{BufferFrame, BufferPacketCursor, Index, NodeId, NodeNext};
+use hammer_core::data_plane::{BufferFrame, BufferPacketCursor, NodeId, NodeNext};
 use hammer_plugin_ip::ip::ip_header;
 use hammer_plugin_ip::protocol::icmp::IcmpErrorMetadata;
 use hammer_plugin_ip::protocol::ip::{IpProtocol, IpVersion};
@@ -330,7 +330,7 @@ impl crate::IcmpMain {
 
 impl Node for Icmp4InputNode {
     #[inline(always)]
-    fn process(&mut self, runtime: &DataPlaneMain, frame: &mut BufferFrame) -> () {
+    fn process(&mut self, runtime: &mut DataPlaneMain, frame: &mut BufferFrame) -> () {
         icmp_input_process(runtime, self.runtime_data, frame, IpVersion::V4)
     }
 
@@ -352,7 +352,7 @@ impl Node for Icmp4InputNode {
 
 impl Node for Icmp6InputNode {
     #[inline(always)]
-    fn process(&mut self, runtime: &DataPlaneMain, frame: &mut BufferFrame) -> () {
+    fn process(&mut self, runtime: &mut DataPlaneMain, frame: &mut BufferFrame) -> () {
         icmp_input_process(runtime, self.runtime_data, frame, IpVersion::V6)
     }
 
@@ -404,7 +404,7 @@ fn register_icmp4_echo_request(runtime: &DataPlaneMain) -> RuntimeResult<NodeId>
 
 impl Node for Icmp4EchoRequestNode {
     #[inline(always)]
-    fn process(&mut self, runtime: &DataPlaneMain, frame: &mut BufferFrame) -> () {
+    fn process(&mut self, runtime: &mut DataPlaneMain, frame: &mut BufferFrame) -> () {
         icmp_echo_request_process_frame(runtime, frame, IpVersion::V4)
     }
 
@@ -451,7 +451,7 @@ fn register_icmp6_echo_request(runtime: &DataPlaneMain) -> RuntimeResult<NodeId>
 
 impl Node for Icmp6EchoRequestNode {
     #[inline(always)]
-    fn process(&mut self, runtime: &DataPlaneMain, frame: &mut BufferFrame) -> () {
+    fn process(&mut self, runtime: &mut DataPlaneMain, frame: &mut BufferFrame) -> () {
         icmp_echo_request_process_frame(runtime, frame, IpVersion::V6)
     }
 
@@ -467,7 +467,7 @@ impl Node for Icmp6EchoRequestNode {
 }
 
 fn icmp_input_process(
-    runtime: &DataPlaneMain,
+    runtime: &mut DataPlaneMain,
     _: NodeRuntimeData,
     frame: &mut BufferFrame,
     version: IpVersion,
@@ -488,7 +488,7 @@ fn icmp_input_process(
 }
 
 fn icmp_echo_request_process_frame(
-    runtime: &DataPlaneMain,
+    runtime: &mut DataPlaneMain,
     frame: &mut BufferFrame,
     version: IpVersion,
 ) -> () {
@@ -505,12 +505,12 @@ fn icmp_echo_request_process_frame(
 
 #[inline(always)]
 fn next_slot_for_index(
-    runtime: &DataPlaneMain,
-    index: Index,
+    runtime: &mut DataPlaneMain,
+    index: u32,
     version: IpVersion,
 ) -> RuntimeResult<u16> {
     let main = crate::IcmpMain::global()?;
-    let buffer = runtime.get_buffer(index)?;
+    let buffer = runtime.buffer(index);
     let current = buffer.current();
     // SAFETY: IP local initializes the network overlay before ICMP dispatch.
     let network = unsafe { &*(buffer.opaque() as *const _ as *const NetworkOpaque) };
@@ -571,10 +571,9 @@ fn next_slot_for_index(
             None => Ok(entry.next),
         }
     })();
-    drop(buffer);
     match selected {
         Ok(next) => {
-            runtime.get_buffer_mut(index)?.clear_node_error();
+            runtime.buffer_mut(index).clear_node_error();
             trace.next = next;
         }
         Err(error) => {
@@ -595,24 +594,31 @@ fn next_slot_for_index(
 
 #[inline(always)]
 fn next_for_echo_request_index(
-    runtime: &DataPlaneMain,
-    index: Index,
+    runtime: &mut DataPlaneMain,
+    index: u32,
     version: IpVersion,
 ) -> RuntimeResult<u16> {
     let net = hammer_service::net::NetMain::global()?;
-    let mut buffer = runtime.get_buffer_mut(index)?;
-    // SAFETY: IP local initialized the packet's network overlay before dispatch.
-    let network = unsafe { &*(buffer.opaque() as *const _ as *const NetworkOpaque) };
-    let parsed =
-        ip_header(buffer.current(), network.packet_cursor()).map_err(|_| IcmpBuildError::BadLength);
+    let parsed = {
+        let buffer = runtime.buffer(index);
+        // SAFETY: IP local initialized the packet's network overlay before dispatch.
+        let network = unsafe { &*(buffer.opaque() as *const _ as *const NetworkOpaque) };
+        ip_header(buffer.current(), network.packet_cursor())
+            .map_err(|_| IcmpBuildError::BadLength)
+            .and_then(|parsed| {
+                if parsed.version == version {
+                    Ok(parsed)
+                } else {
+                    Err(IcmpBuildError::WrongProtocol)
+                }
+            })
+    };
+    let fragment_id = match &parsed {
+        Ok(parsed) if parsed.version == IpVersion::V4 => runtime.random().next_u32() as u16,
+        _ => 0,
+    };
+    let buffer = runtime.buffer_mut(index);
     let reply = parsed.and_then(|parsed| {
-        if parsed.version != version {
-            return Err(IcmpBuildError::WrongProtocol);
-        }
-        let fragment_id = match parsed.version {
-            IpVersion::V4 => runtime.random().next_u32() as u16,
-            IpVersion::V6 => 0,
-        };
         build_echo_reply(buffer.current_mut(), &parsed, fragment_id)?;
         Ok(parsed)
     });
@@ -652,7 +658,6 @@ fn next_for_echo_request_index(
                         parsed.transport_header_offset + ICMP_ECHO_HEADER_LEN,
                     ),
             );
-            drop(buffer);
             add_packet_trace!(
                 runtime,
                 index,
@@ -665,7 +670,6 @@ fn next_for_echo_request_index(
             Ok(next)
         }
         Err(error) => {
-            drop(buffer);
             let error = IcmpNodeError::from(error);
             set_index_node_error(runtime, index, error)?;
             let next = match version {
@@ -694,6 +698,8 @@ mod tests {
     #[test]
     fn input_dispatch_preserves_protocol_specific_validation() -> RuntimeResult<()> {
         hammer_runtime::config::Memory::default().ensure_main_heap()?;
+        hammer_core::buffer::BufferMain::new(64, 1024, &[0], 2, hammer_infra::PageSize::Default)
+            .unwrap();
         let mut main = GlobalMain::new(
             DataPlaneMain::new(DataPlaneBufferConfig::default()),
             RuntimeRegistry::new(),
@@ -809,7 +815,7 @@ mod tests {
                 .alloc_index_with_bytes(&packet[..packet_len])?;
             frame.push_index(index)?;
             {
-                let mut buffer = runtime.get_buffer_mut(index)?;
+                let mut buffer = runtime.buffer_mut(index);
                 // SAFETY: this fixture installs the same initialized service
                 // overlay that IP local supplies at the ICMP input boundary.
                 let network =
@@ -834,10 +840,7 @@ mod tests {
                     runtime.with_current_node(input, || runtime.record_current_node_error(error))
                 })
                 .transpose()?;
-            assert_eq!(
-                runtime.get_buffer(index)?.node_error_index(),
-                expected_error
-            );
+            assert_eq!(runtime.buffer(index).node_error_index(), expected_error);
             if error.is_none() {
                 let mut expected_random = runtime.random().clone();
                 let fragment_id = expected_random.next_u32() as u16;
@@ -854,7 +857,7 @@ mod tests {
                         })
                         .unwrap()
                 );
-                let buffer = runtime.get_buffer(index)?;
+                let buffer = runtime.buffer(index);
                 let reply = buffer.current();
                 if version == IpVersion::V4 {
                     assert_eq!(&reply[4..6], &fragment_id.to_be_bytes());

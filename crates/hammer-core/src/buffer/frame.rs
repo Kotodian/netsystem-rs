@@ -2,7 +2,7 @@ use super::*;
 
 #[derive(Debug)]
 pub struct BufferFrame {
-    indices: Vec<Index>,
+    indices: Vec<u32>,
     /// Logical graph Frame maximum. Independent of the growable vector's
     /// reserved capacity.
     limit: usize,
@@ -133,7 +133,7 @@ impl BufferFrame {
     }
 
     #[inline]
-    pub fn push_index(&mut self, index: Index) -> DataPlaneResult<()> {
+    pub fn push_index(&mut self, index: u32) -> DataPlaneResult<()> {
         if self.indices.len() == self.limit {
             return Err(DataPlaneError::BufferFrameCapacityExceeded.into());
         }
@@ -142,10 +142,7 @@ impl BufferFrame {
     }
 
     #[inline]
-    pub fn push_indices(
-        &mut self,
-        indices: impl IntoIterator<Item = Index>,
-    ) -> DataPlaneResult<()> {
+    pub fn push_indices(&mut self, indices: impl IntoIterator<Item = u32>) -> DataPlaneResult<()> {
         let indices = indices.into_iter();
         let (lower, upper) = indices.size_hint();
         if let Some(upper) = upper {
@@ -188,12 +185,12 @@ impl BufferFrame {
     }
 
     #[inline]
-    pub fn indices(&self) -> &[Index] {
+    pub fn indices(&self) -> &[u32] {
         &self.indices
     }
 
     #[inline]
-    pub(crate) fn drain_indices(&mut self) -> std::vec::Drain<'_, Index> {
+    pub(crate) fn drain_indices(&mut self) -> std::vec::Drain<'_, u32> {
         self.indices.drain(..)
     }
 
@@ -209,7 +206,7 @@ impl BufferFrame {
     #[inline]
     pub fn retain_indices(
         &mut self,
-        mut keep: impl FnMut(Index) -> DataPlaneResult<bool>,
+        mut keep: impl FnMut(u32) -> DataPlaneResult<bool>,
     ) -> DataPlaneResult<()> {
         let mut write = 0usize;
         for read in 0..self.indices.len() {
@@ -229,7 +226,7 @@ impl BufferFrame {
     pub fn retain_indices_batched(
         &mut self,
         width: FrameBatchWidth,
-        mut keep: impl FnMut(Index) -> DataPlaneResult<bool>,
+        mut keep: impl FnMut(u32) -> DataPlaneResult<bool>,
     ) -> DataPlaneResult<()> {
         match width {
             FrameBatchWidth::Octo => self.retain_indices_octo(&mut keep),
@@ -242,8 +239,8 @@ impl BufferFrame {
     pub fn retain_indices_batched_with_prefetch(
         &mut self,
         width: FrameBatchWidth,
-        mut prefetch: impl FnMut(Index),
-        mut keep: impl FnMut(Index) -> DataPlaneResult<bool>,
+        mut prefetch: impl FnMut(u32),
+        mut keep: impl FnMut(u32) -> DataPlaneResult<bool>,
     ) -> DataPlaneResult<()> {
         match width {
             FrameBatchWidth::Quad => {
@@ -263,8 +260,8 @@ impl BufferFrame {
         &mut self,
         width: FrameBatchWidth,
         state: &mut S,
-        mut prefetch: impl FnMut(&mut S, Index),
-        mut keep: impl FnMut(&mut S, Index) -> DataPlaneResult<bool>,
+        mut prefetch: impl FnMut(&mut S, u32),
+        mut keep: impl FnMut(&mut S, u32) -> DataPlaneResult<bool>,
     ) -> DataPlaneResult<()> {
         match width {
             FrameBatchWidth::Quad => {
@@ -284,8 +281,8 @@ impl BufferFrame {
         &mut self,
         width: FrameBatchWidth,
         state: &mut S,
-        mut prefetch: impl FnMut(&mut S, Index),
-        mut keep: impl FnMut(&mut S, Index) -> DataPlaneResult<bool>,
+        mut prefetch: impl FnMut(&mut S, u32),
+        mut keep: impl FnMut(&mut S, u32) -> DataPlaneResult<bool>,
     ) -> DataPlaneResult<()> {
         match width {
             FrameBatchWidth::Quad => {
@@ -304,7 +301,7 @@ impl BufferFrame {
     pub fn rewrite_indices_batched(
         &mut self,
         width: FrameBatchWidth,
-        mut rewrite: impl FnMut(Index) -> DataPlaneResult<Option<Index>>,
+        mut rewrite: impl FnMut(u32) -> DataPlaneResult<Option<u32>>,
     ) -> DataPlaneResult<()> {
         match width {
             FrameBatchWidth::Quad => self.rewrite_indices_quad(&mut rewrite),
@@ -316,7 +313,7 @@ impl BufferFrame {
     #[inline(always)]
     fn retain_indices_quad(
         &mut self,
-        keep: &mut impl FnMut(Index) -> DataPlaneResult<bool>,
+        keep: &mut impl FnMut(u32) -> DataPlaneResult<bool>,
     ) -> DataPlaneResult<()> {
         let len = self.indices.len();
         let mut read = 0usize;
@@ -363,8 +360,8 @@ impl BufferFrame {
     #[inline(always)]
     fn retain_indices_quad_with_prefetch(
         &mut self,
-        prefetch: &mut impl FnMut(Index),
-        keep: &mut impl FnMut(Index) -> DataPlaneResult<bool>,
+        prefetch: &mut impl FnMut(u32),
+        keep: &mut impl FnMut(u32) -> DataPlaneResult<bool>,
     ) -> DataPlaneResult<()> {
         let len = self.indices.len();
         let mut read = 0usize;
@@ -379,7 +376,7 @@ impl BufferFrame {
     #[inline(always)]
     fn retain_indices_pair(
         &mut self,
-        keep: &mut impl FnMut(Index) -> DataPlaneResult<bool>,
+        keep: &mut impl FnMut(u32) -> DataPlaneResult<bool>,
     ) -> DataPlaneResult<()> {
         let len = self.indices.len();
         let mut read = 0usize;
@@ -394,7 +391,7 @@ impl BufferFrame {
     #[inline(always)]
     fn retain_indices_octo(
         &mut self,
-        keep: &mut impl FnMut(Index) -> DataPlaneResult<bool>,
+        keep: &mut impl FnMut(u32) -> DataPlaneResult<bool>,
     ) -> DataPlaneResult<()> {
         let len = self.indices.len();
         let mut read = 0usize;
@@ -481,8 +478,8 @@ impl BufferFrame {
     #[inline(always)]
     fn retain_indices_pair_with_prefetch(
         &mut self,
-        prefetch: &mut impl FnMut(Index),
-        keep: &mut impl FnMut(Index) -> DataPlaneResult<bool>,
+        prefetch: &mut impl FnMut(u32),
+        keep: &mut impl FnMut(u32) -> DataPlaneResult<bool>,
     ) -> DataPlaneResult<()> {
         let len = self.indices.len();
         let mut read = 0usize;
@@ -498,8 +495,8 @@ impl BufferFrame {
     fn retain_indices_quad_with_prefetch_state<S>(
         &mut self,
         state: &mut S,
-        prefetch: &mut impl FnMut(&mut S, Index),
-        keep: &mut impl FnMut(&mut S, Index) -> DataPlaneResult<bool>,
+        prefetch: &mut impl FnMut(&mut S, u32),
+        keep: &mut impl FnMut(&mut S, u32) -> DataPlaneResult<bool>,
     ) -> DataPlaneResult<()> {
         let len = self.indices.len();
         let mut read = 0usize;
@@ -515,8 +512,8 @@ impl BufferFrame {
     fn retain_indices_pair_with_prefetch_state<S>(
         &mut self,
         state: &mut S,
-        prefetch: &mut impl FnMut(&mut S, Index),
-        keep: &mut impl FnMut(&mut S, Index) -> DataPlaneResult<bool>,
+        prefetch: &mut impl FnMut(&mut S, u32),
+        keep: &mut impl FnMut(&mut S, u32) -> DataPlaneResult<bool>,
     ) -> DataPlaneResult<()> {
         let len = self.indices.len();
         let mut read = 0usize;
@@ -532,8 +529,8 @@ impl BufferFrame {
     fn retain_indices_quad_with_prefetch_state_lazy<S>(
         &mut self,
         state: &mut S,
-        prefetch: &mut impl FnMut(&mut S, Index),
-        keep: &mut impl FnMut(&mut S, Index) -> DataPlaneResult<bool>,
+        prefetch: &mut impl FnMut(&mut S, u32),
+        keep: &mut impl FnMut(&mut S, u32) -> DataPlaneResult<bool>,
     ) -> DataPlaneResult<()> {
         let len = self.indices.len();
         let mut read = 0usize;
@@ -549,8 +546,8 @@ impl BufferFrame {
     fn retain_indices_pair_with_prefetch_state_lazy<S>(
         &mut self,
         state: &mut S,
-        prefetch: &mut impl FnMut(&mut S, Index),
-        keep: &mut impl FnMut(&mut S, Index) -> DataPlaneResult<bool>,
+        prefetch: &mut impl FnMut(&mut S, u32),
+        keep: &mut impl FnMut(&mut S, u32) -> DataPlaneResult<bool>,
     ) -> DataPlaneResult<()> {
         let len = self.indices.len();
         let mut read = 0usize;
@@ -565,7 +562,7 @@ impl BufferFrame {
     #[inline(always)]
     fn rewrite_indices_quad(
         &mut self,
-        rewrite: &mut impl FnMut(Index) -> DataPlaneResult<Option<Index>>,
+        rewrite: &mut impl FnMut(u32) -> DataPlaneResult<Option<u32>>,
     ) -> DataPlaneResult<()> {
         let len = self.indices.len();
         let mut read = 0usize;
@@ -580,7 +577,7 @@ impl BufferFrame {
     #[inline(always)]
     fn rewrite_indices_octo(
         &mut self,
-        rewrite: &mut impl FnMut(Index) -> DataPlaneResult<Option<Index>>,
+        rewrite: &mut impl FnMut(u32) -> DataPlaneResult<Option<u32>>,
     ) -> DataPlaneResult<()> {
         let len = self.indices.len();
         let mut read = 0usize;
@@ -595,7 +592,7 @@ impl BufferFrame {
     #[inline(always)]
     fn rewrite_indices_pair(
         &mut self,
-        rewrite: &mut impl FnMut(Index) -> DataPlaneResult<Option<Index>>,
+        rewrite: &mut impl FnMut(u32) -> DataPlaneResult<Option<u32>>,
     ) -> DataPlaneResult<()> {
         let len = self.indices.len();
         let mut read = 0usize;
@@ -612,7 +609,7 @@ impl BufferFrame {
         &mut self,
         read: usize,
         write: &mut usize,
-        keep: &mut impl FnMut(Index) -> DataPlaneResult<bool>,
+        keep: &mut impl FnMut(u32) -> DataPlaneResult<bool>,
     ) -> DataPlaneResult<()> {
         let index = self.indices[read];
         if keep(index)? {
@@ -628,7 +625,7 @@ impl BufferFrame {
         read: usize,
         write: &mut usize,
         state: &mut S,
-        keep: &mut impl FnMut(&mut S, Index) -> DataPlaneResult<bool>,
+        keep: &mut impl FnMut(&mut S, u32) -> DataPlaneResult<bool>,
     ) -> DataPlaneResult<()> {
         let index = self.indices[read];
         if keep(state, index)? {
@@ -644,7 +641,7 @@ impl BufferFrame {
         read: usize,
         write: &mut Option<usize>,
         state: &mut S,
-        keep: &mut impl FnMut(&mut S, Index) -> DataPlaneResult<bool>,
+        keep: &mut impl FnMut(&mut S, u32) -> DataPlaneResult<bool>,
     ) -> DataPlaneResult<()> {
         let index = self.indices[read];
         if keep(state, index)? {
@@ -663,7 +660,7 @@ impl BufferFrame {
         &mut self,
         read: usize,
         write: &mut usize,
-        rewrite: &mut impl FnMut(Index) -> DataPlaneResult<Option<Index>>,
+        rewrite: &mut impl FnMut(u32) -> DataPlaneResult<Option<u32>>,
     ) -> DataPlaneResult<()> {
         let index = self.indices[read];
         if let Some(index) = rewrite(index)? {
@@ -674,7 +671,7 @@ impl BufferFrame {
     }
 
     #[inline(always)]
-    fn prefetch_indices(&self, offset: usize, width: usize, prefetch: &mut impl FnMut(Index)) {
+    fn prefetch_indices(&self, offset: usize, width: usize, prefetch: &mut impl FnMut(u32)) {
         let end = (offset + width).min(self.indices.len());
         for index in self.indices[offset..end].iter().copied() {
             prefetch(index);
@@ -687,7 +684,7 @@ impl BufferFrame {
         offset: usize,
         width: usize,
         state: &mut S,
-        prefetch: &mut impl FnMut(&mut S, Index),
+        prefetch: &mut impl FnMut(&mut S, u32),
     ) {
         let end = (offset + width).min(self.indices.len());
         for index in self.indices[offset..end].iter().copied() {

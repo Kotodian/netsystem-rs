@@ -4,7 +4,7 @@ use std::net::IpAddr;
 
 use crate::protocol::ip::{Ipv4Header, Ipv6Header};
 use crate::protocol::wire::read_header;
-use hammer_core::data_plane::{BufferFrame, BufferPacketCursor, Index, NodeId, NodeNext};
+use hammer_core::data_plane::{BufferFrame, BufferPacketCursor, NodeId, NodeNext};
 use hammer_infra::checksum::InternetChecksum;
 use hammer_runtime::{
     DataPlaneMain, Node, NodeProcessFn, TraceFormatter, add_packet_trace, format_packet_trace,
@@ -137,7 +137,7 @@ fn register_ip4_local(runtime: &DataPlaneMain) -> RuntimeResult<NodeId> {
 }
 
 impl Node for Ip4LocalNode {
-    fn process(&mut self, runtime: &DataPlaneMain, frame: &mut BufferFrame) {
+    fn process(&mut self, runtime: &mut DataPlaneMain, frame: &mut BufferFrame) {
         process_frame(runtime, frame, LocalStage::Head, IpVersion::V4)
     }
     fn node_process(&self) -> NodeProcessFn {
@@ -187,7 +187,7 @@ fn register_ip4_receive(runtime: &DataPlaneMain) -> RuntimeResult<NodeId> {
 }
 
 impl Node for Ip4ReceiveNode {
-    fn process(&mut self, runtime: &DataPlaneMain, frame: &mut BufferFrame) {
+    fn process(&mut self, runtime: &mut DataPlaneMain, frame: &mut BufferFrame) {
         process_frame(runtime, frame, LocalStage::Receive, IpVersion::V4)
     }
     fn node_process(&self) -> NodeProcessFn {
@@ -213,7 +213,7 @@ fn register_ip4_local_end_of_arc(runtime: &DataPlaneMain) -> RuntimeResult<NodeI
 }
 
 impl Node for Ip4LocalEndOfArcNode {
-    fn process(&mut self, runtime: &DataPlaneMain, frame: &mut BufferFrame) {
+    fn process(&mut self, runtime: &mut DataPlaneMain, frame: &mut BufferFrame) {
         process_frame(runtime, frame, LocalStage::End, IpVersion::V4)
     }
     fn node_process(&self) -> NodeProcessFn {
@@ -274,7 +274,7 @@ fn register_ip6_local(runtime: &DataPlaneMain) -> RuntimeResult<NodeId> {
 }
 
 impl Node for Ip6LocalNode {
-    fn process(&mut self, runtime: &DataPlaneMain, frame: &mut BufferFrame) {
+    fn process(&mut self, runtime: &mut DataPlaneMain, frame: &mut BufferFrame) {
         process_frame(runtime, frame, LocalStage::Head, IpVersion::V6)
     }
     fn node_process(&self) -> NodeProcessFn {
@@ -324,7 +324,7 @@ fn register_ip6_receive(runtime: &DataPlaneMain) -> RuntimeResult<NodeId> {
 }
 
 impl Node for Ip6ReceiveNode {
-    fn process(&mut self, runtime: &DataPlaneMain, frame: &mut BufferFrame) {
+    fn process(&mut self, runtime: &mut DataPlaneMain, frame: &mut BufferFrame) {
         process_frame(runtime, frame, LocalStage::Receive, IpVersion::V6)
     }
     fn node_process(&self) -> NodeProcessFn {
@@ -350,7 +350,7 @@ fn register_ip6_local_end_of_arc(runtime: &DataPlaneMain) -> RuntimeResult<NodeI
 }
 
 impl Node for Ip6LocalEndOfArcNode {
-    fn process(&mut self, runtime: &DataPlaneMain, frame: &mut BufferFrame) {
+    fn process(&mut self, runtime: &mut DataPlaneMain, frame: &mut BufferFrame) {
         process_frame(runtime, frame, LocalStage::End, IpVersion::V6)
     }
     fn node_process(&self) -> NodeProcessFn {
@@ -421,7 +421,7 @@ impl LocalStage {
 
 #[inline(always)]
 fn process_frame(
-    runtime: &DataPlaneMain,
+    runtime: &mut DataPlaneMain,
     frame: &mut BufferFrame,
     stage: LocalStage,
     version: IpVersion,
@@ -439,12 +439,12 @@ fn process_frame(
 
 #[inline(always)]
 fn process_index(
-    runtime: &DataPlaneMain,
-    index: Index,
+    runtime: &mut DataPlaneMain,
+    index: u32,
     stage: LocalStage,
     version: IpVersion,
 ) -> RuntimeResult<u16> {
-    let buffer = runtime.get_buffer(index)?;
+    let buffer = runtime.buffer(index);
     let current = buffer.current();
     let mut network = *unsafe { transmute::<_, &NetworkOpaque>(buffer.opaque()) };
     if stage.is_head_of_feature_arc() {
@@ -502,7 +502,6 @@ fn process_index(
     let parsed = match ip_header(current, network.packet_cursor()) {
         Ok(parsed) if parsed.version == version => parsed,
         _ => {
-            drop(buffer);
             set_index_node_error(runtime, index, IpLocalError::BadLength)?;
             let resolved = match version {
                 IpVersion::V4 => NodeNext::slot(Ip4LocalNext::Drop),
@@ -526,7 +525,6 @@ fn process_index(
     match parsed.input_target {
         IpInputTarget::Drop | IpInputTarget::IcmpError | IpInputTarget::Options => {
             let error = error_for_input(parsed.input_error);
-            drop(buffer);
             set_index_node_error(runtime, index, error)?;
             let resolved = match version {
                 IpVersion::V4 => NodeNext::slot(Ip4LocalNext::Drop),
@@ -547,7 +545,6 @@ fn process_index(
             return Ok(resolved);
         }
         IpInputTarget::Reassembly => {
-            drop(buffer);
             refresh_basic_metadata(runtime, index, &parsed, None)?;
             let resolved = match version {
                 IpVersion::V4 => NodeNext::slot(Ip4LocalNext::Reassembly),
@@ -582,7 +579,6 @@ fn process_index(
             transport
         }
         _ => {
-            drop(buffer);
             set_index_node_error(runtime, index, IpLocalError::BadLength)?;
             let resolved = match version {
                 IpVersion::V4 => NodeNext::slot(Ip4LocalNext::Drop),
@@ -607,7 +603,6 @@ fn process_index(
     let transport_len = match validate_transport(transport, &parsed) {
         Ok(transport_len) => transport_len,
         Err(error) => {
-            drop(buffer);
             set_index_node_error(runtime, index, error)?;
             let resolved = match version {
                 IpVersion::V4 => NodeNext::slot(Ip4LocalNext::Drop),
@@ -634,7 +629,6 @@ fn process_index(
         IpProtocol::Icmpv4 | IpProtocol::Icmpv6 => true,
         IpProtocol::Other(_) => false,
     };
-    drop(buffer);
     let offloaded = match parsed.protocol {
         IpProtocol::Tcp => network.oflags.contains(NetworkOffloadFlags::TCP_CHECKSUM),
         IpProtocol::Udp => network.oflags.contains(NetworkOffloadFlags::UDP_CHECKSUM),
@@ -647,7 +641,7 @@ fn process_index(
         && !network.flags.contains(NetworkFlags::L4_CHECKSUM_COMPUTED)
     {
         checksum_correct = l4_checksum(runtime, index, &parsed)? == 0;
-        let mut buffer = runtime.get_buffer_mut(index)?;
+        let buffer = runtime.buffer_mut(index);
         // SAFETY: the frame owns the initialized network overlay exclusively.
         let network = unsafe { &mut *(buffer.opaque_mut() as *mut _ as *mut NetworkOpaque) };
         network.flags.insert(NetworkFlags::L4_CHECKSUM_COMPUTED);
@@ -738,7 +732,7 @@ fn process_index(
             }
         };
         let net = NetMain::global()?;
-        let mut buffer = runtime.get_buffer_mut(index)?;
+        let mut buffer = runtime.buffer_mut(index);
         // Preserve the physical RX identity; features use the receive DPO's
         // effective interface, including when the packet arrived elsewhere.
         let interface_index = network.ip().rx_sw_if_index;
@@ -821,12 +815,12 @@ fn tcp_header_len(transport: &[u8]) -> Result<usize, IpLocalError> {
 
 #[inline(always)]
 fn refresh_basic_metadata(
-    runtime: &DataPlaneMain,
-    index: Index,
+    runtime: &mut DataPlaneMain,
+    index: u32,
     parsed: &ParsedIpPacket,
     transport_header_len: Option<usize>,
 ) -> RuntimeResult<()> {
-    let mut buffer = runtime.get_buffer_mut(index)?;
+    let buffer = runtime.buffer_mut(index);
     let transport_header_len = transport_header_len.unwrap_or_default();
     unsafe { transmute::<_, &mut NetworkOpaque>(buffer.opaque_mut()) }.set_packet_cursor(
         BufferPacketCursor::new()
@@ -847,11 +841,7 @@ fn error_for_input(error: IpInputError) -> IpLocalError {
 }
 
 #[inline(always)]
-fn l4_checksum(
-    runtime: &DataPlaneMain,
-    index: Index,
-    parsed: &ParsedIpPacket,
-) -> RuntimeResult<u16> {
+fn l4_checksum(runtime: &DataPlaneMain, index: u32, parsed: &ParsedIpPacket) -> RuntimeResult<u16> {
     let mut checksum: InternetChecksum = Default::default();
     let mut remaining = parsed.packet_len - parsed.transport_header_offset;
     match (parsed.source, parsed.destination) {
@@ -1027,7 +1017,7 @@ pub(crate) mod tests {
                 let index = runtime.alloc_index_with_bytes(&packet)?;
                 frame.push_index(index)?;
                 {
-                    let mut buffer = runtime.get_buffer_mut(index)?;
+                    let mut buffer = runtime.buffer_mut(index);
                     let mut network = NetworkOpaque::default();
                     network.sw_if_index[0] = raw_rx;
                     network.flags = flags;
@@ -1051,7 +1041,7 @@ pub(crate) mod tests {
                 let next = runtime.with_current_node(receive, || {
                     process_index(runtime, index, LocalStage::Receive, version)
                 })?;
-                let buffer = runtime.get_buffer(index)?;
+                let buffer = runtime.buffer(index);
                 let network = unsafe { &*(buffer.opaque() as *const _ as *const NetworkOpaque) };
                 assert_eq!(network.sw_if_index[0], raw_rx);
                 if accepted {
@@ -1075,7 +1065,23 @@ pub(crate) mod tests {
     #[test]
     fn icmp_checksum_spans_odd_buffer_boundary() -> RuntimeResult<()> {
         hammer_runtime::config::Memory::default().ensure_main_heap()?;
-        let runtime = DataPlaneMain::new(DataPlaneBufferConfig::default());
+        crate::BUFFER_MAIN_INIT.call_once(|| {
+            hammer_infra::main_heap::init_default().unwrap();
+            hammer_core::buffer::BufferMain::new(
+                64,
+                1024,
+                &[0, 1],
+                2,
+                hammer_infra::PageSize::Default,
+            )
+            .unwrap();
+        });
+        let runtime = DataPlaneMain::new(DataPlaneBufferConfig {
+            numa_nodes: &[1],
+            active_numa_node: 1,
+            thread_index: 1,
+            ..DataPlaneBufferConfig::default()
+        });
         // test_ip4.py::TestICMPEcho uses ID 0xB, sequence 5 and 18 payload
         // bytes. Split that message across buffers to exercise the chain
         // checksum used by VPP ip_calculate_l4_checksum, including odd carry.
@@ -1102,7 +1108,7 @@ pub(crate) mod tests {
                 .with_transport_header(20, 8),
         )?;
         assert_eq!(l4_checksum(&runtime, head, &parsed)?, 0);
-        runtime.get_buffer_mut(tail)?.current_mut()[0] ^= 1;
+        runtime.buffer_mut(tail).current_mut()[0] ^= 1;
         assert_ne!(l4_checksum(&runtime, head, &parsed)?, 0);
         drop(frame);
         assert_eq!(runtime.buffers().in_use_buffers(), 0);

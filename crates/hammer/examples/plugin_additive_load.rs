@@ -15,9 +15,8 @@ use std::sync::Arc;
 
 use hammer_core::data_plane::NodeId;
 use hammer_runtime::RuntimeRegistry;
-use hammer_runtime::config::Memory;
+use hammer_runtime::config::{Memory, Worker};
 use hammer_runtime::global_main::GlobalMain;
-use hammer_runtime::{DataPlaneBufferConfig, DataPlaneMain};
 use hammer_runtime::{PluginError, RuntimeError};
 
 // Shared device/interface/transport/session registrations remain host-owned.
@@ -42,6 +41,7 @@ const PLUGIN_NAMES: [&str; 3] = ["ip", "tcp", "udp"];
 #[serde(default)]
 struct ExampleEarlyConfig {
     memory: Memory,
+    worker: Worker,
 }
 
 #[derive(Debug, Default, serde::Deserialize)]
@@ -121,8 +121,7 @@ fn main() -> Result<(), ExampleError> {
         .plugins;
     exercise_post_ready_allocations(&roots)?;
 
-    let runtime = DataPlaneMain::new(DataPlaneBufferConfig::default());
-    let mut engine = GlobalMain::new(runtime, RuntimeRegistry::new());
+    let mut engine = GlobalMain::new_configured(RuntimeRegistry::new(), early.worker)?;
     engine.init_control()?;
     engine
         .plugin_main_mut()

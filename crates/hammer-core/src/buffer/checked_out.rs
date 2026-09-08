@@ -7,14 +7,14 @@ use super::{BufferFrame, DataPlaneBuffers};
 
 pub struct Next {
     pub(super) owner: DataPlaneBuffers,
-    pub(super) index: super::Index,
+    pub(super) index: (u64, u32, u32),
     pub(super) next: NodeId,
     pub(super) frame: Option<BufferFrame>,
 }
 
 pub struct Pending {
     pub(super) owner: DataPlaneBuffers,
-    pub(super) index: super::Index,
+    pub(super) index: (u64, u32, u32),
     pub(super) frame: Option<BufferFrame>,
 }
 
@@ -70,6 +70,14 @@ impl Frame<Next> {
 
 impl Frame<Pending> {
     #[inline]
+    pub fn return_with_trace_release(mut self, release_trace: impl FnMut(u32)) {
+        if let Some(frame) = self.state.frame.take() {
+            self.state
+                .owner
+                .drop_owned_frame_with_trace(self.state.index, frame, release_trace);
+        }
+    }
+    #[inline]
     fn frame(&self) -> &BufferFrame {
         match self.state.frame.as_ref() {
             Some(frame) => frame,
@@ -82,15 +90,6 @@ impl Frame<Pending> {
         match self.state.frame.as_mut() {
             Some(frame) => frame,
             None => super::abort_checked_out_frame(),
-        }
-    }
-
-    #[inline]
-    pub fn return_with_trace_release(mut self, release_trace: impl FnMut(u32)) {
-        if let Some(frame) = self.state.frame.take() {
-            self.state
-                .owner
-                .drop_owned_frame_with_trace(self.state.index, frame, release_trace);
         }
     }
 }

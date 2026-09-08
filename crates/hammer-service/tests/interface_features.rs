@@ -6,6 +6,8 @@ use hammer_service::interface::{InterfaceMain, InterfaceOutputNode};
 fn feature_chain_terminates_without_an_end_node_self_edge() -> Result<(), Box<dyn std::error::Error>>
 {
     hammer_runtime::config::Memory::default().ensure_main_heap()?;
+    hammer_core::buffer::BufferMain::new(64, 1024, &[0], 2, hammer_infra::PageSize::Default)
+        .unwrap();
     let mut main = GlobalMain::new(
         DataPlaneMain::new(DataPlaneBufferConfig::default()),
         RuntimeRegistry::new(),
@@ -41,17 +43,17 @@ fn feature_chain_terminates_without_an_end_node_self_edge() -> Result<(), Box<dy
         let mut frame = runtime.buffers().get_next_frame(output)?;
         let index = runtime.buffers().alloc_index_with_bytes(&[0; 64])?;
         frame.push_index(index)?;
-        let mut buffer = runtime.get_buffer_mut(index)?;
-        let first = interfaces.start_feature_arc(arc, interface, &mut buffer, u16::MAX);
+        let buffer = runtime.buffer_mut(index);
+        let first = interfaces.start_feature_arc(arc, interface, buffer, u16::MAX);
+        let cursor = buffer.current_config_index();
+        let (words, next) = interfaces.next_feature_with_config::<2>(buffer);
+        selected_config = words;
+        assert_eq!(words, config);
+        assert_eq!(buffer.current_config_index(), cursor + 3);
         assert_eq!(
             runtime.nodes().node_next_slot(output, usize::from(first))?,
             punt
         );
-        let cursor = buffer.current_config_index();
-        let (words, next) = interfaces.next_feature_with_config::<2>(&mut buffer);
-        selected_config = words;
-        assert_eq!(words, config);
-        assert_eq!(buffer.current_config_index(), cursor + 3);
         assert_eq!(
             runtime.nodes().node_next_slot(punt, usize::from(next))?,
             drop_node
@@ -71,10 +73,10 @@ fn feature_chain_terminates_without_an_end_node_self_edge() -> Result<(), Box<dy
         let mut frame = runtime.buffers().get_next_frame(output)?;
         let index = runtime.buffers().alloc_index_with_bytes(&[0; 64])?;
         frame.push_index(index)?;
-        let mut buffer = runtime.get_buffer_mut(index)?;
-        interfaces.start_feature_arc(arc, interface, &mut buffer, u16::MAX);
+        let buffer = runtime.buffer_mut(index);
+        interfaces.start_feature_arc(arc, interface, buffer, u16::MAX);
         let cursor = buffer.current_config_index();
-        let next = interfaces.next_feature(&mut buffer);
+        let next = interfaces.next_feature(buffer);
         assert_eq!(buffer.current_config_index(), cursor + 1);
         assert_eq!(
             runtime.nodes().node_next_slot(punt, usize::from(next))?,
@@ -86,14 +88,10 @@ fn feature_chain_terminates_without_an_end_node_self_edge() -> Result<(), Box<dy
     let mut frame = runtime.buffers().get_next_frame(output)?;
     let index = runtime.buffers().alloc_index_with_bytes(&[0; 64])?;
     frame.push_index(index)?;
-    let mut buffer = runtime.get_buffer_mut(index)?;
+    let buffer = runtime.buffer_mut(index);
     let cursor = buffer.current_config_index();
-    assert_eq!(
-        interfaces.start_feature_arc(arc, interface, &mut buffer, 7),
-        7
-    );
+    assert_eq!(interfaces.start_feature_arc(arc, interface, buffer, 7), 7);
     assert_eq!(buffer.current_config_index(), cursor);
-    drop(buffer);
     drop(frame);
     assert_eq!(runtime.buffers().in_use_buffers(), 0);
     GlobalMain::uninstall_current();

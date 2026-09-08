@@ -1,9 +1,10 @@
 use super::*;
 
 impl DataPlaneMain {
-    pub fn run_ready_nodes(&self) -> RuntimeResult<usize> {
+    pub fn run_ready_nodes(&mut self) -> RuntimeResult<usize> {
         self.drain_handoff_frames()?;
-        self.nodes.run_ready_function_nodes(self)
+        let nodes = self.nodes.clone();
+        nodes.run_ready_function_nodes(self)
     }
 
     #[inline]
@@ -66,7 +67,7 @@ impl DataPlaneMain {
         &self,
         worker: DataWorkerId,
         target: NodeId,
-        index: Index,
+        index: u32,
     ) -> RuntimeResult<()> {
         let Some(handoff) = &self.handoff else {
             return Err(DataPlaneError::HandoffNotConfigured.into());
@@ -92,11 +93,11 @@ mod tests {
     use crate::handoff::DataPlaneHandoff;
     use crate::node::NodeDescriptor;
 
-    fn local_input(runtime: &DataPlaneMain, data: NodeRuntimeData, frame: &mut BufferFrame) {
+    fn local_input(runtime: &mut DataPlaneMain, data: NodeRuntimeData, frame: &mut BufferFrame) {
         assert_eq!(runtime.thread_index(), 2);
         assert_eq!(data.usize_word(0).unwrap(), 1);
         for &index in frame.indices() {
-            let buffer = runtime.get_buffer(index).unwrap();
+            let buffer = runtime.buffer(index);
             assert_eq!(buffer.current_config_index(), 0x1234_5678);
             assert_eq!(buffer.current(), &[0x45; 20]);
             assert_eq!(buffer.ref_count(), 1);
@@ -107,10 +108,21 @@ mod tests {
     // Exercise that contract across OS threads without a NodeHandle or cursor rewrite.
     #[test]
     fn handoff_preserves_feature_cursor_and_transfers_buffer_ownership() {
+        crate::BUFFER_MAIN_INIT.call_once(|| {
+            hammer_infra::main_heap::init_default().unwrap();
+            hammer_core::buffer::BufferMain::new(
+                64,
+                1024,
+                &[0],
+                2,
+                hammer_infra::PageSize::Default,
+            )
+            .unwrap();
+        });
         hammer_infra::main_heap::init_default().unwrap();
         let arena = BufferPoolArena::with_capacity(64, 64);
         let buffers = DataPlaneBuffers::from_arenas([arena.clone()], 8, 1, 0);
-        let source = DataPlaneMain::from_buffers(buffers, native_simd_bytes()).unwrap();
+        let mut source = DataPlaneMain::from_buffers(buffers, native_simd_bytes()).unwrap();
         source
             .nodes()
             .try_register_descriptor(
@@ -131,15 +143,15 @@ mod tests {
                 ),
             )
             .unwrap();
-        let handoff = DataPlaneHandoff::new_shared_buffer_arena_with_node_capacity(2, 2, 2, arena);
-        let source =
+        let handoff = DataPlaneHandoff::with_node_capacity(2, 2, 2);
+        let mut source =
             DataPlaneMain::attach_handoff_worker(source, handoff.worker(DataWorkerId::new(0)));
         let receiver = handoff.worker(DataWorkerId::new(1));
         let (arenas, frame_slots, nodes, simd_bytes, _, trace_control) = source.worker_parts();
         let (send, receive) = std::sync::mpsc::channel();
         let (acknowledge, acknowledged) = std::sync::mpsc::channel();
         let worker = std::thread::spawn(move || {
-            let runtime = DataPlaneMain::from_worker_parts(
+            let mut runtime = DataPlaneMain::from_worker_parts(
                 arenas,
                 frame_slots,
                 nodes,
@@ -163,8 +175,7 @@ mod tests {
         for _ in 0..33 {
             let index = source.alloc_index_with_bytes(&[0x45; 20]).unwrap();
             source
-                .get_buffer_mut(index)
-                .unwrap()
+                .buffer_mut(index)
                 .set_current_config_index(0x1234_5678);
             frame.push_index(index).unwrap();
         }
@@ -204,8 +215,7 @@ mod tests {
         for _ in 0..2 {
             let index = source.alloc_index_with_bytes(&[0x45; 20]).unwrap();
             source
-                .get_buffer_mut(index)
-                .unwrap()
+                .buffer_mut(index)
                 .set_current_config_index(0x1234_5678);
             frame.push_index(index).unwrap();
         }

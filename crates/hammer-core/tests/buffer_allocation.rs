@@ -1,4 +1,4 @@
-use hammer_core::buffer::{BufferPoolArena, DataPlaneBuffers};
+use hammer_core::buffer::{BufferMain, BufferPoolArena, DataPlaneBuffers};
 use hammer_core::error::{BufferInvariant, DataPlaneError, DataPlaneResult};
 use hammer_core::graph::{NodeErrorIndex, NodeId};
 
@@ -7,6 +7,7 @@ use hammer_core::graph::{NodeErrorIndex, NodeId};
 #[test]
 fn independent_segment_survives_original_chain_release() -> DataPlaneResult<()> {
     hammer_infra::main_heap::init_default().unwrap();
+    BufferMain::new(16, 3, &[0], 1, hammer_infra::PageSize::Default)?;
     let arena = BufferPoolArena::with_capacity(16, 3);
     let buffers = DataPlaneBuffers::from_arenas([arena], 2, 1, 0);
     let mut originals = buffers.get_next_frame(NodeId::new(0))?;
@@ -14,8 +15,8 @@ fn independent_segment_survives_original_chain_release() -> DataPlaneResult<()> 
     originals.push_index(source)?;
     {
         let mut buffer = buffers.get_buffer_mut(source)?;
-        buffer.advance(4)?;
-        buffer.prepend(&[0x42; 8])?;
+        buffer.advance(4);
+        buffer.push_uninit(8).copy_from_slice(&[0x42; 8]);
         buffer.set_trace_handle(29);
         buffer.set_node_error_index(NodeErrorIndex::new(31).unwrap());
         // SAFETY: both opaque unions are initialized, u64-aligned storage;
@@ -48,12 +49,25 @@ fn independent_segment_survives_original_chain_release() -> DataPlaneResult<()> 
         }
         buffer.current_mut()[0] = 0x55;
     }
+    // Pool capacity follows Physmem page carving rather than the requested
+    // minimum. Exhaust its remaining slots before checking copy pressure.
+    let mut retained = Vec::new();
+    loop {
+        match buffers.alloc_index() {
+            Ok(index) => retained.push(index),
+            Err(DataPlaneError::BufferInvariant(BufferInvariant::PoolExhausted)) => break,
+            Err(error) => return Err(error),
+        }
+    }
     assert!(matches!(
         buffers.alloc_index_from(source),
         Err(DataPlaneError::BufferInvariant(
             BufferInvariant::PoolExhausted
         ))
     ));
+    for index in retained {
+        buffers.drop_index_owned_with_trace(index, |_| {});
+    }
     assert_eq!(buffers.in_use_buffers(), 3);
     {
         let mut buffer = buffers.get_buffer_mut(source)?;

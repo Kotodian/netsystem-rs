@@ -14,6 +14,8 @@ use hammer_service::net::{
 #[test]
 fn shared_bucket_references_survive_parent_replacement() -> Result<(), DpoError> {
     hammer_runtime::config::Memory::default().ensure_main_heap()?;
+    hammer_core::buffer::BufferMain::new(64, 1024, &[0], 2, hammer_infra::PageSize::Default)
+        .unwrap();
     let runtime = DataPlaneMain::new(DataPlaneBufferConfig::default());
     let mut main = GlobalMain::new(runtime, RuntimeRegistry::new());
     main.install_current();

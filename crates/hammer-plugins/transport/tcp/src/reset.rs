@@ -1,5 +1,5 @@
 use crate::{TcpError, TcpSegmentFlags, tcp_header};
-use hammer_core::data_plane::{BufferFrame, BufferPacketCursor, Index, NodeId};
+use hammer_core::data_plane::{BufferFrame, BufferPacketCursor, NodeId};
 use hammer_infra::checksum::{internet_checksum, internet_checksum_parts};
 use hammer_runtime::RuntimeResult;
 use hammer_runtime::{DataPlaneMain, Node, NodeProcessFn, NodeRuntimeData};
@@ -30,7 +30,7 @@ pub fn register_tcp_reset(runtime: &DataPlaneMain) -> RuntimeResult<NodeId> {
 
 impl Node for TcpResetNode {
     #[inline(always)]
-    fn process(&mut self, runtime: &DataPlaneMain, frame: &mut BufferFrame) -> () {
+    fn process(&mut self, runtime: &mut DataPlaneMain, frame: &mut BufferFrame) -> () {
         tcp_reset_process_frame(runtime, frame)
     }
 
@@ -45,20 +45,27 @@ impl Node for TcpResetNode {
     }
 }
 
-fn tcp_reset_process(runtime: &DataPlaneMain, _: NodeRuntimeData, frame: &mut BufferFrame) -> () {
+fn tcp_reset_process(
+    runtime: &mut DataPlaneMain,
+    _: NodeRuntimeData,
+    frame: &mut BufferFrame,
+) -> () {
     tcp_reset_process_frame(runtime, frame)
 }
 
-fn tcp_reset_process_frame(runtime: &DataPlaneMain, frame: &mut BufferFrame) -> () {
+fn tcp_reset_process_frame(runtime: &mut DataPlaneMain, frame: &mut BufferFrame) -> () {
     hammer_runtime::process_frame!(runtime, frame, |index| {
         tcp_reset_next_for_index(runtime, index).unwrap_or(TcpResetNext::Drop)
     })
 }
 
 #[inline(always)]
-fn tcp_reset_next_for_index(runtime: &DataPlaneMain, index: Index) -> RuntimeResult<TcpResetNext> {
+fn tcp_reset_next_for_index(
+    runtime: &mut DataPlaneMain,
+    index: u32,
+) -> RuntimeResult<TcpResetNext> {
     let reset = {
-        let buffer = runtime.get_buffer(index)?;
+        let buffer = runtime.buffer(index);
         tcp_reset_prepare_from_current(
             buffer.current(),
             unsafe {
@@ -81,8 +88,8 @@ fn tcp_reset_next_for_index(runtime: &DataPlaneMain, index: Index) -> RuntimeRes
 
 #[inline(always)]
 fn tcp_reset_write_reply(
-    runtime: &DataPlaneMain,
-    index: Index,
+    runtime: &mut DataPlaneMain,
+    index: u32,
     reset: Option<([u8; 16], [u8; 16], u16, u16, u32, u32, u8, u8)>,
 ) -> RuntimeResult<Option<usize>> {
     let Some((
@@ -98,10 +105,18 @@ fn tcp_reset_write_reply(
     else {
         return Ok(None);
     };
+    let reply_len = match version {
+        4 => 20 + 20,
+        6 => 40 + 20,
+        _ => return Ok(None),
+    };
     let reply_len = {
-        let mut buffer = runtime.get_buffer_mut(index)?;
+        let buffer = runtime.buffer_mut(index);
         buffer.truncate(0)?;
-        let writable = buffer.writable_tail_mut();
+        if buffer.space_left_at_end() < reply_len {
+            return Ok(None);
+        }
+        let writable = buffer.put_uninit(reply_len as u16);
         let Some(reply_len) = tcp_reset_write_current_reply(
             writable,
             source,
@@ -113,9 +128,9 @@ fn tcp_reset_write_reply(
             flags,
             version,
         ) else {
+            buffer.truncate(0)?;
             return Ok(None);
         };
-        buffer.commit_writable_tail(reply_len)?;
         reply_len
     };
     Ok(Some(reply_len))
@@ -418,13 +433,13 @@ fn be_u32(value: u32) -> [u8; 4] {
 }
 
 fn refresh_reset_metadata(
-    runtime: &DataPlaneMain,
-    index: Index,
+    runtime: &mut DataPlaneMain,
+    index: u32,
     packet_len: usize,
 ) -> RuntimeResult<()> {
     const TCP_HEADER_LEN: usize = 20;
 
-    let mut buffer = runtime.get_buffer_mut(index)?;
+    let buffer = runtime.buffer_mut(index);
     let network_header_len = match buffer.current().first().copied().map(|byte| byte >> 4) {
         Some(4) => 20,
         Some(6) => 40,

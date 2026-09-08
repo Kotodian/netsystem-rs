@@ -59,17 +59,17 @@ impl DataPlaneMain {
     }
 
     #[inline]
-    pub fn alloc_index(&self) -> RuntimeResult<Index> {
+    pub fn alloc_index(&self) -> RuntimeResult<u32> {
         Ok(self.buffers.alloc_index()?)
     }
 
     #[inline]
-    pub fn alloc_index_with_bytes(&self, bytes: &[u8]) -> RuntimeResult<Index> {
+    pub fn alloc_index_with_bytes(&self, bytes: &[u8]) -> RuntimeResult<u32> {
         Ok(self.buffers.alloc_index_with_bytes(bytes)?)
     }
 
     #[inline]
-    pub(crate) fn drop_index_owned(&self, index: Index) {
+    pub(crate) fn drop_index_owned(&self, index: u32) {
         self.buffers
             .drop_index_owned_with_trace(index, |handle| self.trace.finalize(handle));
     }
@@ -80,30 +80,30 @@ impl DataPlaneMain {
     }
 
     #[inline]
-    pub fn prefetch_header(&self, index: Index) {
+    pub fn prefetch_header(&self, index: u32) {
         self.buffers.prefetch_header(index);
     }
 
     #[inline]
-    pub fn prefetch_read(&self, index: Index) {
+    pub fn prefetch_read(&self, index: u32) {
         self.buffers.prefetch_read(index);
     }
 
     #[inline]
-    pub fn prefetch_write(&self, index: Index) {
+    pub fn prefetch_write(&self, index: u32) {
         self.buffers.prefetch_write(index);
     }
 
     #[inline]
     pub fn chain(
         &self,
-        index: Index,
+        index: u32,
     ) -> impl Iterator<Item = Result<BufferRef<'_>, DataPlaneError>> + '_ {
         self.buffers.chain(index)
     }
 
     #[inline]
-    pub fn current_config_index(&self, index: Index) -> RuntimeResult<u32> {
+    pub fn current_config_index(&self, index: u32) -> RuntimeResult<u32> {
         Ok(self.buffers.current_config_index(index)?)
     }
 
@@ -118,13 +118,19 @@ impl DataPlaneMain {
     }
 
     #[inline]
-    pub fn get_buffer(&self, index: Index) -> RuntimeResult<BufferRef<'_>> {
-        Ok(self.buffers.get_buffer(index)?)
+    pub fn buffer(&self, index: u32) -> &hammer_core::data_plane::Buffer {
+        // SAFETY: the graph owns this live index on the calling Worker. The
+        // returned borrow is bounded by this runtime borrow, not BufferMain's
+        // process lifetime. Shared chain tails remain immutable.
+        unsafe { hammer_core::buffer::BufferMain::global().buffer(index) }
     }
 
     #[inline]
-    pub fn get_buffer_mut(&self, index: Index) -> RuntimeResult<BufferRefMut<'_>> {
-        Ok(self.buffers.get_buffer_mut(index)?)
+    pub fn buffer_mut(&mut self, index: u32) -> &mut hammer_core::data_plane::Buffer {
+        // SAFETY: Node invocation borrows its Worker runtime exclusively. The
+        // graph owns the index throughout this borrow; core rejects shared
+        // tails. The borrow ends before the Node transfers the index onward.
+        unsafe { hammer_core::buffer::BufferMain::global().buffer_mut(index) }
     }
 
     #[inline]

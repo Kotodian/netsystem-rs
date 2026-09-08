@@ -1,6 +1,6 @@
 use criterion::{BenchmarkId, Criterion, criterion_group, criterion_main};
 use hammer_core::data_plane::{
-    BufferPoolArena, DEFAULT_BUFFER_FRAME_CAPACITY, DataPlaneBuffers, Index, NodeId,
+    BufferMain, BufferPoolArena, DEFAULT_BUFFER_FRAME_CAPACITY, DataPlaneBuffers, NodeId,
 };
 use hammer_runtime::{DataPlaneBufferConfig, DataPlaneMain};
 
@@ -9,6 +9,10 @@ fn test_runtime(
     buffer_slots: usize,
     frame_slots: usize,
 ) -> DataPlaneMain {
+    BUFFER_MAIN_INIT.call_once(|| {
+        hammer_infra::main_heap::init_default().unwrap();
+        BufferMain::new(2048, 4096, &[0], 0, hammer_infra::PageSize::Default).unwrap();
+    });
     let config = DataPlaneBufferConfig {
         buffer_slot_capacity,
         buffer_slots,
@@ -19,6 +23,10 @@ fn test_runtime(
 }
 
 fn test_buffers(buffer_slot_capacity: usize, buffer_slots: usize) -> DataPlaneBuffers {
+    BUFFER_MAIN_INIT.call_once(|| {
+        hammer_infra::main_heap::init_default().unwrap();
+        BufferMain::new(2048, 4096, &[0], 0, hammer_infra::PageSize::Default).unwrap();
+    });
     DataPlaneBuffers::from_arenas(
         [BufferPoolArena::with_capacity(
             buffer_slot_capacity,
@@ -30,14 +38,14 @@ fn test_buffers(buffer_slot_capacity: usize, buffer_slots: usize) -> DataPlaneBu
     )
 }
 
-fn drop_owned_index(buffers: &DataPlaneBuffers, index: Index) {
+fn drop_owned_index(buffers: &DataPlaneBuffers, index: u32) {
     let mut frame = buffers
         .get_next_frame(NodeId::new(0))
         .expect("cleanup frame");
     frame.push_index(index).expect("cleanup push index");
 }
 
-fn drop_owned_indices(buffers: &DataPlaneBuffers, indices: Vec<Index>) {
+fn drop_owned_indices(buffers: &DataPlaneBuffers, indices: Vec<u32>) {
     for chunk in indices.chunks(DEFAULT_BUFFER_FRAME_CAPACITY) {
         let mut frame = buffers
             .get_next_frame(NodeId::new(0))
@@ -175,3 +183,5 @@ criterion_group!(
     bench_runtime_alloc_free,
 );
 criterion_main!(benches);
+
+static BUFFER_MAIN_INIT: std::sync::Once = std::sync::Once::new();

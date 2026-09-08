@@ -7,7 +7,7 @@ use crate::{
     TcpSegmentHeader, TcpSeq, TcpTimestampOption, TcpWireHeader, tcp_header,
     tcp_options_from_bytes,
 };
-use hammer_core::data_plane::{BufferPacketCursor, Index};
+use hammer_core::data_plane::BufferPacketCursor;
 use hammer_runtime::DataPlaneMain;
 use hammer_runtime::RuntimeResult;
 use hammer_service::opaque::NetworkOpaque;
@@ -104,11 +104,10 @@ impl TcpSegment {
 
     pub(crate) fn write_to_buffer(
         &self,
-        buffers: &hammer_core::data_plane::DataPlaneBuffers,
-        index: Index,
+        buffer: &mut hammer_core::data_plane::Buffer,
     ) -> RuntimeResult<()> {
-        let mut buffer = buffers.get_buffer_mut(index)?;
-        let header = buffer.prepend_mut(self.header_len())?;
+        let header =
+            buffer.push_uninit(u8::try_from(self.header_len()).expect("TCP header fits u8"));
         self.write_header(header)?;
         {
             let network = unsafe { transmute::<_, &mut NetworkOpaque>(buffer.opaque_mut()) };
@@ -120,8 +119,8 @@ impl TcpSegment {
     }
 }
 
-pub(crate) fn tcp_packet(runtime: &DataPlaneMain, index: Index) -> RuntimeResult<TcpPacket> {
-    let buffer = runtime.get_buffer(index)?;
+pub(crate) fn tcp_packet(runtime: &DataPlaneMain, index: u32) -> RuntimeResult<TcpPacket> {
+    let buffer = runtime.buffer(index);
     let network = unsafe { transmute::<_, &NetworkOpaque>(buffer.opaque()) };
     let cursor = network.packet_cursor();
     let packet = buffer.current();

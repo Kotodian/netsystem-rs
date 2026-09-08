@@ -1,4 +1,4 @@
-use crate::error::{RuntimeError, RuntimeResult};
+use crate::error::RuntimeResult;
 use crate::global_main::GlobalMain;
 use crate::plugin::PluginMain;
 
@@ -17,10 +17,6 @@ impl GlobalMain {
 
     /// Load plugin images and publish their graph/init declarations.
     pub fn load_plugins(&mut self, roots: &[String], config: &str) -> RuntimeResult<()> {
-        if !self.memory_initialized {
-            return Err(RuntimeError::MemoryNotInitialized);
-        }
-
         let resume_main_loop = self.main_loop_entered;
         let resume_processes = self.control_thread.is_started();
         let loaded_plugin_count = self.plugin_main.loaded_plugins().len();

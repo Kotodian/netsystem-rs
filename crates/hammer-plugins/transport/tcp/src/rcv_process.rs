@@ -1,7 +1,5 @@
 use crate::{publish_tcp_connection, read_session_id};
-use hammer_core::data_plane::{
-    BufferFrame, DEFAULT_BUFFER_FRAME_CAPACITY, Index, NodeId, NodeNext,
-};
+use hammer_core::data_plane::{BufferFrame, DEFAULT_BUFFER_FRAME_CAPACITY, NodeId, NodeNext};
 use hammer_runtime::{DataPlaneMain, Node, NodeProcessFn, NodeRuntimeData};
 use hammer_runtime::{RuntimeError, RuntimeResult};
 
@@ -43,7 +41,7 @@ pub fn register_tcp_rcv_process(runtime: &DataPlaneMain) -> RuntimeResult<NodeId
 
 impl Node for TcpRcvProcessNode {
     #[inline(always)]
-    fn process(&mut self, runtime: &DataPlaneMain, frame: &mut BufferFrame) -> () {
+    fn process(&mut self, runtime: &mut DataPlaneMain, frame: &mut BufferFrame) -> () {
         (self.process)(runtime, NodeRuntimeData::empty(), frame)
     }
 
@@ -54,17 +52,17 @@ impl Node for TcpRcvProcessNode {
 }
 
 pub(crate) fn tcp_rcv_process_process(
-    runtime: &DataPlaneMain,
+    runtime: &mut DataPlaneMain,
     _: NodeRuntimeData,
     frame: &mut BufferFrame,
 ) -> () {
     tcp_rcv_process_frame(runtime, frame)
 }
 
-fn tcp_rcv_process_frame(runtime: &DataPlaneMain, frame: &mut BufferFrame) -> () {
+fn tcp_rcv_process_frame(runtime: &mut DataPlaneMain, frame: &mut BufferFrame) -> () {
     let input_len = frame.len();
     debug_assert!(input_len <= DEFAULT_BUFFER_FRAME_CAPACITY);
-    let mut inputs = [core::mem::MaybeUninit::<Index>::uninit(); DEFAULT_BUFFER_FRAME_CAPACITY];
+    let mut inputs = [core::mem::MaybeUninit::<u32>::uninit(); DEFAULT_BUFFER_FRAME_CAPACITY];
     for (offset, &index) in frame.indices().iter().enumerate() {
         inputs[offset].write(index);
     }
@@ -98,7 +96,7 @@ fn emit_local(
     nexts: &mut [u16; DEFAULT_BUFFER_FRAME_CAPACITY],
     out_len: &mut usize,
     next: TcpRcvProcessNext,
-    index: Index,
+    index: u32,
 ) -> RuntimeResult<()> {
     if *out_len == DEFAULT_BUFFER_FRAME_CAPACITY {
         runtime.enqueue_to_next(frame, &nexts[..*out_len]);
@@ -112,8 +110,8 @@ fn emit_local(
 }
 
 fn tcp_rcv_process_index(
-    runtime: &DataPlaneMain,
-    index: Index,
+    runtime: &mut DataPlaneMain,
+    index: u32,
     out_frame: &mut BufferFrame,
     nexts: &mut [u16; DEFAULT_BUFFER_FRAME_CAPACITY],
     out_len: &mut usize,
@@ -122,7 +120,7 @@ fn tcp_rcv_process_index(
     let main = crate::TCP_MAIN
         .get()
         .ok_or(RuntimeError::PluginStateNotInitialized { plugin: "tcp" })?;
-    let control = main.with_worker(runtime, |sessions, tcp| {
+    let control = main.with_worker(runtime.thread_index(), |sessions, tcp| {
         let session_id = read_session_id(runtime, index)?.ok_or_else(|| {
             let _ = runtime.record_current_node_error(TcpNodeError::RcvProcessSessionRouteMissing);
             TcpNodeError::RcvProcessSessionRouteMissing
@@ -170,8 +168,8 @@ fn tcp_rcv_process_index(
         }
         if established_with_payload {
             {
-                let mut buffer = runtime.buffers().get_buffer_mut(index)?;
-                buffer.advance(packet.payload_offset as isize)?;
+                let buffer = runtime.buffer_mut(index);
+                buffer.advance(packet.payload_offset as isize);
                 buffer.truncate(packet.payload_len)?;
             }
             let enqueue = sessions.enqueue_rx(runtime.buffers(), session_id, index, 0)?;
@@ -184,7 +182,7 @@ fn tcp_rcv_process_index(
     })?;
     if let Some(segment) = control {
         let allocated = runtime.buffers().alloc_index()?;
-        segment.write_to_buffer(runtime.buffers(), allocated)?;
+        segment.write_to_buffer(&mut *runtime.buffer_mut(allocated))?;
         emit_local(
             runtime,
             out_frame,

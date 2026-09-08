@@ -9,9 +9,9 @@ use std::sync::{Arc, Mutex};
 use crate::error::{RuntimeError, RuntimeResult};
 use crate::file::{FILE_MAIN, FileMain};
 use hammer_core::data_plane::{
-    BUFFER_CACHE_LINE_SIZE, BufferFrame, BufferPoolArena, BufferRef, BufferRefMut,
-    DEFAULT_BUFFER_FRAME_POOL_SIZE, DataPlaneBuffers, Frame, FrameBatchWidth, Index, Next,
-    NodeErrorIndex, NodeId, NodeKind, NodeRegistration, Pending,
+    BUFFER_CACHE_LINE_SIZE, BufferFrame, BufferPoolArena, BufferRef,
+    DEFAULT_BUFFER_FRAME_POOL_SIZE, DataPlaneBuffers, Frame, FrameBatchWidth, Next, NodeErrorIndex,
+    NodeId, NodeKind, NodeRegistration, Pending,
 };
 use hammer_core::error::{DataPlaneError, DataPlaneResult};
 use hammer_infra::PageSize;
@@ -62,8 +62,7 @@ pub struct DataPlaneMain {
 }
 
 impl DataPlaneMain {
-    /// Worker-local, non-cryptographic randomness. Runtime clones on this
-    /// worker advance the same stream; worker construction seeds a new stream.
+    /// Worker-local, non-cryptographic randomness seeded at worker construction.
     #[inline]
     pub fn random(&self) -> std::cell::RefMut<'_, SmallRng> {
         self.random.borrow_mut()
@@ -119,37 +118,6 @@ impl Drop for HandoffSlotGuard<'_> {
     fn drop(&mut self) {
         if let Some(slot) = self.slot.take() {
             self.runtime.drop_handoff_slot_owned(slot);
-        }
-    }
-}
-
-impl Clone for DataPlaneMain {
-    fn clone(&self) -> Self {
-        Self {
-            random: Rc::clone(&self.random),
-            buffers: self.buffers.clone(),
-            nodes: self.nodes.clone(),
-            current_node: Rc::clone(&self.current_node),
-            appendable_next_frames: RefCell::new(Vec::with_capacity(
-                hammer_core::data_plane::DEFAULT_BUFFER_FRAME_CAPACITY,
-            )),
-            handoff: self.handoff.clone(),
-            active_numa_node: self.active_numa_node,
-            trace: self.trace.clone(),
-            simd_bytes: self.simd_bytes,
-            registry: Arc::clone(&self.registry),
-            main_loop_exit_now: Arc::clone(&self.main_loop_exit_now),
-            main_loop_exit_status: Arc::clone(&self.main_loop_exit_status),
-            publication: Arc::clone(&self.publication),
-            workers_updating_graph: Arc::clone(&self.workers_updating_graph),
-            worker_config: self.worker_config.clone(),
-            worker_exit_functions: self.worker_exit_functions.clone(),
-            called_worker_init_functions: self.called_worker_init_functions.clone(),
-            main_loop_count: AtomicU32::new(
-                self.main_loop_count
-                    .load(std::sync::atomic::Ordering::Relaxed),
-            ),
-            worker_control_queues: Arc::clone(&self.worker_control_queues),
         }
     }
 }

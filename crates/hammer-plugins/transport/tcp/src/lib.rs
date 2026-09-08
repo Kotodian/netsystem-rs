@@ -257,20 +257,19 @@ impl TcpMain {
 
     fn with_worker<R>(
         &self,
-        runtime: &DataPlaneMain,
+        thread_index: u32,
         operation: impl FnOnce(&mut SessionWorker, &mut TcpWorker) -> RuntimeResult<R>,
     ) -> RuntimeResult<R> {
-        session_main().with_worker_mut(runtime, |sessions| {
-            self.with_tcp_worker(runtime, |tcp| operation(sessions, tcp))
+        session_main().with_worker_mut(thread_index, |sessions| {
+            self.with_tcp_worker(thread_index, |tcp| operation(sessions, tcp))
         })
     }
 
     fn with_tcp_worker<R>(
         &self,
-        runtime: &DataPlaneMain,
+        thread_index: u32,
         operation: impl FnOnce(&mut TcpWorker) -> RuntimeResult<R>,
     ) -> RuntimeResult<R> {
-        let thread_index = runtime.thread_index();
         let worker = DataWorkerId::try_from(thread_index)
             .map_err(|_| TcpWorkerError::WorkerUnavailable { thread_index })?;
         let mut slot =
@@ -356,7 +355,7 @@ pub(crate) fn connect(endpoint: SessionConnectEndpoint) -> RuntimeResult<()> {
                 let main = TCP_MAIN
                     .get()
                     .ok_or(RuntimeError::PluginStateNotInitialized { plugin: "tcp" })?;
-                main.with_worker(runtime, |sessions, tcp| {
+                main.with_worker(runtime.thread_index(), |sessions, tcp| {
                     start_connect(sessions, tcp, endpoint.connection, local, endpoint.remote)
                 })
             });
@@ -588,7 +587,7 @@ fn init_tcp_worker(engine: &mut DataPlaneMain) -> RuntimeResult<()> {
 }
 
 fn tcp_session_queue_update_time(
-    runtime: &DataPlaneMain,
+    runtime: &mut DataPlaneMain,
     sessions: &mut SessionWorker,
     _: NodeRuntimeData,
     output_next: SessionQueueNext,
@@ -599,14 +598,14 @@ fn tcp_session_queue_update_time(
     TCP_MAIN
         .get()
         .ok_or(RuntimeError::PluginStateNotInitialized { plugin: "tcp" })?
-        .with_tcp_worker(runtime, |tcp| {
+        .with_tcp_worker(runtime.thread_index(), |tcp| {
             tcp.update_time(sessions, runtime, output_next, frame, output, now)?;
             Ok(())
         })
 }
 
 fn tcp_session_queue_dispatch(
-    runtime: &DataPlaneMain,
+    runtime: &mut DataPlaneMain,
     sessions: &mut SessionWorker,
     _: NodeRuntimeData,
     output_next: SessionQueueNext,
@@ -617,7 +616,7 @@ fn tcp_session_queue_dispatch(
     TCP_MAIN
         .get()
         .ok_or(RuntimeError::PluginStateNotInitialized { plugin: "tcp" })?
-        .with_tcp_worker(runtime, |tcp| {
+        .with_tcp_worker(runtime.thread_index(), |tcp| {
             dispatch_session_queue_events(runtime, sessions, tcp, output_next, frame, output, now)
                 .map(|_| ())
         })
@@ -918,11 +917,8 @@ pub(crate) fn read_session_route_opaque(
 }
 
 #[inline(always)]
-pub(crate) fn read_session_id(
-    runtime: &DataPlaneMain,
-    index: hammer_core::data_plane::Index,
-) -> RuntimeResult<Option<u32>> {
-    let buffer = runtime.get_buffer(index)?;
+pub(crate) fn read_session_id(runtime: &DataPlaneMain, index: u32) -> RuntimeResult<Option<u32>> {
+    let buffer = runtime.buffer(index);
     Ok(read_session_route_opaque(buffer.opaque2()).map(|(session_id, _, _)| session_id))
 }
 
@@ -965,7 +961,7 @@ pub fn tcp_control_cursor(packet: &[u8]) -> Result<BufferPacketCursor, TcpContro
 }
 
 fn enqueue_tcp_segment(
-    runtime: &DataPlaneMain,
+    runtime: &mut DataPlaneMain,
     frame: &mut hammer_core::data_plane::BufferFrame,
     output_next: SessionQueueNext,
     output: &mut SessionQueueOutput,
@@ -975,7 +971,7 @@ fn enqueue_tcp_segment(
         return Ok(());
     }
     let index = runtime.buffers().alloc_index()?;
-    segment.write_to_buffer(runtime.buffers(), index)?;
+    segment.write_to_buffer(&mut *runtime.buffer_mut(index))?;
     let _ = output.try_enqueue_io(frame, output_next, index)?;
     Ok(())
 }

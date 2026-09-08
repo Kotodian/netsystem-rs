@@ -34,12 +34,16 @@ impl FramePool {
     }
 
     #[inline]
-    pub(super) fn alloc_index(&self) -> DataPlaneResult<Index> {
+    pub(super) fn alloc_index(&self) -> DataPlaneResult<(u64, u32, u32)> {
         self.inner.borrow_mut().alloc_index()
     }
 
     #[inline]
-    pub(super) fn return_index(&self, buffers: &BufferPool, index: Index) -> DataPlaneResult<()> {
+    pub(super) fn return_index(
+        &self,
+        buffers: &DataPlaneBuffers,
+        index: (u64, u32, u32),
+    ) -> DataPlaneResult<()> {
         let mut pool = self.inner.borrow_mut();
         let frame = pool.frame_mut(index)?;
         buffers.drop_frame_indices(frame);
@@ -48,14 +52,14 @@ impl FramePool {
     }
 
     #[inline]
-    pub(super) fn take_index(&self, index: Index) -> DataPlaneResult<BufferFrame> {
+    pub(super) fn take_index(&self, index: (u64, u32, u32)) -> DataPlaneResult<BufferFrame> {
         self.inner.borrow_mut().take_frame(index)
     }
 
     #[inline]
     pub(super) fn return_taken_index(
         &self,
-        index: Index,
+        index: (u64, u32, u32),
         frame: BufferFrame,
     ) -> DataPlaneResult<()> {
         self.inner
@@ -66,7 +70,7 @@ impl FramePool {
 
 impl FramePoolInner {
     #[inline]
-    fn alloc_index(&mut self) -> DataPlaneResult<Index> {
+    fn alloc_index(&mut self) -> DataPlaneResult<(u64, u32, u32)> {
         loop {
             if self.available_len == 0 {
                 return Err(DataPlaneError::FramePoolExhausted.into());
@@ -90,20 +94,16 @@ impl FramePoolInner {
                 .ok_or(DataPlaneError::FrameSlotCheckedOut)?;
             frame.reset_for_pool_reuse();
             self.in_use += 1;
-            return Ok(Index {
-                pool_id,
-                slot,
-                generation,
-            });
+            return Ok((pool_id, slot, generation));
         }
     }
 
     #[inline]
-    fn validate_index(&self, index: Index) -> DataPlaneResult<()> {
-        if index.pool_id != self.pool_id {
+    fn validate_index(&self, index: (u64, u32, u32)) -> DataPlaneResult<()> {
+        if index.0 != self.pool_id {
             return Err(DataPlaneError::ForeignIndex {
                 expected_pool_id: self.pool_id,
-                actual_pool_id: index.pool_id,
+                actual_pool_id: index.0,
             }
             .into());
         }
@@ -111,19 +111,20 @@ impl FramePoolInner {
     }
 
     #[inline]
-    fn entry_mut(&mut self, index: Index) -> DataPlaneResult<&mut FrameSlot> {
+    fn entry_mut(&mut self, index: (u64, u32, u32)) -> DataPlaneResult<&mut FrameSlot> {
         self.validate_index(index)?;
         let pool_id = self.pool_id;
-        let entry = self.slots.get_mut(index.slot as usize).ok_or(
-            DataPlaneError::IndexSlotOutOfBounds {
-                pool_id,
-                slot: index.slot,
-            },
-        )?;
-        if entry.generation != index.generation {
+        let entry =
+            self.slots
+                .get_mut(index.1 as usize)
+                .ok_or(DataPlaneError::IndexSlotOutOfBounds {
+                    pool_id,
+                    slot: index.1,
+                })?;
+        if entry.generation != index.2 {
             return Err(DataPlaneError::StaleIndex {
-                slot: index.slot,
-                index_generation: index.generation,
+                slot: index.1,
+                index_generation: index.2,
                 current_generation: entry.generation,
             }
             .into());
@@ -131,7 +132,7 @@ impl FramePoolInner {
         if !entry.allocated {
             return Err(DataPlaneError::IndexSlotFree {
                 pool_id,
-                slot: index.slot,
+                slot: index.1,
             }
             .into());
         }
@@ -139,7 +140,7 @@ impl FramePoolInner {
     }
 
     #[inline]
-    fn frame_mut(&mut self, index: Index) -> DataPlaneResult<&mut BufferFrame> {
+    fn frame_mut(&mut self, index: (u64, u32, u32)) -> DataPlaneResult<&mut BufferFrame> {
         self.entry_mut(index)?
             .frame
             .as_mut()
@@ -147,7 +148,7 @@ impl FramePoolInner {
     }
 
     #[inline]
-    fn take_frame(&mut self, index: Index) -> DataPlaneResult<BufferFrame> {
+    fn take_frame(&mut self, index: (u64, u32, u32)) -> DataPlaneResult<BufferFrame> {
         self.entry_mut(index)?
             .frame
             .take()
@@ -155,7 +156,7 @@ impl FramePoolInner {
     }
 
     #[inline]
-    fn release_index(&mut self, index: Index) -> DataPlaneResult<()> {
+    fn release_index(&mut self, index: (u64, u32, u32)) -> DataPlaneResult<()> {
         let entry = self.entry_mut(index)?;
         if entry.frame.is_none() {
             return Err(DataPlaneError::FrameSlotCheckedOut.into());
@@ -165,7 +166,7 @@ impl FramePoolInner {
         if self.available_len == self.available.len() {
             return Err(DataPlaneError::FramePoolAvailableOverflow.into());
         }
-        self.available[self.available_len] = index.slot;
+        self.available[self.available_len] = index.1;
         self.available_len += 1;
         Ok(())
     }
@@ -173,7 +174,7 @@ impl FramePoolInner {
     #[inline]
     fn return_frame_and_release(
         &mut self,
-        index: Index,
+        index: (u64, u32, u32),
         frame: BufferFrame,
     ) -> DataPlaneResult<()> {
         let entry = self.entry_mut(index)?;
@@ -186,7 +187,7 @@ impl FramePoolInner {
         if self.available_len == self.available.len() {
             return Err(DataPlaneError::FramePoolAvailableOverflow.into());
         }
-        self.available[self.available_len] = index.slot;
+        self.available[self.available_len] = index.1;
         self.available_len += 1;
         Ok(())
     }

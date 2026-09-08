@@ -165,14 +165,6 @@ impl DataPlaneMain {
         runtime.nodes = nodes.into();
         runtime.handoff = handoff;
         runtime.trace.set_control(trace_control);
-        if let Some(arena) = runtime
-            .handoff
-            .as_ref()
-            .and_then(DataPlaneHandoffWorker::configured_buffer_arena)
-        {
-            runtime.buffers = runtime.buffers.with_active_buffer_arena(arena);
-            runtime.active_numa_node = runtime.buffers.active_numa_node();
-        }
         Ok(runtime)
     }
 
@@ -192,10 +184,6 @@ impl DataPlaneMain {
 
     #[inline]
     pub fn attach_handoff_worker(mut runtime: Self, handoff: DataPlaneHandoffWorker) -> Self {
-        if let Some(arena) = handoff.configured_buffer_arena() {
-            runtime.buffers = runtime.buffers.with_active_buffer_arena(arena);
-            runtime.active_numa_node = runtime.buffers.active_numa_node();
-        }
         runtime.handoff = Some(handoff);
         runtime
     }

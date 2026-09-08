@@ -4,7 +4,7 @@ use super::*;
 
 #[derive(Debug, Clone, Copy)]
 #[repr(C)]
-pub(super) struct BufferHeaderCacheline0 {
+pub(super) struct BufferTemplate {
     pub(super) cacheline0: hammer_infra::align::CacheLineAlignMark,
     pub(super) current_data: i16,
     pub(super) current_length: u16,
@@ -20,10 +20,20 @@ pub(super) struct BufferHeaderCacheline0 {
 
 const _: () =
     assert!(core::mem::size_of::<Option<NodeErrorIndex>>() == core::mem::size_of::<u16>());
-const _: () = assert!(core::mem::size_of::<BufferHeaderCacheline0>() == 64);
-const _: () = assert!(core::mem::align_of::<BufferHeaderCacheline0>() == 64);
+const _: () = assert!(core::mem::size_of::<BufferTemplate>() == 64);
+const _: () = assert!(core::mem::align_of::<BufferTemplate>() == 64);
+const _: () = assert!(mem::offset_of!(BufferTemplate, current_data) == 0);
+const _: () = assert!(mem::offset_of!(BufferTemplate, current_length) == 2);
+const _: () = assert!(mem::offset_of!(BufferTemplate, flags) == 4);
+const _: () = assert!(mem::offset_of!(BufferTemplate, flow_id) == 8);
+const _: () = assert!(mem::offset_of!(BufferTemplate, ref_count) == 12);
+const _: () = assert!(mem::offset_of!(BufferTemplate, buffer_pool_index) == 13);
+const _: () = assert!(mem::offset_of!(BufferTemplate, error) == 14);
+const _: () = assert!(mem::offset_of!(BufferTemplate, next_buffer) == 16);
+const _: () = assert!(mem::offset_of!(BufferTemplate, current_config_or_punt) == 20);
+const _: () = assert!(mem::offset_of!(BufferTemplate, opaque) == 24);
 
-impl Default for BufferHeaderCacheline0 {
+impl Default for BufferTemplate {
     fn default() -> Self {
         Self {
             cacheline0: hammer_infra::align::CacheLineAlignMark,
@@ -31,7 +41,7 @@ impl Default for BufferHeaderCacheline0 {
             current_length: 0,
             flags: BufferFlags::empty(),
             flow_id: 0,
-            ref_count: 0,
+            ref_count: 1,
             buffer_pool_index: 0,
             error: None,
             next_buffer: BUFFER_INVALID_INDEX,
@@ -41,132 +51,40 @@ impl Default for BufferHeaderCacheline0 {
     }
 }
 
-#[derive(Debug, Clone, Copy)]
-#[repr(C)]
-pub(super) struct BufferHeaderCacheline1 {
-    pub(super) cacheline1: hammer_infra::align::CacheLineAlignMark,
-    pub(super) trace_handle: u32,
-    pub(super) total_length_not_including_first: u32,
-    pub(super) opaque2: SecondaryOpaque,
-}
-
-const _: () = assert!(core::mem::size_of::<BufferHeaderCacheline1>() == 64);
-const _: () = assert!(core::mem::align_of::<BufferHeaderCacheline1>() == 64);
-
-impl Default for BufferHeaderCacheline1 {
-    fn default() -> Self {
-        Self {
-            cacheline1: hammer_infra::align::CacheLineAlignMark,
-            trace_handle: 0,
-            total_length_not_including_first: 0,
-            opaque2: SecondaryOpaque::default(),
-        }
-    }
-}
-
 #[derive(Debug)]
 #[repr(C)]
 pub struct Buffer {
-    pub(super) cacheline0: BufferHeaderCacheline0,
-    pub(super) cacheline1: BufferHeaderCacheline1,
+    pub(super) cacheline0: BufferTemplate,
+    pub(super) second_half: hammer_infra::align::CacheLineAlignMark,
+    trace_handle: u32,
+    total_length_not_including_first: u32,
+    opaque2: SecondaryOpaque,
+    #[cfg(hammer_buffer_trace_trajectory)]
+    trajectory: hammer_infra::align::CacheLineAlignMark,
     #[cfg(hammer_buffer_trace_trajectory)]
     trajectory_nb: u16,
     #[cfg(hammer_buffer_trace_trajectory)]
     trajectory_trace: [u16; 31],
     headroom: hammer_infra::align::CacheLineAlignMark,
     pre_data: [u8; BUFFER_PRE_DATA_SIZE],
+    data: [u8; 0],
 }
 
 const _: () = assert!(mem::align_of::<Buffer>() == BUFFER_CACHE_LINE_SIZE);
 const _: () = assert!(mem::size_of::<Buffer>() == BUFFER_HEADER_SIZE + BUFFER_PRE_DATA_SIZE);
 const _: () = assert!(mem::offset_of!(Buffer, headroom) == BUFFER_HEADER_SIZE);
 const _: () = assert!(mem::offset_of!(Buffer, pre_data) == BUFFER_HEADER_SIZE);
+const _: () = assert!(mem::offset_of!(Buffer, second_half) == 64);
+const _: () = assert!(mem::offset_of!(Buffer, trace_handle) == 64);
+const _: () = assert!(mem::offset_of!(Buffer, total_length_not_including_first) == 68);
+const _: () = assert!(mem::offset_of!(Buffer, opaque2) == 72);
+const _: () = assert!(mem::offset_of!(Buffer, data) == BUFFER_HEADER_SIZE + BUFFER_PRE_DATA_SIZE);
 #[cfg(hammer_buffer_trace_trajectory)]
 const _: () = assert!(mem::offset_of!(Buffer, trajectory_nb) == 128);
 #[cfg(hammer_buffer_trace_trajectory)]
 const _: () = assert!(mem::offset_of!(Buffer, trajectory_trace) == 130);
 
-#[inline]
-pub(crate) const fn buffer_data_offset() -> usize {
-    mem::size_of::<Buffer>()
-}
-
 impl Buffer {
-    #[inline]
-    pub(crate) fn reset(&mut self, data_size: usize, bytes: &[u8]) -> DataPlaneResult<()> {
-        if bytes.len() > data_size {
-            return Err(BufferInvariant::BytesExceedCapacity {
-                length: bytes.len(),
-                capacity: data_size,
-            }
-            .into());
-        }
-        let current_len =
-            u16::try_from(bytes.len()).map_err(|_| BufferInvariant::CurrentLengthOutOfRange)?;
-        self.cacheline0 = BufferHeaderCacheline0::default();
-        self.cacheline0.current_data = 0;
-        self.cacheline0.current_length = current_len;
-        self.cacheline0.ref_count = 1;
-        self.set_data_capacity(data_size);
-        self.cacheline0.flags.insert(BufferFlags::SLOT_CLEAN);
-        self.cacheline1 = BufferHeaderCacheline1::default();
-        self.data_region_mut(data_size)[..bytes.len()].copy_from_slice(bytes);
-        Ok(())
-    }
-
-    #[inline]
-    pub(crate) fn reset_for_free(&mut self, data_size: usize) {
-        self.cacheline0 = BufferHeaderCacheline0::default();
-        self.set_data_capacity(data_size);
-        self.cacheline0.flags.insert(BufferFlags::SLOT_CLEAN);
-        self.cacheline1 = BufferHeaderCacheline1::default();
-    }
-
-    #[inline]
-    pub(crate) fn reset_empty(&mut self, data_size: usize, headroom: usize) -> DataPlaneResult<()> {
-        if headroom > data_size {
-            return Err(BufferInvariant::HeadroomExceedsCapacity.into());
-        }
-        self.cacheline0 = BufferHeaderCacheline0::default();
-        self.set_current_data_offset(isize::try_from(headroom).expect("headroom fits isize"))?;
-        self.cacheline0.ref_count = 1;
-        self.set_data_capacity(data_size);
-        self.cacheline0.flags.insert(BufferFlags::SLOT_CLEAN);
-        self.cacheline1 = BufferHeaderCacheline1::default();
-        Ok(())
-    }
-
-    /// Clear only cacheline0 and mark the slot clean, leaving cacheline1 alone.
-    /// Caller must have verified `flags.contains(SLOT_CLEAN)` so cacheline1 is
-    /// already zeroed from the previous free. Returns the headroom/length pair
-    /// the alloc fast path needs.
-    #[inline]
-    pub(crate) fn reset_empty_fast(
-        &mut self,
-        data_size: usize,
-        headroom: usize,
-    ) -> DataPlaneResult<()> {
-        if headroom > data_size {
-            return Err(BufferInvariant::HeadroomExceedsCapacity.into());
-        }
-        self.cacheline0 = BufferHeaderCacheline0::default();
-        self.set_current_data_offset(isize::try_from(headroom).expect("headroom fits isize"))?;
-        self.cacheline0.ref_count = 1;
-        self.set_data_capacity(data_size);
-        self.cacheline0.flags.insert(BufferFlags::SLOT_CLEAN);
-        Ok(())
-    }
-
-    /// Free fast path: only cacheline0 is rewritten (clean-default with
-    /// SLOT_CLEAN set); cacheline1 is left untouched because it is already
-    /// zeroed when SLOT_CLEAN was set on the slot.
-    #[inline]
-    pub(crate) fn reset_for_free_fast(&mut self, data_size: usize) {
-        self.cacheline0 = BufferHeaderCacheline0::default();
-        self.set_data_capacity(data_size);
-        self.cacheline0.flags.insert(BufferFlags::SLOT_CLEAN);
-    }
-
     #[inline]
     pub fn opaque(&self) -> &PrimaryOpaque {
         &self.cacheline0.opaque
@@ -179,13 +97,12 @@ impl Buffer {
 
     #[inline]
     pub fn opaque2(&self) -> &SecondaryOpaque {
-        &self.cacheline1.opaque2
+        &self.opaque2
     }
 
     #[inline]
     pub fn opaque2_mut(&mut self) -> &mut SecondaryOpaque {
-        self.cacheline0.flags.remove(BufferFlags::SLOT_CLEAN);
-        &mut self.cacheline1.opaque2
+        &mut self.opaque2
     }
 
     #[inline]
@@ -205,28 +122,22 @@ impl Buffer {
 
     #[inline]
     pub fn trace_handle(&self) -> Option<u32> {
-        (self.cacheline1.trace_handle != 0).then_some(self.cacheline1.trace_handle)
+        self.cacheline0
+            .flags
+            .contains(BufferFlags::TRACED)
+            .then_some(self.trace_handle)
     }
 
     #[inline]
     pub fn set_trace_handle(&mut self, handle: u32) {
-        self.cacheline0.flags.remove(BufferFlags::SLOT_CLEAN);
-        self.cacheline1.trace_handle = handle;
+        self.trace_handle = handle;
+        self.cacheline0.flags.insert(BufferFlags::TRACED);
     }
 
     #[inline]
     pub fn take_trace_handle(&mut self) -> Option<u32> {
         let handle = self.trace_handle();
-        self.cacheline1.trace_handle = 0;
-        if handle.is_none() {
-            // trace_handle was already 0; if the rest of cacheline1 is also
-            // zeroed we keep CLEAN, otherwise it was already cleared.
-        } else {
-            // We cannot prove cacheline1 is fully zeroed anymore without a
-            // scan; conservatively drop the clean invariant. A subsequent
-            // free will rebuild it via the slow path.
-            self.cacheline0.flags.remove(BufferFlags::SLOT_CLEAN);
-        }
+        self.cacheline0.flags.remove(BufferFlags::TRACED);
         handle
     }
 
@@ -251,11 +162,6 @@ impl Buffer {
     }
 
     #[inline]
-    pub fn current_data(&self) -> usize {
-        usize::try_from(self.current_data_offset()).unwrap_or(0)
-    }
-
-    #[inline]
     pub fn ref_count(&self) -> u8 {
         self.cacheline0.ref_count
     }
@@ -274,20 +180,28 @@ impl Buffer {
 
     #[inline]
     pub fn total_len_not_including_first(&self) -> usize {
-        self.cacheline1.total_length_not_including_first as usize
+        if self
+            .cacheline0
+            .flags
+            .contains(BufferFlags::TOTAL_LENGTH_VALID)
+        {
+            self.total_length_not_including_first as usize
+        } else {
+            0
+        }
     }
 
     #[inline]
     pub fn current(&self) -> &[u8] {
         let len = self.current_len();
         // SAFETY: `current_ptr` is computed from the inline slot backing owned
-        // by the arena, and `current_len` is maintained within slot bounds by
-        // the pool mutation paths.
+        // by its Physmem-backed Pool, and `current_len` is maintained within
+        // slot bounds by the data-window operations.
         unsafe { slice::from_raw_parts(self.current_ptr(), len) }
     }
 
     #[inline]
-    pub fn current_ptr(&self) -> *const u8 {
+    pub(crate) fn current_ptr(&self) -> *const u8 {
         // SAFETY: the slot layout is `[header][pre_data][data]`; the current
         // window is always kept within that inline backing.
         unsafe {
@@ -311,62 +225,110 @@ impl Buffer {
     }
 
     #[inline]
-    pub fn writable_tail_mut(&mut self) -> &mut [u8] {
-        let data_size = self.data_capacity();
-        let start = self.current_end_offset_from_header();
-        let len = self.available_tail_with_data_size(data_size);
-        let writable_start = BUFFER_HEADER_SIZE;
-        let offset = start - writable_start;
-        &mut self.slot_writable_region_mut(data_size)[offset..offset + len]
-    }
-
-    #[inline]
-    pub fn commit_writable_tail(&mut self, len: usize) -> DataPlaneResult<()> {
-        if len > self.available_tail_with_data_size(self.data_capacity()) {
-            return Err(BufferInvariant::CommitExceedsWritableTail.into());
-        }
-        self.set_current_len(self.current_len() + len)?;
-        Ok(())
-    }
-
-    #[inline]
     pub fn truncate(&mut self, len: usize) -> DataPlaneResult<()> {
         if len > self.current_len() {
             return Err(BufferInvariant::TruncateExtendsCurrentLength.into());
         }
-        self.set_current_len(len)
+        self.set_current_window(isize::from(self.current_data_offset()), len);
+        Ok(())
     }
 
     #[inline]
-    pub fn advance(&mut self, displacement: isize) -> DataPlaneResult<()> {
-        if displacement == 0 {
-            return Ok(());
-        }
-        if displacement < 0 {
-            let rewind = displacement.unsigned_abs();
-            if rewind > self.available_headroom() {
-                return Err(BufferInvariant::RewindExceedsHeadroom.into());
-            }
-            let new_offset = isize::from(self.current_data_offset())
-                - isize::try_from(rewind).expect("rewind fits isize");
-            self.set_current_data_offset(new_offset)?;
-            self.set_current_len(self.current_len() + rewind)?;
-            return Ok(());
-        }
-
-        let len = usize::try_from(displacement)
-            .map_err(|_| BufferInvariant::AdvanceDisplacementOutOfRange)?;
-        if len > self.current_len() {
-            return Err(BufferInvariant::AdvanceExceedsCurrentLength.into());
-        }
-        let new_offset =
-            isize::from(self.current_data_offset()) + isize::try_from(len).expect("len fits isize");
-        self.set_current_data_offset(new_offset)?;
-        self.set_current_len(self.current_len() - len)
+    pub fn advance(&mut self, displacement: isize) {
+        let offset = isize::from(self.current_data_offset())
+            .checked_add(displacement)
+            .expect("Buffer advance offset fits isize");
+        let length = (self.current_len() as isize)
+            .checked_sub(displacement)
+            .and_then(|length| usize::try_from(length).ok())
+            .expect("Buffer advance stays within the current length");
+        self.set_current_window(offset, length);
     }
 
     #[inline]
-    pub fn current_mut_ptr(&mut self) -> *mut u8 {
+    pub fn reset(&mut self) {
+        // vlib_buffer_reset retains current_length for a negative offset and
+        // restores previously consumed bytes only for a positive offset.
+        let consumed = self.current_data_offset().max(0) as usize;
+        self.set_current_window(0, self.current_len() + consumed);
+    }
+
+    #[inline]
+    pub fn space_left_at_end(&self) -> usize {
+        self.data_end_offset_from_header(self.data_capacity())
+            .checked_sub(self.current_end_offset_from_header())
+            .expect("Buffer current window ends within its Pool data capacity")
+    }
+
+    /// Exposes retained storage without clearing it and publishes the new length.
+    #[inline]
+    pub fn put_uninit(&mut self, len: u16) -> &mut [u8] {
+        let len = usize::from(len);
+        assert!(
+            len <= self.space_left_at_end(),
+            "Buffer append fits tail capacity"
+        );
+        let start = self.current_end_offset_from_header();
+        self.set_current_window(
+            isize::from(self.current_data_offset()),
+            self.current_len() + len,
+        );
+        // SAFETY: Physmem storage is initialized on mapping and retained on
+        // recycle. The validated extension stays in this exclusively borrowed slot.
+        unsafe { slice::from_raw_parts_mut(self.as_mut_bytes_ptr().add(start), len) }
+    }
+
+    #[inline]
+    pub fn push_uninit(&mut self, len: u8) -> &mut [u8] {
+        self.advance(-isize::from(len));
+        &mut self.current_mut()[..usize::from(len)]
+    }
+
+    #[inline]
+    pub fn make_headroom(&mut self, len: u8) -> &mut [u8] {
+        self.set_current_window(
+            isize::from(self.current_data_offset()) + isize::from(len),
+            self.current_len(),
+        );
+        let available = self.space_left_at_end();
+        // SAFETY: vlib_buffer_make_headroom returns the new current pointer.
+        // ADR-0007 bounds the safe slice by the remaining end capacity. The
+        // complete range was validated before changing current_data.
+        unsafe { slice::from_raw_parts_mut(self.current_mut_ptr(), available) }
+    }
+
+    #[inline]
+    pub fn pull(&mut self, len: u8) -> Option<&[u8]> {
+        if usize::from(len) > self.current_len() {
+            return None;
+        }
+        let start = self.current_start_offset_from_header();
+        self.advance(isize::from(len));
+        // SAFETY: this prefix belonged to the previous valid current window;
+        // its storage remains borrowed through self after advancing the header.
+        Some(unsafe { slice::from_raw_parts(self.as_bytes_ptr().add(start), usize::from(len)) })
+    }
+
+    pub(super) fn set_current_window(&mut self, offset: isize, length: usize) {
+        let current_data = i16::try_from(offset).expect("Buffer current_data fits i16");
+        let current_length = u16::try_from(length).expect("Buffer current_length fits u16");
+        assert!(
+            offset >= -(BUFFER_PRE_DATA_SIZE as isize),
+            "Buffer current_data stays in pre-data"
+        );
+        let end = offset
+            .checked_add(length as isize)
+            .expect("Buffer current end fits isize");
+        assert!(
+            end <= self.data_capacity() as isize,
+            "Buffer current window fits Pool data capacity"
+        );
+        self.cacheline0.current_data = current_data;
+        self.cacheline0.current_length = current_length;
+    }
+
+    #[inline]
+    pub(crate) fn current_mut_ptr(&mut self) -> *mut u8 {
         // SAFETY: the slot layout is `[header][pre_data][data]`; the current
         // window is always kept within that inline backing.
         unsafe {
@@ -376,87 +338,13 @@ impl Buffer {
     }
 
     #[inline]
-    pub fn prepend(&mut self, bytes: &[u8]) -> DataPlaneResult<()> {
-        self.prepend_mut(bytes.len())?.copy_from_slice(bytes);
-        Ok(())
-    }
-
-    #[inline]
-    pub fn prepend_mut(&mut self, len: usize) -> DataPlaneResult<&mut [u8]> {
-        if len > self.available_headroom() {
-            return Err(BufferInvariant::PrependExceedsHeadroom.into());
-        }
-        let current_start = self.current_start_offset_from_header();
-        let start = current_start - len;
-        let offset_from_data = isize::try_from(start).expect("slot offset fits isize")
-            - isize::try_from(buffer_data_offset()).expect("buffer data offset fits isize");
-        self.set_current_data_offset(offset_from_data)?;
-        self.set_current_len(self.current_len() + len)?;
-        // SAFETY: `start..current_start` lies within the inline pre_data/data
-        // range and the mutable borrow of `self` guarantees uniqueness.
-        unsafe {
-            Ok(slice::from_raw_parts_mut(
-                self.as_mut_bytes_ptr().add(start),
-                len,
-            ))
-        }
-    }
-
-    #[inline]
-    pub(crate) fn available_tail_with_data_size(&self, data_size: usize) -> usize {
-        self.data_end_offset_from_header(data_size)
-            .saturating_sub(self.current_end_offset_from_header())
-    }
-
-    #[inline]
-    pub(crate) fn append_in_place(&mut self, data_size: usize, bytes: &[u8]) -> usize {
-        let take = bytes
-            .len()
-            .min(self.available_tail_with_data_size(data_size));
-        if take == 0 {
-            return 0;
-        }
-        let start = self.current_end_offset_from_header();
-        let end = start + take;
-        let writable_start = BUFFER_HEADER_SIZE;
-        self.slot_writable_region_mut(data_size)[start - writable_start..end - writable_start]
-            .copy_from_slice(&bytes[..take]);
-        self.set_current_len(self.current_len() + take)
-            .expect("buffer append keeps current length within u16");
-        take
-    }
-
-    #[inline]
-    pub(crate) fn set_current_data_offset(&mut self, offset: isize) -> DataPlaneResult<()> {
-        let lower_bound = -isize::try_from(BUFFER_PRE_DATA_SIZE).expect("pre-data size fits isize");
-        if offset < lower_bound {
-            return Err(BufferInvariant::CurrentDataExceedsPreData.into());
-        }
-        self.cacheline0.current_data =
-            i16::try_from(offset).map_err(|_| BufferInvariant::CurrentDataOutOfRange)?;
-        Ok(())
-    }
-
-    #[inline]
-    pub(crate) fn set_current_len(&mut self, len: usize) -> DataPlaneResult<()> {
-        self.cacheline0.current_length =
-            u16::try_from(len).map_err(|_| BufferInvariant::CurrentLengthOutOfRange)?;
-        Ok(())
-    }
-
-    #[inline]
-    pub(crate) fn set_data_capacity(&mut self, data_size: usize) {
-        self.cacheline0.flags = self.cacheline0.flags.with_private_data_capacity(data_size);
-    }
-
-    #[inline]
     pub(crate) fn data_capacity(&self) -> usize {
-        self.cacheline0.flags.private_data_capacity()
+        BufferMain::global().pools[usize::from(self.cacheline0.buffer_pool_index)].data_size
     }
 
     #[inline]
-    pub(crate) fn set_next_buffer(&mut self, next: Option<Index>) {
-        self.cacheline0.next_buffer = next.map_or(BUFFER_INVALID_INDEX, Index::slot);
+    pub(crate) fn set_next_buffer(&mut self, next: Option<u32>) {
+        self.cacheline0.next_buffer = next.unwrap_or(BUFFER_INVALID_INDEX);
         if next.is_some() {
             self.cacheline0.flags.insert(BufferFlags::NEXT_PRESENT);
         } else {
@@ -466,9 +354,11 @@ impl Buffer {
 
     #[inline]
     pub(crate) fn set_total_len_not_including_first(&mut self, len: usize) -> DataPlaneResult<()> {
-        self.cacheline0.flags.remove(BufferFlags::SLOT_CLEAN);
-        self.cacheline1.total_length_not_including_first =
-            u32::try_from(len).map_err(|_| BufferInvariant::ChainTailLengthOutOfRange)?;
+        let len = u32::try_from(len).map_err(|_| BufferInvariant::ChainTailLengthOutOfRange)?;
+        self.total_length_not_including_first = len;
+        self.cacheline0
+            .flags
+            .insert(BufferFlags::TOTAL_LENGTH_VALID);
         Ok(())
     }
 
@@ -484,7 +374,8 @@ impl Buffer {
 
     #[inline]
     pub(crate) fn current_start_offset_from_header(&self) -> usize {
-        let offset = isize::try_from(buffer_data_offset()).expect("buffer data offset fits isize")
+        let offset = isize::try_from(mem::offset_of!(Buffer, data))
+            .expect("buffer data offset fits isize")
             + isize::from(self.current_data_offset());
         usize::try_from(offset).expect("buffer current start underflowed header")
     }
@@ -496,38 +387,105 @@ impl Buffer {
 
     #[inline]
     pub(crate) fn data_end_offset_from_header(&self, data_size: usize) -> usize {
-        buffer_data_offset() + data_size
+        mem::offset_of!(Buffer, data) + data_size
     }
+}
 
-    #[inline]
-    pub(crate) fn slot_writable_end_offset_from_header(&self, data_size: usize) -> usize {
-        mem::size_of::<Buffer>() + data_size
-    }
+#[cfg(test)]
+mod tests {
+    use crate::buffer::{BUFFER_PRE_DATA_SIZE, BufferMain, BufferPoolArena, DataPlaneBuffers};
+    use crate::error::DataPlaneResult;
+    use hammer_infra::PageSize;
 
-    #[inline]
-    pub(crate) fn available_headroom(&self) -> usize {
-        self.current_start_offset_from_header()
-            .saturating_sub(BUFFER_HEADER_SIZE)
-    }
+    // Issue #293, task 3 only.
+    // Upstream test: third_party/vpp/src/plugins/unittest/vlib_test.c,
+    // test_vlib_command_fn's "Cover simple functions in buffer.h / buffer_funcs.h".
+    // Nonzero cases below exercise the named vendored helper's semantics required
+    // by ADR-0007; they are not claimed to be separate upstream test cases.
+    #[test]
+    fn single_segment_operations_preserve_the_packet_window() -> DataPlaneResult<()> {
+        hammer_infra::main_heap::init_default().unwrap();
+        BufferMain::new(2048, 16, &[0], 1, PageSize::Default)?;
+        let buffers =
+            DataPlaneBuffers::from_arenas([BufferPoolArena::with_capacity(2048, 16)], 1, 1, 0);
+        let index = buffers.alloc_index_with_bytes(&[1, 2, 3, 4])?;
+        {
+            let mut buffer = buffers.get_buffer_mut(index)?;
+            let data_start = buffer.current().as_ptr();
 
-    #[inline]
-    pub(crate) fn data_region_mut(&mut self, data_size: usize) -> &mut [u8] {
-        // SAFETY: the inline data region begins at `buffer_data_offset()` and
-        // spans exactly `data_size` bytes in the owning arena slot.
-        unsafe {
-            slice::from_raw_parts_mut(self.as_mut_bytes_ptr().add(buffer_data_offset()), data_size)
+            // vlib_test.c: reset and the four zero-length operations.
+            buffer.reset();
+            assert_eq!(buffer.current_data_offset(), 0);
+            assert_eq!(buffer.current(), &[1, 2, 3, 4]);
+            assert!(buffer.put_uninit(0).is_empty());
+            assert!(buffer.push_uninit(0).is_empty());
+            assert_eq!(buffer.make_headroom(0).as_ptr(), data_start);
+            assert_eq!(buffer.pull(0), Some([].as_slice()));
+            assert_eq!(buffer.current_data_offset(), 0);
+            assert_eq!(buffer.current(), &[1, 2, 3, 4]);
+
+            // buffer.h: vlib_buffer_put_uninit returns the old tail, then
+            // increases current_length. It does not move the current pointer.
+            let tail = buffer.put_uninit(4);
+            assert_eq!(tail.as_ptr(), data_start.wrapping_add(4));
+            tail.copy_from_slice(&[5, 6, 7, 8]);
+            assert_eq!(buffer.current_data_offset(), 0);
+            assert_eq!(buffer.current(), &[1, 2, 3, 4, 5, 6, 7, 8]);
+            assert_eq!(buffer.space_left_at_end(), 2040);
+
+            // buffer.h: vlib_buffer_advance changes offset and length inversely;
+            // vlib_buffer_reset adds max(current_data, 0) back to current_length.
+            buffer.advance(4);
+            assert_eq!(buffer.current_data_offset(), 4);
+            assert_eq!(buffer.current(), &[5, 6, 7, 8]);
+            assert_eq!(buffer.space_left_at_end(), 2040);
+            buffer.advance(-4);
+            assert_eq!(buffer.current_data_offset(), 0);
+            assert_eq!(buffer.current(), &[1, 2, 3, 4, 5, 6, 7, 8]);
+            buffer.advance(4);
+            buffer.reset();
+            assert_eq!(buffer.current_data_offset(), 0);
+            assert_eq!(buffer.current(), &[1, 2, 3, 4, 5, 6, 7, 8]);
+
+            if BUFFER_PRE_DATA_SIZE >= 4 {
+                // buffer.h: vlib_buffer_push_uninit exposes inline pre_data.
+                // vlib_buffer_reset does not subtract a negative current_data.
+                let prefix = buffer.push_uninit(4);
+                assert_eq!(prefix.as_ptr(), data_start.wrapping_sub(4));
+                prefix.copy_from_slice(&[9, 10, 11, 12]);
+                assert_eq!(buffer.current_data_offset(), -4);
+                assert_eq!(buffer.current_len(), 12);
+                assert_eq!(&buffer.current()[..4], &[9, 10, 11, 12]);
+                assert_eq!(&buffer.current()[4..], &[1, 2, 3, 4, 5, 6, 7, 8]);
+                assert_eq!(buffer.space_left_at_end(), 2040);
+                buffer.reset();
+                assert_eq!(buffer.current_data_offset(), 0);
+                assert_eq!(buffer.current_len(), 12);
+                assert_eq!(buffer.current().as_ptr(), data_start);
+                assert_eq!(&buffer.current()[..8], &[1, 2, 3, 4, 5, 6, 7, 8]);
+            }
+
+            // buffer.h: vlib_buffer_make_headroom advances current_data without
+            // changing current_length, returning the new current pointer.
+            let length = buffer.current_len();
+            let writable = buffer.make_headroom(8);
+            assert_eq!(writable.as_ptr(), data_start.wrapping_add(8));
+            // ADR-0007 defines the Rust slice extent for the upstream pointer.
+            assert_eq!(writable.len(), 2048 - 8 - length);
+            writable[..4].copy_from_slice(&[13, 14, 15, 16]);
+            assert_eq!(buffer.current_data_offset(), 8);
+            assert_eq!(buffer.current_len(), length);
+
+            // buffer.h: vlib_buffer_pull returns the previous current pointer
+            // and advances the window for a prefix within current_length.
+            let prefix = buffer.pull(2).unwrap();
+            assert_eq!(prefix.as_ptr(), data_start.wrapping_add(8));
+            assert_eq!(prefix, &[13, 14]);
+            assert_eq!(buffer.current_data_offset(), 10);
+            assert_eq!(buffer.current_len(), length - 2);
+            assert_eq!(&buffer.current()[..2], &[15, 16]);
         }
-    }
-
-    #[inline]
-    pub(crate) fn slot_writable_region_mut(&mut self, data_size: usize) -> &mut [u8] {
-        // SAFETY: the writable inline slot backing begins immediately after the
-        // header and spans the full `[pre_data][data]` capacity for the slot.
-        unsafe {
-            slice::from_raw_parts_mut(
-                self.as_mut_bytes_ptr().add(BUFFER_HEADER_SIZE),
-                self.slot_writable_end_offset_from_header(data_size) - BUFFER_HEADER_SIZE,
-            )
-        }
+        buffers.drop_index_owned_with_trace(index, |_| {});
+        Ok(())
     }
 }
