@@ -69,10 +69,15 @@ impl BufferMain {
     #[inline]
     pub unsafe fn buffer_mut(&self, index: u32) -> &mut Buffer {
         let pool = self.pool(index);
-        // SAFETY: the caller retains exclusive ownership for this borrow.
-        let buffer = unsafe { pool.buffer_mut(index) };
-        assert_eq!(buffer.ref_count(), 1, "shared Buffer tails are immutable");
-        buffer
+        // SAFETY: the caller retains a live obligation. Inspect shared state
+        // before creating any mutable reference to a possibly shared segment.
+        assert_eq!(
+            unsafe { pool.buffer(index) }.ref_count(),
+            1,
+            "shared Buffer tails are immutable"
+        );
+        // SAFETY: exclusivity was checked before constructing the reference.
+        unsafe { pool.buffer_mut(index) }
     }
 
     pub(super) fn pool(&self, index: u32) -> &BufferPool {
