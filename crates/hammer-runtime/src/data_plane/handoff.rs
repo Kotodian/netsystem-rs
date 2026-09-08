@@ -12,21 +12,28 @@ impl DataPlaneMain {
             return Ok(());
         };
         while let Some(handoff_frame) = handoff.pop() {
-            let mut slot = HandoffSlotGuard::new(self, handoff_frame.slot);
-            let mut frame = self.get_frame_to_node(handoff_frame.target)?;
-            slot.push_into_frame(&mut frame)?;
-            self.put_frame_to_node(handoff_frame.target, frame)?;
+            // vlib/handoff.c copies raw indices into the destination Frame.
+            // Enqueue validated the target; graph refork preserves its identity.
+            let mut frame = self
+                .get_frame_to_node(handoff_frame.target)
+                .expect("queued handoff target remains registered");
+            frame.set_vector_count(handoff_frame.slot.len());
+            for (destination, index) in frame
+                .vector_args_mut()
+                .iter_mut()
+                .zip(handoff_frame.slot.iter())
+            {
+                *destination = index;
+            }
+            self.put_frame_to_node(handoff_frame.target, frame)
+                .expect("queued handoff target accepts its Frame");
         }
         Ok(())
     }
 
-    #[inline]
-    pub(crate) fn drop_handoff_slot_owned(&self, slot: HandoffSlot) {
-        for index in slot.iter() {
-            self.drop_index_owned(index);
-        }
-    }
-
+    /// Transfer packet release obligations to the destination Worker.
+    /// On success the input vectors remain unchanged but are no longer owned
+    /// by the source. On error the Frame contains only the untransferred suffix.
     #[inline]
     pub fn handoff_frame(
         &self,
@@ -44,14 +51,20 @@ impl DataPlaneMain {
         self.nodes.node_kind(target)?;
         let slots = pending.div_ceil(HANDOFF_SLOT_CAPACITY);
         handoff.ensure_enqueue_slots(worker, slots)?;
+        let mut transferred = 0;
         for indices in frame.vector_args().chunks(HANDOFF_SLOT_CAPACITY) {
             let slot = HandoffSlot::from_prefix(indices);
             match handoff.enqueue_slot(worker, target, slot) {
                 Ok(()) => {
+                    transferred += indices.len();
                     self.set_worker_node_interrupt_pending(worker, target);
                 }
                 Err(err) => {
                     let (error, _) = err.into_parts();
+                    // Another producer can fill the queue after the capacity
+                    // check. Already published indices belong to the receiver.
+                    frame.vector_args_mut().copy_within(transferred.., 0);
+                    frame.set_vector_count(pending - transferred);
                     return Err(error.into());
                 }
             }
@@ -106,11 +119,12 @@ mod tests {
                 assert_eq!(buffer.ref_count(), 1);
             }
         })();
+        runtime.buffer_free(frame.vector_args());
         processed_vectors
     }
 
     // vlib/handoff.c delivers queued indices directly to hqm->node_index.
-    // Exercise that contract across OS threads without a NodeHandle or cursor rewrite.
+    // Drive source enqueue and destination dispatch directly as a unit test.
     #[test]
     fn handoff_preserves_feature_cursor_and_transfers_buffer_ownership() {
         crate::BUFFER_MAIN_INIT.call_once(|| {
@@ -153,27 +167,17 @@ mod tests {
             DataPlaneMain::attach_handoff_worker(source, handoff.worker(DataWorkerId::new(0)));
         let receiver = handoff.worker(DataWorkerId::new(1));
         let (arenas, frame_slots, nodes, simd_bytes, _, trace_control) = source.worker_parts();
-        let (send, receive) = std::sync::mpsc::channel();
-        let (acknowledge, acknowledged) = std::sync::mpsc::channel();
-        let worker = std::thread::spawn(move || {
-            let mut runtime = DataPlaneMain::from_worker_parts(
-                arenas,
-                frame_slots,
-                nodes,
-                simd_bytes,
-                Some(receiver),
-                trace_control,
-                2,
-                0,
-            )
-            .unwrap();
-            for expected_frames in receive {
-                assert_eq!(runtime.run_ready_nodes().unwrap(), expected_frames);
-                assert_eq!(runtime.nodes().frames_in_use(), 0);
-                acknowledge.send(()).unwrap();
-            }
-            assert_eq!(runtime.buffers().in_use_buffers(), 0);
-        });
+        let mut receiver = DataPlaneMain::from_worker_parts(
+            arenas,
+            frame_slots,
+            nodes,
+            simd_bytes,
+            Some(receiver),
+            trace_control,
+            2,
+            0,
+        )
+        .unwrap();
 
         let destination = DataWorkerId::new(1);
         let mut frame = Frame::<(), u32, ()>::new(0);
@@ -219,10 +223,11 @@ mod tests {
         ));
         assert_eq!(frame.len(), 31);
         assert_eq!(source.current_config_index(index).unwrap(), 0x1234_5678);
-        assert_eq!(source.buffers().in_use_buffers(), 33);
-        send.send(2).unwrap();
-        acknowledged.recv().unwrap();
-        assert_eq!(source.buffers().in_use_buffers(), 31);
+        assert_eq!(source.buffer(index).ref_count(), 1);
+        let cached_free = receiver.buffers().cached_free_buffers();
+        assert_eq!(receiver.run_ready_nodes().unwrap(), 2);
+        assert_eq!(receiver.nodes().frames_in_use(), 0);
+        assert_eq!(receiver.buffers().cached_free_buffers(), cached_free + 2);
 
         // Retry the unchanged source frame, spanning two queue slots.
         for _ in 0..2 {
@@ -239,11 +244,10 @@ mod tests {
         source
             .handoff_frame(destination, target, &mut frame)
             .unwrap();
-        assert!(frame.is_empty());
-        send.send(2).unwrap();
-        acknowledged.recv().unwrap();
-        assert_eq!(source.buffers().in_use_buffers(), 0);
-        drop(send);
-        worker.join().unwrap();
+        assert_eq!(frame.len(), 33);
+        assert_eq!(receiver.run_ready_nodes().unwrap(), 2);
+        assert_eq!(receiver.nodes().frames_in_use(), 0);
+        assert_eq!(receiver.buffers().cached_free_buffers(), cached_free + 35);
+        assert_eq!(receiver.run_ready_nodes().unwrap(), 0);
     }
 }

@@ -58,3 +58,6 @@ pub mod session;
 pub mod transport;
 
 pub use hammer_runtime::{AttachError, RuntimeError, RuntimeResult};
+
+#[cfg(test)]
+static BUFFER_MAIN_INIT: std::sync::Once = std::sync::Once::new();

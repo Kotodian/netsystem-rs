@@ -266,8 +266,16 @@ mod tests {
     #[test]
     fn interface_tx_stack_uses_the_interface_output_node() -> Result<(), DpoError> {
         hammer_runtime::config::Memory::default().ensure_main_heap()?;
-        hammer_core::buffer::BufferMain::new(64, 1024, &[0], 2, hammer_infra::PageSize::Default)
+        crate::BUFFER_MAIN_INIT.call_once(|| {
+            hammer_core::buffer::BufferMain::new(
+                64,
+                1024,
+                &[0],
+                2,
+                hammer_infra::PageSize::Default,
+            )
             .unwrap();
+        });
         let mut main = GlobalMain::new(
             DataPlaneMain::new(DataPlaneBufferConfig::default()),
             RuntimeRegistry::new(),

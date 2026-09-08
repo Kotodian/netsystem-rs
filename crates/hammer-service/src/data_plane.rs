@@ -39,10 +39,9 @@ impl Node for PuntNode {
         node_runtime: &mut hammer_runtime::NodeRuntime,
         frame: &mut Frame,
     ) -> usize {
-        let process: NodeProcessFn = // VPP releases the packet frame when no OS punt consumer is installed.
-        // Leaving ownership in the incoming frame lets its owner release it.
-        |_, _, frame| frame.len();
-        process(runtime, node_runtime, frame)
+        // vlib/drop.c uses the ordinary drop path when no OS punt consumer
+        // is installed. Frame storage is recycled separately by dispatch.
+        drop_node_process(runtime, node_runtime, frame)
     }
 }
 
@@ -97,7 +96,7 @@ impl Node for DropNode {
 
 fn drop_node_process(
     runtime: &mut DataPlaneMain,
-    _data: &mut hammer_runtime::node::NodeRuntime,
+    _: &mut hammer_runtime::node::NodeRuntime,
     frame: &mut Frame,
 ) -> usize {
     let processed_vectors = frame.len();
@@ -152,6 +151,7 @@ fn drop_node_process(
         }
         ()
     })();
+    runtime.buffer_free(frame.vector_args());
     processed_vectors
 }
 
@@ -162,5 +162,51 @@ impl InternalNode for DropNode {
         Self: Sized,
     {
         Some(NodeRegistration::next(Self::NODE_NAME, 0))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use hammer_runtime::{DataPlaneBufferConfig, NodeRuntime};
+
+    #[test]
+    fn terminal_nodes_release_buffer_chains() {
+        hammer_infra::main_heap::init_default().unwrap();
+        crate::BUFFER_MAIN_INIT.call_once(|| {
+            hammer_core::buffer::BufferMain::new(
+                64,
+                1024,
+                &[0],
+                2,
+                hammer_infra::PageSize::Default,
+            )
+            .unwrap();
+        });
+        let mut runtime = DataPlaneMain::new(DataPlaneBufferConfig {
+            thread_index: 1,
+            ..Default::default()
+        });
+        // vlib/drop.c::process_drop_punt releases complete chains for Drop
+        // and for Punt without an OS consumer. Neither operation drains vectors.
+        for process in [DropNode::process as NodeProcessFn, PuntNode::process] {
+            let mut indices = [0; 3];
+            assert_eq!(runtime.buffer_alloc(&mut indices), 3);
+            runtime.buffer_chain_buffer(indices[0], indices[1]);
+            let cached_free = runtime.buffers().cached_free_buffers();
+            let mut frame = Frame::<(), u32, ()>::new(0);
+            frame.set_vector_count(2);
+            frame
+                .vector_args_mut()
+                .copy_from_slice(&[indices[0], indices[2]]);
+            assert_eq!(
+                process(&mut runtime, &mut NodeRuntime::empty(), &mut frame),
+                2
+            );
+            assert_eq!(frame.vector_args(), &[indices[0], indices[2]]);
+            assert_eq!(runtime.buffers().cached_free_buffers(), cached_free + 3);
+            drop(frame);
+            assert_eq!(runtime.buffers().cached_free_buffers(), cached_free + 3);
+        }
     }
 }

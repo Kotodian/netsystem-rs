@@ -209,14 +209,14 @@ impl IpReassemblyMain {
         runtime.thread_index().saturating_sub(1) as usize
     }
 
-    fn expire_all(&self, runtime: &DataPlaneMain, now: Instant) -> usize {
+    fn expire_all(&self, runtime: &mut DataPlaneMain, now: Instant) -> usize {
         self.per_thread_data
             .iter()
             .map(|worker| worker.lock().expire(runtime, now))
             .sum()
     }
 
-    fn expire_worker(&self, runtime: &DataPlaneMain, now: Instant) -> usize {
+    fn expire_worker(&self, runtime: &mut DataPlaneMain, now: Instant) -> usize {
         self.per_thread_data
             .get(Self::worker_slot(runtime))
             .map(|worker| worker.lock().expire(runtime, now))
@@ -333,7 +333,7 @@ impl Ip4ReassemblyNode {
     }
 
     #[inline]
-    pub fn expire(&mut self, runtime: &DataPlaneMain, now: Instant) -> usize {
+    pub fn expire(&mut self, runtime: &mut DataPlaneMain, now: Instant) -> usize {
         IP_REASSEMBLY_MAIN
             .get()
             .map(|main| main.expire_worker(runtime, now))
@@ -394,7 +394,7 @@ impl Ip6ReassemblyNode {
     }
 
     #[inline]
-    pub fn expire(&mut self, runtime: &DataPlaneMain, now: Instant) -> usize {
+    pub fn expire(&mut self, runtime: &mut DataPlaneMain, now: Instant) -> usize {
         IP_REASSEMBLY_MAIN
             .get()
             .map(|main| main.expire_worker(runtime, now))
@@ -423,13 +423,13 @@ async fn ip_reassembly_expire_process(
             .wait_for_event_or_clock(REASSEMBLY_EXPIRE_WALK_INTERVAL)
             .await;
         let _ = GlobalMain::with_current(|engine| {
-            main.expire_all(engine.data_plane_main(), Instant::now())
+            main.expire_all(engine.data_plane_main_mut(), Instant::now())
         });
     }
 }
 
 impl IpReassemblyWorker {
-    fn expire(&mut self, runtime: &DataPlaneMain, now: Instant) -> usize {
+    fn expire(&mut self, runtime: &mut DataPlaneMain, now: Instant) -> usize {
         let timeout = self.timeout;
         let capacity = self.contexts.capacity();
         let walk_len = self
@@ -453,7 +453,15 @@ impl IpReassemblyWorker {
         let count = expired_keys.len();
         for (index, key) in expired_keys {
             if let Some(context) = self.contexts.remove(index) {
-                let _ = context.drop_fragments(runtime);
+                // Like ip4_full_reass_drop_all, release each retained chain
+                // before dropping its reassembly context.
+                let mut indices = [0u32; DEFAULT_BUFFER_FRAME_CAPACITY];
+                for fragments in context.fragments.chunks(indices.len()) {
+                    for (index, fragment) in indices.iter_mut().zip(fragments) {
+                        *index = fragment.index;
+                    }
+                    runtime.buffer_free(&indices[..fragments.len()]);
+                }
             }
             if let Some(directory) = &self.directory {
                 directory.remove(key);
@@ -583,7 +591,11 @@ impl IpReassemblyWorker {
                             next: None,
                         },
                     );
-                    runtime.handoff_index(owner, handoff.reassembly, index)?;
+                    if let Err(error) = runtime.handoff_index(owner, handoff.reassembly, index) {
+                        // A rejected enqueue leaves this Worker owning the chain.
+                        runtime.buffer_free_one(index);
+                        return Err(error);
+                    }
                     return Ok(());
                 }
             }
@@ -641,7 +653,13 @@ impl IpReassemblyWorker {
                                         next: None,
                                     },
                                 );
-                                runtime.handoff_index(owner, handoff.reassembly, index)?;
+                                if let Err(error) =
+                                    runtime.handoff_index(owner, handoff.reassembly, index)
+                                {
+                                    // A rejected enqueue leaves this Worker owning the chain.
+                                    runtime.buffer_free_one(index);
+                                    return Err(error);
+                                }
                                 return Ok(());
                             }
                         }
@@ -672,13 +690,34 @@ impl IpReassemblyWorker {
             if fragment.payload_offset == 0 {
                 context.sendout_worker = Some(current_worker);
             }
-            let outcome = context.insert_fragment(
+            let outcome = match context.insert_fragment(
                 runtime,
                 index,
                 fragment,
                 now,
                 self.max_fragments_per_reassembly,
-            )?;
+            ) {
+                Ok(outcome) => outcome,
+                Err(error) => {
+                    // Finalization errors occur after insertion. The context
+                    // still owns every root, including any partially built chain.
+                    let context = self
+                        .contexts
+                        .remove(pool_index)
+                        .expect("reassembly context remains installed during insertion");
+                    let mut indices = [0u32; DEFAULT_BUFFER_FRAME_CAPACITY];
+                    for fragments in context.fragments.chunks(indices.len()) {
+                        for (index, fragment) in indices.iter_mut().zip(fragments) {
+                            *index = fragment.index;
+                        }
+                        runtime.buffer_free(&indices[..fragments.len()]);
+                    }
+                    if let Some(directory) = directory {
+                        directory.remove(key);
+                    }
+                    return Err(error);
+                }
+            };
             match outcome {
                 ReassemblyInsert::Pending => {
                     pending_sendout = context.sendout_worker.or(Some(current_worker));
@@ -735,26 +774,23 @@ impl IpReassemblyWorker {
                 return Err(IpReassemblyError::FragmentContextMissing.into());
             };
             let sendout = context.sendout_worker.unwrap_or(current_worker);
-            for fragment in context.fragments {
-                let _ = add_packet_trace!(
-                    runtime,
-                    fragment.index,
-                    IpReassemblyTrace {
-                        key: Some(key),
-                        action: IpReassemblyTraceAction::Failed,
-                        current_worker,
-                        owner_worker: Some(sendout),
-                        next: Some(drop_slot),
-                    },
-                );
-                Self::emit_local(
-                    runtime,
-                    out_frame,
-                    nexts,
-                    out_len,
-                    drop_next,
-                    fragment.index,
-                )?;
+            let mut indices = [0u32; DEFAULT_BUFFER_FRAME_CAPACITY];
+            for fragments in context.fragments.chunks(indices.len()) {
+                for (index, fragment) in indices.iter_mut().zip(fragments) {
+                    let _ = add_packet_trace!(
+                        runtime,
+                        fragment.index,
+                        IpReassemblyTrace {
+                            key: Some(key),
+                            action: IpReassemblyTraceAction::Failed,
+                            current_worker,
+                            owner_worker: Some(sendout),
+                            next: None,
+                        },
+                    );
+                    *index = fragment.index;
+                }
+                runtime.buffer_free(&indices[..fragments.len()]);
             }
             let _ = add_packet_trace!(
                 runtime,
@@ -791,7 +827,10 @@ impl IpReassemblyWorker {
             } else if let Some(handoff) = &self.handoff {
                 handoff.directory.remove(key);
             }
-            refresh_metadata(runtime, index)?;
+            if let Err(error) = refresh_metadata(runtime, index) {
+                runtime.buffer_free_one(index);
+                return Err(error);
+            }
             if let Some(handoff) = &self.handoff {
                 if sendout != current_worker {
                     let _ = add_packet_trace!(
@@ -805,7 +844,11 @@ impl IpReassemblyWorker {
                             next: None,
                         },
                     );
-                    runtime.handoff_index(sendout, handoff.input, index)?;
+                    if let Err(error) = runtime.handoff_index(sendout, handoff.input, index) {
+                        // A rejected enqueue leaves this Worker owning the chain.
+                        runtime.buffer_free_one(index);
+                        return Err(error);
+                    }
                     return Ok(());
                 }
             }
@@ -930,9 +973,9 @@ impl FragmentContext {
     ) -> RuntimeResult<ReassemblyInsert> {
         self.updated_at = now;
         let start = fragment.payload_offset;
-        let end = start
-            .checked_add(fragment.payload_len)
-            .ok_or(IpReassemblyError::FragmentRangeOverflow)?;
+        let Some(end) = start.checked_add(fragment.payload_len) else {
+            return Ok(ReassemblyInsert::Failed(index));
+        };
         if start == end {
             return Ok(ReassemblyInsert::Drop(index));
         }
@@ -1030,16 +1073,22 @@ impl FragmentContext {
         }
 
         let complete = first.index;
-        let mut fragments = std::mem::take(&mut self.fragments);
-        fragments.sort_by_key(|fragment| fragment.start);
-        for fragment in fragments.iter().copied() {
+        self.fragments.sort_by_key(|fragment| fragment.start);
+        let mut position = 0;
+        while position < self.fragments.len() {
+            let fragment = self.fragments[position];
             if fragment.index == complete {
                 let buffer = runtime.buffer_mut(complete);
                 buffer.truncate(fragment.header_len + (fragment.end - fragment.start))?;
             } else {
                 trim_fragment_payload_chain(runtime, fragment)?;
                 runtime.buffers().chain_buffer(complete, fragment.index)?;
+                // The head now owns this complete chain. Retain only roots
+                // that still carry a separate release obligation on error.
+                self.fragments.remove(position);
+                continue;
             }
+            position += 1;
         }
         {
             let buffer = runtime.buffer_mut(complete);
@@ -1054,6 +1103,7 @@ impl FragmentContext {
                 .copy_from_slice(&0u16.to_be_bytes());
             update_ipv4_header_checksum(header, header_len);
         }
+        self.fragments.clear();
         Ok(ReassemblyInsert::Reassembled(complete))
     }
 
@@ -1077,9 +1127,10 @@ impl FragmentContext {
             let buffer = runtime.buffer(complete);
             buffer.current()[IPV6_HEADER_LEN]
         };
-        let mut fragments = std::mem::take(&mut self.fragments);
-        fragments.sort_by_key(|fragment| fragment.start);
-        for fragment in fragments.iter().copied() {
+        self.fragments.sort_by_key(|fragment| fragment.start);
+        let mut position = 0;
+        while position < self.fragments.len() {
+            let fragment = self.fragments[position];
             if fragment.index == complete {
                 let buffer = runtime.buffer_mut(complete);
                 {
@@ -1102,8 +1153,14 @@ impl FragmentContext {
             } else {
                 trim_fragment_payload_chain(runtime, fragment)?;
                 runtime.buffers().chain_buffer(complete, fragment.index)?;
+                // The head now owns this complete chain. Retain only roots
+                // that still carry a separate release obligation on error.
+                self.fragments.remove(position);
+                continue;
             }
+            position += 1;
         }
+        self.fragments.clear();
         Ok(ReassemblyInsert::Reassembled(complete))
     }
 
@@ -1113,24 +1170,6 @@ impl FragmentContext {
             .iter()
             .position(|fragment| fragment.start == 0)
             .ok_or_else(|| IpReassemblyError::FirstFragmentMissing.into())
-    }
-
-    #[inline]
-    fn drop_fragments(self, runtime: &DataPlaneMain) -> RuntimeResult<()> {
-        let mut owner = runtime
-            .buffers()
-            .get_next_frame(NodeId::new(0), (0, 4, 0))?;
-        for fragment in self.fragments {
-            if owner.len() == DEFAULT_BUFFER_FRAME_CAPACITY {
-                owner = runtime
-                    .buffers()
-                    .get_next_frame(NodeId::new(0), (0, 4, 0))?;
-            }
-            let count = owner.len();
-            owner.set_vector_count(count + 1);
-            owner.vector_args_mut()[count] = fragment.index;
-        }
-        Ok(())
     }
 }
 
@@ -1180,4 +1219,258 @@ fn update_ipv4_header_checksum(packet: &mut [u8], header_len: usize) {
     let checksum = internet_checksum(&packet[..header_len]);
     packet[IPV4_HEADER_CHECKSUM_OFFSET..IPV4_HEADER_CHECKSUM_OFFSET + 2]
         .copy_from_slice(&checksum.to_be_bytes());
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use hammer_runtime::DataPlaneBufferConfig;
+    use std::net::Ipv4Addr;
+
+    #[test]
+    fn reassembly_transfers_complete_chains_and_expires_incomplete_chains() {
+        crate::BUFFER_MAIN_INIT.call_once(|| {
+            hammer_infra::main_heap::init_default().unwrap();
+            hammer_core::buffer::BufferMain::new(
+                64,
+                1024,
+                &[0, 1],
+                2,
+                hammer_infra::PageSize::Default,
+            )
+            .unwrap();
+        });
+        let mut runtime = DataPlaneMain::new(DataPlaneBufferConfig {
+            thread_index: 2,
+            ..Default::default()
+        });
+        let now = Instant::now();
+        let key = IpFragmentKey::V4 {
+            source: Ipv4Addr::new(192, 0, 2, 1),
+            destination: Ipv4Addr::new(192, 0, 2, 2),
+            protocol: 17,
+            identification: 7,
+        };
+        let directory = Arc::new(IpReassemblyDirectory::new(1));
+        let mut worker = IpReassemblyWorker {
+            worker: DataWorkerId::new(1),
+            contexts: Pool::with_capacity(1),
+            directory: Some(Arc::clone(&directory)),
+            handoff: None,
+            timeout: Duration::from_millis(100),
+            max_reassemblies: 1,
+            max_fragments_per_reassembly: 4,
+            last_id: 0,
+        };
+        let mut indices = [0; 2];
+        assert_eq!(runtime.buffer_alloc(&mut indices), 2);
+        runtime.buffer_mut(indices[0]).put_uninit(28).fill(0);
+        runtime.buffer_mut(indices[1]).put_uninit(8).fill(0);
+        runtime.buffer_chain_buffer(indices[0], indices[1]);
+        let mut context = FragmentContext::new(key, IpVersion::V4, now);
+        assert!(matches!(
+            context
+                .insert_fragment(
+                    &mut runtime,
+                    indices[0],
+                    ParsedIpFragment {
+                        version: IpVersion::V4,
+                        key,
+                        payload_offset: 0,
+                        payload_len: 16,
+                        more_fragments: true,
+                        header_len: 20,
+                    },
+                    now,
+                    4
+                )
+                .unwrap(),
+            ReassemblyInsert::Pending
+        ));
+        let slot = worker.contexts.insert(context);
+        assert_eq!(
+            directory.claim_or_lookup(key, slot, worker.worker),
+            (worker.worker, true)
+        );
+        let cached_free = runtime.buffers().cached_free_buffers();
+        // test_reassembly.py::test_timeout_cleanup: omit the last fragment,
+        // expire the context, then deliver the last fragment too late.
+        assert_eq!(
+            worker.expire(&mut runtime, now + Duration::from_millis(50)),
+            0
+        );
+        assert!(directory.lookup(key).is_some());
+        assert_eq!(
+            worker.expire(&mut runtime, now + Duration::from_millis(250)),
+            1
+        );
+        assert!(worker.contexts.is_empty());
+        assert!(directory.lookup(key).is_none());
+        assert_eq!(runtime.buffers().cached_free_buffers(), cached_free + 2);
+        assert_eq!(
+            worker.expire(&mut runtime, now + Duration::from_millis(300)),
+            0
+        );
+        assert_eq!(runtime.buffers().cached_free_buffers(), cached_free + 2);
+
+        let mut last = [0];
+        assert_eq!(runtime.buffer_alloc(&mut last), 1);
+        runtime.buffer_mut(last[0]).put_uninit(28).fill(0);
+        let mut context = FragmentContext::new(key, IpVersion::V4, now);
+        assert!(matches!(
+            context
+                .insert_fragment(
+                    &mut runtime,
+                    last[0],
+                    ParsedIpFragment {
+                        version: IpVersion::V4,
+                        key,
+                        payload_offset: 16,
+                        payload_len: 8,
+                        more_fragments: false,
+                        header_len: 20,
+                    },
+                    now,
+                    4
+                )
+                .unwrap(),
+            ReassemblyInsert::Pending
+        ));
+        assert_eq!(context.fragments.len(), 1);
+        let slot = worker.contexts.insert(context);
+        assert_eq!(
+            directory.claim_or_lookup(key, slot, worker.worker),
+            (worker.worker, true)
+        );
+        assert_eq!(
+            worker.expire(&mut runtime, now + Duration::from_millis(350)),
+            1
+        );
+        assert!(worker.contexts.is_empty());
+        assert!(directory.lookup(key).is_none());
+        assert_eq!(runtime.buffers().cached_free_buffers(), cached_free + 2);
+
+        // test_reassembly.py::test_reassembly repeats successful reassembly.
+        // Finalization transfers the complete chain without retaining a clone.
+        for _ in 0..2 {
+            let mut indices = [0; 2];
+            assert_eq!(runtime.buffer_alloc(&mut indices), 2);
+            for (offset, index) in indices.iter().copied().enumerate() {
+                let packet = runtime.buffer_mut(index).put_uninit(28);
+                packet.fill(0);
+                packet[0] = 0x45;
+                packet[2..4].copy_from_slice(&28u16.to_be_bytes());
+                packet[9] = 17;
+                packet[20..].fill(offset as u8 + 1);
+            }
+            let cached_free = runtime.buffers().cached_free_buffers();
+            let mut context = FragmentContext::new(key, IpVersion::V4, now);
+            assert!(matches!(
+                context
+                    .insert_fragment(
+                        &mut runtime,
+                        indices[0],
+                        ParsedIpFragment {
+                            version: IpVersion::V4,
+                            key,
+                            payload_offset: 0,
+                            payload_len: 8,
+                            more_fragments: true,
+                            header_len: 20,
+                        },
+                        now,
+                        4
+                    )
+                    .unwrap(),
+                ReassemblyInsert::Pending
+            ));
+            let ReassemblyInsert::Reassembled(head) = context
+                .insert_fragment(
+                    &mut runtime,
+                    indices[1],
+                    ParsedIpFragment {
+                        version: IpVersion::V4,
+                        key,
+                        payload_offset: 8,
+                        payload_len: 8,
+                        more_fragments: false,
+                        header_len: 20,
+                    },
+                    now,
+                    4,
+                )
+                .unwrap()
+            else {
+                panic!("complete IPv4 fragment range produces one chain");
+            };
+            assert_eq!(head, indices[0]);
+            assert!(context.fragments.is_empty());
+            drop(context);
+            assert_eq!(runtime.buffer(head).next_buffer_slot(), Some(indices[1]));
+            assert_eq!(&runtime.buffer(head).current()[20..], &[1; 8]);
+            assert_eq!(runtime.buffer(indices[1]).current(), &[2; 8]);
+            assert_eq!(&runtime.buffer(head).current()[2..4], &36u16.to_be_bytes());
+            assert_eq!(runtime.buffer(head).total_len_not_including_first(), 8);
+            assert_eq!(runtime.buffer(head).ref_count(), 1);
+            assert_eq!(runtime.buffer(indices[1]).ref_count(), 1);
+            assert_eq!(runtime.buffers().cached_free_buffers(), cached_free);
+            runtime.buffer_free(core::slice::from_ref(&head));
+            assert_eq!(runtime.buffers().cached_free_buffers(), cached_free + 2);
+        }
+
+        // VPP's fragment-limit path drops all retained ranges before freeing
+        // the context. The rejected incoming fragment remains a drop output.
+        worker.max_fragments_per_reassembly = 1;
+        let mut indices = [0; 2];
+        assert_eq!(runtime.buffer_alloc(&mut indices), 2);
+        for (offset, index) in indices.iter().copied().enumerate() {
+            let packet = runtime.buffer_mut(index).put_uninit(28);
+            packet.fill(0);
+            packet[0] = 0x45;
+            packet[2..4].copy_from_slice(&28u16.to_be_bytes());
+            packet[4..6].copy_from_slice(&7u16.to_be_bytes());
+            packet[6..8].copy_from_slice(&(0x2000u16 | offset as u16).to_be_bytes());
+            packet[9] = 17;
+            packet[12..16].copy_from_slice(&[192, 0, 2, 1]);
+            packet[16..20].copy_from_slice(&[192, 0, 2, 2]);
+        }
+        let cached_free = runtime.buffers().cached_free_buffers();
+        let mut output = Frame::<(), u32, ()>::new(0);
+        let mut nexts = [0; DEFAULT_BUFFER_FRAME_CAPACITY];
+        let mut output_len = 0;
+        worker
+            .process_index(
+                &mut runtime,
+                indices[0],
+                now,
+                &mut output,
+                &mut nexts,
+                &mut output_len,
+                IpVersion::V4,
+            )
+            .unwrap();
+        assert_eq!(worker.contexts.len(), 1);
+        assert!(directory.lookup(key).is_some());
+        assert_eq!(output_len, 0);
+        worker
+            .process_index(
+                &mut runtime,
+                indices[1],
+                now,
+                &mut output,
+                &mut nexts,
+                &mut output_len,
+                IpVersion::V4,
+            )
+            .unwrap();
+        assert!(worker.contexts.is_empty());
+        assert!(directory.lookup(key).is_none());
+        assert_eq!(runtime.buffers().cached_free_buffers(), cached_free + 1);
+        assert_eq!(output.vector_args(), &indices[1..]);
+        assert_eq!(output_len, 1);
+        assert_eq!(nexts[0], NodeNext::slot(Ip4ReassemblyNext::Drop));
+        assert_eq!(runtime.buffer(indices[1]).ref_count(), 1);
+        runtime.buffer_free(output.vector_args());
+        assert_eq!(runtime.buffers().cached_free_buffers(), cached_free + 2);
+    }
 }

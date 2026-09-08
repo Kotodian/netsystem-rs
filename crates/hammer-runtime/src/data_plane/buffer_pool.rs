@@ -66,12 +66,6 @@ impl DataPlaneMain {
     }
 
     #[inline]
-    pub(crate) fn drop_index_owned(&self, index: u32) {
-        self.buffers
-            .drop_index_owned_with_trace(index, |handle| self.trace.finalize(handle));
-    }
-
-    #[inline]
     pub fn prefetch_header(&self, index: u32) {
         self.buffers.prefetch_header(index);
     }

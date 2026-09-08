@@ -92,7 +92,7 @@ pub(crate) struct HandoffFrame {
 
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct HandoffSlot {
-    indices: [Option<u32>; HANDOFF_SLOT_CAPACITY],
+    indices: [u32; HANDOFF_SLOT_CAPACITY],
     len: usize,
 }
 
@@ -100,7 +100,7 @@ impl HandoffSlot {
     #[inline]
     pub(crate) fn new() -> Self {
         Self {
-            indices: [None; HANDOFF_SLOT_CAPACITY],
+            indices: [0; HANDOFF_SLOT_CAPACITY],
             len: 0,
         }
     }
@@ -128,7 +128,7 @@ impl HandoffSlot {
         if self.len == HANDOFF_SLOT_CAPACITY {
             return false;
         }
-        self.indices[self.len] = Some(index);
+        self.indices[self.len] = index;
         self.len += 1;
         true
     }
@@ -140,7 +140,7 @@ impl HandoffSlot {
 
     #[inline]
     pub(crate) fn iter(&self) -> impl Iterator<Item = u32> + '_ {
-        self.indices[..self.len].iter().filter_map(|index| *index)
+        self.indices[..self.len].iter().copied()
     }
 }
 
