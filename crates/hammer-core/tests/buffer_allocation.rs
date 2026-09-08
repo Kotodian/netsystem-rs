@@ -1,38 +1,57 @@
-use hammer_core::buffer::{BufferPoolArena, DataPlaneBuffers};
-use hammer_core::error::{BufferInvariant, DataPlaneError, DataPlaneResult};
-use hammer_core::graph::{NodeErrorIndex, NodeId};
+use hammer_core::buffer::{BufferFlags, BufferMain};
+use hammer_core::error::DataPlaneResult;
+use hammer_core::graph::NodeErrorIndex;
+
+#[hammer_component_macros::buffer_opaque(primary)]
+#[derive(Clone, Copy)]
+struct PacketMetadata {
+    identity: u64,
+}
+
+#[hammer_component_macros::buffer_opaque(secondary)]
+#[derive(Clone, Copy)]
+struct PacketSecondaryMetadata {
+    identity: u64,
+}
 
 // Derived from buffer_funcs.h's first-segment allocation used by icmp4.c and
 // icmp6.c. This verifies storage semantics, not ICMP graph forwarding.
 #[test]
 fn independent_segment_survives_original_chain_release() -> DataPlaneResult<()> {
     hammer_infra::main_heap::init_default().unwrap();
-    let arena = BufferPoolArena::with_capacity(16, 3);
-    let buffers = DataPlaneBuffers::from_arenas([arena], 2, 1, 0);
-    let mut originals = buffers.get_next_frame(NodeId::new(0))?;
-    let source = buffers.alloc_index_with_bytes(&[0x31; 32])?;
-    originals.push_index(source)?;
+    BufferMain::new(16, 3, &[0], 1, hammer_infra::PageSize::Default)?;
+    let buffers = BufferMain::global();
+    let mut caches = buffers.borrow_worker_caches(1);
+    let mut source = u32::MAX;
+    assert_eq!(
+        buffers.add_data(&mut caches, 0, &mut source, &[0x31; 32]),
+        32
+    );
     {
-        let mut buffer = buffers.get_buffer_mut(source)?;
-        buffer.advance(4)?;
-        buffer.prepend(&[0x42; 8])?;
+        // Ownership: the fixture owns this segment until the explicit free below.
+        let buffer = buffers.buffer_mut(&mut caches, source);
+        buffer.advance(4);
+        buffer.push_uninit(8).copy_from_slice(&[0x42; 8]);
         buffer.set_trace_handle(29);
         buffer.set_node_error_index(NodeErrorIndex::new(31).unwrap());
-        // SAFETY: both opaque unions are initialized, u64-aligned storage;
-        // write only their first word while holding the exclusive buffer borrow.
-        unsafe {
-            *std::ptr::from_mut(buffer.opaque_mut()).cast::<u64>() = 17;
-            *std::ptr::from_mut(buffer.opaque2_mut()).cast::<u64>() = 23;
-        }
+        hammer_core::buffer_opaque!(mut buffer => PacketMetadata).identity = 17;
+        hammer_core::buffer_opaque!(mut buffer => PacketSecondaryMetadata).identity = 23;
     }
-    let mut responses = buffers.get_next_frame(NodeId::new(1))?;
-    let response = buffers.alloc_index_from(source)?;
-    responses.push_index(response)?;
+    let response = buffers.copy_no_chain(&mut caches, source).unwrap();
     assert_ne!(response, source);
-    assert_eq!(buffers.chain(source).count(), 2);
-    assert_eq!(buffers.chain(response).count(), 1);
+    // Ownership: both allocations are retained and no mutable borrows exist.
     {
-        let mut buffer = buffers.get_buffer_mut(response)?;
+        assert!(buffers.buffer(&caches, source).next_buffer_slot().is_some());
+        assert!(
+            buffers
+                .buffer(&caches, response)
+                .next_buffer_slot()
+                .is_none()
+        );
+    }
+    {
+        // Ownership: the fixture owns this segment until the explicit free below.
+        let buffer = buffers.buffer_mut(&mut caches, response);
         assert_eq!(buffer.current_data_offset(), -4);
         assert_eq!(buffer.current_len(), 20);
         assert_eq!(&buffer.current()[..8], &[0x42; 8]);
@@ -41,33 +60,48 @@ fn independent_segment_survives_original_chain_release() -> DataPlaneResult<()> 
         assert_eq!(buffer.ref_count(), 1);
         assert_eq!(buffer.trace_handle(), None);
         assert_eq!(buffer.node_error_index(), None);
-        // SAFETY: the source initialized these aligned words before allocation.
-        unsafe {
-            assert_eq!(*std::ptr::from_ref(buffer.opaque()).cast::<u64>(), 17);
-            assert_eq!(*std::ptr::from_ref(buffer.opaque2()).cast::<u64>(), 23);
-        }
+        assert_eq!(
+            hammer_core::buffer_opaque!(&buffer => PacketMetadata).identity,
+            17
+        );
+        assert_eq!(
+            hammer_core::buffer_opaque!(&buffer => PacketSecondaryMetadata).identity,
+            23
+        );
         buffer.current_mut()[0] = 0x55;
     }
-    assert!(matches!(
-        buffers.alloc_index_from(source),
-        Err(DataPlaneError::BufferInvariant(
-            BufferInvariant::PoolExhausted
-        ))
-    ));
-    assert_eq!(buffers.in_use_buffers(), 3);
+    // Pool capacity follows Physmem page carving rather than the requested
+    // minimum. Exhaust its remaining slots before checking copy pressure.
+    let mut retained = Vec::new();
+    loop {
+        let mut indices = [0; 32];
+        let count = buffers.alloc_from_pool(&mut caches, &mut indices, 0);
+        retained.extend_from_slice(&indices[..count]);
+        if count == 0 {
+            break;
+        }
+    }
+    assert!(buffers.copy_no_chain(&mut caches, source).is_none());
+    buffers.free_buffers(&mut caches, &retained, true, |_| {});
+    let cached_free = buffers.cached_free_buffers(&caches, 0);
     {
-        let mut buffer = buffers.get_buffer_mut(source)?;
+        // Ownership: the fixture owns this segment until the explicit free below.
+        let buffer = buffers.buffer_mut(&mut caches, source);
         assert_eq!(buffer.current()[0], 0x42);
         assert_eq!(buffer.current_len(), 20);
-        assert_eq!(buffer.total_len_not_including_first(), 16);
+        // vlib_buffer_add_data invalidates the cached total; inspect the
+        // retained tail itself after ending this mutable head borrow.
+        assert!(!buffer.flags().contains(BufferFlags::TOTAL_LENGTH_VALID));
         assert_eq!(buffer.node_error_index(), NodeErrorIndex::new(31));
         assert_eq!(buffer.take_trace_handle(), Some(29));
     }
-    drop(originals);
-    assert_eq!(buffers.in_use_buffers(), 1);
-    assert_eq!(buffers.get_buffer(response)?.current()[0], 0x55);
-    drop(responses);
-    assert_eq!(buffers.in_use_buffers(), 0);
-    assert_eq!(buffers.frames_in_use(), 0);
+    let tail = buffers.buffer(&caches, source).next_buffer_slot().unwrap();
+    assert_eq!(buffers.buffer(&caches, tail).current(), &[0x31; 16]);
+    BufferMain::global().free_buffers(&mut caches, &[source], true, |_| {});
+    assert_eq!(buffers.cached_free_buffers(&caches, 0), cached_free + 2);
+    // Ownership: releasing the source chain did not release the independent copy.
+    assert_eq!(buffers.buffer(&caches, response).current()[0], 0x55);
+    BufferMain::global().free_buffers(&mut caches, &[response], true, |_| {});
+    assert_eq!(buffers.cached_free_buffers(&caches, 0), cached_free + 3);
     Ok(())
 }

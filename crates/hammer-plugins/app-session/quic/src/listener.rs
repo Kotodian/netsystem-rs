@@ -494,7 +494,7 @@ pub(crate) fn connect_stream(endpoint: SessionConnectEndpoint) -> RuntimeResult<
             let main = main;
             move || {
                 let result = hammer_runtime::with_data_plane_main(|runtime| {
-                    session_main().with_worker_mut(runtime, |sessions| {
+                    session_main().with_worker_mut(runtime.thread_index(), |sessions| {
                         main.with_worker_and_sessions(sessions, |sessions, quic| {
                             quic.connect_stream(sessions, parent, connection, flags)
                                 .map(|_| ())

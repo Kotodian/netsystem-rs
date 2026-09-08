@@ -6,8 +6,8 @@ use std::time::Instant;
 use hammer_infra::thread_owned::ThreadOwned;
 use hammer_service::net::throttle::Throttle;
 
-use hammer_core::data_plane::{BufferFrame, NodeId, NodeNext};
-use hammer_runtime::{DataPlaneMain, Node, NodeProcessFn, NodeRuntimeData, RuntimeResult};
+use hammer_core::data_plane::{Frame, NodeId, NodeNext};
+use hammer_runtime::{DataPlaneMain, Node, NodeProcessFn, NodeRuntime, RuntimeResult};
 use hammer_service::net::{DpoId, DpoProto, DpoType, NetMain};
 use hammer_service::opaque::NetworkOpaque;
 
@@ -183,8 +183,8 @@ enum Ip6InterfaceRxNext {
     next = Ip4InterfaceRxNext,
 )]
 pub struct Ip4InterfaceRxNode {
-    #[node(default = NodeRuntimeData::empty())]
-    runtime_data: NodeRuntimeData,
+    #[node(default = NodeRuntime::empty())]
+    runtime_data: NodeRuntime,
 }
 
 #[hammer_component_macros::graph_node(
@@ -195,8 +195,8 @@ pub struct Ip4InterfaceRxNode {
     next = Ip6InterfaceRxNext,
 )]
 pub struct Ip6InterfaceRxNode {
-    #[node(default = NodeRuntimeData::empty())]
-    runtime_data: NodeRuntimeData,
+    #[node(default = NodeRuntime::empty())]
+    runtime_data: NodeRuntime,
 }
 
 fn register_ip4_interface_rx(runtime: &DataPlaneMain) -> RuntimeResult<NodeId> {
@@ -250,39 +250,57 @@ fn register_interface_rx_class(
 }
 
 impl Node for Ip4InterfaceRxNode {
-    fn process(&mut self, runtime: &DataPlaneMain, frame: &mut BufferFrame) {
-        process_interface_rx(runtime, frame, DpoProto::IP4);
+    fn process(
+        runtime: &mut DataPlaneMain,
+        node_runtime: &mut hammer_runtime::NodeRuntime,
+        frame: &mut Frame,
+    ) -> usize {
+        let process: NodeProcessFn = |runtime, node_runtime, frame| {
+            let processed_vectors = frame.len();
+            process_interface_rx(runtime, node_runtime, frame, DpoProto::IP4);
+            processed_vectors
+        };
+        process(runtime, node_runtime, frame)
     }
-    fn node_process(&self) -> NodeProcessFn {
-        |runtime, _, frame| process_interface_rx(runtime, frame, DpoProto::IP4)
-    }
-    fn node_runtime_data(&self) -> RuntimeResult<NodeRuntimeData> {
+
+    fn node_runtime_data(&self) -> RuntimeResult<NodeRuntime> {
         Ok(self.runtime_data)
     }
 }
 
 impl Node for Ip6InterfaceRxNode {
-    fn process(&mut self, runtime: &DataPlaneMain, frame: &mut BufferFrame) {
-        process_interface_rx(runtime, frame, DpoProto::IP6);
+    fn process(
+        runtime: &mut DataPlaneMain,
+        node_runtime: &mut hammer_runtime::NodeRuntime,
+        frame: &mut Frame,
+    ) -> usize {
+        let process: NodeProcessFn = |runtime, node_runtime, frame| {
+            let processed_vectors = frame.len();
+            process_interface_rx(runtime, node_runtime, frame, DpoProto::IP6);
+            processed_vectors
+        };
+        process(runtime, node_runtime, frame)
     }
-    fn node_process(&self) -> NodeProcessFn {
-        |runtime, _, frame| process_interface_rx(runtime, frame, DpoProto::IP6)
-    }
-    fn node_runtime_data(&self) -> RuntimeResult<NodeRuntimeData> {
+
+    fn node_runtime_data(&self) -> RuntimeResult<NodeRuntime> {
         Ok(self.runtime_data)
     }
 }
 
-fn process_interface_rx(runtime: &DataPlaneMain, frame: &mut BufferFrame, proto: DpoProto) {
+fn process_interface_rx(
+    runtime: &mut DataPlaneMain,
+    node_runtime: &mut hammer_runtime::NodeRuntime,
+    frame: &mut Frame,
+    proto: DpoProto,
+) {
     let net = NetMain::global().expect("interface RX graph requires its installed owner");
-    hammer_runtime::process_frame!(runtime, frame, |index| {
-        let mut buffer = runtime
-            .get_buffer_mut(index)
-            .expect("interface RX frame owns its buffer");
+    hammer_runtime::process_frame!(runtime, node_runtime, frame, |index| {
+        let buffer = runtime.buffer_mut(index);
         // SAFETY: DPO lookup/stack execution initialized this IP-owned overlay;
         // the mutable buffer borrow excludes concurrent metadata access.
-        let forwarding =
-            unsafe { &*(buffer.opaque2() as *const _ as *const LookupMetadata) }.forwarding;
+        let forwarding = hammer_core::buffer_opaque!(buffer => IpSecondaryOpaque)
+            .lookup
+            .forwarding;
         assert_eq!(
             forwarding.proto(),
             proto,
@@ -294,7 +312,7 @@ fn process_interface_rx(runtime: &DataPlaneMain, frame: &mut BufferFrame, proto:
             .expect("published interface RX DPO remains retained during packet processing");
         // SAFETY: NetworkOpaque is the asserted packet ABI overlay, and the
         // packet is exclusively owned by this node while changing its RX fact.
-        let opaque = unsafe { &mut *(buffer.opaque_mut() as *mut _ as *mut NetworkOpaque) };
+        let opaque = hammer_core::buffer_opaque!(mut buffer => NetworkOpaque);
         opaque.sw_if_index[0] = sw_if_index;
         if proto == DpoProto::IP4 {
             NodeNext::slot(Ip4InterfaceRxNext::Input)
@@ -306,17 +324,36 @@ fn process_interface_rx(runtime: &DataPlaneMain, frame: &mut BufferFrame, proto:
 
 #[derive(Clone, Copy)]
 #[repr(C)]
+#[derive(zerocopy::FromBytes, zerocopy::IntoBytes, zerocopy::Immutable)]
 pub(crate) struct LookupMetadata {
     fib_index: u32,
+    padding: [u8; 4],
     pub(crate) forwarding: DpoId,
     flow_hash: u32,
     lookup_count: u8,
+    reserved: [u8; 3],
 }
+
+// Lookup occupies the initial bytes; the ICMP request is the final u64,
+// matching the existing IP producer/consumer contract over opaque2[14].
+#[hammer_component_macros::buffer_opaque(secondary)]
+#[derive(Clone, Copy)]
+pub struct IpSecondaryOpaque {
+    pub(crate) lookup: LookupMetadata,
+    reserved: [u8; 48 - core::mem::size_of::<LookupMetadata>()],
+    pub(crate) icmp_error: u64,
+}
+
+const _: () = assert!(core::mem::size_of::<IpSecondaryOpaque>() == 56);
+const _: () = assert!(core::mem::offset_of!(IpSecondaryOpaque, lookup) == 0);
+const _: () = assert!(core::mem::offset_of!(IpSecondaryOpaque, icmp_error) == 48);
 
 impl Default for LookupMetadata {
     fn default() -> Self {
         Self {
             fib_index: u32::MAX,
+            padding: [0; 4],
+            reserved: [0; 3],
             forwarding: DpoId::INVALID,
             flow_hash: 0,
             lookup_count: 0,
@@ -333,8 +370,8 @@ impl Default for LookupMetadata {
 )]
 #[hammer_component_macros::feature(arc = crate::ip::input::Ip4InputNode)]
 pub struct Ip4LookupNode {
-    #[node(default = NodeRuntimeData::empty())]
-    runtime_data: NodeRuntimeData,
+    #[node(default = NodeRuntime::empty())]
+    runtime_data: NodeRuntime,
 }
 
 #[hammer_component_macros::graph_node(
@@ -346,8 +383,8 @@ pub struct Ip4LookupNode {
 )]
 #[hammer_component_macros::feature(arc = crate::ip::input::Ip6InputNode)]
 pub struct Ip6LookupNode {
-    #[node(default = NodeRuntimeData::empty())]
-    runtime_data: NodeRuntimeData,
+    #[node(default = NodeRuntime::empty())]
+    runtime_data: NodeRuntime,
 }
 
 #[hammer_component_macros::graph_node(
@@ -358,8 +395,8 @@ pub struct Ip6LookupNode {
     sibling_of = Ip4LookupNode,
 )]
 pub struct Ip4LoadBalanceNode {
-    #[node(default = NodeRuntimeData::empty())]
-    runtime_data: NodeRuntimeData,
+    #[node(default = NodeRuntime::empty())]
+    runtime_data: NodeRuntime,
 }
 
 #[hammer_component_macros::graph_node(
@@ -370,8 +407,8 @@ pub struct Ip4LoadBalanceNode {
     sibling_of = Ip6LookupNode,
 )]
 pub struct Ip6LoadBalanceNode {
-    #[node(default = NodeRuntimeData::empty())]
-    runtime_data: NodeRuntimeData,
+    #[node(default = NodeRuntime::empty())]
+    runtime_data: NodeRuntime,
 }
 
 fn register_ip4_lookup(runtime: &DataPlaneMain) -> RuntimeResult<NodeId> {
@@ -451,63 +488,72 @@ fn register_ip6_load_balance(runtime: &DataPlaneMain) -> RuntimeResult<NodeId> {
 }
 
 impl Node for Ip4LookupNode {
-    fn process(&mut self, runtime: &DataPlaneMain, frame: &mut BufferFrame) {
-        process_lookup_frame(runtime, frame, IpVersion::V4)
+    fn process(
+        runtime: &mut DataPlaneMain,
+        node_runtime: &mut hammer_runtime::NodeRuntime,
+        frame: &mut Frame,
+    ) -> usize {
+        let process: NodeProcessFn = process_lookup_v4;
+        process(runtime, node_runtime, frame)
     }
 
-    fn node_process(&self) -> NodeProcessFn {
-        process_lookup_v4
-    }
-
-    fn node_runtime_data(&self) -> RuntimeResult<NodeRuntimeData> {
+    fn node_runtime_data(&self) -> RuntimeResult<NodeRuntime> {
         Ok(self.runtime_data)
     }
 }
 
 impl Node for Ip6LookupNode {
-    fn process(&mut self, runtime: &DataPlaneMain, frame: &mut BufferFrame) {
-        process_lookup_frame(runtime, frame, IpVersion::V6)
+    fn process(
+        runtime: &mut DataPlaneMain,
+        node_runtime: &mut hammer_runtime::NodeRuntime,
+        frame: &mut Frame,
+    ) -> usize {
+        let process: NodeProcessFn = process_lookup_v6;
+        process(runtime, node_runtime, frame)
     }
 
-    fn node_process(&self) -> NodeProcessFn {
-        process_lookup_v6
-    }
-
-    fn node_runtime_data(&self) -> RuntimeResult<NodeRuntimeData> {
+    fn node_runtime_data(&self) -> RuntimeResult<NodeRuntime> {
         Ok(self.runtime_data)
     }
 }
 
 impl Node for Ip4LoadBalanceNode {
-    fn process(&mut self, runtime: &DataPlaneMain, frame: &mut BufferFrame) {
-        process_load_balance_frame(runtime, frame, IpVersion::V4)
+    fn process(
+        runtime: &mut DataPlaneMain,
+        node_runtime: &mut hammer_runtime::NodeRuntime,
+        frame: &mut Frame,
+    ) -> usize {
+        let process: NodeProcessFn = process_load_balance_v4;
+        process(runtime, node_runtime, frame)
     }
 
-    fn node_process(&self) -> NodeProcessFn {
-        process_load_balance_v4
-    }
-
-    fn node_runtime_data(&self) -> RuntimeResult<NodeRuntimeData> {
+    fn node_runtime_data(&self) -> RuntimeResult<NodeRuntime> {
         Ok(self.runtime_data)
     }
 }
 
 impl Node for Ip6LoadBalanceNode {
-    fn process(&mut self, runtime: &DataPlaneMain, frame: &mut BufferFrame) {
-        process_load_balance_frame(runtime, frame, IpVersion::V6)
+    fn process(
+        runtime: &mut DataPlaneMain,
+        node_runtime: &mut hammer_runtime::NodeRuntime,
+        frame: &mut Frame,
+    ) -> usize {
+        let process: NodeProcessFn = process_load_balance_v6;
+        process(runtime, node_runtime, frame)
     }
 
-    fn node_process(&self) -> NodeProcessFn {
-        process_load_balance_v6
-    }
-
-    fn node_runtime_data(&self) -> RuntimeResult<NodeRuntimeData> {
+    fn node_runtime_data(&self) -> RuntimeResult<NodeRuntime> {
         Ok(self.runtime_data)
     }
 }
 
-fn process_lookup_frame(runtime: &DataPlaneMain, frame: &mut BufferFrame, version: IpVersion) {
-    hammer_runtime::process_frame!(runtime, frame, |index| {
+fn process_lookup_frame(
+    runtime: &mut DataPlaneMain,
+    node_runtime: &mut hammer_runtime::NodeRuntime,
+    frame: &mut Frame,
+    version: IpVersion,
+) {
+    hammer_runtime::process_frame!(runtime, node_runtime, frame, |index| {
         lookup_index(runtime, index, version)
     })
 }
@@ -723,57 +769,64 @@ fn ip6_flow_hash(packet: &[u8], parsed: ParsedIpPacket, config: u16) -> u32 {
     c as u32
 }
 
-fn process_lookup_v4(runtime: &DataPlaneMain, _data: NodeRuntimeData, frame: &mut BufferFrame) {
-    process_lookup_frame(runtime, frame, IpVersion::V4)
+fn process_lookup_v4(
+    runtime: &mut DataPlaneMain,
+    node_runtime: &mut NodeRuntime,
+    frame: &mut Frame,
+) -> usize {
+    let processed_vectors = frame.len();
+    process_lookup_frame(runtime, node_runtime, frame, IpVersion::V4);
+    processed_vectors
 }
 
 fn process_load_balance_v4(
-    runtime: &DataPlaneMain,
-    _data: NodeRuntimeData,
-    frame: &mut BufferFrame,
-) {
-    process_load_balance_frame(runtime, frame, IpVersion::V4)
+    runtime: &mut DataPlaneMain,
+    node_runtime: &mut NodeRuntime,
+    frame: &mut Frame,
+) -> usize {
+    let processed_vectors = frame.len();
+    process_load_balance_frame(runtime, node_runtime, frame, IpVersion::V4);
+    processed_vectors
 }
 
 fn process_load_balance_v6(
-    runtime: &DataPlaneMain,
-    _data: NodeRuntimeData,
-    frame: &mut BufferFrame,
-) {
-    process_load_balance_frame(runtime, frame, IpVersion::V6)
+    runtime: &mut DataPlaneMain,
+    node_runtime: &mut NodeRuntime,
+    frame: &mut Frame,
+) -> usize {
+    let processed_vectors = frame.len();
+    process_load_balance_frame(runtime, node_runtime, frame, IpVersion::V6);
+    processed_vectors
 }
 
 fn process_load_balance_frame(
-    runtime: &DataPlaneMain,
-    frame: &mut BufferFrame,
+    runtime: &mut DataPlaneMain,
+    node_runtime: &mut hammer_runtime::NodeRuntime,
+    frame: &mut Frame,
     version: IpVersion,
 ) {
-    hammer_runtime::process_frame!(runtime, frame, |index| {
+    hammer_runtime::process_frame!(runtime, node_runtime, frame, |index| {
         load_balance_index(runtime, index, version)
     })
 }
 
 #[inline(always)]
-fn load_balance_index(
-    runtime: &DataPlaneMain,
-    index: hammer_core::data_plane::Index,
-    version: IpVersion,
-) -> u16 {
+fn load_balance_index(runtime: &mut DataPlaneMain, index: u32, version: IpVersion) -> u16 {
     let drop_next = match version {
         IpVersion::V4 => NodeNext::slot(Ip4LookupNext::Drop),
         IpVersion::V6 => NodeNext::slot(Ip6LookupNext::Drop),
     };
-    let Ok(mut buffer) = runtime.get_buffer_mut(index) else {
-        return drop_next;
-    };
-    let opaque = unsafe { &*(buffer.opaque() as *const _ as *const NetworkOpaque) };
-    let metadata = unsafe { &mut *(buffer.opaque2_mut() as *mut _ as *mut LookupMetadata) };
+    let buffer = runtime.buffer_mut(index);
+    let opaque = hammer_core::buffer_opaque!(buffer => NetworkOpaque);
+    let cursor = opaque.packet_cursor();
+    let metadata = &mut hammer_core::buffer_opaque!(mut buffer => IpSecondaryOpaque).lookup;
     const MAX_LOOKUPS_PER_PACKET: u8 = 4;
     if metadata.lookup_count >= MAX_LOOKUPS_PER_PACKET {
         return drop_next;
     }
     metadata.lookup_count += 1;
     let current = metadata.forwarding;
+    let flow_hash = metadata.flow_hash;
     let expected_proto = match version {
         IpVersion::V4 => DpoProto::IP4,
         IpVersion::V6 => DpoProto::IP6,
@@ -784,12 +837,13 @@ fn load_balance_index(
     let Ok(net) = hammer_service::net::NetMain::global() else {
         return drop_next;
     };
-    let parsed = ip_header(buffer.current(), opaque.packet_cursor()).ok();
+    let parsed = ip_header(buffer.current(), cursor).ok();
+    let mut next_flow_hash = None;
     let selected = net.select_load_balance(current, |bucket_count, flow_hash_config| {
         let hash = if bucket_count <= 1 {
             0
-        } else if metadata.flow_hash != 0 {
-            metadata.flow_hash >> 1
+        } else if flow_hash != 0 {
+            flow_hash >> 1
         } else {
             let parsed = parsed.filter(|packet| packet.version == version)?;
             match version {
@@ -798,10 +852,14 @@ fn load_balance_index(
             }
         };
         if bucket_count > 1 {
-            metadata.flow_hash = hash;
+            next_flow_hash = Some(hash);
         }
         Some(hash)
     });
+    let metadata = &mut hammer_core::buffer_opaque!(mut buffer => IpSecondaryOpaque).lookup;
+    if let Some(hash) = next_flow_hash {
+        metadata.flow_hash = hash;
+    }
     let Some(selected) = selected else {
         return drop_next;
     };
@@ -816,24 +874,24 @@ fn load_balance_index(
     }
 }
 
-fn process_lookup_v6(runtime: &DataPlaneMain, _data: NodeRuntimeData, frame: &mut BufferFrame) {
-    process_lookup_frame(runtime, frame, IpVersion::V6)
+fn process_lookup_v6(
+    runtime: &mut DataPlaneMain,
+    node_runtime: &mut NodeRuntime,
+    frame: &mut Frame,
+) -> usize {
+    let processed_vectors = frame.len();
+    process_lookup_frame(runtime, node_runtime, frame, IpVersion::V6);
+    processed_vectors
 }
 
 #[inline(always)]
-fn lookup_index(
-    runtime: &DataPlaneMain,
-    index: hammer_core::data_plane::Index,
-    version: IpVersion,
-) -> u16 {
+fn lookup_index(runtime: &mut DataPlaneMain, index: u32, version: IpVersion) -> u16 {
     let drop_next = match version {
         IpVersion::V4 => NodeNext::slot(Ip4LookupNext::Drop),
         IpVersion::V6 => NodeNext::slot(Ip6LookupNext::Drop),
     };
-    let Ok(mut buffer) = runtime.get_buffer_mut(index) else {
-        return drop_next;
-    };
-    let opaque = unsafe { &*(buffer.opaque() as *const _ as *const NetworkOpaque) };
+    let buffer = runtime.buffer_mut(index);
+    let opaque = hammer_core::buffer_opaque!(buffer => NetworkOpaque);
     let fib_index = opaque
         .ip()
         .fib_index_override()
@@ -861,9 +919,11 @@ fn lookup_index(
         },
         _ => None,
     };
-    let metadata = unsafe { &mut *(buffer.opaque2_mut() as *mut _ as *mut LookupMetadata) };
+    let metadata = &mut hammer_core::buffer_opaque!(mut buffer => IpSecondaryOpaque).lookup;
     *metadata = LookupMetadata {
         fib_index,
+        padding: [0; 4],
+        reserved: [0; 3],
         forwarding: forwarding.unwrap_or(DpoId::INVALID),
         flow_hash: 0,
         lookup_count: 0,

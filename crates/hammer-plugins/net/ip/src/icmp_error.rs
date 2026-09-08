@@ -1,12 +1,12 @@
 use std::net::IpAddr;
 use std::time::Duration;
 
-use hammer_core::data_plane::{BufferFrame, BufferPacketCursor, Index, NodeId};
+use hammer_core::data_plane::{BufferPacketCursor, Frame, NodeId};
 use hammer_core::error::{BufferInvariant, DataPlaneError};
 use hammer_infra::checksum::{internet_checksum, internet_checksum_parts};
 use hammer_runtime::node::{NodeErrorCode, NodeErrorDescriptor, NodeErrorSeverity};
 use hammer_runtime::{
-    DataPlaneMain, Node, NodeProcessFn, NodeRuntimeData, RuntimeError, RuntimeResult,
+    DataPlaneMain, Node, NodeProcessFn, NodeRuntime, RuntimeError, RuntimeResult,
 };
 use hammer_service::net::{NetMain, throttle::Throttle};
 use hammer_service::opaque::{NetworkFlags, NetworkOffloadFlags, NetworkOpaque};
@@ -39,8 +39,8 @@ enum Ip6IcmpErrorNext {
     name = "ip4-icmp-error", next = Ip4IcmpErrorNext,
 )]
 pub(crate) struct Ip4IcmpErrorNode {
-    #[node(default = NodeRuntimeData::empty())]
-    runtime_data: NodeRuntimeData,
+    #[node(default = NodeRuntime::empty())]
+    runtime_data: NodeRuntime,
 }
 
 #[hammer_component_macros::graph_node(
@@ -48,8 +48,8 @@ pub(crate) struct Ip4IcmpErrorNode {
     name = "ip6-icmp-error", next = Ip6IcmpErrorNext,
 )]
 pub(crate) struct Ip6IcmpErrorNode {
-    #[node(default = NodeRuntimeData::empty())]
-    runtime_data: NodeRuntimeData,
+    #[node(default = NodeRuntime::empty())]
+    runtime_data: NodeRuntime,
 }
 
 #[derive(Clone, Copy)]
@@ -139,25 +139,31 @@ fn register_ip6_icmp_error(runtime: &DataPlaneMain) -> RuntimeResult<NodeId> {
 }
 
 impl Node for Ip4IcmpErrorNode {
-    fn process(&mut self, runtime: &DataPlaneMain, frame: &mut BufferFrame) {
-        ip4_icmp_error(runtime, self.runtime_data, frame);
+    fn process(
+        runtime: &mut DataPlaneMain,
+        node_runtime: &mut hammer_runtime::NodeRuntime,
+        frame: &mut Frame,
+    ) -> usize {
+        let process: NodeProcessFn = ip4_icmp_error;
+        process(runtime, node_runtime, frame)
     }
-    fn node_process(&self) -> NodeProcessFn {
-        ip4_icmp_error
-    }
-    fn node_runtime_data(&self) -> RuntimeResult<NodeRuntimeData> {
+
+    fn node_runtime_data(&self) -> RuntimeResult<NodeRuntime> {
         Ok(self.runtime_data)
     }
 }
 
 impl Node for Ip6IcmpErrorNode {
-    fn process(&mut self, runtime: &DataPlaneMain, frame: &mut BufferFrame) {
-        ip6_icmp_error(runtime, self.runtime_data, frame);
+    fn process(
+        runtime: &mut DataPlaneMain,
+        node_runtime: &mut hammer_runtime::NodeRuntime,
+        frame: &mut Frame,
+    ) -> usize {
+        let process: NodeProcessFn = ip6_icmp_error;
+        process(runtime, node_runtime, frame)
     }
-    fn node_process(&self) -> NodeProcessFn {
-        ip6_icmp_error
-    }
-    fn node_runtime_data(&self) -> RuntimeResult<NodeRuntimeData> {
+
+    fn node_runtime_data(&self) -> RuntimeResult<NodeRuntime> {
         Ok(self.runtime_data)
     }
 }
@@ -183,101 +189,98 @@ fn init_worker(runtime: &mut DataPlaneMain) -> RuntimeResult<()> {
             .is_ok(),
         "IPv6 ICMP throttle already installed for worker {worker}"
     );
-    runtime.register_worker_exit_function(exit_worker);
     Ok(())
 }
 
-fn exit_worker(runtime: &mut DataPlaneMain) -> RuntimeResult<()> {
-    let worker = runtime.thread_index() as usize;
-    IP4_MAIN
-        .get()
-        .expect("IP initialized before worker exit")
-        .icmp_throttle[worker]
-        .clear()
-        .expect("IPv4 ICMP throttle released on its owner worker");
-    IP6_MAIN
-        .get()
-        .expect("IP initialized before worker exit")
-        .icmp_throttle[worker]
-        .clear()
-        .expect("IPv6 ICMP throttle released on its owner worker");
-    Ok(())
+fn ip4_icmp_error(
+    runtime: &mut DataPlaneMain,
+    node_runtime: &mut NodeRuntime,
+    frame: &mut Frame,
+) -> usize {
+    let processed_vectors = frame.len();
+    (|| {
+        let ip = IP4_MAIN
+            .get()
+            .expect("IP initialized before graph execution");
+        let mut throttle = ip.icmp_throttle[runtime.thread_index() as usize]
+            .borrow_mut()
+            .expect("IPv4 ICMP throttle belongs to executing worker");
+        let seed = throttle.seed(ip.clock_origin.elapsed());
+        hammer_runtime::process_frame!(runtime, node_runtime, frame, |index| {
+            let result = generate_error(
+                runtime,
+                index,
+                IcmpErrorFamily::Ipv4,
+                &mut throttle,
+                seed,
+                Ip4IcmpErrorNext::Lookup.slot(),
+            );
+            let error = match result {
+                Ok(error) => error,
+                Err(RuntimeError::DataPlane(DataPlaneError::BufferInvariant(
+                    BufferInvariant::PoolExhausted,
+                ))) => IcmpError::NoBuffer,
+                Err(error) => panic!("IPv4 ICMP graph ownership invariant: {error}"),
+            };
+            runtime
+                .record_current_node_error(error)
+                .expect("IPv4 ICMP node counters installed");
+            Ip4IcmpErrorNext::Drop
+        });
+    })();
+    processed_vectors
 }
 
-fn ip4_icmp_error(runtime: &DataPlaneMain, _: NodeRuntimeData, frame: &mut BufferFrame) {
-    let ip = IP4_MAIN
-        .get()
-        .expect("IP initialized before graph execution");
-    let mut throttle = ip.icmp_throttle[runtime.thread_index() as usize]
-        .borrow_mut()
-        .expect("IPv4 ICMP throttle belongs to executing worker");
-    let seed = throttle.seed(ip.clock_origin.elapsed());
-    hammer_runtime::process_frame!(runtime, frame, |index| {
-        let result = generate_error(
-            runtime,
-            index,
-            IcmpErrorFamily::Ipv4,
-            &mut throttle,
-            seed,
-            Ip4IcmpErrorNext::Lookup.slot(),
-        );
-        let error = match result {
-            Ok(error) => error,
-            Err(RuntimeError::DataPlane(
-                DataPlaneError::BufferInvariant(BufferInvariant::PoolExhausted)
-                | DataPlaneError::FramePoolExhausted,
-            )) => IcmpError::NoBuffer,
-            Err(error) => panic!("IPv4 ICMP graph ownership invariant: {error}"),
-        };
-        runtime
-            .record_current_node_error(error)
-            .expect("IPv4 ICMP node counters installed");
-        Ip4IcmpErrorNext::Drop
-    });
-}
-
-fn ip6_icmp_error(runtime: &DataPlaneMain, _: NodeRuntimeData, frame: &mut BufferFrame) {
-    let ip = IP6_MAIN
-        .get()
-        .expect("IP initialized before graph execution");
-    let mut throttle = ip.icmp_throttle[runtime.thread_index() as usize]
-        .borrow_mut()
-        .expect("IPv6 ICMP throttle belongs to executing worker");
-    let seed = throttle.seed(ip.clock_origin.elapsed());
-    hammer_runtime::process_frame!(runtime, frame, |index| {
-        let result = generate_error(
-            runtime,
-            index,
-            IcmpErrorFamily::Ipv6,
-            &mut throttle,
-            seed,
-            Ip6IcmpErrorNext::Lookup.slot(),
-        );
-        let error = match result {
-            Ok(error) => error,
-            Err(RuntimeError::DataPlane(
-                DataPlaneError::BufferInvariant(BufferInvariant::PoolExhausted)
-                | DataPlaneError::FramePoolExhausted,
-            )) => IcmpError::NoBuffer,
-            Err(error) => panic!("IPv6 ICMP graph ownership invariant: {error}"),
-        };
-        runtime
-            .record_current_node_error(error)
-            .expect("IPv6 ICMP node counters installed");
-        Ip6IcmpErrorNext::Drop
-    });
+fn ip6_icmp_error(
+    runtime: &mut DataPlaneMain,
+    node_runtime: &mut NodeRuntime,
+    frame: &mut Frame,
+) -> usize {
+    let processed_vectors = frame.len();
+    (|| {
+        let ip = IP6_MAIN
+            .get()
+            .expect("IP initialized before graph execution");
+        let mut throttle = ip.icmp_throttle[runtime.thread_index() as usize]
+            .borrow_mut()
+            .expect("IPv6 ICMP throttle belongs to executing worker");
+        let seed = throttle.seed(ip.clock_origin.elapsed());
+        hammer_runtime::process_frame!(runtime, node_runtime, frame, |index| {
+            let result = generate_error(
+                runtime,
+                index,
+                IcmpErrorFamily::Ipv6,
+                &mut throttle,
+                seed,
+                Ip6IcmpErrorNext::Lookup.slot(),
+            );
+            let error = match result {
+                Ok(error) => error,
+                Err(RuntimeError::DataPlane(DataPlaneError::BufferInvariant(
+                    BufferInvariant::PoolExhausted,
+                ))) => IcmpError::NoBuffer,
+                Err(error) => panic!("IPv6 ICMP graph ownership invariant: {error}"),
+            };
+            runtime
+                .record_current_node_error(error)
+                .expect("IPv6 ICMP node counters installed");
+            Ip6IcmpErrorNext::Drop
+        });
+    })();
+    processed_vectors
 }
 
 fn generate_error(
-    runtime: &DataPlaneMain,
-    index: Index,
+    runtime: &mut DataPlaneMain,
+    index: u32,
     family: IcmpErrorFamily,
     throttle: &mut Throttle,
     seed: u64,
     lookup_slot: usize,
 ) -> RuntimeResult<IcmpError> {
-    let original = runtime.get_buffer(index)?;
-    let metadata = IcmpErrorMetadata::read(original.opaque2());
+    let original = runtime.buffer(index);
+    let metadata =
+        IcmpErrorMetadata::read(hammer_core::buffer_opaque!(original => crate::IpSecondaryOpaque));
     let Some(metadata) = metadata else {
         return Ok(IcmpError::BadRequest);
     };
@@ -319,7 +322,7 @@ fn generate_error(
         return Ok(IcmpError::Suppressed);
     }
     // SAFETY: the IP graph owns the initialized NetworkOpaque packet overlay.
-    let network = unsafe { &*(original.opaque() as *const _ as *const NetworkOpaque) };
+    let network = hammer_core::buffer_opaque!(original => NetworkOpaque);
     let rx = network.sw_if_index[0];
     let interfaces = NetMain::global()?.interface_main();
     let Some(interface) = interfaces.software_interface(rx) else {
@@ -369,18 +372,26 @@ fn generate_error(
             .ok_or(RuntimeError::NodeDispatchContextMissing)?,
         lookup_slot,
     )?;
-    drop(original);
     // The next frame owns the response immediately; any later failure frees it.
-    let mut output = runtime.buffers().get_next_frame(next)?;
-    let response = runtime.buffers().alloc_index_from(index)?;
-    output
-        .push_index(response)
-        .expect("empty next frame accepts one response");
-    let mut buffer = runtime.get_buffer_mut(response)?;
+    let mut output = runtime.get_frame_to_node(next)?;
+    let response =
+        runtime
+            .buffer_copy_no_chain(index)
+            .ok_or(hammer_core::error::DataPlaneError::from(
+                hammer_core::error::BufferInvariant::PoolExhausted,
+            ))?;
+    {
+        let count = output.len();
+        output.set_vector_count(count + 1);
+        output.vector_args_mut()[count] = response;
+    }
+    let buffer = runtime.buffer_mut(response);
     let quote_len = buffer.current_len().min(limit - header_len - 8);
     let length = header_len + 8 + quote_len;
     buffer.truncate(quote_len)?;
-    buffer.prepend_mut(header_len + 8)?.fill(0);
+    buffer
+        .push_uninit(u8::try_from(header_len + 8).expect("IP and ICMP headers fit u8"))
+        .fill(0);
     let packet = buffer.current_mut();
     match (source, destination) {
         (IpAddr::V4(source), IpAddr::V4(destination)) => {
@@ -417,9 +428,9 @@ fn generate_error(
         ]),
     };
     packet[header_len + 2..header_len + 4].copy_from_slice(&checksum.to_be_bytes());
-    IcmpErrorMetadata::clear(buffer.opaque2_mut());
+    IcmpErrorMetadata::clear(hammer_core::buffer_opaque!(mut buffer => crate::IpSecondaryOpaque));
     // SAFETY: the response inherited the initialized IP overlay from its source.
-    let network = unsafe { &mut *(buffer.opaque_mut() as *mut _ as *mut NetworkOpaque) };
+    let network = hammer_core::buffer_opaque!(mut buffer => NetworkOpaque);
     network.flags = NetworkFlags::LOCALLY_ORIGINATED
         | NetworkFlags::L4_CHECKSUM_COMPUTED
         | NetworkFlags::L4_CHECKSUM_CORRECT;
@@ -431,8 +442,7 @@ fn generate_error(
             .with_transport_header(header_len, 8)
             .with_transport_payload_offset(header_len + 8),
     );
-    drop(buffer);
-    runtime.put_next_frame(output)?;
+    runtime.put_frame_to_node(next, output)?;
     Ok(match (family, metadata.icmp_type()) {
         (IcmpErrorFamily::Ipv4, 3) | (IcmpErrorFamily::Ipv6, 1) => {
             IcmpError::DestinationUnreachableSent
@@ -445,7 +455,7 @@ fn generate_error(
 }
 
 #[cfg(test)]
-pub(crate) fn error_response_source_and_origin(runtime: &DataPlaneMain) -> RuntimeResult<()> {
+pub(crate) fn error_response_source_and_origin(runtime: &mut DataPlaneMain) -> RuntimeResult<()> {
     use hammer_core::data_plane::NodeKind;
     use hammer_runtime::node::NodeDescriptor;
     let interfaces = NetMain::global()?.interface_main();
@@ -460,17 +470,22 @@ pub(crate) fn error_response_source_and_origin(runtime: &DataPlaneMain) -> Runti
     let output = runtime.nodes().try_register_descriptor(
         NodeKind::Internal,
         NodeDescriptor::new(
-            |runtime, _, frame| {
+            |runtime, node_runtime, frame| {
                 assert_eq!(frame.len(), 1);
-                let buffer = runtime.get_buffer(frame.indices()[0]).unwrap();
+                let buffer = runtime.buffer(frame.vector_args()[0]);
                 let packet = buffer.current();
-                let network = unsafe { &*(buffer.opaque() as *const _ as *const NetworkOpaque) };
+                let network = hammer_core::buffer_opaque!(buffer => NetworkOpaque);
                 assert!(network.flags.contains(NetworkFlags::LOCALLY_ORIGINATED));
                 assert!(network.flags.contains(
                     NetworkFlags::L4_CHECKSUM_COMPUTED | NetworkFlags::L4_CHECKSUM_CORRECT
                 ));
                 assert!(network.oflags.is_empty());
-                assert!(IcmpErrorMetadata::read(buffer.opaque2()).is_none());
+                assert!(
+                    IcmpErrorMetadata::read(
+                        hammer_core::buffer_opaque!(buffer => crate::IpSecondaryOpaque)
+                    )
+                    .is_none()
+                );
                 match packet[0] >> 4 {
                     4 => {
                         assert_eq!(&packet[12..16], &[192, 0, 2, 1]);
@@ -503,8 +518,9 @@ pub(crate) fn error_response_source_and_origin(runtime: &DataPlaneMain) -> Runti
                     }
                     version => panic!("unexpected response IP version {version}"),
                 }
+                frame.len()
             },
-            NodeRuntimeData::empty(),
+            NodeRuntime::empty(),
             None,
             &[],
             None,
@@ -550,31 +566,35 @@ pub(crate) fn error_response_source_and_origin(runtime: &DataPlaneMain) -> Runti
                     .octets(),
             );
         }
-        let mut frame = runtime.buffers().get_next_frame(node)?;
-        let index = runtime.alloc_index_with_bytes(&packet)?;
-        frame.push_index(index)?;
+        let mut index = u32::MAX;
+        assert_eq!(
+            runtime.buffer_add_data(&mut index, &packet),
+            (&packet).len()
+        );
         {
-            let mut buffer = runtime.get_buffer_mut(index)?;
+            let mut buffer = runtime.buffer_mut(index);
             let mut network = NetworkOpaque::default();
             network.sw_if_index[0] = rx;
             network.oflags = NetworkOffloadFlags::UDP_CHECKSUM;
-            unsafe { (buffer.opaque_mut() as *mut _ as *mut NetworkOpaque).write(network) };
-            metadata.write(buffer.opaque2_mut());
+            *hammer_core::buffer_opaque!(mut buffer => NetworkOpaque) = network;
+            metadata.write(hammer_core::buffer_opaque!(mut buffer => crate::IpSecondaryOpaque));
         }
         let mut throttle = Throttle::new(Duration::from_millis(1));
         let seed = throttle.seed(Duration::from_secs(1));
-        let error = runtime.with_current_node(node, || {
+        let error = runtime.with_current_node(node, |runtime| {
             generate_error(runtime, index, family, &mut throttle, seed, 1)
         })?;
         assert!(matches!(error, IcmpError::TimeExceededSent));
-        let error = runtime.with_current_node(node, || {
+        let error = runtime.with_current_node(node, |runtime| {
             generate_error(runtime, index, family, &mut throttle, seed, 1)
         })?;
         assert!(matches!(error, IcmpError::Suppressed));
         assert_eq!(runtime.run_ready_nodes()?, 1);
-        assert_eq!(runtime.get_buffer(index)?.current(), packet);
-        drop(frame);
-        assert_eq!(runtime.buffers().in_use_buffers(), 0);
+        assert_eq!(runtime.buffer(index).current(), packet);
+        let segments = runtime.chain(index).count();
+        let cached_free = runtime.cached_free_buffers();
+        runtime.buffer_free_one(index);
+        assert_eq!(runtime.cached_free_buffers(), cached_free + segments);
     }
     interfaces.delete_hardware_interface(hardware)?;
     Ok(())

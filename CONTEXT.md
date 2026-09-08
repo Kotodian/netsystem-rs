@@ -51,6 +51,81 @@ corresponding to `vlib_main_t.random_buffer`. Protocol nodes consume that
 stream; they do not install a separate per-protocol RNG lifecycle.
 _Avoid_: main thread, control thread
 
+**Data-Plane Buffer**:
+The packet-storage object transferred through Graph Nodes. Its header carries
+pool provenance and a signed current-data position over inline pre-data and
+packet data.
+_Avoid_: generated buffer identity, pool handle
+
+**Buffer Index**:
+The process-wide compact `u32` identity that locates one Data-Plane Buffer at
+64-byte granularity. It contains neither pool identity nor an allocation
+generation, and copying it does not change Buffer ownership or reference count.
+_Avoid_: generic Index, buffer handle, pool identity
+
+**Physmem Mapping**:
+The shared page-based backing region from which a Buffer Pool obtains packet
+storage. It owns mapping and placement, while the Buffer Pool owns slots.
+_Avoid_: Buffer allocator, slot pool, Buffer owner
+
+**Buffer Pool**:
+The allocation authority for Data-Plane Buffer slots of one data capacity,
+backed by one Physmem Mapping. It owns slot lifecycle, its central free set,
+per-worker caches, and the Buffer initialization template.
+_Avoid_: capacity flags, per-index pool identity
+
+**Buffer Main**:
+The independent process-global Buffer authority, initialized once before any
+Data Worker starts and retained until process exit. It owns the process address
+base, Buffer Pool registry, and default NUMA Pool selection.
+_Avoid_: GlobalMain field, worker-owned arena, mutable buffer address base
+
+**Frame**:
+The contiguous calling record delivered to one Graph Node, carrying that
+Node's scalar, vector, and auxiliary arguments. Recycling Frame memory is
+separate from releasing the Buffer obligations named by its vector elements.
+_Avoid_: BufferFrame, growable index list, per-element owner
+
+**Next Frame**:
+Worker-local append state for one source-Node next arc. It tracks a Frame and
+the exclusive right to enqueue that Frame to its destination Node.
+_Avoid_: checked-out frame, output vector
+
+**Pending Frame**:
+A Frame scheduled for destination-Node dispatch together with its Node Runtime
+and associated Next Frame identity.
+_Avoid_: scheduled buffer owner, frame pool token
+
+**Node Main**:
+The worker-local graph execution authority that owns Node Runtimes, Next
+Frames, Pending Frames, and reusable Frame size classes.
+_Avoid_: graph manager, aggregate NodeRuntime
+
+**Node Runtime**:
+The worker-local execution state for one Graph Node, passed mutably to that
+Node while it processes a Frame.
+_Avoid_: copied runtime data, current-node side channel
+
+**Drop Node**:
+The terminal Graph Node for ordinary packet discard. Packet-processing Nodes
+route rejected Buffer Indices to it with a typed error classification; it
+records disposition and ends the retained Buffer lifecycle.
+_Avoid_: per-node Buffer cleanup, public `free_buffer`, silent discard
+
+**Buffer Ownership**:
+The exclusive responsibility to mutate and eventually release an allocated
+Data-Plane Buffer. A Frame carries that responsibility through the graph, and
+a Worker Handoff or long-lived domain owner may retain it without changing the
+reference count. Shared chain segments are immutable until their reference
+count again permits exclusive access.
+_Avoid_: arena-wide buffer lock, shared mutable packet, per-Buffer free helper
+
+**IP Reassembly Context**:
+Worker-owned state for the fragments of one original IP packet. It retains raw
+Buffer Indices and either transfers the completed chain or ends the lifecycle
+of fragments it still owns.
+_Avoid_: borrowed retained fragment, manual fragment release path
+
 **Worker Handoff**:
 Transfer of packet ownership to another Data Worker at an explicit graph
 destination, independent of the packet's current Feature Arc position.

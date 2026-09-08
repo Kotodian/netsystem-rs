@@ -1,17 +1,16 @@
 use std::cell::RefCell;
-use std::mem::transmute;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::sync::Arc;
 
 use crate::{TcpError, TcpInputFlags, TcpSegmentFlags, tcp_header};
 use arc_swap::ArcSwap;
-use hammer_core::data_plane::{BufferFrame, BufferPacketCursor, Index};
+use hammer_core::data_plane::{BufferPacketCursor, Frame};
 use hammer_runtime::{
-    DataPlaneMain, DataWorkerId, Node, NodeProcessFn, NodeRuntimeData, TraceFormatter,
+    DataPlaneMain, DataWorkerId, Node, NodeProcessFn, NodeRuntime, TraceFormatter,
     add_packet_trace, format_packet_trace,
 };
 use hammer_runtime::{RuntimeError, RuntimeResult};
-use hammer_service::data_plane::set_buffer_node_error;
+use hammer_service::data_plane::set_index_node_error;
 
 use super::lookup::{
     TcpIpv4ListenerAddress, TcpIpv6ListenerAddress, TcpLookupSnapshot, TcpLookupValue,
@@ -65,13 +64,8 @@ impl TcpInputControlPlane {
     }
 
     #[inline]
-    pub(crate) fn node(
-        &self,
-        process: NodeProcessFn,
-        handoff_worker: Option<DataWorkerId>,
-    ) -> TcpInputNode {
-        let mut node =
-            TcpInputNode::new(register_tcp_input_runtime(Arc::clone(&self.inner)), process);
+    pub(crate) fn node(&self, handoff_worker: Option<DataWorkerId>) -> TcpInputNode {
+        let mut node = TcpInputNode::new(register_tcp_input_runtime(Arc::clone(&self.inner)));
         node.handoff_worker = handoff_worker;
         node
     }
@@ -85,19 +79,20 @@ impl TcpInputControlPlane {
     role = internal,
 )]
 pub struct TcpInputNode {
-    runtime_data: NodeRuntimeData,
-    process: NodeProcessFn,
+    runtime_data: NodeRuntime,
     #[node(default)]
     handoff_worker: Option<DataWorkerId>,
 }
 
 impl Node for TcpInputNode {
     #[inline(always)]
-    fn process(&mut self, runtime: &DataPlaneMain, frame: &mut BufferFrame) -> () {
-        if sync_tcp_input_runtime(self.runtime_data, self.handoff_worker).is_err() {
-            return ();
-        }
-        (self.process)(runtime, self.runtime_data, frame)
+    fn process(
+        runtime: &mut DataPlaneMain,
+        node_runtime: &mut hammer_runtime::NodeRuntime,
+        frame: &mut Frame,
+    ) -> usize {
+        let process: NodeProcessFn = tcp_input_process;
+        process(runtime, node_runtime, frame)
     }
 
     #[inline]
@@ -106,12 +101,7 @@ impl Node for TcpInputNode {
     }
 
     #[inline]
-    fn node_process(&self) -> NodeProcessFn {
-        self.process
-    }
-
-    #[inline]
-    fn node_runtime_data(&self) -> RuntimeResult<NodeRuntimeData> {
+    fn node_runtime_data(&self) -> RuntimeResult<NodeRuntime> {
         sync_tcp_input_runtime(self.runtime_data, self.handoff_worker)?;
         Ok(self.runtime_data)
     }
@@ -128,7 +118,7 @@ thread_local! {
         const { RefCell::new(Vec::new()) };
 }
 
-fn register_tcp_input_runtime(snapshot: Arc<ArcSwap<TcpLookupSnapshot>>) -> NodeRuntimeData {
+fn register_tcp_input_runtime(snapshot: Arc<ArcSwap<TcpLookupSnapshot>>) -> NodeRuntime {
     TCP_INPUT_RUNTIMES.with(|runtimes| {
         let mut runtimes = runtimes.borrow_mut();
         let slot = runtimes.len();
@@ -136,7 +126,7 @@ fn register_tcp_input_runtime(snapshot: Arc<ArcSwap<TcpLookupSnapshot>>) -> Node
             snapshot,
             handoff_worker: None,
         });
-        NodeRuntimeData::from_usize(slot).expect("TCP input runtime slot overflow")
+        NodeRuntime::from_usize(slot).expect("TCP input runtime slot overflow")
     })
 }
 
@@ -147,7 +137,7 @@ struct TcpInputSlotInvalid {
     slot: usize,
 }
 
-fn tcp_input_runtime(data: NodeRuntimeData) -> RuntimeResult<TcpInputRuntime> {
+fn tcp_input_runtime(data: NodeRuntime) -> RuntimeResult<TcpInputRuntime> {
     let slot = data.usize_word(0)?;
     TCP_INPUT_RUNTIMES.with(|runtimes| {
         runtimes
@@ -159,7 +149,7 @@ fn tcp_input_runtime(data: NodeRuntimeData) -> RuntimeResult<TcpInputRuntime> {
 }
 
 fn sync_tcp_input_runtime(
-    data: NodeRuntimeData,
+    data: NodeRuntime,
     handoff_worker: Option<DataWorkerId>,
 ) -> RuntimeResult<()> {
     let slot = data.usize_word(0)?;
@@ -174,56 +164,60 @@ fn sync_tcp_input_runtime(
 }
 
 pub(crate) fn tcp_input_process(
-    runtime: &DataPlaneMain,
-    data: NodeRuntimeData,
-    frame: &mut BufferFrame,
-) -> () {
-    let state = match tcp_input_runtime(data) {
-        Ok(state) => state,
-        Err(_) => return (),
-    };
-    let snapshot = state.snapshot.load();
-    tcp_input_process_frame(runtime, frame, &snapshot, state.handoff_worker)
+    runtime: &mut DataPlaneMain,
+    data: &mut NodeRuntime,
+    frame: &mut Frame,
+) -> usize {
+    let processed_vectors = frame.len();
+    (|| {
+        let state = match tcp_input_runtime(*data) {
+            Ok(state) => state,
+            Err(_) => return (),
+        };
+        let snapshot = state.snapshot.load();
+        tcp_input_process_frame(runtime, data, frame, &snapshot, state.handoff_worker)
+    })();
+    processed_vectors
 }
 
 fn tcp_input_process_frame(
-    runtime: &DataPlaneMain,
-    frame: &mut BufferFrame,
+    runtime: &mut DataPlaneMain,
+    node_runtime: &mut hammer_runtime::NodeRuntime,
+    frame: &mut Frame,
     snapshot: &TcpLookupSnapshot,
     handoff_worker: Option<DataWorkerId>,
 ) -> () {
-    let width = runtime.preferred_frame_batch_width();
-    let mut nexts = Vec::with_capacity(frame.len());
-    let _ = frame.rewrite_indices_batched(width, |index| {
+    let mut output = Frame::<(), u32, ()>::new(0);
+    let mut nexts = [0u16; hammer_core::graph::frame::FRAME_VECTOR_CAPACITY];
+    for &index in frame.vector_args() {
         prefetch_tcp_input(runtime, &[index], snapshot);
-        match tcp_input_local_next_for_index(runtime, index, snapshot, handoff_worker) {
-            Ok(Some(slot)) => {
-                nexts.push(slot);
-                Ok(Some(index))
-            }
-            Ok(None) => Ok(None),
-            Err(_) => {
-                nexts.push(TcpInputNext::Drop.slot() as u16);
-                Ok(Some(index))
-            }
-        }
-    });
-    if !nexts.is_empty() {
-        runtime.enqueue_to_next(frame, nexts.as_slice());
+        let next = tcp_input_local_next_for_index(runtime, index, snapshot, handoff_worker);
+        let slot = match next {
+            Ok(Some(slot)) => slot,
+            Ok(None) => continue,
+            Err(_) => TcpInputNext::Drop.slot() as u16,
+        };
+        let count = output.len();
+        output.set_vector_count(count + 1);
+        output.vector_args_mut()[count] = index;
+        nexts[count] = slot;
+    }
+    let count = output.len();
+    if count != 0 {
+        runtime.enqueue_to_next(node_runtime, &mut output, &nexts[..count]);
     }
     ()
 }
 
 #[inline(always)]
 fn tcp_input_local_next_for_index(
-    runtime: &DataPlaneMain,
-    index: Index,
+    runtime: &mut DataPlaneMain,
+    index: u32,
     snapshot: &TcpLookupSnapshot,
     handoff_worker: Option<DataWorkerId>,
 ) -> RuntimeResult<Option<u16>> {
-    let buffer = runtime.get_buffer(index)?;
+    let buffer = runtime.buffer(index);
     let parsed = tcp_input_buffer(&buffer)?;
-    drop(buffer);
     next_slot_for_index_with_runtime(runtime, index, parsed, snapshot, handoff_worker)
 }
 
@@ -238,8 +232,8 @@ enum TcpInputError {
 
 #[inline(always)]
 fn next_slot_for_index_with_runtime(
-    runtime: &DataPlaneMain,
-    index: Index,
+    runtime: &mut DataPlaneMain,
+    index: u32,
     parsed: Result<
         (
             TcpIpVersion,
@@ -253,7 +247,7 @@ fn next_slot_for_index_with_runtime(
     snapshot: &TcpLookupSnapshot,
     handoff_worker: Option<DataWorkerId>,
 ) -> RuntimeResult<Option<u16>> {
-    let traced = runtime.get_buffer(index)?.trace_handle().is_some();
+    let traced = runtime.buffer(index).trace_handle().is_some();
     let (version, protocol, local, remote, flags) = match parsed {
         Ok(parsed) => parsed,
         Err(TcpInputError::BadLength) => {
@@ -289,13 +283,18 @@ fn next_slot_for_index_with_runtime(
     if let Some((session_id, owner, session_next)) = session_route {
         let slot = session_next.slot() as u16;
         {
-            let mut buffer = runtime.get_buffer_mut(index)?;
+            let buffer = runtime.buffer_mut(index);
             buffer.clear_node_error();
-            write_session_route_opaque(buffer.opaque2_mut(), session_id, owner, session_next);
+            write_session_route_opaque(
+                hammer_core::buffer_opaque!(mut buffer => crate::TcpSecondaryOpaque).route_mut(),
+                session_id,
+                owner,
+                session_next,
+            );
             if let Some(current_worker) = handoff_worker
                 && owner != current_worker
             {
-                unsafe { transmute::<_, &mut NetworkOpaque>(buffer.opaque_mut()) }
+                hammer_core::buffer_opaque!(mut buffer => NetworkOpaque)
                     .set_handoff_source_worker(Some(current_worker.slot() as u16));
             }
         }
@@ -339,9 +338,10 @@ fn next_slot_for_index_with_runtime(
 
     if listener_pending {
         {
-            let mut buffer = runtime.get_buffer_mut(index)?;
+            let buffer = runtime.buffer_mut(index);
             buffer.clear_node_error();
-            buffer.opaque2_mut().clear();
+            *hammer_core::buffer_opaque!(mut buffer => crate::TcpSecondaryOpaque).route_mut() =
+                Default::default();
         }
         return resolve_success_next_with_trace(
             runtime,
@@ -383,9 +383,10 @@ fn next_slot_for_index_with_runtime(
         );
     };
     {
-        let mut buffer = runtime.get_buffer_mut(index)?;
+        let buffer = runtime.buffer_mut(index);
         buffer.clear_node_error();
-        buffer.opaque2_mut().clear();
+        *hammer_core::buffer_opaque!(mut buffer => crate::TcpSecondaryOpaque).route_mut() =
+            Default::default();
     }
     resolve_success_next_with_trace(
         runtime,
@@ -403,7 +404,7 @@ fn next_slot_for_index_with_runtime(
 #[inline(always)]
 fn resolve_success_next_with_trace(
     runtime: &DataPlaneMain,
-    index: Index,
+    index: u32,
     next_key: TcpInputNext,
     version: TcpIpVersion,
     protocol: TcpIpProtocol,
@@ -433,8 +434,8 @@ fn resolve_success_next_with_trace(
 
 #[inline(always)]
 fn resolve_error_next_with_runtime(
-    runtime: &DataPlaneMain,
-    index: Index,
+    runtime: &mut DataPlaneMain,
+    index: u32,
     next_key: TcpInputNext,
     error: TcpError,
     version: Option<TcpIpVersion>,
@@ -442,10 +443,7 @@ fn resolve_error_next_with_runtime(
     flags: u16,
     traced: bool,
 ) -> RuntimeResult<Option<u16>> {
-    {
-        let mut buffer = runtime.get_buffer_mut(index)?;
-        set_buffer_node_error(runtime, &mut buffer, error)?;
-    }
+    set_index_node_error(runtime, index, error)?;
     let slot = next_key.slot() as u16;
     if traced {
         add_packet_trace!(
@@ -475,7 +473,7 @@ fn session_or_listener_pending_input_entry(
     crate::TCP_MAIN
         .get()
         .ok_or(RuntimeError::PluginStateNotInitialized { plugin: "tcp" })?
-        .with_worker(runtime, |_, worker| {
+        .with_worker(runtime.thread_index(), |_, worker| {
             let (route, listener_pending) = worker.lookup.input_route(
                 local,
                 remote,
@@ -517,21 +515,21 @@ fn tcp_input_buffer(
         TcpInputError,
     >,
 > {
-    tcp_input_parts(buffer.current(), unsafe {
-        transmute::<_, &NetworkOpaque>(buffer.opaque())
-    })
+    tcp_input_parts(
+        buffer.current(),
+        hammer_core::buffer_opaque!(buffer => NetworkOpaque),
+    )
 }
 
 #[inline(always)]
-fn prefetch_tcp_input(runtime: &DataPlaneMain, indices: &[Index], lookup: &TcpLookupSnapshot) {
+fn prefetch_tcp_input(runtime: &DataPlaneMain, indices: &[u32], lookup: &TcpLookupSnapshot) {
     let mut read = 0usize;
     while read < indices.len() {
         let index = indices[read];
         runtime.prefetch_read(index);
-        if let Ok(buffer) = runtime.get_buffer(index) {
-            prefetch_lookup_for_buffer(lookup, &buffer);
-            prefetch_session_route_for_buffer(runtime, &buffer);
-        }
+        let buffer = runtime.buffer(index);
+        prefetch_lookup_for_buffer(lookup, buffer);
+        prefetch_session_route_for_buffer(runtime, buffer);
         read += 1;
     }
 }
@@ -694,7 +692,7 @@ fn prefetch_lookup_for_buffer(
     snapshot: &TcpLookupSnapshot,
     buffer: &hammer_core::data_plane::Buffer,
 ) {
-    let network = unsafe { transmute::<_, &NetworkOpaque>(buffer.opaque()) };
+    let network = hammer_core::buffer_opaque!(buffer => NetworkOpaque);
     let cursor = network.packet_cursor();
     if !valid_tcp_cursor(cursor) {
         return;
@@ -761,7 +759,7 @@ fn prefetch_session_route_for_buffer(
     runtime: &DataPlaneMain,
     buffer: &hammer_core::data_plane::Buffer,
 ) {
-    let network = unsafe { transmute::<_, &NetworkOpaque>(buffer.opaque()) };
+    let network = hammer_core::buffer_opaque!(buffer => NetworkOpaque);
     let cursor = network.packet_cursor();
     if !valid_tcp_cursor(cursor) {
         return;
@@ -791,7 +789,7 @@ fn prefetch_session_route_for_buffer(
     let Some(main) = crate::TCP_MAIN.get() else {
         return;
     };
-    let _ = main.with_worker(runtime, |_, worker| {
+    let _ = main.with_worker(runtime.thread_index(), |_, worker| {
         worker.lookup.prefetch_tuple(local, remote);
         Ok(())
     });
@@ -799,7 +797,7 @@ fn prefetch_session_route_for_buffer(
 
 #[inline(always)]
 fn tcp_source_port(buffer: &hammer_core::data_plane::Buffer) -> u16 {
-    let transport = unsafe { transmute::<_, &NetworkOpaque>(buffer.opaque()) }
+    let transport = hammer_core::buffer_opaque!(buffer => NetworkOpaque)
         .packet_cursor()
         .transport_header_offset();
     let current = buffer.current();
@@ -811,7 +809,7 @@ fn tcp_source_port(buffer: &hammer_core::data_plane::Buffer) -> u16 {
 
 #[inline(always)]
 fn tcp_destination_port(buffer: &hammer_core::data_plane::Buffer) -> u16 {
-    let transport = unsafe { transmute::<_, &NetworkOpaque>(buffer.opaque()) }
+    let transport = hammer_core::buffer_opaque!(buffer => NetworkOpaque)
         .packet_cursor()
         .transport_header_offset();
     let current = buffer.current();

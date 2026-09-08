@@ -322,6 +322,21 @@ mod tests {
     use super::*;
     use std::sync::atomic::AtomicBool;
 
+    // vlib/main.c::vlib_main keeps the final barrier held after exit hooks.
+    // Zero Workers lets this unit test verify the permanent scope directly.
+    #[test]
+    fn final_barrier_remains_held_after_exit_hooks() {
+        let barrier = WorkerBarrier::new(0);
+        let status = barrier.final_sync(|| {
+            assert!(barrier.is_pending());
+            assert_eq!(barrier.recursion_level(), 1);
+            7
+        });
+        assert_eq!(status, 7);
+        assert!(barrier.is_pending());
+        assert_eq!(barrier.recursion_level(), 1);
+    }
+
     #[test]
     fn barrier_scope_matches_sync_check_release() {
         let barrier = WorkerBarrier::new(1);
@@ -338,6 +353,17 @@ mod tests {
             }
         });
 
+        crate::BUFFER_MAIN_INIT.call_once(|| {
+            hammer_infra::main_heap::init_default().unwrap();
+            hammer_core::buffer::BufferMain::new(
+                64,
+                1024,
+                &[0],
+                3,
+                hammer_infra::PageSize::Default,
+            )
+            .unwrap();
+        });
         let mut main = crate::DataPlaneMain::new(crate::DataPlaneBufferConfig::default());
         crate::worker_thread_barrier_sync!(&mut main, {
             assert_eq!(barrier.recursion_level(), 1);

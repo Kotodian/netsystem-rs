@@ -1,7 +1,7 @@
 use std::time::Instant;
 
-use hammer_core::data_plane::{BufferFrame, Index, NodeId, NodeRegistration};
-use hammer_runtime::{DataPlaneMain, DriverNode, Node, NodeProcessFn, NodeRuntimeData};
+use hammer_core::data_plane::{Frame, NodeId, NodeRegistration};
+use hammer_runtime::{DataPlaneMain, DriverNode, Node, NodeProcessFn, NodeRuntime};
 use hammer_runtime::{RuntimeError, RuntimeResult};
 
 use crate::session::SessionQueueError;
@@ -28,10 +28,10 @@ pub fn register_app_session_input_node(runtime: &DataPlaneMain) -> RuntimeResult
 
 impl AppSessionInputNode {
     pub fn worker_runtime_data(
-        session_queue_data: NodeRuntimeData,
+        session_queue_data: NodeRuntime,
         session_queue: NodeId,
-    ) -> NodeRuntimeData {
-        NodeRuntimeData::from_words([
+    ) -> NodeRuntime {
+        NodeRuntime::from_words([
             session_queue_data.word(0),
             session_queue.slot().into(),
             0,
@@ -41,13 +41,13 @@ impl AppSessionInputNode {
 }
 
 impl Node for AppSessionInputNode {
-    fn process(&mut self, runtime: &DataPlaneMain, frame: &mut BufferFrame) -> () {
-        app_session_input_node_process(runtime, NodeRuntimeData::empty(), frame)
-    }
-
-    #[inline]
-    fn node_process(&self) -> NodeProcessFn {
-        app_session_input_node_process
+    fn process(
+        runtime: &mut DataPlaneMain,
+        node_runtime: &mut hammer_runtime::NodeRuntime,
+        frame: &mut Frame,
+    ) -> usize {
+        let process: NodeProcessFn = app_session_input_node_process;
+        process(runtime, node_runtime, frame)
     }
 }
 
@@ -62,27 +62,31 @@ impl DriverNode for AppSessionInputNode {
 }
 
 fn app_session_input_node_process(
-    runtime: &DataPlaneMain,
-    data: NodeRuntimeData,
-    _: &mut BufferFrame,
-) -> () {
-    let _ = (|| {
-        let handled = SessionQueueNode::poll_app(runtime, data)?;
-        if handled != 0 && SessionQueueNode::session_queue_is_interrupt(runtime, data)? {
-            let session_queue = NodeId::new(
-                u32::try_from(data.word(1))
-                    .expect("Session Queue node identity is stored as a u32"),
-            );
-            let _ = runtime.set_node_interrupt_pending(session_queue)?;
-        }
-        if SessionQueueNode::has_pending_app_mqs(runtime, data)? {
-            if let Some(node) = runtime.current_node() {
-                let _ = runtime.set_node_interrupt_pending(node)?;
+    runtime: &mut DataPlaneMain,
+    data: &mut NodeRuntime,
+    frame: &mut Frame,
+) -> usize {
+    let processed_vectors = frame.len();
+    (|| {
+        let _ = (|| {
+            let handled = SessionQueueNode::poll_app(runtime, *data)?;
+            if handled != 0 && SessionQueueNode::session_queue_is_interrupt(runtime, *data)? {
+                let session_queue = NodeId::new(
+                    u32::try_from(data.word(1))
+                        .expect("Session Queue node identity is stored as a u32"),
+                );
+                let _ = runtime.set_node_interrupt_pending(session_queue)?;
             }
-        }
-        Ok::<(), RuntimeError>(())
+            if SessionQueueNode::has_pending_app_mqs(runtime, *data)? {
+                if let Some(node) = runtime.current_node() {
+                    let _ = runtime.set_node_interrupt_pending(node)?;
+                }
+            }
+            Ok::<(), RuntimeError>(())
+        })();
+        ()
     })();
-    ()
+    processed_vectors
 }
 
 /// Current-node-local next slot for Session Queue generated output.
@@ -102,22 +106,22 @@ impl SessionQueueNext {
 }
 
 pub type SessionQueueDispatchFn = fn(
-    &DataPlaneMain,
+    &mut DataPlaneMain,
     &mut SessionWorker,
-    NodeRuntimeData,
+    NodeRuntime,
     SessionQueueNext,
     Instant,
-    &mut BufferFrame,
+    &mut Frame,
     &mut SessionQueueOutput,
 ) -> RuntimeResult<()>;
 
 pub type SessionQueueUpdateTimeFn = fn(
-    &DataPlaneMain,
+    &mut DataPlaneMain,
     &mut SessionWorker,
-    NodeRuntimeData,
+    NodeRuntime,
     SessionQueueNext,
     Instant,
-    &mut BufferFrame,
+    &mut Frame,
     &mut SessionQueueOutput,
 ) -> RuntimeResult<()>;
 
@@ -161,14 +165,18 @@ impl SessionQueueOutput {
     #[inline]
     pub fn try_enqueue_io(
         &mut self,
-        frame: &mut BufferFrame,
+        frame: &mut Frame,
         next: SessionQueueNext,
-        index: Index,
+        index: u32,
     ) -> RuntimeResult<bool> {
         if self.io_count >= SESSION_QUEUE_IO_BUDGET {
             return Ok(false);
         }
-        frame.push_index(index)?;
+        {
+            let count = frame.len();
+            frame.set_vector_count(count + 1);
+            frame.vector_args_mut()[count] = index;
+        }
         self.nexts.push(next.slot());
         self.io_count += 1;
         Ok(true)
@@ -176,12 +184,17 @@ impl SessionQueueOutput {
 
     /// One Graph Fanout flush for every index recorded on `frame` this dispatch.
     #[inline]
-    pub fn flush(self, runtime: &DataPlaneMain, frame: &mut BufferFrame) {
+    pub fn flush(
+        self,
+        runtime: &mut DataPlaneMain,
+        node_runtime: &mut NodeRuntime,
+        frame: &mut Frame,
+    ) {
         debug_assert_eq!(frame.len(), self.nexts.len());
         if self.nexts.is_empty() {
             return;
         }
-        runtime.enqueue_to_next(frame, self.nexts.as_slice());
+        runtime.enqueue_to_next(node_runtime, frame, self.nexts.as_slice());
     }
 }
 
@@ -202,7 +215,7 @@ pub(crate) struct SessionQueueTransportDispatch {
 )]
 #[derive(Clone)]
 pub struct SessionQueueNode {
-    runtime_data: NodeRuntimeData,
+    runtime_data: NodeRuntime,
 }
 
 pub fn register_session_queue_node(runtime: &DataPlaneMain) -> RuntimeResult<NodeId> {
@@ -216,26 +229,26 @@ pub fn register_session_queue_node(runtime: &DataPlaneMain) -> RuntimeResult<Nod
 impl SessionQueueNode {
     pub fn new() -> RuntimeResult<Self> {
         Ok(Self {
-            runtime_data: NodeRuntimeData::empty(),
+            runtime_data: NodeRuntime::empty(),
         })
     }
 
-    fn poll_app(runtime: &DataPlaneMain, runtime_data: NodeRuntimeData) -> RuntimeResult<usize> {
+    fn poll_app(runtime: &DataPlaneMain, runtime_data: NodeRuntime) -> RuntimeResult<usize> {
         let ptr = runtime_data.word(0) as usize as *const SessionMain;
         if ptr.is_null() {
             return Err(RuntimeError::RuntimeCapabilityMissing {
                 type_name: std::any::type_name::<SessionMain>(),
             });
         }
-        // SAFETY: worker NodeRuntimeData is installed by the owning Data Worker
+        // SAFETY: worker NodeRuntime is installed by the owning Data Worker
         // and points at the process-global SessionMain for its lifetime.
         let main = unsafe { &*ptr };
-        main.with_worker_mut(runtime, |sessions| sessions.poll_app())
+        main.with_worker_mut(runtime.thread_index(), |sessions| sessions.poll_app())
     }
 
     fn has_pending_app_mqs(
         runtime: &DataPlaneMain,
-        runtime_data: NodeRuntimeData,
+        runtime_data: NodeRuntime,
     ) -> RuntimeResult<bool> {
         let ptr = runtime_data.word(0) as usize as *const SessionMain;
         if ptr.is_null() {
@@ -243,15 +256,17 @@ impl SessionQueueNode {
                 type_name: std::any::type_name::<SessionMain>(),
             });
         }
-        // SAFETY: worker NodeRuntimeData is installed by the owning Data Worker
+        // SAFETY: worker NodeRuntime is installed by the owning Data Worker
         // and points at the process-global SessionMain for its lifetime.
         let main = unsafe { &*ptr };
-        main.with_worker_mut(runtime, |sessions| Ok(sessions.has_pending_app_mqs()))
+        main.with_worker_mut(runtime.thread_index(), |sessions| {
+            Ok(sessions.has_pending_app_mqs())
+        })
     }
 
     fn session_queue_is_interrupt(
         runtime: &DataPlaneMain,
-        runtime_data: NodeRuntimeData,
+        runtime_data: NodeRuntime,
     ) -> RuntimeResult<bool> {
         let ptr = runtime_data.word(0) as usize as *const SessionMain;
         if ptr.is_null() {
@@ -259,7 +274,7 @@ impl SessionQueueNode {
                 type_name: std::any::type_name::<SessionMain>(),
             });
         }
-        // SAFETY: worker NodeRuntimeData is installed by the owning Data Worker
+        // SAFETY: worker NodeRuntime is installed by the owning Data Worker
         // and points at the process-global SessionMain for its lifetime.
         let main = unsafe { &*ptr };
         main.session_queue_is_interrupt(runtime)
@@ -312,7 +327,7 @@ impl SessionQueueNode {
     /// thread. This method owns only the worker's dispatch table.
     pub fn install_worker_attachment(
         runtime: &DataPlaneMain,
-        runtime_data: NodeRuntimeData,
+        runtime_data: NodeRuntime,
         output_next: SessionQueueNext,
         update_time: SessionQueueUpdateTimeFn,
         function: SessionQueueDispatchFn,
@@ -323,10 +338,10 @@ impl SessionQueueNode {
                 type_name: std::any::type_name::<SessionMain>(),
             });
         }
-        // SAFETY: worker NodeRuntimeData is installed by the owning Data Worker
+        // SAFETY: worker NodeRuntime is installed by the owning Data Worker
         // and points at the process-global SessionMain for its lifetime.
         let main = unsafe { &*ptr };
-        main.with_worker_mut(runtime, |sessions| {
+        main.with_worker_mut(runtime.thread_index(), |sessions| {
             if sessions.transport_dispatches.iter().any(|dispatch| {
                 dispatch.output_next == output_next
                     && std::ptr::fn_addr_eq(dispatch.update_time, update_time)
@@ -348,7 +363,7 @@ impl SessionQueueNode {
     /// Removes one exact worker-local transport dispatch attachment.
     pub fn remove_worker_attachment(
         runtime: &DataPlaneMain,
-        runtime_data: NodeRuntimeData,
+        runtime_data: NodeRuntime,
         output_next: SessionQueueNext,
         update_time: SessionQueueUpdateTimeFn,
         function: SessionQueueDispatchFn,
@@ -359,10 +374,10 @@ impl SessionQueueNode {
                 type_name: std::any::type_name::<SessionMain>(),
             });
         }
-        // SAFETY: worker NodeRuntimeData is installed by the owning Data Worker
+        // SAFETY: worker NodeRuntime is installed by the owning Data Worker
         // and the SessionMain Arc remains alive in that worker's SessionMain.
         let main = unsafe { &*ptr };
-        main.with_worker_mut(runtime, |sessions| {
+        main.with_worker_mut(runtime.thread_index(), |sessions| {
             let Some(index) = sessions.transport_dispatches.iter().position(|dispatch| {
                 dispatch.output_next == output_next
                     && std::ptr::fn_addr_eq(dispatch.update_time, update_time)
@@ -377,17 +392,17 @@ impl SessionQueueNode {
 }
 
 impl Node for SessionQueueNode {
-    fn process(&mut self, runtime: &DataPlaneMain, frame: &mut BufferFrame) -> () {
-        session_queue_node_process(runtime, self.runtime_data, frame)
+    fn process(
+        runtime: &mut DataPlaneMain,
+        node_runtime: &mut hammer_runtime::NodeRuntime,
+        frame: &mut Frame,
+    ) -> usize {
+        let process: NodeProcessFn = session_queue_node_process;
+        process(runtime, node_runtime, frame)
     }
 
     #[inline]
-    fn node_process(&self) -> NodeProcessFn {
-        session_queue_node_process
-    }
-
-    #[inline]
-    fn node_runtime_data(&self) -> RuntimeResult<NodeRuntimeData> {
+    fn node_runtime_data(&self) -> RuntimeResult<NodeRuntime> {
         Ok(self.runtime_data)
     }
 }
@@ -403,62 +418,65 @@ impl DriverNode for SessionQueueNode {
 }
 
 fn session_queue_node_process(
-    runtime: &DataPlaneMain,
-    data: NodeRuntimeData,
-    frame: &mut BufferFrame,
-) -> () {
-    let now = Instant::now();
-    let mut output = SessionQueueOutput::default();
-    let ptr = data.word(0) as usize as *const SessionMain;
-    if ptr.is_null() {
-        return ();
-    }
-    // SAFETY: worker NodeRuntimeData is installed by the owning Data Worker and
-    // points at the process-global SessionMain for its lifetime.
-    let main = unsafe { &*ptr };
-    let _ = main.with_worker_mut(runtime, |sessions| -> RuntimeResult<bool> {
-        let dispatch_count = sessions.transport_dispatches.len();
-        for dispatch_index in 0..dispatch_count {
-            let dispatch = sessions.transport_dispatches[dispatch_index];
-            if (dispatch.update_time)(
-                runtime,
-                sessions,
-                data,
-                dispatch.output_next,
-                now,
-                frame,
-                &mut output,
-            )
-            .is_err()
-            {
+    runtime: &mut DataPlaneMain,
+    data: &mut NodeRuntime,
+    frame: &mut Frame,
+) -> usize {
+    (|| {
+        let now = Instant::now();
+        let mut output = SessionQueueOutput::default();
+        let ptr = data.word(0) as usize as *const SessionMain;
+        if ptr.is_null() {
+            return ();
+        }
+        // SAFETY: worker NodeRuntime is installed by the owning Data Worker and
+        // points at the process-global SessionMain for its lifetime.
+        let main = unsafe { &*ptr };
+        let _ = main.with_worker_mut(runtime.thread_index(), |sessions| -> RuntimeResult<bool> {
+            let dispatch_count = sessions.transport_dispatches.len();
+            for dispatch_index in 0..dispatch_count {
+                let dispatch = sessions.transport_dispatches[dispatch_index];
+                if (dispatch.update_time)(
+                    runtime,
+                    sessions,
+                    *data,
+                    dispatch.output_next,
+                    now,
+                    frame,
+                    &mut output,
+                )
+                .is_err()
+                {
+                    return Ok(true);
+                }
+            }
+            if sessions.poll_session_events().is_err() {
                 return Ok(true);
             }
-        }
-        if sessions.poll_session_events().is_err() {
-            return Ok(true);
-        }
-        let dispatch_count = sessions.transport_dispatches.len();
-        for dispatch_index in 0..dispatch_count {
-            let dispatch = sessions.transport_dispatches[dispatch_index];
-            if (dispatch.function)(
-                runtime,
-                sessions,
-                data,
-                dispatch.output_next,
-                now,
-                frame,
-                &mut output,
-            )
-            .is_err()
-            {
+            let dispatch_count = sessions.transport_dispatches.len();
+            for dispatch_index in 0..dispatch_count {
+                let dispatch = sessions.transport_dispatches[dispatch_index];
+                if (dispatch.function)(
+                    runtime,
+                    sessions,
+                    *data,
+                    dispatch.output_next,
+                    now,
+                    frame,
+                    &mut output,
+                )
+                .is_err()
+                {
+                    return Ok(true);
+                }
+            }
+            if sessions.update_state(runtime, output.io_count()).is_err() {
                 return Ok(true);
             }
-        }
-        if sessions.update_state(runtime, output.io_count()).is_err() {
-            return Ok(true);
-        }
-        Ok(false)
-    });
-    output.flush(runtime, frame);
-    ()
+            Ok(false)
+        });
+        output.flush(runtime, data, frame);
+        ()
+    })();
+    frame.len()
 }

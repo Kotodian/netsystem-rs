@@ -1,9 +1,7 @@
 //! VPP `vlib_buffer_enqueue_to_next` / `enqueue_one`.
 
-use crate::DataPlaneMain;
-use hammer_core::data_plane::{
-    BufferFrame, DEFAULT_BUFFER_FRAME_CAPACITY, Frame, Index, Next, NodeId, NodeNext,
-};
+use crate::{DataPlaneMain, NodeRuntime};
+use hammer_core::data_plane::{DEFAULT_BUFFER_FRAME_CAPACITY, Frame, NodeId, NodeNext};
 use hammer_infra::mask_compare::{mask_compare_u16, mask_compare_u16_words};
 
 const MASK_WORDS: usize = mask_compare_u16_words(DEFAULT_BUFFER_FRAME_CAPACITY);
@@ -30,11 +28,16 @@ fn first_unhandled(nexts: &[u16], used: &[u64]) -> u16 {
 }
 
 impl DataPlaneMain {
-    /// Enqueue every Index in `frame` to its parallel current-node-local next.
+    /// Enqueue every u32 in `frame` to its parallel current-node-local next.
     ///
     /// Shape matches VPP `vlib_buffer_enqueue_to_next`: walk first-unhandled
     /// next groups via a used bitmap, and for each group run `enqueue_one`.
-    pub fn enqueue_to_next<N: NodeNext>(&self, frame: &mut BufferFrame, nexts: &[N]) {
+    pub fn enqueue_to_next<N: NodeNext>(
+        &mut self,
+        node_runtime: &mut NodeRuntime,
+        frame: &mut Frame,
+        nexts: &[N],
+    ) {
         if frame.len() != nexts.len() {
             abort_fanout("nexts length must equal frame length");
         }
@@ -59,24 +62,25 @@ impl DataPlaneMain {
         while n_left > 0 {
             let next_index = first_unhandled(&next_slots[..count], &used);
             n_left = self.enqueue_one(
+                node_runtime,
                 current,
                 next_index,
-                frame.indices(),
+                frame.vector_args(),
                 &next_slots[..count],
                 &mut used,
                 n_left,
             );
         }
-        frame.discard_prefix(count);
     }
 
     /// VPP `enqueue_one`: mask-compare, copy matches into the appendable next
     /// frame, put when full, rotate once if the group still spills.
     fn enqueue_one(
-        &self,
+        &mut self,
+        node_runtime: &mut NodeRuntime,
         current: NodeId,
         next_index: u16,
-        buffers: &[Index],
+        buffers: &[u32],
         nexts: &[u16],
         used: &mut [u64; MASK_WORDS],
         n_left: usize,
@@ -95,81 +99,35 @@ impl DataPlaneMain {
             used[word] |= bits;
         }
 
-        let mut out = self.take_appendable_next_frame(current, next_index, target);
-        let mut copied = 0usize;
-        for offset in 0..nexts.len() {
-            if !mask_bit(&match_bmp, offset) {
-                continue;
-            }
-            if out.capacity() == out.len() {
-                if self.put_next_frame(out).is_err() {
-                    abort_fanout("failed to put full next frame");
+        let scalar_size = self
+            .nodes()
+            .frame_args_size(target)
+            .expect("registered next layout")
+            .0;
+        let mut source_offset = 0;
+        let mut copied = 0;
+        while copied < n_extracted {
+            let frame_index = self
+                .nodes
+                .prepare_next_frame(current, u32::from(next_index));
+            let vectors_left = {
+                let (vectors, _) = self
+                    .nodes
+                    .next_frame_mut(frame_index)
+                    .next_args_mut::<u32, ()>(scalar_size);
+                let mut written = 0;
+                while source_offset < nexts.len() && written < vectors.len() {
+                    if mask_bit(&match_bmp, source_offset) {
+                        vectors[written] = buffers[source_offset];
+                        written += 1;
+                    }
+                    source_offset += 1;
                 }
-                out = match self.buffers().get_next_frame(target) {
-                    Ok(frame) => frame,
-                    Err(_) => abort_fanout("failed to acquire next frame"),
-                };
-            }
-            if out.push_index(buffers[offset]).is_err() {
-                abort_fanout("next frame rejected an index within remaining capacity");
-            }
-            copied += 1;
+                copied += written;
+                vectors.len() - written
+            };
+            self.put_next_frame(node_runtime, u32::from(next_index), vectors_left);
         }
-        if copied != n_extracted {
-            abort_fanout("extracted count mismatch");
-        }
-
-        if out.is_empty() {
-            drop(out);
-        } else if out.capacity() == out.len() {
-            if self.put_next_frame(out).is_err() {
-                abort_fanout("failed to put next frame");
-            }
-        } else {
-            // Hammer put takes ownership; keep partial frames worker-local until
-            // flush (VPP leaves them in next_frames and still appendable after put).
-            self.appendable_next_frames
-                .borrow_mut()
-                .push((current, next_index, out));
-        }
-
         n_left - n_extracted
-    }
-
-    pub(crate) fn flush_fanout_appendable(&self) {
-        let mut appendable = self.appendable_next_frames.borrow_mut();
-        while let Some((_, _, frame)) = appendable.pop() {
-            if frame.is_empty() {
-                drop(frame);
-                continue;
-            }
-            if self.put_next_frame(frame).is_err() {
-                abort_fanout("failed to put appendable next frame");
-            }
-        }
-    }
-
-    fn take_appendable_next_frame(
-        &self,
-        current: NodeId,
-        slot: u16,
-        target: NodeId,
-    ) -> Frame<Next> {
-        let mut appendable = self.appendable_next_frames.borrow_mut();
-        if let Some(position) = appendable
-            .iter()
-            .position(|&(node, next_slot, _)| node == current && next_slot == slot)
-        {
-            let (_, _, frame) = appendable.swap_remove(position);
-            if frame.next() != target {
-                abort_fanout("appendable next frame target mismatch");
-            }
-            return frame;
-        }
-        drop(appendable);
-        match self.buffers().get_next_frame(target) {
-            Ok(frame) => frame,
-            Err(_) => abort_fanout("failed to acquire next frame"),
-        }
     }
 }

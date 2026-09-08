@@ -9,6 +9,7 @@ name = "hammer_plugin_ip"
 crate-type = ["dylib", "rlib"]
 
 [dependencies]
+zerocopy = { version = "0.8.48", features = ["derive"] }
 abi_stable = { workspace = true }
 arc-swap = { workspace = true }
 bitflags = { workspace = true }

@@ -61,7 +61,6 @@ impl GlobalMain {
             registry,
             main_loop_exit_now,
             main_loop_exit_status,
-            memory_initialized: false,
             plugin_main: PluginMain::default(),
             worker_config,
             called_init_functions: HashSet::new(),
@@ -88,7 +87,6 @@ impl GlobalMain {
         let mut main = Self::new(runtime, registry);
         main.worker_config = worker;
         main.main.set_worker_config(main.worker_config.clone());
-        main.memory_initialized = true;
         Ok(main)
     }
 
@@ -98,27 +96,10 @@ impl GlobalMain {
     }
 
     pub(crate) fn apply_worker_config(&mut self, worker: Worker) -> RuntimeResult<()> {
-        if self.memory_initialized {
-            return if self.worker_config == worker {
-                Ok(())
-            } else {
-                Err(RuntimeError::WorkerConfigurationAlreadyInitialized)
-            };
+        if self.worker_config == worker {
+            Ok(())
+        } else {
+            Err(RuntimeError::WorkerConfigurationAlreadyInitialized)
         }
-        worker.validate()?;
-        self.main = worker.create_runtime()?;
-        self.main.set_worker_config(worker.clone());
-        self.main.install_global_control(
-            Arc::clone(&self.registry),
-            Arc::clone(&self.main_loop_exit_now),
-            Arc::clone(&self.main_loop_exit_status),
-            Arc::clone(&self.publication),
-            Arc::clone(&self.workers_updating_graph),
-            worker.clone(),
-            Arc::clone(&self.worker_control_queues),
-        );
-        self.worker_config = worker;
-        self.memory_initialized = true;
-        Ok(())
     }
 }

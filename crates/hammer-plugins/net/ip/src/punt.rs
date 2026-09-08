@@ -1,7 +1,7 @@
 use crate::ip::input::{Ip4InputNode, Ip6InputNode};
 use crate::ip::local::{Ip4LocalEndOfArcNode, Ip4LocalNode, Ip6LocalEndOfArcNode, Ip6LocalNode};
 use crate::lookup::{IP4_MAIN, IP6_MAIN, Ip4LookupNode, Ip6LookupNode};
-use hammer_core::data_plane::{BufferFrame, NodeId, NodeNext};
+use hammer_core::data_plane::{Frame, NodeId, NodeNext};
 use hammer_runtime::{DataPlaneMain, Node, NodeProcessFn, RuntimeResult};
 use hammer_service::interface::feature::FeatureError;
 use hammer_service::net::{DpoProto, DpoType, NetMain};
@@ -43,34 +43,41 @@ fn register_ip4_punt(runtime: &DataPlaneMain) -> RuntimeResult<NodeId> {
 }
 
 impl Node for Ip4PuntNode {
-    fn process(&mut self, runtime: &DataPlaneMain, frame: &mut BufferFrame) {
-        (self.node_process())(runtime, Default::default(), frame)
-    }
-    fn node_process(&self) -> NodeProcessFn {
-        |runtime, _, frame| {
-            let net = NetMain::global().expect("IP node requires initialized NetMain");
-            // SAFETY: startup installs this scalar before workers execute nodes.
-            let arc = unsafe {
-                *IP4_MAIN
-                    .get()
-                    .expect("IP main initialized")
-                    .punt_feature_arc_index
-                    .get()
-            };
-            hammer_runtime::process_frame!(runtime, frame, |index| {
-                let mut buffer = runtime.get_buffer_mut(index).expect("frame owns buffer");
-                // SAFETY: IP ingress initializes the network overlay.
-                let sw_if_index =
-                    unsafe { &*(buffer.opaque() as *const _ as *const NetworkOpaque) }.sw_if_index
-                        [0];
-                net.interface_main().start_feature_arc(
-                    arc,
-                    sw_if_index,
-                    &mut buffer,
-                    NodeNext::slot(Ip4PuntNext::Punt),
-                )
-            });
-        }
+    fn process(
+        runtime: &mut DataPlaneMain,
+        node_runtime: &mut hammer_runtime::NodeRuntime,
+        frame: &mut Frame,
+    ) -> usize {
+        let process: NodeProcessFn = |runtime, node_runtime, frame| {
+            let processed_vectors = frame.len();
+            (|| {
+                {
+                    let net = NetMain::global().expect("IP node requires initialized NetMain");
+                    // SAFETY: startup installs this scalar before workers execute nodes.
+                    let arc = unsafe {
+                        *IP4_MAIN
+                            .get()
+                            .expect("IP main initialized")
+                            .punt_feature_arc_index
+                            .get()
+                    };
+                    hammer_runtime::process_frame!(runtime, node_runtime, frame, |index| {
+                        let buffer = runtime.buffer_mut(index);
+                        // SAFETY: IP ingress initializes the network overlay.
+                        let sw_if_index =
+                            hammer_core::buffer_opaque!(buffer => NetworkOpaque).sw_if_index[0];
+                        net.interface_main().start_feature_arc(
+                            arc,
+                            sw_if_index,
+                            buffer,
+                            NodeNext::slot(Ip4PuntNext::Punt),
+                        )
+                    });
+                }
+            })();
+            processed_vectors
+        };
+        process(runtime, node_runtime, frame)
     }
 }
 
@@ -85,34 +92,41 @@ pub enum Ip4DropNext {
 pub struct Ip4DropNode;
 
 impl Node for Ip4DropNode {
-    fn process(&mut self, runtime: &DataPlaneMain, frame: &mut BufferFrame) {
-        (self.node_process())(runtime, Default::default(), frame)
-    }
-    fn node_process(&self) -> NodeProcessFn {
-        |runtime, _, frame| {
-            let net = NetMain::global().expect("IP node requires initialized NetMain");
-            // SAFETY: startup installs this scalar before workers execute nodes.
-            let arc = unsafe {
-                *IP4_MAIN
-                    .get()
-                    .expect("IP main initialized")
-                    .drop_feature_arc_index
-                    .get()
-            };
-            hammer_runtime::process_frame!(runtime, frame, |index| {
-                let mut buffer = runtime.get_buffer_mut(index).expect("frame owns buffer");
-                // SAFETY: IP ingress initializes the network overlay.
-                let sw_if_index =
-                    unsafe { &*(buffer.opaque() as *const _ as *const NetworkOpaque) }.sw_if_index
-                        [0];
-                net.interface_main().start_feature_arc(
-                    arc,
-                    sw_if_index,
-                    &mut buffer,
-                    NodeNext::slot(Ip4DropNext::Drop),
-                )
-            });
-        }
+    fn process(
+        runtime: &mut DataPlaneMain,
+        node_runtime: &mut hammer_runtime::NodeRuntime,
+        frame: &mut Frame,
+    ) -> usize {
+        let process: NodeProcessFn = |runtime, node_runtime, frame| {
+            let processed_vectors = frame.len();
+            (|| {
+                {
+                    let net = NetMain::global().expect("IP node requires initialized NetMain");
+                    // SAFETY: startup installs this scalar before workers execute nodes.
+                    let arc = unsafe {
+                        *IP4_MAIN
+                            .get()
+                            .expect("IP main initialized")
+                            .drop_feature_arc_index
+                            .get()
+                    };
+                    hammer_runtime::process_frame!(runtime, node_runtime, frame, |index| {
+                        let buffer = runtime.buffer_mut(index);
+                        // SAFETY: IP ingress initializes the network overlay.
+                        let sw_if_index =
+                            hammer_core::buffer_opaque!(buffer => NetworkOpaque).sw_if_index[0];
+                        net.interface_main().start_feature_arc(
+                            arc,
+                            sw_if_index,
+                            buffer,
+                            NodeNext::slot(Ip4DropNext::Drop),
+                        )
+                    });
+                }
+            })();
+            processed_vectors
+        };
+        process(runtime, node_runtime, frame)
     }
 }
 
@@ -152,34 +166,41 @@ fn register_ip6_punt(runtime: &DataPlaneMain) -> RuntimeResult<NodeId> {
 }
 
 impl Node for Ip6PuntNode {
-    fn process(&mut self, runtime: &DataPlaneMain, frame: &mut BufferFrame) {
-        (self.node_process())(runtime, Default::default(), frame)
-    }
-    fn node_process(&self) -> NodeProcessFn {
-        |runtime, _, frame| {
-            let net = NetMain::global().expect("IP node requires initialized NetMain");
-            // SAFETY: startup installs this scalar before workers execute nodes.
-            let arc = unsafe {
-                *IP6_MAIN
-                    .get()
-                    .expect("IP main initialized")
-                    .punt_feature_arc_index
-                    .get()
-            };
-            hammer_runtime::process_frame!(runtime, frame, |index| {
-                let mut buffer = runtime.get_buffer_mut(index).expect("frame owns buffer");
-                // SAFETY: IP ingress initializes the network overlay.
-                let sw_if_index =
-                    unsafe { &*(buffer.opaque() as *const _ as *const NetworkOpaque) }.sw_if_index
-                        [0];
-                net.interface_main().start_feature_arc(
-                    arc,
-                    sw_if_index,
-                    &mut buffer,
-                    NodeNext::slot(Ip6PuntNext::Punt),
-                )
-            });
-        }
+    fn process(
+        runtime: &mut DataPlaneMain,
+        node_runtime: &mut hammer_runtime::NodeRuntime,
+        frame: &mut Frame,
+    ) -> usize {
+        let process: NodeProcessFn = |runtime, node_runtime, frame| {
+            let processed_vectors = frame.len();
+            (|| {
+                {
+                    let net = NetMain::global().expect("IP node requires initialized NetMain");
+                    // SAFETY: startup installs this scalar before workers execute nodes.
+                    let arc = unsafe {
+                        *IP6_MAIN
+                            .get()
+                            .expect("IP main initialized")
+                            .punt_feature_arc_index
+                            .get()
+                    };
+                    hammer_runtime::process_frame!(runtime, node_runtime, frame, |index| {
+                        let buffer = runtime.buffer_mut(index);
+                        // SAFETY: IP ingress initializes the network overlay.
+                        let sw_if_index =
+                            hammer_core::buffer_opaque!(buffer => NetworkOpaque).sw_if_index[0];
+                        net.interface_main().start_feature_arc(
+                            arc,
+                            sw_if_index,
+                            buffer,
+                            NodeNext::slot(Ip6PuntNext::Punt),
+                        )
+                    });
+                }
+            })();
+            processed_vectors
+        };
+        process(runtime, node_runtime, frame)
     }
 }
 
@@ -194,34 +215,41 @@ pub enum Ip6DropNext {
 pub struct Ip6DropNode;
 
 impl Node for Ip6DropNode {
-    fn process(&mut self, runtime: &DataPlaneMain, frame: &mut BufferFrame) {
-        (self.node_process())(runtime, Default::default(), frame)
-    }
-    fn node_process(&self) -> NodeProcessFn {
-        |runtime, _, frame| {
-            let net = NetMain::global().expect("IP node requires initialized NetMain");
-            // SAFETY: startup installs this scalar before workers execute nodes.
-            let arc = unsafe {
-                *IP6_MAIN
-                    .get()
-                    .expect("IP main initialized")
-                    .drop_feature_arc_index
-                    .get()
-            };
-            hammer_runtime::process_frame!(runtime, frame, |index| {
-                let mut buffer = runtime.get_buffer_mut(index).expect("frame owns buffer");
-                // SAFETY: IP ingress initializes the network overlay.
-                let sw_if_index =
-                    unsafe { &*(buffer.opaque() as *const _ as *const NetworkOpaque) }.sw_if_index
-                        [0];
-                net.interface_main().start_feature_arc(
-                    arc,
-                    sw_if_index,
-                    &mut buffer,
-                    NodeNext::slot(Ip6DropNext::Drop),
-                )
-            });
-        }
+    fn process(
+        runtime: &mut DataPlaneMain,
+        node_runtime: &mut hammer_runtime::NodeRuntime,
+        frame: &mut Frame,
+    ) -> usize {
+        let process: NodeProcessFn = |runtime, node_runtime, frame| {
+            let processed_vectors = frame.len();
+            (|| {
+                {
+                    let net = NetMain::global().expect("IP node requires initialized NetMain");
+                    // SAFETY: startup installs this scalar before workers execute nodes.
+                    let arc = unsafe {
+                        *IP6_MAIN
+                            .get()
+                            .expect("IP main initialized")
+                            .drop_feature_arc_index
+                            .get()
+                    };
+                    hammer_runtime::process_frame!(runtime, node_runtime, frame, |index| {
+                        let buffer = runtime.buffer_mut(index);
+                        // SAFETY: IP ingress initializes the network overlay.
+                        let sw_if_index =
+                            hammer_core::buffer_opaque!(buffer => NetworkOpaque).sw_if_index[0];
+                        net.interface_main().start_feature_arc(
+                            arc,
+                            sw_if_index,
+                            buffer,
+                            NodeNext::slot(Ip6DropNext::Drop),
+                        )
+                    });
+                }
+            })();
+            processed_vectors
+        };
+        process(runtime, node_runtime, frame)
     }
 }
 

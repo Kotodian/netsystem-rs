@@ -387,6 +387,17 @@ mod tests {
     #[test]
     fn route_sources_retain_forwarding_until_withdrawal() -> Result<(), DpoError> {
         hammer_runtime::config::Memory::default().ensure_main_heap()?;
+        crate::BUFFER_MAIN_INIT.call_once(|| {
+            hammer_infra::main_heap::init_default().unwrap();
+            hammer_core::buffer::BufferMain::new(
+                64,
+                1024,
+                &[0, 1],
+                2,
+                hammer_infra::PageSize::Default,
+            )
+            .unwrap();
+        });
         let mut main = GlobalMain::new(
             DataPlaneMain::new(DataPlaneBufferConfig::default()),
             RuntimeRegistry::new(),

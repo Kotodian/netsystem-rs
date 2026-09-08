@@ -304,7 +304,7 @@ impl SessionMain {
         let result = GlobalMain::with_current(|engine| {
             schedule_worker_task(engine, worker, move || {
                 hammer_runtime::with_data_plane_main(|runtime| {
-                    main.with_worker_mut(runtime, |sessions| {
+                    main.with_worker_mut(runtime.thread_index(), |sessions| {
                         sessions.accept_reply(application, request.session, request.result)
                     })
                 })

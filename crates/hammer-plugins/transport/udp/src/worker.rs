@@ -4,13 +4,13 @@ use std::net::SocketAddr;
 use std::ops::Deref;
 use std::sync::{Arc, OnceLock, mpsc};
 
-use hammer_core::data_plane::{BufferFrame, Index as BufferIndex, NodeId, NodeState};
+use hammer_core::data_plane::{Frame, NodeId, NodeState};
 use hammer_infra::align::CacheLineAlignMark;
 use hammer_infra::pool::Pool;
 use hammer_infra::thread_owned::{ThreadOwned, ThreadOwnedError};
 use hammer_runtime::app::{SessionDgramHeader, SessionHandle};
 use hammer_runtime::{
-    DataPlaneMain, DataWorkerId, GlobalMain, NodeRuntimeData, RuntimeError, RuntimeResult,
+    DataPlaneMain, DataWorkerId, GlobalMain, NodeRuntime, RuntimeError, RuntimeResult,
     SessionConnectEndpoint, SessionListenEndpoint, with_data_plane_main,
 };
 use hammer_service::session::SessionQueueNext;
@@ -167,11 +167,10 @@ impl UdpMain {
 
     fn with_worker<R>(
         &self,
-        runtime: &DataPlaneMain,
+        thread_index: u32,
         operation: impl FnOnce(&mut SessionWorker, &mut UdpWorker) -> RuntimeResult<R>,
     ) -> RuntimeResult<R> {
-        session_main().with_worker_mut(runtime, |sessions| {
-            let thread_index = runtime.thread_index();
+        session_main().with_worker_mut(thread_index, |sessions| {
             let worker = DataWorkerId::try_from(thread_index)
                 .map_err(|_| UdpTransportError::WorkerUnavailable { thread_index })?;
             let mut slot = self.worker(worker)?.borrow_mut().map_err(|source| {
@@ -187,7 +186,7 @@ impl UdpMain {
     pub(crate) fn deliver_datagram(
         &self,
         runtime: &DataPlaneMain,
-        index: BufferIndex,
+        index: u32,
         local: SocketAddr,
         remote: SocketAddr,
         payload_offset: usize,
@@ -196,7 +195,7 @@ impl UdpMain {
         return_node: NodeId,
     ) -> RuntimeResult<UdpDelivery> {
         let listener = find_udp_listener(self.listeners.get(), local);
-        self.with_worker(runtime, |sessions, udp| {
+        self.with_worker(runtime.thread_index(), |sessions, udp| {
             udp.deliver_datagram(
                 sessions,
                 runtime,
@@ -383,7 +382,7 @@ impl UdpWorker {
         &mut self,
         sessions: &mut SessionWorker,
         runtime: &DataPlaneMain,
-        index: BufferIndex,
+        index: u32,
         local: SocketAddr,
         remote: SocketAddr,
         payload_offset: usize,
@@ -406,7 +405,7 @@ impl UdpWorker {
             let header = SessionDgramHeader::new(local, remote, payload_len)
                 .ok_or(UdpTransportError::InvalidConnection)?;
             let written = sessions.enqueue_datagram_rx_from_buffer_at(
-                runtime.buffers(),
+                runtime,
                 session_id,
                 index,
                 payload_offset,
@@ -451,7 +450,7 @@ impl UdpWorker {
         let header = SessionDgramHeader::new(local, remote, payload_len)
             .ok_or(UdpTransportError::InvalidConnection)?;
         let written = sessions.enqueue_datagram_rx_from_buffer_at(
-            runtime.buffers(),
+            runtime,
             session_id,
             index,
             payload_offset,
@@ -549,7 +548,7 @@ impl UdpWorker {
 
     fn handoff_migration_datagram(
         &self,
-        runtime: &DataPlaneMain,
+        runtime: &mut DataPlaneMain,
         reply: SessionSwitchPoolReply,
     ) -> Result<(), SessionSwitchPoolReply> {
         let worker = if reply.status == SessionSwitchPoolStatus::Rejected {
@@ -564,20 +563,18 @@ impl UdpWorker {
 
     fn handoff_migration_datagram_or_drop(
         &self,
-        runtime: &DataPlaneMain,
+        runtime: &mut DataPlaneMain,
         reply: SessionSwitchPoolReply,
     ) {
         if let Err(reply) = self.handoff_migration_datagram(runtime, reply) {
-            runtime
-                .buffers()
-                .drop_index_owned_with_trace(reply.dgram.index, |_| {});
+            runtime.buffer_free_one(reply.dgram.index);
         }
     }
 
     fn process_migration_reply(
         &mut self,
         sessions: &mut SessionWorker,
-        runtime: &DataPlaneMain,
+        runtime: &mut DataPlaneMain,
         mut reply: SessionSwitchPoolReply,
     ) -> Result<(), SessionSwitchPoolReply> {
         if reply.status == SessionSwitchPoolStatus::Rejected {
@@ -745,54 +742,6 @@ impl UdpWorker {
         }
     }
 
-    fn drop_migration_datagram(runtime: &DataPlaneMain, dgram: SessionDgramArgs) {
-        runtime
-            .buffers()
-            .drop_index_owned_with_trace(dgram.index, |_| {});
-    }
-
-    fn drain_migration_shutdown_requests(
-        &mut self,
-        sessions: &SessionWorker,
-        runtime: &DataPlaneMain,
-    ) {
-        while let Some(args) = sessions.pop_session_migrate_request() {
-            let _ = sessions.cancel_thread_migration(args.old_sh, args.tuple);
-            Self::drop_migration_datagram(runtime, args.dgram);
-        }
-    }
-
-    fn drain_migration_shutdown_replies(
-        &mut self,
-        sessions: &SessionWorker,
-        runtime: &DataPlaneMain,
-    ) {
-        while let Some(reply) = self.session_switch_pool_replies.pop_front() {
-            let _ = sessions.cancel_thread_migration(reply.old_sh, reply.tuple);
-            Self::drop_migration_datagram(runtime, reply.dgram);
-        }
-        while let Some(reply) = sessions.pop_session_switch_pool_reply() {
-            let _ = sessions.cancel_thread_migration(reply.old_sh, reply.tuple);
-            Self::drop_migration_datagram(runtime, reply.dgram);
-        }
-    }
-
-    fn drain_migration_shutdown(&mut self, sessions: &mut SessionWorker, runtime: &DataPlaneMain) {
-        sessions.wait_session_migration_shutdown_phase();
-        self.drain_migration_shutdown_requests(sessions, runtime);
-        self.drain_migration_shutdown_replies(sessions, runtime);
-        self.drain_migration_completions(sessions, runtime);
-
-        sessions.wait_session_migration_shutdown_phase();
-        self.drain_migration_closed(sessions, runtime);
-
-        sessions.wait_session_migration_shutdown_phase();
-        self.drain_migration_closed(sessions, runtime);
-
-        sessions.wait_session_migration_shutdown_phase();
-        self.drain_migration_closed(sessions, runtime);
-    }
-
     fn drain_migration_completions(
         &mut self,
         sessions: &mut SessionWorker,
@@ -814,7 +763,11 @@ impl UdpWorker {
         }
     }
 
-    fn drain_migration_replies(&mut self, sessions: &mut SessionWorker, runtime: &DataPlaneMain) {
+    fn drain_migration_replies(
+        &mut self,
+        sessions: &mut SessionWorker,
+        runtime: &mut DataPlaneMain,
+    ) {
         while let Some(reply) = self.session_switch_pool_replies.pop_front() {
             if let Err(reply) = sessions.push_session_switch_pool_reply(runtime, reply) {
                 self.session_switch_pool_replies.push_front(reply);
@@ -950,7 +903,7 @@ pub(crate) fn connect(endpoint: SessionConnectEndpoint) -> RuntimeResult<()> {
     GlobalMain::with_current(|engine| {
         engine.schedule_on_worker(worker, move || {
             let result = with_data_plane_main(|runtime| {
-                main.with_worker(runtime, |sessions, udp| {
+                main.with_worker(runtime.thread_index(), |sessions, udp| {
                     udp.active_connect(sessions, endpoint.connection, local, endpoint.remote)
                 })
             });
@@ -1047,51 +1000,39 @@ fn init_udp_worker(engine: &mut DataPlaneMain) -> RuntimeResult<()> {
         .get()
         .ok_or(RuntimeError::PluginStateNotInitialized { plugin: "udp" })?;
     bind_worker_graph(engine)?;
-    engine.register_worker_exit_function(udp_worker_exit);
     Ok(())
 }
 
-fn udp_worker_exit(engine: &mut DataPlaneMain) -> RuntimeResult<()> {
-    let main = UDP_MAIN
-        .get()
-        .ok_or(RuntimeError::PluginStateNotInitialized { plugin: "udp" })?;
-    let runtime = engine.clone();
-    main.with_worker(&runtime, |sessions, udp| {
-        udp.drain_migration_shutdown(sessions, &runtime);
-        Ok(())
-    })
-}
-
 fn udp_session_queue_update_time(
-    runtime: &DataPlaneMain,
+    runtime: &mut DataPlaneMain,
     _: &mut SessionWorker,
-    _: NodeRuntimeData,
+    _: NodeRuntime,
     output_next: SessionQueueNext,
     now: std::time::Instant,
-    frame: &mut BufferFrame,
+    frame: &mut Frame,
     output: &mut SessionQueueOutput,
 ) -> RuntimeResult<()> {
     let main = UDP_MAIN
         .get()
         .ok_or(RuntimeError::PluginStateNotInitialized { plugin: "udp" })?;
-    main.with_worker(runtime, |sessions, udp| {
+    main.with_worker(runtime.thread_index(), |sessions, udp| {
         udp.update_time(sessions, runtime, output_next, frame, output, now)
     })
 }
 
 fn udp_session_queue_dispatch(
-    runtime: &DataPlaneMain,
+    runtime: &mut DataPlaneMain,
     _: &mut SessionWorker,
-    _: NodeRuntimeData,
+    _: NodeRuntime,
     output_next: SessionQueueNext,
     now: std::time::Instant,
-    frame: &mut BufferFrame,
+    frame: &mut Frame,
     output: &mut SessionQueueOutput,
 ) -> RuntimeResult<()> {
     let main = UDP_MAIN
         .get()
         .ok_or(RuntimeError::PluginStateNotInitialized { plugin: "udp" })?;
-    main.with_worker(runtime, |sessions, udp| {
+    main.with_worker(runtime.thread_index(), |sessions, udp| {
         dispatch_session_queue_events(runtime, sessions, udp, output_next, frame, output, now)
             .map(|_| ())
     })
@@ -1108,9 +1049,9 @@ impl SessionTransport for UdpWorker {
     fn update_time(
         &mut self,
         sessions: &mut SessionWorker,
-        runtime: &DataPlaneMain,
+        runtime: &mut DataPlaneMain,
         _: SessionQueueNext,
-        _: &mut BufferFrame,
+        _: &mut Frame,
         _: &mut SessionQueueOutput,
         _: std::time::Instant,
     ) -> RuntimeResult<()> {
@@ -1125,9 +1066,9 @@ impl SessionTransport for UdpWorker {
         &mut self,
         sessions: &mut SessionWorker,
         index: u32,
-        _: &DataPlaneMain,
+        _: &mut DataPlaneMain,
         _: SessionQueueNext,
-        _: &mut BufferFrame,
+        _: &mut Frame,
         _: &mut SessionQueueOutput,
         _: std::time::Instant,
     ) -> RuntimeResult<()> {
@@ -1156,9 +1097,9 @@ impl TransportInternalTransport for UdpWorker {
         sessions: &mut SessionWorker,
         session_id: u32,
         index: u32,
-        runtime: &DataPlaneMain,
+        runtime: &mut DataPlaneMain,
         output_next: SessionQueueNext,
-        frame: &mut BufferFrame,
+        frame: &mut Frame,
         output: &mut SessionQueueOutput,
         _: std::time::Instant,
     ) -> RuntimeResult<()> {
@@ -1178,33 +1119,35 @@ impl TransportInternalTransport for UdpWorker {
                 (connection.local(), connection.remote())
             };
 
-            let buffer = runtime.buffers().alloc_index()?;
+            let mut buffer = 0;
+            if runtime.buffer_alloc(core::slice::from_mut(&mut buffer)) != 1 {
+                return Err(hammer_core::error::DataPlaneError::from(
+                    hammer_core::error::BufferInvariant::PoolExhausted,
+                )
+                .into());
+            }
             if let Err(error) =
-                sessions.copy_tx_datagram_to_buffer(runtime.buffers(), session_id, header, buffer)
+                sessions.copy_tx_datagram_to_buffer(runtime, session_id, header, buffer)
             {
-                runtime
-                    .buffers()
-                    .drop_index_owned_with_trace(buffer, |_| {});
+                runtime.buffer_free_one(buffer);
                 return Err(error);
             }
             {
-                let mut output_buffer = runtime.buffers().get_buffer_mut(buffer)?;
-                let header_slice = output_buffer.prepend_mut(UDP_HEADER_LEN)?;
+                let output_buffer = runtime.buffer_mut(buffer);
+                let header_slice = output_buffer.push_uninit(UDP_HEADER_LEN as u8);
                 if write_udp_header(header_slice, local.port(), remote.port(), payload_len)
                     .is_none()
                 {
                     return Err(UdpTransportError::OutputHeader.into());
                 }
                 crate::output::write_udp_egress_endpoints(
-                    output_buffer.opaque2_mut(),
+                    hammer_core::buffer_opaque!(mut output_buffer => crate::output::UdpEgressOpaque),
                     local.ip(),
                     remote.ip(),
                 );
             }
             if !output.try_enqueue_io(frame, output_next, buffer)? {
-                runtime
-                    .buffers()
-                    .drop_index_owned_with_trace(buffer, |_| {});
+                runtime.buffer_free_one(buffer);
                 sessions.mark_ready(session_id);
                 break;
             }

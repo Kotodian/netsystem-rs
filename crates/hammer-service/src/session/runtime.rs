@@ -1,18 +1,15 @@
 use std::cell::UnsafeCell;
 use std::collections::VecDeque;
-use std::hint::spin_loop;
 use std::net::SocketAddr;
 use std::num::NonZeroU32;
 use std::ops::Deref;
 use std::os::fd::BorrowedFd;
-use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
 
 use crossbeam_queue::ArrayQueue;
-use hammer_core::data_plane::{
-    BufferFrame, DataPlaneBuffers, Index as BufferIndex, NodeId, NodeState,
-};
+use hammer_core::data_plane::{Frame, NodeId, NodeState};
 use hammer_infra::align::{CacheLineAlignMark, align_up};
 use hammer_infra::fifo::Fifo;
 use hammer_infra::linked_list::LinkedList;
@@ -31,8 +28,7 @@ use hammer_runtime::{
     AttachError, RuntimeError, RuntimeResult, SessionConnectEndpoint, SessionListenEndpoint,
 };
 use hammer_runtime::{
-    DataPlaneMain, DataWorkerId, Deadline, File, FileFunctions, GlobalMain, NodeRuntime,
-    NodeRuntimeData,
+    DataPlaneMain, DataWorkerId, Deadline, File, FileFunctions, GlobalMain, NodeMain, NodeRuntime,
 };
 
 use crate::session::app::AppWorkerError;
@@ -131,7 +127,7 @@ const DEFAULT_SESSION_MIGRATE_QUEUE_CAPACITY: usize = 1024;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SessionDgramArgs {
-    pub index: BufferIndex,
+    pub index: u32,
     pub payload_offset: usize,
     pub payload_len: usize,
     pub urgent: bool,
@@ -206,8 +202,6 @@ struct SessionMigrateQueues {
     session_switch_pool_completions: Box<[ArrayQueue<SessionSwitchPoolCompletion>]>,
     session_switch_pool_closed: Box<[ArrayQueue<SessionSwitchPoolClosed>]>,
     session_migration_shutdown: AtomicBool,
-    session_migration_shutdown_workers: AtomicU32,
-    session_migration_shutdown_phase: AtomicU32,
 }
 
 impl SessionMigrateQueues {
@@ -226,8 +220,6 @@ impl SessionMigrateQueues {
                 .map(|_| ArrayQueue::new(DEFAULT_SESSION_MIGRATE_QUEUE_CAPACITY))
                 .collect(),
             session_migration_shutdown: AtomicBool::new(false),
-            session_migration_shutdown_workers: AtomicU32::new(0),
-            session_migration_shutdown_phase: AtomicU32::new(0),
         }
     }
 
@@ -650,35 +642,6 @@ impl SessionMain {
             .load(Ordering::Acquire)
     }
 
-    pub fn wait_session_migration_shutdown_phase(&self) {
-        let worker_count = self.workers.len() as u32;
-        if worker_count == 0 {
-            return;
-        }
-        let queues = session_migrate_queues(self.workers.len());
-        let phase = queues
-            .session_migration_shutdown_phase
-            .load(Ordering::Acquire);
-        let expected = phase.saturating_add(1).saturating_mul(worker_count);
-        let arrived = queues
-            .session_migration_shutdown_workers
-            .fetch_add(1, Ordering::AcqRel)
-            .saturating_add(1);
-        if arrived == expected {
-            queues
-                .session_migration_shutdown_phase
-                .store(phase.saturating_add(1), Ordering::Release);
-            return;
-        }
-        while queues
-            .session_migration_shutdown_phase
-            .load(Ordering::Acquire)
-            <= phase
-        {
-            spin_loop();
-        }
-    }
-
     pub(crate) fn add_connection(
         &self,
         local: std::net::SocketAddr,
@@ -1096,10 +1059,9 @@ impl SessionMain {
 
     pub fn with_worker_mut<R>(
         &self,
-        runtime: &DataPlaneMain,
+        thread_index: u32,
         operation: impl FnOnce(&mut SessionWorker) -> RuntimeResult<R>,
     ) -> RuntimeResult<R> {
-        let thread_index = runtime.thread_index();
         let worker = DataWorkerId::try_from(thread_index)
             .map_err(|_| SessionQueueError::WorkerUnavailable { thread_index })?;
         let mut slot = self.worker(worker)?.borrow_mut().map_err(|source| {
@@ -1115,7 +1077,7 @@ impl SessionMain {
         &self,
         runtime: &DataPlaneMain,
     ) -> RuntimeResult<bool> {
-        self.with_worker_mut(runtime, |sessions| {
+        self.with_worker_mut(runtime.thread_index(), |sessions| {
             Ok(sessions.state == SessionWorkerState::Interrupt)
         })
     }
@@ -1276,7 +1238,7 @@ pub fn install_session_worker(
         .get()
         .expect("SessionMain is initialized before worker installation");
     let session_queue_data =
-        hammer_runtime::NodeRuntimeData::from_usize(main as *const SessionMain as usize)?;
+        hammer_runtime::NodeRuntime::from_usize(main as *const SessionMain as usize)?;
     let input_data = AppSessionInputNode::worker_runtime_data(session_queue_data, session_queue);
     let worker_id = worker.worker();
     let slot = main.worker(worker_id)?;
@@ -1338,10 +1300,10 @@ fn cleanup_session_worker_install(worker: &mut SessionWorker, engine: &mut DataP
 fn rollback_session_worker_graph(
     engine: &mut DataPlaneMain,
     app_session_input: hammer_core::data_plane::NodeId,
-    previous_app_session_input_data: NodeRuntimeData,
+    previous_app_session_input_data: NodeRuntime,
     previous_app_session_input_state: NodeState,
     session_queue: NodeId,
-    previous_session_queue_data: NodeRuntimeData,
+    previous_session_queue_data: NodeRuntime,
     previous_session_queue_state: NodeState,
 ) {
     if let Err(error) = engine
@@ -1701,12 +1663,12 @@ impl SessionWorker {
     /// publish a partial datagram.
     pub fn enqueue_datagram_rx_from_buffer(
         &self,
-        buffers: &DataPlaneBuffers,
+        runtime: &DataPlaneMain,
         session_id: u32,
-        index: BufferIndex,
+        index: u32,
         header: SessionDgramHeader,
     ) -> RuntimeResult<usize> {
-        self.enqueue_datagram_rx_from_buffer_at(buffers, session_id, index, 0, header)
+        self.enqueue_datagram_rx_from_buffer_at(runtime, session_id, index, 0, header)
     }
 
     /// Variant of [`Self::enqueue_datagram_rx_from_buffer`] for a packet
@@ -1714,9 +1676,9 @@ impl SessionWorker {
     /// Only `payload_offset..payload_offset + header.data_length` is copied.
     pub fn enqueue_datagram_rx_from_buffer_at(
         &self,
-        buffers: &DataPlaneBuffers,
+        runtime: &DataPlaneMain,
         session_id: u32,
-        index: BufferIndex,
+        index: u32,
         payload_offset: usize,
         header: SessionDgramHeader,
     ) -> RuntimeResult<usize> {
@@ -1733,9 +1695,9 @@ impl SessionWorker {
             },
         )?;
         let mut source_len = 0usize;
-        for buffer in buffers.chain(index) {
+        for buffer in runtime.chain(index) {
             source_len = source_len
-                .checked_add(buffer?.current_len())
+                .checked_add(buffer.current_len())
                 .ok_or(SessionError::RxLengthOverflow { session_id })?;
         }
         if payload_end > source_len {
@@ -1783,8 +1745,7 @@ impl SessionWorker {
         }
         let mut skip = payload_offset;
         let mut remaining = payload_len;
-        for buffer in buffers.chain(index) {
-            let buffer = buffer?;
+        for buffer in runtime.chain(index) {
             if skip >= buffer.current_len() {
                 skip -= buffer.current_len();
                 continue;
@@ -1846,10 +1807,10 @@ impl SessionWorker {
     /// is called after output header construction succeeds.
     pub fn copy_tx_datagram_to_buffer(
         &self,
-        buffers: &DataPlaneBuffers,
+        runtime: &mut DataPlaneMain,
         session_id: u32,
         header: SessionDgramHeader,
-        index: BufferIndex,
+        index: u32,
     ) -> RuntimeResult<usize> {
         let data_offset = header.data_offset() as usize;
         let data_length = header.data_length() as usize;
@@ -1869,7 +1830,7 @@ impl SessionWorker {
                 header_len: header.data_length(),
             },
         )?;
-        self.copy_tx_to_buffer(buffers, session_id, fifo_offset, payload_len, index)?;
+        self.copy_tx_to_buffer(runtime, session_id, fifo_offset, payload_len, index)?;
         Ok(payload_len)
     }
 
@@ -2931,37 +2892,6 @@ impl SessionWorker {
             .pop_session_switch_pool_closed(self.worker)
     }
 
-    pub fn wait_session_migration_shutdown_phase(&self) {
-        let worker_count = self.worker_count as u32;
-        if worker_count == 0 {
-            return;
-        }
-        let phase = self
-            .migration_queues
-            .session_migration_shutdown_phase
-            .load(Ordering::Acquire);
-        let expected = phase.saturating_add(1).saturating_mul(worker_count);
-        let arrived = self
-            .migration_queues
-            .session_migration_shutdown_workers
-            .fetch_add(1, Ordering::AcqRel)
-            .saturating_add(1);
-        if arrived == expected {
-            self.migration_queues
-                .session_migration_shutdown_phase
-                .store(phase.saturating_add(1), Ordering::Release);
-            return;
-        }
-        while self
-            .migration_queues
-            .session_migration_shutdown_phase
-            .load(Ordering::Acquire)
-            <= phase
-        {
-            spin_loop();
-        }
-    }
-
     pub fn insert_session_endpoint(
         &self,
         session_id: u32,
@@ -3768,13 +3698,13 @@ impl SessionWorker {
 
     pub fn enqueue_rx(
         &mut self,
-        buffers: &DataPlaneBuffers,
+        runtime: &DataPlaneMain,
         session_id: u32,
-        index: BufferIndex,
+        index: u32,
         offset: u32,
     ) -> RuntimeResult<RxDelivery> {
         if offset == 0 {
-            let (accepted, promoted) = self.copy_rx_from_buffer(session_id, buffers, index)?;
+            let (accepted, promoted) = self.copy_rx_from_buffer(session_id, runtime, index)?;
             let rx_available = self.rx_available_u32(session_id);
             let delivery = match NonZeroU32::new(accepted) {
                 Some(accepted) => RxDelivery::InOrder {
@@ -3790,7 +3720,7 @@ impl SessionWorker {
             return Ok(delivery);
         }
         let (accepted, newest) =
-            self.copy_rx_from_buffer_ooo(session_id, buffers, index, offset)?;
+            self.copy_rx_from_buffer_ooo(session_id, runtime, index, offset)?;
         let rx_available = self.rx_available_u32(session_id);
         let delivery = match NonZeroU32::new(accepted) {
             Some(accepted) => {
@@ -3995,11 +3925,11 @@ impl SessionWorker {
 
     pub fn copy_tx_to_buffer(
         &self,
-        buffers: &DataPlaneBuffers,
+        runtime: &mut DataPlaneMain,
         session_id: u32,
         offset: usize,
         len: usize,
-        index: BufferIndex,
+        index: u32,
     ) -> RuntimeResult<()> {
         let entry = self
             .entries
@@ -4008,11 +3938,19 @@ impl SessionWorker {
         let written = entry
             .tx_fifo
             .peek_segments(offset, len, |first, second| {
-                if !first.is_empty() {
-                    buffers.append(index, first)?;
+                let mut last = index;
+                while let Some(next) = runtime.buffer(last).next_buffer_slot() {
+                    last = next;
                 }
-                if !second.is_empty() {
-                    buffers.append(index, second)?;
+                for data in [first, second] {
+                    let copied =
+                        runtime.buffer_chain_append_data_with_alloc(index, &mut last, data);
+                    if copied != data.len() {
+                        return Err(hammer_core::error::DataPlaneError::from(
+                            hammer_core::error::BufferInvariant::PoolExhausted,
+                        )
+                        .into());
+                    }
                 }
                 Ok::<usize, RuntimeError>(first.len() + second.len())
             })
@@ -4049,8 +3987,8 @@ impl SessionWorker {
     fn copy_rx_from_buffer(
         &self,
         session_id: u32,
-        buffers: &DataPlaneBuffers,
-        index: BufferIndex,
+        runtime: &DataPlaneMain,
+        index: u32,
     ) -> RuntimeResult<(u32, u32)> {
         let Some(entry) = self.entries.get(session_id) else {
             return Ok((0, 0));
@@ -4058,8 +3996,7 @@ impl SessionWorker {
         let mut total = 0u32;
         let mut accepted = 0u32;
         let mut promoted = 0u32;
-        for buffer in buffers.chain(index) {
-            let buffer = buffer?;
+        for buffer in runtime.chain(index) {
             let chunk = buffer.current();
             let chunk_len = u32::try_from(chunk.len())
                 .map_err(|_| SessionError::RxLengthOverflow { session_id })?;
@@ -4089,8 +4026,8 @@ impl SessionWorker {
     fn copy_rx_from_buffer_ooo(
         &self,
         session_id: u32,
-        buffers: &DataPlaneBuffers,
-        index: BufferIndex,
+        runtime: &DataPlaneMain,
+        index: u32,
         offset: u32,
     ) -> RuntimeResult<(u32, Option<(u32, u32)>)> {
         let Some(entry) = self.entries.get(session_id) else {
@@ -4101,8 +4038,7 @@ impl SessionWorker {
         let mut delivered = 0u32;
         let mut newest_start = None;
         let mut newest_end = None;
-        for buffer in buffers.chain(index) {
-            let buffer = buffer?;
+        for buffer in runtime.chain(index) {
             let current = buffer.current();
             let chunk_offset =
                 offset
@@ -4220,7 +4156,7 @@ pub struct TransportSendParams {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct TxBatchBuffer {
-    pub index: BufferIndex,
+    pub index: u32,
     pub tx_offset: usize,
     pub payload_len: usize,
 }
@@ -4247,9 +4183,9 @@ pub trait SessionTransport: Sized {
         _: u32,
         _: usize,
         _: usize,
-        _: &DataPlaneMain,
+        _: &mut DataPlaneMain,
         _: SessionQueueNext,
-        _: &mut BufferFrame,
+        _: &mut Frame,
         _: &mut crate::session::node::SessionQueueOutput,
     ) -> RuntimeResult<bool> {
         Ok(false)
@@ -4258,9 +4194,9 @@ pub trait SessionTransport: Sized {
     fn update_time(
         &mut self,
         sessions: &mut SessionWorker,
-        runtime: &DataPlaneMain,
+        runtime: &mut DataPlaneMain,
         output_next: SessionQueueNext,
-        frame: &mut BufferFrame,
+        frame: &mut Frame,
         output: &mut crate::session::node::SessionQueueOutput,
         now: Instant,
     ) -> RuntimeResult<()>;
@@ -4269,9 +4205,9 @@ pub trait SessionTransport: Sized {
         &mut self,
         sessions: &mut SessionWorker,
         index: u32,
-        runtime: &DataPlaneMain,
+        runtime: &mut DataPlaneMain,
         output_next: SessionQueueNext,
-        frame: &mut BufferFrame,
+        frame: &mut Frame,
         output: &mut crate::session::node::SessionQueueOutput,
         now: Instant,
     ) -> RuntimeResult<()>;
@@ -4287,9 +4223,9 @@ pub trait SessionTransport: Sized {
         &mut self,
         sessions: &mut SessionWorker,
         index: u32,
-        runtime: &DataPlaneMain,
+        runtime: &mut DataPlaneMain,
         output_next: SessionQueueNext,
-        frame: &mut BufferFrame,
+        frame: &mut Frame,
         output: &mut crate::session::node::SessionQueueOutput,
         now: Instant,
     ) -> RuntimeResult<()> {
@@ -4302,9 +4238,9 @@ pub trait SessionPacketizedTransport: SessionTransport {
         &mut self,
         sessions: &mut SessionWorker,
         index: u32,
-        runtime: &DataPlaneMain,
+        runtime: &mut DataPlaneMain,
         output_next: SessionQueueNext,
-        frame: &mut BufferFrame,
+        frame: &mut Frame,
         output: &mut crate::session::node::SessionQueueOutput,
         now: Instant,
     ) -> RuntimeResult<()>;
@@ -4321,7 +4257,7 @@ pub trait SessionPacketizedTransport: SessionTransport {
         &mut self,
         index: u32,
         batch: &[TxBatchBuffer],
-        buffers: &DataPlaneBuffers,
+        runtime: &mut DataPlaneMain,
         now: Instant,
     ) -> RuntimeResult<()>;
 }
@@ -4332,9 +4268,9 @@ pub trait TransportInternalTransport: SessionTransport {
         sessions: &mut SessionWorker,
         session_id: u32,
         index: u32,
-        runtime: &DataPlaneMain,
+        runtime: &mut DataPlaneMain,
         output_next: SessionQueueNext,
-        frame: &mut BufferFrame,
+        frame: &mut Frame,
         output: &mut crate::session::node::SessionQueueOutput,
         now: Instant,
     ) -> RuntimeResult<()>;
@@ -4349,9 +4285,9 @@ where
         sessions: &mut SessionWorker,
         index: u32,
         session_id: u32,
-        runtime: &DataPlaneMain,
+        runtime: &mut DataPlaneMain,
         output_next: SessionQueueNext,
-        frame: &mut BufferFrame,
+        frame: &mut Frame,
         output: &mut crate::session::node::SessionQueueOutput,
         now: Instant,
     ) -> RuntimeResult<()>;
@@ -4369,9 +4305,9 @@ where
         sessions: &mut SessionWorker,
         index: u32,
         session_id: u32,
-        runtime: &DataPlaneMain,
+        runtime: &mut DataPlaneMain,
         output_next: SessionQueueNext,
-        frame: &mut BufferFrame,
+        frame: &mut Frame,
         output: &mut crate::session::node::SessionQueueOutput,
         now: Instant,
     ) -> RuntimeResult<()> {
@@ -4393,13 +4329,14 @@ where
         let io_budget = output
             .remaining_io_budget()
             .min(DEFAULT_TX_DISPATCH_BUDGET)
-            .min(frame.capacity().saturating_sub(frame.len()));
+            .min(hammer_core::graph::frame::FRAME_VECTOR_CAPACITY.saturating_sub(frame.len()));
         if batch_offset < total_len
             && remaining_space != 0
             && params.send_goal_size != 0
             && io_budget != 0
         {
             let mut batch = Vec::with_capacity(io_budget);
+            let mut indices = [0; DEFAULT_TX_DISPATCH_BUDGET];
             while batch.len() < io_budget && remaining_space != 0 {
                 let pending_len = total_len.saturating_sub(batch_offset);
                 if pending_len == 0 {
@@ -4409,14 +4346,27 @@ where
                 if payload_len == 0 {
                     break;
                 }
-                let buffer = runtime.buffers().alloc_index()?;
-                sessions.copy_tx_to_buffer(
-                    runtime.buffers(),
+                let mut buffer = 0;
+                if runtime.buffer_alloc(core::slice::from_mut(&mut buffer)) != 1 {
+                    runtime.buffer_free(&indices[..batch.len()]);
+                    return Err(hammer_core::error::DataPlaneError::from(
+                        hammer_core::error::BufferInvariant::PoolExhausted,
+                    )
+                    .into());
+                }
+                indices[batch.len()] = buffer;
+                if let Err(error) = sessions.copy_tx_to_buffer(
+                    runtime,
                     session_id,
                     batch_offset,
                     payload_len,
                     buffer,
-                )?;
+                ) {
+                    // Chain append retains its prefix on Pool pressure. None
+                    // of these heads has transferred to the output Frame yet.
+                    runtime.buffer_free(&indices[..batch.len() + 1]);
+                    return Err(error);
+                }
                 batch.push(TxBatchBuffer {
                     index: buffer,
                     tx_offset: batch_offset,
@@ -4425,11 +4375,22 @@ where
                 batch_offset += payload_len;
                 remaining_space -= payload_len;
             }
-            transport.tx_action(index, batch.as_slice(), runtime.buffers(), now)?;
-            for item in batch.as_slice() {
-                if !output.try_enqueue_io(frame, output_next, item.index)? {
-                    sessions.reschedule_old(session_id);
-                    break;
+            if let Err(error) = transport.tx_action(index, batch.as_slice(), runtime, now) {
+                runtime.buffer_free(&indices[..batch.len()]);
+                return Err(error);
+            }
+            for (position, item) in batch.iter().enumerate() {
+                match output.try_enqueue_io(frame, output_next, item.index) {
+                    Ok(true) => {}
+                    Ok(false) => {
+                        runtime.buffer_free(&indices[position..batch.len()]);
+                        sessions.reschedule_old(session_id);
+                        break;
+                    }
+                    Err(error) => {
+                        runtime.buffer_free(&indices[position..batch.len()]);
+                        return Err(error);
+                    }
                 }
             }
         }
@@ -4453,9 +4414,9 @@ where
         sessions: &mut SessionWorker,
         index: u32,
         session_id: u32,
-        runtime: &DataPlaneMain,
+        runtime: &mut DataPlaneMain,
         output_next: SessionQueueNext,
-        frame: &mut BufferFrame,
+        frame: &mut Frame,
         output: &mut crate::session::node::SessionQueueOutput,
         now: Instant,
     ) -> RuntimeResult<()> {
@@ -4473,7 +4434,8 @@ where
 }
 
 pub fn dispatch_session_queue_once<T>(
-    runtime: &DataPlaneMain,
+    runtime: &mut DataPlaneMain,
+    node_runtime: &mut hammer_runtime::NodeRuntime,
     owner: hammer_core::data_plane::NodeId,
     sessions: &mut SessionWorker,
     transport: &mut T,
@@ -4484,8 +4446,7 @@ where
 {
     let now = Instant::now();
     sessions.poll_app()?;
-    let mut staging =
-        BufferFrame::with_capacity(hammer_core::data_plane::DEFAULT_BUFFER_FRAME_CAPACITY);
+    let mut staging = Frame::<(), u32, ()>::new(0);
     let mut output = crate::session::node::SessionQueueOutput::default();
     let step = dispatch_session_queue_pending(
         runtime,
@@ -4496,16 +4457,18 @@ where
         &mut output,
         now,
     )?;
-    runtime.with_current_node(owner, || output.flush(runtime, &mut staging));
+    runtime.with_current_node(owner, |runtime| {
+        output.flush(runtime, node_runtime, &mut staging)
+    });
     Ok(step)
 }
 
 pub fn dispatch_session_queue_pending<T>(
-    runtime: &DataPlaneMain,
+    runtime: &mut DataPlaneMain,
     sessions: &mut SessionWorker,
     transport: &mut T,
     output_next: SessionQueueNext,
-    frame: &mut BufferFrame,
+    frame: &mut Frame,
     output: &mut crate::session::node::SessionQueueOutput,
     now: Instant,
 ) -> RuntimeResult<SessionQueueStep>
@@ -4528,11 +4491,11 @@ where
 }
 
 pub fn dispatch_session_queue_events<T>(
-    runtime: &DataPlaneMain,
+    runtime: &mut DataPlaneMain,
     sessions: &mut SessionWorker,
     transport: &mut T,
     output_next: SessionQueueNext,
-    frame: &mut BufferFrame,
+    frame: &mut Frame,
     output: &mut crate::session::node::SessionQueueOutput,
     now: Instant,
 ) -> RuntimeResult<SessionQueueStep>
@@ -4720,9 +4683,9 @@ where
 fn dispatch_io_event<T>(
     sessions: &mut SessionWorker,
     transport: &mut T,
-    runtime: &DataPlaneMain,
+    runtime: &mut DataPlaneMain,
     output_next: SessionQueueNext,
-    frame: &mut BufferFrame,
+    frame: &mut Frame,
     output: &mut crate::session::node::SessionQueueOutput,
     now: Instant,
     event: SessionEvt,
@@ -4821,7 +4784,7 @@ fn enqueue_app_event(
 }
 
 fn schedule_app_session_input(
-    graph: &hammer_runtime::NodeRuntime,
+    graph: &hammer_runtime::NodeMain,
     file: &mut File,
 ) -> RuntimeResult<()> {
     let node = hammer_core::data_plane::NodeId::new(file.private_data() as u32);
@@ -4829,10 +4792,7 @@ fn schedule_app_session_input(
     Ok(())
 }
 
-fn schedule_session_queue_deadline(
-    graph: &NodeRuntime,
-    deadline: &mut Deadline,
-) -> RuntimeResult<()> {
+fn schedule_session_queue_deadline(graph: &NodeMain, deadline: &mut Deadline) -> RuntimeResult<()> {
     let node = NodeId::new(
         u32::try_from(deadline.private_data())
             .expect("Session Queue node identity is stored as a u32"),
@@ -4841,10 +4801,7 @@ fn schedule_session_queue_deadline(
     Ok(())
 }
 
-fn schedule_app_mq_pending(
-    graph: &hammer_runtime::NodeRuntime,
-    file: &mut File,
-) -> RuntimeResult<()> {
+fn schedule_app_mq_pending(graph: &hammer_runtime::NodeMain, file: &mut File) -> RuntimeResult<()> {
     // SAFETY: the entry is boxed and owned by this worker's SessionWorker for
     // the File lifetime; FileMain deletes this File before the box is dropped.
     let entry = unsafe { &mut *(file.private_data() as usize as *mut AppRxMqEntry) };

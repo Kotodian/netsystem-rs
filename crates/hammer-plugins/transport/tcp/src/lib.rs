@@ -27,16 +27,15 @@ hammer_component_macros::declare_plugin!(
     process_nodes = [],
 );
 
-use std::mem::transmute;
 use std::net::SocketAddr;
 use std::ops::Deref;
 use std::sync::{Arc, OnceLock, mpsc};
 
-use hammer_core::data_plane::{BufferPacketCursor, NodeId, NodeState, SecondaryOpaque};
+use hammer_core::data_plane::{BufferPacketCursor, NodeId, NodeState};
 use hammer_runtime::app::SessionHandle;
 use hammer_runtime::{
-    DataPlaneMain, DataWorkerId, GlobalMain, Node, NodeProcessFn, NodeRuntimeData, RuntimeError,
-    RuntimeResult, SessionConnectEndpoint, SessionListenEndpoint, with_data_plane_main,
+    DataPlaneMain, DataWorkerId, GlobalMain, Node, NodeRuntime, RuntimeError, RuntimeResult,
+    SessionConnectEndpoint, SessionListenEndpoint, with_data_plane_main,
 };
 use thiserror::Error;
 
@@ -216,11 +215,6 @@ pub struct TcpMain {
     protocol: u8,
     control: TcpInputControlPlane,
     listeners: listener_control::TcpListenerControlHandle,
-    input_process: NodeProcessFn,
-    listen_process: NodeProcessFn,
-    established_process: NodeProcessFn,
-    rcv_process: NodeProcessFn,
-    syn_sent_process: NodeProcessFn,
     workers: Box<[TcpWorkerSlot]>,
 }
 
@@ -236,11 +230,6 @@ impl TcpMain {
             protocol,
             control,
             listeners,
-            input_process: input::tcp_input_process,
-            listen_process: listen::tcp_listen_process,
-            established_process: established::tcp_established_process,
-            rcv_process: rcv_process::tcp_rcv_process_process,
-            syn_sent_process: syn_sent::tcp_syn_sent_process,
             workers,
         }
     }
@@ -257,20 +246,19 @@ impl TcpMain {
 
     fn with_worker<R>(
         &self,
-        runtime: &DataPlaneMain,
+        thread_index: u32,
         operation: impl FnOnce(&mut SessionWorker, &mut TcpWorker) -> RuntimeResult<R>,
     ) -> RuntimeResult<R> {
-        session_main().with_worker_mut(runtime, |sessions| {
-            self.with_tcp_worker(runtime, |tcp| operation(sessions, tcp))
+        session_main().with_worker_mut(thread_index, |sessions| {
+            self.with_tcp_worker(thread_index, |tcp| operation(sessions, tcp))
         })
     }
 
     fn with_tcp_worker<R>(
         &self,
-        runtime: &DataPlaneMain,
+        thread_index: u32,
         operation: impl FnOnce(&mut TcpWorker) -> RuntimeResult<R>,
     ) -> RuntimeResult<R> {
-        let thread_index = runtime.thread_index();
         let worker = DataWorkerId::try_from(thread_index)
             .map_err(|_| TcpWorkerError::WorkerUnavailable { thread_index })?;
         let mut slot =
@@ -356,7 +344,7 @@ pub(crate) fn connect(endpoint: SessionConnectEndpoint) -> RuntimeResult<()> {
                 let main = TCP_MAIN
                     .get()
                     .ok_or(RuntimeError::PluginStateNotInitialized { plugin: "tcp" })?;
-                main.with_worker(runtime, |sessions, tcp| {
+                main.with_worker(runtime.thread_index(), |sessions, tcp| {
                     start_connect(sessions, tcp, endpoint.connection, local, endpoint.remote)
                 })
             });
@@ -479,7 +467,7 @@ pub fn register_tcp_input(runtime: &DataPlaneMain) -> RuntimeResult<NodeId> {
         node
     } else {
         runtime.nodes().try_register_internal_with_next_names(
-            main.control().node(main.input_process, None),
+            main.control().node(None),
             &TcpInputNext::NEXT_NAMES,
         )?
     };
@@ -540,14 +528,11 @@ fn bind_worker_graph(engine: &mut DataPlaneMain) -> RuntimeResult<()> {
     let main = TCP_MAIN
         .get()
         .ok_or(RuntimeError::PluginStateNotInitialized { plugin: "tcp" })?;
-    let input_data = main
-        .control()
-        .node(main.input_process, Some(worker))
-        .node_runtime_data()?;
-    let listen_data = TcpListenNode::new(main.listen_process).node_runtime_data()?;
-    let established_data = TcpEstablishedNode::new(main.established_process).node_runtime_data()?;
-    let rcv_process_data = TcpRcvProcessNode::new(main.rcv_process).node_runtime_data()?;
-    let syn_sent_data = TcpSynSentNode::new(main.syn_sent_process).node_runtime_data()?;
+    let input_data = main.control().node(Some(worker)).node_runtime_data()?;
+    let listen_data = TcpListenNode::new().node_runtime_data()?;
+    let established_data = TcpEstablishedNode::new().node_runtime_data()?;
+    let rcv_process_data = TcpRcvProcessNode::new().node_runtime_data()?;
+    let syn_sent_data = TcpSynSentNode::new().node_runtime_data()?;
 
     // A worker graph clone can retain the old polling state. Keep the node
     // dormant until its replacement SessionWorker owns a live readiness file.
@@ -588,36 +573,36 @@ fn init_tcp_worker(engine: &mut DataPlaneMain) -> RuntimeResult<()> {
 }
 
 fn tcp_session_queue_update_time(
-    runtime: &DataPlaneMain,
+    runtime: &mut DataPlaneMain,
     sessions: &mut SessionWorker,
-    _: NodeRuntimeData,
+    _: NodeRuntime,
     output_next: SessionQueueNext,
     now: std::time::Instant,
-    frame: &mut hammer_core::data_plane::BufferFrame,
+    frame: &mut hammer_core::data_plane::Frame,
     output: &mut SessionQueueOutput,
 ) -> RuntimeResult<()> {
     TCP_MAIN
         .get()
         .ok_or(RuntimeError::PluginStateNotInitialized { plugin: "tcp" })?
-        .with_tcp_worker(runtime, |tcp| {
+        .with_tcp_worker(runtime.thread_index(), |tcp| {
             tcp.update_time(sessions, runtime, output_next, frame, output, now)?;
             Ok(())
         })
 }
 
 fn tcp_session_queue_dispatch(
-    runtime: &DataPlaneMain,
+    runtime: &mut DataPlaneMain,
     sessions: &mut SessionWorker,
-    _: NodeRuntimeData,
+    _: NodeRuntime,
     output_next: SessionQueueNext,
     now: std::time::Instant,
-    frame: &mut hammer_core::data_plane::BufferFrame,
+    frame: &mut hammer_core::data_plane::Frame,
     output: &mut SessionQueueOutput,
 ) -> RuntimeResult<()> {
     TCP_MAIN
         .get()
         .ok_or(RuntimeError::PluginStateNotInitialized { plugin: "tcp" })?
-        .with_tcp_worker(runtime, |tcp| {
+        .with_tcp_worker(runtime.thread_index(), |tcp| {
             dispatch_session_queue_events(runtime, sessions, tcp, output_next, frame, output, now)
                 .map(|_| ())
         })
@@ -771,6 +756,7 @@ impl TcpResetError {
     }
 }
 
+#[hammer_component_macros::buffer_opaque(secondary)]
 #[derive(Clone, Copy)]
 #[repr(C)]
 struct TcpRouteOpaque {
@@ -781,8 +767,7 @@ struct TcpRouteOpaque {
     reserved: [u8; 42],
 }
 
-const _: () =
-    assert!(std::mem::size_of::<TcpRouteOpaque>() == std::mem::size_of::<SecondaryOpaque>());
+const _: () = assert!(std::mem::size_of::<TcpRouteOpaque>() == 56);
 
 impl Default for TcpRouteOpaque {
     #[inline]
@@ -802,6 +787,7 @@ impl Default for TcpRouteOpaque {
 const TCP_EGRESS_TAG: u32 = 0x5443_5045; // "TCPE"
 
 #[derive(Clone, Copy)]
+#[hammer_component_macros::buffer_opaque(secondary)]
 #[repr(C)]
 struct TcpEgressOpaque {
     tag: u32,
@@ -812,12 +798,11 @@ struct TcpEgressOpaque {
     reserved: [u8; 16],
 }
 
-const _: () =
-    assert!(std::mem::size_of::<TcpEgressOpaque>() == std::mem::size_of::<SecondaryOpaque>());
+const _: () = assert!(std::mem::size_of::<TcpEgressOpaque>() == 56);
 
 #[inline(always)]
 pub(crate) fn write_tcp_egress_endpoints(
-    opaque: &mut SecondaryOpaque,
+    opaque: &mut TcpEgressOpaque,
     local: std::net::IpAddr,
     remote: std::net::IpAddr,
 ) {
@@ -834,8 +819,7 @@ pub(crate) fn write_tcp_egress_endpoints(
         }
         _ => return,
     };
-    let egress = unsafe { transmute::<&mut SecondaryOpaque, &mut TcpEgressOpaque>(opaque) };
-    *egress = TcpEgressOpaque {
+    *opaque = TcpEgressOpaque {
         tag: TCP_EGRESS_TAG,
         version,
         pad: [0; 3],
@@ -847,30 +831,29 @@ pub(crate) fn write_tcp_egress_endpoints(
 
 #[inline(always)]
 pub(crate) fn read_tcp_egress_endpoints(
-    opaque: &SecondaryOpaque,
+    opaque: &TcpEgressOpaque,
 ) -> Option<(std::net::IpAddr, std::net::IpAddr)> {
-    let egress = unsafe { *transmute::<&SecondaryOpaque, &TcpEgressOpaque>(opaque) };
-    if egress.tag != TCP_EGRESS_TAG {
+    if opaque.tag != TCP_EGRESS_TAG {
         return None;
     }
-    match egress.version {
+    match opaque.version {
         4 => Some((
             std::net::IpAddr::V4(std::net::Ipv4Addr::new(
-                egress.local[0],
-                egress.local[1],
-                egress.local[2],
-                egress.local[3],
+                opaque.local[0],
+                opaque.local[1],
+                opaque.local[2],
+                opaque.local[3],
             )),
             std::net::IpAddr::V4(std::net::Ipv4Addr::new(
-                egress.remote[0],
-                egress.remote[1],
-                egress.remote[2],
-                egress.remote[3],
+                opaque.remote[0],
+                opaque.remote[1],
+                opaque.remote[2],
+                opaque.remote[3],
             )),
         )),
         6 => Some((
-            std::net::IpAddr::V6(std::net::Ipv6Addr::from(egress.local)),
-            std::net::IpAddr::V6(std::net::Ipv6Addr::from(egress.remote)),
+            std::net::IpAddr::V6(std::net::Ipv6Addr::from(opaque.local)),
+            std::net::IpAddr::V6(std::net::Ipv6Addr::from(opaque.remote)),
         )),
         _ => None,
     }
@@ -880,13 +863,12 @@ pub(crate) fn read_tcp_egress_endpoints(
 
 #[inline(always)]
 pub(crate) fn write_session_route_opaque(
-    opaque: &mut SecondaryOpaque,
+    opaque: &mut TcpRouteOpaque,
     session_id: u32,
     owner: DataWorkerId,
     next: TcpInputNext,
 ) {
-    let route = unsafe { transmute::<&mut SecondaryOpaque, &mut TcpRouteOpaque>(opaque) };
-    *route = TcpRouteOpaque {
+    *opaque = TcpRouteOpaque {
         session_raw: session_id.into(),
         owner_worker: owner.slot() as u32,
         next: next as u8,
@@ -897,16 +879,15 @@ pub(crate) fn write_session_route_opaque(
 
 #[inline(always)]
 pub(crate) fn read_session_route_opaque(
-    opaque: &SecondaryOpaque,
+    opaque: &TcpRouteOpaque,
 ) -> Option<(u32, DataWorkerId, TcpInputNext)> {
-    let route = unsafe { *transmute::<&SecondaryOpaque, &TcpRouteOpaque>(opaque) };
-    if route.present == 0 {
+    if opaque.present == 0 {
         return None;
     }
     Some((
-        u32::try_from(route.session_raw).ok()?,
-        DataWorkerId::new(route.owner_worker),
-        match route.next {
+        u32::try_from(opaque.session_raw).ok()?,
+        DataWorkerId::new(opaque.owner_worker),
+        match opaque.next {
             value if value == TcpInputNext::Listen as u8 => TcpInputNext::Listen,
             value if value == TcpInputNext::RcvProcess as u8 => TcpInputNext::RcvProcess,
             value if value == TcpInputNext::SynSent as u8 => TcpInputNext::SynSent,
@@ -918,12 +899,14 @@ pub(crate) fn read_session_route_opaque(
 }
 
 #[inline(always)]
-pub(crate) fn read_session_id(
-    runtime: &DataPlaneMain,
-    index: hammer_core::data_plane::Index,
-) -> RuntimeResult<Option<u32>> {
-    let buffer = runtime.get_buffer(index)?;
-    Ok(read_session_route_opaque(buffer.opaque2()).map(|(session_id, _, _)| session_id))
+pub(crate) fn read_session_id(runtime: &DataPlaneMain, index: u32) -> RuntimeResult<Option<u32>> {
+    let buffer = runtime.buffer(index);
+    Ok(
+        read_session_route_opaque(
+            hammer_core::buffer_opaque!(buffer => TcpSecondaryOpaque).route(),
+        )
+        .map(|(session_id, _, _)| session_id),
+    )
 }
 
 pub fn tcp_control_cursor(packet: &[u8]) -> Result<BufferPacketCursor, TcpControlPacketParseError> {
@@ -965,8 +948,8 @@ pub fn tcp_control_cursor(packet: &[u8]) -> Result<BufferPacketCursor, TcpContro
 }
 
 fn enqueue_tcp_segment(
-    runtime: &DataPlaneMain,
-    frame: &mut hammer_core::data_plane::BufferFrame,
+    runtime: &mut DataPlaneMain,
+    frame: &mut hammer_core::data_plane::Frame,
     output_next: SessionQueueNext,
     output: &mut SessionQueueOutput,
     segment: TcpSegment,
@@ -974,8 +957,14 @@ fn enqueue_tcp_segment(
     if output.remaining_io_budget() == 0 {
         return Ok(());
     }
-    let index = runtime.buffers().alloc_index()?;
-    segment.write_to_buffer(runtime.buffers(), index)?;
+    let mut index = 0;
+    if runtime.buffer_alloc(core::slice::from_mut(&mut index)) != 1 {
+        return Err(hammer_core::error::DataPlaneError::from(
+            hammer_core::error::BufferInvariant::PoolExhausted,
+        )
+        .into());
+    }
+    segment.write_to_buffer(&mut *runtime.buffer_mut(index))?;
     let _ = output.try_enqueue_io(frame, output_next, index)?;
     Ok(())
 }
@@ -995,4 +984,11 @@ pub enum TcpInputNext {
     Established,
     #[next("tcp-reset")]
     Reset,
+}
+
+#[hammer_component_macros::buffer_opaque(secondary)]
+#[derive(Clone, Copy)]
+pub(crate) union TcpSecondaryOpaque {
+    route: TcpRouteOpaque,
+    egress: TcpEgressOpaque,
 }

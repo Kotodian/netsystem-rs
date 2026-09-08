@@ -5,7 +5,7 @@ use std::thread;
 
 use crate::error::RuntimeResult;
 use crossbeam_queue::ArrayQueue;
-use hammer_core::data_plane::{BufferPoolArena, Index, NodeId};
+use hammer_core::data_plane::NodeId;
 use hammer_core::error::DataPlaneError;
 
 pub(crate) const HANDOFF_SLOT_CAPACITY: usize = 32;
@@ -58,7 +58,6 @@ pub struct DataPlaneHandoff {
 
 struct DataPlaneHandoffInner {
     queues: Box<[ArrayQueue<HandoffFrame>]>,
-    buffer_arena: Option<BufferPoolArena>,
     worker_interrupt_pending: Box<[Vec<AtomicBool>]>,
     worker_interrupt_threads: Box<[OnceLock<thread::Thread>]>,
 }
@@ -93,7 +92,7 @@ pub(crate) struct HandoffFrame {
 
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct HandoffSlot {
-    indices: [Option<Index>; HANDOFF_SLOT_CAPACITY],
+    indices: [u32; HANDOFF_SLOT_CAPACITY],
     len: usize,
 }
 
@@ -101,13 +100,13 @@ impl HandoffSlot {
     #[inline]
     pub(crate) fn new() -> Self {
         Self {
-            indices: [None; HANDOFF_SLOT_CAPACITY],
+            indices: [0; HANDOFF_SLOT_CAPACITY],
             len: 0,
         }
     }
 
     #[inline]
-    pub(crate) fn single(index: Index) -> Self {
+    pub(crate) fn single(index: u32) -> Self {
         let mut slot = Self::new();
         let pushed = slot.push(index);
         debug_assert!(pushed);
@@ -115,7 +114,7 @@ impl HandoffSlot {
     }
 
     #[inline]
-    pub(crate) fn from_prefix(indices: &[Index]) -> Self {
+    pub(crate) fn from_prefix(indices: &[u32]) -> Self {
         let mut slot = Self::new();
         for index in indices.iter().copied().take(HANDOFF_SLOT_CAPACITY) {
             let pushed = slot.push(index);
@@ -125,11 +124,11 @@ impl HandoffSlot {
     }
 
     #[inline]
-    pub(crate) fn push(&mut self, index: Index) -> bool {
+    pub(crate) fn push(&mut self, index: u32) -> bool {
         if self.len == HANDOFF_SLOT_CAPACITY {
             return false;
         }
-        self.indices[self.len] = Some(index);
+        self.indices[self.len] = index;
         self.len += 1;
         true
     }
@@ -140,8 +139,8 @@ impl HandoffSlot {
     }
 
     #[inline]
-    pub(crate) fn iter(&self) -> impl Iterator<Item = Index> + '_ {
-        self.indices[..self.len].iter().filter_map(|index| *index)
+    pub(crate) fn iter(&self) -> impl Iterator<Item = u32> + '_ {
+        self.indices[..self.len].iter().copied()
     }
 }
 
@@ -176,37 +175,6 @@ impl DataPlaneHandoff {
                 queues: (0..workers)
                     .map(|_| ArrayQueue::new(queue_capacity))
                     .collect::<Box<[_]>>(),
-                buffer_arena: None,
-                worker_interrupt_pending: (0..workers)
-                    .map(|_| (0..node_capacity).map(|_| AtomicBool::new(false)).collect())
-                    .collect(),
-                worker_interrupt_threads: (0..workers).map(|_| OnceLock::new()).collect(),
-            }),
-        }
-    }
-
-    #[inline]
-    pub fn new_shared_buffer_arena(
-        workers: usize,
-        queue_capacity: usize,
-        buffer_arena: BufferPoolArena,
-    ) -> Self {
-        Self::new_shared_buffer_arena_with_node_capacity(workers, queue_capacity, 0, buffer_arena)
-    }
-
-    #[inline]
-    pub fn new_shared_buffer_arena_with_node_capacity(
-        workers: usize,
-        queue_capacity: usize,
-        node_capacity: usize,
-        buffer_arena: BufferPoolArena,
-    ) -> Self {
-        Self {
-            inner: Arc::new(DataPlaneHandoffInner {
-                queues: (0..workers)
-                    .map(|_| ArrayQueue::new(queue_capacity))
-                    .collect::<Box<[_]>>(),
-                buffer_arena: Some(buffer_arena),
                 worker_interrupt_pending: (0..workers)
                     .map(|_| (0..node_capacity).map(|_| AtomicBool::new(false)).collect())
                     .collect(),
@@ -231,11 +199,6 @@ impl DataPlaneHandoffWorker {
     }
 
     #[inline]
-    pub(crate) fn configured_buffer_arena(&self) -> Option<BufferPoolArena> {
-        self.inner.buffer_arena.clone()
-    }
-
-    #[inline]
     pub(crate) fn enqueue_slot(
         &self,
         worker: DataWorkerId,
@@ -250,7 +213,7 @@ impl DataPlaneHandoffWorker {
         &self,
         worker: DataWorkerId,
         target: NodeId,
-        index: Index,
+        index: u32,
     ) -> Result<(), HandoffEnqueueError> {
         self.enqueue_indices(worker, target, HandoffSlot::single(index))
     }

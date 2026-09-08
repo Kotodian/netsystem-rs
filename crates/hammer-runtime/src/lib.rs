@@ -86,7 +86,7 @@ pub use metrics::{
 pub use network::{Network, SocksAddr};
 pub use node::{
     DriverNode, InternalNode, Node, NodeDescriptor, NodeEntry, NodeErrorCode, NodeErrorDescriptor,
-    NodeErrorSeverity, NodeProcessFn, NodeRuntime, NodeRuntimeData, NodeRuntimeReady,
+    NodeErrorSeverity, NodeMain, NodeProcessFn, NodeRuntime, NodeRuntimeReady,
     default_prefetch_indices,
 };
 pub use plugin::{
@@ -120,3 +120,6 @@ macro_rules! worker_thread_barrier_sync {
 }
 pub use control_thread::ControlThread;
 pub use spawn::{with_data_plane_main, with_data_plane_main_mut};
+
+#[cfg(test)]
+static BUFFER_MAIN_INIT: std::sync::Once = std::sync::Once::new();

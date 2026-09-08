@@ -57,8 +57,7 @@ pub fn data_plane_main_loop(
         if let Some(barrier) = crate::barrier::global()
             && barrier.is_pending()
         {
-            barrier.check();
-            main.refork_worker_graph();
+            main.refork_worker_graph(&barrier);
         }
 
         // Step 2: Poll worker-local File readiness before graph dispatch.

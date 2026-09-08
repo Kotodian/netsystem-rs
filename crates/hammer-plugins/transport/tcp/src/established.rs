@@ -1,8 +1,6 @@
 use crate::{publish_tcp_connection, read_session_id};
-use hammer_core::data_plane::{
-    BufferFrame, DEFAULT_BUFFER_FRAME_CAPACITY, Index, NodeId, NodeNext,
-};
-use hammer_runtime::{DataPlaneMain, Node, NodeProcessFn, NodeRuntimeData};
+use hammer_core::data_plane::{DEFAULT_BUFFER_FRAME_CAPACITY, Frame, NodeId, NodeNext};
+use hammer_runtime::{DataPlaneMain, Node, NodeProcessFn, NodeRuntime};
 use hammer_runtime::{RuntimeError, RuntimeResult};
 use hammer_service::session::runtime::RxDelivery;
 
@@ -23,60 +21,67 @@ pub enum TcpEstablishedNext {
     next = TcpEstablishedNext,
     role = internal,
 )]
-pub struct TcpEstablishedNode {
-    process: NodeProcessFn,
-}
+pub struct TcpEstablishedNode {}
 
 pub fn register_tcp_established(runtime: &DataPlaneMain) -> RuntimeResult<NodeId> {
-    let main = crate::TCP_MAIN
+    crate::TCP_MAIN
         .get()
         .ok_or(RuntimeError::PluginStateNotInitialized { plugin: "tcp" })?;
     if let Some(node) = runtime.nodes().node_by_name("tcp-established") {
         return Ok(node);
     }
     runtime.nodes().try_register_internal_with_next_names(
-        TcpEstablishedNode::new(main.established_process),
+        TcpEstablishedNode::new(),
         &TcpEstablishedNext::NEXT_NAMES,
     )
 }
 
 impl Node for TcpEstablishedNode {
     #[inline(always)]
-    fn process(&mut self, runtime: &DataPlaneMain, frame: &mut BufferFrame) -> () {
-        (self.process)(runtime, NodeRuntimeData::empty(), frame)
-    }
-
-    #[inline]
-    fn node_process(&self) -> NodeProcessFn {
-        self.process
+    fn process(
+        runtime: &mut DataPlaneMain,
+        node_runtime: &mut hammer_runtime::NodeRuntime,
+        frame: &mut Frame,
+    ) -> usize {
+        let process: NodeProcessFn = tcp_established_process;
+        process(runtime, node_runtime, frame)
     }
 }
 
 pub(crate) fn tcp_established_process(
-    runtime: &DataPlaneMain,
-    _: NodeRuntimeData,
-    frame: &mut BufferFrame,
-) -> () {
-    tcp_established_frame(runtime, frame)
+    runtime: &mut DataPlaneMain,
+    node_runtime: &mut NodeRuntime,
+    frame: &mut Frame,
+) -> usize {
+    let processed_vectors = frame.len();
+    tcp_established_frame(runtime, node_runtime, frame);
+    processed_vectors
 }
 
-fn tcp_established_frame(runtime: &DataPlaneMain, frame: &mut BufferFrame) -> () {
-    let input_len = frame.len();
-    debug_assert!(input_len <= DEFAULT_BUFFER_FRAME_CAPACITY);
-    let mut inputs = [core::mem::MaybeUninit::<Index>::uninit(); DEFAULT_BUFFER_FRAME_CAPACITY];
-    for (offset, &index) in frame.indices().iter().enumerate() {
-        inputs[offset].write(index);
-    }
-    frame.discard_prefix(input_len);
+fn tcp_established_frame(
+    runtime: &mut DataPlaneMain,
+    node_runtime: &mut hammer_runtime::NodeRuntime,
+    frame: &mut Frame,
+) -> () {
+    let mut output = Frame::<(), u32, ()>::new(0);
 
     let mut nexts = [0u16; DEFAULT_BUFFER_FRAME_CAPACITY];
     let mut out_len = 0usize;
-    for offset in 0..input_len {
-        let index = unsafe { inputs[offset].assume_init() };
-        if tcp_established_index(runtime, index, frame, &mut nexts, &mut out_len).is_err() {
+    for &index in frame.vector_args() {
+        if tcp_established_index(
+            runtime,
+            node_runtime,
+            index,
+            &mut output,
+            &mut nexts,
+            &mut out_len,
+        )
+        .is_err()
+        {
             let _ = emit_local(
                 runtime,
-                frame,
+                node_runtime,
+                &mut output,
                 &mut nexts,
                 &mut out_len,
                 TcpEstablishedNext::Drop,
@@ -85,35 +90,42 @@ fn tcp_established_frame(runtime: &DataPlaneMain, frame: &mut BufferFrame) -> ()
         }
     }
     if out_len != 0 {
-        runtime.enqueue_to_next(frame, &nexts[..out_len]);
+        runtime.enqueue_to_next(node_runtime, &mut output, &nexts[..out_len]);
     }
     ()
 }
 
 #[inline]
 fn emit_local(
-    runtime: &DataPlaneMain,
-    frame: &mut BufferFrame,
+    runtime: &mut DataPlaneMain,
+    node_runtime: &mut hammer_runtime::NodeRuntime,
+    frame: &mut Frame,
     nexts: &mut [u16; DEFAULT_BUFFER_FRAME_CAPACITY],
     out_len: &mut usize,
     next: TcpEstablishedNext,
-    index: Index,
+    index: u32,
 ) -> RuntimeResult<()> {
     if *out_len == DEFAULT_BUFFER_FRAME_CAPACITY {
-        runtime.enqueue_to_next(frame, &nexts[..*out_len]);
+        runtime.enqueue_to_next(node_runtime, frame, &nexts[..*out_len]);
+        frame.set_vector_count(0);
         *out_len = 0;
     }
     nexts[*out_len] = NodeNext::slot(next);
-    frame.push_index(index)?;
+    {
+        let count = frame.len();
+        frame.set_vector_count(count + 1);
+        frame.vector_args_mut()[count] = index;
+    }
     *out_len += 1;
     debug_assert_eq!(*out_len, frame.len());
     Ok(())
 }
 
 fn tcp_established_index(
-    runtime: &DataPlaneMain,
-    index: Index,
-    out_frame: &mut BufferFrame,
+    runtime: &mut DataPlaneMain,
+    node_runtime: &mut hammer_runtime::NodeRuntime,
+    index: u32,
+    out_frame: &mut Frame,
     nexts: &mut [u16; DEFAULT_BUFFER_FRAME_CAPACITY],
     out_len: &mut usize,
 ) -> RuntimeResult<()> {
@@ -121,7 +133,7 @@ fn tcp_established_index(
     let main = crate::TCP_MAIN
         .get()
         .ok_or(RuntimeError::PluginStateNotInitialized { plugin: "tcp" })?;
-    let tx_segment = main.with_worker(runtime, |sessions, tcp| {
+    let tx_segment = main.with_worker(runtime.thread_index(), |sessions, tcp| {
         let session_id = read_session_id(runtime, index)?.ok_or_else(|| {
             let _ = runtime.record_current_node_error(TcpNodeError::EstablishedSessionRouteMissing);
             TcpNodeError::EstablishedSessionRouteMissing
@@ -178,11 +190,11 @@ fn tcp_established_index(
         if let Some((trim, offset)) = accept_payload {
             let accepted_len = packet.payload_len.saturating_sub(trim) as u32;
             {
-                let mut buffer = runtime.buffers().get_buffer_mut(index)?;
-                buffer.advance(packet.payload_offset.saturating_add(trim) as isize)?;
+                let buffer = runtime.buffer_mut(index);
+                buffer.advance(packet.payload_offset.saturating_add(trim) as isize);
                 buffer.truncate(accepted_len as usize)?;
             }
-            let delivery = sessions.enqueue_rx(runtime.buffers(), session_id, index, offset)?;
+            let delivery = sessions.enqueue_rx(runtime, session_id, index, offset)?;
             let rx_available = match delivery {
                 RxDelivery::NotAccepted { rx_available }
                 | RxDelivery::InOrder { rx_available, .. }
@@ -282,10 +294,17 @@ fn tcp_established_index(
         Ok(tx_segment)
     })?;
     if let Some(segment) = tx_segment {
-        let allocated = runtime.buffers().alloc_index()?;
-        segment.write_to_buffer(runtime.buffers(), allocated)?;
+        let mut allocated = 0;
+        if runtime.buffer_alloc(core::slice::from_mut(&mut allocated)) != 1 {
+            return Err(hammer_core::error::DataPlaneError::from(
+                hammer_core::error::BufferInvariant::PoolExhausted,
+            )
+            .into());
+        }
+        segment.write_to_buffer(&mut *runtime.buffer_mut(allocated))?;
         emit_local(
             runtime,
+            node_runtime,
             out_frame,
             nexts,
             out_len,

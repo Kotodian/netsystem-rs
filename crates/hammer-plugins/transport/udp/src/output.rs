@@ -1,11 +1,8 @@
-use std::mem::transmute;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 
-use hammer_core::data_plane::{
-    BufferFrame, BufferPacketCursor, Index, NodeId, NodeState, SecondaryOpaque,
-};
+use hammer_core::data_plane::{BufferPacketCursor, Frame, NodeId, NodeState};
 use hammer_infra::checksum::internet_checksum_parts;
-use hammer_runtime::{DataPlaneMain, Node, NodeProcessFn, NodeRuntimeData, RuntimeResult};
+use hammer_runtime::{DataPlaneMain, Node, NodeProcessFn, NodeRuntime, RuntimeResult};
 use hammer_service::opaque::NetworkOpaque;
 use hammer_service::session::node::SessionQueueNode;
 
@@ -16,8 +13,9 @@ const IPV6_HEADER_LEN: usize = 40;
 const UDP_EGRESS_TAG: u32 = 0x5544_5045; // "UDPE"
 
 #[derive(Clone, Copy)]
+#[hammer_component_macros::buffer_opaque(secondary)]
 #[repr(C)]
-struct UdpEgressOpaque {
+pub(crate) struct UdpEgressOpaque {
     tag: u32,
     version: u8,
     pad: [u8; 3],
@@ -26,12 +24,11 @@ struct UdpEgressOpaque {
     reserved: [u8; 16],
 }
 
-const _: () =
-    assert!(std::mem::size_of::<UdpEgressOpaque>() == std::mem::size_of::<SecondaryOpaque>());
+const _: () = assert!(std::mem::size_of::<UdpEgressOpaque>() == 56);
 
 #[inline(always)]
 pub(crate) fn write_udp_egress_endpoints(
-    opaque: &mut SecondaryOpaque,
+    opaque: &mut UdpEgressOpaque,
     local: IpAddr,
     remote: IpAddr,
 ) {
@@ -46,8 +43,7 @@ pub(crate) fn write_udp_egress_endpoints(
         (IpAddr::V6(local), IpAddr::V6(remote)) => (6u8, local.octets(), remote.octets()),
         _ => return,
     };
-    let egress = unsafe { transmute::<&mut SecondaryOpaque, &mut UdpEgressOpaque>(opaque) };
-    *egress = UdpEgressOpaque {
+    *opaque = UdpEgressOpaque {
         tag: UDP_EGRESS_TAG,
         version,
         pad: [0; 3],
@@ -58,29 +54,28 @@ pub(crate) fn write_udp_egress_endpoints(
 }
 
 #[inline(always)]
-fn read_udp_egress_endpoints(opaque: &SecondaryOpaque) -> Option<(IpAddr, IpAddr)> {
-    let egress = unsafe { *transmute::<&SecondaryOpaque, &UdpEgressOpaque>(opaque) };
-    if egress.tag != UDP_EGRESS_TAG {
+fn read_udp_egress_endpoints(opaque: &UdpEgressOpaque) -> Option<(IpAddr, IpAddr)> {
+    if opaque.tag != UDP_EGRESS_TAG {
         return None;
     }
-    match egress.version {
+    match opaque.version {
         4 => Some((
             IpAddr::V4(Ipv4Addr::new(
-                egress.local[0],
-                egress.local[1],
-                egress.local[2],
-                egress.local[3],
+                opaque.local[0],
+                opaque.local[1],
+                opaque.local[2],
+                opaque.local[3],
             )),
             IpAddr::V4(Ipv4Addr::new(
-                egress.remote[0],
-                egress.remote[1],
-                egress.remote[2],
-                egress.remote[3],
+                opaque.remote[0],
+                opaque.remote[1],
+                opaque.remote[2],
+                opaque.remote[3],
             )),
         )),
         6 => Some((
-            IpAddr::V6(Ipv6Addr::from(egress.local)),
-            IpAddr::V6(Ipv6Addr::from(egress.remote)),
+            IpAddr::V6(Ipv6Addr::from(opaque.local)),
+            IpAddr::V6(Ipv6Addr::from(opaque.remote)),
         )),
         _ => None,
     }
@@ -124,41 +119,51 @@ pub fn register_udp_output(runtime: &DataPlaneMain) -> RuntimeResult<NodeId> {
 
 impl Node for UdpOutputNode {
     #[inline(always)]
-    fn process(&mut self, runtime: &DataPlaneMain, frame: &mut BufferFrame) -> () {
-        udp_output_process_frame(runtime, frame)
+    fn process(
+        runtime: &mut DataPlaneMain,
+        node_runtime: &mut hammer_runtime::NodeRuntime,
+        frame: &mut Frame,
+    ) -> usize {
+        let process: NodeProcessFn = udp_output_process;
+        process(runtime, node_runtime, frame)
     }
 
     #[inline]
-    fn node_process(&self) -> NodeProcessFn {
-        udp_output_process
-    }
-
-    #[inline]
-    fn node_runtime_data(&self) -> RuntimeResult<NodeRuntimeData> {
-        Ok(NodeRuntimeData::default())
+    fn node_runtime_data(&self) -> RuntimeResult<NodeRuntime> {
+        Ok(NodeRuntime::default())
     }
 }
 
-fn udp_output_process(runtime: &DataPlaneMain, _: NodeRuntimeData, frame: &mut BufferFrame) -> () {
-    udp_output_process_frame(runtime, frame)
+fn udp_output_process(
+    runtime: &mut DataPlaneMain,
+    node_runtime: &mut NodeRuntime,
+    frame: &mut Frame,
+) -> usize {
+    let processed_vectors = frame.len();
+    udp_output_process_frame(runtime, node_runtime, frame);
+    processed_vectors
 }
 
-fn udp_output_process_frame(runtime: &DataPlaneMain, frame: &mut BufferFrame) -> () {
-    hammer_runtime::process_frame!(runtime, frame, |index| {
+fn udp_output_process_frame(
+    runtime: &mut DataPlaneMain,
+    node_runtime: &mut hammer_runtime::NodeRuntime,
+    frame: &mut Frame,
+) -> () {
+    hammer_runtime::process_frame!(runtime, node_runtime, frame, |index| {
         udp_output_next_for_index(runtime, index).unwrap_or(UdpOutputNext::Drop)
     })
 }
 
 fn udp_output_next_for_index(
-    runtime: &DataPlaneMain,
-    index: Index,
+    runtime: &mut DataPlaneMain,
+    index: u32,
 ) -> RuntimeResult<UdpOutputNext> {
-    let buffer = runtime.get_buffer(index)?;
+    let buffer = runtime.buffer(index);
     let udp_len = buffer
         .current_len()
         .checked_add(buffer.total_len_not_including_first());
-    let endpoints = read_udp_egress_endpoints(buffer.opaque2());
-    drop(buffer);
+    let endpoints =
+        read_udp_egress_endpoints(hammer_core::buffer_opaque!(buffer => UdpEgressOpaque));
 
     let Some(udp_len) = udp_len else {
         return Ok(UdpOutputNext::Drop);
@@ -190,8 +195,8 @@ fn udp_output_next_for_index(
 }
 
 fn udp_output_push_ipv4(
-    runtime: &DataPlaneMain,
-    index: Index,
+    runtime: &mut DataPlaneMain,
+    index: u32,
     src: Ipv4Addr,
     dst: Ipv4Addr,
     total_len: u16,
@@ -199,7 +204,7 @@ fn udp_output_push_ipv4(
     let udp_len =
         u16::try_from(usize::from(total_len) - IPV4_HEADER_LEN).expect("IPv4 UDP length fits u16");
     let checksum = {
-        let buffer = runtime.get_buffer(index)?;
+        let buffer = runtime.buffer(index);
         let datagram = buffer.current();
         internet_checksum_parts(&[
             &src.octets(),
@@ -210,17 +215,17 @@ fn udp_output_push_ipv4(
         ])
     };
     {
-        let mut buffer = runtime.get_buffer_mut(index)?;
+        let buffer = runtime.buffer_mut(index);
         buffer.current_mut()[6..8].copy_from_slice(&checksum.to_be_bytes());
     }
 
-    let mut buffer = runtime.get_buffer_mut(index)?;
+    let buffer = runtime.buffer_mut(index);
     {
-        let header = buffer.prepend_mut(IPV4_HEADER_LEN)?;
+        let header = buffer.push_uninit(IPV4_HEADER_LEN as u8);
         hammer_plugin_ip::write_ipv4_push_header(header, src, dst, UDP_PROTOCOL, total_len, true)?;
     }
     let packet_len = usize::from(total_len);
-    let network = unsafe { transmute::<_, &mut NetworkOpaque>(buffer.opaque_mut()) };
+    let network = hammer_core::buffer_opaque!(mut buffer => NetworkOpaque);
     network.sw_if_index = [u32::MAX; 2];
     network.set_packet_cursor(
         BufferPacketCursor::new()
@@ -235,14 +240,14 @@ fn udp_output_push_ipv4(
 }
 
 fn udp_output_push_ipv6(
-    runtime: &DataPlaneMain,
-    index: Index,
+    runtime: &mut DataPlaneMain,
+    index: u32,
     src: Ipv6Addr,
     dst: Ipv6Addr,
     payload_len: u16,
 ) -> RuntimeResult<()> {
     let checksum = {
-        let buffer = runtime.get_buffer(index)?;
+        let buffer = runtime.buffer(index);
         let datagram = buffer.current();
         internet_checksum_parts(&[
             &src.octets(),
@@ -253,17 +258,17 @@ fn udp_output_push_ipv6(
         ])
     };
     {
-        let mut buffer = runtime.get_buffer_mut(index)?;
+        let buffer = runtime.buffer_mut(index);
         buffer.current_mut()[6..8].copy_from_slice(&checksum.to_be_bytes());
     }
 
-    let mut buffer = runtime.get_buffer_mut(index)?;
+    let buffer = runtime.buffer_mut(index);
     {
-        let header = buffer.prepend_mut(IPV6_HEADER_LEN)?;
+        let header = buffer.push_uninit(IPV6_HEADER_LEN as u8);
         hammer_plugin_ip::write_ipv6_push_header(header, src, dst, UDP_PROTOCOL, payload_len)?;
     }
     let packet_len = IPV6_HEADER_LEN + usize::from(payload_len);
-    let network = unsafe { transmute::<_, &mut NetworkOpaque>(buffer.opaque_mut()) };
+    let network = hammer_core::buffer_opaque!(mut buffer => NetworkOpaque);
     network.sw_if_index = [u32::MAX; 2];
     network.set_packet_cursor(
         BufferPacketCursor::new()
@@ -275,4 +280,46 @@ fn udp_output_push_ipv6(
     network.ip_mut().set_ip_version(Some(6));
     network.ip_mut().set_ip_protocol(Some(UDP_PROTOCOL));
     Ok(())
+}
+
+#[cfg(test)]
+mod opaque_tests {
+    use super::*;
+
+    // Derived from vnet/udp/udp_output.c: output consumes transport endpoint
+    // facts, prepends IP, and publishes primary metadata for IP lookup.
+    #[test]
+    fn datagram_metadata_reaches_ip_output() -> RuntimeResult<()> {
+        hammer_infra::main_heap::init_default().unwrap();
+        hammer_core::buffer::BufferMain::new(2048, 16, &[0], 1, hammer_infra::PageSize::Default)?;
+        let mut runtime = DataPlaneMain::new(hammer_runtime::DataPlaneBufferConfig {
+            buffer_slot_capacity: 2048,
+            buffer_slots: 16,
+            ..Default::default()
+        });
+        let mut index = u32::MAX;
+        assert_eq!(
+            runtime.buffer_add_data(&mut index, &[0x04, 0xd2, 0x10, 0xe1, 0, 8, 0, 0]),
+            (&[0x04, 0xd2, 0x10, 0xe1, 0, 8, 0, 0]).len()
+        );
+        write_udp_egress_endpoints(
+            hammer_core::buffer_opaque!(mut runtime.buffer_mut(index) => UdpEgressOpaque),
+            "192.0.2.1".parse().unwrap(),
+            "192.0.2.2".parse().unwrap(),
+        );
+        assert!(matches!(
+            udp_output_next_for_index(&mut runtime, index)?,
+            UdpOutputNext::LookupV4
+        ));
+        {
+            let buffer = runtime.buffer(index);
+            assert_eq!(&buffer.current()[12..16], &[192, 0, 2, 1]);
+            assert_eq!(&buffer.current()[16..20], &[192, 0, 2, 2]);
+            let network = hammer_core::buffer_opaque!(buffer => NetworkOpaque);
+            assert_eq!(network.ip().ip_protocol(), Some(17));
+            assert_eq!(network.packet_cursor().transport_header_offset(), 20);
+        }
+        runtime.buffer_free_one(index);
+        Ok(())
+    }
 }

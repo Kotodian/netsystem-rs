@@ -11,8 +11,6 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Duration;
 
-use hammer_core::data_plane::DataPlaneBuffers;
-
 use crate::DataPlaneMain;
 use tracing::instrument::WithSubscriber;
 
@@ -164,8 +162,4 @@ pub fn with_data_plane_main_mut<R>(f: impl FnOnce(&mut DataPlaneMain) -> R) -> R
         // and worker control tasks execute serially on that thread.
         unsafe { f(&mut *pointer) }
     })
-}
-
-pub fn with_data_plane_buffers<R>(f: impl FnOnce(&DataPlaneBuffers) -> R) -> R {
-    with_data_plane_main(|main| f(main.buffers()))
 }

@@ -1,4 +1,5 @@
 mod error;
+pub mod frame;
 mod id;
 mod next;
 mod registration;

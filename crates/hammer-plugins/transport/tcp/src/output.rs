@@ -1,14 +1,13 @@
 use crate::{TCP_FLAG_FIN, TCP_FLAG_SYN, tcp_header};
 use core::hash::Hasher;
-use hammer_core::data_plane::{BufferFrame, BufferPacketCursor, Index, NodeId, NodeState};
+use hammer_core::data_plane::{BufferPacketCursor, Frame, NodeId, NodeState};
 use hammer_infra::checksum::InternetChecksum;
 use hammer_runtime::RuntimeResult;
-use hammer_runtime::{DataPlaneMain, Node, NodeProcessFn, NodeRuntimeData};
+use hammer_runtime::{DataPlaneMain, Node, NodeProcessFn, NodeRuntime};
 use hammer_service::session::node::SessionQueueNode;
 
 use super::{TcpOutputError, read_tcp_egress_endpoints};
 use hammer_service::opaque::NetworkOpaque;
-use std::mem::transmute;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 pub const DEFAULT_TCP_OUTPUT_PAYLOAD_LEN: usize = 1_440;
 const TCP_CHECKSUM_OFFSET: usize = 16;
@@ -52,52 +51,57 @@ pub fn register_tcp_output(runtime: &DataPlaneMain) -> RuntimeResult<NodeId> {
 
 impl Node for TcpOutputNode {
     #[inline(always)]
-    fn process(&mut self, runtime: &DataPlaneMain, frame: &mut BufferFrame) -> () {
-        tcp_output_node_process_frame::<1>(runtime, frame)
+    fn process(
+        runtime: &mut DataPlaneMain,
+        node_runtime: &mut hammer_runtime::NodeRuntime,
+        frame: &mut Frame,
+    ) -> usize {
+        let process: NodeProcessFn = tcp_output_node_process;
+        process(runtime, node_runtime, frame)
     }
 
     #[inline]
-    fn node_process(&self) -> NodeProcessFn {
-        tcp_output_node_process
-    }
-
-    #[inline]
-    fn node_runtime_data(&self) -> RuntimeResult<NodeRuntimeData> {
-        Ok(NodeRuntimeData::default())
+    fn node_runtime_data(&self) -> RuntimeResult<NodeRuntime> {
+        Ok(NodeRuntime::default())
     }
 }
 
 fn tcp_output_node_process(
-    runtime: &DataPlaneMain,
-    _: NodeRuntimeData,
-    frame: &mut BufferFrame,
-) -> () {
-    tcp_output_node_process_frame::<1>(runtime, frame)
+    runtime: &mut DataPlaneMain,
+    node_runtime: &mut NodeRuntime,
+    frame: &mut Frame,
+) -> usize {
+    let processed_vectors = frame.len();
+    tcp_output_node_process_frame::<1>(runtime, node_runtime, frame);
+    processed_vectors
 }
 
 #[hammer_component_macros::node_function(node = TcpOutputNode)]
 fn tcp_output_node_process_simd<const SIMD_BYTES: usize>(
-    runtime: &DataPlaneMain,
-    _: NodeRuntimeData,
-    frame: &mut BufferFrame,
-) -> () {
-    tcp_output_node_process_frame::<SIMD_BYTES>(runtime, frame)
+    runtime: &mut DataPlaneMain,
+    node_runtime: &mut NodeRuntime,
+    frame: &mut Frame,
+) -> usize {
+    let processed_vectors = frame.len();
+    tcp_output_node_process_frame::<SIMD_BYTES>(runtime, node_runtime, frame);
+    processed_vectors
 }
 
 fn tcp_output_node_process_frame<const SIMD_BYTES: usize>(
-    runtime: &DataPlaneMain,
-    frame: &mut BufferFrame,
+    runtime: &mut DataPlaneMain,
+    node_runtime: &mut hammer_runtime::NodeRuntime,
+    frame: &mut Frame,
 ) -> () {
-    hammer_runtime::process_frame!(runtime, frame, |index| {
+    hammer_runtime::process_frame!(runtime, node_runtime, frame, |index| {
         tcp_output_next_for_index::<SIMD_BYTES>(runtime, index).unwrap_or(TcpOutputNext::Drop)
     })
 }
 
 fn tcp_output_next_for_index<const SIMD_BYTES: usize>(
-    runtime: &DataPlaneMain,
-    index: Index,
+    runtime: &mut DataPlaneMain,
+    index: u32,
 ) -> RuntimeResult<TcpOutputNext> {
-    let buffer = runtime.get_buffer(index)?;
+    let buffer = runtime.buffer(index);
     let header = buffer.current();
     if tcp_header(header).is_err() {
         let _ = runtime.record_current_node_error(TcpOutputError::NoTcpHeader);
@@ -106,8 +110,9 @@ fn tcp_output_next_for_index<const SIMD_BYTES: usize>(
     let tcp_len = buffer
         .current_len()
         .checked_add(buffer.total_len_not_including_first());
-    let endpoints = read_tcp_egress_endpoints(buffer.opaque2());
-    drop(buffer);
+    let endpoints = read_tcp_egress_endpoints(
+        hammer_core::buffer_opaque!(buffer => crate::TcpSecondaryOpaque).egress(),
+    );
 
     let Some(tcp_len) = tcp_len else {
         let _ = runtime.record_current_node_error(TcpOutputError::SegmentTooLong);
@@ -148,8 +153,8 @@ fn tcp_output_next_for_index<const SIMD_BYTES: usize>(
 
 /// VPP `tcp_output_push_ip` → `vlib_buffer_push_ip4(..., is_df=1)`.
 fn tcp_output_push_ipv4<const SIMD_BYTES: usize>(
-    runtime: &DataPlaneMain,
-    index: Index,
+    runtime: &mut DataPlaneMain,
+    index: u32,
     src: Ipv4Addr,
     dst: Ipv4Addr,
     total_len: u16,
@@ -163,16 +168,16 @@ fn tcp_output_push_ipv4<const SIMD_BYTES: usize>(
     checksum.write(&tcp_len.to_be_bytes());
     set_tcp_checksum(runtime, index, checksum)?;
 
-    let mut buffer = runtime.get_buffer_mut(index)?;
+    let buffer = runtime.buffer_mut(index);
     {
-        let header = buffer.prepend_mut(IPV4_HEADER_LEN)?;
+        let header = buffer.push_uninit(IPV4_HEADER_LEN as u8);
         hammer_plugin_ip::write_ipv4_push_header(header, src, dst, TCP_PROTOCOL, total_len, true)?;
     }
     let packet_len = usize::from(total_len);
     let tcp_header_len = tcp_header(&buffer.current()[IPV4_HEADER_LEN..])
         .map(|tcp| tcp.header_len())
         .unwrap_or(20);
-    let network = unsafe { transmute::<_, &mut NetworkOpaque>(buffer.opaque_mut()) };
+    let network = hammer_core::buffer_opaque!(mut buffer => NetworkOpaque);
     network.sw_if_index = [u32::MAX; 2];
     network.set_packet_cursor(
         BufferPacketCursor::new()
@@ -188,8 +193,8 @@ fn tcp_output_push_ipv4<const SIMD_BYTES: usize>(
 
 /// VPP `tcp_output_push_ip` IPv6 path (`vlib_buffer_push_ip6_custom`).
 fn tcp_output_push_ipv6<const SIMD_BYTES: usize>(
-    runtime: &DataPlaneMain,
-    index: Index,
+    runtime: &mut DataPlaneMain,
+    index: u32,
     src: Ipv6Addr,
     dst: Ipv6Addr,
     payload_len: u16,
@@ -202,16 +207,16 @@ fn tcp_output_push_ipv6<const SIMD_BYTES: usize>(
     checksum.write(&[0, 0, 0, TCP_PROTOCOL]);
     set_tcp_checksum(runtime, index, checksum)?;
 
-    let mut buffer = runtime.get_buffer_mut(index)?;
+    let buffer = runtime.buffer_mut(index);
     {
-        let header = buffer.prepend_mut(IPV6_HEADER_LEN)?;
+        let header = buffer.push_uninit(IPV6_HEADER_LEN as u8);
         hammer_plugin_ip::write_ipv6_push_header(header, src, dst, TCP_PROTOCOL, payload_len)?;
     }
     let packet_len = IPV6_HEADER_LEN + usize::from(payload_len);
     let tcp_header_len = tcp_header(&buffer.current()[IPV6_HEADER_LEN..])
         .map(|tcp| tcp.header_len())
         .unwrap_or(20);
-    let network = unsafe { transmute::<_, &mut NetworkOpaque>(buffer.opaque_mut()) };
+    let network = hammer_core::buffer_opaque!(mut buffer => NetworkOpaque);
     network.sw_if_index = [u32::MAX; 2];
     network.set_packet_cursor(
         BufferPacketCursor::new()
@@ -226,19 +231,19 @@ fn tcp_output_push_ipv6<const SIMD_BYTES: usize>(
 }
 
 fn set_tcp_checksum<const SIMD_BYTES: usize>(
-    runtime: &DataPlaneMain,
-    index: Index,
+    runtime: &mut DataPlaneMain,
+    index: u32,
     mut checksum: InternetChecksum<SIMD_BYTES>,
 ) -> RuntimeResult<()> {
     {
-        let mut buffer = runtime.get_buffer_mut(index)?;
+        let buffer = runtime.buffer_mut(index);
         buffer.current_mut()[TCP_CHECKSUM_OFFSET..TCP_CHECKSUM_OFFSET + 2].fill(0);
     }
     for buffer in runtime.chain(index) {
-        checksum.write(buffer?.current());
+        checksum.write(buffer.current());
     }
     let value = checksum.finish() as u16;
-    let mut buffer = runtime.get_buffer_mut(index)?;
+    let buffer = runtime.buffer_mut(index);
     buffer.current_mut()[TCP_CHECKSUM_OFFSET..TCP_CHECKSUM_OFFSET + 2]
         .copy_from_slice(&value.to_be_bytes());
     Ok(())
@@ -311,5 +316,80 @@ fn tcp_inflight_sequence_len(snd_una: u32, snd_nxt: u32) -> u32 {
         snd_una.distance_to(snd_nxt)
     } else {
         0
+    }
+}
+
+#[cfg(test)]
+mod opaque_tests {
+    use super::*;
+    use crate::{TcpCapabilities, TcpSecondaryOpaque, TcpSegment, TcpSegmentFlags};
+
+    // Derived from vnet/tcp/tcp_output.c: tcp_output_push_ip consumes the
+    // transport producer's packet metadata to select the IP lookup arc.
+    #[test]
+    fn segment_metadata_reaches_ip_output() -> RuntimeResult<()> {
+        hammer_infra::main_heap::init_default().unwrap();
+        hammer_core::buffer::BufferMain::new(2048, 16, &[0], 1, hammer_infra::PageSize::Default)?;
+        let mut runtime = DataPlaneMain::new(hammer_runtime::DataPlaneBufferConfig {
+            buffer_slot_capacity: 2048,
+            buffer_slots: 16,
+            ..Default::default()
+        });
+        let mut index = 0;
+        if runtime.buffer_alloc(core::slice::from_mut(&mut index)) != 1 {
+            return Err(hammer_core::error::DataPlaneError::from(
+                hammer_core::error::BufferInvariant::PoolExhausted,
+            )
+            .into());
+        }
+        let local = "192.0.2.1:1234".parse().unwrap();
+        let remote = "192.0.2.2:4321".parse().unwrap();
+        {
+            let buffer = runtime.buffer_mut(index);
+            let opaque = hammer_core::buffer_opaque!(mut buffer => TcpSecondaryOpaque);
+            crate::write_session_route_opaque(
+                opaque.route_mut(),
+                17,
+                hammer_runtime::DataWorkerId::new(0),
+                crate::TcpInputNext::Established,
+            );
+            let (session, worker, next) = crate::read_session_route_opaque(opaque.route()).unwrap();
+            assert_eq!(session, 17);
+            assert_eq!(worker.slot(), 0);
+            assert!(matches!(next, crate::TcpInputNext::Established));
+            assert_eq!(
+                std::ptr::from_ref(opaque.route()).addr(),
+                std::ptr::from_ref(opaque.egress()).addr()
+            );
+            TcpSegment::new(
+                local,
+                remote,
+                1,
+                2,
+                1024,
+                TcpSegmentFlags::ACK,
+                TcpCapabilities::default(),
+                None,
+                None,
+                None,
+                None,
+                0,
+            )
+            .write_to_buffer(buffer)?;
+        }
+        assert!(matches!(
+            tcp_output_next_for_index::<1>(&mut runtime, index)?,
+            TcpOutputNext::LookupV4
+        ));
+        {
+            let buffer = runtime.buffer(index);
+            assert_eq!(&buffer.current()[12..16], &[192, 0, 2, 1]);
+            assert_eq!(&buffer.current()[16..20], &[192, 0, 2, 2]);
+            let network = hammer_core::buffer_opaque!(buffer => NetworkOpaque);
+            assert_eq!(network.ip().ip_protocol(), Some(6));
+            assert_eq!(network.packet_cursor().transport_header_offset(), 20);
+        }
+        runtime.buffer_free_one(index);
+        Ok(())
     }
 }

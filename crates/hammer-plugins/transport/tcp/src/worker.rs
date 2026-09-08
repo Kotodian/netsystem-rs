@@ -1,7 +1,6 @@
 use std::time::{Duration, Instant};
 
 use crate::{TcpError, TcpSeq, TcpState};
-use hammer_core::data_plane::DataPlaneBuffers;
 use hammer_infra::pool::Pool;
 use hammer_runtime::{DataPlaneMain, DataWorkerId};
 use hammer_runtime::{RuntimeError, RuntimeResult};
@@ -93,9 +92,9 @@ impl TcpWorker {
         &mut self,
         sessions: &mut SessionWorker,
         index: u32,
-        runtime: &DataPlaneMain,
+        runtime: &mut DataPlaneMain,
         output_next: SessionQueueNext,
-        frame: &mut hammer_core::data_plane::BufferFrame,
+        frame: &mut hammer_core::data_plane::Frame,
         output: &mut SessionQueueOutput,
         now: Instant,
     ) -> RuntimeResult<()> {
@@ -147,9 +146,9 @@ impl SessionTransport for TcpWorker {
         index: u32,
         rx_available: usize,
         rx_capacity: usize,
-        runtime: &DataPlaneMain,
+        runtime: &mut DataPlaneMain,
         output_next: SessionQueueNext,
-        frame: &mut hammer_core::data_plane::BufferFrame,
+        frame: &mut hammer_core::data_plane::Frame,
         output: &mut SessionQueueOutput,
     ) -> RuntimeResult<bool> {
         let zero_receive_window_sent = {
@@ -184,9 +183,9 @@ impl SessionTransport for TcpWorker {
     fn update_time(
         &mut self,
         sessions: &mut SessionWorker,
-        runtime: &DataPlaneMain,
+        runtime: &mut DataPlaneMain,
         output_next: SessionQueueNext,
-        frame: &mut hammer_core::data_plane::BufferFrame,
+        frame: &mut hammer_core::data_plane::Frame,
         output: &mut SessionQueueOutput,
         now: Instant,
     ) -> RuntimeResult<()> {
@@ -250,9 +249,9 @@ impl SessionTransport for TcpWorker {
         &mut self,
         sessions: &mut SessionWorker,
         index: u32,
-        runtime: &DataPlaneMain,
+        runtime: &mut DataPlaneMain,
         output_next: SessionQueueNext,
-        frame: &mut hammer_core::data_plane::BufferFrame,
+        frame: &mut hammer_core::data_plane::Frame,
         output: &mut SessionQueueOutput,
         now: Instant,
     ) -> RuntimeResult<()> {
@@ -273,9 +272,9 @@ impl SessionPacketizedTransport for TcpWorker {
         &mut self,
         sessions: &mut SessionWorker,
         index: u32,
-        runtime: &DataPlaneMain,
+        runtime: &mut DataPlaneMain,
         output_next: SessionQueueNext,
-        frame: &mut hammer_core::data_plane::BufferFrame,
+        frame: &mut hammer_core::data_plane::Frame,
         output: &mut SessionQueueOutput,
         now: Instant,
     ) -> RuntimeResult<()> {
@@ -325,7 +324,7 @@ impl SessionPacketizedTransport for TcpWorker {
         &mut self,
         index: u32,
         batch: &[TxBatchBuffer],
-        buffers: &DataPlaneBuffers,
+        runtime: &mut DataPlaneMain,
         now: Instant,
     ) -> RuntimeResult<()> {
         let connection = self
@@ -348,7 +347,7 @@ impl SessionPacketizedTransport for TcpWorker {
         }
         for entry in batch {
             let segment = connection.tx_segment(entry.payload_len, capabilities)?;
-            segment.write_to_buffer(buffers, entry.index)?;
+            segment.write_to_buffer(&mut *runtime.buffer_mut(entry.index))?;
             connection.commit_payload_tx(entry.payload_len, now)?;
         }
         connection.sync_payload_tx_timers(index, &mut self.timers, now)

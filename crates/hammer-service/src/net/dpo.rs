@@ -62,7 +62,7 @@ impl DpoType {
 }
 
 #[repr(transparent)]
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, zerocopy::FromBytes, zerocopy::IntoBytes, zerocopy::Immutable)]
 pub struct DpoId(u64);
 
 impl PartialEq for DpoId {

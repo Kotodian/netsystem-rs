@@ -2,7 +2,8 @@
 
 ## When to read
 
-Read this file when reviewing a completed Hammer feature against vendored VPP. Use the paths as starting points, not as exhaustive search boundaries.
+Read this file when designing or reviewing a Hammer change against vendored
+VPP. Use the paths as starting points, not as exhaustive search boundaries.
 
 ## Contents
 

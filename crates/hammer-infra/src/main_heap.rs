@@ -25,7 +25,7 @@ use libmimalloc_sys::{
 use crate::align::VEC_MIN_ALIGN;
 use crate::physmem::PhysmemError;
 #[cfg(target_os = "linux")]
-use crate::physmem::map_hugetlb;
+use crate::physmem::map_pages;
 
 mod interpose;
 
@@ -58,7 +58,7 @@ pub enum PageSize {
 }
 
 impl PageSize {
-    pub(crate) fn bytes(self) -> io::Result<usize> {
+    pub fn bytes(self) -> io::Result<usize> {
         match self {
             Self::Default => {
                 // SAFETY: sysconf reads process-global kernel configuration.
@@ -381,7 +381,7 @@ pub fn init_with(
                         continue;
                     }
 
-                    let mapping = match map_hugetlb(
+                    let mapping = match map_pages(
                         size,
                         page_size,
                         selected_page_size,

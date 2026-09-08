@@ -58,7 +58,6 @@ pub struct GlobalMain {
     pub registry: Arc<RuntimeRegistry>,
     pub(crate) main_loop_exit_now: Arc<AtomicBool>,
     pub main_loop_exit_status: Arc<Mutex<i32>>,
-    pub(crate) memory_initialized: bool,
     pub(crate) worker_config: Worker,
     pub(crate) called_init_functions: HashSet<&'static str>,
     pub(crate) called_early_config_functions: HashSet<&'static str>,

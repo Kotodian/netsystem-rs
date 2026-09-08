@@ -1,12 +1,12 @@
 use crate::protocol::{IcmpBuildError, IcmpHeader, build_echo_reply};
-use hammer_core::data_plane::{BufferFrame, BufferPacketCursor, Index, NodeId, NodeNext};
+use hammer_core::data_plane::{BufferPacketCursor, Frame, NodeId, NodeNext};
 use hammer_plugin_ip::ip::ip_header;
 use hammer_plugin_ip::protocol::icmp::IcmpErrorMetadata;
 use hammer_plugin_ip::protocol::ip::{IpProtocol, IpVersion};
 use hammer_plugin_ip::protocol::wire::read_header;
 use hammer_runtime::RuntimeResult;
 use hammer_runtime::{
-    DataPlaneMain, Node, NodeProcessFn, NodeRuntimeData, TraceFormatter, add_packet_trace,
+    DataPlaneMain, Node, NodeProcessFn, NodeRuntime, TraceFormatter, add_packet_trace,
     format_packet_trace,
 };
 
@@ -236,8 +236,8 @@ impl Default for IcmpTypeSpec {
     next = Icmp4InputNext,
 )]
 pub struct Icmp4InputNode {
-    #[node(default = NodeRuntimeData::empty())]
-    runtime_data: NodeRuntimeData,
+    #[node(default = NodeRuntime::empty())]
+    runtime_data: NodeRuntime,
 }
 
 fn register_icmp4_input(runtime: &DataPlaneMain) -> RuntimeResult<NodeId> {
@@ -265,8 +265,8 @@ fn register_icmp4_input(runtime: &DataPlaneMain) -> RuntimeResult<NodeId> {
     next = Icmp6InputNext,
 )]
 pub struct Icmp6InputNode {
-    #[node(default = NodeRuntimeData::empty())]
-    runtime_data: NodeRuntimeData,
+    #[node(default = NodeRuntime::empty())]
+    runtime_data: NodeRuntime,
 }
 
 fn register_icmp6_input(runtime: &DataPlaneMain) -> RuntimeResult<NodeId> {
@@ -304,7 +304,7 @@ fn register_icmp6_input(runtime: &DataPlaneMain) -> RuntimeResult<NodeId> {
 impl crate::IcmpMain {
     fn register_type(
         &self,
-        nodes: &hammer_runtime::node::NodeRuntime,
+        nodes: &hammer_runtime::node::NodeMain,
         version: IpVersion,
         icmp_type: u8,
         node: NodeId,
@@ -330,8 +330,17 @@ impl crate::IcmpMain {
 
 impl Node for Icmp4InputNode {
     #[inline(always)]
-    fn process(&mut self, runtime: &DataPlaneMain, frame: &mut BufferFrame) -> () {
-        icmp_input_process(runtime, self.runtime_data, frame, IpVersion::V4)
+    fn process(
+        runtime: &mut DataPlaneMain,
+        node_runtime: &mut hammer_runtime::NodeRuntime,
+        frame: &mut Frame,
+    ) -> usize {
+        let process: NodeProcessFn = |runtime, data, frame| {
+            let processed_vectors = frame.len();
+            icmp_input_process(runtime, data, frame, IpVersion::V4);
+            processed_vectors
+        };
+        process(runtime, node_runtime, frame)
     }
 
     #[inline]
@@ -340,20 +349,24 @@ impl Node for Icmp4InputNode {
     }
 
     #[inline]
-    fn node_process(&self) -> NodeProcessFn {
-        |runtime, data, frame| icmp_input_process(runtime, data, frame, IpVersion::V4)
-    }
-
-    #[inline]
-    fn node_runtime_data(&self) -> RuntimeResult<NodeRuntimeData> {
+    fn node_runtime_data(&self) -> RuntimeResult<NodeRuntime> {
         Ok(self.runtime_data)
     }
 }
 
 impl Node for Icmp6InputNode {
     #[inline(always)]
-    fn process(&mut self, runtime: &DataPlaneMain, frame: &mut BufferFrame) -> () {
-        icmp_input_process(runtime, self.runtime_data, frame, IpVersion::V6)
+    fn process(
+        runtime: &mut DataPlaneMain,
+        node_runtime: &mut hammer_runtime::NodeRuntime,
+        frame: &mut Frame,
+    ) -> usize {
+        let process: NodeProcessFn = |runtime, data, frame| {
+            let processed_vectors = frame.len();
+            icmp_input_process(runtime, data, frame, IpVersion::V6);
+            processed_vectors
+        };
+        process(runtime, node_runtime, frame)
     }
 
     #[inline]
@@ -362,12 +375,7 @@ impl Node for Icmp6InputNode {
     }
 
     #[inline]
-    fn node_process(&self) -> NodeProcessFn {
-        |runtime, data, frame| icmp_input_process(runtime, data, frame, IpVersion::V6)
-    }
-
-    #[inline]
-    fn node_runtime_data(&self) -> RuntimeResult<NodeRuntimeData> {
+    fn node_runtime_data(&self) -> RuntimeResult<NodeRuntime> {
         Ok(self.runtime_data)
     }
 }
@@ -404,18 +412,22 @@ fn register_icmp4_echo_request(runtime: &DataPlaneMain) -> RuntimeResult<NodeId>
 
 impl Node for Icmp4EchoRequestNode {
     #[inline(always)]
-    fn process(&mut self, runtime: &DataPlaneMain, frame: &mut BufferFrame) -> () {
-        icmp_echo_request_process_frame(runtime, frame, IpVersion::V4)
+    fn process(
+        runtime: &mut DataPlaneMain,
+        node_runtime: &mut hammer_runtime::NodeRuntime,
+        frame: &mut Frame,
+    ) -> usize {
+        let process: NodeProcessFn = |runtime, node_runtime, frame| {
+            let processed_vectors = frame.len();
+            icmp_echo_request_process_frame(runtime, node_runtime, frame, IpVersion::V4);
+            processed_vectors
+        };
+        process(runtime, node_runtime, frame)
     }
 
     #[inline]
     fn node_trace_formatter(&self) -> Option<TraceFormatter> {
         Some(format_packet_trace!(IcmpEchoRequestTrace))
-    }
-
-    #[inline]
-    fn node_process(&self) -> NodeProcessFn {
-        |runtime, _, frame| icmp_echo_request_process_frame(runtime, frame, IpVersion::V4)
     }
 }
 
@@ -451,48 +463,57 @@ fn register_icmp6_echo_request(runtime: &DataPlaneMain) -> RuntimeResult<NodeId>
 
 impl Node for Icmp6EchoRequestNode {
     #[inline(always)]
-    fn process(&mut self, runtime: &DataPlaneMain, frame: &mut BufferFrame) -> () {
-        icmp_echo_request_process_frame(runtime, frame, IpVersion::V6)
+    fn process(
+        runtime: &mut DataPlaneMain,
+        node_runtime: &mut hammer_runtime::NodeRuntime,
+        frame: &mut Frame,
+    ) -> usize {
+        let process: NodeProcessFn = |runtime, node_runtime, frame| {
+            let processed_vectors = frame.len();
+            icmp_echo_request_process_frame(runtime, node_runtime, frame, IpVersion::V6);
+            processed_vectors
+        };
+        process(runtime, node_runtime, frame)
     }
 
     #[inline]
     fn node_trace_formatter(&self) -> Option<TraceFormatter> {
         Some(format_packet_trace!(IcmpEchoRequestTrace))
     }
-
-    #[inline]
-    fn node_process(&self) -> NodeProcessFn {
-        |runtime, _, frame| icmp_echo_request_process_frame(runtime, frame, IpVersion::V6)
-    }
 }
 
 fn icmp_input_process(
-    runtime: &DataPlaneMain,
-    _: NodeRuntimeData,
-    frame: &mut BufferFrame,
+    runtime: &mut DataPlaneMain,
+    node_runtime: &mut NodeRuntime,
+    frame: &mut Frame,
     version: IpVersion,
-) -> () {
-    let drop_slot = match version {
-        IpVersion::V4 => NodeNext::slot(Icmp4InputNext::Drop),
-        IpVersion::V6 => NodeNext::slot(Icmp6InputNext::Drop),
-    };
-    let mut nexts = [0; hammer_core::data_plane::DEFAULT_BUFFER_FRAME_CAPACITY];
-    for (index, slot) in frame.indices().iter().zip(&mut nexts) {
-        *slot = match next_slot_for_index(runtime, *index, version) {
-            Ok(slot) => slot,
-            Err(_) => drop_slot,
+) -> usize {
+    let processed_vectors = frame.len();
+    (|| {
+        let drop_slot = match version {
+            IpVersion::V4 => NodeNext::slot(Icmp4InputNext::Drop),
+            IpVersion::V6 => NodeNext::slot(Icmp6InputNext::Drop),
         };
-    }
-    runtime.enqueue_to_next(frame, &nexts[..frame.len()]);
-    ()
+        let mut nexts = [0; hammer_core::data_plane::DEFAULT_BUFFER_FRAME_CAPACITY];
+        for (index, slot) in frame.vector_args().iter().zip(&mut nexts) {
+            *slot = match next_slot_for_index(runtime, *index, version) {
+                Ok(slot) => slot,
+                Err(_) => drop_slot,
+            };
+        }
+        runtime.enqueue_to_next(node_runtime, frame, &nexts[..frame.len()]);
+        ()
+    })();
+    processed_vectors
 }
 
 fn icmp_echo_request_process_frame(
-    runtime: &DataPlaneMain,
-    frame: &mut BufferFrame,
+    runtime: &mut DataPlaneMain,
+    node_runtime: &mut hammer_runtime::NodeRuntime,
+    frame: &mut Frame,
     version: IpVersion,
 ) -> () {
-    hammer_runtime::process_frame!(runtime, frame, |index| {
+    hammer_runtime::process_frame!(runtime, node_runtime, frame, |index| {
         match next_for_echo_request_index(runtime, index, version) {
             Ok(next) => next,
             Err(_) => match version {
@@ -505,15 +526,15 @@ fn icmp_echo_request_process_frame(
 
 #[inline(always)]
 fn next_slot_for_index(
-    runtime: &DataPlaneMain,
-    index: Index,
+    runtime: &mut DataPlaneMain,
+    index: u32,
     version: IpVersion,
 ) -> RuntimeResult<u16> {
     let main = crate::IcmpMain::global()?;
-    let buffer = runtime.get_buffer(index)?;
+    let buffer = runtime.buffer(index);
     let current = buffer.current();
     // SAFETY: IP local initializes the network overlay before ICMP dispatch.
-    let network = unsafe { &*(buffer.opaque() as *const _ as *const NetworkOpaque) };
+    let network = hammer_core::buffer_opaque!(buffer => NetworkOpaque);
     let default_next = match version {
         IpVersion::V4 => NodeNext::slot(Icmp4InputNext::Drop),
         IpVersion::V6 => NodeNext::slot(Icmp6InputNext::Punt),
@@ -571,10 +592,9 @@ fn next_slot_for_index(
             None => Ok(entry.next),
         }
     })();
-    drop(buffer);
     match selected {
         Ok(next) => {
-            runtime.get_buffer_mut(index)?.clear_node_error();
+            runtime.buffer_mut(index).clear_node_error();
             trace.next = next;
         }
         Err(error) => {
@@ -595,24 +615,31 @@ fn next_slot_for_index(
 
 #[inline(always)]
 fn next_for_echo_request_index(
-    runtime: &DataPlaneMain,
-    index: Index,
+    runtime: &mut DataPlaneMain,
+    index: u32,
     version: IpVersion,
 ) -> RuntimeResult<u16> {
     let net = hammer_service::net::NetMain::global()?;
-    let mut buffer = runtime.get_buffer_mut(index)?;
-    // SAFETY: IP local initialized the packet's network overlay before dispatch.
-    let network = unsafe { &*(buffer.opaque() as *const _ as *const NetworkOpaque) };
-    let parsed =
-        ip_header(buffer.current(), network.packet_cursor()).map_err(|_| IcmpBuildError::BadLength);
+    let parsed = {
+        let buffer = runtime.buffer(index);
+        // SAFETY: IP local initialized the packet's network overlay before dispatch.
+        let network = hammer_core::buffer_opaque!(buffer => NetworkOpaque);
+        ip_header(buffer.current(), network.packet_cursor())
+            .map_err(|_| IcmpBuildError::BadLength)
+            .and_then(|parsed| {
+                if parsed.version == version {
+                    Ok(parsed)
+                } else {
+                    Err(IcmpBuildError::WrongProtocol)
+                }
+            })
+    };
+    let fragment_id = match &parsed {
+        Ok(parsed) if parsed.version == IpVersion::V4 => runtime.random().next_u32() as u16,
+        _ => 0,
+    };
+    let buffer = runtime.buffer_mut(index);
     let reply = parsed.and_then(|parsed| {
-        if parsed.version != version {
-            return Err(IcmpBuildError::WrongProtocol);
-        }
-        let fragment_id = match parsed.version {
-            IpVersion::V4 => runtime.random().next_u32() as u16,
-            IpVersion::V6 => 0,
-        };
         build_echo_reply(buffer.current_mut(), &parsed, fragment_id)?;
         Ok(parsed)
     });
@@ -623,9 +650,11 @@ fn next_for_echo_request_index(
                 IpVersion::V6 => NodeNext::slot(Icmp6EchoRequestNext::Lookup),
             };
             buffer.clear_node_error();
-            IcmpErrorMetadata::clear(buffer.opaque2_mut());
+            IcmpErrorMetadata::clear(
+                hammer_core::buffer_opaque!(mut buffer => hammer_plugin_ip::IpSecondaryOpaque),
+            );
             // SAFETY: same initialized overlay; the packet remains owned by this frame.
-            let network = unsafe { &mut *(buffer.opaque_mut() as *mut _ as *mut NetworkOpaque) };
+            let network = hammer_core::buffer_opaque!(mut buffer => NetworkOpaque);
             network.flags = NetworkFlags::LOCALLY_ORIGINATED
                 | NetworkFlags::L4_CHECKSUM_COMPUTED
                 | NetworkFlags::L4_CHECKSUM_CORRECT;
@@ -652,7 +681,6 @@ fn next_for_echo_request_index(
                         parsed.transport_header_offset + ICMP_ECHO_HEADER_LEN,
                     ),
             );
-            drop(buffer);
             add_packet_trace!(
                 runtime,
                 index,
@@ -665,7 +693,6 @@ fn next_for_echo_request_index(
             Ok(next)
         }
         Err(error) => {
-            drop(buffer);
             let error = IcmpNodeError::from(error);
             set_index_node_error(runtime, index, error)?;
             let next = match version {
@@ -694,6 +721,8 @@ mod tests {
     #[test]
     fn input_dispatch_preserves_protocol_specific_validation() -> RuntimeResult<()> {
         hammer_runtime::config::Memory::default().ensure_main_heap()?;
+        hammer_core::buffer::BufferMain::new(64, 1024, &[0], 2, hammer_infra::PageSize::Default)
+            .unwrap();
         let mut main = GlobalMain::new(
             DataPlaneMain::new(DataPlaneBufferConfig::default()),
             RuntimeRegistry::new(),
@@ -711,7 +740,7 @@ mod tests {
             std::process::id()
         ))?;
         hammer_runtime::init::run_init_functions(&mut main)?;
-        let runtime = main.data_plane_main();
+        let runtime = main.data_plane_main_mut();
 
         // icmp6.c::icmp6_input applies code, hop-limit, then minimum-length
         // validation. Every classified error uses punt, including registered
@@ -803,17 +832,16 @@ mod tests {
                 ]);
                 packet[42..44].copy_from_slice(&checksum.to_be_bytes());
             }
-            let mut frame = runtime.buffers().get_next_frame(input)?;
-            let index = runtime
-                .buffers()
-                .alloc_index_with_bytes(&packet[..packet_len])?;
-            frame.push_index(index)?;
+            let mut index = u32::MAX;
+            assert_eq!(
+                runtime.buffer_add_data(&mut index, &packet[..packet_len]),
+                (&packet[..packet_len]).len()
+            );
             {
-                let mut buffer = runtime.get_buffer_mut(index)?;
+                let mut buffer = runtime.buffer_mut(index);
                 // SAFETY: this fixture installs the same initialized service
                 // overlay that IP local supplies at the ICMP input boundary.
-                let network =
-                    unsafe { &mut *(buffer.opaque_mut() as *mut _ as *mut NetworkOpaque) };
+                let network = hammer_core::buffer_opaque!(mut buffer => NetworkOpaque);
                 *network = NetworkOpaque::default();
                 network.set_packet_cursor(
                     BufferPacketCursor::new()
@@ -823,25 +851,25 @@ mod tests {
                         .with_transport_payload_offset(header_len + 4),
                 );
             }
-            let next = runtime
-                .with_current_node(input, || next_slot_for_index(runtime, index, version))?;
+            let next = runtime.with_current_node(input, |runtime| {
+                next_slot_for_index(runtime, index, version)
+            })?;
             assert_eq!(
                 runtime.nodes().node_next_slot(input, usize::from(next))?,
                 if error.is_some() { punt } else { echo },
             );
             let expected_error = error
                 .map(|error| {
-                    runtime.with_current_node(input, || runtime.record_current_node_error(error))
+                    runtime.with_current_node(input, |runtime| {
+                        runtime.record_current_node_error(error)
+                    })
                 })
                 .transpose()?;
-            assert_eq!(
-                runtime.get_buffer(index)?.node_error_index(),
-                expected_error
-            );
+            assert_eq!(runtime.buffer(index).node_error_index(), expected_error);
             if error.is_none() {
                 let mut expected_random = runtime.random().clone();
                 let fragment_id = expected_random.next_u32() as u16;
-                let next = runtime.with_current_node(echo, || {
+                let next = runtime.with_current_node(echo, |runtime| {
                     next_for_echo_request_index(runtime, index, version)
                 })?;
                 assert_eq!(
@@ -854,7 +882,7 @@ mod tests {
                         })
                         .unwrap()
                 );
-                let buffer = runtime.get_buffer(index)?;
+                let buffer = runtime.buffer(index);
                 let reply = buffer.current();
                 if version == IpVersion::V4 {
                     assert_eq!(&reply[4..6], &fragment_id.to_be_bytes());
@@ -879,11 +907,15 @@ mod tests {
                         0
                     );
                 }
-                let network = unsafe { &*(buffer.opaque() as *const _ as *const NetworkOpaque) };
+                let network = hammer_core::buffer_opaque!(buffer => NetworkOpaque);
                 assert!(network.flags.contains(NetworkFlags::LOCALLY_ORIGINATED));
             }
+            let segments = runtime.chain(index).count();
+            let cached_free = runtime.cached_free_buffers();
+            runtime.buffer_free_one(index);
+            assert_eq!(runtime.cached_free_buffers(), cached_free + segments);
         }
-        assert_eq!(runtime.buffers().in_use_buffers(), 0);
+
         main.close()?;
         GlobalMain::uninstall_current();
         Ok(())

@@ -73,11 +73,8 @@ pub fn start_workers(engine: &mut GlobalMain) -> RuntimeResult<()> {
                     }
 
                     let numa_node = worker_config.apply_current_thread_setup(worker.slot())?;
-                    let (buffer_arenas, frame_slots, nodes, simd_bytes, _, trace_control) =
-                        runtime_parts;
+                    let (nodes, simd_bytes, _, trace_control) = runtime_parts;
                     let runtime = DataPlaneMain::from_worker_parts(
-                        buffer_arenas,
-                        frame_slots,
                         nodes,
                         simd_bytes,
                         Some(handoff),
@@ -124,19 +121,7 @@ pub fn start_workers(engine: &mut GlobalMain) -> RuntimeResult<()> {
                             format!("exited with status {exit_status}"),
                         ))
                     };
-                    let exit_result = crate::init::run_worker_exit_functions(&mut main);
-                    match (loop_result, exit_result) {
-                        (Ok(()), result) => result,
-                        (Err(loop_error), Ok(())) => Err(loop_error),
-                        (Err(loop_error), Err(exit_error)) => {
-                            tracing::error!(
-                                worker = thread_index,
-                                %exit_error,
-                                "data worker exit callback failed"
-                            );
-                            Err(loop_error)
-                        }
-                    }
+                    loop_result
                 }));
                 remote_local.close();
                 spawn::cleanup_thread_local();

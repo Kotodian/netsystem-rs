@@ -6,17 +6,21 @@
 
 use criterion::{BenchmarkId, Criterion, criterion_group, criterion_main};
 use hammer_core::data_plane::{
-    BufferFrame, DEFAULT_BUFFER_FRAME_CAPACITY, Frame, Index, Next, NodeId, NodeKind,
-    NodeRegistration,
+    DEFAULT_BUFFER_FRAME_CAPACITY, Frame, NodeId, NodeKind, NodeRegistration,
 };
 use hammer_infra::mask_compare::{
     mask_compare_u16_arch, mask_compare_u16_scalar, mask_compare_u16_words,
 };
 use hammer_runtime::RuntimeResult;
-use hammer_runtime::node::{NodeDescriptor, NodeRuntimeData};
+use hammer_runtime::node::{NodeDescriptor, NodeRuntime};
 use hammer_runtime::{DataPlaneBufferConfig, DataPlaneMain};
 
 fn test_runtime(frame_slots: usize, buffer_slots: usize) -> DataPlaneMain {
+    BUFFER_MAIN_INIT.call_once(|| {
+        hammer_infra::main_heap::init_default().unwrap();
+        hammer_core::buffer::BufferMain::new(64, 4096, &[0], 0, hammer_infra::PageSize::Default)
+            .unwrap();
+    });
     DataPlaneMain::new(DataPlaneBufferConfig {
         buffer_slot_capacity: 64,
         buffer_slots,
@@ -29,11 +33,11 @@ fn register_sink(runtime: &DataPlaneMain, name: &'static str) -> RuntimeResult<N
     runtime.nodes().try_register_descriptor(
         NodeKind::Internal,
         NodeDescriptor::new(
-            |_, _, frame: &mut BufferFrame| {
-                frame.discard_prefix(frame.len());
-                ()
+            |runtime, _, frame: &mut Frame| {
+                runtime.buffer_free(frame.vector_args());
+                frame.len()
             },
-            NodeRuntimeData::empty(),
+            NodeRuntime::empty(),
             Some(NodeRegistration::next(name, 0)),
             &[],
             None,
@@ -45,8 +49,8 @@ fn register_owner(runtime: &DataPlaneMain, nexts: &[NodeId]) -> RuntimeResult<No
     runtime.nodes().try_register_descriptor(
         NodeKind::Internal,
         NodeDescriptor::new(
-            |_, _, _| (),
-            NodeRuntimeData::empty(),
+            |_, _, frame| frame.len(),
+            NodeRuntime::empty(),
             Some(NodeRegistration::next("fanout-owner", nexts.len())),
             nexts,
             None,
@@ -57,13 +61,22 @@ fn register_owner(runtime: &DataPlaneMain, nexts: &[NodeId]) -> RuntimeResult<No
 struct FanoutFixture {
     runtime: DataPlaneMain,
     owner: NodeId,
-    frame: Frame<Next>,
+    frame: Box<Frame>,
     nexts: [u16; DEFAULT_BUFFER_FRAME_CAPACITY],
-    _indices: Vec<Index>,
+}
+
+impl Drop for FanoutFixture {
+    fn drop(&mut self) {
+        // Dispatch queued packets to the terminal nodes outside measurement;
+        // those nodes release Buffers independently of Frame storage.
+        self.runtime
+            .run_ready_nodes()
+            .expect("fanout terminal dispatch");
+    }
 }
 
 fn build_fixture(pattern: FanoutPattern) -> FanoutFixture {
-    let runtime = test_runtime(128, DEFAULT_BUFFER_FRAME_CAPACITY * 4);
+    let mut runtime = test_runtime(128, DEFAULT_BUFFER_FRAME_CAPACITY * 4);
     let sinks = [
         register_sink(&runtime, "s0").expect("s0"),
         register_sink(&runtime, "s1").expect("s1"),
@@ -71,14 +84,18 @@ fn build_fixture(pattern: FanoutPattern) -> FanoutFixture {
         register_sink(&runtime, "s3").expect("s3"),
     ];
     let owner = register_owner(&runtime, &sinks).expect("owner");
-    let mut indices = Vec::with_capacity(DEFAULT_BUFFER_FRAME_CAPACITY);
-    let mut frame = runtime.buffers().get_next_frame(owner).expect("frame");
+    let mut frame = Frame::<(), u32, ()>::new(0);
     for offset in 0..DEFAULT_BUFFER_FRAME_CAPACITY {
-        let index = runtime
-            .alloc_index_with_bytes(&[(offset % 256) as u8])
-            .expect("alloc");
-        frame.push_index(index).expect("push");
-        indices.push(index);
+        let mut index = u32::MAX;
+        assert_eq!(
+            runtime.buffer_add_data(&mut index, &[(offset % 256) as u8]),
+            1
+        );
+        {
+            let count = frame.len();
+            frame.set_vector_count(count + 1);
+            frame.vector_args_mut()[count] = index;
+        }
     }
     let mut nexts = [0u16; DEFAULT_BUFFER_FRAME_CAPACITY];
     match pattern {
@@ -96,22 +113,23 @@ fn build_fixture(pattern: FanoutPattern) -> FanoutFixture {
     }
 
     // Warm grouping/transfer once so measured iterations start from a steady state.
-    runtime.with_current_node(owner, || {
-        runtime.enqueue_to_next(&mut frame, &nexts);
+    runtime.with_current_node(owner, |runtime| {
+        runtime.enqueue_to_next(&mut NodeRuntime::empty(), &mut frame, &nexts);
     });
-    let _ = runtime.run_ready_nodes();
+    runtime.run_ready_nodes().expect("warm fanout dispatch");
 
-    let mut frame = runtime
-        .buffers()
-        .get_next_frame(owner)
-        .expect("measured frame");
-    let mut indices = Vec::with_capacity(DEFAULT_BUFFER_FRAME_CAPACITY);
+    let mut frame = Frame::<(), u32, ()>::new(0);
     for offset in 0..DEFAULT_BUFFER_FRAME_CAPACITY {
-        let index = runtime
-            .alloc_index_with_bytes(&[(offset % 256) as u8])
-            .expect("alloc");
-        frame.push_index(index).expect("push");
-        indices.push(index);
+        let mut index = u32::MAX;
+        assert_eq!(
+            runtime.buffer_add_data(&mut index, &[(offset % 256) as u8]),
+            1
+        );
+        {
+            let count = frame.len();
+            frame.set_vector_count(count + 1);
+            frame.vector_args_mut()[count] = index;
+        }
     }
 
     FanoutFixture {
@@ -119,7 +137,6 @@ fn build_fixture(pattern: FanoutPattern) -> FanoutFixture {
         owner,
         frame,
         nexts,
-        _indices: indices,
     }
 }
 
@@ -141,10 +158,12 @@ fn bench_fanout_256(c: &mut Criterion) {
             b.iter_batched_ref(
                 || build_fixture(pattern),
                 |fixture| {
-                    fixture.runtime.with_current_node(fixture.owner, || {
-                        fixture
-                            .runtime
-                            .enqueue_to_next(&mut fixture.frame, &fixture.nexts);
+                    fixture.runtime.with_current_node(fixture.owner, |runtime| {
+                        runtime.enqueue_to_next(
+                            &mut NodeRuntime::empty(),
+                            &mut fixture.frame,
+                            &fixture.nexts,
+                        );
                     });
                 },
                 criterion::BatchSize::PerIteration,
@@ -185,3 +204,5 @@ fn bench_mask_compare_paths(c: &mut Criterion) {
 
 criterion_group!(benches, bench_fanout_256, bench_mask_compare_paths);
 criterion_main!(benches);
+
+static BUFFER_MAIN_INIT: std::sync::Once = std::sync::Once::new();

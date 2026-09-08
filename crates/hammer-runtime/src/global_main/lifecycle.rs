@@ -4,7 +4,7 @@ use std::sync::atomic::Ordering;
 use crate::AsyncFileMain;
 use crate::error::{RuntimeError, RuntimeResult};
 use crate::global_main::GlobalMain;
-use crate::node::NodeRuntime;
+use crate::node::NodeMain;
 use crate::process::ProcessHandle;
 use hammer_stats::StatsMain;
 
@@ -38,7 +38,7 @@ impl GlobalMain {
                 "control runtime is not initialized",
             )
         })?;
-        let graph = NodeRuntime::default();
+        let graph = NodeMain::default();
         self.control_thread.run(async {
             let process_future = self.control_thread.run_processes_until(future);
             tokio::pin!(process_future);
@@ -89,7 +89,6 @@ impl GlobalMain {
             Some(barrier) => barrier.final_sync(exit),
             None => exit(),
         };
-        let worker_result = Ok(());
         drop(self.ipc_listener.take());
         let unlink_result = match StatsMain::global() {
             Ok(stats_main) => stats_main.unlink_socket_path().map_err(RuntimeError::from),
@@ -98,7 +97,7 @@ impl GlobalMain {
         };
 
         let mut first_error = None;
-        for result in [exit_result, worker_result, unlink_result] {
+        for result in [exit_result, unlink_result] {
             if let Err(error) = result
                 && first_error.is_none()
             {
@@ -106,35 +105,5 @@ impl GlobalMain {
             }
         }
         first_error.map_or(Ok(()), Err)
-    }
-
-    fn join_worker_threads(&mut self) -> RuntimeResult<()> {
-        let threads = std::mem::take(&mut self.worker_threads);
-        let mut worker_error = None;
-        let mut unwind_payload = None;
-        for (worker, thread) in threads.into_iter().enumerate() {
-            match thread.join() {
-                Ok(Ok(())) => {}
-                Ok(Err(error)) if worker_error.is_none() => worker_error = Some(error),
-                Ok(Err(error)) => {
-                    tracing::error!(worker, %error, "data worker failed during shutdown");
-                }
-                Err(payload) if unwind_payload.is_none() => unwind_payload = Some(payload),
-                Err(payload) => {
-                    tracing::error!(
-                        worker,
-                        panic = %super::thread_panic_message(payload),
-                        "data worker panicked during shutdown"
-                    );
-                }
-            }
-        }
-        if let Some(payload) = unwind_payload {
-            std::panic::resume_unwind(payload);
-        }
-        match worker_error {
-            Some(error) => Err(error),
-            None => Ok(()),
-        }
     }
 }

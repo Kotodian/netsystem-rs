@@ -14,8 +14,6 @@ pub enum RuntimeError {
     Lifecycle { stage: String, message: String },
     #[error("service closed")]
     ServiceClosed,
-    #[error("memory initialization has not completed")]
-    MemoryNotInitialized,
     #[error("global FileMain is already initialized")]
     FileMainAlreadyInitialized,
     #[error("global FileMain is not initialized")]
@@ -147,9 +145,9 @@ pub enum RuntimeError {
     #[error("data worker requested exit during initialization")]
     WorkerRequestedExitDuringInitialization,
     #[error("node runtime data value {value} does not fit u64")]
-    NodeRuntimeDataOverflow { value: usize },
+    NodeRuntimeValueOverflow { value: usize },
     #[error("node runtime data word {word} value {value} does not fit usize")]
-    NodeRuntimeDataWordOutOfRange { word: usize, value: u64 },
+    NodeRuntimeWordOutOfRange { word: usize, value: u64 },
     #[error("graph node next count {count} does not fit a u16 slot")]
     NodeNextCountOverflow { count: usize },
     #[error(

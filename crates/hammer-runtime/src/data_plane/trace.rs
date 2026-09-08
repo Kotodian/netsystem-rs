@@ -25,11 +25,10 @@ impl DataPlaneMain {
     /// Used by Session Queue test helpers and any non-dispatch path that must
     /// flush through Graph Fanout against a concrete owner node's local nexts.
     #[inline]
-    pub fn with_current_node<R>(&self, node: NodeId, f: impl FnOnce() -> R) -> R {
+    pub fn with_current_node<R>(&mut self, node: NodeId, f: impl FnOnce(&mut Self) -> R) -> R {
         let previous = self.current_node.get();
         self.current_node.set(Some(node));
-        let result = f();
-        self.flush_fanout_appendable();
+        let result = f(self);
         self.current_node.set(previous);
         result
     }
@@ -40,26 +39,26 @@ impl DataPlaneMain {
     }
 
     #[inline]
-    pub fn try_mark_trace(&self, node: NodeId, index: Index) -> RuntimeResult<()> {
+    pub fn try_mark_trace(&mut self, node: NodeId, index: u32) -> RuntimeResult<()> {
         if !self.trace.may_mark(node) {
             return Ok(());
         }
-        if self.get_buffer(index)?.trace_handle().is_some() {
+        if self.buffer(index).trace_handle().is_some() {
             return Ok(());
         }
         let node_name = self.nodes.node_name(node)?;
         if let Some(handle) = self.trace.try_mark(node, node_name) {
-            self.get_buffer_mut(index)?.set_trace_handle(handle);
+            self.buffer_mut(index).set_trace_handle(handle);
         }
         Ok(())
     }
 
     #[inline]
-    pub fn add_trace<T: PacketTrace>(&self, index: Index, trace: T) -> RuntimeResult<()> {
+    pub fn add_trace<T: PacketTrace>(&self, index: u32, trace: T) -> RuntimeResult<()> {
         let Some(node) = self.current_node() else {
             return Ok(());
         };
-        let Some(handle) = self.get_buffer(index)?.trace_handle() else {
+        let Some(handle) = self.buffer(index).trace_handle() else {
             return Ok(());
         };
         let node_name = self.nodes.node_name(node)?;
@@ -72,10 +71,8 @@ impl DataPlaneMain {
     }
 
     #[inline(always)]
-    pub fn should_trace_packet(&self, index: Index) -> RuntimeResult<bool> {
-        Ok(crate::unlikely(
-            self.get_buffer(index)?.trace_handle().is_some(),
-        ))
+    pub fn should_trace_packet(&self, index: u32) -> RuntimeResult<bool> {
+        Ok(crate::unlikely(self.buffer(index).trace_handle().is_some()))
     }
 
     /// Record the current node's generated local error and return its global index.

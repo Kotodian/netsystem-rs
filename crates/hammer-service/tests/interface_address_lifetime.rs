@@ -7,6 +7,8 @@ fn address_removal_preserves_other_interface_addresses() {
     hammer_runtime::config::Memory::default()
         .ensure_main_heap()
         .unwrap();
+    hammer_core::buffer::BufferMain::new(64, 1024, &[0], 2, hammer_infra::PageSize::Default)
+        .unwrap();
     let mut main = GlobalMain::new(
         DataPlaneMain::new(DataPlaneBufferConfig::default()),
         RuntimeRegistry::new(),
