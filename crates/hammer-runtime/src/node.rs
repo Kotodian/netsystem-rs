@@ -2026,6 +2026,22 @@ impl DataPlaneMain {
             assert!(!frame.is_empty(), "Pending Frame contains vectors");
             self.nodes.clear_interrupt_pending(node)?;
 
+            // dispatch_pending_node transfers the enqueue trace bit once and
+            // clears it for the next frame, including an untraced dispatch.
+            let trace = next_frame_index.map_or(0, |index| {
+                let next = &mut self.nodes.next_frames[index];
+                let trace = next.flags & (1 << 5);
+                next.flags &= !(1 << 5);
+                trace
+            });
+            {
+                let mut graph = self.nodes.inner.borrow_mut();
+                let runtime = graph.nodes[node.slot() as usize]
+                    .runtime_data
+                    .as_mut()
+                    .expect("pending node runtime is available before dispatch");
+                runtime.flags = (runtime.flags & !(1 << 5)) | trace;
+            }
             self.dispatch_node(node, &mut frame)?;
             processed += 1;
             frame.frame_flags &= !((1 << 2) | (1 << 14));

@@ -235,8 +235,8 @@ impl DataPlaneMain {
         let index = self.nodes.next_frame_indices[source.slot() as usize][next_index as usize];
         if vectors_left < FRAME_VECTOR_CAPACITY {
             runtime.cached_next_index = next_index;
+            self.nodes.next_frames[index].flags |= runtime.flags & (1 << 5);
         }
-        self.nodes.next_frames[index].flags |= runtime.flags & (1 << 5);
         self.nodes.put_next_frame_index(index, vectors_left);
     }
 }
@@ -447,7 +447,7 @@ mod tests {
     }
 
     fn packet_output(_: &mut DataPlaneMain, state: &mut NodeRuntime, frame: &mut Frame) -> usize {
-        *state = NodeRuntime::from_words([
+        state.words = [
             state.word(0) + 1,
             state.word(1) + frame.len() as u64,
             state.word(2)
@@ -456,8 +456,8 @@ mod tests {
                     .iter()
                     .map(|index| u64::from(*index))
                     .sum::<u64>(),
-            0,
-        ]);
+            u64::from(state.flags & (1 << 5)),
+        ];
         frame.len()
     }
 
@@ -607,5 +607,30 @@ mod tests {
             runtime.nodes().node_runtime_data(output).unwrap().word(1),
             300
         );
+
+        // main.c::vlib_put_next_frame / dispatch_pending_node: no standalone
+        // upstream unit case; verify the actual Next -> Runtime flag transition.
+        state.flags |= 1 << 5;
+        runtime.with_current_node(input, |runtime| {
+            runtime.get_next_frame::<u32, ()>(&mut state, 0);
+            runtime.put_next_frame(&mut state, 0, 256);
+        });
+        let next = runtime.nodes.next_frame_indices[input.slot() as usize][0];
+        assert_eq!(runtime.nodes.next_frames[next].flags & (1 << 5), 0);
+        assert_eq!(runtime.run_ready_nodes().unwrap(), 0);
+        for trace in [true, false] {
+            state.flags = if trace { 1 << 5 } else { 0 };
+            runtime.with_current_node(input, |runtime| {
+                let (vectors, _) = runtime.get_next_frame::<u32, ()>(&mut state, 0);
+                vectors[0] = 41;
+                runtime.put_next_frame(&mut state, 0, 255);
+            });
+            assert_eq!(runtime.run_ready_nodes().unwrap(), 1);
+            assert_eq!(
+                runtime.nodes().node_runtime_data(output).unwrap().word(3),
+                if trace { 1 << 5 } else { 0 }
+            );
+            assert_eq!(runtime.nodes.next_frames[next].flags & (1 << 5), 0);
+        }
     }
 }
