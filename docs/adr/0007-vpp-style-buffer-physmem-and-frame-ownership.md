@@ -139,6 +139,64 @@ capacity and clean-state flag bits are removed. Data capacity belongs to the
 Buffer Pool, and validity of second-half or opaque fields follows the public
 first-cache-line flags and the operation that owns those fields.
 
+### Opaque overlays
+
+The two opaque regions retain VPP's fixed storage and lifecycle. Primary
+`opaque` is exactly ten `u32` words (40 bytes) inside the first-cache-line
+template. Secondary `opaque2` is exactly fourteen `u32` words (56 bytes) in
+the second half. Returning a Buffer to its Pool and allocating it again
+restores the first-cache-line template, including primary `opaque`; it does
+not clear or initialize `opaque2`. A producer must write the secondary fields
+owned by its current graph path before a consumer reads them.
+
+An owner declares a typed overlay with the `#[buffer_opaque(primary)]` or
+`#[buffer_opaque(secondary)]` macro. The macro emits the C representation and
+compile-time size/alignment assertions against the selected fixed region. An
+eligible overlay is fixed-layout, `Copy`, accepts every initialized bit
+pattern, and contains no references or values requiring `Drop`. These are
+compile-time representation requirements needed to construct a Rust borrow;
+the macro does not generate runtime tags, versions, initialization tracking,
+field validation, or dynamic registration.
+
+Call sites obtain the overlay directly through one macro:
+
+```rust
+let network = buffer_opaque!(buffer => NetworkOpaque);
+let network = buffer_opaque!(mut buffer => NetworkOpaque);
+```
+
+The immutable form returns `&NetworkOpaque`; the mutable form returns
+`&mut NetworkOpaque`. The declaration associates the type with primary or
+secondary storage, so the use site does not pass an offset or choose a raw
+region. Expansion performs a direct zero-copy overlay of the Buffer union.
+The pointer cast and Rust-union member access remain generated implementation
+details; callers invoke no unsafe function and write no unsafe block.
+
+The macro accepts owner-defined structs and unions. For a declared union it
+generates safe shared and mutable member accessors for members that satisfy the
+same representation contract. Selecting the member remains a graph-path
+semantic responsibility, as it is for VPP's `vnet_buffer_opaque_t` unions; no
+active-member discriminator is added. Fields that must coexist are placed in
+one explicit owner-defined struct. Mutually exclusive interpretations are
+placed in an explicit union. The macro does not support an arbitrary byte or
+word offset.
+
+`hammer-core` owns only the fixed primary/secondary storage mechanism and the
+access macro. Each service or plugin owns the overlay types whose packet facts
+it defines. In particular, the network service owns its primary network
+overlay; the IP plugin owns one secondary layout that visibly contains both
+lookup state and the ICMP-error word; TCP and UDP own their mutually exclusive
+secondary layouts. No plugin-specific type, union member, registry entry, or
+capability is moved into `hammer-core` or `hammer-runtime`.
+
+Opaque data is Buffer header state rather than a Rust-owned object. The Buffer
+free family never runs an overlay destructor or clears `opaque2`. Operations
+that copy a Buffer and its metadata copy both opaque regions byte-for-byte,
+matching VPP's Buffer copy paths. `buffer_attach_clone` shares the existing
+tail Buffers and does not create another overlay owner or perform an overlay
+copy. Domain presence tags already required by a protocol remain owned and
+interpreted by that protocol; the opaque mechanism adds none.
+
 ### Buffer access and chains
 
 `BUFFER_MAIN` is the independent process-global `BufferMain` authority. It is
@@ -146,9 +204,9 @@ initialized once before any Data Worker starts and remains valid for the
 process lifetime. It is not a field of, or owned by, `GlobalMain`.
 `DataPlaneMain` reaches the same global value and uses its own Worker index to
 select per-Worker Pool caches. `buffer_mem_start`, Buffer address ranges, the
-Pool table, and default NUMA Pool selection are immutable after publication.
+Pool table, and default NUMA Pool selection are immutable after initialization.
 
-Construction and publication use one safe startup API:
+Construction and global installation are one startup operation:
 
 ```rust
 impl BufferMain {
@@ -158,22 +216,22 @@ impl BufferMain {
         numa_nodes: &[u32],
         worker_count: usize,
         page_size: PageSize,
-    ) -> DataPlaneResult<Self>;
-    pub fn publish(self) -> &'static Self;
+    ) -> DataPlaneResult<&'static Self>;
     pub fn global() -> &'static Self;
 }
 ```
 
-`new` builds an unpublished value so huge-page fallback and startup rollback
-drop every partially created Physmem mapping normally. Its recoverable failures
-are the typed `DataPlaneError` variants `BufferAllocationSizeOverflow {
+`new` builds the complete value locally, installs it in the process-global
+`BUFFER_MAIN` only after every Pool succeeds, and returns that global reference.
+Any failure before installation drops every partially created Physmem mapping
+normally. Its recoverable failures are the typed `DataPlaneError` variants `BufferAllocationSizeOverflow {
 data_size }`, `BufferAllocationExceedsPage { allocation_size, page_size }`,
 `BufferPoolCountExceeded { requested, maximum }`, `BufferMemorySpanExceeded {
 bytes, maximum }`, `BufferPoolsUnavailable`, and `BufferPoolMapping { numa_node,
-source }`. `publish` panics on a second publication, and `global` panics before
-publication, because both violate startup ordering rather than describe a
-recoverable runtime condition. Frame size-class allocation and ordinary Buffer
-allocation use the Main Heap fatal-allocation policy and short counts,
+source }`. Calling `new` after initialization and calling `global` before
+initialization panic because both violate startup ordering rather than describe
+a recoverable runtime condition. Frame size-class allocation and ordinary
+Buffer allocation use the Main Heap fatal-allocation policy and short counts,
 respectively; neither adds a per-allocation `Result`.
 
 A raw Index does not independently produce a Rust reference. Node and retained
@@ -547,11 +605,10 @@ drain or free Next Frames, return per-Worker Buffer caches, or traverse retained
 domain Buffers. Those values remain unreachable and unchanged until process
 termination; the operating system reclaims the process mappings.
 
-There is no explicit backing-memory free API. A scoped `BufferMain` or Buffer
-Pool used by startup rollback or isolated tests is destroyed only after its
-Buffer users have ended; normal Rust field drop then reaches each owned
-`PhysmemMap`, whose `Drop` releases the mapping. The production `BUFFER_MAIN`
-has process lifetime and is not dropped during final shutdown.
+There is no explicit backing-memory free API. Before `BufferMain::new` installs
+the global value, an error drops its locally constructed Buffer Pools and each
+owned `PhysmemMap` releases its mapping. The installed `BUFFER_MAIN` has
+process lifetime and is not dropped during final shutdown.
 
 ### Removed alternatives
 
@@ -565,6 +622,10 @@ The design does not use any of the following:
 - a public raw-Index Buffer lookup detached from `DataPlaneMain`;
 - feature-specific Buffer release helpers beside the generic VPP-shaped free
   family;
+- public raw primary/secondary opaque storage borrows or plugin-written
+  `transmute`/pointer casts;
+- a dynamic opaque-type registry, runtime active-member tag, or arbitrary
+  offset-based overlay API;
 - per-Buffer owner wrappers in Frame vector slots;
 - `allocator_api2::Box<T, A>` as a Buffer owner;
 - `maybe-owned`, `mown`, or a custom owned-or-borrowed enum;
@@ -600,8 +661,10 @@ service Drop Node、interface 与 session，以及 IP、ICMP、TCP、UDP 插件�
 
 | 类型 | 位置或所有者 | 新增内容与不变量 | 兼容性/迁移 | 验证方式 |
 | --- | --- | --- | --- | --- |
-| `BufferMain` / `BUFFER_MAIN` | `hammer-core::buffer` 中定义的类型与独立进程全局值 | 持有 `buffer_mem_start`、总地址跨度、Pool 表和每个 NUMA 的默认 Pool Index；先于 Data Worker 初始化，所有 `DataPlaneMain` 访问同一全局值；不属于 `GlobalMain` | 新类型和全局权威；替代每个 runtime 自带的 Buffer Arena。它位于 dylib 边界，必须验证 daemon 与插件解析到同一实例 | 多 Worker/动态插件集成测试比较同一 Buffer Index 的地址解析、Pool 表身份和 `BUFFER_MAIN` 地址；初始化回滚测试验证未发布的 Pool 由 Rust Drop 释放 mapping |
+| `BufferMain` / `BUFFER_MAIN` | `hammer-core::buffer` 中定义的类型与独立进程全局值 | 持有 `buffer_mem_start`、总地址跨度、Pool 表和每个 NUMA 的默认 Pool Index；先于 Data Worker 初始化，所有 `DataPlaneMain` 访问同一全局值；不属于 `GlobalMain` | 新类型和全局权威；替代每个 runtime 自带的 Buffer Arena。它位于 dylib 边界，必须验证 daemon 与插件解析到同一实例 | 多 Worker/动态插件集成测试比较同一 Buffer Index 的地址解析、Pool 表身份和 `BUFFER_MAIN` 地址；初始化失败测试验证尚未安装的局部 Pool 由 Rust Drop 释放 mapping |
 | `BufferTemplate` | `hammer-core::buffer`，Buffer Pool 私有 | 精确覆盖 Buffer 第一 cache line；`ref_count = 1`，`buffer_pool_index` 为所属 Pool；分配和最终回收均复制该模板 | 新的私有布局类型；无数据迁移 | `size_of == 64`、`align_of == 64`、字段 offset 与 vendored VPP C probe 一致 |
+| primary/secondary opaque storage | `hammer-core::buffer` 私有 Buffer layout | 固定为 `opaque[10]`（40 bytes）和 `opaque2[14]`（56 bytes）的 aligned union storage；只承载原始 Buffer header state，不持有 overlay 类型注册或析构职责 | 新的私有布局类型；替代插件可直接取得并 `transmute` 的公开 storage 类型；所有插件重编译 | size、alignment、Buffer field offset、primary template restore、secondary retained-byte 和 raw-copy 测试 |
+| IP secondary opaque layout | `hammer-plugin-ip` | 一个显式 owner layout 同时放置 lookup state 与 ICMP-error word；共存关系由字段位置表达，不再由两个调用点分别覆盖 `opaque2` 起点和末 word | 新的 plugin-private layout；`LookupMetadata` 与 ICMP metadata 的存取迁移到同一布局；依赖 IP 的 ICMP/UDP 插件改用 owner API | lookup 后生成 ICMP error、successful path clear、DPO forwarding 与 ICMP metadata 共存测试 |
 | `Frame<Scalar = (), Vector = u32, Aux = ()>` | `hammer-core::frame` packet-graph ABI | 泛型参数仅携带参数类型，zero-sized `PhantomData` 不改变 VPP header；尾部区域按注册类型计算并在首次 typed access 前完成一次初始化；vector 固定容纳 256 个元素和 4 个 speculative 元素；Frame allocation 自身不拥有 Buffer 析构行为 | 与现有 `Frame<State>` 同名但语义不同，按“删除旧项 + 新增新项”迁移；普通 packet Node 使用 `Frame<(), u32, ()>`；所有节点和插件重编译 | header offset、总分配长度、泛型实例 size/align 相同、初始化有效性、16/64 字节对齐、256+4 边界测试和 VPP C probe |
 | `NodeMain` | `hammer-runtime::node`，每个 Data Worker 独占且不公开导出 | 取代当前由 `NodeRuntime` 承担的 graph-wide 容器职责，拥有 Node Runtimes、Next Frames、Pending Frames 和 Frame size classes | 新的 runtime 内部权威；Node 查询和调度调用方迁移到该 owner，不增加插件可见 API | graph 安装、next owner 交换、pending dispatch、refork 和 final-barrier 生命周期集成测试 |
 | `NextFrame` | `hammer-runtime::node`，Worker 私有 | 保存 Frame 指针、目标 Node Runtime、flags、enqueue owner 状态和 overflow 计数；每个目标只允许一个 enqueue owner | 新的内部状态；替代 `Frame<Next>` owner wrapper 和 `appendable_next_frames` 元组 | 多 next fanout、partial put 后继续 append、owner 交换及 pending link 修复测试 |
@@ -612,7 +675,9 @@ service Drop Node、interface 与 session，以及 IP、ICMP、TCP、UDP 插件�
 | API | 位置或签名 | 输入/输出与行为 | 兼容性/迁移 | 验证方式 |
 | --- | --- | --- | --- | --- |
 | Buffer layout build configuration and generated constants | `hammer-core/build.rs`; public `BUFFER_PRE_DATA_SIZE`, `BUFFER_TRACE_TRAJECTORY`, `BUFFER_TRACE_TRAJECTORY_SIZE`, and `BUFFER_HEADER_SIZE` | `HAMMER_BUFFER_PRE_DATA_SIZE` defaults to 128 and accepts only cache-line multiples in the signed `current_data` range; `HAMMER_BUFFER_TRACE_TRAJECTORY` defaults to `0` and accepts only `0` or `1`; the build script emits one private trajectory `cfg` and the four public constants from those inputs | New build inputs and public constants; daemon and every plugin must use matching values even when built in separate Cargo invocations | build-script rejection tests for invalid values; trajectory on/off and pre-data variants in the VPP C layout probe; public constant assertions |
-| `BufferMain::{new, publish, global}` | `new(usize, usize, &[u32], usize, PageSize) -> DataPlaneResult<Self>`；`publish(self) -> &'static Self`；`global() -> &'static Self` | `new` 构造未发布的 Physmem-backed Pools；`publish` 一次发布到独立 `BUFFER_MAIN`；`global` 取得进程期共享值；重复发布和发布前访问是 startup invariant panic | 新增 safe 启动 API；调用顺序必须先于 graph/Worker 初始化；默认 huge-page fallback 只在未发布值上重试 | 启动顺序、fallback rollback、重复发布/过早访问 expected panic、255/256 Pool 边界、256 GiB 跨度边界及跨 dylib 单例测试 |
+| opaque overlay declaration macro | `#[hammer_component_macros::buffer_opaque(primary)]` / `#[hammer_component_macros::buffer_opaque(secondary)]` | 在 owner crate 声明 `repr(C)` typed struct/union overlay；生成 selected-region 的编译期 size/alignment 断言及 union safe member borrows；不生成 runtime tag、初始化状态、字段校验或注册表 | 新增 source-level macro API；network/IP/TCP/UDP overlay 定义迁移到声明式布局，owner 仍在原 crate | 正常 struct/union 编译；oversize、over-aligned、含 padding/无效位模式或 Drop state 的 compile-fail；生成的 union member shared/mutable borrow 测试 |
+| opaque overlay access macro | `buffer_opaque!(buffer => T)` / `buffer_opaque!(mut buffer => T)` | 根据 `T` 的声明直接从 primary 或 secondary union storage 返回 `&T`/`&mut T`；零复制、无任意 offset、无 runtime 分支或校验；调用者不使用裸 storage、pointer、`transmute` 或 unsafe API | 新增 safe source-level API；替代 `Buffer::opaque*`/`opaque2*` 原始 borrow 及插件手写转换；所有调用方重编译 | primary/secondary shared/mutable borrow、borrow exclusivity、地址 identity、无 copy、动态插件调用和公开 API compile tests |
+| `BufferMain::{new, global}` | `new(usize, usize, &[u32], usize, PageSize) -> DataPlaneResult<&'static Self>`；`global() -> &'static Self` | `new` 在本地完成全部 Physmem-backed Pools 后一次安装独立 `BUFFER_MAIN` 并返回全局引用；失败前正常 Drop 局部 mappings；`global` 取得同一进程期值；重复初始化和初始化前访问是 startup invariant panic | 新增 safe 单阶段启动 API；调用顺序必须先于 graph/Worker 初始化；不暴露未安装的 `BufferMain` 或两阶段安装 API | 启动顺序、fallback rollback、重复初始化/过早访问 expected panic、255/256 Pool 边界、256 GiB 跨度边界及跨 dylib 单例测试 |
 | `DataPlaneMain::{buffer, buffer_mut}` | `buffer(&self, u32) -> &Buffer`；`buffer_mut(&mut self, u32) -> &mut Buffer` | 输入 raw Buffer Index，输出直接 borrow，不返回 guard 或 `Result`；mutable borrow 绑定整个 `DataPlaneMain`，必须先结束再操作 Next Frame；无 generation check；invalid/stale/foreign/released/shared-mutable Index 是程序错误 | 新增 safe borrow API并删除 `get_buffer*` guard API；所有调用改名并移除 `?`/guard；节点按 Buffer phase、enqueue phase 缩短借用 | 编译期借用作用域测试、私有 raw-pointer boundary 单元测试、invalid Index expected panic、共享 tail 拒绝 mutable borrow 测试 |
 | Buffer allocation family | `DataPlaneMain::{buffer_alloc, buffer_alloc_from_pool, buffer_alloc_on_numa, buffer_alloc_to_ring, buffer_alloc_to_ring_from_pool}`，签名见 Decision | 接收调用方已拥有的 initialized `u32` slice、可选 Pool/NUMA 与 ring range，返回被新 Index 覆盖的前缀长度；Pool 压力以 short count 表达 | 新增完整 VPP-shaped batch allocation family；替代返回单个裸 Index 的普通公开路径，不产生成功但无人承担 release obligation 的 Index | 0、部分、完整批量分配；default/NUMA/Pool selection；wrapping ring；跨 cache refill；未返回 suffix 保持不变；Pool 压力不返回逐 Buffer `Err` |
 | `Frame::{scalar_args, scalar_args_mut, vector_args, vector_args_mut, aux_args, aux_args_mut}` | `scalar_args(&self) -> Option<&Scalar>`；`scalar_args_mut(&mut self) -> Option<&mut Scalar>`；`vector_args(&self) -> &[Vector]`；`vector_args_mut(&mut self) -> &mut [Vector]`；`aux_args(&self) -> Option<&[Aux]>`；`aux_args_mut(&mut self) -> Option<&mut [Aux]>` | `Frame` 自己从 header offset 返回带正确生命周期的 typed borrow；vector/aux slices 恰含 `n_vectors` 个已初始化元素；泛型参数与 `zerocopy` traits 约束 layout/bit validity；所有公开方法均为 safe Rust且不返回裸指针 | 新增 ABI 访问 API；Node 宏将参数类型与注册尺寸绑定并生成私有 erased trampoline；调用者不编写 unsafe | 不同参数类型/大小的 graph 安装和真实 node invocation；错误 trampoline/layout expected panic；compile test 证明 public API 无 unsafe；zero-size 区域和 initialized-byte 测试 |
@@ -626,11 +691,12 @@ service Drop Node、interface 与 session，以及 IP、ICMP、TCP、UDP 插件�
 
 | 类型 | 当前/目标位置 | 修改内容与不变量 | 兼容性/迁移 | 验证方式 |
 | --- | --- | --- | --- | --- |
-| `Buffer` | `hammer-core::buffer` | 从两个 64-byte header 变为完整 VPP 顺序：template overlay、second half、可选 64-byte trajectory、64-byte `headroom` align mark、内联 `pre_data[BUFFER_PRE_DATA_SIZE]`，随后是同一 Pool allocation 的 `data[]`；`current_data: i16` 相对 `data[0]`，允许负值 | 二进制布局破坏；所有访问 Buffer 的 crate/DSO 必须一起重编译；无持久化迁移 | 两种 trajectory 配置下的 size/align/offset C probe；`pre_data.end == data.start`；负 `current_data` prepend 测试 |
+| `Buffer` | `hammer-core::buffer` | 从两个 64-byte header 变为完整 VPP 顺序：template overlay、second half、可选 64-byte trajectory、64-byte `headroom` align mark、内联 `pre_data[BUFFER_PRE_DATA_SIZE]`，随后是同一 Pool allocation 的 `data[]`；`current_data: i16` 相对 `data[0]`，允许负值；typed opaque 只能通过声明及访问宏借用 | 二进制布局和 opaque 访问面破坏；所有访问 Buffer 的 crate/DSO 必须一起重编译；无持久化迁移 | 两种 trajectory 配置下的 size/align/offset C probe；`pre_data.end == data.start`；负 `current_data` prepend；opaque macro borrow 测试 |
+| network/IP/TCP/UDP opaque types | `hammer-service`、`hammer-plugin-ip`、`hammer-plugin-tcp`、`hammer-plugin-udp` 各 owner crate | 保留各 owner 的 packet facts，改为宏声明的 primary/secondary struct/union；共存字段使用一个显式 layout，互斥解释使用 union；只含 fixed-layout Copy state，不持有引用或 Drop state | Rust layout/access contract 破坏；删除调用点手写 `transmute`，依赖 owner API 的插件同步重编译 | 每种 overlay 的 compile-time layout、真实 graph producer/consumer、Buffer copy 与 recycle 生命周期测试 |
 | `BufferFlags` | `hammer-core::buffer` | 仅保存 core/VPP-style 公开 flags；删除 `SLOT_CLEAN` 和高位私有 data-capacity 编码；second half/opaque 有效性由公开 flags 和所属操作保证 | 行为及 bit contract 破坏；插件不得依赖旧私有位 | bit round-trip、template restore、未初始化 second half 只在有效 flag 下读取的测试 |
 | `PhysmemMap` | `hammer-infra::physmem` | 继续拥有 mapping/fd/page/NUMA 生命周期，但其 Buffer 用途改为由进程 Buffer Main 注册、由 Buffer Pool 切槽；不承担 slot allocate/recycle；其 `Drop` 是 backing mapping 真正释放点 | 现有 OS mapping API原则上可复用；若无需字段/API变化则实现阶段不得修改 | mapping ownership、page size、NUMA 与 drop/unmap 测试；Buffer Pool 仅持有有效 mapping 关系 |
 | `BufferPool` | `hammer-core::buffer`，由 `BufferMain` 持有 | 从 `BufferPoolArena + Rc<RefCell<BufferThreadCache>>` façade 改为 VPP Pool：mapping 范围、Pool index、data/alloc size、central free indices、每 Worker cache、lock 和 template；每段按自己的 Pool 回收 | 私有结构完全重排；删除 arena lock 访问模式 | page-crossing slot skip、Index zero skip、central/cache batch、cross-Pool chain release 测试 |
-| `BufferThreadCache` | `hammer-core::buffer`，每 Pool 每 Worker | 直接保存 raw `u32` indices 和数量，由 Worker 生命周期对应的 cache slot 使用；不再 `Rc<RefCell<_>>` clone | 私有结构破坏；Worker 创建时建立 cache；生产 final shutdown 不归还 parked Worker cache，scoped owner drop 正常销毁 storage | Worker 并行 alloc/recycle、cache high-water、final barrier 后 cache 不再访问、scoped Pool drop 测试 |
+| `BufferThreadCache` | `hammer-core::buffer`，每 Pool 每 Worker | 直接保存 raw `u32` indices 和数量，由 Worker 生命周期对应的 cache slot 使用；不再 `Rc<RefCell<_>>` clone | 私有结构破坏；Worker 创建时建立 cache；生产 final shutdown 不归还 parked Worker cache | Worker 并行 alloc/recycle、cache high-water、final barrier 后 cache 不再访问测试 |
 | `FramePool` | runtime `NodeMain` | 从 generational `FrameSlot { Option<BufferFrame> }` Pool 改为按 frame allocation size 分类的 raw Frame 重用；recycle 只回收 Frame memory | 私有结构及错误路径破坏；不再以 packet `Index` 标识 Frame slot | 不同 Node frame size 的重复分配、debug poison/magic、回收不触碰 Buffer 测试 |
 | `DataPlaneBufferConfig` / `WorkerBuffer` | `hammer-runtime::data_plane::config` / startup config | 从“每个 DataPlaneMain 构造 arenas”改为“进程启动构造 Physmem-backed Pools，再给 Worker 建立对应 cache”；`slot_bytes` 表示 Pool data size；`frame_pool_size` 表示每个 lazily-created Frame size-class free list 的初始 reserve capacity | TOML 字段和 aliases 保留，无配置文本迁移；初始化时序和 `frame_pool_size` 行为改变 | config parse、Frame size-class initial reserve、NUMA Pool 建立、默认 hugepage fallback 和所有 Worker 共享同一 Buffer Main 测试 |
 | `DataPlaneMain` | `hammer-runtime` | 改为不可通过 `Clone` 扩散 packet-path owner；Node ABI 以 `&mut DataPlaneMain` 进入；持有 Worker-local execution/cache state并访问同一进程 Buffer Main | Rust API 与借用模型破坏；所有 Node、trace、handoff、session 及 plugin 调用点迁移 | compile-time `!Clone` 约束、每 Worker 独占、handoff 后仅目标 Worker mutable access 测试 |
@@ -642,7 +708,7 @@ service Drop Node、interface 与 session，以及 IP、ICMP、TCP、UDP 插件�
 | `HandoffSlot` / `HandoffFrame` | `hammer-runtime::handoff` | slot element 从 `[Option<Index>; 32]` 改为 raw `u32` prefix + length；handoff 只转移 release obligation，不改 refcount | 进程内队列布局破坏；不做新旧版本互通 | full/partial slot、queue full failure-atomicity、跨 Worker ownership 与 wakeup 测试 |
 | `DropNode` | `hammer-service::data_plane` | 从仅 trace 后依赖 incoming `Frame` owner 隐式释放，改为显式批量结束每个 Buffer chain 生命周期；Frame memory 随后独立 recycle | 行为变化；所有 drop/punt/error arcs 必须确认最终 disposition | node error counter、trace、chain release、shared tail 和 Frame reuse 集成测试 |
 | `FragmentContext` / `ReassemblyFragment` | IP plugin reassembly | 继续保存 raw Buffer Indices；完成时转移，失败/超时/显式 owner removal 时在持有 `&mut DataPlaneMain` 的 owner lifecycle 中批量 free 剩余 Indices，再由 Rust `Drop` 销毁空 context 的普通 storage；production final shutdown 不遍历 parked Worker state | 插件内部生命周期变化；删除通过伪 Next Frame 聚合后隐式回收的做法，不增加 owner wrapper 或 reassembly-specific release API | complete、duplicate、overlap、timeout、context removal 的精确一次 release；final barrier 不触碰 retained state |
-| `BufferInvariant` / `DataPlaneError` | `hammer-core::error` | 删除 generation/arena/checked-out-owner、`FramePoolExhausted` 和 scheduled-queue 类 variants；增加 `BufferAllocationSizeOverflow { data_size }`、`BufferAllocationExceedsPage { allocation_size, page_size }`、`BufferPoolCountExceeded { requested, maximum }`、`BufferMemorySpanExceeded { bytes, maximum }`、`BufferPoolsUnavailable`、`BufferPoolMapping { numa_node, source }`；已建立 ownership 后的 invalid raw Index、共享写、chain shape 和 refcount overflow 是程序错误 | error enum 是公开破坏；startup caller 只处理配置、mapping 和 Pool 建立失败；packet path 删除旧 `Result` 分支 | concrete variant/字段匹配、`BufferPoolMapping` source chain、unpublished construction failure atomicity 和 invariant expected-panic 测试；不做 display-string-only 测试 |
+| `BufferInvariant` / `DataPlaneError` | `hammer-core::error` | 删除 generation/arena/checked-out-owner、`FramePoolExhausted` 和 scheduled-queue 类 variants；增加 `BufferAllocationSizeOverflow { data_size }`、`BufferAllocationExceedsPage { allocation_size, page_size }`、`BufferPoolCountExceeded { requested, maximum }`、`BufferMemorySpanExceeded { bytes, maximum }`、`BufferPoolsUnavailable`、`BufferPoolMapping { numa_node, source }`；已建立 ownership 后的 invalid raw Index、共享写、chain shape 和 refcount overflow 是程序错误 | error enum 是公开破坏；startup caller 只处理配置、mapping 和 Pool 建立失败；packet path 删除旧 `Result` 分支 | concrete variant/字段匹配、`BufferPoolMapping` source chain、单阶段初始化 failure atomicity 和 invariant expected-panic 测试；不做 display-string-only 测试 |
 | `PluginError` | `hammer-runtime::plugin` | 增加 `BufferLayoutMismatch`，携带 host/plugin 的 pre-data size、trajectory size、Buffer size 和 alignment；在任何 metadata/registration publication 前返回 | 新 recoverable load rejection；调用方保留现有 plugin-load recovery path，无字符串匹配 | 匹配 concrete variant and fields；确认 source transaction 未发布 library metadata 或 registrations；更正 artifact 后可重试 |
 
 #### API
@@ -699,6 +765,7 @@ service Drop Node、interface 与 session，以及 IP、ICMP、TCP、UDP 插件�
 | transactional writable-tail API | `Buffer::{writable_tail_mut, commit_writable_tail}` | VPP 没有 writable-tail/commit 两阶段语义；删除两者，不保留同义改名 | TCP reset 等调用迁移到 `put_uninit` 或 chain add-data family | old API compile-fail；替代操作的 capacity、length 和 chain 测试 |
 | copied prepend API | `Buffer::{prepend, prepend_mut}` | 删除与 VPP 不一致的复制式/`usize` prepend surface；由 `push_uninit(u8)` 返回新前缀 slice 并立即更新窗口 | 调用方改为 `push_uninit` 后直接写入返回 slice | old API compile-fail；header prepend 行为测试 |
 | public Buffer pointer getters | `Buffer::{current_ptr, current_mut_ptr}` | 删除公开 raw pointer；地址计算和 slice 构造只留在 `hammer-core` 私有实现 | 外部调用改用 `current`、`current_mut` 或本 ADR 定义的 data-window safe slice API | old API compile-fail；public API snapshot；Miri/边界测试覆盖私有 unsafe proof |
+| raw opaque storage access | `Buffer::{opaque, opaque_mut, opaque2, opaque2_mut}` 及公开 `PrimaryOpaque`/`SecondaryOpaque` raw borrow | 删除可供插件自行 cast 的原始 union 引用；fixed storage 留在 `hammer-core` 私有 Buffer layout | 所有 owner 先用 declaration macro 定义布局，再用 `buffer_opaque!` 取得 typed borrow；不提供兼容 accessor | old API compile-fail；插件通过 safe macro 编译并执行；公开 API snapshot 不含 raw storage borrow |
 | copied node runtime API | `NodeRuntimeData::{empty, from_words, from_usize, word, usize_word}`、`Node::node_runtime_data`、`NodeDescriptor::runtime_data` | 删除复制式四 word state | node state 放在单-node `NodeRuntime` | all Node registrations compile；state mutation tests |
 | old Node function ABI | 所有 `fn(&DataPlaneMain, NodeRuntimeData, &mut BufferFrame) -> ()` function pointers 与宏生成项 | 删除旧 ABI 和适配 shim | daemon/core/runtime/service/plugins 必须原子升级并全量重编译 | real dylib load and invoke test；不只做源码匹配 |
 | bounded scheduled Frame queue | `ScheduledFrameQueue`、`scheduled_frame_queue_capacity`、`DataPlaneError::ScheduledFrameQueueExhausted` 及 queue-full `Result` 分支 | 删除固定容量 ring 和可恢复 queue-full 模型；由 `NodeMain.pending_frames: Vec<PendingFrame>` 直接表达 VPP pending vector | `put_next_frame` 和内部 schedule path 不再返回 queue exhaustion；调用方删除 `?`、`is_err` 及 fallback free 分支 | 超过旧容量持续 dispatch、dispatch 中 vector 增长、Main Heap allocation-fatal 子进程测试；old error variant compile-fail |
@@ -718,9 +785,14 @@ Frame layout 和 Buffer Index width 都跨 dylib，不能滚动混装旧插件�
 由同一 ABI 与 compile-time Buffer 配置构建。回滚同样需要恢复整套 artifact
 并重启进程；没有磁盘数据回滚步骤。
 
+Opaque 调用方必须与 owner layout 一起迁移：先以 declaration macro 固定
+network/IP/TCP/UDP 的 struct/union，再把所有 raw storage borrow 和手写 cast
+替换为 `buffer_opaque!`。不保留旧 accessor、offset helper 或动态注册兼容层。
+
 `hammer-core` 新增对 `zerocopy` 0.8 的直接依赖并公开使用其 trait bounds；
-这使相关 traits 成为 source-level API contract。daemon 与所有插件必须由同一
-workspace lockfile 重编译，不依赖当前仅由其他 crate 间接带入的版本。
+这使 Frame 参数和 opaque overlay 的表示约束成为 source-level API contract。
+daemon 与所有插件必须由同一 workspace lockfile 重编译，不依赖当前仅由其他
+crate 间接带入的版本。
 
 实现迁移顺序按依赖方向进行：先完成 `hammer-infra` Physmem 所需的通用能力
 和 `hammer-core` ABI，再完成 runtime Node/Frame lifecycle，随后迁移 service
@@ -735,6 +807,15 @@ workspace lockfile 重编译，不依赖当前仅由其他 crate 间接带入的
   和 256 GiB 上限；Pool 数覆盖 255 成功与第 256 个失败。
 - Pool 测试覆盖自然 stride 对齐、跳过跨页 slot、per-worker cache refill/
   drain、short allocation、template restore 和 Pool pressure failure atomicity。
+- opaque 测试覆盖 40/56-byte storage、声明宏的 compile-time size/alignment/
+  bit-validity/无 Drop 约束、shared/mutable macro borrow、union member borrow 和
+  无 copy 地址 identity；调用路径不执行 tag、初始化或 offset runtime 校验。
+- Buffer recycle 测试证明 primary opaque 随 template 恢复而 `opaque2` 保留旧
+  bytes；Buffer metadata copy 同时逐 byte 复制两块区域；`attach_clone` 只共享
+  原 Buffer，不复制或析构 overlay。
+- network/IP/TCP/UDP graph 测试覆盖各 owner overlay 的真实 producer/consumer；
+  IP lookup 与 ICMP-error word 在一个显式 secondary layout 中共存，互斥 union
+  解释仅由对应 graph path 使用。
 - chain/clone 测试覆盖跨 Pool chain、tail refcount 增减、shared tail 只读、
   overflow/double release/invalid shape 的程序错误边界。
 - Frame/Node 测试覆盖 scalar/vector/aux offset、256+4 slots、debug poison/magic、
@@ -765,8 +846,8 @@ refork 定义的错误分支。
   当前 loop 的 Pending dispatch 后进入 final barrier；Barrier 永不释放；main-loop
   exit functions 在 Workers parked 时执行；Worker-local exit callbacks 不存在；
   Next/Pending Frames、Buffer caches 和 retained domain Buffers 不被遍历或 free；
-  进程随后退出。另以 scoped `BufferMain` 和 startup rollback 测试验证正常 Rust
-  field drop 最终调用 `PhysmemMap::Drop`。
+  进程随后退出。另以 startup rollback 测试验证安装前的局部 Pool 正常 field
+  drop，并最终调用 `PhysmemMap::Drop`。
 - API/ABI 验证必须通过 workspace 编译、公开 API snapshot 和真实动态插件
   load/invoke；不能使用读取 Rust 源码并匹配字符串的测试替代。
 - 性能验证比较旧/新 Buffer lookup、batch alloc/recycle 与 graph fanout，确认
@@ -779,8 +860,11 @@ refork 定义的错误分支。
 `BufferFrame` 使用 `Vec<Index>`；`Frame<State>` 的 `Drop` 同时回收 Frame 和
 Buffer；`DataPlaneMain` 可 Clone；Node ABI 使用 immutable runtime、复制式
 `NodeRuntimeData` 和 `BufferFrame`；handoff slot 使用 `Option<Index>`；IP
-reassembly 通过临时 Next Frame 汇集待回收 fragments。上述事实来自本 ADR
-基线中列出的 Rust 文件。
+reassembly 通过临时 Next Frame 汇集待回收 fragments。当前 opaque 迁移代码
+已经建立 40-byte primary 和 56-byte secondary storage，但 service/IP/TCP/UDP
+调用方仍直接借用 raw storage 并手写 `transmute`/pointer casts；IP lookup 使用
+secondary 起始字段而 ICMP error 使用最后一个 `u64`。上述事实来自本 ADR
+基线中列出的 Rust 文件及当前对应 overlay consumers。
 
 **来自 vendored VPP 的已核实事实**：Buffer template/second-half/trajectory/
 headroom/pre-data/data 布局、`buffer_mem_start + (index << 6)`、最大 255 Pools、
@@ -789,6 +873,12 @@ Next Frame enqueue owner、Pending Frame link、Drop Node 批量释放、Worker 
 Refork 的旧 Frame 回收，以及 final barrier 永不释放的进程退出顺序，均来自
 下列 VPP references。vendored VPP 将 `vlib_buffer_main_t *` 放在
 `vlib_main_t` 中；它不是 `vlib_global_main_t` 拥有的字段。
+
+vendored VPP 的 primary `opaque[10]` 位于 64-byte Buffer template，secondary
+`opaque2[14]` 位于明确标注为 allocation 不初始化的 second half；free 只恢复
+template。`vnet_buffer_opaque_t`/`vnet_buffer_opaque2_t` 使用固定 struct/union
+overlay 和 static size assertions，插件也只在明确的 `unused` 区域上放置临时
+状态。VPP Buffer copy 路径显式复制 `opaque` 与 `opaque2`。
 
 vendored VPP 没有独立的 Graph Refork 行为测试；本 ADR 的 Refork 测试矩阵由
 上述实现源码逐项导出，作为 Hammer 必须新增的可执行回归测试，不声称复制了
@@ -818,8 +908,16 @@ boundary 执行；refork 不访问 Pending vector，按 VPP 条件和顺序先�
 Next Frame allocation、重置新 Next Frame 状态并保留 Worker runtime state，且不
 读取 Frame vector arguments 或调用 Buffer free；
 final process shutdown 永久持有 Worker Barrier，不运行 Worker-local exit callback、
-不遍历或 free Worker-local Frame/Buffer/domain state；scoped owner 和 startup
-rollback 才通过正常 Rust field drop 释放 `PhysmemMap`；
+不遍历或 free Worker-local Frame/Buffer/domain state；仅 installation 前的 startup
+rollback 通过正常 Rust field drop 释放已经创建的 `PhysmemMap`；
+`BufferMain::new` 完整构造后直接安装全局值并返回 `&'static BufferMain`，不暴露
+两阶段安装 API；opaque 使用固定 40/56-byte union storage，owner 以
+declaration macro 声明 primary/secondary struct/union，调用点只通过
+`buffer_opaque!` 取得 safe typed borrow；宏不支持 arbitrary offset、动态注册、
+runtime active-member tag、初始化 tracking 或字段校验；同一 owner 内需共存的
+字段放进一个显式 layout，互斥解释放进 union；opaque 不持有引用或 Drop state，
+free 不析构 overlay，primary 随 template 恢复、secondary 保留，Buffer metadata
+copy 复制两块 raw regions，`attach_clone` 仅共享既有 Buffer；
 不采用 `Owned<Buffer>`、owned-or-borrowed enum、guard 或 `retain_from` 作为
 Frame ownership 模型。
 
@@ -860,7 +958,12 @@ the generic Buffer free family.
 - `third_party/vpp/src/vlib/buffer.c`: `vlib_buffer_alloc_size` and
   `vlib_buffer_pool_create`.
 - `third_party/vpp/src/vlib/buffer_funcs.h`: Buffer lookup, allocation,
-  release, chaining, and `vlib_buffer_attach_clone`.
+  release, chaining, opaque copy, and `vlib_buffer_attach_clone`.
+- `third_party/vpp/src/vnet/buffer.h`: `vnet_buffer_opaque_t`,
+  `vnet_buffer_opaque2_t`, their struct/union overlays, reserved `unused`
+  storage, access casts, and static layout assertions.
+- `third_party/vpp/src/plugins/ping/ping.c`: plugin-owned temporary metadata
+  placed in the network opaque `unused` region with a static size assertion.
 - `third_party/vpp/src/vlib/node.h`: `vlib_frame_t`, `vlib_next_frame_t`, and
   `vlib_pending_frame_t`.
 - `third_party/vpp/src/vlib/main.c` and `node_funcs.h`: Frame allocation,
