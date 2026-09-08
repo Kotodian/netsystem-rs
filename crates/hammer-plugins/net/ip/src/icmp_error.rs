@@ -385,9 +385,7 @@ fn generate_error(
         lookup_slot,
     )?;
     // The next frame owns the response immediately; any later failure frees it.
-    let mut output = runtime
-        .buffers()
-        .get_next_frame(next, runtime.nodes().frame_args_size(next)?)?;
+    let mut output = runtime.get_frame_to_node(next)?;
     let response = runtime.buffers().alloc_index_from(index)?;
     {
         let count = output.len();
@@ -451,7 +449,7 @@ fn generate_error(
             .with_transport_header(header_len, 8)
             .with_transport_payload_offset(header_len + 8),
     );
-    runtime.put_next_frame(output)?;
+    runtime.put_frame_to_node(next, output)?;
     Ok(match (family, metadata.icmp_type()) {
         (IcmpErrorFamily::Ipv4, 3) | (IcmpErrorFamily::Ipv6, 1) => {
             IcmpError::DestinationUnreachableSent

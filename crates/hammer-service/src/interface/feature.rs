@@ -471,7 +471,6 @@ impl InterfaceMain {
         occurrences: Vec<FeatureOccurrence>,
         end_node: NodeId,
     ) -> Result<(), FeatureError> {
-        let nodes = main.nodes().clone();
         if main.nodes().node_kind(end_node).is_err() {
             return Err(FeatureError::GraphNodeNotFound { node: end_node });
         }
@@ -508,7 +507,7 @@ impl InterfaceMain {
             })?;
         let extent_len = u32::try_from(requested_words)
             .map_err(|_| FeatureError::StorageExhausted { requested_words })?;
-        let publish = || -> Result<(), FeatureError> {
+        let publish = |nodes: &NodeMain| -> Result<(), FeatureError> {
             let state = &mut self.state_mut().feature;
             let position = sw_if_index as usize;
             let arc = &mut state.arcs[usize::from(arc_index)];
@@ -644,9 +643,9 @@ impl InterfaceMain {
             Ok(())
         };
         if hammer_runtime::barrier::global().is_some_and(|barrier| barrier.worker_count() != 0) {
-            hammer_runtime::worker_thread_barrier_sync!(main, { publish() })
+            hammer_runtime::worker_thread_barrier_sync!(main, { publish(main.nodes()) })
         } else {
-            publish()
+            publish(main.nodes())
         }
     }
 

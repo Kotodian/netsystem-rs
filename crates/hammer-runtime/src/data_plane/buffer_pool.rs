@@ -28,9 +28,6 @@ impl DataPlaneMain {
             buffers,
             nodes: NodeMain::default(),
             current_node: Rc::new(Cell::new(None)),
-            appendable_next_frames: RefCell::new(Vec::with_capacity(
-                hammer_core::data_plane::DEFAULT_BUFFER_FRAME_CAPACITY,
-            )),
             handoff: None,
             trace: DataPlaneTrace::default(),
             simd_bytes,
@@ -75,14 +72,6 @@ impl DataPlaneMain {
     }
 
     #[inline]
-    pub(crate) fn drop_pending_frame_owned(
-        &self,
-        frame: hammer_core::buffer::checked_out::Frame<Pending>,
-    ) {
-        frame.return_with_trace_release(|handle| self.trace.finalize(handle));
-    }
-
-    #[inline]
     pub fn prefetch_header(&self, index: u32) {
         self.buffers.prefetch_header(index);
     }
@@ -111,18 +100,6 @@ impl DataPlaneMain {
     }
 
     #[inline]
-    pub fn put_next_frame(
-        &self,
-        frame: hammer_core::buffer::checked_out::Frame<Next>,
-    ) -> RuntimeResult<()> {
-        let next = frame.next();
-        let pending = frame.into_pending()?;
-        if pending.is_empty() {
-            return Ok(());
-        }
-        self.nodes.schedule_frame(next, pending, false)
-    }
-
     #[inline]
     pub fn buffer(&self, index: u32) -> &hammer_core::data_plane::Buffer {
         // SAFETY: the graph owns this live index on the calling Worker. The

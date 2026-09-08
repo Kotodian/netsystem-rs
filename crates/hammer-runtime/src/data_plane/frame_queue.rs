@@ -2,11 +2,7 @@ use super::*;
 
 impl DataPlaneMain {
     pub fn schedule_empty_frame(&self, node: NodeId) -> RuntimeResult<()> {
-        let frame = self
-            .buffers
-            .get_next_frame(node, self.nodes.frame_args_size(node)?)?;
-        let pending = frame.into_pending()?;
-        self.nodes.schedule_frame(node, pending, true)
+        self.nodes.schedule_node(node)
     }
 
     #[inline]

@@ -10,8 +10,7 @@ use crate::error::{RuntimeError, RuntimeResult};
 use crate::file::{FILE_MAIN, FileMain};
 use hammer_core::data_plane::{
     BUFFER_CACHE_LINE_SIZE, BufferPoolArena, BufferRef, DEFAULT_BUFFER_FRAME_POOL_SIZE,
-    DataPlaneBuffers, Frame, FrameBatchWidth, Next, NodeErrorIndex, NodeId, NodeKind,
-    NodeRegistration, Pending,
+    DataPlaneBuffers, Frame, FrameBatchWidth, NodeErrorIndex, NodeId, NodeKind, NodeRegistration,
 };
 use hammer_core::error::{DataPlaneError, DataPlaneResult};
 use hammer_infra::PageSize;
@@ -40,11 +39,8 @@ pub use config::DataPlaneBufferConfig;
 pub struct DataPlaneMain {
     random: Rc<RefCell<SmallRng>>,
     buffers: DataPlaneBuffers,
-    nodes: NodeMain,
+    pub(crate) nodes: NodeMain,
     current_node: Rc<Cell<Option<NodeId>>>,
-    /// Worker-local appendable Next Frame per (current node × local slot).
-    pub(crate) appendable_next_frames:
-        RefCell<Vec<(NodeId, u16, hammer_core::buffer::checked_out::Frame<Next>)>>,
     handoff: Option<DataPlaneHandoffWorker>,
     active_numa_node: u32,
     trace: DataPlaneTrace,
@@ -75,10 +71,6 @@ impl fmt::Debug for DataPlaneMain {
             .field("buffers", &self.buffers)
             .field("nodes", &self.nodes)
             .field("current_node", &self.current_node.get())
-            .field(
-                "appendable_next_frames",
-                &self.appendable_next_frames.borrow().len(),
-            )
             .field("handoff", &self.handoff)
             .field("active_numa_node", &self.active_numa_node)
             .field("trace", &self.trace)
@@ -103,10 +95,7 @@ impl<'runtime> HandoffSlotGuard<'runtime> {
     }
 
     #[inline]
-    fn push_into_frame(
-        &mut self,
-        frame: &mut hammer_core::buffer::checked_out::Frame<Next>,
-    ) -> RuntimeResult<()> {
+    fn push_into_frame(&mut self, frame: &mut Frame) -> RuntimeResult<()> {
         match self.slot.as_ref() {
             Some(slot) => {
                 let count = frame.len();

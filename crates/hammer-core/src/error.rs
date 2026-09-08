@@ -96,8 +96,6 @@ pub enum DataPlaneError {
     FrameSlotAlreadyHasFrame,
     #[error("frame pool available-list overflow")]
     FramePoolAvailableOverflow,
-    #[error("scheduled frame queue exhausted")]
-    ScheduledFrameQueueExhausted,
     #[error("data plane handoff target worker out of bounds")]
     HandoffTargetWorkerOutOfBounds,
     #[error("data plane handoff queue exhausted")]

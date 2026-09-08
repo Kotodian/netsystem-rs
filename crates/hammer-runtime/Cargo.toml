@@ -18,6 +18,7 @@ hammer-core = { path = "../hammer-core" }
 hammer-infra = { path = "../hammer-infra" }
 hammer-stats = { path = "../hammer-stats" }
 hammer-component-macros = { path = "../hammer-component-macros" }
+zerocopy = "0.8.48"
 linkme = { workspace = true }
 petgraph = { workspace = true }
 semver = { workspace = true }

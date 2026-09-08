@@ -214,6 +214,52 @@ where
 }
 
 impl Frame {
+    /// Initialized Next Frame suffix. Runtime validates the destination's
+    /// vector/auxiliary sizes; core verifies the complete stored layout before
+    /// constructing the two disjoint borrows.
+    #[doc(hidden)]
+    pub fn next_args_mut<V, A>(&mut self, scalar_size: u16) -> (&mut [V], Option<&mut [A]>)
+    where
+        V: KnownLayout + FromBytes + Immutable + IntoBytes,
+        A: KnownLayout + FromBytes + Immutable + IntoBytes,
+    {
+        const {
+            assert!(mem::size_of::<V>() > 0);
+            assert!(mem::align_of::<V>() <= 16 && mem::align_of::<A>() <= 16);
+        }
+        let vector_size = u16::try_from(mem::size_of::<V>()).expect("Frame vector size fits u16");
+        let aux_size = u16::try_from(mem::size_of::<A>()).expect("Frame auxiliary size fits u16");
+        let (scalar, vector, magic, aux, bytes) = Self::layout(scalar_size, vector_size, aux_size);
+        assert_eq!(self.scalar_offset as usize, scalar);
+        assert_eq!(self.vector_offset as usize, vector);
+        assert_eq!(self.aux_offset as usize, aux);
+        assert_eq!(mem::size_of_val(self), bytes);
+        let count = self.len();
+        assert!(count <= FRAME_VECTOR_CAPACITY);
+        let start = ptr::from_mut(self) as *mut u8;
+        // SAFETY: checked offsets and extent contain aligned, initialized
+        // vector and auxiliary arrays. The arrays occupy disjoint regions;
+        // their suffixes share only this exclusive Frame borrow's lifetime.
+        unsafe {
+            if cfg!(debug_assertions) {
+                assert_eq!(start.add(magic).cast::<u32>().read_unaligned(), FRAME_MAGIC);
+            }
+            let vectors = slice::from_raw_parts_mut(
+                start.add(vector).cast::<V>().add(count),
+                FRAME_VECTOR_CAPACITY - count,
+            );
+            let auxiliary = if aux_size == 0 {
+                None
+            } else {
+                Some(slice::from_raw_parts_mut(
+                    start.add(aux).cast::<A>().add(count),
+                    FRAME_VECTOR_CAPACITY - count,
+                ))
+            };
+            (vectors, auxiliary)
+        }
+    }
+
     pub(crate) fn layout(
         scalar_size: u16,
         vector_size: u16,

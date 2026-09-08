@@ -3,8 +3,7 @@ use super::*;
 impl DataPlaneMain {
     pub fn run_ready_nodes(&mut self) -> RuntimeResult<usize> {
         self.drain_handoff_frames()?;
-        let nodes = self.nodes.clone();
-        nodes.run_ready_function_nodes(self)
+        self.run_ready_function_nodes()
     }
 
     #[inline]
@@ -14,12 +13,9 @@ impl DataPlaneMain {
         };
         while let Some(handoff_frame) = handoff.pop() {
             let mut slot = HandoffSlotGuard::new(self, handoff_frame.slot);
-            let mut frame = self.buffers.get_next_frame(
-                handoff_frame.target,
-                self.nodes.frame_args_size(handoff_frame.target)?,
-            )?;
+            let mut frame = self.get_frame_to_node(handoff_frame.target)?;
             slot.push_into_frame(&mut frame)?;
-            self.put_next_frame(frame)?;
+            self.put_frame_to_node(handoff_frame.target, frame)?;
         }
         Ok(())
     }
@@ -173,7 +169,7 @@ mod tests {
             .unwrap();
             for expected_frames in receive {
                 assert_eq!(runtime.run_ready_nodes().unwrap(), expected_frames);
-                assert_eq!(runtime.buffers().frames_in_use(), 0);
+                assert_eq!(runtime.nodes().frames_in_use(), 0);
                 acknowledge.send(()).unwrap();
             }
             assert_eq!(runtime.buffers().in_use_buffers(), 0);

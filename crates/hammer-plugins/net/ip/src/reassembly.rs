@@ -494,7 +494,7 @@ impl IpReassemblyWorker {
 
     #[inline]
     fn emit_local(
-        runtime: &DataPlaneMain,
+        runtime: &mut DataPlaneMain,
         frame: &mut Frame,
         nexts: &mut [u16; DEFAULT_BUFFER_FRAME_CAPACITY],
         out_len: &mut usize,

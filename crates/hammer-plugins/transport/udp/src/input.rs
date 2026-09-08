@@ -121,13 +121,13 @@ pub enum UdpIpProtocol {
     Other(u8),
 }
 
-pub struct UdpInputControlPlane {
+pub struct UdpInputControlPlane<'graph> {
     inner: Arc<UdpInputSnapshotCell>,
-    nodes: Option<hammer_runtime::node::NodeMain>,
+    nodes: Option<&'graph hammer_runtime::node::NodeMain>,
     consumer: Option<NodeId>,
 }
 
-impl UdpInputControlPlane {
+impl<'graph> UdpInputControlPlane<'graph> {
     #[inline]
     pub fn new() -> Self {
         Self {
@@ -138,7 +138,7 @@ impl UdpInputControlPlane {
     }
 
     #[inline]
-    pub fn with_nodes(mut self, nodes: hammer_runtime::node::NodeMain) -> Self {
+    pub fn with_nodes(mut self, nodes: &'graph hammer_runtime::node::NodeMain) -> Self {
         self.nodes = Some(nodes);
         self
     }
@@ -294,7 +294,7 @@ pub(crate) fn register_dst_port(
     let result = GlobalMain::with_current(|engine| {
         let control = UdpInputControlPlane {
             inner: Arc::clone(&registration.inner),
-            nodes: Some(engine.data_plane_main().nodes().clone()),
+            nodes: Some(engine.data_plane_main().nodes()),
             consumer: Some(registration.consumer),
         };
         control.register_dst_port(version, port, node).map(|_| ())

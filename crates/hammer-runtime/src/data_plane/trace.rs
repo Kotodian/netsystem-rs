@@ -29,7 +29,6 @@ impl DataPlaneMain {
         let previous = self.current_node.get();
         self.current_node.set(Some(node));
         let result = f(self);
-        self.flush_fanout_appendable();
         self.current_node.set(previous);
         result
     }

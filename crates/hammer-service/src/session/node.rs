@@ -184,7 +184,7 @@ impl SessionQueueOutput {
 
     /// One Graph Fanout flush for every index recorded on `frame` this dispatch.
     #[inline]
-    pub fn flush(self, runtime: &DataPlaneMain, frame: &mut Frame) {
+    pub fn flush(self, runtime: &mut DataPlaneMain, frame: &mut Frame) {
         debug_assert_eq!(frame.len(), self.nexts.len());
         if self.nexts.is_empty() {
             return;
