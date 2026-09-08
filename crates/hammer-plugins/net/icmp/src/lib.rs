@@ -80,14 +80,14 @@ hammer_component_macros::declare_plugin!(
 );
 
 pub fn register_ip4_local(
-    nodes: &hammer_runtime::node::NodeRuntime,
+    nodes: &hammer_runtime::node::NodeMain,
     node: NodeId,
 ) -> RuntimeResult<()> {
     hammer_plugin_ip::register_ip4_protocol(nodes, 1, node)
 }
 
 pub fn register_ip6_local(
-    nodes: &hammer_runtime::node::NodeRuntime,
+    nodes: &hammer_runtime::node::NodeMain,
     node: NodeId,
 ) -> RuntimeResult<()> {
     hammer_plugin_ip::register_ip6_protocol(nodes, 58, node)

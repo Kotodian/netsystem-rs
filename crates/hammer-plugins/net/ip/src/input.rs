@@ -1,4 +1,4 @@
-use hammer_core::data_plane::{BufferFrame, BufferPacketCursor};
+use hammer_core::data_plane::{BufferPacketCursor, Frame};
 use hammer_runtime::RuntimeResult;
 use hammer_runtime::{
     DataPlaneMain, Node, NodeProcessFn, TraceFormatter, add_packet_trace, format_packet_trace,
@@ -61,24 +61,38 @@ pub struct IpInputTrace {
 }
 
 impl Node for Ip4InputNode {
-    fn process(&mut self, runtime: &mut DataPlaneMain, frame: &mut BufferFrame) {
-        ip_input_process_frame(runtime, frame, IpVersion::V4)
+    fn process(
+        runtime: &mut DataPlaneMain,
+        node_runtime: &mut hammer_runtime::NodeRuntime,
+        frame: &mut Frame,
+    ) -> usize {
+        let process: NodeProcessFn = |runtime, _, frame| {
+            let processed_vectors = frame.len();
+            ip_input_process_frame(runtime, frame, IpVersion::V4);
+            processed_vectors
+        };
+        process(runtime, node_runtime, frame)
     }
-    fn node_process(&self) -> NodeProcessFn {
-        |runtime, _, frame| ip_input_process_frame(runtime, frame, IpVersion::V4)
-    }
+
     fn node_trace_formatter(&self) -> Option<TraceFormatter> {
         Some(format_packet_trace!(IpInputTrace))
     }
 }
 
 impl Node for Ip6InputNode {
-    fn process(&mut self, runtime: &mut DataPlaneMain, frame: &mut BufferFrame) {
-        ip_input_process_frame(runtime, frame, IpVersion::V6)
+    fn process(
+        runtime: &mut DataPlaneMain,
+        node_runtime: &mut hammer_runtime::NodeRuntime,
+        frame: &mut Frame,
+    ) -> usize {
+        let process: NodeProcessFn = |runtime, _, frame| {
+            let processed_vectors = frame.len();
+            ip_input_process_frame(runtime, frame, IpVersion::V6);
+            processed_vectors
+        };
+        process(runtime, node_runtime, frame)
     }
-    fn node_process(&self) -> NodeProcessFn {
-        |runtime, _, frame| ip_input_process_frame(runtime, frame, IpVersion::V6)
-    }
+
     fn node_trace_formatter(&self) -> Option<TraceFormatter> {
         Some(format_packet_trace!(IpInputTrace))
     }
@@ -87,7 +101,7 @@ impl Node for Ip6InputNode {
 #[inline(always)]
 fn ip_input_process_frame(
     runtime: &mut DataPlaneMain,
-    frame: &mut BufferFrame,
+    frame: &mut Frame,
     version: IpVersion,
 ) -> () {
     let mut nexts = Vec::with_capacity(frame.len());
@@ -95,7 +109,7 @@ fn ip_input_process_frame(
         IpVersion::V4 => Ip4InputNext::Drop.slot() as u16,
         IpVersion::V6 => Ip6InputNext::Drop.slot() as u16,
     };
-    for index in frame.indices() {
+    for index in frame.vector_args() {
         let slot = match next_slot_for_index(runtime, *index, version) {
             Ok(slot) => slot,
             Err(_) => drop_slot,

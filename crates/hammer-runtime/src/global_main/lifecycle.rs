@@ -4,7 +4,7 @@ use std::sync::atomic::Ordering;
 use crate::AsyncFileMain;
 use crate::error::{RuntimeError, RuntimeResult};
 use crate::global_main::GlobalMain;
-use crate::node::NodeRuntime;
+use crate::node::NodeMain;
 use crate::process::ProcessHandle;
 use hammer_stats::StatsMain;
 
@@ -38,7 +38,7 @@ impl GlobalMain {
                 "control runtime is not initialized",
             )
         })?;
-        let graph = NodeRuntime::default();
+        let graph = NodeMain::default();
         self.control_thread.run(async {
             let process_future = self.control_thread.run_processes_until(future);
             tokio::pin!(process_future);

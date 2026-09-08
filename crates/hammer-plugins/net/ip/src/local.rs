@@ -3,7 +3,7 @@ use std::net::IpAddr;
 
 use crate::protocol::ip::{Ipv4Header, Ipv6Header};
 use crate::protocol::wire::read_header;
-use hammer_core::data_plane::{BufferFrame, BufferPacketCursor, NodeId, NodeNext};
+use hammer_core::data_plane::{BufferPacketCursor, Frame, NodeId, NodeNext};
 use hammer_infra::checksum::InternetChecksum;
 use hammer_runtime::{
     DataPlaneMain, Node, NodeProcessFn, TraceFormatter, add_packet_trace, format_packet_trace,
@@ -136,12 +136,19 @@ fn register_ip4_local(runtime: &DataPlaneMain) -> RuntimeResult<NodeId> {
 }
 
 impl Node for Ip4LocalNode {
-    fn process(&mut self, runtime: &mut DataPlaneMain, frame: &mut BufferFrame) {
-        process_frame(runtime, frame, LocalStage::Head, IpVersion::V4)
+    fn process(
+        runtime: &mut DataPlaneMain,
+        node_runtime: &mut hammer_runtime::NodeRuntime,
+        frame: &mut Frame,
+    ) -> usize {
+        let process: NodeProcessFn = |runtime, _, frame| {
+            let processed_vectors = frame.len();
+            process_frame(runtime, frame, LocalStage::Head, IpVersion::V4);
+            processed_vectors
+        };
+        process(runtime, node_runtime, frame)
     }
-    fn node_process(&self) -> NodeProcessFn {
-        |runtime, _, frame| process_frame(runtime, frame, LocalStage::Head, IpVersion::V4)
-    }
+
     fn node_trace_formatter(&self) -> Option<TraceFormatter> {
         Some(format_packet_trace!(IpLocalTrace))
     }
@@ -186,12 +193,19 @@ fn register_ip4_receive(runtime: &DataPlaneMain) -> RuntimeResult<NodeId> {
 }
 
 impl Node for Ip4ReceiveNode {
-    fn process(&mut self, runtime: &mut DataPlaneMain, frame: &mut BufferFrame) {
-        process_frame(runtime, frame, LocalStage::Receive, IpVersion::V4)
+    fn process(
+        runtime: &mut DataPlaneMain,
+        node_runtime: &mut hammer_runtime::NodeRuntime,
+        frame: &mut Frame,
+    ) -> usize {
+        let process: NodeProcessFn = |runtime, _, frame| {
+            let processed_vectors = frame.len();
+            process_frame(runtime, frame, LocalStage::Receive, IpVersion::V4);
+            processed_vectors
+        };
+        process(runtime, node_runtime, frame)
     }
-    fn node_process(&self) -> NodeProcessFn {
-        |runtime, _, frame| process_frame(runtime, frame, LocalStage::Receive, IpVersion::V4)
-    }
+
     fn node_trace_formatter(&self) -> Option<TraceFormatter> {
         Some(format_packet_trace!(IpLocalTrace))
     }
@@ -212,19 +226,26 @@ fn register_ip4_local_end_of_arc(runtime: &DataPlaneMain) -> RuntimeResult<NodeI
 }
 
 impl Node for Ip4LocalEndOfArcNode {
-    fn process(&mut self, runtime: &mut DataPlaneMain, frame: &mut BufferFrame) {
-        process_frame(runtime, frame, LocalStage::End, IpVersion::V4)
+    fn process(
+        runtime: &mut DataPlaneMain,
+        node_runtime: &mut hammer_runtime::NodeRuntime,
+        frame: &mut Frame,
+    ) -> usize {
+        let process: NodeProcessFn = |runtime, _, frame| {
+            let processed_vectors = frame.len();
+            process_frame(runtime, frame, LocalStage::End, IpVersion::V4);
+            processed_vectors
+        };
+        process(runtime, node_runtime, frame)
     }
-    fn node_process(&self) -> NodeProcessFn {
-        |runtime, _, frame| process_frame(runtime, frame, LocalStage::End, IpVersion::V4)
-    }
+
     fn node_trace_formatter(&self) -> Option<TraceFormatter> {
         Some(format_packet_trace!(IpLocalTrace))
     }
 }
 
 pub(crate) fn register_ip4_protocol(
-    nodes: &hammer_runtime::node::NodeRuntime,
+    nodes: &hammer_runtime::node::NodeMain,
     protocol: u8,
     node: NodeId,
 ) -> RuntimeResult<()> {
@@ -273,12 +294,19 @@ fn register_ip6_local(runtime: &DataPlaneMain) -> RuntimeResult<NodeId> {
 }
 
 impl Node for Ip6LocalNode {
-    fn process(&mut self, runtime: &mut DataPlaneMain, frame: &mut BufferFrame) {
-        process_frame(runtime, frame, LocalStage::Head, IpVersion::V6)
+    fn process(
+        runtime: &mut DataPlaneMain,
+        node_runtime: &mut hammer_runtime::NodeRuntime,
+        frame: &mut Frame,
+    ) -> usize {
+        let process: NodeProcessFn = |runtime, _, frame| {
+            let processed_vectors = frame.len();
+            process_frame(runtime, frame, LocalStage::Head, IpVersion::V6);
+            processed_vectors
+        };
+        process(runtime, node_runtime, frame)
     }
-    fn node_process(&self) -> NodeProcessFn {
-        |runtime, _, frame| process_frame(runtime, frame, LocalStage::Head, IpVersion::V6)
-    }
+
     fn node_trace_formatter(&self) -> Option<TraceFormatter> {
         Some(format_packet_trace!(IpLocalTrace))
     }
@@ -323,12 +351,19 @@ fn register_ip6_receive(runtime: &DataPlaneMain) -> RuntimeResult<NodeId> {
 }
 
 impl Node for Ip6ReceiveNode {
-    fn process(&mut self, runtime: &mut DataPlaneMain, frame: &mut BufferFrame) {
-        process_frame(runtime, frame, LocalStage::Receive, IpVersion::V6)
+    fn process(
+        runtime: &mut DataPlaneMain,
+        node_runtime: &mut hammer_runtime::NodeRuntime,
+        frame: &mut Frame,
+    ) -> usize {
+        let process: NodeProcessFn = |runtime, _, frame| {
+            let processed_vectors = frame.len();
+            process_frame(runtime, frame, LocalStage::Receive, IpVersion::V6);
+            processed_vectors
+        };
+        process(runtime, node_runtime, frame)
     }
-    fn node_process(&self) -> NodeProcessFn {
-        |runtime, _, frame| process_frame(runtime, frame, LocalStage::Receive, IpVersion::V6)
-    }
+
     fn node_trace_formatter(&self) -> Option<TraceFormatter> {
         Some(format_packet_trace!(IpLocalTrace))
     }
@@ -349,19 +384,26 @@ fn register_ip6_local_end_of_arc(runtime: &DataPlaneMain) -> RuntimeResult<NodeI
 }
 
 impl Node for Ip6LocalEndOfArcNode {
-    fn process(&mut self, runtime: &mut DataPlaneMain, frame: &mut BufferFrame) {
-        process_frame(runtime, frame, LocalStage::End, IpVersion::V6)
+    fn process(
+        runtime: &mut DataPlaneMain,
+        node_runtime: &mut hammer_runtime::NodeRuntime,
+        frame: &mut Frame,
+    ) -> usize {
+        let process: NodeProcessFn = |runtime, _, frame| {
+            let processed_vectors = frame.len();
+            process_frame(runtime, frame, LocalStage::End, IpVersion::V6);
+            processed_vectors
+        };
+        process(runtime, node_runtime, frame)
     }
-    fn node_process(&self) -> NodeProcessFn {
-        |runtime, _, frame| process_frame(runtime, frame, LocalStage::End, IpVersion::V6)
-    }
+
     fn node_trace_formatter(&self) -> Option<TraceFormatter> {
         Some(format_packet_trace!(IpLocalTrace))
     }
 }
 
 pub(crate) fn register_ip6_protocol(
-    nodes: &hammer_runtime::node::NodeRuntime,
+    nodes: &hammer_runtime::node::NodeMain,
     protocol: u8,
     node: NodeId,
 ) -> RuntimeResult<()> {
@@ -421,7 +463,7 @@ impl LocalStage {
 #[inline(always)]
 fn process_frame(
     runtime: &mut DataPlaneMain,
-    frame: &mut BufferFrame,
+    frame: &mut Frame,
     stage: LocalStage,
     version: IpVersion,
 ) -> () {
@@ -1012,9 +1054,15 @@ pub(crate) mod tests {
                 }
                 packet[header_len + 4..header_len + 6].copy_from_slice(&8u16.to_be_bytes());
                 packet[header_len + 6..header_len + 8].copy_from_slice(&1u16.to_be_bytes());
-                let mut frame = runtime.buffers().get_next_frame(receive)?;
+                let mut frame = runtime
+                    .buffers()
+                    .get_next_frame(receive, runtime.nodes().frame_args_size(receive)?)?;
                 let index = runtime.alloc_index_with_bytes(&packet)?;
-                frame.push_index(index)?;
+                {
+                    let count = frame.len();
+                    frame.set_vector_count(count + 1);
+                    frame.vector_args_mut()[count] = index;
+                }
                 {
                     let mut buffer = runtime.buffer_mut(index);
                     let mut network = NetworkOpaque::default();
@@ -1103,9 +1151,15 @@ pub(crate) mod tests {
         packet[20..28].copy_from_slice(&[8, 0, 0, 0, 0, 0x0b, 0, 5]);
         let checksum = internet_checksum(&packet[20..]);
         packet[22..24].copy_from_slice(&checksum.to_be_bytes());
-        let mut frame = runtime.buffers().get_next_frame(NodeId::new(0))?;
+        let mut frame = runtime
+            .buffers()
+            .get_next_frame(NodeId::new(0), (0, 4, 0))?;
         let head = runtime.buffers().alloc_index_with_bytes(&packet[..37])?;
-        frame.push_index(head)?;
+        {
+            let count = frame.len();
+            frame.set_vector_count(count + 1);
+            frame.vector_args_mut()[count] = head;
+        }
         let tail = runtime.buffers().alloc_index_with_bytes(&packet[37..])?;
         runtime.buffers().chain_buffer(head, tail)?;
         let parsed = ip_header(

@@ -1,8 +1,8 @@
 use crate::{TcpError, TcpSegmentFlags, tcp_header};
-use hammer_core::data_plane::{BufferFrame, BufferPacketCursor, NodeId};
+use hammer_core::data_plane::{BufferPacketCursor, Frame, NodeId};
 use hammer_infra::checksum::{internet_checksum, internet_checksum_parts};
 use hammer_runtime::RuntimeResult;
-use hammer_runtime::{DataPlaneMain, Node, NodeProcessFn, NodeRuntimeData};
+use hammer_runtime::{DataPlaneMain, Node, NodeProcessFn, NodeRuntime};
 
 #[hammer_component_macros::node_next]
 pub enum TcpResetNext {
@@ -30,30 +30,28 @@ pub fn register_tcp_reset(runtime: &DataPlaneMain) -> RuntimeResult<NodeId> {
 
 impl Node for TcpResetNode {
     #[inline(always)]
-    fn process(&mut self, runtime: &mut DataPlaneMain, frame: &mut BufferFrame) -> () {
-        tcp_reset_process_frame(runtime, frame)
+    fn process(
+        runtime: &mut DataPlaneMain,
+        node_runtime: &mut hammer_runtime::NodeRuntime,
+        frame: &mut Frame,
+    ) -> usize {
+        let process: NodeProcessFn = tcp_reset_process;
+        process(runtime, node_runtime, frame)
     }
 
     #[inline]
-    fn node_process(&self) -> NodeProcessFn {
-        tcp_reset_process
-    }
-
-    #[inline]
-    fn node_runtime_data(&self) -> RuntimeResult<NodeRuntimeData> {
-        Ok(NodeRuntimeData::default())
+    fn node_runtime_data(&self) -> RuntimeResult<NodeRuntime> {
+        Ok(NodeRuntime::default())
     }
 }
 
-fn tcp_reset_process(
-    runtime: &mut DataPlaneMain,
-    _: NodeRuntimeData,
-    frame: &mut BufferFrame,
-) -> () {
-    tcp_reset_process_frame(runtime, frame)
+fn tcp_reset_process(runtime: &mut DataPlaneMain, _: &mut NodeRuntime, frame: &mut Frame) -> usize {
+    let processed_vectors = frame.len();
+    tcp_reset_process_frame(runtime, frame);
+    processed_vectors
 }
 
-fn tcp_reset_process_frame(runtime: &mut DataPlaneMain, frame: &mut BufferFrame) -> () {
+fn tcp_reset_process_frame(runtime: &mut DataPlaneMain, frame: &mut Frame) -> () {
     hammer_runtime::process_frame!(runtime, frame, |index| {
         tcp_reset_next_for_index(runtime, index).unwrap_or(TcpResetNext::Drop)
     })

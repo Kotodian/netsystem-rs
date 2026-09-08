@@ -32,7 +32,7 @@ impl DataPlaneBuffers {
             buffer_pools,
             active_numa_node,
             thread_index,
-            frames: FramePool::with_capacity(DEFAULT_BUFFER_FRAME_CAPACITY, frame_slots),
+            frames: Rc::new(RefCell::new(frame_pool::FramePool::default())),
             frame_slots,
         }
     }
@@ -72,7 +72,7 @@ impl DataPlaneBuffers {
             .len
     }
     pub fn frames_in_use(&self) -> usize {
-        self.frames.in_use()
+        self.frames.borrow().in_use()
     }
     pub fn frame_capacity(&self) -> usize {
         DEFAULT_BUFFER_FRAME_CAPACITY
@@ -173,46 +173,25 @@ impl DataPlaneBuffers {
         prefetch_buffer_data_write(&buffer);
     }
 
-    pub(super) fn drop_frame_indices(&self, frame: &mut BufferFrame) {
-        for index in frame.drain_indices() {
-            self.drop_index_owned(index);
-        }
+    pub(super) fn drop_owned_frame(&self, frame: Box<Frame>) {
+        self.frames.borrow_mut().recycle(frame);
     }
-    pub(super) fn drop_owned_frame(&self, index: (u64, u32, u32), frame: BufferFrame) {
-        self.drop_owned_frame_with_trace(index, frame, |_| {});
+    pub(super) fn drop_owned_frame_with_trace(&self, frame: Box<Frame>, _: impl FnMut(u32)) {
+        self.frames.borrow_mut().recycle(frame);
     }
-    pub(super) fn drop_owned_frame_with_trace(
+    pub fn get_next_frame(
         &self,
-        index: (u64, u32, u32),
-        mut frame: BufferFrame,
-        mut release_trace: impl FnMut(u32),
-    ) {
-        for buffer in frame.drain_indices() {
-            self.drop_index_owned_with_trace(buffer, &mut release_trace);
-        }
-        frame.reset_for_pool_reuse();
-        self.frames
-            .return_taken_index(index, frame)
-            .expect("return checked-out Frame");
-    }
-    fn alloc_frame(&self) -> DataPlaneResult<((u64, u32, u32), BufferFrame)> {
-        let index = self.frames.alloc_index()?;
-        match self.frames.take_index(index) {
-            Ok(frame) => Ok((index, frame)),
-            Err(error) => {
-                self.frames
-                    .return_index(self, index)
-                    .expect("return reserved Frame");
-                Err(error)
-            }
-        }
-    }
-    pub fn get_next_frame(&self, next: NodeId) -> DataPlaneResult<Frame<Next>> {
-        let (index, frame) = self.alloc_frame()?;
-        Ok(Frame {
+        next: NodeId,
+        argument_sizes: (u16, u16, u16),
+    ) -> DataPlaneResult<hammer_core::buffer::checked_out::Frame<Next>> {
+        let (scalar_size, vector_size, aux_size) = argument_sizes;
+        let frame = self
+            .frames
+            .borrow_mut()
+            .allocate(scalar_size, vector_size, aux_size);
+        Ok(checked_out::Frame {
             state: Next {
                 owner: self.clone(),
-                index,
                 next,
                 frame: Some(frame),
             },

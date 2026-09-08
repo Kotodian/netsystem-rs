@@ -1,5 +1,4 @@
 use core::ptr;
-use core::sync::atomic::{AtomicU64, Ordering};
 use std::cell::RefCell;
 use std::fmt;
 use std::ops::{Deref, DerefMut};
@@ -9,7 +8,6 @@ use crate::graph::{NodeErrorIndex, NodeId};
 use hammer_infra::{
     PageSize,
     prefetch::{prefetch_read_l1, prefetch_write_l1},
-    simd::movemask_4,
 };
 use spinning_top::{
     RawRwSpinlock,
@@ -21,12 +19,11 @@ use std::rc::Rc;
 use self::memory::{HAMMER_MAX_NUMA_NODES, StaticNumaTable};
 
 mod chain;
-mod checked_out;
+pub mod checked_out;
 mod clone;
 mod cursor;
 mod flags;
-mod frame;
-mod frame_pool;
+pub mod frame_pool;
 mod header;
 mod main;
 mod memory;
@@ -35,10 +32,10 @@ mod operations;
 mod pool;
 mod prefetch;
 
-pub use checked_out::{Frame, FrameBatchWidth, Next, Pending};
+pub use crate::graph::frame::Frame;
+pub use checked_out::{FrameBatchWidth, Next, Pending};
 pub use cursor::BufferPacketCursor;
 pub use flags::BufferFlags;
-pub use frame::BufferFrame;
 pub use main::BufferMain;
 pub use opaque::{BufferOpaque, BufferOpaqueRegion, PRIMARY_OPAQUE_ALIGN, PRIMARY_OPAQUE_BYTES};
 use opaque::{PrimaryOpaque, SecondaryOpaque};
@@ -101,33 +98,12 @@ impl DerefMut for BufferRefMut<'_> {
     }
 }
 
-#[derive(Debug)]
-struct FrameSlot {
-    generation: u32,
-    allocated: bool,
-    frame: Option<BufferFrame>,
-}
-
-#[derive(Debug)]
-struct FramePoolInner {
-    pool_id: u64,
-    slots: Box<[FrameSlot]>,
-    available: Box<[u32]>,
-    available_len: usize,
-    in_use: usize,
-}
-
-#[derive(Debug, Clone)]
-pub(crate) struct FramePool {
-    inner: Rc<RefCell<FramePoolInner>>,
-}
-
 #[derive(Clone)]
 pub struct DataPlaneBuffers {
     buffer_pools: StaticNumaTable<BufferPoolArena, HAMMER_MAX_NUMA_NODES>,
     active_numa_node: u32,
     thread_index: u32,
-    frames: FramePool,
+    frames: Rc<RefCell<frame_pool::FramePool>>,
     frame_slots: usize,
 }
 
@@ -139,34 +115,6 @@ impl fmt::Debug for DataPlaneBuffers {
             .field("frame_capacity", &DEFAULT_BUFFER_FRAME_CAPACITY)
             .field("frame_slots", &self.frame_slots)
             .finish()
-    }
-}
-
-static NEXT_POOL_ID: AtomicU64 = AtomicU64::new(1);
-
-#[inline]
-fn next_pool_id() -> u64 {
-    let id = NEXT_POOL_ID.fetch_add(1, Ordering::Relaxed);
-    if id == 0 || id == u64::MAX {
-        // Nonzero namespace; never wrap to a previously used ID.
-        abort_pool_id_namespace_exhausted();
-    }
-    id
-}
-
-#[inline(never)]
-#[cold]
-fn abort_pool_id_namespace_exhausted() -> ! {
-    panic!("data-plane pool ID namespace exhausted");
-}
-
-/// Advance a slot generation. Retires the slot when the generation would wrap.
-#[inline]
-fn advance_generation(current: u32) -> Option<u32> {
-    if current == u32::MAX {
-        None
-    } else {
-        Some(current.wrapping_add(1).max(1))
     }
 }
 

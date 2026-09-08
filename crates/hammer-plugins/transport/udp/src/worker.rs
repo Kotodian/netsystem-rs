@@ -4,13 +4,13 @@ use std::net::SocketAddr;
 use std::ops::Deref;
 use std::sync::{Arc, OnceLock, mpsc};
 
-use hammer_core::data_plane::{BufferFrame, NodeId, NodeState};
+use hammer_core::data_plane::{Frame, NodeId, NodeState};
 use hammer_infra::align::CacheLineAlignMark;
 use hammer_infra::pool::Pool;
 use hammer_infra::thread_owned::{ThreadOwned, ThreadOwnedError};
 use hammer_runtime::app::{SessionDgramHeader, SessionHandle};
 use hammer_runtime::{
-    DataPlaneMain, DataWorkerId, GlobalMain, NodeRuntimeData, RuntimeError, RuntimeResult,
+    DataPlaneMain, DataWorkerId, GlobalMain, NodeRuntime, RuntimeError, RuntimeResult,
     SessionConnectEndpoint, SessionListenEndpoint, with_data_plane_main,
 };
 use hammer_service::session::SessionQueueNext;
@@ -1063,10 +1063,10 @@ fn udp_worker_exit(engine: &mut DataPlaneMain) -> RuntimeResult<()> {
 fn udp_session_queue_update_time(
     runtime: &mut DataPlaneMain,
     _: &mut SessionWorker,
-    _: NodeRuntimeData,
+    _: NodeRuntime,
     output_next: SessionQueueNext,
     now: std::time::Instant,
-    frame: &mut BufferFrame,
+    frame: &mut Frame,
     output: &mut SessionQueueOutput,
 ) -> RuntimeResult<()> {
     let main = UDP_MAIN
@@ -1080,10 +1080,10 @@ fn udp_session_queue_update_time(
 fn udp_session_queue_dispatch(
     runtime: &mut DataPlaneMain,
     _: &mut SessionWorker,
-    _: NodeRuntimeData,
+    _: NodeRuntime,
     output_next: SessionQueueNext,
     now: std::time::Instant,
-    frame: &mut BufferFrame,
+    frame: &mut Frame,
     output: &mut SessionQueueOutput,
 ) -> RuntimeResult<()> {
     let main = UDP_MAIN
@@ -1108,7 +1108,7 @@ impl SessionTransport for UdpWorker {
         sessions: &mut SessionWorker,
         runtime: &mut DataPlaneMain,
         _: SessionQueueNext,
-        _: &mut BufferFrame,
+        _: &mut Frame,
         _: &mut SessionQueueOutput,
         _: std::time::Instant,
     ) -> RuntimeResult<()> {
@@ -1125,7 +1125,7 @@ impl SessionTransport for UdpWorker {
         index: u32,
         _: &mut DataPlaneMain,
         _: SessionQueueNext,
-        _: &mut BufferFrame,
+        _: &mut Frame,
         _: &mut SessionQueueOutput,
         _: std::time::Instant,
     ) -> RuntimeResult<()> {
@@ -1156,7 +1156,7 @@ impl TransportInternalTransport for UdpWorker {
         index: u32,
         runtime: &mut DataPlaneMain,
         output_next: SessionQueueNext,
-        frame: &mut BufferFrame,
+        frame: &mut Frame,
         output: &mut SessionQueueOutput,
         _: std::time::Instant,
     ) -> RuntimeResult<()> {

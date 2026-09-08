@@ -59,7 +59,7 @@ pub enum DataPlaneError {
     #[error(transparent)]
     BufferInvariant(#[from] BufferInvariant),
     #[error("buffer frame capacity exceeded")]
-    BufferFrameCapacityExceeded,
+    FrameCapacityExceeded,
     #[error("buffer arena must contain at least one usable slot")]
     BufferArenaSlotsZero,
     #[error("buffer arena size overflow")]

@@ -99,7 +99,7 @@ impl DataPlaneMain {
     pub fn set_worker_node_runtime_data(
         &mut self,
         node: NodeId,
-        data: NodeRuntimeData,
+        data: NodeRuntime,
     ) -> RuntimeResult<()> {
         self.data_worker_id()?;
         self.nodes.set_node_runtime_data(node, data)

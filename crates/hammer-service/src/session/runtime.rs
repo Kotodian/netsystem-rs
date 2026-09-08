@@ -10,7 +10,7 @@ use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
 
 use crossbeam_queue::ArrayQueue;
-use hammer_core::data_plane::{BufferFrame, DataPlaneBuffers, NodeId, NodeState};
+use hammer_core::data_plane::{DataPlaneBuffers, Frame, NodeId, NodeState};
 use hammer_infra::align::{CacheLineAlignMark, align_up};
 use hammer_infra::fifo::Fifo;
 use hammer_infra::linked_list::LinkedList;
@@ -29,8 +29,7 @@ use hammer_runtime::{
     AttachError, RuntimeError, RuntimeResult, SessionConnectEndpoint, SessionListenEndpoint,
 };
 use hammer_runtime::{
-    DataPlaneMain, DataWorkerId, Deadline, File, FileFunctions, GlobalMain, NodeRuntime,
-    NodeRuntimeData,
+    DataPlaneMain, DataWorkerId, Deadline, File, FileFunctions, GlobalMain, NodeMain, NodeRuntime,
 };
 
 use crate::session::app::AppWorkerError;
@@ -1273,7 +1272,7 @@ pub fn install_session_worker(
         .get()
         .expect("SessionMain is initialized before worker installation");
     let session_queue_data =
-        hammer_runtime::NodeRuntimeData::from_usize(main as *const SessionMain as usize)?;
+        hammer_runtime::NodeRuntime::from_usize(main as *const SessionMain as usize)?;
     let input_data = AppSessionInputNode::worker_runtime_data(session_queue_data, session_queue);
     let worker_id = worker.worker();
     let slot = main.worker(worker_id)?;
@@ -1335,10 +1334,10 @@ fn cleanup_session_worker_install(worker: &mut SessionWorker, engine: &mut DataP
 fn rollback_session_worker_graph(
     engine: &mut DataPlaneMain,
     app_session_input: hammer_core::data_plane::NodeId,
-    previous_app_session_input_data: NodeRuntimeData,
+    previous_app_session_input_data: NodeRuntime,
     previous_app_session_input_state: NodeState,
     session_queue: NodeId,
-    previous_session_queue_data: NodeRuntimeData,
+    previous_session_queue_data: NodeRuntime,
     previous_session_queue_state: NodeState,
 ) {
     if let Err(error) = engine
@@ -4246,7 +4245,7 @@ pub trait SessionTransport: Sized {
         _: usize,
         _: &mut DataPlaneMain,
         _: SessionQueueNext,
-        _: &mut BufferFrame,
+        _: &mut Frame,
         _: &mut crate::session::node::SessionQueueOutput,
     ) -> RuntimeResult<bool> {
         Ok(false)
@@ -4257,7 +4256,7 @@ pub trait SessionTransport: Sized {
         sessions: &mut SessionWorker,
         runtime: &mut DataPlaneMain,
         output_next: SessionQueueNext,
-        frame: &mut BufferFrame,
+        frame: &mut Frame,
         output: &mut crate::session::node::SessionQueueOutput,
         now: Instant,
     ) -> RuntimeResult<()>;
@@ -4268,7 +4267,7 @@ pub trait SessionTransport: Sized {
         index: u32,
         runtime: &mut DataPlaneMain,
         output_next: SessionQueueNext,
-        frame: &mut BufferFrame,
+        frame: &mut Frame,
         output: &mut crate::session::node::SessionQueueOutput,
         now: Instant,
     ) -> RuntimeResult<()>;
@@ -4286,7 +4285,7 @@ pub trait SessionTransport: Sized {
         index: u32,
         runtime: &mut DataPlaneMain,
         output_next: SessionQueueNext,
-        frame: &mut BufferFrame,
+        frame: &mut Frame,
         output: &mut crate::session::node::SessionQueueOutput,
         now: Instant,
     ) -> RuntimeResult<()> {
@@ -4301,7 +4300,7 @@ pub trait SessionPacketizedTransport: SessionTransport {
         index: u32,
         runtime: &mut DataPlaneMain,
         output_next: SessionQueueNext,
-        frame: &mut BufferFrame,
+        frame: &mut Frame,
         output: &mut crate::session::node::SessionQueueOutput,
         now: Instant,
     ) -> RuntimeResult<()>;
@@ -4331,7 +4330,7 @@ pub trait TransportInternalTransport: SessionTransport {
         index: u32,
         runtime: &mut DataPlaneMain,
         output_next: SessionQueueNext,
-        frame: &mut BufferFrame,
+        frame: &mut Frame,
         output: &mut crate::session::node::SessionQueueOutput,
         now: Instant,
     ) -> RuntimeResult<()>;
@@ -4348,7 +4347,7 @@ where
         session_id: u32,
         runtime: &mut DataPlaneMain,
         output_next: SessionQueueNext,
-        frame: &mut BufferFrame,
+        frame: &mut Frame,
         output: &mut crate::session::node::SessionQueueOutput,
         now: Instant,
     ) -> RuntimeResult<()>;
@@ -4368,7 +4367,7 @@ where
         session_id: u32,
         runtime: &mut DataPlaneMain,
         output_next: SessionQueueNext,
-        frame: &mut BufferFrame,
+        frame: &mut Frame,
         output: &mut crate::session::node::SessionQueueOutput,
         now: Instant,
     ) -> RuntimeResult<()> {
@@ -4390,7 +4389,7 @@ where
         let io_budget = output
             .remaining_io_budget()
             .min(DEFAULT_TX_DISPATCH_BUDGET)
-            .min(frame.capacity().saturating_sub(frame.len()));
+            .min(hammer_core::graph::frame::FRAME_VECTOR_CAPACITY.saturating_sub(frame.len()));
         if batch_offset < total_len
             && remaining_space != 0
             && params.send_goal_size != 0
@@ -4452,7 +4451,7 @@ where
         session_id: u32,
         runtime: &mut DataPlaneMain,
         output_next: SessionQueueNext,
-        frame: &mut BufferFrame,
+        frame: &mut Frame,
         output: &mut crate::session::node::SessionQueueOutput,
         now: Instant,
     ) -> RuntimeResult<()> {
@@ -4481,8 +4480,7 @@ where
 {
     let now = Instant::now();
     sessions.poll_app()?;
-    let mut staging =
-        BufferFrame::with_capacity(hammer_core::data_plane::DEFAULT_BUFFER_FRAME_CAPACITY);
+    let mut staging = Frame::<(), u32, ()>::new(0);
     let mut output = crate::session::node::SessionQueueOutput::default();
     let step = dispatch_session_queue_pending(
         runtime,
@@ -4502,7 +4500,7 @@ pub fn dispatch_session_queue_pending<T>(
     sessions: &mut SessionWorker,
     transport: &mut T,
     output_next: SessionQueueNext,
-    frame: &mut BufferFrame,
+    frame: &mut Frame,
     output: &mut crate::session::node::SessionQueueOutput,
     now: Instant,
 ) -> RuntimeResult<SessionQueueStep>
@@ -4529,7 +4527,7 @@ pub fn dispatch_session_queue_events<T>(
     sessions: &mut SessionWorker,
     transport: &mut T,
     output_next: SessionQueueNext,
-    frame: &mut BufferFrame,
+    frame: &mut Frame,
     output: &mut crate::session::node::SessionQueueOutput,
     now: Instant,
 ) -> RuntimeResult<SessionQueueStep>
@@ -4719,7 +4717,7 @@ fn dispatch_io_event<T>(
     transport: &mut T,
     runtime: &mut DataPlaneMain,
     output_next: SessionQueueNext,
-    frame: &mut BufferFrame,
+    frame: &mut Frame,
     output: &mut crate::session::node::SessionQueueOutput,
     now: Instant,
     event: SessionEvt,
@@ -4818,7 +4816,7 @@ fn enqueue_app_event(
 }
 
 fn schedule_app_session_input(
-    graph: &hammer_runtime::NodeRuntime,
+    graph: &hammer_runtime::NodeMain,
     file: &mut File,
 ) -> RuntimeResult<()> {
     let node = hammer_core::data_plane::NodeId::new(file.private_data() as u32);
@@ -4826,10 +4824,7 @@ fn schedule_app_session_input(
     Ok(())
 }
 
-fn schedule_session_queue_deadline(
-    graph: &NodeRuntime,
-    deadline: &mut Deadline,
-) -> RuntimeResult<()> {
+fn schedule_session_queue_deadline(graph: &NodeMain, deadline: &mut Deadline) -> RuntimeResult<()> {
     let node = NodeId::new(
         u32::try_from(deadline.private_data())
             .expect("Session Queue node identity is stored as a u32"),
@@ -4838,10 +4833,7 @@ fn schedule_session_queue_deadline(
     Ok(())
 }
 
-fn schedule_app_mq_pending(
-    graph: &hammer_runtime::NodeRuntime,
-    file: &mut File,
-) -> RuntimeResult<()> {
+fn schedule_app_mq_pending(graph: &hammer_runtime::NodeMain, file: &mut File) -> RuntimeResult<()> {
     // SAFETY: the entry is boxed and owned by this worker's SessionWorker for
     // the File lifetime; FileMain deletes this File before the box is dropped.
     let entry = unsafe { &mut *(file.private_data() as usize as *mut AppRxMqEntry) };

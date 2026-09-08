@@ -705,19 +705,98 @@ fn expand_node_function_variant(
     } else {
         quote!(#function_name)
     };
+    let frame_type = match function.sig.inputs.last() {
+        Some(FnArg::Typed(argument)) => match argument.ty.as_ref() {
+            Type::Reference(reference) if reference.mutability.is_some() => reference.elem.as_ref(),
+            other => {
+                return Error::new_spanned(other, "Node Frame must be a mutable borrow")
+                    .into_compile_error();
+            }
+        },
+        _ => {
+            return Error::new_spanned(&function.sig, "Node function requires a Frame argument")
+                .into_compile_error();
+        }
+    };
+    let Type::Path(frame_path) = frame_type else {
+        return Error::new_spanned(frame_type, "Node Frame must name its argument types")
+            .into_compile_error();
+    };
+    let mut argument_types: Vec<Type> = match &frame_path
+        .path
+        .segments
+        .last()
+        .expect("Frame path")
+        .arguments
+    {
+        PathArguments::None => Vec::new(),
+        PathArguments::AngleBracketed(arguments) => arguments
+            .args
+            .iter()
+            .filter_map(|argument| match argument {
+                GenericArgument::Type(ty) => Some(ty.clone()),
+                _ => None,
+            })
+            .collect(),
+        other => {
+            return Error::new_spanned(other, "Frame expects scalar, vector and auxiliary types")
+                .into_compile_error();
+        }
+    };
+    let defaults: [Type; 3] = [parse_quote!(()), parse_quote!(u32), parse_quote!(())];
+    if argument_types.len() > 3 {
+        return Error::new_spanned(frame_type, "Frame has three argument types")
+            .into_compile_error();
+    }
+    argument_types.extend(defaults[argument_types.len()..].iter().cloned());
+    let scalar = &argument_types[0];
+    let vector = &argument_types[1];
+    let aux = &argument_types[2];
+    let trampoline = format_ident!("__{}_{}_invoke", function.sig.ident, suffix);
+    let invocation = if variant_function.sig.unsafety.is_some() {
+        quote! {
+            // SAFETY: runtime selects this registration only after checking
+            // the matching SIMD width against this Worker's CPU features.
+            unsafe { #registered_function(runtime, node_runtime, frame) }
+        }
+    } else {
+        quote! { #registered_function(runtime, node_runtime, frame) }
+    };
+    let input_cfg: Vec<_> = input_cfg.collect();
     quote! {
         #target_feature
         #variant_function
 
         #(#input_cfg)*
+        fn #trampoline(
+            runtime: &mut ::hammer_runtime::DataPlaneMain,
+            node_runtime: &mut ::hammer_runtime::NodeRuntime,
+            frame: &mut ::hammer_core::data_plane::Frame,
+        ) -> usize {
+            match ::std::panic::catch_unwind(::std::panic::AssertUnwindSafe(|| {
+                frame.validate_layout::<#scalar, #vector, #aux>();
+                // SAFETY: the installed offsets, allocation extent, alignment and
+                // initialized vector count match the declared argument types.
+                // Generic markers do not alter the common C header or DST metadata.
+                let frame = unsafe { &mut *(frame as *mut ::hammer_core::data_plane::Frame as *mut #frame_type) };
+                #invocation
+            })) {
+                Ok(processed) => processed,
+                Err(_) => ::std::process::abort(),
+            }
+        }
+
+        #(#input_cfg)*
         pub(crate) static #static_name: ::hammer_runtime::node::NodeFunctionRegistration =
-            unsafe {
-                ::hammer_runtime::node::NodeFunctionRegistration::new(
+            ::hammer_runtime::node::NodeFunctionRegistration::new(
                 #node::NODE_NAME,
                 ::hammer_runtime::Simd::<u8, #simd_bytes>::splat(0),
-                #registered_function,
-                )
-            };
+                #trampoline,
+                {
+                    assert!(<#frame_type>::ALLOCATION_SIZE <= u16::MAX as usize);
+                    (::core::mem::size_of::<#scalar>() as u16, ::core::mem::size_of::<#vector>() as u16, ::core::mem::size_of::<#aux>() as u16)
+                },
+            );
     }
 }
 
@@ -998,7 +1077,7 @@ pub fn feature_arc(args: TokenStream, input: TokenStream) -> TokenStream {
         #item
         impl #impl_generics #ident #ty_generics #where_clause {
             pub const FEATURE_ARC_NAME: &'static str = #name;
-            pub fn register_feature_arc(interfaces: &::hammer_service::interface::InterfaceMain, nodes: &::hammer_runtime::NodeRuntime) -> Result<u8, ::hammer_service::interface::feature::FeatureError> {
+            pub fn register_feature_arc(interfaces: &::hammer_service::interface::InterfaceMain, nodes: &::hammer_runtime::NodeMain) -> Result<u8, ::hammer_service::interface::feature::FeatureError> {
                 interfaces.register_feature_arc(Self::FEATURE_ARC_NAME, &[#(nodes.node_by_name(#starts::NODE_NAME).ok_or(::hammer_service::interface::feature::FeatureError::NodeNotFound { name: #starts::NODE_NAME })?),*], #last)
             }
         }
@@ -1018,7 +1097,7 @@ pub fn feature(args: TokenStream, input: TokenStream) -> TokenStream {
     quote! {
         #item
         impl #impl_generics #ident #ty_generics #where_clause {
-            pub fn register_feature(interfaces: &::hammer_service::interface::InterfaceMain, nodes: &::hammer_runtime::NodeRuntime) -> Result<(), ::hammer_service::interface::feature::FeatureError> {
+            pub fn register_feature(interfaces: &::hammer_service::interface::InterfaceMain, nodes: &::hammer_runtime::NodeMain) -> Result<(), ::hammer_service::interface::feature::FeatureError> {
                 let node = nodes.node_by_name(Self::NODE_NAME).ok_or(::hammer_service::interface::feature::FeatureError::NodeNotFound { name: Self::NODE_NAME })?;
                 interfaces.register_feature(#arc::FEATURE_ARC_NAME, Self::NODE_NAME, node, &[#(#before::NODE_NAME),*], &[#(#after::NODE_NAME),*])
             }
@@ -2146,12 +2225,27 @@ fn expand_graph_node(args: GraphNodeArgs, ident: &Ident, item: Item) -> Result<T
         (quote!(#init), generated)
     };
 
+    let trampoline = format_ident!("__{}_invoke", to_snake_case(&ident.to_string()));
     let registration = quote! {
+        fn #trampoline(
+            runtime: &mut ::hammer_runtime::DataPlaneMain,
+            node_runtime: &mut ::hammer_runtime::NodeRuntime,
+            frame: &mut ::hammer_core::data_plane::Frame,
+        ) -> usize {
+            match ::std::panic::catch_unwind(::std::panic::AssertUnwindSafe(|| {
+                frame.validate_layout::<(), u32, ()>();
+                <#ident as ::hammer_runtime::Node>::process(runtime, node_runtime, frame)
+            })) {
+                Ok(count) => count,
+                Err(_) => ::std::process::abort(),
+            }
+        }
         pub static #static_ident: ::hammer_runtime::NodeEntry =
             ::hammer_runtime::NodeEntry {
             registration: #node_registration,
             kind: #node_kind,
             init: #init,
+            process: #trampoline,
             error_counters: &[],
         };
     };

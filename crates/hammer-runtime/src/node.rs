@@ -9,8 +9,8 @@ use crate::error::{RuntimeError, RuntimeResult};
 use crate::trace::TraceFormatter;
 use crate::{DataPlaneMain, GlobalMain, Simd};
 use hammer_core::data_plane::{
-    BufferFrame, Frame, NodeErrorIndex, NodeErrorIndexError, NodeHandle, NodeId, NodeKind,
-    NodeNext, NodeRegistration, NodeState, Pending,
+    Frame, NodeErrorIndex, NodeErrorIndexError, NodeHandle, NodeId, NodeKind, NodeNext,
+    NodeRegistration, NodeState, Pending,
 };
 use hammer_core::error::DataPlaneError;
 
@@ -49,7 +49,7 @@ macro_rules! process_frame {
             "process_frame! input exceeds production frame capacity"
         );
         let mut n = 0usize;
-        for &packet_index in $frame.indices() {
+        for &packet_index in $frame.vector_args() {
             let next = {
                 let $index = packet_index;
                 $body
@@ -63,16 +63,15 @@ macro_rules! process_frame {
 }
 
 pub trait Node {
-    fn process(&mut self, runtime: &mut DataPlaneMain, frame: &mut BufferFrame) -> ();
+    fn process(
+        runtime: &mut DataPlaneMain,
+        node_runtime: &mut NodeRuntime,
+        frame: &mut Frame,
+    ) -> usize;
 
     #[inline]
-    fn node_process(&self) -> NodeProcessFn {
-        missing_node_process
-    }
-
-    #[inline]
-    fn node_runtime_data(&self) -> RuntimeResult<NodeRuntimeData> {
-        Ok(NodeRuntimeData::empty())
+    fn node_runtime_data(&self) -> RuntimeResult<NodeRuntime> {
+        Ok(NodeRuntime::empty())
     }
 
     #[inline]
@@ -99,7 +98,7 @@ pub trait Node {
         Self: Sized,
     {
         Ok(NodeDescriptor {
-            process: self.node_process(),
+            process: Self::process,
             runtime_data: self.node_runtime_data()?,
             registration: Node::node_registration(self),
             initial_nexts: self.node_initial_nexts(),
@@ -109,11 +108,11 @@ pub trait Node {
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub struct NodeRuntimeData {
+pub struct NodeRuntime {
     words: [u64; 4],
 }
 
-impl NodeRuntimeData {
+impl NodeRuntime {
     #[inline(always)]
     pub const fn empty() -> Self {
         Self { words: [0; 4] }
@@ -147,9 +146,9 @@ impl NodeRuntimeData {
     }
 }
 
-pub type NodeProcessFn = fn(&mut DataPlaneMain, NodeRuntimeData, &mut BufferFrame) -> ();
+pub type NodeProcessFn = fn(&mut DataPlaneMain, &mut NodeRuntime, &mut Frame) -> usize;
 
-type NodeFunction = unsafe fn(&mut DataPlaneMain, NodeRuntimeData, &mut BufferFrame) -> ();
+type NodeFunction = fn(&mut DataPlaneMain, &mut NodeRuntime, &mut Frame) -> usize;
 
 /// One platform-compiled process-function candidate for an existing Graph Node.
 #[derive(Clone, Copy)]
@@ -158,25 +157,27 @@ pub struct NodeFunctionRegistration {
     node_name: &'static str,
     simd_bytes: usize,
     function: NodeFunction,
+    frame_args_size: (u16, u16, u16),
 }
 
 impl NodeFunctionRegistration {
     /// Creates a Node Function registration used by `#[node_function]`.
     ///
-    /// # Safety
-    /// `function` must have no CPU requirements beyond `simd` and must obey
-    /// the [`NodeFunction`] calling contract.
+    /// The generated private trampoline contains CPU specialization and
+    /// terminates Node panics inside the owning plugin artifact.
     #[doc(hidden)]
-    pub const unsafe fn new<const LANES: usize>(
+    pub const fn new<const LANES: usize>(
         node_name: &'static str,
         _: Simd<u8, LANES>,
-        function: unsafe fn(&mut DataPlaneMain, NodeRuntimeData, &mut BufferFrame) -> (),
+        function: fn(&mut DataPlaneMain, &mut NodeRuntime, &mut Frame) -> usize,
+        frame_args_size: (u16, u16, u16),
     ) -> Self {
         assert!(matches!(LANES, 1 | 16 | 32 | 64));
         Self {
             node_name,
             simd_bytes: core::mem::size_of::<Simd<u8, LANES>>(),
             function,
+            frame_args_size,
         }
     }
 }
@@ -184,7 +185,7 @@ impl NodeFunctionRegistration {
 #[derive(Debug, Clone, Copy)]
 pub struct NodeDescriptor<'a> {
     process: NodeProcessFn,
-    runtime_data: NodeRuntimeData,
+    runtime_data: NodeRuntime,
     registration: Option<NodeRegistration>,
     initial_nexts: &'a [NodeId],
     trace_formatter: Option<TraceFormatter>,
@@ -194,7 +195,7 @@ impl<'a> NodeDescriptor<'a> {
     #[inline]
     pub fn new(
         process: NodeProcessFn,
-        runtime_data: NodeRuntimeData,
+        runtime_data: NodeRuntime,
         registration: Option<NodeRegistration>,
         initial_nexts: &'a [NodeId],
         trace_formatter: Option<TraceFormatter>,
@@ -214,7 +215,7 @@ impl<'a> NodeDescriptor<'a> {
     }
 
     #[inline]
-    pub fn runtime_data(self) -> NodeRuntimeData {
+    pub fn runtime_data(self) -> NodeRuntime {
         self.runtime_data
     }
 
@@ -232,24 +233,6 @@ impl<'a> NodeDescriptor<'a> {
     pub fn trace_formatter(self) -> Option<TraceFormatter> {
         self.trace_formatter
     }
-}
-
-fn missing_node_process(
-    runtime: &mut DataPlaneMain,
-    _data: NodeRuntimeData,
-    _frame: &mut BufferFrame,
-) -> () {
-    let current = runtime
-        .current_node()
-        .map(|node| match runtime.nodes().node_name(node) {
-            Ok(Some(name)) => format!("node {name} ({:?})", node),
-            _ => format!("node {:?}", node),
-        })
-        .unwrap_or_else(|| "current node".to_owned());
-    // Programming error: node descriptor missing a process function. Drop
-    // the frame silently.
-    _ = current;
-    ()
 }
 
 /// Packet graph node that drives an external input boundary.
@@ -339,33 +322,18 @@ pub struct NodeEntry {
     pub registration: Option<NodeRegistration>,
     pub kind: NodeKind,
     pub init: fn(&DataPlaneMain) -> RuntimeResult<NodeId>,
+    pub process: NodeProcessFn,
     pub error_counters: &'static [NodeErrorDescriptor],
 }
 
-impl NodeEntry {
-    #[inline]
-    pub const fn new(
-        registration: Option<NodeRegistration>,
-        kind: NodeKind,
-        init: fn(&DataPlaneMain) -> RuntimeResult<NodeId>,
-    ) -> Self {
-        Self {
-            registration,
-            kind,
-            init,
-            error_counters: &[],
-        }
-    }
-}
-
-pub struct NodeRuntime {
+pub struct NodeMain {
     inner: Rc<RefCell<NodeRuntimeInner>>,
     queue: Rc<RefCell<ScheduledFrameQueue>>,
     readiness: Rc<NodeReadiness>,
     topology_owner: bool,
 }
 
-impl Clone for NodeRuntime {
+impl Clone for NodeMain {
     fn clone(&self) -> Self {
         Self {
             inner: Rc::clone(&self.inner),
@@ -376,11 +344,11 @@ impl Clone for NodeRuntime {
     }
 }
 
-impl std::fmt::Debug for NodeRuntime {
+impl std::fmt::Debug for NodeMain {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let inner = self.inner.borrow();
         let queue = self.queue.borrow();
-        f.debug_struct("NodeRuntime")
+        f.debug_struct("NodeMain")
             .field("nodes_len", &inner.nodes.len())
             .field("queue_len", &queue.len())
             .field("readiness", &self.readiness)
@@ -482,7 +450,8 @@ impl Clone for NodeRuntimeInner {
 struct NodeRuntimeSlot {
     kind: NodeKind,
     process: NodeFunction,
-    runtime_data: NodeRuntimeData,
+    frame_args_size: (u16, u16, u16),
+    runtime_data: Option<NodeRuntime>,
 }
 
 impl Copy for NodeRuntimeSlot {}
@@ -506,19 +475,26 @@ impl std::fmt::Debug for NodeRuntimeSlot {
 
 impl NodeRuntimeSlot {
     #[inline]
-    fn dispatch(self, runtime: &mut DataPlaneMain, frame: Frame<Pending>) -> Frame<Pending> {
+    fn dispatch(
+        &mut self,
+        runtime: &mut DataPlaneMain,
+        frame: hammer_core::buffer::checked_out::Frame<Pending>,
+    ) -> hammer_core::buffer::checked_out::Frame<Pending> {
         let mut frame = frame;
-        // SAFETY: graph initialization installs specialized functions only
-        // after validating their instruction set against the current CPU.
-        // Default safe functions coerce to this pointer type.
-        unsafe { (self.process)(runtime, self.runtime_data, &mut frame) };
+        (self.process)(
+            runtime,
+            self.runtime_data
+                .as_mut()
+                .expect("Node owns its executing runtime"),
+            &mut frame,
+        );
         frame
     }
 }
 
 struct ScheduledFrame {
     node: NodeId,
-    frame: Frame<Pending>,
+    frame: hammer_core::buffer::checked_out::Frame<Pending>,
     allow_empty: bool,
 }
 
@@ -722,12 +698,13 @@ impl NodeRuntimeInner {
         &mut self,
         kind: NodeKind,
         process: NodeProcessFn,
-        runtime_data: NodeRuntimeData,
+        runtime_data: NodeRuntime,
     ) -> NodeId {
         self.push_node_slot(NodeRuntimeSlot {
             kind,
             process,
-            runtime_data,
+            frame_args_size: (0, 4, 0),
+            runtime_data: Some(runtime_data),
         })
     }
 
@@ -735,7 +712,7 @@ impl NodeRuntimeInner {
         &mut self,
         kind: NodeKind,
         process: NodeProcessFn,
-        runtime_data: NodeRuntimeData,
+        runtime_data: NodeRuntime,
         registration: Option<NodeRegistration>,
         initial_nexts: &[NodeId],
         trace_formatter: Option<TraceFormatter>,
@@ -1096,7 +1073,7 @@ impl NodeRuntimeInner {
     }
 }
 
-impl Default for NodeRuntime {
+impl Default for NodeMain {
     fn default() -> Self {
         Self {
             inner: Rc::new(RefCell::new(NodeRuntimeInner {
@@ -1126,7 +1103,7 @@ impl Default for NodeRuntime {
     }
 }
 
-impl From<NodeRuntimeInner> for NodeRuntime {
+impl From<NodeRuntimeInner> for NodeMain {
     fn from(inner: NodeRuntimeInner) -> Self {
         debug_assert!(
             inner
@@ -1180,7 +1157,7 @@ fn preferred_node_function<'registration>(
     Ok(selected)
 }
 
-impl NodeRuntime {
+impl NodeMain {
     #[inline]
     fn ensure_topology_owner(&self) -> RuntimeResult<()> {
         if self.topology_owner {
@@ -1271,8 +1248,14 @@ impl NodeRuntime {
         node: NodeId,
         simd_bytes: usize,
         registrations: &[NodeFunctionRegistration],
+        process: NodeProcessFn,
     ) -> RuntimeResult<()> {
         self.ensure_topology_owner()?;
+        {
+            let mut inner = self.inner.borrow_mut();
+            inner.validate_node(node)?;
+            inner.nodes[node.slot() as usize].process = process;
+        }
         let Some(node_name) = self.node_name(node)? else {
             return Ok(());
         };
@@ -1283,6 +1266,7 @@ impl NodeRuntime {
         let mut inner = self.inner.borrow_mut();
         inner.validate_node(node)?;
         inner.nodes[node.slot() as usize].process = registration.function;
+        inner.nodes[node.slot() as usize].frame_args_size = registration.frame_args_size;
         Ok(())
     }
 
@@ -1301,7 +1285,7 @@ impl NodeRuntime {
         self.register_descriptor(
             NodeKind::Driver,
             NodeDescriptor::new(
-                node.node_process(),
+                N::process,
                 node.node_runtime_data()?,
                 DriverNode::node_registration(&node),
                 DriverNode::node_initial_nexts(&node),
@@ -1321,7 +1305,7 @@ impl NodeRuntime {
         self.register_descriptor(
             NodeKind::PreInput,
             NodeDescriptor::new(
-                node.node_process(),
+                N::process,
                 node.node_runtime_data()?,
                 DriverNode::node_registration(&node),
                 DriverNode::node_initial_nexts(&node),
@@ -1353,7 +1337,7 @@ impl NodeRuntime {
         self.register_descriptor(
             NodeKind::Internal,
             NodeDescriptor::new(
-                node.node_process(),
+                N::process,
                 node.node_runtime_data()?,
                 InternalNode::node_registration(&node),
                 InternalNode::node_initial_nexts(&node),
@@ -1374,7 +1358,7 @@ impl NodeRuntime {
             NodeKind::Internal,
             handle,
             NodeDescriptor::new(
-                node.node_process(),
+                N::process,
                 node.node_runtime_data()?,
                 InternalNode::node_registration(&node),
                 InternalNode::node_initial_nexts(&node),
@@ -1447,7 +1431,7 @@ impl NodeRuntime {
         &self,
         kind: NodeKind,
         process: NodeProcessFn,
-        runtime_data: NodeRuntimeData,
+        runtime_data: NodeRuntime,
         registration: Option<NodeRegistration>,
         initial_nexts: &[NodeId],
         trace_formatter: Option<TraceFormatter>,
@@ -1480,7 +1464,7 @@ impl NodeRuntime {
         let mut inner = self.inner.borrow_mut();
         inner.register_function_declared(
             NodeKind::Internal,
-            node.node_process(),
+            N::process,
             node.node_runtime_data()?,
             InternalNode::node_registration(&node),
             &[],
@@ -1504,7 +1488,7 @@ impl NodeRuntime {
         let mut inner = self.inner.borrow_mut();
         inner.register_function_declared(
             NodeKind::Driver,
-            node.node_process(),
+            N::process,
             node.node_runtime_data()?,
             DriverNode::node_registration(&node),
             &[],
@@ -1527,7 +1511,7 @@ impl NodeRuntime {
         let mut inner = self.inner.borrow_mut();
         inner.register_function_declared(
             NodeKind::PreInput,
-            node.node_process(),
+            N::process,
             node.node_runtime_data()?,
             DriverNode::node_registration(&node),
             &[],
@@ -1579,10 +1563,12 @@ impl NodeRuntime {
     }
 
     #[inline]
-    pub fn node_runtime_data(&self, node: NodeId) -> RuntimeResult<NodeRuntimeData> {
+    pub fn node_runtime_data(&self, node: NodeId) -> RuntimeResult<NodeRuntime> {
         let inner = self.inner.borrow();
         inner.validate_node(node)?;
-        Ok(inner.nodes[node.slot() as usize].runtime_data)
+        Ok(inner.nodes[node.slot() as usize]
+            .runtime_data
+            .expect("Node runtime is borrowed by its invocation"))
     }
 
     pub fn polling_driver_nodes(&self) -> RuntimeResult<Vec<NodeId>> {
@@ -1650,11 +1636,14 @@ impl NodeRuntime {
     pub(crate) fn set_node_runtime_data(
         &self,
         node: NodeId,
-        runtime_data: NodeRuntimeData,
+        runtime_data: NodeRuntime,
     ) -> RuntimeResult<()> {
         let mut inner = self.inner.borrow_mut();
         inner.validate_node(node)?;
-        inner.nodes[node.slot() as usize].runtime_data = runtime_data;
+        *inner.nodes[node.slot() as usize]
+            .runtime_data
+            .as_mut()
+            .expect("Node runtime is borrowed by its invocation") = runtime_data;
         Ok(())
     }
 
@@ -1837,7 +1826,7 @@ impl NodeRuntime {
     pub(crate) fn schedule_frame(
         &self,
         node: NodeId,
-        frame: Frame<Pending>,
+        frame: hammer_core::buffer::checked_out::Frame<Pending>,
         allow_empty: bool,
     ) -> RuntimeResult<()> {
         self.validate_node(node)?;
@@ -1864,7 +1853,6 @@ impl NodeRuntime {
                 frame,
                 allow_empty,
             } = scheduled;
-            let slot = self.runtime_slot(node)?;
             if self.node_state(node)? == NodeState::Disabled {
                 self.clear_interrupt_pending(node)?;
                 continue;
@@ -1874,8 +1862,19 @@ impl NodeRuntime {
             }
             self.clear_interrupt_pending(node)?;
 
+            let mut slot = self.runtime_slot(node)?;
             runtime.set_current_node(Some(node));
             let frame = slot.dispatch(runtime, frame);
+            let state = slot.runtime_data.take().expect("Node returns its runtime");
+            let mut inner = self.inner.borrow_mut();
+            assert!(
+                inner.nodes[node.slot() as usize]
+                    .runtime_data
+                    .replace(state)
+                    .is_none(),
+                "Node runtime has one active invocation"
+            );
+            drop(inner);
             runtime.flush_fanout_appendable();
             runtime.set_current_node(None);
             processed += 1;
@@ -1889,12 +1888,27 @@ impl NodeRuntime {
     }
 
     fn runtime_slot(&self, node: NodeId) -> RuntimeResult<NodeRuntimeSlot> {
-        let inner = self.inner.borrow();
-        inner
+        let mut inner = self.inner.borrow_mut();
+        let slot = inner
             .nodes
-            .get(node.slot() as usize)
-            .copied()
-            .ok_or(RuntimeError::NodeNotRegistered { node })
+            .get_mut(node.slot() as usize)
+            .ok_or(RuntimeError::NodeNotRegistered { node })?;
+        Ok(NodeRuntimeSlot {
+            kind: slot.kind,
+            process: slot.process,
+            frame_args_size: slot.frame_args_size,
+            runtime_data: Some(
+                slot.runtime_data
+                    .take()
+                    .expect("Node runtime has one active invocation"),
+            ),
+        })
+    }
+
+    pub fn frame_args_size(&self, node: NodeId) -> RuntimeResult<(u16, u16, u16)> {
+        let inner = self.inner.borrow();
+        inner.validate_node(node)?;
+        Ok(inner.nodes[node.slot() as usize].frame_args_size)
     }
 
     fn pop_scheduled(&self) -> Option<ScheduledFrame> {
@@ -1923,25 +1937,109 @@ impl Future for NodeRuntimeReady {
 mod tests {
     use super::*;
 
-    fn process(_: &mut DataPlaneMain, _: NodeRuntimeData, _: &mut BufferFrame) {}
+    struct PacketInputNode;
+
+    impl PacketInputNode {
+        const NODE_NAME: &'static str = "packet-input";
+    }
+
+    #[hammer_component_macros::node_function(node = PacketInputNode)]
+    fn packet_input(
+        _: &mut DataPlaneMain,
+        state: &mut NodeRuntime,
+        frame: &mut Frame<u64, u32, u16>,
+    ) -> usize {
+        let calls = state.word(0) + 1;
+        *frame.scalar_args_mut().unwrap() = calls;
+        frame.set_vector_count(2);
+        frame.vector_args_mut().copy_from_slice(&[11, 17]);
+        frame.aux_args_mut().unwrap().copy_from_slice(&[3, 5]);
+        *state = NodeRuntime::from_words([
+            *frame.scalar_args().unwrap(),
+            frame
+                .vector_args()
+                .iter()
+                .map(|index| u64::from(*index))
+                .sum(),
+            frame
+                .aux_args()
+                .unwrap()
+                .iter()
+                .map(|next| u64::from(*next))
+                .sum(),
+            frame.len() as u64,
+        ]);
+        frame.len()
+    }
+
+    // Derived from vlib/main.c frame_alloc_to_node and dispatch_node: the
+    // destination layout selects storage, and each invocation mutates its own
+    // persistent node runtime. This exercises the actual generated trampoline.
+    #[test]
+    fn registered_frame_arguments_and_node_state_survive_invocation() {
+        crate::BUFFER_MAIN_INIT.call_once(|| {
+            hammer_infra::main_heap::init_default().unwrap();
+            hammer_core::buffer::BufferMain::new(
+                64,
+                1024,
+                &[0],
+                2,
+                hammer_infra::PageSize::Default,
+            )
+            .unwrap();
+        });
+        let mut runtime = DataPlaneMain::new(crate::DataPlaneBufferConfig::default());
+        let node = runtime
+            .nodes()
+            .try_register_descriptor(
+                NodeKind::Internal,
+                NodeDescriptor::new(
+                    process,
+                    NodeRuntime::empty(),
+                    Some(NodeRegistration::next(PacketInputNode::NODE_NAME, 0)),
+                    &[],
+                    None,
+                ),
+            )
+            .unwrap();
+        runtime
+            .nodes()
+            .install_node_function(node, 1, &[__NODE_FUNCTION_PACKET_INPUT_SCALAR], process)
+            .unwrap();
+        assert_eq!(runtime.nodes().frame_args_size(node).unwrap(), (8, 4, 2));
+        for calls in 1..=2 {
+            runtime.schedule_empty_frame(node).unwrap();
+            assert_eq!(runtime.run_ready_nodes().unwrap(), 1);
+            assert_eq!(
+                runtime.nodes().node_runtime_data(node).unwrap(),
+                NodeRuntime::from_words([calls, 28, 8, 2])
+            );
+            assert_eq!(runtime.buffers().frames_in_use(), 0);
+        }
+    }
+
+    fn process(_: &mut DataPlaneMain, _: &mut NodeRuntime, frame: &mut Frame) -> usize {
+        let processed_vectors = frame.len();
+        processed_vectors
+    }
 
     #[test]
     fn refork_preserves_existing_worker_state_and_initializes_new_nodes() {
-        let main = NodeRuntime::default();
+        let main = NodeMain::default();
         let existing = main
             .try_register_descriptor(
                 NodeKind::Internal,
                 NodeDescriptor::new(
                     process,
-                    NodeRuntimeData::from_words([1, 0, 0, 0]),
+                    NodeRuntime::from_words([1, 0, 0, 0]),
                     None,
                     &[],
                     None,
                 ),
             )
             .expect("register existing node");
-        let worker = NodeRuntime::from(main.snapshot());
-        let worker_data = NodeRuntimeData::from_words([9, 8, 7, 6]);
+        let worker = NodeMain::from(main.snapshot());
+        let worker_data = NodeRuntime::from_words([9, 8, 7, 6]);
         worker
             .set_node_runtime_data(existing, worker_data)
             .expect("set worker runtime data");
@@ -1957,7 +2055,7 @@ mod tests {
                 NodeKind::Internal,
                 NodeDescriptor::new(
                     process,
-                    NodeRuntimeData::from_words([2, 3, 4, 5]),
+                    NodeRuntime::from_words([2, 3, 4, 5]),
                     None,
                     &[],
                     None,
@@ -1974,7 +2072,7 @@ mod tests {
         );
         assert_eq!(
             worker.node_runtime_data(added).unwrap(),
-            NodeRuntimeData::from_words([2, 3, 4, 5])
+            NodeRuntime::from_words([2, 3, 4, 5])
         );
         assert_eq!(worker.node_state(added).unwrap(), NodeState::Polling);
     }

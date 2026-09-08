@@ -9,9 +9,9 @@ use std::sync::{Arc, Mutex};
 use crate::error::{RuntimeError, RuntimeResult};
 use crate::file::{FILE_MAIN, FileMain};
 use hammer_core::data_plane::{
-    BUFFER_CACHE_LINE_SIZE, BufferFrame, BufferPoolArena, BufferRef,
-    DEFAULT_BUFFER_FRAME_POOL_SIZE, DataPlaneBuffers, Frame, FrameBatchWidth, Next, NodeErrorIndex,
-    NodeId, NodeKind, NodeRegistration, Pending,
+    BUFFER_CACHE_LINE_SIZE, BufferPoolArena, BufferRef, DEFAULT_BUFFER_FRAME_POOL_SIZE,
+    DataPlaneBuffers, Frame, FrameBatchWidth, Next, NodeErrorIndex, NodeId, NodeKind,
+    NodeRegistration, Pending,
 };
 use hammer_core::error::{DataPlaneError, DataPlaneResult};
 use hammer_infra::PageSize;
@@ -20,8 +20,7 @@ use crate::config::Worker;
 use crate::global_main::WorkerPublication;
 use crate::handoff::{DataPlaneHandoffWorker, DataWorkerId, HANDOFF_SLOT_CAPACITY, HandoffSlot};
 use crate::node::{
-    NodeEntry, NodeErrorCode, NodeFunctionRegistration, NodeRuntime, NodeRuntimeData,
-    NodeRuntimeInner,
+    NodeEntry, NodeErrorCode, NodeFunctionRegistration, NodeMain, NodeRuntime, NodeRuntimeInner,
 };
 use crate::registry::RuntimeRegistry;
 use crate::runtime_simd::{native_simd_bytes, preferred_frame_batch_width};
@@ -41,10 +40,11 @@ pub use config::DataPlaneBufferConfig;
 pub struct DataPlaneMain {
     random: Rc<RefCell<SmallRng>>,
     buffers: DataPlaneBuffers,
-    nodes: NodeRuntime,
+    nodes: NodeMain,
     current_node: Rc<Cell<Option<NodeId>>>,
     /// Worker-local appendable Next Frame per (current node × local slot).
-    pub(crate) appendable_next_frames: RefCell<Vec<(NodeId, u16, Frame<Next>)>>,
+    pub(crate) appendable_next_frames:
+        RefCell<Vec<(NodeId, u16, hammer_core::buffer::checked_out::Frame<Next>)>>,
     handoff: Option<DataPlaneHandoffWorker>,
     active_numa_node: u32,
     trace: DataPlaneTrace,
@@ -103,9 +103,20 @@ impl<'runtime> HandoffSlotGuard<'runtime> {
     }
 
     #[inline]
-    fn push_into_frame(&mut self, frame: &mut Frame<Next>) -> RuntimeResult<()> {
+    fn push_into_frame(
+        &mut self,
+        frame: &mut hammer_core::buffer::checked_out::Frame<Next>,
+    ) -> RuntimeResult<()> {
         match self.slot.as_ref() {
-            Some(slot) => frame.push_indices(slot.iter())?,
+            Some(slot) => {
+                let count = frame.len();
+                frame.set_vector_count(count + slot.len());
+                for (destination, index) in
+                    frame.vector_args_mut()[count..].iter_mut().zip(slot.iter())
+                {
+                    *destination = index;
+                }
+            }
             None => return Ok(()),
         }
         self.slot = None;

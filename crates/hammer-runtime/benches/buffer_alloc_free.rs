@@ -40,19 +40,22 @@ fn test_buffers(buffer_slot_capacity: usize, buffer_slots: usize) -> DataPlaneBu
 
 fn drop_owned_index(buffers: &DataPlaneBuffers, index: u32) {
     let mut frame = buffers
-        .get_next_frame(NodeId::new(0))
+        .get_next_frame(NodeId::new(0), (0, 4, 0))
         .expect("cleanup frame");
-    frame.push_index(index).expect("cleanup push index");
+    {
+        let count = frame.len();
+        frame.set_vector_count(count + 1);
+        frame.vector_args_mut()[count] = index;
+    }
 }
 
 fn drop_owned_indices(buffers: &DataPlaneBuffers, indices: Vec<u32>) {
     for chunk in indices.chunks(DEFAULT_BUFFER_FRAME_CAPACITY) {
         let mut frame = buffers
-            .get_next_frame(NodeId::new(0))
+            .get_next_frame(NodeId::new(0), (0, 4, 0))
             .expect("cleanup frame");
-        frame
-            .push_indices(chunk.iter().copied())
-            .expect("cleanup push batch indices");
+        frame.set_vector_count(chunk.len());
+        frame.vector_args_mut().copy_from_slice(chunk);
     }
 }
 

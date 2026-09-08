@@ -34,8 +34,8 @@ use std::sync::{Arc, OnceLock, mpsc};
 use hammer_core::data_plane::{BufferPacketCursor, NodeId, NodeState};
 use hammer_runtime::app::SessionHandle;
 use hammer_runtime::{
-    DataPlaneMain, DataWorkerId, GlobalMain, Node, NodeProcessFn, NodeRuntimeData, RuntimeError,
-    RuntimeResult, SessionConnectEndpoint, SessionListenEndpoint, with_data_plane_main,
+    DataPlaneMain, DataWorkerId, GlobalMain, Node, NodeRuntime, RuntimeError, RuntimeResult,
+    SessionConnectEndpoint, SessionListenEndpoint, with_data_plane_main,
 };
 use thiserror::Error;
 
@@ -215,11 +215,6 @@ pub struct TcpMain {
     protocol: u8,
     control: TcpInputControlPlane,
     listeners: listener_control::TcpListenerControlHandle,
-    input_process: NodeProcessFn,
-    listen_process: NodeProcessFn,
-    established_process: NodeProcessFn,
-    rcv_process: NodeProcessFn,
-    syn_sent_process: NodeProcessFn,
     workers: Box<[TcpWorkerSlot]>,
 }
 
@@ -235,11 +230,6 @@ impl TcpMain {
             protocol,
             control,
             listeners,
-            input_process: input::tcp_input_process,
-            listen_process: listen::tcp_listen_process,
-            established_process: established::tcp_established_process,
-            rcv_process: rcv_process::tcp_rcv_process_process,
-            syn_sent_process: syn_sent::tcp_syn_sent_process,
             workers,
         }
     }
@@ -477,7 +467,7 @@ pub fn register_tcp_input(runtime: &DataPlaneMain) -> RuntimeResult<NodeId> {
         node
     } else {
         runtime.nodes().try_register_internal_with_next_names(
-            main.control().node(main.input_process, None),
+            main.control().node(None),
             &TcpInputNext::NEXT_NAMES,
         )?
     };
@@ -538,14 +528,11 @@ fn bind_worker_graph(engine: &mut DataPlaneMain) -> RuntimeResult<()> {
     let main = TCP_MAIN
         .get()
         .ok_or(RuntimeError::PluginStateNotInitialized { plugin: "tcp" })?;
-    let input_data = main
-        .control()
-        .node(main.input_process, Some(worker))
-        .node_runtime_data()?;
-    let listen_data = TcpListenNode::new(main.listen_process).node_runtime_data()?;
-    let established_data = TcpEstablishedNode::new(main.established_process).node_runtime_data()?;
-    let rcv_process_data = TcpRcvProcessNode::new(main.rcv_process).node_runtime_data()?;
-    let syn_sent_data = TcpSynSentNode::new(main.syn_sent_process).node_runtime_data()?;
+    let input_data = main.control().node(Some(worker)).node_runtime_data()?;
+    let listen_data = TcpListenNode::new().node_runtime_data()?;
+    let established_data = TcpEstablishedNode::new().node_runtime_data()?;
+    let rcv_process_data = TcpRcvProcessNode::new().node_runtime_data()?;
+    let syn_sent_data = TcpSynSentNode::new().node_runtime_data()?;
 
     // A worker graph clone can retain the old polling state. Keep the node
     // dormant until its replacement SessionWorker owns a live readiness file.
@@ -588,10 +575,10 @@ fn init_tcp_worker(engine: &mut DataPlaneMain) -> RuntimeResult<()> {
 fn tcp_session_queue_update_time(
     runtime: &mut DataPlaneMain,
     sessions: &mut SessionWorker,
-    _: NodeRuntimeData,
+    _: NodeRuntime,
     output_next: SessionQueueNext,
     now: std::time::Instant,
-    frame: &mut hammer_core::data_plane::BufferFrame,
+    frame: &mut hammer_core::data_plane::Frame,
     output: &mut SessionQueueOutput,
 ) -> RuntimeResult<()> {
     TCP_MAIN
@@ -606,10 +593,10 @@ fn tcp_session_queue_update_time(
 fn tcp_session_queue_dispatch(
     runtime: &mut DataPlaneMain,
     sessions: &mut SessionWorker,
-    _: NodeRuntimeData,
+    _: NodeRuntime,
     output_next: SessionQueueNext,
     now: std::time::Instant,
-    frame: &mut hammer_core::data_plane::BufferFrame,
+    frame: &mut hammer_core::data_plane::Frame,
     output: &mut SessionQueueOutput,
 ) -> RuntimeResult<()> {
     TCP_MAIN
@@ -962,7 +949,7 @@ pub fn tcp_control_cursor(packet: &[u8]) -> Result<BufferPacketCursor, TcpContro
 
 fn enqueue_tcp_segment(
     runtime: &mut DataPlaneMain,
-    frame: &mut hammer_core::data_plane::BufferFrame,
+    frame: &mut hammer_core::data_plane::Frame,
     output_next: SessionQueueNext,
     output: &mut SessionQueueOutput,
     segment: TcpSegment,

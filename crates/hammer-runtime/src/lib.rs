@@ -86,7 +86,7 @@ pub use metrics::{
 pub use network::{Network, SocksAddr};
 pub use node::{
     DriverNode, InternalNode, Node, NodeDescriptor, NodeEntry, NodeErrorCode, NodeErrorDescriptor,
-    NodeErrorSeverity, NodeProcessFn, NodeRuntime, NodeRuntimeData, NodeRuntimeReady,
+    NodeErrorSeverity, NodeMain, NodeProcessFn, NodeRuntime, NodeRuntimeReady,
     default_prefetch_indices,
 };
 pub use plugin::{

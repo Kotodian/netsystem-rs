@@ -1,4 +1,3 @@
-#[cfg(test)]
 extern crate self as hammer_core;
 
 pub mod buffer;

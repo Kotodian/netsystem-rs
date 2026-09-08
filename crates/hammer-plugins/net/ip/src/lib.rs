@@ -79,7 +79,7 @@ pub mod pmtu;
 pub mod protocol;
 
 pub fn register_ip4_protocol(
-    nodes: &hammer_runtime::node::NodeRuntime,
+    nodes: &hammer_runtime::node::NodeMain,
     protocol: u8,
     node: NodeId,
 ) -> RuntimeResult<()> {
@@ -87,7 +87,7 @@ pub fn register_ip4_protocol(
 }
 
 pub fn register_ip6_protocol(
-    nodes: &hammer_runtime::node::NodeRuntime,
+    nodes: &hammer_runtime::node::NodeMain,
     protocol: u8,
     node: NodeId,
 ) -> RuntimeResult<()> {

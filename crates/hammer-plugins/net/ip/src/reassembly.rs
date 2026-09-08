@@ -1,13 +1,13 @@
 use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
 
-use hammer_core::data_plane::{BufferFrame, DEFAULT_BUFFER_FRAME_CAPACITY, NodeId, NodeNext};
+use hammer_core::data_plane::{DEFAULT_BUFFER_FRAME_CAPACITY, Frame, NodeId, NodeNext};
 use hammer_infra::bihash::{Bihash, FREE_U64};
 use hammer_infra::checksum::internet_checksum;
 use hammer_infra::pool::Pool;
 use hammer_runtime::sync::SpinLock;
 use hammer_runtime::{
-    DataPlaneMain, DataWorkerId, GlobalMain, Node, NodeProcessFn, NodeRuntimeData, TraceFormatter,
+    DataPlaneMain, DataWorkerId, GlobalMain, Node, NodeProcessFn, NodeRuntime, TraceFormatter,
     add_packet_trace, format_packet_trace,
 };
 use hammer_runtime::{RuntimeError, RuntimeResult};
@@ -226,7 +226,7 @@ impl IpReassemblyMain {
     fn process_frame(
         &self,
         runtime: &mut DataPlaneMain,
-        frame: &mut BufferFrame,
+        frame: &mut Frame,
         version: IpVersion,
     ) -> () {
         let Some(worker) = self.per_thread_data.get(Self::worker_slot(runtime)) else {
@@ -467,34 +467,27 @@ impl IpReassemblyWorker {
     fn process_frame(
         &mut self,
         runtime: &mut DataPlaneMain,
-        frame: &mut BufferFrame,
+        frame: &mut Frame,
         now: Instant,
         version: IpVersion,
     ) -> () {
-        let input_len = frame.len();
-        debug_assert!(input_len <= DEFAULT_BUFFER_FRAME_CAPACITY);
-        let mut inputs = [core::mem::MaybeUninit::<u32>::uninit(); DEFAULT_BUFFER_FRAME_CAPACITY];
-        for (offset, &index) in frame.indices().iter().enumerate() {
-            inputs[offset].write(index);
-        }
-        frame.discard_prefix(input_len);
+        let mut output = Frame::<(), u32, ()>::new(0);
 
         let mut nexts = [0u16; DEFAULT_BUFFER_FRAME_CAPACITY];
         let mut out_len = 0usize;
-        for offset in 0..input_len {
-            let index = unsafe { inputs[offset].assume_init() };
+        for &index in frame.vector_args() {
             let _ = self.process_index(
                 runtime,
                 index,
                 now,
-                frame,
+                &mut output,
                 &mut nexts,
                 &mut out_len,
                 version,
             );
         }
         if out_len != 0 {
-            runtime.enqueue_to_next(frame, &nexts[..out_len]);
+            runtime.enqueue_to_next(&mut output, &nexts[..out_len]);
         }
         ()
     }
@@ -502,7 +495,7 @@ impl IpReassemblyWorker {
     #[inline]
     fn emit_local(
         runtime: &DataPlaneMain,
-        frame: &mut BufferFrame,
+        frame: &mut Frame,
         nexts: &mut [u16; DEFAULT_BUFFER_FRAME_CAPACITY],
         out_len: &mut usize,
         next: u16,
@@ -510,10 +503,15 @@ impl IpReassemblyWorker {
     ) -> RuntimeResult<()> {
         if *out_len == DEFAULT_BUFFER_FRAME_CAPACITY {
             runtime.enqueue_to_next(frame, &nexts[..*out_len]);
+            frame.set_vector_count(0);
             *out_len = 0;
         }
         nexts[*out_len] = next;
-        frame.push_index(index)?;
+        {
+            let count = frame.len();
+            frame.set_vector_count(count + 1);
+            frame.vector_args_mut()[count] = index;
+        }
         *out_len += 1;
         Ok(())
     }
@@ -523,7 +521,7 @@ impl IpReassemblyWorker {
         runtime: &mut DataPlaneMain,
         index: u32,
         now: Instant,
-        out_frame: &mut BufferFrame,
+        out_frame: &mut Frame,
         nexts: &mut [u16; DEFAULT_BUFFER_FRAME_CAPACITY],
         out_len: &mut usize,
         version: IpVersion,
@@ -834,18 +832,22 @@ impl IpReassemblyWorker {
 
 impl Node for Ip4ReassemblyNode {
     #[inline(always)]
-    fn process(&mut self, _runtime: &mut DataPlaneMain, _frame: &mut BufferFrame) -> () {
-        ()
+    fn process(
+        runtime: &mut DataPlaneMain,
+        node_runtime: &mut hammer_runtime::NodeRuntime,
+        frame: &mut Frame,
+    ) -> usize {
+        let process: NodeProcessFn = |runtime, data, frame| {
+            let processed_vectors = frame.len();
+            ip_reassembly_process(runtime, data, frame, IpVersion::V4);
+            processed_vectors
+        };
+        process(runtime, node_runtime, frame)
     }
 
     #[inline]
-    fn node_process(&self) -> NodeProcessFn {
-        |runtime, data, frame| ip_reassembly_process(runtime, data, frame, IpVersion::V4)
-    }
-
-    #[inline]
-    fn node_runtime_data(&self) -> RuntimeResult<NodeRuntimeData> {
-        Ok(NodeRuntimeData::empty())
+    fn node_runtime_data(&self) -> RuntimeResult<NodeRuntime> {
+        Ok(NodeRuntime::empty())
     }
 
     #[inline]
@@ -856,18 +858,22 @@ impl Node for Ip4ReassemblyNode {
 
 impl Node for Ip6ReassemblyNode {
     #[inline(always)]
-    fn process(&mut self, _runtime: &mut DataPlaneMain, _frame: &mut BufferFrame) -> () {
-        ()
+    fn process(
+        runtime: &mut DataPlaneMain,
+        node_runtime: &mut hammer_runtime::NodeRuntime,
+        frame: &mut Frame,
+    ) -> usize {
+        let process: NodeProcessFn = |runtime, data, frame| {
+            let processed_vectors = frame.len();
+            ip_reassembly_process(runtime, data, frame, IpVersion::V6);
+            processed_vectors
+        };
+        process(runtime, node_runtime, frame)
     }
 
     #[inline]
-    fn node_process(&self) -> NodeProcessFn {
-        |runtime, data, frame| ip_reassembly_process(runtime, data, frame, IpVersion::V6)
-    }
-
-    #[inline]
-    fn node_runtime_data(&self) -> RuntimeResult<NodeRuntimeData> {
-        Ok(NodeRuntimeData::empty())
+    fn node_runtime_data(&self) -> RuntimeResult<NodeRuntime> {
+        Ok(NodeRuntime::empty())
     }
 
     #[inline]
@@ -878,13 +884,17 @@ impl Node for Ip6ReassemblyNode {
 
 fn ip_reassembly_process(
     runtime: &mut DataPlaneMain,
-    _data: NodeRuntimeData,
-    frame: &mut BufferFrame,
+    _data: &mut NodeRuntime,
+    frame: &mut Frame,
     version: IpVersion,
-) -> () {
-    if let Some(main) = IP_REASSEMBLY_MAIN.get() {
-        main.process_frame(runtime, frame, version);
-    }
+) -> usize {
+    let processed_vectors = frame.len();
+    (|| {
+        if let Some(main) = IP_REASSEMBLY_MAIN.get() {
+            main.process_frame(runtime, frame, version);
+        }
+    })();
+    processed_vectors
 }
 
 struct FragmentContext {
@@ -1107,12 +1117,18 @@ impl FragmentContext {
 
     #[inline]
     fn drop_fragments(self, runtime: &DataPlaneMain) -> RuntimeResult<()> {
-        let mut owner = runtime.buffers().get_next_frame(NodeId::new(0))?;
+        let mut owner = runtime
+            .buffers()
+            .get_next_frame(NodeId::new(0), (0, 4, 0))?;
         for fragment in self.fragments {
-            if owner.push_index(fragment.index).is_err() {
-                owner = runtime.buffers().get_next_frame(NodeId::new(0))?;
-                owner.push_index(fragment.index)?;
+            if owner.len() == DEFAULT_BUFFER_FRAME_CAPACITY {
+                owner = runtime
+                    .buffers()
+                    .get_next_frame(NodeId::new(0), (0, 4, 0))?;
             }
+            let count = owner.len();
+            owner.set_vector_count(count + 1);
+            owner.vector_args_mut()[count] = fragment.index;
         }
         Ok(())
     }

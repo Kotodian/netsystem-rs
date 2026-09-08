@@ -1,9 +1,7 @@
 //! VPP `vlib_buffer_enqueue_to_next` / `enqueue_one`.
 
 use crate::DataPlaneMain;
-use hammer_core::data_plane::{
-    BufferFrame, DEFAULT_BUFFER_FRAME_CAPACITY, Frame, Next, NodeId, NodeNext,
-};
+use hammer_core::data_plane::{DEFAULT_BUFFER_FRAME_CAPACITY, Frame, Next, NodeId, NodeNext};
 use hammer_infra::mask_compare::{mask_compare_u16, mask_compare_u16_words};
 
 const MASK_WORDS: usize = mask_compare_u16_words(DEFAULT_BUFFER_FRAME_CAPACITY);
@@ -34,7 +32,7 @@ impl DataPlaneMain {
     ///
     /// Shape matches VPP `vlib_buffer_enqueue_to_next`: walk first-unhandled
     /// next groups via a used bitmap, and for each group run `enqueue_one`.
-    pub fn enqueue_to_next<N: NodeNext>(&self, frame: &mut BufferFrame, nexts: &[N]) {
+    pub fn enqueue_to_next<N: NodeNext>(&self, frame: &mut Frame, nexts: &[N]) {
         if frame.len() != nexts.len() {
             abort_fanout("nexts length must equal frame length");
         }
@@ -61,13 +59,12 @@ impl DataPlaneMain {
             n_left = self.enqueue_one(
                 current,
                 next_index,
-                frame.indices(),
+                frame.vector_args(),
                 &next_slots[..count],
                 &mut used,
                 n_left,
             );
         }
-        frame.discard_prefix(count);
     }
 
     /// VPP `enqueue_one`: mask-compare, copy matches into the appendable next
@@ -101,18 +98,23 @@ impl DataPlaneMain {
             if !mask_bit(&match_bmp, offset) {
                 continue;
             }
-            if out.capacity() == out.len() {
+            if hammer_core::graph::frame::FRAME_VECTOR_CAPACITY == out.len() {
                 if self.put_next_frame(out).is_err() {
                     abort_fanout("failed to put full next frame");
                 }
-                out = match self.buffers().get_next_frame(target) {
+                out = match self.buffers().get_next_frame(
+                    target,
+                    self.nodes()
+                        .frame_args_size(target)
+                        .expect("registered next node layout"),
+                ) {
                     Ok(frame) => frame,
                     Err(_) => abort_fanout("failed to acquire next frame"),
                 };
             }
-            if out.push_index(buffers[offset]).is_err() {
-                abort_fanout("next frame rejected an index within remaining capacity");
-            }
+            let count = out.len();
+            out.set_vector_count(count + 1);
+            out.vector_args_mut()[count] = buffers[offset];
             copied += 1;
         }
         if copied != n_extracted {
@@ -121,7 +123,7 @@ impl DataPlaneMain {
 
         if out.is_empty() {
             drop(out);
-        } else if out.capacity() == out.len() {
+        } else if hammer_core::graph::frame::FRAME_VECTOR_CAPACITY == out.len() {
             if self.put_next_frame(out).is_err() {
                 abort_fanout("failed to put next frame");
             }
@@ -154,7 +156,7 @@ impl DataPlaneMain {
         current: NodeId,
         slot: u16,
         target: NodeId,
-    ) -> Frame<Next> {
+    ) -> hammer_core::buffer::checked_out::Frame<Next> {
         let mut appendable = self.appendable_next_frames.borrow_mut();
         if let Some(position) = appendable
             .iter()
@@ -167,7 +169,12 @@ impl DataPlaneMain {
             return frame;
         }
         drop(appendable);
-        match self.buffers().get_next_frame(target) {
+        match self.buffers().get_next_frame(
+            target,
+            self.nodes()
+                .frame_args_size(target)
+                .expect("registered next node layout"),
+        ) {
             Ok(frame) => frame,
             Err(_) => abort_fanout("failed to acquire next frame"),
         }

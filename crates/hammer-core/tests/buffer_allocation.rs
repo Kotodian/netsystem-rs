@@ -22,9 +22,13 @@ fn independent_segment_survives_original_chain_release() -> DataPlaneResult<()> 
     BufferMain::new(16, 3, &[0], 1, hammer_infra::PageSize::Default)?;
     let arena = BufferPoolArena::with_capacity(16, 3);
     let buffers = DataPlaneBuffers::from_arenas([arena], 2, 1, 0);
-    let mut originals = buffers.get_next_frame(NodeId::new(0))?;
+    let mut originals = buffers.get_next_frame(NodeId::new(0), (0, 4, 0))?;
     let source = buffers.alloc_index_with_bytes(&[0x31; 32])?;
-    originals.push_index(source)?;
+    {
+        let count = originals.len();
+        originals.set_vector_count(count + 1);
+        originals.vector_args_mut()[count] = source;
+    }
     {
         let mut buffer = buffers.get_buffer_mut(source)?;
         buffer.advance(4);
@@ -34,9 +38,13 @@ fn independent_segment_survives_original_chain_release() -> DataPlaneResult<()> 
         hammer_core::buffer_opaque!(mut &mut buffer => PacketMetadata).identity = 17;
         hammer_core::buffer_opaque!(mut &mut buffer => PacketSecondaryMetadata).identity = 23;
     }
-    let mut responses = buffers.get_next_frame(NodeId::new(1))?;
+    let mut responses = buffers.get_next_frame(NodeId::new(1), (0, 4, 0))?;
     let response = buffers.alloc_index_from(source)?;
-    responses.push_index(response)?;
+    {
+        let count = responses.len();
+        responses.set_vector_count(count + 1);
+        responses.vector_args_mut()[count] = response;
+    }
     assert_ne!(response, source);
     assert_eq!(buffers.chain(source).count(), 2);
     assert_eq!(buffers.chain(response).count(), 1);

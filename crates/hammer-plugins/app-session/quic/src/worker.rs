@@ -6,7 +6,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use bytes::Bytes;
-use hammer_core::data_plane::BufferFrame;
+use hammer_core::data_plane::Frame;
 use hammer_infra::bytes::BytesBuffer;
 use hammer_infra::fifo::{Fifo, FifoError};
 use hammer_infra::pool::Pool;
@@ -14,7 +14,7 @@ use hammer_infra::thread_owned::ThreadOwnedError;
 use hammer_infra::timer_wheel::TimerWheel1t2w2048sl;
 use hammer_runtime::app::{SessionConnectError, SessionDgramHeader, SessionFlags, SessionHandle};
 use hammer_runtime::session::SessionStreamDirection;
-use hammer_runtime::{DataPlaneMain, DataWorkerId, NodeRuntimeData, RuntimeError, RuntimeResult};
+use hammer_runtime::{DataPlaneMain, DataWorkerId, NodeRuntime, RuntimeError, RuntimeResult};
 use hammer_service::session::application::{ApplicationMain, application_main};
 use hammer_service::session::node::{SessionQueueNext, SessionQueueOutput};
 use hammer_service::session::runtime::{
@@ -3151,10 +3151,10 @@ impl QuicWorker {
 pub(crate) fn quic_session_queue_update_time(
     _runtime: &mut DataPlaneMain,
     sessions: &mut SessionWorker,
-    _: NodeRuntimeData,
+    _: NodeRuntime,
     _: SessionQueueNext,
     now: Instant,
-    _: &mut BufferFrame,
+    _: &mut Frame,
     _: &mut SessionQueueOutput,
 ) -> RuntimeResult<()> {
     let main = QUIC_MAIN
@@ -3166,10 +3166,10 @@ pub(crate) fn quic_session_queue_update_time(
 pub(crate) fn quic_session_queue_dispatch(
     runtime: &mut DataPlaneMain,
     sessions: &mut SessionWorker,
-    _: NodeRuntimeData,
+    _: NodeRuntime,
     output_next: SessionQueueNext,
     now: Instant,
-    frame: &mut BufferFrame,
+    frame: &mut Frame,
     output: &mut SessionQueueOutput,
 ) -> RuntimeResult<()> {
     let main = QUIC_MAIN
@@ -3394,7 +3394,7 @@ impl SessionTransport for QuicWorker {
         sessions: &mut SessionWorker,
         _: &mut DataPlaneMain,
         _: SessionQueueNext,
-        _: &mut BufferFrame,
+        _: &mut Frame,
         _: &mut SessionQueueOutput,
         now: Instant,
     ) -> RuntimeResult<()> {
@@ -3408,7 +3408,7 @@ impl SessionTransport for QuicWorker {
         _: usize,
         _: &mut DataPlaneMain,
         _: SessionQueueNext,
-        _: &mut BufferFrame,
+        _: &mut Frame,
         _: &mut SessionQueueOutput,
     ) -> RuntimeResult<bool> {
         self.app_rx_evt(index, rx_available)
@@ -3420,7 +3420,7 @@ impl SessionTransport for QuicWorker {
         index: u32,
         _: &mut DataPlaneMain,
         _: SessionQueueNext,
-        _: &mut BufferFrame,
+        _: &mut Frame,
         _: &mut SessionQueueOutput,
         now: Instant,
     ) -> RuntimeResult<()> {
@@ -3463,7 +3463,7 @@ impl SessionTransport for QuicWorker {
         index: u32,
         _: &mut DataPlaneMain,
         _: SessionQueueNext,
-        _: &mut BufferFrame,
+        _: &mut Frame,
         _: &mut SessionQueueOutput,
         now: Instant,
     ) -> RuntimeResult<()> {
@@ -3550,7 +3550,7 @@ impl TransportInternalTransport for QuicWorker {
         index: u32,
         _: &mut DataPlaneMain,
         _: SessionQueueNext,
-        _: &mut BufferFrame,
+        _: &mut Frame,
         _: &mut SessionQueueOutput,
         now: Instant,
     ) -> RuntimeResult<()> {

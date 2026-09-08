@@ -4,9 +4,9 @@ use std::sync::Arc;
 
 use crate::{TcpError, TcpInputFlags, TcpSegmentFlags, tcp_header};
 use arc_swap::ArcSwap;
-use hammer_core::data_plane::{BufferFrame, BufferPacketCursor};
+use hammer_core::data_plane::{BufferPacketCursor, Frame};
 use hammer_runtime::{
-    DataPlaneMain, DataWorkerId, Node, NodeProcessFn, NodeRuntimeData, TraceFormatter,
+    DataPlaneMain, DataWorkerId, Node, NodeProcessFn, NodeRuntime, TraceFormatter,
     add_packet_trace, format_packet_trace,
 };
 use hammer_runtime::{RuntimeError, RuntimeResult};
@@ -64,13 +64,8 @@ impl TcpInputControlPlane {
     }
 
     #[inline]
-    pub(crate) fn node(
-        &self,
-        process: NodeProcessFn,
-        handoff_worker: Option<DataWorkerId>,
-    ) -> TcpInputNode {
-        let mut node =
-            TcpInputNode::new(register_tcp_input_runtime(Arc::clone(&self.inner)), process);
+    pub(crate) fn node(&self, handoff_worker: Option<DataWorkerId>) -> TcpInputNode {
+        let mut node = TcpInputNode::new(register_tcp_input_runtime(Arc::clone(&self.inner)));
         node.handoff_worker = handoff_worker;
         node
     }
@@ -84,19 +79,20 @@ impl TcpInputControlPlane {
     role = internal,
 )]
 pub struct TcpInputNode {
-    runtime_data: NodeRuntimeData,
-    process: NodeProcessFn,
+    runtime_data: NodeRuntime,
     #[node(default)]
     handoff_worker: Option<DataWorkerId>,
 }
 
 impl Node for TcpInputNode {
     #[inline(always)]
-    fn process(&mut self, runtime: &mut DataPlaneMain, frame: &mut BufferFrame) -> () {
-        if sync_tcp_input_runtime(self.runtime_data, self.handoff_worker).is_err() {
-            return ();
-        }
-        (self.process)(runtime, self.runtime_data, frame)
+    fn process(
+        runtime: &mut DataPlaneMain,
+        node_runtime: &mut hammer_runtime::NodeRuntime,
+        frame: &mut Frame,
+    ) -> usize {
+        let process: NodeProcessFn = tcp_input_process;
+        process(runtime, node_runtime, frame)
     }
 
     #[inline]
@@ -105,12 +101,7 @@ impl Node for TcpInputNode {
     }
 
     #[inline]
-    fn node_process(&self) -> NodeProcessFn {
-        self.process
-    }
-
-    #[inline]
-    fn node_runtime_data(&self) -> RuntimeResult<NodeRuntimeData> {
+    fn node_runtime_data(&self) -> RuntimeResult<NodeRuntime> {
         sync_tcp_input_runtime(self.runtime_data, self.handoff_worker)?;
         Ok(self.runtime_data)
     }
@@ -127,7 +118,7 @@ thread_local! {
         const { RefCell::new(Vec::new()) };
 }
 
-fn register_tcp_input_runtime(snapshot: Arc<ArcSwap<TcpLookupSnapshot>>) -> NodeRuntimeData {
+fn register_tcp_input_runtime(snapshot: Arc<ArcSwap<TcpLookupSnapshot>>) -> NodeRuntime {
     TCP_INPUT_RUNTIMES.with(|runtimes| {
         let mut runtimes = runtimes.borrow_mut();
         let slot = runtimes.len();
@@ -135,7 +126,7 @@ fn register_tcp_input_runtime(snapshot: Arc<ArcSwap<TcpLookupSnapshot>>) -> Node
             snapshot,
             handoff_worker: None,
         });
-        NodeRuntimeData::from_usize(slot).expect("TCP input runtime slot overflow")
+        NodeRuntime::from_usize(slot).expect("TCP input runtime slot overflow")
     })
 }
 
@@ -146,7 +137,7 @@ struct TcpInputSlotInvalid {
     slot: usize,
 }
 
-fn tcp_input_runtime(data: NodeRuntimeData) -> RuntimeResult<TcpInputRuntime> {
+fn tcp_input_runtime(data: NodeRuntime) -> RuntimeResult<TcpInputRuntime> {
     let slot = data.usize_word(0)?;
     TCP_INPUT_RUNTIMES.with(|runtimes| {
         runtimes
@@ -158,7 +149,7 @@ fn tcp_input_runtime(data: NodeRuntimeData) -> RuntimeResult<TcpInputRuntime> {
 }
 
 fn sync_tcp_input_runtime(
-    data: NodeRuntimeData,
+    data: NodeRuntime,
     handoff_worker: Option<DataWorkerId>,
 ) -> RuntimeResult<()> {
     let slot = data.usize_word(0)?;
@@ -174,41 +165,45 @@ fn sync_tcp_input_runtime(
 
 pub(crate) fn tcp_input_process(
     runtime: &mut DataPlaneMain,
-    data: NodeRuntimeData,
-    frame: &mut BufferFrame,
-) -> () {
-    let state = match tcp_input_runtime(data) {
-        Ok(state) => state,
-        Err(_) => return (),
-    };
-    let snapshot = state.snapshot.load();
-    tcp_input_process_frame(runtime, frame, &snapshot, state.handoff_worker)
+    data: &mut NodeRuntime,
+    frame: &mut Frame,
+) -> usize {
+    let processed_vectors = frame.len();
+    (|| {
+        let state = match tcp_input_runtime(*data) {
+            Ok(state) => state,
+            Err(_) => return (),
+        };
+        let snapshot = state.snapshot.load();
+        tcp_input_process_frame(runtime, frame, &snapshot, state.handoff_worker)
+    })();
+    processed_vectors
 }
 
 fn tcp_input_process_frame(
     runtime: &mut DataPlaneMain,
-    frame: &mut BufferFrame,
+    frame: &mut Frame,
     snapshot: &TcpLookupSnapshot,
     handoff_worker: Option<DataWorkerId>,
 ) -> () {
-    let width = runtime.preferred_frame_batch_width();
-    let mut nexts = Vec::with_capacity(frame.len());
-    let _ = frame.rewrite_indices_batched(width, |index| {
+    let mut output = Frame::<(), u32, ()>::new(0);
+    let mut nexts = [0u16; hammer_core::graph::frame::FRAME_VECTOR_CAPACITY];
+    for &index in frame.vector_args() {
         prefetch_tcp_input(runtime, &[index], snapshot);
-        match tcp_input_local_next_for_index(runtime, index, snapshot, handoff_worker) {
-            Ok(Some(slot)) => {
-                nexts.push(slot);
-                Ok(Some(index))
-            }
-            Ok(None) => Ok(None),
-            Err(_) => {
-                nexts.push(TcpInputNext::Drop.slot() as u16);
-                Ok(Some(index))
-            }
-        }
-    });
-    if !nexts.is_empty() {
-        runtime.enqueue_to_next(frame, nexts.as_slice());
+        let next = tcp_input_local_next_for_index(runtime, index, snapshot, handoff_worker);
+        let slot = match next {
+            Ok(Some(slot)) => slot,
+            Ok(None) => continue,
+            Err(_) => TcpInputNext::Drop.slot() as u16,
+        };
+        let count = output.len();
+        output.set_vector_count(count + 1);
+        output.vector_args_mut()[count] = index;
+        nexts[count] = slot;
+    }
+    let count = output.len();
+    if count != 0 {
+        runtime.enqueue_to_next(&mut output, &nexts[..count]);
     }
     ()
 }

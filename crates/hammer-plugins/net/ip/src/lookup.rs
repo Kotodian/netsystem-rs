@@ -6,8 +6,8 @@ use std::time::Instant;
 use hammer_infra::thread_owned::ThreadOwned;
 use hammer_service::net::throttle::Throttle;
 
-use hammer_core::data_plane::{BufferFrame, NodeId, NodeNext};
-use hammer_runtime::{DataPlaneMain, Node, NodeProcessFn, NodeRuntimeData, RuntimeResult};
+use hammer_core::data_plane::{Frame, NodeId, NodeNext};
+use hammer_runtime::{DataPlaneMain, Node, NodeProcessFn, NodeRuntime, RuntimeResult};
 use hammer_service::net::{DpoId, DpoProto, DpoType, NetMain};
 use hammer_service::opaque::NetworkOpaque;
 
@@ -183,8 +183,8 @@ enum Ip6InterfaceRxNext {
     next = Ip4InterfaceRxNext,
 )]
 pub struct Ip4InterfaceRxNode {
-    #[node(default = NodeRuntimeData::empty())]
-    runtime_data: NodeRuntimeData,
+    #[node(default = NodeRuntime::empty())]
+    runtime_data: NodeRuntime,
 }
 
 #[hammer_component_macros::graph_node(
@@ -195,8 +195,8 @@ pub struct Ip4InterfaceRxNode {
     next = Ip6InterfaceRxNext,
 )]
 pub struct Ip6InterfaceRxNode {
-    #[node(default = NodeRuntimeData::empty())]
-    runtime_data: NodeRuntimeData,
+    #[node(default = NodeRuntime::empty())]
+    runtime_data: NodeRuntime,
 }
 
 fn register_ip4_interface_rx(runtime: &DataPlaneMain) -> RuntimeResult<NodeId> {
@@ -250,30 +250,44 @@ fn register_interface_rx_class(
 }
 
 impl Node for Ip4InterfaceRxNode {
-    fn process(&mut self, runtime: &mut DataPlaneMain, frame: &mut BufferFrame) {
-        process_interface_rx(runtime, frame, DpoProto::IP4);
+    fn process(
+        runtime: &mut DataPlaneMain,
+        node_runtime: &mut hammer_runtime::NodeRuntime,
+        frame: &mut Frame,
+    ) -> usize {
+        let process: NodeProcessFn = |runtime, _, frame| {
+            let processed_vectors = frame.len();
+            process_interface_rx(runtime, frame, DpoProto::IP4);
+            processed_vectors
+        };
+        process(runtime, node_runtime, frame)
     }
-    fn node_process(&self) -> NodeProcessFn {
-        |runtime, _, frame| process_interface_rx(runtime, frame, DpoProto::IP4)
-    }
-    fn node_runtime_data(&self) -> RuntimeResult<NodeRuntimeData> {
+
+    fn node_runtime_data(&self) -> RuntimeResult<NodeRuntime> {
         Ok(self.runtime_data)
     }
 }
 
 impl Node for Ip6InterfaceRxNode {
-    fn process(&mut self, runtime: &mut DataPlaneMain, frame: &mut BufferFrame) {
-        process_interface_rx(runtime, frame, DpoProto::IP6);
+    fn process(
+        runtime: &mut DataPlaneMain,
+        node_runtime: &mut hammer_runtime::NodeRuntime,
+        frame: &mut Frame,
+    ) -> usize {
+        let process: NodeProcessFn = |runtime, _, frame| {
+            let processed_vectors = frame.len();
+            process_interface_rx(runtime, frame, DpoProto::IP6);
+            processed_vectors
+        };
+        process(runtime, node_runtime, frame)
     }
-    fn node_process(&self) -> NodeProcessFn {
-        |runtime, _, frame| process_interface_rx(runtime, frame, DpoProto::IP6)
-    }
-    fn node_runtime_data(&self) -> RuntimeResult<NodeRuntimeData> {
+
+    fn node_runtime_data(&self) -> RuntimeResult<NodeRuntime> {
         Ok(self.runtime_data)
     }
 }
 
-fn process_interface_rx(runtime: &mut DataPlaneMain, frame: &mut BufferFrame, proto: DpoProto) {
+fn process_interface_rx(runtime: &mut DataPlaneMain, frame: &mut Frame, proto: DpoProto) {
     let net = NetMain::global().expect("interface RX graph requires its installed owner");
     hammer_runtime::process_frame!(runtime, frame, |index| {
         let buffer = runtime.buffer_mut(index);
@@ -351,8 +365,8 @@ impl Default for LookupMetadata {
 )]
 #[hammer_component_macros::feature(arc = crate::ip::input::Ip4InputNode)]
 pub struct Ip4LookupNode {
-    #[node(default = NodeRuntimeData::empty())]
-    runtime_data: NodeRuntimeData,
+    #[node(default = NodeRuntime::empty())]
+    runtime_data: NodeRuntime,
 }
 
 #[hammer_component_macros::graph_node(
@@ -364,8 +378,8 @@ pub struct Ip4LookupNode {
 )]
 #[hammer_component_macros::feature(arc = crate::ip::input::Ip6InputNode)]
 pub struct Ip6LookupNode {
-    #[node(default = NodeRuntimeData::empty())]
-    runtime_data: NodeRuntimeData,
+    #[node(default = NodeRuntime::empty())]
+    runtime_data: NodeRuntime,
 }
 
 #[hammer_component_macros::graph_node(
@@ -376,8 +390,8 @@ pub struct Ip6LookupNode {
     sibling_of = Ip4LookupNode,
 )]
 pub struct Ip4LoadBalanceNode {
-    #[node(default = NodeRuntimeData::empty())]
-    runtime_data: NodeRuntimeData,
+    #[node(default = NodeRuntime::empty())]
+    runtime_data: NodeRuntime,
 }
 
 #[hammer_component_macros::graph_node(
@@ -388,8 +402,8 @@ pub struct Ip4LoadBalanceNode {
     sibling_of = Ip6LookupNode,
 )]
 pub struct Ip6LoadBalanceNode {
-    #[node(default = NodeRuntimeData::empty())]
-    runtime_data: NodeRuntimeData,
+    #[node(default = NodeRuntime::empty())]
+    runtime_data: NodeRuntime,
 }
 
 fn register_ip4_lookup(runtime: &DataPlaneMain) -> RuntimeResult<NodeId> {
@@ -469,62 +483,66 @@ fn register_ip6_load_balance(runtime: &DataPlaneMain) -> RuntimeResult<NodeId> {
 }
 
 impl Node for Ip4LookupNode {
-    fn process(&mut self, runtime: &mut DataPlaneMain, frame: &mut BufferFrame) {
-        process_lookup_frame(runtime, frame, IpVersion::V4)
+    fn process(
+        runtime: &mut DataPlaneMain,
+        node_runtime: &mut hammer_runtime::NodeRuntime,
+        frame: &mut Frame,
+    ) -> usize {
+        let process: NodeProcessFn = process_lookup_v4;
+        process(runtime, node_runtime, frame)
     }
 
-    fn node_process(&self) -> NodeProcessFn {
-        process_lookup_v4
-    }
-
-    fn node_runtime_data(&self) -> RuntimeResult<NodeRuntimeData> {
+    fn node_runtime_data(&self) -> RuntimeResult<NodeRuntime> {
         Ok(self.runtime_data)
     }
 }
 
 impl Node for Ip6LookupNode {
-    fn process(&mut self, runtime: &mut DataPlaneMain, frame: &mut BufferFrame) {
-        process_lookup_frame(runtime, frame, IpVersion::V6)
+    fn process(
+        runtime: &mut DataPlaneMain,
+        node_runtime: &mut hammer_runtime::NodeRuntime,
+        frame: &mut Frame,
+    ) -> usize {
+        let process: NodeProcessFn = process_lookup_v6;
+        process(runtime, node_runtime, frame)
     }
 
-    fn node_process(&self) -> NodeProcessFn {
-        process_lookup_v6
-    }
-
-    fn node_runtime_data(&self) -> RuntimeResult<NodeRuntimeData> {
+    fn node_runtime_data(&self) -> RuntimeResult<NodeRuntime> {
         Ok(self.runtime_data)
     }
 }
 
 impl Node for Ip4LoadBalanceNode {
-    fn process(&mut self, runtime: &mut DataPlaneMain, frame: &mut BufferFrame) {
-        process_load_balance_frame(runtime, frame, IpVersion::V4)
+    fn process(
+        runtime: &mut DataPlaneMain,
+        node_runtime: &mut hammer_runtime::NodeRuntime,
+        frame: &mut Frame,
+    ) -> usize {
+        let process: NodeProcessFn = process_load_balance_v4;
+        process(runtime, node_runtime, frame)
     }
 
-    fn node_process(&self) -> NodeProcessFn {
-        process_load_balance_v4
-    }
-
-    fn node_runtime_data(&self) -> RuntimeResult<NodeRuntimeData> {
+    fn node_runtime_data(&self) -> RuntimeResult<NodeRuntime> {
         Ok(self.runtime_data)
     }
 }
 
 impl Node for Ip6LoadBalanceNode {
-    fn process(&mut self, runtime: &mut DataPlaneMain, frame: &mut BufferFrame) {
-        process_load_balance_frame(runtime, frame, IpVersion::V6)
+    fn process(
+        runtime: &mut DataPlaneMain,
+        node_runtime: &mut hammer_runtime::NodeRuntime,
+        frame: &mut Frame,
+    ) -> usize {
+        let process: NodeProcessFn = process_load_balance_v6;
+        process(runtime, node_runtime, frame)
     }
 
-    fn node_process(&self) -> NodeProcessFn {
-        process_load_balance_v6
-    }
-
-    fn node_runtime_data(&self) -> RuntimeResult<NodeRuntimeData> {
+    fn node_runtime_data(&self) -> RuntimeResult<NodeRuntime> {
         Ok(self.runtime_data)
     }
 }
 
-fn process_lookup_frame(runtime: &mut DataPlaneMain, frame: &mut BufferFrame, version: IpVersion) {
+fn process_lookup_frame(runtime: &mut DataPlaneMain, frame: &mut Frame, version: IpVersion) {
     hammer_runtime::process_frame!(runtime, frame, |index| {
         lookup_index(runtime, index, version)
     })
@@ -741,31 +759,37 @@ fn ip6_flow_hash(packet: &[u8], parsed: ParsedIpPacket, config: u16) -> u32 {
     c as u32
 }
 
-fn process_lookup_v4(runtime: &mut DataPlaneMain, _data: NodeRuntimeData, frame: &mut BufferFrame) {
-    process_lookup_frame(runtime, frame, IpVersion::V4)
+fn process_lookup_v4(
+    runtime: &mut DataPlaneMain,
+    _data: &mut NodeRuntime,
+    frame: &mut Frame,
+) -> usize {
+    let processed_vectors = frame.len();
+    process_lookup_frame(runtime, frame, IpVersion::V4);
+    processed_vectors
 }
 
 fn process_load_balance_v4(
     runtime: &mut DataPlaneMain,
-    _data: NodeRuntimeData,
-    frame: &mut BufferFrame,
-) {
-    process_load_balance_frame(runtime, frame, IpVersion::V4)
+    _data: &mut NodeRuntime,
+    frame: &mut Frame,
+) -> usize {
+    let processed_vectors = frame.len();
+    process_load_balance_frame(runtime, frame, IpVersion::V4);
+    processed_vectors
 }
 
 fn process_load_balance_v6(
     runtime: &mut DataPlaneMain,
-    _data: NodeRuntimeData,
-    frame: &mut BufferFrame,
-) {
-    process_load_balance_frame(runtime, frame, IpVersion::V6)
+    _data: &mut NodeRuntime,
+    frame: &mut Frame,
+) -> usize {
+    let processed_vectors = frame.len();
+    process_load_balance_frame(runtime, frame, IpVersion::V6);
+    processed_vectors
 }
 
-fn process_load_balance_frame(
-    runtime: &mut DataPlaneMain,
-    frame: &mut BufferFrame,
-    version: IpVersion,
-) {
+fn process_load_balance_frame(runtime: &mut DataPlaneMain, frame: &mut Frame, version: IpVersion) {
     hammer_runtime::process_frame!(runtime, frame, |index| {
         load_balance_index(runtime, index, version)
     })
@@ -835,8 +859,14 @@ fn load_balance_index(runtime: &mut DataPlaneMain, index: u32, version: IpVersio
     }
 }
 
-fn process_lookup_v6(runtime: &mut DataPlaneMain, _data: NodeRuntimeData, frame: &mut BufferFrame) {
-    process_lookup_frame(runtime, frame, IpVersion::V6)
+fn process_lookup_v6(
+    runtime: &mut DataPlaneMain,
+    _data: &mut NodeRuntime,
+    frame: &mut Frame,
+) -> usize {
+    let processed_vectors = frame.len();
+    process_lookup_frame(runtime, frame, IpVersion::V6);
+    processed_vectors
 }
 
 #[inline(always)]

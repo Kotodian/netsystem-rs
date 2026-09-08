@@ -94,7 +94,7 @@ impl TcpWorker {
         index: u32,
         runtime: &mut DataPlaneMain,
         output_next: SessionQueueNext,
-        frame: &mut hammer_core::data_plane::BufferFrame,
+        frame: &mut hammer_core::data_plane::Frame,
         output: &mut SessionQueueOutput,
         now: Instant,
     ) -> RuntimeResult<()> {
@@ -148,7 +148,7 @@ impl SessionTransport for TcpWorker {
         rx_capacity: usize,
         runtime: &mut DataPlaneMain,
         output_next: SessionQueueNext,
-        frame: &mut hammer_core::data_plane::BufferFrame,
+        frame: &mut hammer_core::data_plane::Frame,
         output: &mut SessionQueueOutput,
     ) -> RuntimeResult<bool> {
         let zero_receive_window_sent = {
@@ -185,7 +185,7 @@ impl SessionTransport for TcpWorker {
         sessions: &mut SessionWorker,
         runtime: &mut DataPlaneMain,
         output_next: SessionQueueNext,
-        frame: &mut hammer_core::data_plane::BufferFrame,
+        frame: &mut hammer_core::data_plane::Frame,
         output: &mut SessionQueueOutput,
         now: Instant,
     ) -> RuntimeResult<()> {
@@ -251,7 +251,7 @@ impl SessionTransport for TcpWorker {
         index: u32,
         runtime: &mut DataPlaneMain,
         output_next: SessionQueueNext,
-        frame: &mut hammer_core::data_plane::BufferFrame,
+        frame: &mut hammer_core::data_plane::Frame,
         output: &mut SessionQueueOutput,
         now: Instant,
     ) -> RuntimeResult<()> {
@@ -274,7 +274,7 @@ impl SessionPacketizedTransport for TcpWorker {
         index: u32,
         runtime: &mut DataPlaneMain,
         output_next: SessionQueueNext,
-        frame: &mut hammer_core::data_plane::BufferFrame,
+        frame: &mut hammer_core::data_plane::Frame,
         output: &mut SessionQueueOutput,
         now: Instant,
     ) -> RuntimeResult<()> {

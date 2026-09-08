@@ -40,9 +40,15 @@ fn feature_chain_terminates_without_an_end_node_self_edge() -> Result<(), Box<dy
         if explicit_end {
             interfaces.enable_feature(runtime, arc, drop_feature, interface, &[])?;
         }
-        let mut frame = runtime.buffers().get_next_frame(output)?;
+        let mut frame = runtime
+            .buffers()
+            .get_next_frame(output, runtime.nodes().frame_args_size(output)?)?;
         let index = runtime.buffers().alloc_index_with_bytes(&[0; 64])?;
-        frame.push_index(index)?;
+        {
+            let count = frame.len();
+            frame.set_vector_count(count + 1);
+            frame.vector_args_mut()[count] = index;
+        }
         let buffer = runtime.buffer_mut(index);
         let first = interfaces.start_feature_arc(arc, interface, buffer, u16::MAX);
         let cursor = buffer.current_config_index();
@@ -70,9 +76,15 @@ fn feature_chain_terminates_without_an_end_node_self_edge() -> Result<(), Box<dy
     interfaces.disable_feature(runtime, arc, drop_feature, interface, &[])?;
     interfaces.enable_feature(runtime, arc, punt_feature, interface, &[])?;
     {
-        let mut frame = runtime.buffers().get_next_frame(output)?;
+        let mut frame = runtime
+            .buffers()
+            .get_next_frame(output, runtime.nodes().frame_args_size(output)?)?;
         let index = runtime.buffers().alloc_index_with_bytes(&[0; 64])?;
-        frame.push_index(index)?;
+        {
+            let count = frame.len();
+            frame.set_vector_count(count + 1);
+            frame.vector_args_mut()[count] = index;
+        }
         let buffer = runtime.buffer_mut(index);
         interfaces.start_feature_arc(arc, interface, buffer, u16::MAX);
         let cursor = buffer.current_config_index();
@@ -85,9 +97,15 @@ fn feature_chain_terminates_without_an_end_node_self_edge() -> Result<(), Box<dy
     }
     assert_eq!(selected_config, config);
     interfaces.disable_feature(runtime, arc, punt_feature, interface, &[])?;
-    let mut frame = runtime.buffers().get_next_frame(output)?;
+    let mut frame = runtime
+        .buffers()
+        .get_next_frame(output, runtime.nodes().frame_args_size(output)?)?;
     let index = runtime.buffers().alloc_index_with_bytes(&[0; 64])?;
-    frame.push_index(index)?;
+    {
+        let count = frame.len();
+        frame.set_vector_count(count + 1);
+        frame.vector_args_mut()[count] = index;
+    }
     let buffer = runtime.buffer_mut(index);
     let cursor = buffer.current_config_index();
     assert_eq!(interfaces.start_feature_arc(arc, interface, buffer, 7), 7);

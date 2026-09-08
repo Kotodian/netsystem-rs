@@ -18,7 +18,7 @@ use hammer_runtime::FILE_MAIN;
 use hammer_runtime::binary_api::{BinaryApiMethodEntry, BinaryApiMethodStatus};
 use hammer_runtime::file::{FileIoStatus, FileMain};
 use hammer_runtime::{
-    GlobalMain, NodeRuntime, PluginError, ProcessContext, ProcessWake, RuntimeError, RuntimeResult,
+    GlobalMain, NodeMain, PluginError, ProcessContext, ProcessWake, RuntimeError, RuntimeResult,
 };
 use prost::Message;
 
@@ -178,7 +178,7 @@ impl BinaryApiConnections {
             self.listener,
             "binary-api client",
             connection_index as u64,
-            client_file::file_functions::<NodeRuntime, RuntimeError>(),
+            client_file::file_functions::<NodeMain, RuntimeError>(),
         ) {
             Ok(Some(index)) => {
                 match self.clients.get_mut(connection_index) {
@@ -428,7 +428,7 @@ impl BinaryApiMain {
                 listener,
                 "binary-api listener",
                 LISTENER_TOKEN,
-                listener_file::file_functions::<NodeRuntime, RuntimeError>(),
+                listener_file::file_functions::<NodeMain, RuntimeError>(),
             )
             .map_err(|source| BinaryApiServerError::ListenerRegistration { source })?;
         Ok(Self {

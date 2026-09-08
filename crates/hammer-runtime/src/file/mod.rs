@@ -19,7 +19,7 @@ use tokio::runtime::Handle;
 use hammer_infra::pool::Pool;
 use hammer_infra::sync::{SpinLock, SpinLockGuard};
 
-use crate::NodeRuntime;
+use crate::NodeMain;
 use crate::error::{RuntimeError, RuntimeResult};
 use crate::global_main::GlobalMain;
 use hammer_component_macros::init_function;
@@ -37,9 +37,9 @@ mod linux;
 use linux::Poller;
 
 /// The runtime's concrete specialization of the shared File ABI.
-pub type File = CoreFile<NodeRuntime, RuntimeError>;
-pub type FileFunction = CoreFileFunction<NodeRuntime, RuntimeError>;
-pub type FileFunctions = CoreFileFunctions<NodeRuntime, RuntimeError>;
+pub type File = CoreFile<NodeMain, RuntimeError>;
+pub type FileFunction = CoreFileFunction<NodeMain, RuntimeError>;
+pub type FileFunctions = CoreFileFunctions<NodeMain, RuntimeError>;
 
 fn duplicate_file_descriptor(file: &File) -> io::Result<OwnedFd> {
     // SAFETY: `F_DUPFD_CLOEXEC` returns a fresh descriptor referencing the
@@ -65,7 +65,7 @@ pub enum FileIoStatus {
 }
 
 /// Worker-local callback invoked when a registered deadline expires.
-pub type DeadlineFunction = fn(&NodeRuntime, &mut Deadline) -> RuntimeResult<()>;
+pub type DeadlineFunction = fn(&NodeMain, &mut Deadline) -> RuntimeResult<()>;
 
 /// A worker-local deadline registration owned by [`FileMain`].
 pub struct Deadline {
@@ -167,11 +167,7 @@ pub fn init_file_main(engine: &mut GlobalMain) -> RuntimeResult<()> {
     Ok(())
 }
 
-fn dispatch_file(
-    file: &mut File,
-    graph: &NodeRuntime,
-    readiness: Readiness,
-) -> RuntimeResult<usize> {
+fn dispatch_file(file: &mut File, graph: &NodeMain, readiness: Readiness) -> RuntimeResult<usize> {
     let functions = file.functions();
     if readiness.contains(Readiness::ERROR)
         && let Some(function) = functions.error
@@ -683,7 +679,7 @@ impl FileMain {
     }
 
     /// Performs one nonblocking readiness poll and dispatches main-thread callbacks.
-    pub fn poll(&self, graph: &NodeRuntime) -> RuntimeResult<usize> {
+    pub fn poll(&self, graph: &NodeMain) -> RuntimeResult<usize> {
         self.poll_for_worker(0, graph)
     }
 
@@ -691,7 +687,7 @@ impl FileMain {
     pub(crate) fn poll_for_worker(
         &self,
         thread_index: u32,
-        graph: &NodeRuntime,
+        graph: &NodeMain,
     ) -> RuntimeResult<usize> {
         self.release_pending(thread_index);
         let mut events = [PollEvent::default(); POLL_BATCH_SIZE];
@@ -777,7 +773,7 @@ impl AsyncFileMain {
     }
 
     /// Awaits main-shard readiness and performs one nonblocking poll.
-    pub async fn next_ready(&mut self, graph: &NodeRuntime) -> RuntimeResult<usize> {
+    pub async fn next_ready(&mut self, graph: &NodeMain) -> RuntimeResult<usize> {
         let mut guard =
             self.wake
                 .readable()

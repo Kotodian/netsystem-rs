@@ -68,7 +68,7 @@ fn init_stats_main(config: Arc<StatsConfig>) -> RuntimeResult<()> {
             listener,
             "stats segment socket".to_owned(),
             0,
-            stats_segment_socket::file_functions::<crate::NodeRuntime, crate::RuntimeError>(),
+            stats_segment_socket::file_functions::<crate::NodeMain, crate::RuntimeError>(),
         ))?;
     Ok(())
 }

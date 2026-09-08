@@ -1,12 +1,12 @@
 use std::net::IpAddr;
 use std::time::Duration;
 
-use hammer_core::data_plane::{BufferFrame, BufferPacketCursor, NodeId};
+use hammer_core::data_plane::{BufferPacketCursor, Frame, NodeId};
 use hammer_core::error::{BufferInvariant, DataPlaneError};
 use hammer_infra::checksum::{internet_checksum, internet_checksum_parts};
 use hammer_runtime::node::{NodeErrorCode, NodeErrorDescriptor, NodeErrorSeverity};
 use hammer_runtime::{
-    DataPlaneMain, Node, NodeProcessFn, NodeRuntimeData, RuntimeError, RuntimeResult,
+    DataPlaneMain, Node, NodeProcessFn, NodeRuntime, RuntimeError, RuntimeResult,
 };
 use hammer_service::net::{NetMain, throttle::Throttle};
 use hammer_service::opaque::{NetworkFlags, NetworkOffloadFlags, NetworkOpaque};
@@ -39,8 +39,8 @@ enum Ip6IcmpErrorNext {
     name = "ip4-icmp-error", next = Ip4IcmpErrorNext,
 )]
 pub(crate) struct Ip4IcmpErrorNode {
-    #[node(default = NodeRuntimeData::empty())]
-    runtime_data: NodeRuntimeData,
+    #[node(default = NodeRuntime::empty())]
+    runtime_data: NodeRuntime,
 }
 
 #[hammer_component_macros::graph_node(
@@ -48,8 +48,8 @@ pub(crate) struct Ip4IcmpErrorNode {
     name = "ip6-icmp-error", next = Ip6IcmpErrorNext,
 )]
 pub(crate) struct Ip6IcmpErrorNode {
-    #[node(default = NodeRuntimeData::empty())]
-    runtime_data: NodeRuntimeData,
+    #[node(default = NodeRuntime::empty())]
+    runtime_data: NodeRuntime,
 }
 
 #[derive(Clone, Copy)]
@@ -139,25 +139,31 @@ fn register_ip6_icmp_error(runtime: &DataPlaneMain) -> RuntimeResult<NodeId> {
 }
 
 impl Node for Ip4IcmpErrorNode {
-    fn process(&mut self, runtime: &mut DataPlaneMain, frame: &mut BufferFrame) {
-        ip4_icmp_error(runtime, self.runtime_data, frame);
+    fn process(
+        runtime: &mut DataPlaneMain,
+        node_runtime: &mut hammer_runtime::NodeRuntime,
+        frame: &mut Frame,
+    ) -> usize {
+        let process: NodeProcessFn = ip4_icmp_error;
+        process(runtime, node_runtime, frame)
     }
-    fn node_process(&self) -> NodeProcessFn {
-        ip4_icmp_error
-    }
-    fn node_runtime_data(&self) -> RuntimeResult<NodeRuntimeData> {
+
+    fn node_runtime_data(&self) -> RuntimeResult<NodeRuntime> {
         Ok(self.runtime_data)
     }
 }
 
 impl Node for Ip6IcmpErrorNode {
-    fn process(&mut self, runtime: &mut DataPlaneMain, frame: &mut BufferFrame) {
-        ip6_icmp_error(runtime, self.runtime_data, frame);
+    fn process(
+        runtime: &mut DataPlaneMain,
+        node_runtime: &mut hammer_runtime::NodeRuntime,
+        frame: &mut Frame,
+    ) -> usize {
+        let process: NodeProcessFn = ip6_icmp_error;
+        process(runtime, node_runtime, frame)
     }
-    fn node_process(&self) -> NodeProcessFn {
-        ip6_icmp_error
-    }
-    fn node_runtime_data(&self) -> RuntimeResult<NodeRuntimeData> {
+
+    fn node_runtime_data(&self) -> RuntimeResult<NodeRuntime> {
         Ok(self.runtime_data)
     }
 }
@@ -204,68 +210,76 @@ fn exit_worker(runtime: &mut DataPlaneMain) -> RuntimeResult<()> {
     Ok(())
 }
 
-fn ip4_icmp_error(runtime: &mut DataPlaneMain, _: NodeRuntimeData, frame: &mut BufferFrame) {
-    let ip = IP4_MAIN
-        .get()
-        .expect("IP initialized before graph execution");
-    let mut throttle = ip.icmp_throttle[runtime.thread_index() as usize]
-        .borrow_mut()
-        .expect("IPv4 ICMP throttle belongs to executing worker");
-    let seed = throttle.seed(ip.clock_origin.elapsed());
-    hammer_runtime::process_frame!(runtime, frame, |index| {
-        let result = generate_error(
-            runtime,
-            index,
-            IcmpErrorFamily::Ipv4,
-            &mut throttle,
-            seed,
-            Ip4IcmpErrorNext::Lookup.slot(),
-        );
-        let error = match result {
-            Ok(error) => error,
-            Err(RuntimeError::DataPlane(
-                DataPlaneError::BufferInvariant(BufferInvariant::PoolExhausted)
-                | DataPlaneError::FramePoolExhausted,
-            )) => IcmpError::NoBuffer,
-            Err(error) => panic!("IPv4 ICMP graph ownership invariant: {error}"),
-        };
-        runtime
-            .record_current_node_error(error)
-            .expect("IPv4 ICMP node counters installed");
-        Ip4IcmpErrorNext::Drop
-    });
+fn ip4_icmp_error(runtime: &mut DataPlaneMain, _: &mut NodeRuntime, frame: &mut Frame) -> usize {
+    let processed_vectors = frame.len();
+    (|| {
+        let ip = IP4_MAIN
+            .get()
+            .expect("IP initialized before graph execution");
+        let mut throttle = ip.icmp_throttle[runtime.thread_index() as usize]
+            .borrow_mut()
+            .expect("IPv4 ICMP throttle belongs to executing worker");
+        let seed = throttle.seed(ip.clock_origin.elapsed());
+        hammer_runtime::process_frame!(runtime, frame, |index| {
+            let result = generate_error(
+                runtime,
+                index,
+                IcmpErrorFamily::Ipv4,
+                &mut throttle,
+                seed,
+                Ip4IcmpErrorNext::Lookup.slot(),
+            );
+            let error = match result {
+                Ok(error) => error,
+                Err(RuntimeError::DataPlane(
+                    DataPlaneError::BufferInvariant(BufferInvariant::PoolExhausted)
+                    | DataPlaneError::FramePoolExhausted,
+                )) => IcmpError::NoBuffer,
+                Err(error) => panic!("IPv4 ICMP graph ownership invariant: {error}"),
+            };
+            runtime
+                .record_current_node_error(error)
+                .expect("IPv4 ICMP node counters installed");
+            Ip4IcmpErrorNext::Drop
+        });
+    })();
+    processed_vectors
 }
 
-fn ip6_icmp_error(runtime: &mut DataPlaneMain, _: NodeRuntimeData, frame: &mut BufferFrame) {
-    let ip = IP6_MAIN
-        .get()
-        .expect("IP initialized before graph execution");
-    let mut throttle = ip.icmp_throttle[runtime.thread_index() as usize]
-        .borrow_mut()
-        .expect("IPv6 ICMP throttle belongs to executing worker");
-    let seed = throttle.seed(ip.clock_origin.elapsed());
-    hammer_runtime::process_frame!(runtime, frame, |index| {
-        let result = generate_error(
-            runtime,
-            index,
-            IcmpErrorFamily::Ipv6,
-            &mut throttle,
-            seed,
-            Ip6IcmpErrorNext::Lookup.slot(),
-        );
-        let error = match result {
-            Ok(error) => error,
-            Err(RuntimeError::DataPlane(
-                DataPlaneError::BufferInvariant(BufferInvariant::PoolExhausted)
-                | DataPlaneError::FramePoolExhausted,
-            )) => IcmpError::NoBuffer,
-            Err(error) => panic!("IPv6 ICMP graph ownership invariant: {error}"),
-        };
-        runtime
-            .record_current_node_error(error)
-            .expect("IPv6 ICMP node counters installed");
-        Ip6IcmpErrorNext::Drop
-    });
+fn ip6_icmp_error(runtime: &mut DataPlaneMain, _: &mut NodeRuntime, frame: &mut Frame) -> usize {
+    let processed_vectors = frame.len();
+    (|| {
+        let ip = IP6_MAIN
+            .get()
+            .expect("IP initialized before graph execution");
+        let mut throttle = ip.icmp_throttle[runtime.thread_index() as usize]
+            .borrow_mut()
+            .expect("IPv6 ICMP throttle belongs to executing worker");
+        let seed = throttle.seed(ip.clock_origin.elapsed());
+        hammer_runtime::process_frame!(runtime, frame, |index| {
+            let result = generate_error(
+                runtime,
+                index,
+                IcmpErrorFamily::Ipv6,
+                &mut throttle,
+                seed,
+                Ip6IcmpErrorNext::Lookup.slot(),
+            );
+            let error = match result {
+                Ok(error) => error,
+                Err(RuntimeError::DataPlane(
+                    DataPlaneError::BufferInvariant(BufferInvariant::PoolExhausted)
+                    | DataPlaneError::FramePoolExhausted,
+                )) => IcmpError::NoBuffer,
+                Err(error) => panic!("IPv6 ICMP graph ownership invariant: {error}"),
+            };
+            runtime
+                .record_current_node_error(error)
+                .expect("IPv6 ICMP node counters installed");
+            Ip6IcmpErrorNext::Drop
+        });
+    })();
+    processed_vectors
 }
 
 fn generate_error(
@@ -371,11 +385,15 @@ fn generate_error(
         lookup_slot,
     )?;
     // The next frame owns the response immediately; any later failure frees it.
-    let mut output = runtime.buffers().get_next_frame(next)?;
+    let mut output = runtime
+        .buffers()
+        .get_next_frame(next, runtime.nodes().frame_args_size(next)?)?;
     let response = runtime.buffers().alloc_index_from(index)?;
-    output
-        .push_index(response)
-        .expect("empty next frame accepts one response");
+    {
+        let count = output.len();
+        output.set_vector_count(count + 1);
+        output.vector_args_mut()[count] = response;
+    }
     let buffer = runtime.buffer_mut(response);
     let quote_len = buffer.current_len().min(limit - header_len - 8);
     let length = header_len + 8 + quote_len;
@@ -463,7 +481,7 @@ pub(crate) fn error_response_source_and_origin(runtime: &mut DataPlaneMain) -> R
         NodeDescriptor::new(
             |runtime, _, frame| {
                 assert_eq!(frame.len(), 1);
-                let buffer = runtime.buffer(frame.indices()[0]);
+                let buffer = runtime.buffer(frame.vector_args()[0]);
                 let packet = buffer.current();
                 let network = hammer_core::buffer_opaque!(buffer => NetworkOpaque);
                 assert!(network.flags.contains(NetworkFlags::LOCALLY_ORIGINATED));
@@ -509,8 +527,9 @@ pub(crate) fn error_response_source_and_origin(runtime: &mut DataPlaneMain) -> R
                     }
                     version => panic!("unexpected response IP version {version}"),
                 }
+                frame.len()
             },
-            NodeRuntimeData::empty(),
+            NodeRuntime::empty(),
             None,
             &[],
             None,
@@ -556,9 +575,15 @@ pub(crate) fn error_response_source_and_origin(runtime: &mut DataPlaneMain) -> R
                     .octets(),
             );
         }
-        let mut frame = runtime.buffers().get_next_frame(node)?;
+        let mut frame = runtime
+            .buffers()
+            .get_next_frame(node, runtime.nodes().frame_args_size(node)?)?;
         let index = runtime.alloc_index_with_bytes(&packet)?;
-        frame.push_index(index)?;
+        {
+            let count = frame.len();
+            frame.set_vector_count(count + 1);
+            frame.vector_args_mut()[count] = index;
+        }
         {
             let mut buffer = runtime.buffer_mut(index);
             let mut network = NetworkOpaque::default();

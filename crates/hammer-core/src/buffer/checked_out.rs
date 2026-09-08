@@ -3,19 +3,18 @@ use std::ops::{Deref, DerefMut};
 use crate::error::{DataPlaneError, DataPlaneResult};
 use crate::graph::NodeId;
 
-use super::{BufferFrame, DataPlaneBuffers};
+use super::DataPlaneBuffers;
+use crate::graph::frame;
 
 pub struct Next {
     pub(super) owner: DataPlaneBuffers,
-    pub(super) index: (u64, u32, u32),
     pub(super) next: NodeId,
-    pub(super) frame: Option<BufferFrame>,
+    pub(super) frame: Option<Box<frame::Frame>>,
 }
 
 pub struct Pending {
     pub(super) owner: DataPlaneBuffers,
-    pub(super) index: (u64, u32, u32),
-    pub(super) frame: Option<BufferFrame>,
+    pub(super) frame: Option<Box<frame::Frame>>,
 }
 
 pub struct Frame<State> {
@@ -31,7 +30,7 @@ pub enum FrameBatchWidth {
 
 impl Frame<Next> {
     #[inline]
-    fn frame(&self) -> &BufferFrame {
+    fn frame(&self) -> &frame::Frame {
         match self.state.frame.as_ref() {
             Some(frame) => frame,
             None => super::abort_checked_out_frame(),
@@ -39,7 +38,7 @@ impl Frame<Next> {
     }
 
     #[inline]
-    fn frame_mut(&mut self) -> &mut BufferFrame {
+    fn frame_mut(&mut self) -> &mut frame::Frame {
         match self.state.frame.as_mut() {
             Some(frame) => frame,
             None => super::abort_checked_out_frame(),
@@ -61,7 +60,6 @@ impl Frame<Next> {
         Ok(Frame {
             state: Pending {
                 owner: self.state.owner.clone(),
-                index: self.state.index,
                 frame: Some(frame),
             },
         })
@@ -74,11 +72,11 @@ impl Frame<Pending> {
         if let Some(frame) = self.state.frame.take() {
             self.state
                 .owner
-                .drop_owned_frame_with_trace(self.state.index, frame, release_trace);
+                .drop_owned_frame_with_trace(frame, release_trace);
         }
     }
     #[inline]
-    fn frame(&self) -> &BufferFrame {
+    fn frame(&self) -> &frame::Frame {
         match self.state.frame.as_ref() {
             Some(frame) => frame,
             None => super::abort_checked_out_frame(),
@@ -86,7 +84,7 @@ impl Frame<Pending> {
     }
 
     #[inline]
-    fn frame_mut(&mut self) -> &mut BufferFrame {
+    fn frame_mut(&mut self) -> &mut frame::Frame {
         match self.state.frame.as_mut() {
             Some(frame) => frame,
             None => super::abort_checked_out_frame(),
@@ -97,7 +95,7 @@ impl Frame<Pending> {
 impl Drop for Next {
     fn drop(&mut self) {
         if let Some(frame) = self.frame.take() {
-            self.owner.drop_owned_frame(self.index, frame);
+            self.owner.drop_owned_frame(frame);
         }
     }
 }
@@ -105,13 +103,13 @@ impl Drop for Next {
 impl Drop for Pending {
     fn drop(&mut self) {
         if let Some(frame) = self.frame.take() {
-            self.owner.drop_owned_frame(self.index, frame);
+            self.owner.drop_owned_frame(frame);
         }
     }
 }
 
 impl Deref for Frame<Next> {
-    type Target = BufferFrame;
+    type Target = frame::Frame;
 
     fn deref(&self) -> &Self::Target {
         self.frame()
@@ -125,7 +123,7 @@ impl DerefMut for Frame<Next> {
 }
 
 impl Deref for Frame<Pending> {
-    type Target = BufferFrame;
+    type Target = frame::Frame;
 
     fn deref(&self) -> &Self::Target {
         self.frame()

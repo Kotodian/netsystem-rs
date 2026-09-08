@@ -1,12 +1,12 @@
 use crate::protocol::{IcmpBuildError, IcmpHeader, build_echo_reply};
-use hammer_core::data_plane::{BufferFrame, BufferPacketCursor, NodeId, NodeNext};
+use hammer_core::data_plane::{BufferPacketCursor, Frame, NodeId, NodeNext};
 use hammer_plugin_ip::ip::ip_header;
 use hammer_plugin_ip::protocol::icmp::IcmpErrorMetadata;
 use hammer_plugin_ip::protocol::ip::{IpProtocol, IpVersion};
 use hammer_plugin_ip::protocol::wire::read_header;
 use hammer_runtime::RuntimeResult;
 use hammer_runtime::{
-    DataPlaneMain, Node, NodeProcessFn, NodeRuntimeData, TraceFormatter, add_packet_trace,
+    DataPlaneMain, Node, NodeProcessFn, NodeRuntime, TraceFormatter, add_packet_trace,
     format_packet_trace,
 };
 
@@ -236,8 +236,8 @@ impl Default for IcmpTypeSpec {
     next = Icmp4InputNext,
 )]
 pub struct Icmp4InputNode {
-    #[node(default = NodeRuntimeData::empty())]
-    runtime_data: NodeRuntimeData,
+    #[node(default = NodeRuntime::empty())]
+    runtime_data: NodeRuntime,
 }
 
 fn register_icmp4_input(runtime: &DataPlaneMain) -> RuntimeResult<NodeId> {
@@ -265,8 +265,8 @@ fn register_icmp4_input(runtime: &DataPlaneMain) -> RuntimeResult<NodeId> {
     next = Icmp6InputNext,
 )]
 pub struct Icmp6InputNode {
-    #[node(default = NodeRuntimeData::empty())]
-    runtime_data: NodeRuntimeData,
+    #[node(default = NodeRuntime::empty())]
+    runtime_data: NodeRuntime,
 }
 
 fn register_icmp6_input(runtime: &DataPlaneMain) -> RuntimeResult<NodeId> {
@@ -304,7 +304,7 @@ fn register_icmp6_input(runtime: &DataPlaneMain) -> RuntimeResult<NodeId> {
 impl crate::IcmpMain {
     fn register_type(
         &self,
-        nodes: &hammer_runtime::node::NodeRuntime,
+        nodes: &hammer_runtime::node::NodeMain,
         version: IpVersion,
         icmp_type: u8,
         node: NodeId,
@@ -330,8 +330,17 @@ impl crate::IcmpMain {
 
 impl Node for Icmp4InputNode {
     #[inline(always)]
-    fn process(&mut self, runtime: &mut DataPlaneMain, frame: &mut BufferFrame) -> () {
-        icmp_input_process(runtime, self.runtime_data, frame, IpVersion::V4)
+    fn process(
+        runtime: &mut DataPlaneMain,
+        node_runtime: &mut hammer_runtime::NodeRuntime,
+        frame: &mut Frame,
+    ) -> usize {
+        let process: NodeProcessFn = |runtime, data, frame| {
+            let processed_vectors = frame.len();
+            icmp_input_process(runtime, data, frame, IpVersion::V4);
+            processed_vectors
+        };
+        process(runtime, node_runtime, frame)
     }
 
     #[inline]
@@ -340,20 +349,24 @@ impl Node for Icmp4InputNode {
     }
 
     #[inline]
-    fn node_process(&self) -> NodeProcessFn {
-        |runtime, data, frame| icmp_input_process(runtime, data, frame, IpVersion::V4)
-    }
-
-    #[inline]
-    fn node_runtime_data(&self) -> RuntimeResult<NodeRuntimeData> {
+    fn node_runtime_data(&self) -> RuntimeResult<NodeRuntime> {
         Ok(self.runtime_data)
     }
 }
 
 impl Node for Icmp6InputNode {
     #[inline(always)]
-    fn process(&mut self, runtime: &mut DataPlaneMain, frame: &mut BufferFrame) -> () {
-        icmp_input_process(runtime, self.runtime_data, frame, IpVersion::V6)
+    fn process(
+        runtime: &mut DataPlaneMain,
+        node_runtime: &mut hammer_runtime::NodeRuntime,
+        frame: &mut Frame,
+    ) -> usize {
+        let process: NodeProcessFn = |runtime, data, frame| {
+            let processed_vectors = frame.len();
+            icmp_input_process(runtime, data, frame, IpVersion::V6);
+            processed_vectors
+        };
+        process(runtime, node_runtime, frame)
     }
 
     #[inline]
@@ -362,12 +375,7 @@ impl Node for Icmp6InputNode {
     }
 
     #[inline]
-    fn node_process(&self) -> NodeProcessFn {
-        |runtime, data, frame| icmp_input_process(runtime, data, frame, IpVersion::V6)
-    }
-
-    #[inline]
-    fn node_runtime_data(&self) -> RuntimeResult<NodeRuntimeData> {
+    fn node_runtime_data(&self) -> RuntimeResult<NodeRuntime> {
         Ok(self.runtime_data)
     }
 }
@@ -404,18 +412,22 @@ fn register_icmp4_echo_request(runtime: &DataPlaneMain) -> RuntimeResult<NodeId>
 
 impl Node for Icmp4EchoRequestNode {
     #[inline(always)]
-    fn process(&mut self, runtime: &mut DataPlaneMain, frame: &mut BufferFrame) -> () {
-        icmp_echo_request_process_frame(runtime, frame, IpVersion::V4)
+    fn process(
+        runtime: &mut DataPlaneMain,
+        node_runtime: &mut hammer_runtime::NodeRuntime,
+        frame: &mut Frame,
+    ) -> usize {
+        let process: NodeProcessFn = |runtime, _, frame| {
+            let processed_vectors = frame.len();
+            icmp_echo_request_process_frame(runtime, frame, IpVersion::V4);
+            processed_vectors
+        };
+        process(runtime, node_runtime, frame)
     }
 
     #[inline]
     fn node_trace_formatter(&self) -> Option<TraceFormatter> {
         Some(format_packet_trace!(IcmpEchoRequestTrace))
-    }
-
-    #[inline]
-    fn node_process(&self) -> NodeProcessFn {
-        |runtime, _, frame| icmp_echo_request_process_frame(runtime, frame, IpVersion::V4)
     }
 }
 
@@ -451,45 +463,53 @@ fn register_icmp6_echo_request(runtime: &DataPlaneMain) -> RuntimeResult<NodeId>
 
 impl Node for Icmp6EchoRequestNode {
     #[inline(always)]
-    fn process(&mut self, runtime: &mut DataPlaneMain, frame: &mut BufferFrame) -> () {
-        icmp_echo_request_process_frame(runtime, frame, IpVersion::V6)
+    fn process(
+        runtime: &mut DataPlaneMain,
+        node_runtime: &mut hammer_runtime::NodeRuntime,
+        frame: &mut Frame,
+    ) -> usize {
+        let process: NodeProcessFn = |runtime, _, frame| {
+            let processed_vectors = frame.len();
+            icmp_echo_request_process_frame(runtime, frame, IpVersion::V6);
+            processed_vectors
+        };
+        process(runtime, node_runtime, frame)
     }
 
     #[inline]
     fn node_trace_formatter(&self) -> Option<TraceFormatter> {
         Some(format_packet_trace!(IcmpEchoRequestTrace))
     }
-
-    #[inline]
-    fn node_process(&self) -> NodeProcessFn {
-        |runtime, _, frame| icmp_echo_request_process_frame(runtime, frame, IpVersion::V6)
-    }
 }
 
 fn icmp_input_process(
     runtime: &mut DataPlaneMain,
-    _: NodeRuntimeData,
-    frame: &mut BufferFrame,
+    _: &mut NodeRuntime,
+    frame: &mut Frame,
     version: IpVersion,
-) -> () {
-    let drop_slot = match version {
-        IpVersion::V4 => NodeNext::slot(Icmp4InputNext::Drop),
-        IpVersion::V6 => NodeNext::slot(Icmp6InputNext::Drop),
-    };
-    let mut nexts = [0; hammer_core::data_plane::DEFAULT_BUFFER_FRAME_CAPACITY];
-    for (index, slot) in frame.indices().iter().zip(&mut nexts) {
-        *slot = match next_slot_for_index(runtime, *index, version) {
-            Ok(slot) => slot,
-            Err(_) => drop_slot,
+) -> usize {
+    let processed_vectors = frame.len();
+    (|| {
+        let drop_slot = match version {
+            IpVersion::V4 => NodeNext::slot(Icmp4InputNext::Drop),
+            IpVersion::V6 => NodeNext::slot(Icmp6InputNext::Drop),
         };
-    }
-    runtime.enqueue_to_next(frame, &nexts[..frame.len()]);
-    ()
+        let mut nexts = [0; hammer_core::data_plane::DEFAULT_BUFFER_FRAME_CAPACITY];
+        for (index, slot) in frame.vector_args().iter().zip(&mut nexts) {
+            *slot = match next_slot_for_index(runtime, *index, version) {
+                Ok(slot) => slot,
+                Err(_) => drop_slot,
+            };
+        }
+        runtime.enqueue_to_next(frame, &nexts[..frame.len()]);
+        ()
+    })();
+    processed_vectors
 }
 
 fn icmp_echo_request_process_frame(
     runtime: &mut DataPlaneMain,
-    frame: &mut BufferFrame,
+    frame: &mut Frame,
     version: IpVersion,
 ) -> () {
     hammer_runtime::process_frame!(runtime, frame, |index| {
@@ -811,11 +831,17 @@ mod tests {
                 ]);
                 packet[42..44].copy_from_slice(&checksum.to_be_bytes());
             }
-            let mut frame = runtime.buffers().get_next_frame(input)?;
+            let mut frame = runtime
+                .buffers()
+                .get_next_frame(input, runtime.nodes().frame_args_size(input)?)?;
             let index = runtime
                 .buffers()
                 .alloc_index_with_bytes(&packet[..packet_len])?;
-            frame.push_index(index)?;
+            {
+                let count = frame.len();
+                frame.set_vector_count(count + 1);
+                frame.vector_args_mut()[count] = index;
+            }
             {
                 let mut buffer = runtime.buffer_mut(index);
                 // SAFETY: this fixture installs the same initialized service

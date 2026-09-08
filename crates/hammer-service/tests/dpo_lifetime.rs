@@ -3,7 +3,7 @@ use std::sync::Arc;
 use hammer_core::data_plane::{NodeId, NodeKind};
 use hammer_runtime::node::NodeDescriptor;
 use hammer_runtime::{
-    DataPlaneBufferConfig, DataPlaneMain, GlobalMain, Node, NodeRuntimeData, RuntimeRegistry,
+    DataPlaneBufferConfig, DataPlaneMain, GlobalMain, Node, NodeRuntime, RuntimeRegistry,
 };
 use hammer_service::interface::InterfaceMain;
 use hammer_service::net::{
@@ -97,8 +97,8 @@ fn shared_bucket_references_survive_parent_replacement() -> Result<(), DpoError>
     let output = runtime.nodes().try_register_descriptor(
         NodeKind::Internal,
         NodeDescriptor::new(
-            hammer_service::data_plane::DropNode.node_process(),
-            NodeRuntimeData::empty(),
+            hammer_service::data_plane::DropNode::process,
+            NodeRuntime::empty(),
             None,
             &[],
             None,

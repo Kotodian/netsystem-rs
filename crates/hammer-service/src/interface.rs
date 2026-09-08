@@ -1,6 +1,6 @@
-use hammer_core::data_plane::{BufferFrame, NodeId, NodeRegistration};
+use hammer_core::data_plane::{Frame, NodeId, NodeRegistration};
 use hammer_runtime::{
-    DataPlaneMain, InternalNode, Node, NodeProcessFn, NodeRuntimeData, RuntimeError, RuntimeResult,
+    DataPlaneMain, InternalNode, Node, NodeProcessFn, NodeRuntime, RuntimeError, RuntimeResult,
     add_packet_trace, process_frame,
 };
 use ipnet::IpNet;
@@ -225,11 +225,13 @@ impl InterfaceOutputNode {
 }
 
 impl Node for InterfaceOutputNode {
-    fn process(&mut self, runtime: &mut DataPlaneMain, frame: &mut BufferFrame) {
-        interface_output_process(runtime, NodeRuntimeData::empty(), frame)
-    }
-    fn node_process(&self) -> NodeProcessFn {
-        interface_output_process
+    fn process(
+        runtime: &mut DataPlaneMain,
+        node_runtime: &mut hammer_runtime::NodeRuntime,
+        frame: &mut Frame,
+    ) -> usize {
+        let process: NodeProcessFn = interface_output_process;
+        process(runtime, node_runtime, frame)
     }
 }
 
@@ -241,13 +243,17 @@ impl InternalNode for InterfaceOutputNode {
 
 fn interface_output_process(
     runtime: &mut DataPlaneMain,
-    _: NodeRuntimeData,
-    frame: &mut BufferFrame,
-) {
-    process_frame!(runtime, frame, |index| InterfaceOutputNode::tx_for_index(
-        runtime, index, 0
-    )
-    .unwrap_or(0));
+    _: &mut NodeRuntime,
+    frame: &mut Frame,
+) -> usize {
+    let processed_vectors = frame.len();
+    (|| {
+        process_frame!(runtime, frame, |index| InterfaceOutputNode::tx_for_index(
+            runtime, index, 0
+        )
+        .unwrap_or(0));
+    })();
+    processed_vectors
 }
 
 #[cfg(test)]

@@ -2,7 +2,7 @@ use std::collections::{BTreeMap, HashMap};
 
 use hammer_core::data_plane::{Buffer, NodeId};
 use hammer_infra::{bitmap::Bitmap, pool::Pool};
-use hammer_runtime::{DataPlaneMain, NodeRuntime, RuntimeError};
+use hammer_runtime::{DataPlaneMain, NodeMain, RuntimeError};
 
 use super::InterfaceMain;
 
@@ -201,7 +201,7 @@ impl InterfaceMain {
         Ok(())
     }
 
-    pub fn install_feature_arcs(&self, nodes: &NodeRuntime) -> Result<(), FeatureError> {
+    pub fn install_feature_arcs(&self, nodes: &NodeMain) -> Result<(), FeatureError> {
         hammer_runtime::ensure_main_thread()
             .expect("feature installation belongs to the main thread");
         let state = &mut self.state_mut().feature;

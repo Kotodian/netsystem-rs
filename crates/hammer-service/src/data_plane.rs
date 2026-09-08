@@ -1,4 +1,4 @@
-use hammer_core::data_plane::{BufferFrame, NodeId, NodeRegistration};
+use hammer_core::data_plane::{Frame, NodeId, NodeRegistration};
 use hammer_runtime::RuntimeResult;
 use hammer_runtime::{
     DataPlaneMain, InternalNode, Node, NodeErrorCode, NodeProcessFn, add_packet_trace,
@@ -34,11 +34,15 @@ pub struct DropNode;
 pub struct PuntNode;
 
 impl Node for PuntNode {
-    fn process(&mut self, _: &mut DataPlaneMain, _: &mut BufferFrame) {}
-    fn node_process(&self) -> NodeProcessFn {
-        // VPP releases the packet frame when no OS punt consumer is installed.
+    fn process(
+        runtime: &mut DataPlaneMain,
+        node_runtime: &mut hammer_runtime::NodeRuntime,
+        frame: &mut Frame,
+    ) -> usize {
+        let process: NodeProcessFn = // VPP releases the packet frame when no OS punt consumer is installed.
         // Leaving ownership in the incoming frame lets its owner release it.
-        |_, _, _| {}
+        |_, _, frame| frame.len();
+        process(runtime, node_runtime, frame)
     }
 }
 
@@ -81,70 +85,74 @@ pub struct DropTrace {
 
 impl Node for DropNode {
     #[inline(always)]
-    fn process(&mut self, _runtime: &mut DataPlaneMain, _frame: &mut BufferFrame) -> () {
-        ()
-    }
-
-    #[inline]
-    fn node_process(&self) -> NodeProcessFn {
-        drop_node_process
+    fn process(
+        runtime: &mut DataPlaneMain,
+        node_runtime: &mut hammer_runtime::NodeRuntime,
+        frame: &mut Frame,
+    ) -> usize {
+        let process: NodeProcessFn = drop_node_process;
+        process(runtime, node_runtime, frame)
     }
 }
 
 fn drop_node_process(
     runtime: &mut DataPlaneMain,
-    _data: hammer_runtime::node::NodeRuntimeData,
-    frame: &mut BufferFrame,
-) -> () {
-    let dropped = frame.len();
-    let indices = frame.indices();
-    let len = indices.len();
-    let mut read = 0usize;
-    while read + 4 <= len {
-        if read + 4 < len {
-            runtime.prefetch_header(indices[read + 4]);
+    _data: &mut hammer_runtime::node::NodeRuntime,
+    frame: &mut Frame,
+) -> usize {
+    let processed_vectors = frame.len();
+    (|| {
+        let dropped = frame.len();
+        let indices = frame.vector_args();
+        let len = indices.len();
+        let mut read = 0usize;
+        while read + 4 <= len {
+            if read + 4 < len {
+                runtime.prefetch_header(indices[read + 4]);
+            }
+            if read + 5 < len {
+                runtime.prefetch_header(indices[read + 5]);
+            }
+            if read + 6 < len {
+                runtime.prefetch_header(indices[read + 6]);
+            }
+            if read + 7 < len {
+                runtime.prefetch_header(indices[read + 7]);
+            }
+            let index0 = indices[read];
+            let index1 = indices[read + 1];
+            let index2 = indices[read + 2];
+            let index3 = indices[read + 3];
+            let _ = add_packet_trace!(runtime, index0, DropTrace { dropped });
+            let _ = add_packet_trace!(runtime, index1, DropTrace { dropped });
+            let _ = add_packet_trace!(runtime, index2, DropTrace { dropped });
+            let _ = add_packet_trace!(runtime, index3, DropTrace { dropped });
+            read += 4;
         }
-        if read + 5 < len {
-            runtime.prefetch_header(indices[read + 5]);
+        if read + 2 <= len {
+            if read + 2 < len {
+                runtime.prefetch_header(indices[read + 2]);
+            }
+            if read + 3 < len {
+                runtime.prefetch_header(indices[read + 3]);
+            }
+            let index0 = indices[read];
+            let index1 = indices[read + 1];
+            let _ = add_packet_trace!(runtime, index0, DropTrace { dropped });
+            let _ = add_packet_trace!(runtime, index1, DropTrace { dropped });
+            read += 2;
         }
-        if read + 6 < len {
-            runtime.prefetch_header(indices[read + 6]);
+        while read < len {
+            if read + 1 < len {
+                runtime.prefetch_header(indices[read + 1]);
+            }
+            let index0 = indices[read];
+            let _ = add_packet_trace!(runtime, index0, DropTrace { dropped });
+            read += 1;
         }
-        if read + 7 < len {
-            runtime.prefetch_header(indices[read + 7]);
-        }
-        let index0 = indices[read];
-        let index1 = indices[read + 1];
-        let index2 = indices[read + 2];
-        let index3 = indices[read + 3];
-        let _ = add_packet_trace!(runtime, index0, DropTrace { dropped });
-        let _ = add_packet_trace!(runtime, index1, DropTrace { dropped });
-        let _ = add_packet_trace!(runtime, index2, DropTrace { dropped });
-        let _ = add_packet_trace!(runtime, index3, DropTrace { dropped });
-        read += 4;
-    }
-    if read + 2 <= len {
-        if read + 2 < len {
-            runtime.prefetch_header(indices[read + 2]);
-        }
-        if read + 3 < len {
-            runtime.prefetch_header(indices[read + 3]);
-        }
-        let index0 = indices[read];
-        let index1 = indices[read + 1];
-        let _ = add_packet_trace!(runtime, index0, DropTrace { dropped });
-        let _ = add_packet_trace!(runtime, index1, DropTrace { dropped });
-        read += 2;
-    }
-    while read < len {
-        if read + 1 < len {
-            runtime.prefetch_header(indices[read + 1]);
-        }
-        let index0 = indices[read];
-        let _ = add_packet_trace!(runtime, index0, DropTrace { dropped });
-        read += 1;
-    }
-    ()
+        ()
+    })();
+    processed_vectors
 }
 
 impl InternalNode for DropNode {

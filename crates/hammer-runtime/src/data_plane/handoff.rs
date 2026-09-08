@@ -14,7 +14,10 @@ impl DataPlaneMain {
         };
         while let Some(handoff_frame) = handoff.pop() {
             let mut slot = HandoffSlotGuard::new(self, handoff_frame.slot);
-            let mut frame = self.buffers.get_next_frame(handoff_frame.target)?;
+            let mut frame = self.buffers.get_next_frame(
+                handoff_frame.target,
+                self.nodes.frame_args_size(handoff_frame.target)?,
+            )?;
             slot.push_into_frame(&mut frame)?;
             self.put_next_frame(frame)?;
         }
@@ -33,7 +36,7 @@ impl DataPlaneMain {
         &self,
         worker: DataWorkerId,
         target: NodeId,
-        frame: &mut BufferFrame,
+        frame: &mut Frame,
     ) -> RuntimeResult<()> {
         let Some(handoff) = &self.handoff else {
             return Err(DataPlaneError::HandoffNotConfigured.into());
@@ -45,12 +48,10 @@ impl DataPlaneMain {
         self.nodes.node_kind(target)?;
         let slots = pending.div_ceil(HANDOFF_SLOT_CAPACITY);
         handoff.ensure_enqueue_slots(worker, slots)?;
-        while !frame.is_empty() {
-            let slot = HandoffSlot::from_prefix(frame.indices());
-            let slot_len = slot.len();
+        for indices in frame.vector_args().chunks(HANDOFF_SLOT_CAPACITY) {
+            let slot = HandoffSlot::from_prefix(indices);
             match handoff.enqueue_slot(worker, target, slot) {
                 Ok(()) => {
-                    frame.discard_prefix(slot_len);
                     self.set_worker_node_interrupt_pending(worker, target);
                 }
                 Err(err) => {
@@ -93,15 +94,23 @@ mod tests {
     use crate::handoff::DataPlaneHandoff;
     use crate::node::NodeDescriptor;
 
-    fn local_input(runtime: &mut DataPlaneMain, data: NodeRuntimeData, frame: &mut BufferFrame) {
-        assert_eq!(runtime.thread_index(), 2);
-        assert_eq!(data.usize_word(0).unwrap(), 1);
-        for &index in frame.indices() {
-            let buffer = runtime.buffer(index);
-            assert_eq!(buffer.current_config_index(), 0x1234_5678);
-            assert_eq!(buffer.current(), &[0x45; 20]);
-            assert_eq!(buffer.ref_count(), 1);
-        }
+    fn local_input(
+        runtime: &mut DataPlaneMain,
+        data: &mut NodeRuntime,
+        frame: &mut Frame,
+    ) -> usize {
+        let processed_vectors = frame.len();
+        (|| {
+            assert_eq!(runtime.thread_index(), 2);
+            assert_eq!(data.usize_word(0).unwrap(), 1);
+            for &index in frame.vector_args() {
+                let buffer = runtime.buffer(index);
+                assert_eq!(buffer.current_config_index(), 0x1234_5678);
+                assert_eq!(buffer.current(), &[0x45; 20]);
+                assert_eq!(buffer.ref_count(), 1);
+            }
+        })();
+        processed_vectors
     }
 
     // vlib/handoff.c delivers queued indices directly to hqm->node_index.
@@ -127,7 +136,7 @@ mod tests {
             .nodes()
             .try_register_descriptor(
                 NodeKind::Internal,
-                NodeDescriptor::new(local_input, NodeRuntimeData::empty(), None, &[], None),
+                NodeDescriptor::new(local_input, NodeRuntime::empty(), None, &[], None),
             )
             .unwrap();
         let target = source
@@ -136,7 +145,7 @@ mod tests {
                 NodeKind::Internal,
                 NodeDescriptor::new(
                     local_input,
-                    NodeRuntimeData::from_words([1, 0, 0, 0]),
+                    NodeRuntime::from_words([1, 0, 0, 0]),
                     None,
                     &[],
                     None,
@@ -171,27 +180,35 @@ mod tests {
         });
 
         let destination = DataWorkerId::new(1);
-        let mut frame = BufferFrame::with_capacity(33);
+        let mut frame = Frame::<(), u32, ()>::new(0);
         for _ in 0..33 {
             let index = source.alloc_index_with_bytes(&[0x45; 20]).unwrap();
             source
                 .buffer_mut(index)
                 .set_current_config_index(0x1234_5678);
-            frame.push_index(index).unwrap();
+            {
+                let count = frame.len();
+                frame.set_vector_count(count + 1);
+                frame.vector_args_mut()[count] = index;
+            }
         }
-        let index = frame.indices()[0];
+        let index = frame.vector_args()[0];
         let absent = NodeId::new(u32::MAX);
         assert!(matches!(
             source.handoff_index(destination, absent, index),
             Err(RuntimeError::NodeNotRegistered { node }) if node == absent
         ));
         source.handoff_index(destination, target, index).unwrap();
-        frame.discard_prefix(1);
-        let index = frame.indices()[0];
+        let count = frame.len();
+        frame.vector_args_mut().copy_within(1..count, 0);
+        frame.set_vector_count(count - 1);
+        let index = frame.vector_args()[0];
         source.handoff_index(destination, target, index).unwrap();
-        frame.discard_prefix(1);
+        let count = frame.len();
+        frame.vector_args_mut().copy_within(1..count, 0);
+        frame.set_vector_count(count - 1);
 
-        let index = frame.indices()[0];
+        let index = frame.vector_args()[0];
         assert!(matches!(
             source.handoff_index(destination, target, index),
             Err(RuntimeError::DataPlane(
@@ -217,7 +234,11 @@ mod tests {
             source
                 .buffer_mut(index)
                 .set_current_config_index(0x1234_5678);
-            frame.push_index(index).unwrap();
+            {
+                let count = frame.len();
+                frame.set_vector_count(count + 1);
+                frame.vector_args_mut()[count] = index;
+            }
         }
         source
             .handoff_frame(destination, target, &mut frame)

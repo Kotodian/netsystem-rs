@@ -4,14 +4,14 @@ use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::sync::{Arc, OnceLock};
 
 use crate::wire::UdpHeader;
-use hammer_core::data_plane::{BufferFrame, BufferPacketCursor, NodeId};
+use hammer_core::data_plane::{BufferPacketCursor, Frame, NodeId};
 use hammer_infra::bitmap::Bitmap;
 use hammer_infra::checksum::internet_checksum_parts;
 use hammer_infra::sparse_vec::SparseVec;
 use hammer_plugin_ip::protocol::icmp::IcmpErrorMetadata;
 use hammer_runtime::RuntimeResult;
 use hammer_runtime::{
-    DataPlaneMain, GlobalMain, Node, NodeProcessFn, NodeRuntimeData, RuntimeError, TraceFormatter,
+    DataPlaneMain, GlobalMain, Node, NodeProcessFn, NodeRuntime, RuntimeError, TraceFormatter,
     add_packet_trace, format_packet_trace,
 };
 use hammer_service::data_plane::set_index_node_error;
@@ -123,7 +123,7 @@ pub enum UdpIpProtocol {
 
 pub struct UdpInputControlPlane {
     inner: Arc<UdpInputSnapshotCell>,
-    nodes: Option<hammer_runtime::node::NodeRuntime>,
+    nodes: Option<hammer_runtime::node::NodeMain>,
     consumer: Option<NodeId>,
 }
 
@@ -138,7 +138,7 @@ impl UdpInputControlPlane {
     }
 
     #[inline]
-    pub fn with_nodes(mut self, nodes: hammer_runtime::node::NodeRuntime) -> Self {
+    pub fn with_nodes(mut self, nodes: hammer_runtime::node::NodeMain) -> Self {
         self.nodes = Some(nodes);
         self
     }
@@ -208,7 +208,7 @@ impl UdpInputControlPlane {
         version: UdpIpVersion,
         port: u16,
         node: NodeId,
-        nodes: &hammer_runtime::node::NodeRuntime,
+        nodes: &hammer_runtime::node::NodeMain,
         consumer: NodeId,
     ) -> RuntimeResult<u16> {
         let current = self.inner.get();
@@ -562,12 +562,12 @@ impl UdpInputSnapshotHandle {
     }
 }
 
-fn register_udp_input_runtime(snapshot: UdpInputSnapshotHandle) -> NodeRuntimeData {
-    NodeRuntimeData::from_usize(Arc::as_ptr(&snapshot.inner) as usize)
+fn register_udp_input_runtime(snapshot: UdpInputSnapshotHandle) -> NodeRuntime {
+    NodeRuntime::from_usize(Arc::as_ptr(&snapshot.inner) as usize)
         .expect("UDP input snapshot pointer must fit runtime data")
 }
 
-fn udp_input_runtime(data: NodeRuntimeData) -> RuntimeResult<&'static UdpInputSnapshotCell> {
+fn udp_input_runtime(data: NodeRuntime) -> RuntimeResult<&'static UdpInputSnapshotCell> {
     let pointer = data.usize_word(0)? as *const UdpInputSnapshotCell;
     if pointer.is_null() {
         return Err(UdpControlError::RuntimeSlotInvalid { slot: 0 }.into());
@@ -579,14 +579,18 @@ fn udp_input_runtime(data: NodeRuntimeData) -> RuntimeResult<&'static UdpInputSn
 
 fn udp_input_process(
     runtime: &mut DataPlaneMain,
-    data: NodeRuntimeData,
-    frame: &mut BufferFrame,
-) -> () {
-    let snapshot = match udp_input_runtime(data) {
-        Ok(state) => state.get(),
-        Err(_) => return (),
-    };
-    udp_input_process_frame(runtime, frame, snapshot)
+    data: &mut NodeRuntime,
+    frame: &mut Frame,
+) -> usize {
+    let processed_vectors = frame.len();
+    (|| {
+        let snapshot = match udp_input_runtime(*data) {
+            Ok(state) => state.get(),
+            Err(_) => return (),
+        };
+        udp_input_process_frame(runtime, frame, snapshot)
+    })();
+    processed_vectors
 }
 
 #[hammer_component_macros::graph_node(
@@ -598,7 +602,7 @@ fn udp_input_process(
 )]
 pub struct UdpInputNode {
     #[node(default = register_udp_input_runtime(snapshot.clone()))]
-    runtime_data: NodeRuntimeData,
+    runtime_data: NodeRuntime,
     snapshot: UdpInputSnapshotHandle,
 }
 
@@ -620,9 +624,13 @@ fn register_udp_input(runtime: &DataPlaneMain) -> RuntimeResult<NodeId> {
 
 impl Node for UdpInputNode {
     #[inline(always)]
-    fn process(&mut self, runtime: &mut DataPlaneMain, frame: &mut BufferFrame) -> () {
-        let snapshot = self.snapshot.load();
-        udp_input_process_frame(runtime, frame, &snapshot)
+    fn process(
+        runtime: &mut DataPlaneMain,
+        node_runtime: &mut hammer_runtime::NodeRuntime,
+        frame: &mut Frame,
+    ) -> usize {
+        let process: NodeProcessFn = udp_input_process;
+        process(runtime, node_runtime, frame)
     }
 
     #[inline]
@@ -631,12 +639,7 @@ impl Node for UdpInputNode {
     }
 
     #[inline]
-    fn node_process(&self) -> NodeProcessFn {
-        udp_input_process
-    }
-
-    #[inline]
-    fn node_runtime_data(&self) -> RuntimeResult<NodeRuntimeData> {
+    fn node_runtime_data(&self) -> RuntimeResult<NodeRuntime> {
         Ok(self.runtime_data)
     }
 }
@@ -644,27 +647,27 @@ impl Node for UdpInputNode {
 #[inline(always)]
 fn udp_input_process_frame(
     runtime: &mut DataPlaneMain,
-    frame: &mut BufferFrame,
+    frame: &mut Frame,
     snapshot: &UdpInputSnapshot,
 ) -> () {
     let drop_slot = UdpInputNext::Drop.slot() as u16;
-    let width = runtime.preferred_frame_batch_width();
-    let mut nexts = Vec::with_capacity(frame.len());
-    let _ = frame.rewrite_indices_batched(width, |index| {
-        match next_slot_for_index(runtime, index, snapshot) {
-            Ok(Some(slot)) => {
-                nexts.push(slot);
-                Ok(Some(index))
-            }
-            Ok(None) => Ok(None),
-            Err(_) => {
-                nexts.push(drop_slot);
-                Ok(Some(index))
-            }
-        }
-    });
-    if !nexts.is_empty() {
-        runtime.enqueue_to_next(frame, nexts.as_slice());
+    let mut output = Frame::<(), u32, ()>::new(0);
+    let mut nexts = [0u16; hammer_core::graph::frame::FRAME_VECTOR_CAPACITY];
+    for &index in frame.vector_args() {
+        let next = next_slot_for_index(runtime, index, snapshot);
+        let slot = match next {
+            Ok(Some(slot)) => slot,
+            Ok(None) => continue,
+            Err(_) => drop_slot,
+        };
+        let count = output.len();
+        output.set_vector_count(count + 1);
+        output.vector_args_mut()[count] = index;
+        nexts[count] = slot;
+    }
+    let count = output.len();
+    if count != 0 {
+        runtime.enqueue_to_next(&mut output, &nexts[..count]);
     }
     ()
 }

@@ -1,9 +1,9 @@
 use crate::{TCP_FLAG_FIN, TCP_FLAG_SYN, tcp_header};
 use core::hash::Hasher;
-use hammer_core::data_plane::{BufferFrame, BufferPacketCursor, NodeId, NodeState};
+use hammer_core::data_plane::{BufferPacketCursor, Frame, NodeId, NodeState};
 use hammer_infra::checksum::InternetChecksum;
 use hammer_runtime::RuntimeResult;
-use hammer_runtime::{DataPlaneMain, Node, NodeProcessFn, NodeRuntimeData};
+use hammer_runtime::{DataPlaneMain, Node, NodeProcessFn, NodeRuntime};
 use hammer_service::session::node::SessionQueueNode;
 
 use super::{TcpOutputError, read_tcp_egress_endpoints};
@@ -51,41 +51,45 @@ pub fn register_tcp_output(runtime: &DataPlaneMain) -> RuntimeResult<NodeId> {
 
 impl Node for TcpOutputNode {
     #[inline(always)]
-    fn process(&mut self, runtime: &mut DataPlaneMain, frame: &mut BufferFrame) -> () {
-        tcp_output_node_process_frame::<1>(runtime, frame)
+    fn process(
+        runtime: &mut DataPlaneMain,
+        node_runtime: &mut hammer_runtime::NodeRuntime,
+        frame: &mut Frame,
+    ) -> usize {
+        let process: NodeProcessFn = tcp_output_node_process;
+        process(runtime, node_runtime, frame)
     }
 
     #[inline]
-    fn node_process(&self) -> NodeProcessFn {
-        tcp_output_node_process
-    }
-
-    #[inline]
-    fn node_runtime_data(&self) -> RuntimeResult<NodeRuntimeData> {
-        Ok(NodeRuntimeData::default())
+    fn node_runtime_data(&self) -> RuntimeResult<NodeRuntime> {
+        Ok(NodeRuntime::default())
     }
 }
 
 fn tcp_output_node_process(
     runtime: &mut DataPlaneMain,
-    _: NodeRuntimeData,
-    frame: &mut BufferFrame,
-) -> () {
-    tcp_output_node_process_frame::<1>(runtime, frame)
+    _: &mut NodeRuntime,
+    frame: &mut Frame,
+) -> usize {
+    let processed_vectors = frame.len();
+    tcp_output_node_process_frame::<1>(runtime, frame);
+    processed_vectors
 }
 
 #[hammer_component_macros::node_function(node = TcpOutputNode)]
 fn tcp_output_node_process_simd<const SIMD_BYTES: usize>(
     runtime: &mut DataPlaneMain,
-    _: NodeRuntimeData,
-    frame: &mut BufferFrame,
-) -> () {
-    tcp_output_node_process_frame::<SIMD_BYTES>(runtime, frame)
+    _: &mut NodeRuntime,
+    frame: &mut Frame,
+) -> usize {
+    let processed_vectors = frame.len();
+    tcp_output_node_process_frame::<SIMD_BYTES>(runtime, frame);
+    processed_vectors
 }
 
 fn tcp_output_node_process_frame<const SIMD_BYTES: usize>(
     runtime: &mut DataPlaneMain,
-    frame: &mut BufferFrame,
+    frame: &mut Frame,
 ) -> () {
     hammer_runtime::process_frame!(runtime, frame, |index| {
         tcp_output_next_for_index::<SIMD_BYTES>(runtime, index).unwrap_or(TcpOutputNext::Drop)

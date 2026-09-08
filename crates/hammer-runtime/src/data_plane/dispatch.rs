@@ -20,6 +20,7 @@ impl DataPlaneMain {
             .iter()
             .filter(|entry| matches!(entry.registration, Some(NodeRegistration::Sibling { .. })));
         let mut nodes = Vec::with_capacity(entries.len());
+        let mut processes = Vec::with_capacity(entries.len());
         for entry in owners.chain(siblings) {
             let node =
                 (entry.init)(self).map_err(|source| RuntimeError::GraphNodeInitialization {
@@ -30,12 +31,13 @@ impl DataPlaneMain {
                     source: Box::new(source),
                 })?;
             nodes.push((node, entry.error_counters));
+            processes.push(entry.process);
         }
         self.nodes.validate_node_error_batch(&nodes)?;
-        for (node, error_counters) in nodes {
+        for ((node, error_counters), process) in nodes.into_iter().zip(processes) {
             self.nodes.materialize_node_errors(node, error_counters)?;
             self.nodes
-                .install_node_function(node, self.simd_bytes, node_functions)?;
+                .install_node_function(node, self.simd_bytes, node_functions, process)?;
         }
         self.nodes.resolve_named_next_nodes()
     }
@@ -46,6 +48,7 @@ impl DataPlaneMain {
         node_functions: &[NodeFunctionRegistration],
     ) -> RuntimeResult<()> {
         let mut nodes = Vec::with_capacity(entries.len());
+        let mut processes = Vec::with_capacity(entries.len());
         for register_siblings in [false, true] {
             for entry in entries {
                 let is_sibling =
@@ -62,13 +65,14 @@ impl DataPlaneMain {
                 }
                 let node = (entry.init)(self)?;
                 nodes.push((node, entry.error_counters));
+                processes.push(entry.process);
             }
         }
         self.nodes.validate_node_error_batch(&nodes)?;
-        for (node, error_counters) in nodes {
+        for ((node, error_counters), process) in nodes.into_iter().zip(processes) {
             self.nodes.materialize_node_errors(node, error_counters)?;
             self.nodes
-                .install_node_function(node, self.simd_bytes, node_functions)?;
+                .install_node_function(node, self.simd_bytes, node_functions, process)?;
         }
         self.nodes.resolve_named_next_nodes()?;
         Ok(())

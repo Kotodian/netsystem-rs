@@ -6,13 +6,13 @@
 
 use criterion::{BenchmarkId, Criterion, criterion_group, criterion_main};
 use hammer_core::data_plane::{
-    BufferFrame, DEFAULT_BUFFER_FRAME_CAPACITY, Frame, Next, NodeId, NodeKind, NodeRegistration,
+    DEFAULT_BUFFER_FRAME_CAPACITY, Frame, Next, NodeId, NodeKind, NodeRegistration,
 };
 use hammer_infra::mask_compare::{
     mask_compare_u16_arch, mask_compare_u16_scalar, mask_compare_u16_words,
 };
 use hammer_runtime::RuntimeResult;
-use hammer_runtime::node::{NodeDescriptor, NodeRuntimeData};
+use hammer_runtime::node::{NodeDescriptor, NodeRuntime};
 use hammer_runtime::{DataPlaneBufferConfig, DataPlaneMain};
 
 fn test_runtime(frame_slots: usize, buffer_slots: usize) -> DataPlaneMain {
@@ -33,8 +33,8 @@ fn register_sink(runtime: &DataPlaneMain, name: &'static str) -> RuntimeResult<N
     runtime.nodes().try_register_descriptor(
         NodeKind::Internal,
         NodeDescriptor::new(
-            |_, _, _: &mut BufferFrame| (),
-            NodeRuntimeData::empty(),
+            |_, _, frame: &mut Frame| frame.len(),
+            NodeRuntime::empty(),
             Some(NodeRegistration::next(name, 0)),
             &[],
             None,
@@ -46,8 +46,8 @@ fn register_owner(runtime: &DataPlaneMain, nexts: &[NodeId]) -> RuntimeResult<No
     runtime.nodes().try_register_descriptor(
         NodeKind::Internal,
         NodeDescriptor::new(
-            |_, _, _| (),
-            NodeRuntimeData::empty(),
+            |_, _, frame| frame.len(),
+            NodeRuntime::empty(),
             Some(NodeRegistration::next("fanout-owner", nexts.len())),
             nexts,
             None,
@@ -58,7 +58,7 @@ fn register_owner(runtime: &DataPlaneMain, nexts: &[NodeId]) -> RuntimeResult<No
 struct FanoutFixture {
     runtime: DataPlaneMain,
     owner: NodeId,
-    frame: Frame<Next>,
+    frame: hammer_core::buffer::checked_out::Frame<Next>,
     nexts: [u16; DEFAULT_BUFFER_FRAME_CAPACITY],
 }
 
@@ -71,12 +71,22 @@ fn build_fixture(pattern: FanoutPattern) -> FanoutFixture {
         register_sink(&runtime, "s3").expect("s3"),
     ];
     let owner = register_owner(&runtime, &sinks).expect("owner");
-    let mut frame = runtime.buffers().get_next_frame(owner).expect("frame");
+    let mut frame = runtime
+        .buffers()
+        .get_next_frame(
+            owner,
+            runtime.nodes().frame_args_size(owner).expect("node layout"),
+        )
+        .expect("frame");
     for offset in 0..DEFAULT_BUFFER_FRAME_CAPACITY {
         let index = runtime
             .alloc_index_with_bytes(&[(offset % 256) as u8])
             .expect("alloc");
-        frame.push_index(index).expect("push");
+        {
+            let count = frame.len();
+            frame.set_vector_count(count + 1);
+            frame.vector_args_mut()[count] = index;
+        }
     }
     let mut nexts = [0u16; DEFAULT_BUFFER_FRAME_CAPACITY];
     match pattern {
@@ -101,13 +111,20 @@ fn build_fixture(pattern: FanoutPattern) -> FanoutFixture {
 
     let mut frame = runtime
         .buffers()
-        .get_next_frame(owner)
+        .get_next_frame(
+            owner,
+            runtime.nodes().frame_args_size(owner).expect("node layout"),
+        )
         .expect("measured frame");
     for offset in 0..DEFAULT_BUFFER_FRAME_CAPACITY {
         let index = runtime
             .alloc_index_with_bytes(&[(offset % 256) as u8])
             .expect("alloc");
-        frame.push_index(index).expect("push");
+        {
+            let count = frame.len();
+            frame.set_vector_count(count + 1);
+            frame.vector_args_mut()[count] = index;
+        }
     }
 
     FanoutFixture {

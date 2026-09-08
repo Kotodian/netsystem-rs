@@ -1,8 +1,8 @@
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 
-use hammer_core::data_plane::{BufferFrame, BufferPacketCursor, NodeId, NodeState};
+use hammer_core::data_plane::{BufferPacketCursor, Frame, NodeId, NodeState};
 use hammer_infra::checksum::internet_checksum_parts;
-use hammer_runtime::{DataPlaneMain, Node, NodeProcessFn, NodeRuntimeData, RuntimeResult};
+use hammer_runtime::{DataPlaneMain, Node, NodeProcessFn, NodeRuntime, RuntimeResult};
 use hammer_service::opaque::NetworkOpaque;
 use hammer_service::session::node::SessionQueueNode;
 
@@ -119,30 +119,32 @@ pub fn register_udp_output(runtime: &DataPlaneMain) -> RuntimeResult<NodeId> {
 
 impl Node for UdpOutputNode {
     #[inline(always)]
-    fn process(&mut self, runtime: &mut DataPlaneMain, frame: &mut BufferFrame) -> () {
-        udp_output_process_frame(runtime, frame)
+    fn process(
+        runtime: &mut DataPlaneMain,
+        node_runtime: &mut hammer_runtime::NodeRuntime,
+        frame: &mut Frame,
+    ) -> usize {
+        let process: NodeProcessFn = udp_output_process;
+        process(runtime, node_runtime, frame)
     }
 
     #[inline]
-    fn node_process(&self) -> NodeProcessFn {
-        udp_output_process
-    }
-
-    #[inline]
-    fn node_runtime_data(&self) -> RuntimeResult<NodeRuntimeData> {
-        Ok(NodeRuntimeData::default())
+    fn node_runtime_data(&self) -> RuntimeResult<NodeRuntime> {
+        Ok(NodeRuntime::default())
     }
 }
 
 fn udp_output_process(
     runtime: &mut DataPlaneMain,
-    _: NodeRuntimeData,
-    frame: &mut BufferFrame,
-) -> () {
-    udp_output_process_frame(runtime, frame)
+    _: &mut NodeRuntime,
+    frame: &mut Frame,
+) -> usize {
+    let processed_vectors = frame.len();
+    udp_output_process_frame(runtime, frame);
+    processed_vectors
 }
 
-fn udp_output_process_frame(runtime: &mut DataPlaneMain, frame: &mut BufferFrame) -> () {
+fn udp_output_process_frame(runtime: &mut DataPlaneMain, frame: &mut Frame) -> () {
     hammer_runtime::process_frame!(runtime, frame, |index| {
         udp_output_next_for_index(runtime, index).unwrap_or(UdpOutputNext::Drop)
     })
