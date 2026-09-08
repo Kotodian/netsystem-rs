@@ -51,7 +51,6 @@ pub struct DataPlaneMain {
     publication: Arc<WorkerPublication>,
     workers_updating_graph: Arc<AtomicU32>,
     worker_config: Worker,
-    worker_exit_functions: Vec<fn(&mut DataPlaneMain) -> RuntimeResult<()>>,
     called_worker_init_functions: HashSet<&'static str>,
     main_loop_count: AtomicU32,
     worker_control_queues: Arc<[DataRemoteLocalQueue]>,

@@ -37,7 +37,6 @@ impl DataPlaneMain {
             publication: std::sync::Arc::new(crate::global_main::WorkerPublication::new()),
             workers_updating_graph: std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0)),
             worker_config: Worker::default(),
-            worker_exit_functions: Vec::new(),
             called_worker_init_functions: std::collections::HashSet::new(),
             main_loop_count: std::sync::atomic::AtomicU32::new(0),
             worker_control_queues: std::sync::Arc::from([]),

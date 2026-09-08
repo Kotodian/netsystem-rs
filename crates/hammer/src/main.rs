@@ -230,15 +230,16 @@ fn run(config: String, roots: Vec<String>, worker: Worker) {
         tracing::error!(%error, "main control dispatch failed");
     }
 
-    // `close` first drops the top-level control dispatcher and its registered
-    // listener, unlinks the stats path, then stops and joins Data Workers.
+    // vlib/main.c holds the final Worker Barrier while running main-loop
+    // exit hooks. Process exit leaves Worker-owned packet state untouched.
     engine
         .close()
         .unwrap_or_else(|error| tracing::error!(%error, "Main-loop exit hook failed"));
-    engine
-        .shutdown_process_nodes()
-        .unwrap_or_else(|error| tracing::error!(%error, "Process Node shutdown failed"));
-    GlobalMain::uninstall_current();
+    let exit_status = *engine
+        .main_loop_exit_status
+        .lock()
+        .expect("main-loop exit status mutex poisoned");
+    std::process::exit(exit_status);
 }
 
 fn read_config(path: &Path) -> std::io::Result<String> {

@@ -744,54 +744,6 @@ impl UdpWorker {
         }
     }
 
-    fn drop_migration_datagram(runtime: &DataPlaneMain, dgram: SessionDgramArgs) {
-        runtime
-            .buffers()
-            .drop_index_owned_with_trace(dgram.index, |_| {});
-    }
-
-    fn drain_migration_shutdown_requests(
-        &mut self,
-        sessions: &SessionWorker,
-        runtime: &DataPlaneMain,
-    ) {
-        while let Some(args) = sessions.pop_session_migrate_request() {
-            let _ = sessions.cancel_thread_migration(args.old_sh, args.tuple);
-            Self::drop_migration_datagram(runtime, args.dgram);
-        }
-    }
-
-    fn drain_migration_shutdown_replies(
-        &mut self,
-        sessions: &SessionWorker,
-        runtime: &DataPlaneMain,
-    ) {
-        while let Some(reply) = self.session_switch_pool_replies.pop_front() {
-            let _ = sessions.cancel_thread_migration(reply.old_sh, reply.tuple);
-            Self::drop_migration_datagram(runtime, reply.dgram);
-        }
-        while let Some(reply) = sessions.pop_session_switch_pool_reply() {
-            let _ = sessions.cancel_thread_migration(reply.old_sh, reply.tuple);
-            Self::drop_migration_datagram(runtime, reply.dgram);
-        }
-    }
-
-    fn drain_migration_shutdown(&mut self, sessions: &mut SessionWorker, runtime: &DataPlaneMain) {
-        sessions.wait_session_migration_shutdown_phase();
-        self.drain_migration_shutdown_requests(sessions, runtime);
-        self.drain_migration_shutdown_replies(sessions, runtime);
-        self.drain_migration_completions(sessions, runtime);
-
-        sessions.wait_session_migration_shutdown_phase();
-        self.drain_migration_closed(sessions, runtime);
-
-        sessions.wait_session_migration_shutdown_phase();
-        self.drain_migration_closed(sessions, runtime);
-
-        sessions.wait_session_migration_shutdown_phase();
-        self.drain_migration_closed(sessions, runtime);
-    }
-
     fn drain_migration_completions(
         &mut self,
         sessions: &mut SessionWorker,
@@ -1046,18 +998,7 @@ fn init_udp_worker(engine: &mut DataPlaneMain) -> RuntimeResult<()> {
         .get()
         .ok_or(RuntimeError::PluginStateNotInitialized { plugin: "udp" })?;
     bind_worker_graph(engine)?;
-    engine.register_worker_exit_function(udp_worker_exit);
     Ok(())
-}
-
-fn udp_worker_exit(engine: &mut DataPlaneMain) -> RuntimeResult<()> {
-    let main = UDP_MAIN
-        .get()
-        .ok_or(RuntimeError::PluginStateNotInitialized { plugin: "udp" })?;
-    main.with_worker(engine.thread_index(), |sessions, udp| {
-        udp.drain_migration_shutdown(sessions, engine);
-        Ok(())
-    })
 }
 
 fn udp_session_queue_update_time(

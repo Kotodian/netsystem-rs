@@ -219,23 +219,6 @@ pub fn run_worker_init_functions(
     result
 }
 
-pub fn run_worker_exit_functions(main: &mut DataPlaneMain) -> RuntimeResult<()> {
-    let functions = main.take_worker_exit_functions();
-    let mut first_error = None;
-    for function in functions {
-        match catch_unwind(AssertUnwindSafe(|| function(main))) {
-            Ok(Ok(())) => {}
-            Ok(Err(error)) => {
-                if first_error.is_none() {
-                    first_error = Some(error);
-                }
-            }
-            Err(payload) => std::panic::resume_unwind(payload),
-        }
-    }
-    first_error.map_or(Ok(()), Err)
-}
-
 pub fn run_main_loop_enter(engine: &mut GlobalMain) -> RuntimeResult<()> {
     let functions = engine.plugin_main().main_loop_enter_functions();
     let mut called = std::mem::take(&mut engine.called_main_loop_enter_functions);

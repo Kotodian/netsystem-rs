@@ -74,20 +74,6 @@ impl DataPlaneMain {
             .poll_for_worker(self.thread_index(), self.nodes())
     }
 
-    #[inline]
-    pub fn register_worker_exit_function(
-        &mut self,
-        function: fn(&mut DataPlaneMain) -> RuntimeResult<()>,
-    ) {
-        self.worker_exit_functions.push(function);
-    }
-
-    pub(crate) fn take_worker_exit_functions(
-        &mut self,
-    ) -> Vec<fn(&mut DataPlaneMain) -> RuntimeResult<()>> {
-        std::mem::take(&mut self.worker_exit_functions)
-    }
-
     pub(crate) fn take_called_worker_init_functions(&mut self) -> HashSet<&'static str> {
         std::mem::take(&mut self.called_worker_init_functions)
     }

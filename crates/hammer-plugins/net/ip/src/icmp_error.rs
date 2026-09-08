@@ -189,24 +189,6 @@ fn init_worker(runtime: &mut DataPlaneMain) -> RuntimeResult<()> {
             .is_ok(),
         "IPv6 ICMP throttle already installed for worker {worker}"
     );
-    runtime.register_worker_exit_function(exit_worker);
-    Ok(())
-}
-
-fn exit_worker(runtime: &mut DataPlaneMain) -> RuntimeResult<()> {
-    let worker = runtime.thread_index() as usize;
-    IP4_MAIN
-        .get()
-        .expect("IP initialized before worker exit")
-        .icmp_throttle[worker]
-        .clear()
-        .expect("IPv4 ICMP throttle released on its owner worker");
-    IP6_MAIN
-        .get()
-        .expect("IP initialized before worker exit")
-        .icmp_throttle[worker]
-        .clear()
-        .expect("IPv6 ICMP throttle released on its owner worker");
     Ok(())
 }
 

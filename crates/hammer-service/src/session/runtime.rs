@@ -1,11 +1,10 @@
 use std::cell::UnsafeCell;
 use std::collections::VecDeque;
-use std::hint::spin_loop;
 use std::net::SocketAddr;
 use std::num::NonZeroU32;
 use std::ops::Deref;
 use std::os::fd::BorrowedFd;
-use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
 
@@ -203,8 +202,6 @@ struct SessionMigrateQueues {
     session_switch_pool_completions: Box<[ArrayQueue<SessionSwitchPoolCompletion>]>,
     session_switch_pool_closed: Box<[ArrayQueue<SessionSwitchPoolClosed>]>,
     session_migration_shutdown: AtomicBool,
-    session_migration_shutdown_workers: AtomicU32,
-    session_migration_shutdown_phase: AtomicU32,
 }
 
 impl SessionMigrateQueues {
@@ -223,8 +220,6 @@ impl SessionMigrateQueues {
                 .map(|_| ArrayQueue::new(DEFAULT_SESSION_MIGRATE_QUEUE_CAPACITY))
                 .collect(),
             session_migration_shutdown: AtomicBool::new(false),
-            session_migration_shutdown_workers: AtomicU32::new(0),
-            session_migration_shutdown_phase: AtomicU32::new(0),
         }
     }
 
@@ -645,35 +640,6 @@ impl SessionMain {
         session_migrate_queues(self.workers.len())
             .session_migration_shutdown
             .load(Ordering::Acquire)
-    }
-
-    pub fn wait_session_migration_shutdown_phase(&self) {
-        let worker_count = self.workers.len() as u32;
-        if worker_count == 0 {
-            return;
-        }
-        let queues = session_migrate_queues(self.workers.len());
-        let phase = queues
-            .session_migration_shutdown_phase
-            .load(Ordering::Acquire);
-        let expected = phase.saturating_add(1).saturating_mul(worker_count);
-        let arrived = queues
-            .session_migration_shutdown_workers
-            .fetch_add(1, Ordering::AcqRel)
-            .saturating_add(1);
-        if arrived == expected {
-            queues
-                .session_migration_shutdown_phase
-                .store(phase.saturating_add(1), Ordering::Release);
-            return;
-        }
-        while queues
-            .session_migration_shutdown_phase
-            .load(Ordering::Acquire)
-            <= phase
-        {
-            spin_loop();
-        }
     }
 
     pub(crate) fn add_connection(
@@ -2925,37 +2891,6 @@ impl SessionWorker {
     pub fn pop_session_switch_pool_closed(&self) -> Option<SessionSwitchPoolClosed> {
         self.migration_queues
             .pop_session_switch_pool_closed(self.worker)
-    }
-
-    pub fn wait_session_migration_shutdown_phase(&self) {
-        let worker_count = self.worker_count as u32;
-        if worker_count == 0 {
-            return;
-        }
-        let phase = self
-            .migration_queues
-            .session_migration_shutdown_phase
-            .load(Ordering::Acquire);
-        let expected = phase.saturating_add(1).saturating_mul(worker_count);
-        let arrived = self
-            .migration_queues
-            .session_migration_shutdown_workers
-            .fetch_add(1, Ordering::AcqRel)
-            .saturating_add(1);
-        if arrived == expected {
-            self.migration_queues
-                .session_migration_shutdown_phase
-                .store(phase.saturating_add(1), Ordering::Release);
-            return;
-        }
-        while self
-            .migration_queues
-            .session_migration_shutdown_phase
-            .load(Ordering::Acquire)
-            <= phase
-        {
-            spin_loop();
-        }
     }
 
     pub fn insert_session_endpoint(
