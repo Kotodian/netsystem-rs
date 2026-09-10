@@ -13,13 +13,12 @@
 //! connection context index and worker (http3.c:35-48).
 //!
 //! `HttpMain` owns one `HttpWorker` per data worker in a
-//! A cache-line-isolated concrete worker slot, mirroring `QuicMain.workers`
+//! cache-line-isolated concrete worker slot, mirroring `QuicMain.workers`
 //! (quic listener.rs:58) and VPP's `http_main.wrk`, a fixed array sized by
 //! thread count and indexed per thread by `http_worker_get` (http.c:1073,
-//! http_private.h:1275-1278). Each worker installs itself once via the
-//! `http_worker_init` worker init function, ordered after session/QUIC
-//! worker init; `install_worker`/`with_worker` are O(1) slot lookups with
-//! typed out-of-range, not-installed, and wrong-thread errors.
+//! http_private.h:1275-1278). The complete array is constructed before data
+//! workers start; direct current-worker lookup is O(1) with a typed
+//! out-of-range error.
 //!
 //! Stream contexts live in a second, independent generation-checked pool on
 //! the same worker, mirroring VPP `http_ts_accept_stream` (http.c:675-721):
@@ -35,7 +34,6 @@
 
 use hammer_infra::fifo::{Fifo, FifoError};
 use hammer_infra::pool::Pool;
-use hammer_infra::thread_owned::ThreadOwnedError;
 use hammer_runtime::DataWorkerId;
 use hammer_runtime::error::RuntimeError;
 use hammer_runtime::session::SessionStreamDirection;
@@ -480,14 +478,6 @@ pub(crate) enum HttpWorkerError {
     ControlStreamOpenFailed { context: u32 },
     #[error("http worker {worker} is outside the configured worker range")]
     WorkerOutOfRange { worker: usize },
-    #[error("http worker {worker} is already installed")]
-    WorkerAlreadyInstalled { worker: usize },
-    #[error("http worker {worker} cannot be accessed")]
-    WorkerAccess {
-        worker: usize,
-        #[source]
-        source: ThreadOwnedError,
-    },
 }
 
 /// Identities returned by
@@ -573,9 +563,8 @@ impl RequestReadError {
 /// Owns `ConnectionContext` slots exactly as VPP's `http_worker_t::ctx_pool`
 /// does, plus a separate generation-checked `StreamContext` pool mirroring
 /// VPP `http_ts_accept_stream` (http.c:675-721); callers resolve identities
-/// by `u32`/`u32`, never by raw index. The container
-/// (worker installation/attachment) is deferred until Session App callbacks
-/// need it.
+/// by `u32`/`u32`, never by raw index. Every worker Pool exists before Session
+/// App callbacks begin.
 #[derive(Debug)]
 pub(crate) struct HttpWorker {
     contexts: Pool<ConnectionContext>,
@@ -607,10 +596,9 @@ pub(crate) struct HttpWorker {
 impl HttpWorker {
     /// Constructs the worker for one data worker id.
     ///
-    /// Called once per data worker by the `http_worker_init` worker init
-    /// function (listener.rs), mirroring `QuicWorker::new` (quic
-    /// worker.rs:684).
-    pub(crate) fn new(_worker: DataWorkerId) -> Self {
+    /// Called while `HttpMain` constructs its complete worker array, mirroring
+    /// `QuicWorker::new` (quic worker.rs:684).
+    pub(crate) fn new(_: DataWorkerId) -> Self {
         Self::with_capacity(HTTP_CONTEXT_CAPACITY)
     }
 

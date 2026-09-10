@@ -6,13 +6,13 @@
 //! It does not access a transport, Data-Plane Buffers, or another protocol
 //! layer.
 
+use std::cell::{RefCell, RefMut};
 use std::io::{self, BufRead, Write};
 use std::sync::{Arc, OnceLock};
 
 use hammer_infra::fifo::Fifo;
 use hammer_infra::pool::Pool;
-use hammer_infra::thread_owned::ThreadOwned;
-use hammer_runtime::{DataPlaneMain, DataWorkerId, RuntimeError, RuntimeResult};
+use hammer_runtime::{DataWorkerId, RuntimeError, RuntimeResult};
 use hammer_service::session::protocol::SessionAppVft;
 use hammer_service::session::runtime::SessionWorker;
 use rustls::pki_types::ServerName;
@@ -31,14 +31,6 @@ pub use config::{
 enum Error {
     #[error("TLS worker {worker} is not installed")]
     WorkerMissing { worker: usize },
-    #[error("TLS worker {worker} is already installed")]
-    WorkerAlreadyInstalled { worker: usize },
-    #[error("TLS worker {worker} cannot be accessed")]
-    WorkerAccess {
-        worker: usize,
-        #[source]
-        source: hammer_infra::thread_owned::ThreadOwnedError,
-    },
     #[error("TLS connection context {context:#x} is missing")]
     ConnectionMissing { context: u64 },
     #[error("create TLS client connection")]
@@ -92,7 +84,7 @@ pub struct Connection {
 const TLS_CONNECTION_CAPACITY: usize = 1_024;
 
 struct TlsWorkers {
-    workers: Box<[ThreadOwned<Pool<Connection>>]>,
+    workers: Box<[RefCell<Pool<Connection>>]>,
 }
 
 static TLS_WORKERS: OnceLock<TlsWorkers> = OnceLock::new();
@@ -101,82 +93,26 @@ impl TlsWorkers {
     fn new(worker_count: usize) -> Self {
         Self {
             workers: (0..worker_count)
-                .map(|_| ThreadOwned::new())
+                .map(|_| RefCell::new(Pool::with_capacity(TLS_CONNECTION_CAPACITY)))
                 .collect::<Vec<_>>()
                 .into_boxed_slice(),
         }
     }
 
-    fn install(&self, worker: DataWorkerId) -> RuntimeResult<()> {
+    fn worker(&self, worker: DataWorkerId) -> RuntimeResult<RefMut<'_, Pool<Connection>>> {
         let slot = self
             .workers
             .get(worker.slot())
             .ok_or(Error::WorkerMissing {
                 worker: worker.slot(),
             })?;
-        slot.install(Pool::with_capacity(TLS_CONNECTION_CAPACITY))
-            .map_err(|_| {
-                Error::WorkerAlreadyInstalled {
-                    worker: worker.slot(),
-                }
-                .into()
-            })
-    }
-
-    fn insert(&self, worker: DataWorkerId, connection: Connection) -> RuntimeResult<u64> {
-        let slot = self
-            .workers
-            .get(worker.slot())
-            .ok_or(Error::WorkerMissing {
-                worker: worker.slot(),
-            })?;
-        let mut slot = slot.borrow_mut().map_err(|source| Error::WorkerAccess {
-            worker: worker.slot(),
-            source,
-        })?;
-        let context = slot.insert(connection);
-        Ok(context.into())
-    }
-
-    fn with_mut<R>(
-        &self,
-        worker: DataWorkerId,
-        context: u64,
-        operation: impl FnOnce(&mut Connection) -> RuntimeResult<R>,
-    ) -> RuntimeResult<R> {
-        let index = u32::try_from(context).map_err(|_| Error::ConnectionMissing { context })?;
-        let slot = self
-            .workers
-            .get(worker.slot())
-            .ok_or(Error::WorkerMissing {
-                worker: worker.slot(),
-            })?;
-        let mut slot = slot.borrow_mut().map_err(|source| Error::WorkerAccess {
-            worker: worker.slot(),
-            source,
-        })?;
-        let connection = slot
-            .get_mut(index)
-            .ok_or(Error::ConnectionMissing { context })?;
-        operation(connection)
-    }
-
-    fn remove(&self, worker: DataWorkerId, context: u64) -> RuntimeResult<()> {
-        let index = u32::try_from(context).map_err(|_| Error::ConnectionMissing { context })?;
-        let slot = self
-            .workers
-            .get(worker.slot())
-            .ok_or(Error::WorkerMissing {
-                worker: worker.slot(),
-            })?;
-        let mut slot = slot.borrow_mut().map_err(|source| Error::WorkerAccess {
-            worker: worker.slot(),
-            source,
-        })?;
-        slot.remove(index);
-        Ok(())
+        Ok(slot.borrow_mut())
     }
 }
+
+// SAFETY: each Data Worker borrows only the Pool selected by its immutable
+// worker id. No Pool entry is accessed from another worker.
+unsafe impl Sync for TlsWorkers {}
 
 impl Connection {
     /// Creates a client connection from Main Thread-owned configuration.
@@ -322,67 +258,78 @@ fn ensure_connection(worker: &mut SessionWorker, session: u32, context: u64) -> 
         .session_app_endpoint(session)
         .ok_or(Error::ConnectionMissing { context })?;
     let connection = Connection::create(Some(application), None, opaque, server_name)?;
-    let context = tls_workers()?.insert(worker.worker(), connection)?;
+    let context = u64::from(tls_workers()?.worker(worker.worker())?.insert(connection));
     if let Err(error) = worker.set_app_session(session, context) {
-        let _ = tls_workers()?.remove(worker.worker(), context);
+        drop(
+            tls_workers()?
+                .worker(worker.worker())?
+                .remove(context as u32),
+        );
         return Err(error);
     }
     Ok(context)
 }
 
-fn with_connection<R>(
-    worker: &mut SessionWorker,
-    context: u64,
-    operation: impl FnOnce(&mut Connection, &mut SessionWorker) -> RuntimeResult<R>,
-) -> RuntimeResult<R> {
-    let workers = tls_workers()?;
-    let worker_id = worker.worker();
-    workers.with_mut(worker_id, context, |connection| {
-        operation(connection, worker)
-    })
-}
-
 fn accept(worker: &mut SessionWorker, session: u32, context: u64) -> RuntimeResult<()> {
     let context = ensure_connection(worker, session, context)?;
-    with_connection(worker, context, |connection, worker| {
-        connection.accept(worker, session, context)
-    })
+    let index = u32::try_from(context).map_err(|_| Error::ConnectionMissing { context })?;
+    let mut connections = tls_workers()?.worker(worker.worker())?;
+    let connection = connections
+        .get_mut(index)
+        .ok_or(Error::ConnectionMissing { context })?;
+    connection.accept(worker, session, context)
 }
 
 fn connected(worker: &mut SessionWorker, session: u32, context: u64) -> RuntimeResult<()> {
     let context = ensure_connection(worker, session, context)?;
-    with_connection(worker, context, |connection, worker| {
-        connection.connected(worker, session, context)
-    })
+    let index = u32::try_from(context).map_err(|_| Error::ConnectionMissing { context })?;
+    let mut connections = tls_workers()?.worker(worker.worker())?;
+    let connection = connections
+        .get_mut(index)
+        .ok_or(Error::ConnectionMissing { context })?;
+    connection.connected(worker, session, context)
 }
 
 fn builtin_rx(worker: &mut SessionWorker, session: u32, context: u64) -> RuntimeResult<()> {
-    with_connection(worker, context, |connection, worker| {
-        connection.builtin_rx(worker, session, context)
-    })
+    let index = u32::try_from(context).map_err(|_| Error::ConnectionMissing { context })?;
+    let mut connections = tls_workers()?.worker(worker.worker())?;
+    let connection = connections
+        .get_mut(index)
+        .ok_or(Error::ConnectionMissing { context })?;
+    connection.builtin_rx(worker, session, context)
 }
 
 fn builtin_tx(worker: &mut SessionWorker, session: u32, context: u64) -> RuntimeResult<()> {
-    with_connection(worker, context, |connection, worker| {
-        connection.builtin_tx(worker, session, context)
-    })
+    let index = u32::try_from(context).map_err(|_| Error::ConnectionMissing { context })?;
+    let mut connections = tls_workers()?.worker(worker.worker())?;
+    let connection = connections
+        .get_mut(index)
+        .ok_or(Error::ConnectionMissing { context })?;
+    connection.builtin_tx(worker, session, context)
 }
 
 fn disconnect(worker: &mut SessionWorker, session: u32, context: u64) -> RuntimeResult<()> {
-    with_connection(worker, context, |connection, worker| {
-        connection.disconnect(worker, session, context)
-    })
+    let index = u32::try_from(context).map_err(|_| Error::ConnectionMissing { context })?;
+    let mut connections = tls_workers()?.worker(worker.worker())?;
+    let connection = connections
+        .get_mut(index)
+        .ok_or(Error::ConnectionMissing { context })?;
+    connection.disconnect(worker, session, context)
 }
 
 fn transport_closed(worker: &mut SessionWorker, session: u32, context: u64) -> RuntimeResult<()> {
-    with_connection(worker, context, |connection, worker| {
-        connection.transport_closed(worker, session, context)
-    })
+    let index = u32::try_from(context).map_err(|_| Error::ConnectionMissing { context })?;
+    let mut connections = tls_workers()?.worker(worker.worker())?;
+    let connection = connections
+        .get_mut(index)
+        .ok_or(Error::ConnectionMissing { context })?;
+    connection.transport_closed(worker, session, context)
 }
 
 fn cleanup(worker: &mut SessionWorker, session: u32, context: u64) -> RuntimeResult<()> {
     if context != 0 {
-        tls_workers()?.remove(worker.worker(), context)?;
+        let index = u32::try_from(context).map_err(|_| Error::ConnectionMissing { context })?;
+        drop(tls_workers()?.worker(worker.worker())?.remove(index));
         worker.set_app_session(session, 0)?;
     }
     Ok(())
@@ -498,17 +445,6 @@ fn init_tls() -> RuntimeResult<()> {
     Ok(())
 }
 
-#[hammer_component_macros::worker_init_function(
-    name = "tls_worker_init",
-    runs_after = ["session_worker_init"]
-)]
-fn init_tls_worker(engine: &mut DataPlaneMain) -> RuntimeResult<()> {
-    TLS_WORKERS
-        .get()
-        .ok_or(RuntimeError::PluginStateNotInitialized { plugin: "tls" })?
-        .install(engine.data_worker_id()?)
-}
-
 hammer_component_macros::declare_plugin!(
     name = "tls",
     load_after = [],
@@ -516,7 +452,7 @@ hammer_component_macros::declare_plugin!(
     config_functions = [],
     main_loop_enter_functions = [],
     main_loop_exit_functions = [],
-    worker_init_functions = [__INIT_FN_TLS_WORKER_INIT],
+    worker_init_functions = [],
     graph_nodes = [],
     node_functions = [],
     process_nodes = [],

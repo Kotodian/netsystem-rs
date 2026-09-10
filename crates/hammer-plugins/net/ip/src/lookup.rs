@@ -1,9 +1,8 @@
-use std::cell::UnsafeCell;
+use std::cell::{RefCell, UnsafeCell};
 use std::net::{Ipv4Addr, Ipv6Addr};
 use std::sync::OnceLock;
 use std::time::Instant;
 
-use hammer_infra::thread_owned::ThreadOwned;
 use hammer_service::net::throttle::Throttle;
 
 use hammer_core::data_plane::{Frame, NodeId, NodeNext};
@@ -21,7 +20,7 @@ pub struct Ip4Main {
     pub(crate) punt_feature_arc_index: UnsafeCell<u8>,
     pub(crate) drop_feature_arc_index: UnsafeCell<u8>,
     pub(crate) local_next_by_ip_protocol: UnsafeCell<[u16; 256]>,
-    pub(crate) icmp_throttle: Vec<ThreadOwned<Throttle>>,
+    pub(crate) icmp_throttle: Vec<RefCell<Throttle>>,
     pub(crate) clock_origin: Instant,
     unicast_tables: Vec<Ip4FibTable>,
     fib_index_by_sw_if_index: Vec<u32>,
@@ -65,7 +64,7 @@ pub struct Ip6Main {
     pub(crate) punt_feature_arc_index: UnsafeCell<u8>,
     pub(crate) drop_feature_arc_index: UnsafeCell<u8>,
     pub(crate) local_next_by_ip_protocol: UnsafeCell<[u16; 256]>,
-    pub(crate) icmp_throttle: Vec<ThreadOwned<Throttle>>,
+    pub(crate) icmp_throttle: Vec<RefCell<Throttle>>,
     pub(crate) clock_origin: Instant,
     unicast_tables: Vec<Ip6FibTable>,
     fib_index_by_sw_if_index: Vec<u32>,
@@ -130,10 +129,10 @@ fn init_lookup() -> RuntimeResult<()> {
     let mut ip4 = Ip4Main::new();
     let mut ip6 = Ip6Main::new();
     ip4.icmp_throttle = (0..=hammer_runtime::config::worker::worker_count())
-        .map(|_| ThreadOwned::new())
+        .map(|_| RefCell::new(Throttle::new(std::time::Duration::from_micros(10))))
         .collect();
     ip6.icmp_throttle = (0..=hammer_runtime::config::worker::worker_count())
-        .map(|_| ThreadOwned::new())
+        .map(|_| RefCell::new(Throttle::new(std::time::Duration::from_millis(1))))
         .collect();
     assert!(
         IP4_MAIN.set(ip4).is_ok(),

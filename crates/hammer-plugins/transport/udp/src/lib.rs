@@ -47,7 +47,7 @@ pub use input::{
     UdpControlError, UdpInputControlPlane, UdpInputError, UdpInputNext, UdpInputNode, UdpInputTrace,
 };
 pub use output::{UdpOutputNext, UdpOutputNode};
-pub use worker::{UdpWorker, protocol};
+pub use worker::{UdpWorker, connect, protocol};
 
 mod connection;
 pub(crate) mod lookup;

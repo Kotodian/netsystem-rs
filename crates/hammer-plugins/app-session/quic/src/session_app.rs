@@ -19,21 +19,15 @@ enum QuicSessionError {
     ContextOutOfRange { context: u64 },
 }
 
-fn with_quic_worker<R>(
-    worker: &mut SessionWorker,
-    operation: impl FnOnce(&mut crate::worker::QuicWorker) -> RuntimeResult<R>,
-) -> RuntimeResult<R> {
-    QUIC_MAIN
-        .get()
-        .ok_or(RuntimeError::PluginStateNotInitialized { plugin: NAME })?
-        .with_worker(worker.worker(), operation)
-}
-
 fn publish_context(worker: &mut SessionWorker, session: u32, context: u32) -> RuntimeResult<()> {
     if let Err(error) = worker.set_app_session(session, context.into()) {
         // Rollback is best effort and must not replace the primary
         // set_app_session error; QUIC_MAIN may already be gone during teardown.
-        let _ = with_quic_worker(worker, |quic| quic.remove_context(context));
+        if let Some(main) = QUIC_MAIN.get()
+            && let Ok(mut quic) = main.worker(worker.worker())
+        {
+            drop(quic.remove_context(context));
+        }
         return Err(error);
     }
     Ok(())
@@ -55,9 +49,11 @@ fn accept(worker: &mut SessionWorker, session: u32, context: u64) -> RuntimeResu
         .ok_or(RuntimeError::PluginStateNotInitialized { plugin: NAME })?
         .listener_context(listener_id)
         .ok_or_else(|| QuicSessionError::ContextMissing { session })?;
-    let connection = with_quic_worker(worker, |quic| {
-        quic.accept_connection(session, listener_id, &listener)
-    })?;
+    let connection = QUIC_MAIN
+        .get()
+        .ok_or(RuntimeError::PluginStateNotInitialized { plugin: NAME })?
+        .worker(worker.worker())?
+        .accept_connection(session, listener_id, &listener)?;
     publish_context(worker, session, connection)
 }
 
@@ -68,20 +64,24 @@ fn connected(worker: &mut SessionWorker, session: u32, _: u64) -> RuntimeResult<
     let context = opaque.ok_or(QuicSessionError::ContextMissing { session })?;
     let context =
         u32::try_from(context).map_err(|_| QuicSessionError::ContextOutOfRange { context })?;
-    let connection = with_quic_worker(worker, |quic| {
-        quic.connect_connection(context, session, Instant::now())
-    })?;
+    let connection = QUIC_MAIN
+        .get()
+        .ok_or(RuntimeError::PluginStateNotInitialized { plugin: NAME })?
+        .worker(worker.worker())?
+        .connect_connection(context, session, Instant::now())?;
     publish_context(worker, session, connection)?;
     let main = QUIC_MAIN
         .get()
         .ok_or(RuntimeError::PluginStateNotInitialized { plugin: NAME })?;
-    main.with_worker_and_sessions(worker, |sessions, quic| {
-        quic.send_packets(sessions, connection, Instant::now())
-    })
-    .map_err(|error| {
+    let send = main
+        .worker(worker.worker())?
+        .send_packets(worker, connection, Instant::now());
+    send.map_err(|error| {
         // Rollback is best effort and must not replace the primary
         // send_packets error; QUIC_MAIN may already be gone during teardown.
-        let _ = with_quic_worker(worker, |quic| quic.remove_context(connection));
+        if let Ok(mut quic) = main.worker(worker.worker()) {
+            drop(quic.remove_context(connection));
+        }
         let _ = worker.set_app_session(session, 0);
         error
     })
@@ -96,21 +96,16 @@ fn builtin_rx(worker: &mut SessionWorker, session: u32, context: u64) -> Runtime
     let main = QUIC_MAIN
         .get()
         .ok_or(RuntimeError::PluginStateNotInitialized { plugin: NAME })?;
-    let listener =
-        main.with_worker_and_sessions(worker, |_, quic| Ok(quic.listener_context_id(context)))?;
+    let listener = main.worker(worker.worker())?.listener_context_id(context);
     if let Some(listener) = listener
         && main.listener_context(listener).is_none()
     {
-        main.with_worker_and_sessions(worker, |sessions, quic| {
-            quic.remove_context(context)?;
-            sessions.set_app_session(session, 0)?;
-            Ok(())
-        })?;
+        main.worker(worker.worker())?.remove_context(context)?;
+        worker.set_app_session(session, 0)?;
         return Ok(());
     }
-    main.with_worker_and_sessions(worker, |sessions, quic| {
-        quic.process_udp_rx(sessions, session, context, Instant::now())
-    })
+    main.worker(worker.worker())?
+        .process_udp_rx(worker, session, context, Instant::now())
 }
 
 fn builtin_tx(worker: &mut SessionWorker, session: u32, context: u64) -> RuntimeResult<()> {
@@ -122,9 +117,8 @@ fn builtin_tx(worker: &mut SessionWorker, session: u32, context: u64) -> Runtime
     QUIC_MAIN
         .get()
         .ok_or(RuntimeError::PluginStateNotInitialized { plugin: NAME })?
-        .with_worker_and_sessions(worker, |sessions, quic| {
-            quic.send_packets(sessions, context, Instant::now())
-        })
+        .worker(worker.worker())?
+        .send_packets(worker, context, Instant::now())
 }
 
 fn close_lower_connection(
@@ -142,15 +136,16 @@ fn close_lower_connection(
     let main = QUIC_MAIN
         .get()
         .ok_or(RuntimeError::PluginStateNotInitialized { plugin: NAME })?;
-    main.with_worker_and_sessions(worker, |sessions, quic| {
+    let mut quic = main.worker(worker.worker())?;
+    {
         let Some(lower) = quic.lower_session_if_present(context) else {
             return Ok(());
         };
         if lower != session {
             return Err(QuicSessionError::ContextSessionMismatch { context, session }.into());
         }
-        quic.transport_closed(sessions, context)
-    })
+        quic.transport_closed(worker, context)
+    }
 }
 
 pub(crate) const VFT: SessionAppVft = SessionAppVft {

@@ -470,17 +470,17 @@ fn session_or_listener_pending_input_entry(
     remote: SocketAddr,
     flags: TcpInputFlags,
 ) -> RuntimeResult<(Option<(u32, DataWorkerId, TcpInputNext)>, bool)> {
-    crate::TCP_MAIN
+    // SAFETY: packet input executes on the DataPlaneMain's owning runtime thread.
+    let mut worker = crate::TCP_MAIN
         .get()
         .ok_or(RuntimeError::PluginStateNotInitialized { plugin: "tcp" })?
-        .with_worker(runtime.thread_index(), |_, worker| {
-            let (route, listener_pending) = worker.lookup.input_route(
-                local,
-                remote,
-                flags.contains(TcpInputFlags::ACK) && !flags.contains(TcpInputFlags::RST),
-            );
-            Ok((route, listener_pending))
-        })
+        .worker(runtime.thread_index())?;
+    let (route, listener_pending) = worker.lookup.input_route(
+        local,
+        remote,
+        flags.contains(TcpInputFlags::ACK) && !flags.contains(TcpInputFlags::RST),
+    );
+    Ok((route, listener_pending))
 }
 
 #[inline(always)]
@@ -789,10 +789,9 @@ fn prefetch_session_route_for_buffer(
     let Some(main) = crate::TCP_MAIN.get() else {
         return;
     };
-    let _ = main.with_worker(runtime.thread_index(), |_, worker| {
+    if let Ok(worker) = main.worker(runtime.thread_index()) {
         worker.lookup.prefetch_tuple(local, remote);
-        Ok(())
-    });
+    }
 }
 
 #[inline(always)]

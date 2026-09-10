@@ -29,26 +29,20 @@
 //! config registration seam in this slice. `HttpMain` also owns the
 //! per-data-worker HTTP worker
 //! container, mirroring `QuicMain.workers` (quic listener.rs:58) and VPP's
-//! `http_main.wrk` array (http.c:1073); each worker installs itself once
-//! via the `http_worker_init` worker init function ordered after
-//! session/QUIC worker init, exactly as QUIC binds its workers (quic
-//! listener.rs:568-577). `stop_listen` (http.c:1453-1490) is mirrored with
+//! `http_main.wrk` array (http.c:1073); all worker entries exist before
+//! Session App callbacks begin. `stop_listen` (http.c:1453-1490) is mirrored with
 //! the same strict ordering: lower QUIC Session unlisten first (a typed
 //! failure preserves the context), inner Application listener removal
 //! second, outer HTTP context clear last. The HTTP3 engine, FIFO, QPACK,
 //! and Session App lifecycle are later slices.
 
-use std::cell::UnsafeCell;
+use std::cell::{RefCell, RefMut, UnsafeCell};
 use std::collections::HashMap;
-use std::ops::Deref;
 use std::sync::OnceLock;
 
 use hammer_infra::align::CacheLineAlignMark;
-use hammer_infra::thread_owned::ThreadOwned;
 use hammer_runtime::app::SessionHandle;
-use hammer_runtime::{
-    DataPlaneMain, DataWorkerId, RuntimeError, RuntimeResult, SessionListenEndpoint,
-};
+use hammer_runtime::{DataWorkerId, RuntimeError, RuntimeResult, SessionListenEndpoint};
 use hammer_service::session::application_main;
 use hammer_service::session::runtime::session_main;
 use hammer_service::transport::{TransportVft, register_transport};
@@ -167,23 +161,15 @@ unsafe impl Sync for HttpListenerContexts {}
 #[repr(C)]
 struct HttpWorkerSlot {
     cacheline0: CacheLineAlignMark,
-    owner: ThreadOwned<HttpWorker>,
+    worker: RefCell<HttpWorker>,
 }
 
 impl HttpWorkerSlot {
-    fn new() -> Self {
+    fn new(worker: HttpWorker) -> Self {
         Self {
             cacheline0: CacheLineAlignMark,
-            owner: ThreadOwned::new(),
+            worker: RefCell::new(worker),
         }
-    }
-}
-
-impl Deref for HttpWorkerSlot {
-    type Target = ThreadOwned<HttpWorker>;
-
-    fn deref(&self) -> &Self::Target {
-        &self.owner
     }
 }
 
@@ -192,10 +178,15 @@ pub struct HttpMain {
     session_app: u32,
     inner_application: u32,
     contexts: HttpListenerContexts,
-    /// One cache-line-aligned, thread-owned `HttpWorker` per configured data
+    /// One cache-line-aligned `HttpWorker` per configured data
     /// worker, mirroring `QuicMain.workers` (quic listener.rs:58).
     workers: Box<[HttpWorkerSlot]>,
 }
+
+// SAFETY: every worker RefCell is permanently assigned to one Data Worker and
+// Session callbacks borrow only the slot matching that worker's immutable id.
+// Listener context publication is independently guarded by WorkerBarrier.
+unsafe impl Sync for HttpMain {}
 
 impl HttpMain {
     /// Session-layer transport identity for HTTP.
@@ -211,7 +202,9 @@ impl HttpMain {
             inner_application,
             contexts: HttpListenerContexts::new(),
             workers: (0..worker_count)
-                .map(|_| HttpWorkerSlot::new())
+                .map(|worker| {
+                    HttpWorkerSlot::new(HttpWorker::new(DataWorkerId::new(worker as u32)))
+                })
                 .collect::<Vec<_>>()
                 .into_boxed_slice(),
         }
@@ -353,49 +346,13 @@ impl HttpMain {
         Ok(())
     }
 
-    /// Installs the data worker's `HttpWorker` once, bound to the current
-    /// thread.
-    ///
-    /// O(1). The slot is addressed by the exact `DataWorkerId`; out-of-range
-    /// ids and duplicate or cross-thread installs are typed errors. Mirrors
-    /// `QuicMain::install_worker` (quic listener.rs:234-246).
-    pub(crate) fn install_worker(&self, worker: DataWorkerId) -> RuntimeResult<()> {
-        let slot =
-            self.workers
-                .get(worker.slot())
-                .ok_or_else(|| HttpWorkerError::WorkerOutOfRange {
-                    worker: worker.slot(),
-                })?;
-        slot.install(HttpWorker::new(worker)).map_err(|_| {
-            RuntimeError::from(HttpWorkerError::WorkerAlreadyInstalled {
-                worker: worker.slot(),
-            })
-        })
-    }
-
-    /// Runs `operation` on the exact data worker's installed `HttpWorker`.
-    ///
-    /// O(1). Out-of-range ids fail with `WorkerOutOfRange`; access from any
-    /// thread other than the installing one, or before install, fails with
-    /// `WorkerAccess`. Mirrors `QuicMain::with_worker` (quic
-    /// listener.rs:248-264).
-    pub(crate) fn with_worker<R>(
-        &self,
-        worker: DataWorkerId,
-        operation: impl FnOnce(&mut HttpWorker) -> RuntimeResult<R>,
-    ) -> RuntimeResult<R> {
+    pub(crate) fn worker(&self, worker: DataWorkerId) -> RuntimeResult<RefMut<'_, HttpWorker>> {
         let slot = self.workers.get(worker.slot()).ok_or_else(|| {
             RuntimeError::from(HttpWorkerError::WorkerOutOfRange {
                 worker: worker.slot(),
             })
         })?;
-        let mut slot = slot.borrow_mut().map_err(|source| {
-            RuntimeError::from(HttpWorkerError::WorkerAccess {
-                worker: worker.slot(),
-                source,
-            })
-        })?;
-        operation(&mut slot)
+        Ok(slot.worker.borrow_mut())
     }
 }
 
@@ -460,7 +417,6 @@ fn init_http_transport() -> RuntimeResult<()> {
         HTTP_MAIN.get().is_none(),
         "HTTP initialization callback executes once"
     );
-    let quic_protocol = hammer_plugin_quic::protocol()?;
     let inner_application = application_main().attach().map_err(RuntimeError::from)?;
     let session_app = match http_app::register(inner_application) {
         Ok(session_app) => session_app,
@@ -500,21 +456,4 @@ fn init_http_transport() -> RuntimeResult<()> {
         "HTTP Main remains uninitialized after lifecycle preflight"
     );
     Ok(())
-}
-
-/// Install the current data worker's HTTP worker.
-///
-/// Runs once per data worker, ordered after session and QUIC worker init so
-/// lower transport state exists before HTTP contexts can bind to it,
-/// mirroring `init_quic_worker` (quic listener.rs:568-577) and VPP's
-/// per-thread `http_worker_t` slot in `http_main.wrk` (http.c:1073).
-#[hammer_component_macros::worker_init_function(
-    name = "http_worker_init",
-    runs_after = ["session_worker_init", "quic_worker_init"]
-)]
-fn init_http_worker(engine: &mut DataPlaneMain) -> RuntimeResult<()> {
-    let main = HTTP_MAIN
-        .get()
-        .ok_or(RuntimeError::PluginStateNotInitialized { plugin: "http" })?;
-    main.install_worker(engine.data_worker_id()?)
 }

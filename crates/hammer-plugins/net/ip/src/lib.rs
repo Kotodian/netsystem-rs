@@ -37,7 +37,7 @@ hammer_component_macros::declare_plugin!(
     config_functions = [ip::reassembly::__CONFIG_FN_IP_REASSEMBLY_CONFIG,],
     main_loop_enter_functions = [],
     main_loop_exit_functions = [],
-    worker_init_functions = [icmp_error::__INIT_FN_IP_ICMP_ERROR_WORKER_INIT],
+    worker_init_functions = [],
     graph_nodes = [
         icmp_error::__IP_GRAPH_NODE_IP4_ICMP_ERROR_NODE,
         icmp_error::__IP_GRAPH_NODE_IP6_ICMP_ERROR_NODE,

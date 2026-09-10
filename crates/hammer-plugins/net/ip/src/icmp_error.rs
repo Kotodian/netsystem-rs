@@ -1,4 +1,5 @@
 use std::net::IpAddr;
+#[cfg(test)]
 use std::time::Duration;
 
 use hammer_core::data_plane::{BufferPacketCursor, Frame, NodeId};
@@ -168,30 +169,6 @@ impl Node for Ip6IcmpErrorNode {
     }
 }
 
-#[hammer_component_macros::worker_init_function(name = "ip_icmp_error_worker_init")]
-fn init_worker(runtime: &mut DataPlaneMain) -> RuntimeResult<()> {
-    let ip4 = IP4_MAIN
-        .get()
-        .ok_or(RuntimeError::PluginStateNotInitialized { plugin: "ip" })?;
-    let ip6 = IP6_MAIN
-        .get()
-        .ok_or(RuntimeError::PluginStateNotInitialized { plugin: "ip" })?;
-    let worker = runtime.thread_index() as usize;
-    assert!(
-        ip4.icmp_throttle[worker]
-            .install(Throttle::new(Duration::from_micros(10)))
-            .is_ok(),
-        "IPv4 ICMP throttle already installed for worker {worker}"
-    );
-    assert!(
-        ip6.icmp_throttle[worker]
-            .install(Throttle::new(Duration::from_millis(1)))
-            .is_ok(),
-        "IPv6 ICMP throttle already installed for worker {worker}"
-    );
-    Ok(())
-}
-
 fn ip4_icmp_error(
     runtime: &mut DataPlaneMain,
     node_runtime: &mut NodeRuntime,
@@ -202,9 +179,7 @@ fn ip4_icmp_error(
         let ip = IP4_MAIN
             .get()
             .expect("IP initialized before graph execution");
-        let mut throttle = ip.icmp_throttle[runtime.thread_index() as usize]
-            .borrow_mut()
-            .expect("IPv4 ICMP throttle belongs to executing worker");
+        let mut throttle = ip.icmp_throttle[runtime.thread_index() as usize].borrow_mut();
         let seed = throttle.seed(ip.clock_origin.elapsed());
         hammer_runtime::process_frame!(runtime, node_runtime, frame, |index| {
             let result = generate_error(
@@ -241,9 +216,7 @@ fn ip6_icmp_error(
         let ip = IP6_MAIN
             .get()
             .expect("IP initialized before graph execution");
-        let mut throttle = ip.icmp_throttle[runtime.thread_index() as usize]
-            .borrow_mut()
-            .expect("IPv6 ICMP throttle belongs to executing worker");
+        let mut throttle = ip.icmp_throttle[runtime.thread_index() as usize].borrow_mut();
         let seed = throttle.seed(ip.clock_origin.elapsed());
         hammer_runtime::process_frame!(runtime, node_runtime, frame, |index| {
             let result = generate_error(

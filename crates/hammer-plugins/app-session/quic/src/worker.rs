@@ -10,12 +10,10 @@ use hammer_core::data_plane::Frame;
 use hammer_infra::bytes::BytesBuffer;
 use hammer_infra::fifo::{Fifo, FifoError};
 use hammer_infra::pool::Pool;
-use hammer_infra::thread_owned::ThreadOwnedError;
 use hammer_infra::timer_wheel::TimerWheel1t2w2048sl;
 use hammer_runtime::app::{SessionConnectError, SessionDgramHeader, SessionFlags, SessionHandle};
-use hammer_runtime::session::SessionStreamDirection;
+use hammer_runtime::session::{SessionConnectEndpoint, SessionStreamDirection};
 use hammer_runtime::{DataPlaneMain, DataWorkerId, NodeRuntime, RuntimeError, RuntimeResult};
-use hammer_service::session::application::{ApplicationMain, application_main};
 use hammer_service::session::node::{SessionQueueNext, SessionQueueOutput};
 use hammer_service::session::runtime::{
     SessionTransport, SessionWorker, TransportInternalTransport, TransportInternalTx,
@@ -829,8 +827,7 @@ impl QuicWorker {
         &mut self,
         sessions: &mut SessionWorker,
         parent: SessionHandle,
-        connection: u32,
-        flags: SessionFlags,
+        endpoint: SessionConnectEndpoint,
     ) -> RuntimeResult<u32> {
         let parent_session = sessions
             .session_id_from_handle(parent)
@@ -852,23 +849,43 @@ impl QuicWorker {
             0,
             quinn_proto::StreamId::new(quinn_proto::Side::Client, quinn_proto::Dir::Bi, 0),
         ));
-        let child_session =
-            match sessions.stream_connect_pending(self.protocol, child_index, connection) {
-                Ok(session) => session,
-                Err(error) => {
-                    let cleanup = self.remove_context(child_index).err();
-                    return match cleanup {
-                        Some(cleanup) => Err(QuicWorkerError::StreamConnectCleanupFailed {
-                            context: child_index,
-                            primary: error,
-                            cleanup,
-                        }
-                        .into()),
-                        None => Err(error),
-                    };
-                }
-            };
-        let direction = if flags.contains(SessionFlags::UNIDIRECTIONAL) {
+        let session = match endpoint.connection {
+            Some(connection) => {
+                sessions.stream_connect_pending(self.protocol, child_index, connection)
+            }
+            None => {
+                let allocation_owner = sessions
+                    .session_allocation_owner(parent_session)
+                    .or_else(|| endpoint.app.map(|_| 0))
+                    .ok_or(QuicWorkerError::ParentAllocationOwnerMissing { parent })?;
+                sessions.construct_transport_session(
+                    self.protocol,
+                    child_index,
+                    allocation_owner,
+                    endpoint.application,
+                    endpoint.app,
+                    endpoint.opaque,
+                    endpoint.server_name.as_deref(),
+                    false,
+                )
+            }
+        };
+        let child_session = match session {
+            Ok(session) => session,
+            Err(error) => {
+                let cleanup = self.remove_context(child_index).err();
+                return match cleanup {
+                    Some(cleanup) => Err(QuicWorkerError::StreamConnectCleanupFailed {
+                        context: child_index,
+                        primary: error,
+                        cleanup,
+                    }
+                    .into()),
+                    None => Err(error),
+                };
+            }
+        };
+        let direction = if endpoint.flags.contains(SessionFlags::UNIDIRECTIONAL) {
             quinn_proto::Dir::Uni
         } else {
             quinn_proto::Dir::Bi
@@ -975,18 +992,10 @@ impl QuicWorker {
     /// connection is live (quic.c:175-206); the child inherits the parent's
     /// application endpoint and carries the supplied `app_context` as both
     /// its Session App context and its VPP `opaque` (`s->opaque = sep->opaque`,
-    /// session.c:1410). The Application Connection is registered here on
-    /// `applications` exactly like the CONNECT_STREAM control path
-    /// (session/control.rs `application_connect`), which also rolls it back
-    /// when the transport connect fails; every validation precedes
-    /// registration, and failures after registration roll the connection
-    /// back so no orphaned Application connection, Session, or context is
-    /// left behind. The remaining open work reuses `connect_stream` and its
-    /// rollback paths.
-    #[allow(dead_code)] // consumed by the upcoming session action slice
+    /// session.c:1410). The worker constructs the child directly from those
+    /// inherited facts; no Main Thread Application connection is registered.
     pub(super) fn open_stream(
         &mut self,
-        applications: &ApplicationMain,
         sessions: &mut SessionWorker,
         parent: u32,
         direction: SessionStreamDirection,
@@ -1017,70 +1026,40 @@ impl QuicWorker {
         let (application, app, _parent_opaque, server_name) = sessions
             .session_app_endpoint(parent)
             .ok_or(QuicWorkerError::SessionMissing { session: parent })?;
-        // VPP session_open_stream hands the stream to the parent's app worker
-        // (quic.c:230-231 copies `qctx->parent_app_wrk_id`); the parent's
-        // allocation owner is inherited by the child Session through the
-        // registered Application Connection (stream_connect_pending reads
-        // `connection.context()` as the allocation owner). It must exist
-        // before any allocation so a missing owner fails typed instead of
-        // registering a zeroed connection.
-        let owner = sessions.session_allocation_owner(parent).ok_or(
-            QuicWorkerError::ParentAllocationOwnerMissing {
-                parent: parent_handle,
-            },
-        )?;
-        let server_name = server_name.map(str::to_owned);
-        let connection = applications
-            .register_connection(application, owner, server_name, app, Some(app_context))
-            .map_err(|error| RuntimeError::subsystem("application", error))?;
+        let (local, remote) = self
+            .contexts
+            .get(parent_index)
+            .and_then(Context::connection)
+            .and_then(|connection| connection.engine.as_deref())
+            .and_then(|engine| engine.local.zip(engine.remote))
+            .ok_or(QuicWorkerError::ConnectionMissing)?;
         let flags = match direction {
             SessionStreamDirection::Bidi => SessionFlags::STREAM,
             SessionStreamDirection::Uni => SessionFlags::STREAM | SessionFlags::UNIDIRECTIONAL,
         };
-        let child = match self.connect_stream(sessions, parent_handle, connection, flags) {
-            Ok(child) => child,
-            Err(primary) => {
-                // VPP session.c:1425-1433: when the transport fails to open
-                // the stream the Session is freed and the app worker is
-                // notified so its connection object is dropped; the
-                // registered Application Connection is that counterpart and
-                // must not be left behind.
-                let cleanup = applications
-                    .remove_connection(application, connection)
-                    .map_err(|error| RuntimeError::subsystem("application", error))
-                    .err();
-                return match cleanup {
-                    Some(cleanup) => Err(QuicWorkerError::OpenStreamCleanupFailed {
-                        parent: parent_handle,
-                        primary,
-                        cleanup,
-                    }
-                    .into()),
-                    None => Err(primary),
-                };
-            }
+        let endpoint = SessionConnectEndpoint {
+            remote,
+            local: Some(local),
+            worker: sessions.worker(),
+            connection: None,
+            application,
+            app,
+            parent_handle: Some(parent_handle),
+            flags,
+            opaque: Some(app_context),
+            server_name: server_name.map(str::to_owned),
         };
+        let child = self.connect_stream(sessions, parent_handle, endpoint)?;
         if let Err(primary) = sessions.set_app_session(child, app_context) {
-            // VPP session.c:1425-1433 frees the stream Session and its
-            // transport context before the app worker is notified so its
-            // connection object is dropped; mirror that reverse ownership
-            // order (Session rollback, context removal, Application
-            // Connection removal), attempting each step independently so
-            // one cleanup failure does not skip the later steps. The child
-            // context index is resolved up front O(1) so context removal
-            // runs even when the Session rollback itself fails; the
-            // aggregation matches connect_stream's rollback path above.
+            // Resolve the transport context before rolling back the Session so
+            // both worker-owned records are removed even if one cleanup fails.
             let child_index = sessions.transport_connection_index(child);
             let session_cleanup = sessions.rollback_session_creation(child).err();
             let context_cleanup = match child_index {
                 Some(index) => self.remove_context(index).err(),
                 None => None,
             };
-            let connection_cleanup = applications
-                .remove_connection(application, connection)
-                .map_err(|error| RuntimeError::subsystem("application", error))
-                .err();
-            let cleanup = session_cleanup.or(context_cleanup).or(connection_cleanup);
+            let cleanup = session_cleanup.or(context_cleanup);
             return match cleanup {
                 Some(cleanup) => Err(QuicWorkerError::OpenStreamCleanupFailed {
                     parent: parent_handle,
@@ -3160,7 +3139,7 @@ pub(crate) fn quic_session_queue_update_time(
     let main = QUIC_MAIN
         .get()
         .ok_or(RuntimeError::PluginStateNotInitialized { plugin: "quic" })?;
-    main.with_worker_and_sessions(sessions, |sessions, quic| quic.update_time(sessions, now))
+    main.worker(sessions.worker())?.update_time(sessions, now)
 }
 
 pub(crate) fn quic_session_queue_dispatch(
@@ -3175,10 +3154,18 @@ pub(crate) fn quic_session_queue_dispatch(
     let main = QUIC_MAIN
         .get()
         .ok_or(RuntimeError::PluginStateNotInitialized { plugin: "quic" })?;
-    main.with_worker_and_sessions(sessions, |sessions, quic| {
-        dispatch_session_queue_events(runtime, sessions, quic, output_next, frame, output, now)
-            .map(|_| ())
-    })
+    let worker = sessions.worker();
+    let mut quic = main.worker(worker)?;
+    dispatch_session_queue_events(
+        runtime,
+        sessions,
+        &mut *quic,
+        output_next,
+        frame,
+        output,
+        now,
+    )
+    .map(|_| ())
 }
 
 /// Opens one stream child of `parent` through the globally registered
@@ -3195,10 +3182,8 @@ pub(crate) fn quic_transport_open_stream(
     let main = QUIC_MAIN
         .get()
         .ok_or(RuntimeError::PluginStateNotInitialized { plugin: "quic" })?;
-    let applications = application_main();
-    main.with_worker_and_sessions(sessions, |sessions, quic| {
-        quic.open_stream(applications, sessions, parent, direction, app_context)
-    })
+    main.worker(sessions.worker())?
+        .open_stream(sessions, parent, direction, app_context)
 }
 
 /// Resets one QUIC stream Session through the globally registered transport
@@ -3216,9 +3201,8 @@ pub(crate) fn quic_transport_reset_stream(
     let main = QUIC_MAIN
         .get()
         .ok_or(RuntimeError::PluginStateNotInitialized { plugin: "quic" })?;
-    main.with_worker_and_sessions(sessions, |sessions, quic| {
-        quic.reset_stream(sessions, session, code)
-    })
+    main.worker(sessions.worker())?
+        .reset_stream(sessions, session, code)
 }
 
 /// Stops the receive side of one QUIC stream Session through the globally
@@ -3237,9 +3221,8 @@ pub(crate) fn quic_transport_stop_sending(
     let main = QUIC_MAIN
         .get()
         .ok_or(RuntimeError::PluginStateNotInitialized { plugin: "quic" })?;
-    main.with_worker_and_sessions(sessions, |sessions, quic| {
-        quic.stop_sending(sessions, session, code)
-    })
+    main.worker(sessions.worker())?
+        .stop_sending(sessions, session, code)
 }
 
 /// Closes one connection Session through the globally registered transport
@@ -3260,9 +3243,8 @@ pub(crate) fn quic_transport_close_connection(
     let main = QUIC_MAIN
         .get()
         .ok_or(RuntimeError::PluginStateNotInitialized { plugin: "quic" })?;
-    main.with_worker_and_sessions(sessions, |sessions, quic| {
-        quic.close_connection_action(sessions, connection, code, reason)
-    })
+    main.worker(sessions.worker())?
+        .close_connection_action(sessions, connection, code, reason)
 }
 
 impl QuicWorker {
@@ -3711,12 +3693,4 @@ pub(super) enum QuicWorkerError {
     ApplicationErrorCodeInvalid { session: u32, code: u64 },
     #[error("QUIC worker {worker} is outside the configured worker range")]
     WorkerOutOfRange { worker: usize },
-    #[error("QUIC worker {worker} is already installed")]
-    WorkerAlreadyInstalled { worker: usize },
-    #[error("QUIC worker {worker} cannot be accessed")]
-    WorkerAccess {
-        worker: usize,
-        #[source]
-        source: ThreadOwnedError,
-    },
 }

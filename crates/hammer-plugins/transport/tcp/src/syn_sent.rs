@@ -6,7 +6,7 @@ use hammer_runtime::{RuntimeError, RuntimeResult};
 
 use super::TcpNodeError;
 use super::segment::tcp_packet;
-use hammer_service::session::runtime::RxDelivery;
+use hammer_service::session::runtime::{RxDelivery, session_main};
 
 #[hammer_component_macros::node_next]
 pub enum TcpSynSentNext {
@@ -146,74 +146,78 @@ fn tcp_syn_sent_index(
     let main = crate::TCP_MAIN
         .get()
         .ok_or(RuntimeError::PluginStateNotInitialized { plugin: "tcp" })?;
-    let (keep_current, control_segment) =
-        main.with_worker(runtime.thread_index(), |sessions, tcp| {
-            let mut keep_current = true;
-            let session_id = read_session_id(runtime, index)?.ok_or_else(|| {
-                let _ = runtime.record_current_node_error(TcpNodeError::SynSentSessionRouteMissing);
-                TcpNodeError::SynSentSessionRouteMissing
-            })?;
-            let connection_index = sessions
-                .transport_connection_index(session_id)
-                .ok_or(TcpNodeError::SynSentSessionMissing)?;
-            let (control, acked_tx_len, established_with_payload) = {
-                let crate::worker::TcpWorker {
-                    connections,
-                    lookup,
-                    timers,
-                    ..
-                } = tcp;
-                let local_capabilities = lookup
-                    .pending_open_capabilities(session_id)
-                    .unwrap_or_default();
-                let connection = connections.get_mut(connection_index).ok_or_else(|| {
-                    let _ = runtime.record_current_node_error(TcpNodeError::SynSentSessionMissing);
-                    TcpNodeError::SynSentSessionMissing
-                })?;
-                let previous_snd_una = connection.snd_una();
-                let previous_state = connection.state();
-                let control = connection.receive_open_reply(
-                    connection_index,
-                    timers,
-                    &packet,
-                    local_capabilities,
-                    std::time::Instant::now(),
-                )?;
-                let established = connection.state() == crate::TcpState::Established;
-                (
-                    control,
-                    connection.take_acked_tx_len(previous_snd_una),
-                    previous_state == crate::TcpState::SynSent
-                        && established
-                        && packet.payload_len != 0,
-                )
-            };
-            if acked_tx_len != 0 {
-                sessions.ack_tx_up_to(session_id, acked_tx_len as usize)?;
-            }
-            if let Some(cookie) = packet.fast_open_cookie.filter(|cookie| !cookie.is_empty()) {
-                tcp.lookup.remember_fast_open_cookie(
-                    packet.local,
-                    packet.remote,
-                    cookie,
-                    packet.capabilities.max_segment_size,
-                );
-            }
-            if established_with_payload {
-                {
-                    let buffer = runtime.buffer_mut(index);
-                    buffer.advance(packet.payload_offset as isize);
-                    buffer.truncate(packet.payload_len)?;
-                }
-                let enqueue = sessions.enqueue_rx(runtime, session_id, index, 0)?;
-                if matches!(enqueue, RxDelivery::InOrder { .. }) {
-                    sessions.mark_ready(session_id);
-                }
-                keep_current = false;
-            };
-            publish_tcp_connection(sessions, tcp, session_id)?;
-            Ok((keep_current, control))
+    // SAFETY: this Node executes on the DataPlaneMain's owning runtime thread.
+    let mut sessions = unsafe { session_main().worker(runtime.thread_index()) }?;
+    let mut tcp = main.worker(runtime.thread_index())?;
+    let (keep_current, control_segment) = {
+        let sessions = &mut *sessions;
+        let tcp = &mut *tcp;
+        let mut keep_current = true;
+        let session_id = read_session_id(runtime, index)?.ok_or_else(|| {
+            let _ = runtime.record_current_node_error(TcpNodeError::SynSentSessionRouteMissing);
+            TcpNodeError::SynSentSessionRouteMissing
         })?;
+        let connection_index = sessions
+            .transport_connection_index(session_id)
+            .ok_or(TcpNodeError::SynSentSessionMissing)?;
+        let (control, acked_tx_len, established_with_payload) = {
+            let crate::worker::TcpWorker {
+                connections,
+                lookup,
+                timers,
+                ..
+            } = tcp;
+            let local_capabilities = lookup
+                .pending_open_capabilities(session_id)
+                .unwrap_or_default();
+            let connection = connections.get_mut(connection_index).ok_or_else(|| {
+                let _ = runtime.record_current_node_error(TcpNodeError::SynSentSessionMissing);
+                TcpNodeError::SynSentSessionMissing
+            })?;
+            let previous_snd_una = connection.snd_una();
+            let previous_state = connection.state();
+            let control = connection.receive_open_reply(
+                connection_index,
+                timers,
+                &packet,
+                local_capabilities,
+                std::time::Instant::now(),
+            )?;
+            let established = connection.state() == crate::TcpState::Established;
+            (
+                control,
+                connection.take_acked_tx_len(previous_snd_una),
+                previous_state == crate::TcpState::SynSent
+                    && established
+                    && packet.payload_len != 0,
+            )
+        };
+        if acked_tx_len != 0 {
+            sessions.ack_tx_up_to(session_id, acked_tx_len as usize)?;
+        }
+        if let Some(cookie) = packet.fast_open_cookie.filter(|cookie| !cookie.is_empty()) {
+            tcp.lookup.remember_fast_open_cookie(
+                packet.local,
+                packet.remote,
+                cookie,
+                packet.capabilities.max_segment_size,
+            );
+        }
+        if established_with_payload {
+            {
+                let buffer = runtime.buffer_mut(index);
+                buffer.advance(packet.payload_offset as isize);
+                buffer.truncate(packet.payload_len)?;
+            }
+            let enqueue = sessions.enqueue_rx(runtime, session_id, index, 0)?;
+            if matches!(enqueue, RxDelivery::InOrder { .. }) {
+                sessions.mark_ready(session_id);
+            }
+            keep_current = false;
+        };
+        publish_tcp_connection(sessions, tcp, session_id)?;
+        (keep_current, control)
+    };
     if let Some(segment) = control_segment {
         let mut allocated = 0;
         if runtime.buffer_alloc(core::slice::from_mut(&mut allocated)) != 1 {

@@ -1,14 +1,15 @@
 use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
 
+use hammer_core::buffer::BufferMain;
 use hammer_core::data_plane::{DEFAULT_BUFFER_FRAME_CAPACITY, Frame, NodeId, NodeNext};
 use hammer_infra::bihash::{Bihash, FREE_U64};
 use hammer_infra::checksum::internet_checksum;
 use hammer_infra::pool::Pool;
 use hammer_runtime::sync::SpinLock;
 use hammer_runtime::{
-    DataPlaneMain, DataWorkerId, Node, NodeProcessFn, NodeRuntime, TraceFormatter,
-    add_packet_trace, format_packet_trace,
+    DataPlaneMain, DataWorkerId, Node, NodeProcessFn, NodeRuntime, TraceControlHandle,
+    TraceFormatter, add_packet_trace, format_packet_trace,
 };
 use hammer_runtime::{RuntimeError, RuntimeResult};
 
@@ -216,6 +217,27 @@ impl IpReassemblyMain {
             .unwrap_or(0)
     }
 
+    fn expire_all(&self, trace: Option<&TraceControlHandle>, now: Instant) -> usize {
+        let buffers = BufferMain::global();
+        // SAFETY: reassembly expiry runs only on the thread-zero Process.
+        let mut caches = unsafe { buffers.borrow_worker_caches(0) };
+        let mut expired_buffers = Vec::new();
+        let mut expired_contexts = 0usize;
+        for worker in &self.per_thread_data {
+            expired_buffers.clear();
+            expired_contexts = expired_contexts
+                .saturating_add(worker.lock().remove_expired(now, &mut expired_buffers));
+            for indices in expired_buffers.chunks(DEFAULT_BUFFER_FRAME_CAPACITY) {
+                buffers.free_buffers(&mut caches, indices, true, |handle| {
+                    if let Some(trace) = trace {
+                        trace.finalize(handle);
+                    }
+                });
+            }
+        }
+        expired_contexts
+    }
+
     fn process_frame(
         &self,
         runtime: &mut DataPlaneMain,
@@ -403,8 +425,9 @@ fn register_ip6_reassembly(runtime: &DataPlaneMain) -> RuntimeResult<NodeId> {
 
 #[hammer_component_macros::process_node(name = "ip-reassembly-expire-walk")]
 fn ip_reassembly_expire_process(
-    _: &mut DataPlaneMain,
+    runtime: &mut DataPlaneMain,
 ) -> impl std::future::Future<Output = RuntimeResult<()>> + Send + 'static {
+    let trace = runtime.trace_control();
     async move {
         // VPP `ip4_full_reass_walk_expired` reads the module-global main directly;
         // the config phase stores it before Process Nodes start.
@@ -413,18 +436,22 @@ fn ip_reassembly_expire_process(
             .ok_or(RuntimeError::PluginStateNotInitialized { plugin: "ip" })?;
         loop {
             tokio::time::sleep(REASSEMBLY_EXPIRE_WALK_INTERVAL).await;
-            for worker_slot in 0..hammer_runtime::config::worker::worker_count() {
-                let worker = DataWorkerId::new(worker_slot as u32);
-                hammer_runtime::schedule_on_worker(worker, move |runtime| {
-                    main.expire_worker(runtime, Instant::now());
-                })?;
-            }
+            main.expire_all(trace.as_ref(), Instant::now());
         }
     }
 }
 
 impl IpReassemblyWorker {
     fn expire(&mut self, runtime: &mut DataPlaneMain, now: Instant) -> usize {
+        let mut expired_buffers = Vec::new();
+        let count = self.remove_expired(now, &mut expired_buffers);
+        for indices in expired_buffers.chunks(DEFAULT_BUFFER_FRAME_CAPACITY) {
+            runtime.buffer_free(indices);
+        }
+        count
+    }
+
+    fn remove_expired(&mut self, now: Instant, expired_buffers: &mut Vec<u32>) -> usize {
         let timeout = self.timeout;
         let capacity = self.contexts.capacity();
         let walk_len = self
@@ -450,13 +477,7 @@ impl IpReassemblyWorker {
             if let Some(context) = self.contexts.remove(index) {
                 // Like ip4_full_reass_drop_all, release each retained chain
                 // before dropping its reassembly context.
-                let mut indices = [0u32; DEFAULT_BUFFER_FRAME_CAPACITY];
-                for fragments in context.fragments.chunks(indices.len()) {
-                    for (index, fragment) in indices.iter_mut().zip(fragments) {
-                        *index = fragment.index;
-                    }
-                    runtime.buffer_free(&indices[..fragments.len()]);
-                }
+                expired_buffers.extend(context.fragments.iter().map(|fragment| fragment.index));
             }
             if let Some(directory) = &self.directory {
                 directory.remove(key);

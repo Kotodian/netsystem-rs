@@ -1,13 +1,11 @@
-use std::cell::UnsafeCell;
+use std::cell::{RefCell, RefMut, UnsafeCell};
 use std::collections::VecDeque;
 use std::net::SocketAddr;
-use std::ops::Deref;
-use std::sync::{Arc, OnceLock, mpsc};
+use std::sync::{Arc, OnceLock};
 
 use hammer_core::data_plane::{Frame, NodeId, NodeState};
 use hammer_infra::align::CacheLineAlignMark;
 use hammer_infra::pool::Pool;
-use hammer_infra::thread_owned::{ThreadOwned, ThreadOwnedError};
 use hammer_runtime::app::{SessionDgramHeader, SessionHandle};
 use hammer_runtime::{
     DataPlaneMain, DataWorkerId, NodeRuntime, RuntimeError, RuntimeResult, SessionConnectEndpoint,
@@ -42,14 +40,6 @@ pub(crate) enum UdpTransportError {
     WorkerUnavailable { thread_index: u32 },
     #[error("UDP worker {worker} is outside the configured worker range")]
     WorkerOutOfRange { worker: usize },
-    #[error("UDP worker {worker} is already installed")]
-    WorkerAlreadyInstalled { worker: usize },
-    #[error("UDP worker {worker} cannot be accessed")]
-    WorkerAccess {
-        worker: usize,
-        #[source]
-        source: ThreadOwnedError,
-    },
     #[error("UDP connection pool capacity {capacity} is exhausted")]
     ConnectionCapacityExhausted { capacity: usize },
     #[error("UDP connection {index:?} is missing")]
@@ -110,23 +100,15 @@ unsafe impl Sync for UdpListenerCell {}
 #[repr(C)]
 struct UdpWorkerSlot {
     cacheline0: CacheLineAlignMark,
-    owner: ThreadOwned<UdpWorker>,
+    worker: RefCell<UdpWorker>,
 }
 
 impl UdpWorkerSlot {
-    fn new() -> Self {
+    fn new(worker: UdpWorker) -> Self {
         Self {
             cacheline0: CacheLineAlignMark,
-            owner: ThreadOwned::new(),
+            worker: RefCell::new(worker),
         }
-    }
-}
-
-impl Deref for UdpWorkerSlot {
-    type Target = ThreadOwned<UdpWorker>;
-
-    fn deref(&self) -> &Self::Target {
-        &self.owner
     }
 }
 
@@ -136,10 +118,17 @@ pub struct UdpMain {
     workers: Box<[UdpWorkerSlot]>,
 }
 
+// SAFETY: every worker RefCell is permanently assigned to one Data Worker.
+// Data-plane callers select only the slot for the executing runtime thread;
+// Main Thread listener mutation is separately protected by WorkerBarrier.
+unsafe impl Sync for UdpMain {}
+
 impl UdpMain {
     fn new(protocol: u8, worker_count: usize) -> Self {
         let workers = (0..worker_count)
-            .map(|_| UdpWorkerSlot::new())
+            .map(|worker| {
+                UdpWorkerSlot::new(UdpWorker::new(DataWorkerId::new(worker as u32), protocol))
+            })
             .collect::<Vec<_>>()
             .into_boxed_slice();
         Self {
@@ -153,34 +142,18 @@ impl UdpMain {
         self.protocol
     }
 
-    fn worker(&self, worker: DataWorkerId) -> RuntimeResult<&ThreadOwned<UdpWorker>> {
+    fn worker(&self, thread_index: u32) -> RuntimeResult<RefMut<'_, UdpWorker>> {
+        let worker = DataWorkerId::try_from(thread_index)
+            .map_err(|_| UdpTransportError::WorkerUnavailable { thread_index })?;
         self.workers
             .get(worker.slot())
-            .map(|slot| &**slot)
             .ok_or_else(|| {
                 UdpTransportError::WorkerOutOfRange {
                     worker: worker.slot(),
                 }
                 .into()
             })
-    }
-
-    fn with_worker<R>(
-        &self,
-        thread_index: u32,
-        operation: impl FnOnce(&mut SessionWorker, &mut UdpWorker) -> RuntimeResult<R>,
-    ) -> RuntimeResult<R> {
-        session_main().with_worker_mut(thread_index, |sessions| {
-            let worker = DataWorkerId::try_from(thread_index)
-                .map_err(|_| UdpTransportError::WorkerUnavailable { thread_index })?;
-            let mut slot = self.worker(worker)?.borrow_mut().map_err(|source| {
-                UdpTransportError::WorkerAccess {
-                    worker: worker.slot(),
-                    source,
-                }
-            })?;
-            operation(sessions, &mut slot)
-        })
+            .map(|slot| slot.worker.borrow_mut())
     }
 
     pub(crate) fn deliver_datagram(
@@ -195,20 +168,21 @@ impl UdpMain {
         return_node: NodeId,
     ) -> RuntimeResult<UdpDelivery> {
         let listener = find_udp_listener(self.listeners.get(), local);
-        self.with_worker(runtime.thread_index(), |sessions, udp| {
-            udp.deliver_datagram(
-                sessions,
-                runtime,
-                index,
-                local,
-                remote,
-                payload_offset,
-                payload_len,
-                urgent,
-                listener,
-                return_node,
-            )
-        })
+        // SAFETY: packet delivery executes on the DataPlaneMain's owning runtime thread.
+        let mut sessions = unsafe { session_main().worker(runtime.thread_index()) }?;
+        let mut udp = self.worker(runtime.thread_index())?;
+        udp.deliver_datagram(
+            &mut sessions,
+            runtime,
+            index,
+            local,
+            remote,
+            payload_offset,
+            payload_len,
+            urgent,
+            listener,
+            return_node,
+        )
     }
 }
 
@@ -314,10 +288,10 @@ impl UdpWorker {
     fn active_connect(
         &mut self,
         sessions: &mut SessionWorker,
-        connection: u32,
-        local: SocketAddr,
-        remote: SocketAddr,
+        endpoint: &SessionConnectEndpoint,
     ) -> RuntimeResult<u32> {
+        let local = endpoint.local.ok_or(UdpTransportError::InvalidConnection)?;
+        let remote = endpoint.remote;
         if self
             .lookup
             .find_tuple(&self.connections, local, remote)
@@ -329,7 +303,26 @@ impl UdpWorker {
         let connection_state = UdpConnection::connected(self.worker, local, remote)
             .ok_or(UdpTransportError::InvalidConnection)?;
         let index = self.insert_connection(connection_state)?;
-        let session_id = match sessions.stream_connect_pending(self.protocol, index, connection) {
+        if endpoint.connection.is_none() && endpoint.app.is_none() {
+            self.remove_connection(index);
+            return Err(
+                hammer_service::session::error::SessionError::ApplicationConnectionMissing.into(),
+            );
+        }
+        let session = match endpoint.connection {
+            Some(connection) => sessions.stream_connect_pending(self.protocol, index, connection),
+            None => sessions.construct_transport_session(
+                self.protocol,
+                index,
+                0,
+                endpoint.application,
+                endpoint.app,
+                endpoint.opaque,
+                endpoint.server_name.as_deref(),
+                false,
+            ),
+        };
+        let session_id = match session {
             Ok(session_id) => session_id,
             Err(error) => {
                 self.remove_connection(index);
@@ -889,7 +882,11 @@ pub(crate) fn stop_listen(connection_index: u32) -> RuntimeResult<()> {
     Ok(())
 }
 
-pub(crate) fn connect(endpoint: SessionConnectEndpoint) -> RuntimeResult<()> {
+/// Starts a UDP connection on the endpoint's owning Session worker.
+pub fn connect(
+    sessions: &mut SessionWorker,
+    endpoint: SessionConnectEndpoint,
+) -> RuntimeResult<()> {
     let local = endpoint.local.ok_or(UdpTransportError::InvalidConnection)?;
     if local.is_ipv4() != endpoint.remote.is_ipv4() || local.port() == 0 {
         return Err(UdpTransportError::InvalidConnection.into());
@@ -897,22 +894,9 @@ pub(crate) fn connect(endpoint: SessionConnectEndpoint) -> RuntimeResult<()> {
     let main = UDP_MAIN
         .get()
         .ok_or(RuntimeError::PluginStateNotInitialized { plugin: "udp" })?;
-    let worker = endpoint.worker;
-    let worker_slot = worker.slot();
-    let (completion, completed) = mpsc::sync_channel(1);
-    hammer_runtime::schedule_on_worker(worker, move |runtime| {
-        let result = main.with_worker(runtime.thread_index(), |sessions, udp| {
-            udp.active_connect(sessions, endpoint.connection, local, endpoint.remote)
-        });
-        if completion.send(result).is_err() {
-            return;
-        }
-    })?;
-    let _ = completed
-        .recv()
-        .map_err(|_| RuntimeError::DataWorkerCallCanceled {
-            worker: worker_slot,
-        })??;
+    debug_assert_eq!(endpoint.worker, sessions.worker());
+    let mut udp = main.worker(sessions.worker().thread_index())?;
+    udp.active_connect(sessions, &endpoint)?;
     Ok(())
 }
 
@@ -945,7 +929,6 @@ fn init_udp() -> RuntimeResult<()> {
 }
 
 fn bind_worker_graph(engine: &mut DataPlaneMain) -> RuntimeResult<()> {
-    let worker = engine.data_worker_id()?;
     let session_queue =
         engine
             .node_by_name("session-queue")
@@ -968,19 +951,6 @@ fn bind_worker_graph(engine: &mut DataPlaneMain) -> RuntimeResult<()> {
         udp_session_queue_update_time,
         udp_session_queue_dispatch,
     )?;
-    let main = UDP_MAIN
-        .get()
-        .ok_or(RuntimeError::PluginStateNotInitialized { plugin: "udp" })?;
-    if main
-        .worker(worker)?
-        .install(UdpWorker::new(worker, main.protocol))
-        .is_err()
-    {
-        return Err(UdpTransportError::WorkerAlreadyInstalled {
-            worker: worker.slot(),
-        }
-        .into());
-    }
     engine
         .nodes()
         .set_node_state(session_queue, NodeState::Polling)?;
@@ -1001,7 +971,7 @@ fn init_udp_worker(engine: &mut DataPlaneMain) -> RuntimeResult<()> {
 
 fn udp_session_queue_update_time(
     runtime: &mut DataPlaneMain,
-    _: &mut SessionWorker,
+    sessions: &mut SessionWorker,
     _: NodeRuntime,
     output_next: SessionQueueNext,
     now: std::time::Instant,
@@ -1011,14 +981,13 @@ fn udp_session_queue_update_time(
     let main = UDP_MAIN
         .get()
         .ok_or(RuntimeError::PluginStateNotInitialized { plugin: "udp" })?;
-    main.with_worker(runtime.thread_index(), |sessions, udp| {
-        udp.update_time(sessions, runtime, output_next, frame, output, now)
-    })
+    let mut udp = main.worker(runtime.thread_index())?;
+    udp.update_time(sessions, runtime, output_next, frame, output, now)
 }
 
 fn udp_session_queue_dispatch(
     runtime: &mut DataPlaneMain,
-    _: &mut SessionWorker,
+    sessions: &mut SessionWorker,
     _: NodeRuntime,
     output_next: SessionQueueNext,
     now: std::time::Instant,
@@ -1028,10 +997,17 @@ fn udp_session_queue_dispatch(
     let main = UDP_MAIN
         .get()
         .ok_or(RuntimeError::PluginStateNotInitialized { plugin: "udp" })?;
-    main.with_worker(runtime.thread_index(), |sessions, udp| {
-        dispatch_session_queue_events(runtime, sessions, udp, output_next, frame, output, now)
-            .map(|_| ())
-    })
+    let mut udp = main.worker(runtime.thread_index())?;
+    dispatch_session_queue_events(
+        runtime,
+        sessions,
+        &mut *udp,
+        output_next,
+        frame,
+        output,
+        now,
+    )
+    .map(|_| ())
 }
 
 impl SessionTransport for UdpWorker {

@@ -3,7 +3,7 @@ use hammer_core::data_plane::{DEFAULT_BUFFER_FRAME_CAPACITY, Frame, NodeId, Node
 use hammer_runtime::{DataPlaneMain, Node, NodeProcessFn, NodeRuntime};
 use hammer_runtime::{RuntimeError, RuntimeResult};
 
-use hammer_service::session::runtime::RxDelivery;
+use hammer_service::session::runtime::{RxDelivery, session_main};
 
 use super::TcpNodeError;
 use super::segment::tcp_packet;
@@ -134,7 +134,12 @@ fn tcp_rcv_process_index(
     let main = crate::TCP_MAIN
         .get()
         .ok_or(RuntimeError::PluginStateNotInitialized { plugin: "tcp" })?;
-    let control = main.with_worker(runtime.thread_index(), |sessions, tcp| {
+    // SAFETY: this Node executes on the DataPlaneMain's owning runtime thread.
+    let mut sessions = unsafe { session_main().worker(runtime.thread_index()) }?;
+    let mut tcp = main.worker(runtime.thread_index())?;
+    let control = {
+        let sessions = &mut *sessions;
+        let tcp = &mut *tcp;
         let session_id = read_session_id(runtime, index)?.ok_or_else(|| {
             let _ = runtime.record_current_node_error(TcpNodeError::RcvProcessSessionRouteMissing);
             TcpNodeError::RcvProcessSessionRouteMissing
@@ -192,8 +197,8 @@ fn tcp_rcv_process_index(
             }
         }
         publish_tcp_connection(sessions, tcp, session_id)?;
-        Ok(control)
-    })?;
+        control
+    };
     if let Some(segment) = control {
         let mut allocated = 0;
         if runtime.buffer_alloc(core::slice::from_mut(&mut allocated)) != 1 {

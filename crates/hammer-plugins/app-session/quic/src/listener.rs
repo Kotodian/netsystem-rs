@@ -1,13 +1,11 @@
-use std::cell::UnsafeCell;
+use std::cell::{RefCell, RefMut, UnsafeCell};
 use std::collections::HashMap;
-use std::ops::Deref;
-use std::sync::{Arc, OnceLock, mpsc};
+use std::sync::{Arc, OnceLock};
 
 use hammer_core::data_plane::NodeState;
 use hammer_infra::align::CacheLineAlignMark;
 use hammer_infra::pool::Pool;
-use hammer_infra::thread_owned::ThreadOwned;
-use hammer_runtime::app::SessionHandle;
+use hammer_runtime::app::{SessionFlags, SessionHandle};
 use hammer_runtime::{
     DataPlaneMain, DataWorkerId, RuntimeError, RuntimeResult, SessionConnectEndpoint,
     SessionListenEndpoint,
@@ -34,6 +32,15 @@ pub(crate) enum QuicListenerError {
     LocalEndpointMissing,
     #[error("QUIC active connect endpoint family mismatch between local and remote")]
     ConnectEndpointMismatch,
+    #[error(
+        "QUIC lower transport connect failed for context {context:?}: {primary}; context cleanup failed: {cleanup}"
+    )]
+    LowerTransportConnectCleanupFailed {
+        context: u32,
+        #[source]
+        primary: RuntimeError,
+        cleanup: RuntimeError,
+    },
     #[error("QUIC stream connect requires a parent Session handle")]
     ParentSessionMissing,
     #[error("QUIC worker graph setup failed: {setup}; attachment rollback failed: {cleanup}")]
@@ -52,23 +59,15 @@ pub(crate) enum QuicListenerError {
 #[repr(C)]
 struct QuicWorkerSlot {
     cacheline0: CacheLineAlignMark,
-    owner: ThreadOwned<QuicWorker>,
+    worker: RefCell<QuicWorker>,
 }
 
 impl QuicWorkerSlot {
-    fn new() -> Self {
+    fn new(worker: QuicWorker) -> Self {
         Self {
             cacheline0: CacheLineAlignMark,
-            owner: ThreadOwned::new(),
+            worker: RefCell::new(worker),
         }
-    }
-}
-
-impl Deref for QuicWorkerSlot {
-    type Target = ThreadOwned<QuicWorker>;
-
-    fn deref(&self) -> &Self::Target {
-        &self.owner
     }
 }
 
@@ -80,6 +79,11 @@ pub struct QuicMain {
     contexts: Arc<QuicListenerContexts>,
     workers: Box<[QuicWorkerSlot]>,
 }
+
+// SAFETY: every worker RefCell is permanently assigned to one Data Worker and
+// is borrowed only by callbacks executing on that worker. Listener/config
+// state follows its own Main Thread publication contract.
+unsafe impl Sync for QuicMain {}
 
 struct QuicListenerContexts {
     value: UnsafeCell<Pool<Context>>,
@@ -177,7 +181,9 @@ impl QuicMain {
             configs: QuicConfigRegistry::new(QUIC_CONFIG_CAPACITY),
             contexts: Arc::new(QuicListenerContexts::new(QUIC_CONTEXT_CAPACITY)),
             workers: (0..worker_count)
-                .map(|_| QuicWorkerSlot::new())
+                .map(|worker| {
+                    QuicWorkerSlot::new(QuicWorker::new(DataWorkerId::new(worker as u32), protocol))
+                })
                 .collect::<Vec<_>>()
                 .into_boxed_slice(),
         }
@@ -296,58 +302,13 @@ impl QuicMain {
             .and_then(Context::listener_context)
     }
 
-    pub(crate) fn install_worker(&self, worker: DataWorkerId) -> RuntimeResult<()> {
-        let slot =
-            self.workers
-                .get(worker.slot())
-                .ok_or_else(|| QuicWorkerError::WorkerOutOfRange {
-                    worker: worker.slot(),
-                })?;
-        slot.install(QuicWorker::new(worker, self.protocol))
-            .map_err(|_| {
-                RuntimeError::from(QuicWorkerError::WorkerAlreadyInstalled {
-                    worker: worker.slot(),
-                })
-            })
-    }
-
-    pub(crate) fn with_worker<R>(
-        &self,
-        worker: DataWorkerId,
-        operation: impl FnOnce(&mut QuicWorker) -> RuntimeResult<R>,
-    ) -> RuntimeResult<R> {
+    pub(crate) fn worker(&self, worker: DataWorkerId) -> RuntimeResult<RefMut<'_, QuicWorker>> {
         let slot = self.workers.get(worker.slot()).ok_or_else(|| {
             RuntimeError::from(QuicWorkerError::WorkerOutOfRange {
                 worker: worker.slot(),
             })
         })?;
-        let mut slot = slot.borrow_mut().map_err(|source| {
-            RuntimeError::from(QuicWorkerError::WorkerAccess {
-                worker: worker.slot(),
-                source,
-            })
-        })?;
-        operation(&mut slot)
-    }
-
-    pub(crate) fn with_worker_and_sessions<R>(
-        &self,
-        sessions: &mut SessionWorker,
-        operation: impl FnOnce(&mut SessionWorker, &mut QuicWorker) -> RuntimeResult<R>,
-    ) -> RuntimeResult<R> {
-        let worker = sessions.worker();
-        let slot = self.workers.get(worker.slot()).ok_or_else(|| {
-            RuntimeError::from(QuicWorkerError::WorkerOutOfRange {
-                worker: worker.slot(),
-            })
-        })?;
-        let mut slot = slot.borrow_mut().map_err(|source| {
-            RuntimeError::from(QuicWorkerError::WorkerAccess {
-                worker: worker.slot(),
-                source,
-            })
-        })?;
-        operation(sessions, &mut slot)
+        Ok(slot.worker.borrow_mut())
     }
 
     pub(crate) fn application_is_attached(
@@ -367,7 +328,10 @@ pub fn protocol() -> RuntimeResult<u8> {
         .ok_or(RuntimeError::PluginStateNotInitialized { plugin: "quic" })
 }
 
-pub(crate) fn connect(endpoint: SessionConnectEndpoint) -> RuntimeResult<()> {
+pub(crate) fn connect(
+    sessions: &mut SessionWorker,
+    endpoint: SessionConnectEndpoint,
+) -> RuntimeResult<()> {
     let main = QUIC_MAIN
         .get()
         .ok_or(RuntimeError::PluginStateNotInitialized { plugin: "quic" })?;
@@ -391,116 +355,63 @@ pub(crate) fn connect(endpoint: SessionConnectEndpoint) -> RuntimeResult<()> {
         return Err(QuicListenerError::ConnectEndpointMismatch.into());
     }
     let server_name = endpoint.server_name.unwrap_or_else(|| remote.to_string());
-    let worker = endpoint.worker;
+    let application_connection = endpoint
+        .connection
+        .ok_or(hammer_service::session::error::SessionError::ApplicationConnectionMissing)?;
+    debug_assert_eq!(endpoint.worker, sessions.worker());
+    let mut quic = main.worker(sessions.worker())?;
+    let context = quic.allocate_client_connect_with_timeout(
+        Arc::clone(&client_config),
+        server_name,
+        local,
+        remote,
+        endpoint.application,
+        endpoint.app,
+        endpoint.opaque,
+        application_connection,
+        connection_timeout,
+    )?;
 
-    let (completion, completed) = mpsc::sync_channel(1);
-    hammer_runtime::schedule_on_worker(worker, {
-        let main = main;
-        let client_config = Arc::clone(&client_config);
-        let server_name = server_name.clone();
-        move |_| {
-            let result = main.with_worker(worker, |quic| {
-                quic.allocate_client_connect_with_timeout(
-                    client_config,
-                    server_name,
-                    local,
-                    remote,
-                    endpoint.application,
-                    None,
-                    endpoint.opaque,
-                    endpoint.connection,
-                    connection_timeout,
-                )
-            });
-            if completion.send(result).is_err() {
-                return;
+    let lower_endpoint = SessionConnectEndpoint {
+        remote,
+        local: Some(local),
+        worker: sessions.worker(),
+        connection: None,
+        application: main.inner_application,
+        app: Some(main.session_app),
+        parent_handle: None,
+        flags: SessionFlags::empty(),
+        opaque: Some(context.into()),
+        server_name: None,
+    };
+    if let Err(primary) = hammer_plugin_udp::connect(sessions, lower_endpoint) {
+        return match quic.remove_context(context) {
+            Ok(()) => Err(primary),
+            Err(cleanup) => Err(QuicListenerError::LowerTransportConnectCleanupFailed {
+                context,
+                primary,
+                cleanup,
             }
-        }
-    })?;
-    let context = completed
-        .recv()
-        .map_err(|_| RuntimeError::DataWorkerCallCanceled {
-            worker: worker.slot(),
-        })??;
-
-    let inner_connection = application_main()
-        .register_connection(
-            main.inner_application,
-            endpoint.connection.into(),
-            None,
-            Some(main.session_app),
-            Some(context.into()),
-        )
-        .map_err(RuntimeError::from)?;
-    let udp_protocol = hammer_plugin_udp::protocol()?;
-    if let Err(error) = session_main().connect(
-        udp_protocol,
-        SessionConnectEndpoint::new(
-            endpoint.remote,
-            endpoint.local,
-            endpoint.worker,
-            inner_connection,
-            main.inner_application,
-            Some(context.into()),
-            None,
-        ),
-    ) {
-        let _ = application_main().remove_connection(main.inner_application, inner_connection);
-        let (completion, completed) = mpsc::sync_channel(1);
-        hammer_runtime::schedule_on_worker(worker, {
-            let main = main;
-            move |_| {
-                let result = main.with_worker(worker, |quic| quic.remove_context(context));
-                if completion.send(result).is_err() {
-                    return;
-                }
-            }
-        })?;
-        let _ = completed
-            .recv()
-            .map_err(|_| RuntimeError::DataWorkerCallCanceled {
-                worker: worker.slot(),
-            })?;
-        return Err(error.into());
+            .into()),
+        };
     }
-    application_main()
-        .reclaim_connection(main.inner_application, inner_connection)
-        .map_err(RuntimeError::from)?;
     Ok(())
 }
 
-pub(crate) fn connect_stream(endpoint: SessionConnectEndpoint) -> RuntimeResult<()> {
+pub(crate) fn connect_stream(
+    sessions: &mut SessionWorker,
+    endpoint: SessionConnectEndpoint,
+) -> RuntimeResult<()> {
     let main = QUIC_MAIN
         .get()
         .ok_or(RuntimeError::PluginStateNotInitialized { plugin: "quic" })?;
     let parent = endpoint
         .parent_handle
         .ok_or(QuicListenerError::ParentSessionMissing)?;
-    let worker = endpoint.worker;
-    let connection = endpoint.connection;
-    let flags = endpoint.flags;
-    let (completion, completed) = mpsc::sync_channel(1);
-
-    hammer_runtime::schedule_on_worker(worker, {
-        let main = main;
-        move |runtime| {
-            let result = session_main().with_worker_mut(runtime.thread_index(), |sessions| {
-                main.with_worker_and_sessions(sessions, |sessions, quic| {
-                    quic.connect_stream(sessions, parent, connection, flags)
-                        .map(|_| ())
-                })
-            });
-            if completion.send(result).is_err() {
-                return;
-            }
-        }
-    })?;
-
-    completed
-        .recv()
-        .map_err(|_| RuntimeError::DataWorkerCallCanceled {
-            worker: worker.slot(),
-        })??;
+    debug_assert_eq!(endpoint.worker, sessions.worker());
+    main.worker(sessions.worker())?
+        .connect_stream(sessions, parent, endpoint)
+        .map(|_| ())?;
     Ok(())
 }
 
@@ -578,8 +489,7 @@ fn init_quic() -> RuntimeResult<()> {
     Ok(())
 }
 
-fn bind_worker_graph(engine: &mut DataPlaneMain, main: &QuicMain) -> RuntimeResult<()> {
-    let worker = engine.data_worker_id()?;
+fn bind_worker_graph(engine: &mut DataPlaneMain) -> RuntimeResult<()> {
     let session_queue =
         engine
             .node_by_name("session-queue")
@@ -599,11 +509,9 @@ fn bind_worker_graph(engine: &mut DataPlaneMain, main: &QuicMain) -> RuntimeResu
         crate::worker::quic_session_queue_update_time,
         crate::worker::quic_session_queue_dispatch,
     )?;
-    let setup = main.install_worker(worker).and_then(|()| {
-        engine
-            .nodes()
-            .set_node_state(session_queue, NodeState::Polling)
-    });
+    let setup = engine
+        .nodes()
+        .set_node_state(session_queue, NodeState::Polling);
     if let Err(setup) = setup {
         if attachment_installed {
             if let Err(cleanup) = SessionQueueNode::remove_worker_attachment(
@@ -626,8 +534,8 @@ fn bind_worker_graph(engine: &mut DataPlaneMain, main: &QuicMain) -> RuntimeResu
     runs_after = ["session_worker_init", "udp_worker_init"]
 )]
 fn init_quic_worker(engine: &mut DataPlaneMain) -> RuntimeResult<()> {
-    let main = QUIC_MAIN
+    QUIC_MAIN
         .get()
         .ok_or(RuntimeError::PluginStateNotInitialized { plugin: "quic" })?;
-    bind_worker_graph(engine, main)
+    bind_worker_graph(engine)
 }

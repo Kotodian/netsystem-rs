@@ -26,9 +26,9 @@ hammer_component_macros::declare_plugin!(
     process_nodes = [],
 );
 
+use std::cell::{RefCell, RefMut};
 use std::net::SocketAddr;
-use std::ops::Deref;
-use std::sync::{OnceLock, mpsc};
+use std::sync::OnceLock;
 
 use hammer_core::data_plane::{BufferPacketCursor, NodeId, NodeState};
 use hammer_runtime::app::SessionHandle;
@@ -39,11 +39,10 @@ use hammer_runtime::{
 use thiserror::Error;
 
 use hammer_infra::align::CacheLineAlignMark;
-use hammer_infra::thread_owned::{ThreadOwned, ThreadOwnedError};
 use hammer_service::session::SessionQueueNext;
 use hammer_service::session::node::{SessionQueueNode, SessionQueueOutput};
 use hammer_service::session::runtime::{
-    SessionTransport, SessionWorker, dispatch_session_queue_events, session_main,
+    SessionTransport, SessionWorker, dispatch_session_queue_events,
 };
 use hammer_service::transport::{TransportVft, register_transport};
 
@@ -95,14 +94,6 @@ enum TcpWorkerError {
     WorkerUnavailable { thread_index: u32 },
     #[error("TCP worker {worker} is outside the configured worker range")]
     WorkerOutOfRange { worker: usize },
-    #[error("TCP worker {worker} is already installed")]
-    WorkerAlreadyInstalled { worker: usize },
-    #[error("TCP worker {worker} cannot be accessed")]
-    WorkerAccess {
-        worker: usize,
-        #[source]
-        source: ThreadOwnedError,
-    },
 }
 
 pub(crate) fn publish_tcp_connection(
@@ -190,23 +181,15 @@ pub(crate) fn publish_tcp_connection(
 #[repr(C)]
 struct TcpWorkerSlot {
     cacheline0: CacheLineAlignMark,
-    owner: ThreadOwned<TcpWorker>,
+    worker: RefCell<TcpWorker>,
 }
 
 impl TcpWorkerSlot {
-    fn new() -> Self {
+    fn new(worker: TcpWorker) -> Self {
         Self {
             cacheline0: CacheLineAlignMark,
-            owner: ThreadOwned::new(),
+            worker: RefCell::new(worker),
         }
-    }
-}
-
-impl Deref for TcpWorkerSlot {
-    type Target = ThreadOwned<TcpWorker>;
-
-    fn deref(&self) -> &Self::Target {
-        &self.owner
     }
 }
 
@@ -217,12 +200,19 @@ pub struct TcpMain {
     workers: Box<[TcpWorkerSlot]>,
 }
 
+// SAFETY: every RefCell slot is permanently assigned to one Data Worker.
+// Main Thread never borrows worker slots after startup; each worker selects
+// only its own immutable runtime thread index.
+unsafe impl Sync for TcpMain {}
+
 impl TcpMain {
     fn new(protocol: u8, worker_count: usize) -> Self {
         let control = TcpInputControlPlane::new();
         let listeners = listener_control::TcpListenerControlHandle::new(control.clone());
         let workers = (0..worker_count)
-            .map(|_| TcpWorkerSlot::new())
+            .map(|worker| {
+                TcpWorkerSlot::new(TcpWorker::new(DataWorkerId::new(worker as u32), protocol))
+            })
             .collect::<Vec<_>>()
             .into_boxed_slice();
         Self {
@@ -233,41 +223,16 @@ impl TcpMain {
         }
     }
 
-    fn worker(&self, worker: DataWorkerId) -> RuntimeResult<&ThreadOwned<TcpWorker>> {
+    fn worker(&self, thread_index: u32) -> RuntimeResult<RefMut<'_, TcpWorker>> {
+        let worker = DataWorkerId::try_from(thread_index)
+            .map_err(|_| TcpWorkerError::WorkerUnavailable { thread_index })?;
         self.workers
             .get(worker.slot())
-            .map(|slot| &**slot)
             .ok_or_else(|| TcpWorkerError::WorkerOutOfRange {
                 worker: worker.slot(),
             })
+            .map(|slot| slot.worker.borrow_mut())
             .map_err(RuntimeError::from)
-    }
-
-    fn with_worker<R>(
-        &self,
-        thread_index: u32,
-        operation: impl FnOnce(&mut SessionWorker, &mut TcpWorker) -> RuntimeResult<R>,
-    ) -> RuntimeResult<R> {
-        session_main().with_worker_mut(thread_index, |sessions| {
-            self.with_tcp_worker(thread_index, |tcp| operation(sessions, tcp))
-        })
-    }
-
-    fn with_tcp_worker<R>(
-        &self,
-        thread_index: u32,
-        operation: impl FnOnce(&mut TcpWorker) -> RuntimeResult<R>,
-    ) -> RuntimeResult<R> {
-        let worker = DataWorkerId::try_from(thread_index)
-            .map_err(|_| TcpWorkerError::WorkerUnavailable { thread_index })?;
-        let mut slot =
-            self.worker(worker)?
-                .borrow_mut()
-                .map_err(|source| TcpWorkerError::WorkerAccess {
-                    worker: worker.slot(),
-                    source,
-                })?;
-        operation(&mut slot)
     }
 
     pub fn control(&self) -> &TcpInputControlPlane {
@@ -330,32 +295,22 @@ pub(crate) fn stop_listen(connection_index: u32) -> RuntimeResult<()> {
     main.listeners.close_connection_index(connection_index)
 }
 
-pub(crate) fn connect(endpoint: SessionConnectEndpoint) -> RuntimeResult<()> {
+pub(crate) fn connect(
+    sessions: &mut SessionWorker,
+    endpoint: SessionConnectEndpoint,
+) -> RuntimeResult<()> {
     let local = endpoint.local.ok_or(TcpError::InvalidConnection)?;
     if local.is_ipv4() != endpoint.remote.is_ipv4() || local.port() == 0 {
         return Err(TcpError::InvalidConnection.into());
     }
-    let worker = endpoint.worker;
-    let worker_slot = worker.slot();
-    let (completion, completed) = mpsc::sync_channel(1);
-    hammer_runtime::schedule_on_worker(worker, move |runtime| {
-        let result = TCP_MAIN
-            .get()
-            .ok_or(RuntimeError::PluginStateNotInitialized { plugin: "tcp" })
-            .and_then(|main| {
-                main.with_worker(runtime.thread_index(), |sessions, tcp| {
-                    start_connect(sessions, tcp, endpoint.connection, local, endpoint.remote)
-                })
-            });
-        if completion.send(result).is_err() {
-            return;
-        }
-    })?;
-    completed
-        .recv()
-        .map_err(|_| RuntimeError::DataWorkerCallCanceled {
-            worker: worker_slot,
-        })?
+    let connection = endpoint
+        .connection
+        .ok_or(hammer_service::session::error::SessionError::ApplicationConnectionMissing)?;
+    let mut tcp = TCP_MAIN
+        .get()
+        .ok_or(RuntimeError::PluginStateNotInitialized { plugin: "tcp" })?
+        .worker(endpoint.worker.thread_index())?;
+    start_connect(sessions, &mut tcp, connection, local, endpoint.remote)
 }
 
 fn start_connect(
@@ -549,16 +504,6 @@ fn bind_worker_graph(engine: &mut DataPlaneMain) -> RuntimeResult<()> {
     engine.set_worker_node_runtime_data(tcp_rcv_process, rcv_process_data)?;
     engine.set_worker_node_runtime_data(tcp_syn_sent, syn_sent_data)?;
 
-    if main
-        .worker(worker)?
-        .install(TcpWorker::new(worker, main.protocol))
-        .is_err()
-    {
-        return Err(TcpWorkerError::WorkerAlreadyInstalled {
-            worker: worker.slot(),
-        }
-        .into());
-    }
     engine
         .nodes()
         .set_node_state(session_queue, NodeState::Polling)?;
@@ -585,13 +530,11 @@ fn tcp_session_queue_update_time(
     frame: &mut hammer_core::data_plane::Frame,
     output: &mut SessionQueueOutput,
 ) -> RuntimeResult<()> {
-    TCP_MAIN
+    let mut tcp = TCP_MAIN
         .get()
         .ok_or(RuntimeError::PluginStateNotInitialized { plugin: "tcp" })?
-        .with_tcp_worker(runtime.thread_index(), |tcp| {
-            tcp.update_time(sessions, runtime, output_next, frame, output, now)?;
-            Ok(())
-        })
+        .worker(runtime.thread_index())?;
+    tcp.update_time(sessions, runtime, output_next, frame, output, now)
 }
 
 fn tcp_session_queue_dispatch(
@@ -603,13 +546,20 @@ fn tcp_session_queue_dispatch(
     frame: &mut hammer_core::data_plane::Frame,
     output: &mut SessionQueueOutput,
 ) -> RuntimeResult<()> {
-    TCP_MAIN
+    let mut tcp = TCP_MAIN
         .get()
         .ok_or(RuntimeError::PluginStateNotInitialized { plugin: "tcp" })?
-        .with_tcp_worker(runtime.thread_index(), |tcp| {
-            dispatch_session_queue_events(runtime, sessions, tcp, output_next, frame, output, now)
-                .map(|_| ())
-        })
+        .worker(runtime.thread_index())?;
+    dispatch_session_queue_events(
+        runtime,
+        sessions,
+        &mut *tcp,
+        output_next,
+        frame,
+        output,
+        now,
+    )
+    .map(|_| ())
 }
 
 #[derive(Debug, Error, Clone, Copy, PartialEq, Eq)]

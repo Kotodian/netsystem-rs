@@ -7,7 +7,7 @@
 //! `APP_OPTIONS_FLAGS_IS_BUILTIN`). This slice owns the plugin descriptor and
 //! the Session App registration whose `install` path hands `SessionMain` a
 //! static callback table, plus the `accept` callback: it resolves the owning
-//! `ThreadOwned<HttpWorker>` by Session worker id, branches on the accepted
+//! the existing `HttpWorker` slot by Session worker id, branches on the accepted
 //! Session's metadata exactly as VPP `http_ts_accept_callback`
 //! (http.c:733-740) branches on `SESSION_F_STREAM`, and allocates exactly
 //! one O(1) context — a `ConnectionContext` for a root
@@ -249,10 +249,9 @@ fn execute_request_error_action(
             // Section 4.1) must not recreate the upper request Session
             // (VPP never re-dispatches to the app after terminating the
             // request, http3.c:140-149).
-            main.with_worker(worker.worker(), |http| {
-                http.abort_request_stream(stream, session)
-                    .map_err(RuntimeError::from)
-            })?;
+            main.worker(worker.worker())?
+                .abort_request_stream(stream, session)
+                .map_err(RuntimeError::from)?;
             worker
                 .reset_stream(session, u64::from(code.value()))
                 .map_err(RuntimeError::from)
@@ -275,7 +274,7 @@ fn execute_request_error_action(
 /// http3.c:216-250), and a bootstrap failure rolls the accept back as
 /// `http3_conn_terminate` does (http3.c:152-165).
 /// Here the per-worker `HttpWorker` slot is resolved by the Session's
-/// `DataWorkerId` (`HttpMain::with_worker`, listener.rs) and the publication
+/// `DataWorkerId` (`HttpMain::worker`, listener.rs) and the publication
 /// is the Session worker's opaque `set_app_session`, with the allocated
 /// context removed directly when publication fails so the primary typed
 /// error is preserved (QUIC publish rollback, quic session_app.rs:37-49).
@@ -333,26 +332,29 @@ fn accept_connection(
     session: u32,
     role: Option<SessionEndpointRole>,
 ) -> RuntimeResult<()> {
-    let context = main.with_worker(worker.worker(), |http| {
-        http.allocate_with_role(session, role)
-            .map_err(RuntimeError::from)
-    })?;
+    let context = main
+        .worker(worker.worker())?
+        .allocate_with_role(session, role)
+        .map_err(RuntimeError::from)?;
     if let Err(error) = worker.set_app_session(session, u64::from(context)) {
         // Rollback is best effort and must not replace the primary
         // set_app_session error, mirroring the QUIC publish path
         // (quic session_app.rs:42-47).
-        let _ = main.with_worker(worker.worker(), |http| {
-            http.remove(context).map_err(RuntimeError::from)
-        });
+        drop(
+            main.worker(worker.worker())
+                .and_then(|mut http| http.remove(context).map_err(RuntimeError::from)),
+        );
         return Err(error);
     }
-    if let Err(error) = main.with_worker(worker.worker(), |http| {
+    let bootstrap = {
+        let mut http = main.worker(worker.worker())?;
         // The local uni control stream is opened exactly once per accepted
         // connection, with the published `u32` as its app context,
         // mirroring `http3_conn_init`'s first stream (http3.c:223-234).
         http.bootstrap_control_stream(context, worker, u64::from(context))
             .map_err(RuntimeError::from)
-    }) {
+    };
+    if let Err(error) = bootstrap {
         // VPP `http3_conn_terminate` (http3.c:152-165) after a failed
         // control-stream open (http3.c:228): roll the direct owner/index
         // paths back in reverse order, each best effort so the primary
@@ -361,9 +363,10 @@ fn accept_connection(
         // the connection context released, and the lower connection closed
         // with the VPP H3_INTERNAL_ERROR code.
         let _ = worker.set_app_session(session, 0);
-        let _ = main.with_worker(worker.worker(), |http| {
-            http.remove(context).map_err(RuntimeError::from)
-        });
+        drop(
+            main.worker(worker.worker())
+                .and_then(|mut http| http.remove(context).map_err(RuntimeError::from)),
+        );
         let _ = worker.close_connection(session, H3_INTERNAL_ERROR, &[]);
         return Err(error);
     }
@@ -397,17 +400,18 @@ fn accept_stream(
     } else {
         SessionStreamDirection::Bidi
     };
-    let stream = main.with_worker(worker.worker(), |http| {
-        http.allocate_stream(session, parent, direction)
-            .map_err(RuntimeError::from)
-    })?;
+    let stream = main
+        .worker(worker.worker())?
+        .allocate_stream(session, parent, direction)
+        .map_err(RuntimeError::from)?;
     if let Err(error) = worker.set_app_session(session, u64::from(stream)) {
         // Rollback is best effort and must not replace the primary
         // set_app_session error, mirroring the QUIC publish path
         // (quic session_app.rs:42-47).
-        let _ = main.with_worker(worker.worker(), |http| {
-            http.remove_stream(stream).map_err(RuntimeError::from)
-        });
+        drop(
+            main.worker(worker.worker())
+                .and_then(|mut http| http.remove_stream(stream).map_err(RuntimeError::from)),
+        );
         return Err(error);
     }
     Ok(())
@@ -419,7 +423,7 @@ fn accept_stream(
 /// callback with the Session's published app-state identity naming the
 /// generation-checked `u32`; a RESET is dispatched separately
 /// through the `reset` callback. The owning `HttpWorker`
-/// is resolved by the Session worker id (`HttpMain::with_worker`,
+/// is resolved by the Session worker id (`HttpMain::worker`,
 /// listener.rs) and the stream context is generation/session-checked with
 /// `HttpWorker::get_stream_for_session` before any mutation, exactly as
 /// `accept` resolves the worker and checks its metadata.
@@ -490,12 +494,13 @@ pub(crate) fn disconnect_on(
         return Ok(());
     }
     let stream = u32::try_from(context).map_err(|_| HttpAppError::ContextOutOfRange { context })?;
-    let (direction, aborted) = main.with_worker(worker.worker(), |http| {
+    let (direction, aborted) = {
+        let http = main.worker(worker.worker())?;
         let stream_context = http
             .get_stream_for_session(stream, session)
             .map_err(RuntimeError::from)?;
-        Ok((stream_context.direction, stream_context.aborted))
-    })?;
+        (stream_context.direction, stream_context.aborted)
+    };
     if direction != SessionStreamDirection::Uni {
         // Bidi/request FIN completes the request: the declared body must be
         // fully received before any cleanup (`validate_request_finish`, a
@@ -518,28 +523,27 @@ pub(crate) fn disconnect_on(
         // The upper removal is a no-op and the live lower stream context is
         // still released in the same order.
         if !aborted {
-            main.with_worker(worker.worker(), |http| {
-                http.validate_request_finish(stream, session)
-                    .map_err(|error| match error {
-                        RequestReadError::Worker(inner) => RuntimeError::from(inner),
-                        RequestReadError::Protocol(error) => {
-                            RuntimeError::from(HttpAppError::RequestFinishProtocol {
-                                code: error.error_code(),
-                            })
-                        }
-                    })
-            })?;
+            main.worker(worker.worker())?
+                .validate_request_finish(stream, session)
+                .map_err(|error| match error {
+                    RequestReadError::Worker(inner) => RuntimeError::from(inner),
+                    RequestReadError::Protocol(error) => {
+                        RuntimeError::from(HttpAppError::RequestFinishProtocol {
+                            code: error.error_code(),
+                        })
+                    }
+                })?;
         }
         if let Some(upper) = worker.upper_session(session) {
             worker.remove_upper_session(upper)?;
         }
-        main.with_worker(worker.worker(), |http| {
-            http.release_request_stream(stream, session)
-                .map_err(RuntimeError::from)
-        })?;
+        main.worker(worker.worker())?
+            .release_request_stream(stream, session)
+            .map_err(RuntimeError::from)?;
         return Ok(());
     }
-    main.with_worker(worker.worker(), |http| {
+    let mut http = main.worker(worker.worker())?;
+    {
         let peer_role = http
             .get_stream_for_session(stream, session)
             .map_err(RuntimeError::from)?
@@ -580,7 +584,7 @@ pub(crate) fn disconnect_on(
                 http.remove_stream(stream).map_err(RuntimeError::from)
             }
         }
-    })
+    }
 }
 
 /// Session App `reset` for a peer HTTP/3 unidirectional stream RESET.
@@ -637,14 +641,13 @@ fn stream_direction(
     stream: u32,
     session: u32,
 ) -> RuntimeResult<Option<SessionStreamDirection>> {
-    main.with_worker(worker.worker(), |http| {
-        http.get_stream_for_session(stream, session)
-            .map(|stream_context| Some(stream_context.direction))
-            .or_else(|error| match error {
-                HttpWorkerError::StreamMissing { .. } => Ok(None),
-                error => Err(RuntimeError::from(error)),
-            })
-    })
+    main.worker(worker.worker())?
+        .get_stream_for_session(stream, session)
+        .map(|stream_context| Some(stream_context.direction))
+        .or_else(|error| match error {
+            HttpWorkerError::StreamMissing { .. } => Ok(None),
+            error => Err(RuntimeError::from(error)),
+        })
 }
 
 /// `reset` on a caller-resolved authority, so unit tests own their `HttpMain`
@@ -691,18 +694,20 @@ pub(crate) fn reset_on(
         if let Some(upper) = worker.upper_session(session) {
             worker.remove_upper_session(upper)?;
         }
-        main.with_worker(worker.worker(), |http| {
-            match http.release_request_stream(stream, session) {
-                Ok(()) => Ok(()),
-                // The release is the generation-checked ownership boundary; an
-                // already-released identity stays a no-op.
-                Err(HttpWorkerError::StreamMissing { .. }) => Ok(()),
-                Err(error) => Err(RuntimeError::from(error)),
-            }
-        })?;
+        match main
+            .worker(worker.worker())?
+            .release_request_stream(stream, session)
+        {
+            Ok(()) => {}
+            // The release is the generation-checked ownership boundary; an
+            // already-released identity stays a no-op.
+            Err(HttpWorkerError::StreamMissing { .. }) => {}
+            Err(error) => return Err(RuntimeError::from(error)),
+        }
         return Ok(());
     }
-    main.with_worker(worker.worker(), |http| {
+    let http = main.worker(worker.worker())?;
+    {
         let reset = match http.classify_peer_uni_stream_reset(stream) {
             Ok(reset) => reset,
             // An already-released identity means the first reset already
@@ -714,7 +719,7 @@ pub(crate) fn reset_on(
             .close_connection(reset.session, u64::from(reset.error_code.value()), &[])
             .map_err(RuntimeError::from)?;
         Ok(())
-    })
+    }
 }
 
 /// Session App `cleanup` for a Session whose SessionWorker entry is being
@@ -797,11 +802,11 @@ pub(crate) fn cleanup_on(
             // the SETTINGS reader when this stream was the registered peer
             // control stream. An identity the FIN seam already released is
             // a no-op.
-            main.with_worker(worker.worker(), |http| match http.remove_stream(stream) {
+            match main.worker(worker.worker())?.remove_stream(stream) {
                 Ok(()) => Ok(()),
                 Err(HttpWorkerError::StreamMissing { .. }) => Ok(()),
                 Err(error) => Err(RuntimeError::from(error)),
-            })?;
+            }?;
             return Ok(());
         }
         // A bidi request stream's cleanup removes the upper request Session
@@ -811,10 +816,9 @@ pub(crate) fn cleanup_on(
         if let Some(upper) = worker.upper_session(session) {
             worker.remove_upper_session(upper)?;
         }
-        main.with_worker(worker.worker(), |http| {
-            http.release_request_stream(stream, session)
-                .map_err(RuntimeError::from)
-        })?;
+        main.worker(worker.worker())?
+            .release_request_stream(stream, session)
+            .map_err(RuntimeError::from)?;
         return Ok(());
     }
     // Root connection cleanup, mirroring VPP `http3_conn_cleanup_callback`
@@ -822,11 +826,11 @@ pub(crate) fn cleanup_on(
     // published app session is cleared (delete-before-free); clearing makes
     // a later dispatch a no-op. The Session entry itself is freed by the
     // SessionWorker after the callback.
-    main.with_worker(worker.worker(), |http| {
-        let context =
-            u32::try_from(context).map_err(|_| HttpAppError::ContextOutOfRange { context })?;
-        http.remove(context).map_err(RuntimeError::from)
-    })?;
+    let context =
+        u32::try_from(context).map_err(|_| HttpAppError::ContextOutOfRange { context })?;
+    main.worker(worker.worker())?
+        .remove(context)
+        .map_err(RuntimeError::from)?;
     worker.set_app_session(session, 0)
 }
 
@@ -941,11 +945,11 @@ pub(crate) fn builtin_rx_on(
     // attached upper can be aborted (the abort removed it), so live streams
     // pay no extra lookup.
     if upper.is_none()
-        && main.with_worker(worker.worker(), |http| {
-            http.get_stream_for_session(stream, lower)
-                .map(|stream_context| stream_context.aborted)
-                .map_err(RuntimeError::from)
-        })?
+        && main
+            .worker(worker.worker())?
+            .get_stream_for_session(stream, lower)
+            .map(|stream_context| stream_context.aborted)
+            .map_err(RuntimeError::from)?
     {
         // Drain every readable lower byte without feeding the request
         // reader: no HEADERS publication, no upper re-creation, no stream
@@ -976,8 +980,9 @@ pub(crate) fn builtin_rx_on(
             ),
             None => None,
         };
+        let mut http = main.worker(worker.worker())?;
         let outcome =
-            main.with_worker(worker.worker(), |http| {
+            (|| -> RuntimeResult<FeedOutcome> {
                 // The encoded block and its exact lower-FIFO consumed count: on
                 // a publication retry the retained pending section is ready to
                 // publish again (borrowed below, never re-fed); otherwise a
@@ -1193,7 +1198,8 @@ pub(crate) fn builtin_rx_on(
                         produced: 0,
                         action: None,
                     }))
-            })?;
+            })();
+        let outcome = outcome?;
         // Dequeue now the bytes the reader consumed into partial-frame state
         // (or an erroring frame's fed bytes, or a committed DATA chunk's
         // frame); the bytes of a completed section dequeue only after the
@@ -1245,7 +1251,8 @@ pub(crate) fn builtin_rx_on(
         .ok_or(SessionError::SessionMissing { session_id: upper })?;
     // Publish the retained section all-or-nothing into the upper RX FIFO
     // (QPACK decode, request validation, one `InboundRequest` write).
-    let published = main.with_worker(worker.worker(), |http| {
+    let mut http = main.worker(worker.worker())?;
+    let published = (|| -> RuntimeResult<Option<(usize, usize, Option<RequestErrorAction>)>> {
         let produced_before = upper_rx.max_dequeue();
         // The slot owns the retained section; borrow it back for
         // publication. A successful retain always leaves it pending (the
@@ -1288,7 +1295,7 @@ pub(crate) fn builtin_rx_on(
                 Ok(Some((0, 0, Some(action))))
             }
         }
-    })?;
+    })()?;
     let Some((produced, section_consumed, action)) = published else {
         // FIFO capacity backpressure: the retained pending section and the
         // unconsumed lower bytes both stay intact — the exact dequeue

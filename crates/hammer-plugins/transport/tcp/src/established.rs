@@ -2,7 +2,7 @@ use crate::{publish_tcp_connection, read_session_id};
 use hammer_core::data_plane::{DEFAULT_BUFFER_FRAME_CAPACITY, Frame, NodeId, NodeNext};
 use hammer_runtime::{DataPlaneMain, Node, NodeProcessFn, NodeRuntime};
 use hammer_runtime::{RuntimeError, RuntimeResult};
-use hammer_service::session::runtime::RxDelivery;
+use hammer_service::session::runtime::{RxDelivery, session_main};
 
 use super::TcpNodeError;
 use super::segment::tcp_packet;
@@ -133,7 +133,12 @@ fn tcp_established_index(
     let main = crate::TCP_MAIN
         .get()
         .ok_or(RuntimeError::PluginStateNotInitialized { plugin: "tcp" })?;
-    let tx_segment = main.with_worker(runtime.thread_index(), |sessions, tcp| {
+    // SAFETY: this Node executes on the DataPlaneMain's owning runtime thread.
+    let mut sessions = unsafe { session_main().worker(runtime.thread_index()) }?;
+    let mut tcp = main.worker(runtime.thread_index())?;
+    let tx_segment = {
+        let sessions = &mut *sessions;
+        let tcp = &mut *tcp;
         let session_id = read_session_id(runtime, index)?.ok_or_else(|| {
             let _ = runtime.record_current_node_error(TcpNodeError::EstablishedSessionRouteMissing);
             TcpNodeError::EstablishedSessionRouteMissing
@@ -291,8 +296,8 @@ fn tcp_established_index(
         .or(fin_control)
         .or(control);
         publish_tcp_connection(sessions, tcp, session_id)?;
-        Ok(tx_segment)
-    })?;
+        tx_segment
+    };
     if let Some(segment) = tx_segment {
         let mut allocated = 0;
         if runtime.buffer_alloc(core::slice::from_mut(&mut allocated)) != 1 {

@@ -8,7 +8,7 @@ use hammer_runtime::{DataPlaneMain, Node, NodeProcessFn, NodeRuntime};
 use super::connection::TcpConnection;
 use super::segment::{TcpSegment, tcp_packet};
 use super::{TcpInputNext, TcpNodeError, write_session_route_opaque};
-use hammer_service::session::runtime::{RxDelivery, SessionTransport, SessionWorker};
+use hammer_service::session::runtime::{RxDelivery, SessionTransport, SessionWorker, session_main};
 
 const TCP_LISTENER_BACKLOG: usize = 128;
 
@@ -149,17 +149,17 @@ fn tcp_listen_index(
             let _ = runtime.record_current_node_error(TcpNodeError::NoListener);
             TcpError::NoListener
         })?;
-    let (control_segment, established_session) =
-        main.with_worker(runtime.thread_index(), |sessions, tcp| {
-            TcpListener::new(
-                sessions,
-                tcp,
-                listener.id,
-                listener.session_listener,
-                listener.capabilities,
-            )
-            .handle_packet(runtime, index, &packet)
-        })?;
+    // SAFETY: this Node executes on the DataPlaneMain's owning runtime thread.
+    let mut sessions = unsafe { session_main().worker(runtime.thread_index()) }?;
+    let mut tcp = main.worker(runtime.thread_index())?;
+    let (control_segment, established_session) = TcpListener::new(
+        &mut sessions,
+        &mut tcp,
+        listener.id,
+        listener.session_listener,
+        listener.capabilities,
+    )
+    .handle_packet(runtime, index, &packet)?;
 
     if let Some(segment) = control_segment {
         let mut allocated = 0;
