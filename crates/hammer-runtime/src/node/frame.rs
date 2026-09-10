@@ -304,7 +304,7 @@ mod tests {
                 ),
             )
             .unwrap();
-        let mut worker = NodeMain::from(main.snapshot());
+        let mut worker = main.clone();
         let packet_next = worker.prepare_next_frame(input, 0);
         let auxiliary_next = worker.prepare_next_frame(input, 1);
         let packet_address = core::ptr::from_ref(worker.next_frame_mut(packet_next)).addr();
@@ -318,7 +318,7 @@ mod tests {
                 .is_none()
         );
         assert_eq!(worker.frames_in_use(), 2);
-        worker.refork(main.snapshot());
+        worker.refork(main.inner.borrow().clone());
         assert_eq!(worker.frames_in_use(), 0);
         assert!(worker.next_frames.iter().all(|next| next.frame.is_none()));
         // test_vlib.py::test_vlib_mw_refork_frame_leak repeats the same
@@ -356,11 +356,11 @@ mod tests {
             .unwrap()
             .flags = 1 | (1 << 5);
         main.add_node_next_slot(input, punt).unwrap();
-        let mut worker = NodeMain::from(main.snapshot());
+        let mut worker = main.clone();
         let index = worker.prepare_next_frame(input, 0);
         worker.next_frames[index].flags |= ENQUEUE_OWNER | IS_PENDING | (1 << 5);
         worker.next_frames[index].vectors_since_last_overflow = 123;
-        worker.refork(main.snapshot());
+        worker.refork(main.inner.borrow().clone());
         let ordinary = &worker.next_frames[worker.next_frame_indices[input.slot() as usize][0]];
         let retained = &worker.next_frames[worker.next_frame_indices[input.slot() as usize][1]];
         assert_eq!(ordinary.node, output);
@@ -390,7 +390,7 @@ mod tests {
         });
         let (main, _, output) = packet_graph();
         let mut worker = DataPlaneMain::new(crate::DataPlaneBufferConfig::default());
-        worker.nodes = NodeMain::from(main.snapshot());
+        worker.nodes = main.clone();
         for index in 1..=40 {
             let mut frame = worker.get_frame_to_node(output).unwrap();
             frame.set_vector_count(1);
@@ -402,7 +402,7 @@ mod tests {
         assert!(pending.is_empty());
         let address = pending.as_ptr().addr();
         let capacity = pending.capacity();
-        worker.nodes.refork(main.snapshot());
+        worker.nodes.refork(main.inner.borrow().clone());
         let pending = worker.nodes.pending_frames.get_mut();
         assert!(pending.is_empty());
         assert_eq!(pending.as_ptr().addr(), address);
@@ -429,7 +429,7 @@ mod tests {
             thread_index: 3,
             ..Default::default()
         });
-        worker.nodes = NodeMain::from(main.snapshot());
+        worker.nodes = main.clone();
         let mut indices = [0];
         assert_eq!(worker.buffer_alloc(&mut indices), 1);
         let index = indices[0];
@@ -439,7 +439,7 @@ mod tests {
         let frame = worker.nodes.next_frame_mut(next);
         frame.next_args_mut::<u32, ()>(0).0[17] = index;
         assert!(frame.is_empty());
-        worker.nodes.refork(main.snapshot());
+        worker.nodes.refork(main.inner.borrow().clone());
         assert_eq!(worker.buffer(index).ref_count(), references);
         assert_eq!(worker.cached_free_buffers(), cached_free);
         assert_eq!(worker.nodes.frames_in_use(), 0);

@@ -14,9 +14,7 @@ use hammer_infra::align::{CACHE_LINE, CacheLineAlignMark};
 use hammer_infra::bitmap::Bitmap;
 
 use crate::handoff::{DataPlaneHandoffWorker, DataWorkerId, HANDOFF_SLOT_CAPACITY, HandoffSlot};
-use crate::node::{
-    NodeEntry, NodeErrorCode, NodeFunctionRegistration, NodeMain, NodeRuntime, NodeRuntimeInner,
-};
+use crate::node::{NodeEntry, NodeErrorCode, NodeFunctionRegistration, NodeMain, NodeRuntime};
 use crate::runtime_simd::{native_simd_bytes, preferred_frame_batch_width};
 use crate::trace::{DataPlaneTrace, PacketTrace, TraceControlHandle};
 

@@ -1,5 +1,4 @@
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread::JoinHandle;
 use std::time::Duration;
 
@@ -16,9 +15,10 @@ fn data_worker_entry(_: u32) -> RuntimeResult<()> {
 pub struct WorkerThread {
     cacheline0: CacheLineAlignMark,
     barrier: Option<crate::WorkerBarrier>,
-    startup_acknowledged: bool,
     cacheline1: CacheLineAlignMark,
     thread_index: u32,
+    name: &'static str,
+    instance_index: u32,
     cpu_index: Option<u32>,
     numa_node: Option<u32>,
     stack_size: usize,
@@ -28,7 +28,6 @@ pub struct WorkerThread {
     numa_memory_binding: bool,
     entry: fn(u32) -> RuntimeResult<()>,
     no_data_structure_clone: bool,
-    refork_pending: bool,
     join_handle: Option<JoinHandle<RuntimeResult<()>>>,
 }
 
@@ -44,34 +43,11 @@ const _: () = {
 };
 
 impl WorkerThread {
-    pub(crate) fn new_main(
-        cpu_index: Option<u32>,
-        numa_node: Option<u32>,
-        scheduler: WorkerScheduler,
-    ) -> Self {
-        Self {
-            cacheline0: CacheLineAlignMark,
-            barrier: None,
-            startup_acknowledged: true,
-            cacheline1: CacheLineAlignMark,
-            thread_index: 0,
-            cpu_index,
-            numa_node,
-            stack_size: 0,
-            max_blocking_threads: 0,
-            idle_slice: Duration::ZERO,
-            scheduler,
-            numa_memory_binding: false,
-            entry: data_worker_entry,
-            no_data_structure_clone: false,
-            refork_pending: false,
-            join_handle: None,
-        }
-    }
-
     #[allow(clippy::too_many_arguments)]
-    pub(crate) fn new_data_worker(
+    pub(crate) fn new(
         thread_index: u32,
+        name: &'static str,
+        instance_index: u32,
         cpu_index: Option<u32>,
         numa_node: Option<u32>,
         stack_size: usize,
@@ -79,13 +55,21 @@ impl WorkerThread {
         idle_slice: Duration,
         scheduler: WorkerScheduler,
         numa_memory_binding: bool,
+        entry: Option<fn(u32) -> RuntimeResult<()>>,
+        no_data_structure_clone: bool,
     ) -> Self {
+        assert_eq!(
+            entry.is_some(),
+            no_data_structure_clone,
+            "only a no-data-structure-clone registration supplies its own entry"
+        );
         Self {
             cacheline0: CacheLineAlignMark,
             barrier: None,
-            startup_acknowledged: false,
             cacheline1: CacheLineAlignMark,
             thread_index,
+            name,
+            instance_index,
             cpu_index,
             numa_node,
             stack_size,
@@ -93,34 +77,8 @@ impl WorkerThread {
             idle_slice,
             scheduler,
             numa_memory_binding,
-            entry: data_worker_entry,
-            no_data_structure_clone: false,
-            refork_pending: false,
-            join_handle: None,
-        }
-    }
-
-    pub(crate) fn new_auxiliary(
-        thread_index: u32,
-        stack_size: usize,
-        entry: fn(u32) -> RuntimeResult<()>,
-    ) -> Self {
-        Self {
-            cacheline0: CacheLineAlignMark,
-            barrier: None,
-            startup_acknowledged: false,
-            cacheline1: CacheLineAlignMark,
-            thread_index,
-            cpu_index: None,
-            numa_node: None,
-            stack_size,
-            max_blocking_threads: 0,
-            idle_slice: Duration::ZERO,
-            scheduler: WorkerScheduler::default(),
-            numa_memory_binding: false,
-            entry,
-            no_data_structure_clone: true,
-            refork_pending: false,
+            entry: entry.unwrap_or(data_worker_entry),
+            no_data_structure_clone,
             join_handle: None,
         }
     }
@@ -145,68 +103,36 @@ impl WorkerThread {
         self.no_data_structure_clone
     }
 
-    pub(crate) fn apply_current_thread_setup(&self) -> RuntimeResult<u32> {
-        #[cfg(target_os = "linux")]
-        {
-            if let Some(cpu) = self.cpu_index {
-                let cpu = cpu as usize;
-                if !core_affinity::set_for_current(core_affinity::CoreId { id: cpu }) {
-                    return Err(RuntimeError::WorkerCpuAffinity {
-                        thread_index: self.thread_index,
-                        cpu,
-                    });
-                }
-            }
-            apply_scheduler(&self.scheduler)?;
-            let numa_node = self
-                .numa_node
-                .or_else(crate::numa::current_numa_node)
-                .unwrap_or(0);
-            if self.numa_memory_binding {
-                crate::numa::bind_current_thread_memory_to_numa(numa_node)?;
-            }
-            return Ok(numa_node);
-        }
-
-        #[cfg(target_os = "macos")]
-        {
-            apply_qos(&self.scheduler)?;
-            Ok(0)
-        }
-
-        #[cfg(not(any(target_os = "linux", target_os = "macos")))]
-        {
-            Ok(0)
-        }
+    pub(crate) fn install_barrier(&mut self, barrier: crate::WorkerBarrier) {
+        assert!(
+            self.barrier.replace(barrier).is_none(),
+            "barrier installs once"
+        );
     }
 
-    pub(crate) fn launch_auxiliary(&mut self) -> RuntimeResult<()> {
-        assert!(self.no_data_structure_clone);
-        let thread_index = self.thread_index;
-        let entry = self.entry;
-        let thread = std::thread::Builder::new()
-            .name(format!("hammer-auxiliary-{thread_index}"))
-            .stack_size(self.stack_size)
-            .spawn(move || entry(thread_index))
-            .map_err(|source| RuntimeError::DataWorkerThreadSpawn {
-                worker: thread_index as usize,
-                source,
-            })?;
-        self.join_handle = Some(thread);
-        Ok(())
-    }
-
-    pub(crate) fn launch_data_worker(
+    pub(crate) fn launch(
         &mut self,
-        mut main: crate::DataPlaneMain,
-        remote_local: crate::spawn::DataRemoteLocalQueue,
-        init_functions: Vec<&'static crate::init::InitFunction>,
-        barrier: crate::WorkerBarrier,
-        startup_cancelled: Arc<AtomicBool>,
+        main: Option<(
+            Box<crate::DataPlaneMain>,
+            crate::spawn::DataRemoteLocalQueue,
+        )>,
+        init_functions: Arc<[&'static crate::init::InitFunction]>,
     ) -> RuntimeResult<()> {
-        assert!(!self.no_data_structure_clone);
         assert_ne!(self.thread_index, 0);
+        assert_eq!(
+            main.is_none(),
+            self.no_data_structure_clone,
+            "no-data-structure-clone registration controls DataPlaneMain ownership"
+        );
+        assert!(self.join_handle.is_none(), "WorkerThread launches once");
+        let barrier = self
+            .barrier
+            .as_ref()
+            .expect("worker barrier installs before thread launch")
+            .clone();
         let thread_index = self.thread_index;
+        let name = self.name;
+        let instance_index = self.instance_index;
         let cpu_index = self.cpu_index;
         let numa_node = self.numa_node;
         let scheduler = self.scheduler.clone();
@@ -214,35 +140,67 @@ impl WorkerThread {
         let stack_size = self.stack_size;
         let max_blocking_threads = self.max_blocking_threads;
         let idle_slice = self.idle_slice;
+        let entry = self.entry;
         let thread = std::thread::Builder::new()
-            .name(format!("hammer-worker-{thread_index}"))
+            .name(format!("hammer-{name}-{instance_index}"))
             .stack_size(stack_size)
             .spawn(move || -> RuntimeResult<()> {
-                barrier.check();
-                if startup_cancelled.load(Ordering::Acquire) {
-                    return Ok(());
-                }
                 apply_current_thread_setup(
                     thread_index,
                     cpu_index,
                     numa_node,
                     &scheduler,
                     numa_memory_binding,
-                )?;
-                remote_local.attach_current_thread();
+                )
+                .map_err(|source| RuntimeError::ThreadSetup {
+                    thread_index,
+                    source: Box::new(source),
+                })?;
+                let runtime = if main.is_some() {
+                    Some(
+                        tokio::runtime::Builder::new_current_thread()
+                            .max_blocking_threads(max_blocking_threads)
+                            .enable_all()
+                            .build()
+                            .map_err(|source| RuntimeError::DataWorkerRuntime {
+                                worker: thread_index,
+                                source,
+                            })?,
+                    )
+                } else {
+                    None
+                };
+                if let Some((_, remote_local)) = &main {
+                    remote_local.attach_current_thread();
+                }
+                let refork_required = barrier.check_for_refork();
+                if barrier.startup_cancelled() {
+                    assert!(
+                        !refork_required,
+                        "startup cancellation cannot publish a graph refork"
+                    );
+                    if let Some((_, remote_local)) = &main {
+                        remote_local.close();
+                    }
+                    return Ok(());
+                }
+
+                let Some((mut main, remote_local)) = main else {
+                    assert!(
+                        !refork_required,
+                        "a no-data-structure-clone thread cannot refork a graph"
+                    );
+                    return entry(thread_index);
+                };
+                if refork_required {
+                    barrier.refork(&mut main.nodes);
+                }
+                let runtime = runtime.expect("Data Worker builds its Tokio runtime before launch");
                 if let Err(error) =
                     crate::init::run_worker_init_functions(&mut main, &init_functions)
                 {
                     tracing::error!(worker = thread_index, %error, "worker initialization failed");
                 }
-                let runtime = tokio::runtime::Builder::new_current_thread()
-                    .max_blocking_threads(max_blocking_threads)
-                    .enable_all()
-                    .build()
-                    .map_err(|source| RuntimeError::DataWorkerRuntime {
-                        worker: thread_index,
-                        source,
-                    })?;
                 let exit_status = crate::main_loop::data_plane_main_loop(
                     &mut main,
                     &runtime,
@@ -259,33 +217,13 @@ impl WorkerThread {
                     })
                 }
             })
-            .map_err(|source| RuntimeError::DataWorkerThreadSpawn {
-                worker: thread_index as usize - 1,
+            .map_err(|source| RuntimeError::ThreadSpawn {
+                thread_index,
+                name,
                 source,
             })?;
         self.join_handle = Some(thread);
         Ok(())
-    }
-
-    pub(crate) fn acknowledge_startup(&mut self) {
-        self.startup_acknowledged = true;
-    }
-
-    pub(crate) fn install_barrier(&mut self, barrier: crate::WorkerBarrier) {
-        self.barrier = Some(barrier);
-    }
-
-    pub(crate) fn request_refork(&mut self) {
-        self.refork_pending = true;
-    }
-
-    pub(crate) fn complete_refork(&mut self) {
-        self.refork_pending = false;
-    }
-
-    pub(crate) fn retain_join_handle(&mut self, handle: JoinHandle<RuntimeResult<()>>) {
-        assert!(self.join_handle.is_none(), "WorkerThread launches once");
-        self.join_handle = Some(handle);
     }
 
     pub(crate) fn join(&mut self) -> RuntimeResult<()> {
@@ -302,18 +240,6 @@ impl WorkerThread {
         self.join_handle
             .as_ref()
             .is_some_and(JoinHandle::is_finished)
-    }
-
-    pub(crate) fn stack_size(&self) -> usize {
-        self.stack_size
-    }
-
-    pub(crate) fn max_blocking_threads(&self) -> usize {
-        self.max_blocking_threads
-    }
-
-    pub(crate) fn idle_slice(&self) -> Duration {
-        self.idle_slice
     }
 }
 

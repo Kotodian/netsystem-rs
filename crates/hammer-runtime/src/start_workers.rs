@@ -1,6 +1,5 @@
 use core::hint::spin_loop;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Instant;
 
 use crate::error::{RuntimeError, RuntimeResult};
@@ -14,9 +13,15 @@ pub fn start_workers(
     global: &mut GlobalMain,
 ) -> RuntimeResult<()> {
     let worker_count = threads.worker_count();
-    let barrier = barrier::install(worker_count);
-    barrier.arm();
-    let startup_cancelled = Arc::new(AtomicBool::new(false));
+    let participant_count = threads
+        .thread_count()
+        .checked_sub(1)
+        .expect("configured ThreadMain includes thread zero");
+    let init_order = crate::init::topological_order(&global.worker_init_function_registrations)?;
+    let init_functions: Arc<[&'static crate::init::InitFunction]> = init_order
+        .into_iter()
+        .map(|index| global.worker_init_function_registrations[index])
+        .collect();
     let handoff = DataPlaneHandoff::with_node_capacity(
         worker_count as usize,
         crate::config::worker::handoff().queue_capacity,
@@ -26,7 +31,6 @@ pub fn start_workers(
         .map(|_| spawn::DataRemoteLocalQueue::new(crate::config::worker::control().queue_capacity))
         .collect::<Vec<_>>()
         .into();
-    spawn::install_worker_control_queues(Arc::clone(&queues));
 
     let mut worker_mains = Vec::with_capacity(worker_count as usize);
     for worker_slot in 0..worker_count {
@@ -35,44 +39,47 @@ pub fn start_workers(
             .thread_by_index(thread_index)
             .expect("configured worker descriptor exists");
         let (nodes, simd_bytes, _, trace_control) = main.worker_parts();
-        worker_mains.push(DataPlaneMain::new_worker(
+        worker_mains.push(Box::new(DataPlaneMain::new_worker(
             nodes,
             simd_bytes,
             Some(handoff.worker(DataWorkerId::new(worker_slot))),
             trace_control,
             thread_index,
             descriptor.numa_node().unwrap_or(0),
-        )?);
+        )?));
     }
 
+    spawn::install_worker_control_queues(Arc::clone(&queues));
+    let barrier = barrier::install(worker_count, participant_count);
+    barrier.arm();
     for (worker_slot, worker_main) in worker_mains.into_iter().enumerate() {
         let thread_index = worker_slot as u32 + 1;
         let descriptor = threads
             .thread_by_index_mut(thread_index)
             .expect("configured worker descriptor exists");
         descriptor.install_barrier(barrier.clone());
-        if let Err(error) = descriptor.launch_data_worker(
-            worker_main,
-            queues[worker_slot].clone(),
-            global.worker_init_function_registrations.clone(),
-            barrier.clone(),
-            Arc::clone(&startup_cancelled),
+        if let Err(error) = descriptor.launch(
+            Some((worker_main, queues[worker_slot].clone())),
+            Arc::clone(&init_functions),
         ) {
-            return Err(abort_workers(threads, &barrier, &startup_cancelled, error));
+            return Err(abort_workers(threads, &barrier, error));
+        }
+    }
+    for thread_index in worker_count + 1..threads.thread_count() {
+        let descriptor = threads
+            .thread_by_index_mut(thread_index)
+            .expect("registered runtime thread descriptor exists");
+        descriptor.install_barrier(barrier.clone());
+        if let Err(error) = descriptor.launch(None, Arc::clone(&init_functions)) {
+            return Err(abort_workers(threads, &barrier, error));
         }
     }
 
     if let Err(error) = wait_for_workers_at_barrier(threads, &barrier) {
-        return Err(abort_workers(threads, &barrier, &startup_cancelled, error));
+        return Err(abort_workers(threads, &barrier, error));
     }
     if let Err(error) = crate::init::run_num_workers_change(global, main) {
-        return Err(abort_workers(threads, &barrier, &startup_cancelled, error));
-    }
-    for thread_index in 1..=worker_count {
-        threads
-            .thread_by_index_mut(thread_index)
-            .expect("configured worker descriptor exists")
-            .acknowledge_startup();
+        return Err(abort_workers(threads, &barrier, error));
     }
     barrier.release();
     Ok(())
@@ -90,7 +97,7 @@ pub fn stop_workers(threads: &mut ThreadMain, status: i32) -> RuntimeResult<()> 
             }
         }
     }
-    for thread_index in 1..=worker_count {
+    for thread_index in 1..threads.thread_count() {
         threads
             .thread_by_index_mut(thread_index)
             .expect("configured worker descriptor exists")
@@ -100,24 +107,35 @@ pub fn stop_workers(threads: &mut ThreadMain, status: i32) -> RuntimeResult<()> 
 }
 
 fn wait_for_workers_at_barrier(
-    threads: &ThreadMain,
+    threads: &mut ThreadMain,
     barrier: &barrier::WorkerBarrier,
 ) -> RuntimeResult<()> {
     let deadline = Instant::now() + barrier::BARRIER_SYNC_TIMEOUT;
     loop {
         let observed = barrier.paused_workers();
-        if observed == barrier.worker_count() {
+        if observed == barrier.participant_count() {
             return Ok(());
         }
-        if (1..=threads.worker_count()).any(|thread_index| {
+        if let Some(thread_index) = (1..threads.thread_count()).find(|&thread_index| {
             threads
                 .thread_by_index(thread_index)
                 .is_some_and(crate::WorkerThread::is_finished)
         }) {
-            return Err(RuntimeError::WorkerExitedBeforeStartupBarrier { phase: "launch" });
+            return match threads
+                .thread_by_index_mut(thread_index)
+                .expect("finished runtime thread descriptor exists")
+                .join()
+            {
+                Err(error) => Err(error),
+                Ok(()) => Err(RuntimeError::ThreadExitedBeforeStartupBarrier { thread_index }),
+            };
         }
         if Instant::now() > deadline {
-            barrier::barrier_deadlock("worker launch barrier", barrier.worker_count(), observed);
+            barrier::barrier_deadlock(
+                "worker launch barrier",
+                barrier.participant_count(),
+                observed,
+            );
         }
         spin_loop();
     }
@@ -126,12 +144,11 @@ fn wait_for_workers_at_barrier(
 fn abort_workers(
     threads: &mut ThreadMain,
     barrier: &barrier::WorkerBarrier,
-    startup_cancelled: &AtomicBool,
     startup_error: RuntimeError,
 ) -> RuntimeError {
-    startup_cancelled.store(true, Ordering::Release);
+    barrier.cancel_startup();
     barrier.release();
-    for thread_index in 1..=threads.worker_count() {
+    for thread_index in 1..threads.thread_count() {
         if let Some(thread) = threads.thread_by_index_mut(thread_index)
             && let Err(error) = thread.join()
         {

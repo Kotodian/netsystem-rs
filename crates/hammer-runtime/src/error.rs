@@ -141,15 +141,16 @@ pub enum RuntimeError {
     WorkerConfigurationFieldUnknown { field: String },
     #[error("data workers are already started")]
     DataWorkersAlreadyStarted,
-    #[error("data worker {worker} thread setup failed")]
-    DataWorkerThreadSetup {
-        worker: usize,
+    #[error("runtime thread {thread_index} setup failed")]
+    ThreadSetup {
+        thread_index: u32,
         #[source]
         source: Box<RuntimeError>,
     },
-    #[error("failed to spawn data worker {worker} thread")]
-    DataWorkerThreadSpawn {
-        worker: usize,
+    #[error("failed to spawn runtime thread {thread_index} for registration `{name}`")]
+    ThreadSpawn {
+        thread_index: u32,
+        name: &'static str,
         #[source]
         source: std::io::Error,
     },
@@ -166,6 +167,13 @@ pub enum RuntimeError {
     },
     #[error("data worker {worker} exited with status {status}")]
     DataWorkerExited { worker: u32, status: i32 },
+    #[error("data worker {worker} callback `{function}` initialization failed")]
+    WorkerInitialization {
+        worker: u32,
+        function: &'static str,
+        #[source]
+        source: Box<RuntimeError>,
+    },
     #[error("data worker {worker} control call was canceled")]
     DataWorkerCallCanceled { worker: usize },
     #[error("data worker index {worker} is outside configured worker count {worker_count}")]
@@ -258,8 +266,8 @@ pub enum RuntimeError {
     NodeDispatchContextMissing,
     #[error("required runtime capability `{type_name}` is not registered")]
     RuntimeCapabilityMissing { type_name: &'static str },
-    #[error("data worker exited before reaching the {phase} barrier")]
-    WorkerExitedBeforeStartupBarrier { phase: &'static str },
+    #[error("runtime thread {thread_index} exited before reaching the startup barrier")]
+    ThreadExitedBeforeStartupBarrier { thread_index: u32 },
     #[error("data worker requested exit during initialization")]
     WorkerRequestedExitDuringInitialization,
     #[error("system clock is before the Unix epoch")]

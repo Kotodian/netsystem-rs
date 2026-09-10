@@ -233,7 +233,24 @@ pub fn run_worker_init_functions(
     functions: &[&'static InitFunction],
 ) -> RuntimeResult<()> {
     let mut called = std::mem::take(&mut main.worker_init_functions_called);
-    let result = dispatch_init(functions, &mut called, main);
+    let worker = main.thread_index();
+    let mut result = Ok(());
+    for function in functions {
+        let callback_index = function
+            .callback_index()
+            .expect("worker-init callback index is assigned during registration");
+        if !called.set(callback_index) {
+            continue;
+        }
+        if let Err(source) = (function.func)(main) {
+            result = Err(crate::RuntimeError::WorkerInitialization {
+                worker,
+                function: function.name,
+                source: Box::new(source),
+            });
+            break;
+        }
+    }
     main.worker_init_functions_called = called;
     result
 }

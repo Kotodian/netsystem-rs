@@ -60,8 +60,9 @@ pub fn data_plane_main_loop(
         // Step 1: Barrier check — VPP threads.c:296
         if let Some(barrier) = crate::barrier::global()
             && barrier.is_pending()
+            && barrier.check_for_refork()
         {
-            barrier.check();
+            barrier.refork(&mut main.nodes);
         }
 
         // Step 2: Poll worker-local File readiness before graph dispatch.

@@ -855,7 +855,12 @@ impl NodeRuntimeInner {
             .ok_or(RuntimeError::NodeNextSlotNotRegistered { node, slot })
     }
 
-    fn set_node_next_slot(&mut self, node: NodeId, slot: usize, next: NodeId) -> RuntimeResult<()> {
+    fn set_node_next_slot(
+        &mut self,
+        node: NodeId,
+        slot: usize,
+        next: NodeId,
+    ) -> RuntimeResult<bool> {
         let next_count = self
             .next_nodes
             .get(node.slot() as usize)
@@ -886,6 +891,9 @@ impl NodeRuntimeInner {
                 );
             }
         }
+        let changed = group
+            .iter()
+            .any(|sibling| self.next_nodes[sibling.slot() as usize][slot] != Some(next));
         for sibling in group {
             let sibling_slot = sibling.slot() as usize;
             if !self.pending_next_names[sibling_slot].is_empty() {
@@ -893,7 +901,7 @@ impl NodeRuntimeInner {
             }
             self.next_nodes[sibling_slot][slot] = Some(next);
         }
-        Ok(())
+        Ok(changed)
     }
 
     fn add_node_next_slots(
@@ -1065,6 +1073,12 @@ impl Default for NodeMain {
     }
 }
 
+impl Clone for NodeMain {
+    fn clone(&self) -> Self {
+        Self::from(self.inner.borrow().clone())
+    }
+}
+
 impl From<NodeRuntimeInner> for NodeMain {
     fn from(inner: NodeRuntimeInner) -> Self {
         debug_assert!(
@@ -1217,10 +1231,6 @@ impl NodeMain {
             siblings: Vec::new(),
         };
         Ok(())
-    }
-
-    pub(crate) fn snapshot(&self) -> NodeRuntimeInner {
-        self.inner.borrow().clone()
     }
 
     pub(crate) fn refork(&mut self, mut graph: NodeRuntimeInner) {
@@ -1760,10 +1770,19 @@ impl NodeMain {
 
     pub fn set_node_next_slot(&self, node: NodeId, slot: usize, next: NodeId) -> RuntimeResult<()> {
         self.ensure_topology_owner()?;
+        let barrier = crate::barrier::global().filter(|barrier| barrier.worker_count() != 0);
+        if barrier.is_some() {
+            crate::barrier::__assert_held();
+        }
         let mut inner = self.inner.borrow_mut();
         inner.validate_node(node)?;
         inner.validate_node(next)?;
-        inner.set_node_next_slot(node, slot, next)
+        let changed = inner.set_node_next_slot(node, slot, next)?;
+        drop(inner);
+        if changed && let Some(barrier) = barrier {
+            barrier.request_node_refork(self.inner.borrow().clone());
+        }
+        Ok(())
     }
 
     pub fn add_node_next_slot(&self, node: NodeId, next: NodeId) -> RuntimeResult<u16> {
@@ -1798,8 +1817,14 @@ impl NodeMain {
             }
         }
         let mut inner = self.inner.borrow_mut();
-        let (slots, _) = inner.add_node_next_slots(edges, shared_slots)?;
+        let (slots, changed) = inner.add_node_next_slots(edges, shared_slots)?;
         drop(inner);
+        if changed
+            && let Some(barrier) =
+                crate::barrier::global().filter(|barrier| barrier.worker_count() != 0)
+        {
+            barrier.request_node_refork(self.inner.borrow().clone());
+        }
         Ok(slots)
     }
 
@@ -1999,7 +2024,7 @@ mod tests {
                 ),
             )
             .expect("register existing node");
-        let mut worker = NodeMain::from(main.snapshot());
+        let mut worker = main.clone();
         let worker_data = NodeRuntime::from_words([9, 8, 7, 6]);
         worker
             .set_node_runtime_data(existing, worker_data)
@@ -2023,7 +2048,7 @@ mod tests {
                 ),
             )
             .expect("register added node");
-        worker.refork(main.snapshot());
+        worker.refork(main.inner.borrow().clone());
 
         assert_eq!(worker.node_runtime_data(existing).unwrap(), worker_data);
         assert_eq!(worker.node_state(existing).unwrap(), NodeState::Interrupt);

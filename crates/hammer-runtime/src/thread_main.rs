@@ -140,10 +140,19 @@ impl ThreadMain {
         let main_cpu = cpu
             .main_core
             .or_else(|| usize::try_from(unsafe { libc::sched_getcpu() }).ok());
-        self.worker_threads.push(WorkerThread::new_main(
+        self.worker_threads.push(WorkerThread::new(
+            0,
+            "main",
+            0,
             main_cpu.and_then(|cpu| u32::try_from(cpu).ok()),
             main_cpu.map(crate::numa::node_for_cpu).transpose()?,
+            0,
+            0,
+            Duration::ZERO,
             scheduler.clone(),
+            false,
+            None,
+            false,
         ));
         for (slot, cpu_index) in cores.into_iter().enumerate() {
             let thread_index =
@@ -151,8 +160,10 @@ impl ThreadMain {
                     count: worker_count_usize,
                 })?;
             let numa_node = crate::numa::node_for_cpu(cpu_index)?;
-            self.worker_threads.push(WorkerThread::new_data_worker(
+            self.worker_threads.push(WorkerThread::new(
                 thread_index,
+                "workers",
+                u32::try_from(slot).expect("worker slot fits configured u32 count"),
                 Some(
                     u32::try_from(cpu_index)
                         .map_err(|_| RuntimeError::CpuIndexOverflow { cpu: cpu_index })?,
@@ -163,6 +174,8 @@ impl ThreadMain {
                 idle_slice,
                 scheduler.clone(),
                 numa.enabled,
+                None,
+                false,
             ));
         }
         self.worker_count = worker_count;
@@ -187,21 +200,37 @@ impl ThreadMain {
         );
         Self::validate_thread_fields(worker_count as usize, stack_size, max_blocking_threads)?;
         scheduler.validate()?;
-        self.worker_threads
-            .push(WorkerThread::new_main(None, Some(0), scheduler.clone()));
+        self.worker_threads.push(WorkerThread::new(
+            0,
+            "main",
+            0,
+            None,
+            Some(0),
+            0,
+            0,
+            Duration::ZERO,
+            scheduler.clone(),
+            false,
+            None,
+            false,
+        ));
         for slot in 0..worker_count as usize {
             let thread_index =
                 u32::try_from(slot + 1).map_err(|_| RuntimeError::WorkerCountOverflow {
                     count: worker_count as usize,
                 })?;
-            self.worker_threads.push(WorkerThread::new_data_worker(
+            self.worker_threads.push(WorkerThread::new(
                 thread_index,
+                "workers",
+                u32::try_from(slot).expect("worker slot fits configured u32 count"),
                 None,
                 Some(0),
                 stack_size,
                 max_blocking_threads,
                 idle_slice,
                 scheduler.clone(),
+                false,
+                None,
                 false,
             ));
         }
@@ -297,21 +326,40 @@ impl ThreadMain {
         &mut self.worker_threads
     }
 
-    pub(crate) fn register_auxiliary(
+    pub fn register_thread(
         &mut self,
+        name: &'static str,
         count: u32,
         stack_size: usize,
         entry: fn(u32) -> RuntimeResult<()>,
     ) -> RuntimeResult<()> {
-        for _ in 0..count {
-            let thread_index = self.thread_count;
-            self.worker_threads
-                .push(WorkerThread::new_auxiliary(thread_index, stack_size, entry));
-            self.thread_count = self
+        assert!(!name.is_empty(), "runtime thread registration has a name");
+        assert!(stack_size != 0, "runtime thread registration has a stack");
+        let next_thread_index = self
+            .thread_count
+            .checked_add(count)
+            .ok_or(RuntimeError::ThreadCountOverflow)?;
+        for instance_index in 0..count {
+            let thread_index = self
                 .thread_count
-                .checked_add(1)
-                .ok_or(RuntimeError::ThreadCountOverflow)?;
+                .checked_add(instance_index)
+                .expect("validated runtime thread count");
+            self.worker_threads.push(WorkerThread::new(
+                thread_index,
+                name,
+                instance_index,
+                None,
+                None,
+                stack_size,
+                0,
+                Duration::ZERO,
+                WorkerScheduler::default(),
+                false,
+                Some(entry),
+                true,
+            ));
         }
+        self.thread_count = next_thread_index;
         Ok(())
     }
 }

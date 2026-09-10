@@ -70,13 +70,13 @@ impl DataPlaneMain {
     pub(crate) fn worker_parts(
         &self,
     ) -> (
-        NodeRuntimeInner,
+        NodeMain,
         usize,
         Option<DataPlaneHandoffWorker>,
         Option<TraceControlHandle>,
     ) {
         (
-            self.nodes.snapshot(),
+            self.nodes.clone(),
             self.simd_bytes,
             self.handoff.clone(),
             self.trace.control(),
@@ -84,7 +84,7 @@ impl DataPlaneMain {
     }
 
     pub(crate) fn new_worker(
-        nodes: NodeRuntimeInner,
+        nodes: NodeMain,
         simd_bytes: usize,
         handoff: Option<DataPlaneHandoffWorker>,
         trace_control: Option<TraceControlHandle>,
@@ -99,7 +99,7 @@ impl DataPlaneMain {
             },
             simd_bytes,
         )?;
-        runtime.nodes = nodes.into();
+        runtime.nodes = nodes;
         runtime.handoff = handoff;
         runtime.trace.set_control(trace_control);
         Ok(runtime)
