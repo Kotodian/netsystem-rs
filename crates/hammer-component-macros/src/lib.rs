@@ -2262,6 +2262,8 @@ fn expand_graph_node(args: GraphNodeArgs, ident: &Ident, item: Item) -> Result<T
             kind: #node_kind,
             init: #init,
             process: #trampoline,
+            process_start: None,
+            process_node_index: None,
             error_counters: &[],
         };
     };
@@ -2338,7 +2340,7 @@ impl Parse for ProcessFnArgs {
     }
 }
 
-/// Registers an async VPP-style Process Node on the main-thread executor.
+/// Registers a VPP-style Process Node on the thread-zero executor.
 #[proc_macro_attribute]
 pub fn process_node(args: TokenStream, input: TokenStream) -> TokenStream {
     let args = parse_macro_input!(args as ProcessFnArgs);
@@ -2350,7 +2352,7 @@ pub fn process_node(args: TokenStream, input: TokenStream) -> TokenStream {
 
 fn expand_process_node(args: ProcessFnArgs, function: ItemFn) -> Result<TokenStream2> {
     let signature = &function.sig;
-    if signature.asyncness.is_none()
+    if signature.asyncness.is_some()
         || signature.constness.is_some()
         || signature.unsafety.is_some()
         || signature.abi.is_some()
@@ -2360,53 +2362,49 @@ fn expand_process_node(args: ProcessFnArgs, function: ItemFn) -> Result<TokenStr
     {
         return Err(Error::new(
             signature.span(),
-            "Process Nodes must be safe, async, non-generic Rust functions",
+            "Process Node factories must be safe, synchronous, non-generic Rust functions",
         ));
     }
     if signature.inputs.len() != 1 {
         return Err(Error::new(
             signature.inputs.span(),
-            "Process Nodes take exactly one ProcessContext parameter",
+            "Process Node factories take exactly one &mut DataPlaneMain parameter",
         ));
     }
-    let Some(FnArg::Typed(context)) = signature.inputs.first() else {
+    let Some(FnArg::Typed(main)) = signature.inputs.first() else {
         return Err(Error::new(
             signature.inputs.span(),
             "Process Nodes cannot have a receiver",
         ));
     };
-    if !type_path_ends_with(&context.ty, "ProcessContext") {
+    let Type::Reference(reference) = main.ty.as_ref() else {
         return Err(Error::new(
-            context.ty.span(),
-            "Process Node parameter must be ProcessContext",
+            main.ty.span(),
+            "Process Node factory parameter must be &mut DataPlaneMain",
+        ));
+    };
+    if reference.mutability.is_none() || !type_path_ends_with(&reference.elem, "DataPlaneMain") {
+        return Err(Error::new(
+            main.ty.span(),
+            "Process Node factory parameter must be &mut DataPlaneMain",
         ));
     }
-    let ReturnType::Type(_, output) = &signature.output else {
+    if matches!(&signature.output, ReturnType::Default) {
         return Err(Error::new(
             signature.output.span(),
-            "Process Nodes must return RuntimeResult<()> through their future",
-        ));
-    };
-    let Some(value) = wrapped_type(output, "RuntimeResult") else {
-        return Err(Error::new(
-            output.span(),
-            "Process Nodes must return RuntimeResult<()> through their future",
-        ));
-    };
-    if !matches!(&value, Type::Tuple(tuple) if tuple.elems.is_empty()) {
-        return Err(Error::new(
-            value.span(),
-            "Process Nodes must return RuntimeResult<()> through their future",
+            "Process Node factories must return a concrete Future<Output = RuntimeResult<()>>",
         ));
     }
 
     let function_name = &function.sig.ident;
     let adapter_name = format_ident!("__hammer_process_adapter_{}", function_name);
+    let init_name = format_ident!("__hammer_process_init_{}", function_name);
+    let graph_name = format_ident!("__hammer_process_graph_{}", function_name);
     let static_ident = format_ident!(
         "__PROCESS_NODE_{}",
         args.name.value().to_ascii_uppercase().replace('-', "_")
     );
-    let handle_ident = format_ident!("{}_HANDLE", static_ident);
+    let node_index_ident = format_ident!("{}_NODE_INDEX", static_ident);
     let name = args.name;
     let conditional_attributes: Vec<_> = function
         .attrs
@@ -2422,21 +2420,49 @@ fn expand_process_node(args: ProcessFnArgs, function: ItemFn) -> Result<TokenStr
 
         #(#conditional_attributes)*
         fn #adapter_name(
-            __hammer_context: ::hammer_runtime::ProcessContext,
-        ) -> ::hammer_runtime::ProcessFuture {
-            ::std::boxed::Box::pin(#function_name(__hammer_context))
+            hammer_main: &mut ::hammer_runtime::DataPlaneMain,
+            hammer_node: ::hammer_core::data_plane::NodeId,
+        ) -> ::hammer_runtime::RuntimeResult<()> {
+            let hammer_future = #function_name(hammer_main);
+            hammer_main.__register_process(::hammer_runtime::Process::new(
+                hammer_node,
+                (),
+                hammer_future,
+            ))
         }
 
         #(#conditional_attributes)*
-        static #handle_ident: ::std::sync::OnceLock<::hammer_runtime::ProcessHandle> =
+        fn #init_name(
+            hammer_main: &::hammer_runtime::DataPlaneMain,
+        ) -> ::hammer_runtime::RuntimeResult<::hammer_core::data_plane::NodeId> {
+            hammer_main
+                .nodes()
+                .try_register_process_node(#name, #graph_name)
+        }
+
+        #(#conditional_attributes)*
+        fn #graph_name(
+            _: &mut ::hammer_runtime::DataPlaneMain,
+            _: &mut ::hammer_runtime::NodeRuntime,
+            _: &mut ::hammer_core::data_plane::Frame,
+        ) -> usize {
+            0
+        }
+
+        #(#conditional_attributes)*
+        static #node_index_ident: ::std::sync::OnceLock<::hammer_core::data_plane::NodeId> =
             ::std::sync::OnceLock::new();
 
         #(#conditional_attributes)*
-        pub(crate) static #static_ident: ::hammer_runtime::ProcessEntry =
-            ::hammer_runtime::ProcessEntry {
-            name: #name,
-            start: #adapter_name,
-            handle: &#handle_ident,
+        pub(crate) static #static_ident: ::hammer_runtime::NodeEntry =
+            ::hammer_runtime::NodeEntry {
+            registration: Some(::hammer_core::data_plane::NodeRegistration::next(#name, 0)),
+            kind: ::hammer_core::data_plane::NodeKind::Process,
+            init: #init_name,
+            process: #graph_name,
+            process_start: Some(#adapter_name),
+            process_node_index: Some(&#node_index_ident),
+            error_counters: &[],
         };
     })
 }

@@ -716,9 +716,7 @@ fn next_for_echo_request_index(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use hammer_runtime::log::Level;
-    use hammer_runtime::{ControlThread, GlobalMain, PluginMain, ThreadMain};
-    use std::time::Instant;
+    use hammer_runtime::{GlobalMain, PluginMain, ThreadMain};
 
     #[test]
     fn input_dispatch_preserves_protocol_specific_validation() -> RuntimeResult<()> {
@@ -741,8 +739,7 @@ mod tests {
         hammer_runtime::init::run_config_functions(&mut global, None, true, &document)?;
         let mut threads = ThreadMain::new()?;
         threads.configure()?;
-        let control = ControlThread::new(Instant::now(), Level::Info);
-        let mut runtime = DataPlaneMain::new_main(&threads, control.runtime())?;
+        let mut runtime = DataPlaneMain::new_main(&threads)?;
         plugins.install_graph(&mut runtime)?;
         hammer_runtime::init::run_config_functions(
             &mut global,

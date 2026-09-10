@@ -17,9 +17,7 @@ use hammer_infra::pool::Pool;
 use hammer_runtime::FILE_MAIN;
 use hammer_runtime::binary_api::{BinaryApiMethodEntry, BinaryApiMethodStatus};
 use hammer_runtime::file::{FileIoStatus, FileMain};
-use hammer_runtime::{
-    NodeMain, PluginError, ProcessContext, ProcessWake, RuntimeError, RuntimeResult,
-};
+use hammer_runtime::{DataPlaneMain, NodeMain, PluginError, RuntimeError, RuntimeResult};
 use prost::Message;
 
 /// Shared envelope, blocking client, and client-facing errors owned by
@@ -472,65 +470,97 @@ impl Drop for BinaryApiMain {
 
 /// VPP's `vl_api_clnt_node` signal path: the callback never touches the
 /// socket registration pool; it only hands the File's token to the node.
-/// Without a live node (main process shutdown) the readiness is dropped.
-fn signal_ready(event_type: u64, token: u64) -> RuntimeResult<()> {
-    __PROCESS_NODE_BINARY_API.signal(event_type, token)
+/// A missing Process Node identity is a startup/lifecycle error.
+fn signal_ready(graph: &mut NodeMain, event_type: u64, token: u64) -> RuntimeResult<()> {
+    let node = __PROCESS_NODE_BINARY_API
+        .process_node_index()
+        .ok_or(RuntimeError::ProcessNodeIdentityUnavailable { name: "binary-api" })?;
+    graph.signal_process(node, event_type, token)
 }
 
 #[hammer_component_macros::file]
 mod listener_file {
     fn read<Context, Error>(
-        _graph: &Context,
+        graph: &mut Context,
         file: &mut hammer_core::file::File<Context, Error>,
     ) -> Result<(), Error>
     where
+        Context: std::borrow::BorrowMut<super::NodeMain>,
         Error: From<super::RuntimeError>,
     {
-        super::signal_ready(super::EVENT_ACCEPT_READY, file.private_data()).map_err(Into::into)
+        super::signal_ready(
+            graph.borrow_mut(),
+            super::EVENT_ACCEPT_READY,
+            file.private_data(),
+        )
+        .map_err(Into::into)
     }
 
     fn error<Context, Error>(
-        _graph: &Context,
+        graph: &mut Context,
         file: &mut hammer_core::file::File<Context, Error>,
     ) -> Result<(), Error>
     where
+        Context: std::borrow::BorrowMut<super::NodeMain>,
         Error: From<super::RuntimeError>,
     {
-        super::signal_ready(super::EVENT_ACCEPT_READY, file.private_data()).map_err(Into::into)
+        super::signal_ready(
+            graph.borrow_mut(),
+            super::EVENT_ACCEPT_READY,
+            file.private_data(),
+        )
+        .map_err(Into::into)
     }
 }
 
 #[hammer_component_macros::file]
 mod client_file {
     fn read<Context, Error>(
-        _graph: &Context,
+        graph: &mut Context,
         file: &mut hammer_core::file::File<Context, Error>,
     ) -> Result<(), Error>
     where
+        Context: std::borrow::BorrowMut<super::NodeMain>,
         Error: From<super::RuntimeError>,
     {
-        super::signal_ready(super::EVENT_CLIENT_READ_READY, file.private_data()).map_err(Into::into)
+        super::signal_ready(
+            graph.borrow_mut(),
+            super::EVENT_CLIENT_READ_READY,
+            file.private_data(),
+        )
+        .map_err(Into::into)
     }
 
     fn write<Context, Error>(
-        _graph: &Context,
+        graph: &mut Context,
         file: &mut hammer_core::file::File<Context, Error>,
     ) -> Result<(), Error>
     where
+        Context: std::borrow::BorrowMut<super::NodeMain>,
         Error: From<super::RuntimeError>,
     {
-        super::signal_ready(super::EVENT_CLIENT_WRITE_READY, file.private_data())
-            .map_err(Into::into)
+        super::signal_ready(
+            graph.borrow_mut(),
+            super::EVENT_CLIENT_WRITE_READY,
+            file.private_data(),
+        )
+        .map_err(Into::into)
     }
 
     fn error<Context, Error>(
-        _graph: &Context,
+        graph: &mut Context,
         file: &mut hammer_core::file::File<Context, Error>,
     ) -> Result<(), Error>
     where
+        Context: std::borrow::BorrowMut<super::NodeMain>,
         Error: From<super::RuntimeError>,
     {
-        super::signal_ready(super::EVENT_CLIENT_READ_READY, file.private_data()).map_err(Into::into)
+        super::signal_ready(
+            graph.borrow_mut(),
+            super::EVENT_CLIENT_READ_READY,
+            file.private_data(),
+        )
+        .map_err(Into::into)
     }
 }
 
@@ -696,32 +726,32 @@ impl Config {
 }
 
 #[hammer_component_macros::process_node(name = "binary-api")]
-async fn binary_api_clnt(mut context: ProcessContext) -> RuntimeResult<()> {
+fn binary_api_clnt(
+    main: &mut DataPlaneMain,
+) -> impl std::future::Future<Output = RuntimeResult<()>> + Send + 'static {
     // VPP `vl_api_clnt_node`: FileMain callbacks signal this node; the main
     // FileMain poll loop owns readiness and this node consumes its event batch.
-    let capability =
-        BINARY_API_MAIN
-            .get()
-            .map(Arc::clone)
-            .ok_or(RuntimeError::RuntimeCapabilityMissing {
+    let events = main.process_events();
+    async move {
+        let mut events = events?;
+        let capability = BINARY_API_MAIN.get().map(Arc::clone).ok_or(
+            RuntimeError::RuntimeCapabilityMissing {
                 type_name: "hammer_service::binary_api::BinaryApiMain",
-            })?;
-    let file_main = FILE_MAIN
-        .get()
-        .expect("FileMain is initialized before Binary API startup");
-    let mut table = BinaryApiConnections::new(capability.listener);
-    let max_frame_bytes = capability.max_frame_bytes;
-    loop {
-        match context.wait_for_event().await {
-            ProcessWake::Clock => return Ok(()),
-            ProcessWake::Event(batch) => {
-                table.process_event(
-                    file_main,
-                    batch.event_type(),
-                    batch.data(),
-                    max_frame_bytes,
-                )?;
-            }
+            },
+        )?;
+        let file_main = FILE_MAIN
+            .get()
+            .expect("FileMain is initialized before Binary API startup");
+        let mut table = BinaryApiConnections::new(capability.listener);
+        let max_frame_bytes = capability.max_frame_bytes;
+        while let Some((event_type, token)) = events.recv().await {
+            table.process_event(
+                file_main,
+                event_type,
+                std::slice::from_ref(&token),
+                max_frame_bytes,
+            )?;
         }
+        Ok(())
     }
 }

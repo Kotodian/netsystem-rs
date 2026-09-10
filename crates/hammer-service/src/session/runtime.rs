@@ -4780,7 +4780,7 @@ fn enqueue_app_event(
 }
 
 fn schedule_app_session_input(
-    graph: &hammer_runtime::NodeMain,
+    graph: &mut hammer_runtime::NodeMain,
     file: &mut File,
 ) -> RuntimeResult<()> {
     let node = hammer_core::data_plane::NodeId::new(file.private_data() as u32);
@@ -4788,7 +4788,10 @@ fn schedule_app_session_input(
     Ok(())
 }
 
-fn schedule_session_queue_deadline(graph: &NodeMain, deadline: &mut Deadline) -> RuntimeResult<()> {
+fn schedule_session_queue_deadline(
+    graph: &mut NodeMain,
+    deadline: &mut Deadline,
+) -> RuntimeResult<()> {
     let node = NodeId::new(
         u32::try_from(deadline.private_data())
             .expect("Session Queue node identity is stored as a u32"),
@@ -4797,7 +4800,10 @@ fn schedule_session_queue_deadline(graph: &NodeMain, deadline: &mut Deadline) ->
     Ok(())
 }
 
-fn schedule_app_mq_pending(graph: &hammer_runtime::NodeMain, file: &mut File) -> RuntimeResult<()> {
+fn schedule_app_mq_pending(
+    graph: &mut hammer_runtime::NodeMain,
+    file: &mut File,
+) -> RuntimeResult<()> {
     // SAFETY: the entry is boxed and owned by this worker's SessionWorker for
     // the File lifetime; FileMain deletes this File before the box is dropped.
     let entry = unsafe { &mut *(file.private_data() as usize as *mut AppRxMqEntry) };

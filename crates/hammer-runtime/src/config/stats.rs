@@ -6,7 +6,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use crate::error::RuntimeResult;
 use crate::file::FILE_MAIN;
-use crate::{DataPlaneMain, File, ProcessContext, RuntimeError};
+use crate::{DataPlaneMain, File, RuntimeError};
 use hammer_component_macros::Stats;
 use hammer_stats::{StatsMain, Timestamp, stats_segment_socket};
 
@@ -47,21 +47,23 @@ pub(crate) struct Sys {
 }
 
 #[hammer_component_macros::process_node(name = "statseg-collector-process")]
-async fn stat_segment_collector_process(mut context: ProcessContext) -> RuntimeResult<()> {
-    let sys = Sys::global();
-    let stats_main = StatsMain::global()?;
-    let config = stats_config();
-    let boottime = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map_err(|source| RuntimeError::SystemClockBeforeUnixEpoch { source })?
-        .as_secs();
-    sys.boottime.store(&stats_main, boottime)?;
+fn stat_segment_collector_process(
+    _: &mut DataPlaneMain,
+) -> impl std::future::Future<Output = RuntimeResult<()>> + Send + 'static {
+    async move {
+        let sys = Sys::global();
+        let stats_main = StatsMain::global()?;
+        let config = stats_config();
+        let boottime = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_err(|source| RuntimeError::SystemClockBeforeUnixEpoch { source })?
+            .as_secs();
+        sys.boottime.store(&stats_main, boottime)?;
 
-    loop {
-        sys.heartbeat.increment(&stats_main)?;
-        let _ = context
-            .wait_for_event_or_clock(config.update_interval)
-            .await;
+        loop {
+            sys.heartbeat.increment(&stats_main)?;
+            tokio::time::sleep(config.update_interval).await;
+        }
     }
 }
 

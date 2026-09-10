@@ -3,14 +3,13 @@
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::OnceLock;
-use std::time::Instant;
 
 use hammer_runtime::attach::AppServer;
 use hammer_runtime::config::Memory;
 use hammer_runtime::global_main::GlobalMain;
 use hammer_runtime::log::Level;
 use hammer_runtime::{
-    ControlThread, DataPlaneMain, PluginMain, RuntimeError, RuntimeResult, ThreadMain, UnixMain,
+    DataPlaneMain, PluginMain, RuntimeError, RuntimeResult, ThreadMain, UnixMain,
 };
 
 // Shared device/interface/transport/session infrastructure contributes host
@@ -158,8 +157,7 @@ fn run(
     hammer_runtime::init::run_config_functions(&mut global, None, true, &config)?;
     let mut threads = ThreadMain::new()?;
     threads.configure()?;
-    let mut control = ControlThread::new(Instant::now(), log_level);
-    let mut main = DataPlaneMain::new_main(&threads, control.runtime())?;
+    let mut main = DataPlaneMain::new_main(&threads)?;
     plugins.install_graph(&mut main)?;
     hammer_runtime::init::run_config_functions(&mut global, Some(&mut main), false, &config)?;
     hammer_runtime::init::run_init_functions(&mut global, &mut main)?;
@@ -169,19 +167,15 @@ fn run(
     hammer_runtime::init::run_api_init(&mut global, &mut main)?;
 
     let plugins = PluginMain::publish(Box::new(plugins));
-    control.start_processes(plugins)?;
+    plugins.install_processes(&mut main)?;
     let attach_server = hammer_service::session::app_server();
     let applications = hammer_service::session::ApplicationMain::global()?;
     tracing::info!("hammer started");
-    let run_result = control.run(control.run_processes_until(run_main_thread(
-        &mut main,
-        &mut unix,
-        attach_server,
-        applications,
-    )))?;
+    let run_result =
+        main.run_main_until(run_main_thread(&mut unix, attach_server, applications))?;
     let status = run_result.as_ref().copied().unwrap_or(1);
     let worker_result = hammer_runtime::start_workers::stop_workers(&mut threads, status);
-    let process_result = control.shutdown_processes();
+    let process_result = main.stop_processes();
     let exit_result = hammer_runtime::init::run_main_loop_exit(&mut global, &mut main);
     let unix_result = unix.shutdown(status);
 
@@ -194,7 +188,6 @@ fn run(
 }
 
 async fn run_main_thread(
-    main: &mut DataPlaneMain,
     unix: &mut UnixMain,
     attach_server: Option<Arc<AppServer>>,
     applications: &'static hammer_service::session::ApplicationMain,
@@ -206,9 +199,6 @@ async fn run_main_thread(
     loop {
         tokio::select! {
             status = &mut exit_signal => return status,
-            readiness = main.next_file_readiness() => {
-                readiness?;
-            }
             result = &mut attach => {
                 result?;
                 return Err(RuntimeError::service_closed());

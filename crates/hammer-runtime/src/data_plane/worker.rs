@@ -27,12 +27,13 @@ impl DataPlaneMain {
         self.main_loop_exit_status
     }
 
-    pub(crate) fn poll_file_readiness(&self) -> RuntimeResult<usize> {
+    pub(crate) fn poll_file_readiness(&mut self) -> RuntimeResult<usize> {
+        let thread_index = self.thread_index();
         match &self.file_main {
             FileMode::Sync => FILE_MAIN
                 .get()
                 .expect("FileMain is initialized before data-plane use")
-                .poll_for_worker(self.thread_index(), self.nodes()),
+                .poll_for_worker(thread_index, &mut self.nodes),
             FileMode::Async(_) => panic!("thread zero awaits AsyncFileMain readiness"),
         }
     }

@@ -12,15 +12,11 @@ use std::hint::black_box;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::Arc;
-use std::time::Instant;
 
 use hammer_core::data_plane::NodeId;
 use hammer_runtime::config::Memory;
 use hammer_runtime::global_main::GlobalMain;
-use hammer_runtime::log::Level;
-use hammer_runtime::{
-    ControlThread, DataPlaneMain, PluginError, PluginMain, RuntimeError, ThreadMain,
-};
+use hammer_runtime::{DataPlaneMain, PluginError, PluginMain, RuntimeError, ThreadMain};
 
 // Shared device/interface/transport/session registrations remain host-owned.
 use hammer_service as _;
@@ -140,8 +136,7 @@ fn main() -> Result<(), ExampleError> {
     hammer_runtime::init::run_config_functions(&mut global, None, true, EXAMPLE_CONFIG)?;
     let mut threads = ThreadMain::new()?;
     threads.configure()?;
-    let mut control = ControlThread::new(Instant::now(), Level::Info);
-    let mut main = DataPlaneMain::new_main(&threads, control.runtime())?;
+    let mut main = DataPlaneMain::new_main(&threads)?;
     plugins.install_graph(&mut main)?;
     hammer_runtime::init::run_config_functions(
         &mut global,
@@ -154,7 +149,7 @@ fn main() -> Result<(), ExampleError> {
     hammer_runtime::init::run_main_loop_enter(&mut global, &mut main)?;
     hammer_runtime::start_workers::start_workers(&mut threads, &mut main, &mut global)?;
     hammer_runtime::init::run_api_init(&mut global, &mut main)?;
-    control.start_processes(&plugins)?;
+    plugins.install_processes(&mut main)?;
 
     let example_result = run_example(
         &mut plugins,
@@ -164,7 +159,7 @@ fn main() -> Result<(), ExampleError> {
         &plugin_path,
     );
     let worker_shutdown = hammer_runtime::start_workers::stop_workers(&mut threads, 0);
-    let process_shutdown = control.shutdown_processes();
+    let process_shutdown = main.stop_processes();
     let close_result = hammer_runtime::init::run_main_loop_exit(&mut global, &mut main);
 
     example_result?;

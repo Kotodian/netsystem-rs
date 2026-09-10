@@ -18,10 +18,7 @@ impl DataPlaneMain {
         Self::from_config_with_file(config, simd_bytes, FileMode::Sync)
     }
 
-    pub fn new_main(
-        threads: &crate::ThreadMain,
-        runtime: &tokio::runtime::Runtime,
-    ) -> RuntimeResult<Self> {
+    pub fn new_main(threads: &crate::ThreadMain) -> RuntimeResult<Self> {
         let buffer = crate::config::worker::buffer();
         let mut numa_nodes = (1..=threads.worker_count())
             .filter_map(|thread_index| {
@@ -70,8 +67,12 @@ impl DataPlaneMain {
             }
         };
         crate::file::init_file_main(threads.thread_count() as usize)?;
+        let process_runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .map_err(|source| RuntimeError::MainRuntime { source })?;
         let file_main = {
-            let runtime_guard = runtime.enter();
+            let runtime_guard = process_runtime.enter();
             let file_main = crate::file::AsyncFileMain::new()?;
             drop(runtime_guard);
             file_main
@@ -80,7 +81,7 @@ impl DataPlaneMain {
             .thread_by_index(0)
             .and_then(crate::WorkerThread::numa_node)
             .unwrap_or(0);
-        Self::from_config_with_file(
+        let mut main = Self::from_config_with_file(
             DataPlaneBufferConfig {
                 buffer_slot_capacity: buffer.slot_bytes,
                 buffer_slots: buffer.slots_per_numa,
@@ -92,7 +93,9 @@ impl DataPlaneMain {
             },
             native_simd_bytes(),
             FileMode::Async(file_main),
-        )
+        )?;
+        main.nodes.process_runtime = Some(process_runtime);
+        Ok(main)
     }
 
     fn from_config_with_file(

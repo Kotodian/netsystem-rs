@@ -159,6 +159,11 @@ pub enum RuntimeError {
         #[source]
         source: std::io::Error,
     },
+    #[error("failed to build the Tokio runtime for thread-zero Process Nodes")]
+    MainRuntime {
+        #[source]
+        source: std::io::Error,
+    },
     #[error("data worker {worker} exited with status {status}")]
     DataWorkerExited { worker: u32, status: i32 },
     #[error("data worker {worker} control call was canceled")]
@@ -174,10 +179,8 @@ pub enum RuntimeError {
         worker: crate::DataWorkerId,
         capacity: usize,
     },
-    #[error("Process Nodes can only start on GlobalMain")]
-    ProcessNodesRequireGlobalMain,
-    #[error("Process Nodes must be controlled by their owner thread")]
-    ProcessControlWrongThread,
+    #[error("thread-zero Process runtime is unavailable")]
+    MainProcessRuntimeUnavailable,
     #[error(transparent)]
     AppSession(#[from] crate::app::AppSessionError),
     #[error("Application Session control operation failed")]
@@ -192,6 +195,49 @@ pub enum RuntimeError {
     },
     #[error("duplicate Process Node `{name}`")]
     DuplicateProcessNode { name: &'static str },
+    #[error("Process Node declaration has no registered name")]
+    ProcessNodeNameMissing,
+    #[error("Process Node declaration `{name}` has graph kind {kind:?}")]
+    ProcessNodeKindInvalid {
+        name: &'static str,
+        kind: hammer_core::data_plane::NodeKind,
+    },
+    #[error("Process Node declaration `{name}` has no concrete future constructor")]
+    ProcessStartMissing { name: &'static str },
+    #[error("Process Node declaration `{name}` has no NodeId storage")]
+    ProcessNodeIndexStorageMissing { name: &'static str },
+    #[error("Process Node `{name}` has not installed its NodeId")]
+    ProcessNodeIdentityUnavailable { name: &'static str },
+    #[error("Process Node {node:?} is not registered on thread zero")]
+    ProcessNodeNotRegistered {
+        node: hammer_core::data_plane::NodeId,
+    },
+    #[error("Process Node {node:?} is already started")]
+    ProcessNodeAlreadyStarted {
+        node: hammer_core::data_plane::NodeId,
+    },
+    #[error("Process event receiver requested outside its constructor step")]
+    ProcessConstructorInactive,
+    #[error("Process Node {node:?} event receiver is already installed")]
+    ProcessEventReceiverAlreadyTaken {
+        node: hammer_core::data_plane::NodeId,
+    },
+    #[error("Process Node {node:?} event queue is closed")]
+    ProcessEventQueueClosed {
+        node: hammer_core::data_plane::NodeId,
+    },
+    #[error("Process Node {node:?} task join failed")]
+    ProcessTaskJoin {
+        node: hammer_core::data_plane::NodeId,
+        #[source]
+        source: tokio::task::JoinError,
+    },
+    #[error("Process shutdown failed: {primary}; later Process cleanup also failed: {cleanup}")]
+    ProcessShutdownCleanup {
+        #[source]
+        primary: Box<RuntimeError>,
+        cleanup: Box<RuntimeError>,
+    },
     #[error("data worker {worker:?} does not match Handoff owner {handoff_owner:?}")]
     HandoffWorkerMismatch {
         worker: crate::DataWorkerId,

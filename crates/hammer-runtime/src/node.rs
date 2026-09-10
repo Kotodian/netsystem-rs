@@ -2,7 +2,9 @@ use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
 use std::future::Future;
 use std::pin::Pin;
+use std::sync::OnceLock;
 use std::task::{Context, Poll, Waker};
+use std::time::Instant;
 
 use crate::error::{RuntimeError, RuntimeResult};
 use crate::trace::TraceFormatter;
@@ -330,7 +332,21 @@ pub struct NodeEntry {
     pub kind: NodeKind,
     pub init: fn(&DataPlaneMain) -> RuntimeResult<NodeId>,
     pub process: NodeProcessFn,
+    #[doc(hidden)]
+    pub process_start: Option<ProcessStartFn>,
+    #[doc(hidden)]
+    pub process_node_index: Option<&'static OnceLock<NodeId>>,
     pub error_counters: &'static [NodeErrorDescriptor],
+}
+
+#[doc(hidden)]
+pub type ProcessStartFn = fn(&mut DataPlaneMain, NodeId) -> RuntimeResult<()>;
+
+impl NodeEntry {
+    #[inline]
+    pub fn process_node_index(&self) -> Option<NodeId> {
+        self.process_node_index.and_then(OnceLock::get).copied()
+    }
 }
 
 pub struct NodeMain {
@@ -343,6 +359,18 @@ pub struct NodeMain {
     enqueue_owners: Vec<Option<usize>>,
     readiness: NodeReadiness,
     topology_owner: bool,
+    pub(crate) process_node_indices: Vec<NodeId>,
+    pub(crate) process_restore_current: Vec<(NodeId, u64)>,
+    pub(crate) process_restore_next: Vec<(NodeId, u64)>,
+    pub(crate) suspended_processes: Vec<NodeId>,
+    pub(crate) process_event_state: Vec<Vec<(u64, u64)>>,
+    pub(crate) process_timer_state: Vec<(NodeId, Instant)>,
+    pub(crate) current_process_index: Option<NodeId>,
+    pub(crate) time_next_process_ready: Option<Instant>,
+    pub(crate) process_event_senders: Vec<Option<tokio::sync::mpsc::UnboundedSender<(u64, u64)>>>,
+    pub(crate) process_runtime: Option<tokio::runtime::Runtime>,
+    pub(crate) running_processes: Vec<crate::process::RunningProcess>,
+    pub(crate) processes_started: bool,
 }
 
 impl std::fmt::Debug for NodeMain {
@@ -353,6 +381,8 @@ impl std::fmt::Debug for NodeMain {
             .field("nodes_len", &inner.nodes.len())
             .field("queue_len", &queue.len())
             .field("readiness", &self.readiness)
+            .field("process_nodes", &self.process_node_indices)
+            .field("running_processes", &self.running_processes.len())
             .finish()
     }
 }
@@ -1019,6 +1049,18 @@ impl Default for NodeMain {
             enqueue_owners: Vec::new(),
             readiness: NodeReadiness::default(),
             topology_owner: true,
+            process_node_indices: Vec::new(),
+            process_restore_current: Vec::new(),
+            process_restore_next: Vec::new(),
+            suspended_processes: Vec::new(),
+            process_event_state: Vec::new(),
+            process_timer_state: Vec::new(),
+            current_process_index: None,
+            time_next_process_ready: None,
+            process_event_senders: Vec::new(),
+            process_runtime: None,
+            running_processes: Vec::new(),
+            processes_started: false,
         }
     }
 }
@@ -1044,6 +1086,18 @@ impl From<NodeRuntimeInner> for NodeMain {
             enqueue_owners,
             readiness: NodeReadiness::default(),
             topology_owner: false,
+            process_node_indices: Vec::new(),
+            process_restore_current: Vec::new(),
+            process_restore_next: Vec::new(),
+            suspended_processes: Vec::new(),
+            process_event_state: Vec::new(),
+            process_timer_state: Vec::new(),
+            current_process_index: None,
+            time_next_process_ready: None,
+            process_event_senders: Vec::new(),
+            process_runtime: None,
+            running_processes: Vec::new(),
+            processes_started: false,
         }
     }
 }
@@ -1276,6 +1330,26 @@ impl NodeMain {
                 node.node_trace_formatter(),
             ),
         )
+    }
+
+    #[doc(hidden)]
+    pub fn try_register_process_node(
+        &self,
+        name: &'static str,
+        process: NodeProcessFn,
+    ) -> RuntimeResult<NodeId> {
+        let node = self.register_descriptor(
+            NodeKind::Process,
+            NodeDescriptor::new(
+                process,
+                NodeRuntime::empty(),
+                Some(NodeRegistration::next(name, 0)),
+                &[],
+                None,
+            ),
+        )?;
+        self.set_node_state(node, NodeState::Disabled)?;
+        Ok(node)
     }
 
     pub fn register_internal_with_handle<N>(

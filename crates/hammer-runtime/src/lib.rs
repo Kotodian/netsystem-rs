@@ -68,7 +68,6 @@ pub use hammer_infra::simd::Simd;
 
 pub mod app;
 pub mod attach;
-mod control_thread;
 pub mod data_plane;
 pub mod handoff;
 pub mod network;
@@ -94,9 +93,7 @@ pub use plugin::{
     PluginError, PluginMain, PluginMetadata, PluginModule, PluginModuleRef,
     host_meets_plugin_requirement,
 };
-pub use process::{
-    ProcessContext, ProcessEntry, ProcessEventBatch, ProcessFuture, ProcessHandle, ProcessWake,
-};
+pub use process::Process;
 pub use registry::RuntimeRegistry;
 pub use session::{SessionConnectEndpoint, SessionListenEndpoint};
 pub use thread_main::ThreadMain;
@@ -123,7 +120,6 @@ macro_rules! worker_thread_barrier_sync {
         __worker_barrier_result
     }};
 }
-pub use control_thread::ControlThread;
 pub use spawn::schedule_on_worker;
 
 #[cfg(test)]

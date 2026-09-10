@@ -10,7 +10,6 @@ use crate::binary_api::BinaryApiMethodEntry;
 use crate::error::RuntimeResult;
 use crate::init::{ConfigFunction, InitFunction};
 use crate::node::{NodeEntry, NodeFunctionRegistration};
-use crate::process::ProcessEntry;
 use abi_stable::StableAbi;
 use hammer_stats::StatsMain;
 
@@ -40,7 +39,7 @@ pub struct RegistrationImage {
     api_init_functions: &'static [&'static InitFunction],
     graph_nodes: &'static [&'static NodeEntry],
     node_functions: &'static [&'static NodeFunctionRegistration],
-    process_nodes: &'static [&'static ProcessEntry],
+    process_nodes: &'static [&'static NodeEntry],
     binary_api_methods: &'static [&'static BinaryApiMethodEntry],
     stats_registrations: &'static [&'static StatsRegistration],
 }
@@ -58,7 +57,7 @@ impl RegistrationImage {
         api_init_functions: &'static [&'static InitFunction],
         graph_nodes: &'static [&'static NodeEntry],
         node_functions: &'static [&'static NodeFunctionRegistration],
-        process_nodes: &'static [&'static ProcessEntry],
+        process_nodes: &'static [&'static NodeEntry],
         binary_api_methods: &'static [&'static BinaryApiMethodEntry],
     ) -> Self {
         Self::new_with_stats(
@@ -89,7 +88,7 @@ impl RegistrationImage {
         api_init_functions: &'static [&'static InitFunction],
         graph_nodes: &'static [&'static NodeEntry],
         node_functions: &'static [&'static NodeFunctionRegistration],
-        process_nodes: &'static [&'static ProcessEntry],
+        process_nodes: &'static [&'static NodeEntry],
         binary_api_methods: &'static [&'static BinaryApiMethodEntry],
         stats_registrations: &'static [&'static StatsRegistration],
     ) -> Self {
@@ -171,7 +170,7 @@ impl RegistrationImage {
     }
 
     #[inline]
-    pub(crate) fn process_nodes(&self) -> impl Clone + Iterator<Item = &'static ProcessEntry> + '_ {
+    pub(crate) fn process_nodes(&self) -> impl Clone + Iterator<Item = &'static NodeEntry> + '_ {
         self.process_nodes.iter().copied()
     }
 

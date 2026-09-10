@@ -405,23 +405,23 @@ fn register_ip6_reassembly(runtime: &DataPlaneMain) -> RuntimeResult<NodeId> {
 }
 
 #[hammer_component_macros::process_node(name = "ip-reassembly-expire-walk")]
-async fn ip_reassembly_expire_process(
-    mut context: hammer_runtime::ProcessContext,
-) -> RuntimeResult<()> {
-    // VPP `ip4_full_reass_walk_expired` reads the module-global main directly;
-    // the config phase stores it before Process Nodes start.
-    let main = IP_REASSEMBLY_MAIN
-        .get()
-        .ok_or(RuntimeError::PluginStateNotInitialized { plugin: "ip" })?;
-    loop {
-        let _ = context
-            .wait_for_event_or_clock(REASSEMBLY_EXPIRE_WALK_INTERVAL)
-            .await;
-        for worker_slot in 0..hammer_runtime::config::worker::worker_count() {
-            let worker = DataWorkerId::new(worker_slot as u32);
-            hammer_runtime::schedule_on_worker(worker, move |runtime| {
-                main.expire_worker(runtime, Instant::now());
-            })?;
+fn ip_reassembly_expire_process(
+    _: &mut DataPlaneMain,
+) -> impl std::future::Future<Output = RuntimeResult<()>> + Send + 'static {
+    async move {
+        // VPP `ip4_full_reass_walk_expired` reads the module-global main directly;
+        // the config phase stores it before Process Nodes start.
+        let main = IP_REASSEMBLY_MAIN
+            .get()
+            .ok_or(RuntimeError::PluginStateNotInitialized { plugin: "ip" })?;
+        loop {
+            tokio::time::sleep(REASSEMBLY_EXPIRE_WALK_INTERVAL).await;
+            for worker_slot in 0..hammer_runtime::config::worker::worker_count() {
+                let worker = DataWorkerId::new(worker_slot as u32);
+                hammer_runtime::schedule_on_worker(worker, move |runtime| {
+                    main.expire_worker(runtime, Instant::now());
+                })?;
+            }
         }
     }
 }

@@ -584,6 +584,13 @@ impl PluginMain {
         crate::graph::install::install_packet_graph(main, entries, functions)
     }
 
+    pub fn install_processes(&self, main: &mut crate::DataPlaneMain) -> crate::RuntimeResult<()> {
+        main.start_processes(
+            self.registration_images()
+                .flat_map(|image| image.process_nodes()),
+        )
+    }
+
     pub fn binary_api_method(&self, name: &str) -> Result<BinaryApiMethodEntry, PluginError> {
         let mut found = None;
         let mut duplicate = false;
