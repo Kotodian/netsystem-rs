@@ -1,4 +1,4 @@
-use std::cell::UnsafeCell;
+use std::cell::{Cell, UnsafeCell};
 use std::os::fd::BorrowedFd;
 use std::sync::atomic::{AtomicU8, AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock};
@@ -125,7 +125,7 @@ pub(super) struct ApplicationWorkerMq {
     queue: Arc<SessionMsgQueue>,
     app_session_input: NodeId,
     file: Option<u32>,
-    pending: std::sync::atomic::AtomicBool,
+    pending: Cell<bool>,
 }
 
 impl ApplicationWorkerMq {
@@ -136,7 +136,7 @@ impl ApplicationWorkerMq {
 
     #[inline]
     pub(super) fn clear_pending(&self) {
-        self.pending.store(false, Ordering::Release);
+        self.pending.set(false);
     }
 }
 
@@ -210,7 +210,7 @@ impl ApplicationMqResources {
                 queue: Arc::new(queue),
                 app_session_input,
                 file: None,
-                pending: std::sync::atomic::AtomicBool::new(false),
+                pending: Cell::new(false),
             }));
             offsets.push(offset);
         }
@@ -340,7 +340,7 @@ fn schedule_application_mq(graph: &mut NodeMain, file: &mut File) -> RuntimeResu
     // SAFETY: ApplicationMqResources stores each entry in a Box whose address
     // is stable until its File registration is deleted under WorkerBarrier.
     let entry = unsafe { &*entry };
-    if !entry.pending.swap(true, Ordering::AcqRel) {
+    if !entry.pending.replace(true) {
         // SAFETY: FileMain invokes this callback on the File's assigned runtime thread.
         let mut sessions =
             unsafe { super::runtime::session_main().worker(file.polling_thread_index()) }?;
@@ -401,8 +401,9 @@ const APP_MQ_SEGMENT_HEADROOM: usize = 1 << 20;
 // Data Workers may read published listener and connection entries; their
 // mutation or removal occurs only while WorkerBarrier stops those readers.
 unsafe impl Send for ApplicationMain {}
-// SAFETY: worker reads follow the publication contract above, and the
-// connecting/connected transition changes only its dedicated atomic state.
+// SAFETY: worker reads follow the publication contract above. Each MQ pending
+// Cell is accessed only by the File callback and input Node on its assigned
+// Data Worker; the connecting/connected transition uses its dedicated atomic.
 unsafe impl Sync for ApplicationMain {}
 
 impl ApplicationMain {
