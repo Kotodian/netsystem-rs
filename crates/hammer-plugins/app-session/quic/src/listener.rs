@@ -527,8 +527,7 @@ pub(crate) fn stop_listen(connection_index: u32) -> RuntimeResult<()> {
 
 #[hammer_component_macros::init_function(
     name = "quic_init",
-    runs_after = ["transport_main_init", "session_init", "udp_init"],
-    runs_before = ["install_packet_graph"]
+    runs_after = ["transport_main_init", "session_init", "udp_init"]
 )]
 fn init_quic() -> RuntimeResult<()> {
     assert!(

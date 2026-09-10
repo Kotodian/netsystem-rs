@@ -121,10 +121,7 @@ pub(crate) fn fib_index_for(version: IpVersion, sw_if_index: u32) -> Option<u32>
     }
 }
 
-#[hammer_component_macros::init_function(
-    name = "ip_lookup_init",
-    runs_before = ["install_packet_graph"]
-)]
+#[hammer_component_macros::init_function(name = "ip_lookup_init")]
 fn init_lookup() -> RuntimeResult<()> {
     assert!(
         IP4_MAIN.get().is_none() && IP6_MAIN.get().is_none(),

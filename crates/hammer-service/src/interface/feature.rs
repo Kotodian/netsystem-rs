@@ -768,7 +768,7 @@ impl FeatureState {
         }
     }
 }
-#[hammer_component_macros::init_function(name = "interface_feature_init", runs_after = ["install_packet_graph"])]
+#[hammer_component_macros::init_function(name = "interface_feature_init")]
 fn interface_feature_init(
     main: &mut hammer_runtime::DataPlaneMain,
 ) -> hammer_runtime::RuntimeResult<()> {

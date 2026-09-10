@@ -918,8 +918,7 @@ pub(crate) fn connect(endpoint: SessionConnectEndpoint) -> RuntimeResult<()> {
 
 #[hammer_component_macros::init_function(
     name = "udp_init",
-    runs_after = ["transport_main_init", "session_init"],
-    runs_before = ["install_packet_graph"]
+    runs_after = ["transport_main_init", "session_init"]
 )]
 fn init_udp() -> RuntimeResult<()> {
     assert!(

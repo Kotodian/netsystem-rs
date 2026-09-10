@@ -1,8 +1,13 @@
+use std::cell::UnsafeCell;
+use std::sync::OnceLock;
+
 use hammer_infra::align::{CACHE_LINE, CacheLineAlignMark};
 use hammer_infra::bitmap::Bitmap;
 
 use crate::init::{ConfigFunction, InitFunction};
-use crate::node::NodeEntry;
+use crate::node::{NodeEntry, NodeFunctionRegistration};
+
+pub(crate) static GLOBAL_MAIN: OnceLock<GlobalMain> = OnceLock::new();
 
 #[repr(C)]
 pub struct GlobalMain {
@@ -12,6 +17,7 @@ pub struct GlobalMain {
     argv: Vec<String>,
     startup_config: String,
     pub(crate) node_registrations: Vec<&'static NodeEntry>,
+    pub(crate) node_function_registrations: Vec<&'static NodeFunctionRegistration>,
     pub(crate) init_function_registrations: Vec<&'static InitFunction>,
     pub(crate) main_loop_enter_function_registrations: Vec<&'static InitFunction>,
     pub(crate) main_loop_exit_function_registrations: Vec<&'static InitFunction>,
@@ -19,8 +25,13 @@ pub struct GlobalMain {
     pub(crate) num_workers_change_function_registrations: Vec<&'static InitFunction>,
     pub(crate) api_init_function_registrations: Vec<&'static InitFunction>,
     pub(crate) config_function_registrations: Vec<&'static ConfigFunction>,
-    pub(crate) init_functions_called: Bitmap,
+    init_functions_called: UnsafeCell<Bitmap>,
 }
+
+// SAFETY: registration lists and metadata are immutable after publication.
+// The main thread is the only writer of lifecycle progress, and every access
+// verifies that owner before dereferencing the UnsafeCell.
+unsafe impl Sync for GlobalMain {}
 
 const _: () = {
     assert!(core::mem::align_of::<GlobalMain>() == CACHE_LINE);
@@ -37,6 +48,7 @@ impl GlobalMain {
             argv,
             startup_config,
             node_registrations: Vec::new(),
+            node_function_registrations: Vec::new(),
             init_function_registrations: Vec::new(),
             main_loop_enter_function_registrations: Vec::new(),
             main_loop_exit_function_registrations: Vec::new(),
@@ -44,8 +56,19 @@ impl GlobalMain {
             num_workers_change_function_registrations: Vec::new(),
             api_init_function_registrations: Vec::new(),
             config_function_registrations: Vec::new(),
-            init_functions_called: Bitmap::new(),
+            init_functions_called: UnsafeCell::new(Bitmap::new()),
         }
+    }
+
+    pub(crate) fn global() -> &'static Self {
+        GLOBAL_MAIN
+            .get()
+            .expect("GlobalMain is published before lifecycle dispatch")
+    }
+
+    #[inline]
+    pub(crate) fn startup_config(&self) -> &str {
+        &self.startup_config
     }
 
     pub(crate) fn register_node(&mut self, registration: &'static NodeEntry) {
@@ -56,6 +79,21 @@ impl GlobalMain {
         {
             self.node_registrations.push(registration);
         }
+    }
+
+    pub(crate) fn register_node_function(
+        &mut self,
+        registration: &'static NodeFunctionRegistration,
+    ) {
+        Self::push_declaration(&mut self.node_function_registrations, registration);
+    }
+
+    pub(crate) fn mark_init_function_called(&self, callback_index: usize) -> bool {
+        crate::ensure_main_thread()
+            .expect("global lifecycle progress belongs to the process main thread");
+        // SAFETY: GlobalMain is published once, and only the verified process
+        // main thread dispatches or mutates global lifecycle progress.
+        unsafe { (&mut *self.init_functions_called.get()).set(callback_index) }
     }
 
     pub(crate) fn register_init(&mut self, registration: &'static InitFunction) {

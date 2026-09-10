@@ -5,7 +5,6 @@ use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
 use crate::data_plane::DataPlaneMain;
 use crate::error::RuntimeResult;
 use crate::global_main::GlobalMain;
-use hammer_stats::StatsMain;
 
 #[derive(Debug, thiserror::Error)]
 pub enum InitError {
@@ -186,7 +185,7 @@ pub fn topological_order<T: Ordered>(items: &[T]) -> Result<Vec<usize>, InitErro
 
 fn dispatch_init(
     items: &[&'static InitFunction],
-    called: &mut hammer_infra::bitmap::Bitmap,
+    global: &GlobalMain,
     main: &mut DataPlaneMain,
 ) -> RuntimeResult<()> {
     let order = topological_order(items)?;
@@ -195,7 +194,7 @@ fn dispatch_init(
         let callback_index = function
             .callback_index()
             .expect("lifecycle callback index is assigned during registration");
-        if !called.set(callback_index) {
+        if !global.mark_init_function_called(callback_index) {
             continue;
         }
         (function.func)(main)?;
@@ -203,16 +202,13 @@ fn dispatch_init(
     Ok(())
 }
 
-pub fn run_init_functions(global: &mut GlobalMain, main: &mut DataPlaneMain) -> RuntimeResult<()> {
-    dispatch_init(
-        &global.init_function_registrations,
-        &mut global.init_functions_called,
-        main,
-    )
+pub fn run_init_functions(global: &GlobalMain, main: &mut DataPlaneMain) -> RuntimeResult<()> {
+    dispatch_init(&global.init_function_registrations, global, main)
 }
 
-pub fn run_stats_registrations(plugins: &crate::PluginMain) -> RuntimeResult<()> {
-    let stats_main = StatsMain::global()?;
+pub(crate) fn run_stats_registrations() -> RuntimeResult<()> {
+    let stats_main = hammer_stats::StatsMain::global()?;
+    let plugins = crate::PluginMain::global()?;
     let mut result = Ok(());
     plugins.visit_images(|image| {
         if result.is_err() {
@@ -255,44 +251,30 @@ pub fn run_worker_init_functions(
     result
 }
 
-pub fn run_main_loop_enter(global: &mut GlobalMain, main: &mut DataPlaneMain) -> RuntimeResult<()> {
-    dispatch_init(
-        &global.main_loop_enter_function_registrations,
-        &mut global.init_functions_called,
-        main,
-    )
+pub fn run_main_loop_enter(global: &GlobalMain, main: &mut DataPlaneMain) -> RuntimeResult<()> {
+    dispatch_init(&global.main_loop_enter_function_registrations, global, main)
 }
 
-pub fn run_main_loop_exit(global: &mut GlobalMain, main: &mut DataPlaneMain) -> RuntimeResult<()> {
-    dispatch_init(
-        &global.main_loop_exit_function_registrations,
-        &mut global.init_functions_called,
-        main,
-    )
+pub fn run_main_loop_exit(global: &GlobalMain, main: &mut DataPlaneMain) -> RuntimeResult<()> {
+    dispatch_init(&global.main_loop_exit_function_registrations, global, main)
 }
 
-pub fn run_num_workers_change(
-    global: &mut GlobalMain,
-    main: &mut DataPlaneMain,
-) -> RuntimeResult<()> {
+pub fn run_num_workers_change(global: &GlobalMain, main: &mut DataPlaneMain) -> RuntimeResult<()> {
     dispatch_init(
         &global.num_workers_change_function_registrations,
-        &mut global.init_functions_called,
+        global,
         main,
     )
 }
 
-pub fn run_api_init(global: &mut GlobalMain, main: &mut DataPlaneMain) -> RuntimeResult<()> {
-    dispatch_init(
-        &global.api_init_function_registrations,
-        &mut global.init_functions_called,
-        main,
-    )
+pub fn run_api_init(main: &mut DataPlaneMain) -> RuntimeResult<()> {
+    let global = GlobalMain::global();
+    dispatch_init(&global.api_init_function_registrations, global, main)
 }
 
 fn dispatch_config(
     items: &[&'static ConfigFunction],
-    called: &mut hammer_infra::bitmap::Bitmap,
+    global: &GlobalMain,
     mut main: Option<&mut DataPlaneMain>,
     early: bool,
     document: &str,
@@ -308,7 +290,7 @@ fn dispatch_config(
         let callback_index = function
             .callback_index()
             .expect("config callback index is assigned during registration");
-        if !called.set(callback_index) {
+        if !global.mark_init_function_called(callback_index) {
             continue;
         }
         (function.func)(document, main.as_deref_mut())?;
@@ -317,14 +299,14 @@ fn dispatch_config(
 }
 
 pub fn run_config_functions(
-    global: &mut GlobalMain,
+    global: &GlobalMain,
     main: Option<&mut DataPlaneMain>,
     early: bool,
     document: &str,
 ) -> RuntimeResult<()> {
     dispatch_config(
         &global.config_function_registrations,
-        &mut global.init_functions_called,
+        global,
         main,
         early,
         document,

@@ -269,6 +269,33 @@ impl NodeMain {
     }
 }
 
+impl NodeEntry {
+    pub(crate) fn install_process_node_index(&self, node: NodeId) -> RuntimeResult<()> {
+        if self.kind != NodeKind::Process {
+            return Ok(());
+        }
+        let name = self
+            .registration
+            .map(hammer_core::data_plane::NodeRegistration::name)
+            .ok_or(RuntimeError::ProcessNodeNameMissing)?;
+        if self.process_start.is_none() {
+            return Err(RuntimeError::ProcessStartMissing { name });
+        }
+        let node_index = self
+            .process_node_index
+            .ok_or(RuntimeError::ProcessNodeIndexStorageMissing { name })?;
+        if let Some(current) = node_index.get() {
+            assert_eq!(*current, node, "Process Node identity remains stable");
+        } else {
+            assert!(
+                node_index.set(node).is_ok(),
+                "Process Node identity is installed once"
+            );
+        }
+        Ok(())
+    }
+}
+
 impl DataPlaneMain {
     pub fn start_processes<'entry>(
         &mut self,
@@ -285,11 +312,14 @@ impl DataPlaneMain {
             return Err(RuntimeError::MainProcessRuntimeUnavailable);
         }
 
-        let mut declarations: Vec<&NodeEntry> = Vec::new();
+        let mut declarations: Vec<(&NodeEntry, NodeId)> = Vec::new();
         for entry in entries {
+            if entry.kind != NodeKind::Process {
+                continue;
+            }
             if declarations
                 .iter()
-                .any(|current| std::ptr::eq(*current, entry))
+                .any(|(current, _)| std::ptr::eq(*current, entry))
             {
                 continue;
             }
@@ -297,39 +327,30 @@ impl DataPlaneMain {
                 .registration
                 .map(hammer_core::data_plane::NodeRegistration::name)
                 .ok_or(RuntimeError::ProcessNodeNameMissing)?;
-            if entry.kind != NodeKind::Process {
-                return Err(RuntimeError::ProcessNodeKindInvalid {
-                    name,
-                    kind: entry.kind,
-                });
-            }
             if entry.process_start.is_none() {
                 return Err(RuntimeError::ProcessStartMissing { name });
             }
-            if entry.process_node_index.is_none() {
-                return Err(RuntimeError::ProcessNodeIndexStorageMissing { name });
-            }
-            if declarations.iter().any(|current: &&NodeEntry| {
+            let node = entry
+                .process_node_index
+                .ok_or(RuntimeError::ProcessNodeIndexStorageMissing { name })?
+                .get()
+                .copied()
+                .ok_or(RuntimeError::ProcessNodeIdentityUnavailable { name })?;
+            if declarations.iter().any(|(current, _)| {
                 current.registration.map(|registration| registration.name()) == Some(name)
             }) {
                 return Err(RuntimeError::DuplicateProcessNode { name });
             }
-            declarations.push(entry);
+            if self.nodes.node_kind(node)? != NodeKind::Process {
+                return Err(RuntimeError::ProcessNodeKindInvalid {
+                    name,
+                    kind: self.nodes.node_kind(node)?,
+                });
+            }
+            declarations.push((entry, node));
         }
 
-        for entry in declarations {
-            let node = (entry.init)(self)?;
-            let node_index = entry
-                .process_node_index
-                .expect("validated Process declaration owns its NodeId slot");
-            if let Some(current) = node_index.get() {
-                assert_eq!(*current, node, "Process Node identity remains stable");
-            } else {
-                assert!(
-                    node_index.set(node).is_ok(),
-                    "Process Node identity is installed once"
-                );
-            }
+        for (entry, node) in declarations {
             self.nodes.process_node_indices.push(node);
             let slot = node.slot() as usize;
             self.nodes

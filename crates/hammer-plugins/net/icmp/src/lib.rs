@@ -52,7 +52,6 @@ impl IcmpMain {
 
 #[hammer_component_macros::init_function(
     name = "icmp_main_init", runs_after = ["ip_lookup_init"],
-    runs_before = ["install_packet_graph"],
 )]
 fn init_icmp_main() -> RuntimeResult<()> {
     IcmpMain::init()

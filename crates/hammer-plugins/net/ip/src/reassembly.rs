@@ -271,10 +271,7 @@ pub(crate) enum IpReassemblyError {
     Unsupportedu8 { protocol: u8 },
 }
 
-#[hammer_component_macros::init_function(
-    name = "ip_reassembly_init",
-    runs_before = ["install_packet_graph"]
-)]
+#[hammer_component_macros::init_function(name = "ip_reassembly_init")]
 fn init_ip_reassembly() -> RuntimeResult<()> {
     if IP_REASSEMBLY_MAIN.get().is_none() {
         return Err(RuntimeError::PluginStateNotInitialized { plugin: "ip" });

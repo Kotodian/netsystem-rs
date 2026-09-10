@@ -1,4 +1,4 @@
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use std::thread::JoinHandle;
 use std::time::Duration;
 
@@ -14,7 +14,7 @@ fn data_worker_entry(_: u32) -> RuntimeResult<()> {
 #[repr(C)]
 pub struct WorkerThread {
     cacheline0: CacheLineAlignMark,
-    barrier: Option<crate::WorkerBarrier>,
+    barrier: OnceLock<crate::WorkerBarrier>,
     cacheline1: CacheLineAlignMark,
     thread_index: u32,
     name: &'static str,
@@ -22,13 +22,12 @@ pub struct WorkerThread {
     cpu_index: Option<u32>,
     numa_node: Option<u32>,
     stack_size: usize,
-    max_blocking_threads: usize,
     idle_slice: Duration,
     scheduler: WorkerScheduler,
     numa_memory_binding: bool,
     entry: fn(u32) -> RuntimeResult<()>,
     no_data_structure_clone: bool,
-    join_handle: Option<JoinHandle<RuntimeResult<()>>>,
+    join_handle: OnceLock<JoinHandle<RuntimeResult<()>>>,
 }
 
 const _: () = {
@@ -51,7 +50,6 @@ impl WorkerThread {
         cpu_index: Option<u32>,
         numa_node: Option<u32>,
         stack_size: usize,
-        max_blocking_threads: usize,
         idle_slice: Duration,
         scheduler: WorkerScheduler,
         numa_memory_binding: bool,
@@ -65,7 +63,7 @@ impl WorkerThread {
         );
         Self {
             cacheline0: CacheLineAlignMark,
-            barrier: None,
+            barrier: OnceLock::new(),
             cacheline1: CacheLineAlignMark,
             thread_index,
             name,
@@ -73,13 +71,12 @@ impl WorkerThread {
             cpu_index,
             numa_node,
             stack_size,
-            max_blocking_threads,
             idle_slice,
             scheduler,
             numa_memory_binding,
             entry: entry.unwrap_or(data_worker_entry),
             no_data_structure_clone,
-            join_handle: None,
+            join_handle: OnceLock::new(),
         }
     }
 
@@ -103,15 +100,12 @@ impl WorkerThread {
         self.no_data_structure_clone
     }
 
-    pub(crate) fn install_barrier(&mut self, barrier: crate::WorkerBarrier) {
-        assert!(
-            self.barrier.replace(barrier).is_none(),
-            "barrier installs once"
-        );
+    pub(crate) fn install_barrier(&self, barrier: crate::WorkerBarrier) {
+        assert!(self.barrier.set(barrier).is_ok(), "barrier installs once");
     }
 
     pub(crate) fn launch(
-        &mut self,
+        &self,
         main: Option<(
             Box<crate::DataPlaneMain>,
             crate::spawn::DataRemoteLocalQueue,
@@ -124,10 +118,13 @@ impl WorkerThread {
             self.no_data_structure_clone,
             "no-data-structure-clone registration controls DataPlaneMain ownership"
         );
-        assert!(self.join_handle.is_none(), "WorkerThread launches once");
+        assert!(
+            self.join_handle.get().is_none(),
+            "WorkerThread launches once"
+        );
         let barrier = self
             .barrier
-            .as_ref()
+            .get()
             .expect("worker barrier installs before thread launch")
             .clone();
         let thread_index = self.thread_index;
@@ -138,7 +135,6 @@ impl WorkerThread {
         let scheduler = self.scheduler.clone();
         let numa_memory_binding = self.numa_memory_binding;
         let stack_size = self.stack_size;
-        let max_blocking_threads = self.max_blocking_threads;
         let idle_slice = self.idle_slice;
         let entry = self.entry;
         let thread = std::thread::Builder::new()
@@ -156,20 +152,6 @@ impl WorkerThread {
                     thread_index,
                     source: Box::new(source),
                 })?;
-                let runtime = if main.is_some() {
-                    Some(
-                        tokio::runtime::Builder::new_current_thread()
-                            .max_blocking_threads(max_blocking_threads)
-                            .enable_all()
-                            .build()
-                            .map_err(|source| RuntimeError::DataWorkerRuntime {
-                                worker: thread_index,
-                                source,
-                            })?,
-                    )
-                } else {
-                    None
-                };
                 if let Some((_, remote_local)) = &main {
                     remote_local.attach_current_thread();
                 }
@@ -195,18 +177,13 @@ impl WorkerThread {
                 if refork_required {
                     barrier.refork(&mut main.nodes);
                 }
-                let runtime = runtime.expect("Data Worker builds its Tokio runtime before launch");
                 if let Err(error) =
                     crate::init::run_worker_init_functions(&mut main, &init_functions)
                 {
                     tracing::error!(worker = thread_index, %error, "worker initialization failed");
                 }
-                let exit_status = crate::main_loop::data_plane_main_loop(
-                    &mut main,
-                    &runtime,
-                    &remote_local,
-                    idle_slice,
-                );
+                let exit_status =
+                    crate::main_loop::data_plane_main_loop(&mut main, &remote_local, idle_slice);
                 remote_local.close();
                 if exit_status == 0 {
                     Ok(())
@@ -222,24 +199,11 @@ impl WorkerThread {
                 name,
                 source,
             })?;
-        self.join_handle = Some(thread);
+        assert!(
+            self.join_handle.set(thread).is_ok(),
+            "WorkerThread launch handle installs once"
+        );
         Ok(())
-    }
-
-    pub(crate) fn join(&mut self) -> RuntimeResult<()> {
-        let Some(handle) = self.join_handle.take() else {
-            return Ok(());
-        };
-        match handle.join() {
-            Ok(result) => result,
-            Err(payload) => std::panic::resume_unwind(payload),
-        }
-    }
-
-    pub(crate) fn is_finished(&self) -> bool {
-        self.join_handle
-            .as_ref()
-            .is_some_and(JoinHandle::is_finished)
     }
 }
 

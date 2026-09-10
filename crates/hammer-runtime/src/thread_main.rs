@@ -10,6 +10,21 @@ use crate::error::{RuntimeError, RuntimeResult};
 use crate::worker_thread::WorkerThread;
 
 static MAIN_THREAD_ID: OnceLock<ThreadId> = OnceLock::new();
+pub(crate) static THREAD_MAIN: OnceLock<ThreadMain> = OnceLock::new();
+
+pub(crate) fn install_main_thread() -> RuntimeResult<()> {
+    let current = std::thread::current().id();
+    if let Some(owner) = MAIN_THREAD_ID.get() {
+        if *owner != current {
+            return Err(RuntimeError::ControlRequiresMainThread);
+        }
+    } else {
+        MAIN_THREAD_ID
+            .set(current)
+            .expect("Main Thread identity is installed once");
+    }
+    Ok(())
+}
 
 pub fn ensure_main_thread() -> RuntimeResult<()> {
     if MAIN_THREAD_ID
@@ -43,16 +58,7 @@ pub struct ThreadMain {
 
 impl ThreadMain {
     pub fn new() -> RuntimeResult<Self> {
-        let current = std::thread::current().id();
-        if let Some(owner) = MAIN_THREAD_ID.get() {
-            if *owner != current {
-                return Err(RuntimeError::ControlRequiresMainThread);
-            }
-        } else {
-            MAIN_THREAD_ID
-                .set(current)
-                .expect("Main Thread identity is installed once");
-        }
+        install_main_thread()?;
         let mut cpu_core_bitmap = Bitmap::new();
         #[cfg(target_os = "linux")]
         let cores = core_affinity::get_core_ids().ok_or(RuntimeError::CpuInventoryUnavailable)?;
@@ -83,6 +89,12 @@ impl ThreadMain {
             cpu_socket_bitmap,
             worker_threads: Vec::new(),
         })
+    }
+
+    pub(crate) fn global() -> &'static Self {
+        THREAD_MAIN
+            .get()
+            .expect("ThreadMain is published before worker startup")
     }
 
     pub fn configure(&mut self) -> RuntimeResult<()> {
@@ -147,7 +159,6 @@ impl ThreadMain {
             main_cpu.and_then(|cpu| u32::try_from(cpu).ok()),
             main_cpu.map(crate::numa::node_for_cpu).transpose()?,
             0,
-            0,
             Duration::ZERO,
             scheduler.clone(),
             false,
@@ -170,7 +181,6 @@ impl ThreadMain {
                 ),
                 Some(numa_node),
                 stack_size,
-                max_blocking_threads,
                 idle_slice,
                 scheduler.clone(),
                 numa.enabled,
@@ -207,7 +217,6 @@ impl ThreadMain {
             None,
             Some(0),
             0,
-            0,
             Duration::ZERO,
             scheduler.clone(),
             false,
@@ -226,7 +235,6 @@ impl ThreadMain {
                 None,
                 Some(0),
                 stack_size,
-                max_blocking_threads,
                 idle_slice,
                 scheduler.clone(),
                 false,
@@ -316,16 +324,6 @@ impl ThreadMain {
             .find(|thread| thread.thread_index() == index)
     }
 
-    pub(crate) fn thread_by_index_mut(&mut self, index: u32) -> Option<&mut WorkerThread> {
-        self.worker_threads
-            .iter_mut()
-            .find(|thread| thread.thread_index() == index)
-    }
-
-    pub(crate) fn worker_threads_mut(&mut self) -> &mut [WorkerThread] {
-        &mut self.worker_threads
-    }
-
     pub fn register_thread(
         &mut self,
         name: &'static str,
@@ -351,7 +349,6 @@ impl ThreadMain {
                 None,
                 None,
                 stack_size,
-                0,
                 Duration::ZERO,
                 WorkerScheduler::default(),
                 false,

@@ -38,6 +38,7 @@ impl DataPlaneMain {
                             .unwrap_or("?"),
                         source: Box::new(source),
                     })?;
+                entry.install_process_node_index(node)?;
                 nodes.push((node, entry.error_counters));
                 processes.push(entry.process);
             }

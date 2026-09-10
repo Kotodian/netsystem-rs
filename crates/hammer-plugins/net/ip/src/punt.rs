@@ -253,7 +253,10 @@ impl Node for Ip6DropNode {
     }
 }
 
-#[hammer_component_macros::init_function(name = "ip_feature_init", runs_after = ["install_packet_graph"], runs_before = ["interface_feature_init"])]
+#[hammer_component_macros::init_function(
+    name = "ip_feature_init",
+    runs_before = ["interface_feature_init"]
+)]
 fn ip_feature_init(main: &mut hammer_runtime::DataPlaneMain) -> RuntimeResult<()> {
     let net = NetMain::global()?;
     let interfaces = net.interface_main();

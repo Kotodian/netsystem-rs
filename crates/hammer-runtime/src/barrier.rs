@@ -58,6 +58,7 @@ struct State {
     wait: BarrierCounter,
     workers: BarrierCounter,
     reforks: BarrierCounter,
+    recursion: AtomicU32,
     startup_cancelled: AtomicBool,
     node_runtime: UnsafeCell<Option<crate::node::NodeRuntimeInner>>,
 }
@@ -133,6 +134,7 @@ impl WorkerBarrier {
                 wait: BarrierCounter::new(0),
                 workers: BarrierCounter::new(0),
                 reforks: BarrierCounter::new(0),
+                recursion: AtomicU32::new(0),
                 startup_cancelled: AtomicBool::new(false),
                 node_runtime: UnsafeCell::new(None),
             }),
@@ -142,6 +144,11 @@ impl WorkerBarrier {
         }
     }
 
+    /// Pauses every worker permanently while process-exit work runs.
+    ///
+    /// This matches VPP's final main-thread barrier: callers must invoke it
+    /// only when the process will terminate after `operation` returns.
+    #[track_caller]
     pub(crate) fn final_sync<R>(&self, operation: impl FnOnce() -> R) -> R {
         self.pause(Location::caller());
         operation()
@@ -188,7 +195,7 @@ impl WorkerBarrier {
     /// while non-zero, so nested code must not wait for worker progress.
     #[inline]
     pub(crate) fn recursion_level(&self) -> u32 {
-        self.state.wait.load(Ordering::Acquire)
+        self.state.recursion.load(Ordering::Acquire)
     }
 
     /// Acknowledges an armed barrier and waits for release.
@@ -269,6 +276,11 @@ impl WorkerBarrier {
 
     #[track_caller]
     pub(crate) fn arm(&self) {
+        assert_eq!(
+            self.state.recursion.load(Ordering::Acquire),
+            0,
+            "startup barrier is armed outside a barrier scope"
+        );
         let previous = self.state.wait.fetch_add(1, Ordering::Release);
         if previous != 0 {
             barrier_deadlock_at("arm startup barrier", 0, previous, Location::caller());
@@ -281,8 +293,21 @@ impl WorkerBarrier {
     }
 
     #[track_caller]
-    pub(crate) fn release(&self) {
-        self.release_from(Location::caller());
+    pub(crate) fn release_startup(&self) {
+        assert_eq!(
+            self.state.recursion.load(Ordering::Acquire),
+            0,
+            "cancelled startup has no active barrier scope"
+        );
+        let previous = self.state.wait.fetch_sub(1, Ordering::Release);
+        assert_eq!(previous, 1, "startup barrier releases once");
+        wait_for_worker_count(
+            &self.state.workers,
+            0,
+            Instant::now() + BARRIER_SYNC_TIMEOUT,
+            "startup barrier release",
+            Location::caller(),
+        );
     }
 
     fn pause(&self, caller: &'static Location<'static>) {
@@ -291,8 +316,12 @@ impl WorkerBarrier {
             self.main_thread,
             "worker barrier sync requires the installed main thread"
         );
-        let recursion_level = self.state.wait.fetch_add(1, Ordering::Release);
+        let recursion_level = self.state.recursion.fetch_add(1, Ordering::Relaxed);
         if recursion_level == 0 {
+            if self.state.wait.load(Ordering::Acquire) == 0 {
+                let previous = self.state.wait.fetch_add(1, Ordering::Release);
+                assert_eq!(previous, 0, "outer barrier sync closes once");
+            }
             wait_for_worker_count(
                 &self.state.workers,
                 self.participant_count,
@@ -304,12 +333,13 @@ impl WorkerBarrier {
     }
 
     fn release_from(&self, caller: &'static Location<'static>) {
-        let recursion_level = self.state.wait.load(Ordering::Acquire);
+        let recursion_level = self.state.recursion.load(Ordering::Relaxed);
         if recursion_level == 0 {
             barrier_deadlock_at("barrier release without matching sync", 1, 0, caller);
         }
-        if recursion_level > 1 {
-            self.state.wait.fetch_sub(1, Ordering::Release);
+        let previous_recursion = self.state.recursion.fetch_sub(1, Ordering::Relaxed);
+        assert_eq!(previous_recursion, recursion_level);
+        if previous_recursion > 1 {
             return;
         }
         // SAFETY: only the main thread writes this slot and workers remain
@@ -358,6 +388,7 @@ impl fmt::Debug for WorkerBarrier {
             .field("wait", &self.state.wait.load(Ordering::Relaxed))
             .field("workers", &self.state.workers.load(Ordering::Relaxed))
             .field("reforks", &self.state.reforks.load(Ordering::Relaxed))
+            .field("recursion", &self.state.recursion.load(Ordering::Relaxed))
             .finish()
     }
 }

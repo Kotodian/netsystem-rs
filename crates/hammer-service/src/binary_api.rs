@@ -731,7 +731,10 @@ fn binary_api_clnt(
 ) -> impl std::future::Future<Output = RuntimeResult<()>> + Send + 'static {
     // VPP `vl_api_clnt_node`: FileMain callbacks signal this node; the main
     // FileMain poll loop owns readiness and this node consumes its event batch.
-    let events = main.process_events();
+    let events = (|| {
+        hammer_runtime::init::run_api_init(main)?;
+        main.process_events()
+    })();
     async move {
         let mut events = events?;
         let capability = BINARY_API_MAIN.get().map(Arc::clone).ok_or(

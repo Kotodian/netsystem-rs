@@ -736,19 +736,13 @@ mod tests {
         plugins.register_image(hammer_plugin_ip::plugin_module().registration_image().get());
         plugins.register_image(crate::plugin_module().registration_image().get());
         plugins.register_global_declarations(&mut global);
-        hammer_runtime::init::run_config_functions(&mut global, None, true, &document)?;
+        hammer_runtime::init::run_config_functions(&global, None, true, &document)?;
         let mut threads = ThreadMain::new()?;
         threads.configure()?;
         let mut runtime = DataPlaneMain::new_main(&threads)?;
-        plugins.install_graph(&mut runtime)?;
-        hammer_runtime::init::run_config_functions(
-            &mut global,
-            Some(&mut runtime),
-            false,
-            &document,
-        )?;
-        hammer_runtime::init::run_init_functions(&mut global, &mut runtime)?;
-        hammer_runtime::init::run_stats_registrations(&plugins)?;
+        hammer_runtime::main_loop::run(global, threads, plugins, &mut runtime, async {
+            Ok::<(), hammer_runtime::RuntimeError>(())
+        })?;
 
         // icmp6.c::icmp6_input applies code, hop-limit, then minimum-length
         // validation. Every classified error uses punt, including registered
@@ -924,7 +918,6 @@ mod tests {
             assert_eq!(runtime.cached_free_buffers(), cached_free + segments);
         }
 
-        hammer_runtime::init::run_main_loop_exit(&mut global, &mut runtime)?;
         Ok(())
     }
 }

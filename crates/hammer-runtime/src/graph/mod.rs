@@ -5,11 +5,9 @@
 //! each entry's `init` fn; `NodeMain::resolve_named_next_nodes` links by
 //! name (VPP `vlib_node_main_init`).
 //!
-//! Graph *contents* come from plugins (and runtime builtins). The host only
-//! installs the filtered catalog — see [`install::install_packet_graph`].
+//! Graph contents come from declarations installed by the thread-zero runtime
+//! before normal initialization begins.
 
 mod fanout;
-pub(crate) mod install;
 
 pub use crate::NodeEntry;
-pub use install::install_packet_graph;

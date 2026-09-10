@@ -108,5 +108,6 @@ fn init_stats_main(_: &mut DataPlaneMain) -> RuntimeResult<()> {
             0,
             stats_segment_socket::file_functions::<crate::NodeMain, crate::RuntimeError>(),
         ))?;
+    crate::init::run_stats_registrations()?;
     Ok(())
 }

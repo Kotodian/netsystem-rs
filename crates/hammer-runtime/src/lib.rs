@@ -21,7 +21,7 @@ crate::__declare_registration_image!(
         memory::__CONFIG_FN_RUNTIME_WORKER_CONFIG,
         config::stats::__CONFIG_FN_RUNTIME_STATS_CONFIG,
     ];
-    main_loop_enter_functions = [];
+    main_loop_enter_functions = [start_workers::__INIT_FN_START_WORKERS];
     main_loop_exit_functions = [];
     worker_init_functions = [];
     num_workers_change_functions = [];

@@ -246,7 +246,7 @@ pub struct PluginMain {
     libraries: Vec<PluginLibrary>,
 }
 
-static PLUGIN_MAIN: OnceLock<&'static PluginMain> = OnceLock::new();
+pub(crate) static PLUGIN_MAIN: OnceLock<PluginMain> = OnceLock::new();
 
 impl Default for PluginMain {
     fn default() -> Self {
@@ -270,19 +270,8 @@ impl std::fmt::Debug for PluginMain {
 }
 
 impl PluginMain {
-    pub fn publish(main: Box<Self>) -> &'static Self {
-        let main = Box::leak(main);
-        PLUGIN_MAIN
-            .set(main)
-            .expect("Plugin Main is published once");
-        main
-    }
-
     pub fn global() -> Result<&'static Self, PluginError> {
-        PLUGIN_MAIN
-            .get()
-            .copied()
-            .ok_or(PluginError::MainUnavailable)
+        PLUGIN_MAIN.get().ok_or(PluginError::MainUnavailable)
     }
 
     pub fn get_plugin_symbol<T>(
@@ -550,6 +539,12 @@ impl PluginMain {
             for registration in image.graph_nodes() {
                 global.register_node(registration);
             }
+            for registration in image.process_nodes() {
+                global.register_node(registration);
+            }
+            for registration in image.node_functions() {
+                global.register_node_function(registration);
+            }
             for registration in image.init_functions() {
                 global.register_init(registration);
             }
@@ -572,23 +567,6 @@ impl PluginMain {
                 global.register_config(registration);
             }
         });
-    }
-
-    pub fn install_graph(&self, main: &mut crate::DataPlaneMain) -> crate::RuntimeResult<()> {
-        let entries = self
-            .registration_images()
-            .flat_map(|image| image.graph_nodes());
-        let functions = self
-            .registration_images()
-            .flat_map(|image| image.node_functions());
-        crate::graph::install::install_packet_graph(main, entries, functions)
-    }
-
-    pub fn install_processes(&self, main: &mut crate::DataPlaneMain) -> crate::RuntimeResult<()> {
-        main.start_processes(
-            self.registration_images()
-                .flat_map(|image| image.process_nodes()),
-        )
     }
 
     pub fn binary_api_method(&self, name: &str) -> Result<BinaryApiMethodEntry, PluginError> {

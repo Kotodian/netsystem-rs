@@ -404,8 +404,7 @@ fn configure_tcp(config: crate::config::TcpPluginConfig) -> RuntimeResult<()> {
 
 #[hammer_component_macros::init_function(
     name = "tcp_init",
-    runs_after = ["transport_main_init", "session_init"],
-    runs_before = ["install_packet_graph"]
+    runs_after = ["transport_main_init", "session_init"]
 )]
 fn init_tcp() -> RuntimeResult<()> {
     assert!(

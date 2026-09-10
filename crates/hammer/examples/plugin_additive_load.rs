@@ -107,8 +107,6 @@ enum ExampleError {
     },
     #[error("a failed plugin transaction changed the active plugin set")]
     FailedTransactionChangedPluginSet,
-    #[error("a failed plugin transaction changed the existing drop NodeId")]
-    FailedTransactionChangedDropNode,
 }
 
 fn main() -> Result<(), ExampleError> {
@@ -132,48 +130,23 @@ fn main() -> Result<(), ExampleError> {
     plugins
         .load(env!("CARGO_PKG_VERSION"), &roots)
         .map_err(RuntimeError::from)?;
+    verify_plugin_transactions(&mut plugins, &roots)?;
     plugins.register_global_declarations(&mut global);
-    hammer_runtime::init::run_config_functions(&mut global, None, true, EXAMPLE_CONFIG)?;
+    hammer_runtime::init::run_config_functions(&global, None, true, EXAMPLE_CONFIG)?;
     let mut threads = ThreadMain::new()?;
     threads.configure()?;
     let mut main = DataPlaneMain::new_main(&threads)?;
-    plugins.install_graph(&mut main)?;
-    hammer_runtime::init::run_config_functions(
-        &mut global,
-        Some(&mut main),
-        false,
-        EXAMPLE_CONFIG,
-    )?;
-    hammer_runtime::init::run_init_functions(&mut global, &mut main)?;
-    hammer_runtime::init::run_stats_registrations(&plugins)?;
-    hammer_runtime::init::run_main_loop_enter(&mut global, &mut main)?;
-    hammer_runtime::start_workers::start_workers(&mut threads, &mut main, &mut global)?;
-    hammer_runtime::init::run_api_init(&mut global, &mut main)?;
-    plugins.install_processes(&mut main)?;
-
-    let example_result = run_example(
-        &mut plugins,
-        &main,
-        main_heap_capacity,
-        &roots,
-        &plugin_path,
-    );
-    let worker_shutdown = hammer_runtime::start_workers::stop_workers(&mut threads, 0);
-    let process_shutdown = main.stop_processes();
-    let close_result = hammer_runtime::init::run_main_loop_exit(&mut global, &mut main);
-
-    example_result?;
-    worker_shutdown?;
-    process_shutdown?;
-    close_result?;
-    Ok(())
+    hammer_runtime::main_loop::run(global, threads, plugins, &mut main, async {
+        Ok::<(), RuntimeError>(())
+    })?;
+    let plugins = PluginMain::global().map_err(RuntimeError::from)?;
+    run_example(plugins, &main, main_heap_capacity, &plugin_path)
 }
 
 fn run_example(
-    plugins: &mut PluginMain,
+    plugins: &PluginMain,
     main: &DataPlaneMain,
     main_heap_capacity: usize,
-    roots: &[String],
     plugin_path: &Path,
 ) -> Result<(), ExampleError> {
     let drop_before = main
@@ -198,10 +171,19 @@ fn run_example(
             after: drop_after_load,
         });
     }
-    // Repeated load is a no-op, while a failed new closure leaves the active
-    // set and existing NodeIds unchanged.
     verify_shared_allocator_images(plugin_path)?;
 
+    println!("fixed main heap: {main_heap_capacity} bytes");
+    println!("loaded plugins: ip, tcp, udp");
+    println!("host and plugin images share libhammer_infra allocator authority");
+    println!("main graph and live worker update completed");
+    Ok(())
+}
+
+fn verify_plugin_transactions(
+    plugins: &mut PluginMain,
+    roots: &[String],
+) -> Result<(), ExampleError> {
     plugins
         .load(env!("CARGO_PKG_VERSION"), roots)
         .map_err(RuntimeError::from)?;
@@ -218,14 +200,6 @@ fn run_example(
     if plugins.loaded_plugins().as_slice() != PLUGIN_NAMES {
         return Err(ExampleError::FailedTransactionChangedPluginSet);
     }
-    if main.node_by_name("drop") != Some(drop_before) {
-        return Err(ExampleError::FailedTransactionChangedDropNode);
-    }
-
-    println!("fixed main heap: {main_heap_capacity} bytes");
-    println!("loaded plugins: ip, tcp, udp");
-    println!("host and plugin images share libhammer_infra allocator authority");
-    println!("main graph and live worker update completed");
     Ok(())
 }
 
