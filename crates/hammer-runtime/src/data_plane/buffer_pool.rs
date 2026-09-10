@@ -183,7 +183,9 @@ impl DataPlaneMain {
     fn borrow_buffer_caches(
         &self,
     ) -> Box<[std::cell::RefMut<'static, hammer_core::buffer::BufferThreadCache>]> {
-        self.buffer_main.borrow_worker_caches(self.thread_index)
+        // SAFETY: this DataPlaneMain is the unique execution owner for its
+        // immutable runtime thread index.
+        unsafe { self.buffer_main.borrow_worker_caches(self.thread_index) }
     }
 
     #[inline]

@@ -6,6 +6,11 @@ impl DataPlaneMain {
     }
 
     #[inline]
+    pub fn trace_control(&self) -> Option<TraceControlHandle> {
+        self.trace.control()
+    }
+
+    #[inline]
     pub fn node_by_name(&self, name: &str) -> Option<NodeId> {
         self.nodes.node_by_name(name)
     }

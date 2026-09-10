@@ -38,8 +38,6 @@ const BUFFER_SLOTS_PER_NUMA: usize = 4_096;
 const BUFFER_FRAME_POOL_SIZE: usize = 64;
 // hammer-runtime/src/handoff.rs (DataPlaneHandoff::new(workers, cap))
 const HANDOFF_QUEUE_CAPACITY: usize = 1_024;
-// hammer-runtime/src/spawn.rs (DataRemoteLocalQueue::new(cap))
-const WORKER_CONTROL_QUEUE_CAPACITY: usize = 1_024;
 // hammer-runtime/src/app/session.rs AppSessionConfig::DEFAULT
 const APP_SESSION_FIFO_CAPACITY: usize = 64 * 1024;
 const APP_SESSION_EVENT_QUEUE_CAPACITY: usize = 16;
@@ -50,7 +48,6 @@ static MAX_BLOCKING: OnceLock<usize> = OnceLock::new();
 static IDLE_SLICE: OnceLock<Duration> = OnceLock::new();
 static BUFFER: OnceLock<WorkerBuffer> = OnceLock::new();
 static HANDOFF: OnceLock<WorkerHandoff> = OnceLock::new();
-static CONTROL: OnceLock<WorkerControl> = OnceLock::new();
 static APP_SESSION: OnceLock<WorkerAppSession> = OnceLock::new();
 static SCHEDULER: OnceLock<WorkerScheduler> = OnceLock::new();
 #[cfg(target_os = "linux")]
@@ -99,7 +96,6 @@ pub(crate) fn install(mut section: toml::Table) -> RuntimeResult<()> {
     .unwrap_or(WORKER_IDLE_SLICE);
     let buffer: WorkerBuffer = take_value(&mut section, "buffer", &[])?.unwrap_or_default();
     let handoff: WorkerHandoff = take_value(&mut section, "handoff", &[])?.unwrap_or_default();
-    let control: WorkerControl = take_value(&mut section, "control", &[])?.unwrap_or_default();
     let app_session: WorkerAppSession =
         take_value(&mut section, "app_session", &[])?.unwrap_or_default();
     let scheduler: WorkerScheduler =
@@ -125,7 +121,6 @@ pub(crate) fn install(mut section: toml::Table) -> RuntimeResult<()> {
     }
     buffer.validate()?;
     handoff.validate()?;
-    control.validate()?;
     app_session.validate()?;
     scheduler.validate()?;
     #[cfg(target_os = "linux")]
@@ -140,7 +135,6 @@ pub(crate) fn install(mut section: toml::Table) -> RuntimeResult<()> {
     assert!(IDLE_SLICE.set(idle_slice).is_ok());
     assert!(BUFFER.set(buffer).is_ok());
     assert!(HANDOFF.set(handoff).is_ok());
-    assert!(CONTROL.set(control).is_ok());
     assert!(APP_SESSION.set(app_session).is_ok());
     assert!(SCHEDULER.set(scheduler).is_ok());
     #[cfg(target_os = "linux")]
@@ -185,12 +179,6 @@ pub(crate) fn handoff() -> &'static WorkerHandoff {
     HANDOFF
         .get()
         .expect("worker configuration is installed before handoff setup")
-}
-
-pub(crate) fn control() -> &'static WorkerControl {
-    CONTROL
-        .get()
-        .expect("worker configuration is installed before worker control setup")
 }
 
 pub(crate) fn app_session() -> &'static WorkerAppSession {
@@ -279,32 +267,6 @@ impl WorkerBuffer {
 pub struct WorkerHandoff {
     /// Per-worker packet handoff queue capacity.
     pub queue_capacity: usize,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
-#[serde(deny_unknown_fields, default)]
-pub struct WorkerControl {
-    /// Per-worker Main Thread to Data Worker control queue capacity.
-    pub queue_capacity: usize,
-}
-
-impl Default for WorkerControl {
-    fn default() -> Self {
-        Self {
-            queue_capacity: WORKER_CONTROL_QUEUE_CAPACITY,
-        }
-    }
-}
-
-impl WorkerControl {
-    pub(crate) fn validate(&self) -> RuntimeResult<()> {
-        if self.queue_capacity == 0 {
-            return Err(RuntimeError::config_validation(
-                "worker.control.queue_capacity must be non-zero",
-            ));
-        }
-        Ok(())
-    }
 }
 
 impl Default for WorkerHandoff {

@@ -27,7 +27,7 @@ pub use application::{
     METADATA_WORDS as APPLICATION_MQ_METADATA_WORDS,
 };
 
-pub const ATTACH_PROTOCOL_VERSION: u64 = 4;
+pub const ATTACH_PROTOCOL_VERSION: u64 = 5;
 pub const ATTACH_REQUEST_BYTES: usize = size_of::<u64>();
 pub const ATTACH_REPLY_WORDS: usize = 3;
 pub const ATTACH_REPLY_BYTES: usize = ATTACH_REPLY_WORDS * size_of::<u64>();

@@ -1,5 +1,4 @@
 use crate::DataPlaneMain;
-use crate::spawn;
 use std::future::Future;
 use std::time::Duration;
 
@@ -74,16 +73,12 @@ where
 /// Step order mirrors VPP `main.c:1442-1693`:
 /// 1. Barrier check (workers_at_barrier / wait_at_barrier)
 /// 2. Poll worker-local File readiness
-/// 3. Drain handoff, run ready nodes, and poll the worker control queue
+/// 3. Drain handoff and run ready nodes
 /// 4. Schedule polling-state driver nodes (periodically)
 /// 5. Run ready nodes (handles interrupt frames + newly-scheduled polling frames)
 /// 6. Dispatch timer nodes (no timer wheel in data-plane yet)
 /// 7. Advance timers, increment main_loop_count and check exit
-pub fn data_plane_main_loop(
-    main: &mut DataPlaneMain,
-    remote_local: &spawn::DataRemoteLocalQueue,
-    idle_slice: Duration,
-) -> i32 {
+pub fn data_plane_main_loop(main: &mut DataPlaneMain, idle_slice: Duration) -> i32 {
     main.attach_worker_interrupt_thread();
 
     loop {
@@ -121,9 +116,7 @@ pub fn data_plane_main_loop(
             progress |= scheduled != 0;
         }
 
-        // Step 3: Drain handoff queues, run ready nodes, poll remote/local tasks
-        let _ = main.run_ready_nodes();
-        progress |= spawn::poll_remote_local_tasks(remote_local, main);
+        // Step 3: Drain handoff queues and run ready nodes.
         let _ = main.run_ready_nodes();
 
         if !progress {

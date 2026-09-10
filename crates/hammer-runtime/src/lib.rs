@@ -54,7 +54,6 @@ pub mod init;
 pub mod log;
 pub mod main_loop;
 pub mod memory;
-pub mod metrics;
 pub mod plugin;
 pub mod plugin_loader;
 mod process;
@@ -69,7 +68,6 @@ pub mod app;
 pub mod attach;
 pub mod data_plane;
 pub mod handoff;
-pub mod network;
 pub mod node;
 mod runtime_simd;
 pub mod thread_main;
@@ -78,11 +76,6 @@ pub mod unix_main;
 pub use data_plane::{DataPlaneBufferConfig, DataPlaneMain};
 pub use hammer_core::data_plane::FrameBatchWidth;
 pub use handoff::{DataPlaneHandoff, DataPlaneHandoffWorker, DataWorkerId};
-pub use metrics::{
-    MetricCounter, MetricGauge, MetricKind, MetricLabel, MetricSample, MetricsRegistry,
-    MetricsScope, RegistryRecorder,
-};
-pub use network::{Network, SocksAddr};
 pub use node::{
     DriverNode, InternalNode, Node, NodeDescriptor, NodeEntry, NodeErrorCode, NodeErrorDescriptor,
     NodeErrorSeverity, NodeMain, NodeProcessFn, NodeRuntime, NodeRuntimeReady,
@@ -118,7 +111,5 @@ macro_rules! worker_thread_barrier_sync {
         __worker_barrier_result
     }};
 }
-pub use spawn::schedule_on_worker;
-
 #[cfg(test)]
 static BUFFER_MAIN_INIT: std::sync::Once = std::sync::Once::new();

@@ -49,7 +49,7 @@ pub const SESSION_CTRL_MSG_MAX_SIZE: usize = 86;
 /// Fixed shared-memory Session event codec size. VPP keeps event type and
 /// postponed state before a target union; Hammer preserves the fixed slot,
 /// explicit Session identity fields, and its own event metadata.
-const SESSION_EVT_BYTES: usize = 16;
+const SESSION_EVT_BYTES: usize = 24;
 
 fn encode_session_evt(event: SessionEvt) -> [u8; SESSION_EVT_BYTES] {
     let mut bytes = [0_u8; SESSION_EVT_BYTES];
@@ -57,6 +57,7 @@ fn encode_session_evt(event: SessionEvt) -> [u8; SESSION_EVT_BYTES] {
     bytes[1] = u8::from(event.postponed);
     bytes[2..6].copy_from_slice(&event.session_index.to_le_bytes());
     bytes[6..10].copy_from_slice(&event.thread_index.to_le_bytes());
+    bytes[10..18].copy_from_slice(&event.control_data.to_le_bytes());
     bytes
 }
 
@@ -71,7 +72,7 @@ fn decode_session_evt(bytes: &[u8]) -> Result<SessionEvt, SessionEvtDecodeError>
         1 => true,
         value => return Err(SessionEvtDecodeError::InvalidPostponed { value }),
     };
-    if bytes[10..].iter().any(|byte| *byte != 0) {
+    if bytes[18..].iter().any(|byte| *byte != 0) {
         return Err(SessionEvtDecodeError::ReservedBytes);
     }
     Ok(SessionEvt {
@@ -79,6 +80,7 @@ fn decode_session_evt(bytes: &[u8]) -> Result<SessionEvt, SessionEvtDecodeError>
         postponed,
         session_index: u32::from_le_bytes(bytes[2..6].try_into().expect("four byte index")),
         thread_index: u32::from_le_bytes(bytes[6..10].try_into().expect("four byte index")),
+        control_data: u64::from_le_bytes(bytes[10..18].try_into().expect("eight byte data")),
     })
 }
 
@@ -867,4 +869,4 @@ impl SessionProducer {
     }
 }
 
-const _: () = assert!(SESSION_EVT_BYTES == 16);
+const _: () = assert!(SESSION_EVT_BYTES == 24);

@@ -118,8 +118,6 @@ pub enum RuntimeError {
     PluginStateNotInitialized { plugin: &'static str },
     #[error("thread {thread_index} is not a data worker")]
     DataWorkerIdUnavailable { thread_index: u32 },
-    #[error("only GlobalMain can schedule worker control work")]
-    WorkerControlRequiresGlobalMain,
     #[error("control operation must run on GlobalMain")]
     ControlRequiresMainThread,
     #[error("control operation requires the worker barrier while Data Workers are running")]
@@ -173,19 +171,6 @@ pub enum RuntimeError {
         function: &'static str,
         #[source]
         source: Box<RuntimeError>,
-    },
-    #[error("data worker {worker} control call was canceled")]
-    DataWorkerCallCanceled { worker: usize },
-    #[error("data worker index {worker} is outside configured worker count {worker_count}")]
-    DataWorkerIndexOutOfRange { worker: usize, worker_count: usize },
-    #[error("worker control queue for {worker:?} is unavailable before worker startup")]
-    WorkerControlUnavailable { worker: crate::DataWorkerId },
-    #[error("worker control queue for {worker:?} is closed")]
-    WorkerControlClosed { worker: crate::DataWorkerId },
-    #[error("worker control queue for {worker:?} reached capacity {capacity}")]
-    WorkerControlQueueFull {
-        worker: crate::DataWorkerId,
-        capacity: usize,
     },
     #[error("thread-zero Process runtime is unavailable")]
     MainProcessRuntimeUnavailable,

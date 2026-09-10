@@ -1,9 +1,7 @@
 use std::sync::Arc;
 
 use crate::error::{RuntimeError, RuntimeResult};
-use crate::{
-    DataPlaneHandoff, DataPlaneMain, DataWorkerId, GlobalMain, ThreadMain, barrier, spawn,
-};
+use crate::{DataPlaneHandoff, DataPlaneMain, DataWorkerId, GlobalMain, ThreadMain, barrier};
 
 #[hammer_component_macros::main_loop_enter_function]
 fn start_workers(main: &mut DataPlaneMain) -> RuntimeResult<()> {
@@ -24,11 +22,6 @@ fn start_workers(main: &mut DataPlaneMain) -> RuntimeResult<()> {
         crate::config::worker::handoff().queue_capacity,
         main.nodes().node_count(),
     );
-    let queues: Arc<[spawn::DataRemoteLocalQueue]> = (0..worker_count)
-        .map(|_| spawn::DataRemoteLocalQueue::new(crate::config::worker::control().queue_capacity))
-        .collect::<Vec<_>>()
-        .into();
-
     let mut worker_mains = Vec::with_capacity(worker_count as usize);
     for worker_slot in 0..worker_count {
         let thread_index = worker_slot + 1;
@@ -46,7 +39,6 @@ fn start_workers(main: &mut DataPlaneMain) -> RuntimeResult<()> {
         )?));
     }
 
-    spawn::install_worker_control_queues(Arc::clone(&queues));
     let barrier = barrier::install(worker_count, participant_count);
     for thread_index in 1..threads.thread_count() {
         threads
@@ -60,10 +52,7 @@ fn start_workers(main: &mut DataPlaneMain) -> RuntimeResult<()> {
         let descriptor = threads
             .thread_by_index(thread_index)
             .expect("configured worker descriptor exists");
-        if let Err(error) = descriptor.launch(
-            Some((worker_main, queues[worker_slot].clone())),
-            Arc::clone(&init_functions),
-        ) {
+        if let Err(error) = descriptor.launch(Some(worker_main), Arc::clone(&init_functions)) {
             return Err(cancel_startup(&barrier, error));
         }
     }

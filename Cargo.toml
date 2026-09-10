@@ -53,8 +53,6 @@ thiserror = "2.0"
 async-trait = "0.1"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", default-features = false, features = ["registry", "std", "fmt", "env-filter"] }
-metrics = "0.24"
-metrics-derive = "0.1"
 humantime-serde = "1.1"
 byte-unit = { version = "5.2.5", features = ["serde"] }
 parse-display = "0.11.0"

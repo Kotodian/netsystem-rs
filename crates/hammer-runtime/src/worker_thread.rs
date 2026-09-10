@@ -106,10 +106,7 @@ impl WorkerThread {
 
     pub(crate) fn launch(
         &self,
-        main: Option<(
-            Box<crate::DataPlaneMain>,
-            crate::spawn::DataRemoteLocalQueue,
-        )>,
+        main: Option<Box<crate::DataPlaneMain>>,
         init_functions: Arc<[&'static crate::init::InitFunction]>,
     ) -> RuntimeResult<()> {
         assert_ne!(self.thread_index, 0);
@@ -152,22 +149,16 @@ impl WorkerThread {
                     thread_index,
                     source: Box::new(source),
                 })?;
-                if let Some((_, remote_local)) = &main {
-                    remote_local.attach_current_thread();
-                }
                 let refork_required = barrier.check_for_refork();
                 if barrier.startup_cancelled() {
                     assert!(
                         !refork_required,
                         "startup cancellation cannot publish a graph refork"
                     );
-                    if let Some((_, remote_local)) = &main {
-                        remote_local.close();
-                    }
                     return Ok(());
                 }
 
-                let Some((mut main, remote_local)) = main else {
+                let Some(mut main) = main else {
                     assert!(
                         !refork_required,
                         "a no-data-structure-clone thread cannot refork a graph"
@@ -182,9 +173,7 @@ impl WorkerThread {
                 {
                     tracing::error!(worker = thread_index, %error, "worker initialization failed");
                 }
-                let exit_status =
-                    crate::main_loop::data_plane_main_loop(&mut main, &remote_local, idle_slice);
-                remote_local.close();
+                let exit_status = crate::main_loop::data_plane_main_loop(&mut main, idle_slice);
                 if exit_status == 0 {
                     Ok(())
                 } else {
