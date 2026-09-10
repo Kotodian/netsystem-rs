@@ -716,31 +716,42 @@ fn next_for_echo_request_index(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use hammer_runtime::{DataPlaneBufferConfig, GlobalMain, RuntimeRegistry};
+    use hammer_runtime::log::Level;
+    use hammer_runtime::{ControlThread, GlobalMain, PluginMain, ThreadMain};
+    use std::time::Instant;
 
     #[test]
     fn input_dispatch_preserves_protocol_specific_validation() -> RuntimeResult<()> {
         hammer_runtime::config::Memory::default().ensure_main_heap()?;
-        hammer_core::buffer::BufferMain::new(64, 1024, &[0], 2, hammer_infra::PageSize::Default)
-            .unwrap();
-        let mut main = GlobalMain::new(
-            DataPlaneMain::new(DataPlaneBufferConfig::default()),
-            RuntimeRegistry::new(),
-        );
-        main.init_control()?;
-        main.install_current();
-        main.plugin_main_mut()
-            .register_image(hammer_service::registration_image());
-        main.plugin_main_mut()
-            .register_image(hammer_plugin_ip::plugin_module().registration_image().get());
-        main.plugin_main_mut()
-            .register_image(crate::plugin_module().registration_image().get());
-        main.configure_early(&format!(
+        let document = format!(
             "[stats]\nsocket_path = '/tmp/hammer-icmp-input-{}.sock'\n",
             std::process::id()
-        ))?;
-        hammer_runtime::init::run_init_functions(&mut main)?;
-        let runtime = main.data_plane_main_mut();
+        );
+        let mut global = GlobalMain::new(
+            "hammer-icmp-input".to_owned(),
+            String::new(),
+            Vec::new(),
+            document.clone(),
+        );
+        let mut plugins = PluginMain::default();
+        plugins.register_image(hammer_service::registration_image());
+        plugins.register_image(hammer_plugin_ip::plugin_module().registration_image().get());
+        plugins.register_image(crate::plugin_module().registration_image().get());
+        plugins.register_global_declarations(&mut global);
+        hammer_runtime::init::run_config_functions(&mut global, None, true, &document)?;
+        let mut threads = ThreadMain::new()?;
+        threads.configure()?;
+        let control = ControlThread::new(Instant::now(), Level::Info);
+        let mut runtime = DataPlaneMain::new_main(&threads, control.runtime())?;
+        plugins.install_graph(&mut runtime)?;
+        hammer_runtime::init::run_config_functions(
+            &mut global,
+            Some(&mut runtime),
+            false,
+            &document,
+        )?;
+        hammer_runtime::init::run_init_functions(&mut global, &mut runtime)?;
+        hammer_runtime::init::run_stats_registrations(&plugins)?;
 
         // icmp6.c::icmp6_input applies code, hop-limit, then minimum-length
         // validation. Every classified error uses punt, including registered
@@ -838,7 +849,7 @@ mod tests {
                 (&packet[..packet_len]).len()
             );
             {
-                let mut buffer = runtime.buffer_mut(index);
+                let buffer = runtime.buffer_mut(index);
                 // SAFETY: this fixture installs the same initialized service
                 // overlay that IP local supplies at the ICMP input boundary.
                 let network = hammer_core::buffer_opaque!(mut buffer => NetworkOpaque);
@@ -916,8 +927,7 @@ mod tests {
             assert_eq!(runtime.cached_free_buffers(), cached_free + segments);
         }
 
-        main.close()?;
-        GlobalMain::uninstall_current();
+        hammer_runtime::init::run_main_loop_exit(&mut global, &mut runtime)?;
         Ok(())
     }
 }

@@ -7,7 +7,7 @@ use hammer_infra::checksum::internet_checksum;
 use hammer_infra::pool::Pool;
 use hammer_runtime::sync::SpinLock;
 use hammer_runtime::{
-    DataPlaneMain, DataWorkerId, GlobalMain, Node, NodeProcessFn, NodeRuntime, TraceFormatter,
+    DataPlaneMain, DataWorkerId, Node, NodeProcessFn, NodeRuntime, TraceFormatter,
     add_packet_trace, format_packet_trace,
 };
 use hammer_runtime::{RuntimeError, RuntimeResult};
@@ -209,13 +209,6 @@ impl IpReassemblyMain {
         runtime.thread_index().saturating_sub(1) as usize
     }
 
-    fn expire_all(&self, runtime: &mut DataPlaneMain, now: Instant) -> usize {
-        self.per_thread_data
-            .iter()
-            .map(|worker| worker.lock().expire(runtime, now))
-            .sum()
-    }
-
     fn expire_worker(&self, runtime: &mut DataPlaneMain, now: Instant) -> usize {
         self.per_thread_data
             .get(Self::worker_slot(runtime))
@@ -245,15 +238,16 @@ impl IpReassemblyMain {
     early = true,
     runs_after = ["runtime_worker_config"]
 )]
-fn configure_ip_reassembly(
-    config: NetworkIpConfig,
-    engine: &mut hammer_runtime::GlobalMain,
-) -> RuntimeResult<()> {
+fn configure_ip_reassembly(config: NetworkIpConfig) -> RuntimeResult<()> {
     config.ip.reassembly.validate()?;
-    let main = IpReassemblyMain::new(engine.configured_worker_count(), &config.ip.reassembly);
-    IP_REASSEMBLY_MAIN
-        .set(main)
-        .map_err(|_| RuntimeError::PluginStateNotInitialized { plugin: "ip" })?;
+    let main = IpReassemblyMain::new(
+        hammer_runtime::config::worker::worker_count(),
+        &config.ip.reassembly,
+    );
+    assert!(
+        IP_REASSEMBLY_MAIN.set(main).is_ok(),
+        "IP reassembly configuration callback executes once"
+    );
     Ok(())
 }
 
@@ -423,9 +417,12 @@ async fn ip_reassembly_expire_process(
         let _ = context
             .wait_for_event_or_clock(REASSEMBLY_EXPIRE_WALK_INTERVAL)
             .await;
-        let _ = GlobalMain::with_current(|engine| {
-            main.expire_all(engine.data_plane_main_mut(), Instant::now())
-        });
+        for worker_slot in 0..hammer_runtime::config::worker::worker_count() {
+            let worker = DataWorkerId::new(worker_slot as u32);
+            hammer_runtime::schedule_on_worker(worker, move |runtime| {
+                main.expire_worker(runtime, Instant::now());
+            })?;
+        }
     }
 }
 

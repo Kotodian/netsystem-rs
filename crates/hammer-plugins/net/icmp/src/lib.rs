@@ -34,11 +34,10 @@ impl IcmpMain {
             ip4_input_node: OnceLock::new(),
             ip6_input_node: OnceLock::new(),
         };
-        ICMP_MAIN
-            .set(main)
-            .map_err(|_| RuntimeError::RuntimeCapabilityMissing {
-                type_name: "hammer_plugin_icmp::IcmpMain",
-            })?;
+        assert!(
+            ICMP_MAIN.set(main).is_ok(),
+            "ICMP initialization callback executes once"
+        );
         Ok(())
     }
 
@@ -64,7 +63,6 @@ hammer_component_macros::declare_plugin!(
     load_after = ["ip"],
     init_functions = [__INIT_FN_ICMP_MAIN_INIT],
     config_functions = [],
-    early_config_functions = [],
     main_loop_enter_functions = [],
     main_loop_exit_functions = [],
     worker_init_functions = [],

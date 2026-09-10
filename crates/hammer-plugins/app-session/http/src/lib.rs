@@ -32,7 +32,6 @@ hammer_component_macros::declare_plugin!(
     load_after = ["quic"],
     init_functions = [listener::__INIT_FN_HTTP_TRANSPORT_INIT],
     config_functions = [],
-    early_config_functions = [],
     main_loop_enter_functions = [],
     main_loop_exit_functions = [],
     worker_init_functions = [listener::__INIT_FN_HTTP_WORKER_INIT],

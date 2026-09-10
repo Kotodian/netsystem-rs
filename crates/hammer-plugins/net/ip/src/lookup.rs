@@ -125,21 +125,27 @@ pub(crate) fn fib_index_for(version: IpVersion, sw_if_index: u32) -> Option<u32>
     name = "ip_lookup_init",
     runs_before = ["install_packet_graph"]
 )]
-fn init_lookup(engine: &mut hammer_runtime::GlobalMain) -> RuntimeResult<()> {
+fn init_lookup() -> RuntimeResult<()> {
+    assert!(
+        IP4_MAIN.get().is_none() && IP6_MAIN.get().is_none(),
+        "IP lookup initialization callback executes once"
+    );
     let mut ip4 = Ip4Main::new();
     let mut ip6 = Ip6Main::new();
-    ip4.icmp_throttle = (0..=engine.configured_worker_count())
+    ip4.icmp_throttle = (0..=hammer_runtime::config::worker::worker_count())
         .map(|_| ThreadOwned::new())
         .collect();
-    ip6.icmp_throttle = (0..=engine.configured_worker_count())
+    ip6.icmp_throttle = (0..=hammer_runtime::config::worker::worker_count())
         .map(|_| ThreadOwned::new())
         .collect();
-    IP4_MAIN
-        .set(ip4)
-        .map_err(|_| hammer_runtime::RuntimeError::PluginStateNotInitialized { plugin: "ip" })?;
-    IP6_MAIN
-        .set(ip6)
-        .map_err(|_| hammer_runtime::RuntimeError::PluginStateNotInitialized { plugin: "ip" })?;
+    assert!(
+        IP4_MAIN.set(ip4).is_ok(),
+        "IP4 Main remains uninitialized after lifecycle preflight"
+    );
+    assert!(
+        IP6_MAIN.set(ip6).is_ok(),
+        "IP6 Main remains uninitialized after lifecycle preflight"
+    );
     Ok(())
 }
 

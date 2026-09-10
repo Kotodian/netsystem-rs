@@ -504,6 +504,7 @@ fn expand_stats(item: ItemStruct) -> Result<TokenStream2> {
     }
 
     let registration_name = format_ident!("__STATS_REGISTRATION_{}", aggregate);
+    let owner_name = format_ident!("__STATS_OWNER_{}", aggregate);
     let aggregate_name = LitStr::new(&aggregate.to_string(), aggregate.span());
     let descriptors = stats_fields.iter().map(expand_stats_descriptor);
     let registrations = stats_fields.iter().map(expand_stats_registration);
@@ -528,15 +529,31 @@ fn expand_stats(item: ItemStruct) -> Result<TokenStream2> {
                 })
             }
 
-            fn bind_to_registry(
+            fn install(
                 stats_main: &::hammer_stats::StatsMain,
-                registry: &::hammer_runtime::RuntimeRegistry,
             ) -> ::hammer_runtime::RuntimeResult<()> {
-                let stats = ::std::sync::Arc::new(Self::bind(stats_main)?);
-                registry.set(stats);
+                if #owner_name.get().is_some() {
+                    return Ok(());
+                }
+                Self::register(stats_main)?;
+                let stats = Self::bind(stats_main)?;
+                assert!(
+                    #owner_name.set(stats).is_ok(),
+                    "stats owner changed after installation preflight"
+                );
                 Ok(())
             }
+
+            pub(crate) fn global() -> &'static Self {
+                #owner_name
+                    .get()
+                    .expect("stats declarations are installed before process startup")
+            }
         }
+
+        #[allow(non_upper_case_globals)]
+        static #owner_name: ::std::sync::OnceLock<#aggregate> =
+            ::std::sync::OnceLock::new();
 
         #[doc(hidden)]
         #[allow(non_upper_case_globals)]
@@ -544,8 +561,7 @@ fn expand_stats(item: ItemStruct) -> Result<TokenStream2> {
             ::hammer_runtime::registration::StatsRegistration =
             ::hammer_runtime::registration::StatsRegistration {
                 name: #aggregate_name,
-                register: #aggregate::register,
-                bind: #aggregate::bind_to_registry,
+                register: #aggregate::install,
             };
     })
 }
@@ -2390,6 +2406,7 @@ fn expand_process_node(args: ProcessFnArgs, function: ItemFn) -> Result<TokenStr
         "__PROCESS_NODE_{}",
         args.name.value().to_ascii_uppercase().replace('-', "_")
     );
+    let handle_ident = format_ident!("{}_HANDLE", static_ident);
     let name = args.name;
     let conditional_attributes: Vec<_> = function
         .attrs
@@ -2411,10 +2428,15 @@ fn expand_process_node(args: ProcessFnArgs, function: ItemFn) -> Result<TokenStr
         }
 
         #(#conditional_attributes)*
+        static #handle_ident: ::std::sync::OnceLock<::hammer_runtime::ProcessHandle> =
+            ::std::sync::OnceLock::new();
+
+        #(#conditional_attributes)*
         pub(crate) static #static_ident: ::hammer_runtime::ProcessEntry =
             ::hammer_runtime::ProcessEntry {
             name: #name,
             start: #adapter_name,
+            handle: &#handle_ident,
         };
     })
 }
@@ -2774,44 +2796,32 @@ fn config_function_static_name(fn_name: &LitStr) -> Ident {
 /// Example:
 /// ```ignore
 /// #[init_function(name = "tcp_init", runs_after = ["buffer_main_init"], runs_before = ["session_init"])]
-/// fn tcp_init(vm: &mut GlobalMain, config: Arc<Config>) -> RuntimeResult<Arc<TcpMain>> { ... }
+/// fn tcp_init(main: &mut DataPlaneMain) -> RuntimeResult<()> { ... }
 /// ```
 #[proc_macro_attribute]
 pub fn init_function(args: TokenStream, input: TokenStream) -> TokenStream {
     let args = parse_macro_input!(args as InitFnArgs);
     let fn_item = parse_macro_input!(input as syn::ItemFn);
-    expand_registered_function(args, fn_item, false)
+    expand_registered_function(args, fn_item)
         .unwrap_or_else(Error::into_compile_error)
         .into()
 }
 
 enum InitArgument {
-    GlobalMain,
     DataPlaneMain,
-    Required { binding: Ident, ty: Type },
-    Optional { binding: Ident, ty: Type },
 }
 
-enum InitOutput {
-    Unit,
-    Arc,
-    OptionalArc,
-}
-
-fn expand_registered_function(
-    args: InitFnArgs,
-    mut function: ItemFn,
-    worker: bool,
-) -> Result<TokenStream2> {
+fn expand_registered_function(args: InitFnArgs, function: ItemFn) -> Result<TokenStream2> {
     validate_init_function_qualifiers(&function)?;
-    let arguments = init_arguments(&mut function, worker)?;
-    let output = init_output(&function)?;
+    let arguments = init_arguments(&function)?;
+    validate_unit_init_output(&function)?;
     let function_name = &function.sig.ident;
     let adapter_name = format_ident!("__hammer_init_adapter_{}", function_name);
     let name = args.name;
     let runs_before = args.runs_before;
     let runs_after = args.runs_after;
     let static_ident = init_function_static_name(&name);
+    let callback_index_ident = format_ident!("{}_CALLBACK_INDEX", static_ident);
     let conditional_attributes: Vec<_> = function
         .attrs
         .iter()
@@ -2822,73 +2832,35 @@ fn expand_registered_function(
         .collect();
     let adapter_attributes = conditional_attributes.clone();
     let registration_attributes = conditional_attributes;
-    let mut injections = Vec::new();
     let mut call_arguments = Vec::with_capacity(arguments.len());
     for argument in arguments {
         match argument {
-            InitArgument::GlobalMain | InitArgument::DataPlaneMain => {
-                call_arguments.push(quote!(__hammer_main))
-            }
-            InitArgument::Required { binding, ty } => {
-                injections.push(quote! {
-                    let #binding = __hammer_main.registry().require::<#ty>()?;
-                });
-                call_arguments.push(quote!(#binding));
-            }
-            InitArgument::Optional { binding, ty } => {
-                injections.push(quote! {
-                    let Some(#binding) = __hammer_main.registry().get::<#ty>() else {
-                        return Ok(());
-                    };
-                });
-                call_arguments.push(quote!(#binding));
-            }
+            InitArgument::DataPlaneMain => call_arguments.push(quote!(__hammer_main)),
         }
     }
-    let invoke = match output {
-        InitOutput::Unit => quote!(#function_name(#(#call_arguments),*)),
-        InitOutput::Arc => quote! {
-            let __hammer_produced = #function_name(#(#call_arguments),*)?;
-            __hammer_main.registry().set(__hammer_produced);
-            Ok(())
-        },
-        InitOutput::OptionalArc => quote! {
-            if let Some(__hammer_produced) = #function_name(#(#call_arguments),*)? {
-                __hammer_main.registry().set(__hammer_produced);
-            }
-            Ok(())
-        },
-    };
-
-    let main_type = if worker {
-        quote!(::hammer_runtime::DataPlaneMain)
-    } else {
-        quote!(::hammer_runtime::GlobalMain)
-    };
-    let registration_type = if worker {
-        quote!(::hammer_runtime::init::WorkerInitFunction)
-    } else {
-        quote!(::hammer_runtime::init::InitFunction)
-    };
 
     Ok(quote! {
         #function
 
         #(#adapter_attributes)*
         fn #adapter_name(
-            __hammer_main: &mut #main_type,
+            __hammer_main: &mut ::hammer_runtime::DataPlaneMain,
         ) -> ::hammer_runtime::RuntimeResult<()> {
-            #(#injections)*
-            #invoke
+            #function_name(#(#call_arguments),*)
         }
 
         #(#registration_attributes)*
-        pub(crate) static #static_ident: #registration_type =
-            #registration_type {
+        static #callback_index_ident: ::core::sync::atomic::AtomicUsize =
+            ::core::sync::atomic::AtomicUsize::new(::core::primitive::usize::MAX);
+
+        #(#registration_attributes)*
+        pub(crate) static #static_ident: ::hammer_runtime::init::InitFunction =
+            ::hammer_runtime::init::InitFunction {
             name: #name,
             runs_before: &[#(#runs_before),*],
             runs_after: &[#(#runs_after),*],
             func: #adapter_name,
+            callback_index: &#callback_index_ident,
         };
     })
 }
@@ -2911,99 +2883,40 @@ fn validate_init_function_qualifiers(function: &ItemFn) -> Result<()> {
     Ok(())
 }
 
-fn init_arguments(function: &mut ItemFn, worker: bool) -> Result<Vec<InitArgument>> {
+fn init_arguments(function: &ItemFn) -> Result<Vec<InitArgument>> {
     let mut arguments = Vec::with_capacity(function.sig.inputs.len());
     let mut main_count = 0usize;
-    for (index, argument) in function.sig.inputs.iter_mut().enumerate() {
+    for argument in &function.sig.inputs {
         let FnArg::Typed(argument) = argument else {
             return Err(Error::new(
                 argument.span(),
                 "init functions cannot have a receiver",
             ));
         };
-        let optional = take_optional_injection(&mut argument.attrs)?;
-        if is_mut_main_reference(&argument.ty, worker) {
-            if optional {
-                return Err(Error::new(
-                    argument.span(),
-                    "the main parameter cannot use #[inject(optional)]",
-                ));
-            }
+        if is_mut_data_plane_main_reference(&argument.ty) {
             main_count += 1;
-            arguments.push(if worker {
-                InitArgument::DataPlaneMain
-            } else {
-                InitArgument::GlobalMain
-            });
+            arguments.push(InitArgument::DataPlaneMain);
             continue;
         }
-        let Some(ty) = wrapped_type(&argument.ty, "Arc") else {
-            return Err(Error::new(
-                argument.ty.span(),
-                if worker {
-                    "worker init parameters must be `&mut DataPlaneMain` or `Arc<T>`"
-                } else {
-                    "init parameters must be `&mut GlobalMain` or `Arc<T>`"
-                },
-            ));
-        };
-        let binding = format_ident!("__hammer_injected_{index}");
-        arguments.push(if optional {
-            InitArgument::Optional { binding, ty }
-        } else {
-            InitArgument::Required { binding, ty }
-        });
+        return Err(Error::new(
+            argument.ty.span(),
+            "lifecycle parameters must be `&mut DataPlaneMain`",
+        ));
     }
     if main_count > 1 {
         return Err(Error::new(
             function.sig.inputs.span(),
-            if worker {
-                "worker init functions can have at most one `&mut DataPlaneMain` parameter"
-            } else {
-                "init functions can have at most one `&mut GlobalMain` parameter"
-            },
+            "lifecycle functions can have at most one `&mut DataPlaneMain` parameter",
         ));
     }
     Ok(arguments)
 }
 
-fn take_optional_injection(attributes: &mut Vec<Attribute>) -> Result<bool> {
-    let mut optional = false;
-    let mut retained = Vec::with_capacity(attributes.len());
-    for attribute in attributes.drain(..) {
-        if !attribute.path().is_ident("inject") {
-            retained.push(attribute);
-            continue;
-        }
-        if optional {
-            return Err(Error::new(
-                attribute.span(),
-                "duplicate #[inject(optional)] attribute",
-            ));
-        }
-        let mode = attribute.parse_args::<Ident>()?;
-        if mode != "optional" {
-            return Err(Error::new(mode.span(), "expected `inject(optional)`"));
-        }
-        optional = true;
-    }
-    *attributes = retained;
-    Ok(optional)
-}
-
-fn is_mut_main_reference(ty: &Type, worker: bool) -> bool {
+fn is_mut_data_plane_main_reference(ty: &Type) -> bool {
     let Type::Reference(reference) = ty else {
         return false;
     };
-    reference.mutability.is_some()
-        && type_path_ends_with(
-            &reference.elem,
-            if worker {
-                "DataPlaneMain"
-            } else {
-                "GlobalMain"
-            },
-        )
+    reference.mutability.is_some() && type_path_ends_with(&reference.elem, "DataPlaneMain")
 }
 
 fn type_path_ends_with(ty: &Type, expected: &str) -> bool {
@@ -3038,7 +2951,7 @@ fn wrapped_type(ty: &Type, wrapper: &str) -> Option<Type> {
     }
 }
 
-fn init_output(function: &ItemFn) -> Result<InitOutput> {
+fn validate_unit_init_output(function: &ItemFn) -> Result<()> {
     let ReturnType::Type(_, result) = &function.sig.output else {
         return Err(Error::new(
             function.sig.output.span(),
@@ -3052,19 +2965,11 @@ fn init_output(function: &ItemFn) -> Result<InitOutput> {
         ));
     };
     if matches!(&value, Type::Tuple(tuple) if tuple.elems.is_empty()) {
-        return Ok(InitOutput::Unit);
-    }
-    if wrapped_type(&value, "Arc").is_some() {
-        return Ok(InitOutput::Arc);
-    }
-    if let Some(value) = wrapped_type(&value, "Option")
-        && wrapped_type(&value, "Arc").is_some()
-    {
-        return Ok(InitOutput::OptionalArc);
+        return Ok(());
     }
     Err(Error::new(
         value.span(),
-        "init functions must return RuntimeResult<()>, RuntimeResult<Arc<T>>, or RuntimeResult<Option<Arc<T>>>",
+        "lifecycle functions must return RuntimeResult<()>",
     ))
 }
 
@@ -3073,7 +2978,7 @@ fn init_output(function: &ItemFn) -> Result<InitOutput> {
 /// Example:
 /// ```ignore
 /// #[config_function(name = "tcp_config", section = "plugin.tcp", early = true)]
-/// fn configure_tcp(config: TcpPluginConfig, engine: &mut GlobalMain) -> RuntimeResult<()> { ... }
+/// fn configure_tcp(config: TcpPluginConfig, main: &mut DataPlaneMain) -> RuntimeResult<()> { ... }
 ///
 /// Use `required = true` when the section and all of its fields must be
 /// present instead of defaulting through a generated wrapper.
@@ -3089,48 +2994,24 @@ pub fn config_function(args: TokenStream, input: TokenStream) -> TokenStream {
 
 enum ConfigArgument {
     Section { ty: Type },
-    GlobalMain,
-    Required { binding: Ident, ty: Type },
-    Optional { binding: Ident, ty: Type },
+    DataPlaneMain,
 }
 
-fn config_arguments(function: &mut ItemFn) -> Result<Vec<ConfigArgument>> {
+fn config_arguments(function: &ItemFn) -> Result<Vec<ConfigArgument>> {
     let mut arguments = Vec::with_capacity(function.sig.inputs.len());
     let mut section_count = 0usize;
     let mut engine_count = 0usize;
-    for (index, argument) in function.sig.inputs.iter_mut().enumerate() {
+    for argument in &function.sig.inputs {
         let FnArg::Typed(argument) = argument else {
             return Err(Error::new(
                 argument.span(),
                 "config functions cannot have a receiver",
             ));
         };
-        let optional = take_optional_injection(&mut argument.attrs)?;
-        if is_mut_main_reference(&argument.ty, false) {
-            if optional {
-                return Err(Error::new(
-                    argument.span(),
-                    "the GlobalMain parameter cannot use #[inject(optional)]",
-                ));
-            }
+        if is_mut_data_plane_main_reference(&argument.ty) {
             engine_count += 1;
-            arguments.push(ConfigArgument::GlobalMain);
+            arguments.push(ConfigArgument::DataPlaneMain);
             continue;
-        }
-        if let Some(ty) = wrapped_type(&argument.ty, "Arc") {
-            let binding = format_ident!("__hammer_injected_{index}");
-            arguments.push(if optional {
-                ConfigArgument::Optional { binding, ty }
-            } else {
-                ConfigArgument::Required { binding, ty }
-            });
-            continue;
-        }
-        if optional {
-            return Err(Error::new(
-                argument.span(),
-                "only injected Arc<T> parameters can use #[inject(optional)]",
-            ));
         }
         section_count += 1;
         arguments.push(ConfigArgument::Section {
@@ -3146,7 +3027,7 @@ fn config_arguments(function: &mut ItemFn) -> Result<Vec<ConfigArgument>> {
     if engine_count > 1 {
         return Err(Error::new(
             function.sig.inputs.span(),
-            "config functions can have at most one `&mut GlobalMain` parameter",
+            "config functions can have at most one `&mut DataPlaneMain` parameter",
         ));
     }
     Ok(arguments)
@@ -3155,15 +3036,17 @@ fn config_arguments(function: &mut ItemFn) -> Result<Vec<ConfigArgument>> {
 fn expand_config_function(args: ConfigFnArgs, mut function: ItemFn) -> Result<TokenStream2> {
     validate_init_function_qualifiers(&function)?;
     let arguments = config_arguments(&mut function)?;
-    let output = init_output(&function)?;
+    validate_unit_init_output(&function)?;
     let function_name = &function.sig.ident;
     let adapter_name = format_ident!("__hammer_config_adapter_{}", function_name);
     let name = args.init.name;
     let section = args.section;
     let required = args.required;
+    let early = args.early;
     let runs_before = args.init.runs_before;
     let runs_after = args.init.runs_after;
     let static_ident = config_function_static_name(&name);
+    let callback_index_ident = format_ident!("{}_CALLBACK_INDEX", static_ident);
     let conditional_attributes: Vec<_> = function
         .attrs
         .iter()
@@ -3247,47 +3130,21 @@ fn expand_config_function(args: ConfigFnArgs, mut function: ItemFn) -> Result<To
                 injections.push(quote! {
                     #(#wrapper_definitions)*
                     let __hammer_config_document: #root = ::toml::from_str(__hammer_document)
-                        .map_err(|error| ::hammer_runtime::RuntimeError::config_parse(format!(
-                            "config function `{}` section `{}`: {error}",
-                            #name,
-                            #section,
-                        )))?;
+                        .map_err(|source| ::hammer_runtime::RuntimeError::ConfigFunctionParse {
+                            function: #name,
+                            section: #section,
+                            source,
+                        })?;
                     let __hammer_config: #ty =
                         #value;
                 });
                 call_arguments.push(quote!(__hammer_config));
             }
-            ConfigArgument::GlobalMain => call_arguments.push(quote!(__hammer_engine)),
-            ConfigArgument::Required { binding, ty } => {
-                injections.push(quote! {
-                    let #binding = __hammer_engine.registry.require::<#ty>()?;
-                });
-                call_arguments.push(quote!(#binding));
-            }
-            ConfigArgument::Optional { binding, ty } => {
-                injections.push(quote! {
-                    let Some(#binding) = __hammer_engine.registry.get::<#ty>() else {
-                        return Ok(());
-                    };
-                });
-                call_arguments.push(quote!(#binding));
-            }
+            ConfigArgument::DataPlaneMain => call_arguments.push(quote!(
+                __hammer_main.expect("config callback requires an initialized DataPlaneMain")
+            )),
         }
     }
-    let invoke = match output {
-        InitOutput::Unit => quote!(#function_name(#(#call_arguments),*)),
-        InitOutput::Arc => quote! {
-            let __hammer_produced = #function_name(#(#call_arguments),*)?;
-            __hammer_engine.registry.set(__hammer_produced);
-            Ok(())
-        },
-        InitOutput::OptionalArc => quote! {
-            if let Some(__hammer_produced) = #function_name(#(#call_arguments),*)? {
-                __hammer_engine.registry.set(__hammer_produced);
-            }
-            Ok(())
-        },
-    };
 
     Ok(quote! {
         #function
@@ -3295,11 +3152,15 @@ fn expand_config_function(args: ConfigFnArgs, mut function: ItemFn) -> Result<To
         #(#adapter_attributes)*
         fn #adapter_name(
             __hammer_document: &str,
-            __hammer_engine: &mut ::hammer_runtime::GlobalMain,
+            __hammer_main: ::core::option::Option<&mut ::hammer_runtime::DataPlaneMain>,
         ) -> ::hammer_runtime::RuntimeResult<()> {
             #(#injections)*
-            #invoke
+            #function_name(#(#call_arguments),*)
         }
+
+        #(#registration_attributes)*
+        static #callback_index_ident: ::core::sync::atomic::AtomicUsize =
+            ::core::sync::atomic::AtomicUsize::new(::core::primitive::usize::MAX);
 
         #(#registration_attributes)*
         pub(crate) static #static_ident: ::hammer_runtime::init::ConfigFunction =
@@ -3308,7 +3169,9 @@ fn expand_config_function(args: ConfigFnArgs, mut function: ItemFn) -> Result<To
                 section: #section,
                 runs_before: &[#(#runs_before),*],
                 runs_after: &[#(#runs_after),*],
+                early: #early,
                 func: #adapter_name,
+                callback_index: &#callback_index_ident,
             };
     })
 }
@@ -3329,7 +3192,7 @@ pub fn early_config_function(args: TokenStream, input: TokenStream) -> TokenStre
 /// Example:
 /// ```ignore
 /// #[main_loop_enter_function]
-/// fn start_workers(vm: &mut GlobalMain, config: Arc<Config>) -> RuntimeResult<()> { ... }
+/// fn enter(main: &mut DataPlaneMain) -> RuntimeResult<()> { ... }
 /// ```
 #[proc_macro_attribute]
 pub fn main_loop_enter_function(args: TokenStream, input: TokenStream) -> TokenStream {
@@ -3373,7 +3236,6 @@ fn expand_main_loop_function(function: ItemFn) -> Result<TokenStream2> {
             runs_after: Vec::new(),
         },
         function,
-        false,
     )
 }
 
@@ -3382,13 +3244,13 @@ fn expand_main_loop_function(function: ItemFn) -> Result<TokenStream2> {
 /// Example:
 /// ```ignore
 /// #[worker_init_function(name = "tcp_worker_init", runs_after = ["generic_worker_init"])]
-/// fn tcp_worker_init(vm: &mut DataPlaneMain, tcp: Arc<TcpMain>) -> RuntimeResult<()> { ... }
+/// fn tcp_worker_init(main: &mut DataPlaneMain) -> RuntimeResult<()> { ... }
 /// ```
 #[proc_macro_attribute]
 pub fn worker_init_function(args: TokenStream, input: TokenStream) -> TokenStream {
     let args = parse_macro_input!(args as InitFnArgs);
     let fn_item = parse_macro_input!(input as syn::ItemFn);
-    expand_registered_function(args, fn_item, true)
+    expand_registered_function(args, fn_item)
         .unwrap_or_else(Error::into_compile_error)
         .into()
 }
@@ -3398,10 +3260,11 @@ struct PluginArgs {
     load_after: Vec<LitStr>,
     init_functions: Vec<Path>,
     config_functions: Vec<Path>,
-    early_config_functions: Vec<Path>,
     main_loop_enter_functions: Vec<Path>,
     main_loop_exit_functions: Vec<Path>,
     worker_init_functions: Vec<Path>,
+    num_workers_change_functions: Vec<Path>,
+    api_init_functions: Vec<Path>,
     graph_nodes: Vec<Path>,
     node_functions: Vec<Path>,
     process_nodes: Vec<Path>,
@@ -3415,10 +3278,11 @@ impl Parse for PluginArgs {
         let mut load_after = Vec::new();
         let mut init_functions = Vec::new();
         let mut config_functions = Vec::new();
-        let mut early_config_functions = Vec::new();
         let mut main_loop_enter_functions = Vec::new();
         let mut main_loop_exit_functions = Vec::new();
         let mut worker_init_functions = Vec::new();
+        let mut num_workers_change_functions = Vec::new();
+        let mut api_init_functions = Vec::new();
         let mut graph_nodes = Vec::new();
         let mut node_functions = Vec::new();
         let mut process_nodes = Vec::new();
@@ -3437,7 +3301,6 @@ impl Parse for PluginArgs {
                 "load_after" => load_after = parse_litstr_array(input)?,
                 "init_functions" => init_functions = parse_path_array(input)?,
                 "config_functions" => config_functions = parse_path_array(input)?,
-                "early_config_functions" => early_config_functions = parse_path_array(input)?,
                 "main_loop_enter_functions" => {
                     main_loop_enter_functions = parse_path_array(input)?;
                 }
@@ -3445,6 +3308,10 @@ impl Parse for PluginArgs {
                     main_loop_exit_functions = parse_path_array(input)?;
                 }
                 "worker_init_functions" => worker_init_functions = parse_path_array(input)?,
+                "num_workers_change_functions" => {
+                    num_workers_change_functions = parse_path_array(input)?;
+                }
+                "api_init_functions" => api_init_functions = parse_path_array(input)?,
                 "graph_nodes" => graph_nodes = parse_path_array(input)?,
                 "node_functions" => node_functions = parse_path_array(input)?,
                 "process_nodes" => process_nodes = parse_path_array(input)?,
@@ -3466,10 +3333,11 @@ impl Parse for PluginArgs {
             load_after,
             init_functions,
             config_functions,
-            early_config_functions,
             main_loop_enter_functions,
             main_loop_exit_functions,
             worker_init_functions,
+            num_workers_change_functions,
+            api_init_functions,
             graph_nodes,
             node_functions,
             process_nodes,
@@ -3821,10 +3689,11 @@ fn plugin_registration_tokens(args: &PluginArgs) -> TokenStream2 {
     let dependency_len = load_after.len();
     let init_functions = &args.init_functions;
     let config_functions = &args.config_functions;
-    let early_config_functions = &args.early_config_functions;
     let main_loop_enter_functions = &args.main_loop_enter_functions;
     let main_loop_exit_functions = &args.main_loop_exit_functions;
     let worker_init_functions = &args.worker_init_functions;
+    let num_workers_change_functions = &args.num_workers_change_functions;
+    let api_init_functions = &args.api_init_functions;
     let graph_nodes = &args.graph_nodes;
     let node_functions = &args.node_functions;
     let process_nodes = &args.process_nodes;
@@ -3838,10 +3707,11 @@ fn plugin_registration_tokens(args: &PluginArgs) -> TokenStream2 {
         ::hammer_runtime::__declare_registration_image!(
             init_functions = [#(#init_functions),*];
             config_functions = [#(#config_functions),*];
-            early_config_functions = [#(#early_config_functions),*];
             main_loop_enter_functions = [#(#main_loop_enter_functions),*];
             main_loop_exit_functions = [#(#main_loop_exit_functions),*];
             worker_init_functions = [#(#worker_init_functions),*];
+            num_workers_change_functions = [#(#num_workers_change_functions),*];
+            api_init_functions = [#(#api_init_functions),*];
             graph_nodes = [#(#graph_nodes),*];
             node_functions = [#(#node_functions),*];
             process_nodes = [#(#process_nodes),*];

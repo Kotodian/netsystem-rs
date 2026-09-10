@@ -12,7 +12,7 @@ use std::sync::{Arc, OnceLock};
 use hammer_infra::fifo::Fifo;
 use hammer_infra::pool::Pool;
 use hammer_infra::thread_owned::ThreadOwned;
-use hammer_runtime::{DataPlaneMain, DataWorkerId, GlobalMain, RuntimeError, RuntimeResult};
+use hammer_runtime::{DataPlaneMain, DataWorkerId, RuntimeError, RuntimeResult};
 use hammer_service::session::protocol::SessionAppVft;
 use hammer_service::session::runtime::SessionWorker;
 use rustls::pki_types::ServerName;
@@ -485,11 +485,16 @@ pub(crate) const VFT: SessionAppVft = SessionAppVft {
 };
 
 #[hammer_component_macros::init_function(name = "tls_init")]
-fn init_tls(engine: &mut GlobalMain) -> RuntimeResult<()> {
+fn init_tls() -> RuntimeResult<()> {
     config::init()?;
-    TLS_WORKERS
-        .set(TlsWorkers::new(engine.configured_worker_count()))
-        .map_err(|_| RuntimeError::PluginStateNotInitialized { plugin: "tls" })?;
+    assert!(
+        TLS_WORKERS
+            .set(TlsWorkers::new(
+                hammer_runtime::config::worker::worker_count(),
+            ))
+            .is_ok(),
+        "TLS initialization callback executes once"
+    );
     Ok(())
 }
 
@@ -509,7 +514,6 @@ hammer_component_macros::declare_plugin!(
     load_after = [],
     init_functions = [__INIT_FN_TLS_INIT],
     config_functions = [],
-    early_config_functions = [],
     main_loop_enter_functions = [],
     main_loop_exit_functions = [],
     worker_init_functions = [__INIT_FN_TLS_WORKER_INIT],

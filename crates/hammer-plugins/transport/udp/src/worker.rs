@@ -10,8 +10,8 @@ use hammer_infra::pool::Pool;
 use hammer_infra::thread_owned::{ThreadOwned, ThreadOwnedError};
 use hammer_runtime::app::{SessionDgramHeader, SessionHandle};
 use hammer_runtime::{
-    DataPlaneMain, DataWorkerId, GlobalMain, NodeRuntime, RuntimeError, RuntimeResult,
-    SessionConnectEndpoint, SessionListenEndpoint, with_data_plane_main,
+    DataPlaneMain, DataWorkerId, NodeRuntime, RuntimeError, RuntimeResult, SessionConnectEndpoint,
+    SessionListenEndpoint,
 };
 use hammer_service::session::SessionQueueNext;
 use hammer_service::session::node::{SessionQueueNode, SessionQueueOutput};
@@ -900,19 +900,14 @@ pub(crate) fn connect(endpoint: SessionConnectEndpoint) -> RuntimeResult<()> {
     let worker = endpoint.worker;
     let worker_slot = worker.slot();
     let (completion, completed) = mpsc::sync_channel(1);
-    GlobalMain::with_current(|engine| {
-        engine.schedule_on_worker(worker, move || {
-            let result = with_data_plane_main(|runtime| {
-                main.with_worker(runtime.thread_index(), |sessions, udp| {
-                    udp.active_connect(sessions, endpoint.connection, local, endpoint.remote)
-                })
-            });
-            if completion.send(result).is_err() {
-                return;
-            }
-        })
-    })
-    .ok_or(RuntimeError::WorkerControlRequiresGlobalMain)??;
+    hammer_runtime::schedule_on_worker(worker, move |runtime| {
+        let result = main.with_worker(runtime.thread_index(), |sessions, udp| {
+            udp.active_connect(sessions, endpoint.connection, local, endpoint.remote)
+        });
+        if completion.send(result).is_err() {
+            return;
+        }
+    })?;
     let _ = completed
         .recv()
         .map_err(|_| RuntimeError::DataWorkerCallCanceled {
@@ -926,10 +921,11 @@ pub(crate) fn connect(endpoint: SessionConnectEndpoint) -> RuntimeResult<()> {
     runs_after = ["transport_main_init", "session_init"],
     runs_before = ["install_packet_graph"]
 )]
-fn init_udp(engine: &mut GlobalMain) -> RuntimeResult<()> {
-    if UDP_MAIN.get().is_some() {
-        return Err(RuntimeError::PluginStateNotInitialized { plugin: "udp" });
-    }
+fn init_udp() -> RuntimeResult<()> {
+    assert!(
+        UDP_MAIN.get().is_none(),
+        "UDP initialization callback executes once"
+    );
     let protocol = register_transport(TransportVft::new(
         Some(start_listen),
         Some(stop_listen),
@@ -941,10 +937,11 @@ fn init_udp(engine: &mut GlobalMain) -> RuntimeResult<()> {
         None,
     ))
     .map_err(RuntimeError::from)?;
-    let main = UdpMain::new(protocol, engine.configured_worker_count());
-    UDP_MAIN
-        .set(main)
-        .map_err(|_| RuntimeError::PluginStateNotInitialized { plugin: "udp" })?;
+    let main = UdpMain::new(protocol, hammer_runtime::config::worker::worker_count());
+    assert!(
+        UDP_MAIN.set(main).is_ok(),
+        "UDP initialization callback executes once"
+    );
     Ok(())
 }
 

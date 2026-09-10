@@ -64,7 +64,7 @@ use std::borrow::Cow;
 use std::mem;
 
 use crate::http_common::{
-    AppHeader, FieldLineFlags, HeaderName, InboundRequest, PublishError, ReqMethod, UrlScheme,
+    AppHeader, HeaderName, InboundRequest, PublishError, ReqMethod, UrlScheme,
     publish_inbound_request,
 };
 use crate::http3::proto::error::ErrorCode;

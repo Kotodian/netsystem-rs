@@ -7,8 +7,6 @@
 //! first, then the settings frame) via `http3_frame_settings_write`
 //! (`third_party/vpp/src/plugins/http/http3/frame.c`, ~152).
 
-use bytes::BufMut;
-
 use crate::http3::proto::coding::Encode;
 use crate::http3::proto::frame::{Settings, SettingsError};
 use crate::http3::proto::stream::StreamType;

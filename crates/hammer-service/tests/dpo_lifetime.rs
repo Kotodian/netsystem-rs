@@ -2,9 +2,7 @@ use std::sync::Arc;
 
 use hammer_core::data_plane::{NodeId, NodeKind};
 use hammer_runtime::node::NodeDescriptor;
-use hammer_runtime::{
-    DataPlaneBufferConfig, DataPlaneMain, GlobalMain, Node, NodeRuntime, RuntimeRegistry,
-};
+use hammer_runtime::{DataPlaneBufferConfig, DataPlaneMain, Node, NodeRuntime};
 use hammer_service::interface::InterfaceMain;
 use hammer_service::net::{
     DpoError, DpoId, DpoProto, DpoType, LoadBalanceDpo, LoadBalanceFlags, LoadBalancePath, NetMain,
@@ -16,12 +14,10 @@ fn shared_bucket_references_survive_parent_replacement() -> Result<(), DpoError>
     hammer_runtime::config::Memory::default().ensure_main_heap()?;
     hammer_core::buffer::BufferMain::new(64, 1024, &[0], 2, hammer_infra::PageSize::Default)
         .unwrap();
-    let runtime = DataPlaneMain::new(DataPlaneBufferConfig::default());
-    let mut main = GlobalMain::new(runtime, RuntimeRegistry::new());
-    main.install_current();
+    hammer_runtime::ThreadMain::new().unwrap();
+    let mut runtime = DataPlaneMain::new(DataPlaneBufferConfig::default());
     let net = NetMain::init(Arc::new(InterfaceMain::new()))?;
-    let runtime = main.data_plane_main_mut();
-    let terminal = hammer_service::data_plane::register_drop(runtime)?;
+    let terminal = hammer_service::data_plane::register_drop(&mut runtime)?;
     // This is a pool-lifetime test, not a packet-forwarding test. Both owning
     // classes use an installed terminal node; no packet processing is invoked.
     net.register_dpo(
@@ -48,7 +44,7 @@ fn shared_bucket_references_survive_parent_replacement() -> Result<(), DpoError>
     )?;
 
     let child = net.create_load_balance(
-        runtime,
+        &mut runtime,
         DpoProto::IP4,
         LoadBalanceDpo::new(DpoProto::IP4, &[], LoadBalanceFlags::empty(), 0x9f)?,
     )?;
@@ -58,12 +54,12 @@ fn shared_bucket_references_survive_parent_replacement() -> Result<(), DpoError>
         weight: 1,
     }; 8];
     let parent = net.create_load_balance(
-        runtime,
+        &mut runtime,
         DpoProto::IP4,
         LoadBalanceDpo::new(DpoProto::IP4, &child_paths, LoadBalanceFlags::empty(), 0x9f)?,
     )?;
     let replicate = net.create_replicate(
-        runtime,
+        &mut runtime,
         DpoProto::IP4,
         ReplicateDpo::new(DpoProto::IP4, &[child; 8], ReplicateFlags::empty())?,
     )?;
@@ -82,7 +78,7 @@ fn shared_bucket_references_survive_parent_replacement() -> Result<(), DpoError>
 
     let invalid = DpoId::load_balance(DpoProto::IP4, u32::MAX);
     assert_eq!(
-        net.update_load_balance(runtime, invalid, &child_paths[..1])?,
+        net.update_load_balance(&mut runtime, invalid, &child_paths[..1])?,
         None
     );
     let object = net
@@ -136,7 +132,7 @@ fn shared_bucket_references_survive_parent_replacement() -> Result<(), DpoError>
     );
     assert!(matches!(
         net.update_load_balance(
-            runtime,
+            &mut runtime,
             parent,
             &[
                 LoadBalancePath {
@@ -191,23 +187,26 @@ fn shared_bucket_references_survive_parent_replacement() -> Result<(), DpoError>
         .identity(interface_tx_class, DpoProto::IP4, output.slot())?;
     let stacked = net
         .dpo_main_mut()
-        .stack_from_node(runtime, terminal, interface_tx)?;
+        .stack_from_node(&mut runtime, terminal, interface_tx)?;
     assert_eq!(
         Some(stacked.next()),
         runtime
             .nodes()
             .node_next_slot_for_target(terminal, output)?
     );
-    let cached =
-        net.dpo_main_mut()
-            .stack(runtime, DpoType::LOAD_BALANCE, DpoProto::IP4, interface_tx)?;
+    let cached = net.dpo_main_mut().stack(
+        &mut runtime,
+        DpoType::LOAD_BALANCE,
+        DpoProto::IP4,
+        interface_tx,
+    )?;
     assert_eq!(cached.next(), stacked.next());
     let local_tx = net
         .dpo_main()
         .identity(interface_tx_class, DpoProto::IP4, terminal.slot())?;
     let local_stack = net
         .dpo_main_mut()
-        .stack_from_node(runtime, terminal, local_tx)?;
+        .stack_from_node(&mut runtime, terminal, local_tx)?;
     assert_eq!(
         Some(local_stack.next()),
         runtime
@@ -216,7 +215,7 @@ fn shared_bucket_references_survive_parent_replacement() -> Result<(), DpoError>
     );
     assert_ne!(local_stack.next(), stacked.next());
 
-    net.update_load_balance(runtime, parent, &[])?;
+    net.update_load_balance(&mut runtime, parent, &[])?;
     assert!(net.load_balance(child.index()).is_some());
     assert_eq!(
         net.replicate(replicate.index()).unwrap().bucket(7),
@@ -226,14 +225,12 @@ fn shared_bucket_references_survive_parent_replacement() -> Result<(), DpoError>
     assert!(net.load_balance(parent.index()).is_none());
     assert!(net.load_balance(child.index()).is_some());
 
-    net.update_replicate(runtime, replicate, &[DpoId::drop(DpoProto::IP4)])?;
+    net.update_replicate(&mut runtime, replicate, &[DpoId::drop(DpoProto::IP4)])?;
     assert!(net.load_balance(child.index()).is_some());
     net.unlock_dpo(interposed);
     assert!(net.load_balance(child.index()).is_none());
     net.unlock_dpo(replicate);
     assert!(net.replicate(replicate.index()).is_none());
 
-    main.close()?;
-    GlobalMain::uninstall_current();
     Ok(())
 }

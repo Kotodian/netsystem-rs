@@ -1,4 +1,4 @@
-use hammer_runtime::{DataPlaneBufferConfig, DataPlaneMain, GlobalMain, RuntimeRegistry};
+use hammer_runtime::ThreadMain;
 use hammer_service::interface::{InterfaceError, InterfaceMain};
 use ipnet::IpNet;
 
@@ -9,11 +9,7 @@ fn address_removal_preserves_other_interface_addresses() {
         .unwrap();
     hammer_core::buffer::BufferMain::new(64, 1024, &[0], 2, hammer_infra::PageSize::Default)
         .unwrap();
-    let mut main = GlobalMain::new(
-        DataPlaneMain::new(DataPlaneBufferConfig::default()),
-        RuntimeRegistry::new(),
-    );
-    main.install_current();
+    ThreadMain::new().unwrap();
     let interfaces = InterfaceMain::new();
     let ingress = interfaces.register_hardware_interface(0, 1, 0, 0).unwrap();
     let egress = interfaces.register_hardware_interface(0, 2, 0, 0).unwrap();
@@ -63,5 +59,4 @@ fn address_removal_preserves_other_interface_addresses() {
     assert_eq!(interfaces.interface_addresses(ingress_sw), [ip6]);
     interfaces.delete_hardware_interface(ingress).unwrap();
     assert_eq!(interfaces.interface_address(ip6_index), None);
-    GlobalMain::uninstall_current();
 }

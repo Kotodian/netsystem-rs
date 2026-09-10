@@ -2,7 +2,6 @@ use std::cell::UnsafeCell;
 use std::sync::Arc;
 
 use hammer_infra::pool::Pool;
-use hammer_runtime::GlobalMain;
 use hammer_runtime::app::AppSessionConfig;
 use prost::Message;
 use quinn_proto::rustls::pki_types::{CertificateDer, PrivateKeyDer};
@@ -297,20 +296,11 @@ impl QuicConfigRegistry {
     }
 
     fn with_control_barrier<R>(&self, operation: impl FnOnce() -> R) -> Result<R, ConfigError> {
-        let barrier = match GlobalMain::with_current(|engine| {
-            engine
-                .ensure_main_thread()
-                .map(|()| engine.worker_barrier())
-                .map_err(|_| ConfigError::WrongThread)
-        }) {
-            Some(Ok(barrier)) => barrier,
-            Some(Err(error)) => return Err(error),
-            None => return Err(ConfigError::WrongThread),
-        };
-        Ok(if barrier.is_pending() {
-            operation()
-        } else {
-            barrier.sync(operation)
+        hammer_runtime::ensure_main_thread().map_err(|_| ConfigError::WrongThread)?;
+        Ok(match hammer_runtime::barrier::global() {
+            Some(barrier) if barrier.is_pending() => operation(),
+            Some(barrier) => barrier.sync(operation),
+            None => operation(),
         })
     }
 }
@@ -793,22 +783,14 @@ fn api_transport(
 }
 
 fn binary_application(application: u32) -> Result<u32, QuicApiStatus> {
-    let Some(attached) = GlobalMain::with_current(|engine| {
-        let applications = engine
-            .registry
-            .require::<hammer_service::session::ApplicationMain>()
-            .map_err(|_| QuicApiStatus::MainThreadUnavailable)?;
-        applications
-            .contains(application)
-            .map_err(|error| match error {
-                hammer_service::session::ApplicationError::WrongThread => {
-                    QuicApiStatus::WrongThread
-                }
-                _ => QuicApiStatus::MainThreadUnavailable,
-            })
-    }) else {
-        return Err(QuicApiStatus::MainThreadUnavailable);
-    };
+    let applications = hammer_service::session::ApplicationMain::global()
+        .map_err(|_| QuicApiStatus::MainThreadUnavailable)?;
+    let attached = applications
+        .contains(application)
+        .map_err(|error| match error {
+            hammer_service::session::ApplicationError::WrongThread => QuicApiStatus::WrongThread,
+            _ => QuicApiStatus::MainThreadUnavailable,
+        });
     match attached {
         Ok(true) => Ok(application),
         Ok(false) => Err(QuicApiStatus::ApplicationMissing),

@@ -4,13 +4,11 @@ use std::sync::{Arc, OnceLock};
 
 use hammer_infra::pool::Pool;
 use hammer_infra::segment::Segment;
-use hammer_runtime::GlobalMain;
 use hammer_runtime::app::{SessionMsgQueue, SessionMsgQueueError};
 use hammer_runtime::attach::{ApplicationMqPublication, ExtConfigStore};
 use hammer_runtime::{AttachError, DataWorkerId, RuntimeError};
 use thiserror::Error;
 
-use super::config::Session;
 use super::protocol::SessionAppVft;
 
 static APP_MQ_SEGMENT_COUNTER: AtomicU64 = AtomicU64::new(0);
@@ -249,11 +247,10 @@ impl ApplicationMain {
                 connections: Pool::new(),
             }),
         };
-        APPLICATION_MAIN
-            .set(main)
-            .map_err(|_| RuntimeError::PluginStateNotInitialized {
-                plugin: "application",
-            })?;
+        assert!(
+            APPLICATION_MAIN.set(main).is_ok(),
+            "Application initialization callback executes once"
+        );
         Ok(())
     }
 
@@ -309,7 +306,7 @@ impl ApplicationMain {
             entry.session_callbacks = Some(vft);
             Ok(0)
         };
-        let barrier = GlobalMain::with_current(|engine| engine.worker_barrier());
+        let barrier = hammer_runtime::barrier::global();
         match barrier {
             Some(barrier) if barrier.is_pending() => register(),
             Some(barrier) => barrier.sync(register),
@@ -367,15 +364,8 @@ impl ApplicationMain {
 
     fn attach_with_runtime(&self, shared: bool) -> Result<u32, ApplicationError> {
         self.ensure_main_thread()?;
-        let (worker_count, mq_capacity) =
-            GlobalMain::with_current(|engine| -> Result<(usize, usize), ApplicationError> {
-                let session = engine
-                    .registry
-                    .get::<Session>()
-                    .expect("Session configuration is published before Application attach");
-                Ok((engine.configured_worker_count(), session.app_mq_capacity))
-            })
-            .expect("main GlobalMain is installed before Application attach")?;
+        let worker_count = hammer_runtime::config::worker::worker_count();
+        let mq_capacity = super::session_config().app_mq_capacity;
         self.attach_with_mq(worker_count, mq_capacity, shared)
     }
 
@@ -384,7 +374,7 @@ impl ApplicationMain {
         // SAFETY: Main Thread mutation is synchronized by the barrier below;
         // Data Workers only read published Application records.
         let state = unsafe { &mut *self.state.get() };
-        let barrier = GlobalMain::with_current(|engine| engine.worker_barrier());
+        let barrier = hammer_runtime::barrier::global();
         let application = match barrier {
             Some(barrier) if barrier.is_pending() => {
                 state.applications.insert(Application::new(worker_count))
@@ -416,26 +406,20 @@ impl ApplicationMain {
                 return Err(error);
             }
         };
-        let install_result = GlobalMain::with_current(|engine| {
-            let main = super::runtime::session_main();
-            main.install_application_mqs(engine, application, &resources)
-                .map_err(|source| ApplicationError::MqInstall { source })
-        });
+        let install_result = super::runtime::session_main()
+            .install_application_mqs(application, &resources)
+            .map_err(|source| ApplicationError::MqInstall { source });
         match install_result {
-            Some(Ok(())) => {
+            Ok(()) => {
                 if let Err(error) = self.store_mq_resources(application, resources) {
                     self.remove_application(application);
                     return Err(error);
                 }
                 Ok(application)
             }
-            Some(Err(error)) => {
+            Err(error) => {
                 self.remove_application(application);
                 Err(error)
-            }
-            None => {
-                self.remove_application(application);
-                panic!("main GlobalMain is installed before Application MQ attach")
             }
         }
     }
@@ -449,7 +433,7 @@ impl ApplicationMain {
         // SAFETY: Main Thread mutation is synchronized by the barrier below;
         // Data Workers only read published Application records.
         let state = unsafe { &mut *self.state.get() };
-        let barrier = GlobalMain::with_current(|engine| engine.worker_barrier());
+        let barrier = hammer_runtime::barrier::global();
         let store = || {
             let entry = state
                 .applications
@@ -474,7 +458,7 @@ impl ApplicationMain {
         // SAFETY: this path runs on Main Thread while the barrier excludes
         // Data Worker readers of Application records.
         let state = unsafe { &mut *self.state.get() };
-        let barrier = GlobalMain::with_current(|engine| engine.worker_barrier());
+        let barrier = hammer_runtime::barrier::global();
         let removed = match barrier {
             Some(barrier) if barrier.is_pending() => state.applications.remove(application),
             Some(barrier) => barrier.sync(|| state.applications.remove(application)),
@@ -526,20 +510,14 @@ impl ApplicationMain {
             return Err(ApplicationError::Missing { application });
         }
 
-        match GlobalMain::with_current(|engine| -> Result<(), ApplicationError> {
-            let sessions = super::runtime::session_main();
-            sessions
-                .application_detached(engine, application)
-                .map_err(|source| ApplicationError::MqDetachFailed { source })
-        }) {
-            Some(result) => result,
-            None => Ok(()),
-        }?;
+        super::runtime::session_main()
+            .application_detached(application)
+            .map_err(|source| ApplicationError::MqDetachFailed { source })?;
 
         // SAFETY: Main Thread mutation is synchronized by the barrier below;
         // Data Workers only read published Application records.
         let state = unsafe { &mut *self.state.get() };
-        let barrier = GlobalMain::with_current(|engine| engine.worker_barrier());
+        let barrier = hammer_runtime::barrier::global();
         let mut detach = || -> Result<(), ApplicationError> {
             let (listener_indexes, connection_indexes) = {
                 let entry = state
@@ -588,7 +566,7 @@ impl ApplicationMain {
         // SAFETY: Main Thread mutation is synchronized by the barrier below;
         // Data Workers only read published listener records.
         let state = unsafe { &mut *self.state.get() };
-        let barrier = GlobalMain::with_current(|engine| engine.worker_barrier());
+        let barrier = hammer_runtime::barrier::global();
         let register = || {
             let index = state.listeners.insert(listener);
             state
@@ -627,7 +605,7 @@ impl ApplicationMain {
         // SAFETY: Main Thread mutation is synchronized by the barrier below;
         // Data Workers only read published connection records.
         let state = unsafe { &mut *self.state.get() };
-        let barrier = GlobalMain::with_current(|engine| engine.worker_barrier());
+        let barrier = hammer_runtime::barrier::global();
         let register = || {
             // Reap connected entries ahead of the primary insert. VPP
             // session_free is void best-effort cleanup (session.c:258-265):
@@ -710,7 +688,7 @@ impl ApplicationMain {
         // SAFETY: Main Thread mutation is synchronized by the barrier below;
         // Data Workers only read published connection records.
         let state = unsafe { &mut *self.state.get() };
-        let barrier = GlobalMain::with_current(|engine| engine.worker_barrier());
+        let barrier = hammer_runtime::barrier::global();
         let mut remove = || {
             let index = connection;
             let entry = state
@@ -752,7 +730,7 @@ impl ApplicationMain {
         // SAFETY: Main Thread mutation is synchronized by the barrier below;
         // Data Workers only read published connection records.
         let state = unsafe { &mut *self.state.get() };
-        let barrier = GlobalMain::with_current(|engine| engine.worker_barrier());
+        let barrier = hammer_runtime::barrier::global();
         let mut reclaim = || {
             let index = connection;
             let entry = state
@@ -806,7 +784,7 @@ impl ApplicationMain {
         // SAFETY: Main Thread mutation is synchronized by the barrier below;
         // Data Workers only read published listener records.
         let state = unsafe { &mut *self.state.get() };
-        let barrier = GlobalMain::with_current(|engine| engine.worker_barrier());
+        let barrier = hammer_runtime::barrier::global();
         let mut remove = || {
             let index = listener_id;
             if !state.listeners.contains_key(index) {
@@ -855,7 +833,7 @@ impl ApplicationMain {
         // SAFETY: Main Thread mutation is synchronized by the barrier below;
         // Data Workers only read published listener records.
         let state = unsafe { &mut *self.state.get() };
-        let barrier = GlobalMain::with_current(|engine| engine.worker_barrier());
+        let barrier = hammer_runtime::barrier::global();
         let mut update = || {
             let index = listener_id;
             if !state.listeners.contains_key(index) {
@@ -922,10 +900,7 @@ impl ApplicationMain {
     }
 
     fn ensure_main_thread(&self) -> Result<(), ApplicationError> {
-        match GlobalMain::with_current(|engine| engine.ensure_main_thread()) {
-            Some(Ok(())) => Ok(()),
-            Some(Err(_)) | None => Err(ApplicationError::WrongThread),
-        }
+        hammer_runtime::ensure_main_thread().map_err(|_| ApplicationError::WrongThread)
     }
 }
 

@@ -1,4 +1,4 @@
-use hammer_runtime::{DataPlaneBufferConfig, DataPlaneMain, GlobalMain, RuntimeRegistry};
+use hammer_runtime::{DataPlaneBufferConfig, DataPlaneMain};
 use hammer_service::data_plane::{DropNode, PuntNode};
 use hammer_service::interface::{InterfaceMain, InterfaceOutputNode};
 
@@ -8,18 +8,14 @@ fn feature_chain_terminates_without_an_end_node_self_edge() -> Result<(), Box<dy
     hammer_runtime::config::Memory::default().ensure_main_heap()?;
     hammer_core::buffer::BufferMain::new(64, 1024, &[0], 2, hammer_infra::PageSize::Default)
         .unwrap();
-    let mut main = GlobalMain::new(
-        DataPlaneMain::new(DataPlaneBufferConfig::default()),
-        RuntimeRegistry::new(),
-    );
-    main.install_current();
+    hammer_runtime::ThreadMain::new()?;
+    let mut runtime = DataPlaneMain::new(DataPlaneBufferConfig::default());
     let interfaces = InterfaceMain::new();
     let hardware = interfaces.register_hardware_interface(0, 0, 0, 0)?;
     let interface = interfaces
         .hardware_interface(hardware)
         .unwrap()
         .sw_if_index();
-    let runtime = main.data_plane_main_mut();
     let output = runtime.nodes().try_register_internal(InterfaceOutputNode)?;
     let punt = runtime.nodes().try_register_internal(PuntNode::new())?;
     let drop_node = runtime.nodes().try_register_internal(DropNode::new())?;
@@ -30,7 +26,7 @@ fn feature_chain_terminates_without_an_end_node_self_edge() -> Result<(), Box<dy
     let punt_feature = interfaces.feature_index(arc, "punt").unwrap();
     let drop_feature = interfaces.feature_index(arc, "drop").unwrap();
     let config = [17, 23];
-    interfaces.enable_feature(runtime, arc, punt_feature, interface, &config)?;
+    interfaces.enable_feature(&mut runtime, arc, punt_feature, interface, &config)?;
     let mut selected_config = [0; 2];
 
     // config.c::find_config_with_features appends the end next only when the
@@ -38,7 +34,7 @@ fn feature_chain_terminates_without_an_end_node_self_edge() -> Result<(), Box<dy
     // the same node; explicitly enabling the end must not add a self edge.
     for explicit_end in [false, true] {
         if explicit_end {
-            interfaces.enable_feature(runtime, arc, drop_feature, interface, &[])?;
+            interfaces.enable_feature(&mut runtime, arc, drop_feature, interface, &[])?;
         }
         let mut index = u32::MAX;
         assert_eq!(
@@ -72,9 +68,9 @@ fn feature_chain_terminates_without_an_end_node_self_edge() -> Result<(), Box<dy
         assert_eq!(runtime.cached_free_buffers(), cached_free + segments);
     }
 
-    interfaces.disable_feature(runtime, arc, punt_feature, interface, &config)?;
-    interfaces.disable_feature(runtime, arc, drop_feature, interface, &[])?;
-    interfaces.enable_feature(runtime, arc, punt_feature, interface, &[])?;
+    interfaces.disable_feature(&mut runtime, arc, punt_feature, interface, &config)?;
+    interfaces.disable_feature(&mut runtime, arc, drop_feature, interface, &[])?;
+    interfaces.enable_feature(&mut runtime, arc, punt_feature, interface, &[])?;
     {
         let mut index = u32::MAX;
         assert_eq!(
@@ -96,7 +92,7 @@ fn feature_chain_terminates_without_an_end_node_self_edge() -> Result<(), Box<dy
         assert_eq!(runtime.cached_free_buffers(), cached_free + segments);
     }
     assert_eq!(selected_config, config);
-    interfaces.disable_feature(runtime, arc, punt_feature, interface, &[])?;
+    interfaces.disable_feature(&mut runtime, arc, punt_feature, interface, &[])?;
     let mut index = u32::MAX;
     assert_eq!(
         runtime.buffer_add_data(&mut index, &[0; 64]),
@@ -111,6 +107,5 @@ fn feature_chain_terminates_without_an_end_node_self_edge() -> Result<(), Box<dy
     runtime.buffer_free_one(index);
     assert_eq!(runtime.cached_free_buffers(), cached_free + segments);
 
-    GlobalMain::uninstall_current();
     Ok(())
 }

@@ -72,9 +72,10 @@ impl NetMain {
             local_interface_hw_index: local_hw,
             local_interface_sw_index: local_sw,
         });
-        NET_MAIN
-            .set(Arc::clone(&shared))
-            .map_err(|_| RuntimeError::PluginStateNotInitialized { plugin: "net" })?;
+        assert!(
+            NET_MAIN.set(Arc::clone(&shared)).is_ok(),
+            "network initialization callback executes once"
+        );
         Ok(shared)
     }
 
@@ -692,17 +693,10 @@ impl NetMain {
         if hammer_runtime::ensure_main_thread().is_ok() {
             return select(&self.load_balances());
         }
-        hammer_runtime::with_data_plane_main(|runtime| {
-            assert_ne!(
-                runtime.thread_index(),
-                0,
-                "packet selection requires an installed Data Worker"
-            );
-            // SAFETY: this worker cannot acknowledge a barrier during this
-            // synchronous selection. Only the main thread mutates the pool,
-            // after every worker acknowledges. No pool reference escapes.
-            unsafe { select(&*self.load_balances.as_ptr()) }
-        })
+        // SAFETY: a Data Worker cannot acknowledge a barrier during this
+        // synchronous selection. Only the main thread mutates the pool after
+        // every worker acknowledges, and no pool reference escapes.
+        unsafe { select(&*self.load_balances.as_ptr()) }
     }
 
     #[inline(always)]
@@ -713,20 +707,13 @@ impl NetMain {
         let index = if hammer_runtime::ensure_main_thread().is_ok() {
             self.load_balance(dpo.index())?.urpf_index
         } else {
-            hammer_runtime::with_data_plane_main(|runtime| {
-                assert_ne!(
-                    runtime.thread_index(),
-                    0,
-                    "uRPF lookup requires a Data Worker"
-                );
-                // SAFETY: no barrier acknowledgement can occur during this
-                // read; only the retained list index leaves the worker scope.
-                unsafe {
-                    (&*self.load_balances.as_ptr())
-                        .get(dpo.index())
-                        .map(|object| object.urpf_index)
-                }
-            })?
+            // SAFETY: no barrier acknowledgement can occur during this read;
+            // only the retained list index leaves the worker operation.
+            unsafe {
+                (&*self.load_balances.as_ptr())
+                    .get(dpo.index())
+                    .map(|object| object.urpf_index)
+            }?
         };
         (index != u32::MAX).then_some(index)
     }
@@ -744,6 +731,12 @@ impl NetMain {
 pub static NET_MAIN: OnceLock<Arc<NetMain>> = OnceLock::new();
 
 #[hammer_component_macros::init_function(name = "net_main_init", runs_after = ["interface_main_init"])]
-fn init_net_main(interface_main: Arc<InterfaceMain>) -> RuntimeResult<Arc<NetMain>> {
-    NetMain::init(interface_main)
+fn init_net_main() -> RuntimeResult<()> {
+    let interface_main = crate::interface_model::INTERFACE_MAIN
+        .get()
+        .map(Arc::clone)
+        .ok_or(RuntimeError::RuntimeCapabilityMissing {
+            type_name: "hammer_service::interface::InterfaceMain",
+        })?;
+    NetMain::init(interface_main).map(|_| ())
 }

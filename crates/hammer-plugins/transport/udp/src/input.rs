@@ -11,7 +11,7 @@ use hammer_infra::sparse_vec::SparseVec;
 use hammer_plugin_ip::protocol::icmp::IcmpErrorMetadata;
 use hammer_runtime::RuntimeResult;
 use hammer_runtime::{
-    DataPlaneMain, GlobalMain, Node, NodeProcessFn, NodeRuntime, RuntimeError, TraceFormatter,
+    DataPlaneMain, Node, NodeProcessFn, NodeRuntime, RuntimeError, TraceFormatter,
     add_packet_trace, format_packet_trace,
 };
 use hammer_service::data_plane::set_index_node_error;
@@ -283,6 +283,7 @@ pub(crate) fn is_external_port_registered(version: UdpIpVersion, port: u16) -> b
 }
 
 pub(crate) fn register_dst_port(
+    main: &DataPlaneMain,
     version: UdpIpVersion,
     port: u16,
     node: NodeId,
@@ -291,16 +292,12 @@ pub(crate) fn register_dst_port(
         .get()
         .ok_or(UdpControlError::PortControlNotInitialized)?;
     hammer_runtime::ensure_main_thread_with_barrier()?;
-    let result = GlobalMain::with_current(|engine| {
-        let control = UdpInputControlPlane {
-            inner: Arc::clone(&registration.inner),
-            nodes: Some(engine.data_plane_main().nodes()),
-            consumer: Some(registration.consumer),
-        };
-        control.register_dst_port(version, port, node).map(|_| ())
-    })
-    .ok_or(RuntimeError::ControlRequiresMainThread)?;
-    result
+    let control = UdpInputControlPlane {
+        inner: Arc::clone(&registration.inner),
+        nodes: Some(main.nodes()),
+        consumer: Some(registration.consumer),
+    };
+    control.register_dst_port(version, port, node).map(|_| ())
 }
 
 pub(crate) fn unregister_dst_port(
@@ -312,16 +309,12 @@ pub(crate) fn unregister_dst_port(
         .get()
         .ok_or(UdpControlError::PortControlNotInitialized)?;
     hammer_runtime::ensure_main_thread_with_barrier()?;
-    let result = GlobalMain::with_current(|_| {
-        let control = UdpInputControlPlane {
-            inner: Arc::clone(&registration.inner),
-            nodes: None,
-            consumer: None,
-        };
-        control.unregister_dst_port(version, port, node)
-    })
-    .ok_or(RuntimeError::ControlRequiresMainThread)?;
-    result
+    let control = UdpInputControlPlane {
+        inner: Arc::clone(&registration.inner),
+        nodes: None,
+        consumer: None,
+    };
+    control.unregister_dst_port(version, port, node)
 }
 
 #[derive(Clone)]

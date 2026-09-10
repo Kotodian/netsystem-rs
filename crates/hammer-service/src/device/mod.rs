@@ -6,7 +6,7 @@ use std::ops::Range;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock};
 
-use hammer_runtime::{DataWorkerId, GlobalMain, RuntimeError, RuntimeResult};
+use hammer_runtime::{DataWorkerId, RuntimeError, RuntimeResult};
 
 pub use crate::interface_model::{DeviceClass, HwClass, HwInterface, SwInterface};
 
@@ -53,13 +53,13 @@ impl DeviceMain {
             })
     }
 
-    pub fn init(engine: &mut GlobalMain) -> RuntimeResult<Arc<DeviceMain>> {
-        let main = DeviceMain::new(engine.configured_worker_count());
-        let shared = Arc::new(main.clone());
-        DEVICE_MAIN
-            .set(main)
-            .map_err(|_| RuntimeError::PluginStateNotInitialized { plugin: "device" })?;
-        Ok(shared)
+    pub fn init() -> RuntimeResult<()> {
+        let main = DeviceMain::new(hammer_runtime::config::worker::worker_count());
+        assert!(
+            DEVICE_MAIN.set(main).is_ok(),
+            "device initialization callback executes once"
+        );
+        Ok(())
     }
 
     pub fn worker_range(&self) -> Range<usize> {
@@ -123,6 +123,6 @@ impl DeviceMain {
 pub static DEVICE_MAIN: OnceLock<DeviceMain> = OnceLock::new();
 
 #[hammer_component_macros::init_function(name = "device_main_init", runs_after = ["net_main_init"])]
-fn init_device_main(engine: &mut GlobalMain) -> RuntimeResult<Arc<DeviceMain>> {
-    DeviceMain::init(engine)
+fn init_device_main() -> RuntimeResult<()> {
+    DeviceMain::init()
 }

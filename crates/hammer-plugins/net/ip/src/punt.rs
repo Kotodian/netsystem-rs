@@ -254,10 +254,10 @@ impl Node for Ip6DropNode {
 }
 
 #[hammer_component_macros::init_function(name = "ip_feature_init", runs_after = ["install_packet_graph"], runs_before = ["interface_feature_init"])]
-fn ip_feature_init(engine: &mut hammer_runtime::GlobalMain) -> RuntimeResult<()> {
+fn ip_feature_init(main: &mut hammer_runtime::DataPlaneMain) -> RuntimeResult<()> {
     let net = NetMain::global()?;
     let interfaces = net.interface_main();
-    let nodes = engine.data_plane_main().nodes();
+    let nodes = main.nodes();
     let install = || -> Result<(), FeatureError> {
         let main = IP4_MAIN.get().expect("IP main initialized before graph");
         let arc = Ip4InputNode::register_feature_arc(interfaces, nodes)?;

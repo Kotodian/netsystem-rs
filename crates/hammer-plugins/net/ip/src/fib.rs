@@ -376,7 +376,7 @@ pub type Ip6FibTable = FibTable<Ipv6Net, Ip6FibBackend>;
 #[cfg(test)]
 mod tests {
     use super::*;
-    use hammer_runtime::{DataPlaneBufferConfig, DataPlaneMain, GlobalMain, RuntimeRegistry};
+    use hammer_runtime::{DataPlaneBufferConfig, DataPlaneMain};
     use hammer_service::interface::InterfaceMain;
     use hammer_service::net::{
         DpoError, DpoProto, DpoType, FibPath, FibPathList, FibPathListFlags, LoadBalanceDpo,
@@ -398,14 +398,10 @@ mod tests {
             )
             .unwrap();
         });
-        let mut main = GlobalMain::new(
-            DataPlaneMain::new(DataPlaneBufferConfig::default()),
-            RuntimeRegistry::new(),
-        );
-        main.install_current();
+        hammer_runtime::ThreadMain::new().unwrap();
+        let mut runtime = DataPlaneMain::new(DataPlaneBufferConfig::default());
         let net = NetMain::init(Arc::new(InterfaceMain::new()))?;
-        let runtime = main.data_plane_main_mut();
-        let terminal = hammer_service::data_plane::register_drop(runtime)?;
+        let terminal = hammer_service::data_plane::register_drop(&mut runtime)?;
         let punt_terminal = runtime
             .nodes()
             .try_register_internal(hammer_service::data_plane::PuntNode::new())?;
@@ -423,11 +419,11 @@ mod tests {
                 "ip6-punt",
             ),
         ] {
-            let punt = (entry.init)(runtime)?;
+            let punt = (entry.init)(&runtime)?;
             runtime.nodes().resolve_named_next_nodes()?;
             let forwarding =
                 net.dpo_main_mut()
-                    .stack_from_node(runtime, terminal, DpoId::punt(proto))?;
+                    .stack_from_node(&mut runtime, terminal, DpoId::punt(proto))?;
             assert_eq!(
                 runtime
                     .nodes()
@@ -458,7 +454,7 @@ mod tests {
             DpoProto::IP6,
         ] {
             roots.push(net.create_load_balance(
-                runtime,
+                &mut runtime,
                 proto,
                 LoadBalanceDpo::new(proto, &[], LoadBalanceFlags::empty(), 0x9f)?,
             )?);
@@ -551,8 +547,8 @@ mod tests {
         // then release the independent reference and check pool reclamation.
         // The source test uses MPLS; only its protocol-neutral DPO ownership
         // sequence is reused here. No MPLS policy is added to Hammer.
-        (crate::lookup::__IP_GRAPH_NODE_IP4_INTERFACE_RX_NODE.init)(runtime)?;
-        (crate::lookup::__IP_GRAPH_NODE_IP6_INTERFACE_RX_NODE.init)(runtime)?;
+        (crate::lookup::__IP_GRAPH_NODE_IP4_INTERFACE_RX_NODE.init)(&runtime)?;
+        (crate::lookup::__IP_GRAPH_NODE_IP6_INTERFACE_RX_NODE.init)(&runtime)?;
         let interfaces = net.interface_main();
         let hardware = interfaces.register_hardware_interface(0, 1, 0, 0).unwrap();
         let software = interfaces.hardware_interface(hardware).unwrap().sw_if_index;
@@ -564,7 +560,7 @@ mod tests {
             .unwrap();
         assert_eq!(rx4, shared);
         let forwarding = net.create_load_balance(
-            runtime,
+            &mut runtime,
             DpoProto::IP4,
             LoadBalanceDpo::new(
                 DpoProto::IP4,
@@ -616,7 +612,7 @@ mod tests {
             });
         }
         let forwarding = net.create_load_balance(
-            runtime,
+            &mut runtime,
             DpoProto::IP4,
             LoadBalanceDpo::new(
                 DpoProto::IP4,
@@ -650,7 +646,7 @@ mod tests {
             Some(())
         );
         let other_forwarding = net.create_load_balance(
-            runtime,
+            &mut runtime,
             DpoProto::IP4,
             LoadBalanceDpo::new(DpoProto::IP4, &rx_paths, LoadBalanceFlags::empty(), 0x9f)?,
         )?;
@@ -679,7 +675,7 @@ mod tests {
         net.unlock_dpo(forwarding);
         for count in [4, 8, 1, 8, 4] {
             assert_eq!(
-                net.update_load_balance(runtime, forwarding, &rx_paths[..count])?,
+                net.update_load_balance(&mut runtime, forwarding, &rx_paths[..count])?,
                 Some(())
             );
             let selected = table.forwarding_lookup(destination.addr()).unwrap();
@@ -735,7 +731,7 @@ mod tests {
                 }
             }
             assert_eq!(
-                net.update_load_balance(runtime, forwarding, &paths)?,
+                net.update_load_balance(&mut runtime, forwarding, &paths)?,
                 Some(())
             );
             let selected = table.forwarding_lookup(destination.addr()).unwrap();
@@ -749,7 +745,10 @@ mod tests {
                 );
             }
         }
-        assert_eq!(net.update_load_balance(runtime, forwarding, &[])?, Some(()));
+        assert_eq!(
+            net.update_load_balance(&mut runtime, forwarding, &[])?,
+            Some(())
+        );
         assert_eq!(
             net.select_load_balance(forwarding, |count, _| {
                 assert_eq!(count, 1);
@@ -758,7 +757,7 @@ mod tests {
             Some(DpoId::drop(DpoProto::IP4))
         );
         assert_eq!(
-            net.update_load_balance(runtime, forwarding, &rx_paths[..4])?,
+            net.update_load_balance(&mut runtime, forwarding, &rx_paths[..4])?,
             Some(())
         );
         // Hammer rejects VPP's empty normalized-prefix corner instead of
@@ -769,7 +768,7 @@ mod tests {
                 path.weight = weight;
             }
             assert!(matches!(
-                net.update_load_balance(runtime, forwarding, &paths),
+                net.update_load_balance(&mut runtime, forwarding, &paths),
                 Err(DpoError::InvalidBucketCount)
             ));
             assert_eq!(
@@ -807,10 +806,8 @@ mod tests {
         for hardware in hardware_interfaces {
             interfaces.delete_hardware_interface(hardware).unwrap();
         }
-        crate::local::tests::receive_interface_and_checksum(runtime).unwrap();
-        crate::icmp_error::error_response_source_and_origin(runtime)?;
-        main.close()?;
-        GlobalMain::uninstall_current();
+        crate::local::tests::receive_interface_and_checksum(&mut runtime).unwrap();
+        crate::icmp_error::error_response_source_and_origin(&mut runtime)?;
         Ok(())
     }
 }
