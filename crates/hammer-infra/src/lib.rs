@@ -32,7 +32,6 @@ pub mod sparse_vec;
 pub mod stack;
 pub mod svm_region;
 pub mod sync;
-pub mod thread_owned;
 pub mod timer_wheel;
 
 pub use main_heap::PageSize;
