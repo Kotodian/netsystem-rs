@@ -118,6 +118,17 @@ DataPlaneMain/NodeMain scheduler, with a worker barrier when the operation
 publishes worker-visible state.
 _Avoid_: Data Worker task, Tokio request, packet dispatch
 
+**Per-Thread State**:
+Module-owned state partitioned by runtime thread. An executing thread may
+borrow only its own entry, and every entry exists before worker launch.
+_Avoid_: shared worker state, remotely borrowed state
+
+**Session Worker Event**:
+A concrete Session operation delivered through the target Session worker's
+event queue and executed by the Session queue Node. Enqueue acceptance is not
+operation completion and never grants access to another worker's state.
+_Avoid_: arbitrary worker task, synchronous worker call
+
 **Data Worker**:
 A worker operating-system thread that owns one `DataPlaneMain` and executes
 packet graph nodes, frames, buffers, handoff work, and worker-local readiness.

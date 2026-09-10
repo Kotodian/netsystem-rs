@@ -2,6 +2,10 @@
 
 Status: proposed
 
+The `ThreadOwned<T>` and generic main-to-Data-Worker control-path portions of
+this proposal are superseded by ADR-0010. The remaining runtime-authority and
+thread-zero Process design is unchanged.
+
 Date: 2026-09-09
 
 This proposed ADR records the runtime owner design and the user's subsequent

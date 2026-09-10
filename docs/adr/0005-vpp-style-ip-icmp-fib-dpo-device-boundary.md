@@ -2,6 +2,10 @@
 
 Status: accepted
 
+The `ThreadOwned<Throttle>` install/clear portion of this ADR is superseded by
+ADR-0010. Its remaining IP/ICMP/FIB/DPO/device ownership decisions stay in
+force.
+
 Partial supersession: ADR-0006 replaces this ADR's IP local-delivery node,
 local protocol table, and generic Feature Arc decisions. The FIB, DPO,
 IP/ICMP DSO, device, `local0`, PMTU, and route Binary API decisions remain in

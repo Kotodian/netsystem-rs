@@ -2,6 +2,10 @@
 
 Status: accepted
 
+The `ThreadOwned<T>` and generic main-to-Data-Worker control-path portions of
+this ADR are superseded by ADR-0010. The main-thread Tokio Process scheduling
+decision remains accepted.
+
 Hammer adopts VPP's split between the process-global `GlobalMain` and one
 per-thread `DataPlaneMain`, while using the existing `ControlThread` as the
 main operating-system thread's single-thread Tokio scheduler. `GlobalMain` is
