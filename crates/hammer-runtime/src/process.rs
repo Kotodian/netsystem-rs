@@ -8,10 +8,9 @@
 
 use std::future::Future;
 use std::pin::Pin;
-use std::sync::Arc;
+use std::sync::OnceLock;
 use std::time::Duration;
 
-use crate::RuntimeRegistry;
 use crate::error::{RuntimeError, RuntimeResult};
 use tokio::sync::mpsc;
 
@@ -21,6 +20,17 @@ pub type ProcessFuture = Pin<Box<dyn Future<Output = RuntimeResult<()>> + 'stati
 pub struct ProcessEntry {
     pub name: &'static str,
     pub start: fn(ProcessContext) -> ProcessFuture,
+    #[doc(hidden)]
+    pub handle: &'static OnceLock<ProcessHandle>,
+}
+
+impl ProcessEntry {
+    pub fn signal(&self, event_type: u64, data: u64) -> RuntimeResult<()> {
+        match self.handle.get() {
+            Some(handle) => handle.signal(event_type, data),
+            None => Ok(()),
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -73,20 +83,14 @@ pub(crate) struct ProcessSignal {
 
 pub struct ProcessContext {
     name: &'static str,
-    registry: Arc<RuntimeRegistry>,
     events: mpsc::UnboundedReceiver<ProcessSignal>,
     pending: Vec<ProcessEventBatch>,
 }
 
 impl ProcessContext {
-    pub(crate) fn new(
-        name: &'static str,
-        registry: Arc<RuntimeRegistry>,
-        events: mpsc::UnboundedReceiver<ProcessSignal>,
-    ) -> Self {
+    pub(crate) fn new(name: &'static str, events: mpsc::UnboundedReceiver<ProcessSignal>) -> Self {
         Self {
             name,
-            registry,
             events,
             pending: Vec::new(),
         }
@@ -95,14 +99,6 @@ impl ProcessContext {
     #[inline]
     pub fn name(&self) -> &'static str {
         self.name
-    }
-
-    #[inline]
-    pub fn require<T>(&self) -> RuntimeResult<Arc<T>>
-    where
-        T: Send + Sync + 'static,
-    {
-        self.registry.require::<T>()
     }
 
     /// Suspend until a signal arrives or `duration` elapses.

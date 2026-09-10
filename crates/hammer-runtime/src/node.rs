@@ -2,12 +2,11 @@ use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
 use std::future::Future;
 use std::pin::Pin;
-use std::rc::Rc;
 use std::task::{Context, Poll, Waker};
 
 use crate::error::{RuntimeError, RuntimeResult};
 use crate::trace::TraceFormatter;
-use crate::{DataPlaneMain, GlobalMain, Simd};
+use crate::{DataPlaneMain, Simd};
 use hammer_core::data_plane::{
     Frame, NodeErrorIndex, NodeErrorIndexError, NodeHandle, NodeId, NodeKind, NodeNext,
     NodeRegistration, NodeState,
@@ -342,7 +341,7 @@ pub struct NodeMain {
     next_frames: Vec<NextFrame>,
     next_frame_indices: Vec<Vec<usize>>,
     enqueue_owners: Vec<Option<usize>>,
-    readiness: Rc<NodeReadiness>,
+    readiness: NodeReadiness,
     topology_owner: bool,
 }
 
@@ -1018,7 +1017,7 @@ impl Default for NodeMain {
             next_frames: Vec::new(),
             next_frame_indices: Vec::new(),
             enqueue_owners: Vec::new(),
-            readiness: Rc::new(NodeReadiness::default()),
+            readiness: NodeReadiness::default(),
             topology_owner: true,
         }
     }
@@ -1043,7 +1042,7 @@ impl From<NodeRuntimeInner> for NodeMain {
             next_frames,
             next_frame_indices,
             enqueue_owners,
-            readiness: Rc::new(NodeReadiness::default()),
+            readiness: NodeReadiness::default(),
             topology_owner: false,
         }
     }
@@ -1052,17 +1051,23 @@ impl From<NodeRuntimeInner> for NodeMain {
 fn preferred_node_function<'registration>(
     node_name: &str,
     max_simd_bytes: usize,
-    registrations: &'registration [NodeFunctionRegistration],
+    registrations: impl Iterator<Item = &'registration NodeFunctionRegistration>,
 ) -> RuntimeResult<Option<&'registration NodeFunctionRegistration>> {
     let mut selected = None;
+    let mut seen_simd_widths = [false; 4];
 
-    for (offset, registration) in registrations.iter().enumerate() {
+    for registration in registrations {
         if registration.node_name != node_name {
             continue;
         }
-        if registrations[..offset].iter().any(|previous| {
-            previous.node_name == node_name && previous.simd_bytes == registration.simd_bytes
-        }) {
+        let width_index = match registration.simd_bytes {
+            1 => 0,
+            16 => 1,
+            32 => 2,
+            64 => 3,
+            _ => unreachable!("Node Function SIMD width is validated at construction"),
+        };
+        if std::mem::replace(&mut seen_simd_widths[width_index], true) {
             return Err(DataPlaneError::DuplicateNodeFunction {
                 node: registration.node_name,
                 simd_bytes: registration.simd_bytes,
@@ -1170,11 +1175,11 @@ impl NodeMain {
         *self.inner.get_mut() = graph;
     }
 
-    pub(crate) fn install_node_function(
+    pub(crate) fn install_node_function<'registration>(
         &self,
         node: NodeId,
         simd_bytes: usize,
-        registrations: &[NodeFunctionRegistration],
+        registrations: impl Iterator<Item = &'registration NodeFunctionRegistration>,
         process: NodeProcessFn,
     ) -> RuntimeResult<()> {
         self.ensure_topology_owner()?;
@@ -1642,9 +1647,9 @@ impl NodeMain {
             .flatten())
     }
 
-    pub fn ready(&self) -> NodeRuntimeReady {
+    pub fn ready(&self) -> NodeRuntimeReady<'_> {
         NodeRuntimeReady {
-            readiness: Rc::clone(&self.readiness),
+            readiness: &self.readiness,
         }
     }
 
@@ -1719,12 +1724,8 @@ impl NodeMain {
             }
         }
         let mut inner = self.inner.borrow_mut();
-        let (slots, changed) = inner.add_node_next_slots(edges, shared_slots)?;
+        let (slots, _) = inner.add_node_next_slots(edges, shared_slots)?;
         drop(inner);
-        if changed && workers_running {
-            GlobalMain::with_current(|main| main.request_worker_graph_refork())
-                .expect("main graph mutation requires the installed GlobalMain");
-        }
         Ok(slots)
     }
 
@@ -1802,11 +1803,11 @@ impl NodeMain {
     }
 }
 
-pub struct NodeRuntimeReady {
-    readiness: Rc<NodeReadiness>,
+pub struct NodeRuntimeReady<'a> {
+    readiness: &'a NodeReadiness,
 }
 
-impl Future for NodeRuntimeReady {
+impl Future for NodeRuntimeReady<'_> {
     type Output = ();
 
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
@@ -1885,7 +1886,12 @@ mod tests {
             .unwrap();
         runtime
             .nodes()
-            .install_node_function(node, 1, &[__NODE_FUNCTION_PACKET_INPUT_SCALAR], process)
+            .install_node_function(
+                node,
+                1,
+                [&__NODE_FUNCTION_PACKET_INPUT_SCALAR].into_iter(),
+                process,
+            )
             .unwrap();
         assert_eq!(runtime.nodes().frame_args_size(node).unwrap(), (8, 4, 2));
         for calls in 1..=2 {

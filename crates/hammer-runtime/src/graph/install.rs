@@ -4,16 +4,11 @@
 //! link-image inventories. This is not a service-owned graph catalog.
 
 use crate::error::RuntimeResult;
-use hammer_component_macros::init_function;
 
-use crate::global_main::GlobalMain;
-
-#[init_function(name = "install_packet_graph")]
-pub fn install_packet_graph(engine: &mut GlobalMain) -> RuntimeResult<()> {
-    let entries = engine.plugin_main().graph_nodes();
-    let functions = engine.plugin_main().node_functions();
-    engine
-        .main
-        .init_graph_with_node_functions(&entries, &functions)?;
-    Ok(())
+pub fn install_packet_graph<'entry, 'function>(
+    main: &mut crate::DataPlaneMain,
+    entries: impl Clone + Iterator<Item = &'entry crate::node::NodeEntry>,
+    functions: impl Clone + Iterator<Item = &'function crate::node::NodeFunctionRegistration>,
+) -> RuntimeResult<()> {
+    main.init_graph_from_declarations(entries, functions)
 }

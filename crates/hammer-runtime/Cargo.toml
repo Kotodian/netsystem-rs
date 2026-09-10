@@ -30,7 +30,7 @@ abi_stable = { workspace = true }
 bytes = { workspace = true }
 bincode = { workspace = true }
 crossbeam-queue = { workspace = true }
-tokio = { workspace = true }
+tokio = { workspace = true, features = ["signal"] }
 tracing = { workspace = true }
 metrics = { workspace = true }
 metrics-derive = { workspace = true }
