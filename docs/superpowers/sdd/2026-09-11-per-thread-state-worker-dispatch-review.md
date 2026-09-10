@@ -36,6 +36,11 @@ replacement runtime metrics API was added.
   `application_detach_process`, and `vnet_application_detach` perform
   Application cleanup from the control path and synchronize worker-visible
   teardown.
+- `third_party/vpp/src/vnet/session/application.h` and `application.c`:
+  `app_rx_mq_elt_t::flags`, `app_rx_mq_fd_read_ready`, and
+  `appsl_rx_mqs_input_node` keep the MQ pending flag on the selected worker;
+  the File callback and input Node access it serially while producers signal
+  the queue.
 - `third_party/vpp/src/vnet/ip/reass/ip4_full_reass.c`:
   `ip4_full_reass_walk_expired` iterates and locks per-thread reassembly state
   from the expiry Process. The IPv6 counterpart is in
@@ -63,19 +68,24 @@ cannot prove worker exclusivity, Application MQ wakeup behavior, detach
 failure recovery, Session event targeting, transport completion, reassembly
 expiry, or Buffer cache behavior. These remain residual verification risk.
 
-During completion review, three blocking implementation defects were corrected:
+During completion review, four blocking implementation defects were corrected:
 
 - Application MQ attach rollback now unregisters every File before releasing
   the boxed entry referenced by File private data. A failed unregister retains
   the resources instead of creating a dangling pointer.
-- Application MQ snapshot draining now keeps the Application pending whenever
-  the queue remains nonempty or dequeue reports an error. It clears pending
-  only after observing an empty queue, avoiding an empty-to-nonempty wakeup
-  loss while producers append during a drain.
+- Application MQ pending state is a worker-local `Cell<bool>`, matching VPP's
+  plain per-worker pending flag. File callbacks and input-node draining execute
+  serially on the selected Data Worker; producers do not inspect that flag and
+  signal the queue's empty-to-nonempty transition. Draining retains pending for
+  a nonempty queue or dequeue error, while an enqueue after the empty check
+  leaves a readable signal that schedules the Application on the next File
+  poll.
 - Application detach now completes the fallible Session listener cleanup before
   unregistering Application MQ Files, so a failed transport unlisten does not
   leave a still-attached Application without worker MQ readiness. Session
   Worker readiness cleanup also retains its File index when deletion fails.
+- IP reassembly production expiry now has one entry point: the thread-zero
+  Process walk. The unused public worker-local Node expiry methods were removed.
 
 The process-global Session and Buffer direct-index APIs also state an explicit
 unsafe contract: the caller must be the unique runtime execution thread for

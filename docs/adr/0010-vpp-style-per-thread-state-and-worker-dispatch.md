@@ -70,6 +70,7 @@ Out of scope:
 | V5 | VPP | `third_party/vpp/src/vlib/threads.c`: `vlib_rpc_call_main_thread`, `vlib_rpc_call_main_thread_process` | Generic vlib RPC is worker-to-main; VPP has no symmetric generic main-to-worker `vlib_main_t` closure queue | `DataRemoteLocalQueue` has no VPP runtime counterpart |
 | V6 | VPP | `third_party/vpp/src/vnet/ip/reass/ip4_full_reass.c`: `ip4_full_reass_walk_expired` | The main Process walks `per_thread_data`, locks each entry, and expires it directly | IP expiry does not schedule worker closures |
 | V7 | VPP | `third_party/vpp/src/vlib/buffer.h`: `vlib_buffer_pool_t::threads`; `buffer.c`: `vlib_buffer_num_workers_change`; `buffer_funcs.h`: `vlib_buffer_alloc_from_pool` | Each Buffer Pool owns its cache vector, sized for all threads and selected by `vm->thread_index` | Keep Buffer caches in `BufferPool`; remove only lazy install semantics |
+| V8 | VPP | `third_party/vpp/src/vnet/session/application.h`: `app_rx_mq_elt_t::flags`; `application.c`: `app_rx_mq_fd_read_ready`, `appsl_rx_mqs_input_node` | The File callback and input Node use one plain pending flag on the selected worker; producers signal the MQ and do not access the flag | Hammer pending state is worker-local, not an atomic cross-thread protocol |
 
 A scoped search under `third_party/vpp/src/vlib` and
 `third_party/vpp/src/vnet` found no runtime queue that sends an arbitrary
@@ -85,6 +86,7 @@ Session-owned events and generic worker-to-main RPC are distinct mechanisms.
 | Runtime relationship | Draft designs made `DataPlaneMain` a generic access authority | `DataPlaneMain` only supplies its existing numeric `thread_index()` to its caller | V1-V3 | No generic method, trait, token, or owner registration |
 | Worker startup | Worker-init creates and installs module worker state | Module init creates all entries; worker-init configures the current existing entry | V1-V3 | No cross-thread installation lifecycle remains |
 | Cross-thread Session work | Runtime executes arbitrary closures, sometimes followed by blocking `recv` | Existing Session queue carries concrete Session control events | V4 | Queue acceptance and completion remain distinct |
+| Application MQ readiness | Session worker stores MQ readiness separately from the Application-owned queue | Application owns stable per-worker MQ entries; each selected worker serializes its File callback, pending flag, and input Node | V8 | No runtime closure or cross-thread pending protocol |
 | TCP/UDP/QUIC connect | Transport code schedules itself on a runtime worker | Session `Connect`/`ConnectStream` dispatch invokes the selected transport | V2-V4 | Transport does not choose runtime scheduling |
 | IP expiry | Main Process schedules one closure per worker | Main Process walks locked per-thread reassembly entries | V6 | Runtime queue is removed; packet handoff is unchanged |
 | Buffer cache | Pool cache entries lazily install on first access | Pool cache entries are constructed with `BufferPool` and borrowed by thread index | V7 | Preserve VPP Pool ownership; no new `DataPlaneMain` field |
@@ -177,9 +179,13 @@ Per-Application MQ readiness is not a Session lifecycle event. Attach creates
 one `ApplicationWorkerMq` per Data Worker and registers each queue's File with
 that worker's polling index. The File callback appends the Application identity
 to the current Session worker's pending queue and marks the existing
-App-Session input Node pending. Snapshot draining preserves `pending` while the
-queue remains nonempty, including error paths, so a producer cannot lose a
-wakeup while adding work during the drain.
+App-Session input Node pending. The pending flag is worker-local `Cell<bool>`
+state: the File callback and input Node run serially on that worker, while
+producers only enqueue and signal the queue's empty-to-nonempty transition.
+Snapshot draining preserves pending while the queue remains nonempty or a
+dequeue fails. If a producer enqueues after the Node observes an empty queue,
+its signal remains readable after the Node clears pending and the next File
+callback schedules the Application again.
 
 Application detach runs on the Main Thread inside `WorkerBarrier`, unregisters
 the MQ Files before releasing their pointer-owning boxes, and directly walks
@@ -195,6 +201,8 @@ The thread-zero IP reassembly Process iterates the existing per-thread
 range, releases retained Buffer chains, unlocks, and advances. This lock is
 specific to VPP's reassembly Process walk and does not justify locks around
 ordinary Session, transport, protocol, throttle, or Buffer worker state.
+The Process is the only production expiry entry; the obsolete public
+`Ip4ReassemblyNode::expire` and `Ip6ReassemblyNode::expire` methods are deleted.
 
 ### D7: Delete Generic Runtime Metrics
 
@@ -255,7 +263,7 @@ not change.
 | 类型 | `TlsWorkers::workers` | TLS plugin | each entry directly contains a preconstructed connection `Pool` borrow cell | install errors disappear | all-target compile; behavior not run |
 | 类型 | `Ip4Main::icmp_throttle`, `Ip6Main::icmp_throttle` | IP plugin | existing vectors directly contain preconstructed throttle borrow cells | no wire migration | all-target compile; behavior not run |
 | 类型 | `BufferPool::workers` | `hammer-core::buffer` | Pool-owned cache array directly contains complete borrow cells constructed by `BufferMain::new` | remains in core, not runtime | all-target compile; behavior not run |
-| 类型 | `ApplicationMqResources` | `hammer-service::session::application` | queue array becomes stable boxed worker entries; File deletion precedes entry release and pending state survives nonempty/error drains | daemon/SDK rebuild; no persistence | all-target compile; failure paths reviewed |
+| 类型 | `ApplicationMqResources` | `hammer-service::session::application` | queue array becomes stable boxed worker entries; File deletion precedes entry release; worker-local `Cell<bool>` coalesces File readiness and survives nonempty/error drains | daemon/SDK rebuild; no persistence | all-target compile; failure paths and worker serialization reviewed |
 | 类型/wire | `SessionEvt` and Session event codec | `hammer-core::session`, `hammer-runtime::app` | add `control_data: u64`; fixed codec grows 16 to 24 bytes; no new `SessionEvtType` variant | attach protocol 4 to 5; atomic daemon/SDK upgrade | all-target compile; codec behavior not run |
 | 类型 | `SessionConnectEndpoint` | `hammer-runtime::session` | `connection: u32` becomes `Option<u32>` and `app: Option<u32>` is added for owner-defined chained Session connects | all constructors and transports rebuild | all-target compile; behavior not run |
 | 类型/error | `QuicListenerError` | QUIC plugin | add a private lower-transport-connect cleanup variant that preserves both the primary UDP connect error and a later QUIC context cleanup error | no public error ABI or persistence change | all-target compile; failure path reviewed |
@@ -283,6 +291,7 @@ not change.
 | API | `schedule_on_worker`, queue install/attach/push/drain/close, `poll_remote_local_tasks` | `hammer-runtime` | delete generic worker execution and loop stage | callers use Session event or Process walk | worker loop integration |
 | API | `schedule_worker_task` and blocking worker `mpsc` replies | Session owner and transport callers | delete synchronous cross-thread closure wrapper | completion becomes owner event state | all-target compile and symbol audit |
 | API | `ApplicationMain::reclaim_connection` | `hammer-service::session::application` | delete the obsolete reclaim operation; connected entries are reaped by the Application owner | internal callers removed | all-target compile and symbol audit |
+| API | `Ip4ReassemblyNode::expire`, `Ip6ReassemblyNode::expire` | IP plugin | delete obsolete worker-local expiry entry points; thread-zero Process owns production expiry | public Rust callers must rely on configured Process expiry | all-target compile and symbol audit |
 | API | all `hammer_runtime::metrics` constructors, registration, update, snapshot, recorder methods, and public re-exports | `hammer-runtime` | delete complete API surface | downstream users must use owner stats; no deprecation | workspace compile and public API audit |
 | 类型 | `hammer_runtime::network::{Network,SocksAddr}` | `hammer-runtime` | delete old definitions and module path after move | breaking Rust import; use `hammer_service::net` | no runtime definition/re-export remains |
 | API | runtime-root `Network`/`SocksAddr` re-exports and their old method paths | `hammer_runtime::{Network,SocksAddr}` | delete old public path without alias | downstream import migration required | downstream-style compile fixture |
