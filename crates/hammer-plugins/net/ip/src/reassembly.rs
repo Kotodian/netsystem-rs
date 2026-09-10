@@ -210,13 +210,6 @@ impl IpReassemblyMain {
         runtime.thread_index().saturating_sub(1) as usize
     }
 
-    fn expire_worker(&self, runtime: &mut DataPlaneMain, now: Instant) -> usize {
-        self.per_thread_data
-            .get(Self::worker_slot(runtime))
-            .map(|worker| worker.lock().expire(runtime, now))
-            .unwrap_or(0)
-    }
-
     fn expire_all(&self, trace: Option<&TraceControlHandle>, now: Instant) -> usize {
         let buffers = BufferMain::global();
         // SAFETY: reassembly expiry runs only on the thread-zero Process.
@@ -345,14 +338,6 @@ impl Ip4ReassemblyNode {
         self.max_fragments_per_reassembly = max_fragments;
         self
     }
-
-    #[inline]
-    pub fn expire(&mut self, runtime: &mut DataPlaneMain, now: Instant) -> usize {
-        IP_REASSEMBLY_MAIN
-            .get()
-            .map(|main| main.expire_worker(runtime, now))
-            .unwrap_or(0)
-    }
 }
 
 fn register_ip4_reassembly(runtime: &DataPlaneMain) -> RuntimeResult<NodeId> {
@@ -405,14 +390,6 @@ impl Ip6ReassemblyNode {
     pub fn with_max_fragments_per_reassembly(mut self, max_fragments: usize) -> Self {
         self.max_fragments_per_reassembly = max_fragments;
         self
-    }
-
-    #[inline]
-    pub fn expire(&mut self, runtime: &mut DataPlaneMain, now: Instant) -> usize {
-        IP_REASSEMBLY_MAIN
-            .get()
-            .map(|main| main.expire_worker(runtime, now))
-            .unwrap_or(0)
     }
 }
 
