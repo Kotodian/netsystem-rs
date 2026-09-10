@@ -175,7 +175,7 @@ fn run(config: String, roots: Vec<String>, worker: Worker) {
 
     engine
         .plugin_main_mut()
-        .register_builtin_image(hammer_service::registration_image());
+        .register_image(hammer_service::registration_image());
     engine.main_loop_enter(&roots, &config).unwrap_or_else(|e| {
         eprintln!("main_loop_enter failed: {e}");
         std::process::exit(1);

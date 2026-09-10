@@ -125,7 +125,7 @@ fn main() -> Result<(), ExampleError> {
     engine.init_control()?;
     engine
         .plugin_main_mut()
-        .register_builtin_image(hammer_service::registration_image());
+        .register_image(hammer_service::registration_image());
     engine.install_current();
 
     let example_result = run_example(&mut engine, main_heap_capacity, &roots, EXAMPLE_CONFIG);

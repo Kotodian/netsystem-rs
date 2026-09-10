@@ -730,11 +730,11 @@ mod tests {
         main.init_control()?;
         main.install_current();
         main.plugin_main_mut()
-            .register_builtin_image(hammer_service::registration_image());
+            .register_image(hammer_service::registration_image());
         main.plugin_main_mut()
-            .register_builtin_image(hammer_plugin_ip::plugin_module().registration_image().get());
+            .register_image(hammer_plugin_ip::plugin_module().registration_image().get());
         main.plugin_main_mut()
-            .register_builtin_image(crate::plugin_module().registration_image().get());
+            .register_image(crate::plugin_module().registration_image().get());
         main.configure_early(&format!(
             "[stats]\nsocket_path = '/tmp/hammer-icmp-input-{}.sock'\n",
             std::process::id()

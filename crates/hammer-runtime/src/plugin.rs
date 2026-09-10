@@ -297,7 +297,7 @@ impl PluginMain {
             })
     }
     /// Adds one host-owned registration image before plugin lifecycle starts.
-    pub fn register_builtin_image(&mut self, image: &'static RegistrationImage) {
+    pub fn register_image(&mut self, image: &'static RegistrationImage) {
         self.builtin_registration_images.push(image);
     }
 
