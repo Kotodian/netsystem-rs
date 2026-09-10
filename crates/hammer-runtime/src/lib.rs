@@ -58,7 +58,6 @@ pub mod metrics;
 pub mod plugin;
 pub mod plugin_loader;
 mod process;
-pub mod registry;
 pub mod session;
 pub mod sync;
 
@@ -94,7 +93,6 @@ pub use plugin::{
     host_meets_plugin_requirement,
 };
 pub use process::Process;
-pub use registry::RuntimeRegistry;
 pub use session::{SessionConnectEndpoint, SessionListenEndpoint};
 pub use thread_main::ThreadMain;
 pub use thread_main::{ensure_main_thread, ensure_main_thread_with_barrier};
