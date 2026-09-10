@@ -3,7 +3,8 @@ use hammer_infra::thread_owned::ThreadOwnedError;
 
 impl BufferMain {
     /// Exclusively borrow the existing Pool-owned caches on their Worker thread.
-    /// The guards retain the borrow until the runtime ends; refork keeps them.
+    /// `ThreadOwned` verifies the current OS thread while each operation keeps
+    /// the selected Pool caches mutably borrowed.
     pub fn borrow_worker_caches(&self, thread_index: u32) -> Box<[RefMut<'_, BufferThreadCache>]> {
         self.pools
             .iter()
@@ -14,6 +15,39 @@ impl BufferMain {
                     .expect("one runtime borrows this Worker's Buffer cache")
             })
             .collect()
+    }
+
+    /// Borrow a live Buffer through one Worker's exclusive cache authority.
+    ///
+    /// # Safety
+    ///
+    /// The caller must own the live Buffer for the returned borrow and must
+    /// prevent every overlapping mutable borrow for the same slot.
+    #[doc(hidden)]
+    #[inline]
+    pub unsafe fn buffer_for_worker<'a>(&'a self, thread_index: u32, index: u32) -> &'a Buffer {
+        self.pool(index).bind_worker(thread_index);
+        // SAFETY: upheld by the caller's live readable Buffer ownership.
+        unsafe { self.buffer_unchecked(index) }
+    }
+
+    /// Borrow an exclusive Buffer through one Worker's cache authority.
+    ///
+    /// # Safety
+    ///
+    /// The caller must be the sole owner of the live Buffer and must prevent
+    /// every overlapping shared or mutable borrow for the same slot.
+    #[doc(hidden)]
+    #[inline]
+    pub unsafe fn buffer_mut_for_worker<'a>(
+        &'a self,
+        thread_index: u32,
+        index: u32,
+    ) -> &'a mut Buffer {
+        self.pool(index).bind_worker(thread_index);
+        // SAFETY: upheld by the caller's exclusive Buffer ownership; the
+        // private boundary also rejects shared clone tails.
+        unsafe { self.buffer_mut_unchecked(index) }
     }
 
     pub(super) fn validate_caches(&self, caches: &[RefMut<'_, BufferThreadCache>]) {

@@ -2,8 +2,9 @@ use tokio::io::Interest;
 use tokio::io::unix::AsyncFd;
 
 use crate::DataPlaneMain;
+use crate::FILE_MAIN;
 use crate::spawn;
-use crate::spawn::DATA_WORKER_IDLE_SLICE;
+use std::time::Duration;
 
 /// VPP-style fixed-schedule data-plane main loop.
 ///
@@ -20,14 +21,17 @@ pub fn data_plane_main_loop(
     main: &mut DataPlaneMain,
     runtime: &tokio::runtime::Runtime,
     remote_local: &spawn::DataRemoteLocalQueue,
+    idle_slice: Duration,
 ) -> i32 {
-    let idle_slice = DATA_WORKER_IDLE_SLICE.with(|s| s.get());
-
     main.attach_worker_interrupt_thread();
 
     let io_wake = {
         let _reactor = runtime.enter();
-        match main.file_main().io_wake_fd_for_worker(main.thread_index()) {
+        match FILE_MAIN
+            .get()
+            .expect("FileMain is initialized before Data Worker startup")
+            .io_wake_fd_for_worker(main.thread_index())
+        {
             Ok(wake_fd) => match AsyncFd::with_interest(wake_fd, Interest::READABLE) {
                 Ok(wake) => Some(wake),
                 Err(error) => {
@@ -57,7 +61,7 @@ pub fn data_plane_main_loop(
         if let Some(barrier) = crate::barrier::global()
             && barrier.is_pending()
         {
-            main.refork_worker_graph(&barrier);
+            barrier.check();
         }
 
         // Step 2: Poll worker-local File readiness before graph dispatch.
@@ -86,7 +90,7 @@ pub fn data_plane_main_loop(
 
         // Step 3: Drain handoff queues, run ready nodes, poll remote/local tasks
         let _ = main.run_ready_nodes();
-        progress |= spawn::poll_remote_local_tasks(remote_local);
+        progress |= spawn::poll_remote_local_tasks(remote_local, main);
         let _ = main.run_ready_nodes();
 
         // Step 4: Tokio reactor tick. VPP sleeps inside `epoll_wait`
@@ -98,23 +102,35 @@ pub fn data_plane_main_loop(
                 tokio::task::yield_now().await;
             });
         } else {
-            runtime.block_on(async {
+            let wake_error = runtime.block_on(async {
                 match &io_wake {
                     Some(wake) => tokio::select! {
                         guard = wake.readable() => match guard {
                             Ok(mut guard) => {
-                                let _ = main
-                                    .file_main()
+                                let result = FILE_MAIN
+                                    .get()
+                                    .expect("FileMain is initialized before Data Worker startup")
                                     .clear_io_wake_for_worker(main.thread_index());
                                 guard.clear_ready();
+                                result.err()
                             }
-                            Err(_) => tokio::time::sleep(idle_slice).await,
+                            Err(_) => {
+                                tokio::time::sleep(idle_slice).await;
+                                None
+                            },
                         },
-                        _ = tokio::time::sleep(idle_slice) => {}
+                        _ = tokio::time::sleep(idle_slice) => None
                     },
-                    None => tokio::time::sleep(idle_slice).await,
+                    None => {
+                        tokio::time::sleep(idle_slice).await;
+                        None
+                    }
                 }
             });
+            if let Some(error) = wake_error {
+                tracing::error!(worker = main.thread_index(), %error, "File wake clear failed");
+                return 1;
+            }
         }
 
         // Step 5: Run any newly-scheduled frames (pre-input + input)

@@ -9,15 +9,12 @@ use crossbeam_queue::SegQueue;
 use hammer_core::data_plane::NodeId;
 
 #[hammer_component_macros::config_function(name = "runtime_trace_config", section = "trace")]
-fn configure_trace(
-    trace: Trace,
-    engine: &mut crate::GlobalMain,
-) -> RuntimeResult<Arc<TraceControlPlane>> {
+fn configure_trace(trace: Trace, main: &mut crate::DataPlaneMain) -> RuntimeResult<()> {
     trace.validate()?;
     let control = Arc::new(TraceControlPlane::new(trace.record_capacity));
-    control.publish_options(&trace, |name| engine.main.node_by_name(name))?;
-    engine.main.set_trace_control(Some(control.handle()));
-    Ok(control)
+    control.publish_options(&trace, |name| main.node_by_name(name))?;
+    main.set_trace_control(Some(control.handle()));
+    Ok(())
 }
 
 pub type TraceFormatter = fn(&[u8]) -> String;
@@ -75,11 +72,6 @@ impl TraceEntry {
 
 #[derive(Debug, Default, Clone)]
 pub struct DataPlaneTrace {
-    inner: std::rc::Rc<std::cell::RefCell<DataPlaneTraceState>>,
-}
-
-#[derive(Debug, Default)]
-struct DataPlaneTraceState {
     control: Option<TraceControlHandle>,
 }
 
@@ -288,23 +280,21 @@ impl TraceControlPlane {
 }
 
 impl DataPlaneTrace {
-    pub fn set_control(&self, control: Option<TraceControlHandle>) {
-        self.inner.borrow_mut().control = control;
+    pub fn set_control(&mut self, control: Option<TraceControlHandle>) {
+        self.control = control;
     }
 
     pub(crate) fn control(&self) -> Option<TraceControlHandle> {
-        self.inner.borrow().control.clone()
+        self.control.clone()
     }
 
     pub fn try_mark(&self, node: NodeId, node_name: Option<&'static str>) -> Option<u32> {
-        let control = self.inner.borrow().control.clone()?;
+        let control = self.control.clone()?;
         control.try_mark(node, node_name)
     }
 
     pub fn may_mark(&self, node: NodeId) -> bool {
-        let state = self.inner.borrow();
-        state
-            .control
+        self.control
             .as_ref()
             .is_some_and(|control| control.may_mark(node))
     }
@@ -317,14 +307,14 @@ impl DataPlaneTrace {
         formatter: Option<TraceFormatter>,
         payload_bytes: Vec<u8>,
     ) {
-        let Some(control) = self.inner.borrow().control.clone() else {
+        let Some(control) = self.control.clone() else {
             return;
         };
         control.add_entry(handle, node, node_name, formatter, payload_bytes);
     }
 
     pub fn finalize(&self, handle: u32) {
-        let Some(control) = self.inner.borrow().control.clone() else {
+        let Some(control) = self.control.clone() else {
             return;
         };
         control.finalize(handle);

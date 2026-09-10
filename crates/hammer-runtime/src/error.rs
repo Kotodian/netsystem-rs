@@ -8,12 +8,31 @@ pub enum RuntimeError {
     DataPlane(#[from] DataPlaneError),
     #[error("parse TOML: {message}")]
     ConfigParse { message: String },
+    #[error("config callback `{function}` failed to parse section `{section}`")]
+    ConfigFunctionParse {
+        function: &'static str,
+        section: &'static str,
+        #[source]
+        source: toml::de::Error,
+    },
     #[error("invalid runtime configuration: {message}")]
     ConfigValidation { message: String },
     #[error("{stage}: {message}")]
     Lifecycle { stage: String, message: String },
     #[error("service closed")]
     ServiceClosed,
+    #[error("read startup configuration `{path}`")]
+    StartupConfigRead {
+        path: std::path::PathBuf,
+        #[source]
+        source: std::io::Error,
+    },
+    #[error("wait for Unix signal `{signal}`")]
+    UnixSignal {
+        signal: &'static str,
+        #[source]
+        source: std::io::Error,
+    },
     #[error("global FileMain is already initialized")]
     FileMainAlreadyInitialized,
     #[error("global FileMain is not initialized")]
@@ -63,6 +82,38 @@ pub enum RuntimeError {
     Stats(#[from] hammer_stats::StatsError),
     #[error("worker count {count} does not fit u32")]
     WorkerCountOverflow { count: usize },
+    #[error("worker count must be non-zero")]
+    WorkerCountZero,
+    #[error("worker thread stack size must be non-zero")]
+    WorkerStackSizeZero,
+    #[error("worker blocking thread count must be non-zero")]
+    WorkerBlockingThreadCountZero,
+    #[error("thread count does not fit u32")]
+    ThreadCountOverflow,
+    #[error("operating-system CPU inventory is unavailable")]
+    CpuInventoryUnavailable,
+    #[error("CPU index {cpu} does not fit the runtime identity")]
+    CpuIndexOverflow { cpu: usize },
+    #[error("configured CPU {cpu} is unavailable")]
+    CpuUnavailable { cpu: usize },
+    #[error("CPU {cpu} configured for data worker {worker} is unavailable")]
+    WorkerCpuUnavailable { worker: usize, cpu: usize },
+    #[error("no CPU remains for data worker {worker}")]
+    WorkerCpuExhausted { worker: usize },
+    #[error("failed to bind runtime thread {thread_index} to CPU {cpu}")]
+    WorkerCpuAffinity { thread_index: u32, cpu: usize },
+    #[cfg(target_os = "linux")]
+    #[error("failed to configure data-worker scheduling policy")]
+    WorkerScheduler {
+        #[source]
+        source: Box<thread_priority::Error>,
+    },
+    #[cfg(target_os = "macos")]
+    #[error("failed to configure data-worker QoS")]
+    WorkerQos {
+        #[source]
+        source: std::io::Error,
+    },
     #[error("plugin `{plugin}` state is not initialized")]
     PluginStateNotInitialized { plugin: &'static str },
     #[error("thread {thread_index} is not a data worker")]
@@ -75,6 +126,19 @@ pub enum RuntimeError {
     ControlRequiresWorkerBarrier,
     #[error("worker configuration cannot change after runtime initialization")]
     WorkerConfigurationAlreadyInitialized,
+    #[error("worker configuration field `{field}` is specified more than once via `{alias}`")]
+    WorkerConfigurationFieldDuplicate {
+        field: &'static str,
+        alias: &'static str,
+    },
+    #[error("failed to parse worker configuration field `{field}`")]
+    WorkerConfigurationFieldParse {
+        field: &'static str,
+        #[source]
+        source: toml::de::Error,
+    },
+    #[error("unknown worker configuration field `{field}`")]
+    WorkerConfigurationFieldUnknown { field: String },
     #[error("data workers are already started")]
     DataWorkersAlreadyStarted,
     #[error("data worker {worker} thread setup failed")]
@@ -89,6 +153,14 @@ pub enum RuntimeError {
         #[source]
         source: std::io::Error,
     },
+    #[error("failed to build the Tokio runtime for data worker {worker}")]
+    DataWorkerRuntime {
+        worker: u32,
+        #[source]
+        source: std::io::Error,
+    },
+    #[error("data worker {worker} exited with status {status}")]
+    DataWorkerExited { worker: u32, status: i32 },
     #[error("data worker {worker} control call was canceled")]
     DataWorkerCallCanceled { worker: usize },
     #[error("data worker index {worker} is outside configured worker count {worker_count}")]
@@ -144,6 +216,11 @@ pub enum RuntimeError {
     WorkerExitedBeforeStartupBarrier { phase: &'static str },
     #[error("data worker requested exit during initialization")]
     WorkerRequestedExitDuringInitialization,
+    #[error("system clock is before the Unix epoch")]
+    SystemClockBeforeUnixEpoch {
+        #[source]
+        source: std::time::SystemTimeError,
+    },
     #[error("node runtime data value {value} does not fit u64")]
     NodeRuntimeValueOverflow { value: usize },
     #[error("node runtime data word {word} value {value} does not fit usize")]

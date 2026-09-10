@@ -260,22 +260,7 @@ impl Drop for Release {
 
 impl WorkerBarrier {
     fn release_scope(&self, caller: &'static Location<'static>) {
-        let outermost = self.recursion_level() == 1;
-        if outermost {
-            if let Some(worker_count) = PROCESS_BARRIER.get().map(WorkerBarrier::worker_count) {
-                let _ = crate::global_main::GlobalMain::with_current(|engine| {
-                    if worker_count != 0 {
-                        engine.publish_worker_graph_refork(worker_count);
-                    }
-                });
-            }
-        }
         self.release_from(caller);
-        if outermost {
-            let _ = crate::global_main::GlobalMain::with_current(|engine| {
-                engine.wait_for_worker_graph_refork();
-            });
-        }
     }
 }
 

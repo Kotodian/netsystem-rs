@@ -18,18 +18,20 @@
 // `#[cfg]`-gated fields, so they cannot be replaced by `#[derive(Default)]`.
 #![allow(clippy::derivable_impls)]
 
+use std::sync::OnceLock;
 use std::time::Duration;
 
 use hammer_infra::PageSize;
+use serde::de::DeserializeOwned;
 
 use crate::error::{RuntimeError, RuntimeResult};
 
 // hammer-service/src/service.rs
-const WORKER_THREADS: usize = 2;
-const WORKER_STACK_SIZE: usize = 2 * 1024 * 1024;
-const MAX_BLOCKING_THREADS: usize = 4;
+pub(crate) const WORKER_THREADS: usize = 2;
+pub(crate) const WORKER_STACK_SIZE: usize = 2 * 1024 * 1024;
+pub(crate) const MAX_BLOCKING_THREADS: usize = 4;
 // hammer-runtime/src/spawn.rs
-const WORKER_IDLE_SLICE: Duration = Duration::from_millis(1);
+pub(crate) const WORKER_IDLE_SLICE: Duration = Duration::from_millis(1);
 const BUFFER_SLOT_BYTES: usize = 2_048;
 const BUFFER_SLOTS_PER_NUMA: usize = 4_096;
 // hammer-core/src/data_plane/buffer.rs
@@ -42,98 +44,177 @@ const WORKER_CONTROL_QUEUE_CAPACITY: usize = 1_024;
 const APP_SESSION_FIFO_CAPACITY: usize = 64 * 1024;
 const APP_SESSION_EVENT_QUEUE_CAPACITY: usize = 16;
 
-#[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
-#[serde(deny_unknown_fields, default)]
-pub struct Worker {
-    /// Number of dataplane worker threads running the packet graph.
-    /// VPP `cpu { workers N }` alias: `workers`.
-    #[serde(alias = "workers")]
-    pub count: usize,
-    /// Worker thread stack size in bytes.
-    pub stack_size: usize,
-    /// Tokio blocking thread pool cap for the worker runtime.
-    pub max_blocking_threads: usize,
-    /// VPP-style poll interval: how long a worker parks when no packets are
-    /// pending. `idle_slice` is kept as the serialized field for existing
-    /// configs; `poll_interval` / `poll_sleep` (VPP `unix.poll-sleep-usec`)
-    /// are accepted as input aliases.
-    #[serde(
-        with = "humantime_serde",
-        alias = "poll_interval",
-        alias = "poll_sleep"
-    )]
-    pub idle_slice: Duration,
-    pub buffer: WorkerBuffer,
-    pub handoff: WorkerHandoff,
-    pub control: WorkerControl,
-    pub app_session: WorkerAppSession,
-    /// CPU pinning. Linux only; absent on macOS (XNU has no thread
-    /// affinity). The three cores are independent: `main_core` runs the
-    /// control thread, `app_core` runs the app session/ring runtime, and
-    /// `worker_cores` run the dataplane packet graph.
-    #[cfg(target_os = "linux")]
-    pub cpu: WorkerCpu,
-    /// Scheduling policy / QoS. Linux exposes policy+priority; macOS exposes
-    /// QoS class. The two shapes are mutually exclusive by target.
-    pub scheduler: WorkerScheduler,
-    /// NUMA-aware buffer allocation. Linux only.
-    #[cfg(target_os = "linux")]
-    pub numa: WorkerNuma,
+static COUNT: OnceLock<usize> = OnceLock::new();
+static STACK_SIZE: OnceLock<usize> = OnceLock::new();
+static MAX_BLOCKING: OnceLock<usize> = OnceLock::new();
+static IDLE_SLICE: OnceLock<Duration> = OnceLock::new();
+static BUFFER: OnceLock<WorkerBuffer> = OnceLock::new();
+static HANDOFF: OnceLock<WorkerHandoff> = OnceLock::new();
+static CONTROL: OnceLock<WorkerControl> = OnceLock::new();
+static APP_SESSION: OnceLock<WorkerAppSession> = OnceLock::new();
+static SCHEDULER: OnceLock<WorkerScheduler> = OnceLock::new();
+#[cfg(target_os = "linux")]
+static CPU: OnceLock<WorkerCpu> = OnceLock::new();
+#[cfg(target_os = "linux")]
+static NUMA: OnceLock<WorkerNuma> = OnceLock::new();
+
+fn take_value<T: DeserializeOwned>(
+    section: &mut toml::Table,
+    name: &'static str,
+    aliases: &[&'static str],
+) -> RuntimeResult<Option<T>> {
+    let mut value = section.remove(name);
+    for alias in aliases {
+        if let Some(alias_value) = section.remove(*alias) {
+            if value.is_some() {
+                return Err(RuntimeError::WorkerConfigurationFieldDuplicate { field: name, alias });
+            }
+            value = Some(alias_value);
+        }
+    }
+    value
+        .map(|value| value.try_into::<T>())
+        .transpose()
+        .map_err(|source| RuntimeError::WorkerConfigurationFieldParse {
+            field: name,
+            source,
+        })
 }
 
-impl Default for Worker {
-    fn default() -> Self {
-        Self {
-            count: WORKER_THREADS,
-            stack_size: WORKER_STACK_SIZE,
-            max_blocking_threads: MAX_BLOCKING_THREADS,
-            idle_slice: WORKER_IDLE_SLICE,
-            buffer: WorkerBuffer::default(),
-            handoff: WorkerHandoff::default(),
-            control: WorkerControl::default(),
-            app_session: WorkerAppSession::default(),
-            #[cfg(target_os = "linux")]
-            cpu: WorkerCpu::default(),
-            scheduler: WorkerScheduler::default(),
-            #[cfg(target_os = "linux")]
-            numa: WorkerNuma::default(),
-        }
+pub(crate) fn install(mut section: toml::Table) -> RuntimeResult<()> {
+    if COUNT.get().is_some() {
+        return Err(RuntimeError::WorkerConfigurationAlreadyInitialized);
     }
+
+    let count = take_value(&mut section, "count", &["workers"])?.unwrap_or(WORKER_THREADS);
+    let stack_size = take_value(&mut section, "stack_size", &[])?.unwrap_or(WORKER_STACK_SIZE);
+    let max_blocking_threads =
+        take_value(&mut section, "max_blocking_threads", &[])?.unwrap_or(MAX_BLOCKING_THREADS);
+    let idle_slice = take_value::<humantime_serde::Serde<Duration>>(
+        &mut section,
+        "idle_slice",
+        &["poll_interval", "poll_sleep"],
+    )?
+    .map(humantime_serde::Serde::into_inner)
+    .unwrap_or(WORKER_IDLE_SLICE);
+    let buffer: WorkerBuffer = take_value(&mut section, "buffer", &[])?.unwrap_or_default();
+    let handoff: WorkerHandoff = take_value(&mut section, "handoff", &[])?.unwrap_or_default();
+    let control: WorkerControl = take_value(&mut section, "control", &[])?.unwrap_or_default();
+    let app_session: WorkerAppSession =
+        take_value(&mut section, "app_session", &[])?.unwrap_or_default();
+    let scheduler: WorkerScheduler =
+        take_value(&mut section, "scheduler", &[])?.unwrap_or_default();
+    #[cfg(target_os = "linux")]
+    let cpu: WorkerCpu = take_value(&mut section, "cpu", &[])?.unwrap_or_default();
+    #[cfg(target_os = "linux")]
+    let numa: WorkerNuma = take_value(&mut section, "numa", &[])?.unwrap_or_default();
+
+    if let Some((name, _)) = section.iter().next() {
+        return Err(RuntimeError::WorkerConfigurationFieldUnknown {
+            field: name.clone(),
+        });
+    }
+    if count == 0 {
+        return Err(RuntimeError::WorkerCountZero);
+    }
+    if stack_size == 0 {
+        return Err(RuntimeError::WorkerStackSizeZero);
+    }
+    if max_blocking_threads == 0 {
+        return Err(RuntimeError::WorkerBlockingThreadCountZero);
+    }
+    buffer.validate()?;
+    handoff.validate()?;
+    control.validate()?;
+    app_session.validate()?;
+    scheduler.validate()?;
+    #[cfg(target_os = "linux")]
+    {
+        cpu.validate(count)?;
+        numa.validate()?;
+    }
+
+    assert!(COUNT.set(count).is_ok());
+    assert!(STACK_SIZE.set(stack_size).is_ok());
+    assert!(MAX_BLOCKING.set(max_blocking_threads).is_ok());
+    assert!(IDLE_SLICE.set(idle_slice).is_ok());
+    assert!(BUFFER.set(buffer).is_ok());
+    assert!(HANDOFF.set(handoff).is_ok());
+    assert!(CONTROL.set(control).is_ok());
+    assert!(APP_SESSION.set(app_session).is_ok());
+    assert!(SCHEDULER.set(scheduler).is_ok());
+    #[cfg(target_os = "linux")]
+    {
+        assert!(CPU.set(cpu).is_ok());
+        assert!(NUMA.set(numa).is_ok());
+    }
+    Ok(())
 }
 
-impl Worker {
-    pub fn is_default(&self) -> bool {
-        *self == Worker::default()
-    }
+pub fn worker_count() -> usize {
+    *COUNT
+        .get()
+        .expect("worker configuration is installed before lifecycle initialization")
+}
 
-    pub fn validate(&self) -> RuntimeResult<()> {
-        if self.count == 0 {
-            return Err(RuntimeError::config_validation(
-                "worker.count must be non-zero",
-            ));
-        }
-        if self.stack_size == 0 {
-            return Err(RuntimeError::config_validation(
-                "worker.stack_size must be non-zero",
-            ));
-        }
-        if self.max_blocking_threads == 0 {
-            return Err(RuntimeError::config_validation(
-                "worker.max_blocking_threads must be non-zero",
-            ));
-        }
-        self.buffer.validate()?;
-        self.handoff.validate()?;
-        self.control.validate()?;
-        self.app_session.validate()?;
-        #[cfg(target_os = "linux")]
-        {
-            self.cpu.validate(self.count)?;
-            self.numa.validate()?;
-        }
-        self.scheduler.validate()?;
-        Ok(())
-    }
+pub(crate) fn stack_size() -> usize {
+    *STACK_SIZE
+        .get()
+        .expect("worker configuration is installed before thread setup")
+}
+
+pub(crate) fn max_blocking_threads() -> usize {
+    *MAX_BLOCKING
+        .get()
+        .expect("worker configuration is installed before thread setup")
+}
+
+pub(crate) fn idle_slice() -> Duration {
+    *IDLE_SLICE
+        .get()
+        .expect("worker configuration is installed before thread setup")
+}
+
+pub(crate) fn buffer() -> &'static WorkerBuffer {
+    BUFFER
+        .get()
+        .expect("worker configuration is installed before Buffer setup")
+}
+
+pub(crate) fn handoff() -> &'static WorkerHandoff {
+    HANDOFF
+        .get()
+        .expect("worker configuration is installed before handoff setup")
+}
+
+pub(crate) fn control() -> &'static WorkerControl {
+    CONTROL
+        .get()
+        .expect("worker configuration is installed before worker control setup")
+}
+
+pub(crate) fn app_session() -> &'static WorkerAppSession {
+    APP_SESSION
+        .get()
+        .expect("worker configuration is installed before App Session setup")
+}
+
+pub(crate) fn scheduler() -> &'static WorkerScheduler {
+    SCHEDULER
+        .get()
+        .expect("worker configuration is installed before thread setup")
+}
+
+#[cfg(target_os = "linux")]
+pub(crate) fn cpu() -> &'static WorkerCpu {
+    CPU.get()
+        .expect("worker configuration is installed before CPU setup")
+}
+
+#[cfg(target_os = "linux")]
+pub(crate) fn numa() -> &'static WorkerNuma {
+    NUMA.get()
+        .expect("worker configuration is installed before NUMA setup")
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
@@ -165,7 +246,7 @@ impl Default for WorkerBuffer {
 }
 
 impl WorkerBuffer {
-    fn validate(&self) -> RuntimeResult<()> {
+    pub(crate) fn validate(&self) -> RuntimeResult<()> {
         if self.slot_bytes == 0 {
             return Err(RuntimeError::config_validation(
                 "worker.buffer.slot_bytes must be non-zero",
@@ -216,7 +297,7 @@ impl Default for WorkerControl {
 }
 
 impl WorkerControl {
-    fn validate(&self) -> RuntimeResult<()> {
+    pub(crate) fn validate(&self) -> RuntimeResult<()> {
         if self.queue_capacity == 0 {
             return Err(RuntimeError::config_validation(
                 "worker.control.queue_capacity must be non-zero",
@@ -235,7 +316,7 @@ impl Default for WorkerHandoff {
 }
 
 impl WorkerHandoff {
-    fn validate(&self) -> RuntimeResult<()> {
+    pub(crate) fn validate(&self) -> RuntimeResult<()> {
         if self.queue_capacity == 0 {
             return Err(RuntimeError::config_validation(
                 "worker.handoff.queue_capacity must be non-zero",
@@ -264,7 +345,7 @@ impl Default for WorkerAppSession {
 }
 
 impl WorkerAppSession {
-    fn validate(&self) -> RuntimeResult<()> {
+    pub(crate) fn validate(&self) -> RuntimeResult<()> {
         if self.fifo_capacity == 0 {
             return Err(RuntimeError::config_validation(
                 "worker.app_session.fifo_capacity must be non-zero",
@@ -310,7 +391,7 @@ impl Default for WorkerCpu {
 
 #[cfg(target_os = "linux")]
 impl WorkerCpu {
-    fn validate(&self, worker_count: usize) -> RuntimeResult<()> {
+    pub(crate) fn validate(&self, worker_count: usize) -> RuntimeResult<()> {
         let mut cores = std::collections::HashSet::new();
         for slot in self.main_core.into_iter().chain(self.app_core) {
             if !cores.insert(slot) {
@@ -367,7 +448,7 @@ impl Default for WorkerScheduler {
 }
 
 impl WorkerScheduler {
-    fn validate(&self) -> RuntimeResult<()> {
+    pub(crate) fn validate(&self) -> RuntimeResult<()> {
         #[cfg(target_os = "linux")]
         {
             use SchedulerPolicy::*;
@@ -439,7 +520,7 @@ impl Default for WorkerNuma {
 
 #[cfg(target_os = "linux")]
 impl WorkerNuma {
-    fn validate(&self) -> RuntimeResult<()> {
+    pub(crate) fn validate(&self) -> RuntimeResult<()> {
         Ok(())
     }
 }

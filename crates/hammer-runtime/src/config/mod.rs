@@ -15,4 +15,4 @@ pub use trace::{Trace, TraceInput};
 pub use worker::QosClass;
 #[cfg(target_os = "linux")]
 pub use worker::{SchedulerPolicy, WorkerCpu, WorkerNuma};
-pub use worker::{Worker, WorkerScheduler};
+pub use worker::{WorkerAppSession, WorkerBuffer, WorkerControl, WorkerHandoff, WorkerScheduler};

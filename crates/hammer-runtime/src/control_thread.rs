@@ -1,10 +1,8 @@
 use std::future::Future;
 use std::panic::{AssertUnwindSafe, catch_unwind};
-use std::sync::Arc;
 use std::thread::{self, ThreadId};
 use std::time::Instant;
 
-use crate::RuntimeRegistry;
 use crate::error::{RuntimeError, RuntimeResult};
 use crate::log::Level;
 use crate::process::{ProcessContext, ProcessEntry, ProcessFuture, ProcessHandle};
@@ -64,42 +62,51 @@ impl ControlThread {
             .ok_or(RuntimeError::ProcessControlWrongThread)
     }
 
-    pub(crate) fn start_processes(
-        &mut self,
-        registry: Arc<RuntimeRegistry>,
-        entries: Vec<ProcessEntry>,
-    ) -> RuntimeResult<()> {
+    pub fn start_processes(&mut self, plugins: &crate::PluginMain) -> RuntimeResult<()> {
         self.ensure_owner()?;
-        let mut names = Vec::with_capacity(entries.len());
-        for entry in &entries {
-            if names.contains(&entry.name) {
-                return Err(RuntimeError::DuplicateProcessNode { name: entry.name });
+        let mut names = Vec::new();
+        let mut validation = Ok(());
+        plugins.visit_images(|image| {
+            if validation.is_err() {
+                return;
             }
-            names.push(entry.name);
-        }
-        let mut prepared: Vec<(ProcessEntry, _, ProcessFuture)> = Vec::with_capacity(entries.len());
-        for entry in entries {
-            if self
-                .running
-                .iter()
-                .any(|running| running.handle.name() == entry.name)
-            {
-                continue;
+            for entry in image.process_nodes() {
+                if names.contains(&entry.name) {
+                    validation = Err(RuntimeError::DuplicateProcessNode { name: entry.name });
+                    return;
+                }
+                names.push(entry.name);
             }
-            let (events, receiver) = tokio::sync::mpsc::unbounded_channel();
-            let context = ProcessContext::new(entry.name, Arc::clone(&registry), receiver);
-            let future = match catch_unwind(AssertUnwindSafe(|| (entry.start)(context))) {
-                Ok(future) => future,
-                Err(payload) => std::panic::resume_unwind(payload),
-            };
-            prepared.push((entry, events, future));
-        }
+        });
+        validation?;
+        let mut prepared: Vec<(&'static ProcessEntry, _, ProcessFuture)> =
+            Vec::with_capacity(names.len());
+        plugins.visit_images(|image| {
+            for entry in image.process_nodes() {
+                if self
+                    .running
+                    .iter()
+                    .any(|running| running.handle.name() == entry.name)
+                {
+                    continue;
+                }
+                let (events, receiver) = tokio::sync::mpsc::unbounded_channel();
+                let context = ProcessContext::new(entry.name, receiver);
+                let future = match catch_unwind(AssertUnwindSafe(|| (entry.start)(context))) {
+                    Ok(future) => future,
+                    Err(payload) => std::panic::resume_unwind(payload),
+                };
+                prepared.push((entry, events, future));
+            }
+        });
         for (entry, events, future) in prepared {
+            let handle = ProcessHandle::new(entry.name, events);
+            assert!(
+                entry.handle.set(handle.clone()).is_ok(),
+                "Process Node starts once"
+            );
             let task = self.local.spawn_local(future);
-            self.running.push(RunningProcess {
-                handle: ProcessHandle::new(entry.name, events),
-                task,
-            });
+            self.running.push(RunningProcess { handle, task });
         }
         self.started = true;
         Ok(())
@@ -112,17 +119,14 @@ impl ControlThread {
             .map(|running| running.handle.clone())
     }
 
-    pub(crate) fn run_processes_until<'a, F>(
-        &'a self,
-        future: F,
-    ) -> impl Future<Output = F::Output> + 'a
+    pub fn run_processes_until<'a, F>(&'a self, future: F) -> impl Future<Output = F::Output> + 'a
     where
         F: Future + 'a,
     {
         self.local.run_until(future)
     }
 
-    pub(crate) fn shutdown_processes(&mut self) -> RuntimeResult<()> {
+    pub fn shutdown_processes(&mut self) -> RuntimeResult<()> {
         self.ensure_owner()?;
         let mut running = core::mem::take(&mut self.running);
         for process in &running {

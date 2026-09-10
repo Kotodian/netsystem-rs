@@ -1,6 +1,5 @@
-use crate::config::{Memory, Worker};
+use crate::config::Memory;
 use crate::error::RuntimeResult;
-use crate::global_main::GlobalMain;
 use hammer_component_macros::config_function;
 
 impl Memory {
@@ -15,6 +14,6 @@ impl Memory {
 }
 
 #[config_function(name = "runtime_worker_config", section = "worker", early = true)]
-fn configure_worker(worker: Worker, engine: &mut GlobalMain) -> RuntimeResult<()> {
-    engine.apply_worker_config(worker)
+fn configure_worker(section: toml::Table) -> RuntimeResult<()> {
+    crate::config::worker::install(section)
 }
