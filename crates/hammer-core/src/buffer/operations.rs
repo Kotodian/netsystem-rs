@@ -290,7 +290,8 @@ pub(super) mod tests {
     // assertions below are derived from buffer.c and buffer_funcs.h themselves.
     pub(in crate::buffer) fn allocation_chains_and_reference_release() {
         let main = BufferMain::global();
-        let mut caches = main.borrow_worker_caches(1);
+        // SAFETY: this test is the only executor for runtime thread index 1.
+        let mut caches = unsafe { main.borrow_worker_caches(1) };
         let mut heads = [0; 2];
         assert_eq!(main.alloc_from_pool(&mut caches, &mut heads, 0), 2);
         let mut tail = [0];

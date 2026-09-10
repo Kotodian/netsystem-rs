@@ -1,19 +1,19 @@
 use super::*;
-use hammer_infra::thread_owned::ThreadOwnedError;
-
 impl BufferMain {
     /// Exclusively borrow the existing Pool-owned caches on their Worker thread.
-    /// `ThreadOwned` verifies the current OS thread while each operation keeps
-    /// the selected Pool caches mutably borrowed.
-    pub fn borrow_worker_caches(&self, thread_index: u32) -> Box<[RefMut<'_, BufferThreadCache>]> {
+    /// Each operation keeps the selected Pool caches mutably borrowed.
+    ///
+    /// # Safety
+    ///
+    /// The caller must be the unique runtime execution thread for
+    /// `thread_index` for the full lifetime of every returned borrow.
+    pub unsafe fn borrow_worker_caches(
+        &self,
+        thread_index: u32,
+    ) -> Box<[RefMut<'_, BufferThreadCache>]> {
         self.pools
             .iter()
-            .map(|pool| {
-                pool.bind_worker(thread_index);
-                pool.workers[thread_index as usize]
-                    .borrow_mut()
-                    .expect("one runtime borrows this Worker's Buffer cache")
-            })
+            .map(|pool| pool.workers[thread_index as usize].borrow_mut())
             .collect()
     }
 
@@ -26,7 +26,10 @@ impl BufferMain {
     #[doc(hidden)]
     #[inline]
     pub unsafe fn buffer_for_worker<'a>(&'a self, thread_index: u32, index: u32) -> &'a Buffer {
-        self.pool(index).bind_worker(thread_index);
+        self.pool(index)
+            .workers
+            .get(thread_index as usize)
+            .expect("configured Buffer Worker index");
         // SAFETY: upheld by the caller's live readable Buffer ownership.
         unsafe { self.buffer_unchecked(index) }
     }
@@ -44,7 +47,10 @@ impl BufferMain {
         thread_index: u32,
         index: u32,
     ) -> &'a mut Buffer {
-        self.pool(index).bind_worker(thread_index);
+        self.pool(index)
+            .workers
+            .get(thread_index as usize)
+            .expect("configured Buffer Worker index");
         // SAFETY: upheld by the caller's exclusive Buffer ownership; the
         // private boundary also rejects shared clone tails.
         unsafe { self.buffer_mut_unchecked(index) }
@@ -191,27 +197,6 @@ impl BufferMain {
 }
 
 impl BufferPool {
-    fn bind_worker(&self, thread_index: u32) {
-        let worker = self
-            .workers
-            .get(thread_index as usize)
-            .expect("configured Buffer Worker index");
-        match worker.borrow_mut() {
-            Ok(_) => {}
-            Err(ThreadOwnedError::NotInstalled) => {
-                worker
-                    .install(BufferThreadCache {
-                        pool_index: self.index,
-                        thread_index,
-                        indices: [0; BUFFER_THREAD_CACHE_HIGH_WATER],
-                        len: 0,
-                    })
-                    .expect("bind Buffer cache once on its Worker");
-            }
-            Err(error) => panic!("Buffer cache {thread_index} owner violation: {error}"),
-        }
-    }
-
     fn slot(&self, index: u32) -> usize {
         assert_ne!(index, 0, "Buffer Index zero is invalid");
         let address = BufferMain::global().buffer_mem_start + ((index as usize) << 6);

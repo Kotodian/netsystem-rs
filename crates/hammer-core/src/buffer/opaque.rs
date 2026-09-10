@@ -161,7 +161,8 @@ pub(super) mod tests {
     pub(in crate::buffer) fn metadata_copy_and_pool_recycle_preserve_secondary_storage(
         buffers: &BufferMain,
     ) -> DataPlaneResult<()> {
-        let mut caches = buffers.borrow_worker_caches(1);
+        // SAFETY: this test is the only executor for runtime thread index 1.
+        let mut caches = unsafe { buffers.borrow_worker_caches(1) };
         let mut index = 0;
         assert_eq!(
             buffers.alloc_from_pool(&mut caches, core::slice::from_mut(&mut index), 0),

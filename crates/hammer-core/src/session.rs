@@ -49,6 +49,7 @@ pub struct SessionEvt {
     pub postponed: bool,
     pub session_index: u32,
     pub thread_index: u32,
+    pub control_data: u64,
 }
 
 impl SessionEvt {
@@ -59,6 +60,7 @@ impl SessionEvt {
             postponed: false,
             session_index,
             thread_index: 0,
+            control_data: 0,
         }
     }
 
@@ -69,6 +71,7 @@ impl SessionEvt {
             postponed: false,
             session_index: handle.session_index,
             thread_index: handle.thread_index,
+            control_data: 0,
         }
     }
 }

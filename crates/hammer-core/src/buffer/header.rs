@@ -406,7 +406,8 @@ mod tests {
         hammer_infra::main_heap::init_default().unwrap();
         BufferMain::new(2048, 16, &[0, 1], 1, PageSize::Default)?;
         let buffers = BufferMain::global();
-        let mut caches = buffers.borrow_worker_caches(1);
+        // SAFETY: this test is the only executor for runtime thread index 1.
+        let mut caches = unsafe { buffers.borrow_worker_caches(1) };
         let mut index = u32::MAX;
         assert_eq!(
             buffers.add_data(&mut caches, 0, &mut index, &[1, 2, 3, 4]),
@@ -415,7 +416,8 @@ mod tests {
         let packet = buffers.buffer(&caches, index);
         assert!(
             std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                buffers.borrow_worker_caches(1);
+                // SAFETY: this test is the only executor for runtime thread index 1.
+                unsafe { buffers.borrow_worker_caches(1) };
             }))
             .is_err()
         );

@@ -1,6 +1,7 @@
+use std::cell::RefCell;
 use std::sync::OnceLock;
 
-use hammer_infra::{PageSize, physmem::PhysmemMap, thread_owned::ThreadOwned};
+use hammer_infra::{PageSize, physmem::PhysmemMap};
 use spinning_top::Spinlock;
 
 use super::{BUFFER_CACHE_LINE_SIZE, BUFFER_THREAD_CACHE_HIGH_WATER, Buffer};
@@ -23,6 +24,11 @@ pub struct BufferMain {
     pub(super) default_pool_by_numa: [u8; MAX_NUMA_NODES],
 }
 
+// SAFETY: each Buffer Pool cache slot is permanently assigned to one runtime
+// thread. Callers borrow only the slot selected by the executing thread index;
+// shared Pool state uses its own synchronization.
+unsafe impl Sync for BufferMain {}
+
 pub(super) struct BufferPool {
     pub(super) mapping: PhysmemMap,
     pub(super) index: u8,
@@ -34,7 +40,7 @@ pub(super) struct BufferPool {
     // VPP buffer_known_hash equivalent: diagnostics only, never ownership.
     #[cfg(debug_assertions)]
     pub(super) known_allocated: Spinlock<std::collections::HashSet<u32>>,
-    pub(super) workers: Box<[ThreadOwned<BufferThreadCache>]>,
+    pub(super) workers: Box<[RefCell<BufferThreadCache>]>,
     pub(super) template: super::header::BufferTemplate,
 }
 
@@ -196,7 +202,16 @@ impl BufferMain {
                 known_allocated: Spinlock::new(std::collections::HashSet::with_capacity(
                     buffer_count,
                 )),
-                workers: (0..thread_count).map(|_| ThreadOwned::new()).collect(),
+                workers: (0..thread_count)
+                    .map(|thread_index| {
+                        RefCell::new(BufferThreadCache {
+                            pool_index: index,
+                            thread_index: thread_index as u32,
+                            indices: [0; BUFFER_THREAD_CACHE_HIGH_WATER],
+                            len: 0,
+                        })
+                    })
+                    .collect(),
                 template,
             });
         }

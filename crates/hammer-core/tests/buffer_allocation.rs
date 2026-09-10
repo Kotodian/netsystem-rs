@@ -21,7 +21,8 @@ fn independent_segment_survives_original_chain_release() -> DataPlaneResult<()> 
     hammer_infra::main_heap::init_default().unwrap();
     BufferMain::new(16, 3, &[0], 1, hammer_infra::PageSize::Default)?;
     let buffers = BufferMain::global();
-    let mut caches = buffers.borrow_worker_caches(1);
+    // SAFETY: this test is the only executor for runtime thread index 1.
+    let mut caches = unsafe { buffers.borrow_worker_caches(1) };
     let mut source = u32::MAX;
     assert_eq!(
         buffers.add_data(&mut caches, 0, &mut source, &[0x31; 32]),
