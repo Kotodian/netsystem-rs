@@ -1,5 +1,4 @@
 use super::*;
-use hammer_core::buffer::BufferMain;
 
 /// Runtime Buffer Pool selection and local Frame policy.
 ///
@@ -28,90 +27,5 @@ impl Default for DataPlaneBufferConfig {
             active_numa_node: 0,
             page_size: PageSize::Default,
         }
-    }
-}
-
-impl Worker {
-    pub fn create_runtime(&self) -> RuntimeResult<DataPlaneMain> {
-        let buffer = &self.buffer;
-        let numa_nodes = self.buffer_numa_nodes()?;
-        let create_main = |page_size| {
-            BufferMain::new(
-                buffer.slot_bytes,
-                buffer.slots_per_numa,
-                &numa_nodes,
-                self.count,
-                page_size,
-            )
-        };
-
-        let page_size = match buffer.page_size {
-            Some(page_size) => {
-                create_main(page_size)?;
-                page_size
-            }
-            None => {
-                #[cfg(target_os = "linux")]
-                {
-                    match create_main(PageSize::DefaultHuge) {
-                        Ok(_) => PageSize::DefaultHuge,
-                        Err(source) => {
-                            tracing::warn!(%source, "default HugeTLB Buffer Pool unavailable; using ordinary pages");
-                            create_main(PageSize::Default)?;
-                            PageSize::Default
-                        }
-                    }
-                }
-                #[cfg(not(target_os = "linux"))]
-                {
-                    create_main(PageSize::Default)?;
-                    PageSize::Default
-                }
-            }
-        };
-        let config = DataPlaneBufferConfig {
-            buffer_slot_capacity: buffer.slot_bytes,
-            buffer_slots: buffer.slots_per_numa,
-            frame_slots: buffer.frame_pool_size,
-            active_numa_node: numa_nodes[0],
-            page_size,
-            ..DataPlaneBufferConfig::default()
-        };
-        DataPlaneMain::from_config(config, native_simd_bytes())
-    }
-
-    fn buffer_numa_nodes(&self) -> RuntimeResult<Vec<u32>> {
-        #[cfg(target_os = "linux")]
-        {
-            if self.numa.enabled {
-                return self.buffer_numa_nodes_with(crate::numa::node_for_cpu);
-            }
-        }
-        Ok(vec![0])
-    }
-
-    #[cfg(target_os = "linux")]
-    fn buffer_numa_nodes_with(
-        &self,
-        mut node_for_cpu: impl FnMut(usize) -> RuntimeResult<u32>,
-    ) -> RuntimeResult<Vec<u32>> {
-        let mut nodes = Vec::with_capacity(self.count);
-        for worker in 0..self.count {
-            let core = crate::worker_thread::worker_core(worker, &self.cpu).ok_or_else(|| {
-                RuntimeError::config_validation(format!(
-                    "worker {worker} has no available CPU core"
-                ))
-            })?;
-            let node = node_for_cpu(core)?;
-            if node >= 32 {
-                return Err(RuntimeError::config_validation(format!(
-                    "worker CPU {core} resolves to unsupported NUMA node {node}"
-                )));
-            }
-            nodes.push(node);
-        }
-        nodes.sort_unstable();
-        nodes.dedup();
-        Ok(nodes)
     }
 }

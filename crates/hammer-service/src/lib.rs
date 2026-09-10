@@ -12,8 +12,7 @@ hammer_runtime::__declare_registration_image!(
         session::__INIT_FN_SESSION_ATTACH_SERVER,
         transport::__INIT_FN_TRANSPORT_MAIN_INIT,
     ];
-    config_functions = [];
-    early_config_functions = [
+    config_functions = [
         binary_api::__CONFIG_FN_BINARY_API_CONFIG,
         session::__CONFIG_FN_SESSION_CONFIG,
     ];
@@ -22,6 +21,8 @@ hammer_runtime::__declare_registration_image!(
     worker_init_functions = [
         session::__INIT_FN_SESSION_WORKER_INIT,
     ];
+    num_workers_change_functions = [];
+    api_init_functions = [];
     graph_nodes = [
         data_plane::__SERVICE_GRAPH_NODE_DROP_NODE,
         data_plane::__SERVICE_GRAPH_NODE_PUNT_NODE,

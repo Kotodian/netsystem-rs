@@ -14,10 +14,9 @@ use std::process::Command;
 use std::sync::Arc;
 
 use hammer_core::data_plane::NodeId;
-use hammer_runtime::RuntimeRegistry;
-use hammer_runtime::config::{Memory, Worker};
+use hammer_runtime::config::Memory;
 use hammer_runtime::global_main::GlobalMain;
-use hammer_runtime::{PluginError, RuntimeError};
+use hammer_runtime::{DataPlaneMain, PluginError, PluginMain, RuntimeError, ThreadMain};
 
 // Shared device/interface/transport/session registrations remain host-owned.
 use hammer_service as _;
@@ -34,6 +33,9 @@ count = 1
 [worker.buffer]
 slots_per_numa = 256
 frame_pool_size = 32
+
+[stats]
+socket_path = "/tmp/hammer-plugin-additive-load.stats"
 "#;
 const PLUGIN_NAMES: [&str; 3] = ["ip", "tcp", "udp"];
 
@@ -41,7 +43,6 @@ const PLUGIN_NAMES: [&str; 3] = ["ip", "tcp", "udp"];
 #[serde(default)]
 struct ExampleEarlyConfig {
     memory: Memory,
-    worker: Worker,
 }
 
 #[derive(Debug, Default, serde::Deserialize)]
@@ -97,8 +98,6 @@ enum ExampleError {
         before: NodeId,
         after: Option<NodeId>,
     },
-    #[error("loading plugins did not start the ip-reassembly-expire-walk Process Node")]
-    IpProcessNodeMissing,
     #[error("loading a missing plugin unexpectedly succeeded")]
     MissingPluginLoadSucceeded,
     #[error("loading a missing plugin returned the wrong typed error")]
@@ -108,8 +107,6 @@ enum ExampleError {
     },
     #[error("a failed plugin transaction changed the active plugin set")]
     FailedTransactionChangedPluginSet,
-    #[error("a failed plugin transaction changed the existing drop NodeId")]
-    FailedTransactionChangedDropNode,
 }
 
 fn main() -> Result<(), ExampleError> {
@@ -121,53 +118,41 @@ fn main() -> Result<(), ExampleError> {
         .plugins;
     exercise_post_ready_allocations(&roots)?;
 
-    let mut engine = GlobalMain::new_configured(RuntimeRegistry::new(), early.worker)?;
-    engine.init_control()?;
-    engine
-        .plugin_main_mut()
-        .register_builtin_image(hammer_service::registration_image());
-    engine.install_current();
-
-    let example_result = run_example(&mut engine, main_heap_capacity, &roots, EXAMPLE_CONFIG);
-    let process_shutdown = engine.shutdown_process_nodes();
-    let close_result = engine.close();
-    GlobalMain::uninstall_current();
-
-    example_result?;
-    process_shutdown?;
-    close_result?;
-    Ok(())
+    let mut global = GlobalMain::new(
+        "plugin-additive-load".to_owned(),
+        std::env::args().next().unwrap_or_default(),
+        std::env::args().collect(),
+        EXAMPLE_CONFIG.to_owned(),
+    );
+    let mut plugins = PluginMain::default();
+    plugins.register_image(hammer_service::registration_image());
+    let plugin_path = plugins.directory().map_err(RuntimeError::from)?;
+    plugins
+        .load(env!("CARGO_PKG_VERSION"), &roots)
+        .map_err(RuntimeError::from)?;
+    verify_plugin_transactions(&mut plugins, &roots)?;
+    plugins.register_global_declarations(&mut global);
+    hammer_runtime::init::run_config_functions(&global, None, true, EXAMPLE_CONFIG)?;
+    let mut threads = ThreadMain::new()?;
+    threads.configure()?;
+    let mut main = DataPlaneMain::new_main(&threads)?;
+    hammer_runtime::main_loop::run(global, threads, plugins, &mut main, async {
+        Ok::<(), RuntimeError>(())
+    })?;
+    let plugins = PluginMain::global().map_err(RuntimeError::from)?;
+    run_example(plugins, &main, main_heap_capacity, &plugin_path)
 }
 
 fn run_example(
-    engine: &mut GlobalMain,
+    plugins: &PluginMain,
+    main: &DataPlaneMain,
     main_heap_capacity: usize,
-    roots: &[String],
-    config_document: &str,
+    plugin_path: &Path,
 ) -> Result<(), ExampleError> {
-    engine.configure_early(config_document)?;
-    let plugin_path = engine
-        .plugin_main()
-        .directory()
-        .map_err(RuntimeError::from)?;
-
-    // Materialize host registrations with no startup plugin roots, then start
-    // one live Data Worker and the main-thread Process Node runtime.
-    engine.load_plugins(&[], config_document)?;
-    hammer_runtime::init::run_main_loop_enter(engine)?;
-    engine.start_process_nodes()?;
-
-    if !engine.loaded_plugins().is_empty() {
-        return Err(ExampleError::StartupPluginSetNotEmpty);
-    }
-    let drop_before = engine
-        .data_plane_main()
+    let drop_before = main
         .node_by_name("drop")
         .ok_or(ExampleError::HostDropNodeMissing)?;
-    // This call performs real dlopen, incremental lifecycle/config dispatch,
-    // append-only main graph extension, worker graph publication, and worker-init.
-    engine.load_plugins(roots, config_document)?;
-    let loaded_plugins = engine.loaded_plugins();
+    let loaded_plugins = plugins.loaded_plugins();
     if loaded_plugins.as_slice() != PLUGIN_NAMES {
         return Err(ExampleError::PluginSetMismatch {
             expected: PLUGIN_NAMES.to_vec(),
@@ -175,43 +160,46 @@ fn run_example(
         });
     }
     for name in ["ip4-input", "ip6-input", "tcp-input", "udp-input"] {
-        if engine.data_plane_main().node_by_name(name).is_none() {
+        if main.node_by_name(name).is_none() {
             return Err(ExampleError::PluginNodeMissing { name });
         }
     }
-    let drop_after_load = engine.data_plane_main().node_by_name("drop");
+    let drop_after_load = main.node_by_name("drop");
     if drop_after_load != Some(drop_before) {
         return Err(ExampleError::DropNodeChanged {
             before: drop_before,
             after: drop_after_load,
         });
     }
-    if engine.process_handle("ip-reassembly-expire-walk").is_none() {
-        return Err(ExampleError::IpProcessNodeMissing);
-    }
-
-    // Repeated load is a no-op, while a failed new closure leaves the active
-    // set and existing NodeIds unchanged.
-    verify_shared_allocator_images(&plugin_path)?;
-
-    engine.load_plugins(roots, config_document)?;
-    let missing_roots = ["missing".into()];
-    match engine.load_plugins(&missing_roots, config_document) {
-        Err(RuntimeError::Plugin(PluginError::ManifestRead { .. })) => {}
-        Err(source) => return Err(ExampleError::UnexpectedMissingPluginError { source }),
-        Ok(()) => return Err(ExampleError::MissingPluginLoadSucceeded),
-    }
-    if engine.loaded_plugins().as_slice() != PLUGIN_NAMES {
-        return Err(ExampleError::FailedTransactionChangedPluginSet);
-    }
-    if engine.data_plane_main().node_by_name("drop") != Some(drop_before) {
-        return Err(ExampleError::FailedTransactionChangedDropNode);
-    }
+    verify_shared_allocator_images(plugin_path)?;
 
     println!("fixed main heap: {main_heap_capacity} bytes");
     println!("loaded plugins: ip, tcp, udp");
     println!("host and plugin images share libhammer_infra allocator authority");
     println!("main graph and live worker update completed");
+    Ok(())
+}
+
+fn verify_plugin_transactions(
+    plugins: &mut PluginMain,
+    roots: &[String],
+) -> Result<(), ExampleError> {
+    plugins
+        .load(env!("CARGO_PKG_VERSION"), roots)
+        .map_err(RuntimeError::from)?;
+    let missing_roots = ["missing".into()];
+    match plugins.load(env!("CARGO_PKG_VERSION"), &missing_roots) {
+        Err(PluginError::ManifestRead { .. }) => {}
+        Err(source) => {
+            return Err(ExampleError::UnexpectedMissingPluginError {
+                source: RuntimeError::from(source),
+            });
+        }
+        Ok(()) => return Err(ExampleError::MissingPluginLoadSucceeded),
+    }
+    if plugins.loaded_plugins().as_slice() != PLUGIN_NAMES {
+        return Err(ExampleError::FailedTransactionChangedPluginSet);
+    }
     Ok(())
 }
 

@@ -259,7 +259,7 @@ fn interface_output_process(
 mod tests {
     use super::*;
     use crate::net::{DpoError, DpoId, DpoProto, DpoType};
-    use hammer_runtime::{DataPlaneBufferConfig, GlobalMain, RuntimeRegistry};
+    use hammer_runtime::DataPlaneBufferConfig;
     use std::sync::Arc;
 
     #[test]
@@ -275,15 +275,11 @@ mod tests {
             )
             .unwrap();
         });
-        let mut main = GlobalMain::new(
-            DataPlaneMain::new(DataPlaneBufferConfig::default()),
-            RuntimeRegistry::new(),
-        );
-        main.install_current();
+        hammer_runtime::ThreadMain::new().unwrap();
+        let mut runtime = DataPlaneMain::new(DataPlaneBufferConfig::default());
         let net = NetMain::init(Arc::new(InterfaceMain::new()))?;
-        let runtime = main.data_plane_main_mut();
-        let child = crate::data_plane::register_drop(runtime)?;
-        let output = register_interface_output_graph(runtime)?;
+        let child = crate::data_plane::register_drop(&mut runtime)?;
+        let output = register_interface_output_graph(&mut runtime)?;
         let interfaces = net.interface_main();
         let hardware = interfaces.register_hardware_interface(0, 1, 0, 0).unwrap();
         let software = interfaces.hardware_interface(hardware).unwrap().sw_if_index;
@@ -298,7 +294,9 @@ mod tests {
             let dpo = net
                 .dpo_main()
                 .identity(DpoType::INTERFACE_TX, DpoProto::IP4, software)?;
-            let stacked = net.dpo_main_mut().stack_from_node(runtime, child, dpo)?;
+            let stacked = net
+                .dpo_main_mut()
+                .stack_from_node(&mut runtime, child, dpo)?;
             assert_eq!(stacked.index(), software);
             assert_eq!(
                 Some(stacked.next()),
@@ -310,14 +308,12 @@ mod tests {
         interfaces.delete_hardware_interface(hardware).unwrap();
         assert!(matches!(
             net.dpo_main_mut().stack_from_node(
-                runtime,
+                &mut runtime,
                 child,
                 DpoId::interface_tx(DpoProto::IP4, software)
             ),
             Err(DpoError::NodeMissing { .. })
         ));
-        main.close()?;
-        GlobalMain::uninstall_current();
         Ok(())
     }
 }

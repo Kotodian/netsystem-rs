@@ -3,6 +3,7 @@ pub enum NodeKind {
     Driver,
     PreInput,
     Internal,
+    Process,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]

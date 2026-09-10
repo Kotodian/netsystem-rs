@@ -1,17 +1,98 @@
 # Hammer Runtime
 
-Hammer's runtime separates process-wide authority from the control scheduler
-that owns the main operating-system thread and keeps packet execution on Data
-Workers.
+Hammer's runtime separates process-wide authorities, operating-system thread
+descriptions, and per-thread execution state. GlobalMain and ThreadMain are
+distinct process-wide authorities; Data Workers own packet graph execution,
+and the main thread drives control processes.
 
 ## Runtime Language
 
 **GlobalMain**:
-The process-wide runtime authority corresponding to VPP's
-`vlib_global_main_t`. It owns worker lifecycle, graph publication and refork,
-registrations, plugin lifetime, and process-wide lifecycle state; it does not
-own Worker Barrier synchronization or execute packet graph work.
-_Avoid_: MainThread, DataPlaneMain, engine
+The process-wide authority corresponding to VPP's `vlib_global_main_t`, owning
+process metadata, global registrations, and their global call progress. Its
+seven hook registration lists belong directly to GlobalMain; thread
+administration, per-thread main ownership, graph-refork coordination, and
+plugin image lifetime have separate owners.
+_Avoid_: MainThread, ThreadMain, DataPlaneMain, engine
+
+**UnixMain**:
+The process host-runtime authority corresponding to VPP's `unix_main_t` and
+`vlib_unix_main`, owning Unix startup, host process lifecycle, and Unix-facing
+control concerns independently from GlobalMain's graph and registration state.
+_Avoid_: GlobalMain, DataPlaneMain, ControlThread
+
+**ThreadMain**:
+The process-wide thread administration authority corresponding to VPP's
+`vlib_thread_main_t`, responsible for thread registrations, configured thread
+counts, and CPU, NUMA, and scheduling policy. It is distinct from a thread's
+execution state and from GlobalMain's seven hook registration lists.
+Its available CPU and NUMA-node sets use the existing
+`hammer_infra::bitmap::Bitmap`; configured placement does not replace them.
+_Avoid_: GlobalMain, WorkerThread, ControlThread, runtime registry
+
+**WorkerThread**:
+The description of one runtime operating-system thread, corresponding to
+VPP's `vlib_worker_thread_t`, including its identity, placement, launch facts,
+and role in worker synchronization. The main thread also has a thread-zero
+description; thread identity is distinct from DataPlaneMain execution state.
+_Avoid_: ThreadMain, DataPlaneMain, worker configuration
+
+**DataPlaneMain**:
+The execution state owned by one runtime thread, corresponding to VPP's
+`vlib_main_t`, including its graph, trace, random stream, main-loop facts, and
+worker-init progress. A single `FileMode` enum selects file scheduling: index
+zero owns the existing `AsyncFileMain` through `Async`, and workers select
+`Sync` against the existing global FileMain. Subsequent Data Worker mains
+belong to their workers for the process lifetime.
+_Avoid_: GlobalMain, ThreadMain, WorkerThread, shared control registry
+
+**PluginMain**:
+The independent process authority for plugin images, plugin metadata, load
+order, and the lifetime of loaded plugin code. It supplies direct references
+to image declarations to their registration owners without becoming a second
+owner of those inventories or their dispatch progress.
+_Avoid_: GlobalMain plugin field, plugin registry, generic module manager
+
+**Thread Registration**:
+A declaration of a runtime OS-thread role administered by ThreadMain,
+including its entry function, configured count, placement policy, and whether
+the thread receives a DataPlaneMain clone. It is distinct from a lifecycle hook
+executed against an existing DataPlaneMain.
+_Avoid_: worker-init hook, GlobalMain hook list, WorkerThread instance
+
+**Auxiliary Thread**:
+A registered runtime OS thread whose role does not receive a DataPlaneMain
+clone. It remains a WorkerThread description administered by ThreadMain, but it
+does not enter the Data Worker graph execution path.
+_Avoid_: Data Worker, worker-init target, cloned main
+
+**Runtime Registration Inventory**:
+GlobalMain's seven distinct hook registration lists: init, main-loop-enter,
+main-loop-exit, worker-init, worker-count-change, API-init, and config, with
+early config belonging to the config list. GlobalMain owns global call
+progress, each DataPlaneMain owns its worker-init progress, and ThreadMain's
+thread registrations describe threads rather than lifecycle hooks.
+The proposed Rust progress storage reuses `Bitmap` with stable callback
+indices. Assigning those indices while preserving callback identity across
+lists and plugin images is registration work still to verify; an erased raw
+pointer, callback name, or temporary sorting position is not that contract.
+_Avoid_: one universal registration list, per-category called set, plugin-owned
+dispatch state
+
+**Registration Image**:
+An image-boundary carrier exported by a process image. It carries references
+to declarations across the image boundary so the
+corresponding owner can install them into the process-global inventories. It is
+not a second registration owner and does not own dispatch progress.
+_Avoid_: copied registration Vec, plugin-local registration owner, universal
+registration carrier
+
+**Graph Refork Request**:
+The worker-thread-owned fact that a published graph change requires each Data
+Worker to rebuild its worker-local graph state. Worker barrier state, worker
+thread coordination, the request, and refork completion accounting belong to
+the worker-thread authority.
+_Avoid_: GlobalMain-owned barrier, worker completion counter, graph worker state
 
 **Worker Barrier**:
 A main-thread synchronization interval that pauses every Data Worker while
@@ -24,22 +105,16 @@ Rebuilding each Data Worker's node/runtime clone from the published main graph
 while retaining that worker's existing runtime state.
 _Avoid_: graph replacement, worker reinitialization
 
-**ControlThread**:
-The scheduler running on the main operating-system thread. It uses a
-single-thread Tokio runtime to dispatch Process Nodes, process restores, timer
-expirations, main-thread RPCs, control I/O readiness, and lifecycle decisions;
-it does not execute Data Worker packet graph work.
-_Avoid_: GlobalMain, Data Worker, control loop
-
 **Process Restore**:
 A main-thread scheduling record that says why a suspended Process Node may be
 resumed, such as an event, clock expiration, timed event, or yield. It is
-consumed by `ControlThread` and is distinct from a Data Worker graph frame.
+consumed by thread-zero DataPlaneMain/NodeMain scheduling and is distinct from
+a Data Worker graph frame.
 _Avoid_: packet frame, task completion, generic wakeup
 
 **Main-Thread RPC**:
-A queued control-plane operation whose callback is executed by `ControlThread`
-on the main operating-system thread, with a worker barrier when the operation
+A queued control-plane operation whose callback is executed by the thread-zero
+DataPlaneMain/NodeMain scheduler, with a worker barrier when the operation
 publishes worker-visible state.
 _Avoid_: Data Worker task, Tokio request, packet dispatch
 
@@ -347,3 +422,41 @@ _Avoid_: global input next, fixed IP input redirect
 The control-plane command surface used to request runtime route and forwarding
 changes from the plugin that owns them.
 _Avoid_: direct route publish handle, config-only route mutation
+
+**Stats Metric**:
+An owner-defined, externally observable runtime value published through the
+Hammer stats segment with a stable VPP-style directory path. It has one owning
+subsystem and one defined update authority.
+_Avoid_: ad-hoc metric, log value, duplicated monitoring counter
+
+**Show Diagnostic**:
+A VPP-style CLI projection of owner-defined stats and runtime facts. It selects
+and formats existing published data; it does not create a second metric store.
+_Avoid_: command-local counter, CLI-only metric
+
+**Stats Owner**:
+The subsystem that defines, registers, updates, and explains a Stats Metric.
+Runtime, interface, session, transport, plugin, and infrastructure metrics
+remain with their concrete owners.
+_Avoid_: central metrics manager, generic metric registry owner
+
+**Runtime Statistic**:
+A VPP-style cumulative fact such as node calls, vectors, clocks, suspends, or
+classified input/output/drop/punt vectors. Rates and summaries are derived
+when a diagnostic snapshot is formatted.
+_Avoid_: stored rate, query-time counter, CLI-local measurement
+
+**Module-owned ctl**:
+The owner module defines its ctl arguments, Binary API request/reply binding,
+reply decoding, and VPP-style formatter. `hammerctl` supplies the Binary API
+and stats-segment transport plus static ctl-module composition; it does not
+own plugin-specific command enums or formatting. Runtime owns core runtime,
+error, and memory ctl commands; interface, session, and transport modules own
+their respective ctl commands.
+_Avoid_: central plugin command enum, CLI-owned plugin formatter
+
+**Statistic Clear Baseline**:
+The owner-published cumulative values against which a VPP-style `show` command
+computes post-clear deltas. Clearing updates the baseline at the control-plane
+synchronization boundary.
+_Avoid_: resetting hot-path counters, client-side subtraction state

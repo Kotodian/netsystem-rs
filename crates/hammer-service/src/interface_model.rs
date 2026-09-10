@@ -7,7 +7,7 @@ use std::sync::{Arc, OnceLock};
 use hammer_core::data_plane::NodeId;
 use hammer_infra::bitmap::Bitmap;
 use hammer_infra::pool::Pool;
-use hammer_runtime::{DataWorkerId, GlobalMain, RuntimeResult};
+use hammer_runtime::{DataWorkerId, RuntimeResult};
 use ipnet::IpNet;
 
 use crate::interface::{InterfaceError, InterfaceMtu, InterfaceMtuKind, InterfaceResult};
@@ -657,17 +657,10 @@ impl InterfaceMain {
         if hammer_runtime::ensure_main_thread().is_ok() {
             return interface(&self.rx_dpos.borrow());
         }
-        hammer_runtime::with_data_plane_main(|runtime| {
-            assert_ne!(
-                runtime.thread_index(),
-                0,
-                "RX DPO reads require a Data Worker"
-            );
-            // SAFETY: the installed worker cannot acknowledge a barrier in
-            // this synchronous read. All pool mutation requires acknowledged
-            // workers; no reference or RefCell borrow flag escapes to workers.
-            unsafe { interface(&*self.rx_dpos.as_ptr()) }
-        })
+        // SAFETY: a Data Worker cannot acknowledge a barrier during this
+        // synchronous read. All pool mutation requires acknowledged workers;
+        // no reference or RefCell borrow flag escapes the operation.
+        unsafe { interface(&*self.rx_dpos.as_ptr()) }
     }
 
     pub(crate) fn interface_tx_nodes(dpo: crate::net::DpoId) -> Vec<NodeId> {
@@ -1047,7 +1040,13 @@ impl InterfaceMain {
     }
 }
 
+pub static INTERFACE_MAIN: OnceLock<Arc<InterfaceMain>> = OnceLock::new();
+
 #[hammer_component_macros::init_function(name = "interface_main_init")]
-pub fn interface_main_init(_: &mut GlobalMain) -> RuntimeResult<Arc<InterfaceMain>> {
-    Ok(Arc::new(InterfaceMain::new()))
+pub fn interface_main_init() -> RuntimeResult<()> {
+    assert!(
+        INTERFACE_MAIN.set(Arc::new(InterfaceMain::new())).is_ok(),
+        "interface initialization callback executes once"
+    );
+    Ok(())
 }

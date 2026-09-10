@@ -11,15 +11,13 @@ use std::os::unix::fs::MetadataExt;
 use std::os::unix::net::UnixListener as StdUnixListener;
 use std::os::unix::net::UnixStream as StdUnixStream;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
 use hammer_infra::pool::Pool;
 use hammer_runtime::FILE_MAIN;
 use hammer_runtime::binary_api::{BinaryApiMethodEntry, BinaryApiMethodStatus};
 use hammer_runtime::file::{FileIoStatus, FileMain};
-use hammer_runtime::{
-    GlobalMain, NodeMain, PluginError, ProcessContext, ProcessWake, RuntimeError, RuntimeResult,
-};
+use hammer_runtime::{DataPlaneMain, NodeMain, PluginError, RuntimeError, RuntimeResult};
 use prost::Message;
 
 /// Shared envelope, blocking client, and client-facing errors owned by
@@ -61,7 +59,6 @@ pub enum BinaryApiServerError {
 
 // VPP `VL_API_CLNT_NODE` budgets: bounded work per readiness event so one
 // chatty client or a burst of connects cannot monopolize the main thread.
-const PROCESS_NODE_NAME: &str = "binary-api";
 const MAX_CLIENTS: u32 = 1024;
 const MAX_ACCEPTS_PER_EVENT: usize = 16;
 const MAX_FRAMES_PER_READ_EVENT: usize = 16;
@@ -473,68 +470,97 @@ impl Drop for BinaryApiMain {
 
 /// VPP's `vl_api_clnt_node` signal path: the callback never touches the
 /// socket registration pool; it only hands the File's token to the node.
-/// Without a live node (main process shutdown) the readiness is dropped.
-fn signal_ready(event_type: u64, token: u64) -> RuntimeResult<()> {
-    match GlobalMain::with_current(|engine| engine.process_handle(PROCESS_NODE_NAME)) {
-        Some(Some(handle)) => handle.signal(event_type, token),
-        _ => Ok(()),
-    }
+/// A missing Process Node identity is a startup/lifecycle error.
+fn signal_ready(graph: &mut NodeMain, event_type: u64, token: u64) -> RuntimeResult<()> {
+    let node = __PROCESS_NODE_BINARY_API
+        .process_node_index()
+        .ok_or(RuntimeError::ProcessNodeIdentityUnavailable { name: "binary-api" })?;
+    graph.signal_process(node, event_type, token)
 }
 
 #[hammer_component_macros::file]
 mod listener_file {
     fn read<Context, Error>(
-        _graph: &Context,
+        graph: &mut Context,
         file: &mut hammer_core::file::File<Context, Error>,
     ) -> Result<(), Error>
     where
+        Context: std::borrow::BorrowMut<super::NodeMain>,
         Error: From<super::RuntimeError>,
     {
-        super::signal_ready(super::EVENT_ACCEPT_READY, file.private_data()).map_err(Into::into)
+        super::signal_ready(
+            graph.borrow_mut(),
+            super::EVENT_ACCEPT_READY,
+            file.private_data(),
+        )
+        .map_err(Into::into)
     }
 
     fn error<Context, Error>(
-        _graph: &Context,
+        graph: &mut Context,
         file: &mut hammer_core::file::File<Context, Error>,
     ) -> Result<(), Error>
     where
+        Context: std::borrow::BorrowMut<super::NodeMain>,
         Error: From<super::RuntimeError>,
     {
-        super::signal_ready(super::EVENT_ACCEPT_READY, file.private_data()).map_err(Into::into)
+        super::signal_ready(
+            graph.borrow_mut(),
+            super::EVENT_ACCEPT_READY,
+            file.private_data(),
+        )
+        .map_err(Into::into)
     }
 }
 
 #[hammer_component_macros::file]
 mod client_file {
     fn read<Context, Error>(
-        _graph: &Context,
+        graph: &mut Context,
         file: &mut hammer_core::file::File<Context, Error>,
     ) -> Result<(), Error>
     where
+        Context: std::borrow::BorrowMut<super::NodeMain>,
         Error: From<super::RuntimeError>,
     {
-        super::signal_ready(super::EVENT_CLIENT_READ_READY, file.private_data()).map_err(Into::into)
+        super::signal_ready(
+            graph.borrow_mut(),
+            super::EVENT_CLIENT_READ_READY,
+            file.private_data(),
+        )
+        .map_err(Into::into)
     }
 
     fn write<Context, Error>(
-        _graph: &Context,
+        graph: &mut Context,
         file: &mut hammer_core::file::File<Context, Error>,
     ) -> Result<(), Error>
     where
+        Context: std::borrow::BorrowMut<super::NodeMain>,
         Error: From<super::RuntimeError>,
     {
-        super::signal_ready(super::EVENT_CLIENT_WRITE_READY, file.private_data())
-            .map_err(Into::into)
+        super::signal_ready(
+            graph.borrow_mut(),
+            super::EVENT_CLIENT_WRITE_READY,
+            file.private_data(),
+        )
+        .map_err(Into::into)
     }
 
     fn error<Context, Error>(
-        _graph: &Context,
+        graph: &mut Context,
         file: &mut hammer_core::file::File<Context, Error>,
     ) -> Result<(), Error>
     where
+        Context: std::borrow::BorrowMut<super::NodeMain>,
         Error: From<super::RuntimeError>,
     {
-        super::signal_ready(super::EVENT_CLIENT_READ_READY, file.private_data()).map_err(Into::into)
+        super::signal_ready(
+            graph.borrow_mut(),
+            super::EVENT_CLIENT_READ_READY,
+            file.private_data(),
+        )
+        .map_err(Into::into)
     }
 }
 
@@ -549,22 +575,17 @@ fn output_budget(max_frame_bytes: usize) -> usize {
 fn dispatch(request: BinaryApiRequest) -> BinaryApiReply {
     let context = request.context;
     let resolved: Result<BinaryApiMethodEntry, BinaryApiReply> =
-        match GlobalMain::with_current(|engine| {
-            engine.plugin_main().binary_api_method(&request.method)
-        }) {
-            None => Err(reply(
-                context,
-                BinaryApiStatus::MainThreadUnavailable,
-                Vec::new(),
-            )),
-            Some(Err(PluginError::BinaryApiMethodMissing { .. })) => {
+        match hammer_runtime::PluginMain::global()
+            .and_then(|plugins| plugins.binary_api_method(&request.method))
+        {
+            Err(PluginError::BinaryApiMethodMissing { .. }) => {
                 Err(reply(context, BinaryApiStatus::MethodMissing, Vec::new()))
             }
-            Some(Err(PluginError::BinaryApiMethodDuplicate { .. })) => {
+            Err(PluginError::BinaryApiMethodDuplicate { .. }) => {
                 Err(reply(context, BinaryApiStatus::MethodDuplicate, Vec::new()))
             }
-            Some(Err(_)) => Err(reply(context, BinaryApiStatus::Internal, Vec::new())),
-            Some(Ok(method)) => Ok(method),
+            Err(_) => Err(reply(context, BinaryApiStatus::Internal, Vec::new())),
+            Ok(method) => Ok(method),
         };
     match resolved {
         // VPP's `msg_handler_internal` takes the worker barrier only when
@@ -602,22 +623,11 @@ fn dispatch_barriered(
         Ok(entry) => entry,
         Err(reply) => return reply,
     };
-    let mut request = Some(request);
-    let Some(reply) = GlobalMain::with_current(|engine| {
-        let main = engine.data_plane_main_mut();
-        let request = request.take().expect("binary request is invoked once");
-        if hammer_runtime::barrier::__is_pending() {
-            invoke_method(request, entry)
-        } else {
-            hammer_runtime::worker_thread_barrier_sync!(main, { invoke_method(request, entry) })
-        }
-    }) else {
-        return invoke_method(
-            request.take().expect("binary request is invoked once"),
-            entry,
-        );
-    };
-    reply
+    match hammer_runtime::barrier::global() {
+        Some(barrier) if barrier.is_pending() => invoke_method(request, entry),
+        Some(barrier) => barrier.sync(|| invoke_method(request, entry)),
+        None => invoke_method(request, entry),
+    }
 }
 
 fn reply(context: u64, status: BinaryApiStatus, payload: Vec<u8>) -> BinaryApiReply {
@@ -653,20 +663,29 @@ fn bind_listener(path: &Path) -> io::Result<StdUnixListener> {
     section = "binary_api",
     early = true
 )]
-fn configure(config: Config) -> RuntimeResult<Arc<Config>> {
+fn configure(config: Config) -> RuntimeResult<()> {
     config.validate().map_err(RuntimeError::from)?;
-    Ok(Arc::new(config))
+    assert!(
+        BINARY_API_CONFIG.set(config).is_ok(),
+        "Binary API configuration callback executes once"
+    );
+    Ok(())
 }
 
 #[hammer_component_macros::init_function(name = "binary_api_init")]
-fn init(config: Arc<Config>) -> RuntimeResult<Option<Arc<BinaryApiMain>>> {
+fn init() -> RuntimeResult<()> {
+    let config = BINARY_API_CONFIG
+        .get()
+        .expect("Binary API configuration is installed before initialization");
     let Some(path) = config.socket_path.as_deref() else {
-        return Ok(None);
+        return Ok(());
     };
-    BinaryApiMain::bind(path, config.max_frame_bytes)
-        .map(Arc::new)
-        .map(Some)
-        .map_err(RuntimeError::from)
+    let main = Arc::new(BinaryApiMain::bind(path, config.max_frame_bytes)?);
+    assert!(
+        BINARY_API_MAIN.set(main).is_ok(),
+        "binary API initialization callback executes once"
+    );
+    Ok(())
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize)]
@@ -675,6 +694,9 @@ struct Config {
     socket_path: Option<String>,
     max_frame_bytes: usize,
 }
+
+static BINARY_API_CONFIG: OnceLock<Config> = OnceLock::new();
+static BINARY_API_MAIN: OnceLock<Arc<BinaryApiMain>> = OnceLock::new();
 
 impl Default for Config {
     fn default() -> Self {
@@ -704,26 +726,35 @@ impl Config {
 }
 
 #[hammer_component_macros::process_node(name = "binary-api")]
-async fn binary_api_clnt(mut context: ProcessContext) -> RuntimeResult<()> {
+fn binary_api_clnt(
+    main: &mut DataPlaneMain,
+) -> impl std::future::Future<Output = RuntimeResult<()>> + Send + 'static {
     // VPP `vl_api_clnt_node`: FileMain callbacks signal this node; the main
     // FileMain poll loop owns readiness and this node consumes its event batch.
-    let capability = context.require::<BinaryApiMain>()?;
-    let file_main = FILE_MAIN
-        .get()
-        .expect("FileMain is initialized before Binary API startup");
-    let mut table = BinaryApiConnections::new(capability.listener);
-    let max_frame_bytes = capability.max_frame_bytes;
-    loop {
-        match context.wait_for_event().await {
-            ProcessWake::Clock => return Ok(()),
-            ProcessWake::Event(batch) => {
-                table.process_event(
-                    file_main,
-                    batch.event_type(),
-                    batch.data(),
-                    max_frame_bytes,
-                )?;
-            }
+    let events = (|| {
+        hammer_runtime::init::run_api_init(main)?;
+        main.process_events()
+    })();
+    async move {
+        let mut events = events?;
+        let capability = BINARY_API_MAIN.get().map(Arc::clone).ok_or(
+            RuntimeError::RuntimeCapabilityMissing {
+                type_name: "hammer_service::binary_api::BinaryApiMain",
+            },
+        )?;
+        let file_main = FILE_MAIN
+            .get()
+            .expect("FileMain is initialized before Binary API startup");
+        let mut table = BinaryApiConnections::new(capability.listener);
+        let max_frame_bytes = capability.max_frame_bytes;
+        while let Some((event_type, token)) = events.recv().await {
+            table.process_event(
+                file_main,
+                event_type,
+                std::slice::from_ref(&token),
+                max_frame_bytes,
+            )?;
         }
+        Ok(())
     }
 }

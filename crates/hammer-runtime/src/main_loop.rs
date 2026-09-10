@@ -1,9 +1,73 @@
-use tokio::io::Interest;
-use tokio::io::unix::AsyncFd;
-
 use crate::DataPlaneMain;
 use crate::spawn;
-use crate::spawn::DATA_WORKER_IDLE_SLICE;
+use std::future::Future;
+use std::time::Duration;
+
+/// Runs the thread-zero graph lifecycle and Tokio executor.
+///
+/// VPP correspondence: `vlib_main` initializes the graph, dispatches normal
+/// init/config and main-loop-enter callbacks, performs the later initial worker
+/// barrier, starts Process Nodes, and keeps the final worker barrier held while
+/// exit callbacks run.
+pub fn run<F, T>(
+    global: crate::GlobalMain,
+    threads: crate::ThreadMain,
+    plugins: crate::PluginMain,
+    main: &mut DataPlaneMain,
+    future: F,
+) -> crate::RuntimeResult<T>
+where
+    F: Future<Output = crate::RuntimeResult<T>>,
+{
+    crate::ensure_main_thread()?;
+    assert_eq!(
+        main.thread_index(),
+        0,
+        "thread-zero lifecycle requires main index 0"
+    );
+
+    assert!(
+        crate::global_main::GLOBAL_MAIN.set(global).is_ok(),
+        "GlobalMain initializes once"
+    );
+    assert!(
+        crate::thread_main::THREAD_MAIN.set(threads).is_ok(),
+        "ThreadMain initializes once"
+    );
+    assert!(
+        crate::plugin::PLUGIN_MAIN.set(plugins).is_ok(),
+        "PluginMain initializes once"
+    );
+    let global = crate::GlobalMain::global();
+
+    let run_result = (|| -> crate::RuntimeResult<T> {
+        main.init_graph_from_declarations(
+            global.node_registrations.iter().copied(),
+            global.node_function_registrations.iter().copied(),
+        )?;
+        crate::init::run_init_functions(global, main)?;
+        crate::init::run_config_functions(global, Some(main), false, global.startup_config())?;
+        crate::init::run_main_loop_enter(global, main)?;
+
+        crate::worker_thread_barrier_sync!(main, {});
+        main.start_processes(global.node_registrations.iter().copied())?;
+        main.run_main_until(future)?
+    })();
+
+    let finish = || {
+        let process_result = main.stop_processes();
+        let exit_result = crate::init::run_main_loop_exit(global, main);
+
+        let output = run_result?;
+        process_result?;
+        exit_result?;
+        Ok(output)
+    };
+    match crate::barrier::global() {
+        Some(barrier) if !barrier.startup_cancelled() => barrier.final_sync(finish),
+        _ => finish(),
+    }
+}
 
 /// VPP-style fixed-schedule data-plane main loop.
 ///
@@ -11,44 +75,16 @@ use crate::spawn::DATA_WORKER_IDLE_SLICE;
 /// 1. Barrier check (workers_at_barrier / wait_at_barrier)
 /// 2. Poll worker-local File readiness
 /// 3. Drain handoff, run ready nodes, and poll the worker control queue
-/// 4. Tokio reactor tick — drive transport/session futures
-/// 5. Schedule polling-state driver nodes (periodically)
-/// 6. Run ready nodes (handles interrupt frames + newly-scheduled polling frames)
-/// 7. Dispatch timer nodes (no timer wheel in data-plane yet)
-/// 8. Advance timers, increment main_loop_count and check exit
+/// 4. Schedule polling-state driver nodes (periodically)
+/// 5. Run ready nodes (handles interrupt frames + newly-scheduled polling frames)
+/// 6. Dispatch timer nodes (no timer wheel in data-plane yet)
+/// 7. Advance timers, increment main_loop_count and check exit
 pub fn data_plane_main_loop(
     main: &mut DataPlaneMain,
-    runtime: &tokio::runtime::Runtime,
     remote_local: &spawn::DataRemoteLocalQueue,
+    idle_slice: Duration,
 ) -> i32 {
-    let idle_slice = DATA_WORKER_IDLE_SLICE.with(|s| s.get());
-
     main.attach_worker_interrupt_thread();
-
-    let io_wake = {
-        let _reactor = runtime.enter();
-        match main.file_main().io_wake_fd_for_worker(main.thread_index()) {
-            Ok(wake_fd) => match AsyncFd::with_interest(wake_fd, Interest::READABLE) {
-                Ok(wake) => Some(wake),
-                Err(error) => {
-                    tracing::warn!(
-                        worker = main.thread_index(),
-                        %error,
-                        "File wake fd registration failed; idle sleep is fixed-slice"
-                    );
-                    None
-                }
-            },
-            Err(error) => {
-                tracing::warn!(
-                        worker = main.thread_index(),
-                    %error,
-                    "File wake fd duplication failed; idle sleep is fixed-slice"
-                );
-                None
-            }
-        }
-    };
 
     loop {
         let mut progress = false;
@@ -56,8 +92,9 @@ pub fn data_plane_main_loop(
         // Step 1: Barrier check — VPP threads.c:296
         if let Some(barrier) = crate::barrier::global()
             && barrier.is_pending()
+            && barrier.check_for_refork()
         {
-            main.refork_worker_graph(&barrier);
+            barrier.refork(&mut main.nodes);
         }
 
         // Step 2: Poll worker-local File readiness before graph dispatch.
@@ -86,48 +123,24 @@ pub fn data_plane_main_loop(
 
         // Step 3: Drain handoff queues, run ready nodes, poll remote/local tasks
         let _ = main.run_ready_nodes();
-        progress |= spawn::poll_remote_local_tasks(remote_local);
+        progress |= spawn::poll_remote_local_tasks(remote_local, main);
         let _ = main.run_ready_nodes();
 
-        // Step 4: Tokio reactor tick. VPP sleeps inside `epoll_wait`
-        // (`vlib_file_poll`) so device readiness ends the idle wait
-        // immediately; select the File wake fd against the idle slice for the
-        // same behavior.
-        if progress {
-            runtime.block_on(async {
-                tokio::task::yield_now().await;
-            });
-        } else {
-            runtime.block_on(async {
-                match &io_wake {
-                    Some(wake) => tokio::select! {
-                        guard = wake.readable() => match guard {
-                            Ok(mut guard) => {
-                                let _ = main
-                                    .file_main()
-                                    .clear_io_wake_for_worker(main.thread_index());
-                                guard.clear_ready();
-                            }
-                            Err(_) => tokio::time::sleep(idle_slice).await,
-                        },
-                        _ = tokio::time::sleep(idle_slice) => {}
-                    },
-                    None => tokio::time::sleep(idle_slice).await,
-                }
-            });
+        if !progress {
+            std::thread::sleep(idle_slice);
         }
 
-        // Step 5: Run any newly-scheduled frames (pre-input + input)
+        // Step 4: Run any newly-scheduled frames (pre-input + input)
         let _ = main.run_ready_nodes();
 
-        // Step 6: Dispatch timer nodes (no data-plane timer wheel yet)
+        // Step 5: Dispatch timer nodes (no data-plane timer wheel yet)
 
-        // Step 7: Advance timers — deferred (no data-plane timer wheel yet).
+        // Step 6: Advance timers — deferred (no data-plane timer wheel yet).
         // VPP dispatches timer-wheel-expired sched nodes here.
         // Increment loop count.
         main.increment_main_loop_count();
 
-        // Step 8: Exit check
+        // Step 7: Exit check
         if let Some(status) = requested_exit_status(main) {
             return status;
         }

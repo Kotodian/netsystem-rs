@@ -15,6 +15,94 @@ impl DataPlaneMain {
         config: DataPlaneBufferConfig,
         simd_bytes: usize,
     ) -> RuntimeResult<Self> {
+        Self::from_config_with_file(config, simd_bytes, FileMode::Sync)
+    }
+
+    pub fn new_main(threads: &crate::ThreadMain) -> RuntimeResult<Self> {
+        let buffer = crate::config::worker::buffer();
+        let mut numa_nodes = (1..=threads.worker_count())
+            .filter_map(|thread_index| {
+                threads
+                    .thread_by_index(thread_index)
+                    .and_then(crate::WorkerThread::numa_node)
+            })
+            .collect::<Vec<_>>();
+        if numa_nodes.is_empty() {
+            numa_nodes.push(0);
+        } else {
+            numa_nodes.sort_unstable();
+            numa_nodes.dedup();
+        }
+        let create_buffer_main = |page_size| {
+            hammer_core::buffer::BufferMain::new(
+                buffer.slot_bytes,
+                buffer.slots_per_numa,
+                &numa_nodes,
+                threads.worker_count() as usize,
+                page_size,
+            )
+        };
+        let page_size = match buffer.page_size {
+            Some(page_size) => {
+                create_buffer_main(page_size)?;
+                page_size
+            }
+            None => {
+                #[cfg(target_os = "linux")]
+                {
+                    match create_buffer_main(PageSize::DefaultHuge) {
+                        Ok(_) => PageSize::DefaultHuge,
+                        Err(source) => {
+                            tracing::warn!(%source, "default HugeTLB Buffer Pool unavailable; using ordinary pages");
+                            create_buffer_main(PageSize::Default)?;
+                            PageSize::Default
+                        }
+                    }
+                }
+                #[cfg(not(target_os = "linux"))]
+                {
+                    create_buffer_main(PageSize::Default)?;
+                    PageSize::Default
+                }
+            }
+        };
+        crate::file::init_file_main(threads.thread_count() as usize)?;
+        let process_runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .map_err(|source| RuntimeError::MainRuntime { source })?;
+        let file_main = {
+            let runtime_guard = process_runtime.enter();
+            let file_main = crate::file::AsyncFileMain::new()?;
+            drop(runtime_guard);
+            file_main
+        };
+        let active_numa_node = threads
+            .thread_by_index(0)
+            .and_then(crate::WorkerThread::numa_node)
+            .unwrap_or(0);
+        let mut main = Self::from_config_with_file(
+            DataPlaneBufferConfig {
+                buffer_slot_capacity: buffer.slot_bytes,
+                buffer_slots: buffer.slots_per_numa,
+                frame_slots: buffer.frame_pool_size,
+                numa_nodes: &[0],
+                thread_index: 0,
+                active_numa_node,
+                page_size,
+            },
+            native_simd_bytes(),
+            FileMode::Async(file_main),
+        )?;
+        main.nodes.process_runtime = Some(process_runtime);
+        Ok(main)
+    }
+
+    fn from_config_with_file(
+        config: DataPlaneBufferConfig,
+        simd_bytes: usize,
+        file_main: FileMode,
+    ) -> RuntimeResult<Self> {
         // Like vlib_main's clock seed, this is not cryptographic entropy.
         // Seed once at runtime construction, never on the packet path.
         let elapsed = match std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH) {
@@ -23,24 +111,21 @@ impl DataPlaneMain {
         };
         let seed = elapsed.as_nanos() as u64 ^ u64::from(config.thread_index);
         Ok(Self {
-            random: Rc::new(RefCell::new(SmallRng::seed_from_u64(seed))),
+            cacheline0: CacheLineAlignMark,
+            random: SmallRng::seed_from_u64(seed),
             active_numa_node: config.active_numa_node,
             thread_index: config.thread_index,
-            buffer_caches: std::cell::OnceCell::new(),
+            buffer_main: hammer_core::buffer::BufferMain::global(),
             nodes: NodeMain::default(),
-            current_node: Rc::new(Cell::new(None)),
+            current_node: Cell::new(None),
             handoff: None,
             trace: DataPlaneTrace::default(),
             simd_bytes,
-            registry: crate::RuntimeRegistry::new(),
-            main_loop_exit_now: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
-            main_loop_exit_status: std::sync::Arc::new(std::sync::Mutex::new(0)),
-            publication: std::sync::Arc::new(crate::global_main::WorkerPublication::new()),
-            workers_updating_graph: std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0)),
-            worker_config: Worker::default(),
-            called_worker_init_functions: std::collections::HashSet::new(),
-            main_loop_count: std::sync::atomic::AtomicU32::new(0),
-            worker_control_queues: std::sync::Arc::from([]),
+            file_main,
+            main_loop_count: 0,
+            main_loop_exit_now: false,
+            main_loop_exit_status: 0,
+            worker_init_functions_called: hammer_infra::bitmap::Bitmap::new(),
         })
     }
 
@@ -95,53 +180,45 @@ impl DataPlaneMain {
         })
     }
 
-    fn buffer_caches(
+    fn borrow_buffer_caches(
         &self,
-    ) -> &[std::cell::RefMut<'static, hammer_core::buffer::BufferThreadCache>] {
-        self.buffer_caches.get_or_init(|| {
-            hammer_core::buffer::BufferMain::global().borrow_worker_caches(self.thread_index)
-        })
-    }
-
-    fn buffer_caches_mut(
-        &mut self,
-    ) -> &mut [std::cell::RefMut<'static, hammer_core::buffer::BufferThreadCache>] {
-        self.buffer_caches();
-        self.buffer_caches
-            .get_mut()
-            .expect("Worker Buffer caches are borrowed")
+    ) -> Box<[std::cell::RefMut<'static, hammer_core::buffer::BufferThreadCache>]> {
+        self.buffer_main.borrow_worker_caches(self.thread_index)
     }
 
     #[inline]
     pub fn buffer(&self, index: u32) -> &hammer_core::data_plane::Buffer {
-        hammer_core::buffer::BufferMain::global().buffer(self.buffer_caches(), index)
+        // SAFETY: this DataPlaneMain is the unique execution owner for its
+        // Worker, and graph Buffer ownership keeps the slot live for the borrow.
+        unsafe { self.buffer_main.buffer_for_worker(self.thread_index, index) }
     }
 
     #[inline]
     pub fn buffer_mut(&mut self, index: u32) -> &mut hammer_core::data_plane::Buffer {
-        hammer_core::buffer::BufferMain::global().buffer_mut(self.buffer_caches_mut(), index)
+        // SAFETY: the exclusive DataPlaneMain borrow serializes this Worker's
+        // graph access; BufferMain rejects shared clone tails before returning.
+        unsafe {
+            self.buffer_main
+                .buffer_mut_for_worker(self.thread_index, index)
+        }
     }
 
     #[inline]
     pub fn nodes(&self) -> &NodeMain {
         &self.nodes
     }
-
-    pub fn file_main(&self) -> &'static FileMain {
-        FILE_MAIN
-            .get()
-            .expect("FileMain is initialized before data-plane use")
-    }
 }
 
 impl DataPlaneMain {
     pub fn cached_free_buffers(&self) -> usize {
-        hammer_core::buffer::BufferMain::global()
-            .cached_free_buffers(self.buffer_caches(), self.active_numa_node)
+        let caches = self.borrow_buffer_caches();
+        self.buffer_main
+            .cached_free_buffers(&caches, self.active_numa_node)
     }
 
     pub fn buffer_copy_no_chain(&mut self, source: u32) -> Option<u32> {
-        hammer_core::buffer::BufferMain::global().copy_no_chain(self.buffer_caches_mut(), source)
+        let mut caches = self.borrow_buffer_caches();
+        self.buffer_main.copy_no_chain(&mut caches, source)
     }
 
     pub fn buffer_alloc(&mut self, indices: &mut [u32]) -> usize {
@@ -149,20 +226,18 @@ impl DataPlaneMain {
     }
 
     pub fn buffer_alloc_from_pool(&mut self, indices: &mut [u32], pool_index: u8) -> usize {
-        hammer_core::buffer::BufferMain::global().alloc_from_pool(
-            self.buffer_caches_mut(),
-            indices,
-            pool_index,
-        )
+        let mut caches = self.borrow_buffer_caches();
+        self.buffer_main
+            .alloc_from_pool(&mut caches, indices, pool_index)
     }
 
     pub fn buffer_alloc_on_numa(&mut self, indices: &mut [u32], numa_node: u32) -> usize {
-        let pool = hammer_core::buffer::BufferMain::global().default_pool(numa_node);
+        let pool = self.buffer_main.default_pool(numa_node);
         self.buffer_alloc_from_pool(indices, pool)
     }
 
     pub fn buffer_alloc_to_ring(&mut self, ring: &mut [u32], start: usize, count: usize) -> usize {
-        let pool = hammer_core::buffer::BufferMain::global().default_pool(self.active_numa_node);
+        let pool = self.buffer_main.default_pool(self.active_numa_node);
         self.buffer_alloc_to_ring_from_pool(ring, start, count, pool)
     }
 
@@ -187,20 +262,19 @@ impl DataPlaneMain {
     }
 
     pub fn buffer_chain_init(&mut self, first: u32) {
-        hammer_core::buffer::BufferMain::global().chain_init(self.buffer_caches_mut(), first);
+        let mut caches = self.borrow_buffer_caches();
+        self.buffer_main.chain_init(&mut caches, first);
     }
 
     pub fn buffer_chain_buffer(&mut self, last: u32, next: u32) -> u32 {
-        hammer_core::buffer::BufferMain::global().chain_link(self.buffer_caches_mut(), last, next)
+        let mut caches = self.borrow_buffer_caches();
+        self.buffer_main.chain_link(&mut caches, last, next)
     }
 
     pub fn buffer_chain_append_data(&mut self, first: u32, last: u32, data: &[u8]) -> usize {
-        hammer_core::buffer::BufferMain::global().chain_append(
-            self.buffer_caches_mut(),
-            first,
-            last,
-            data,
-        )
+        let mut caches = self.borrow_buffer_caches();
+        self.buffer_main
+            .chain_append(&mut caches, first, last, data)
     }
 
     pub fn buffer_chain_append_data_with_alloc(
@@ -209,50 +283,37 @@ impl DataPlaneMain {
         last: &mut u32,
         data: &[u8],
     ) -> usize {
-        hammer_core::buffer::BufferMain::global().chain_append_with_alloc(
-            self.buffer_caches_mut(),
-            first,
-            last,
-            data,
-        )
+        let mut caches = self.borrow_buffer_caches();
+        self.buffer_main
+            .chain_append_with_alloc(&mut caches, first, last, data)
     }
 
     pub fn buffer_add_data(&mut self, head: &mut u32, data: &[u8]) -> usize {
         let numa_node = self.active_numa_node;
-        hammer_core::buffer::BufferMain::global().add_data(
-            self.buffer_caches_mut(),
-            numa_node,
-            head,
-            data,
-        )
+        let mut caches = self.borrow_buffer_caches();
+        self.buffer_main
+            .add_data(&mut caches, numa_node, head, data)
     }
 
     pub fn buffer_attach_clone(&mut self, head: u32, tail: u32) {
-        hammer_core::buffer::BufferMain::global().attach_clone(
-            self.buffer_caches_mut(),
-            head,
-            tail,
-        );
+        let mut caches = self.borrow_buffer_caches();
+        self.buffer_main.attach_clone(&mut caches, head, tail);
     }
 
     pub fn buffer_free(&mut self, indices: &[u32]) {
-        self.buffer_caches();
-        let caches = self
-            .buffer_caches
-            .get_mut()
-            .expect("Worker Buffer caches are borrowed");
-        hammer_core::buffer::BufferMain::global()
-            .free_buffers(caches, indices, true, |handle| self.trace.finalize(handle));
+        let mut caches = self.borrow_buffer_caches();
+        self.buffer_main
+            .free_buffers(&mut caches, indices, true, |handle| {
+                self.trace.finalize(handle)
+            });
     }
 
     pub fn buffer_free_no_next(&mut self, indices: &[u32]) {
-        self.buffer_caches();
-        let caches = self
-            .buffer_caches
-            .get_mut()
-            .expect("Worker Buffer caches are borrowed");
-        hammer_core::buffer::BufferMain::global()
-            .free_buffers(caches, indices, false, |handle| self.trace.finalize(handle));
+        let mut caches = self.borrow_buffer_caches();
+        self.buffer_main
+            .free_buffers(&mut caches, indices, false, |handle| {
+                self.trace.finalize(handle)
+            });
     }
 
     pub fn buffer_free_one(&mut self, index: u32) {

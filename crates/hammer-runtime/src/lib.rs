@@ -14,23 +14,23 @@ pub mod __private {
 
 crate::__declare_registration_image!(
     init_functions = [
-        graph::install::__INIT_FN_INSTALL_PACKET_GRAPH,
-        file::__INIT_FN_FILE_MAIN_INIT,
         config::stats::__INIT_FN_STATS_MAIN_INIT,
     ];
-    config_functions = [trace::__CONFIG_FN_RUNTIME_TRACE_CONFIG];
-    early_config_functions = [
+    config_functions = [
+        trace::__CONFIG_FN_RUNTIME_TRACE_CONFIG,
         memory::__CONFIG_FN_RUNTIME_WORKER_CONFIG,
         config::stats::__CONFIG_FN_RUNTIME_STATS_CONFIG,
     ];
     main_loop_enter_functions = [start_workers::__INIT_FN_START_WORKERS];
     main_loop_exit_functions = [];
     worker_init_functions = [];
+    num_workers_change_functions = [];
+    api_init_functions = [];
     graph_nodes = [];
     node_functions = [];
-    process_nodes = [global_main::__PROCESS_NODE_STATSEG_COLLECTOR_PROCESS];
+    process_nodes = [config::stats::__PROCESS_NODE_STATSEG_COLLECTOR_PROCESS];
     binary_api_methods = [];
-    stats_registrations = [global_main::__STATS_REGISTRATION_Sys];
+    stats_registrations = [config::stats::__STATS_REGISTRATION_Sys];
 );
 
 pub(crate) fn builtin_registration_image() -> &'static registration::RegistrationImage {
@@ -39,7 +39,7 @@ pub(crate) fn builtin_registration_image() -> &'static registration::Registratio
 
 pub mod error;
 pub mod global_main;
-pub use global_main::{GlobalMain, ensure_main_thread, ensure_main_thread_with_barrier};
+pub use global_main::GlobalMain;
 pub mod config;
 pub mod file;
 pub use file::{
@@ -58,7 +58,6 @@ pub mod metrics;
 pub mod plugin;
 pub mod plugin_loader;
 mod process;
-pub mod registry;
 pub mod session;
 pub mod sync;
 
@@ -68,17 +67,17 @@ pub use hammer_infra::simd::Simd;
 
 pub mod app;
 pub mod attach;
-mod control_thread;
 pub mod data_plane;
 pub mod handoff;
 pub mod network;
 pub mod node;
 mod runtime_simd;
+pub mod thread_main;
 pub mod trace;
+pub mod unix_main;
 pub use data_plane::{DataPlaneBufferConfig, DataPlaneMain};
 pub use hammer_core::data_plane::FrameBatchWidth;
 pub use handoff::{DataPlaneHandoff, DataPlaneHandoffWorker, DataWorkerId};
-pub use init::WorkerInitFunction;
 pub use metrics::{
     MetricCounter, MetricGauge, MetricKind, MetricLabel, MetricSample, MetricsRegistry,
     MetricsScope, RegistryRecorder,
@@ -93,21 +92,22 @@ pub use plugin::{
     PluginError, PluginMain, PluginMetadata, PluginModule, PluginModuleRef,
     host_meets_plugin_requirement,
 };
-pub use process::{
-    ProcessContext, ProcessEntry, ProcessEventBatch, ProcessFuture, ProcessHandle, ProcessWake,
-};
-pub use registry::RuntimeRegistry;
+pub use process::Process;
 pub use session::{SessionConnectEndpoint, SessionListenEndpoint};
+pub use thread_main::ThreadMain;
+pub use thread_main::{ensure_main_thread, ensure_main_thread_with_barrier};
 pub use trace::{
     PacketTrace, TraceControlHandle, TraceControlPlane, TraceEntry, TraceFormatter,
     TraceInputPolicy, TracePolicy, TraceRecord, TraceRecordSink,
 };
+pub use unix_main::UnixMain;
 pub mod graph;
 
 mod numa;
 pub mod spawn;
 pub mod start_workers;
 mod worker_thread;
+pub use worker_thread::WorkerThread;
 
 #[macro_export]
 macro_rules! worker_thread_barrier_sync {
@@ -118,8 +118,7 @@ macro_rules! worker_thread_barrier_sync {
         __worker_barrier_result
     }};
 }
-pub use control_thread::ControlThread;
-pub use spawn::{with_data_plane_main, with_data_plane_main_mut};
+pub use spawn::schedule_on_worker;
 
 #[cfg(test)]
 static BUFFER_MAIN_INIT: std::sync::Once = std::sync::Once::new();

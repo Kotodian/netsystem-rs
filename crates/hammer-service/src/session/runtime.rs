@@ -28,7 +28,7 @@ use hammer_runtime::{
     AttachError, RuntimeError, RuntimeResult, SessionConnectEndpoint, SessionListenEndpoint,
 };
 use hammer_runtime::{
-    DataPlaneMain, DataWorkerId, Deadline, File, FileFunctions, GlobalMain, NodeMain, NodeRuntime,
+    DataPlaneMain, DataWorkerId, Deadline, FILE_MAIN, File, FileFunctions, NodeMain, NodeRuntime,
 };
 
 use crate::session::app::AppWorkerError;
@@ -571,15 +571,17 @@ impl SessionMain {
             .map(|_| SessionWorkerSlot::new())
             .collect::<Vec<_>>()
             .into_boxed_slice();
-        let _ = publish_session_migrate_queues(worker_count);
+        publish_session_migrate_queues(worker_count);
         let main = Self {
             workers,
             listeners: UnsafeCell::new(Pool::new()),
             endpoint_lookup: SessionEndpointLookup::new(),
         };
-        SESSION_MAIN
-            .set(main)
-            .map_err(|_| RuntimeError::PluginStateNotInitialized { plugin: "session" })
+        assert!(
+            SESSION_MAIN.set(main).is_ok(),
+            "Session initialization callback executes once"
+        );
+        Ok(())
     }
 
     /// Returns the published process-global Session authority.
@@ -943,19 +945,11 @@ impl SessionMain {
         &self,
         operation: impl FnOnce() -> R,
     ) -> RuntimeResult<R> {
-        let barrier = match GlobalMain::with_current(|engine| {
-            engine
-                .ensure_main_thread()
-                .map(|()| engine.worker_barrier())
-        }) {
-            Some(Ok(barrier)) => barrier,
-            Some(Err(error)) => return Err(error),
-            None => return Err(RuntimeError::ControlRequiresMainThread),
-        };
-        if barrier.is_pending() {
-            Ok(operation())
-        } else {
-            Ok(barrier.sync(operation))
+        hammer_runtime::ensure_main_thread()?;
+        match hammer_runtime::barrier::global() {
+            Some(barrier) if barrier.is_pending() => Ok(operation()),
+            Some(barrier) => Ok(barrier.sync(operation)),
+            None => Ok(operation()),
         }
     }
 
@@ -1041,7 +1035,7 @@ impl SessionMain {
         // SAFETY: only the Main Thread mutates this pool while Data Workers
         // are stopped by the barrier below.
         let listeners = unsafe { &mut *self.listeners.get() };
-        let barrier = GlobalMain::with_current(|engine| engine.worker_barrier());
+        let barrier = hammer_runtime::barrier::global();
         Ok(match barrier {
             Some(barrier) if barrier.is_pending() => operation(listeners),
             Some(barrier) => barrier.sync(|| operation(listeners)),
@@ -1082,12 +1076,8 @@ impl SessionMain {
         })
     }
 
-    pub(crate) fn application_detached(
-        self: &'static Self,
-        engine: &GlobalMain,
-        application: u32,
-    ) -> RuntimeResult<()> {
-        self.remove_application_mqs(engine, application)?;
+    pub(crate) fn application_detached(self: &'static Self, application: u32) -> RuntimeResult<()> {
+        self.remove_application_mqs(application)?;
         let listeners = {
             // SAFETY: this call runs on the Main Thread. Listener removal
             // below stops Data Workers through the same barrier as publish.
@@ -1106,14 +1096,15 @@ impl SessionMain {
             let worker = DataWorkerId::new(worker_slot as u32);
             loop {
                 let main = self;
-                match engine.schedule_on_worker(worker, move || {
+                match hammer_runtime::schedule_on_worker(worker, move |runtime| {
                     let mut sessions = main
                         .worker(worker)
                         .expect("scheduled Application detach targets an existing Session worker")
                         .borrow_mut()
                         .expect("scheduled Application detach runs on its Session worker");
                     sessions.application_detached(application);
-                    hammer_runtime::with_data_plane_main(|main| sessions.wake_session_queue(main))
+                    sessions
+                        .wake_session_queue(runtime)
                         .expect("Application detach operation failed on its Session worker");
                 }) {
                     Ok(()) => break,
@@ -1134,17 +1125,12 @@ impl SessionMain {
 
     pub fn install_application_mqs(
         self: &'static Self,
-        engine: &GlobalMain,
         application: u32,
         resources: &ApplicationMqResources,
     ) -> RuntimeResult<()> {
-        if engine.thread_index() != 0 {
-            return Err(RuntimeError::WorkerControlRequiresGlobalMain);
-        }
-        let app_session_input = engine
-            .data_plane_main()
-            .nodes()
-            .node_by_name("appsl-rx-mqs-input")
+        hammer_runtime::ensure_main_thread()?;
+        let app_session_input = *super::APP_SESSION_INPUT_NODE
+            .get()
             .ok_or(SessionQueueError::NodeMissing)?;
         (0..resources.worker_count()).try_for_each(|worker_slot| {
             let worker = DataWorkerId::new(worker_slot as u32);
@@ -1153,16 +1139,14 @@ impl SessionMain {
                 .ok_or(SessionQueueError::ApplicationMqMissing { application })?
                 .clone();
             let main = self;
-            schedule_worker_task(engine, worker, move || {
-                hammer_runtime::with_data_plane_main_mut(|runtime| {
-                    let mut sessions = main.worker(worker)?.borrow_mut().map_err(|source| {
-                        SessionQueueError::WorkerAccess {
-                            worker: worker.slot(),
-                            source,
-                        }
-                    })?;
-                    sessions.install_app_mq(application, queue, app_session_input, runtime)
-                })
+            schedule_worker_task(worker, move |runtime| {
+                let mut sessions = main.worker(worker)?.borrow_mut().map_err(|source| {
+                    SessionQueueError::WorkerAccess {
+                        worker: worker.slot(),
+                        source,
+                    }
+                })?;
+                sessions.install_app_mq(application, queue, app_session_input, runtime)
             })?;
             Ok::<(), RuntimeError>(())
         })?;
@@ -1171,13 +1155,12 @@ impl SessionMain {
 
     pub(crate) fn remove_application_mqs(
         self: &'static Self,
-        engine: &GlobalMain,
         application: u32,
     ) -> RuntimeResult<()> {
         (0..self.workers.len()).try_for_each(|worker_slot| {
             let worker = DataWorkerId::new(worker_slot as u32);
             let main = self;
-            schedule_worker_task(engine, worker, move || {
+            schedule_worker_task(worker, move |_| {
                 let mut sessions = main.worker(worker)?.borrow_mut().map_err(|source| {
                     SessionQueueError::WorkerAccess {
                         worker: worker.slot(),
@@ -1194,16 +1177,14 @@ impl SessionMain {
         (0..self.workers.len()).for_each(|worker_slot| {
             let worker = DataWorkerId::new(worker_slot as u32);
             let main = self;
-            if let Err(error) = schedule_worker_task(engine, worker, move || {
-                hammer_runtime::with_data_plane_main_mut(|runtime| {
-                    let mut sessions = main.worker(worker)?.borrow_mut().map_err(|source| {
-                        SessionQueueError::WorkerAccess {
-                            worker: worker.slot(),
-                            source,
-                        }
-                    })?;
-                    sessions.remove_app_mq(application, runtime)
-                })
+            if let Err(error) = schedule_worker_task(worker, move |_| {
+                let mut sessions = main.worker(worker)?.borrow_mut().map_err(|source| {
+                    SessionQueueError::WorkerAccess {
+                        worker: worker.slot(),
+                        source,
+                    }
+                })?;
+                sessions.remove_app_mq(application)
             }) {
                 first_error.get_or_insert(error);
             }
@@ -1216,13 +1197,14 @@ impl SessionMain {
 }
 
 pub(super) fn schedule_worker_task<R: Send + 'static>(
-    engine: &GlobalMain,
     worker: DataWorkerId,
-    task: impl FnOnce() -> RuntimeResult<R> + Send + 'static,
+    task: impl FnOnce(&mut DataPlaneMain) -> RuntimeResult<R> + Send + 'static,
 ) -> RuntimeResult<R> {
     let (tx, rx) = std::sync::mpsc::channel();
-    engine.schedule_on_worker(worker, move || {
-        let _ = tx.send(task());
+    hammer_runtime::schedule_on_worker(worker, move |runtime| {
+        if tx.send(task(runtime)).is_err() {
+            return;
+        }
     })?;
     rx.recv()
         .map_err(|_| RuntimeError::WorkerControlClosed { worker })?
@@ -1259,7 +1241,7 @@ pub fn install_session_worker(
         worker.install_state_deadline(engine, session_queue)
     })();
     if let Err(error) = setup {
-        cleanup_session_worker_install(&mut worker, engine);
+        cleanup_session_worker_install(&mut worker);
         rollback_session_worker_graph(
             engine,
             app_session_input,
@@ -1273,7 +1255,7 @@ pub fn install_session_worker(
     }
 
     if let Err(mut worker) = slot.install(worker) {
-        cleanup_session_worker_install(&mut worker, engine);
+        cleanup_session_worker_install(&mut worker);
         rollback_session_worker_graph(
             engine,
             app_session_input,
@@ -1291,8 +1273,8 @@ pub fn install_session_worker(
     Ok(())
 }
 
-fn cleanup_session_worker_install(worker: &mut SessionWorker, engine: &mut DataPlaneMain) {
-    if let Err(error) = worker.remove_state_deadline(engine) {
+fn cleanup_session_worker_install(worker: &mut SessionWorker) {
+    if let Err(error) = worker.remove_state_deadline() {
         tracing::error!(%error, "failed to remove Session Worker deadline during install rollback");
     }
 }
@@ -1398,17 +1380,24 @@ impl SessionWorker {
             schedule_session_queue_deadline,
         );
         deadline.set_polling_thread_index(runtime.thread_index());
-        let index = runtime.file_main().add_deadline(deadline)?;
+        let index = FILE_MAIN
+            .get()
+            .expect("FileMain is initialized before Session Worker startup")
+            .add_deadline(deadline)?;
         self.state_deadline_file = Some(index);
         self.session_queue = Some(session_queue);
         Ok(())
     }
 
-    pub(crate) fn remove_state_deadline(&mut self, runtime: &DataPlaneMain) -> RuntimeResult<()> {
+    pub(crate) fn remove_state_deadline(&mut self) -> RuntimeResult<()> {
         let Some(index) = self.state_deadline_file else {
             return Ok(());
         };
-        if !runtime.file_main().delete_deadline(index)? {
+        if !FILE_MAIN
+            .get()
+            .expect("FileMain is initialized before Session Worker startup")
+            .delete_deadline(index)?
+        {
             return Err(RuntimeError::DeadlineIndexInvalid { index });
         }
         self.state_deadline_file = None;
@@ -1465,7 +1454,10 @@ impl SessionWorker {
                 .set_node_state(session_queue, next.node_state())?;
         }
         if let Some(index) = self.state_deadline_file
-            && let Err(error) = runtime.file_main().set_deadline(index, next.deadline())
+            && let Err(error) = FILE_MAIN
+                .get()
+                .expect("FileMain is initialized before Session Worker startup")
+                .set_deadline(index, next.deadline())
         {
             if let Some(session_queue) = self.session_queue
                 && let Err(cleanup_error) = runtime
@@ -2154,7 +2146,11 @@ impl SessionWorker {
             },
         );
         file.set_polling_thread_index(runtime.thread_index());
-        let file = match runtime.file_main().add(file) {
+        let file = match FILE_MAIN
+            .get()
+            .expect("FileMain is initialized before Session Worker startup")
+            .add(file)
+        {
             Ok(file) => file,
             Err(error) => {
                 // SAFETY: `entry_ptr` still owns the entry until FileMain add
@@ -2175,11 +2171,7 @@ impl SessionWorker {
 
     /// Removes one per-Application MQ registration before the queue is
     /// released by `ApplicationMain`.
-    pub(crate) fn remove_app_mq(
-        &mut self,
-        application: u32,
-        runtime: &mut DataPlaneMain,
-    ) -> RuntimeResult<()> {
+    pub(crate) fn remove_app_mq(&mut self, application: u32) -> RuntimeResult<()> {
         let slot = application as usize;
         let Some(entry) = self.app_rx_mqs.get_mut(slot).and_then(|entry| {
             if entry
@@ -2196,7 +2188,11 @@ impl SessionWorker {
         self.app_rx_mq_pending
             .retain(|candidate| *candidate != application);
         if let Some(file) = entry.file {
-            match runtime.file_main().delete(file) {
+            match FILE_MAIN
+                .get()
+                .expect("FileMain is initialized before Session Worker startup")
+                .delete(file)
+            {
                 Ok(true) => {}
                 Ok(false) => {
                     if entry.pending {
@@ -4784,7 +4780,7 @@ fn enqueue_app_event(
 }
 
 fn schedule_app_session_input(
-    graph: &hammer_runtime::NodeMain,
+    graph: &mut hammer_runtime::NodeMain,
     file: &mut File,
 ) -> RuntimeResult<()> {
     let node = hammer_core::data_plane::NodeId::new(file.private_data() as u32);
@@ -4792,7 +4788,10 @@ fn schedule_app_session_input(
     Ok(())
 }
 
-fn schedule_session_queue_deadline(graph: &NodeMain, deadline: &mut Deadline) -> RuntimeResult<()> {
+fn schedule_session_queue_deadline(
+    graph: &mut NodeMain,
+    deadline: &mut Deadline,
+) -> RuntimeResult<()> {
     let node = NodeId::new(
         u32::try_from(deadline.private_data())
             .expect("Session Queue node identity is stored as a u32"),
@@ -4801,7 +4800,10 @@ fn schedule_session_queue_deadline(graph: &NodeMain, deadline: &mut Deadline) ->
     Ok(())
 }
 
-fn schedule_app_mq_pending(graph: &hammer_runtime::NodeMain, file: &mut File) -> RuntimeResult<()> {
+fn schedule_app_mq_pending(
+    graph: &mut hammer_runtime::NodeMain,
+    file: &mut File,
+) -> RuntimeResult<()> {
     // SAFETY: the entry is boxed and owned by this worker's SessionWorker for
     // the File lifetime; FileMain deletes this File before the box is dropped.
     let entry = unsafe { &mut *(file.private_data() as usize as *mut AppRxMqEntry) };

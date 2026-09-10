@@ -2,7 +2,7 @@
 
 use abi_stable::StableAbi;
 use hammer_core::data_plane::NodeId;
-use hammer_runtime::RuntimeResult;
+use hammer_runtime::{DataPlaneMain, RuntimeResult};
 
 pub mod input;
 mod wire;
@@ -14,8 +14,13 @@ pub enum UdpIpVersion {
     V6 = 1,
 }
 
-pub fn register_dst_port(version: UdpIpVersion, port: u16, node: NodeId) -> RuntimeResult<()> {
-    input::register_dst_port(version, port, node)
+pub fn register_dst_port(
+    main: &DataPlaneMain,
+    version: UdpIpVersion,
+    port: u16,
+    node: NodeId,
+) -> RuntimeResult<()> {
+    input::register_dst_port(main, version, port, node)
 }
 
 pub fn unregister_dst_port(version: UdpIpVersion, port: u16, node: NodeId) -> RuntimeResult<()> {
@@ -27,7 +32,6 @@ hammer_component_macros::declare_plugin!(
     load_after = ["ip"],
     init_functions = [worker::__INIT_FN_UDP_INIT],
     config_functions = [],
-    early_config_functions = [],
     main_loop_enter_functions = [],
     main_loop_exit_functions = [],
     worker_init_functions = [worker::__INIT_FN_UDP_WORKER_INIT],

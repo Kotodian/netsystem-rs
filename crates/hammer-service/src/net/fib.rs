@@ -71,21 +71,14 @@ impl super::NetMain {
         if hammer_runtime::ensure_main_thread().is_ok() {
             return self.urpf_list(index).map(|list| list.interfaces.len());
         }
-        hammer_runtime::with_data_plane_main(|runtime| {
-            assert_ne!(
-                runtime.thread_index(),
-                0,
-                "uRPF packet read requires a Data Worker"
-            );
-            // SAFETY: the worker cannot acknowledge a barrier inside this
-            // synchronous read. Main mutates only after all acknowledgements;
-            // only the interface count escapes.
-            unsafe {
-                (&*self.urpf_lists.as_ptr())
-                    .get(index)
-                    .map(|list| list.interfaces.len())
-            }
-        })
+        // SAFETY: the worker cannot acknowledge a barrier inside this
+        // synchronous read. Main mutates only after all acknowledgements;
+        // only the interface count escapes.
+        unsafe {
+            (&*self.urpf_lists.as_ptr())
+                .get(index)
+                .map(|list| list.interfaces.len())
+        }
     }
 
     #[inline(always)]
@@ -95,20 +88,13 @@ impl super::NetMain {
                 .urpf_list(index)
                 .map(|list| list.interfaces.binary_search(&sw_if_index).is_ok());
         }
-        hammer_runtime::with_data_plane_main(|runtime| {
-            assert_ne!(
-                runtime.thread_index(),
-                0,
-                "uRPF packet read requires a Data Worker"
-            );
-            // SAFETY: main cannot change or reclaim the list until this
-            // worker acknowledges its barrier. Only membership is returned.
-            unsafe {
-                (&*self.urpf_lists.as_ptr())
-                    .get(index)
-                    .map(|list| list.interfaces.binary_search(&sw_if_index).is_ok())
-            }
-        })
+        // SAFETY: main cannot change or reclaim the list until this worker
+        // acknowledges its barrier. Only membership is returned.
+        unsafe {
+            (&*self.urpf_lists.as_ptr())
+                .get(index)
+                .map(|list| list.interfaces.binary_search(&sw_if_index).is_ok())
+        }
     }
 }
 

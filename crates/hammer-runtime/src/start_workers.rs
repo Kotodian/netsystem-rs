@@ -1,251 +1,86 @@
-use core::hint::spin_loop;
-use std::panic::{AssertUnwindSafe, catch_unwind};
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::thread;
-use std::thread::JoinHandle;
-use std::time::Instant;
+use std::sync::Arc;
 
 use crate::error::{RuntimeError, RuntimeResult};
-
-use crate::DataPlaneMain;
-use crate::config::Worker;
-use crate::global_main::GlobalMain;
-use crate::spawn;
-use crate::{DataPlaneHandoff, DataWorkerId, barrier};
+use crate::{
+    DataPlaneHandoff, DataPlaneMain, DataWorkerId, GlobalMain, ThreadMain, barrier, spawn,
+};
 
 #[hammer_component_macros::main_loop_enter_function]
-pub fn start_workers(engine: &mut GlobalMain) -> RuntimeResult<()> {
-    let (worker_config, worker_count) = resolve_worker_startup(engine)?;
-    let barrier = barrier::install(worker_count);
-    barrier.arm();
-    engine.main_loop_exit_now.store(false, Ordering::Release);
-    engine.prepare_worker_publication();
-
+fn start_workers(main: &mut DataPlaneMain) -> RuntimeResult<()> {
+    let threads = ThreadMain::global();
+    let global = GlobalMain::global();
+    let worker_count = threads.worker_count();
+    let participant_count = threads
+        .thread_count()
+        .checked_sub(1)
+        .expect("configured ThreadMain includes thread zero");
+    let init_order = crate::init::topological_order(&global.worker_init_function_registrations)?;
+    let init_functions: Arc<[&'static crate::init::InitFunction]> = init_order
+        .into_iter()
+        .map(|index| global.worker_init_function_registrations[index])
+        .collect();
     let handoff = DataPlaneHandoff::with_node_capacity(
-        worker_config.count,
-        worker_config.handoff.queue_capacity,
-        engine.main.nodes().node_count(),
+        worker_count as usize,
+        crate::config::worker::handoff().queue_capacity,
+        main.nodes().node_count(),
     );
-    let worker_control_queues: std::sync::Arc<[spawn::DataRemoteLocalQueue]> = (0..worker_count)
-        .map(|_| spawn::DataRemoteLocalQueue::new(worker_config.control.queue_capacity))
+    let queues: Arc<[spawn::DataRemoteLocalQueue]> = (0..worker_count)
+        .map(|_| spawn::DataRemoteLocalQueue::new(crate::config::worker::control().queue_capacity))
         .collect::<Vec<_>>()
         .into();
-    engine.install_worker_control_queues(std::sync::Arc::clone(&worker_control_queues));
-    engine.main.install_global_control(
-        std::sync::Arc::clone(&engine.registry),
-        std::sync::Arc::clone(&engine.main_loop_exit_now),
-        std::sync::Arc::clone(&engine.main_loop_exit_status),
-        std::sync::Arc::clone(&engine.publication),
-        std::sync::Arc::clone(&engine.workers_updating_graph),
-        worker_config.clone(),
-        std::sync::Arc::clone(&worker_control_queues),
-    );
-    let mut threads = Vec::with_capacity(worker_config.count);
 
+    let mut worker_mains = Vec::with_capacity(worker_count as usize);
     for worker_slot in 0..worker_count {
-        let worker = DataWorkerId::new(worker_slot);
         let thread_index = worker_slot + 1;
-        let runtime_parts = engine.main.worker_parts();
-        let registry = std::sync::Arc::clone(&engine.registry);
-        let publication = std::sync::Arc::clone(&engine.publication);
-        let workers_updating_graph = std::sync::Arc::clone(&engine.workers_updating_graph);
-        let worker_init_functions = engine.plugin_main().worker_init_functions();
-        let main_loop_exit_now = std::sync::Arc::clone(&engine.main_loop_exit_now);
-        let main_loop_exit_status = std::sync::Arc::clone(&engine.main_loop_exit_status);
-        let worker_config_template = engine.worker_config.clone();
-        let worker_config = worker_config.clone();
-        let handoff = handoff.worker(worker);
-        let remote_local = worker_control_queues[worker.slot()].clone();
-        let worker_control_queues_for_thread = std::sync::Arc::clone(&worker_control_queues);
-        let worker_exit = std::sync::Arc::clone(&engine.main_loop_exit_now);
-        let launched = thread::Builder::new()
-            .name(format!("hammer-worker-{thread_index}"))
-            .stack_size(worker_config.stack_size)
-            .spawn(move || -> RuntimeResult<()> {
-                let result = catch_unwind(AssertUnwindSafe(|| -> RuntimeResult<()> {
-                    // VPP workers stop at the launch barrier before constructing
-                    // any thread-local runtime state.
-                    crate::barrier::global()
-                        .expect("worker barrier is installed")
-                        .check();
-                    if worker_exit.load(Ordering::Acquire) {
-                        return Ok(());
-                    }
-
-                    let numa_node = worker_config.apply_current_thread_setup(worker.slot())?;
-                    let (nodes, simd_bytes, _, trace_control) = runtime_parts;
-                    let runtime = DataPlaneMain::from_worker_parts(
-                        nodes,
-                        simd_bytes,
-                        Some(handoff),
-                        trace_control,
-                        thread_index,
-                        numa_node,
-                    )?;
-                    let mut main = runtime;
-                    main.install_global_control(
-                        registry,
-                        main_loop_exit_now,
-                        main_loop_exit_status,
-                        publication,
-                        workers_updating_graph,
-                        worker_config_template,
-                        worker_control_queues_for_thread,
-                    );
-                    spawn::set_data_plane_main(&mut main);
-                    spawn::apply_worker_idle_slice(worker_config.idle_slice);
-                    crate::init::run_worker_init_functions(&mut main, worker_init_functions)?;
-                    if worker_exit.load(Ordering::Acquire) {
-                        return Ok(());
-                    }
-
-                    let tokio = tokio::runtime::Builder::new_current_thread()
-                        .max_blocking_threads(worker_config.max_blocking_threads)
-                        .enable_all()
-                        .build()
-                        .map_err(|error| {
-                            RuntimeError::lifecycle(
-                                format!("build data worker {thread_index} runtime"),
-                                error.to_string(),
-                            )
-                        })?;
-                    remote_local.attach_current_thread();
-                    let exit_status =
-                        crate::main_loop::data_plane_main_loop(&mut main, &tokio, &remote_local);
-                    tracing::debug!(worker = thread_index, exit_status, "worker exited");
-                    let loop_result = if exit_status == 0 {
-                        Ok(())
-                    } else {
-                        Err(RuntimeError::lifecycle(
-                            format!("data worker {thread_index} main loop"),
-                            format!("exited with status {exit_status}"),
-                        ))
-                    };
-                    loop_result
-                }));
-                remote_local.close();
-                spawn::cleanup_thread_local();
-                match result {
-                    Ok(result) => result,
-                    Err(payload) => std::panic::resume_unwind(payload),
-                }
-            });
-
-        match launched {
-            Ok(thread) => threads.push(thread),
-            Err(error) => {
-                let startup_error = RuntimeError::lifecycle(
-                    format!("spawn data worker {thread_index}"),
-                    error.to_string(),
-                );
-                return Err(abort_workers(
-                    &barrier,
-                    &engine.main_loop_exit_now,
-                    threads,
-                    startup_error,
-                ));
-            }
-        }
+        let descriptor = threads
+            .thread_by_index(thread_index)
+            .expect("configured worker descriptor exists");
+        let (nodes, simd_bytes, _, trace_control) = main.worker_parts();
+        worker_mains.push(Box::new(DataPlaneMain::new_worker(
+            nodes,
+            simd_bytes,
+            Some(handoff.worker(DataWorkerId::new(worker_slot))),
+            trace_control,
+            thread_index,
+            descriptor.numa_node().unwrap_or(0),
+        )?));
     }
 
-    if !wait_for_workers_at_barrier(&barrier, &threads, "worker launch barrier sync") {
-        return Err(abort_workers(
-            &barrier,
-            &engine.main_loop_exit_now,
-            threads,
-            RuntimeError::WorkerExitedBeforeStartupBarrier { phase: "launch" },
-        ));
+    spawn::install_worker_control_queues(Arc::clone(&queues));
+    let barrier = barrier::install(worker_count, participant_count);
+    for thread_index in 1..threads.thread_count() {
+        threads
+            .thread_by_index(thread_index)
+            .expect("configured runtime thread descriptor exists")
+            .install_barrier(barrier.clone());
     }
-
-    // Release the launch barrier, then immediately arm VPP's second initial
-    // barrier. A worker can acknowledge this one only from its main-loop entry,
-    // after worker-local initialization has completed.
-    barrier.release();
     barrier.arm();
-    if !wait_for_workers_at_barrier(&barrier, &threads, "worker main-loop barrier sync") {
-        return Err(abort_workers(
-            &barrier,
-            &engine.main_loop_exit_now,
-            threads,
-            RuntimeError::WorkerExitedBeforeStartupBarrier { phase: "main-loop" },
-        ));
+    for (worker_slot, worker_main) in worker_mains.into_iter().enumerate() {
+        let thread_index = worker_slot as u32 + 1;
+        let descriptor = threads
+            .thread_by_index(thread_index)
+            .expect("configured worker descriptor exists");
+        if let Err(error) = descriptor.launch(
+            Some((worker_main, queues[worker_slot].clone())),
+            Arc::clone(&init_functions),
+        ) {
+            return Err(cancel_startup(&barrier, error));
+        }
     }
-    if engine.main_loop_exit_now.load(Ordering::Acquire) {
-        return Err(abort_workers(
-            &barrier,
-            &engine.main_loop_exit_now,
-            threads,
-            RuntimeError::WorkerRequestedExitDuringInitialization,
-        ));
+    for thread_index in worker_count + 1..threads.thread_count() {
+        let descriptor = threads
+            .thread_by_index(thread_index)
+            .expect("registered runtime thread descriptor exists");
+        if let Err(error) = descriptor.launch(None, Arc::clone(&init_functions)) {
+            return Err(cancel_startup(&barrier, error));
+        }
     }
-    if let Err(error) = engine.retain_worker_threads(&mut threads) {
-        return Err(abort_workers(
-            &barrier,
-            &engine.main_loop_exit_now,
-            threads,
-            error,
-        ));
-    }
-    barrier.release();
-    Ok(())
+
+    crate::worker_thread_barrier_sync!(main, { crate::init::run_num_workers_change(global, main) })
 }
 
-fn resolve_worker_startup(engine: &GlobalMain) -> RuntimeResult<(Worker, u32)> {
-    let worker = engine.worker_config().clone();
-    worker.validate()?;
-    let count = u32::try_from(worker.count).map_err(|_| RuntimeError::WorkerCountOverflow {
-        count: worker.count,
-    })?;
-    Ok((worker, count))
-}
-
-#[track_caller]
-fn wait_for_workers_at_barrier(
-    barrier: &barrier::WorkerBarrier,
-    threads: &[JoinHandle<RuntimeResult<()>>],
-    phase: &'static str,
-) -> bool {
-    let deadline = Instant::now() + barrier::BARRIER_SYNC_TIMEOUT;
-    loop {
-        let observed = barrier.paused_workers();
-        if observed == barrier.worker_count() {
-            return true;
-        }
-        if threads.iter().any(JoinHandle::is_finished) {
-            return false;
-        }
-        if Instant::now() > deadline {
-            barrier::barrier_deadlock(phase, barrier.worker_count(), observed);
-        }
-        spin_loop();
-    }
-}
-
-fn abort_workers(
-    barrier: &barrier::WorkerBarrier,
-    exit: &AtomicBool,
-    threads: Vec<JoinHandle<RuntimeResult<()>>>,
-    startup_error: RuntimeError,
-) -> RuntimeError {
-    exit.store(true, Ordering::Release);
-    barrier.release();
-    let mut unwind_payload = None;
-    for (worker, thread) in threads.into_iter().enumerate() {
-        match thread.join() {
-            Ok(Ok(())) => {}
-            Ok(Err(error)) => {
-                tracing::error!(worker, %error, "data worker failed while startup aborted");
-            }
-            Err(payload) if unwind_payload.is_none() => unwind_payload = Some(payload),
-            Err(payload) => tracing::error!(
-                worker,
-                panic = %crate::global_main::thread_panic_message(payload),
-                "data worker panicked while startup aborted"
-            ),
-        }
-    }
-    if let Some(payload) = unwind_payload {
-        std::panic::resume_unwind(payload);
-    }
+fn cancel_startup(barrier: &barrier::WorkerBarrier, startup_error: RuntimeError) -> RuntimeError {
+    barrier.cancel_startup();
+    barrier.release_startup();
     startup_error
 }

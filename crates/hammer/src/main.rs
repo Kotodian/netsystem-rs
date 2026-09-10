@@ -4,12 +4,13 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::OnceLock;
 
-use hammer_runtime::RuntimeRegistry;
 use hammer_runtime::attach::AppServer;
-use hammer_runtime::config::{Memory, Worker};
+use hammer_runtime::config::Memory;
 use hammer_runtime::global_main::GlobalMain;
 use hammer_runtime::log::Level;
-use hammer_runtime::{RuntimeError, RuntimeResult};
+use hammer_runtime::{
+    DataPlaneMain, PluginMain, RuntimeError, RuntimeResult, ThreadMain, UnixMain,
+};
 
 // Shared device/interface/transport/session infrastructure contributes host
 // builtins; loadable protocol and device-driver code comes only from DSOs.
@@ -24,7 +25,6 @@ static STARTUP_CONFIG_PATH: OnceLock<PathBuf> = OnceLock::new();
 #[serde(default)]
 struct DaemonEarlyConfig {
     memory: Memory,
-    worker: Worker,
     log: DaemonLogConfig,
 }
 
@@ -36,8 +36,7 @@ struct DaemonLogConfig {
 
 impl DaemonEarlyConfig {
     fn validate(&self) -> RuntimeResult<()> {
-        self.memory.validate()?;
-        self.worker.validate()
+        self.memory.validate()
     }
 }
 
@@ -65,23 +64,9 @@ fn main() {
         eprintln!("Invalid early config {}: {error}", config_path.display());
         std::process::exit(1);
     });
-    #[cfg(target_os = "linux")]
-    if let Some(core) = early.worker.cpu.main_core {
-        let available = core_affinity::get_core_ids()
-            .is_some_and(|cores| cores.into_iter().any(|candidate| candidate.id == core));
-        if !available || !core_affinity::set_for_current(core_affinity::CoreId { id: core }) {
-            eprintln!("Failed to pin main thread to configured core {core}");
-            std::process::exit(1);
-        }
-    }
-    let DaemonEarlyConfig {
-        memory,
-        worker: _,
-        log,
-    } = early;
+    let DaemonEarlyConfig { memory, log } = early;
     let log_level = log.level;
     drop(bootstrap_document);
-    drop(config_path);
     memory.ensure_main_heap().unwrap_or_else(|error| {
         eprintln!("Failed to initialize main heap: {error}");
         std::process::exit(1);
@@ -91,7 +76,6 @@ fn main() {
         std::process::exit(1);
     });
 
-    let config_path = config_path_from_args();
     let config = read_config(&config_path).unwrap_or_else(|error| {
         eprintln!(
             "Failed to read config {} on the main heap: {error}",
@@ -106,21 +90,16 @@ fn main() {
         );
         std::process::exit(1);
     });
-    let worker = toml::from_str::<DaemonEarlyConfig>(&config)
-        .map(|config| config.worker)
-        .unwrap_or_else(|error| {
-            eprintln!(
-                "Failed to deserialize worker config {}: {error}",
-                config_path.display()
-            );
-            std::process::exit(1);
-        });
-    if STARTUP_CONFIG_PATH.set(config_path).is_err() {
+    if STARTUP_CONFIG_PATH.set(config_path.clone()).is_err() {
         eprintln!("startup configuration path was initialized more than once");
         std::process::exit(1);
     }
 
-    run(config, roots, worker);
+    let status = run(config, roots, config_path, log_level).unwrap_or_else(|error| {
+        tracing::error!(%error, "hammer runtime failed");
+        1
+    });
+    std::process::exit(status);
 }
 
 fn install_tracing(default_level: Level) -> Result<(), String> {
@@ -160,86 +139,86 @@ fn config_path_from_args() -> PathBuf {
         })
 }
 
-fn run(config: String, roots: Vec<String>, worker: Worker) {
-    let registry = RuntimeRegistry::new();
-    let engine =
-        GlobalMain::new_configured(Arc::clone(&registry), worker).unwrap_or_else(|error| {
-            eprintln!("Failed to construct configured runtime: {error}");
-            std::process::exit(1);
-        });
-    let mut engine = engine;
-    if let Err(error) = engine.init_control() {
-        eprintln!("Failed to construct stats-enabled runtime: {error}");
-        std::process::exit(1);
-    }
+fn run(
+    config: String,
+    roots: Vec<String>,
+    config_path: PathBuf,
+    log_level: Level,
+) -> RuntimeResult<i32> {
+    let mut unix = UnixMain::new(config_path, log_level);
+    let argv = std::env::args().collect::<Vec<_>>();
+    let exec_path = argv.first().cloned().unwrap_or_default();
+    let mut global = GlobalMain::new("hammer".to_owned(), exec_path, argv, config.clone());
+    let mut plugins = PluginMain::default();
+    plugins.register_image(hammer_service::registration_image());
+    plugins.load(env!("CARGO_PKG_VERSION"), &roots)?;
+    plugins.register_global_declarations(&mut global);
 
-    engine
-        .plugin_main_mut()
-        .register_builtin_image(hammer_service::registration_image());
-    engine.main_loop_enter(&roots, &config).unwrap_or_else(|e| {
-        eprintln!("main_loop_enter failed: {e}");
-        std::process::exit(1);
-    });
-    drop(config);
+    hammer_runtime::init::run_config_functions(&global, None, true, &config)?;
+    let mut threads = ThreadMain::new()?;
+    threads.configure()?;
+    let mut main = DataPlaneMain::new_main(&threads)?;
+    let run_result = hammer_runtime::main_loop::run(
+        global,
+        threads,
+        plugins,
+        &mut main,
+        run_main_thread(&mut unix),
+    );
+    let status = run_result.as_ref().copied().unwrap_or(1);
+    let unix_result = unix.shutdown(status);
 
-    let attach_server = registry.get::<AppServer>();
-    let applications = registry.get::<hammer_service::session::ApplicationMain>();
+    run_result?;
+    unix_result?;
+    Ok(status)
+}
 
+async fn run_main_thread(unix: &mut UnixMain) -> RuntimeResult<i32> {
+    let attach_server = hammer_service::session::app_server();
+    let applications = hammer_service::session::ApplicationMain::global()?;
     tracing::info!("hammer started");
-
-    // The `binary-api` Process Node serves the Binary API socket; it runs as
-    // a registered Process Node, not as a control-loop select arm.
-    if let Err(error) = engine.run_processes_until(async move {
-        match attach_server {
-            Some(attach) => {
-                let attach_applications = applications
-                    .as_ref()
-                    .cloned()
-                    .expect("Application Main is initialized with attach server");
-                let publish_applications = Arc::clone(&attach_applications);
-                let detach_applications = Arc::clone(&attach_applications);
-                if let Err(error) = attach
-                    .serve(
-                        move || attach_applications.attach_external_with_runtime(),
-                        move |application| {
-                            publish_applications.application_mq_publication(application)
-                        },
-                        move |application, requests, replies| {
-                            hammer_service::session::runtime::SessionMain::global()?.dispatch_application_session_mq(
-                                application,
-                                requests,
-                                replies,
-                            )
-                        },
-                        move |application| {
-                            if detach_applications.contains(application).unwrap_or(false)
-                                && let Err(error) = detach_applications.detach(application)
-                            {
-                                tracing::error!(%error, ?application, "failed to detach Application after attach connection closed");
-                            }
-                        },
-                    )
-                    .await
-                {
-                    tracing::error!(%error, "application attach server failed");
-                }
+    let exit_signal = unix.wait_for_exit_signal();
+    let attach = serve_applications(attach_server, applications);
+    tokio::pin!(exit_signal);
+    tokio::pin!(attach);
+    loop {
+        tokio::select! {
+            status = &mut exit_signal => return status,
+            result = &mut attach => {
+                result?;
+                return Err(RuntimeError::service_closed());
             }
-            None => std::future::pending::<()>().await,
         }
-    }) {
-        tracing::error!(%error, "main control dispatch failed");
     }
+}
 
-    // vlib/main.c holds the final Worker Barrier while running main-loop
-    // exit hooks. Process exit leaves Worker-owned packet state untouched.
-    engine
-        .close()
-        .unwrap_or_else(|error| tracing::error!(%error, "Main-loop exit hook failed"));
-    let exit_status = *engine
-        .main_loop_exit_status
-        .lock()
-        .expect("main-loop exit status mutex poisoned");
-    std::process::exit(exit_status);
+async fn serve_applications(
+    attach_server: Option<Arc<AppServer>>,
+    applications: &'static hammer_service::session::ApplicationMain,
+) -> RuntimeResult<()> {
+    let Some(attach) = attach_server else {
+        return std::future::pending::<RuntimeResult<()>>().await;
+    };
+    let attach_applications = applications;
+    let publish_applications = applications;
+    let detach_applications = applications;
+    attach
+        .serve(
+            move || attach_applications.attach_external_with_runtime(),
+            move |application| publish_applications.application_mq_publication(application),
+            move |application, requests, replies| {
+                hammer_service::session::runtime::SessionMain::global()?
+                    .dispatch_application_session_mq(application, requests, replies)
+            },
+            move |application| {
+                if detach_applications.contains(application).unwrap_or(false)
+                    && let Err(error) = detach_applications.detach(application)
+                {
+                    tracing::error!(%error, ?application, "failed to detach Application after attach connection closed");
+                }
+            },
+        )
+        .await
 }
 
 fn read_config(path: &Path) -> std::io::Result<String> {

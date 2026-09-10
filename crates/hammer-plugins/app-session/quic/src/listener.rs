@@ -9,7 +9,7 @@ use hammer_infra::pool::Pool;
 use hammer_infra::thread_owned::ThreadOwned;
 use hammer_runtime::app::SessionHandle;
 use hammer_runtime::{
-    DataPlaneMain, DataWorkerId, GlobalMain, RuntimeError, RuntimeResult, SessionConnectEndpoint,
+    DataPlaneMain, DataWorkerId, RuntimeError, RuntimeResult, SessionConnectEndpoint,
     SessionListenEndpoint,
 };
 use hammer_service::session::application_main;
@@ -394,34 +394,29 @@ pub(crate) fn connect(endpoint: SessionConnectEndpoint) -> RuntimeResult<()> {
     let worker = endpoint.worker;
 
     let (completion, completed) = mpsc::sync_channel(1);
-    GlobalMain::with_current(|engine| {
-        engine.schedule_on_worker(worker, {
-            let main = main;
-            let client_config = Arc::clone(&client_config);
-            let server_name = server_name.clone();
-            let local = local;
-            let remote = remote;
-            move || {
-                let result = main.with_worker(worker, |quic| {
-                    quic.allocate_client_connect_with_timeout(
-                        client_config,
-                        server_name,
-                        local,
-                        remote,
-                        endpoint.application,
-                        None,
-                        endpoint.opaque,
-                        endpoint.connection,
-                        connection_timeout,
-                    )
-                });
-                if completion.send(result).is_err() {
-                    return;
-                }
+    hammer_runtime::schedule_on_worker(worker, {
+        let main = main;
+        let client_config = Arc::clone(&client_config);
+        let server_name = server_name.clone();
+        move |_| {
+            let result = main.with_worker(worker, |quic| {
+                quic.allocate_client_connect_with_timeout(
+                    client_config,
+                    server_name,
+                    local,
+                    remote,
+                    endpoint.application,
+                    None,
+                    endpoint.opaque,
+                    endpoint.connection,
+                    connection_timeout,
+                )
+            });
+            if completion.send(result).is_err() {
+                return;
             }
-        })
-    })
-    .ok_or(RuntimeError::WorkerControlRequiresGlobalMain)??;
+        }
+    })?;
     let context = completed
         .recv()
         .map_err(|_| RuntimeError::DataWorkerCallCanceled {
@@ -452,18 +447,15 @@ pub(crate) fn connect(endpoint: SessionConnectEndpoint) -> RuntimeResult<()> {
     ) {
         let _ = application_main().remove_connection(main.inner_application, inner_connection);
         let (completion, completed) = mpsc::sync_channel(1);
-        GlobalMain::with_current(|engine| {
-            engine.schedule_on_worker(worker, {
-                let main = main;
-                move || {
-                    let result = main.with_worker(worker, |quic| quic.remove_context(context));
-                    if completion.send(result).is_err() {
-                        return;
-                    }
+        hammer_runtime::schedule_on_worker(worker, {
+            let main = main;
+            move |_| {
+                let result = main.with_worker(worker, |quic| quic.remove_context(context));
+                if completion.send(result).is_err() {
+                    return;
                 }
-            })
-        })
-        .ok_or(RuntimeError::WorkerControlRequiresGlobalMain)??;
+            }
+        })?;
         let _ = completed
             .recv()
             .map_err(|_| RuntimeError::DataWorkerCallCanceled {
@@ -489,23 +481,20 @@ pub(crate) fn connect_stream(endpoint: SessionConnectEndpoint) -> RuntimeResult<
     let flags = endpoint.flags;
     let (completion, completed) = mpsc::sync_channel(1);
 
-    GlobalMain::with_current(|engine| {
-        engine.schedule_on_worker(worker, {
-            let main = main;
-            move || {
-                let result = hammer_runtime::with_data_plane_main(|runtime| {
-                    session_main().with_worker_mut(runtime.thread_index(), |sessions| {
-                        main.with_worker_and_sessions(sessions, |sessions, quic| {
-                            quic.connect_stream(sessions, parent, connection, flags)
-                                .map(|_| ())
-                        })
-                    })
-                });
-                let _ = completion.send(result);
+    hammer_runtime::schedule_on_worker(worker, {
+        let main = main;
+        move |runtime| {
+            let result = session_main().with_worker_mut(runtime.thread_index(), |sessions| {
+                main.with_worker_and_sessions(sessions, |sessions, quic| {
+                    quic.connect_stream(sessions, parent, connection, flags)
+                        .map(|_| ())
+                })
+            });
+            if completion.send(result).is_err() {
+                return;
             }
-        })
-    })
-    .ok_or(RuntimeError::WorkerControlRequiresGlobalMain)??;
+        }
+    })?;
 
     completed
         .recv()
@@ -538,13 +527,13 @@ pub(crate) fn stop_listen(connection_index: u32) -> RuntimeResult<()> {
 
 #[hammer_component_macros::init_function(
     name = "quic_init",
-    runs_after = ["transport_main_init", "session_init", "udp_init"],
-    runs_before = ["install_packet_graph"]
+    runs_after = ["transport_main_init", "session_init", "udp_init"]
 )]
-fn init_quic(engine: &mut GlobalMain) -> RuntimeResult<()> {
-    if QUIC_MAIN.get().is_some() {
-        return Err(RuntimeError::PluginStateNotInitialized { plugin: "quic" });
-    }
+fn init_quic() -> RuntimeResult<()> {
+    assert!(
+        QUIC_MAIN.get().is_none(),
+        "QUIC initialization callback executes once"
+    );
     let inner_application = application_main().attach().map_err(RuntimeError::from)?;
     let session_app = match hammer_service::session::register_session_app(
         inner_application,
@@ -580,14 +569,12 @@ fn init_quic(engine: &mut GlobalMain) -> RuntimeResult<()> {
         protocol,
         inner_application,
         session_app,
-        engine.configured_worker_count(),
+        hammer_runtime::config::worker::worker_count(),
     );
-    if QUIC_MAIN.set(main).is_err() {
-        application_main()
-            .detach(inner_application)
-            .expect("duplicate QUIC initialization leaves no published inner Application");
-        return Err(RuntimeError::PluginStateNotInitialized { plugin: "quic" });
-    }
+    assert!(
+        QUIC_MAIN.set(main).is_ok(),
+        "QUIC Main remains uninitialized after lifecycle preflight"
+    );
     Ok(())
 }
 

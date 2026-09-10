@@ -4,8 +4,7 @@ hammer_component_macros::declare_plugin!(
     name = "tcp",
     load_after = ["ip"],
     init_functions = [__INIT_FN_TCP_INIT],
-    config_functions = [],
-    early_config_functions = [__CONFIG_FN_TCP_CONFIG],
+    config_functions = [__CONFIG_FN_TCP_CONFIG],
     main_loop_enter_functions = [],
     main_loop_exit_functions = [],
     worker_init_functions = [__INIT_FN_TCP_WORKER_INIT],
@@ -29,13 +28,13 @@ hammer_component_macros::declare_plugin!(
 
 use std::net::SocketAddr;
 use std::ops::Deref;
-use std::sync::{Arc, OnceLock, mpsc};
+use std::sync::{OnceLock, mpsc};
 
 use hammer_core::data_plane::{BufferPacketCursor, NodeId, NodeState};
 use hammer_runtime::app::SessionHandle;
 use hammer_runtime::{
-    DataPlaneMain, DataWorkerId, GlobalMain, Node, NodeRuntime, RuntimeError, RuntimeResult,
-    SessionConnectEndpoint, SessionListenEndpoint, with_data_plane_main,
+    DataPlaneMain, DataWorkerId, Node, NodeRuntime, RuntimeError, RuntimeResult,
+    SessionConnectEndpoint, SessionListenEndpoint,
 };
 use thiserror::Error;
 
@@ -295,6 +294,7 @@ impl TcpMain {
 // `tcp.c`; nodes read it directly and `tcp_init` publishes the configured
 // instance before workers start.
 pub static TCP_MAIN: OnceLock<TcpMain> = OnceLock::new();
+static TCP_CONFIG: OnceLock<crate::config::TcpPluginConfig> = OnceLock::new();
 
 pub fn protocol() -> RuntimeResult<u8> {
     TCP_MAIN
@@ -338,22 +338,19 @@ pub(crate) fn connect(endpoint: SessionConnectEndpoint) -> RuntimeResult<()> {
     let worker = endpoint.worker;
     let worker_slot = worker.slot();
     let (completion, completed) = mpsc::sync_channel(1);
-    GlobalMain::with_current(|engine| {
-        engine.schedule_on_worker(worker, move || {
-            let result = with_data_plane_main(|runtime| {
-                let main = TCP_MAIN
-                    .get()
-                    .ok_or(RuntimeError::PluginStateNotInitialized { plugin: "tcp" })?;
+    hammer_runtime::schedule_on_worker(worker, move |runtime| {
+        let result = TCP_MAIN
+            .get()
+            .ok_or(RuntimeError::PluginStateNotInitialized { plugin: "tcp" })
+            .and_then(|main| {
                 main.with_worker(runtime.thread_index(), |sessions, tcp| {
                     start_connect(sessions, tcp, endpoint.connection, local, endpoint.remote)
                 })
             });
-            if completion.send(result).is_err() {
-                return;
-            }
-        })
-    })
-    .ok_or(RuntimeError::WorkerControlRequiresGlobalMain)??;
+        if completion.send(result).is_err() {
+            return;
+        }
+    })?;
     completed
         .recv()
         .map_err(|_| RuntimeError::DataWorkerCallCanceled {
@@ -396,25 +393,24 @@ fn start_connect(
     early = true,
     runs_after = ["runtime_worker_config"]
 )]
-fn configure_tcp(
-    config: crate::config::TcpPluginConfig,
-) -> RuntimeResult<Arc<crate::config::TcpPluginConfig>> {
+fn configure_tcp(config: crate::config::TcpPluginConfig) -> RuntimeResult<()> {
     config.validate()?;
-    Ok(Arc::new(config))
+    assert!(
+        TCP_CONFIG.set(config).is_ok(),
+        "TCP configuration callback executes once"
+    );
+    Ok(())
 }
 
 #[hammer_component_macros::init_function(
     name = "tcp_init",
-    runs_after = ["transport_main_init", "session_init"],
-    runs_before = ["install_packet_graph"]
+    runs_after = ["transport_main_init", "session_init"]
 )]
-fn init_tcp(
-    engine: &mut GlobalMain,
-    config: Arc<crate::config::TcpPluginConfig>,
-) -> RuntimeResult<()> {
-    if TCP_MAIN.get().is_some() {
-        return Err(RuntimeError::PluginStateNotInitialized { plugin: "tcp" });
-    }
+fn init_tcp() -> RuntimeResult<()> {
+    assert!(
+        TCP_MAIN.get().is_none(),
+        "TCP initialization callback executes once"
+    );
     let protocol = register_transport(TransportVft::new(
         Some(start_listen),
         Some(stop_listen),
@@ -426,10 +422,18 @@ fn init_tcp(
         None,
     ))
     .map_err(RuntimeError::from)?;
-    let main = configured_tcp_main(config.as_ref(), protocol, engine.configured_worker_count())?;
-    TCP_MAIN
-        .set(main)
-        .map_err(|_| RuntimeError::PluginStateNotInitialized { plugin: "tcp" })?;
+    let config = TCP_CONFIG
+        .get()
+        .expect("TCP configuration is installed before initialization");
+    let main = configured_tcp_main(
+        config,
+        protocol,
+        hammer_runtime::config::worker::worker_count(),
+    )?;
+    assert!(
+        TCP_MAIN.set(main).is_ok(),
+        "TCP initialization callback executes once"
+    );
     Ok(())
 }
 

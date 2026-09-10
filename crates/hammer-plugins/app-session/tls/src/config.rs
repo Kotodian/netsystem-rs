@@ -2,7 +2,7 @@ use std::cell::UnsafeCell;
 use std::sync::{Arc, OnceLock};
 
 use hammer_infra::pool::Pool;
-use hammer_runtime::{GlobalMain, RuntimeResult};
+use hammer_runtime::RuntimeResult;
 use hammer_service::session::ApplicationMain;
 use prost::Message;
 use rustls::ServerConfig as RustlsServerConfig;
@@ -176,7 +176,7 @@ impl TlsMain {
     pub fn remove_config(&self, application: u32, config: ConfigId) -> Result<(), ConfigError> {
         self.ensure_main_thread()?;
         let state = unsafe { &mut *self.state.get() };
-        let barrier = GlobalMain::with_current(|engine| engine.worker_barrier());
+        let barrier = hammer_runtime::barrier::global();
         match barrier {
             Some(barrier) => barrier.sync(|| {
                 config_entry(&state.configs, application, config)?;
@@ -194,7 +194,7 @@ impl TlsMain {
     fn insert(&self, application: u32, config: ConnectionConfig) -> Result<ConfigId, ConfigError> {
         self.ensure_main_thread()?;
         let state = unsafe { &mut *self.state.get() };
-        let barrier = GlobalMain::with_current(|engine| engine.worker_barrier());
+        let barrier = hammer_runtime::barrier::global();
         match barrier {
             Some(barrier) => Ok(barrier.sync(|| {
                 config_id(state.configs.insert(ConfigEntry {
@@ -220,10 +220,7 @@ impl TlsMain {
     }
 
     fn ensure_main_thread(&self) -> Result<(), ConfigError> {
-        match GlobalMain::with_current(|engine| engine.ensure_main_thread()) {
-            Some(Ok(())) => Ok(()),
-            Some(Err(_)) | None => Err(ConfigError::WrongThread),
-        }
+        hammer_runtime::ensure_main_thread().map_err(|_| ConfigError::WrongThread)
     }
 }
 
@@ -552,15 +549,9 @@ fn remove_config_api(request: RemoveConfigRequest) -> RemoveConfigReply {
 
 fn binary_application(application: u64) -> Result<u32, TlsApiStatus> {
     let application = application as u32;
-    let Some(attached) = GlobalMain::with_current(|engine| {
-        engine
-            .registry
-            .require::<ApplicationMain>()
-            .ok()
-            .and_then(|applications| applications.contains(application).ok())
-    }) else {
-        return Err(TlsApiStatus::MainThreadUnavailable);
-    };
+    let attached = ApplicationMain::global()
+        .ok()
+        .and_then(|applications| applications.contains(application).ok());
     match attached {
         Some(true) => Ok(application),
         Some(false) => Err(TlsApiStatus::ApplicationMissing),

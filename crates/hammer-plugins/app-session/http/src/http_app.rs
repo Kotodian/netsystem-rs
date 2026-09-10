@@ -41,7 +41,7 @@
 
 use hammer_runtime::app::SessionFlags;
 use hammer_runtime::session::SessionStreamDirection;
-use hammer_runtime::{DataWorkerId, RuntimeError, RuntimeResult};
+use hammer_runtime::{RuntimeError, RuntimeResult};
 use hammer_service::session::SessionEndpointRole;
 use hammer_service::session::error::SessionError;
 use hammer_service::session::protocol::SessionAppVft;

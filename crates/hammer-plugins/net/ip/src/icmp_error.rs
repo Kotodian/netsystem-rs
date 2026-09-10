@@ -470,7 +470,7 @@ pub(crate) fn error_response_source_and_origin(runtime: &mut DataPlaneMain) -> R
     let output = runtime.nodes().try_register_descriptor(
         NodeKind::Internal,
         NodeDescriptor::new(
-            |runtime, node_runtime, frame| {
+            |runtime, _, frame| {
                 assert_eq!(frame.len(), 1);
                 let buffer = runtime.buffer(frame.vector_args()[0]);
                 let packet = buffer.current();
@@ -572,7 +572,7 @@ pub(crate) fn error_response_source_and_origin(runtime: &mut DataPlaneMain) -> R
             (&packet).len()
         );
         {
-            let mut buffer = runtime.buffer_mut(index);
+            let buffer = runtime.buffer_mut(index);
             let mut network = NetworkOpaque::default();
             network.sw_if_index[0] = rx;
             network.oflags = NetworkOffloadFlags::UDP_CHECKSUM;

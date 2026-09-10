@@ -2,12 +2,13 @@ use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
 use std::future::Future;
 use std::pin::Pin;
-use std::rc::Rc;
+use std::sync::OnceLock;
 use std::task::{Context, Poll, Waker};
+use std::time::Instant;
 
 use crate::error::{RuntimeError, RuntimeResult};
 use crate::trace::TraceFormatter;
-use crate::{DataPlaneMain, GlobalMain, Simd};
+use crate::{DataPlaneMain, Simd};
 use hammer_core::data_plane::{
     Frame, NodeErrorIndex, NodeErrorIndexError, NodeHandle, NodeId, NodeKind, NodeNext,
     NodeRegistration, NodeState,
@@ -331,7 +332,21 @@ pub struct NodeEntry {
     pub kind: NodeKind,
     pub init: fn(&DataPlaneMain) -> RuntimeResult<NodeId>,
     pub process: NodeProcessFn,
+    #[doc(hidden)]
+    pub process_start: Option<ProcessStartFn>,
+    #[doc(hidden)]
+    pub process_node_index: Option<&'static OnceLock<NodeId>>,
     pub error_counters: &'static [NodeErrorDescriptor],
+}
+
+#[doc(hidden)]
+pub type ProcessStartFn = fn(&mut DataPlaneMain, NodeId) -> RuntimeResult<()>;
+
+impl NodeEntry {
+    #[inline]
+    pub fn process_node_index(&self) -> Option<NodeId> {
+        self.process_node_index.and_then(OnceLock::get).copied()
+    }
 }
 
 pub struct NodeMain {
@@ -342,8 +357,20 @@ pub struct NodeMain {
     next_frames: Vec<NextFrame>,
     next_frame_indices: Vec<Vec<usize>>,
     enqueue_owners: Vec<Option<usize>>,
-    readiness: Rc<NodeReadiness>,
+    readiness: NodeReadiness,
     topology_owner: bool,
+    pub(crate) process_node_indices: Vec<NodeId>,
+    pub(crate) process_restore_current: Vec<(NodeId, u64)>,
+    pub(crate) process_restore_next: Vec<(NodeId, u64)>,
+    pub(crate) suspended_processes: Vec<NodeId>,
+    pub(crate) process_event_state: Vec<Vec<(u64, u64)>>,
+    pub(crate) process_timer_state: Vec<(NodeId, Instant)>,
+    pub(crate) current_process_index: Option<NodeId>,
+    pub(crate) time_next_process_ready: Option<Instant>,
+    pub(crate) process_event_senders: Vec<Option<tokio::sync::mpsc::UnboundedSender<(u64, u64)>>>,
+    pub(crate) process_runtime: Option<tokio::runtime::Runtime>,
+    pub(crate) running_processes: Vec<crate::process::RunningProcess>,
+    pub(crate) processes_started: bool,
 }
 
 impl std::fmt::Debug for NodeMain {
@@ -354,6 +381,8 @@ impl std::fmt::Debug for NodeMain {
             .field("nodes_len", &inner.nodes.len())
             .field("queue_len", &queue.len())
             .field("readiness", &self.readiness)
+            .field("process_nodes", &self.process_node_indices)
+            .field("running_processes", &self.running_processes.len())
             .finish()
     }
 }
@@ -826,7 +855,12 @@ impl NodeRuntimeInner {
             .ok_or(RuntimeError::NodeNextSlotNotRegistered { node, slot })
     }
 
-    fn set_node_next_slot(&mut self, node: NodeId, slot: usize, next: NodeId) -> RuntimeResult<()> {
+    fn set_node_next_slot(
+        &mut self,
+        node: NodeId,
+        slot: usize,
+        next: NodeId,
+    ) -> RuntimeResult<bool> {
         let next_count = self
             .next_nodes
             .get(node.slot() as usize)
@@ -857,6 +891,9 @@ impl NodeRuntimeInner {
                 );
             }
         }
+        let changed = group
+            .iter()
+            .any(|sibling| self.next_nodes[sibling.slot() as usize][slot] != Some(next));
         for sibling in group {
             let sibling_slot = sibling.slot() as usize;
             if !self.pending_next_names[sibling_slot].is_empty() {
@@ -864,7 +901,7 @@ impl NodeRuntimeInner {
             }
             self.next_nodes[sibling_slot][slot] = Some(next);
         }
-        Ok(())
+        Ok(changed)
     }
 
     fn add_node_next_slots(
@@ -1018,9 +1055,27 @@ impl Default for NodeMain {
             next_frames: Vec::new(),
             next_frame_indices: Vec::new(),
             enqueue_owners: Vec::new(),
-            readiness: Rc::new(NodeReadiness::default()),
+            readiness: NodeReadiness::default(),
             topology_owner: true,
+            process_node_indices: Vec::new(),
+            process_restore_current: Vec::new(),
+            process_restore_next: Vec::new(),
+            suspended_processes: Vec::new(),
+            process_event_state: Vec::new(),
+            process_timer_state: Vec::new(),
+            current_process_index: None,
+            time_next_process_ready: None,
+            process_event_senders: Vec::new(),
+            process_runtime: None,
+            running_processes: Vec::new(),
+            processes_started: false,
         }
+    }
+}
+
+impl Clone for NodeMain {
+    fn clone(&self) -> Self {
+        Self::from(self.inner.borrow().clone())
     }
 }
 
@@ -1043,8 +1098,20 @@ impl From<NodeRuntimeInner> for NodeMain {
             next_frames,
             next_frame_indices,
             enqueue_owners,
-            readiness: Rc::new(NodeReadiness::default()),
+            readiness: NodeReadiness::default(),
             topology_owner: false,
+            process_node_indices: Vec::new(),
+            process_restore_current: Vec::new(),
+            process_restore_next: Vec::new(),
+            suspended_processes: Vec::new(),
+            process_event_state: Vec::new(),
+            process_timer_state: Vec::new(),
+            current_process_index: None,
+            time_next_process_ready: None,
+            process_event_senders: Vec::new(),
+            process_runtime: None,
+            running_processes: Vec::new(),
+            processes_started: false,
         }
     }
 }
@@ -1052,17 +1119,23 @@ impl From<NodeRuntimeInner> for NodeMain {
 fn preferred_node_function<'registration>(
     node_name: &str,
     max_simd_bytes: usize,
-    registrations: &'registration [NodeFunctionRegistration],
+    registrations: impl Iterator<Item = &'registration NodeFunctionRegistration>,
 ) -> RuntimeResult<Option<&'registration NodeFunctionRegistration>> {
     let mut selected = None;
+    let mut seen_simd_widths = [false; 4];
 
-    for (offset, registration) in registrations.iter().enumerate() {
+    for registration in registrations {
         if registration.node_name != node_name {
             continue;
         }
-        if registrations[..offset].iter().any(|previous| {
-            previous.node_name == node_name && previous.simd_bytes == registration.simd_bytes
-        }) {
+        let width_index = match registration.simd_bytes {
+            1 => 0,
+            16 => 1,
+            32 => 2,
+            64 => 3,
+            _ => unreachable!("Node Function SIMD width is validated at construction"),
+        };
+        if std::mem::replace(&mut seen_simd_widths[width_index], true) {
             return Err(DataPlaneError::DuplicateNodeFunction {
                 node: registration.node_name,
                 simd_bytes: registration.simd_bytes,
@@ -1160,21 +1233,17 @@ impl NodeMain {
         Ok(())
     }
 
-    pub(crate) fn snapshot(&self) -> NodeRuntimeInner {
-        self.inner.borrow().clone()
-    }
-
     pub(crate) fn refork(&mut self, mut graph: NodeRuntimeInner) {
         self.refork_next_frames(&graph);
         graph.inherit_worker_state(self.inner.get_mut());
         *self.inner.get_mut() = graph;
     }
 
-    pub(crate) fn install_node_function(
+    pub(crate) fn install_node_function<'registration>(
         &self,
         node: NodeId,
         simd_bytes: usize,
-        registrations: &[NodeFunctionRegistration],
+        registrations: impl Iterator<Item = &'registration NodeFunctionRegistration>,
         process: NodeProcessFn,
     ) -> RuntimeResult<()> {
         self.ensure_topology_owner()?;
@@ -1271,6 +1340,26 @@ impl NodeMain {
                 node.node_trace_formatter(),
             ),
         )
+    }
+
+    #[doc(hidden)]
+    pub fn try_register_process_node(
+        &self,
+        name: &'static str,
+        process: NodeProcessFn,
+    ) -> RuntimeResult<NodeId> {
+        let node = self.register_descriptor(
+            NodeKind::Process,
+            NodeDescriptor::new(
+                process,
+                NodeRuntime::empty(),
+                Some(NodeRegistration::next(name, 0)),
+                &[],
+                None,
+            ),
+        )?;
+        self.set_node_state(node, NodeState::Disabled)?;
+        Ok(node)
     }
 
     pub fn register_internal_with_handle<N>(
@@ -1642,9 +1731,9 @@ impl NodeMain {
             .flatten())
     }
 
-    pub fn ready(&self) -> NodeRuntimeReady {
+    pub fn ready(&self) -> NodeRuntimeReady<'_> {
         NodeRuntimeReady {
-            readiness: Rc::clone(&self.readiness),
+            readiness: &self.readiness,
         }
     }
 
@@ -1681,10 +1770,19 @@ impl NodeMain {
 
     pub fn set_node_next_slot(&self, node: NodeId, slot: usize, next: NodeId) -> RuntimeResult<()> {
         self.ensure_topology_owner()?;
+        let barrier = crate::barrier::global().filter(|barrier| barrier.worker_count() != 0);
+        if barrier.is_some() {
+            crate::barrier::__assert_held();
+        }
         let mut inner = self.inner.borrow_mut();
         inner.validate_node(node)?;
         inner.validate_node(next)?;
-        inner.set_node_next_slot(node, slot, next)
+        let changed = inner.set_node_next_slot(node, slot, next)?;
+        drop(inner);
+        if changed && let Some(barrier) = barrier {
+            barrier.request_node_refork(self.inner.borrow().clone());
+        }
+        Ok(())
     }
 
     pub fn add_node_next_slot(&self, node: NodeId, next: NodeId) -> RuntimeResult<u16> {
@@ -1721,9 +1819,11 @@ impl NodeMain {
         let mut inner = self.inner.borrow_mut();
         let (slots, changed) = inner.add_node_next_slots(edges, shared_slots)?;
         drop(inner);
-        if changed && workers_running {
-            GlobalMain::with_current(|main| main.request_worker_graph_refork())
-                .expect("main graph mutation requires the installed GlobalMain");
+        if changed
+            && let Some(barrier) =
+                crate::barrier::global().filter(|barrier| barrier.worker_count() != 0)
+        {
+            barrier.request_node_refork(self.inner.borrow().clone());
         }
         Ok(slots)
     }
@@ -1802,11 +1902,11 @@ impl NodeMain {
     }
 }
 
-pub struct NodeRuntimeReady {
-    readiness: Rc<NodeReadiness>,
+pub struct NodeRuntimeReady<'a> {
+    readiness: &'a NodeReadiness,
 }
 
-impl Future for NodeRuntimeReady {
+impl Future for NodeRuntimeReady<'_> {
     type Output = ();
 
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
@@ -1885,7 +1985,12 @@ mod tests {
             .unwrap();
         runtime
             .nodes()
-            .install_node_function(node, 1, &[__NODE_FUNCTION_PACKET_INPUT_SCALAR], process)
+            .install_node_function(
+                node,
+                1,
+                [&__NODE_FUNCTION_PACKET_INPUT_SCALAR].into_iter(),
+                process,
+            )
             .unwrap();
         assert_eq!(runtime.nodes().frame_args_size(node).unwrap(), (8, 4, 2));
         for calls in 1..=2 {
@@ -1919,7 +2024,7 @@ mod tests {
                 ),
             )
             .expect("register existing node");
-        let mut worker = NodeMain::from(main.snapshot());
+        let mut worker = main.clone();
         let worker_data = NodeRuntime::from_words([9, 8, 7, 6]);
         worker
             .set_node_runtime_data(existing, worker_data)
@@ -1943,7 +2048,7 @@ mod tests {
                 ),
             )
             .expect("register added node");
-        worker.refork(main.snapshot());
+        worker.refork(main.inner.borrow().clone());
 
         assert_eq!(worker.node_runtime_data(existing).unwrap(), worker_data);
         assert_eq!(worker.node_state(existing).unwrap(), NodeState::Interrupt);

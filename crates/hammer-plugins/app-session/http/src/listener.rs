@@ -41,13 +41,13 @@
 use std::cell::UnsafeCell;
 use std::collections::HashMap;
 use std::ops::Deref;
-use std::sync::{Arc, OnceLock};
+use std::sync::OnceLock;
 
 use hammer_infra::align::CacheLineAlignMark;
 use hammer_infra::thread_owned::ThreadOwned;
 use hammer_runtime::app::SessionHandle;
 use hammer_runtime::{
-    DataPlaneMain, DataWorkerId, GlobalMain, RuntimeError, RuntimeResult, SessionListenEndpoint,
+    DataPlaneMain, DataWorkerId, RuntimeError, RuntimeResult, SessionListenEndpoint,
 };
 use hammer_service::session::application_main;
 use hammer_service::session::runtime::session_main;
@@ -449,17 +449,17 @@ pub(crate) fn stop_listen(connection_index: u32) -> RuntimeResult<()> {
 /// already resolvable from the plugin main (mirroring `init_quic`,
 /// quic listener.rs:487-520). Resolves the builtin HTTP Session App and
 /// attaches the inner Application exactly as QUIC does for its inner
-/// listener (quic listener.rs:493-504). Duplicate initialization is a typed
-/// error and detaches the just-attached inner Application; the OnceLock keeps
-/// the authority single-owner with no lock.
+/// listener (quic listener.rs:493-504). The lifecycle progress bitmap makes
+/// initialization call-once; the OnceLock retains the resulting authority.
 #[hammer_component_macros::init_function(
     name = "http_transport_init",
     runs_after = ["quic_init", "session_init"]
 )]
-fn init_http_transport(engine: &mut GlobalMain) -> RuntimeResult<()> {
-    if HTTP_MAIN.get().is_some() {
-        return Err(RuntimeError::PluginStateNotInitialized { plugin: "http" });
-    }
+fn init_http_transport() -> RuntimeResult<()> {
+    assert!(
+        HTTP_MAIN.get().is_none(),
+        "HTTP initialization callback executes once"
+    );
     let quic_protocol = hammer_plugin_quic::protocol()?;
     let inner_application = application_main().attach().map_err(RuntimeError::from)?;
     let session_app = match http_app::register(inner_application) {
@@ -493,14 +493,12 @@ fn init_http_transport(engine: &mut GlobalMain) -> RuntimeResult<()> {
         protocol,
         session_app,
         inner_application,
-        engine.configured_worker_count(),
+        hammer_runtime::config::worker::worker_count(),
     );
-    if HTTP_MAIN.set(main).is_err() {
-        application_main()
-            .detach(inner_application)
-            .expect("duplicate HTTP initialization leaves no published inner Application");
-        return Err(RuntimeError::PluginStateNotInitialized { plugin: "http" });
-    }
+    assert!(
+        HTTP_MAIN.set(main).is_ok(),
+        "HTTP Main remains uninitialized after lifecycle preflight"
+    );
     Ok(())
 }
 

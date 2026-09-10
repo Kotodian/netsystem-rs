@@ -768,13 +768,13 @@ impl FeatureState {
         }
     }
 }
-#[hammer_component_macros::init_function(name = "interface_feature_init", runs_after = ["install_packet_graph"])]
+#[hammer_component_macros::init_function(name = "interface_feature_init")]
 fn interface_feature_init(
-    engine: &mut hammer_runtime::GlobalMain,
+    main: &mut hammer_runtime::DataPlaneMain,
 ) -> hammer_runtime::RuntimeResult<()> {
     crate::net::NetMain::global()?
         .interface_main()
-        .install_feature_arcs(engine.data_plane_main().nodes())
+        .install_feature_arcs(main.nodes())
         .map_err(
             |source| hammer_runtime::RuntimeError::GraphNodeInitialization {
                 node: "interface-output",

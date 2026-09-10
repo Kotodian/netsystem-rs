@@ -1,7 +1,7 @@
 use super::*;
 
 impl DataPlaneMain {
-    pub fn set_trace_control(&self, control: Option<TraceControlHandle>) {
+    pub fn set_trace_control(&mut self, control: Option<TraceControlHandle>) {
         self.trace.set_control(control);
     }
 

@@ -1084,7 +1084,7 @@ pub(crate) mod tests {
                     (&packet).len()
                 );
                 {
-                    let mut buffer = runtime.buffer_mut(index);
+                    let buffer = runtime.buffer_mut(index);
                     let mut network = NetworkOpaque::default();
                     network.sw_if_index[0] = raw_rx;
                     network.flags = flags;

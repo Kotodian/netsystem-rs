@@ -1,11 +1,11 @@
 //! Session layer — shared in `hammer-service` (not a loadable plugin).
 
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
-use hammer_core::data_plane::NodeState;
+use hammer_core::data_plane::{NodeId, NodeState};
 use hammer_runtime::app::AppSessionConfig;
 use hammer_runtime::attach::AppServer;
-use hammer_runtime::{DataPlaneMain, GlobalMain, RuntimeResult};
+use hammer_runtime::{DataPlaneMain, RuntimeResult};
 
 pub mod app;
 pub mod application;
@@ -30,29 +30,46 @@ pub use runtime::{
     SESSION_MAIN, SessionAcceptMetadata, SessionEndpointRole, SessionWorker, session_main,
 };
 
+static SESSION_CONFIG: OnceLock<Session> = OnceLock::new();
+static APP_SERVER: OnceLock<Arc<AppServer>> = OnceLock::new();
+static APP_SESSION_INPUT_NODE: OnceLock<NodeId> = OnceLock::new();
+
+pub fn app_server() -> Option<Arc<AppServer>> {
+    APP_SERVER.get().map(Arc::clone)
+}
+
+pub fn session_config() -> &'static Session {
+    SESSION_CONFIG
+        .get()
+        .expect("Session configuration is installed before Session initialization")
+}
+
 #[hammer_component_macros::config_function(
     name = "session_config",
     section = "network",
     early = true,
     runs_after = ["runtime_worker_config"]
 )]
-fn configure_session(config: config::NetworkSessionConfig) -> RuntimeResult<Arc<Session>> {
+fn configure_session(config: config::NetworkSessionConfig) -> RuntimeResult<()> {
     let session = config.session.unwrap_or_default();
     session.validate()?;
-    Ok(Arc::new(session))
+    assert!(
+        SESSION_CONFIG.set(session).is_ok(),
+        "Session configuration callback executes once"
+    );
+    Ok(())
 }
 
 #[hammer_component_macros::init_function(
     name = "session_init",
     runs_after = ["transport_main_init", "application_init"]
 )]
-fn init_session(engine: &mut GlobalMain, session: Arc<Session>) -> RuntimeResult<()> {
-    engine.registry.set(Arc::clone(&session));
-    runtime::SessionMain::init(engine.configured_worker_count())
+fn init_session() -> RuntimeResult<()> {
+    runtime::SessionMain::init(hammer_runtime::config::worker::worker_count())
 }
 
 #[hammer_component_macros::main_loop_exit_function]
-fn exit_session(_engine: &mut GlobalMain) -> RuntimeResult<()> {
+fn exit_session() -> RuntimeResult<()> {
     session_main().begin_session_migration_shutdown();
     Ok(())
 }
@@ -61,12 +78,13 @@ fn exit_session(_engine: &mut GlobalMain) -> RuntimeResult<()> {
     name = "application_init",
     runs_after = ["transport_main_init"]
 )]
-fn init_application(_: &mut GlobalMain, _: Arc<Session>) -> RuntimeResult<()> {
+fn init_application() -> RuntimeResult<()> {
     ApplicationMain::init()
 }
 
 #[hammer_component_macros::worker_init_function(name = "session_worker_init")]
-fn init_session_worker(engine: &mut DataPlaneMain, session: Arc<Session>) -> RuntimeResult<()> {
+fn init_session_worker(engine: &mut DataPlaneMain) -> RuntimeResult<()> {
+    let session = session_config();
     let worker = engine.data_worker_id()?;
     let session_queue = engine
         .node_by_name("session-queue")
@@ -77,16 +95,23 @@ fn init_session_worker(engine: &mut DataPlaneMain, session: Arc<Session>) -> Run
     let app_session_input = engine
         .node_by_name("appsl-rx-mqs-input")
         .ok_or(error::SessionQueueError::NodeMissing)?;
+    if let Some(installed) = APP_SESSION_INPUT_NODE.get() {
+        assert_eq!(
+            *installed, app_session_input,
+            "Session workers share graph node identities"
+        );
+    } else {
+        APP_SESSION_INPUT_NODE
+            .set(app_session_input)
+            .expect("Session input node identity is installed once");
+    }
     engine
         .nodes()
         .set_node_state(app_session_input, NodeState::Disabled)?;
-    let publisher = engine
-        .registry()
-        .get::<AppServer>()
-        .map(|server| server.publisher());
+    let publisher = APP_SERVER.get().map(|server| server.publisher());
     let sessions = SessionWorker::new(
         worker,
-        engine.configured_worker_count(),
+        hammer_runtime::config::worker::worker_count(),
         AppSessionConfig::default(),
         session.pool_capacity,
         publisher,
@@ -96,12 +121,15 @@ fn init_session_worker(engine: &mut DataPlaneMain, session: Arc<Session>) -> Run
 }
 
 #[hammer_component_macros::init_function(name = "session_attach_server")]
-fn configure_attach_server(
-    #[inject(optional)] session: Arc<Session>,
-) -> RuntimeResult<Option<Arc<AppServer>>> {
+fn configure_attach_server() -> RuntimeResult<()> {
+    let session = session_config();
     let Some(path) = session.attach_socket_path.as_deref() else {
-        return Ok(None);
+        return Ok(());
     };
     let server = Arc::new(AppServer::bind(path, session.app_session_capacity)?);
-    Ok(Some(server))
+    assert!(
+        APP_SERVER.set(server).is_ok(),
+        "Session attach server configuration callback executes once"
+    );
+    Ok(())
 }

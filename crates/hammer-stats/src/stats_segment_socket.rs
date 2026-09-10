@@ -4,10 +4,7 @@ pub mod stats_segment_socket {
 
     use crate::{StatsError, StatsMain};
 
-    fn read<Context, Error>(
-        _context: &Context,
-        file: &mut File<Context, Error>,
-    ) -> Result<(), Error>
+    fn read<Context, Error>(_: &mut Context, file: &mut File<Context, Error>) -> Result<(), Error>
     where
         Error: From<StatsError>,
     {
@@ -16,7 +13,7 @@ pub mod stats_segment_socket {
     }
 
     fn error<Context, Error>(
-        context: &Context,
+        context: &mut Context,
         file: &mut File<Context, Error>,
     ) -> Result<(), Error>
     where

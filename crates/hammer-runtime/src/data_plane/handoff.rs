@@ -168,15 +168,9 @@ mod tests {
             DataPlaneMain::attach_handoff_worker(source, handoff.worker(DataWorkerId::new(0)));
         let receiver = handoff.worker(DataWorkerId::new(1));
         let (nodes, simd_bytes, _, trace_control) = source.worker_parts();
-        let mut receiver = DataPlaneMain::from_worker_parts(
-            nodes,
-            simd_bytes,
-            Some(receiver),
-            trace_control,
-            2,
-            0,
-        )
-        .unwrap();
+        let mut receiver =
+            DataPlaneMain::new_worker(nodes, simd_bytes, Some(receiver), trace_control, 2, 0)
+                .unwrap();
 
         let destination = DataWorkerId::new(1);
         let mut frame = Frame::<(), u32, ()>::new(0);

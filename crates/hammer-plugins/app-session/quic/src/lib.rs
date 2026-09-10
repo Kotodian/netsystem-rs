@@ -16,7 +16,6 @@ hammer_component_macros::declare_plugin!(
     load_after = ["udp"],
     init_functions = [listener::__INIT_FN_QUIC_INIT],
     config_functions = [],
-    early_config_functions = [],
     main_loop_enter_functions = [],
     main_loop_exit_functions = [],
     worker_init_functions = [listener::__INIT_FN_QUIC_WORKER_INIT],

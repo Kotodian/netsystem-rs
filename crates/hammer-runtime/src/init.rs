@@ -1,12 +1,10 @@
 use petgraph::algo::toposort;
 use petgraph::graphmap::DiGraphMap;
-use std::collections::HashSet;
-use std::panic::{AssertUnwindSafe, catch_unwind};
+use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
 
 use crate::data_plane::DataPlaneMain;
 use crate::error::RuntimeResult;
 use crate::global_main::GlobalMain;
-use hammer_stats::StatsMain;
 
 #[derive(Debug, thiserror::Error)]
 pub enum InitError {
@@ -37,31 +35,9 @@ pub struct InitFunction {
     pub name: &'static str,
     pub runs_before: &'static [&'static str],
     pub runs_after: &'static [&'static str],
-    pub func: fn(&mut GlobalMain) -> RuntimeResult<()>,
-}
-
-/// Lifecycle registration executed once on each Data Worker.
-///
-/// Worker callbacks receive the owning [`DataPlaneMain`] directly. Global
-/// registration and control authority remain with [`GlobalMain`].
-#[derive(Clone, Copy)]
-pub struct WorkerInitFunction {
-    pub name: &'static str,
-    pub runs_before: &'static [&'static str],
-    pub runs_after: &'static [&'static str],
     pub func: fn(&mut DataPlaneMain) -> RuntimeResult<()>,
-}
-
-impl Ordered for WorkerInitFunction {
-    fn name(&self) -> &'static str {
-        self.name
-    }
-    fn runs_before(&self) -> &'static [&'static str] {
-        self.runs_before
-    }
-    fn runs_after(&self) -> &'static [&'static str] {
-        self.runs_after
-    }
+    #[doc(hidden)]
+    pub callback_index: &'static AtomicUsize,
 }
 
 impl Ordered for InitFunction {
@@ -86,8 +62,50 @@ pub struct ConfigFunction {
     pub section: &'static str,
     pub runs_before: &'static [&'static str],
     pub runs_after: &'static [&'static str],
-    pub func: fn(&str, &mut GlobalMain) -> RuntimeResult<()>,
+    pub early: bool,
+    pub func: fn(&str, Option<&mut DataPlaneMain>) -> RuntimeResult<()>,
+    #[doc(hidden)]
+    pub callback_index: &'static AtomicUsize,
 }
+
+const UNASSIGNED_CALLBACK_INDEX: usize = usize::MAX;
+static NEXT_CALLBACK_INDEX: AtomicUsize = AtomicUsize::new(0);
+
+pub(crate) fn allocate_callback_index() -> usize {
+    let index = NEXT_CALLBACK_INDEX.fetch_add(1, AtomicOrdering::Relaxed);
+    assert_ne!(
+        index, UNASSIGNED_CALLBACK_INDEX,
+        "lifecycle callback index space is exhausted"
+    );
+    index
+}
+
+macro_rules! impl_callback_index {
+    ($registration:ty) => {
+        impl $registration {
+            #[inline]
+            pub(crate) fn callback_index(&self) -> Option<usize> {
+                let index = self.callback_index.load(AtomicOrdering::Relaxed);
+                (index != UNASSIGNED_CALLBACK_INDEX).then_some(index)
+            }
+
+            pub(crate) fn assign_callback_index(&self, index: usize) -> usize {
+                match self.callback_index.compare_exchange(
+                    UNASSIGNED_CALLBACK_INDEX,
+                    index,
+                    AtomicOrdering::Relaxed,
+                    AtomicOrdering::Relaxed,
+                ) {
+                    Ok(_) => index,
+                    Err(assigned) => assigned,
+                }
+            }
+        }
+    };
+}
+
+impl_callback_index!(InitFunction);
+impl_callback_index!(ConfigFunction);
 
 impl Ordered for ConfigFunction {
     fn name(&self) -> &'static str {
@@ -98,6 +116,20 @@ impl Ordered for ConfigFunction {
     }
     fn runs_after(&self) -> &'static [&'static str] {
         self.runs_after
+    }
+}
+
+impl<T: Ordered + ?Sized> Ordered for &T {
+    fn name(&self) -> &'static str {
+        (*self).name()
+    }
+
+    fn runs_before(&self) -> &'static [&'static str] {
+        (*self).runs_before()
+    }
+
+    fn runs_after(&self) -> &'static [&'static str] {
+        (*self).runs_after()
     }
 }
 
@@ -152,127 +184,131 @@ pub fn topological_order<T: Ordered>(items: &[T]) -> Result<Vec<usize>, InitErro
 }
 
 fn dispatch_init(
-    items: Vec<InitFunction>,
-    called: &mut HashSet<&'static str>,
-    engine: &mut GlobalMain,
-) -> RuntimeResult<()> {
-    let order = topological_order(&items)?;
-    for index in order {
-        let function = items[index];
-        if called.contains(function.name) {
-            continue;
-        }
-        called.insert(function.name);
-        match catch_unwind(AssertUnwindSafe(|| (function.func)(engine))) {
-            Ok(result) => result?,
-            Err(payload) => std::panic::resume_unwind(payload),
-        }
-    }
-    Ok(())
-}
-
-fn dispatch_worker_init(
-    items: Vec<WorkerInitFunction>,
-    called: &mut HashSet<&'static str>,
+    items: &[&'static InitFunction],
+    global: &GlobalMain,
     main: &mut DataPlaneMain,
 ) -> RuntimeResult<()> {
-    let order = topological_order(&items)?;
+    let order = topological_order(items)?;
     for index in order {
         let function = items[index];
-        if called.contains(function.name) {
+        let callback_index = function
+            .callback_index()
+            .expect("lifecycle callback index is assigned during registration");
+        if !global.mark_init_function_called(callback_index) {
             continue;
         }
-        called.insert(function.name);
-        match catch_unwind(AssertUnwindSafe(|| (function.func)(main))) {
-            Ok(result) => result?,
-            Err(payload) => std::panic::resume_unwind(payload),
+        (function.func)(main)?;
+    }
+    Ok(())
+}
+
+pub fn run_init_functions(global: &GlobalMain, main: &mut DataPlaneMain) -> RuntimeResult<()> {
+    dispatch_init(&global.init_function_registrations, global, main)
+}
+
+pub(crate) fn run_stats_registrations() -> RuntimeResult<()> {
+    let stats_main = hammer_stats::StatsMain::global()?;
+    let plugins = crate::PluginMain::global()?;
+    let mut result = Ok(());
+    plugins.visit_images(|image| {
+        if result.is_err() {
+            return;
         }
-    }
-    Ok(())
-}
-
-pub fn run_init_functions(engine: &mut GlobalMain) -> RuntimeResult<()> {
-    let functions = engine.plugin_main().init_functions();
-    let mut called = std::mem::take(&mut engine.called_init_functions);
-    let result = dispatch_init(functions, &mut called, engine);
-    engine.called_init_functions = called;
+        for registration in image.stats_registrations() {
+            if let Err(error) = (registration.register)(stats_main) {
+                result = Err(error);
+                return;
+            }
+        }
+    });
     result
-}
-
-pub fn run_stats_registrations(engine: &GlobalMain) -> RuntimeResult<()> {
-    let stats_main = StatsMain::global()?;
-    for registration in engine.plugin_main().stats_registrations() {
-        (registration.register)(stats_main)?;
-        (registration.bind)(stats_main, &engine.registry)?;
-    }
-    Ok(())
 }
 
 pub fn run_worker_init_functions(
     main: &mut DataPlaneMain,
-    functions: Vec<WorkerInitFunction>,
+    functions: &[&'static InitFunction],
 ) -> RuntimeResult<()> {
-    let functions = functions;
-    let mut called = main.take_called_worker_init_functions();
-    let result = dispatch_worker_init(functions, &mut called, main);
-    main.restore_called_worker_init_functions(called);
+    let mut called = std::mem::take(&mut main.worker_init_functions_called);
+    let worker = main.thread_index();
+    let mut result = Ok(());
+    for function in functions {
+        let callback_index = function
+            .callback_index()
+            .expect("worker-init callback index is assigned during registration");
+        if !called.set(callback_index) {
+            continue;
+        }
+        if let Err(source) = (function.func)(main) {
+            result = Err(crate::RuntimeError::WorkerInitialization {
+                worker,
+                function: function.name,
+                source: Box::new(source),
+            });
+            break;
+        }
+    }
+    main.worker_init_functions_called = called;
     result
 }
 
-pub fn run_main_loop_enter(engine: &mut GlobalMain) -> RuntimeResult<()> {
-    let functions = engine.plugin_main().main_loop_enter_functions();
-    let mut called = std::mem::take(&mut engine.called_main_loop_enter_functions);
-    let result = dispatch_init(functions, &mut called, engine);
-    engine.called_main_loop_enter_functions = called;
-    result?;
-    engine.main_loop_entered = true;
-    Ok(())
+pub fn run_main_loop_enter(global: &GlobalMain, main: &mut DataPlaneMain) -> RuntimeResult<()> {
+    dispatch_init(&global.main_loop_enter_function_registrations, global, main)
 }
 
-pub fn run_main_loop_exit(engine: &mut GlobalMain) -> RuntimeResult<()> {
-    let functions = engine.plugin_main().main_loop_exit_functions();
-    let mut called = std::mem::take(&mut engine.called_main_loop_exit_functions);
-    let result = dispatch_init(functions, &mut called, engine);
-    engine.called_main_loop_exit_functions = called;
-    result
+pub fn run_main_loop_exit(global: &GlobalMain, main: &mut DataPlaneMain) -> RuntimeResult<()> {
+    dispatch_init(&global.main_loop_exit_function_registrations, global, main)
+}
+
+pub fn run_num_workers_change(global: &GlobalMain, main: &mut DataPlaneMain) -> RuntimeResult<()> {
+    dispatch_init(
+        &global.num_workers_change_function_registrations,
+        global,
+        main,
+    )
+}
+
+pub fn run_api_init(main: &mut DataPlaneMain) -> RuntimeResult<()> {
+    let global = GlobalMain::global();
+    dispatch_init(&global.api_init_function_registrations, global, main)
 }
 
 fn dispatch_config(
-    items: Vec<ConfigFunction>,
-    called: &mut HashSet<&'static str>,
-    engine: &mut GlobalMain,
+    items: &[&'static ConfigFunction],
+    global: &GlobalMain,
+    mut main: Option<&mut DataPlaneMain>,
+    early: bool,
     document: &str,
 ) -> RuntimeResult<()> {
-    let order = topological_order(&items)?;
+    let selected: Vec<_> = items
+        .iter()
+        .copied()
+        .filter(|function| function.early == early)
+        .collect();
+    let order = topological_order(&selected)?;
     for index in order {
-        let function = items[index];
-        if called.contains(function.name) {
+        let function = selected[index];
+        let callback_index = function
+            .callback_index()
+            .expect("config callback index is assigned during registration");
+        if !global.mark_init_function_called(callback_index) {
             continue;
         }
-        match catch_unwind(AssertUnwindSafe(|| (function.func)(document, engine))) {
-            Ok(result) => result?,
-            Err(payload) => std::panic::resume_unwind(payload),
-        }
-        called.insert(function.name);
+        (function.func)(document, main.as_deref_mut())?;
     }
     Ok(())
 }
 
 pub fn run_config_functions(
-    engine: &mut GlobalMain,
+    global: &GlobalMain,
+    main: Option<&mut DataPlaneMain>,
     early: bool,
     document: &str,
 ) -> RuntimeResult<()> {
-    let functions = engine.plugin_main().config_functions(early);
-    if early {
-        let mut called = std::mem::take(&mut engine.called_early_config_functions);
-        let result = dispatch_config(functions, &mut called, engine, document);
-        engine.called_early_config_functions = called;
-        result
-    } else {
-        let mut called = std::mem::take(&mut engine.called_config_functions);
-        let result = dispatch_config(functions, &mut called, engine, document);
-        engine.called_config_functions = called;
-        result
-    }
+    dispatch_config(
+        &global.config_function_registrations,
+        global,
+        main,
+        early,
+        document,
+    )
 }

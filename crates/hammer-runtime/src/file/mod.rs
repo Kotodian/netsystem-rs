@@ -21,8 +21,6 @@ use hammer_infra::sync::{SpinLock, SpinLockGuard};
 
 use crate::NodeMain;
 use crate::error::{RuntimeError, RuntimeResult};
-use crate::global_main::GlobalMain;
-use hammer_component_macros::init_function;
 use hammer_core::file::{
     File as CoreFile, FileFunction as CoreFileFunction, FileFunctions as CoreFileFunctions,
 };
@@ -65,7 +63,7 @@ pub enum FileIoStatus {
 }
 
 /// Worker-local callback invoked when a registered deadline expires.
-pub type DeadlineFunction = fn(&NodeMain, &mut Deadline) -> RuntimeResult<()>;
+pub type DeadlineFunction = fn(&mut NodeMain, &mut Deadline) -> RuntimeResult<()>;
 
 /// A worker-local deadline registration owned by [`FileMain`].
 pub struct Deadline {
@@ -157,17 +155,23 @@ unsafe impl Sync for FileMain {}
 
 pub static FILE_MAIN: OnceLock<FileMain> = OnceLock::new();
 
-#[init_function(name = "file_main_init")]
-pub fn init_file_main(engine: &mut GlobalMain) -> RuntimeResult<()> {
-    if FILE_MAIN.get().is_none() {
-        let poller_count = engine.configured_worker_count().saturating_add(1);
-        let file_main = FileMain::with_worker_count(poller_count)?;
-        let _ = FILE_MAIN.set(file_main);
+pub(crate) fn init_file_main(thread_count: usize) -> RuntimeResult<()> {
+    if FILE_MAIN.get().is_some() {
+        return Ok(());
     }
+    let file_main = FileMain::with_worker_count(thread_count)?;
+    assert!(
+        FILE_MAIN.set(file_main).is_ok(),
+        "FileMain has one startup owner"
+    );
     Ok(())
 }
 
-fn dispatch_file(file: &mut File, graph: &NodeMain, readiness: Readiness) -> RuntimeResult<usize> {
+fn dispatch_file(
+    file: &mut File,
+    graph: &mut NodeMain,
+    readiness: Readiness,
+) -> RuntimeResult<usize> {
     let functions = file.functions();
     if readiness.contains(Readiness::ERROR)
         && let Some(function) = functions.error
@@ -679,7 +683,7 @@ impl FileMain {
     }
 
     /// Performs one nonblocking readiness poll and dispatches main-thread callbacks.
-    pub fn poll(&self, graph: &NodeMain) -> RuntimeResult<usize> {
+    pub fn poll(&self, graph: &mut NodeMain) -> RuntimeResult<usize> {
         self.poll_for_worker(0, graph)
     }
 
@@ -687,7 +691,7 @@ impl FileMain {
     pub(crate) fn poll_for_worker(
         &self,
         thread_index: u32,
-        graph: &NodeMain,
+        graph: &mut NodeMain,
     ) -> RuntimeResult<usize> {
         self.release_pending(thread_index);
         let mut events = [PollEvent::default(); POLL_BATCH_SIZE];
@@ -751,6 +755,11 @@ pub struct AsyncFileMain {
     wake: AsyncFd<OwnedFd>,
 }
 
+pub(crate) enum FileMode {
+    Sync,
+    Async(AsyncFileMain),
+}
+
 impl AsyncFileMain {
     /// Creates the Tokio adapter for the main-thread shard.
     pub fn new() -> RuntimeResult<Self> {
@@ -773,7 +782,7 @@ impl AsyncFileMain {
     }
 
     /// Awaits main-shard readiness and performs one nonblocking poll.
-    pub async fn next_ready(&mut self, graph: &NodeMain) -> RuntimeResult<usize> {
+    pub async fn next_ready(&mut self, graph: &mut NodeMain) -> RuntimeResult<usize> {
         let mut guard =
             self.wake
                 .readable()
@@ -788,13 +797,6 @@ impl AsyncFileMain {
         file_main.clear_io_wake_for_worker(0)?;
         guard.clear_ready();
         file_main.poll_for_worker(0, graph)
-    }
-
-    /// Returns the direct global FileMain registry.
-    pub fn file_main(&self) -> &'static FileMain {
-        FILE_MAIN
-            .get()
-            .expect("FileMain is initialized before runtime services start")
     }
 }
 

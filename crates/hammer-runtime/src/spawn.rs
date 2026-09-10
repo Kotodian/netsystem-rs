@@ -4,25 +4,16 @@
 //! Control code submits closures through `DataRemoteLocalQueue`; it does not
 //! create another runtime context or execution aggregate.
 
-use std::cell::Cell;
 use std::collections::VecDeque;
 use std::future::Future;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::thread;
-use std::time::Duration;
 
 use crate::DataPlaneMain;
+use crate::{DataWorkerId, RuntimeError, RuntimeResult};
 use tracing::instrument::WithSubscriber;
 
-thread_local! {
-    static DATA_PLANE_MAIN: Cell<Option<*mut DataPlaneMain>> = const { Cell::new(None) };
-    pub(crate) static DATA_WORKER_IDLE_SLICE: Cell<Duration> =
-        const { Cell::new(Duration::from_millis(1)) };
-}
-
-pub(crate) fn apply_worker_idle_slice(idle_slice: Duration) {
-    DATA_WORKER_IDLE_SLICE.with(|slot| slot.set(idle_slice));
-}
+static WORKER_CONTROL_QUEUES: OnceLock<Arc<[DataRemoteLocalQueue]>> = OnceLock::new();
 
 #[derive(Clone)]
 pub struct DataRemoteLocalQueue {
@@ -33,7 +24,7 @@ pub struct DataRemoteLocalQueue {
 struct DataRemoteLocalQueueState {
     accepting: bool,
     capacity: usize,
-    tasks: VecDeque<Box<dyn FnOnce() + Send + 'static>>,
+    tasks: VecDeque<Box<dyn FnOnce(&mut DataPlaneMain) + Send + 'static>>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -74,7 +65,7 @@ impl DataRemoteLocalQueue {
 
     pub(crate) fn push(
         &self,
-        task: impl FnOnce() + Send + 'static,
+        task: impl FnOnce(&mut DataPlaneMain) + Send + 'static,
     ) -> Result<(), DataRemoteLocalQueueError> {
         let mut state = self.tasks.lock().expect("remote local queue poisoned");
         if !state.accepting {
@@ -111,17 +102,51 @@ impl DataRemoteLocalQueue {
         drop(tasks);
     }
 
-    pub(crate) fn drain(&self) -> VecDeque<Box<dyn FnOnce() + Send + 'static>> {
+    pub(crate) fn drain(&self) -> VecDeque<Box<dyn FnOnce(&mut DataPlaneMain) + Send + 'static>> {
         let mut state = self.tasks.lock().expect("remote local queue poisoned");
         std::mem::take(&mut state.tasks)
     }
 }
 
-pub(crate) fn poll_remote_local_tasks(queue: &DataRemoteLocalQueue) -> bool {
+pub(crate) fn install_worker_control_queues(queues: Arc<[DataRemoteLocalQueue]>) {
+    assert!(
+        WORKER_CONTROL_QUEUES.set(queues).is_ok(),
+        "worker control queues are installed once"
+    );
+}
+
+pub fn schedule_on_worker(
+    worker: DataWorkerId,
+    task: impl FnOnce(&mut DataPlaneMain) + Send + 'static,
+) -> RuntimeResult<()> {
+    crate::ensure_main_thread()?;
+    let worker_count = crate::config::worker::worker_count();
+    if worker.slot() >= worker_count {
+        return Err(RuntimeError::DataWorkerIndexOutOfRange {
+            worker: worker.slot(),
+            worker_count,
+        });
+    }
+    let queue = WORKER_CONTROL_QUEUES
+        .get()
+        .and_then(|queues| queues.get(worker.slot()))
+        .ok_or(RuntimeError::WorkerControlUnavailable { worker })?;
+    queue.push(task).map_err(|error| match error {
+        DataRemoteLocalQueueError::Closed => RuntimeError::WorkerControlClosed { worker },
+        DataRemoteLocalQueueError::Full { capacity } => {
+            RuntimeError::WorkerControlQueueFull { worker, capacity }
+        }
+    })
+}
+
+pub(crate) fn poll_remote_local_tasks(
+    queue: &DataRemoteLocalQueue,
+    main: &mut DataPlaneMain,
+) -> bool {
     let mut progressed = false;
     for task in queue.drain() {
         progressed = true;
-        task();
+        task(main);
     }
     progressed
 }
@@ -132,34 +157,4 @@ where
     F::Output: Send + 'static,
 {
     tokio::spawn(future.with_current_subscriber())
-}
-
-pub(crate) fn cleanup_thread_local() {
-    DATA_PLANE_MAIN.with(|slot| slot.set(None));
-}
-
-pub fn set_data_plane_main(main: &mut DataPlaneMain) {
-    DATA_PLANE_MAIN.with(|slot| slot.set(Some(main as *mut DataPlaneMain)));
-}
-
-pub fn with_data_plane_main<R>(f: impl FnOnce(&DataPlaneMain) -> R) -> R {
-    DATA_PLANE_MAIN.with(|slot| {
-        let pointer = slot
-            .get()
-            .expect("data plane main not initialized on worker thread");
-        // SAFETY: the pointer is installed only for the owning worker thread
-        // and cleared before the worker's DataPlaneMain is dropped.
-        unsafe { f(&*pointer) }
-    })
-}
-
-pub fn with_data_plane_main_mut<R>(f: impl FnOnce(&mut DataPlaneMain) -> R) -> R {
-    DATA_PLANE_MAIN.with(|slot| {
-        let pointer = slot
-            .get()
-            .expect("data plane main not initialized on worker thread");
-        // SAFETY: the pointer is installed only for the owning worker thread,
-        // and worker control tasks execute serially on that thread.
-        unsafe { f(&mut *pointer) }
-    })
 }

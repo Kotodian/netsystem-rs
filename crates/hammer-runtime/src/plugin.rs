@@ -5,6 +5,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
+use std::sync::OnceLock;
 
 use abi_stable::{
     RRef, StableAbi,
@@ -17,11 +18,8 @@ use semver::Version;
 use serde::Deserialize;
 
 use crate::binary_api::BinaryApiMethodEntry;
-use crate::init::{ConfigFunction, InitFunction, WorkerInitFunction};
-use crate::node::{NodeEntry, NodeFunctionRegistration};
 use crate::plugin_loader::{PluginLibrary, read_plugin_module};
-use crate::process::ProcessEntry;
-use crate::registration::{RegistrationImage, StatsRegistration};
+use crate::registration::RegistrationImage;
 
 /// Metadata owned by one dynamically loaded plugin module.
 #[repr(C)]
@@ -149,6 +147,8 @@ impl RootModule for PluginModuleRef {
 
 #[derive(Debug, thiserror::Error)]
 pub enum PluginError {
+    #[error("Plugin Main is not published")]
+    MainUnavailable,
     #[error("plugin `{name}` is not loaded")]
     NotLoaded { name: String },
     #[error("plugin `{plugin}` symbol `{symbol}` lookup failed")]
@@ -246,6 +246,8 @@ pub struct PluginMain {
     libraries: Vec<PluginLibrary>,
 }
 
+pub(crate) static PLUGIN_MAIN: OnceLock<PluginMain> = OnceLock::new();
+
 impl Default for PluginMain {
     fn default() -> Self {
         Self {
@@ -268,6 +270,10 @@ impl std::fmt::Debug for PluginMain {
 }
 
 impl PluginMain {
+    pub fn global() -> Result<&'static Self, PluginError> {
+        PLUGIN_MAIN.get().ok_or(PluginError::MainUnavailable)
+    }
+
     pub fn get_plugin_symbol<T>(
         &self,
         plugin: &str,
@@ -297,8 +303,14 @@ impl PluginMain {
             })
     }
     /// Adds one host-owned registration image before plugin lifecycle starts.
-    pub fn register_builtin_image(&mut self, image: &'static RegistrationImage) {
-        self.builtin_registration_images.push(image);
+    pub fn register_image(&mut self, image: &'static RegistrationImage) {
+        if !self
+            .builtin_registration_images
+            .iter()
+            .any(|current| std::ptr::eq(*current, image))
+        {
+            self.builtin_registration_images.push(image);
+        }
     }
 
     /// Resolve the configured plugin directory.
@@ -503,75 +515,79 @@ impl PluginMain {
         self.load_order.clone()
     }
 
-    fn collect_registrations<T: Copy + 'static>(
-        &self,
-        inventory: impl Fn(&RegistrationImage) -> &'static [T],
-    ) -> Vec<T> {
-        let mut registrations = Vec::new();
-        for image in &self.builtin_registration_images {
-            registrations.extend_from_slice(inventory(image));
+    fn registration_images(&self) -> impl Clone + Iterator<Item = &RegistrationImage> {
+        self.builtin_registration_images
+            .iter()
+            .copied()
+            .chain(self.load_order.iter().map(|name| {
+                self.modules_by_plugin
+                    .get(name)
+                    .expect("loaded plugin order references a retained module")
+                    .registration_image()
+                    .get()
+            }))
+    }
+
+    pub(crate) fn visit_images(&self, mut visit: impl FnMut(&RegistrationImage)) {
+        for image in self.registration_images() {
+            visit(image);
         }
-        for name in &self.load_order {
-            let Some(module) = self.modules_by_plugin.get(name) else {
-                continue;
-            };
-            registrations.extend_from_slice(inventory(module.registration_image().get()));
-        }
-        registrations
     }
 
-    pub(crate) fn init_functions(&self) -> Vec<InitFunction> {
-        self.collect_registrations(RegistrationImage::init_functions)
-    }
-
-    pub(crate) fn config_functions(&self, early: bool) -> Vec<ConfigFunction> {
-        self.collect_registrations(|image| image.config_functions(early))
-    }
-
-    pub(crate) fn stats_registrations(&self) -> Vec<StatsRegistration> {
-        self.collect_registrations(RegistrationImage::stats_registrations)
-    }
-
-    pub(crate) fn worker_init_functions(&self) -> Vec<WorkerInitFunction> {
-        self.collect_registrations(RegistrationImage::worker_init_functions)
-    }
-
-    pub(crate) fn main_loop_enter_functions(&self) -> Vec<InitFunction> {
-        self.collect_registrations(RegistrationImage::main_loop_enter_functions)
-    }
-
-    pub(crate) fn main_loop_exit_functions(&self) -> Vec<InitFunction> {
-        self.collect_registrations(RegistrationImage::main_loop_exit_functions)
-    }
-
-    pub(crate) fn graph_nodes(&self) -> Vec<NodeEntry> {
-        self.collect_registrations(RegistrationImage::graph_nodes)
-    }
-
-    pub(crate) fn node_functions(&self) -> Vec<NodeFunctionRegistration> {
-        self.collect_registrations(RegistrationImage::node_functions)
-    }
-
-    pub(crate) fn process_nodes(&self) -> Vec<ProcessEntry> {
-        self.collect_registrations(RegistrationImage::process_nodes)
-    }
-
-    pub fn binary_api_methods(&self) -> Vec<BinaryApiMethodEntry> {
-        self.collect_registrations(RegistrationImage::binary_api_methods)
+    pub fn register_global_declarations(&self, global: &mut crate::GlobalMain) {
+        self.visit_images(|image| {
+            for registration in image.graph_nodes() {
+                global.register_node(registration);
+            }
+            for registration in image.process_nodes() {
+                global.register_node(registration);
+            }
+            for registration in image.node_functions() {
+                global.register_node_function(registration);
+            }
+            for registration in image.init_functions() {
+                global.register_init(registration);
+            }
+            for registration in image.main_loop_enter_functions() {
+                global.register_main_loop_enter(registration);
+            }
+            for registration in image.main_loop_exit_functions() {
+                global.register_main_loop_exit(registration);
+            }
+            for registration in image.worker_init_functions() {
+                global.register_worker_init(registration);
+            }
+            for registration in image.num_workers_change_functions() {
+                global.register_num_workers_change(registration);
+            }
+            for registration in image.api_init_functions() {
+                global.register_api_init(registration);
+            }
+            for registration in image.config_functions() {
+                global.register_config(registration);
+            }
+        });
     }
 
     pub fn binary_api_method(&self, name: &str) -> Result<BinaryApiMethodEntry, PluginError> {
         let mut found = None;
-        for entry in self.binary_api_methods() {
-            if entry.name() != name {
-                continue;
+        let mut duplicate = false;
+        self.visit_images(|image| {
+            for entry in image.binary_api_methods() {
+                if entry.name() != name {
+                    continue;
+                }
+                if found.is_some() {
+                    duplicate = true;
+                } else {
+                    found = Some(*entry);
+                }
             }
-            if found.is_some() {
-                return Err(PluginError::BinaryApiMethodDuplicate {
-                    name: name.to_owned(),
-                });
-            }
-            found = Some(entry);
+        });
+        if duplicate {
+            return Err(PluginError::BinaryApiMethodDuplicate {
+                name: name.to_owned(),
+            });
         }
         found.ok_or_else(|| PluginError::BinaryApiMethodMissing {
             name: name.to_owned(),

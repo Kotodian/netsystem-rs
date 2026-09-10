@@ -5,7 +5,7 @@ use std::os::fd::{AsRawFd, OwnedFd, RawFd};
 
 /// Callback invoked for one ready file descriptor.
 pub type FileFunction<Context, Error> =
-    fn(&Context, &mut File<Context, Error>) -> Result<(), Error>;
+    fn(&mut Context, &mut File<Context, Error>) -> Result<(), Error>;
 
 /// Read, write, and error callbacks associated with one [`File`].
 pub struct FileFunctions<Context, Error> {

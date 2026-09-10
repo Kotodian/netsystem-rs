@@ -8,12 +8,31 @@ pub enum RuntimeError {
     DataPlane(#[from] DataPlaneError),
     #[error("parse TOML: {message}")]
     ConfigParse { message: String },
+    #[error("config callback `{function}` failed to parse section `{section}`")]
+    ConfigFunctionParse {
+        function: &'static str,
+        section: &'static str,
+        #[source]
+        source: toml::de::Error,
+    },
     #[error("invalid runtime configuration: {message}")]
     ConfigValidation { message: String },
     #[error("{stage}: {message}")]
     Lifecycle { stage: String, message: String },
     #[error("service closed")]
     ServiceClosed,
+    #[error("read startup configuration `{path}`")]
+    StartupConfigRead {
+        path: std::path::PathBuf,
+        #[source]
+        source: std::io::Error,
+    },
+    #[error("wait for Unix signal `{signal}`")]
+    UnixSignal {
+        signal: &'static str,
+        #[source]
+        source: std::io::Error,
+    },
     #[error("global FileMain is already initialized")]
     FileMainAlreadyInitialized,
     #[error("global FileMain is not initialized")]
@@ -63,6 +82,38 @@ pub enum RuntimeError {
     Stats(#[from] hammer_stats::StatsError),
     #[error("worker count {count} does not fit u32")]
     WorkerCountOverflow { count: usize },
+    #[error("worker count must be non-zero")]
+    WorkerCountZero,
+    #[error("worker thread stack size must be non-zero")]
+    WorkerStackSizeZero,
+    #[error("worker blocking thread count must be non-zero")]
+    WorkerBlockingThreadCountZero,
+    #[error("thread count does not fit u32")]
+    ThreadCountOverflow,
+    #[error("operating-system CPU inventory is unavailable")]
+    CpuInventoryUnavailable,
+    #[error("CPU index {cpu} does not fit the runtime identity")]
+    CpuIndexOverflow { cpu: usize },
+    #[error("configured CPU {cpu} is unavailable")]
+    CpuUnavailable { cpu: usize },
+    #[error("CPU {cpu} configured for data worker {worker} is unavailable")]
+    WorkerCpuUnavailable { worker: usize, cpu: usize },
+    #[error("no CPU remains for data worker {worker}")]
+    WorkerCpuExhausted { worker: usize },
+    #[error("failed to bind runtime thread {thread_index} to CPU {cpu}")]
+    WorkerCpuAffinity { thread_index: u32, cpu: usize },
+    #[cfg(target_os = "linux")]
+    #[error("failed to configure data-worker scheduling policy")]
+    WorkerScheduler {
+        #[source]
+        source: Box<thread_priority::Error>,
+    },
+    #[cfg(target_os = "macos")]
+    #[error("failed to configure data-worker QoS")]
+    WorkerQos {
+        #[source]
+        source: std::io::Error,
+    },
     #[error("plugin `{plugin}` state is not initialized")]
     PluginStateNotInitialized { plugin: &'static str },
     #[error("thread {thread_index} is not a data worker")]
@@ -75,19 +126,53 @@ pub enum RuntimeError {
     ControlRequiresWorkerBarrier,
     #[error("worker configuration cannot change after runtime initialization")]
     WorkerConfigurationAlreadyInitialized,
+    #[error("worker configuration field `{field}` is specified more than once via `{alias}`")]
+    WorkerConfigurationFieldDuplicate {
+        field: &'static str,
+        alias: &'static str,
+    },
+    #[error("failed to parse worker configuration field `{field}`")]
+    WorkerConfigurationFieldParse {
+        field: &'static str,
+        #[source]
+        source: toml::de::Error,
+    },
+    #[error("unknown worker configuration field `{field}`")]
+    WorkerConfigurationFieldUnknown { field: String },
     #[error("data workers are already started")]
     DataWorkersAlreadyStarted,
-    #[error("data worker {worker} thread setup failed")]
-    DataWorkerThreadSetup {
-        worker: usize,
+    #[error("runtime thread {thread_index} setup failed")]
+    ThreadSetup {
+        thread_index: u32,
         #[source]
         source: Box<RuntimeError>,
     },
-    #[error("failed to spawn data worker {worker} thread")]
-    DataWorkerThreadSpawn {
-        worker: usize,
+    #[error("failed to spawn runtime thread {thread_index} for registration `{name}`")]
+    ThreadSpawn {
+        thread_index: u32,
+        name: &'static str,
         #[source]
         source: std::io::Error,
+    },
+    #[error("failed to build the Tokio runtime for data worker {worker}")]
+    DataWorkerRuntime {
+        worker: u32,
+        #[source]
+        source: std::io::Error,
+    },
+    #[error("failed to build the Tokio runtime for thread-zero Process Nodes")]
+    MainRuntime {
+        #[source]
+        source: std::io::Error,
+    },
+    #[error("data worker {worker} exited with status {status}")]
+    DataWorkerExited { worker: u32, status: i32 },
+    #[error("data worker {worker} callback `{function}` initialization failed")]
+    WorkerInitialization {
+        worker: u32,
+        function: &'static str,
+        #[source]
+        source: Box<RuntimeError>,
     },
     #[error("data worker {worker} control call was canceled")]
     DataWorkerCallCanceled { worker: usize },
@@ -102,10 +187,8 @@ pub enum RuntimeError {
         worker: crate::DataWorkerId,
         capacity: usize,
     },
-    #[error("Process Nodes can only start on GlobalMain")]
-    ProcessNodesRequireGlobalMain,
-    #[error("Process Nodes must be controlled by their owner thread")]
-    ProcessControlWrongThread,
+    #[error("thread-zero Process runtime is unavailable")]
+    MainProcessRuntimeUnavailable,
     #[error(transparent)]
     AppSession(#[from] crate::app::AppSessionError),
     #[error("Application Session control operation failed")]
@@ -120,6 +203,49 @@ pub enum RuntimeError {
     },
     #[error("duplicate Process Node `{name}`")]
     DuplicateProcessNode { name: &'static str },
+    #[error("Process Node declaration has no registered name")]
+    ProcessNodeNameMissing,
+    #[error("Process Node declaration `{name}` has graph kind {kind:?}")]
+    ProcessNodeKindInvalid {
+        name: &'static str,
+        kind: hammer_core::data_plane::NodeKind,
+    },
+    #[error("Process Node declaration `{name}` has no concrete future constructor")]
+    ProcessStartMissing { name: &'static str },
+    #[error("Process Node declaration `{name}` has no NodeId storage")]
+    ProcessNodeIndexStorageMissing { name: &'static str },
+    #[error("Process Node `{name}` has not installed its NodeId")]
+    ProcessNodeIdentityUnavailable { name: &'static str },
+    #[error("Process Node {node:?} is not registered on thread zero")]
+    ProcessNodeNotRegistered {
+        node: hammer_core::data_plane::NodeId,
+    },
+    #[error("Process Node {node:?} is already started")]
+    ProcessNodeAlreadyStarted {
+        node: hammer_core::data_plane::NodeId,
+    },
+    #[error("Process event receiver requested outside its constructor step")]
+    ProcessConstructorInactive,
+    #[error("Process Node {node:?} event receiver is already installed")]
+    ProcessEventReceiverAlreadyTaken {
+        node: hammer_core::data_plane::NodeId,
+    },
+    #[error("Process Node {node:?} event queue is closed")]
+    ProcessEventQueueClosed {
+        node: hammer_core::data_plane::NodeId,
+    },
+    #[error("Process Node {node:?} task join failed")]
+    ProcessTaskJoin {
+        node: hammer_core::data_plane::NodeId,
+        #[source]
+        source: tokio::task::JoinError,
+    },
+    #[error("Process shutdown failed: {primary}; later Process cleanup also failed: {cleanup}")]
+    ProcessShutdownCleanup {
+        #[source]
+        primary: Box<RuntimeError>,
+        cleanup: Box<RuntimeError>,
+    },
     #[error("data worker {worker:?} does not match Handoff owner {handoff_owner:?}")]
     HandoffWorkerMismatch {
         worker: crate::DataWorkerId,
@@ -140,10 +266,15 @@ pub enum RuntimeError {
     NodeDispatchContextMissing,
     #[error("required runtime capability `{type_name}` is not registered")]
     RuntimeCapabilityMissing { type_name: &'static str },
-    #[error("data worker exited before reaching the {phase} barrier")]
-    WorkerExitedBeforeStartupBarrier { phase: &'static str },
+    #[error("runtime thread {thread_index} exited before reaching the startup barrier")]
+    ThreadExitedBeforeStartupBarrier { thread_index: u32 },
     #[error("data worker requested exit during initialization")]
     WorkerRequestedExitDuringInitialization,
+    #[error("system clock is before the Unix epoch")]
+    SystemClockBeforeUnixEpoch {
+        #[source]
+        source: std::time::SystemTimeError,
+    },
     #[error("node runtime data value {value} does not fit u64")]
     NodeRuntimeValueOverflow { value: usize },
     #[error("node runtime data word {word} value {value} does not fit usize")]
