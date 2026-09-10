@@ -22,8 +22,10 @@ const ALPN_PROTOCOL_CAPACITY: u32 = 64;
 pub type TransportStartListen =
     fn(SessionHandle, u32, Option<u64>, SessionListenEndpoint) -> RuntimeResult<u32>;
 pub type TransportStopListen = fn(u32) -> RuntimeResult<()>;
-pub type TransportConnect = fn(SessionConnectEndpoint) -> RuntimeResult<()>;
-pub type TransportConnectStream = fn(SessionConnectEndpoint) -> RuntimeResult<()>;
+pub type TransportConnect =
+    fn(&mut crate::session::runtime::SessionWorker, SessionConnectEndpoint) -> RuntimeResult<()>;
+pub type TransportConnectStream =
+    fn(&mut crate::session::runtime::SessionWorker, SessionConnectEndpoint) -> RuntimeResult<()>;
 pub type TransportOpenStream = fn(
     &mut crate::session::runtime::SessionWorker,
     u32,

@@ -1,12 +1,17 @@
 use std::cell::UnsafeCell;
+use std::os::fd::BorrowedFd;
 use std::sync::atomic::{AtomicU8, AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock};
 
+use hammer_core::data_plane::NodeId;
 use hammer_infra::pool::Pool;
 use hammer_infra::segment::Segment;
 use hammer_runtime::app::{SessionMsgQueue, SessionMsgQueueError};
 use hammer_runtime::attach::{ApplicationMqPublication, ExtConfigStore};
-use hammer_runtime::{AttachError, DataWorkerId, RuntimeError};
+use hammer_runtime::{
+    AttachError, DataWorkerId, FILE_MAIN, File, FileFunctions, NodeMain, RuntimeError,
+    RuntimeResult, SessionConnectEndpoint,
+};
 use thiserror::Error;
 
 use super::protocol::SessionAppVft;
@@ -20,7 +25,6 @@ struct ApplicationState {
 }
 
 struct Application {
-    workers: Vec<DataWorkerId>,
     listeners: Vec<u32>,
     connections: Vec<u32>,
     mq_resources: Option<ApplicationMqResources>,
@@ -29,11 +33,8 @@ struct Application {
 
 impl Application {
     #[inline]
-    fn new(worker_count: usize) -> Self {
+    fn new() -> Self {
         Self {
-            workers: (0..worker_count)
-                .map(|worker| DataWorkerId::new(worker as u32))
-                .collect(),
             listeners: Vec::new(),
             connections: Vec::new(),
             mq_resources: None,
@@ -49,11 +50,9 @@ pub(crate) struct ApplicationListener {
 }
 
 pub(crate) struct ApplicationConnection {
-    application: u32,
+    protocol: u8,
     context: u64,
-    app: Option<u32>,
-    opaque: Option<u64>,
-    server_name: Option<String>,
+    endpoint: SessionConnectEndpoint,
     connect_state: AtomicU8,
 }
 
@@ -77,7 +76,7 @@ impl ApplicationListener {
 impl ApplicationConnection {
     #[inline]
     pub(crate) const fn application(&self) -> u32 {
-        self.application
+        self.endpoint.application
     }
 
     #[inline]
@@ -87,17 +86,24 @@ impl ApplicationConnection {
 
     #[inline]
     pub(crate) const fn app(&self) -> Option<u32> {
-        self.app
+        self.endpoint.app
     }
 
     #[inline]
     pub(crate) const fn opaque(&self) -> Option<u64> {
-        self.opaque
+        self.endpoint.opaque
     }
 
     #[inline]
     pub(crate) fn server_name(&self) -> Option<&str> {
-        self.server_name.as_deref()
+        self.endpoint.server_name.as_deref()
+    }
+
+    #[inline]
+    pub(crate) fn connect_endpoint(&self, connection: u32) -> (u8, SessionConnectEndpoint) {
+        let mut endpoint = self.endpoint.clone();
+        endpoint.connection = Some(connection);
+        (self.protocol, endpoint)
     }
 }
 
@@ -108,27 +114,51 @@ impl ApplicationConnection {
 /// by its Application and Data Worker; there is no shared worker fallback.
 pub struct ApplicationMqResources {
     segment: Segment,
-    queues: Box<[Arc<SessionMsgQueue>]>,
+    workers: Box<[Box<ApplicationWorkerMq>]>,
     offsets: Box<[u64]>,
     ext_config: Option<ExtConfigStore>,
 }
 
+pub(super) struct ApplicationWorkerMq {
+    application: u32,
+    worker: DataWorkerId,
+    queue: Arc<SessionMsgQueue>,
+    app_session_input: NodeId,
+    file: Option<u32>,
+    pending: std::sync::atomic::AtomicBool,
+}
+
+impl ApplicationWorkerMq {
+    #[inline]
+    pub(super) fn queue(&self) -> &Arc<SessionMsgQueue> {
+        &self.queue
+    }
+
+    #[inline]
+    pub(super) fn clear_pending(&self) {
+        self.pending.store(false, Ordering::Release);
+    }
+}
+
 impl ApplicationMqResources {
     pub(crate) fn create_local(
+        application: u32,
         worker_count: usize,
         capacity: usize,
     ) -> Result<Self, ApplicationError> {
-        Self::create(worker_count, capacity, false)
+        Self::create(application, worker_count, capacity, false)
     }
 
     pub(crate) fn create_external(
+        application: u32,
         worker_count: usize,
         capacity: usize,
     ) -> Result<Self, ApplicationError> {
-        Self::create(worker_count, capacity, true)
+        Self::create(application, worker_count, capacity, true)
     }
 
     fn create(
+        application: u32,
         worker_count: usize,
         capacity: usize,
         shared: bool,
@@ -159,9 +189,12 @@ impl ApplicationMqResources {
             Segment::local(segment_bytes)
         };
 
-        let mut queues = Vec::with_capacity(worker_count);
+        let app_session_input = *super::APP_SESSION_INPUT_NODE
+            .get()
+            .ok_or(ApplicationError::MqInputNodeMissing)?;
+        let mut workers = Vec::with_capacity(worker_count);
         let mut offsets = Vec::with_capacity(worker_count);
-        for _ in 0..worker_count {
+        for worker in 0..worker_count {
             let offset = segment
                 .alloc(queue_bytes, 64)
                 .ok_or(ApplicationError::MqSegmentExhausted)?;
@@ -171,7 +204,14 @@ impl ApplicationMqResources {
                 SessionMsgQueue::init_at_with_signal(segment.clone(), offset, q_nitems, ring_nitems)
             }
             .map_err(|source| ApplicationError::MqInit { source })?;
-            queues.push(Arc::new(queue));
+            workers.push(Box::new(ApplicationWorkerMq {
+                application,
+                worker: DataWorkerId::new(worker as u32),
+                queue: Arc::new(queue),
+                app_session_input,
+                file: None,
+                pending: std::sync::atomic::AtomicBool::new(false),
+            }));
             offsets.push(offset);
         }
         // The bounded ext-config store (QUIC/TLS Session control data) lives
@@ -190,7 +230,7 @@ impl ApplicationMqResources {
             .ok_or(ApplicationError::MqSegmentExhausted)?;
         Ok(Self {
             segment,
-            queues: queues.into_boxed_slice(),
+            workers: workers.into_boxed_slice(),
             offsets: offsets.into_boxed_slice(),
             ext_config: Some(ext_config),
         })
@@ -204,18 +244,27 @@ impl ApplicationMqResources {
 
     #[inline]
     pub fn worker_count(&self) -> usize {
-        self.queues.len()
+        self.workers.len()
     }
 
     #[inline]
     pub(crate) fn queue(&self, worker: DataWorkerId) -> Option<&Arc<SessionMsgQueue>> {
-        self.queues.get(worker.slot())
+        self.workers.get(worker.slot()).map(|entry| &entry.queue)
+    }
+
+    #[inline]
+    pub(super) fn worker(&self, worker: DataWorkerId) -> Option<&ApplicationWorkerMq> {
+        self.workers.get(worker.slot()).map(Box::as_ref)
     }
 
     pub(crate) fn publication(&self) -> Result<ApplicationMqPublication, ApplicationError> {
         ApplicationMqPublication::new(
             self.segment.clone(),
-            self.queues.clone(),
+            self.workers
+                .iter()
+                .map(|entry| Arc::clone(&entry.queue))
+                .collect::<Vec<_>>()
+                .into_boxed_slice(),
             self.offsets.clone(),
             self.ext_config
                 .as_ref()
@@ -224,6 +273,81 @@ impl ApplicationMqResources {
         )
         .map_err(|source| ApplicationError::MqPublication { source })
     }
+
+    fn install(&mut self) -> RuntimeResult<()> {
+        for worker in &mut self.workers {
+            let signal_read_fd = worker
+                .queue
+                .read_fd()
+                .ok_or(AttachError::SessionSignalMissing)?;
+            // SAFETY: the queue retains the original read endpoint while
+            // FileMain owns this independent duplicated descriptor.
+            let signal_read = unsafe { BorrowedFd::borrow_raw(signal_read_fd) }
+                .try_clone_to_owned()
+                .map_err(|source| AttachError::SessionSignalDuplicate { source })?;
+            let mut file = File::new(
+                signal_read,
+                format!("app rx mq {:?}", worker.application),
+                worker.as_ref() as *const ApplicationWorkerMq as usize as u64,
+                FileFunctions {
+                    read: Some(schedule_application_mq),
+                    ..FileFunctions::default()
+                },
+            );
+            file.set_polling_thread_index(worker.worker.thread_index());
+            match FILE_MAIN
+                .get()
+                .expect("FileMain is initialized before Application attach")
+                .add(file)
+            {
+                Ok(file) => worker.file = Some(file),
+                Err(error) => return Err(error),
+            }
+        }
+        Ok(())
+    }
+
+    fn uninstall(&mut self) -> RuntimeResult<()> {
+        let mut first_error = None;
+        for worker in &mut self.workers {
+            let Some(file) = worker.file else {
+                continue;
+            };
+            match FILE_MAIN
+                .get()
+                .expect("FileMain remains initialized through Application detach")
+                .delete(file)
+            {
+                Ok(true) => worker.file = None,
+                Ok(false) => {
+                    first_error.get_or_insert(RuntimeError::FileIndexInvalid { index: file });
+                }
+                Err(error) => {
+                    first_error.get_or_insert(error);
+                }
+            }
+        }
+        first_error.map_or(Ok(()), Err)
+    }
+}
+
+fn schedule_application_mq(graph: &mut NodeMain, file: &mut File) -> RuntimeResult<()> {
+    let entry = file.private_data() as usize as *const ApplicationWorkerMq;
+    assert!(
+        !entry.is_null(),
+        "Application MQ File retains its owner entry"
+    );
+    // SAFETY: ApplicationMqResources stores each entry in a Box whose address
+    // is stable until its File registration is deleted under WorkerBarrier.
+    let entry = unsafe { &*entry };
+    if !entry.pending.swap(true, Ordering::AcqRel) {
+        // SAFETY: FileMain invokes this callback on the File's assigned runtime thread.
+        let mut sessions =
+            unsafe { super::runtime::session_main().worker(file.polling_thread_index()) }?;
+        sessions.schedule_application_mq(entry.application);
+    }
+    graph.mark_interrupt_pending(entry.app_session_input)?;
+    Ok(())
 }
 
 const CONNECTION_CONNECTING: u8 = 0;
@@ -327,7 +451,7 @@ impl ApplicationMain {
     }
 
     pub fn attach(&self) -> Result<u32, ApplicationError> {
-        self.attach_with_worker_count(0)
+        self.attach_entry()
     }
 
     /// Attaches an external Application and creates one private Session
@@ -369,20 +493,16 @@ impl ApplicationMain {
         self.attach_with_mq(worker_count, mq_capacity, shared)
     }
 
-    fn attach_with_worker_count(&self, worker_count: usize) -> Result<u32, ApplicationError> {
+    fn attach_entry(&self) -> Result<u32, ApplicationError> {
         self.ensure_main_thread()?;
         // SAFETY: Main Thread mutation is synchronized by the barrier below;
         // Data Workers only read published Application records.
         let state = unsafe { &mut *self.state.get() };
         let barrier = hammer_runtime::barrier::global();
         let application = match barrier {
-            Some(barrier) if barrier.is_pending() => {
-                state.applications.insert(Application::new(worker_count))
-            }
-            Some(barrier) => {
-                barrier.sync(|| state.applications.insert(Application::new(worker_count)))
-            }
-            None => state.applications.insert(Application::new(worker_count)),
+            Some(barrier) if barrier.is_pending() => state.applications.insert(Application::new()),
+            Some(barrier) => barrier.sync(|| state.applications.insert(Application::new())),
+            None => state.applications.insert(Application::new()),
         };
         Ok(application)
     }
@@ -393,33 +513,57 @@ impl ApplicationMain {
         mq_capacity: usize,
         shared: bool,
     ) -> Result<u32, ApplicationError> {
-        let application = self.attach_with_worker_count(worker_count)?;
+        let application = self.attach_entry()?;
         let resources = if shared {
-            ApplicationMqResources::create_external(worker_count, mq_capacity)
+            ApplicationMqResources::create_external(application, worker_count, mq_capacity)
         } else {
-            ApplicationMqResources::create_local(worker_count, mq_capacity)
+            ApplicationMqResources::create_local(application, worker_count, mq_capacity)
         };
-        let resources = match resources {
+        let mut resources = match resources {
             Ok(resources) => resources,
             Err(error) => {
                 self.remove_application(application);
                 return Err(error);
             }
         };
-        let install_result = super::runtime::session_main()
-            .install_application_mqs(application, &resources)
-            .map_err(|source| ApplicationError::MqInstall { source });
+        let mut install = || resources.install();
+        let install_result = match hammer_runtime::barrier::global() {
+            Some(barrier) if barrier.is_pending() => install(),
+            Some(barrier) => barrier.sync(install),
+            None => install(),
+        };
         match install_result {
             Ok(()) => {
-                if let Err(error) = self.store_mq_resources(application, resources) {
+                if let Err((error, mut resources)) = self.store_mq_resources(application, resources)
+                {
+                    let mut uninstall = || resources.uninstall();
+                    let cleanup_result = match hammer_runtime::barrier::global() {
+                        Some(barrier) if barrier.is_pending() => uninstall(),
+                        Some(barrier) => barrier.sync(uninstall),
+                        None => uninstall(),
+                    };
+                    if let Err(cleanup_error) = cleanup_result {
+                        tracing::error!(%cleanup_error, "failed to roll back Application Session MQ files");
+                        std::mem::forget(resources);
+                    }
                     self.remove_application(application);
                     return Err(error);
                 }
                 Ok(application)
             }
-            Err(error) => {
+            Err(source) => {
+                let mut uninstall = || resources.uninstall();
+                let cleanup_result = match hammer_runtime::barrier::global() {
+                    Some(barrier) if barrier.is_pending() => uninstall(),
+                    Some(barrier) => barrier.sync(uninstall),
+                    None => uninstall(),
+                };
+                if let Err(cleanup_error) = cleanup_result {
+                    tracing::error!(%cleanup_error, "failed to roll back Application Session MQ files");
+                    std::mem::forget(resources);
+                }
                 self.remove_application(application);
-                Err(error)
+                Err(ApplicationError::MqInstall { source })
             }
         }
     }
@@ -428,19 +572,23 @@ impl ApplicationMain {
         &self,
         application: u32,
         resources: ApplicationMqResources,
-    ) -> Result<(), ApplicationError> {
-        self.ensure_main_thread()?;
+    ) -> Result<(), (ApplicationError, ApplicationMqResources)> {
+        if let Err(error) = self.ensure_main_thread() {
+            return Err((error, resources));
+        }
         // SAFETY: Main Thread mutation is synchronized by the barrier below;
         // Data Workers only read published Application records.
         let state = unsafe { &mut *self.state.get() };
         let barrier = hammer_runtime::barrier::global();
         let store = || {
-            let entry = state
-                .applications
-                .get_mut(application)
-                .ok_or(ApplicationError::Missing { application })?;
+            let Some(entry) = state.applications.get_mut(application) else {
+                return Err((ApplicationError::Missing { application }, resources));
+            };
             if entry.mq_resources.is_some() {
-                return Err(ApplicationError::MqAlreadyAttached { application });
+                return Err((
+                    ApplicationError::MqAlreadyAttached { application },
+                    resources,
+                ));
             }
             entry.mq_resources = Some(resources);
             Ok(())
@@ -481,22 +629,16 @@ impl ApplicationMain {
         resources.publication()
     }
 
-    /// Runs `operation` against the stored Rx MQ resources of `application`.
-    ///
-    /// The control path uses this to read and free one ext-config chunk
-    /// owned by the Application (see `ExtConfigStore`).
-    pub(crate) fn with_application_mq<R>(
+    /// Returns the stored Rx MQ resources of `application`.
+    pub(crate) fn application_mq(
         &self,
         application: u32,
-        operation: impl FnOnce(&ApplicationMqResources) -> Result<R, ApplicationError>,
-    ) -> Result<R, ApplicationError> {
-        let resources = self
-            .state()?
+    ) -> Result<&ApplicationMqResources, ApplicationError> {
+        self.state()?
             .applications
             .get(application)
             .and_then(|application| application.mq_resources.as_ref())
-            .ok_or(ApplicationError::Missing { application })?;
-        operation(resources)
+            .ok_or(ApplicationError::Missing { application })
     }
 
     pub fn contains(&self, application: u32) -> Result<bool, ApplicationError> {
@@ -509,21 +651,24 @@ impl ApplicationMain {
         if !state.applications.contains_key(application) {
             return Err(ApplicationError::Missing { application });
         }
-
-        super::runtime::session_main()
-            .application_detached(application)
-            .map_err(|source| ApplicationError::MqDetachFailed { source })?;
-
-        // SAFETY: Main Thread mutation is synchronized by the barrier below;
-        // Data Workers only read published Application records.
-        let state = unsafe { &mut *self.state.get() };
         let barrier = hammer_runtime::barrier::global();
-        let mut detach = || -> Result<(), ApplicationError> {
+        let detach = || -> Result<(), ApplicationError> {
+            super::runtime::session_main()
+                .application_detached(application)
+                .map_err(|source| ApplicationError::MqDetachFailed { source })?;
+            // SAFETY: Main Thread owns Application resource mutation and the
+            // WorkerBarrier excludes File callbacks and Session worker access.
+            let state = unsafe { &mut *self.state.get() };
             let (listener_indexes, connection_indexes) = {
                 let entry = state
                     .applications
                     .get_mut(application)
                     .ok_or(ApplicationError::Missing { application })?;
+                if let Some(resources) = entry.mq_resources.as_mut() {
+                    resources
+                        .uninstall()
+                        .map_err(|source| ApplicationError::MqDetachFailed { source })?;
+                }
                 (
                     std::mem::take(&mut entry.listeners),
                     std::mem::take(&mut entry.connections),
@@ -586,19 +731,16 @@ impl ApplicationMain {
 
     pub fn register_connection(
         &self,
-        application: u32,
+        protocol: u8,
         context: u64,
-        server_name: Option<String>,
-        app: Option<u32>,
-        opaque: Option<u64>,
+        endpoint: SessionConnectEndpoint,
     ) -> Result<u32, ApplicationError> {
+        let application = endpoint.application;
         self.ensure_active(application)?;
         let connection = ApplicationConnection {
-            application,
+            protocol,
             context,
-            app,
-            opaque,
-            server_name,
+            endpoint,
             connect_state: AtomicU8::new(CONNECTION_CONNECTING),
         };
         self.ensure_main_thread()?;
@@ -620,7 +762,8 @@ impl ApplicationMain {
                 .collect::<Vec<_>>();
             for index in connected {
                 if let Some(removed) = state.connections.remove(index) {
-                    if let Some(application_entry) = state.applications.get_mut(removed.application)
+                    if let Some(application_entry) =
+                        state.applications.get_mut(removed.application())
                     {
                         application_entry
                             .connections
@@ -644,28 +787,36 @@ impl ApplicationMain {
         })
     }
 
-    pub(crate) fn with_connection<R>(
+    pub(crate) fn connection(
         &self,
         connection: u32,
-        operation: impl FnOnce(&ApplicationConnection) -> R,
-    ) -> Result<R, ApplicationError> {
+    ) -> Result<&ApplicationConnection, ApplicationError> {
         // SAFETY: workers only read published entries. Main Thread mutation is
         // synchronized by the worker barrier.
         let state = unsafe { &*self.state.get() };
-        let index = connection;
         state
             .connections
-            .get(index)
-            .map(operation)
+            .get(connection)
             .ok_or(ApplicationError::ConnectionMissing { connection })
     }
 
+    pub(super) fn worker_mq(
+        &self,
+        application: u32,
+        worker: DataWorkerId,
+    ) -> Option<&ApplicationWorkerMq> {
+        // SAFETY: Application MQ entries stay allocated until Main Thread
+        // removes the owner record while WorkerBarrier stops every Data Worker.
+        unsafe { &*self.state.get() }
+            .applications
+            .get(application)?
+            .mq_resources
+            .as_ref()?
+            .worker(worker)
+    }
+
     pub(crate) fn mark_connected(&self, connection: u32) -> Result<(), ApplicationError> {
-        let entry =
-            self.with_connection(connection, |entry| entry as *const ApplicationConnection)?;
-        // SAFETY: the entry remains published until Main Thread observes the
-        // connected state under the worker barrier and reaps it.
-        let entry = unsafe { &*entry };
+        let entry = self.connection(connection)?;
         entry
             .connect_state
             .compare_exchange(
@@ -695,7 +846,7 @@ impl ApplicationMain {
                 .connections
                 .get(index)
                 .ok_or(ApplicationError::ConnectionMissing { connection })?;
-            if entry.application != application {
+            if entry.application() != application {
                 return Err(ApplicationError::ConnectionNotOwned {
                     application,
                     connection,
@@ -720,66 +871,18 @@ impl ApplicationMain {
         }
     }
 
-    pub fn reclaim_connection(
-        &self,
-        application: u32,
-        connection: u32,
-    ) -> Result<(), ApplicationError> {
-        self.ensure_active(application)?;
-        self.ensure_main_thread()?;
-        // SAFETY: Main Thread mutation is synchronized by the barrier below;
-        // Data Workers only read published connection records.
-        let state = unsafe { &mut *self.state.get() };
-        let barrier = hammer_runtime::barrier::global();
-        let mut reclaim = || {
-            let index = connection;
-            let entry = state
-                .connections
-                .get(index)
-                .ok_or(ApplicationError::ConnectionMissing { connection })?;
-            if entry.application != application {
-                return Err(ApplicationError::ConnectionNotOwned {
-                    application,
-                    connection,
-                });
-            }
-            if entry.connect_state.load(Ordering::Acquire) != CONNECTION_CONNECTED {
-                return Err(ApplicationError::ConnectionNotConnected { connection });
-            }
-            state
-                .connections
-                .remove(index)
-                .ok_or(ApplicationError::ConnectionMissing { connection })?;
-            state
-                .applications
-                .get_mut(application)
-                .expect("active Application remains allocated")
-                .connections
-                .retain(|entry| *entry != connection);
-            Ok(())
-        };
-        match barrier {
-            Some(barrier) if barrier.is_pending() => reclaim(),
-            Some(barrier) => barrier.sync(reclaim),
-            None => reclaim(),
-        }
-    }
-
     pub fn remove_listener(
         &self,
         application: u32,
         listener_id: u32,
     ) -> Result<(), ApplicationError> {
         self.ensure_active(application)?;
-        self.with_listener(listener_id, |listener| {
-            if listener.application != application {
-                return Err(ApplicationError::ListenerNotOwned {
-                    application,
-                    listener: listener_id,
-                });
-            }
-            Ok(())
-        })??;
+        if self.listener(listener_id)?.application != application {
+            return Err(ApplicationError::ListenerNotOwned {
+                application,
+                listener: listener_id,
+            });
+        }
         self.ensure_main_thread()?;
         // SAFETY: Main Thread mutation is synchronized by the barrier below;
         // Data Workers only read published listener records.
@@ -864,24 +967,14 @@ impl ApplicationMain {
         }
     }
 
-    pub(crate) fn with_listener<R>(
-        &self,
-        listener: u32,
-        operation: impl FnOnce(&ApplicationListener) -> R,
-    ) -> Result<R, ApplicationError> {
+    pub(crate) fn listener(&self, listener: u32) -> Result<&ApplicationListener, ApplicationError> {
         // SAFETY: production callers are the Main Thread or a Data Worker that
         // participates in `barrier`; listener mutation stops every Data Worker.
         let state = unsafe { &*self.state.get() };
-        let index = listener;
-        if !state.listeners.contains_key(index) {
-            return Err(ApplicationError::ListenerMissing { listener });
-        }
-        Ok(operation(
-            state
-                .listeners
-                .get(index)
-                .ok_or(ApplicationError::ListenerMissing { listener })?,
-        ))
+        state
+            .listeners
+            .get(listener)
+            .ok_or(ApplicationError::ListenerMissing { listener })
     }
 
     fn ensure_active(&self, application: u32) -> Result<(), ApplicationError> {
@@ -917,6 +1010,8 @@ pub enum ApplicationError {
     MqCapacityInvalid { capacity: usize },
     #[error("per-Application MQ requires at least one Data Worker")]
     MqWorkerCountZero,
+    #[error("Application Session MQ input node is not registered")]
+    MqInputNodeMissing,
     #[error("per-Application MQ layout rejected: {source:?}")]
     MqLayout {
         #[source]
@@ -936,7 +1031,7 @@ pub enum ApplicationError {
         #[source]
         source: SessionMsgQueueError,
     },
-    #[error("per-Application MQ worker installation failed")]
+    #[error("per-Application MQ file registration failed")]
     MqInstall {
         #[source]
         source: RuntimeError,
@@ -963,6 +1058,4 @@ pub enum ApplicationError {
     ConnectionNotOwned { application: u32, connection: u32 },
     #[error("Application connection {connection:?} was already connected")]
     ConnectionAlreadyConnected { connection: u32 },
-    #[error("Application connection {connection:?} is not connected")]
-    ConnectionNotConnected { connection: u32 },
 }

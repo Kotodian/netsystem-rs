@@ -1,8 +1,7 @@
-use std::cell::UnsafeCell;
+use std::cell::{RefCell, RefMut, UnsafeCell};
 use std::collections::VecDeque;
 use std::net::SocketAddr;
 use std::num::NonZeroU32;
-use std::ops::Deref;
 use std::os::fd::BorrowedFd;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, OnceLock};
@@ -15,7 +14,6 @@ use hammer_infra::fifo::Fifo;
 use hammer_infra::linked_list::LinkedList;
 use hammer_infra::pool::Pool;
 use hammer_infra::segment::Segment;
-use hammer_infra::thread_owned::ThreadOwned;
 use hammer_runtime::app::{
     AppSession, AppSessionConfig, AppSessionError, SessionAcceptedMsg, SessionConnectError,
     SessionConnectedMsg, SessionControlError, SessionDgramHeader, SessionEventQueue, SessionEvt,
@@ -32,7 +30,7 @@ use hammer_runtime::{
 };
 
 use crate::session::app::AppWorkerError;
-use crate::session::application::{ApplicationMain, ApplicationMqResources, application_main};
+use crate::session::application::{ApplicationMain, application_main};
 use crate::session::error::{SessionError, SessionQueueError};
 use crate::session::lookup::SessionEndpointLookup;
 use crate::session::node::{AppSessionInputNode, SessionQueueTransportDispatch};
@@ -483,75 +481,27 @@ pub struct SessionWorker {
     pub(crate) control_events: LinkedList<SessionEvt>,
     pub(crate) new_io_events: LinkedList<SessionEvt>,
     pub(crate) old_io_events: LinkedList<SessionEvt>,
-    app_rx_mqs: Vec<Option<Box<AppRxMqEntry>>>,
     app_rx_mq_pending: VecDeque<u32>,
     state: SessionWorkerState,
     state_deadline_file: Option<u32>,
     session_queue: Option<NodeId>,
-}
-
-struct AppRxMqEntry {
-    application: u32,
-    queue: Arc<SessionMsgQueue>,
-    file: Option<u32>,
-    appsl_input_node: hammer_core::data_plane::NodeId,
-    pending_queue: usize,
-    pending: bool,
-    postponed: bool,
-}
-
-impl AppRxMqEntry {
-    fn drain_snapshot_to(
-        &mut self,
-        dispatch_event: &mut impl FnMut(SessionMqRing, SessionEvt),
-    ) -> Result<usize, SessionMsgQueueError> {
-        let was_postponed = self.postponed;
-        if !was_postponed {
-            self.queue.drain();
-        }
-        self.postponed = false;
-
-        let snapshot = self.queue.len();
-        let mut dispatched = 0usize;
-        for _ in 0..snapshot {
-            let Some((ring, event)) = self.queue.dequeue_with_ring()? else {
-                break;
-            };
-            dispatch_event(ring, event);
-            dispatched += 1;
-        }
-
-        let mut has_work = !self.queue.is_empty();
-        if was_postponed && !has_work {
-            self.queue.drain();
-            has_work = !self.queue.is_empty();
-        }
-        self.pending = has_work;
-        self.postponed = has_work;
-        Ok(dispatched)
-    }
+    session_event_file: Option<u32>,
 }
 
 #[repr(C)]
 struct SessionWorkerSlot {
     cacheline0: CacheLineAlignMark,
-    owner: ThreadOwned<SessionWorker>,
+    event_queue: Arc<SessionMsgQueue>,
+    worker: RefCell<SessionWorker>,
 }
 
 impl SessionWorkerSlot {
-    fn new() -> Self {
+    fn new(worker: SessionWorker, event_queue: Arc<SessionMsgQueue>) -> Self {
         Self {
             cacheline0: CacheLineAlignMark,
-            owner: ThreadOwned::new(),
+            event_queue,
+            worker: RefCell::new(worker),
         }
-    }
-}
-
-impl Deref for SessionWorkerSlot {
-    type Target = ThreadOwned<SessionWorker>;
-
-    fn deref(&self) -> &Self::Target {
-        &self.owner
     }
 }
 
@@ -567,9 +517,33 @@ pub static SESSION_MAIN: OnceLock<SessionMain> = OnceLock::new();
 impl SessionMain {
     /// Initializes and publishes the process-global Session authority.
     pub fn init(worker_count: usize) -> RuntimeResult<()> {
+        let session = super::session_config();
+        let publisher = super::APP_SERVER.get().map(|server| server.publisher());
         let workers = (0..worker_count)
-            .map(|_| SessionWorkerSlot::new())
-            .collect::<Vec<_>>()
+            .map(|worker| {
+                let capacity = DEFAULT_SESSION_EVENT_CAPACITY.next_power_of_two().max(2) as u32;
+                let bytes = SessionMsgQueue::layout_bytes(capacity, capacity.max(2))
+                    .map_err(|error| AppWorkerError::SessionEventQueue { error })?;
+                let segment = Segment::local(bytes.saturating_add(64));
+                let offset = segment
+                    .alloc(bytes, 64)
+                    .ok_or(SessionMsgQueueError::InvalidConfig)?;
+                // SAFETY: this fresh local segment allocation is owned by this
+                // queue and is initialized exactly once at `offset`.
+                let event_queue = Arc::new(unsafe {
+                    SessionMsgQueue::init_at_with_signal(segment, offset, capacity, capacity.max(2))
+                }?);
+                let session_worker = SessionWorker::new(
+                    DataWorkerId::new(worker as u32),
+                    worker_count,
+                    AppSessionConfig::default(),
+                    session.pool_capacity,
+                    publisher.clone(),
+                    Arc::clone(&event_queue),
+                )?;
+                Ok(SessionWorkerSlot::new(session_worker, event_queue))
+            })
+            .collect::<RuntimeResult<Vec<_>>>()?
             .into_boxed_slice();
         publish_session_migrate_queues(worker_count);
         let main = Self {
@@ -835,13 +809,14 @@ impl SessionMain {
         self.with_control_barrier(|| {
             let transport =
                 transport_vft(protocol).ok_or(SessionError::TransportListenUnsupported)?;
-            let (application, app, opaque) = application_main()
-                .with_listener(application_listener, |listener| {
-                    (listener.application(), listener.app(), listener.opaque())
-                })
+            let application_listener_entry = application_main()
+                .listener(application_listener)
                 .map_err(|source| SessionError::TransportOpFailed {
                     source: source.into(),
                 })?;
+            let application = application_listener_entry.application();
+            let app = application_listener_entry.app();
+            let opaque = application_listener_entry.opaque();
             if let Some(app) = app {
                 if application_main()
                     .session_callbacks(application, app)
@@ -850,48 +825,35 @@ impl SessionMain {
                     return Err(SessionError::SessionAppNotRegistered { app });
                 }
             }
-            let listener = self
-                .with_listeners_mut(|listeners| {
-                    Ok(SessionHandle::new(
-                        listeners.insert(SessionListener {
-                            application,
-                            application_listener,
-                            app,
-                            protocol,
-                            connection_index: None,
-                            accepting: true,
-                        }),
-                        0,
-                    ))
-                })
-                .map_err(|_| SessionError::ListenerControlWrongThread)??;
+            // SAFETY: with_control_barrier runs this operation on the Main
+            // Thread while every Data Worker is stopped.
+            let listeners = unsafe { self.listeners_mut() };
+            let listener = SessionHandle::new(
+                listeners.insert(SessionListener {
+                    application,
+                    application_listener,
+                    app,
+                    protocol,
+                    connection_index: None,
+                    accepting: true,
+                }),
+                0,
+            );
             let Some(start_listen) = transport.start_listen else {
-                self.with_listeners_mut(|listeners| {
-                    drop(listeners.remove(listener.session_index));
-                    Ok(())
-                })
-                .map_err(|_| SessionError::ListenerControlWrongThread)??;
+                drop(listeners.remove(listener.session_index));
                 return Err(SessionError::TransportListenUnsupported);
             };
             let connection_index = match start_listen(listener, application, opaque, endpoint) {
                 Ok(index) => index,
                 Err(error) => {
-                    self.with_listeners_mut(|listeners| {
-                        drop(listeners.remove(listener.session_index));
-                        Ok(())
-                    })
-                    .map_err(|_| SessionError::ListenerControlWrongThread)??;
+                    drop(listeners.remove(listener.session_index));
                     return Err(SessionError::TransportOpFailed { source: error });
                 }
             };
-            self.with_listeners_mut(|listeners| {
-                let entry = listeners
-                    .get_mut(listener.session_index)
-                    .ok_or(SessionError::ListenerMissing { listener })?;
-                entry.connection_index = Some(connection_index);
-                Ok(())
-            })
-            .map_err(|_| SessionError::ListenerControlWrongThread)??;
+            let entry = listeners
+                .get_mut(listener.session_index)
+                .ok_or(SessionError::ListenerMissing { listener })?;
+            entry.connection_index = Some(connection_index);
             Ok(listener)
         })
         .map_err(|_| SessionError::ListenerControlWrongThread)?
@@ -899,43 +861,36 @@ impl SessionMain {
 
     pub fn unlisten(&self, listener: SessionHandle) -> Result<(), SessionError> {
         self.with_control_barrier(|| {
-            let (protocol, connection_index) = self
-                .with_listener(listener, |entry| (entry.protocol, entry.connection_index))
+            let listener_entry = self
+                .listener(listener)
                 .map_err(|_| SessionError::ListenerMissing { listener })?;
+            let protocol = listener_entry.protocol;
+            let connection_index = listener_entry.connection_index;
             let transport =
                 transport_vft(protocol).ok_or(SessionError::TransportListenUnsupported)?;
             let Some(stop_listen) = transport.stop_listen else {
                 return Err(SessionError::TransportListenUnsupported);
             };
-            self.with_listeners_mut(|listeners| {
-                let entry = listeners
-                    .get_mut(listener.session_index)
-                    .ok_or(SessionError::ListenerMissing { listener })?;
-                entry.accepting = false;
-                Ok(())
-            })
-            .map_err(|_| SessionError::ListenerControlWrongThread)??;
+            // SAFETY: with_control_barrier runs this operation on the Main
+            // Thread while every Data Worker is stopped.
+            let listeners = unsafe { self.listeners_mut() };
+            let entry = listeners
+                .get_mut(listener.session_index)
+                .ok_or(SessionError::ListenerMissing { listener })?;
+            entry.accepting = false;
             let connection_index =
                 connection_index.ok_or(SessionError::ListenerMissing { listener })?;
             if let Err(source) = stop_listen(connection_index) {
-                self.with_listeners_mut(|listeners| {
-                    if let Some(entry) = listeners.get_mut(listener.session_index) {
-                        entry.accepting = true;
-                    }
-                    Ok(())
-                })
-                .map_err(|_| SessionError::ListenerControlWrongThread)??;
+                if let Some(entry) = listeners.get_mut(listener.session_index) {
+                    entry.accepting = true;
+                }
                 return Err(SessionError::TransportOpFailed { source });
             }
-            self.with_listeners_mut(|listeners| {
-                let index = listener.session_index;
-                if !listeners.contains_key(index) {
-                    return Err(SessionError::ListenerMissing { listener });
-                }
-                drop(listeners.remove(index));
-                Ok(())
-            })
-            .map_err(|_| SessionError::ListenerControlWrongThread)??;
+            let index = listener.session_index;
+            if !listeners.contains_key(index) {
+                return Err(SessionError::ListenerMissing { listener });
+            }
+            drop(listeners.remove(index));
             Ok(())
         })
         .map_err(|_| SessionError::ListenerControlWrongThread)?
@@ -959,15 +914,26 @@ impl SessionMain {
         endpoint: SessionConnectEndpoint,
     ) -> Result<u32, SessionError> {
         let transport = transport_vft(protocol).ok_or(SessionError::TransportConnectUnsupported)?;
-        let Some(connect) = transport.connect else {
+        if transport.connect.is_none() {
             return Err(SessionError::TransportConnectUnsupported);
-        };
-        let connection = endpoint.connection;
-        let worker_count = self.workers.len();
-        if worker_count == 0 {
+        }
+        let connection = endpoint
+            .connection
+            .ok_or(SessionError::ApplicationConnectionMissing)?;
+        if self.workers.is_empty() {
             return Err(SessionError::NoDataWorkers);
         }
-        connect(endpoint).map_err(|source| SessionError::TransportOpFailed { source })?;
+        self.enqueue_worker_event(
+            endpoint.worker,
+            SessionEvt {
+                evt_type: SessionEvtType::Connect,
+                postponed: false,
+                session_index: connection,
+                thread_index: endpoint.worker.thread_index(),
+                control_data: 0,
+            },
+        )
+        .map_err(|source| SessionError::TransportOpFailed { source })?;
         Ok(connection)
     }
 
@@ -996,19 +962,27 @@ impl SessionMain {
                 actual: endpoint.worker,
             });
         }
-        let Some(connect_stream) = transport.connect_stream else {
+        if transport.connect_stream.is_none() {
             return Err(SessionError::TransportConnectStreamUnsupported);
-        };
-        let connection = endpoint.connection;
-        connect_stream(endpoint).map_err(|source| SessionError::TransportOpFailed { source })?;
+        }
+        let connection = endpoint
+            .connection
+            .ok_or(SessionError::ApplicationConnectionMissing)?;
+        self.enqueue_worker_event(
+            endpoint.worker,
+            SessionEvt {
+                evt_type: SessionEvtType::ConnectStream,
+                postponed: false,
+                session_index: connection,
+                thread_index: endpoint.worker.thread_index(),
+                control_data: 0,
+            },
+        )
+        .map_err(|source| SessionError::TransportOpFailed { source })?;
         Ok(connection)
     }
 
-    pub(super) fn with_listener<R>(
-        &self,
-        listener: SessionHandle,
-        operation: impl FnOnce(&SessionListener) -> R,
-    ) -> RuntimeResult<R> {
+    pub(super) fn listener(&self, listener: SessionHandle) -> RuntimeResult<&SessionListener> {
         // SAFETY: Data Workers read a listener only after Main Thread has
         // published it through the worker barrier.
         let listeners = unsafe { &*self.listeners.get() };
@@ -1025,205 +999,99 @@ impl SessionMain {
         if !entry.accepting {
             return Err(SessionError::ListenerMissing { listener }.into());
         }
-        Ok(operation(entry))
+        Ok(entry)
     }
 
-    fn with_listeners_mut<R>(
-        &self,
-        operation: impl FnOnce(&mut Pool<SessionListener>) -> R,
-    ) -> RuntimeResult<R> {
-        // SAFETY: only the Main Thread mutates this pool while Data Workers
-        // are stopped by the barrier below.
-        let listeners = unsafe { &mut *self.listeners.get() };
-        let barrier = hammer_runtime::barrier::global();
-        Ok(match barrier {
-            Some(barrier) if barrier.is_pending() => operation(listeners),
-            Some(barrier) => barrier.sync(|| operation(listeners)),
-            None => operation(listeners),
-        })
+    /// # Safety
+    ///
+    /// The caller must be the Main Thread with every Data Worker stopped by
+    /// the active WorkerBarrier for the full returned borrow.
+    unsafe fn listeners_mut(&self) -> &mut Pool<SessionListener> {
+        // SAFETY: upheld by the caller's Main Thread and WorkerBarrier contract.
+        unsafe { &mut *self.listeners.get() }
     }
 
-    fn worker(&self, worker: DataWorkerId) -> RuntimeResult<&ThreadOwned<SessionWorker>> {
-        Ok(self.workers.get(worker.slot()).map(|slot| &**slot).ok_or(
-            SessionQueueError::WorkerOutOfRange {
-                worker: worker.slot(),
-            },
-        )?)
-    }
-
-    pub fn with_worker_mut<R>(
-        &self,
-        thread_index: u32,
-        operation: impl FnOnce(&mut SessionWorker) -> RuntimeResult<R>,
-    ) -> RuntimeResult<R> {
+    /// Borrows the Session state owned by one runtime worker index.
+    ///
+    /// # Safety
+    ///
+    /// The caller must be the unique runtime execution thread for
+    /// `thread_index` for the full lifetime of the returned borrow.
+    pub unsafe fn worker(&self, thread_index: u32) -> RuntimeResult<RefMut<'_, SessionWorker>> {
         let worker = DataWorkerId::try_from(thread_index)
             .map_err(|_| SessionQueueError::WorkerUnavailable { thread_index })?;
-        let mut slot = self.worker(worker)?.borrow_mut().map_err(|source| {
-            SessionQueueError::WorkerAccess {
+        let slot = self
+            .workers
+            .get(worker.slot())
+            .ok_or(SessionQueueError::WorkerOutOfRange {
                 worker: worker.slot(),
-                source,
-            }
-        })?;
-        operation(&mut slot)
+            })?;
+        Ok(slot.worker.borrow_mut())
+    }
+
+    pub(super) fn enqueue_worker_event(
+        &self,
+        worker: DataWorkerId,
+        event: SessionEvt,
+    ) -> RuntimeResult<()> {
+        let slot = self
+            .workers
+            .get(worker.slot())
+            .ok_or(SessionQueueError::WorkerOutOfRange {
+                worker: worker.slot(),
+            })?;
+        slot.event_queue.enqueue_ctrl(event)?;
+        Ok(())
     }
 
     pub(crate) fn session_queue_is_interrupt(
         &self,
         runtime: &DataPlaneMain,
     ) -> RuntimeResult<bool> {
-        self.with_worker_mut(runtime.thread_index(), |sessions| {
-            Ok(sessions.state == SessionWorkerState::Interrupt)
-        })
+        // SAFETY: this call executes on the DataPlaneMain's owning runtime thread.
+        Ok(unsafe { self.worker(runtime.thread_index()) }?.state == SessionWorkerState::Interrupt)
     }
 
     pub(crate) fn application_detached(self: &'static Self, application: u32) -> RuntimeResult<()> {
-        self.remove_application_mqs(application)?;
-        let listeners = {
-            // SAFETY: this call runs on the Main Thread. Listener removal
-            // below stops Data Workers through the same barrier as publish.
-            let listeners = unsafe { &*self.listeners.get() };
+        self.with_control_barrier(|| {
+            let listeners = {
+                // SAFETY: Main Thread owns listener mutation while the pending
+                // WorkerBarrier excludes Data Worker readers.
+                let listeners = unsafe { &*self.listeners.get() };
+                listeners
+                    .iter()
+                    .filter_map(|(index, listener)| {
+                        (listener.application() == application)
+                            .then_some(SessionHandle::new(index, 0))
+                    })
+                    .collect::<Vec<_>>()
+            };
             listeners
-                .iter()
-                .filter_map(|(index, listener)| {
-                    (listener.application() == application).then_some(SessionHandle::new(index, 0))
-                })
-                .collect::<Vec<_>>()
-        };
-        listeners
-            .into_iter()
-            .try_for_each(|listener| self.unlisten(listener))?;
-        (0..self.workers.len()).try_for_each(|worker_slot| -> RuntimeResult<()> {
-            let worker = DataWorkerId::new(worker_slot as u32);
-            loop {
-                let main = self;
-                match hammer_runtime::schedule_on_worker(worker, move |runtime| {
-                    let mut sessions = main
-                        .worker(worker)
-                        .expect("scheduled Application detach targets an existing Session worker")
-                        .borrow_mut()
-                        .expect("scheduled Application detach runs on its Session worker");
-                    sessions.application_detached(application);
-                    sessions
-                        .wake_session_queue(runtime)
-                        .expect("Application detach operation failed on its Session worker");
-                }) {
-                    Ok(()) => break,
-                    Err(RuntimeError::WorkerControlQueueFull { .. }) => {
-                        std::thread::yield_now();
-                    }
-                    Err(
-                        RuntimeError::WorkerControlUnavailable { .. }
-                        | RuntimeError::WorkerControlClosed { .. },
-                    ) => return Err(RuntimeError::WorkerControlClosed { worker }),
-                    Err(error) => return Err(error),
-                }
+                .into_iter()
+                .try_for_each(|listener| self.unlisten(listener))?;
+            for slot in &self.workers {
+                slot.worker.borrow_mut().application_detached(application);
             }
-            Ok(())
-        })?;
-        Ok(())
-    }
-
-    pub fn install_application_mqs(
-        self: &'static Self,
-        application: u32,
-        resources: &ApplicationMqResources,
-    ) -> RuntimeResult<()> {
-        hammer_runtime::ensure_main_thread()?;
-        let app_session_input = *super::APP_SESSION_INPUT_NODE
-            .get()
-            .ok_or(SessionQueueError::NodeMissing)?;
-        (0..resources.worker_count()).try_for_each(|worker_slot| {
-            let worker = DataWorkerId::new(worker_slot as u32);
-            let queue = resources
-                .queue(worker)
-                .ok_or(SessionQueueError::ApplicationMqMissing { application })?
-                .clone();
-            let main = self;
-            schedule_worker_task(worker, move |runtime| {
-                let mut sessions = main.worker(worker)?.borrow_mut().map_err(|source| {
-                    SessionQueueError::WorkerAccess {
-                        worker: worker.slot(),
-                        source,
-                    }
-                })?;
-                sessions.install_app_mq(application, queue, app_session_input, runtime)
-            })?;
             Ok::<(), RuntimeError>(())
-        })?;
+        })??;
         Ok(())
     }
-
-    pub(crate) fn remove_application_mqs(
-        self: &'static Self,
-        application: u32,
-    ) -> RuntimeResult<()> {
-        (0..self.workers.len()).try_for_each(|worker_slot| {
-            let worker = DataWorkerId::new(worker_slot as u32);
-            let main = self;
-            schedule_worker_task(worker, move |_| {
-                let mut sessions = main.worker(worker)?.borrow_mut().map_err(|source| {
-                    SessionQueueError::WorkerAccess {
-                        worker: worker.slot(),
-                        source,
-                    }
-                })?;
-                sessions.drain_app_mq(application)?;
-                Ok::<(), RuntimeError>(())
-            })?;
-            Ok::<(), RuntimeError>(())
-        })?;
-
-        let mut first_error = None;
-        (0..self.workers.len()).for_each(|worker_slot| {
-            let worker = DataWorkerId::new(worker_slot as u32);
-            let main = self;
-            if let Err(error) = schedule_worker_task(worker, move |_| {
-                let mut sessions = main.worker(worker)?.borrow_mut().map_err(|source| {
-                    SessionQueueError::WorkerAccess {
-                        worker: worker.slot(),
-                        source,
-                    }
-                })?;
-                sessions.remove_app_mq(application)
-            }) {
-                first_error.get_or_insert(error);
-            }
-        });
-        if let Some(error) = first_error {
-            return Err(error);
-        }
-        Ok(())
-    }
-}
-
-pub(super) fn schedule_worker_task<R: Send + 'static>(
-    worker: DataWorkerId,
-    task: impl FnOnce(&mut DataPlaneMain) -> RuntimeResult<R> + Send + 'static,
-) -> RuntimeResult<R> {
-    let (tx, rx) = std::sync::mpsc::channel();
-    hammer_runtime::schedule_on_worker(worker, move |runtime| {
-        if tx.send(task(runtime)).is_err() {
-            return;
-        }
-    })?;
-    rx.recv()
-        .map_err(|_| RuntimeError::WorkerControlClosed { worker })?
 }
 
 pub fn install_session_worker(
     engine: &mut DataPlaneMain,
     app_session_input: hammer_core::data_plane::NodeId,
     session_queue: hammer_core::data_plane::NodeId,
-    mut worker: SessionWorker,
 ) -> RuntimeResult<()> {
     let main = SESSION_MAIN
         .get()
-        .expect("SessionMain is initialized before worker installation");
+        .expect("SessionMain is initialized before worker graph initialization");
     let session_queue_data =
         hammer_runtime::NodeRuntime::from_usize(main as *const SessionMain as usize)?;
     let input_data = AppSessionInputNode::worker_runtime_data(session_queue_data, session_queue);
-    let worker_id = worker.worker();
-    let slot = main.worker(worker_id)?;
+    // SAFETY: worker graph initialization runs on the DataPlaneMain's owning
+    // runtime thread before that worker enters its main loop.
+    let mut worker = unsafe { main.worker(engine.thread_index()) }?;
     let previous_app_session_input_data = engine.nodes().node_runtime_data(app_session_input)?;
     let previous_session_queue_data = engine.nodes().node_runtime_data(session_queue)?;
     let previous_app_session_input_state = engine.nodes().node_state(app_session_input)?;
@@ -1238,6 +1106,7 @@ pub fn install_session_worker(
         engine
             .nodes()
             .set_node_state(app_session_input, NodeState::Interrupt)?;
+        worker.install_event_queue(engine, session_queue)?;
         worker.install_state_deadline(engine, session_queue)
     })();
     if let Err(error) = setup {
@@ -1254,26 +1123,13 @@ pub fn install_session_worker(
         return Err(error);
     }
 
-    if let Err(mut worker) = slot.install(worker) {
-        cleanup_session_worker_install(&mut worker);
-        rollback_session_worker_graph(
-            engine,
-            app_session_input,
-            previous_app_session_input_data,
-            previous_app_session_input_state,
-            session_queue,
-            previous_session_queue_data,
-            previous_session_queue_state,
-        );
-        return Err(SessionQueueError::WorkerAlreadyInstalled {
-            worker: worker_id.slot(),
-        }
-        .into());
-    }
     Ok(())
 }
 
 fn cleanup_session_worker_install(worker: &mut SessionWorker) {
+    if let Err(error) = worker.remove_event_queue() {
+        tracing::error!(%error, "failed to remove Session Worker event queue");
+    }
     if let Err(error) = worker.remove_state_deadline() {
         tracing::error!(%error, "failed to remove Session Worker deadline during install rollback");
     }
@@ -1329,6 +1185,54 @@ fn rollback_session_worker_graph(
 }
 
 impl SessionWorker {
+    fn install_event_queue(
+        &mut self,
+        runtime: &DataPlaneMain,
+        session_queue: NodeId,
+    ) -> RuntimeResult<()> {
+        let signal_read_fd = self
+            .session_evt_q
+            .read_fd()
+            .ok_or(AttachError::SessionSignalMissing)?;
+        // SAFETY: the queue retains the original read endpoint while FileMain
+        // owns this independent duplicated descriptor.
+        let signal_read = unsafe { BorrowedFd::borrow_raw(signal_read_fd) }
+            .try_clone_to_owned()
+            .map_err(|source| AttachError::SessionSignalDuplicate { source })?;
+        let mut file = File::new(
+            signal_read,
+            format!("session worker {} events", self.worker.slot()),
+            session_queue.slot().into(),
+            FileFunctions {
+                read: Some(schedule_session_event_queue),
+                ..FileFunctions::default()
+            },
+        );
+        file.set_polling_thread_index(runtime.thread_index());
+        self.session_event_file = Some(
+            FILE_MAIN
+                .get()
+                .expect("FileMain is initialized before Session Worker startup")
+                .add(file)?,
+        );
+        Ok(())
+    }
+
+    fn remove_event_queue(&mut self) -> RuntimeResult<()> {
+        let Some(file) = self.session_event_file else {
+            return Ok(());
+        };
+        if !FILE_MAIN
+            .get()
+            .expect("FileMain remains initialized through Session Worker cleanup")
+            .delete(file)?
+        {
+            return Err(RuntimeError::FileIndexInvalid { index: file });
+        }
+        self.session_event_file = None;
+        Ok(())
+    }
+
     #[inline]
     pub const fn worker(&self) -> DataWorkerId {
         self.worker
@@ -2100,130 +2004,19 @@ impl SessionWorker {
         Ok(())
     }
 
-    /// Registers one per-Application MQ with this Data Worker's FileMain.
-    pub(crate) fn install_app_mq(
-        &mut self,
-        application: u32,
-        queue: Arc<SessionMsgQueue>,
-        app_session_input: hammer_core::data_plane::NodeId,
-        runtime: &mut DataPlaneMain,
-    ) -> RuntimeResult<()> {
-        let slot = application as usize;
-        if slot >= self.app_rx_mqs.len() {
-            self.app_rx_mqs.resize_with(slot + 1, || None);
-        }
-        if self.app_rx_mqs[slot]
-            .as_ref()
-            .is_some_and(|entry| entry.application == application)
-        {
-            return Err(SessionQueueError::ApplicationMqAlreadyRegistered { application }.into());
-        }
-        let Some(signal_read_fd) = queue.read_fd() else {
-            return Err(AttachError::SessionSignalMissing.into());
-        };
-        // SAFETY: the queue retains its original read endpoint while FileMain
-        // owns this independent duplicated descriptor.
-        let signal_read = unsafe { BorrowedFd::borrow_raw(signal_read_fd) }
-            .try_clone_to_owned()
-            .map_err(|source| AttachError::SessionSignalDuplicate { source })?;
-        let entry = Box::new(AppRxMqEntry {
-            application,
-            queue,
-            file: None,
-            appsl_input_node: app_session_input,
-            pending_queue: &mut self.app_rx_mq_pending as *mut VecDeque<u32> as usize,
-            pending: false,
-            postponed: false,
-        });
-        let entry_ptr = Box::into_raw(entry);
-        let mut file = File::new(
-            signal_read,
-            format!("app rx mq {:?}", application),
-            entry_ptr as usize as u64,
-            FileFunctions {
-                read: Some(schedule_app_mq_pending),
-                ..FileFunctions::default()
-            },
-        );
-        file.set_polling_thread_index(runtime.thread_index());
-        let file = match FILE_MAIN
-            .get()
-            .expect("FileMain is initialized before Session Worker startup")
-            .add(file)
-        {
-            Ok(file) => file,
-            Err(error) => {
-                // SAFETY: `entry_ptr` still owns the entry until FileMain add
-                // succeeds; reconstruct it here so the queue is dropped.
-                unsafe {
-                    drop(Box::from_raw(entry_ptr));
-                }
-                return Err(error);
-            }
-        };
-        // SAFETY: `entry_ptr` was produced by `Box::into_raw` and is still
-        // unaliased; reconstruct it for worker-local storage.
-        let mut entry = unsafe { Box::from_raw(entry_ptr) };
-        entry.file = Some(file);
-        self.app_rx_mqs[slot] = Some(entry);
-        Ok(())
-    }
-
-    /// Removes one per-Application MQ registration before the queue is
-    /// released by `ApplicationMain`.
-    pub(crate) fn remove_app_mq(&mut self, application: u32) -> RuntimeResult<()> {
-        let slot = application as usize;
-        let Some(entry) = self.app_rx_mqs.get_mut(slot).and_then(|entry| {
-            if entry
-                .as_ref()
-                .is_some_and(|entry| entry.application == application)
-            {
-                entry.take()
-            } else {
-                None
-            }
-        }) else {
-            return Ok(());
-        };
-        self.app_rx_mq_pending
-            .retain(|candidate| *candidate != application);
-        if let Some(file) = entry.file {
-            match FILE_MAIN
-                .get()
-                .expect("FileMain is initialized before Session Worker startup")
-                .delete(file)
-            {
-                Ok(true) => {}
-                Ok(false) => {
-                    if entry.pending {
-                        self.app_rx_mq_pending.push_back(application);
-                    }
-                    self.app_rx_mqs[slot] = Some(entry);
-                    return Err(RuntimeError::FileIndexInvalid { index: file });
-                }
-                Err(error) => {
-                    if entry.pending {
-                        self.app_rx_mq_pending.push_back(application);
-                    }
-                    self.app_rx_mqs[slot] = Some(entry);
-                    return Err(error);
-                }
-            }
-        }
-        Ok(())
-    }
-
     #[inline]
     pub(crate) fn app_mq_worker(&self, application: u32) -> Option<Arc<SessionMsgQueue>> {
-        self.app_rx_mqs
-            .get(application as usize)?
-            .as_ref()
-            .filter(|entry| entry.application == application)
-            .map(|entry| Arc::clone(&entry.queue))
+        application_main()
+            .worker_mq(application, self.worker)
+            .map(|entry| Arc::clone(entry.queue()))
     }
 
     pub(crate) fn has_pending_app_mqs(&self) -> bool {
         !self.app_rx_mq_pending.is_empty()
+    }
+
+    pub(super) fn schedule_application_mq(&mut self, application: u32) {
+        self.app_rx_mq_pending.push_back(application);
     }
 
     fn drain_app_mq_events_to(
@@ -2233,18 +2026,30 @@ impl SessionWorker {
         let pending_snapshot = core::mem::take(&mut self.app_rx_mq_pending);
         let mut dispatched = 0usize;
         for application in pending_snapshot {
-            let slot = application as usize;
-            let Some(Some(entry)) = self.app_rx_mqs.get_mut(slot) else {
+            let Some(entry) = application_main().worker_mq(application, self.worker) else {
                 continue;
             };
-            if entry.application != application || !entry.pending {
-                continue;
+            entry.queue().drain();
+            let snapshot = entry.queue().len();
+            for _ in 0..snapshot {
+                let event = match entry.queue().dequeue_with_ring() {
+                    Ok(event) => event,
+                    Err(error) => {
+                        self.app_rx_mq_pending.push_back(application);
+                        return Err(error);
+                    }
+                };
+                let Some((ring, event)) = event else {
+                    break;
+                };
+                dispatch_event(ring, event);
+                dispatched = dispatched.saturating_add(1);
             }
-            let entry_dispatched = entry.drain_snapshot_to(&mut dispatch_event)?;
-            if entry.pending {
+            if entry.queue().is_empty() {
+                entry.clear_pending();
+            } else {
                 self.app_rx_mq_pending.push_back(application);
             }
-            dispatched = dispatched.saturating_add(entry_dispatched);
         }
         Ok(dispatched)
     }
@@ -2267,16 +2072,29 @@ impl SessionWorker {
     ) -> Result<usize, SessionMsgQueueError> {
         self.app_rx_mq_pending
             .retain(|candidate| *candidate != application);
-        let slot = application as usize;
-        let Some(Some(entry)) = self.app_rx_mqs.get_mut(slot) else {
+        let Some(entry) = application_main().worker_mq(application, self.worker) else {
             return Ok(0);
         };
-        if entry.application != application {
-            return Ok(0);
+        entry.queue().drain();
+        let snapshot = entry.queue().len();
+        let mut dispatched = 0usize;
+        for _ in 0..snapshot {
+            let event = match entry.queue().dequeue_with_ring() {
+                Ok(event) => event,
+                Err(error) => {
+                    self.app_rx_mq_pending.push_back(application);
+                    return Err(error);
+                }
+            };
+            let Some((ring, event)) = event else {
+                break;
+            };
+            dispatch_event(ring, event);
+            dispatched = dispatched.saturating_add(1);
         }
-
-        let dispatched = entry.drain_snapshot_to(&mut dispatch_event)?;
-        if entry.pending {
+        if entry.queue().is_empty() {
+            entry.clear_pending();
+        } else {
             self.app_rx_mq_pending.push_back(application);
         }
         Ok(dispatched)
@@ -2391,15 +2209,11 @@ impl SessionWorker {
         let main = SESSION_MAIN
             .get()
             .expect("SessionMain is initialized before worker acceptance");
-        let (application_listener, application, app) = main.with_listener(listener, |entry| {
-            (
-                entry.application_listener(),
-                entry.application(),
-                entry.app(),
-            )
-        })?;
-        let opaque =
-            application_main().with_listener(application_listener, |entry| entry.opaque())?;
+        let listener_entry = main.listener(listener)?;
+        let application_listener = listener_entry.application_listener();
+        let application = listener_entry.application();
+        let app = listener_entry.app();
+        let opaque = application_main().listener(application_listener)?.opaque();
         let session_id = self.construct_stream_sessions(
             transport,
             index,
@@ -2556,20 +2370,19 @@ impl SessionWorker {
         connection: u32,
     ) -> RuntimeResult<u32> {
         let application_connection = connection;
-        let session_id = application_main()
-            .with_connection(application_connection, |connection| {
-                self.construct_stream_sessions(
-                    transport,
-                    index,
-                    connection.context(),
-                    connection.application(),
-                    connection.app(),
-                    connection.opaque(),
-                    connection.server_name(),
-                    false,
-                )
-            })
-            .map_err(RuntimeError::from)??;
+        let connection = application_main()
+            .connection(application_connection)
+            .map_err(RuntimeError::from)?;
+        let session_id = self.construct_stream_sessions(
+            transport,
+            index,
+            connection.context(),
+            connection.application(),
+            connection.app(),
+            connection.opaque(),
+            connection.server_name(),
+            false,
+        )?;
         let entry = self
             .entries
             .get_mut(session_id)
@@ -2598,8 +2411,9 @@ impl SessionWorker {
             .filter(|_| self.app.app_session(session_id).is_some())
             .map(|connection| {
                 let context = application_main()
-                    .with_connection(connection, |entry| entry.context())
-                    .map_err(RuntimeError::from)?;
+                    .connection(connection)
+                    .map_err(RuntimeError::from)?
+                    .context();
                 let connected =
                     SessionConnectedMsg::new(context, Ok(self.session_handle(session_id)));
                 Ok::<_, RuntimeError>(connected)
@@ -2614,11 +2428,11 @@ impl SessionWorker {
         error: SessionConnectError,
     ) -> RuntimeResult<bool> {
         let application_connection = connection;
-        let (application, context) = application_main()
-            .with_connection(application_connection, |entry| {
-                (entry.application(), entry.context())
-            })
+        let application_connection_entry = application_main()
+            .connection(application_connection)
             .map_err(RuntimeError::from)?;
+        let application = application_connection_entry.application();
+        let context = application_connection_entry.context();
         let message = SessionConnectedMsg::new(context, Err(error));
         let accepted = self.app.publish_connect_failed(application, message)?;
         if accepted {
@@ -3105,6 +2919,8 @@ impl SessionWorker {
     }
 
     fn application_detached(&mut self, application: u32) {
+        self.app_rx_mq_pending
+            .retain(|candidate| *candidate != application);
         let sessions = self
             .entries
             .iter()
@@ -3408,20 +3224,6 @@ impl SessionWorker {
     }
 
     pub fn poll_app(&mut self) -> RuntimeResult<usize> {
-        // Direct test registrations have no FileMain descriptor; production
-        // registrations always acquire one in `install_app_mq`.
-        let pending_applications = self
-            .app_rx_mqs
-            .iter_mut()
-            .filter_map(|entry| {
-                let entry = entry.as_mut()?;
-                (entry.file.is_none() && !entry.pending && !entry.queue.is_empty()).then(|| {
-                    entry.pending = true;
-                    entry.application
-                })
-            })
-            .collect::<Vec<_>>();
-        self.app_rx_mq_pending.extend(pending_applications);
         let mut control_events = core::mem::take(&mut self.control_events);
         let mut new_io_events = core::mem::take(&mut self.new_io_events);
         let app_mq_handled = self.drain_app_mq_events_to(|ring, event| {
@@ -3457,21 +3259,80 @@ impl SessionWorker {
     }
 
     pub(crate) fn poll_session_events(&mut self) -> RuntimeResult<usize> {
+        self.session_evt_q.drain();
         let snapshot = self.session_evt_q.len();
         let mut handled = 0usize;
+        let mut first_error = None;
         for _ in 0..snapshot {
             let Some((ring, event)) = self.session_evt_q.dequeue_with_ring()? else {
                 break;
             };
-            enqueue_app_event(
-                &mut self.control_events,
-                &mut self.new_io_events,
-                ring,
-                event,
-            );
+            let result = match event.evt_type {
+                SessionEvtType::Connect => self.dispatch_connect(event.session_index, false),
+                SessionEvtType::ConnectStream => self.dispatch_connect(event.session_index, true),
+                SessionEvtType::AcceptedReply => {
+                    let application = (event.control_data >> 32) as u32;
+                    let result = if event.control_data as u32 == 0 {
+                        Ok(())
+                    } else {
+                        Err(SessionControlError::TransportFailed)
+                    };
+                    self.accept_reply(
+                        application,
+                        SessionHandle::new(event.session_index, event.thread_index),
+                        result,
+                    )
+                }
+                _ => {
+                    enqueue_app_event(
+                        &mut self.control_events,
+                        &mut self.new_io_events,
+                        ring,
+                        event,
+                    );
+                    Ok(())
+                }
+            };
+            if let Err(error) = result {
+                first_error.get_or_insert(error);
+            }
             handled += 1;
         }
-        Ok(handled)
+        first_error.map_or(Ok(handled), Err)
+    }
+
+    fn dispatch_connect(&mut self, connection: u32, stream: bool) -> RuntimeResult<()> {
+        let (protocol, endpoint) = application_main()
+            .connection(connection)
+            .map_err(RuntimeError::from)?
+            .connect_endpoint(connection);
+        let transport = transport_vft(protocol).ok_or(if stream {
+            SessionError::TransportConnectStreamUnsupported
+        } else {
+            SessionError::TransportConnectUnsupported
+        })?;
+        let operation = if stream {
+            transport.connect_stream
+        } else {
+            transport.connect
+        };
+        let Some(operation) = operation else {
+            return Err(if stream {
+                SessionError::TransportConnectStreamUnsupported.into()
+            } else {
+                SessionError::TransportConnectUnsupported.into()
+            });
+        };
+        if let Err(error) = operation(self, endpoint) {
+            tracing::warn!(%error, ?connection, ?protocol, "Session transport connect failed");
+            self.stream_connect_failed(
+                connection,
+                SessionConnectError::Control {
+                    error: SessionControlError::TransportFailed,
+                },
+            )?;
+        }
+        Ok(())
     }
 
     fn dispatch_application(
@@ -3813,9 +3674,8 @@ impl SessionWorker {
     ///
     /// VPP redirects main-thread arrivals back to a worker before this
     /// handler runs (session_node.c:511-515); Hammer executes this
-    /// worker-local transition through the engine task queue
-    /// ([`schedule_worker_task`]), the only runtime-model difference. The
-    /// transition mirrors VPP:
+    /// worker-local transition through the owning worker's Session event
+    /// queue. The transition mirrors VPP:
     /// - unknown Session or application-ownership mismatch: drop the reply
     ///   (session_node.c:516-521);
     /// - error retval: disconnect only this Session
@@ -4106,12 +3966,8 @@ impl SessionWorker {
         app_session_config: AppSessionConfig,
         pool_capacity: usize,
         publisher: Option<AppSessionPublisher>,
+        session_evt_q: Arc<SessionMsgQueue>,
     ) -> RuntimeResult<Self> {
-        let cap = DEFAULT_SESSION_EVENT_CAPACITY.next_power_of_two().max(2) as u32;
-        let session_evt_q = Arc::new(
-            SessionMsgQueue::with_cfg(cap, cap.max(2))
-                .map_err(|error| AppWorkerError::SessionEventQueue { error })?,
-        );
         let app = AppWorker::new(pool_capacity, worker.slot(), publisher);
         Ok(Self {
             worker,
@@ -4125,11 +3981,11 @@ impl SessionWorker {
             control_events: LinkedList::new(),
             new_io_events: LinkedList::new(),
             old_io_events: LinkedList::new(),
-            app_rx_mqs: Vec::new(),
             app_rx_mq_pending: VecDeque::new(),
             state: SessionWorkerState::Polling,
             state_deadline_file: None,
             session_queue: None,
+            session_event_file: None,
         })
     }
 }
@@ -4779,11 +4635,8 @@ fn enqueue_app_event(
     }
 }
 
-fn schedule_app_session_input(
-    graph: &mut hammer_runtime::NodeMain,
-    file: &mut File,
-) -> RuntimeResult<()> {
-    let node = hammer_core::data_plane::NodeId::new(file.private_data() as u32);
+fn schedule_session_event_queue(graph: &mut NodeMain, file: &mut File) -> RuntimeResult<()> {
+    let node = NodeId::new(file.private_data() as u32);
     let _ = graph.mark_interrupt_pending(node)?;
     Ok(())
 }
@@ -4797,24 +4650,5 @@ fn schedule_session_queue_deadline(
             .expect("Session Queue node identity is stored as a u32"),
     );
     let _ = graph.mark_interrupt_pending(node)?;
-    Ok(())
-}
-
-fn schedule_app_mq_pending(
-    graph: &mut hammer_runtime::NodeMain,
-    file: &mut File,
-) -> RuntimeResult<()> {
-    // SAFETY: the entry is boxed and owned by this worker's SessionWorker for
-    // the File lifetime; FileMain deletes this File before the box is dropped.
-    let entry = unsafe { &mut *(file.private_data() as usize as *mut AppRxMqEntry) };
-    if entry.pending || entry.queue.is_empty() {
-        return Ok(());
-    }
-    entry.pending = true;
-    // SAFETY: the pending queue belongs to the same worker that owns this
-    // File/entry, and FileMain deletes the File before the queue is dropped.
-    let pending_queue = unsafe { &mut *(entry.pending_queue as *mut VecDeque<u32>) };
-    pending_queue.push_back(entry.application);
-    let _ = graph.mark_interrupt_pending(entry.appsl_input_node)?;
     Ok(())
 }

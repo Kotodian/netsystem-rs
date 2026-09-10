@@ -243,7 +243,8 @@ impl SessionQueueNode {
         // SAFETY: worker NodeRuntime is installed by the owning Data Worker
         // and points at the process-global SessionMain for its lifetime.
         let main = unsafe { &*ptr };
-        main.with_worker_mut(runtime.thread_index(), |sessions| sessions.poll_app())
+        // SAFETY: this Node executes on the DataPlaneMain's owning runtime thread.
+        unsafe { main.worker(runtime.thread_index()) }?.poll_app()
     }
 
     fn has_pending_app_mqs(
@@ -259,9 +260,8 @@ impl SessionQueueNode {
         // SAFETY: worker NodeRuntime is installed by the owning Data Worker
         // and points at the process-global SessionMain for its lifetime.
         let main = unsafe { &*ptr };
-        main.with_worker_mut(runtime.thread_index(), |sessions| {
-            Ok(sessions.has_pending_app_mqs())
-        })
+        // SAFETY: this Node executes on the DataPlaneMain's owning runtime thread.
+        Ok(unsafe { main.worker(runtime.thread_index()) }?.has_pending_app_mqs())
     }
 
     fn session_queue_is_interrupt(
@@ -341,23 +341,23 @@ impl SessionQueueNode {
         // SAFETY: worker NodeRuntime is installed by the owning Data Worker
         // and points at the process-global SessionMain for its lifetime.
         let main = unsafe { &*ptr };
-        main.with_worker_mut(runtime.thread_index(), |sessions| {
-            if sessions.transport_dispatches.iter().any(|dispatch| {
-                dispatch.output_next == output_next
-                    && std::ptr::fn_addr_eq(dispatch.update_time, update_time)
-                    && std::ptr::fn_addr_eq(dispatch.function, function)
-            }) {
-                return Ok(false);
-            }
-            sessions
-                .transport_dispatches
-                .push(SessionQueueTransportDispatch {
-                    output_next,
-                    update_time,
-                    function,
-                });
-            Ok(true)
-        })
+        // SAFETY: this Node executes on the DataPlaneMain's owning runtime thread.
+        let mut sessions = unsafe { main.worker(runtime.thread_index()) }?;
+        if sessions.transport_dispatches.iter().any(|dispatch| {
+            dispatch.output_next == output_next
+                && std::ptr::fn_addr_eq(dispatch.update_time, update_time)
+                && std::ptr::fn_addr_eq(dispatch.function, function)
+        }) {
+            return Ok(false);
+        }
+        sessions
+            .transport_dispatches
+            .push(SessionQueueTransportDispatch {
+                output_next,
+                update_time,
+                function,
+            });
+        Ok(true)
     }
 
     /// Removes one exact worker-local transport dispatch attachment.
@@ -377,17 +377,17 @@ impl SessionQueueNode {
         // SAFETY: worker NodeRuntime is installed by the owning Data Worker
         // and the SessionMain Arc remains alive in that worker's SessionMain.
         let main = unsafe { &*ptr };
-        main.with_worker_mut(runtime.thread_index(), |sessions| {
-            let Some(index) = sessions.transport_dispatches.iter().position(|dispatch| {
-                dispatch.output_next == output_next
-                    && std::ptr::fn_addr_eq(dispatch.update_time, update_time)
-                    && std::ptr::fn_addr_eq(dispatch.function, function)
-            }) else {
-                return Ok(false);
-            };
-            sessions.transport_dispatches.remove(index);
-            Ok(true)
-        })
+        // SAFETY: this Node executes on the DataPlaneMain's owning runtime thread.
+        let mut sessions = unsafe { main.worker(runtime.thread_index()) }?;
+        let Some(index) = sessions.transport_dispatches.iter().position(|dispatch| {
+            dispatch.output_next == output_next
+                && std::ptr::fn_addr_eq(dispatch.update_time, update_time)
+                && std::ptr::fn_addr_eq(dispatch.function, function)
+        }) else {
+            return Ok(false);
+        };
+        sessions.transport_dispatches.remove(index);
+        Ok(true)
     }
 }
 
@@ -432,13 +432,17 @@ fn session_queue_node_process(
         // SAFETY: worker NodeRuntime is installed by the owning Data Worker and
         // points at the process-global SessionMain for its lifetime.
         let main = unsafe { &*ptr };
-        let _ = main.with_worker_mut(runtime.thread_index(), |sessions| -> RuntimeResult<bool> {
+        'dispatch: {
+            // SAFETY: this Node executes on the DataPlaneMain's owning runtime thread.
+            let Ok(mut sessions) = (unsafe { main.worker(runtime.thread_index()) }) else {
+                break 'dispatch;
+            };
             let dispatch_count = sessions.transport_dispatches.len();
             for dispatch_index in 0..dispatch_count {
                 let dispatch = sessions.transport_dispatches[dispatch_index];
                 if (dispatch.update_time)(
                     runtime,
-                    sessions,
+                    &mut sessions,
                     *data,
                     dispatch.output_next,
                     now,
@@ -447,18 +451,18 @@ fn session_queue_node_process(
                 )
                 .is_err()
                 {
-                    return Ok(true);
+                    break 'dispatch;
                 }
             }
             if sessions.poll_session_events().is_err() {
-                return Ok(true);
+                break 'dispatch;
             }
             let dispatch_count = sessions.transport_dispatches.len();
             for dispatch_index in 0..dispatch_count {
                 let dispatch = sessions.transport_dispatches[dispatch_index];
                 if (dispatch.function)(
                     runtime,
-                    sessions,
+                    &mut sessions,
                     *data,
                     dispatch.output_next,
                     now,
@@ -467,14 +471,13 @@ fn session_queue_node_process(
                 )
                 .is_err()
                 {
-                    return Ok(true);
+                    break 'dispatch;
                 }
             }
             if sessions.update_state(runtime, output.io_count()).is_err() {
-                return Ok(true);
+                break 'dispatch;
             }
-            Ok(false)
-        });
+        }
         output.flush(runtime, data, frame);
         ()
     })();

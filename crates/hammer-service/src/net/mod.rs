@@ -1,4 +1,6 @@
 use std::cell::{Ref, RefCell, RefMut};
+use std::fmt;
+use std::net::IpAddr;
 use std::sync::{Arc, OnceLock};
 
 use hammer_infra::pool::Pool;
@@ -20,6 +22,75 @@ pub use fib::{
     FibPathList, FibPathListFlags, FibSource, FibSourceBehavior, FibTable, FibTableBackend,
     FibUrpfList,
 };
+
+/// Network family used by dial/listen paths.
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, Hash, Default, serde::Deserialize, serde::Serialize,
+)]
+#[serde(rename_all = "lowercase")]
+pub enum Network {
+    #[default]
+    Tcp,
+    Udp,
+    Icmp,
+}
+
+impl Network {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Tcp => "tcp",
+            Self::Udp => "udp",
+            Self::Icmp => "icmp",
+        }
+    }
+}
+
+impl fmt::Display for Network {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SocksAddr {
+    pub host: IpAddr,
+    pub port: u16,
+    pub domain: Option<String>,
+}
+
+impl SocksAddr {
+    pub fn ip(host: IpAddr, port: u16) -> Self {
+        Self {
+            host,
+            port,
+            domain: None,
+        }
+    }
+
+    pub fn domain(domain: impl Into<String>, fallback: IpAddr, port: u16) -> Self {
+        Self {
+            host: fallback,
+            port,
+            domain: Some(domain.into()),
+        }
+    }
+
+    pub fn destination_host(&self) -> String {
+        self.domain.clone().unwrap_or_else(|| self.host.to_string())
+    }
+}
+
+impl fmt::Display for SocksAddr {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        if let Some(domain) = &self.domain {
+            return write!(f, "{domain}:{}", self.port);
+        }
+        match self.host {
+            IpAddr::V4(addr) => write!(f, "{addr}:{}", self.port),
+            IpAddr::V6(addr) => write!(f, "[{addr}]:{}", self.port),
+        }
+    }
+}
 
 pub struct NetMain {
     interface_main: Arc<InterfaceMain>,

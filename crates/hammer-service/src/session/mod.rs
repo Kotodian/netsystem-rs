@@ -3,7 +3,6 @@
 use std::sync::{Arc, OnceLock};
 
 use hammer_core::data_plane::{NodeId, NodeState};
-use hammer_runtime::app::AppSessionConfig;
 use hammer_runtime::attach::AppServer;
 use hammer_runtime::{DataPlaneMain, RuntimeResult};
 
@@ -62,7 +61,7 @@ fn configure_session(config: config::NetworkSessionConfig) -> RuntimeResult<()> 
 
 #[hammer_component_macros::init_function(
     name = "session_init",
-    runs_after = ["transport_main_init", "application_init"]
+    runs_after = ["transport_main_init", "application_init", "session_attach_server"]
 )]
 fn init_session() -> RuntimeResult<()> {
     runtime::SessionMain::init(hammer_runtime::config::worker::worker_count())
@@ -84,8 +83,6 @@ fn init_application() -> RuntimeResult<()> {
 
 #[hammer_component_macros::worker_init_function(name = "session_worker_init")]
 fn init_session_worker(engine: &mut DataPlaneMain) -> RuntimeResult<()> {
-    let session = session_config();
-    let worker = engine.data_worker_id()?;
     let session_queue = engine
         .node_by_name("session-queue")
         .ok_or(error::SessionQueueError::NodeMissing)?;
@@ -108,19 +105,14 @@ fn init_session_worker(engine: &mut DataPlaneMain) -> RuntimeResult<()> {
     engine
         .nodes()
         .set_node_state(app_session_input, NodeState::Disabled)?;
-    let publisher = APP_SERVER.get().map(|server| server.publisher());
-    let sessions = SessionWorker::new(
-        worker,
-        hammer_runtime::config::worker::worker_count(),
-        AppSessionConfig::default(),
-        session.pool_capacity,
-        publisher,
-    )?;
-    runtime::install_session_worker(engine, app_session_input, session_queue, sessions)?;
+    runtime::install_session_worker(engine, app_session_input, session_queue)?;
     Ok(())
 }
 
-#[hammer_component_macros::init_function(name = "session_attach_server")]
+#[hammer_component_macros::init_function(
+    name = "session_attach_server",
+    runs_after = ["application_init"]
+)]
 fn configure_attach_server() -> RuntimeResult<()> {
     let session = session_config();
     let Some(path) = session.attach_socket_path.as_deref() else {

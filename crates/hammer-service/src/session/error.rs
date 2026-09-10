@@ -14,21 +14,11 @@ pub enum SessionQueueError {
     WorkerUnavailable { thread_index: u32 },
     #[error("session worker {worker} is outside the configured worker range")]
     WorkerOutOfRange { worker: usize },
-    #[error("session worker {worker} is already installed")]
-    WorkerAlreadyInstalled { worker: usize },
-    #[error("session worker {worker} cannot be accessed")]
-    WorkerAccess {
-        worker: usize,
-        #[source]
-        source: hammer_infra::thread_owned::ThreadOwnedError,
-    },
     #[error("session queue output node {output_node:?} is not registered for {consumer:?}")]
     OutputMissing {
         consumer: NodeId,
         output_node: NodeId,
     },
-    #[error("Application {application:?} already has a per-worker MQ registration")]
-    ApplicationMqAlreadyRegistered { application: u32 },
     #[error("Application {application:?} has no per-worker MQ registration")]
     ApplicationMqMissing { application: u32 },
 }
@@ -40,11 +30,8 @@ impl SessionQueueError {
             Self::NodeMissing => 0,
             Self::WorkerUnavailable { .. } => 1,
             Self::WorkerOutOfRange { .. } => 2,
-            Self::WorkerAlreadyInstalled { .. } => 3,
-            Self::WorkerAccess { .. } => 4,
-            Self::OutputMissing { .. } => 5,
-            Self::ApplicationMqAlreadyRegistered { .. } => 6,
-            Self::ApplicationMqMissing { .. } => 7,
+            Self::OutputMissing { .. } => 3,
+            Self::ApplicationMqMissing { .. } => 4,
         }
     }
 }
@@ -127,6 +114,8 @@ pub enum SessionError {
     TransportListenUnsupported,
     #[error("Session transport does not register active-open")]
     TransportConnectUnsupported,
+    #[error("Session active-open has no Application connection")]
+    ApplicationConnectionMissing,
     #[error("Session transport does not register stream active-open")]
     TransportConnectStreamUnsupported,
     #[error("Session transport operation failed")]
@@ -167,6 +156,7 @@ impl From<SessionError> for SessionControlError {
             SessionError::ListenerControlWrongThread => Self::ApplicationControlWrongThread,
             SessionError::TransportListenUnsupported { .. } => Self::TransportListenUnsupported,
             SessionError::TransportConnectUnsupported { .. } => Self::TransportConnectUnsupported,
+            SessionError::ApplicationConnectionMissing => Self::ConnectionMissing,
             SessionError::TransportConnectStreamUnsupported { .. } => {
                 Self::TransportConnectUnsupported
             }

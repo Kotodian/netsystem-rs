@@ -6,7 +6,7 @@ use hammer_runtime::app::{
 use hammer_runtime::{DataWorkerId, RuntimeResult, SessionConnectEndpoint};
 
 use super::application::{ApplicationError, application_main};
-use super::runtime::{SessionMain, schedule_worker_task};
+use super::runtime::SessionMain;
 use crate::transport::transport_vft;
 
 impl SessionMain {
@@ -147,21 +147,13 @@ impl SessionMain {
                 .ok_or(SessionControlError::ConnectStreamParentMissing)?;
             let worker = DataWorkerId::try_from(parent.thread_index)
                 .map_err(|_| SessionControlError::ConnectStreamParentMissing)?;
-            let application_connection = application_main()
-                .register_connection(
-                    application,
-                    request.context,
-                    None,
-                    request.app,
-                    request.opaque,
-                )
-                .map_err(SessionControlError::from)?;
-            let endpoint = SessionConnectEndpoint {
+            let mut endpoint = SessionConnectEndpoint {
                 remote: request.remote,
                 local: request.local,
                 worker,
-                connection: application_connection,
+                connection: None,
                 application,
+                app: request.app,
                 parent_handle: Some(parent),
                 flags: request.flags,
                 opaque: request.opaque,
@@ -169,6 +161,10 @@ impl SessionMain {
                 // parent Session; no per-stream ext-config is accepted.
                 server_name: None,
             };
+            let application_connection = application_main()
+                .register_connection(request.transport, request.context, endpoint.clone())
+                .map_err(SessionControlError::from)?;
+            endpoint.connection = Some(application_connection);
             if let Err(error) = self.connect_stream(request.transport, endpoint) {
                 let _ = application_main().remove_connection(application, application_connection);
                 // VPP notifies the app with the concrete connect rv
@@ -180,24 +176,22 @@ impl SessionMain {
             if transport.connect.is_none() {
                 return Err(SessionControlError::TransportConnectUnsupported);
             }
-            let application_connection = application_main()
-                .register_connection(
-                    application,
-                    request.context,
-                    None,
-                    request.app,
-                    request.opaque,
-                )
-                .map_err(SessionControlError::from)?;
-            let endpoint = SessionConnectEndpoint::new(
-                request.remote,
-                request.local,
-                DataWorkerId::new(0),
-                application_connection,
+            let mut endpoint = SessionConnectEndpoint {
+                remote: request.remote,
+                local: request.local,
+                worker: DataWorkerId::new(0),
+                connection: None,
                 application,
-                request.opaque,
+                parent_handle: None,
+                flags: request.flags,
+                opaque: request.opaque,
                 server_name,
-            );
+                app: request.app,
+            };
+            let application_connection = application_main()
+                .register_connection(request.transport, request.context, endpoint.clone())
+                .map_err(SessionControlError::from)?;
+            endpoint.connection = Some(application_connection);
             if let Err(error) = self.connect(request.transport, endpoint) {
                 let _ = application_main().remove_connection(application, application_connection);
                 // VPP propagates the concrete connect rv to the app
@@ -224,8 +218,9 @@ impl SessionMain {
             return Ok(None);
         };
         let store = application_main()
-            .with_application_mq(application, |resources| Ok(resources.ext_config_store()))
+            .application_mq(application)
             .map_err(SessionControlError::from)?
+            .ext_config_store()
             .ok_or(SessionControlError::ExtConfigUnavailable)?;
         let data = store
             .read(offset)
@@ -258,16 +253,16 @@ impl SessionMain {
                     Ok(false) => return Err(SessionControlError::ApplicationMissing),
                     Err(error) => return Err(SessionControlError::from(error)),
                 }
-                let (owner, application_listener) = self
-                    .with_listener(listener, |listener| {
-                        (listener.application(), listener.application_listener())
-                    })
+                let listener_entry = self
+                    .listener(listener)
                     .map_err(|_| SessionControlError::ListenerMissing)?;
+                let owner = listener_entry.application();
+                let application_listener = listener_entry.application_listener();
                 if owner != application {
                     return Err(SessionControlError::ListenerNotOwned);
                 }
                 application_main()
-                    .with_listener(application_listener, |listener| listener.application())
+                    .listener(application_listener)
                     .map_err(SessionControlError::from)?;
                 self.unlisten(listener).map_err(SessionControlError::from)?;
                 application_main()
@@ -286,24 +281,26 @@ impl SessionMain {
 
     /// Applies an ACCEPTED_REPLY from the Application on the worker that owns
     /// the accepted Session. VPP redirects the main-thread arrival to a worker
-    /// before running the handler (session_node.c:511-515); Hammer forwards it
-    /// synchronously through the engine task queue — the same mechanism used
-    /// for Application MQ install/removal — because the main thread cannot
-    /// mutate the worker-owned Session table (`ThreadOwned::with_mut` would
-    /// return WrongThread). The request drain records the first typed
-    /// scheduling/worker failure and continues with later replies.
+    /// before running the handler (session_node.c:511-515); Hammer enqueues the
+    /// concrete event on that worker's existing Session queue. The request
+    /// drain records the first typed queue failure and continues with later
+    /// replies.
     fn accepted_reply(
         &self,
         application: u32,
         request: SessionAcceptedReplyMsg,
     ) -> RuntimeResult<()> {
         let worker = DataWorkerId::try_from(request.session.thread_index)?;
-        let main = SessionMain::global()?;
-        schedule_worker_task(worker, move |runtime| {
-            main.with_worker_mut(runtime.thread_index(), |sessions| {
-                sessions.accept_reply(application, request.session, request.result)
-            })
-        })?;
+        self.enqueue_worker_event(
+            worker,
+            hammer_runtime::app::SessionEvt {
+                evt_type: SessionEvtType::AcceptedReply,
+                postponed: false,
+                session_index: request.session.session_index,
+                thread_index: request.session.thread_index,
+                control_data: (u64::from(application) << 32) | u64::from(request.result.is_err()),
+            },
+        )?;
         Ok(())
     }
 }
@@ -311,9 +308,9 @@ impl SessionMain {
 impl From<ApplicationError> for SessionControlError {
     fn from(error: ApplicationError) -> Self {
         match error {
-            ApplicationError::MqCapacityInvalid { .. } | ApplicationError::MqWorkerCountZero => {
-                Self::TransportFailed
-            }
+            ApplicationError::MqCapacityInvalid { .. }
+            | ApplicationError::MqWorkerCountZero
+            | ApplicationError::MqInputNodeMissing => Self::TransportFailed,
             ApplicationError::Missing { .. } => Self::ApplicationMissing,
             ApplicationError::WrongThread => Self::ApplicationControlWrongThread,
             ApplicationError::ListenerMissing { .. } => Self::ListenerMissing,
@@ -321,7 +318,6 @@ impl From<ApplicationError> for SessionControlError {
             ApplicationError::ConnectionMissing { .. } => Self::ConnectionMissing,
             ApplicationError::ConnectionNotOwned { .. } => Self::ConnectionNotOwned,
             ApplicationError::ConnectionAlreadyConnected { .. }
-            | ApplicationError::ConnectionNotConnected { .. }
             | ApplicationError::MqLayout { .. }
             | ApplicationError::MqLayoutOverflow
             | ApplicationError::MqSegmentCreate { .. }
