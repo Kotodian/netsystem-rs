@@ -36,7 +36,7 @@ Workspace root: `crates/`. Dependency direction is strictly one-way to avoid cyc
 | `hammer` | Daemon binary (analogous to VPP's `vpp`). Loads TOML config, initializes runtime engine + worker graph, binds IPC TCP socket (default `127.0.0.1:7299`, overridable via `HAMMER_IPC_ADDR`), runs the data-plane main loop. |
 | `hammerctl` | CLI control tool (analogous to `vppctl`). Subcommands: `Pause`, `Wake`, `ResetNetwork`, `Shutdown`, `Status`, `Send` (raw handler dispatch). |
 
-Patched dependencies live under `third_party/`. Design docs live in `docs/superpowers/` (`specs/` for architecture specs, `plans/` for dated implementation plans, `sdd/` for task execution tracking).
+Patched dependencies live under `third_party/`. Architecture decisions, type/interface designs, migration inventories, and validation records live in `docs/adr/`. Domain terminology lives in root `CONTEXT.md`. Do not create `docs/superpowers/` or `.superpowers/`; this repository rule overrides document-output paths in skills.
 
 ### Business application boundary
 
@@ -85,14 +85,24 @@ Use Rust 2024 conventions and rustfmt defaults: 4-space indentation, `snake_case
 - Enforce architectural boundaries with visibility, traits, and narrow re-exports instead of comments or convention.
 - Do not introduce `thread_local!` state. Thread-bound state must be owned
   directly by the runtime, worker, Graph Node, or other value that owns that
-  thread lifecycle. Use `hammer_infra::thread_owned::ThreadOwned` only when a
-  shared main structure needs indexed access to worker-owned `T: Send` values;
-  do not add locks, weaken its `Send`/`Sync` contract, or force a thread-bound
-  value to implement `Send` merely to fit that container.
+  thread lifecycle. A shared Main that contains fixed per-thread values must
+  construct its existing `Vec`, slice, or `Pool` entries before worker launch;
+  the executing worker borrows only the entry selected by its runtime thread
+  index. Do not add a generic per-thread container, cross-thread install/clear
+  lifecycle, or lock merely to make that state shared.
 - Express access to an existing value with Rust's ownership and borrowing
   primitives: `&T`, `&mut T`, slices, iterators, and guards. Do not introduce a
   wrapper type merely to observe, borrow, or re-expose another value, or to
   cache pointers and offsets into storage owned elsewhere.
+- Closure-mediated access to existing state is forbidden in production code,
+  tests, examples, and test support. A method whose purpose is to lend owned or
+  worker-local state must not accept `Fn`, `FnMut`, or `FnOnce`; this includes
+  `with_*` methods taking an `operation` or `callback` closure, such as
+  `with_worker(..., operation: impl FnOnce(&mut T) -> Result<_>)`. Return the
+  direct borrow with its real lifetime from an appropriately borrowed owner
+  (`&self -> &T` or `&mut self -> &mut T`). If the owner must perform the work,
+  expose a narrowly named domain operation implemented by the owner without a
+  caller-supplied closure.
 - Plugin-specific types, traits, function tables, references, capabilities, and
   state must be defined and stored only in the plugin that owns them. They must
   not appear in `hammer-runtime`, `hammer-service`, `PluginMain`,
@@ -119,9 +129,10 @@ Use Rust 2024 conventions and rustfmt defaults: 4-space indentation, `snake_case
 ### Synchronization rules
 
 - Prefer ownership over synchronization. Keep packet-path state worker-owned and
-  pass `&T`/`&mut T`; use `ThreadOwned<T>` only for indexed access to values
-  that remain owned by individual workers. Do not add a lock merely to satisfy
-  `Send` or `Sync`.
+  pass `&T`/`&mut T`; fixed worker collections use their existing `Vec`, slice,
+  or `Pool` and the current runtime thread index. Cross-thread code must use the
+  owning domain's event or handoff path instead of borrowing another worker's
+  entry. Do not add a lock merely to satisfy `Send` or `Sync`.
 - Project-owned generic synchronization primitives live in
   `hammer_runtime::sync`. Do not define or re-export another generic spin lock,
   reader-writer lock, fence wrapper, or barrier in another module or crate.
@@ -364,7 +375,7 @@ Add integration tests near the crate whose behavior changes. Test files live in 
 
 Do not write source-text assertion tests that read `.rs`, `Cargo.toml`, or other implementation files and use `contains`, regular expressions, or string matching to claim behavioral or architectural correctness. Such tests do not prove that code compiles, symbols are registered, dynamic libraries export the required inventory, generic dispatch is preserved, or runtime state is installed. Verify those properties through compile-time type checks, real `dlopen`/`dlsym` integration tests, callable lifecycle hooks, and observable runtime graph/state assertions. Source inspection is allowed only in dedicated repository-policy tooling when the property is inherently textual and cannot be expressed through compilation or behavior; it must not substitute for an executable test.
 
-The project follows a TDD rhythm (RED → GREEN → commit) documented in `docs/superpowers/plans/`, with the repository test-timing rule above: test commands are reserved for the final pre-commit gate, not iterative development or post-commit verification.
+The project follows a TDD rhythm (RED → GREEN → commit) documented in the relevant ADR under `docs/adr/`, with the repository test-timing rule above: test commands are reserved for the final pre-commit gate, not iterative development or post-commit verification.
 
 TUN/TCP lab integration is CI-only. The GitHub Actions workflow owns creation,
 configuration, diagnostics, and cleanup of the host-side utun/TUN interface;
@@ -395,9 +406,8 @@ Do not commit real VPN credentials, server addresses, certificates, or generated
 
 ## Documentation
 
-- `docs/superpowers/specs/` — architecture design specs (node-next traits, shared app ingress registry, timer wheel, TCP complete echo design, TCP worker driver node, L5 app session layer).
-- `docs/superpowers/plans/` — dated implementation plans with checkboxes, file maps, and public-interface additions.
-- `docs/superpowers/sdd/` — per-task execution tracking (progress, briefs, reports, review diffs).
+- `docs/adr/` — architecture decisions, concrete type/interface designs, added/modified/deleted inventories, migration plans, and relevant validation records.
+- `CONTEXT.md` — canonical domain terminology; keep implementation details in ADRs.
 - `README.md` — high-level architecture overview for the standalone data-plane framework.
 
 ## Issue-Driven Agent Contract

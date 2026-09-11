@@ -471,3 +471,191 @@ The owner-published cumulative values against which a VPP-style `show` command
 computes post-clear deltas. Clearing updates the baseline at the control-plane
 synchronization boundary.
 _Avoid_: resetting hot-path counters, client-side subtraction state
+
+## Binary API Language
+
+**API Main**:
+The process-wide Binary API authority corresponding to VPP's `api_main_t`. It
+owns Message Data, runtime Message ID ranges, name/CRC lookup, API versions,
+shared-memory regions, the main input queue, and shared-memory client
+registrations; socket listener and socket connection state have a separate
+owner.
+_Avoid_: BinaryApiMain, socket listener owner, method-name table, plugin API
+state
+
+**Socket Main**:
+The Binary API socket-transport authority corresponding to VPP's
+`socket_main_t`. It owns the listener, socket registrations, incomplete stream
+input, pending output, and socket readiness state, but not Message Data or
+shared-memory client registrations.
+_Avoid_: API Main, UnixMain, generic client registry
+
+**Binary API Message**:
+The protobuf transport value containing only a runtime Message ID and the
+encoded bytes of one `.api`-defined message. Client Index, Context, `retval`,
+and operation fields remain in that generated message exactly when declared by
+its `.api` schema.
+_Avoid_: method invocation, request envelope, reply envelope, event envelope,
+generic reply status
+
+**API Message Config**:
+The generated registration input corresponding to VPP's
+`vl_msg_api_msg_config_t`; it binds one runtime Message ID and message name to
+its generated protobuf validator, handler, trace policy, replay policy, and
+MP-safe bit during API initialization.
+_Avoid_: method declaration, message descriptor, handler invocation
+
+**API Message Data**:
+The API Main record indexed by runtime Message ID, corresponding to VPP's
+`vl_api_msg_data_t`. It contains the installed message name, generated
+protobuf validator, handler, trace policy, replay policy, and MP-safe bit for
+the current process; CRC lookup remains in the separate name-and-CRC table.
+_Avoid_: API Message Config, payload object, plugin state
+
+**Message Name and CRC**:
+The canonical `<message-name>_<crc>` key generated from `.api` and used to map
+client schema messages to the current runtime Message IDs.
+_Avoid_: API Message Identity object, method string, persisted Message ID
+
+**Message ID**:
+The runtime-assigned numeric identity used by the current API process to find a
+Binary API Message Data record and handler. It has VPP's `u16` semantic range,
+is valid for one running API instance, and is not a persisted or cross-version
+identity.
+_Avoid_: stable API version, method string, global sequence number
+
+**API Message Range**:
+A contiguous range of runtime Message IDs assigned to one API owner during
+API startup. The range is an allocation fact, not part of the stable message
+identity.
+_Avoid_: plugin version, fixed public ID block, request sequence
+
+**API Message Table**:
+The client-visible association between Message Name and CRC keys and the
+current runtime Message IDs, serialized when a client registers.
+_Avoid_: message registry, protobuf `oneof`, client-side method list
+
+**Client Index**:
+The API registration handle assigned to one connected client. Shared-memory
+handles include the restart epoch and socket handles identify the socket
+registration space; stale handles never resolve to a current registration.
+_Avoid_: process ID, file index, request ID
+
+**API Registration**:
+The server-side record for one shared-memory API client, corresponding to the
+shared-memory fields of VPP's `vl_api_registration_t`. It identifies the
+client's reply queue and liveness state; socket registrations belong to Socket
+Main.
+_Avoid_: API Message Config, event subscription, transport-neutral connection
+object
+
+**API Shared Memory Region**:
+The shared Segment containing the Binary API header, main input queue,
+per-client reply queues, message rings, and serialized API Message Table. Values
+crossing processes are mapping-relative offsets rather than process-local raw
+pointers.
+_Avoid_: App Session Segment, Main Heap, fixed virtual-address contract
+
+**API Shared Memory Header**:
+The published root of an API Shared Memory Region, corresponding to VPP's
+`vl_shmem_hdr_t`. It names the main input queue and records protocol version,
+server identity, restart epoch, and API Message Table location.
+_Avoid_: transport frame header, protobuf message header, socket bootstrap
+
+**Socket Registration**:
+The Socket Main record for a listener, accepted server connection, or client
+connection. It owns the File index, incomplete input, pending output, removal
+state, and any descriptors retained for shared-memory bootstrap.
+_Avoid_: API Registration, transport-neutral client, API Message Config
+
+**API Event Subscription**:
+A subscription record owned by the network subsystem or plugin that emits the
+event. It names a Client Index but is not owned by API Main; Hammer does not
+create a process-wide `VpeApiMain` aggregate for unrelated event families.
+_Avoid_: API Main event pool, generic plugin subscription registry
+
+**Request Context**:
+The client-supplied value echoed by a reply to associate that reply with its
+request. It is scoped to a client and does not establish ordering between
+clients.
+_Avoid_: Message ID, Client Index, global sequence number
+
+**Unary Message**:
+A Binary API request whose operation completes with one typed reply carrying
+the operation's result code and response fields.
+_Avoid_: dump request, event message, transport status
+
+**Dump Stream**:
+A Binary API request sequence that yields zero or more ordered Details
+Messages and ends at the corresponding control-ping reply.
+_Avoid_: paginated RPC, vector response, repeated unary call
+
+**Details Message**:
+An owner-defined reply item emitted in order while a Dump Stream is being
+enumerated. It is not the completion marker for the stream.
+_Avoid_: final reply, event message, diagnostic log
+
+**Control Ping**:
+The API message used to delimit completion of a Dump Stream after all Details
+Messages have been emitted.
+_Avoid_: transport heartbeat, timeout probe, dump item
+
+**Event Message**:
+An owner-defined Binary API message sent to a subscribed Client Index without
+being the direct reply to a single request.
+_Avoid_: unsolicited reply, log event, polling result
+
+**MP-Safe Message**:
+A Binary API message whose handler may run on the serial Main Thread without
+entering the Worker Barrier. A non-MP-safe handler enters the existing Worker
+Barrier before it may publish or mutate worker-visible state.
+_Avoid_: thread-safe payload, worker-owned message, lock-free message
+
+**API Schema**:
+The owner-maintained `.api` description of Binary API message fields, Message
+Name and CRC values, request/reply/details/event relationships, and service
+metadata. Runtime MP-safe selection is installed during API initialization,
+matching VPP rather than becoming a second schema annotation.
+_Avoid_: generated transport frame, runtime registry snapshot, CLI syntax
+
+
+## SVM Language
+
+**SvmSegment**:
+The SVM mapping and backing-resource owner used by shared regions, FIFO
+segments, and API memory bootstrap. A segment is distinct from the allocator
+or protocol state placed in its storage.
+_Avoid_: Segment, shared-memory wrapper, application segment owner
+
+**SvmRegion**:
+A general SVM region with its own metadata, data allocation authority, client
+membership, and published root. It can occupy an existing SvmSegment and is
+not limited to App Sessions.
+_Avoid_: mmap wrapper, FIFO segment, API registration
+
+**SvmRegionMain**:
+The authority for the named root and subregions of SVM. A region embedded in
+a directly exchanged segment does not require named-root registration.
+_Avoid_: API Main, process-global memory allocator
+
+**SvmFifoSegment**:
+The SVM owner of FIFO storage allocation, slices, and reusable FIFO headers
+and chunks. Session policy belongs to the Session owner using that storage.
+_Avoid_: SvmRegion, Session segment manager, generic heap
+
+**SvmFifo**:
+The SVM byte FIFO whose producer publishes bytes and whose consumer releases
+bytes, including out-of-order delivery and FIFO notification state.
+_Avoid_: Fifo, message queue, packet Buffer
+
+**SvmQueue**:
+The SVM bounded queue of fixed-size elements, with interprocess production,
+consumption, and waiting semantics. It is distinct from API message storage
+allocation rings.
+_Avoid_: SharedQueue, SvmFifo, API message allocator
+
+**SvmMsgQueue**:
+The SVM message queue exchanging descriptors for slots in its data rings.
+The storage protocol is independent of Session event contents and Binary API
+message allocation policy.
+_Avoid_: MultiRingMsgQueue, SvmQueue, API message allocation ring
