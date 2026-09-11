@@ -621,6 +621,13 @@ _Avoid_: generated transport frame, runtime registry snapshot, CLI syntax
 
 ## SVM Language
 
+These are target domain terms. The current implementation still uses
+`Segment`, an mmap-oriented `SvmRegion`, `Fifo`, and `MultiRingMsgQueue`.
+The proposed ownership, Rust fields/method signatures, deletion inventory,
+and approval status are recorded in
+[ADR-0011](docs/adr/0011-vpp-style-svm-ownership-and-multiarch.md).
+Terminology here is not a claim that the migration has been implemented.
+
 **SvmSegment**:
 The SVM mapping and backing-resource owner used by shared regions, FIFO
 segments, and API memory bootstrap. A segment is distinct from the allocator
@@ -651,11 +658,70 @@ _Avoid_: Fifo, message queue, packet Buffer
 **SvmQueue**:
 The SVM bounded queue of fixed-size elements, with interprocess production,
 consumption, and waiting semantics. It is distinct from API message storage
-allocation rings.
+allocation rings. The proposed Rust element parameter describes a validated
+shared representation; size and alignment are derived from that element type.
+Only stored contents are generic; synchronization and storage backends are not
+type parameters. In VPP's
+fixed-element queue, eventfd changes notification, not the shared mutex.
 _Avoid_: SharedQueue, SvmFifo, API message allocator
 
 **SvmMsgQueue**:
 The SVM message queue exchanging descriptors for slots in its data rings.
 The storage protocol is independent of Session event contents and Binary API
-message allocation policy.
+message allocation policy. Descriptors are consumed in queue order; each
+data ring allocates at its tail and reclaims at its head. Dequeuing a
+descriptor and releasing its payload slot are distinct operations. The queue
+owner is not generic: reserve<T> and dequeue<T> select the stored content type
+for a slot, allowing different rings to hold different contents. Reservations own
+publication; consumed messages own ordered slot reclamation. Ring count
+and capacity remain runtime configuration.
 _Avoid_: MultiRingMsgQueue, SvmQueue, API message allocation ring
+
+**Message Reservation**:
+An unpublished data-ring slot whose transaction owns the producer exclusion
+until commit or cancellation. MsgReservation<T> lends the stored value as
+&mut T. Commit transfers the message to the consumer;
+cancellation restores the unpublished allocation.
+_Avoid_: arbitrary free slot, payload copy, detached pointer wrapper
+
+**FIFO Segment Slice**:
+The allocation partition containing reusable FIFO headers and chunk size
+classes. Shared allocation state is distinct from the executing worker's
+private FIFO and out-of-order state.
+_Avoid_: per-thread wrapper, message ring, Session policy
+
+**Queue Notification**:
+The Linux design uses posix-sync's process-shared robust mutex and shared
+condition variable directly. One mutex protects queue state, publication,
+consumption, and ordered slot reclamation; there is no extra consumer mutex.
+A consumed message retains the crate guard until it releases its slot, so
+handlers run after decoding and releasing the message. Only stored contents
+are generic. Eventfd changes notification only in this Rust design; VPP's
+eventfd MQ instead uses a private producer spinlock.
+Owner death from lock or condition-wait reacquisition closes the damaged
+instance without declaring unknown data consistent. Later operations observe
+Closed/NotRecoverable, and the lifecycle owner retires the old identity and
+creates a fresh queue after participants stop using the old instance. Waiters
+periodically reacquire to detect failure even without notification. This
+recovery design must be behaviorally tested; it is not implemented yet.
+MacOS/iOS remain outside the current Linux scope.
+_Avoid_: Worker Barrier, payload publication, shared numeric fd identity
+
+**API Message Allocation Ring**:
+Binary API-owned storage that selects a message size class and reclaims each
+message after its receiver finishes. It is separate from SvmQueue transport
+and from SvmMsgQueue's ordered payload rings. API queue elements identify
+shared message storage using validated offsets/identities; they do not carry
+process-local pointers. Shared region allocation, peer lifecycle, and recovery
+remain prerequisites for the future vlibapi/vlibmemory refactor. ADR-0011
+records the caller audit and required behavioral validation.
+_Avoid_: Session CTRL ring, SvmMsgQueue, fixed-element transport queue
+
+**Machine Architecture Function**:
+A concrete ordinary function with a baseline implementation and supported
+instruction-set implementations selected by CPU capability and priority.
+The SVM uses correspond to VPP's two FIFO chunk copy functions; selection is
+independent of Graph Node registration and never stored in shared memory.
+Rust compiles concrete instruction-set variants and selects a supported
+machine-code entry once; this does not introduce algorithm type parameters.
+_Avoid_: Graph Node, protocol backend, shared function pointer
