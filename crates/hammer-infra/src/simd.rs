@@ -127,6 +127,21 @@ pub fn compact_indices(indices: &mut [u32], keep_mask: u8, offset: usize, write:
 
 // ── copy_bytes_simd : SIMD-accelerated byte copy ─────────────────
 
+/// Copy bytes into a FIFO chunk using the best implementation available to
+/// this process. The selected function is process-local and never stored in
+/// shared memory.
+#[inline]
+pub fn copy_to_chunk(destination: &mut [u8], source: &[u8]) -> usize {
+    copy_bytes_simd(destination, source)
+}
+
+/// Copy bytes out of a FIFO chunk using the best implementation available to
+/// this process.
+#[inline]
+pub fn copy_from_chunk(destination: &mut [u8], source: &[u8]) -> usize {
+    copy_bytes_simd(destination, source)
+}
+
 /// Copy bytes from `src` to `dst` (length = min(dst.len(), src.len())).
 ///
 /// x86_64: SSE2 128-bit vector copy for bulk throughput.
