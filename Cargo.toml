@@ -90,6 +90,7 @@ io-uring = "0.7.13"
 semver = "1"
 libloading = "0.8"
 object = "0.38"
+zerocopy = { version = "0.8", features = ["derive"] }
 
 [patch.crates-io]
 io-uring = { path = "third_party/io-uring" }

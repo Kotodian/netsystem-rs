@@ -1069,6 +1069,7 @@ dependencies = [
  "spinning_top",
  "talc",
  "thiserror 2.0.18",
+ "zerocopy",
 ]
 
 [[package]]

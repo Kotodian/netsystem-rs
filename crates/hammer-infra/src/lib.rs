@@ -31,6 +31,7 @@ pub mod simd;
 pub mod sparse_vec;
 pub mod stack;
 pub mod svm_region;
+pub mod svm_segment;
 pub mod sync;
 pub mod timer_wheel;
 

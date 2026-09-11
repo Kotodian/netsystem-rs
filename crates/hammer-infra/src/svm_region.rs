@@ -13,6 +13,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use talc::source::Manual;
 
 use crate::align::align_up;
+use crate::svm_segment::{SvmSegment, SvmSegmentError};
 
 const SVM_OFFSET_ALIGN: usize = 64;
 
@@ -25,6 +26,192 @@ struct OffsetAllocHeader {
 
 pub struct SvmRegion {
     inner: Arc<SvmRegionInner>,
+}
+
+/// Configuration for a shared region allocator.
+#[derive(Debug, Clone, Copy)]
+pub struct SvmRegionConfig {
+    pub data_offset: u64,
+}
+
+/// Process-local owner of shared region metadata and offset allocation.
+///
+/// The allocator is deliberately a monotonic shared offset allocator. It
+/// never stores process-local pointers in the mapping; a future free-list can
+/// be added without changing the segment/region ownership boundary.
+pub struct SvmRegionMain {
+    segment: std::sync::Arc<SvmSegment>,
+    metadata: *mut RegionMetadata,
+}
+
+#[repr(C, align(64))]
+struct RegionMetadata {
+    magic: u64,
+    version: u32,
+    ready: AtomicU64,
+    next_offset: AtomicU64,
+    end_offset: u64,
+    root_offset: AtomicU64,
+    members: AtomicU64,
+}
+
+const REGION_MAGIC: u64 = 0x4841_4d4d_4552_5247;
+const REGION_VERSION: u32 = 1;
+
+#[derive(Debug, thiserror::Error)]
+pub enum SvmRegionError {
+    #[error("region metadata is outside the segment")]
+    InvalidMetadata,
+    #[error("region metadata is not ready")]
+    NotReady,
+    #[error("region metadata version {version} is unsupported")]
+    UnsupportedVersion { version: u32 },
+    #[error("region allocator is exhausted for {requested} bytes")]
+    Exhausted { requested: usize },
+    #[error("region allocation alignment {alignment} is invalid")]
+    InvalidAlignment { alignment: usize },
+    #[error("region allocation offset {offset} is invalid")]
+    InvalidOffset { offset: u64 },
+    #[error("region segment operation failed: {0}")]
+    Segment(#[from] SvmSegmentError),
+}
+
+unsafe impl Send for SvmRegionMain {}
+unsafe impl Sync for SvmRegionMain {}
+
+impl SvmRegionMain {
+    pub fn create(
+        segment: std::sync::Arc<SvmSegment>,
+        config: SvmRegionConfig,
+    ) -> Result<Self, SvmRegionError> {
+        let metadata_offset = config
+            .data_offset
+            .saturating_sub(std::mem::size_of::<RegionMetadata>() as u64);
+        let metadata_ptr =
+            segment.offset_ptr(metadata_offset, std::mem::size_of::<RegionMetadata>(), 64)?;
+        let end_offset = segment.size() as u64;
+        let first = align_up(config.data_offset as usize, 64) as u64;
+        if first >= end_offset {
+            return Err(SvmRegionError::Exhausted { requested: 1 });
+        }
+        unsafe {
+            std::ptr::write(
+                metadata_ptr.cast::<RegionMetadata>(),
+                RegionMetadata {
+                    magic: REGION_MAGIC,
+                    version: REGION_VERSION,
+                    ready: AtomicU64::new(1),
+                    next_offset: AtomicU64::new(first),
+                    end_offset,
+                    root_offset: AtomicU64::new(0),
+                    members: AtomicU64::new(1),
+                },
+            );
+        }
+        Ok(Self {
+            segment,
+            metadata: metadata_ptr.cast(),
+        })
+    }
+
+    /// Attaches to region metadata already initialized in the mapping.
+    pub unsafe fn attach(
+        segment: std::sync::Arc<SvmSegment>,
+        metadata_offset: u64,
+    ) -> Result<Self, SvmRegionError> {
+        let metadata =
+            segment.offset_ptr(metadata_offset, std::mem::size_of::<RegionMetadata>(), 64)?;
+        let value = unsafe { &*metadata.cast::<RegionMetadata>() };
+        if value.magic != REGION_MAGIC {
+            return Err(SvmRegionError::InvalidMetadata);
+        }
+        if value.version != REGION_VERSION {
+            return Err(SvmRegionError::UnsupportedVersion {
+                version: value.version,
+            });
+        }
+        if value.ready.load(Ordering::Acquire) == 0 {
+            return Err(SvmRegionError::NotReady);
+        }
+        value.members.fetch_add(1, Ordering::AcqRel);
+        Ok(Self {
+            segment,
+            metadata: metadata.cast(),
+        })
+    }
+
+    pub fn segment(&self) -> &std::sync::Arc<SvmSegment> {
+        &self.segment
+    }
+
+    pub fn metadata_offset(&self) -> u64 {
+        self.metadata as usize as u64 - self.segment.base() as usize as u64
+    }
+
+    pub fn allocate(&self, bytes: usize, alignment: usize) -> Result<u64, SvmRegionError> {
+        if bytes == 0 || alignment == 0 || !alignment.is_power_of_two() {
+            return Err(SvmRegionError::InvalidAlignment { alignment });
+        }
+        let metadata = unsafe { &*self.metadata };
+        let mut current = metadata.next_offset.load(Ordering::Acquire);
+        loop {
+            let aligned = (current as usize).saturating_add(alignment - 1) & !(alignment - 1);
+            let end = aligned
+                .checked_add(bytes)
+                .ok_or(SvmRegionError::Exhausted { requested: bytes })?
+                as u64;
+            if end > metadata.end_offset {
+                return Err(SvmRegionError::Exhausted { requested: bytes });
+            }
+            match metadata.next_offset.compare_exchange(
+                current,
+                end,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => return Ok(aligned as u64),
+                Err(next) => current = next,
+            }
+        }
+    }
+
+    pub fn free(&self, offset: u64, bytes: usize) -> Result<(), SvmRegionError> {
+        let end = offset
+            .checked_add(bytes as u64)
+            .ok_or(SvmRegionError::InvalidOffset { offset })?;
+        if offset < std::mem::size_of::<RegionMetadata>() as u64 || end > self.segment.size() as u64
+        {
+            return Err(SvmRegionError::InvalidOffset { offset });
+        }
+        Ok(())
+    }
+
+    pub fn publish_root(&self, offset: u64) -> Result<(), SvmRegionError> {
+        self.segment.offset_ptr(offset, 1, 1)?;
+        unsafe {
+            (*self.metadata)
+                .root_offset
+                .store(offset, Ordering::Release);
+        }
+        Ok(())
+    }
+
+    pub fn root(&self) -> Option<u64> {
+        let offset = unsafe { (*self.metadata).root_offset.load(Ordering::Acquire) };
+        (offset != 0).then_some(offset)
+    }
+
+    pub fn member_count(&self) -> u64 {
+        unsafe { (*self.metadata).members.load(Ordering::Acquire) }
+    }
+}
+
+impl Drop for SvmRegionMain {
+    fn drop(&mut self) {
+        unsafe {
+            (*self.metadata).members.fetch_sub(1, Ordering::AcqRel);
+        }
+    }
 }
 
 struct SvmRegionInner {
