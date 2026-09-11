@@ -158,6 +158,10 @@ impl SvmSegment {
         self.creator
     }
 
+    pub fn close(self) {
+        drop(self);
+    }
+
     pub fn is_ready(&self) -> bool {
         let header = unsafe { &*(self.base.cast::<SegmentHeader>()) };
         header.ready.load(Ordering::Acquire) != 0
