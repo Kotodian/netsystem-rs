@@ -35,7 +35,6 @@ pub mod svm_msg_queue;
 pub mod svm_queue;
 pub mod svm_region;
 pub mod svm_segment;
-pub mod svm_sync;
 pub mod sync;
 pub mod timer_wheel;
 

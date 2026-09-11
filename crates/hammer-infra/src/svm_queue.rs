@@ -2,15 +2,21 @@
 
 use std::alloc::{Layout, LayoutError};
 use std::marker::PhantomData;
-use std::mem::{align_of, size_of};
-use std::sync::Arc;
+use std::mem::{MaybeUninit, align_of, size_of};
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::thread;
 use std::time::{Duration, Instant};
 
+use posix_sync::condvar::{
+    BorrowedCondvar, CondvarBuilder, CondvarClock, CondvarSharing, RawCondvarAlloc,
+};
+use posix_sync::mutex::guards::{RobustGuardContainer, StandardGuard};
+use posix_sync::mutex::{
+    BorrowedMutex, MutexBuilder, MutexSharing, RawMutexAlloc, robustness_markers::Robust,
+};
 use zerocopy::{FromBytes, Immutable, IntoBytes, KnownLayout};
 
-use crate::svm_segment::{SegmentBackend, SvmSegment, SvmSegmentError};
+use crate::svm_segment::{SvmSegment, SvmSegmentError};
 
 const QUEUE_MAGIC: u64 = 0x4841_4d4d_4552_5155;
 const QUEUE_VERSION: u32 = 1;
@@ -51,6 +57,23 @@ pub enum SvmQueueError {
     InvalidOffset { offset: u64 },
     #[error("queue segment operation failed: {0}")]
     Segment(#[from] SvmSegmentError),
+    #[error("queue mutex owner died")]
+    OwnerDied,
+    #[error("queue mutex is not recoverable: {source}")]
+    NotRecoverable {
+        #[source]
+        source: posix_sync::mutex::MutexLockError,
+    },
+    #[error("queue mutex lock failed: {source}")]
+    Lock {
+        #[source]
+        source: posix_sync::mutex::MutexLockError,
+    },
+    #[error("queue condition signal failed: {source}")]
+    Signal {
+        #[source]
+        source: posix_sync::condvar::CondvarSignalError,
+    },
     #[error("queue layout construction failed")]
     Layout(#[from] LayoutError),
 }
@@ -64,21 +87,25 @@ struct QueueHeader {
     element_alignment: u32,
     head: AtomicU32,
     tail: AtomicU32,
-    lock: AtomicU32,
+    mutex: MaybeUninit<RawMutexAlloc>,
+    condvar: MaybeUninit<RawCondvarAlloc>,
+    failed: std::sync::atomic::AtomicBool,
 }
 
-pub struct SvmQueue<T> {
-    segment: Arc<SvmSegment>,
+pub struct SvmQueue<'segment, T> {
+    segment: &'segment SvmSegment,
     header_offset: u64,
     header: *mut QueueHeader,
     elements: *mut u8,
+    mutex: BorrowedMutex<'segment, Robust>,
+    condvar: BorrowedCondvar<'segment>,
     _element: PhantomData<T>,
 }
 
-unsafe impl<T: Send> Send for SvmQueue<T> {}
-unsafe impl<T: Send> Sync for SvmQueue<T> {}
+unsafe impl<T: Send> Send for SvmQueue<'_, T> {}
+unsafe impl<T: Send> Sync for SvmQueue<'_, T> {}
 
-impl<T> SvmQueue<T>
+impl<'segment, T> SvmQueue<'segment, T>
 where
     T: Copy + FromBytes + IntoBytes + KnownLayout + Immutable,
 {
@@ -100,7 +127,7 @@ where
     /// The caller owns the allocation represented by `offset`; this method
     /// only writes the queue header and never allocates from the segment.
     pub unsafe fn init_at(
-        segment: Arc<SvmSegment>,
+        segment: &'segment SvmSegment,
         offset: u64,
         config: &SvmQueueConfig,
     ) -> Result<Self, SvmQueueError> {
@@ -118,22 +145,46 @@ where
                     element_alignment: align_of::<T>() as u32,
                     head: AtomicU32::new(0),
                     tail: AtomicU32::new(0),
-                    lock: AtomicU32::new(0),
+                    mutex: MaybeUninit::uninit(),
+                    condvar: MaybeUninit::uninit(),
+                    failed: std::sync::atomic::AtomicBool::new(false),
                 },
             );
         }
         let elements = unsafe { header_ptr.add(size_of::<QueueHeader>()) };
+        let mutex = unsafe {
+            MutexBuilder::<Robust>::new()
+                .with_sharing(MutexSharing::Shared)
+                .build_borrowed(
+                    (&mut (*header).mutex as *mut MaybeUninit<RawMutexAlloc>).cast(),
+                    segment,
+                )
+        };
+        let condvar = unsafe {
+            CondvarBuilder::new()
+                .with_sharing(CondvarSharing::Shared)
+                .with_clock(CondvarClock::Monotonic)
+                .build_borrowed(
+                    (&mut (*header).condvar as *mut MaybeUninit<RawCondvarAlloc>).cast(),
+                    segment,
+                )
+        };
         Ok(Self {
             segment,
             header_offset: offset,
             header,
             elements,
+            mutex,
+            condvar,
             _element: PhantomData,
         })
     }
 
     /// Attaches to an initialized queue without reconstructing any allocator.
-    pub unsafe fn attach(segment: Arc<SvmSegment>, offset: u64) -> Result<Self, SvmQueueError> {
+    pub unsafe fn attach(
+        segment: &'segment SvmSegment,
+        offset: u64,
+    ) -> Result<Self, SvmQueueError> {
         let header_ptr =
             segment.offset_ptr(offset, size_of::<QueueHeader>(), align_of::<QueueHeader>())?;
         let header = header_ptr.cast::<QueueHeader>();
@@ -167,18 +218,33 @@ where
         if stored.capacity == 0 {
             return Err(SvmQueueError::ZeroCapacity);
         }
+        let mutex = unsafe {
+            BorrowedMutex::<Robust>::from_raw(
+                (&mut (*header).mutex as *mut MaybeUninit<RawMutexAlloc>).cast(),
+                segment,
+            )
+        };
+        let condvar = unsafe {
+            BorrowedCondvar::from_raw(
+                (&mut (*header).condvar as *mut MaybeUninit<RawCondvarAlloc>).cast(),
+                segment,
+                CondvarClock::Monotonic,
+            )
+        };
         let elements = unsafe { header_ptr.add(size_of::<QueueHeader>()) };
         Ok(Self {
             segment,
             header_offset: offset,
             header,
             elements,
+            mutex,
+            condvar,
             _element: PhantomData,
         })
     }
 
-    pub fn segment(&self) -> &Arc<SvmSegment> {
-        &self.segment
+    pub fn segment(&self) -> &SvmSegment {
+        self.segment
     }
 
     pub fn header_offset(&self) -> u64 {
@@ -190,12 +256,11 @@ where
     }
 
     pub fn enqueue(&self, value: T) -> Result<(), SvmQueueError> {
-        self.lock();
+        let guard = self.lock()?;
         let header = unsafe { &*self.header };
         let head = header.head.load(Ordering::Relaxed);
         let tail = header.tail.load(Ordering::Relaxed);
         if tail.wrapping_sub(head) >= header.capacity {
-            self.unlock();
             return Err(SvmQueueError::QueueFull);
         }
         let slot = tail % header.capacity;
@@ -203,17 +268,16 @@ where
             std::ptr::write(self.elements.cast::<T>().add(slot as usize), value);
         }
         header.tail.store(tail.wrapping_add(1), Ordering::Release);
-        self.unlock();
+        unsafe { self.condvar.notify_all() }.map_err(|source| SvmQueueError::Signal { source })?;
         Ok(())
     }
 
     pub fn enqueue_pair(&self, first: T, second: T) -> Result<(), SvmQueueError> {
-        self.lock();
+        let guard = self.lock()?;
         let header = unsafe { &*self.header };
         let head = header.head.load(Ordering::Relaxed);
         let tail = header.tail.load(Ordering::Relaxed);
         if (tail.wrapping_sub(head) as u64) + 2 > header.capacity as u64 {
-            self.unlock();
             return Err(SvmQueueError::QueueFull);
         }
         let capacity = header.capacity;
@@ -223,17 +287,16 @@ where
             std::ptr::write(elements.add(((tail + 1) % capacity) as usize), second);
         }
         header.tail.store(tail.wrapping_add(2), Ordering::Release);
-        self.unlock();
+        unsafe { self.condvar.notify_all() }.map_err(|source| SvmQueueError::Signal { source })?;
         Ok(())
     }
 
     pub fn dequeue(&self) -> Result<Option<T>, SvmQueueError> {
-        self.lock();
+        let guard = self.lock()?;
         let header = unsafe { &*self.header };
         let head = header.head.load(Ordering::Relaxed);
         let tail = header.tail.load(Ordering::Acquire);
         if head == tail {
-            self.unlock();
             return Ok(None);
         }
         let value = unsafe {
@@ -244,7 +307,7 @@ where
             )
         };
         header.head.store(head.wrapping_add(1), Ordering::Release);
-        self.unlock();
+        unsafe { self.condvar.notify_all() }.map_err(|source| SvmQueueError::Signal { source })?;
         Ok(Some(value))
     }
 
@@ -252,7 +315,7 @@ where
         if destination.is_empty() {
             return Ok(0);
         }
-        self.lock();
+        let guard = self.lock()?;
         let header = unsafe { &*self.header };
         let mut head = header.head.load(Ordering::Relaxed);
         let tail = header.tail.load(Ordering::Acquire);
@@ -265,7 +328,10 @@ where
         if count != 0 {
             header.head.store(head, Ordering::Release);
         }
-        self.unlock();
+        if count != 0 {
+            unsafe { self.condvar.notify_all() }
+                .map_err(|source| SvmQueueError::Signal { source })?;
+        }
         Ok(count)
     }
 
@@ -299,13 +365,12 @@ where
     }
 
     pub fn len(&self) -> Result<usize, SvmQueueError> {
-        self.lock();
+        let guard = self.lock()?;
         let header = unsafe { &*self.header };
         let len = header
             .tail
             .load(Ordering::Acquire)
             .wrapping_sub(header.head.load(Ordering::Acquire)) as usize;
-        self.unlock();
         Ok(len)
     }
 
@@ -313,19 +378,21 @@ where
         Ok(self.len()? == 0)
     }
 
-    fn lock(&self) {
-        let lock = unsafe { &(*self.header).lock };
-        while lock
-            .compare_exchange_weak(0, 1, Ordering::Acquire, Ordering::Relaxed)
-            .is_err()
-        {
-            thread::yield_now();
-        }
-    }
-
-    fn unlock(&self) {
-        unsafe {
-            (*self.header).lock.store(0, Ordering::Release);
+    fn lock(&self) -> Result<StandardGuard<'_>, SvmQueueError> {
+        match unsafe { self.mutex.lock() } {
+            Ok(RobustGuardContainer::Standard(guard)) => Ok(guard),
+            Ok(RobustGuardContainer::Indeterminate(_)) => {
+                unsafe {
+                    (*self.header)
+                        .failed
+                        .store(true, std::sync::atomic::Ordering::Release);
+                }
+                Err(SvmQueueError::OwnerDied)
+            }
+            Err(source) if matches!(source, posix_sync::mutex::MutexLockError::NotRecoverable) => {
+                Err(SvmQueueError::NotRecoverable { source })
+            }
+            Err(source) => Err(SvmQueueError::Lock { source }),
         }
     }
 }
@@ -344,12 +411,4 @@ where
         return Err(SvmQueueError::LayoutOverflow);
     }
     Ok(())
-}
-
-#[allow(dead_code)]
-fn _backend_is_shared(segment: &SvmSegment) -> bool {
-    matches!(
-        segment.backend(),
-        SegmentBackend::Memfd | SegmentBackend::Shm
-    )
 }
