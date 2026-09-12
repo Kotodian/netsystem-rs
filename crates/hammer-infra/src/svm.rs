@@ -10,6 +10,7 @@
 
 pub mod fifo;
 pub mod fifo_segment;
+pub mod hash_map;
 pub mod msg_queue;
 pub mod queue;
 pub mod region;

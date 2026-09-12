@@ -2,9 +2,9 @@
 
 - 日期：2026-09-11
 - 状态：Proposed；本轮仅修改 ADR/CONTEXT。2026-09-12 更新：SVM owner 已移入
-  `crates/hammer-infra/src/svm/`，见 §12.1 模块落点；A11 `SvmRegionHeap` 已按 §12.4
-  落地并带测试（`crates/hammer-infra/tests/svm_region_heap.rs`，见 §12.11）。
-  Linux 优先，macOS/iOS 不在本轮设计验证范围；A12/A13 及其余生产代码尚未迁移。
+  `crates/hammer-infra/src/svm/`，见 §12.1 模块落点；A11 `SvmRegionHeap` 与 A12
+  `SvmHashMap<V>` 已按 §12.4/§12.5 落地并带测试（见 §12.11）。Linux 优先，macOS/iOS
+  不在本轮设计验证范围；A13 及其余生产代码尚未迁移。
 - 请求：完整核对 VPP `src/svm`，删除 Hammer `MultiRingQueue`，Rust 支持对应的 `CLIB_MARCH_FN`，更新 ADR 和 CONTEXT。
 - Hammer 基线：`418aa0953d929f4175370ce1873066f4ff193f38`。
 - VPP 参考：官方 FDio/vpp `629fe2764bd997189fedd2d98cbe8dc9189c1ec3`。
@@ -1489,18 +1489,26 @@ heap 里从用户 offset 找回块头的唯一依据，若被链指针覆盖，�
 ### 12.5 `SvmHashMap<V>`
 
 与 `std::collections::HashMap` 语义一一对应的共享表：相同的替换/删除/计数/容量/迭代
-语义，唯一的差别是底层 allocator 换成 offset arena，且键是 arena 内字节串。
+语义，唯一的差别是底层 allocator 换成 offset arena，且键是 arena 内字节串。已落地在
+`hammer_infra::svm::hash_map`（测试 `crates/hammer-infra/tests/svm_hash_map.rs`）。
 
 ```rust
 // hammer_infra::svm::hash_map
-#[repr(u8)]
-enum SvmSlotState { Empty = 0, Occupied = 1, Vacant = 2 }
+pub const SVM_HASH_MAP_MIN_BUCKETS: u64 = 64;
+const SHRINK_FLOOR: u64 = 32;
+const LOAD_NUMERATOR: u64 = 3;
+const LOAD_DENOMINATOR: u64 = 4;
+
+const SLOT_EMPTY: u8 = 0;     // 探测在此终止
+const SLOT_OCCUPIED: u8 = 1;
+const SLOT_VACANT: u8 = 2;    // 墓碑：探测穿过，插入优先复用
 
 #[repr(C)]
 struct SvmSlot<V> {
-    state: SvmSlotState,
-    _align: [u8; 7],
-    name_offset: u64,   // 键字节块在 arena 内的 offset；0 = 无
+    state: u8,          // 裸字节而非 #[repr(u8)] enum：共享字节里只允许全 bit 模式合法的类型
+    padding: [u8; 7],
+    hash: u64,          // 先比 hash 再比键字节；rehash 只搬槽，不读键块
+    name_offset: u64,   // 键字节块在 arena 内的 offset
     name_len: u64,
     value: V,
 }
@@ -1511,41 +1519,36 @@ pub struct SvmHashMap<V> {
     bucket_capacity: u64,  // 2 的幂，最小 64（VPP hash.c:646-650）
     occupied: u64,
     vacant: u64,
-    _value: PhantomData<V>,
+    values: PhantomData<V>,
 }
 ```
 
 ```rust
-impl<V: IntoBytes + FromBytes + Immutable + KnownLayout> SvmHashMap<V> {
+impl<V: Copy + FromBytes + IntoBytes + Immutable + KnownLayout> SvmHashMap<V> {
     pub const fn new() -> Self;
-    pub fn with_capacity(arena: &mut SvmRegionHeap, capacity: usize) -> Self;
+    pub fn with_capacity(heap: &mut SvmRegionHeap, arena: &mut [u8], capacity: usize) -> Self;
     pub fn len(&self) -> usize;
     pub fn is_empty(&self) -> bool;
     pub fn capacity(&self) -> usize; // 不再扩容可容纳的元素数 = bucket_capacity * 3 / 4
 
-    pub fn contains_key(&self, arena: &SvmRegionHeap, name: &str) -> bool;
-    pub fn get<'a>(&self, arena: &'a SvmRegionHeap, name: &str) -> Option<&'a V>;
-    pub fn get_mut<'a>(&mut self, arena: &'a mut SvmRegionHeap, name: &str) -> Option<&'a mut V>;
-    pub fn get_key_value<'a>(&self, arena: &'a SvmRegionHeap, name: &str) -> Option<(&'a str, &'a V)>;
-    pub fn insert(&mut self, arena: &mut SvmRegionHeap, name: &str, value: V) -> Option<V>;
-    pub fn remove(&mut self, arena: &mut SvmRegionHeap, name: &str) -> Option<V>;
-    pub fn entry<'a>(&'a mut self, arena: &'a mut SvmRegionHeap, name: &str) -> SvmEntry<'a, V>;
-    pub fn clear(&mut self, arena: &mut SvmRegionHeap);
-    pub fn reserve(&mut self, arena: &mut SvmRegionHeap, additional: usize);
-    pub fn shrink_to_fit(&mut self, arena: &mut SvmRegionHeap);
+    pub fn contains_key(&self, heap: &SvmRegionHeap, arena: &[u8], name: &str) -> bool;
+    pub fn get<'a>(&self, heap: &SvmRegionHeap, arena: &'a [u8], name: &str) -> Option<&'a V>;
+    pub fn get_mut<'a>(&mut self, heap: &mut SvmRegionHeap, arena: &'a mut [u8], name: &str) -> Option<&'a mut V>;
+    pub fn get_key_value<'a>(&self, heap: &SvmRegionHeap, arena: &'a [u8], name: &str) -> Option<(&'a str, &'a V)>;
+    pub fn insert(&mut self, heap: &mut SvmRegionHeap, arena: &mut [u8], name: &str, value: V) -> Option<V>;
+    pub fn remove(&mut self, heap: &mut SvmRegionHeap, arena: &mut [u8], name: &str) -> Option<V>;
+    pub fn entry<'a>(&'a mut self, heap: &'a mut SvmRegionHeap, arena: &'a mut [u8], name: &'a str) -> SvmEntry<'a, V>;
+    pub fn clear(&mut self, heap: &mut SvmRegionHeap, arena: &mut [u8]);
+    pub fn reserve(&mut self, heap: &mut SvmRegionHeap, arena: &mut [u8], additional: usize);
+    pub fn shrink_to_fit(&mut self, heap: &mut SvmRegionHeap, arena: &mut [u8]);
 
-    pub fn iter<'a>(&self, arena: &'a SvmRegionHeap) -> SvmIter<'a, V>;
-    pub fn keys<'a>(&self, arena: &'a SvmRegionHeap) -> SvmKeys<'a>;
-    pub fn values<'a>(&self, arena: &'a SvmRegionHeap) -> SvmValues<'a, V>;
-    pub fn values_mut<'a>(&mut self, arena: &'a mut SvmRegionHeap) -> SvmValuesMut<'a, V>;
-
-    fn slots<'a>(&self, arena: &'a SvmRegionHeap) -> &'a [SvmSlot<V>];
-    fn slots_mut<'a>(&mut self, arena: &'a mut SvmRegionHeap) -> &'a mut [SvmSlot<V>];
-    fn find_occupied(&self, arena: &SvmRegionHeap, name: &str) -> Option<u64>;
-    fn find_insert_slot(&self, arena: &SvmRegionHeap, name: &str) -> u64;
-    fn grow(&mut self, arena: &mut SvmRegionHeap, capacity: u64);
-    fn release_key(&mut self, arena: &mut SvmRegionHeap, slot: u64);
+    pub fn iter<'a>(&self, heap: &'a SvmRegionHeap, arena: &'a [u8]) -> SvmIter<'a, V>;
+    pub fn keys<'a>(&self, heap: &'a SvmRegionHeap, arena: &'a [u8]) -> SvmKeys<'a, V>;
+    pub fn values<'a>(&self, heap: &'a SvmRegionHeap, arena: &'a [u8]) -> SvmValues<'a, V>;
+    pub fn values_mut<'a>(&mut self, heap: &mut SvmRegionHeap, arena: &'a mut [u8]) -> SvmValuesMut<'a, V>;
 }
+
+pub enum SvmEntry<'a, V> { Occupied(SvmOccupiedEntry<'a, V>), Vacant(SvmVacantEntry<'a, V>) }
 
 impl<'a, V> SvmEntry<'a, V> {
     pub fn key(&self) -> &str;
@@ -1564,34 +1567,48 @@ impl<'a, V> SvmVacantEntry<'a, V> {
     pub fn insert(self, value: V) -> &'a mut V;
 }
 
-fn hash_name(name: &str) -> u64;                       // DefaultHasher::new() + 字节 + 长度
+impl<'a, V> Iterator for SvmIter<'a, V> { type Item = (&'a str, &'a V); }
+impl<'a, V> Iterator for SvmKeys<'a, V> { type Item = &'a str; }
+impl<'a, V> Iterator for SvmValues<'a, V> { type Item = &'a V; }
+impl<'a, V> Iterator for SvmValuesMut<'a, V> { type Item = &'a mut V; }
+
+fn hash_name(name: &str) -> u64;                        // DefaultHasher::new()，无随机种子
 fn probe_start(hash: u64, bucket_capacity: u64) -> u64; // hash & (bucket_capacity - 1)
-fn name_at<'a>(arena: &'a SvmRegionHeap, offset: u64, len: u64) -> &'a str;
+fn name_at<'a>(heap: &SvmRegionHeap, arena: &'a [u8], offset: u64, length: u64) -> &'a str;
 ```
+
+与 `SvmRegionHeap` 相同的借用形状：descriptor 只存 offset，自己拿不到字节，因此每个
+方法都传入当前映射视图——只读方法借 `&SvmRegionHeap`，需要改字节的方法借
+`&mut SvmRegionHeap`。`SvmKeys` 要按槽类型迭代，所以名字里带 `V`（`SvmKeys<'a, V>`）。
 
 与 `HashMap` 一致的语义：
 
 - `insert` 命中已有键 → 替换值、返回旧值、`len` 不变；未命中 → 新增、返回 `None`。
-- `get`/`get_mut`/`contains_key` 只按键内容（长度 + 字节）匹配；`len` = `occupied`；
-  `capacity` 是"不再扩容可容纳的元素数"；`clear` 后 `len == 0`，桶数组不释放。
-- 探测：线性探测，遇 `Empty` 终止；`Vacant` 不终止查找，但插入优先复用第一个 `Vacant`。
-- 扩容 3/4、收缩 1/4 且 `len > 32`，最小 64 桶（对齐 VPP `hash.c:499-509`、`:628-637`）。
+- `get`/`get_mut`/`contains_key`/`get_key_value` 只按键内容（长度 + 字节）匹配；
+  `len` = `occupied`；`clear` 后 `len == 0`，桶数组不释放。
+- 探测：线性探测，遇 `Empty` 终止；`Vacant` 不终止查找，插入优先复用探测路径上第一个
+  `Vacant`（该路径先遇到 `Empty` 时用 `Empty`）。
+- 扩容与收缩都以**元素**口径为准：`capacity() = bucket_capacity * 3 / 4`；当
+  `occupied + vacant` 达到该上限时先原地整理（rehash 到同一桶数、丢弃墓碑），只有活跃
+  元素本身到达上限才把桶数组翻倍。这样 `capacity()` 不会因为曾经存过更多元素而虚高。
+- 收缩：`occupied > 32` 且 `occupied < bucket_capacity / 4` 时缩到仍能容纳当前元素的最小
+  桶数（对齐 VPP `hash.c:499-509`、`:628-637`）；`shrink_to_fit` 用同一目标，最小 64 桶。
 - 迭代顺序不保证，与 std 相同。
-- 空间不足走 `SvmRegionHeapViolation` 终止（V19）；容量参数导致的 `usize` 溢出是调用方
-  bug，panic 并带请求容量。
+- 空间不足走 `SvmRegionHeapViolation` 终止（V19）；容量参数导致的 `usize`/`u64` 溢出、
+  槽状态字节或桶数组对齐异常都是本地 bug，panic 并带上槽位、请求容量或对齐事实。
 
 与 `HashMap` 的差异，全部有明确原因：
 
 | 差异 | 原因 |
 | --- | --- |
-| 每个方法多一个 `arena: &SvmRegionHeap` 参数 | 表在共享区，自己不能持有本进程 allocator 句柄 |
-| 哈希用固定种子 `DefaultHasher`，不用 `RandomState` | `RandomState` 每进程随机种子，会让另一进程查不到同名项；`DefaultHasher::new()` 跨进程结果一致（同一二进制） |
+| 每个方法多 heap 与 arena 两个参数 | 表在共享区，descriptor 自己不能持有本进程 allocator 句柄或映射指针 |
+| 哈希用固定种子 `DefaultHasher`，不用 `RandomState` | `RandomState` 每进程随机种子，会让另一进程探到不同桶（`DefaultHasher::new()` 同一二进制内一致） |
 | 键是 `&str`，表在 arena 内持有键字节 | `String`/`Box<str>` 在共享区不可移植；键由表持有后，`remove`/`clear` 能一次性释放，不会悬空（VPP 用 `hash_unset_mem_free` 达到同样所有权，`hash.h:256-270`） |
 | 没有 `remove_entry`、`drain` | std 语义要求把 `K` 交还调用方；键字节在 arena 内，交出借用后立刻释放即悬空。用 `keys()` + `remove()` 等价替代 |
 | 没有 `retain`、`and_modify`、`or_insert_with`、`or_default` | AGENTS 禁止闭包中介访问既有状态；需要值时用 `entry` + `or_insert` |
 | 没有 `Extend`、`FromIterator`、`Index`、`Clone`、`Debug`、`PartialEq` | 都需要 arena 参数或对共享表无意义；`Clone` 复制跨进程表本身是错的 |
-| 表不实现 `Drop` | 表住在共享区，任何一个进程的析构都会破坏其他进程；释放必须显式 `clear(arena)`。`SvmVacantEntry` 是进程内句柄，未插入时由它的 `Drop` 释放已分配的键块 |
-| 值类型约束 `IntoBytes + FromBytes + Immutable + KnownLayout` | 与 A5 的 `SvmQueue<T>` 同一套共享内容约束 |
+| 表不实现 `Drop` | 表住在共享区，任何一个进程的析构都会破坏其他进程；释放必须显式 `clear(heap, arena)`。`SvmVacantEntry` 是进程内句柄，未插入时不持有任何分配（键块只在 `insert` 时申请），因此也不需要 `Drop` |
+| 值类型约束 `Copy + IntoBytes + FromBytes + Immutable + KnownLayout` | 与 A5 的 `SvmQueue<T>` 同一套共享内容约束，另加 `Copy`：`insert`/`remove` 要把值按值交还调用方 |
 
 ### 12.6 子区与名字注册表
 
@@ -1742,9 +1759,9 @@ pub struct RegionMembership<'a> { /* RAII：Drop 时从 client_pids 移除本 pi
 | 行为 | 方式 | 通过条件 |
 | --- | --- | --- |
 | 跨进程 attach（不同 VA） | 独立 exec 进程经 `SCM_RIGHTS` 拿 fd 后 attach | version/magic/flags/size 校验通过；共享位置的 offset 在两进程都指向同一逻辑对象 |
-| 名字表跨进程可见 | 进程 A `find_or_create`，进程 B 查同一名字 | B 得到相同子区序号；两个 exec 进程对同一名字得到同一 `hash_name` |
-| 名字表语义 | 插入/替换/删除/墓碑复用/3-4 扩容/1-4 收缩/`clear` | `len`、`capacity`、返回值、迭代集合与 std `HashMap` 行为一致 |
 | heap 模块（已实现，`crates/hammer-infra/tests/svm_region_heap.rs`） | 对齐与清零、块头计费、释放后同 layout 复用、双向相邻合并、500 块占满再逐块释放、grow 拷贝/原地 shrink、尾块不足最小块时不切分、0 字节请求、`holds` 拒绝内部与越界与更强对齐、未初始化查询、3 个种子 × 2000 步混合 allocate/reallocate/deallocate 序列 | 每一步 `free_bytes + used_bytes == heap_end - heap_start`；活跃块互不重叠且 `holds` 成立；序列结束后整堆可被一个块重新分配 |
+| 名字表（已实现，`crates/hammer-infra/tests/svm_hash_map.rs`） | 与 std `HashMap` 逐步对照 4000 步随机 insert/remove/get/contains；`entry().or_insert`、occupied/vacant 句柄、`keys`/`values`/`values_mut`/`get_key_value`、空键与 4096 字节键、u128 与 `repr(C)` 结构值、`clear`、`with_capacity`/`reserve`/`shrink_to_fit`（3/4 扩容、1/4 收缩）、墓碑复用不扩容、200 轮 insert+remove 不泄漏键块 | 每步 `len`/返回值/`contains_key` 与 std 一致；收尾迭代集合与 std 完全一致；`len <= capacity()`；`used_bytes` 除桶数组外只随活跃键块变化 |
+| 名字表跨进程可见（未实现，待 A13） | 进程 A `find_or_create`，进程 B 查同一名字 | B 得到相同子区序号；两个 exec 进程对同一名字得到同一 `hash_name` |
 | heap 违规（已实现，同文件子进程用例） | 双释放、耗尽、未对齐释放、非起始 offset 释放、段外读取、越过块的读取、非法范围初始化、0 长度 `reallocate`、超大 `reallocate`、被写坏的块头 | 子进程 abort（`status.code() == None`），stderr 携带对应变体的结构化事实 |
 | 子区 | `find_or_create` 幂等；`remove` 后名字不可见；序号不复用 | 段创建失败时名字被回滚，无"名字可见但无段"状态 |
 | 成员 | 多进程 join/离开；`remove_exited_members` 回收 dead pid | 条目数与真实成员一致；探测失败不误删 |
@@ -1761,8 +1778,10 @@ pub struct RegionMembership<'a> { /* RAII：Drop 时从 client_pids 移除本 pi
   allocator（V18）。
 - `SvmHashMap` 的已撤回提案：不在 `hammer-infra` 新增 `hash_bytes`，改用固定种子
   `DefaultHasher`；若后续要求仓库自有哈希函数，它需要单独批准并补进本节。
-- 已完成：A11 `SvmRegionHeap` 的具体化与测试（`crates/hammer-infra/src/svm/region_heap.rs`、
-  `crates/hammer-infra/tests/svm_region_heap.rs`）。A12/A13 仍未实现。
+- 已完成：A11 `SvmRegionHeap`（`crates/hammer-infra/src/svm/region_heap.rs`、
+  `crates/hammer-infra/tests/svm_region_heap.rs`）与 A12 `SvmHashMap<V>`
+  （`crates/hammer-infra/src/svm/hash_map.rs`、`crates/hammer-infra/tests/svm_hash_map.rs`）
+  的具体化与测试。A13（`SvmRegionMain`/`SvmRegion`/锁/成员）仍未实现。
 - 未决：`SvmRegionHeap` 是否需要 `peak` 之外的压力统计（例如最大连续空闲块）、
   以及子区序号的持久化语义（重启后是否必须保持）。这两项不影响本节的类型与
   方法形状，实施前定稿即可。
