@@ -14,7 +14,7 @@ use std::ffi::CString;
 use std::io;
 use std::mem::size_of;
 use std::os::fd::RawFd;
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::thread::sleep;
 use std::time::{Duration, Instant};
 
@@ -44,6 +44,7 @@ pub struct SsvmSharedHeader {
     client_pid: u32,
     name_len: u32,
     ready: AtomicU32,
+    fifo_segment_offset: AtomicU64,
     name: [u8; SSVM_NAME_MAX],
 }
 
@@ -352,6 +353,26 @@ impl SsvmPrivate {
         self.shared_header().ready.store(1, Ordering::Release);
     }
 
+    /// Offset of the VPP-style FIFO segment header relative to this mapping.
+    pub fn fifo_segment_offset(&self) -> Option<u64> {
+        let offset = self
+            .shared_header()
+            .fifo_segment_offset
+            .load(Ordering::Acquire);
+        (offset != 0).then_some(offset)
+    }
+
+    /// Publishes the FIFO segment header location before the segment ready bit.
+    pub fn set_fifo_segment_offset(&self, offset: u64) {
+        assert!(
+            self.is_server,
+            "only the segment creator may publish metadata"
+        );
+        self.shared_header()
+            .fifo_segment_offset
+            .store(offset, Ordering::Release);
+    }
+
     /// Waits for the creator to publish `ready`.
     pub fn wait_ready(&self, timeout: Duration) -> Result<(), SsvmError> {
         let deadline = Instant::now() + timeout;
@@ -506,6 +527,7 @@ impl SsvmPrivate {
         header.server_pid = self.my_pid;
         header.client_pid = 0;
         header.name_len = bytes.len() as u32;
+        header.fifo_segment_offset.store(0, Ordering::Relaxed);
         header.name[..bytes.len()].copy_from_slice(bytes);
         header.ready.store(0, Ordering::Release);
     }

@@ -727,11 +727,11 @@ impl HttpWorker {
     /// the app TX FIFO via `http_io_ts_write`, followed by one
     /// `http_io_ts_after_write (stream, 1)` event. Here the exact 7-byte
     /// preface comes from [`encode_control_preface`], copied in one
-    /// `reserve_write` + `copy_from_segments` + `commit` so an
-    /// insufficient-capacity shortfall exposes zero bytes, then
+    /// `enqueue_segments` so an insufficient-capacity shortfall exposes zero
+    /// bytes, then
     /// [`SessionWorker::publish_tx_enqueue`] raises the child FIFO event
     /// flag and enqueues a TxEnq. O(1): fixed 7-byte stack buffer, one
-    /// reservation, one commit, no allocation or copy beyond the preface.
+    /// segmented enqueue, no allocation or copy beyond the preface.
     ///
     /// Event publication is edge-triggered and coalescing:
     /// `publish_tx_enqueue` raises the flag and enqueues one TxEnq only on
@@ -765,14 +765,8 @@ impl HttpWorker {
         let (_, tx_fifo) = sessions
             .fifo_pair(child)
             .ok_or(HttpWorkerError::ControlStreamFifoMissing { context, child })?;
-        let mut reservation = tx_fifo
-            .reserve_write(preface.len())
-            .map_err(|source| HttpWorkerError::ControlPrefaceFifo { context, source })?;
-        let copied = reservation
-            .copy_from_segments([&preface[..]])
-            .map_err(|source| HttpWorkerError::ControlPrefaceFifo { context, source })?;
-        let committed = reservation
-            .commit(copied)
+        let committed = tx_fifo
+            .enqueue_segments(preface.len(), [&preface[..]])
             .map_err(|source| HttpWorkerError::ControlPrefaceFifo { context, source })?;
         sessions
             .publish_tx_enqueue(child, committed)

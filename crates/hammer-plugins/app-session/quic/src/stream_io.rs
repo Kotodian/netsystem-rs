@@ -121,18 +121,16 @@ impl StreamIoTable {
                 len: offsets.end - offsets.start,
             });
         }
-        let copied = entry
-            .tx_fifo
-            .peek_segments(fifo_offset, len, |first, second| {
-                output.extend_from_slice(first);
-                output.extend_from_slice(second);
-                Ok::<usize, StreamDataError>(first.len() + second.len())
-            })
-            .ok_or(StreamDataError::TxRangeUnavailable {
+        let (first, second) = entry.tx_fifo.segments(fifo_offset, len).ok_or(
+            StreamDataError::TxRangeUnavailable {
                 stream,
                 offset: offsets.start,
                 len: offsets.end - offsets.start,
-            })??;
+            },
+        )?;
+        output.extend_from_slice(first);
+        output.extend_from_slice(second);
+        let copied = first.len() + second.len();
         if copied != len {
             return Err(StreamDataError::IoRangeInvalid {
                 stream,
