@@ -15,6 +15,12 @@ use crate::align::align_up;
 const SEGMENT_MAGIC: u64 = 0x4841_4d4d_4552_5356;
 const SEGMENT_VERSION: u32 = 1;
 
+/// Offset of the caller-owned payload inside every segment mapping.
+///
+/// The segment header occupies the leading bytes; region owners start their own
+/// layout at this offset.
+pub const SVM_SEGMENT_PAYLOAD_OFFSET: u64 = size_of::<SegmentHeader>() as u64;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SegmentBackend {
     Private,
@@ -148,6 +154,19 @@ impl SvmSegment {
 
     pub fn size(&self) -> usize {
         self.size
+    }
+
+    /// Offset at which the caller-owned payload starts inside this mapping.
+    pub fn payload_offset(&self) -> u64 {
+        SVM_SEGMENT_PAYLOAD_OFFSET
+    }
+
+    /// Bytes from [`Self::payload_offset`] to the end of this mapping.
+    ///
+    /// The payload is what a region owner or FIFO segment lays out; the OS page
+    /// rounding of the mapping is already included.
+    pub fn payload_len(&self) -> u64 {
+        self.size as u64 - self.payload_offset()
     }
 
     pub fn fd(&self) -> Option<RawFd> {

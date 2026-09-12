@@ -625,8 +625,10 @@ These are target domain terms. The SVM owner modules live in one subtree,
 `crates/hammer-infra/src/svm.rs` plus `crates/hammer-infra/src/svm/`
 (`segment`, `region`, `queue`, `msg_queue`, `fifo`, `fifo_segment`); the legacy
 `Segment` and `MultiRingMsgQueue` remain at the crate root until they are
-deleted. The current implementation still uses `Segment`, an mmap-oriented
-`SvmRegion`, `Fifo`, and `MultiRingMsgQueue`.
+deleted. The offset-based region owner is implemented in `svm/region.rs`,
+`svm/region_heap.rs`, and `svm/hash_map.rs`; the remaining SVM users still run
+on the legacy `Segment`, `Fifo`, and `MultiRingMsgQueue` until they are
+migrated to it.
 The proposed ownership, Rust fields/method signatures, deletion inventory,
 and approval status are recorded in
 [ADR-0011](docs/adr/0011-vpp-style-svm-ownership-and-multiarch.md); the region

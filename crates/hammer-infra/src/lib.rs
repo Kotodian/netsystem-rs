@@ -33,5 +33,5 @@ pub mod svm;
 pub mod sync;
 pub mod timer_wheel;
 
+pub use align::page_size;
 pub use main_heap::PageSize;
-pub use svm::region::page_size;

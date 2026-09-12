@@ -1,4 +1,5 @@
 use std::alloc::Layout;
+use std::io;
 use std::mem;
 
 pub const CACHE_LINE: usize = 64;
@@ -9,6 +10,20 @@ pub const CACHE_LINE: usize = 64;
 /// `vec_bootstrap.h`. It controls the allocation base only; it does not alter
 /// an element's stride or add cache-line padding.
 pub const VEC_MIN_ALIGN: usize = 8;
+
+/// Page size reported by the operating system.
+///
+/// This is the granularity every anonymous or file-backed mapping is rounded up
+/// to, so mapping owners need it before they can lay out a segment.
+pub fn page_size() -> io::Result<usize> {
+    let page = unsafe { libc::sysconf(libc::_SC_PAGESIZE) };
+    if page <= 0 {
+        return Err(io::Error::other(
+            "sysconf(_SC_PAGESIZE) must return a positive page size",
+        ));
+    }
+    Ok(page as usize)
+}
 
 /// Zero-sized field marker corresponding to VPP's
 /// `CLIB_CACHE_LINE_ALIGN_MARK(mark)`.

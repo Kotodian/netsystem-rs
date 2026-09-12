@@ -9,7 +9,7 @@ use std::alloc::{GlobalAlloc, Layout};
 use std::ptr::NonNull;
 use std::sync::Arc;
 
-use crate::svm::region::SvmRegion;
+use crate::segment::SegmentMapping;
 
 struct HeapVTable {
     alloc: unsafe fn(*const (), Layout) -> *mut u8,
@@ -17,7 +17,7 @@ struct HeapVTable {
 }
 
 enum HeapData {
-    SvmData { region: SvmRegion },
+    SvmData { mapping: SegmentMapping },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -46,13 +46,13 @@ impl Heap {
     }
 
     #[inline]
-    pub fn svm_data(region: SvmRegion) -> Result<Heap, HeapError> {
-        if !region.is_allocation_owner() {
+    pub fn svm_data(mapping: SegmentMapping) -> Result<Heap, HeapError> {
+        if !mapping.is_allocation_owner() {
             return Err(HeapError::AttachedSvmRegion);
         }
         Ok(Heap {
             vtable: &SVM_VTABLE,
-            data: Some(Arc::new(HeapData::SvmData { region })),
+            data: Some(Arc::new(HeapData::SvmData { mapping })),
         })
     }
 
@@ -68,9 +68,9 @@ impl Heap {
     }
 
     #[inline]
-    pub fn region(&self) -> Option<&SvmRegion> {
+    pub fn mapping(&self) -> Option<&SegmentMapping> {
         match self.data.as_deref() {
-            Some(HeapData::SvmData { region }) => Some(region),
+            Some(HeapData::SvmData { mapping }) => Some(mapping),
             None => None,
         }
     }
@@ -107,20 +107,20 @@ static MAIN_VTABLE: HeapVTable = HeapVTable {
 };
 
 unsafe fn shared_owner_alloc_callback(data: *const (), layout: Layout) -> *mut u8 {
-    let region = match unsafe { &*(data.cast::<HeapData>()) } {
-        HeapData::SvmData { region } => region,
+    let mapping = match unsafe { &*(data.cast::<HeapData>()) } {
+        HeapData::SvmData { mapping } => mapping,
     };
-    region
+    mapping
         .alloc_layout(layout)
         .map_or(std::ptr::null_mut(), NonNull::as_ptr)
 }
 
 unsafe fn shared_owner_dealloc_callback(data: *const (), ptr: *mut u8, layout: Layout) {
-    let region = match unsafe { &*(data.cast::<HeapData>()) } {
-        HeapData::SvmData { region } => region,
+    let mapping = match unsafe { &*(data.cast::<HeapData>()) } {
+        HeapData::SvmData { mapping } => mapping,
     };
     if let Some(ptr) = NonNull::new(ptr) {
-        unsafe { region.dealloc_layout(ptr, layout) };
+        unsafe { mapping.dealloc_layout(ptr, layout) };
     }
 }
 

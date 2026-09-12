@@ -293,6 +293,16 @@ impl SvmRegionHeap {
         self.peak_used_bytes
     }
 
+    /// Start of the range this descriptor owns, relative to its arena.
+    pub fn heap_start(&self) -> u64 {
+        self.heap_start
+    }
+
+    /// End of the range this descriptor owns, relative to its arena.
+    pub fn heap_end(&self) -> u64 {
+        self.heap_end
+    }
+
     /// Borrows `length` initialized bytes of the live allocation at `offset`.
     pub fn bytes_at<'a>(&self, arena: &'a [u8], offset: u64, length: u64) -> &'a [u8] {
         self.bytes_checked(arena, offset, length)
