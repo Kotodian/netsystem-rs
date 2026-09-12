@@ -32,8 +32,8 @@
 //! HTTP3 engine
 //! dispatch, QPACK, request publication, and stop_listen are later slices.
 
-use hammer_infra::fifo::{Fifo, FifoError};
 use hammer_infra::pool::Pool;
+use hammer_infra::svm::fifo::{Fifo, FifoError};
 use hammer_runtime::DataWorkerId;
 use hammer_runtime::error::RuntimeError;
 use hammer_runtime::session::SessionStreamDirection;

@@ -48,7 +48,7 @@ mod types;
 pub(crate) use body::{BodyAccumulator, BodyError};
 pub use types::*;
 
-use hammer_infra::fifo::{Fifo, FifoError, FifoWriteReservation};
+use hammer_infra::svm::fifo::{Fifo, FifoError, FifoWriteReservation};
 
 /// Size of the fixed `http_msg_t` header on the wire.
 pub const MSG_HEADER_LEN: usize = 88;

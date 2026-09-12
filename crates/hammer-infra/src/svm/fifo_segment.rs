@@ -2,8 +2,8 @@
 
 use std::sync::Arc;
 
-use crate::fifo::{Fifo, FifoError};
-use crate::svm_segment::SvmSegment;
+use crate::svm::fifo::{Fifo, FifoError};
+use crate::svm::segment::SvmSegment;
 
 #[derive(Debug, Clone, Copy)]
 pub struct SvmFifoSegmentConfig {
@@ -110,4 +110,4 @@ impl Default for SvmFifoSegmentMain {
     }
 }
 
-pub use crate::fifo::Fifo as SvmFifo;
+pub use crate::svm::fifo::Fifo as SvmFifo;

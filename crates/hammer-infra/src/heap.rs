@@ -9,7 +9,7 @@ use std::alloc::{GlobalAlloc, Layout};
 use std::ptr::NonNull;
 use std::sync::Arc;
 
-use crate::svm_region::SvmRegion;
+use crate::svm::region::SvmRegion;
 
 struct HeapVTable {
     alloc: unsafe fn(*const (), Layout) -> *mut u8,

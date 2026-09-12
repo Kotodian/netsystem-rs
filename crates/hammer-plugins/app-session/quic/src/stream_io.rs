@@ -5,7 +5,7 @@ use std::ops::Range;
 use std::sync::Arc;
 
 use bytes::BytesMut;
-use hammer_infra::fifo::Fifo;
+use hammer_infra::svm::fifo::Fifo;
 use quinn_proto::{StreamDataError, StreamDataIo, StreamId};
 
 pub(super) struct StreamIoEntry {

@@ -1,5 +1,5 @@
 use hammer_core::data_plane::NodeId;
-use hammer_infra::fifo::FifoError;
+use hammer_infra::svm::fifo::FifoError;
 use hammer_runtime::app::{SessionControlError, SessionHandle};
 use hammer_runtime::{DataWorkerId, RuntimeError};
 use thiserror::Error;

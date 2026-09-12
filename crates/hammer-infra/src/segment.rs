@@ -5,7 +5,7 @@ use std::mem::MaybeUninit;
 use std::os::fd::RawFd;
 
 use crate::align::align_up;
-use crate::svm_region::SvmRegion;
+use crate::svm::region::SvmRegion;
 
 /// Memory domain backing application FIFOs and message queues.
 ///

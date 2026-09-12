@@ -4,8 +4,8 @@ use std::os::fd::{BorrowedFd, OwnedFd, RawFd};
 use std::sync::Arc;
 
 use hammer_core::session::{SessionEvt, SessionEvtType};
-use hammer_infra::fifo::{Fifo, FifoError};
 use hammer_infra::segment::Segment;
+use hammer_infra::svm::fifo::{Fifo, FifoError};
 use thiserror::Error;
 use tokio::io::unix::AsyncFd;
 use tokio::sync::OnceCell;

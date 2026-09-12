@@ -10,10 +10,10 @@ use std::time::{Duration, Instant};
 use crossbeam_queue::ArrayQueue;
 use hammer_core::data_plane::{Frame, NodeId, NodeState};
 use hammer_infra::align::{CacheLineAlignMark, align_up};
-use hammer_infra::fifo::Fifo;
 use hammer_infra::linked_list::LinkedList;
 use hammer_infra::pool::Pool;
 use hammer_infra::segment::Segment;
+use hammer_infra::svm::fifo::Fifo;
 use hammer_runtime::app::{
     AppSession, AppSessionConfig, AppSessionError, SessionAcceptedMsg, SessionConnectError,
     SessionConnectedMsg, SessionControlError, SessionDgramHeader, SessionEventQueue, SessionEvt,
@@ -1618,7 +1618,7 @@ impl SessionWorker {
 
         let mut reservation = match entry.rx_fifo.reserve_write(total) {
             Ok(reservation) => reservation,
-            Err(hammer_infra::fifo::FifoError::InsufficientCapacity { .. }) => {
+            Err(hammer_infra::svm::fifo::FifoError::InsufficientCapacity { .. }) => {
                 entry.rx_fifo.want_deq_notification();
                 return Ok(0);
             }

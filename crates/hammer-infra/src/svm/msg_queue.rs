@@ -17,7 +17,7 @@ use posix_sync::mutex::{
 use zerocopy::{FromBytes, Immutable, IntoBytes, KnownLayout};
 
 use crate::align::align_up;
-use crate::svm_segment::{SvmSegment, SvmSegmentError};
+use crate::svm::segment::{SvmSegment, SvmSegmentError};
 
 const MSG_QUEUE_MAGIC: u64 = 0x4841_4d4d_4552_4d51;
 const MSG_QUEUE_VERSION: u32 = 1;

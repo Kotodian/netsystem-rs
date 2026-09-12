@@ -1,7 +1,7 @@
 //! Linux shared virtual-memory mapping ownership.
 //!
 //! `SvmSegment` owns only the OS mapping and backing descriptor. Allocation
-//! metadata belongs to [`crate::svm_region`], so an attached process never
+//! metadata belongs to [`crate::svm::region`], so an attached process never
 //! reconstructs the creator's allocator from process-local pointers.
 
 use std::ffi::CString;

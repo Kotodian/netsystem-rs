@@ -13,7 +13,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use talc::source::Manual;
 
 use crate::align::align_up;
-use crate::svm_segment::{SvmSegment, SvmSegmentError};
+use crate::svm::segment::{SvmSegment, SvmSegmentError};
 
 const SVM_OFFSET_ALIGN: usize = 64;
 

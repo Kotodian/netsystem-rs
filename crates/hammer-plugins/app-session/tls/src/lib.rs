@@ -10,8 +10,8 @@ use std::cell::{RefCell, RefMut};
 use std::io::{self, BufRead, Write};
 use std::sync::{Arc, OnceLock};
 
-use hammer_infra::fifo::Fifo;
 use hammer_infra::pool::Pool;
+use hammer_infra::svm::fifo::Fifo;
 use hammer_runtime::{DataWorkerId, RuntimeError, RuntimeResult};
 use hammer_service::session::protocol::SessionAppVft;
 use hammer_service::session::runtime::SessionWorker;
