@@ -981,224 +981,210 @@ pub(crate) fn builtin_rx_on(
             None => None,
         };
         let mut http = main.worker(worker.worker())?;
-        let outcome =
-            (|| -> RuntimeResult<FeedOutcome> {
-                // The encoded block and its exact lower-FIFO consumed count: on
-                // a publication retry the retained pending section is ready to
-                // publish again (borrowed below, never re-fed); otherwise a
-                // fresh feed of the borrowed lower RX bytes.
-                let pending = http
-                    .pending_field_section(stream, lower)
-                    .map_err(RuntimeError::from)?;
-                if pending.is_some() {
-                    return Ok(FeedOutcome {
-                        ready: true,
-                        consumed: 0,
-                        produced: 0,
-                        action: None,
-                    });
+        let outcome = (|| -> RuntimeResult<FeedOutcome> {
+            // The encoded block and its exact lower-FIFO consumed count: on
+            // a publication retry the retained pending section is ready to
+            // publish again (borrowed below, never re-fed); otherwise a
+            // fresh feed of the borrowed lower RX bytes.
+            let pending = http
+                .pending_field_section(stream, lower)
+                .map_err(RuntimeError::from)?;
+            if pending.is_some() {
+                return Ok(FeedOutcome {
+                    ready: true,
+                    consumed: 0,
+                    produced: 0,
+                    action: None,
+                });
+            }
+            // Borrow the readable lower bytes without dequeuing and feed
+            // them to the request reader. Each byte is fed exactly once
+            // across fragmented callbacks: a partial frame leaves its bytes
+            // in the reader's state and they are dequeued below, so the
+            // next RX callback starts at the first byte the reader has not
+            // seen (VPP drains each callback's processed bytes,
+            // `max_deq - left_deq`, http3.c:1798, and never re-reads a
+            // frame's bytes).
+            let (first, second) = lower_rx
+                .segments(0, lower_rx.max_dequeue())
+                .unwrap_or((&[], &[]));
+            let mut total = 0usize;
+            let mut produced = 0usize;
+            let mut completed: Option<(Vec<u8>, usize)> = None;
+            for segment in [first, second] {
+                if completed.is_some() || segment.is_empty() {
+                    continue;
                 }
-                // Borrow the readable lower bytes without dequeuing and feed
-                // them to the request reader. Each byte is fed exactly once
-                // across fragmented callbacks: a partial frame leaves its bytes
-                // in the reader's state and they are dequeued below, so the
-                // next RX callback starts at the first byte the reader has not
-                // seen (VPP drains each callback's processed bytes,
-                // `max_deq - left_deq`, http3.c:1798, and never re-reads a
-                // frame's bytes).
-                Ok(lower_rx
-                    .peek_segments(0, lower_rx.max_dequeue(), |first, second| {
-                        let mut total = 0usize;
-                        let mut produced = 0usize;
-                        let mut completed: Option<(Vec<u8>, usize)> = None;
-                        for segment in [first, second] {
-                            if completed.is_some() || segment.is_empty() {
-                                continue;
-                            }
-                            let (read, used) =
-                                match http.process_request_bytes(stream, lower, segment) {
-                                    Ok(feed) => feed,
-                                    Err(RequestReadError::Worker(inner)) => {
-                                        return Err(RuntimeError::from(inner));
-                                    }
-                                    Err(RequestReadError::Protocol(error)) => {
-                                        // A request-stream frame error kills the
-                                        // stream before any payload is consumed:
-                                        // only the bytes the reader consumed into
-                                        // earlier partial-frame state dequeue, and
-                                        // the request stream resets with the typed
-                                        // error code (VPP abandons the transport
-                                        // bytes on an RX error,
-                                        // http3.c:1791-1796; RFC 9114
-                                        // Section 4.1).
-                                        return Ok(FeedOutcome {
-                                            ready: false,
-                                            consumed: total,
-                                            produced,
-                                            action: Some(RequestErrorAction::ResetStream {
-                                                code: error.error_code(),
-                                            }),
-                                        });
-                                    }
-                                };
-                            total += used;
-                            match read {
-                                RequestFrameRead::Headers(encoded) => {
-                                    completed = Some((encoded, total));
-                                }
-                                RequestFrameRead::Data { chunk, .. } => {
-                                    // A DATA frame publishes its borrowed payload
-                                    // through the shared body publication
-                                    // (`HttpWorker::process_request_data`, VPP
-                                    // `http3_req_state_transport_io_more_data`
-                                    // writing each frame's payload to the app
-                                    // FIFO, http3.c:1184-1263): the body
-                                    // accumulator rejects body-less or
-                                    // overrunning DATA with the typed
-                                    // request-stream error before any FIFO
-                                    // mutation, the upper commit is
-                                    // all-or-nothing, and the lower dequeue
-                                    // happens only after it.
-                                    let Some(upper_rx) = upper_rx else {
-                                        // Reachable after a prior stream error
-                                        // (no upper was ever created) or after a
-                                        // prior DATA publication-failure
-                                        // teardown removed the upper: the stream
-                                        // is already dead, so the
-                                        // reader-consumed bytes dequeue and
-                                        // nothing publishes.
-                                        continue;
-                                    };
-                                    match http.process_request_data(stream, lower, upper_rx, chunk)
-                                    {
-                                        Ok(()) => produced += chunk.len(),
-                                        Err(RequestReadError::Worker(
-                                            HttpWorkerError::BodyChunkPublishFailed {
-                                                error:
-                                                    PublishError::Capacity { .. }
-                                                    | PublishError::Fifo(_),
-                                                ..
-                                            },
-                                        )) => {
-                                            // A DATA publication failure is never
-                                            // retryable: the reader has already
-                                            // advanced over the rejected bytes
-                                            // (`payload_len` moved past them,
-                                            // request_frame_reader.rs), so a
-                                            // retry would re-feed
-                                            // reader-consumed bytes into the
-                                            // in-progress frame and re-publish
-                                            // duplicated body bytes (VPP never
-                                            // faces this: it checks the app FIFO
-                                            // before draining any transport
-                                            // bytes, http3.c:1211-1218, and only
-                                            // pauses). Capacity exhaustion and
-                                            // FIFO reservation/copy/commit
-                                            // rollback both leave the upper FIFO
-                                            // and the slot's body accumulator at
-                                            // their pre-call state
-                                            // (process_request_data persists the
-                                            // advance only after the commit,
-                                            // worker.rs), so both abort the
-                                            // request: the app-visible request
-                                            // ends (its upper Session is removed,
-                                            // VPP `http3_stream_terminate` →
-                                            // `session_transport_reset_notify`,
-                                            // http3.c:140-149,
-                                            // session.c:1165-1180) and the
-                                            // request stream resets with
-                                            // HTTP3_ERROR_INTERNAL_ERROR,
-                                            // dequeueing exactly the
-                                            // reader-accounted bytes without
-                                            // further body or FIFO mutation.
-                                            return Ok(FeedOutcome {
-                                                ready: false,
-                                                consumed: total,
-                                                produced,
-                                                action: Some(
-                                                    RequestErrorAction::ResetStreamAbortRequest {
-                                                        code: ErrorCode::InternalError,
-                                                    },
-                                                ),
-                                            });
-                                        }
-                                        Err(RequestReadError::Worker(inner)) => {
-                                            return Err(RuntimeError::from(inner));
-                                        }
-                                        Err(RequestReadError::Protocol(error)) => {
-                                            // Body-less or overrunning DATA is a
-                                            // typed stream protocol error, not a
-                                            // publish failure: the
-                                            // reader-consumed bytes dequeue with
-                                            // the stream reset.
-                                            return Ok(FeedOutcome {
-                                                ready: false,
-                                                consumed: total,
-                                                produced,
-                                                action: Some(RequestErrorAction::ResetStream {
-                                                    code: error.error_code(),
-                                                }),
-                                            });
-                                        }
-                                    }
-                                }
-                                RequestFrameRead::Incomplete | RequestFrameRead::Drained(..) => {}
-                            }
-                        }
-                        let Some((encoded, total)) = completed else {
-                            // The reader consumed every fed byte into its
-                            // partial-frame state (or the payload of a DATA
-                            // frame); dequeue exactly those bytes now so the
-                            // next RX callback feeds only bytes the reader has
-                            // not seen.
-                            return Ok(FeedOutcome {
-                                ready: false,
-                                consumed: total,
-                                produced,
-                                action: None,
-                            });
-                        };
-                        // An empty HEADERS field section is a request-stream
-                        // error, not a QPACK connection decompression failure:
-                        // VPP checks `req->fh.length == 0` before
-                        // `qpack_parse_request` and terminates the request
-                        // stream with HTTP3_ERROR_MESSAGE_ERROR (http3.c:860-869,
-                        // RFC 9114 Section 4.1.2). The reset is dispatched
-                        // below.
-                        if encoded.is_empty() {
-                            return Ok(FeedOutcome {
-                                ready: false,
-                                consumed: total,
-                                produced,
-                                action: Some(RequestErrorAction::ResetStream {
-                                    code: ErrorCode::MessageError,
-                                }),
-                            });
-                        }
-                        http.retain_pending_field_section(
-                            stream,
-                            lower,
-                            PendingFieldSection {
-                                encoded,
-                                consumed: total,
-                            },
-                        )
-                        .map_err(RuntimeError::from)?;
-                        Ok(FeedOutcome {
-                            ready: true,
-                            consumed: 0,
+                let (read, used) = match http.process_request_bytes(stream, lower, segment) {
+                    Ok(feed) => feed,
+                    Err(RequestReadError::Worker(inner)) => {
+                        return Err(RuntimeError::from(inner));
+                    }
+                    Err(RequestReadError::Protocol(error)) => {
+                        // A request-stream frame error kills the
+                        // stream before any payload is consumed:
+                        // only the bytes the reader consumed into
+                        // earlier partial-frame state dequeue, and
+                        // the request stream resets with the typed
+                        // error code (VPP abandons the transport
+                        // bytes on an RX error,
+                        // http3.c:1791-1796; RFC 9114
+                        // Section 4.1).
+                        return Ok(FeedOutcome {
+                            ready: false,
+                            consumed: total,
                             produced,
-                            action: None,
-                        })
-                    })
-                    .transpose()?
-                    .unwrap_or(FeedOutcome {
-                        ready: false,
-                        consumed: 0,
-                        produced: 0,
-                        action: None,
-                    }))
-            })();
+                            action: Some(RequestErrorAction::ResetStream {
+                                code: error.error_code(),
+                            }),
+                        });
+                    }
+                };
+                total += used;
+                match read {
+                    RequestFrameRead::Headers(encoded) => {
+                        completed = Some((encoded, total));
+                    }
+                    RequestFrameRead::Data { chunk, .. } => {
+                        // A DATA frame publishes its borrowed payload
+                        // through the shared body publication
+                        // (`HttpWorker::process_request_data`, VPP
+                        // `http3_req_state_transport_io_more_data`
+                        // writing each frame's payload to the app
+                        // FIFO, http3.c:1184-1263): the body
+                        // accumulator rejects body-less or
+                        // overrunning DATA with the typed
+                        // request-stream error before any FIFO
+                        // mutation, the upper commit is
+                        // all-or-nothing, and the lower dequeue
+                        // happens only after it.
+                        let Some(upper_rx) = upper_rx else {
+                            // Reachable after a prior stream error
+                            // (no upper was ever created) or after a
+                            // prior DATA publication-failure
+                            // teardown removed the upper: the stream
+                            // is already dead, so the
+                            // reader-consumed bytes dequeue and
+                            // nothing publishes.
+                            continue;
+                        };
+                        match http.process_request_data(stream, lower, upper_rx, chunk) {
+                            Ok(()) => produced += chunk.len(),
+                            Err(RequestReadError::Worker(
+                                HttpWorkerError::BodyChunkPublishFailed {
+                                    error: PublishError::Capacity { .. } | PublishError::Fifo(_),
+                                    ..
+                                },
+                            )) => {
+                                // A DATA publication failure is never
+                                // retryable: the reader has already
+                                // advanced over the rejected bytes
+                                // (`payload_len` moved past them,
+                                // request_frame_reader.rs), so a
+                                // retry would re-feed
+                                // reader-consumed bytes into the
+                                // in-progress frame and re-publish
+                                // duplicated body bytes (VPP never
+                                // faces this: it checks the app FIFO
+                                // before draining any transport
+                                // bytes, http3.c:1211-1218, and only
+                                // pauses). Capacity exhaustion and
+                                // FIFO reservation/copy/commit
+                                // rollback both leave the upper FIFO
+                                // and the slot's body accumulator at
+                                // their pre-call state
+                                // (process_request_data persists the
+                                // advance only after the commit,
+                                // worker.rs), so both abort the
+                                // request: the app-visible request
+                                // ends (its upper Session is removed,
+                                // VPP `http3_stream_terminate` →
+                                // `session_transport_reset_notify`,
+                                // http3.c:140-149,
+                                // session.c:1165-1180) and the
+                                // request stream resets with
+                                // HTTP3_ERROR_INTERNAL_ERROR,
+                                // dequeueing exactly the
+                                // reader-accounted bytes without
+                                // further body or FIFO mutation.
+                                return Ok(FeedOutcome {
+                                    ready: false,
+                                    consumed: total,
+                                    produced,
+                                    action: Some(RequestErrorAction::ResetStreamAbortRequest {
+                                        code: ErrorCode::InternalError,
+                                    }),
+                                });
+                            }
+                            Err(RequestReadError::Worker(inner)) => {
+                                return Err(RuntimeError::from(inner));
+                            }
+                            Err(RequestReadError::Protocol(error)) => {
+                                // Body-less or overrunning DATA is a
+                                // typed stream protocol error, not a
+                                // publish failure: the
+                                // reader-consumed bytes dequeue with
+                                // the stream reset.
+                                return Ok(FeedOutcome {
+                                    ready: false,
+                                    consumed: total,
+                                    produced,
+                                    action: Some(RequestErrorAction::ResetStream {
+                                        code: error.error_code(),
+                                    }),
+                                });
+                            }
+                        }
+                    }
+                    RequestFrameRead::Incomplete | RequestFrameRead::Drained(..) => {}
+                }
+            }
+            let Some((encoded, total)) = completed else {
+                // The reader consumed every fed byte into its
+                // partial-frame state (or the payload of a DATA
+                // frame); dequeue exactly those bytes now so the
+                // next RX callback feeds only bytes the reader has
+                // not seen.
+                return Ok(FeedOutcome {
+                    ready: false,
+                    consumed: total,
+                    produced,
+                    action: None,
+                });
+            };
+            // An empty HEADERS field section is a request-stream
+            // error, not a QPACK connection decompression failure:
+            // VPP checks `req->fh.length == 0` before
+            // `qpack_parse_request` and terminates the request
+            // stream with HTTP3_ERROR_MESSAGE_ERROR (http3.c:860-869,
+            // RFC 9114 Section 4.1.2). The reset is dispatched
+            // below.
+            if encoded.is_empty() {
+                return Ok(FeedOutcome {
+                    ready: false,
+                    consumed: total,
+                    produced,
+                    action: Some(RequestErrorAction::ResetStream {
+                        code: ErrorCode::MessageError,
+                    }),
+                });
+            }
+            http.retain_pending_field_section(
+                stream,
+                lower,
+                PendingFieldSection {
+                    encoded,
+                    consumed: total,
+                },
+            )
+            .map_err(RuntimeError::from)?;
+            Ok(FeedOutcome {
+                ready: true,
+                consumed: 0,
+                produced,
+                action: None,
+            })
+        })();
         let outcome = outcome?;
         // Dequeue now the bytes the reader consumed into partial-frame state
         // (or an erroring frame's fed bytes, or a committed DATA chunk's

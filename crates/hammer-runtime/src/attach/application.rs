@@ -6,7 +6,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use hammer_infra::segment::Segment;
 use tokio::io::unix::AsyncFd;
 
-use crate::app::{SessionMsgQueue, SessionProducer, SingleProducer};
+use crate::app::{SessionMsgQueue, SessionProducer};
 use crate::{AttachError, RuntimeResult};
 
 use super::{ATTACH_PROTOCOL_VERSION, MAX_ATTACH_DESCRIPTORS, descriptor};
@@ -109,14 +109,14 @@ impl ApplicationMqPublication {
 
 pub(super) struct AttachedApplication {
     pub(super) stream: Arc<tokio::net::UnixStream>,
-    pub(super) requests: SessionMsgQueue<SingleProducer>,
+    pub(super) requests: SessionMsgQueue,
     pub(super) replies: SessionProducer,
 }
 
 pub(super) struct ApplicationAttachment {
     segment: Segment,
     request_offset: u64,
-    pub(super) requests: SessionMsgQueue<SingleProducer>,
+    pub(super) requests: SessionMsgQueue,
     reply_offset: u64,
     pub(super) replies: SessionProducer,
     application_mqs: ApplicationMqPublication,
@@ -137,9 +137,8 @@ impl ApplicationAttachment {
             SEGMENT_BYTES,
         )
         .map_err(|source| AttachError::ControlSegmentCreate { source })?;
-        let queue_bytes =
-            SessionMsgQueue::<SingleProducer>::layout_bytes_with_control(Q_NITEMS, RING_NITEMS)
-                .map_err(|source| AttachError::ControlQueueLayout { source })?;
+        let queue_bytes = SessionMsgQueue::layout_bytes_with_control(Q_NITEMS, RING_NITEMS)
+            .map_err(|source| AttachError::ControlQueueLayout { source })?;
         let request_offset = segment
             .alloc(queue_bytes, 64)
             .ok_or(AttachError::ControlSegmentCapacity)?;
@@ -147,7 +146,7 @@ impl ApplicationAttachment {
             .alloc(queue_bytes, 64)
             .ok_or(AttachError::ControlSegmentCapacity)?;
         let requests = unsafe {
-            SessionMsgQueue::<SingleProducer>::init_at_with_signal_and_control(
+            SessionMsgQueue::init_at_with_signal_and_control(
                 segment.clone(),
                 request_offset,
                 Q_NITEMS,
@@ -156,7 +155,7 @@ impl ApplicationAttachment {
         }
         .map_err(|source| AttachError::ControlQueueInit { source })?;
         let replies = unsafe {
-            SessionMsgQueue::<SingleProducer>::init_at_with_signal_and_control(
+            SessionMsgQueue::init_at_with_signal_and_control(
                 segment.clone(),
                 reply_offset,
                 Q_NITEMS,

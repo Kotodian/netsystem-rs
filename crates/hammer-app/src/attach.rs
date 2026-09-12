@@ -11,7 +11,7 @@ use hammer_runtime::app::{
     AppSession, AppSessionError, SessionAcceptedMsg, SessionBoundMsg, SessionConnectError,
     SessionConnectedMsg, SessionControlDecodeError, SessionControlError, SessionEvtType,
     SessionHandle, SessionMsgQueue, SessionMsgQueueError, SessionOffsets, SessionProducer,
-    SessionUnlistenReplyMsg, SingleProducer,
+    SessionUnlistenReplyMsg,
 };
 use hammer_runtime::attach::{
     APPLICATION_MQ_BASE_DESCRIPTOR_COUNT, APPLICATION_MQ_METADATA_BYTES,
@@ -202,7 +202,7 @@ pub struct AppClient {
     pub(crate) session_requests: RefCell<SessionProducer>,
     /// The Application-side consumer of Session control replies. The daemon
     /// owns the reply single-producer capability.
-    pub(crate) session_replies: RefCell<SessionMsgQueue<SingleProducer>>,
+    pub(crate) session_replies: RefCell<SessionMsgQueue>,
     rx_mqs: Box<[Arc<SessionMsgQueue>]>,
     pub(crate) ext_config: Option<ExtConfigStore>,
     pub(crate) next_session_context: u64,
@@ -303,7 +303,7 @@ impl AppClient {
         // claimed once here (a daemon-side claim would be a typed error) and
         // outlives the mapping.
         let session_requests = unsafe {
-            SessionMsgQueue::<SingleProducer>::from_shared(
+            SessionMsgQueue::from_shared(
                 control_segment.clone(),
                 words[2],
                 None,
@@ -319,7 +319,7 @@ impl AppClient {
         .claim_producer()
         .map_err(|source| AppClientError::SessionControl { source })?;
         let session_replies = unsafe {
-            SessionMsgQueue::<SingleProducer>::from_shared(
+            SessionMsgQueue::from_shared(
                 control_segment,
                 words[3],
                 Some(
@@ -404,7 +404,7 @@ impl AppClient {
         stream: UnixStream,
         application: u32,
         requests: SessionProducer,
-        replies: SessionMsgQueue<SingleProducer>,
+        replies: SessionMsgQueue,
         rx_mqs: Box<[Arc<SessionMsgQueue>]>,
     ) -> Self {
         Self {

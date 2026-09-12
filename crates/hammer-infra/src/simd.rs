@@ -127,6 +127,21 @@ pub fn compact_indices(indices: &mut [u32], keep_mask: u8, offset: usize, write:
 
 // ── copy_bytes_simd : SIMD-accelerated byte copy ─────────────────
 
+/// Copy bytes into a FIFO chunk using the best implementation available to
+/// this process. The selected function is process-local and never stored in
+/// shared memory.
+#[inline]
+pub fn copy_to_chunk(destination: &mut [u8], source: &[u8]) -> usize {
+    copy_bytes_simd(destination, source)
+}
+
+/// Copy bytes out of a FIFO chunk using the best implementation available to
+/// this process.
+#[inline]
+pub fn copy_from_chunk(destination: &mut [u8], source: &[u8]) -> usize {
+    copy_bytes_simd(destination, source)
+}
+
 /// Copy bytes from `src` to `dst` (length = min(dst.len(), src.len())).
 ///
 /// x86_64: SSE2 128-bit vector copy for bulk throughput.
@@ -184,3 +199,42 @@ pub fn copy_bytes_simd(dst: &mut [u8], src: &[u8]) -> usize {
 }
 
 // ── Tests ───────────────────────────────────────────────────────
+/// Define a VPP-style ordinary multi-architecture function.
+///
+/// The macro emits one public selected entry point. The baseline and ISA
+/// implementations remain ordinary concrete functions; selection happens once
+/// per process and the selected pointer is never placed in shared memory.
+#[macro_export]
+macro_rules! march_fn {
+    (
+        $vis:vis fn $name:ident = $baseline:path;
+        variants {
+            $(x86_64($feature:expr, priority = $priority:expr => $isa:path),)*
+        }
+        ;
+        ($($arg:ident : $arg_ty:ty),* $(,)?) -> $ret:ty
+    ) => {
+        $vis fn $name($($arg: $arg_ty),*) -> $ret {
+            static SELECTED: ::std::sync::OnceLock<unsafe fn($($arg_ty),*) -> $ret> =
+                ::std::sync::OnceLock::new();
+            let function = *SELECTED.get_or_init(|| {
+                let (selected, _) = {
+                    let mut selected: unsafe fn($($arg_ty),*) -> $ret = $baseline;
+                    let mut selected_priority = 0;
+                    $(
+                        #[cfg(target_arch = "x86_64")]
+                        if $feature
+                            && $priority > selected_priority
+                        {
+                            selected = $isa;
+                            selected_priority = $priority;
+                        }
+                    )*
+                    (selected, selected_priority)
+                };
+                selected
+            });
+            unsafe { function($($arg),*) }
+        }
+    };
+}

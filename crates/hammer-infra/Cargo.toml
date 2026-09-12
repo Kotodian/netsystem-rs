@@ -14,11 +14,13 @@ byte-unit = { workspace = true }
 libc = { workspace = true }
 libmimalloc-sys = { workspace = true }
 parse-display = { workspace = true }
+posix-sync = { workspace = true }
 serde = { workspace = true }
 serde_with = { workspace = true }
 spinning_top = { workspace = true }
 talc = { workspace = true }
 thiserror = { workspace = true }
+zerocopy = { workspace = true }
 
 [target.'cfg(target_os = "linux")'.dependencies]
 procfs = { workspace = true }

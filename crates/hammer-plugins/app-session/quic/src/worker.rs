@@ -8,8 +8,8 @@ use std::time::{Duration, Instant};
 use bytes::Bytes;
 use hammer_core::data_plane::Frame;
 use hammer_infra::bytes::BytesBuffer;
-use hammer_infra::fifo::{Fifo, FifoError};
 use hammer_infra::pool::Pool;
+use hammer_infra::svm::fifo::{Fifo, FifoError};
 use hammer_infra::timer_wheel::TimerWheel1t2w2048sl;
 use hammer_runtime::app::{SessionConnectError, SessionDgramHeader, SessionFlags, SessionHandle};
 use hammer_runtime::session::{SessionConnectEndpoint, SessionStreamDirection};
@@ -2455,20 +2455,11 @@ impl QuicWorker {
         for _ in 0..packet_budget {
             // VPP provisions UDP FIFO chunks before `quicly_send`, so a
             // resource failure cannot follow a committed QUIC transmit.
-            let mut reservation = {
-                let (_, tx_fifo) = sessions.fifo_pair(lower_session).ok_or_else(|| {
-                    QuicWorkerError::SessionMissing {
-                        session: lower_session,
-                    }
-                })?;
-                tx_fifo.reserve_write(record_size).map_err(|source| {
-                    QuicWorkerError::OutputReservationFailed {
-                        context,
-                        bytes: record_size,
-                        source,
-                    }
-                })?
-            };
+            let (_, tx_fifo) = sessions.fifo_pair(lower_session).ok_or_else(|| {
+                QuicWorkerError::SessionMissing {
+                    session: lower_session,
+                }
+            })?;
             // Fresh transmit window per burst: quinn appends to the buffer
             // from its current length, so stale handshake bytes would corrupt
             // the accounting (VPP `quic_quicly_send_packets` resets the
@@ -2478,7 +2469,6 @@ impl QuicWorker {
                 .connection_mut()?
                 .poll_transmit(now, 1, &mut *self.tx_bufs)
             else {
-                reservation.cancel();
                 break;
             };
             let payload_len = transmit.size;
@@ -2504,23 +2494,19 @@ impl QuicWorker {
                         length: payload_len as u32,
                     })?;
             let header_bytes = header.to_bytes();
-            let written = reservation
-                .copy_from_segments([
-                    header_bytes.as_slice(),
-                    &self.tx_bufs.as_slice()[..payload_len],
-                ])
+            let committed = tx_fifo
+                .enqueue_segments(
+                    record_len,
+                    [
+                        header_bytes.as_slice(),
+                        &self.tx_bufs.as_slice()[..payload_len],
+                    ],
+                )
                 .map_err(|source| QuicWorkerError::OutputReservationFailed {
                     context,
                     bytes: record_len,
                     source,
                 })?;
-            let committed = reservation.commit(written).map_err(|source| {
-                QuicWorkerError::OutputReservationFailed {
-                    context,
-                    bytes: record_len,
-                    source,
-                }
-            })?;
             if committed != record_len {
                 return Err(QuicWorkerError::OutputCommitLengthMismatch {
                     context,
@@ -2576,27 +2562,13 @@ impl QuicWorker {
                     session: lower_session,
                 }
             })?;
-            let mut reservation = tx_fifo.reserve_write(record_len).map_err(|source| {
-                QuicWorkerError::OutputReservationFailed {
-                    context,
-                    bytes: record_len,
-                    source,
-                }
-            })?;
-            reservation
-                .copy_from_segments([header_bytes.as_slice(), payload])
+            tx_fifo
+                .enqueue_segments(record_len, [header_bytes.as_slice(), payload])
                 .map_err(|source| QuicWorkerError::OutputReservationFailed {
                     context,
                     bytes: record_len,
                     source,
                 })?;
-            reservation.commit(record_len).map_err(|source| {
-                QuicWorkerError::OutputReservationFailed {
-                    context,
-                    bytes: record_len,
-                    source,
-                }
-            })?;
         }
         sessions.publish_tx_enqueue(lower_session, record_len)?;
         self.timers

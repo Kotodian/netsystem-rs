@@ -11,7 +11,6 @@ pub use control::{
 };
 pub use error::SessionConnectError;
 pub use hammer_core::session::{SessionEvt, SessionEvtType, SessionHandle};
-pub use hammer_infra::multi_ring_msg_queue::SingleProducer;
 pub use layout::SessionOffsets;
 pub use session::{AppSession, AppSessionConfig, AppSessionError, SessionDgramHeader};
 pub use session_msg_queue::{

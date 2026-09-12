@@ -10,10 +10,10 @@ use std::time::{Duration, Instant};
 use crossbeam_queue::ArrayQueue;
 use hammer_core::data_plane::{Frame, NodeId, NodeState};
 use hammer_infra::align::{CacheLineAlignMark, align_up};
-use hammer_infra::fifo::Fifo;
 use hammer_infra::linked_list::LinkedList;
 use hammer_infra::pool::Pool;
 use hammer_infra::segment::Segment;
+use hammer_infra::svm::fifo::Fifo;
 use hammer_runtime::app::{
     AppSession, AppSessionConfig, AppSessionError, SessionAcceptedMsg, SessionConnectError,
     SessionConnectedMsg, SessionControlError, SessionDgramHeader, SessionEventQueue, SessionEvt,
@@ -1616,31 +1616,15 @@ impl SessionWorker {
             return Ok(0);
         }
 
-        let mut reservation = match entry.rx_fifo.reserve_write(total) {
-            Ok(reservation) => reservation,
-            Err(hammer_infra::fifo::FifoError::InsufficientCapacity { .. }) => {
-                entry.rx_fifo.want_deq_notification();
-                return Ok(0);
-            }
-            Err(source) => {
-                return Err(SessionError::DatagramFifo { session_id, source }.into());
-            }
-        };
-        let header_bytes = header.to_bytes();
-        let copied_header = reservation
-            .copy_from_segments([header_bytes.as_slice()])
-            .map_err(|source| SessionError::DatagramFifo { session_id, source })?;
-        if copied_header != SessionDgramHeader::SIZE {
-            reservation.cancel();
-            return Err(SessionError::DatagramLengthMismatch {
-                session_id,
-                payload_len: copied_header,
-                header_len: SessionDgramHeader::SIZE as u32,
-            }
-            .into());
+        if entry.rx_fifo.max_enqueue() < total {
+            entry.rx_fifo.want_deq_notification();
+            return Ok(0);
         }
+        let header_bytes = header.to_bytes();
         let mut skip = payload_offset;
         let mut remaining = payload_len;
+        let mut segments = Vec::new();
+        segments.push(header_bytes.as_slice());
         for buffer in runtime.chain(index) {
             if skip >= buffer.current_len() {
                 skip -= buffer.current_len();
@@ -1648,9 +1632,7 @@ impl SessionWorker {
             }
             let start = skip;
             let take = (buffer.current_len() - start).min(remaining);
-            reservation
-                .copy_from_segments([&buffer.current()[start..start + take]])
-                .map_err(|source| SessionError::DatagramFifo { session_id, source })?;
+            segments.push(&buffer.current()[start..start + take]);
             remaining -= take;
             skip = 0;
             if remaining == 0 {
@@ -1658,7 +1640,6 @@ impl SessionWorker {
             }
         }
         if remaining != 0 {
-            reservation.cancel();
             return Err(SessionError::DatagramLengthMismatch {
                 session_id,
                 payload_len: payload_len - remaining,
@@ -1666,8 +1647,9 @@ impl SessionWorker {
             }
             .into());
         }
-        reservation
-            .commit(total)
+        entry
+            .rx_fifo
+            .enqueue_segments(total, segments)
             .map_err(|source| SessionError::DatagramFifo { session_id, source })?;
         self.publish_rx_enqueue(session_id, total)?;
         Ok(payload_len)
@@ -3791,30 +3773,26 @@ impl SessionWorker {
             .entries
             .get(session_id)
             .ok_or(SessionError::SessionMissing { session_id })?;
-        let written = entry
-            .tx_fifo
-            .peek_segments(offset, len, |first, second| {
-                let mut last = index;
-                while let Some(next) = runtime.buffer(last).next_buffer_slot() {
-                    last = next;
-                }
-                for data in [first, second] {
-                    let copied =
-                        runtime.buffer_chain_append_data_with_alloc(index, &mut last, data);
-                    if copied != data.len() {
-                        return Err(hammer_core::error::DataPlaneError::from(
-                            hammer_core::error::BufferInvariant::PoolExhausted,
-                        )
-                        .into());
-                    }
-                }
-                Ok::<usize, RuntimeError>(first.len() + second.len())
-            })
-            .ok_or(SessionError::TxFifoRangeInvalid {
-                session_id,
-                tx_offset: offset,
-                payload_len: len,
-            })??;
+        let (first, second) =
+            entry
+                .tx_fifo
+                .segments(offset, len)
+                .ok_or(SessionError::TxFifoRangeInvalid {
+                    session_id,
+                    tx_offset: offset,
+                    payload_len: len,
+                })?;
+        let mut last = index;
+        while let Some(next) = runtime.buffer(last).next_buffer_slot() {
+            last = next;
+        }
+        for data in [first, second] {
+            let copied = runtime.buffer_chain_append_data_with_alloc(index, &mut last, data);
+            if copied != data.len() {
+                return Err(hammer_core::error::DataPlaneError::BufferPoolsUnavailable.into());
+            }
+        }
+        let written = first.len() + second.len();
         if written != len {
             return Err(SessionError::TxFifoRangeInvalid {
                 session_id,
@@ -4201,10 +4179,7 @@ where
                 let mut buffer = 0;
                 if runtime.buffer_alloc(core::slice::from_mut(&mut buffer)) != 1 {
                     runtime.buffer_free(&indices[..batch.len()]);
-                    return Err(hammer_core::error::DataPlaneError::from(
-                        hammer_core::error::BufferInvariant::PoolExhausted,
-                    )
-                    .into());
+                    return Err(hammer_core::error::DataPlaneError::BufferPoolsUnavailable.into());
                 }
                 indices[batch.len()] = buffer;
                 if let Err(error) = sessions.copy_tx_to_buffer(

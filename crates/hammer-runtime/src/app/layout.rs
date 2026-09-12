@@ -1,6 +1,6 @@
 use hammer_infra::align::align_up;
-use hammer_infra::fifo::{Fifo, FifoError};
 use hammer_infra::segment::Segment;
+use hammer_infra::svm::fifo::{Fifo, FifoError};
 
 use crate::app::session_msg_queue::SessionMsgQueue;
 

@@ -4,8 +4,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Weak};
 
 use hammer_infra::align::align_up;
-use hammer_infra::fifo::Fifo;
 use hammer_infra::segment::Segment;
+use hammer_infra::svm::fifo::Fifo;
 use hammer_runtime::app::{
     AppSession, AppSessionConfig, AppSessionError, SessionAcceptedMsg, SessionConnectedMsg,
     SessionEventQueue, SessionEvtType, SessionHandle, SessionMsgQueue, SessionMsgQueueError,

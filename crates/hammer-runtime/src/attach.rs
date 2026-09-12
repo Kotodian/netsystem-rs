@@ -11,7 +11,7 @@ use tokio::sync::Notify;
 
 use crate::app::{
     AppSession, SessionAcceptedMsg, SessionConnectedMsg, SessionControlPayload, SessionMsgQueue,
-    SessionMsgQueueError, SessionOffsets, SessionProducer, SingleProducer,
+    SessionMsgQueueError, SessionOffsets, SessionProducer,
 };
 use crate::{AttachError, RuntimeError, RuntimeResult};
 
@@ -204,11 +204,7 @@ impl AppServer {
     where
         Attach: Fn() -> Result<u32, ApplicationError>,
         Mq: Fn(u32) -> Result<ApplicationMqPublication, ApplicationError>,
-        Control: Fn(
-            u32,
-            &mut SessionMsgQueue<SingleProducer>,
-            &mut SessionProducer,
-        ) -> RuntimeResult<()>,
+        Control: Fn(u32, &mut SessionMsgQueue, &mut SessionProducer) -> RuntimeResult<()>,
         Detached: Fn(u32),
         ApplicationError: std::fmt::Display,
     {

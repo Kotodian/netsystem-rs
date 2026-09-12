@@ -473,7 +473,7 @@ pub enum AttachError {
     #[error("failed to allocate attach session layout")]
     SessionLayout {
         #[source]
-        source: hammer_infra::fifo::FifoError,
+        source: hammer_infra::svm::fifo::FifoError,
     },
     #[error("attach RX FIFO configuration is invalid")]
     RxFifoInvalid,

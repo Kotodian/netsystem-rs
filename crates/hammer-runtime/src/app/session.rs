@@ -4,8 +4,8 @@ use std::os::fd::{BorrowedFd, OwnedFd, RawFd};
 use std::sync::Arc;
 
 use hammer_core::session::{SessionEvt, SessionEvtType};
-use hammer_infra::fifo::{Fifo, FifoError};
 use hammer_infra::segment::Segment;
+use hammer_infra::svm::fifo::{Fifo, FifoError};
 use thiserror::Error;
 use tokio::io::unix::AsyncFd;
 use tokio::sync::OnceCell;
@@ -331,9 +331,8 @@ impl AppSession {
         }
         let total = SessionDgramHeader::SIZE.checked_add(payload.len()).ok_or(
             AppSessionError::DatagramFifo {
-                source: FifoError::ReservationTooLong {
-                    requested: usize::MAX,
-                    max_len: self.tx_fifo.max_enqueue(),
+                source: FifoError::CapacityOutOfRange {
+                    capacity: usize::MAX,
                 },
             },
         )?;
@@ -341,24 +340,9 @@ impl AppSession {
             return Ok(0);
         }
         let header_bytes = header.to_bytes();
-        let mut reservation = self
+        let copied = self
             .tx_fifo
-            .reserve_write(total)
-            .map_err(|source| AppSessionError::DatagramFifo { source })?;
-        let copied = reservation
-            .copy_from_segments([header_bytes.as_slice(), payload])
-            .map_err(|source| AppSessionError::DatagramFifo { source })?;
-        if copied != total {
-            reservation.cancel();
-            return Err(AppSessionError::DatagramFifo {
-                source: FifoError::CommitExceedsReservation {
-                    initialized: copied,
-                    reserved: total,
-                },
-            });
-        }
-        reservation
-            .commit(copied)
+            .enqueue_segments(total, [header_bytes.as_slice(), payload])
             .map_err(|source| AppSessionError::DatagramFifo { source })?;
         self.publish_tx_enqueue(copied)?;
         Ok(payload.len())

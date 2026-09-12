@@ -72,7 +72,7 @@ use crate::http3::proto::frame::FrameType;
 use crate::http3::proto::headers::{FieldSectionValidator, MessageKind};
 use crate::http3::proto::qpack::block::decode_block;
 use crate::http3::request_fields::validate_request_field_line;
-use hammer_infra::fifo::Fifo;
+use hammer_infra::svm::fifo::Fifo;
 
 /// The phase of a client request stream, advanced one frame at a time.
 #[derive(Debug, Copy, Clone, Eq, PartialEq)]

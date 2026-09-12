@@ -6,13 +6,11 @@
 //!
 //! Session Event identity follows ADR-0010 (VPP `session_event_t` rules).
 //!
-//! Application Session control queues are single-producer queues
-//! ([`SessionMsgQueue<SingleProducer>`]) shaped like VPP `svm_msg_q` with
-//! cursor head/tail rings: the producer capability is claimed once with
-//! [`SessionMsgQueue::claim_producer`] and publishes fixed VPP-shaped control
-//! slots ([`SESSION_CTRL_MSG_MAX_SIZE`] bytes = VPP
-//! `SESSION_CTRL_MSG_MAX_SIZE`) on the CTRL ring via
-//! [`SessionProducer::enqueue_control`]. The consumer reads them with
+//! Application Session control queues use the same locked shared queue as
+//! worker event queues. They publish fixed VPP-shaped control slots (the
+//! payload contract is [`SESSION_CTRL_MSG_MAX_SIZE`], while the physical
+//! control element is the VPP `256`-byte slot) via
+//! [`SessionMsgQueue::enqueue_control`]. The consumer reads them with
 //! [`SessionMsgQueue::dequeue_control`], which returns a borrowed
 //! [`SessionControlItem`] that decodes on request. The slot carries one
 //! event-type byte plus the private fixed-layout payload selected by that
@@ -25,8 +23,8 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 use hammer_core::session::{SessionEvt, SessionEvtType};
 use hammer_infra::multi_ring_msg_queue::{
-    MultiProducer, MultiRingMsgQueue, MultiRingMsgQueueCfg, MultiRingMsgQueueError, ProducerMode,
-    RingCfg, RingMsg, SingleProducer,
+    MultiProducer, MultiRingMsgQueue, MultiRingMsgQueueCfg, MultiRingMsgQueueError, RingCfg,
+    RingMsg,
 };
 use hammer_infra::segment::Segment;
 
@@ -45,6 +43,7 @@ pub enum SessionMqRing {
 /// `session_evt_ctrl_data_t.data[SESSION_CTRL_MSG_MAX_SIZE]` (session.h:51-54).
 /// The slot is `[event_type: u8][payload: 85]`.
 pub const SESSION_CTRL_MSG_MAX_SIZE: usize = 86;
+const SESSION_CTRL_MSG_BYTES: usize = 256;
 
 /// Fixed shared-memory Session event codec size. VPP keeps event type and
 /// postponed state before a target union; Hammer preserves the fixed slot,
@@ -141,12 +140,13 @@ pub trait SessionEventQueue: Send + Sync {
 }
 
 fn session_ring_cfg(q_nitems: u32, ring_nitems: u32) -> Result<[RingCfg; 2], SessionMsgQueueError> {
-    if !q_nitems.is_power_of_two() || q_nitems < 2 || ring_nitems < 1 {
+    if q_nitems < 1 || ring_nitems < 1 {
         return Err(SessionMsgQueueError::InvalidConfig);
     }
+    let ctrl_nitems = (ring_nitems / 2).max(1);
     Ok([
         RingCfg {
-            nitems: ring_nitems,
+            nitems: ctrl_nitems,
             elsize: SESSION_EVT_BYTES,
         },
         RingCfg {
@@ -158,7 +158,7 @@ fn session_ring_cfg(q_nitems: u32, ring_nitems: u32) -> Result<[RingCfg; 2], Ses
 
 fn control_ring_cfg(q_nitems: u32, ring_nitems: u32) -> Result<[RingCfg; 2], SessionMsgQueueError> {
     let mut rings = session_ring_cfg(q_nitems, ring_nitems)?;
-    rings[SessionMqRing::Ctrl as usize].elsize = SESSION_CTRL_MSG_MAX_SIZE;
+    rings[SessionMqRing::Ctrl as usize].elsize = SESSION_CTRL_MSG_BYTES;
     Ok(rings)
 }
 
@@ -202,27 +202,21 @@ impl SessionControlItem<'_> {
 
 /// Session Message Queue: runtime wrapper over the infra multi-ring queue.
 ///
-/// `P` selects the producer mode. [`MultiProducer`] (default) is the worker
-/// event queue shape (locked producers, free-list rings). [`SingleProducer`]
-/// is the Application Session control queue shape: one capability-claimed
-/// producer ([`SessionProducer`]) publishing fixed control slots, cursor
-/// head/tail rings, and in-order consumer slot free (VPP `svm_msg_q`).
-pub struct SessionMsgQueue<P = MultiProducer> {
-    inner: MultiRingMsgQueue<P>,
+/// The queue uses one VPP-style shared lock for all producers. Ring selection
+/// is explicit at each operation, matching `svm_msg_q_alloc_msg_w_ring`.
+pub struct SessionMsgQueue {
+    inner: MultiRingMsgQueue<MultiProducer>,
     signal_atomic: Arc<AtomicBool>,
     signal_read: Option<Arc<OwnedFd>>,
     signal_write: Option<Arc<OwnedFd>>,
 }
 
-// Moving a queue between threads is sound: all shared state lives in the
-// segment and is reached through atomics. Shared references are only sound
-// for the MultiProducer queue (the locked producer protocol); the
-// SingleProducer consumer requires `&mut self` for in-order slot free, so
-// those queues are not Sync. Both properties follow from the inner queue.
-unsafe impl<P: ProducerMode> Send for SessionMsgQueue<P> {}
-unsafe impl Sync for SessionMsgQueue<MultiProducer> {}
+// All queue state is in the shared mapping and producer serialization is
+// provided by the VPP-shaped queue lock.
+unsafe impl Send for SessionMsgQueue {}
+unsafe impl Sync for SessionMsgQueue {}
 
-impl<P: ProducerMode> SessionMsgQueue<P> {
+impl SessionMsgQueue {
     /// Number of queued events, matching VPP `svm_msg_q_size`.
     #[inline]
     pub fn len(&self) -> usize {
@@ -300,7 +294,7 @@ impl<P: ProducerMode> SessionMsgQueue<P> {
         rings: &[RingCfg; 2],
     ) -> Result<Self, SessionMsgQueueError> {
         let inner = unsafe {
-            MultiRingMsgQueue::<P>::init_at(
+            MultiRingMsgQueue::<MultiProducer>::init_at(
                 seg,
                 hdr_offset,
                 &MultiRingMsgQueueCfg { q_nitems, rings },
@@ -392,9 +386,6 @@ impl<P: ProducerMode> SessionMsgQueue<P> {
 
     /// Remap an already-initialised Session Message Queue and attach optional signal fds.
     ///
-    /// The on-segment producer mode tag is validated against `P`; a mismatch
-    /// is a typed error, never a panic.
-    ///
     /// # Safety
     /// `hdr_offset` must point at a queue previously initialised with [`Self::init_at`].
     /// Every supplied descriptor must be valid and transfer ownership to the
@@ -430,14 +421,12 @@ impl<P: ProducerMode> SessionMsgQueue<P> {
                 (read, write)
             }
         };
-        let inner =
-            unsafe { MultiRingMsgQueue::<P>::from_shared(seg, hdr_offset) }.map_err(|error| {
-                match error {
-                    MultiRingMsgQueueError::ModeMismatch { expected, actual } => {
-                        SessionMsgQueueError::ModeMismatch { expected, actual }
-                    }
-                    _ => SessionMsgQueueError::InvalidConfig,
+        let inner = unsafe { MultiRingMsgQueue::<MultiProducer>::from_shared(seg, hdr_offset) }
+            .map_err(|error| match error {
+                MultiRingMsgQueueError::ModeMismatch { expected, actual } => {
+                    SessionMsgQueueError::ModeMismatch { expected, actual }
                 }
+                _ => SessionMsgQueueError::InvalidConfig,
             })?;
         Ok(Self {
             inner,
@@ -448,7 +437,7 @@ impl<P: ProducerMode> SessionMsgQueue<P> {
     }
 }
 
-impl SessionMsgQueue<MultiProducer> {
+impl SessionMsgQueue {
     /// Default Local queue: 2048 descriptors, 1024 slots per ring, SessionEvt elsize.
     pub fn with_defaults() -> Result<Self, SessionMsgQueueError> {
         Self::with_cfg(2048, 1024)
@@ -572,7 +561,7 @@ impl SessionMsgQueue<MultiProducer> {
     }
 }
 
-impl SessionEventQueue for SessionMsgQueue<MultiProducer> {
+impl SessionEventQueue for SessionMsgQueue {
     fn enqueue_io(&self, evt: SessionEvt) -> Result<(), SessionMsgQueueError> {
         self.enqueue_on(SessionMqRing::Io, evt)
     }
@@ -667,7 +656,7 @@ impl SessionEventQueue for SessionMsgQueue<MultiProducer> {
     }
 }
 
-impl SessionMsgQueue<SingleProducer> {
+impl SessionMsgQueue {
     /// Local Application Session control queue: 2048 descriptors, 1024 slots
     /// per ring, fixed [`SESSION_CTRL_MSG_MAX_SIZE`] control slots on CTRL.
     pub fn with_control_defaults() -> Result<Self, SessionMsgQueueError> {
@@ -677,7 +666,7 @@ impl SessionMsgQueue<SingleProducer> {
     /// Local Application Session control queue with explicit capacities.
     pub fn with_control_cfg(q_nitems: u32, ring_nitems: u32) -> Result<Self, SessionMsgQueueError> {
         let rings = control_ring_cfg(q_nitems, ring_nitems)?;
-        let inner = MultiRingMsgQueue::<SingleProducer>::with_cfg(MultiRingMsgQueueCfg {
+        let inner = MultiRingMsgQueue::<MultiProducer>::with_cfg(MultiRingMsgQueueCfg {
             q_nitems,
             rings: &rings,
         })
@@ -697,7 +686,7 @@ impl SessionMsgQueue<SingleProducer> {
         ring_nitems: u32,
     ) -> Result<usize, SessionMsgQueueError> {
         let rings = control_ring_cfg(q_nitems, ring_nitems)?;
-        Ok(MultiRingMsgQueue::<SingleProducer>::layout_bytes(
+        Ok(MultiRingMsgQueue::<MultiProducer>::layout_bytes(
             &MultiRingMsgQueueCfg {
                 q_nitems,
                 rings: &rings,
@@ -721,23 +710,42 @@ impl SessionMsgQueue<SingleProducer> {
         unsafe { Self::init_at_with_signal_and_rings(seg, hdr_offset, q_nitems, &rings) }
     }
 
-    /// Claim the single-producer capability for this control queue.
-    ///
-    /// The shared header claim is taken once with a compare-exchange; a
-    /// second claim (same or another mapping of the segment) is a typed
-    /// error, never a panic. The returned [`SessionProducer`] carries clones
-    /// of the signal endpoints, so the queue mapping may be dropped.
-    pub fn claim_producer(&self) -> Result<SessionProducer, SessionMsgQueueError> {
-        let producer = self.inner.claim_producer().map_err(|error| match error {
-            MultiRingMsgQueueError::ProducerClaimed => SessionMsgQueueError::ProducerClaimed,
-            _ => SessionMsgQueueError::InvalidConfig,
-        })?;
-        Ok(SessionProducer {
-            producer,
-            signal_read: self.signal_read.clone(),
-            signal_write: self.signal_write.clone(),
-            signal_atomic: Arc::clone(&self.signal_atomic),
-        })
+    /// Enqueues one concrete Session control message into the CTRL ring.
+    /// Allocation, payload write, publication, and wakeup follow the VPP
+    /// message-queue producer order while the queue lock serializes producers.
+    pub fn enqueue_control<M: super::control::SessionControlPayload>(
+        &self,
+        message: &M,
+    ) -> Result<(), SessionMsgQueueError> {
+        if self.inner.ring_element_size(SessionMqRing::Ctrl as u32) != Some(SESSION_CTRL_MSG_BYTES)
+        {
+            return Err(SessionMsgQueueError::InvalidConfig);
+        }
+        let mut guard = self.inner.lock();
+        let mut reservation = match guard.alloc(SessionMqRing::Ctrl as u32) {
+            Ok(slot) => slot,
+            Err(MultiRingMsgQueueError::QueueFull | MultiRingMsgQueueError::RingFull) => {
+                return Err(SessionMsgQueueError::ControlFull);
+            }
+            Err(_) => return Err(SessionMsgQueueError::InvalidConfig),
+        };
+        let payload = reservation.as_mut_slice();
+        payload.fill(0);
+        payload[0] = message.event_type() as u8;
+        message.encode_wire(&mut payload[1..]);
+        guard.add(reservation);
+        let became_non_empty = self.inner.len() == 1;
+        drop(guard);
+        if became_non_empty {
+            self.fire();
+        }
+        Ok(())
+    }
+
+    /// Moves a control queue into the owner-side producer handle. VPP uses the
+    /// queue lock for producer serialization; there is no producer claim tag.
+    pub fn claim_producer(self) -> Result<SessionProducer, SessionMsgQueueError> {
+        Ok(SessionProducer { queue: self })
     }
 
     /// Dequeues one borrowed control slot from the CTRL ring.
@@ -756,8 +764,7 @@ impl SessionMsgQueue<SingleProducer> {
         // SessionEvt-sized CTRL ring carries worker control events, not
         // control slots, and decoding one as a slot would misread it. Nothing
         // is consumed on this path.
-        if self.inner.ring_element_size(SessionMqRing::Ctrl as u32)
-            != Some(SESSION_CTRL_MSG_MAX_SIZE)
+        if self.inner.ring_element_size(SessionMqRing::Ctrl as u32) != Some(SESSION_CTRL_MSG_BYTES)
         {
             return Err(SessionMsgQueueError::InvalidConfig);
         }
@@ -782,18 +789,8 @@ impl SessionMsgQueue<SingleProducer> {
     }
 }
 
-/// Single-producer control capability for a Session control queue.
-///
-/// Claimed once per queue via [`SessionMsgQueue::claim_producer`]; not `Sync`
-/// by construction — one exclusive writer. Publish → descriptor → `q_tail`
-/// ordering and in-order consumer slot free follow VPP `svm_msg_q` cursor
-/// semantics; the queue's consumer is signaled only on the empty → nonempty
-/// transition, decided before the publish.
 pub struct SessionProducer {
-    producer: hammer_infra::multi_ring_msg_queue::Producer,
-    signal_read: Option<Arc<OwnedFd>>,
-    signal_write: Option<Arc<OwnedFd>>,
-    signal_atomic: Arc<AtomicBool>,
+    queue: SessionMsgQueue,
 }
 
 impl SessionProducer {
@@ -806,66 +803,17 @@ impl SessionProducer {
         &mut self,
         message: &M,
     ) -> Result<(), SessionMsgQueueError> {
-        if self.producer.ring_element_size(SessionMqRing::Ctrl as u32)
-            != Some(SESSION_CTRL_MSG_MAX_SIZE)
-        {
-            return Err(SessionMsgQueueError::InvalidConfig);
-        }
-        let mut reservation =
-            self.producer
-                .reserve(SessionMqRing::Ctrl as u32)
-                .map_err(|error| match error {
-                    MultiRingMsgQueueError::QueueFull | MultiRingMsgQueueError::RingFull => {
-                        SessionMsgQueueError::ControlFull
-                    }
-                    MultiRingMsgQueueError::InvalidConfig
-                    | MultiRingMsgQueueError::BadRing
-                    | MultiRingMsgQueueError::ProducerClaimed
-                    | MultiRingMsgQueueError::ModeMismatch { .. } => {
-                        SessionMsgQueueError::InvalidConfig
-                    }
-                })?;
-        let payload = reservation.payload_mut();
-        payload[0] = message.event_type() as u8;
-        message.encode_wire(&mut payload[1..]);
-        let was_empty = reservation.publish();
-        drop(reservation);
-        // The message is already committed: a failed wakeup is logged, never
-        // surfaced as an enqueue error (a retry would duplicate the message).
-        if was_empty && let Err(error) = self.signal() {
-            tracing::warn!(%error, "failed to signal Session control consumer");
-        }
-        Ok(())
+        self.queue.enqueue_control(message)
     }
 
     /// Read endpoint of the queue's signal pair, when owned.
     pub fn read_fd(&self) -> Option<RawFd> {
-        self.signal_read.as_ref().map(|signal| signal.as_raw_fd())
+        self.queue.read_fd()
     }
 
     /// Write endpoint of the queue's signal pair, when owned.
     pub fn write_fd(&self) -> Option<RawFd> {
-        self.signal_write.as_ref().map(|signal| signal.as_raw_fd())
-    }
-
-    /// Signal the consumer: a nonblocking signal write, or the shared atomic
-    /// flag when no signal pair is owned. `WouldBlock` means the consumer is
-    /// already signaled, so it is not an error.
-    fn signal(&self) -> Result<(), SessionMsgQueueError> {
-        if let Some(signal_write) = &self.signal_write {
-            let fd = signal_write.as_raw_fd();
-            let val: [u8; 1] = [1];
-            let ret = unsafe { libc::write(fd, val.as_ptr() as *const libc::c_void, 1) };
-            if ret < 0 {
-                let error = std::io::Error::last_os_error();
-                if error.kind() != std::io::ErrorKind::WouldBlock {
-                    return Err(SessionMsgQueueError::SignalWrite);
-                }
-            }
-        } else {
-            self.signal_atomic.store(true, Ordering::Release);
-        }
-        Ok(())
+        self.queue.write_fd()
     }
 }
 

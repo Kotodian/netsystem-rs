@@ -26,10 +26,10 @@
 //! buffer (adjacent-FIFO style, no copied payload ownership); no movement
 //! between FIFOs happens in this slice.
 //!
-//! [`publish_request`] writes the same layout to a FIFO in one
-//! reserve/commit: every length is validated first, then metadata and
-//! payloads are scattered from a fixed stack buffer, and the commit is the
-//! only visibility point (single producer, no locks, no event flag).
+//! [`publish_request`] writes the same layout to a FIFO with one
+//! `enqueue_segments` publication: every length is validated first, then
+//! metadata and payloads are copied from borrowed segments (single producer,
+//! no locks, no event flag).
 //!
 //! Hammer differences (documented, bytes identical to VPP on x86_64):
 //! - byte order is explicit little-endian; VPP memcpys native-endian structs.
@@ -48,7 +48,7 @@ mod types;
 pub(crate) use body::{BodyAccumulator, BodyError};
 pub use types::*;
 
-use hammer_infra::fifo::{Fifo, FifoError, FifoWriteReservation};
+use hammer_infra::svm::fifo::{Fifo, FifoError};
 
 /// Size of the fixed `http_msg_t` header on the wire.
 pub const MSG_HEADER_LEN: usize = 88;
@@ -366,8 +366,7 @@ impl WireLayout {
 }
 
 /// Why a FIFO publish failed. `Encode` and `Capacity` leave the FIFO
-/// unchanged; `Fifo` covers reservation/copy/commit failures, which roll
-/// back so nothing becomes visible.
+/// unchanged; `Fifo` covers the direct segmented enqueue operation.
 #[derive(Debug, PartialEq, Eq)]
 #[allow(dead_code)] // exercised from tests; wired to the app publisher later
 pub(crate) enum PublishError {
@@ -376,7 +375,7 @@ pub(crate) enum PublishError {
     /// The FIFO cannot hold the whole request. `want_deq_notification` was
     /// armed so the producer is signalled when space frees up.
     Capacity { requested: usize, available: usize },
-    /// Reservation, scatter copy, or commit failed on the FIFO.
+    /// Segmented copy or publication failed on the FIFO.
     Fifo(FifoError),
 }
 
@@ -401,16 +400,15 @@ impl core::fmt::Display for PublishError {
 /// (`third_party/vpp/src/plugins/hs_apps/http_client.c:229-250`): the
 /// 88-byte `http_msg_t`, then the target path, then the header list, then
 /// the body. Synchronization mirrors that path: the caller is the single
-/// producer, `reserve_write` re-checks the FIFO head with an acquire load,
-/// and `commit` is the only visibility point (a release tail publication).
+/// producer, and `enqueue_segments` is the only visibility point (a release
+/// tail publication).
 /// No FIFO event flag is raised here.
 ///
 /// Every length is computed and validated before anything is reserved. If
 /// the FIFO cannot hold the whole request, the capacity preflight arms
 /// `want_deq_notification` and returns with the FIFO untouched; otherwise
-/// one `reserve_write(total)` is followed by a scatter copy (metadata from
-/// a fixed stack buffer, path, header entries, body) and a single commit.
-/// Any copy or commit failure cancels the reservation, exposing zero bytes.
+/// one `enqueue_segments(total, ...)` copies metadata from a fixed stack
+/// buffer, the path, header entries, and body before publishing the tail.
 #[allow(dead_code)] // tests exercise it; the app-session publisher wires it in a later seam
 pub(crate) fn publish_request(fifo: &Fifo, req: &Request<'_>) -> Result<(), PublishError> {
     let total = req.encoded_len().map_err(PublishError::Encode)?;
@@ -423,80 +421,54 @@ pub(crate) fn publish_request(fifo: &Fifo, req: &Request<'_>) -> Result<(), Publ
             available,
         });
     }
-    let mut reservation = fifo.reserve_write(total).map_err(PublishError::Fifo)?;
     let mut meta = [0u8; MSG_HEADER_LEN];
     req.encode_msg_header(&layout, &mut meta);
-    scatter(&mut reservation, [&meta[..]]).map_err(PublishError::Fifo)?;
-    scatter(&mut reservation, [req.target_path]).map_err(PublishError::Fifo)?;
-    scatter_headers(&mut reservation, req.headers).map_err(PublishError::Fifo)?;
-    let copied = scatter(&mut reservation, [req.body]).map_err(PublishError::Fifo)?;
-    if copied != total {
-        reservation.cancel();
-        return Err(PublishError::Fifo(FifoError::CommitExceedsReservation {
-            initialized: copied,
-            reserved: total,
-        }));
-    }
-    match reservation.commit(copied) {
-        Ok(_) => Ok(()),
-        Err(source) => {
-            reservation.cancel();
-            Err(PublishError::Fifo(source))
-        }
-    }
+    let header_bytes = encode_header_bytes(req.headers).map_err(PublishError::Fifo)?;
+    fifo.enqueue_segments(
+        total,
+        [
+            &meta[..],
+            req.target_path,
+            header_bytes.as_slice(),
+            req.body,
+        ],
+    )
+    .map(|_| ())
+    .map_err(PublishError::Fifo)
 }
 
-/// Scatter-copy one group of source slices into `reservation`, returning the
-/// cumulative byte count; on failure the reservation is cancelled so no
-/// bytes become visible.
-#[allow(dead_code)] // used only by the FIFO publish paths, wired in a later seam
-fn scatter<I, S>(reservation: &mut FifoWriteReservation<'_>, segs: I) -> Result<usize, FifoError>
-where
-    I: IntoIterator<Item = S>,
-    S: AsRef<[u8]>,
-{
-    let copied = reservation.copy_from_segments(segs);
-    if copied.is_err() {
-        reservation.cancel();
-    }
-    copied
-}
-
-/// Scatter-copy the header-list entries into `reservation`, each as its
-/// 8-byte prefix plus the value (name/value split for custom names), all
-/// prefixes reusing one stack buffer; returns the cumulative byte count. On
-/// failure the reservation is cancelled so no bytes become visible.
-#[allow(dead_code)] // used only by the FIFO publish paths, wired in a later seam
-fn scatter_headers(
-    reservation: &mut FifoWriteReservation<'_>,
-    headers: &[AppHeader<'_>],
-) -> Result<usize, FifoError> {
-    let mut prefix = [0u8; 8];
-    let mut copied = 0usize;
+fn encode_header_bytes(headers: &[AppHeader<'_>]) -> Result<Vec<u8>, FifoError> {
+    let mut encoded = Vec::new();
     for header in headers {
-        copied = match *header {
+        match *header {
             AppHeader::Known { flags, name, value } => {
+                let mut prefix = [0u8; 8];
                 let mut w = put_u16(&mut prefix, 0, flags.bits());
                 w = put_u16(&mut prefix, w, name);
                 put_u32(&mut prefix, w, value.len() as u32);
-                scatter(reservation, [&prefix[..], value])?
+                encoded.extend_from_slice(&prefix);
+                encoded.extend_from_slice(value);
             }
             AppHeader::Custom { flags, name, value } => {
+                let mut prefix = [0u8; 8];
                 let mut w = put_u16(&mut prefix, 0, (flags | FieldLineFlags::CUSTOM_NAME).bits());
                 w = put_u16(&mut prefix, w, name.len() as u16);
                 put_u32(&mut prefix, w, value.len() as u32);
-                scatter(reservation, [&prefix[..4], name, &prefix[4..], value])?
+                encoded.extend_from_slice(&prefix[..4]);
+                encoded.extend_from_slice(name);
+                encoded.extend_from_slice(&prefix[4..]);
+                encoded.extend_from_slice(value);
             }
-        };
+        }
     }
-    Ok(copied)
+    Ok(encoded)
 }
 
 // --- Inbound publish: server/transport -> app --------------------------------
 
 /// One inbound request to publish: a request received from the transport and
 /// delivered to the app. All payloads are borrowed slices; the encoder writes
-/// the complete VPP byte layout into a FIFO in one reserve/commit.
+/// the complete VPP byte layout into a FIFO in one segmented enqueue.
 #[derive(Debug, Clone, Copy)]
 #[allow(dead_code)] // tests exercise it; the app-session publisher wires it in a later seam
 pub(crate) struct InboundRequest<'a> {
@@ -659,9 +631,9 @@ impl InboundLayout {
 /// Synchronization mirrors [`publish_request`]: the caller is the single
 /// producer, a capacity preflight (`max_enqueue`) arms
 /// `want_deq_notification` and returns with the FIFO untouched on failure,
-/// then one `reserve_write(total)` is followed by a scatter copy (the fixed
-/// 88-byte header from a stack buffer, then each borrowed span) and a single
-/// commit as the only visibility point. No FIFO event flag is raised here.
+/// then one `enqueue_segments(total, ...)` copies the fixed 88-byte header
+/// from a stack buffer followed by each borrowed span. No FIFO event flag is
+/// raised here.
 ///
 /// Hammer differences (documented): VPP servers may stream large bodies out
 /// of the data area (`HTTP_DATA_STREAMING`); this seam publishes one complete
@@ -685,29 +657,22 @@ pub(crate) fn publish_inbound_request(
             available,
         });
     }
-    let mut reservation = fifo.reserve_write(total).map_err(PublishError::Fifo)?;
     let mut meta = [0u8; MSG_HEADER_LEN];
     req.encode_msg_header(&layout, &mut meta);
-    scatter(&mut reservation, [&meta[..]]).map_err(PublishError::Fifo)?;
-    scatter(&mut reservation, [req.target_authority]).map_err(PublishError::Fifo)?;
-    scatter(&mut reservation, [req.target_path]).map_err(PublishError::Fifo)?;
-    scatter(&mut reservation, [req.target_query]).map_err(PublishError::Fifo)?;
-    scatter_headers(&mut reservation, req.headers).map_err(PublishError::Fifo)?;
-    let copied = scatter(&mut reservation, [req.body]).map_err(PublishError::Fifo)?;
-    if copied != total {
-        reservation.cancel();
-        return Err(PublishError::Fifo(FifoError::CommitExceedsReservation {
-            initialized: copied,
-            reserved: total,
-        }));
-    }
-    match reservation.commit(copied) {
-        Ok(_) => Ok(()),
-        Err(source) => {
-            reservation.cancel();
-            Err(PublishError::Fifo(source))
-        }
-    }
+    let header_bytes = encode_header_bytes(req.headers).map_err(PublishError::Fifo)?;
+    fifo.enqueue_segments(
+        total,
+        [
+            &meta[..],
+            req.target_authority,
+            req.target_path,
+            req.target_query,
+            header_bytes.as_slice(),
+            req.body,
+        ],
+    )
+    .map(|_| ())
+    .map_err(PublishError::Fifo)
 }
 
 /// Publish one body chunk to `fifo` all-or-nothing.
@@ -716,11 +681,9 @@ pub(crate) fn publish_inbound_request(
 /// (`third_party/vpp/src/plugins/http/http3/http3.c:1184-1263`): the whole
 /// chunk is capacity-checked first, and zero or short capacity arms the
 /// dequeue notification and returns with the FIFO untouched, without any
-/// reservation or mutation; otherwise one `reserve_write` is followed by a
-/// single scatter copy of the borrowed chunk directly into the reservation
-/// segments (no temporary buffer, no separate sizing pass) and one commit as
-/// the only visibility point. A reservation is cancelled only on a pre-commit
-/// failure; committed bytes are never dequeued as rollback.
+/// mutation; otherwise one `enqueue_segments` copies the borrowed chunk and
+/// publishes it as the only visibility point, without an intermediate payload
+/// buffer.
 ///
 /// Hammer difference (documented): the VPP state machine copies at most
 /// `min(max_deq, max_enq)` bytes per call and carries the remainder in the
@@ -740,22 +703,9 @@ pub(crate) fn publish_body_chunk(fifo: &Fifo, chunk: &[u8]) -> Result<(), Publis
             available,
         });
     }
-    let mut reservation = fifo.reserve_write(total).map_err(PublishError::Fifo)?;
-    let copied = scatter(&mut reservation, [chunk]).map_err(PublishError::Fifo)?;
-    if copied != total {
-        reservation.cancel();
-        return Err(PublishError::Fifo(FifoError::CommitExceedsReservation {
-            initialized: copied,
-            reserved: total,
-        }));
-    }
-    match reservation.commit(copied) {
-        Ok(_) => Ok(()),
-        Err(source) => {
-            reservation.cancel();
-            Err(PublishError::Fifo(source))
-        }
-    }
+    fifo.enqueue_segments(total, [chunk])
+        .map(|_| ())
+        .map_err(PublishError::Fifo)
 }
 
 /// Total wire size of a header list: each entry's 8-byte prefix plus its

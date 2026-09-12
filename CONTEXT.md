@@ -621,29 +621,95 @@ _Avoid_: generated transport frame, runtime registry snapshot, CLI syntax
 
 ## SVM Language
 
-These are target domain terms. The current implementation still uses
-`Segment`, an mmap-oriented `SvmRegion`, `Fifo`, and `MultiRingMsgQueue`.
+These are target domain terms. The SVM owner modules live in one subtree,
+`crates/hammer-infra/src/svm.rs` plus `crates/hammer-infra/src/svm/`
+(`segment`, `region`, `queue`, `msg_queue`, `fifo`, `fifo_segment`); the legacy
+`Segment` and `MultiRingMsgQueue` remain at the crate root until they are
+deleted. The offset-based region owner is implemented in `svm/region.rs`,
+`svm/region_heap.rs`, and `svm/hash_map.rs`; the remaining SVM users still run
+on the legacy `Segment`, `Fifo`, and `MultiRingMsgQueue` until they are
+migrated to it.
 The proposed ownership, Rust fields/method signatures, deletion inventory,
 and approval status are recorded in
-[ADR-0011](docs/adr/0011-vpp-style-svm-ownership-and-multiarch.md).
+[ADR-0011](docs/adr/0011-vpp-style-svm-ownership-and-multiarch.md); the region
+redesign (offset heap, name table, independent subregions) is specified in
+section 12 of that ADR.
 Terminology here is not a claim that the migration has been implemented.
 
-**SvmSegment**:
-The SVM mapping and backing-resource owner used by shared regions, FIFO
-segments, and API memory bootstrap. A segment is distinct from the allocator
-or protocol state placed in its storage.
-_Avoid_: Segment, shared-memory wrapper, application segment owner
+**SsvmPrivate**:
+The shared-VM mapping owner (`ssvm_private_t`) used by shared regions, FIFO
+segments, and API memory bootstrap. It owns the mapping, the backing
+descriptor, and the mapping's shared header; the allocator or protocol state
+placed in its payload belongs to the region or FIFO segment that lays it out.
+The mapping records `ssvm_va = 0` unless a creator asks for a fixed address.
+_Avoid_: SvmSegment, Segment, shared-memory wrapper, application segment owner
 
 **SvmRegion**:
 A general SVM region with its own metadata, data allocation authority, client
-membership, and published root. It can occupy an existing SvmSegment and is
-not limited to App Sessions.
-_Avoid_: mmap wrapper, FIFO segment, API registration
+membership, and published root. Its segment payload is a fixed header followed
+by a metadata heap and, when present, a data portion; every shared location is
+an offset, never a process-local pointer. A region does not own the mapping,
+descriptor, or backend, and it is closed rather than repaired when its lock
+owner dies. It can occupy an existing SsvmPrivate mapping and is not limited to App
+Sessions.
+_Avoid_: mmap wrapper, FIFO segment, API registration, RegionName, root_path, backing_file
 
 **SvmRegionMain**:
-The authority for the named root and subregions of SVM. A region embedded in
-a directly exchanged segment does not require named-root registration.
-_Avoid_: API Main, process-global memory allocator
+The named-root authority of a subdivided region. It lives in the root region's
+metadata heap and holds the region name table and the monotonic subregion
+identity counter. It does not reserve or carve a virtual-address range and does
+not own subregion mappings; each subregion is its own SsvmPrivate mapping whose
+descriptor is exchanged by the daemon outside the shared region.
+_Avoid_: API Main, process-global memory allocator, subregion pool, name hash
+
+**SvmRegionHeap**:
+The offset-based block allocator that owns a region's metadata heap. Blocks
+carry adjacent-block size and use flags in their headers, free blocks are
+linked by offsets into fixed bins, and the bytes preceding a user area point
+back at its block header, so no process-private pointer is stored in shared
+memory. Exhaustion, double free, and block corruption terminate the process
+with structured facts instead of returning a recoverable error. The heap has no
+lock of its own; the region lock serializes access.
+
+A heap is a field of the region header, never inside the arena it manages, so
+it is owned by the region rather than by any process or Rust value: there is no
+destructor, no destroy operation, and no way to move a descriptor out of shared
+memory. Only region creation initializes it, once, before the region is
+published; attach validates and never repairs it. Its range is fixed at
+creation and only its contents grow. It disappears with the segment mapping
+after the name is removed, and a region whose lock owner died is closed instead
+of having its heap reused.
+_Avoid_: local heap, Main Heap, talc allocator, bump allocator
+
+**SvmHashMap**:
+The byte-string-keyed hash table used for the region name table. Its semantics
+match the standard library hash map, but slots, key bytes, and links are
+offsets in the owning SvmRegionHeap, the table owns its key bytes in that heap,
+and hashing uses a fixed-seed hasher so another process reaches the same
+bucket. It has no destructor and no internal lock.
+_Avoid_: std HashMap, Bihash, name hash, RegionName
+
+**Subregion**:
+An independently mapped region registered by name under a subdivided root
+region. It is located by name lookup in the root region's name table and
+identified by a monotonic, never-reused subregion identity, so a stale identity
+never silently addresses another subregion. Its mapping descriptor is exchanged
+by the daemon, not derived from a virtual-address bitmap.
+_Avoid_: VA slice, child region, subregion pool
+
+**Region Membership**:
+One process's registration in a region's client list, written in that region's
+metadata heap and reclaimed by pid liveness probing. Registration is an RAII
+handle; recovery records no process start time and never reuses a registration
+for a different process.
+_Avoid_: client vec, connection handle, worker registration
+
+**Region Owner Death**:
+Robust-mutex owner death marks the region failed and later access reports the
+dead owner instead of pretending the lock was acquired; the mutex is never
+reinitialized in place. A fresh region identity replaces the failed one only
+after participants stop using the old region.
+_Avoid_: force unlock, mutex rebuild, consistent-but-unknown
 
 **SvmFifoSegment**:
 The SVM owner of FIFO storage allocation, slices, and reusable FIFO headers
