@@ -1,14 +1,8 @@
 //! VPP-style fixed-size shared-memory queues.
-//!
-//! The queue owns only its shared header and synchronization state. Allocation
-//! and mapping lifetime belong to the caller that owns the SVM region. The
-//! constructors take a mapping only long enough to validate an offset and
-//! resolve the queue pointer; the returned handle does not retain that mapping.
 
 use std::alloc::{Layout, LayoutError};
 use std::io;
-use std::marker::PhantomData;
-use std::mem::{MaybeUninit, align_of, size_of};
+use std::mem::{MaybeUninit, size_of};
 use std::os::fd::{AsRawFd, OwnedFd};
 use std::ptr::NonNull;
 use std::time::Duration;
@@ -20,19 +14,21 @@ use posix_sync::mutex::guards::{MutexGuard, RobustGuardContainer, StandardGuard}
 use posix_sync::mutex::{
     BorrowedMutex, MutexBuilder, MutexSharing, RawMutexAlloc, robustness_markers::Robust,
 };
-use zerocopy::{FromBytes, Immutable, IntoBytes, KnownLayout};
 
 use crate::svm::ssvm::{SsvmError, SsvmPrivate};
 
 const CACHE_LINE_BYTES: usize = 64;
 
-// The mapping is owned by the caller. This anchor only supplies the lifetime
-// required by posix-sync's borrowed process-shared primitives.
+// posix-sync ties a borrowed process-shared primitive to an address-lifetime
+// token. The mapping owner keeps the actual mapping alive; this token only
+// prevents the queue handle from becoming self-referential.
 static SVM_QUEUE_MAPPING_ANCHOR: () = ();
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SvmQueueConfig {
-    pub capacity: u32,
+    pub nels: u32,
+    pub elsize: u32,
+    pub consumer_pid: i32,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -51,10 +47,10 @@ pub enum SvmQueueOperation {
 
 #[derive(Debug, thiserror::Error)]
 pub enum SvmQueueError {
-    #[error("queue capacity must be positive")]
+    #[error("queue element count must be positive")]
     ZeroCapacity,
-    #[error("queue element type must have non-zero size")]
-    ZeroSizedElement,
+    #[error("queue element size must be positive")]
+    ZeroElementSize,
     #[error("queue layout is too large")]
     LayoutOverflow,
     #[error("queue capacity is full")]
@@ -69,6 +65,8 @@ pub enum SvmQueueError {
     InvalidHeader,
     #[error("queue element size mismatch: requested {requested} bytes, stored {stored} bytes")]
     ElementSizeMismatch { requested: usize, stored: usize },
+    #[error("queue element buffer has length {actual}, expected {expected}")]
+    ElementLengthMismatch { expected: usize, actual: usize },
     #[error("queue offset {offset} is outside the segment")]
     InvalidOffset { offset: u64 },
     #[error("queue segment operation failed: {0}")]
@@ -106,96 +104,88 @@ pub enum SvmQueueError {
     Layout(#[from] LayoutError),
 }
 
-/// Shared queue header. The element bytes begin immediately after this header.
+/// VPP `svm_queue_t`. The flexible `data[]` region follows this header in the
+/// same caller-owned allocation and is addressed by runtime `elsize`.
 #[repr(C, align(64))]
 struct SvmQueueHeader {
     mutex: MaybeUninit<RawMutexAlloc>,
     condvar: MaybeUninit<RawCondvarAlloc>,
     head: u32,
     tail: u32,
-    current_size: u32,
-    max_size: u32,
-    element_size: u32,
+    cursize: u32,
+    maxsize: u32,
+    elsize: u32,
     consumer_pid: i32,
     producer_evtfd: i32,
     consumer_evtfd: i32,
 }
 
-/// A process-local pointer to a queue in shared memory. The caller that owns
-/// the mapping and allocation must keep both alive until every queue handle is
-/// dropped and the shared synchronization objects are destroyed.
-pub struct SvmQueue<T> {
+pub struct SvmQueue {
     header: NonNull<SvmQueueHeader>,
     mutex: BorrowedMutex<'static, Robust>,
     condvar: BorrowedCondvar<'static>,
-    producer_evtfd: Option<OwnedFd>,
-    consumer_evtfd: Option<OwnedFd>,
-    _element: PhantomData<T>,
+    producer_event_fd: Option<OwnedFd>,
+    consumer_event_fd: Option<OwnedFd>,
 }
 
-/// A queue mutex guard. Dropping it unlocks the shared mutex.
-pub struct SvmQueueLock<'queue, T> {
-    queue: &'queue SvmQueue<T>,
+pub struct SvmQueueLock<'queue> {
+    queue: &'queue SvmQueue,
     guard: StandardGuard<'queue>,
+    nowait: bool,
 }
 
-unsafe impl<T: Send> Send for SvmQueue<T> {}
-unsafe impl<T: Send + Sync> Sync for SvmQueue<T> {}
+unsafe impl Send for SvmQueue {}
+unsafe impl Sync for SvmQueue {}
 
-impl<T> SvmQueue<T>
-where
-    T: Copy + FromBytes + IntoBytes + KnownLayout + Immutable,
-{
+impl SvmQueue {
     pub fn layout(config: &SvmQueueConfig) -> Result<Layout, SvmQueueError> {
-        validate_config::<T>(config)?;
+        validate_config(config)?;
         let bytes = size_of::<SvmQueueHeader>()
             .checked_add(
-                (config.capacity as usize)
-                    .checked_mul(size_of::<T>())
+                (config.nels as usize)
+                    .checked_mul(config.elsize as usize)
                     .ok_or(SvmQueueError::LayoutOverflow)?,
             )
             .ok_or(SvmQueueError::LayoutOverflow)?;
         Layout::from_size_align(bytes, CACHE_LINE_BYTES).map_err(SvmQueueError::Layout)
     }
 
-    /// Initializes a queue at a caller-owned segment offset.
-    ///
-    /// # Safety
-    /// The caller must own the allocation at `offset`, keep the mapping alive
-    /// for every returned queue handle, and ensure no initialized queue already
-    /// occupies the range.
+    /// Initializes VPP's header and its inline `data[]` region at an existing
+    /// caller-owned allocation in the mapped segment.
     pub unsafe fn init_at(
         segment: &SsvmPrivate,
         offset: u64,
         config: &SvmQueueConfig,
-        consumer_pid: i32,
     ) -> Result<Self, SvmQueueError> {
         let layout = Self::layout(config)?;
-        let header_ptr = segment.offset_ptr(offset, layout.size(), layout.align())?;
-        let header = header_ptr.cast::<SvmQueueHeader>();
+        let header = NonNull::new(
+            segment
+                .offset_ptr(offset, layout.size(), layout.align())?
+                .cast::<SvmQueueHeader>(),
+        )
+        .expect("queue pointer");
         unsafe {
             std::ptr::write(
-                header,
+                header.as_ptr(),
                 SvmQueueHeader {
                     mutex: MaybeUninit::uninit(),
                     condvar: MaybeUninit::uninit(),
                     head: 0,
                     tail: 0,
-                    current_size: 0,
-                    max_size: config.capacity,
-                    element_size: size_of::<T>() as u32,
-                    consumer_pid,
+                    cursize: 0,
+                    maxsize: config.nels,
+                    elsize: config.elsize,
+                    consumer_pid: config.consumer_pid,
                     producer_evtfd: -1,
                     consumer_evtfd: -1,
                 },
             );
         }
-
         let mutex = unsafe {
             MutexBuilder::<Robust>::new()
                 .with_sharing(MutexSharing::Shared)
                 .build_borrowed(
-                    std::ptr::addr_of_mut!((*header).mutex).cast(),
+                    std::ptr::addr_of_mut!((*header.as_ptr()).mutex).cast(),
                     &SVM_QUEUE_MAPPING_ANCHOR,
                 )
         };
@@ -204,128 +194,111 @@ where
                 .with_sharing(CondvarSharing::Shared)
                 .with_clock(CondvarClock::Monotonic)
                 .build_borrowed(
-                    std::ptr::addr_of_mut!((*header).condvar).cast(),
+                    std::ptr::addr_of_mut!((*header.as_ptr()).condvar).cast(),
                     &SVM_QUEUE_MAPPING_ANCHOR,
                 )
         };
         Ok(Self {
-            header: NonNull::new(header).expect("segment offset returned a null queue pointer"),
+            header,
             mutex,
             condvar,
-            producer_evtfd: None,
-            consumer_evtfd: None,
-            _element: PhantomData,
+            producer_event_fd: None,
+            consumer_event_fd: None,
         })
     }
 
-    /// Attaches to an initialized queue without reconstructing its allocator.
-    ///
-    /// # Safety
-    /// The caller must keep the mapping and allocation alive for the returned
-    /// handle and must attach only to a queue initialized by this layout.
     pub unsafe fn attach(segment: &SsvmPrivate, offset: u64) -> Result<Self, SvmQueueError> {
-        let header_ptr =
-            segment.offset_ptr(offset, size_of::<SvmQueueHeader>(), CACHE_LINE_BYTES)?;
-        let header = header_ptr.cast::<SvmQueueHeader>();
-        let stored = unsafe { &*header };
-        if stored.max_size == 0 || stored.element_size == 0 {
-            return Err(SvmQueueError::InvalidHeader);
-        }
-        if stored.head >= stored.max_size
-            || stored.tail >= stored.max_size
-            || stored.current_size > stored.max_size
+        let header = NonNull::new(
+            segment
+                .offset_ptr(offset, size_of::<SvmQueueHeader>(), CACHE_LINE_BYTES)?
+                .cast::<SvmQueueHeader>(),
+        )
+        .expect("queue pointer");
+        let stored = unsafe { header.as_ref() };
+        if stored.maxsize == 0
+            || stored.elsize == 0
+            || stored.head >= stored.maxsize
+            || stored.tail >= stored.maxsize
+            || stored.cursize > stored.maxsize
         {
             return Err(SvmQueueError::InvalidHeader);
         }
-        if align_of::<T>() > CACHE_LINE_BYTES {
-            return Err(SvmQueueError::LayoutOverflow);
-        }
         let bytes = size_of::<SvmQueueHeader>()
             .checked_add(
-                (stored.max_size as usize)
-                    .checked_mul(stored.element_size as usize)
+                (stored.maxsize as usize)
+                    .checked_mul(stored.elsize as usize)
                     .ok_or(SvmQueueError::LayoutOverflow)?,
             )
             .ok_or(SvmQueueError::LayoutOverflow)?;
         segment.offset_ptr(offset, bytes, CACHE_LINE_BYTES)?;
-        if stored.element_size as usize != size_of::<T>() {
-            return Err(SvmQueueError::ElementSizeMismatch {
-                requested: size_of::<T>(),
-                stored: stored.element_size as usize,
-            });
-        }
-
         let mutex = unsafe {
             BorrowedMutex::<Robust>::from_raw(
-                std::ptr::addr_of_mut!((*header).mutex).cast(),
+                std::ptr::addr_of_mut!((*header.as_ptr()).mutex).cast(),
                 &SVM_QUEUE_MAPPING_ANCHOR,
             )
         };
         let condvar = unsafe {
             BorrowedCondvar::from_raw(
-                std::ptr::addr_of_mut!((*header).condvar).cast(),
+                std::ptr::addr_of_mut!((*header.as_ptr()).condvar).cast(),
                 &SVM_QUEUE_MAPPING_ANCHOR,
                 CondvarClock::Monotonic,
             )
         };
         Ok(Self {
-            header: NonNull::new(header).expect("segment offset returned a null queue pointer"),
+            header,
             mutex,
             condvar,
-            producer_evtfd: None,
-            consumer_evtfd: None,
-            _element: PhantomData,
+            producer_event_fd: None,
+            consumer_event_fd: None,
         })
     }
 
     pub fn capacity(&self) -> usize {
-        self.header().max_size as usize
-    }
-
-    pub fn max_size(&self) -> usize {
-        self.capacity()
+        self.header().maxsize as usize
     }
 
     pub fn element_size(&self) -> usize {
-        self.header().element_size as usize
+        self.header().elsize as usize
     }
 
     pub fn consumer_pid(&self) -> i32 {
         self.header().consumer_pid
     }
 
-    pub fn add(&self, value: T, nowait: bool) -> Result<(), SvmQueueError> {
+    pub fn add(&self, element: &[u8], nowait: bool) -> Result<(), SvmQueueError> {
+        validate_element(self.element_size(), element)?;
         let mut lock = if nowait {
             self.try_lock()?
         } else {
             self.lock()?
         };
-        if nowait && lock.queue.header().current_size == lock.queue.header().max_size {
-            return Err(SvmQueueError::QueueFull);
-        }
-        lock.add_nolock(value)
+        lock.add_nolock(element)
     }
 
-    pub fn add2(&self, first: T, second: T, nowait: bool) -> Result<(), SvmQueueError> {
+    pub fn add2(&self, first: &[u8], second: &[u8], nowait: bool) -> Result<(), SvmQueueError> {
+        validate_element(self.element_size(), first)?;
+        validate_element(self.element_size(), second)?;
         let mut lock = if nowait {
             self.try_lock()?
         } else {
             self.lock()?
         };
-        if nowait && lock.queue.header().max_size - lock.queue.header().current_size < 2 {
-            return Err(SvmQueueError::QueueFull);
-        }
-        lock.add_pair_nolock(first, second)
+        lock.add2_nolock(first, second)
     }
 
-    pub fn sub(&self, conditional_wait: SvmQueueConditionalWait) -> Result<T, SvmQueueError> {
+    pub fn sub(
+        &self,
+        element: &mut [u8],
+        conditional_wait: SvmQueueConditionalWait,
+    ) -> Result<(), SvmQueueError> {
+        validate_element(self.element_size(), element)?;
         let mut lock = match conditional_wait {
             SvmQueueConditionalWait::Nowait => self.try_lock()?,
             SvmQueueConditionalWait::Wait | SvmQueueConditionalWait::TimedWait(_) => self.lock()?,
         };
         loop {
-            if lock.queue.header().current_size != 0 {
-                return lock.sub_one(lock.queue.header().max_size);
+            if lock.queue.header().cursize != 0 {
+                return lock.sub_nolock(element);
             }
             match conditional_wait {
                 SvmQueueConditionalWait::Nowait => return Err(SvmQueueError::Empty),
@@ -339,17 +312,19 @@ where
         }
     }
 
-    pub fn sub2(&self) -> Result<Option<T>, SvmQueueError> {
+    pub fn sub2(&self, element: &mut [u8]) -> Result<bool, SvmQueueError> {
+        validate_element(self.element_size(), element)?;
         let mut lock = self.lock()?;
-        if lock.queue.header().current_size == 0 {
-            return Ok(None);
+        if lock.queue.header().cursize == 0 {
+            return Ok(false);
         }
-        lock.sub_one(lock.queue.header().max_size / 2).map(Some)
+        lock.sub_nolock(element)?;
+        Ok(true)
     }
 
     pub fn len(&self) -> Result<usize, SvmQueueError> {
-        let lock = self.lock()?;
-        Ok(lock.queue.header().current_size as usize)
+        let _guard = self.lock()?;
+        Ok(self.header().cursize as usize)
     }
 
     pub fn is_empty(&self) -> Result<bool, SvmQueueError> {
@@ -357,25 +332,38 @@ where
     }
 
     pub fn is_full(&self) -> Result<bool, SvmQueueError> {
-        let lock = self.lock()?;
-        Ok(lock.queue.header().current_size == lock.queue.header().max_size)
+        let _guard = self.lock()?;
+        Ok(self.header().cursize == self.header().maxsize)
     }
 
-    pub fn lock(&self) -> Result<SvmQueueLock<'_, T>, SvmQueueError> {
-        let guard = self.acquire(false)?;
-        Ok(SvmQueueLock { queue: self, guard })
+    pub fn lock(&self) -> Result<SvmQueueLock<'_>, SvmQueueError> {
+        Ok(SvmQueueLock {
+            queue: self,
+            guard: self.acquire(false)?,
+            nowait: false,
+        })
     }
 
-    pub fn try_lock(&self) -> Result<SvmQueueLock<'_, T>, SvmQueueError> {
-        let guard = self.acquire(true)?;
-        Ok(SvmQueueLock { queue: self, guard })
+    pub fn try_lock(&self) -> Result<SvmQueueLock<'_>, SvmQueueError> {
+        Ok(SvmQueueLock {
+            queue: self,
+            guard: self.acquire(true)?,
+            nowait: true,
+        })
     }
 
-    /// Destroys the shared synchronization objects. Allocation is released by
-    /// the caller's region/heap owner after this method returns.
-    ///
-    /// # Safety
-    /// No queue handle, waiter, or operation in any process may remain.
+    pub fn set_producer_event_fd(&mut self, fd: OwnedFd) {
+        self.header_mut().producer_evtfd = fd.as_raw_fd();
+        self.producer_event_fd = Some(fd);
+    }
+
+    pub fn set_consumer_event_fd(&mut self, fd: OwnedFd) {
+        self.header_mut().consumer_evtfd = fd.as_raw_fd();
+        self.consumer_event_fd = Some(fd);
+    }
+
+    /// Destroys the process-shared synchronization objects. The caller frees
+    /// the enclosing allocation through its mapping/region owner.
     pub unsafe fn destroy(self) -> Result<(), SvmQueueError> {
         unsafe {
             self.mutex.destroy();
@@ -384,30 +372,15 @@ where
         Ok(())
     }
 
-    pub fn set_producer_event_fd(&mut self, fd: OwnedFd) {
-        self.header_mut().producer_evtfd = fd.as_raw_fd();
-        self.producer_evtfd = Some(fd);
-    }
-
-    pub fn set_consumer_event_fd(&mut self, fd: OwnedFd) {
-        self.header_mut().consumer_evtfd = fd.as_raw_fd();
-        self.consumer_evtfd = Some(fd);
-    }
-
     fn header(&self) -> &SvmQueueHeader {
         unsafe { self.header.as_ref() }
     }
 
-    fn header_mut(&self) -> &mut SvmQueueHeader {
-        unsafe {
-            self.header
-                .as_ptr()
-                .as_mut()
-                .expect("queue pointer is non-null")
-        }
+    fn header_mut(&mut self) -> &mut SvmQueueHeader {
+        unsafe { self.header.as_mut() }
     }
 
-    fn elements(&self) -> *mut u8 {
+    fn data(&self) -> *mut u8 {
         unsafe {
             self.header
                 .as_ptr()
@@ -425,24 +398,23 @@ where
         let Some(container) = result else {
             return Err(SvmQueueError::LockBusy);
         };
-        let guard = match container {
-            RobustGuardContainer::Standard(guard) => guard,
+        match container {
+            RobustGuardContainer::Standard(guard) => Ok(guard),
             RobustGuardContainer::Indeterminate(guard) => {
                 let guard = guard
                     .make_consistent()
                     .map_err(|source| SvmQueueError::NotRecoverable { source })?;
                 drop(guard);
-                return Err(SvmQueueError::OwnerDied);
+                Err(SvmQueueError::OwnerDied)
             }
-        };
-        Ok(guard)
+        }
     }
 
     fn signal(&self, is_producer: bool, operation: SvmQueueOperation) -> Result<(), SvmQueueError> {
         let fd = if is_producer {
-            self.producer_evtfd.as_ref()
+            self.producer_event_fd.as_ref()
         } else {
-            self.consumer_evtfd.as_ref()
+            self.consumer_event_fd.as_ref()
         };
         if let Some(fd) = fd {
             let value = 1_u64.to_ne_bytes();
@@ -462,27 +434,33 @@ where
     }
 }
 
-impl<T> SvmQueueLock<'_, T>
-where
-    T: Copy + FromBytes + IntoBytes + KnownLayout + Immutable,
-{
-    pub fn add_nolock(&mut self, value: T) -> Result<(), SvmQueueError> {
-        while self.queue.header().current_size == self.queue.header().max_size {
+impl SvmQueueLock<'_> {
+    pub fn add_nolock(&mut self, element: &[u8]) -> Result<(), SvmQueueError> {
+        validate_element(self.queue.element_size(), element)?;
+        while self.queue.header().cursize == self.queue.header().maxsize {
+            if self.nowait {
+                return Err(SvmQueueError::QueueFull);
+            }
             self.wait()?;
         }
-        let was_empty = self.queue.header().current_size == 0;
-        self.write_one(value);
+        let was_empty = self.queue.header().cursize == 0;
+        self.write_one(element);
         if was_empty {
             self.queue.signal(true, SvmQueueOperation::Add)?;
         }
         Ok(())
     }
 
-    fn add_pair_nolock(&mut self, first: T, second: T) -> Result<(), SvmQueueError> {
-        while self.queue.header().max_size - self.queue.header().current_size < 2 {
+    pub fn add2_nolock(&mut self, first: &[u8], second: &[u8]) -> Result<(), SvmQueueError> {
+        validate_element(self.queue.element_size(), first)?;
+        validate_element(self.queue.element_size(), second)?;
+        while self.queue.header().maxsize - self.queue.header().cursize < 2 {
+            if self.nowait {
+                return Err(SvmQueueError::QueueFull);
+            }
             self.wait()?;
         }
-        let was_empty = self.queue.header().current_size == 0;
+        let was_empty = self.queue.header().cursize == 0;
         self.write_one(first);
         self.write_one(second);
         if was_empty {
@@ -491,21 +469,19 @@ where
         Ok(())
     }
 
-    /// Adds one element without checking capacity. The caller must hold this
-    /// lock and prove that a slot is available.
-    pub unsafe fn add_raw(&mut self, value: T) -> Result<(), SvmQueueError> {
-        let was_empty = self.queue.header().current_size == 0;
-        self.write_one(value);
+    pub unsafe fn add_raw(&mut self, element: &[u8]) -> Result<(), SvmQueueError> {
+        validate_element(self.queue.element_size(), element)?;
+        let was_empty = self.queue.header().cursize == 0;
+        self.write_one(element);
         if was_empty {
             self.queue.signal(true, SvmQueueOperation::Add)?;
         }
         Ok(())
     }
 
-    /// Removes one element without waiting. The caller must hold this lock and
-    /// prove that the queue is non-empty.
-    pub unsafe fn sub_raw(&mut self) -> Result<T, SvmQueueError> {
-        self.sub_one(self.queue.header().max_size)
+    pub unsafe fn sub_raw(&mut self, element: &mut [u8]) -> Result<(), SvmQueueError> {
+        validate_element(self.queue.element_size(), element)?;
+        self.sub_nolock(element)
     }
 
     pub fn wait(&mut self) -> Result<(), SvmQueueError> {
@@ -530,43 +506,44 @@ where
         self.queue.signal(is_producer, SvmQueueOperation::Add)
     }
 
-    fn write_one(&mut self, value: T) {
-        let elements = self.queue.elements();
-        let header = self.queue.header_mut();
+    fn write_one(&mut self, element: &[u8]) {
+        let header = unsafe { &mut *self.queue.header.as_ptr() };
         let slot = header.tail as usize;
+        let element_size = header.elsize as usize;
+        let destination = unsafe { self.queue.data().add(slot * element_size) };
         unsafe {
-            std::ptr::write(elements.cast::<T>().add(slot), value);
+            std::ptr::copy_nonoverlapping(element.as_ptr(), destination, element_size);
         }
-        header.tail = if header.tail + 1 == header.max_size {
+        header.tail = if header.tail + 1 == header.maxsize {
             0
         } else {
             header.tail + 1
         };
-        header.current_size += 1;
+        header.cursize += 1;
     }
 
-    fn sub_one(&mut self, signal_at_size: u32) -> Result<T, SvmQueueError> {
-        if self.queue.header().current_size == 0 {
+    fn sub_nolock(&mut self, element: &mut [u8]) -> Result<(), SvmQueueError> {
+        if self.queue.header().cursize == 0 {
             return Err(SvmQueueError::Empty);
         }
-        let elements = self.queue.elements();
-        let (value, should_signal) = {
-            let header = self.queue.header_mut();
-            let should_signal = header.current_size == signal_at_size;
-            let slot = header.head as usize;
-            let value = unsafe { std::ptr::read(elements.cast::<T>().add(slot)) };
-            header.head = if header.head + 1 == header.max_size {
-                0
-            } else {
-                header.head + 1
-            };
-            header.current_size -= 1;
-            (value, should_signal)
+        let header = unsafe { &mut *self.queue.header.as_ptr() };
+        let slot = header.head as usize;
+        let element_size = header.elsize as usize;
+        let source = unsafe { self.queue.data().add(slot * element_size) };
+        unsafe {
+            std::ptr::copy_nonoverlapping(source, element.as_mut_ptr(), element_size);
+        }
+        let was_full = header.cursize == header.maxsize;
+        header.head = if header.head + 1 == header.maxsize {
+            0
+        } else {
+            header.head + 1
         };
-        if should_signal {
+        header.cursize -= 1;
+        if was_full {
             self.queue.signal(false, SvmQueueOperation::Sub)?;
         }
-        Ok(value)
+        Ok(())
     }
 
     fn owner_died(&mut self) -> Result<(), SvmQueueError> {
@@ -577,21 +554,25 @@ where
     }
 }
 
-fn validate_config<T>(config: &SvmQueueConfig) -> Result<(), SvmQueueError>
-where
-    T: Copy + FromBytes + IntoBytes + KnownLayout + Immutable,
-{
-    if config.capacity == 0 {
+fn validate_config(config: &SvmQueueConfig) -> Result<(), SvmQueueError> {
+    if config.nels == 0 {
         return Err(SvmQueueError::ZeroCapacity);
     }
-    if size_of::<T>() == 0 {
-        return Err(SvmQueueError::ZeroSizedElement);
+    if config.elsize == 0 {
+        return Err(SvmQueueError::ZeroElementSize);
     }
-    if size_of::<T>() > u32::MAX as usize
-        || align_of::<T>() > u32::MAX as usize
-        || align_of::<T>() > CACHE_LINE_BYTES
-    {
-        return Err(SvmQueueError::LayoutOverflow);
+    (config.nels as usize)
+        .checked_mul(config.elsize as usize)
+        .ok_or(SvmQueueError::LayoutOverflow)?;
+    Ok(())
+}
+
+fn validate_element(expected: usize, element: &[u8]) -> Result<(), SvmQueueError> {
+    if element.len() != expected {
+        return Err(SvmQueueError::ElementLengthMismatch {
+            expected,
+            actual: element.len(),
+        });
     }
     Ok(())
 }

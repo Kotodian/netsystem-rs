@@ -1,75 +1,131 @@
-//! Unified descriptor/data-ring message queue.
+//! VPP-style shared-memory multi-ring message queue.
+//!
+//! The descriptor queue and ring accounting live in the shared mapping. Ring
+//! bytes are supplied by the caller in [`SvmMsgQRingConfig`], matching VPP's
+//! `svm_msg_q_ring_cfg_t::data` ownership boundary. The queue never allocates,
+//! frees, or binds payload storage after construction.
 
 use std::alloc::{Layout, LayoutError};
-use std::marker::PhantomData;
-use std::mem::MaybeUninit;
-use std::mem::{align_of, size_of};
-use std::time::{Duration, Instant};
+use std::io;
+use std::mem::{MaybeUninit, size_of};
+use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+use std::ptr::NonNull;
+use std::time::Duration;
 
 use posix_sync::condvar::{
     BorrowedCondvar, CondvarBuilder, CondvarClock, CondvarSharing, CondvarSignalError,
-    RawCondvarAlloc,
+    RawCondvarAlloc, WaitOutcome,
 };
-use posix_sync::mutex::guards::{RobustGuardContainer, StandardGuard};
+use posix_sync::mutex::guards::{MutexGuard, RobustGuardContainer, StandardGuard};
 use posix_sync::mutex::{
     BorrowedMutex, MutexBuilder, MutexSharing, RawMutexAlloc, robustness_markers::Robust,
 };
-use zerocopy::{FromBytes, Immutable, IntoBytes, KnownLayout};
 
-use crate::align::align_up;
+use crate::svm::queue::SvmQueueConditionalWait;
 use crate::svm::ssvm::{SsvmError, SsvmPrivate};
+use crate::sync::{SpinLock, SpinLockGuard};
 
-const MSG_QUEUE_MAGIC: u64 = 0x4841_4d4d_4552_4d51;
-const MSG_QUEUE_VERSION: u32 = 1;
+const CACHE_LINE_BYTES: usize = 64;
+static SVM_MSG_Q_MAPPING_ANCHOR: () = ();
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct MsgDescriptor {
-    ring_index: u32,
-    element_index: u32,
+#[repr(C)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SvmMsgQDescriptorParts {
+    pub ring_index: u32,
+    pub elt_index: u32,
 }
 
-impl MsgDescriptor {
-    pub fn ring_index(self) -> u32 {
-        self.ring_index
-    }
-    pub fn element_index(self) -> u32 {
-        self.element_index
-    }
+#[repr(C)]
+pub union SvmMsgQDescriptor {
+    pub parts: SvmMsgQDescriptorParts,
+    pub as_u64: u64,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct MsgRingConfig {
-    pub capacity: u32,
-    pub element_size: usize,
-    pub element_alignment: usize,
-}
+impl SvmMsgQDescriptor {
+    pub const INVALID: Self = Self { as_u64: u64::MAX };
 
-impl MsgRingConfig {
-    pub fn new<T>(capacity: u32) -> Self {
+    pub const fn new(ring_index: u32, elt_index: u32) -> Self {
         Self {
-            capacity,
-            element_size: size_of::<T>(),
-            element_alignment: align_of::<T>(),
+            parts: SvmMsgQDescriptorParts {
+                ring_index,
+                elt_index,
+            },
+        }
+    }
+
+    pub fn parts(self) -> SvmMsgQDescriptorParts {
+        unsafe { self.parts }
+    }
+
+    pub fn is_invalid(self) -> bool {
+        unsafe { self.as_u64 == u64::MAX }
+    }
+}
+
+impl Copy for SvmMsgQDescriptor {}
+impl Clone for SvmMsgQDescriptor {
+    fn clone(&self) -> Self {
+        *self
+    }
+}
+
+impl std::fmt::Debug for SvmMsgQDescriptor {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("SvmMsgQDescriptor")
+            .field("ring_index", &self.parts().ring_index)
+            .field("elt_index", &self.parts().elt_index)
+            .finish()
+    }
+}
+
+impl PartialEq for SvmMsgQDescriptor {
+    fn eq(&self, other: &Self) -> bool {
+        unsafe { self.as_u64 == other.as_u64 }
+    }
+}
+
+impl Eq for SvmMsgQDescriptor {}
+
+/// Caller-owned bytes for one VPP message ring.
+pub struct SvmMsgQRingConfig<'data> {
+    pub nitems: u32,
+    pub elsize: u32,
+    pub data: &'data mut [u8],
+}
+
+impl<'data> SvmMsgQRingConfig<'data> {
+    pub fn new(nitems: u32, elsize: u32, data: &'data mut [u8]) -> Self {
+        Self {
+            nitems,
+            elsize,
+            data,
         }
     }
 }
 
-#[derive(Debug, Clone, Copy)]
-pub struct SvmMsgQueueConfig<'a> {
-    pub capacity: u32,
-    pub rings: &'a [MsgRingConfig],
+pub struct SvmMsgQConfig<'rings, 'data> {
+    pub consumer_pid: i32,
+    pub q_nitems: u32,
+    pub ring_cfgs: &'rings mut [SvmMsgQRingConfig<'data>],
 }
 
 #[derive(Debug, thiserror::Error)]
-pub enum SvmMsgQueueError {
-    #[error("message queue descriptor capacity must be positive")]
-    ZeroCapacity,
+pub enum SvmMsgQError {
+    #[error("message queue descriptor count must be positive")]
+    ZeroQueueCapacity,
     #[error("message queue must contain at least one ring")]
     NoRings,
-    #[error("message ring {ring} capacity must be positive")]
+    #[error("message ring {ring} item count must be positive")]
     ZeroRingCapacity { ring: u32 },
-    #[error("message ring {ring} has zero-sized elements")]
-    ZeroSizedElement { ring: u32 },
+    #[error("message ring {ring} element size must be positive")]
+    ZeroElementSize { ring: u32 },
+    #[error("message ring {ring} data length {actual} does not equal {expected}")]
+    RingDataLength {
+        ring: u32,
+        expected: usize,
+        actual: usize,
+    },
     #[error("message queue layout is too large")]
     LayoutOverflow,
     #[error("message descriptor queue is full")]
@@ -78,24 +134,18 @@ pub enum SvmMsgQueueError {
     RingFull { ring: u32 },
     #[error("message ring {ring} does not exist")]
     InvalidRing { ring: u32 },
-    #[error(
-        "message element layout mismatch for ring {ring}: requested {requested} bytes/{requested_alignment} alignment, stored {stored} bytes/{stored_alignment} alignment"
-    )]
-    ElementLayoutMismatch {
-        ring: u32,
-        requested: usize,
-        requested_alignment: usize,
-        stored: usize,
-        stored_alignment: usize,
-    },
+    #[error("message descriptor is invalid")]
+    InvalidDescriptor,
+    #[error("message descriptor does not refer to an allocated ring slot")]
+    DescriptorNotAllocated,
     #[error("message queue is empty")]
     Empty,
+    #[error("message queue lock is busy")]
+    LockBusy,
     #[error("message queue wait deadline expired")]
     Timeout,
     #[error("message queue header is invalid")]
     InvalidHeader,
-    #[error("message queue header version {version} is unsupported")]
-    UnsupportedVersion { version: u32 },
     #[error("message queue segment operation failed: {0}")]
     Segment(#[from] SsvmError),
     #[error("message queue mutex owner died")]
@@ -115,164 +165,122 @@ pub enum SvmMsgQueueError {
         #[source]
         source: posix_sync::condvar::CondvarWaitError,
     },
-    #[error("message queue condition signal failed: {source}")]
-    Signal {
+    #[error("message queue condition signal failed after {operation} committed: {source}")]
+    SignalAfterCommit {
+        operation: &'static str,
         #[source]
         source: CondvarSignalError,
+    },
+    #[error("message queue event notification failed after {operation} committed: {source}")]
+    EventSignalAfterCommit {
+        operation: &'static str,
+        #[source]
+        source: io::Error,
+    },
+    #[error("message queue operation failed: {operation}: {source}")]
+    Io {
+        operation: &'static str,
+        #[source]
+        source: io::Error,
     },
     #[error("message queue layout construction failed")]
     Layout(#[from] LayoutError),
 }
 
-#[repr(C, align(64))]
-struct MessageQueueHeader {
-    magic: u64,
-    version: u32,
-    descriptor_capacity: u32,
-    ring_count: u32,
-    reserved: u32,
-    descriptor_offset: u64,
-    ring_offset: u64,
-    head: u32,
-    tail: u32,
-    len: u32,
+#[repr(C)]
+struct SvmMsgQSharedQueue {
     mutex: MaybeUninit<RawMutexAlloc>,
     condvar: MaybeUninit<RawCondvarAlloc>,
-    failed: std::sync::atomic::AtomicBool,
+    head: u32,
+    tail: u32,
+    cursize: u32,
+    maxsize: u32,
+    elsize: u32,
+    consumer_pid: i32,
 }
 
 #[repr(C)]
-struct MessageRingHeader {
-    capacity: u32,
-    element_size: u32,
-    element_alignment: u32,
-    reserved: u32,
-    elements_offset: u64,
+struct SvmMsgQRingShared {
+    cursize: u32,
+    nitems: u32,
     head: u32,
     tail: u32,
-    occupied: u32,
-    padding: u32,
+    elsize: u32,
 }
 
-pub struct SvmMsgQueue<'segment> {
-    segment: &'segment SsvmPrivate,
-    header_offset: u64,
-    header: *mut MessageQueueHeader,
-    descriptors: *mut MsgDescriptor,
-    rings: *mut MessageRingHeader,
-    mutex: BorrowedMutex<'segment, Robust>,
-    condvar: BorrowedCondvar<'segment>,
+#[repr(C, align(64))]
+struct SvmMsgQShared {
+    n_rings: u32,
+    reserved: u32,
+    q: SvmMsgQSharedQueue,
 }
 
-unsafe impl Send for SvmMsgQueue<'_> {}
-unsafe impl Sync for SvmMsgQueue<'_> {}
+struct SvmMsgQRing {
+    shared: NonNull<SvmMsgQRingShared>,
+    data: NonNull<u8>,
+}
 
-impl<'segment> SvmMsgQueue<'segment> {
-    pub fn layout(config: &SvmMsgQueueConfig<'_>) -> Result<Layout, SvmMsgQueueError> {
+pub struct SvmMsgQ<'data> {
+    shared: NonNull<SvmMsgQShared>,
+    descriptors: NonNull<SvmMsgQDescriptor>,
+    rings: Vec<SvmMsgQRing>,
+    mutex: BorrowedMutex<'static, Robust>,
+    condvar: BorrowedCondvar<'static>,
+    event_fd: Option<OwnedFd>,
+    producer_lock: SpinLock<()>,
+    _data: std::marker::PhantomData<&'data mut [u8]>,
+}
+
+unsafe impl Send for SvmMsgQ<'_> {}
+unsafe impl Sync for SvmMsgQ<'_> {}
+
+impl<'data> SvmMsgQ<'data> {
+    pub fn layout(config: &SvmMsgQConfig<'_, 'data>) -> Result<Layout, SvmMsgQError> {
         validate_config(config)?;
-        let mut bytes = size_of::<MessageQueueHeader>();
-        bytes = bytes
-            .checked_add(
-                (config.capacity as usize)
-                    .checked_mul(size_of::<MsgDescriptor>())
-                    .ok_or(SvmMsgQueueError::LayoutOverflow)?,
-            )
-            .ok_or(SvmMsgQueueError::LayoutOverflow)?;
-        bytes = bytes
-            .checked_add(
-                config
-                    .rings
-                    .len()
-                    .checked_mul(size_of::<MessageRingHeader>())
-                    .ok_or(SvmMsgQueueError::LayoutOverflow)?,
-            )
-            .ok_or(SvmMsgQueueError::LayoutOverflow)?;
-        for ring in config.rings {
-            let aligned = bytes
-                .checked_add(ring.element_alignment - 1)
-                .ok_or(SvmMsgQueueError::LayoutOverflow)?;
-            let aligned = align_up(aligned, ring.element_alignment);
-            let ring_bytes = (ring.capacity as usize)
-                .checked_mul(ring.element_size)
-                .ok_or(SvmMsgQueueError::LayoutOverflow)?;
-            bytes = aligned
-                .checked_add(ring_bytes)
-                .ok_or(SvmMsgQueueError::LayoutOverflow)?;
-        }
-        Layout::from_size_align(bytes, 64).map_err(SvmMsgQueueError::Layout)
+        let descriptors = (config.q_nitems as usize)
+            .checked_mul(size_of::<SvmMsgQDescriptor>())
+            .ok_or(SvmMsgQError::LayoutOverflow)?;
+        let rings = config
+            .ring_cfgs
+            .len()
+            .checked_mul(size_of::<SvmMsgQRingShared>())
+            .ok_or(SvmMsgQError::LayoutOverflow)?;
+        let bytes = size_of::<SvmMsgQShared>()
+            .checked_add(descriptors)
+            .and_then(|bytes| bytes.checked_add(rings))
+            .ok_or(SvmMsgQError::LayoutOverflow)?;
+        Layout::from_size_align(bytes, CACHE_LINE_BYTES).map_err(SvmMsgQError::Layout)
     }
 
+    /// Initializes only queue metadata in the caller-owned segment allocation.
+    /// Ring bytes remain owned by the caller and are referenced by `config`.
     pub unsafe fn init_at(
-        segment: &'segment SsvmPrivate,
+        segment: &SsvmPrivate,
         offset: u64,
-        config: &SvmMsgQueueConfig<'_>,
-    ) -> Result<Self, SvmMsgQueueError> {
+        config: &SvmMsgQConfig<'_, 'data>,
+    ) -> Result<Self, SvmMsgQError> {
         let layout = Self::layout(config)?;
         let base = segment.offset_ptr(offset, layout.size(), layout.align())?;
-        let header = base.cast::<MessageQueueHeader>();
-        let descriptor_offset = offset
-            .checked_add(size_of::<MessageQueueHeader>() as u64)
-            .ok_or(SvmMsgQueueError::LayoutOverflow)?;
-        let ring_offset = descriptor_offset
-            .checked_add(
-                (config.capacity as usize)
-                    .checked_mul(size_of::<MsgDescriptor>())
-                    .ok_or(SvmMsgQueueError::LayoutOverflow)? as u64,
-            )
-            .ok_or(SvmMsgQueueError::LayoutOverflow)?;
+        let shared = NonNull::new(base.cast::<SvmMsgQShared>()).expect("message queue pointer");
+        unsafe { std::ptr::write_bytes(shared.as_ptr().cast::<u8>(), 0, layout.size()) };
         unsafe {
-            std::ptr::write_bytes(header, 0, 1);
-            (*header).magic = MSG_QUEUE_MAGIC;
-            (*header).version = MSG_QUEUE_VERSION;
-            (*header).descriptor_capacity = config.capacity;
-            (*header).ring_count = config.rings.len() as u32;
-            (*header).descriptor_offset = descriptor_offset;
-            (*header).ring_offset = ring_offset;
-            (*header).failed = std::sync::atomic::AtomicBool::new(false);
+            (*shared.as_ptr()).n_rings = config.ring_cfgs.len() as u32;
+            (*shared.as_ptr()).q.maxsize = config.q_nitems;
+            (*shared.as_ptr()).q.elsize = size_of::<SvmMsgQDescriptor>() as u32;
+            (*shared.as_ptr()).q.consumer_pid = config.consumer_pid;
         }
-        let descriptors = unsafe {
-            base.add(size_of::<MessageQueueHeader>())
-                .cast::<MsgDescriptor>()
-        };
-        let rings = segment
-            .offset_ptr(
-                ring_offset,
-                config.rings.len() * size_of::<MessageRingHeader>(),
-                8,
-            )?
-            .cast::<MessageRingHeader>();
-        let mut cursor = ring_offset
-            .checked_add((config.rings.len() * size_of::<MessageRingHeader>()) as u64)
-            .ok_or(SvmMsgQueueError::LayoutOverflow)?;
-        for (index, ring) in config.rings.iter().enumerate() {
-            let ring_header = unsafe { &mut *rings.add(index) };
-            ring_header.capacity = ring.capacity;
-            ring_header.element_size = ring.element_size as u32;
-            ring_header.element_alignment = ring.element_alignment as u32;
-            ring_header.reserved = 0;
-            ring_header.head = 0;
-            ring_header.tail = 0;
-            ring_header.occupied = 0;
-            ring_header.padding = 0;
-            let aligned = (cursor as usize)
-                .checked_add(ring.element_alignment - 1)
-                .ok_or(SvmMsgQueueError::LayoutOverflow)?;
-            cursor = align_up(aligned, ring.element_alignment) as u64;
-            ring_header.elements_offset = cursor;
-            cursor = cursor
-                .checked_add(
-                    (ring.capacity as usize)
-                        .checked_mul(ring.element_size)
-                        .ok_or(SvmMsgQueueError::LayoutOverflow)? as u64,
-                )
-                .ok_or(SvmMsgQueueError::LayoutOverflow)?;
+        let (descriptors, rings) = shared_layout(shared, config.ring_cfgs.len(), config.q_nitems);
+        for (index, config_ring) in config.ring_cfgs.iter().enumerate() {
+            let ring = unsafe { &mut *rings.as_ptr().add(index) };
+            ring.nitems = config_ring.nitems;
+            ring.elsize = config_ring.elsize;
         }
         let mutex = unsafe {
             MutexBuilder::<Robust>::new()
                 .with_sharing(MutexSharing::Shared)
                 .build_borrowed(
-                    (&mut (*header).mutex as *mut MaybeUninit<RawMutexAlloc>).cast(),
-                    segment,
+                    (&mut (*shared.as_ptr()).q.mutex as *mut MaybeUninit<RawMutexAlloc>).cast(),
+                    &SVM_MSG_Q_MAPPING_ANCHOR,
                 )
         };
         let condvar = unsafe {
@@ -280,360 +288,578 @@ impl<'segment> SvmMsgQueue<'segment> {
                 .with_sharing(CondvarSharing::Shared)
                 .with_clock(CondvarClock::Monotonic)
                 .build_borrowed(
-                    (&mut (*header).condvar as *mut MaybeUninit<RawCondvarAlloc>).cast(),
-                    segment,
+                    (&mut (*shared.as_ptr()).q.condvar as *mut MaybeUninit<RawCondvarAlloc>).cast(),
+                    &SVM_MSG_Q_MAPPING_ANCHOR,
                 )
         };
         Ok(Self {
-            segment,
-            header_offset: offset,
-            header,
+            shared,
             descriptors,
-            rings,
+            rings: ring_handles(rings, config.ring_cfgs),
             mutex,
             condvar,
+            event_fd: None,
+            producer_lock: SpinLock::new(()),
+            _data: std::marker::PhantomData,
         })
     }
 
+    /// Attaches queue metadata and receives the caller-owned ring bytes again.
     pub unsafe fn attach(
-        segment: &'segment SsvmPrivate,
+        segment: &SsvmPrivate,
         offset: u64,
-    ) -> Result<Self, SvmMsgQueueError> {
-        let base = segment.offset_ptr(offset, size_of::<MessageQueueHeader>(), 64)?;
-        let header = base.cast::<MessageQueueHeader>();
-        let stored = unsafe { &*header };
-        if stored.magic != MSG_QUEUE_MAGIC {
-            return Err(SvmMsgQueueError::InvalidHeader);
+        ring_cfgs: &'data mut [SvmMsgQRingConfig<'data>],
+    ) -> Result<Self, SvmMsgQError> {
+        let header = NonNull::new(
+            segment
+                .offset_ptr(offset, size_of::<SvmMsgQShared>(), CACHE_LINE_BYTES)?
+                .cast::<SvmMsgQShared>(),
+        )
+        .expect("message queue pointer");
+        let shared_ref = unsafe { header.as_ref() };
+        if shared_ref.n_rings == 0
+            || shared_ref.n_rings as usize != ring_cfgs.len()
+            || shared_ref.q.maxsize == 0
+            || shared_ref.q.elsize as usize != size_of::<SvmMsgQDescriptor>()
+            || shared_ref.q.head >= shared_ref.q.maxsize
+            || shared_ref.q.tail >= shared_ref.q.maxsize
+            || shared_ref.q.cursize > shared_ref.q.maxsize
+        {
+            return Err(SvmMsgQError::InvalidHeader);
         }
-        if stored.version != MSG_QUEUE_VERSION {
-            return Err(SvmMsgQueueError::UnsupportedVersion {
-                version: stored.version,
-            });
-        }
-        if stored.descriptor_capacity == 0 || stored.ring_count == 0 {
-            return Err(SvmMsgQueueError::InvalidHeader);
-        }
-        if stored.failed.load(std::sync::atomic::Ordering::Acquire) {
-            return Err(SvmMsgQueueError::InvalidHeader);
-        }
-        let descriptors = segment
-            .offset_ptr(
-                stored.descriptor_offset,
-                stored.descriptor_capacity as usize * size_of::<MsgDescriptor>(),
-                8,
-            )?
-            .cast();
-        let rings = segment
-            .offset_ptr(
-                stored.ring_offset,
-                stored.ring_count as usize * size_of::<MessageRingHeader>(),
-                8,
-            )?
-            .cast::<MessageRingHeader>();
-        for index in 0..stored.ring_count as usize {
-            let ring = unsafe { &*rings.add(index) };
-            if ring.capacity == 0 || ring.element_size == 0 {
-                return Err(SvmMsgQueueError::InvalidHeader);
+        let (descriptors, rings) = shared_layout(header, ring_cfgs.len(), shared_ref.q.maxsize);
+        for (index, config_ring) in ring_cfgs.iter().enumerate() {
+            let ring = unsafe { &*rings.as_ptr().add(index) };
+            validate_ring_data(index as u32, ring.nitems, ring.elsize, config_ring.data)?;
+            if ring.nitems != config_ring.nitems || ring.elsize != config_ring.elsize {
+                return Err(SvmMsgQError::InvalidHeader);
             }
-            segment.offset_ptr(
-                ring.elements_offset,
-                ring.capacity as usize * ring.element_size as usize,
-                ring.element_alignment as usize,
-            )?;
         }
         let mutex = unsafe {
             BorrowedMutex::<Robust>::from_raw(
-                (&mut (*header).mutex as *mut MaybeUninit<RawMutexAlloc>).cast(),
-                segment,
+                (&mut (*header.as_ptr()).q.mutex as *mut MaybeUninit<RawMutexAlloc>).cast(),
+                &SVM_MSG_Q_MAPPING_ANCHOR,
             )
         };
         let condvar = unsafe {
             BorrowedCondvar::from_raw(
-                (&mut (*header).condvar as *mut MaybeUninit<RawCondvarAlloc>).cast(),
-                segment,
+                (&mut (*header.as_ptr()).q.condvar as *mut MaybeUninit<RawCondvarAlloc>).cast(),
+                &SVM_MSG_Q_MAPPING_ANCHOR,
                 CondvarClock::Monotonic,
             )
         };
         Ok(Self {
-            segment,
-            header_offset: offset,
-            header,
+            shared: header,
             descriptors,
-            rings,
+            rings: ring_handles(rings, ring_cfgs),
             mutex,
             condvar,
+            event_fd: None,
+            producer_lock: SpinLock::new(()),
+            _data: std::marker::PhantomData,
         })
     }
 
-    pub fn header_offset(&self) -> u64 {
-        self.header_offset
+    pub fn size(&self) -> u32 {
+        unsafe { (*self.shared.as_ptr()).q.cursize }
     }
 
-    pub fn reserve<T>(
+    pub fn is_empty(&self) -> bool {
+        self.size() == 0
+    }
+
+    pub fn is_full(&self) -> bool {
+        unsafe { self.size() == (*self.shared.as_ptr()).q.maxsize }
+    }
+
+    pub fn ring_is_full(&self, ring_index: u32) -> Result<bool, SvmMsgQError> {
+        let ring = self.ring(ring_index)?;
+        Ok(unsafe { (*ring.shared.as_ptr()).cursize >= (*ring.shared.as_ptr()).nitems })
+    }
+
+    pub fn alloc_msg(&self, nbytes: u32) -> SvmMsgQDescriptor {
+        for (ring_index, ring) in self.rings.iter().enumerate() {
+            let shared = unsafe { &mut *ring.shared.as_ptr() };
+            if shared.elsize >= nbytes && shared.cursize < shared.nitems {
+                return self.alloc_msg_w_ring_unchecked(ring_index as u32, shared);
+            }
+        }
+        SvmMsgQDescriptor::INVALID
+    }
+
+    pub fn alloc_msg_w_ring(&self, ring_index: u32) -> Result<SvmMsgQDescriptor, SvmMsgQError> {
+        let ring = self.ring(ring_index)?;
+        let shared = unsafe { &mut *ring.shared.as_ptr() };
+        if shared.cursize >= shared.nitems {
+            return Err(SvmMsgQError::RingFull { ring: ring_index });
+        }
+        Ok(self.alloc_msg_w_ring_unchecked(ring_index, shared))
+    }
+
+    pub fn add(&self, msg: SvmMsgQDescriptor, nowait: bool) -> Result<(), SvmMsgQError> {
+        let parts = self.validate_descriptor(msg)?;
+        if self.event_fd.is_some() {
+            let guard = if nowait {
+                self.producer_lock
+                    .try_lock()
+                    .ok_or(SvmMsgQError::LockBusy)?
+            } else {
+                self.producer_lock.lock()
+            };
+            self.add_locked(parts, guard, nowait)
+        } else {
+            let guard = if nowait {
+                self.try_lock_shared()?.ok_or(SvmMsgQError::LockBusy)?
+            } else {
+                self.lock_shared()?
+            };
+            self.add_locked_shared(parts, guard, nowait)
+        }
+    }
+
+    pub unsafe fn add_raw(&self, msg: SvmMsgQDescriptor) -> Result<(), SvmMsgQError> {
+        let parts = self.validate_descriptor(msg)?;
+        unsafe { self.add_raw_parts(parts) }
+    }
+
+    pub fn sub(&self, wait: SvmQueueConditionalWait) -> Result<SvmMsgQDescriptor, SvmMsgQError> {
+        if !self.is_empty() {
+            return unsafe { self.sub_raw() };
+        }
+        match wait {
+            SvmQueueConditionalWait::Nowait => Err(SvmMsgQError::Empty),
+            SvmQueueConditionalWait::Wait => {
+                self.wait(SvmMsgQWaitType::Empty)?;
+                unsafe { self.sub_raw() }
+            }
+            SvmQueueConditionalWait::TimedWait(timeout) => {
+                if self.timedwait(SvmMsgQWaitType::Empty, timeout)? == WaitOutcome::TimedOut {
+                    Err(SvmMsgQError::Timeout)
+                } else {
+                    unsafe { self.sub_raw() }
+                }
+            }
+        }
+    }
+
+    pub unsafe fn sub_raw(&self) -> Result<SvmMsgQDescriptor, SvmMsgQError> {
+        if self.is_empty() {
+            return Err(SvmMsgQError::Empty);
+        }
+        let shared = unsafe { &mut (*self.shared.as_ptr()).q };
+        let descriptor = unsafe { *self.descriptors.as_ptr().add(shared.head as usize) };
+        shared.head = next_index(shared.head, shared.maxsize);
+        let was_full = shared.cursize == shared.maxsize;
+        shared.cursize -= 1;
+        if was_full {
+            self.signal("sub")?;
+        }
+        Ok(descriptor)
+    }
+
+    /// Returns the slot pointer for a descriptor.
+    ///
+    /// # Safety
+    /// The caller must hold the descriptor's ownership and must not create
+    /// overlapping mutable borrows for the same slot.
+    pub unsafe fn msg_data(&self, msg: SvmMsgQDescriptor) -> Result<*mut u8, SvmMsgQError> {
+        let parts = self.validate_descriptor(msg)?;
+        let ring = self.ring(parts.ring_index)?;
+        let shared = unsafe { &*ring.shared.as_ptr() };
+        let offset = (parts.elt_index as usize)
+            .checked_mul(shared.elsize as usize)
+            .ok_or(SvmMsgQError::LayoutOverflow)?;
+        Ok(unsafe { ring.data.as_ptr().add(offset) })
+    }
+
+    pub fn free_msg(&self, msg: SvmMsgQDescriptor) -> Result<(), SvmMsgQError> {
+        let parts = self.validate_descriptor(msg)?;
+        let ring = self.ring(parts.ring_index)?;
+        let shared = unsafe { &mut *ring.shared.as_ptr() };
+        if parts.elt_index != shared.head || shared.cursize == 0 {
+            return Err(SvmMsgQError::DescriptorNotAllocated);
+        }
+        let was_full = shared.cursize == shared.nitems;
+        shared.head = next_index(shared.head, shared.nitems);
+        shared.cursize -= 1;
+        if was_full {
+            self.signal("free_msg")?;
+        }
+        Ok(())
+    }
+
+    pub fn wait(&self, wait_type: SvmMsgQWaitType) -> Result<(), SvmMsgQError> {
+        if self.event_fd.is_some() {
+            while self.wait_predicate(wait_type) {
+                self.read_event_fd()?;
+            }
+            return Ok(());
+        }
+        let mut guard = self.lock_shared()?;
+        while self.wait_predicate(wait_type) {
+            match unsafe { self.condvar.wait(&mut guard) } {
+                Ok(()) => {}
+                Err(posix_sync::condvar::CondvarWaitError::OwnerDead) => {
+                    guard
+                        .mark_consistent()
+                        .map_err(|source| SvmMsgQError::NotRecoverable { source })?;
+                    return Err(SvmMsgQError::OwnerDied);
+                }
+                Err(source) => return Err(SvmMsgQError::Wait { source }),
+            }
+        }
+        Ok(())
+    }
+
+    pub fn wait_prod(&self) -> Result<(), SvmMsgQError> {
+        self.wait(SvmMsgQWaitType::Full)
+    }
+
+    pub fn or_ring_wait_prod(&self, ring_index: u32) -> Result<(), SvmMsgQError> {
+        self.ring(ring_index)?;
+        if self.event_fd.is_some() {
+            while self.is_full() || self.ring_is_full(ring_index)? {
+                self.read_event_fd()?;
+            }
+            return Ok(());
+        }
+        let mut guard = self.lock_shared()?;
+        while self.is_full() || self.ring_is_full(ring_index)? {
+            match unsafe { self.condvar.wait(&mut guard) } {
+                Ok(()) => {}
+                Err(posix_sync::condvar::CondvarWaitError::OwnerDead) => {
+                    guard
+                        .mark_consistent()
+                        .map_err(|source| SvmMsgQError::NotRecoverable { source })?;
+                    return Err(SvmMsgQError::OwnerDied);
+                }
+                Err(source) => return Err(SvmMsgQError::Wait { source }),
+            }
+        }
+        Ok(())
+    }
+
+    pub fn timedwait(
         &self,
-        ring_index: u32,
-    ) -> Result<MsgReservation<'_, 'segment, T>, SvmMsgQueueError>
-    where
-        T: Copy + FromBytes + IntoBytes + KnownLayout + Immutable,
-    {
-        let guard = self.lock()?;
-        let header = unsafe { &mut *self.header };
-        if ring_index >= header.ring_count {
-            return Err(SvmMsgQueueError::InvalidRing { ring: ring_index });
+        wait_type: SvmMsgQWaitType,
+        timeout: Duration,
+    ) -> Result<WaitOutcome, SvmMsgQError> {
+        if self.event_fd.is_some() {
+            if !self.wait_predicate(wait_type) {
+                return Ok(WaitOutcome::Notified);
+            }
+            self.read_event_fd_timeout(timeout)?;
+            return Ok(WaitOutcome::Notified);
         }
-        let ring = unsafe { &mut *self.rings.add(ring_index as usize) };
-        if let Err(error) = check_ring_layout::<T>(ring_index, ring) {
-            return Err(error);
+        let mut guard = self.lock_shared()?;
+        if !self.wait_predicate(wait_type) {
+            return Ok(WaitOutcome::Notified);
         }
-        if header.len >= header.descriptor_capacity {
-            return Err(SvmMsgQueueError::QueueFull);
-        }
-        if ring.occupied >= ring.capacity {
-            return Err(SvmMsgQueueError::RingFull { ring: ring_index });
-        }
-        let slot = ring.tail % ring.capacity;
-        Ok(MsgReservation {
-            queue: self,
-            ring_index,
-            slot,
-            guard,
-            _element: PhantomData,
-        })
+        unsafe { self.condvar.wait_for(&mut guard, timeout) }
+            .map_err(|source| SvmMsgQError::Wait { source })
     }
 
-    pub fn dequeue<T>(&self) -> Result<Option<Message<'_, 'segment, T>>, SvmMsgQueueError>
-    where
-        T: Copy + FromBytes + IntoBytes + KnownLayout + Immutable,
-    {
-        let guard = self.lock()?;
-        let header = unsafe { &mut *self.header };
-        if header.len == 0 {
-            return Ok(None);
-        }
-        let descriptor = unsafe {
-            *self
-                .descriptors
-                .add((header.head % header.descriptor_capacity) as usize)
-        };
-        if descriptor.ring_index >= header.ring_count {
-            return Err(SvmMsgQueueError::InvalidRing {
-                ring: descriptor.ring_index,
+    pub fn set_eventfd(&mut self, event_fd: OwnedFd) {
+        self.event_fd = Some(event_fd);
+    }
+
+    pub fn alloc_eventfd(&mut self) -> Result<(), SvmMsgQError> {
+        let fd = unsafe { libc::eventfd(0, libc::EFD_NONBLOCK | libc::EFD_CLOEXEC) };
+        if fd < 0 {
+            return Err(SvmMsgQError::Io {
+                operation: "alloc_eventfd",
+                source: io::Error::last_os_error(),
             });
         }
-        let ring = unsafe { &mut *self.rings.add(descriptor.ring_index as usize) };
-        if let Err(error) = check_ring_layout::<T>(descriptor.ring_index, ring) {
-            return Err(error);
-        }
-        header.head = header.head.wrapping_add(1);
-        header.len -= 1;
-        Ok(Some(Message {
-            queue: self,
-            descriptor,
-            released: false,
-            guard,
-            _element: PhantomData,
-        }))
-    }
-
-    pub fn wait_nonempty(&self) -> Result<(), SvmMsgQueueError> {
-        while self.is_empty()? {
-            std::thread::yield_now();
-        }
+        self.set_eventfd(unsafe { OwnedFd::from_raw_fd(fd) });
         Ok(())
     }
 
-    pub fn wait_nonempty_until(&self, deadline: Instant) -> Result<(), SvmMsgQueueError> {
-        while self.is_empty()? {
-            if Instant::now() >= deadline {
-                return Err(SvmMsgQueueError::Timeout);
+    fn add_locked(
+        &self,
+        parts: SvmMsgQDescriptorParts,
+        _guard: SpinLockGuard<'_, ()>,
+        nowait: bool,
+    ) -> Result<(), SvmMsgQError> {
+        while self.is_full() {
+            if nowait {
+                return Err(SvmMsgQError::QueueFull);
             }
-            std::thread::sleep(Duration::from_millis(1));
+            self.wait_prod()?;
+        }
+        unsafe { self.add_raw_parts(parts) }
+    }
+
+    fn add_locked_shared(
+        &self,
+        parts: SvmMsgQDescriptorParts,
+        mut guard: StandardGuard<'_>,
+        nowait: bool,
+    ) -> Result<(), SvmMsgQError> {
+        while self.is_full() {
+            if nowait {
+                return Err(SvmMsgQError::QueueFull);
+            }
+            match unsafe { self.condvar.wait(&mut guard) } {
+                Ok(()) => {}
+                Err(posix_sync::condvar::CondvarWaitError::OwnerDead) => {
+                    guard
+                        .mark_consistent()
+                        .map_err(|source| SvmMsgQError::NotRecoverable { source })?;
+                    return Err(SvmMsgQError::OwnerDied);
+                }
+                Err(source) => return Err(SvmMsgQError::Wait { source }),
+            }
+        }
+        unsafe { self.add_raw_parts(parts) }
+    }
+
+    unsafe fn add_raw_parts(&self, parts: SvmMsgQDescriptorParts) -> Result<(), SvmMsgQError> {
+        let queue = unsafe { &mut (*self.shared.as_ptr()).q };
+        unsafe {
+            *self.descriptors.as_ptr().add(queue.tail as usize) =
+                SvmMsgQDescriptor::new(parts.ring_index, parts.elt_index);
+        }
+        queue.tail = next_index(queue.tail, queue.maxsize);
+        let was_empty = queue.cursize == 0;
+        queue.cursize += 1;
+        if was_empty {
+            self.signal("add")?;
         }
         Ok(())
     }
 
-    pub fn wait_space(&self, ring: u32) -> Result<(), SvmMsgQueueError> {
-        while self.ring_is_full(ring)? {
-            std::thread::yield_now();
+    fn validate_descriptor(
+        &self,
+        descriptor: SvmMsgQDescriptor,
+    ) -> Result<SvmMsgQDescriptorParts, SvmMsgQError> {
+        if descriptor.is_invalid() {
+            return Err(SvmMsgQError::InvalidDescriptor);
         }
-        Ok(())
-    }
-
-    pub fn len(&self) -> Result<usize, SvmMsgQueueError> {
-        let guard = self.lock()?;
-        let len = unsafe { (*self.header).len as usize };
-        Ok(len)
-    }
-
-    pub fn is_empty(&self) -> Result<bool, SvmMsgQueueError> {
-        Ok(self.len()? == 0)
-    }
-
-    fn ring_is_full(&self, ring_index: u32) -> Result<bool, SvmMsgQueueError> {
-        let guard = self.lock()?;
-        let header = unsafe { &*self.header };
-        if ring_index >= header.ring_count {
-            return Err(SvmMsgQueueError::InvalidRing { ring: ring_index });
+        let parts = descriptor.parts();
+        let ring = self.ring(parts.ring_index)?;
+        let shared = unsafe { &*ring.shared.as_ptr() };
+        if parts.elt_index >= shared.nitems {
+            return Err(SvmMsgQError::InvalidDescriptor);
         }
-        let full = unsafe {
-            (*self.rings.add(ring_index as usize)).occupied
-                >= (*self.rings.add(ring_index as usize)).capacity
+        let distance = (parts.elt_index + shared.nitems - shared.head) % shared.nitems;
+        let span = if shared.tail == shared.head {
+            if shared.cursize == 0 {
+                0
+            } else {
+                shared.nitems
+            }
+        } else {
+            (shared.tail + shared.nitems - shared.head) % shared.nitems
         };
-        Ok(full)
+        if distance >= span {
+            return Err(SvmMsgQError::DescriptorNotAllocated);
+        }
+        Ok(parts)
     }
 
-    fn lock(&self) -> Result<StandardGuard<'_>, SvmMsgQueueError> {
+    fn ring(&self, ring_index: u32) -> Result<&SvmMsgQRing, SvmMsgQError> {
+        self.rings
+            .get(ring_index as usize)
+            .ok_or(SvmMsgQError::InvalidRing { ring: ring_index })
+    }
+
+    fn lock_shared(&self) -> Result<StandardGuard<'_>, SvmMsgQError> {
         match unsafe { self.mutex.lock() } {
             Ok(RobustGuardContainer::Standard(guard)) => Ok(guard),
-            Ok(RobustGuardContainer::Indeterminate(_)) => {
-                unsafe {
-                    (*self.header)
-                        .failed
-                        .store(true, std::sync::atomic::Ordering::Release);
-                }
-                Err(SvmMsgQueueError::OwnerDied)
+            Ok(RobustGuardContainer::Indeterminate(guard)) => {
+                guard
+                    .make_consistent()
+                    .map_err(|source| SvmMsgQError::NotRecoverable { source })?;
+                Err(SvmMsgQError::OwnerDied)
             }
-            Err(source) if matches!(source, posix_sync::mutex::MutexLockError::NotRecoverable) => {
-                Err(SvmMsgQueueError::NotRecoverable { source })
-            }
-            Err(source) => Err(SvmMsgQueueError::Lock { source }),
+            Err(source) => Err(SvmMsgQError::Lock { source }),
         }
     }
 
-    fn element_ptr<T>(&self, ring_index: u32, slot: u32) -> *mut T {
-        let ring = unsafe { &*self.rings.add(ring_index as usize) };
-        let base = self.segment.base();
-        unsafe {
-            base.add(ring.elements_offset as usize)
-                .cast::<T>()
-                .add(slot as usize)
+    fn try_lock_shared(&self) -> Result<Option<StandardGuard<'_>>, SvmMsgQError> {
+        let result =
+            unsafe { self.mutex.try_lock() }.map_err(|source| SvmMsgQError::Lock { source })?;
+        let Some(container) = result else {
+            return Ok(None);
+        };
+        match container {
+            RobustGuardContainer::Standard(guard) => Ok(Some(guard)),
+            RobustGuardContainer::Indeterminate(guard) => {
+                guard
+                    .make_consistent()
+                    .map_err(|source| SvmMsgQError::NotRecoverable { source })?;
+                Err(SvmMsgQError::OwnerDied)
+            }
         }
     }
-}
 
-pub struct MsgReservation<'queue, 'segment, T> {
-    queue: &'queue SvmMsgQueue<'segment>,
-    ring_index: u32,
-    slot: u32,
-    guard: StandardGuard<'queue>,
-    _element: PhantomData<T>,
-}
-
-impl<T> MsgReservation<'_, '_, T>
-where
-    T: Copy + FromBytes + IntoBytes + KnownLayout + Immutable,
-{
-    pub fn value_mut(&mut self) -> &mut T {
-        unsafe { &mut *self.queue.element_ptr::<T>(self.ring_index, self.slot) }
+    fn signal(&self, operation: &'static str) -> Result<(), SvmMsgQError> {
+        if let Some(event_fd) = &self.event_fd {
+            let value = 1_u64.to_ne_bytes();
+            let written =
+                unsafe { libc::write(event_fd.as_raw_fd(), value.as_ptr().cast(), value.len()) };
+            if written != value.len() as isize {
+                return Err(SvmMsgQError::EventSignalAfterCommit {
+                    operation,
+                    source: io::Error::last_os_error(),
+                });
+            }
+        } else {
+            unsafe { self.condvar.notify_all() }
+                .map_err(|source| SvmMsgQError::SignalAfterCommit { operation, source })?;
+        }
+        Ok(())
     }
 
-    pub fn commit(self) -> Result<(), SvmMsgQueueError> {
-        let header = unsafe { &mut *self.queue.header };
-        let ring = unsafe { &mut *self.queue.rings.add(self.ring_index as usize) };
-        let descriptor_slot = header.tail % header.descriptor_capacity;
-        unsafe {
-            *self.queue.descriptors.add(descriptor_slot as usize) = MsgDescriptor {
-                ring_index: self.ring_index,
-                element_index: self.slot,
+    fn wait_predicate(&self, wait_type: SvmMsgQWaitType) -> bool {
+        match wait_type {
+            SvmMsgQWaitType::Empty => self.is_empty(),
+            SvmMsgQWaitType::Full => self.is_full(),
+        }
+    }
+
+    fn read_event_fd(&self) -> Result<(), SvmMsgQError> {
+        let event_fd = self.event_fd.as_ref().expect("event fd predicate checked");
+        let mut value = 0_u64;
+        loop {
+            let read = unsafe {
+                libc::read(
+                    event_fd.as_raw_fd(),
+                    (&mut value as *mut u64).cast(),
+                    size_of::<u64>(),
+                )
             };
+            if read == size_of::<u64>() as isize {
+                return Ok(());
+            }
+            let error = io::Error::last_os_error();
+            if error.kind() == io::ErrorKind::WouldBlock {
+                std::thread::yield_now();
+                continue;
+            }
+            return Err(SvmMsgQError::Io {
+                operation: "read_eventfd",
+                source: error,
+            });
         }
-        ring.tail = ring.tail.wrapping_add(1);
-        ring.occupied += 1;
-        header.tail = header.tail.wrapping_add(1);
-        header.len += 1;
-        unsafe { self.queue.condvar.notify_all() }
-            .map_err(|source| SvmMsgQueueError::Signal { source })?;
-        Ok(())
+    }
+
+    fn read_event_fd_timeout(&self, timeout: Duration) -> Result<(), SvmMsgQError> {
+        let event_fd = self.event_fd.as_ref().expect("event fd predicate checked");
+        let mut poll_fd = libc::pollfd {
+            fd: event_fd.as_raw_fd(),
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        let timeout_ms = timeout.as_millis().min(i32::MAX as u128) as i32;
+        let result = unsafe { libc::poll(&mut poll_fd, 1, timeout_ms) };
+        if result == 0 {
+            return Err(SvmMsgQError::Timeout);
+        }
+        if result < 0 {
+            return Err(SvmMsgQError::Io {
+                operation: "poll_eventfd",
+                source: io::Error::last_os_error(),
+            });
+        }
+        self.read_event_fd()
+    }
+
+    fn alloc_msg_w_ring_unchecked(
+        &self,
+        ring_index: u32,
+        shared: &mut SvmMsgQRingShared,
+    ) -> SvmMsgQDescriptor {
+        let elt_index = shared.tail;
+        shared.tail = next_index(shared.tail, shared.nitems);
+        shared.cursize += 1;
+        SvmMsgQDescriptor::new(ring_index, elt_index)
     }
 }
 
-pub struct Message<'queue, 'segment, T> {
-    queue: &'queue SvmMsgQueue<'segment>,
-    descriptor: MsgDescriptor,
-    released: bool,
-    guard: StandardGuard<'queue>,
-    _element: PhantomData<T>,
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SvmMsgQWaitType {
+    Empty,
+    Full,
 }
 
-impl<T> Message<'_, '_, T> {
-    pub fn ring_index(&self) -> u32 {
-        self.descriptor.ring_index
+fn validate_config(config: &SvmMsgQConfig<'_, '_>) -> Result<(), SvmMsgQError> {
+    if config.q_nitems == 0 {
+        return Err(SvmMsgQError::ZeroQueueCapacity);
     }
-
-    pub fn value(&self) -> &T
-    where
-        T: Copy + FromBytes + IntoBytes + KnownLayout + Immutable,
-    {
-        unsafe {
-            &*self
-                .queue
-                .element_ptr::<T>(self.descriptor.ring_index, self.descriptor.element_index)
+    if config.ring_cfgs.is_empty() {
+        return Err(SvmMsgQError::NoRings);
+    }
+    for (index, ring) in config.ring_cfgs.iter().enumerate() {
+        if ring.nitems == 0 {
+            return Err(SvmMsgQError::ZeroRingCapacity { ring: index as u32 });
         }
-    }
-
-    pub fn release(mut self) -> Result<(), SvmMsgQueueError> {
-        self.release_inner();
-        Ok(())
-    }
-
-    fn release_inner(&mut self) {
-        if self.released {
-            return;
+        if ring.elsize == 0 {
+            return Err(SvmMsgQError::ZeroElementSize { ring: index as u32 });
         }
-        let ring = unsafe { &mut *self.queue.rings.add(self.descriptor.ring_index as usize) };
-        assert!(ring.occupied != 0, "message ring occupancy underflow");
-        ring.head = ring.head.wrapping_add(1);
-        ring.occupied -= 1;
-        self.released = true;
-        let _ = unsafe { self.queue.condvar.notify_all() };
-    }
-}
-
-impl<T> Drop for Message<'_, '_, T> {
-    fn drop(&mut self) {
-        self.release_inner();
-    }
-}
-
-fn validate_config(config: &SvmMsgQueueConfig<'_>) -> Result<(), SvmMsgQueueError> {
-    if config.capacity == 0 {
-        return Err(SvmMsgQueueError::ZeroCapacity);
-    }
-    if config.rings.is_empty() {
-        return Err(SvmMsgQueueError::NoRings);
-    }
-    for (index, ring) in config.rings.iter().enumerate() {
-        if ring.capacity == 0 {
-            return Err(SvmMsgQueueError::ZeroRingCapacity { ring: index as u32 });
-        }
-        if ring.element_size == 0 {
-            return Err(SvmMsgQueueError::ZeroSizedElement { ring: index as u32 });
-        }
-        if ring.element_alignment == 0
-            || !ring.element_alignment.is_power_of_two()
-            || ring.element_size > u32::MAX as usize
-            || ring.element_alignment > u32::MAX as usize
-        {
-            return Err(SvmMsgQueueError::LayoutOverflow);
-        }
+        validate_ring_data(index as u32, ring.nitems, ring.elsize, ring.data)?;
     }
     Ok(())
 }
 
-fn check_ring_layout<T>(ring_index: u32, ring: &MessageRingHeader) -> Result<(), SvmMsgQueueError>
-where
-    T: Copy + FromBytes + IntoBytes + KnownLayout + Immutable,
-{
-    if ring.element_size as usize != size_of::<T>()
-        || ring.element_alignment as usize != align_of::<T>()
-    {
-        return Err(SvmMsgQueueError::ElementLayoutMismatch {
-            ring: ring_index,
-            requested: size_of::<T>(),
-            requested_alignment: align_of::<T>(),
-            stored: ring.element_size as usize,
-            stored_alignment: ring.element_alignment as usize,
+fn validate_ring_data(
+    ring: u32,
+    nitems: u32,
+    elsize: u32,
+    data: &[u8],
+) -> Result<(), SvmMsgQError> {
+    let expected = (nitems as usize)
+        .checked_mul(elsize as usize)
+        .ok_or(SvmMsgQError::LayoutOverflow)?;
+    if data.len() != expected {
+        return Err(SvmMsgQError::RingDataLength {
+            ring,
+            expected,
+            actual: data.len(),
         });
     }
     Ok(())
+}
+
+fn shared_layout(
+    shared: NonNull<SvmMsgQShared>,
+    _ring_count: usize,
+    queue_capacity: u32,
+) -> (NonNull<SvmMsgQDescriptor>, NonNull<SvmMsgQRingShared>) {
+    let descriptor_ptr = unsafe {
+        shared
+            .as_ptr()
+            .cast::<u8>()
+            .add(size_of::<SvmMsgQShared>())
+            .cast::<SvmMsgQDescriptor>()
+    };
+    let rings_ptr = unsafe {
+        descriptor_ptr
+            .cast::<u8>()
+            .add(queue_capacity as usize * size_of::<SvmMsgQDescriptor>())
+            .cast::<SvmMsgQRingShared>()
+    };
+    (
+        NonNull::new(descriptor_ptr).expect("descriptor pointer is non-null"),
+        NonNull::new(rings_ptr).expect("ring pointer is non-null"),
+    )
+}
+
+fn ring_handles<'data>(
+    rings: NonNull<SvmMsgQRingShared>,
+    configs: &[SvmMsgQRingConfig<'data>],
+) -> Vec<SvmMsgQRing> {
+    configs
+        .iter()
+        .enumerate()
+        .map(|(index, config)| SvmMsgQRing {
+            shared: unsafe { NonNull::new_unchecked(rings.as_ptr().add(index)) },
+            data: NonNull::new(config.data.as_ptr().cast_mut()).expect("ring data is non-null"),
+        })
+        .collect()
+}
+
+fn next_index(index: u32, capacity: u32) -> u32 {
+    if index + 1 == capacity { 0 } else { index + 1 }
 }
