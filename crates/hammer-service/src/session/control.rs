@@ -1,7 +1,7 @@
 use hammer_runtime::app::{
     SessionAcceptedReplyMsg, SessionBoundMsg, SessionConnectError, SessionConnectMsg,
     SessionConnectedMsg, SessionControlError, SessionEvtType, SessionListenMsg, SessionMsgQueue,
-    SessionProducer, SessionUnlistenMsg, SessionUnlistenReplyMsg, SingleProducer,
+    SessionProducer, SessionUnlistenMsg, SessionUnlistenReplyMsg,
 };
 use hammer_runtime::{DataWorkerId, RuntimeResult, SessionConnectEndpoint};
 
@@ -13,7 +13,7 @@ impl SessionMain {
     pub fn dispatch_application_session_mq(
         &self,
         application: u32,
-        requests: &mut SessionMsgQueue<SingleProducer>,
+        requests: &mut SessionMsgQueue,
         replies: &mut SessionProducer,
     ) -> RuntimeResult<()> {
         // One bad element never strands later requests (VPP
