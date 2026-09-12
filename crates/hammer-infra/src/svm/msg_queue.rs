@@ -17,7 +17,7 @@ use posix_sync::mutex::{
 use zerocopy::{FromBytes, Immutable, IntoBytes, KnownLayout};
 
 use crate::align::align_up;
-use crate::svm::segment::{SvmSegment, SvmSegmentError};
+use crate::svm::ssvm::{SsvmError, SsvmPrivate};
 
 const MSG_QUEUE_MAGIC: u64 = 0x4841_4d4d_4552_4d51;
 const MSG_QUEUE_VERSION: u32 = 1;
@@ -97,7 +97,7 @@ pub enum SvmMsgQueueError {
     #[error("message queue header version {version} is unsupported")]
     UnsupportedVersion { version: u32 },
     #[error("message queue segment operation failed: {0}")]
-    Segment(#[from] SvmSegmentError),
+    Segment(#[from] SsvmError),
     #[error("message queue mutex owner died")]
     OwnerDied,
     #[error("message queue mutex is not recoverable: {source}")]
@@ -155,7 +155,7 @@ struct MessageRingHeader {
 }
 
 pub struct SvmMsgQueue<'segment> {
-    segment: &'segment SvmSegment,
+    segment: &'segment SsvmPrivate,
     header_offset: u64,
     header: *mut MessageQueueHeader,
     descriptors: *mut MsgDescriptor,
@@ -203,7 +203,7 @@ impl<'segment> SvmMsgQueue<'segment> {
     }
 
     pub unsafe fn init_at(
-        segment: &'segment SvmSegment,
+        segment: &'segment SsvmPrivate,
         offset: u64,
         config: &SvmMsgQueueConfig<'_>,
     ) -> Result<Self, SvmMsgQueueError> {
@@ -296,7 +296,7 @@ impl<'segment> SvmMsgQueue<'segment> {
     }
 
     pub unsafe fn attach(
-        segment: &'segment SvmSegment,
+        segment: &'segment SsvmPrivate,
         offset: u64,
     ) -> Result<Self, SvmMsgQueueError> {
         let base = segment.offset_ptr(offset, size_of::<MessageQueueHeader>(), 64)?;

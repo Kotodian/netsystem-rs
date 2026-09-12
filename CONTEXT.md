@@ -636,11 +636,13 @@ redesign (offset heap, name table, independent subregions) is specified in
 section 12 of that ADR.
 Terminology here is not a claim that the migration has been implemented.
 
-**SvmSegment**:
-The SVM mapping and backing-resource owner used by shared regions, FIFO
-segments, and API memory bootstrap. A segment is distinct from the allocator
-or protocol state placed in its storage.
-_Avoid_: Segment, shared-memory wrapper, application segment owner
+**SsvmPrivate**:
+The shared-VM mapping owner (`ssvm_private_t`) used by shared regions, FIFO
+segments, and API memory bootstrap. It owns the mapping, the backing
+descriptor, and the mapping's shared header; the allocator or protocol state
+placed in its payload belongs to the region or FIFO segment that lays it out.
+The mapping records `ssvm_va = 0` unless a creator asks for a fixed address.
+_Avoid_: SvmSegment, Segment, shared-memory wrapper, application segment owner
 
 **SvmRegion**:
 A general SVM region with its own metadata, data allocation authority, client
@@ -648,7 +650,7 @@ membership, and published root. Its segment payload is a fixed header followed
 by a metadata heap and, when present, a data portion; every shared location is
 an offset, never a process-local pointer. A region does not own the mapping,
 descriptor, or backend, and it is closed rather than repaired when its lock
-owner dies. It can occupy an existing SvmSegment and is not limited to App
+owner dies. It can occupy an existing SsvmPrivate mapping and is not limited to App
 Sessions.
 _Avoid_: mmap wrapper, FIFO segment, API registration, RegionName, root_path, backing_file
 
@@ -656,7 +658,7 @@ _Avoid_: mmap wrapper, FIFO segment, API registration, RegionName, root_path, ba
 The named-root authority of a subdivided region. It lives in the root region's
 metadata heap and holds the region name table and the monotonic subregion
 identity counter. It does not reserve or carve a virtual-address range and does
-not own subregion mappings; each subregion is its own SvmSegment whose
+not own subregion mappings; each subregion is its own SsvmPrivate mapping whose
 descriptor is exchanged by the daemon outside the shared region.
 _Avoid_: API Main, process-global memory allocator, subregion pool, name hash
 

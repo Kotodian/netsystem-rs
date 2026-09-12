@@ -6,7 +6,8 @@
   `SvmHashMap<V>` 与 A13 region owner（`SvmRegion`/`SvmRegionMain`/`RegionLock`/
   `RegionMembership`）已按 §12.4/§12.5/§12.7 落地并带测试（见 §12.11）。Linux 优先，
   macOS/iOS 不在本轮设计验证范围；`Segment`/`Fifo`/`MultiRingMsgQueue` 等其余生产
-  代码尚未迁移。
+  代码尚未迁移。2026-09-12 更新：§13 的 `ssvm` 映射层命名、字段与生命周期对齐已实现
+  （`crates/hammer-infra/src/svm/ssvm.rs`，测试 `crates/hammer-infra/tests/svm_ssvm.rs`）。
 - 请求：完整核对 VPP `src/svm`，删除 Hammer `MultiRingQueue`，Rust 支持对应的 `CLIB_MARCH_FN`，更新 ADR 和 CONTEXT。
 - Hammer 基线：`418aa0953d929f4175370ce1873066f4ff193f38`。
 - VPP 参考：官方 FDio/vpp `629fe2764bd997189fedd2d98cbe8dc9189c1ec3`。
@@ -33,7 +34,7 @@
 
 | VPP 文件 | 类型、函数族及职责 | Hammer 目标归属 |
 | --- | --- | --- |
-| `ssvm.h/c` | `ssvm_private_t`、`ssvm_shared_header_t`；server/client init、delete，SHM/MEMFD/PRIVATE backend，ready 和映射生命周期 | infra `svm::segment`：映射与 backing resource |
+| `ssvm.h/c` | `ssvm_private_t`、`ssvm_shared_header_t`；server/client init、delete，SHM/MEMFD/PRIVATE backend，ready 和映射生命周期 | infra `svm::ssvm`（§13）：映射与 backing resource |
 | `svm_common.h`、`svm.h/c` | `svm_region_t`、`svm_main_region_t`、`svm_subregion_t`、`svm_map_region_args_t`；根/子 region、find-or-create、成员扫描、map/unmap、metadata/data heap、user root | infra `svm::region`：region authority |
 | `fifo_types.h` | `svm_fifo_shared_t`、`svm_fifo_t`、chunk、OOO、signals；共享/私有 FIFO 和 segment slice 状态 | infra `svm::fifo`、`svm::fifo_segment` |
 | `fifo_segment.h/c` | `fifo_segment_t`、`fifo_segment_main_t`、shared/private slice；create/attach/delete、FIFO/chunk 分配回收、迁移、MQ 存储、预分配及压力统计 | infra FIFO segment；Session 保留应用策略 |
@@ -1286,7 +1287,7 @@ client detach 与在途消息；持锁 peer 退出。当前没有执行这些行
 
 ```text
 svm.rs              子树文档与子模块声明
-svm/segment.rs      SvmSegment：映射、backing、ready
+svm/ssvm.rs         SsvmPrivate：映射、backing、ready
 svm/region.rs       SvmRegion、SvmRegionConfig、SvmRegionMain：region authority
 svm/queue.rs        SvmQueue<T>
 svm/msg_queue.rs    SvmMsgQueue
@@ -1294,7 +1295,7 @@ svm/fifo.rs         SVM 字节 FIFO
 svm/fifo_segment.rs SvmFifoSegment：FIFO 存储 owner
 ```
 
-公开路径相应变为 `hammer_infra::svm::{region,segment,queue,msg_queue,fifo,fifo_segment}`；
+公开路径相应变为 `hammer_infra::svm::{region,ssvm,queue,msg_queue,fifo,fifo_segment}`；
 `hammer_infra::page_size` 保留为 crate 根的重导出。新的 `svm/region_heap.rs`、
 `svm/hash_map.rs` 按 12.4/12.5 落在这棵子树内。留在 crate 根部的 `segment.rs`
 （旧 `Segment`）与 `multi_ring_msg_queue.rs` 是 §7 已登记的删除目标，不搬进子树。
@@ -1782,7 +1783,7 @@ pub struct RegionMembership<'a> { /* RAII：Drop 时从 client_pids 移除本 pi
 
 | 层 | 允许 | 禁止 | 验证 |
 | --- | --- | --- | --- |
-| `SvmSegment` | libc backing/mapping、fd、backend、ready、payload offset 定位 | allocator、region 语义、名字 | infra 独立编译；不同地址 attach |
+| `SsvmPrivate` | libc backing/mapping、fd、backend、ready、payload offset 定位 | allocator、region 语义、名字 | infra 独立编译；不同地址 attach |
 | `SvmRegionHeap` | 只操作自己 `[heap_start, heap_end)` 的 offset；失败终止 | 读 segment ready、碰 fd、访问 heap 外 | 子进程断言终止；块合并统计 |
 | `SvmHashMap` | 通过传入的 `&SvmRegionHeap` 分配/释放/借用；键字节由自己持有 | 持有进程 allocator 句柄、内部锁、`Drop` | 跨进程读写同一张表 |
 | `SvmRegion` | heap、成员、root、锁 | fd/munmap/segment ready、runtime/service/plugin 状态 | infra 独立编译；并发与 owner-death 测试 |
@@ -1839,3 +1840,272 @@ pub struct RegionMembership<'a> { /* RAII：Drop 时从 client_pids 移除本 pi
 - 未决：`SvmRegionHeap` 是否需要 `peak` 之外的压力统计（例如最大连续空闲块）、
   以及子区序号的持久化语义（重启后是否必须保持）。这两项不影响本节的类型与
   方法形状，实施前定稿即可。
+
+## 13. `ssvm` 重新设计：逐字对齐 VPP 映射层
+
+`src/svm` 的映射 owner 在 VPP 叫 `ssvm`，不叫 `svm_segment`。全仓库搜 `svm_segment`
+命中 21 处，全部落在 `ssvm_segment_type_t` 上（`ssvm.h:38-43`、`ssvm.c:429`、
+`fifo_segment.h:75`、`segment_manager.h:30`），不存在 `svm_segment_t`。Hammer 现有
+`crates/hammer-infra/src/svm/segment.rs` 的 `SvmSegment` 就是这一层，本节把它按
+`ssvm.h` 逐字对齐，并列出必须换形的字段。第 1 节的事实类别（`H`/`V`/`R`/`D`）
+继续适用；13.5/13.6 的改名与删除已实施，13.7 的覆盖情况见该节末。
+
+### 13.1 证据与决策
+
+| ID | VPP 来源 | 已核实事实 | 本节决策 |
+| --- | --- | --- | --- |
+| V22 | `ssvm.h:38-43` | `ssvm_segment_type_t` = `SSVM_SEGMENT_SHM`/`MEMFD`/`PRIVATE`，另有 `SSVM_N_SEGMENT_TYPES` | `SsvmSegmentBackend::{Shm,Memfd,Private}`，逐字对齐 |
+| V23 | `ssvm.h:46-70` | `ssvm_shared_header_t` 字段全集：`lock/owner_pid/recursion_count/tag/heap/ssvm_va/ssvm_size/server_pid/client_pid/name/opaque[7]/ready/type` | 字段映射见 13.2 |
+| V24 | `ssvm.h:72-87` | `ssvm_private_t` 字段全集；`numa` 标注 UNUSED；`fd` 与 `attach_timeout` 是 union | 字段映射见 13.3 |
+| V25 | `ssvm.h:88-131` | `ssvm_lock`/`ssvm_unlock`/`ssvm_lock_non_recursive`/`ssvm_unlock_non_recursive` 四个内联函数；全仓库搜 `ssvm_lock|ssvm_unlock` 命中 4 处，全部是这四个定义本身，零调用者 | 不移植 `lock/owner_pid/recursion_count/tag`：VPP 里没有使用者 |
+| V26 | `ssvm.c:100`、`:265`、`:389`；`mem_dlmalloc.c:79-83` | 段内堆用 `clib_mem_create_heap(..., 1 /*locked*/, ...)` 建立，`is_locked` 传入 `create_mspace_with_base(base, size, is_locked)`，即 dlmalloc mspace 自带锁 | ssvm 层不承担堆锁；Hammer 侧对应物是 `RegionLock`（§12.7），与 V25 的死锁无关 |
+| V27 | `ssvm.c:111-180` | shm client 轮询 `shm_open`+`fstat` 等 size>0，先 `mmap` 一页读 `ssvm_va`/`ssvm_size`，`munmap` 后按该 VA 重映射，最后写 `client_pid` | client 不再由调用方传 size；见 13.4 |
+| V28 | `ssvm.c:288-341` | memfd client 同样两步映射，但不等待 `ready` | memfd attach 不阻塞；`ready` 由应用层发布 |
+| V29 | `ssvm.c:106`、`:276`、`:153` | server 不设置 `ready`（注释 “The application has to set sh->ready”）；只有 shm client 在 `:153` 等 `ready` | `publish_ready`/`is_ready`/`wait_ready` 三个操作分开 |
+| V30 | `ssvm.c:182-207`、`:343-356` | shm 在 delete 时 unlink backing file；memfd delete 只 unmap + close | 现在 create 后立刻 `shm_unlink`（`segment.rs:288`）是错的；shm 名字在 attach 期间必须可见 |
+| V31 | `ssvm.c:441-455` | `ssvm_delete` 按 `sh->type` 分发；`ssvm_type()`/`ssvm_name()` 都从 shared header 读 | backend/name 必须进 header；现在 attach 后硬编码 `Memfd`（`segment.rs:139`）是错的 |
+| V32 | `fifo_segment.c:322-323` | fifo_segment 主动把 `sh->ssvm_va = 0`，注释 “Allow random offsets” | `ssvm_va` 只作可选 `MAP_FIXED` 协商，0 表示允许任意地址 |
+| V33 | `svm.c:1215-1229` | 多 client 由 region 的 `client_pids` 跟踪；`ssvm_shared_header_t.client_pid` 只记最后一个 attacher | header 保留 `server_pid`/`client_pid` 作诊断；成员权威在 region |
+| V34 | `ssvm.c:414-419` | `ssvm_client_init_private` 是 “BUG: this should not be called!” | 不移植 |
+
+### 13.2 `ssvm_shared_header_t` 字段映射
+
+```rust
+pub const SSVM_NAME_MAX: usize = 64;
+
+#[repr(C, align(64))]
+pub struct SsvmSharedHeader {
+    magic: u64,                  // Hammer 自有校验；VPP 无对应字段
+    version: u32,                // 同上
+    segment_type: u8,
+    padding: [u8; 3],
+    ssvm_size: u64,
+    ssvm_va: u64,
+    server_pid: u32,
+    client_pid: u32,
+    name_len: u32,
+    ready: AtomicU32,
+    name: [u8; SSVM_NAME_MAX],
+}
+```
+
+| VPP `ssvm_shared_header_t` | Hammer `SsvmSharedHeader` | 说明 |
+| --- | --- | --- |
+| `lock`/`owner_pid`/`recursion_count`/`tag` | — | 不移植；V25 证实零调用者 |
+| `heap` | — | 不移植；offset 化 `SvmRegionHeap` 取代段内 clib heap（§12.3/§12.4），shared 区不得存指针 |
+| `ssvm_va` | `ssvm_va: u64` | 固定宽度地址，只作 `MAP_FIXED` 协商与诊断，不解引用（V32）。Hammer 默认写 0（任意地址），只有 `SsvmConfig::requested_va != 0` 时才记录并要求 attacher 固定映射 |
+| — | `magic`/`version` | Hammer 自有的 header 校验；VPP 只靠 `ready`。attach 校验失败返回 `InvalidMagic`/`UnsupportedVersion` |
+| `ssvm_size` | `ssvm_size: u64` | 实际 mmap 大小 |
+| `server_pid` | `server_pid: u32` | 创建者 pid |
+| `client_pid` | `client_pid: u32` | 最后一个 attacher pid；成员权威在 region（V33） |
+| `name` | `name: [u8; SSVM_NAME_MAX]` + `name_len` | VPP 是堆内 vec；改内联定长，建堆之前就要有名字且不使用指针 |
+| `opaque[SSVM_N_OPAQUE]` | — | 不移植；typed offset 由 `SvmRegion::publish_root`/`root` 承担（§12.3） |
+| `ready` | `ready: AtomicU32` | 应用层 release 写 |
+| `type` | `segment_type: u8` | `SsvmSegmentBackend` |
+
+### 13.3 `ssvm_private_t` 字段映射
+
+```rust
+#[repr(C)]
+pub union SsvmBackendParameter {
+    pub fd: RawFd,                // memfd segments
+    pub attach_timeout: Duration, // shm segments attach timeout
+}
+
+pub struct SsvmPrivate {
+    base: *mut u8,
+    ssvm_size: usize,
+    backend: SsvmSegmentBackend,
+    is_server: bool,
+    requested_va: u64,
+    my_pid: u32,
+    name: CString,
+    numa: u8,
+    huge_page: bool,
+    backing: SsvmBackendParameter,
+}
+```
+
+字段私有：`SsvmPrivate` 只通过 13.4 的访问器暴露 `ssvm_va`/`ssvm_size`/`server_pid`/
+`client_pid`/`segment_type`/`name`/`is_server`/`numa`/`huge_page`/`fd`/`base`。
+
+| VPP `ssvm_private_t` | Hammer `SsvmPrivate` | 说明 |
+| --- | --- | --- |
+| `sh` | `base: *mut u8` + `shared_header()` | 不单独缓存第二处 header 指针；header 就在映射 offset 0，由 `base` 派生。进程私有对象内允许指针，shared 区仍禁止 |
+| `ssvm_size` | `ssvm_size: usize` | |
+| `requested_va` | `requested_va: u64` | |
+| `my_pid` | `my_pid: u32` | |
+| `name` | `name: CString` | 创建/attach 时的名字副本；共享权威在 header |
+| `numa` | `numa: u8` | VPP 标注 UNUSED，逐字保留字段 |
+| `is_server` | `is_server: bool` | |
+| `huge_page` | `huge_page: bool` | |
+| `fd` \| `attach_timeout`（匿名 union） | `backing: SsvmBackendParameter`（Rust `union`，字段名保持 `fd`/`attach_timeout`） | 逐字用 union，不拆成并列字段。不变量：`segment_type == Memfd` 时 `fd` 有效，`Shm` 时 `attach_timeout` 有效，`Private` 时两者都无效 |
+
+VPP 的 union 一律用 Rust `union` 逐字对应，不拆字段：本节是 `fd`|`attach_timeout`；
+FIFO 设计里的 `vpp_sh`（两个 `u32` 与 `u64` 的 union）与
+`ct_fifo`|`seg_ctx_index`+`ct_seg_index` 同规则。字段读取的位置由所属 backend/角色决定，
+只有该 backend 成立的读取才执行 `unsafe` 访问；写错分支是逻辑错误，不是可恢复错误。
+
+### 13.4 类型与方法
+
+```rust
+// crates/hammer-infra/src/svm/ssvm.rs
+impl SsvmPrivate {
+    // ssvm_server_init / _shm / _memfd / _private
+    pub fn server_init(config: &SsvmConfig) -> Result<Self, SsvmError>;
+    pub fn server_init_shm(config: &SsvmConfig) -> Result<Self, SsvmError>;
+    pub fn server_init_memfd(config: &SsvmConfig) -> Result<Self, SsvmError>;
+    pub fn server_init_private(config: &SsvmConfig) -> Result<Self, SsvmError>;
+
+    // ssvm_client_init / _shm / _memfd；_private 不移植（V34）
+    pub fn client_init(config: &SsvmConfig, fd: Option<RawFd>) -> Result<Self, SsvmError>;
+    pub fn client_init_shm(name: &str, attach_timeout: Duration) -> Result<Self, SsvmError>;
+    pub fn client_init_memfd(fd: RawFd) -> Result<Self, SsvmError>;
+
+    // ssvm_delete
+    pub fn delete(self);
+
+    // ssvm_type / ssvm_name：从 shared_header 读
+    pub fn segment_type(&self) -> SsvmSegmentBackend;
+    pub fn name(&self) -> &str;
+
+    pub fn base(&self) -> *mut u8;
+    pub fn ssvm_va(&self) -> u64;
+    pub fn ssvm_size(&self) -> usize;
+    pub fn server_pid(&self) -> u32;
+    pub fn client_pid(&self) -> u32;
+    pub fn fd(&self) -> Option<RawFd>;
+    pub fn is_server(&self) -> bool;
+    pub fn requested_va(&self) -> u64;
+    pub fn numa(&self) -> u8;
+    pub fn huge_page(&self) -> bool;
+
+    // ready：由 region / fifo segment 初始化完后发布，ssvm 自己不设置（V29）
+    pub fn is_ready(&self) -> bool;
+    pub fn publish_ready(&self);
+    pub fn wait_ready(&self, timeout: Duration) -> Result<(), SsvmError>;
+
+    // payload 定位
+    pub fn payload_offset(&self) -> u64;
+    pub fn payload_len(&self) -> u64;
+    pub fn offset_ptr(&self, offset: u64, length: usize, alignment: usize)
+        -> Result<*mut u8, SsvmError>;
+}
+```
+
+```rust
+pub enum SsvmSegmentBackend { Shm, Memfd, Private }   // ssvm_segment_type_t
+
+pub struct SsvmConfig {                                // server 侧入参
+    pub backend: SsvmSegmentBackend,
+    pub name: String,
+    pub size: usize,
+    pub requested_va: u64,
+    pub huge_page: bool,
+    pub attach_timeout: Duration,                      // attacher 等待段与 ready 的上限
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum SsvmError {
+    #[error("segment name must be 1..{max} bytes and must not contain NUL")]
+    NoName { max: usize },
+    #[error("segment size is not set")]
+    NoSize,
+    #[error("segment size {requested} is too small for the segment header")]
+    SizeTooSmall { requested: usize },
+    #[error("segment backend is unavailable on this platform")]
+    BackendUnavailable,
+    #[error("segment attach needs a backing descriptor for this backend")]
+    MissingBackingDescriptor,
+    #[error("shared segment backend {value} is invalid")]
+    InvalidBackend { value: u8 },
+    #[error("segment system call failed during {operation}: {source}")]
+    Io { operation: &'static str, #[source] source: io::Error },
+    #[error("client did not map segment {name} within {seconds} s")]
+    ClientTimeout { name: String, seconds: u64 },
+    #[error("segment header magic is invalid")]
+    InvalidMagic,
+    #[error("segment header version {version} is unsupported")]
+    UnsupportedVersion { version: u32 },
+    #[error("segment header size {declared} does not match mapping size {mapped}")]
+    SizeMismatch { declared: u64, mapped: usize },
+    #[error("segment header is not ready")]
+    NotReady,
+    #[error("segment offset {offset} with length {length} is outside {size} bytes")]
+    OutOfBounds { offset: u64, length: usize, size: usize },
+    #[error("segment offset {offset} is not aligned to {alignment}")]
+    Misaligned { offset: u64, alignment: usize },
+}
+```
+
+### 13.5 命名与影响面
+
+| 现状 | 改为 | VPP 对应 |
+| --- | --- | --- |
+| `svm/segment.rs` | `svm/ssvm.rs` | `ssvm.c` |
+| `SvmSegment` | `SsvmPrivate` | `ssvm_private_t` |
+| `SegmentHeader` | `SsvmSharedHeader` | `ssvm_shared_header_t` |
+| `SegmentBackend` | `SsvmSegmentBackend` | `ssvm_segment_type_t` |
+| `SvmSegmentConfig` | `SsvmConfig` | `ssvm_private_t` 的调用方入参（VPP 无独立类型） |
+| `SvmSegmentError` | `SsvmError` | `foreach_ssvm_api_error` |
+| `SVM_SEGMENT_PAYLOAD_OFFSET` | `SSVM_PAYLOAD_OFFSET` | Hammer 自有概念，命名随层 |
+| `SvmRegion::segment()` | `SvmRegion::ssvm()` | `svm_region_t` 持有映射的访问器 |
+| `SvmQueue::segment()` | `SvmQueue::ssvm()` | 同上 |
+| `SvmFifoSegment::segment()` | `SvmFifoSegment::ssvm()` | 同上 |
+
+已改名的调用点：`svm/region.rs`、`svm/queue.rs`、`svm/msg_queue.rs`、
+`svm/fifo_segment.rs`、`tests/svm_region.rs`；`svm/segment.rs` 删除。`svm/fifo.rs`
+未改：它用的是 crate 根部的旧 `Segment`，属 §14 的 FIFO 重做范围。§2 目录范围表与
+本节的 `svm::ssvm` 目标归属、§12.9 层隔离表中的 `SsvmPrivate` 行都按本表改名，
+职责与禁止项不变。
+
+### 13.6 删除账本
+
+| 现状 | 处理 | 证明 |
+| --- | --- | --- |
+| `SegmentHeader` 的 `magic/version/size/ready` 布局 | 扩成 13.2 的 `SsvmSharedHeader`，不含锁/heap/opaque | 13.2 字段逐项核对 |
+| `SvmSegment::attach(fd, size)` 由调用方传 size | 删除该签名，改为 `client_init_memfd(fd)`，size/va 从 header 读（V27/V28） | 调用方不再可能传错 size；跨进程 attach 用例 |
+| `attach` 内 `validate_header` 要求 `ready` | 拆开：attach 只校验 magic/version/size/backend，ready 由 `wait_ready` 表达（V29） | region 初始化顺序不再被 attach 打死 |
+| `create_shared` 内立即 `shm_unlink` | 删除，改为 delete 时 unlink（V30） | 第二个进程能按名字 attach |
+| `attach` 内硬编码 `SegmentBackend::Memfd` | 删除，backend 从 header 读（V31） | attach 后 `segment_type()` 与创建者一致 |
+| `SvmSegmentError::NotReady` 由 attach 返回 | 保留变体，改由 `wait_ready` 返回 | shm 超时用例 |
+| `numa`/`huge_page` | 保留字段（V24 逐字对齐），运行时未使用 | 13.3 映射表 |
+
+本节 13.6 的删除项已随 `crates/hammer-infra/src/svm/ssvm.rs` 一起实施：
+`svm/segment.rs` 删除，旧 `create`/`memfd`/`shm`/`attach(fd, size)`/`close` 入口
+全部由 13.4 的 `server_init*`/`client_init*`/`delete` 取代。`client_init_memfd`
+保留“调用方仍持有自己的 fd”语义：映射内部复制一份并负责关闭。
+
+### 13.7 验证矩阵
+
+| 行为 | 方式 | 通过条件 |
+| --- | --- | --- |
+| memfd 跨进程 attach | 父进程 `server_init_memfd` 后经 `SCM_RIGHTS` 传 fd，exec 子进程 `client_init_memfd` | 子进程 `ssvm_size`/`ssvm_va`/`segment_type`/`name` 与父进程一致；两进程写同一 offset 互相可见 |
+| attach 不由调用方传 size | 子进程只凭 fd 得到 size | header 声明 size 与实际映射一致；篡改 size 时返回 `SizeMismatch` |
+| 任意 VA | 创建者与 attacher 映射地址不同 | 地址不同仍能按 offset 访问同一逻辑对象（沿用 §12.11 跨进程用例） |
+| `ssvm_va != 0` 的固定映射 | 创建者记录 VA 且 attacher 请求固定映射 | 两进程基址相同；该 VA 被占用时返回 `Io` 而不是静默换址 |
+| shm 名字可见 | `server_init_shm` 后、`delete` 前另一进程 `client_init_shm` | attach 成功；delete 后名字不可见 |
+| shm ready 等待 | server 未 `publish_ready` 时 `client_init_shm` | 超时返回 `ClientTimeout{name,seconds}`；`publish_ready` 后 attach 成功 |
+| memfd 不等 ready | server 未发布 ready 时 `client_init_memfd` | 立即返回且 `is_ready()` 为 false（V28） |
+| backend/name 从 header 读 | attach 后查 `segment_type()`/`name()` | 与创建者参数一致 |
+| ready 发布语义 | `SvmRegion`/`SvmFifoSegment` 初始化完成后才 `publish_ready` | attach 侧在 ready 之前不把 payload 当已初始化 |
+| 不移植残留锁 | 源码清单核对 | `ssvm.rs` 无 `lock`/`owner_pid`/`recursion_count`/`tag` 字段与自旋锁实现 |
+
+已实现并有测试覆盖（`crates/hammer-infra/tests/svm_ssvm.rs`）：header 身份与
+payload 边界、memfd attach 从 header 取 size/name/backend、跨映射写读同一 offset、
+`ready` 未发布时不阻塞 attach、`wait_ready` 超时、shm 按名字 attach 与 delete
+unlink、private 不可 attach、空名/超长名/0 size 的 typed 失败、offset 越界与
+未对齐拒绝。未覆盖：`requested_va != 0` 的固定映射用例（依赖地址占用情况，属
+未决 1 决定后再补）；13.7 的 shm “第二个进程”用例目前是同进程内两个映射。
+
+### 13.8 批准请求与未决项
+
+- A14（已完成）：`SsvmPrivate`/`SsvmSharedHeader`/`SsvmSegmentBackend`/`SsvmConfig`/
+  `SsvmError` 落在 `crates/hammer-infra/src/svm/ssvm.rs`，取代 A1 中 `SvmSegment`
+  的命名与 13.6 的旧签名；测试见 `crates/hammer-infra/tests/svm_ssvm.rs`。
+- A15（已完成）：`SsvmPrivate` 的方法集按 13.4；`server_init`/`client_init` 的通用
+  入口与 `_shm`/`_memfd`/`_private` 专用入口并存，与 VPP 一致。
+- 未决 1：`Shm` backend 是否保留。app/session 边界走 socket + `SCM_RIGHTS`
+  （VPP 的 fifo segment 也用 memfd）；VPP 的 shm 服务于 vlibmemory。保留则必须
+  满足 13.7 的两条 shm 用例。
+- 未决 2：`SSVM_NAME_MAX`（本节取 64）与 region 名字上限 256 是否统一为同一常量。

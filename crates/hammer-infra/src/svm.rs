@@ -15,4 +15,4 @@ pub mod msg_queue;
 pub mod queue;
 pub mod region;
 pub mod region_heap;
-pub mod segment;
+pub mod ssvm;

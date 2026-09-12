@@ -3,7 +3,7 @@
 use std::sync::Arc;
 
 use crate::svm::fifo::{Fifo, FifoError};
-use crate::svm::segment::SvmSegment;
+use crate::svm::ssvm::SsvmPrivate;
 
 #[derive(Debug, Clone, Copy)]
 pub struct SvmFifoSegmentConfig {
@@ -11,7 +11,7 @@ pub struct SvmFifoSegmentConfig {
 }
 
 pub struct SvmFifoSegment {
-    segment: Arc<SvmSegment>,
+    segment: Arc<SsvmPrivate>,
     slices: Vec<Vec<Fifo>>,
     capacity_bytes: usize,
 }
@@ -21,7 +21,7 @@ pub struct SvmFifoSegmentMain {
 }
 
 impl SvmFifoSegment {
-    pub fn new(segment: Arc<SvmSegment>, config: SvmFifoSegmentConfig) -> Result<Self, FifoError> {
+    pub fn new(segment: Arc<SsvmPrivate>, config: SvmFifoSegmentConfig) -> Result<Self, FifoError> {
         if config.slices == 0 {
             return Err(FifoError::InvalidCapacity);
         }
@@ -71,14 +71,14 @@ impl SvmFifoSegment {
     }
 
     pub fn available_bytes(&self) -> usize {
-        self.segment.size().saturating_sub(self.capacity_bytes)
+        self.segment.ssvm_size().saturating_sub(self.capacity_bytes)
     }
 
     pub fn cached_bytes(&self) -> usize {
         self.capacity_bytes
     }
 
-    pub fn segment(&self) -> &Arc<SvmSegment> {
+    pub fn ssvm(&self) -> &Arc<SsvmPrivate> {
         &self.segment
     }
 }

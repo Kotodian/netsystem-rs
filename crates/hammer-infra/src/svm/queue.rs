@@ -1,4 +1,4 @@
-//! Fixed-size typed queue backed by an [`SvmSegment`].
+//! Fixed-size typed queue backed by an [`SsvmPrivate`].
 
 use std::alloc::{Layout, LayoutError};
 use std::marker::PhantomData;
@@ -16,7 +16,7 @@ use posix_sync::mutex::{
 };
 use zerocopy::{FromBytes, Immutable, IntoBytes, KnownLayout};
 
-use crate::svm::segment::{SvmSegment, SvmSegmentError};
+use crate::svm::ssvm::{SsvmError, SsvmPrivate};
 
 const QUEUE_MAGIC: u64 = 0x4841_4d4d_4552_5155;
 const QUEUE_VERSION: u32 = 1;
@@ -56,7 +56,7 @@ pub enum SvmQueueError {
     #[error("queue offset {offset} is outside the segment")]
     InvalidOffset { offset: u64 },
     #[error("queue segment operation failed: {0}")]
-    Segment(#[from] SvmSegmentError),
+    Segment(#[from] SsvmError),
     #[error("queue mutex owner died")]
     OwnerDied,
     #[error("queue mutex is not recoverable: {source}")]
@@ -93,7 +93,7 @@ struct QueueHeader {
 }
 
 pub struct SvmQueue<'segment, T> {
-    segment: &'segment SvmSegment,
+    segment: &'segment SsvmPrivate,
     header_offset: u64,
     header: *mut QueueHeader,
     elements: *mut u8,
@@ -127,7 +127,7 @@ where
     /// The caller owns the allocation represented by `offset`; this method
     /// only writes the queue header and never allocates from the segment.
     pub unsafe fn init_at(
-        segment: &'segment SvmSegment,
+        segment: &'segment SsvmPrivate,
         offset: u64,
         config: &SvmQueueConfig,
     ) -> Result<Self, SvmQueueError> {
@@ -182,7 +182,7 @@ where
 
     /// Attaches to an initialized queue without reconstructing any allocator.
     pub unsafe fn attach(
-        segment: &'segment SvmSegment,
+        segment: &'segment SsvmPrivate,
         offset: u64,
     ) -> Result<Self, SvmQueueError> {
         let header_ptr =
@@ -243,7 +243,7 @@ where
         })
     }
 
-    pub fn segment(&self) -> &SvmSegment {
+    pub fn ssvm(&self) -> &SsvmPrivate {
         self.segment
     }
 

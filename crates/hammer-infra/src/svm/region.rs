@@ -2,7 +2,7 @@
 //!
 //! Rust counterpart of VPP's `svm_region_t` / `svm_main_region_t` (ADR-0011
 //! section 12). A region is the metadata and allocation authority living inside
-//! one [`SvmSegment`] payload: a fixed header, one or two [`SvmRegionHeap`]
+//! one [`SsvmPrivate`] payload: a fixed header, one or two [`SvmRegionHeap`]
 //! instances, the member table, and - for a subdivided root - the
 //! [`SvmRegionMain`] subregion name registry.
 //!
@@ -33,7 +33,7 @@ use posix_sync::mutex::{
 
 use crate::svm::hash_map::{SvmHashMap, SvmKeys};
 use crate::svm::region_heap::SvmRegionHeap;
-use crate::svm::segment::{SVM_SEGMENT_PAYLOAD_OFFSET, SvmSegment, SvmSegmentError};
+use crate::svm::ssvm::{SSVM_PAYLOAD_OFFSET, SsvmError, SsvmPrivate};
 
 /// Region version; a nonzero `version` is the single ready authority.
 ///
@@ -234,7 +234,7 @@ pub enum SvmRegionError {
         source: posix_sync::mutex::MutexLockError,
     },
     #[error("region segment operation failed: {0}")]
-    Segment(#[from] SvmSegmentError),
+    Segment(#[from] SsvmError),
 }
 
 /// Configuration of a region created inside one segment payload.
@@ -247,20 +247,20 @@ pub struct SvmRegionConfig {
     pub flags: u64,
 }
 
-/// Owner handle for one region inside an [`SvmSegment`].
+/// Owner handle for one region inside an [`SsvmPrivate`].
 ///
 /// The handle is process-local; the state it reaches is shared. Every method
 /// that touches shared state takes the region mutex first, so a caller does not
 /// have to know the section layout or remember which fields need serialization.
 pub struct SvmRegion {
-    segment: Arc<SvmSegment>,
+    segment: Arc<SsvmPrivate>,
     header_offset: u64,
     mutex: BorrowedMutex<'static, Robust>,
 }
 
 /// Lifetime witness for mutexes that live inside a region mapping.
 ///
-/// [`SvmRegion`] owns the [`SvmSegment`] that keeps the payload mapped, so the
+/// [`SvmRegion`] owns the [`SsvmPrivate`] that keeps the payload mapped, so the
 /// mutex bytes outlive every borrow of the region; this value supplies that
 /// lifetime to the borrowed-mutex constructors.
 struct RegionMappingAnchor;
@@ -440,7 +440,7 @@ impl SvmRegion {
         let payload = config
             .size
             .max(data_section_start(config.flags).saturating_add(MINIMUM_HEAP_BYTES));
-        let requested = SVM_SEGMENT_PAYLOAD_OFFSET.saturating_add(payload);
+        let requested = SSVM_PAYLOAD_OFFSET.saturating_add(payload);
         let size = usize::try_from(requested).map_err(|_| SvmRegionError::InvalidBounds {
             offset: 0,
             length: requested,
@@ -458,11 +458,11 @@ impl SvmRegion {
     /// The segment stays unpublished until the header is complete, so no other
     /// process can attach to a half-initialized region.
     pub fn create(
-        segment: Arc<SvmSegment>,
+        segment: Arc<SsvmPrivate>,
         config: &SvmRegionConfig,
     ) -> Result<Self, SvmRegionError> {
         validate_region_flags(config.flags)?;
-        if !segment.is_creator() {
+        if !segment.is_server() {
             return Err(SvmRegionError::UnsupportedOperation {
                 operation: RegionOperation::CreateOnAttachedSegment,
             });
@@ -584,7 +584,7 @@ impl SvmRegion {
     ///
     /// Validation happens before any shared state is used, and attach never
     /// mutates the member table: membership is an explicit [`Self::join`].
-    pub fn attach(segment: Arc<SvmSegment>) -> Result<Self, SvmRegionError> {
+    pub fn attach(segment: Arc<SsvmPrivate>) -> Result<Self, SvmRegionError> {
         let header_offset = segment.payload_offset();
         let payload_len = segment.payload_len();
         let header_pointer =
@@ -690,8 +690,8 @@ impl SvmRegion {
         })
     }
 
-    /// Segment this region lives in.
-    pub fn segment(&self) -> &Arc<SvmSegment> {
+    /// Mapping this region lives in.
+    pub fn ssvm(&self) -> &Arc<SsvmPrivate> {
         &self.segment
     }
 

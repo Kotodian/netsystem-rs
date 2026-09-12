@@ -12,17 +12,17 @@ use std::mem::size_of;
 use std::process::{Command, Stdio};
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
+use std::time::Duration;
 
 use hammer_infra::svm::region::{
     REGION_FLAG_DATA_HEAP, REGION_FLAG_SUBDIVIDED, RegionLockTag, SvmRegion, SvmRegionConfig,
     SvmRegionError, SvmRegionHeader, SvmRegionState,
 };
 use hammer_infra::svm::region_heap::SvmRegionHeap;
-use hammer_infra::svm::segment::{SVM_SEGMENT_PAYLOAD_OFFSET, SvmSegment};
+use hammer_infra::svm::ssvm::{SSVM_PAYLOAD_OFFSET, SsvmConfig, SsvmPrivate, SsvmSegmentBackend};
 
 const CHILD_CASE: &str = "HAMMER_SVM_REGION_CHILD_CASE";
 const CHILD_FD: &str = "HAMMER_SVM_REGION_CHILD_FD";
-const CHILD_SIZE: &str = "HAMMER_SVM_REGION_CHILD_SIZE";
 const CHILD_TEST: &str = "region_is_reachable_from_another_process";
 const CHILD_LOCK_TEST: &str = "region_lock_owner_death_fails_the_region";
 const REGION_BYTES: u64 = 1 << 20;
@@ -51,21 +51,30 @@ fn header_end() -> u64 {
 
 /// Creates a segment plus region for `config`, using the layout the region asks
 /// for so the mapping size and the region layout cannot drift apart.
-fn create_region(config: &SvmRegionConfig) -> Result<(Arc<SvmSegment>, SvmRegion), SvmRegionError> {
+fn create_region(
+    config: &SvmRegionConfig,
+) -> Result<(Arc<SsvmPrivate>, SvmRegion), SvmRegionError> {
     let mapping = SvmRegion::layout(config)?;
-    let segment = Arc::new(SvmSegment::memfd("hammer-svm-region-test", mapping.size())?);
+    let segment = Arc::new(SsvmPrivate::server_init_memfd(&SsvmConfig {
+        backend: SsvmSegmentBackend::Memfd,
+        name: "hammer-svm-region-test".to_string(),
+        size: mapping.size(),
+        requested_va: 0,
+        huge_page: false,
+        attach_timeout: Duration::from_secs(5),
+    })?);
     let region = SvmRegion::create(Arc::clone(&segment), config)?;
     Ok((segment, region))
 }
 
-fn header(region: &SvmRegion, segment: &SvmSegment) -> *mut SvmRegionHeader {
+fn header(region: &SvmRegion, segment: &SsvmPrivate) -> *mut SvmRegionHeader {
     segment
         .offset_ptr(region.header_offset(), size_of::<SvmRegionHeader>(), 64)
         .expect("region header inside mapping")
         .cast()
 }
 
-fn read_payload(segment: &SvmSegment, region: &SvmRegion, offset: u64, length: usize) -> Vec<u8> {
+fn read_payload(segment: &SsvmPrivate, region: &SvmRegion, offset: u64, length: usize) -> Vec<u8> {
     let pointer = segment
         .offset_ptr(region.header_offset() + offset, length, 1)
         .expect("payload range inside mapping");
@@ -74,7 +83,7 @@ fn read_payload(segment: &SvmSegment, region: &SvmRegion, offset: u64, length: u
     unsafe { std::slice::from_raw_parts(pointer, length) }.to_vec()
 }
 
-fn write_payload(segment: &SvmSegment, region: &SvmRegion, offset: u64, bytes: &[u8]) {
+fn write_payload(segment: &SsvmPrivate, region: &SvmRegion, offset: u64, bytes: &[u8]) {
     let pointer = segment
         .offset_ptr(region.header_offset() + offset, bytes.len(), 1)
         .expect("payload range inside mapping");
@@ -87,7 +96,7 @@ fn region_layout_reserves_header_metadata_and_data() {
     let subdivided = SvmRegion::layout(&subdivided_config()).expect("subdivided layout");
     let regular = SvmRegion::layout(&data_heap_config()).expect("regular layout");
     assert!(
-        subdivided.size() as u64 >= REGION_BYTES + SVM_SEGMENT_PAYLOAD_OFFSET,
+        subdivided.size() as u64 >= REGION_BYTES + SSVM_PAYLOAD_OFFSET,
         "subdivided mapping {} cannot hold the header and a heap",
         subdivided.size()
     );
@@ -107,7 +116,7 @@ fn region_layout_reserves_header_metadata_and_data() {
     .expect("minimum regular layout");
     assert_eq!(
         smallest_subdivided.size() as u64,
-        SVM_SEGMENT_PAYLOAD_OFFSET + header_end() + 64
+        SSVM_PAYLOAD_OFFSET + header_end() + 64
     );
     assert!(
         smallest_regular.size() > smallest_subdivided.size(),
@@ -138,8 +147,8 @@ fn region_publishes_and_reports_its_shared_header() -> Result<(), SvmRegionError
     assert_eq!(region.flags()?, REGION_FLAG_SUBDIVIDED);
     assert_eq!(region.state()?, SvmRegionState::Ready);
     assert_eq!(region.virtual_size()?, segment.payload_len());
-    assert_eq!(region.header_offset(), SVM_SEGMENT_PAYLOAD_OFFSET);
-    assert!(Arc::ptr_eq(region.segment(), &segment));
+    assert_eq!(region.header_offset(), SSVM_PAYLOAD_OFFSET);
+    assert!(Arc::ptr_eq(region.ssvm(), &segment));
 
     let attached = SvmRegion::attach(Arc::clone(&segment))?;
     assert_eq!(attached.flags()?, REGION_FLAG_SUBDIVIDED);
@@ -291,7 +300,7 @@ fn region_create_requires_a_created_segment() -> Result<(), SvmRegionError> {
     let (segment, region) = create_region(&subdivided_config())?;
     drop(region);
     let fd = segment.fd().expect("shared descriptor");
-    let attached = SvmSegment::attach(fd, segment.size())?;
+    let attached = SsvmPrivate::client_init_memfd(fd)?;
     match SvmRegion::create(Arc::new(attached), &subdivided_config()) {
         Err(SvmRegionError::UnsupportedOperation { .. }) => Ok(()),
         other => panic!("attached segments cannot create a region, got {other:?}"),
@@ -526,13 +535,13 @@ fn region_lock_owner_death_fails_the_region() -> Result<(), SvmRegionError> {
     }
 }
 
-fn spawn_child(test: &str, case: &str, segment: &Arc<SvmSegment>) -> std::process::Output {
+fn spawn_child(test: &str, case: &str, segment: &Arc<SsvmPrivate>) -> std::process::Output {
     spawn_child_process(test, case, segment)
         .wait_with_output()
         .expect("child output")
 }
 
-fn spawn_child_process(test: &str, case: &str, segment: &Arc<SvmSegment>) -> std::process::Child {
+fn spawn_child_process(test: &str, case: &str, segment: &Arc<SsvmPrivate>) -> std::process::Child {
     let descriptor = segment.fd().expect("shared descriptor");
     // The descriptor crosses exec only once CLOEXEC is cleared.
     let cleared = unsafe { libc::fcntl(descriptor, libc::F_SETFD, 0) };
@@ -541,7 +550,6 @@ fn spawn_child_process(test: &str, case: &str, segment: &Arc<SvmSegment>) -> std
         .args(["--exact", test, "--nocapture"])
         .env(CHILD_CASE, case)
         .env(CHILD_FD, descriptor.to_string())
-        .env(CHILD_SIZE, segment.size().to_string())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
@@ -554,11 +562,7 @@ fn run_child(case: &str) {
         .expect("child descriptor")
         .parse()
         .expect("descriptor number");
-    let size: usize = std::env::var(CHILD_SIZE)
-        .expect("child mapping size")
-        .parse()
-        .expect("mapping size");
-    let segment = SvmSegment::attach(descriptor, size).expect("child segment attach");
+    let segment = SsvmPrivate::client_init_memfd(descriptor).expect("child segment attach");
     let region = SvmRegion::attach(Arc::new(segment)).expect("child region attach");
     match case {
         "shared" => {
@@ -567,7 +571,7 @@ fn run_child(case: &str) {
                 .expect("child registry read")
                 .expect("child sees the parent's subregion");
             eprintln!("child: subregion={subregion}");
-            eprintln!("child: base={:p}", region.segment().base());
+            eprintln!("child: base={:p}", region.ssvm().base());
             let membership = region.join().expect("child join");
             eprintln!("child: joined");
             let offset = region
@@ -575,7 +579,7 @@ fn run_child(case: &str) {
                 .expect("child allocation from the shared heap");
             eprintln!("child: marker={offset}");
             let pointer = region
-                .segment()
+                .ssvm()
                 .offset_ptr(region.header_offset() + offset, 4, 1)
                 .expect("child marker inside mapping");
             // SAFETY: the child owns the block it just allocated and no other
