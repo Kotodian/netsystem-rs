@@ -463,31 +463,36 @@ wrapper 和 8-byte union 分开。Hammer 采用同一职责划分，不把 paylo
 use posix_sync::condvar::{BorrowedCondvar, RawCondvarAlloc};
 use posix_sync::mutex::{BorrowedMutex, RawMutexAlloc};
 use posix_sync::mutex::robustness_markers::Robust;
-use std::mem::MaybeUninit;
 use std::marker::PhantomData;
-#[repr(C)]
-#[derive(Clone, Copy)]
-pub struct SvmMsgQDescriptorParts {
-    pub ring_index: u32,
-    pub elt_index: u32,
-}
-
+use std::mem::MaybeUninit;
+use std::os::fd::OwnedFd;
+use std::ptr::NonNull;
+use crate::sync::SpinLock;
 #[repr(C)]
 pub union SvmMsgQDescriptor {
-    pub parts: SvmMsgQDescriptorParts,
+    words: [u32; 2],
     pub as_u64: u64,
 }
 
 #[repr(C)]
-pub struct SvmMsgQSharedQueue {
-    pub mutex: RawMutexAlloc,
-    pub condvar: RawCondvarAlloc,
-    pub head: u32,
-    pub tail: u32,
-    pub cursize: u32,
-    pub maxsize: u32,
-    pub elsize: u32,
-    pub descriptors_offset: u64,
+struct SvmMsgQSharedQueue {
+    mutex: MaybeUninit<RawMutexAlloc>,
+    condvar: MaybeUninit<RawCondvarAlloc>,
+    head: u32,
+    tail: u32,
+    cursize: u32,
+    maxsize: u32,
+    elsize: u32,
+    pad: u32,
+}
+
+#[repr(C)]
+struct SvmMsgQRingShared {
+    cursize: u32,
+    nitems: u32,
+    head: u32,
+    tail: u32,
+    elsize: u32,
 }
 
 pub struct SvmMsgQRingConfig<'data> {
@@ -499,29 +504,33 @@ pub struct SvmMsgQRingConfig<'data> {
 pub struct SvmMsgQConfig<'a, 'data> {
     pub consumer_pid: i32,
     pub q_nitems: u32,
-    pub rings: &'a mut [SvmMsgQRingConfig<'data>],
+    pub ring_cfgs: &'a mut [SvmMsgQRingConfig<'data>],
 }
 
-pub struct SvmMsgQQueue {
-    shared: SvmMsgQSharedQueue,
+struct SvmMsgQQueue {
+    shared: NonNull<SvmMsgQSharedQueue>,
     event_fd: Option<OwnedFd>,
-    producer_lock: SpinLock,
+    lock: SpinLock<SvmMsgQProducerState>,
 }
 
-#[repr(C)]
-pub struct SvmMsgQRingMetadata {
-    pub cursize: u32,
-    pub nitems: u32,
-    pub head: u32,
-    pub tail: u32,
-    pub elsize: u32,
+struct SvmMsgQProducerState {
+    shared: NonNull<SvmMsgQSharedQueue>,
 }
 
-pub struct SvmMsgQ {
-    q: SvmMsgQQueue,
-    rings: Vec<SvmMsgQRingMetadata>,
+pub struct SvmMsgQ<'data> {
+    descriptors: NonNull<SvmMsgQDescriptor>,
+    rings: Vec<SvmMsgQRing>,
+    queue: SvmMsgQQueue,
     mutex: BorrowedMutex<'static, Robust>,
     condvar: BorrowedCondvar<'static>,
+    _data: PhantomData<&'data mut [u8]>,
+}
+
+struct SvmMsgQRing {
+    nitems: u32,
+    elsize: u32,
+    shared: NonNull<SvmMsgQRingShared>,
+    data: NonNull<u8>,
 }
 
 impl SvmMsgQ {
@@ -552,7 +561,7 @@ impl SvmMsgQ {
 ```
 
 `SvmMsgQSharedQueue` 对应 VPP `svm_msg_q_shared_queue_t` 的 head/tail/cursize/
-maxsize/elsize 和 descriptor 数组；`SvmMsgQRingMetadata` 对应
+maxsize/elsize；它后面紧邻 queue-owned descriptor 数组。`SvmMsgQRingShared` 对应
 `svm_msg_q_ring_shared_t` 的 ring accounting。queue 共享布局不依赖 q_mask 或
 空槽哨兵，descriptor capacity 与每个 ring 的 `nitems` 独立。data slot 不属于
 queue 的 allocation owner；它只由 `SvmMsgQRingConfig::data` 的调用方提供。
@@ -1086,11 +1095,12 @@ git diff --check
 [src/plugins/unittest/svm_fifo_test.c](https://github.com/FDio/vpp/blob/629fe2764bd997189fedd2d98cbe8dc9189c1ec3/src/plugins/unittest/svm_fifo_test.c)
 与
 [src/plugins/unittest/session_test.c](https://github.com/FDio/vpp/blob/629fe2764bd997189fedd2d98cbe8dc9189c1ec3/src/plugins/unittest/session_test.c)。
-下表的 Rust 文件均为**拟新增测试**，本轮不创建测试代码、不运行 VPP 或 Hammer。
+下表区分已经落地的 Linux MQ 行为用例与仍待实现的跨进程/性能用例；本轮不运行
+VPP 二进制。
 
 | VPP 测试及位置 | 已核对的测试行为 | Rust 文件与必须保留的断言 |
 | --- | --- | --- |
-| session_test.c:2107，session_test_mq_basic | descriptor 容量 16；两个容量 8、元素尺寸 8/16 的 ring；分配/释放、满小 ring 后选择大 ring、跨 ring 入队顺序、payload 123 和 0..11、最终占用清零 | hammer-infra/tests/svm_msg_queue.rs：typed 8/16-byte 内容；发布 13 条后的占用分别为 8/5，消费顺序与内容逐条一致，回收后两 ring 可再次用满；见下文显式选 ring 的差异 |
+| session_test.c:2107，session_test_mq_basic | descriptor 容量 16；两个容量 8、元素尺寸 8/16 的 ring；分配/释放、满小 ring 后选择大 ring、跨 ring 入队顺序、payload 123 和 0..11、最终占用清零 | `hammer-infra/tests/svm_msg_queue.rs::message_queue_matches_vpp_session_test_mq_basic`：同一组容量、分配/发布/出队/回收顺序，以及 ring/element/data 断言；已实现 |
 | session_test.c:1977，session_test_mq_speed；:1875，wait_for_event | fork 收发，分别使用 condvar 和 eventfd/epoll；读 fd 后重新检查 queue predicate；打印事件速率 | hammer-infra/tests/svm_msg_queue_process.rs：独立 exec 进程与真实 fd 传递，分别验证等待和通知；正确性验证序列无遗漏/重复，吞吐只作独立 benchmark，不作为功能通过证据 |
 | svm_fifo_test.c:217，sfifo_test_fifo1；:479，fifo2；:869，fifo5；:1005，fifo6 | OOO 间隙、相邻与重叠区间合并、已排序/未排序输入；补洞推进可读边界 | hammer-infra/tests/svm_fifo_ooo.rs：最终字节一致，补洞前不暴露后方 bytes；保留 fifo2 的 [4,3000) 合并为一段以及前 4 bytes 补齐后可读 3000 的具体断言 |
 | svm_fifo_test.c:565，sfifo_test_fifo3；:2858 起的配置组 | 可重复随机分段、overlap、in-seq-all、初始偏移、drop、顺序输入 | 同上：保留 seed=123、nsegs=10、initial-offset=3917 及上游五种组合；失败输出 seed、操作序列和首次不一致字节，能确定性重放 |
@@ -1154,7 +1164,8 @@ Session/SDK 集成、性能测量。进程测试无需 TUN，不启动 Hammer da
 TUN/TCP lab 仍仅由专门 CI workflow 运行。
 
 实现完成并完成 review/formatting 后，最终提交前 gate 才运行测试。用例落地后
-应至少覆盖以下命令对应的测试目标（本轮文档提交不执行这些命令）：
+应至少覆盖以下命令对应的测试目标；当前提交的 focused gate 执行已实现的 MQ
+与固定元素 queue 测试：
 
 ```bash
 cargo test -p hammer-infra --test svm_msg_queue --test svm_queue
@@ -1165,9 +1176,8 @@ cargo test -p hammer-runtime --test session_msg_queue
 cargo test -p hammer-app --test session_control
 ```
 
-这些是拟新增目标，不宣称目前存在或已通过。最后按第 9 节全工作区 gate 检查
-跨 crate 影响；全部通过立即提交，不在提交后重复测试。本轮只核对 VPP 源码、
-补充测试设计和执行 git diff --check；未获得任何生产行为测试通过证据。
+除上文已标注的 MQ 基本用例外，其余目标仍是后续迁移清单，不宣称目前存在或已通过。
+最后按第 9 节 gate 检查跨 crate 影响；测试通过立即提交，不在提交后重复测试。
 
 ## 10. 后续 vlibapi / vlibmemory 的 SVM 适配核对
 
