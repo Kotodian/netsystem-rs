@@ -619,169 +619,195 @@ matching VPP rather than becoming a second schema annotation.
 _Avoid_: generated transport frame, runtime registry snapshot, CLI syntax
 
 
+## Memory Language
+
+These are the target allocator terms specified by
+[ADR-0012](docs/adr/0012-vpp-style-active-memory-heaps.md). The current
+`main_heap.rs`, crate-private `Heap`, and offset `SvmRegionHeap` implementation
+do not yet satisfy this model.
+
+**MemMain**:
+The process-global memory authority corresponding to VPP's
+`clib_mem_main_t`. It owns the process Main Heap, the heap inventory, the
+registered memory-thread inventory, and the existing fixed-capacity process
+arena state.
+_Avoid_: AllocatorMain, GlobalMain, Buffer Main, SvmRegion
+
+**MemThreadMain**:
+The allocator-owned state of one OS thread, corresponding to VPP's
+`clib_mem_thread_main_t`. It owns that thread's active `MemHeap` selection and
+runtime thread index. It is allocator TLS because Rust `GlobalAlloc` and C
+malloc-family entry points receive no runtime owner argument; it is not a
+`DataPlaneMain` field or a generic per-thread container.
+_Avoid_: AllocatorThreadMain, ThreadMain, DataPlaneMain field, worker-local heap
+
+**MemHeap**:
+One concrete allocation authority that can become the current thread's active
+heap. Process heaps use the fixed-capacity mimalloc backend; SVM pvt/data heaps
+use a locked shared mspace whose state and `MemHeap` control block live in the
+fixed-address region mapping. The backend is private and is not a trait,
+vtable, or public selection enum.
+_Avoid_: Heap, SvmRegionHeap, OffsetHeap, allocator trait
+
+**Active Heap**:
+The `MemHeap` selected by the current `MemThreadMain`. Ordinary Rust allocation
+and the interposed C malloc family allocate, reallocate, and free through this
+selection. A nested activation owns restoration of the previous heap and may
+not cross threads or `.await`.
+_Avoid_: default allocator hint, process-global selected heap, pointer-owner scan
+
+**PVT Heap**:
+The locked `MemHeap` present in every SVM region at the second mapped page. It
+owns the region name, client pid list, bitmap, root `SvmMainRegion`, and other
+region-private metadata. "PVT" names its VPP region role; it is shared by
+attached processes at the same virtual address and is not a process-private
+heap.
+_Avoid_: metadata heap, SvmRegionHeap, offset heap, process heap
+
+**Data Heap**:
+The optional locked `MemHeap` created at an SVM region's data base only when
+the region requests data-heap semantics. A root `NODATA` region has no Data
+Heap and must not fall back to its PVT Heap or the process Main Heap.
+_Avoid_: region heap, mandatory payload allocator, fallback heap
+
 ## SVM Language
 
 These are target domain terms. The SVM owner modules live in one subtree,
 `crates/hammer-infra/src/svm.rs` plus `crates/hammer-infra/src/svm/`
-(`segment`, `region`, `queue`, `msg_queue`, `fifo`, `fifo_segment`); the legacy
+(`ssvm`, `region`, `queue`, `msg_queue`, `fifo`, `fifo_segment`); the legacy
 `Segment` and `MultiRingMsgQueue` remain at the crate root until they are
-deleted. The offset-based region owner is implemented in `svm/region.rs`,
-`svm/region_heap.rs`, and `svm/hash_map.rs`; the remaining SVM users still run
-on the legacy `Segment`, `Fifo`, and `MultiRingMsgQueue` until they are
-migrated to it.
-The proposed ownership, Rust fields/method signatures, deletion inventory,
-and approval status are recorded in
-[ADR-0011](docs/adr/0011-vpp-style-svm-ownership-and-multiarch.md); the region
-redesign (offset heap, name table, independent subregions) is specified in
-section 12 of that ADR.
-Terminology here is not a claim that the migration has been implemented.
+deleted. The current offset-based region owner in `svm/region.rs`,
+`svm/region_heap.rs`, and `svm/hash_map.rs` is a rejected implementation and
+must not be extended. ADR-0011 still owns queue, FIFO, multiarch, and SSVM
+decisions; ADR-0012 supersedes its entire region-heap section with fixed-VA
+PVT/Data `MemHeap` semantics. Terminology here is not a claim that the
+migration has been implemented.
 
 **SsvmPrivate**:
-The shared-VM mapping owner (`ssvm_private_t`) used by shared regions, FIFO
-segments, and API memory bootstrap. It owns the mapping, the backing
-descriptor, and the mapping's shared header; the allocator or protocol state
-placed in its payload belongs to the region or FIFO segment that lays it out.
-The mapping records `ssvm_va = 0` unless a creator asks for a fixed address.
-_Avoid_: SvmSegment, Segment, shared-memory wrapper, application segment owner
+The process-local owner corresponding to `ssvm_private_t`. It owns one
+SHM/MEMFD/PRIVATE backing, mapping, shared header, ready lifecycle, and generic
+shared `MemHeap`. A generic server publishes its actual non-zero mapping
+address and an attacher probes page zero before mapping the full segment at
+that same address. It is separate from VPP `svm_region`: a `SvmRegion` is not
+nested in this owner's payload. An offset-only payload such as
+`SvmFifoSegment` uses the owner-private map-only path and may explicitly publish
+`ssvm_va = 0`; zero uniformly selects non-fixed attach for SHM and MEMFD. This
+is a protocol-owned exception, not the SSVM default.
+_Avoid_: SvmSegment, Segment, SvmRegion payload, default arbitrary-VA mapping
 
 **SvmRegion**:
-A general SVM region with its own metadata, data allocation authority, client
-membership, and published root. Its segment payload is a fixed header followed
-by a metadata heap and, when present, a data portion; every shared location is
-an offset, never a process-local pointer. A region does not own the mapping,
-descriptor, or backend, and it is closed rather than repaired when its lock
-owner dies. It can occupy an existing SsvmPrivate mapping and is not limited to App
-Sessions.
-_Avoid_: mmap wrapper, FIFO segment, API registration, RegionName, root_path, backing_file
+A fixed-VA shared region corresponding to VPP `svm_region_t`. It owns its
+region mapping lifecycle, page-zero header, mandatory PVT Heap, optional Data
+Heap, client membership, and published root. An attacher probes the header and
+then maps the complete region at the creator's published address so shared heap
+and collection pointers remain valid. It is not an `SsvmPrivate` payload and
+does not support a different-address offset compatibility mode.
+_Avoid_: SsvmPrivate payload, FIFO segment, offset region, arbitrary-VA attach
 
-**SvmRegionMain**:
-The named-root authority of a subdivided region. It lives in the root region's
-metadata heap and holds the region name table and the monotonic subregion
-identity counter. It does not reserve or carve a virtual-address range and does
-not own subregion mappings; each subregion is its own SsvmPrivate mapping whose
-descriptor is exchanged by the daemon outside the shared region.
-_Avoid_: API Main, process-global memory allocator, subregion pool, name hash
-
-**SvmRegionHeap**:
-The offset-based block allocator that owns a region's metadata heap. Blocks
-carry adjacent-block size and use flags in their headers, free blocks are
-linked by offsets into fixed bins, and the bytes preceding a user area point
-back at its block header, so no process-private pointer is stored in shared
-memory. Exhaustion, double free, and block corruption terminate the process
-with structured facts instead of returning a recoverable error. The heap has no
-lock of its own; the region lock serializes access.
-
-A heap is a field of the region header, never inside the arena it manages, so
-it is owned by the region rather than by any process or Rust value: there is no
-destructor, no destroy operation, and no way to move a descriptor out of shared
-memory. Only region creation initializes it, once, before the region is
-published; attach validates and never repairs it. Its range is fixed at
-creation and only its contents grow. It disappears with the segment mapping
-after the name is removed, and a region whose lock owner died is closed instead
-of having its heap reused.
-_Avoid_: local heap, Main Heap, talc allocator, bump allocator
-
-**SvmHashMap**:
-The byte-string-keyed hash table used for the region name table. Its semantics
-match the standard library hash map, but slots, key bytes, and links are
-offsets in the owning SvmRegionHeap, the table owns its key bytes in that heap,
-and hashing uses a fixed-seed hasher so another process reaches the same
-bucket. It has no destructor and no internal lock.
-_Avoid_: std HashMap, Bihash, name hash, RegionName
+**SvmMainRegion**:
+The named-root state allocated from a subdivided root region's PVT Heap. It
+holds the ordinary name HashMap and `Pool<SvmSubregion>` whose backing
+allocations also come from the active PVT Heap. The enclosing root region owns
+the virtual-address bitmap; process-private backing descriptors stay with the
+daemon rendezvous owner.
+_Avoid_: SvmRegionMain, monotonic region-id authority, API Main, fd table
 
 **Subregion**:
-An independently mapped region registered by name under a subdivided root
-region. It is located by name lookup in the root region's name table and
-identified by a monotonic, never-reused subregion identity, so a stale identity
-never silently addresses another subregion. Its mapping descriptor is exchanged
-by the daemon, not derived from a virtual-address bitmap.
-_Avoid_: VA slice, child region, subregion pool
+A region registered by name under a subdivided root. The root bitmap grants a
+contiguous page range, the subregion is mapped at
+`root_base + page_index * page_size`, and the name table value is its
+`Pool<SvmSubregion>` index. Hammer may exchange its backing descriptor through
+the daemon, but descriptor transport does not change the root-owned VA
+assignment.
+_Avoid_: arbitrary-VA region, monotonic region id, independent address space
 
 **Region Membership**:
 One process's registration in a region's client list, written in that region's
-metadata heap and reclaimed by pid liveness probing. Registration is an RAII
+active PVT Heap and reclaimed by pid liveness probing. Registration is an RAII
 handle; recovery records no process start time and never reuses a registration
 for a different process.
 _Avoid_: client vec, connection handle, worker registration
 
 **Region Owner Death**:
-Robust-mutex owner death marks the region failed and later access reports the
-dead owner instead of pretending the lock was acquired; the mutex is never
-reinitialized in place. A fresh region identity replaces the failed one only
-after participants stop using the old region.
-_Avoid_: force unlock, mutex rebuild, consistent-but-unknown
+Failure of a process while it owns the SVM region mutex. Recovery belongs to
+the `SvmRegion` lifecycle and must preserve the PVT/Data Heap and ordinary
+collection invariants before another participant accesses them. Generic SSVM
+locks, FIFO slice locks, and WorkerBarrier do not prove region consistency.
+_Avoid_: generic SSVM recovery, FIFO recovery, Worker Barrier, unverified force unlock
 
 **SvmFifoSegment**:
-The SVM owner of FIFO storage allocation, slices, and reusable FIFO headers
-and chunks. Session policy belongs to the Session owner using that storage.
-_Avoid_: SvmRegion, Session segment manager, generic heap
+An offset-only `SsvmPrivate` payload that owns FIFO segment creation, attach,
+delete and cleanup; its monotonic byte allocator, fixed shared slices, reusable
+FIFO headers and chunks; private per-worker FIFO pools and RX active lists;
+message-queue placement; preallocation; and memory-pressure accounting. It
+publishes the FIFO segment header offset and permits arbitrary-VA attach. It
+uses neither `SvmRegion` PVT/Data Heap nor an SSVM generic heap for FIFO
+storage; its map-only path does not expose such a heap. Session policy and
+worker handoff decisions remain with Session.
+_Avoid_: SvmRegion, PVT Heap, Data Heap, Session segment manager, generic heap
 
-**SvmFifo**:
-The SVM byte FIFO whose producer publishes bytes and whose consumer releases
-bytes, including out-of-order delivery and FIFO notification state.
-_Avoid_: Fifo, message queue, packet Buffer
+**Fifo**:
+The SPSC byte FIFO whose shared header and chunks use FIFO-segment-relative
+offsets while chunk lookup, out-of-order trees/pool, active links, and worker
+ownership remain process-private. The producer owns tail and OOO mutation; the
+consumer owns head. Each reads the foreign index with acquire ordering and
+publishes its own index with release ordering. Session identities are not FIFO
+infrastructure state.
+_Avoid_: message queue, packet Buffer, Sync shared owner, Session record
 
 **SvmQueue**:
-The SVM bounded queue of fixed-size elements, with interprocess production,
-consumption, and waiting semantics. It is distinct from API message storage
-allocation rings. The proposed Rust element parameter describes a validated
-shared representation; size and alignment are derived from that element type.
-Only stored contents are generic; synchronization and storage backends are not
-type parameters. In VPP's
-fixed-element queue, eventfd changes notification, not the shared mutex.
-_Avoid_: SharedQueue, SvmFifo, API message allocator
+The SVM bounded byte queue with runtime `nels` and `elsize`, interprocess
+production, consumption, and waiting semantics. Its operations accept byte
+slices of exactly `elsize`; queue-level `T` is forbidden because the element
+schema belongs to the caller protocol. It is distinct from FIFO bytes,
+`SvmMsgQ` data rings, and API message allocation rings. Eventfd changes
+notification, not the fixed queue's shared mutex. Its producer and consumer fd
+numbers occupy role-specific shared slots, but each number is meaningful only
+inside the process that installed and uses that role.
+_Avoid_: typed generic queue, SharedQueue, SvmFifo, API message allocator
 
-**SvmMsgQueue**:
-The SVM message queue exchanging descriptors for slots in its data rings.
-The storage protocol is independent of Session event contents and Binary API
-message allocation policy. Descriptors are consumed in queue order; each
-data ring allocates at its tail and reclaims at its head. Dequeuing a
-descriptor and releasing its payload slot are distinct operations. The queue
-owner is not generic: reserve<T> and dequeue<T> select the stored content type
-for a slot, allowing different rings to hold different contents. Reservations own
-publication; consumed messages own ordered slot reclamation. Ring count
-and capacity remain runtime configuration.
-_Avoid_: MultiRingMsgQueue, SvmQueue, API message allocation ring
-
-**Message Reservation**:
-An unpublished data-ring slot whose transaction owns the producer exclusion
-until commit or cancellation. MsgReservation<T> lends the stored value as
-&mut T. Commit transfers the message to the consumer;
-cancellation restores the unpublished allocation.
-_Avoid_: arbitrary free slot, payload copy, detached pointer wrapper
+**SvmMsgQ**:
+The SVM message queue exchanging 8-byte descriptors for slots in ordered
+inline data rings. Its one shared allocation contains the descriptor queue,
+each ring header, and each ring's `nitems * elsize` bytes. The explicit
+lifecycle is `alloc_msg -> add -> sub -> free_msg`: allocation advances the
+selected ring tail, add publishes the descriptor, sub consumes only the
+descriptor, and free advances that ring's head in order. There is no
+reservation, cancellation, Drop rollback, generic content parameter, or
+caller-owned ring byte binding. Session event contents and Binary API message
+allocation policy belong to their respective owners.
+_Avoid_: MultiRingMsgQueue, SvmQueue, caller-owned ring data, reservation, API message allocation ring
 
 **FIFO Segment Slice**:
-The allocation partition containing reusable FIFO headers and chunk size
-classes. Shared allocation state is distinct from the executing worker's
-private FIFO and out-of-order state.
-_Avoid_: per-thread wrapper, message ring, Session policy
+The allocation partition containing reusable FIFO headers and 11 chunk size
+classes. Shared freelists/counters are distinct from the executing worker's
+private FIFO pool and RX active list. RX and TX both contribute to the shared
+active count, while only RX enters the private active list. A worker directly
+owns its private slice entry; cross-worker migration uses Session handoff and
+is failure-atomic.
+_Avoid_: per-thread wrapper, message ring, Session policy, cross-worker borrow
 
 **Queue Notification**:
-The Linux design uses posix-sync's process-shared robust mutex and shared
-condition variable directly. One mutex protects queue state, publication,
-consumption, and ordered slot reclamation; there is no extra consumer mutex.
-A consumed message retains the crate guard until it releases its slot, so
-handlers run after decoding and releasing the message. Only stored contents
-are generic. Eventfd changes notification only in this Rust design; VPP's
-eventfd MQ instead uses a private producer spinlock.
-Owner death from lock or condition-wait reacquisition closes the damaged
-instance without declaring unknown data consistent. Later operations observe
-Closed/NotRecoverable, and the lifecycle owner retires the old identity and
-creates a fresh queue after participants stop using the old instance. Waiters
-periodically reacquire to detect failure even without notification. This
-recovery design must be behaviorally tested; it is not implemented yet.
-MacOS/iOS remain outside the current Linux scope.
-_Avoid_: Worker Barrier, payload publication, shared numeric fd identity
+Notification policy attached to an SVM queue, not a second publication
+protocol. `SvmQueue` retains its process-shared robust mutex/condition variable
+when eventfd is installed. `SvmMsgQ` without eventfd uses its shared robust
+mutex/condition variable; its eventfd mode uses a process-local producer
+spinlock and a private fd. Waiters always recheck empty/full predicates after
+wake. Owner-death recovery must validate the exact queue state or retire the
+identity. `SvmQueue` shared fd slots are not cross-process descriptor identity;
+`SvmMsgQ` fd numbers never enter shared memory. MacOS/iOS remain outside the
+current Linux design scope.
+_Avoid_: Worker Barrier, payload publication, shared numeric fd identity, one policy for both queue families
 
 **API Message Allocation Ring**:
 Binary API-owned storage that selects a message size class and reclaims each
 message after its receiver finishes. It is separate from SvmQueue transport
-and from SvmMsgQueue's ordered payload rings. API queue elements identify
+and from SvmMsgQ's ordered payload rings. API queue elements identify
 shared message storage using validated offsets/identities; they do not carry
 process-local pointers. Shared region allocation, peer lifecycle, and recovery
 remain prerequisites for the future vlibapi/vlibmemory refactor. ADR-0011
 records the caller audit and required behavioral validation.
-_Avoid_: Session CTRL ring, SvmMsgQueue, fixed-element transport queue
+_Avoid_: Session CTRL ring, SvmMsgQ, fixed-element transport queue
 
 **Machine Architecture Function**:
 A concrete ordinary function with a baseline implementation and supported

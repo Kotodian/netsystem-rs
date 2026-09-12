@@ -1,2096 +1,555 @@
-# ADR-0011：SVM 所有权、消息队列、同步与普通函数多架构选择
+# ADR-0011：SVM 队列、FIFO、SSVM 所有权与普通函数多架构选择
 
 - 日期：2026-09-11
-- 状态：Proposed；本轮仅修改 ADR/CONTEXT。2026-09-12 更新：SVM owner 已移入
-  `crates/hammer-infra/src/svm/`，见 §12.1 模块落点；A11 `SvmRegionHeap`、A12
-  `SvmHashMap<V>` 与 A13 region owner（`SvmRegion`/`SvmRegionMain`/`RegionLock`/
-  `RegionMembership`）已按 §12.4/§12.5/§12.7 落地并带测试（见 §12.11）。Linux 优先，
-  macOS/iOS 不在本轮设计验证范围；`Segment`/`Fifo`/`MultiRingMsgQueue` 等其余生产
-  代码尚未迁移。2026-09-12 更新：§13 的 `ssvm` 映射层命名、字段与生命周期对齐已实现
-  （`crates/hammer-infra/src/svm/ssvm.rs`，测试 `crates/hammer-infra/tests/svm_ssvm.rs`）。2026-09-12
-  更新：message queue 设计按 VPP `svm_msg_q_t` 重写为 `SvmMsgQ` 加 caller-owned
-  caller-owned byte rings；实现与测试已按本 ADR 修正。
-- 请求：完整核对 VPP `src/svm`，删除 Hammer `MultiRingQueue`，Rust 支持对应的 `CLIB_MARCH_FN`，更新 ADR 和 CONTEXT。
-- Hammer 基线：`418aa0953d929f4175370ce1873066f4ff193f38`。
-- VPP 参考：官方 FDio/vpp `629fe2764bd997189fedd2d98cbe8dc9189c1ec3`。
+- 修正日期：2026-09-12
+- 状态：Proposed；仅设计，尚未批准本次修正规范，未修改生产代码
+- Hammer 基线：`418aa0953d929f4175370ce1873066f4ff193f38`
+- VPP 基线：`third_party/vpp`，提交
+  `629fe2764bd997189fedd2d98cbe8dc9189c1ec3`
+- 替代关系：ADR-0012 完整拥有 `svm_region`、PVT/Data Heap 和 active heap
+  设计；本 ADR 不再定义 region allocator、region layout 或 subregion
+  address assignment
 
-## 1. 证据边界与批准状态
+本文是 ADR-0011 的一致性修正版。旧版关于 offset region heap、different-VA
+region attach、`SvmRegionHeap`、`SvmHashMap` 和独立 monotonic subregion identity
+的规范已删除，而不是继续作为“历史设计”留在可实施段落中。它们均为当前代码中
+待迁移的错误基线，不是可选实现。
 
-用户指定的 `/Users/linqiankai/rust/src/github.com/Kotodian/hammer-ios-rs/third_party/vpp/src/svm`
-在本环境不存在；工作区初始也没有 `third_party/vpp`。因此从官方仓库取得
-上述提交，置于仓库已忽略的 `third_party/vpp/`，作为可复核参考。不能声称
-它与用户机器上的版本相同。以下 VPP 路径均相对此目录；官方永久链接为
-[本次 SVM 参考源码](https://github.com/FDio/vpp/tree/629fe2764bd997189fedd2d98cbe8dc9189c1ec3/src/svm)。
+## 1. 范围与结论
 
-事实类别：`H` 是当前 Hammer 代码，`V` 是实际读取的 VPP 源码，`R` 是用户
-要求或仓库约束，`D` 是本 ADR 提议，不能把 D 当成已经实现或获批的事实。
+本文只决定以下内容：
 
-用户本轮明确要求修改 ADR，不实施生产代码。本文具体化 Linux 优先的替代
-设计及删除清单；“删除”指后续实施目标，不表示旧文件已经删除。第 8 节是
-拟议类型和方法，不是生产 API。后续实施仍按 AGENTS.md 的接口批准规则执行，
-本轮文档工作不以再次批准为前提。
+1. `SsvmPrivate` 映射层与 `SvmRegion`、FIFO segment 的关系；
+2. VPP `svm_queue_t` 对应的 runtime-sized byte queue；
+3. VPP `svm_msg_q_t` 对应的 descriptor queue 和 inline data rings；
+4. `svm_fifo_t` 的 shared/private split、SPSC ownership、chunk、OOO 和通知；
+5. `fifo_segment_t` 的 slice、allocation、migration、MQ 和 memory pressure；
+6. 两个 FIFO copy function 的普通函数 multiarch selection。
 
-## 2. 完整目录范围
+本文不把 Session event、TCP、应用策略或 Binary API schema 下移到
+`hammer-infra`，也不把任何 FIFO segment 解释成 `SvmRegion`。
 
-“SVM”不是一个 mmap 类型，也不是一条消息队列。目录中的层次必须分清：
+最终决策如下：
 
-| VPP 文件 | 类型、函数族及职责 | Hammer 目标归属 |
+- **D1 Region authority。** `SvmRegion` 直接拥有 fixed-VA mapping、mandatory
+  PVT `MemHeap`、optional Data `MemHeap`、membership、root bitmap 和
+  `SvmMainRegion`。它不是 `SsvmPrivate` payload。所有细节以 ADR-0012 为准。
+- **D2 SSVM mapping。** 通用 `SsvmPrivate` 对应 `ssvm_private_t`，拥有
+  SHM/MEMFD/PRIVATE backing、mapping、shared header、ready 和 generic shared
+  heap。creator 记录实际 `ssvm_va`，client probe page 0 后默认在同一 VA 完整
+  attach。只有 payload protocol 明确证明全部共享引用都是 relative offset 时，
+  才能把 `ssvm_va` 发布为 0。
+- **D3 FIFO segment exception。** `SvmFifoSegment` 是 `SsvmPrivate` payload，
+  不使用 `SvmRegion` PVT/Data Heap，也不从 SSVM generic heap 分配 FIFO storage。
+  它通过 owner-private map-only path 保留 two-page allocation overhead，从第二页之后
+  直接管理 storage，发布 FIFO-segment-header-relative offset，并把 `ssvm_va` 置 0，
+  所以 client 可以 arbitrary-VA attach。该 path 不向任何参与者暴露可用 generic heap。
+- **D4 Fixed-element queue。** `SvmQueue` 是 runtime `nels`/`elsize` byte queue，
+  queue level 不使用 `T`。元素 schema 属于调用方协议。
+- **D5 Message queue。** `SvmMsgQ` 是 8-byte descriptor queue 加可变数量的
+  ordered inline data rings。保留显式
+  `alloc_msg -> add -> sub -> free_msg`；不增加 reservation、cancel 或 Drop
+  rollback。
+- **D6 FIFO。** `svm::fifo::Fifo` 的 shared header/chunks 位于共享 mapping；
+  OOO trees/pool、chunk lookup、active links 和 worker ownership 位于每个进程的
+  private FIFO。生产者和消费者各自只写本方 index，读取对方 index 时 acquire。
+- **D7 FIFO segment。** segment 使用 monotonic CAS byte allocator 和 per-slice
+  freelists，拥有 create/attach/delete/cleanup、FIFO direction、migration、MQ、
+  preallocation、capacity accounting 和 pressure policy。只有 RX FIFO 进入
+  private active list。
+- **D8 Multiarch。** `svm_fifo_copy_to_chunk` 和
+  `svm_fifo_copy_from_chunk` 通过 infra 普通函数选择机制在进程启动后选定实现；
+  它不使用 Graph Node registration，也不改变 FIFO ownership。
+
+## 2. VPP 证据账本
+
+以下路径均相对 `third_party/vpp/src/`。
+
+| ID | 来源 | 已核实事实 | 约束 |
+| --- | --- | --- | --- |
+| V1 | `svm/ssvm.h:46-87` | shared header 含 heap、VA、size、pid、name、opaque、ready、backend；`ssvm_private_t` 持进程私有 mapping/backing 状态 | shared 与 private state 必须分开 |
+| V2 | `svm/ssvm.c:70-106`、`:209-277`、`:357-410` | SHM、MEMFD、PRIVATE server 都创建 shared locked heap，并把实际 mapping address 写入 `ssvm_va` | 通用 SSVM 不是默认 offset-only mapping |
+| V3 | `svm/ssvm.c:111-178`、`:280-340` | client probe page 0并读取 `ssvm_va`/size；SHM 无条件 fixed remap且等待 ready，MEMFD 仅对非零 VA fixed remap且不等待 | attach、地址选择与 ready 是独立约束 |
+| V4 | `svm/fifo_segment.c:285-330` | FIFO segment 从第二个 page 后直接布置 header/allocator，发布 header offset，最后把 `ssvm_va` 清零 | zero VA 是 FIFO owner 的 arbitrary-address 意图；backend 差异见 V18 |
+| V5 | `svm/queue.h/c` | `svm_queue_t` 使用 runtime `maxsize`/`elsize` 和 inline bytes；shared robust mutex/condvar 保护 add/sub/wait；producer/consumer eventfd 数值位于 shared queue，但各自只在所属进程有意义 | queue 不应按 Rust element type 参数化；两个 fd slot 不能冒充跨进程 descriptor identity |
+| V6 | `svm/message_queue.h:18-87` | shared descriptor queue/ring state与private ring pointers/eventfd/spinlock分开；descriptor 是两个 `u32` 的 8-byte union | MQ 不是旧 MultiRing layout |
+| V7 | `svm/message_queue.c:62-117` | `svm_msg_q_init` 把每个 ring header 和 `nitems * elsize` bytes 连续排在 queue allocation 内 | data ring 是 inline shared storage |
+| V8 | `svm/message_queue.c:103-110` 及全树调用点 | `ring_cfg.data` 只在 size calculation 中被检查，init/attach/msg_data 从不绑定它；所有在树调用者都传 0 | 不得把 `data` 字段解释成可用的 caller-owned ring contract |
+| V9 | `svm/message_queue.c:210-307`、`:334-467` | ring tail 分配、descriptor add/sub、ring head 回收互相独立；回收必须按 ring head 顺序 | 保留 explicit four-stage lifecycle |
+| V10 | `svm/fifo_types.h:29-195` | chunk/shared FIFO/signals 位于共享存储；`svm_fifo_t`、OOO、active list、session fields 位于 private storage | Rust 不能把整个 FIFO struct 放进 shared mapping |
+| V11 | `svm/svm_fifo.h:68-111`、`:466-620` | owner index relaxed，foreign index acquire；通用检查两边 acquire | 需要 role-specific max/read/write APIs |
+| V12 | `svm/svm_fifo.h:219-457` | 完整操作含 fill/provision、enqueue variants、peek/drop、arbitrary segment list、clone 和 diagnostics | 两个 slice 返回值不构成 parity |
+| V13 | `svm/svm_fifo.h:629-883` | OOO newest/reset；event flag；immediate/full/empty dequeue notification；threshold；最多 7 subscribers | 通知不是单个 bool |
+| V14 | `svm/fifo_segment.c:127-210`、`:482-919` | byte range CAS allocation；chunk freelist head 使用 48-bit offset + 16-bit tag；按 size class batch/reuse | plain offset CAS 不足以声称等价 |
+| V15 | `svm/fifo_segment.c:938-1077` | duplicate、server/client free 和 worker-slice attach/detach 是不同操作；slice attach 取得 replacement resources，但没有 allocation-failure branch | Hammer 必须保留角色差异并补上 failure-atomic error path |
+| V16 | `svm/fifo_segment.c:1109-1529` | segment 提供 MQ alloc/attach/discover/offset、header/chunk/pair preallocation、容量统计和 pressure status | 这些能力属于 FIFO segment owner |
+| V17 | `svm/svm_fifo.c:17-100`、`svm/CMakeLists.txt` | 只有两个 FIFO chunk copy functions 使用 `CLIB_MARCH_FN` | multiarch 范围必须保持具体 |
+| V18 | `svm/ssvm.c:161-168`、`:316-328` 与 `svm/fifo_segment.c:320-330` | FIFO init 把 `ssvm_va` 清零；MEMFD client 仅在 VA 非零时加 `MAP_FIXED`，但 SHM client 无条件 `MAP_FIXED` | vendored SHM FIFO attach 与 zero-VA contract 冲突；Hammer 必须显式决定而不能声称该分支已由 VPP 证明 |
+| V19 | `svm/fifo_segment.c:873-918`、`:948-1006`、`:1042-1077` | RX/TX allocation 都增减 shared active count，只有 RX 进入 private active list；slice attach 在 private copy 后分配 replacement header/chunks，且没有 allocation-failure branch | direction 的 count/list 语义必须分开；Hammer failure atomicity 是安全增强，不是 VPP 已有错误路径 |
+| V20 | `svm/fifo_segment.c:1414-1529`、全树 `FIFO_SEGMENT_F_MEM_LIMIT` 搜索及 `plugins/unittest/segment_manager_test.c:334-353` | status calculation 在 usage 低于 high watermark 时清除 `MEM_LIMIT`，但 vendored tree 没有置位调用；预期 `NoMemory` 的测试被注释 | 自动置位不是已核实 VPP 行为；Hammer 若补全该 transition，必须记录为明确策略 |
+| V21 | `svm/queue.c:87-100`、`svm/message_queue.c:176-207` | robust mutex owner death只调用 `pthread_mutex_consistent`，没有验证受保护的 queue indices/occupancy | Hammer 必须按仓库错误规则验证 exact state或retire queue，不能无条件继续 |
+
+VPP 测试来源是
+`plugins/unittest/svm_fifo_test.c`、
+`plugins/unittest/segment_manager_test.c` 和
+`plugins/unittest/session_test.c`。这些测试是行为来源，不等于 Hammer 已通过。
+
+## 3. 当前 Hammer 基线与语义差距
+
+本表记录当前代码，不是目标状态。
+
+| 当前位置 | 已有内容 | 仍不符合本文的部分 |
 | --- | --- | --- |
-| `ssvm.h/c` | `ssvm_private_t`、`ssvm_shared_header_t`；server/client init、delete，SHM/MEMFD/PRIVATE backend，ready 和映射生命周期 | infra `svm::ssvm`（§13）：映射与 backing resource |
-| `svm_common.h`、`svm.h/c` | `svm_region_t`、`svm_main_region_t`、`svm_subregion_t`、`svm_map_region_args_t`；根/子 region、find-or-create、成员扫描、map/unmap、metadata/data heap、user root | infra `svm::region`：region authority |
-| `fifo_types.h` | `svm_fifo_shared_t`、`svm_fifo_t`、chunk、OOO、signals；共享/私有 FIFO 和 segment slice 状态 | infra `svm::fifo`、`svm::fifo_segment` |
-| `fifo_segment.h/c` | `fifo_segment_t`、`fifo_segment_main_t`、shared/private slice；create/attach/delete、FIFO/chunk 分配回收、迁移、MQ 存储、预分配及压力统计 | infra FIFO segment；Session 保留应用策略 |
-| `svm_fifo.h/c` | enqueue/offset/nocopy/segments、dequeue/peek/drop、chunk provision、OOO、通知、clone、diagnostics；两个多架构复制函数 | infra 字节 FIFO |
-| `queue.h/c` | `svm_queue_t`、wait 条件；固定尺寸元素的 add/add2/sub/batch-related raw operations、锁、通知和等待 | infra `svm::queue`；与 MQ data ring 分离 |
-| `message_queue.h/c` | `svm_msg_q_t`、shared queue/ring、8-byte message descriptor、config；alloc/attach/cleanup、reserve/add/sub/free、wait/eventfd | infra `svm::msg_queue` |
-| `svmdb.h/c` | 独立 `svmdb` 库：client、shared header、string/vector namespaces、values、notification registrations；map/unmap、get/set/unset、serialize/unserialize | 需单独交付的 SVM database，不能塞进 Session |
-| `svmtool.c`、`svmdbtool.c` | region/database 诊断命令 | owner diagnostics；CLI glue 不拥有共享状态 |
-| `svm_test.c`、`persist.c` | region 测试、持久共享对象示例；`persist.c` 明确标记 test/demo | 行为参考，不能注册为 daemon 生产业务 |
-| `dir.dox`、`CMakeLists.txt` | 目录说明、库/工具构建和 multiarch 来源 | 文档与 Cargo 编译组织 |
+| `svm/region.rs`、`region_heap.rs`、`hash_map.rs` | offset region、`SvmRegionHeap`、`SvmHashMap` 已实现 | 整体由 ADR-0012 替换并待删除 |
+| `svm/ssvm.rs` | backend、mapping、probe attach、ready、typed FIFO header offset | 默认把 `ssvm_va` 写 0；没有 generic shared heap；payload 紧跟自定义 header；因此不能声称 generic SSVM parity |
+| `svm/queue.rs` | runtime byte element、shared mutex/condvar、add/add2/sub/wait | 仍需跨进程、owner-death、eventfd 与 ABI integration 证明 |
+| `svm/msg_queue.rs` | descriptor、four-stage operations、wait/eventfd 基本面 | `SvmMsgQRingConfig<'data>` 把 ring bytes 放在 caller slice，和 V7/V8 相反；生命周期与并发 guard 仍需重做 |
+| `svm/fifo.rs` | shared/private 字段、chunk、部分 OOO/notification/multiarch operations | `unsafe impl Sync`、大量 `&self` mutation、`Read/Write for &Fifo`、两个 segment 上限、Session IDs 下沉 infra、通知和 chunk APIs 不完整 |
+| `svm/fifo_segment.rs` | shared header/slices、byte CAS、basic allocate/free/attach、部分 preallocation/statistics | private storage 是 `Vec<Vec<Option<Fifo>>>`；没有 direction/active RX list、完整 main-owned lifecycle、migration、MQ、flags/watermarks/pressure；freelist 没有完整 tagged-head proof |
+| `multi_ring_msg_queue.rs` 及 runtime callers | 旧 MP/SP queue 仍被 Session runtime 使用 | 完整调用闭包迁移后删除，不保留 alias |
 
-本设计的可实施核心是六个 SVM owner 与多架构函数支持。Database/工具也列入
-完整性账本；它们是独立交付范围，尚未设计新的公开接口，不能在核心完成后
-宣称整个目录的功能已经全部移植。`CMakeLists.txt` 仅把 `svm_fifo.c` 放入
-`MULTIARCH_SOURCES`；不应把整个 SVM 库全部做多架构注册。
+因此 `Fifo`、`SvmFifoSegment`、`SsvmPrivate` 和 `SvmMsgQ` 当前都不能标记为
+“完全符合 VPP”。已有单元测试只证明其覆盖到的行为，不能替代本表中的缺口。
 
-## 3. 证据账本与当前差距
+### 3.1 缺失或必须重做的 API inventory
 
-| ID | 来源及符号 | 已核实事实 | 设计影响 |
-| --- | --- | --- | --- |
-| V1 | `ssvm.h:42`、`ssvm.c` 的 `ssvm_server_init_*` / `ssvm_client_init_*` / `ssvm_delete_*` | 三种 backend；共享 header 与进程私有映射信息不同；private client attach 不成立 | D1：映射 owner 与 region 分开 |
-| V2 | `svm_common.h` 的 `svm_region_t` / `svm_main_region_t`；`svm.c:434`、`:879`、`:1010` | region 初始化共享 mutex/condvar，维护两个 heap、成员和命名子区；退出有 server/client 区分 | D2：现有 mmap owner 不能冒充 region |
-| V3 | `queue.c:21`、`:87`、`:112`；`vlibmemory/memory_client.c:179` | 固定元素队列由 Binary API 客户端创建；共享 robust mutex/condvar；eventfd 可替换通知 | D3：独立 SvmQueue，不复用 Session 消息模型 |
-| V4 | `message_queue.h:19`、`:32`、`:39`、`:63`；`message_queue.c:134` | shared queue/rings 与私有 attach 状态分离；evtfd 和多生产者 spinlock 在进程私有对象 | D4：一份共享布局，删除 MP/SP 两种存储语义 |
-| V5 | `message_queue.c:210`、`:254`、`:282`、`:334`、`:390`、`:411` | ring tail 分配、ring head 按序释放、cursize 计数；descriptor 与 payload slot 各自占用；按配置顺序选择足够大的非满 ring | D4：保留多 data ring，删除任意空闲槽栈 |
-| V6 | `message_queue.h:361`、`:380`；`message_queue.c:177`、`:489`、`:531`、`:589`；`application.c::app_rx_mqs_alloc`；`segment_manager.c::segment_manager_alloc_queue` | app RX MQ 创建 eventfd；segment manager 按配置选择；无 eventfd 走共享 mutex，有 eventfd 走本地 spinlock；通知条件分别覆盖空/满转换 | D5：按真实创建/调用链选择具体 Rust 同步能力 |
-| V7 | `vnet/session/application_worker.c:970`；`session_node.c:1974`；`vcl/vppcom.c` 的 `svm_msg_q_sub_raw_batch` 调用 | Session 选择 IO/CTRL ring，消费事件后释放 slot；VCL 可批量取 descriptor | D6：事件类型和调度仍属 Session |
-| V8 | `fifo_types.h`；`fifo_segment.c:15`、`:190`、`:874`、`:949`、`:1015`、`:1042` | 全局字节区间由 CAS 分配；chunk free list 使用带 tag 的 offset；FIFO header list 与 private slice 有不同同步；迁移要求停用旧 FIFO | D7：不能把所有 free list 都当成 MQ ring 或都加同一把锁 |
-| V9 | `svm_fifo.h:74`、`:87`；`svm_fifo.c:833`、`:892`、`:1092` | SPSC 角色所有权，外方 index acquire，本方提交 release；OOO 与 chunk lookup 为私有状态 | D8：角色借用、chunk storage、发布顺序 |
-| V10 | `svm_fifo.c:17`、`:48`、`:81`；`vppinfra/cpu.h:554`；`svm/CMakeLists.txt` | 两个复制函数各有 baseline/ISA 实现，constructor 按 CPU priority 选择函数指针；普通入口调用 selected function | D9：普通函数选择机制，非 Graph Node 注册 |
-| V11 | `svmdb.c:59`、`:127`、`:182`、`:417`；`persist.c:6`；`svm/CMakeLists.txt` | database 单独成库，锁 region、发布数据库 root、支持通知及字符串持久化；persist 是示例 | 不得遗漏，也不得冒充当前已有功能 |
-| H1 | `crates/hammer-infra/src/multi_ring_msg_queue.rs` 的 `MultiRingMsgQueue<P>`、`QueueHeader`、`RingHeader`、`ProducerGuard`、`RingMsg` | MP 使用 shared spin word 与 free-slot stack；SP 使用 claim、独立 cursor；power-of-two descriptor 容量；两种回收行为 | 删除整套旧布局与模式标签 |
-| H2 | 同文件 `MsgSlot` / `ProducerReservation::publish` / `sub` | MP slot 不带 guard lifetime；publish 借用 `&mut self` 可被再次调用；MP consumer 仅接收 `&self` | 替代 API 必须约束事务生命周期和唯一消费者，不能保留旧安全漏洞 |
-| H3 | `svm/region.rs` 的 `SvmRegionInner`；`segment.rs` 的 `Segment` | 映射内存由创建方 Talc 分配；attached mapping 无 allocator；`Segment::local` 仍创建映射，只隐藏可共享属性 | 不是 VPP region，也没有真正 private backend 选择 |
-| H4 | `fifo.rs` 的 `Fifo`、`FifoHeader`、`OooBookkeeping`、`peek_segments` | FIFO 自带 chunk 布局、私有 OOO；没有 FIFO segment slices；共享引用能进入修改路径；存在 closure-mediated borrow | 迁移到 FIFO segment owner，删除闭包访问，收紧借用 |
-| H5 | runtime `app/session_msg_queue.rs`、service `session/{application,runtime,control}.rs`、app `attach.rs` | SessionMsgQueue 包装旧 infra queue；生产者模式贯穿 app/session bootstrap；pipe/AtomicBool 通知在 runtime | 必须迁移整个调用闭包，不能只改 infra 名称 |
-| H6 | infra `simd.rs`、`checksum.rs`；component macros `lib.rs:605` 的 `node_function` | 已有 CPU feature detection、专用 ISA 复制及 Graph Node variants；没有通用普通函数选择宏 | 复用检测/复制，不能让 infra 依赖 graph/runtime |
-| H7 | infra `sync.rs`；runtime `sync.rs:15` | 当前 SpinLock 实现在 infra，runtime 重导出；与 AGENTS 对泛型锁归属的文字存在既有差距 | 复用已有实现，本次不复制锁、不偷偷重排 crate 依赖 |
-| H8 | service `binary_api.rs`；ipc `binary_api.rs` | 当前 Binary API 是 Unix socket/protobuf 路径；CONTEXT 中的完整 API shared-memory 术语不是实现证据 | SvmQueue 可独立验证，不凭空宣称已接入 Binary API |
+下表以最终语义为准；“重做”表示当前有同名或相近入口，但 ownership、layout 或失败行为
+不满足契约，不能按“API 已存在”关闭差距。
 
-## 4. 三方语义比较与决策
-
-| 维度 | 当前 Hammer | 提议 Hammer | VPP 依据 |
-| --- | --- | --- | --- |
-| 映射 / region | 两种名字围绕同一个 mmap+Talc owner | D1/D2：SvmSegment 管资源；SvmRegion 管 metadata/data allocation、成员与 root；命名根另有 SvmRegionMain | V1/V2 |
-| MQ 数据结构 | MP 空闲槽栈，SP cursor，各自 mode tag | D4：单一 descriptor FIFO + 可变数量的有序 data rings；正整数容量不强制二次幂 | V4/V5 |
-| FIFO 分配 | 每个 FIFO 预铺固定 chunk 存储 | D7：segment slices、分级 chunk 复用、按需 provision、压力与回收统计 | V8 |
-| 发布 | 部分 index 已 release/acquire，但共享引用掩盖写者权限 | D5/D8：角色所有权 + 显式发布/回收边界；OOO 只属 producer | V6/V9 |
-| 等待 | runtime pipe 与共享进程内 AtomicBool 通知 | D5：infra 队列等待后端；runtime 只集成就绪事件与调度 | V6/V7 |
-| ISA | Graph Node 专用；部分复制固定 ISA | D9：普通函数按支持的 CPU features 选定实现，复制入口实际使用选择结果 | V10 |
-| ABI | Hammer offsets + 自定义 queue layouts | D10：继续相对 offset，版本化且拒绝旧布局；不承诺 C 二进制互通 | V1/V4/V8 + R |
-| 生命周期 | 本地 Arc 管映射引用，不能代表远端进程退出 | D11：peer detach/worker handoff 后才回收；本地 Drop 不销毁仍被外部使用的共享对象 | V1/V2/V7/V8 |
-
-### D1/D2：映射、region 与分配 authority
-
-将现有 `SvmRegion` 的 fd/mmap 部分迁入 `SvmSegment`，合并现有 `Segment`
-重复资源路径。`SvmSegment` 拥有 mapping、backing fd、size、backend 和本地
-生命周期；不把 region allocator 自动绑定到每个映射。
-
-真正的 `SvmRegion` 拥有 region metadata、data allocation authority、成员与
-published root；`SvmRegionMain` 管命名根和子区。初始化在对象最终共享地址
-完成 mutex/condvar 与 metadata 设置，最后 release 发布 ready/version；attach
-先 acquire 再验证版本、偏移、容量与对齐。不能在 attached mapping 重建 Talc
-并覆盖创建方 heap。跨进程通用 region 分配需要共享的 offset allocator 元数据，
-不能使用带进程私有裸指针的 Talc 状态伪装为共享 heap。
-
-SSVM 的 SHM、MEMFD、PRIVATE backend 是真实资源模式。Rust private 模式不
-导出 fd；共享 region 与 Buffer Arena 继续是 Main Heap 的例外。普通 Vec/Pool
-控制元数据仍遵循现有全局 Main Heap。VPP 的 push/pop 当前 heap 不移植为
-thread-local heap 切换，改为明确持有 allocator owner 并直接调用。
-
-### D3/D4：删除旧队列，建立两个不同的 SVM 队列
-
-`SvmQueue` 和 `SvmMsgQ` 是两个不同的协议。前者交换运行时 `elsize` 定义的固定尺寸
-字节元素；后者
-严格对应 VPP `svm_msg_q_t`，交换 8 字节的 `(ring_index, elt_index)` descriptor，
-而消息内容留在调用方提供的 data ring 中。MQ 不拥有 payload，也不持有
-`SsvmPrivate`、`SvmSegment` 或任何外层映射 owner。
-
-VPP 的生命周期必须原样保留：
-
-```
-alloc_msg -> 写入 ring slot -> add -> sub -> 读取 ring slot -> free_msg
-```
-
-`alloc_msg` 只推进目标 ring 的 tail 并返回 descriptor；`add` 才把 descriptor
-复制到 descriptor queue。`sub` 只取出 descriptor，不释放 data slot；调用方完成
-读取后显式 `free_msg`，由该 ring 的 head 按序回收。descriptor queue 的容量和
-每个 ring 的容量独立，跨 ring 的 descriptor 顺序不改变，各 ring 只能按自己的
-head 顺序释放。
-
-共享布局只保存 descriptor queue 和 ring metadata；不保存 `mode`、`claim`、
-`q_mask`、`free_top`、`free_slots`，也不保存一份 queue-owned payload。生产者
-数量是访问契约，不是共享布局的类型参数：无 eventfd 时使用共享 robust mutex/
-condvar；eventfd 模式保留 VPP 的进程本地 producer spinlock。consumer 是单一
-owner，`sub_raw`/`sub` 不需要第二把消费者锁。
-
-`SvmMsgQRingConfig` 是当前 ring 的 caller-owned byte configuration：它只借用调用方
-的 `&mut [u8]`，不再增加第二层 storage 或 pointer owner。调用方
-负责保证切片长度等于该 ring 的 `nitems`、slot
-布局与 descriptor 一致、在 `read` 前已经由 producer 初始化；跨进程时各参与者
-分别绑定自己的映射，具体 payload 是否可重定位由使用者协议决定。queue 不为
-payload 分配、复制、释放，也不判断业务消息类型。
-
-旧 `MultiRingMsgQueue` 的 MP/SP 两套布局、任意空闲槽回收和可重复 publish
-接口全部删除。Rust 只约束 descriptor 的生命周期和 ring 借用，不改变 VPP
-alloc/add/sub/free_msg 的状态转换；未发布 slot 不由 `Drop` 自动回滚，调用方
-必须按 VPP API 显式完成或放弃该操作并由 owner 处理。
-
-#### 实现修正：不引入后置绑定 API
-
-这里的 ring `data` 不是方法，也不是新的 queue 生命周期阶段。它只表示 VPP
-`svm_msg_q_ring_cfg_t::data` 对应的构造期输入：`SvmMsgQRingConfig`
-在 `SvmMsgQ::init_at` 或 `SvmMsgQ::attach` 时携带 `nitems`、`elsize` 和调用方
-拥有的 `&mut [u8]`。初始化完成后不存在后置绑定、reservation、message
-Drop 回收或 queue-owned payload storage。
-
-Hammer 的实现 API 以 VPP 名称为中心：`SvmMsgQDescriptor` 是 8-byte union，
-`alloc_msg`/`alloc_msg_w_ring` 只推进 ring tail，`add`/`add_raw` 发布 descriptor，
-`sub`/`sub_raw` 取出 descriptor，`msg_data` 返回 caller-owned slot pointer，`free_msg`
-按该 ring head 顺序释放；`wait`、`wait_prod`、`or_ring_wait_prod`、`timedwait`、
-`set_eventfd` 和 `alloc_eventfd` 分别对应 VPP 的等待和通知入口。
-
-错误只表达 VPP 已有的语义边界：配置布局错误、无可用 descriptor、ring/queue
-满、空队列、nowait 锁竞争、超时、robust owner death 以及底层 mutex/condvar/
-eventfd 错误。Rust 不暴露 VPP 的 `-1`/`-2` 数字，也不把 `free_msg` 的错序
-断言伪装成新的恢复事务；调用者必须保持 `alloc_msg -> add -> sub -> free_msg`
-顺序。
-
-### D5：同步原语与等待
-
-| 状态 | Owner / readers / writers | 原语及发布边界 | 回收与失败 |
-| --- | --- | --- | --- |
-| region metadata / allocator | 加入同一 region 的控制线程和进程 | Rust process-shared mutex 的 RAII guard；VPP 参考为 PTHREAD_PROCESS_SHARED，具体平台字段留在同步实现内部 | 最后成员退出且无借用/等待者才销毁；初始化失败不能发布 ready |
-| Linux MQ 状态 | 同一映射的各生产者及单一消费者 | 无 eventfd 时使用 process-shared robust mutex/condvar；eventfd 时使用 VPP 风格的进程本地 producer spinlock，consumer 由角色契约独占 | full 保持可见位置；owner death 按 8.4 的 `make_consistent` 路径恢复 |
-| descriptor / payload | producer 发布 descriptor；consumer 读取并释放 ring slot | queue/ring 的 head、tail、cursize 按对应锁或角色规则更新；descriptor 出队不等于 ring slot 释放 | 不叠加第二套 payload 发布协议；满时不覆盖，通知不代替互斥 |
-| FIFO head/tail | 一 producer，一 consumer | 写 bytes/chunk links → tail Release → consumer Acquire；读完成 → head Release → producer Acquire | OOO 由 producer 本地维护，未填洞不能推进可读 tail |
-| segment byte allocator | 多 slice 申请不重叠区间 | CAS 仅授予字节区间所有权，不发布初始化后的对象 | 初始化后另行发布；容量耗尽保持 allocator 有效 |
-| segment chunk free lists | chunk 交还者与分配者 | 对照 VPP offset+tag CAS；Rust 必须证明节点读取、tag wrap、在途读者及重用安全 | 不能把 16-bit tag 的“概率低”当 Rust 安全证明；未证明前该 slice 不可交付 |
-| FIFO private slice / OOO | 当前 Data Worker | 启动前固定 slice 数；执行 worker 直接 `&mut` 借用自己的 entry | 外 worker 通过现有事件/handoff 请求；无 TLS、无全局新锁 |
-| graph/file/worker 可见登记 | main/control 与 Data Workers | 现有 WorkerBarrier acknowledgement 下修改 | Barrier 不包含外部 app 进程；不能以它证明 SVM peer 已退出 |
-
-无 eventfd 时，condvar 与共享 mutex 配对；检查 predicate、释放锁并睡眠、
-重新取得锁是同一等待协议。醒来后必须循环重查空/满条件。eventfd 是进程本地
-`OwnedFd`，通过现有 fd 传递路径交给 peer；fd 数值不写入共享 ABI。eventfd
-路径的 producer lock 只保护本进程的 producer 竞争，不能被当作跨进程 mutex；
-等待 eventfd 前必须释放 spinlock，poll/read 期间不得持锁做 syscall。
-
-等待容量和获取锁是两件事：alloc/add/sub/free 使用各自的锁和角色契约，容量不足立即返回，
-但不承诺锁竞争时整个调用非阻塞。显式 wait 仅供控制线程使用；Data Worker
-不调用 condvar wait/poll，也不能持 guard 进入调度、barrier、I/O 或 await。
-若后续要求 Data Worker 在外部进程停顿时仍具备有界延迟，必须另行解决这项
-共享锁约束，不能把 lock 接口标记为无锁或 wait-free。
-
-Linux 队列改选 posix-sync 0.1.0：固定使用 Robust、MutexSharing::Shared 和
-CondvarSharing::Shared。rustix-futex-sync 不满足 owner-death 要求，不再作为
-选定依赖。正常加锁、条件等待重新加锁都处理 owner death；收到
-`EOWNERDEAD` 后调用 crate 提供的 `make_consistent`，修复/确认队列状态后返回
-`OwnerDied`，不增加共享 `failed`、`closed` 或 `queue state` 字段。SVM region
-初始化在 VPP svm.c 中只设 process-shared，不把 queue.c 的 robust 设置误称为
-所有 VPP region 锁的属性；Rust 共享 allocator 的恢复另按 region owner 契约
-处理。
-
-不新增 ProcessMutex、ProcessCondvar、同步 trait、GAT 或后端类型参数。
-具体锁与 guard 直接来自外部 crate；内容 T 不改变同步协议。
-
-### D6/D7/D8：Session、FIFO segment 与字节操作
-
-Session 仍负责 IO/CTRL ring 的含义、消息编码、目标 Session 和节点调度。
-SVM 只知道 ring index、slot capacity、FIFO bytes、offset、slice 及同步。
-不向 infra 下移 TCP、TLS、HTTP、SessionEvt 或应用 attach 策略。
-
-`SvmFifoSegment` 拥有 chunk/header 存储、共享 slice freelists、私有 FIFO
-对象、message-queue metadata 的 attach 关系及预分配/压力统计。普通 RX/TX 分配、client attach、client
-detach 和最终 FIFO free 是不同操作；attached client 不能回收 server 的共享
-header。迁移先由 Session 停止旧 owner 的 I/O，再完成目标 slice 的资源准备
-和所有权交接，最后回收旧私有状态。失败时旧 owner 仍有效，禁止先改 slice
-index 后返回资源不足。
-
-FIFO 私有状态借用必须收紧，删除 `peek_segments(..., FnOnce)`；直接返回
-与 owner 同寿命的 slice/iterator。不能以 `Read for &Fifo`、`Write for &Fifo`
-或无条件 `Sync` 暴露多写者/多消费者。使用真实 owner 的 `&mut`；跨进程映射
-建立 producer/consumer 权限属于 attach 契约。新借用设计需要连同 SDK async
-方法检查，不能跨 `.await` 持有同步 guard 或 worker-local 协议借用。
-
-OOO 使用现有 infra Pool/RbTree，存储在 producer owner 内；不引入 observer
-atomics/locks。有效 sequence 窗口和 wrapping 比较需要边界测试。Chunk provision
-可能产生任意数量的片段，不能把当前“两个 slice”接口宣称为完整 chunk chain
-API。保留写 reservation 的事务语义：目标 commit 先于源 consume，错误时两个
-FIFO 可见位置不动。TX retention 与 ACK 回收仍属于 Session，TCP 不复制恢复载荷。
-
-### D9：Rust 普通函数的 CLIB_MARCH_FN 对应能力
-
-已核实完整 `src/svm` 的调用定义只有：
-
-1. `svm_fifo.c:17`：`svm_fifo_copy_to_chunk`，把 source bytes 跨 chunk 写入 FIFO。
-2. `svm_fifo.c:48`：`svm_fifo_copy_from_chunk`，从 FIFO chunk chain 复制到 destination。
-
-普通入口在同文件 `:84` / `:92`，通过 `CLIB_MARCH_FN_SELECT` 调用。
-`vppinfra/cpu.h:554` 定义 constructor 选择；baseline priority 为 0，受支持
-架构提供更高 priority。不要把 `CLIB_MARCH_FN_REGISTRATION`、
-`VLIB_NODE_FN` 和这套普通函数 selected pointer 机制混为一谈。
-
-全 `src` 范围的同名宏定义使用还包括 `plugins/npol/npol_match.c:690`、
-`plugins/memif/node.c:1052`、`plugins/memif/device.c:399`；这些是范围核对，
-本次不扩张到对应插件。检查命令：
-
-```bash
-rg -n 'CLIB_MARCH_FN|CLIB_MARCH_FN_SELECT' third_party/vpp/src/svm
-rg -n 'CLIB_MARCH_FN\s*\(' third_party/vpp/src --glob '*.[ch]'
-```
-
-提议在 infra `simd` 中新增 `march_fn!` 声明宏。它生成一个普通具体签名入口、
-私有 baseline/ISA 实现及一个相同签名的 selected 函数指针。避免新增 proc-macro
-依赖，维持 infra external-only 依赖规则。已有 `node_function` 专属 Graph Node，
-不能直接用于 FIFO，也不向普通函数注入 DataPlaneMain/Frame。
-
-宏输入列出函数体、baseline/ISA 的 feature 集和 priority；使用编译期 `cfg` 排除
-外架构实现，使用 `#[target_feature]` 编译各实现，运行时检查全部必需 feature，
-按 priority 选优。x86 的 AVX2/AVX512 依赖 feature detection 的 OS 状态支持；
-AArch64 基线与 NEON 选择分别声明，其他 target 必有 baseline。不能按向量宽度
-推断任意 ISA 已受支持，也不能只编译不同名字但全部调用相同 scalar 热路径。
-
-每个普通函数的选择状态属于定义该函数的进程映像，具体函数指针经 OnceLock
-发布，启动预热后不变；standalone SDK 使用时也必须可安全初始化。CPU 检测只
-在初始化发生，payload 热路径不分配、不注册节点、不反复检测 CPU、不跨 DSO
-查找全局 registry。目标 CPU 支持集合必须覆盖该进程允许运行的全部 CPU；不能
-把某个初始化 core 的额外特性无条件用于异构 core。
-
-两个 FIFO chunk 复制入口必须实际使用该机制，并复用现有平台复制内核或由
-专用 target 编译的内核。它只选择机器码，不改变 FIFO ownership、不产生中间
-payload Vec、不将协议状态类型擦除。这个具体函数指针调用是用户要求的运行时
-ISA 选择，需要在批准时明确为该用途的例外；不由此放开任意 dyn trait dispatch。
-不得把 selected 指针写进共享 region。宏不支持的 generic/async/签名形式应在
-编译期拒绝，不生成假的通用支持。
-
-### D10/D11：ABI、发布与销毁
-
-对齐的是职责、状态转换和同步语义，保留 Rust offset ABI；VPP SSVM 的固定
-virtual address 和共享裸指针不照搬。pthread ABI 是平台相关的，跨平台不承诺
-同一共享映射布局。布局变更必须更新 attach/bootstrap 版本且拒绝旧 queue/FIFO，
-不能解释旧 mode tag 或留下旧 `MultiRingMsgQueue` alias。
-
-创建过程为 mapping → allocator/header/rings 初始化 → ready 发布 → fd/offset
-交付。失败逆序清理，保留 primary error 与 cleanup error。退出顺序为停止
-enqueue/调度来源 → 处理在途 descriptor/借用 → detach peer / 完成 owner handoff →
-注销 fd readiness → 销毁共享同步对象（仅最终 owner）→ unmap/close。Arc 的本地
-引用计数不代表远端消费者已经不再访问，WorkerBarrier 也不提供此证明。
-
-## 5. 层隔离契约
-
-| 层 | 允许调用 | 禁止调用/存储 | 验证 |
-| --- | --- | --- | --- |
-| SvmSegment / SvmRegion | libc backing/mapping；已有 infra allocator/primitives | runtime/service/plugin 状态、TLS 当前 heap 切换 | infra 独立编译；不同地址 subprocess attach、资源回收 |
-| SvmFifoSegment / SvmFifo | region storage、Pool/RbTree、直接 slice/reservation | SessionEvt、TCP header、Graph Node scheduling、跨 worker 私有状态 | FIFO/segment integration；借用编译失败用例；边界失败原子性 |
-| SvmQueue / SvmMsgQ | 通用元素、descriptor、ring slot、队列等待和通知 | IO/CTRL 含义、应用业务、payload allocation、通用 erased registry | 通用消息 roundtrip、并发/跨进程、explicit alloc/add/sub/free、唤醒测试 |
-| runtime Session MQ 接入 | infra queue、已有 FileMain readiness | 第二套 slot allocator、重复 queue signaling 状态机 | runtime 事件队列集成测试 |
-| service Session / hammer-app | owner-defined queue API、消息编码、attach/handoff | 新的共享协议状态锁、业务逻辑进入 SDK | App/Session bootstrap、控制消息与关闭流程 |
-| march_fn | 同签名机器码变体、CPU feature detection | Frame、DataPlaneMain、共享函数指针、plugin registry | infra-only compile、选择和两条复制入口行为测试 |
-
-## 6. 错误契约
-
-这些是基础设施或生命周期失败，不是每包分配的控制面错误。
-
-| Owner | 类别 / 事实字段 | 可行动调用者 | 恢复与原子性 |
-| --- | --- | --- | --- |
-| SvmSegment | backing create/size/map/attach、size/alignment、backend unsupported、原始 io source | region/session bootstrap、SDK attach | 拒绝 attach，关闭本次 fd；已发布映射不改变 |
-| SvmRegion | version/root/offset 验证、成员状态、容量、共享同步初始化、成员退出 | RegionMain / 生命周期控制方 | 回滚成员登记；不能假装普通 absence |
-| SvmQueue / SvmMsgQ | queue full、ring full `{ring}`、无效 ring/descriptor、wait timeout、owner death、signal io error | Session 重试/背压、SDK wait、队列生命周期 owner | alloc/add/sub/free 的每一步保持状态可观察；发布或释放后 signal 失败不能报告成“消息未发送”诱发重复提交 |
-| SvmFifo / segment | invalid capacity、segment exhausted、reservation too long、非法 offset/attachment、migration allocation | Session/TCP owner、协议链 | chunk 初始化失败不发布，目标 reservation 失败不消费源 |
-
-复用现有 `FifoError` 与 `SegmentAllocationError` 中仍匹配的事实，不保留旧 MQ
-`InvalidConfig` 吞掉所有 allocation/OS 原因的路径。迁移时旧 `ModeMismatch`
-与 `ProducerClaimed` 随旧布局删除；外部旧 ABI 返回版本/布局错误。
-具体新增错误见第 8 节，source 只在真正 seam 翻译一次。
-
-alloc/add/sub/free_msg 的调用顺序决定消息是否已经发布和 ring slot 是否已经回收。
-signal/wait 返回单独结果；不能把发布后的 signal failure 转成 `Full`，也不能
-对已发布消息回滚。
-格式字符串不是错误类别。pthread 函数返回的 errno 数值需要直接转换为 source，
-不能误读 `last_os_error()`。owner-local cleanup 必须显式释放全部已创建对象，
-并在主错误中保留次级 cleanup 事实；不新增通用 boxed error helper。
-
-## 7. 迁移闭包与删除账本
-
-| 请求 | 当前定义/调用者 | 替换或删除 | 证明 |
-| --- | --- | --- | --- |
-| 删除 MultiRing | infra `multi_ring_msg_queue.rs`、`lib.rs` export | 删除整个文件及 MultiRingMsgQueue/Cfg/Error、ProducerMode、MP/SP tags、RingView/ProducerRing、SlotFree | 编译全部调用者；旧定义/import 搜索为零 |
-| 同一共享 MQ 模型 | runtime `app/{mod,session_msg_queue,layout,session}.rs` | SessionMsgQueue 接入新的 descriptor/ring API；删除存储 mode 泛型，移交通用 fd signaling | runtime 消息顺序/背压/slot 回收/borrow contract |
-| App/Session 迁移 | service `session/{app,application,runtime,control}.rs`；app `attach.rs`；其他经全仓搜索发现的调用者 | bootstrap 使用新版布局；producer/consumer 权限、控制消息及 reply 迁移 | 多进程 attach、IO/CTRL、listen/connect/accept/close/reset 相关原有路径回归 |
-| region/mapping 分离 | infra `segment.rs`、`svm/region.rs`；stats `segment.rs`、`metric.rs`、`lib.rs`；所有 Segment imports | 明确 mapping 与 allocator owner，更新 raw allocation ownership；stats 不被迫创建 FIFO segment | stats allocation/drop 与共享 bootstrap 回归 |
-| FIFO segment | infra `fifo.rs`；runtime app session；service session allocation/reclaim；TCP/协议 FIFO 消费者 | 移交 chunk/header 分配；直接借用替代闭包访问；同步更新 OOO、retention 和 reclaim | FIFO/OOO、协议失败原子性、TX/ACK retention 回归 |
-| 普通函数 multiarch | infra `simd.rs`；FIFO copy paths | 新增宏及两条复制入口选择；复用已有 ISA 内核 | 真实复制行为、选择合法性、baseline 和 ISA 一致 |
-| 文档和依赖 | CONTEXT、此 ADR、各 owner docs、Cargo manifests | 无兼容别名；新增测试依赖按现有布局组织；第三方源码不提交 | diff review、Cargo 依赖检查、旧术语删除审计 |
-
-不能只迁移默认 MP 路径而留下 `<SingleProducer>` 控制队列，也不能把 generic
-mode 删掉后保留原 free-list 布局。变更共享 layout 时必须覆盖从 creator 到
-attached client 的全部 constructor、offset、对齐与版本验证。
-
-## 8. 新类型/API 批准清单
-
-以下均为提议，批准必须覆盖对应行为和调用闭包，而不是只批准名字。
-内部 wire/header 类型保持私有；不引入 View、TLS 或闭包借用。
-
-| ID | 新增/替代类型与 API | Owner / consumer | 为什么已有接口不足 |
-| --- | --- | --- | --- |
-| A1 | `SvmSegment`、`SvmSegmentConfig`、`SegmentBackend::{Private,Shm,Memfd}`；create/attach、size/backend、显式 close | infra；region/FIFO segment/stats/bootstrap | Segment 把资源与创建方 allocator 绑死，没有完整 backend/ready 生命周期 |
-| A2 | 重定义 `SvmRegion`；`SvmRegionMain`、`SvmRegionConfig`；find-or-create、加入/离开、root、allocate/free | infra；命名 SVM 使用方 | 当前同名类型只是映射；缺失共享 metadata allocator、成员与命名根 |
-| A3 | `SvmFifoSegment`、`SvmFifoSegmentConfig`、`SvmFifoSegmentMain`；create/attach/delete、slice FIFO/chunk 分配回收、迁移、preallocate、pressure 查询 | infra；Session | 没有该分配 owner；FIFO 各自分配无法提供 slice 复用和生命周期 |
-| A4 | `SvmFifo` 替代 Fifo；私有 shared header/chunk/OOO；迁移现有 enqueue/peek/drop/OOO/notification，新增 chunk provision/segment borrow、subscriber 和迁移操作 | infra；Session/协议/SDK | 缺少完整 chunk 模型；共享引用和 closure 接口不满足所有权约束 |
-| A5 | `SvmQueue`、`SvmQueueConfig`；运行时 `nels`/`elsize` 的 byte `add`/`add2`/`sub`/`sub2`、lock/wait、attach；不引入 queue-level 类型参数 | infra；通用 SVM 调用者 | VPP `svm_queue_t` 的 inline data[] 是字节布局；调用者负责内容 schema，普通队列不依赖 zerocopy 类型约束 |
-| A6 | `SvmMsgQ`、私有 `SvmMsgQSharedQueue`/ring metadata、`SvmMsgQDescriptor` union；构造期 `SvmMsgQRingConfig { nitems, elsize, data }`、`alloc_msg`/`add`/`sub`/`free_msg`、init/attach | infra；runtime Session MQ | 必须替换旧双布局/任意空闲槽模型；descriptor 只表示 ring/slot 身份，不授予 queue-owned payload 访问 |
-| A7 | `SvmMsgQRingConfig` 的 caller-owned `&mut [u8]`；`msg_data` 返回当前 descriptor 的 slot pointer；不新增 typed ring、reservation 或 Drop 事务 | infra；Session producer/consumer | VPP `svm_msg_q_ring_cfg_t::data` 是调用方输入；payload ownership 和内容编码由调用方负责 |
-| A8 | 直接使用外部 crate 的同步原语；Linux 无 eventfd 使用 shared robust mutex/condvar，eventfd 使用 process-local producer spinlock；恢复契约见 8.4；不新增同步泛型 API | 队列维护自己的同步协议；通用原语遵循现有归属规则 | eventfd MQ 与固定元素队列的锁语义不同，不能抽象成可任意组合的后端 |
-| A9 | `march_fn!`；具体函数签名的 baseline/ISA 变体与一次 CPU 选择 | infra `simd` 和 FIFO | node_function 引入 graph 类型，不能用于 infra 普通函数；需要具体函数指针 ISA dispatch 的限定许可 |
-| A10 | `SvmSegmentError` / `SvmRegionError` / `SvmQueueError` / `SvmMsgQError`；现有 FifoError/SegmentAllocationError 的必要迁移 | 各 infra owner；bootstrap、Session、SDK | 现有 InvalidConfig/Option 丢掉 OS、owner-death、版本和容量事实；按第 6 节限定类别，禁止万能 error |
-| A11 | `SvmRegionHeap`；offset 化块分配/释放/`reallocate`/`holds`/统计；无 `Result`，耗尽与损坏按 `SvmRegionHeapViolation` 终止 | infra region；root region 名字表、成员表、用户上下文 | 现有 bump 分配器不回收，Talc 含进程私有指针不能跨进程；§12.4 |
-| A12 | `SvmHashMap<V>` 及其 `SvmEntry`/`SvmIter`/`SvmKeys`/`SvmValues`/`SvmValuesMut` 句柄；键是 arena 内字节串，表自己持有键字节 | infra region（名字注册表）；后续通用 SVM 调用者 | 标准 `HashMap` 只能从进程全局堆分配、内部是绝对指针、`RandomState` 每进程随机种子；`Bihash` 无字节键且槽位为指针；§12.5 |
-| A13 | `SvmRegionHeader`/`SvmRegion`/`SvmRegionConfig`/`SvmRegionState`/`SvmRegionMain`/`SvmRegionError`/`RegionLock`/`RegionMembership` 的具体化；成员表、锁序与子区序号 | infra region；命名 SVM 使用方、daemon 注册 owner、SDK | A2 只有粗粒度描述，缺少字段映射、三段布局、锁恢复与子区所有权；§12.2–§12.8 |
-
-A1–A13 不自动批准 database/CLI 的全新产品接口，也不自动批准改变所有 runtime
-同步原语归属。Database、工具 parity 需后续具体 owner/API 设计；这项缺口保留在
-完整性账本，不作为删除旧 MQ 的前置依赖。
-
-## 8.1 泛型范围：只描述存储的内容
-
-用户明确要求只对存储内容泛型化。本设计的 `T` 只表示调用方绑定到一个 data
-ring slot 的值。锁、通知、映射后端、生产者模式、queue 类型和 ring 数量均不
-作为类型参数；ring 数量和容量继续是运行时配置。本文删除同步 trait、GAT、
-同步后端类型、const ring 参数和 queue-level `T`，相关接口不再属于提议清单。
-
-以下代码省略方法体，表达字段、类型约束、借用和方法签名，不是已实现代码。
-
-| 存储对象 | Rust 表达 | T 的含义 |
+| Owner | 缺失或必须重做的 surface | 当前差距 |
 | --- | --- | --- |
-| 固定元素队列 | `SvmQueue` | 每个元素都是 T，尺寸和对齐由 T 决定 |
-| 异构消息队列 | `SvmMsgQ`，descriptor queue + data rings | descriptor 只保存 ring/slot 身份；不同 rings 可以绑定不同内容 |
-| ring typed view | `SvmMsgQRingConfig` | 调用方提供的 `[u8]` slots；不属于 Ssvm 或 queue ownership |
-| message identity | `SvmMsgQDescriptor` | 8-byte descriptor 与 T 的编译期关联；不缓存 payload pointer |
-| byte FIFO | `SvmFifo` | 内容固定为 u8，保留字节位置和 OOO 语义 |
-| 映射 / FIFO segment | `SvmSegment` / `SvmFifoSegment` | 仍是存储 owner，不引入同步或后端泛型 |
-
-MQ 不强制所有 data rings 同一种 T。泛型放在访问当前 slot 的方法和实际写入
-事务上；不另造一个只缓存 ring pointer 的 `Ring<T>` 借用 wrapper。
-
-### 8.2 固定元素队列 SvmQueue
-
-```rust
-// hammer_infra::svm::queue
-use zerocopy::{FromBytes, Immutable, IntoBytes, KnownLayout};
-
-pub struct SvmQueueConfig {
-    pub capacity: u32,
-}
-
-pub struct SvmQueue {
-    segment: Arc<SvmSegment>,
-    header_offset: u64,
-    producer_event: Option<OwnedFd>,
-    consumer_event: Option<OwnedFd>,
-    element: PhantomData<T>,
-}
-
-impl<T> SvmQueue
-where
-    T: Copy + FromBytes + IntoBytes + KnownLayout + Immutable,
-{
-    pub fn layout(config: &SvmQueueConfig) -> Result<Layout, SvmQueueError>;
-
-    pub unsafe fn init_at(
-        segment: Arc<SvmSegment>,
-        offset: u64,
-        config: &SvmQueueConfig,
-    ) -> Result<Self, SvmQueueError>;
-
-    pub unsafe fn attach(
-        segment: Arc<SvmSegment>,
-        offset: u64,
-    ) -> Result<Self, SvmQueueError>;
-
-    pub fn enqueue(&self, value: T) -> Result<(), SvmQueueError>;
-    pub fn enqueue_pair(&self, first: T, second: T)
-        -> Result<(), SvmQueueError>;
-    pub fn dequeue(&self) -> Result<Option<T>, SvmQueueError>;
-    pub fn dequeue_batch(&self, destination: &mut [T])
-        -> Result<usize, SvmQueueError>;
-    pub fn enqueue_wait(&self, value: T) -> Result<(), SvmQueueError>;
-    pub fn dequeue_wait(&self) -> Result<T, SvmQueueError>;
-    pub fn dequeue_until(&self, deadline: Instant) -> Result<T, SvmQueueError>;
-    pub fn len(&self) -> Result<usize, SvmQueueError>;
-    pub fn is_empty(&self) -> Result<bool, SvmQueueError>;
-}
-```
-
-enqueue/enqueue_pair/dequeue/dequeue_batch 均通过 lock 取共享 mutex，容量不足
-或为空时立即返回，不在这些方法内部等待容量。enqueue_pair 要么同时发布两个
-元素，要么一个也不发布。显式 *_wait / *_until 在相同 mutex 下循环检查条件；
-超时使用固定截止时间，spurious wakeup 不重置总等待时间。这里不提供 try_lock，
-也不承诺普通方法在锁竞争时立即返回。固定元素的复制与出队在 guard 内完成，
-无需向 Binary API 暴露共享 header 或手工 lock/unlock/raw 方法。
-
-`size_of::<T>()` / `align_of::<T>()` 替代调用方手填 elsize 与强制指针转换。
-capacity 仍是配置。T 为 ZST、布局溢出、capacity 为 0 在初始化时拒绝。
-
-Copy 不足以保证跨进程字节有效性，因此提议复用 zerocopy 的既有约束，不新增
-一套通用消息 trait。`IntoBytes` 排除未初始化 padding；`FromBytes` 保证所读取
-位模式有效；引用、进程指针、String、Vec 不允许作为共享 T。现有 lockfile
-已有 zerocopy 0.8，采用时仍需 infra 的直接依赖声明。相关接口依据：
-[IntoBytes](https://docs.rs/zerocopy/latest/zerocopy/derive.IntoBytes.html)、
-[FromBytes](https://docs.rs/zerocopy/latest/zerocopy/trait.FromBytes.html)。
-
-attach 必须验证版本、元素大小、对齐和调用方约定的 schema。相同 size 不能
-证明是同一种业务消息；不能将 Rust TypeId 当成跨进程 schema。协议有效性
-由内容 owner 验证，infra 的约束只解决安全字节表示。
-
-### 8.3 消息队列：VPP descriptor queue 与调用方 byte rings
-
-VPP `message_queue.h:19-92` 把 descriptor queue、data rings、process-local
-wrapper 和 8-byte union 分开。Hammer 采用同一职责划分，不把 payload 再包成
-一个 queue-owned storage abstraction：
-
-```rust
-// hammer_infra::svm::msg_queue；共享布局字段以 offset 表示，省略方法体。
-use posix_sync::condvar::{BorrowedCondvar, RawCondvarAlloc};
-use posix_sync::mutex::{BorrowedMutex, RawMutexAlloc};
-use posix_sync::mutex::robustness_markers::Robust;
-use std::marker::PhantomData;
-use std::mem::MaybeUninit;
-use std::os::fd::OwnedFd;
-use std::ptr::NonNull;
-use crate::sync::SpinLock;
-#[repr(C)]
-pub union SvmMsgQDescriptor {
-    words: [u32; 2],
-    pub as_u64: u64,
-}
-
-#[repr(C)]
-struct SvmMsgQSharedQueue {
-    mutex: MaybeUninit<RawMutexAlloc>,
-    condvar: MaybeUninit<RawCondvarAlloc>,
-    head: u32,
-    tail: u32,
-    cursize: u32,
-    maxsize: u32,
-    elsize: u32,
-    pad: u32,
-}
-
-#[repr(C)]
-struct SvmMsgQRingShared {
-    cursize: u32,
-    nitems: u32,
-    head: u32,
-    tail: u32,
-    elsize: u32,
-}
-
-pub struct SvmMsgQRingConfig<'data> {
-    pub nitems: u32,
-    pub elsize: u32,
-    pub data: &'data mut [u8],
-}
-
-pub struct SvmMsgQConfig<'a, 'data> {
-    pub consumer_pid: i32,
-    pub q_nitems: u32,
-    pub ring_cfgs: &'a mut [SvmMsgQRingConfig<'data>],
-}
-
-struct SvmMsgQQueue {
-    shared: NonNull<SvmMsgQSharedQueue>,
-    event_fd: Option<OwnedFd>,
-    lock: SpinLock<SvmMsgQProducerState>,
-}
-
-struct SvmMsgQProducerState {
-    shared: NonNull<SvmMsgQSharedQueue>,
-}
-
-pub struct SvmMsgQ<'data> {
-    descriptors: NonNull<SvmMsgQDescriptor>,
-    rings: Vec<SvmMsgQRing>,
-    queue: SvmMsgQQueue,
-    mutex: BorrowedMutex<'static, Robust>,
-    condvar: BorrowedCondvar<'static>,
-    _data: PhantomData<&'data mut [u8]>,
-}
-
-struct SvmMsgQRing {
-    nitems: u32,
-    elsize: u32,
-    shared: NonNull<SvmMsgQRingShared>,
-    data: NonNull<u8>,
-}
-
-impl SvmMsgQ {
-    pub unsafe fn init_at(
-        segment: &SsvmPrivate,
-        offset: u64,
-        config: &SvmMsgQConfig<'_, '_>,
-    ) -> Result<Self, SvmMsgQError>;
-    pub unsafe fn attach(
-        segment: &SsvmPrivate,
-        offset: u64,
-        ring_cfgs: &mut [SvmMsgQRingConfig<'_>],
-    ) -> Result<Self, SvmMsgQError>;
-
-    pub fn add(
-        &self,
-        msg: SvmMsgQDescriptor,
-        nowait: bool,
-    ) -> Result<(), SvmMsgQError>;
-    pub fn sub(
-        &self,
-        wait: SvmQueueConditionalWait,
-    ) -> Result<SvmMsgQDescriptor, SvmMsgQError>;
-    pub fn free_msg(&self, msg: SvmMsgQDescriptor)
-        -> Result<(), SvmMsgQError>;
-}
-
-```
-
-`SvmMsgQSharedQueue` 对应 VPP `svm_msg_q_shared_queue_t` 的 head/tail/cursize/
-maxsize/elsize；它后面紧邻 queue-owned descriptor 数组。`SvmMsgQRingShared` 对应
-`svm_msg_q_ring_shared_t` 的 ring accounting。queue 共享布局不依赖 q_mask 或
-空槽哨兵，descriptor capacity 与每个 ring 的 `nitems` 独立。data slot 不属于
-queue 的 allocation owner；它只由 `SvmMsgQRingConfig::data` 的调用方提供。
-
-`alloc_msg` 只检查目标 ring 的 `cursize < nitems`，推进该 ring 的 tail 并返回
-descriptor；它不把 descriptor 放入 queue。调用方写完 slot 后调用 `add`，由
-queue tail/cursize 接收 descriptor。所有 index/stride 计算 checked，容量为零、
-溢出和错位返回结构化错误；内容 schema 与跨进程可重定位性归调用方。
-
-`sub` 只从 descriptor queue head 取出一个 descriptor；它不释放 ring slot。
-consumer 读取完成后调用 `free_msg`，该方法要求 descriptor 等于对应 ring 的
-head，并按 ring head 顺序回收。consumer 是单一角色，不新增第二把消费者锁；
-descriptor 出队和 slot 释放保持两个独立的可观察步骤。
-
-`SvmMsgQ` 不持有 segment、SSVM mapping 或 payload allocation。外层 mapping owner
-在最终地址初始化/attach queue metadata 和共享同步原语，再将 queue 借给
-`SvmMsgQRingConfig::data`；queue 的 `'static` borrowed lock 只表示外部 owner 已证明共享映射
-在 queue 生命周期内稳定，不允许由 queue 自己构造或移动 backing storage。
-
-层次关系固定为：`SsvmPrivate` 负责 `ssvm` backing、fd、mmap 与 ready；
-`SvmRegion` 负责 region header、offset allocator、成员和 published root；
-`SvmMsgQ` 只负责该 region 中的 descriptor queue/ring metadata 及 queue 同步。
-`SvmFifoSegment` 或 Session owner 可以在 region 中登记一个 MQ offset，但不得把
-MQ 变成 segment 的 payload allocator；`SvmMsgQRingConfig::data` 的 data slice 仍由实际使用者
-提供。attach 先由 `SsvmPrivate` 完成 mapping、再由 `SvmRegion` 验证版本/offset，
-最后 `SvmMsgQ::attach` 借用已初始化的 queue header；任意一层失败都不发布 ready。
-
-`SvmMsgQRingConfig::data` 是构造期把 payload storage 交给 queue wrapper 的入口，调用方
-必须保证切片长度等于 ring 的 `nitems * elsize`，并负责 storage 生命周期。queue 不分配或释放 `data`，不要求 data 必须来自 SSVm；它
-可以来自本地内存、Main Heap、其他 mmap 或使用者自己的共享区。不同 ring 可
-分别使用不同的 `elsize`，但一个 ring 在其生命周期内只有一个 byte layout。
-
-`read` 使用明确的 `read_unaligned`，`write` 使用明确的 `write_unaligned`；
-不把 Rust 引用写入共享布局，也不推导跨进程 TypeId/schema。payload 表示、版本
-和内容校验由 Session/API 使用者拥有。
-
-读取 payload 的借用必须只覆盖 `read`/解码；完成后才调用 `free_msg`，再执行
-Session handler、I/O、await 或 barrier。生产者在 `add` 成功后不得再次访问该
-descriptor 或 slot；`SvmMsgQDescriptor` 不提供取消、Drop 回滚或隐式释放。
-
-SessionMsgQueue 本身不再有模式参数或 queue-level `T`。IO/worker CTRL、应用
-CTRL 等业务内容由调用方选择各自的 ring storage 和编码；`SvmMsgQ` 只交换
-descriptor，不存放业务消息类型。
-
-condvar 通知覆盖 descriptor queue 的空/非空和 queue/ring 的满/有空间转换；
-等待方必须重查 predicate。eventfd 通知失败不能回滚已经完成的 add/sub/free_msg；
-错误必须标明操作已经完成，由 queue owner 记录并交给 runtime 处理，不能通过
-重发 payload 伪造成功通知。
-
-### 8.4 同步保持具体实现，不参与内容泛型
-
-| 已核对的 VPP 路径 | 实际语义 | Rust 约束 |
-| --- | --- | --- |
-| `application.c::app_rx_mqs_alloc` | 每条 app RX MQ 创建 eventfd | 私有 owner 持有 fd 和 producer lock |
-| `segment_manager.c::segment_manager_alloc_queue` | 由 use_mq_eventfd 决定是否创建 eventfd | 配置保持原有选择，不产生类型参数 |
-| `message_queue.h::svm_msg_q_lock/try_lock/unlock` | eventfd MQ 用私有 spinlock；无 eventfd 用共享 mutex | 复用具体原语，不新增同步 trait 或 GAT |
-| `queue.c::svm_queue_lock` / `svm_queue_send_signal_inline` | eventfd 只替换通知，共享 mutex 保留 | 不套用 MQ 的锁选择规则 |
-| `svm.h::svm_mem_alloc/free` | region 分配使用共享 mutex | region 分配锁不因队列内容 T 改变 |
-
-以上表格描述 VPP 源行为，也是本轮 Linux MQ 的选择：无 eventfd 使用共享
-mutex/condvar，eventfd 保留进程本地 producer spinlock。eventfd 只替换通知
-路径，不把该 spinlock 当作跨进程互斥。SVM 领域类型不直接暴露原始 pthread
-字段，也不定义可插拔同步框架；具体 platform primitive 由外部 crate 提供。
-
-mutex 与 condvar 仍属于共享队列头。`SvmMsgQ` 只保存对已初始化 header 的
-borrowed handles，不保存映射 owner；不能把 queue API 不持有 segment 误写成
-共享 header 没有同步字段。
-VPP 的依据是 `queue.h:16`、`message_queue.h:21`，以及两份 `.c` 初始化时的
-`pthread_mutexattr_setpshared` / `pthread_condattr_setpshared`。
-
-同步原语直接复用外部 crate，不定义 Hammer 自有 mutex/condvar 类型，
-不增加同步 trait 或队列同步类型参数。此处不再用未实现的类型名占位。
-
-锁接口按用户要求只保留 lock，由 guard 释放；不要求 crate 提供 try_lock。
-队列 alloc/add/sub/free 的容量检查与锁获取是不同操作，不能因此宣称整个
-调用无等待；这也不是给公开队列增加同步类型参数的理由。
-
-**Linux 选型：posix-sync 0.1.0，共享 robust mutex + condvar**
-
-文档确认了完整组合：BorrowedMutex<Robust> 支持共享映射中的原位初始化、
-attach、阻塞 lock 和 RAII guard；BorrowedCondvar 支持 shared、Monotonic、
-wait/wait_for、notify_one/notify_all。两种锁获取入口都能识别 owner death。
-Robust 是第三方 crate 的固定配置，本项目不把它暴露为队列类型参数。内容 T
-继续只描述 slot/固定队列元素，crate 的 mutex 无需也不提供 Mutex<T>。
-
-```toml
-# 仅为 ADR 的拟议依赖；本轮不修改 Cargo.toml。
-[target.'cfg(target_os = "linux")'.dependencies]
-posix-sync = "=0.1.0"
-```
-
-```rust
-use posix_sync::mutex::{
-    BorrowedMutex, MutexBuilder, MutexSharing, RawMutexAlloc,
-    guards::{RobustGuardContainer, StandardGuard},
-    robustness_markers::Robust,
-};
-use posix_sync::condvar::{
-    BorrowedCondvar, CondvarBuilder, CondvarSharing, CondvarClock, RawCondvarAlloc,
-};
-
-// 创建方：mutex_storage / condvar_storage 指向最终映射中相应 Raw*Alloc 空间。
-// segment 是外层 owner；初始化完成前不得发布共享 ready。
-let mutex = unsafe {
-    MutexBuilder::<Robust>::new()
-        .with_sharing(MutexSharing::Shared)
-        .build_borrowed(mutex_storage, segment)
-};
-let condvar = unsafe {
-    CondvarBuilder::new()
-        .with_sharing(CondvarSharing::Shared)
-        .with_clock(CondvarClock::Monotonic)
-        .build_borrowed(condvar_storage, segment)
-};
-
-// attach 方：先 Acquire ready 并校验版本/偏移/对齐；不能再次 build。
-let mutex: BorrowedMutex<'_, Robust> = unsafe {
-    BorrowedMutex::from_raw(mutex_storage, segment)
-};
-let condvar = unsafe {
-    BorrowedCondvar::from_raw(condvar_storage, segment, CondvarClock::Monotonic)
-};
-```
-
-RawMutexAlloc / RawCondvarAlloc 是 crate 提供的实际同步存储，不是 Hammer 新增
-类型。按其 SIZE/ALIGN 安排空间，构造后禁止移动，不能将 BorrowedMutex 指针
-值写进共享 ABI。RawMutexAlloc 的 !Unpin 约束不免除调用者对 mmap 的生命周期
-责任。所有进程/线程的借用和等待结束后，最后资源 owner 才能 destroy；普通
-attached queue Drop 只结束本地借用，不销毁共享同步对象。
-
-**owner death：按 VPP 语义接管并 make_consistent**
-
-VPP `message_queue.c` 在 lock 或 condvar 重新加锁收到 `EOWNERDEAD` 后调用
-`pthread_mutex_consistent`，然后把本次获取报告给调用方；它没有 `failed`、
-`closed` 或独立 queue-state 字段。Hammer 保留这一语义：
-
-1. 接管方只在已取得 robust guard 后检查 queue/ring 的结构不变量（head/tail/
-   cursize 范围、descriptor 所属 ring、每个 ring 的 occupancy）。
-2. 不变量满足时调用 `make_consistent`，释放 guard，并返回结构化 `OwnerDied`
-   让上层决定是否重试当前 alloc/add/sub/free_msg；不自动重发 payload。
-3. 无法证明不变量时返回 owner-local 的结构损坏错误，不能继续读取 payload；
-   生命周期 owner 负责停止该 queue、完成 peer handoff 后重新初始化新的 queue
-   身份。不能通过增加共享 `failed`/`closed` 标志把这一路径变成第二套状态机。
-4. `EOWNERDEAD` 不是普通 empty/full，也不是成功；它只说明锁已经接管。旧
-   descriptor 的交付结果由 Session/API owner 根据消息身份处理，SVM 不承诺
-   跨进程崩溃 exactly-once。
-
-```rust
-// 队列私有方法；使用 crate guard，不定义新同步包装类型。
-fn lock(&self) -> Result<StandardGuard<'_>, SvmMsgQError> {
-    match unsafe { self.mutex.lock() } {
-        Ok(RobustGuardContainer::Standard(guard)) => Ok(guard),
-        Ok(RobustGuardContainer::Indeterminate(guard)) => {
-            self.validate_invariants(&guard)?;
-            guard.make_consistent()?;
-            Err(SvmMsgQError::OwnerDied)
-        }
-        Err(source) => Err(SvmMsgQError::Lock { source }),
-    }
-}
-```
-
-`len`/`is_empty` 不把锁错误伪装成空队列。验证只读取已取得 guard 保护的
-head/tail/cursize 和 descriptor/ring metadata；不定义可在无锁状态下观察的
-`failed` 标志，也不复制第三方 MutexLockError。
-
-**条件变量重新加锁必须走同样的恢复分支**
-
-BorrowedCondvar::wait/wait_for 接受 &mut guard，不消耗 guard。返回
-CondvarWaitError::OwnerDead 时 mutex 已被重新获取；验证 queue/ring 不变量后
-调用 `make_consistent`，释放 guard，并返回带 source 的 `OwnerDiedDuringWait`。
-不能写成 `wait(...)?` 后继续使用 payload。NotRecoverable 时不访问受保护状态，
-由 crate guard 的等待状态处理其释放；这一路径必须列入实施时的实际行为验证。
-
-crate 提供 IndeterminateGuard::make_consistent() 和 MutexGuard::mark_consistent()
-供已经完成不变量验证的调用方使用；本设计明确调用它们，不把 robust mutex
-留在 ENOTRECOVERABLE。
-RobustGuardContainer 的 Indeterminate 来自 lock；condvar wait 的 OwnerDead
-通过错误返回，不能假设 wait 会把 StandardGuard 自动变成 Indeterminate 变体。
-
-owner 死亡不会自动为 condvar 产生业务通知。无限等待接口在控制线程内部使用
-Monotonic wait_for 的有限检查周期（设计默认 100 ms），每轮重新加锁并检查
-predicate 和截止时间。内部周期超时不等于调用者超时；只有用户截止
-时间到达才返回 Timeout。已在 mutex.lock 阻塞者由 robust mutex owner-death
-协议接管；不改成 try_lock。活 owner 永久停顿和在途 syscall 的调度延迟不由
-robust 解决，100 ms 也不是端到端实时上界。
-
-初始化限制：0.1.0 builder 文档签名不返回 Result，不能在 ADR 中虚构可传播的
-初始化错误。原位初始化在 bootstrap 未发布阶段完成，初始化异常不得发布 ready；
-由 bootstrap 边界结束本次构建并回收尚未交给 peer 的映射。若以后要求逐条
-pthread 初始化 errno 可恢复，须单独调整依赖能力，不能伪称当前 builder 支持。
-
-官方文档依据（只读在线文档，未下载 crate 源码或编译）：
-[mutex 与 robust 示例](https://docs.rs/posix-sync/latest/posix_sync/mutex/index.html)、
-[MutexBuilder](https://docs.rs/posix-sync/latest/posix_sync/mutex/builders/struct.MutexBuilder.html)、
-[BorrowedMutex](https://docs.rs/posix-sync/latest/posix_sync/mutex/struct.BorrowedMutex.html)、
-[BorrowedCondvar](https://docs.rs/posix-sync/latest/posix_sync/condvar/struct.BorrowedCondvar.html)、
-[CondvarBuilder](https://docs.rs/posix-sync/latest/posix_sync/condvar/builders/struct.CondvarBuilder.html)、
-[RobustGuardContainer](https://docs.rs/posix-sync/latest/posix_sync/mutex/guards/enum.RobustGuardContainer.html)、
-[IndeterminateGuard](https://docs.rs/posix-sync/latest/posix_sync/mutex/guards/struct.IndeterminateGuard.html)、
-[CondvarWaitError](https://docs.rs/posix-sync/latest/posix_sync/condvar/enum.CondvarWaitError.html)、
-[MutexGuard::mark_consistent](https://docs.rs/posix-sync/latest/posix_sync/mutex/guards/trait.MutexGuard.html)。
-
-rustix-futex-sync::shm 虽支持共享 mutex/condvar，但缺少上述 robust 能力，退出
-本 ADR 选型。[其共享同步文档](https://docs.rs/rustix-futex-sync/latest/rustix_futex_sync/shm/index.html)
-不能作为已支持 owner-death 的证据。
-
-**parking_lot 0.12.5 文档核对（2026-09-11）**
-
-该 crate 同时提供 Mutex<T> 和 Condvar，lock 返回 RAII guard，wait 接受
-&mut MutexGuard，符合所需的调用形式。
-
-
-
-但其同步范围是同一进程中的线程。parking_lot_core 文档说明，线程等待队列
-由 parking lot 按锁地址管理；这不是共享 segment 中可供独立 app 进程 attach
-的等待状态。将 Mutex/Condvar 放入 mmap 不会把 parking lot 的线程队列变成
-跨进程共享队列。因此不将 parking_lot 选为 SVM 共享 mutex/condvar 的实现。
-这个适配判断与是否提供 try_lock 无关。
-
-依据：[Mutex](https://docs.rs/parking_lot/latest/parking_lot/type.Mutex.html)、
-[Condvar](https://docs.rs/parking_lot/latest/parking_lot/struct.Condvar.html)、
-[parking_lot_core 的等待队列设计](https://docs.rs/parking_lot_core/latest/parking_lot_core/)。
-
-**process-sync 0.2.2 文档核对（2026-09-11）**
-
-该 crate 确实同时提供 `process_sync::SharedMutex` 和
-`process_sync::SharedCondvar`，支持基础跨进程互斥与等待/通知，但公开 API
-不足以直接承担本 ADR 的完整 SVM 同步契约：
-
-| 需求 | 文档中的接口与结论 |
-| --- | --- |
-| 现有共享 segment 的原位初始化、独立 app attach | mutex/condvar 只有 new 构造；没有指定地址初始化、from_raw 或 fd attach API。SharedMemoryObject 文档描述 fork/clone 继承 MAP_SHARED 映射，不能作为独立 app attach 的接口证据 |
-| 超时等待 | SharedCondvar 只列 wait、notify_one、notify_all，没有 timed wait |
-| Rust 持锁生命周期 | lock(&mut self) 返回 Result<()>，需要手动 unlock；两个同步类型均为 !Send、!Sync，没有可直接复用的 RAII guard |
-| owner death | 没有公开 robust 配置或 consistent 恢复接口；不能从基础 pthread 封装推断已满足 VPP robust mutex 契约 |
-
-以上是公开文档/API 的适配结论，不是源码审计或运行验证。可用于文档演示的
-父子进程基础同步，不能原样选作 Hammer 独立 app/daemon 共享队列的同步依赖；
-也不通过新增本地同步包装类型绕过这些接口缺口。
-
-文档依据：
-[SharedMutex](https://docs.rs/process-sync/latest/process_sync/struct.SharedMutex.html)、
-[SharedCondvar](https://docs.rs/process-sync/latest/process_sync/struct.SharedCondvar.html)、
-[SharedMemoryObject](https://docs.rs/process-sync/latest/process_sync/struct.SharedMemoryObject.html)。
-
-iceoryx2-bb-posix 0.9.3 的公开模块中未找到配套 condvar，不列为本次方案。
-[模块目录](https://docs.rs/iceoryx2-bb-posix/latest/iceoryx2_bb_posix/)。
-
-操作契约：lock 返回 RAII guard；wait 持有同一 mutex 的 guard，原子释放锁并
-等待，返回前重新获取锁；调用方循环检查队列 predicate。condvar 本身不保护
-队列内容。std::sync::Mutex / Condvar 可用于进程内阻塞状态；不能将这一组
-进程内字段替换到上述跨进程共享布局中而声称语义已对齐。
-
-VPP MQ 选择 eventfd 时使用私有 producer spinlock；无 eventfd 时使用共享
-mutex/condvar；VPP 固定元素队列仍使用共享 mutex。本轮 Linux MQ 保留这两条
-具体路径，不以新增后端泛型隐藏差异。
-
-### 8.5 Mapping、region 与 FIFO segment 不增加泛型参数
-
-SvmSegment、SvmRegion、SvmRegionMain、SvmFifoSegment 与 SvmFifoSegmentMain
-继续表达实际存储/分配 owner。root、chunk、members 等共享位置仍使用 offset；
-OS fd 留在私有 owner。内容类型 T 不进入 backend、slice 数、worker、TCP 或
-通知选择。Region 的共享分配锁和映射生命周期仍按前面的 VPP 证据单独设计。
-
-### 8.6 CLIB_MARCH_FN 与内容泛型是两个独立要求
-
-保留用户最初要求的普通函数多架构选择。它按 CPU 支持选择具体机器码，
-不因此新增 ByteCopy trait、算法类型参数或 generic FIFO。两个入口仍是
-copy_to_chunk / copy_from_chunk；第 8.8 节给出宏与具体签名。
-
-### 8.7 FIFO segment 与 FIFO 私有状态
-
-```rust
-// hammer_infra::svm::fifo_segment
-const CHUNK_SIZE_CLASSES: usize = 11;
-
-#[repr(C, align(64))]
-struct FifoSegmentSlice {
-    free_chunks: [AtomicU64; CHUNK_SIZE_CLASSES],
-    free_fifos: u64,
-    free_chunk_bytes: AtomicU64,
-    virtual_bytes: u64,
-    chunk_counts: [u32; CHUNK_SIZE_CLASSES],
-}
-
-struct FifoSlice {
-    fifos: Pool<SvmFifo>,
-    virtual_bytes: u64,
-    active_fifos: Vec<u32>,
-}
-
-pub struct SvmFifoSegment {
-    segment: Arc<SvmSegment>,
-    header_offset: u64,
-    slices: Vec<FifoSlice>,
-    message_queue_offsets: Vec<u64>, // 已分配队列身份；使用者借用外层映射后 attach。
-}
-
-pub struct SvmFifoSegmentMain {
-    segments: Pool<SvmFifoSegment>,
-    attach_timeout: Duration,
-}
-
-impl SvmFifoSegment {
-    // slices 在启动前固定；调用者只能操作当前 worker 的 slice。
-    pub fn allocate_fifo(&mut self, slice: u32, capacity: u32)
-        -> Result<u32, FifoError>;
-    pub fn fifo(&self, slice: u32, index: u32) -> Option<&SvmFifo>;
-    pub fn fifo_mut(&mut self, slice: u32, index: u32) -> Option<&mut SvmFifo>;
-    pub fn free_fifo(&mut self, slice: u32, index: u32) -> Result<(), FifoError>;
-    pub fn preallocate_chunks(&mut self, slice: u32, size: u32, count: u32)
-        -> Result<(), FifoError>;
-    pub fn available_bytes(&self) -> usize;
-    pub fn cached_bytes(&self) -> usize;
-}
-```
-
-上面的 `&mut SvmFifoSegment` 是独占的配置/单 worker 接入，不是多个 worker
-从 shared Main 获取整个 segment 的可变引用的许可。多 worker 的最终安装接口
-必须把启动前已存在的 slice 私有值直接交给其 worker，或从真实借用的 owner
-分割现有 slice；禁止 `&self -> &mut FifoSlice`，禁止按任意 thread index 安全
-地借到外 worker。A3 的并行 worker 安装和迁移签名在所有权拆分后才能定稿。
-
-```rust
-// hammer_infra::svm_fifo
-#[repr(C, align(64))]
-struct FifoPosition {
-    chunk_offset: AtomicU64,
-    byte: AtomicU32,
-}
-
-#[repr(C, align(64))]
-struct FifoHeader {
-    start_chunk: AtomicU64,
-    end_chunk: AtomicU64,
-    size: u32,
-    min_alloc: u32,
-    slice_index: u32,
-    has_event: AtomicU32,
-    want_dequeue_notification: AtomicU32,
-    has_dequeue_notification: AtomicU32,
-    dequeue_threshold: AtomicU32,
-    consumer: FifoPosition,
-    producer: FifoPosition,
-}
-
-pub struct SvmFifo {
-    segment: Arc<SvmSegment>,
-    header_offset: u64,
-    segment_header_offset: u64,
-    enqueue_lookup: RbTree<u32, u64>,
-    dequeue_lookup: RbTree<u32, u64>,
-    ooo: Pool<OooSegment>,
-}
-
-// 迁移现有事务类型；不新增 payload 缓存。
-pub struct FifoWriteReservation<'a> {
-    fifo: &'a mut SvmFifo,
-    start_tail: u32,
-    reserved_len: usize,
-    committed: bool,
-}
-
-impl SvmFifo {
-    pub fn max_enqueue(&self) -> usize;
-    pub fn max_dequeue(&self) -> usize;
-    pub fn enqueue(&mut self, source: &[u8]) -> Result<usize, FifoError>;
-    pub fn enqueue_ooo(&mut self, offset: u32, source: &[u8])
-        -> Result<OooResult, FifoError>;
-    pub fn peek(&mut self, offset: usize, destination: &mut [u8])
-        -> Result<usize, FifoError>;
-    pub fn readable_segment(&self) -> Option<&[u8]>;
-    pub fn dequeue_drop(&mut self, bytes: usize) -> Result<usize, FifoError>;
-    pub fn reserve_write(&mut self, bytes: usize)
-        -> Result<FifoWriteReservation<'_>, FifoError>;
-    pub fn set_event(&self) -> bool;
-    pub fn unset_event(&self);
-}
-
-impl FifoWriteReservation<'_> {
-    // 每次借出一个实际 chunk 的目标区域，不假定 chain 只有两个片段。
-    pub fn segment_mut(&mut self, offset: usize) -> Option<&mut [u8]>;
-    pub fn reserved_len(&self) -> usize;
-    pub fn commit(self, initialized: usize) -> Result<usize, FifoError>;
-}
-```
-
-FIFO 的 attach 同样需要证明 producer/consumer 权限；`&mut` 只能防止本地
-同一 owner 的重入，不能单凭它保证跨 mapping 的唯一角色。FifoPosition 是
-自身持有 index 的共享 cacheline，不是包裹外部借用的 View。完整 subscriber、
-OOO list linkage、迁移 rollback 字段仍须由对应 VPP 函数的具体 slice 设计补齐；
-这些块明确展示核心状态，不作为所有 VPP 字段已映射的声明。
-
-### 8.8 普通函数 multiarch：具体函数签名
-
-```rust
-// 提议宏语法。宏生成同一函数体的各 target-feature 实现与选择入口。
-march_fn! {
-    variants {
-        baseline;
-        x86_64("avx2", priority = 20);
-        x86_64("avx512f,avx512bw", priority = 30);
-        aarch64("neon", priority = 10);
-    }
-
-    unsafe fn copy_to_chunk(
-        fifo: &mut SvmFifo,
-        chunk_offset: u64,
-        position: u32,
-        source: &[u8],
-    ) -> u64 {
-        // 同一 chunk 遍历函数体，由宏复制到各 ISA entry。
-        // 在每个 entry 内编译对应字节复制指令；此处省略实现。
-    }
-}
-```
-
-copy_from_chunk 使用相同声明方式，最后一个参数为 `destination: &mut [u8]`。
-返回最后处理位置对应的 chunk offset。各具体 entry 根据 feature 集编译，普通
-入口通过本进程的一次性选择调用受支持实现：
-
-```rust
-static SELECTED: OnceLock<
-    unsafe fn(&mut SvmFifo, u64, u32, &[u8]) -> u64,
-> = OnceLock::new();
-```
-
-不把所选函数写入共享内存；不新增算法 trait、generic worker 或 graph
-registration。实际复制必须走选择后的 ISA 内核，不能只生成不同名字。
-
-### 8.9 错误的具体签名示例
-
-```rust
-// hammer_infra::svm::msg_queue：owner-local，保留结构化事实。
-#[derive(Debug, thiserror::Error)]
-pub enum SvmMsgQError {
-    #[error("message descriptor queue is full")]
-    QueueFull,
-    #[error("message ring {ring} is full")]
-    RingFull { ring: u32 },
-    #[error("message ring {ring} does not exist")]
-    InvalidRing { ring: u32 },
-    #[error("message descriptor is invalid")]
-    InvalidDescriptor { ring: u32, element: u32 },
-    #[error("message queue mutex owner died; delivery is indeterminate")]
-    OwnerDied,
-    #[error("message queue owner died while reacquiring after condition wait")]
-    OwnerDiedDuringWait { #[source] source: posix_sync::condvar::CondvarWaitError },
-    #[error("message queue mutex is not recoverable")]
-    NotRecoverable { #[source] source: posix_sync::mutex::MutexLockError },
-    #[error("message queue mutex could not be reacquired after condition wait")]
-    NotRecoverableDuringWait { #[source] source: posix_sync::condvar::CondvarWaitError },
-    #[error("message queue lock failed")]
-    Lock { #[source] source: posix_sync::mutex::MutexLockError },
-    #[error("message queue wait timed out")]
-    Timeout,
-    #[error("message queue layout version {actual} differs from {expected}")]
-    VersionMismatch { expected: u32, actual: u32 },
-    #[error("message ring {ring} has element size {actual}, expected {expected}")]
-    ElementSizeMismatch { ring: u32, expected: u32, actual: u32 },
-    #[error("message ring {ring} has {actual} slots, expected {expected}")]
-    RingLengthMismatch { ring: u32, expected: u32, actual: usize },
-    #[error("message ring {ring} data alignment {actual} is not {expected}")]
-    AlignmentMismatch { ring: u32, expected: usize, actual: usize },
-    #[error("message was published but notification failed")]
-    PublishedSignal { #[source] source: std::io::Error },
-    #[error("descriptor was dequeued but producer notification failed")]
-    DequeuedSignal { #[source] source: std::io::Error },
-    #[error("message slot was released but producer notification failed")]
-    ReleasedSignal { #[source] source: std::io::Error },
-    #[error("message queue wait failed")]
-    Wait { #[source] source: posix_sync::condvar::CondvarWaitError },
-}
-```
-
-PublishedSignal/DequeuedSignal/ReleasedSignal 的类别直接记录操作已经完成，
-调用者据此重试通知或关闭连接，不能重试数据操作。布局/初始化/同步 acquire/
-cleanup 的其余错误随 create/attach 事务定稿。owner death 与 Rust panic 不同；
-panic unwind 会释放 RAII guard，不能期待内核随后报告 EOWNERDEAD。任何可能
-部分修改状态的 unwind 路径必须由所属队列 owner 保持 alloc/add/sub/free_msg
-顺序不变；不新增 `failed` 字段或 catch-all error。
-
-## 9. 验证矩阵与执行顺序
-
-基线没有发现 infra 的 crate-local FIFO/MQ 测试文件，不能写“现有测试已覆盖”。
-VPP 的有效参考包括 `src/plugins/unittest/svm_fifo_test.c`，以及
-`src/plugins/unittest/session_test.c` 中的 MQ basic/speed 测试。
-`src/svm/svm_test.c` 是未列入当前 CMake 测试目标的旧示例，见 9.1。
-robust owner-death 与 Rust 借用/多架构专项用例是补充设计，不冒充上游已有测试。
-
-| 测试 | 级别与布置 | 必须验证 | 决策 |
+| `SsvmPrivate` | generic shared `MemHeap` create/attach、nonzero same-VA attach、zero-VA map-only attach、owner-private FIFO map-only creation | 当前所有 server path 都没有 generic heap，且默认发布 zero VA |
+| `SvmQueue` | byte `add/add2/sub/sub2`、guard-owned no-lock operations、wait/timed-wait、producer/consumer eventfd、owner-death validation | 基本入口已有；仍缺跨进程、eventfd role ownership和owner-death后的行为证明 |
+| `SvmMsgQ` | inline-data `layout/size/init/attach/cleanup`、producer guard 内的 alloc/write/add、`sub/sub_batch/free_msg`、wait/timed-wait、eventfd install/allocate | 当前 ring data 来自 caller slice，producer lock 没有覆盖完整 three-stage publication |
+| `Fifo` | role-specific max enqueue/dequeue 与 empty/full、`fill_chunk_list`、`provision_chunks`、arbitrary-count `segments`、max read/write chunk、newest OOO/reset、完整 dequeue notification/subscribers、single-chunk clone | 当前只有 generic capacity、two-slice read、部分 OOO/notification；多数 mutator 错用 `&self` |
+| `SvmFifoSegmentMain` | `init/create/attach/lookup/index/delete` 和 segment base/size query | 当前 Main 只有 local add/get，create/attach/delete 生命周期在 segment 外没有闭合 |
+| `SvmFifoSegment` FIFO/chunk | directional allocate、offset attach、duplicate、server free、client free、slice migrate、FIFO offset；chunk allocate/collect/offset | 当前 allocate 没有 direction；attach/detach/free 没有完整 VPP role 与 migration contract |
+| `SvmFifoSegment` MQ/preallocation | MQ allocate/attach/discover/offset；FIFO header、每个 chunk class、RX/TX pair preallocation；aligned reserved-byte allocation | 当前没有 MQ/reserved allocation，preallocation surface 只覆盖部分行为 |
+| `SvmFifoSegment` accounting | segment allocatable size、new/cached/available/freelist bytes、active/free FIFO counts、per-class free chunk counts、flags、watermarks、usage/status | 当前只有部分 free/cached/available counters，没有 active count、flags 或 pressure state machine |
+| `simd` | `march_fn!` 和两个 FIFO copy registrations | scalar/variant functions 已有，普通函数 registration/selection 未闭合 |
+
+## 4. ABI 与映射边界
+
+“SVM 一律用 offset”与“SSVM 一律 same VA”都不成立。每个 owner 的 ABI 如下：
+
+| Owner | shared references | attach VA | allocator |
 | --- | --- | --- | --- |
-| segment attach | 两个独立进程，不同映射地址，真实 fd 传递 | offset 可用、ready 前不可读、版本拒绝、fd 生命周期、失败不泄漏 | D1/D10/D11 |
-| region membership | 独立进程 create/find/leave + 分配失败注入 | root/成员一致，最后退出后回收；attached allocator 不覆盖共享状态 | D2 |
-| fixed element queue | typed T，真实跨进程队列与具体等待路径 | 顺序、add2 容量不足不部分插入、full/empty、timeout、spurious wakeup | D3/D5 |
-| MQ ring lifecycle | caller-owned byte rings，非二次幂容量，descriptor capacity 与 ring capacity 不同 | 8-byte descriptor、按序 free、ring 满与 queue 满分别背压、`nitems * elsize` data length 契约 | D4 |
-| MQ ownership | 编译失败用例 + 并发 producer/subprocess consumer | `alloc_msg -> add -> sub -> free_msg` 顺序；descriptor 不越过 queue owner；无丢失/重复 | D4/D5 |
-| MQ notifications | eventfd 与条件等待路径分别运行；生产/消费竞争窗口 | 空→非空、两种满→非满通知；清信号重检查；已发布后 signal failure 不重发消息 | D5/D11 |
-| robust owner death | 独立 child 在 alloc/add/sub/free_msg 各持锁窗口退出；父进程有外部超时保护 | 接管后验证不变量、`make_consistent`、返回 OwnerDied；无法验证才隔离旧身份；不自动重发 | D5/8.4 |
-| robust condvar reacquire | waiter 已释放锁睡眠，另一进程取得锁后退出 | wait OwnerDead 分类及无非法 unlock；无 notify 也通过周期检查发现；NotRecoverable 不访问数据 | D5/8.4 |
-| FIFO bytes / OOO | 独立 owner，跨多个 chunk、sequence wrap、洞填充 | 发布/回收顺序；OOO 合并；source/destination 位置 failure-atomic | D7/D8 |
-| FIFO allocation / migration | slice 耗尽、chunk 回收、迁移分配失败、peer detach | 不错 slice 回收、旧 owner 失败仍有效、无提前 unmap | D7/D11 |
-| multiarch selection | baseline 强制路径及当前 CPU 支持的每个 ISA 路径 | unsupported 永不执行；priority 正确；copy-to/from 在长度/对齐/chunk 边界结果一致 | D9 |
-| multiarch linking | infra standalone + SDK/process image，适当的真实 DSO loading | 普通函数无需 runtime；选择只初始化一次；没有共享函数指针 | D9 |
-| platform layout | Rust size/alignment/offset assertions；必要时编译平台 primitive probe | 共享同步状态在最终地址初始化、shared header 对齐、同步 ABI/旧布局拒绝 | D10 |
-| content types | compile-pass/compile-fail + typed slot 行为测试 | caller-owned `[u8]` 长度/对齐正确；不同 ring 的内容类型可不同；queue 不存指针、不分配 payload | D3/D4 |
-| Session / SDK / stats | 各 crate integration | app attach/control events、TX retention/ACK release、close/reset、stats storage 不回归 | D6/D8/D11 |
+| `SvmRegion` | raw pointers、ordinary collection pointers、`*mut MemHeap` | 必须与 creator 相同 | mandatory PVT `MemHeap`，optional Data `MemHeap` |
+| generic `SsvmPrivate` payload | header/shared heap 中含 raw pointers | 默认与 creator 相同 | SSVM generic locked `MemHeap` |
+| `SvmFifoSegment` payload | FIFO-header-relative offsets；private process rebuilds pointers | 可以不同；owner 显式发布 `ssvm_va = 0` | monotonic segment byte allocator + freelists；不使用 region heap或generic heap |
+| `SvmQueue` | inline bytes/indices和两个role-specific fd数值，无进程本地 pointer | 由 enclosing payload contract 决定 | 不拥有 payload allocator |
+| `SvmMsgQ` | inline descriptor queue、ring headers和ring bytes；private attach state重建 pointers | 由 enclosing FIFO segment offset contract 决定 | enclosing FIFO segment allocation |
 
-步骤：批准 A1–A10 → infra ownership/storage 完整迁移 → runtime/service/app/stats
-调用闭包 → 实现审查与 formatting → 最终 pre-commit gate → 测试通过立即提交。
-涉及多 owner 的 commits 按依赖顺序组织。测试失败保持未提交，修复并完成 review
-后重新运行同一 gate。不做本地 TUN/daemon/lab；这些只由 CI 执行。
+共享 layout 只支持相同 architecture、endianness、atomic width 和已批准的 layout
+version。Hammer 不承诺与 VPP C struct 二进制互通，但每项有意 layout 差异必须单独
+记录；不得以“Rust ABI”作为改变状态机或 ownership 的理由。
 
-最终候选 gate（本次设计阶段未运行）：
+创建发布顺序是：mapping -> allocator/header/storage 初始化 -> protocol identity
+发布 -> ready release。attach acquire ready 后才读取 payload。失败按逆序释放尚未
+发布的资源，不得让 peer 看见半初始化 header。
 
-```bash
+## 5. `SsvmPrivate` 规范
+
+### 5.1 Owner 与 shared header
+
+`SsvmPrivate` 是进程私有 owner，保存 mapping base/size、backend、server role、pid、
+name copy、fd 或 attach timeout。它不包含 `SvmRegion`，也不替 region 管 membership、
+root、PVT/Data Heap 或 subregion。
+
+通用 shared header 至少表达：actual `ssvm_va`、mapping size、server/client pid、
+backend、ready、shared `MemHeap` pointer 和 payload publication slot。Hammer 可保留
+magic/layout version 与 typed FIFO header offset 作为明确扩展。VPP 中未被调用的
+recursive header spinlock 不要求为了字段相似而移植；shared heap 和同 VA attach
+具有实际调用语义，不能再删除。
+
+generic server 对 SHM/MEMFD/PRIVATE 创建 locked shared `MemHeap`，并在该 active heap 中
+分配 generic payload metadata。attach 只复用 creator 的 heap，不重建。PRIVATE
+backend 没有 client attach。
+
+### 5.2 Mapping 与 ready
+
+- server 的 `requested_va == 0` 只表示让 OS 选择 creator address；初始化完成后
+  shared `ssvm_va` 记录返回的实际非零地址；
+- SHM/MEMFD client 先只映射 page 0，读取 size、backend 和 `ssvm_va`，解除 probe，
+  再映射完整 segment；
+- generic SSVM 的非零 `ssvm_va` 要求 same-VA attach；目标 range 已占用必须返回
+  typed error，不能覆盖未知 mapping；
+- owner 明确发布的零 `ssvm_va` 表示 non-fixed attach；Hammer 对 SHM/MEMFD 使用同一
+  分支，不复制 VPP SHM client 无条件 `MAP_FIXED` 到地址 0 的矛盾；
+- SHM client 等待 ready；MEMFD attach 本身不等待 ready，payload owner 决定何时
+  调 `wait_ready`；
+- `delete` 按 backend 分发，server/client 只释放各自拥有的 mapping/fd/name；
+  SHM backing name 只由 lifecycle owner unlink。
+
+### 5.3 FIFO segment 特例
+
+VPP 的 generic server init 先建立 shared heap，`fifo_segment_init` 随后保留 two-page
+overhead，从第二页之后直接建立 header 与 byte allocator，并留下“remove ssvm heap
+entirely”的 TODO。该 heap 与直接管理的 storage range 重叠但之后不再用于 FIFO storage。
+
+Hammer 把这项实现残留收窄为 owner-private map-only path：保留 two-page layout，
+不创建或发布可用 generic heap。它把 header 相对 SSVM base 的 offset 发布到 typed slot，
+再把 `ssvm_va` 改为 0，最后发布 ready。client arbitrary-VA attach 后只允许调用
+FIFO segment 的 offset translation；不存在可读取或重建的 generic heap pointer。
+
+这一特例不能推广到 `SvmRegion`、generic SSVM 或未来任意 payload。新增 offset
+payload 必须逐项证明 shared state 中没有 raw pointer，并由自己的 owner 明确选择
+`ssvm_va = 0`。
+
+## 6. `SvmQueue` 与 `SvmMsgQ`
+
+### 6.1 `SvmQueue`
+
+`SvmQueue` 的配置是 `nels`、`elsize` 和 consumer identity；共享 storage 是 header
+后连续 `nels * elsize` bytes。公开操作接收精确长度的 `&[u8]`/`&mut [u8]`：
+
+- `add`、`add2`、对应的 guard-owned no-lock variants；
+- `sub`、nonblocking `sub2`；
+- empty/full/length；
+- lock/try-lock RAII guard；
+- wait、timed wait、producer/consumer signal 与 eventfd installation。
+
+`add2` 容量不足必须零提交。wait 在循环中重查 predicate。eventfd 改变通知路径，
+不删除 fixed queue 的 shared mutex。VPP 把 `producer_evtfd`/`consumer_evtfd` 数值放在
+shared queue 中，但每个 slot 只由对应 role 在自己的进程安装和解释；Rust owner保留
+`OwnedFd`，shared slot只发布该进程的 raw number，不能把它复制给另一进程直接使用。
+Data Worker packet loop 不做 condvar wait、poll或未知时长的 shared-lock contention。
+
+### 6.2 `SvmMsgQ` layout
+
+shared allocation 依次包含：
+
+```text
+SvmMsgQShared
+descriptor queue header + q_nitems * 8-byte descriptor
+ring[0] header + ring[0].nitems * ring[0].elsize bytes
+...
+ring[n-1] header + ring[n-1].nitems * ring[n-1].elsize bytes
+```
+
+private `SvmMsgQ` attach state保存 descriptor queue pointer、每个 ring 的 shared
+pointer、eventfd 和 process-local producer lock。`SvmMsgQRingConfig` 只包含
+`nitems`/`elsize`；删除 `'data` lifetime 和 `&mut [u8] data`。VPP 的 dead
+`ring_cfg.data` 字段不进入 Hammer API。
+
+`alloc_msg(nbytes)` 按配置顺序选择第一个 `elsize >= nbytes` 且未满的 ring；
+`alloc_msg_w_ring` 使用指定 ring。两者推进 ring tail/cursize但不发布 descriptor。
+`msg_data` 只借用 descriptor 对应的 inline slot。`add` 才复制 descriptor 并 release
+发布 descriptor queue tail；`sub` acquire 取得 descriptor但不回收 slot；
+`free_msg` 必须等于该 ring 当前 head，随后推进 head 并减少 cursize。
+
+并发生产者必须让 alloc、slot write 和 add 处于同一个 producer lock scope。
+Rust 用 owner-local RAII producer guard表达这个 scope；guard Drop 只解锁，不取消
+已经分配的 ring slot。不存在 `MsgReservation`、`cancel` 或隐式回收。单 consumer
+通过 `&mut SvmMsgQ` 执行 sub/read/free，不添加 consumer lock。
+
+无 eventfd 时使用 descriptor queue 的 process-shared robust mutex/condvar；有
+eventfd 时 producer coordination 使用 process-local spinlock，fd 只存在 private
+handle。eventfd number 不进入 shared layout。queue 从 empty 变 non-empty 时通知
+consumer；descriptor queue 或 data ring从 full 变 non-full时通知 producer。
+
+## 7. `Fifo` 规范
+
+### 7.1 Shared/private split
+
+shared mapping 中只有：
+
+- `SvmFifoShared`：start/end/head/tail chunk offsets、size、min allocation、slice、
+  freelist next、signals、head/tail positions；
+- `SvmFifoChunk`：normalized start、length、next offset、chunk lookup indices、bytes；
+- FIFO segment shared slices与 allocation counters。
+
+process-private `Fifo` 保存 shared/header pointers、enqueue/dequeue chunk lookup、OOO
+trees、OOO segment `Pool`、newest/list state、local reference/lifecycle state和 active
+list links。它由当前 Data Worker直接拥有，不能 `Sync`，也不能通过 `&self` 修改
+private或shared FIFO state。删除 `Read/Write/BufRead for &Fifo`；producer/consumer
+domain operation 均要求真实 owner 的 `&mut self`。
+
+VPP private `svm_fifo_t` 内的 app/session/thread/segment-manager identities 是 VPP
+Session coupling。Hammer 将这些 identities 留在 `hammer-service` 的 Session owner，
+不在 `hammer-infra::svm::fifo::Fifo` 复制 `app_session_index`、`vpp_sh` 等字段。这是
+保持 crate dependency direction 的有意差异，不影响 FIFO storage/state machine。
+
+### 7.2 Index ordering
+
+- producer relaxed 读写自己拥有的 tail；读取 consumer head 使用 Acquire；发布新
+  tail 使用 Release；
+- consumer relaxed 读写自己拥有的 head；读取 producer tail 使用 Acquire；发布新
+  head 使用 Release；
+- role-independent diagnostics 对 head/tail 都使用 Acquire；
+- chunk bytes和links必须在 tail Release 前完成；consumer 释放 chunk/header前先
+  head Release并结束所有借用。
+
+API 必须区分 `max_dequeue_cons`、`max_dequeue_prod`、`max_dequeue` 和
+`max_enqueue_prod`、`max_enqueue`，以及 owner-specific `is_empty`/`is_full`。
+
+### 7.3 Chunk 与 I/O API
+
+必须提供或保留以下语义：
+
+- `fill_chunk_list`：为 advertised FIFO size 准备完整 chunk coverage；
+- `provision_chunks`：按 caller 提供的输出容量返回任意数量 writable segments，
+  允许只 provision 部分请求；
+- `enqueue`、`enqueue_with_offset`、`enqueue_segments`、`overwrite_head`；
+- `dequeue`、`peek`、`dequeue_drop`、`dequeue_drop_all`；
+- `segments`：填充 caller-provided segment slice，不限制为两个 borrowed slices；
+- `max_read_chunk`、`max_write_chunk`；
+- `init_pointers`、single/default-chunk-only clone、`n_chunks`、`is_sane`。
+
+公开 safe API 不得发布未初始化 bytes。VPP `enqueue_nocopy` 的 Rust 对应只能是
+owner-internal commit，或由能证明 destination 已完整初始化的写入借用调用；不能让
+任意 safe caller仅凭长度推进 tail。任何协议层只能直接写相邻 destination FIFO，
+commit 成功后再 consume source；失败时两边可见位置不变。
+
+### 7.4 OOO
+
+OOO state完全属于 producer private FIFO。`enqueue_with_offset` 使用 wrapping
+sequence comparison，合并相邻/重叠 holes，并只在从 tail 开始的洞被连续填满时
+推进 visible tail。API 包含 first/count/has、newest 和 newest reset。OOM、越界或
+chunk provision 失败不能发布部分 OOO range。
+
+### 7.5 Notification
+
+完整通知状态包含：
+
+- event flag 的 set/unset；
+- dequeue immediate notification；
+- 从 full 到 non-full transition notification；
+- 到 empty transition notification；
+- `has_deq_ntf` suppression/reset；
+- dequeue threshold；
+- 最多 7 个 subscriber identities及 add/delete/count。
+
+`needs_deq_ntf(last_dequeued)` 必须按 flags、threshold、前后 occupancy 和
+`has_deq_ntf` 计算，不能把全部模式折叠成 `want == 1`。通知只产生 owner-defined
+event fact，不把 Session scheduler下移到 infra。
+
+## 8. `SvmFifoSegment` 规范
+
+### 8.1 Layout 与 allocation
+
+shared segment header包含 cached/active/reserved bytes、max FIFO size、slice count、
+first-allocation percentage、MQ count、monotonic byte index/range和 fixed shared
+slices。每个 shared slice包含 11 个 4 KiB 到 4 MiB chunk classes、FIFO header
+freelist、cached chunk bytes、virtual bytes和per-class counts。
+
+byte allocator只用 CAS 授予不重叠的新 range；它不承担 free。回收的 chunks进入
+size-class freelist，FIFO shared headers进入本 slice header freelist。private slice
+使用现有 `Pool<Fifo>` 或等价 fixed owner-local pool，并维护 virtual bytes与 active
+RX FIFO list；禁止 `Vec<Vec<Option<Fifo>>>` 作为最终 ownership model。
+
+VPP 的 chunk stack把 48-bit segment-relative offset与 16-bit generation tag放在同一
+atomic head。该 tag 只降低 ABA 概率，注释本身不是 Rust memory-safety proof。实现前
+必须提交并批准以下二选一证明：
+
+1. 证明 producer/consumer/slice lifecycle使被 pop node 在所有潜在 reader结束前
+   不会重新入栈，tag wrap不影响有效 pointer读取；或
+2. 选择已有、可证明 reclamation protocol，同时保持 segment-relative identity、
+   lock-free hot path和VPP可观察语义。
+
+在该证明获批并通过 loom/model与跨进程 stress前，chunk freelist parity是 blocker，
+不能仅把 plain offset改成 tagged integer后宣称完成。所有可入栈 chunk offset还必须
+严格小于 `2^48`，create/attach在发布前验证 segment range满足该表示上限。
+
+### 8.2 Lifecycle 与 direction
+
+`SvmFifoSegmentMain` 以 `Pool<SvmFifoSegment>` 拥有 process-local segments，并提供
+main init、create、attach、lookup、delete。segment 自身提供 cleanup；delete先
+cleanup private FIFOs/MQs，再按 SSVM backend释放 mapping。
+
+FIFO allocation必须接收 `FifoDirection::{Rx, Tx}`。两种方向都建立 shared header、
+chunks和private FIFO，并都增加 shared active count；只有 RX 进入 private active list。
+server free对两种方向都减少 shared active count，并回收 private FIFO、shared header和
+chunks；client-only free只释放 client private FIFO，不回收server shared storage。按
+shared-header offset attach和duplicate是独立操作，不能合并为一个“reconstruct then
+always free”入口。
+
+### 8.3 Worker slice migration
+
+VPP 的 attach path先复制 private FIFO，再取得 replacement shared header/chunks，最后
+写 `slice_index`；这些 allocation 没有失败分支。Hammer 不能把这个前置条件改写成可恢复
+错误后继续半迁移。migration只能在 Session owner先停用旧 FIFO I/O 后开始，目标 slice
+必须先预留与旧 FIFO 等价的 private capacity、replacement header/chunks并建立新 private
+lookup，再一次性发布 slice/owner transition，最后释放旧 private state。任何预留失败都
+保持旧 owner、旧 slice和shared header不变。这是仓库 failure-atomicity 规则要求的安全增强。
+
+跨 worker请求走既有 event/handoff path；不得让一个 worker按任意 index取得另一个
+worker private slice的 `&mut`，不得新增 TLS container或锁住整个 segment热路径。
+
+### 8.4 MQ、preallocation 与 pressure
+
+segment必须提供：
+
+- MQ allocate、attach-at-offset、MQ-only segment discovery、MQ offset query；
+- FIFO header、chunk size class和RX/TX pair preallocation；
+- allocated size、new free bytes、cached bytes、available bytes、free-list bytes；
+- active/free FIFO count和per-size free chunk count；
+- usage percentage和 `NoPressure`/`LowPressure`/`HighPressure`/`NoMemory`；
+- preallocated/will-delete/memory-limit/custom-use flags；
+- low/high watermarks；Hammer 在 segment-capacity exhaustion 时设置 memory-limit flag，
+  该 flag保持sticky，只有usage降到high watermark以下时由status calculation自动清除。
+
+最后一条是 Hammer 补全的明确策略：vendored VPP 已实现 sticky/clear status calculation，
+但当前树没有任何 `MEM_LIMIT` 置位调用，且对应 `NoMemory` 断言被注释。实现不得把该
+Hammer transition误报成上游已覆盖行为。
+
+flags、low/high watermarks和memory-limit hysteresis属于每个进程的 private
+`SvmFifoSegment` state；usage 所读取的 reserved/cached/free counters位于 shared header。
+attach 不能把一个进程的 pressure flag当作跨进程发布状态。
+
+segment还提供aligned reserved-byte allocation；该分配和MQ storage都来自monotonic
+allocator并计入reserved bytes。attach用
+FIFO-segment-header-relative offset重建 private `SvmMsgQ`；eventfds由外层 fd transfer
+传递，不存共享数值。
+
+## 9. 同步、层隔离与错误
+
+| State | owner / synchronization | 禁止项 |
+| --- | --- | --- |
+| Region metadata/heaps | ADR-0012 region lock + active PVT/Data heap | offset region、different-VA attach、fallback Main Heap |
+| generic SSVM heap | shared locked `MemHeap`，same-VA participants | FIFO segment client解引用该heap、重建heap |
+| fixed queue | shared robust mutex/condvar；role-specific shared fd slots；RAII guard | 把一个进程的raw fd当成peer identity、Data Worker blocking wait、manual unlock泄漏 |
+| MQ no-eventfd | shared robust mutex/condvar | 第二套payload publication state |
+| MQ eventfd | process-local producer spinlock + private fd | 把fd或lock写入shared ABI |
+| FIFO positions | SPSC release/acquire，private owner `&mut Fifo` | `unsafe impl Sync`、`&self` mutation、跨worker borrow |
+| segment byte index | CAS range grant | 当成object initialization publication |
+| segment freelists | per-slice protocol；tag/reclamation proof required | 仅凭16-bit tag宣称Rust安全 |
+
+### 9.1 有意差异
+
+| ID | Hammer decision | VPP 差异与理由 | 验证 |
+| --- | --- | --- | --- |
+| I1 | zero `ssvm_va` 对 SHM/MEMFD 都表示 non-fixed attach | 修正 V18 的 backend 矛盾；nonzero 才允许 fixed mapping | 两个 backend 独立 exec different-VA attach |
+| I2 | FIFO map-only path 不创建或发布 generic heap | VPP 留有未使用且与 direct allocator range 重叠的 heap和删除 TODO；Hammer 不暴露失效 raw pointer | layout probe；FIFO attach无法取得heap |
+| I3 | Session/thread/segment-manager identities不进入 infra `Fifo` | VPP private FIFO 与 Session 耦合；Hammer crate dependency direction要求Session持有 | compile/API boundary与Session lookup integration |
+| I4 | FIFO mutation要求 owner `&mut`；safe no-copy只能通过初始化写入借用commit | C pointer API不能证明 Rust aliasing或initialized-byte invariant | compile-fail ownership；error位置不变 |
+| I5 | slice migration在所有可失败预留后一次发布 | VPP 对 replacement allocation没有失败分支；Hammer control-plane error必须failure-atomic | private/header/chunk exhaustion injection |
+| I6 | segment-capacity exhaustion显式设置memory-limit flag | VPP 有sticky/clear reader但当前树没有writer；Hammer闭合 `NoMemory` transition | pressure hysteresis test |
+| I7 | robust owner death后验证queue state，否则retire identity | VPP 无条件标记consistent；Hammer不能在未知共享状态上继续 | owner-death subprocess与corruption cases |
+| I8 | chunk freelist只有在48-bit+16-bit方案得到lifetime/tag-wrap证明后才照搬，否则选已证明的reclamation protocol | VPP tag不是Rust memory-safety proof | model checking、multi-process stress、tag-wrap strategy |
+| I9 | 不移植 generic SSVM recursive header spinlock | vendored tree对该lock无调用者；真实同步由payload owner提供 | scoped symbol/call-site audit与owner tests |
+
+Expected full/empty、capacity exhaustion、invalid offset/layout、timeout、owner death和
+OS mapping错误属于 owner-local typed `Result`。Corrupted shared links、double free、
+wrong ring-head release、违反 owner role和不可能的 internal state是 assertion/abort
+边界，不能恢复后继续访问未知内存。
+
+Fallible operations必须 failure-atomic：`add2` 不部分入队；FIFO write在完整 copy或
+destination-write reservation commit前不推进tail；segment FIFO allocation失败回收本次取得的
+header/chunks；migration失败保留old owner；ready之前失败不发布payload。通知发生在
+state commit之后，通知I/O失败必须表达“操作已提交”，避免调用方重复提交。
+
+`hammer-infra` 只拥有 generic mapping、allocation和queue/FIFO state。Session拥有
+IO/CTRL event meanings、Session identities、scheduling和worker handoff。TCP拥有
+sequence/ACK/recovery/timers。应用拥有业务协议。依赖方向不可反转。
+
+## 10. API 与删除批准清单
+
+下表是后续实现需要的公开或 crate-visible surface。它不表示已批准生产代码。
+
+| ID | 新增或修改 | Owner | 原因 |
+| --- | --- | --- | --- |
+| A1 | `SsvmPrivate` generic shared `MemHeap`、same-VA default、zero-VA non-fixed attach、FIFO owner-private map-only creation/publication | `svm::ssvm` / `svm::fifo_segment` | 修正当前默认 arbitrary-VA 和无heap布局，并隔离 FIFO offset ABI |
+| A2 | `SvmQueueConfig { nels, elsize, consumer_pid }` 及 byte add/add2/sub/wait API | `svm::queue` | VPP queue element size是runtime ABI，不是Rust泛型 |
+| A3 | `SvmMsgQRingConfig { nitems, elsize }`、inline ring layout、`SvmMsgQProducerGuard`、alloc/write/add/sub/sub-batch/free/cleanup/wait/eventfd API | `svm::msg_queue` | 删除错误caller-owned data contract并闭合MP lock scope |
+| A4 | `Fifo` owner-mutating full API：role-specific capacity/empty/full、fill/provision、arbitrary segments、max chunk、OOO newest/reset、notification/subscribers、clone | `svm::fifo` | 当前只覆盖部分VPP behavior |
+| A5 | `FifoDirection`、Main-owned segment lifecycle/query、directional alloc/free/duplicate/migrate、FIFO/chunk offset operations、MQ、preallocate、reserved allocation、accounting和pressure API | `svm::fifo_segment` | 当前segment lifecycle与owner surface不完整；细项见3.1 |
+| A6 | `FifoSegmentFlags`、`FifoSegmentMemoryStatus` | `svm::fifo_segment` | flags/watermarks/pressure是segment domain state |
+| A7 | `march_fn!` 及两个具体 FIFO copy registrations | `hammer-infra::simd` / `svm::fifo` | 对应唯一两个 `CLIB_MARCH_FN` uses |
+| A8 | owner-local typed SVM errors和post-commit notification errors | 各SVM owner | 保持恢复动作、source chain和failure atomicity |
+
+删除或迁移：
+
+| 当前 surface | 处理 | 完成证明 |
+| --- | --- | --- |
+| `SvmRegionHeap`、`SvmHashMap`、offset `SvmRegion` layout/tests | 按ADR-0012删除并替换 | old symbols归零；same-VA region behavior tests通过 |
+| `SsvmPrivate` 默认 `ssvm_va = 0`、无shared heap、紧邻header payload layout | 改成generic SSVM contract；FIFO segment显式选择map-only例外 | generic same-VA与SHM/MEMFD FIFO different-VA测试分别通过 |
+| `SvmMsgQRingConfig<'data>::data` 和 MQ caller-owned ring pointers | 删除 | inline layout/attach/roundtrip通过；`'data` API归零 |
+| `unsafe impl Sync for Fifo`、`Read/Write/BufRead for &Fifo`、生产修改的`&self`方法 | 删除或改真实`&mut` owner operation | compile-time ownership和SPSC behavior通过 |
+| infra FIFO 的 Session union/indices和segment-manager identities | 上移到Session owner | infra不依赖或命名Session；integration仍能定位FIFO |
+| FIFO `segments() -> (&[u8], &[u8])` | 替换为caller-capacity arbitrary segment API | 三个以上chunks零拷贝读取通过 |
+| `Vec<Vec<Option<Fifo>>>` private slices、segment-wide `Sync` | 改owner-local Pool/slice直接借用 | worker不能借外slice；migration tests通过 |
+| plain-offset chunk freelist | 替换为获批且证明过的reclamation protocol | model/stress/ABA-wrap proof通过 |
+| `MultiRingMsgQueue`、mode tags、claim/reservation/cancel、runtime callers | 完整迁移到`SvmMsgQ`后删除 | old symbols/imports/layout tags归零；Session tests通过 |
+
+不新增 `SvmRegionHeap`、`OffsetHeap`、`MessageReservation`、generic queue backend、
+thread-local worker container或 closure-mediated state access。
+
+## 11. 验证矩阵
+
+实现、review和formatting都完成后，才运行最终pre-commit gate。必需行为包括：
+
+| Area | Test | 通过条件 |
+| --- | --- | --- |
+| generic SSVM | independent exec creator/attacher；occupied target VA | actual `ssvm_va`非零；same-VA attach；heap pointer可用；占用时typed失败且不覆盖mapping |
+| FIFO segment mapping | SHM/MEMFD independent exec at different VAs | zero VA走non-fixed map；header/chunk/MQ offset解析一致；无generic heap pointer；ready前不可用 |
+| fixed queue | capacities 1/3/5、add2、sub2、wait/timedwait、eventfd、owner death | 顺序无丢失；add2零部分提交；predicate重查；每个role只使用自己安装的fd；source chain保留 |
+| MQ layout | 复现`session_test_mq_basic`的16 descriptors与两个8-slot rings | inline data、first-fit ring选择、跨ring descriptor顺序、ordered free、最终占用为0 |
+| MQ concurrency | multiple producers和single consumer；condvar/eventfd各一套 | alloc/write/add在同一guard；无重复descriptor；full transition通知正确 |
+| FIFO basic/chunks | non-power-of-two size、3+ chunks、fill/provision、grow/shrink、wrap | bytes一致；arbitrary segment count；max read/write chunk正确；失败不改变visible positions |
+| FIFO OOO | VPP fifo1/2/3/5/6/7/large scenarios | wrapping compare、adjacent/overlap merge、newest/reset、hole fill后才推进tail |
+| FIFO notifications | immediate/full/empty、threshold、7 subscribers | `want`/`has` transition和suppression与VPP一致 |
+| FIFO ownership | compile-fail/API checks | 无`Sync`共享修改；无`Read/Write for &Fifo`；owner `&mut`不跨`.await` |
+| segment allocation | exhaust/reuse、preallocate、all size classes、direction | RX/TX都计入shared active count；只有RX进入private active list；client free不回收server storage |
+| segment migration | destination private/header/chunk exhaustion与成功handoff | 每种失败old owner/shared header不变；成功后只有new owner active；无提前回收 |
+| segment pressure | low/high/no-memory和sticky limit hysteresis | watermarks边界精确；segment-capacity exhaustion按Hammer策略进入NoMemory；usage低于high后自动清除sticky flag |
+| freelist safety | model checking + multi-process stress + tag wrap strategy | 无ABA use-after-free、lost node、duplicate allocation |
+| multiarch | forced baseline与所有host-supported variants | 两个copy入口在0/1、alignment、vector边界和chunk边界结果一致；unsupported永不执行 |
+| Session migration | runtime/service/app integration | IO/CTRL ring选择、fd handoff、close/reset和backpressure不再引用legacy queue |
+
+测试命令在完整实施候选上至少包括：
+
+```text
 cargo fmt --all -- --check
 cargo clippy --workspace --all-targets
+cargo test -p hammer-infra
+cargo test -p hammer-runtime
+cargo test -p hammer-service
+cargo test -p hammer-app
 cargo test --workspace
 git diff --check
 ```
 
-全工作区测试应包含上表新增的行为测试；不能只跑某个 queue unit suite 就声称
-跨 crate 迁移完成。`rg` 只用于删除/依赖文字审计，不写读取 `.rs` 的架构断言测试。
-每个完成项需同时有编译/行为/回收证据。
-
-### 9.1 VPP 测试来源与逐项迁移
-
-本节基于第 1 节的固定 VPP 提交。主要参考文件是
-[src/plugins/unittest/svm_fifo_test.c](https://github.com/FDio/vpp/blob/629fe2764bd997189fedd2d98cbe8dc9189c1ec3/src/plugins/unittest/svm_fifo_test.c)
-与
-[src/plugins/unittest/session_test.c](https://github.com/FDio/vpp/blob/629fe2764bd997189fedd2d98cbe8dc9189c1ec3/src/plugins/unittest/session_test.c)。
-下表区分已经落地的 Linux MQ 行为用例与仍待实现的跨进程/性能用例；本轮不运行
-VPP 二进制。
-
-| VPP 测试及位置 | 已核对的测试行为 | Rust 文件与必须保留的断言 |
-| --- | --- | --- |
-| session_test.c:2107，session_test_mq_basic | descriptor 容量 16；两个容量 8、元素尺寸 8/16 的 ring；分配/释放、满小 ring 后选择大 ring、跨 ring 入队顺序、payload 123 和 0..11、最终占用清零 | `hammer-infra/tests/svm_msg_queue.rs::message_queue_matches_vpp_session_test_mq_basic`：同一组容量、分配/发布/出队/回收顺序，以及 ring/element/data 断言；已实现 |
-| session_test.c:1977，session_test_mq_speed；:1875，wait_for_event | fork 收发，分别使用 condvar 和 eventfd/epoll；读 fd 后重新检查 queue predicate；打印事件速率 | hammer-infra/tests/svm_msg_queue_process.rs：独立 exec 进程与真实 fd 传递，分别验证等待和通知；正确性验证序列无遗漏/重复，吞吐只作独立 benchmark，不作为功能通过证据 |
-| svm_fifo_test.c:217，sfifo_test_fifo1；:479，fifo2；:869，fifo5；:1005，fifo6 | OOO 间隙、相邻与重叠区间合并、已排序/未排序输入；补洞推进可读边界 | hammer-infra/tests/svm_fifo_ooo.rs：最终字节一致，补洞前不暴露后方 bytes；保留 fifo2 的 [4,3000) 合并为一段以及前 4 bytes 补齐后可读 3000 的具体断言 |
-| svm_fifo_test.c:565，sfifo_test_fifo3；:2858 起的配置组 | 可重复随机分段、overlap、in-seq-all、初始偏移、drop、顺序输入 | 同上：保留 seed=123、nsegs=10、initial-offset=3917 及上游五种组合；失败输出 seed、操作序列和首次不一致字节，能确定性重放 |
-| svm_fifo_test.c:1093，sfifo_test_fifo7；:1174，fifo_large | 非二次幂容量 101、接近 u32 边界的初始位置、反向单字节 OOO、重复补洞/消费；大 FIFO 两半乱序输入 | svm_fifo_ooo.rs：100 次循环，合并前后 OOO 数量/可读量和逐字节数据；分别覆盖物理环绕与逻辑序号回绕，不把二者混成一个条件 |
-| svm_fifo_test.c:1374，sfifo_test_fifo_grow；:1761，fifo_shrink | 增长/缩小、chunk 分配、不同 enqueue/dequeue 步长以及 sanity 检查 | hammer-infra/tests/svm_fifo_chunks.rs：跨 chunk 数据保持、容量变化后的可写量、空/满、分配失败后旧 FIFO 仍可读写；Rust 按本身布局计算容量，不抄 C struct 大小 |
-| svm_fifo_test.c:1915，sfifo_test_fifo_indirect | 4096-byte 初始 chunk，扩展到 4 MiB；nocopy 发布跨 chunk，max_read/write_chunk 和 head/tail 所在 chunk 变化 | svm_fifo_chunks.rs：通过真实写 reservation 初始化 bytes 后 commit；跨 chunk 借用长度和读写结果正确，未初始化字节不得像 C 测试那样直接 nocopy 发布 |
-| svm_fifo_test.c:2033，sfifo_test_fifo_make_rcv_wnd_zero | 4096 容量写入 3000，剩余 1096；缩至占用量后 max_enqueue 为 0 | svm_fifo_chunks.rs：精确验证 1096→0、数据仍完整、消费后容量释放；TCP advertised window 的行为另放 TCP owner 测试 |
-| svm_fifo_test.c:2096，segment_hello_world；:2145，segment_fifo_grow；:2379，segment_over_max_chunk | segment 内 FIFO 填满/排空/再次填满、扩大、超过最大单 chunk 的多 chunk 数据读回 | hammer-infra/tests/svm_fifo_segment.rs：往返数据、重复使用、跨 chunk、FIFO/header/chunk 回收；额外保留不同 slice 的隔离断言 |
-| svm_fifo_test.c:2546，segment_mempig；:2615，segment_prealloc | 分配至耗尽、释放后再分配；预分配 50 个 4096-byte chunks 与 50 个 headers；缓存数/字节数；空间不足的负向分配 | svm_fifo_segment.rs：可恢复的容量错误、缓存/accounting 与实际使用一致、已分配 FIFO 不被失败破坏、回收后可再次分配；不抄上游 overhead=8192+384 魔数 |
-| svm_fifo_test.c:2440/:2490，segment_slave / segment_master_slave | 子进程 attach，共享 FIFO 的 Hello world 传递 | hammer-infra/tests/svm_segment_process.rs：独立 exec、不同虚拟地址映射、ready/ABI 验证、实际 payload、fd 关闭及退出清理；父进程检查 child exit status，不能仅检查共享计数 |
-
-上游 segment_master_slave 被默认全量 segment 测试注释跳过（:2795，原因是慢），
-不能声称运行上游 all 就覆盖了它。Rust 将独立进程套件放在明确的 Linux CI job，
-必须显式执行，失败不得被 benchmark 或 TUN job 的结果掩盖。
-
-src/svm/svm_test.c 只保留一个 root/subregion 创建、写入 0xdeadbeef、unmap 的
-旧示例；其 region 函数实参与当前 svm_common.h 的声明不一致，且当前
-src/svm/CMakeLists.txt 没有将它列为测试目标。只提取生命周期意图，不能把它当作
-当前可运行的 SVM 回归套件。src/vppinfra/test_fifo.c 是另一种容器的测试，也不能
-作为 svm_fifo / svm_msg_q 已覆盖的证据。
-
-### 9.2 MQ 语义差异必须反映到测试
-
-VPP `mq_basic` 使用两个容量 8、元素尺寸 8/16 的 ring，测试 descriptor 入队
-顺序、ring 满后的回收和再次使用。Rust 测试保留这些行为，但 payload storage
-由测试调用方分别提供长度为 `nitems * elsize` 的 `&mut [u8]`，在
-`SvmMsgQRingConfig` 构造期提供；`alloc_msg` 明确选定
-ring，不能按内容大小偷偷切换到另一个 ring。测试发布 123、0..7、8..11，消费
-顺序必须与 descriptor queue 一致，随后验证两个 ring 都可再次使用。
-
-Rust 额外覆盖 descriptor/ring 容量组合 (3;5,2)、(5;2,3)、容量 1 和零容量拒绝，
-区分 QueueFull 与 RingFull。每轮验证显式 `alloc_msg`、`add`、`sub`、`free_msg`，
-错误不推进错误一侧的 head/tail；乱序 `free_msg` 必须失败，不引入取消事务或
-Drop 回滚语义。
-
-以下用例是从 SVM 实现和 Rust 设计推导的新增要求，不伪称 VPP 已有同名测试：
-
-| Rust 测试文件 | 来源 / 场景 | 可观察通过条件 |
-| --- | --- | --- |
-| hammer-infra/tests/svm_queue.rs | queue.c 的 add/add2/sub/wait；内容 T、full/empty、配对插入、截止时间 | add2 容量不足完全不入队；两元素顺序保持；空队列 Option 与超时错误不同；非二次幂容量完整可用 |
-| hammer-infra/tests/svm_sync_process.rs | queue.c robust 初始化/lock；本 ADR posix-sync 的 wait 重新加锁 | kill 持锁子进程后接管并 `make_consistent`，返回 OwnerDied/NotRecoverable；condvar 返回 OwnerDead 的路径保留 source；不读半提交数据、不重复 unlock；新队列成功往返 |
-| 同上 | waiter 进入条件等待后 producer 持锁退出，没有 notify | 通过有限周期重新获取 robust mutex 检出死亡；外部 deadline 只防止测试卡死，不能用 sleep 猜测线程先后顺序 |
-| hammer-infra/tests/svm_segment_process.rs | ssvm.c / svm.c 的 ready、attach、成员退出；Rust offset ABI | 不同地址 attach 成功，未 ready/旧 ABI/越界/错位拒绝；失败不发布 root，不释放仍在使用的映射 |
-| hammer-infra/tests/svm_multiarch.rs | svm_fifo.c 的 copy_to_chunk / copy_from_chunk 及 MULTIARCH_SOURCES | baseline 与本机支持 ISA 的真实复制结果一致；长度 0/1、向量边界 ±1、不对齐、chunk 边界；不执行不支持 ISA，输出实际选中的实现身份 |
-| infra 编译失败用例（crate-local） | Rust 借用与内容表示契约 | 不能重复释放 descriptor、越过 mapping 寿命使用 ring borrow、提前复用仍被读取的 slot、将 Vec/引用/指针当共享 T；用 Rust 编译结果证明，禁止 source-text assertion |
-| runtime/tests/session_msg_queue.rs 与 app/tests/session_control.rs | Session/SDK 的实际迁移闭包 | IO/CTRL 编码及环选择、处理前释放消息 guard、满队列重试、关闭与重建、独立 app attach；不得依赖旧 SingleProducer 类型或 claim 路径 |
-
-同步测试以 socket/pipe 的阶段握手确认“已持锁”“进入等待前”等状态；再执行
-目标动作，并用有界等待、child kill/wait 回收兜底。需要精确命中 alloc/add/sub/free_msg
-中间窗口时使用仅测试构建可见的内部阶段控制，不能向生产 API 注入回调或在
-共享 ABI 中永久增加测试字段。真实 pthread/futex 跨进程行为必须由独立进程
-验证；线程测试或模型检查只能补充，不能替代。每个队列测试还要核对精确消息数、
-每个生产者的顺序及有效 payload，而不是只断言最终 len=0。
-
-### 9.3 测试落点与实施验收顺序
-
-基础设施测试放在 crates/hammer-infra/tests/，runtime 与 SDK 接入测试各归其
-crate；内部私有状态测试邻近所属模块。上文表格省略了路径共同前缀 crates/。
-Linux CI 分开执行编译/lint、FIFO/队列确定性测试、跨进程同步与生命周期、
-Session/SDK 集成、性能测量。进程测试无需 TUN，不启动 Hammer daemon；真正
-TUN/TCP lab 仍仅由专门 CI workflow 运行。
-
-实现完成并完成 review/formatting 后，最终提交前 gate 才运行测试。用例落地后
-应至少覆盖以下命令对应的测试目标；当前提交的 focused gate 执行已实现的 MQ
-与固定元素 queue 测试：
-
-```bash
-cargo test -p hammer-infra --test svm_msg_queue --test svm_queue
-cargo test -p hammer-infra --test svm_fifo_ooo --test svm_fifo_chunks --test svm_fifo_segment
-cargo test -p hammer-infra --test svm_segment_process --test svm_msg_queue_process --test svm_sync_process
-cargo test -p hammer-infra --test svm_multiarch
-cargo test -p hammer-runtime --test session_msg_queue
-cargo test -p hammer-app --test session_control
-```
-
-除上文已标注的 MQ 基本用例外，其余目标仍是后续迁移清单，不宣称目前存在或已通过。
-最后按第 9 节 gate 检查跨 crate 影响；测试通过立即提交，不在提交后重复测试。
-
-## 10. 后续 vlibapi / vlibmemory 的 SVM 适配核对
-
-核对范围是 vendored src/vlibapi 与 src/vlibmemory 的调用者及其 SVM 实现，
-不是只查结构定义。结论是：**统一 MQ 不阻碍后续分层；仅完成 MQ 仍不足以
-宣称 Binary API 共享内存路径已经可迁移或验证通过。**
-
-| VPP 证据 | 实际需求 | Rust 设计边界与验收 |
-| --- | --- | --- |
-| vlibmemory/memory_client.c::vl_client_connect_to_vlib（svm_queue_alloc_and_init / svm_queue_sub）；vlibapi/api_shared.c::vl_msg_api_queue_handler | 客户端输入队列固定存 sizeof(uword) 的消息地址，支持阻塞接收 | 使用独立 SvmQueue，T 是协议定义的 offset/消息身份值；不使用 Session IO/CTRL 或 SvmMsgQ data rings |
-| vlibapi/memory_shared.c::vl_msg_api_send_shmem / vl_mem_api_can_send / vl_msg_api_send_shmem_nolock；vlibmemory/memory_api.c::void_mem_api_handle_msg_i | 满队列背压、发送所有权转移、主线程消费；部分 C 调用直接使用 raw 队列操作 | Rust 的 enqueue/dequeue 由 owner 内部加锁；不要求调用方访问 header，也不复制裸指针或暴露手工解锁 |
-| svm/queue.c::svm_queue_add2 / svm_queue_sub | 两元素原子插入、空/满判断、WAIT/NOWAIT/TIMEDWAIT | SvmQueue 有 enqueue_pair、显式阻塞/截止时间接收；按用户要求只用 lock，NOWAIT 的锁忙即返行为是有意不保留的差异 |
-| vlibapi/memory_shared.c::vl_msg_api_alloc_internal / vl_msg_api_free_w_region | API allocation rings 根据消息大小选择池；slot 可在消费者处理完成后独立释放；miss 转 region heap | 这是 Binary API 消息分配策略，不是 SvmMsgQ 按序释放的 data ring。分配器归未来 Binary API owner，使用 infra 的共享 region 分配能力，不能把消息回收强制改成 MQ 顺序 |
-| vlibmemory/socket_api.c 的 sock_init_shm handler；socket_client.c 的 sock_init_shm_reply handler | memfd 建立后在其中初始化 region、API root/rings，ready 后传 fd 并 attach | SvmSegment 管 memfd/mmap，SvmRegion 管共享 allocator/root；Unix socket 层管 SCM_RIGHTS 和注册。不同地址映射使用 offset，不依赖 C 的固定 VA |
-| vlibapi/memory_shared.c::vl_map_shmem / vl_unmap_shmem_internal；svm.c::svm_region_find_or_create / svm_region_unmap_client | 命名 region、成员和 server/client 不同的退出职责 | 通用 SvmRegion/SvmRegionMain 提供能力，API 层持有自己的注册和消息身份；MQ 不持有客户端注册表 |
-| vlibmemory/memory_api.c::memclnt_queue_callback | 检查输入队列是否有消息，再发 VLIB process event | 调度留在 runtime/API owner。Rust 不借用 C 的 volatile cursize 指针，不在 SVM 层注册 graph node；len/is_empty 只提供检查结果 |
-| svm/queue.c::svm_queue_init / svm_queue_lock；svm.c 的 region 初始化 | 固定队列设 robust + process-shared；region 初始化只设 process-shared | posix-sync 采用 Shared + Robust；owner death 关闭旧实例并重建；不得把所有 VPP region 锁描述为 robust |
-
-SVM 层只拥有通用共享存储、队列、分配、等待与回收协议，不包含 API 消息 ID、
-处理函数表、客户端注册、版本协商或 Session 控制消息。API owner 可以调用
-SvmQueue 的 typed 接口和 SvmRegion 分配接口；SVM 不反向依赖 API/runtime。
-同一个 segment 中可以同时放 API queues 与 API allocation rings，但两者的
-生命周期、回收顺序和容量统计必须独立。
-
-共享 region allocator 是实际前置能力：当前 Hammer attached SvmRegion 没有
-allocator，不能让各进程重新初始化带本地指针的 Talc。未来 API client 与 daemon
-必须能通过同一套 offset allocator 元数据分配/释放，或在具体设计中明确改为
-由拥有者处理回收请求；后者不在本轮擅自选定。存储耗尽返回所属层错误，不能
-回落进程 Main Heap 后将私有地址发给 peer。
-
-API 消息身份必须能在当前映射中检查范围、所属 region 和有效生命周期；具体
-协议字段由 API owner 定稿，不从裸 u64 的可存储性推断身份有效。VPP allocation
-ring 按时间强行回收旧 slot 的行为不能直接移植为 Rust 内存安全保证：需要证明
-原 owner 已放弃访问。队列满时尚未发生所有权转移，消息仍归发送方；成功入队
-后发送方不得再访问，通知失败不得触发重复发送。
-
-后续验收必须包含：独立 exec 进程在不同地址 attach；固定元素 queue 的顺序、
-满/空、双元素插入失败原子性、condvar 与绝对截止时间；API allocation slots
-乱序释放；共享 heap miss/耗尽；发送失败仍由发送方回收；接收处理后回收；
-client detach 与在途消息；持锁 peer 退出。当前没有执行这些行为测试，不能把
-此次源码和文档核对写成“后续使用 SVM 已确认没有问题”。
-
-## 11. 设计审查结论与未决证据
-
-结论：`Design only / Linux first`。统一 MQ 方案已写入设计；当前实现尚未迁移，
-未来 Binary API 的完整接入也尚未验证。
-
-- 已决（Linux robust）：选用 posix-sync 的共享 robust mutex/condvar；按 8.4
-  验证不变量后 `make_consistent` 并返回 OwnerDied，无法验证时才隔离并重建。
-  实施必须通过 lock 与 condvar reacquire 的 owner-death 测试，文档选型不冒充
-  行为验证。
-- Blocking（完整 Binary API 接入）：共享 region allocator、API 消息分配/回收、
-  peer detach 与消息身份校验须由相应 owner 定稿并通过第 10 节验收。其中共享
-  region allocator 已在 §12 给出具体类型、方法、布局与验收矩阵，但实施与验收
-  仍未完成。
-- Blocking（MQ 实施完成前）：eventfd 通知错误留存/处理接口、Session 在
-  `sub` 后到 `free_msg` 的释放时机，以及跨进程互斥/唤醒测试必须补齐。
-- Blocking（完整 FIFO parity）：chunk reclamation 与多 worker slice 安装需要
-  所有权证明；不能以本轮 MQ 设计代替 FIFO segment 的验收。
-- Non-blocking（本轮 ADR）：macOS/iOS 暂不设计；database/工具另有 API 范围。
-
-本轮交付是 Linux MQ 的具体类型、方法、同步与删除设计，以及 Binary API
-适配核对。未修改生产代码、依赖和测试，未删除现有 MultiRingMsgQueue，未声称
-完成整体 SVM 重构。后续实施使用第 7/8 节清单及第 9/10 节验证矩阵。
-
-## 12. `svm_region` 重新设计：offset heap、名字表与独立子区
-
-本节把 §8 的 A2 细化为可实施的具体类型与方法，并给出字段映射、布局、
-删除账本与验证矩阵。事实类别沿用第 1 节：`V` 是 vendored VPP 源码，`H` 是
-当前 Hammer，`R` 是仓库/用户约束，`D` 是本节提议。已经落地的是 12.1 的模块
-落点（纯文件移动与导入路径更新，无行为变化）；12.4/12.5/12.6/12.7 的类型与
-方法仍未实现，本轮不修改任何行为、依赖或测试。
-
-### 12.1 证据与决策
-
-| ID | VPP 来源 | 已核实事实 | 本节决策 |
-| --- | --- | --- | --- |
-| V11 | `svm_common.h:28-56` | `svm_region_t` 全集含 `version/mutex/condvar/mutex_owner_pid/mutex_owner_tag/flags/virtual_base/virtual_size/region_heap/data_base/data_heap/user_ctx/bitmap_size/bitmap/region_name/backing_file/filenames/client_pids`，并注明 `region_heap` 之后才是 data 段 | 保留跨进程有意义的字段；删除绝对 VA、文件 backing 与 bitmap，见 12.2 |
-| V12 | `svm.c:90-104`、`:110-113`、`:694-732` | `mutex_owner_pid/tag` 只在 `#ifdef MUTEX_DEBUG` 下由 `region_lock`/`region_unlock` 写；attach 侧发现 holder 已死后直接 `pthread_mutex_init` 重建 region 锁 | 保留两个字段；**不重建 mutex**：robust guard 返回 `Indeterminate` 时把 region 标记 Failed，后续访问返回 `OwnerDied`，沿用 §8.4 的恢复契约 |
-| V13 | `svm.c:474-476`、`:498-512` | pvt heap 建在 `baseva+MMAP_PAGESIZE`（默认 128K `SVM_PVT_MHEAP_SIZE`），`data_base` 按页对齐到它之后 | 三段布局：固定 header + metadata heap + data 段，见 12.3 |
-| V14 | `svm.c:801-813` | root region 的 `svm_main_region_t` 由 pvt heap 分配，并覆写 `rp->data_base` 指向它（`:812`） | root 的 `SvmRegionMain` 在 metadata heap 内，由 `data_base_offset` 指向，见 12.6 |
-| V15 | `svm.c:786-800`、`:910`、`:965-969`、`:1090-1106` | 名字表 `hash_create_string`；key 是堆内名字字符串地址，value 是 subregion pool 下标；删除时先 `hash_unset_mem` 再 `vec_free` 名字 | 名字表改为 `SvmHashMap<u64>`（键字节由表持有），值是单调不复用的子区序号 |
-| V16 | `svm_common.h:92`、`svm.c:262-266`、`:909-975` | root region 保留 64MB 保留 VA，用 bitmap 按页切分，子区 mmap 在 `baseva + index*MMAP_PAGESIZE`，因此依赖固定 VA | 不做 VA 切分：每个子区一个独立 `SvmSegment`，fd 经 socket + `SCM_RIGHTS` 传递；删除 `bitmap/bitmap_size` 与 `SVM_FLAGS_FILE` |
-| V17 | `svm.c:483`、`:1215-1229`、`:1258-1275` | 成员表是每个 region 私有堆内的 `client_pids` vec；回收只用 `kill(pid, 0)` 探测，不记录进程启动时间 | 成员数组与计数放在 region 自己的 metadata heap；回收语义与 VPP 相同 |
-| V18 | `ssvm.h:47-70`、`svm.c:326-339` | `ssvm_shared_header_t.heap` 仍在，但 `ssvm.h` 自己带 `/* TODO remove ssvm heap entirely */`；`data_heap` 只在 `SVM_FLAGS_MHEAP` 时创建 | segment 不携带 allocator；region heap 归 region owner；segment 只提供 payload 定位 |
-| V19 | `mem.h:143-158`、`mem_dlmalloc.c:363-383`、`:418-423`、`:519-536` | `clib_mem_heap_alloc` 失败即 `os_out_of_memory()` 终止；`clib_mem_heap_free` 以 ASSERT 校验对象属于该堆后 `mspace_free` | `SvmRegionHeap` 不返回 `Result`；耗尽/双释放/块损坏以携带事实的违规载荷终止，见 12.4 |
-| V20 | `vlibapi/api_common.h:356`、`svm.c:409-428`、`:568`、`:625`、`:856-869`、`memory_api.c:1140-1160` | `root_path` 只用于拼 `/dev/shm/<root>-<name>` 文件名，`uid`/`gid` 只用于 `fchown`，扫描与清理按同一路径进行 | 不移植 `root_path`/`uid`/`gid`：Hammer 的 rendezvous 是 socket + `SCM_RIGHTS` 传 fd，没有路径解析与 uid 复核，见 12.2 |
-| V21 | `svm_common.h:46`、`:67-68`、`svm.c:262-322`、`:347-404` | `backing_file`/`backing_mmap_size` 只在 `SVM_FLAGS_FILE` 下使用：把 region 的 data 段以 `MAP_SHARED|MAP_FIXED` 映射到普通文件，使 data 内容跨 daemon 重启保留；`backing_mmap_size` 只在 backing 不是普通文件时决定映射长度；`svm_region_t.backing_file`（`svm_common.h:46`）在 `svm.c:320` 写入后全树无人读取 | 不移植 `backing_file`/`backing_mmap_size`/`SVM_FLAGS_FILE`：它是 segment backend 选择与持久化需求，不是 region 语义，见 12.2 |
-
-模块落点：SVM owner 已独立成 `crates/hammer-infra/src/svm.rs` +
-`crates/hammer-infra/src/svm/` 子树，文件划分对应 VPP `src/svm` 的职责：
-
-```text
-svm.rs              子树文档与子模块声明
-svm/ssvm.rs         SsvmPrivate：映射、backing、ready
-svm/region.rs       SvmRegion、SvmRegionConfig、SvmRegionMain：region authority
-svm/queue.rs        SvmQueue
-svm/msg_queue.rs    SvmMsgQ / SvmMsgQRing / SvmMsgQDescriptor
-svm/fifo.rs         SVM 字节 FIFO
-svm/fifo_segment.rs SvmFifoSegment：FIFO 存储 owner
-```
-
-公开路径相应变为 `hammer_infra::svm::{region,ssvm,queue,msg_queue,fifo,fifo_segment}`；
-`hammer_infra::page_size` 保留为 crate 根的重导出。新的 `svm/region_heap.rs`、
-`svm/hash_map.rs` 按 12.4/12.5 落在这棵子树内。留在 crate 根部的 `segment.rs`
-（旧 `Segment`）与 `multi_ring_msg_queue.rs` 是 §7 已登记的删除目标，不搬进子树。
-
-### 12.2 `svm_region_t` 字段映射
-
-| VPP `svm_region_t` | Hammer `SvmRegionHeader` | 说明 |
-| --- | --- | --- |
-| `volatile uword version` | `version: AtomicU64` | 唯一 ready 标志；初始化最后 release 写（`svm.c:513-517`），attach 先 acquire 读 |
-| `pthread_mutex_t mutex` | `mutex: MaybeUninit<RawMutexAlloc>` | header 内嵌原始存储，`SvmRegion` 借成 `BorrowedMutex<'static, Robust>`；process-shared robust，posix-sync，见 §8.4 |
-| `pthread_cond_t condvar` | `condvar: MaybeUninit<RawCondvarAlloc>` | VPP 建了 process-shared condvar，但 `svm.c` 从不 wait/notify；保留字段以免将来改变共享布局 |
-| `int mutex_owner_pid` | `mutex_owner_pid: AtomicI32` | 与 `region_lock` 同步写（`svm.c:93-96`） |
-| `int mutex_owner_tag` | `mutex_owner_tag: AtomicI32` | 取值来自 `RegionLockTag`，不是任意整数 |
-| `uword flags` | `flags: AtomicU64` | 只保留 `REGION_FLAG_DATA_HEAP`（VPP `SVM_FLAGS_MHEAP`）与 `REGION_FLAG_SUBDIVIDED`（VPP `SVM_FLAGS_NODATA`） |
-| `uword virtual_base` | 删除 | 跨进程绝对 VA 无意义；header 自身即 offset 0，`SvmSegment` 负责映射地址 |
-| `uword virtual_size` | `virtual_size: u64` | attach 校验与 `layout()` 用 |
-| `void *region_heap` | 删除 | heap 起点由 header 尺寸与 64 字节对齐算出，固定布局，见 12.3 |
-| `void *data_base` | `data_base_offset: u64` | `SUBDIVIDED` 时指向 `SvmRegionMain`（对齐 `svm.c:812`），否则指向 data 段起点 |
-| `void *data_heap` | `data_heap: SvmRegionHeap` | 仅 `REGION_FLAG_DATA_HEAP` 时有效；header 内嵌，不使用绝对地址 |
-| `volatile void *user_ctx` | `user_ctx_offset: u64` | 0 = 未设置；用户上下文保存在同一 region 的堆内 |
-| `uword bitmap_size`、`uword *bitmap` | 删除 | 不再切分保留 VA，见 12.6 |
-| `char *region_name` | 删除 | 名字的唯一权威是 root region 的名字表；region 自身不重复保存名字 |
-| `char *backing_file`、`char **filenames` | 删除 | 文件 backing 与 `SVM_FLAGS_FILE` 不移植；backing 归 `SvmSegment` |
-| `uword *client_pids` | `client_pids_offset: u64`、`client_count: u64`、`client_capacity: u64` | 成员数组在 metadata heap；VPP vec 的 append/delete 语义保留，增长用 offset 块重分配 |
-
-Hammer 新增、VPP 没有对应项的字段：
-
-| 字段 | 事实 |
-| --- | --- |
-| `magic: u64` | header 身份；attach 在信任其它字段前先校验，不符返回 `InvalidMagic` |
-| `state: AtomicU32` | 失败 latch，只写 `Uninitialized`(0) 或 `Failed`；`Ready` 由 `version` 派生，ready 只有一个权威 |
-| `metadata_heap: SvmRegionHeap` | region 自己的元数据堆（成员表、名字、`SvmRegionMain`）；VPP 用 `baseva + MMAP_PAGESIZE` 处的 clib pvt heap，Hammer 用同一个 offset heap 类型表达，见 12.3 |
-| `root_offset: AtomicU64` | 已发布 root 对象的 offset，0 = 未设置。VPP 只把 root 放进 `data_base`/`user_ctx`，Hammer 把"region 数据面 root"与"调用方 user_ctx"分开，`publish_root` 校验后 release 写 |
-
-不移植的开关：`SVM_FLAGS_FILE`、`SVM_FLAGS_NEED_DATA_INIT`、`SVM_OVERLAY_REGION_BASEVA/SIZE/BASENAME`，
-以及 `svm_main_region_t` 的 `root_path`/`uid`/`gid`（`svm_common.h:110-116`）。前三个的原因
-是没有文件 backing、ready 由 `version` 单点表达、不支持 overlay 布局；`root_path`/`uid`/`gid`
-的原因见下面两段。
-
-chroot/`root_path`/`uid`/`gid` 与 region 语义无关，它们服务的是"按文件路径
-rendezvous + 跨 uid 放行"：`root_path` 只用于拼 shm 文件名
-（`shm_name_from_svm_map_region_args`，`svm.c:409-428`），`uid`/`gid` 只做一次
-`fchown (svm_fd, uid, gid)`（`svm.c:568`、`:625`）让不同 uid 的客户端能打开该
-文件，清理与扫描同样按 `/dev/shm/<root>-*` 路径进行（`memory_api.c:1140-1160`、
-`svm.c:1237-1252`）；`svm_region_init_chroot_uid_gid` 就是这两件事的组合
-（`svm.c:856-869`）。Hammer 的 rendezvous 是 socket + `SCM_RIGHTS` 传 fd：
-`SvmSegment` 的 `shm` 后端 open 后立即 `shm_unlink`（`svm_segment.rs:260-276`），
-`memfd` 后端无路径，`SvmSegmentConfig.name` 只存在于创建进程的私有 config，
-权限在 `connect()` 时判定一次而不是按 uid/gid 复核。因此 `root_path` 在本设计
-中没有消费者；把它放进共享区反而有害——chroot 内的绝对路径对另一 mount
-namespace 的进程无意义。
-
-`backing_file`/`backing_mmap_size`/`SVM_FLAGS_FILE` 同样不属于 region 语义：
-它们只在 `SVM_FLAGS_FILE` 下把 region 的 data 段映射到普通文件，使 data 内容
-跨 daemon 重启保留（`svm.c:262-322`、`:347-404`），代价是必须 `MAP_FIXED` 到
-同一地址，因为 data heap 内部保存的是绝对指针；使用者只是 `persist.c` 这个
-test/demo，而 `svm_region_t.backing_file`（`svm_common.h:46`）在 `svm.c:320`
-写入后全树无人读取，本身就是死字段。Hammer 的 region 共享位置只有 offset，
-不依赖固定 VA，也没有跨重启持久化需求；将来若需要，那是 `SvmSegment` 的
-backend 选项，`SvmRegion::attach` 只需把旧文件内容当不可信输入并先做
-magic/version/flags/size/heap 边界校验。
-
-### 12.3 三段布局
-
-```text
-SvmSegment payload（offset 0 = region 起点）
-  [0, sizeof(SvmRegionHeader))           固定元数据：version/mutex/condvar/
-                                         flags/两个 heap/成员表头
-  align_up(sizeof(header), 64)           SvmRegionHeap（metadata heap）起点
-  data_base_offset ─┬─ SUBDIVIDED（root）：SvmRegionMain（名字表 + 子区序号）
-                    └─ 普通 region：data 段起点；data_heap_offset != 0 时为 data heap 起点
-```
-
-- 共享位置一律用 payload 内 offset；map 由 `SvmRegion` 在 attach 后建立，不进入共享区。
-- 没有固定 VA、没有页粒度切分、没有 64MB 保留区间；子区是独立 segment（V16）。
-- header 不得放进 heap：`region_heap` 字段因此删除，heap 的 `heap_start` 由 header 尺寸算出。
-- 两个 `SvmRegionHeap` 都是 header 的字段，范围在 `create` 时切定、之后不变
-  （`header_end = align_up (sizeof (header), 64)`）：
-  `SUBDIVIDED`（root）只有 metadata heap，覆盖 `[header_end, payload_len)`，
-  `data_base_offset` 指向由它分配的 `SvmRegionMain`（对齐 `svm.c:812`）；
-  普通 region 的 metadata heap 覆盖 `[header_end, data_base_offset)`，
-  带 `REGION_FLAG_DATA_HEAP` 时 data heap 覆盖 `[data_base_offset, payload_len)`，
-  不带标志时 `data_base_offset` 之后是调用方自管的数据段。
-- 普通 region 的 metadata heap 固定为 `SVM_REGION_METADATA_HEAP_SIZE`（128K，对应 VPP
-  `SVM_PVT_MHEAP_SIZE`），因此 `data_base_offset = header_end + 128K`；`SvmRegion::layout`
-  保证 payload 至少容纳 header、这段保留区与 `MINIMUM_HEAP_BYTES`（64，块的
-  `MIN_BLOCK_SIZE` 之上）。子区名字上限 `SVM_REGION_NAME_MAX_LENGTH = 256` 字节，
-  空名与超长名在写入共享区前被拒绝（`InvalidRegionName`）。
-- 两个 heap 的 arena 都是**整个 payload**，`heap_start`/`heap_end` 就是 payload 内
-  offset：metadata heap 的 `heap_start = header_end`，data heap 的
-  `heap_start = data_base_offset`。于是 `SvmRegionHeap` 返回的 offset 本身就是可跨进程
-  传递的 payload offset，调用方不再叠加段起点，member 表与名字表也共用同一段 arena。
-- 发布顺序：初始化 mutex/condvar/heap/成员/名字表，最后 release 写 `version`；attach 先
-  acquire 读 `version`，再校验 magic、size、flags、offset 边界与对齐，任何失败都不发布。
-- `SvmRegionHeader` 含 `#[repr(C, align(64))]`；所有字段宽度固定，跨 32/64 位进程不互通
-  （沿用 D10：不承诺 C 二进制兼容，只承诺同架构、同版本 Hammer 进程互通）。
-
-### 12.4 `SvmRegionHeap`
-
-`DLmalloc` 的 offset 化等价物：块头保留相邻块合并所需的 size/flag，空闲块按大小链入
-定长 bin，用户区前的 8 字节前缀回指块头，从而让 `deallocate` 在没有进程私有指针的
-情况下完成校验与合并。已落地在 `hammer_infra::svm::region_heap`（测试
-`crates/hammer-infra/tests/svm_region_heap.rs`）。
-
-```rust
-// hammer_infra::svm::region_heap
-pub const SVM_REGION_HEAP_BINS: usize = 64;
-
-const FLAG_PREVIOUS_IN_USE: u64 = 1 << 0; // 相邻前一块在使用，同 dlmalloc PREV_INUSE
-const FLAG_CURRENT_IN_USE: u64 = 1 << 1;
-const BLOCK_HEADER_SIZE: u64 = 16; // [previous_size][size_and_flags]
-const USER_PREFIX_SIZE: u64 = 8;   // 用户区前 8 字节：本块块头 offset
-const MIN_BLOCK_SIZE: u64 = 40;    // 块头 + 前缀 + 两个 bin 链指针
-
-// 块布局：
-//   [block + 0,  block + 16)   previous_size / size_and_flags
-//   [block + 16, block + 24)   back-pointer：块头 offset，deallocate 恢复块头的唯一依据
-//   [block + 24, block + size) 用户数据；块空闲时尾部 16 字节是 next/previous bin 链
-
-#[repr(C)]
-pub struct SvmRegionHeap {
-    free_bins: [u64; SVM_REGION_HEAP_BINS], // 各 bin 空闲链头 offset；0 = 空
-    heap_start: u64,                        // 管理区起点（含本 header）
-    heap_end: u64,
-    free_bytes: u64,
-    used_bytes: u64,
-    peak_used_bytes: u64,
-}
-
-impl SvmRegionHeap {
-    pub const fn new() -> Self;
-    pub fn initialize(&mut self, arena: &mut [u8], heap_start: u64, heap_end: u64);
-    pub fn allocate(&mut self, arena: &mut [u8], layout: Layout) -> u64;
-    pub fn reallocate(
-        &mut self,
-        arena: &mut [u8],
-        offset: u64,
-        layout: Layout,
-        new_size: usize,
-    ) -> u64;
-    pub fn deallocate(&mut self, arena: &mut [u8], offset: u64, layout: Layout);
-    pub fn holds(&self, arena: &[u8], offset: u64, layout: Layout) -> bool;
-    pub fn free_bytes(&self) -> u64;
-    pub fn used_bytes(&self) -> u64;
-    pub fn peak_used_bytes(&self) -> u64;
-    pub fn bytes_at<'a>(&self, arena: &'a [u8], offset: u64, length: u64) -> &'a [u8];
-    pub fn bytes_at_mut<'a>(
-        &mut self,
-        arena: &'a mut [u8],
-        offset: u64,
-        length: u64,
-    ) -> &'a mut [u8];
-}
-```
-
-每个方法都接收当前映射的字节视图 `arena`：descriptor 只保存 offset 与计数，不保存
-指向数据的进程私有指针，因此既不引入 wrapper，也不要求 heap 与它管理的字节同处一个
-Rust 值；调用方每次调用借一次映射即可。
-
-bin 链放在空闲块的尾部而不是 dlmalloc 的用户区头部：用户区前的 back-pointer 是 offset
-heap 里从用户 offset 找回块头的唯一依据，若被链指针覆盖，重复释放会被误报成
-`NotAllocated`。放在尾部后，双释放能准确报出 `DoubleFree`。
-
-生命周期与所有权：
-
-- **归属**：heap 归它所在的 region。共享侧只有两个 `SvmRegionHeader` 字段（metadata heap
-  与 data heap），它们不在自己管理的 arena 内，否则无法完成第一次分配。进程侧
-  `SvmRegion` 只是句柄，不缓存 `*mut SvmRegionHeap`，每次按 `header_offset` 在当前映射
-  现取 `&SvmRegionHeap`/`&mut SvmRegionHeap`；`SvmHashMap` 等使用者每次调用借一次；
-  `SvmSegment` 不持有、也不知道 heap（V18）。
-- **无析构**：不实现 `Drop`，没有 `destroy`，也没有“把 heap 拷出共享区”的按值持有方式；
-  把 descriptor 拷出后它与真实空闲链立刻脱节。删除 region 只有一条路径：先从 root
-  名字表移除名字（客户端不再可能找到），再由 daemon 关闭对应 `SvmSegment`，映射消失
-  即 heap 字节消失。
-- **初始化只发生一次**：只有 `SvmRegion::create` 在 `state == Uninitialized`、持有 region
-  锁、且在 release 发布 `version` 之前调用 `initialize`；shm/memfd 初始为零页，因此初始
-  状态确定——`[heap_start, heap_end)` 一个整块空闲。`attach` 只校验，**绝不初始化或
-  修复**，否则两个进程都会自认为 owner（即 VPP attach 侧重建 Talc 的错误翻版）。
-- **范围在 create 时切定**，堆范围本身不增长；`SvmRegionHeap` 内的内容（名字表桶、键
-  字节、成员数组、`user_ctx`、`SvmRegionMain`）按需 allocate/reallocate。
-- **进程死亡不改变所有权**：某个客户端进程退出只回收它自己的映射；heap 仍在其他映射
-  中有效，直到该 region 的最后一个成员 unmap，或 daemon 拆除该 segment。owner death
-  后 region 置 `Failed`，heap 不再使用也不就地修复，随 segment 拆除一起消失。
-- **借用纪律**：`&mut SvmRegionHeap` 只允许在 `RegionLock` 内取得；不得跨锁释放保留，
-  也不得同时持有两个 heap 的可变借用去跨界分配。
-
-契约：
-
-- **没有 `Result`，没有 error 类型。** 空间不足、offset 落在 heap 外、对齐不匹配、
-  双释放、bin 链或块大小损坏，一律构造 `SvmRegionHeapViolation` 并把结构化事实
-  写到 stderr 后 `std::process::abort()`（对齐 V19）。共享堆一旦损坏，其他进程可能
-  正在使用，unwind 会让同一 region 处于不可判定状态。
-- 终止载荷是单一枚举，不另造只被嵌套的 wrapper，每个变体只陈述一类可诊断事实：
-  `NotInitialized { heap_start, heap_end, arena_len }`、`InvalidRange { .. }`、
-  `Exhausted { requested, alignment, free_bytes }`、`LayoutOverflow { size, alignment }`、
-  `ZeroSizeReallocation { offset }`、`Misaligned { offset, alignment }`、
-  `OutOfRange { offset, length, heap_end, arena_len }`、`NotAllocated { offset }`、
-  `DoubleFree { offset }`、`BlockCorruption { offset, declared_size, previous_size, heap_end }`、
-  `BinCorruption { bin, offset }`。
-- 对齐：`layout.align()` 向上取到 8 字节档；每个块（含空闲块与切分出的尾块）都不小于
-  `MIN_BLOCK_SIZE`，因此释放后一定能放下块头、前缀与 bin 链。用户 offset 满足
-  `offset % align == 0`，且等于由块头与 `align` 反推的位置；`deallocate`/`holds` 都按
-  这一条校验，所以按分配时的 `layout` 调用才能通过，内部 offset 一律被拒。
-- **offset 0 不能是块起点**：`free_bins` 与空闲块尾部的 `next`/`previous` 链都用 0 表示
-  “链尾”，因此 heap 的 arena 必须在块区前留出空间，`heap_start` 不能是 0。测试用
-  `HEAP_START = 64` 满足它，region 用 `header_end()`（metadata heap）与
-  `data_base_offset`（data heap）满足它；A13 初版把 heap 初始化在 arena offset 0，
-  第一次 `allocate` 就被判 `Exhausted`，这是该约束的反例。
-- `reallocate` 遵循 dlmalloc：原地扩缩可行则原地完成，否则新分配、拷贝 `min(old, new)`、
-  释放旧块；收缩只在前后两半都不小于 `MIN_BLOCK_SIZE` 时切分；`new_size == 0` 视为非法
-  （调用方应 `deallocate`）。
-- heap 不自带锁：跨进程互斥由 region 的 `RegionLock` 承担（VPP 建的是 `is_locked=1`
-  的 mspace，Hammer 用 region mutex 代替，因为 offset heap 里放不下进程私有的锁状态）。
-- `free_bytes`/`used_bytes`/`peak_used_bytes` 是单调可核对的自有统计，不外推为
-  “映射真实占用”。
-
-### 12.5 `SvmHashMap<V>`
-
-与 `std::collections::HashMap` 语义一一对应的共享表：相同的替换/删除/计数/容量/迭代
-语义，唯一的差别是底层 allocator 换成 offset arena，且键是 arena 内字节串。已落地在
-`hammer_infra::svm::hash_map`（测试 `crates/hammer-infra/tests/svm_hash_map.rs`）。
-
-```rust
-// hammer_infra::svm::hash_map
-pub const SVM_HASH_MAP_MIN_BUCKETS: u64 = 64;
-const SHRINK_FLOOR: u64 = 32;
-const LOAD_NUMERATOR: u64 = 3;
-const LOAD_DENOMINATOR: u64 = 4;
-
-const SLOT_EMPTY: u8 = 0;     // 探测在此终止
-const SLOT_OCCUPIED: u8 = 1;
-const SLOT_VACANT: u8 = 2;    // 墓碑：探测穿过，插入优先复用
-
-#[repr(C)]
-struct SvmSlot<V> {
-    state: u8,          // 裸字节而非 #[repr(u8)] enum：共享字节里只允许全 bit 模式合法的类型
-    padding: [u8; 7],
-    hash: u64,          // 先比 hash 再比键字节；rehash 只搬槽，不读键块
-    name_offset: u64,   // 键字节块在 arena 内的 offset
-    name_len: u64,
-    value: V,
-}
-
-#[repr(C)]
-pub struct SvmHashMap<V> {
-    buckets_offset: u64,   // SvmSlot<V>[bucket_capacity] 的 offset；0 = 未建表
-    bucket_capacity: u64,  // 2 的幂，最小 64（VPP hash.c:646-650）
-    occupied: u64,
-    vacant: u64,
-    values: PhantomData<V>,
-}
-```
-
-```rust
-impl<V: Copy + FromBytes + IntoBytes + Immutable + KnownLayout> SvmHashMap<V> {
-    pub const fn new() -> Self;
-    pub fn with_capacity(heap: &mut SvmRegionHeap, arena: &mut [u8], capacity: usize) -> Self;
-    pub fn len(&self) -> usize;
-    pub fn is_empty(&self) -> bool;
-    pub fn capacity(&self) -> usize; // 不再扩容可容纳的元素数 = bucket_capacity * 3 / 4
-
-    pub fn contains_key(&self, heap: &SvmRegionHeap, arena: &[u8], name: &str) -> bool;
-    pub fn get<'a>(&self, heap: &SvmRegionHeap, arena: &'a [u8], name: &str) -> Option<&'a V>;
-    pub fn get_mut<'a>(&mut self, heap: &mut SvmRegionHeap, arena: &'a mut [u8], name: &str) -> Option<&'a mut V>;
-    pub fn get_key_value<'a>(&self, heap: &SvmRegionHeap, arena: &'a [u8], name: &str) -> Option<(&'a str, &'a V)>;
-    pub fn insert(&mut self, heap: &mut SvmRegionHeap, arena: &mut [u8], name: &str, value: V) -> Option<V>;
-    pub fn remove(&mut self, heap: &mut SvmRegionHeap, arena: &mut [u8], name: &str) -> Option<V>;
-    pub fn entry<'a>(&'a mut self, heap: &'a mut SvmRegionHeap, arena: &'a mut [u8], name: &'a str) -> SvmEntry<'a, V>;
-    pub fn clear(&mut self, heap: &mut SvmRegionHeap, arena: &mut [u8]);
-    pub fn reserve(&mut self, heap: &mut SvmRegionHeap, arena: &mut [u8], additional: usize);
-    pub fn shrink_to_fit(&mut self, heap: &mut SvmRegionHeap, arena: &mut [u8]);
-
-    pub fn iter<'a>(&self, heap: &'a SvmRegionHeap, arena: &'a [u8]) -> SvmIter<'a, V>;
-    pub fn keys<'a>(&self, heap: &'a SvmRegionHeap, arena: &'a [u8]) -> SvmKeys<'a, V>;
-    pub fn values<'a>(&self, heap: &'a SvmRegionHeap, arena: &'a [u8]) -> SvmValues<'a, V>;
-    pub fn values_mut<'a>(&mut self, heap: &mut SvmRegionHeap, arena: &'a mut [u8]) -> SvmValuesMut<'a, V>;
-}
-
-pub enum SvmEntry<'a, V> { Occupied(SvmOccupiedEntry<'a, V>), Vacant(SvmVacantEntry<'a, V>) }
-
-impl<'a, V> SvmEntry<'a, V> {
-    pub fn key(&self) -> &str;
-    pub fn or_insert(self, value: V) -> &'a mut V;
-}
-impl<'a, V> SvmOccupiedEntry<'a, V> {
-    pub fn key(&self) -> &str;
-    pub fn get(&self) -> &V;
-    pub fn get_mut(&mut self) -> &mut V;
-    pub fn into_mut(self) -> &'a mut V;
-    pub fn insert(&mut self, value: V) -> V;
-    pub fn remove(self) -> V;
-}
-impl<'a, V> SvmVacantEntry<'a, V> {
-    pub fn key(&self) -> &str;
-    pub fn insert(self, value: V) -> &'a mut V;
-}
-
-impl<'a, V> Iterator for SvmIter<'a, V> { type Item = (&'a str, &'a V); }
-impl<'a, V> Iterator for SvmKeys<'a, V> { type Item = &'a str; }
-impl<'a, V> Iterator for SvmValues<'a, V> { type Item = &'a V; }
-impl<'a, V> Iterator for SvmValuesMut<'a, V> { type Item = &'a mut V; }
-
-fn hash_name(name: &str) -> u64;                        // DefaultHasher::new()，无随机种子
-fn probe_start(hash: u64, bucket_capacity: u64) -> u64; // hash & (bucket_capacity - 1)
-fn name_at<'a>(heap: &SvmRegionHeap, arena: &'a [u8], offset: u64, length: u64) -> &'a str;
-```
-
-与 `SvmRegionHeap` 相同的借用形状：descriptor 只存 offset，自己拿不到字节，因此每个
-方法都传入当前映射视图——只读方法借 `&SvmRegionHeap`，需要改字节的方法借
-`&mut SvmRegionHeap`。`SvmKeys` 要按槽类型迭代，所以名字里带 `V`（`SvmKeys<'a, V>`）。
-
-与 `HashMap` 一致的语义：
-
-- `insert` 命中已有键 → 替换值、返回旧值、`len` 不变；未命中 → 新增、返回 `None`。
-- `get`/`get_mut`/`contains_key`/`get_key_value` 只按键内容（长度 + 字节）匹配；
-  `len` = `occupied`；`clear` 后 `len == 0`，桶数组不释放。
-- 探测：线性探测，遇 `Empty` 终止；`Vacant` 不终止查找，插入优先复用探测路径上第一个
-  `Vacant`（该路径先遇到 `Empty` 时用 `Empty`）。
-- 扩容与收缩都以**元素**口径为准：`capacity() = bucket_capacity * 3 / 4`；当
-  `occupied + vacant` 达到该上限时先原地整理（rehash 到同一桶数、丢弃墓碑），只有活跃
-  元素本身到达上限才把桶数组翻倍。这样 `capacity()` 不会因为曾经存过更多元素而虚高。
-- 收缩：`occupied > 32` 且 `occupied < bucket_capacity / 4` 时缩到仍能容纳当前元素的最小
-  桶数（对齐 VPP `hash.c:499-509`、`:628-637`）；`shrink_to_fit` 用同一目标，最小 64 桶。
-- 迭代顺序不保证，与 std 相同。
-- 空间不足走 `SvmRegionHeapViolation` 终止（V19）；容量参数导致的 `usize`/`u64` 溢出、
-  槽状态字节或桶数组对齐异常都是本地 bug，panic 并带上槽位、请求容量或对齐事实。
-
-与 `HashMap` 的差异，全部有明确原因：
-
-| 差异 | 原因 |
-| --- | --- |
-| 每个方法多 heap 与 arena 两个参数 | 表在共享区，descriptor 自己不能持有本进程 allocator 句柄或映射指针 |
-| 哈希用固定种子 `DefaultHasher`，不用 `RandomState` | `RandomState` 每进程随机种子，会让另一进程探到不同桶（`DefaultHasher::new()` 同一二进制内一致） |
-| 键是 `&str`，表在 arena 内持有键字节 | `String`/`Box<str>` 在共享区不可移植；键由表持有后，`remove`/`clear` 能一次性释放，不会悬空（VPP 用 `hash_unset_mem_free` 达到同样所有权，`hash.h:256-270`） |
-| 没有 `remove_entry`、`drain` | std 语义要求把 `K` 交还调用方；键字节在 arena 内，交出借用后立刻释放即悬空。用 `keys()` + `remove()` 等价替代 |
-| 没有 `retain`、`and_modify`、`or_insert_with`、`or_default` | AGENTS 禁止闭包中介访问既有状态；需要值时用 `entry` + `or_insert` |
-| 没有 `Extend`、`FromIterator`、`Index`、`Clone`、`Debug`、`PartialEq` | 都需要 arena 参数或对共享表无意义；`Clone` 复制跨进程表本身是错的 |
-| 表不实现 `Drop` | 表住在共享区，任何一个进程的析构都会破坏其他进程；释放必须显式 `clear(heap, arena)`。`SvmVacantEntry` 是进程内句柄，未插入时不持有任何分配（键块只在 `insert` 时申请），因此也不需要 `Drop` |
-| 值类型约束 `Copy + IntoBytes + FromBytes + Immutable + KnownLayout` | 与 A5 的 `SvmQueue` 同一套共享内容约束，另加 `Copy`：`insert`/`remove` 要把值按值交还调用方 |
-
-### 12.6 子区与名字注册表
-
-```rust
-#[repr(C, align(64))]
-pub struct SvmRegionMain {
-    subregions: SvmHashMap<u64>,      // 名字 → 子区序号
-    next_subregion_id: AtomicU64,     // 单调、不复用；0 保留表示无效
-}
-
-impl SvmRegionMain {
-    pub fn new() -> Self;
-    pub fn find_or_create(&mut self, heap: &mut SvmRegionHeap, arena: &mut [u8], name: &str)
-        -> Result<(u64, bool), SvmRegionError>;
-    pub fn subregion_id(&self, heap: &SvmRegionHeap, arena: &[u8], name: &str) -> Option<u64>;
-    pub fn remove(&mut self, heap: &mut SvmRegionHeap, arena: &mut [u8], name: &str) -> Option<u64>;
-    pub fn subregion_count(&self) -> u64;
-    pub fn subregion_names<'a>(&'a self, heap: &'a SvmRegionHeap, arena: &'a [u8]) -> SvmKeys<'a, u64>;
-    pub fn next_subregion_id(&self) -> u64;
-}
-```
-
-- 与 §12.5 的 `SvmHashMap` 相同，每个方法接收 heap 与 arena 两个参数：descriptor 在共享
-  区内，拿不到本进程的映射视图。`find_or_create` 返回 `Result` 是为了让非法名字在写入
-  共享状态前退出；`remove`/`subregion_id` 不改字节，只借 arena。
-- 位置：`SvmRegionMain` 在 root region 的 metadata heap，`SvmRegionHeader::data_base_offset`
-  指向它（对齐 `svm.c:812`）。
-- VPP 的 `svm_subregion_t` 池消失：它只承担 (a) 持有名字字符串、(b) 作为 hash value、
-  (c) 枚举名字（`svmtool.c:64-65`、`:318-319`）。`SvmHashMap` 自己持有键字节、值是
-  子区序号、`subregion_names()` 提供枚举，三件事都已覆盖。因此先前草稿中的
-  `SvmSubregion`、`SvmSubregionTable`、`SvmRegionNameHash`、`RegionName` 都**不引入**。
-- 值 = 单调不复用的子区序号。VPP 用 pool 下标，`pool_put` 后可被 `pool_get` 复用
-  （`svm.c:1103-1105`）；不复用可保证 stale 句柄不会静默指向另一个子区。
-- `find_or_create` 是唯一会改共享状态的入口，且只有一次插入；调用方（daemon 侧注册
-  owner）创建/attach 子区 `SvmSegment` 失败时必须调用 `remove` 回滚名字。顺序契约：
-  先登记名字再让段对客户端可见，撤销时先把段从客户端可见集合移除再删名字，任何时刻
-  都不得出现"名字可见但没有段"的持续状态。
-- 子区与 root 的段关系、fd 传递（socket + `SCM_RIGHTS`）由 SDK/daemon 的注册 owner 执行；
-  `svm_region` 只提供上面的原子单步和子区自己的 `SvmRegion` 视图。
-
-### 12.7 `SvmRegion`、锁与成员
-
-```rust
-pub struct SvmRegionConfig {
-    pub size: u64,
-    pub flags: u64,
-}
-
-pub struct SvmRegion {
-    segment: Arc<SvmSegment>,
-    header_offset: u64,
-    mutex: BorrowedMutex<'static, Robust>,
-}
-
-#[repr(u32)]
-pub enum SvmRegionState { Uninitialized = 0, Ready = 1, Failed = 2 }
-
-impl SvmRegion {
-    pub fn layout(config: &SvmRegionConfig) -> Result<Layout, SvmRegionError>;
-    pub fn create(segment: Arc<SvmSegment>, config: &SvmRegionConfig) -> Result<Self, SvmRegionError>;
-    pub fn attach(segment: Arc<SvmSegment>) -> Result<Self, SvmRegionError>;
-
-    pub fn segment(&self) -> &Arc<SvmSegment>;
-    pub fn header_offset(&self) -> u64;
-    pub fn virtual_size(&self) -> Result<u64, SvmRegionError>;
-    pub fn flags(&self) -> Result<u64, SvmRegionError>;
-    pub fn state(&self) -> Result<SvmRegionState, SvmRegionError>;
-    pub fn user_ctx_offset(&self) -> Result<u64, SvmRegionError>;
-    pub fn publish_user_ctx(&self, offset: u64) -> Result<(), SvmRegionError>;
-
-    pub fn allocate(&self, layout: Layout) -> Result<u64, SvmRegionError>;
-    pub fn reallocate(&self, offset: u64, layout: Layout, new_size: usize) -> Result<u64, SvmRegionError>;
-    pub fn deallocate(&self, offset: u64, layout: Layout) -> Result<(), SvmRegionError>;
-    pub fn free_bytes(&self) -> Result<u64, SvmRegionError>;
-    pub fn used_bytes(&self) -> Result<u64, SvmRegionError>;
-
-    pub fn publish_root(&self, offset: u64) -> Result<(), SvmRegionError>;
-    pub fn root(&self) -> Result<Option<u64>, SvmRegionError>;
-    pub fn main(&self) -> Result<&SvmRegionMain, SvmRegionError>;   // 仅 SUBDIVIDED
-
-    pub fn find_or_create_subregion(&self, name: &str) -> Result<(u64, bool), SvmRegionError>;
-    pub fn subregion_id(&self, name: &str) -> Result<Option<u64>, SvmRegionError>;
-    pub fn remove_subregion(&self, name: &str) -> Result<Option<u64>, SvmRegionError>;
-    pub fn subregion_count(&self) -> Result<u64, SvmRegionError>;
-    pub fn subregion_names<'region>(&'region self)
-        -> Result<SvmKeys<'region, u64>, SvmRegionError>;
-
-    pub fn join(&self) -> Result<RegionMembership<'_>, SvmRegionError>;
-    pub fn member_count(&self) -> Result<u64, SvmRegionError>;
-    pub fn client_pids(&self) -> Result<&[i32], SvmRegionError>;
-    pub fn remove_exited_members(&self) -> Result<usize, SvmRegionError>;
-
-    pub fn lock(&self, tag: RegionLockTag) -> Result<RegionLock<'_>, SvmRegionError>;
-}
-
-pub struct RegionLock<'a> { /* posix-sync robust guard */ }
-pub struct RegionMembership<'a> { /* RAII：Drop 时从 client_pids 移除本 pid */ }
-```
-
-- robust guard 返回 `Indeterminate` 时把 `state` 置 `Failed` 并返回
-  `SvmRegionError::OwnerDied`，**不重建 mutex**（V12）；`RegionLock` 的 `Drop` 先清
-  `mutex_owner_pid`/`mutex_owner_tag` 再释放 mutex。
-- `RegionLockTag` 是枚举（`RegionLockTag::{Init, Attach, Subregion, Unmap, Scan,
-  Membership, Allocate}`），写入 `mutex_owner_tag` 供诊断。VPP 的等价物是文件内
-  `static region_lock (rp, tag)`（`svm.c:89-105`），tag 取值 1/2/4/5/7 出现在
-  `svm.c:471`、`:733`、`:896`、`:1034`、`:1167`；`Membership`/`Allocate` 是 Hammer
-  新增，VPP 没有对应 tag。
-- `lock()` 的可见性是本设计相对 §12.7 初稿的唯一 API 偏离：初稿写作私有
-  `fn lock(&self)`，落地时是 `pub fn lock(&self, tag: RegionLockTag)`，因为
-  owner-death 契约只有让第二个进程真正持锁并死亡才能验证，而本仓库的测试约定是
-  集成测试（`crates/hammer-infra/tests/`），无法调用私有方法。区域使用者此后也可以
-  借它把多步操作放进同一个 region 临界区。此项待用户确认：若不接受，改为私有入口，
-  owner-death 证据只能退化为直接篡改 `state`/`mutex_owner_pid` 的失败路径测试。
-- 锁序：root → subregion，永不反向（`svm.c:37-39`、`:1280-1295`）。跨进程死锁检查依赖
-  这个全局顺序，debug 构建断言反向获取。
-- 成员回收只用 pid 探测（`kill(pid, 0)`），不记录进程启动时间，与 V17 相同；不引入 pid
-  复用防护的额外字段。
-- `SvmRegion` 不读 `SvmSegment::ready`、不碰 fd、不调用 `munmap`；这些属于 `SvmSegment`。
-  `SvmSegment` 需要新增 `payload_offset()`/`payload_len()`（A1 的补充，见 12.12）。
-
-### 12.8 错误契约
-
-`SvmRegionError`（`hammer-infra`，owner 是 region）：
-
-| 变体 | 事实字段 | 可行动调用者 | 恢复与原子性 |
-| --- | --- | --- | --- |
-| `InvalidMagic` | `found: u64` | attach | 拒绝 attach，关闭本次 fd，不发布任何状态 |
-| `UnsupportedVersion` | `found: u64`, `expected: u64` | attach | 同上；不尝试降级 |
-| `NotReady` | `state: SvmRegionState` | attach/访问 | 等待并重试，或按调用方策略放弃 |
-| `RegionFailed` | `mutex_owner_pid: i32` | 任何访问 | 该 region 不再可用；调用方重建新 region，不复用本映射 |
-| `OwnerDied` | `pid: i32` | 持锁方 | 明确区分于"锁忙"；不允许假装成功 |
-| `InvalidBounds` | `offset: u64`, `length: u64`, `size: u64` | 任何 offset 使用方 | 拒绝操作，不部分写入 |
-| `Misaligned` | `offset: u64`, `alignment: usize` | 任何 offset 使用方 | 同上 |
-| `LayoutMismatch` | `declared: u64`, `expected: u64` | attach | 拒绝 attach（版本相同但布局不同） |
-| `InvalidRegionName` | `length: u64` | 名字表调用方 | 拒绝插入；空名/超长名不进入共享状态 |
-| `InvalidRoot` | `offset: u64` | 任何 root 使用方 | 拒绝；不把非法 offset 当成"没有 root" |
-| `MemberProbeUnavailable` | `pid: i32`, `source` | 成员回收方 | 保留条目，稍后重试；不得当成成员已退出 |
-| `UnsupportedOperation` | `operation: RegionOperation` | 调用方 | 例如对 `SUBDIVIDED` region 请求 data heap |
-| `Lock` | `source` | 持锁方 | 原始 errno 保留为 `#[source]`，不转成字符串 |
-| `Segment` | `source: SvmSegmentError` | 创建/attach | 语义未改变，用 `#[from]`；其余显式构造 |
-
-不提供万能变体（`Internal`/`Other`/`Message`/`Subsystem`）。堆耗尽与堆损坏不进这个
-枚举，按 12.4 终止。
-
-### 12.9 层隔离契约
-
-| 层 | 允许 | 禁止 | 验证 |
-| --- | --- | --- | --- |
-| `SsvmPrivate` | libc backing/mapping、fd、backend、ready、payload offset 定位 | allocator、region 语义、名字 | infra 独立编译；不同地址 attach |
-| `SvmRegionHeap` | 只操作自己 `[heap_start, heap_end)` 的 offset；失败终止 | 读 segment ready、碰 fd、访问 heap 外 | 子进程断言终止；块合并统计 |
-| `SvmHashMap` | 通过传入的 `&SvmRegionHeap` 分配/释放/借用；键字节由自己持有 | 持有进程 allocator 句柄、内部锁、`Drop` | 跨进程读写同一张表 |
-| `SvmRegion` | heap、成员、root、锁 | fd/munmap/segment ready、runtime/service/plugin 状态 | infra 独立编译；并发与 owner-death 测试 |
-| `SvmRegionMain` | root region 的名字表与子区序号 | 子区段创建、fd 传递、SDK 策略 | 多进程 find_or_create/remove |
-
-不新增 `SvmHashMap` 之外的通用泛型容器；`Bihash`（指针槽、`Arc<Heap>`、hazard slot、
-无字节键，`bihash/key.rs:11-61`）与 `Pool`/`Bitmap`/`RbTree`（`Vec` 支撑）都不能放进
-共享区，这一点由本节的布局约束保证，不再另立“共享容器 trait”。
-
-### 12.10 删除账本
-
-| 现状 | 处理 | 证明 |
-| --- | --- | --- |
-| `svm/region.rs` 的 `SvmRegionInner`（Talc + `RawSpinlock`）、`SvmRegionConfig::data_offset` | 删除，替换为 12.3/12.7 的 header + offset heap；旧 Talc/mmap 实现暂存为 `segment.rs` 的私有 `SegmentMapping`，只服务仍用旧 `Segment`/`Heap` 的调用方 | `svm/region.rs` 不再有 talc/fd/bump 符号；偏移分配与跨进程可见性测试通过；`Segment`/`Heap` 迁移后删除该私有类型 |
-| `svm/region.rs` 的 bump `next_offset`/`free()`（`free` 不回收）、attach 侧 `alloc_layout` panic | 删除，由 `SvmRegionHeap` 承担分配与回收 | 释放后可复用；双释放终止 |
-| `svm/region.rs` 自带 `memfd_create`/`mmap` 路径 | 删除，全部经 `SvmSegment` | `SvmRegion` 不再直接持有 fd 或映射；残余路径只存在于过渡的 `SegmentMapping` |
-| `svm/region.rs` 的 `RegionMetadata`（magic/version/ready/next_offset/end_offset/root_offset/members） | 删除，字段按 12.2 映射到 `SvmRegionHeader` | 字段映射表逐项核对 |
-| `heap.rs:49-52` 的 `HeapError::AttachedSvmRegion` 拒绝路径 | 保留到 `Segment` 删除完成；attached region 不再回到 Main Heap | 迁移后删除该变体 |
-| `segment.rs::Segment` 旧包装 | 只登记删除，本轮不动 | 迁移清单 |
-| `SvmRegionMain` 的 `root_path`/`uid`/`gid`、`bitmap`/`bitmap_size`、`filenames`/`backing_file`/`backing_mmap_size`、`SVM_FLAGS_FILE`/`NEED_DATA_INIT`/`OVERLAY_*` | 不移植 | 12.2 的删除说明 |
-
-### 12.11 验证矩阵
-
-| 行为 | 方式 | 通过条件 |
-| --- | --- | --- |
-| 跨进程 attach（不同 VA，已实现） | 独立 exec 子进程用清掉 `FD_CLOEXEC` 的同一 memfd attach（`region_is_reachable_from_another_process`） | 两进程映射地址不同；version/magic/flags/size 校验通过；共享位置的 offset 在两进程都指向同一逻辑对象（子进程写的字节在父进程同一 offset 读到） |
-| heap 模块（已实现，`crates/hammer-infra/tests/svm_region_heap.rs`） | 对齐与清零、块头计费、释放后同 layout 复用、双向相邻合并、500 块占满再逐块释放、grow 拷贝/原地 shrink、尾块不足最小块时不切分、0 字节请求、`holds` 拒绝内部与越界与更强对齐、未初始化查询、3 个种子 × 2000 步混合 allocate/reallocate/deallocate 序列 | 每一步 `free_bytes + used_bytes == heap_end - heap_start`；活跃块互不重叠且 `holds` 成立；序列结束后整堆可被一个块重新分配 |
-| region 布局与 heap 范围（已实现，`crates/hammer-infra/tests/svm_region.rs`） | `create`/`attach` 后核对 header、metadata heap 与 data heap 的 `heap_start`/`heap_end`/`free+used`；`layout()` 的最小 payload；`allocate`/`reallocate`/`deallocate` 的 offset 在同一 payload 视图下往返 | metadata heap = `[header_end, payload_len)`（subdivided）或 `[header_end, +128K)`；data heap = `[data_base_offset, payload_len)`；所有 offset 都是 payload 相对，`free + used == heap_end - heap_start` |
-| 名字表（已实现，`crates/hammer-infra/tests/svm_hash_map.rs`） | 与 std `HashMap` 逐步对照 4000 步随机 insert/remove/get/contains；`entry().or_insert`、occupied/vacant 句柄、`keys`/`values`/`values_mut`/`get_key_value`、空键与 4096 字节键、u128 与 `repr(C)` 结构值、`clear`、`with_capacity`/`reserve`/`shrink_to_fit`（3/4 扩容、1/4 收缩）、墓碑复用不扩容、200 轮 insert+remove 不泄漏键块 | 每步 `len`/返回值/`contains_key` 与 std 一致；收尾迭代集合与 std 完全一致；`len <= capacity()`；`used_bytes` 除桶数组外只随活跃键块变化 |
-| 名字表跨进程可见（已实现） | 进程 A `find_or_create`，exec 子进程查同一名字 | 子进程得到相同子区序号 1；固定种子 hasher 使两进程对同一名字落在同一桶（由与 std 对照的用例保证） |
-| heap 违规（已实现，同文件子进程用例） | 双释放、耗尽、未对齐释放、非起始 offset 释放、段外读取、越过块的读取、非法范围初始化、0 长度 `reallocate`、超大 `reallocate`、被写坏的块头 | 子进程 abort（`status.code() == None`），stderr 携带对应变体的结构化事实 |
-| 子区（已实现，`crates/hammer-infra/tests/svm_region.rs`） | `find_or_create` 幂等；`remove` 后名字不可见；序号不复用；空名与 257 字节名被拒绝（上限 256 字节）；200 轮 create/remove 复用元数据 | 每次调用返回的 id/创建标志与预期一致；`remove` 后 `subregion_id` 为 `None`；`used_bytes` 回到基线 |
-| 成员（已实现，同文件） | 本进程 join/离开；子进程 join 后离开；`remove_exited_members` 回收不存在的 pid | 条目数与真实成员一致；存活 pid 不被回收；回收只发生在探测报 Exited 之后。探测无法回答（`MemberProbeUnavailable`）时不修改表，该分支未直接测试 |
-| owner death（已实现，同文件子进程用例） | 持锁子进程 `_exit`（不释放锁）后父进程访问 | 返回 `OwnerDied{pid}` 并把 region 置 `Failed`；之后的所有访问返回 `RegionFailed`，attach 也被拒绝；不重建 mutex、不假装成功 |
-| 锁序（未实现，待 root/subregion 双层持有者） | root/subregion 双层获取；debug 断言反向获取 | 无死锁；反向顺序被断言捕获。region 自身是单层锁，该断言属于同时持有两个 region 的调用方 |
-| 版本/布局（已实现，同文件） | 篡改 `version`(0/未知)/magic/size/flags/`data_base_offset`/`metadata_heap` 范围后 attach | 分别返回 `NotReady`/`UnsupportedVersion`/`InvalidMagic`/`LayoutMismatch`/`InvalidBounds` |
-
-### 12.12 批准请求与未决项
-
-- A11 `SvmRegionHeap`、A12 `SvmHashMap<V>` 及其句柄类型、A13 `SvmRegionMain`/`SvmRegion`/
-  `SvmRegionConfig`/`SvmRegionHeader`/`SvmRegionState`/`SvmRegionError`/`RegionLock`/
-  `RegionMembership` 的具体化，取代 A2 的粗粒度描述。批准必须覆盖本节的行为契约。
-- A1 补充：`SvmSegment` 新增 `payload_offset()`/`payload_len()`；`SvmSegment` 仍不携带
-  allocator（V18）。
-- `SvmHashMap` 的已撤回提案：不在 `hammer-infra` 新增 `hash_bytes`，改用固定种子
-  `DefaultHasher`；若后续要求仓库自有哈希函数，它需要单独批准并补进本节。
-- 已完成：A11 `SvmRegionHeap`（`crates/hammer-infra/src/svm/region_heap.rs`、
-  `crates/hammer-infra/tests/svm_region_heap.rs`）、A12 `SvmHashMap<V>`
-  （`crates/hammer-infra/src/svm/hash_map.rs`、`crates/hammer-infra/tests/svm_hash_map.rs`）
-  与 A13 region owner（`crates/hammer-infra/src/svm/region.rs`、
-  `crates/hammer-infra/tests/svm_region.rs`）的具体化与测试。A1 补充的
-  `SvmSegment::payload_offset()`/`payload_len()` 与 `SvmRegionHeap::heap_start()`/
-  `heap_end()` 也在本轮加入。
-- 未决：`SvmRegionHeap` 是否需要 `peak` 之外的压力统计（例如最大连续空闲块）、
-  以及子区序号的持久化语义（重启后是否必须保持）。这两项不影响本节的类型与
-  方法形状，实施前定稿即可。
-
-## 13. `ssvm` 重新设计：逐字对齐 VPP 映射层
-
-`src/svm` 的映射 owner 在 VPP 叫 `ssvm`，不叫 `svm_segment`。全仓库搜 `svm_segment`
-命中 21 处，全部落在 `ssvm_segment_type_t` 上（`ssvm.h:38-43`、`ssvm.c:429`、
-`fifo_segment.h:75`、`segment_manager.h:30`），不存在 `svm_segment_t`。Hammer 现有
-`crates/hammer-infra/src/svm/segment.rs` 的 `SvmSegment` 就是这一层，本节把它按
-`ssvm.h` 逐字对齐，并列出必须换形的字段。第 1 节的事实类别（`H`/`V`/`R`/`D`）
-继续适用；13.5/13.6 的改名与删除已实施，13.7 的覆盖情况见该节末。
-
-### 13.1 证据与决策
-
-| ID | VPP 来源 | 已核实事实 | 本节决策 |
-| --- | --- | --- | --- |
-| V22 | `ssvm.h:38-43` | `ssvm_segment_type_t` = `SSVM_SEGMENT_SHM`/`MEMFD`/`PRIVATE`，另有 `SSVM_N_SEGMENT_TYPES` | `SsvmSegmentBackend::{Shm,Memfd,Private}`，逐字对齐 |
-| V23 | `ssvm.h:46-70` | `ssvm_shared_header_t` 字段全集：`lock/owner_pid/recursion_count/tag/heap/ssvm_va/ssvm_size/server_pid/client_pid/name/opaque[7]/ready/type` | 字段映射见 13.2 |
-| V24 | `ssvm.h:72-87` | `ssvm_private_t` 字段全集；`numa` 标注 UNUSED；`fd` 与 `attach_timeout` 是 union | 字段映射见 13.3 |
-| V25 | `ssvm.h:88-131` | `ssvm_lock`/`ssvm_unlock`/`ssvm_lock_non_recursive`/`ssvm_unlock_non_recursive` 四个内联函数；全仓库搜 `ssvm_lock|ssvm_unlock` 命中 4 处，全部是这四个定义本身，零调用者 | 不移植 `lock/owner_pid/recursion_count/tag`：VPP 里没有使用者 |
-| V26 | `ssvm.c:100`、`:265`、`:389`；`mem_dlmalloc.c:79-83` | 段内堆用 `clib_mem_create_heap(..., 1 /*locked*/, ...)` 建立，`is_locked` 传入 `create_mspace_with_base(base, size, is_locked)`，即 dlmalloc mspace 自带锁 | ssvm 层不承担堆锁；Hammer 侧对应物是 `RegionLock`（§12.7），与 V25 的死锁无关 |
-| V27 | `ssvm.c:111-180` | shm client 轮询 `shm_open`+`fstat` 等 size>0，先 `mmap` 一页读 `ssvm_va`/`ssvm_size`，`munmap` 后按该 VA 重映射，最后写 `client_pid` | client 不再由调用方传 size；见 13.4 |
-| V28 | `ssvm.c:288-341` | memfd client 同样两步映射，但不等待 `ready` | memfd attach 不阻塞；`ready` 由应用层发布 |
-| V29 | `ssvm.c:106`、`:276`、`:153` | server 不设置 `ready`（注释 “The application has to set sh->ready”）；只有 shm client 在 `:153` 等 `ready` | `publish_ready`/`is_ready`/`wait_ready` 三个操作分开 |
-| V30 | `ssvm.c:182-207`、`:343-356` | shm 在 delete 时 unlink backing file；memfd delete 只 unmap + close | 现在 create 后立刻 `shm_unlink`（`segment.rs:288`）是错的；shm 名字在 attach 期间必须可见 |
-| V31 | `ssvm.c:441-455` | `ssvm_delete` 按 `sh->type` 分发；`ssvm_type()`/`ssvm_name()` 都从 shared header 读 | backend/name 必须进 header；现在 attach 后硬编码 `Memfd`（`segment.rs:139`）是错的 |
-| V32 | `fifo_segment.c:322-323` | fifo_segment 主动把 `sh->ssvm_va = 0`，注释 “Allow random offsets” | `ssvm_va` 只作可选 `MAP_FIXED` 协商，0 表示允许任意地址 |
-| V33 | `svm.c:1215-1229` | 多 client 由 region 的 `client_pids` 跟踪；`ssvm_shared_header_t.client_pid` 只记最后一个 attacher | header 保留 `server_pid`/`client_pid` 作诊断；成员权威在 region |
-| V34 | `ssvm.c:414-419` | `ssvm_client_init_private` 是 “BUG: this should not be called!” | 不移植 |
-
-### 13.2 `ssvm_shared_header_t` 字段映射
-
-```rust
-pub const SSVM_NAME_MAX: usize = 64;
-
-#[repr(C, align(64))]
-pub struct SsvmSharedHeader {
-    magic: u64,                  // Hammer 自有校验；VPP 无对应字段
-    version: u32,                // 同上
-    segment_type: u8,
-    padding: [u8; 3],
-    ssvm_size: u64,
-    ssvm_va: u64,
-    server_pid: u32,
-    client_pid: u32,
-    name_len: u32,
-    ready: AtomicU32,
-    name: [u8; SSVM_NAME_MAX],
-}
-```
-
-| VPP `ssvm_shared_header_t` | Hammer `SsvmSharedHeader` | 说明 |
-| --- | --- | --- |
-| `lock`/`owner_pid`/`recursion_count`/`tag` | — | 不移植；V25 证实零调用者 |
-| `heap` | — | 不移植；offset 化 `SvmRegionHeap` 取代段内 clib heap（§12.3/§12.4），shared 区不得存指针 |
-| `ssvm_va` | `ssvm_va: u64` | 固定宽度地址，只作 `MAP_FIXED` 协商与诊断，不解引用（V32）。Hammer 默认写 0（任意地址），只有 `SsvmConfig::requested_va != 0` 时才记录并要求 attacher 固定映射 |
-| — | `magic`/`version` | Hammer 自有的 header 校验；VPP 只靠 `ready`。attach 校验失败返回 `InvalidMagic`/`UnsupportedVersion` |
-| `ssvm_size` | `ssvm_size: u64` | 实际 mmap 大小 |
-| `server_pid` | `server_pid: u32` | 创建者 pid |
-| `client_pid` | `client_pid: u32` | 最后一个 attacher pid；成员权威在 region（V33） |
-| `name` | `name: [u8; SSVM_NAME_MAX]` + `name_len` | VPP 是堆内 vec；改内联定长，建堆之前就要有名字且不使用指针 |
-| `opaque[SSVM_N_OPAQUE]` | — | 不移植；typed offset 由 `SvmRegion::publish_root`/`root` 承担（§12.3） |
-| `ready` | `ready: AtomicU32` | 应用层 release 写 |
-| `type` | `segment_type: u8` | `SsvmSegmentBackend` |
-
-### 13.3 `ssvm_private_t` 字段映射
-
-```rust
-#[repr(C)]
-pub union SsvmBackendParameter {
-    pub fd: RawFd,                // memfd segments
-    pub attach_timeout: Duration, // shm segments attach timeout
-}
-
-pub struct SsvmPrivate {
-    base: *mut u8,
-    ssvm_size: usize,
-    backend: SsvmSegmentBackend,
-    is_server: bool,
-    requested_va: u64,
-    my_pid: u32,
-    name: CString,
-    numa: u8,
-    huge_page: bool,
-    backing: SsvmBackendParameter,
-}
-```
-
-字段私有：`SsvmPrivate` 只通过 13.4 的访问器暴露 `ssvm_va`/`ssvm_size`/`server_pid`/
-`client_pid`/`segment_type`/`name`/`is_server`/`numa`/`huge_page`/`fd`/`base`。
-
-| VPP `ssvm_private_t` | Hammer `SsvmPrivate` | 说明 |
-| --- | --- | --- |
-| `sh` | `base: *mut u8` + `shared_header()` | 不单独缓存第二处 header 指针；header 就在映射 offset 0，由 `base` 派生。进程私有对象内允许指针，shared 区仍禁止 |
-| `ssvm_size` | `ssvm_size: usize` | |
-| `requested_va` | `requested_va: u64` | |
-| `my_pid` | `my_pid: u32` | |
-| `name` | `name: CString` | 创建/attach 时的名字副本；共享权威在 header |
-| `numa` | `numa: u8` | VPP 标注 UNUSED，逐字保留字段 |
-| `is_server` | `is_server: bool` | |
-| `huge_page` | `huge_page: bool` | |
-| `fd` \| `attach_timeout`（匿名 union） | `backing: SsvmBackendParameter`（Rust `union`，字段名保持 `fd`/`attach_timeout`） | 逐字用 union，不拆成并列字段。不变量：`segment_type == Memfd` 时 `fd` 有效，`Shm` 时 `attach_timeout` 有效，`Private` 时两者都无效 |
-
-VPP 的 union 一律用 Rust `union` 逐字对应，不拆字段：本节是 `fd`|`attach_timeout`；
-FIFO 设计里的 `vpp_sh`（两个 `u32` 与 `u64` 的 union）与
-`ct_fifo`|`seg_ctx_index`+`ct_seg_index` 同规则。字段读取的位置由所属 backend/角色决定，
-只有该 backend 成立的读取才执行 `unsafe` 访问；写错分支是逻辑错误，不是可恢复错误。
-
-### 13.4 类型与方法
-
-```rust
-// crates/hammer-infra/src/svm/ssvm.rs
-impl SsvmPrivate {
-    // ssvm_server_init / _shm / _memfd / _private
-    pub fn server_init(config: &SsvmConfig) -> Result<Self, SsvmError>;
-    pub fn server_init_shm(config: &SsvmConfig) -> Result<Self, SsvmError>;
-    pub fn server_init_memfd(config: &SsvmConfig) -> Result<Self, SsvmError>;
-    pub fn server_init_private(config: &SsvmConfig) -> Result<Self, SsvmError>;
-
-    // ssvm_client_init / _shm / _memfd；_private 不移植（V34）
-    pub fn client_init(config: &SsvmConfig, fd: Option<RawFd>) -> Result<Self, SsvmError>;
-    pub fn client_init_shm(name: &str, attach_timeout: Duration) -> Result<Self, SsvmError>;
-    pub fn client_init_memfd(fd: RawFd) -> Result<Self, SsvmError>;
-
-    // ssvm_delete
-    pub fn delete(self);
-
-    // ssvm_type / ssvm_name：从 shared_header 读
-    pub fn segment_type(&self) -> SsvmSegmentBackend;
-    pub fn name(&self) -> &str;
-
-    pub fn base(&self) -> *mut u8;
-    pub fn ssvm_va(&self) -> u64;
-    pub fn ssvm_size(&self) -> usize;
-    pub fn server_pid(&self) -> u32;
-    pub fn client_pid(&self) -> u32;
-    pub fn fd(&self) -> Option<RawFd>;
-    pub fn is_server(&self) -> bool;
-    pub fn requested_va(&self) -> u64;
-    pub fn numa(&self) -> u8;
-    pub fn huge_page(&self) -> bool;
-
-    // ready：由 region / fifo segment 初始化完后发布，ssvm 自己不设置（V29）
-    pub fn is_ready(&self) -> bool;
-    pub fn publish_ready(&self);
-    pub fn wait_ready(&self, timeout: Duration) -> Result<(), SsvmError>;
-
-    // payload 定位
-    pub fn payload_offset(&self) -> u64;
-    pub fn payload_len(&self) -> u64;
-    pub fn offset_ptr(&self, offset: u64, length: usize, alignment: usize)
-        -> Result<*mut u8, SsvmError>;
-}
-```
-
-```rust
-pub enum SsvmSegmentBackend { Shm, Memfd, Private }   // ssvm_segment_type_t
-
-pub struct SsvmConfig {                                // server 侧入参
-    pub backend: SsvmSegmentBackend,
-    pub name: String,
-    pub size: usize,
-    pub requested_va: u64,
-    pub huge_page: bool,
-    pub attach_timeout: Duration,                      // attacher 等待段与 ready 的上限
-}
-
-#[derive(Debug, thiserror::Error)]
-pub enum SsvmError {
-    #[error("segment name must be 1..{max} bytes and must not contain NUL")]
-    NoName { max: usize },
-    #[error("segment size is not set")]
-    NoSize,
-    #[error("segment size {requested} is too small for the segment header")]
-    SizeTooSmall { requested: usize },
-    #[error("segment backend is unavailable on this platform")]
-    BackendUnavailable,
-    #[error("segment attach needs a backing descriptor for this backend")]
-    MissingBackingDescriptor,
-    #[error("shared segment backend {value} is invalid")]
-    InvalidBackend { value: u8 },
-    #[error("segment system call failed during {operation}: {source}")]
-    Io { operation: &'static str, #[source] source: io::Error },
-    #[error("client did not map segment {name} within {seconds} s")]
-    ClientTimeout { name: String, seconds: u64 },
-    #[error("segment header magic is invalid")]
-    InvalidMagic,
-    #[error("segment header version {version} is unsupported")]
-    UnsupportedVersion { version: u32 },
-    #[error("segment header size {declared} does not match mapping size {mapped}")]
-    SizeMismatch { declared: u64, mapped: usize },
-    #[error("segment header is not ready")]
-    NotReady,
-    #[error("segment offset {offset} with length {length} is outside {size} bytes")]
-    OutOfBounds { offset: u64, length: usize, size: usize },
-    #[error("segment offset {offset} is not aligned to {alignment}")]
-    Misaligned { offset: u64, alignment: usize },
-}
-```
-
-### 13.5 命名与影响面
-
-| 现状 | 改为 | VPP 对应 |
-| --- | --- | --- |
-| `svm/segment.rs` | `svm/ssvm.rs` | `ssvm.c` |
-| `SvmSegment` | `SsvmPrivate` | `ssvm_private_t` |
-| `SegmentHeader` | `SsvmSharedHeader` | `ssvm_shared_header_t` |
-| `SegmentBackend` | `SsvmSegmentBackend` | `ssvm_segment_type_t` |
-| `SvmSegmentConfig` | `SsvmConfig` | `ssvm_private_t` 的调用方入参（VPP 无独立类型） |
-| `SvmSegmentError` | `SsvmError` | `foreach_ssvm_api_error` |
-| `SVM_SEGMENT_PAYLOAD_OFFSET` | `SSVM_PAYLOAD_OFFSET` | Hammer 自有概念，命名随层 |
-| `SvmRegion::segment()` | `SvmRegion::ssvm()` | `svm_region_t` 持有映射的访问器 |
-| `SvmQueue::segment()` | `SvmQueue::ssvm()` | 同上 |
-| `SvmFifoSegment::segment()` | `SvmFifoSegment::ssvm()` | 同上 |
-
-已改名的调用点：`svm/region.rs`、`svm/queue.rs`、`svm/msg_queue.rs`、
-`svm/fifo_segment.rs`、`tests/svm_region.rs`；`svm/segment.rs` 删除。`svm/fifo.rs`
-未改：它用的是 crate 根部的旧 `Segment`，属 §14 的 FIFO 重做范围。§2 目录范围表与
-本节的 `svm::ssvm` 目标归属、§12.9 层隔离表中的 `SsvmPrivate` 行都按本表改名，
-职责与禁止项不变。
-
-### 13.6 删除账本
-
-| 现状 | 处理 | 证明 |
-| --- | --- | --- |
-| `SegmentHeader` 的 `magic/version/size/ready` 布局 | 扩成 13.2 的 `SsvmSharedHeader`，不含锁/heap/opaque | 13.2 字段逐项核对 |
-| `SvmSegment::attach(fd, size)` 由调用方传 size | 删除该签名，改为 `client_init_memfd(fd)`，size/va 从 header 读（V27/V28） | 调用方不再可能传错 size；跨进程 attach 用例 |
-| `attach` 内 `validate_header` 要求 `ready` | 拆开：attach 只校验 magic/version/size/backend，ready 由 `wait_ready` 表达（V29） | region 初始化顺序不再被 attach 打死 |
-| `create_shared` 内立即 `shm_unlink` | 删除，改为 delete 时 unlink（V30） | 第二个进程能按名字 attach |
-| `attach` 内硬编码 `SegmentBackend::Memfd` | 删除，backend 从 header 读（V31） | attach 后 `segment_type()` 与创建者一致 |
-| `SvmSegmentError::NotReady` 由 attach 返回 | 保留变体，改由 `wait_ready` 返回 | shm 超时用例 |
-| `numa`/`huge_page` | 保留字段（V24 逐字对齐），运行时未使用 | 13.3 映射表 |
-
-本节 13.6 的删除项已随 `crates/hammer-infra/src/svm/ssvm.rs` 一起实施：
-`svm/segment.rs` 删除，旧 `create`/`memfd`/`shm`/`attach(fd, size)`/`close` 入口
-全部由 13.4 的 `server_init*`/`client_init*`/`delete` 取代。`client_init_memfd`
-保留“调用方仍持有自己的 fd”语义：映射内部复制一份并负责关闭。
-
-### 13.7 验证矩阵
-
-| 行为 | 方式 | 通过条件 |
-| --- | --- | --- |
-| memfd 跨进程 attach | 父进程 `server_init_memfd` 后经 `SCM_RIGHTS` 传 fd，exec 子进程 `client_init_memfd` | 子进程 `ssvm_size`/`ssvm_va`/`segment_type`/`name` 与父进程一致；两进程写同一 offset 互相可见 |
-| attach 不由调用方传 size | 子进程只凭 fd 得到 size | header 声明 size 与实际映射一致；篡改 size 时返回 `SizeMismatch` |
-| 任意 VA | 创建者与 attacher 映射地址不同 | 地址不同仍能按 offset 访问同一逻辑对象（沿用 §12.11 跨进程用例） |
-| `ssvm_va != 0` 的固定映射 | 创建者记录 VA 且 attacher 请求固定映射 | 两进程基址相同；该 VA 被占用时返回 `Io` 而不是静默换址 |
-| shm 名字可见 | `server_init_shm` 后、`delete` 前另一进程 `client_init_shm` | attach 成功；delete 后名字不可见 |
-| shm ready 等待 | server 未 `publish_ready` 时 `client_init_shm` | 超时返回 `ClientTimeout{name,seconds}`；`publish_ready` 后 attach 成功 |
-| memfd 不等 ready | server 未发布 ready 时 `client_init_memfd` | 立即返回且 `is_ready()` 为 false（V28） |
-| backend/name 从 header 读 | attach 后查 `segment_type()`/`name()` | 与创建者参数一致 |
-| ready 发布语义 | `SvmRegion`/`SvmFifoSegment` 初始化完成后才 `publish_ready` | attach 侧在 ready 之前不把 payload 当已初始化 |
-| 不移植残留锁 | 源码清单核对 | `ssvm.rs` 无 `lock`/`owner_pid`/`recursion_count`/`tag` 字段与自旋锁实现 |
-
-已实现并有测试覆盖（`crates/hammer-infra/tests/svm_ssvm.rs`）：header 身份与
-payload 边界、memfd attach 从 header 取 size/name/backend、跨映射写读同一 offset、
-`ready` 未发布时不阻塞 attach、`wait_ready` 超时、shm 按名字 attach 与 delete
-unlink、private 不可 attach、空名/超长名/0 size 的 typed 失败、offset 越界与
-未对齐拒绝。未覆盖：`requested_va != 0` 的固定映射用例（依赖地址占用情况，属
-未决 1 决定后再补）；13.7 的 shm “第二个进程”用例目前是同进程内两个映射。
-
-### 13.8 批准请求与未决项
-
-- A14（已完成）：`SsvmPrivate`/`SsvmSharedHeader`/`SsvmSegmentBackend`/`SsvmConfig`/
-  `SsvmError` 落在 `crates/hammer-infra/src/svm/ssvm.rs`，取代 A1 中 `SvmSegment`
-  的命名与 13.6 的旧签名；测试见 `crates/hammer-infra/tests/svm_ssvm.rs`。
-- A15（已完成）：`SsvmPrivate` 的方法集按 13.4；`server_init`/`client_init` 的通用
-  入口与 `_shm`/`_memfd`/`_private` 专用入口并存，与 VPP 一致。
-- 未决 1：`Shm` backend 是否保留。app/session 边界走 socket + `SCM_RIGHTS`
-  （VPP 的 fifo segment 也用 memfd）；VPP 的 shm 服务于 vlibmemory。保留则必须
-  满足 13.7 的两条 shm 用例。
-- 未决 2：`SSVM_NAME_MAX`（本节取 64）与 region 名字上限 256 是否统一为同一常量。
+不得用 source-text assertions代替compile/runtime proof。跨进程测试使用显式
+socket/pipe phase handshake，不用sleep猜执行顺序。本地不运行TUN/TCP lab；该部分
+仍由CI workflow负责。
+
+## 12. vlibapi / vlibmemory 边界
+
+未来 Binary API shared-memory path不能把三个协议混成一个：
+
+- `SvmQueue` 传输runtime-sized queue elements；VPP API queue元素虽常是pointer，
+  Hammer跨地址协议必须使用所属API owner验证过的identity；
+- Binary API allocation rings决定message size class和独立slot回收；它们不是
+  `SvmMsgQ` ordered data rings；
+- Session `SvmMsgQ` 传输Session event descriptors；event schema和调度留在Session；
+- API region allocation使用ADR-0012 fixed-VA PVT/Data Heap，不再承诺different-VA
+  region；
+- FIFO segment仍是offset payload，可different-VA attach；这个例外不改变API region
+  contract。
+
+完成 queue或MQ单元测试不足以声称vlibapi/vlibmemory已迁移。还需验证allocation
+ring的乱序释放、sender failure ownership、receiver cleanup、client detach、in-flight
+message和SCM_RIGHTS lifecycle。
+
+## 13. 撤销记录与审查结论
+
+2026-09-12 一致性审查撤销并删除了旧 ADR-0011 的以下规范：
+
+- shared region一律relative offset；
+- `SvmRegion` different-VA attach；
+- `SvmRegion` over `SsvmPrivate`；
+- `SvmRegionHeap`/`SvmHashMap`；
+- monotonic independent subregion identity；
+- `SvmRegion::ssvm()`；
+- 把 FIFO segment 的 `ssvm_va = 0` 推广成所有 SSVM 默认；
+- MQ caller-owned ring data和reservation/cancel lifecycle。
+
+Region replacement只在ADR-0012中定义：PVT heap、optional Data Heap、active heap、
+same-VA raw-pointer ABI、root bitmap和subregion pool index。
+
+审查结论：**Needs decisions / not yet aligned in code**。`SvmQueue` 和 `SvmMsgQ` 已有
+部分基础实现；generic SSVM、MQ storage contract、`Fifo` ownership/API、FIFO segment
+lifecycle/pressure/migration和legacy Session queue仍有明确缺口。实施前必须批准
+A1-A8，并在8.1节的两个freelist方案中选定一个可证明方案。完成第10节迁移并通过
+第11节验证前，不得标记SVM FIFO/FIFO segment或整体SVM为VPP-aligned。
