@@ -628,20 +628,20 @@ do not yet satisfy this model.
 
 **MemMain**:
 The process-global memory authority corresponding to VPP's
-`clib_mem_main_t`. It owns the process Main Heap, the heap inventory, the
-registered memory-thread inventory, and the existing fixed-capacity process
-arena state. Recoverable memory operations return owned typed errors directly;
+`clib_mem_main_t`. It owns the process Main Heap, the `heaps` list, the
+registered memory-thread `threads` list, and the fixed-capacity process
+allocation state. Recoverable memory operations return owned typed errors directly;
 MemMain does not retain VPP's mutable last-error pointer side channel.
 _Avoid_: AllocatorMain, GlobalMain, Buffer Main, SvmRegion
 
 **MemThreadMain**:
 The allocator-owned state of one OS thread, corresponding to VPP's
 `clib_mem_thread_main_t`. It owns that thread's active `MemHeap` selection and
-runtime thread index. It is allocator TLS because Rust `GlobalAlloc` and C
-malloc-family entry points receive no runtime owner argument; it is not a
+runtime thread index. It is allocator TLS because Rust `GlobalAlloc` receives
+no runtime owner argument; it is not a
 `DataPlaneMain` field or a generic per-thread container. Only runtime OS
-threads guaranteed to live until process exit enter MemMain's TLS-address
-inventory. A short-lived or external thread uses an unregistered TLS entry
+threads guaranteed to live until process exit link their TLS address into
+`MemMain.threads`. A short-lived or external thread uses an unregistered TLS entry
 whose active heap defaults to the Main Heap. The allocator selector is private
 and does not expose a safe `'static` reference.
 _Avoid_: AllocatorThreadMain, ThreadMain, DataPlaneMain field, worker-local heap
@@ -655,11 +655,11 @@ vtable, or public selection enum.
 _Avoid_: Heap, SvmRegionHeap, OffsetHeap, allocator trait
 
 **Active Heap**:
-The `MemHeap` selected by the current `MemThreadMain`. Ordinary Rust allocation
-and the interposed C malloc family allocate, reallocate, and free through this
-selection. A nested activation owns restoration of the previous heap and may
-not cross threads or `.await`.
-_Avoid_: default allocator hint, process-global selected heap, pointer-owner scan
+The `MemHeap` selected by the current `MemThreadMain`. When
+`alloc_free_intercept` is enabled, ordinary Rust allocation, reallocation, and
+free use this selection. A nested activation owns restoration of the previous
+heap and may not cross threads or `.await`.
+_Avoid_: default allocator hint, process-global selected heap, free时根据pointer改选heap
 
 **PVT Heap**:
 The locked `MemHeap` present in every SVM region at the second mapped page. It

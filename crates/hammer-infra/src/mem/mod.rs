@@ -1,7 +1,7 @@
 //! VPP-shaped process Main Heap and allocator-owned thread state.
 //!
 //! `MemMain` is the process allocation authority. Rust's global allocator uses
-//! `System` until the Main Heap is published, then routes through the current
+//! `System` until the Main Heap is published, then uses the current
 //! thread's active `MemHeap`. The selector is a const-initialized Rust
 //! `thread_local!` containing only the four fields required by ADR-0012.
 
@@ -20,6 +20,7 @@ use byte_unit::Byte;
 pub const DEFAULT_MAIN_HEAP_SIZE: usize = 1 << 30;
 
 const PAGE_SIZE_UNKNOWN: u8 = 0;
+const MIN_HEAP_ALIGNMENT: usize = 1 << 3;
 const RESERVED_THREAD_INDEX: u32 = u32::MAX;
 const MAP_HUGE_SHIFT: u32 = 26;
 const MFD_CLOEXEC: c_int = 0x0001;
@@ -41,6 +42,7 @@ unsafe extern "C" {
     fn mspace_memalign(mspace: Mspace, alignment: usize, size: usize) -> *mut c_void;
     fn mspace_realloc_in_place(mspace: Mspace, pointer: *mut c_void, size: usize) -> *mut c_void;
     fn mspace_free(mspace: Mspace, pointer: *mut c_void);
+    fn mspace_usable_size(pointer: *const c_void) -> usize;
     fn mspace_is_heap_object(mspace: Mspace, pointer: *mut c_void) -> c_int;
 }
 
@@ -343,19 +345,24 @@ impl MainHeapConfig {
         };
 
         unsafe {
+            (*heap.as_ptr()).unmap_on_destroy = 1;
             (*state).main_heap = heap.as_ptr();
             let current = MemThreadMain::current();
             (*current).active_heap = heap.as_ptr();
-            AtomicU8::from_ptr(ptr::addr_of_mut!((*state).alloc_free_intercept))
-                .store(1, Ordering::Release);
-            (*state).heaps.reserve(1);
-            (*state).heaps.push(heap.as_ptr());
             MemThreadMain::register_current(0);
-        }
-        if let Some(default_hugepage_log2) = default_hugepage_log2 {
-            unsafe {
+
+            // Build MemMain.heaps in the Main Heap before enabling interception.
+            let Some(heaps) = (*heap.as_ptr()).allocate(Layout::new::<*mut MemHeap>()) else {
+                std::process::abort();
+            };
+            (*state).heaps = Vec::from_raw_parts(heaps.cast().as_ptr(), 0, 1);
+            (*state).heaps.push(heap.as_ptr());
+
+            if let Some(default_hugepage_log2) = default_hugepage_log2 {
                 (*state).log2_default_hugepage_size = default_hugepage_log2;
             }
+            AtomicU8::from_ptr(ptr::addr_of_mut!((*state).alloc_free_intercept))
+                .store(1, Ordering::Release);
         }
         Ok(size)
     }
@@ -515,6 +522,12 @@ impl MemThreadMain {
         }
     }
 
+    /// Registers the current runtime thread in `MemMain.threads`.
+    ///
+    /// # Safety
+    ///
+    /// The current OS thread must remain alive until process exit, and this
+    /// function must be called exactly once on that thread.
     pub unsafe fn register_current(thread_index: u32) {
         assert_ne!(
             thread_index, RESERVED_THREAD_INDEX,
@@ -534,9 +547,7 @@ impl MemThreadMain {
                 RESERVED_THREAD_INDEX,
                 "allocator thread registers once"
             );
-            if (*current).active_heap.is_null() {
-                (*current).active_heap = main_heap;
-            }
+            (*current).active_heap = main_heap;
             (*current).thread_index = thread_index;
 
             let head = AtomicPtr::from_ptr(ptr::addr_of_mut!((*state).threads));
@@ -720,9 +731,8 @@ impl MemHeap {
     }
 
     pub fn allocate(&self, layout: Layout) -> Option<NonNull<u8>> {
-        let layout =
-            Layout::from_size_align(layout.size(), layout.align().max(align_of::<usize>()))
-                .expect("valid minimum allocation layout");
+        let layout = Layout::from_size_align(layout.size(), layout.align().max(MIN_HEAP_ALIGNMENT))
+            .expect("valid minimum allocation layout");
         let pointer = unsafe { mspace_memalign(self.mspace, layout.align(), layout.size()) };
         NonNull::new(pointer.cast::<u8>())
     }
@@ -733,24 +743,30 @@ impl MemHeap {
         Some(pointer)
     }
 
+    /// Reallocates a block in this heap.
+    ///
+    /// # Safety
+    ///
+    /// `pointer` must name a live block allocated by this `MemHeap`, and
+    /// `old_layout` must match the layout used for that allocation.
     pub unsafe fn reallocate(
         &self,
         pointer: NonNull<u8>,
         old_layout: Layout,
         new_layout: Layout,
     ) -> Option<NonNull<u8>> {
-        let old_layout = Layout::from_size_align(
-            old_layout.size(),
-            old_layout.align().max(align_of::<usize>()),
-        )
-        .expect("valid minimum allocation layout");
         let new_layout = Layout::from_size_align(
             new_layout.size(),
-            new_layout.align().max(align_of::<usize>()),
+            new_layout.align().max(MIN_HEAP_ALIGNMENT),
         )
         .expect("valid minimum allocation layout");
         if !self.is_heap_object(pointer) {
             std::process::abort();
+        }
+        let old_size = unsafe { mspace_usable_size(pointer.as_ptr().cast()) };
+        debug_assert!(old_layout.size() <= old_size);
+        if new_layout.size() == old_size {
+            return Some(pointer);
         }
         if pointer.as_ptr().addr().is_multiple_of(new_layout.align())
             && !unsafe {
@@ -766,7 +782,7 @@ impl MemHeap {
             ptr::copy_nonoverlapping(
                 pointer.as_ptr(),
                 replacement.as_ptr(),
-                old_layout.size().min(new_layout.size()),
+                old_size.min(new_layout.size()),
             );
             if !self.is_heap_object(pointer) {
                 std::process::abort();
@@ -776,6 +792,12 @@ impl MemHeap {
         Some(replacement)
     }
 
+    /// Releases a block from this heap.
+    ///
+    /// # Safety
+    ///
+    /// `pointer` must name a live block allocated by this `MemHeap`, and the
+    /// supplied layout must match the layout used for that allocation.
     pub unsafe fn deallocate(&self, pointer: NonNull<u8>, _: Layout) {
         if !self.is_heap_object(pointer) {
             std::process::abort();
@@ -1217,11 +1239,6 @@ impl MemMain {
         let system_page_size = unsafe { 1usize << (*state).log2_page_size };
         assert!(alignment.is_power_of_two() && alignment >= system_page_size);
 
-        #[cfg(target_os = "linux")]
-        let map_fixed_noreplace = libc::MAP_FIXED_NOREPLACE;
-        #[cfg(not(target_os = "linux"))]
-        let map_fixed_noreplace = libc::MAP_FIXED;
-
         let (reservation_base, reservation_size, payload) = if let Some(base) = base {
             let payload = base.get();
             if !payload.is_multiple_of(alignment) {
@@ -1258,12 +1275,17 @@ impl MemMain {
                             "mapping size overflow",
                         ),
                     })?;
+            #[cfg(target_os = "linux")]
+            let reservation_flags =
+                libc::MAP_PRIVATE | libc::MAP_ANONYMOUS | libc::MAP_FIXED_NOREPLACE;
+            #[cfg(not(target_os = "linux"))]
+            let reservation_flags = libc::MAP_PRIVATE | libc::MAP_ANONYMOUS;
             let reservation = unsafe {
                 libc::mmap(
                     header as *mut c_void,
                     reservation_size,
                     libc::PROT_NONE,
-                    libc::MAP_PRIVATE | libc::MAP_ANONYMOUS | map_fixed_noreplace,
+                    reservation_flags,
                     -1,
                     0,
                 )
@@ -1273,6 +1295,19 @@ impl MemMain {
                     base: payload,
                     size,
                     source: io::Error::last_os_error(),
+                });
+            }
+            if reservation.addr() != header {
+                if unsafe { libc::munmap(reservation, reservation_size) } != 0 {
+                    std::process::abort();
+                }
+                return Err(MemError::AddressRangeOccupied {
+                    base: payload,
+                    size,
+                    source: io::Error::new(
+                        io::ErrorKind::AddrInUse,
+                        "requested address range is unavailable",
+                    ),
                 });
             }
             (header as *mut u8, reservation_size, payload as *mut u8)
@@ -1313,25 +1348,33 @@ impl MemMain {
             let header = payload - system_page_size;
             let prefix = header - raw_address;
             if prefix != 0 && unsafe { libc::munmap(raw, prefix) } != 0 {
+                let source = io::Error::last_os_error();
+                if unsafe { libc::munmap(raw, total) } != 0 {
+                    std::process::abort();
+                }
                 return Err(MemError::AddressReservation {
                     requested_base: None,
                     size,
                     alignment,
-                    source: io::Error::last_os_error(),
+                    source,
                 });
             }
             let mapped_end = raw_address + total;
-            let reservation_end = payload + size + system_page_size;
+            let reservation_end = payload + size;
             if mapped_end != reservation_end
                 && unsafe {
                     libc::munmap(reservation_end as *mut c_void, mapped_end - reservation_end)
                 } != 0
             {
+                let source = io::Error::last_os_error();
+                if unsafe { libc::munmap(header as *mut c_void, mapped_end - header) } != 0 {
+                    std::process::abort();
+                }
                 return Err(MemError::AddressReservation {
                     requested_base: None,
                     size,
                     alignment,
-                    source: io::Error::last_os_error(),
+                    source,
                 });
             }
             (

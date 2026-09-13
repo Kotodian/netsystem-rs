@@ -17,9 +17,6 @@ use hammer_runtime::{DataPlaneBufferConfig, DataPlaneMain};
 
 fn test_runtime(frame_slots: usize, buffer_slots: usize) -> DataPlaneMain {
     BUFFER_MAIN_INIT.call_once(|| {
-        hammer_infra::mem::MainHeapConfig::default()
-            .initialize()
-            .unwrap();
         hammer_core::buffer::BufferMain::new(64, 4096, &[0], 0, hammer_infra::PageSize::Default)
             .unwrap();
     });

@@ -8,9 +8,6 @@ fn test_runtime(
     frame_slots: usize,
 ) -> DataPlaneMain {
     BUFFER_MAIN_INIT.call_once(|| {
-        hammer_infra::mem::MainHeapConfig::default()
-            .initialize()
-            .unwrap();
         BufferMain::new(2048, 4096, &[0], 0, hammer_infra::PageSize::Default).unwrap();
     });
     let config = DataPlaneBufferConfig {

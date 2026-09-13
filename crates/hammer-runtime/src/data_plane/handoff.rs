@@ -128,9 +128,6 @@ mod tests {
     #[test]
     fn handoff_preserves_feature_cursor_and_transfers_buffer_ownership() {
         crate::BUFFER_MAIN_INIT.call_once(|| {
-            hammer_infra::mem::MainHeapConfig::default()
-                .initialize()
-                .unwrap();
             hammer_core::buffer::BufferMain::new(
                 64,
                 1024,
@@ -140,9 +137,6 @@ mod tests {
             )
             .unwrap();
         });
-        hammer_infra::mem::MainHeapConfig::default()
-            .initialize()
-            .unwrap();
         let source = DataPlaneMain::new(DataPlaneBufferConfig {
             thread_index: 1,
             ..Default::default()

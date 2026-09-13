@@ -5,7 +5,6 @@ use hammer_service::interface::{InterfaceMain, InterfaceOutputNode};
 #[test]
 fn feature_chain_terminates_without_an_end_node_self_edge() -> Result<(), Box<dyn std::error::Error>>
 {
-    hammer_runtime::config::Memory::default().ensure_main_heap()?;
     hammer_core::buffer::BufferMain::new(64, 1024, &[0], 2, hammer_infra::PageSize::Default)
         .unwrap();
     hammer_runtime::ThreadMain::new()?;

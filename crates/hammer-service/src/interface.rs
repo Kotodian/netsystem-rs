@@ -264,7 +264,6 @@ mod tests {
 
     #[test]
     fn interface_tx_stack_uses_the_interface_output_node() -> Result<(), DpoError> {
-        hammer_runtime::config::Memory::default().ensure_main_heap()?;
         crate::BUFFER_MAIN_INIT.call_once(|| {
             hammer_core::buffer::BufferMain::new(
                 64,

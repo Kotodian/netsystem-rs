@@ -7,10 +7,12 @@
 //! ```
 //!
 
+use std::alloc::{Layout, alloc_zeroed, dealloc};
 use std::ffi::OsStr;
 use std::hint::black_box;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::ptr::NonNull;
 use std::sync::Arc;
 
 use hammer_core::data_plane::NodeId;
@@ -112,7 +114,7 @@ fn main() -> Result<(), ExampleError> {
     let roots = toml::from_str::<ExampleStartupConfig>(EXAMPLE_CONFIG)
         .map_err(|error| RuntimeError::config_parse(format!("parse example TOML: {error}")))?
         .plugins;
-    exercise_post_ready_allocations(&roots)?;
+    exercise_main_heap_allocations(&roots)?;
 
     let mut global = GlobalMain::new(
         "plugin-additive-load".to_owned(),
@@ -128,8 +130,8 @@ fn main() -> Result<(), ExampleError> {
         .map_err(RuntimeError::from)?;
     verify_plugin_transactions(&mut plugins, &roots)?;
     plugins.register_global_declarations(&mut global);
-    hammer_runtime::init::run_config_functions(&global, None, true, EXAMPLE_CONFIG)?;
     let mut threads = ThreadMain::new()?;
+    hammer_runtime::init::run_config_functions(&global, None, true, EXAMPLE_CONFIG)?;
     threads.configure()?;
     let mut main = DataPlaneMain::new_main(&threads)?;
     hammer_runtime::main_loop::run(global, threads, plugins, &mut main, async {
@@ -199,14 +201,33 @@ fn verify_plugin_transactions(
     Ok(())
 }
 
-fn exercise_post_ready_allocations(roots: &[String]) -> Result<(), ExampleError> {
+fn exercise_main_heap_allocations(roots: &[String]) -> Result<(), ExampleError> {
+    let main_heap = hammer_infra::mem::MemMain::main_heap();
     let string = String::from("Hammer fixed-capacity process-global main heap");
+    assert!(main_heap.is_heap_object(NonNull::from(string.as_bytes()).cast()));
 
-    let values = vec![0x5au64; 64];
+    let mut values = Vec::with_capacity(1);
+    values.extend(0..64u64);
+    assert!(main_heap.is_heap_object(NonNull::from(values.as_slice()).cast()));
 
     let boxed = Box::new([0xa5u8; 128]);
+    assert!(main_heap.is_heap_object(NonNull::from(boxed.as_ref()).cast()));
 
     let shared = Arc::new([0x3cu8; 128]);
+    assert!(main_heap.is_heap_object(NonNull::from(shared.as_ref()).cast()));
+
+    let zeroed_layout = Layout::from_size_align(256, 64).expect("zeroed layout is valid");
+    let zeroed = unsafe { alloc_zeroed(zeroed_layout) };
+    let zeroed =
+        NonNull::new(zeroed).unwrap_or_else(|| std::alloc::handle_alloc_error(zeroed_layout));
+    assert_eq!(zeroed.as_ptr().addr() % zeroed_layout.align(), 0);
+    assert!(main_heap.is_heap_object(zeroed));
+    assert!(
+        unsafe { std::slice::from_raw_parts(zeroed.as_ptr(), zeroed_layout.size()) }
+            .iter()
+            .all(|byte| *byte == 0)
+    );
+    unsafe { dealloc(zeroed.as_ptr(), zeroed_layout) };
 
     let current_exe =
         std::env::current_exe().map_err(|source| ExampleError::ImageInspectionIo {

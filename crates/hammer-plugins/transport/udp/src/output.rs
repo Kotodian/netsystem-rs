@@ -290,9 +290,6 @@ mod opaque_tests {
     // facts, prepends IP, and publishes primary metadata for IP lookup.
     #[test]
     fn datagram_metadata_reaches_ip_output() -> RuntimeResult<()> {
-        hammer_infra::mem::MainHeapConfig::default()
-            .initialize()
-            .unwrap();
         hammer_core::buffer::BufferMain::new(2048, 16, &[0], 1, hammer_infra::PageSize::Default)?;
         let mut runtime = DataPlaneMain::new(hammer_runtime::DataPlaneBufferConfig {
             buffer_slot_capacity: 2048,
