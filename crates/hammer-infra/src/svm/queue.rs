@@ -1,6 +1,5 @@
 //! VPP-style fixed-size shared-memory queues.
 
-use std::alloc::{Layout, LayoutError};
 use std::io;
 use std::mem::{MaybeUninit, size_of};
 use std::os::fd::{AsRawFd, OwnedFd};
@@ -14,8 +13,6 @@ use posix_sync::mutex::guards::{MutexGuard, RobustGuardContainer, StandardGuard}
 use posix_sync::mutex::{
     BorrowedMutex, MutexBuilder, MutexSharing, RawMutexAlloc, robustness_markers::Robust,
 };
-
-use crate::svm::ssvm::{SsvmError, SsvmPrivate};
 
 const CACHE_LINE_BYTES: usize = 64;
 
@@ -67,10 +64,6 @@ pub enum SvmQueueError {
     ElementSizeMismatch { requested: usize, stored: usize },
     #[error("queue element buffer has length {actual}, expected {expected}")]
     ElementLengthMismatch { expected: usize, actual: usize },
-    #[error("queue offset {offset} is outside the segment")]
-    InvalidOffset { offset: u64 },
-    #[error("queue segment operation failed: {0}")]
-    Segment(#[from] SsvmError),
     #[error("queue mutex owner died")]
     OwnerDied,
     #[error("queue mutex is not recoverable: {source}")]
@@ -100,8 +93,6 @@ pub enum SvmQueueError {
         #[source]
         source: io::Error,
     },
-    #[error("queue layout construction failed")]
-    Layout(#[from] LayoutError),
 }
 
 /// VPP `svm_queue_t`. The flexible `data[]` region follows this header in the
@@ -131,39 +122,36 @@ pub struct SvmQueue {
 pub struct SvmQueueLock<'queue> {
     queue: &'queue SvmQueue,
     guard: StandardGuard<'queue>,
-    nowait: bool,
+    conditional_wait: SvmQueueConditionalWait,
 }
 
 unsafe impl Send for SvmQueue {}
 unsafe impl Sync for SvmQueue {}
 
 impl SvmQueue {
-    pub fn layout(config: &SvmQueueConfig) -> Result<Layout, SvmQueueError> {
+    pub fn size_to_alloc(config: &SvmQueueConfig) -> Result<usize, SvmQueueError> {
         validate_config(config)?;
-        let bytes = size_of::<SvmQueueHeader>()
+        size_of::<SvmQueueHeader>()
             .checked_add(
                 (config.nels as usize)
                     .checked_mul(config.elsize as usize)
                     .ok_or(SvmQueueError::LayoutOverflow)?,
             )
-            .ok_or(SvmQueueError::LayoutOverflow)?;
-        Layout::from_size_align(bytes, CACHE_LINE_BYTES).map_err(SvmQueueError::Layout)
+            .ok_or(SvmQueueError::LayoutOverflow)
     }
 
     /// Initializes VPP's header and its inline `data[]` region at an existing
     /// caller-owned allocation in the mapped segment.
-    pub unsafe fn init_at(
-        segment: &SsvmPrivate,
-        offset: u64,
+    pub(crate) unsafe fn init(
+        base: NonNull<u8>,
         config: &SvmQueueConfig,
     ) -> Result<Self, SvmQueueError> {
-        let layout = Self::layout(config)?;
-        let header = NonNull::new(
-            segment
-                .offset_ptr(offset, layout.size(), layout.align())?
-                .cast::<SvmQueueHeader>(),
-        )
-        .expect("queue pointer");
+        assert!(
+            base.as_ptr().addr().is_multiple_of(CACHE_LINE_BYTES),
+            "queue base is cache-line aligned"
+        );
+        let _ = Self::size_to_alloc(config)?;
+        let header = base.cast::<SvmQueueHeader>();
         unsafe {
             std::ptr::write(
                 header.as_ptr(),
@@ -207,13 +195,12 @@ impl SvmQueue {
         })
     }
 
-    pub unsafe fn attach(segment: &SsvmPrivate, offset: u64) -> Result<Self, SvmQueueError> {
-        let header = NonNull::new(
-            segment
-                .offset_ptr(offset, size_of::<SvmQueueHeader>(), CACHE_LINE_BYTES)?
-                .cast::<SvmQueueHeader>(),
-        )
-        .expect("queue pointer");
+    pub(crate) unsafe fn attach(base: NonNull<u8>) -> Result<Self, SvmQueueError> {
+        assert!(
+            base.as_ptr().addr().is_multiple_of(CACHE_LINE_BYTES),
+            "queue base is cache-line aligned"
+        );
+        let header = base.cast::<SvmQueueHeader>();
         let stored = unsafe { header.as_ref() };
         if stored.maxsize == 0
             || stored.elsize == 0
@@ -230,7 +217,7 @@ impl SvmQueue {
                     .ok_or(SvmQueueError::LayoutOverflow)?,
             )
             .ok_or(SvmQueueError::LayoutOverflow)?;
-        segment.offset_ptr(offset, bytes, CACHE_LINE_BYTES)?;
+        let _ = bytes;
         let mutex = unsafe {
             BorrowedMutex::<Robust>::from_raw(
                 std::ptr::addr_of_mut!((*header.as_ptr()).mutex).cast(),
@@ -265,24 +252,33 @@ impl SvmQueue {
         self.header().consumer_pid
     }
 
-    pub fn add(&self, element: &[u8], nowait: bool) -> Result<(), SvmQueueError> {
+    pub fn add(
+        &self,
+        element: &[u8],
+        conditional_wait: SvmQueueConditionalWait,
+    ) -> Result<(), SvmQueueError> {
         validate_element(self.element_size(), element)?;
-        let mut lock = if nowait {
-            self.try_lock()?
-        } else {
-            self.lock()?
+        let mut lock = match conditional_wait {
+            SvmQueueConditionalWait::Nowait => self.try_lock()?,
+            SvmQueueConditionalWait::Wait | SvmQueueConditionalWait::TimedWait(_) => self.lock()?,
         };
+        lock.conditional_wait = conditional_wait;
         lock.add_nolock(element)
     }
 
-    pub fn add2(&self, first: &[u8], second: &[u8], nowait: bool) -> Result<(), SvmQueueError> {
+    pub fn add2(
+        &self,
+        first: &[u8],
+        second: &[u8],
+        conditional_wait: SvmQueueConditionalWait,
+    ) -> Result<(), SvmQueueError> {
         validate_element(self.element_size(), first)?;
         validate_element(self.element_size(), second)?;
-        let mut lock = if nowait {
-            self.try_lock()?
-        } else {
-            self.lock()?
+        let mut lock = match conditional_wait {
+            SvmQueueConditionalWait::Nowait => self.try_lock()?,
+            SvmQueueConditionalWait::Wait | SvmQueueConditionalWait::TimedWait(_) => self.lock()?,
         };
+        lock.conditional_wait = conditional_wait;
         lock.add2_nolock(first, second)
     }
 
@@ -304,7 +300,7 @@ impl SvmQueue {
                 SvmQueueConditionalWait::Nowait => return Err(SvmQueueError::Empty),
                 SvmQueueConditionalWait::Wait => lock.wait()?,
                 SvmQueueConditionalWait::TimedWait(timeout) => {
-                    if lock.timedwait(timeout)? == WaitOutcome::TimedOut {
+                    if lock.timed_wait(timeout)? == WaitOutcome::TimedOut {
                         return Err(SvmQueueError::Timeout);
                     }
                 }
@@ -312,14 +308,14 @@ impl SvmQueue {
         }
     }
 
-    pub fn sub2(&self, element: &mut [u8]) -> Result<bool, SvmQueueError> {
+    pub fn sub2(&self, element: &mut [u8]) -> Result<(), SvmQueueError> {
         validate_element(self.element_size(), element)?;
         let mut lock = self.lock()?;
         if lock.queue.header().cursize == 0 {
-            return Ok(false);
+            return Err(SvmQueueError::Empty);
         }
         lock.sub_nolock(element)?;
-        Ok(true)
+        Ok(())
     }
 
     pub fn len(&self) -> Result<usize, SvmQueueError> {
@@ -340,7 +336,7 @@ impl SvmQueue {
         Ok(SvmQueueLock {
             queue: self,
             guard: self.acquire(false)?,
-            nowait: false,
+            conditional_wait: SvmQueueConditionalWait::Wait,
         })
     }
 
@@ -348,7 +344,7 @@ impl SvmQueue {
         Ok(SvmQueueLock {
             queue: self,
             guard: self.acquire(true)?,
-            nowait: true,
+            conditional_wait: SvmQueueConditionalWait::Nowait,
         })
     }
 
@@ -364,12 +360,11 @@ impl SvmQueue {
 
     /// Destroys the process-shared synchronization objects. The caller frees
     /// the enclosing allocation through its mapping/region owner.
-    pub unsafe fn destroy(self) -> Result<(), SvmQueueError> {
+    pub(crate) unsafe fn cleanup(&mut self) {
         unsafe {
             self.mutex.destroy();
             self.condvar.destroy();
         }
-        Ok(())
     }
 
     fn header(&self) -> &SvmQueueHeader {
@@ -438,10 +433,15 @@ impl SvmQueueLock<'_> {
     pub fn add_nolock(&mut self, element: &[u8]) -> Result<(), SvmQueueError> {
         validate_element(self.queue.element_size(), element)?;
         while self.queue.header().cursize == self.queue.header().maxsize {
-            if self.nowait {
-                return Err(SvmQueueError::QueueFull);
+            match self.conditional_wait {
+                SvmQueueConditionalWait::Nowait => return Err(SvmQueueError::QueueFull),
+                SvmQueueConditionalWait::Wait => self.wait()?,
+                SvmQueueConditionalWait::TimedWait(timeout) => {
+                    if self.timed_wait(timeout)? == WaitOutcome::TimedOut {
+                        return Err(SvmQueueError::Timeout);
+                    }
+                }
             }
-            self.wait()?;
         }
         let was_empty = self.queue.header().cursize == 0;
         self.write_one(element);
@@ -455,10 +455,15 @@ impl SvmQueueLock<'_> {
         validate_element(self.queue.element_size(), first)?;
         validate_element(self.queue.element_size(), second)?;
         while self.queue.header().maxsize - self.queue.header().cursize < 2 {
-            if self.nowait {
-                return Err(SvmQueueError::QueueFull);
+            match self.conditional_wait {
+                SvmQueueConditionalWait::Nowait => return Err(SvmQueueError::QueueFull),
+                SvmQueueConditionalWait::Wait => self.wait()?,
+                SvmQueueConditionalWait::TimedWait(timeout) => {
+                    if self.timed_wait(timeout)? == WaitOutcome::TimedOut {
+                        return Err(SvmQueueError::Timeout);
+                    }
+                }
             }
-            self.wait()?;
         }
         let was_empty = self.queue.header().cursize == 0;
         self.write_one(first);
@@ -469,17 +474,7 @@ impl SvmQueueLock<'_> {
         Ok(())
     }
 
-    pub unsafe fn add_raw(&mut self, element: &[u8]) -> Result<(), SvmQueueError> {
-        validate_element(self.queue.element_size(), element)?;
-        let was_empty = self.queue.header().cursize == 0;
-        self.write_one(element);
-        if was_empty {
-            self.queue.signal(true, SvmQueueOperation::Add)?;
-        }
-        Ok(())
-    }
-
-    pub unsafe fn sub_raw(&mut self, element: &mut [u8]) -> Result<(), SvmQueueError> {
+    pub fn sub_raw(&mut self, element: &mut [u8]) -> Result<(), SvmQueueError> {
         validate_element(self.queue.element_size(), element)?;
         self.sub_nolock(element)
     }
@@ -492,7 +487,7 @@ impl SvmQueueLock<'_> {
         }
     }
 
-    pub fn timedwait(&mut self, timeout: Duration) -> Result<WaitOutcome, SvmQueueError> {
+    pub fn timed_wait(&mut self, timeout: Duration) -> Result<WaitOutcome, SvmQueueError> {
         match unsafe { self.queue.condvar.wait_for(&mut self.guard, timeout) } {
             Ok(outcome) => Ok(outcome),
             Err(posix_sync::condvar::CondvarWaitError::OwnerDead) => {
@@ -575,4 +570,63 @@ fn validate_element(expected: usize, element: &[u8]) -> Result<(), SvmQueueError
         });
     }
     Ok(())
+}
+
+pub trait SvmQueueElement:
+    zerocopy::KnownLayout + zerocopy::FromBytes + zerocopy::Immutable + zerocopy::IntoBytes
+{
+}
+
+impl<T> SvmQueueElement for T where
+    T: zerocopy::KnownLayout + zerocopy::FromBytes + zerocopy::Immutable + zerocopy::IntoBytes
+{
+}
+
+pub struct SvmQueueElements<T: SvmQueueElement> {
+    queue: SvmQueue,
+    _element: std::marker::PhantomData<fn() -> T>,
+}
+
+impl<T: SvmQueueElement> SvmQueueElements<T> {
+    pub(crate) fn from_raw(queue: SvmQueue) -> Self {
+        Self {
+            queue,
+            _element: std::marker::PhantomData,
+        }
+    }
+
+    pub fn add(
+        &self,
+        element: &T,
+        conditional_wait: SvmQueueConditionalWait,
+    ) -> Result<(), SvmQueueError> {
+        self.queue.add(element.as_bytes(), conditional_wait)
+    }
+
+    pub fn add2(
+        &self,
+        first: &T,
+        second: &T,
+        conditional_wait: SvmQueueConditionalWait,
+    ) -> Result<(), SvmQueueError> {
+        self.queue
+            .add2(first.as_bytes(), second.as_bytes(), conditional_wait)
+    }
+
+    pub fn sub(&self, conditional_wait: SvmQueueConditionalWait) -> Result<T, SvmQueueError> {
+        let mut bytes = vec![0_u8; size_of::<T>()];
+        self.queue.sub(&mut bytes, conditional_wait)?;
+        T::read_from_bytes(&bytes).map_err(|_| SvmQueueError::InvalidHeader)
+    }
+
+    pub fn try_sub(&self) -> Result<Option<T>, SvmQueueError> {
+        let mut bytes = vec![0_u8; size_of::<T>()];
+        match self.queue.sub2(&mut bytes) {
+            Ok(()) => T::read_from_bytes(&bytes)
+                .map(Some)
+                .map_err(|_| SvmQueueError::InvalidHeader),
+            Err(SvmQueueError::Empty) => Ok(None),
+            Err(error) => Err(error),
+        }
+    }
 }

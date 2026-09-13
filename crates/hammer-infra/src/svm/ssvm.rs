@@ -1,24 +1,26 @@
 //! Linux shared virtual-memory mappings (`ssvm`).
 //!
-//! `SsvmPrivate` owns the OS mapping, its backing descriptor, and the mapping's
-//! [`SsvmSharedHeader`]. Allocation metadata belongs to [`crate::svm::region`],
-//! so an attached process never rebuilds the creator's allocator from
-//! process-local pointers.
+//! `SsvmPrivate` owns the OS mapping, its backing descriptor, the mapping's
+//! [`SsvmSharedHeader`], and the generic shared heap. Region allocation metadata
+//! belongs to [`crate::svm::region`], so an attached process never rebuilds the
+//! creator's allocator from process-local pointers.
 //!
 //! Field and lifecycle semantics follow VPP `src/svm/ssvm.h` and `ssvm.c`.
-//! ADR-0011 section 13 records the two intentional divergences: the ported
-//! mapping carries no `lock`/`heap`/`opaque` fields, and `ssvm_va` stays 0
-//! unless a creator asks for a fixed address.
+//! ADR-0011 section 13 records the intentional layout divergences: the ported
+//! mapping carries no VPP recursive lock or opaque pointer slots, while the
+//! generic SSVM heap pointer is retained; FIFO map-only segments explicitly
+//! omit that heap and publish a zero VA for relative-offset storage.
 
 use std::ffi::CString;
 use std::io;
 use std::mem::size_of;
 use std::os::fd::RawFd;
+use std::ptr::NonNull;
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::thread::sleep;
 use std::time::{Duration, Instant};
 
-use crate::align::align_up;
+use crate::mem::MemHeap;
 
 const SSVM_MAGIC: u64 = 0x4841_4d4d_4552_5353;
 const SSVM_VERSION: u32 = 1;
@@ -29,9 +31,10 @@ pub const SSVM_NAME_MAX: usize = 64;
 
 /// Shared header at offset 0 of every segment mapping.
 ///
-/// Corresponds to VPP `ssvm_shared_header_t` without the fields ADR-0011
-/// section 13 rejects: VPP's unused `lock`/`owner_pid`/`recursion_count`/`tag`,
-/// the in-segment `heap` pointer, and the untyped `opaque` slots.
+/// Corresponds to the used VPP `ssvm_shared_header_t` fields. The generic heap
+/// pointer is retained because attached processes reuse the creator's mspace;
+/// the unused recursive lock and untyped opaque pointer slots are not part of
+/// Hammer's layout.
 #[repr(C, align(64))]
 pub struct SsvmSharedHeader {
     magic: u64,
@@ -42,6 +45,7 @@ pub struct SsvmSharedHeader {
     ssvm_va: u64,
     server_pid: u32,
     client_pid: u32,
+    heap: *mut MemHeap,
     name_len: u32,
     ready: AtomicU32,
     fifo_segment_offset: AtomicU64,
@@ -64,7 +68,9 @@ pub enum SsvmSegmentBackend {
 pub struct SsvmConfig {
     pub backend: SsvmSegmentBackend,
     pub name: String,
-    /// Total mapping size; the caller payload starts at [`SSVM_PAYLOAD_OFFSET`].
+    /// Requested segment size. Generic mappings are page-rounded; PRIVATE
+    /// mappings round this value for the heap and add one header page to the
+    /// actual mapping.
     pub size: usize,
     /// Address hint, and the address an attacher must use when non-zero.
     pub requested_va: u64,
@@ -122,12 +128,20 @@ pub enum SsvmError {
     },
     #[error("segment offset {offset} is not aligned to {alignment}")]
     Misaligned { offset: u64, alignment: usize },
+    #[error("failed to create heap at {base:#x}+{size}: {source}")]
+    Heap {
+        base: usize,
+        size: usize,
+        #[source]
+        source: crate::mem::MemError,
+    },
 }
 
 /// One mapped segment (`ssvm_private_t`).
 pub struct SsvmPrivate {
     base: *mut u8,
     ssvm_size: usize,
+    mapping_size: usize,
     backend: SsvmSegmentBackend,
     is_server: bool,
     requested_va: u64,
@@ -147,31 +161,81 @@ impl SsvmPrivate {
         match config.backend {
             SsvmSegmentBackend::Shm => Self::server_init_shm(config),
             SsvmSegmentBackend::Memfd => Self::server_init_memfd(config),
-            SsvmSegmentBackend::Private => Self::server_init_private(config),
+            SsvmSegmentBackend::Private => Self::server_init_private_mode(config, false),
+        }
+    }
+
+    /// Creates a FIFO segment with the owner-private map-only layout.
+    pub fn server_init_fifo_segment(config: &SsvmConfig) -> Result<Self, SsvmError> {
+        match config.backend {
+            SsvmSegmentBackend::Shm => {
+                let name = validated_name(&config.name)?;
+                let descriptor = create_shm(&name)?;
+                let result =
+                    Self::create_shared(SsvmSegmentBackend::Shm, config, &name, descriptor, true);
+                close_descriptor(descriptor);
+                result
+            }
+            SsvmSegmentBackend::Memfd => {
+                let name = validated_name(&config.name)?;
+                let descriptor = create_memfd(&name)?;
+                match Self::create_shared(
+                    SsvmSegmentBackend::Memfd,
+                    config,
+                    &name,
+                    descriptor,
+                    true,
+                ) {
+                    Ok(segment) => Ok(segment),
+                    Err(error) => {
+                        close_descriptor(descriptor);
+                        Err(error)
+                    }
+                }
+            }
+            SsvmSegmentBackend::Private => Self::server_init_private_mode(config, true),
         }
     }
 
     /// Creates an anonymous private mapping.
     pub fn server_init_private(config: &SsvmConfig) -> Result<Self, SsvmError> {
+        Self::server_init_private_mode(config, false)
+    }
+
+    fn server_init_private_mode(config: &SsvmConfig, map_only: bool) -> Result<Self, SsvmError> {
         if config.size == 0 {
             return Err(SsvmError::NoSize);
         }
         let name = validated_name(&config.name)?;
-        let mapped_size = mapped_size_for(config.size)?;
-        let base = map_private(mapped_size)?;
+        let page = page_size()?;
+        let mut rnd_size = rounded_size_for(config.size, page)?;
+        let mapping_size = rnd_size.checked_add(page).ok_or(SsvmError::SizeTooSmall {
+            requested: config.size,
+        })?;
+        let base = map_private(mapping_size)?;
         let mut segment = Self {
             base,
-            ssvm_size: mapped_size,
+            ssvm_size: if map_only { mapping_size } else { rnd_size },
+            mapping_size,
             backend: SsvmSegmentBackend::Private,
             is_server: true,
-            requested_va: 0,
+            requested_va: u64::MAX,
             my_pid: std::process::id(),
             name,
             numa: 0,
             huge_page: config.huge_page,
             backing: SsvmBackendParameter { fd: -1 },
         };
-        segment.initialize_header(0);
+        segment.initialize_header(if map_only { 0 } else { base as u64 });
+        if !map_only {
+            segment.initialize_heap(rnd_size)?;
+            rnd_size = segment
+                .heap()
+                .expect("private SSVM heap is initialized")
+                .free_space();
+            segment.ssvm_size = rnd_size;
+            unsafe { (*shared_header_at(segment.base)).ssvm_size = rnd_size as u64 };
+        }
         Ok(segment)
     }
 
@@ -179,7 +243,7 @@ impl SsvmPrivate {
     pub fn server_init_shm(config: &SsvmConfig) -> Result<Self, SsvmError> {
         let name = validated_name(&config.name)?;
         let descriptor = create_shm(&name)?;
-        let result = Self::create_shared(SsvmSegmentBackend::Shm, config, &name, descriptor);
+        let result = Self::create_shared(SsvmSegmentBackend::Shm, config, &name, descriptor, false);
         close_descriptor(descriptor);
         result
     }
@@ -188,7 +252,7 @@ impl SsvmPrivate {
     pub fn server_init_memfd(config: &SsvmConfig) -> Result<Self, SsvmError> {
         let name = validated_name(&config.name)?;
         let descriptor = create_memfd(&name)?;
-        match Self::create_shared(SsvmSegmentBackend::Memfd, config, &name, descriptor) {
+        match Self::create_shared(SsvmSegmentBackend::Memfd, config, &name, descriptor, false) {
             Ok(segment) => Ok(segment),
             Err(error) => {
                 close_descriptor(descriptor);
@@ -231,7 +295,7 @@ impl SsvmPrivate {
             }
             sleep(SSVM_POLL_INTERVAL);
         };
-        let segment = match Self::attach(descriptor, attach_timeout) {
+        let segment = match Self::attach(descriptor, attach_timeout, true) {
             Ok(segment) => segment,
             Err(error) => {
                 close_descriptor(descriptor);
@@ -239,7 +303,6 @@ impl SsvmPrivate {
             }
         };
         close_descriptor(descriptor);
-        segment.wait_ready(deadline.saturating_duration_since(Instant::now()))?;
         Ok(segment)
     }
 
@@ -248,7 +311,7 @@ impl SsvmPrivate {
     /// The mapping owns a duplicate of `descriptor`; the caller keeps its own.
     pub fn client_init_memfd(descriptor: RawFd) -> Result<Self, SsvmError> {
         let owned = duplicate_descriptor(descriptor)?;
-        match Self::attach(owned, Duration::ZERO) {
+        match Self::attach(owned, Duration::ZERO, false) {
             Ok(segment) => Ok(segment),
             Err(error) => {
                 close_descriptor(owned);
@@ -281,7 +344,14 @@ impl SsvmPrivate {
         self.shared_header().ssvm_va
     }
 
-    /// Mapped size in bytes.
+    pub fn published_va(&self) -> Option<std::num::NonZeroUsize> {
+        std::num::NonZeroUsize::new(self.ssvm_va() as usize)
+    }
+
+    /// Advertised `ssvm_size` in bytes.
+    ///
+    /// For PRIVATE SSVM this is the dlmalloc free space after heap creation;
+    /// the actual mmap length is kept separately by the mapping owner.
     pub fn ssvm_size(&self) -> usize {
         self.ssvm_size
     }
@@ -301,6 +371,11 @@ impl SsvmPrivate {
         self.base
     }
 
+    #[inline(always)]
+    pub(crate) fn page_size(&self) -> Result<usize, SsvmError> {
+        page_size()
+    }
+
     /// Descriptor owned by this mapping, when the backend keeps one open.
     pub fn fd(&self) -> Option<RawFd> {
         match self.backend {
@@ -310,6 +385,20 @@ impl SsvmPrivate {
             }
             SsvmSegmentBackend::Shm | SsvmSegmentBackend::Private => None,
         }
+    }
+
+    pub fn heap(&self) -> Option<&MemHeap> {
+        let pointer = self.shared_header().heap;
+        if pointer.is_null() {
+            return None;
+        }
+        let start = self.base as usize;
+        let end = start.checked_add(self.mapping_size)?;
+        let address = pointer as usize;
+        if address < start || address >= end {
+            return None;
+        }
+        Some(unsafe { &*pointer })
     }
 
     /// Whether this mapping created the segment.
@@ -337,7 +426,7 @@ impl SsvmPrivate {
         SSVM_PAYLOAD_OFFSET
     }
 
-    /// Bytes from [`Self::payload_offset`] to the end of this mapping.
+    /// Bytes from [`Self::payload_offset`] to the advertised segment end.
     pub fn payload_len(&self) -> u64 {
         self.ssvm_size as u64 - self.payload_offset()
     }
@@ -422,6 +511,7 @@ impl SsvmPrivate {
         config: &SsvmConfig,
         name: &CString,
         descriptor: RawFd,
+        map_only: bool,
     ) -> Result<Self, SsvmError> {
         if config.size == 0 {
             return Err(SsvmError::NoSize);
@@ -436,14 +526,11 @@ impl SsvmPrivate {
             libc::MAP_SHARED,
             descriptor,
         )?;
-        let recorded_va = if config.requested_va == 0 {
-            0
-        } else {
-            base as u64
-        };
+        let recorded_va = if map_only { 0 } else { base as u64 };
         let mut segment = Self {
             base,
             ssvm_size: mapped_size,
+            mapping_size: mapped_size,
             backend,
             is_server: true,
             requested_va: config.requested_va,
@@ -454,6 +541,15 @@ impl SsvmPrivate {
             backing: backend_parameter(backend, descriptor, config.attach_timeout),
         };
         segment.initialize_header(recorded_va);
+        if !map_only {
+            let page = page_size()?;
+            let heap_size = mapped_size
+                .checked_sub(page)
+                .ok_or(SsvmError::SizeTooSmall {
+                    requested: config.size,
+                })?;
+            segment.initialize_heap(heap_size)?;
+        }
         Ok(segment)
     }
 
@@ -461,21 +557,52 @@ impl SsvmPrivate {
     ///
     /// Every error path returns before the mapping owns `descriptor`, so the
     /// caller still closes it; on success the mapping owns it.
-    fn attach(descriptor: RawFd, shm_timeout: Duration) -> Result<Self, SsvmError> {
+    fn attach(
+        descriptor: RawFd,
+        shm_timeout: Duration,
+        wait_for_ready: bool,
+    ) -> Result<Self, SsvmError> {
         let page = page_size()?;
         let probe = map_raw(std::ptr::null_mut(), page, libc::MAP_SHARED, descriptor)?;
-        let probed = {
-            let header = unsafe { &*shared_header_at(probe) };
-            validate_header(header)?;
-            (
-                header.ssvm_size,
-                header.ssvm_va,
-                backend_from_byte(header.segment_type)?,
-                name_from_header(header)?,
-            )
+        let header = unsafe { &*shared_header_at(probe) };
+        if let Err(error) = validate_header(header) {
+            unsafe { libc::munmap(probe.cast(), page) };
+            return Err(error);
+        }
+        if wait_for_ready {
+            let deadline = Instant::now() + shm_timeout;
+            while header.ready.load(Ordering::Acquire) == 0 {
+                if Instant::now() >= deadline {
+                    let error = match name_from_header(header) {
+                        Ok(name) => timeout_error(
+                            name.to_str().expect("validated segment name"),
+                            shm_timeout,
+                        ),
+                        Err(error) => error,
+                    };
+                    unsafe { libc::munmap(probe.cast(), page) };
+                    return Err(error);
+                }
+                sleep(SSVM_POLL_INTERVAL);
+            }
+        }
+        let name = match name_from_header(header) {
+            Ok(name) => name,
+            Err(error) => {
+                unsafe { libc::munmap(probe.cast(), page) };
+                return Err(error);
+            }
         };
+        let backend = match backend_from_byte(header.segment_type) {
+            Ok(backend) => backend,
+            Err(error) => {
+                unsafe { libc::munmap(probe.cast(), page) };
+                return Err(error);
+            }
+        };
+        let probed = (header.ssvm_size, header.ssvm_va, backend, name, header.heap);
         unsafe { libc::munmap(probe.cast(), page) };
-        let (declared_size, declared_va, backend, name) = probed;
+        let (declared_size, declared_va, backend, name, heap) = probed;
         if backend == SsvmSegmentBackend::Private {
             return Err(SsvmError::BackendUnavailable);
         }
@@ -500,6 +627,7 @@ impl SsvmPrivate {
         let segment = Self {
             base,
             ssvm_size: mapped_size,
+            mapping_size: mapped_size,
             backend,
             is_server: false,
             requested_va: declared_va,
@@ -512,6 +640,18 @@ impl SsvmPrivate {
         let header = unsafe { &mut *shared_header_at(segment.base) };
         debug_assert_eq!(header.ssvm_size, mapped_size as u64);
         header.client_pid = std::process::id();
+        if !heap.is_null() {
+            let heap_address = heap as usize;
+            let mapping_end = segment.base.addr().checked_add(segment.ssvm_size).ok_or(
+                SsvmError::SizeMismatch {
+                    declared: declared_size,
+                    mapped: mapped_size,
+                },
+            )?;
+            if heap_address < segment.base.addr() || heap_address >= mapping_end {
+                return Err(SsvmError::InvalidMagic);
+            }
+        }
         Ok(segment)
     }
 
@@ -526,10 +666,37 @@ impl SsvmPrivate {
         header.ssvm_va = recorded_va;
         header.server_pid = self.my_pid;
         header.client_pid = 0;
+        header.heap = std::ptr::null_mut();
         header.name_len = bytes.len() as u32;
         header.fifo_segment_offset.store(0, Ordering::Relaxed);
         header.name[..bytes.len()].copy_from_slice(bytes);
         header.ready.store(0, Ordering::Release);
+    }
+
+    fn initialize_heap(&mut self, heap_size: usize) -> Result<(), SsvmError> {
+        let page = page_size()?;
+        let heap_base =
+            NonNull::new(unsafe { self.base.add(page) }).expect("heap base is non-null");
+        if heap_size == 0
+            || page
+                .checked_add(heap_size)
+                .is_none_or(|end| end > self.mapping_size)
+        {
+            return Err(SsvmError::SizeTooSmall {
+                requested: heap_size,
+            });
+        }
+        let heap = unsafe {
+            MemHeap::create_at(heap_base, heap_size, true, "ssvm heap").map_err(|source| {
+                SsvmError::Heap {
+                    base: heap_base.as_ptr() as usize,
+                    size: heap_size,
+                    source,
+                }
+            })?
+        };
+        unsafe { (*shared_header_at(self.base)).heap = heap.as_ptr() };
+        Ok(())
     }
 
     fn shared_header(&self) -> &SsvmSharedHeader {
@@ -539,8 +706,13 @@ impl SsvmPrivate {
 
 impl Drop for SsvmPrivate {
     fn drop(&mut self) {
+        if self.is_server {
+            if let Some(heap) = self.heap() {
+                unsafe { heap.destroy() };
+            }
+        }
         unsafe {
-            libc::munmap(self.base.cast(), self.ssvm_size);
+            libc::munmap(self.base.cast(), self.mapping_size);
         }
         if let Some(descriptor) = self.fd() {
             close_descriptor(descriptor);
@@ -628,11 +800,23 @@ fn mapped_size_for(size: usize) -> Result<usize, SsvmError> {
     if size == 0 {
         return Err(SsvmError::NoSize);
     }
-    let mapped = align_up(size, page_size()?);
+    let page = page_size()?;
+    let mapped = rounded_size_for(size, page)?;
     if mapped < size_of::<SsvmSharedHeader>() {
         return Err(SsvmError::SizeTooSmall { requested: size });
     }
     Ok(mapped)
+}
+
+fn rounded_size_for(size: usize, page: usize) -> Result<usize, SsvmError> {
+    let rounded = size
+        .checked_add(page - 1)
+        .ok_or(SsvmError::SizeTooSmall { requested: size })?
+        & !(page - 1);
+    if rounded == 0 {
+        return Err(SsvmError::SizeTooSmall { requested: size });
+    }
+    Ok(rounded)
 }
 
 fn timeout_error(name: &str, timeout: Duration) -> SsvmError {

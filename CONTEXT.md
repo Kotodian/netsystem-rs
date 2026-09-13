@@ -649,7 +649,7 @@ _Avoid_: AllocatorThreadMain, ThreadMain, DataPlaneMain field, worker-local heap
 **MemHeap**:
 One concrete allocation authority that can become the current thread's active
 heap. Main, process-private, and SVM PVT/Data Heaps all use fixed-capacity
-dlmalloc mspaces. A shared mspace and its `MemHeap` control block live in the
+dlmalloc mspaces. An mspace and its `MemHeap` control block live in the
 fixed-address region mapping. The backend is private and is not a trait,
 vtable, or public selection enum.
 _Avoid_: Heap, SvmRegionHeap, OffsetHeap, allocator trait
@@ -691,7 +691,7 @@ migration has been implemented.
 **SsvmPrivate**:
 The process-local owner corresponding to `ssvm_private_t`. It owns one
 SHM/MEMFD/PRIVATE backing, mapping, shared header, ready lifecycle, and generic
-shared `MemHeap`. A generic server publishes its actual non-zero mapping
+`MemHeap`. A generic server publishes its actual non-zero mapping
 address and an attacher probes page zero before mapping the full segment at
 that same address. It is separate from VPP `svm_region`: a `SvmRegion` is not
 nested in this owner's payload. An offset-only payload such as
@@ -704,7 +704,7 @@ _Avoid_: SvmSegment, Segment, SvmRegion payload, default arbitrary-VA mapping
 A fixed-VA shared region corresponding to VPP `svm_region_t`. It owns its
 region mapping lifecycle, page-zero header, mandatory PVT Heap, optional Data
 Heap, client PID registrations, and published root. An attacher probes the header and
-then maps the complete region at the creator's published address so shared heap
+then maps the complete region at the creator's published address so heap
 and collection pointers remain valid. It is not an `SsvmPrivate` payload and
 does not support a different-address offset compatibility mode. Create and
 attach register the current PID; explicit unmap removes it inside the active

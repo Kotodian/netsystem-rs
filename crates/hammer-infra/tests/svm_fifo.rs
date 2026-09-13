@@ -7,8 +7,9 @@ fn fifo_round_trip_non_power_of_two_capacity() {
 
     assert_eq!(fifo.enqueue(&payload), payload.len());
     assert_eq!(fifo.max_dequeue(), payload.len());
-    let (first, second) = fifo.segments(0, payload.len()).expect("segments");
-    assert_eq!([first, second].concat(), payload);
+    let mut peeked = vec![0; payload.len()];
+    assert_eq!(fifo.peek(0, peeked.len(), &mut peeked), payload.len());
+    assert_eq!(peeked, payload);
 
     let mut received = vec![0; payload.len()];
     assert_eq!(fifo.dequeue(received.len(), &mut received), payload.len());

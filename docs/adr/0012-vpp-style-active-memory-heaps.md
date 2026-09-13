@@ -22,7 +22,7 @@
    路由到当前线程的 active heap；
 3. `svm_region` 如何把 VPP 的 pvt heap 和可选 data heap 都实现为 `MemHeap`，
    并通过 active heap 执行 `Vec`、字符串、名字表和用户数据分配；
-4. Main Heap、process-private heap 与 shared heap 如何统一使用 dlmalloc mspace；
+4. Main Heap、process-private heap 与 heap 如何统一使用 dlmalloc mspace；
 5. 当前已经落地的 offset region heap 需要删除什么。
 
 本文不把 `SvmFifoSegment`、`SvmMsgQ` 或普通 `ssvm` payload 自动改成
@@ -57,7 +57,7 @@ different-VA attach。
 | V7 | `src/vppinfra/dlmalloc.c:4012-4032`、`:4054-4065` | mspace allocator state 位于 supplied base；locked mspace 的锁也在该 state；range 标为 external | fixed-VA attach 后可直接继续使用 shared mspace state |
 | V8 | `src/svm/svm_common.h:19-50` | region header 保存version、mutex/condvar、mutex owner pid/tag、flags、virtual base/size、region/data heap、data base、user context、bitmap size/pointer、region/backing names、filenames和client pids；pvt heap默认128 KiB | Hammer header逐字段保留VPP region fields并使用固定VA raw pointers，不增加lifecycle enum或offset descriptor |
 | V9 | `src/svm/svm.c:434-531`，`svm_region_init_mapped_region` | creator 在 `baseva + page_size` 创建 locked `region_heap`，切到它分配名字、pid vec、bitmap；之后按 flags 创建可选 data heap | region 初始化必须先有 pvt heap，所有 region metadata 由它分配 |
-| V10 | `src/svm/svm.c:537-610`、`:654-704`，`svm_map_region` | creator 用 `MAP_SHARED|MAP_FIXED`；attach 先探测一页取得 creator 发布的 VA/size，再在相同 VA 重映射完整 region | raw pointers 和 shared heap 依赖所有参与进程映射到同一 VA |
+| V10 | `src/svm/svm.c:537-610`、`:654-704`，`svm_map_region` | creator 用 `MAP_SHARED|MAP_FIXED`；attach 先探测一页取得 creator 发布的 VA/size，再在相同 VA 重映射完整 region | raw pointers 和 heap 依赖所有参与进程映射到同一 VA |
 | V11 | `src/svm/svm.c:733-751`，attach branch | attach 持 region lock，切到 creator 的 pvt heap，追加 client pid，并只映射 data backing；不创建 pvt/data heap | attach 复用 creator 已发布的 `MemHeap` 控制块 |
 | V12 | `src/svm/svm.c:770-818`，`svm_region_init_internal` | root 映射完成后，在 `NEED_DATA_INIT` 分支切到 pvt heap，分配 `svm_main_region_t`、name hash、root path，再令 `data_base = mp` | root 的 `data_base` 是 pvt heap 中的 main-region 对象，不是 data heap 起点 |
 | V13 | `src/svm/svm.c:821-875`，root init callers | global root 使用 `SVM_FLAGS_NODATA`，不是 `SVM_FLAGS_MHEAP` | root 只有 pvt heap；不得为它虚构 data heap |
@@ -255,7 +255,7 @@ programmer/shared-state violation，立即abort，不进入`SvmRegionError`。
 Main Heap、process-private heap 和 SVM PVT/Data Heap 只有一个 backend：从 vendored VPP
 使用的 public-domain dlmalloc 提取的 mspace。owner 先映射完整 range，再调用
 `create_mspace_with_base(base, size, locked)`，随后 `mspace_disable_expand`；`MemHeap`
-控制块也从该 mspace 自身分配。Main Heap 与 shared heap 固定 `locked = true`，只有由一个
+控制块也从该 mspace 自身分配。Main Heap 与 heap 固定 `locked = true`，只有由一个
 OS thread完整拥有的 process-private heap才允许创建为 unlocked。
 
 #### D4.1 source 与 build ownership
@@ -377,7 +377,7 @@ layout fingerprint。
 
 region page 0 是 `SvmRegionHeader`；pvt heap 从 `base + page_size` 开始，默认
 `SVM_PVT_HEAP_SIZE = 128 KiB`。creator 调用 `MemHeap::create_at` 在这段 range 建 locked
-shared heap，并把返回的 `*mut MemHeap` 写入 `pvt_heap`。该控制块和 mspace state 都位于
+heap，并把返回的 `*mut MemHeap` 写入 `pvt_heap`。该控制块和 mspace state 都位于
 映射中。attach 只读取并验证该 pointer/range，绝不 recreate、reload 或转成 offset heap。
 
 creator 持 region mutex并激活 pvt heap后，分配 region name、client pid Vec、root bitmap
@@ -614,7 +614,7 @@ VPP与Hammer错误边界逐项对应如下：
 | 层 | 允许调用 | 禁止调用/保存 | 验证 |
 | --- | --- | --- | --- |
 | `mem` | dlmalloc mspace、flag关闭时的System fallback、allocator TLS | SVM name/member policy、runtime graph/plugin状态、caller closure、第二allocator backend、C interposition | infra allocation tests、wrong-heap subprocess |
-| `SvmRegion` | mapping/fd、region mutex、owner pid/tag、`MemHeap`、standard collection/Pool、root bitmap | `SsvmPrivate` header、offset heap、runtime WorkerBarrier、fallback Main Heap、owner-death后访问shared heap、额外shared状态字段 | same-VA subprocess creator/attach与owner-death failure |
+| `SvmRegion` | mapping/fd、region mutex、owner pid/tag、`MemHeap`、standard collection/Pool、root bitmap | `SsvmPrivate` header、offset heap、runtime WorkerBarrier、fallback Main Heap、owner-death后访问heap、额外shared状态字段 | same-VA subprocess creator/attach与owner-death failure |
 | `RegionLock` | 直接借 pvt/data `MemHeap` 并创建 `ActiveHeap` | 返回越过lock lifetime的heap借用、从allocator TLS取得safe heap reference、跨`.await` scope | compile-time lifetime用例、nested restore行为 |
 | runtime thread entry | 只为process-lifetime OS thread登记index；短命thread仅使用unregistered TLS default | 拥有或跨线程move `MemThreadMain`、登记可能在线程退出时失效的TLS address、为allocator添加第二个TLS | startup与short-lived thread integration |
 | App/session rendezvous | 交付 fd、base、size和协议版本 | 把 fd/进程本地表写入 shared `SvmMainRegion` | multi-process attach |
@@ -1061,7 +1061,7 @@ SvmRegionHeader::root_offset
 | public `RegionLockTag`与caller-selected `Membership`/`Allocate` tag | VPP tag是`svm.c` file-local lock调用点的调试整数，不是public lifecycle API | public `lock()`不接收tag；owner内部按调用点记录诊断值 |
 | `SvmRegion::remove_subregion` | VPP由最后client的`svm_region_unmap_internal`在root/region lock内完成pool/hash/bitmap和mapping cleanup | 只有`unmap(self)`删除client并在计数归零时清root注册；无第二条删除路径 |
 | `SvmRegionMain` monotonic id API | VPP名字表值是subregion pool index，root bitmap拥有地址 | find/create/remove重复index行为与bitmap断言通过 |
-| `SvmRegion` over `SsvmPrivate`、不同 VA attach contract | shared heap与普通 collection含raw pointer | occupied-VA attach明确失败；无different-VA测试 |
+| `SvmRegion` over `SsvmPrivate`、不同 VA attach contract | heap与普通 collection含raw pointer | occupied-VA attach明确失败；无different-VA测试 |
 | `Heap`/`HeapError::AttachedSvmRegion`/private vtable | `MemHeap` 已表达实际分配 authority | Bihash/heap_boxed编译并走明确 heap |
 | 旧 ADR-0011 的 offset-heap target与 CONTEXT 同名术语 | 文档不得继续把已否决实现写成目标 | 文档 review 与修正版 ADR-0011 cross-reference |
 
@@ -1074,7 +1074,7 @@ daemon/app组件必须同批重编译并重建 region。
    active `MemHeap`。
 2. **把 pvt heap叫 metadata heap。** metadata 是主要用途，不是VPP heap角色；root
    `data_base` 也实际指向该 heap中的对象。字段统一叫 `pvt_heap`。
-3. **保留 mimalloc 作为 process heap。** 这会让 process 与 shared heap拥有不同allocator
+3. **保留 mimalloc 作为 process heap。** 这会让 process 与 heap拥有不同allocator
    状态、TLS和free/realloc路径；最终决定统一使用dlmalloc mspace并删除mimalloc。
 4. **用 mimalloc exclusive arena直接 attach。** 现有 supported API没有 shared live heap
    reopen，`mi_heap_t`/TLS/TLD仍是process local。

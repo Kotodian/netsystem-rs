@@ -35,6 +35,20 @@ const MPOL_F_MEMS_ALLOWED: usize = 0x4;
 
 type Mspace = *mut c_void;
 
+#[repr(C)]
+struct DlMallInfo {
+    arena: usize,
+    ordblks: usize,
+    smblks: usize,
+    hblks: usize,
+    hblkhd: usize,
+    usmblks: usize,
+    fsmblks: usize,
+    uordblks: usize,
+    fordblks: usize,
+    keepcost: usize,
+}
+
 unsafe extern "C" {
     fn create_mspace_with_base(base: *mut c_void, capacity: usize, locked: i32) -> Mspace;
     fn destroy_mspace(mspace: Mspace) -> usize;
@@ -42,6 +56,7 @@ unsafe extern "C" {
     fn mspace_memalign(mspace: Mspace, alignment: usize, size: usize) -> *mut c_void;
     fn mspace_realloc_in_place(mspace: Mspace, pointer: *mut c_void, size: usize) -> *mut c_void;
     fn mspace_free(mspace: Mspace, pointer: *mut c_void);
+    fn mspace_mallinfo(mspace: Mspace) -> DlMallInfo;
     fn mspace_usable_size(pointer: *const c_void) -> usize;
     fn mspace_is_heap_object(mspace: Mspace, pointer: *mut c_void) -> c_int;
 }
@@ -832,6 +847,10 @@ impl MemHeap {
 
     pub fn size(&self) -> usize {
         self.size
+    }
+
+    pub(crate) fn free_space(&self) -> usize {
+        unsafe { mspace_mallinfo(self.mspace).fordblks }
     }
 
     pub fn name(&self) -> &str {

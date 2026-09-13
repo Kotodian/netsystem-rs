@@ -10,6 +10,7 @@ crate-type = ["dylib", "rlib"]
 
 [dependencies]
 bytes = { workspace = true }
+bitflags = { workspace = true }
 byte-unit = { workspace = true }
 libc = { workspace = true }
 parse-display = { workspace = true }

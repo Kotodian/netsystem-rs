@@ -4,7 +4,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use hammer_infra::svm::fifo::{FifoSegmentHeader, SvmFifoShared};
-use hammer_infra::svm::fifo_segment::{SvmFifoSegment, SvmFifoSegmentConfig};
+use hammer_infra::svm::fifo_segment::{FifoSegmentFtype, SvmFifoSegment, SvmFifoSegmentConfig};
 use hammer_infra::svm::ssvm::{SsvmConfig, SsvmPrivate, SsvmSegmentBackend};
 
 const SEGMENT_SIZE: usize = 1 << 20;
@@ -23,7 +23,7 @@ fn memfd_config(name: &str) -> SsvmConfig {
 #[test]
 fn fifo_segment_uses_and_reclaims_shared_freelists() {
     let segment = Arc::new(
-        SsvmPrivate::server_init_private(&SsvmConfig {
+        SsvmPrivate::server_init_fifo_segment(&SsvmConfig {
             backend: SsvmSegmentBackend::Private,
             name: "hammer-fifo-segment".to_string(),
             size: SEGMENT_SIZE,
@@ -33,22 +33,27 @@ fn fifo_segment_uses_and_reclaims_shared_freelists() {
         })
         .expect("private segment"),
     );
-    let mut fifo_segment =
-        SvmFifoSegment::new(Arc::clone(&segment), SvmFifoSegmentConfig { slices: 2 })
-            .expect("fifo segment");
+    let mut fifo_segment = SvmFifoSegment::new(
+        Arc::clone(&segment),
+        SvmFifoSegmentConfig {
+            slices: 2,
+            ..SvmFifoSegmentConfig::default()
+        },
+    )
+    .expect("fifo segment");
 
-    fifo_segment.preallocate_chunks(1, 4096, 8).expect("chunks");
+    fifo_segment.preallocate_chunks(1, 8192, 8).expect("chunks");
     fifo_segment
         .preallocate_fifo_headers(1, 2)
         .expect("headers");
-    assert_eq!(fifo_segment.num_free_chunks(4096), 8);
-    assert_eq!(fifo_segment.num_free_fifos(), 2);
+    assert_eq!(fifo_segment.free_chunk_count(8192), 8);
+    assert_eq!(fifo_segment.free_fifo_count(), 2);
 
     let index = fifo_segment
-        .allocate_fifo(1, 7000)
+        .allocate_fifo(1, 7000, FifoSegmentFtype::RxFifo)
         .expect("fifo allocation");
-    assert_eq!(fifo_segment.num_free_fifos(), 1);
-    assert_eq!(fifo_segment.num_free_chunks(4096), 6);
+    assert_eq!(fifo_segment.free_fifo_count(), 1);
+    assert_eq!(fifo_segment.free_chunk_count(8192), 7);
     let fifo = fifo_segment.fifo(1, index).expect("fifo handle");
     let payload = vec![0xA5; 7000];
     assert_eq!(fifo.enqueue(&payload), payload.len());
@@ -56,25 +61,30 @@ fn fifo_segment_uses_and_reclaims_shared_freelists() {
     assert_eq!(fifo.dequeue(received.len(), &mut received), payload.len());
     assert_eq!(received, payload);
 
-    fifo_segment.free_fifo(1, index).expect("fifo free");
-    assert_eq!(fifo_segment.num_free_fifos(), 2);
-    assert_eq!(fifo_segment.num_free_chunks(4096), 8);
+    fifo_segment.free_server_fifo(1, index).expect("fifo free");
+    assert_eq!(fifo_segment.free_fifo_count(), 2);
+    assert_eq!(fifo_segment.free_chunk_count(8192), 8);
     assert!(fifo_segment.cached_bytes() >= 8 * 4096);
-    assert!(fifo_segment.available_bytes() >= fifo_segment.free_bytes());
+    assert!(fifo_segment.available_bytes() >= fifo_segment.freelist_bytes());
 }
 
 #[test]
 fn fifo_segment_attaches_shared_fifo_by_offset() {
     let server_segment = Arc::new(
-        SsvmPrivate::server_init_memfd(&memfd_config("hammer-fifo-segment-attach"))
+        SsvmPrivate::server_init_fifo_segment(&memfd_config("hammer-fifo-segment-attach"))
             .expect("server segment"),
     );
     let mut server = SvmFifoSegment::new(
         Arc::clone(&server_segment),
-        SvmFifoSegmentConfig { slices: 1 },
+        SvmFifoSegmentConfig {
+            slices: 1,
+            ..SvmFifoSegmentConfig::default()
+        },
     )
     .expect("server fifo segment");
-    let fifo_index = server.allocate_fifo(0, 4096).expect("server fifo");
+    let fifo_index = server
+        .allocate_fifo(0, 4096, FifoSegmentFtype::RxFifo)
+        .expect("server fifo");
     let fifo_offset = server
         .fifo(0, fifo_index)
         .expect("server fifo handle")
@@ -85,11 +95,14 @@ fn fifo_segment_attaches_shared_fifo_by_offset() {
         Arc::new(SsvmPrivate::client_init_memfd(descriptor).expect("client segment attach"));
     let mut client = SvmFifoSegment::attach(
         Arc::clone(&client_segment),
-        SvmFifoSegmentConfig { slices: 1 },
+        SvmFifoSegmentConfig {
+            slices: 1,
+            ..SvmFifoSegmentConfig::default()
+        },
     )
     .expect("client fifo segment attach");
     let client_index = client
-        .attach_fifo(0, fifo_offset)
+        .attach_fifo(0, fifo_offset as usize)
         .expect("client fifo attach");
 
     let payload = b"shared fifo";
@@ -104,9 +117,7 @@ fn fifo_segment_attaches_shared_fifo_by_offset() {
         payload.len()
     );
     assert_eq!(&received, payload);
-    client
-        .detach_fifo(0, client_index)
-        .expect("client fifo detach");
+    client.cleanup().expect("client fifo cleanup");
 }
 
 #[test]
