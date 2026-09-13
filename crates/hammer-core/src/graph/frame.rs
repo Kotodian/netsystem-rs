@@ -344,7 +344,9 @@ mod tests {
     // argument access follows vlib/main.c vlib_frame_alloc_to_node.
     #[test]
     fn fixed_frame_offsets_and_typed_arguments_match_registration() {
-        hammer_infra::main_heap::init_default().unwrap();
+        hammer_infra::mem::MainHeapConfig::default()
+            .initialize()
+            .unwrap();
         let mut frame = Frame::<u64, u32, u16>::new(7);
         frame.validate_layout::<u64, u32, u16>();
         assert_eq!(Frame::<u64, u32, u16>::SCALAR_OFFSET, 16);

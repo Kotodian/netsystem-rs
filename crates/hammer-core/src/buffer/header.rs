@@ -403,7 +403,9 @@ mod tests {
     // by ADR-0007; they are not claimed to be separate upstream test cases.
     #[test]
     fn single_segment_operations_preserve_the_packet_window() -> DataPlaneResult<()> {
-        hammer_infra::main_heap::init_default().unwrap();
+        hammer_infra::mem::MainHeapConfig::default()
+            .initialize()
+            .unwrap();
         BufferMain::new(2048, 16, &[0, 1], 1, PageSize::Default)?;
         let buffers = BufferMain::global();
         // SAFETY: this test is the only executor for runtime thread index 1.
