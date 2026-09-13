@@ -5,7 +5,6 @@ use std::sync::Arc;
 use std::sync::OnceLock;
 
 use hammer_runtime::attach::AppServer;
-use hammer_runtime::config::Memory;
 use hammer_runtime::global_main::GlobalMain;
 use hammer_runtime::log::Level;
 use hammer_runtime::{
@@ -24,7 +23,7 @@ static STARTUP_CONFIG_PATH: OnceLock<PathBuf> = OnceLock::new();
 #[derive(Debug, Default, serde::Deserialize)]
 #[serde(default)]
 struct DaemonEarlyConfig {
-    memory: Memory,
+    memory: hammer_infra::mem::MainHeapConfig,
     log: DaemonLogConfig,
 }
 
@@ -35,7 +34,7 @@ struct DaemonLogConfig {
 }
 
 impl DaemonEarlyConfig {
-    fn validate(&self) -> RuntimeResult<()> {
+    fn validate(&self) -> Result<(), hammer_infra::mem::MemError> {
         self.memory.validate()
     }
 }
@@ -68,7 +67,7 @@ fn main() {
     let log_level = log.level;
     drop(config_document);
     drop(config_path);
-    memory.ensure_main_heap().unwrap_or_else(|error| {
+    memory.initialize().unwrap_or_else(|error| {
         eprintln!("Failed to initialize main heap: {error}");
         std::process::exit(1);
     });

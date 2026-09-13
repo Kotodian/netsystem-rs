@@ -16,12 +16,13 @@ use std::ptr::NonNull;
 use std::sync::Arc;
 
 use hammer_core::data_plane::NodeId;
-use hammer_runtime::config::Memory;
 use hammer_runtime::global_main::GlobalMain;
 use hammer_runtime::{DataPlaneMain, PluginError, PluginMain, RuntimeError, ThreadMain};
 
 // Shared device/interface/transport/session registrations remain host-owned.
 use hammer_service as _;
+
+use hammer_infra::mem::MainHeapConfig;
 
 const EXAMPLE_CONFIG: &str = r#"
 plugins = ["ip", "tcp", "udp"]
@@ -44,7 +45,7 @@ const PLUGIN_NAMES: [&str; 3] = ["ip", "tcp", "udp"];
 #[derive(Debug, Default, serde::Deserialize)]
 #[serde(default)]
 struct ExampleEarlyConfig {
-    memory: Memory,
+    memory: MainHeapConfig,
 }
 
 #[derive(Debug, Default, serde::Deserialize)]
@@ -57,6 +58,8 @@ struct ExampleStartupConfig {
 enum ExampleError {
     #[error(transparent)]
     Hammer(#[from] RuntimeError),
+    #[error(transparent)]
+    MainHeap(#[from] hammer_infra::mem::MemError),
     #[error("required image does not exist: {path}")]
     ImageMissing { path: PathBuf },
     #[error("failed to run `{tool}` for {path}")]
@@ -110,7 +113,7 @@ enum ExampleError {
 fn main() -> Result<(), ExampleError> {
     let early: ExampleEarlyConfig = toml::from_str(EXAMPLE_CONFIG)
         .map_err(|error| RuntimeError::config_parse(format!("parse example TOML: {error}")))?;
-    let main_heap_capacity = early.memory.ensure_main_heap()?;
+    let main_heap_capacity = early.memory.initialize()?;
     let roots = toml::from_str::<ExampleStartupConfig>(EXAMPLE_CONFIG)
         .map_err(|error| RuntimeError::config_parse(format!("parse example TOML: {error}")))?
         .plugins;

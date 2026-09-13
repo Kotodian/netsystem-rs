@@ -75,8 +75,6 @@ pub enum RuntimeError {
         source: std::io::Error,
     },
     #[error(transparent)]
-    MainHeap(#[from] hammer_infra::mem::MemError),
-    #[error(transparent)]
     Plugin(#[from] crate::plugin::PluginError),
     #[error(transparent)]
     Stats(#[from] hammer_stats::StatsError),
