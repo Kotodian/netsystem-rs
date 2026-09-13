@@ -2,8 +2,8 @@
 
 - 日期：2026-09-12
 - 修正日期：2026-09-13
-- 状态：Accepted；设计修正已于 2026-09-13 批准；Phase 1 allocator、VM map 与
-  active heap 代码路径已落地但尚未完成评审与验证，Phase 2-4 尚未实施
+- 状态：Accepted；设计修正已于 2026-09-13 批准；Phase 1 allocator、VM map、
+  active heap 与 Phase 2 fixed-VA SVM region 已实施，Phase 3-4 尚未实施
 - 范围：`hammer-infra` allocator、`svm_region` 的 pvt/data heap、运行时线程入口
 - VPP 基线：`third_party/vpp`，提交 `629fe2764bd997189fedd2d98cbe8dc9189c1ec3`
 - 被替换 allocator 调研：当前 `libmimalloc-sys 0.1.49` 内置 mimalloc `3.3.2`；
@@ -627,7 +627,7 @@ VPP与Hammer错误边界逐项对应如下：
 | --- | --- | --- | --- |
 | A1 | `#[global_allocator] static MEM_MAIN: MemMain`；`GlobalAlloc`实现；page/NUMA/`alloc_free_intercept`/map/heap/thread字段；`MemVmMapHeader`；direct getter；public startup只经`MainHeapConfig::initialize` | `hammer-infra::mem`；所有Rust allocation、VM mapping与daemon/ctl startup | 移植有运行语义的`clib_mem_main_t` authority并让它本身成为Rust global allocator；C last-error pointer由owned typed `Result`替代；删除`HammerMainHeap`代理和`MemDiagnostics` wrapper |
 | A2 | `MemThreadMain`；const-initialized allocator `thread_local!`、unsafe process-lifetime registration、private raw active selector、Copy thread index | allocator TLS；runtime thread entries | `GlobalAlloc`需要VPP等价current-thread selector，但不得制造`'static`safe borrow；短命thread不链接到`MemMain.threads` |
-| A3 | `MemHeap`；`create_at`、`allocate`、`allocate_zeroed`、`reallocate`、`deallocate`、`contains`、`base`、`size` | `MemMain`、SVM region、现有 explicit allocator consumers | 统一 process heap和pvt/data heap身份；替代 crate-private `Heap` 和 `SvmRegionHeap` |
+| A3 | `MemHeap`；`create_at`、仅供发布前回滚的crate-private `destroy`、`allocate`、`allocate_zeroed`、`reallocate`、`deallocate`、`is_heap_object`、`base`、`size` | `MemMain`、SVM region、现有 explicit allocator consumers | 统一 process heap和pvt/data heap身份；替代 crate-private `Heap` 和 `SvmRegionHeap`；`destroy`对应`clib_mem_destroy_heap`且正常region unmap不调用 |
 | A4 | `ActiveHeap<'a>`；`MemHeap::activate` | 需要临时切换的 region/allocator caller | 保存并 RAII恢复 previous heap；不能用 closure或公开 raw setter表达 unwind-safe nested scope |
 | A5 | `MemError` concrete operation variants | `hammer-infra::mem`；startup、VM mapping、backing fd、NUMA和heap create seam | 替换当前`MainHeapError`及`PhysmemError`透传；VPP assert/OOM边界不进入该enum，OS source只在真实control-plane失败处保留 |
 | A6 | `SvmRegionHeader` 的 VPP fields：`virtual_base`、`pvt_heap: *mut MemHeap`、`data_base`、`data_heap: *mut MemHeap`、bitmap/name/backing/client pointers | `hammer-infra::svm::region` | 恢复 VPP pointer/fixed-VA layout；删除两个内嵌offset heap descriptor和当前failure latch，不增加替代state |
@@ -768,6 +768,7 @@ impl MemHeap {
         locked: bool,
         name: &str,
     ) -> Result<NonNull<Self>, MemError>;
+    pub(crate) unsafe fn destroy(&self);
 
     pub fn activate(&self) -> ActiveHeap<'_>;
     pub fn allocate(&self, layout: Layout) -> Option<NonNull<u8>>;
@@ -900,6 +901,7 @@ pub enum MemError {
 pub struct SvmRegionFlags(u64);
 
 impl SvmRegionFlags {
+    pub const NONE: Self;
     pub const DATA_HEAP: Self;
     pub const NODATA: Self;
     pub fn contains(self, flag: Self) -> bool;
@@ -1148,6 +1150,6 @@ git diff --check
 设计 verdict：**Aligned design，已批准**。active heap、pvt/data heap、root init和
 attach ownership与vendored VPP一致；typed `Result`替代last-error pointer、只登记
 process-lifetime TLS、safe fixed-map、通过SCM_RIGHTS交付backing fd、version最后发布以及
-region owner-death后停止访问是明确的Hammer差异，均有对应验证。Phase 1 allocator、VM map
-与active heap的生产代码路径已经迁移，但评审和验证尚未完成；H2-H6描述的SVM region旧实现仍由
-Phase 2-4迁移，不能因本文完成而声称整个issue已经对齐。
+region owner-death后停止访问是明确的Hammer差异，均有对应验证。Phase 1 allocator、VM map、
+active heap与Phase 2 fixed-VA SVM region生产代码已经迁移；Phase 3-4仍未完成，不能因本文
+完成而声称整个issue已经对齐。

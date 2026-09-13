@@ -1,602 +1,477 @@
-//! Behavior tests for the SVM region owner (ADR-0011 section 12).
-//!
-//! A region is a payload layout: a fixed header, one or two offset heaps, the
-//! member table, and the root subregion registry. Every shared location is a
-//! payload-relative offset, so the cross-process cases attach the same memfd
-//! from a second exec and check that both processes see the same objects.
-
-#![cfg(target_os = "linux")]
-
-use std::alloc::Layout;
-use std::mem::size_of;
+use std::ffi::c_void;
+use std::num::NonZeroUsize;
+use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 use std::process::{Command, Stdio};
-use std::sync::Arc;
-use std::sync::atomic::Ordering;
-use std::time::Duration;
+use std::ptr::NonNull;
+use std::sync::atomic::AtomicU64;
 
+use byte_unit::Byte;
+use hammer_infra::mem::{MainHeapConfig, MemMain};
 use hammer_infra::svm::region::{
-    REGION_FLAG_DATA_HEAP, REGION_FLAG_SUBDIVIDED, RegionLockTag, SvmRegion, SvmRegionConfig,
-    SvmRegionError, SvmRegionHeader, SvmRegionState,
+    SVM_REGION_VERSION, SvmRegion, SvmRegionConfig, SvmRegionError, SvmRegionFlags,
 };
-use hammer_infra::svm::region_heap::SvmRegionHeap;
-use hammer_infra::svm::ssvm::{SSVM_PAYLOAD_OFFSET, SsvmConfig, SsvmPrivate, SsvmSegmentBackend};
 
-const CHILD_CASE: &str = "HAMMER_SVM_REGION_CHILD_CASE";
-const CHILD_FD: &str = "HAMMER_SVM_REGION_CHILD_FD";
-const CHILD_TEST: &str = "region_is_reachable_from_another_process";
-const CHILD_LOCK_TEST: &str = "region_lock_owner_death_fails_the_region";
-const REGION_BYTES: u64 = 1 << 20;
+const REGION_PROCESS_MODE: &str = "HAMMER_REGION_PROCESS_MODE";
+const REGION_PROCESS_FD: &str = "HAMMER_REGION_PROCESS_FD";
+const REGION_PROCESS_BASE: &str = "HAMMER_REGION_PROCESS_BASE";
+const REGION_PROCESS_SIZE: &str = "HAMMER_REGION_PROCESS_SIZE";
+const REGION_PROCESS_NOTIFY_FD: &str = "HAMMER_REGION_PROCESS_NOTIFY_FD";
 
-fn subdivided_config() -> SvmRegionConfig {
-    SvmRegionConfig {
-        size: REGION_BYTES,
-        flags: REGION_FLAG_SUBDIVIDED,
-    }
-}
-
-fn data_heap_config() -> SvmRegionConfig {
-    SvmRegionConfig {
-        size: REGION_BYTES,
-        flags: REGION_FLAG_DATA_HEAP,
-    }
-}
-
-fn layout(size: usize, align: usize) -> Layout {
-    Layout::from_size_align(size, align).expect("test layout")
-}
-
-fn header_end() -> u64 {
-    (size_of::<SvmRegionHeader>() as u64).div_ceil(64) * 64
-}
-
-/// Creates a segment plus region for `config`, using the layout the region asks
-/// for so the mapping size and the region layout cannot drift apart.
-fn create_region(
-    config: &SvmRegionConfig,
-) -> Result<(Arc<SsvmPrivate>, SvmRegion), SvmRegionError> {
-    let mapping = SvmRegion::layout(config)?;
-    let segment = Arc::new(SsvmPrivate::server_init_memfd(&SsvmConfig {
-        backend: SsvmSegmentBackend::Memfd,
-        name: "hammer-svm-region-test".to_string(),
-        size: mapping.size(),
-        requested_va: 0,
-        huge_page: false,
-        attach_timeout: Duration::from_secs(5),
-    })?);
-    let region = SvmRegion::create(Arc::clone(&segment), config)?;
-    Ok((segment, region))
-}
-
-fn header(region: &SvmRegion, segment: &SsvmPrivate) -> *mut SvmRegionHeader {
-    segment
-        .offset_ptr(region.header_offset(), size_of::<SvmRegionHeader>(), 64)
-        .expect("region header inside mapping")
-        .cast()
-}
-
-fn read_payload(segment: &SsvmPrivate, region: &SvmRegion, offset: u64, length: usize) -> Vec<u8> {
-    let pointer = segment
-        .offset_ptr(region.header_offset() + offset, length, 1)
-        .expect("payload range inside mapping");
-    // SAFETY: the range was validated against the mapping, and the segment owns
-    // that mapping for the duration of the borrow.
-    unsafe { std::slice::from_raw_parts(pointer, length) }.to_vec()
-}
-
-fn write_payload(segment: &SsvmPrivate, region: &SvmRegion, offset: u64, bytes: &[u8]) {
-    let pointer = segment
-        .offset_ptr(region.header_offset() + offset, bytes.len(), 1)
-        .expect("payload range inside mapping");
-    // SAFETY: as `read_payload`; the test is the only writer of this block.
-    unsafe { std::slice::from_raw_parts_mut(pointer, bytes.len()) }.copy_from_slice(bytes);
-}
+const LOCAL_ROOT_BASE: usize = 0x4000_0000_0000;
+const SHARED_REGION_BASE: usize = 0x4100_0000_0000;
+const OWNER_DEATH_BASE: usize = 0x4200_0000_0000;
 
 #[test]
-fn region_layout_reserves_header_metadata_and_data() {
-    let subdivided = SvmRegion::layout(&subdivided_config()).expect("subdivided layout");
-    let regular = SvmRegion::layout(&data_heap_config()).expect("regular layout");
-    assert!(
-        subdivided.size() as u64 >= REGION_BYTES + SSVM_PAYLOAD_OFFSET,
-        "subdivided mapping {} cannot hold the header and a heap",
-        subdivided.size()
-    );
-    assert!(
-        regular.size() >= subdivided.size(),
-        "the requested payload dominates the mapping size"
-    );
-    let smallest_subdivided = SvmRegion::layout(&SvmRegionConfig {
-        size: 1,
-        flags: REGION_FLAG_SUBDIVIDED,
-    })
-    .expect("minimum subdivided layout");
-    let smallest_regular = SvmRegion::layout(&SvmRegionConfig {
-        size: 1,
-        flags: REGION_FLAG_DATA_HEAP,
-    })
-    .expect("minimum regular layout");
-    assert_eq!(
-        smallest_subdivided.size() as u64,
-        SSVM_PAYLOAD_OFFSET + header_end() + 64
-    );
-    assert!(
-        smallest_regular.size() > smallest_subdivided.size(),
-        "a regular region reserves a metadata heap in front of its data section"
-    );
-    assert_eq!(subdivided.align(), 64);
-    let unknown = SvmRegionConfig {
-        size: REGION_BYTES,
-        flags: 1 << 5,
+fn fixed_va_regions_use_pvt_and_data_mem_heaps() {
+    if let Ok(mode) = std::env::var(REGION_PROCESS_MODE) {
+        run_region_process(&mode);
+    }
+
+    for mode in ["local-root", "shared-region", "old-layout", "owner-death"] {
+        let output = Command::new(std::env::current_exe().expect("current test executable"))
+            .env(REGION_PROCESS_MODE, mode)
+            .arg("--exact")
+            .arg("fixed_va_regions_use_pvt_and_data_mem_heaps")
+            .arg("--nocapture")
+            .output()
+            .expect("spawn region process");
+        assert!(
+            output.status.success(),
+            "region process {mode} failed\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+}
+
+fn run_region_process(mode: &str) -> ! {
+    initialize_main_heap();
+    match mode {
+        "local-root" => local_root_region(),
+        "shared-region" => shared_region_server(),
+        "shared-client" => shared_region_client(),
+        "occupied-client" => occupied_region_client(),
+        "exited-client" => exited_region_client(),
+        "old-layout" => old_layout_is_rejected(),
+        "owner-death" => owner_death_server(),
+        "owner-death-client" => owner_death_client(),
+        _ => panic!("unknown region process mode {mode}"),
+    }
+    unsafe { libc::_exit(0) }
+}
+
+fn initialize_main_heap() {
+    MainHeapConfig {
+        size: Byte::from_u64(256 << 20),
+        page_size: hammer_infra::PageSize::Default,
+        default_hugepage_size: None,
+    }
+    .initialize()
+    .expect("initialize process Main Heap");
+}
+
+fn local_root_region() {
+    let page_size = MemMain::system_page_size();
+    let root_config = SvmRegionConfig {
+        name: "phase-two-root".to_owned(),
+        size: 32 << 20,
+        pvt_heap_size: 0,
+        flags: SvmRegionFlags::NODATA,
     };
-    match SvmRegion::layout(&unknown) {
-        Err(SvmRegionError::LayoutMismatch { declared, .. }) => assert_eq!(declared, 1 << 5),
-        other => panic!("unknown flags must be rejected, got {other:?}"),
+    let mut root = SvmRegion::create(
+        NonZeroUsize::new(LOCAL_ROOT_BASE).expect("fixed root base"),
+        &root_config,
+        memfd("phase-two-root"),
+    )
+    .expect("create root region");
+    assert_eq!(root.base().as_ptr().addr(), LOCAL_ROOT_BASE);
+    assert_eq!(root.size(), root_config.size);
+    assert_eq!(root.flags(), SvmRegionFlags::NODATA);
+    assert_eq!(root.client_count().expect("root client count"), 1);
+
+    {
+        let lock = root.lock().expect("lock root region");
+        assert!(lock.data_heap().is_none());
+        assert_eq!(
+            lock.pvt_heap().base().as_ptr().addr(),
+            LOCAL_ROOT_BASE + page_size
+        );
+        let main = lock.main_region().expect("root main region");
+        assert_eq!(main.subregion_count(), 0);
+        assert!(lock.pvt_heap().is_heap_object(NonNull::from(main).cast()));
     }
-    let contradictory = SvmRegionConfig {
-        size: REGION_BYTES,
-        flags: REGION_FLAG_DATA_HEAP | REGION_FLAG_SUBDIVIDED,
+
+    let data_config = SvmRegionConfig {
+        name: "phase-two-data".to_owned(),
+        size: 2 << 20,
+        pvt_heap_size: 0,
+        flags: SvmRegionFlags::DATA_HEAP,
     };
-    match SvmRegion::layout(&contradictory) {
-        Err(SvmRegionError::UnsupportedOperation { .. }) => {}
-        other => panic!("subdivided data heap must be rejected, got {other:?}"),
-    }
-}
-
-#[test]
-fn region_publishes_and_reports_its_shared_header() -> Result<(), SvmRegionError> {
-    let (segment, region) = create_region(&subdivided_config())?;
-    assert_eq!(region.flags()?, REGION_FLAG_SUBDIVIDED);
-    assert_eq!(region.state()?, SvmRegionState::Ready);
-    assert_eq!(region.virtual_size()?, segment.payload_len());
-    assert_eq!(region.header_offset(), SSVM_PAYLOAD_OFFSET);
-    assert!(Arc::ptr_eq(region.ssvm(), &segment));
-
-    let attached = SvmRegion::attach(Arc::clone(&segment))?;
-    assert_eq!(attached.flags()?, REGION_FLAG_SUBDIVIDED);
-    assert_eq!(attached.state()?, SvmRegionState::Ready);
-    assert_eq!(attached.virtual_size()?, region.virtual_size()?);
-    assert_eq!(attached.find_or_create_subregion("echo")?, (1, true));
-    assert_eq!(
-        region.subregion_id("echo")?,
-        Some(1),
-        "both handles see one registry"
-    );
-    Ok(())
-}
-
-#[test]
-fn region_registry_assigns_monotonic_ids() -> Result<(), SvmRegionError> {
-    let (segment, region) = create_region(&subdivided_config())?;
-    let attached = SvmRegion::attach(segment)?;
-    assert_eq!(region.subregion_count()?, 0);
-    assert!(region.subregion_names()?.next().is_none());
-    assert_eq!(region.find_or_create_subregion("echo")?, (1, true));
-    assert_eq!(region.find_or_create_subregion("echo")?, (1, false));
-    assert_eq!(region.find_or_create_subregion("sip")?, (2, true));
-    assert_eq!(region.subregion_count()?, 2);
-    assert_eq!(region.subregion_id("sip")?, Some(2));
-    let mut names: Vec<&str> = region.subregion_names()?.collect();
-    names.sort_unstable();
-    assert_eq!(names, ["echo", "sip"]);
-    assert_eq!(attached.remove_subregion("echo")?, Some(1));
-    assert_eq!(region.subregion_id("echo")?, None);
-    assert_eq!(region.subregion_count()?, 1);
-    assert_eq!(
-        region.find_or_create_subregion("echo")?,
-        (3, true),
-        "a removed name gets a fresh id, never the old one"
-    );
-    Ok(())
-}
-
-#[test]
-fn region_registry_reuse_does_not_grow_the_table() -> Result<(), SvmRegionError> {
-    let (_, region) = create_region(&subdivided_config())?;
-    assert_eq!(region.find_or_create_subregion("loop")?, (1, true));
-    assert_eq!(region.remove_subregion("loop")?, Some(1));
-    let baseline = region.used_bytes()?;
-    for round in 2..=201 {
-        assert_eq!(region.find_or_create_subregion("loop")?, (round, true));
-        assert_eq!(region.remove_subregion("loop")?, Some(round));
-    }
-    assert_eq!(
-        region.used_bytes()?,
-        baseline,
-        "repeated create/remove must not leak registry storage"
-    );
-    assert_eq!(region.subregion_count()?, 0);
-    Ok(())
-}
-
-#[test]
-fn region_registry_rejects_invalid_names() -> Result<(), SvmRegionError> {
-    let (_, region) = create_region(&subdivided_config())?;
-    match region.find_or_create_subregion("") {
-        Err(SvmRegionError::InvalidRegionName { length: 0 }) => {}
-        other => panic!("empty name must be rejected, got {other:?}"),
-    }
-    let longest = "n".repeat(256);
-    assert_eq!(region.find_or_create_subregion(&longest)?, (1, true));
-    let too_long = "n".repeat(257);
-    match region.find_or_create_subregion(&too_long) {
-        Err(SvmRegionError::InvalidRegionName { length: 257 }) => {}
-        other => panic!("overlong name must be rejected, got {other:?}"),
-    }
-    assert_eq!(region.subregion_count()?, 1);
-    Ok(())
-}
-
-#[test]
-fn region_data_heap_allocates_reallocates_and_frees() -> Result<(), SvmRegionError> {
-    let (segment, region) = create_region(&data_heap_config())?;
-    let data_start = unsafe { (*header(&region, &segment)).data_base_offset };
-    assert_eq!(region.used_bytes()?, 0);
-    assert_eq!(
-        region.free_bytes()? + region.used_bytes()?,
-        region.virtual_size()? - header_end(),
-        "the heaps account for the whole payload behind the header"
-    );
-    let request = layout(64, 8);
-    let offset = region.allocate(request)?;
-    assert!(
-        offset >= data_start,
-        "a data heap region allocates in its data section"
-    );
-    write_payload(&segment, &region, offset, &[0xAB; 64]);
-    assert!(region.used_bytes()? >= 64);
-    let grown = region.reallocate(offset, request, 128)?;
-    assert_eq!(read_payload(&segment, &region, grown, 64), vec![0xAB; 64]);
-    region.deallocate(grown, layout(128, 8))?;
-    assert_eq!(region.used_bytes()?, 0);
-    assert_eq!(
-        region.allocate(request)?,
-        offset,
-        "the released block is reusable"
-    );
-    Ok(())
-}
-
-#[test]
-fn region_root_and_user_context_round_trip() -> Result<(), SvmRegionError> {
-    let (segment, region) = create_region(&data_heap_config())?;
-    assert_eq!(region.root()?, None);
-    assert_eq!(region.user_ctx_offset()?, 0);
-    let offset = region.allocate(layout(32, 8))?;
-    region.publish_root(offset)?;
-    assert_eq!(region.root()?, Some(offset));
-    let beyond = region.virtual_size()?;
-    match region.publish_root(beyond) {
-        Err(SvmRegionError::InvalidRoot { offset: reported }) => assert_eq!(reported, beyond),
-        other => panic!("out-of-range root must be rejected, got {other:?}"),
-    }
-    match region.publish_root(header_end() - 1) {
-        Err(SvmRegionError::InvalidRoot { offset }) => assert_eq!(offset, header_end() - 1),
-        other => panic!("a root inside the header must be rejected, got {other:?}"),
-    }
-    let attached = SvmRegion::attach(Arc::clone(&segment))?;
-    assert_eq!(attached.root()?, Some(offset));
-    attached.publish_user_ctx(offset)?;
-    assert_eq!(region.user_ctx_offset()?, offset);
-    attached.publish_root(0)?;
-    assert_eq!(region.root()?, None);
-    Ok(())
-}
-
-#[test]
-fn region_regular_layout_has_no_registry() -> Result<(), SvmRegionError> {
-    let (_, region) = create_region(&data_heap_config())?;
-    match region.main() {
-        Err(SvmRegionError::UnsupportedOperation { .. }) => {}
-        other => panic!("a regular region has no registry, got {other:?}"),
-    }
-    match region.find_or_create_subregion("echo") {
-        Err(SvmRegionError::UnsupportedOperation { .. }) => {}
-        other => panic!("a regular region has no registry, got {other:?}"),
-    }
-    Ok(())
-}
-
-#[test]
-fn region_create_requires_a_created_segment() -> Result<(), SvmRegionError> {
-    let (segment, region) = create_region(&subdivided_config())?;
-    drop(region);
-    let fd = segment.fd().expect("shared descriptor");
-    let attached = SsvmPrivate::client_init_memfd(fd)?;
-    match SvmRegion::create(Arc::new(attached), &subdivided_config()) {
-        Err(SvmRegionError::UnsupportedOperation { .. }) => Ok(()),
-        other => panic!("attached segments cannot create a region, got {other:?}"),
-    }
-}
-
-#[test]
-fn region_attach_validates_the_shared_header() -> Result<(), SvmRegionError> {
+    let data_region = root
+        .find_or_create_subregion(&data_config, memfd("phase-two-data"))
+        .expect("create Data Heap subregion");
+    let data_base = data_region.base();
     {
-        let (segment, region) = create_region(&subdivided_config())?;
-        unsafe {
-            (*header(&region, &segment))
-                .version
-                .store(0, Ordering::Release)
-        };
-        match SvmRegion::attach(Arc::clone(&segment)) {
-            Err(SvmRegionError::NotReady {
-                state: SvmRegionState::Uninitialized,
-            }) => {}
-            other => panic!("an unpublished region must be NotReady, got {other:?}"),
-        }
+        let lock = data_region.lock().expect("lock Data Heap region");
+        let data_heap = lock.data_heap().expect("Data Heap exists");
+        let active_heap = data_heap.activate();
+        let mut bytes = Vec::with_capacity(1);
+        bytes.extend(0..4096u32);
+        let text = String::from("allocated from the active Data Heap");
+        assert!(data_heap.is_heap_object(NonNull::from(bytes.as_slice()).cast()));
+        assert!(data_heap.is_heap_object(NonNull::from(text.as_bytes()).cast()));
+        drop(text);
+        drop(bytes);
+        drop(active_heap);
     }
+
+    let plain_config = SvmRegionConfig {
+        name: "phase-two-plain".to_owned(),
+        size: 64 << 10,
+        pvt_heap_size: 0,
+        flags: SvmRegionFlags::NONE,
+    };
+    let plain_region = root
+        .find_or_create_subregion(&plain_config, memfd("phase-two-plain"))
+        .expect("create subregion without Data Heap");
     {
-        let (segment, region) = create_region(&subdivided_config())?;
-        unsafe {
-            (*header(&region, &segment))
-                .version
-                .store(9, Ordering::Release)
-        };
-        match SvmRegion::attach(Arc::clone(&segment)) {
-            Err(SvmRegionError::UnsupportedVersion { found, expected }) => {
-                assert_eq!((found, expected), (9, (1 << 16) | 1));
-            }
-            other => panic!("an unknown version must be rejected, got {other:?}"),
-        }
+        let lock = plain_region.lock().expect("lock plain region");
+        assert!(lock.data_heap().is_none());
+        assert!(lock.main_region().is_none());
     }
+
     {
-        let (segment, region) = create_region(&subdivided_config())?;
-        unsafe { (*header(&region, &segment)).magic = 0 };
-        match SvmRegion::attach(Arc::clone(&segment)) {
-            Err(SvmRegionError::InvalidMagic { found: 0 }) => {}
-            other => panic!("a bad magic must be rejected, got {other:?}"),
-        }
+        let lock = root.lock().expect("lock populated root");
+        let main = lock.main_region().expect("root main region");
+        let data_index = main
+            .subregion_index(&data_config.name)
+            .expect("Data Heap region is indexed by name");
+        assert!(main.subregion(data_index).is_some());
+        assert!(main.subregion_index(&plain_config.name).is_some());
+        assert_eq!(main.subregion_count(), 2);
     }
+
+    plain_region.unmap().expect("unmap plain subregion");
+    data_region.unmap().expect("unmap Data Heap subregion");
     {
-        let (segment, region) = create_region(&subdivided_config())?;
-        unsafe { (*header(&region, &segment)).virtual_size += 1 };
-        match SvmRegion::attach(Arc::clone(&segment)) {
-            Err(SvmRegionError::LayoutMismatch { declared, expected }) => {
-                assert_eq!(declared, segment.payload_len() + 1);
-                assert_eq!(expected, segment.payload_len());
-            }
-            other => panic!("a size mismatch must be rejected, got {other:?}"),
-        }
+        let lock = root.lock().expect("lock cleaned root");
+        let main = lock.main_region().expect("root main region");
+        assert_eq!(main.subregion_count(), 0);
+        assert!(main.subregion_index(&data_config.name).is_none());
+        assert!(main.subregion_index(&plain_config.name).is_none());
     }
-    {
-        let (segment, region) = create_region(&subdivided_config())?;
-        unsafe {
-            (*header(&region, &segment))
-                .flags
-                .store(1 << 5, Ordering::Release)
-        };
-        match SvmRegion::attach(Arc::clone(&segment)) {
-            Err(SvmRegionError::LayoutMismatch { declared, expected }) => {
-                assert_eq!((declared, expected), (1 << 5, 0b101));
-            }
-            other => panic!("unknown flags must be rejected, got {other:?}"),
-        }
-    }
-    {
-        let (segment, region) = create_region(&subdivided_config())?;
-        unsafe { (*header(&region, &segment)).data_base_offset = u64::MAX };
-        match SvmRegion::attach(Arc::clone(&segment)) {
-            Err(SvmRegionError::InvalidBounds { offset, .. }) => assert_eq!(offset, u64::MAX),
-            other => panic!("an out-of-range data section must be rejected, got {other:?}"),
-        }
-    }
-    {
-        let (segment, region) = create_region(&subdivided_config())?;
-        unsafe { (*header(&region, &segment)).metadata_heap = SvmRegionHeap::new() };
-        match SvmRegion::attach(Arc::clone(&segment)) {
-            Err(SvmRegionError::LayoutMismatch { declared: 0, .. }) => {}
-            other => panic!("an inconsistent heap range must be rejected, got {other:?}"),
-        }
-    }
-    Ok(())
+
+    let replacement = root
+        .find_or_create_subregion(&data_config, memfd("phase-two-data-replacement"))
+        .expect("reuse released root bitmap range");
+    assert_eq!(replacement.base(), data_base);
+    replacement.unmap().expect("unmap replacement region");
+    root.unmap().expect("unmap root region");
 }
 
-#[test]
-fn region_membership_tracks_joins_and_leaves() -> Result<(), SvmRegionError> {
-    let (_, region) = create_region(&subdivided_config())?;
-    let pid = std::process::id() as i32;
-    assert_eq!(region.member_count()?, 0);
-    assert!(region.client_pids()?.is_empty());
-    {
-        let membership = region.join()?;
-        assert_eq!(region.member_count()?, 1);
-        assert_eq!(region.client_pids()?.to_vec(), vec![pid]);
-        drop(membership);
-    }
-    assert_eq!(region.member_count()?, 0);
-    let first = region.join()?;
-    let second = region.join()?;
+fn shared_region_server() {
+    let config = SvmRegionConfig {
+        name: "phase-two-shared".to_owned(),
+        size: 4 << 20,
+        pvt_heap_size: 0,
+        flags: SvmRegionFlags::DATA_HEAP,
+    };
+    let backing = memfd("phase-two-shared");
+    let shared_descriptor = inheritable_duplicate(backing.as_raw_fd());
+    let region = SvmRegion::create(
+        NonZeroUsize::new(SHARED_REGION_BASE).expect("fixed shared base"),
+        &config,
+        backing,
+    )
+    .expect("create shared region");
+
+    let shared = spawn_region_client(
+        "shared-client",
+        shared_descriptor.as_raw_fd(),
+        region.base().as_ptr().addr(),
+        region.size(),
+    );
+    assert!(shared.success(), "same-VA client failed: {shared}");
+    assert_eq!(region.client_count().expect("post-client count"), 1);
+
+    let occupied = spawn_region_client(
+        "occupied-client",
+        shared_descriptor.as_raw_fd(),
+        region.base().as_ptr().addr(),
+        region.size(),
+    );
+    assert!(occupied.success(), "occupied-VA client failed: {occupied}");
+    assert_eq!(region.client_count().expect("occupied attach count"), 1);
+
+    let exited = spawn_region_client(
+        "exited-client",
+        shared_descriptor.as_raw_fd(),
+        region.base().as_ptr().addr(),
+        region.size(),
+    );
+    assert!(exited.success(), "exited client failed: {exited}");
+    assert_eq!(region.client_count().expect("stale client count"), 2);
     assert_eq!(
-        region.member_count()?,
-        2,
-        "each join records one membership"
+        region
+            .remove_exited_clients()
+            .expect("remove exited client"),
+        1
     );
-    drop(first);
-    drop(second);
-    assert_eq!(region.member_count()?, 0);
+    assert_eq!(region.client_count().expect("clean client count"), 1);
+    region.unmap().expect("unmap shared region");
+}
+
+fn shared_region_client() {
+    let expected_base = environment_usize(REGION_PROCESS_BASE);
+    let region = SvmRegion::attach(inherited_descriptor()).expect("attach shared region");
+    assert_eq!(region.base().as_ptr().addr(), expected_base);
+    assert_eq!(region.client_count().expect("client sees both pids"), 2);
+    let lock = region.lock().expect("lock attached region");
+    let pvt_heap = lock.pvt_heap();
     assert_eq!(
-        region.remove_exited_members()?,
-        0,
-        "this process is alive, so nothing is reclaimed"
+        pvt_heap.base().as_ptr().addr(),
+        expected_base + MemMain::system_page_size()
     );
-    Ok(())
+    let data_heap = lock.data_heap().expect("attached Data Heap");
+    let active_heap = data_heap.activate();
+    let mut values = Vec::with_capacity(1);
+    values.extend(0..2048u64);
+    assert!(data_heap.is_heap_object(NonNull::from(values.as_slice()).cast()));
+    drop(values);
+    drop(active_heap);
+    drop(lock);
+    region.unmap().expect("client unmaps and unregisters pid");
 }
 
-#[test]
-fn region_reclaims_only_exited_members() -> Result<(), SvmRegionError> {
-    let (segment, region) = create_region(&subdivided_config())?;
-    let membership = region.join()?;
-    let pointer = header(&region, &segment);
-    // A pid above the Linux maximum can never exist, so the probe reports it as
-    // exited exactly like a process that has already been reaped.
-    let dead: i32 = 0x7fff_ffff;
-    let members = unsafe { (*pointer).client_pids_offset.load(Ordering::Acquire) };
-    write_payload(
-        &segment,
-        &region,
-        members + size_of::<i32>() as u64,
-        &dead.to_ne_bytes(),
-    );
-    unsafe { (*pointer).client_count.store(2, Ordering::Release) };
-    assert_eq!(region.remove_exited_members()?, 1);
-    assert_eq!(region.member_count()?, 1);
+fn occupied_region_client() {
+    let base = environment_usize(REGION_PROCESS_BASE);
+    let size = environment_usize(REGION_PROCESS_SIZE);
+    let reservation = unsafe {
+        libc::mmap(
+            base as *mut c_void,
+            size,
+            libc::PROT_NONE,
+            libc::MAP_PRIVATE | libc::MAP_ANONYMOUS | libc::MAP_FIXED_NOREPLACE,
+            -1,
+            0,
+        )
+    };
+    assert_ne!(reservation, libc::MAP_FAILED);
+    assert_eq!(reservation.addr(), base);
+    let error = SvmRegion::attach(inherited_descriptor()).expect_err("occupied VA rejects attach");
+    assert!(matches!(
+        error,
+        SvmRegionError::AddressRangeOccupied {
+            base: found,
+            size: found_size,
+            ..
+        } if found == base && found_size == size
+    ));
     assert_eq!(
-        region.client_pids()?.to_vec(),
-        vec![std::process::id() as i32]
+        unsafe { libc::mprotect(reservation, size, libc::PROT_READ | libc::PROT_WRITE) },
+        0
     );
-    drop(membership);
-    Ok(())
+    unsafe { reservation.cast::<u8>().write(0xA5) };
+    assert_eq!(unsafe { reservation.cast::<u8>().read() }, 0xA5);
+    assert_eq!(unsafe { libc::munmap(reservation, size) }, 0);
 }
 
-#[test]
-fn region_is_reachable_from_another_process() -> Result<(), SvmRegionError> {
-    if let Ok(case) = std::env::var(CHILD_CASE) {
-        run_child(&case);
-        return Ok(());
-    }
-    let (segment, region) = create_region(&subdivided_config())?;
-    assert_eq!(region.find_or_create_subregion("echo")?, (1, true));
-    let output = spawn_child(CHILD_TEST, "shared", &segment);
-    assert!(
-        output.status.success(),
-        "child failed: {}",
-        String::from_utf8_lossy(&output.stderr)
-    );
-    let reported = String::from_utf8_lossy(&output.stderr);
-    assert!(
-        reported.contains("child: subregion=1"),
-        "child did not see the parent's registry: {reported}"
-    );
-    assert!(
-        reported.contains("child: joined"),
-        "child did not join the region: {reported}"
-    );
-    let child_base = reported
-        .lines()
-        .find_map(|line| line.strip_prefix("child: base="))
-        .expect("child reported its mapping base");
-    assert_ne!(
-        child_base,
-        format!("{:p}", segment.base()),
-        "the child maps the same payload at its own address"
-    );
-    let marker = reported
-        .lines()
-        .find_map(|line| line.strip_prefix("child: marker="))
-        .expect("child reported its allocation")
-        .parse::<u64>()
-        .expect("marker offset");
+fn exited_region_client() {
+    let region = SvmRegion::attach(inherited_descriptor()).expect("attach before process exit");
     assert_eq!(
-        read_payload(&segment, &region, marker, 4),
-        vec![0xC5; 4],
-        "the parent reads the bytes the child wrote at the same offset"
+        region.base().as_ptr().addr(),
+        environment_usize(REGION_PROCESS_BASE)
     );
-    assert_eq!(region.subregion_id("echo")?, Some(1));
+    std::mem::forget(region);
+}
+
+fn old_layout_is_rejected() {
+    let page_size = MemMain::system_page_size();
+    let backing = memfd("phase-two-old-layout");
     assert_eq!(
-        region.member_count()?,
-        0,
-        "the child removed its membership before exiting"
+        unsafe { libc::ftruncate(backing.as_raw_fd(), page_size as libc::off_t) },
+        0
     );
-    assert_eq!(region.remove_exited_members()?, 0);
-    Ok(())
+    let mapping = unsafe {
+        libc::mmap(
+            std::ptr::null_mut(),
+            page_size,
+            libc::PROT_READ | libc::PROT_WRITE,
+            libc::MAP_SHARED,
+            backing.as_raw_fd(),
+            0,
+        )
+    };
+    assert_ne!(mapping, libc::MAP_FAILED);
+    unsafe {
+        mapping
+            .cast::<AtomicU64>()
+            .write(AtomicU64::new((1 << 16) | 1));
+    }
+    assert_eq!(unsafe { libc::munmap(mapping, page_size) }, 0);
+    let error = SvmRegion::attach(backing).expect_err("offset layout version is rejected");
+    assert!(matches!(
+        error,
+        SvmRegionError::UnsupportedVersion {
+            found,
+            expected: SVM_REGION_VERSION,
+        } if found == (1 << 16) | 1
+    ));
 }
 
-#[test]
-fn region_lock_owner_death_fails_the_region() -> Result<(), SvmRegionError> {
-    if let Ok(case) = std::env::var(CHILD_CASE) {
-        run_child(&case);
-        return Ok(());
-    }
-    let (segment, region) = create_region(&subdivided_config())?;
-    let child = spawn_child_process(CHILD_LOCK_TEST, "owner_death", &segment);
-    let child_pid = child.id();
-    let output = child.wait_with_output().expect("child output");
-    assert!(
-        output.status.success(),
-        "child failed: {}",
-        String::from_utf8_lossy(&output.stderr)
-    );
-    assert!(
-        String::from_utf8_lossy(&output.stderr).contains("child: locked"),
-        "child never held the region mutex"
-    );
-    match region.subregion_count() {
-        Err(SvmRegionError::OwnerDied { pid }) => assert_eq!(pid, child_pid as i32),
-        other => panic!("a dead mutex owner must be reported, got {other:?}"),
-    }
-    assert_eq!(region.state()?, SvmRegionState::Failed);
-    match region.allocate(layout(8, 8)) {
-        Err(SvmRegionError::RegionFailed { mutex_owner_pid }) => {
-            assert_eq!(mutex_owner_pid, child_pid as i32);
-        }
-        other => panic!("a failed region must stay failed, got {other:?}"),
-    }
-    match SvmRegion::attach(Arc::clone(&segment)) {
-        Err(SvmRegionError::RegionFailed { .. }) => Ok(()),
-        other => panic!("a failed region must not attach, got {other:?}"),
-    }
-}
+fn owner_death_server() {
+    let config = SvmRegionConfig {
+        name: "phase-two-owner-death".to_owned(),
+        size: 2 << 20,
+        pvt_heap_size: 0,
+        flags: SvmRegionFlags::NONE,
+    };
+    let backing = memfd("phase-two-owner-death");
+    let shared_descriptor = inheritable_duplicate(backing.as_raw_fd());
+    let region = SvmRegion::create(
+        NonZeroUsize::new(OWNER_DEATH_BASE).expect("owner-death base"),
+        &config,
+        backing,
+    )
+    .expect("create owner-death region");
+    let mut pipe_descriptors = [0; 2];
+    assert_eq!(unsafe { libc::pipe(pipe_descriptors.as_mut_ptr()) }, 0);
+    let read_descriptor = unsafe { OwnedFd::from_raw_fd(pipe_descriptors[0]) };
+    let write_descriptor = unsafe { OwnedFd::from_raw_fd(pipe_descriptors[1]) };
+    clear_close_on_exec(write_descriptor.as_raw_fd());
 
-fn spawn_child(test: &str, case: &str, segment: &Arc<SsvmPrivate>) -> std::process::Output {
-    spawn_child_process(test, case, segment)
-        .wait_with_output()
-        .expect("child output")
-}
-
-fn spawn_child_process(test: &str, case: &str, segment: &Arc<SsvmPrivate>) -> std::process::Child {
-    let descriptor = segment.fd().expect("shared descriptor");
-    // The descriptor crosses exec only once CLOEXEC is cleared.
-    let cleared = unsafe { libc::fcntl(descriptor, libc::F_SETFD, 0) };
-    assert_eq!(cleared, 0, "clearing FD_CLOEXEC failed");
-    Command::new(std::env::current_exe().expect("test binary"))
-        .args(["--exact", test, "--nocapture"])
-        .env(CHILD_CASE, case)
-        .env(CHILD_FD, descriptor.to_string())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
+    let mut child = region_command("owner-death-client")
+        .env(REGION_PROCESS_FD, shared_descriptor.as_raw_fd().to_string())
+        .env(REGION_PROCESS_BASE, OWNER_DEATH_BASE.to_string())
+        .env(
+            REGION_PROCESS_NOTIFY_FD,
+            write_descriptor.as_raw_fd().to_string(),
+        )
+        .stdout(Stdio::inherit())
+        .stderr(Stdio::inherit())
         .spawn()
-        .expect("child process")
+        .expect("spawn owner-death client");
+    drop(write_descriptor);
+    let mut notification = 0u8;
+    assert_eq!(
+        unsafe {
+            libc::read(
+                read_descriptor.as_raw_fd(),
+                std::ptr::from_mut(&mut notification).cast(),
+                1,
+            )
+        },
+        1
+    );
+    assert_eq!(notification, 1);
+    let child_pid = child.id() as i32;
+    assert!(child.wait().expect("wait owner-death child").success());
+
+    for _ in 0..2 {
+        let error = match region.lock() {
+            Err(error) => error,
+            Ok(_) => panic!("dead mutex owner must stop region access"),
+        };
+        assert!(matches!(
+            error,
+            SvmRegionError::OwnerDied {
+                owner_pid,
+                owner_tag: 7,
+            } if owner_pid == child_pid
+        ));
+    }
+    drop(region);
 }
 
-/// Child side of the cross-process cases.
-fn run_child(case: &str) {
-    let descriptor: i32 = std::env::var(CHILD_FD)
-        .expect("child descriptor")
+fn owner_death_client() {
+    let region = SvmRegion::attach(inherited_descriptor()).expect("attach owner-death client");
+    assert_eq!(
+        region.base().as_ptr().addr(),
+        environment_usize(REGION_PROCESS_BASE)
+    );
+    let lock = region.lock().expect("hold region mutex");
+    let notify_descriptor = environment_i32(REGION_PROCESS_NOTIFY_FD);
+    let notification = [1u8];
+    assert_eq!(
+        unsafe {
+            libc::write(
+                notify_descriptor,
+                notification.as_ptr().cast(),
+                notification.len(),
+            )
+        },
+        1
+    );
+    std::mem::forget(lock);
+    std::mem::forget(region);
+    unsafe { libc::_exit(0) }
+}
+
+fn spawn_region_client(
+    mode: &str,
+    descriptor: RawFd,
+    base: usize,
+    size: usize,
+) -> std::process::ExitStatus {
+    region_command(mode)
+        .env(REGION_PROCESS_FD, descriptor.to_string())
+        .env(REGION_PROCESS_BASE, base.to_string())
+        .env(REGION_PROCESS_SIZE, size.to_string())
+        .status()
+        .expect("spawn region client")
+}
+
+fn region_command(mode: &str) -> Command {
+    let mut command = Command::new(std::env::current_exe().expect("current test executable"));
+    command
+        .env(REGION_PROCESS_MODE, mode)
+        .arg("--exact")
+        .arg("fixed_va_regions_use_pvt_and_data_mem_heaps")
+        .arg("--nocapture");
+    command
+}
+
+fn memfd(name: &str) -> OwnedFd {
+    let name = std::ffi::CString::new(name).expect("memfd name");
+    let descriptor = unsafe { libc::syscall(libc::SYS_memfd_create, name.as_ptr(), 0) };
+    assert!(
+        descriptor >= 0,
+        "memfd_create failed: {}",
+        std::io::Error::last_os_error()
+    );
+    unsafe { OwnedFd::from_raw_fd(descriptor as RawFd) }
+}
+
+fn inheritable_duplicate(descriptor: RawFd) -> OwnedFd {
+    let duplicate = unsafe { libc::dup(descriptor) };
+    assert!(
+        duplicate >= 0,
+        "dup failed: {}",
+        std::io::Error::last_os_error()
+    );
+    clear_close_on_exec(duplicate);
+    unsafe { OwnedFd::from_raw_fd(duplicate) }
+}
+
+fn clear_close_on_exec(descriptor: RawFd) {
+    assert_eq!(unsafe { libc::fcntl(descriptor, libc::F_SETFD, 0) }, 0);
+}
+
+fn inherited_descriptor() -> OwnedFd {
+    let descriptor = environment_i32(REGION_PROCESS_FD);
+    unsafe { OwnedFd::from_raw_fd(descriptor) }
+}
+
+fn environment_usize(name: &str) -> usize {
+    std::env::var(name)
+        .expect("region process environment")
         .parse()
-        .expect("descriptor number");
-    let segment = SsvmPrivate::client_init_memfd(descriptor).expect("child segment attach");
-    let region = SvmRegion::attach(Arc::new(segment)).expect("child region attach");
-    match case {
-        "shared" => {
-            let subregion = region
-                .subregion_id("echo")
-                .expect("child registry read")
-                .expect("child sees the parent's subregion");
-            eprintln!("child: subregion={subregion}");
-            eprintln!("child: base={:p}", region.ssvm().base());
-            let membership = region.join().expect("child join");
-            eprintln!("child: joined");
-            let offset = region
-                .allocate(layout(4, 4))
-                .expect("child allocation from the shared heap");
-            eprintln!("child: marker={offset}");
-            let pointer = region
-                .ssvm()
-                .offset_ptr(region.header_offset() + offset, 4, 1)
-                .expect("child marker inside mapping");
-            // SAFETY: the child owns the block it just allocated and no other
-            // process writes it before the child exits.
-            unsafe { std::slice::from_raw_parts_mut(pointer, 4) }.copy_from_slice(&[0xC5; 4]);
-            drop(membership);
-            std::process::exit(0);
-        }
-        "owner_death" => {
-            let lock = region.lock(RegionLockTag::Scan).expect("child region lock");
-            eprintln!("child: locked");
-            assert_eq!(region.state().expect("child state"), SvmRegionState::Ready);
-            // Leaving without dropping the guard keeps the robust mutex owned by
-            // a process that no longer exists.
-            std::mem::forget(lock);
-            unsafe { libc::_exit(0) };
-        }
-        other => panic!("unknown child case {other}"),
-    }
+        .expect("numeric region process environment")
+}
+
+fn environment_i32(name: &str) -> i32 {
+    std::env::var(name)
+        .expect("region process environment")
+        .parse()
+        .expect("numeric region process environment")
 }

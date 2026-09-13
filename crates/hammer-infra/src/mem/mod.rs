@@ -800,6 +800,23 @@ impl MemHeap {
     /// supplied layout must match the layout used for that allocation.
     pub unsafe fn deallocate(&self, pointer: NonNull<u8>, _: Layout) {
         if !self.is_heap_object(pointer) {
+            unsafe {
+                let mut message = [0_u8; 128];
+                let length = libc::snprintf(
+                    message.as_mut_ptr().cast(),
+                    message.len(),
+                    c"hammer-infra: active heap %p cannot free %p\n".as_ptr(),
+                    (self as *const Self).cast::<c_void>(),
+                    pointer.as_ptr().cast::<c_void>(),
+                );
+                if length > 0 {
+                    libc::write(
+                        libc::STDERR_FILENO,
+                        message.as_ptr().cast(),
+                        (length as usize).min(message.len()),
+                    );
+                }
+            };
             std::process::abort();
         }
         unsafe { mspace_free(self.mspace, pointer.as_ptr().cast()) };
@@ -822,6 +839,32 @@ impl MemHeap {
         unsafe { CStr::from_ptr(pointer.cast()) }
             .to_str()
             .expect("heap names are constructed from UTF-8")
+    }
+
+    /// Destroys a heap that was not published to its owning subsystem.
+    ///
+    /// # Safety
+    ///
+    /// No allocation from this heap may remain live or be accessed again.
+    pub(crate) unsafe fn destroy(&self) {
+        let state = ptr::addr_of_mut!(MEM_MAIN);
+        let main_heap = unsafe { (*state).main_heap };
+        assert_ne!(
+            main_heap,
+            (self as *const Self).cast_mut(),
+            "main heap remains live for process lifetime"
+        );
+
+        if !main_heap.is_null() {
+            let active_heap = unsafe { (*main_heap).activate() };
+            let pointer = (self as *const Self).cast_mut();
+            if let Some(index) = unsafe { (*state).heaps.iter().position(|heap| *heap == pointer) }
+            {
+                unsafe { (*state).heaps.remove(index) };
+            }
+            drop(active_heap);
+        }
+        unsafe { destroy_mspace(self.mspace) };
     }
 }
 

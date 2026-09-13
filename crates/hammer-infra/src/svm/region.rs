@@ -1,604 +1,1196 @@
-//! Offset-based shared region owner.
+//! Fixed-address shared regions with VPP-style PVT and Data Heaps.
 //!
-//! Rust counterpart of VPP's `svm_region_t` / `svm_main_region_t` (ADR-0011
-//! section 12). A region is the metadata and allocation authority living inside
-//! one [`SsvmPrivate`] payload: a fixed header, one or two [`SvmRegionHeap`]
-//! instances, the member table, and - for a subdivided root - the
-//! [`SvmRegionMain`] subregion name registry.
-//!
-//! Every shared location is a payload-relative offset, so two processes that map
-//! the same segment at different addresses observe the same objects. The header
-//! is published by storing `version` last; attach reads it first and then
-//! validates magic, layout, and section offsets before touching shared state.
-//!
-//! The region mutex is the only serialization point. It is process-shared and
-//! robust, so an owner that dies while holding it is reported instead of
-//! deadlocking: the region latches `Failed` and every later access fails with
-//! `RegionFailed`. VPP re-initializes the mutex in that situation
-//! (`svm.c:713-732`); Hammer refuses to guess whether the shared state the dead
-//! owner touched is consistent.
+//! A region owns one shared mapping whose first page contains
+//! [`SvmRegionHeader`]. The next range contains a locked [`MemHeap`] used for
+//! region metadata. Ordinary subregions may also contain a locked Data Heap.
+//! Every attached process maps the region at the creator's address, so shared
+//! Rust collections and dlmalloc mspace pointers retain the same value.
 
-use std::alloc::Layout;
+use std::collections::HashMap;
+use std::ffi::c_void;
 use std::fmt;
 use std::io;
-use std::mem::{MaybeUninit, align_of, size_of};
-use std::sync::Arc;
-use std::sync::atomic::{AtomicI32, AtomicU32, AtomicU64, Ordering};
+use std::mem::{MaybeUninit, size_of};
+use std::num::NonZeroUsize;
+use std::os::fd::{AsRawFd, OwnedFd};
+use std::ptr::{self, NonNull};
+use std::sync::atomic::{AtomicI32, AtomicPtr, AtomicU64, Ordering};
 
 use posix_sync::condvar::{CondvarBuilder, CondvarClock, CondvarSharing, RawCondvarAlloc};
 use posix_sync::mutex::guards::{RobustGuardContainer, StandardGuard};
 use posix_sync::mutex::{
-    BorrowedMutex, MutexBuilder, MutexSharing, RawMutexAlloc, robustness_markers::Robust,
+    BorrowedMutex, MutexBuilder, MutexLockError, MutexSharing, RawMutexAlloc,
+    robustness_markers::Robust,
 };
 
-use crate::svm::hash_map::{SvmHashMap, SvmKeys};
-use crate::svm::region_heap::SvmRegionHeap;
-use crate::svm::ssvm::{SSVM_PAYLOAD_OFFSET, SsvmError, SsvmPrivate};
+use crate::bitmap::Bitmap;
+use crate::mem::{MemError, MemHeap, MemMain};
+use crate::pool::Pool;
 
-/// Region version; a nonzero `version` is the single ready authority.
-///
-/// The value mirrors VPP's `SVM_VERSION` (`svm_common.h:19`) so a region header
-/// can be compared against the VPP constant while debugging.
-pub const SVM_REGION_VERSION: u64 = (1 << 16) | 1;
+/// Shared layout version. Version 1 was Hammer's removed offset-heap layout.
+pub const SVM_REGION_VERSION: u64 = (2 << 16) | 1;
 
-/// The region owns a heap for its data section (VPP `SVM_FLAGS_MHEAP`).
-pub const REGION_FLAG_DATA_HEAP: u64 = 1 << 0;
-/// The region is a root whose data section carries the subregion registry
-/// (VPP `SVM_FLAGS_NODATA`).
-pub const REGION_FLAG_SUBDIVIDED: u64 = 1 << 2;
+/// Default size of the locked PVT Heap following the region header page.
+pub const SVM_PVT_HEAP_SIZE: usize = 128 << 10;
 
-/// Every flag bit this version understands.
-const REGION_FLAGS: u64 = REGION_FLAG_DATA_HEAP | REGION_FLAG_SUBDIVIDED;
-
-/// Metadata heap reserved in front of a regular region's data section.
-///
-/// VPP keeps a 128K private mheap for region metadata
-/// (`SVM_PVT_MHEAP_SIZE`, `svm_common.h:23`); the same reservation keeps the
-/// name registry and member table of a root region out of the data section.
-pub const SVM_REGION_METADATA_HEAP_SIZE: u64 = 128 << 10;
-
-/// Longest accepted subregion name.
+/// Longest accepted region name.
 pub const SVM_REGION_NAME_MAX_LENGTH: usize = 256;
 
-/// Smallest member table; grows by doubling from here.
-const MINIMUM_MEMBER_CAPACITY: u64 = 8;
+const DATA_HEAP_FLAG: u64 = 1 << 0;
+const NODATA_FLAG: u64 = 1 << 2;
+const NEED_DATA_INIT_FLAG: u64 = 1 << 3;
+const PUBLIC_FLAGS: u64 = DATA_HEAP_FLAG | NODATA_FLAG;
 
-/// Smallest heap range a region creates: one block, rounded to the alignment
-/// every region offset uses. The heap itself rejects anything below its own
-/// block minimum.
-const MINIMUM_HEAP_BYTES: u64 = 64;
+const LOCK_TAG_INIT: i32 = 1;
+const LOCK_TAG_ATTACH: i32 = 2;
+const LOCK_TAG_ROOT_INIT: i32 = 3;
+const LOCK_TAG_SUBREGION: i32 = 4;
+const LOCK_TAG_UNMAP: i32 = 5;
+const LOCK_TAG_SCAN: i32 = 7;
 
-/// Shared-state alignment for the header and every region section.
-const REGION_ALIGN: usize = 64;
+#[repr(transparent)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SvmRegionFlags(u64);
 
-/// Identifies the region header inside a segment payload.
-const REGION_MAGIC: u64 = 0x4841_4d4d_4552_5247;
+impl SvmRegionFlags {
+    /// An ordinary region with caller-owned data bytes and no Data Heap.
+    pub const NONE: Self = Self(0);
+    /// The ordinary region's data range contains a locked Data Heap.
+    pub const DATA_HEAP: Self = Self(DATA_HEAP_FLAG);
+    /// The region is a root whose remaining virtual range is subdivided.
+    pub const NODATA: Self = Self(NODATA_FLAG);
 
-#[inline]
-fn align_u64(value: u64, alignment: u64) -> u64 {
-    (value + alignment - 1) & !(alignment - 1)
-}
+    pub fn contains(self, flag: Self) -> bool {
+        self.0 & flag.0 == flag.0
+    }
 
-/// End of the fixed header, where the metadata heap starts.
-fn header_end() -> u64 {
-    align_u64(size_of::<SvmRegionHeader>() as u64, REGION_ALIGN as u64)
-}
-
-/// Payload-relative start of the data section for `flags`.
-///
-/// A subdivided root keeps the whole payload after the header as its metadata
-/// heap and points `data_base_offset` at the registry it allocates there. A
-/// regular region reserves the metadata heap in front of the data section.
-fn data_section_start(flags: u64) -> u64 {
-    if flags & REGION_FLAG_SUBDIVIDED != 0 {
-        header_end()
-    } else {
-        header_end() + SVM_REGION_METADATA_HEAP_SIZE
+    fn bits(self) -> u64 {
+        self.0
     }
 }
 
-/// Shared region header.
-///
-/// The field order follows VPP's `svm_region_t` where the field survives; the
-/// trailing fields are Hammer additions described in ADR-0011 section 12.2.
-/// `version` is the ready flag: creation stores it last and attach reads it
-/// first. `state` only ever holds `Uninitialized` or `Failed`; `Ready` is
-/// derived from `version`, so readiness has one authority.
+#[derive(Debug)]
+pub struct SvmRegionConfig {
+    pub name: String,
+    pub size: usize,
+    pub pvt_heap_size: usize,
+    pub flags: SvmRegionFlags,
+}
+
+impl SvmRegionConfig {
+    fn map_size(
+        &self,
+        page_size: usize,
+        include_region_overhead: bool,
+    ) -> Result<(usize, usize), SvmRegionError> {
+        let name_length = self.name.len();
+        if name_length == 0
+            || name_length > SVM_REGION_NAME_MAX_LENGTH
+            || self.name.as_bytes().contains(&0)
+        {
+            return Err(SvmRegionError::InvalidName {
+                length: name_length,
+                maximum: SVM_REGION_NAME_MAX_LENGTH,
+            });
+        }
+
+        let flag_bits = self.flags.bits();
+        if flag_bits & !PUBLIC_FLAGS != 0
+            || self.flags.contains(SvmRegionFlags::DATA_HEAP)
+                && self.flags.contains(SvmRegionFlags::NODATA)
+        {
+            return Err(SvmRegionError::InvalidFlags { bits: flag_bits });
+        }
+
+        let pvt_heap_size = if self.pvt_heap_size == 0 {
+            SVM_PVT_HEAP_SIZE
+        } else {
+            self.pvt_heap_size
+        };
+        if pvt_heap_size < page_size || !pvt_heap_size.is_multiple_of(page_size) {
+            return Err(SvmRegionError::InvalidSize {
+                requested: pvt_heap_size,
+                minimum: page_size,
+            });
+        }
+
+        let overhead =
+            page_size
+                .checked_add(pvt_heap_size)
+                .ok_or(SvmRegionError::SizeOverflow {
+                    requested: self.size,
+                    alignment: page_size,
+                })?;
+        let requested = if include_region_overhead {
+            self.size
+                .checked_add(overhead)
+                .ok_or(SvmRegionError::SizeOverflow {
+                    requested: self.size,
+                    alignment: page_size,
+                })?
+        } else {
+            self.size
+        };
+        let minimum = overhead
+            .checked_add(if self.flags.contains(SvmRegionFlags::DATA_HEAP) {
+                page_size
+            } else {
+                0
+            })
+            .ok_or(SvmRegionError::SizeOverflow {
+                requested: self.size,
+                alignment: page_size,
+            })?;
+        if requested < minimum {
+            return Err(SvmRegionError::InvalidSize {
+                requested: self.size,
+                minimum: if include_region_overhead {
+                    minimum - overhead
+                } else {
+                    minimum
+                },
+            });
+        }
+        let size = requested
+            .checked_add(page_size - 1)
+            .map(|size| size & !(page_size - 1))
+            .ok_or(SvmRegionError::SizeOverflow {
+                requested: self.size,
+                alignment: page_size,
+            })?;
+        Ok((size, pvt_heap_size))
+    }
+}
+
 #[repr(C, align(64))]
-pub struct SvmRegionHeader {
-    /// Ready flag, written last by the creator and read first by attach.
-    pub version: AtomicU64,
-    /// Process-shared mutex; the region's only serialization point.
-    pub mutex: MaybeUninit<RawMutexAlloc>,
-    /// Process-shared condvar. VPP creates one per region and never waits on it;
-    /// the field is kept so the shared layout matches that expectation.
-    pub condvar: MaybeUninit<RawCondvarAlloc>,
-    /// PID of the process currently holding `mutex`, 0 when free.
-    pub mutex_owner_pid: AtomicI32,
-    /// [`RegionLockTag`] value describing why `mutex` is held, 0 when free.
-    pub mutex_owner_tag: AtomicI32,
-    /// `REGION_FLAG_*` bits.
-    pub flags: AtomicU64,
-    /// Payload bytes this header describes.
-    pub virtual_size: u64,
-    /// Payload-relative start of the data section.
-    pub data_base_offset: u64,
-    /// Data-section heap; valid only with [`REGION_FLAG_DATA_HEAP`].
-    pub data_heap: SvmRegionHeap,
-    /// Region metadata heap: names, member table, and the subdivided registry.
-    pub metadata_heap: SvmRegionHeap,
-    /// Payload-relative offset of the user context, 0 when unset.
-    pub user_ctx_offset: u64,
-    /// Payload-relative offset of the member pid array, 0 when empty.
-    pub client_pids_offset: AtomicU64,
-    /// Number of stored member pids.
-    pub client_count: AtomicU64,
-    /// Capacity of the member pid array.
-    pub client_capacity: AtomicU64,
-    /// Header identity, checked before any other field is trusted.
-    pub magic: u64,
-    /// Failure latch; see the type documentation.
-    pub state: AtomicU32,
-    /// Payload-relative offset of the root object, 0 when unset.
-    pub root_offset: AtomicU64,
+pub(crate) struct SvmRegionHeader {
+    version: AtomicU64,
+    mutex: MaybeUninit<RawMutexAlloc>,
+    condvar: MaybeUninit<RawCondvarAlloc>,
+    mutex_owner_pid: AtomicI32,
+    mutex_owner_tag: AtomicI32,
+    flags: SvmRegionFlags,
+    virtual_base: *mut u8,
+    virtual_size: usize,
+    pvt_heap: *mut MemHeap,
+    data_base: *mut c_void,
+    data_heap: *mut MemHeap,
+    user_ctx: AtomicPtr<c_void>,
+    bitmap_size: usize,
+    bitmap: *mut Bitmap,
+    region_name: *mut String,
+    backing_file: *mut String,
+    filenames: *mut Vec<String>,
+    client_pids: *mut Vec<i32>,
 }
 
-/// Lifecycle of a shared region as observed from any mapping.
-#[repr(u32)]
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum SvmRegionState {
-    /// `version` has not been published yet.
-    Uninitialized = 0,
-    /// `version` is published and the region is usable.
-    Ready = 1,
-    /// A mutex owner died or the header was corrupted; the region is unusable.
-    Failed = 2,
+#[derive(Debug)]
+pub struct SvmSubregion {
+    subregion_name: String,
 }
 
-/// Why the region mutex is held; stored in `mutex_owner_tag` for debugging.
-///
-/// VPP passes the same kind of tag to its file-local `region_lock`
-/// (`svm.c:89-105`, called with 1/2/4/5/7 at `svm.c:471`, `:733`, `:896`,
-/// `:1034`, `:1167`). The discriminants here follow those values where a VPP
-/// tag exists; `Membership` and `Allocate` are Hammer additions with no VPP
-/// counterpart.
-#[repr(i32)]
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum RegionLockTag {
-    /// Initializing a region header.
-    Init = 1,
-    /// Mapping an initialized region.
-    Attach = 2,
-    /// Reading or writing the subregion registry.
-    Subregion = 4,
-    /// Releasing a mapping.
-    Unmap = 5,
-    /// Scanning members or borrowed state.
-    Scan = 7,
-    /// Joining or leaving the member table.
-    Membership = 8,
-    /// Allocating or releasing region storage.
-    Allocate = 9,
+#[derive(Debug)]
+pub struct SvmMainRegion {
+    subregions: Pool<SvmSubregion>,
+    name_hash: HashMap<String, u32>,
 }
 
-/// Operation a caller asked for that the region cannot provide.
-#[repr(u32)]
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum RegionOperation {
-    /// Creating a region on a segment this process attached instead of created.
-    CreateOnAttachedSegment = 0,
-    /// Asking a regular region for the subregion registry.
-    SubregionRegistry = 1,
-    /// Combining the subdivided layout with a region-owned data heap.
-    SubdividedDataHeap = 2,
+impl SvmMainRegion {
+    pub fn subregion_index(&self, name: &str) -> Option<u32> {
+        self.name_hash.get(name).copied()
+    }
+
+    pub fn subregion(&self, index: u32) -> Option<&SvmSubregion> {
+        self.subregions.get(index)
+    }
+
+    pub fn subregion_count(&self) -> usize {
+        self.subregions.len()
+    }
 }
 
-/// Failures a region reports to its caller.
-///
-/// Heap exhaustion and block corruption are not here: [`SvmRegionHeap`]
-/// terminates the process instead, because a shared allocator that is already
-/// inconsistent cannot be unwound (ADR-0011 section 12.4).
 #[derive(Debug, thiserror::Error)]
 pub enum SvmRegionError {
-    #[error("region header magic {found:#x} is invalid")]
-    InvalidMagic { found: u64 },
-    #[error("region version {found} is unsupported, expected {expected}")]
+    #[error("region name has {length} bytes; expected 1..={maximum}")]
+    InvalidName { length: usize, maximum: usize },
+    #[error("region flags {bits:#x} are invalid")]
+    InvalidFlags { bits: u64 },
+    #[error("region size {requested} is smaller than {minimum}")]
+    InvalidSize { requested: usize, minimum: usize },
+    #[error("region size {requested} cannot be aligned to {alignment}")]
+    SizeOverflow { requested: usize, alignment: usize },
+    #[error("region base {base:#x} is not aligned to {alignment}")]
+    MisalignedBase { base: usize, alignment: usize },
+    #[error("region backing descriptor metadata is unavailable: {source}")]
+    BackingMetadata {
+        #[source]
+        source: io::Error,
+    },
+    #[error("region backing descriptor cannot be resized to {size} bytes: {source}")]
+    BackingResize {
+        size: usize,
+        #[source]
+        source: io::Error,
+    },
+    #[error("region backing descriptor has {available} bytes; {required} are required")]
+    BackingTooSmall { available: usize, required: usize },
+    #[error("failed to probe the first {size} bytes of a region: {source}")]
+    ProbeMapping {
+        size: usize,
+        #[source]
+        source: io::Error,
+    },
+    #[error("region version {found:#x} is unsupported; expected {expected:#x}")]
     UnsupportedVersion { found: u64, expected: u64 },
-    #[error("region is not ready: {state:?}")]
-    NotReady { state: SvmRegionState },
-    #[error("region failed while pid {mutex_owner_pid} held its mutex")]
-    RegionFailed { mutex_owner_pid: i32 },
-    #[error("region mutex owner pid {pid} died")]
-    OwnerDied { pid: i32 },
-    #[error("region range offset {offset} length {length} is outside {size} bytes")]
-    InvalidBounds { offset: u64, length: u64, size: u64 },
-    #[error("region offset {offset} is not aligned to {alignment}")]
-    Misaligned { offset: u64, alignment: usize },
-    #[error("region layout is {declared:#x}, expected {expected:#x}")]
-    LayoutMismatch { declared: u64, expected: u64 },
-    #[error("region name of {length} bytes is invalid")]
-    InvalidRegionName { length: u64 },
-    #[error("region root offset {offset} is invalid")]
-    InvalidRoot { offset: u64 },
-    #[error("region member probe failed for pid {pid}: {source}")]
-    MemberProbeUnavailable {
+    #[error("region version has not been published")]
+    NotReady,
+    #[error("region address range {base:#x}+{size} is occupied: {source}")]
+    AddressRangeOccupied {
+        base: usize,
+        size: usize,
+        #[source]
+        source: io::Error,
+    },
+    #[error("failed to map region at {base:#x}+{size}: {source}")]
+    FixedMapping {
+        base: usize,
+        size: usize,
+        #[source]
+        source: io::Error,
+    },
+    #[error("mapped region base {found:#x} differs from published base {expected:#x}")]
+    VirtualBaseMismatch { found: usize, expected: usize },
+    #[error("mapped region size {mapped} differs from published size {declared}")]
+    VirtualSizeMismatch { mapped: usize, declared: usize },
+    #[error(
+        "region PVT Heap describes {found_base:#x}+{found_size}; expected base {expected_base:#x}"
+    )]
+    PvtHeapLayout {
+        found_base: usize,
+        found_size: usize,
+        expected_base: usize,
+    },
+    #[error("region PVT Heap object pointer {pointer:#x} is invalid")]
+    InvalidPvtObject { pointer: usize },
+    #[error("region data base {pointer:#x} is outside {base:#x}+{size}")]
+    InvalidDataBase {
+        pointer: usize,
+        base: usize,
+        size: usize,
+    },
+    #[error("DATA_HEAP region has no Data Heap")]
+    MissingDataHeap,
+    #[error("region without DATA_HEAP published Data Heap {pointer:#x}")]
+    UnexpectedDataHeap { pointer: usize },
+    #[error(
+        "region Data Heap describes {found_base:#x}+{found_size}; expected {expected_base:#x}+{expected_size}"
+    )]
+    DataHeapLayout {
+        found_base: usize,
+        found_size: usize,
+        expected_base: usize,
+        expected_size: usize,
+    },
+    #[error("failed to create the region PVT Heap: {source}")]
+    PvtHeapCreation {
+        #[source]
+        source: MemError,
+    },
+    #[error("failed to create the region Data Heap: {source}")]
+    DataHeapCreation {
+        #[source]
+        source: MemError,
+    },
+    #[error("operation requires a NODATA root region")]
+    RootRequired,
+    #[error("root region has no contiguous range of {requested} bytes in {available} bytes")]
+    RootAddressSpaceExhausted { requested: usize, available: usize },
+    #[error("subregion publishes size {found}; expected {expected}")]
+    SubregionSizeMismatch { found: usize, expected: usize },
+    #[error("subregion publishes flags {found:#x}; expected {expected:#x}")]
+    SubregionFlagsMismatch { found: u64, expected: u64 },
+    #[error("subregion backing publishes a different name")]
+    SubregionNameMismatch,
+    #[error("subregion range {base:#x}+{size} is outside root {root_base:#x}+{root_size}")]
+    SubregionOutsideRoot {
+        base: usize,
+        size: usize,
+        root_base: usize,
+        root_size: usize,
+    },
+    #[error("subregion range {base:#x}+{size} is not reserved in the root bitmap")]
+    SubregionNotReserved { base: usize, size: usize },
+    #[error("pid {pid} is not registered in the region")]
+    ClientNotRegistered { pid: i32 },
+    #[error("failed to probe region client pid {pid}: {source}")]
+    ClientProbe {
         pid: i32,
         #[source]
         source: io::Error,
     },
-    #[error("region operation {operation:?} is unsupported")]
-    UnsupportedOperation { operation: RegionOperation },
+    #[error("region mutex owner pid {owner_pid} tag {owner_tag} died")]
+    OwnerDied { owner_pid: i32, owner_tag: i32 },
     #[error("region mutex lock failed: {source}")]
     Lock {
         #[source]
-        source: posix_sync::mutex::MutexLockError,
+        source: MutexLockError,
     },
-    #[error("region segment operation failed: {0}")]
-    Segment(#[from] SsvmError),
+    #[error("failed to release local region mapping {base:#x}+{size}: {source}")]
+    Unmapping {
+        base: usize,
+        size: usize,
+        #[source]
+        source: io::Error,
+    },
 }
 
-/// Configuration of a region created inside one segment payload.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct SvmRegionConfig {
-    /// Minimum payload bytes the region needs; `size` counts the region header,
-    /// its heaps, and the data section together.
-    pub size: u64,
-    /// `REGION_FLAG_*` bits.
-    pub flags: u64,
-}
-
-/// Owner handle for one region inside an [`SsvmPrivate`].
-///
-/// The handle is process-local; the state it reaches is shared. Every method
-/// that touches shared state takes the region mutex first, so a caller does not
-/// have to know the section layout or remember which fields need serialization.
 pub struct SvmRegion {
-    segment: Arc<SsvmPrivate>,
-    header_offset: u64,
-    mutex: BorrowedMutex<'static, Robust>,
+    backing: OwnedFd,
+    base: NonNull<u8>,
+    size: usize,
+    header: NonNull<SvmRegionHeader>,
+    root_header: Option<NonNull<SvmRegionHeader>>,
+    is_client: bool,
 }
 
-/// Lifetime witness for mutexes that live inside a region mapping.
-///
-/// [`SvmRegion`] owns the [`SsvmPrivate`] that keeps the payload mapped, so the
-/// mutex bytes outlive every borrow of the region; this value supplies that
-/// lifetime to the borrowed-mutex constructors.
-struct RegionMappingAnchor;
-
-static REGION_MAPPING_ANCHOR: RegionMappingAnchor = RegionMappingAnchor;
-
-/// Region mutex guard; releases the mutex and clears the owner fields on drop.
-pub struct RegionLock<'region> {
-    header: *mut SvmRegionHeader,
-    /// Held so dropping the lock releases the region mutex; the fields above
-    /// are cleared first, in this type's `Drop` implementation.
-    #[expect(dead_code, reason = "the guard releases the mutex on drop")]
-    guard: StandardGuard<'region>,
-}
-
-impl Drop for RegionLock<'_> {
-    fn drop(&mut self) {
-        // The owner fields are cleared before `guard` drops and unlocks, so a
-        // later lock never observes this pid as the holder.
-        unsafe {
-            (*self.header).mutex_owner_pid.store(0, Ordering::Release);
-            (*self.header).mutex_owner_tag.store(0, Ordering::Release);
-        }
-    }
-}
-
-/// Membership of one process in a region.
-///
-/// Dropping the value removes this process from the member table once. The
-/// region keeps no other record of the process, exactly like VPP's
-/// `client_pids` vector.
-pub struct RegionMembership<'region> {
-    region: &'region SvmRegion,
-    pid: i32,
-}
-
-impl Drop for RegionMembership<'_> {
-    fn drop(&mut self) {
-        match self.region.lock(RegionLockTag::Membership) {
-            Ok(lock) => {
-                if !self
-                    .region
-                    .member_remove(self.region.header_ptr(), self.pid)
-                {
-                    eprintln!(
-                        "svm region membership for pid {} is not in the table",
-                        self.pid
-                    );
-                }
-                drop(lock);
-            }
-            Err(error) => {
-                eprintln!(
-                    "svm region membership for pid {} not removed: {error}",
-                    self.pid
-                );
-            }
-        }
-    }
-}
-
-/// Root region registry: subregion names to subregion ids.
-///
-/// It replaces VPP's `svm_main_region_t` (`svm_common.h:108-115`) without its
-/// subregion pool: [`SvmHashMap`] owns the name bytes, stores the id, and
-/// enumerates the names, which is everything the pool was used for.
-#[repr(C, align(64))]
-pub struct SvmRegionMain {
-    subregions: SvmHashMap<u64>,
-    next_subregion_id: AtomicU64,
-}
-
-impl SvmRegionMain {
-    /// Creates an empty registry; 0 stays reserved as "no subregion".
-    pub const fn new() -> Self {
-        Self {
-            subregions: SvmHashMap::new(),
-            next_subregion_id: AtomicU64::new(1),
-        }
-    }
-
-    /// Returns the id registered for `name`, creating one when absent.
-    ///
-    /// The returned flag reports whether this call created the entry. Ids are
-    /// monotonic and never reused, so a stale id can never silently name
-    /// another subregion.
-    pub fn find_or_create(
-        &mut self,
-        heap: &mut SvmRegionHeap,
-        arena: &mut [u8],
-        name: &str,
-    ) -> Result<(u64, bool), SvmRegionError> {
-        validate_region_name(name)?;
-        if let Some(id) = self.subregions.get(heap, arena, name) {
-            return Ok((*id, false));
-        }
-        let id = self.next_subregion_id.fetch_add(1, Ordering::AcqRel);
-        self.subregions.insert(heap, arena, name, id);
-        Ok((id, true))
-    }
-
-    /// Returns the id registered for `name`.
-    pub fn subregion_id(&self, heap: &SvmRegionHeap, arena: &[u8], name: &str) -> Option<u64> {
-        self.subregions.get(heap, arena, name).copied()
-    }
-
-    /// Removes `name` from the registry, returning the id it held.
-    ///
-    /// The name and its key bytes disappear from the table; the id is not
-    /// reused. The caller that owns the subregion segment must have made it
-    /// invisible to clients before this call.
-    pub fn remove(
-        &mut self,
-        heap: &mut SvmRegionHeap,
-        arena: &mut [u8],
-        name: &str,
-    ) -> Option<u64> {
-        self.subregions.remove(heap, arena, name)
-    }
-
-    /// Number of registered subregions.
-    pub fn subregion_count(&self) -> u64 {
-        self.subregions.len() as u64
-    }
-
-    /// Iterates over every registered name.
-    pub fn subregion_names<'a>(
-        &'a self,
-        heap: &'a SvmRegionHeap,
-        arena: &'a [u8],
-    ) -> SvmKeys<'a, u64> {
-        self.subregions.keys(heap, arena)
-    }
-
-    /// Next id that will be handed out.
-    pub fn next_subregion_id(&self) -> u64 {
-        self.next_subregion_id.load(Ordering::Acquire)
-    }
-}
-
-impl Default for SvmRegionMain {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-impl fmt::Debug for SvmRegionMain {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter
-            .debug_struct("SvmRegionMain")
-            .field("subregions", &self.subregions.len())
-            .field("next_subregion_id", &self.next_subregion_id())
-            .finish()
-    }
-}
+unsafe impl Send for SvmRegion {}
+unsafe impl Sync for SvmRegion {}
 
 impl fmt::Debug for SvmRegion {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
             .debug_struct("SvmRegion")
-            .field("header_offset", &self.header_offset)
-            .field("payload_len", &self.payload_len())
+            .field("base", &self.base)
+            .field("size", &self.size)
+            .field("is_client", &self.is_client)
             .finish_non_exhaustive()
     }
 }
 
-impl SvmRegion {
-    /// Mapping layout to create for `config`.
-    ///
-    /// `config.size` counts payload bytes, so the returned mapping adds the
-    /// segment header in front of it and rounds the structural minimum up.
-    /// The returned size is still a minimum: the segment rounds the mapping up
-    /// to a page size. Pass it to the segment constructor, then call
-    /// [`Self::create`] with the same config.
-    pub fn layout(config: &SvmRegionConfig) -> Result<Layout, SvmRegionError> {
-        validate_region_flags(config.flags)?;
-        let payload = config
-            .size
-            .max(data_section_start(config.flags).saturating_add(MINIMUM_HEAP_BYTES));
-        let requested = SSVM_PAYLOAD_OFFSET.saturating_add(payload);
-        let size = usize::try_from(requested).map_err(|_| SvmRegionError::InvalidBounds {
-            offset: 0,
-            length: requested,
-            size: u64::MAX,
-        })?;
-        Layout::from_size_align(size, REGION_ALIGN).map_err(|_| SvmRegionError::InvalidBounds {
-            offset: 0,
-            length: requested,
-            size: u64::MAX,
-        })
+pub struct RegionLock<'region> {
+    header: NonNull<SvmRegionHeader>,
+    guard: StandardGuard<'region>,
+}
+
+impl RegionLock<'_> {
+    pub fn pvt_heap(&self) -> &MemHeap {
+        let pointer = unsafe { self.header.as_ref().pvt_heap };
+        assert!(!pointer.is_null(), "validated region has a PVT Heap");
+        unsafe { &*pointer }
     }
 
-    /// Initializes a region header in a segment this process created.
-    ///
-    /// The segment stays unpublished until the header is complete, so no other
-    /// process can attach to a half-initialized region.
+    pub fn data_heap(&self) -> Option<&MemHeap> {
+        let pointer = unsafe { self.header.as_ref().data_heap };
+        unsafe { pointer.as_ref() }
+    }
+
+    pub fn main_region(&self) -> Option<&SvmMainRegion> {
+        let header = unsafe { self.header.as_ref() };
+        if !header.flags.contains(SvmRegionFlags::NODATA) {
+            return None;
+        }
+        unsafe { header.data_base.cast::<SvmMainRegion>().as_ref() }
+    }
+
+    pub fn main_region_mut(&mut self) -> Option<&mut SvmMainRegion> {
+        let header = unsafe { self.header.as_mut() };
+        if !header.flags.contains(SvmRegionFlags::NODATA) {
+            return None;
+        }
+        unsafe { header.data_base.cast::<SvmMainRegion>().as_mut() }
+    }
+}
+
+impl Drop for RegionLock<'_> {
+    fn drop(&mut self) {
+        let header = unsafe { self.header.as_ref() };
+        header.mutex_owner_tag.store(0, Ordering::Relaxed);
+        header.mutex_owner_pid.store(0, Ordering::Release);
+        let _ = &self.guard;
+    }
+}
+
+impl SvmRegion {
     pub fn create(
-        segment: Arc<SsvmPrivate>,
+        base: NonZeroUsize,
         config: &SvmRegionConfig,
+        backing: OwnedFd,
     ) -> Result<Self, SvmRegionError> {
-        validate_region_flags(config.flags)?;
-        if !segment.is_server() {
-            return Err(SvmRegionError::UnsupportedOperation {
-                operation: RegionOperation::CreateOnAttachedSegment,
+        let page_size = MemMain::system_page_size();
+        let (size, pvt_heap_size) = config.map_size(page_size, false)?;
+        if !base.get().is_multiple_of(page_size) {
+            return Err(SvmRegionError::MisalignedBase {
+                base: base.get(),
+                alignment: page_size,
             });
         }
-        let header_offset = segment.payload_offset();
-        let payload_len = segment.payload_len();
-        let data_start = data_section_start(config.flags);
-        if payload_len < data_start + MINIMUM_HEAP_BYTES || payload_len < config.size {
-            return Err(SvmRegionError::InvalidBounds {
-                offset: header_offset,
-                length: data_start + MINIMUM_HEAP_BYTES,
-                size: payload_len,
-            });
-        }
-        let header_pointer =
-            segment.offset_ptr(header_offset, size_of::<SvmRegionHeader>(), REGION_ALIGN)?;
-        let header = header_pointer.cast::<SvmRegionHeader>();
-        // SAFETY: the header owns this range of the payload exclusively; the
-        // bytes were just mapped and no other process has a published version
-        // to observe them through.
+        resize_backing(&backing, size)?;
+        let mapped = map_fixed_backing(&backing, base.get(), size, 0)?;
+        let header = mapped.cast::<SvmRegionHeader>();
+
         unsafe {
-            std::ptr::write(
-                header,
+            ptr::write(
+                header.as_ptr(),
                 SvmRegionHeader {
                     version: AtomicU64::new(0),
                     mutex: MaybeUninit::uninit(),
                     condvar: MaybeUninit::uninit(),
                     mutex_owner_pid: AtomicI32::new(0),
                     mutex_owner_tag: AtomicI32::new(0),
-                    flags: AtomicU64::new(config.flags),
-                    virtual_size: payload_len,
-                    data_base_offset: data_start,
-                    data_heap: SvmRegionHeap::new(),
-                    metadata_heap: SvmRegionHeap::new(),
-                    user_ctx_offset: 0,
-                    client_pids_offset: AtomicU64::new(0),
-                    client_count: AtomicU64::new(0),
-                    client_capacity: AtomicU64::new(0),
-                    magic: REGION_MAGIC,
-                    state: AtomicU32::new(SvmRegionState::Uninitialized as u32),
-                    root_offset: AtomicU64::new(0),
+                    flags: SvmRegionFlags(
+                        config.flags.bits()
+                            | if config.flags.contains(SvmRegionFlags::NODATA) {
+                                NEED_DATA_INIT_FLAG
+                            } else {
+                                0
+                            },
+                    ),
+                    virtual_base: mapped.as_ptr(),
+                    virtual_size: size,
+                    pvt_heap: ptr::null_mut(),
+                    data_base: ptr::null_mut(),
+                    data_heap: ptr::null_mut(),
+                    user_ctx: AtomicPtr::new(ptr::null_mut()),
+                    bitmap_size: 0,
+                    bitmap: ptr::null_mut(),
+                    region_name: ptr::null_mut(),
+                    backing_file: ptr::null_mut(),
+                    filenames: ptr::null_mut(),
+                    client_pids: ptr::null_mut(),
                 },
             );
-        }
-        // SAFETY: the raw mutex and condvar storage is inside the header just
-        // written, and the builders initialize it in place.
-        let mutex = unsafe {
+
             MutexBuilder::<Robust>::new()
                 .with_sharing(MutexSharing::Shared)
-                .build_borrowed((&raw mut (*header).mutex).cast(), &REGION_MAPPING_ANCHOR)
-        };
-        unsafe {
+                .build_borrowed(ptr::addr_of_mut!((*header.as_ptr()).mutex).cast(), &backing);
             CondvarBuilder::new()
                 .with_sharing(CondvarSharing::Shared)
                 .with_clock(CondvarClock::Monotonic)
-                .build_borrowed((&raw mut (*header).condvar).cast(), &REGION_MAPPING_ANCHOR);
-        }
-        let region = Self {
-            segment,
-            header_offset,
-            mutex,
-        };
-        let subdivided = config.flags & REGION_FLAG_SUBDIVIDED != 0;
-        let lock = region.lock(RegionLockTag::Init)?;
-        let metadata_start = header_end();
-        // Heap offsets stay payload relative: every descriptor manages a range
-        // of the same arena, so no caller has to add a section start back.
-        let metadata_end = if subdivided {
-            payload_len
-        } else {
-            header_end() + SVM_REGION_METADATA_HEAP_SIZE
-        };
-        // SAFETY: the create path holds the region lock. Each descriptor is a
-        // header field, and the arena is the whole payload, so a descriptor
-        // never overlaps the range it manages.
-        unsafe { metadata_heap(header) }.initialize(
-            unsafe { arena_mut(region.arena_range()) },
-            metadata_start,
-            metadata_end,
-        );
-        if config.flags & REGION_FLAG_DATA_HEAP != 0 {
-            // SAFETY: as above; the data range starts after the metadata range,
-            // so the two descriptors never describe the same bytes.
-            unsafe {
-                (*std::ptr::addr_of_mut!((*header).data_heap)).initialize(
-                    arena_mut(region.arena_range()),
-                    data_start,
-                    payload_len,
+                .build_borrowed(
+                    ptr::addr_of_mut!((*header.as_ptr()).condvar).cast(),
+                    &backing,
                 );
+        }
+
+        let mut region = Self {
+            backing,
+            base: mapped,
+            size,
+            header,
+            root_header: None,
+            is_client: false,
+        };
+        if let Err(error) = region.initialize_mapped_region(config, pvt_heap_size, page_size) {
+            let header = unsafe { region.header.as_ref() };
+            if let Some(data_heap) = unsafe { header.data_heap.as_ref() } {
+                unsafe { data_heap.destroy() };
             }
-        }
-        if subdivided {
-            let registry_layout = Layout::new::<SvmRegionMain>();
-            let offset = unsafe { metadata_heap(header) }
-                .allocate(unsafe { arena_mut(region.arena_range()) }, registry_layout);
-            // SAFETY: the heap just returned this block, and the registry is
-            // written once before `version` publishes it.
-            unsafe {
-                std::ptr::write(
-                    region.payload_address(offset).cast::<SvmRegionMain>(),
-                    SvmRegionMain::new(),
-                );
-                (*header).data_base_offset = offset;
+            if let Some(pvt_heap) = unsafe { header.pvt_heap.as_ref() } {
+                unsafe { pvt_heap.destroy() };
             }
+            if unsafe { libc::munmap(region.base.as_ptr().cast(), region.size) } != 0 {
+                std::process::abort();
+            }
+            region.size = 0;
+            return Err(error);
         }
-        // Publish: every earlier write is visible to a process that observes
-        // this version.
-        unsafe {
-            (*header)
-                .version
-                .store(SVM_REGION_VERSION, Ordering::Release);
-        }
-        drop(lock);
-        region.segment.publish_ready();
         Ok(region)
     }
 
-    /// Attaches to a region that another mapping already initialized.
-    ///
-    /// Validation happens before any shared state is used, and attach never
-    /// mutates the member table: membership is an explicit [`Self::join`].
-    pub fn attach(segment: Arc<SsvmPrivate>) -> Result<Self, SvmRegionError> {
-        let header_offset = segment.payload_offset();
-        let payload_len = segment.payload_len();
-        let header_pointer =
-            segment.offset_ptr(header_offset, size_of::<SvmRegionHeader>(), REGION_ALIGN)?;
-        let header = header_pointer.cast::<SvmRegionHeader>();
-        let version = unsafe { (*header).version.load(Ordering::Acquire) };
-        if version == 0 {
-            let state = region_state(header);
-            if state == SvmRegionState::Failed {
-                return Err(SvmRegionError::RegionFailed {
-                    mutex_owner_pid: unsafe { (*header).mutex_owner_pid.load(Ordering::Acquire) },
+    pub fn attach(backing: OwnedFd) -> Result<Self, SvmRegionError> {
+        Self::map_region(backing, None)
+    }
+
+    pub fn base(&self) -> NonNull<u8> {
+        self.base
+    }
+
+    pub fn size(&self) -> usize {
+        self.size
+    }
+
+    pub fn flags(&self) -> SvmRegionFlags {
+        unsafe { self.header.as_ref().flags }
+    }
+
+    pub fn lock(&self) -> Result<RegionLock<'_>, SvmRegionError> {
+        self.lock_header(self.header, LOCK_TAG_SCAN)
+    }
+
+    pub fn client_count(&self) -> Result<usize, SvmRegionError> {
+        let lock = self.lock()?;
+        let pvt_heap = lock.pvt_heap() as *const MemHeap;
+        let active_heap = unsafe { &*pvt_heap }.activate();
+        let count = unsafe { (&*self.header.as_ref().client_pids).len() };
+        drop(active_heap);
+        drop(lock);
+        Ok(count)
+    }
+
+    pub fn remove_exited_clients(&self) -> Result<usize, SvmRegionError> {
+        let lock = self.lock()?;
+        let pvt_heap = lock.pvt_heap() as *const MemHeap;
+        let active_heap = unsafe { &*pvt_heap }.activate();
+        let clients = unsafe { &mut *self.header.as_ref().client_pids };
+        let current_pid = std::process::id() as i32;
+        let mut exited = Vec::new();
+        for (index, pid) in clients.iter().copied().enumerate() {
+            if pid != current_pid && process_is_dead(pid)? {
+                exited.push(index);
+            }
+        }
+        for index in exited.iter().rev().copied() {
+            clients.remove(index);
+        }
+        let removed = exited.len();
+        drop(exited);
+        drop(active_heap);
+        drop(lock);
+        Ok(removed)
+    }
+
+    pub fn find_or_create_subregion(
+        &mut self,
+        config: &SvmRegionConfig,
+        backing: OwnedFd,
+    ) -> Result<Self, SvmRegionError> {
+        if config.flags.contains(SvmRegionFlags::NODATA) {
+            return Err(SvmRegionError::InvalidFlags {
+                bits: config.flags.bits(),
+            });
+        }
+
+        let page_size = MemMain::system_page_size();
+        let (mapped_size, pvt_heap_size) = config.map_size(page_size, true)?;
+
+        let mut root_lock = self.lock_header(self.header, LOCK_TAG_SUBREGION)?;
+        if !unsafe { root_lock.header.as_ref().flags }.contains(SvmRegionFlags::NODATA) {
+            return Err(SvmRegionError::RootRequired);
+        }
+        let root_pvt_heap = root_lock.pvt_heap() as *const MemHeap;
+        let root_pvt_heap_size = unsafe { &*root_pvt_heap }.size();
+        let active_heap = unsafe { &*root_pvt_heap }.activate();
+        let root_main = root_lock
+            .main_region_mut()
+            .expect("validated NODATA region has SvmMainRegion");
+
+        if root_main.name_hash.contains_key(config.name.as_str()) {
+            let (base, size) = probe_backing(&backing, page_size)?;
+            let root_base = self.base.as_ptr().addr();
+            let root_end = root_base + self.size;
+            let end = base
+                .checked_add(size)
+                .ok_or(SvmRegionError::SubregionOutsideRoot {
+                    base,
+                    size,
+                    root_base,
+                    root_size: self.size,
+                })?;
+            if base < root_base || end > root_end || !base.is_multiple_of(page_size) {
+                return Err(SvmRegionError::SubregionOutsideRoot {
+                    base,
+                    size,
+                    root_base,
+                    root_size: self.size,
                 });
             }
-            return Err(SvmRegionError::NotReady { state });
+            let first_page = (base - root_base) / page_size;
+            let page_count = size / page_size;
+            let bitmap = unsafe { &*self.header.as_ref().bitmap };
+            if !(first_page..first_page + page_count).all(|page| bitmap.is_set(page)) {
+                return Err(SvmRegionError::SubregionNotReserved { base, size });
+            }
+            if unsafe { libc::munmap(base as *mut c_void, size) } != 0 {
+                return Err(SvmRegionError::Unmapping {
+                    base,
+                    size,
+                    source: io::Error::last_os_error(),
+                });
+            }
+
+            let mut region = match Self::map_region(backing, Some(config)) {
+                Ok(region) => region,
+                Err(error) => {
+                    if map_fixed_backing(&self.backing, base, size, (base - root_base) as u64)
+                        .is_err()
+                    {
+                        std::process::abort();
+                    }
+                    return Err(error);
+                }
+            };
+            region.root_header = Some(self.header);
+            drop(active_heap);
+            drop(root_lock);
+            return Ok(region);
+        }
+
+        resize_backing(&backing, mapped_size)?;
+        let bitmap = unsafe { &mut *self.header.as_ref().bitmap };
+        let overhead_pages = (page_size + root_pvt_heap_size) / page_size;
+        let required_pages = mapped_size / page_size;
+        let bitmap_size = unsafe { self.header.as_ref().bitmap_size };
+        let mut page_index = overhead_pages;
+        let mut available_page = None;
+        while page_index + required_pages <= bitmap_size {
+            match (page_index..page_index + required_pages).find(|page| bitmap.is_set(*page)) {
+                Some(occupied_page) => page_index = occupied_page + 1,
+                None => {
+                    available_page = Some(page_index);
+                    break;
+                }
+            }
+        }
+        let Some(page_index) = available_page else {
+            return Err(SvmRegionError::RootAddressSpaceExhausted {
+                requested: mapped_size,
+                available: self.size,
+            });
+        };
+        for page in page_index..page_index + required_pages {
+            assert!(bitmap.set(page), "root bitmap reserves clear pages");
+        }
+        let subregion_base = self
+            .base
+            .as_ptr()
+            .addr()
+            .checked_add(page_index * page_size)
+            .expect("validated root range address fits usize");
+        if unsafe { libc::munmap(subregion_base as *mut c_void, mapped_size) } != 0 {
+            for page in page_index..page_index + required_pages {
+                assert!(bitmap.clear(page), "root bitmap releases reserved pages");
+            }
+            return Err(SvmRegionError::Unmapping {
+                base: subregion_base,
+                size: mapped_size,
+                source: io::Error::last_os_error(),
+            });
+        }
+
+        let mapped_config = SvmRegionConfig {
+            name: config.name.clone(),
+            size: mapped_size,
+            pvt_heap_size,
+            flags: config.flags,
+        };
+        let base = NonZeroUsize::new(subregion_base).expect("root base is nonzero");
+        let mut region = match Self::create(base, &mapped_config, backing) {
+            Ok(region) => region,
+            Err(error) => {
+                for page in page_index..page_index + required_pages {
+                    assert!(bitmap.clear(page), "root bitmap releases reserved pages");
+                }
+                if map_fixed_backing(
+                    &self.backing,
+                    subregion_base,
+                    mapped_size,
+                    (subregion_base - self.base.as_ptr().addr()) as u64,
+                )
+                .is_err()
+                {
+                    std::process::abort();
+                }
+                return Err(error);
+            }
+        };
+
+        let subregion_name = config.name.clone();
+        let index = root_main.subregions.insert(SvmSubregion {
+            subregion_name: subregion_name.clone(),
+        });
+        assert!(
+            root_main.name_hash.insert(subregion_name, index).is_none(),
+            "new subregion name inserts once"
+        );
+        region.root_header = Some(self.header);
+        drop(mapped_config);
+        drop(active_heap);
+        drop(root_lock);
+        Ok(region)
+    }
+
+    pub fn unmap(mut self) -> Result<(), SvmRegionError> {
+        if let Err(error) = self.remove_client() {
+            if self.unmap_local().is_err() {
+                std::process::abort();
+            }
+            return Err(error);
+        }
+
+        self.unmap_local()
+    }
+
+    fn initialize_mapped_region(
+        &mut self,
+        config: &SvmRegionConfig,
+        pvt_heap_size: usize,
+        page_size: usize,
+    ) -> Result<(), SvmRegionError> {
+        let mut header = self.header;
+        let lock = self.lock_header(header, LOCK_TAG_INIT)?;
+        let pvt_base = NonNull::new(unsafe { self.base.as_ptr().add(page_size) })
+            .expect("mapped region base plus one page is non-null");
+        let pvt_heap = unsafe {
+            MemHeap::create_at(pvt_base, pvt_heap_size, true, "svm region")
+                .map_err(|source| SvmRegionError::PvtHeapCreation { source })?
+        };
+        unsafe { header.as_mut().pvt_heap = pvt_heap.as_ptr() };
+
+        let active_heap = unsafe { pvt_heap.as_ref() }.activate();
+        let data_base = unsafe { pvt_base.as_ptr().add(pvt_heap_size) };
+        unsafe { header.as_mut().data_base = data_base.cast() };
+        if config.flags.contains(SvmRegionFlags::DATA_HEAP) {
+            let data_size = self.size - page_size - pvt_heap_size;
+            let data_heap = unsafe {
+                MemHeap::create_at(
+                    NonNull::new(data_base).expect("validated data range is non-null"),
+                    data_size,
+                    true,
+                    "svm data",
+                )
+                .map_err(|source| SvmRegionError::DataHeapCreation { source })?
+            };
+            unsafe { header.as_mut().data_heap = data_heap.as_ptr() };
+        }
+
+        let region_pages = self.size / page_size;
+        let overhead_pages = (page_size + pvt_heap_size) / page_size;
+        let mut bitmap = Box::new(Bitmap::with_capacity(region_pages));
+        for page in 0..overhead_pages {
+            assert!(bitmap.set(page), "region overhead pages begin clear");
+        }
+        let region_name = Box::new(config.name.clone());
+        let filenames = Box::new(Vec::new());
+        let client_pids = Box::new(vec![std::process::id() as i32]);
+
+        unsafe {
+            let shared = header.as_mut();
+            shared.bitmap_size = region_pages;
+            shared.bitmap = Box::into_raw(bitmap);
+            shared.region_name = Box::into_raw(region_name);
+            shared.filenames = Box::into_raw(filenames);
+            shared.client_pids = Box::into_raw(client_pids);
+        }
+
+        if config.flags.contains(SvmRegionFlags::NODATA) {
+            let main_region = Box::new(SvmMainRegion {
+                subregions: Pool::new(),
+                name_hash: HashMap::new(),
+            });
+            unsafe {
+                let shared = header.as_mut();
+                shared.data_base = Box::into_raw(main_region).cast();
+                shared.flags = SvmRegionFlags(shared.flags.bits() & !NEED_DATA_INIT_FLAG);
+            }
+            unsafe {
+                header
+                    .as_ref()
+                    .mutex_owner_tag
+                    .store(LOCK_TAG_ROOT_INIT, Ordering::Relaxed);
+            }
+        }
+
+        unsafe {
+            header
+                .as_ref()
+                .version
+                .store(SVM_REGION_VERSION, Ordering::Release);
+        }
+        drop(active_heap);
+        drop(lock);
+        Ok(())
+    }
+
+    fn map_region(
+        backing: OwnedFd,
+        expected: Option<&SvmRegionConfig>,
+    ) -> Result<Self, SvmRegionError> {
+        let page_size = MemMain::system_page_size();
+        let (base, size) = probe_backing(&backing, page_size)?;
+        let mapped = map_fixed_backing(&backing, base, size, 0)?;
+        let header = mapped.cast::<SvmRegionHeader>();
+        let mut region = Self {
+            backing,
+            base: mapped,
+            size,
+            header,
+            root_header: None,
+            is_client: true,
+        };
+
+        let result = (|| {
+            let header = unsafe { region.header.as_ref() };
+            let version = header.version.load(Ordering::Acquire);
+            if version == 0 {
+                return Err(SvmRegionError::NotReady);
+            }
+            if version != SVM_REGION_VERSION {
+                return Err(SvmRegionError::UnsupportedVersion {
+                    found: version,
+                    expected: SVM_REGION_VERSION,
+                });
+            }
+            if header.virtual_base != region.base.as_ptr() {
+                return Err(SvmRegionError::VirtualBaseMismatch {
+                    found: region.base.as_ptr().addr(),
+                    expected: header.virtual_base.addr(),
+                });
+            }
+            if header.virtual_size != region.size {
+                return Err(SvmRegionError::VirtualSizeMismatch {
+                    mapped: region.size,
+                    declared: header.virtual_size,
+                });
+            }
+            let flag_bits = header.flags.bits();
+            if flag_bits & !PUBLIC_FLAGS != 0
+                || header.flags.contains(SvmRegionFlags::DATA_HEAP)
+                    && header.flags.contains(SvmRegionFlags::NODATA)
+            {
+                return Err(SvmRegionError::InvalidFlags { bits: flag_bits });
+            }
+
+            let lock = region.lock_header(region.header, LOCK_TAG_ATTACH)?;
+            let expected_pvt_base = region.base.as_ptr().addr() + page_size;
+            let region_end = region.base.as_ptr().addr() + region.size;
+            let pvt_heap = header.pvt_heap;
+            let pvt_heap_address = pvt_heap.addr();
+            if pvt_heap_address < expected_pvt_base
+                || pvt_heap_address
+                    .checked_add(size_of::<MemHeap>())
+                    .is_none_or(|control_end| control_end > region_end)
+            {
+                return Err(SvmRegionError::PvtHeapLayout {
+                    found_base: pvt_heap_address,
+                    found_size: 0,
+                    expected_base: expected_pvt_base,
+                });
+            }
+            let pvt_heap_ref = unsafe { &*pvt_heap };
+            if pvt_heap_ref.base().as_ptr().addr() != expected_pvt_base
+                || pvt_heap_ref.size() < page_size
+                || !pvt_heap_ref.size().is_multiple_of(page_size)
+                || expected_pvt_base
+                    .checked_add(pvt_heap_ref.size())
+                    .is_none_or(|pvt_end| pvt_end > region_end)
+            {
+                return Err(SvmRegionError::PvtHeapLayout {
+                    found_base: pvt_heap_ref.base().as_ptr().addr(),
+                    found_size: pvt_heap_ref.size(),
+                    expected_base: expected_pvt_base,
+                });
+            }
+            for pointer in [
+                header.pvt_heap.cast::<u8>(),
+                header.bitmap.cast::<u8>(),
+                header.region_name.cast::<u8>(),
+                header.filenames.cast::<u8>(),
+                header.client_pids.cast::<u8>(),
+            ] {
+                let Some(pointer) = NonNull::new(pointer) else {
+                    return Err(SvmRegionError::InvalidPvtObject { pointer: 0 });
+                };
+                if !pvt_heap_ref.is_heap_object(pointer) {
+                    return Err(SvmRegionError::InvalidPvtObject {
+                        pointer: pointer.as_ptr().addr(),
+                    });
+                }
+            }
+            if let Some(backing_file) = NonNull::new(header.backing_file.cast::<u8>())
+                && !pvt_heap_ref.is_heap_object(backing_file)
+            {
+                return Err(SvmRegionError::InvalidPvtObject {
+                    pointer: backing_file.as_ptr().addr(),
+                });
+            }
+
+            let expected_data_base = expected_pvt_base + pvt_heap_ref.size();
+            if header.flags.contains(SvmRegionFlags::NODATA) {
+                if !header.data_heap.is_null() {
+                    return Err(SvmRegionError::UnexpectedDataHeap {
+                        pointer: header.data_heap.addr(),
+                    });
+                }
+                let Some(data_base) = NonNull::new(header.data_base.cast()) else {
+                    return Err(SvmRegionError::InvalidDataBase {
+                        pointer: 0,
+                        base: expected_pvt_base,
+                        size: pvt_heap_ref.size(),
+                    });
+                };
+                if !pvt_heap_ref.is_heap_object(data_base) {
+                    return Err(SvmRegionError::InvalidDataBase {
+                        pointer: data_base.as_ptr().addr(),
+                        base: expected_pvt_base,
+                        size: pvt_heap_ref.size(),
+                    });
+                }
+            } else if header.data_base.addr() != expected_data_base {
+                return Err(SvmRegionError::InvalidDataBase {
+                    pointer: header.data_base.addr(),
+                    base: expected_data_base,
+                    size: region_end - expected_data_base,
+                });
+            } else if header.flags.contains(SvmRegionFlags::DATA_HEAP) {
+                let data_heap_address = header.data_heap.addr();
+                if data_heap_address < expected_data_base
+                    || data_heap_address
+                        .checked_add(size_of::<MemHeap>())
+                        .is_none_or(|control_end| control_end > region_end)
+                {
+                    return Err(SvmRegionError::DataHeapLayout {
+                        found_base: data_heap_address,
+                        found_size: 0,
+                        expected_base: expected_data_base,
+                        expected_size: region_end - expected_data_base,
+                    });
+                }
+                let Some(data_heap) = (unsafe { header.data_heap.as_ref() }) else {
+                    return Err(SvmRegionError::MissingDataHeap);
+                };
+                if data_heap.base().as_ptr().addr() != expected_data_base
+                    || data_heap.size() != region_end - expected_data_base
+                {
+                    return Err(SvmRegionError::DataHeapLayout {
+                        found_base: data_heap.base().as_ptr().addr(),
+                        found_size: data_heap.size(),
+                        expected_base: expected_data_base,
+                        expected_size: region_end - expected_data_base,
+                    });
+                }
+            } else if !header.data_heap.is_null() {
+                return Err(SvmRegionError::UnexpectedDataHeap {
+                    pointer: header.data_heap.addr(),
+                });
+            }
+
+            let active_heap = unsafe { &*pvt_heap }.activate();
+            if let Some(config) = expected {
+                let (expected_size, _) = config.map_size(page_size, true)?;
+                let name = unsafe { &*header.region_name };
+                if name != &config.name {
+                    return Err(SvmRegionError::SubregionNameMismatch);
+                }
+                if region.size != expected_size {
+                    return Err(SvmRegionError::SubregionSizeMismatch {
+                        found: region.size,
+                        expected: expected_size,
+                    });
+                }
+                if header.flags != config.flags {
+                    return Err(SvmRegionError::SubregionFlagsMismatch {
+                        found: header.flags.bits(),
+                        expected: config.flags.bits(),
+                    });
+                }
+            }
+            unsafe {
+                (&mut *region.header.as_ref().client_pids).push(std::process::id() as i32);
+            }
+            drop(active_heap);
+            drop(lock);
+            Ok(())
+        })();
+        if let Err(error) = result {
+            if unsafe { libc::munmap(region.base.as_ptr().cast(), region.size) } != 0 {
+                std::process::abort();
+            }
+            region.size = 0;
+            return Err(error);
+        }
+        Ok(region)
+    }
+
+    fn lock_header<'region>(
+        &'region self,
+        header: NonNull<SvmRegionHeader>,
+        tag: i32,
+    ) -> Result<RegionLock<'region>, SvmRegionError> {
+        let shared = unsafe { header.as_ref() };
+        let owner_pid = shared.mutex_owner_pid.load(Ordering::Acquire);
+        let owner_tag = shared.mutex_owner_tag.load(Ordering::Relaxed);
+        if owner_pid != 0 && process_is_dead(owner_pid)? {
+            return Err(SvmRegionError::OwnerDied {
+                owner_pid,
+                owner_tag,
+            });
+        }
+
+        let mutex = unsafe {
+            BorrowedMutex::<Robust>::from_raw(
+                ptr::addr_of!((*header.as_ptr()).mutex).cast_mut().cast(),
+                self,
+            )
+        };
+        match unsafe { mutex.lock() } {
+            Ok(RobustGuardContainer::Standard(guard)) => {
+                shared.mutex_owner_tag.store(tag, Ordering::Relaxed);
+                shared
+                    .mutex_owner_pid
+                    .store(std::process::id() as i32, Ordering::Release);
+                // The guard borrows a Copy BorrowedMutex local, but that value
+                // never owns the pthread mutex. The mapped header outlives the
+                // returned borrow of `self`, which is the real guard lifetime.
+                let guard = unsafe {
+                    std::mem::transmute::<StandardGuard<'_>, StandardGuard<'region>>(guard)
+                };
+                Ok(RegionLock { header, guard })
+            }
+            Ok(RobustGuardContainer::Indeterminate(guard)) => {
+                let owner_pid = shared.mutex_owner_pid.load(Ordering::Acquire);
+                let owner_tag = shared.mutex_owner_tag.load(Ordering::Relaxed);
+                drop(guard);
+                Err(SvmRegionError::OwnerDied {
+                    owner_pid,
+                    owner_tag,
+                })
+            }
+            Err(MutexLockError::NotRecoverable) => Err(SvmRegionError::OwnerDied {
+                owner_pid: shared.mutex_owner_pid.load(Ordering::Acquire),
+                owner_tag: shared.mutex_owner_tag.load(Ordering::Relaxed),
+            }),
+            Err(source) => Err(SvmRegionError::Lock { source }),
+        }
+    }
+
+    fn remove_client(&self) -> Result<(), SvmRegionError> {
+        let mut root_lock = match self.root_header {
+            Some(root_header) => {
+                let lock = self.lock_header(root_header, LOCK_TAG_UNMAP)?;
+                if !unsafe { lock.header.as_ref().flags }.contains(SvmRegionFlags::NODATA) {
+                    return Err(SvmRegionError::RootRequired);
+                }
+                Some(lock)
+            }
+            None => None,
+        };
+        let region_lock = self.lock_header(self.header, LOCK_TAG_UNMAP)?;
+        let pvt_heap = region_lock.pvt_heap() as *const MemHeap;
+        let active_heap = unsafe { &*pvt_heap }.activate();
+        let clients = unsafe { &mut *self.header.as_ref().client_pids };
+        let pid = std::process::id() as i32;
+        let Some(client_index) = clients.iter().position(|client| *client == pid) else {
+            return Err(SvmRegionError::ClientNotRegistered { pid });
+        };
+        clients.remove(client_index);
+        let last_client = clients.is_empty();
+        drop(active_heap);
+
+        if last_client && let Some(root_lock) = root_lock.as_mut() {
+            let root_pvt_heap = root_lock.pvt_heap() as *const MemHeap;
+            let root_active_heap = unsafe { &*root_pvt_heap }.activate();
+            let name = unsafe { (&*self.header.as_ref().region_name).clone() };
+            let root_main = root_lock
+                .main_region_mut()
+                .expect("NODATA root has SvmMainRegion");
+            let index = root_main
+                .name_hash
+                .remove(name.as_str())
+                .expect("mapped subregion name is registered in root");
+            let subregion = root_main
+                .subregions
+                .remove(index)
+                .expect("mapped subregion pool index is occupied");
+            assert_eq!(subregion.subregion_name, name);
+            drop(subregion);
+
+            let root_header = unsafe { root_lock.header.as_ref() };
+            let page_size = MemMain::system_page_size();
+            let first_page =
+                (self.base.as_ptr().addr() - root_header.virtual_base.addr()) / page_size;
+            let page_count = self.size / page_size;
+            let bitmap = unsafe { &mut *root_header.bitmap };
+            for page in first_page..first_page + page_count {
+                assert!(bitmap.clear(page), "root bitmap releases reserved pages");
+            }
+            drop(name);
+            drop(root_active_heap);
+        }
+
+        drop(region_lock);
+        drop(root_lock);
+        Ok(())
+    }
+
+    fn unmap_local(&mut self) -> Result<(), SvmRegionError> {
+        if self.size == 0 {
+            return Ok(());
+        }
+        let base = self.base.as_ptr().addr();
+        let size = self.size;
+        if unsafe { libc::munmap(self.base.as_ptr().cast(), size) } != 0 {
+            return Err(SvmRegionError::Unmapping {
+                base,
+                size,
+                source: io::Error::last_os_error(),
+            });
+        }
+        self.size = 0;
+        Ok(())
+    }
+}
+
+impl Drop for SvmRegion {
+    fn drop(&mut self) {
+        if self.size != 0 && self.unmap_local().is_err() {
+            std::process::abort();
+        }
+    }
+}
+
+fn resize_backing(backing: &OwnedFd, size: usize) -> Result<(), SvmRegionError> {
+    let length = libc::off_t::try_from(size).map_err(|_| SvmRegionError::SizeOverflow {
+        requested: size,
+        alignment: MemMain::system_page_size(),
+    })?;
+    if unsafe { libc::ftruncate(backing.as_raw_fd(), length) } != 0 {
+        return Err(SvmRegionError::BackingResize {
+            size,
+            source: io::Error::last_os_error(),
+        });
+    }
+    Ok(())
+}
+
+fn probe_backing(backing: &OwnedFd, page_size: usize) -> Result<(usize, usize), SvmRegionError> {
+    let mut status = MaybeUninit::<libc::stat>::uninit();
+    if unsafe { libc::fstat(backing.as_raw_fd(), status.as_mut_ptr()) } != 0 {
+        return Err(SvmRegionError::BackingMetadata {
+            source: io::Error::last_os_error(),
+        });
+    }
+    let available = usize::try_from(unsafe { status.assume_init() }.st_size).map_err(|_| {
+        SvmRegionError::BackingMetadata {
+            source: io::Error::new(io::ErrorKind::InvalidData, "negative backing size"),
+        }
+    })?;
+    if available < page_size {
+        return Err(SvmRegionError::BackingTooSmall {
+            available,
+            required: page_size,
+        });
+    }
+    let probe = unsafe {
+        libc::mmap(
+            ptr::null_mut(),
+            page_size,
+            libc::PROT_READ | libc::PROT_WRITE,
+            libc::MAP_SHARED,
+            backing.as_raw_fd(),
+            0,
+        )
+    };
+    if probe == libc::MAP_FAILED {
+        return Err(SvmRegionError::ProbeMapping {
+            size: page_size,
+            source: io::Error::last_os_error(),
+        });
+    }
+    let header = probe.cast::<SvmRegionHeader>();
+    let result = (|| {
+        let version = unsafe { (*header).version.load(Ordering::Acquire) };
+        if version == 0 {
+            return Err(SvmRegionError::NotReady);
         }
         if version != SVM_REGION_VERSION {
             return Err(SvmRegionError::UnsupportedVersion {
@@ -606,731 +1198,115 @@ impl SvmRegion {
                 expected: SVM_REGION_VERSION,
             });
         }
-        if failure_latched(header) {
-            return Err(SvmRegionError::RegionFailed {
-                mutex_owner_pid: unsafe { (*header).mutex_owner_pid.load(Ordering::Acquire) },
+        let base = unsafe { (*header).virtual_base.addr() };
+        let size = unsafe { (*header).virtual_size };
+        if !base.is_multiple_of(page_size) {
+            return Err(SvmRegionError::MisalignedBase {
+                base,
+                alignment: page_size,
             });
         }
-        let magic = unsafe { (*header).magic };
-        if magic != REGION_MAGIC {
-            return Err(SvmRegionError::InvalidMagic { found: magic });
-        }
-        let declared_size = unsafe { (*header).virtual_size };
-        if declared_size != payload_len {
-            return Err(SvmRegionError::LayoutMismatch {
-                declared: declared_size,
-                expected: payload_len,
+        if size < page_size || !size.is_multiple_of(page_size) {
+            return Err(SvmRegionError::InvalidSize {
+                requested: size,
+                minimum: page_size,
             });
         }
-        let flags = unsafe { (*header).flags.load(Ordering::Acquire) };
-        validate_region_flags(flags)?;
-        let subdivided = flags & REGION_FLAG_SUBDIVIDED != 0;
-        let data_start = unsafe { (*header).data_base_offset };
-        if data_start < header_end() || data_start >= payload_len {
-            return Err(SvmRegionError::InvalidBounds {
-                offset: data_start,
-                length: size_of::<SvmRegionHeader>() as u64,
-                size: payload_len,
+        if available < size {
+            return Err(SvmRegionError::BackingTooSmall {
+                available,
+                required: size,
             });
         }
-        if subdivided {
-            let registry_bytes = size_of::<SvmRegionMain>() as u64;
-            if data_start + registry_bytes > payload_len {
-                return Err(SvmRegionError::InvalidBounds {
-                    offset: data_start,
-                    length: registry_bytes,
-                    size: payload_len,
-                });
-            }
-        } else if data_start != header_end() + SVM_REGION_METADATA_HEAP_SIZE {
-            return Err(SvmRegionError::LayoutMismatch {
-                declared: data_start,
-                expected: header_end() + SVM_REGION_METADATA_HEAP_SIZE,
+        let owner_pid = unsafe { (*header).mutex_owner_pid.load(Ordering::Acquire) };
+        let owner_tag = unsafe { (*header).mutex_owner_tag.load(Ordering::Relaxed) };
+        if owner_pid != 0 && process_is_dead(owner_pid)? {
+            return Err(SvmRegionError::OwnerDied {
+                owner_pid,
+                owner_tag,
             });
         }
-        let expected_metadata = if subdivided {
-            payload_len
-        } else {
-            header_end() + SVM_REGION_METADATA_HEAP_SIZE
-        };
-        let metadata = unsafe { &(*header).metadata_heap };
-        if metadata.heap_start() != header_end()
-            || metadata.heap_end() != expected_metadata
-            || metadata.free_bytes() + metadata.used_bytes() != expected_metadata - header_end()
-        {
-            return Err(SvmRegionError::LayoutMismatch {
-                declared: metadata.heap_end(),
-                expected: expected_metadata,
-            });
+        Ok((base, size))
+    })();
+    if unsafe { libc::munmap(probe, page_size) } != 0 {
+        std::process::abort();
+    }
+    result
+}
+
+fn map_fixed_backing(
+    backing: &OwnedFd,
+    base: usize,
+    size: usize,
+    offset: u64,
+) -> Result<NonNull<u8>, SvmRegionError> {
+    #[cfg(target_os = "linux")]
+    let reservation_flags = libc::MAP_PRIVATE | libc::MAP_ANONYMOUS | libc::MAP_FIXED_NOREPLACE;
+    #[cfg(not(target_os = "linux"))]
+    let reservation_flags = libc::MAP_PRIVATE | libc::MAP_ANONYMOUS;
+    let reservation = unsafe {
+        libc::mmap(
+            base as *mut c_void,
+            size,
+            libc::PROT_NONE,
+            reservation_flags,
+            -1,
+            0,
+        )
+    };
+    if reservation == libc::MAP_FAILED {
+        let source = io::Error::last_os_error();
+        if source.raw_os_error() == Some(libc::EEXIST) {
+            return Err(SvmRegionError::AddressRangeOccupied { base, size, source });
         }
-        if flags & REGION_FLAG_DATA_HEAP != 0 {
-            let data = unsafe { &(*header).data_heap };
-            if data.heap_start() != data_start
-                || data.heap_end() != payload_len
-                || data.free_bytes() + data.used_bytes() != payload_len - data_start
-            {
-                return Err(SvmRegionError::LayoutMismatch {
-                    declared: data.heap_end(),
-                    expected: payload_len,
-                });
-            }
+        return Err(SvmRegionError::FixedMapping { base, size, source });
+    }
+    if reservation.addr() != base {
+        if unsafe { libc::munmap(reservation, size) } != 0 {
+            std::process::abort();
         }
-        // SAFETY: the header was validated above, and the creator initialized
-        // this process-shared mutex before publishing `version`.
-        let mutex = unsafe {
-            BorrowedMutex::<Robust>::from_raw(
-                (&raw mut (*header).mutex).cast(),
-                &REGION_MAPPING_ANCHOR,
-            )
-        };
-        Ok(Self {
-            segment,
-            header_offset,
-            mutex,
-        })
+        return Err(SvmRegionError::AddressRangeOccupied {
+            base,
+            size,
+            source: io::Error::new(io::ErrorKind::AddrInUse, "fixed range is unavailable"),
+        });
     }
-
-    /// Mapping this region lives in.
-    pub fn ssvm(&self) -> &Arc<SsvmPrivate> {
-        &self.segment
-    }
-
-    /// Payload-relative offset of the region header.
-    pub fn header_offset(&self) -> u64 {
-        self.header_offset
-    }
-
-    /// Payload bytes the region spans.
-    pub fn virtual_size(&self) -> Result<u64, SvmRegionError> {
-        self.require_usable()?;
-        Ok(unsafe { (*self.header_ptr()).virtual_size })
-    }
-
-    /// `REGION_FLAG_*` bits of this region.
-    pub fn flags(&self) -> Result<u64, SvmRegionError> {
-        self.require_usable()?;
-        Ok(unsafe { (*self.header_ptr()).flags.load(Ordering::Acquire) })
-    }
-
-    /// Lifecycle state of this region.
-    pub fn state(&self) -> Result<SvmRegionState, SvmRegionError> {
-        Ok(region_state(self.header_ptr()))
-    }
-
-    /// Payload-relative offset of the user context, 0 when unset.
-    pub fn user_ctx_offset(&self) -> Result<u64, SvmRegionError> {
-        self.require_usable()?;
-        Ok(unsafe { (*self.header_ptr()).user_ctx_offset })
-    }
-
-    /// Stores the user context offset; 0 clears it.
-    ///
-    /// A nonzero offset must address a live object behind the header, because
-    /// the header itself is not a user context.
-    pub fn publish_user_ctx(&self, offset: u64) -> Result<(), SvmRegionError> {
-        let lock = self.lock(RegionLockTag::Scan)?;
-        let pointer = self.header_ptr();
-        if offset != 0 && (offset < header_end() || offset >= self.payload_len()) {
-            return Err(SvmRegionError::InvalidBounds {
-                offset,
-                length: 1,
-                size: self.payload_len(),
-            });
-        }
-        unsafe {
-            (*pointer).user_ctx_offset = offset;
-        }
-        drop(lock);
-        Ok(())
-    }
-
-    /// Allocates `layout` from the region's data heap, or from the metadata
-    /// heap when the region has no data heap.
-    ///
-    /// The returned offset is payload relative and stays valid for every process
-    /// mapping this region.
-    pub fn allocate(&self, layout: Layout) -> Result<u64, SvmRegionError> {
-        let lock = self.lock(RegionLockTag::Allocate)?;
-        let result = self.allocate_locked(layout);
-        drop(lock);
-        result
-    }
-
-    /// Resizes the live allocation at `offset`; the offset changes only when the
-    /// block must grow.
-    pub fn reallocate(
-        &self,
-        offset: u64,
-        layout: Layout,
-        new_size: usize,
-    ) -> Result<u64, SvmRegionError> {
-        let lock = self.lock(RegionLockTag::Allocate)?;
-        let result = self.reallocate_locked(offset, layout, new_size);
-        drop(lock);
-        result
-    }
-
-    /// Releases the live allocation at `offset`.
-    pub fn deallocate(&self, offset: u64, layout: Layout) -> Result<(), SvmRegionError> {
-        let lock = self.lock(RegionLockTag::Allocate)?;
-        let result = self.deallocate_locked(offset, layout);
-        drop(lock);
-        result
-    }
-
-    /// Free bytes in the heaps this region owns.
-    pub fn free_bytes(&self) -> Result<u64, SvmRegionError> {
-        let lock = self.lock(RegionLockTag::Scan)?;
-        let total = self.free_bytes_locked(self.header_ptr());
-        drop(lock);
-        Ok(total)
-    }
-
-    /// Bytes currently held by live blocks in the heaps this region owns.
-    pub fn used_bytes(&self) -> Result<u64, SvmRegionError> {
-        let lock = self.lock(RegionLockTag::Scan)?;
-        let total = self.used_bytes_locked(self.header_ptr());
-        drop(lock);
-        Ok(total)
-    }
-
-    /// Publishes the root object offset; 0 clears it.
-    ///
-    /// A nonzero offset must address a live object behind the header; the
-    /// header and the region heaps' own descriptors live in front of it.
-    pub fn publish_root(&self, offset: u64) -> Result<(), SvmRegionError> {
-        let lock = self.lock(RegionLockTag::Scan)?;
-        let pointer = self.header_ptr();
-        if offset != 0 && (offset < header_end() || offset >= self.payload_len()) {
-            return Err(SvmRegionError::InvalidRoot { offset });
-        }
-        unsafe {
-            (*pointer).root_offset.store(offset, Ordering::Release);
-        }
-        drop(lock);
-        Ok(())
-    }
-
-    /// Offset of the published root object.
-    pub fn root(&self) -> Result<Option<u64>, SvmRegionError> {
-        self.require_usable()?;
-        let offset = unsafe { (*self.header_ptr()).root_offset.load(Ordering::Acquire) };
-        Ok((offset != 0).then_some(offset))
-    }
-
-    /// Subregion registry of a subdivided root region.
-    pub fn main(&self) -> Result<&SvmRegionMain, SvmRegionError> {
-        self.require_usable()?;
-        self.require_subdivided()?;
-        let pointer = self.header_ptr();
-        let offset = unsafe { (*pointer).data_base_offset };
-        Ok(unsafe { &*self.payload_address(offset).cast::<SvmRegionMain>() })
-    }
-
-    /// Registers `name`, returning its id and whether this call created it.
-    pub fn find_or_create_subregion(&self, name: &str) -> Result<(u64, bool), SvmRegionError> {
-        let lock = self.lock(RegionLockTag::Subregion)?;
-        self.require_subdivided()?;
-        let pointer = self.header_ptr();
-        let registry = unsafe {
-            &mut *self
-                .payload_address((*pointer).data_base_offset)
-                .cast::<SvmRegionMain>()
-        };
-        let result = registry.find_or_create(
-            unsafe { metadata_heap(pointer) },
-            unsafe { arena_mut(self.arena_range()) },
-            name,
-        );
-        drop(lock);
-        result
-    }
-
-    /// Id registered for `name`.
-    pub fn subregion_id(&self, name: &str) -> Result<Option<u64>, SvmRegionError> {
-        let lock = self.lock(RegionLockTag::Subregion)?;
-        self.require_subdivided()?;
-        let pointer = self.header_ptr();
-        let registry = unsafe {
-            &*self
-                .payload_address((*pointer).data_base_offset)
-                .cast::<SvmRegionMain>()
-        };
-        let result = registry.subregion_id(unsafe { metadata_heap(pointer) }, self.arena(), name);
-        drop(lock);
-        Ok(result)
-    }
-
-    /// Removes `name`, returning the id it held.
-    pub fn remove_subregion(&self, name: &str) -> Result<Option<u64>, SvmRegionError> {
-        let lock = self.lock(RegionLockTag::Subregion)?;
-        self.require_subdivided()?;
-        let pointer = self.header_ptr();
-        let registry = unsafe {
-            &mut *self
-                .payload_address((*pointer).data_base_offset)
-                .cast::<SvmRegionMain>()
-        };
-        let result = registry.remove(
-            unsafe { metadata_heap(pointer) },
-            unsafe { arena_mut(self.arena_range()) },
-            name,
-        );
-        drop(lock);
-        Ok(result)
-    }
-
-    /// Number of registered subregions.
-    pub fn subregion_count(&self) -> Result<u64, SvmRegionError> {
-        let lock = self.lock(RegionLockTag::Subregion)?;
-        self.require_subdivided()?;
-        let count = self.main()?.subregion_count();
-        drop(lock);
-        Ok(count)
-    }
-
-    /// Iterates over the registered subregion names.
-    pub fn subregion_names<'region>(
-        &'region self,
-    ) -> Result<SvmKeys<'region, u64>, SvmRegionError> {
-        let lock = self.lock(RegionLockTag::Subregion)?;
-        let result = (|| {
-            self.require_subdivided()?;
-            let pointer = self.header_ptr();
-            let registry = unsafe {
-                &*self
-                    .payload_address((*pointer).data_base_offset)
-                    .cast::<SvmRegionMain>()
-            };
-            let heap: &'region SvmRegionHeap = unsafe { metadata_heap(pointer) };
-            Ok(registry.subregion_names(heap, self.arena()))
-        })();
-        drop(lock);
-        result
-    }
-
-    /// Joins this process to the region.
-    pub fn join(&self) -> Result<RegionMembership<'_>, SvmRegionError> {
-        let lock = self.lock(RegionLockTag::Membership)?;
-        let pointer = self.header_ptr();
-        let pid = std::process::id() as i32;
-        self.member_push(pointer, pid);
-        drop(lock);
-        Ok(RegionMembership { region: self, pid })
-    }
-
-    /// Number of member pids.
-    pub fn member_count(&self) -> Result<u64, SvmRegionError> {
-        self.require_usable()?;
-        Ok(unsafe { (*self.header_ptr()).client_count.load(Ordering::Acquire) })
-    }
-
-    /// Member pids currently recorded.
-    pub fn client_pids(&self) -> Result<&[i32], SvmRegionError> {
-        let lock = self.lock(RegionLockTag::Scan)?;
-        let members = self.client_pids_locked(self.header_ptr());
-        drop(lock);
-        Ok(members)
-    }
-
-    /// Removes members whose process no longer exists, returning how many were
-    /// removed.
-    ///
-    /// Every pid is probed before the table is changed, so a probe that cannot
-    /// answer (rather than reporting the process as gone) leaves the table
-    /// untouched.
-    pub fn remove_exited_members(&self) -> Result<usize, SvmRegionError> {
-        let lock = self.lock(RegionLockTag::Scan)?;
-        let result = self.remove_exited_members_locked(self.header_ptr());
-        drop(lock);
-        result
-    }
-
-    /// Takes the region mutex.
-    ///
-    /// A robust mutex reports a dead owner instead of blocking forever; the
-    /// region then latches `Failed` and this call returns `OwnerDied`. Later
-    /// calls return `RegionFailed`, because the state the dead owner touched
-    /// cannot be assumed consistent.
-    pub fn lock(&self, tag: RegionLockTag) -> Result<RegionLock<'_>, SvmRegionError> {
-        let header = self.header_ptr();
-        if failure_latched(header) {
-            return Err(SvmRegionError::RegionFailed {
-                mutex_owner_pid: unsafe { (*header).mutex_owner_pid.load(Ordering::Acquire) },
-            });
-        }
-        match unsafe { self.mutex.lock() } {
-            Ok(RobustGuardContainer::Standard(guard)) => {
-                unsafe {
-                    (*header)
-                        .mutex_owner_pid
-                        .store(std::process::id() as i32, Ordering::Release);
-                    (*header)
-                        .mutex_owner_tag
-                        .store(tag as i32, Ordering::Release);
-                }
-                Ok(RegionLock { header, guard })
-            }
-            Ok(RobustGuardContainer::Indeterminate(_)) => {
-                let pid = unsafe { (*header).mutex_owner_pid.load(Ordering::Acquire) };
-                unsafe {
-                    (*header)
-                        .state
-                        .store(SvmRegionState::Failed as u32, Ordering::Release);
-                }
-                Err(SvmRegionError::OwnerDied { pid })
-            }
-            Err(source) => Err(SvmRegionError::Lock { source }),
-        }
-    }
-
-    fn allocate_locked(&self, layout: Layout) -> Result<u64, SvmRegionError> {
-        let pointer = self.header_ptr();
-        let heap = self.allocation_target(pointer);
-        let offset = unsafe {
-            let arena = arena_mut(self.arena_range());
-            (*heap).allocate(arena, layout)
-        };
-        Ok(offset)
-    }
-
-    fn reallocate_locked(
-        &self,
-        offset: u64,
-        layout: Layout,
-        new_size: usize,
-    ) -> Result<u64, SvmRegionError> {
-        let heap = self.heap_for_offset(offset, layout)?;
-        let moved = unsafe {
-            let arena = arena_mut(self.arena_range());
-            (*heap).reallocate(arena, offset, layout, new_size)
-        };
-        Ok(moved)
-    }
-
-    fn deallocate_locked(&self, offset: u64, layout: Layout) -> Result<(), SvmRegionError> {
-        let heap = self.heap_for_offset(offset, layout)?;
-        unsafe {
-            let arena = arena_mut(self.arena_range());
-            (*heap).deallocate(arena, offset, layout);
-        }
-        Ok(())
-    }
-
-    fn remove_exited_members_locked(
-        &self,
-        pointer: *mut SvmRegionHeader,
-    ) -> Result<usize, SvmRegionError> {
-        let members = self.client_pids_locked(pointer);
-        if members.is_empty() {
-            return Ok(0);
-        }
-        let mut exited = Vec::new();
-        for member in members {
-            match probe_member(*member) {
-                MemberProbe::Alive => {}
-                MemberProbe::Exited => exited.push(*member),
-                MemberProbe::Unavailable(source) => {
-                    return Err(SvmRegionError::MemberProbeUnavailable {
-                        pid: *member,
-                        source,
-                    });
-                }
-            }
-        }
-        for pid in &exited {
-            self.member_remove(pointer, *pid);
-        }
-        Ok(exited.len())
-    }
-
-    fn member_push(&self, pointer: *mut SvmRegionHeader, pid: i32) {
-        let mut offset = unsafe { (*pointer).client_pids_offset.load(Ordering::Acquire) };
-        let count = unsafe { (*pointer).client_count.load(Ordering::Acquire) };
-        let capacity = unsafe { (*pointer).client_capacity.load(Ordering::Acquire) };
-        if count == capacity {
-            let grown = (capacity * 2).max(MINIMUM_MEMBER_CAPACITY);
-            let arena = unsafe { arena_mut(self.arena_range()) };
-            let heap = unsafe { metadata_heap(pointer) };
-            let replacement = heap.allocate(arena, pids_layout(grown));
-            if offset != 0 {
-                let length = (count as usize) * size_of::<i32>();
-                arena.copy_within(
-                    offset as usize..offset as usize + length,
-                    replacement as usize,
-                );
-                heap.deallocate(arena, offset, pids_layout(capacity));
-            }
-            unsafe {
-                (*pointer)
-                    .client_pids_offset
-                    .store(replacement, Ordering::Release);
-                (*pointer).client_capacity.store(grown, Ordering::Release);
-            }
-            offset = replacement;
-        }
-        let slot = self.payload_address(offset).cast::<i32>();
-        unsafe {
-            slot.add(count as usize).write(pid);
-            (*pointer).client_count.store(count + 1, Ordering::Release);
-        }
-    }
-
-    fn member_remove(&self, pointer: *mut SvmRegionHeader, pid: i32) -> bool {
-        let count = unsafe { (*pointer).client_count.load(Ordering::Acquire) } as usize;
-        if count == 0 {
-            return false;
-        }
-        let offset = unsafe { (*pointer).client_pids_offset.load(Ordering::Acquire) };
-        let slot = self.payload_address(offset).cast::<i32>();
-        // SAFETY: the member array is a live metadata-heap block of `count` pids
-        // and the region mutex excludes every other process.
-        let members = unsafe { std::slice::from_raw_parts_mut(slot, count) };
-        let Some(index) = members.iter().position(|member| *member == pid) else {
-            return false;
-        };
-        members.copy_within(index + 1.., index);
-        unsafe {
-            (*pointer)
-                .client_count
-                .store((count - 1) as u64, Ordering::Release);
-        }
-        true
-    }
-
-    fn client_pids_locked(&self, pointer: *mut SvmRegionHeader) -> &[i32] {
-        let offset = unsafe { (*pointer).client_pids_offset.load(Ordering::Acquire) };
-        let count = unsafe { (*pointer).client_count.load(Ordering::Acquire) } as usize;
-        if offset == 0 || count == 0 {
-            return &[];
-        }
-        let slot = self.payload_address(offset).cast::<i32>();
-        // SAFETY: the member array is a live metadata-heap block of `count` pids,
-        // published by a release store of `client_count`.
-        unsafe { std::slice::from_raw_parts(slot, count) }
-    }
-
-    fn free_bytes_locked(&self, pointer: *mut SvmRegionHeader) -> u64 {
-        let flags = unsafe { (*pointer).flags.load(Ordering::Acquire) };
-        let metadata = unsafe { (*std::ptr::addr_of!((*pointer).metadata_heap)).free_bytes() };
-        if flags & REGION_FLAG_DATA_HEAP == 0 {
-            return metadata;
-        }
-        metadata + unsafe { (*std::ptr::addr_of!((*pointer).data_heap)).free_bytes() }
-    }
-
-    fn used_bytes_locked(&self, pointer: *mut SvmRegionHeader) -> u64 {
-        let flags = unsafe { (*pointer).flags.load(Ordering::Acquire) };
-        let metadata = unsafe { (*std::ptr::addr_of!((*pointer).metadata_heap)).used_bytes() };
-        if flags & REGION_FLAG_DATA_HEAP == 0 {
-            return metadata;
-        }
-        metadata + unsafe { (*std::ptr::addr_of!((*pointer).data_heap)).used_bytes() }
-    }
-
-    /// Heap that [`Self::allocate`] uses for this region.
-    fn allocation_target(&self, pointer: *mut SvmRegionHeader) -> *mut SvmRegionHeap {
-        self.data_heap(pointer)
-            .unwrap_or(unsafe { std::ptr::addr_of_mut!((*pointer).metadata_heap) })
-    }
-
-    /// Heap of the region's data section, when it has one.
-    fn data_heap(&self, pointer: *mut SvmRegionHeader) -> Option<*mut SvmRegionHeap> {
-        let flags = unsafe { (*pointer).flags.load(Ordering::Acquire) };
-        (flags & REGION_FLAG_DATA_HEAP != 0)
-            .then(|| unsafe { std::ptr::addr_of_mut!((*pointer).data_heap) })
-    }
-
-    /// Heap that owns the payload-relative `offset`.
-    ///
-    /// Overlapping heap ranges are impossible by construction, so an offset
-    /// inside the region belongs to exactly one heap.
-    fn heap_for_offset(
-        &self,
-        offset: u64,
-        layout: Layout,
-    ) -> Result<*mut SvmRegionHeap, SvmRegionError> {
-        let pointer = self.header_ptr();
-        let payload_len = self.payload_len();
-        let alignment = (layout.align() as u64).max(1);
-        if !offset.is_multiple_of(alignment) {
-            return Err(SvmRegionError::Misaligned {
-                offset,
-                alignment: layout.align(),
-            });
-        }
-        let metadata_start = header_end();
-        let data_start = unsafe { (*pointer).data_base_offset };
-        let data_heap = self.data_heap(pointer);
-        let metadata_end = data_heap.map_or(payload_len, |_| data_start);
-        if offset >= metadata_start && offset < metadata_end {
-            return Ok(unsafe { std::ptr::addr_of_mut!((*pointer).metadata_heap) });
-        }
-        if let Some(heap) = data_heap
-            && offset >= data_start
-            && offset < payload_len
-        {
-            return Ok(heap);
-        }
-        Err(SvmRegionError::InvalidBounds {
+    let offset = libc::off_t::try_from(offset).map_err(|_| SvmRegionError::FixedMapping {
+        base,
+        size,
+        source: io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "mapping offset does not fit off_t",
+        ),
+    })?;
+    let mapped = unsafe {
+        libc::mmap(
+            reservation,
+            size,
+            libc::PROT_READ | libc::PROT_WRITE,
+            libc::MAP_SHARED | libc::MAP_FIXED,
+            backing.as_raw_fd(),
             offset,
-            length: layout.size() as u64,
-            size: payload_len,
-        })
-    }
-
-    fn require_usable(&self) -> Result<(), SvmRegionError> {
-        let pointer = self.header_ptr();
-        if failure_latched(pointer) {
-            return Err(SvmRegionError::RegionFailed {
-                mutex_owner_pid: unsafe { (*pointer).mutex_owner_pid.load(Ordering::Acquire) },
-            });
+        )
+    };
+    if mapped == libc::MAP_FAILED {
+        let source = io::Error::last_os_error();
+        if unsafe { libc::munmap(reservation, size) } != 0 {
+            std::process::abort();
         }
-        Ok(())
+        return Err(SvmRegionError::FixedMapping { base, size, source });
     }
-
-    fn require_subdivided(&self) -> Result<(), SvmRegionError> {
-        let flags = unsafe { (*self.header_ptr()).flags.load(Ordering::Acquire) };
-        if flags & REGION_FLAG_SUBDIVIDED == 0 {
-            return Err(SvmRegionError::UnsupportedOperation {
-                operation: RegionOperation::SubregionRegistry,
-            });
-        }
-        Ok(())
-    }
-
-    fn payload_len(&self) -> u64 {
-        self.segment.payload_len()
-    }
-
-    fn header_ptr(&self) -> *mut SvmRegionHeader {
-        unsafe {
-            self.segment
-                .base()
-                .add(self.header_offset as usize)
-                .cast::<SvmRegionHeader>()
-        }
-    }
-
-    fn payload_address(&self, offset: u64) -> *mut u8 {
-        unsafe {
-            self.segment
-                .base()
-                .add((self.header_offset + offset) as usize)
-        }
-    }
-
-    /// Shared view of the whole region payload.
-    ///
-    /// Every stored offset is payload relative, so one view serves every heap,
-    /// the member table, and the name registry.
-    fn arena(&self) -> &[u8] {
-        let length = self.payload_len() as usize;
-        // SAFETY: the payload is the bytes from offset 0 to the end of this
-        // mapping, and the mapping outlives `&self`.
-        unsafe { std::slice::from_raw_parts(self.payload_address(0), length) }
-    }
-
-    /// Raw mutable view of the whole region payload.
-    ///
-    /// The region mutex is the exclusivity witness for this borrow: a caller
-    /// may only turn the range into an [`arena_mut`] borrow while it holds the
-    /// region lock, and must not keep that borrow past its guard.
-    fn arena_range(&self) -> *mut [u8] {
-        std::ptr::slice_from_raw_parts_mut(self.payload_address(0), self.payload_len() as usize)
-    }
+    Ok(NonNull::new(mapped.cast()).expect("successful fixed mmap is non-null"))
 }
 
-/// Mutable view of one region payload arena.
-///
-/// # Safety
-///
-/// The caller must hold the region mutex, which makes this borrow exclusive,
-/// and must not keep the borrow past that guard.
-unsafe fn arena_mut<'arena>(range: *mut [u8]) -> &'arena mut [u8] {
-    // SAFETY: the caller upholds the exclusivity contract above.
-    unsafe { &mut *range }
-}
-
-/// Mutable metadata heap descriptor of `pointer`.
-///
-/// # Safety
-///
-/// The caller must hold the region mutex. The descriptor is a header field, so
-/// it never overlaps an arena this region hands to the metadata heap.
-unsafe fn metadata_heap<'arena>(pointer: *mut SvmRegionHeader) -> &'arena mut SvmRegionHeap {
-    // SAFETY: the caller upholds the contract above; the projection itself only
-    // forms a raw pointer.
-    unsafe { &mut *std::ptr::addr_of_mut!((*pointer).metadata_heap) }
-}
-
-/// Whether a header records a failure and must not be operated on.
-fn failure_latched(header: *mut SvmRegionHeader) -> bool {
-    let stored = unsafe { (*header).state.load(Ordering::Acquire) };
-    stored != SvmRegionState::Uninitialized as u32
-}
-
-/// Lifecycle state derived from the failure latch and the ready flag.
-fn region_state(header: *mut SvmRegionHeader) -> SvmRegionState {
-    if failure_latched(header) {
-        return SvmRegionState::Failed;
-    }
-    let version = unsafe { (*header).version.load(Ordering::Acquire) };
-    if version == SVM_REGION_VERSION {
-        SvmRegionState::Ready
-    } else {
-        SvmRegionState::Uninitialized
-    }
-}
-
-fn validate_region_flags(flags: u64) -> Result<(), SvmRegionError> {
-    if flags & !REGION_FLAGS != 0 {
-        return Err(SvmRegionError::LayoutMismatch {
-            declared: flags,
-            expected: REGION_FLAGS,
-        });
-    }
-    if flags & REGION_FLAG_SUBDIVIDED != 0 && flags & REGION_FLAG_DATA_HEAP != 0 {
-        return Err(SvmRegionError::UnsupportedOperation {
-            operation: RegionOperation::SubdividedDataHeap,
-        });
-    }
-    Ok(())
-}
-
-fn validate_region_name(name: &str) -> Result<(), SvmRegionError> {
-    if name.is_empty() || name.len() > SVM_REGION_NAME_MAX_LENGTH {
-        return Err(SvmRegionError::InvalidRegionName {
-            length: name.len() as u64,
-        });
-    }
-    Ok(())
-}
-
-fn pids_layout(capacity: u64) -> Layout {
-    Layout::from_size_align((capacity as usize) * size_of::<i32>(), align_of::<i32>())
-        .expect("member pid array layout is valid")
-}
-
-enum MemberProbe {
-    Alive,
-    Exited,
-    Unavailable(io::Error),
-}
-
-/// Probes whether `pid` still exists without sending it a signal.
-fn probe_member(pid: i32) -> MemberProbe {
-    // SAFETY: signal 0 runs the existence and permission checks and delivers
-    // nothing.
-    let result = unsafe { libc::kill(pid, 0) };
-    if result == 0 {
-        return MemberProbe::Alive;
+fn process_is_dead(pid: i32) -> Result<bool, SvmRegionError> {
+    if unsafe { libc::kill(pid, 0) } == 0 {
+        return Ok(false);
     }
     let source = io::Error::last_os_error();
     match source.raw_os_error() {
-        Some(libc::ESRCH) => MemberProbe::Exited,
-        // A live process owned by another user refuses signal 0 with EPERM.
-        Some(libc::EPERM) => MemberProbe::Alive,
-        _ => MemberProbe::Unavailable(source),
+        Some(libc::ESRCH) => Ok(true),
+        Some(libc::EPERM) => Ok(false),
+        _ => Err(SvmRegionError::ClientProbe { pid, source }),
     }
 }
