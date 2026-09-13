@@ -33,14 +33,6 @@ impl<T, const ALIGN: usize> Slice<T, ALIGN> {
     }
 
     #[inline]
-    pub fn from_elem(len: usize, value: T) -> Self
-    where
-        T: Clone,
-    {
-        Self::from_fn(len, |_| value.clone())
-    }
-
-    #[inline]
     pub fn from_fn(len: usize, f: impl FnMut(usize) -> T) -> Self {
         Self::from_fn_with_heap(len, f, ptr::null_mut())
     }
@@ -98,21 +90,6 @@ impl<T, const ALIGN: usize> Slice<T, ALIGN> {
             heap,
             marker: PhantomData,
         }
-    }
-
-    #[inline(always)]
-    pub fn len(&self) -> usize {
-        self.len
-    }
-
-    #[inline(always)]
-    pub fn is_empty(&self) -> bool {
-        self.len == 0
-    }
-
-    #[inline(always)]
-    pub fn as_ptr(&self) -> *const T {
-        self.ptr.as_ptr()
     }
 
     #[inline(always)]

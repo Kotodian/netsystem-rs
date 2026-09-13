@@ -1229,6 +1229,206 @@ impl MemMain {
         }
     }
 
+    pub(crate) fn vm_reserve(
+        base: Option<NonZeroUsize>,
+        size: usize,
+        alignment: usize,
+    ) -> Result<NonNull<u8>, MemError> {
+        let system_page_size = MemMain::system_page_size();
+        assert!(alignment.is_power_of_two() && alignment >= system_page_size);
+        assert!(size != 0 && size.is_multiple_of(system_page_size));
+
+        if let Some(base) = base {
+            if !base.get().is_multiple_of(alignment) {
+                return Err(MemError::AddressReservation {
+                    requested_base: Some(base.get()),
+                    size,
+                    alignment,
+                    source: io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        "requested base is misaligned",
+                    ),
+                });
+            }
+            #[cfg(target_os = "linux")]
+            let flags = libc::MAP_PRIVATE | libc::MAP_ANONYMOUS | libc::MAP_FIXED_NOREPLACE;
+            #[cfg(not(target_os = "linux"))]
+            let flags = libc::MAP_PRIVATE | libc::MAP_ANONYMOUS;
+            let mapped = unsafe {
+                libc::mmap(
+                    base.get() as *mut c_void,
+                    size,
+                    libc::PROT_NONE,
+                    flags,
+                    -1,
+                    0,
+                )
+            };
+            if mapped == libc::MAP_FAILED || mapped.addr() != base.get() {
+                if mapped != libc::MAP_FAILED {
+                    unsafe { libc::munmap(mapped, size) };
+                }
+                return Err(MemError::AddressRangeOccupied {
+                    base: base.get(),
+                    size,
+                    source: io::Error::last_os_error(),
+                });
+            }
+            return Ok(unsafe { NonNull::new_unchecked(base.get() as *mut u8) });
+        }
+
+        let total = size
+            .checked_add(alignment - 1)
+            .ok_or(MemError::AddressReservation {
+                requested_base: None,
+                size,
+                alignment,
+                source: io::Error::new(io::ErrorKind::InvalidInput, "reservation size overflow"),
+            })?;
+        let mapped = unsafe {
+            libc::mmap(
+                ptr::null_mut(),
+                total,
+                libc::PROT_NONE,
+                libc::MAP_PRIVATE | libc::MAP_ANONYMOUS,
+                -1,
+                0,
+            )
+        };
+        if mapped == libc::MAP_FAILED {
+            return Err(MemError::AddressReservation {
+                requested_base: None,
+                size,
+                alignment,
+                source: io::Error::last_os_error(),
+            });
+        }
+        let raw = mapped.addr();
+        let aligned = raw
+            .checked_add(alignment - 1)
+            .map(|value| value & !(alignment - 1))
+            .expect("reservation alignment overflow");
+        let prefix = aligned - raw;
+        let suffix = total - prefix - size;
+        if (prefix != 0 && unsafe { libc::munmap(raw as *mut c_void, prefix) } != 0)
+            || (suffix != 0
+                && unsafe { libc::munmap((aligned + size) as *mut c_void, suffix) } != 0)
+        {
+            std::process::abort();
+        }
+        Ok(unsafe { NonNull::new_unchecked(aligned as *mut u8) })
+    }
+
+    pub(crate) fn vm_map_reserved(
+        base: NonNull<u8>,
+        size: usize,
+        page_size: PageSize,
+        backing: Option<BorrowedFd<'_>>,
+        backing_offset: u64,
+    ) -> Result<(), MemError> {
+        let page_bytes = page_size
+            .bytes()
+            .map_err(|_| MemError::PageSizeUnavailable {
+                requested: page_size,
+            })?;
+        if page_bytes == 0 || !page_bytes.is_power_of_two() || !size.is_multiple_of(page_bytes) {
+            return Err(MemError::PageSizeUnavailable {
+                requested: page_size,
+            });
+        }
+
+        let backing_fd = backing.map(|fd| fd.as_raw_fd());
+        let mut flags = match backing_fd {
+            Some(_) => libc::MAP_SHARED,
+            None => libc::MAP_PRIVATE | libc::MAP_ANONYMOUS,
+        };
+        if backing_fd.is_none() && page_bytes != MemMain::system_page_size() {
+            #[cfg(target_os = "linux")]
+            {
+                flags |= libc::MAP_HUGETLB;
+                if page_bytes != MemMain::system_default_hugepage_size().unwrap_or(0) {
+                    flags |= (page_bytes.trailing_zeros() as c_int) << MAP_HUGE_SHIFT;
+                }
+            }
+            #[cfg(not(target_os = "linux"))]
+            {
+                return Err(MemError::PageSizeUnavailable {
+                    requested: page_size,
+                });
+            }
+        }
+        let mapped = unsafe {
+            libc::mmap(
+                base.as_ptr().cast(),
+                size,
+                libc::PROT_READ | libc::PROT_WRITE,
+                flags | libc::MAP_FIXED,
+                backing_fd.unwrap_or(-1),
+                backing_offset as libc::off_t,
+            )
+        };
+        if mapped == libc::MAP_FAILED {
+            return Err(MemError::VirtualMemoryMap {
+                requested_base: Some(base.as_ptr().addr()),
+                size,
+                page_size_log2: page_bytes.trailing_zeros() as u8,
+                backing_fd,
+                backing_offset,
+                source: io::Error::last_os_error(),
+            });
+        }
+        if page_bytes != MemMain::system_page_size()
+            && unsafe { libc::mlock(base.as_ptr().cast(), size) } != 0
+        {
+            let source = io::Error::last_os_error();
+            if MemMain::vm_restore_reserved(base, size).is_err() {
+                std::process::abort();
+            }
+            return Err(MemError::VirtualMemoryLock {
+                base: base.as_ptr().addr(),
+                size,
+                source,
+            });
+        }
+        unsafe { ptr::write_bytes(base.as_ptr(), 0, size) };
+        Ok(())
+    }
+
+    pub(crate) fn vm_restore_reserved(base: NonNull<u8>, size: usize) -> Result<(), MemError> {
+        let mapped = unsafe {
+            libc::mmap(
+                base.as_ptr().cast(),
+                size,
+                libc::PROT_NONE,
+                libc::MAP_PRIVATE | libc::MAP_ANONYMOUS | libc::MAP_FIXED,
+                -1,
+                0,
+            )
+        };
+        if mapped == libc::MAP_FAILED {
+            return Err(MemError::VirtualMemoryMap {
+                requested_base: Some(base.as_ptr().addr()),
+                size,
+                page_size_log2: MemMain::system_page_size().trailing_zeros() as u8,
+                backing_fd: None,
+                backing_offset: 0,
+                source: io::Error::last_os_error(),
+            });
+        }
+        Ok(())
+    }
+
+    pub(crate) unsafe fn vm_unmap_reserved(base: NonNull<u8>, size: usize) -> Result<(), MemError> {
+        if unsafe { libc::munmap(base.as_ptr().cast(), size) } != 0 {
+            return Err(MemError::VirtualMemoryUnmap {
+                base: base.as_ptr().addr(),
+                size,
+                source: io::Error::last_os_error(),
+            });
+        }
+        Ok(())
+    }
+
     pub(crate) fn vm_map(
         base: Option<NonZeroUsize>,
         size: usize,

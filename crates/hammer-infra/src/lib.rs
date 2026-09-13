@@ -1,4 +1,5 @@
 pub mod align;
+pub mod aligned_vec;
 pub mod bihash;
 pub mod bitmap;
 pub mod bytes;
@@ -14,6 +15,7 @@ pub mod mem;
 pub mod mtrie;
 pub mod multi_ring_msg_queue;
 pub mod physmem;
+pub mod pmalloc;
 pub mod pool;
 pub mod prefetch;
 pub mod rbtree;
