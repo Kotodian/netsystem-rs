@@ -5,7 +5,7 @@ use hammer_infra::PageSize;
 
 use crate::error::{RuntimeError, RuntimeResult};
 
-pub const DEFAULT_MAIN_HEAP_SIZE: usize = hammer_infra::main_heap::DEFAULT_MAIN_HEAP_SIZE;
+pub const DEFAULT_MAIN_HEAP_SIZE: usize = hammer_infra::mem::DEFAULT_MAIN_HEAP_SIZE;
 pub const DEFAULT_MAIN_HEAP_PAGE_SIZE: PageSize = PageSize::Default;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
@@ -27,7 +27,9 @@ impl Default for Memory {
 impl Memory {
     pub fn validate(&self) -> RuntimeResult<()> {
         let requested = self.main_heap_size_bytes()?;
-        let minimum = hammer_infra::main_heap::minimum_capacity();
+        let minimum = self.main_heap_page_size.bytes().map_err(|_| {
+            RuntimeError::config_validation("memory.main_heap_page_size is unavailable")
+        })?;
         if requested < minimum {
             return Err(RuntimeError::config_validation(format!(
                 "memory.main_heap_size must be at least {} bytes",

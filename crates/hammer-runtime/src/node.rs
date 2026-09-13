@@ -1959,7 +1959,9 @@ mod tests {
     #[test]
     fn registered_frame_arguments_and_node_state_survive_invocation() {
         crate::BUFFER_MAIN_INIT.call_once(|| {
-            hammer_infra::main_heap::init_default().unwrap();
+            hammer_infra::mem::MainHeapConfig::default()
+                .initialize()
+                .unwrap();
             hammer_core::buffer::BufferMain::new(
                 64,
                 1024,

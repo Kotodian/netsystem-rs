@@ -352,7 +352,9 @@ mod buffer_tests {
     #[test]
     fn ring_ranges_and_chain_release_follow_segment_obligations() {
         crate::BUFFER_MAIN_INIT.call_once(|| {
-            hammer_infra::main_heap::init_default().unwrap();
+            hammer_infra::mem::MainHeapConfig::default()
+                .initialize()
+                .unwrap();
             hammer_core::buffer::BufferMain::new(
                 64,
                 1024,
