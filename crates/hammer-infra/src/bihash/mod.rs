@@ -12,7 +12,6 @@
 //! - Page allocation and reclamation use VPP's `alloc_lock`-shaped atomic
 //!   serialization bit; this is allocator state, not a data-plane object lock.
 
-use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 mod alloc;
@@ -30,8 +29,8 @@ pub use key::{BihashKey, hash_words, splitmix64};
 pub use template::{Bihash8x8, Bihash16x8, Bihash24x8, Bihash48x8};
 pub use value::{FREE_U64, Kv, ValuePage};
 
-use crate::heap::Heap;
 use crate::heap_boxed::Slice;
+use crate::mem::{MemHeap, MemMain};
 use alloc::PageAlloc;
 
 /// A bounded-index extensible hash table.
@@ -54,10 +53,10 @@ impl<K: BihashKey + Default, const KVP: usize> Bihash<K, KVP> {
     /// used to select bucket indices from hash bits.
     #[inline]
     pub fn new(nbuckets: u32) -> Self {
-        Self::with_capacity_in(nbuckets, Arc::new(Heap::local()))
+        Self::with_capacity_in(nbuckets, MemMain::main_heap())
     }
 
-    pub(crate) fn with_capacity_in(mut nbuckets: u32, heap: Arc<Heap>) -> Self {
+    pub(crate) fn with_capacity_in(mut nbuckets: u32, heap: &MemHeap) -> Self {
         if nbuckets == 0 {
             nbuckets = 1;
         }
@@ -66,7 +65,7 @@ impl<K: BihashKey + Default, const KVP: usize> Bihash<K, KVP> {
         let buckets = Slice::from_fn_in(
             actual_buckets as usize,
             |_| AtomicBucket::new(Bucket::empty()),
-            heap.clone(),
+            heap,
         );
         Self {
             buckets,

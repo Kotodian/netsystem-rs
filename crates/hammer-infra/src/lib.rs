@@ -1,9 +1,3 @@
-#![doc = r#"
-```compile_fail
-use hammer_infra::heap::Heap;
-```
-"#]
-
 pub mod align;
 pub mod bihash;
 pub mod bitmap;
@@ -11,13 +5,12 @@ pub mod bytes;
 pub mod checksum;
 pub mod descriptor;
 pub mod fifo_queue;
-pub(crate) mod heap;
 pub mod heap_boxed;
 pub mod hint;
 pub mod linked_list;
-pub mod main_heap;
 pub mod map;
 pub mod mask_compare;
+pub mod mem;
 pub mod mtrie;
 pub mod multi_ring_msg_queue;
 pub mod physmem;
@@ -34,4 +27,4 @@ pub mod sync;
 pub mod timer_wheel;
 
 pub use align::page_size;
-pub use main_heap::PageSize;
+pub use mem::{ActiveHeap, MainHeapConfig, MemError, MemHeap, MemThreadMain, PageSize};
