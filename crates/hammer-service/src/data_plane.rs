@@ -172,7 +172,9 @@ mod tests {
 
     #[test]
     fn terminal_nodes_release_buffer_chains() {
-        hammer_infra::main_heap::init_default().unwrap();
+        hammer_infra::mem::MainHeapConfig::default()
+            .initialize()
+            .unwrap();
         crate::BUFFER_MAIN_INIT.call_once(|| {
             hammer_core::buffer::BufferMain::new(
                 64,
