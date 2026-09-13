@@ -388,7 +388,9 @@ mod tests {
     fn route_sources_retain_forwarding_until_withdrawal() -> Result<(), DpoError> {
         hammer_runtime::config::Memory::default().ensure_main_heap()?;
         crate::BUFFER_MAIN_INIT.call_once(|| {
-            hammer_infra::main_heap::init_default().unwrap();
+            hammer_infra::mem::MainHeapConfig::default()
+                .initialize()
+                .unwrap();
             hammer_core::buffer::BufferMain::new(
                 64,
                 1024,

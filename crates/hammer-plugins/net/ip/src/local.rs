@@ -1146,7 +1146,9 @@ pub(crate) mod tests {
     fn icmp_checksum_spans_odd_buffer_boundary() -> RuntimeResult<()> {
         hammer_runtime::config::Memory::default().ensure_main_heap()?;
         crate::BUFFER_MAIN_INIT.call_once(|| {
-            hammer_infra::main_heap::init_default().unwrap();
+            hammer_infra::mem::MainHeapConfig::default()
+                .initialize()
+                .unwrap();
             hammer_core::buffer::BufferMain::new(
                 64,
                 1024,

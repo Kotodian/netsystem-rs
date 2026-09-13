@@ -1334,7 +1334,9 @@ mod tests {
     #[test]
     fn reassembly_transfers_complete_chains_and_expires_incomplete_chains() {
         crate::BUFFER_MAIN_INIT.call_once(|| {
-            hammer_infra::main_heap::init_default().unwrap();
+            hammer_infra::mem::MainHeapConfig::default()
+                .initialize()
+                .unwrap();
             hammer_core::buffer::BufferMain::new(
                 64,
                 1024,
