@@ -328,7 +328,6 @@ mod opaque_tests {
     // transport producer's packet metadata to select the IP lookup arc.
     #[test]
     fn segment_metadata_reaches_ip_output() -> RuntimeResult<()> {
-        hammer_infra::main_heap::init_default().unwrap();
         hammer_core::buffer::BufferMain::new(2048, 16, &[0], 1, hammer_infra::PageSize::Default)?;
         let mut runtime = DataPlaneMain::new(hammer_runtime::DataPlaneBufferConfig {
             buffer_slot_capacity: 2048,

@@ -138,6 +138,9 @@ impl WorkerThread {
             .name(format!("hammer-{name}-{instance_index}"))
             .stack_size(stack_size)
             .spawn(move || -> RuntimeResult<()> {
+                // Runtime worker threads live for the process lifetime and use
+                // the process Main Heap for ordinary allocations.
+                unsafe { hammer_infra::MemThreadMain::register_current(thread_index) };
                 apply_current_thread_setup(
                     thread_index,
                     cpu_index,

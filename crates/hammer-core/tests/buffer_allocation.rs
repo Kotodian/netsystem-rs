@@ -18,7 +18,6 @@ struct PacketSecondaryMetadata {
 // icmp6.c. This verifies storage semantics, not ICMP graph forwarding.
 #[test]
 fn independent_segment_survives_original_chain_release() -> DataPlaneResult<()> {
-    hammer_infra::main_heap::init_default().unwrap();
     BufferMain::new(16, 3, &[0], 1, hammer_infra::PageSize::Default)?;
     let buffers = BufferMain::global();
     // SAFETY: this test is the only executor for runtime thread index 1.

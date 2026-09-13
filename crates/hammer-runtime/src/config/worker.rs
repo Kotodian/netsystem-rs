@@ -21,6 +21,7 @@
 use std::sync::OnceLock;
 use std::time::Duration;
 
+use hammer_component_macros::config_function;
 use hammer_infra::PageSize;
 use serde::de::DeserializeOwned;
 
@@ -485,4 +486,9 @@ impl WorkerNuma {
     pub(crate) fn validate(&self) -> RuntimeResult<()> {
         Ok(())
     }
+}
+
+#[config_function(name = "runtime_worker_config", section = "worker", early = true)]
+fn configure_worker(section: toml::Table) -> RuntimeResult<()> {
+    install(section)
 }

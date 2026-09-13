@@ -716,33 +716,105 @@ fn next_for_echo_request_index(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use hammer_runtime::{GlobalMain, PluginMain, ThreadMain};
+    use std::sync::Arc;
+
+    use hammer_core::data_plane::NodeRegistration;
+    use hammer_runtime::{DataPlaneBufferConfig, InternalNode, ThreadMain};
+
+    struct IcmpNextNode {
+        name: &'static str,
+    }
+
+    impl Node for IcmpNextNode {
+        fn process(_: &mut DataPlaneMain, _: &mut NodeRuntime, frame: &mut Frame) -> usize {
+            frame.len()
+        }
+    }
+
+    impl InternalNode for IcmpNextNode {
+        fn node_registration(&self) -> Option<NodeRegistration> {
+            Some(NodeRegistration::next(self.name, 0))
+        }
+    }
 
     #[test]
     fn input_dispatch_preserves_protocol_specific_validation() -> RuntimeResult<()> {
-        hammer_runtime::config::Memory::default().ensure_main_heap()?;
-        let document = format!(
-            "[stats]\nsocket_path = '/tmp/hammer-icmp-input-{}.sock'\n",
-            std::process::id()
-        );
-        let mut global = GlobalMain::new(
-            "hammer-icmp-input".to_owned(),
-            String::new(),
-            Vec::new(),
-            document.clone(),
-        );
-        let mut plugins = PluginMain::default();
-        plugins.register_image(hammer_service::registration_image());
-        plugins.register_image(hammer_plugin_ip::plugin_module().registration_image().get());
-        plugins.register_image(crate::plugin_module().registration_image().get());
-        plugins.register_global_declarations(&mut global);
-        hammer_runtime::init::run_config_functions(&global, None, true, &document)?;
-        let mut threads = ThreadMain::new()?;
-        threads.configure()?;
-        let mut runtime = DataPlaneMain::new_main(&threads)?;
-        hammer_runtime::main_loop::run(global, threads, plugins, &mut runtime, async {
-            Ok::<(), hammer_runtime::RuntimeError>(())
-        })?;
+        hammer_core::buffer::BufferMain::new(64, 1024, &[0], 2, hammer_infra::PageSize::Default)
+            .unwrap();
+        ThreadMain::new()?;
+        let mut runtime = DataPlaneMain::new(DataPlaneBufferConfig::default());
+        for name in [
+            "drop",
+            "ip4-drop",
+            "ip4-punt",
+            "ip4-lookup",
+            "ip6-drop",
+            "ip6-punt",
+            "ip6-lookup",
+        ] {
+            runtime
+                .nodes()
+                .try_register_internal(IcmpNextNode { name })?;
+        }
+
+        hammer_service::net::NetMain::init(Arc::new(
+            hammer_service::interface::InterfaceMain::new(),
+        ))?;
+        crate::IcmpMain::init()?;
+        let main = crate::IcmpMain::global()?;
+        let ip4_input = runtime.nodes().try_register_internal_with_next_names(
+            Icmp4InputNode::new(),
+            &Icmp4InputNext::NEXT_NAMES,
+        )?;
+        runtime
+            .nodes()
+            .materialize_node_errors(ip4_input, &IcmpInputError::DESCRIPTORS)?;
+        main.ip4_input_node
+            .set(ip4_input)
+            .expect("ICMP4 input node installs once");
+
+        let ip6_input = runtime.nodes().try_register_internal_with_next_names(
+            Icmp6InputNode::new(),
+            &Icmp6InputNext::NEXT_NAMES,
+        )?;
+        runtime
+            .nodes()
+            .materialize_node_errors(ip6_input, &IcmpInputError::DESCRIPTORS)?;
+        unsafe {
+            let ip6 = &mut *main.ip6.get();
+            for entry in &mut ip6.entries {
+                entry.spec.max_code = 0;
+            }
+            for (icmp_type, max_code) in [(1, 6), (3, 1), (4, 3), (138, 1), (139, 2), (140, 2)] {
+                ip6.entries[icmp_type].spec.max_code = max_code;
+            }
+            for (icmp_type, min_len) in [(133, 8), (134, 16), (135, 24), (136, 24), (137, 40)] {
+                ip6.entries[icmp_type].spec.min_hop_limit = 255;
+                ip6.entries[icmp_type].spec.min_len = min_len;
+            }
+        }
+        main.ip6_input_node
+            .set(ip6_input)
+            .expect("ICMP6 input node installs once");
+
+        let ip4_echo = runtime.nodes().try_register_internal_with_next_names(
+            Icmp4EchoRequestNode::new(),
+            &Icmp4EchoRequestNext::NEXT_NAMES,
+        )?;
+        runtime
+            .nodes()
+            .materialize_node_errors(ip4_echo, &IcmpNodeError::DESCRIPTORS)?;
+        main.register_type(runtime.nodes(), IpVersion::V4, ICMP4_ECHO_REQUEST, ip4_echo)?;
+
+        let ip6_echo = runtime.nodes().try_register_internal_with_next_names(
+            Icmp6EchoRequestNode::new(),
+            &Icmp6EchoRequestNext::NEXT_NAMES,
+        )?;
+        runtime
+            .nodes()
+            .materialize_node_errors(ip6_echo, &IcmpNodeError::DESCRIPTORS)?;
+        main.register_type(runtime.nodes(), IpVersion::V6, ICMP6_ECHO_REQUEST, ip6_echo)?;
+        runtime.nodes().resolve_named_next_nodes()?;
 
         // icmp6.c::icmp6_input applies code, hop-limit, then minimum-length
         // validation. Every classified error uses punt, including registered

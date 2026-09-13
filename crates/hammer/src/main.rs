@@ -5,7 +5,6 @@ use std::sync::Arc;
 use std::sync::OnceLock;
 
 use hammer_runtime::attach::AppServer;
-use hammer_runtime::config::Memory;
 use hammer_runtime::global_main::GlobalMain;
 use hammer_runtime::log::Level;
 use hammer_runtime::{
@@ -24,7 +23,7 @@ static STARTUP_CONFIG_PATH: OnceLock<PathBuf> = OnceLock::new();
 #[derive(Debug, Default, serde::Deserialize)]
 #[serde(default)]
 struct DaemonEarlyConfig {
-    memory: Memory,
+    memory: hammer_infra::mem::MainHeapConfig,
     log: DaemonLogConfig,
 }
 
@@ -35,7 +34,7 @@ struct DaemonLogConfig {
 }
 
 impl DaemonEarlyConfig {
-    fn validate(&self) -> RuntimeResult<()> {
+    fn validate(&self) -> Result<(), hammer_infra::mem::MemError> {
         self.memory.validate()
     }
 }
@@ -49,11 +48,11 @@ struct DaemonStartupConfig {
 
 fn main() {
     let config_path = config_path_from_args();
-    let bootstrap_document = read_config(&config_path).unwrap_or_else(|error| {
+    let config_document = read_config(&config_path).unwrap_or_else(|error| {
         eprintln!("Failed to read config {}: {error}", config_path.display());
         std::process::exit(1);
     });
-    let early: DaemonEarlyConfig = toml::from_str(&bootstrap_document).unwrap_or_else(|error| {
+    let early: DaemonEarlyConfig = toml::from_str(&config_document).unwrap_or_else(|error| {
         eprintln!(
             "Failed to deserialize early config {}: {error}",
             config_path.display()
@@ -66,11 +65,13 @@ fn main() {
     });
     let DaemonEarlyConfig { memory, log } = early;
     let log_level = log.level;
-    drop(bootstrap_document);
-    memory.ensure_main_heap().unwrap_or_else(|error| {
+    drop(config_document);
+    drop(config_path);
+    memory.initialize().unwrap_or_else(|error| {
         eprintln!("Failed to initialize main heap: {error}");
         std::process::exit(1);
     });
+    let config_path = config_path_from_args();
     install_tracing(log_level).unwrap_or_else(|error| {
         eprintln!("Failed to initialize logging: {error}");
         std::process::exit(1);
@@ -154,8 +155,8 @@ fn run(
     plugins.load(env!("CARGO_PKG_VERSION"), &roots)?;
     plugins.register_global_declarations(&mut global);
 
-    hammer_runtime::init::run_config_functions(&global, None, true, &config)?;
     let mut threads = ThreadMain::new()?;
+    hammer_runtime::init::run_config_functions(&global, None, true, &config)?;
     threads.configure()?;
     let mut main = DataPlaneMain::new_main(&threads)?;
     let run_result = hammer_runtime::main_loop::run(

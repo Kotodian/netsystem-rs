@@ -628,33 +628,38 @@ do not yet satisfy this model.
 
 **MemMain**:
 The process-global memory authority corresponding to VPP's
-`clib_mem_main_t`. It owns the process Main Heap, the heap inventory, the
-registered memory-thread inventory, and the existing fixed-capacity process
-arena state.
+`clib_mem_main_t`. It owns the process Main Heap, the `heaps` list, the
+registered memory-thread `threads` list, and the fixed-capacity process
+allocation state. Recoverable memory operations return owned typed errors directly;
+MemMain does not retain VPP's mutable last-error pointer side channel.
 _Avoid_: AllocatorMain, GlobalMain, Buffer Main, SvmRegion
 
 **MemThreadMain**:
 The allocator-owned state of one OS thread, corresponding to VPP's
 `clib_mem_thread_main_t`. It owns that thread's active `MemHeap` selection and
-runtime thread index. It is allocator TLS because Rust `GlobalAlloc` and C
-malloc-family entry points receive no runtime owner argument; it is not a
-`DataPlaneMain` field or a generic per-thread container.
+runtime thread index. It is allocator TLS because Rust `GlobalAlloc` receives
+no runtime owner argument; it is not a
+`DataPlaneMain` field or a generic per-thread container. Only runtime OS
+threads guaranteed to live until process exit link their TLS address into
+`MemMain.threads`. A short-lived or external thread uses an unregistered TLS entry
+whose active heap defaults to the Main Heap. The allocator selector is private
+and does not expose a safe `'static` reference.
 _Avoid_: AllocatorThreadMain, ThreadMain, DataPlaneMain field, worker-local heap
 
 **MemHeap**:
 One concrete allocation authority that can become the current thread's active
-heap. Process heaps use the fixed-capacity mimalloc backend; SVM pvt/data heaps
-use a locked shared mspace whose state and `MemHeap` control block live in the
+heap. Main, process-private, and SVM PVT/Data Heaps all use fixed-capacity
+dlmalloc mspaces. An mspace and its `MemHeap` control block live in the
 fixed-address region mapping. The backend is private and is not a trait,
 vtable, or public selection enum.
 _Avoid_: Heap, SvmRegionHeap, OffsetHeap, allocator trait
 
 **Active Heap**:
-The `MemHeap` selected by the current `MemThreadMain`. Ordinary Rust allocation
-and the interposed C malloc family allocate, reallocate, and free through this
-selection. A nested activation owns restoration of the previous heap and may
-not cross threads or `.await`.
-_Avoid_: default allocator hint, process-global selected heap, pointer-owner scan
+The `MemHeap` selected by the current `MemThreadMain`. When
+`alloc_free_intercept` is enabled, ordinary Rust allocation, reallocation, and
+free use this selection. A nested activation owns restoration of the previous
+heap and may not cross threads or `.await`.
+_Avoid_: default allocator hint, process-global selected heap, free时根据pointer改选heap
 
 **PVT Heap**:
 The locked `MemHeap` present in every SVM region at the second mapped page. It
@@ -686,7 +691,7 @@ migration has been implemented.
 **SsvmPrivate**:
 The process-local owner corresponding to `ssvm_private_t`. It owns one
 SHM/MEMFD/PRIVATE backing, mapping, shared header, ready lifecycle, and generic
-shared `MemHeap`. A generic server publishes its actual non-zero mapping
+`MemHeap`. A generic server publishes its actual non-zero mapping
 address and an attacher probes page zero before mapping the full segment at
 that same address. It is separate from VPP `svm_region`: a `SvmRegion` is not
 nested in this owner's payload. An offset-only payload such as
@@ -698,11 +703,14 @@ _Avoid_: SvmSegment, Segment, SvmRegion payload, default arbitrary-VA mapping
 **SvmRegion**:
 A fixed-VA shared region corresponding to VPP `svm_region_t`. It owns its
 region mapping lifecycle, page-zero header, mandatory PVT Heap, optional Data
-Heap, client membership, and published root. An attacher probes the header and
-then maps the complete region at the creator's published address so shared heap
+Heap, client PID registrations, and published root. An attacher probes the header and
+then maps the complete region at the creator's published address so heap
 and collection pointers remain valid. It is not an `SsvmPrivate` payload and
-does not support a different-address offset compatibility mode.
-_Avoid_: SsvmPrivate payload, FIFO segment, offset region, arbitrary-VA attach
+does not support a different-address offset compatibility mode. Create and
+attach register the current PID; explicit unmap removes it inside the active
+PVT Heap scope.
+_Avoid_: SsvmPrivate payload, FIFO segment, offset region, arbitrary-VA attach,
+separate client-registration handle
 
 **SvmMainRegion**:
 The named-root state allocated from a subdivided root region's PVT Heap. It
@@ -721,19 +729,22 @@ the daemon, but descriptor transport does not change the root-owned VA
 assignment.
 _Avoid_: arbitrary-VA region, monotonic region id, independent address space
 
-**Region Membership**:
-One process's registration in a region's client list, written in that region's
-active PVT Heap and reclaimed by pid liveness probing. Registration is an RAII
-handle; recovery records no process start time and never reuses a registration
-for a different process.
-_Avoid_: client vec, connection handle, worker registration
+**Region Client Registration**:
+One process's PID entry in a region's client list. `SvmRegion::create` and
+`attach` add it, explicit `unmap` removes it, and stale entries are reclaimed
+by PID liveness probing. Each mutation occurs under the region lock with the
+PVT Heap active.
+_Avoid_: connection handle, worker registration
 
 **Region Owner Death**:
-Failure of a process while it owns the SVM region mutex. Recovery belongs to
-the `SvmRegion` lifecycle and must preserve the PVT/Data Heap and ordinary
-collection invariants before another participant accesses them. Generic SSVM
-locks, FIFO slice locks, and WorkerBarrier do not prove region consistency.
-_Avoid_: generic SSVM recovery, FIFO recovery, Worker Barrier, unverified force unlock
+Failure of a process while it owns the SVM region mutex. `version` remains the
+only ready authority, and the existing mutex-owner PID/tag identify the failed
+acquisition. Hammer returns a typed owner-death error and stops accessing that
+region because recovering the region mutex cannot prove the non-robust PVT/Data
+mspace or ordinary collection invariants. Generic SSVM locks, FIFO slice locks,
+and WorkerBarrier do not prove region consistency.
+_Avoid_: generic SSVM recovery, FIFO recovery, Worker Barrier, unverified force
+unlock
 
 **SvmFifoSegment**:
 An offset-only `SsvmPrivate` payload that owns FIFO segment creation, attach,

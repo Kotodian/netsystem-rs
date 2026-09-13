@@ -7,19 +7,22 @@
 //! ```
 //!
 
+use std::alloc::{Layout, alloc_zeroed, dealloc};
 use std::ffi::OsStr;
 use std::hint::black_box;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::ptr::NonNull;
 use std::sync::Arc;
 
 use hammer_core::data_plane::NodeId;
-use hammer_runtime::config::Memory;
 use hammer_runtime::global_main::GlobalMain;
 use hammer_runtime::{DataPlaneMain, PluginError, PluginMain, RuntimeError, ThreadMain};
 
 // Shared device/interface/transport/session registrations remain host-owned.
 use hammer_service as _;
+
+use hammer_infra::mem::MainHeapConfig;
 
 const EXAMPLE_CONFIG: &str = r#"
 plugins = ["ip", "tcp", "udp"]
@@ -42,7 +45,7 @@ const PLUGIN_NAMES: [&str; 3] = ["ip", "tcp", "udp"];
 #[derive(Debug, Default, serde::Deserialize)]
 #[serde(default)]
 struct ExampleEarlyConfig {
-    memory: Memory,
+    memory: MainHeapConfig,
 }
 
 #[derive(Debug, Default, serde::Deserialize)]
@@ -55,6 +58,8 @@ struct ExampleStartupConfig {
 enum ExampleError {
     #[error(transparent)]
     Hammer(#[from] RuntimeError),
+    #[error(transparent)]
+    MainHeap(#[from] hammer_infra::mem::MemError),
     #[error("required image does not exist: {path}")]
     ImageMissing { path: PathBuf },
     #[error("failed to run `{tool}` for {path}")]
@@ -73,10 +78,6 @@ enum ExampleError {
     },
     #[error("image does not dynamically depend on the shared hammer-infra authority: {path}")]
     SharedInfraDependencyMissing { path: PathBuf },
-    #[error("image embeds an independent mimalloc authority: {path}")]
-    IndependentAllocatorEmbedded { path: PathBuf },
-    #[error("the shared hammer-infra image does not contain the mimalloc authority: {path}")]
-    SharedAllocatorMissing { path: PathBuf },
     #[cfg(not(any(target_os = "macos", target_os = "linux")))]
     #[error("image inspection is unsupported on this platform")]
     ImageInspectionUnsupported,
@@ -112,11 +113,11 @@ enum ExampleError {
 fn main() -> Result<(), ExampleError> {
     let early: ExampleEarlyConfig = toml::from_str(EXAMPLE_CONFIG)
         .map_err(|error| RuntimeError::config_parse(format!("parse example TOML: {error}")))?;
-    let main_heap_capacity = early.memory.ensure_main_heap()?;
+    let main_heap_capacity = early.memory.initialize()?;
     let roots = toml::from_str::<ExampleStartupConfig>(EXAMPLE_CONFIG)
         .map_err(|error| RuntimeError::config_parse(format!("parse example TOML: {error}")))?
         .plugins;
-    exercise_post_ready_allocations(&roots)?;
+    exercise_main_heap_allocations(&roots)?;
 
     let mut global = GlobalMain::new(
         "plugin-additive-load".to_owned(),
@@ -132,8 +133,8 @@ fn main() -> Result<(), ExampleError> {
         .map_err(RuntimeError::from)?;
     verify_plugin_transactions(&mut plugins, &roots)?;
     plugins.register_global_declarations(&mut global);
-    hammer_runtime::init::run_config_functions(&global, None, true, EXAMPLE_CONFIG)?;
     let mut threads = ThreadMain::new()?;
+    hammer_runtime::init::run_config_functions(&global, None, true, EXAMPLE_CONFIG)?;
     threads.configure()?;
     let mut main = DataPlaneMain::new_main(&threads)?;
     hammer_runtime::main_loop::run(global, threads, plugins, &mut main, async {
@@ -203,14 +204,33 @@ fn verify_plugin_transactions(
     Ok(())
 }
 
-fn exercise_post_ready_allocations(roots: &[String]) -> Result<(), ExampleError> {
+fn exercise_main_heap_allocations(roots: &[String]) -> Result<(), ExampleError> {
+    let main_heap = hammer_infra::mem::MemMain::main_heap();
     let string = String::from("Hammer fixed-capacity process-global main heap");
+    assert!(main_heap.is_heap_object(NonNull::from(string.as_bytes()).cast()));
 
-    let values = vec![0x5au64; 64];
+    let mut values = Vec::with_capacity(1);
+    values.extend(0..64u64);
+    assert!(main_heap.is_heap_object(NonNull::from(values.as_slice()).cast()));
 
     let boxed = Box::new([0xa5u8; 128]);
+    assert!(main_heap.is_heap_object(NonNull::from(boxed.as_ref()).cast()));
 
     let shared = Arc::new([0x3cu8; 128]);
+    assert!(main_heap.is_heap_object(NonNull::from(shared.as_ref()).cast()));
+
+    let zeroed_layout = Layout::from_size_align(256, 64).expect("zeroed layout is valid");
+    let zeroed = unsafe { alloc_zeroed(zeroed_layout) };
+    let zeroed =
+        NonNull::new(zeroed).unwrap_or_else(|| std::alloc::handle_alloc_error(zeroed_layout));
+    assert_eq!(zeroed.as_ptr().addr() % zeroed_layout.align(), 0);
+    assert!(main_heap.is_heap_object(zeroed));
+    assert!(
+        unsafe { std::slice::from_raw_parts(zeroed.as_ptr(), zeroed_layout.size()) }
+            .iter()
+            .all(|byte| *byte == 0)
+    );
+    unsafe { dealloc(zeroed.as_ptr(), zeroed_layout) };
 
     let current_exe =
         std::env::current_exe().map_err(|source| ExampleError::ImageInspectionIo {
@@ -245,11 +265,6 @@ fn verify_shared_allocator_images(plugin_path: &Path) -> Result<(), ExampleError
     let infra_path = plugin_path.join(&infra_name);
     require_image(&infra_path)?;
 
-    let infra_symbols = image_symbols(&infra_path)?;
-    if !infra_symbols.contains("mi_reserve_os_memory_ex") {
-        return Err(ExampleError::SharedAllocatorMissing { path: infra_path });
-    }
-
     let mut consumers =
         vec![
             std::env::current_exe().map_err(|source| ExampleError::ImageInspectionIo {
@@ -275,9 +290,6 @@ fn verify_shared_allocator_images(plugin_path: &Path) -> Result<(), ExampleError
         require_image(&path)?;
         if !dynamic_dependencies(&path)?.contains(&infra_name) {
             return Err(ExampleError::SharedInfraDependencyMissing { path });
-        }
-        if image_symbols(&path)?.contains("mi_reserve_os_memory_ex") {
-            return Err(ExampleError::IndependentAllocatorEmbedded { path });
         }
     }
     Ok(())
@@ -306,10 +318,6 @@ fn dynamic_dependencies(path: &Path) -> Result<String, ExampleError> {
 #[cfg(not(any(target_os = "macos", target_os = "linux")))]
 fn dynamic_dependencies(_: &Path) -> Result<String, ExampleError> {
     Err(ExampleError::ImageInspectionUnsupported)
-}
-
-fn image_symbols(path: &Path) -> Result<String, ExampleError> {
-    run_image_tool("nm", &[OsStr::new("-a")], path)
 }
 
 fn run_image_tool(

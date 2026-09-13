@@ -18,7 +18,7 @@ crate::__declare_registration_image!(
     ];
     config_functions = [
         trace::__CONFIG_FN_RUNTIME_TRACE_CONFIG,
-        memory::__CONFIG_FN_RUNTIME_WORKER_CONFIG,
+        config::worker::__CONFIG_FN_RUNTIME_WORKER_CONFIG,
         config::stats::__CONFIG_FN_RUNTIME_STATS_CONFIG,
     ];
     main_loop_enter_functions = [start_workers::__INIT_FN_START_WORKERS];
@@ -53,7 +53,6 @@ pub mod binary_api;
 pub mod init;
 pub mod log;
 pub mod main_loop;
-pub mod memory;
 pub mod plugin;
 pub mod plugin_loader;
 mod process;

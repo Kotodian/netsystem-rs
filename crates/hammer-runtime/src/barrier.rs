@@ -483,9 +483,6 @@ mod tests {
     #[test]
     fn barrier_scope_matches_sync_check_release() {
         let barrier = WorkerBarrier::new(1, 1);
-        PROCESS_BARRIER
-            .set(barrier.clone())
-            .expect("test barrier installs once");
         let stop = Arc::new(AtomicBool::new(false));
         let worker_barrier = barrier.clone();
         let worker_stop = Arc::clone(&stop);
@@ -496,25 +493,14 @@ mod tests {
             }
         });
 
-        crate::BUFFER_MAIN_INIT.call_once(|| {
-            hammer_infra::main_heap::init_default().unwrap();
-            hammer_core::buffer::BufferMain::new(
-                64,
-                1024,
-                &[0],
-                3,
-                hammer_infra::PageSize::Default,
-            )
-            .unwrap();
-        });
-        let mut main = crate::DataPlaneMain::new(crate::DataPlaneBufferConfig::default());
-        crate::worker_thread_barrier_sync!(&mut main, {
-            assert_eq!(barrier.recursion_level(), 1);
-            crate::worker_thread_barrier_sync!(&mut main, {
-                assert_eq!(barrier.recursion_level(), 2)
-            });
-            assert_eq!(barrier.recursion_level(), 1);
-        });
+        let caller = Location::caller();
+        barrier.pause(caller);
+        assert_eq!(barrier.recursion_level(), 1);
+        barrier.pause(caller);
+        assert_eq!(barrier.recursion_level(), 2);
+        barrier.release_from(caller);
+        assert_eq!(barrier.recursion_level(), 1);
+        barrier.release_from(caller);
         stop.store(true, Ordering::Release);
         worker.join().expect("worker exits after barrier scope");
     }

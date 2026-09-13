@@ -83,10 +83,10 @@ petgraph = "0.6"
 prost = "0.14.4"
 clap = "4"
 bincode = "1"
-libmimalloc-sys = { version = "0.1.49", features = ["arena", "extended"] }
 talc = { version = "5.0.4", default-features = false }
 spinning_top = "0.3"
 io-uring = "0.7.13"
+cc = "1"
 semver = "1"
 libloading = "0.8"
 object = "0.38"

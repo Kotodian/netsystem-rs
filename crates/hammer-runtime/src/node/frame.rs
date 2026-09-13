@@ -246,7 +246,6 @@ mod tests {
     use super::*;
 
     fn packet_graph() -> (NodeMain, NodeId, NodeId) {
-        hammer_infra::main_heap::init_default().unwrap();
         let graph = NodeMain::default();
         let output = graph
             .try_register_descriptor(
@@ -378,7 +377,6 @@ mod tests {
     #[test]
     fn refork_preserves_pending_frame_storage() {
         crate::BUFFER_MAIN_INIT.call_once(|| {
-            hammer_infra::main_heap::init_default().unwrap();
             hammer_core::buffer::BufferMain::new(
                 64,
                 1024,
@@ -412,7 +410,6 @@ mod tests {
     #[test]
     fn refork_does_not_release_packet_buffers() {
         crate::BUFFER_MAIN_INIT.call_once(|| {
-            hammer_infra::main_heap::init_default().unwrap();
             hammer_core::buffer::BufferMain::new(
                 64,
                 1024,
@@ -482,7 +479,6 @@ mod tests {
     #[test]
     fn next_frames_append_swap_owners_and_dispatch_overflow() {
         crate::BUFFER_MAIN_INIT.call_once(|| {
-            hammer_infra::main_heap::init_default().unwrap();
             hammer_core::buffer::BufferMain::new(
                 64,
                 1024,

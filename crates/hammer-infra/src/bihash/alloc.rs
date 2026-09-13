@@ -5,16 +5,15 @@
 //! through the bucket word, and retires old offsets only after no lookup
 //! hazard protects them.
 
-use std::alloc::{GlobalAlloc, Layout, handle_alloc_error};
+use std::alloc::{Layout, handle_alloc_error};
 use std::cell::UnsafeCell;
-use std::ptr::NonNull;
-use std::sync::Arc;
+use std::ptr::{self, NonNull};
 use std::sync::atomic::{AtomicBool, AtomicPtr, AtomicU64, Ordering};
 
 use crate::align::{CACHE_LINE, CacheLineAlignMark};
 use crate::bihash::value::ValuePage;
-use crate::heap::Heap;
 use crate::heap_boxed::{Slice, allocate_in, deallocate_in};
+use crate::mem::{MemHeap, MemMain};
 
 const MAX_LOG2_PAGES: usize = 8;
 const NO_OFFSET: u64 = 0;
@@ -31,23 +30,23 @@ struct RetiredOffset {
 }
 
 struct PageAllocState<K, const KVP: usize> {
+    heap_pointer: *mut MemHeap,
     blocks: Vec<PageBlock<K, KVP>>,
     directories: Vec<Slice<usize>>,
     hazards: Vec<NonNull<HazardSlot>>,
     freelists: [Vec<u64>; MAX_LOG2_PAGES + 1],
     retired: Vec<RetiredOffset>,
-    heap: Arc<Heap>,
 }
 
 impl<K: Copy + Default, const KVP: usize> PageAllocState<K, KVP> {
-    fn new(heap: Arc<Heap>) -> Self {
+    fn new(heap: *mut MemHeap) -> Self {
         Self {
+            heap_pointer: heap,
             blocks: Vec::new(),
             directories: Vec::new(),
             hazards: Vec::new(),
             freelists: core::array::from_fn(|_| Vec::new()),
             retired: Vec::new(),
-            heap,
         }
     }
 
@@ -68,7 +67,9 @@ impl<K: Copy + Default, const KVP: usize> PageAllocState<K, KVP> {
         }
 
         let page_count = 1usize << log2_pages;
-        let pages = allocate_in::<ValuePage<K, KVP>, CACHE_LINE>(page_count, &self.heap);
+        let pages = allocate_in::<ValuePage<K, KVP>, CACHE_LINE>(page_count, unsafe {
+            &*self.heap_pointer
+        });
         for index in 0..page_count {
             // SAFETY: `pages` names `page_count` uninitialized writable slots.
             unsafe { pages.as_ptr().add(index).write(ValuePage::new()) };
@@ -81,7 +82,7 @@ impl<K: Copy + Default, const KVP: usize> PageAllocState<K, KVP> {
 
     fn grow_directory(&mut self) -> *mut usize {
         let capacity = self.blocks.len().next_power_of_two();
-        let mut directory = Slice::from_elem_in(capacity, 0usize, self.heap.clone());
+        let mut directory = Slice::from_elem_in(capacity, 0usize, unsafe { &*self.heap_pointer });
         for (index, block) in self.blocks.iter().enumerate() {
             directory[index] = block.pages.as_ptr().expose_provenance();
         }
@@ -92,9 +93,8 @@ impl<K: Copy + Default, const KVP: usize> PageAllocState<K, KVP> {
 
     fn allocate_hazard(&mut self) -> NonNull<HazardSlot> {
         let layout = Layout::new::<HazardSlot>();
-        let raw = self
-            .heap
-            .alloc(layout)
+        let raw = unsafe { &*self.heap_pointer }
+            .allocate(layout)
             .unwrap_or_else(|| handle_alloc_error(layout));
         let slot = raw.cast::<HazardSlot>();
         // SAFETY: `slot` points to one suitably aligned writable allocation.
@@ -142,6 +142,7 @@ impl<K: Copy + Default, const KVP: usize> PageAllocState<K, KVP> {
 
 impl<K, const KVP: usize> Drop for PageAllocState<K, KVP> {
     fn drop(&mut self) {
+        let heap = unsafe { &*self.heap_pointer };
         for block in &self.blocks {
             let page_count = 1usize << block.log2_pages;
             // SAFETY: every block was initialized by `allocate` and is still owned here.
@@ -150,7 +151,7 @@ impl<K, const KVP: usize> Drop for PageAllocState<K, KVP> {
                     block.pages.as_ptr(),
                     page_count,
                 ));
-                deallocate_in::<ValuePage<K, KVP>, CACHE_LINE>(block.pages, page_count, &self.heap);
+                deallocate_in::<ValuePage<K, KVP>, CACHE_LINE>(block.pages, page_count, heap);
             }
         }
         for slot in &self.hazards {
@@ -158,7 +159,7 @@ impl<K, const KVP: usize> Drop for PageAllocState<K, KVP> {
             // SAFETY: every slot was allocated with this layout from `self.heap`.
             unsafe {
                 std::ptr::drop_in_place(slot.as_ptr());
-                GlobalAlloc::dealloc(&*self.heap, slot.as_ptr().cast::<u8>(), layout);
+                heap.deallocate(slot.cast::<u8>(), layout);
             }
         }
     }
@@ -178,7 +179,13 @@ unsafe impl<K: Copy + Default + Send, const KVP: usize> Send for PageAlloc<K, KV
 unsafe impl<K: Copy + Default + Send, const KVP: usize> Sync for PageAlloc<K, KVP> {}
 
 impl<K: Copy + Default, const KVP: usize> PageAlloc<K, KVP> {
-    pub(crate) fn new_in(heap: Arc<Heap>) -> Self {
+    pub(crate) fn new_in(heap: &MemHeap) -> Self {
+        let heap = if ptr::eq(heap, MemMain::main_heap()) {
+            MemMain::main_heap() as *const MemHeap
+        } else {
+            heap as *const MemHeap
+        }
+        .cast_mut();
         Self {
             state: UnsafeCell::new(PageAllocState::new(heap)),
             busy: AtomicBool::new(false),

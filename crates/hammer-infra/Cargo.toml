@@ -10,9 +10,9 @@ crate-type = ["dylib", "rlib"]
 
 [dependencies]
 bytes = { workspace = true }
+bitflags = { workspace = true }
 byte-unit = { workspace = true }
 libc = { workspace = true }
-libmimalloc-sys = { workspace = true }
 parse-display = { workspace = true }
 posix-sync = { workspace = true }
 serde = { workspace = true }
@@ -24,3 +24,9 @@ zerocopy = { workspace = true }
 
 [target.'cfg(target_os = "linux")'.dependencies]
 procfs = { workspace = true }
+
+[build-dependencies]
+cc = { workspace = true }
+
+[dev-dependencies]
+toml = { workspace = true }

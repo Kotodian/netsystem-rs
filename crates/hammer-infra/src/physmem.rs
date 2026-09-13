@@ -12,7 +12,7 @@ use std::path::Path;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use crate::main_heap::PageSize;
+use crate::mem::PageSize;
 
 static PHYSMEM_COUNTER: AtomicU64 = AtomicU64::new(1);
 
@@ -226,7 +226,7 @@ impl Drop for MappedRegion {
     fn drop(&mut self) {
         if !self.base.is_null() && self.size != 0 {
             // SAFETY: this object exclusively owns the mapping for its entire
-            // recorded length until ownership is transferred to mimalloc.
+            // recorded length until ownership is transferred to the main heap.
             unsafe { libc::munmap(self.base.cast(), self.size) };
         }
         if self.fd >= 0 {

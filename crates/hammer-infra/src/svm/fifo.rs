@@ -1,5 +1,4 @@
 use std::cell::UnsafeCell;
-use std::io::{self, BufRead, Read, Write};
 use std::os::fd::RawFd;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
@@ -16,6 +15,9 @@ pub const OOO_SEGMENT_INVALID_INDEX: u32 = u32::MAX;
 pub const FS_MIN_LOG2_CHUNK_SIZE: u32 = 12;
 pub const FS_MAX_LOG2_CHUNK_SIZE: u32 = 22;
 pub const FS_CHUNK_VEC_LEN: usize = (FS_MAX_LOG2_CHUNK_SIZE - FS_MIN_LOG2_CHUNK_SIZE + 1) as usize;
+pub const FS_CHUNK_OFFSET_MASK: u64 = 0x0000_ffff_ffff_ffff;
+pub const FS_CHUNK_TAG_MASK: u64 = 0xffff_0000_0000_0000;
+pub const FS_CHUNK_TAG_INCREMENT: u64 = 1_u64 << 48;
 
 /// FIFO chunk stored in a FIFO segment.
 ///
@@ -204,7 +206,46 @@ pub fn f_chunk_includes_pos(c: &SvmFifoChunk, pos: u32) -> bool {
 }
 
 #[inline(always)]
+pub(crate) fn fs_head_offset(head: u64) -> u64 {
+    head & FS_CHUNK_OFFSET_MASK
+}
+
+#[inline(always)]
+pub(crate) fn fs_head_with_next(old_head: u64, next_offset: u64) -> u64 {
+    assert!(
+        next_offset <= FS_CHUNK_OFFSET_MASK,
+        "FIFO chunk offset exceeds 48 bits"
+    );
+    next_offset | (old_head.wrapping_add(FS_CHUNK_TAG_INCREMENT) & FS_CHUNK_TAG_MASK)
+}
+
+#[inline(always)]
+pub(crate) fn fs_offset_is_valid(offset: u64, max_byte_index: u64) -> bool {
+    offset != 0 && offset <= FS_CHUNK_OFFSET_MASK && offset < max_byte_index
+}
+
+#[inline(always)]
+pub(crate) const fn fs_chunk_class(size: usize) -> usize {
+    let size = if size < 1usize << FS_MIN_LOG2_CHUNK_SIZE {
+        1usize << FS_MIN_LOG2_CHUNK_SIZE
+    } else {
+        size
+    };
+    let log2 = usize::BITS - size.saturating_sub(1).leading_zeros();
+    let class = log2.saturating_sub(FS_MIN_LOG2_CHUNK_SIZE) as usize;
+    if class < FS_CHUNK_VEC_LEN {
+        class
+    } else {
+        FS_CHUNK_VEC_LEN - 1
+    }
+}
+
+#[inline(always)]
 pub unsafe fn fs_ptr(fsh: *mut FifoSegmentHeader, sp: FsSptr) -> *mut u8 {
+    assert!(
+        sp <= FS_CHUNK_OFFSET_MASK,
+        "FIFO segment offset exceeds 48 bits"
+    );
     if sp == 0 {
         std::ptr::null_mut()
     } else {
@@ -217,7 +258,12 @@ pub unsafe fn fs_sptr(fsh: *mut FifoSegmentHeader, ptr: *mut u8) -> FsSptr {
     if ptr.is_null() {
         0
     } else {
-        (ptr as usize).wrapping_sub(fsh as usize) as FsSptr
+        let offset = (ptr as usize).wrapping_sub(fsh as usize) as FsSptr;
+        assert!(
+            offset <= FS_CHUNK_OFFSET_MASK,
+            "FIFO segment offset exceeds 48 bits"
+        );
+        offset
     }
 }
 
@@ -566,68 +612,6 @@ enum FifoStorage {
 }
 
 unsafe impl Send for Fifo {}
-unsafe impl Sync for Fifo {}
-
-impl Read for &Fifo {
-    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
-        if buf.is_empty() {
-            return Ok(0);
-        }
-        if self.max_dequeue() == 0 {
-            return Err(io::ErrorKind::WouldBlock.into());
-        }
-
-        let read = self.peek(0, buf.len(), buf);
-        assert_eq!(
-            self.dequeue_drop(read),
-            read,
-            "FIFO readable bytes changed while held by its consumer"
-        );
-        Ok(read)
-    }
-}
-
-impl BufRead for &Fifo {
-    fn fill_buf(&mut self) -> io::Result<&[u8]> {
-        self.readable_segment()
-            .ok_or_else(|| io::ErrorKind::WouldBlock.into())
-    }
-
-    fn consume(&mut self, amount: usize) {
-        let readable = self.readable_segment().map_or(0, <[u8]>::len);
-        assert!(
-            amount <= readable,
-            "cannot consume {amount} bytes from a FIFO segment containing {readable} bytes"
-        );
-        assert_eq!(
-            self.dequeue_drop(amount),
-            amount,
-            "FIFO readable bytes changed while held by its consumer"
-        );
-    }
-}
-
-impl Write for &Fifo {
-    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
-        if buf.is_empty() {
-            return Ok(0);
-        }
-
-        let available = self.max_enqueue();
-        if available == 0 {
-            return Err(io::ErrorKind::WouldBlock.into());
-        }
-        let requested = buf.len().min(available);
-        match self.enqueue_segments(requested, [buf]) {
-            Ok(written) => Ok(written),
-            Err(error) => Err(io::Error::other(error)),
-        }
-    }
-
-    fn flush(&mut self) -> io::Result<()> {
-        Ok(())
-    }
-}
 
 impl Fifo {
     const fn chunk_data_size(_capacity: usize) -> usize {
@@ -867,11 +851,24 @@ impl Fifo {
         start_chunk: u64,
         end_chunk: u64,
     ) -> Result<Self, FifoError> {
-        if capacity == 0 || capacity > u32::MAX as usize || start_chunk == 0 {
+        if capacity == 0 || capacity > u32::MAX as usize {
             return Err(FifoError::InvalidCapacity);
         }
         let fs_offset = segment.fifo_segment_offset().unwrap_or(SSVM_PAYLOAD_OFFSET);
         let base = unsafe { segment.base().add(fs_offset as usize) };
+        let segment_header = unsafe { &*base.cast::<FifoSegmentHeader>() };
+        if !fs_offset_is_valid(hdr_offset, segment_header.max_byte_index)
+            || !fs_offset_is_valid(start_chunk, segment_header.max_byte_index)
+            || !fs_offset_is_valid(end_chunk, segment_header.max_byte_index)
+        {
+            return Err(FifoError::SegmentExhausted);
+        }
+        if hdr_offset
+            .checked_add(std::mem::size_of::<FifoHeader>() as u64)
+            .is_none_or(|end| end > segment_header.max_byte_index)
+        {
+            return Err(FifoError::SegmentExhausted);
+        }
         let hdr = unsafe { base.add(hdr_offset as usize).cast::<FifoHeader>() };
         let first_chunk = unsafe { base.add(start_chunk as usize).cast::<Chunk>() };
         let min_alloc = unsafe { (*first_chunk).length.load(Ordering::Acquire) };
@@ -953,6 +950,16 @@ impl Fifo {
             .fifo_segment_offset()
             .ok_or(FifoError::SegmentExhausted)?;
         let base = unsafe { segment.base().add(fs_offset as usize) };
+        let segment_header = unsafe { &*base.cast::<FifoSegmentHeader>() };
+        if !fs_offset_is_valid(hdr_offset, segment_header.max_byte_index) {
+            return Err(FifoError::SegmentExhausted);
+        }
+        if hdr_offset
+            .checked_add(std::mem::size_of::<FifoHeader>() as u64)
+            .is_none_or(|end| end > segment_header.max_byte_index)
+        {
+            return Err(FifoError::SegmentExhausted);
+        }
         let hdr = unsafe { base.add(hdr_offset as usize).cast::<FifoHeader>() };
         let (capacity, start_chunk, end_chunk) = unsafe {
             (
@@ -961,7 +968,10 @@ impl Fifo {
                 (*hdr).end_chunk.load(Ordering::Acquire),
             )
         };
-        if capacity == 0 || start_chunk == 0 || end_chunk == 0 {
+        if capacity == 0
+            || !fs_offset_is_valid(start_chunk, segment_header.max_byte_index)
+            || !fs_offset_is_valid(end_chunk, segment_header.max_byte_index)
+        {
             return Err(FifoError::SegmentExhausted);
         }
         Ok(Self {
@@ -1008,6 +1018,50 @@ impl Fifo {
         self.hdr_off
     }
 
+    #[inline(always)]
+    pub(crate) fn set_slice_index(&mut self, slice: u32) {
+        assert!(
+            slice <= u8::MAX as u32,
+            "FIFO slice index exceeds shared field"
+        );
+        unsafe { (*self.hdr).slice_index = slice as u8 };
+    }
+
+    /// Copies the process-local FIFO state while retaining the shared FIFO
+    /// header and chunk chain, matching `fifo_segment_duplicate_fifo`.
+    pub(crate) fn duplicate(&self) -> Self {
+        Self {
+            shr: self.shr,
+            fs_hdr: self.fs_hdr,
+            ooo_enq_lookup: UnsafeCell::new(RbTree::with_capacity(4)),
+            ooo_deq_lookup: UnsafeCell::new(RbTree::with_capacity(4)),
+            ooo_deq: self.ooo_deq,
+            ooo_enq: self.ooo_enq,
+            ooo_segments: UnsafeCell::new(Pool::with_capacity(4)),
+            ooos_list_head: self.ooos_list_head,
+            ooos_newest: self.ooos_newest,
+            flags: self.flags,
+            refcnt: self.refcnt,
+            client_thread_index: self.client_thread_index,
+            app_session_index: self.app_session_index,
+            session: self.session,
+            segment_manager: self.segment_manager,
+            segment_index: self.segment_index,
+            signals: self.signals,
+            next: std::ptr::null_mut(),
+            prev: std::ptr::null_mut(),
+            attachment: self.attachment,
+            storage: match &self.storage {
+                FifoStorage::Segment(segment) => FifoStorage::Segment(segment.clone()),
+                FifoStorage::Ssvm(segment) => FifoStorage::Ssvm(Arc::clone(segment)),
+            },
+            base: self.base,
+            hdr: self.hdr,
+            hdr_off: self.hdr_off,
+            ooo_base: UnsafeCell::new(unsafe { *self.ooo_base.get() }),
+        }
+    }
+
     unsafe fn acquire_chunk(&self, start_byte: u32) -> Option<u64> {
         let bytes = CHUNK_HEADER_SIZE + unsafe { (*self.hdr).min_alloc as usize };
         let chunk_off = match &self.storage {
@@ -1041,19 +1095,18 @@ impl Fifo {
         };
         let chunk = unsafe { &*self.base.add(chunk_off as usize).cast::<Chunk>() };
         let length = chunk.length.load(Ordering::Relaxed) as usize;
-        let class = if length <= 1 << FS_MIN_LOG2_CHUNK_SIZE {
-            0
-        } else {
-            ((usize::BITS - (length - 1).leading_zeros()).saturating_sub(FS_MIN_LOG2_CHUNK_SIZE)
-                as usize)
-                .min(FS_CHUNK_VEC_LEN - 1)
-        };
+        assert!(
+            fs_offset_is_valid(chunk_off, header.max_byte_index),
+            "FIFO chunk offset is outside the segment"
+        );
+        let class = fs_chunk_class(length);
         let mut head = slice.free_chunks[class].load(Ordering::Acquire);
         loop {
-            chunk.next.store(head, Ordering::Relaxed);
+            chunk.next.store(fs_head_offset(head), Ordering::Relaxed);
+            let new_head = fs_head_with_next(head, chunk_off);
             match slice.free_chunks[class].compare_exchange_weak(
                 head,
-                chunk_off,
+                new_head,
                 Ordering::Release,
                 Ordering::Acquire,
             ) {
@@ -1145,86 +1198,75 @@ impl Fifo {
     }
 
     #[inline]
-    pub fn segments(&self, offset: usize, len: usize) -> Option<(&[u8], &[u8])> {
+    pub fn readable_segments<'fifo>(
+        &'fifo self,
+        offset: usize,
+        output: &mut [std::mem::MaybeUninit<&'fifo [u8]>],
+    ) -> Result<usize, FifoError> {
+        if output.is_empty() {
+            return Err(FifoError::InvalidCapacity);
+        }
         let hdr = self.hdr;
         unsafe {
             let head = (*hdr).head.load(Ordering::Relaxed);
             let tail = (*hdr).tail.load(Ordering::Acquire);
             let available = tail.wrapping_sub(head) as usize;
             if offset >= available {
-                return None;
+                return Ok(0);
             }
-            let to_read = len.min(available - offset);
-            if to_read == 0 {
-                return Some((&[], &[]));
-            }
+            let to_read = available - offset;
             let logical_pos = head + offset as u32;
             let mut chunk_off = (*hdr).head_chunk.load(Ordering::Relaxed);
+            let mut written = 0;
+            let mut remaining = to_read;
             while chunk_off != 0 {
                 let chunk = &*(self.base.add(chunk_off as usize) as *mut Chunk);
                 if f_chunk_includes_pos(chunk, logical_pos) {
                     let data_off = logical_pos.wrapping_sub(chunk.start_byte) as usize;
                     let chunk_avail = chunk.length.load(Ordering::Relaxed) as usize - data_off;
-                    let first_len = to_read.min(chunk_avail);
-                    let first_slice = std::slice::from_raw_parts(
+                    let first_len = remaining.min(chunk_avail);
+                    let first_slice: &'fifo [u8] = std::slice::from_raw_parts(
                         self.base
                             .add(chunk_off as usize + CHUNK_HEADER_SIZE + data_off),
                         first_len,
                     );
-                    if first_len == to_read {
-                        return Some((first_slice, &[]));
+                    output[written].write(first_slice);
+                    written += 1;
+                    remaining -= first_len;
+                    if remaining == 0 {
+                        return Ok(written);
                     }
-                    let second_len = to_read - first_len;
-                    let next_off = chunk.next.load(Ordering::Acquire);
-                    if next_off != 0 {
-                        let next_chunk = &*(self.base.add(next_off as usize) as *mut Chunk);
-                        let second_avail = next_chunk.length.load(Ordering::Relaxed) as usize;
-                        let second_actual = second_len.min(second_avail);
-                        let second_slice = std::slice::from_raw_parts(
-                            self.base.add(next_off as usize + CHUNK_HEADER_SIZE),
-                            second_actual,
+                    chunk_off = chunk.next.load(Ordering::Acquire);
+                    while chunk_off != 0 && remaining != 0 {
+                        if written == output.len() {
+                            return Err(FifoError::InsufficientCapacity {
+                                requested: to_read,
+                                available: written,
+                            });
+                        }
+                        let next = &*(self.base.add(chunk_off as usize) as *mut Chunk);
+                        let next_len = remaining.min(next.length.load(Ordering::Relaxed) as usize);
+                        let next_slice: &'fifo [u8] = std::slice::from_raw_parts(
+                            self.base.add(chunk_off as usize + CHUNK_HEADER_SIZE),
+                            next_len,
                         );
-                        return Some((first_slice, second_slice));
+                        output[written].write(next_slice);
+                        written += 1;
+                        remaining -= next_len;
+                        chunk_off = next.next.load(Ordering::Acquire);
                     }
-                    return Some((first_slice, &[]));
+                    return (remaining == 0)
+                        .then_some(written)
+                        .ok_or(FifoError::SegmentExhausted);
                 }
                 chunk_off = chunk.next.load(Ordering::Acquire);
             }
-            None
-        }
-    }
-
-    fn readable_segment(&self) -> Option<&[u8]> {
-        let hdr = self.hdr;
-        unsafe {
-            let head = (*hdr).head.load(Ordering::Relaxed);
-            let tail = (*hdr).tail.load(Ordering::Acquire);
-            if head == tail {
-                return None;
-            }
-
-            let mut chunk_off = (*hdr).head_chunk.load(Ordering::Relaxed);
-            while chunk_off != 0 {
-                let chunk = &*self.base.add(chunk_off as usize).cast::<Chunk>();
-                if f_chunk_includes_pos(chunk, head) {
-                    let data_offset = head.wrapping_sub(chunk.start_byte) as usize;
-                    let available = (chunk.length.load(Ordering::Relaxed) as u32)
-                        .wrapping_sub(data_offset as u32)
-                        .min(tail.wrapping_sub(head)) as usize;
-                    return Some(std::slice::from_raw_parts(
-                        self.base
-                            .add(chunk_off as usize + CHUNK_HEADER_SIZE + data_offset),
-                        available,
-                    ));
-                }
-                chunk_off = chunk.next.load(Ordering::Acquire);
-            }
-            None
+            Err(FifoError::SegmentExhausted)
         }
     }
 
     #[inline]
-    pub fn dequeue_drop(&self, len: usize) -> usize {
+    pub fn drop_dequeue(&self, len: usize) -> usize {
         let hdr = self.hdr;
         unsafe {
             let head = (*hdr).head.load(Ordering::Relaxed);
@@ -1569,7 +1611,7 @@ impl Fifo {
         }
     }
 
-    pub fn clear(&self) {
+    pub fn clear(&mut self) {
         let hdr = self.hdr;
         unsafe {
             let first_chunk = (*hdr).start_chunk.load(Ordering::Relaxed);
@@ -1694,12 +1736,12 @@ impl Fifo {
     #[inline]
     pub fn dequeue(&self, len: usize, dst: &mut [u8]) -> usize {
         let copied = self.peek(0, len, dst);
-        self.dequeue_drop(copied)
+        self.drop_dequeue(copied)
     }
 
     #[inline]
     pub fn dequeue_drop_all(&self) -> usize {
-        self.dequeue_drop(self.max_dequeue())
+        self.drop_dequeue(self.max_dequeue())
     }
 
     #[inline]

@@ -1,19 +1,17 @@
-use std::alloc::{GlobalAlloc, handle_alloc_error};
+use std::alloc::handle_alloc_error;
 use std::fmt;
 use std::marker::PhantomData;
 use std::mem;
 use std::ops::{Deref, DerefMut};
 use std::ptr::{self, NonNull};
-use std::sync::Arc;
 
 use crate::align;
-use crate::heap::Heap;
+use crate::mem::{MemHeap, MemMain};
 
 pub(crate) struct Slice<T, const ALIGN: usize = 0> {
     ptr: NonNull<T>,
     len: usize,
-    /// `None` selects the main heap. `Some` retains an explicit non-main heap.
-    heap: Option<Arc<Heap>>,
+    heap: *mut MemHeap,
     marker: PhantomData<T>,
 }
 
@@ -29,7 +27,7 @@ impl<T, const ALIGN: usize> Slice<T, ALIGN> {
         Self {
             ptr: NonNull::dangling(),
             len: 0,
-            heap: None,
+            heap: ptr::null_mut(),
             marker: PhantomData,
         }
     }
@@ -42,11 +40,13 @@ impl<T, const ALIGN: usize> Slice<T, ALIGN> {
         Self::from_fn(len, |_| value.clone())
     }
 
-    /// Allocates `len` slots of `T` from `heap` and initializes every slot to
-    /// `value.clone()`. Explicit non-main heaps are retained as provenance;
-    /// the main heap is normalized to the default representation.
     #[inline]
-    pub fn from_elem_in(len: usize, value: T, heap: Arc<Heap>) -> Self
+    pub fn from_fn(len: usize, f: impl FnMut(usize) -> T) -> Self {
+        Self::from_fn_with_heap(len, f, ptr::null_mut())
+    }
+
+    #[inline]
+    pub(crate) fn from_elem_in(len: usize, value: T, heap: &MemHeap) -> Self
     where
         T: Clone,
     {
@@ -54,21 +54,17 @@ impl<T, const ALIGN: usize> Slice<T, ALIGN> {
     }
 
     #[inline]
-    pub fn from_fn(len: usize, f: impl FnMut(usize) -> T) -> Self {
-        Self::from_fn_with_heap(len, f, None)
-    }
-
-    #[inline]
-    pub(crate) fn from_fn_in(len: usize, f: impl FnMut(usize) -> T, heap: Arc<Heap>) -> Self {
-        let heap = (!heap.is_main_heap()).then_some(heap);
+    pub(crate) fn from_fn_in(len: usize, f: impl FnMut(usize) -> T, heap: &MemHeap) -> Self {
+        let heap = if ptr::eq(heap, MemMain::main_heap()) {
+            ptr::null_mut()
+        } else {
+            (heap as *const MemHeap).cast_mut()
+        };
         Self::from_fn_with_heap(len, f, heap)
     }
 
-    fn from_fn_with_heap(
-        len: usize,
-        mut f: impl FnMut(usize) -> T,
-        heap: Option<Arc<Heap>>,
-    ) -> Self {
+    fn from_fn_with_heap(len: usize, f: impl FnMut(usize) -> T, heap: *mut MemHeap) -> Self {
+        let mut f = f;
         if len == 0 {
             return Self {
                 ptr: NonNull::dangling(),
@@ -78,14 +74,17 @@ impl<T, const ALIGN: usize> Slice<T, ALIGN> {
             };
         }
 
-        let main_heap = Heap::main();
-        let allocator = heap.as_deref().unwrap_or(&main_heap);
-        let ptr = allocate_in::<T, ALIGN>(len, allocator);
+        let heap_reference = if heap.is_null() {
+            MemMain::main_heap()
+        } else {
+            unsafe { &*heap }
+        };
+        let ptr = allocate_in::<T, ALIGN>(len, heap_reference);
         let mut guard = SliceInitGuard::<T, ALIGN> {
             ptr,
             initialized: 0,
             capacity: len,
-            heap: allocator,
+            heap: heap_reference,
         };
         for index in 0..len {
             // SAFETY: `index < len`; each slot is written exactly once.
@@ -145,8 +144,7 @@ impl<T, const ALIGN: usize> Default for Slice<T, ALIGN> {
 impl<T: Clone, const ALIGN: usize> Clone for Slice<T, ALIGN> {
     #[inline]
     fn clone(&self) -> Self {
-        let heap = self.heap.clone();
-        Self::from_fn_with_heap(self.len, |index| self[index].clone(), heap)
+        Self::from_fn_with_heap(self.len, |index| self[index].clone(), self.heap)
     }
 }
 
@@ -161,8 +159,11 @@ impl<T, const ALIGN: usize> Drop for Slice<T, ALIGN> {
         if self.len == 0 {
             return;
         }
-        let main_heap = Heap::main();
-        let heap = self.heap.as_deref().unwrap_or(&main_heap);
+        let heap = if self.heap.is_null() {
+            MemMain::main_heap()
+        } else {
+            unsafe { &*self.heap }
+        };
         let len = mem::take(&mut self.len);
         // SAFETY: Slice owns all `len` initialized elements and the allocation
         // was created by this same heap with the matching layout.
@@ -193,7 +194,7 @@ struct SliceInitGuard<'a, T, const ALIGN: usize> {
     ptr: NonNull<T>,
     initialized: usize,
     capacity: usize,
-    heap: &'a Heap,
+    heap: &'a MemHeap,
 }
 
 impl<T, const ALIGN: usize> Drop for SliceInitGuard<'_, T, ALIGN> {
@@ -218,16 +219,16 @@ impl<T, const ALIGN: usize> Drop for SliceInitGuard<'_, T, ALIGN> {
 /// Allocation failure uses the process allocation-error policy.
 #[inline]
 pub fn allocate<T, const ALIGN: usize>(capacity: usize) -> NonNull<T> {
-    allocate_in::<T, ALIGN>(capacity, &Heap::main())
+    allocate_in::<T, ALIGN>(capacity, MemMain::main_heap())
 }
 
 #[inline]
-pub(crate) fn allocate_in<T, const ALIGN: usize>(capacity: usize, heap: &Heap) -> NonNull<T> {
+pub(crate) fn allocate_in<T, const ALIGN: usize>(capacity: usize, heap: &MemHeap) -> NonNull<T> {
     if capacity == 0 {
         return NonNull::dangling();
     }
     let layout = align::array_layout::<T, ALIGN>(capacity);
-    heap.alloc(layout)
+    heap.allocate(layout)
         .unwrap_or_else(|| handle_alloc_error(layout))
         .cast::<T>()
 }
@@ -242,20 +243,21 @@ pub(crate) fn allocate_in<T, const ALIGN: usize>(capacity: usize, heap: &Heap) -
 #[inline]
 pub unsafe fn deallocate<T, const ALIGN: usize>(ptr: NonNull<T>, capacity: usize) {
     // SAFETY: the public contract fixes provenance to the process Main Heap.
-    unsafe { deallocate_in::<T, ALIGN>(ptr, capacity, &Heap::main()) };
+    unsafe { deallocate_in::<T, ALIGN>(ptr, capacity, MemMain::main_heap()) };
 }
 
 #[inline]
 pub(crate) unsafe fn deallocate_in<T, const ALIGN: usize>(
     ptr: NonNull<T>,
     capacity: usize,
-    heap: &Heap,
+    heap: &MemHeap,
 ) {
     if capacity == 0 {
         return;
     }
     let layout = align::array_layout::<T, ALIGN>(capacity);
+    let pointer = unsafe { NonNull::new_unchecked(ptr.as_ptr().cast::<u8>()) };
     // SAFETY: callers pass the same heap, capacity, element type, and alignment
     // used by `allocate_in`.
-    unsafe { GlobalAlloc::dealloc(heap, ptr.as_ptr().cast::<u8>(), layout) };
+    unsafe { heap.deallocate(pointer, layout) };
 }

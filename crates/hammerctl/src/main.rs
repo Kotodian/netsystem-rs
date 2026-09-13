@@ -37,10 +37,13 @@ enum Command {
 }
 
 fn main() -> ExitCode {
-    hammer_infra::main_heap::init_default().unwrap_or_else(|error| {
-        eprintln!("Failed to initialize main heap: {error}");
-        std::process::exit(1);
-    });
+    hammer_infra::MainHeapConfig::default()
+        .initialize()
+        .map(|_| ())
+        .unwrap_or_else(|error| {
+            eprintln!("Failed to initialize main heap: {error}");
+            std::process::exit(1);
+        });
     let cli = Cli::parse();
     match &cli.cmd {
         Command::Send {

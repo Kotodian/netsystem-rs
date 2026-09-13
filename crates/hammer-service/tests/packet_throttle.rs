@@ -4,9 +4,6 @@ use hammer_service::net::throttle::Throttle;
 
 #[test]
 fn duplicate_suppression_expires_per_worker_interval() {
-    hammer_runtime::config::Memory::default()
-        .ensure_main_heap()
-        .unwrap();
     let period = Duration::from_micros(10);
     let mut ingress = Throttle::new(period);
     let mut egress = Throttle::new(period);
@@ -27,9 +24,6 @@ fn duplicate_suppression_expires_per_worker_interval() {
 
 #[test]
 fn collisions_bound_admitted_keys_until_bitmap_reset() {
-    hammer_runtime::config::Memory::default()
-        .ensure_main_heap()
-        .unwrap();
     let mut throttle = Throttle::new(Duration::from_millis(1));
     let seed = throttle.seed(Duration::ZERO);
     let mut admitted = 0;
