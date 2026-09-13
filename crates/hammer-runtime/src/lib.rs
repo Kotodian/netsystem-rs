@@ -57,7 +57,6 @@ pub mod plugin;
 pub mod plugin_loader;
 mod process;
 pub mod session;
-pub mod sync;
 
 pub use error::{AttachError, RuntimeError, RuntimeResult};
 pub use hammer_infra::hint::unlikely;
