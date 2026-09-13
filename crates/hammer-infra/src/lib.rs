@@ -3,7 +3,6 @@ pub mod bihash;
 pub mod bitmap;
 pub mod bytes;
 pub mod checksum;
-pub mod descriptor;
 pub mod fifo_queue;
 pub mod heap_boxed;
 pub mod hint;

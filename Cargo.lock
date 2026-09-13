@@ -1218,7 +1218,6 @@ dependencies = [
  "async-trait",
  "bincode",
  "bitflags 2.11.1",
- "byte-unit",
  "bytes",
  "core_affinity",
  "criterion",
