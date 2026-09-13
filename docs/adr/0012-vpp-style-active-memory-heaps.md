@@ -2,7 +2,8 @@
 
 - 日期：2026-09-12
 - 修正日期：2026-09-13
-- 状态：Accepted；设计修正已于 2026-09-13 批准，尚未实施生产代码
+- 状态：Accepted；设计修正已于 2026-09-13 批准；Phase 1 allocator、VM map 与
+  active heap 代码路径已落地但尚未完成评审与验证，Phase 2-4 尚未实施
 - 范围：`hammer-infra` allocator、`svm_region` 的 pvt/data heap、运行时线程入口
 - VPP 基线：`third_party/vpp`，提交 `629fe2764bd997189fedd2d98cbe8dc9189c1ec3`
 - 被替换 allocator 调研：当前 `libmimalloc-sys 0.1.49` 内置 mimalloc `3.3.2`；
@@ -17,7 +18,7 @@
 
 1. Hammer 如何用 `MemMain`、`MemThreadMain`、`MemHeap` 表达 VPP
    `clib_mem_main_t`、`clib_mem_thread_main_t`、`clib_mem_heap_t` 的所有权；
-2. Rust `GlobalAlloc` 和已存在的 C malloc-family interposition 如何把普通分配
+2. Rust `GlobalAlloc` 如何在 Main Heap 发布前使用 `System`、发布后把普通分配
    路由到当前线程的 active heap；
 3. `svm_region` 如何把 VPP 的 pvt heap 和可选 data heap 都实现为 `MemHeap`，
    并通过 active heap 执行 `Vec`、字符串、名字表和用户数据分配；
@@ -48,11 +49,11 @@ different-VA attach。
 | ID | 路径与符号 | 已核实行为 | 设计约束 |
 | --- | --- | --- | --- |
 | V1 | `src/vppinfra/mem.h:70-83`，`clib_mem_thread_main_t` | TLS 状态直接保存 `active_heap`、thread index 和 thread-main 链 | `MemThreadMain` 是 allocator 的线程状态，不是 `DataPlaneMain` 字段 |
-| V2 | `src/vppinfra/mem.h:85-119`、`:420-424`，`clib_mem_main_t` / `clib_mem_get_last_error` | process Main 保存 main heap、heap 列表、thread-main 列表、system/default/system-default-huge page size、malloc-family intercept flag、NUMA bitmap、mapping 双向链、map lock和last-error pointer | allocator、page、NUMA、mapping和inventory状态必须移植；C sentinel + mutable error pointer不进入Rust owner，见D1 |
+| V2 | `src/vppinfra/mem.h:85-119`、`:420-424`，`clib_mem_main_t` / `clib_mem_get_last_error` | process Main 保存 main heap、heap 列表、thread-main 列表、system/default/system-default-huge page size、malloc-family intercept flag、NUMA bitmap、mapping 双向链、map lock和last-error pointer | allocator、page、NUMA、mapping、inventory和`alloc_free_intercept`发布状态必须移植；Hammer的Rust `GlobalAlloc`读取该flag，但不实现C interposition；C sentinel + mutable error pointer不进入Rust owner，见D1 |
 | V3 | `src/vppinfra/mem.c:16-28`，`clib_mem_thread_init` | 新线程默认把 main heap 设为 active heap，再登记 thread index | 未显式切换的线程必须始终从 main heap 分配 |
 | V4 | `src/vppinfra/mem.h:184-200`，`clib_mem_get_heap` / `clib_mem_set_heap` | get 在未初始化时初始化线程状态；set 替换 active heap 并返回旧 heap | nested active-heap scope 必须恢复旧 heap |
 | V5 | `src/vppinfra/mem_dlmalloc.c:41-100`，`clib_mem_create_heap_internal` | `create_mspace_with_base` 在给定 range 内建 heap；`MemHeap` 等价控制块再从该 mspace 自身分配；heap 列表扩容时临时切回 main heap | pvt/data heap 的控制块在自身映射内，attach 不重建 |
-| V6 | `src/vppinfra/mem_dlmalloc.c:363-383`、`:446-473`、`:519-537` | alloc/realloc/free 没有显式 heap 时取 active heap；free 断言对象属于该 heap | Rust/C 普通 allocation family 必须共用 active selector；错误 active heap 是违规，不自动猜 owner |
+| V6 | `src/vppinfra/mem_dlmalloc.c:363-383`、`:446-473`、`:519-537` | alloc/realloc/free 没有显式 heap 时取 active heap；free 断言对象属于该 heap | Rust普通allocation family必须使用active selector；错误active heap是违规，不自动猜owner |
 | V7 | `src/vppinfra/dlmalloc.c:4012-4032`、`:4054-4065` | mspace allocator state 位于 supplied base；locked mspace 的锁也在该 state；range 标为 external | fixed-VA attach 后可直接继续使用 shared mspace state |
 | V8 | `src/svm/svm_common.h:19-50` | region header 保存version、mutex/condvar、mutex owner pid/tag、flags、virtual base/size、region/data heap、data base、user context、bitmap size/pointer、region/backing names、filenames和client pids；pvt heap默认128 KiB | Hammer header逐字段保留VPP region fields并使用固定VA raw pointers，不增加lifecycle enum或offset descriptor |
 | V9 | `src/svm/svm.c:434-531`，`svm_region_init_mapped_region` | creator 在 `baseva + page_size` 创建 locked `region_heap`，切到它分配名字、pid vec、bitmap；之后按 flags 创建可选 data heap | region 初始化必须先有 pvt heap，所有 region metadata 由它分配 |
@@ -66,7 +67,7 @@ different-VA attach。
 | V17 | `src/svm/svmdb.c:70-120`、`:185-214` | DB 初始化把共享 header、Hash 和 Vec 放进 active data heap；后续 mutation 同样先切 data heap | active heap 必须覆盖普通 collection 的隐式分配，不只覆盖手写 raw allocation API |
 | V18 | `src/vppinfra/dlmalloc.h:527-535`、`:1330-1469` | VPP 固定启用 `USE_LOCKS=1`、`ONLY_MSPACES=1`，并声明 supplied-base mspace 与 heap 检查、禁止扩展等接口 | Hammer 必须构建同一类 mspace backend，不能改用只提供 process-global malloc 的 Rust allocator |
 | V19 | `src/vppinfra/CMakeLists.txt:61-92` | `dlmalloc.c` 和 `mem_dlmalloc.c` 是两个独立编译单元，vppinfra 默认隐藏内部 C 符号 | Hammer 只引入 dlmalloc engine；`MemMain`/`MemHeap` 行为由 Rust 移植，不能再编译一套 `clib_mem_*` authority |
-| V20 | `src/vppinfra/mem_intercept.c:28-38`、`:79-99`，`src/vpp/vnet/main.c:132-175`、`:362-375` | intercept开启后free/realloc无条件走active heap；VPP先销毁bootstrap heap，只让独立mmap中的config bytes跨heap切换 | Hammer cutover前必须结束全部System/libc allocation owner；不实现切换后的provenance routing |
+| V20 | `src/vppinfra/mem_intercept.c:28-38`、`:79-99`，`src/vpp/vnet/main.c:132-175`、`:362-375` | intercept开启后free/realloc无条件走active heap；VPP先销毁bootstrap heap，只让独立mmap中的config bytes跨heap切换 | Hammer保留`alloc_free_intercept`发布语义，但只在Rust `GlobalAlloc`内部读取；不实现C interposition、bootstrap allocation tracking或cutover计数，flag开启后不做provenance routing |
 | V21 | `src/vppinfra/mem.c:16-28`、`src/vppinfra/mem_dlmalloc.c:145-167` | VPP把TLS对象地址链接到process inventory，destroy时遍历并写零每个记录；源码没有短命thread的unlink | 只有保证存活到process exit的runtime thread可进入Hammer inventory；短命外部thread只初始化active main heap |
 | V22 | `src/svm/svm.c:709-751`、`src/vppinfra/dlmalloc.c:407-480`、`:1183`、`:1336-1337` | VPP发现region mutex owner死亡后重建mutex并继续；shared mspace使用不具备owner-death恢复能力的spinlock，进程可能死在allocator mutation中 | Hammer不得验证或继续使用未知mspace/collection；owner death必须终止region生命周期 |
 | V23 | `src/svm/svm.c:1034-1119`、`:1215-1228` | member、pool、hash和name删除都在region/root lock及对应active pvt heap内完成；heap-owned值不按值返回给外层销毁 | Rust删除API只返回无heap ownership的事实；所有drop在owner的active PVT scope内完成 |
@@ -98,8 +99,9 @@ heap 和 SVM heap 各自拥有一套 allocator/TLS/provenance 语义，最终设
 实现从 vendored VPP commit `629fe2764bd997189fedd2d98cbe8dc9189c1ec3` 使用的
 public-domain dlmalloc 2.8.6 提取 `third_party/dlmalloc/`。该目录保存来源、许可证、
 独立的 `dlmalloc.c` 与 `dlmalloc.h`，只保留 VPP memory path 实际依赖的 mspace engine
-和扩展；移除对 `vppinfra/clib.h`、`vppinfra/cache.h`、`os_panic` 及 VPP trace symbol
-的编译依赖时，不改变 chunk、mspace、锁或 supplied-base 行为。
+和扩展；移除对 `vppinfra/clib.h`、`vppinfra/cache.h` 和 `os_panic` 的编译依赖，并提供
+私有no-op trace entry points；这些构建独立差异不改变 chunk、mspace、锁或 supplied-base
+行为。
 
 `hammer-infra/build.rs` 用 `cc` 直接构建这份 C source，并固定
 `ONLY_MSPACES=1`、`MSPACES=1`、`USE_LOCKS=1` 和 hidden visibility。不增加
@@ -114,16 +116,15 @@ Main Heap、process-private heap、PVT Heap 与 Data Heap都通过
 
 Main Heap 和所有跨线程/跨进程 heap 使用 locked mspace。仅有完整单线程 owner 生命周期的
 process-private heap 才允许 `locked = false`；该选择在创建后不可改变。Cargo workspace、
-`hammer-infra`、C interposition 和 plugin image checks 删除全部 `libmimalloc-sys`/`mi_*`
-依赖与符号。
+`hammer-infra` 和 plugin image checks 删除全部 `libmimalloc-sys`/`mi_*`依赖与符号。
 
 ## 3. 三方语义比较
 
 | 维度 | 当前 Hammer | 目标 Hammer | VPP |
 | --- | --- | --- | --- |
 | process authority | `main_heap.rs` 的分散 atomics | `MemMain` 集中拥有 main heap、heap/thread inventory 和现有固定 arena | `clib_mem_main_t` |
-| thread state | 无 Hammer active selector | allocator-owned `MemThreadMain` TLS，默认main heap；只有process-lifetime runtime threads进入inventory | `__thread clib_mem_thread_main_t`；所有初始化thread都入链且无unlink |
-| ordinary allocation | ready 后固定 mimalloc main | Rust GlobalAlloc 与 C malloc family读取同一 active dlmalloc mspace；cutover前bootstrap allocation归零 | `clib_mem_alloc/free/realloc` 取active heap；intercept后不识别libc provenance |
+| thread state | 无 Hammer active selector | allocator-owned `thread_local!` `MemThreadMain`，默认main heap；只有process-lifetime runtime threads进入inventory | `__thread clib_mem_thread_main_t`；所有初始化thread都入链且无unlink |
+| ordinary allocation | ready 后固定 mimalloc main | Rust `GlobalAlloc` 自身读取`alloc_free_intercept`：false时用`System`，true时使用当前active dlmalloc mspace | `clib_mem_alloc/free/realloc` 取active heap；intercept后不识别libc provenance |
 | memory errors | owner-local `Result` | 每次失败直接返回owned typed `MemError`，`MemMain`不保存第二份error pointer | C函数返回sentinel并在`clib_mem_main.error`保存mutable error |
 | process heap backend | mimalloc fixed arena | fixed-range locked dlmalloc mspace | locked dlmalloc mspace |
 | SVM heap backend | offset `SvmRegionHeap` | fixed-base locked mspace，公开身份仍是 `MemHeap` | locked mspace |
@@ -151,9 +152,10 @@ enum。
 `main_heap::{init, init_with, init_default}` 提升为新的 `MemMain` public API。
 
 `MemMain` 的规范字段不是只含 allocator selector。完整移植VPP memory-main中的main heap、
-heap inventory、thread-main inventory、system page size、
-selected default hugepage size、system default hugepage size、malloc-family interception flag、
-available NUMA-node bitmap、mapping 双向链首尾和map lock。
+heap inventory、thread-main inventory、system page size、selected default hugepage size、
+system default hugepage size、`alloc_free_intercept`、available NUMA-node bitmap、mapping
+双向链首尾和map lock。Hammer没有C malloc-family interposition，但`alloc_free_intercept`
+仍是Rust `GlobalAlloc`的System/Main Heap切换authority，不能删除或由另一个flag替代。
 `MemVmMapHeader` 直接对应
 `clib_mem_vm_map_hdr_t`，同样移植 base、page count、page size、backing fd、固定容量 name 与
 prev/next link。字段的 Rust 拼写见 8.2，不得把这些状态拆回 `physmem` 或 runtime 的第二个
@@ -181,9 +183,11 @@ locked/traced/unmap-on-destroy flags和末尾name bytes；没有backend selector
 3. `PageSize::Default`解析到system page size；`PageSize::DefaultHuge`解析到selected default
    hugepage size。`MainHeapConfig.default_hugepage_size`若存在，在Main Heap发布后覆盖selected
    值，不改写system default值。
-4. Main Heap、heap inventory、main-thread `MemThreadMain.active_heap`全部发布后，才把
-   `allocation_intercept`设为true。C malloc-family在false时走libc，在true时与Rust
-   `GlobalAlloc`共同走current active mspace。
+4. Main Heap与main-thread `MemThreadMain.active_heap`就绪后先把`alloc_free_intercept`设为
+   true，再用该active heap构造heap inventory。VPP的`heaps` Vec通过显式`clib_mem_alloc`
+   直接走active main heap；Hammer的`heaps: Vec`是普通Rust allocation，必须先发布flag，
+   否则inventory会落在System并在后续扩容时触发wrong-heap。flag发布后执行
+   `heaps.reserve/push`和thread registration。
 5. NUMA枚举从bitmap中清除不大于previous node的bits，再返回最低set bit；VM mapping和
    affinity选择都只读该字段，不重复探测另一份NUMA state。
 6. backing-fd、NUMA、mapping和heap创建失败只通过当前调用的`Result<T, MemError>`返回；
@@ -191,9 +195,8 @@ locked/traced/unmap-on-destroy flags和末尾name bytes；没有backend selector
 
 ### D2：只有一个 active-heap authority
 
-`MemThreadMain.active_heap` 是 Rust GlobalAlloc、C malloc-family interposition 和
-`MemHeap` 普通入口共同读取的唯一 authority。首次读取初始化为
-`MemMain.main_heap`。`MemHeap::activate` 返回 `ActiveHeap<'_>`；该值拥有恢复义务，
+`MemThreadMain.active_heap` 是 Rust GlobalAlloc 和 `MemHeap` 普通入口共同读取的唯一
+authority。首次读取初始化为 `MemMain.main_heap`。`MemHeap::activate` 返回 `ActiveHeap<'_>`；该值拥有恢复义务，
 `Drop` 恢复旧 heap，因此 early return 和 unwind 不泄漏 heap selection。nested scope 按栈
 恢复。
 
@@ -202,11 +205,12 @@ locked/traced/unmap-on-destroy flags和末尾name bytes；没有backend selector
 它不可 `Send`/`Sync`，也不能跨 `.await`。
 
 VPP 用 `__thread`，而 `GlobalAlloc` 没有 `DataPlaneMain` 参数。要让标准库和第三方
-allocation 自动读取 active heap，allocator 必须有一个 TLS slot。实现使用 allocator C
-shim 的 `_Thread_local MemThreadMain`，不新增 Rust `thread_local!`、generic per-thread
-container 或跨线程 install/clear API。这是相对仓库“线程状态由 runtime value 持有”规则的
-一项窄例外，需要随 A2 明确批准；不批准该例外就无法同时满足 GlobalAlloc 与 active heap，
-本文不得以隐藏的 pthread key 或全局锁绕过。
+allocation 自动读取 active heap，allocator 必须有一个 TLS slot。实现使用模块私有的
+const-initialized Rust `thread_local!`，其中 `MEM_THREAD_MAIN` 直接持有
+`UnsafeCell<MemThreadMain>`；不增加 allocator C shim、generic per-thread container 或
+跨线程 install/clear API。该 allocator-only TLS 是相对仓库“线程状态由 runtime value 持有”
+规则的一项窄例外，已按 A2 由 issue #300 明确批准；本文不得以隐藏的 pthread key 或全局锁
+绕过。
 
 runtime thread 在自己的 OS-thread entry 登记 `thread_index`。只有main、Data Worker以及
 其它明确保证存活到process exit的runtime OS thread允许登记并链接到`MemMain.threads`；
@@ -220,34 +224,26 @@ current-thread selector完全属于allocator内部。它只返回本次调用使
 也不从TLS制造任何安全`&MemHeap`。process Main Heap的`'static`借用由process lifetime
 成立；region内pvt/data heap的安全借用只能由`RegionLock`产生并受其lifetime约束。
 
-### D3：普通 Rust/C 分配都走 active heap
+### D3：Rust GlobalAlloc 内部切换 System 与 active heap
 
-`MemMain` 的 `GlobalAlloc::{alloc,alloc_zeroed,dealloc,realloc}` 与当前 interposed
-`malloc/calloc/free/realloc/aligned_alloc/posix_memalign/...` 先取得 active `MemHeap`，
-再调用同一个 mspace dispatch。Rust 和 C 不再各自维护默认 heap。
+`MemMain` 的 `GlobalAlloc::{alloc,alloc_zeroed,dealloc,realloc}` 是普通Rust allocation的
+唯一切换点。每次调用读取`alloc_free_intercept`：false时本次操作交给`System`；true时读取
+`MemThreadMain.active_heap()`并直接调用当前`MemHeap`的mspace。switch判断位于trait实现内部，
+不存在C malloc-family wrapper、bootstrap counter、provenance table或第二套切换状态机。
 
-ready前的Rust/C bootstrap allocation走System/libc，不增加VPP没有的per-allocation header。
-与VPP在切换Main Heap前销毁bootstrap heap、把config bytes暂存在独立`mmap`中的流程一致，Hammer
-process entry必须把early parse限定在独立scope：只留下Copy的`MainHeapConfig`和mmap中的原始
-startup bytes，所有System/libc bootstrap owner在Main Heap发布前drop。cutover的前置条件是
-经`MemMain` bootstrap path产生的live allocation计数为零；实现用test/debug-only observer
-验证该条件，不把计数、header或provenance table带入production layout。存在任一live
-bootstrap allocation时不得发布Main Heap或开启intercept。
-
-发布后alloc/realloc/free直接走current active mspace；free先以
+`alloc_free_intercept`发布后alloc/realloc/free直接走current active mspace；free先以
 `mspace_is_heap_object(active.mspace, pointer)`断言pointer属于当前heap，再调用`mspace_free`。
-不得扫描heap inventory猜owner，不得回落System/libc。dlmalloc chunk metadata是唯一allocation
-metadata，不增加`AllocationHeader`。这与`clib_mem_heap_free`的wrong-active-heap assert和
-`mem_intercept.c`按当前intercept flag选择allocator的逻辑一致。
+不得扫描heap inventory猜owner，不得回落System。dlmalloc chunk metadata是唯一allocation
+metadata，不增加`AllocationHeader`。
 
-因此不存在“初始化后free/realloc bootstrap block”的合法路径，也没有切换后的provenance
-routing。startup owners归零是cutover proof；一旦intercept开启，任何System/libc pointer
-进入free/realloc都违反该前置条件并按wrong-heap abort。
+`MainHeapConfig::initialize` 是进程启动边界。它不记录或分类flag发布前的System allocation；
+flag发布后继续持有并在新active heap下free/realloc的System pointer违反契约并按wrong-heap
+abort。合法使用必须在flag发布前结束旧allocation owner，再创建需要跨启动阶段存活的普通
+Rust allocation。
 
-OOM 对 Rust GlobalAlloc 返回 null，由 Rust allocation failure boundary 终止；C malloc-family
-保持 C ABI 的 null/`ENOMEM`。显式 `MemHeap` nullable API 可返回 null。wrong-active-heap
-free、double free和mspace corruption是programmer/shared-state violation，立即abort，不进入
-`SvmRegionError`。
+OOM对Rust GlobalAlloc返回null，由Rust allocation failure boundary终止。显式`MemHeap`
+nullable API可返回null。wrong-active-heap free、double free和mspace corruption是
+programmer/shared-state violation，立即abort，不进入`SvmRegionError`。
 
 ### D4：所有 `MemHeap` 统一使用 dlmalloc mspace
 
@@ -282,8 +278,7 @@ cc = "1"
 cc = { workspace = true }
 ```
 
-`build.rs` 保留已有 Linux interpose linker 参数，并增加以下 mspace 编译；所有 source
-路径都从 `CARGO_MANIFEST_DIR` 解析：
+`build.rs` 只编译 mspace source；所有路径都从 `CARGO_MANIFEST_DIR` 解析：
 
 ```rust
 use std::env;
@@ -313,16 +308,12 @@ fn main() {
 
     println!("cargo:rerun-if-changed={}", source_dir.join("dlmalloc.c").display());
     println!("cargo:rerun-if-changed={}", source_dir.join("dlmalloc.h").display());
-
-    if env::var_os("CARGO_CFG_TARGET_OS").as_deref() == Some(OsStr::new("linux")) {
-        println!("cargo:rustc-link-arg=-Wl,-z,interpose");
-    }
 }
 ```
 
 `ONLY_MSPACES=1` 保证 dlmalloc 不定义或接管 process `malloc/free`。Rust
-`GlobalAlloc` 与已有 C malloc-family interposition 仍由 `MemMain` 统一接收，再把操作
-派发到当前 active `MemHeap.mspace`；dlmalloc 不能成为第二个全局 allocator。
+`GlobalAlloc` 读取`alloc_free_intercept`，再把操作派发到当前 active `MemHeap.mspace`；
+dlmalloc不能成为第二个全局allocator，也没有C malloc-family interposition。
 
 #### D4.2 Rust FFI
 
@@ -351,10 +342,7 @@ unsafe extern "C" {
         size: usize,
     ) -> *mut c_void;
     fn mspace_free(mspace: Mspace, pointer: *mut c_void);
-    fn mspace_usable_size(pointer: *const c_void) -> usize;
     fn mspace_is_heap_object(mspace: Mspace, pointer: *mut c_void) -> i32;
-    fn mspace_least_addr(mspace: Mspace) -> *mut c_void;
-    fn mspace_footprint(mspace: Mspace) -> usize;
 }
 ```
 
@@ -619,7 +607,7 @@ VPP与Hammer错误边界逐项对应如下：
 
 | 层 | 允许调用 | 禁止调用/保存 | 验证 |
 | --- | --- | --- | --- |
-| `mem` | dlmalloc mspace、System bootstrap、allocator TLS | SVM name/member policy、runtime graph/plugin状态、caller closure、第二allocator backend | infra allocation tests、C ABI tests、wrong-heap subprocess |
+| `mem` | dlmalloc mspace、flag关闭时的System fallback、allocator TLS | SVM name/member policy、runtime graph/plugin状态、caller closure、第二allocator backend、C interposition | infra allocation tests、wrong-heap subprocess |
 | `SvmRegion` | mapping/fd、region mutex、owner pid/tag、`MemHeap`、standard collection/Pool、root bitmap | `SsvmPrivate` header、offset heap、runtime WorkerBarrier、fallback Main Heap、owner-death后访问shared heap、额外shared状态字段 | same-VA subprocess creator/attach与owner-death failure |
 | `RegionLock` | 直接借 pvt/data `MemHeap` 并创建 `ActiveHeap` | 返回越过lock lifetime的heap借用、从allocator TLS取得safe heap reference、跨`.await` scope | compile-time lifetime用例、nested restore行为 |
 | runtime thread entry | 只为process-lifetime OS thread登记index；短命thread仅使用unregistered TLS default | 拥有或跨线程move `MemThreadMain`、登记可能在线程退出时失效的TLS address、为allocator添加第二个TLS | startup与short-lived thread integration |
@@ -631,8 +619,8 @@ VPP与Hammer错误边界逐项对应如下：
 
 | ID | 类型/API | Owner / consumer | 最终结果与现有接口不足 |
 | --- | --- | --- | --- |
-| A1 | `#[global_allocator] static MEM_MAIN: MemMain`；`GlobalAlloc`实现；page/NUMA/intercept/map/heap/thread字段；`MemVmMapHeader`；direct getter；public startup只经`MainHeapConfig::initialize` | `hammer-infra::mem`；所有Rust/C allocation、VM mapping与daemon/ctl startup | 移植有运行语义的`clib_mem_main_t` authority并让它本身成为Rust global allocator；C last-error pointer由owned typed `Result`替代；删除`HammerMainHeap`代理和`MemDiagnostics` wrapper |
-| A2 | `MemThreadMain`；unsafe process-lifetime registration、private raw active selector、Copy thread index | allocator TLS；runtime thread entries | `GlobalAlloc`需要VPP等价current-thread selector，但不得制造`'static`safe borrow；短命thread不进入TLS-address inventory |
+| A1 | `#[global_allocator] static MEM_MAIN: MemMain`；`GlobalAlloc`实现；page/NUMA/`alloc_free_intercept`/map/heap/thread字段；`MemVmMapHeader`；direct getter；public startup只经`MainHeapConfig::initialize` | `hammer-infra::mem`；所有Rust allocation、VM mapping与daemon/ctl startup | 移植有运行语义的`clib_mem_main_t` authority并让它本身成为Rust global allocator；C last-error pointer由owned typed `Result`替代；删除`HammerMainHeap`代理和`MemDiagnostics` wrapper |
+| A2 | `MemThreadMain`；const-initialized allocator `thread_local!`、unsafe process-lifetime registration、private raw active selector、Copy thread index | allocator TLS；runtime thread entries | `GlobalAlloc`需要VPP等价current-thread selector，但不得制造`'static`safe borrow；短命thread不进入TLS-address inventory |
 | A3 | `MemHeap`；`create_at`、`allocate`、`allocate_zeroed`、`reallocate`、`deallocate`、`contains`、`base`、`size` | `MemMain`、SVM region、现有 explicit allocator consumers | 统一 process heap和pvt/data heap身份；替代 crate-private `Heap` 和 `SvmRegionHeap` |
 | A4 | `ActiveHeap<'a>`；`MemHeap::activate` | 需要临时切换的 region/allocator caller | 保存并 RAII恢复 previous heap；不能用 closure或公开 raw setter表达 unwind-safe nested scope |
 | A5 | `MemError` concrete operation variants | `hammer-infra::mem`；startup、VM mapping、backing fd、NUMA和heap create seam | 替换当前`MainHeapError`及`PhysmemError`透传；VPP assert/OOM边界不进入该enum，OS source只在真实control-plane失败处保留 |
@@ -641,7 +629,7 @@ VPP与Hammer错误边界逐项对应如下：
 | A8 | `SvmMainRegion`、`SvmSubregion` 使用 `HashMap`/`Pool`/bitmap 的 active-pvt allocation；最后client的`unmap`完成root cleanup | root region | 恢复`svm_region_init_internal`、root VA切分和`svm_region_unmap_internal`单一路径；heap-owned值的drop不逃出active PVT scope |
 | A9 | `third_party/dlmalloc/{LICENSE,README.md,dlmalloc.c,dlmalloc.h}`；workspace build-time `cc`；`hammer-infra/build.rs` mspace build；`hammer-infra::mem` private FFI | `hammer-infra::mem`唯一 backend | Main/PVT/Data Heap统一使用VPP同类mspace；不编译`mem_dlmalloc.c`，不增加sys crate，不公开mspace symbol；当前offset allocator与mimalloc都不能满足完整目标 |
 | A10 | 删除 `libmimalloc-sys`、mimalloc arena/interposition 和 image-authority checks | workspace、`hammer-infra`、daemon example | 不保留第二allocator authority或无调用的mimalloc binding |
-| A11 | 零live-allocation bootstrap cutover、`mspace_is_heap_object`与统一Rust/C routing | global allocator/interposition与process entry | 不增加allocation header、pointer-owner scan或provenance routing；bootstrap owner在publication前全部结束，之后只由active mspace处理，wrong heap abort |
+| A11 | `alloc_free_intercept`发布、`mspace_is_heap_object`与Rust `GlobalAlloc`内部routing | global allocator与process entry | 不增加C interposition、allocation header、pointer-owner scan或provenance routing；flag false时System，true后只由active mspace处理，wrong heap abort |
 | A12 | `SvmRegionError::OwnerDied`和无额外shared state的owner-death stop boundary | attach/lock与region lifecycle owner | shared layout保持VPP字段；robust region mutex不能证明非robust shared mspace一致，因此不force-unlock后继续 |
 
 以上批准不自动授权公开 backend enum、allocator trait、generic TLS container、closure access、
@@ -1047,8 +1035,8 @@ SvmRegionHeader::root_offset
 | `HammerMainHeap` 与 `GLOBAL_ALLOCATOR` proxy | 删除；改为`#[global_allocator] static MEM_MAIN: MemMain`直接实现`GlobalAlloc` |
 | `third_party/dlmalloc`、workspace Cargo与`hammer-infra/build.rs` | vendored source记录VPP commit与提取差异；`cc`按D4.1构建hidden mspace-only archive；`mem`私有FFI按D4.2链接 |
 | `heap.rs`、`heap_boxed.rs`、Bihash explicit allocator | crate-private `Heap` 改为直接借 `MemHeap`；不保留 vtable或 `Heap::svm_data` |
-| Rust `GlobalAlloc` 与 C interpose | 改读private current-thread raw active selector；cutover前证明bootstrap live allocation为零；cutover后只接受active mspace object，不做bootstrap provenance routing或heap inventory scan |
-| workspace与plugin image检查 | 删除`libmimalloc-sys`依赖、所有`mi_*`调用与mimalloc authority检查；改为验证唯一dlmalloc/mem authority位于`hammer-infra` |
+| Rust `GlobalAlloc` | trait方法内部读取`alloc_free_intercept`；false时System，true时读取private current-thread raw active selector；只接受active mspace object，不做provenance routing或heap inventory scan |
+| workspace与plugin image检查 | 删除`libmimalloc-sys`依赖、所有`mi_*`调用与image authority检查；只验证consumer动态依赖共享`hammer-infra` |
 | runtime main/worker/aux thread entry | main、Data Worker和process-lifetime auxiliary thread在各自OS thread登记index；短命auxiliary/external thread不进inventory；不改变`DataPlaneMain` ownership |
 | `svm/region.rs` | 按 D5-D11 重写 mapping/header/root/subregion/heap操作；`create/attach/unmap`直接增删`client_pids`；删除`RegionMembership`、`SvmRegionState`、`join/state`和public caller-selected lock tag；layout version bump，拒绝旧 layout |
 | SVM region consumers | offset变成 same-VA pointer；mutation在 RegionLock + ActiveHeap scope内使用普通 collections |
@@ -1088,10 +1076,10 @@ daemon/app组件必须同批重编译并重建 region。
    收到该参数，无法满足 active heap。
 7. **把 `MemThreadMain` 放入 `DataPlaneMain`。** allocator在DataPlaneMain构造前、auxiliary
    thread和外部thread也会运行；这会制造不必要的Send/启动冲突。
-8. **按 pointer range猜 owner并自动 free。** cutover前bootstrap allocation必须归零；
-   cutover后active `mspace_is_heap_object`未命中就是wrong-scope violation。不得扫描其它heap、
-   回落System/libc或选择另一个heap执行free，否则会破坏VPP active-free invariant并隐藏
-   wrong-scope SVM drop。
+8. **按 pointer range猜 owner并自动 free。** `alloc_free_intercept`为false时Rust
+   `GlobalAlloc`走System；为true后active `mspace_is_heap_object`未命中就是wrong-scope
+   violation。不得扫描其它heap、回落System或选择另一个heap执行free，否则会破坏VPP
+   active-free invariant并隐藏wrong-scope SVM drop。
 
 ## 10. 验证矩阵
 
@@ -1105,10 +1093,9 @@ daemon/app组件必须同批重编译并重建 region。
 | `thread_defaults_to_main_heap` | real OS threads | main/Data Worker登记并落main；短命aux/external thread不登记也落main；其退出后inventory count和每个已登记TLS address仍有效 | D2/D10，V1-V4/V21 |
 | `active_heap_restores_nested_scopes` | infra unit | main -> heap A -> heap B -> A -> main；early return/unwind也恢复；token不可跨thread | D2，V4 |
 | `active_selector_does_not_escape_region_lock` | compile-time lifetime/API checks | 无public `current() -> &'static MemThreadMain`或TLS-derived `&MemHeap`；region heap borrow与`ActiveHeap`均不能越过`RegionLock`或unmap | D2/D8，V4/V16 |
-| `rust_and_c_allocations_use_active_heap` | Rust + linked C probe | Vec/String/HashMap与malloc/calloc/aligned_alloc都落当前heap，alignment/zeroing正确 | D3，V6/V17 |
-| `plugin_allocations_use_host_active_heap` | real plugin DSO load/invoke | plugin在Main/PVT/Data active scopes中分别执行Rust collection与C malloc/realloc/free；pointer属于调用时active mspace；对象在同一scope内drop；DSO不产生第二allocator authority | D2-D4，V6/V19 |
+| `rust_allocations_use_active_heap` | Rust integration | flag false时走System，true时Vec/String/HashMap都落当前heap，alignment/zeroing正确 | D3，V6/V17 |
+| `plugin_allocations_use_host_active_heap` | real plugin DSO load/invoke | plugin在Main/PVT/Data active scopes中执行Rust collection allocate/realloc/free；pointer属于调用时active mspace；对象在同一scope内drop；DSO不产生第二allocator authority | D2-D4，V6/V19 |
 | `wrong_active_heap_free_aborts` | subprocess | 在heap A分配、heap B active时drop，进程abort并输出owner facts；不调用System/其它heap | D3，V6 |
-| `bootstrap_cutover_has_no_live_allocations` | dedicated startup subprocess + test/debug-only allocation observer | early parse owners先drop；只有Copy config与mmap bytes跨scope；observer在intercept publish前为0；注入retained bootstrap block时拒绝cutover且Main Heap/intercept未发布；切换后不执行System/libc free/realloc routing | D3，V20 |
 | `shared_mspace_uses_supplied_range` | C ABI + Rust integration | `MemHeap`控制块与所有block都在base/size内；disable expand；耗尽不回落main | D4/D6，V5/V7 |
 | `root_init_allocates_main_region_from_pvt_heap` | infra subprocess | root无data heap；name/pids/bitmap/`SvmMainRegion`都由pvt heap拥有；`data_base`等于该对象pointer | D6/D7，V9/V12/V13 |
 | `pvt_heap_routes_global_allocations` | infra unit + independent process attach | creator只调用一次`MemHeap::create_at`并把mapping内pointer写入header；attach复用相同pointer；PVT active时Box/String/Vec/Bitmap/HashMap/Pool block均由PVT mspace识别；scope退出恢复previous heap | D2/D6.1，V4/V5/V9/V11 |
@@ -1140,9 +1127,9 @@ git diff --check
 用户已于 2026-09-13 批准 A1-A12，包括：
 
 - `MemMain` / `MemThreadMain` / `MemHeap` 命名与唯一 active authority；
-- A2 的 allocator-owned C TLS 窄例外；
+- A2 的 allocator-owned Rust `thread_local!` 窄例外；
 - 只有process-lifetime runtime threads进入inventory，短命thread只使用未登记TLS default；
-- bootstrap allocation在intercept cutover前归零，不增加切换后provenance routing；
+- `alloc_free_intercept`在Main Heap与main thread active selector就绪后切换，再构造heap inventory；不增加C interposition或provenance routing；
 - Main/process-private/PVT/Data Heap统一使用dlmalloc mspace；
 - SVM region 同 VA/raw-pointer ABI，以及 root bitmap VA切分；
 - `create/attach/unmap`直接维护`client_pids`，删除`RegionMembership`、`join`、
@@ -1152,8 +1139,9 @@ git diff --check
 - 删除已实现的 `SvmRegionHeap`、`SvmHashMap` 和不同 VA layout，不保留兼容层；
 - `third_party/dlmalloc` 的引入与 `libmimalloc-sys`/mimalloc调用的完整删除。
 
-设计 verdict：**Aligned design，已批准，待实施**。active heap、pvt/data heap、root init和
+设计 verdict：**Aligned design，已批准**。active heap、pvt/data heap、root init和
 attach ownership与vendored VPP一致；typed `Result`替代last-error pointer、只登记
 process-lifetime TLS、safe fixed-map、通过SCM_RIGHTS交付backing fd、version最后发布以及
-region owner-death后停止访问是明确的Hammer差异，均有对应验证。当前代码仍是
-H1-H6描述的旧实现，不能因本文完成而声称功能已对齐。
+region owner-death后停止访问是明确的Hammer差异，均有对应验证。Phase 1 allocator、VM map
+与active heap的生产代码路径已经迁移，但评审和验证尚未完成；H2-H6描述的SVM region旧实现仍由
+Phase 2-4迁移，不能因本文完成而声称整个issue已经对齐。

@@ -73,10 +73,6 @@ enum ExampleError {
     },
     #[error("image does not dynamically depend on the shared hammer-infra authority: {path}")]
     SharedInfraDependencyMissing { path: PathBuf },
-    #[error("image embeds an independent mimalloc authority: {path}")]
-    IndependentAllocatorEmbedded { path: PathBuf },
-    #[error("the shared hammer-infra image does not contain the mimalloc authority: {path}")]
-    SharedAllocatorMissing { path: PathBuf },
     #[cfg(not(any(target_os = "macos", target_os = "linux")))]
     #[error("image inspection is unsupported on this platform")]
     ImageInspectionUnsupported,
@@ -245,11 +241,6 @@ fn verify_shared_allocator_images(plugin_path: &Path) -> Result<(), ExampleError
     let infra_path = plugin_path.join(&infra_name);
     require_image(&infra_path)?;
 
-    let infra_symbols = image_symbols(&infra_path)?;
-    if !infra_symbols.contains("mi_reserve_os_memory_ex") {
-        return Err(ExampleError::SharedAllocatorMissing { path: infra_path });
-    }
-
     let mut consumers =
         vec![
             std::env::current_exe().map_err(|source| ExampleError::ImageInspectionIo {
@@ -275,9 +266,6 @@ fn verify_shared_allocator_images(plugin_path: &Path) -> Result<(), ExampleError
         require_image(&path)?;
         if !dynamic_dependencies(&path)?.contains(&infra_name) {
             return Err(ExampleError::SharedInfraDependencyMissing { path });
-        }
-        if image_symbols(&path)?.contains("mi_reserve_os_memory_ex") {
-            return Err(ExampleError::IndependentAllocatorEmbedded { path });
         }
     }
     Ok(())
@@ -306,10 +294,6 @@ fn dynamic_dependencies(path: &Path) -> Result<String, ExampleError> {
 #[cfg(not(any(target_os = "macos", target_os = "linux")))]
 fn dynamic_dependencies(_: &Path) -> Result<String, ExampleError> {
     Err(ExampleError::ImageInspectionUnsupported)
-}
-
-fn image_symbols(path: &Path) -> Result<String, ExampleError> {
-    run_image_tool("nm", &[OsStr::new("-a")], path)
 }
 
 fn run_image_tool(
