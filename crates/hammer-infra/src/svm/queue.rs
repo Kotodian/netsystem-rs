@@ -1,10 +1,12 @@
 //! VPP-style fixed-size shared-memory queues.
 
+use std::cell::UnsafeCell;
 use std::io;
 use std::mem::{MaybeUninit, size_of};
-use std::os::fd::{AsRawFd, OwnedFd};
+use std::os::fd::{AsRawFd, BorrowedFd};
 use std::ptr::NonNull;
-use std::time::Duration;
+use std::sync::atomic::{AtomicI32, AtomicU32, Ordering};
+use std::time::{Duration, Instant};
 
 use posix_sync::condvar::{
     BorrowedCondvar, CondvarBuilder, CondvarClock, CondvarSharing, RawCondvarAlloc, WaitOutcome,
@@ -15,11 +17,6 @@ use posix_sync::mutex::{
 };
 
 const CACHE_LINE_BYTES: usize = 64;
-
-// posix-sync ties a borrowed process-shared primitive to an address-lifetime
-// token. The mapping owner keeps the actual mapping alive; this token only
-// prevents the queue handle from becoming self-referential.
-static SVM_QUEUE_MAPPING_ANCHOR: () = ();
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SvmQueueConfig {
@@ -95,43 +92,59 @@ pub enum SvmQueueError {
     },
 }
 
-/// VPP `svm_queue_t`. The flexible `data[]` region follows this header in the
-/// same caller-owned allocation and is addressed by runtime `elsize`.
-#[repr(C, align(64))]
-struct SvmQueueHeader {
-    mutex: MaybeUninit<RawMutexAlloc>,
-    condvar: MaybeUninit<RawCondvarAlloc>,
-    head: u32,
-    tail: u32,
-    cursize: u32,
+/// Shared queue at a 64-byte-aligned, caller-owned allocation. Elements start
+/// immediately after this naturally aligned object and use runtime `elsize`.
+#[repr(C)]
+pub struct SvmQueue {
+    mutex: UnsafeCell<MaybeUninit<RawMutexAlloc>>,
+    condvar: UnsafeCell<MaybeUninit<RawCondvarAlloc>>,
+    head: UnsafeCell<u32>,
+    tail: UnsafeCell<u32>,
+    cursize: AtomicU32,
     maxsize: u32,
     elsize: u32,
-    consumer_pid: i32,
-    producer_evtfd: i32,
-    consumer_evtfd: i32,
+    consumer_pid: AtomicI32,
+    producer_evtfd: AtomicI32,
+    consumer_evtfd: AtomicI32,
 }
 
-pub struct SvmQueue {
-    header: NonNull<SvmQueueHeader>,
-    mutex: BorrowedMutex<'static, Robust>,
-    condvar: BorrowedCondvar<'static>,
-    producer_event_fd: Option<OwnedFd>,
-    consumer_event_fd: Option<OwnedFd>,
-}
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+const _: () = {
+    use std::mem::{align_of, offset_of};
+
+    assert!(align_of::<SvmQueue>() == 8);
+    assert!(size_of::<SvmQueue>() == 120);
+    assert!(offset_of!(SvmQueue, mutex) == 0);
+    assert!(offset_of!(SvmQueue, condvar) == 40);
+    assert!(offset_of!(SvmQueue, head) == 88);
+    assert!(offset_of!(SvmQueue, tail) == 92);
+    assert!(offset_of!(SvmQueue, cursize) == 96);
+    assert!(offset_of!(SvmQueue, maxsize) == 100);
+    assert!(offset_of!(SvmQueue, elsize) == 104);
+    assert!(offset_of!(SvmQueue, consumer_pid) == 108);
+    assert!(offset_of!(SvmQueue, producer_evtfd) == 112);
+    assert!(offset_of!(SvmQueue, consumer_evtfd) == 116);
+};
 
 pub struct SvmQueueLock<'queue> {
     queue: &'queue SvmQueue,
-    guard: StandardGuard<'queue>,
+    guard: Option<StandardGuard<'queue>>,
     conditional_wait: SvmQueueConditionalWait,
 }
 
+// SAFETY: geometry is immutable after publication; head/tail update under
+// the shared mutex (or exclusive server ring owner) and are accessed atomically
+// so a concurrent attach may validate their bounds without a Rust data race.
+// POSIX state follows the shared mutex.
+// Occupancy, PID and descriptor numbers are independent atomics. The mapping
+// owner must keep this allocation live across all queue borrows and guards.
 unsafe impl Send for SvmQueue {}
 unsafe impl Sync for SvmQueue {}
 
 impl SvmQueue {
     pub fn size_to_alloc(config: &SvmQueueConfig) -> Result<usize, SvmQueueError> {
         validate_config(config)?;
-        size_of::<SvmQueueHeader>()
+        size_of::<Self>()
             .checked_add(
                 (config.nels as usize)
                     .checked_mul(config.elsize as usize)
@@ -140,116 +153,180 @@ impl SvmQueue {
             .ok_or(SvmQueueError::LayoutOverflow)
     }
 
-    /// Initializes VPP's header and its inline `data[]` region at an existing
-    /// caller-owned allocation in the mapped segment.
-    pub(crate) unsafe fn init(
+    /// Initializes the queue in an aligned allocation of at least
+    /// `size_to_alloc(config)` bytes, kept mapped by the caller.
+    pub unsafe fn init(
         base: NonNull<u8>,
         config: &SvmQueueConfig,
-    ) -> Result<Self, SvmQueueError> {
+    ) -> Result<NonNull<Self>, SvmQueueError> {
         assert!(
             base.as_ptr().addr().is_multiple_of(CACHE_LINE_BYTES),
             "queue base is cache-line aligned"
         );
-        let _ = Self::size_to_alloc(config)?;
-        let header = base.cast::<SvmQueueHeader>();
+        Self::size_to_alloc(config)?;
+        let queue = base.cast::<Self>();
         unsafe {
             std::ptr::write(
-                header.as_ptr(),
-                SvmQueueHeader {
-                    mutex: MaybeUninit::uninit(),
-                    condvar: MaybeUninit::uninit(),
-                    head: 0,
-                    tail: 0,
-                    cursize: 0,
+                queue.as_ptr(),
+                Self {
+                    mutex: UnsafeCell::new(MaybeUninit::uninit()),
+                    condvar: UnsafeCell::new(MaybeUninit::uninit()),
+                    head: UnsafeCell::new(0),
+                    tail: UnsafeCell::new(0),
+                    cursize: AtomicU32::new(0),
                     maxsize: config.nels,
                     elsize: config.elsize,
-                    consumer_pid: config.consumer_pid,
-                    producer_evtfd: -1,
-                    consumer_evtfd: -1,
+                    consumer_pid: AtomicI32::new(config.consumer_pid),
+                    producer_evtfd: AtomicI32::new(-1),
+                    consumer_evtfd: AtomicI32::new(-1),
                 },
             );
         }
-        let mutex = unsafe {
+        unsafe {
             MutexBuilder::<Robust>::new()
                 .with_sharing(MutexSharing::Shared)
-                .build_borrowed(
-                    std::ptr::addr_of_mut!((*header.as_ptr()).mutex).cast(),
-                    &SVM_QUEUE_MAPPING_ANCHOR,
-                )
-        };
-        let condvar = unsafe {
+                .build_borrowed((*queue.as_ptr()).mutex.get().cast(), queue.as_ref());
+        }
+        unsafe {
             CondvarBuilder::new()
                 .with_sharing(CondvarSharing::Shared)
                 .with_clock(CondvarClock::Monotonic)
-                .build_borrowed(
-                    std::ptr::addr_of_mut!((*header.as_ptr()).condvar).cast(),
-                    &SVM_QUEUE_MAPPING_ANCHOR,
-                )
-        };
-        Ok(Self {
-            header,
-            mutex,
-            condvar,
-            producer_event_fd: None,
-            consumer_event_fd: None,
-        })
+                .build_borrowed((*queue.as_ptr()).condvar.get().cast(), queue.as_ref());
+        }
+        Ok(queue)
     }
 
-    pub(crate) unsafe fn attach(base: NonNull<u8>) -> Result<Self, SvmQueueError> {
+    /// The caller proves that the allocation remains mapped and is not
+    /// concurrently initialized or destroyed during validation.
+    pub unsafe fn attach(
+        base: NonNull<u8>,
+        allocation_bytes: usize,
+    ) -> Result<NonNull<Self>, SvmQueueError> {
         assert!(
             base.as_ptr().addr().is_multiple_of(CACHE_LINE_BYTES),
             "queue base is cache-line aligned"
         );
-        let header = base.cast::<SvmQueueHeader>();
-        let stored = unsafe { header.as_ref() };
+        if allocation_bytes < size_of::<Self>() {
+            return Err(SvmQueueError::InvalidHeader);
+        }
+        let queue = base.cast::<Self>();
+        let stored = unsafe { queue.as_ref() };
         if stored.maxsize == 0
             || stored.elsize == 0
-            || stored.head >= stored.maxsize
-            || stored.tail >= stored.maxsize
-            || stored.cursize > stored.maxsize
+            || unsafe { AtomicU32::from_ptr(stored.head.get()) }.load(Ordering::Relaxed)
+                >= stored.maxsize
+            || unsafe { AtomicU32::from_ptr(stored.tail.get()) }.load(Ordering::Relaxed)
+                >= stored.maxsize
+            || stored.cursize.load(Ordering::Relaxed) > stored.maxsize
         {
             return Err(SvmQueueError::InvalidHeader);
         }
-        let bytes = size_of::<SvmQueueHeader>()
+        let bytes = size_of::<Self>()
             .checked_add(
                 (stored.maxsize as usize)
                     .checked_mul(stored.elsize as usize)
                     .ok_or(SvmQueueError::LayoutOverflow)?,
             )
             .ok_or(SvmQueueError::LayoutOverflow)?;
-        let _ = bytes;
-        let mutex = unsafe {
-            BorrowedMutex::<Robust>::from_raw(
-                std::ptr::addr_of_mut!((*header.as_ptr()).mutex).cast(),
-                &SVM_QUEUE_MAPPING_ANCHOR,
-            )
-        };
-        let condvar = unsafe {
-            BorrowedCondvar::from_raw(
-                std::ptr::addr_of_mut!((*header.as_ptr()).condvar).cast(),
-                &SVM_QUEUE_MAPPING_ANCHOR,
-                CondvarClock::Monotonic,
-            )
-        };
-        Ok(Self {
-            header,
-            mutex,
-            condvar,
-            producer_event_fd: None,
-            consumer_event_fd: None,
-        })
+        if bytes > allocation_bytes {
+            return Err(SvmQueueError::InvalidHeader);
+        }
+        Ok(queue)
     }
 
+    #[inline]
     pub fn capacity(&self) -> usize {
-        self.header().maxsize as usize
+        self.maxsize as usize
     }
 
+    #[inline]
     pub fn element_size(&self) -> usize {
-        self.header().elsize as usize
+        self.elsize as usize
     }
 
+    #[inline]
     pub fn consumer_pid(&self) -> i32 {
-        self.header().consumer_pid
+        self.consumer_pid.load(Ordering::Relaxed)
+    }
+
+    /// Called only while the mapping's restart owner excludes active users.
+    pub fn set_consumer_pid(&self, pid: i32) {
+        self.consumer_pid.store(pid, Ordering::Relaxed);
+    }
+
+    #[inline]
+    pub fn can_send(&self) -> bool {
+        self.cursize.load(Ordering::Relaxed) < self.maxsize
+    }
+
+    /// Only the sole server main thread may inspect a ring without the mutex.
+    #[inline(always)]
+    pub unsafe fn ring_head_slot_unlocked(&self) -> NonNull<u8> {
+        let head = unsafe { AtomicU32::from_ptr(self.head.get()) }.load(Ordering::Relaxed) as usize;
+        let slot = unsafe { self.data().add(head * self.element_size()) };
+        unsafe { NonNull::new_unchecked(slot) }
+    }
+
+    /// Only the sole server main thread may advance a ring without the mutex.
+    #[inline(always)]
+    pub unsafe fn advance_ring_head_unlocked(&self) {
+        let head = unsafe { AtomicU32::from_ptr(self.head.get()) };
+        let next = head.load(Ordering::Relaxed) + 1;
+        head.store(
+            if next == self.maxsize { 0 } else { next },
+            Ordering::Relaxed,
+        );
+    }
+
+    pub fn add_element<T: SvmQueueElement>(
+        &self,
+        element: &T,
+        wait: SvmQueueConditionalWait,
+    ) -> Result<(), SvmQueueError> {
+        self.check_element_size::<T>()?;
+        self.add(zerocopy::IntoBytes::as_bytes(element), wait)
+    }
+
+    pub fn sub_element<T: SvmQueueElement>(
+        &self,
+        wait: SvmQueueConditionalWait,
+    ) -> Result<T, SvmQueueError> {
+        self.check_element_size::<T>()?;
+        let mut value = MaybeUninit::<T>::uninit();
+        let bytes = unsafe {
+            std::slice::from_raw_parts_mut(
+                value.as_mut_ptr().cast::<MaybeUninit<u8>>(),
+                size_of::<T>(),
+            )
+        };
+        self.sub_into(bytes, wait)?;
+        Ok(unsafe { value.assume_init() })
+    }
+
+    pub fn try_sub_element<T: SvmQueueElement>(&self) -> Result<Option<T>, SvmQueueError> {
+        self.check_element_size::<T>()?;
+        let mut value = MaybeUninit::<T>::uninit();
+        let bytes = unsafe {
+            std::slice::from_raw_parts_mut(
+                value.as_mut_ptr().cast::<MaybeUninit<u8>>(),
+                size_of::<T>(),
+            )
+        };
+        match self.sub2_into(bytes) {
+            Ok(()) => Ok(Some(unsafe { value.assume_init() })),
+            Err(SvmQueueError::Empty) => Ok(None),
+            Err(error) => Err(error),
+        }
+    }
+
+    fn check_element_size<T: SvmQueueElement>(&self) -> Result<(), SvmQueueError> {
+        if size_of::<T>() != self.element_size() {
+            return Err(SvmQueueError::ElementSizeMismatch {
+                requested: size_of::<T>(),
+                stored: self.element_size(),
+            });
+        }
+        Ok(())
     }
 
     pub fn add(
@@ -287,13 +364,23 @@ impl SvmQueue {
         element: &mut [u8],
         conditional_wait: SvmQueueConditionalWait,
     ) -> Result<(), SvmQueueError> {
-        validate_element(self.element_size(), element)?;
+        let output =
+            unsafe { std::slice::from_raw_parts_mut(element.as_mut_ptr().cast(), element.len()) };
+        self.sub_into(output, conditional_wait)
+    }
+
+    fn sub_into(
+        &self,
+        element: &mut [MaybeUninit<u8>],
+        conditional_wait: SvmQueueConditionalWait,
+    ) -> Result<(), SvmQueueError> {
+        validate_element_length(self.element_size(), element.len())?;
         let mut lock = match conditional_wait {
             SvmQueueConditionalWait::Nowait => self.try_lock()?,
             SvmQueueConditionalWait::Wait | SvmQueueConditionalWait::TimedWait(_) => self.lock()?,
         };
         loop {
-            if lock.queue.header().cursize != 0 {
+            if lock.queue.cursize.load(Ordering::Relaxed) != 0 {
                 return lock.sub_nolock(element);
             }
             match conditional_wait {
@@ -309,9 +396,15 @@ impl SvmQueue {
     }
 
     pub fn sub2(&self, element: &mut [u8]) -> Result<(), SvmQueueError> {
-        validate_element(self.element_size(), element)?;
+        let output =
+            unsafe { std::slice::from_raw_parts_mut(element.as_mut_ptr().cast(), element.len()) };
+        self.sub2_into(output)
+    }
+
+    fn sub2_into(&self, element: &mut [MaybeUninit<u8>]) -> Result<(), SvmQueueError> {
+        validate_element_length(self.element_size(), element.len())?;
         let mut lock = self.lock()?;
-        if lock.queue.header().cursize == 0 {
+        if lock.queue.cursize.load(Ordering::Relaxed) == 0 {
             return Err(SvmQueueError::Empty);
         }
         lock.sub_nolock(element)?;
@@ -319,8 +412,8 @@ impl SvmQueue {
     }
 
     pub fn len(&self) -> Result<usize, SvmQueueError> {
-        let _guard = self.lock()?;
-        Ok(self.header().cursize as usize)
+        let guard = self.lock()?;
+        Ok(guard.queue.cursize.load(Ordering::Relaxed) as usize)
     }
 
     pub fn is_empty(&self) -> Result<bool, SvmQueueError> {
@@ -328,14 +421,14 @@ impl SvmQueue {
     }
 
     pub fn is_full(&self) -> Result<bool, SvmQueueError> {
-        let _guard = self.lock()?;
-        Ok(self.header().cursize == self.header().maxsize)
+        let guard = self.lock()?;
+        Ok(guard.queue.cursize.load(Ordering::Relaxed) == self.maxsize)
     }
 
     pub fn lock(&self) -> Result<SvmQueueLock<'_>, SvmQueueError> {
         Ok(SvmQueueLock {
             queue: self,
-            guard: self.acquire(false)?,
+            guard: Some(self.acquire(false)?),
             conditional_wait: SvmQueueConditionalWait::Wait,
         })
     }
@@ -343,58 +436,84 @@ impl SvmQueue {
     pub fn try_lock(&self) -> Result<SvmQueueLock<'_>, SvmQueueError> {
         Ok(SvmQueueLock {
             queue: self,
-            guard: self.acquire(true)?,
+            guard: Some(self.acquire(true)?),
             conditional_wait: SvmQueueConditionalWait::Nowait,
         })
     }
 
-    pub fn set_producer_event_fd(&mut self, fd: OwnedFd) {
-        self.header_mut().producer_evtfd = fd.as_raw_fd();
-        self.producer_event_fd = Some(fd);
+    /// All processes using this shared queue must have corresponding local
+    /// descriptors before event mode is enabled, and retain them while used.
+    /// A shared numeric fd never transfers descriptor ownership.
+    pub unsafe fn set_producer_event_fd(&self, fd: BorrowedFd<'_>) {
+        self.producer_evtfd.store(fd.as_raw_fd(), Ordering::Relaxed);
     }
 
-    pub fn set_consumer_event_fd(&mut self, fd: OwnedFd) {
-        self.header_mut().consumer_evtfd = fd.as_raw_fd();
-        self.consumer_event_fd = Some(fd);
+    /// All processes using this shared queue must have corresponding local
+    /// descriptors before event mode is enabled, and retain them while used.
+    /// A shared numeric fd never transfers descriptor ownership.
+    pub unsafe fn set_consumer_event_fd(&self, fd: BorrowedFd<'_>) {
+        self.consumer_evtfd.store(fd.as_raw_fd(), Ordering::Relaxed);
     }
 
-    /// Destroys the process-shared synchronization objects. The caller frees
-    /// the enclosing allocation through its mapping/region owner.
-    pub(crate) unsafe fn cleanup(&mut self) {
+    /// Destroys POSIX state only; the mapping owner separately frees storage.
+    pub unsafe fn cleanup(&self) {
         unsafe {
-            self.mutex.destroy();
-            self.condvar.destroy();
+            self.borrowed_mutex().destroy();
+            self.borrowed_condvar().destroy();
         }
     }
 
-    fn header(&self) -> &SvmQueueHeader {
-        unsafe { self.header.as_ref() }
+    /// On restart only, under the region lock, with no local queue guard.
+    /// Resetting raw POSIX state after ten failed attempts mirrors the
+    /// implementation-dependent recovery branch in the shared-memory API.
+    pub unsafe fn reset_mutex_for_restart(&self) {
+        let mutex = self.mutex.get().cast::<libc::pthread_mutex_t>();
+        for _ in 0..10 {
+            if unsafe { libc::pthread_mutex_trylock(mutex) } == 0 {
+                let status = unsafe { libc::pthread_mutex_unlock(mutex) };
+                assert_eq!(status, 0, "restart queue mutex unlock failed");
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        unsafe { std::ptr::write_bytes(self.mutex.get(), 0, 1) };
     }
 
-    fn header_mut(&mut self) -> &mut SvmQueueHeader {
-        unsafe { self.header.as_mut() }
+    fn borrowed_mutex(&self) -> BorrowedMutex<'_, Robust> {
+        unsafe { BorrowedMutex::from_raw(self.mutex.get().cast(), self) }
+    }
+
+    fn borrowed_condvar(&self) -> BorrowedCondvar<'_> {
+        unsafe {
+            BorrowedCondvar::from_raw(self.condvar.get().cast(), self, CondvarClock::Monotonic)
+        }
     }
 
     fn data(&self) -> *mut u8 {
         unsafe {
-            self.header
-                .as_ptr()
+            (self as *const Self)
                 .cast::<u8>()
-                .add(size_of::<SvmQueueHeader>())
+                .add(size_of::<Self>())
+                .cast_mut()
         }
     }
 
     fn acquire(&self, try_only: bool) -> Result<StandardGuard<'_>, SvmQueueError> {
+        let mutex = self.borrowed_mutex();
         let result = if try_only {
-            unsafe { self.mutex.try_lock() }.map_err(|source| SvmQueueError::Lock { source })?
+            unsafe { mutex.try_lock() }.map_err(|source| SvmQueueError::Lock { source })?
         } else {
-            Some(unsafe { self.mutex.lock() }.map_err(|source| SvmQueueError::Lock { source })?)
+            Some(unsafe { mutex.lock() }.map_err(|source| SvmQueueError::Lock { source })?)
         };
         let Some(container) = result else {
             return Err(SvmQueueError::LockBusy);
         };
         match container {
-            RobustGuardContainer::Standard(guard) => Ok(guard),
+            RobustGuardContainer::Standard(guard) => {
+                // The borrowed mutex contains no allocation: this queue owns
+                // the mapped POSIX storage for the full returned guard borrow.
+                Ok(unsafe { std::mem::transmute::<StandardGuard<'_>, StandardGuard<'_>>(guard) })
+            }
             RobustGuardContainer::Indeterminate(guard) => {
                 let guard = guard
                     .make_consistent()
@@ -407,14 +526,13 @@ impl SvmQueue {
 
     fn signal(&self, is_producer: bool, operation: SvmQueueOperation) -> Result<(), SvmQueueError> {
         let fd = if is_producer {
-            self.producer_event_fd.as_ref()
+            self.producer_evtfd.load(Ordering::Relaxed)
         } else {
-            self.consumer_event_fd.as_ref()
+            self.consumer_evtfd.load(Ordering::Relaxed)
         };
-        if let Some(fd) = fd {
+        if fd >= 0 {
             let value = 1_u64.to_ne_bytes();
-            let written =
-                unsafe { libc::write(fd.as_raw_fd(), value.as_ptr().cast(), value.len()) };
+            let written = unsafe { libc::write(fd, value.as_ptr().cast(), value.len()) };
             if written != value.len() as isize {
                 return Err(SvmQueueError::EventSignalAfterCommit {
                     operation,
@@ -422,7 +540,7 @@ impl SvmQueue {
                 });
             }
         } else {
-            unsafe { self.condvar.notify_all() }
+            unsafe { self.borrowed_condvar().notify_all() }
                 .map_err(|source| SvmQueueError::SignalAfterCommit { operation, source })?;
         }
         Ok(())
@@ -432,7 +550,7 @@ impl SvmQueue {
 impl SvmQueueLock<'_> {
     pub fn add_nolock(&mut self, element: &[u8]) -> Result<(), SvmQueueError> {
         validate_element(self.queue.element_size(), element)?;
-        while self.queue.header().cursize == self.queue.header().maxsize {
+        while self.queue.cursize.load(Ordering::Relaxed) == self.queue.maxsize {
             match self.conditional_wait {
                 SvmQueueConditionalWait::Nowait => return Err(SvmQueueError::QueueFull),
                 SvmQueueConditionalWait::Wait => self.wait()?,
@@ -443,7 +561,7 @@ impl SvmQueueLock<'_> {
                 }
             }
         }
-        let was_empty = self.queue.header().cursize == 0;
+        let was_empty = self.queue.cursize.load(Ordering::Relaxed) == 0;
         self.write_one(element);
         if was_empty {
             self.queue.signal(true, SvmQueueOperation::Add)?;
@@ -454,7 +572,10 @@ impl SvmQueueLock<'_> {
     pub fn add2_nolock(&mut self, first: &[u8], second: &[u8]) -> Result<(), SvmQueueError> {
         validate_element(self.queue.element_size(), first)?;
         validate_element(self.queue.element_size(), second)?;
-        while self.queue.header().maxsize - self.queue.header().cursize < 2 {
+        if self.queue.maxsize < 2 {
+            return Err(SvmQueueError::QueueFull);
+        }
+        while self.queue.maxsize - self.queue.cursize.load(Ordering::Relaxed) < 2 {
             match self.conditional_wait {
                 SvmQueueConditionalWait::Nowait => return Err(SvmQueueError::QueueFull),
                 SvmQueueConditionalWait::Wait => self.wait()?,
@@ -465,7 +586,7 @@ impl SvmQueueLock<'_> {
                 }
             }
         }
-        let was_empty = self.queue.header().cursize == 0;
+        let was_empty = self.queue.cursize.load(Ordering::Relaxed) == 0;
         self.write_one(first);
         self.write_one(second);
         if was_empty {
@@ -475,12 +596,19 @@ impl SvmQueueLock<'_> {
     }
 
     pub fn sub_raw(&mut self, element: &mut [u8]) -> Result<(), SvmQueueError> {
-        validate_element(self.queue.element_size(), element)?;
-        self.sub_nolock(element)
+        let output =
+            unsafe { std::slice::from_raw_parts_mut(element.as_mut_ptr().cast(), element.len()) };
+        validate_element_length(self.queue.element_size(), output.len())?;
+        self.sub_nolock(output)
     }
 
     pub fn wait(&mut self) -> Result<(), SvmQueueError> {
-        match unsafe { self.queue.condvar.wait(&mut self.guard) } {
+        if self.queue.producer_evtfd.load(Ordering::Relaxed) >= 0 {
+            self.wait_on_event(None)?;
+            return Ok(());
+        }
+        let guard = self.guard.as_mut().expect("queue lock held during wait");
+        match unsafe { self.queue.borrowed_condvar().wait(guard) } {
             Ok(()) => Ok(()),
             Err(posix_sync::condvar::CondvarWaitError::OwnerDead) => self.owner_died(),
             Err(source) => Err(SvmQueueError::Wait { source }),
@@ -488,7 +616,14 @@ impl SvmQueueLock<'_> {
     }
 
     pub fn timed_wait(&mut self, timeout: Duration) -> Result<WaitOutcome, SvmQueueError> {
-        match unsafe { self.queue.condvar.wait_for(&mut self.guard, timeout) } {
+        if self.queue.producer_evtfd.load(Ordering::Relaxed) >= 0 {
+            return self.wait_on_event(Some(Instant::now() + timeout));
+        }
+        let guard = self
+            .guard
+            .as_mut()
+            .expect("queue lock held during timed wait");
+        match unsafe { self.queue.borrowed_condvar().wait_for(guard, timeout) } {
             Ok(outcome) => Ok(outcome),
             Err(posix_sync::condvar::CondvarWaitError::OwnerDead) => {
                 self.owner_died().map(|_| WaitOutcome::Notified)
@@ -501,40 +636,72 @@ impl SvmQueueLock<'_> {
         self.queue.signal(is_producer, SvmQueueOperation::Add)
     }
 
+    fn wait_on_event(&mut self, deadline: Option<Instant>) -> Result<WaitOutcome, SvmQueueError> {
+        let occupancy = self.queue.cursize.load(Ordering::Relaxed);
+        drop(self.guard.take());
+        while self.queue.cursize.load(Ordering::Acquire) == occupancy {
+            if deadline.is_some_and(|until| Instant::now() >= until) {
+                self.guard = Some(self.queue.acquire(false)?);
+                return Ok(WaitOutcome::TimedOut);
+            }
+            std::hint::spin_loop();
+        }
+        self.guard = Some(self.queue.acquire(false)?);
+        Ok(WaitOutcome::Notified)
+    }
+
+    #[inline(always)]
+    pub fn ring_head_slot(&mut self) -> NonNull<u8> {
+        let head =
+            unsafe { AtomicU32::from_ptr(self.queue.head.get()) }.load(Ordering::Relaxed) as usize;
+        let slot = unsafe { self.queue.data().add(head * self.queue.element_size()) };
+        unsafe { NonNull::new_unchecked(slot) }
+    }
+
+    #[inline(always)]
+    pub fn advance_ring_head(&mut self) {
+        let head = unsafe { AtomicU32::from_ptr(self.queue.head.get()) };
+        let next = head.load(Ordering::Relaxed) + 1;
+        head.store(
+            if next == self.queue.maxsize { 0 } else { next },
+            Ordering::Relaxed,
+        );
+    }
+
     fn write_one(&mut self, element: &[u8]) {
-        let header = unsafe { &mut *self.queue.header.as_ptr() };
-        let slot = header.tail as usize;
-        let element_size = header.elsize as usize;
+        let tail = unsafe { AtomicU32::from_ptr(self.queue.tail.get()) };
+        let slot = tail.load(Ordering::Relaxed) as usize;
+        let element_size = self.queue.element_size();
         let destination = unsafe { self.queue.data().add(slot * element_size) };
         unsafe {
             std::ptr::copy_nonoverlapping(element.as_ptr(), destination, element_size);
         }
-        header.tail = if header.tail + 1 == header.maxsize {
-            0
-        } else {
-            header.tail + 1
-        };
-        header.cursize += 1;
+        let next = slot as u32 + 1;
+        tail.store(
+            if next == self.queue.maxsize { 0 } else { next },
+            Ordering::Relaxed,
+        );
+        self.queue.cursize.fetch_add(1, Ordering::Release);
     }
 
-    fn sub_nolock(&mut self, element: &mut [u8]) -> Result<(), SvmQueueError> {
-        if self.queue.header().cursize == 0 {
+    fn sub_nolock(&mut self, element: &mut [MaybeUninit<u8>]) -> Result<(), SvmQueueError> {
+        if self.queue.cursize.load(Ordering::Relaxed) == 0 {
             return Err(SvmQueueError::Empty);
         }
-        let header = unsafe { &mut *self.queue.header.as_ptr() };
-        let slot = header.head as usize;
-        let element_size = header.elsize as usize;
+        let head = unsafe { AtomicU32::from_ptr(self.queue.head.get()) };
+        let slot = head.load(Ordering::Relaxed) as usize;
+        let element_size = self.queue.element_size();
         let source = unsafe { self.queue.data().add(slot * element_size) };
         unsafe {
-            std::ptr::copy_nonoverlapping(source, element.as_mut_ptr(), element_size);
+            std::ptr::copy_nonoverlapping(source, element.as_mut_ptr().cast(), element_size);
         }
-        let was_full = header.cursize == header.maxsize;
-        header.head = if header.head + 1 == header.maxsize {
-            0
-        } else {
-            header.head + 1
-        };
-        header.cursize -= 1;
+        let was_full = self.queue.cursize.load(Ordering::Relaxed) == self.queue.maxsize;
+        let next = slot as u32 + 1;
+        head.store(
+            if next == self.queue.maxsize { 0 } else { next },
+            Ordering::Relaxed,
+        );
+        self.queue.cursize.fetch_sub(1, Ordering::Release);
         if was_full {
             self.queue.signal(false, SvmQueueOperation::Sub)?;
         }
@@ -543,6 +710,8 @@ impl SvmQueueLock<'_> {
 
     fn owner_died(&mut self) -> Result<(), SvmQueueError> {
         self.guard
+            .as_mut()
+            .expect("queue lock held after owner death")
             .mark_consistent()
             .map_err(|source| SvmQueueError::NotRecoverable { source })?;
         Err(SvmQueueError::OwnerDied)
@@ -563,11 +732,12 @@ fn validate_config(config: &SvmQueueConfig) -> Result<(), SvmQueueError> {
 }
 
 fn validate_element(expected: usize, element: &[u8]) -> Result<(), SvmQueueError> {
-    if element.len() != expected {
-        return Err(SvmQueueError::ElementLengthMismatch {
-            expected,
-            actual: element.len(),
-        });
+    validate_element_length(expected, element.len())
+}
+
+fn validate_element_length(expected: usize, actual: usize) -> Result<(), SvmQueueError> {
+    if actual != expected {
+        return Err(SvmQueueError::ElementLengthMismatch { expected, actual });
     }
     Ok(())
 }
@@ -580,53 +750,4 @@ pub trait SvmQueueElement:
 impl<T> SvmQueueElement for T where
     T: zerocopy::KnownLayout + zerocopy::FromBytes + zerocopy::Immutable + zerocopy::IntoBytes
 {
-}
-
-pub struct SvmQueueElements<T: SvmQueueElement> {
-    queue: SvmQueue,
-    _element: std::marker::PhantomData<fn() -> T>,
-}
-
-impl<T: SvmQueueElement> SvmQueueElements<T> {
-    pub(crate) fn from_raw(queue: SvmQueue) -> Self {
-        Self {
-            queue,
-            _element: std::marker::PhantomData,
-        }
-    }
-
-    pub fn add(
-        &self,
-        element: &T,
-        conditional_wait: SvmQueueConditionalWait,
-    ) -> Result<(), SvmQueueError> {
-        self.queue.add(element.as_bytes(), conditional_wait)
-    }
-
-    pub fn add2(
-        &self,
-        first: &T,
-        second: &T,
-        conditional_wait: SvmQueueConditionalWait,
-    ) -> Result<(), SvmQueueError> {
-        self.queue
-            .add2(first.as_bytes(), second.as_bytes(), conditional_wait)
-    }
-
-    pub fn sub(&self, conditional_wait: SvmQueueConditionalWait) -> Result<T, SvmQueueError> {
-        let mut bytes = vec![0_u8; size_of::<T>()];
-        self.queue.sub(&mut bytes, conditional_wait)?;
-        T::read_from_bytes(&bytes).map_err(|_| SvmQueueError::InvalidHeader)
-    }
-
-    pub fn try_sub(&self) -> Result<Option<T>, SvmQueueError> {
-        let mut bytes = vec![0_u8; size_of::<T>()];
-        match self.queue.sub2(&mut bytes) {
-            Ok(()) => T::read_from_bytes(&bytes)
-                .map(Some)
-                .map_err(|_| SvmQueueError::InvalidHeader),
-            Err(SvmQueueError::Empty) => Ok(None),
-            Err(error) => Err(error),
-        }
-    }
 }

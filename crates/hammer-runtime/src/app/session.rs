@@ -425,7 +425,7 @@ impl AppSession {
             },
         )?;
         let copied = self.rx_fifo.peek(offset, payload_len.min(out.len()), out);
-        self.rx_fifo.dequeue_drop(total);
+        self.rx_fifo.drop_dequeue(total);
         self.publish_rx_dequeue(total);
         Ok(Some((header, copied)))
     }
@@ -441,7 +441,7 @@ impl AppSession {
     /// the app has consumed them. Mirrors VPP `svm_fifo_dequeue`.
     #[inline]
     pub fn consume_rx(&self, len: usize) -> usize {
-        let dropped = self.rx_fifo.dequeue_drop(len);
+        let dropped = self.rx_fifo.drop_dequeue(len);
         self.publish_rx_dequeue(dropped);
         dropped
     }
@@ -510,7 +510,7 @@ impl AppSession {
     /// `SessionEvtType::TxDeq` (edge-triggered by FIFO dequeue notification).
     #[inline]
     pub fn drop_tx_acked(&self, len: usize) -> Result<usize, AppSessionError> {
-        let dropped = self.tx_fifo.dequeue_drop(len);
+        let dropped = self.tx_fifo.drop_dequeue(len);
         self.publish_tx_dequeue(dropped)?;
         Ok(dropped)
     }
@@ -648,10 +648,15 @@ impl AppSession {
         self.tx_fifo.clear_deq_notification();
     }
 
-    /// Reset all state (used on session close / reuse).
-    pub fn clear(&self) {
-        self.rx_fifo.clear();
-        self.tx_fifo.clear();
+    /// Reset all state after session close, once other FIFO owners have
+    /// released their Arc references. Reuse requires exclusive FIFO access.
+    pub fn clear(&mut self) {
+        Arc::get_mut(&mut self.rx_fifo)
+            .expect("reset requires exclusive RX FIFO ownership")
+            .clear();
+        Arc::get_mut(&mut self.tx_fifo)
+            .expect("reset requires exclusive TX FIFO ownership")
+            .clear();
         self.evt_q.clear();
     }
 
@@ -663,7 +668,7 @@ impl AppSession {
         loop {
             let read = self.rx_fifo.peek(0, out.len(), out);
             if read != 0 || out.is_empty() {
-                let dropped = self.rx_fifo.dequeue_drop(read);
+                let dropped = self.rx_fifo.drop_dequeue(read);
                 self.publish_rx_dequeue(dropped);
                 return Ok(read);
             }

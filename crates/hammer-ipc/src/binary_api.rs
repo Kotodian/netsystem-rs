@@ -8,8 +8,9 @@ pub mod api;
 pub mod table;
 pub use api::{ApiMain, ApiMsgConfig, ApiMsgData, ApiMsgRange, ApiVersion};
 pub mod codec;
-pub use codec::{Array, Deserializer, Serializer, deserialize, serialize};
+pub use codec::{Array, Deserializer, Serializer, deserialize, serialize, serialize_uninit};
 pub mod definition;
+pub mod memory_shared;
 pub use definition::{Api, Block, Field, Service, Typedef};
 
 use std::io::{self, Read, Write};

@@ -1076,6 +1076,8 @@ name = "hammer-ipc"
 version = "0.1.0"
 dependencies = [
  "hammer-component-macros",
+ "hammer-infra",
+ "hammer-runtime",
  "hammer-stats",
  "libc",
  "memmap2",

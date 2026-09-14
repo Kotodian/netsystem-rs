@@ -83,7 +83,9 @@ Use Rust 2024 conventions and rustfmt defaults: 4-space indentation, `snake_case
 
 - Do **not** introduce underscore-prefixed variable names such as `_value`. If a parameter or pattern slot is intentionally unused, use the bare `_` pattern. If a local binding is unused, delete it and the work that produced it.
 - Enforce architectural boundaries with visibility, traits, and narrow re-exports instead of comments or convention.
-- Do not introduce `thread_local!` state. Thread-bound state must be owned
+- Do not introduce `thread_local!` state except the Binary API's `my_api_main`
+  selector, which follows VPP's per-thread current-main pointer and stores no
+  packet or worker protocol state. Other thread-bound state must be owned
   directly by the runtime, worker, Graph Node, or other value that owns that
   thread lifecycle. A shared Main that contains fixed per-thread values must
   construct its existing `Vec`, slice, or `Pool` entries before worker launch;
