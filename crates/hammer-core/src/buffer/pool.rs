@@ -177,8 +177,9 @@ impl BufferMain {
             .pools
             .iter()
             .find(|pool| {
-                let base = pool.mapping.base() as usize;
-                address >= base && address - base < pool.mapping.size()
+                let mapping = pool.mapping();
+                let base = mapping.base() as usize;
+                address >= base && address - base < mapping.size()
             })
             .expect("Buffer index belongs to a registered Pool");
         // Validate the address before reading its header. The header owns
@@ -197,6 +198,11 @@ impl BufferMain {
 }
 
 impl BufferPool {
+    #[inline]
+    fn mapping(&self) -> &hammer_infra::physmem::PhysmemMap {
+        hammer_infra::physmem::PhysmemMain::global().get_map(self.mapping_index)
+    }
+
     fn slot(&self, index: u32) -> usize {
         assert_ne!(index, 0, "Buffer Index zero is invalid");
         let address = BufferMain::global().buffer_mem_start + ((index as usize) << 6);
@@ -210,14 +216,15 @@ impl BufferPool {
             0,
             "Buffer index is a slot boundary"
         );
-        let end = self.mapping.base() as usize + self.mapping.size();
+        let mapping = self.mapping();
+        let end = mapping.base() as usize + mapping.size();
         assert!(
             address < end - self.allocation_size,
             "Buffer index exceeds Pool slots"
         );
         assert_eq!(
-            address / self.mapping.page_size(),
-            (address + self.allocation_size) / self.mapping.page_size(),
+            address / mapping.page_size(),
+            (address + self.allocation_size) / mapping.page_size(),
             "Buffer index identifies a non-crossing page slot"
         );
         offset / self.allocation_size
@@ -231,10 +238,11 @@ impl BufferPool {
             "Buffer {index} is allocated"
         );
         let slot = self.slot(index);
-        let offset = self.first_buffer - self.mapping.base() as usize + slot * self.allocation_size;
+        let mapping = self.mapping();
+        let offset = self.first_buffer - mapping.base() as usize + slot * self.allocation_size;
         // SAFETY: slot validates alignment, mapping bounds and page containment;
         // the caller retains readable ownership of the initialized segment.
-        unsafe { &*self.mapping.base().add(offset).cast::<Buffer>() }
+        unsafe { &*mapping.base().add(offset).cast::<Buffer>() }
     }
 
     unsafe fn buffer_mut(&self, index: u32) -> &mut Buffer {
@@ -244,10 +252,11 @@ impl BufferPool {
             "Buffer {index} is allocated"
         );
         let slot = self.slot(index);
-        let offset = self.first_buffer - self.mapping.base() as usize + slot * self.allocation_size;
+        let mapping = self.mapping();
+        let offset = self.first_buffer - mapping.base() as usize + slot * self.allocation_size;
         // SAFETY: the same slot validation applies; the caller owns this segment
         // exclusively, including when restoring a slot removed from its cache.
-        unsafe { &mut *self.mapping.base().add(offset).cast::<Buffer>() }
+        unsafe { &mut *mapping.base().add(offset).cast::<Buffer>() }
     }
 
     pub(super) fn alloc_indices(

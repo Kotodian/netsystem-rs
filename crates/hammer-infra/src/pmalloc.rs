@@ -56,6 +56,7 @@ pub struct PmallocArena {
     pub page_indices: Vec<u32>,
 }
 
+#[repr(align(64))]
 pub struct PmallocMain {
     pub flags: u32,
     pub base: usize,
@@ -142,6 +143,27 @@ impl PmallocMain {
         self.arenas
             .get(arena_index)
             .expect("pmalloc page has a live arena")
+    }
+
+    #[inline]
+    pub fn arena(&self, index: u32) -> &PmallocArena {
+        self.arenas
+            .get(index)
+            .expect("pmalloc arena index names a live arena")
+    }
+
+    #[inline]
+    pub fn page_size_bytes(&self) -> usize {
+        Self::page_size(self.default_log2_page_size)
+    }
+
+    #[inline]
+    pub fn page_address_for_index(&self, index: u32) -> usize {
+        assert!(
+            (index as usize) < self.pages.len(),
+            "pmalloc page index is live"
+        );
+        self.base + ((index as usize) << self.default_log2_page_size)
     }
 
     #[inline]

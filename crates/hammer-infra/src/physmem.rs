@@ -1,20 +1,15 @@
-//! VPP-style physmem shared map for buffer packet regions.
-//!
-//! Packet slots are carved from this mapped span. Freelist metadata stays on
-//! the main heap (see Buffer Arena). This is independent of [`SvmRegion`].
+//! Process-wide physical-memory authority for packet Buffer mappings.
 
-use std::ffi::CString;
 use std::fmt;
 use std::io;
+use std::num::NonZeroUsize;
 use std::os::fd::RawFd;
-#[cfg(target_os = "linux")]
-use std::path::Path;
-use std::path::PathBuf;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::OnceLock;
 
+use crate::align::CACHE_LINE;
 use crate::mem::PageSize;
-
-static PHYSMEM_COUNTER: AtomicU64 = AtomicU64::new(1);
+use crate::pmalloc::PmallocMain;
+use crate::pool::Pool;
 
 #[derive(Debug)]
 pub enum PhysmemError {
@@ -46,11 +41,11 @@ pub enum PhysmemError {
     HugePageUnsupported {
         requested: PageSize,
         page_size: usize,
-        path: PathBuf,
+        path: std::path::PathBuf,
     },
     HugePagePool {
         operation: &'static str,
-        path: PathBuf,
+        path: std::path::PathBuf,
         requested: PageSize,
         page_size: usize,
         numa_node: u32,
@@ -91,10 +86,9 @@ impl fmt::Display for PhysmemError {
                     "physmem page size `{requested}` does not fit usize"
                 )
             }
-            Self::UnsupportedPageSize { requested } => write!(
-                formatter,
-                "physmem page size `{requested}` is unsupported on this platform"
-            ),
+            Self::UnsupportedPageSize { requested } => {
+                write!(formatter, "physmem page size `{requested}` is unsupported")
+            }
             Self::PageSizeQuery { source } => {
                 write!(formatter, "failed to query the OS page size: {source}")
             }
@@ -105,10 +99,12 @@ impl fmt::Display for PhysmemError {
                 write!(formatter, "failed to size physmem backing: {source}")
             }
             Self::Map { source } => write!(formatter, "failed to map physmem backing: {source}"),
-            Self::HugePageDiscovery { requested, source } => write!(
-                formatter,
-                "failed to resolve HugeTLB size for `{requested}`: {source}"
-            ),
+            Self::HugePageDiscovery { requested, source } => {
+                write!(
+                    formatter,
+                    "failed to resolve HugeTLB size for `{requested}`: {source}"
+                )
+            }
             Self::HugePageUnsupported {
                 requested,
                 page_size,
@@ -185,184 +181,203 @@ impl std::error::Error for PhysmemError {
     }
 }
 
-#[cfg(target_os = "linux")]
-pub(crate) struct MappedRegion {
-    base: *mut u8,
-    size: usize,
-    fd: RawFd,
+#[repr(align(64))]
+pub struct PhysmemMain {
+    flags: u32,
+    base_addr: usize,
+    max_size: usize,
+    maps: Pool<PhysmemMap>,
+    pmalloc_main: PmallocMain,
 }
 
-#[cfg(target_os = "linux")]
-impl MappedRegion {
-    #[inline]
-    pub(crate) fn base(&self) -> *mut u8 {
-        self.base
-    }
-
-    #[inline]
-    pub(crate) fn size(&self) -> usize {
-        self.size
-    }
-
-    #[inline]
-    fn into_parts(mut self) -> (*mut u8, usize, RawFd) {
-        let parts = (self.base, self.size, self.fd);
-        self.base = std::ptr::null_mut();
-        self.size = 0;
-        self.fd = -1;
-        parts
-    }
-
-    #[inline]
-    pub(crate) fn retain_for_process_lifetime(mut self) {
-        self.base = std::ptr::null_mut();
-        self.size = 0;
-        self.fd = -1;
-    }
-}
-
-#[cfg(target_os = "linux")]
-impl Drop for MappedRegion {
-    fn drop(&mut self) {
-        if !self.base.is_null() && self.size != 0 {
-            // SAFETY: this object exclusively owns the mapping for its entire
-            // recorded length until ownership is transferred to the main heap.
-            unsafe { libc::munmap(self.base.cast(), self.size) };
-        }
-        if self.fd >= 0 {
-            // SAFETY: this object owns the descriptor and closes it once.
-            unsafe { libc::close(self.fd) };
-        }
-    }
-}
-
-/// NUMA-aware shared mmap arena used as the Buffer Arena packet region.
 pub struct PhysmemMap {
+    index: u32,
+    fd: RawFd,
     base: *mut u8,
     size: usize,
+    n_pages: u32,
+    page_table: Vec<usize>,
+    log2_page_size: u32,
     numa_node: u32,
-    page_size: usize,
-    hugetlb: bool,
-    fd: RawFd,
-    fd_owned: bool,
 }
 
 unsafe impl Send for PhysmemMap {}
 unsafe impl Sync for PhysmemMap {}
 
-impl PhysmemMap {
-    /// Create a shared map sized for buffer packet storage.
-    ///
-    /// `name` is retained for VPP-shaped call sites; the OS object uses a short
-    /// unique token because macOS `shm_open` names are length-limited.
-    pub fn create(
-        _: &str,
-        size: usize,
-        requested_page_size: PageSize,
-        numa_node: u32,
-    ) -> Result<Self, PhysmemError> {
-        if size == 0 {
-            return Err(PhysmemError::InvalidSize { requested: size });
-        }
-        #[cfg(not(target_os = "linux"))]
-        if !requested_page_size.is_supported_on_current_platform() {
-            return Err(PhysmemError::UnsupportedPageSize {
-                requested: requested_page_size,
+pub static PHYSMEM_MAIN: OnceLock<PhysmemMain> = OnceLock::new();
+
+const INVALID_MAP_INDEX: u32 = u32::MAX;
+
+impl PhysmemMain {
+    pub fn init(
+        base_addr: Option<NonZeroUsize>,
+        max_size: usize,
+        map_size: usize,
+        page_size: PageSize,
+        numa_nodes: &[u32],
+    ) -> Result<&'static Self, PhysmemError> {
+        assert!(
+            PHYSMEM_MAIN.get().is_none(),
+            "Physmem Main initializes once"
+        );
+        assert!(!numa_nodes.is_empty(), "Physmem Main requires a NUMA node");
+        if map_size == 0 {
+            return Err(PhysmemError::InvalidSize {
+                requested: map_size,
             });
         }
-        let ordinary_page_size = PageSize::Default
+        let page_bytes = page_size
             .bytes()
-            .map_err(|source| PhysmemError::PageSizeQuery { source })?;
-        let page_bytes =
-            requested_page_size
-                .bytes()
-                .map_err(|source| PhysmemError::HugePageDiscovery {
-                    requested: requested_page_size,
-                    source,
-                })?;
-        let hugetlb = page_bytes != ordinary_page_size;
-        #[cfg(not(target_os = "linux"))]
-        if hugetlb {
+            .map_err(|source| PhysmemError::HugePageDiscovery {
+                requested: page_size,
+                source,
+            })?;
+        if !page_bytes.is_power_of_two() {
             return Err(PhysmemError::UnsupportedPageSize {
-                requested: requested_page_size,
+                requested: page_size,
             });
         }
-        let total = checked_align_up(size, page_bytes).ok_or(PhysmemError::PageSizeOverflow {
-            requested: requested_page_size,
-        })?;
-        #[cfg(target_os = "linux")]
-        let (base, fd, fd_owned) = {
-            // VPP's physmem shared-map path applies NUMA placement to both
-            // ordinary and huge pages before their first fault.
-            let (base, _, fd) = map_pages(
-                total,
-                requested_page_size,
-                page_bytes,
-                numa_node,
-                true,
-                page_bytes,
-            )?
-            .into_parts();
-            (base, fd, true)
+        let log2_page_size = page_bytes.trailing_zeros();
+        let mut pmalloc_main = PmallocMain::new();
+        pmalloc_main
+            .initialize(base_addr, max_size)
+            .map_err(|source| PhysmemError::Map {
+                source: io::Error::other(source),
+            })?;
+        let mut main = Self {
+            flags: pmalloc_main.flags,
+            base_addr: pmalloc_main.base,
+            max_size: (pmalloc_main.max_pages as usize)
+                .saturating_mul(pmalloc_main.page_size_bytes()),
+            maps: Pool::with_capacity(numa_nodes.len()),
+            pmalloc_main,
         };
-
-        #[cfg(not(target_os = "linux"))]
-        let (base, fd, fd_owned) = {
-            let (cname, fd) = loop {
-                let counter = PHYSMEM_COUNTER.fetch_add(1, Ordering::Relaxed);
-                let label = format!("/hpm{}-{counter}", std::process::id());
-                let cname = CString::new(label).expect("generated shm name contains no NUL");
-                let fd = unsafe {
-                    libc::shm_open(
-                        cname.as_ptr(),
-                        libc::O_CREAT | libc::O_EXCL | libc::O_RDWR,
-                        0o600,
-                    )
-                };
-                if fd >= 0 {
-                    break (cname, fd);
-                }
-                if std::io::Error::last_os_error().raw_os_error() != Some(libc::EEXIST) {
-                    return Err(PhysmemError::Create {
-                        source: io::Error::last_os_error(),
-                    });
-                }
-            };
-            unsafe { libc::shm_unlink(cname.as_ptr()) };
-            if unsafe { libc::ftruncate(fd, total as libc::off_t) } != 0 {
-                let source = io::Error::last_os_error();
-                unsafe { libc::close(fd) };
-                return Err(PhysmemError::Truncate { source });
-            }
-            let base = unsafe {
-                libc::mmap(
-                    std::ptr::null_mut(),
-                    total,
-                    libc::PROT_READ | libc::PROT_WRITE,
-                    libc::MAP_SHARED,
-                    fd,
-                    0,
-                )
-            };
-            if base == libc::MAP_FAILED {
-                let source = io::Error::last_os_error();
-                unsafe { libc::close(fd) };
-                return Err(PhysmemError::Map { source });
-            }
-            (base.cast::<u8>(), fd, true)
-        };
-
-        Ok(Self {
-            base,
-            size: total,
-            numa_node,
-            page_size: page_bytes,
-            hugetlb,
-            fd,
-            fd_owned,
-        })
+        for &numa_node in numa_nodes {
+            main.shared_map_create("buffers", map_size, log2_page_size, numa_node)?;
+        }
+        assert!(
+            PHYSMEM_MAIN.set(main).is_ok(),
+            "Physmem Main initializes once"
+        );
+        Ok(Self::global())
     }
 
+    pub fn global() -> &'static Self {
+        PHYSMEM_MAIN
+            .get()
+            .expect("Physmem Main is published before Buffer Main")
+    }
+
+    #[inline]
+    pub fn base_addr(&self) -> usize {
+        self.base_addr
+    }
+
+    #[inline]
+    pub fn max_size(&self) -> usize {
+        self.max_size
+    }
+
+    #[inline]
+    pub fn flags(&self) -> u32 {
+        self.flags
+    }
+
+    #[inline]
+    pub fn get_map(&self, index: u32) -> &PhysmemMap {
+        self.maps
+            .get(index)
+            .expect("physmem map index names a live map")
+    }
+
+    #[inline]
+    pub fn get_page_index(&self, address: usize) -> u32 {
+        self.pmalloc_main.get_page_index(address)
+    }
+
+    #[inline]
+    pub fn get_pa(&self, address: usize) -> usize {
+        self.pmalloc_main.get_pa(address)
+    }
+
+    #[inline]
+    pub fn convert_to_phys_addrs_with_offset(&self, addresses: &mut [usize], offset: i32) {
+        self.pmalloc_main
+            .convert_to_phys_addrs_with_offset(addresses, offset);
+    }
+
+    #[inline]
+    pub fn convert_to_phys_addrs(&self, addresses: &mut [usize]) {
+        self.pmalloc_main.convert_to_phys_addrs(addresses);
+    }
+
+    fn shared_map_create(
+        &mut self,
+        name: &str,
+        size: usize,
+        log2_page_size: u32,
+        numa_node: u32,
+    ) -> Result<u32, PhysmemError> {
+        let base = self
+            .pmalloc_main
+            .create_shared_arena(name, size, log2_page_size, numa_node)
+            .map_err(|source| PhysmemError::Map {
+                source: io::Error::other(source),
+            })?;
+        let Some(base) = NonZeroUsize::new(base.addr()) else {
+            return Err(PhysmemError::Create {
+                source: io::Error::from_raw_os_error(libc::ENOMEM),
+            });
+        };
+        let arena_index = self.pmalloc_main.get_arena(base.get()).index;
+        let arena = self.pmalloc_main.arena(arena_index);
+        let page_size = 1usize
+            .checked_shl(log2_page_size)
+            .expect("physmem page size fits usize");
+        let n_pages = (arena.n_pages as usize)
+            .checked_mul(arena.subpages_per_page as usize)
+            .and_then(|count| u32::try_from(count).ok())
+            .ok_or(PhysmemError::PageSizeOverflow {
+                requested: PageSize::Bytes(byte_unit::Byte::from_u64(page_size as u64)),
+            })?;
+        let mapping_size =
+            (n_pages as usize)
+                .checked_mul(page_size)
+                .ok_or(PhysmemError::PageSizeOverflow {
+                    requested: PageSize::Bytes(byte_unit::Byte::from_u64(page_size as u64)),
+                })?;
+        let first_page = arena.first_page_index;
+        let page_table = (0..arena.n_pages)
+            .map(|offset| {
+                let address = self.pmalloc_main.page_address_for_index(first_page)
+                    + (offset as usize * page_size);
+                let physical_address = self.pmalloc_main.get_pa(address);
+                if physical_address == 0 {
+                    address
+                } else {
+                    physical_address
+                }
+            })
+            .collect();
+        let index = self.maps.insert(PhysmemMap {
+            index: INVALID_MAP_INDEX,
+            fd: arena.fd,
+            base: base.get() as *mut u8,
+            size: mapping_size,
+            n_pages,
+            page_table,
+            log2_page_size,
+            numa_node: arena.numa_node,
+        });
+        self.maps
+            .get_mut(index)
+            .expect("new physmem map is installed")
+            .index = index;
+        Ok(index)
+    }
+}
+
+impl PhysmemMap {
     #[inline]
     pub fn base(&self) -> *mut u8 {
         self.base
@@ -374,476 +389,34 @@ impl PhysmemMap {
     }
 
     #[inline]
+    pub fn page_size(&self) -> usize {
+        1usize << self.log2_page_size
+    }
+
+    #[inline]
     pub fn numa_node(&self) -> u32 {
         self.numa_node
-    }
-
-    #[inline]
-    pub fn page_size(&self) -> usize {
-        self.page_size
-    }
-
-    #[inline]
-    pub fn is_hugetlb(&self) -> bool {
-        self.hugetlb
     }
 
     #[inline]
     pub fn fd(&self) -> RawFd {
         self.fd
     }
-}
 
-fn checked_align_up(value: usize, alignment: usize) -> Option<usize> {
-    value
-        .checked_add(alignment.checked_sub(1)?)
-        .map(|rounded| rounded / alignment * alignment)
-}
-
-#[cfg(target_os = "linux")]
-fn provision_hugepages(
-    directory: &Path,
-    requested: PageSize,
-    page_size: usize,
-    numa_node: u32,
-    required: usize,
-) -> Result<(), PhysmemError> {
-    let free_path = directory.join("free_hugepages");
-    let current_path = directory.join("nr_hugepages");
-    let free = std::fs::read_to_string(&free_path)
-        .and_then(|value| {
-            value
-                .trim()
-                .parse::<usize>()
-                .map_err(|source| io::Error::new(io::ErrorKind::InvalidData, source))
-        })
-        .map_err(|source| PhysmemError::HugePagePool {
-            operation: "read free",
-            path: free_path.clone(),
-            requested,
-            page_size,
-            numa_node,
-            required,
-            free: 0,
-            current: 0,
-            attempted: None,
-            source,
-        })?;
-    let current = std::fs::read_to_string(&current_path)
-        .and_then(|value| {
-            value
-                .trim()
-                .parse::<usize>()
-                .map_err(|source| io::Error::new(io::ErrorKind::InvalidData, source))
-        })
-        .map_err(|source| PhysmemError::HugePagePool {
-            operation: "read current",
-            path: current_path.clone(),
-            requested,
-            page_size,
-            numa_node,
-            required,
-            free,
-            current: 0,
-            attempted: None,
-            source,
-        })?;
-    if free >= required {
-        return Ok(());
+    #[inline]
+    pub fn page_physical_address(&self, page_index: u32) -> usize {
+        self.page_table
+            .get(page_index as usize)
+            .copied()
+            .expect("physmem page index names a map page")
     }
 
-    let attempted = current
-        .checked_add(required - free)
-        .ok_or(PhysmemError::PageSizeOverflow { requested })?;
-    std::fs::write(&current_path, attempted.to_string()).map_err(|source| {
-        PhysmemError::HugePagePool {
-            operation: "grow",
-            path: current_path.clone(),
-            requested,
-            page_size,
-            numa_node,
-            required,
-            free,
-            current,
-            attempted: Some(attempted),
-            source,
-        }
-    })?;
-    let available = std::fs::read_to_string(&free_path)
-        .and_then(|value| {
-            value
-                .trim()
-                .parse::<usize>()
-                .map_err(|source| io::Error::new(io::ErrorKind::InvalidData, source))
-        })
-        .map_err(|source| PhysmemError::HugePagePool {
-            operation: "re-read free",
-            path: free_path,
-            requested,
-            page_size,
-            numa_node,
-            required,
-            free,
-            current,
-            attempted: Some(attempted),
-            source,
-        })?;
-    let provisioned = std::fs::read_to_string(&current_path)
-        .and_then(|value| {
-            value
-                .trim()
-                .parse::<usize>()
-                .map_err(|source| io::Error::new(io::ErrorKind::InvalidData, source))
-        })
-        .map_err(|source| PhysmemError::HugePagePool {
-            operation: "re-read current",
-            path: current_path.clone(),
-            requested,
-            page_size,
-            numa_node,
-            required,
-            free: available,
-            current,
-            attempted: Some(attempted),
-            source,
-        })?;
-    if available < required {
-        return Err(PhysmemError::HugePagePool {
-            operation: "confirm",
-            path: current_path,
-            requested,
-            page_size,
-            numa_node,
-            required,
-            free: available,
-            current: provisioned,
-            attempted: Some(attempted),
-            source: io::Error::other("kernel did not make the requested pages available"),
-        });
-    }
-    Ok(())
-}
-
-#[cfg(target_os = "linux")]
-pub(crate) fn map_pages(
-    size: usize,
-    requested: PageSize,
-    page_size: usize,
-    numa_node: u32,
-    shared: bool,
-    alignment: usize,
-) -> Result<MappedRegion, PhysmemError> {
-    use procfs::process::Process;
-
-    const MFD_HUGETLB: libc::c_uint = 0x0004;
-    const MFD_HUGE_SHIFT: u32 = 26;
-    const MAX_NUMA_NODES: usize = 1024;
-
-    let alignment = alignment.max(page_size);
-    if page_size == 0
-        || !page_size.is_power_of_two()
-        || !alignment.is_power_of_two()
-        || alignment % page_size != 0
-    {
-        return Err(PhysmemError::UnsupportedPageSize { requested });
-    }
-    let total =
-        checked_align_up(size, alignment).ok_or(PhysmemError::PageSizeOverflow { requested })?;
-    let ordinary_page_size = PageSize::Default
-        .bytes()
-        .map_err(|source| PhysmemError::PageSizeQuery { source })?;
-    let hugetlb = page_size != ordinary_page_size;
-    // Only HugeTLB mappings consume preallocated huge pages. NUMA binding,
-    // first touch, policy restoration and placement verification are shared.
-    if hugetlb {
-        let mut directory = PathBuf::from(format!(
-            "/sys/devices/system/node/node{numa_node}/hugepages/hugepages-{}kB",
-            page_size / 1024
-        ));
-        if numa_node == 0 && !directory.is_dir() {
-            directory = PathBuf::from(format!(
-                "/sys/kernel/mm/hugepages/hugepages-{}kB",
-                page_size / 1024
-            ));
-        }
-        if !directory.is_dir() {
-            return Err(PhysmemError::HugePageUnsupported {
-                requested,
-                page_size,
-                path: directory,
-            });
-        }
-
-        let required = total / page_size;
-        provision_hugepages(&directory, requested, page_size, numa_node, required)?;
-    }
-    let reserve_size = total
-        .checked_add(alignment)
-        .ok_or(PhysmemError::PageSizeOverflow { requested })?;
-
-    let mut previous_mode: libc::c_int = 0;
-    let mut previous_mask = [0 as libc::c_ulong; MAX_NUMA_NODES / libc::c_ulong::BITS as usize];
-    // SAFETY: all pointers refer to writable storage sized for `maxnode` bits.
-    if unsafe {
-        libc::syscall(
-            libc::SYS_get_mempolicy,
-            &mut previous_mode,
-            previous_mask.as_mut_ptr(),
-            MAX_NUMA_NODES as libc::c_ulong,
-            std::ptr::null_mut::<libc::c_void>(),
-            0,
-        )
-    } != 0
-    {
-        return Err(PhysmemError::NumaPolicy {
-            operation: "snapshot",
-            numa_node,
-            source: io::Error::last_os_error(),
-        });
-    }
-
-    let node = usize::try_from(numa_node).map_err(|_| PhysmemError::NumaPolicy {
-        operation: "bind",
-        numa_node,
-        source: io::Error::other("NUMA node does not fit usize"),
-    })?;
-    if node >= MAX_NUMA_NODES {
-        return Err(PhysmemError::NumaPolicy {
-            operation: "bind",
-            numa_node,
-            source: io::Error::other("NUMA node exceeds the Linux nodemask limit"),
-        });
-    }
-    let mut target_mask = [0 as libc::c_ulong; MAX_NUMA_NODES / libc::c_ulong::BITS as usize];
-    target_mask[node / libc::c_ulong::BITS as usize] = 1 << (node % libc::c_ulong::BITS as usize);
-    // SAFETY: `target_mask` contains exactly the requested node and remains
-    // live for the syscall.
-    if unsafe {
-        libc::syscall(
-            libc::SYS_set_mempolicy,
-            libc::MPOL_BIND,
-            target_mask.as_ptr(),
-            MAX_NUMA_NODES as libc::c_ulong,
-        )
-    } != 0
-    {
-        return Err(PhysmemError::NumaPolicy {
-            operation: "bind",
-            numa_node,
-            source: io::Error::last_os_error(),
-        });
-    }
-
-    let mapping = (|| {
-        let fd = if shared {
-            let counter = PHYSMEM_COUNTER.fetch_add(1, Ordering::Relaxed);
-            let label = format!("hpm{}-{counter}", std::process::id());
-            let cname = CString::new(label).expect("generated memfd name contains no NUL");
-            let mut flags = libc::MFD_CLOEXEC;
-            if hugetlb {
-                flags |= MFD_HUGETLB | (page_size.trailing_zeros() << MFD_HUGE_SHIFT);
-            }
-            // SAFETY: the generated name is NUL terminated. Ordinary shared
-            // pages use memfd's default backing; HugeTLB explicitly selects its size.
-            let fd = unsafe { libc::memfd_create(cname.as_ptr(), flags) };
-            if fd < 0 {
-                return Err(PhysmemError::Create {
-                    source: io::Error::last_os_error(),
-                });
-            }
-            // SAFETY: `fd` is owned here and `total` was checked to fit usize.
-            if unsafe { libc::ftruncate(fd, total as libc::off_t) } != 0 {
-                let source = io::Error::last_os_error();
-                // SAFETY: this branch still owns the descriptor.
-                unsafe { libc::close(fd) };
-                return Err(PhysmemError::Truncate { source });
-            }
-            fd
-        } else {
-            -1
-        };
-        // SAFETY: this anonymous inaccessible reservation only selects an
-        // address range; MAP_FIXED below replaces its aligned middle.
-        let reservation = unsafe {
-            libc::mmap(
-                std::ptr::null_mut(),
-                reserve_size,
-                libc::PROT_NONE,
-                libc::MAP_PRIVATE | libc::MAP_ANONYMOUS,
-                -1,
-                0,
-            )
-        };
-        if reservation == libc::MAP_FAILED {
-            if fd >= 0 {
-                // SAFETY: this branch still owns the descriptor.
-                unsafe { libc::close(fd) };
-            }
-            return Err(PhysmemError::Map {
-                source: io::Error::last_os_error(),
-            });
-        }
-        let reservation_start = reservation as usize;
-        let Some(aligned_start) = checked_align_up(reservation_start, alignment) else {
-            // SAFETY: this branch still owns the complete reservation.
-            unsafe { libc::munmap(reservation, reserve_size) };
-            if fd >= 0 {
-                // SAFETY: this branch still owns the descriptor.
-                unsafe { libc::close(fd) };
-            }
-            return Err(PhysmemError::PageSizeOverflow { requested });
-        };
-        let prefix = aligned_start - reservation_start;
-        let suffix = reserve_size - prefix - total;
-        let mut flags = libc::MAP_FIXED;
-        if shared {
-            flags |= libc::MAP_SHARED;
-        } else {
-            flags |= libc::MAP_PRIVATE | libc::MAP_ANONYMOUS;
-            if hugetlb {
-                flags |= libc::MAP_HUGETLB | ((page_size.trailing_zeros() as libc::c_int) << 26);
-            }
-        }
-        // SAFETY: the length and flags describe a new read/write mapping; the
-        // descriptor is valid for shared mappings and ignored for anonymous.
-        let base = unsafe {
-            libc::mmap(
-                aligned_start as *mut libc::c_void,
-                total,
-                libc::PROT_READ | libc::PROT_WRITE,
-                flags,
-                fd,
-                0,
-            )
-        };
-        if base == libc::MAP_FAILED {
-            let source = io::Error::last_os_error();
-            // SAFETY: the failed replacement leaves this reservation owned.
-            unsafe { libc::munmap(reservation, reserve_size) };
-            if fd >= 0 {
-                // SAFETY: mapping failed, so this branch retains fd ownership.
-                unsafe { libc::close(fd) };
-            }
-            return Err(PhysmemError::Map { source });
-        }
-        if prefix != 0 {
-            // SAFETY: this is the untouched prefix of the owned reservation.
-            unsafe { libc::munmap(reservation, prefix) };
-        }
-        if suffix != 0 {
-            // SAFETY: this is the untouched suffix after the new mapping.
-            unsafe { libc::munmap((aligned_start + total) as *mut libc::c_void, suffix) };
-        }
-        let region = MappedRegion {
-            base: base.cast(),
-            size: total,
-            fd,
-        };
-        for offset in (0..total).step_by(page_size) {
-            // SAFETY: each offset is inside the writable mapping and touching
-            // one byte faults in each selected page under MPOL_BIND, before the
-            // previous thread policy is restored.
-            unsafe { region.base.add(offset).write_volatile(0) };
-        }
-        Ok(region)
-    })();
-
-    // SAFETY: these are the exact mode and nodemask returned by
-    // get_mempolicy before the temporary bind.
-    let restore = unsafe {
-        libc::syscall(
-            libc::SYS_set_mempolicy,
-            previous_mode,
-            previous_mask.as_ptr(),
-            MAX_NUMA_NODES as libc::c_ulong,
-        )
-    };
-    let region = match (mapping, restore) {
-        (Err(primary), value) if value != 0 => {
-            return Err(PhysmemError::NumaPolicyRestore {
-                primary: Box::new(primary),
-                source: io::Error::last_os_error(),
-            });
-        }
-        (Err(primary), _) => return Err(primary),
-        (Ok(_), value) if value != 0 => {
-            return Err(PhysmemError::NumaPolicy {
-                operation: "restore",
-                numa_node,
-                source: io::Error::last_os_error(),
-            });
-        }
-        (Ok(region), _) => region,
-    };
-
-    let start = region.base() as u64;
-    let end = start + region.size() as u64;
-    let actual_page_size = Process::myself()
-        .and_then(|process| process.smaps())
-        .ok()
-        .and_then(|maps| {
-            maps.0
-                .into_iter()
-                .find(|mapping| mapping.address.0 <= start && mapping.address.1 >= end)
-                .and_then(|mapping| mapping.extension.map.get("KernelPageSize").copied())
-        })
-        .and_then(|value| usize::try_from(value).ok())
-        .unwrap_or(0);
-    if actual_page_size != page_size {
-        return Err(PhysmemError::BackingVerification {
-            requested: page_size,
-            actual: actual_page_size,
-        });
-    }
-
-    let pages = (0..region.size())
-        .step_by(page_size)
-        .map(|offset| unsafe { region.base().add(offset).cast::<libc::c_void>() })
-        .collect::<Vec<_>>();
-    let mut status = vec![-1 as libc::c_int; pages.len()];
-    // SAFETY: `pages` and `status` have the same count and remain live for the
-    // query. A null nodes array requests placement without moving pages.
-    if unsafe {
-        libc::syscall(
-            libc::SYS_move_pages,
-            0,
-            pages.len(),
-            pages.as_ptr(),
-            std::ptr::null::<libc::c_int>(),
-            status.as_mut_ptr(),
-            0,
-        )
-    } != 0
-    {
-        return Err(PhysmemError::NumaPolicy {
-            operation: "verify placement",
-            numa_node,
-            source: io::Error::last_os_error(),
-        });
-    }
-    if let Some(actual) = status
-        .into_iter()
-        .find(|actual| *actual != numa_node as i32)
-    {
-        return Err(PhysmemError::PlacementVerification {
-            requested: numa_node,
-            actual,
-        });
-    }
-    Ok(region)
-}
-
-impl Drop for PhysmemMap {
-    fn drop(&mut self) {
-        if !self.base.is_null() && self.size != 0 {
-            unsafe {
-                libc::munmap(self.base.cast(), self.size);
-            }
-        }
-        if self.fd_owned && self.fd >= 0 {
-            unsafe {
-                libc::close(self.fd);
-            }
-        }
+    #[inline]
+    pub fn page_count(&self) -> u32 {
+        self.n_pages
     }
 }
+
+const _: () = {
+    assert!(core::mem::align_of::<PhysmemMain>() == CACHE_LINE);
+};

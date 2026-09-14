@@ -33,7 +33,6 @@ pub struct DataPlaneMain {
     cacheline0: CacheLineAlignMark,
     random: SmallRng,
     thread_index: u32,
-    buffer_main: &'static hammer_core::buffer::BufferMain,
     pub(crate) nodes: NodeMain,
     current_node: Cell<Option<NodeId>>,
     handoff: Option<DataPlaneHandoffWorker>,
