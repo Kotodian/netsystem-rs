@@ -96,7 +96,6 @@ pub use unix_main::UnixMain;
 pub mod graph;
 
 mod numa;
-pub mod spawn;
 pub mod start_workers;
 mod worker_thread;
 pub use worker_thread::WorkerThread;
