@@ -351,7 +351,12 @@ impl PhysmemMain {
             .map(|offset| {
                 let address = self.pmalloc_main.page_address_for_index(first_page)
                     + (offset as usize * page_size);
-                self.pmalloc_main.get_pa(address)
+                let physical_address = self.pmalloc_main.get_pa(address);
+                if physical_address == 0 {
+                    address
+                } else {
+                    physical_address
+                }
             })
             .collect();
         let index = self.maps.insert(PhysmemMap {
