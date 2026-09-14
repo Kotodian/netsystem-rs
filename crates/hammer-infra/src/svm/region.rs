@@ -27,8 +27,8 @@ use crate::bitmap::Bitmap;
 use crate::mem::{MemError, MemHeap, MemMain};
 use crate::pool::Pool;
 
-/// Shared layout version. Version 1 was Hammer's removed offset-heap layout.
-pub const SVM_REGION_VERSION: u64 = (2 << 16) | 1;
+/// Shared layout version. 2.1 held the former process-local SVM queue handle.
+pub const SVM_REGION_VERSION: u64 = (2 << 16) | 2;
 
 /// Default size of the locked PVT Heap following the region header page.
 pub const SVM_PVT_HEAP_SIZE: usize = 128 << 10;
@@ -373,6 +373,32 @@ pub struct RegionLock<'region> {
 }
 
 impl RegionLock<'_> {
+    /// Makes initialized region-owned state visible to attaching clients.
+    pub fn set_user_context(&mut self, value: NonNull<u8>) {
+        unsafe { self.header.as_ref() }
+            .user_ctx
+            .store(value.as_ptr().cast(), Ordering::Release);
+    }
+
+    pub fn remove_exited_clients(&mut self) -> Result<usize, SvmRegionError> {
+        let active_heap = self.pvt_heap().activate();
+        let clients = unsafe { &mut *self.header.as_ref().client_pids };
+        let current_pid = std::process::id() as i32;
+        let mut exited = Vec::new();
+        for (index, pid) in clients.iter().copied().enumerate() {
+            if pid != current_pid && process_is_dead(pid)? {
+                exited.push(index);
+            }
+        }
+        for index in exited.iter().rev().copied() {
+            clients.remove(index);
+        }
+        let removed = exited.len();
+        drop(exited);
+        drop(active_heap);
+        Ok(removed)
+    }
+
     pub fn pvt_heap(&self) -> &MemHeap {
         let pointer = unsafe { self.header.as_ref().pvt_heap };
         assert!(!pointer.is_null(), "validated region has a PVT Heap");
@@ -509,6 +535,24 @@ impl SvmRegion {
         self.size
     }
 
+    pub fn user_context(&self) -> Option<NonNull<u8>> {
+        NonNull::new(
+            unsafe { self.header.as_ref() }
+                .user_ctx
+                .load(Ordering::Acquire)
+                .cast(),
+        )
+    }
+
+    pub fn contains_range(&self, start: NonNull<u8>, bytes: usize) -> bool {
+        let base = self.base.as_ptr().addr();
+        let Some(end) = base.checked_add(self.size) else {
+            return false;
+        };
+        let start = start.as_ptr().addr();
+        start >= base && start.checked_add(bytes).is_some_and(|last| last <= end)
+    }
+
     pub fn flags(&self) -> SvmRegionFlags {
         unsafe { self.header.as_ref().flags }
     }
@@ -528,25 +572,7 @@ impl SvmRegion {
     }
 
     pub fn remove_exited_clients(&self) -> Result<usize, SvmRegionError> {
-        let lock = self.lock()?;
-        let pvt_heap = lock.pvt_heap() as *const MemHeap;
-        let active_heap = unsafe { &*pvt_heap }.activate();
-        let clients = unsafe { &mut *self.header.as_ref().client_pids };
-        let current_pid = std::process::id() as i32;
-        let mut exited = Vec::new();
-        for (index, pid) in clients.iter().copied().enumerate() {
-            if pid != current_pid && process_is_dead(pid)? {
-                exited.push(index);
-            }
-        }
-        for index in exited.iter().rev().copied() {
-            clients.remove(index);
-        }
-        let removed = exited.len();
-        drop(exited);
-        drop(active_heap);
-        drop(lock);
-        Ok(removed)
+        self.lock()?.remove_exited_clients()
     }
 
     pub fn find_or_create_subregion(

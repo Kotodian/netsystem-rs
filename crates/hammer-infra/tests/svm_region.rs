@@ -88,6 +88,14 @@ fn local_root_region() {
     assert_eq!(root.size(), root_config.size);
     assert_eq!(root.flags(), SvmRegionFlags::NODATA);
     assert_eq!(root.client_count().expect("root client count"), 1);
+    assert!(root.user_context().is_none());
+    assert!(root.contains_range(root.base(), root.size()));
+    assert!(!root.contains_range(root.base(), root.size() + 1));
+    {
+        let mut lock = root.lock().expect("lock root for context publication");
+        lock.set_user_context(root.base());
+    }
+    assert_eq!(root.user_context(), Some(root.base()));
 
     {
         let lock = root.lock().expect("lock root region");
@@ -211,11 +219,19 @@ fn shared_region_server() {
     );
     assert!(exited.success(), "exited client failed: {exited}");
     assert_eq!(region.client_count().expect("stale client count"), 2);
+    {
+        let mut lock = region.lock().expect("scan under existing region lock");
+        assert_eq!(
+            lock.remove_exited_clients()
+                .expect("remove exited client while locked"),
+            1
+        );
+    }
     assert_eq!(
         region
             .remove_exited_clients()
             .expect("remove exited client"),
-        1
+        0
     );
     assert_eq!(region.client_count().expect("clean client count"), 1);
     region.unmap().expect("unmap shared region");
@@ -303,20 +319,15 @@ fn old_layout_is_rejected() {
         )
     };
     assert_ne!(mapping, libc::MAP_FAILED);
-    unsafe {
-        mapping
-            .cast::<AtomicU64>()
-            .write(AtomicU64::new((1 << 16) | 1));
+    for previous in [(1 << 16) | 1, (2 << 16) | 1] {
+        unsafe { mapping.cast::<AtomicU64>().write(AtomicU64::new(previous)) };
+        let duplicate = inheritable_duplicate(backing.as_raw_fd());
+        let error = SvmRegion::attach(duplicate).expect_err("previous layout is rejected");
+        assert!(matches!(error,
+            SvmRegionError::UnsupportedVersion { found, expected: SVM_REGION_VERSION }
+                if found == previous));
     }
     assert_eq!(unsafe { libc::munmap(mapping, page_size) }, 0);
-    let error = SvmRegion::attach(backing).expect_err("offset layout version is rejected");
-    assert!(matches!(
-        error,
-        SvmRegionError::UnsupportedVersion {
-            found,
-            expected: SVM_REGION_VERSION,
-        } if found == (1 << 16) | 1
-    ));
 }
 
 fn owner_death_server() {
