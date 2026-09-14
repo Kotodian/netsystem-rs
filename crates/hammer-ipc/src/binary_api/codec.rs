@@ -2,6 +2,7 @@
 //! existing value error; they are local codec diagnostics, never API retval.
 use std::fmt;
 use std::marker::PhantomData;
+use std::mem::MaybeUninit;
 
 use serde::de::Error as _;
 pub use serde::de::value::Error;
@@ -10,7 +11,7 @@ use serde::ser::{Impossible, SerializeSeq, SerializeStruct, SerializeTuple, Seri
 use serde::{Deserialize, Serialize};
 
 pub struct Serializer<'a> {
-    output: &'a mut [u8],
+    output: &'a mut [MaybeUninit<u8>],
     offset: usize,
     opaque: bool,
 }
@@ -29,12 +30,27 @@ pub fn serialize<T: Serialize + ?Sized>(value: &T, output: &mut [u8]) -> Result<
     Ok(serializer.finish())
 }
 
+pub fn serialize_uninit<T: Serialize + ?Sized>(
+    value: &T,
+    output: &mut [MaybeUninit<u8>],
+) -> Result<usize, Error> {
+    let mut serializer = Serializer {
+        output,
+        offset: 0,
+        opaque: false,
+    };
+    value.serialize(&mut serializer)?;
+    Ok(serializer.finish())
+}
+
 pub fn deserialize<'de, T: Deserialize<'de>>(input: &'de [u8]) -> Result<T, Error> {
     T::deserialize(&mut Deserializer::new(input))
 }
 
 impl<'a> Serializer<'a> {
     pub fn new(output: &'a mut [u8]) -> Self {
+        let output =
+            unsafe { std::slice::from_raw_parts_mut(output.as_mut_ptr().cast(), output.len()) };
         Self {
             output,
             offset: 0,
@@ -52,7 +68,13 @@ impl<'a> Serializer<'a> {
             .checked_add(bytes.len())
             .filter(|end| *end <= self.output.len())
             .ok_or_else(|| Error::custom("API output slice is too short"))?;
-        self.output[self.offset..end].copy_from_slice(bytes);
+        unsafe {
+            std::ptr::copy_nonoverlapping(
+                bytes.as_ptr(),
+                self.output.as_mut_ptr().add(self.offset).cast(),
+                bytes.len(),
+            );
+        }
         self.offset = end;
         Ok(())
     }

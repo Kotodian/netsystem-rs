@@ -7,6 +7,8 @@ publish = false
 [dependencies]
 serde = { workspace = true }
 hammer-component-macros = { path = "../hammer-component-macros" }
+hammer-infra = { path = "../hammer-infra" }
+hammer-runtime = { path = "../hammer-runtime" }
 hammer-stats = { path = "../hammer-stats" }
 libc = { workspace = true }
 memmap2 = { workspace = true }
