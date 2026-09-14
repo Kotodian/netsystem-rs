@@ -492,6 +492,35 @@ format and make the boundary explicit:
 - state the thread model explicitly. The main/control thread must not acquire
   ownership of data-plane worker state merely to make an API convenient.
 
+Every non-trivial design must also include the following implementation decisions
+explicitly; do not leave them implicit in code or in a later review:
+
+- **Alignment (`align`) and layout:** state the required alignment and layout
+  for structs, fields, buffers, atomics, SIMD values, and FFI/ABI boundaries.
+  Identify cache-line ownership, padding, `repr` requirements, and the proof or
+  check that validates them. Do not add alignment only as a speculative
+  optimization.
+- **Error handling:** classify every failure as a packet/node error, a
+  recoverable control-plane error, a lifecycle boundary state, or a programmer
+  bug. Name the owning typed error or node counter, caller recovery action,
+  source-chain behavior, rollback/failure-atomicity rule, and the test that
+  proves the contract. Follow the detailed Error handling rules above.
+- **Inline optimization:** identify the hot path and the evidence for any
+  `#[inline]` or `#[inline(always)]` attribute. Explain code-size,
+  monomorphization, branch, and LTO tradeoffs, and name the benchmark or
+  compiler evidence used to validate the choice. Do not apply inline
+  attributes globally or as a substitute for measuring the design.
+- **Existing code reuse:** record the closest Hammer and vendored VPP
+  implementations and the existing types, traits, primitives, and APIs that
+  are reused. Before proposing a new type, helper, wrapper, or public API,
+  explain why each applicable existing surface cannot satisfy the requirement.
+- **VPP domain naming:** use the canonical VPP domain term for each concept and
+  map it to Hammer's owning crate and semantic (for example, `Main`, `Worker`,
+  `Graph Node`, `Frame`, `Buffer`, `Fifo`, `Segment`, `Session`, and
+  `WorkerBarrier`). Explicitly document any intentional terminology or
+  ownership deviation. These are domain names, not permission to add `vpp` or
+  `Vpp` to Hammer identifiers; the Naming rules still apply.
+
 Do not implement one complained-about symbol at a time. Complete one coherent
 scope, including its callers and deletion audit, then run one scope-level
 verification. A failed check may identify migration work still missing, but it
