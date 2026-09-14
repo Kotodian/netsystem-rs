@@ -4,6 +4,8 @@
 //! processes such as `hammerctl` use this module directly over a Unix
 //! socket, mirroring VPP's separate vat2 client process.
 
+extern crate self as hammer_ipc;
+
 mod stats_client;
 
 pub mod binary_api;

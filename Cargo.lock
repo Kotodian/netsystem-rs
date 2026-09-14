@@ -1075,12 +1075,15 @@ dependencies = [
 name = "hammer-ipc"
 version = "0.1.0"
 dependencies = [
+ "hammer-component-macros",
  "hammer-stats",
  "libc",
  "memmap2",
  "prost",
+ "serde",
  "socket2",
  "thiserror 2.0.18",
+ "tracing",
 ]
 
 [[package]]
