@@ -4,9 +4,12 @@ use byte_unit::Byte;
 use hammer_infra::align::{CACHE_LINE, is_aligned};
 use hammer_infra::aligned_vec::AlignedVec;
 use hammer_infra::mem::{MainHeapConfig, MemMain};
+use hammer_infra::physmem::PhysmemMain;
 use hammer_infra::pmalloc::{PMALLOC_BLOCK_SIZE, PmallocMain};
 
 const CHILD_MODE: &str = "HAMMER_PMALLOC_TEST_CHILD";
+const HUGE_PHYSMEM_CHILD_MODE: &str = "HAMMER_HUGE_PHYSMEM_TEST_CHILD";
+const EXPLICIT_HUGE_PHYSMEM_CHILD_MODE: &str = "HAMMER_EXPLICIT_HUGE_PHYSMEM_TEST_CHILD";
 
 #[test]
 fn pmalloc_behavior() {
@@ -46,6 +49,87 @@ fn run_pmalloc_cases() {
     pmalloc_converts_addresses_in_place();
     pmalloc_rejects_non_power_of_two_alignment();
     pmalloc_rejects_foreign_free();
+    physmem_maps_configured_numa_nodes();
+}
+
+#[test]
+fn physmem_page_size_capabilities() {
+    if std::env::var_os(HUGE_PHYSMEM_CHILD_MODE).is_some() {
+        MainHeapConfig {
+            size: Byte::from_u64(128 << 20),
+            page_size: hammer_infra::PageSize::Default,
+            default_hugepage_size: None,
+        }
+        .initialize()
+        .expect("initialize process Main Heap");
+        let result = PhysmemMain::init(
+            None,
+            64 << 20,
+            MemMain::system_page_size(),
+            hammer_infra::PageSize::DefaultHuge,
+            &[0],
+        );
+        if let Ok(main) = result {
+            assert!(main.get_map(0).page_size() >= MemMain::system_page_size());
+        }
+        unsafe { libc::_exit(0) }
+    }
+
+    let output = Command::new(std::env::current_exe().expect("current test executable"))
+        .env(HUGE_PHYSMEM_CHILD_MODE, "1")
+        .arg("--exact")
+        .arg("physmem_page_size_capabilities")
+        .arg("--nocapture")
+        .output()
+        .expect("spawn physmem page-size test process");
+    assert!(
+        output.status.success(),
+        "HugeTLB child failed\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[test]
+fn physmem_explicit_hugepage_capability() {
+    if std::env::var_os(EXPLICIT_HUGE_PHYSMEM_CHILD_MODE).is_some() {
+        let huge_page = 2 * 1024 * 1024;
+        let result = MainHeapConfig {
+            size: Byte::from_u64(128 << 20),
+            page_size: hammer_infra::PageSize::Default,
+            default_hugepage_size: Some(hammer_infra::PageSize::Bytes(Byte::from_u64(
+                huge_page as u64,
+            ))),
+        }
+        .initialize();
+        if result.is_ok() {
+            let result = PhysmemMain::init(
+                None,
+                64 << 20,
+                huge_page,
+                hammer_infra::PageSize::Bytes(Byte::from_u64(huge_page as u64)),
+                &[0],
+            );
+            if let Ok(main) = result {
+                assert_eq!(main.get_map(0).page_size(), huge_page);
+            }
+        }
+        unsafe { libc::_exit(0) }
+    }
+
+    let output = Command::new(std::env::current_exe().expect("current test executable"))
+        .env(EXPLICIT_HUGE_PHYSMEM_CHILD_MODE, "1")
+        .arg("--exact")
+        .arg("physmem_explicit_hugepage_capability")
+        .arg("--nocapture")
+        .output()
+        .expect("spawn explicit HugeTLB test process");
+    assert!(
+        output.status.success(),
+        "explicit HugeTLB child failed\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
 }
 
 fn aligned_vec_grows_without_changing_element_stride() {
@@ -171,4 +255,38 @@ fn pmalloc_rejects_foreign_free() {
         pmalloc.free(std::ptr::NonNull::<u8>::dangling().as_ptr());
     }));
     assert!(result.is_err());
+}
+
+fn physmem_maps_configured_numa_nodes() {
+    let mut numa_nodes = std::fs::read_dir("/sys/devices/system/node")
+        .ok()
+        .into_iter()
+        .flatten()
+        .filter_map(Result::ok)
+        .filter_map(|entry| entry.file_name().to_str().map(str::to_owned))
+        .filter_map(|name| name.strip_prefix("node")?.parse::<u32>().ok())
+        .collect::<Vec<_>>();
+    if numa_nodes.is_empty() {
+        numa_nodes.push(0);
+    }
+    numa_nodes.sort_unstable();
+    numa_nodes.truncate(2);
+    let page_size = MemMain::system_page_size();
+    let result = PhysmemMain::init(
+        None,
+        page_size * 16,
+        page_size * 2,
+        hammer_infra::PageSize::Default,
+        &numa_nodes,
+    );
+    let Ok(main) = result else {
+        eprintln!("NUMA physmem capability unavailable; map test skipped");
+        return;
+    };
+    for (index, &numa_node) in numa_nodes.iter().enumerate() {
+        let map = main.get_map(index as u32);
+        assert_eq!(map.numa_node(), numa_node);
+        assert_eq!(map.page_size(), page_size);
+        assert_eq!(map.size() % page_size, 0);
+    }
 }
