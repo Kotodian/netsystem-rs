@@ -307,6 +307,7 @@ pub fn f_cptr(f: &Fifo, cp: FsSptr) -> *mut SvmFifoChunk {
 }
 
 #[inline(always)]
+#[allow(clippy::not_unsafe_ptr_arg_deref)]
 pub fn f_csptr(f: &Fifo, chunk: *mut SvmFifoChunk) -> FsSptr {
     if chunk.is_null() {
         0

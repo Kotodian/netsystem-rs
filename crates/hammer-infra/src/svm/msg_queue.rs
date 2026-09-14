@@ -189,11 +189,11 @@ struct SvmMsgQRingShared {
     elsize: u32,
 }
 
-#[repr(C, align(64))]
+#[repr(C, packed)]
 struct SvmMsgQShared {
     n_rings: u32,
-    reserved: u32,
-    q: SvmMsgQSharedQueue,
+    pad: u32,
+    q: [u8; 0],
 }
 
 struct SvmMsgQRing {
@@ -250,7 +250,8 @@ impl SvmMsgQ {
                 .ok_or(SvmMsgQError::LayoutOverflow)
         })?;
         size_of::<SvmMsgQShared>()
-            .checked_add(descriptors)
+            .checked_add(size_of::<SvmMsgQSharedQueue>())
+            .and_then(|size| size.checked_add(descriptors))
             .and_then(|size| size.checked_add(ring_bytes))
             .ok_or(SvmMsgQError::LayoutOverflow)
     }
@@ -258,6 +259,11 @@ impl SvmMsgQ {
     /// Initializes a queue in a caller-owned, cache-line-aligned shared range.
     ///
     /// The caller must reserve at least [`Self::size_to_alloc`] bytes at `base`.
+    ///
+    /// # Safety
+    ///
+    /// `base` must point to writable shared storage of the required size, be
+    /// cache-line aligned, and not overlap another live message queue.
     pub unsafe fn init(
         base: NonNull<u8>,
         config: &SvmMsgQConfig<'_>,
@@ -268,12 +274,13 @@ impl SvmMsgQ {
         );
         let size = Self::size_to_alloc(config)?;
         let shared = base.cast::<SvmMsgQShared>();
+        let queue = shared_queue_ptr(shared);
         unsafe { std::ptr::write_bytes(shared.as_ptr().cast::<u8>(), 0, size) };
         unsafe {
             (*shared.as_ptr()).n_rings = config.rings.len() as u32;
-            (*shared.as_ptr()).q.maxsize = config.q_nitems;
-            (*shared.as_ptr()).q.elsize = size_of::<SvmMsgQDescriptor>() as u32;
-            (*shared.as_ptr()).q.pad = 0;
+            (*queue.as_ptr()).maxsize = config.q_nitems;
+            (*queue.as_ptr()).elsize = size_of::<SvmMsgQDescriptor>() as u32;
+            (*queue.as_ptr()).pad = 0;
         }
         let (descriptors, rings) = shared_layout(shared, config.q_nitems);
         let mut ring = rings;
@@ -292,7 +299,7 @@ impl SvmMsgQ {
             MutexBuilder::<Robust>::new()
                 .with_sharing(MutexSharing::Shared)
                 .build_borrowed(
-                    (&mut (*shared.as_ptr()).q.mutex as *mut MaybeUninit<RawMutexAlloc>).cast(),
+                    (&mut (*queue.as_ptr()).mutex as *mut MaybeUninit<RawMutexAlloc>).cast(),
                     &SVM_MSG_Q_MAPPING_ANCHOR,
                 )
         };
@@ -301,7 +308,7 @@ impl SvmMsgQ {
                 .with_sharing(CondvarSharing::Shared)
                 .with_clock(CondvarClock::Monotonic)
                 .build_borrowed(
-                    (&mut (*shared.as_ptr()).q.condvar as *mut MaybeUninit<RawCondvarAlloc>).cast(),
+                    (&mut (*queue.as_ptr()).condvar as *mut MaybeUninit<RawCondvarAlloc>).cast(),
                     &SVM_MSG_Q_MAPPING_ANCHOR,
                 )
         };
@@ -309,15 +316,9 @@ impl SvmMsgQ {
             descriptors,
             rings: ring_handles(rings, config.rings.len()),
             queue: SvmMsgQQueue {
-                shared: unsafe {
-                    NonNull::new_unchecked(std::ptr::addr_of_mut!((*shared.as_ptr()).q))
-                },
+                shared: queue,
                 event_fd: None,
-                lock: SpinLock::new(SvmMsgQProducerState {
-                    shared: unsafe {
-                        NonNull::new_unchecked(std::ptr::addr_of_mut!((*shared.as_ptr()).q))
-                    },
-                }),
+                lock: SpinLock::new(SvmMsgQProducerState { shared: queue }),
             },
             mutex,
             condvar,
@@ -326,19 +327,26 @@ impl SvmMsgQ {
 
     /// Attaches queue metadata and inline ring storage from its shared base.
     /// The enclosing mapping owner validates the range before calling this.
+    ///
+    /// # Safety
+    ///
+    /// `base` must point to a live, valid message queue allocation whose
+    /// shared header and inline storage remain mapped for the returned queue.
     pub unsafe fn attach(base: NonNull<u8>) -> Result<Self, SvmMsgQError> {
         let header = base.cast::<SvmMsgQShared>();
+        let queue = shared_queue_ptr(header);
         let shared_ref = unsafe { header.as_ref() };
+        let queue_ref = unsafe { queue.as_ref() };
         if shared_ref.n_rings == 0
-            || shared_ref.q.maxsize == 0
-            || shared_ref.q.elsize as usize != size_of::<SvmMsgQDescriptor>()
-            || shared_ref.q.head >= shared_ref.q.maxsize
-            || shared_ref.q.tail >= shared_ref.q.maxsize
-            || shared_ref.q.cursize > shared_ref.q.maxsize
+            || queue_ref.maxsize == 0
+            || queue_ref.elsize as usize != size_of::<SvmMsgQDescriptor>()
+            || queue_ref.head >= queue_ref.maxsize
+            || queue_ref.tail >= queue_ref.maxsize
+            || queue_ref.cursize > queue_ref.maxsize
         {
             return Err(SvmMsgQError::InvalidHeader);
         }
-        let (descriptors, rings) = shared_layout(header, shared_ref.q.maxsize);
+        let (descriptors, rings) = shared_layout(header, queue_ref.maxsize);
         let mut ring = rings;
         for _ in 0..shared_ref.n_rings {
             let ring_header = unsafe { &*ring.as_ptr() };
@@ -354,13 +362,13 @@ impl SvmMsgQ {
         }
         let mutex = unsafe {
             BorrowedMutex::<Robust>::from_raw(
-                (&mut (*header.as_ptr()).q.mutex as *mut MaybeUninit<RawMutexAlloc>).cast(),
+                (&mut (*queue.as_ptr()).mutex as *mut MaybeUninit<RawMutexAlloc>).cast(),
                 &SVM_MSG_Q_MAPPING_ANCHOR,
             )
         };
         let condvar = unsafe {
             BorrowedCondvar::from_raw(
-                (&mut (*header.as_ptr()).q.condvar as *mut MaybeUninit<RawCondvarAlloc>).cast(),
+                (&mut (*queue.as_ptr()).condvar as *mut MaybeUninit<RawCondvarAlloc>).cast(),
                 &SVM_MSG_Q_MAPPING_ANCHOR,
                 CondvarClock::Monotonic,
             )
@@ -369,15 +377,9 @@ impl SvmMsgQ {
             descriptors,
             rings: ring_handles(rings, shared_ref.n_rings as usize),
             queue: SvmMsgQQueue {
-                shared: unsafe {
-                    NonNull::new_unchecked(std::ptr::addr_of_mut!((*header.as_ptr()).q))
-                },
+                shared: queue,
                 event_fd: None,
-                lock: SpinLock::new(SvmMsgQProducerState {
-                    shared: unsafe {
-                        NonNull::new_unchecked(std::ptr::addr_of_mut!((*header.as_ptr()).q))
-                    },
-                }),
+                lock: SpinLock::new(SvmMsgQProducerState { shared: queue }),
             },
             mutex,
             condvar,
@@ -1033,7 +1035,7 @@ fn shared_layout(
         shared
             .as_ptr()
             .cast::<u8>()
-            .add(size_of::<SvmMsgQShared>())
+            .add(size_of::<SvmMsgQShared>() + size_of::<SvmMsgQSharedQueue>())
             .cast::<SvmMsgQDescriptor>()
     };
     let rings_ptr = unsafe {
@@ -1046,6 +1048,19 @@ fn shared_layout(
         NonNull::new(descriptor_ptr).expect("descriptor pointer is non-null"),
         NonNull::new(rings_ptr).expect("ring pointer is non-null"),
     )
+}
+
+#[inline(always)]
+fn shared_queue_ptr(shared: NonNull<SvmMsgQShared>) -> NonNull<SvmMsgQSharedQueue> {
+    unsafe {
+        NonNull::new_unchecked(
+            shared
+                .as_ptr()
+                .cast::<u8>()
+                .add(size_of::<SvmMsgQShared>())
+                .cast::<SvmMsgQSharedQueue>(),
+        )
+    }
 }
 
 fn ring_handles(rings: NonNull<SvmMsgQRingShared>, ring_count: usize) -> Vec<SvmMsgQRing> {
@@ -1075,4 +1090,29 @@ fn ring_handles(rings: NonNull<SvmMsgQRingShared>, ring_count: usize) -> Vec<Svm
 
 fn next_index(index: u32, capacity: u32) -> u32 {
     if index + 1 == capacity { 0 } else { index + 1 }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn shared_layout_matches_vpp_message_queue_prefix() {
+        assert_eq!(size_of::<SvmMsgQShared>(), 8);
+        assert_eq!(align_of::<SvmMsgQShared>(), 1);
+
+        let shared = NonNull::<SvmMsgQShared>::dangling();
+        let queue = shared_queue_ptr(shared);
+        let (descriptors, rings) = shared_layout(shared, 3);
+
+        assert_eq!(queue.as_ptr().addr() - shared.as_ptr().addr(), 8);
+        assert_eq!(
+            descriptors.as_ptr().addr() - shared.as_ptr().addr(),
+            size_of::<SvmMsgQShared>() + size_of::<SvmMsgQSharedQueue>()
+        );
+        assert_eq!(
+            rings.as_ptr().addr() - descriptors.as_ptr().addr(),
+            3 * size_of::<SvmMsgQDescriptor>()
+        );
+    }
 }

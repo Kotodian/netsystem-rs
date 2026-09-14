@@ -214,6 +214,7 @@ macro_rules! march_fn {
         ;
         ($($arg:ident : $arg_ty:ty),* $(,)?) -> $ret:ty
     ) => {
+        #[allow(clippy::not_unsafe_ptr_arg_deref)]
         $vis fn $name($($arg: $arg_ty),*) -> $ret {
             static SELECTED: ::std::sync::OnceLock<unsafe fn($($arg_ty),*) -> $ret> =
                 ::std::sync::OnceLock::new();
