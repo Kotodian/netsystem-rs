@@ -17,6 +17,7 @@ crate::__declare_registration_image!(
         config::stats::__INIT_FN_STATS_MAIN_INIT,
     ];
     config_functions = [
+        config::physmem::__CONFIG_FN_RUNTIME_PHYSMEM_CONFIG,
         trace::__CONFIG_FN_RUNTIME_TRACE_CONFIG,
         config::worker::__CONFIG_FN_RUNTIME_WORKER_CONFIG,
         config::stats::__CONFIG_FN_RUNTIME_STATS_CONFIG,

@@ -1,7 +1,8 @@
 use std::cell::RefCell;
+use std::num::NonZeroUsize;
 use std::sync::OnceLock;
 
-use hammer_infra::{PageSize, physmem::PhysmemMap};
+use hammer_infra::{PageSize, physmem::PhysmemMain};
 use spinning_top::Spinlock;
 
 use super::{BUFFER_CACHE_LINE_SIZE, BUFFER_THREAD_CACHE_HIGH_WATER, Buffer};
@@ -30,7 +31,7 @@ pub struct BufferMain {
 unsafe impl Sync for BufferMain {}
 
 pub(super) struct BufferPool {
-    pub(super) mapping: PhysmemMap,
+    pub(super) mapping_index: u32,
     pub(super) index: u8,
     pub(super) data_size: usize,
     pub(super) allocation_size: usize,
@@ -57,6 +58,26 @@ pub struct BufferThreadCache {
 
 impl BufferMain {
     pub fn new(
+        data_size: usize,
+        buffers_per_numa: usize,
+        numa_nodes: &[u32],
+        worker_count: usize,
+        page_size: PageSize,
+    ) -> DataPlaneResult<&'static Self> {
+        Self::init(
+            None,
+            0,
+            data_size,
+            buffers_per_numa,
+            numa_nodes,
+            worker_count,
+            page_size,
+        )
+    }
+
+    pub fn init(
+        base_addr: Option<NonZeroUsize>,
+        max_size: usize,
         data_size: usize,
         buffers_per_numa: usize,
         numa_nodes: &[u32],
@@ -116,24 +137,26 @@ impl BufferMain {
         let thread_count = worker_count
             .checked_add(1)
             .expect("worker count fits thread indexing");
-        let mut mappings = Vec::with_capacity(numa_nodes.len());
-        for &numa_node in numa_nodes {
-            mappings.push(
-                PhysmemMap::create("buffers", mapping_size, page_size, numa_node)
-                    .map_err(|source| DataPlaneError::BufferPoolMapping { numa_node, source })?,
-            );
-        }
+        let physmem = PhysmemMain::init(base_addr, max_size, mapping_size, page_size, numa_nodes)
+            .map_err(|source| DataPlaneError::BufferPoolMapping {
+            numa_node: numa_nodes[0],
+            source,
+        })?;
+        let mapping_indices = (0..numa_nodes.len() as u32).collect::<Vec<_>>();
         // Establish the final base before producing any index: later mappings
         // may lie below an earlier one. No already-issued index is rebased.
-        let start = mappings
+        let start = mapping_indices
             .iter()
-            .map(|mapping| mapping.base() as usize)
+            .map(|&index| physmem.get_map(index).base() as usize)
             .min()
             .expect("nonempty Pool mapping registry");
-        let end = mappings
+        let end = mapping_indices
             .iter()
-            .map(|mapping| {
-                (mapping.base() as usize)
+            .map(|&index| {
+                let mapping = physmem.get_map(index);
+                mapping
+                    .base()
+                    .addr()
                     .checked_add(mapping.size())
                     .expect("mapping address range fits usize")
             })
@@ -149,10 +172,11 @@ impl BufferMain {
         let mut main = Self {
             buffer_mem_start: start,
             buffer_mem_size: span,
-            pools: Vec::with_capacity(mappings.len()),
+            pools: Vec::with_capacity(mapping_indices.len()),
             default_pool_by_numa: [u8::MAX; MAX_NUMA_NODES],
         };
-        for mapping in mappings {
+        for mapping_index in mapping_indices {
+            let mapping = physmem.get_map(mapping_index);
             let index = main.pools.len() as u8;
             let mut template = super::header::BufferTemplate::default();
             template.buffer_pool_index = index;
@@ -191,7 +215,7 @@ impl BufferMain {
             }
             let buffer_count = indices.len();
             main.pools.push(BufferPool {
-                mapping,
+                mapping_index,
                 index,
                 data_size,
                 allocation_size,

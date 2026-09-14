@@ -3,6 +3,7 @@
 //! Each type is deserialized only for its registered TOML section. There is no
 //! runtime aggregate configuration object and no parsed document is retained.
 
+pub mod physmem;
 pub mod stats;
 pub mod trace;
 pub mod worker;
