@@ -4,6 +4,14 @@
 //! processes such as `hammerctl` use this module directly over a Tokio
 //! Unix socket, mirroring VPP's separate vat2 client process.
 
+pub mod api;
+pub mod table;
+pub use api::{ApiMain, ApiMsgConfig, ApiMsgData, ApiMsgRange, ApiVersion};
+pub mod codec;
+pub use codec::{Array, Deserializer, Serializer, deserialize, serialize};
+pub mod definition;
+pub use definition::{Api, Block, Field, Service, Typedef};
+
 use std::io::{self, Read, Write};
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};

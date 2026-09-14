@@ -1,3 +1,5 @@
+mod api;
+
 use std::collections::HashSet;
 
 use proc_macro::TokenStream;
@@ -3812,4 +3814,20 @@ fn expand_plugin(args: PluginArgs, module: &mut ItemMod) -> Result<TokenStream2>
 
         #module
     })
+}
+
+/// Define Binary API message identity and service relationships.
+#[proc_macro_derive(Api, attributes(api, serde))]
+pub fn derive_api(input: TokenStream) -> TokenStream {
+    api::derive(input.into(), true)
+        .unwrap_or_else(syn::Error::into_compile_error)
+        .into()
+}
+
+/// Declare the protocol definition of a non-message API type.
+#[proc_macro_derive(Typedef, attributes(api, serde))]
+pub fn derive_typedef(input: TokenStream) -> TokenStream {
+    api::derive(input.into(), false)
+        .unwrap_or_else(syn::Error::into_compile_error)
+        .into()
 }
