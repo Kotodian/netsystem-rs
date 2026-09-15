@@ -1,9 +1,9 @@
 //! VPE-owned binary API messages.
 use std::sync::OnceLock;
 
-use hammer_component_macros::{Api, api_message_table, init_function};
-use hammer_ipc::binary_api::ApiMain;
+use hammer_component_macros::{Api, api_message_range, init_function};
 use hammer_infra::svm::queue::{SvmQueueConditionalWait, SvmQueueOperation};
+use hammer_ipc::binary_api::ApiMain;
 use hammer_runtime::{DataPlaneMain, RuntimeError, RuntimeResult};
 use serde::{Deserialize, Serialize};
 
@@ -63,9 +63,11 @@ static VPE_API_MAIN: OnceLock<VpeApiMain> = OnceLock::new();
 
 impl VpeApiMain {
     pub fn global() -> RuntimeResult<&'static Self> {
-        VPE_API_MAIN.get().ok_or(RuntimeError::RuntimeCapabilityMissing {
-            type_name: "hammer_service::binary_api::VpeApiMain",
-        })
+        VPE_API_MAIN
+            .get()
+            .ok_or(RuntimeError::RuntimeCapabilityMissing {
+                type_name: "hammer_service::binary_api::VpeApiMain",
+            })
     }
 }
 
@@ -108,13 +110,23 @@ fn show_version_handler(request: ShowVersion) {
         return;
     }
     let mut reply = ShowVersionReply {
-        id: 30,
+        id: api
+            .get_msg_index(ShowVersionReply::NAME_CRC)
+            .expect("show version reply is registered"),
         context: request.context,
         retval: 0,
         program: string32(b"vpe"),
         version: string32(env!("CARGO_PKG_VERSION").as_bytes()),
-        build_date: string32(option_env!("HAMMER_BUILD_DATE").unwrap_or("unknown").as_bytes()),
-        build_directory: string256(option_env!("HAMMER_BUILD_DIRECTORY").unwrap_or("").as_bytes()),
+        build_date: string32(
+            option_env!("HAMMER_BUILD_DATE")
+                .unwrap_or("unknown")
+                .as_bytes(),
+        ),
+        build_directory: string256(
+            option_env!("HAMMER_BUILD_DIRECTORY")
+                .unwrap_or("")
+                .as_bytes(),
+        ),
     };
     let message_len = 10 + 32 + 32 + 32 + 256;
     let mut message = unsafe { api.alloc(message_len) };
@@ -130,14 +142,15 @@ fn show_version_handler(request: ShowVersion) {
     let _ = sent;
 }
 
-api_message_table! {
+api_message_range! {
     pub fn setup_message_id_table;
-    ShowVersion = 29 { is_mp_safe: true, traced: true, replay: false };
-    ShowVersionReply = 30 { is_mp_safe: true, traced: true, replay: false };
+    range "vpe";
+    ShowVersion = 0 { is_mp_safe: true, traced: true, replay: false };
+    ShowVersionReply = 1 { is_mp_safe: true, traced: true, replay: false };
 }
 
 #[init_function(name = "vpe_api_hookup", runs_after = ["vpe_api_init"])]
 fn hookup_vpe_api(_: &mut DataPlaneMain) -> RuntimeResult<()> {
-    setup_message_id_table(ApiMain::current());
+    setup_message_id_table(ApiMain::current()).expect("VPE API message range installs once");
     Ok(())
 }

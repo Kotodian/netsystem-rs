@@ -3836,6 +3836,14 @@ pub fn api_message_table(input: TokenStream) -> TokenStream {
         .into()
 }
 
+/// Generate a VPP-style dynamically allocated message-id range.
+#[proc_macro]
+pub fn api_message_range(input: TokenStream) -> TokenStream {
+    api::message_range(input.into())
+        .unwrap_or_else(syn::Error::into_compile_error)
+        .into()
+}
+
 /// Generate the client Message/MessageId inventory and owned request methods.
 /// A bracketed message list is followed by request constructor functions.
 #[proc_macro]
