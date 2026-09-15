@@ -629,10 +629,12 @@ impl SvmFifoSegment {
 
     pub fn duplicate_fifo(&mut self, slice: u32, fifo: u32) -> Result<u32, FifoSegmentError> {
         self.slice(slice)?;
-        let duplicate = self
-            .fifo(slice, fifo)
-            .ok_or(FifoSegmentError::InvalidFifo { fifo })?
-            .duplicate();
+        // The slice owner controls both the original and its private duplicate.
+        let duplicate = unsafe {
+            self.fifo(slice, fifo)
+                .ok_or(FifoSegmentError::InvalidFifo { fifo })?
+                .duplicate()
+        };
         let fifo_index = self.slice_mut(slice)?.fifos.insert(duplicate);
         Ok(fifo_index)
     }
@@ -648,10 +650,12 @@ impl SvmFifoSegment {
         if source_slice == destination_slice {
             return Ok(fifo);
         }
-        let replacement = self
-            .fifo(source_slice, fifo)
-            .ok_or(FifoSegmentError::InvalidFifo { fifo })?
-            .duplicate();
+        // Migration replaces the source entry before the destination executes.
+        let replacement = unsafe {
+            self.fifo(source_slice, fifo)
+                .ok_or(FifoSegmentError::InvalidFifo { fifo })?
+                .duplicate()
+        };
         let capacity = replacement.size();
         let was_active = self.slice(source_slice)?.active_fifos.contains(&fifo);
         let new_index = self.slice_mut(destination_slice)?.fifos.insert(replacement);

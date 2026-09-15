@@ -40,7 +40,8 @@ pub const MAX_ATTACH_DESCRIPTORS: usize = 128;
 
 #[derive(Clone)]
 pub struct AppSessionPublication {
-    session: Arc<AppSession>,
+    session: crate::app::SessionHandle,
+    event_queue: Arc<SessionMsgQueue>,
     application: u32,
     session_segment: Segment,
     offsets: SessionOffsets,
@@ -63,7 +64,8 @@ impl AppSessionPublication {
             return Err(AttachError::SessionSignalMissing.into());
         }
         Ok(Self {
-            session,
+            session: session.session_handle(),
+            event_queue: Arc::clone(session.evt_q()),
             application,
             session_segment,
             offsets,
@@ -555,16 +557,15 @@ async fn send_publication(
                         .ok_or(AttachError::SegmentDescriptorMissing)
                         .map_err(|error| PublicationSendError::Fatal(error.into()))?,
                     current
-                        .session
-                        .evt_q()
+                        .event_queue
                         .read_fd()
                         .ok_or(AttachError::SessionSignalMissing)
                         .map_err(|error| PublicationSendError::Fatal(error.into()))?,
                 ];
                 let words = [
                     ATTACH_PROTOCOL_VERSION,
-                    current.session.session_handle().session_index as u64,
-                    current.session.session_handle().thread_index as u64,
+                    current.session.session_index as u64,
+                    current.session.thread_index as u64,
                     current.session_segment.size() as u64,
                     current.offsets.rx_fifo_off,
                     current.offsets.tx_fifo_off,

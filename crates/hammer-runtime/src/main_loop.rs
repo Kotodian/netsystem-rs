@@ -4,10 +4,10 @@ use std::time::Duration;
 
 /// Runs the thread-zero graph lifecycle and Tokio executor.
 ///
-/// VPP correspondence: `vlib_main` initializes the graph, dispatches normal
-/// init/config and main-loop-enter callbacks, performs the later initial worker
-/// barrier, starts Process Nodes, and keeps the final worker barrier held while
-/// exit callbacks run.
+/// VPP correspondence: `vlib_main` dispatches normal init/config, materializes
+/// the graph after owner state is published, enters the main-loop callbacks,
+/// performs the later initial worker barrier, starts Process Nodes, and keeps
+/// the final worker barrier held while exit callbacks run.
 pub fn run<F, T>(
     global: crate::GlobalMain,
     threads: crate::ThreadMain,
@@ -40,12 +40,15 @@ where
     let global = crate::GlobalMain::global();
 
     let run_result = (|| -> crate::RuntimeResult<T> {
+        crate::init::run_init_functions(global, main)?;
+        crate::init::run_config_functions(global, Some(main), false, global.startup_config())?;
+        // Service node initializers may publish registrations through their
+        // owner Mains (for example NetMain's DPO roots). Materialize the
+        // graph only after those owners have completed normal init/config.
         main.init_graph_from_declarations(
             global.node_registrations.iter().copied(),
             global.node_function_registrations.iter().copied(),
         )?;
-        crate::init::run_init_functions(global, main)?;
-        crate::init::run_config_functions(global, Some(main), false, global.startup_config())?;
         crate::init::run_main_loop_enter(global, main)?;
 
         crate::worker_thread_barrier_sync!(main, {});

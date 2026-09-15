@@ -1030,7 +1030,12 @@ impl Fifo {
 
     /// Copies the process-local FIFO state while retaining the shared FIFO
     /// header and chunk chain, matching `fifo_segment_duplicate_fifo`.
-    pub(crate) fn duplicate(&self) -> Self {
+    ///
+    /// # Safety
+    /// The caller must preserve the shared FIFO's single producer and single
+    /// consumer ownership. Duplicating private lookup state does not authorize
+    /// either side to run concurrently with another owner of that same side.
+    pub unsafe fn duplicate(&self) -> Self {
         Self {
             shr: self.shr,
             fs_hdr: self.fs_hdr,
@@ -1240,10 +1245,10 @@ impl Fifo {
                     chunk_off = chunk.next.load(Ordering::Acquire);
                     while chunk_off != 0 && remaining != 0 {
                         if written == output.len() {
-                            return Err(FifoError::InsufficientCapacity {
-                                requested: to_read,
-                                available: written,
-                            });
+                            // VPP svm_fifo_segments returns the prefix that fits
+                            // in the caller's segment array. Continue with another
+                            // offset when more chunks are needed.
+                            return Ok(written);
                         }
                         let next = &*(self.base.add(chunk_off as usize) as *mut Chunk);
                         let next_len = remaining.min(next.length.load(Ordering::Relaxed) as usize);

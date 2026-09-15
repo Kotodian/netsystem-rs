@@ -18,7 +18,11 @@ use super::memclnt::{
     MemclntKeepaliveReply,
 };
 use super::memory_shared::MsgBuf;
-use super::{Api, codec, table};
+use super::vpe::{ShowVersion, ShowVersionReply};
+use super::{
+    Api, MEMCLNT_CREATE_V2, MEMCLNT_CREATE_V2_REPLY, MEMCLNT_DELETE, MEMCLNT_DELETE_REPLY, codec,
+    table,
+};
 
 const RECEIVE_INTERVAL: Duration = Duration::from_micros(400);
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
@@ -111,9 +115,13 @@ struct Request<C> {
 
 hammer_component_macros::api_client_messages! {
     [MemclntCreateV2, MemclntCreateV2Reply, MemclntDelete, MemclntDeleteReply,
-     MemclntKeepalive, MemclntKeepaliveReply, ControlPing, ControlPingReply]
+     MemclntKeepalive, MemclntKeepaliveReply, ControlPing, ControlPingReply,
+     ShowVersion, ShowVersionReply]
     fn control_ping() -> ControlPing {
         ControlPing { id: 0, client_index: 0, context: 0 }
+    }
+    fn show_version() -> ShowVersion {
+        ShowVersion { id: 0, client_index: 0, context: 0 }
     }
 }
 
@@ -412,7 +420,7 @@ impl<C> Client<C> {
             let length = name_bytes.len().min(63);
             client_name[..length].copy_from_slice(&name_bytes[..length]);
             let request = MemclntCreateV2 {
-                id: 25,
+                id: MEMCLNT_CREATE_V2,
                 context: 0,
                 ctx_quota: 0,
                 input_queue: self
@@ -449,7 +457,7 @@ impl<C> Client<C> {
                 return Err(Error::ConnectTimeout { context: 0 });
             };
             let payload = unsafe { message.as_bytes() }.expect("received message initialized");
-            if payload.get(..2) != Some(26_u16.to_be_bytes().as_slice()) {
+            if payload.get(..2) != Some(MEMCLNT_CREATE_V2_REPLY.to_be_bytes().as_slice()) {
                 unsafe { api.free(message) };
                 continue;
             }
@@ -770,7 +778,7 @@ impl<C> Client<C> {
             return Ok(());
         }
         let request = MemclntDelete {
-            id: 3,
+            id: MEMCLNT_DELETE,
             index,
             handle: 0,
             do_cleanup,
@@ -837,7 +845,7 @@ impl<C> Client<C> {
                     return Err(Error::DisconnectTimeout { client_index });
                 };
                 let payload = unsafe { message.as_bytes() }.expect("received message initialized");
-                if payload.get(..2) != Some(4_u16.to_be_bytes().as_slice()) {
+                if payload.get(..2) != Some(MEMCLNT_DELETE_REPLY.to_be_bytes().as_slice()) {
                     unsafe { api.free(message) };
                     continue;
                 }

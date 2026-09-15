@@ -69,7 +69,9 @@ fn init_session() -> RuntimeResult<()> {
 
 #[hammer_component_macros::main_loop_exit_function]
 fn exit_session() -> RuntimeResult<()> {
-    session_main().begin_session_migration_shutdown();
+    if let Ok(session) = runtime::SessionMain::global() {
+        session.begin_session_migration_shutdown();
+    }
     Ok(())
 }
 

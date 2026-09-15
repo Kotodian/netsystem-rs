@@ -15,6 +15,7 @@ hammer_runtime::__declare_registration_image!(
     ];
     config_functions = [
         binary_api::__CONFIG_FN_BINARY_API_CONFIG,
+        binary_api::__CONFIG_FN_API_SEGMENT_CONFIG,
         session::__CONFIG_FN_SESSION_CONFIG,
     ];
     main_loop_enter_functions = [];

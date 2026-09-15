@@ -49,7 +49,7 @@ impl ApiMsgConfig {
             id,
             name: T::NAME,
             crc: T::CRC,
-            dispatch: T::HANDLER.map(|_| dispatch_message::<T> as _),
+            dispatch: None,
             is_mp_safe: false,
             traced: !T::FLAGS.contains(&"dont_trace"),
             replay: true,
@@ -97,8 +97,8 @@ pub struct ApiMain {
     pub(super) process_pid: AtomicI32,
     pub(super) ring_misses: AtomicU32,
     pub(super) input_queue_length: u32,
-    api_uid: i32,
-    api_gid: i32,
+    api_uid: u32,
+    api_gid: u32,
     global_base_va: u64,
     global_size: u64,
     pub(super) api_size: u64,
@@ -135,8 +135,8 @@ impl ApiMain {
             process_pid: AtomicI32::new(0),
             ring_misses: AtomicU32::new(0),
             input_queue_length: 0,
-            api_uid: -1,
-            api_gid: -1,
+            api_uid: unsafe { libc::getuid() },
+            api_gid: unsafe { libc::getgid() },
             global_base_va: 0,
             global_size: 0,
             api_size: 0,
@@ -186,11 +186,11 @@ impl ApiMain {
         self.input_queue_length = length;
     }
 
-    pub fn set_api_uid(&mut self, uid: i32) {
+    pub fn set_api_uid(&mut self, uid: u32) {
         self.api_uid = uid;
     }
 
-    pub fn set_api_gid(&mut self, gid: i32) {
+    pub fn set_api_gid(&mut self, gid: u32) {
         self.api_gid = gid;
     }
 
@@ -218,11 +218,11 @@ impl ApiMain {
         self.api_region_name = name;
     }
 
-    pub fn api_uid(&self) -> i32 {
+    pub fn api_uid(&self) -> u32 {
         self.api_uid
     }
 
-    pub fn api_gid(&self) -> i32 {
+    pub fn api_gid(&self) -> u32 {
         self.api_gid
     }
 
@@ -388,11 +388,16 @@ impl ApiMain {
 }
 
 #[inline(always)]
-fn handler<T: Api>(message: T) {
-    T::HANDLER.expect("installed dispatch has a typed handler")(message);
+fn handler<T: Api>(message: T, function: fn(T)) {
+    function(message);
 }
 
-fn dispatch_message<T: Api>(payload: &[u8], barrier_required: bool) -> Result<(), codec::Error> {
+#[doc(hidden)]
+pub fn dispatch_message<T: Api>(
+    payload: &[u8],
+    barrier_required: bool,
+    function: fn(T),
+) -> Result<(), codec::Error> {
     let mut decoder = codec::Deserializer::new(payload);
     let message = serde::Deserialize::deserialize(&mut decoder)?;
     if decoder.remaining_bytes() != 0 {
@@ -402,10 +407,10 @@ fn dispatch_message<T: Api>(payload: &[u8], barrier_required: bool) -> Result<()
     }
     if barrier_required {
         hammer_runtime::worker_thread_barrier_sync!({
-            handler::<T>(message);
+            handler::<T>(message, function);
         });
     } else {
-        handler::<T>(message);
+        handler::<T>(message, function);
     }
     Ok(())
 }

@@ -6,6 +6,7 @@
 
 pub mod api;
 pub mod table;
+pub mod vpe;
 pub use api::{ApiMain, ApiMsgConfig, ApiMsgData, ApiMsgRange, ApiVersion};
 pub mod codec;
 pub mod control;
@@ -15,6 +16,41 @@ pub mod memclnt;
 pub mod memory_client;
 pub mod memory_shared;
 pub use definition::{Api, Block, Field, Service, Typedef};
+
+// vlibmemory/memclnt.api declaration order. The macro assigns the stable
+// built-in IDs; registration sites select implemented messages from this one
+// order without repeating numeric IDs.
+hammer_component_macros::api_message_table! {
+    pub ids MEMCLNT_LAST;
+    MemclntCreate;
+    MemclntCreateReply;
+    MemclntDelete;
+    MemclntDeleteReply;
+    RxThreadExit;
+    MemclntRxThreadSuspend;
+    MemclntReadTimeout;
+    RpcCall;
+    RpcCallReply;
+    GetFirstMsgId;
+    GetFirstMsgIdReply;
+    ApiVersions;
+    ApiVersionsReply;
+    TracePluginMsgIds;
+    SockclntCreate;
+    SockclntCreateReply;
+    SockclntDelete;
+    SockclntDeleteReply;
+    SockInitShm;
+    SockInitShmReply;
+    MemclntKeepalive;
+    MemclntKeepaliveReply;
+    ControlPing;
+    ControlPingReply;
+    MemclntCreateV2;
+    MemclntCreateV2Reply;
+    GetApiJson;
+    GetApiJsonReply;
+}
 
 use std::io::{self, Read, Write};
 use std::os::unix::net::UnixStream;

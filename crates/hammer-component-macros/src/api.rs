@@ -3,7 +3,7 @@
 
 use heck::{ToShoutySnakeCase, ToSnakeCase};
 use proc_macro2::{Span, TokenStream};
-use quote::quote;
+use quote::{format_ident, quote};
 use syn::{
     Attribute, Data, DeriveInput, Error, Expr, Fields, Ident, Lit, LitStr, Path, Result, Type,
     spanned::Spanned,
@@ -16,9 +16,8 @@ struct Attributes {
     stream: Option<Path>,
     events: Option<Vec<Path>>,
     autoreply: Option<Ident>,
-    handler: Option<Path>,
-    reply_handler: Option<Path>,
     string: bool,
+    string_length: Option<syn::LitInt>,
     legacy: bool,
     alias: bool,
     enumflag: bool,
@@ -46,10 +45,19 @@ fn attributes(attrs: &[Attribute]) -> Result<Attributes> {
                 "returns" => result.returns = Some(meta.value()?.parse()?),
                 "stream" => result.stream = Some(meta.value()?.parse()?),
                 "autoreply" => result.autoreply = Some(meta.value()?.parse()?),
-                "handler" => result.handler = Some(meta.value()?.parse()?),
-                "reply_handler" => result.reply_handler = Some(meta.value()?.parse()?),
                 "length" => result.length = Some(meta.value()?.parse()?),
-                "string" => result.string = true,
+                "string" => {
+                    result.string = true;
+                    if meta.input.peek(syn::Token![=]) {
+                        let length: syn::LitInt = meta.value()?.parse()?;
+                        if length.base10_parse::<usize>()? == 0 {
+                            return Err(
+                                meta.error("a fixed API string needs space for its terminator")
+                            );
+                        }
+                        result.string_length = Some(length);
+                    }
+                }
                 "legacy" => result.legacy = true,
                 "alias" => result.alias = true,
                 "enumflag" => result.enumflag = true,
@@ -105,7 +113,9 @@ fn reject_serde_layout(attrs: &[Attribute]) -> Result<()> {
                 let _: LitStr = meta.value()?.parse()?;
                 Ok(())
             } else {
-                Err(meta.error("Serde layout attributes are not supported by this API definition; supply a matching manual Serde implementation"))
+                Err(meta.error(
+                    "Serde layout attributes are not supported; Api derives the protocol codec from api attributes",
+                ))
             }
         })?;
     }
@@ -142,29 +152,73 @@ fn ipc_owner() -> Result<TokenStream> {
     Ok(quote!(::#name))
 }
 
-/// Built-in protocols have fixed bootstrap IDs, including gaps for unsupported
-/// messages. Generate configuration and CRC discovery from the same declaration.
+/// Declare one built-in protocol order, or install a subset of that order.
+/// IDs are generated from the complete protocol order instead of repeated at
+/// each handler-registration site.
 pub fn message_table(tokens: TokenStream) -> Result<TokenStream> {
     use syn::parse::Parser;
     let owner = ipc_owner()?;
     let parser = |input: syn::parse::ParseStream<'_>| {
         let visibility: syn::Visibility = input.parse()?;
+        if !input.peek(syn::Token![fn]) {
+            let keyword: Ident = input.parse()?;
+            if keyword != "ids" {
+                return Err(Error::new(keyword.span(), "expected ids or fn"));
+            }
+            let last: Ident = input.parse()?;
+            input.parse::<syn::Token![;]>()?;
+            let mut constants = Vec::new();
+            let mut names = std::collections::HashSet::new();
+            let mut id = 1_u16;
+            while !input.is_empty() {
+                let message: Ident = input.parse()?;
+                if !names.insert(message.to_string()) {
+                    return Err(Error::new(message.span(), "duplicate built-in API message"));
+                }
+                let constant =
+                    Ident::new(&message.to_string().to_shouty_snake_case(), message.span());
+                constants.push(quote!(#visibility const #constant: u16 = #id;));
+                id = id
+                    .checked_add(1)
+                    .ok_or_else(|| Error::new(message.span(), "built-in API ID overflow"))?;
+                input.parse::<syn::Token![;]>()?;
+            }
+            if constants.is_empty() {
+                return Err(input.error("a built-in API order requires a message"));
+            }
+            let last_id = id - 1;
+            return Ok(quote! {
+                #(#constants)*
+                #visibility const #last: u16 = #last_id;
+            });
+        }
         input.parse::<syn::Token![fn]>()?;
         let name: Ident = input.parse()?;
         input.parse::<syn::Token![;]>()?;
+        let keyword: Ident = input.parse()?;
+        if keyword != "ids" {
+            return Err(Error::new(keyword.span(), "expected ids"));
+        }
+        let ids: Path = input.parse()?;
+        input.parse::<syn::Token![;]>()?;
         let mut entries = Vec::new();
-        let mut ids = std::collections::HashSet::new();
+        let mut messages = std::collections::HashSet::new();
         while !input.is_empty() {
             let message: Path = input.parse()?;
-            input.parse::<syn::Token![=]>()?;
-            let id: syn::LitInt = input.parse()?;
-            let value = id.base10_parse::<u16>()?;
-            if value == 0 || !ids.insert(value) {
+            let message_name = message.segments.last().unwrap().ident.to_string();
+            if !messages.insert(message_name.clone()) {
                 return Err(Error::new(
-                    id.span(),
-                    "bootstrap message IDs must be nonzero and unique",
+                    message.span(),
+                    "duplicate built-in API message registration",
                 ));
             }
+            let id = Ident::new(&message_name.to_shouty_snake_case(), message.span());
+            let handler = if input.peek(syn::Token![=>]) {
+                input.parse::<syn::Token![=>]>()?;
+                Some(input.parse::<Path>()?)
+            } else {
+                None
+            };
             let content;
             syn::braced!(content in input);
             let mut policies = Vec::new();
@@ -195,12 +249,32 @@ pub fn message_table(tokens: TokenStream) -> Result<TokenStream> {
                 ));
             }
             input.parse::<syn::Token![;]>()?;
+            let install_handler = handler.map(|handler| {
+                let adapter = format_ident!("__dispatch_{}", message_name.to_snake_case());
+                quote! {
+                    fn #adapter(
+                        payload: &[u8],
+                        barrier_required: bool,
+                    ) -> Result<(), #owner::binary_api::codec::Error> {
+                        #owner::binary_api::api::dispatch_message::<#message>(
+                            payload,
+                            barrier_required,
+                            #handler,
+                        )
+                    }
+                    config.dispatch = Some(#adapter);
+                }
+            });
             entries.push(quote! {
                 {
-                    let mut config = #owner::binary_api::ApiMsgConfig::new::<#message>(#id);
+                    let mut config = #owner::binary_api::ApiMsgConfig::new::<#message>(#ids::#id);
+                    #install_handler
                     #(#policies)*
                     api.msg_config(config);
-                    api.add_msg_name_crc(<#message as #owner::binary_api::Api>::NAME_CRC, #id);
+                    api.add_msg_name_crc(
+                        <#message as #owner::binary_api::Api>::NAME_CRC,
+                        #ids::#id,
+                    );
                 }
             });
         }
@@ -224,29 +298,45 @@ pub fn message_range(tokens: TokenStream) -> Result<TokenStream> {
         input.parse::<syn::Token![fn]>()?;
         let name: Ident = input.parse()?;
         input.parse::<syn::Token![;]>()?;
-        input.parse::<syn::Ident>()?; // range
+        let keyword: Ident = input.parse()?;
+        if keyword != "range" {
+            return Err(Error::new(keyword.span(), "expected range"));
+        }
         let range: LitStr = input.parse()?;
         input.parse::<syn::Token![;]>()?;
         let mut entries = Vec::new();
-        let mut offsets = std::collections::HashSet::new();
+        let mut messages = std::collections::HashSet::new();
+        let mut constants = Vec::new();
+        let mut offset = 0_u16;
         while !input.is_empty() {
             let message: Path = input.parse()?;
-            input.parse::<syn::Token![=]>()?;
-            let offset: syn::LitInt = input.parse()?;
-            let offset_value = offset.base10_parse::<u16>()?;
-            if !offsets.insert(offset_value) {
-                return Err(Error::new(offset.span(), "duplicate API range offset"));
+            let message_name = message.segments.last().unwrap().ident.to_string();
+            if !messages.insert(message_name.clone()) {
+                return Err(Error::new(message.span(), "duplicate API range message"));
             }
+            let constant = Ident::new(&message_name.to_shouty_snake_case(), message.span());
+            constants.push(quote!(#visibility const #constant: u16 = #offset;));
+            let handler = if input.peek(syn::Token![=>]) {
+                input.parse::<syn::Token![=>]>()?;
+                Some(input.parse::<Path>()?)
+            } else {
+                None
+            };
             let content;
             syn::braced!(content in input);
             let mut policies = Vec::new();
+            let mut seen = std::collections::HashSet::new();
             while !content.is_empty() {
                 let field: Ident = content.parse()?;
                 if !matches!(
                     field.to_string().as_str(),
                     "is_mp_safe" | "traced" | "replay"
-                ) {
-                    return Err(Error::new(field.span(), "unknown API message policy"));
+                ) || !seen.insert(field.to_string())
+                {
+                    return Err(Error::new(
+                        field.span(),
+                        "expected a unique is_mp_safe, traced, or replay policy",
+                    ));
                 }
                 content.parse::<syn::Token![:]>()?;
                 let enabled: syn::LitBool = content.parse()?;
@@ -255,29 +345,56 @@ pub fn message_range(tokens: TokenStream) -> Result<TokenStream> {
                     content.parse::<syn::Token![,]>()?;
                 }
             }
+            if seen.len() != 3 {
+                return Err(Error::new(
+                    message.span(),
+                    "declare all three API range message policies",
+                ));
+            }
             input.parse::<syn::Token![;]>()?;
+            let install_handler = handler.map(|handler| {
+                let adapter = format_ident!("__dispatch_{}", message_name.to_snake_case());
+                quote! {
+                    fn #adapter(
+                        payload: &[u8],
+                        barrier_required: bool,
+                    ) -> Result<(), #owner::binary_api::codec::Error> {
+                        #owner::binary_api::api::dispatch_message::<#message>(
+                            payload,
+                            barrier_required,
+                            #handler,
+                        )
+                    }
+                    config.dispatch = Some(#adapter);
+                }
+            });
             entries.push(quote! {
                 {
-                    let id = base.checked_add(#offset_value)
+                    let id = base.checked_add(#offset)
                         .expect("API message range exceeds u16");
                     let mut config = #owner::binary_api::ApiMsgConfig::new::<#message>(id);
+                    #install_handler
                     #(#policies)*
                     api.msg_config(config);
                     api.add_msg_name_crc(<#message as #owner::binary_api::Api>::NAME_CRC, id);
                 }
             });
+            offset = offset
+                .checked_add(1)
+                .ok_or_else(|| Error::new(message.span(), "API range offset overflow"))?;
         }
         if entries.is_empty() {
             return Err(input.error("an API message range requires a message"));
         }
-        let count = offsets.len() as u16;
+        let count = offset;
         Ok(quote! {
+            #(#constants)*
             #visibility fn #name(
                 api: &#owner::binary_api::ApiMain,
-            ) -> Result<(), #owner::binary_api::api::Error> {
+            ) -> Result<u16, #owner::binary_api::api::Error> {
                 let base = api.get_msg_ids(#range, #count)?;
                 #(#entries)*
-                Ok(())
+                Ok(base)
             }
         })
     };
@@ -531,6 +648,14 @@ fn field(field: &syn::Field, owner: &TokenStream, fallback: &str) -> Result<(Lit
         None => protocol_name(rust_name.as_deref().unwrap_or(fallback), field.span())?,
     };
     if attrs.string {
+        if attrs.string_length.is_some()
+            && !matches!(&field.ty, Type::Path(path) if path.path.segments.last().is_some_and(|segment| segment.ident == "String"))
+        {
+            return Err(Error::new_spanned(
+                field,
+                "an explicit API string length requires String",
+            ));
+        }
         if attrs.length.is_some() || attrs.legacy {
             return Err(Error::new_spanned(
                 field,
@@ -538,6 +663,17 @@ fn field(field: &syn::Field, owner: &TokenStream, fallback: &str) -> Result<(Lit
             ));
         }
         let length = match &field.ty {
+            Type::Path(path)
+                if attrs.string_length.is_some()
+                    && path
+                        .path
+                        .segments
+                        .last()
+                        .is_some_and(|segment| segment.ident == "String") =>
+            {
+                let length = attrs.string_length.as_ref().unwrap();
+                quote!(#length)
+            }
             Type::Array(array) if primitive(&array.elem).as_deref() == Some("u8") => {
                 let length = &array.len;
                 quote!(#length)
@@ -786,6 +922,132 @@ fn enum_block(
     Ok(quote!(#owner::Block::Enum(&[#(#values),*])))
 }
 
+/// Generate the codec operations from the same fields as API identity. Fixed
+/// arrays emit their declared elements without a bytes/string length prefix.
+fn message_codec(input: &DeriveInput, owner: &TokenStream) -> Result<TokenStream> {
+    let ident = &input.ident;
+    let Data::Struct(data) = &input.data else {
+        return Err(Error::new_spanned(
+            input,
+            "API codec generation requires named fields",
+        ));
+    };
+    let Fields::Named(fields) = &data.fields else {
+        return Err(Error::new_spanned(
+            input,
+            "API codec generation requires named fields",
+        ));
+    };
+    let mut counts = Vec::new();
+    let mut field_names = Vec::new();
+    let mut encode = Vec::new();
+    let mut decode = Vec::new();
+    for field in &fields.named {
+        let name = field.ident.as_ref().unwrap();
+        let spelling = name.to_string();
+        let ty = &field.ty;
+        if vector_element(ty).is_some() {
+            return Err(Error::new_spanned(
+                field,
+                "counted API vectors still require an explicit codec",
+            ));
+        }
+        let attrs = attributes(&field.attrs)?;
+        if let Some(len) = attrs.string_length {
+            counts.push(quote!(#len));
+            field_names.push(quote! {
+                let end = index + #len;
+                while index < end { fields[index] = #spelling; index += 1; }
+            });
+            encode.push(quote! {
+                let bytes = self.#name.as_bytes();
+                let mut length = bytes.len().min(#len - 1);
+                while !self.#name.is_char_boundary(length) { length -= 1; }
+                for index in 0..#len {
+                    let byte = if index < length { bytes[index] } else { 0u8 };
+                    #owner::serde::ser::SerializeStruct::serialize_field(&mut output, #spelling, &byte)?;
+                }
+            });
+            decode.push(quote! {
+                #name: {
+                    let mut bytes = [0u8; #len];
+                    for byte in &mut bytes {
+                        *byte = #owner::serde::de::SeqAccess::next_element(&mut sequence)?
+                            .ok_or_else(|| <A::Error as #owner::serde::de::Error>::missing_field(#spelling))?;
+                    }
+                    let length = bytes.iter().position(|byte| *byte == 0).unwrap_or(#len);
+                    ::std::string::String::from_utf8(bytes[..length].to_vec())
+                        .map_err(<A::Error as #owner::serde::de::Error>::custom)?
+                },
+            });
+        } else if let Type::Array(array) = ty {
+            let len = &array.len;
+            let element = &array.elem;
+            counts.push(quote!(#len));
+            field_names.push(quote! {
+                let end = index + #len;
+                while index < end { fields[index] = #spelling; index += 1; }
+            });
+            encode.push(quote! {
+                for element in &self.#name {
+                    #owner::serde::ser::SerializeStruct::serialize_field(&mut output, #spelling, element)?;
+                }
+            });
+            decode.push(quote! {
+                #name: {
+                    let mut elements: [Option<#element>; #len] = [const { None }; #len];
+                    for element in &mut elements {
+                        *element = Some(#owner::serde::de::SeqAccess::next_element(&mut sequence)?
+                            .ok_or_else(|| <A::Error as #owner::serde::de::Error>::missing_field(#spelling))?);
+                    }
+                    elements.map(|element| element.expect("all fixed API array elements decoded"))
+                },
+            });
+        } else {
+            counts.push(quote!(1));
+            field_names.push(quote! { fields[index] = #spelling; index += 1; });
+            encode.push(quote! {
+                #owner::serde::ser::SerializeStruct::serialize_field(&mut output, #spelling, &self.#name)?;
+            });
+            decode.push(quote! {
+                #name: #owner::serde::de::SeqAccess::next_element(&mut sequence)?
+                    .ok_or_else(|| <A::Error as #owner::serde::de::Error>::missing_field(#spelling))?,
+            });
+        }
+    }
+    Ok(quote! {
+        impl #owner::serde::Serialize for #ident {
+            fn serialize<S: #owner::serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+                let mut output = #owner::serde::Serializer::serialize_struct(serializer, stringify!(#ident), 0 #(+ #counts)*)?;
+                #(#encode)*
+                #owner::serde::ser::SerializeStruct::end(output)
+            }
+        }
+        impl<'de> #owner::serde::Deserialize<'de> for #ident {
+            fn deserialize<D: #owner::serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+                struct ApiMessage;
+                impl<'de> #owner::serde::de::Visitor<'de> for ApiMessage {
+                    type Value = #ident;
+                    fn expecting(&self, f: &mut ::core::fmt::Formatter) -> ::core::fmt::Result {
+                        f.write_str(stringify!(#ident))
+                    }
+                    fn visit_seq<A: #owner::serde::de::SeqAccess<'de>>(self, mut sequence: A) -> Result<Self::Value, A::Error> {
+                        Ok(#ident { #(#decode)* })
+                    }
+                }
+                const FIELDS: [&str; 0 #(+ #counts)*] = {
+                    let mut fields = [""; 0 #(+ #counts)*];
+                    let mut index = 0;
+                    #(#field_names)*
+                    assert!(index == fields.len());
+                    fields
+                };
+                #owner::serde::Deserializer::deserialize_struct(deserializer, stringify!(#ident), &FIELDS, ApiMessage)
+            }
+        }
+    })
+}
+
 pub fn derive(tokens: TokenStream, message: bool) -> Result<TokenStream> {
     let input: DeriveInput = syn::parse2(tokens)?;
     if !input.generics.params.is_empty() || input.generics.where_clause.is_some() {
@@ -917,12 +1179,6 @@ pub fn derive(tokens: TokenStream, message: bool) -> Result<TokenStream> {
             "returns and autoreply both declare the reply; choose one",
         ));
     }
-    if attrs.reply_handler.is_some() && attrs.autoreply.is_none() {
-        return Err(Error::new_spanned(
-            &input,
-            "reply_handler requires autoreply",
-        ));
-    }
     let null = attrs
         .returns
         .as_ref()
@@ -960,10 +1216,6 @@ pub fn derive(tokens: TokenStream, message: bool) -> Result<TokenStream> {
     let mut generated_reply = TokenStream::new();
     let reply = if let Some(reply) = &attrs.autoreply {
         let reply_name = format!("{}_reply", name.value());
-        let serde_path = LitStr::new(
-            &quote!(#owner::serde).to_string().replace(' ', ""),
-            Span::call_site(),
-        );
         let options: Vec<_> = attrs
             .options
             .iter()
@@ -972,15 +1224,9 @@ pub fn derive(tokens: TokenStream, message: bool) -> Result<TokenStream> {
                 None => quote!(#[api(option(#key))]),
             })
             .collect();
-        let reply_handler = attrs
-            .reply_handler
-            .as_ref()
-            .map(|handler| quote!(#[api(handler = #handler)]));
         generated_reply = quote! {
-            #[derive(#owner::serde::Serialize, #owner::serde::Deserialize, #owner::Api)]
-            #[serde(crate = #serde_path)]
+            #[derive(#owner::Api)]
             #[api(name = #reply_name)]
-            #reply_handler
             #(#options)*
             #visibility struct #reply {
                 pub id: u16,
@@ -1054,10 +1300,7 @@ pub fn derive(tokens: TokenStream, message: bool) -> Result<TokenStream> {
     let write_context = context.then(|| quote!(self.context = context;));
     let write_client = client_index.then(|| quote!(self.client_index = client_index;));
     let key_length = name.value().len() + 9;
-    let handler = attrs
-        .handler
-        .as_ref()
-        .map(|handler| quote!(const HANDLER: Option<fn(Self)> = Some(#handler);));
+    let serialization = message_codec(&input, &owner)?;
     Ok(quote! {
         impl #owner::Api for #ident {
             const NAME: &'static str = #name;
@@ -1075,7 +1318,6 @@ pub fn derive(tokens: TokenStream, message: bool) -> Result<TokenStream> {
             const SERVICE: Option<#owner::Service> = #service;
             const OPTIONS: &'static [(&'static str, Option<&'static str>)] = &[#(#option_values),*];
             const FLAGS: &'static [&'static str] = &[#(#flags),*];
-            #handler
             #[inline]
             fn context(&self) -> Option<u32> { #read_context }
             #[inline]
@@ -1087,6 +1329,68 @@ pub fn derive(tokens: TokenStream, message: bool) -> Result<TokenStream> {
         }
         const _: () = (#block).validate();
         #identity_check
+        #serialization
         #generated_reply
     })
+}
+
+/// VPP REPLY_MACRO2: generate reply identity/context and use the memory
+/// transport's send operation. Business handlers supply only payload fields.
+pub fn reply(tokens: TokenStream) -> Result<TokenStream> {
+    use syn::parse::Parser;
+    let owner = ipc_owner()?;
+    let parser = |input: syn::parse::ParseStream<'_>| {
+        let request: Expr = input.parse()?;
+        input.parse::<syn::Token![,]>()?;
+        let mode: Ident = input.parse()?;
+        let identity: Expr = input.parse()?;
+        input.parse::<syn::Token![,]>()?;
+        let reply: syn::ExprStruct = input.parse()?;
+        if !input.is_empty() {
+            return Err(input.error("unexpected reply arguments"));
+        }
+        if reply.rest.is_some() {
+            return Err(Error::new_spanned(reply, "reply fields must be explicit"));
+        }
+        for field in &reply.fields {
+            if matches!(&field.member, syn::Member::Named(name) if name == "id" || name == "context")
+            {
+                return Err(Error::new_spanned(
+                    field,
+                    "reply id and context are generated",
+                ));
+            }
+        }
+        let message = &reply.path;
+        let constant = Ident::new(
+            &message
+                .segments
+                .last()
+                .unwrap()
+                .ident
+                .to_string()
+                .to_shouty_snake_case(),
+            message.span(),
+        );
+        let id = match mode.to_string().as_str() {
+            "id" => quote!(#identity),
+            "base" => quote!(
+                *#identity.get().expect("API hookup precedes request dispatch") + #constant
+            ),
+            _ => return Err(Error::new(mode.span(), "expected id or base")),
+        };
+        let fields = &reply.fields;
+        Ok(quote! {{
+            let request = #request;
+            let reply = #message {
+                id: #id,
+                context: request.context,
+                #fields
+            };
+            if let Err(source) = #owner::binary_api::ApiMain::current().send_msg(request.client_index, &reply) {
+                ::tracing::warn!(?source, client_index = request.client_index, "API reply delivery failed");
+            }
+        }})
+    };
+    parser.parse2(tokens)
 }
