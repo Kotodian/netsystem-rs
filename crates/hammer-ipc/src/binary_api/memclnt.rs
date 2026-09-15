@@ -315,7 +315,7 @@ fn memclnt_delete_handler(request: MemclntDelete) {
     }
 }
 
-pub(super) fn is_committed(source: &SvmQueueError, operation: SvmQueueOperation) -> bool {
+pub fn is_committed(source: &SvmQueueError, operation: SvmQueueOperation) -> bool {
     matches!(source,
         SvmQueueError::SignalAfterCommit { operation: reported, .. }
         | SvmQueueError::EventSignalAfterCommit { operation: reported, .. }
@@ -396,6 +396,15 @@ impl ApiMain {
             && value.pool_index == slot
             && client_index & 0xff == header.application_restarts() & 0xff)
             .then_some(registration)
+    }
+
+    pub fn registration_queue(
+        &self,
+        client_index: u32,
+    ) -> Option<&'static hammer_infra::svm::queue::SvmQueue> {
+        let registration = self.registration(client_index)?;
+        let queue = unsafe { registration.as_ref().input_queue.as_ref() };
+        Some(unsafe { &*(queue as *const _) })
     }
     fn remove_registration(
         &self,
