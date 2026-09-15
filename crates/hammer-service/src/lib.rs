@@ -11,6 +11,7 @@ hammer_runtime::__declare_registration_image!(
         session::__INIT_FN_SESSION_INIT,
         session::__INIT_FN_SESSION_ATTACH_SERVER,
         transport::__INIT_FN_TRANSPORT_MAIN_INIT,
+        vpe_api::__INIT_FN_VPE_API_INIT,
     ];
     config_functions = [
         binary_api::__CONFIG_FN_BINARY_API_CONFIG,
@@ -25,7 +26,7 @@ hammer_runtime::__declare_registration_image!(
         session::__INIT_FN_SESSION_WORKER_INIT,
     ];
     num_workers_change_functions = [];
-    api_init_functions = [];
+    api_init_functions = [vpe_api::__INIT_FN_VPE_API_HOOKUP];
     graph_nodes = [
         data_plane::__SERVICE_GRAPH_NODE_DROP_NODE,
         data_plane::__SERVICE_GRAPH_NODE_PUNT_NODE,
@@ -60,6 +61,7 @@ pub mod opaque;
 pub mod session;
 /// Transport-neutral helpers. Protocol plugins live under `hammer-plugins/transport/`.
 pub mod transport;
+pub mod vpe_api;
 
 pub use hammer_runtime::{AttachError, RuntimeError, RuntimeResult};
 

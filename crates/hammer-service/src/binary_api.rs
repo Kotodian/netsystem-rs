@@ -640,13 +640,23 @@ fn bind_listener(path: &Path) -> io::Result<StdUnixListener> {
 )]
 fn configure(config: Config) -> RuntimeResult<()> {
     config.validate().map_err(RuntimeError::from)?;
+    let api_segment = config.api_segment.clone();
     assert!(
         BINARY_API_CONFIG.set(config).is_ok(),
         "Binary API configuration callback executes once"
     );
     // All clients must agree on bootstrap IDs, including unsupported messages.
     // Reserve memclnt.api's 1..=28 before any plugin API-init allocates a range.
-    ApiMain::new(29).install();
+    let mut api = ApiMain::new(29);
+    api.set_api_region_name(api_segment.region_name);
+    api.set_api_uid(i32::try_from(api_segment.uid).expect("API uid fits i32"));
+    api.set_api_gid(i32::try_from(api_segment.gid).expect("API gid fits i32"));
+    api.set_global_base_va(api_segment.global_base_va as u64);
+    api.set_global_size(api_segment.global_size as u64);
+    api.set_global_pvt_heap_size(api_segment.global_private_heap_size as u64);
+    api.set_api_pvt_heap_size(api_segment.api_private_heap_size as u64);
+    api.set_api_size(api_segment.api_size as u64);
+    api.install();
     Ok(())
 }
 
@@ -671,6 +681,37 @@ fn init() -> RuntimeResult<()> {
 struct Config {
     socket_path: Option<String>,
     max_frame_bytes: usize,
+    api_segment: ApiSegmentConfig,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize)]
+#[serde(default, deny_unknown_fields)]
+struct ApiSegmentConfig {
+    region_name: String,
+    root_path: PathBuf,
+    uid: u32,
+    gid: u32,
+    global_base_va: usize,
+    global_size: usize,
+    global_private_heap_size: usize,
+    api_private_heap_size: usize,
+    api_size: usize,
+}
+
+impl Default for ApiSegmentConfig {
+    fn default() -> Self {
+        Self {
+            region_name: "/vpe-api".to_owned(),
+            root_path: PathBuf::new(),
+            uid: unsafe { libc::getuid() },
+            gid: unsafe { libc::getgid() },
+            global_base_va: 0x1_3000_0000,
+            global_size: 64 << 20,
+            global_private_heap_size: 128 << 10,
+            api_private_heap_size: 128 << 10,
+            api_size: 16 << 20,
+        }
+    }
 }
 
 static BINARY_API_CONFIG: OnceLock<Config> = OnceLock::new();
@@ -681,6 +722,7 @@ impl Default for Config {
         Self {
             socket_path: None,
             max_frame_bytes: hammer_ipc::binary_api::DEFAULT_MAX_FRAME_BYTES,
+            api_segment: ApiSegmentConfig::default(),
         }
     }
 }
