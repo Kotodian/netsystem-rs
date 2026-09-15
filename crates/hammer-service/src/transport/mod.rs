@@ -5,11 +5,11 @@ use std::sync::atomic::AtomicU32;
 
 use hammer_infra::bihash::Bihash;
 use hammer_infra::pool::Pool;
+use hammer_infra::sync::SpinLock;
 use hammer_runtime::app::SessionHandle;
 use hammer_runtime::session::{
     SessionConnectEndpoint, SessionListenEndpoint, SessionStreamDirection,
 };
-use hammer_runtime::sync::SpinLock;
 use hammer_runtime::{RuntimeError, RuntimeResult};
 use thiserror::Error;
 

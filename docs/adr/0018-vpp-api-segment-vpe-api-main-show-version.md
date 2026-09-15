@@ -31,12 +31,13 @@ The design is based on the vendored VPP sources:
 | --- | --- |
 | Early API-segment configuration | `third_party/vpp/src/vpp/api/api.c`, `api_segment_config`, registered with `VLIB_EARLY_CONFIG_FUNCTION("api-segment")`; it accepts `prefix`, numeric or named `uid`/`gid`, `baseva`, `global-size`, `global-pvt-heap-size`, `api-pvt-heap-size`, and `api-size`. |
 | Mapping after configuration | `third_party/vpp/src/vlib/main.c` and `third_party/vpp/src/vlibmemory/memory_api.c`; `map_api_segment_init` calls `vl_mem_api_init(am->region_name)` after early configuration. |
-| VPE state | `third_party/vpp/src/vlibapi/api_helper_macros.h`; `vpe_api_main_t` contains VPE registration pools/hashes, `link_state_process_up`, and convenience pointers to `vlib_main_t` and `vnet_main_t`. |
+| VPE state | `third_party/vpp/src/vlibapi/api_helper_macros.h:636-728`; `vpe_api_main_t` contains the registration pools/hashes, `link_state_process_up`, and convenience pointers `vlib_main` and `vnet_main`. The concrete global is declared there and owned by the VPE API module. |
 | VPE ownership | `third_party/vpp/src/vnet/interface_api.c`; the process-global `vpe_api_main` is defined by the VPE API owner, not by the generic memory transport. |
 | Message registration | `third_party/vpp/src/vpp/api/api.c`; `vpe_api_hookup` includes generated VPE declarations, allocates the VPE message-id range, and marks `show_version` thread-safe. |
 | Show-version request/reply | `third_party/vpp/src/vpp/api/vpe.api`; request has `client_index` and `context`; reply has `context`, `retval`, `program[32]`, `version[32]`, `build_date[32]`, and `build_directory[256]`. |
 | Handler behavior | `third_party/vpp/src/vpp/api/api.c`, `vl_api_show_version_t_handler`; it obtains build metadata, fills a reply, and sends it through the registration selected by the request. |
-| Client entry point | `third_party/vpp/src/vpp-api/vapi/vapi_c_test.c` and `vapi_cpp_test.cpp`; the client allocates `show_version`, sends it, and consumes `show_version_reply` through the normal VAPI request/callback path. |
+| Build metadata | `third_party/vpp/src/vpp/app/version.c:137-151`; the handler calls `vpe_api_get_build_directory`, `vpe_api_get_version`, and `vpe_api_get_build_date` directly. |
+| Client entry point | `third_party/vpp/src/vpp-api/vapi/vapi_c_test.c:302-314,420-430`; the client allocates `show_version`, sends it, and consumes `show_version_reply` through the normal VAPI request/callback path. |
 
 ### 已核对的 VPP 实际调用链
 
@@ -127,11 +128,16 @@ impl Default for ApiSegmentConfig {
 // Existing hammer-ipc API; not a new wrapper.
 pub unsafe fn map_shared_region(
     &self,
-    root: &mut SvmRegion,
+    root: SvmRegion,
     path: &Path,
     is_server: bool,
 ) -> Result<(), MapError>;
 ```
+
+The call transfers the root descriptor to `ApiMain`; its existing mapped-region
+owner stores root before the API subregion so explicit shutdown unmaps the
+subregion first. The service init therefore does not keep a second static root
+owner or depend on `Drop` for shared-memory lifecycle.
 
 删除草案中的 `map_primary_segment` 和 `ApiSegmentError`：目前没有证据
 表明复用上述 owner 方法和既有错误类型不能完成映射。mapping 调用必须
@@ -155,31 +161,27 @@ allocation, or underlying message-id table storage:
 
 ```rust
 pub struct VpeApiMain {
-    /// The process-lifetime DataPlaneMain used by VPE API code.
-    data_plane_main: &'static DataPlaneMain,
     net_main: &'static crate::net::NetMain,
 }
 ```
 
 `VpeApiMain` is a `hammer-service` process-global owner for VPE API state. Its installation is explicit and call-once, matching
-the existing main installation path. `data_plane_main` is the direct
-`&'static DataPlaneMain` equivalent of VPP's `vlib_main_t *vlib_main`.
-Both fields are required references; there is no `Option` or raw-pointer
-selector. `net_main` uses the existing `hammer_service::net::NetMain`, defined
-at `crates/hammer-service/src/net/mod.rs:95`, and its existing `global()` at :115.
-The VPE init hook runs after `net_main_init` (:804) and obtains that reference
-with `NetMain::global()?`. The DataPlaneMain static-lifetime requirement remains
-an implementation prerequisite documented below; it is not already provided
-by the current init callback signature.
-Callers do not obtain VPE business behavior by calling `ApiMain::global()`.
+the existing main installation path. `net_main` uses the existing
+`hammer_service::net::NetMain`, defined at `crates/hammer-service/src/net/mod.rs:95`,
+and its existing `global()` at :115. The VPE init hook runs after `net_main_init`
+and obtains that reference with `NetMain::global()?`. VPP's `vlib_main` convenience
+pointer is not copied into this owner: Hammer's `DataPlaneMain` is a mutable
+runtime owner borrowed by the main loop, and the show-version owner has no
+operation requiring a second static reference. Manufacturing one with a lifetime
+cast or raw pointer would violate Rust aliasing. Callers do not obtain VPE
+business behavior by calling `ApiMain::global()`.
 
 初始化通过现有注册链进行。`VpeApiMain` 没有 `init`、`new`、`install`、
 `register_messages` 或 `show_version` 方法，也没有由 daemon 手动调用的
 `init_vpe_api` 编排函数。
 
 两个 hook 都由 `#[init_function]` 生成 `InitFunction`，所属的
-`RegistrationImage` 列表决定阶段。下面是目标 hook 声明签名，函数体职责
-在表中定义；普通 init 的静态 main 引用来源仍须满足下述生命周期条件：
+`RegistrationImage` 列表决定阶段：
 
 ```rust
 // crates/hammer-service/src/vpe_api.rs — ordinary initialization hook
@@ -190,7 +192,7 @@ fn vpe_api_init(main: &mut DataPlaneMain) -> RuntimeResult<()>;
 
 // Same module — API initialization hook, NOT an ordinary init callback.
 #[hammer_component_macros::init_function(name = "vpe_api_hookup")]
-fn vpe_api_hookup() -> RuntimeResult<()> {
+fn vpe_api_hookup(_: &mut DataPlaneMain) -> RuntimeResult<()> {
     vpe::setup_message_id_table(ApiMain::current())?;
     Ok(())
 }
@@ -198,7 +200,7 @@ fn vpe_api_hookup() -> RuntimeResult<()> {
 
 | Hook | RegistrationImage 归属 | 函数体职责 |
 | --- | --- | --- |
-| `vpe_api_init` | `init_functions` | 在 service 内初始化并发布 `VpeApiMain`，建立 DataPlaneMain 和现有 NetMain 引用；初始化实际订阅状态并决定 API Process 启用。映射是后续独立步骤，不能把 enable 当成 map。这里不安装 VPE 消息表。 |
+| `vpe_api_init` | `init_functions` | 在 service 内初始化并发布 `VpeApiMain`，建立现有 NetMain 引用；初始化实际订阅状态并决定 API Process 启用。映射是后续独立步骤，不能把 enable 当成 map。这里不安装 VPE 消息表。 |
 | `vpe_api_hookup` | `api_init_functions` | 调用 API 宏生成的 `vpe::setup_message_id_table`，分配 VPE 消息范围、安装 handler/name/CRC 和 MP-safe 属性。这里不初始化 VpeApiMain、不映射区域。 |
 
 在 `crates/hammer-service/src/lib.rs` 的现有 image 声明中追加：
@@ -219,19 +221,14 @@ VPP 对应关系是 `src/vpp/api/api.c:247` 的 `vpe_api_init` 负责 main 引�
 调用生成的 `setup_message_id_table`，由 `VLIB_API_INIT_FUNCTION` 注册。
 订阅表仅在有相应订阅业务时引入，show-version 不新增空订阅池。
 
-现有 Hammer `api_message_table!` 只生成固定 ID 表，不能声称它已经具备
-VPE 动态范围能力。后续在这个宏内补动态范围声明和对应的
-`setup_message_id_table(&ApiMain) -> Result<u16, api::Error>` 生成能力；复用
-现有 `ApiMain::get_msg_ids`、`msg_config` 和 name/CRC 注册。这里的 `?`
-对应生成的动态范围分配结果，普通 init 不调用这个 setup，也不手写
+`api_message_table!` 保留固定 bootstrap 表，`api_message_range!` 负责 VPE
+动态范围：它复用 `ApiMain::get_msg_ids`、`msg_config` 和 name/CRC 注册，
+返回生成的 `u16` base。普通 init 不调用这个 setup，也不手写
 `setup_vpe_message_id_table` 包装。
 
-`DataPlaneMain` 引用字段保留用户要求的 `&'static DataPlaneMain`。现有
-`InitFunction.func` 只有 `fn(&mut DataPlaneMain)`，不能由这个短借用直接
-得到静态引用。实现必须先落实 runtime owner 的静态共享引用和后续可变
-访问的兼容性；仅让内存地址固定并不满足 Rust 借用规则。禁止在 hook 中
-用 `transmute` 或裸指针延长生命周期。本 ADR 不把不存在的静态 main
-访问器伪装成既有 API；这一运行时依赖属于后续实现前需完成的设计项。
+`vpe_api_hookup` 保留 runtime 现有的 `fn(&mut DataPlaneMain)` 适配签名，
+但只使用 `ApiMain::current()` 完成 API range 安装；它不保存或延长该借用，
+也不制造 `vlib_main` 的静态替身。
 
 ### 3. Add the V2 show-version API
 
@@ -239,10 +236,9 @@ The messages follow `vpe.api` semantics and use owned Rust values. The handler
 has the required safe generic shape at the dispatch boundary:
 
 ```rust
-// crates/hammer-service/src/vpe_api.rs
+// crates/hammer-ipc/src/binary_api/vpe.rs
 #[derive(Clone, Copy, Debug, Api)]
-#[api(name = "show_version", returns = ShowVersionReply,
-      handler = show_version_handler)]
+#[api(name = "show_version", returns = ShowVersionReply)]
 pub struct ShowVersion {
     pub id: u16,
     pub client_index: u32,
@@ -255,41 +251,75 @@ pub struct ShowVersionReply {
     pub id: u16,
     pub context: u32,
     pub retval: i32,
-    #[api(string)]
-    pub program: [u8; 32],
-    #[api(string)]
-    pub version: [u8; 32],
-    #[api(string)]
-    pub build_date: [u8; 32],
-    #[api(string)]
-    pub build_directory: [u8; 256],
+    #[api(string = 32)]
+    pub program: String,
+    #[api(string = 32)]
+    pub version: String,
+    #[api(string = 32)]
+    pub build_date: String,
+    #[api(string = 256)]
+    pub build_directory: String,
 }
 
-// Concrete business callback signature (body described below).
+// crates/hammer-service/src/vpe_api.rs
 fn show_version_handler(request: ShowVersion);
-// Reuse binary_api/api.rs:391's existing safe generic handler<T: Api>(T).
+
+api_message_range! {
+    pub fn setup_message_id_table;
+    range "vpe";
+    ShowVersion => show_version_handler { is_mp_safe: true, traced: true, replay: false };
+    ShowVersionReply { is_mp_safe: true, traced: true, replay: false };
+}
 
 ```
 
 The concrete implementation is the safe value handler in `hammer-service`,
-`fn show_version_handler(request: ShowVersion)`. It performs the complete
-operation in that function: it reads build constants (VPP uses
-`vpe_api_get_*` from `src/vpp/app/version.c:137,144,151`), looks up the
-registration through the existing `ApiMain`
-operation, constructs the owned reply, allocates and encodes it, queues it, and
-frees the allocation only when queue insertion did not commit. There is no
-`VpeApiMain::show_version` indirection and no reply-building method on
-`ApiMain`; `ApiMain` supplies only allocation, registration lookup, and queue
-access.
+`fn show_version_handler(request: ShowVersion)`. It reads build constants and
+supplies business reply fields to `api_reply!`. The macro sets the message ID
+from the module base and generated offset, copies request context, and calls
+`ApiMain::send_msg<T: Api>(&self, client_index: u32, reply: &T)
+-> Result<(), SvmQueueError>`. This is a transport operation; it does not read
+build metadata or know ShowVersion. Queue lookup, allocation, encoding and
+commit-aware release stay inside IPC. The handler has no `unsafe`, manual
+encoder, length arithmetic or direct queue insertion.
 
-The reply uses fixed string arrays from `vpe.api:73`, not the codec's
-length-prefixed API String. The payload sizes including the message ID are
-10 bytes for the request and 362 bytes for the reply. Field serialization
-must preserve those fixed widths, including the 256-byte array; the type
-sketch does not claim the required Serde implementations already exist.
-The handler zero-initializes each array and copies at most capacity minus one
-bytes, following VPP's `strncpy` calls in `api.c:103`. A missing registration is an ordinary
-request rejection and does not allocate a reply.
+The source is `src/vlibapi/api_helper_macros.h:27-93`: `REPLY_MACRO` fills only
+common reply fields; `REPLY_MACRO2` additionally runs the supplied business
+body before sending. Both look up registrations and allocate/send messages.
+`api_reply!` corresponds to the second form for replies with business fields.
+It reports send failures after the transport resolves allocation ownership;
+there is no retry once the request has been disposed. A missing registration
+is the normal no-recipient case and does not allocate a reply.
+
+The Rust fields are standard `String`; `#[api(string = 32)]` or
+`#[api(string = 256)]` declares their fixed protocol capacity. Generated codec
+operations write that exact byte count, truncating to capacity minus one and
+zero-padding, with no string length prefix. Unlike C's byte truncation, the
+Rust encoder stops at a UTF-8 boundary so a truncated Rust String can be
+received as String; invalid UTF-8 from a peer is a decode error. This is an
+explicit Rust representation constraint, not a VPP requirement. Request and
+reply encoded lengths remain 10 and 362 bytes respectively. Length attributes
+also determine name/CRC metadata, so changing storage to String does not turn
+the protocol field into a variable-length string.
+
+API range 宏按消息声明顺序生成 `SHOW_VERSION`、`SHOW_VERSION_REPLY` 模块内偏移常量，
+`setup_message_id_table` 返回实际分配的 `u16` base。API-init 将 base 保存到
+模块的 `MSG_ID_BASE: OnceLock<u16>`；回复宏使用保存的 base 和根据回复类型
+推导出的 `SHOW_VERSION_REPLY` 偏移。
+不在服务端回复路径查 name/CRC，也不引入 `ApiTrait` 别名补救该查表方式。
+VPP 对应 `api.c:227` 保存 `msg_id_base`，reply macro 使用 base 加消息偏移。
+客户端的 name/CRC 查询仍负责连接时建立双方消息 ID 的映射。
+
+`ShowVersionReply` 在 IPC 声明并供 service 直接复用。字段使用标准 `String`，
+固定编码长度由 API 属性声明，
+不引入 `String32`、`String256`、`fixed_string!` 或按长度命名的构造函数。
+`#[derive(Api)]` 根据同一份字段声明无条件生成编解码；类型属性中不存在额外的
+`serde` 开关，也不同时派生或手写 `Serialize` / `Deserialize`。
+定长字符串与数组按声明宽度编码，无长度前缀；保留字段名让 codec 正确处理 opaque
+`context` / `client_index`。业务模块不手写 Serde impl 或 Visitor，
+不再维护 `355` 这种由字段布局重复计算的常量。请求和回复都只在 IPC 声明
+一次；service 的 API-init hookup 用 `ShowVersion => show_version_handler`
+绑定 safe handler，避免 IPC 反向依赖 service，也不复制协议类型。
 
 The VPE range marks `show_version` as MP-safe, matching the VPP hookup. The
 handler still uses the existing dispatch barrier rules; MP-safe means it may
@@ -303,10 +333,11 @@ request bookkeeping, context counter, message-id mappings, registration handle,
 and queue ownership. `show_version` is an ordinary typed request:
 
 ```rust
-impl MemoryClient {
-    pub async fn show_version(
+impl<C> Client<C> {
+    pub fn show_version(
         &mut self,
-    ) -> Result<ShowVersionReply, MemoryClientError>;
+        callback: fn(&mut C, u32, bool, Result<Option<Message>, Error>),
+    ) -> Result<u32, Error>;
 }
 ```
 
@@ -325,7 +356,11 @@ message installed before that traversal.
 2. 普通 init 遍历调用 `vpe_api_init`，初始化 service 的 `VpeApiMain`；
    mapping 路径消费完整配置，建立区域并安装 `memclnt` bootstrap。
    所需区域名字在映射前确定，不在映射后再修改。普通 init 不做 VPE
-   消息表 hookup，映射失败阻止进入请求处理阶段。
+   消息表 hookup，映射失败阻止进入请求处理阶段。普通 init/config 完成后
+   才 materialize graph nodes；这是当前 service owner 的实际依赖边界，
+   `drop`、`interface-output` 和 feature arcs 会在节点初始化时发布到
+   `NetMain`，不能在 owner 发布前建图。随后才进入 `main_loop_enter`，由
+   现有 hook 启动 worker 和 barrier。
 3. 沿用 `binary_api_clnt` 的 Process factory 启动路径：先直接执行
    `control::setup_message_id_table(api)`，再执行 `run_api_init(main)`。
 4. API-init 遍历 service image 的 `vpe_api_hookup`，由它调用宏生成的
@@ -346,7 +381,8 @@ owned request, calls the safe handler, and queues the typed reply through the
 registration's input queue.
 
 `ApiMain` owns mapping, allocation, message tables, client registrations, and
-queue operations. `VpeApiMain` owns VPE API state and the two main references.
+queue operations. `VpeApiMain` owns VPE API state and the existing `NetMain`
+reference; `DataPlaneMain` remains owned and mutably borrowed by the runtime.
 Build metadata is read directly by the handler, as in VPP; it does not require
 an owned `BuildMetadata` field or a business method on VpeApiMain. The
 memory client owns request correlation and client-side message-id mappings.

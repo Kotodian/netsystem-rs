@@ -1,7 +1,6 @@
 use hammer_ipc::binary_api::{Api, deserialize, serialize};
-use serde::{Deserialize, Serialize};
 
-#[derive(Debug, PartialEq, Serialize, Deserialize, Api)]
+#[derive(Debug, PartialEq, Api)]
 #[api(returns = null)]
 struct InterfaceState {
     id: u16,

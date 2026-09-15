@@ -21,6 +21,7 @@ use super::{Api, api::ApiMain, codec};
 
 const SHMEM_VERSION: u32 = 2;
 
+#[hammer_component_macros::runtime_error(subsystem = "binary API memory")]
 #[derive(Debug, thiserror::Error)]
 pub enum MapError {
     #[error("open shared-memory backing `{path}`: {source}")]
@@ -704,7 +705,7 @@ impl ApiMain {
     /// arbitrary shared bytes cannot be parsed as Rust Vec metadata.
     pub unsafe fn map_shared_region(
         &self,
-        root: &mut SvmRegion,
+        mut root: SvmRegion,
         path: &Path,
         is_server: bool,
     ) -> Result<(), MapError> {
@@ -861,7 +862,9 @@ impl ApiMain {
             }
         }
         unsafe {
-            (*self.mapped_shmem_regions.get()).push(region);
+            let regions = &mut *self.mapped_shmem_regions.get();
+            regions.push(Box::new(root));
+            regions.push(region);
             *self.rp.get() = Some(region_address);
             *self.shmem_header.get() = Some(header);
         }

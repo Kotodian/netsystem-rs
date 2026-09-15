@@ -6,7 +6,8 @@ pub use hammer_component_macros::{Api, Typedef};
 #[doc(hidden)]
 pub use serde;
 
-/// A concrete owned message, with independently supplied Serde implementations.
+/// A concrete owned message. `#[derive(Api)]` generates its protocol codec from
+/// the same field declarations used for identity and CRC generation.
 pub trait Api: serde::Serialize + for<'de> serde::Deserialize<'de> {
     const NAME: &'static str;
     const BLOCK: Block;
@@ -15,8 +16,6 @@ pub trait Api: serde::Serialize + for<'de> serde::Deserialize<'de> {
     const SERVICE: Option<Service> = None;
     const OPTIONS: &'static [(&'static str, Option<&'static str>)] = &[];
     const FLAGS: &'static [&'static str] = &[];
-    const HANDLER: Option<fn(Self)> = None;
-
     /// Correlation token, when declared by this message's protocol header.
     fn context(&self) -> Option<u32>;
 

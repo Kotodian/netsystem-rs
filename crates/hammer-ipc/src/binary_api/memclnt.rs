@@ -1,25 +1,19 @@
 //! Shared-memory Binary API messages and their server-owned protocol operations.
 use std::alloc::Layout;
-use std::fmt;
 use std::mem::size_of;
 use std::ptr::NonNull;
 use std::time::Instant;
 
+use super::api::ApiMain;
+use super::memory_shared::ShmemHeader;
+use super::{Api, MEMCLNT_CREATE_V2_REPLY, MEMCLNT_DELETE_REPLY, MEMCLNT_KEEPALIVE};
 use hammer_infra::svm::queue::{
     SvmQueue, SvmQueueConditionalWait, SvmQueueConfig, SvmQueueError, SvmQueueOperation,
 };
 use hammer_infra::svm::region::SvmRegion;
-use serde::de::{Error as _, SeqAccess, Visitor};
-use serde::ser::SerializeStruct;
-use serde::{Deserialize, Serialize};
 
-use super::api::ApiMain;
-use super::memory_shared::ShmemHeader;
-use super::{Api, Array};
-
-#[derive(Clone, Copy, Debug, Serialize, Deserialize, Api)]
-#[api(name = "memclnt_delete", returns = MemclntDeleteReply,
-    handler = memclnt_delete_handler)]
+#[derive(Clone, Copy, Debug, Api)]
+#[api(name = "memclnt_delete", returns = MemclntDeleteReply)]
 pub struct MemclntDelete {
     pub id: u16,
     pub index: u32,
@@ -27,7 +21,7 @@ pub struct MemclntDelete {
     pub do_cleanup: bool,
 }
 
-#[derive(Clone, Copy, Debug, Serialize, Deserialize, Api)]
+#[derive(Clone, Copy, Debug, Api)]
 #[api(name = "memclnt_delete_reply")]
 pub struct MemclntDeleteReply {
     pub id: u16,
@@ -35,9 +29,8 @@ pub struct MemclntDeleteReply {
     pub handle: u64,
 }
 
-#[derive(Clone, Copy, Debug, Serialize, Deserialize, Api)]
-#[api(name = "memclnt_keepalive", autoreply = MemclntKeepaliveReply,
-    reply_handler = memclnt_keepalive_reply_handler)]
+#[derive(Clone, Copy, Debug, Api)]
+#[api(name = "memclnt_keepalive", autoreply = MemclntKeepaliveReply)]
 pub struct MemclntKeepalive {
     pub id: u16,
     pub client_index: u32,
@@ -45,8 +38,7 @@ pub struct MemclntKeepalive {
 }
 
 #[derive(Clone, Copy, Debug, Api)]
-#[api(name = "memclnt_create_v2", returns = MemclntCreateV2Reply,
-    handler = memclnt_create_v2_handler)]
+#[api(name = "memclnt_create_v2", returns = MemclntCreateV2Reply)]
 pub struct MemclntCreateV2 {
     pub id: u16,
     pub context: u32,
@@ -58,71 +50,7 @@ pub struct MemclntCreateV2 {
     pub keepalive: bool,
 }
 
-impl Serialize for MemclntCreateV2 {
-    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
-        let mut fields = serializer.serialize_struct("memclnt_create_v2", 7)?;
-        fields.serialize_field("id", &self.id)?;
-        fields.serialize_field("context", &self.context)?;
-        fields.serialize_field("ctx_quota", &self.ctx_quota)?;
-        fields.serialize_field("input_queue", &self.input_queue)?;
-        fields.serialize_field("name", self.name.as_slice())?;
-        fields.serialize_field("api_versions", &self.api_versions)?;
-        fields.serialize_field("keepalive", &self.keepalive)?;
-        fields.end()
-    }
-}
-
-impl<'de> Deserialize<'de> for MemclntCreateV2 {
-    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
-        struct CreateV2;
-        impl<'de> Visitor<'de> for CreateV2 {
-            type Value = MemclntCreateV2;
-            fn expecting(&self, f: &mut fmt::Formatter) -> fmt::Result {
-                f.write_str("memory client create-v2 message")
-            }
-            fn visit_seq<A: SeqAccess<'de>>(self, mut fields: A) -> Result<Self::Value, A::Error> {
-                Ok(MemclntCreateV2 {
-                    id: fields
-                        .next_element()?
-                        .ok_or_else(|| A::Error::missing_field("id"))?,
-                    context: fields
-                        .next_element()?
-                        .ok_or_else(|| A::Error::missing_field("context"))?,
-                    ctx_quota: fields
-                        .next_element()?
-                        .ok_or_else(|| A::Error::missing_field("ctx_quota"))?,
-                    input_queue: fields
-                        .next_element()?
-                        .ok_or_else(|| A::Error::missing_field("input_queue"))?,
-                    name: fields
-                        .next_element_seed(Array::<[u8; 64]>::new())?
-                        .ok_or_else(|| A::Error::missing_field("name"))?,
-                    api_versions: fields
-                        .next_element()?
-                        .ok_or_else(|| A::Error::missing_field("api_versions"))?,
-                    keepalive: fields
-                        .next_element()?
-                        .ok_or_else(|| A::Error::missing_field("keepalive"))?,
-                })
-            }
-        }
-        deserializer.deserialize_struct(
-            "memclnt_create_v2",
-            &[
-                "id",
-                "context",
-                "ctx_quota",
-                "input_queue",
-                "name",
-                "api_versions",
-                "keepalive",
-            ],
-            CreateV2,
-        )
-    }
-}
-
-#[derive(Clone, Copy, Debug, Serialize, Deserialize, Api)]
+#[derive(Clone, Copy, Debug, Api)]
 #[api(name = "memclnt_create_v2_reply")]
 pub struct MemclntCreateV2Reply {
     pub id: u16,
@@ -227,7 +155,7 @@ fn memclnt_create_v2_handler(request: MemclntCreateV2) {
     };
     let index = slot << 8 | unsafe { api.shmem_header() }.application_restarts() & 0xff;
     let reply = MemclntCreateV2Reply {
-        id: 26,
+        id: MEMCLNT_CREATE_V2_REPLY,
         context: request.context,
         response: 0,
         handle: registration.as_ptr().addr() as u64,
@@ -283,7 +211,7 @@ fn memclnt_delete_handler(request: MemclntDelete) {
     if !request.do_cleanup {
         let queue = unsafe { registration.as_ref().input_queue.as_ref() };
         let reply = MemclntDeleteReply {
-            id: 4,
+            id: MEMCLNT_DELETE_REPLY,
             response: 1,
             handle: request.handle,
         };
@@ -371,16 +299,17 @@ pub fn receive() -> Result<bool, SvmQueueError> {
 }
 
 // Fixed bootstrap IDs from memclnt.api; unsupported messages retain their gaps.
-// The derived Api::HANDLER selects executable entries; replies without a server
-// handler still appear in name/CRC discovery.
+// Hookup binds executable entries explicitly; replies without a server handler
+// still appear in name/CRC discovery.
 hammer_component_macros::api_message_table! {
     pub fn setup_message_id_table;
-    MemclntDelete = 3 { is_mp_safe: false, traced: false, replay: false };
-    MemclntDeleteReply = 4 { is_mp_safe: false, traced: false, replay: false };
-    MemclntKeepalive = 21 { is_mp_safe: true, traced: false, replay: false };
-    MemclntKeepaliveReply = 22 { is_mp_safe: true, traced: false, replay: false };
-    MemclntCreateV2 = 25 { is_mp_safe: false, traced: false, replay: false };
-    MemclntCreateV2Reply = 26 { is_mp_safe: false, traced: false, replay: false };
+    ids super;
+    MemclntDelete => memclnt_delete_handler { is_mp_safe: false, traced: false, replay: false };
+    MemclntDeleteReply { is_mp_safe: false, traced: false, replay: false };
+    MemclntKeepalive { is_mp_safe: true, traced: false, replay: false };
+    MemclntKeepaliveReply => memclnt_keepalive_reply_handler { is_mp_safe: true, traced: false, replay: false };
+    MemclntCreateV2 => memclnt_create_v2_handler { is_mp_safe: false, traced: false, replay: false };
+    MemclntCreateV2Reply { is_mp_safe: false, traced: false, replay: false };
 }
 
 impl ApiMain {
@@ -398,14 +327,39 @@ impl ApiMain {
             .then_some(registration)
     }
 
-    pub fn registration_queue(
-        &self,
-        client_index: u32,
-    ) -> Option<&'static hammer_infra::svm::queue::SvmQueue> {
-        let registration = self.registration(client_index)?;
+    /// Sends an owned protocol reply on main[0]. A removed client has no reply
+    /// destination, matching vl_api_client_index_to_registration's null case.
+    /// Serialization completes before the queue borrow, so it cannot retain a
+    /// registration across user-defined Serde calls.
+    pub fn send_msg<T: Api>(&self, client_index: u32, reply: &T) -> Result<(), SvmQueueError> {
+        if self.registration(client_index).is_none() {
+            return Ok(());
+        }
+        let length =
+            super::codec::serialized_len(reply).expect("declared API reply length encodes");
+        let mut allocation = unsafe { self.alloc(length) };
+        let written = unsafe { allocation.encode(reply) }.expect("declared API reply encodes");
+        assert_eq!(written, length, "API reply encoded length is stable");
+        let Some(registration) = self.registration(client_index) else {
+            unsafe { self.free(allocation) };
+            return Ok(());
+        };
+        // Registration lookup enforces main[0]. No callback or await can remove
+        // its queue before insertion finishes. A successful/committed insertion
+        // transfers message ownership to the recipient.
         let queue = unsafe { registration.as_ref().input_queue.as_ref() };
-        Some(unsafe { &*(queue as *const _) })
+        let address = usize::from(&allocation).to_ne_bytes();
+        let sent = queue.add(&address, SvmQueueConditionalWait::Nowait);
+        if sent
+            .as_ref()
+            .err()
+            .is_some_and(|source| !is_committed(source, SvmQueueOperation::Add))
+        {
+            unsafe { self.free(allocation) };
+        }
+        sent
     }
+
     fn remove_registration(
         &self,
         slot: u32,
@@ -531,7 +485,7 @@ impl ApiMain {
             value.last_heard = now;
             let index = slot << 8 | unsafe { self.shmem_header() }.application_restarts() & 0xff;
             let request = MemclntKeepalive {
-                id: 21,
+                id: MEMCLNT_KEEPALIVE,
                 client_index: index,
                 context: index,
             };

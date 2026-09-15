@@ -170,13 +170,13 @@ fn control_ping_shmem_process() {
         .create_new(true)
         .open(&root_path)
         .unwrap();
-    let mut root = SvmRegion::create(
+    let root = SvmRegion::create(
         api.global_base_va(),
         &api.root_region_config(),
         root_file.into(),
     )
     .unwrap();
-    unsafe { api.map_shared_region(&mut root, &api_path, true) }.unwrap();
+    unsafe { api.map_shared_region(root, &api_path, true) }.unwrap();
     let mut main = DataPlaneMain::new_main(&threads).unwrap();
     hammer_runtime::main_loop::run(global, threads, plugins, &mut main, async {
         let mut client = Client::<PingResults>::new();
@@ -323,7 +323,6 @@ fn control_ping_shmem_process() {
     .unwrap();
     // Process tasks have been joined and the client queue has been released.
     unsafe { api.unmap_shared_regions() }.unwrap();
-    root.unmap().unwrap();
     std::fs::remove_file(stats_path).unwrap();
     std::fs::remove_file(api_path).unwrap();
     std::fs::remove_file(root_path).unwrap();

@@ -159,8 +159,8 @@ pub enum SessionSwitchPoolStatus {
 
 pub struct SessionMigrationState {
     transport: u8,
-    rx_fifo: Arc<Fifo>,
-    tx_fifo: Arc<Fifo>,
+    rx_fifo: Fifo,
+    tx_fifo: Fifo,
 }
 
 pub struct SessionSwitchPoolReply {
@@ -1732,7 +1732,7 @@ impl SessionWorker {
         if entry.tx_fifo.max_dequeue() < total {
             return Ok(0);
         }
-        let dropped = entry.tx_fifo.dequeue_drop(total);
+        let dropped = entry.tx_fifo.drop_dequeue(total);
         self.publish_tx_dequeue(session_id, dropped)?;
         Ok(dropped)
     }
@@ -2794,8 +2794,11 @@ impl SessionWorker {
         }
         Some(SessionMigrationState {
             transport,
-            rx_fifo: Arc::clone(&entry.rx_fifo),
-            tx_fifo: Arc::clone(&entry.tx_fifo),
+            // The migration protocol suspends the source before the target
+            // installs these private FIFO records. Shared storage is retained;
+            // process-local OOO/lookup state never crosses threads via Arc.
+            rx_fifo: unsafe { entry.rx_fifo.duplicate() },
+            tx_fifo: unsafe { entry.tx_fifo.duplicate() },
         })
     }
 
@@ -2806,8 +2809,8 @@ impl SessionWorker {
     ) -> RuntimeResult<(u32, SessionHandle)> {
         let session_id = self.insert_session_entry(SessionEntry::creating_transport(
             state.transport,
-            state.rx_fifo,
-            state.tx_fifo,
+            Arc::new(state.rx_fifo),
+            Arc::new(state.tx_fifo),
         ))?;
         if let Err(error) = self.finish_transport_creation(session_id, index) {
             drop(self.entries.remove(session_id));
@@ -3527,7 +3530,7 @@ impl SessionWorker {
             .entries
             .get(session_id)
             .ok_or(SessionError::SessionMissing { session_id })?;
-        let dropped = entry.tx_fifo.dequeue_drop(bytes);
+        let dropped = entry.tx_fifo.drop_dequeue(bytes);
         self.publish_tx_dequeue(session_id, dropped)?;
         if dropped != 0 {
             self.mark_ready(session_id);
@@ -3773,33 +3776,46 @@ impl SessionWorker {
             .entries
             .get(session_id)
             .ok_or(SessionError::SessionMissing { session_id })?;
-        let (first, second) =
-            entry
-                .tx_fifo
-                .segments(offset, len)
-                .ok_or(SessionError::TxFifoRangeInvalid {
-                    session_id,
-                    tx_offset: offset,
-                    payload_len: len,
-                })?;
-        let mut last = index;
-        while let Some(next) = runtime.buffer(last).next_buffer_slot() {
-            last = next;
-        }
-        for data in [first, second] {
-            let copied = runtime.buffer_chain_append_data_with_alloc(index, &mut last, data);
-            if copied != data.len() {
-                return Err(hammer_core::error::DataPlaneError::BufferPoolsUnavailable.into());
-            }
-        }
-        let written = first.len() + second.len();
-        if written != len {
+        if offset
+            .checked_add(len)
+            .is_none_or(|end| end > entry.tx_fifo.max_dequeue())
+        {
             return Err(SessionError::TxFifoRangeInvalid {
                 session_id,
                 tx_offset: offset,
                 payload_len: len,
             }
             .into());
+        }
+        let mut last = index;
+        while let Some(next) = runtime.buffer(last).next_buffer_slot() {
+            last = next;
+        }
+        let mut written = 0;
+        while written < len {
+            let mut segments = [std::mem::MaybeUninit::uninit(); 2];
+            let count = entry
+                .tx_fifo
+                .readable_segments(offset + written, &mut segments)
+                .map_err(|_| SessionError::TxFifoRangeInvalid {
+                    session_id,
+                    tx_offset: offset,
+                    payload_len: len,
+                })?;
+            assert!(
+                count > 0,
+                "validated TX FIFO range remains readable until ACK"
+            );
+            for segment in &segments[..count] {
+                // readable_segments initialized exactly count entries.
+                let data = unsafe { segment.assume_init_ref() };
+                let data = &data[..data.len().min(len - written)];
+                let copied = runtime.buffer_chain_append_data_with_alloc(index, &mut last, data);
+                if copied != data.len() {
+                    return Err(hammer_core::error::DataPlaneError::BufferPoolsUnavailable.into());
+                }
+                written += copied;
+            }
         }
         Ok(())
     }

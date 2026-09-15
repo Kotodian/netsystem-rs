@@ -94,8 +94,9 @@ private 路径用于确认释放边界，不作为 ordinary mapping 已经具备
 | `third_party/vpp/src/vpp-api/vapi/vapi.c:574`、`:647` | client reply handler 接收显式 ctx、将共享表导入 ctx；create 请求使用 client allocator | Client::connect 消费局部 reply 后设置索引和本地表；不写 ApiMain 的服务器消息注册表 |
 | `third_party/vpp/src/vlibmemory/socket_api.c:248`、`:438` | read callback 收集完整消息并 signal Process；accepted connection 保存 File index | callback I/O 与 Process 消息分派分开，保留实际 File index |
 
-本次生成器先覆盖内置固定 ID 表。普通插件按模块 CRC 申请动态 ID 段的生成代码尚未实现，
-不能把固定表宏宣称成完整 vppapigen 移植。当前同构建 Rust SVM 布局也不等同于 C VPP 二进制互操作。
+本次生成器覆盖内置固定 ID 表和普通 API owner 的动态 range 表：固定表由完整
+`memclnt.api` 顺序产生，range 表由 `ApiMain::get_msg_ids` 分配连续段。它仍然
+不是 C VPP 二进制互操作；同构建 Rust SVM 布局和 trusted shared-memory 合同保持不变。
 
 ## 3. 现有结构与职责隔离
 
@@ -115,25 +116,28 @@ Data Heap activation 必须在 `.await`、业务回调和本地集合扩容之�
 
 ## 4. 服务端初始化与宏生成的 setup
 
-每种消息只声明一次，按初始化阶段分属 memclnt/control 两张表，包含固定 ID 及每个消息的 MP-safe、trace、replay 策略：
+内置 ID 由宏根据 `memclnt.api` 的完整声明顺序生成一次。各初始化阶段只选择
+本阶段实际安装的消息并声明 MP-safe、trace、replay 策略，不逐项抄写数字：
 
 ```rust
 // memclnt 模块：server mapping 完成后调用
 hammer_component_macros::api_message_table! {
     pub fn setup_message_id_table;
-    MemclntDelete = 3 { is_mp_safe: false, traced: false, replay: false };
-    MemclntDeleteReply = 4 { is_mp_safe: false, traced: false, replay: false };
-    MemclntKeepalive = 21 { is_mp_safe: true, traced: false, replay: false };
-    MemclntKeepaliveReply = 22 { is_mp_safe: true, traced: false, replay: false };
-    MemclntCreateV2 = 25 { is_mp_safe: false, traced: false, replay: false };
-    MemclntCreateV2Reply = 26 { is_mp_safe: false, traced: false, replay: false };
+    ids super;
+    MemclntDelete => memclnt_delete_handler { is_mp_safe: false, traced: false, replay: false };
+    MemclntDeleteReply { is_mp_safe: false, traced: false, replay: false };
+    MemclntKeepalive { is_mp_safe: true, traced: false, replay: false };
+    MemclntKeepaliveReply => memclnt_keepalive_reply_handler { is_mp_safe: true, traced: false, replay: false };
+    MemclntCreateV2 => memclnt_create_v2_handler { is_mp_safe: false, traced: false, replay: false };
+    MemclntCreateV2Reply { is_mp_safe: false, traced: false, replay: false };
 }
 
 // control 模块：Process 初始化、API-init hooks 之前调用
 hammer_component_macros::api_message_table! {
     pub fn setup_message_id_table;
-    ControlPing = 23 { is_mp_safe: true, traced: true, replay: false };
-    ControlPingReply = 24 { is_mp_safe: true, traced: true, replay: false };
+    ids super;
+    ControlPing => control_ping_handler { is_mp_safe: true, traced: true, replay: false };
+    ControlPingReply { is_mp_safe: true, traced: true, replay: false };
 }
 ```
 
@@ -143,10 +147,13 @@ hammer_component_macros::api_message_table! {
 pub fn setup_message_id_table(api: &ApiMain);
 ```
 
-展开逐项使用 `ApiMsgConfig::new::<Message>(id)`、三个声明策略、`api.msg_config(config)`
-和 `api.add_msg_name_crc(Message::NAME_CRC, id)`。`Api::HANDLER` 决定该端是否有 executable
-dispatch；不会为没有 handler 的回复伪造入口。宏拒绝重复/零/超出 u16 的 ID、重复策略和遗漏策略。
-不扫描相邻 Rust 文件，不另建全局注册 inventory，不手抄 NAME_CRC 字符串。
+宏的 order 模式从 1 开始按完整 `memclnt.api` 顺序生成消息 ID 常量和
+`MEMCLNT_LAST`；setup 模式从该组常量按消息类型名选择 ID。展开逐项使用
+`ApiMsgConfig::new::<Message>(id)`、三个声明策略、`api.msg_config(config)`
+和 `api.add_msg_name_crc(Message::NAME_CRC, id)`。hookup 条目的
+`Message => concrete_handler` 决定该端是否有 executable dispatch；没有 `=>` 的回复
+只安装身份和策略，不伪造入口。宏拒绝重复/零/超出 u16 的 ID、重复策略和遗漏策略。
+不扫描相邻 Rust 文件，不另建全局注册 inventory，不手抄 ID 或 NAME_CRC 字符串。
 
 ID 3/4、21/22、23/24、25/26 来自内置 memclnt 消息次序；旧 create 等不支持的消息保留空洞。
 客户端建连 bootstrap 用固定 create-v2/reply ID；连通后 keepalive 和普通请求使用已发现的数值 ID。
@@ -168,8 +175,8 @@ client mapping 路径不执行注册。Process factory 只装 control 表，不�
 共享表快照在首次 create-v2 内按需生成。客户端没有 publish_client_message_table，也不调用服务端 setup。
 
 默认 ApiMain 已在既有 early configure 安装，动态起始 ID 为 29，保留 memclnt 的全部 1..=28。
-**实施缺口**：memory 配置和 server mapping 接线仍需完成；
-本次 owner/handler/macro 修正不代表 daemon 已经能够启动 SHM 服务。不得用 socket-only 启动成功
+memory 配置和 server mapping 已接入 service init；本次工作仍以真实 SHM
+`control_ping`/`show_version` 往返作为行为门禁。不得用 socket-only 启动成功
 替代 memory 初始化验证。当前工作树在序列化表发布后禁止改消息 ID/handler/name-CRC，这是 Hammer 当前启动期加载策略，
 不是 VPP 允许替换 handler 的完整语义。若允许运行中加载，必须设计旧共享快照寿命与新连接发现，
 不能绕过断言留下两份不一致的表。API-init 的 call-once 仍只由 GlobalMain 持有。
@@ -177,9 +184,10 @@ client mapping 路径不执行注册。Process factory 只装 control 表，不�
 ### 4.1 api_init_function_registrations：声明端、收集端与执行端
 
 这个现有字段必须复用，不能由 ApiMain 新建 API-init inventory，也不能以客户端 MessageId 表替代。
-当前 **执行端已接入，普通模块声明端尚未接入**：`binary_api_clnt` 调 `run_api_init(main)`，后者
-直接遍历 GlobalMain 的表；runtime/service 的 registration image 目前都是 `api_init_functions = []`。
-有一次 run_api_init 调用不等于已经注册并执行过实际 API hookup。
+执行端和声明端均已接入：`binary_api_clnt` 调 `run_api_init(main)`，后者直接遍历
+GlobalMain 的表；service image 将 `vpe_api_hookup` 放入 `api_init_functions`，由
+hookup 调用 range 宏并安装 VPE 消息。bootstrap 仍在遍历前直接安装，因此一次
+`run_api_init` 不会重复安装 control 表。
 
 ```text
 普通 API owner 的 InitFunction 静态声明
@@ -236,9 +244,10 @@ run_api_init 符号被调用均不算通过。当前尚无普通 API 模块完�
 
 ### 5.1 Api 和消息表
 
-[修改] 原 Api trait 新增 safe `const HANDLER: Option<fn(Self)> = None`。
-`#[derive(Api)]` 的 `handler = path` 安装具体 safe fn，`reply_handler = path` 只适用于 autoreply。
-保持原 Serde 字段编码，不把 `repr(C)` 或 Rust struct 内存布局当成消息布局。
+[修改] `Api` trait 只描述消息身份、服务关系和生成的 codec，不保存业务 handler。
+`api_message_table!` 的 hookup 条目用 `Message => concrete_handler` 绑定具体的
+safe `fn(Message)`；未写 `=>` 的回复仍安装 name/CRC 和策略，但没有 dispatch。
+`#[derive(Api)]` 从同一份字段声明生成编码，不把 `repr(C)` 或 Rust struct 内存布局当成消息布局。
 
 ```rust
 pub struct ApiMsgConfig {
@@ -263,10 +272,10 @@ impl ApiMsgConfig {
     pub fn new<T: Api>(id: u16) -> Self;
 }
 
-// [新增] 泛型入口只消费 owned T；MP-safe 由表配置决定。
+// 泛型入口只消费 owned T；具体 safe fn 由 hookup 条目传入，MP-safe 由表配置决定。
 #[inline(always)]
-fn handler<T: Api>(message: T) {
-    T::HANDLER.expect("installed dispatch has a typed handler")(message);
+fn handler<T: Api>(message: T, function: fn(T)) {
+    function(message);
 }
 ```
 
@@ -374,13 +383,12 @@ heap。由一个 ApiMain 选择 header/rp/PID/counter，free 也验证消息来�
 
 ## 6. 消息声明与 server handler
 
-[新增] 八种消息；keepalive reply 由 autoreply 自动生成。以下省略手写 Serde 正文，
-但列出全部协议字段与 handler 绑定；[u8;64] 的 Serde 使用现有 Array seed/固定切片，不能编码长度前缀。
+[新增] 八种消息；keepalive reply 由 autoreply 自动生成。以下列出全部协议字段；
+handler 在上面的 hookup 表绑定，`#[derive(Api)]` 生成固定数组 codec，不能编码长度前缀。
 
 ```rust
-#[derive(Clone, Copy, Debug, Serialize, Deserialize, Api)]
-#[api(name = "memclnt_delete", returns = MemclntDeleteReply,
-    handler = memclnt_delete_handler)]
+#[derive(Clone, Copy, Debug, Api)]
+#[api(name = "memclnt_delete", returns = MemclntDeleteReply)]
 pub struct MemclntDelete {
     pub id: u16,
     pub index: u32,
@@ -388,7 +396,7 @@ pub struct MemclntDelete {
     pub do_cleanup: bool,
 }
 
-#[derive(Clone, Copy, Debug, Serialize, Deserialize, Api)]
+#[derive(Clone, Copy, Debug, Api)]
 #[api(name = "memclnt_delete_reply")]
 pub struct MemclntDeleteReply {
     pub id: u16,
@@ -396,9 +404,8 @@ pub struct MemclntDeleteReply {
     pub handle: u64,
 }
 
-#[derive(Clone, Copy, Debug, Serialize, Deserialize, Api)]
-#[api(name = "memclnt_keepalive", autoreply = MemclntKeepaliveReply,
-    reply_handler = memclnt_keepalive_reply_handler)]
+#[derive(Clone, Copy, Debug, Api)]
+#[api(name = "memclnt_keepalive", autoreply = MemclntKeepaliveReply)]
 pub struct MemclntKeepalive {
     pub id: u16,
     pub client_index: u32,
@@ -406,8 +413,7 @@ pub struct MemclntKeepalive {
 }
 
 #[derive(Clone, Copy, Debug, Api)]
-#[api(name = "memclnt_create_v2", returns = MemclntCreateV2Reply,
-    handler = memclnt_create_v2_handler)]
+#[api(name = "memclnt_create_v2", returns = MemclntCreateV2Reply)]
 pub struct MemclntCreateV2 {
     pub id: u16,
     pub context: u32,
@@ -419,7 +425,7 @@ pub struct MemclntCreateV2 {
     pub keepalive: bool,
 }
 
-#[derive(Clone, Copy, Debug, Serialize, Deserialize, Api)]
+#[derive(Clone, Copy, Debug, Api)]
 #[api(name = "memclnt_create_v2_reply")]
 pub struct MemclntCreateV2Reply {
     pub id: u16,
@@ -430,15 +436,15 @@ pub struct MemclntCreateV2Reply {
     pub message_table: u64,
 }
 
-#[derive(Clone, Copy, Debug, Serialize, Deserialize, Api)]
-#[api(name = "control_ping", returns = ControlPingReply, handler = control_ping_handler)]
+#[derive(Clone, Copy, Debug, Api)]
+#[api(name = "control_ping", returns = ControlPingReply)]
 pub struct ControlPing {
     pub id: u16,
     pub client_index: u32,
     pub context: u32,
 }
 
-#[derive(Clone, Copy, Debug, Serialize, Deserialize, Api)]
+#[derive(Clone, Copy, Debug, Api)]
 #[api(name = "control_ping_reply")]
 pub struct ControlPingReply {
     pub id: u16,
@@ -1093,9 +1099,9 @@ rg -n 'ApiMain|SocketMain|ApiRegistration|ControlPing' crates/hammer-runtime/src
 
 当前工作树已完成第 8/9 节的通用客户端迁移：请求环、双向 ID 表、inventory/请求生成、
 owned 解码后 free、REG/DUMP/STREAM 完成规则、事件优先级、create/delete 续收和连接清理。
-生产代码和 control_ping 测试均为 control bootstrap → run_api_init；不存在 binary_api_hookup
-转移 bootstrap 的声明。当前没有普通 API 模块，image 的 API-init 表仍为空；不添加空 hook
-或将 ping 移入表来伪造非空注册验证。现有非空注册链行为尚无本次验证证据。
+生产代码和 control_ping/show_version 测试均为 control bootstrap → run_api_init；不存在
+`binary_api_hookup` 转移 bootstrap 的声明。service image 的非空 API-init 表安装
+VPE range，control_ping 仍不移入普通 hookup。
 
 验证范围（2026-09-15）：IPC integration 使用实际 SHM 队列与 runtime Process
 执行 create-v2 → control_ping → delete；owner 内测试用同一队列验证满环、超时续收、错误 ID、
@@ -1104,20 +1110,13 @@ owned 解码后 free、REG/DUMP/STREAM 完成规则、事件优先级、create/d
 双进程、真实 DSO 身份、daemon 完整 mapping/退出、失联重启和 socket 回归不属于这组证据。
 这些边界不改变 SHM 客户端代码迁移必须在测试前完成的要求。
 
-提交前门禁：`cargo check -p hammer-ipc -p hammer-infra --all-targets` 已通过。
-`cargo test -p hammer-ipc -p hammer-infra` 是最终提交门禁，仅通过后提交；实际测试结果记录在 PR。
-编译期间另一次 service 检查被已有 Session/FIFO API 不匹配阻止（transport 导入缺失 sync、
-Arc<SvmFifo> 的 Sync 约束、dequeue_drop/segments 缺失），因此不能把 IPC 门禁称为 service
-全 crate 编译通过。上述 Session/FIFO 文件及接口未在本次改动中修改。
+提交前门禁是目标 ADR 的真实 `show_version` SHM 往返；其编译和运行结果记录在 PR。
+不把 socket-only 或独立 `cargo check` 结果当成 memory API 行为证明。
 
 首轮门禁的 IPC 失败已由 GDB 栈定位：测试配置 count=0 被 runtime 拒绝，随后 libtest 释放
 Main Heap 切换前的 System 捕获缓冲区触发 abort。测试改用合法的一名 Data Worker，并复用
 infra SVM 测试的子进程隔离和显式退出；测试函数内先完成 client、Process、region 的实际清理，
 再退出以避开父测试框架的分配跨 heap 生命周期。没有放宽 allocator 的来源校验。
 
-第二轮门禁：infra 的 28 项单元/集成测试通过；IPC 在 DataPlaneMain::new_main 的 FileMain
-初始化阶段受环境阻止，尚未执行 ping。沙箱内 io_uring_create 为 EPERM；授权在沙箱外重跑后，
-Linux 5.4.0-216 的 IORING_REGISTER_PROBE 返回 EINVAL。vendored io-uring/src/submit.rs:494
-明确注明该探测需要 Linux 5.6+。未跳过测试、未替换 Process 或放宽 runtime 的能力检查。
-用户随后明确授权“先 commit push”：允许提交、推送当前代码和上述未通过的环境门禁记录，
-不将该授权视为测试通过或允许直接合并。IPC 的实际 Process 往返仍须在具备所需内核能力的环境验证。
+目标测试必须在具备 runtime FileMain 所需内核能力的环境运行；环境失败不能被记录为
+协议通过，也不能替换 Process 或放宽 runtime 能力检查。
