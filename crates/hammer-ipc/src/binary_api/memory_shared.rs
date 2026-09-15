@@ -251,8 +251,13 @@ impl ShmemHeader {
     }
 
     #[inline]
-    fn server_pid(&self) -> i32 {
+    pub(super) fn server_pid(&self) -> i32 {
         self.server_pid.load(Ordering::Relaxed)
+    }
+
+    #[inline]
+    pub(super) fn application_restarts(&self) -> u32 {
+        self.application_restarts.load(Ordering::Relaxed)
     }
 
     fn set_server_pid(&self, pid: i32) {
@@ -271,113 +276,6 @@ impl ShmemHeader {
     #[inline]
     pub unsafe fn input_queue(&self) -> &SvmQueue {
         unsafe { self.input_queue.as_ref() }
-    }
-
-    pub unsafe fn alloc(&self, payload_len: usize) -> MsgBuf {
-        unsafe { self.alloc_internal(payload_len, None, false, false) }
-            .expect("non-nullable shared-message allocation cannot exhaust the Data Heap")
-    }
-
-    pub unsafe fn alloc_zeroed(&self, payload_len: usize) -> MsgBuf {
-        unsafe { self.alloc_internal(payload_len, None, true, false) }
-            .expect("non-nullable shared-message allocation cannot exhaust the Data Heap")
-    }
-
-    pub unsafe fn alloc_or_null(&self, payload_len: usize) -> Option<MsgBuf> {
-        unsafe { self.alloc_internal(payload_len, None, false, true) }
-    }
-
-    pub unsafe fn alloc_as_client(&self, payload_len: usize) -> MsgBuf {
-        unsafe { self.alloc_internal(payload_len, Some(RingRole::Client), false, false) }
-            .expect("non-nullable shared-message allocation cannot exhaust the Data Heap")
-    }
-
-    pub unsafe fn alloc_zeroed_as_client(&self, payload_len: usize) -> MsgBuf {
-        unsafe { self.alloc_internal(payload_len, Some(RingRole::Client), true, false) }
-            .expect("non-nullable shared-message allocation cannot exhaust the Data Heap")
-    }
-
-    pub unsafe fn alloc_as_client_or_null(&self, payload_len: usize) -> Option<MsgBuf> {
-        unsafe { self.alloc_internal(payload_len, Some(RingRole::Client), false, true) }
-    }
-
-    unsafe fn alloc_internal(
-        &self,
-        payload_len: usize,
-        forced_role: Option<RingRole>,
-        zeroed: bool,
-        nullable: bool,
-    ) -> Option<MsgBuf> {
-        assert!(
-            payload_len <= i32::MAX as usize,
-            "API message length fits signed int"
-        );
-        let (layout, payload_offset) = MsgBuf::layout(payload_len);
-        let api = ApiMain::global();
-        let role = forced_role.unwrap_or_else(|| {
-            if api.process_pid.load(Ordering::Relaxed) == self.server_pid() {
-                RingRole::Server
-            } else {
-                RingRole::Client
-            }
-        });
-        if role == RingRole::Server {
-            hammer_runtime::thread_main::ensure_main_thread()
-                .expect("server message rings require the main thread");
-        }
-
-        let mut message = self.rings(role).iter().find_map(|ring| unsafe {
-            ring.alloc_slot(layout.size(), role, &self.garbage_collects)
-        });
-        if message.is_none() {
-            api.ring_misses.fetch_add(1, Ordering::Relaxed);
-            let region = unsafe { *api.rp.get() }.expect("API region mapped before allocation");
-            let lock = unsafe { region.as_ref() }
-                .lock()
-                .expect("Data Heap region lock");
-            let heap = lock.data_heap().expect("API region has a Data Heap");
-            let active_heap = heap.activate();
-            let allocation = if nullable {
-                heap.allocate(layout)
-            } else {
-                Some(
-                    heap.allocate(layout)
-                        .expect("non-nullable Data Heap allocation"),
-                )
-            };
-            message = allocation.map(|base| {
-                unsafe {
-                    base.as_ptr()
-                        .cast::<AtomicPtr<SvmQueue>>()
-                        .write(AtomicPtr::new(ptr::null_mut()));
-                    base.as_ptr()
-                        .add(MsgBuf::timestamp_offset())
-                        .cast::<AtomicU32>()
-                        .write(AtomicU32::new(0));
-                }
-                MsgBuf {
-                    payload: unsafe { NonNull::new_unchecked(base.as_ptr().add(payload_offset)) },
-                    payload_len,
-                    initialized_len: 0,
-                }
-            });
-            drop(active_heap);
-            drop(lock);
-        }
-        let mut message = message?;
-        message.payload_len = payload_len;
-        let prefix = unsafe { message.payload.as_ptr().sub(payload_offset) };
-        unsafe {
-            prefix
-                .add(MsgBuf::length_offset())
-                .cast::<u32>()
-                .write((payload_len as u32).to_be())
-        };
-        if zeroed {
-            unsafe { ptr::write_bytes(message.payload.as_ptr(), 0, payload_len) };
-            message.initialized_len = payload_len;
-        }
-        Some(message)
     }
 }
 
@@ -508,6 +406,51 @@ impl MsgBuf {
         self.payload_len
     }
 
+    /// The caller owns a message address dequeued from this live mapping.
+    /// Range checks cannot prove that an allocation was not reclaimed by a peer.
+    pub unsafe fn from_address(region: &SvmRegion, address: usize) -> Self {
+        let offset = Self::layout(0).1;
+        let prefix_address = address
+            .checked_sub(offset)
+            .expect("dequeued API message has a complete prefix");
+        let prefix = NonNull::new(prefix_address as *mut u8)
+            .expect("dequeued API message prefix is nonnull");
+        assert!(
+            prefix_address.is_multiple_of(Self::layout(0).0.align())
+                && region.contains_range(prefix, offset),
+            "dequeued API message prefix is aligned and inside its region"
+        );
+        let payload =
+            NonNull::new(address as *mut u8).expect("dequeued API message address is nonnull");
+        let length = unsafe {
+            prefix
+                .as_ptr()
+                .add(Self::length_offset())
+                .cast::<u32>()
+                .read()
+        };
+        let payload_len = u32::from_be(length) as usize;
+        assert!(
+            region.contains_range(payload, payload_len),
+            "dequeued API message payload is inside its region"
+        );
+        Self {
+            payload,
+            payload_len,
+            initialized_len: payload_len,
+        }
+    }
+
+    #[inline]
+    pub unsafe fn as_bytes(&self) -> Result<&[u8], codec::Error> {
+        if self.initialized_len < self.payload_len {
+            return Err(codec::Error::custom(
+                "API message payload is not initialized",
+            ));
+        }
+        Ok(unsafe { std::slice::from_raw_parts(self.payload.as_ptr(), self.payload_len) })
+    }
+
     pub unsafe fn encode<T: Api>(&mut self, value: &T) -> Result<usize, codec::Error> {
         let output = unsafe {
             std::slice::from_raw_parts_mut(
@@ -521,27 +464,14 @@ impl MsgBuf {
     }
 
     pub unsafe fn decode<T: Api>(&self) -> Result<T, codec::Error> {
-        if self.initialized_len < self.payload_len {
+        let mut decoder = codec::Deserializer::new(unsafe { self.as_bytes() }?);
+        let message = T::deserialize(&mut decoder)?;
+        if decoder.remaining_bytes() != 0 {
             return Err(codec::Error::custom(
-                "API message payload is not initialized",
+                "API message has trailing payload bytes",
             ));
         }
-        let input = unsafe { std::slice::from_raw_parts(self.payload.as_ptr(), self.payload_len) };
-        codec::deserialize(input)
-    }
-
-    /// Only the process currently owning this address may release it; a peer
-    /// may have reclaimed a ring slot after ten seconds.
-    pub unsafe fn free(self) {
-        if unsafe { self.release_ring() } {
-            return;
-        }
-        let api = ApiMain::global();
-        let region = unsafe { *api.rp.get() }.expect("originating region remains mapped");
-        let lock = unsafe { region.as_ref() }
-            .lock()
-            .expect("Data Heap region lock");
-        unsafe { self.free_nolock(&lock) };
+        Ok(message)
     }
 
     pub(crate) unsafe fn free_nolock(self, lock: &RegionLock<'_>) {
@@ -623,6 +553,141 @@ const _: () = {
 };
 
 impl ApiMain {
+    // Message allocation and release use this same owner. ShmemHeader supplies
+    // ring storage; it never combines its own rings with a different main's heap.
+    pub unsafe fn alloc(&self, payload_len: usize) -> MsgBuf {
+        unsafe { self.alloc_internal(payload_len, None, false, false) }
+            .expect("non-nullable shared-message allocation cannot exhaust the Data Heap")
+    }
+
+    pub unsafe fn alloc_zeroed(&self, payload_len: usize) -> MsgBuf {
+        unsafe { self.alloc_internal(payload_len, None, true, false) }
+            .expect("non-nullable shared-message allocation cannot exhaust the Data Heap")
+    }
+
+    pub unsafe fn alloc_or_null(&self, payload_len: usize) -> Option<MsgBuf> {
+        unsafe { self.alloc_internal(payload_len, None, false, true) }
+    }
+
+    pub unsafe fn alloc_as_client(&self, payload_len: usize) -> MsgBuf {
+        unsafe { self.alloc_internal(payload_len, Some(RingRole::Client), false, false) }
+            .expect("non-nullable shared-message allocation cannot exhaust the Data Heap")
+    }
+
+    pub unsafe fn alloc_zeroed_as_client(&self, payload_len: usize) -> MsgBuf {
+        unsafe { self.alloc_internal(payload_len, Some(RingRole::Client), true, false) }
+            .expect("non-nullable shared-message allocation cannot exhaust the Data Heap")
+    }
+
+    pub unsafe fn alloc_as_client_or_null(&self, payload_len: usize) -> Option<MsgBuf> {
+        unsafe { self.alloc_internal(payload_len, Some(RingRole::Client), false, true) }
+    }
+
+    unsafe fn alloc_internal(
+        &self,
+        payload_len: usize,
+        forced_role: Option<RingRole>,
+        zeroed: bool,
+        nullable: bool,
+    ) -> Option<MsgBuf> {
+        assert!(
+            payload_len <= i32::MAX as usize,
+            "API message length fits signed int"
+        );
+        let (layout, payload_offset) = MsgBuf::layout(payload_len);
+        let header = unsafe { self.shmem_header() };
+        let role = forced_role.unwrap_or_else(|| {
+            if self.process_pid.load(Ordering::Relaxed) == header.server_pid() {
+                RingRole::Server
+            } else {
+                RingRole::Client
+            }
+        });
+        if role == RingRole::Server {
+            hammer_runtime::thread_main::ensure_main_thread()
+                .expect("server message rings require the main thread");
+        }
+
+        let mut message = header.rings(role).iter().find_map(|ring| unsafe {
+            ring.alloc_slot(layout.size(), role, &header.garbage_collects)
+        });
+        if message.is_none() {
+            self.ring_misses.fetch_add(1, Ordering::Relaxed);
+            let region = unsafe { *self.rp.get() }.expect("API region mapped before allocation");
+            let lock = unsafe { region.as_ref() }
+                .lock()
+                .expect("Data Heap region lock");
+            let heap = lock.data_heap().expect("API region has a Data Heap");
+            let active_heap = heap.activate();
+            let allocation = if nullable {
+                heap.allocate(layout)
+            } else {
+                Some(
+                    heap.allocate(layout)
+                        .expect("non-nullable Data Heap allocation"),
+                )
+            };
+            message = allocation.map(|base| {
+                unsafe {
+                    base.as_ptr()
+                        .cast::<AtomicPtr<SvmQueue>>()
+                        .write(AtomicPtr::new(ptr::null_mut()));
+                    base.as_ptr()
+                        .add(MsgBuf::timestamp_offset())
+                        .cast::<AtomicU32>()
+                        .write(AtomicU32::new(0));
+                }
+                MsgBuf {
+                    payload: unsafe { NonNull::new_unchecked(base.as_ptr().add(payload_offset)) },
+                    payload_len,
+                    initialized_len: 0,
+                }
+            });
+            drop(active_heap);
+            drop(lock);
+        }
+        let mut message = message?;
+        message.payload_len = payload_len;
+        let prefix = unsafe { message.payload.as_ptr().sub(payload_offset) };
+        unsafe {
+            prefix
+                .add(MsgBuf::length_offset())
+                .cast::<u32>()
+                .write((payload_len as u32).to_be())
+        };
+        if zeroed {
+            unsafe { ptr::write_bytes(message.payload.as_ptr(), 0, payload_len) };
+            message.initialized_len = payload_len;
+        }
+        Some(message)
+    }
+
+    /// Releases a message owned by the caller, through the main whose region
+    /// supplied it. The region must stay mapped and peers must not reclaim it.
+    pub unsafe fn free(&self, message: MsgBuf) {
+        let region = unsafe { *self.rp.get() }.expect("originating region remains mapped");
+        let region = unsafe { region.as_ref() };
+        let (layout, offset) = MsgBuf::layout(message.payload_len);
+        let prefix = NonNull::new(
+            (message
+                .payload
+                .as_ptr()
+                .addr()
+                .checked_sub(offset)
+                .expect("message has allocation prefix")) as *mut u8,
+        )
+        .expect("message allocation is nonnull");
+        assert!(
+            region.contains_range(prefix, layout.size()),
+            "message is released through its originating API region"
+        );
+        if unsafe { message.release_ring() } {
+            return;
+        }
+        let lock = region.lock().expect("Data Heap region lock");
+        unsafe { message.free_nolock(&lock) };
+    }
+
     /// The caller must keep the selected mapping installed for the borrow.
     #[inline]
     pub unsafe fn shmem_header(&self) -> &ShmemHeader {
@@ -772,53 +837,9 @@ impl ApiMain {
                 let mut address = [0_u8; size_of::<usize>()];
                 match queue.sub(&mut address, SvmQueueConditionalWait::Nowait) {
                     Ok(()) => {
-                        let payload_address = usize::from_ne_bytes(address);
-                        let Some(payload) = NonNull::new(payload_address as *mut u8) else {
-                            tracing::error!("restart input queue contained a null message address");
-                            std::process::abort();
-                        };
-                        let offset = MsgBuf::layout(0).1;
-                        let Some(prefix_address) = payload_address.checked_sub(offset) else {
-                            tracing::error!(
-                                "restart input queue contained an invalid message address"
-                            );
-                            std::process::abort();
-                        };
-                        let Some(prefix) = NonNull::new(prefix_address as *mut u8) else {
-                            tracing::error!(
-                                "restart input queue contained an invalid message prefix"
-                            );
-                            std::process::abort();
-                        };
-                        if !prefix_address.is_multiple_of(MsgBuf::layout(0).0.align())
-                            || !region.contains_range(prefix, offset)
-                        {
-                            tracing::error!(
-                                "restart input queue contained a message prefix outside the region"
-                            );
-                            std::process::abort();
-                        }
-                        let length = unsafe {
-                            prefix
-                                .as_ptr()
-                                .add(MsgBuf::length_offset())
-                                .cast::<u32>()
-                                .read()
-                        };
-                        let payload_len = u32::from_be(length) as usize;
-                        if !region.contains_range(payload, payload_len) {
-                            tracing::error!(
-                                "restart input queue contained a message outside the region"
-                            );
-                            std::process::abort();
-                        }
                         unsafe {
-                            MsgBuf {
-                                payload,
-                                payload_len,
-                                initialized_len: payload_len,
-                            }
-                            .free_nolock(&lock)
+                            MsgBuf::from_address(&region, usize::from_ne_bytes(address))
+                                .free_nolock(&lock)
                         };
                         shared.restart_reclaims.fetch_add(1, Ordering::Relaxed);
                     }
@@ -845,6 +866,11 @@ impl ApiMain {
             *self.shmem_header.get() = Some(header);
         }
         self.process_pid.store(pid, Ordering::Relaxed);
+        if is_server {
+            // vl_mem_api_init: mapping precedes built-in memory message setup.
+            unsafe { self.set_primary_region() };
+            super::memclnt::setup_message_id_table(self);
+        }
         Ok(())
     }
 

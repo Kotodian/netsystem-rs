@@ -3817,9 +3817,30 @@ fn expand_plugin(args: PluginArgs, module: &mut ItemMod) -> Result<TokenStream2>
 }
 
 /// Define Binary API message identity and service relationships.
+///
+/// The separate `api_message_table!` macro installs fixed bootstrap IDs.
 #[proc_macro_derive(Api, attributes(api, serde))]
 pub fn derive_api(input: TokenStream) -> TokenStream {
     api::derive(input.into(), true)
+        .unwrap_or_else(syn::Error::into_compile_error)
+        .into()
+}
+
+/// Generate a built-in protocol's message configuration and name/CRC table.
+/// Each entry declares `Message = ID { is_mp_safe: bool, traced: bool, replay: bool };`.
+/// The declaration begins with `pub fn setup_message_id_table;`.
+#[proc_macro]
+pub fn api_message_table(input: TokenStream) -> TokenStream {
+    api::message_table(input.into())
+        .unwrap_or_else(syn::Error::into_compile_error)
+        .into()
+}
+
+/// Generate the client Message/MessageId inventory and owned request methods.
+/// A bracketed message list is followed by request constructor functions.
+#[proc_macro]
+pub fn api_client_messages(input: TokenStream) -> TokenStream {
+    api::client_messages(input.into())
         .unwrap_or_else(syn::Error::into_compile_error)
         .into()
 }

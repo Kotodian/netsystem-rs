@@ -15,6 +15,14 @@ pub trait Api: serde::Serialize + for<'de> serde::Deserialize<'de> {
     const SERVICE: Option<Service> = None;
     const OPTIONS: &'static [(&'static str, Option<&'static str>)] = &[];
     const FLAGS: &'static [&'static str] = &[];
+    const HANDLER: Option<fn(Self)> = None;
+
+    /// Correlation token, when declared by this message's protocol header.
+    fn context(&self) -> Option<u32>;
+
+    /// Fills fields actually present in this message. Generated client request
+    /// methods supply identities discovered for their connection.
+    fn set_request_header(&mut self, id: u16, client_index: u32, context: u32);
 }
 
 /// A non-message protocol type. Rust type aliases retain the target's identity.

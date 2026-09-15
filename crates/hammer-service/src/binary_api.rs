@@ -1,35 +1,30 @@
-//! Protobuf Binary API served by the `binary-api` Process Node.
-//!
-//! Mirrors VPP's `vl_api_clnt_node` (`third_party/vpp/src/vlibmemory/socket_api.c`):
-//! FileMain readiness callbacks only signal this node; the node consumes the
-//! event batches to accept connections, read length-prefixed frames, dispatch
-//! them under the worker barrier, and flush replies with TCP backpressure.
-//! Per-event budgets keep one chatty client from monopolizing the main thread.
+//! Binary API Process and the independent socket I/O owner.
+//! File callbacks accept, read complete frames, and flush output. The Process
+//! receives complete messages, matching socket_api.c's process_args boundary.
 
+use std::cell::UnsafeCell;
 use std::io;
+use std::os::fd::{BorrowedFd, OwnedFd, RawFd};
 use std::os::unix::fs::MetadataExt;
-use std::os::unix::net::UnixListener as StdUnixListener;
-use std::os::unix::net::UnixStream as StdUnixStream;
+use std::os::unix::net::{UnixListener as StdUnixListener, UnixStream as StdUnixStream};
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, OnceLock};
+use std::sync::OnceLock;
+use std::time::{Duration, Instant};
 
 use hammer_infra::pool::Pool;
+use hammer_infra::svm::queue::{SvmQueueError, SvmQueueOperation};
+use hammer_ipc::binary_api::{ApiMain, control, memclnt};
 use hammer_runtime::FILE_MAIN;
 use hammer_runtime::binary_api::{BinaryApiMethodEntry, BinaryApiMethodStatus};
-use hammer_runtime::file::{FileIoStatus, FileMain};
 use hammer_runtime::{DataPlaneMain, NodeMain, PluginError, RuntimeError, RuntimeResult};
 use prost::Message;
 
-/// Shared envelope, blocking client, and client-facing errors owned by
-/// `hammer-ipc` and re-exported here so existing callers can reach them
-/// through the server crate.
+// Existing socket protocol compatibility; SHM messages never use this envelope.
 pub use hammer_ipc::binary_api::{
     BinaryApiClient, BinaryApiError, BinaryApiReply, BinaryApiRequest, BinaryApiStatus,
     DEFAULT_MAX_FRAME_BYTES,
 };
 
-/// Server-side Binary API errors. Client-facing errors are `BinaryApiError`
-/// from `hammer-ipc`.
 #[hammer_component_macros::runtime_error(subsystem = "binary api")]
 #[derive(Debug, thiserror::Error)]
 pub enum BinaryApiServerError {
@@ -57,344 +52,44 @@ pub enum BinaryApiServerError {
     FileMainNotReady,
 }
 
-// VPP `VL_API_CLNT_NODE` budgets: bounded work per readiness event so one
-// chatty client or a burst of connects cannot monopolize the main thread.
 const MAX_CLIENTS: u32 = 1024;
 const MAX_ACCEPTS_PER_EVENT: usize = 16;
-const MAX_FRAMES_PER_READ_EVENT: usize = 16;
 const READ_CHUNK_BYTES: usize = 4096;
-const LISTENER_TOKEN: u64 = 0;
-const EVENT_ACCEPT_READY: u64 = 1;
-const EVENT_CLIENT_READ_READY: u64 = 2;
-const EVENT_CLIENT_WRITE_READY: u64 = 3;
+const EVENT_SOCKET_MESSAGE: u64 = 1;
+const EVENT_SOCKET_REMOVE: u64 = 2;
 
-/// One accepted Binary API connection stored directly in the existing index
-/// pool. File private data is the pool index; FileMain deletion precedes pool
-/// removal so a pending readiness event cannot target a recycled value.
 struct BinaryApiConnection {
     file_index: Option<u32>,
     read_buf: Vec<u8>,
     output: Vec<u8>,
+    is_being_removed: bool,
 }
 
-impl BinaryApiConnection {
-    fn new() -> Self {
-        Self {
-            file_index: None,
-            read_buf: Vec::new(),
-            output: Vec::new(),
-        }
-    }
-
-    fn bind_file(&mut self, index: u32) {
-        self.file_index = Some(index);
-    }
-
-    fn clear(&mut self) {
-        self.file_index = None;
-        self.read_buf.clear();
-        self.output.clear();
-    }
-}
-
-/// Main-thread connection pool for Binary API Process Node state.
-struct BinaryApiConnections {
-    listener: u32,
-    clients: Pool<BinaryApiConnection>,
-}
-
-impl BinaryApiConnections {
-    fn new(listener: u32) -> Self {
-        Self {
-            listener,
-            clients: Pool::with_fixed_capacity(MAX_CLIENTS),
-        }
-    }
-
-    fn reserve(&mut self) -> Option<u32> {
-        (self.clients.len() < MAX_CLIENTS as usize)
-            .then(|| self.clients.insert(BinaryApiConnection::new()))
-    }
-
-    fn release(&mut self, index: u32) {
-        if let Some(mut connection) = self.clients.remove(index) {
-            connection.clear();
-        }
-    }
-}
-
-impl Default for BinaryApiConnection {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-impl BinaryApiConnections {
-    /// Consumes one event batch signalled by FileMain readiness callbacks.
-    fn process_event(
-        &mut self,
-        file_main: &FileMain,
-        event_type: u64,
-        data: &[u64],
-        max_frame_bytes: usize,
-    ) -> RuntimeResult<()> {
-        match event_type {
-            EVENT_ACCEPT_READY => {
-                for _ in 0..MAX_ACCEPTS_PER_EVENT {
-                    if !self.accept_ready(file_main)? {
-                        break;
-                    }
-                }
-            }
-            EVENT_CLIENT_READ_READY => {
-                for raw in data {
-                    if let Ok(index) = u32::try_from(*raw) {
-                        self.client_read(file_main, index, max_frame_bytes);
-                    }
-                }
-            }
-            EVENT_CLIENT_WRITE_READY => {
-                for raw in data {
-                    if let Ok(index) = u32::try_from(*raw) {
-                        self.client_flush(file_main, index, max_frame_bytes);
-                    }
-                }
-            }
-            _ => {}
-        }
-        Ok(())
-    }
-
-    /// VPP `vl_api_socket_accept`: pulls one pending connection per call; the
-    /// per-event loop bounds the count.
-    fn accept_ready(&mut self, file_main: &FileMain) -> RuntimeResult<bool> {
-        let Some(connection_index) = self.reserve() else {
-            return Ok(false); // table full: the kernel backlog holds connects
-        };
-        match file_main.accept(
-            self.listener,
-            "binary-api client",
-            connection_index as u64,
-            client_file::file_functions::<NodeMain, RuntimeError>(),
-        ) {
-            Ok(Some(index)) => {
-                match self.clients.get_mut(connection_index) {
-                    Some(connection) => {
-                        connection.bind_file(index);
-                    }
-                    None => {
-                        // Unreachable: the token was just reserved. Drop the
-                        // registered File rather than leak it.
-                        let _ = file_main.delete(index);
-                        self.release(connection_index);
-                    }
-                }
-                Ok(true)
-            }
-            Ok(None) => {
-                self.release(connection_index);
-                Ok(false)
-            }
-            Err(error) => {
-                // A per-connection accept failure must not kill the node: VPP
-                // logs and keeps polling. The dropped socket closes with the
-                // error path; the next listener readiness pulls a new one.
-                tracing::warn!(%error, "Binary API accept failed; dropping connection");
-                self.release(connection_index);
-                Ok(false)
-            }
-        }
-    }
-
-    /// VPP `vl_api_socket_read`: one bounded chunk per readiness event into
-    /// `unprocessed_input`, then every complete frame in it.
-    fn client_read(&mut self, file_main: &FileMain, connection_index: u32, max_frame_bytes: usize) {
-        let Some(connection) = self.clients.get(connection_index) else {
-            return; // stale event for a closed or recycled slot
-        };
-        let Some(index) = connection.file_index else {
-            return;
-        };
-        let mut chunk = [0_u8; READ_CHUNK_BYTES];
-        match file_main.read_some(index, &mut chunk) {
-            Ok(FileIoStatus::Progress(n)) => {
-                if let Some(connection) = self.clients.get_mut(connection_index) {
-                    connection.read_buf.extend_from_slice(&chunk[..n]);
-                }
-                self.parse_frames(file_main, connection_index, max_frame_bytes);
-            }
-            Ok(FileIoStatus::WouldBlock) => {}
-            Ok(FileIoStatus::Closed) => self.close(file_main, connection_index),
-            Err(error) => {
-                tracing::warn!(%error, "Binary API read failed; closing client");
-                self.close(file_main, connection_index);
-            }
-        }
-    }
-
-    /// VPP `vl_api_socket_write`: flush the reply buffer; EAGAIN (WouldBlock)
-    /// keeps write interest armed so the next write readiness drains it, and
-    /// a complete drain clears it.
-    fn client_flush(
-        &mut self,
-        file_main: &FileMain,
-        connection_index: u32,
-        max_frame_bytes: usize,
-    ) {
-        loop {
-            // Resume frames stalled by a saturated output buffer first.
-            self.parse_frames(file_main, connection_index, max_frame_bytes);
-            let Some(connection) = self.clients.get(connection_index) else {
-                return;
-            };
-            if connection.output.is_empty() {
-                if let Some(index) = connection.file_index {
-                    let _ = file_main.set_data_available_to_write(index, false);
-                }
-                return;
-            }
-            let Some(index) = connection.file_index else {
-                return;
-            };
-            match file_main.write_some(index, &connection.output) {
-                Ok(FileIoStatus::Progress(n)) => {
-                    if let Some(connection) = self.clients.get_mut(connection_index) {
-                        connection.output.drain(..n);
-                    }
-                }
-                Ok(FileIoStatus::WouldBlock) => return,
-                Ok(FileIoStatus::Closed) => {
-                    self.close(file_main, connection_index);
-                    return;
-                }
-                Err(error) => {
-                    tracing::warn!(%error, "Binary API write failed; closing client");
-                    self.close(file_main, connection_index);
-                    return;
-                }
-            }
-        }
-    }
-
-    /// Parses every complete length-prefixed frame in `read_buf`, dispatching
-    /// each under the worker barrier and enqueueing the reply. Stops when the
-    /// frame budget for this event is spent, the output buffer saturates, or
-    /// the buffer holds only a partial frame.
-    fn parse_frames(
-        &mut self,
-        file_main: &FileMain,
-        connection_index: u32,
-        max_frame_bytes: usize,
-    ) {
-        for _ in 0..MAX_FRAMES_PER_READ_EVENT {
-            let Some(connection) = self.clients.get(connection_index) else {
-                return;
-            };
-            if connection.read_buf.len() < size_of::<u32>() {
-                return;
-            }
-            let declared = u32::from_be_bytes(
-                connection.read_buf[..size_of::<u32>()]
-                    .try_into()
-                    .expect("four-byte length prefix"),
-            ) as usize;
-            if declared > max_frame_bytes {
-                tracing::warn!(declared, "Binary API frame exceeds maximum; closing client");
-                self.close(file_main, connection_index);
-                return;
-            }
-            let frame_len = size_of::<u32>() + declared;
-            if connection.read_buf.len() < frame_len {
-                return; // partial frame: VPP keeps it in unprocessed_input
-            }
-            let request =
-                BinaryApiRequest::decode(&connection.read_buf[size_of::<u32>()..frame_len]);
-            let reply = match request {
-                Ok(request) => dispatch(request),
-                Err(_) => reply(0, BinaryApiStatus::InvalidRequest, Vec::new()),
-            };
-            let encoded = reply.encode_to_vec(); // single allocation for the reply frame
-            if encoded.len() > max_frame_bytes {
-                tracing::warn!(
-                    bytes = encoded.len(),
-                    "Binary API reply exceeds maximum; closing client"
-                );
-                self.close(file_main, connection_index);
-                return;
-            }
-            let Some(connection) = self.clients.get_mut(connection_index) else {
-                return;
-            };
-            // Saturate rather than grow: parsing stalls until a flush drains
-            // below the budget, and TCP backpressure limits the client.
-            if connection.output.len() + size_of::<u32>() + encoded.len()
-                > output_budget(max_frame_bytes)
-            {
-                return;
-            }
-            let arm_write = connection.output.is_empty();
-            connection
-                .output
-                .extend_from_slice(&(encoded.len() as u32).to_be_bytes());
-            connection.output.extend_from_slice(&encoded);
-            connection.read_buf.drain(..frame_len);
-            if arm_write {
-                if let Some(index) = connection.file_index {
-                    let _ = file_main.set_data_available_to_write(index, true);
-                }
-            }
-        }
-    }
-
-    /// Closes one client: removes backend interest and the File record, then
-    /// frees the slot for reuse.
-    fn close(&mut self, file_main: &FileMain, connection_index: u32) {
-        if let Some(index) = self
-            .clients
-            .get(connection_index)
-            .and_then(|connection| connection.file_index)
-        {
-            let _ = file_main.delete(index);
-        }
-        self.release(connection_index);
-    }
-}
-
-impl Drop for BinaryApiConnections {
-    fn drop(&mut self) {
-        let Some(file_main) = FILE_MAIN.get() else {
-            return;
-        };
-        for connection_index in self
-            .clients
-            .iter()
-            .map(|(index, _)| index)
-            .collect::<Vec<_>>()
-        {
-            if let Some(connection) = self.clients.get(connection_index) {
-                if let Some(index) = connection.file_index {
-                    let _ = file_main.delete(index);
-                }
-            }
-            if let Some(mut connection) = self.clients.remove(connection_index) {
-                connection.clear();
-            }
-        }
-    }
-}
-
-/// Main-thread owner of the Binary API Unix listener and frame policy. The
-/// listener is registered in the process-global `FILE_MAIN`; `GlobalMain` owns
-/// the control loop and the `binary-api` Process Node consumes its events.
-pub struct BinaryApiMain {
+/// Socket registrations and complete messages awaiting the API Process.
+/// This owner is independent of ApiMain's memory registrations and SDK clients.
+pub struct SocketMain {
     listener: u32,
     socket_path: PathBuf,
     socket_device: u64,
     socket_inode: u64,
     max_frame_bytes: usize,
+    clients: UnsafeCell<Pool<BinaryApiConnection>>,
+    process_messages: UnsafeCell<Pool<(u32, Vec<u8>)>>,
 }
 
-impl BinaryApiMain {
+// SAFETY: mutable pools are private; every operation requires the runtime main
+// thread. No pool borrow crosses dispatch, a File callback, or an await.
+unsafe impl Sync for SocketMain {}
+
+impl SocketMain {
+    fn global() -> &'static Self {
+        hammer_runtime::thread_main::ensure_main_thread()
+            .expect("socket API callbacks execute on runtime main thread");
+        SOCKET_MAIN
+            .get()
+            .expect("socket owner installed before File polling")
+    }
+
     pub fn bind(
         path: impl AsRef<Path>,
         max_frame_bytes: usize,
@@ -420,96 +115,379 @@ impl BinaryApiMain {
         let file_main = FILE_MAIN
             .get()
             .ok_or(BinaryApiServerError::FileMainNotReady)?;
-        let listener_index = file_main
+        let listener = file_main
             .add_listener(
                 listener,
                 "binary-api listener",
-                LISTENER_TOKEN,
+                0,
                 listener_file::file_functions::<NodeMain, RuntimeError>(),
             )
             .map_err(|source| BinaryApiServerError::ListenerRegistration { source })?;
         Ok(Self {
-            listener: listener_index,
+            listener,
             socket_path: path.to_path_buf(),
             socket_device: metadata.dev(),
             socket_inode: metadata.ino(),
             max_frame_bytes,
+            clients: UnsafeCell::new(Pool::with_fixed_capacity(MAX_CLIENTS)),
+            process_messages: UnsafeCell::new(Pool::new()),
         })
     }
-}
 
-impl Drop for BinaryApiMain {
-    fn drop(&mut self) {
-        if let Some(file_main) = FILE_MAIN.get() {
-            let _ = file_main.delete(self.listener);
+    fn accept_ready(&self, fd: RawFd) -> RuntimeResult<()> {
+        // Use the File borrowed by the callback, without looking it up again
+        // through FileMain while that &mut File is live.
+        let listener = unsafe { BorrowedFd::borrow_raw(fd) }
+            .try_clone_to_owned()
+            .map(StdUnixListener::from)
+            .map_err(|source| RuntimeError::FileAccept { source })?;
+        for _ in 0..MAX_ACCEPTS_PER_EVENT {
+            if unsafe { &*self.clients.get() }.len() >= MAX_CLIENTS as usize {
+                break;
+            }
+            let stream = match listener.accept() {
+                Ok((stream, _)) => stream,
+                Err(source) if source.kind() == io::ErrorKind::WouldBlock => break,
+                Err(source) if source.kind() == io::ErrorKind::Interrupted => continue,
+                Err(source) => return Err(RuntimeError::FileAccept { source }),
+            };
+            stream
+                .set_nonblocking(true)
+                .map_err(|source| RuntimeError::FileAccept { source })?;
+            #[cfg(target_os = "macos")]
+            {
+                use std::os::fd::AsRawFd;
+                let enabled: libc::c_int = 1;
+                if unsafe {
+                    libc::setsockopt(
+                        stream.as_raw_fd(),
+                        libc::SOL_SOCKET,
+                        libc::SO_NOSIGPIPE,
+                        std::ptr::from_ref(&enabled).cast(),
+                        size_of::<libc::c_int>() as libc::socklen_t,
+                    )
+                } != 0
+                {
+                    return Err(RuntimeError::FileAccept {
+                        source: io::Error::last_os_error(),
+                    });
+                }
+            }
+            let index = unsafe { &mut *self.clients.get() }.insert(BinaryApiConnection {
+                file_index: None,
+                read_buf: Vec::new(),
+                output: Vec::new(),
+                is_being_removed: false,
+            });
+            let file = hammer_runtime::File::new(
+                OwnedFd::from(stream),
+                "binary-api client".to_owned(),
+                u64::from(index),
+                client_file::file_functions::<NodeMain, RuntimeError>(),
+            );
+            match FILE_MAIN
+                .get()
+                .expect("socket FileMain installed")
+                .add(file)
+            {
+                Ok(file_index) => {
+                    unsafe { &mut *self.clients.get() }
+                        .get_mut(index)
+                        .expect("new socket slot is present")
+                        .file_index = Some(file_index)
+                }
+                Err(error) => {
+                    unsafe { &mut *self.clients.get() }
+                        .remove(index)
+                        .expect("new socket slot is present");
+                    return Err(error);
+                }
+            }
         }
-        let metadata = match std::fs::metadata(&self.socket_path) {
-            Ok(metadata) => metadata,
-            Err(source) if source.kind() == io::ErrorKind::NotFound => return,
-            Err(source) => {
-                tracing::warn!(
-                    path = %self.socket_path.display(),
-                    %source,
-                    "failed to inspect Binary API socket during cleanup"
-                );
-                return;
+        Ok(())
+    }
+
+    fn request_remove(&self, graph: &mut NodeMain, index: u32) -> RuntimeResult<()> {
+        let Some(connection) = (unsafe { &mut *self.clients.get() }).get_mut(index) else {
+            return Ok(());
+        };
+        if connection.is_being_removed {
+            return Ok(());
+        }
+        // FIFO event ordering keeps the slot alive until preceding messages
+        // have been retired. This is a cleanup request, never I/O readiness.
+        signal_process(graph, EVENT_SOCKET_REMOVE, index)?;
+        connection.is_being_removed = true;
+        Ok(())
+    }
+
+    fn read_ready(&self, graph: &mut NodeMain, index: u32, fd: RawFd) -> RuntimeResult<()> {
+        if unsafe { &*self.clients.get() }
+            .get(index)
+            .is_none_or(|connection| connection.is_being_removed)
+        {
+            return Ok(());
+        }
+        let mut bytes = [0_u8; READ_CHUNK_BYTES];
+        let length = loop {
+            let read = unsafe { libc::read(fd, bytes.as_mut_ptr().cast(), bytes.len()) };
+            if read > 0 {
+                break read as usize;
+            }
+            if read == 0 {
+                return self.request_remove(graph, index);
+            }
+            let source = io::Error::last_os_error();
+            match source.kind() {
+                io::ErrorKind::Interrupted => continue,
+                io::ErrorKind::WouldBlock => return Ok(()),
+                _ => {
+                    tracing::warn!(?source, index, "socket read failed");
+                    return self.request_remove(graph, index);
+                }
             }
         };
-        if metadata.dev() != self.socket_device || metadata.ino() != self.socket_inode {
-            return;
+        unsafe { &mut *self.clients.get() }
+            .get_mut(index)
+            .expect("socket still present")
+            .read_buf
+            .extend_from_slice(&bytes[..length]);
+        loop {
+            let frame = {
+                let connection = unsafe { &mut *self.clients.get() }
+                    .get_mut(index)
+                    .expect("socket still present");
+                if connection.read_buf.len() < size_of::<u32>() {
+                    break;
+                }
+                let declared = u32::from_be_bytes(
+                    connection.read_buf[..4]
+                        .try_into()
+                        .expect("four-byte length"),
+                ) as usize;
+                if declared > self.max_frame_bytes {
+                    return self.request_remove(graph, index);
+                }
+                let frame_len = size_of::<u32>() + declared;
+                if connection.read_buf.len() < frame_len {
+                    break;
+                }
+                let frame = connection.read_buf[4..frame_len].to_vec();
+                connection.read_buf.drain(..frame_len);
+                frame
+            };
+            let pending = unsafe { &mut *self.process_messages.get() }.insert((index, frame));
+            if let Err(error) = signal_process(graph, EVENT_SOCKET_MESSAGE, pending) {
+                unsafe { &mut *self.process_messages.get() }
+                    .remove(pending)
+                    .expect("unsignalled message remains owned");
+                return Err(error);
+            }
         }
-        if let Err(source) = std::fs::remove_file(&self.socket_path) {
-            tracing::warn!(
-                path = %self.socket_path.display(),
-                %source,
-                "failed to remove Binary API socket during cleanup"
-            );
+        Ok(())
+    }
+
+    fn write_ready(&self, graph: &mut NodeMain, index: u32, fd: RawFd) -> RuntimeResult<bool> {
+        let Some(connection) = (unsafe { &mut *self.clients.get() }).get_mut(index) else {
+            return Ok(false);
+        };
+        if connection.is_being_removed {
+            return Ok(false);
+        }
+        if connection.output.is_empty() {
+            return Ok(false);
+        }
+        #[cfg(target_os = "linux")]
+        let flags = libc::MSG_NOSIGNAL;
+        #[cfg(not(target_os = "linux"))]
+        let flags = 0;
+        let written = unsafe {
+            libc::send(
+                fd,
+                connection.output.as_ptr().cast(),
+                connection.output.len().min(READ_CHUNK_BYTES),
+                flags,
+            )
+        };
+        if written > 0 {
+            connection.output.drain(..written as usize);
+            return Ok(!connection.output.is_empty());
+        }
+        let source = io::Error::last_os_error();
+        if written < 0
+            && matches!(
+                source.kind(),
+                io::ErrorKind::WouldBlock | io::ErrorKind::Interrupted
+            )
+        {
+            return Ok(true);
+        }
+        tracing::warn!(?source, index, "socket write failed");
+        self.request_remove(graph, index)?;
+        Ok(false)
+    }
+
+    fn process_message(&self, pending: u32) -> RuntimeResult<()> {
+        hammer_runtime::thread_main::ensure_main_thread()?;
+        let Some((index, frame)) = (unsafe { &mut *self.process_messages.get() }).remove(pending)
+        else {
+            return Ok(());
+        };
+        if unsafe { &*self.clients.get() }
+            .get(index)
+            .is_none_or(|connection| connection.is_being_removed)
+        {
+            return Ok(());
+        }
+        // This endpoint still has its existing protobuf protocol. The memory
+        // endpoint independently uses numeric ApiMsgData and safe fn(T).
+        let response = match BinaryApiRequest::decode(frame.as_slice()) {
+            Ok(request) => dispatch(request),
+            Err(source) => {
+                tracing::warn!(?source, index, "socket request rejected");
+                reply(0, BinaryApiStatus::InvalidRequest, Vec::new())
+            }
+        }
+        .encode_to_vec();
+        if response.len() > self.max_frame_bytes {
+            return self.close(index);
+        }
+        let file_index = {
+            let connection = unsafe { &mut *self.clients.get() }
+                .get_mut(index)
+                .expect("socket remains present after dispatch");
+            if connection.output.len() + 4 + response.len() > 2 * self.max_frame_bytes {
+                // Never dispatch the same side-effecting request again merely
+                // because its reply did not fit the output budget.
+                return self.close(index);
+            }
+            connection
+                .output
+                .extend_from_slice(&(response.len() as u32).to_be_bytes());
+            connection.output.extend_from_slice(&response);
+            connection
+                .file_index
+                .expect("accepted socket has File index")
+        };
+        FILE_MAIN
+            .get()
+            .expect("socket FileMain installed")
+            .set_data_available_to_write(file_index, true)?;
+        Ok(())
+    }
+
+    fn close(&self, index: u32) -> RuntimeResult<()> {
+        hammer_runtime::thread_main::ensure_main_thread()?;
+        let file_index = unsafe { &*self.clients.get() }
+            .get(index)
+            .and_then(|connection| connection.file_index);
+        if let Some(file_index) = file_index {
+            FILE_MAIN
+                .get()
+                .expect("socket FileMain installed")
+                .delete(file_index)?;
+        }
+        // Purge queued work before this numeric connection index can be reused.
+        let pending: Vec<_> = unsafe { &*self.process_messages.get() }
+            .iter()
+            .filter_map(|(pending, (client, _))| (*client == index).then_some(pending))
+            .collect();
+        for pending in pending {
+            // Keep the pending slot until its event is consumed, so an old
+            // token can never address a new message that reused the slot.
+            if let Some((client, bytes)) =
+                unsafe { &mut *self.process_messages.get() }.get_mut(pending)
+            {
+                *client = u32::MAX;
+                bytes.clear();
+            }
+        }
+        unsafe { &mut *self.clients.get() }.remove(index);
+        Ok(())
+    }
+
+    fn shutdown(&self) -> RuntimeResult<()> {
+        hammer_runtime::thread_main::ensure_main_thread()?;
+        let indices: Vec<_> = unsafe { &*self.clients.get() }
+            .iter()
+            .map(|(index, _)| index)
+            .collect();
+        let mut primary_error = None;
+        for index in indices {
+            if let Err(source) = self.close(index) {
+                if primary_error.is_none() {
+                    primary_error = Some(source);
+                } else {
+                    tracing::error!(?source, "additional socket close error");
+                }
+            }
+        }
+        if let Err(source) = FILE_MAIN
+            .get()
+            .expect("socket FileMain installed")
+            .delete(self.listener)
+        {
+            if primary_error.is_none() {
+                primary_error = Some(source);
+            } else {
+                tracing::error!(?source, "socket listener cleanup error");
+            }
+        }
+        unsafe { *self.process_messages.get() = Pool::new() };
+        match std::fs::metadata(&self.socket_path) {
+            Ok(metadata)
+                if metadata.dev() == self.socket_device && metadata.ino() == self.socket_inode =>
+            {
+                if let Err(source) = std::fs::remove_file(&self.socket_path) {
+                    tracing::error!(?source, path=%self.socket_path.display(), "socket path cleanup failed");
+                }
+            }
+            Ok(_) => (),
+            Err(source) if source.kind() == io::ErrorKind::NotFound => (),
+            Err(source) => {
+                tracing::error!(?source, path=%self.socket_path.display(), "socket path inspection failed")
+            }
+        }
+        match primary_error {
+            Some(error) => Err(error),
+            None => Ok(()),
         }
     }
 }
 
-/// VPP's `vl_api_clnt_node` signal path: the callback never touches the
-/// socket registration pool; it only hands the File's token to the node.
-/// A missing Process Node identity is a startup/lifecycle error.
-fn signal_ready(graph: &mut NodeMain, event_type: u64, token: u64) -> RuntimeResult<()> {
+fn signal_process(graph: &mut NodeMain, event: u64, index: u32) -> RuntimeResult<()> {
     let node = __PROCESS_NODE_BINARY_API
         .process_node_index()
         .ok_or(RuntimeError::ProcessNodeIdentityUnavailable { name: "binary-api" })?;
-    graph.signal_process(node, event_type, token)
+    graph.signal_process(node, event, u64::from(index))
 }
 
 #[hammer_component_macros::file]
 mod listener_file {
     fn read<Context, Error>(
-        graph: &mut Context,
+        _: &mut Context,
         file: &mut hammer_core::file::File<Context, Error>,
     ) -> Result<(), Error>
     where
         Context: std::borrow::BorrowMut<super::NodeMain>,
         Error: From<super::RuntimeError>,
     {
-        super::signal_ready(
-            graph.borrow_mut(),
-            super::EVENT_ACCEPT_READY,
-            file.private_data(),
-        )
-        .map_err(Into::into)
+        super::SocketMain::global()
+            .accept_ready(file.fd())
+            .map_err(Into::into)
     }
-
     fn error<Context, Error>(
-        graph: &mut Context,
-        file: &mut hammer_core::file::File<Context, Error>,
+        _: &mut Context,
+        _: &mut hammer_core::file::File<Context, Error>,
     ) -> Result<(), Error>
     where
         Context: std::borrow::BorrowMut<super::NodeMain>,
         Error: From<super::RuntimeError>,
     {
-        super::signal_ready(
-            graph.borrow_mut(),
-            super::EVENT_ACCEPT_READY,
-            file.private_data(),
-        )
-        .map_err(Into::into)
+        Err(super::RuntimeError::FileAccept {
+            source: std::io::Error::from(std::io::ErrorKind::ConnectionAborted),
+        }
+        .into())
     }
 }
 
@@ -523,14 +501,11 @@ mod client_file {
         Context: std::borrow::BorrowMut<super::NodeMain>,
         Error: From<super::RuntimeError>,
     {
-        super::signal_ready(
-            graph.borrow_mut(),
-            super::EVENT_CLIENT_READ_READY,
-            file.private_data(),
-        )
-        .map_err(Into::into)
+        let index = u32::try_from(file.private_data()).expect("socket File has a connection index");
+        super::SocketMain::global()
+            .read_ready(graph.borrow_mut(), index, file.fd())
+            .map_err(Into::into)
     }
-
     fn write<Context, Error>(
         graph: &mut Context,
         file: &mut hammer_core::file::File<Context, Error>,
@@ -539,14 +514,13 @@ mod client_file {
         Context: std::borrow::BorrowMut<super::NodeMain>,
         Error: From<super::RuntimeError>,
     {
-        super::signal_ready(
-            graph.borrow_mut(),
-            super::EVENT_CLIENT_WRITE_READY,
-            file.private_data(),
-        )
-        .map_err(Into::into)
+        let index = u32::try_from(file.private_data()).expect("socket File has a connection index");
+        let pending = super::SocketMain::global()
+            .write_ready(graph.borrow_mut(), index, file.fd())
+            .map_err(Error::from)?;
+        file.set_write_enabled(pending);
+        Ok(())
     }
-
     fn error<Context, Error>(
         graph: &mut Context,
         file: &mut hammer_core::file::File<Context, Error>,
@@ -555,18 +529,19 @@ mod client_file {
         Context: std::borrow::BorrowMut<super::NodeMain>,
         Error: From<super::RuntimeError>,
     {
-        super::signal_ready(
-            graph.borrow_mut(),
-            super::EVENT_CLIENT_READ_READY,
-            file.private_data(),
-        )
-        .map_err(Into::into)
+        let index = u32::try_from(file.private_data()).expect("socket File has a connection index");
+        super::SocketMain::global()
+            .request_remove(graph.borrow_mut(), index)
+            .map_err(Into::into)
     }
 }
 
-#[inline]
-fn output_budget(max_frame_bytes: usize) -> usize {
-    2 * max_frame_bytes
+#[hammer_component_macros::main_loop_exit_function]
+fn exit_binary_api() -> RuntimeResult<()> {
+    if let Some(socket) = SOCKET_MAIN.get() {
+        socket.shutdown()?;
+    }
+    Ok(())
 }
 
 /// Resolves the method exactly once and routes it by `is_mp_safe`. Only a
@@ -669,6 +644,9 @@ fn configure(config: Config) -> RuntimeResult<()> {
         BINARY_API_CONFIG.set(config).is_ok(),
         "Binary API configuration callback executes once"
     );
+    // All clients must agree on bootstrap IDs, including unsupported messages.
+    // Reserve memclnt.api's 1..=28 before any plugin API-init allocates a range.
+    ApiMain::new(29).install();
     Ok(())
 }
 
@@ -680,9 +658,9 @@ fn init() -> RuntimeResult<()> {
     let Some(path) = config.socket_path.as_deref() else {
         return Ok(());
     };
-    let main = Arc::new(BinaryApiMain::bind(path, config.max_frame_bytes)?);
+    let main = SocketMain::bind(path, config.max_frame_bytes)?;
     assert!(
-        BINARY_API_MAIN.set(main).is_ok(),
+        SOCKET_MAIN.set(main).is_ok(),
         "binary API initialization callback executes once"
     );
     Ok(())
@@ -696,7 +674,7 @@ struct Config {
 }
 
 static BINARY_API_CONFIG: OnceLock<Config> = OnceLock::new();
-static BINARY_API_MAIN: OnceLock<Arc<BinaryApiMain>> = OnceLock::new();
+static SOCKET_MAIN: OnceLock<SocketMain> = OnceLock::new();
 
 impl Default for Config {
     fn default() -> Self {
@@ -731,29 +709,83 @@ fn binary_api_clnt(
 ) -> impl std::future::Future<Output = RuntimeResult<()>> + Send + 'static {
     // VPP `vl_api_clnt_node`: FileMain callbacks signal this node; the main
     // FileMain poll loop owns readiness and this node consumes its event batch.
+    let api = ApiMain::current();
+    let mapped = api.is_mapped();
     let events = (|| {
+        // Control messages are bootstrap declarations, independent of whether
+        // this process has a SHM region. Install them before the API-init list.
+        control::setup_message_id_table(api);
         hammer_runtime::init::run_api_init(main)?;
         main.process_events()
     })();
     async move {
         let mut events = events?;
-        let capability = BINARY_API_MAIN.get().map(Arc::clone).ok_or(
-            RuntimeError::RuntimeCapabilityMissing {
-                type_name: "hammer_service::binary_api::BinaryApiMain",
-            },
-        )?;
-        let file_main = FILE_MAIN
-            .get()
-            .expect("FileMain is initialized before Binary API startup");
-        let mut table = BinaryApiConnections::new(capability.listener);
-        let max_frame_bytes = capability.max_frame_bytes;
-        while let Some((event_type, token)) = events.recv().await {
-            table.process_event(
-                file_main,
-                event_type,
-                std::slice::from_ref(&token),
-                max_frame_bytes,
-            )?;
+        let mut memory_enabled = mapped;
+        let socket = SOCKET_MAIN.get();
+        let scan_interval = Duration::from_secs(10);
+        let mut next_scan = Instant::now() + scan_interval;
+        while memory_enabled || socket.is_some() {
+            if memory_enabled {
+                let drain_started = Instant::now();
+                loop {
+                    match memclnt::receive() {
+                        Ok(false) => break,
+                        Ok(true) => (),
+                        Err(
+                            source @ SvmQueueError::SignalAfterCommit {
+                                operation: SvmQueueOperation::Sub,
+                                ..
+                            },
+                        )
+                        | Err(
+                            source @ SvmQueueError::EventSignalAfterCommit {
+                                operation: SvmQueueOperation::Sub,
+                                ..
+                            },
+                        ) => tracing::warn!(?source, "memory API dequeue notification failed"),
+                        Err(source) => {
+                            tracing::error!(?source, "memory API input disabled after queue error");
+                            memory_enabled = false;
+                            break;
+                        }
+                    }
+                    if drain_started.elapsed() >= Duration::from_micros(10) {
+                        break;
+                    }
+                }
+                let now = Instant::now();
+                if memory_enabled && now >= next_scan {
+                    hammer_runtime::worker_thread_barrier_sync!({
+                        api.dead_client_scan(now);
+                    });
+                    next_scan = Instant::now() + scan_interval;
+                }
+            }
+            if !memory_enabled && socket.is_none() {
+                break;
+            }
+            let wake_at = (Instant::now() + Duration::from_micros(400)).min(next_scan);
+            tokio::task::yield_now().await;
+            tokio::select! {
+                event = events.recv() => {
+                    match event {
+                        Some((event_type, token)) => {
+                            if let Some(socket) = socket {
+                                let index = u32::try_from(token)
+                                    .expect("socket Process event carries a pool index");
+                                match event_type {
+                                    EVENT_SOCKET_MESSAGE => socket.process_message(index)?,
+                                    EVENT_SOCKET_REMOVE => socket.close(index)?,
+                                    _ => tracing::warn!(event_type, "unknown Binary API event"),
+                                }
+                            }
+                        }
+                        None => break,
+                    }
+                }
+                () = tokio::time::sleep_until(tokio::time::Instant::from_std(wake_at)),
+                    if memory_enabled => (),
+            }
         }
         Ok(())
     }

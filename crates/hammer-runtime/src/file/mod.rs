@@ -703,6 +703,7 @@ impl FileMain {
                     let Some(file) = self.file_ptr(index) else {
                         continue;
                     };
+                    let before = unsafe { PollSpec::new(index, &*file) };
                     let remove = unsafe {
                         if event.readiness.contains(Readiness::ERROR)
                             && (*file).functions().error.is_none()
@@ -716,6 +717,14 @@ impl FileMain {
                     if remove {
                         self.delete(index)?;
                         continue;
+                    }
+                    // A callback already borrows its File exclusively. It
+                    // changes that value's write flag directly; reconcile the
+                    // poller only after the callback borrow has ended.
+                    if let Some(after) = self.poll_spec(index)
+                        && before.write != after.write
+                    {
+                        self.poller_mut(thread_index)?.modify(before, after)?;
                     }
                     if event.rearm {
                         let Some(spec) = self.poll_spec(index) else {
