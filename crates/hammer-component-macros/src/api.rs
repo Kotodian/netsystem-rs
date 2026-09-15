@@ -216,6 +216,74 @@ pub fn message_table(tokens: TokenStream) -> Result<TokenStream> {
     parser.parse2(tokens)
 }
 
+pub fn message_range(tokens: TokenStream) -> Result<TokenStream> {
+    use syn::parse::Parser;
+    let owner = ipc_owner()?;
+    let parser = |input: syn::parse::ParseStream<'_>| {
+        let visibility: syn::Visibility = input.parse()?;
+        input.parse::<syn::Token![fn]>()?;
+        let name: Ident = input.parse()?;
+        input.parse::<syn::Token![;]>()?;
+        input.parse::<syn::Ident>()?; // range
+        let range: LitStr = input.parse()?;
+        input.parse::<syn::Token![;]>()?;
+        let mut entries = Vec::new();
+        let mut offsets = std::collections::HashSet::new();
+        while !input.is_empty() {
+            let message: Path = input.parse()?;
+            input.parse::<syn::Token![=]>()?;
+            let offset: syn::LitInt = input.parse()?;
+            let offset_value = offset.base10_parse::<u16>()?;
+            if !offsets.insert(offset_value) {
+                return Err(Error::new(offset.span(), "duplicate API range offset"));
+            }
+            let content;
+            syn::braced!(content in input);
+            let mut policies = Vec::new();
+            while !content.is_empty() {
+                let field: Ident = content.parse()?;
+                if !matches!(
+                    field.to_string().as_str(),
+                    "is_mp_safe" | "traced" | "replay"
+                ) {
+                    return Err(Error::new(field.span(), "unknown API message policy"));
+                }
+                content.parse::<syn::Token![:]>()?;
+                let enabled: syn::LitBool = content.parse()?;
+                policies.push(quote!(config.#field = #enabled;));
+                if !content.is_empty() {
+                    content.parse::<syn::Token![,]>()?;
+                }
+            }
+            input.parse::<syn::Token![;]>()?;
+            entries.push(quote! {
+                {
+                    let id = base.checked_add(#offset_value)
+                        .expect("API message range exceeds u16");
+                    let mut config = #owner::binary_api::ApiMsgConfig::new::<#message>(id);
+                    #(#policies)*
+                    api.msg_config(config);
+                    api.add_msg_name_crc(<#message as #owner::binary_api::Api>::NAME_CRC, id);
+                }
+            });
+        }
+        if entries.is_empty() {
+            return Err(input.error("an API message range requires a message"));
+        }
+        let count = offsets.len() as u16;
+        Ok(quote! {
+            #visibility fn #name(
+                api: &#owner::binary_api::ApiMain,
+            ) -> Result<(), #owner::binary_api::api::Error> {
+                let base = api.get_msg_ids(#range, #count)?;
+                #(#entries)*
+                Ok(())
+            }
+        })
+    };
+    parser.parse2(tokens)
+}
+
 /// Generate one client's closed message inventory and concrete request entries.
 /// Request bodies construct the actual owned message; protocol metadata remains
 /// on Api rather than in a second descriptor registry.
