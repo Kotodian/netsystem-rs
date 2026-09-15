@@ -113,6 +113,22 @@ pub fn __sync_guard(main: &mut crate::DataPlaneMain) -> impl Drop + use<> {
 }
 
 #[doc(hidden)]
+#[track_caller]
+pub fn __main_sync_guard() -> impl Drop + use<> {
+    crate::ensure_main_thread().expect("worker barrier sync requires main thread");
+    let barrier = PROCESS_BARRIER
+        .get()
+        .expect("worker barrier is not installed");
+    let caller = Location::caller();
+    barrier.pause(caller);
+    ScopeGuard {
+        barrier: barrier.clone(),
+        caller,
+        _not_send: std::marker::PhantomData,
+    }
+}
+
+#[doc(hidden)]
 pub fn __assert_held() {
     let Some(barrier) = PROCESS_BARRIER.get() else {
         return;

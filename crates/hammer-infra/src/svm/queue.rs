@@ -548,6 +548,10 @@ impl SvmQueue {
 }
 
 impl SvmQueueLock<'_> {
+    #[inline]
+    pub fn consumer_head(&self) -> u32 {
+        unsafe { AtomicU32::from_ptr(self.queue.head.get()) }.load(Ordering::Relaxed)
+    }
     pub fn add_nolock(&mut self, element: &[u8]) -> Result<(), SvmQueueError> {
         validate_element(self.queue.element_size(), element)?;
         while self.queue.cursize.load(Ordering::Relaxed) == self.queue.maxsize {

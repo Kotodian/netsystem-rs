@@ -11,7 +11,7 @@ use serde::ser::{Impossible, SerializeSeq, SerializeStruct, SerializeTuple, Seri
 use serde::{Deserialize, Serialize};
 
 pub struct Serializer<'a> {
-    output: &'a mut [MaybeUninit<u8>],
+    output: Option<&'a mut [MaybeUninit<u8>]>,
     offset: usize,
     opaque: bool,
 }
@@ -35,7 +35,7 @@ pub fn serialize_uninit<T: Serialize + ?Sized>(
     output: &mut [MaybeUninit<u8>],
 ) -> Result<usize, Error> {
     let mut serializer = Serializer {
-        output,
+        output: Some(output),
         offset: 0,
         opaque: false,
     };
@@ -47,12 +47,24 @@ pub fn deserialize<'de, T: Deserialize<'de>>(input: &'de [u8]) -> Result<T, Erro
     T::deserialize(&mut Deserializer::new(input))
 }
 
+/// Measures with the same Serde encoder used to write the message, without
+/// allocating a temporary payload or assuming Rust struct layout.
+pub fn serialized_len<T: Serialize + ?Sized>(value: &T) -> Result<usize, Error> {
+    let mut serializer = Serializer {
+        output: None,
+        offset: 0,
+        opaque: false,
+    };
+    value.serialize(&mut serializer)?;
+    Ok(serializer.finish())
+}
+
 impl<'a> Serializer<'a> {
     pub fn new(output: &'a mut [u8]) -> Self {
         let output =
             unsafe { std::slice::from_raw_parts_mut(output.as_mut_ptr().cast(), output.len()) };
         Self {
-            output,
+            output: Some(output),
             offset: 0,
             opaque: false,
         }
@@ -66,14 +78,18 @@ impl<'a> Serializer<'a> {
         let end = self
             .offset
             .checked_add(bytes.len())
-            .filter(|end| *end <= self.output.len())
-            .ok_or_else(|| Error::custom("API output slice is too short"))?;
-        unsafe {
-            std::ptr::copy_nonoverlapping(
-                bytes.as_ptr(),
-                self.output.as_mut_ptr().add(self.offset).cast(),
-                bytes.len(),
-            );
+            .ok_or_else(|| Error::custom("API encoded length overflow"))?;
+        if let Some(output) = self.output.as_mut() {
+            if end > output.len() {
+                return Err(Error::custom("API output slice is too short"));
+            }
+            unsafe {
+                std::ptr::copy_nonoverlapping(
+                    bytes.as_ptr(),
+                    output.as_mut_ptr().add(self.offset).cast(),
+                    bytes.len(),
+                );
+            }
         }
         self.offset = end;
         Ok(())
@@ -186,7 +202,8 @@ impl<'a> serde::Serializer for &mut Serializer<'a> {
     }
     fn serialize_bytes(self, value: &[u8]) -> Result<(), Error> {
         let length = u32::try_from(value.len()).map_err(Error::custom)?;
-        if self.output.len() - self.offset < 4 || value.len() > self.output.len() - self.offset - 4
+        if let Some(output) = self.output.as_ref()
+            && (output.len() - self.offset < 4 || value.len() > output.len() - self.offset - 4)
         {
             return Err(Error::custom("API output slice is too short"));
         }

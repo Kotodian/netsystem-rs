@@ -479,7 +479,11 @@ The process-wide Binary API authority corresponding to VPP's `api_main_t`. It
 owns Message Data, runtime Message ID ranges, name/CRC lookup, API versions,
 shared-memory regions, the main input queue, and shared-memory client
 registrations; socket listener and socket connection state have a separate
-owner.
+owner. The daemon uses one default instance on its main thread. The Binary API
+TLS selector `my_api_main` may select another actual ApiMain for a client worker;
+it does not replicate the daemon registry per thread. A VAPI Client owns its
+connection, request correlation and discovered IDs separately, and retains its
+actual mapping owner across async waits.
 _Avoid_: BinaryApiMain, socket listener owner, method-name table, plugin API
 state
 

@@ -9,6 +9,11 @@
 Rust 类型及属性是唯一业务定义入口；不维护、生成或引入 `.api` 文件。
 Vendored VPP 仅用于源码 review，不运行 vppapigen 或引入 generator 测试。
 
+ADR-0017 修订消息表发布后的借用合同：API-init 发生在 ApiMain 安装后，范围/版本/注册表
+使用主线程校验的 Cell/RefCell 与真实 Ref 借用；不从 OnceLock 伪造 &mut。本文旧的安装后
+只读假设由其第 4/5 节取代。codec 本身仍不读取 TLS；唯一的 my_api_main selector 属于 ApiMain，
+客户端 ID/请求/回调属于显式 Client，目标生成与迁移边界见 ADR-0017 第 8/9 节。
+
 ## 1. 设计结论与实施授权
 
 具体消息拥有自己的字段和 Serde 实现，派生 `Api` 获得协议身份和 service。
@@ -227,13 +232,16 @@ returns 与 autoreply 互斥；null 不带 stream/events；events 非空且要�
 
 以下是完整设计中的接入要求，不是本次 Runtime/Service 的已交付代码。
 复用 InitFunction、RegistrationImage、GlobalMain 的 API-init inventory 与
-callback identity/called bitmap。api_init_function 应复用公共声明和排序，
-init_order 与 runs_before/runs_after 由公共机制处理；ApiMain 不保留第二份进度。
+callback identity/called bitmap。ADR-0017 第 4.1 节明确复用现有 #[init_function] 生成声明，
+由所属 RegistrationImage.api_init_functions 选择 API-init 阶段，无须另加同义宏。
+runs_before/runs_after 由公共机制处理；ApiMain 不保留第二份进度。
 
 主线程 API Process 在底层 API 初始化成功、处理请求之前执行 API-init。
 hook 在 owner 中借用 ApiMain 安装消息和策略；不能通过 Runtime registry
 或新增全局 `RefCell<ApiMain>` 绕开最终所有权设计。本次只提供 ApiMain 的普通借用接口，不实施具体模块安装函数、全局借用链或启动调用方。
 
+下面是 VPP 对齐目标；当前 runtime 遇缺失约束返回错误，ADR-0017 的 Process 用 ? 传播
+API-init 错误停止启动，差异与实际接线见其第 4.1 节，不是下述行为已经实现。
 缺失约束警告跳过；循环返回排序错误。调用前标记 call_once，hook 返回错误
 停止当前链且保留标记。底层 socket/API 初始化失败退出 API Process；
 API-init hook 错误报告后继续，不能合并成“一律终止整个启动”。

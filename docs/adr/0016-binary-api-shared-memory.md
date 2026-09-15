@@ -318,12 +318,16 @@ impl ShmemHeader {
     fn rings(&self, role: RingRole) -> &[RingAlloc];
     #[inline]
     pub unsafe fn input_queue(&self) -> &SvmQueue; // mapping and mutex must stay valid
+}
+// ADR-0017: the actual Main selects both rings and the fallback/free heap.
+impl ApiMain {
     pub unsafe fn alloc(&self, payload_len: usize) -> MsgBuf;
     pub unsafe fn alloc_zeroed(&self, payload_len: usize) -> MsgBuf;
     pub unsafe fn alloc_or_null(&self, payload_len: usize) -> Option<MsgBuf>;
     pub unsafe fn alloc_as_client(&self, payload_len: usize) -> MsgBuf;
     pub unsafe fn alloc_zeroed_as_client(&self, payload_len: usize) -> MsgBuf;
     pub unsafe fn alloc_as_client_or_null(&self, payload_len: usize) -> Option<MsgBuf>;
+    pub unsafe fn free(&self, message: MsgBuf);
 }
 impl RingAlloc {
     // A single eligible size class checks its current slot and owns hit/miss/GC accounting.
@@ -337,8 +341,6 @@ impl MsgBuf {
     pub fn len(&self) -> usize; // process-local length; no shared-memory read
     pub unsafe fn encode<T: Api>(&mut self, value: &T) -> Result<usize, codec::Error>;
     pub unsafe fn decode<T: Api>(&self) -> Result<T, codec::Error>;
-    // Requires live exclusive control; a stale buffer may have been reclaimed.
-    pub unsafe fn free(self);
     // Restart already holds the originating region lock; never reacquire it.
     unsafe fn free_nolock(self, lock: &RegionLock<'_>);
 }
@@ -361,19 +363,19 @@ impl RegionLock<'_> {
 static api_global_main: OnceLock<ApiMain> = OnceLock::new();
 thread_local! {
     #[allow(non_upper_case_globals)]
-    static my_api_main: Cell<&'static ApiMain> = Cell::new(
-        api_global_main.get().expect("Binary API main installed before thread selection")
-    );
+    static my_api_main: Cell<Option<&'static ApiMain>> = const { Cell::new(None) };
+    // current() uses the installed default when no explicit selection exists.
 }
 pub struct ApiMain {
-    // Unchanged registration and codec state:
-    msg_data: Vec<ApiMsgData>,
-    msg_id_by_name: HashMap<&'static str, u16>,
-    msg_index_by_name_and_crc: HashMap<String, u16>,
-    first_available_msg_id: u16,
-    msg_ranges: Vec<ApiMsgRange>,
-    msg_range_by_name: HashMap<String, usize>,
-    api_version_list: Vec<ApiVersion>,
+    // ADR-0017: main-thread API-init may populate these after installation.
+    msg_data: RefCell<Vec<ApiMsgData>>,
+    msg_id_by_name: RefCell<HashMap<&'static str, u16>>,
+    msg_index_by_name_and_crc: RefCell<HashMap<String, u16>>,
+    first_available_msg_id: Cell<u16>,
+    msg_ranges: RefCell<Vec<ApiMsgRange>>,
+    msg_range_by_name: RefCell<HashMap<String, usize>>,
+    api_version_list: RefCell<Vec<ApiVersion>>,
+    // Server registration pool and serialized table are specified by ADR-0017.
 
     // New, process-local shared-memory state:
     rp: UnsafeCell<Option<NonNull<SvmRegion>>>, // current region; not an owner
@@ -393,17 +395,18 @@ pub struct ApiMain {
     api_pvt_heap_size: u64, // 0 => SVM default
     api_region_name: String, // ordinary API subregion name
 }
-// SAFETY: after installation, registration/configuration is immutable.
+// SAFETY: configuration is immutable after installation; all registry Cell/
+// RefCell access first checks the runtime main thread (ADR-0017).
 // Only the lifecycle owner mutates UnsafeCell fields, without concurrent
 // allocator users; independent counters/PID are atomic. No mapping outlives
 // its owner, and unsafe access is required while another process may GC.
 unsafe impl Send for ApiMain {}
 unsafe impl Sync for ApiMain {}
 impl ApiMain {
-    pub fn install(self); // once, after registration/configuration and before map
+    pub fn install(self); // once, after configuration and before map/API-init
     #[inline(always)]
-    pub fn global() -> &'static Self; // selected main, defaulting to installed main
-    pub fn set_main(main: &'static Self); // switches this thread only
+    pub fn current() -> &'static Self; // selected main, defaulting to installed main
+    pub unsafe fn set_main(main: &'static Self); // switches this thread only
     pub unsafe fn shmem_header(&self) -> &ShmemHeader; // mapped selected region
     pub fn set_input_queue_length(&mut self, length: u32); // before initial server map
     pub fn set_api_uid(&mut self, uid: i32);
@@ -461,21 +464,28 @@ pub enum MapError {
 zero, UID/GID to `-1`, base VA and size/heap configuration to zero (the VPP
 default sentinels), and
 `api_region_name` to `/vpe-api`.
-Setters take `&mut self` only before installation. `install` stores the same
-configured `ApiMain` in `api_global_main` once and returns `()`. On first use each
-thread's `my_api_main` selects that default; `set_main` changes only that
-thread's selection, and requires a `'static` main so a TLS reference cannot
-dangle. A caller can retain its previous `ApiMain::global()` reference and
-pass it to `set_main` to restore the selection. This narrow API selector is
-an explicit exception to the repository's general no-`thread_local!` rule
-requested after the original ADR; it stores no worker-owned packet state.
-`global` borrows the selected main, and unsafe `shmem_header()` lends its mapped
-header to allocation callers. Allocation/free also use `global` internally;
-each function obtains one local `&ApiMain` and reuses it throughout ring
-selection, heap fallback or release. Neither the ring loop nor a nested
-heap operation fetches the global again. No main is passed to a handler. Unlike the
-earlier ADR draft, there is no existing Hammer global to reuse. The existing
-registration fields freeze after installation. Mapping/unmap use `&self`
+Setters take `&mut self` before installation. `install` stores the configured
+ApiMain in the private `api_global_main`. `my_api_main` stores only a selection,
+not a per-thread server replica; `current()` defaults to that installed object.
+The daemon keeps its main thread on this default. Client workers, including the
+future VCL use case, may select a distinct actual ApiMain with unsafe `set_main`.
+The selected object must be `'static`; this does not grant permission to mutate
+its region concurrently or to destroy its mapping while users remain.
+The selector is the repository's Binary API TLS exception, not worker packet
+state. It never selects a VAPI Client: each Client owns its connection/request
+state and captures `current()` in a direct `&'static ApiMain` at construction.
+
+ADR-0017 migrates ordinary allocation/free onto the actual ApiMain. Synchronous
+implicit-owner handlers acquire `current()` at entry; owner methods and Client
+operations use their existing reference. They do not reselect TLS during a
+nested allocator operation or after an async wait. Switching TLS does not
+redirect an existing Client, and is distinct from changing rp/header within its
+Main. Daemon Process dispatch must keep the daemon Main selected.
+API-init populates checked Cell/RefCell registry fields after installation;
+range/version/table queries return actual Ref borrows. Message identities and
+handlers stop changing once a serialized shared table has been published in the
+current startup-only policy; this is not VPP's full runtime replacement policy.
+Mapping/unmap use `&self`
 and `UnsafeCell` only for lifecycle-owned pointer/vector mutation; they are
 unsafe because callers must exclude simultaneous region-pointer access and
 end all local message/queue operations before unmap. An `&mut ApiMain`
@@ -493,17 +503,15 @@ inside the shared region. An empty ordinary mapping list leaves `rp` and
 selected. A mapped region can exist before its header is ready, but a
 present header requires a live current `rp`. The cached header pointer
 always follows the current `rp`; `primary_rp` remains on the primary region.
-Ordinary
-`ShmemHeader::alloc*` obtains PID, current region and miss counter from that
-main **inside** the operation; it does not accept `&ApiMain` from a caller.
-Its `self` must be the current `ApiMain::shmem_header`. Heap fallback and
-`MsgBuf::free` select `ApiMain::rp` internally, as VPP's ordinary
-alloc/free use `am->vlib_rp`. Ring-slot release only clears its marker and
-needs no region lookup. `ShmemHeader::alloc*` passes its own GC counter to
-`RingAlloc::alloc_slot`; the ring owns the per-class timestamp/hit/miss
-decision without looking up another region. The explicitly selected region variant in VPP is
-for a registration/private region and is outside this ADR; do not add an
-extra region parameter to every ordinary operation for that case.
+Ordinary `ApiMain::alloc*` uses self.shmem_header, self.rp, PID and counters
+from the same owner. ShmemHeader supplies ring storage and RingAlloc owns the
+per-class timestamp/hit/miss decision. `ApiMain::free(message)` verifies the
+allocation belongs to self.rp before releasing a ring slot or activating that
+region's Data Heap. Restart's MsgBuf::free_nolock retains its explicit region
+lock and never reacquires it. No allocator/free method looks up TLS internally.
+VPP's explicit registration/private-region allocator is outside this ordinary
+mapping scope; it cannot be approximated by mixing a header from one Main with
+a heap from another selected Main.
 Ordinary `alloc`/`alloc_zeroed` and the forced-client non-nullable variants
 return `MsgBuf`, not `Option<MsgBuf>`: the existing header reference rules out
 the internal null-header branch, and exhausted Data Heap allocation does not
@@ -560,9 +568,9 @@ UID/GID fields, and neither `SvmRegion` nor `MsgBuf` caches this policy.
 `MsgBuf` stores neither a Rust payload borrow nor `ApiMain`/`SvmRegion`.
 Because the main is global, its lifetime cannot prove the mapping stays
 installed; `alloc*`, `input_queue`, encoding, decoding and free therefore
-carry explicit unsafe preconditions. Calling `ShmemHeader::alloc*` requires
-that `self` be the current mapped header and its `ApiMain::rp` remain valid;
-there is no nullable-header branch once a valid `&ShmemHeader` exists.
+carry explicit unsafe preconditions. Calling `ApiMain::alloc*` requires
+that its rp and header describe the same live mapping; missing setup is an
+internal precondition violation, not successful absence.
 The caller must keep the mapping and
 the **originating** region installed while it accesses or frees a buffer,
 and must not alias a message another process has reclaimed. No type alone
@@ -617,7 +625,7 @@ address as a queue-slot value, not a dereferenceable Rust reference or an
 ownership transfer. Ring release clears the GC timestamp first, then clears the
 marker with `Release`; the next allocator tests the marker with `Acquire`
 before writing, so a previous release cannot reset a new owner's timestamp.
-Heap release obtains the current region from global `ApiMain`, locks it and
+Heap release obtains the originating region from the receiver `ApiMain`, locks it and
 deallocates on its Data Heap; the lifecycle precondition above requires that
 region to be the originating region. `free` acquires the current region lock
 only for heap allocations; the private `free_nolock` accepts the **already
@@ -628,7 +636,7 @@ without deallocating its ring storage. There is no safe payload-slice getter or
 automatic `Drop`: just as in VPP, free is explicit. After enqueue, the
 producer must not access the message; because generic `SvmQueue::add` copies
 address bytes and does not consume `MsgBuf`, the type cannot enforce this.
-`free(self)` is unsafe: the type also cannot detect that another process has
+`ApiMain::free(&self, message)` is unsafe: the type also cannot detect that another process has
 received, freed or forcibly reclaimed that slot. VPP's ten-second threshold
 is not an ownership certificate or a Rust aliasing guarantee.
 
@@ -718,8 +726,8 @@ never truncate a configured capacity or element size.
    interpret arbitrary corrupted bytes as `Vec` values.
    The mapping call records the current region, header address and process PID
    in `ApiMain`, as `memory_shared.c:503-505,598-601,679-683` does.
-2. The global `ApiMain` caches its process PID and current region when
-   mapping. Each ordinary `ShmemHeader::alloc*` reads that main internally
+2. The actual `ApiMain` caches its process PID and current region when
+   mapping. Each ordinary `ApiMain::alloc*` uses that same self
    and compares its PID to the shared `server_pid` at that moment. Equal means
    server rings and an assertion that the caller is the server's main thread
    through the existing runtime
@@ -728,7 +736,7 @@ never truncate a configured capacity or element size.
    load/store only select a pool, never establish header initialization or
    revoke an old server's access. On the existing-region server path the
    mapping call refreshes the process PID, as VPP does.
-3. `ShmemHeader::alloc*` scans eligible `RingAlloc` records. Each record
+3. `ApiMain::alloc*` scans eligible `RingAlloc` records. Each record
    is visited in configured/default vector order, without sorting by size,
    and checks its queue head; clients use `SvmQueueLock::ring_head_slot`, and
    the sole server main thread uses the private unlocked operation. If the
@@ -847,7 +855,7 @@ there is no compatibility wrapper and no change to `SvmMsgQ` storage.
 
 The short `SvmQueue` field queries and `can_send`, `ShmemHeader` PID/ring
 queries, `ApiMain::shmem_header` and `MsgBuf::len` carry `#[inline]`;
-`ApiMain::global` follows VPP's `always_inline vlibapi_get_main`
+`ApiMain::current` follows VPP's `always_inline vlibapi_get_main`
 (`vlibapi/api_common.h:384-389`). The queue/guard ring-head slot
 operations and `RingAlloc::alloc_slot` carry `#[inline(always)]` on their
 signatures above. VPP marks its
@@ -876,7 +884,7 @@ Keep infra queue, region and codec errors with their existing owners.
 | Backing `fchown` fails | Report the original OS error as an advisory diagnostic and continue, matching VPP's warning on both new and already existing backing. The root/API backing owner, not the SVM region or message allocator, performs this step. |
 | Invalid default queue geometry or override | `MapError::Queue { source }` preserves the underlying `SvmQueueError` before setting the shared header address. Custom `ShmElemConfig` is not accepted by ordinary mapping. |
 | Ring head occupied | First observation sets GC seconds mark and tries next class; after `now - mark > 10` the **same** slot is forcibly reused and counted, even if the old peer still has its address. This is not an `Option` failure. |
-| No current mapped header | Cannot call a `ShmemHeader` method without a valid `&ShmemHeader`; mapping must finish before allocation. VPP's internal explicit-region allocator checks `user_ctx == NULL`, but its ordinary entry points already dereference `am->shmem_hdr` for pool selection. Do not invent a successful `None` result for a receiver that cannot exist. |
+| No current mapped header | ApiMain::alloc requires its mapping/header to be installed; missing setup violates its unsafe precondition. VPP's internal explicit-region allocator checks `user_ctx == NULL`, but its ordinary entry points already dereference `am->shmem_hdr` for pool selection. Do not invent a successful `None` result for a receiver that cannot exist. |
 | Nullable Data Heap exhaustion | Only the `*_or_null` variants return `None` for heap exhaustion; non-nullable allocation has VPP's non-returning OOM behavior. No Main Heap fallback. |
 | Invalid allocation length | Assert that the caller's payload length fits VPP's signed `int`, and check prefix/slot arithmetic before writing any shared length; neither silently truncate to `u32` nor report heap exhaustion. |
 | Encode/decode failure | Existing `codec::Error`; an allocation not enqueued remains under the allocating caller's control. |
@@ -907,8 +915,8 @@ the separate shared header is not the queue object, and
 | Delete the separate shared header and local `SvmQueue` handle; replace both with shared `SvmQueue`; remove `SvmRegion` from queue init/attach, returning the actual shared queue address; add queue-bound guard, guarded/unlocked ring-head operations, restart-only unsafe mutex reset, advisory `can_send`, typed method-level operations; remove `SvmQueueElements<T>` | `hammer-infra::svm::queue`; VPP ring pointers and queue operations target one shared queue object without embedding the region in the generic queue; typed receive must not allocate a temporary `Vec`. Update exports and all callers of local queue construction/event-fd setup. `cleanup` destroys POSIX objects; the region heap owner separately frees the queue allocation only when retired, together matching `svm_queue_free`. |
 | Keep `SvmQueueConfig`, `SvmQueueConditionalWait`, `SvmQueueElement` and actionable `SvmQueueError` categories; adjust lock/wait implementation and owner-death handling | `hammer-infra::svm::queue`; preserve existing queue behavior and error categories with a shared-only object. |
 | Add `user_context`, `contains_range`, `set_user_context`; bump region/layout version | `hammer-infra::svm::region`; the existing region owns its `user_ctx`, mapping bounds and old-layout rejection. No second region owner. |
-| Add `ShmemHeader`, private `RingAlloc`/`RingRole`, address-handle `MsgBuf`, borrowed `From<&MsgBuf> for usize`, and narrow `MapError` including immediate backing-open failure; defer `ShmElement`/`ShmElemConfig` to private-region work | `hammer-ipc::binary_api::memory_shared`; no existing Binary API message storage/ring owner. Prefix fields live in the allocation, with no separate header type. `MsgBuf` stores no Rust payload borrow, region or queue, and has no Drop; unsafe operation-scoped access acknowledges forced reclaim. Ordinary free consults the global main. The address conversion is a queue-slot value, not ownership transfer. Dequeue validation remains private implementation detail. |
-| Extend existing `ApiMain` with current `rp`, stable `primary_rp`, private-region pointer list `private_rps`, ordinary owning list `mapped_shmem_regions`, current `shmem_header`, `process_pid`, `ring_misses`, input-queue length, API UID/GID, global base VA, root total/API data sizes, two independent PVT Heap sizes and API-region name. Add pre-installation configuration, UID/GID/base getters, `root_region_config`, `set_primary_region` after primary setup, one ordinary map and one ordinary-list unmap method; install the same `ApiMain` once without returning it into `api_global_main`, select through `my_api_main` per thread, then expose `global()`, `set_main()` and an unsafe current-header borrow | `hammer-ipc::binary_api::api`; VPP separates currently selected, primary, private memfd and ordinary mapped-region roles. Boxing each ordinary process-local `SvmRegion` keeps those pointers stable across vec growth; explicitly unmap every ordinary owner rather than merely dropping it. The root creator uses `global_base_va()` and the root-total config; root/API backing owners apply `api_uid()` and `api_gid()`; the API map passes API **data** size directly to `find_or_create_subregion`. `private_rps` stays empty until a separate private memfd owner is designed; it must not be populated by ordinary mapping or freed through its unmap method. Existing registration fields remain unchanged. No handler parameter or second main type is introduced. |
+| Add `ShmemHeader`, private `RingAlloc`/`RingRole`, address-handle `MsgBuf`, borrowed `From<&MsgBuf> for usize`, and narrow `MapError` including immediate backing-open failure; defer `ShmElement`/`ShmElemConfig` to private-region work | `hammer-ipc::binary_api::memory_shared`; no existing Binary API message storage/ring owner. Prefix fields live in the allocation, with no separate header type. `MsgBuf` stores no Rust payload borrow, region or queue, and has no Drop; unsafe operation-scoped access acknowledges forced reclaim. Ordinary free uses the explicitly borrowed ApiMain that owns the originating mapping. The address conversion is a queue-slot value, not ownership transfer. Dequeue validation remains private implementation detail. |
+| Extend existing `ApiMain` with current `rp`, stable `primary_rp`, private-region pointer list `private_rps`, ordinary owning list `mapped_shmem_regions`, current `shmem_header`, `process_pid`, `ring_misses`, input-queue length, API UID/GID, global base VA, root total/API data sizes, two independent PVT Heap sizes and API-region name. Add pre-installation configuration, UID/GID/base getters, `root_region_config`, `set_primary_region` after primary setup, one ordinary map and one ordinary-list unmap method; install the same `ApiMain` once without returning it into `api_global_main`, select through `my_api_main` per thread, then expose `current()`, `set_main()` and an unsafe current-header borrow | `hammer-ipc::binary_api::api`; VPP separates currently selected, primary, private memfd and ordinary mapped-region roles. Boxing each ordinary process-local `SvmRegion` keeps those pointers stable across vec growth; explicitly unmap every ordinary owner rather than merely dropping it. The root creator uses `global_base_va()` and the root-total config; root/API backing owners apply `api_uid()` and `api_gid()`; the API map passes API **data** size directly to `find_or_create_subregion`. `private_rps` stays empty until a separate private memfd owner is designed; it must not be populated by ordinary mapping or freed through its unmap method. ADR-0017 changes registry borrowing for post-install API-init; its server-only fields are documented there. No handler parameter or second main type is introduced. |
 | Move PID scanning to the acquired `RegionLock`; retain `SvmRegion::remove_exited_clients` as a delegating entry | `hammer-infra::svm::region`; restart already owns the API region lock and must not reacquire it. Preserve the existing `ESRCH`/`EPERM`/typed `ClientProbe` distinction; root cleanup after restart is advisory. |
 | Add direct uninitialized-output serialization; keep method-level `Api` generics on `MsgBuf::encode/decode` | `hammer-ipc::binary_api::codec` and `memory_shared`; current serializer takes initialized bytes, whereas nonzeroing allocation cannot expose an initialized mutable slice. |
 | Add `hammer-infra` and `hammer-runtime` dependencies to `hammer-ipc` | `hammer-ipc/Cargo.toml`; consume existing SVM owners and the existing runtime main-thread check for the server ring, without another thread-identity field in `ApiMain`. |
@@ -962,13 +970,15 @@ Scope: generic `hammer-infra::svm` queue/region and the ordinary
 `vlibapi/api_common.h`, and the client main-selection calls in
 `vlibmemory/memory_client.c` and `vcl/vcl_bapi.c`.
 
-Verdict: **Aligned for the implemented ordinary path; no blocking semantic
-finding.** The shared `SvmQueue` contains its inline elements at offset 120
+Historical ordinary-path review; **not a completion verdict for ADR-0017**.
+TLS/client ownership and allocation/free signatures below incorporate its
+revision; client generation, lifecycle integration and behavioral checks remain
+open as recorded there. The shared `SvmQueue` contains its inline elements at offset 120
 from a 64-byte-aligned allocation; the ring retains a pointer to that queue,
 tries larger classes and reclaims after more than ten seconds. Ordinary
-allocation selects the current thread's `ApiMain` once and compares its PID
-with the shared server PID; each thread initially selects `api_global_main`
-through `my_api_main`. Client rings lock their queues, server rings use the
+allocation uses the actual `&ApiMain` and compares its PID with the shared
+server PID; `current()` uses the default `api_global_main` unless `my_api_main`
+selects a different instance. Async clients retain their own Main reference. Client rings lock their queues, server rings use the
 main thread, and fallback and release activate the mapped region's Data Heap.
 The input queue accepts only a pointer-sized address through its waiting
 `add`; restart resets the input mutex after ten failed trylocks and drains

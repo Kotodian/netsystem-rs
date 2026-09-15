@@ -1,25 +1,27 @@
 //! Message identity and installation. VPP's range failure, replacement and
 //! duplicate-name behaviors are intentionally distinct operations.
 use super::{Api, codec};
-use std::cell::{Cell, UnsafeCell};
+use std::cell::{Cell, Ref, RefCell, UnsafeCell};
 use std::collections::HashMap;
 use std::num::NonZeroUsize;
 use std::ptr::NonNull;
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicI32, AtomicU32};
 
+use hammer_infra::pool::Pool;
 use hammer_infra::svm::region::{SvmRegion, SvmRegionConfig, SvmRegionFlags};
 
+use super::memclnt::ApiRegistration;
 use super::memory_shared::ShmemHeader;
 
 #[allow(non_upper_case_globals)]
 static api_global_main: OnceLock<ApiMain> = OnceLock::new();
 
 thread_local! {
+    // A selector, not a per-thread server registry. The daemon leaves every
+    // selection on the default; client workers may select their own Main.
     #[allow(non_upper_case_globals)]
-    static my_api_main: Cell<&'static ApiMain> = Cell::new(
-        api_global_main.get().expect("Binary API main installed before thread selection")
-    );
+    static my_api_main: Cell<Option<&'static ApiMain>> = const { Cell::new(None) };
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -36,7 +38,7 @@ pub struct ApiMsgConfig {
     pub id: u16,
     pub name: &'static str,
     pub crc: u32,
-    pub handler: Option<fn(&mut ApiMain, &[u8], &mut [u8]) -> Result<usize, codec::Error>>,
+    pub dispatch: Option<fn(&[u8], bool) -> Result<(), codec::Error>>,
     pub is_mp_safe: bool,
     pub traced: bool,
     pub replay: bool,
@@ -47,7 +49,7 @@ impl ApiMsgConfig {
             id,
             name: T::NAME,
             crc: T::CRC,
-            handler: None,
+            dispatch: T::HANDLER.map(|_| dispatch_message::<T> as _),
             is_mp_safe: false,
             traced: !T::FLAGS.contains(&"dont_trace"),
             replay: true,
@@ -58,7 +60,7 @@ impl ApiMsgConfig {
 #[derive(Clone, Copy, Default)]
 pub struct ApiMsgData {
     pub name: Option<&'static str>,
-    pub handler: Option<fn(&mut ApiMain, &[u8], &mut [u8]) -> Result<usize, codec::Error>>,
+    pub dispatch: Option<fn(&[u8], bool) -> Result<(), codec::Error>>,
     pub is_mp_safe: bool,
     pub trace_enable: bool,
     pub replay_allowed: bool,
@@ -78,13 +80,15 @@ pub struct ApiVersion {
 }
 
 pub struct ApiMain {
-    msg_data: Vec<ApiMsgData>,
-    msg_id_by_name: HashMap<&'static str, u16>,
-    msg_index_by_name_and_crc: HashMap<std::string::String, u16>,
-    first_available_msg_id: u16,
-    msg_ranges: Vec<ApiMsgRange>,
-    msg_range_by_name: HashMap<std::string::String, usize>,
-    api_version_list: Vec<ApiVersion>,
+    msg_data: RefCell<Vec<ApiMsgData>>,
+    msg_id_by_name: RefCell<HashMap<&'static str, u16>>,
+    msg_index_by_name_and_crc: RefCell<HashMap<std::string::String, u16>>,
+    first_available_msg_id: Cell<u16>,
+    msg_ranges: RefCell<Vec<ApiMsgRange>>,
+    msg_range_by_name: RefCell<HashMap<std::string::String, usize>>,
+    api_version_list: RefCell<Vec<ApiVersion>>,
+    pub(super) clients: UnsafeCell<Pool<NonNull<ApiRegistration>>>,
+    pub(super) serialized_message_table: UnsafeCell<Option<NonNull<Vec<u8>>>>,
     pub(super) rp: UnsafeCell<Option<NonNull<SvmRegion>>>,
     pub(super) primary_rp: UnsafeCell<Option<NonNull<SvmRegion>>>,
     pub(super) private_rps: UnsafeCell<Vec<NonNull<SvmRegion>>>,
@@ -103,22 +107,26 @@ pub struct ApiMain {
     pub(super) api_region_name: String,
 }
 
-// SAFETY: registration and configuration stop before installation. Only the
-// exclusive lifecycle owner mutates region pointers, and it must ensure no
-// allocator or queue borrower remains before changing/unmapping them.
+// SAFETY: configuration requires &mut access before installation. Every
+// registry Cell/RefCell access checks the runtime main thread first, including
+// the ranges and versions installed by later API-init hooks. Region pointers
+// change only through the unsafe exclusive
+// lifecycle operations, with no allocator, queue or async borrower remaining.
 unsafe impl Send for ApiMain {}
 unsafe impl Sync for ApiMain {}
 
 impl ApiMain {
     pub fn new(first_available_msg_id: u16) -> Self {
         Self {
-            msg_data: Vec::new(),
-            msg_id_by_name: HashMap::new(),
-            msg_index_by_name_and_crc: HashMap::new(),
-            first_available_msg_id,
-            msg_ranges: Vec::new(),
-            msg_range_by_name: HashMap::new(),
-            api_version_list: Vec::new(),
+            msg_data: RefCell::new(Vec::new()),
+            msg_id_by_name: RefCell::new(HashMap::new()),
+            msg_index_by_name_and_crc: RefCell::new(HashMap::new()),
+            first_available_msg_id: Cell::new(first_available_msg_id),
+            msg_ranges: RefCell::new(Vec::new()),
+            msg_range_by_name: RefCell::new(HashMap::new()),
+            api_version_list: RefCell::new(Vec::new()),
+            clients: UnsafeCell::new(Pool::new()),
+            serialized_message_table: UnsafeCell::new(None),
             rp: UnsafeCell::new(None),
             primary_rp: UnsafeCell::new(None),
             private_rps: UnsafeCell::new(Vec::new()),
@@ -138,6 +146,11 @@ impl ApiMain {
         }
     }
 
+    #[inline]
+    pub fn is_mapped(&self) -> bool {
+        unsafe { (*self.shmem_header.get()).is_some() }
+    }
+
     pub fn install(self) {
         assert!(
             api_global_main.set(self).is_ok(),
@@ -145,15 +158,28 @@ impl ApiMain {
         );
     }
 
+    /// The calling thread's selected Main, defaulting to the installed Main.
+    /// This selection is independent of the caller-owned VAPI Client value.
     #[inline(always)]
-    pub fn global() -> &'static Self {
-        my_api_main.get()
+    pub fn current() -> &'static Self {
+        my_api_main.get().unwrap_or_else(|| {
+            api_global_main
+                .get()
+                .expect("Binary API main installed before use")
+        })
     }
 
-    /// Selects the main for this thread; the previous selection remains live
-    /// and can be restored by passing it to this method again.
-    pub fn set_main(main: &'static Self) {
-        my_api_main.set(main);
+    /// Selects an existing Main for synchronous implicit-owner API entry points.
+    ///
+    /// # Safety
+    /// The caller must preserve the selected Main's thread-access contract.
+    /// In particular, daemon handlers must run with the daemon Main selected;
+    /// sharing a reference does not permit concurrent region mutation. An async
+    /// operation must retain its actual Main rather than reselect after await.
+    /// Region switching/unmapping requires all users of that region to finish.
+    #[inline(always)]
+    pub unsafe fn set_main(main: &'static Self) {
+        my_api_main.set(Some(main));
     }
 
     pub fn set_input_queue_length(&mut self, length: u32) {
@@ -231,8 +257,11 @@ impl ApiMain {
         unsafe { *self.primary_rp.get() = Some(region) };
     }
 
-    pub fn get_msg_ids(&mut self, name: &str, count: u16) -> Result<u16, Error> {
-        if self.msg_range_by_name.contains_key(name) {
+    pub fn get_msg_ids(&self, name: &str, count: u16) -> Result<u16, Error> {
+        hammer_runtime::thread_main::ensure_main_thread()
+            .expect("API message ranges are accessed by runtime main thread");
+        let mut names = self.msg_range_by_name.borrow_mut();
+        if names.contains_key(name) {
             return Err(Error::MessageRangeExists {
                 name: name.to_owned(),
             });
@@ -240,22 +269,28 @@ impl ApiMain {
         if count > 1024 {
             return Err(Error::MessageCountInvalid { count });
         }
+        assert!(
+            unsafe { (*self.serialized_message_table.get()).is_none() },
+            "API ranges are installed before clients receive the message table"
+        );
         // VPP stores the counter in u16 and permits zero count. Use explicit
         // wrapping, rather than adding a protocol error absent from that API.
-        let base = self.first_available_msg_id;
+        let base = self.first_available_msg_id.get();
         let end = base.wrapping_add(count);
-        self.msg_ranges.push(ApiMsgRange {
+        let mut ranges = self.msg_ranges.borrow_mut();
+        ranges.push(ApiMsgRange {
             name: name.to_owned(),
             first_msg_id: base,
             last_msg_id: end.wrapping_sub(1),
         });
-        self.msg_range_by_name
-            .insert(name.to_owned(), self.msg_ranges.len() - 1);
-        self.first_available_msg_id = end;
+        names.insert(name.to_owned(), ranges.len() - 1);
+        self.first_available_msg_id.set(end);
         Ok(base)
     }
 
-    pub fn msg_config(&mut self, config: ApiMsgConfig) {
+    pub fn msg_config(&self, config: ApiMsgConfig) {
+        hammer_runtime::thread_main::ensure_main_thread()
+            .expect("API message registry is accessed by runtime main thread");
         if config.id == 0 {
             tracing::warn!(
                 name = config.name,
@@ -263,62 +298,114 @@ impl ApiMain {
             );
             return;
         }
+        assert!(
+            unsafe { (*self.serialized_message_table.get()).is_none() },
+            "API message configuration precedes client message-table publication"
+        );
         let index = usize::from(config.id);
-        self.msg_data
-            .resize(self.msg_data.len().max(index + 1), ApiMsgData::default());
-        if let Some(handler) = self.msg_data[index].handler
+        let mut msg_data = self.msg_data.borrow_mut();
+        let capacity = msg_data.len().max(index + 1);
+        msg_data.resize(capacity, ApiMsgData::default());
+        if let Some(dispatch) = msg_data[index].dispatch
             && config
-                .handler
-                .is_none_or(|next| !std::ptr::fn_addr_eq(handler, next))
+                .dispatch
+                .is_none_or(|next| !std::ptr::fn_addr_eq(dispatch, next))
         {
             tracing::warn!(name = config.name, "replacing an API message handler");
         }
-        self.msg_data[index] = ApiMsgData {
+        msg_data[index] = ApiMsgData {
             name: Some(config.name),
-            handler: config.handler,
+            dispatch: config.dispatch,
             is_mp_safe: config.is_mp_safe,
             trace_enable: config.traced,
             replay_allowed: config.replay,
         };
-        self.msg_id_by_name.insert(config.name, config.id);
+        drop(msg_data);
+        self.msg_id_by_name
+            .borrow_mut()
+            .insert(config.name, config.id);
     }
 
-    pub fn add_msg_name_crc(&mut self, name_crc: &str, id: u16) {
-        if self.msg_index_by_name_and_crc.contains_key(name_crc) {
+    pub fn add_msg_name_crc(&self, name_crc: &str, id: u16) {
+        hammer_runtime::thread_main::ensure_main_thread()
+            .expect("API message registry is accessed by runtime main thread");
+        let mut names = self.msg_index_by_name_and_crc.borrow_mut();
+        if names.contains_key(name_crc) {
             tracing::warn!(name_crc, "duplicate API identity ignored");
             return;
         }
-        self.msg_index_by_name_and_crc
-            .insert(name_crc.to_owned(), id);
+        assert!(
+            unsafe { (*self.serialized_message_table.get()).is_none() },
+            "API message identities are installed before clients receive the table"
+        );
+        names.insert(name_crc.to_owned(), id);
     }
     pub fn get_msg_index(&self, name_crc: &str) -> Result<u16, Error> {
+        hammer_runtime::thread_main::ensure_main_thread()
+            .expect("API message registry is accessed by runtime main thread");
         self.msg_index_by_name_and_crc
+            .borrow()
             .get(name_crc)
             .copied()
             .ok_or_else(|| Error::MessageNameCrcMissing {
                 name_crc: name_crc.to_owned(),
             })
     }
+
     pub fn msg_id_by_name(&self, name: &str) -> Option<u16> {
-        self.msg_id_by_name.get(name).copied()
+        hammer_runtime::thread_main::ensure_main_thread()
+            .expect("API message registry is accessed by runtime main thread");
+        self.msg_id_by_name.borrow().get(name).copied()
     }
-    pub fn get_msg_data(&self, id: u16) -> Option<&ApiMsgData> {
-        self.msg_data.get(usize::from(id))
+    #[inline]
+    pub fn get_msg_data(&self, id: u16) -> Option<ApiMsgData> {
+        hammer_runtime::thread_main::ensure_main_thread()
+            .expect("API message registry is accessed by runtime main thread");
+        self.msg_data.borrow().get(usize::from(id)).copied()
     }
-    pub fn message_range(&self, name: &str) -> Option<&ApiMsgRange> {
-        self.msg_range_by_name
-            .get(name)
-            .map(|index| &self.msg_ranges[*index])
+    pub fn message_range(&self, name: &str) -> Option<Ref<'_, ApiMsgRange>> {
+        hammer_runtime::thread_main::ensure_main_thread()
+            .expect("API message ranges are accessed by runtime main thread");
+        let index = *self.msg_range_by_name.borrow().get(name)?;
+        Some(Ref::map(self.msg_ranges.borrow(), |ranges| &ranges[index]))
     }
-    pub fn add_version(&mut self, version: ApiVersion) {
-        self.api_version_list.push(version);
+    pub fn add_version(&self, version: ApiVersion) {
+        hammer_runtime::thread_main::ensure_main_thread()
+            .expect("API versions are accessed by runtime main thread");
+        self.api_version_list.borrow_mut().push(version);
     }
-    pub fn versions(&self) -> &[ApiVersion] {
-        &self.api_version_list
+    pub fn versions(&self) -> Ref<'_, [ApiVersion]> {
+        hammer_runtime::thread_main::ensure_main_thread()
+            .expect("API versions are accessed by runtime main thread");
+        Ref::map(self.api_version_list.borrow(), Vec::as_slice)
     }
-    pub fn message_table(&self) -> impl Iterator<Item = (&str, u16)> + '_ {
-        self.msg_index_by_name_and_crc
-            .iter()
-            .map(|(name, id)| (name.as_str(), *id))
+    #[inline]
+    pub fn message_table(&self) -> Ref<'_, HashMap<std::string::String, u16>> {
+        hammer_runtime::thread_main::ensure_main_thread()
+            .expect("API message registry is accessed by runtime main thread");
+        self.msg_index_by_name_and_crc.borrow()
     }
+}
+
+#[inline(always)]
+fn handler<T: Api>(message: T) {
+    T::HANDLER.expect("installed dispatch has a typed handler")(message);
+}
+
+fn dispatch_message<T: Api>(payload: &[u8], barrier_required: bool) -> Result<(), codec::Error> {
+    let mut decoder = codec::Deserializer::new(payload);
+    let message = serde::Deserialize::deserialize(&mut decoder)?;
+    if decoder.remaining_bytes() != 0 {
+        return Err(<codec::Error as serde::de::Error>::custom(
+            "API message has trailing payload bytes",
+        ));
+    }
+    if barrier_required {
+        hammer_runtime::worker_thread_barrier_sync!({
+            handler::<T>(message);
+        });
+    } else {
+        handler::<T>(message);
+    }
+    Ok(())
 }

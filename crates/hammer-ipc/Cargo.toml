@@ -4,8 +4,13 @@ version = "0.1.0"
 edition = "2024"
 publish = false
 
+[lib]
+name = "hammer_ipc"
+crate-type = ["dylib", "rlib"]
+
 [dependencies]
 serde = { workspace = true }
+tokio = { workspace = true }
 hammer-component-macros = { path = "../hammer-component-macros" }
 hammer-infra = { path = "../hammer-infra" }
 hammer-runtime = { path = "../hammer-runtime" }
@@ -16,3 +21,6 @@ prost = { workspace = true }
 socket2 = { workspace = true, features = ["all"] }
 thiserror = { workspace = true }
 tracing = { workspace = true }
+
+[dev-dependencies]
+hammer-core = { path = "../hammer-core" }

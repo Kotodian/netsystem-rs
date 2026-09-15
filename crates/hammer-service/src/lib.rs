@@ -17,7 +17,10 @@ hammer_runtime::__declare_registration_image!(
         session::__CONFIG_FN_SESSION_CONFIG,
     ];
     main_loop_enter_functions = [];
-    main_loop_exit_functions = [session::__INIT_FN_EXIT_SESSION];
+    main_loop_exit_functions = [
+        binary_api::__INIT_FN_EXIT_BINARY_API,
+        session::__INIT_FN_EXIT_SESSION,
+    ];
     worker_init_functions = [
         session::__INIT_FN_SESSION_WORKER_INIT,
     ];
