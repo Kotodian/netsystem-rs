@@ -187,7 +187,7 @@ pub struct PhysmemMain {
     base_addr: usize,
     max_size: usize,
     maps: Pool<PhysmemMap>,
-    pmalloc_main: PmallocMain,
+    pmalloc_main: Box<PmallocMain>,
 }
 
 pub struct PhysmemMap {
@@ -238,7 +238,7 @@ impl PhysmemMain {
             });
         }
         let log2_page_size = page_bytes.trailing_zeros();
-        let mut pmalloc_main = PmallocMain::new();
+        let mut pmalloc_main = Box::new(PmallocMain::new());
         pmalloc_main
             .initialize(base_addr, max_size)
             .map_err(|source| PhysmemError::Map {

@@ -31,7 +31,7 @@
 | --- | --- | --- | --- |
 | H1 | `crates/hammer-infra/src/physmem.rs:239` `PhysmemMap` | 一个值同时拥有 mmap 区域、fd、页大小和 NUMA 信息；`create` 直接执行 OS 映射 | 映射 backing 不再由单个 map 值独立拥有 |
 | H2 | `crates/hammer-core/src/buffer/main.rs:58` `BufferMain::new` | 每个 NUMA 节点直接调用 `PhysmemMap::create`，再把 map 放进 `BufferPool` | BufferPool 只保存 map index |
-| H3 | `crates/hammer-infra/src/pmalloc.rs:59` `PmallocMain` | 已有 page、arena、chunk、VA 索引和 VA-to-PA 实现，但尚未成为 physmem owner | 迁移为 `PhysmemMain` 的按值字段 |
+| H3 | `crates/hammer-infra/src/pmalloc.rs:59` `PmallocMain` | 已有 page、arena、chunk、VA 索引和 VA-to-PA 实现，但尚未成为 physmem owner | 由 `PhysmemMain` 通过 `Box<PmallocMain>` 唯一拥有 |
 | H4 | `crates/hammer-core/src/buffer/pool.rs:168` `BufferMain::pool` | 通过 `mapping.base/size/page_size` 定位和检查 Buffer slot | 改为通过 `PhysmemMain::get_map` 读取不可变 map 元数据 |
 | H5 | `crates/hammer-core/src/error.rs:57` | Buffer Pool mapping 错误保留 `PhysmemError` source | 仍在 core 边界只翻译一次 |
 
@@ -39,8 +39,8 @@
 
 | ID | 路径与符号 | 已核实行为 | 设计约束 |
 | --- | --- | --- | --- |
-| E1 | `third_party/vpp/src/vlib/physmem.h:24` `vlib_physmem_main_t` | main 持有 flags、base/max 范围、map pool 和 `pmalloc_main` | Hammer `PhysmemMain` 必须拥有 `PmallocMain` 与 map registry |
-| E2 | `third_party/vpp/src/vlib/physmem.c:83` `vlib_physmem_init` | 检查 pagemap，初始化 pmalloc，并回写实际 base/max | pmalloc 初始化顺序保留；VFIO 不在本 ADR 范围 |
+| E1 | `third_party/vpp/src/vlib/physmem.h:24` `vlib_physmem_main_t` | main 持有 flags、base/max 范围、map pool 和 `pmalloc_main` 指针 | Hammer `PhysmemMain` 必须唯一拥有堆分配的 `PmallocMain` 与 map registry |
+| E2 | `third_party/vpp/src/vlib/physmem.c:83` `vlib_physmem_init` | 使用 `clib_mem_alloc_aligned` 在堆上按 cache line 对齐分配 pmalloc main，保存指针后初始化，并回写实际 base/max | Hammer 先在 Main Heap 上创建 `Box<PmallocMain>`，再就地初始化；VFIO 不在本 ADR 范围 |
 | E3 | `third_party/vpp/src/vlib/physmem.c:30` `vlib_physmem_shared_map_create` | 通过 pmalloc shared arena 创建 backing，再登记 map、fd、base、page 数、page table、page size 和 NUMA | 不再由 `PhysmemMap::create` 直接 mmap |
 | E4 | `third_party/vpp/src/vlib/physmem.c:75` `vlib_physmem_get_map` | map 由稳定 pool index 查询 | Hammer 使用原始 `u32 map_index`，不新增 handle wrapper |
 | E5 | `third_party/vpp/src/vlib/physmem_funcs.h:23` | physmem alloc/free、page index、PA 转换为 `always_inline` helper | 纯算术/索引 helper 使用 `#[inline]`，不分配、不锁、不做 syscall |
@@ -59,7 +59,7 @@ pub struct PhysmemMain {
     base_addr: usize,
     max_size: usize,
     maps: Pool<PhysmemMap>,
-    pmalloc_main: PmallocMain,
+    pmalloc_main: Box<PmallocMain>,
 }
 
 pub struct PhysmemMap {
@@ -79,14 +79,16 @@ pub static PHYSMEM_MAIN: OnceLock<PhysmemMain> = OnceLock::new();
 的 close 和 backing unmap 仍由 `PmallocMain` 内的 arena owner 负责。map index
 为 pool index，`u32::MAX` 不作为有效 index。
 
-`PhysmemMain` 安装前，初始化代码在一个 `PhysmemMain` 值上完成所有 pmalloc 和 map
-操作；安装后 map registry 不再增删。这样 `get_map` 返回的借用在进程生命周期内稳定，
-也不需要给 map registry 增加锁或 callback API。
+`PhysmemMain` 安装前，初始化代码先在已发布的 Main Heap 上分配 `PmallocMain`，再通过
+`Box` 对其就地初始化并完成所有 map 操作。`PhysmemMain` 安装后 map registry 不再增删，
+`PmallocMain` 的地址也保持稳定。这样 `get_map` 返回的借用在进程生命周期内稳定，也不
+需要给 map registry 增加锁或 callback API。
 
 ### 4.2 `PmallocMain`
 
-已有 `PmallocMain` 保留 VPP 的 page、arena、chunk、VA 索引和地址转换语义，但 owner
-改为 `PhysmemMain` 的字段：
+已有 `PmallocMain` 保留 VPP 的 page、arena、chunk、VA 索引和地址转换语义，但由
+`PhysmemMain` 的 `Box<PmallocMain>` 字段唯一拥有。`Box` 是通过 Rust 全局 allocator
+执行的普通分配；按启动顺序，此时 allocator 已切换到进程 Main Heap：
 
 ```rust
 #[repr(align(64))]
@@ -170,7 +172,7 @@ Map 元数据通过 `base`、`size`、`page_size` 和 `numa_node` 直接 getter 
 
 `init` 的内部顺序固定为：
 
-1. 调用 `PmallocMain::initialize`；
+1. 在 Main Heap 上分配 `Box<PmallocMain>`，再调用 `PmallocMain::initialize`；
 2. 对 `numa_nodes` 按输入顺序调用内部 `shared_map_create`；
 3. 使用 `PmallocMain::get_pa` 建立每个 `PhysmemMap::page_table`；
 4. 计算实际 `base_addr` 和 `max_size`；
@@ -361,8 +363,9 @@ physmem recoverable error。
 
 ### 7.1 控制结构
 
-- `PhysmemMain` 和 `PmallocMain` 按 64-byte cache line 对齐，匹配 VPP 对 pmalloc
-  main control block 的 cache-line aligned allocation。
+- `PhysmemMain` 按 64-byte cache line 对齐；`PmallocMain` 通过 `Box` 在 Main Heap 上
+  独立分配，其 `#[repr(align(64))]` 使 allocation layout 保持 64-byte 对齐，匹配 VPP
+  对 pmalloc main control block 的 cache-line aligned allocation。
 - `PhysmemMap` 不声明 C ABI；它是 Rust 内部 owner 的 metadata，不向插件导出裸结构布局。
 - `BufferThreadCache` 保留当前 `#[repr(align(64))]`。
 - `PmallocMain::lookup_table` 保留 `AlignedVec<usize, CACHE_LINE>`。
@@ -434,7 +437,7 @@ pmalloc 分配、NUMA policy 操作和 mapping syscall 不使用 `#[inline]` 作
 | 决策 | 选择 | owner、恢复动作和边界消费者 |
 | --- | --- | --- |
 | D1 | 进程级 `PhysmemMain` 按值拥有 map registry | `hammer-infra` 安装一次；重复安装是启动错误；BufferMain 只通过 `get_map` 读取 |
-| D2 | `PhysmemMain` 按值拥有 `PmallocMain` | pmalloc 的 VM、NUMA、页表和 fd 清理由同一 owner 完成；不新增第二个 singleton |
+| D2 | `PhysmemMain` 通过 `Box<PmallocMain>` 唯一拥有 Main Heap 上的 pmalloc main | pmalloc control block 地址稳定；VM、NUMA、页表和 fd 清理由同一 owner 完成；不新增第二个 singleton |
 | D3 | BufferPool 保存原始 `u32 mapping_index` | pool index 是稳定内部事实；无效 index 是 invariant panic；不增加 handle wrapper |
 | D4 | shared map 由 pmalloc arena 创建 | `shared_map_create` 先完成 arena/page metadata，再登记 map；失败时清理 arena 并保持 registry 不变 |
 | D5 | map 只在 worker 启动前创建 | `DataPlaneMain::new_main` 完成 BufferMain；worker 只读已发布 owner；运行期动态 map 另行设计 |
@@ -446,7 +449,7 @@ pmalloc 分配、NUMA policy 操作和 mapping syscall 不使用 `#[inline]` 作
 | 维度 | 当前 Hammer | 本 ADR | VPP | 结论 |
 | --- | --- | --- | --- | --- |
 | main owner | `PhysmemMap` 值分散在 BufferPool | `PhysmemMain` 按值拥有 pmalloc 和 map pool | `vlib_physmem_main_t` | 对齐，D1 |
-| pmalloc | 独立 `PmallocMain` | 作为 `PhysmemMain` 字段 | `pmalloc_main` 指针字段 | Rust 按值拥有，D2 |
+| pmalloc | 独立 `PmallocMain` | 作为 `PhysmemMain` 的 `Box<PmallocMain>` 字段在 Main Heap 上分配 | `pmalloc_main` 指针字段，control block 由 `clib_mem_alloc_aligned` 分配 | 对齐，D2 |
 | VFIO | 尚无 owner | 本 ADR 不引入 | 独立 `vfio_main` | 明确留待 PCI/DMA ADR |
 | map 创建 | map 直接 mmap | 由 pmalloc shared arena 创建 | `vlib_physmem_shared_map_create` | 对齐，D4 |
 | map mutation | BufferPool 持有值 | worker 启动前完成，之后只读 | VPP main thread 可继续创建 | 有意限制，D5；动态 map 需后续 barrier ADR |
@@ -463,7 +466,7 @@ pmalloc 分配、NUMA policy 操作和 mapping syscall 不使用 `#[inline]` 作
 ### 修改
 
 - `crates/hammer-infra/src/pmalloc.rs`：保持现有 pmalloc 语义，改由 `PhysmemMain`
-  按值拥有。
+  通过 `Box` 唯一拥有。
 - `crates/hammer-infra/src/lib.rs`：注册 owner 模块；不把 plugin-specific 类型
   re-export 到 runtime。
 - `crates/hammer-core/src/buffer/main.rs`：删除 `PhysmemMap::create` 调用，保存
@@ -485,7 +488,7 @@ pmalloc 分配、NUMA policy 操作和 mapping syscall 不使用 `#[inline]` 作
 
 | 测试 | 层级与设置 | 断言 | 决策 |
 | --- | --- | --- | --- |
-| `physmem_main_initializes_pmalloc_and_maps` | infra integration，真实 MemMain/page mapping | `PmallocMain`、map pool、base/max、map index 和 page metadata 正确 | D1,D2,D4 |
+| `physmem_main_initializes_pmalloc_and_maps` | infra integration，真实 MemMain/page mapping | `PmallocMain` control block 位于 Main Heap、保持 cache-line alignment，map pool、base/max、map index 和 page metadata 正确 | D1,D2,D4 |
 | `physmem_map_creation_failure_is_atomic` | infra integration，制造具体 backing/NUMA failure | 不存在半登记 map，已建 arena 被清理 | D4,D6 |
 | `physmem_lookup_matches_pmalloc` | infra unit/integration | `get_page_index`、`get_pa`、批量转换与 pmalloc lookup 一致 | D2,D7 |
 | `physmem_alignment_matches_page_and_cache_contract` | infra integration | main control block 64-byte 对齐，map base/page/Buffer stride 对齐 | D1,D7 |
@@ -507,7 +510,7 @@ skip 与实际通过。普通 page、pmalloc 和 Buffer 测试仍需独立运行
 
 当前结论为 `Needs decisions`，不是实现完成声明。需要明确批准：
 
-1. `PhysmemMain` 按值拥有 `PmallocMain`；
+1. `PhysmemMain` 通过 `Box<PmallocMain>` 唯一拥有 Main Heap 上分配的 pmalloc main；
 2. BufferPool 改存原始 `u32 map_index`；
 3. map 只在 worker 启动前创建，运行期动态 map 另行设计；
 4. `[physmem]` 通过 `early = true` config function 解析，`DataPlaneMain::new_main` 完成 owner 安装；
@@ -526,9 +529,10 @@ BufferPool 保存稳定的 `u32 mapping_index`。
 ### VPP analog and evidence
 
 - `third_party/vpp/src/vlib/physmem.h` 的 `vlib_physmem_main_t` 持有 flags、base/max、
-  map pool 和 pmalloc owner；Hammer 对应 `PhysmemMain` 的 cache-line aligned 按值字段。
-- `third_party/vpp/src/vlib/physmem.c:vlib_physmem_init` 先初始化 pmalloc，再使用实际
-  base/max；Hammer 在 `PhysmemMain::init` 中保留相同顺序，并在 `BufferMain::init` 前完成。
+  map pool 和 pmalloc 指针；Hammer 对应 `PhysmemMain` 的 `Box<PmallocMain>` 唯一 owner。
+- `third_party/vpp/src/vlib/physmem.c:vlib_physmem_init` 使用 `clib_mem_alloc_aligned` 在堆上
+  按 cache line 对齐分配 pmalloc main，保存指针后初始化并使用实际 base/max；Hammer 在
+  `PhysmemMain::init` 中先从 Main Heap 分配 `Box<PmallocMain>`，再就地初始化并保持相同顺序。
 - `third_party/vpp/src/vlib/physmem.c:vlib_physmem_shared_map_create` 通过 shared arena
   创建 backing，再登记 map；Hammer 的 `shared_map_create` 复用同一 pmalloc owner，令
   `n_pages = arena.n_pages * arena.subpages_per_page`，并按 VPP 的 arena-page 粒度填充
@@ -543,8 +547,6 @@ BufferPool 保存稳定的 `u32 mapping_index`。
 
 ### Intentional differences
 
-- VPP 的 `pmalloc_main` 是指针字段，Hammer 按值拥有它，避免 Rust owner 生命周期脱离
-  `PhysmemMain`。
 - VPP 的 `clib_error_t` 由调用方消费；Hammer 沿现有 `PhysmemError`/`DataPlaneError`
   seam 返回 typed `Result`，不新增 VFIO 或通用错误包装。
 - VPP physmem 初始化还调用 Linux VFIO 初始化；本 ADR 明确不引入 VFIO，PCI/DMA 另行
@@ -552,9 +554,22 @@ BufferPool 保存稳定的 `u32 mapping_index`。
 - VPP 可在 main thread 后续创建 map；Hammer 在 worker 启动前一次性创建，运行期变更需
   后续 barrier ADR。
 
+### Findings
+
+- **Blocking，已解决：**此前 `PhysmemMain` 内嵌 `PmallocMain`，与
+  `vlib_physmem_init` 的独立 cache-line aligned heap allocation 不一致，并使 control
+  block 随外层构造值搬移。现已改为 `Box<PmallocMain>`，由启动线程的默认 active Main
+  Heap 分配，并在固定地址就地初始化。
+- 无剩余 blocking 或 non-blocking finding。
+
 ### Verdict
 
 `Aligned` for the approved physmem/pmalloc/Buffer ownership and early-config scope. The
 VFIO omission and pre-worker-only map lifecycle are explicit product decisions, not missing
-implementation. Runtime workspace verification remains blocked by the pre-existing
-`SvmFifo::dequeue_drop` API mismatch outside this change.
+implementation.
+
+### Commands run
+
+- `cargo fmt --all -- --check`
+- `git diff --check`
+- `cargo test -p hammer-infra --test pmalloc`
