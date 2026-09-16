@@ -16,6 +16,7 @@ use syn::{
 #[derive(Default)]
 struct StatsFieldArgs {
     path: Option<LitStr>,
+    bootstrap: Option<Expr>,
 }
 
 impl Parse for StatsFieldArgs {
@@ -31,10 +32,21 @@ impl Parse for StatsFieldArgs {
                     }
                     args.path = Some(input.parse()?);
                 }
+                "bootstrap" => {
+                    if args.bootstrap.is_some() {
+                        return Err(Error::new(
+                            key.span(),
+                            "duplicate `bootstrap` stats argument",
+                        ));
+                    }
+                    args.bootstrap = Some(input.parse()?);
+                }
                 other => {
                     return Err(Error::new(
                         key.span(),
-                        format!("unknown `stats` argument `{other}`; expected `path`"),
+                        format!(
+                            "unknown `stats` argument `{other}`; expected `path` or `bootstrap`"
+                        ),
                     ));
                 }
             }
@@ -69,6 +81,7 @@ struct StatsField {
     ty: Type,
     path: LitStr,
     metric: StatsMetric,
+    bootstrap: Option<Expr>,
 }
 
 fn stats_metric_base(field: &Field) -> Result<StatsMetricBase> {
@@ -188,6 +201,15 @@ fn stats_field(field: &Field, namespace: &str) -> Result<StatsField> {
             if parsed.path.is_some() {
                 args.path = parsed.path;
             }
+            if args.bootstrap.is_some() && parsed.bootstrap.is_some() {
+                return Err(Error::new(
+                    attribute.span(),
+                    "duplicate `stats` field argument",
+                ));
+            }
+            if parsed.bootstrap.is_some() {
+                args.bootstrap = parsed.bootstrap;
+            }
         }
     }
 
@@ -248,45 +270,86 @@ fn stats_field(field: &Field, namespace: &str) -> Result<StatsField> {
         ty: field.ty.clone(),
         path: LitStr::new(&path, path_span),
         metric,
+        bootstrap: args.bootstrap,
     })
 }
 
-fn expand_stats_descriptor(field: &StatsField) -> TokenStream2 {
-    let ident = &field.ident;
-    let ty = &field.ty;
+/// Returns the directory type and the creating operation of one metric family.
+fn stats_metric_operations(field: &StatsField) -> (TokenStream2, TokenStream2) {
     let path = &field.path;
-    quote! {
-        #ident: #ty::new(#path),
+    match &field.metric {
+        StatsMetric::Gauge => (
+            quote!(::hammer_stats::DirectoryType::Gauge),
+            quote!(segment.add_gauge(#path)),
+        ),
+        StatsMetric::Timestamp => (
+            quote!(::hammer_stats::DirectoryType::ScalarIndex),
+            quote!(segment.add_timestamp(#path)),
+        ),
+        StatsMetric::SimpleCounter => (
+            quote!(::hammer_stats::DirectoryType::CounterVectorSimple),
+            quote!(segment.add_simple_counter(#path)),
+        ),
+        StatsMetric::CombinedCounter => (
+            quote!(::hammer_stats::DirectoryType::CounterVectorCombined),
+            quote!(segment.add_combined_counter(#path)),
+        ),
+        StatsMetric::Histogram => (
+            quote!(::hammer_stats::DirectoryType::HistogramLog2),
+            quote!(segment.add_histogram(#path)),
+        ),
     }
 }
 
-fn expand_stats_registration(field: &StatsField) -> TokenStream2 {
+/// Creates one declared fixed slot and checks its VPP directory index.
+fn expand_stats_bootstrap(field: &StatsField) -> Option<TokenStream2> {
+    let expected = field.bootstrap.as_ref()?;
+    let path = &field.path;
+    let (_, register) = stats_metric_operations(field);
+    Some(quote! {
+        let fixed = #register?;
+        assert!(
+            fixed.index.raw() == #expected,
+            "fixed stats slot {} is at directory index {}, not the declared index {}",
+            #path,
+            fixed.index.raw(),
+            #expected,
+        );
+    })
+}
+
+/// Binds one declared field through the segment operation of its metric family.
+///
+/// A `bootstrap` field resolves the fixed slot that the stats segment already
+/// owns; every other field creates its directory entry through `add_*`.
+fn expand_stats_field_binding(field: &StatsField) -> TokenStream2 {
     let ident = &field.ident;
     let ty = &field.ty;
     let path = &field.path;
-    let register = match &field.metric {
-        StatsMetric::Gauge => quote!(stats_main.add_gauge(stats.#ident)),
-        StatsMetric::Timestamp => quote!(stats_main.add_timestamp(stats.#ident)),
-        StatsMetric::SimpleCounter => quote!(stats_main.add_simple_counter(stats.#ident)),
-        StatsMetric::CombinedCounter => quote!(stats_main.add_combined_counter(stats.#ident)),
-        StatsMetric::Histogram => quote!(stats_main.add_histogram(stats.#ident)),
-    };
-    quote! {
-        if let Err(error) = #register {
-            if !matches!(error, ::hammer_stats::StatsError::DuplicateName) {
-                return Err(error);
-            }
-            #ty::bind(stats_main, #path)?;
+    let (directory_type, register) = stats_metric_operations(field);
+    if field.bootstrap.is_some() {
+        quote! {
+            let #ident = match segment.find(#path, #directory_type) {
+                Ok(index) => #ty { index },
+                Err(error) => {
+                    Self::release_partial(&mut segment, &released);
+                    return Err(error.into());
+                }
+            };
         }
-    }
-}
-
-fn expand_stats_bind(field: &StatsField) -> TokenStream2 {
-    let ident = &field.ident;
-    let ty = &field.ty;
-    let path = &field.path;
-    quote! {
-        #ident: #ty::bind(stats_main, #path)?,
+    } else {
+        quote! {
+            let #ident = match #register {
+                Ok(metric) => {
+                    released.push(metric.index);
+                    metric
+                }
+                Err(error) => {
+                    Self::release_partial(&mut segment, &released);
+                    return Err(error.into());
+                }
+            };
+        }
     }
 }
 
@@ -508,27 +571,42 @@ fn expand_stats(item: ItemStruct) -> Result<TokenStream2> {
     let registration_name = format_ident!("__STATS_REGISTRATION_{}", aggregate);
     let owner_name = format_ident!("__STATS_OWNER_{}", aggregate);
     let aggregate_name = LitStr::new(&aggregate.to_string(), aggregate.span());
-    let descriptors = stats_fields.iter().map(expand_stats_descriptor);
-    let registrations = stats_fields.iter().map(expand_stats_registration);
-    let bindings = stats_fields.iter().map(expand_stats_bind);
-    Ok(quote! {
-        impl #aggregate {
-            pub(crate) fn register(
-                stats_main: &::hammer_stats::StatsMain,
+    let bindings = stats_fields.iter().map(expand_stats_field_binding);
+    let idents = stats_fields.iter().map(|field| &field.ident);
+    let bootstrap = stats_fields
+        .iter()
+        .filter_map(expand_stats_bootstrap)
+        .collect::<Vec<_>>();
+    let bootstrap = (!bootstrap.is_empty()).then(|| {
+        quote! {
+            /// Creates the fixed segment slots this declaration owns.
+            ///
+            /// The stats owner calls this once before any metric owner
+            /// registers, so the fixed slots keep their VPP directory index.
+            pub(crate) fn bootstrap(
+                segment: &mut ::hammer_stats::StatsSegment,
             ) -> ::hammer_stats::StatsResult<()> {
-                let stats = Self {
-                    #(#descriptors)*
-                };
-                #(#registrations)*
+                #(#bootstrap)*
                 Ok(())
             }
+        }
+    });
+    Ok(quote! {
+        impl #aggregate {
+            #bootstrap
 
-            pub(crate) fn bind(
-                stats_main: &::hammer_stats::StatsMain,
-            ) -> ::hammer_stats::StatsResult<Self> {
-                Ok(Self {
-                    #(#bindings)*
-                })
+            fn release_partial(
+                segment: &mut ::hammer_stats::StatsSegment,
+                released: &[::hammer_stats::DirectoryIndex],
+            ) {
+                for index in released.iter().rev() {
+                    if let Err(error) = segment.remove_entry(*index) {
+                        eprintln!(
+                            "hammer-stats: failed to release directory entry {}: {error}",
+                            index.raw()
+                        );
+                    }
+                }
             }
 
             fn install(
@@ -537,8 +615,14 @@ fn expand_stats(item: ItemStruct) -> Result<TokenStream2> {
                 if #owner_name.get().is_some() {
                     return Ok(());
                 }
-                Self::register(stats_main)?;
-                let stats = Self::bind(stats_main)?;
+                let mut segment = stats_main.segment.lock();
+                let mut released: ::std::vec::Vec<::hammer_stats::DirectoryIndex> =
+                    ::std::vec::Vec::new();
+                #(#bindings)*
+                let stats = Self {
+                    #(#idents),*
+                };
+                drop(segment);
                 assert!(
                     #owner_name.set(stats).is_ok(),
                     "stats owner changed after installation preflight"

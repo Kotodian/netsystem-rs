@@ -9,4 +9,3 @@ hammer-component-macros = { path = "../hammer-component-macros" }
 hammer-core = { path = "../hammer-core" }
 hammer-infra = { path = "../hammer-infra" }
 libc = { workspace = true }
-socket2 = { workspace = true, features = ["all"] }

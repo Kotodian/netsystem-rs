@@ -347,6 +347,7 @@ impl MainHeapConfig {
             None,
             0,
             page_size,
+            false,
             "main heap",
         )?;
         let heap = match unsafe { MemHeap::create_at(base, size, true, "main heap") } {
@@ -598,7 +599,16 @@ pub struct MemHeap {
 }
 
 impl MemHeap {
-    pub(crate) unsafe fn create_at(
+    /// Creates a fixed-capacity heap covering `base..base + size`.
+    ///
+    /// `base` must name a range inside a live `MemMain` VM mapping. The heap is
+    /// registered in the Main Heap inventory before it is returned.
+    ///
+    /// # Safety
+    ///
+    /// The caller must own the range exclusively and keep it mapped for the
+    /// heap's lifetime.
+    pub unsafe fn create_at(
         base: NonNull<u8>,
         size: usize,
         locked: bool,
@@ -865,7 +875,7 @@ impl MemHeap {
     /// # Safety
     ///
     /// No allocation from this heap may remain live or be accessed again.
-    pub(crate) unsafe fn destroy(&self) {
+    pub unsafe fn destroy(&self) {
         let state = ptr::addr_of_mut!(MEM_MAIN);
         let main_heap = unsafe { (*state).main_heap };
         assert_ne!(
@@ -1149,7 +1159,7 @@ impl MemMain {
         }
     }
 
-    pub(crate) fn vm_create_backing(page_size: PageSize, name: &str) -> Result<OwnedFd, MemError> {
+    pub fn vm_create_backing(page_size: PageSize, name: &str) -> Result<OwnedFd, MemError> {
         let state = ptr::addr_of_mut!(MEM_MAIN);
         assert_ne!(
             unsafe { (*state).log2_page_size },
@@ -1325,6 +1335,7 @@ impl MemMain {
         page_size: PageSize,
         backing: Option<BorrowedFd<'_>>,
         backing_offset: u64,
+        read_only: bool,
     ) -> Result<(), MemError> {
         let page_bytes = page_size
             .bytes()
@@ -1357,11 +1368,16 @@ impl MemMain {
                 });
             }
         }
+        let protection = if read_only {
+            libc::PROT_READ
+        } else {
+            libc::PROT_READ | libc::PROT_WRITE
+        };
         let mapped = unsafe {
             libc::mmap(
                 base.as_ptr().cast(),
                 size,
-                libc::PROT_READ | libc::PROT_WRITE,
+                protection,
                 flags | libc::MAP_FIXED,
                 backing_fd.unwrap_or(-1),
                 backing_offset as libc::off_t,
@@ -1390,7 +1406,9 @@ impl MemMain {
                 source,
             });
         }
-        unsafe { ptr::write_bytes(base.as_ptr(), 0, size) };
+        if !read_only {
+            unsafe { ptr::write_bytes(base.as_ptr(), 0, size) };
+        }
         Ok(())
     }
 
@@ -1429,13 +1447,19 @@ impl MemMain {
         Ok(())
     }
 
-    pub(crate) fn vm_map(
+    /// Maps `size` bytes owned by the caller and registers the mapping.
+    ///
+    /// The returned pointer names the mapping payload. The caller releases it
+    /// with [`MemMain::vm_unmap`] using the same pointer.
+    #[allow(clippy::too_many_arguments)]
+    pub fn vm_map(
         base: Option<NonZeroUsize>,
         size: usize,
         page_size: PageSize,
         backing: Option<BorrowedFd<'_>>,
         backing_offset: u64,
         alignment: usize,
+        read_only: bool,
         name: &str,
     ) -> Result<NonNull<u8>, MemError> {
         let state = ptr::addr_of_mut!(MEM_MAIN);
@@ -1666,11 +1690,16 @@ impl MemMain {
             }
         }
         let fd = backing_fd.unwrap_or(-1);
+        let protection = if read_only {
+            libc::PROT_READ
+        } else {
+            libc::PROT_READ | libc::PROT_WRITE
+        };
         let mapped = unsafe {
             libc::mmap(
                 payload.cast(),
                 size,
-                libc::PROT_READ | libc::PROT_WRITE,
+                protection,
                 flags | libc::MAP_FIXED,
                 fd,
                 backing_offset as libc::off_t,
@@ -1805,7 +1834,17 @@ impl MemMain {
         Ok(unsafe { NonNull::new_unchecked(payload) })
     }
 
-    pub(crate) unsafe fn vm_unmap(base: NonNull<u8>) -> Result<(), MemError> {
+    /// Unmaps a mapping previously returned by [`MemMain::vm_map`].
+    ///
+    /// A recoverable `Err` means the mapping is still registered and owned by
+    /// the caller. Success means the payload and the VM inventory entry are
+    /// gone.
+    ///
+    /// # Safety
+    ///
+    /// `base` must be the pointer returned by `vm_map` and must have no live
+    /// borrows.
+    pub unsafe fn vm_unmap(base: NonNull<u8>) -> Result<(), MemError> {
         let system_page_size = MemMain::system_page_size();
         let header = base
             .as_ptr()
@@ -1952,12 +1991,11 @@ impl MemMain {
         }
         map_lock.store(0, Ordering::Release);
 
+        // The payload and the inventory entry are already gone: the header page
+        // is no longer reachable from the map list, so a failure here cannot be
+        // reported as a recoverable owner-managed state.
         if unsafe { libc::munmap(header.cast(), system_page_size) } != 0 {
-            return Err(MemError::VirtualMemoryUnmap {
-                base: header.addr(),
-                size: system_page_size,
-                source: io::Error::last_os_error(),
-            });
+            std::process::abort();
         }
         Ok(())
     }

@@ -187,7 +187,9 @@ stats header 的保留长度仍按 VPP 的**系统页**契约核实；不得混�
 1. heap 创建前失败：MemMain VM 路径回滚 map inventory/映射，关闭 backing。
 2. 未发布 heap 上的目录创建失败：释放已构造 payload，使用既有
    `MemHeap::destroy` 移除 heap inventory，再 `MemMain::vm_unmap(B)` 移除 map
-   inventory、解除 payload 与 VM 私有页，最后关闭 fd。
+   inventory、解除 payload 与 VM 私有页，最后关闭 fd。当前 create 在 heap
+   建立之后只写共享头（不可失败），该规则因此没有可达调用点；`MemHeap::destroy`
+   仍只服务发布前回滚，不为它先造一个假调用者。
 3. 发布后 heap 按当前 runtime 的 process lifetime 存活；正常最终退出先停 worker、
    collector 和 listener/unlink，随后进程退出释放映射。不能把目前只允许
    “未发布 heap 回滚”的 `destroy` 当成已支持运行期删除。
@@ -298,9 +300,12 @@ crate-private 方法也不能未经批准整体提升 public。旧 Segment 的�
 
 1. `derive(Stats)` 继续表示 owner 的指标声明；`StatsRegistration` 继续是安装
    声明，不伪装成周期 collector，也不成为第八类 GlobalMain lifecycle hook。
-2. 核心三项的固定槽位在 StatsMain bootstrap 中确立，随后 Sys bind；不依赖
-   跨 image 遍历顺序碰巧把 heartbeat 放在 slot zero。当前虽然定义了固定索引
-   常量，但 `StatsSegment::create` 创建的是空目录。
+2. 核心三项的固定槽位只声明一次：Sys 的 `#[stats(bootstrap = STAT_COUNTER_*)]`
+   字段就是 VPP `foreach_stat_segment_counter_name` 的 Rust 对应声明，宏据此
+   生成 bootstrap 创建步骤，并在创建时校验槽位索引等于声明的固定索引。
+   segment 只保留索引与数量常量，不再手写这组名字。该步骤在 StatsMain::init
+   之后、任何 owner 注册与 listener 交付之前执行；不依赖跨 image 遍历顺序
+   碰巧把 heartbeat 放在 slot zero。
 3. runtime 先建立 node calls/vectors/clocks/suspends 与 clear baseline 的真实
    owner 更新点，再导出 `/sys/node/*`、名字与 `/nodes/<name>/*` symlink。
    当前 error descriptor/index 的存在不等于已有运行计数与导出能力。
@@ -336,9 +341,10 @@ vendored C 普通 dump 对 ring 也没有提供完整 payload 读取，不能把
 ### D6. 初始化、错误与退出必须一起闭环
 
 **拟议决定：**沿用现有 StatsMain::init 与 runtime init hook。StatsMain::init
-在内部完成配置验证、mapping、heap、核心目录、socket 和 listener fd 准备，
-全部成功后才设置已有 OnceLock；其内部失败清理本次资源。调用者不取得一个等待
-单独发布的 StatsMain，也不增加二阶段初始化 API。
+在内部完成配置验证、mapping、heap 与核心目录准备，全部成功后才设置已有
+OnceLock；其内部失败清理本次资源。listener bind 与 FileMain 安装由 runtime
+statseg 在此之后完成，对应 VPP 在 vlib 侧的 `stats_segment_socket_init`。
+调用者不取得一个等待单独发布的 StatsMain，也不增加二阶段初始化 API。
 
 runtime 随后通过既有入口完成 FileMain 安装与 owner registration；全部成功后
 才启动 worker、collector 和 File 事件分发。如果这一阶段失败，终止 daemon
@@ -351,15 +357,16 @@ runtime 随后通过既有入口完成 FileMain 安装与 owner registration；�
 unlink 自己的 socket 路径；已发布 heap 与映射按 D0.3 保留到进程退出。
 已有外部映射可继续存活但 heartbeat 停止，不承诺从同一 OnceLock 重启新一代 worker。
 peer 断开只结束该次 fd 交付；文件系统清理失败可观察，不能覆盖原始启动错误。
-`sendmsg` 和缓冲分配不持有 stats spin lock。
+`handoff_segment` 只从 segment 取出稳定 backing fd，`sendmsg` 与缓冲分配都不
+持有 stats spin lock。
 
 | 失败类别 | owner / caller 的恢复动作 | 原子性与证据 |
 | --- | --- | --- |
-| 配置、容量、mapping/fd/I/O | stats 使用既有 StatsError；infra 原始失败保留 source；startup caller 终止该次安装并清理 | StatsMain::init 内部失败不安装 Main；后续 File/owner 安装失败终止启动，不进入事件循环或启动 worker；每个目录操作自身仍须失败原子。 |
+| 配置、容量、mapping/fd/I/O | stats 使用既有 StatsError，listener bind 使用 `RuntimeError::StatsListenerBind`；infra 原始失败保留 source；startup caller 终止该次安装并清理 | StatsMain::init 内部失败不安装 Main；后续 bind/File/owner 安装失败终止启动，不进入事件循环或启动 worker；每个目录操作自身仍须失败原子。 |
 | 外部畸形共享数据、版本不支持 | stats protocol/StatsClient；调用者断开或报告具体问题 | 在 span 验证前不解引用；稳定 epoch 下保留具体类别，不塌缩为无字段 Protocol。 |
 | 结构变化、重试预算耗尽 | StatsClient；继续尝试或返回既有 ClientRetryExhausted | 不把竞争中的暂时缺失报告成确定 MetricNotFound；使用有界预算，不忙循环十六次后假定生产者故障。 |
 | 内部重复所有权、错误线程、绑定失效 | 实际 owner 的程序不变量 | 预检入口约束；包路径不为程序 bug 构造控制面错误，更不能丢弃错误继续写。 |
-| peer 消失、退出清理 | socket/stats lifecycle owner | 文档限定可忽略的交付中断；其余 cleanup error 可观察且不替换 primary error。 |
+| peer 消失、退出清理 | runtime stats listener / stats lifecycle owner | 文档限定可忽略的交付中断（bind 时回收失效路径、退出 unlink 失败只告警）；其余 cleanup error 可观察且不替换 primary error。 |
 
 复用 `StatsError`，不新增通用 result alias/error 框架。`Error::source()` 必须
 实际返回 IO/allocation/protocol 原因。细分类别及替换 catch-all variants 属于 A7，
@@ -516,7 +523,7 @@ stride 和客户端解码。共享头没有表达该构建差异的字段，不�
 | 层 | 可以调用/持有 | 不可以调用/持有 | 验证边界 |
 | --- | --- | --- | --- |
 | hammer-infra | MemMain VM/backing/map inventory、MemHeap/heaps inventory、allocation facts | stats type/path、StatsMain、runtime barrier、collector 业务 | VM 登记/摘除、heap 登记/回滚、只读权限、耗尽测试。 |
-| hammer-stats | 通过 MemMain/MemHeap 持有 stats 存储生命周期；目录/布局、共享 payload、socket 交付 | 直接 mmap/munmap、旧 Segment/Talc、另一个 heap owner、DataPlaneMain、runtime 反向依赖 | stats 编译、VM/heap inventory 与真实布局/生命周期测试。 |
+| hammer-stats | 通过 MemMain/MemHeap 持有 stats 存储生命周期；目录/布局、共享 payload、backing fd 借用 | 直接 mmap/munmap、旧 Segment/Talc、另一个 heap owner、DataPlaneMain、runtime 反向依赖、socket/listener 代码 | stats 编译、VM/heap inventory 与真实布局/生命周期测试。 |
 | hammer-runtime | Main Thread 初始化、FileMain、Process、WorkerBarrier、runtime node 事实 | 替插件拥有指标状态；跨线程裸借用；通用共享 metrics store | runtime worker/collector/clear 行为测试。 |
 | service/plugin owner | 自己的 counter 语义、当前 worker 更新与 owner snapshot | 修改其他 worker 行；把私有协议状态传给 stats 保存 | 接入时做具体 owner 测试；本 ADR 不扩业务指标。 |
 | hammer-ipc::StatsClient | MemMain 只读 map/unmap、校验、重定位、返回拥有的数据 | memmap2 平行映射路径、客户端重建服务端 heap、共享消费 tail、写 stats、无界解引用 | 独立进程只读映射、客户端 VM inventory、并发结构变化测试。 |
@@ -564,7 +571,7 @@ Ring producer 不在上述实现批准范围内；启用时另立完整用途与
 | `ScalarBits`、`protocol::Gauge` / `GaugeValue` | 删除及清理转换 | MetricValue 的 scalar/gauge 直接是 u64，消除 bitcast 歧义。 |
 | `DirectoryDataPointer/StringVectorPointer` | 删除 wrapper/re-export/转换 | 协议内部直接使用已有 pointer arm；client 解码为 checked offset。 |
 | `CollectorRegistration`、`Collector` | 新增 | 分别为待注册输入与已安装的 collector；字段对应 VPP collector reg/collector。 |
-| `HeapUsage` | 新增于 infra mem | 拥有一次 usage 采样的数值，不保存 heap pointer 或借用。 |
+| `HeapUsage` | 移到 M4 | 拥有一次 usage 采样的数值，不保存 heap pointer 或借用；本次没有 owner 消费采样时先不新增空 API，随 M4 的 heap usage collector 一起加入。 |
 | `StatsClient` | 修改 | 直接持有 MemMain 的只读映射、长度和收到的 fd。 |
 | `SharedHeader/DirectoryEntry/DirectoryData/DirectoryType/Counter` | 保留 ABI 定义、改访问方法 | 不新增重复 header/entry 状态。 |
 | `Ring<T>/RingSchema/RingConfig/RingBufferHeader/RingMetadata` | 保留既有能力、按 D7 明确布局 | Config/Header 保留 packed；Metadata 复用 CacheLineAlignMark；统一实际 stride，删除 ring_layout 的可变 cache-line 参数；本次不扩 producer 或有效记录 reader。 |
@@ -584,8 +591,6 @@ pub struct StatsSegment {
     directory_vector_by_name: HashMap<NameBytes, DirectoryIndex>,
     dir_vector_first_free_elt: Option<u32>,
     update_interval: Duration,
-    socket: socket2::Socket,
-    socket_name: PathBuf,
     memory_size: usize,
     log2_page_sz: u8,
     node_counters_enabled: bool,
@@ -616,14 +621,30 @@ StatsSegment 是 backing、mapping、heap 和共享 allocations 的生命周期 
 | `stat_segment_lockp` | `StatsMain.segment: SpinLock<StatsSegment>` | 锁直接保护实际 segment 状态；不能在 StatsSegment 内再放一把 SpinLock<()>，也不再包 State。 |
 | `locking_thread_index` | 不新增字段 | VPP 用 runtime thread index 判断递归持锁；Rust 嵌套调用收到同一 guard 借出的 &mut StatsSegment，不再获取锁，因此不保存锁所属线程。更不能替换为 OS ThreadId。 |
 | `n_locks` | 不新增字段 | 同一外层 guard 覆盖完整操作，嵌套 owner 方法不重新锁；没有第二份手工递归计数。 |
-| `socket` | `socket2::Socket` | 实际 listener owner，属于 segment；不拆出 listener-index 管理结构。 |
-| `socket_name` | `PathBuf` | listener 路径与退出 unlink 的依据，移回 segment。 |
+| `vlib_stats_segment_lock/unlock` | 私有 `DirectoryWrite`（RAII，Drop 时发布 epoch） | in_progress/epoch 只有这一处写入入口；一次目录事务开闭一次，不是每个嵌套步骤各发布一次，见 6.3。 |
+| `socket` | 不进入 StatsSegment；listener File 归 runtime statseg 模块 | VPP 的 `vlib_stats_segment_t.socket` 只被 `stats_segment_socket_init` / `stats_socket_accept_ready` 使用；Hammer 的对应层是拥有 FileMain 的 runtime `config::stats`，segment 不再持有 socket 或 listener 索引。 |
+| `socket_name` | runtime `StatsConfig.socket_name` | bind、File 描述与退出 unlink 共用同一配置值；VPP 的 `unlink(sm->socket_name)` 对应 `exit_stats_main`。 |
 | `memory_size` | `usize` | 校验且按 backing 页大小对齐后的映射长度；不保存负的 ssize_t。 |
 | `log2_page_sz` | `u8` | 实际 backing 页大小指数；PageSize Config 在创建阶段解析，不把输入 enum 当实际页大小。 |
 | `node_counters_enabled` | `bool` | 发布的 node 采样开关，不只留在 StatsConfig。 |
-| `heap` | 私有 `NonNull<MemHeap>`，内部通过 `heap(&self) -> &MemHeap` 借用 | create_at 返回的控制块地址；此地址不是 heap 范围起点，不能按固定偏移重建。生命周期由 StatsSegment 负责。 |
+| `heap` | 私有 `NonNull<MemHeap>`，内部通过 `heap(&self) -> &MemHeap` 借用；activate 窗口与 `&mut self` 目录事务并存时先复制该 NonNull 再 `as_ref()` | create_at 返回的控制块地址；此地址不是 heap 范围起点，不能按固定偏移重建。生命周期由 StatsSegment 负责。也不能直接把 `&MemHeap` 存成字段（自引用）。 |
 | `shared_header` | 删除该 Rust 字段，保留 `mapping: NonNull<u8>` | 映射根是 MemMain::vm_map 的返回值；共享头在 offset 0，字段级访问从 mapping 派生，不缓存第二个地址。 |
 | `memfd` | `OwnedFd` | 共享 backing 的唯一 Rust fd owner；VM header 只记录该 fd。 |
+
+payload 一律从 stats heap 取用，对应 VPP 的 `vec_new_heap` /
+`clib_mem_heap_free (vec_get_heap (v), ...)`，并按 VPP 的规则决定是否需要
+`MemHeap::activate()` 窗口（即 `clib_mem_set_heap (sm->heap)` 后 restore）：
+
+| VPP 分配 | heap 决定方式 | Hammer |
+| --- | --- | --- |
+| 目录 vector、名字 vector 外层与字符串（`vec_new_heap` / `vec_new_generic (..., sm->heap)`，`vlib/stats/init.c:107`、`stats.c:311,353`） | vector 前缀自带 `_vec_heap`，`_vec_free` 从前缀取 heap（`vppinfra/vec.h:115,349`） | `allocate_vector(..., explicit_heap = true)` / `allocate_string`；无 activate 窗口，释放仍显式传 heap。 |
+| 计数行与它的外层（`vec_validate_aligned`，`vlib/stats/stats.c:420,498,501,510,513`） | default-heap vector，`_vec_free` 在“当前 heap”上释放 | `allocate_vector(..., explicit_heap = false)`，`validate` 整个替换窗口（分配与释放替换下来的行）都在 `activate()` 内，行先写进未发布的 replacement 外层，窗口里不做 std 分配。 |
+| ring payload（`clib_mem_alloc_aligned` / `clib_mem_free`，`stats.c:178,648`） | 隐式 heap，必须先把 segment heap 设为 active | `add_ring` 的分配与失败回滚、`release_payload` 的 ring 分支各开一个 `activate()` 窗口。 |
+
+`activate()` 窗口也是隐式分配的归属边界：窗口内任何经全局分配器的分配都落在
+stats heap，因此窗口里不能构造会在 Main Heap 下 drop 的 `String`/`Vec`——目录
+事务、名字查找表和错误值都留在窗口外。`MemHeap::allocate/deallocate` 仍由调用者
+携带 heap，`active_heap` 只决定窗口内隐式分配的归属。
 
 #### 指针与借用边界
 
@@ -687,7 +708,7 @@ hammer-runtime::sync；当前 runtime 又依赖 stats。这个已有归属/依�
 | `payloads: Vec<Vec<SegmentAllocation>>` | 删除；按照 entry family 的真实 allocation 根和协议前缀释放。 |
 | `names / first_free` | 分别归 directory_vector_by_name / dir_vector_first_free_elt。 |
 | `tearing_down` | 删除；候选回滚与进程生命周期明确，不再模拟可重启 teardown。 |
-| `StatsMain.socket_path` | 删除此字段，职责移入 StatsSegment.socket_name。 |
+| `StatsMain.socket_path` | 删除此字段，路径事实归 runtime `StatsConfig.socket_name`；stats crate 不再有 socket 字段。 |
 
 ### 6.3 持锁、发布与方法接收者
 
@@ -695,6 +716,13 @@ hammer-runtime::sync；当前 runtime 又依赖 stats。这个已有归属/依�
 嵌套 add/validate/remove 调用不调用 StatsMain::global，也不重复 lock。计数热路径
 不使用这些结构入口。一次目录事务的 in_progress/epoch 更新围绕完整提交阶段，
 不是每个嵌套小函数各发布一次。
+
+`in_progress`/`epoch` 的写入入口只有私有 `DirectoryWrite` 值：结构入口在已持有的
+`&mut StatsSegment` 上取它打开事务，它在 Drop 时增加 epoch 并 release 清除
+in_progress，对应 `vlib_stats_segment_lock/unlock`
+（`third_party/vpp/src/vlib/stats/stats.c:11,32`）。事务随该值的作用域开闭一次，
+不是每个嵌套步骤各发布一次，也不能忘记关闭；准备阶段产生的、尚未被目录引用的
+allocation 不属于该事务的提交阶段。
 
 锁内不做 socket I/O、未知 collector callback、不可预测分配或进入 WorkerBarrier。
 需要分配的操作先准备容量/storage，再在短锁区复核目录 epoch 和参与者并提交；
@@ -707,21 +735,20 @@ barrier 证明 worker 已停止，stats 锁不承担 worker acknowledgement。
 impl StatsMain {
     pub fn init(
         name: &str, size: usize, page_size: PageSize,
-        socket_name: &Path, update_interval: Duration,
+        update_interval: Duration,
         node_counters_enabled: bool,
-    ) -> StatsResult<OwnedFd>;
+    ) -> StatsResult<()>;
     pub fn global() -> StatsResult<&'static Self>;
-    pub fn accept(&self, listener_fd: RawFd) -> StatsResult<()>;
     pub fn collect(&self) -> StatsResult<()>;
-    pub fn unlink_socket_path(&self) -> StatsResult<()>;
 }
 
 impl StatsSegment {
     pub(crate) fn create(
         name: &str, size: usize, page_size: PageSize,
-        socket_name: &Path, update_interval: Duration,
+        update_interval: Duration,
         node_counters_enabled: bool,
     ) -> StatsResult<Self>;
+    pub fn segment_fd(&self) -> RawFd;
     fn heap(&self) -> &MemHeap;
     fn directory(&self) -> &[DirectoryEntry];
     fn directory_mut(&mut self) -> &mut [DirectoryEntry];
@@ -749,6 +776,11 @@ impl StatsSegment {
     pub fn update_interval(&self) -> Duration;
     pub fn node_counters_enabled(&self) -> bool;
 }
+
+/// VPP `STAT_COUNTER_*`: the fixed directory indexes the segment owns.
+pub const STAT_COUNTER_HEARTBEAT: u32;
+pub const STAT_COUNTER_LAST_STATS_CLEAR: u32;
+pub const STAT_COUNTER_BOOTTIME: u32;
 ```
 
 保留的公共操作必须有实际职责；不把 VPP 内部 C helper、Rust 私有解引用或协议
@@ -763,7 +795,7 @@ impl StatsSegment {
 | find / remove_entry / register_collector | find_entry_index / remove_entry / register_collector_fn；只在 StatsSegment 实现一次。 |
 | add_histogram / add_ring | 对应现有 histogram/ring 注册能力；本次不顺手补齐 VPP 的全部 ring reserve/commit/consume 方法。 |
 | update_interval / node_counters_enabled | 前者对应 get_segment_update_rate；后者是 runtime 跨 crate 选择 node 采样所需的只读入口。保留这两个实际调用点，不为其他 private 字段自动生成 getter/setter。 |
-| StatsMain::init/global、accept、collect、unlink_socket_path | 初始化/取得唯一 owner、fd 交付、执行已注册采样、退出清理。accept/unlink 是现有入口；collect 对应 collector.c 的周期工作，由 runtime Process 调用，不能持锁执行未知 callback。 |
+| StatsMain::init/global、collect | 初始化/取得唯一 owner、执行已注册采样。fd 交付与退出 unlink 归 runtime statseg 的 listener callback 与 exit hook；collect 对应 collector.c 的周期工作，由 runtime Process 调用，不能持锁执行未知 callback。 |
 
 依据为 `third_party/vpp/src/vlib/stats/stats.h:123` 起的领域操作，以及 init.c /
 collector.c 的生命周期函数。接口收缩发生在操作的归属与重复层，不将同一批
@@ -775,19 +807,28 @@ collector.c 的生命周期函数。接口收缩发生在操作的归属与重�
 内。实现前必须列出“准备、复核、提交”的真实调用点；不能把锁内扩容先做出来再
 留下 TODO。本文没有批准另一个准备状态类型或 closure transaction 框架。
 
-StatsMain::init 保留现有返回 listener OwnedFd 的契约；新增参数仅用于容量、
-页大小与采样配置。内部完成全部资源准备后设置已有 STATS_MAIN，没有公共
-StatsMain::create 或 StatsMain::publish，也不以 install/commit/finish 等名称
-另造同一阶段。StatsSegment::create 仍是 stats 内部的资源构造函数。
-Socket 由 segment 持有；返回给 FileMain 的 listener fd 在 init 内复制，并在
-设置 OnceLock 前处理复制失败。两个 fd 代表同一个 socket，各自只关闭一次；
-runtime 后续安装失败按 D6 终止启动。不能再引入 listener_index 字段/注册表。
-accept/sendmsg/unlink 先提取所需稳定 fd/path，释放结构锁再 I/O；fd 生命周期由
-process-lifetime owner 保证，不缓存跨生命周期的裸 fd。
+StatsMain::init 只创建 segment 自身资源（mapping、heap、共享头、固定槽位前
+状态）并设置已有 STATS_MAIN，没有公共 create/publish，也不以
+install/commit/finish 等名称另造同一阶段。StatsSegment::create 仍是 stats
+内部的资源构造函数。
+
+listener 的 bind、FileMain 注册、accept、fd 交付和退出 unlink 都在 runtime
+`config::stats`：对应 VPP 把 socket 原语放在 vppinfra、把
+`stats_segment_socket_init` / `stats_socket_accept_ready` /
+`stats_segment_socket_exit` 放在 vlib 的分层。Hammer 的 `hammer-stats` 位于
+runtime 之下且不能依赖 FileMain，因此这三个函数归 runtime statseg，而不是在
+stats crate 里复制一套 socket 层。listener 在 Linux 上是 `SOCK_SEQPACKET`
+（VPP `CLIB_SOCKET_F_SEQPACKET`；无 seqpacket 的平台上退化为 `SOCK_STREAM`），
+因此以 `OwnedFd` 直接注册 File，不经过只支持 stream 的 std listener 类型。
+`stats_segment_listener` File callback 只做
+accept→sendmsg(memfd)→close；`handoff_segment` 先取得 segment 的稳定
+`segment_fd()` 再释放结构锁做 I/O，fd 生命周期由 process-lifetime owner 保证，
+不缓存跨生命周期的裸 fd。不存在 listener_index 字段/注册表，也不存在 stats
+crate 内的 socket helper。
 
 | 原方法/函数 | 删除、修改或新增 |
 | --- | --- |
-| `StatsMain::init` | 保留初始化入口和 OwnedFd 返回值，补齐配置参数与函数内部失败清理；删除草案新增的公共 create/publish 接口。 |
+| `StatsMain::init` | 保留初始化入口，去掉 socket 参数与 OwnedFd 返回值；补齐配置参数与函数内部失败清理；删除草案新增的公共 create/publish 接口。 |
 | `StatsMain::{bind_index,store_timestamp,increment_timestamp,store_gauge,validate_counter,write_simple_counter,write_combined_counter,write_histogram,add_gauge,add_timestamp,add_simple_counter,add_combined_counter,add_name_vector,add_histogram,add_ring}` | 删除逐层转发；具体目录操作直接在 StatsSegment。 |
 | 草案 `StatsMain::segment` | 撤销；直接 StatsMain.segment.lock()，锁本身约束借用，不增加转发 getter。 |
 | `StatsSegment::{heap,directory,directory_mut}` | 新增私有借用方法，生命周期来自 self；替代各处直接解引用缓存指针，不提供整个共享头的可变引用。 |
@@ -796,7 +837,8 @@ process-lifetime owner 保证，不缓存跨生命周期的裸 fd。
 | 旧 `StatsSegment::{add_simple_counter,add_combined_counter,add_histogram}` 增量签名 | 删除；新同名方法只负责注册，不负责每包 increment。 |
 | `StatsSegment::register<K>` | 删除，连同 RecordKind/layout 泛化层。 |
 | `StatsSegment::remove` | 替换 remove_entry；维护 name/free-list、payload 和依赖 alias，不增加代际版本。 |
-| `StatsSegment::{send_to,teardown}` | 删除；发送归 Main 的 socket 操作，取消 Arc quiescence 假证明。 |
+| `StatsSegment::{send_to,teardown}` | 删除；fd 发送归 runtime `stats_segment_listener` File callback，取消 Arc quiescence 假证明。 |
+| 草案 `bind_listener` / `accept_connection` / `send_segment_fd` / `unlink_socket_path`（在 hammer-stats） | 删除；这些是 vppinfra 层职责，Hammer 对应实现只保留 runtime `config::stats` 的 `bind_listener` / `handoff_segment` / `send_segment_fd`，退出 unlink 直接内联在 `exit_stats_main`。 |
 | `Drop for StatsSegment` 的 let _ = teardown | 删除旧路径；未发布候选按 heap→VM→fd 回滚，错误由生命周期边界处理。 |
 | `StatsSegmentState::{allocate_vector,vector_len,vector_element}` | 在 StatsSegment 内重写真实协议操作，原 impl 整体删除。 |
 | `StatsSegmentState::{mapping_size,allocation_address,allocate_block,allocate_directory,publish,write_shared_header}` | 删除旧 SegmentAllocation/private Vec 整块复制路径；使用 MemHeap、真实共享目录和字段级发布。 |
@@ -821,8 +863,9 @@ pub struct NameVector { pub index: DirectoryIndex }
 
 这六种已有 descriptor 仅保留宏识别的指标类别与索引记录，不新增 impl。
 index 不是权限凭据，也不靠 descriptor 外壳证明槽位类型或存活；segment 的控制面
-操作在实际访问处检查 index/family。宏对固定 Sys 项使用一次 find 后直接构造记录，
-普通注册直接接收 add_* 的返回值，避免 new → register → bind → store 转发链。
+操作在实际访问处检查 index/family。宏先按 bootstrap 声明创建固定槽位并校验其
+固定索引，再对固定 Sys 项使用一次 find 构造记录；普通注册直接接收 add_* 的
+返回值，避免 new → register → bind → store 转发链。
 
 DirectoryIndex 仍是 VPP-style 目录 index，不是带代际版本的 pool handle。
 删除/重用时由控制 owner 结束旧 descriptor、alias、collector 的使用；外部 client
@@ -902,14 +945,14 @@ StatsMain::collect 从 pool 取得本轮 collector 声明值后释放结构锁�
 | --- | --- |
 | StatsConfig | 字段、默认值、校验与配置入口的具体定义见 6.6.1；沿用现有类型，不新增 StatsegConfig。 |
 | `STATS_SEGMENT_SIZE` | 删除固定使用点，改配置默认值。 |
-| Sys | 三个指标字段保留；固定 bootstrap 后 bind，不让 generic DuplicateName 吞冲突。 |
+| Sys | 三个指标字段保留，并作为固定槽位的唯一声明：字段的 `bootstrap = STAT_COUNTER_*` 给出 VPP 固定索引，宏生成创建与校验步骤；`install` 随后 find 绑定，不让 generic DuplicateName 吞冲突。 |
 | StatsRegistration.register | 保留既有 fn(&StatsMain) -> RuntimeResult<()>；由 owner 安装入口执行具体目录操作；不增加 bind 字段。 |
 | 宏 `expand_stats_descriptor` | 删除 descriptor::new 的未绑定聚合；注册直接使用已有静态 path。 |
-| 宏 register/bind/install | 删除宏生成的独立 register/bind 方法；既有 install 一次完成整组安装，直接调用 add_*；Sys 固定项通过 find 构造索引记录。成功后才设置指标 owner OnceLock，失败回滚本组；遵守 6.3 的准备/短锁提交约束。 |
+| 宏 register/bind/install | 删除宏生成的独立 register/bind 方法；既有 install 一次完成整组安装，直接调用 add_*；带 `bootstrap` 的聚合另生成 bootstrap 创建步骤，Sys 固定项随后通过 find 构造索引记录。成功后才设置指标 owner OnceLock，失败回滚本组；遵守 6.3 的准备/短锁提交约束。 |
 | `run_stats_registrations` | 保留现有无参数 RuntimeResult 入口及已有 image inventory；调用既有 registration.register，失败交 runtime 启动边界。 |
-| `init_stats_main` | StatsMain::init → FileMain 安装 → run_stats_registrations；删除 global 已存在就成功跳过的逻辑；任一步失败终止启动，不新增 bind_stats_registrations。 |
+| `init_stats_main` | StatsMain::init → Sys::bootstrap 建立固定槽位 → `bind_listener` + FileMain 安装 `stats_segment_listener` → run_stats_registrations；删除 global 已存在就成功跳过的逻辑；任一步失败终止启动，不新增 bind_stats_registrations。 |
 | collector Process | 周期从 StatsSegment 读取 interval/node flag，释放锁后采样，完成后更新 heartbeat；锁不跨 await。 |
-| `exit_stats_main` | 新增 main-loop-exit hook，unlink segment.socket_name；listener fd 按 Segment/FileMain 各自 fd 生命周期清理，无 listener_index 字段。 |
+| `exit_stats_main` | 新增 main-loop-exit hook，unlink StatsConfig.socket_name；失败只告警，退出清理不替换启动/运行错误，路径由下次启动的 bind 回收，无 listener_index 字段。 |
 | NodeRuntimeSlot/NodeMain | 后续增加真实 calls/vectors/clocks/suspends 累计事实与 clear baseline；不把这组计数存入 StatsSegment 私有副本。 |
 
 当前 Process future 不持有可恢复的 &mut DataPlaneMain，周期进入 WorkerBarrier 的
@@ -943,7 +986,7 @@ update_interval = "10s"
 
 | VPP 输入 | Hammer 输入 / 默认 | 写入或调用位置 |
 | --- | --- | --- |
-| socket-name | socket_name，非空路径，继续必填 | StatsSegment.socket_name；socket bind、listener 与退出 unlink 共用此值。 |
+| socket-name | socket_name，非空路径，继续必填 | runtime StatsConfig.socket_name；socket bind、listener File 描述与退出 unlink 共用此值。 |
 | size | size = "32 MiB" | 从 Byte 检查转换为 usize，按实际 backing 页大小检查向上对齐；传给 backing resize / MemMain::vm_map，结果写 memory_size；heap 范围扣除首系统页。 |
 | page-size | page_size = "default" | 复用 hammer_infra::mem::PageSize，传 MemMain::vm_create_backing / vm_map；实际 backing 页指数写 log2_page_sz，不直接写入配置枚举。 |
 | per-node-counters on/off | per_node_counters = false | 写 StatsSegment.node_counters_enabled；控制 node collector 的目录注册和周期采样，关闭时仍保留基础系统与 heap collector。 |
@@ -1047,17 +1090,6 @@ impl MemHeap {
     pub unsafe fn create_at(base: NonNull<u8>, size: usize, locked: bool, name: &str)
         -> Result<NonNull<Self>, MemError>;
     pub unsafe fn destroy(&self);
-    pub fn usage(&self) -> HeapUsage;
-}
-
-pub struct HeapUsage {
-    pub bytes_total: usize,
-    pub bytes_used: usize,
-    pub bytes_free: usize,
-    pub bytes_used_mmap: usize,
-    pub bytes_max: usize,
-    pub free_chunks: usize,
-    pub bytes_releasable: usize,
 }
 
 pub struct StatsClient {
@@ -1079,7 +1111,7 @@ impl StatsClient {
 | MemMain::vm_map 当前 Main Heap caller | 显式传 `read_only = false`；stats server 同样 false，StatsClient 为 true；不增加第二个 read-only mapping wrapper。 |
 | MemHeap | 不加 stats 字段；create_at/destroy 只扩大窄 API 边界，保持 unsafe 前置条件；destroy 仍仅允许未发布且无 live allocation 的回滚。 |
 | MemHeap::{activate,allocate,allocate_zeroed,reallocate,deallocate,is_heap_object,base,size,name} | 直接复用，不增加同义 StatsHeap 方法。 |
-| MemHeap::usage / HeapUsage | 新增一次完整采样操作与拥有的事实值；现有 size/free_space 不能给出七项同次采样，不向 stats 暴露 DlMallInfo 或 mspace。 |
+| MemHeap::usage / HeapUsage | 随 M4 新增一次完整采样操作与拥有的事实值；现有 size/free_space 不能给出七项同次采样，不向 stats 暴露 DlMallInfo 或 mspace。本次 collector 仍是 heartbeat-only，先不落地没有消费者的采样 API。 |
 | StatsClient.mapping | 删 Mmap，改为 MemMain 返回的实际映射根；StatsClient 存活即拥有映射，不加 open/closed 状态。 |
 | StatsClient.mapping_size / segment_fd | 新增长度与 fd owner；这里不保存 heap、shared header 副本、目录 pointer cache 或 per-metric pointer。 |
 | StatsClient::connect | 删除 MmapOptions::map 和成功 attach 后立即 drop(segment_fd)；调用 MemMain 的 read-only VM map。 |
@@ -1091,9 +1123,10 @@ VM 操作使用既有类型和一个表示保护属性的 bool，不添加 Vmap/
 owner wrapper。MemMain.vm_map 产生的 pointer 归 caller 持有，caller 必须在没有
 live borrow 时交回同一个 vm_unmap；不能用于解除其他来源的映射。
 
-HeapUsage 对应 V17；字段按事实命名，free_chunks 不加 bytes 前缀；它是拥有
-数值的采样结果，没有 heap pointer 或借用 lifetime。固定 mspace 可能使部分
-字段为零，由真实 mallinfo 返回决定，不由 stats 伪造。此新增类型列入 A1 审批。
+HeapUsage 对应 V17，随 M4 的 heap usage collector 一起新增；字段按事实命名，
+free_chunks 不加 bytes 前缀；它是拥有数值的采样结果，没有 heap pointer 或借用
+lifetime。固定 mspace 可能使部分字段为零，由真实 mallinfo 返回决定，不由 stats
+伪造。此新增类型列入 A1 审批。
 
 `vm_unmap` 的返回契约也必须补齐：可恢复 Err 意味原 mapping 仍可被 owner 管理，
 成功意味着 payload 和 VM inventory 已撤销。当前实现有 payload 已撤销后解除
@@ -1112,8 +1145,8 @@ error 框架。`protocol::Error` 改为公开 `ProtocolError`（更名并 re-exp
 | --- | --- | --- |
 | `Protocol` | 改 `Protocol { source: ProtocolError }`；From 保留 source，不丢弃 | stats codec；client 拒绝稳定 epoch 下的畸形输入。 |
 | `Allocation(SegmentAllocationError)` | 删除；新增 `HeapExhausted { requested: usize, alignment: usize, capacity: usize }` | stats 具体分配；控制 caller 回滚/降低容量需求。 |
-| `Io(io::Error)` | 删除万能 I/O variant；拆分 `SocketCreate/SocketConfigure/SocketBind/SocketListen/SocketAccept/DescriptorSend/SocketUnlink/BackingResize` 的操作类别，每项保留 source，涉及路径/长度时保存对应字段 | stats socket/初始化 owner；终止本次安装或本次交付。 |
-| VM/heap 初始化错误 | 新增 `BackingCreate { source: MemError }`、`SegmentMap { source: MemError }`、`HeapCreate { source: MemError }`、`SegmentUnmap { source: MemError }` | stats lifecycle；调用者能区分失败阶段，保留 infra 原因。 |
+| `Io(io::Error)` | 删除万能 I/O variant；StatsError 只保留 stats 自己拥有的失败：`BackingResize { size, source }` 与 `Memory { source }`。listener bind/accept/handoff 失败由 runtime owner 承担：`RuntimeError::StatsListenerBind { path, source }` 与既有 `FileAccept { source }`；peer 断开按 io kind 处理 | stats 初始化 owner 与 runtime statseg owner；终止启动或本次交付。 |
+| VM/heap 初始化错误 | 合并为 `Memory { source: MemError }`；`MemError` 已区分 backing/map/heap 阶段，调用者恢复动作相同（终止启动） | stats lifecycle；保留 infra 原因与 source 链。 |
 | `ClientMapping { source: io::Error }` | 改 source 为 MemError；撤销草案 ClientUnmap/ClientClosed | client connect caller 处理映射失败；Drop 释放错误直接进入已有内存生命周期诊断。 |
 | `DuplicateName` | 改 `DuplicateName { name: String }` | registry；注册 caller 解决两个 owner 的命名冲突。 |
 | `MetricTypeMismatch { expected: &'static str, actual: &'static str }` | 字段改为 DirectoryType，显示文本最后生成 | stats；bind caller 拒绝错误 family。 |
@@ -1122,6 +1155,8 @@ error 框架。`protocol::Error` 改为公开 `ProtocolError`（更名并 re-exp
 | `PublicationFailed` | 删除 catch-all；可恢复输入问题交具体 ProtocolError/容量错误，owner 内不可能状态在原地断言 | 原 owner；不能把损坏的 storage 作为可恢复状态继续运行。 |
 | client 缺失/类型/重试错误 | 现有 MetricNotFound/ClientRetryExhausted 等保留；只有稳定 epoch 才返回确定错误 | client caller 重试或修正查询。 |
 | scalar/vector/ring layout 容量错误 | CapacityTooSmall/InvalidLayout/CollectionCapacity/InvalidShape/InvalidRingSchema 保留并检查是否能携带所需事实 | stats；初始化/扩容 caller 处理，不在每包增量产生。 |
+| `InvalidSocketPath` | 删除；非空 socket_name 由配置 owner 校验并返回配置错误，stats 不保留重复的路径校验 variant | stats 配置入口；缺失/空路径在启动配置阶段拒绝。 |
+| `InvalidLayout` / `CollectionCapacity` | 删除；旧 layout/collection 容量路径已不存在，实际边界只剩 `CapacityTooSmall` 与 `HeapExhausted` | stats；不在每包增量产生。 |
 
 ProtocolError 新增 symlink 目标越界/循环的具体类别，保留原始 index/深度事实；
 `WireValueOverflow` 改为 `EncodedValueOverflow`，没有兼容 alias。两种 Error 都
@@ -1134,7 +1169,7 @@ error，并通过启动生命周期诊断呈现 cleanup error，释放无法完�
 `StatsSegment.state`、`Arc<SpinLock<...>>`、Clone、StatsSegment 内的
 Segment/SegmentAllocation、`RecordKind`、全部 layout 中间类型、私有目录 Vec、
 payload owner 列表，以及第 6.3/6.4 节列出的旧转发方法和协议 wrapper。
-宏、stats socket callback、runtime init/collector、IPC client 不能残留旧参数类型。
+宏、runtime stats listener callback、runtime init/collector、IPC client 不能残留旧参数类型。
 旧 `[stats]` 注册、socket_path 配置字段及其反序列化函数、旧启动配置示例也必须
 一起删除；有效配置示例只使用 `[statseg]`。历史源码差异说明和拒绝旧输入的测试
 可以引用旧拼写，但不能保留可运行的旧入口或兼容分支。
