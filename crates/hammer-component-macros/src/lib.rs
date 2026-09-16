@@ -3339,6 +3339,120 @@ pub fn main_loop_exit_function(args: TokenStream, input: TokenStream) -> TokenSt
         .into()
 }
 
+/// Registers a function as one stats registration of its link image.
+///
+/// The function declares one metric owner's startup work: it creates the
+/// directory entries that owner owns and registers any collector the mechanism
+/// calls each round. The generated static item is listed by the owning crate's
+/// `__declare_registration_image!(stats_registrations = [...])` or by a plugin's
+/// `#[plugin(stats_registrations = [...])]`; the image list is the only carrier,
+/// so the macro adds no ordering qualifier and no bootstrap.
+///
+/// Example:
+/// ```ignore
+/// #[stats_registration]
+/// fn register_main_heap(stats_main: &StatsMain) -> RuntimeResult<()> { ... }
+/// ```
+#[proc_macro_attribute]
+pub fn stats_registration(args: TokenStream, input: TokenStream) -> TokenStream {
+    if !args.is_empty() {
+        return Error::new(Span::call_site(), "stats_registration takes no arguments")
+            .to_compile_error()
+            .into();
+    }
+    let fn_item = parse_macro_input!(input as syn::ItemFn);
+    expand_stats_registration(fn_item)
+        .unwrap_or_else(Error::into_compile_error)
+        .into()
+}
+
+fn expand_stats_registration(function: ItemFn) -> Result<TokenStream2> {
+    let signature = &function.sig;
+    if signature.constness.is_some()
+        || signature.asyncness.is_some()
+        || signature.unsafety.is_some()
+        || signature.abi.is_some()
+        || signature.variadic.is_some()
+        || !signature.generics.params.is_empty()
+        || signature.generics.where_clause.is_some()
+    {
+        return Err(Error::new(
+            signature.span(),
+            "stats registrations must be safe, synchronous, non-generic Rust functions",
+        ));
+    }
+    let mut stats_main_count = 0usize;
+    for argument in &signature.inputs {
+        let FnArg::Typed(argument) = argument else {
+            return Err(Error::new(
+                argument.span(),
+                "stats registrations cannot have a receiver",
+            ));
+        };
+        if is_stats_main_reference(&argument.ty) {
+            stats_main_count += 1;
+            continue;
+        }
+        return Err(Error::new(
+            argument.ty.span(),
+            "the stats registration parameter must be `&StatsMain`",
+        ));
+    }
+    if stats_main_count != 1 {
+        return Err(Error::new(
+            signature.inputs.span(),
+            "stats registrations take exactly one `&StatsMain` argument",
+        ));
+    }
+    let ReturnType::Type(_, result) = &signature.output else {
+        return Err(Error::new(
+            signature.output.span(),
+            "stats registrations must return RuntimeResult<()>",
+        ));
+    };
+    if !matches!(
+        wrapped_type(result, "RuntimeResult"),
+        Some(Type::Tuple(tuple)) if tuple.elems.is_empty()
+    ) {
+        return Err(Error::new(
+            result.span(),
+            "stats registrations must return RuntimeResult<()>",
+        ));
+    }
+    let function_name = &signature.ident;
+    let static_ident = format_ident!(
+        "__STATS_REGISTRATION_{}",
+        function_name.to_string().to_ascii_uppercase()
+    );
+    let conditional_attributes: Vec<_> = function
+        .attrs
+        .iter()
+        .filter(|attribute| {
+            attribute.path().is_ident("cfg") || attribute.path().is_ident("cfg_attr")
+        })
+        .cloned()
+        .collect();
+    Ok(quote! {
+        #function
+
+        #(#conditional_attributes)*
+        #[doc(hidden)]
+        #[allow(non_upper_case_globals)]
+        pub static #static_ident: ::hammer_runtime::registration::StatsRegistration =
+            ::hammer_runtime::registration::StatsRegistration {
+                name: stringify!(#function_name),
+                register: #function_name,
+            };
+    })
+}
+
+fn is_stats_main_reference(ty: &Type) -> bool {
+    let Type::Reference(reference) = ty else {
+        return false;
+    };
+    reference.mutability.is_none() && type_path_ends_with(&reference.elem, "StatsMain")
+}
+
 fn expand_main_loop_function(function: ItemFn) -> Result<TokenStream2> {
     let name = LitStr::new(&function.sig.ident.to_string(), function.sig.ident.span());
     expand_registered_function(

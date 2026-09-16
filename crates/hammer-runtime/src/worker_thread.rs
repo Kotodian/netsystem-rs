@@ -1,3 +1,4 @@
+use std::sync::atomic::AtomicU64;
 use std::sync::{Arc, OnceLock};
 use std::thread::JoinHandle;
 use std::time::Duration;
@@ -28,6 +29,10 @@ pub struct WorkerThread {
     entry: fn(u32) -> RuntimeResult<()>,
     no_data_structure_clone: bool,
     join_handle: OnceLock<JoinHandle<RuntimeResult<()>>>,
+    cacheline2: CacheLineAlignMark,
+    main_loop_count: AtomicU64,
+    cacheline3: CacheLineAlignMark,
+    loops_per_second: AtomicU64,
 }
 
 const _: () = {
@@ -39,6 +44,8 @@ const _: () = {
         core::mem::offset_of!(WorkerThread, thread_index)
             == core::mem::offset_of!(WorkerThread, cacheline1)
     );
+    assert!(core::mem::offset_of!(WorkerThread, main_loop_count) % CACHE_LINE == 0);
+    assert!(core::mem::offset_of!(WorkerThread, loops_per_second) % CACHE_LINE == 0);
 };
 
 impl WorkerThread {
@@ -77,12 +84,35 @@ impl WorkerThread {
             entry: entry.unwrap_or(data_worker_entry),
             no_data_structure_clone,
             join_handle: OnceLock::new(),
+            cacheline2: CacheLineAlignMark,
+            main_loop_count: AtomicU64::new(0),
+            cacheline3: CacheLineAlignMark,
+            loops_per_second: AtomicU64::new(0),
         }
     }
 
     #[inline]
     pub fn thread_index(&self) -> u32 {
         self.thread_index
+    }
+
+    /// The main-loop count this thread publishes.
+    ///
+    /// Only the owning thread writes it and only the round collector reads it,
+    /// so the load the collector performs needs no synchronization beyond the
+    /// relaxed ordering statistics use.
+    #[inline]
+    pub(crate) fn main_loop_count(&self) -> &AtomicU64 {
+        &self.main_loop_count
+    }
+
+    /// The latest loops-per-second value this thread published.
+    ///
+    /// The window itself stays in the owning `DataPlaneMain`; this record only
+    /// carries the value the collector copies into `/sys/loops_per_worker`.
+    #[inline]
+    pub(crate) fn loops_per_second(&self) -> &AtomicU64 {
+        &self.loops_per_second
     }
 
     #[inline]

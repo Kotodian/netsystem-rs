@@ -381,7 +381,11 @@ impl DirectoryData {
 }
 
 #[repr(C)]
-#[derive(Clone, Copy)]
+// Not `Copy`: a directory entry is shared state, and copying one silently
+// detached writers from the published slot. Callers borrow the entry, or copy
+// the small facts they need (`directory_type()`, `name_bytes()`,
+// `data_pointer()`, `scalar_value()`) before taking a mutable borrow.
+#[derive(Clone)]
 pub struct DirectoryEntry {
     directory_type: TypeCode,
     data: DirectoryData,

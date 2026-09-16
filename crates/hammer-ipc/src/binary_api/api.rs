@@ -257,6 +257,30 @@ impl ApiMain {
         unsafe { *self.primary_rp.get() = Some(region) };
     }
 
+    /// Borrows the mapped root region, `/global_vm`.
+    ///
+    /// The caller must have checked [`ApiMain::is_mapped`]: the root region is
+    /// in the mapped-region list only while the segment is attached.
+    pub(crate) fn root_region(&self) -> &SvmRegion {
+        // SAFETY: the list is written only by the mapping lifecycle on this
+        // thread, and the caller holds the segment mapped.
+        let regions = unsafe { &*self.mapped_shmem_regions.get() };
+        regions
+            .first()
+            .expect("API root region is mapped before it is borrowed")
+    }
+
+    /// Borrows the mapped primary region, the configured API region.
+    ///
+    /// Same precondition as [`ApiMain::root_region`].
+    pub(crate) fn primary_region(&self) -> &SvmRegion {
+        let region =
+            unsafe { *self.primary_rp.get() }.expect("API region is mapped before it is borrowed");
+        // SAFETY: the pointer names a region in `mapped_shmem_regions`, which
+        // the attached segment owns and the mapping lifecycle keeps alive.
+        unsafe { region.as_ref() }
+    }
+
     pub fn get_msg_ids(&self, name: &str, count: u16) -> Result<u16, Error> {
         hammer_runtime::thread_main::ensure_main_thread()
             .expect("API message ranges are accessed by runtime main thread");

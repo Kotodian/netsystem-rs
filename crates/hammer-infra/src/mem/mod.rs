@@ -586,6 +586,31 @@ impl MemThreadMain {
     }
 }
 
+/// One `mspace_mallinfo` reading of a heap.
+///
+/// The seven fields come from a single call. The value owns its numbers: it
+/// does not borrow the heap, the mspace or the allocator's internal
+/// representation. `free_chunk_count` is a count of chunks and
+/// `releasable_bytes` is a byte size, named after what the field holds rather
+/// than after the mismatched fields VPP copies them from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct HeapUsage {
+    /// Bytes the heap currently owns from the system (`arena`).
+    pub total_bytes: u64,
+    /// Allocated bytes (`uordblks`).
+    pub used_bytes: u64,
+    /// Free bytes inside the heap (`fordblks`).
+    pub free_bytes: u64,
+    /// Bytes held in mmap regions (`hblkhd`).
+    pub used_mmap_bytes: u64,
+    /// Largest allocated-bytes value ever seen (`usmblks`).
+    pub max_allocated_bytes: u64,
+    /// Number of free chunks (`ordblks`).
+    pub free_chunk_count: u64,
+    /// Bytes that could be released to the system (`keepcost`).
+    pub releasable_bytes: u64,
+}
+
 #[repr(C)]
 pub struct MemHeap {
     base: *mut c_void,
@@ -859,8 +884,22 @@ impl MemHeap {
         self.size
     }
 
-    pub(crate) fn free_space(&self) -> usize {
-        unsafe { mspace_mallinfo(self.mspace).fordblks }
+    /// Samples this heap once.
+    ///
+    /// Only mspace metadata is read: no allocation and no mspace lock, so the
+    /// call may run concurrently with allocations. The result is one set of
+    /// fields from the same reading, not a cross-field atomic snapshot.
+    pub fn usage(&self) -> HeapUsage {
+        let info = unsafe { mspace_mallinfo(self.mspace) };
+        HeapUsage {
+            total_bytes: info.arena as u64,
+            used_bytes: info.uordblks as u64,
+            free_bytes: info.fordblks as u64,
+            used_mmap_bytes: info.hblkhd as u64,
+            max_allocated_bytes: info.usmblks as u64,
+            free_chunk_count: info.ordblks as u64,
+            releasable_bytes: info.keepcost as u64,
+        }
     }
 
     pub fn name(&self) -> &str {

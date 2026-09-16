@@ -1,6 +1,7 @@
 use rand::{SeedableRng, rngs::SmallRng};
 use std::cell::Cell;
 use std::fmt;
+use std::time::Instant;
 
 use crate::error::{RuntimeError, RuntimeResult};
 use crate::file::{FILE_MAIN, FileMode};
@@ -40,7 +41,18 @@ pub struct DataPlaneMain {
     trace: DataPlaneTrace,
     simd_bytes: usize,
     file_main: FileMode,
-    main_loop_count: u32,
+    /// Main loops completed in the current reporting interval
+    /// (`loops_this_reporting_interval` in VPP's `vlib_main_t`).
+    loops_this_reporting_interval: u64,
+    /// Start of the current reporting interval; `None` until one window is
+    /// complete, which VPP expresses with a zero sentinel.
+    loop_interval_start: Option<Instant>,
+    /// End of the current reporting interval (`loop_interval_end`).
+    loop_interval_end: Instant,
+    /// Damped loops per second of the latest window (`loops_per_second`).
+    loops_per_second: f64,
+    /// `exp(-1.0 / 20.0)`, computed once like VPP's `damping_constant`.
+    damping_constant: f64,
     main_loop_exit_now: bool,
     main_loop_exit_status: i32,
     pub(crate) worker_init_functions_called: Bitmap,
@@ -70,7 +82,7 @@ impl fmt::Debug for DataPlaneMain {
             .field("active_numa_node", &self.active_numa_node)
             .field("trace", &self.trace)
             .field("simd_bytes", &self.simd_bytes)
-            .field("main_loop_count", &self.main_loop_count)
+            .field("loops_per_second", &self.loops_per_second)
             .field("main_loop_exit_now", &self.main_loop_exit_now)
             .field("main_loop_exit_status", &self.main_loop_exit_status)
             .finish()

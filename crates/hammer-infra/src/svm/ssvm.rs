@@ -229,10 +229,14 @@ impl SsvmPrivate {
         segment.initialize_header(if map_only { 0 } else { base as u64 });
         if !map_only {
             segment.initialize_heap(rnd_size)?;
-            rnd_size = segment
+            let usage = segment
                 .heap()
                 .expect("private SSVM heap is initialized")
-                .free_space();
+                .usage();
+            // `free_bytes` is bounded by the heap size, which already fits the
+            // mapping size, so this conversion is a local invariant.
+            rnd_size =
+                usize::try_from(usage.free_bytes).expect("heap free bytes fit the mapping size");
             segment.ssvm_size = rnd_size;
             unsafe { (*shared_header_at(segment.base)).ssvm_size = rnd_size as u64 };
         }

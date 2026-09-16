@@ -147,10 +147,22 @@ impl StatsSegment {
         }
     }
 
-    pub(crate) fn advance_heartbeat(&mut self) -> StatsResult<()> {
+    /// Advances the fixed heartbeat slot by one round, the last step of
+    /// `do_stat_segment_updates`.
+    ///
+    /// `Sys::bootstrap` creates the slot before the first round runs, so a
+    /// missing or mistyped slot is this module's bug and asserts.
+    pub(crate) fn advance_heartbeat(&mut self) {
         let index = DirectoryIndex::new(STAT_COUNTER_HEARTBEAT);
-        let value = self.entry(index)?.scalar_value()?;
-        self.set_timestamp(index, value.wrapping_add(1))
+        let value = {
+            let entry = self
+                .entry(index)
+                .expect("the heartbeat slot is created before the first round");
+            entry
+                .scalar_value()
+                .expect("the heartbeat slot is a scalar timestamp")
+        };
+        self.set_timestamp(index, value.wrapping_add(1));
     }
 
     /// Returns the shared backing descriptor owned for the segment lifetime.
@@ -191,16 +203,85 @@ impl StatsSegment {
         Ok(Timestamp { index })
     }
 
-    pub fn set_gauge(&mut self, index: DirectoryIndex, value: u64) -> StatsResult<()> {
-        self.entry_of_type(index, DirectoryType::Gauge)?
+    /// Writes one gauge value into its shared directory slot.
+    ///
+    /// The caller owns a declared slot, so a wrong index or type is this
+    /// module's bug: the write asserts instead of returning a `Result`, like
+    /// `vlib_stats_set_gauge`.
+    pub fn set_gauge(&mut self, index: DirectoryIndex, value: u64) {
+        self.entry_mut_of_type(index, DirectoryType::Gauge)
+            .expect("set_gauge writes a declared gauge slot")
             .set_scalar_value(value);
-        Ok(())
     }
 
-    pub fn set_timestamp(&mut self, index: DirectoryIndex, value: u64) -> StatsResult<()> {
-        self.entry_of_type(index, DirectoryType::ScalarIndex)?
+    /// Writes one scalar timestamp into its shared directory slot, like
+    /// `vlib_stats_set_timestamp`.
+    pub fn set_timestamp(&mut self, index: DirectoryIndex, value: u64) {
+        self.entry_mut_of_type(index, DirectoryType::ScalarIndex)
+            .expect("set_timestamp writes a declared scalar slot")
             .set_scalar_value(value);
-        Ok(())
+    }
+
+    /// Writes one cell of a simple counter vector, like the cell writes
+    /// `vlib_stats_set_simple_counter` performs through the published vector.
+    ///
+    /// The shape must already be published by `validate`: this operation never
+    /// expands rows or columns and never allocates. Writing outside the
+    /// published shape is a bug in the owning collector, so it asserts with the
+    /// index, row and column instead of returning a recoverable `Result`.
+    pub fn set_simple_counter(&mut self, index: DirectoryIndex, row: u32, column: u32, value: u64) {
+        // Every violation below is a bug in the collector that owns the entry:
+        // the published shape is decided by its own `validate` call.
+        let outer = match self.entry_of_type(index, DirectoryType::CounterVectorSimple) {
+            Ok(entry) => match entry.data_pointer() {
+                Ok(pointer) => pointer.cast::<*mut u8>(),
+                Err(error) => panic!(
+                    "set_simple_counter: directory index {} row {row} column {column} is not a data vector: {error}",
+                    index.raw()
+                ),
+            },
+            Err(error) => panic!(
+                "set_simple_counter: directory index {} row {row} column {column} is not a simple counter vector: {error}",
+                index.raw()
+            ),
+        };
+        if outer.is_null() {
+            panic!(
+                "set_simple_counter: directory index {} has no published rows (row {row} column {column})",
+                index.raw()
+            );
+        }
+        // SAFETY: a published counter entry owns its outer vector.
+        let outer_length = unsafe { vector_length(outer.cast::<u8>()) as usize };
+        if row as usize >= outer_length {
+            panic!(
+                "set_simple_counter: directory index {} row {row} is outside the {outer_length} published rows",
+                index.raw()
+            );
+        }
+        // SAFETY: `row` is inside the outer vector.
+        let row_pointer = unsafe { ptr::read(outer.add(row as usize)) };
+        if row_pointer.is_null() {
+            panic!(
+                "set_simple_counter: directory index {} row {row} is not published",
+                index.raw()
+            );
+        }
+        // SAFETY: the published outer vector owns this row.
+        let row_length = unsafe { vector_length(row_pointer) as usize };
+        if column as usize >= row_length {
+            panic!(
+                "set_simple_counter: directory index {} row {row} column {column} is outside the {row_length} published columns",
+                index.raw()
+            );
+        }
+        // SAFETY: `column` is inside the row vector of `u64` cells. The relaxed
+        // store is the whole update; readers are not promised a cross-column
+        // snapshot.
+        unsafe {
+            AtomicU64::from_ptr(row_pointer.cast::<u64>().add(column as usize))
+                .store(value, Ordering::Relaxed);
+        }
     }
 
     pub fn add_simple_counter(&mut self, name: &str) -> StatsResult<SimpleCounter> {
@@ -285,24 +366,25 @@ impl StatsSegment {
         let (header, total) = ring_layout(config, self.memory_size)?;
         let layout = Layout::from_size_align(total, CACHE_LINE).expect("ring layout is valid");
         let heap = self.heap;
-        // SAFETY: the segment owns this heap for the mapping lifetime and the
-        // guard only restores the thread's previously active heap.
+        // SAFETY: the segment owns this heap for the mapping lifetime.
         let segment_heap = unsafe { heap.as_ref() };
-        // The ring payload is a raw shared-heap allocation, which VPP makes with
-        // the segment heap active (`clib_mem_set_heap (sm->heap)` around
-        // `clib_mem_alloc_aligned` in the ring buffer creation).
+        // The ring payload is a shared-heap allocation, which VPP makes with the
+        // segment heap active (`clib_mem_set_heap (sm->heap)` around
+        // `clib_mem_alloc_aligned` in the ring buffer creation). A fixed-capacity
+        // heap that cannot serve it ends the process through the ordinary
+        // allocator's failure path instead of returning a control-plane error.
         let active_heap = segment_heap.activate();
-        let Some(allocation) = segment_heap.allocate(layout) else {
-            return Err(StatsError::HeapExhausted {
-                requested: total,
-                alignment: CACHE_LINE,
-                capacity: segment_heap.size(),
-            });
+        // SAFETY: the ring layout has a non-zero size.
+        let allocation = unsafe { std::alloc::alloc_zeroed(layout) };
+        let Some(allocation) = NonNull::new(allocation) else {
+            // The segment is published and its capacity cannot grow: exhaustion
+            // ends the process through the allocator's failure path.
+            std::alloc::handle_alloc_error(layout)
         };
+        drop(active_heap);
         // SAFETY: the allocation belongs to this segment and `total` bytes stay
         // writable for its lifetime.
         unsafe {
-            ptr::write_bytes(allocation.as_ptr(), 0, total);
             ptr::write(allocation.as_ptr().cast::<RingBufferHeader>(), header);
             if !schema.is_empty() {
                 let metadata_offset = usize::try_from(header.metadata_offset())
@@ -329,7 +411,6 @@ impl StatsSegment {
                 }
             }
         }
-        drop(active_heap);
         match self.create_entry(
             descriptor.name(),
             DirectoryType::RingBuffer,
@@ -337,10 +418,8 @@ impl StatsSegment {
         ) {
             Ok(index) => Ok(index),
             Err(error) => {
-                let active_heap = segment_heap.activate();
                 // SAFETY: the allocation was made with this layout.
                 unsafe { segment_heap.deallocate(allocation, layout) };
-                drop(active_heap);
                 Err(error)
             }
         }
@@ -370,8 +449,10 @@ impl StatsSegment {
     }
 
     pub fn rename_symlink(&mut self, index: DirectoryIndex, name: &str) -> StatsResult<()> {
-        let entry = self.entry_of_type(index, DirectoryType::Symlink)?;
-        let previous_name = entry.name_bytes()?;
+        let previous_name = {
+            let entry = self.entry_of_type(index, DirectoryType::Symlink)?;
+            entry.name_bytes()?
+        };
         let name_bytes = NameBytes::try_from(name)?;
         if self.directory_vector_by_name.contains_key(&name_bytes) {
             return Err(StatsError::DuplicateName {
@@ -394,8 +475,10 @@ impl StatsSegment {
         element: u32,
         value: &str,
     ) -> StatsResult<()> {
-        let entry = self.entry_of_type(index, DirectoryType::NameVector)?;
-        let outer = entry.string_vector_pointer()?;
+        let outer = {
+            let entry = self.entry_of_type(index, DirectoryType::NameVector)?;
+            entry.string_vector_pointer()?
+        };
         // SAFETY: a published name vector owns its outer vector.
         let outer_length = if outer.is_null() {
             0
@@ -484,14 +567,18 @@ impl StatsSegment {
     /// `vlib_stats_validate`: a counter row and its outer vector are
     /// default-heap vectors, so VPP releases them through the active heap.
     pub fn validate(&mut self, index: DirectoryIndex, row: u32, column: u32) -> StatsResult<()> {
-        let entry = self.entry(index)?;
-        let kind = entry.directory_type()?;
-        let element_size = match kind {
-            DirectoryType::CounterVectorSimple | DirectoryType::HistogramLog2 => size_of::<u64>(),
-            DirectoryType::CounterVectorCombined => size_of::<Counter>(),
-            _ => return Err(StatsError::InvalidShape),
+        let (element_size, published) = {
+            let entry = self.entry(index)?;
+            let kind = entry.directory_type()?;
+            let element_size = match kind {
+                DirectoryType::CounterVectorSimple | DirectoryType::HistogramLog2 => {
+                    size_of::<u64>()
+                }
+                DirectoryType::CounterVectorCombined => size_of::<Counter>(),
+                _ => return Err(StatsError::InvalidShape),
+            };
+            (element_size, entry.data_pointer()?.cast::<*mut u8>())
         };
-        let published = entry.data_pointer()?.cast::<*mut u8>();
         // SAFETY: a published counter entry owns its outer vector.
         let published_length = if published.is_null() {
             0
@@ -523,10 +610,8 @@ impl StatsSegment {
         }
 
         let heap = self.heap;
-        // SAFETY: the segment owns this heap for the mapping lifetime and the
-        // guard only restores the thread's previously active heap.
+        // SAFETY: the segment owns this heap for the mapping lifetime.
         let segment_heap = unsafe { heap.as_ref() };
-        let active_heap = segment_heap.activate();
 
         // A replacement outer vector keeps every fresh row unreachable from the
         // published entry until the complete shape is addressable.
@@ -636,7 +721,6 @@ impl StatsSegment {
                 )
             };
         }
-        drop(active_heap);
         Ok(())
     }
 
@@ -645,12 +729,22 @@ impl StatsSegment {
     /// Releasing an entry that is already free is a no-op: the slot is on the
     /// free list and no payload is reachable from it.
     pub fn remove_entry(&mut self, index: DirectoryIndex) -> StatsResult<()> {
-        let entry = self.entry(index)?;
-        let kind = entry.directory_type()?;
-        if kind == DirectoryType::Empty {
-            return Ok(());
-        }
-        let name = entry.name_bytes()?;
+        let (kind, name, payload) = {
+            let entry = self.entry(index)?;
+            let kind = entry.directory_type()?;
+            if kind == DirectoryType::Empty {
+                return Ok(());
+            }
+            let payload = match kind {
+                DirectoryType::NameVector => entry.string_vector_pointer()?.cast::<c_void>(),
+                DirectoryType::CounterVectorSimple
+                | DirectoryType::HistogramLog2
+                | DirectoryType::CounterVectorCombined
+                | DirectoryType::RingBuffer => entry.data_pointer()?,
+                _ => ptr::null_mut(),
+            };
+            (kind, entry.name_bytes()?, payload)
+        };
         let next_free = self
             .dir_vector_first_free_elt
             .map_or(STAT_SEGMENT_INDEX_INVALID, DirectoryIndex::raw);
@@ -665,21 +759,19 @@ impl StatsSegment {
         drop(transaction);
         self.directory_vector_by_name.remove(&name);
         self.dir_vector_first_free_elt = Some(index);
-        self.release_payload(kind, entry)
+        self.release_payload(kind, payload)
     }
 
     /// Releases one entry payload with the segment heap active, the window VPP
     /// opens with `clib_mem_set_heap (sm->heap)` around the `vec_free` loops in
     /// `vlib_stats_remove_entry` and around the ring buffer free.
-    fn release_payload(&self, kind: DirectoryType, entry: DirectoryEntry) -> StatsResult<()> {
+    fn release_payload(&self, kind: DirectoryType, payload: *mut c_void) -> StatsResult<()> {
         let heap = self.heap;
-        // SAFETY: the segment owns this heap for the mapping lifetime and the
-        // guard only restores the thread's previously active heap.
+        // SAFETY: the segment owns this heap for the mapping lifetime.
         let segment_heap = unsafe { heap.as_ref() };
-        let active_heap = segment_heap.activate();
         match kind {
             DirectoryType::NameVector => {
-                let outer = entry.string_vector_pointer()?;
+                let outer = payload.cast::<*mut u8>();
                 if outer.is_null() {
                     return Ok(());
                 }
@@ -710,7 +802,7 @@ impl StatsSegment {
                 } else {
                     size_of::<u64>()
                 };
-                let outer = entry.data_pointer()?.cast::<*mut u8>();
+                let outer = payload.cast::<*mut u8>();
                 if outer.is_null() {
                     return Ok(());
                 }
@@ -736,7 +828,7 @@ impl StatsSegment {
                 };
             }
             DirectoryType::RingBuffer => {
-                let ring = entry.data_pointer()?.cast::<u8>();
+                let ring = payload.cast::<u8>();
                 if ring.is_null() {
                     return Ok(());
                 }
@@ -755,7 +847,6 @@ impl StatsSegment {
             | DirectoryType::Empty
             | DirectoryType::Symlink => {}
         }
-        drop(active_heap);
         Ok(())
     }
 
@@ -840,11 +931,10 @@ impl StatsSegment {
         Ok(())
     }
 
-    fn entry(&self, index: DirectoryIndex) -> StatsResult<DirectoryEntry> {
+    fn entry(&self, index: DirectoryIndex) -> StatsResult<&DirectoryEntry> {
         let directory = self.directory();
         directory
             .get(index.raw() as usize)
-            .copied()
             .ok_or(StatsError::DirectoryIndexOutOfBounds {
                 index: index.raw(),
                 length: directory.len(),
@@ -855,7 +945,7 @@ impl StatsSegment {
         &self,
         index: DirectoryIndex,
         expected: DirectoryType,
-    ) -> StatsResult<DirectoryEntry> {
+    ) -> StatsResult<&DirectoryEntry> {
         let entry = self.entry(index)?;
         let actual = entry.directory_type()?;
         if actual == expected {
@@ -865,7 +955,38 @@ impl StatsSegment {
         }
     }
 
-    fn heap(&self) -> &MemHeap {
+    fn entry_mut(&mut self, index: DirectoryIndex) -> StatsResult<&mut DirectoryEntry> {
+        let length = self.directory().len();
+        self.directory_mut().get_mut(index.raw() as usize).ok_or(
+            StatsError::DirectoryIndexOutOfBounds {
+                index: index.raw(),
+                length,
+            },
+        )
+    }
+
+    fn entry_mut_of_type(
+        &mut self,
+        index: DirectoryIndex,
+        expected: DirectoryType,
+    ) -> StatsResult<&mut DirectoryEntry> {
+        let entry = self.entry_mut(index)?;
+        let actual = entry.directory_type()?;
+        if actual == expected {
+            Ok(entry)
+        } else {
+            Err(StatsError::MetricTypeMismatch { expected, actual })
+        }
+    }
+
+    /// The fixed-capacity heap this segment owns.
+    ///
+    /// The control block lives inside the segment mapping, the segment is owned
+    /// by the process-level `StatsMain` and has no runtime destruction path, so
+    /// the borrow is valid for the caller's lifetime. Whether it is published as
+    /// a `/mem` entry is the owning subsystem's decision; the segment only lends
+    /// the heap.
+    pub fn heap(&self) -> &MemHeap {
         // SAFETY: the heap control block lives inside the segment mapping for
         // the lifetime of this owner.
         unsafe { self.heap.as_ref() }
@@ -971,32 +1092,23 @@ fn allocate_vector(
     let requested = element_size
         .checked_mul(count)
         .and_then(|bytes| prefix.checked_add(bytes))
-        .ok_or(StatsError::HeapExhausted {
-            requested: usize::MAX,
-            alignment,
-            capacity: heap.size(),
-        })?;
-    let layout = Layout::from_size_align(requested, alignment).expect("vector layout is valid");
-    let Some(pointer) = heap.allocate(layout) else {
-        return Err(StatsError::HeapExhausted {
-            requested,
-            alignment,
-            capacity: heap.size(),
-        });
-    };
+        .ok_or(StatsError::InvalidShape)?;
     let Ok(length) = u32::try_from(count) else {
-        // SAFETY: the allocation is owned by this function.
-        unsafe { heap.deallocate(pointer, layout) };
-        return Err(StatsError::HeapExhausted {
-            requested,
-            alignment,
-            capacity: heap.size(),
-        });
+        return Err(StatsError::InvalidShape);
     };
+    let layout = Layout::from_size_align(requested, alignment).expect("vector layout is valid");
+    // The window makes the segment heap the active heap, so the ordinary
+    // allocator serves the request; exhaustion is the allocator's failure path.
+    let active_heap = heap.activate();
+    // SAFETY: `requested` is non-zero for every caller.
+    let pointer = unsafe { std::alloc::alloc_zeroed(layout) };
+    let Some(pointer) = NonNull::new(pointer) else {
+        std::alloc::handle_alloc_error(layout)
+    };
+    drop(active_heap);
     let header_size = u8::try_from(prefix / VEC_MIN_ALIGN).expect("vector prefix fits the header");
     // SAFETY: the allocation is owned by the segment and writable in full.
     unsafe {
-        ptr::write_bytes(pointer.as_ptr(), 0, requested);
         let data = pointer.as_ptr().add(prefix);
         ptr::write(
             data.sub(VECTOR_HEADER_BYTES).cast::<[u8; 8]>(),
