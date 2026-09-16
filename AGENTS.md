@@ -32,11 +32,23 @@ Workspace root: `crates/`. Dependency direction is strictly one-way to avoid cyc
 | `hammer-runtime` | Runtime engine — worker thread spawning, engine main loop with VPP fixed-schedule step order, VPP-style worker barriers and synchronization primitives, `RuntimeRegistry` (typed service registry), session/app handle types. |
 | `hammer-service` | Protocol-neutral network infrastructure — interface, session, device, and feature-arc contracts used by independent plugins. |
 | `hammer-app` | Client Rust SDK for business applications — the application-facing app/session boundary for local and cross-process (shared-memory) sessions. `AppClient` (Unix socket + SCM_RIGHTS) returns `AppSession<Svm>`; independent application crates use its async methods. It is not a business application implementation crate. Echo helpers are test support only. |
-| `hammer-ipc` | Daemon ↔ CLI IPC protocol — length-prefixed frame format, request/reply message types, `#[ipc_handler]` registration via `linkme`, sync `IpcClient`. |
+| `hammer-ipc` | Server-side Binary API protocol and shared-memory transport definitions — message identity/codec, message tables, `ApiMain`, socket request/reply envelopes, and VPE protocol declarations. It contains no external client implementation. |
 | `hammer` | Daemon binary (analogous to VPP's `vpp`). Loads TOML config, initializes runtime engine + worker graph, binds IPC TCP socket (default `127.0.0.1:7299`, overridable via `HAMMER_IPC_ADDR`), runs the data-plane main loop. |
-| `hammerctl` | CLI control tool (analogous to `vppctl`). Subcommands: `Pause`, `Wake`, `ResetNetwork`, `Shutdown`, `Status`, `Send` (raw handler dispatch). |
 
 Patched dependencies live under `third_party/`. Architecture decisions, type/interface designs, migration inventories, and validation records live in `docs/adr/`. Domain terminology lives in root `CONTEXT.md`. Do not create `docs/superpowers/` or `.superpowers/`; this repository rule overrides document-output paths in skills.
+
+### External client boundary
+
+- The parent repository owns the server, shared protocol declarations, and
+  server-side transport state. It must not contain Binary API, stats, RPC, or
+  CLI client implementations.
+- The sibling `netsystem-client` directory is a standalone Git repository, is
+  ignored by this repository, and is not a submodule. It owns all external
+  client transport, request correlation, language bindings, and client-side RPC
+  services.
+- The client repository is language-neutral. Rust crate layouts are
+  implementation details of its Rust binding, not the contract for other
+  language bindings.
 
 ### Business application boundary
 
@@ -68,7 +80,6 @@ cargo clippy --workspace --all-targets  # lint
 make build        # = cargo build --workspace
 make build-release
 make run          # cargo run -p hammer -- -c startup.toml
-make ctl          # cargo run -p hammerctl --
 make test         # cargo test --workspace
 make clippy
 make fmt
@@ -189,6 +200,12 @@ Use Rust 2024 conventions and rustfmt defaults: 4-space indentation, `snake_case
   symbols only; the Hammer identifier itself must state the corresponding
   domain role (for example, `session_handles`, `session_handle`, or
   `external_handle`).
+- Do not use `wire` as a component of any Hammer-owned identifier, including
+  types, traits, fields, parameters, functions, modules, constants, tests, and
+  examples. Name the actual domain value instead, such as `payload_len` for
+  allocated message bytes or `encoded_len` for bytes produced by a codec.
+  References to a protocol's wire format in prose or literal external symbols
+  do not authorize `wire` in Hammer identifiers.
 - Every word in an identifier must express a domain role, fact, operation,
   state, policy, protocol, or invariant at the layer that owns it. This rule
   applies equally to production code, tests, benchmarks, examples, and test

@@ -17,10 +17,10 @@ members = [
     "crates/hammer-stats",
     "crates/hammer-ipc",
     "crates/hammer",
-    "crates/hammerctl",
     "third_party/quinn/quinn-proto",
 ]
 exclude = [
+    "netsystem-client",
     "third_party/allocator-api2",
     "third_party/io-uring",
 ]

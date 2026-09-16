@@ -3,6 +3,7 @@ target/
 /ios-demo
 /.worktrees
 /third_party/vpp
+/netsystem-client/
 .cursor/
 .omo/
 .DS_Store

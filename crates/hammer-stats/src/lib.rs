@@ -351,26 +351,6 @@ pub enum StatsError {
     InvalidSocketPath,
     AlreadyInitialized,
     NotInitialized,
-    ClientConnect {
-        path: PathBuf,
-        source: io::Error,
-    },
-    ClientReceive {
-        source: io::Error,
-    },
-    ClientAncillaryData {
-        received_fds: usize,
-        malformed: bool,
-    },
-    ClientFstat {
-        source: io::Error,
-    },
-    ClientMapping {
-        source: io::Error,
-    },
-    ClientRetryExhausted {
-        operation: &'static str,
-    },
 }
 
 impl fmt::Display for StatsError {
@@ -416,33 +396,6 @@ impl fmt::Display for StatsError {
             Self::InvalidSocketPath => formatter.write_str("stats socket path is required"),
             Self::AlreadyInitialized => formatter.write_str("stats main is already initialized"),
             Self::NotInitialized => formatter.write_str("stats main is not initialized"),
-            Self::ClientConnect { path, source } => {
-                write!(
-                    formatter,
-                    "connect to stats socket `{}`: {source}",
-                    path.display()
-                )
-            }
-            Self::ClientReceive { source } => {
-                write!(formatter, "receive stats segment fd: {source}")
-            }
-            Self::ClientAncillaryData {
-                received_fds,
-                malformed,
-            } => write!(
-                formatter,
-                "invalid stats ancillary data: received {received_fds} fd(s), malformed={malformed}"
-            ),
-            Self::ClientFstat { source } => write!(formatter, "stat stats segment fd: {source}"),
-            Self::ClientMapping { source } => {
-                write!(formatter, "map stats segment read-only: {source}")
-            }
-            Self::ClientRetryExhausted { operation } => {
-                write!(
-                    formatter,
-                    "stats client retry limit exhausted during {operation}"
-                )
-            }
         }
     }
 }

@@ -25,8 +25,7 @@ use prost::Message;
 
 // Existing socket protocol compatibility; SHM messages never use this envelope.
 pub use hammer_ipc::binary_api::{
-    BinaryApiClient, BinaryApiError, BinaryApiReply, BinaryApiRequest, BinaryApiStatus,
-    DEFAULT_MAX_FRAME_BYTES,
+    BinaryApiReply, BinaryApiRequest, BinaryApiStatus, DEFAULT_MAX_FRAME_BYTES,
 };
 
 #[hammer_component_macros::runtime_error(subsystem = "binary api")]

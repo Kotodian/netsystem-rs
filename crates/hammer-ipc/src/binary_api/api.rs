@@ -88,7 +88,7 @@ pub struct ApiMain {
     msg_range_by_name: RefCell<HashMap<std::string::String, usize>>,
     api_version_list: RefCell<Vec<ApiVersion>>,
     pub(super) clients: UnsafeCell<Pool<NonNull<ApiRegistration>>>,
-    pub(super) serialized_message_table: UnsafeCell<Option<NonNull<Vec<u8>>>>,
+    pub(super) serialized_message_table: UnsafeCell<Option<NonNull<u8>>>,
     pub(super) rp: UnsafeCell<Option<NonNull<SvmRegion>>>,
     pub(super) primary_rp: UnsafeCell<Option<NonNull<SvmRegion>>>,
     pub(super) private_rps: UnsafeCell<Vec<NonNull<SvmRegion>>>,

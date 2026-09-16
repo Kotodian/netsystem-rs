@@ -459,11 +459,11 @@ _Avoid_: stored rate, query-time counter, CLI-local measurement
 
 **Module-owned ctl**:
 The owner module defines its ctl arguments, Binary API request/reply binding,
-reply decoding, and VPP-style formatter. `hammerctl` supplies the Binary API
-and stats-segment transport plus static ctl-module composition; it does not
-own plugin-specific command enums or formatting. Runtime owns core runtime,
-error, and memory ctl commands; interface, session, and transport modules own
-their respective ctl commands.
+reply decoding, and VPP-style formatter. The external `netsystem-client`
+repository supplies the Binary API and stats-segment transports plus static
+ctl-module composition; it does not own plugin-specific command enums or
+formatting. Runtime owns core runtime, error, and memory ctl commands;
+interface, session, and transport modules own their respective ctl commands.
 _Avoid_: central plugin command enum, CLI-owned plugin formatter
 
 **Statistic Clear Baseline**:
@@ -480,10 +480,10 @@ owns Message Data, runtime Message ID ranges, name/CRC lookup, API versions,
 shared-memory regions, the main input queue, and shared-memory client
 registrations; socket listener and socket connection state have a separate
 owner. The daemon uses one default instance on its main thread. The Binary API
-TLS selector `my_api_main` may select another actual ApiMain for a client worker;
-it does not replicate the daemon registry per thread. A VAPI Client owns its
-connection, request correlation and discovered IDs separately, and retains its
-actual mapping owner across async waits.
+TLS selector `my_api_main` may select another actual ApiMain for a client
+worker; it does not replicate the daemon registry per thread. The external
+`netsystem-client` repository owns every VAPI-style connection, request
+correlation, discovered ID table, and mapping lifetime.
 _Avoid_: BinaryApiMain, socket listener owner, method-name table, plugin API
 state
 

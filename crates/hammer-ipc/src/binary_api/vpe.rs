@@ -1,4 +1,5 @@
-//! VPE protocol messages consumed by the V2 memory client.
+//! VPE protocol declarations shared by the server handler and external
+//! language bindings.
 use super::Api;
 
 #[derive(Clone, Copy, Debug, Api)]
