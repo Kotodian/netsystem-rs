@@ -9,7 +9,7 @@
 
 ## 1. Context
 
-The previous draft of this ADR was wrong in two ways:
+The previous draft of this ADR was wrong in three ways:
 
 1. It treated `hammer-infra`'s allocator as if it were the allocation policy
    for every Hammer process. Hammer does not have a rule that every process and
@@ -18,18 +18,34 @@ The previous draft of this ADR was wrong in two ways:
    That is a daemon decision, not a client requirement.
 2. It invented public transport and allocator types to work around a linking
    problem. Those types are not in VPP and are not needed in Hammer.
+3. It treated the Rust binding as the client repository contract. Rust types,
+   Cargo crates, traits, and `#[global_allocator]` are language runtime
+   objects; they cannot define a protocol that Go, Python, C, C++, or Lua must
+   consume.
 
 The actual boundary is narrower and concrete:
 
-- An external process may depend on the Binary API client and the stats client.
-- Those dependency graphs must not contain `hammer-infra`.
+- An external process may depend on a language binding for the Binary API
+  client and the stats client.
+- No binding may be required to depend on Rust crates or a Rust runtime
+  allocator, and no client dependency graph may contain `hammer-infra`.
 - `hammer-infra` currently contains the process-wide declaration at
   `crates/hammer-infra/src/mem/mod.rs:1966-1967`. Linking that crate into an
   external binary brings that declaration with it.
-- The correct fix is dependency isolation and an independently owned client
-  SHM layer with an explicit region-local heap instance. It is not a new
-  process allocator, a feature flag, a fake `ApplicationAllocator`, or a
-  requirement that the external process call `MainHeapConfig::initialize()`.
+- The correct fix is a versioned language-neutral schema plus an independently
+  owned client SHM implementation with an explicit region-local heap instance.
+  The shared-memory transport core is an internal cross-language boundary, not
+  a public Rust type hierarchy. It is not a new process allocator, a feature
+  flag, a fake `ApplicationAllocator`, or a requirement that the external
+  process call `MainHeapConfig::initialize()`.
+
+Shared memory does not require the client to be written in the same language
+as the server. The operating system shares bytes and process-shared locks, not
+Rust values. What must be shared is a stable ABI: field layout, alignment,
+endianness, queue representation, ring representation, allocator metadata,
+lock protocol, and ownership rules. A common C ABI implementation is one way
+to share those rules; a language binding may also implement the same published
+layout natively. Rust types and Rust trait objects cannot be that ABI.
 
 The client is the connection and protocol transport boundary. It is not the
 owner of VPE, interface, plugin, or application business operations. The RPC
@@ -52,7 +68,7 @@ The following source facts define the boundary. The paths are relative to
 | V2 server ownership | `src/vlibmemory/memory_api.c:209-287` creates a server-side registration, records the client queue, serializes the message table, and sends `memclnt_create_v2_reply`. | The server `ApiMain` remains server-owned. The client must not use `ApiMain::current()` or the server registration pool as its connection state. |
 | Transport-only common API | `src/vpp-api/vapi/vapi.h:23-33` states that the common VAPI declarations are "only the transport layer"; generated higher-level APIs are separate. | `Client` owns connection, send, receive, request correlation, message-ID translation, and lifecycle. It does not own VPE methods. |
 | Opaque connection context | `src/vpp-api/vapi/vapi.c:72-96` shows `vapi_ctx_s` containing connection state, request slots, message-ID maps, the input queue, and the selected transport fields. | A single Hammer `Client` value is the connection context. A public transport trait or transport wrapper is not required. |
-| Message allocation and release | `src/vpp-api/vapi/vapi.c:223-275` selects SHM allocation with `vl_msg_api_alloc_as_if_client_or_null` and socket allocation with `vec_validate_init_empty`, then releases through the matching path. | Ordinary client Rust values and shared API messages have different allocation domains. The client must keep those domains paired correctly. |
+| Message allocation and release | `src/vpp-api/vapi/vapi.c:223-275` selects SHM allocation with `vl_msg_api_alloc_as_if_client_or_null` and socket allocation with `vec_validate_init_empty`, then releases through the matching path. | Binding-local values and shared API messages have different allocation domains. The client must keep those domains paired correctly. |
 | Client queue allocation | `src/vpp-api/vapi/vapi.c:669-672` calls `svm_queue_alloc_and_init`; `src/svm/queue.c:61-72` allocates that queue with `clib_mem_alloc_aligned`; `src/vlibapi/api_shared.c:969-981` selects the mapped API region's Data Heap. | The client creates and owns its input queue in the shared API region. The server does not pre-create queue storage and the client does not claim a server-owned queue slot. |
 | Message ring allocation | `src/vlibapi/memory_shared.c:77-147` allocates requests and replies from `vl_rings` or `client_rings`, marks the selected slot with `msgbuf_t::q`, and garbage-collects abandoned slots after 10 seconds. `src/vlibapi/memory_shared.c:150-171` falls back to shared-heap allocation when no ring slot fits. | VPP-style message rings are required. A ring-only rule that removes the shared-heap fallback is not VPP behavior. |
 | V2 connection path | `src/vpp-api/vapi/vapi.c:646-720` creates the client queue, sends `memclnt_create_v2`, receives its reply, and imports the message table. | Hammer's SHM client follows this sequence. It does not require a server-side `ApiMain` object in the external process. |
@@ -61,6 +77,11 @@ The following source facts define the boundary. The paths are relative to
 | Generated operation path | `src/vpp-api/vapi/vapi_c_gen.py:669-739` generates operations which allocate a request, assign a context, call `vapi_send`, and then dispatch the typed reply. | The typed operation belongs to a service layer. The client only provides the request/reply mechanism. |
 | Language-neutral API declaration | `src/tools/vppapigen/VPPAPI.rst:4-13` defines one API language for the RPC interface and states that the compiler emits JSON or C. | Binary API declarations are a shared protocol artifact; a Rust crate layout is not the protocol contract. |
 | Per-language binding generation | `src/tools/vppapigen/generate_go.py:120-149` consumes generated JSON definitions with GoVPP's `binapi-generator`; `src/cmake/api.cmake:106-173` generates C and C++ VAPI headers from the same JSON input. | `netsystem-client` consumes a versioned schema and owns language-specific bindings and RPC services. Bindings do not redefine message identity or server behavior. |
+| Go binary API transport | GoVPP's `adapter` tree contains `socketclient` for the Binary API and a separate `statsclient` for shared-memory stats. Its README describes the Binary API adapter as a "Pure Go implementation of VPP binary API protocol (socketclient)". | Go does not reimplement the VPP shared-memory Binary API transport. The language-neutral Binary API transport over sockets is implementable per language. |
+| Python binary API transport | The vendored and current upstream `vpp_papi` package contains `vpp_transport_socket.py`; there is no `vpp_transport_shmem.py` Binary API transport. | Python follows the same split: native Binary API socket transport and separate stats shared-memory decoding. |
+| Rust shared-memory transport | The `vpp-api-transport` crate's `shmem` backend links `libvppapiclient.so`; its build script requires `libvppapiclient` and bindgen generates the `vac_*` ABI. | A real Rust shared-memory client delegates allocator, queue, and connection mechanics to the C client library instead of reimplementing VPP's region heap in Rust. Rust is therefore a consumer of the cross-language boundary, not the boundary itself. |
+| Lua shared-memory transport | `src/vpp-api/lua/vpp-lapi.lua` declares and calls the same `vac_connect`, `vac_read`, `vac_write`, and `vac_free` ABI. | Multiple non-C languages converge on the C ABI for shared-memory Binary API access. |
+| C shared-memory client core | `src/vpp-api/CMakeLists.txt:18-24` builds `libvppapiclient.so` from `client.c` and links `vppinfra`, `vlibmemoryclient`, and pthread. `vac_mem_init()` initializes the client process heap used by that shared-memory path. | The reusable cross-language SHM boundary is a C ABI transport core, not a per-language copy of the region heap and queue implementation. Hammer keeps the C ABI structure but does not copy `vac_mem_init` or install a process-global heap. |
 | VPE ownership | `src/vpp/api/vpe.api:56-81` declares `show_version` and its reply; `src/vpp/api/api.c:93-112` implements the server-side handler. | `VpeService`, not `Client`, owns `show_version()`, its request construction, reply decoding, and `retval` interpretation. |
 | Independent stats client | `src/vpp-api/client/stat_client.c:42-137` connects a Unix socket, receives an fd with `SCM_RIGHTS`, opens the segment read-only with `mmap(PROT_READ)`, and decodes the stats directory separately from the Binary API transport. | The Hammer stats client is not a Binary API service and must not depend on the Binary API client or the server Binary API owner. |
 
@@ -70,6 +91,37 @@ template. Its `api.Connection` exposes only generic `NewStream`, `Invoke`,
 `vpe.RPCService` own `ShowVersion`, call `Connection.Invoke`, and translate a
 non-zero `retval` after the transport call succeeds. Hammer keeps that
 relationship without introducing a dynamic RPC registry.
+
+The cross-language transport comparison is:
+
+| Client surface | Official or established implementation | Binary API transport | Consequence |
+| --- | --- | --- | --- |
+| C and C++ | `libvppapiclient.so` plus generated C API headers | Shared memory and the C `vac_*` ABI | The C ABI is the common implementation boundary for native clients that do not implement the shared-memory protocol themselves. |
+| Lua | `vpp-lapi.lua` loads `libvppapiclient.so` through `ffi.load` and calls `vac_connect`, `vac_read`, `vac_write`, and `vac_free` | Shared memory through the same C ABI | A non-C language can use shared memory without reimplementing the region heap. |
+| Rust | `vpp-api-transport` 0.1.5/0.1.6 | `shmem` links `libvppapiclient.so`; `afunix` is a native Unix-socket implementation | Rust resolves the shared-memory path through C FFI. This is direct evidence that shared memory is not language-bound. |
+| Go | GoVPP `adapter/socketclient` and `adapter/statsclient` | Binary API is pure-Go Unix socket; stats use a separate read-only shared-memory client | Go does not use VPP shared memory for the Binary API, but that is an upstream implementation choice, not a language restriction. |
+| Python | `vpp_papi/vpp_transport_socket.py` and `vpp_papi/vpp_stats.py` | Binary API is Unix socket; stats use a separate read-only `SCM_RIGHTS` plus `mmap` client | Python likewise proves the socket and stats split, not a shared-memory language restriction. |
+
+The conclusions are independent of language:
+
+1. Shared memory is a byte layout and synchronization contract, not a Rust
+   object graph.
+2. A cross-language client needs one canonical schema and either one common
+   ABI implementation or multiple implementations of the same published
+   layout. It must never require another binding to link Rust crates.
+3. VPP chooses a common C ABI for shared-memory clients; Go and Python use the
+   Unix socket for the Binary API while reading stats shared memory directly.
+   Hammer's first implementation may use the common core for SHM and leave
+   socket transport native to each binding later.
+
+For reproducibility, the external check was made against GoVPP commit
+`b7ff1d40eaecc169f592c7f65f0b28b4f8b09066`, VPP commit
+`b5d2e1b02f2be41ad3e1dbc1e2cc275fe0a494f2`, and
+`vpp-api-transport` commit `ed9ed694c8e9b9ee38261f1818acc919c88c98a4`.
+The vendored VPP checkout is `629fe2764bd997189fedd2d98cbe8dc9189c1ec3`.
+The important point is not that every upstream project uses SHM; it is that
+the clients which do use SHM do not all share the server's implementation
+language.
 
 ## 3. Decisions
 
@@ -86,6 +138,10 @@ netsystem-rs/
         .git/
         README.md
         schema/
+        core/
+            CMakeLists.txt
+            include/
+            src/
         rust/
             Cargo.toml
             Cargo.lock
@@ -123,9 +179,10 @@ it. The schema contains message names, CRCs, field layouts, service
 relationships, and protocol versions; it does not contain Rust types or
 client-side error policy.
 
-The Rust binding consumes the versioned schema and owns its Rust protocol,
-shared-memory, client, and RPC implementation packages. A committed client
-manifest must not contain a relative path dependency into
+Each language binding consumes the versioned schema and owns its language
+protocol, client, and RPC packages. The shared-memory transport core is a
+separate internal C ABI package under `core/`; it is not the Rust binding's
+private crate. A committed client manifest must not contain a relative path dependency into
 `../netsystem-rs/crates/**` or any other parent checkout path. Other language
 bindings decode the same schema without linking Hammer Rust crates.
 
@@ -136,59 +193,89 @@ The client CI builds from its own repository using pinned package versions or
 revisions, and the compatibility job selects the server revision it is
 testing against.
 
-### 3.2 Language bindings and Rust packages
+### 3.2 Language bindings and internal transport core
 
 Each language binding owns its public packaging and service tree. The repository
 must not require another language to depend on Rust crates, generated Rust
 types, or Cargo package names.
 
-The initial Rust binding may use these internal packages:
+The repository has three separate contracts:
 
-- `hammer-binary-api-client` owns the Binary API connection abstraction and
-  the SHM backend implementation.
-- `hammer-binary-api-rpc` owns client-side RPC services. Its first service is
-  `VpeService`.
-- `hammer-stats-client` owns stats socket handoff, read-only mapping, directory
-  traversal, and decoded stats values.
+- The versioned schema owns message identity, field layout, CRCs, service
+  relationships, and protocol versions.
+- `hammer-client-core` owns SHM mapping, SVM queues, the region-local heap,
+  message rings, the V2 handshake, request correlation, and the opaque
+  connection context behind an internal C ABI. It contains no typed protocol
+  codec, RPC service, or business operation. Connection state is per opaque
+  handle; there is no process-global current client, active heap, or last
+  error slot.
+- Each language binding owns its public `Client`, protocol codec, and RPC
+  services. The Rust binding's packages are illustrative of one binding, not
+  the repository contract.
 
-These are Rust implementation packages, not the repository contract. Go,
-Python, C, or another binding may organize its client and services differently
-while preserving the same connection and RPC semantics.
+This is not a public transport hierarchy. `hammer-client-core` is an internal
+implementation boundary used to avoid reimplementing the shared-memory heap
+and queue protocol independently in every language. C, C++, Lua, and the Rust
+`vpp-api-transport` ecosystem follow the same pattern around
+`libvppapiclient.so`. A language binding does not expose the C ABI, and callers
+still use their language's concrete `Client` value. The C ABI is an
+implementation detail even though it is stable enough for bindings to link.
+
+Native socket transport may be implemented per language when it is added,
+following GoVPP and `vpp_papi`. The SHM backend remains in
+`hammer-client-core` because it is the backend that requires the shared-region
+allocator and process-shared synchronization ABI.
 
 The client and stats client are not features of one another, do not share a
 connection object, and do not re-export a server `ApiMain` or `StatsMain`.
 
-The `netsystem-client` repository owns the implementation packages used by its
-Rust binding. The server does not depend on these packages and does not share
-their source tree. The initial Rust binding should use these ownership layers:
+The `netsystem-client` repository owns all client implementation packages. The
+server does not depend on these packages and does not share their source tree.
+The initial ownership layers are:
 
 ```text
-hammer-shmem
-    client-owned SvmQueue, SvmRegion, region-local heap, MsgBuf, and ShmemHeader
-    implementations
+core/
+    hammer-client-core: C ABI, SHM mapping, SVM queue, region heap, message
+    rings, V2 handshake, and request correlation; no business operations
 
-hammer-binary-api-protocol
-    client-generated Api, Message, MessageId, codec, and V2 handshake types
+rust/crates/hammer-binary-api-protocol
+    generated Api, Message, MessageId, codec, and V2 handshake types
 
-hammer-stats-protocol
-    client-owned SharedHeader, DirectoryEntry, DirectoryType, and decoded value
-    types
+rust/crates/hammer-binary-api-client
+    safe Rust connection abstraction over hammer-client-core
+
+rust/crates/hammer-binary-api-rpc
+    typed RPC services such as VpeService
+
+rust/crates/hammer-stats-protocol
+rust/crates/hammer-stats-client
+    stats-specific protocol and read-only client
 ```
 
-These crates contain the client implementation required by the published ABI;
-they do not contain transport-style abstractions. They must not contain a
-process-wide `#[global_allocator]`, a `MainHeapConfig`, `MemMain`, or a
-dependency on `hammer-infra`.
+A `hammer-shmem` crate is not the cross-language contract and must not be
+introduced as a second implementation of the same heap, queue, and message
+ring protocol. There is no public Rust `ClientTransport`, `TransportMessage`,
+`ShmemTransport`, or `SocketTransport` hierarchy.
 
-No client crate exposes or accepts process-allocator configuration. The final
+No client package contains a process-wide `#[global_allocator]`, a
+`MainHeapConfig`, `MemMain`, or a dependency on `hammer-infra`.
+
+No client package exposes or accepts process-allocator configuration. The final
 executable's allocator choice is outside the client API and is never changed,
-initialized, or replaced by the client library.
+initialized, or replaced by the client library. In particular, do not port a
+`vac_mem_init`-style process-heap initializer into Hammer.
 
-The region heap in `hammer-shmem` is an explicit instance attached to a mapped
-region, not the process-wide Rust allocator. VPP reaches the same boundary by
-pushing `rp->data_heap` before calling `clib_mem_alloc_aligned` for the client
-queue. Its concrete allocator implementation is a client-crate implementation
-detail; defining or linking it does not select it as `#[global_allocator]`.
+The region heap in `hammer-client-core` is an explicit instance attached to a
+mapped region, not the process-wide Rust allocator. VPP reaches the same
+boundary by pushing `rp->data_heap` before calling `clib_mem_alloc_aligned`
+for the client queue and by wrapping that behavior in `libvppapiclient`.
+
+The client repository must not vendor `third_party/dlmalloc` or reuse
+`hammer-infra::MemHeap` merely to reproduce the server's current region heap.
+The published shared-region ABI must define the allocation contract that the
+core implements. Compatibility between that contract, the server, and the
+core is a required pre-implementation gate; this ADR does not authorize a
+process-global allocator as a shortcut.
 
 Server-only checks and ownership stay in the server crate. In particular,
 `hammer_runtime::thread_main::ensure_main_thread`, `ApiMain` registration and
@@ -198,12 +285,23 @@ allocation role logic may remain server-side, and the server call site remains
 responsible for enforcing that server rings run on the main thread.
 
 `hammer-infra` keeps its server-owned memory, region, and queue implementation.
-It must not depend on the client repository's `hammer-shmem`, and the client
-`hammer-shmem` must not depend on `hammer-infra`.
+It must not depend on `hammer-client-core`, and `hammer-client-core` must not
+depend on `hammer-infra` or any server-only crate.
 
 ### 3.3 Client is one concrete abstraction, not a public transport hierarchy
 
-The public client is a single value:
+Every language binding exposes one concrete connection value. The Rust
+binding's shape is shown below only to make the lifetime and ownership rules
+concrete; Go, Python, C, and C++ use their own idiomatic types with the same
+operations:
+
+```text
+connect(connection configuration) -> Client
+invoke(typed request) -> typed reply
+disconnect(Client)
+```
+
+The Rust binding's public client is a single value:
 
 ```rust
 pub struct Client {
@@ -241,7 +339,7 @@ region, assigns a private context, sends it through the selected backend,
 waits for the matching reply, decodes it, and returns the owned reply. It does
 not interpret a business `retval`; the owning RPC service does that.
 
-The following types are explicitly not part of this API:
+The following types are explicitly not part of any binding's public API:
 
 ```text
 ClientTransport
@@ -257,9 +355,9 @@ EventSubscription
 MainHeapAllocator
 ```
 
-They are not public, not private, and not placeholders. A private enum or
-private fields may be used inside `Client` later to hold an implementation
-backend, but callers never name a backend type, trait, or wrapper.
+They are not public, not placeholders, and not a cross-language ABI. The
+internal `hammer-client-core` C ABI exists below the binding; callers never
+name its handle, mapping, queue, allocator, or backend operations directly.
 
 This is what "the client is an abstraction" means here. VPP's `vapi_ctx_t` is
 also an opaque connection context whose implementation selects SHM or a socket
@@ -283,7 +381,7 @@ The external client side owns:
 - its `memclnt_create_v2` handshake and returned client index;
 - its copy of the server message table;
 - its outstanding request table and context counter;
-- its decoded replies and other ordinary Rust state.
+- its decoded replies and other binding-local state.
 
 The external client does not own or call the server's `ApiMain`, its
 registration pool, its handler table, or its Main Heap lifecycle. It uses the
@@ -311,7 +409,9 @@ the public client return a transport-specific type.
 
 ### 4.1 `VpeService`
 
-`hammer-binary-api-rpc` owns the client-side VPE service:
+The Rust binding's `hammer-binary-api-rpc` package owns the client-side VPE
+service. Other bindings expose the same operation through their own service
+types:
 
 ```rust
 pub struct VpeService<'a> {
@@ -358,8 +458,8 @@ compatible with the server. They live in the client-owned protocol crate, not
 in the client or stats client. Their codec and CRC generation are protocol
 facts, not business operations.
 
-The service operation and `retval` policy live only in
-`hammer-binary-api-rpc`. The server handler and VPE build metadata remain
+The service operation and `retval` policy live only in the RPC service package
+for that language. The server handler and VPE build metadata remain
 server-owned.
 
 Business methods must never be added to `Client`. In particular:
@@ -372,7 +472,10 @@ Business methods must never be added to `Client`. In particular:
 
 ## 5. Stats Client Boundary
 
-`hammer-stats-client` is independent of the Binary API client:
+The stats client is independent of the Binary API client in every language.
+The Rust binding shown here follows the GoVPP and `vpp_papi` split: the stats
+path uses its own read-only shared-memory protocol rather than the Binary API
+connection:
 
 ```rust
 pub struct StatsClient {
@@ -447,7 +550,8 @@ This is required:
 external application
     -> hammer-binary-api-client
         -> hammer-binary-api-protocol  -> no hammer-infra
-        -> hammer-shmem                -> no hammer-infra
+        -> hammer-client-core          -> no hammer-infra
+                                          no process-global allocator
 
 external application
     -> hammer-stats-client
@@ -476,11 +580,11 @@ for the client boundary and are out of scope here.
 
 | Allocation | Allocator or owner | Release |
 | --- | --- | --- |
-| Client maps, request tables, decoded replies, diagnostic strings | The embedding process's existing allocator | Ordinary Rust drop |
-| `Client::connect` queue and shared header | The shared API region | Client disconnect and region cleanup |
+| Binding-local maps, request tables, decoded replies, diagnostic strings | The embedding language runtime's existing allocator | Binding-native cleanup |
+| Connection setup queue and shared header | The shared API region | Client disconnect and region cleanup |
 | API request and reply payloads | The shared API region allocation contract | Matching region release after send or receive |
 | Server `ApiMain`, handlers, registration pools | Existing daemon ownership and its chosen allocation policy | Existing server lifecycle |
-| Stats client decoded vectors and strings | The embedding process's existing allocator | Ordinary Rust drop |
+| Stats client decoded vectors and strings | The embedding language runtime's existing allocator | Binding-native cleanup |
 | Stats directory and payload bytes | The server stats segment, mapped read-only | `StatsClient` drop or unmap |
 
 The client does not allocate shared API messages through its process global
@@ -494,15 +598,16 @@ The boundary is checked from an actual external consumer in each implemented
 language. For the Rust binding, the check uses a real crate outside this
 repository:
 
-1. The consumer uses the platform allocator or whatever
-   `#[global_allocator]` its final executable already chose. The client crates
-   do not declare one and do not request allocator configuration.
+1. The consumer uses the platform allocator or whatever process allocator its
+   final executable already chose. The client packages and the core library do
+   not replace it, install one from a constructor, or request allocator
+   configuration.
 2. It depends directly on `hammer-binary-api-client`,
    `hammer-binary-api-rpc`, and/or `hammer-stats-client`.
 3. Its normal dependency tree contains no `hammer-infra` and, for the stats
    client, no server `hammer-stats`.
 4. It can build and run a V2 SHM connection without calling
-   `MainHeapConfig::initialize()`.
+   `MainHeapConfig::initialize()` or any `vac_mem_init` equivalent.
 
 A source-text search for forbidden imports is not a replacement for this
 check. The relevant proof is the compiled dependency graph and the external
@@ -512,20 +617,23 @@ server-only packages.
 
 ## 7. Required Dependency Direction
 
-The following crates are owned by `netsystem-client/rust/`:
+The client repository has one internal C ABI core and independent language
+bindings:
 
 ```text
-hammer-shmem
-    -> libc, posix-sync, and low-level dependencies only
+hammer-client-core
+    -> libc, OS mapping, and process-shared synchronization dependencies only
     -X-> hammer-infra
+    -X-> process-global allocator
+    -X-> server executable or server-only crate
 
 hammer-binary-api-protocol
-    -> hammer-shmem
-    -> codec/serde/macro dependencies only
+    -> generated schema and language codec dependencies only
+    -X-> hammer-client-core
 
 hammer-binary-api-client
     -> hammer-binary-api-protocol
-    -> hammer-shmem
+    -> hammer-client-core C ABI
     -> tokio, thiserror, tracing
     -X-> hammer-infra
     -X-> hammer-ipc server ownership
@@ -547,12 +655,16 @@ hammer-stats-client
     -X-> hammer-binary-api-client
 ```
 
+The exact package manager and language-runtime dependencies for non-Rust
+bindings are owned by those bindings. Their only shared implementation
+dependency is the internal `hammer-client-core` C ABI and the versioned schema.
+
 The parent repository keeps its server-owned dependency graph:
 
 ```text
 hammer-infra
     -> existing daemon and dataplane dependencies only
-    -X-> hammer-shmem
+    -X-> hammer-client-core
 
 hammer-stats
     -> existing server stats dependencies
@@ -561,13 +673,16 @@ hammer-ipc server API
     -> hammer-infra, hammer-runtime as required by the server
 ```
 
-The direction of every client arrow is one-way. The client-owned protocol and
-shared-memory crates never depend on a client binding, RPC service, server
-handler, the stats server, or `hammer-infra`.
+The direction of every client arrow is one-way. `hammer-client-core` never
+depends on a language binding, RPC service, server handler, stats server, or
+`hammer-infra`. SHM bindings use the core. A native per-language SHM
+implementation would require a separate ADR with its own compatibility proof;
+it must never invent a second schema. Future socket bindings may be native
+because the socket protocol does not require the shared-region allocator.
 
 The parent repository owns the canonical schema and server implementation. The
-`netsystem-client` repository owns every external client implementation,
-including its `hammer-shmem` and protocol crates. Both sides implement the same
+`netsystem-client` repository owns `hammer-client-core`, every language
+binding, and the published schema snapshot. Both sides implement the same
 published ABI independently. The parent does not depend on `netsystem-client`,
 and the client repository does not use a parent-relative path dependency in
 its committed manifests.
@@ -587,27 +702,34 @@ its committed manifests.
 4. Put the Rust binding in `netsystem-client/rust/`; it owns that Cargo
    workspace and lockfile. The repository root is not a Rust workspace and no
    other language is required to consume Rust packages.
-5. Implement the client-owned `hammer-shmem` from the published region and V2
-   SHM ABI. It owns mapping, queues, and an explicit region-local heap. It must
-   not link or re-export `hammer-infra`, and it must not declare a process-wide
-   `#[global_allocator]`.
-6. Generate or write the client-owned `hammer-binary-api-protocol` from the
+5. Implement `netsystem-client/core/` as the internal C ABI transport core. It
+   owns mapping, queues, message rings, the V2 handshake, request correlation,
+   and an explicit region-local heap context. It must not link or re-export
+   `hammer-infra`, install a constructor allocator, expose allocator setup, or
+   vendor the parent's `third_party/dlmalloc` as a client dependency.
+6. Before declaring SHM support, verify and document the region allocation
+   contract shared with the server. The core must allocate, publish, and free
+   client queue and message storage without changing the embedding process's
+   allocator.
+7. Generate or write the client-owned `hammer-binary-api-protocol` from the
    published schema. It owns the codec, message inventory, V2 handshake types,
    and message-table decoding used by the Rust binding.
-7. Implement `hammer-binary-api-client` in the Rust binding so its connection
-   state is owned by `Client`, not by `hammer_infra::ApiMain`. Remove the
-   `ApiMain::current()` dependency and remove `ShowVersion` from the client
-   crate.
-8. Move `show_version` operation and error handling to
+8. Implement `hammer-binary-api-client` in the Rust binding as the safe
+   language wrapper over the core C ABI. Its connection state must not depend
+   on `hammer_infra::ApiMain`; remove the `ApiMain::current()` dependency and
+   remove `ShowVersion` from the client crate.
+9. Move `show_version` operation and error handling to
    `hammer-binary-api-rpc::VpeService`.
-9. Write the client-owned `hammer-stats-protocol` from the published stats
+10. Write the client-owned `hammer-stats-protocol` from the published stats
    segment ABI; the server and stats client validate the same published layout
    without sharing Rust source.
-10. Remove old `hammer-ipc` client/stats exports that would preserve the
+11. Remove old `hammer-ipc` client/stats exports that would preserve the
    dependency path back to `hammer-infra`. Compatibility re-exports must not
    silently reintroduce the allocator or server ownership.
-11. Leave socket support unimplemented. Do not add a placeholder constructor or
+12. Leave socket support unimplemented. Do not add a placeholder constructor or
    unsupported runtime branch.
+13. Do not scaffold empty Go, Python, or C++ binding directories. Add a binding
+    when its package, generated types, and tests are ready.
 
 The client implementations that currently import `ApiMain` and `ShowVersion`
 are removed from the parent repository. They are migration inputs only for
@@ -621,6 +743,12 @@ behavioral reference; the child repository owns its implementation.
   its `.gitignore` and Cargo workspace exclude the sibling repository.
 - The child repository is language-neutral; its Rust binding has its own
   workspace and lockfile under `rust/`, and other bindings do not depend on it.
+- `hammer-client-core` exposes one opaque C ABI. No Rust collection, trait,
+  `Result`, panic, or allocator type crosses that ABI.
+- The core and every binding can be loaded by an external process without
+  replacing, declaring, or initializing the process allocator.
+- The core does not link `hammer-infra` and the client repository does not
+  vendor the parent's `third_party/dlmalloc`.
 - The child repository builds and tests without a committed path dependency on
   the parent checkout.
 - Every binding consumes the same versioned schema and does not depend on
@@ -677,23 +805,47 @@ behavioral reference; the child repository owns its implementation.
 12. Requiring an application to declare an allocator for the client or exposing
     allocator setup in the client API. A client library must remain passive
     with respect to the final executable's process allocator.
+13. Claiming that shared memory is only usable by the server's implementation
+    language. Shared memory is a byte-layout and synchronization contract.
+    VPP's Lua and third-party Rust SHM clients both cross a C ABI, and the Go
+    and Python socket decisions are implementation choices rather than proof
+    of a language restriction.
+14. Making a Rust crate, Rust trait, Rust `Client`, or Cargo package the
+    cross-language transport contract. Only the schema and an ABI with
+    language-neutral data representations can cross binding boundaries.
+15. Reimplementing the region heap, queue, ring, and V2 handshake independently
+    in every language without a published shared-region contract. That creates
+    multiple incompatible definitions of the same memory protocol.
+16. Exposing the `hammer-client-core` C ABI as the public user API. Each
+    language binding owns its idiomatic `Client` and RPC services; the core is
+    an internal implementation boundary.
+17. Porting a `vac_mem_init`-style process-heap initializer or any constructor
+    that replaces the host allocator. The core may own region-local allocation
+    state, but it must remain passive with respect to the final executable's
+    allocator.
+18. Vendoring the parent's `third_party/dlmalloc` into the client repository
+    merely to make the transport build. The shared-region allocation contract
+    must be resolved explicitly and must not smuggle in a process global
+    allocator.
 
 ## 11. Consequences
 
 Each language binding exposes one transport-facing client type that can connect
-to the V2 SHM server without exposing `ApiMain` or any allocator policy. RPC
-services own typed protocol operations, so adding a new service does not add a
-method or message-specific field to the client.
+to the V2 server without exposing `ApiMain`, the core C handle, or any
+allocator policy. RPC services own typed protocol operations, so adding a new
+service does not add a method or message-specific field to the client.
 
-The external dependency graph contains client-owned protocol, shared-memory,
-and region-heap code, but no `hammer-infra` or server process allocator. An
-external process therefore keeps its own global allocator and does not
-initialize or replace Hammer's Main Heap. The daemon's existing allocation
-behavior remains unchanged.
+The external dependency graph contains one client-owned C ABI core, generated
+language protocol packages, and language-specific client and RPC packages, but
+no `hammer-infra` or server process allocator. An external process therefore
+keeps its own global allocator and does not initialize or replace Hammer's Main
+Heap. The daemon's existing allocation behavior remains unchanged.
 
 The cost is a real repository, schema, and code-generation boundary. That is
 acceptable because it removes the link-time allocator hazard, keeps all client
 code out of the server repository, and lets language bindings evolve without
-turning one Rust crate layout into the protocol contract. It does not require
-the generic transport, allocator, event, or message-wrapper types proposed by
-the rejected draft.
+turning one language's crate layout into the protocol contract. It also keeps
+the shared-memory complexity in one internal implementation instead of
+requiring every binding to reproduce the heap, queue, ring, and locking ABI.
+It does not require the generic public transport, allocator, event, or
+message-wrapper types proposed by the rejected draft.
