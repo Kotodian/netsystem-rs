@@ -180,6 +180,10 @@ they do not contain transport-style abstractions. They must not contain a
 process-wide `#[global_allocator]`, a `MainHeapConfig`, `MemMain`, or a
 dependency on `hammer-infra`.
 
+No client crate exposes or accepts process-allocator configuration. The final
+executable's allocator choice is outside the client API and is never changed,
+initialized, or replaced by the client library.
+
 The region heap in `hammer-shmem` is an explicit instance attached to a mapped
 region, not the process-wide Rust allocator. VPP reaches the same boundary by
 pushing `rp->data_heap` before calling `clib_mem_alloc_aligned` for the client
@@ -451,8 +455,8 @@ external application
 ```
 
 The external application keeps whatever allocator it already owns. It does not
-declare an allocator for the client, and the client does not declare one for
-the application.
+declare or configure an allocator for the client, and the client does not
+declare or configure one for the application.
 
 ### 6.2 Existing `hammer-infra` behavior is not changed
 
@@ -490,8 +494,9 @@ The boundary is checked from an actual external consumer in each implemented
 language. For the Rust binding, the check uses a real crate outside this
 repository:
 
-1. The consumer has its own `#[global_allocator]` or uses the platform
-   allocator.
+1. The consumer uses the platform allocator or whatever
+   `#[global_allocator]` its final executable already chose. The client crates
+   do not declare one and do not request allocator configuration.
 2. It depends directly on `hammer-binary-api-client`,
    `hammer-binary-api-rpc`, and/or `hammer-stats-client`.
 3. Its normal dependency tree contains no `hammer-infra` and, for the stats
@@ -669,6 +674,9 @@ behavioral reference; the child repository owns its implementation.
 11. Pulling all of server `hammer-infra` into the client to obtain its region
     allocator. The client repository owns an independent region-local heap
     implementation without a process-wide `#[global_allocator]` declaration.
+12. Requiring an application to declare an allocator for the client or exposing
+    allocator setup in the client API. A client library must remain passive
+    with respect to the final executable's process allocator.
 
 ## 11. Consequences
 
