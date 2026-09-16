@@ -4,7 +4,6 @@
 
 pub mod api;
 pub mod table;
-pub mod vpe;
 pub use api::{ApiMain, ApiMsgConfig, ApiMsgData, ApiMsgRange, ApiVersion};
 pub mod codec;
 pub mod control;

@@ -1,7 +1,7 @@
 //! VPE-owned binary API messages.
 use std::sync::OnceLock;
 
-use hammer_component_macros::{api_message_range, api_reply, init_function};
+use hammer_component_macros::{Api, api_message_range, api_reply, init_function};
 use hammer_ipc::binary_api::ApiMain;
 use hammer_runtime::{DataPlaneMain, RuntimeError, RuntimeResult};
 
@@ -11,7 +11,29 @@ pub struct VpeApiMain {
     pub net_main: &'static NetMain,
 }
 
-pub use hammer_ipc::binary_api::vpe::{ShowVersion, ShowVersionReply};
+#[derive(Clone, Copy, Debug, Api)]
+#[api(name = "show_version", returns = ShowVersionReply)]
+pub struct ShowVersion {
+    pub id: u16,
+    pub client_index: u32,
+    pub context: u32,
+}
+
+#[derive(Clone, Debug, Api)]
+#[api(name = "show_version_reply")]
+pub struct ShowVersionReply {
+    pub id: u16,
+    pub context: u32,
+    pub retval: i32,
+    #[api(string = 32)]
+    pub program: String,
+    #[api(string = 32)]
+    pub version: String,
+    #[api(string = 32)]
+    pub build_date: String,
+    #[api(string = 256)]
+    pub build_directory: String,
+}
 
 static VPE_API_MAIN: OnceLock<VpeApiMain> = OnceLock::new();
 static MSG_ID_BASE: OnceLock<u16> = OnceLock::new();
