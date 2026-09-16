@@ -878,3 +878,20 @@ the shared-memory complexity in one internal implementation instead of
 requiring every binding to reproduce the heap, queue, ring, and locking ABI.
 It does not require the generic public transport, allocator, event, or
 message-wrapper types proposed by the rejected draft.
+
+## 12. Validation Record
+
+Validated on 2026-09-16 in the standalone `netsystem-client/rust` workspace.
+
+| Check | Command | Result |
+| --- | --- | --- |
+| Real V2 SHM lifecycle | `HAMMER_DAEMON=/root/netsystem-rs/target/debug/hammer cargo test -p hammer-binary-api-rpc --test vpe_shm -- --ignored --nocapture` | The test connects to a real daemon, imports the message table, calls `VpeService::show_version()`, disconnects, and observes a successful daemon shutdown. The test executable declares no `#[global_allocator]`; its ordinary values use the Rust default allocator. |
+| Client dependency boundary | `cargo tree -p hammer-binary-api-client` | The tree contains `hammer-shmem`, `hammer-binary-api-protocol`, Tokio, tracing, and `thiserror`; it contains no `hammer-infra`, server `hammer-ipc`, or server executable. |
+| RPC dependency boundary | `cargo tree -p hammer-binary-api-rpc` | The tree contains only the Binary API client/protocol layers needed by `VpeService`; it contains no `hammer-infra` or server ownership. |
+| Client workspace | `cargo test --workspace` | The standalone Rust workspace builds and runs its non-daemon tests without a parent path dependency or process allocator initialization. |
+
+The daemon-side E2E exposed one lifecycle boundary that the initial client
+implementation did not: after `MainHeapConfig::initialize()` publishes the Main
+Heap, Rust runtime teardown would free pre-initialization `System` allocations
+through the active Main Heap. The daemon now exits through `_exit` after its
+explicit shutdown work, matching its process-wide allocator cutover contract.
