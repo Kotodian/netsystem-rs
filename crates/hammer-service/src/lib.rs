@@ -40,6 +40,11 @@ hammer_runtime::__declare_registration_image!(
         binary_api::__PROCESS_NODE_BINARY_API,
     ];
     binary_api_methods = [];
+    stats_registrations = [
+        hammer_ipc::binary_api::memory_shared::__STATS_REGISTRATION_REGISTER_ROOT_REGION_PVT_HEAP,
+        hammer_ipc::binary_api::memory_shared::__STATS_REGISTRATION_REGISTER_API_REGION_PVT_HEAP,
+        hammer_ipc::binary_api::memory_shared::__STATS_REGISTRATION_REGISTER_API_REGION_DATA_HEAP,
+    ];
 );
 
 #[doc(hidden)]

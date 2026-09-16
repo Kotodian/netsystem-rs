@@ -1,3 +1,4 @@
+use std::sync::atomic::AtomicU64;
 use std::time::Duration;
 use std::{sync::OnceLock, thread::ThreadId};
 
@@ -324,6 +325,33 @@ impl ThreadMain {
             .find(|thread| thread.thread_index() == index)
     }
 
+    /// The main-loop count of the Data Worker with `thread_index`.
+    ///
+    /// `configure_fields` pushes thread zero first and then every Data Worker
+    /// in ascending thread index order, and `register_thread` only appends, so
+    /// the thread index indexes the descriptor directly and no second index
+    /// mapping is needed.
+    #[inline]
+    pub(crate) fn worker_main_loop_count(&self, thread_index: u32) -> &AtomicU64 {
+        self.worker_descriptor(thread_index).main_loop_count()
+    }
+
+    /// The latest published loops-per-second value of the Data Worker with
+    /// `thread_index`.
+    #[inline]
+    pub(crate) fn worker_loops_per_second(&self, thread_index: u32) -> &AtomicU64 {
+        self.worker_descriptor(thread_index).loops_per_second()
+    }
+
+    /// Resolves one Data Worker descriptor by thread index.
+    #[inline]
+    fn worker_descriptor(&self, thread_index: u32) -> &WorkerThread {
+        self.worker_threads
+            .get(thread_index as usize)
+            .filter(|descriptor| descriptor.thread_index() == thread_index)
+            .expect("Data Worker descriptors are stored by thread index")
+    }
+
     pub fn register_thread(
         &mut self,
         name: &'static str,
@@ -359,4 +387,18 @@ impl ThreadMain {
         self.thread_count = next_thread_index;
         Ok(())
     }
+}
+
+/// Creates the worker-count gauge `/sys/num_worker_threads`.
+///
+/// The count belongs to the worker-thread domain: VPP creates this gauge in
+/// `threads.c` and sets it to the number of Data Workers, so the entry is
+/// declared here rather than by the stats mechanism or a heap owner.
+#[hammer_component_macros::stats_registration]
+fn register_num_worker_threads(stats_main: &hammer_stats::StatsMain) -> RuntimeResult<()> {
+    let worker_count = ThreadMain::global().worker_count();
+    let mut segment = stats_main.segment.lock();
+    let gauge = segment.add_gauge("/sys/num_worker_threads")?;
+    segment.set_gauge(gauge.index, u64::from(worker_count));
+    Ok(())
 }

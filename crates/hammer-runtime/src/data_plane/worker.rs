@@ -1,4 +1,8 @@
+use std::sync::atomic::Ordering;
+use std::time::{Duration, Instant};
+
 use super::*;
+use crate::ThreadMain;
 
 impl DataPlaneMain {
     #[inline]
@@ -17,9 +21,40 @@ impl DataPlaneMain {
         self.main_loop_exit_now = true;
     }
 
+    /// VPP's two adjacent main-loop steps: publish the counter increment
+    /// (`vlib_increment_main_loop_counter`) and, when the reporting interval is
+    /// over, update the damped loops-per-second value.
+    ///
+    /// The counter goes into this thread's descriptor because the collector
+    /// runs on another thread; the rate window stays in this worker's own
+    /// fields. Both values have a single writer, so the relaxed orderings carry
+    /// no ownership or publication claim.
     #[inline]
     pub(crate) fn increment_main_loop_count(&mut self) {
-        self.main_loop_count = self.main_loop_count.wrapping_add(1);
+        let threads = ThreadMain::global();
+        threads
+            .worker_main_loop_count(self.thread_index())
+            .fetch_add(1, Ordering::Relaxed);
+        self.loops_this_reporting_interval += 1;
+
+        let now = Instant::now();
+        if now < self.loop_interval_end {
+            return;
+        }
+        if let Some(start) = self.loop_interval_start {
+            let elapsed = now.duration_since(start).as_secs_f64();
+            if elapsed > 0.0 {
+                let interval_rate = self.loops_this_reporting_interval as f64 / elapsed;
+                self.loops_per_second = self.loops_per_second * self.damping_constant
+                    + (1.0 - self.damping_constant) * interval_rate;
+                threads
+                    .worker_loops_per_second(self.thread_index())
+                    .store(self.loops_per_second as u64, Ordering::Relaxed);
+            }
+        }
+        self.loop_interval_start = Some(now);
+        self.loop_interval_end = now + Duration::from_micros(200);
+        self.loops_this_reporting_interval = 0;
     }
 
     #[inline]

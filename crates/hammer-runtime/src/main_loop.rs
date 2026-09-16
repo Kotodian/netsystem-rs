@@ -80,7 +80,7 @@ where
 /// 4. Schedule polling-state driver nodes (periodically)
 /// 5. Run ready nodes (handles interrupt frames + newly-scheduled polling frames)
 /// 6. Dispatch timer nodes (no timer wheel in data-plane yet)
-/// 7. Advance timers, increment main_loop_count and check exit
+/// 7. Advance timers, increment the thread's main-loop counter and check exit
 pub fn data_plane_main_loop(main: &mut DataPlaneMain, idle_slice: Duration) -> i32 {
     main.attach_worker_interrupt_thread();
 

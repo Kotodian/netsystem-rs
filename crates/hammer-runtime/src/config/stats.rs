@@ -11,17 +11,18 @@ use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::ptr;
 use std::sync::OnceLock;
+use std::sync::atomic::Ordering;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use byte_unit::Byte;
 use hammer_component_macros::Stats;
-use hammer_infra::mem::PageSize;
-use hammer_stats::{StatsMain, Timestamp};
+use hammer_infra::mem::{MemMain, PageSize};
+use hammer_stats::{CollectorRegistration, DirectoryIndex, SimpleCounter, StatsMain, Timestamp};
 use socket2::{Domain, MsgHdr, SockAddr, SockRef, Socket, Type};
 
 use crate::error::RuntimeResult;
 use crate::file::FILE_MAIN;
-use crate::{DataPlaneMain, File, RuntimeError};
+use crate::{DataPlaneMain, File, RuntimeError, ThreadMain};
 
 pub const DEFAULT_UPDATE_INTERVAL: Duration = Duration::from_secs(10);
 pub(crate) const DEFAULT_STATS_SEGMENT_SIZE: usize = 32 << 20;
@@ -76,11 +77,13 @@ impl StatsConfig {
 
 static STATS_CONFIG: OnceLock<StatsConfig> = OnceLock::new();
 
-/// The three system metrics whose directory slots the segment owns.
+/// The fixed system metrics plus the main loop's own two per-worker vectors.
 ///
 /// Each `bootstrap` field names the fixed VPP directory index of its slot:
 /// the declaration creates those slots once, in `Sys::bootstrap`, and
-/// `Sys::install` binds them afterwards.
+/// `Sys::install` binds them afterwards. `/sys/num_worker_threads` is not
+/// here: the worker count belongs to the worker-thread domain, which creates
+/// that gauge in its own registration.
 #[derive(Stats)]
 pub(crate) struct Sys {
     #[stats(bootstrap = hammer_stats::STAT_COUNTER_HEARTBEAT)]
@@ -94,6 +97,10 @@ pub(crate) struct Sys {
     last_stats_clear: Timestamp,
     #[stats(bootstrap = hammer_stats::STAT_COUNTER_BOOTTIME)]
     boottime: Timestamp,
+    /// Cumulative main-loop count of each Data Worker, one column per worker.
+    main_loop_count_per_worker: SimpleCounter,
+    /// Damped loops per second of each Data Worker, one column per worker.
+    loops_per_worker: SimpleCounter,
 }
 
 #[hammer_component_macros::process_node(name = "statseg-collector-process")]
@@ -109,11 +116,11 @@ fn stat_segment_collector_process(
             .as_secs();
         {
             let mut segment = stats_main.segment.lock();
-            segment.set_timestamp(sys.boottime.index, boottime)?;
+            segment.set_timestamp(sys.boottime.index, boottime);
         }
 
         loop {
-            stats_main.collect()?;
+            stats_main.collect();
             let update_interval = stats_main.segment.lock().update_interval();
             tokio::time::sleep(update_interval).await;
         }
@@ -171,6 +178,85 @@ fn init_stats_main(_: &mut DataPlaneMain) -> RuntimeResult<()> {
             stats_segment_listener::file_functions::<crate::NodeMain, crate::RuntimeError>(),
         ))?;
     crate::init::run_stats_registrations()?;
+    Ok(())
+}
+
+// ---- Per-heap collectors: each reads its own heap and hands the reading to
+// ---- the `/mem` family mapping. No heap owns a `StatsSegment` method.
+
+/// Reads the process main heap for its `/mem` entry.
+fn collect_main_heap_usage(entry_index: DirectoryIndex, row: u32) {
+    let usage = MemMain::main_heap().usage();
+    let stats_main = StatsMain::global().expect("stats owner is installed before the round");
+    let mut segment = stats_main.segment.lock();
+    hammer_stats::mem::update_mem_usage(&mut segment, entry_index, row, usage);
+}
+
+/// Reads the stats segment's own heap for its `/mem` entry.
+fn collect_stat_segment_usage(entry_index: DirectoryIndex, row: u32) {
+    let stats_main = StatsMain::global().expect("stats owner is installed before the round");
+    let mut segment = stats_main.segment.lock();
+    let usage = segment.heap().usage();
+    hammer_stats::mem::update_mem_usage(&mut segment, entry_index, row, usage);
+}
+
+/// Fills both per-worker main-loop vectors in one round.
+///
+/// VPP's `vector_rate_collector_fn` has the same shape: one registered
+/// collector writes the per-worker vectors. Column `slot` is Data Worker
+/// `slot` (runtime thread index `slot + 1`); the round only copies what each
+/// worker published, so it neither allocates nor returns an error.
+fn collect_worker_main_loop(entry_index: DirectoryIndex, row: u32) {
+    let threads = ThreadMain::global();
+    let sys = Sys::global();
+    let stats_main = StatsMain::global().expect("stats owner is installed before the round");
+    let mut segment = stats_main.segment.lock();
+    for slot in 0..threads.worker_count() {
+        let thread_index = slot + 1;
+        let count = threads
+            .worker_main_loop_count(thread_index)
+            .load(Ordering::Relaxed);
+        let rate = threads
+            .worker_loops_per_second(thread_index)
+            .load(Ordering::Relaxed);
+        segment.set_simple_counter(entry_index, row, slot, count);
+        segment.set_simple_counter(sys.loops_per_worker.index, row, slot, rate);
+    }
+}
+
+// ---- Registrations: one per entry this module owns.
+
+/// Registers the process main heap entry.
+#[hammer_component_macros::stats_registration]
+fn register_main_heap(stats_main: &StatsMain) -> RuntimeResult<()> {
+    hammer_stats::mem::register_mem_heap(stats_main, "main heap", collect_main_heap_usage)
+        .map_err(RuntimeError::from)
+}
+
+/// Registers the stats segment's own heap entry.
+#[hammer_component_macros::stats_registration]
+fn register_stat_segment_heap(stats_main: &StatsMain) -> RuntimeResult<()> {
+    hammer_stats::mem::register_mem_heap(stats_main, "stat segment", collect_stat_segment_usage)
+        .map_err(RuntimeError::from)
+}
+
+/// Creates the two per-worker main-loop vectors and registers their collector.
+///
+/// VPP creates and registers the same pair in `stats/init.c`: the row width is
+/// established first, then the collector is registered.
+#[hammer_component_macros::stats_registration]
+fn register_worker_main_loop(stats_main: &StatsMain) -> RuntimeResult<()> {
+    let sys = Sys::global();
+    let worker_count = ThreadMain::global().worker_count();
+    let mut segment = stats_main.segment.lock();
+    segment.validate(sys.main_loop_count_per_worker.index, 0, worker_count - 1)?;
+    segment.validate(sys.loops_per_worker.index, 0, worker_count - 1)?;
+    drop(segment);
+    stats_main.register_collector(CollectorRegistration {
+        collect: collect_worker_main_loop,
+        entry_index: sys.main_loop_count_per_worker.index,
+        vector_index: 0,
+    });
     Ok(())
 }
 

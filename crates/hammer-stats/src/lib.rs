@@ -13,6 +13,7 @@ use std::time::Duration;
 use hammer_infra::mem::{MemError, PageSize};
 use hammer_infra::sync::SpinLock;
 
+pub mod mem;
 mod metric;
 mod protocol;
 mod segment;
@@ -27,10 +28,37 @@ pub use protocol::{
 };
 pub use segment::StatsSegment;
 
+/// One collector registration, corresponding to VPP's
+/// `vlib_stats_collector_reg_t`.
+///
+/// The owner states which entry (and which row of it) its function fills; the
+/// mechanism does not interpret either value.
+#[derive(Clone, Copy)]
+pub struct CollectorRegistration {
+    /// Called once per round; the second argument is the row inside the entry.
+    pub collect: fn(DirectoryIndex, u32),
+    /// The directory entry this collector fills.
+    pub entry_index: DirectoryIndex,
+    /// The row of that entry this collector fills.
+    pub vector_index: u32,
+}
+
+/// One row of the process collector table, corresponding to VPP's
+/// `vlib_stats_collector_t`. The table is private to the process and never
+/// enters the shared segment.
+#[derive(Clone, Copy)]
+struct Collector {
+    collect: fn(DirectoryIndex, u32),
+    entry_index: DirectoryIndex,
+    vector_index: u32,
+}
+
 /// The single process stats owner, corresponding to VPP's `vlib_stats_main_t`.
 pub struct StatsMain {
     /// The statistics segment, protected by one structural lock.
     pub segment: SpinLock<StatsSegment>,
+    /// Collectors called once per round, in registration order.
+    collectors: SpinLock<Vec<Collector>>,
 }
 
 static STATS_MAIN: OnceLock<StatsMain> = OnceLock::new();
@@ -57,6 +85,7 @@ impl StatsMain {
         if STATS_MAIN
             .set(Self {
                 segment: SpinLock::new(segment),
+                collectors: SpinLock::new(Vec::new()),
             })
             .is_err()
         {
@@ -72,9 +101,41 @@ impl StatsMain {
         STATS_MAIN.get().ok_or(StatsError::NotInitialized)
     }
 
+    /// Registers one collector, like `vlib_stats_register_collector_fn`.
+    ///
+    /// Only startup calls this: the table grows once, before the
+    /// `statseg-collector-process` node and the Data Workers run, and rounds
+    /// only read it. There is no recoverable failure, so the operation returns
+    /// `()`; the table is ordinary Main Heap growth and an allocation failure
+    /// ends the process through the allocator's failure path.
+    pub fn register_collector(&self, registration: CollectorRegistration) {
+        self.collectors.lock().push(Collector {
+            collect: registration.collect,
+            entry_index: registration.entry_index,
+            vector_index: registration.vector_index,
+        });
+    }
+
     /// Runs one collector round, like `do_stat_segment_updates`.
-    pub fn collect(&self) -> StatsResult<()> {
-        self.segment.lock().advance_heartbeat()
+    ///
+    /// Every registered collector runs once in registration order, then the
+    /// heartbeat advances. A collector takes the segment lock itself: the table
+    /// lock is released before the call, so the two locks never nest. The round
+    /// has no recoverable failure, matching the VPP loop.
+    pub fn collect(&self) {
+        let mut position = 0;
+        loop {
+            let collector = {
+                let collectors = self.collectors.lock();
+                match collectors.get(position) {
+                    Some(collector) => *collector,
+                    None => break,
+                }
+            };
+            (collector.collect)(collector.entry_index, collector.vector_index);
+            position += 1;
+        }
+        self.segment.lock().advance_heartbeat();
     }
 }
 
@@ -95,12 +156,6 @@ pub enum StatsError {
     BackingResize { size: usize, source: io::Error },
     /// The configured segment size cannot hold the header page and directory.
     CapacityTooSmall { requested: usize, minimum: usize },
-    /// The fixed-capacity stats heap cannot serve one allocation.
-    HeapExhausted {
-        requested: usize,
-        alignment: usize,
-        capacity: usize,
-    },
     /// The directory index does not name a slot of the current directory.
     DirectoryIndexOutOfBounds { index: u32, length: usize },
     /// A metric name is already owned by another directory entry.
@@ -136,14 +191,6 @@ impl fmt::Display for StatsError {
             Self::CapacityTooSmall { requested, minimum } => write!(
                 formatter,
                 "stats segment size {requested} is below minimum {minimum}"
-            ),
-            Self::HeapExhausted {
-                requested,
-                alignment,
-                capacity,
-            } => write!(
-                formatter,
-                "stats heap of {capacity} bytes cannot serve {requested} bytes at alignment {alignment}"
             ),
             Self::DirectoryIndexOutOfBounds { index, length } => write!(
                 formatter,

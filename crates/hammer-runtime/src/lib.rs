@@ -31,7 +31,13 @@ crate::__declare_registration_image!(
     node_functions = [];
     process_nodes = [config::stats::__PROCESS_NODE_STATSEG_COLLECTOR_PROCESS];
     binary_api_methods = [];
-    stats_registrations = [config::stats::__STATS_REGISTRATION_Sys];
+    stats_registrations = [
+        config::stats::__STATS_REGISTRATION_Sys,
+        thread_main::__STATS_REGISTRATION_REGISTER_NUM_WORKER_THREADS,
+        config::stats::__STATS_REGISTRATION_REGISTER_WORKER_MAIN_LOOP,
+        config::stats::__STATS_REGISTRATION_REGISTER_MAIN_HEAP,
+        config::stats::__STATS_REGISTRATION_REGISTER_STAT_SEGMENT_HEAP,
+    ];
 );
 
 pub(crate) fn builtin_registration_image() -> &'static registration::RegistrationImage {

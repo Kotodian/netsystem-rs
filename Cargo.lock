@@ -1080,6 +1080,7 @@ dependencies = [
  "hammer-core",
  "hammer-infra",
  "hammer-runtime",
+ "hammer-stats",
  "libc",
  "prost",
  "serde",

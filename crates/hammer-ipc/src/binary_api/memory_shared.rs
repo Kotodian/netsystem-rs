@@ -10,11 +10,13 @@ use std::ptr::{self, NonNull};
 use std::sync::atomic::{AtomicI32, AtomicPtr, AtomicU32, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use hammer_infra::mem::MemHeap;
+use hammer_infra::mem::{HeapUsage, MemHeap};
 use hammer_infra::svm::queue::{SvmQueue, SvmQueueConditionalWait, SvmQueueConfig, SvmQueueError};
 use hammer_infra::svm::region::{
     RegionLock, SvmRegion, SvmRegionConfig, SvmRegionError, SvmRegionFlags,
 };
+use hammer_runtime::{RuntimeError, RuntimeResult};
+use hammer_stats::{DirectoryIndex, StatsMain};
 use serde::de::Error as _;
 
 use super::{Api, api::ApiMain, codec};
@@ -901,4 +903,94 @@ impl ApiMain {
         }
         Ok(())
     }
+}
+
+// ---- api segment heap entries: this module owns the region heaps, so the
+// ---- three `/mem` entries and their collectors live here.
+
+/// Collects the root region's private heap, `/mem/global_vm pvt`.
+fn collect_root_region_pvt_usage(entry_index: DirectoryIndex, row: u32) {
+    let api = ApiMain::current();
+    if !api.is_mapped() {
+        return;
+    }
+    let region = api
+        .root_region()
+        .lock()
+        .expect("mapped root region takes its lock");
+    let usage = region.pvt_heap().usage();
+    drop(region);
+    write_region_usage(entry_index, row, usage);
+}
+
+/// Collects the api region's private heap, `/mem/<region> pvt`.
+fn collect_api_region_pvt_usage(entry_index: DirectoryIndex, row: u32) {
+    let api = ApiMain::current();
+    if !api.is_mapped() {
+        return;
+    }
+    let region = api
+        .primary_region()
+        .lock()
+        .expect("mapped API region takes its lock");
+    let usage = region.pvt_heap().usage();
+    drop(region);
+    write_region_usage(entry_index, row, usage);
+}
+
+/// Collects the api region's data heap (queues and the shmem header),
+/// `/mem/<region> data`.
+fn collect_api_region_data_usage(entry_index: DirectoryIndex, row: u32) {
+    let api = ApiMain::current();
+    if !api.is_mapped() {
+        return;
+    }
+    let region = api
+        .primary_region()
+        .lock()
+        .expect("mapped API region takes its lock");
+    let usage = region
+        .data_heap()
+        .expect("API region has a Data Heap")
+        .usage();
+    drop(region);
+    write_region_usage(entry_index, row, usage);
+}
+
+/// The one lock and family mapping the three collectors above share.
+fn write_region_usage(entry_index: DirectoryIndex, row: u32, usage: HeapUsage) {
+    let stats_main = StatsMain::global().expect("stats owner is installed before the round");
+    let mut segment = stats_main.segment.lock();
+    hammer_stats::mem::update_mem_usage(&mut segment, entry_index, row, usage);
+}
+
+/// Registers the root region's private heap entry.
+///
+/// The entry name is derived from the region name and its role: the root
+/// region is `/global_vm`; the api region name comes from `ApiSegmentConfig`
+/// (default `/vpe-api`, leaf form `vpe-api`).
+#[hammer_component_macros::stats_registration]
+fn register_root_region_pvt_heap(stats_main: &StatsMain) -> RuntimeResult<()> {
+    hammer_stats::mem::register_mem_heap(stats_main, "global_vm pvt", collect_root_region_pvt_usage)
+        .map_err(RuntimeError::from)
+}
+
+/// Registers the api region's private heap entry.
+#[hammer_component_macros::stats_registration]
+fn register_api_region_pvt_heap(stats_main: &StatsMain) -> RuntimeResult<()> {
+    let api = ApiMain::current();
+    let leaf = api.api_region_name.trim_start_matches('/');
+    let name = format!("{leaf} pvt");
+    hammer_stats::mem::register_mem_heap(stats_main, &name, collect_api_region_pvt_usage)
+        .map_err(RuntimeError::from)
+}
+
+/// Registers the api region's data heap entry.
+#[hammer_component_macros::stats_registration]
+fn register_api_region_data_heap(stats_main: &StatsMain) -> RuntimeResult<()> {
+    let api = ApiMain::current();
+    let leaf = api.api_region_name.trim_start_matches('/');
+    let name = format!("{leaf} data");
+    hammer_stats::mem::register_mem_heap(stats_main, &name, collect_api_region_data_usage)
+        .map_err(RuntimeError::from)
 }

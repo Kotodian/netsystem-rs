@@ -22,7 +22,7 @@ This is a single-context repo: read root `CONTEXT.md` and relevant ADRs under `d
 
 ## Project Structure & Module Organization
 
-Workspace root: `crates/`. Dependency direction is strictly one-way to avoid cycles: `hammer → {hammer-runtime, hammer-service, hammer-ipc, hammer-core, hammer-component-macros}`, `hammer-app → {hammer-runtime, hammer-core, hammer-infra}`, `hammer-service → {hammer-runtime, hammer-core, hammer-infra, hammer-component-macros}`, `hammer-ipc → {hammer-core, hammer-runtime}`, `hammer-runtime → {hammer-core, hammer-component-macros}`, `hammer-infra → (external only)`, `hammer-core → hammer-infra`.
+Workspace root: `crates/`. Dependency direction is strictly one-way to avoid cycles: `hammer → {hammer-runtime, hammer-service, hammer-ipc, hammer-core, hammer-component-macros}`, `hammer-app → {hammer-runtime, hammer-core, hammer-infra}`, `hammer-service → {hammer-runtime, hammer-core, hammer-infra, hammer-component-macros}`, `hammer-ipc → {hammer-core, hammer-runtime, hammer-stats}`, `hammer-runtime → {hammer-core, hammer-component-macros}`, `hammer-infra → (external only)`, `hammer-core → hammer-infra`.
 
 | crate | role |
 |---|---|
