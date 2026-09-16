@@ -39,6 +39,13 @@ The actual boundary is narrower and concrete:
   flag, a fake `ApplicationAllocator`, or a requirement that the external
   process call `MainHeapConfig::initialize()`.
 
+The client core may include a private allocator implementation, including a
+dlmalloc/mspace-compatible allocator, when the shared region's published ABI
+requires it. That implementation belongs to the connection context and
+operates only on the mapped region's Data Heap. It must not become the host
+process allocator, install allocator hooks, export `malloc`/`free`, call
+`clib_mem_init`/`vac_mem_init`, or declare Rust's `#[global_allocator]`.
+
 Shared memory does not require the client to be written in the same language
 as the server. The operating system shares bytes and process-shared locks, not
 Rust values. What must be shared is a stable ABI: field layout, alignment,
@@ -81,7 +88,7 @@ The following source facts define the boundary. The paths are relative to
 | Python binary API transport | The vendored and current upstream `vpp_papi` package contains `vpp_transport_socket.py`; there is no `vpp_transport_shmem.py` Binary API transport. | Python follows the same split: native Binary API socket transport and separate stats shared-memory decoding. |
 | Rust shared-memory transport | The `vpp-api-transport` crate's `shmem` backend links `libvppapiclient.so`; its build script requires `libvppapiclient` and bindgen generates the `vac_*` ABI. | A real Rust shared-memory client delegates allocator, queue, and connection mechanics to the C client library instead of reimplementing VPP's region heap in Rust. Rust is therefore a consumer of the cross-language boundary, not the boundary itself. |
 | Lua shared-memory transport | `src/vpp-api/lua/vpp-lapi.lua` declares and calls the same `vac_connect`, `vac_read`, `vac_write`, and `vac_free` ABI. | Multiple non-C languages converge on the C ABI for shared-memory Binary API access. |
-| C shared-memory client core | `src/vpp-api/CMakeLists.txt:18-24` builds `libvppapiclient.so` from `client.c` and links `vppinfra`, `vlibmemoryclient`, and pthread. `vac_mem_init()` initializes the client process heap used by that shared-memory path. | The reusable cross-language SHM boundary is a C ABI transport core, not a per-language copy of the region heap and queue implementation. Hammer keeps the C ABI structure but does not copy `vac_mem_init` or install a process-global heap. |
+| C shared-memory client core | `src/vpp-api/CMakeLists.txt:18-24` builds `libvppapiclient.so` from `client.c` and links `vppinfra`, `vlibmemoryclient`, and pthread. `vac_mem_init()` initializes the client process heap used by that shared-memory path. | The reusable cross-language SHM boundary is a C ABI transport core, not a per-language copy of the region heap and queue implementation. Hammer keeps the C ABI structure and may reuse the region allocator internally, but it does not copy `vac_mem_init` or install a process-global heap. |
 | VPE ownership | `src/vpp/api/vpe.api:56-81` declares `show_version` and its reply; `src/vpp/api/api.c:93-112` implements the server-side handler. | `VpeService`, not `Client`, owns `show_version()`, its request construction, reply decoding, and `retval` interpretation. |
 | Independent stats client | `src/vpp-api/client/stat_client.c:42-137` connects a Unix socket, receives an fd with `SCM_RIGHTS`, opens the segment read-only with `mmap(PROT_READ)`, and decodes the stats directory separately from the Binary API transport. | The Hammer stats client is not a Binary API service and must not depend on the Binary API client or the server Binary API owner. |
 
@@ -270,12 +277,27 @@ mapped region, not the process-wide Rust allocator. VPP reaches the same
 boundary by pushing `rp->data_heap` before calling `clib_mem_alloc_aligned`
 for the client queue and by wrapping that behavior in `libvppapiclient`.
 
-The client repository must not vendor `third_party/dlmalloc` or reuse
-`hammer-infra::MemHeap` merely to reproduce the server's current region heap.
-The published shared-region ABI must define the allocation contract that the
-core implements. Compatibility between that contract, the server, and the
-core is a required pre-implementation gate; this ADR does not authorize a
-process-global allocator as a shortcut.
+The client core may compile a private dlmalloc/mspace-compatible allocator, or
+an equivalent implementation of the published shared-region ABI, directly
+inside `hammer-client-core`. It may not depend on `hammer-infra::MemHeap` as a
+Rust crate, because that would link the server allocator and Rust runtime into
+every binding.
+
+The private region allocator must satisfy all of the following:
+
+- every allocation and free receives the explicit mapped-region heap context;
+- the implementation is not registered as `#[global_allocator]`;
+- it does not define or interpose process-wide `malloc`, `free`, `realloc`,
+  `calloc`, `new`, or `delete`;
+- it does not install constructor-time allocator hooks;
+- it does not call `vac_mem_init`, `clib_mem_init`, or any equivalent routine
+  that publishes a process-global heap;
+- its symbols are private to the core library or namespaced to avoid collision
+  with the embedding process's allocator.
+
+The published shared-region ABI still defines the exact allocation contract.
+The core may vendor the allocator source it needs to implement that contract,
+but the allocator remains a private implementation detail of the core.
 
 Server-only checks and ownership stay in the server crate. In particular,
 `hammer_runtime::thread_main::ensure_main_thread`, `ApiMain` registration and
@@ -706,9 +728,10 @@ its committed manifests.
    owns mapping, queues, message rings, the V2 handshake, request correlation,
    and an explicit region-local heap context. It must not link or re-export
    `hammer-infra`, install a constructor allocator, expose allocator setup, or
-   vendor the parent's `third_party/dlmalloc` as a client dependency.
-6. Before declaring SHM support, verify and document the region allocation
-   contract shared with the server. The core must allocate, publish, and free
+   route ordinary host allocations through the region heap.
+6. The core may vendor or compile a private dlmalloc/mspace-compatible
+   allocator to implement the published shared-region ABI. Keep its symbols
+   private to the core and verify that the core allocates, publishes, and frees
    client queue and message storage without changing the embedding process's
    allocator.
 7. Generate or write the client-owned `hammer-binary-api-protocol` from the
@@ -747,8 +770,9 @@ behavioral reference; the child repository owns its implementation.
   `Result`, panic, or allocator type crosses that ABI.
 - The core and every binding can be loaded by an external process without
   replacing, declaring, or initializing the process allocator.
-- The core does not link `hammer-infra` and the client repository does not
-  vendor the parent's `third_party/dlmalloc`.
+- The core does not link `hammer-infra`. If it carries a private
+  region-allocator implementation, that allocator is not exported, interposed,
+  installed by a constructor, or selected as the process global allocator.
 - The child repository builds and tests without a committed path dependency on
   the parent checkout.
 - Every binding consumes the same versioned schema and does not depend on
@@ -823,10 +847,10 @@ behavioral reference; the child repository owns its implementation.
     that replaces the host allocator. The core may own region-local allocation
     state, but it must remain passive with respect to the final executable's
     allocator.
-18. Vendoring the parent's `third_party/dlmalloc` into the client repository
-    merely to make the transport build. The shared-region allocation contract
-    must be resolved explicitly and must not smuggle in a process global
-    allocator.
+18. Treating an internal region allocator as a reason to replace or intercept
+    the host process allocator. A private dlmalloc/mspace-compatible allocator
+    is allowed inside the core only when it is context-owned, symbol-isolated,
+    and used exclusively for shared-region allocations.
 
 ## 11. Consequences
 
@@ -840,6 +864,11 @@ language protocol packages, and language-specific client and RPC packages, but
 no `hammer-infra` or server process allocator. An external process therefore
 keeps its own global allocator and does not initialize or replace Hammer's Main
 Heap. The daemon's existing allocation behavior remains unchanged.
+
+The core owns any private region allocator implementation required by the V2
+shared-region ABI. That allocator is linked into the core and receives the
+mapped region's heap context explicitly; it never becomes the embedding
+runtime's allocator and never appears in a language binding's public API.
 
 The cost is a real repository, schema, and code-generation boundary. That is
 acceptable because it removes the link-time allocator hazard, keeps all client
