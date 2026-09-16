@@ -3,7 +3,8 @@ use super::{ApiMain, Array, Typedef, codec::Error};
 use serde::de::{Error as _, SeqAccess, Visitor};
 use serde::ser::SerializeStruct;
 use serde::{Deserialize, Serialize};
-use std::ptr::NonNull;
+use std::alloc::Layout;
+use std::slice;
 
 #[derive(Clone, Debug, PartialEq, Eq, Typedef)]
 pub struct MessageTableEntry {
@@ -182,12 +183,16 @@ impl ApiMain {
         let lock = unsafe { region.as_ref() }.lock()?;
         let heap = lock.data_heap().expect("API region has a Data Heap");
         let active_heap = heap.activate();
-        let mut bytes = vec![0_u8; self.message_table_encoded_len()];
+        let length = self.message_table_encoded_len();
+        let layout = Layout::array::<u8>(length).expect("message table length fits a layout");
+        let table = heap
+            .allocate(layout)
+            .expect("non-nullable shared message table allocation");
+        let output = unsafe { slice::from_raw_parts_mut(table.as_ptr(), length) };
         let written = self
-            .serialize_message_table(&mut bytes)
+            .serialize_message_table(output)
             .expect("measured API message table fits shared allocation");
-        bytes.truncate(written);
-        let table = NonNull::from(Box::leak(Box::new(bytes)));
+        assert_eq!(written, length, "message table length is stable");
         drop(active_heap);
         drop(lock);
         unsafe { *self.serialized_message_table.get() = Some(table) };

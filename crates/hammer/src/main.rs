@@ -50,18 +50,18 @@ fn main() {
     let config_path = config_path_from_args();
     let config_document = read_config(&config_path).unwrap_or_else(|error| {
         eprintln!("Failed to read config {}: {error}", config_path.display());
-        std::process::exit(1);
+        exit_daemon(1);
     });
     let early: DaemonEarlyConfig = toml::from_str(&config_document).unwrap_or_else(|error| {
         eprintln!(
             "Failed to deserialize early config {}: {error}",
             config_path.display()
         );
-        std::process::exit(1);
+        exit_daemon(1);
     });
     early.validate().unwrap_or_else(|error| {
         eprintln!("Invalid early config {}: {error}", config_path.display());
-        std::process::exit(1);
+        exit_daemon(1);
     });
     let DaemonEarlyConfig { memory, log } = early;
     let log_level = log.level;
@@ -69,12 +69,12 @@ fn main() {
     drop(config_path);
     memory.initialize().unwrap_or_else(|error| {
         eprintln!("Failed to initialize main heap: {error}");
-        std::process::exit(1);
+        exit_daemon(1);
     });
     let config_path = config_path_from_args();
     install_tracing(log_level).unwrap_or_else(|error| {
         eprintln!("Failed to initialize logging: {error}");
-        std::process::exit(1);
+        exit_daemon(1);
     });
 
     let config = read_config(&config_path).unwrap_or_else(|error| {
@@ -82,25 +82,32 @@ fn main() {
             "Failed to read config {} on the main heap: {error}",
             config_path.display()
         );
-        std::process::exit(1);
+        exit_daemon(1);
     });
     let roots = parse_startup_config(&config).unwrap_or_else(|error| {
         eprintln!(
             "Failed to deserialize daemon config {}: {error}",
             config_path.display()
         );
-        std::process::exit(1);
+        exit_daemon(1);
     });
     if STARTUP_CONFIG_PATH.set(config_path.clone()).is_err() {
         eprintln!("startup configuration path was initialized more than once");
-        std::process::exit(1);
+        exit_daemon(1);
     }
 
     let status = run(config, roots, config_path, log_level).unwrap_or_else(|error| {
         tracing::error!(%error, "hammer runtime failed");
         1
     });
-    std::process::exit(status);
+    exit_daemon(status);
+}
+
+fn exit_daemon(status: i32) -> ! {
+    // Main Heap publication deliberately does not classify allocations made
+    // before interception. Rust runtime cleanup would free those System
+    // allocations through the active Main Heap, so terminate without teardown.
+    unsafe { libc::_exit(status) }
 }
 
 fn install_tracing(default_level: Level) -> Result<(), String> {
@@ -136,7 +143,7 @@ fn config_path_from_args() -> PathBuf {
         .map(PathBuf::from)
         .unwrap_or_else(|| {
             eprintln!("Usage: hammer <config.toml>");
-            std::process::exit(1);
+            exit_daemon(1);
         })
 }
 

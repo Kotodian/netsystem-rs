@@ -1,4 +1,4 @@
-.PHONY: build build-release run ctl clean clippy fmt fmt-check verify-allocation-contract verify-dataplane-performance
+.PHONY: build build-release run clean clippy fmt fmt-check verify-allocation-contract verify-dataplane-performance
 
 build:
 	cargo build --workspace
@@ -8,9 +8,6 @@ build-release:
 
 run:
 	cargo run -p hammer -- -c startup.toml
-
-ctl:
-	cargo run -p hammerctl --
 
 clean:
 	cargo clean
