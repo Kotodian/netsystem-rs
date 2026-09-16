@@ -1,13 +1,8 @@
-//! Shared Protobuf Binary API envelope, blocking client, and client-facing
-//! errors. The daemon-side server (`hammer-service`) re-exports these and
-//! keeps server ownership and Main Thread dispatch; external client
-//! processes such as `hammerctl` use this module directly over a Unix
-//! socket, mirroring VPP's separate vat2 client process.
+//! Server-owned Binary API protocol and shared-memory transport definitions.
+//! The daemon-side server (`hammer-service`) re-exports the socket envelope
+//! while keeping handler registration, Main Thread dispatch, and lifecycle
+//! ownership on the server side.
 
 extern crate self as hammer_ipc;
 
-mod stats_client;
-
 pub mod binary_api;
-
-pub use stats_client::StatsClient;

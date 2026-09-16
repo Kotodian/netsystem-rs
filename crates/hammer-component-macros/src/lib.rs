@@ -3851,15 +3851,6 @@ pub fn api_reply(input: TokenStream) -> TokenStream {
         .into()
 }
 
-/// Generate the client Message/MessageId inventory and owned request methods.
-/// A bracketed message list is followed by request constructor functions.
-#[proc_macro]
-pub fn api_client_messages(input: TokenStream) -> TokenStream {
-    api::client_messages(input.into())
-        .unwrap_or_else(syn::Error::into_compile_error)
-        .into()
-}
-
 /// Declare the protocol definition of a non-message API type.
 #[proc_macro_derive(Typedef, attributes(api, serde))]
 pub fn derive_typedef(input: TokenStream) -> TokenStream {
