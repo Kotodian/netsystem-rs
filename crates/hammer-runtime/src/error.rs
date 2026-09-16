@@ -78,6 +78,12 @@ pub enum RuntimeError {
     Plugin(#[from] crate::plugin::PluginError),
     #[error(transparent)]
     Stats(#[from] hammer_stats::StatsError),
+    #[error("bind stats segment listener `{path}`")]
+    StatsListenerBind {
+        path: std::path::PathBuf,
+        #[source]
+        source: std::io::Error,
+    },
     #[error("worker count {count} does not fit u32")]
     WorkerCountOverflow { count: usize },
     #[error("worker count must be non-zero")]

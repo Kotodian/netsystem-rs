@@ -37,8 +37,8 @@ count = 1
 slots_per_numa = 256
 frame_pool_size = 32
 
-[stats]
-socket_path = "/tmp/hammer-plugin-additive-load.stats"
+[statseg]
+socket_name = "/tmp/hammer-plugin-additive-load.stats"
 "#;
 const PLUGIN_NAMES: [&str; 3] = ["ip", "tcp", "udp"];
 

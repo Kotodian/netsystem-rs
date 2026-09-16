@@ -1,8 +1,9 @@
 use std::ffi::CStr;
+use std::ffi::c_void;
 pub(crate) const MAX_NAME_BYTES: usize = 128;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum Error {
+pub enum ProtocolError {
     UnknownDirectoryType {
         raw: u32,
     },
@@ -17,13 +18,19 @@ pub enum Error {
     },
     InvalidRingConfig,
     InvalidVectorHeader,
-    InvalidCacheLine,
     RingSizeOverflow,
     MappingCapacityExceeded {
         required: usize,
         capacity: usize,
     },
-    WireValueOverflow {
+    SymlinkTargetOutOfBounds {
+        index: u32,
+    },
+    SymlinkCycle {
+        index: u32,
+        depth: u32,
+    },
+    EncodedValueOverflow {
         value: usize,
     },
     DirectoryDataTypeMismatch {
@@ -47,26 +54,95 @@ pub enum Error {
     },
 }
 
+impl std::fmt::Display for ProtocolError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::UnknownDirectoryType { raw } => {
+                write!(formatter, "unknown stats directory type {raw}")
+            }
+            Self::InvalidNameNul => formatter.write_str("stats name contains an interior NUL"),
+            Self::MissingNameTerminator => formatter.write_str("stats name is not NUL-terminated"),
+            Self::InvalidNamePadding => {
+                formatter.write_str("stats name has non-zero bytes after its terminator")
+            }
+            Self::NameTooLong { length } => {
+                write!(
+                    formatter,
+                    "stats name length {length} exceeds {MAX_NAME_BYTES}"
+                )
+            }
+            Self::InvalidVersion { actual } => write!(
+                formatter,
+                "stats segment version {actual} is not version {STAT_SEGMENT_VERSION}"
+            ),
+            Self::InvalidRingConfig => formatter.write_str("invalid stats ring configuration"),
+            Self::InvalidVectorHeader => formatter.write_str("invalid stats vector header"),
+            Self::RingSizeOverflow => formatter.write_str("stats ring size overflow"),
+            Self::MappingCapacityExceeded { required, capacity } => write!(
+                formatter,
+                "stats allocation needs {required} bytes but the mapping holds {capacity}"
+            ),
+            Self::SymlinkTargetOutOfBounds { index } => {
+                write!(formatter, "stats symlink target {index} is out of bounds")
+            }
+            Self::SymlinkCycle { index, depth } => write!(
+                formatter,
+                "stats symlink at {index} forms a cycle at depth {depth}"
+            ),
+            Self::EncodedValueOverflow { value } => {
+                write!(
+                    formatter,
+                    "stats encoded value {value} does not fit the protocol field"
+                )
+            }
+            Self::DirectoryDataTypeMismatch { expected, actual } => write!(
+                formatter,
+                "stats directory entry has type `{actual}`, expected `{expected}`"
+            ),
+            Self::ElementSizeZero => formatter.write_str("stats vector element size is zero"),
+            Self::ElementOutOfBounds { index, length } => write!(
+                formatter,
+                "stats vector element {index} is outside length {length}"
+            ),
+            Self::OffsetOverflow => formatter.write_str("stats offset arithmetic overflow"),
+            Self::OffsetOutOfBounds { offset, capacity } => write!(
+                formatter,
+                "stats offset {offset} is outside mapping capacity {capacity}"
+            ),
+            Self::SpanOutOfBounds {
+                offset,
+                length,
+                capacity,
+            } => write!(
+                formatter,
+                "stats span {offset}+{length} exceeds mapping capacity {capacity}"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for ProtocolError {}
+
 #[repr(transparent)]
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub(crate) struct NameBytes([u8; MAX_NAME_BYTES]);
 
 impl TryFrom<&[u8]> for NameBytes {
-    type Error = Error;
+    type Error = ProtocolError;
 
     fn try_from(value: &[u8]) -> Result<Self, Self::Error> {
         if value.len() > MAX_NAME_BYTES {
-            return Err(Error::NameTooLong {
+            return Err(ProtocolError::NameTooLong {
                 length: value.len(),
             });
         }
 
         if let Some(nul) = value.iter().position(|byte| *byte == 0) {
             if nul > MAX_NAME_BYTES - 2 {
-                return Err(Error::NameTooLong { length: nul });
+                return Err(ProtocolError::NameTooLong { length: nul });
             }
             if value[nul + 1..].iter().any(|byte| *byte != 0) {
-                return Err(Error::InvalidNameNul);
+                return Err(ProtocolError::InvalidNameNul);
             }
 
             let mut bytes = [0u8; MAX_NAME_BYTES];
@@ -76,11 +152,11 @@ impl TryFrom<&[u8]> for NameBytes {
 
         if value.len() > MAX_NAME_BYTES - 2 {
             if value.len() == MAX_NAME_BYTES - 1 {
-                return Err(Error::NameTooLong {
+                return Err(ProtocolError::NameTooLong {
                     length: value.len(),
                 });
             }
-            return Err(Error::MissingNameTerminator);
+            return Err(ProtocolError::MissingNameTerminator);
         }
 
         let mut bytes = [0u8; MAX_NAME_BYTES];
@@ -90,11 +166,11 @@ impl TryFrom<&[u8]> for NameBytes {
 }
 
 impl TryFrom<&str> for NameBytes {
-    type Error = Error;
+    type Error = ProtocolError;
 
     fn try_from(value: &str) -> Result<Self, Self::Error> {
         if value.as_bytes().contains(&0) {
-            return Err(Error::InvalidNameNul);
+            return Err(ProtocolError::InvalidNameNul);
         }
         Self::try_from(value.as_bytes())
     }
@@ -108,25 +184,17 @@ impl AsRef<[u8]> for NameBytes {
 }
 
 impl NameBytes {
-    pub(crate) fn as_c_str(&self) -> Result<&CStr, Error> {
+    pub(crate) fn as_c_str(&self) -> Result<&CStr, ProtocolError> {
         let Some(nul) = self.0.iter().position(|byte| *byte == 0) else {
-            return Err(Error::MissingNameTerminator);
+            return Err(ProtocolError::MissingNameTerminator);
         };
         if nul > MAX_NAME_BYTES - 2 {
-            return Err(Error::NameTooLong { length: nul });
+            return Err(ProtocolError::NameTooLong { length: nul });
         }
         if self.0[nul + 1..].iter().any(|byte| *byte != 0) {
-            return Err(Error::InvalidNamePadding);
+            return Err(ProtocolError::InvalidNamePadding);
         }
-        CStr::from_bytes_until_nul(&self.0).map_err(|_| Error::MissingNameTerminator)
-    }
-
-    #[inline]
-    pub(crate) fn len(&self) -> usize {
-        match self.0.iter().position(|byte| *byte == 0) {
-            Some(length) => length,
-            None => MAX_NAME_BYTES,
-        }
+        CStr::from_bytes_until_nul(&self.0).map_err(|_| ProtocolError::MissingNameTerminator)
     }
 }
 
@@ -195,8 +263,14 @@ impl From<DirectoryType> for &'static str {
     }
 }
 
+impl std::fmt::Display for DirectoryType {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(<&str>::from(*self))
+    }
+}
+
 impl TryFrom<u32> for DirectoryType {
-    type Error = Error;
+    type Error = ProtocolError;
 
     #[inline]
     fn try_from(raw: u32) -> Result<Self, Self::Error> {
@@ -205,7 +279,7 @@ impl TryFrom<u32> for DirectoryType {
 }
 
 impl TryFrom<TypeCode> for DirectoryType {
-    type Error = Error;
+    type Error = ProtocolError;
 
     #[inline]
     fn try_from(code: TypeCode) -> Result<Self, Self::Error> {
@@ -220,7 +294,7 @@ impl TryFrom<TypeCode> for DirectoryType {
             7 => Ok(Self::HistogramLog2),
             8 => Ok(Self::RingBuffer),
             9 => Ok(Self::Gauge),
-            raw => Err(Error::UnknownDirectoryType { raw }),
+            raw => Err(ProtocolError::UnknownDirectoryType { raw }),
         }
     }
 }
@@ -229,11 +303,6 @@ impl TypeCode {
     #[inline]
     pub(crate) const fn raw(self) -> u32 {
         self.0
-    }
-
-    #[inline]
-    pub(crate) const fn is_known(self) -> bool {
-        self.0 <= DirectoryType::Gauge as u32
     }
 }
 
@@ -246,16 +315,16 @@ pub(crate) struct SymlinkIndex {
 
 #[repr(transparent)]
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
-pub(crate) struct DirectoryIndex(u32);
+pub struct DirectoryIndex(u32);
 
 impl DirectoryIndex {
     #[inline]
-    pub(crate) const fn new(value: u32) -> Self {
+    pub const fn new(value: u32) -> Self {
         Self(value)
     }
 
     #[inline]
-    pub(crate) const fn raw(self) -> u32 {
+    pub const fn raw(self) -> u32 {
         self.0
     }
 }
@@ -274,53 +343,6 @@ impl From<DirectoryIndex> for u32 {
     }
 }
 
-#[repr(transparent)]
-#[derive(Clone, Copy, Debug, Default, Eq, Hash, Ord, PartialEq, PartialOrd)]
-pub struct Gauge(u64);
-
-impl From<u64> for Gauge {
-    #[inline]
-    fn from(value: u64) -> Self {
-        Self(value)
-    }
-}
-
-#[repr(transparent)]
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct DirectoryDataPointer(*mut core::ffi::c_void);
-
-impl DirectoryDataPointer {
-    #[inline]
-    pub const fn as_ptr(self) -> *mut core::ffi::c_void {
-        self.0
-    }
-}
-
-impl From<*mut core::ffi::c_void> for DirectoryDataPointer {
-    #[inline]
-    fn from(value: *mut core::ffi::c_void) -> Self {
-        Self(value)
-    }
-}
-
-#[repr(transparent)]
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct StringVectorPointer(*mut *mut u8);
-
-impl From<*mut *mut u8> for StringVectorPointer {
-    #[inline]
-    fn from(value: *mut *mut u8) -> Self {
-        Self(value)
-    }
-}
-
-impl StringVectorPointer {
-    #[inline]
-    pub const fn as_ptr(self) -> *mut *mut u8 {
-        self.0
-    }
-}
-
 #[repr(C)]
 #[derive(Clone, Copy)]
 pub(crate) union DirectoryData {
@@ -331,58 +353,39 @@ pub(crate) union DirectoryData {
     string_vector: *mut *mut u8,
 }
 
+impl DirectoryData {
+    #[inline]
+    pub(crate) const fn index(index: u64) -> Self {
+        Self { index }
+    }
+
+    #[inline]
+    pub(crate) const fn symlink_index(indices: SymlinkIndex) -> Self {
+        Self { indices }
+    }
+
+    #[inline]
+    pub(crate) const fn value(value: u64) -> Self {
+        Self { value }
+    }
+
+    #[inline]
+    pub(crate) const fn data(data: *mut core::ffi::c_void) -> Self {
+        Self { data }
+    }
+
+    #[inline]
+    pub(crate) const fn string_vector(string_vector: *mut *mut u8) -> Self {
+        Self { string_vector }
+    }
+}
+
 #[repr(C)]
 #[derive(Clone, Copy)]
 pub struct DirectoryEntry {
     directory_type: TypeCode,
     data: DirectoryData,
     name: [u8; MAX_NAME_BYTES],
-}
-
-impl From<DirectoryIndex> for DirectoryData {
-    #[inline]
-    fn from(value: DirectoryIndex) -> Self {
-        Self {
-            index: u64::from(value.0),
-        }
-    }
-}
-
-impl From<SymlinkIndex> for DirectoryData {
-    #[inline]
-    fn from(value: SymlinkIndex) -> Self {
-        Self { indices: value }
-    }
-}
-
-impl From<ScalarBits> for DirectoryData {
-    #[inline]
-    fn from(value: ScalarBits) -> Self {
-        Self { value: value.0 }
-    }
-}
-
-impl From<Gauge> for DirectoryData {
-    #[inline]
-    fn from(value: Gauge) -> Self {
-        Self { value: value.0 }
-    }
-}
-
-impl From<DirectoryDataPointer> for DirectoryData {
-    #[inline]
-    fn from(value: DirectoryDataPointer) -> Self {
-        Self { data: value.0 }
-    }
-}
-
-impl From<StringVectorPointer> for DirectoryData {
-    #[inline]
-    fn from(value: StringVectorPointer) -> Self {
-        Self {
-            string_vector: value.0,
-        }
-    }
 }
 
 impl DirectoryEntry {
@@ -395,18 +398,7 @@ impl DirectoryEntry {
         }
     }
 
-    #[inline]
-    pub fn kind(&self) -> u32 {
-        self.directory_type.raw()
-    }
-
-    pub fn name(&self) -> Result<&CStr, Error> {
-        let checked = NameBytes(self.name);
-        checked.as_c_str()?;
-        CStr::from_bytes_until_nul(&self.name).map_err(|_| Error::MissingNameTerminator)
-    }
-
-    pub(crate) fn name_bytes(&self) -> Result<NameBytes, Error> {
+    pub(crate) fn name_bytes(&self) -> Result<NameBytes, ProtocolError> {
         let name = NameBytes(self.name);
         name.as_c_str()?;
         Ok(name)
@@ -418,147 +410,83 @@ impl DirectoryEntry {
     }
 
     #[inline]
-    pub(crate) fn scalar_value(&self) -> u64 {
-        // SAFETY: Scalar owners call this accessor only after validating the
-        // directory family and selecting the scalar value arm.
-        unsafe { self.data.value }
+    pub(crate) fn directory_type(&self) -> Result<DirectoryType, ProtocolError> {
+        DirectoryType::try_from(self.directory_type)
+    }
+
+    #[inline]
+    pub(crate) fn set_data(&mut self, data: DirectoryData) {
+        self.data = data;
+    }
+
+    #[inline]
+    pub(crate) fn directory_index(&self) -> Result<DirectoryIndex, ProtocolError> {
+        require_directory_type(self, DirectoryType::Empty)?;
+        // SAFETY: the checked Empty kind selects the `index` arm written by the
+        // directory owner for the free-slot chain.
+        let raw = unsafe { self.data.index };
+        let value = u32::try_from(raw)
+            .map_err(|_| ProtocolError::EncodedValueOverflow { value: usize::MAX })?;
+        Ok(DirectoryIndex(value))
+    }
+
+    #[inline]
+    pub(crate) fn scalar_value(&self) -> Result<u64, ProtocolError> {
+        let actual = self.directory_type()?;
+        match actual {
+            DirectoryType::ScalarIndex | DirectoryType::Gauge => {
+                // SAFETY: the checked scalar kinds select the `value` arm.
+                Ok(unsafe { self.data.value })
+            }
+            actual => Err(ProtocolError::DirectoryDataTypeMismatch {
+                expected: DirectoryType::ScalarIndex,
+                actual,
+            }),
+        }
     }
 
     #[inline]
     pub(crate) fn set_scalar_value(&mut self, value: u64) {
-        self.data.value = value;
+        self.data = DirectoryData::value(value);
     }
-}
 
-fn require_directory_type(entry: &DirectoryEntry, expected: DirectoryType) -> Result<(), Error> {
-    let actual = DirectoryType::try_from(entry.kind())?;
-    if actual == expected {
-        Ok(())
-    } else {
-        Err(Error::DirectoryDataTypeMismatch { expected, actual })
-    }
-}
-
-impl TryFrom<&DirectoryEntry> for DirectoryIndex {
-    type Error = Error;
-
-    #[inline]
-    fn try_from(entry: &DirectoryEntry) -> Result<Self, Self::Error> {
-        require_directory_type(entry, DirectoryType::Empty)?;
-        // SAFETY: The entry is a live, aligned mapped record and its checked
-        // Empty kind selects the VPP `index` arm initialized by the writer.
-        let raw = unsafe { entry.data.index };
-        let value =
-            usize::try_from(raw).map_err(|_| Error::WireValueOverflow { value: usize::MAX })?;
-        let value = u32::try_from(value).map_err(|_| Error::WireValueOverflow { value })?;
-        Ok(Self(value))
-    }
-}
-
-impl TryFrom<&DirectoryEntry> for SymlinkIndex {
-    type Error = Error;
-
-    #[inline]
-    fn try_from(entry: &DirectoryEntry) -> Result<Self, Self::Error> {
-        require_directory_type(entry, DirectoryType::Symlink)?;
-        // SAFETY: The entry is a live, aligned mapped record and its checked
-        // Symlink kind selects the initialized `indices` arm.
-        Ok(unsafe { entry.data.indices })
-    }
-}
-
-impl TryFrom<&DirectoryEntry> for ScalarBits {
-    type Error = Error;
-
-    #[inline]
-    fn try_from(entry: &DirectoryEntry) -> Result<Self, Self::Error> {
-        require_directory_type(entry, DirectoryType::ScalarIndex)?;
-        // SAFETY: The entry is a live, aligned mapped record and its checked
-        // ScalarIndex kind selects the VPP timestamp `value` arm.
-        Ok(Self(unsafe { entry.data.value }))
-    }
-}
-
-impl TryFrom<&DirectoryEntry> for Gauge {
-    type Error = Error;
-
-    #[inline]
-    fn try_from(entry: &DirectoryEntry) -> Result<Self, Self::Error> {
-        require_directory_type(entry, DirectoryType::Gauge)?;
-        // SAFETY: The entry is a live, aligned mapped record and its checked
-        // Gauge kind selects the initialized `value` arm.
-        Ok(Self(unsafe { entry.data.value }))
-    }
-}
-
-impl TryFrom<&DirectoryEntry> for DirectoryDataPointer {
-    type Error = Error;
-
-    #[inline]
-    fn try_from(entry: &DirectoryEntry) -> Result<Self, Self::Error> {
-        let actual = DirectoryType::try_from(entry.kind())?;
+    pub(crate) fn data_pointer(&self) -> Result<*mut c_void, ProtocolError> {
+        let actual = self.directory_type()?;
         match actual {
             DirectoryType::CounterVectorSimple
             | DirectoryType::CounterVectorCombined
             | DirectoryType::HistogramLog2
             | DirectoryType::RingBuffer => {
-                // SAFETY: The entry is a live, aligned mapped record and its
-                // checked data-bearing kind selects the initialized `data` arm.
-                Ok(Self(unsafe { entry.data.data }))
+                // SAFETY: the checked data-bearing kinds select the `data` arm.
+                Ok(unsafe { self.data.data })
             }
-            actual => Err(Error::DirectoryDataTypeMismatch {
+            actual => Err(ProtocolError::DirectoryDataTypeMismatch {
                 expected: DirectoryType::CounterVectorSimple,
                 actual,
             }),
         }
     }
-}
 
-impl TryFrom<&DirectoryEntry> for StringVectorPointer {
-    type Error = Error;
-
-    #[inline]
-    fn try_from(entry: &DirectoryEntry) -> Result<Self, Self::Error> {
-        require_directory_type(entry, DirectoryType::NameVector)?;
-        // SAFETY: The entry is a live, aligned mapped record and its checked
-        // NameVector kind selects the initialized `string_vector` arm.
-        Ok(Self(unsafe { entry.data.string_vector }))
+    pub(crate) fn string_vector_pointer(&self) -> Result<*mut *mut u8, ProtocolError> {
+        require_directory_type(self, DirectoryType::NameVector)?;
+        // SAFETY: the checked NameVector kind selects the `string_vector` arm.
+        Ok(unsafe { self.data.string_vector })
     }
 }
 
-#[repr(transparent)]
-#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
-pub struct ScalarBits(u64);
-
-impl From<f64> for ScalarBits {
-    #[inline]
-    fn from(value: f64) -> Self {
-        Self(value.to_bits())
+fn require_directory_type(
+    entry: &DirectoryEntry,
+    expected: DirectoryType,
+) -> Result<(), ProtocolError> {
+    let actual = entry.directory_type()?;
+    if actual == expected {
+        Ok(())
+    } else {
+        Err(ProtocolError::DirectoryDataTypeMismatch { expected, actual })
     }
 }
 
-impl From<ScalarBits> for f64 {
-    #[inline]
-    fn from(bits: ScalarBits) -> Self {
-        f64::from_bits(bits.0)
-    }
-}
-
-impl From<u64> for ScalarBits {
-    #[inline]
-    fn from(value: u64) -> Self {
-        Self(value)
-    }
-}
-
-impl From<ScalarBits> for u64 {
-    #[inline]
-    fn from(bits: ScalarBits) -> Self {
-        bits.0
-    }
-}
-
-pub(crate) const VEC_MIN_ALIGN: usize = 8;
+pub(crate) const VEC_MIN_ALIGN: usize = hammer_infra::align::VEC_MIN_ALIGN;
 
 #[inline]
 pub(crate) const fn vec_header_bytes(
@@ -584,91 +512,11 @@ pub(crate) const fn vec_header_bytes(
 }
 
 #[inline]
-pub fn vec_len(header: Option<&[u8; 8]>) -> u32 {
+pub(crate) fn vec_len(header: Option<&[u8; 8]>) -> u32 {
     match header {
         Some(header) => u32::from_ne_bytes([header[0], header[1], header[2], header[3]]),
         None => 0,
     }
-}
-
-pub fn vector_element_offset(
-    header_offset: usize,
-    vector_offset: usize,
-    header: &[u8; 8],
-    index: usize,
-    element_size: usize,
-    mapping_capacity: usize,
-) -> Result<usize, Error> {
-    let log2_align = u32::from(header[5] & 0x7f);
-    if log2_align >= usize::BITS {
-        return Err(Error::InvalidVectorHeader);
-    }
-    let vector_alignment = 1usize << log2_align;
-    if vector_alignment < VEC_MIN_ALIGN
-        || !header_offset.is_multiple_of(VEC_MIN_ALIGN)
-        || !vector_offset.is_multiple_of(vector_alignment)
-    {
-        return Err(Error::InvalidVectorHeader);
-    }
-    let header_size = if header[4] == 0 {
-        return Err(Error::InvalidVectorHeader);
-    } else {
-        usize::from(header[4])
-            .checked_mul(VEC_MIN_ALIGN)
-            .ok_or(Error::OffsetOverflow)?
-    };
-    let header_end = header_offset
-        .checked_add(header_size)
-        .ok_or(Error::OffsetOverflow)?;
-    if header_end != vector_offset {
-        return Err(Error::OffsetOutOfBounds {
-            offset: vector_offset,
-            capacity: mapping_capacity,
-        });
-    }
-    if header_end > mapping_capacity {
-        return Err(Error::SpanOutOfBounds {
-            offset: header_offset,
-            length: header_size,
-            capacity: mapping_capacity,
-        });
-    }
-    if element_size == 0 {
-        return Err(Error::ElementSizeZero);
-    }
-    let length = usize::try_from(vec_len(Some(header)))
-        .map_err(|_| Error::WireValueOverflow { value: usize::MAX })?;
-    let vector_size = length
-        .checked_mul(element_size)
-        .ok_or(Error::OffsetOverflow)?;
-    let vector_end = vector_offset
-        .checked_add(vector_size)
-        .ok_or(Error::OffsetOverflow)?;
-    if vector_end > mapping_capacity {
-        return Err(Error::SpanOutOfBounds {
-            offset: vector_offset,
-            length: vector_size,
-            capacity: mapping_capacity,
-        });
-    }
-    if index >= length {
-        return Err(Error::ElementOutOfBounds { index, length });
-    }
-    let offset = index
-        .checked_mul(element_size)
-        .and_then(|element_offset| vector_offset.checked_add(element_offset))
-        .ok_or(Error::OffsetOverflow)?;
-    let element_end = offset
-        .checked_add(element_size)
-        .ok_or(Error::OffsetOverflow)?;
-    if element_end > mapping_capacity {
-        return Err(Error::SpanOutOfBounds {
-            offset,
-            length: element_size,
-            capacity: mapping_capacity,
-        });
-    }
-    Ok(offset)
 }
 
 #[repr(C, packed)]
@@ -707,24 +555,10 @@ impl RingConfig {
     }
 
     #[inline]
-    pub(crate) fn set_entry_size(&mut self, value: u32) {
-        // SAFETY: `entry_size` is a field of a live packed record; the write is
-        // explicitly unaligned and does not create a field reference.
-        unsafe { core::ptr::addr_of_mut!(self.entry_size).write_unaligned(value) }
-    }
-
-    #[inline]
     pub fn ring_size(&self) -> u32 {
         // SAFETY: `ring_size` is a field of a live packed record; the copy is
         // explicitly unaligned and does not create a field reference.
         unsafe { core::ptr::addr_of!(self.ring_size).read_unaligned() }
-    }
-
-    #[inline]
-    pub(crate) fn set_ring_size(&mut self, value: u32) {
-        // SAFETY: `ring_size` is a field of a live packed record; the write is
-        // explicitly unaligned and does not create a field reference.
-        unsafe { core::ptr::addr_of_mut!(self.ring_size).write_unaligned(value) }
     }
 
     #[inline]
@@ -735,13 +569,6 @@ impl RingConfig {
     }
 
     #[inline]
-    pub(crate) fn set_n_threads(&mut self, value: u32) {
-        // SAFETY: `n_threads` is a field of a live packed record; the write is
-        // explicitly unaligned and does not create a field reference.
-        unsafe { core::ptr::addr_of_mut!(self.n_threads).write_unaligned(value) }
-    }
-
-    #[inline]
     pub fn schema_size(&self) -> u32 {
         // SAFETY: `schema_size` is a field of a live packed record; the copy is
         // explicitly unaligned and does not create a field reference.
@@ -749,24 +576,10 @@ impl RingConfig {
     }
 
     #[inline]
-    pub(crate) fn set_schema_size(&mut self, value: u32) {
-        // SAFETY: `schema_size` is a field of a live packed record; the write is
-        // explicitly unaligned and does not create a field reference.
-        unsafe { core::ptr::addr_of_mut!(self.schema_size).write_unaligned(value) }
-    }
-
-    #[inline]
     pub(crate) fn schema_version(&self) -> u32 {
         // SAFETY: `schema_version` is a field of a live packed record; the copy is
         // explicitly unaligned and does not create a field reference.
         unsafe { core::ptr::addr_of!(self.schema_version).read_unaligned() }
-    }
-
-    #[inline]
-    pub(crate) fn set_schema_version(&mut self, value: u32) {
-        // SAFETY: `schema_version` is a field of a live packed record; the write is
-        // explicitly unaligned and does not create a field reference.
-        unsafe { core::ptr::addr_of_mut!(self.schema_version).write_unaligned(value) }
     }
 }
 
@@ -780,26 +593,10 @@ pub struct RingBufferHeader {
 
 impl RingBufferHeader {
     #[inline]
-    pub(crate) const fn new(config: RingConfig, metadata_offset: u32, data_offset: u32) -> Self {
-        Self {
-            config,
-            metadata_offset,
-            data_offset,
-        }
-    }
-
-    #[inline]
     pub fn config(&self) -> RingConfig {
         // SAFETY: `config` is a field of a live packed record; the copy is
         // explicitly unaligned and does not create a field reference.
         unsafe { core::ptr::addr_of!(self.config).read_unaligned() }
-    }
-
-    #[inline]
-    pub(crate) fn set_config(&mut self, value: RingConfig) {
-        // SAFETY: `config` is a field of a live packed record; the write is
-        // explicitly unaligned and does not create a field reference.
-        unsafe { core::ptr::addr_of_mut!(self.config).write_unaligned(value) }
     }
 
     #[inline]
@@ -810,170 +607,110 @@ impl RingBufferHeader {
     }
 
     #[inline]
-    pub(crate) fn set_metadata_offset(&mut self, value: u32) {
-        // SAFETY: `metadata_offset` is a field of a live packed record; the
-        // write is explicitly unaligned and does not create a field reference.
-        unsafe { core::ptr::addr_of_mut!(self.metadata_offset).write_unaligned(value) }
-    }
-
-    #[inline]
     pub fn data_offset(&self) -> u32 {
         // SAFETY: `data_offset` is a field of a live packed record; the copy is
         // explicitly unaligned and does not create a field reference.
         unsafe { core::ptr::addr_of!(self.data_offset).read_unaligned() }
     }
-
-    #[inline]
-    pub(crate) fn set_data_offset(&mut self, value: u32) {
-        // SAFETY: `data_offset` is a field of a live packed record; the write is
-        // explicitly unaligned and does not create a field reference.
-        unsafe { core::ptr::addr_of_mut!(self.data_offset).write_unaligned(value) }
-    }
 }
 
-#[repr(C, align(64))]
+#[repr(C)]
 pub(crate) struct RingMetadata {
+    cacheline0: hammer_infra::align::CacheLineAlignMark,
     head: u32,
     schema_version: u32,
     sequence: u64,
     schema_offset: u32,
     schema_size: u32,
-    padding: [u8; 40],
+    padding: [u8; hammer_infra::align::CACHE_LINE - 24],
 }
 
 impl RingMetadata {
     #[inline]
     pub(crate) const fn new(schema_version: u32, schema_offset: u32, schema_size: u32) -> Self {
         Self {
+            cacheline0: hammer_infra::align::CacheLineAlignMark,
             head: 0,
             schema_version,
             sequence: 0,
             schema_offset,
             schema_size,
-            padding: [0; 40],
+            padding: [0; hammer_infra::align::CACHE_LINE - 24],
         }
-    }
-
-    #[inline]
-    pub(crate) fn head(&self) -> u32 {
-        self.head
-    }
-
-    #[inline]
-    pub(crate) fn set_head(&mut self, value: u32) {
-        self.head = value;
-    }
-
-    #[inline]
-    pub(crate) fn schema_version(&self) -> u32 {
-        self.schema_version
-    }
-
-    #[inline]
-    pub(crate) fn set_schema_version(&mut self, value: u32) {
-        self.schema_version = value;
-    }
-
-    #[inline]
-    pub(crate) fn sequence(&self) -> u64 {
-        self.sequence
-    }
-
-    #[inline]
-    pub(crate) fn set_sequence(&mut self, value: u64) {
-        self.sequence = value;
-    }
-
-    #[inline]
-    pub(crate) fn schema_offset(&self) -> u32 {
-        self.schema_offset
-    }
-
-    #[inline]
-    pub(crate) fn set_schema_offset(&mut self, value: u32) {
-        self.schema_offset = value;
-    }
-
-    #[inline]
-    pub(crate) fn schema_size(&self) -> u32 {
-        self.schema_size
-    }
-
-    #[inline]
-    pub(crate) fn set_schema_size(&mut self, value: u32) {
-        self.schema_size = value;
     }
 }
 
 pub fn ring_layout(
     config: RingConfig,
-    cache_line_bytes: usize,
     mapping_capacity: usize,
-) -> Result<(RingBufferHeader, usize), Error> {
+) -> Result<(RingBufferHeader, usize), ProtocolError> {
+    let cache_line_bytes = hammer_infra::align::CACHE_LINE;
     let entry_size = usize::try_from(config.entry_size())
-        .map_err(|_| Error::WireValueOverflow { value: usize::MAX })?;
+        .map_err(|_| ProtocolError::EncodedValueOverflow { value: usize::MAX })?;
     let ring_size = usize::try_from(config.ring_size())
-        .map_err(|_| Error::WireValueOverflow { value: usize::MAX })?;
+        .map_err(|_| ProtocolError::EncodedValueOverflow { value: usize::MAX })?;
     let n_threads = usize::try_from(config.n_threads())
-        .map_err(|_| Error::WireValueOverflow { value: usize::MAX })?;
+        .map_err(|_| ProtocolError::EncodedValueOverflow { value: usize::MAX })?;
     let schema_size = usize::try_from(config.schema_size())
-        .map_err(|_| Error::WireValueOverflow { value: usize::MAX })?;
+        .map_err(|_| ProtocolError::EncodedValueOverflow { value: usize::MAX })?;
 
     if entry_size == 0 || ring_size == 0 {
-        return Err(Error::InvalidRingConfig);
+        return Err(ProtocolError::InvalidRingConfig);
     }
-    if cache_line_bytes < core::mem::align_of::<RingMetadata>()
-        || !cache_line_bytes.is_power_of_two()
+    if core::mem::size_of::<RingMetadata>() != cache_line_bytes
+        || core::mem::align_of::<RingMetadata>() != cache_line_bytes
     {
-        return Err(Error::InvalidCacheLine);
+        return Err(ProtocolError::InvalidVectorHeader);
     }
 
     let data_offset = core::mem::size_of::<RingBufferHeader>();
     let data_size = n_threads
         .checked_mul(ring_size)
         .and_then(|size| size.checked_mul(entry_size))
-        .ok_or(Error::RingSizeOverflow)?;
+        .ok_or(ProtocolError::RingSizeOverflow)?;
     let data_end = data_offset
         .checked_add(data_size)
-        .ok_or(Error::RingSizeOverflow)?;
+        .ok_or(ProtocolError::RingSizeOverflow)?;
     let metadata_offset = data_end
         .checked_add(cache_line_bytes - 1)
-        .ok_or(Error::RingSizeOverflow)?
+        .ok_or(ProtocolError::RingSizeOverflow)?
         & !(cache_line_bytes - 1);
     let metadata_size = n_threads
         .checked_mul(core::mem::size_of::<RingMetadata>())
-        .ok_or(Error::RingSizeOverflow)?;
+        .ok_or(ProtocolError::RingSizeOverflow)?;
     let metadata_end = metadata_offset
         .checked_add(metadata_size)
-        .ok_or(Error::RingSizeOverflow)?;
+        .ok_or(ProtocolError::RingSizeOverflow)?;
     let schema_offset = if schema_size == 0 { 0 } else { metadata_end };
     let total = if schema_size == 0 {
         metadata_end
     } else {
         schema_offset
             .checked_add(schema_size)
-            .ok_or(Error::RingSizeOverflow)?
+            .ok_or(ProtocolError::RingSizeOverflow)?
     };
 
     if total > mapping_capacity {
-        return Err(Error::MappingCapacityExceeded {
+        return Err(ProtocolError::MappingCapacityExceeded {
             required: total,
             capacity: mapping_capacity,
         });
     }
 
-    let data_offset =
-        u32::try_from(data_offset).map_err(|_| Error::WireValueOverflow { value: data_offset })?;
-    let metadata_offset = u32::try_from(metadata_offset).map_err(|_| Error::WireValueOverflow {
-        value: metadata_offset,
-    })?;
+    let data_offset = u32::try_from(data_offset)
+        .map_err(|_| ProtocolError::EncodedValueOverflow { value: data_offset })?;
+    let metadata_offset =
+        u32::try_from(metadata_offset).map_err(|_| ProtocolError::EncodedValueOverflow {
+            value: metadata_offset,
+        })?;
     if schema_size != 0 {
         let _schema_offset =
-            u32::try_from(schema_offset).map_err(|_| Error::WireValueOverflow {
+            u32::try_from(schema_offset).map_err(|_| ProtocolError::EncodedValueOverflow {
                 value: schema_offset,
             })?;
     }
-    let _total = u32::try_from(total).map_err(|_| Error::WireValueOverflow { value: total })?;
+    let _total =
+        u32::try_from(total).map_err(|_| ProtocolError::EncodedValueOverflow { value: total })?;
 
     let header = RingBufferHeader {
         config,
@@ -985,18 +722,25 @@ pub fn ring_layout(
 
 pub(crate) const STAT_SEGMENT_VERSION: u64 = 2;
 pub(crate) const STAT_SEGMENT_INDEX_INVALID: u32 = u32::MAX;
-pub(crate) const STAT_COUNTER_HEARTBEAT: u32 = 0;
-pub(crate) const STAT_COUNTER_LAST_STATS_CLEAR: u32 = 1;
-pub(crate) const STAT_COUNTER_BOOTTIME: u32 = 2;
+
+/// Directory index of the fixed heartbeat slot, as in `STAT_COUNTER_HEARTBEAT`.
+pub const STAT_COUNTER_HEARTBEAT: u32 = 0;
+/// Directory index of the fixed last-clear slot, as in
+/// `STAT_COUNTER_LAST_STATS_CLEAR`.
+pub const STAT_COUNTER_LAST_STATS_CLEAR: u32 = 1;
+/// Directory index of the fixed boot-time slot, as in `STAT_COUNTER_BOOTTIME`.
+pub const STAT_COUNTER_BOOTTIME: u32 = 2;
+/// Number of fixed slots the segment owns, as in `STAT_COUNTERS`.
+pub(crate) const STAT_COUNTERS: u32 = 3;
 
 #[repr(C)]
 #[derive(Clone, Copy)]
 pub struct SharedHeader {
     version: u64,
     base: *mut core::ffi::c_void,
-    epoch: u64,
+    pub(crate) epoch: u64,
     pub(super) in_progress: u64,
-    directory_vector: *mut DirectoryEntry,
+    pub(crate) directory_vector: *mut DirectoryEntry,
 }
 
 impl SharedHeader {
@@ -1010,52 +754,6 @@ impl SharedHeader {
             directory_vector: core::ptr::null_mut(),
         }
     }
-
-    #[inline]
-    pub fn validate_version(&self) -> Result<(), Error> {
-        if self.version == STAT_SEGMENT_VERSION {
-            Ok(())
-        } else {
-            Err(Error::InvalidVersion {
-                actual: self.version,
-            })
-        }
-    }
-
-    #[inline]
-    pub fn is_write_in_progress(&self) -> bool {
-        self.in_progress != 0
-    }
-
-    #[inline]
-    pub fn epoch(&self) -> u64 {
-        self.epoch
-    }
-
-    #[inline]
-    pub fn base(&self) -> *mut core::ffi::c_void {
-        self.base
-    }
-
-    #[inline]
-    pub fn directory_vector(&self) -> *mut DirectoryEntry {
-        self.directory_vector
-    }
-
-    #[inline]
-    pub(crate) fn set_directory_vector(&mut self, value: *mut DirectoryEntry) {
-        self.directory_vector = value;
-    }
-
-    #[inline]
-    pub(crate) fn set_in_progress(&mut self, writing: bool) {
-        self.in_progress = u64::from(writing);
-    }
-
-    #[inline]
-    pub(crate) fn set_epoch(&mut self, value: u64) {
-        self.epoch = value;
-    }
 }
 
 #[repr(C)]
@@ -1065,16 +763,6 @@ pub struct Counter {
     pub bytes: u64,
 }
 
-impl Counter {
-    #[inline]
-    pub(crate) fn wrapping_add(self, other: Self) -> Self {
-        Self {
-            packets: self.packets.wrapping_add(other.packets),
-            bytes: self.bytes.wrapping_add(other.bytes),
-        }
-    }
-}
-
 #[cfg(target_pointer_width = "64")]
 const _: () = {
     use core::mem::{align_of, offset_of, size_of};
@@ -1082,9 +770,13 @@ const _: () = {
     assert!(size_of::<DirectoryData>() == 8);
     assert!(align_of::<DirectoryData>() == 8);
     assert!(size_of::<DirectoryEntry>() == 144);
+    assert!(align_of::<DirectoryEntry>() == 8);
     assert!(offset_of!(DirectoryEntry, directory_type) == 0);
     assert!(offset_of!(DirectoryEntry, data) == 8);
     assert!(offset_of!(DirectoryEntry, name) == 16);
+    assert!(size_of::<NameBytes>() == 128);
+    assert!(size_of::<SharedHeader>() == 40);
+    assert!(align_of::<SharedHeader>() == 8);
     assert!(offset_of!(SharedHeader, version) == 0);
     assert!(offset_of!(SharedHeader, base) == 8);
     assert!(offset_of!(SharedHeader, epoch) == 16);
@@ -1097,8 +789,17 @@ const _: () = {
     assert!(align_of::<RingConfig>() == 1);
     assert!(size_of::<RingBufferHeader>() == 28);
     assert!(align_of::<RingBufferHeader>() == 1);
+    assert!(offset_of!(RingBufferHeader, config) == 0);
+    assert!(offset_of!(RingBufferHeader, metadata_offset) == 20);
+    assert!(offset_of!(RingBufferHeader, data_offset) == 24);
     assert!(size_of::<RingMetadata>() == 64);
     assert!(align_of::<RingMetadata>() == 64);
+    assert!(size_of::<hammer_infra::align::CacheLineAlignMark>() == 0);
+    assert!(align_of::<hammer_infra::align::CacheLineAlignMark>() == 64);
+    assert!(offset_of!(RingMetadata, head) == 0);
+    assert!(offset_of!(RingMetadata, sequence) == 8);
+    assert!(offset_of!(RingMetadata, schema_offset) == 16);
     assert!(size_of::<[u8; 8]>() == 8);
     assert!(VEC_MIN_ALIGN == 8);
+    assert!(VEC_MIN_ALIGN == hammer_infra::align::VEC_MIN_ALIGN);
 };

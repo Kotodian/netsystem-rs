@@ -34,8 +34,10 @@ tokio = { workspace = true, features = ["signal"] }
 tracing = { workspace = true }
 ipnet = { workspace = true }
 serde = { workspace = true }
+byte-unit = { workspace = true }
 humantime-serde = { workspace = true }
 libc = { workspace = true }
+socket2 = { workspace = true, features = ["all"] }
 libloading = { workspace = true }
 object = { workspace = true }
 rand = { version = "0.9", default-features = false, features = ["small_rng"] }

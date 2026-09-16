@@ -671,6 +671,7 @@ impl PmallocMain {
             page_size,
             backing.as_ref().map(AsFd::as_fd),
             0,
+            false,
         ) {
             if MemMain::set_default_numa_affinity().is_err() {
                 std::process::abort();
