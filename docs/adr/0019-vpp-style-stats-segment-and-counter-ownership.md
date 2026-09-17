@@ -237,6 +237,10 @@ VPP `/sys/loops_per_worker`，布局却是单行、线程作为列。不能把�
 worker 可见地址的安装与借用结束点仍须给出真实调用链，不能推导任意 worker 访问权。
 复用既有 owner Vec/slice/Pool，不新增观察 wrapper、指针缓存 carrier、通用 TLS
 容器或另一个原子发布句柄。当前 `&self + 任意 row` 更新接口不能作为最终替代。
+**（ADR-0024 修订）**本节禁止的仍是"控制面任意 row getter + 缓存行地址"；node error
+家族的记录路径不新增任何 row getter：调用方只持有条目索引，行解析与单元格写入留在
+机制层的既有句柄纪律内（`increment_simple_counter`），行号就是写者自己的
+`thread_index`。
 
 VPP 的 stats 结构锁与 WorkerBarrier 面向不同参与者。StatsMain 的 SpinLock
 直接保护 StatsSegment 实际状态；持锁后的嵌套调用传递 &mut StatsSegment，不再

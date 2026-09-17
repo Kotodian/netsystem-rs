@@ -1,5 +1,5 @@
-use petgraph::algo::toposort;
-use petgraph::graphmap::DiGraphMap;
+use std::cmp::Reverse;
+use std::collections::{BinaryHeap, HashMap, HashSet};
 use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
 
 use crate::data_plane::DataPlaneMain;
@@ -133,54 +133,75 @@ impl<T: Ordered + ?Sized> Ordered for &T {
     }
 }
 
+/// Orders lifecycle registrations with VPP's `vlib_sort_init_exit_functions`
+/// semantics (`vlib/init.c:63-199`): repeatedly take the first registered item
+/// whose `runs_after` predecessors already ran, so items without a constraint
+/// between them keep registration order — runtime image, then host images, then
+/// plugins in load order.
 pub fn topological_order<T: Ordered>(items: &[T]) -> Result<Vec<usize>, InitError> {
-    let mut graph = DiGraphMap::<&str, ()>::new();
-    for item in items {
-        graph.add_node(item.name());
-    }
-    if graph.node_count() < items.len() {
-        let mut seen = Vec::with_capacity(items.len());
-        for item in items {
-            if seen.contains(&item.name()) {
-                return Err(InitError::DuplicateName(item.name()));
-            }
-            seen.push(item.name());
+    let mut index_by_name = HashMap::with_capacity(items.len());
+    for (index, item) in items.iter().enumerate() {
+        if index_by_name.insert(item.name(), index).is_some() {
+            return Err(InitError::DuplicateName(item.name()));
         }
-        unreachable!("node_count < items.len() implies a duplicate but scan found none");
     }
 
-    for item in items {
-        let n = item.name();
-        for dep in item.runs_after() {
-            if !graph.contains_node(*dep) {
-                return Err(InitError::UnresolvedDependency { name: n, dep });
-            }
-            graph.add_edge(*dep, n, ());
-        }
-        for before in item.runs_before() {
-            if !graph.contains_node(*before) {
+    let mut successors = vec![Vec::new(); items.len()];
+    let mut predecessor_count = vec![0usize; items.len()];
+    let mut constraints = HashSet::new();
+    for (index, item) in items.iter().enumerate() {
+        for dependency in item.runs_after() {
+            let Some(predecessor) = index_by_name.get(dependency) else {
                 return Err(InitError::UnresolvedDependency {
-                    name: n,
-                    dep: *before,
+                    name: item.name(),
+                    dep: dependency,
                 });
+            };
+            if constraints.insert((*predecessor, index)) {
+                successors[*predecessor].push(index);
+                predecessor_count[index] += 1;
             }
-            graph.add_edge(n, *before, ());
+        }
+        for successor in item.runs_before() {
+            let Some(successor) = index_by_name.get(successor) else {
+                return Err(InitError::UnresolvedDependency {
+                    name: item.name(),
+                    dep: successor,
+                });
+            };
+            if constraints.insert((index, *successor)) {
+                successors[index].push(*successor);
+                predecessor_count[*successor] += 1;
+            }
         }
     }
 
-    let ordered = toposort(&graph, None).map_err(|cycle| InitError::Cycle {
-        cycle: cycle.node_id().to_string(),
-    })?;
-
-    let mut result = Vec::with_capacity(items.len());
-    for name in ordered {
-        let idx = items
-            .iter()
-            .position(|t| t.name() == name)
-            .expect("toposort node must be in items");
-        result.push(idx);
+    let mut ready: BinaryHeap<Reverse<usize>> = predecessor_count
+        .iter()
+        .enumerate()
+        .filter(|(_, count)| **count == 0)
+        .map(|(index, _)| Reverse(index))
+        .collect();
+    let mut order = Vec::with_capacity(items.len());
+    while let Some(Reverse(index)) = ready.pop() {
+        order.push(index);
+        for &successor in &successors[index] {
+            predecessor_count[successor] -= 1;
+            if predecessor_count[successor] == 0 {
+                ready.push(Reverse(successor));
+            }
+        }
     }
-    Ok(result)
+
+    if order.len() != items.len() {
+        let blocked = (0..items.len())
+            .find(|index| predecessor_count[*index] != 0)
+            .expect("an incomplete order leaves a blocked registration");
+        return Err(InitError::Cycle {
+            cycle: items[blocked].name().to_string(),
+        });
+    }
+    Ok(order)
 }
 
 fn dispatch_init(

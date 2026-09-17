@@ -3503,18 +3503,14 @@ pub fn early_config_function(args: TokenStream, input: TokenStream) -> TokenStre
 /// #[main_loop_enter_function]
 /// fn enter(main: &mut DataPlaneMain) -> RuntimeResult<()> { ... }
 /// ```
+///
+/// Like [`init_function`], the registration may name the function and constrain
+/// it against other functions of the same phase, for example
+/// `runs_before = ["start_workers"]`.
 #[proc_macro_attribute]
 pub fn main_loop_enter_function(args: TokenStream, input: TokenStream) -> TokenStream {
-    if !args.is_empty() {
-        return Error::new(
-            Span::call_site(),
-            "main_loop_enter_function takes no arguments",
-        )
-        .to_compile_error()
-        .into();
-    }
     let fn_item = parse_macro_input!(input as syn::ItemFn);
-    expand_main_loop_function(fn_item)
+    expand_main_loop_function(args, fn_item)
         .unwrap_or_else(Error::into_compile_error)
         .into()
 }
@@ -3522,16 +3518,8 @@ pub fn main_loop_enter_function(args: TokenStream, input: TokenStream) -> TokenS
 /// Registers a function to run at main-loop-exit time.
 #[proc_macro_attribute]
 pub fn main_loop_exit_function(args: TokenStream, input: TokenStream) -> TokenStream {
-    if !args.is_empty() {
-        return Error::new(
-            Span::call_site(),
-            "main_loop_exit_function takes no arguments",
-        )
-        .to_compile_error()
-        .into();
-    }
     let fn_item = parse_macro_input!(input as syn::ItemFn);
-    expand_main_loop_function(fn_item)
+    expand_main_loop_function(args, fn_item)
         .unwrap_or_else(Error::into_compile_error)
         .into()
 }
@@ -3659,16 +3647,17 @@ fn is_stats_main_reference(ty: &Type) -> bool {
     reference.mutability.is_some() && type_path_ends_with(&reference.elem, "StatsMain")
 }
 
-fn expand_main_loop_function(function: ItemFn) -> Result<TokenStream2> {
-    let name = LitStr::new(&function.sig.ident.to_string(), function.sig.ident.span());
-    expand_registered_function(
+fn expand_main_loop_function(args: TokenStream, function: ItemFn) -> Result<TokenStream2> {
+    let args = if args.is_empty() {
         InitFnArgs {
-            name,
+            name: LitStr::new(&function.sig.ident.to_string(), function.sig.ident.span()),
             runs_before: Vec::new(),
             runs_after: Vec::new(),
-        },
-        function,
-    )
+        }
+    } else {
+        syn::parse::<InitFnArgs>(args)?
+    };
+    expand_registered_function(args, function)
 }
 
 /// Registers a per-worker init function in the topologically-sorted worker init chain.

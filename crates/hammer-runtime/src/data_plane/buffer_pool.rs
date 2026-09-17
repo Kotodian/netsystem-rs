@@ -120,6 +120,7 @@ impl DataPlaneMain {
             thread_index: config.thread_index,
             nodes: NodeMain::default(),
             current_node: Cell::new(None),
+            node_error_stats_entry_index: Cell::new(None),
             handoff: None,
             trace: DataPlaneTrace::default(),
             simd_bytes,

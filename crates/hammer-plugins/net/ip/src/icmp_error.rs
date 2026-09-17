@@ -122,9 +122,7 @@ fn register_ip4_icmp_error(runtime: &DataPlaneMain) -> RuntimeResult<NodeId> {
         Ip4IcmpErrorNode::new(),
         &Ip4IcmpErrorNext::NEXT_NAMES,
     )?;
-    runtime
-        .nodes()
-        .materialize_node_errors(node, &IcmpError::DESCRIPTORS)?;
+    runtime.register_node_errors(node, &IcmpError::DESCRIPTORS)?;
     Ok(node)
 }
 
@@ -133,9 +131,7 @@ fn register_ip6_icmp_error(runtime: &DataPlaneMain) -> RuntimeResult<NodeId> {
         Ip6IcmpErrorNode::new(),
         &Ip6IcmpErrorNext::NEXT_NAMES,
     )?;
-    runtime
-        .nodes()
-        .materialize_node_errors(node, &IcmpError::DESCRIPTORS)?;
+    runtime.register_node_errors(node, &IcmpError::DESCRIPTORS)?;
     Ok(node)
 }
 

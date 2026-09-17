@@ -13,9 +13,12 @@ use hammer_core::error::DataPlaneError;
 use hammer_infra::PageSize;
 use hammer_infra::align::{CACHE_LINE, CacheLineAlignMark};
 use hammer_infra::bitmap::Bitmap;
+use hammer_stats::DirectoryIndex;
 
 use crate::handoff::{DataPlaneHandoffWorker, DataWorkerId, HANDOFF_SLOT_CAPACITY, HandoffSlot};
-use crate::node::{NodeEntry, NodeErrorCode, NodeFunctionRegistration, NodeMain, NodeRuntime};
+use crate::node::{
+    NodeEntry, NodeErrorCode, NodeErrorDescriptor, NodeFunctionRegistration, NodeMain, NodeRuntime,
+};
 use crate::runtime_simd::{native_simd_bytes, preferred_frame_batch_width};
 use crate::trace::{DataPlaneTrace, PacketTrace, TraceControlHandle};
 
@@ -36,6 +39,13 @@ pub struct DataPlaneMain {
     thread_index: u32,
     pub(crate) nodes: NodeMain,
     current_node: Cell<Option<NodeId>>,
+    /// The `/node/errors` directory entry this thread records into (VPP's
+    /// `error_main.stats_err_entry_index`). The row is this thread's
+    /// `thread_index`, so the entry is the only per-thread fact; `None` means
+    /// this process published no error columns and the record path counts
+    /// nothing. Installed once at the freeze point, like VPP's per-thread
+    /// `error_main.counters` refresh (`third_party/vpp/src/vlib/threads.c:766-778`).
+    pub(crate) node_error_stats_entry_index: Cell<Option<DirectoryIndex>>,
     handoff: Option<DataPlaneHandoffWorker>,
     active_numa_node: u32,
     trace: DataPlaneTrace,
@@ -73,6 +83,15 @@ impl DataPlaneMain {
     #[inline]
     pub fn random(&mut self) -> &mut SmallRng {
         &mut self.random
+    }
+
+    /// Installs this thread's `/node/errors` entry.
+    ///
+    /// Called once at the freeze point, before any Worker runs: thread zero's
+    /// runtime and each Worker runtime get the entry the registration path
+    /// published, or `None` when no node declared errors.
+    pub(crate) fn install_node_error_stats_entry(&self, entry: Option<DirectoryIndex>) {
+        self.node_error_stats_entry_index.set(entry);
     }
 }
 

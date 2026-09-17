@@ -1,4 +1,5 @@
 use super::*;
+use hammer_stats::StatsMain;
 
 impl DataPlaneMain {
     pub fn set_trace_control(&mut self, control: Option<TraceControlHandle>) {
@@ -89,7 +90,16 @@ impl DataPlaneMain {
         let node = self
             .current_node()
             .ok_or(RuntimeError::NodeDispatchContextMissing)?;
-        self.nodes.record_node_error(node, error.local_code())
+        let index = self.nodes.node_error_index(node, error.local_code())?;
+        if let Some(entry) = self.node_error_stats_entry_index.get() {
+            StatsMain::global()?.segment.increment_simple_counter(
+                entry,
+                self.thread_index(),
+                u32::from(index.get()),
+                1,
+            );
+        }
+        Ok(index)
     }
 
     #[inline]

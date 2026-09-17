@@ -41,6 +41,12 @@ fn start_workers(main: &mut DataPlaneMain) -> RuntimeResult<()> {
             .row(0)
             .expect("thread zero owns a counter row"),
     );
+    // Every Worker runtime receives its per-thread error fact at this freeze
+    // point, like VPP's worker clone refresh
+    // (`third_party/vpp/src/vlib/threads.c:766-778`): the entry thread zero's
+    // registration path published, or `None` when no node declared errors. The
+    // record row is the thread index, so the entry is the whole per-thread fact.
+    let node_error_stats_entry = main.node_error_stats_entry_index.get();
     let mut worker_mains = Vec::with_capacity(worker_count as usize);
     for worker_slot in 0..worker_count {
         let thread_index = worker_slot + 1;
@@ -53,14 +59,16 @@ fn start_workers(main: &mut DataPlaneMain) -> RuntimeResult<()> {
                 .row(thread_index)
                 .expect("every Data Worker owns a counter row"),
         );
-        worker_mains.push(Box::new(DataPlaneMain::new_worker(
+        let worker_main = DataPlaneMain::new_worker(
             nodes,
             simd_bytes,
             Some(handoff.worker(DataWorkerId::new(worker_slot))),
             trace_control,
             thread_index,
             descriptor.numa_node().unwrap_or(0),
-        )?));
+        )?;
+        worker_main.install_node_error_stats_entry(node_error_stats_entry);
+        worker_mains.push(Box::new(worker_main));
     }
 
     let barrier = barrier::install(worker_count, participant_count);

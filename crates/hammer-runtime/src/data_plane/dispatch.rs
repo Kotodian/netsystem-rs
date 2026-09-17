@@ -1,4 +1,10 @@
 use super::*;
+use crate::thread_main::ThreadMain;
+use hammer_stats::{DirectoryType, StatsError, StatsMain};
+
+/// The counter vector every registered node error column is published through
+/// (VPP `vlib_stats_add_counter_vector ("/node/errors")`, `error.c:158-159`).
+const NODE_ERROR_COUNTERS_NAME: &str = "/node/errors";
 
 impl DataPlaneMain {
     pub fn init_graph(&self, entries: &[NodeEntry]) -> RuntimeResult<()> {
@@ -45,7 +51,7 @@ impl DataPlaneMain {
         }
         self.nodes.validate_node_error_batch(&nodes)?;
         for ((node, error_counters), process) in nodes.into_iter().zip(processes) {
-            self.nodes.materialize_node_errors(node, error_counters)?;
+            self.register_node_errors(node, error_counters)?;
             self.nodes.install_node_function(
                 node,
                 self.simd_bytes,
@@ -84,7 +90,7 @@ impl DataPlaneMain {
         }
         self.nodes.validate_node_error_batch(&nodes)?;
         for ((node, error_counters), process) in nodes.into_iter().zip(processes) {
-            self.nodes.materialize_node_errors(node, error_counters)?;
+            self.register_node_errors(node, error_counters)?;
             self.nodes.install_node_function(
                 node,
                 self.simd_bytes,
@@ -93,6 +99,87 @@ impl DataPlaneMain {
             )?;
         }
         self.nodes.resolve_named_next_nodes()?;
+        Ok(())
+    }
+
+    /// Register a node's ordered error descriptors and publish them in the
+    /// stats segment.
+    ///
+    /// VPP analogue: `vlib_register_errors`
+    /// (`third_party/vpp/src/vlib/error.c:113-200`) — thread zero reserves the
+    /// node's contiguous column range, lazily adds the `/node/errors` counter
+    /// vector on the first node that declares errors, publishes the shape for
+    /// one row per runtime thread, and aliases every error as
+    /// `/err/<node>/<error>`.
+    ///
+    /// Registration is a startup/plugin-load step: it must complete before the
+    /// freeze point (`crate::start_workers`) installs the per-thread entries,
+    /// because `validate` may grow the row vectors and must not race a record.
+    pub fn register_node_errors(
+        &self,
+        node: NodeId,
+        descriptors: &[NodeErrorDescriptor],
+    ) -> RuntimeResult<()> {
+        self.nodes.register_node_errors(node, descriptors)?;
+        if descriptors.is_empty() {
+            return Ok(());
+        }
+        let name = self
+            .nodes
+            .node_name(node)?
+            .expect("a node that declares errors is named");
+        assert!(
+            !name.contains('/'),
+            "a node error alias path segment must not contain '/': {name}"
+        );
+
+        let stats_main = match StatsMain::global() {
+            Ok(stats_main) => stats_main,
+            // A runtime built outside the daemon lifecycle (unit tests, benches)
+            // has no segment to publish into. The node domain still owns the
+            // column range, and the record path counts nothing because no entry
+            // was installed — the same absence as a process whose nodes declare
+            // no errors.
+            Err(StatsError::NotInitialized) => return Ok(()),
+            Err(source) => return Err(RuntimeError::Stats(source)),
+        };
+        let segment = &stats_main.segment;
+        let entry = match self.node_error_stats_entry_index.get() {
+            Some(entry) => entry,
+            None => {
+                let entry = match segment
+                    .find(NODE_ERROR_COUNTERS_NAME, DirectoryType::CounterVectorSimple)
+                {
+                    Ok(entry) => entry,
+                    Err(StatsError::MetricNotFound { .. }) => {
+                        segment.add_simple_counter(NODE_ERROR_COUNTERS_NAME)?.index
+                    }
+                    Err(source) => return Err(RuntimeError::Stats(source)),
+                };
+                self.node_error_stats_entry_index.set(Some(entry));
+                entry
+            }
+        };
+
+        // One row per runtime thread that owns a node graph: thread zero plus
+        // the Data Workers, exactly like every other per-thread vector.
+        let rows = ThreadMain::global().worker_count() + 1;
+        let columns = self.nodes.node_error_columns();
+        segment.validate(entry, rows - 1, columns - 1)?;
+
+        for (local_code, descriptor) in descriptors.iter().enumerate() {
+            let local_code = u16::try_from(local_code)
+                .expect("a registered node error code fits its u16 local space");
+            let index = self.nodes.node_error_index(node, local_code)?;
+            let path = format!("/err/{name}/{}", descriptor.name);
+            match segment.find(&path, DirectoryType::Symlink) {
+                Ok(_) => {}
+                Err(StatsError::MetricNotFound { .. }) => {
+                    segment.add_symlink(entry, u32::from(index.get()), &path)?;
+                }
+                Err(source) => return Err(RuntimeError::Stats(source)),
+            }
+        }
         Ok(())
     }
 

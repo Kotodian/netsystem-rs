@@ -5,6 +5,7 @@ pub mod bitmap;
 pub mod bytes;
 pub mod checksum;
 pub mod fifo_queue;
+pub mod heap;
 pub mod heap_boxed;
 pub mod hint;
 pub mod linked_list;
