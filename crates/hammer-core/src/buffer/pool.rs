@@ -13,7 +13,7 @@ impl BufferMain {
     ) -> Box<[RefMut<'_, BufferThreadCache>]> {
         self.pools
             .iter()
-            .map(|pool| pool.workers[thread_index as usize].borrow_mut())
+            .map(|pool| pool.workers[thread_index as usize].cache.borrow_mut())
             .collect()
     }
 
@@ -82,7 +82,10 @@ impl BufferMain {
         numa_node: u32,
     ) -> usize {
         self.validate_caches(caches);
-        caches[usize::from(self.default_pool(numa_node))].len
+        let pool = &self.pools[usize::from(self.default_pool(numa_node))];
+        let slot = &pool.workers[caches[usize::from(pool.index)].thread_index as usize];
+        usize::try_from(slot.cached_count.load(std::sync::atomic::Ordering::Relaxed))
+            .expect("a cached count fits usize")
     }
 
     /// Borrow a live Buffer for no longer than the Worker's cache borrow.
@@ -268,20 +271,28 @@ impl BufferPool {
             cache.pool_index, self.index,
             "allocation uses this Pool's cache"
         );
+        // VPP `bpt->n_cached` (`buffer_funcs.h:583-614`): the owning thread holds
+        // the length in a local for this operation and publishes it on the way
+        // out; the Pool-owned slot is the half the stats round reads.
+        let cached_count = &self.workers[cache.thread_index as usize].cached_count;
+        // The published field is VPP's `u32 n_cached`; the local is the index
+        // length the cache itself uses, so it is widened once on the way in.
+        let mut cached = usize::try_from(cached_count.load(std::sync::atomic::Ordering::Relaxed))
+            .expect("a cached count fits usize");
         for (allocated, destination) in indices.iter_mut().enumerate() {
-            if cache.len == 0 {
+            if cached == 0 {
                 let mut free = self.free.lock();
                 let count = free.len().min(BUFFER_THREAD_CACHE_BATCH);
                 let start = free.len() - count;
                 cache.indices[..count].copy_from_slice(&free[start..]);
                 free.truncate(start);
-                cache.len = count;
+                cached = count;
             }
-            if cache.len == 0 {
+            if cached == 0 {
                 return allocated;
             }
-            cache.len -= 1;
-            let index = cache.indices[cache.len];
+            cached -= 1;
+            let index = cache.indices[cached];
             #[cfg(debug_assertions)]
             assert!(
                 self.known_allocated.lock().insert(index),
@@ -292,6 +303,10 @@ impl BufferPool {
             unsafe { self.buffer_mut(index) }.cacheline0 = self.template.clone();
             *destination = index;
         }
+        cached_count.store(
+            u32::try_from(cached).expect("a cache length fits u32"),
+            std::sync::atomic::Ordering::Relaxed,
+        );
         indices.len()
     }
 }
@@ -339,16 +354,25 @@ impl BufferMain {
                             pool.known_allocated.lock().remove(&index),
                             "Buffer {index} is released once"
                         );
-                        if cache.len == BUFFER_THREAD_CACHE_HIGH_WATER {
-                            let start = cache.len - BUFFER_THREAD_CACHE_BATCH;
+                        // VPP `bpt->n_cached` (`buffer_funcs.h:739-757`): the two
+                        // cache writes move together with the published length.
+                        let cached_count = &pool.workers[cache.thread_index as usize].cached_count;
+                        let mut cached = usize::try_from(
+                            cached_count.load(std::sync::atomic::Ordering::Relaxed),
+                        )
+                        .expect("a cached count fits usize");
+                        if cached == BUFFER_THREAD_CACHE_HIGH_WATER {
+                            let start = cached - BUFFER_THREAD_CACHE_BATCH;
                             pool.free
                                 .lock()
-                                .extend_from_slice(&cache.indices[start..cache.len]);
-                            cache.len = start;
+                                .extend_from_slice(&cache.indices[start..cached]);
+                            cached = start;
                         }
-                        let offset = cache.len;
-                        cache.indices[offset] = index;
-                        cache.len += 1;
+                        cache.indices[cached] = index;
+                        cached_count.store(
+                            u32::try_from(cached + 1).expect("a cache length fits u32"),
+                            std::sync::atomic::Ordering::Relaxed,
+                        );
                         trace
                     }
                 };

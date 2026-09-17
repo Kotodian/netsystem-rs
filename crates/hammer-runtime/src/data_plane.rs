@@ -7,4 +7,6 @@
 #[path = "data_plane/main.rs"]
 mod main;
 
+pub(crate) mod buffer_stats;
+
 pub use main::{DataPlaneBufferConfig, DataPlaneMain};

@@ -12,7 +12,7 @@ mod pool;
 pub use crate::graph::frame::{Frame, FrameBatchWidth};
 pub use cursor::BufferPacketCursor;
 pub use flags::BufferFlags;
-pub use main::{BufferMain, BufferThreadCache};
+pub use main::{BufferMain, BufferPoolUsage, BufferThreadCache};
 pub use opaque::{BufferOpaque, BufferOpaqueRegion, PRIMARY_OPAQUE_ALIGN, PRIMARY_OPAQUE_BYTES};
 use opaque::{PrimaryOpaque, SecondaryOpaque};
 

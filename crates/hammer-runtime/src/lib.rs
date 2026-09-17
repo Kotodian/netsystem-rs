@@ -39,6 +39,7 @@ crate::__declare_registration_image!(
         config::stats::__STATS_COLLECT_REGISTRATION_REGISTER_MAIN_HEAP,
         config::stats::__STATS_COLLECT_REGISTRATION_REGISTER_STAT_SEGMENT_HEAP,
         config::stats::__STATS_COLLECT_REGISTRATION_REGISTER_WORKER_MAIN_LOOP,
+        data_plane::buffer_stats::__STATS_COLLECT_REGISTRATION_REGISTER_BUFFER_POOLS,
     ];
 );
 

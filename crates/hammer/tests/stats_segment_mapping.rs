@@ -26,6 +26,11 @@ const SAMPLE_INTERVAL: Duration = Duration::from_millis(300);
 /// in the daemon, which these stats checks do not need.
 const WORKER_COUNT: usize = 1;
 
+/// Buffer Pool slots per NUMA node for this fixture (`worker.buffer.slots_per_numa`).
+/// Each Pool publishes its three gauges over this many buffers, rounded up to
+/// whole pages when the Pool mapping is established.
+const POOL_SLOTS: u64 = 4_096;
+
 /// The segment publishes version 2 (`STAT_SEGMENT_VERSION`).
 const SEGMENT_VERSION: u64 = 2;
 const HEADER_BYTES: usize = 40;
@@ -423,6 +428,14 @@ struct HammerDaemon {
 
 impl HammerDaemon {
     fn start() -> Self {
+        let worker_config = format!(
+            "[worker]\ncount = {WORKER_COUNT}\n\n[worker.buffer]\nslots_per_numa = {POOL_SLOTS}\n"
+        );
+        Self::start_with_worker_config(&worker_config)
+    }
+
+    /// Starts a daemon whose `[worker]` section is exactly `worker_config`.
+    fn start_with_worker_config(worker_config: &str) -> Self {
         let unique = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .expect("system clock is after the Unix epoch")
@@ -440,7 +453,7 @@ impl HammerDaemon {
         fs::write(
             &config_path,
             format!(
-                "plugins = []\n\n[memory]\nmain_heap_size = \"256 MiB\"\n\n[worker]\ncount = {WORKER_COUNT}\n\n[statseg]\nsocket_name = \"{}\"\nupdate_interval = \"50ms\"\n\n[api-segment]\nprefix = \"{prefix}\"\n",
+                "plugins = []\n\n[memory]\nmain_heap_size = \"256 MiB\"\n\n{worker_config}\n[statseg]\nsocket_name = \"{}\"\nupdate_interval = \"50ms\"\n\n[api-segment]\nprefix = \"{prefix}\"\n",
                 stats_socket.display()
             ),
         )
@@ -576,6 +589,17 @@ fn worker_columns(fixture: &Fixture<'_>, name: &str) -> Vec<u64> {
     }
 }
 
+/// The three gauges of one Buffer Pool, in VPP's registration order
+/// (`cached`, `used`, `available`; `third_party/vpp/src/vlib/buffer.c:943-955`).
+fn pool_columns(fixture: &Fixture<'_>, pool: &str) -> [u64; 3] {
+    ["cached", "used", "available"].map(|gauge| {
+        match fixture.read(&format!("/buffer-pools/{pool}/{gauge}")) {
+            Some(Value::Gauge(value)) => value,
+            other => panic!("`/buffer-pools/{pool}/{gauge}` is a gauge, got {other:?}"),
+        }
+    })
+}
+
 fn heartbeat(fixture: &Fixture<'_>) -> u64 {
     match fixture.read("/sys/heartbeat") {
         Some(Value::Scalar(value)) => value,
@@ -615,6 +639,35 @@ fn stats_segment_publishes_mem_and_system_values() {
             "`{expected}` is published: {names:?}"
         );
     }
+
+    // `/buffer-pools/<pool>/{cached,used,available}`: VPP registers three gauges
+    // per Buffer Pool (`third_party/vpp/src/vlib/buffer.c:937-956`); one Pool is
+    // established per NUMA node the Data Workers run on.
+    let mut pools: Vec<&str> = names
+        .iter()
+        .filter_map(|name| {
+            let (pool, gauge) = name.strip_prefix("/buffer-pools/")?.split_once('/')?;
+            matches!(gauge, "cached" | "used" | "available").then_some(pool)
+        })
+        .collect();
+    pools.sort_unstable();
+    pools.dedup();
+    assert_eq!(pools.len(), 1, "one Pool per Worker NUMA node: {names:?}");
+    let pool = pools[0];
+    assert!(
+        pool.starts_with("default-numa-"),
+        "a Pool is named after its NUMA node: {pool}"
+    );
+    let pool_buffers = pool_columns(&fixture, pool);
+    assert!(
+        pool_buffers[2] > 0,
+        "`{pool}` keeps buffers on its free list: {pool_buffers:?}"
+    );
+    let pool_total: u64 = pool_buffers.iter().sum();
+    assert!(
+        (POOL_SLOTS / 2..=POOL_SLOTS * 2).contains(&pool_total),
+        "`{pool}` holds the configured slots, rounded up to whole pages: {pool_total} vs {POOL_SLOTS}"
+    );
 
     for heap in [
         "main heap",
@@ -681,16 +734,25 @@ fn stats_segment_publishes_mem_and_system_values() {
         worker_columns(&fixture, "/sys/main_loop_count_per_worker"),
         worker_columns(&fixture, "/sys/loops_per_worker"),
         heartbeat(&fixture),
+        pool_columns(&fixture, pool),
     );
     std::thread::sleep(SAMPLE_INTERVAL);
     let second = (
         worker_columns(&fixture, "/sys/main_loop_count_per_worker"),
         worker_columns(&fixture, "/sys/loops_per_worker"),
         heartbeat(&fixture),
+        pool_columns(&fixture, pool),
     );
 
     assert_eq!(first.0.len(), WORKER_COUNT);
     assert_eq!(first.1.len(), WORKER_COUNT);
+    assert_eq!(
+        second.3.iter().sum::<u64>(),
+        pool_total,
+        "`{pool}` keeps its buffer count across collect rounds: {:?} then {:?}",
+        first.3,
+        second.3
+    );
     assert!(
         second.2 > first.2,
         "the collect round advances the heartbeat: {} -> {}",
@@ -744,6 +806,239 @@ fn stats_segment_publishes_mem_and_system_values() {
         truncated_fixture.read("/mem/main heap").is_none(),
         "a truncated mapping yields no value"
     );
+
+    drop(fixture);
+    drop(mapping);
+    let status = daemon.shutdown();
+    assert!(
+        status.success(),
+        "{}",
+        daemon.diagnostics(format!("daemon exits unsuccessfully: {status:?}"))
+    );
+}
+
+/// One `/memfd:buffers` mapping of a running daemon, as the kernel reports it.
+#[derive(Debug)]
+struct BufferMapping {
+    huge_pages: bool,
+    pages_per_node: Vec<(u32, u64)>,
+}
+
+/// The daemon's buffer mappings from `/proc/<pid>/numa_maps`.
+fn buffer_mappings(pid: u32) -> Vec<BufferMapping> {
+    let maps = fs::read_to_string(format!("/proc/{pid}/numa_maps"))
+        .expect("the daemon publishes its NUMA maps");
+    maps.lines()
+        .filter(|line| line.contains("memfd:buffers"))
+        .map(|line| {
+            let mut mapping = BufferMapping {
+                huge_pages: false,
+                pages_per_node: Vec::new(),
+            };
+            for token in line.split_whitespace() {
+                if token == "huge" {
+                    mapping.huge_pages = true;
+                } else if let Some(rest) = token.strip_prefix('N')
+                    && let Some((node, pages)) = rest.split_once('=')
+                    && let (Ok(node), Ok(pages)) = (node.parse(), pages.parse())
+                {
+                    mapping.pages_per_node.push((node, pages));
+                }
+            }
+            mapping
+        })
+        .collect()
+}
+
+/// The CPUs this process may run on.
+fn allowed_cpus() -> Vec<usize> {
+    // SAFETY: `sched_getaffinity` writes into the live cpu set.
+    let mut set: libc::cpu_set_t = unsafe { std::mem::zeroed() };
+    // SAFETY: `set` is a live cpu set of the size the syscall expects.
+    let result = unsafe { libc::sched_getaffinity(0, size_of::<libc::cpu_set_t>(), &mut set) };
+    assert_eq!(
+        result,
+        0,
+        "sched_getaffinity: {}",
+        io::Error::last_os_error()
+    );
+    (0..libc::CPU_SETSIZE as usize)
+        // SAFETY: the syscall filled the whole set.
+        .filter(|cpu| unsafe { libc::CPU_ISSET(*cpu, &set) })
+        .collect()
+}
+
+/// The CPUs of one NUMA node, from its `cpulist` (`0-9,20-29`).
+fn node_cpus(node: u32) -> Vec<usize> {
+    let path = format!("/sys/devices/system/node/node{node}/cpulist");
+    let text = fs::read_to_string(path).unwrap_or_default();
+    text.trim()
+        .split(',')
+        .filter(|range| !range.is_empty())
+        .flat_map(|range| match range.split_once('-') {
+            Some((first, last)) => {
+                let first: usize = first.parse().expect("cpulist range start");
+                let last: usize = last.parse().expect("cpulist range end");
+                (first..=last).collect::<Vec<_>>()
+            }
+            None => vec![range.parse().expect("cpulist entry")],
+        })
+        .collect()
+}
+
+/// The NUMA node one CPU belongs to, when this host reports node topology.
+fn numa_node_of_cpu(cpu: usize) -> Option<u32> {
+    let mut nodes: Vec<u32> = fs::read_dir("/sys/devices/system/node")
+        .ok()?
+        .filter_map(|entry| {
+            let name = entry.ok()?.file_name().into_string().ok()?;
+            name.strip_prefix("node")?.parse().ok()
+        })
+        .collect();
+    nodes.sort_unstable();
+    nodes
+        .into_iter()
+        .find(|node| node_cpus(*node).contains(&cpu))
+}
+
+/// One allowed CPU on each of the two lowest NUMA nodes that have one.
+fn two_numa_nodes_with_allowed_cpus() -> Option<[(u32, usize); 2]> {
+    let mut per_node: Vec<(u32, usize)> = Vec::new();
+    for cpu in allowed_cpus() {
+        let Some(node) = numa_node_of_cpu(cpu) else {
+            continue;
+        };
+        if per_node.iter().any(|(known, _)| *known == node) {
+            continue;
+        }
+        per_node.push((node, cpu));
+        if per_node.len() == 2 {
+            break;
+        }
+    }
+    match per_node[..] {
+        [first, second] => Some([first, second]),
+        _ => None,
+    }
+}
+
+/// Free HugeTLB pages of one size, or zero when the host has no such pool.
+fn free_huge_pages(page_bytes: usize) -> u64 {
+    let path = format!(
+        "/sys/kernel/mm/hugepages/hugepages-{}kB/free_hugepages",
+        page_bytes >> 10
+    );
+    fs::read_to_string(path)
+        .ok()
+        .and_then(|text| text.trim().parse().ok())
+        .unwrap_or(0)
+}
+
+/// Buffer Pools follow the NUMA nodes their Data Workers run on, are backed by
+/// the configured HugeTLB pages, and publish three consistent gauges each.
+///
+/// The host must expose two NUMA nodes with allowed CPUs and free 2 MiB HugeTLB
+/// pages; run with
+/// `cargo test -p hammer --test stats_segment_mapping -- --ignored`.
+#[test]
+#[ignore = "requires two NUMA nodes with allowed CPUs and free 2 MiB HugeTLB pages"]
+fn buffer_pools_follow_worker_numa_nodes_on_huge_pages() {
+    const HUGE_PAGE_BYTES: usize = 2 << 20;
+    let Some([(first_node, first_cpu), (second_node, second_cpu)]) =
+        two_numa_nodes_with_allowed_cpus()
+    else {
+        panic!("this host exposes no two NUMA nodes with allowed CPUs");
+    };
+    let free_pages = free_huge_pages(HUGE_PAGE_BYTES);
+    assert!(
+        free_pages > 0,
+        "the host has no free {HUGE_PAGE_BYTES}-byte HugeTLB pages"
+    );
+
+    let spare: Vec<usize> = allowed_cpus()
+        .into_iter()
+        .filter(|cpu| *cpu != first_cpu && *cpu != second_cpu)
+        .take(2)
+        .collect();
+    let mut worker_config = String::from("[worker]\ncount = 2\n\n[worker.cpu]\n");
+    if let [main_cpu, app_cpu] = spare[..] {
+        worker_config.push_str(&format!("main_core = {main_cpu}\napp_core = {app_cpu}\n"));
+    }
+    worker_config.push_str(&format!(
+        "worker_cores = [{first_cpu}, {second_cpu}]\n\n[worker.numa]\nenabled = true\n\n[worker.buffer]\nslots_per_numa = {POOL_SLOTS}\npage_size = \"default-hugepage\"\n"
+    ));
+
+    let mut daemon = HammerDaemon::start_with_worker_config(&worker_config);
+    let mapping = daemon.mapping();
+    let fixture = Fixture::new(mapping.bytes());
+    let names = fixture
+        .names()
+        .unwrap_or_else(|| panic!("{}", daemon.diagnostics("no stable directory")));
+
+    let mut pools: Vec<String> = names
+        .iter()
+        .filter_map(|name| {
+            let (pool, gauge) = name.strip_prefix("/buffer-pools/")?.split_once('/')?;
+            matches!(gauge, "cached" | "used" | "available").then(|| pool.to_owned())
+        })
+        .collect();
+    pools.sort_unstable();
+    pools.dedup();
+    assert_eq!(
+        pools,
+        [
+            format!("default-numa-{first_node}"),
+            format!("default-numa-{second_node}")
+        ],
+        "one Pool per Data Worker NUMA node: {names:?}"
+    );
+
+    let mut totals = Vec::new();
+    for node in [first_node, second_node] {
+        let pool = format!("default-numa-{node}");
+        let buffers = pool_columns(&fixture, &pool);
+        assert!(
+            buffers[2] > 0,
+            "`{pool}` keeps buffers on its free list: {buffers:?}"
+        );
+        let total: u64 = buffers.iter().sum();
+        assert!(
+            (POOL_SLOTS / 2..=POOL_SLOTS * 2).contains(&total),
+            "`{pool}` holds its configured slots, rounded up to whole pages: {total}"
+        );
+        totals.push((node, total));
+    }
+
+    // The kernel's view of the same Pools: one HugeTLB-backed buffer mapping per
+    // Node, each placed on that Node. A Pool that fell back to ordinary pages,
+    // or was allocated on the wrong Node, cannot satisfy this.
+    std::thread::sleep(SAMPLE_INTERVAL);
+    let mappings = buffer_mappings(daemon.child.id());
+    assert_eq!(
+        mappings.len(),
+        2,
+        "one buffer mapping per Pool: {mappings:?}"
+    );
+    for node in [first_node, second_node] {
+        assert!(
+            mappings.iter().any(|mapping| {
+                mapping.huge_pages
+                    && mapping
+                        .pages_per_node
+                        .iter()
+                        .any(|(mapped_node, pages)| *mapped_node == node && *pages > 0)
+            }),
+            "a HugeTLB buffer mapping is placed on NUMA node {node}: {mappings:?}"
+        );
+    }
+    for (node, total) in &totals {
+        let pool = format!("default-numa-{node}");
+        assert_eq!(
+            pool_columns(&fixture, &pool).iter().sum::<u64>(),
+            *total,
+            "`{pool}` keeps its buffer count across collect rounds"
+        );
+    }
 
     drop(fixture);
     drop(mapping);
