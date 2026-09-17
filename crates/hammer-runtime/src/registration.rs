@@ -17,7 +17,7 @@ use hammer_stats::StatsMain;
 #[derive(Clone, Copy)]
 pub struct StatsRegistration {
     pub name: &'static str,
-    pub register: fn(&StatsMain) -> RuntimeResult<()>,
+    pub register: fn(&mut StatsMain) -> RuntimeResult<()>,
 }
 
 /// The existing registration catalog for one link image.

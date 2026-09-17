@@ -16,8 +16,10 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use byte_unit::Byte;
 use hammer_component_macros::Stats;
-use hammer_infra::mem::{MemMain, PageSize};
-use hammer_stats::{CollectorRegistration, DirectoryIndex, SimpleCounter, StatsMain, Timestamp};
+use hammer_infra::mem::{MemHeap, MemMain, PageSize};
+use hammer_stats::{
+    Collector, DirectoryEntry, DirectoryIndex, SimpleCounter, StatsMain, Timestamp,
+};
 use socket2::{Domain, MsgHdr, SockAddr, SockRef, Socket, Type};
 
 use crate::error::RuntimeResult;
@@ -98,9 +100,46 @@ pub(crate) struct Sys {
     #[stats(bootstrap = hammer_stats::STAT_COUNTER_BOOTTIME)]
     boottime: Timestamp,
     /// Cumulative main-loop count of each Data Worker, one column per worker.
+    #[stats(columns = worker_column_count())]
     main_loop_count_per_worker: SimpleCounter,
     /// Damped loops per second of each Data Worker, one column per worker.
+    #[stats(columns = worker_column_count())]
     loops_per_worker: SimpleCounter,
+}
+
+/// Published width of one per-worker `/sys` vector: one column per Data Worker.
+fn worker_column_count() -> u32 {
+    ThreadMain::global().worker_count()
+}
+
+/// `/mem/main heap`: the process Main Heap's seven columns and three aliases.
+#[derive(Stats)]
+pub(crate) struct MainHeapUsage {
+    #[stats(
+        path = "/mem/main heap",
+        columns = hammer_stats::mem::STAT_MEM_COLUMNS,
+        symlinks = [
+            ("total", hammer_stats::mem::STAT_MEM_TOTAL),
+            ("used", hammer_stats::mem::STAT_MEM_USED),
+            ("free", hammer_stats::mem::STAT_MEM_FREE),
+        ],
+    )]
+    usage: SimpleCounter,
+}
+
+/// `/mem/stat segment`: the stats segment's own heap.
+#[derive(Stats)]
+pub(crate) struct StatSegmentUsage {
+    #[stats(
+        path = "/mem/stat segment",
+        columns = hammer_stats::mem::STAT_MEM_COLUMNS,
+        symlinks = [
+            ("total", hammer_stats::mem::STAT_MEM_TOTAL),
+            ("used", hammer_stats::mem::STAT_MEM_USED),
+            ("free", hammer_stats::mem::STAT_MEM_FREE),
+        ],
+    )]
+    usage: SimpleCounter,
 }
 
 #[hammer_component_macros::process_node(name = "statseg-collector-process")]
@@ -114,14 +153,13 @@ fn stat_segment_collector_process(
             .duration_since(UNIX_EPOCH)
             .map_err(|source| RuntimeError::SystemClockBeforeUnixEpoch { source })?
             .as_secs();
-        {
-            let mut segment = stats_main.segment.lock();
-            segment.set_timestamp(sys.boottime.index, boottime);
-        }
+        stats_main
+            .segment
+            .set_timestamp(sys.boottime.index, boottime);
 
         loop {
             stats_main.collect();
-            let update_interval = stats_main.segment.lock().update_interval();
+            let update_interval = stats_main.segment.update_interval();
             tokio::time::sleep(update_interval).await;
         }
     }
@@ -151,7 +189,11 @@ fn configure_stats(config: StatsConfig) -> RuntimeResult<()> {
 #[hammer_component_macros::init_function(name = "stats_main_init")]
 fn init_stats_main(_: &mut DataPlaneMain) -> RuntimeResult<()> {
     let config = stats_config();
-    StatsMain::init(
+    // Establishment order follows `vlib_stats_init`: create the segment and its
+    // owner, fill the fixed slots, run the registration image (entry
+    // declarations and collector registrations), publish the owner, then hand
+    // the segment descriptor to readers.
+    let mut stats_main = StatsMain::create(
         "stat segment",
         config
             .memory_size()
@@ -160,9 +202,9 @@ fn init_stats_main(_: &mut DataPlaneMain) -> RuntimeResult<()> {
         config.update_interval,
         config.per_node_counters,
     )?;
-    // Establish the fixed slots before any owner registers and before the
-    // listener is handed to the file main, like `vlib_stats_init`.
-    Sys::bootstrap(&mut StatsMain::global()?.segment.lock())?;
+    Sys::bootstrap(&stats_main.segment)?;
+    crate::init::run_stats_registrations(&mut stats_main)?;
+    stats_main.publish()?;
     let listener =
         bind_listener(&config.socket_name).map_err(|source| RuntimeError::StatsListenerBind {
             path: config.socket_name.clone(),
@@ -177,86 +219,108 @@ fn init_stats_main(_: &mut DataPlaneMain) -> RuntimeResult<()> {
             0,
             stats_segment_listener::file_functions::<crate::NodeMain, crate::RuntimeError>(),
         ))?;
-    crate::init::run_stats_registrations()?;
     Ok(())
 }
 
-// ---- Per-heap collectors: each reads its own heap and hands the reading to
-// ---- the `/mem` family mapping. No heap owns a `StatsSegment` method.
+// ---- Collectors: one type per "way of reading a value", registered by this
+// ---- module's collect registrations. A collector writes only its own entry.
 
-/// Reads the process main heap for its `/mem` entry.
-fn collect_main_heap_usage(entry_index: DirectoryIndex, row: u32) {
-    let usage = MemMain::main_heap().usage();
-    let stats_main = StatsMain::global().expect("stats owner is installed before the round");
-    let mut segment = stats_main.segment.lock();
-    hammer_stats::mem::update_mem_usage(&mut segment, entry_index, row, usage);
-}
-
-/// Reads the stats segment's own heap for its `/mem` entry.
-fn collect_stat_segment_usage(entry_index: DirectoryIndex, row: u32) {
-    let stats_main = StatsMain::global().expect("stats owner is installed before the round");
-    let mut segment = stats_main.segment.lock();
-    let usage = segment.heap().usage();
-    hammer_stats::mem::update_mem_usage(&mut segment, entry_index, row, usage);
-}
-
-/// Fills both per-worker main-loop vectors in one round.
+/// Reads one heap into its `/mem` entry, VPP's `stat_provider_mem_usage_update_fn`.
 ///
-/// VPP's `vector_rate_collector_fn` has the same shape: one registered
-/// collector writes the per-worker vectors. Column `slot` is Data Worker
-/// `slot` (runtime thread index `slot + 1`); the round only copies what each
-/// worker published, so it neither allocates nor returns an error.
-fn collect_worker_main_loop(entry_index: DirectoryIndex, row: u32) {
-    let threads = ThreadMain::global();
-    let sys = Sys::global();
-    let stats_main = StatsMain::global().expect("stats owner is installed before the round");
-    let mut segment = stats_main.segment.lock();
-    for slot in 0..threads.worker_count() {
-        let thread_index = slot + 1;
-        let count = threads
-            .worker_main_loop_count(thread_index)
-            .load(Ordering::Relaxed);
-        let rate = threads
-            .worker_loops_per_second(thread_index)
-            .load(Ordering::Relaxed);
-        segment.set_simple_counter(entry_index, row, slot, count);
-        segment.set_simple_counter(sys.loops_per_worker.index, row, slot, rate);
+/// One type serves every heap; the instance's own field is the heap it reads,
+/// the Rust form of VPP's `private_data` cell (`provider_mem.c:69`).
+struct HeapCollector {
+    entry_index: DirectoryIndex,
+    heap: &'static MemHeap,
+}
+
+impl Collector for HeapCollector {
+    fn entry_index(&self) -> DirectoryIndex {
+        self.entry_index
+    }
+
+    fn collect(&self, entry: &DirectoryEntry) {
+        hammer_stats::mem::update_mem_usage(entry, self.heap.usage());
     }
 }
 
-// ---- Registrations: one per entry this module owns.
-
-/// Registers the process main heap entry.
-#[hammer_component_macros::stats_registration]
-fn register_main_heap(stats_main: &StatsMain) -> RuntimeResult<()> {
-    hammer_stats::mem::register_mem_heap(stats_main, "main heap", collect_main_heap_usage)
-        .map_err(RuntimeError::from)
+/// Which per-worker published value one `/sys` vector reproduces.
+enum WorkerCounter {
+    /// Cumulative main-loop count.
+    MainLoopCount,
+    /// Damped loops per second.
+    LoopsPerSecond,
 }
 
-/// Registers the stats segment's own heap entry.
-#[hammer_component_macros::stats_registration]
-fn register_stat_segment_heap(stats_main: &StatsMain) -> RuntimeResult<()> {
-    hammer_stats::mem::register_mem_heap(stats_main, "stat segment", collect_stat_segment_usage)
-        .map_err(RuntimeError::from)
-}
-
-/// Creates the two per-worker main-loop vectors and registers their collector.
+/// Copies one worker-published per-worker vector into its `/sys` entry.
 ///
-/// VPP creates and registers the same pair in `stats/init.c`: the row width is
-/// established first, then the collector is registered.
-#[hammer_component_macros::stats_registration]
-fn register_worker_main_loop(stats_main: &StatsMain) -> RuntimeResult<()> {
-    let sys = Sys::global();
-    let worker_count = ThreadMain::global().worker_count();
-    let mut segment = stats_main.segment.lock();
-    segment.validate(sys.main_loop_count_per_worker.index, 0, worker_count - 1)?;
-    segment.validate(sys.loops_per_worker.index, 0, worker_count - 1)?;
-    drop(segment);
-    stats_main.register_collector(CollectorRegistration {
-        collect: collect_worker_main_loop,
-        entry_index: sys.main_loop_count_per_worker.index,
-        vector_index: 0,
+/// VPP's `vector_rate_collector_fn` has the same shape: the round only copies
+/// what each worker published, so it neither allocates nor returns an error.
+struct WorkerCounterCollector {
+    entry_index: DirectoryIndex,
+    counter: WorkerCounter,
+}
+
+impl Collector for WorkerCounterCollector {
+    fn entry_index(&self) -> DirectoryIndex {
+        self.entry_index
+    }
+
+    fn collect(&self, entry: &DirectoryEntry) {
+        let threads = ThreadMain::global();
+        for slot in 0..threads.worker_count() {
+            let thread_index = slot + 1;
+            let value = match self.counter {
+                WorkerCounter::MainLoopCount => threads
+                    .worker_main_loop_count(thread_index)
+                    .load(Ordering::Relaxed),
+                WorkerCounter::LoopsPerSecond => threads
+                    .worker_loops_per_second(thread_index)
+                    .load(Ordering::Relaxed),
+            };
+            entry.set_simple_counter_cell(0, slot, value);
+        }
+    }
+}
+
+// ---- Collect registrations: what each owner updates each round, one per entry.
+
+/// Registers the process main heap collector.
+#[hammer_component_macros::stats_collect_registration]
+fn register_main_heap(stats_main: &mut StatsMain) -> RuntimeResult<()> {
+    stats_main.register_collector(HeapCollector {
+        entry_index: MainHeapUsage::global().usage.index,
+        heap: MemMain::main_heap(),
     });
+    Ok(())
+}
+
+/// Registers the stats segment's own heap collector.
+#[hammer_component_macros::stats_collect_registration]
+fn register_stat_segment_heap(stats_main: &mut StatsMain) -> RuntimeResult<()> {
+    stats_main.register_collector(HeapCollector {
+        entry_index: StatSegmentUsage::global().usage.index,
+        heap: stats_main.segment.heap(),
+    });
+    Ok(())
+}
+
+/// Registers the two per-worker main-loop vectors, one collector each.
+#[hammer_component_macros::stats_collect_registration]
+fn register_worker_main_loop(stats_main: &mut StatsMain) -> RuntimeResult<()> {
+    let sys = Sys::global();
+    for (entry_index, counter) in [
+        (
+            sys.main_loop_count_per_worker.index,
+            WorkerCounter::MainLoopCount,
+        ),
+        (sys.loops_per_worker.index, WorkerCounter::LoopsPerSecond),
+    ] {
+        stats_main.register_collector(WorkerCounterCollector {
+            entry_index,
+            counter,
+        });
+    }
     Ok(())
 }
 
@@ -381,7 +445,7 @@ fn handoff_segment(listener_fd: RawFd) -> RuntimeResult<()> {
         }
         return Err(RuntimeError::FileAccept { source });
     }
-    let segment_fd = StatsMain::global()?.segment.lock().segment_fd();
+    let segment_fd = StatsMain::global()?.segment.segment_fd();
     // `stats_socket_accept_ready` reports a failed handoff and closes the
     // connection; the listener stays registered.
     if let Err(source) = send_segment_fd(&peer, segment_fd) {

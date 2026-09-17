@@ -1,5 +1,7 @@
 use std::ffi::CStr;
 use std::ffi::c_void;
+use std::ptr;
+use std::sync::atomic::{AtomicU64, Ordering};
 pub(crate) const MAX_NAME_BYTES: usize = 128;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -408,9 +410,21 @@ impl DirectoryEntry {
         Ok(name)
     }
 
-    #[inline]
-    pub(crate) fn set_name(&mut self, name: NameBytes) {
-        self.name = name.0;
+    /// The entry's own published slot address inside the segment mapping.
+    ///
+    /// Directory entries are shared-memory records: a write must land where the
+    /// entry is published, never in a copy. This is the Rust address form of
+    /// VPP's `sm->directory_vector[index].value = value` (`stats.c:263-269`) and
+    /// `cb[column] = value` (`collector.c:131-151`).
+    fn slot(&self) -> *mut Self {
+        (self as *const Self).cast_mut()
+    }
+
+    pub(crate) fn set_name(&self, name: NameBytes) {
+        let slot = self.slot();
+        // SAFETY: `slot` is this entry's published address; the structural
+        // caller holds the segment lock, so no other structure writer runs.
+        unsafe { ptr::write(ptr::addr_of_mut!((*slot).name), name.0) };
     }
 
     #[inline]
@@ -418,9 +432,11 @@ impl DirectoryEntry {
         DirectoryType::try_from(self.directory_type)
     }
 
-    #[inline]
-    pub(crate) fn set_data(&mut self, data: DirectoryData) {
-        self.data = data;
+    pub(crate) fn set_data(&self, data: DirectoryData) {
+        let slot = self.slot();
+        // SAFETY: `slot` is this entry's published address; the structural
+        // caller holds the segment lock, so no other structure writer runs.
+        unsafe { ptr::write(ptr::addr_of_mut!((*slot).data), data) };
     }
 
     #[inline]
@@ -449,9 +465,60 @@ impl DirectoryEntry {
         }
     }
 
-    #[inline]
-    pub(crate) fn set_scalar_value(&mut self, value: u64) {
-        self.data = DirectoryData::value(value);
+    /// Writes one scalar value into its published slot, like VPP's
+    /// `sm->directory_vector[index].value = value`.
+    pub fn set_scalar(&self, value: u64) {
+        let slot = self.slot();
+        // SAFETY: the checked scalar kinds publish their value in this arm; the
+        // relaxed store is the whole update, and readers are not promised a
+        // cross-entry snapshot.
+        unsafe {
+            AtomicU64::from_ptr(ptr::addr_of_mut!((*slot).data.value))
+                .store(value, Ordering::Relaxed);
+        }
+    }
+
+    /// Writes one cell of a published simple counter vector, like the cell write
+    /// `vlib_stats_set_simple_counter` performs through the published vector.
+    ///
+    /// The shape must already be published by `validate`: this operation never
+    /// expands rows or columns and never allocates. A row or column outside the
+    /// published shape is a bug in the collector that owns the entry, so it
+    /// asserts with the row and column instead of returning a `Result`.
+    pub fn set_simple_counter_cell(&self, row: u32, column: u32, value: u64) {
+        let outer = match self.data_pointer() {
+            Ok(pointer) => pointer.cast::<*mut u8>(),
+            Err(error) => panic!(
+                "set_simple_counter: row {row} column {column} is not a simple counter vector: {error}"
+            ),
+        };
+        if outer.is_null() {
+            panic!("set_simple_counter: row {row} column {column} has no published rows");
+        }
+        // SAFETY: a published counter entry owns its outer vector.
+        let outer_length = unsafe { crate::segment::vector_length(outer.cast::<u8>()) } as usize;
+        if row as usize >= outer_length {
+            panic!("set_simple_counter: row {row} is outside the {outer_length} published rows");
+        }
+        // SAFETY: `row` is inside the outer vector.
+        let row_pointer = unsafe { ptr::read(outer.add(row as usize)) };
+        if row_pointer.is_null() {
+            panic!("set_simple_counter: row {row} is not published");
+        }
+        // SAFETY: the published outer vector owns this row.
+        let row_length = unsafe { crate::segment::vector_length(row_pointer) } as usize;
+        if column as usize >= row_length {
+            panic!(
+                "set_simple_counter: row {row} column {column} is outside the {row_length} published columns"
+            );
+        }
+        // SAFETY: `column` is inside the row vector of `u64` cells; the relaxed
+        // store is the whole update and readers are not promised a cross-column
+        // snapshot.
+        unsafe {
+            AtomicU64::from_ptr(row_pointer.cast::<u64>().add(column as usize))
+                .store(value, Ordering::Relaxed);
+        }
     }
 
     pub(crate) fn data_pointer(&self) -> Result<*mut c_void, ProtocolError> {

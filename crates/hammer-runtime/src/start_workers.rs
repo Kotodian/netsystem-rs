@@ -1,6 +1,9 @@
 use std::sync::Arc;
 
 use crate::error::{RuntimeError, RuntimeResult};
+use hammer_stats::StatsMain;
+
+use crate::thread_main::WorkerThreadCount;
 use crate::{DataPlaneHandoff, DataPlaneMain, DataWorkerId, GlobalMain, ThreadMain, barrier};
 
 #[hammer_component_macros::main_loop_enter_function]
@@ -12,6 +15,12 @@ fn start_workers(main: &mut DataPlaneMain) -> RuntimeResult<()> {
         .thread_count()
         .checked_sub(1)
         .expect("configured ThreadMain includes thread zero");
+    // The worker-count gauge belongs to this domain and is written once, like
+    // VPP's thread startup publishing `n_vlib_mains - 1`.
+    StatsMain::global()?.segment.set_gauge(
+        WorkerThreadCount::global().worker_threads.index,
+        u64::from(worker_count),
+    );
     let init_order = crate::init::topological_order(&global.worker_init_function_registrations)?;
     let init_functions: Arc<[&'static crate::init::InitFunction]> = init_order
         .into_iter()

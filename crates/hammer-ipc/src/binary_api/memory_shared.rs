@@ -10,13 +10,13 @@ use std::ptr::{self, NonNull};
 use std::sync::atomic::{AtomicI32, AtomicPtr, AtomicU32, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use hammer_infra::mem::{HeapUsage, MemHeap};
+use hammer_infra::mem::MemHeap;
 use hammer_infra::svm::queue::{SvmQueue, SvmQueueConditionalWait, SvmQueueConfig, SvmQueueError};
 use hammer_infra::svm::region::{
     RegionLock, SvmRegion, SvmRegionConfig, SvmRegionError, SvmRegionFlags,
 };
-use hammer_runtime::{RuntimeError, RuntimeResult};
-use hammer_stats::{DirectoryIndex, StatsMain};
+use hammer_runtime::RuntimeResult;
+use hammer_stats::{Collector, DirectoryEntry, DirectoryIndex, SimpleCounter, StatsMain};
 use serde::de::Error as _;
 
 use super::{Api, api::ApiMain, codec};
@@ -905,92 +905,156 @@ impl ApiMain {
     }
 }
 
-// ---- api segment heap entries: this module owns the region heaps, so the
-// ---- three `/mem` entries and their collectors live here.
+/// Leaf name of the API segment root region (`/dev/shm/global_vm`): the
+/// `/mem/global_vm pvt` entry name of the root region's private heap.
+const ROOT_REGION_NAME: &str = "global_vm";
 
-/// Collects the root region's private heap, `/mem/global_vm pvt`.
-fn collect_root_region_pvt_usage(entry_index: DirectoryIndex, row: u32) {
-    let api = ApiMain::current();
-    if !api.is_mapped() {
-        return;
-    }
-    let region = api
-        .root_region()
-        .lock()
-        .expect("mapped root region takes its lock");
-    let usage = region.pvt_heap().usage();
-    drop(region);
-    write_region_usage(entry_index, row, usage);
-}
-
-/// Collects the api region's private heap, `/mem/<region> pvt`.
-fn collect_api_region_pvt_usage(entry_index: DirectoryIndex, row: u32) {
-    let api = ApiMain::current();
-    if !api.is_mapped() {
-        return;
-    }
-    let region = api
-        .primary_region()
-        .lock()
-        .expect("mapped API region takes its lock");
-    let usage = region.pvt_heap().usage();
-    drop(region);
-    write_region_usage(entry_index, row, usage);
-}
-
-/// Collects the api region's data heap (queues and the shmem header),
-/// `/mem/<region> data`.
-fn collect_api_region_data_usage(entry_index: DirectoryIndex, row: u32) {
-    let api = ApiMain::current();
-    if !api.is_mapped() {
-        return;
-    }
-    let region = api
-        .primary_region()
-        .lock()
-        .expect("mapped API region takes its lock");
-    let usage = region
-        .data_heap()
-        .expect("API region has a Data Heap")
-        .usage();
-    drop(region);
-    write_region_usage(entry_index, row, usage);
-}
-
-/// The one lock and family mapping the three collectors above share.
-fn write_region_usage(entry_index: DirectoryIndex, row: u32, usage: HeapUsage) {
-    let stats_main = StatsMain::global().expect("stats owner is installed before the round");
-    let mut segment = stats_main.segment.lock();
-    hammer_stats::mem::update_mem_usage(&mut segment, entry_index, row, usage);
-}
-
-/// Registers the root region's private heap entry.
+/// Declares one API-segment region's private heap: `/mem/{region} pvt`.
 ///
-/// The entry name is derived from the region name and its role: the root
-/// region is `/global_vm`; the api region name comes from `ApiSegmentConfig`
-/// (default `/vpe-api`, leaf form `vpe-api`).
-#[hammer_component_macros::stats_registration]
-fn register_root_region_pvt_heap(stats_main: &StatsMain) -> RuntimeResult<()> {
-    hammer_stats::mem::register_mem_heap(stats_main, "global_vm pvt", collect_root_region_pvt_usage)
-        .map_err(RuntimeError::from)
+/// The name carries a runtime fact (the region name comes from
+/// `ApiSegmentConfig`), so the declaration is parameterized by the same fact
+/// VPP fills into `"/mem/%U"` with `format_clib_mem_heap_name`. The root region
+/// and the API region are two installations of this one template.
+#[derive(hammer_component_macros::Stats)]
+pub(crate) struct RegionPrivateHeap {
+    #[stats(
+        path = "/mem/{region} pvt",
+        columns = hammer_stats::mem::STAT_MEM_COLUMNS,
+        symlinks = [
+            ("total", hammer_stats::mem::STAT_MEM_TOTAL),
+            ("used", hammer_stats::mem::STAT_MEM_USED),
+            ("free", hammer_stats::mem::STAT_MEM_FREE),
+        ],
+    )]
+    pvt: SimpleCounter,
+}
+
+/// Declares the API region's data heap: `/mem/{region} data`.
+#[derive(hammer_component_macros::Stats)]
+pub(crate) struct RegionDataHeap {
+    #[stats(
+        path = "/mem/{region} data",
+        columns = hammer_stats::mem::STAT_MEM_COLUMNS,
+        symlinks = [
+            ("total", hammer_stats::mem::STAT_MEM_TOTAL),
+            ("used", hammer_stats::mem::STAT_MEM_USED),
+            ("free", hammer_stats::mem::STAT_MEM_FREE),
+        ],
+    )]
+    data: SimpleCounter,
+}
+
+/// Which API-segment region one heap collector reads.
+enum RegionRole {
+    Root,
+    Api,
+}
+
+/// Which heap of that region one collector reads.
+enum HeapRole {
+    Private,
+    Data,
+}
+
+/// Reads one API-segment region heap into its `/mem` entry.
+///
+/// The region mapping can be unmapped by `exit_binary_api` after the last
+/// round, and the region guard is only available for the duration of one read,
+/// so the collector holds the `ApiMain` owner and borrows the region per round
+/// instead of storing a heap reference.
+struct RegionHeapCollector {
+    entry_index: DirectoryIndex,
+    api_main: &'static ApiMain,
+    region: RegionRole,
+    heap: HeapRole,
+}
+
+impl Collector for RegionHeapCollector {
+    fn entry_index(&self) -> DirectoryIndex {
+        self.entry_index
+    }
+
+    fn collect(&self, entry: &DirectoryEntry) {
+        if !self.api_main.is_mapped() {
+            return;
+        }
+        let usage = match self.region {
+            RegionRole::Root => {
+                let region = self
+                    .api_main
+                    .root_region()
+                    .lock()
+                    .expect("mapped root region takes its lock");
+                match self.heap {
+                    HeapRole::Private => region.pvt_heap().usage(),
+                    HeapRole::Data => region
+                        .data_heap()
+                        .expect("root region has a Data Heap")
+                        .usage(),
+                }
+            }
+            RegionRole::Api => {
+                let region = self
+                    .api_main
+                    .primary_region()
+                    .lock()
+                    .expect("mapped API region takes its lock");
+                match self.heap {
+                    HeapRole::Private => region.pvt_heap().usage(),
+                    HeapRole::Data => region
+                        .data_heap()
+                        .expect("API region has a Data Heap")
+                        .usage(),
+                }
+            }
+        };
+        hammer_stats::mem::update_mem_usage(entry, usage);
+    }
+}
+
+/// Registers the root region's private heap entry, `/mem/global_vm pvt`.
+///
+/// The root region name is fixed by the API segment root mapping; the API
+/// region name comes from `ApiSegmentConfig` (default `/vpe-api`, leaf form
+/// `vpe-api`).
+#[hammer_component_macros::stats_collect_registration]
+fn register_root_region_pvt_heap(stats_main: &mut StatsMain) -> RuntimeResult<()> {
+    let heaps = RegionPrivateHeap::install(&stats_main.segment, ROOT_REGION_NAME)?;
+    stats_main.register_collector(RegionHeapCollector {
+        entry_index: heaps.pvt.index,
+        api_main: ApiMain::current(),
+        region: RegionRole::Root,
+        heap: HeapRole::Private,
+    });
+    Ok(())
 }
 
 /// Registers the api region's private heap entry.
-#[hammer_component_macros::stats_registration]
-fn register_api_region_pvt_heap(stats_main: &StatsMain) -> RuntimeResult<()> {
+#[hammer_component_macros::stats_collect_registration]
+fn register_api_region_pvt_heap(stats_main: &mut StatsMain) -> RuntimeResult<()> {
     let api = ApiMain::current();
     let leaf = api.api_region_name.trim_start_matches('/');
-    let name = format!("{leaf} pvt");
-    hammer_stats::mem::register_mem_heap(stats_main, &name, collect_api_region_pvt_usage)
-        .map_err(RuntimeError::from)
+    let heaps = RegionPrivateHeap::install(&stats_main.segment, leaf)?;
+    stats_main.register_collector(RegionHeapCollector {
+        entry_index: heaps.pvt.index,
+        api_main: api,
+        region: RegionRole::Api,
+        heap: HeapRole::Private,
+    });
+    Ok(())
 }
 
 /// Registers the api region's data heap entry.
-#[hammer_component_macros::stats_registration]
-fn register_api_region_data_heap(stats_main: &StatsMain) -> RuntimeResult<()> {
+#[hammer_component_macros::stats_collect_registration]
+fn register_api_region_data_heap(stats_main: &mut StatsMain) -> RuntimeResult<()> {
     let api = ApiMain::current();
     let leaf = api.api_region_name.trim_start_matches('/');
-    let name = format!("{leaf} data");
-    hammer_stats::mem::register_mem_heap(stats_main, &name, collect_api_region_data_usage)
-        .map_err(RuntimeError::from)
+    let heaps = RegionDataHeap::install(&stats_main.segment, leaf)?;
+    stats_main.register_collector(RegionHeapCollector {
+        entry_index: heaps.data.index,
+        api_main: api,
+        region: RegionRole::Api,
+        heap: HeapRole::Data,
+    });
+    Ok(())
 }

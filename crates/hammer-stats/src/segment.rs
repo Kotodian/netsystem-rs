@@ -18,6 +18,7 @@ use std::time::Duration;
 
 use hammer_infra::align::{CACHE_LINE, VEC_MIN_ALIGN};
 use hammer_infra::mem::{MemError, MemHeap, MemMain, PageSize};
+use hammer_infra::sync::SpinLock;
 
 use crate::metric::{
     CombinedCounter, Gauge, Histogram, NameVector, Ring, RingSchema, SimpleCounter, Timestamp,
@@ -36,8 +37,11 @@ const VECTOR_HEADER_BYTES: usize = 8;
 const NAME_VECTOR_USER_HEADER: usize = 4;
 
 pub struct StatsSegment {
-    directory_vector_by_name: HashMap<NameBytes, DirectoryIndex>,
-    dir_vector_first_free_elt: Option<DirectoryIndex>,
+    /// The directory *structure* lock, the Rust form of VPP's
+    /// `stat_segment_lockp` (`stats.c:11-52`): it protects the name table and
+    /// the free-slot chain only. Value writes and the stats round never take it
+    /// (`D10`).
+    stat_segment_lock: SpinLock<DirectoryStructure>,
     update_interval: Duration,
     memory_size: usize,
     node_counters_enabled: bool,
@@ -46,9 +50,22 @@ pub struct StatsSegment {
     memfd: OwnedFd,
 }
 
-// SAFETY: the mapped addresses owned by a segment are reachable only through
-// this value, and every access happens behind the `SpinLock` that owns it.
+/// The directory state that only structure changes touch.
+///
+/// VPP keeps the same two facts next to the shared segment
+/// (`directory_vector_by_name`/`dir_vector_first_free_elt`); Hammer keeps them
+/// process-private behind [`StatsSegment::stat_segment_lock`].
+struct DirectoryStructure {
+    vector_by_name: HashMap<NameBytes, DirectoryIndex>,
+    first_free_elt: Option<DirectoryIndex>,
+}
+
+// SAFETY: the mapped addresses owned by a segment outlive every borrower (the
+// segment is owned by the process-level `StatsMain` and has no destruction
+// path), directory structure changes are serialized by `stat_segment_lock`, and
+// value writes are relaxed stores to published cells.
 unsafe impl Send for StatsSegment {}
+unsafe impl Sync for StatsSegment {}
 
 impl StatsSegment {
     pub(crate) fn create(
@@ -118,8 +135,10 @@ impl StatsSegment {
             }
         };
         let mut segment = Self {
-            directory_vector_by_name: HashMap::new(),
-            dir_vector_first_free_elt: None,
+            stat_segment_lock: SpinLock::new(DirectoryStructure {
+                vector_by_name: HashMap::new(),
+                first_free_elt: None,
+            }),
             update_interval,
             memory_size,
             node_counters_enabled,
@@ -152,7 +171,7 @@ impl StatsSegment {
     ///
     /// `Sys::bootstrap` creates the slot before the first round runs, so a
     /// missing or mistyped slot is this module's bug and asserts.
-    pub(crate) fn advance_heartbeat(&mut self) {
+    pub(crate) fn advance_heartbeat(&self) {
         let index = DirectoryIndex::new(STAT_COUNTER_HEARTBEAT);
         let value = {
             let entry = self
@@ -181,7 +200,9 @@ impl StatsSegment {
     pub fn find(&self, name: &str, expected: DirectoryType) -> StatsResult<DirectoryIndex> {
         let name_bytes = NameBytes::try_from(name)?;
         let index = *self
-            .directory_vector_by_name
+            .stat_segment_lock
+            .lock()
+            .vector_by_name
             .get(&name_bytes)
             .ok_or_else(|| StatsError::MetricNotFound {
                 name: name.to_owned(),
@@ -193,12 +214,12 @@ impl StatsSegment {
         Ok(index)
     }
 
-    pub fn add_gauge(&mut self, name: &str) -> StatsResult<Gauge> {
+    pub fn add_gauge(&self, name: &str) -> StatsResult<Gauge> {
         let index = self.create_entry(name, DirectoryType::Gauge, DirectoryData::value(0))?;
         Ok(Gauge { index })
     }
 
-    pub fn add_timestamp(&mut self, name: &str) -> StatsResult<Timestamp> {
+    pub fn add_timestamp(&self, name: &str) -> StatsResult<Timestamp> {
         let index = self.create_entry(name, DirectoryType::ScalarIndex, DirectoryData::value(0))?;
         Ok(Timestamp { index })
     }
@@ -208,18 +229,18 @@ impl StatsSegment {
     /// The caller owns a declared slot, so a wrong index or type is this
     /// module's bug: the write asserts instead of returning a `Result`, like
     /// `vlib_stats_set_gauge`.
-    pub fn set_gauge(&mut self, index: DirectoryIndex, value: u64) {
-        self.entry_mut_of_type(index, DirectoryType::Gauge)
+    pub fn set_gauge(&self, index: DirectoryIndex, value: u64) {
+        self.entry_of_type(index, DirectoryType::Gauge)
             .expect("set_gauge writes a declared gauge slot")
-            .set_scalar_value(value);
+            .set_scalar(value);
     }
 
     /// Writes one scalar timestamp into its shared directory slot, like
     /// `vlib_stats_set_timestamp`.
-    pub fn set_timestamp(&mut self, index: DirectoryIndex, value: u64) {
-        self.entry_mut_of_type(index, DirectoryType::ScalarIndex)
+    pub fn set_timestamp(&self, index: DirectoryIndex, value: u64) {
+        self.entry_of_type(index, DirectoryType::ScalarIndex)
             .expect("set_timestamp writes a declared scalar slot")
-            .set_scalar_value(value);
+            .set_scalar(value);
     }
 
     /// Writes one cell of a simple counter vector, like the cell writes
@@ -229,62 +250,18 @@ impl StatsSegment {
     /// expands rows or columns and never allocates. Writing outside the
     /// published shape is a bug in the owning collector, so it asserts with the
     /// index, row and column instead of returning a recoverable `Result`.
-    pub fn set_simple_counter(&mut self, index: DirectoryIndex, row: u32, column: u32, value: u64) {
-        // Every violation below is a bug in the collector that owns the entry:
-        // the published shape is decided by its own `validate` call.
-        let outer = match self.entry_of_type(index, DirectoryType::CounterVectorSimple) {
-            Ok(entry) => match entry.data_pointer() {
-                Ok(pointer) => pointer.cast::<*mut u8>(),
-                Err(error) => panic!(
-                    "set_simple_counter: directory index {} row {row} column {column} is not a data vector: {error}",
+    pub fn set_simple_counter(&self, index: DirectoryIndex, row: u32, column: u32, value: u64) {
+        self.entry_of_type(index, DirectoryType::CounterVectorSimple)
+            .unwrap_or_else(|error| {
+                panic!(
+                    "set_simple_counter: directory index {} row {row} column {column} is not a simple counter vector: {error}",
                     index.raw()
-                ),
-            },
-            Err(error) => panic!(
-                "set_simple_counter: directory index {} row {row} column {column} is not a simple counter vector: {error}",
-                index.raw()
-            ),
-        };
-        if outer.is_null() {
-            panic!(
-                "set_simple_counter: directory index {} has no published rows (row {row} column {column})",
-                index.raw()
-            );
-        }
-        // SAFETY: a published counter entry owns its outer vector.
-        let outer_length = unsafe { vector_length(outer.cast::<u8>()) as usize };
-        if row as usize >= outer_length {
-            panic!(
-                "set_simple_counter: directory index {} row {row} is outside the {outer_length} published rows",
-                index.raw()
-            );
-        }
-        // SAFETY: `row` is inside the outer vector.
-        let row_pointer = unsafe { ptr::read(outer.add(row as usize)) };
-        if row_pointer.is_null() {
-            panic!(
-                "set_simple_counter: directory index {} row {row} is not published",
-                index.raw()
-            );
-        }
-        // SAFETY: the published outer vector owns this row.
-        let row_length = unsafe { vector_length(row_pointer) as usize };
-        if column as usize >= row_length {
-            panic!(
-                "set_simple_counter: directory index {} row {row} column {column} is outside the {row_length} published columns",
-                index.raw()
-            );
-        }
-        // SAFETY: `column` is inside the row vector of `u64` cells. The relaxed
-        // store is the whole update; readers are not promised a cross-column
-        // snapshot.
-        unsafe {
-            AtomicU64::from_ptr(row_pointer.cast::<u64>().add(column as usize))
-                .store(value, Ordering::Relaxed);
-        }
+                )
+            })
+            .set_simple_counter_cell(row, column, value);
     }
 
-    pub fn add_simple_counter(&mut self, name: &str) -> StatsResult<SimpleCounter> {
+    pub fn add_simple_counter(&self, name: &str) -> StatsResult<SimpleCounter> {
         let index = self.create_entry(
             name,
             DirectoryType::CounterVectorSimple,
@@ -293,7 +270,7 @@ impl StatsSegment {
         Ok(SimpleCounter { index })
     }
 
-    pub fn add_combined_counter(&mut self, name: &str) -> StatsResult<CombinedCounter> {
+    pub fn add_combined_counter(&self, name: &str) -> StatsResult<CombinedCounter> {
         let index = self.create_entry(
             name,
             DirectoryType::CounterVectorCombined,
@@ -302,7 +279,7 @@ impl StatsSegment {
         Ok(CombinedCounter { index })
     }
 
-    pub fn add_histogram(&mut self, name: &str) -> StatsResult<Histogram> {
+    pub fn add_histogram(&self, name: &str) -> StatsResult<Histogram> {
         let index = self.create_entry(
             name,
             DirectoryType::HistogramLog2,
@@ -311,7 +288,7 @@ impl StatsSegment {
         Ok(Histogram { index })
     }
 
-    pub fn add_name_vector(&mut self, name: &str, length: u32) -> StatsResult<NameVector> {
+    pub fn add_name_vector(&self, name: &str, length: u32) -> StatsResult<NameVector> {
         let data = allocate_vector(
             self.heap(),
             size_of::<*mut u8>(),
@@ -342,7 +319,7 @@ impl StatsSegment {
         Ok(NameVector { index })
     }
 
-    pub fn add_ring<T: RingSchema>(&mut self, descriptor: Ring<T>) -> StatsResult<DirectoryIndex> {
+    pub fn add_ring<T: RingSchema>(&self, descriptor: Ring<T>) -> StatsResult<DirectoryIndex> {
         let config = descriptor.config();
         let schema = descriptor.schema();
         if config.entry_size() != T::ENTRY_SIZE {
@@ -426,7 +403,7 @@ impl StatsSegment {
     }
 
     pub fn add_symlink(
-        &mut self,
+        &self,
         target: DirectoryIndex,
         column: u32,
         name: &str,
@@ -448,33 +425,31 @@ impl StatsSegment {
         )
     }
 
-    pub fn rename_symlink(&mut self, index: DirectoryIndex, name: &str) -> StatsResult<()> {
+    pub fn rename_symlink(&self, index: DirectoryIndex, name: &str) -> StatsResult<()> {
         let previous_name = {
             let entry = self.entry_of_type(index, DirectoryType::Symlink)?;
             entry.name_bytes()?
         };
         let name_bytes = NameBytes::try_from(name)?;
-        if self.directory_vector_by_name.contains_key(&name_bytes) {
+        let mut directory = self.stat_segment_lock.lock();
+        if directory.vector_by_name.contains_key(&name_bytes) {
             return Err(StatsError::DuplicateName {
                 name: name.to_owned(),
             });
         }
         let transaction = DirectoryWrite::begin(self);
-        self.directory_mut()[index.raw() as usize].set_name(name_bytes);
+        // SAFETY: the caller holds the segment lock and `index` is a published
+        // symlink slot.
+        unsafe { (*self.entry_pointer(index)).set_name(name_bytes) };
         drop(transaction);
-        self.directory_vector_by_name.remove(&previous_name);
-        self.directory_vector_by_name.insert(name_bytes, index);
+        directory.vector_by_name.remove(&previous_name);
+        directory.vector_by_name.insert(name_bytes, index);
         Ok(())
     }
 
     /// Sets or clears one element of a name vector, like
     /// `vlib_stats_set_string_vector`.
-    pub fn set_name(
-        &mut self,
-        index: DirectoryIndex,
-        element: u32,
-        value: &str,
-    ) -> StatsResult<()> {
+    pub fn set_name(&self, index: DirectoryIndex, element: u32, value: &str) -> StatsResult<()> {
         let outer = {
             let entry = self.entry_of_type(index, DirectoryType::NameVector)?;
             entry.string_vector_pointer()?
@@ -544,8 +519,11 @@ impl StatsSegment {
         // SAFETY: the target element belongs to this entry.
         unsafe { ptr::write(target.add(position), string.as_ptr()) };
         if replaced_outer.is_some() {
-            self.directory_mut()[index.raw() as usize]
-                .set_data(DirectoryData::string_vector(target));
+            // SAFETY: the caller holds the segment lock and `index` is the
+            // published name vector slot.
+            unsafe {
+                (*self.entry_pointer(index)).set_data(DirectoryData::string_vector(target));
+            }
         }
         drop(transaction);
         if !previous.is_null() {
@@ -566,7 +544,7 @@ impl StatsSegment {
     /// window VPP opens with `clib_mem_set_heap (sm->heap)` in
     /// `vlib_stats_validate`: a counter row and its outer vector are
     /// default-heap vectors, so VPP releases them through the active heap.
-    pub fn validate(&mut self, index: DirectoryIndex, row: u32, column: u32) -> StatsResult<()> {
+    pub fn validate(&self, index: DirectoryIndex, row: u32, column: u32) -> StatsResult<()> {
         let (element_size, published) = {
             let entry = self.entry(index)?;
             let kind = entry.directory_type()?;
@@ -696,8 +674,12 @@ impl StatsSegment {
         }
 
         let transaction = DirectoryWrite::begin(self);
-        self.directory_mut()[index.raw() as usize]
-            .set_data(DirectoryData::data(replacement.as_ptr().cast::<c_void>()));
+        // SAFETY: the caller holds the segment lock and `index` is the
+        // published counter slot.
+        unsafe {
+            (*self.entry_pointer(index))
+                .set_data(DirectoryData::data(replacement.as_ptr().cast::<c_void>()));
+        }
         drop(transaction);
 
         for position in 0..published_length {
@@ -728,7 +710,7 @@ impl StatsSegment {
     ///
     /// Releasing an entry that is already free is a no-op: the slot is on the
     /// free list and no payload is reachable from it.
-    pub fn remove_entry(&mut self, index: DirectoryIndex) -> StatsResult<()> {
+    pub fn remove_entry(&self, index: DirectoryIndex) -> StatsResult<()> {
         let (kind, name, payload) = {
             let entry = self.entry(index)?;
             let kind = entry.directory_type()?;
@@ -745,20 +727,25 @@ impl StatsSegment {
             };
             (kind, entry.name_bytes()?, payload)
         };
-        let next_free = self
-            .dir_vector_first_free_elt
+        let mut directory = self.stat_segment_lock.lock();
+        let next_free = directory
+            .first_free_elt
             .map_or(STAT_SEGMENT_INDEX_INVALID, DirectoryIndex::raw);
         let transaction = DirectoryWrite::begin(self);
         // The slot becomes empty before its payload is released: a reader that
         // re-reads the directory never follows a payload that is already gone.
-        self.directory_mut()[index.raw() as usize] = DirectoryEntry::new(
-            TypeCode::from(DirectoryType::Empty),
-            NameBytes::try_from(&[] as &[u8])?,
-            DirectoryData::index(u64::from(next_free)),
+        self.store_entry(
+            index,
+            DirectoryEntry::new(
+                TypeCode::from(DirectoryType::Empty),
+                NameBytes::try_from(&[] as &[u8])?,
+                DirectoryData::index(u64::from(next_free)),
+            ),
         );
         drop(transaction);
-        self.directory_vector_by_name.remove(&name);
-        self.dir_vector_first_free_elt = Some(index);
+        directory.vector_by_name.remove(&name);
+        directory.first_free_elt = Some(index);
+        drop(directory);
         self.release_payload(kind, payload)
     }
 
@@ -854,26 +841,27 @@ impl StatsSegment {
     /// one transaction covers slot reuse or directory growth, the entry store
     /// and the directory pointer publication.
     fn create_entry(
-        &mut self,
+        &self,
         name: &str,
         directory_type: DirectoryType,
         data: DirectoryData,
     ) -> StatsResult<DirectoryIndex> {
         let name_bytes = NameBytes::try_from(name)?;
-        if self.directory_vector_by_name.contains_key(&name_bytes) {
+        let mut directory = self.stat_segment_lock.lock();
+        if directory.vector_by_name.contains_key(&name_bytes) {
             return Err(StatsError::DuplicateName {
                 name: name.to_owned(),
             });
         }
         let entry = DirectoryEntry::new(TypeCode::from(directory_type), name_bytes, data);
-        let reused = match self.dir_vector_first_free_elt {
+        let reused = match directory.first_free_elt {
             Some(index) => Some((index, self.entry(index)?.directory_index()?)),
             None => None,
         };
         let transaction = DirectoryWrite::begin(self);
         let index = match reused {
             Some((index, next)) => {
-                self.dir_vector_first_free_elt =
+                directory.first_free_elt =
                     (next.raw() != STAT_SEGMENT_INDEX_INVALID).then_some(next);
                 index
             }
@@ -883,9 +871,9 @@ impl StatsSegment {
                 index
             }
         };
-        self.directory_mut()[index.raw() as usize] = entry;
+        self.store_entry(index, entry);
         drop(transaction);
-        self.directory_vector_by_name.insert(name_bytes, index);
+        directory.vector_by_name.insert(name_bytes, index);
         Ok(index)
     }
 
@@ -894,7 +882,7 @@ impl StatsSegment {
     ///
     /// The caller holds the directory transaction open: the replacement vector
     /// is published here and the replaced one is released afterwards.
-    fn grow_directory(&mut self, length: usize) -> StatsResult<()> {
+    fn grow_directory(&self, length: usize) -> StatsResult<()> {
         let previous = self.directory_pointer();
         let previous_length = self.directory().len();
         let data = allocate_vector(
@@ -931,7 +919,7 @@ impl StatsSegment {
         Ok(())
     }
 
-    fn entry(&self, index: DirectoryIndex) -> StatsResult<&DirectoryEntry> {
+    pub(crate) fn entry(&self, index: DirectoryIndex) -> StatsResult<&DirectoryEntry> {
         let directory = self.directory();
         directory
             .get(index.raw() as usize)
@@ -941,7 +929,7 @@ impl StatsSegment {
             })
     }
 
-    fn entry_of_type(
+    pub(crate) fn entry_of_type(
         &self,
         index: DirectoryIndex,
         expected: DirectoryType,
@@ -955,28 +943,21 @@ impl StatsSegment {
         }
     }
 
-    fn entry_mut(&mut self, index: DirectoryIndex) -> StatsResult<&mut DirectoryEntry> {
-        let length = self.directory().len();
-        self.directory_mut().get_mut(index.raw() as usize).ok_or(
-            StatsError::DirectoryIndexOutOfBounds {
-                index: index.raw(),
-                length,
-            },
-        )
+    /// The published slot of one directory entry, for structural writes.
+    ///
+    /// Structure writers hold [`StatsSegment::stat_segment_lock`] and have
+    /// checked `index` against the published directory.
+    fn entry_pointer(&self, index: DirectoryIndex) -> *mut DirectoryEntry {
+        // SAFETY: the caller checked the index against the published directory.
+        unsafe { self.directory_pointer().add(index.raw() as usize) }
     }
 
-    fn entry_mut_of_type(
-        &mut self,
-        index: DirectoryIndex,
-        expected: DirectoryType,
-    ) -> StatsResult<&mut DirectoryEntry> {
-        let entry = self.entry_mut(index)?;
-        let actual = entry.directory_type()?;
-        if actual == expected {
-            Ok(entry)
-        } else {
-            Err(StatsError::MetricTypeMismatch { expected, actual })
-        }
+    /// Replaces one whole directory slot, like VPP's
+    /// `sm->directory_vector[index] = entry`.
+    fn store_entry(&self, index: DirectoryIndex, entry: DirectoryEntry) {
+        // SAFETY: the caller holds the segment lock and `index` is inside the
+        // published directory.
+        unsafe { ptr::write(self.entry_pointer(index), entry) };
     }
 
     /// The fixed-capacity heap this segment owns.
@@ -986,10 +967,12 @@ impl StatsSegment {
     /// the borrow is valid for the caller's lifetime. Whether it is published as
     /// a `/mem` entry is the owning subsystem's decision; the segment only lends
     /// the heap.
-    pub fn heap(&self) -> &MemHeap {
-        // SAFETY: the heap control block lives inside the segment mapping for
-        // the lifetime of this owner.
-        unsafe { self.heap.as_ref() }
+    pub fn heap(&self) -> &'static MemHeap {
+        // SAFETY: the heap control block lives inside the segment mapping, and
+        // the segment is owned by the process-level `StatsMain` with no runtime
+        // destruction path (VPP's stats segment has the same lifetime model), so
+        // the borrow outlives every collector that stores it.
+        unsafe { &*self.heap.as_ptr() }
     }
 
     fn shared_header(&self) -> *mut SharedHeader {
@@ -1010,17 +993,6 @@ impl StatsSegment {
         // this segment, whose element count precedes the first entry.
         let length = unsafe { vector_length(pointer.cast::<u8>()) as usize };
         unsafe { std::slice::from_raw_parts(pointer, length) }
-    }
-
-    fn directory_mut(&mut self) -> &mut [DirectoryEntry] {
-        let pointer = self.directory_pointer();
-        if pointer.is_null() {
-            return &mut [];
-        }
-        // SAFETY: every writer holds the segment lock and the pointer names the
-        // directory vector owned by this segment.
-        let length = unsafe { vector_length(pointer.cast::<u8>()) as usize };
-        unsafe { std::slice::from_raw_parts_mut(pointer, length) }
     }
 }
 
@@ -1154,7 +1126,7 @@ unsafe fn free_vector(heap: &MemHeap, data: NonNull<u8>, element_size: usize) {
 /// # Safety
 ///
 /// `data` must be a vector data pointer owned by the caller.
-unsafe fn vector_length(data: *const u8) -> u32 {
+pub(crate) unsafe fn vector_length(data: *const u8) -> u32 {
     let header = unsafe { ptr::read_unaligned(data.sub(VECTOR_HEADER_BYTES).cast::<[u8; 8]>()) };
     vec_len(Some(&header))
 }
