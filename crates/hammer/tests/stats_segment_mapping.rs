@@ -180,6 +180,24 @@ impl<'mapping> Fixture<'mapping> {
         None
     }
 
+    /// The `(target entry, column)` pair of a published symlink.
+    fn symlink(&self, name: &str) -> Option<(String, usize)> {
+        for _ in 0..16 {
+            let Some((_, directory)) = self.published() else {
+                continue;
+            };
+            let index = self.find(&directory, name)?;
+            let entry = self.entry(&directory, index);
+            assert_eq!(entry.directory_type, TYPE_SYMLINK, "`{name}` is a symlink");
+            let target =
+                usize::try_from(entry.data & u64::from(u32::MAX)).expect("low half of the target");
+            let column = usize::try_from(entry.data >> 32).expect("high half of the target");
+            let target = self.entry(&directory, target).name().to_owned();
+            return Some((target, column));
+        }
+        None
+    }
+
     fn read(&self, name: &str) -> Option<Value> {
         for _ in 0..16 {
             let Some((base, directory)) = self.published() else {
@@ -467,6 +485,14 @@ impl HammerDaemon {
     }
 
     fn start_with_config(worker_config: &str, statseg_extra: &str) -> Self {
+        Self::start_with_plugins(worker_config, statseg_extra, "[]")
+    }
+
+    /// Starts a daemon that loads `plugins` as its configured roots.
+    ///
+    /// `PluginMain::directory` resolves roots next to the daemon executable,
+    /// which is where `cargo build --workspace` leaves the plugin cdylibs.
+    fn start_with_plugins(worker_config: &str, statseg_extra: &str, plugins: &str) -> Self {
         let unique = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .expect("system clock is after the Unix epoch")
@@ -484,7 +510,7 @@ impl HammerDaemon {
         fs::write(
             &config_path,
             format!(
-                "plugins = []\n\n[memory]\nmain_heap_size = \"256 MiB\"\n\n{worker_config}\n[statseg]\nsocket_name = \"{}\"\nupdate_interval = \"50ms\"\n{statseg_extra}\n[api-segment]\nprefix = \"{prefix}\"\n",
+                "plugins = {plugins}\n\n[memory]\nmain_heap_size = \"256 MiB\"\n\n{worker_config}\n[statseg]\nsocket_name = \"{}\"\nupdate_interval = \"50ms\"\n{statseg_extra}\n[api-segment]\nprefix = \"{prefix}\"\n",
                 stats_socket.display()
             ),
         )
@@ -966,6 +992,152 @@ fn counter_rows(fixture: &Fixture<'_>, name: &str) -> Vec<Vec<u64>> {
         Some(Value::Simple(rows)) => rows,
         other => panic!("`{name}` is a counter vector, got {other:?}"),
     }
+}
+
+/// The plugin roots the registered-error half loads; the ip plugin owns the
+/// ip4-local/ip4-receive/icmp-error nodes and the icmp plugin the echo and
+/// input nodes, which are the only in-repo nodes that declare errors.
+const ERROR_PLUGIN_ROOTS: &str = r#"["ip", "icmp"]"#;
+
+/// Whether the plugin cdylibs the registered-error half loads were built next
+/// to the daemon binary.
+///
+/// The CI build job's `cargo build --workspace --all-targets` and a plain
+/// `cargo build --workspace` produce them; a bare `cargo test -p hammer` does
+/// not, and a fixture must not silently claim to cover a case whose artifact is
+/// absent.
+fn plugin_cdylibs_present() -> bool {
+    let directory = Path::new(DAEMON_BINARY)
+        .parent()
+        .expect("the daemon binary has a parent directory");
+    ["ip", "icmp"].iter().all(|name| {
+        directory
+            .join(format!("libhammer_plugin_{name}.so"))
+            .exists()
+    })
+}
+
+/// `/node/errors` and `/err/<node>/<error>`: the error family VPP's
+/// `vlib_register_errors` publishes (`error.c:113-200`).
+///
+/// The counter vector exists only once a node declares errors
+/// (`error.c:135,158-159`), so a daemon with no plugins publishes neither the
+/// vector nor a single alias; once the ip and icmp plugins are loaded, the
+/// vector carries the reserved no-error column 0, one column per registered
+/// error, one row per runtime thread, and one alias per error onto exactly its
+/// own column.
+#[test]
+fn stats_segment_publishes_node_error_columns() {
+    let mut daemon = HammerDaemon::start();
+    let mapping = daemon.mapping();
+    let fixture = Fixture::new(mapping.bytes());
+    let names = fixture
+        .names()
+        .unwrap_or_else(|| panic!("{}", daemon.diagnostics("no stable directory")));
+    assert!(
+        !names.iter().any(|name| name == "/node/errors"),
+        "a daemon whose nodes declare no errors publishes no error vector: {names:?}"
+    );
+    assert!(
+        !names.iter().any(|name| name.starts_with("/err/")),
+        "a daemon whose nodes declare no errors publishes no error alias: {names:?}"
+    );
+    drop(fixture);
+    drop(mapping);
+    let status = daemon.shutdown();
+    assert!(
+        status.success(),
+        "{}",
+        daemon.diagnostics(format!("daemon exits unsuccessfully: {status:?}"))
+    );
+
+    if !plugin_cdylibs_present() {
+        eprintln!(
+            "skipping the registered-error half: plugin cdylibs are not next to {DAEMON_BINARY}"
+        );
+        return;
+    }
+
+    let mut daemon =
+        HammerDaemon::start_with_plugins(&HammerDaemon::worker_config(), "", ERROR_PLUGIN_ROOTS);
+    let mapping = daemon.mapping();
+    let fixture = Fixture::new(mapping.bytes());
+    let names = fixture
+        .names()
+        .unwrap_or_else(|| panic!("{}", daemon.diagnostics("no stable directory")));
+    assert!(
+        names.iter().any(|name| name == "/node/errors"),
+        "the loaded plugins declare errors, so the vector exists: {names:?}"
+    );
+
+    let aliases: Vec<String> = names
+        .iter()
+        .filter(|name| name.starts_with("/err/"))
+        .cloned()
+        .collect();
+    assert!(
+        !aliases.is_empty(),
+        "the loaded plugins' nodes registered error aliases: {names:?}"
+    );
+
+    // Rows are thread zero plus the Data Workers; columns are the reserved
+    // no-error column 0 plus one column per registered error.
+    let rows = counter_rows(&fixture, "/node/errors");
+    assert_eq!(
+        rows.len(),
+        WORKER_COUNT + 1,
+        "`/node/errors` has one row per runtime thread"
+    );
+    let columns = rows[0].len();
+    assert_eq!(
+        columns,
+        aliases.len() + 1,
+        "every published column but the reserved one is aliased by one error"
+    );
+    for row in &rows {
+        assert_eq!(row.len(), columns, "`/node/errors` is rectangular");
+    }
+
+    // Every alias is a symlink onto `/node/errors` and selects its own column;
+    // the ranges are contiguous and non-overlapping, so the aliased columns are
+    // exactly 1..columns.
+    let mut selected = Vec::with_capacity(aliases.len());
+    for name in &aliases {
+        let (target, column) = fixture
+            .symlink(name)
+            .unwrap_or_else(|| panic!("{}", daemon.diagnostics(format!("`{name}` resolves"))));
+        assert_eq!(target, "/node/errors", "`{name}` aliases the error vector");
+        assert!(column > 0, "`{name}` skips the reserved no-error column");
+        assert_eq!(
+            counter_rows(&fixture, name).len(),
+            WORKER_COUNT + 1,
+            "`{name}` has one row per runtime thread"
+        );
+        let (node, error) = name
+            .trim_start_matches("/err/")
+            .split_once('/')
+            .expect("every alias is `/err/<node>/<error>`");
+        assert!(
+            !node.is_empty() && !error.is_empty(),
+            "`{name}` names a node and an error"
+        );
+        selected.push(column);
+    }
+    selected.sort_unstable();
+    assert_eq!(
+        selected,
+        (1..columns).collect::<Vec<_>>(),
+        "each registered error owns exactly one column"
+    );
+
+    drop(fixture);
+    drop(mapping);
+    let status = daemon.shutdown();
+    assert!(
+        status.success(),
+        "{}",
+        daemon.diagnostics(format!("daemon exits unsuccessfully: {status:?}"))
+    );
 }
 
 /// One `/memfd:buffers` mapping of a running daemon, as the kernel reports it.

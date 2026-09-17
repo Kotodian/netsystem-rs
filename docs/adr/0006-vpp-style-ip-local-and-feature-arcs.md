@@ -221,6 +221,21 @@ The existing `#[feature_arc]` and `#[feature]` proc-macro names are retained but
 their marker-type implementation is replaced. Both attributes apply to the
 real graph-node struct and generate only a direct owner registration method:
 
+**实现修订（2026-09-17）**：`ip_feature_init`（`register_feature_arc` /
+`register_feature`）与 `interface_feature_init`（`install_feature_arcs`）执行在
+main-loop-enter 阶段，而不是 init-function 阶段；两者用
+`runs_before = ["interface_feature_init"]`、`runs_before = ["start_workers"]`
+固定顺序。原因是本 ADR 的"所有图节点可用、Data Worker 尚未启动"窗口在 Hammer 里
+不是 init-function 阶段：VPP 先注册全部静态节点再跑 init functions
+（`third_party/vpp/src/vlib/main.c:1899-1900`，注释 "Register static nodes so that
+init functions may use them."），而 Hammer 的节点 materialize 在 init functions
+之后（节点初始化需要 owner Main 已发布），因此节点存在而 worker 未启动的唯一阶段
+就是 main-loop-enter。`main_loop_enter_function` 宏为此与 `init_function` 一样接受
+`name`/`runs_before`/`runs_after`：VPP 的 `VLIB_MAIN_LOOP_ENTER_FUNCTION` 与
+`VLIB_INIT_FUNCTION` 共用同一约束字段
+（`third_party/vpp/src/vlib/init.h:26-28,145`），排序同样是稳定的注册顺序拓扑序
+（`third_party/vpp/src/vlib/init.c:172-199`：每次取注册顺序中第一个约束已满足的项）。
+
 ```rust
 #[feature_arc(
     name = "ip4-local",

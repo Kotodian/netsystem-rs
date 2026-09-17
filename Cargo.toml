@@ -79,7 +79,6 @@ rustls = { version = "=0.23.31", default-features = false, features = ["ring", "
 quinn-proto = { path = "third_party/quinn/quinn-proto", default-features = false, features = ["rustls"] }
 criterion = { version = "0.5", default-features = false, features = ["plotters", "cargo_bench_support"] }
 linkme = "0.3"
-petgraph = "0.6"
 prost = "0.14.4"
 clap = "4"
 bincode = "1"

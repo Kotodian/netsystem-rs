@@ -129,9 +129,7 @@ fn register_ip4_local(runtime: &DataPlaneMain) -> RuntimeResult<NodeId> {
     let node = runtime
         .nodes()
         .try_register_internal_with_next_names(Ip4LocalNode::new(), &Ip4LocalNext::NEXT_NAMES)?;
-    runtime
-        .nodes()
-        .materialize_node_errors(node, &IpLocalError::DESCRIPTORS)?;
+    runtime.register_node_errors(node, &IpLocalError::DESCRIPTORS)?;
     Ok(node)
 }
 
@@ -167,9 +165,7 @@ fn register_ip4_receive(runtime: &DataPlaneMain) -> RuntimeResult<NodeId> {
     let node = runtime
         .nodes()
         .try_register_internal(Ip4ReceiveNode::new())?;
-    runtime
-        .nodes()
-        .materialize_node_errors(node, &IpLocalError::DESCRIPTORS)?;
+    runtime.register_node_errors(node, &IpLocalError::DESCRIPTORS)?;
     let net = NetMain::global()?;
     let install_operations = [
         hammer_service::net::DpoProto::IP4,
@@ -231,9 +227,7 @@ fn register_ip4_local_end_of_arc(runtime: &DataPlaneMain) -> RuntimeResult<NodeI
     let node = runtime
         .nodes()
         .try_register_internal(Ip4LocalEndOfArcNode::new())?;
-    runtime
-        .nodes()
-        .materialize_node_errors(node, &IpLocalError::DESCRIPTORS)?;
+    runtime.register_node_errors(node, &IpLocalError::DESCRIPTORS)?;
     Ok(node)
 }
 
@@ -299,9 +293,7 @@ fn register_ip6_local(runtime: &DataPlaneMain) -> RuntimeResult<NodeId> {
     let node = runtime
         .nodes()
         .try_register_internal_with_next_names(Ip6LocalNode::new(), &Ip6LocalNext::NEXT_NAMES)?;
-    runtime
-        .nodes()
-        .materialize_node_errors(node, &IpLocalError::DESCRIPTORS)?;
+    runtime.register_node_errors(node, &IpLocalError::DESCRIPTORS)?;
     Ok(node)
 }
 
@@ -337,9 +329,7 @@ fn register_ip6_receive(runtime: &DataPlaneMain) -> RuntimeResult<NodeId> {
     let node = runtime
         .nodes()
         .try_register_internal(Ip6ReceiveNode::new())?;
-    runtime
-        .nodes()
-        .materialize_node_errors(node, &IpLocalError::DESCRIPTORS)?;
+    runtime.register_node_errors(node, &IpLocalError::DESCRIPTORS)?;
     let net = NetMain::global()?;
     let install_operations = [
         hammer_service::net::DpoProto::IP4,
@@ -401,9 +391,7 @@ fn register_ip6_local_end_of_arc(runtime: &DataPlaneMain) -> RuntimeResult<NodeI
     let node = runtime
         .nodes()
         .try_register_internal(Ip6LocalEndOfArcNode::new())?;
-    runtime
-        .nodes()
-        .materialize_node_errors(node, &IpLocalError::DESCRIPTORS)?;
+    runtime.register_node_errors(node, &IpLocalError::DESCRIPTORS)?;
     Ok(node)
 }
 

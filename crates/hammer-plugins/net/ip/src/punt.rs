@@ -253,7 +253,13 @@ impl Node for Ip6DropNode {
     }
 }
 
-#[hammer_component_macros::init_function(
+/// Registers the IP feature arcs once their nodes exist in the graph.
+///
+/// VPP's `vnet_feature_init` runs after `vlib_register_all_static_nodes`
+/// (`third_party/vpp/src/vlib/main.c:1899-1900`); Hammer materializes declared
+/// nodes after init functions, so arc registration belongs to the
+/// main-loop-enter phase, ahead of the service's arc installation.
+#[hammer_component_macros::main_loop_enter_function(
     name = "ip_feature_init",
     runs_before = ["interface_feature_init"]
 )]

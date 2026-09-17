@@ -6,7 +6,7 @@ use hammer_core::data_plane::{DEFAULT_BUFFER_FRAME_CAPACITY, Frame, NodeId, Node
 use hammer_infra::bihash::{Bihash, FREE_U64};
 use hammer_infra::checksum::internet_checksum;
 use hammer_infra::pool::Pool;
-use hammer_runtime::sync::SpinLock;
+use hammer_infra::sync::SpinLock;
 use hammer_runtime::{
     DataPlaneMain, DataWorkerId, Node, NodeProcessFn, NodeRuntime, TraceControlHandle,
     TraceFormatter, add_packet_trace, format_packet_trace,

@@ -568,6 +568,12 @@ region 堆引用的采集者**。本 ADR 不新增 unregister API；每 session 
 | `statseg-collector-process` process node（thread zero） | 薄驱动：设置 boottime，然后每轮"调用一次 `StatsMain::collect()` → 取 `update_interval` → sleep"；循环体不变，家族步骤不在 node 里（H12、V23） | node 不认识 mem/system，也不持有 stats 段；它只按 interval 调度轮次 |
 | 写路径（轮次与 setter 都不取锁） | `collect()` 只是"取条目 → 写值"（采集者写自己的单元格，最后一条同形语句写 heartbeat）；`set_gauge`/`set_timestamp`/`set_simple_counter` 是"按索引写一个值"（V20、V28）。写入口取 `&self`：单元格走 `AtomicU64::from_ptr`（已有做法），标量走 `addr_of_mut!((*entry).data.value)` 的映射地址写；改目录结构的操作（`add_*`/`validate`/`add_symlink`/`remove_entry`）取 `&self` + D10 那把段锁（VPP `vlib_stats_segment_lock` 的对应物） | 唯一写者是 thread zero（轮次 + owner 自己的生命周期点：boottime 在 node、worker 数在 `start_workers`、登记在启动期）；worker 只写自己的每线程原子，其它进程只读映射。因此值写与轮次不需要锁，也不需要第二套同步——这就是 VPP 的形状（`stats.c:263-269`、`collector.c:131-151`）；`Relaxed` 只用于统计值 |
 
+**（ADR-0024 例外）**node error counter 家族按 VPP 的形状改为"记录点写本线程那一行"
+（`DataPlaneMain::record_current_node_error` → `StatsSegment::increment_simple_counter`）：
+行归该线程所有（行号 = 自己的 `thread_index`）、条目索引在冻结点装好、列增长只允许发生在
+冻结点之前、单元格在机制层本来就是原子访问位置。`/sys/*` 家族继续走本节的"owner 原子计数 +
+轮次投影"，不变。
+
 所有采集者与 `StatsMain::collect()` 都不返回 `Result`：写值 API 与 VPP
 的 `vlib_stats_set_gauge`/`vlib_stats_set_timestamp` 一样只做"按索引写一个值"
 （V20），没有可恢复失败；索引/类型/行列失配意味着本模块的安装与写入不一致，

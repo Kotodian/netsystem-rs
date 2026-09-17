@@ -5,7 +5,6 @@ hammer_runtime::__declare_registration_image!(
         binary_api::__INIT_FN_BINARY_API_INIT,
         session::__INIT_FN_APPLICATION_INIT,
         interface_model::__INIT_FN_INTERFACE_MAIN_INIT,
-        interface_model::feature::__INIT_FN_INTERFACE_FEATURE_INIT,
         net::__INIT_FN_NET_MAIN_INIT,
         device::__INIT_FN_DEVICE_MAIN_INIT,
         session::__INIT_FN_SESSION_INIT,
@@ -18,7 +17,9 @@ hammer_runtime::__declare_registration_image!(
         binary_api::__CONFIG_FN_API_SEGMENT_CONFIG,
         session::__CONFIG_FN_SESSION_CONFIG,
     ];
-    main_loop_enter_functions = [];
+    main_loop_enter_functions = [
+        interface_model::feature::__INIT_FN_INTERFACE_FEATURE_INIT,
+    ];
     main_loop_exit_functions = [
         binary_api::__INIT_FN_EXIT_BINARY_API,
         session::__INIT_FN_EXIT_SESSION,

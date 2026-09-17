@@ -247,9 +247,7 @@ fn register_icmp4_input(runtime: &DataPlaneMain) -> RuntimeResult<NodeId> {
         Icmp4InputNode::new(),
         &Icmp4InputNext::NEXT_NAMES,
     )?;
-    runtime
-        .nodes()
-        .materialize_node_errors(node, &IcmpInputError::DESCRIPTORS)?;
+    runtime.register_node_errors(node, &IcmpInputError::DESCRIPTORS)?;
     hammer_plugin_ip::register_ip4_protocol(runtime.nodes(), IpProtocol::Icmpv4.into(), node)?;
     main.ip4_input_node
         .set(node)
@@ -276,9 +274,7 @@ fn register_icmp6_input(runtime: &DataPlaneMain) -> RuntimeResult<NodeId> {
         Icmp6InputNode::new(),
         &Icmp6InputNext::NEXT_NAMES,
     )?;
-    runtime
-        .nodes()
-        .materialize_node_errors(node, &IcmpInputError::DESCRIPTORS)?;
+    runtime.register_node_errors(node, &IcmpInputError::DESCRIPTORS)?;
     hammer_plugin_ip::register_ip6_protocol(runtime.nodes(), IpProtocol::Icmpv6.into(), node)?;
     // SAFETY: initialization runs on main before publication; later changes
     // use the same main-thread barrier precondition in register_type.
@@ -402,9 +398,7 @@ fn register_icmp4_echo_request(runtime: &DataPlaneMain) -> RuntimeResult<NodeId>
         Icmp4EchoRequestNode::new(),
         &Icmp4EchoRequestNext::NEXT_NAMES,
     )?;
-    runtime
-        .nodes()
-        .materialize_node_errors(node, &IcmpNodeError::DESCRIPTORS)?;
+    runtime.register_node_errors(node, &IcmpNodeError::DESCRIPTORS)?;
     let main = crate::IcmpMain::global()?;
     main.register_type(runtime.nodes(), IpVersion::V4, ICMP4_ECHO_REQUEST, node)?;
     Ok(node)
@@ -453,9 +447,7 @@ fn register_icmp6_echo_request(runtime: &DataPlaneMain) -> RuntimeResult<NodeId>
         Icmp6EchoRequestNode::new(),
         &Icmp6EchoRequestNext::NEXT_NAMES,
     )?;
-    runtime
-        .nodes()
-        .materialize_node_errors(node, &IcmpNodeError::DESCRIPTORS)?;
+    runtime.register_node_errors(node, &IcmpNodeError::DESCRIPTORS)?;
     let main = crate::IcmpMain::global()?;
     main.register_type(runtime.nodes(), IpVersion::V6, ICMP6_ECHO_REQUEST, node)?;
     Ok(node)
@@ -766,9 +758,7 @@ mod tests {
             Icmp4InputNode::new(),
             &Icmp4InputNext::NEXT_NAMES,
         )?;
-        runtime
-            .nodes()
-            .materialize_node_errors(ip4_input, &IcmpInputError::DESCRIPTORS)?;
+        runtime.register_node_errors(ip4_input, &IcmpInputError::DESCRIPTORS)?;
         main.ip4_input_node
             .set(ip4_input)
             .expect("ICMP4 input node installs once");
@@ -777,9 +767,7 @@ mod tests {
             Icmp6InputNode::new(),
             &Icmp6InputNext::NEXT_NAMES,
         )?;
-        runtime
-            .nodes()
-            .materialize_node_errors(ip6_input, &IcmpInputError::DESCRIPTORS)?;
+        runtime.register_node_errors(ip6_input, &IcmpInputError::DESCRIPTORS)?;
         unsafe {
             let ip6 = &mut *main.ip6.get();
             for entry in &mut ip6.entries {
@@ -801,18 +789,14 @@ mod tests {
             Icmp4EchoRequestNode::new(),
             &Icmp4EchoRequestNext::NEXT_NAMES,
         )?;
-        runtime
-            .nodes()
-            .materialize_node_errors(ip4_echo, &IcmpNodeError::DESCRIPTORS)?;
+        runtime.register_node_errors(ip4_echo, &IcmpNodeError::DESCRIPTORS)?;
         main.register_type(runtime.nodes(), IpVersion::V4, ICMP4_ECHO_REQUEST, ip4_echo)?;
 
         let ip6_echo = runtime.nodes().try_register_internal_with_next_names(
             Icmp6EchoRequestNode::new(),
             &Icmp6EchoRequestNext::NEXT_NAMES,
         )?;
-        runtime
-            .nodes()
-            .materialize_node_errors(ip6_echo, &IcmpNodeError::DESCRIPTORS)?;
+        runtime.register_node_errors(ip6_echo, &IcmpNodeError::DESCRIPTORS)?;
         main.register_type(runtime.nodes(), IpVersion::V6, ICMP6_ECHO_REQUEST, ip6_echo)?;
         runtime.nodes().resolve_named_next_nodes()?;
 

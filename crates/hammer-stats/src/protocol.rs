@@ -478,47 +478,65 @@ impl DirectoryEntry {
         }
     }
 
-    /// Writes one cell of a published simple counter vector, like the cell write
-    /// `vlib_stats_set_simple_counter` performs through the published vector.
+    /// Resolves one cell of a published simple counter vector.
     ///
-    /// The shape must already be published by `validate`: this operation never
-    /// expands rows or columns and never allocates. A row or column outside the
+    /// The shape must already be published by `validate`: this never expands
+    /// rows or columns and never allocates. A row or column outside the
     /// published shape is a bug in the collector that owns the entry, so it
     /// asserts with the row and column instead of returning a `Result`.
-    pub fn set_simple_counter_cell(&self, row: u32, column: u32, value: u64) {
+    fn simple_counter_cell_pointer(&self, row: u32, column: u32) -> *mut u64 {
         let outer = match self.data_pointer() {
             Ok(pointer) => pointer.cast::<*mut u8>(),
             Err(error) => panic!(
-                "set_simple_counter: row {row} column {column} is not a simple counter vector: {error}"
+                "simple counter row {row} column {column} is not a simple counter vector: {error}"
             ),
         };
         if outer.is_null() {
-            panic!("set_simple_counter: row {row} column {column} has no published rows");
+            panic!("simple counter row {row} column {column} has no published rows");
         }
         // SAFETY: a published counter entry owns its outer vector.
         let outer_length = unsafe { crate::segment::vector_length(outer.cast::<u8>()) } as usize;
         if row as usize >= outer_length {
-            panic!("set_simple_counter: row {row} is outside the {outer_length} published rows");
+            panic!("simple counter row {row} is outside the {outer_length} published rows");
         }
         // SAFETY: `row` is inside the outer vector.
         let row_pointer = unsafe { ptr::read(outer.add(row as usize)) };
         if row_pointer.is_null() {
-            panic!("set_simple_counter: row {row} is not published");
+            panic!("simple counter row {row} is not published");
         }
         // SAFETY: the published outer vector owns this row.
         let row_length = unsafe { crate::segment::vector_length(row_pointer) } as usize;
         if column as usize >= row_length {
             panic!(
-                "set_simple_counter: row {row} column {column} is outside the {row_length} published columns"
+                "simple counter row {row} column {column} is outside the {row_length} published columns"
             );
         }
+        // SAFETY: `column` is inside the row vector of `u64` cells.
+        unsafe { row_pointer.cast::<u64>().add(column as usize) }
+    }
+
+    /// Writes one cell of a published simple counter vector, like the cell write
+    /// `vlib_stats_set_simple_counter` performs through the published vector.
+    pub fn set_simple_counter_cell(&self, row: u32, column: u32, value: u64) {
+        let cell = self.simple_counter_cell_pointer(row, column);
         // SAFETY: `column` is inside the row vector of `u64` cells; the relaxed
         // store is the whole update and readers are not promised a cross-column
         // snapshot.
-        unsafe {
-            AtomicU64::from_ptr(row_pointer.cast::<u64>().add(column as usize))
-                .store(value, Ordering::Relaxed);
-        }
+        unsafe { AtomicU64::from_ptr(cell).store(value, Ordering::Relaxed) };
+    }
+
+    /// Adds `increment` to one cell of a published simple counter vector, the
+    /// cell update VPP's `vlib_error_count` performs through the published
+    /// vector: `em->counters[counter] += increment`
+    /// (`third_party/vpp/src/vlib/error_funcs.h:35`).
+    ///
+    /// Same shape discipline as [`Self::set_simple_counter_cell`].
+    pub fn add_simple_counter_cell(&self, row: u32, column: u32, increment: u64) {
+        let cell = self.simple_counter_cell_pointer(row, column);
+        // SAFETY: `column` is inside the row vector of `u64` cells; the relaxed
+        // read-modify-write is the whole update, the row has a single writer,
+        // and readers are not promised a cross-column snapshot.
+        unsafe { AtomicU64::from_ptr(cell).fetch_add(increment, Ordering::Relaxed) };
     }
 
     pub(crate) fn data_pointer(&self) -> Result<*mut c_void, ProtocolError> {

@@ -768,9 +768,16 @@ impl FeatureState {
         }
     }
 }
-#[hammer_component_macros::init_function(
+/// Installs the registered arcs once the graph holds their nodes.
+///
+/// VPP installs arcs from `vnet_feature_init` because it registers every static
+/// node before init functions run (`third_party/vpp/src/vlib/main.c:1899-1900`).
+/// Hammer materializes declared nodes after init functions, so the install
+/// belongs to the main-loop-enter phase, before `start_workers` publishes the
+/// frozen graph to the Data Workers.
+#[hammer_component_macros::main_loop_enter_function(
     name = "interface_feature_init",
-    runs_after = ["net_main_init"]
+    runs_before = ["start_workers"]
 )]
 fn interface_feature_init(
     main: &mut hammer_runtime::DataPlaneMain,

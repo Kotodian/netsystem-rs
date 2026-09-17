@@ -1148,6 +1148,16 @@ config declaration 额外接收已经解析的 owner config；worker-init 的 pr
 | `process_node` | 生成具体 `Process` constructor/step declaration；只使用 DataPlaneMain 的一次 step borrow |
 | `run_*_functions` | 由 GlobalMain 或 DataPlaneMain 的实际 owner 调度，不接收 registry 或 copied image Vec |
 
+**实现修订（2026-09-17）**：`main_loop_enter_function` 与 `main_loop_exit_function`
+和 `init_function` 一样接受 `name` / `runs_before` / `runs_after`，排序在同阶段
+注册项之间进行。VPP 的 `VLIB_MAIN_LOOP_ENTER_FUNCTION` 与 `VLIB_INIT_FUNCTION`
+共用同一 `_vlib_init_function_list_elt_t` 约束字段
+（`third_party/vpp/src/vlib/init.h:26-28,145`），排序本身是"注册顺序中第一个约束
+已满足的项先出"的稳定拓扑序（`third_party/vpp/src/vlib/init.c:172-199`）；
+Hammer 的 `topological_order` 与之一致，因此同阶段内未声明约束的注册项按
+runtime image → host image → 插件 load 顺序执行。阶段归属仍由
+`RegistrationImage` 的 list 决定，不由属性宏决定。
+
 插件依赖由插件自己的 owner-defined API 取得和发布。缺失依赖返回其
 owner-local typed error；不得用 `None`、跳过 callback、日志或 generic
 registry 隐藏失败。

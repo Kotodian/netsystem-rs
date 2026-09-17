@@ -10,10 +10,10 @@ use crate::error::{RuntimeError, RuntimeResult};
 use crate::trace::TraceFormatter;
 use crate::{DataPlaneMain, Simd};
 use hammer_core::data_plane::{
-    Frame, NodeErrorIndex, NodeErrorIndexError, NodeHandle, NodeId, NodeKind, NodeNext,
-    NodeRegistration, NodeState,
+    Frame, NodeErrorIndex, NodeHandle, NodeId, NodeKind, NodeNext, NodeRegistration, NodeState,
 };
 use hammer_core::error::DataPlaneError;
+use hammer_infra::heap::Heap;
 
 mod frame;
 pub mod next;
@@ -440,14 +440,30 @@ impl NodeReadiness {
     }
 }
 
+/// The contiguous global error column range one node owns.
+///
+/// VPP analogue: `n->error_heap_index` plus `n->n_errors`
+/// (`third_party/vpp/src/vlib/node.h:333,342`). `first` is already the global
+/// column number (heap offset + 1, skipping the reserved no-error column).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct NodeErrorColumnRange {
+    first: NodeErrorIndex,
+    count: u16,
+}
+
 pub(crate) struct NodeRuntimeInner {
     nodes: Vec<NodeRuntimeSlot>,
     node_states: Vec<NodeState>,
     interrupt_pending: Vec<bool>,
     input_main_loops_per_call: Vec<u32>,
-    error_indices: Vec<Box<[NodeErrorIndex]>>,
-    next_error_index: u32,
-    error_tables_installed: Vec<bool>,
+    /// The node error column space: VPP's `em->counters_heap`
+    /// (`third_party/vpp/src/vlib/error.h:38-39`), where a node error column
+    /// number is the element's offset plus the reserved column 0. Only thread
+    /// zero allocates; a Worker holds the read-only clone it never grows.
+    error_column_heap: Heap<NodeId>,
+    /// Per node slot: the column range that node owns, `None` before it
+    /// registers errors.
+    error_columns: Vec<Option<NodeErrorColumnRange>>,
     handles: HashMap<NodeHandle, NodeId>,
     declared_nodes: HashMap<&'static str, NodeId>,
     node_names: Vec<Option<&'static str>>,
@@ -466,9 +482,8 @@ impl Clone for NodeRuntimeInner {
             node_states: self.node_states.clone(),
             interrupt_pending: vec![false; node_count],
             input_main_loops_per_call: self.input_main_loops_per_call.clone(),
-            error_indices: self.error_indices.clone(),
-            next_error_index: self.next_error_index,
-            error_tables_installed: self.error_tables_installed.clone(),
+            error_column_heap: self.error_column_heap.clone(),
+            error_columns: self.error_columns.clone(),
             handles: self.handles.clone(),
             declared_nodes: self.declared_nodes.clone(),
             node_names: self.node_names.clone(),
@@ -543,7 +558,7 @@ impl NodeRuntimeInner {
                 "published worker graph changed node role"
             );
             assert_eq!(
-                self.error_indices[slot], current.error_indices[slot],
+                self.error_columns[slot], current.error_columns[slot],
                 "published worker graph changed node error layout"
             );
 
@@ -555,44 +570,44 @@ impl NodeRuntimeInner {
         }
     }
 
-    fn materialize_node_errors(
+    /// Reserves this node's contiguous global error column range.
+    ///
+    /// VPP analogue: `vlib_register_errors`
+    /// (`third_party/vpp/src/vlib/error.c:138-139`), which allocates the range
+    /// from `em->counters_heap` and stores its offset in `n->error_heap_index`.
+    /// Column 0 stays reserved for the packet-buffer "no error" sentinel, so
+    /// the first column of the range is its heap offset plus one.
+    fn register_node_errors(
         &mut self,
         node: NodeId,
         descriptors: &[NodeErrorDescriptor],
     ) -> RuntimeResult<()> {
         self.validate_node(node)?;
+        if descriptors.is_empty() {
+            return Ok(());
+        }
         let slot = node.slot() as usize;
-        if self.error_tables_installed[slot] {
+        if self.error_columns[slot].is_some() {
             return Ok(());
         }
 
-        let count = descriptors.len();
-        if count > usize::from(u16::MAX) {
-            return Err(RuntimeError::NodeErrorSlotOverflow);
-        }
-
-        // VPP `vlib_register_errors` reserves one contiguous global range per
-        // node. u32 zero remains the packet-buffer "no error" sentinel.
-        let first = self.next_error_index;
-        let end = first
-            .checked_add(u32::try_from(count).map_err(|_| RuntimeError::NodeErrorSlotOverflow)?)
+        let count =
+            u16::try_from(descriptors.len()).map_err(|_| RuntimeError::NodeErrorSlotOverflow)?;
+        let end = self
+            .error_column_heap
+            .len()
+            .checked_add(u32::from(count))
             .ok_or(RuntimeError::NodeErrorSlotOverflow)?;
-        if end > u32::from(u16::MAX) + 1 {
+        if end > u32::from(u16::MAX) {
             return Err(RuntimeError::NodeErrorSlotOverflow);
         }
 
-        let mut indices = Vec::with_capacity(count);
-        for local_code in 0..count {
-            let encoded = u16::try_from(first + local_code as u32)
-                .map_err(|_| RuntimeError::NodeErrorSlotOverflow)?;
-            let index = NodeErrorIndex::try_from(encoded)
-                .map_err(|_: NodeErrorIndexError| RuntimeError::NodeErrorSlotOverflow)?;
-            indices.push(index);
-        }
-
-        self.error_indices[slot] = indices.into_boxed_slice();
-        self.next_error_index = end;
-        self.error_tables_installed[slot] = true;
+        let offset = self.error_column_heap.alloc(u32::from(count), node);
+        let first_column = u16::try_from(offset + 1)
+            .expect("the checked column capacity keeps every column in the u16 space");
+        let first =
+            NodeErrorIndex::new(first_column).expect("column 0 is the reserved no-error slot");
+        self.error_columns[slot] = Some(NodeErrorColumnRange { first, count });
         Ok(())
     }
 
@@ -600,21 +615,19 @@ impl NodeRuntimeInner {
         &self,
         nodes: &[(NodeId, &'static [NodeErrorDescriptor])],
     ) -> RuntimeResult<()> {
-        let mut next = self.next_error_index;
+        let mut end = self.error_column_heap.len();
         for &(node, descriptors) in nodes {
             self.validate_node(node)?;
             let slot = node.slot() as usize;
-            if self.error_tables_installed[slot] {
+            if descriptors.is_empty() || self.error_columns[slot].is_some() {
                 continue;
             }
-            let count = descriptors.len();
-            if count > usize::from(u16::MAX) {
-                return Err(RuntimeError::NodeErrorSlotOverflow);
-            }
-            next = next
-                .checked_add(u32::try_from(count).map_err(|_| RuntimeError::NodeErrorSlotOverflow)?)
+            let count = u32::try_from(descriptors.len())
+                .map_err(|_| RuntimeError::NodeErrorSlotOverflow)?;
+            end = end
+                .checked_add(count)
                 .ok_or(RuntimeError::NodeErrorSlotOverflow)?;
-            if next > u32::from(u16::MAX) + 1 {
+            if end > u32::from(u16::MAX) {
                 return Err(RuntimeError::NodeErrorSlotOverflow);
             }
         }
@@ -624,10 +637,17 @@ impl NodeRuntimeInner {
     #[inline]
     fn node_error_index(&self, node: NodeId, code: u16) -> RuntimeResult<NodeErrorIndex> {
         self.validate_node(node)?;
-        self.error_indices[node.slot() as usize]
-            .get(code as usize)
-            .copied()
-            .ok_or(RuntimeError::NodeErrorSlotOverflow)
+        let range =
+            self.error_columns[node.slot() as usize].ok_or(RuntimeError::NodeErrorSlotOverflow)?;
+        if code >= range.count {
+            return Err(RuntimeError::NodeErrorSlotOverflow);
+        }
+        let column = range
+            .first
+            .get()
+            .checked_add(code)
+            .ok_or(RuntimeError::NodeErrorSlotOverflow)?;
+        Ok(NodeErrorIndex::new(column).expect("a registered column is non-zero"))
     }
 
     fn push_node_slot(&mut self, slot: NodeRuntimeSlot) -> NodeId {
@@ -636,8 +656,7 @@ impl NodeRuntimeInner {
         self.node_states.push(NodeState::Polling);
         self.interrupt_pending.push(false);
         self.input_main_loops_per_call.push(0);
-        self.error_indices.push(Box::default());
-        self.error_tables_installed.push(false);
+        self.error_columns.push(None);
         self.node_names.push(None);
         self.node_trace_formatters.push(None);
         self.next_nodes.push(Vec::new());
@@ -1043,9 +1062,8 @@ impl Default for NodeMain {
                 node_states: Vec::new(),
                 interrupt_pending: Vec::new(),
                 input_main_loops_per_call: Vec::new(),
-                error_indices: Vec::new(),
-                next_error_index: 1,
-                error_tables_installed: Vec::new(),
+                error_column_heap: Heap::new(),
+                error_columns: Vec::new(),
                 handles: HashMap::new(),
                 declared_nodes: HashMap::new(),
                 node_names: Vec::new(),
@@ -1180,12 +1198,12 @@ impl NodeMain {
         self.inner.borrow().validate_node_error_batch(nodes)
     }
 
-    /// Install a node's ordered error descriptors on the topology owner.
+    /// Reserve a node's ordered error column range on the topology owner.
     ///
-    /// Normal graph construction calls this from [`DataPlaneMain::init_graph`]
-    /// using [`NodeEntry::error_counters`]. The explicit method is retained as
-    /// a structural hook for callers that register nodes directly.
-    pub fn materialize_node_errors(
+    /// VPP analogue: the `heap_alloc (em->counters_heap, n_errors, …)` half of
+    /// `vlib_register_errors`; the caller that also publishes the stats family
+    /// is [`DataPlaneMain::register_node_errors`].
+    pub(crate) fn register_node_errors(
         &self,
         node: NodeId,
         descriptors: &[NodeErrorDescriptor],
@@ -1193,7 +1211,19 @@ impl NodeMain {
         self.ensure_topology_owner()?;
         self.inner
             .borrow_mut()
-            .materialize_node_errors(node, descriptors)
+            .register_node_errors(node, descriptors)
+    }
+
+    /// The published global error column width: zero while no node declared
+    /// errors, otherwise the element space length plus the reserved column 0
+    /// (VPP `l = vec_len (em->counters_heap)`, error.c:140).
+    pub(crate) fn node_error_columns(&self) -> u32 {
+        let inner = self.inner.borrow();
+        if inner.error_column_heap.is_empty() {
+            0
+        } else {
+            inner.error_column_heap.len() + 1
+        }
     }
 
     /// Clear a fully dispatched topology so `init_graph` can renumber it.
@@ -1225,9 +1255,8 @@ impl NodeMain {
             node_states: Vec::new(),
             interrupt_pending: Vec::new(),
             input_main_loops_per_call: Vec::new(),
-            error_indices: Vec::new(),
-            next_error_index: 1,
-            error_tables_installed: Vec::new(),
+            error_column_heap: Heap::new(),
+            error_columns: Vec::new(),
             handles: HashMap::new(),
             declared_nodes: HashMap::new(),
             node_names: Vec::new(),
@@ -1769,9 +1798,9 @@ impl NodeMain {
         }
     }
 
-    /// Return the preinstalled global index for a node-local error code.
+    /// Resolve the global column for a node-local error code.
     #[inline]
-    pub(crate) fn record_node_error(
+    pub(crate) fn node_error_index(
         &self,
         node: NodeId,
         code: u16,

@@ -775,7 +775,9 @@ impl Collector for NodeCounterCollector {
 ### D8 明确不做
 
 - **不做 `clear` 命令面**：不新增 `/sys/last_stats_clear` 的写入者、不做 owner 侧基线
-  （`stats_last_clear`，V26）；`clear` 与它的一次性同步属于另一份设计。
+  （`stats_last_clear`，V26）。理由不是"与 VPP 无关"，而是 Hammer 今天没有对应的控制面
+  命令面，而 VPP 的基线本身只是每线程进程内副本（`error.h:36`）；补它不改段内布局，
+  属于另一份设计（ADR-0024 §8 项 4 沿用这条措辞）。
 - **不采集 `max_clock`/`max_clock_n`**、不做 `n_vectors_by_next_node` 风格的按 next 计数
   （VPP 有，Hammer 无消费者）、不做 `/sys/vector_rate*`（ADR-0019 M4 的另一部分）。
 - **不给 process 节点插桩 calls/vectors/clocks**（D6）。

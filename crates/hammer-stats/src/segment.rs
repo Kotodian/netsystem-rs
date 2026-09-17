@@ -261,6 +261,32 @@ impl StatsSegment {
             .set_simple_counter_cell(row, column, value);
     }
 
+    /// Adds `increment` to one cell of a simple counter vector, the mechanism
+    /// behind VPP's `em->counters[counter] += increment`
+    /// (`third_party/vpp/src/vlib/error_funcs.h:35`).
+    ///
+    /// The shape must already be published by `validate`: this operation never
+    /// expands rows or columns and never allocates, exactly like
+    /// [`Self::set_simple_counter`]. A wrong index, type, row or column is a
+    /// bug in the owning collector, so it asserts with those facts instead of
+    /// returning a recoverable `Result`.
+    pub fn increment_simple_counter(
+        &self,
+        index: DirectoryIndex,
+        row: u32,
+        column: u32,
+        increment: u64,
+    ) {
+        self.entry_of_type(index, DirectoryType::CounterVectorSimple)
+            .unwrap_or_else(|error| {
+                panic!(
+                    "increment_simple_counter: directory index {} row {row} column {column} is not a simple counter vector: {error}",
+                    index.raw()
+                )
+            })
+            .add_simple_counter_cell(row, column, increment);
+    }
+
     pub fn add_simple_counter(&self, name: &str) -> StatsResult<SimpleCounter> {
         let index = self.create_entry(
             name,

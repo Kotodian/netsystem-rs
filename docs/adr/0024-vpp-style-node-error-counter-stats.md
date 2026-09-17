@@ -76,7 +76,7 @@ Hammer 的对应物是 `DataPlaneMain` ↔ `vlib_main_t`、`NodeMain` ↔ `vlib_
 | `error_main.stats_err_entry_index`（error.h:43） | `DataPlaneMain.node_error_stats_entry_index: Cell<Option<DirectoryIndex>>` |
 | `error_main.counters`（缓存的 `u64 *`，三个刷新点重取） | **不缓存地址**：记录点把 `(entry, thread_index, column)` 交给机制层，由 `hammer-stats` 内部解析行地址 |
 | `em->counters[counter] += increment`（error_funcs.h:35） | `StatsSegment::increment_simple_counter (entry, row, column, increment)` |
-| `error_main.counters_heap`（`vlib_error_desc_t *`：元素空间，heap index == 计数列号，error.h:38-39） | `NodeMain` 的 `Heap<NodeErrorColumn>`（节点域，§3.4）；列号 = heap offset + 1（§4） |
+| `error_main.counters_heap`（`vlib_error_desc_t *`：元素空间，heap index == 计数列号，error.h:38-39） | `NodeMain` 的 `Heap<NodeId>`（节点域，元素 = 列归属节点，§3.4）；列号 = heap offset + 1（§4） |
 
 **为什么 Hammer 不缓存 `counters` 那样一个行地址（裸指针、`&'static [T]` 都不行）：**
 
@@ -228,27 +228,26 @@ impl DataPlaneMain {
 
 ```rust
 // crates/hammer-runtime/src/node.rs
-/// heap 元素：`/node/errors` 的一列，只承载列归属（VPP 的元素是
-/// `vlib_error_desc_t`：名字/描述/severity/symlink 索引，error.h:15-28）。
-pub(crate) struct NodeErrorColumn {
-    node: NodeId,
-}
-
 /// 一个节点占用的连续列区间（VPP `n->error_heap_index` + `n->n_errors`，
 /// node.h:333,342）。`first` 已经是全局列号（= heap offset + 1）。
 pub(crate) struct NodeErrorColumnRange {
     first: NodeErrorIndex,
     count: u16,
 }
+// 列空间本身：`error_column_heap: Heap<NodeId>`。元素只承载列归属，而归属
+// 就是 `NodeId`（VPP 的元素是 `vlib_error_desc_t`：名字/描述/severity/symlink
+// 索引，error.h:15-28；Hammer 这些都在静态 descriptor 里，元素没有读者）。
 
 impl NodeMain {
-    /// 节点域分配：`Heap::alloc (count, NodeErrorColumn { node })` 得到区间
+    /// 节点域分配：`Heap::alloc (count, node)` 得到区间
     /// （VPP `heap_alloc (em->counters_heap, n_errors, …)` + `n->error_heap_index`，
     /// error.c:138-139）。既有 `materialize_node_errors` 按 VPP 的函数名
-    /// （`vlib_register_errors`）改名为 `register_node_errors`：`NodeMain` 的是
-    /// `pub fn`（插件有 16 个调用点，`crates/hammer-plugins/net/{ip,icmp}`），
+    /// （`vlib_register_errors`）改名为 `register_node_errors`；
     /// `NodeRuntimeInner` 的私有同名方法一并改；签名与语义不变。
-    pub fn register_node_errors(
+    /// 插件不再直接调它：16 个调用点（`crates/hammer-plugins/net/{ip,icmp}`）
+    /// 改成 `DataPlaneMain::register_node_errors`（§3.3），所以节点域的这份
+    /// 收回到 `pub(crate)`——公开发布面只有 main 域那一个。
+    pub(crate) fn register_node_errors(
         &self,
         node: NodeId,
         descriptors: &[NodeErrorDescriptor],
@@ -271,7 +270,7 @@ impl NodeMain {
 | 今天（`node.rs:448-450`） | 替换为 |
 | --- | --- |
 | `error_indices: Vec<Box<[NodeErrorIndex]>>`（每节点一张本地表） | `error_columns: Vec<Option<NodeErrorColumnRange>>`（每节点一个区间，`None` = 未注册） |
-| `next_error_index: u32`（水位） | `error_column_heap: Heap<NodeErrorColumn>`（列空间本身） |
+| `next_error_index: u32`（水位） | `error_column_heap: Heap<NodeId>`（列空间本身，元素 = 归谁） |
 | `error_tables_installed: Vec<bool>` | 折进上面的 `Option` |
 
 每个节点只存区间（起点 + 数量），不再存逐 code 的表：`record` 路径用 `first + code` 解析，
@@ -338,7 +337,8 @@ impl NodeMain {
   (…)`，`error.c:182-186`），为的是注册之后还能回答"这一列是谁"（再注册、`show errors`、卸载）。
   Hammer 的名字/描述/severity 是节点注册里的 `&'static [NodeErrorDescriptor]`
   （`node.rs:302-321`），不需要第二份；symlink 的 `DirectoryIndex` 今天没有读者（注册路径用
-  `find` 幂等判定，§5 步骤 5）。所以 heap 元素只存列归属：`NodeErrorColumn { node: NodeId }`
+  `find` 幂等判定，§5 步骤 5）。所以 heap 元素只存列归属，而且这个归属就是 `NodeId` 本身——
+  不为一个只写不读的字段再建一个单字段结构
   （§3.4）。它是将来反查/卸载要读的唯一事实；不存它就得另建一张平行表。
 - **放在 `NodeMain`（节点域）**：VPP 把 `counters_heap` 放在 `error_main`，但只有 thread zero 的
   注册路径分配它（`error.c:125` 的 thread-zero 断言），worker 只是拷贝。Hammer 的列归属本来就在
@@ -364,7 +364,7 @@ init 之前发布 `StatsMain`，所以注册期能访问段（`config/stats.rs:1
 1. **节点域**：校验节点、确认该 slot 未注册过；`descriptors.len() == 0` 时直接返回（VPP
    `n_errors == 0` 早退，error.c:135）——不建条目、不改列。
 2. **节点域分配区间**：先做上限检查（`heap.len() + count <= u16::MAX`，超限仍是
-   `NodeErrorSlotOverflow`，§4.5），再 `Heap::alloc(count, NodeErrorColumn { node })` 得到区间起点
+   `NodeErrorSlotOverflow`，§4.5），再 `Heap::alloc(count, node)` 得到区间起点
    offset（`u32`），记下 `NodeErrorColumnRange { first: NodeErrorIndex::new(offset + 1)?, count }`
    （`+1` 跳过保留列 0；上限检查保证这一步必定成功）。等价于 `heap_alloc
    (em->counters_heap, n_errors, …)` + `n->error_heap_index`（error.c:138-139）。
@@ -467,7 +467,7 @@ refork threads.c:930-944），因为它是**缓存地址**。Hammer 不缓存地
 | 7 | 不做 `nm->node_by_error` 反查表（error.c:188-196） | 今天没有"由 buffer 错误值反查节点"的 Hammer 调用者 |
 | 8 | heap 只移植分配侧：没有 `heap_dealloc`、free list、bins、合并；也没有 `error_heap_handle` | VPP 的释放路径只有 `vlib_unregister_errors` 一个调用者（error.c:98-110）；Hammer 没有单节点卸载，重建 = 整张 `NodeRuntimeInner` 替换（Rust Drop）。Rust 的释放是所有权，不是句柄（§4.3） |
 | 9 | heap 归节点域（`NodeMain`），VPP 放在 `error_main` | 只有 thread zero 分配它（error.c:125），worker 只持有拷贝；Hammer 的列归属本来就在节点域，main 域不再加一个 `RefCell<Heap>`（§2、§4.4）。worker 克隆是只读副本，与 VPP 的浅拷贝等价 |
-| 10 | heap 元素只存列归属（`NodeErrorColumn { node }`），不存名字/描述/severity/symlink 索引 | VPP 的 `vlib_error_desc_t` 元素承载这些是因为它注册后还要用（再注册、`show errors`、卸载）；Hammer 的 descriptor 是静态声明，symlink 索引用 `find` 幂等判定、今天没有读者（§4.4） |
+| 10 | heap 元素只存列归属（`NodeId`），不存名字/描述/severity/symlink 索引 | VPP 的 `vlib_error_desc_t` 元素承载这些是因为它注册后还要用（再注册、`show errors`、卸载）；Hammer 的 descriptor 是静态声明，symlink 索引用 `find` 幂等判定、今天没有读者（§4.4），所以元素退回它唯一还成立的事实 |
 
 ## 9. Stats Client 集成（node stats + node error stats）
 
@@ -519,6 +519,9 @@ impl NodeErrorStats {
    VPP 的 `set_errors` 同样只按前缀过滤，从不读 `/node/errors`。
 2. 逐条 `read("/err/<node>/<error>")`：必须是 `Simple(rows)` 且每行 1 列（symlink 裁列）；
    `counts` 就是这些行的值，线程数由 `counts.len()` 得到。VPP 在这一步做的是 `self[k].sum()`。
+   VPP 的 report 是 `name → total` 映射，所以它跳过 total 为 0 的条目；Hammer 的 report 保留
+   每个已发布错误的每线程计数（调用方按 `total()` 自行过滤），这是本仓与 `set_errors` 的
+   唯一有意差异。
 3. 名字解析：去掉 `/err/` 前缀后 `split_once('/')`，两段非空即 `(node, error)`；不满足就跳过该条
    （服务端注册期已断言节点名不含 `/`，§1），不构造新错误类别。
 4. 列举与读取之间消失的条目（`MetricNotFound`）跳过——VPP 的 `except KeyError: pass`。
@@ -537,7 +540,7 @@ impl NodeErrorStats {
 | `hammer-infra` | 泛型 heap（元素空间 + offset 分配），`Vec<T>` 存储 | 认识 node/error/列号/stats/段；出现释放 API、释放相关字段或裸 handle | `rg -n "node_error|NodeError|node/errors" crates/hammer-infra/src` 无命中 |
 | `hammer-stats` | `add_simple_counter`/`find`/`validate`/`add_symlink`/`set_simple_counter`/`increment_simple_counter`/采集者表/轮次 | 出现 node/error/`NodeErrorIndex`/`NodeErrorDescriptor` 名字；为 error 家族加第二套登记 | `rg -n "node_error|NodeError" crates/hammer-stats/src` 无命中 |
 | `hammer-runtime` main 域（`DataPlaneMain`） | 持有本线程的条目索引；注册期发布形状；记录点写本线程行 | 把条目/行交给别的线程；在冻结点之后分配错误槽 | 字段与访问器 `pub(crate)`；冻结点断言 |
-| `hammer-runtime` node 域（`NodeMain`） | 错误槽身份、列空间（`Heap<NodeErrorColumn>`）、列宽、本地 code → 全局列号 | 碰段、碰行、记计数 | `NodeMain` 无任何 stats 段类型；访问器 `pub(crate)` |
+| `hammer-runtime` node 域（`NodeMain`） | 错误槽身份、列空间（`Heap<NodeId>`）、列宽、本地 code → 全局列号 | 碰段、碰行、记计数 | `NodeMain` 无任何 stats 段类型；访问器 `pub(crate)` |
 | 插件/服务 | `record_current_node_error` + `NodeErrorCode`；按需 `set_index_node_error` | 认识 `/node/errors`、列号、段、轮次 | `rg -n "node/errors\|/err/" crates/hammer-plugins crates/hammer-service` 无命中 |
 | client（外部仓） | `StatsReader`（names + read）、`StatsProvider` 投影、本地聚合 | `StatsClient` 家族方法、协议改动、跨 epoch 缓存 | in-memory fixture + e2e；`StatsClient` 公共面无 node error 名字 |
 
@@ -548,13 +551,13 @@ impl NodeErrorStats {
 | 文件 | 项 | 说明 |
 | --- | --- | --- |
 | `crates/hammer-infra/src/heap.rs`（新模块）+ `lib.rs` 的 `pub mod heap;` | `Heap<T>`、`Heap::new/alloc/len/is_empty/get`（offset 用 `u32`） | §3.1、§4：只移植分配侧，没有 `dealloc`/free list/裸 handle |
-| `crates/hammer-runtime/src/node.rs`（状态替换） | `NodeMain.error_column_heap: Heap<NodeErrorColumn>`；`NodeErrorColumn`、`NodeErrorColumnRange`；`error_indices`/`next_error_index`/`error_tables_installed` → `error_columns: Vec<Option<NodeErrorColumnRange>>` | §3.4、§4.2：净减两项状态 |
+| `crates/hammer-runtime/src/node.rs`（状态替换） | `NodeMain.error_column_heap: Heap<NodeId>`（元素 = 列归属节点）；`NodeErrorColumnRange`；`error_indices`/`next_error_index`/`error_tables_installed` → `error_columns: Vec<Option<NodeErrorColumnRange>>` | §3.4、§4.2：净减两项状态 |
 | `crates/hammer-stats/src/segment.rs` | `StatsSegment::increment_simple_counter(index, row, column, increment)` | §3.2，唯一机制改动；纪律与 `set_simple_counter` 相同 |
-| `crates/hammer-runtime/src/data_plane/main.rs` | `DataPlaneMain.node_error_stats_entry_index: Cell<Option<DirectoryIndex>>` | §3.3 |
+| `crates/hammer-runtime/src/data_plane/main.rs` | `DataPlaneMain.node_error_stats_entry_index: Cell<Option<DirectoryIndex>>`（`pub(crate)`：冻结点由 `start_workers` 读取后分发给每个 runtime） | §3.3 |
 | 同上 | `DataPlaneMain::install_node_error_stats_entry(&self, entry: Option<DirectoryIndex>)` | §3.3、§7 |
 | `crates/hammer-runtime/src/data_plane/dispatch.rs` | `DataPlaneMain::register_node_errors(&self, node, descriptors)` | §3.3、§5 |
 | `crates/hammer-runtime/src/node.rs` | `NodeMain::node_error_columns`；`record_node_error` → `node_error_index` 改名 | §3.4 |
-| `crates/hammer-runtime/src/node.rs` + `data_plane/dispatch.rs` + `crates/hammer-plugins/net/{ip,icmp}` | **改名（不是新 API）**：`NodeMain::materialize_node_errors` → `register_node_errors`（`pub`，插件 16 个调用点）；`NodeRuntimeInner::materialize_node_errors` 同名私有方法一并改 | §3.4、§4、§5：与 VPP `vlib_register_errors` 同名，语义不变 |
+| `crates/hammer-runtime/src/node.rs` + `data_plane/dispatch.rs` + `crates/hammer-plugins/net/{ip,icmp}` | **改名（不是新 API）**：`materialize_node_errors` → `register_node_errors`（节点域收为 `pub(crate)`，`NodeRuntimeInner` 同名私有方法一并改）；插件 16 个调用点改调 `DataPlaneMain::register_node_errors` | §3.4、§4、§5：与 VPP `vlib_register_errors` 同名，语义不变 |
 | `crates/hammer-runtime/src/start_workers.rs` | 每线程装条目（thread zero + 每个 Worker） | §7 |
 | `crates/hammer/tests/stats_segment_mapping.rs` | error 家族的只读样例与断言 | §12 |
 | `netsystem-client`（外部仓） | provider/report/两组用例（**不新增错误变体**） | §9 |
@@ -574,7 +577,7 @@ client 侧同样不加错误类别：没有 `columns - 1` 完整性校验，也�
 | M0 机制原语 | `hammer-infra` heap（分配侧：offset 连续、`len` 单调、`get` 越界 `None`、`alloc(0)` 断言；文档写明没有释放面）+ `increment_simple_counter` + 文档（形状需已发布、越界断言） | heap 单测通过；`hammer-infra` 仍无 node/error 名字；机制层单测：行解析、自增、越界/类型断言；`hammer-stats` 仍无 node/error 名字 |
 | M1 注册路径 | 条目字段 + heap 注册（上限检查 + `NodeErrorColumnRange`）+ 改名 `register_node_errors`（含 16 个插件调用点）+ `validate`/symlink/冻结点断言 + `node_error_columns` | 目录侧：`/node/errors` 形状、`/err/*` 完整；零错误时条目不存在；两次注册增长不丢已写计数；列号 = `heap.len()`（列宽 = `heap.len() + 1`）；插件全部编译通过 |
 | M2 记录路径 | `increment_simple_counter` 接入 + `node_error_index` + `install_node_error_stats_entry` + `start_workers` | 两个 Worker 各自记录，读回各自行；thread zero 的 process 节点错误进第 0 行；buffer 值 == 列号 |
-| M3 本仓 fixture | 真实 daemon 的只读断言（零错误配置 + 已注册错误表的节点，如 `ip4-local`/`icmp`） | fixture 通过；`per_node_counters = false` 时 error 家族仍完整 |
+| M3 本仓 fixture | 真实 daemon 的只读断言（零错误配置 + 已注册错误表的节点，如 `ip4-local`/`icmp`） | fixture 通过（`crates/hammer/tests/stats_segment_mapping.rs` 的 `stats_segment_publishes_node_error_columns`）：零错误时 `/node/errors` 与 `/err/*` 都不存在；加载 ip/icmp 插件后形状 = 每线程一行、列 = 1 + 错误数、每个 `/err/*` 是 symlink 且列恰好覆盖 `1..columns`；`per_node_counters = false` 时 error 家族仍完整 |
 | M4 client | §9 的全部用例（in-memory fixture + e2e） | 按 VPP `set_errors` 语义：只按 `/err/` 前缀列举、逐条读、消失就跳过；记录后立即可见 |
 
 关键断言：写者唯一（只改自己那一行=自己 thread_index 那行）；thread zero 行身份；索引解析失败
@@ -596,11 +599,16 @@ client 侧同样不加错误类别：没有 `columns - 1` 完整性校验，也�
 4. **本仓 fixture**：`crates/hammer/tests/stats_segment_mapping.rs` 追加 error 家族样例（§12 M3）。
 5. **外部 `netsystem-client` 仓**：新增 provider/report/用例（§9、§11）；不新增错误变体。
 6. **`hammer-infra` 的 heap 原语**：新增模块与单测（§12 M0）；它不认识 node/error，也不含释放面。
-7. **既有插件缺口（本 ADR 不修，但影响验证选材）**：`ip4-input`/`ip6-input` 在记录点调用
+7. **生命周期阶段修正（本 ADR 的 M3 前置）**：`ip_feature_init` 与 `interface_feature_init`
+   从 init-function 阶段移到 main-loop-enter 阶段（约束见 ADR-0006 的实现修订），因为 Hammer 在
+   init functions 之后才 materialize 图节点，而这两个函数需要节点已经存在；`topological_order`
+   同时改为 VPP 的稳定注册序拓扑序（`third_party/vpp/src/vlib/init.c:172-199`）。M3 的
+   "加载插件即可看到 `/err/*`" 依赖这两处，否则带插件的 daemon 无法启动。
+8. **既有插件缺口（本 ADR 不修，但影响验证选材）**：`ip4-input`/`ip6-input` 在记录点调用
    `record_current_node_error(IpInputError)`，但没有任何 call site 注册 `IpInputError::DESCRIPTORS`
    （该类型也没有 `DESCRIPTORS`），所以这些记录点今天返回 `NodeErrorSlotOverflow`。M2/M3 要选真实
    注册过错误表的节点（`ip4-local`、`icmp`），插件侧单独修。
-8. **既有名字的重命名（语义不变）**：`NodeMain::materialize_node_errors`（`pub`，插件 16 个调用点：
+9. **既有名字的重命名（语义不变）**：`NodeMain::materialize_node_errors`（`pub`，插件 16 个调用点：
    `crates/hammer-plugins/net/ip/src/local.rs:134,172,236,304,342,406`、
    `net/ip/src/icmp_error.rs:127,138`、`net/icmp/src/icmp.rs:252,281,407,458,771,782,806,815`）
    → `register_node_errors`；`NodeRuntimeInner` 的私有同名方法一并改；`record_node_error` →
