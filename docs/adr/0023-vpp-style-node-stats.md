@@ -216,7 +216,7 @@ Date: 2026-09-17
 ///
 /// 只有拥有该行的线程写（派发点写三个计数；`suspends` 只有 thread zero 写），只有轮次读。
 /// 跨线程的那一格因此是一次 `Relaxed` 访问——与 ADR-0021 A7/D4（`/sys` 的每线程发布值）、
-/// ADR-0022 D3（池内 `AtomicUsize` 槽）同一条纪律：**一份状态、没有影子字段**。
+/// ADR-0022 D3（池内 `AtomicU32` 槽）同一条纪律：**一份状态、没有影子字段**。
 /// VPP 在同一位置写裸 32 位字段（V4），那是 C 不需要 data-race 规则；取舍见 D1.4。
 #[repr(C)]
 pub(crate) struct NodeCounters {
@@ -440,7 +440,7 @@ VPP 在同一位置写裸 32 位字段（V4），采集点也刻意不做 barrie
 所以跨线程的那一格必须是一次原子访问。这里选 `Relaxed`（不是 `Acquire`/`SeqCst`）的理由是仓库
 既定的统计序：发布的是数值而不是所有权，AGENTS 的同步规则把 `Relaxed` 限定给统计与线程内顺序，
 ADR-0021 A7/D4 已用同一条纪律发布 `/sys/main_loop_count_per_worker` 与 `/sys/loops_per_worker`，
-ADR-0022 D3 用池内 `AtomicUsize` 发布每个 worker 的 cache 长度。代价与 VPP 相同：轮次读到的是
+ADR-0022 D3 用池内 `AtomicU32` 发布每个 worker 的 cache 长度。代价与 VPP 相同：轮次读到的是
 逐格独立的快照（D7 第 2 条）。
 
 | 被否掉的替代 | 为什么否 |

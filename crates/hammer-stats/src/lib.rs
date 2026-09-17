@@ -12,6 +12,7 @@ use std::time::Duration;
 
 use hammer_infra::mem::{MemError, PageSize};
 
+pub mod buffer_pools;
 pub mod mem;
 mod metric;
 mod protocol;

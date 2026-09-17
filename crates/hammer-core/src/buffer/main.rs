@@ -1,6 +1,7 @@
 use std::cell::RefCell;
 use std::num::NonZeroUsize;
 use std::sync::OnceLock;
+use std::sync::atomic::{AtomicU32, Ordering};
 
 use hammer_infra::{PageSize, physmem::PhysmemMain};
 use spinning_top::Spinlock;
@@ -13,6 +14,34 @@ const MAX_BUFFER_MEMORY: usize = 1 << 38;
 const MAX_NUMA_NODES: usize = 32;
 
 static BUFFER_MAIN: OnceLock<BufferMain> = OnceLock::new();
+
+/// One Buffer Pool reading: the three facts the `/buffer-pools` gauges publish
+/// (`third_party/vpp/src/vlib/buffer.c:838-872`).
+///
+/// The value owns its numbers: it does not borrow the Pool and holds no lock.
+/// `cached` is the sum over the Pool's per-thread slots (VPP `Σ bpt->n_cached`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BufferPoolUsage {
+    /// VPP `bp->n_buffers`: buffers in the Pool, fixed when it is created.
+    pub buffer_count: u64,
+    /// VPP `bp->n_avail`: the Pool free list length.
+    pub available: u64,
+    /// VPP `Σ bpt->n_cached`: buffers held by the Worker thread caches.
+    pub cached: u64,
+}
+
+impl BufferPoolUsage {
+    /// VPP `buffer_gauges_collect_used_fn` (`buffer.c:846`).
+    ///
+    /// The three facts are three independent reads (VPP reads them the same way):
+    /// when they disagree at one instant the result is zero instead of the
+    /// `u32`-wrap `n_buffers - n_avail - Σ n_cached` would produce.
+    pub fn used(&self) -> u64 {
+        self.buffer_count
+            .saturating_sub(self.available)
+            .saturating_sub(self.cached)
+    }
+}
 
 /// Process-wide authority for Physmem-backed packet Buffer Pools.
 ///
@@ -33,6 +62,8 @@ unsafe impl Sync for BufferMain {}
 pub(super) struct BufferPool {
     pub(super) mapping_index: u32,
     pub(super) index: u8,
+    /// VPP `bp->name` (`buffer.c:529`): `default-numa-<numa-node>`.
+    pub(super) name: String,
     pub(super) data_size: usize,
     pub(super) allocation_size: usize,
     pub(super) first_buffer: usize,
@@ -41,8 +72,22 @@ pub(super) struct BufferPool {
     // VPP buffer_known_hash equivalent: diagnostics only, never ownership.
     #[cfg(debug_assertions)]
     pub(super) known_allocated: Spinlock<std::collections::HashSet<u32>>,
-    pub(super) workers: Box<[RefCell<BufferThreadCache>]>,
+    pub(super) workers: Box<[BufferThreadCacheSlot]>,
     pub(super) template: super::header::BufferTemplate,
+}
+
+/// VPP `vlib_buffer_pool_thread_t` (`buffer.h:437-444`): the Pool-owned
+/// per-thread cache-line slot, holding that thread's cache and its length.
+#[repr(align(64))]
+pub struct BufferThreadCacheSlot {
+    /// VPP `n_cached` (`buffer.h:443`): a `u32` length written by the owning
+    /// thread and read by the stats round. VPP keeps this same owner-writes /
+    /// main-thread-reads field as a relaxed atomic in
+    /// `vlib_pool_cache_thread_t.n_cached` (`pool_cache.h:64-68,221-238`), so
+    /// Hammer uses the atomic form of the same `u32` field.
+    pub(super) cached_count: AtomicU32,
+    /// VPP `cached_buffers[]`: only the worker bound to this slot borrows it.
+    pub(super) cache: RefCell<BufferThreadCache>,
 }
 
 #[repr(align(64))]
@@ -53,7 +98,6 @@ pub struct BufferThreadCache {
     pub(super) pool_index: u8,
     pub(super) thread_index: u32,
     pub(super) indices: [u32; BUFFER_THREAD_CACHE_HIGH_WATER],
-    pub(super) len: usize,
 }
 
 impl BufferMain {
@@ -217,6 +261,8 @@ impl BufferMain {
             main.pools.push(BufferPool {
                 mapping_index,
                 index,
+                // VPP `buffer.c:785`: `format (0, "default-numa-%d", numa_node)`.
+                name: format!("default-numa-{}", mapping.numa_node()),
                 data_size,
                 allocation_size,
                 first_buffer,
@@ -227,13 +273,13 @@ impl BufferMain {
                     buffer_count,
                 )),
                 workers: (0..thread_count)
-                    .map(|thread_index| {
-                        RefCell::new(BufferThreadCache {
+                    .map(|thread_index| BufferThreadCacheSlot {
+                        cached_count: AtomicU32::new(0),
+                        cache: RefCell::new(BufferThreadCache {
                             pool_index: index,
                             thread_index: thread_index as u32,
                             indices: [0; BUFFER_THREAD_CACHE_HIGH_WATER],
-                            len: 0,
-                        })
+                        }),
                     })
                     .collect(),
                 template,
@@ -250,5 +296,42 @@ impl BufferMain {
         BUFFER_MAIN
             .get()
             .expect("Buffer Main is published before worker initialization")
+    }
+
+    /// Number of established Pools; the Pool set is fixed after `init`.
+    pub fn pool_count(&self) -> usize {
+        self.pools.len()
+    }
+
+    /// VPP `bp->name` (`buffer.c:529`); `pool_index` comes from `pool_count()`.
+    pub fn pool_name(&self, pool_index: u8) -> &str {
+        &self.pools[usize::from(pool_index)].name
+    }
+
+    /// Samples one Pool: VPP `buffer_gauges_collect_*_fn`'s three reads
+    /// (`buffer.c:838-872`).
+    ///
+    /// Read-only: `available` takes the Pool free-list lock for its length,
+    /// `cached` sums the per-thread slots with relaxed atomic loads (the stats
+    /// round cannot borrow a worker's cache and does not need to). No
+    /// allocation, no I/O.
+    pub fn pool_usage(&self, pool_index: u8) -> BufferPoolUsage {
+        let pool = &self.pools[usize::from(pool_index)];
+        // VPP `bp->n_avail`: the free list length.
+        let available =
+            u64::try_from(pool.free.lock().len()).expect("a pool's free chain fits u64");
+        // VPP `buffer_get_cached`: `vec_foreach (bpt, bp->threads) cached += bpt->n_cached;`
+        // over the Pool's own per-thread slots, without borrowing their caches.
+        let cached = pool
+            .workers
+            .iter()
+            .map(|slot| u64::from(slot.cached_count.load(Ordering::Relaxed)))
+            .sum();
+        BufferPoolUsage {
+            // VPP `bp->n_buffers`, fixed when the Pool is created.
+            buffer_count: u64::try_from(pool.buffer_count).expect("a pool's buffer count fits u64"),
+            available,
+            cached,
+        }
     }
 }
