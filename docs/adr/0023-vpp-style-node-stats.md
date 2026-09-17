@@ -320,6 +320,36 @@ self.last_time_stamp = dispatch_end;
   上一次派发的结束点起算**——它包含派发之间的主循环工作（文件轮询、handoff、调度），
   这是 VPP 的既有口径（V7、V8），不是"Hammer 累计的纯节点执行时间"。
 
+**四个计数各自怎么算**（每个线程 `t`、每个节点槽 `s` 一套；每一项与 VPP 的累加行逐条对应）：
+
+| 计数 | 本设计的算式（一次派发 / 一次挂起） | VPP 对应 |
+| --- | --- | --- |
+| `calls` | `+= 1`（派发点每次调用节点函数一次） | `n->stats_total.calls += n_calls`，`n_calls = 1`（V4、V7） |
+| `vectors` | `+= count`，`count` = 节点函数返回值 = 这一次处理的向量数（H2） | `n->stats_total.vectors += n_vectors + vectors_since_last_overflow`（V4、V7） |
+| `clocks` | `+= cpu_time_now() - last_time_stamp`，即"上一次派发结束（本轮首次派发则是主循环刷新点）到本次派发结束"之间的裸计数器差 | `n->stats_total.clocks += n_clocks + clocks_since_last_overflow`，`n_clocks = t - last_time_stamp`（V4、V7） |
+| `suspends` | 每次进入挂起 `+= 1`（只在 thread zero 的 process 挂起点，D6） | `n->stats_total.suspends += p->n_suspends`，`p->n_suspends += 1`（V6、V9） |
+
+```text
+一次派发（线程 t、节点槽 s）:
+    dispatch_end = cpu_time_now()
+    node_counters(t, s).calls   += 1
+    node_counters(t, s).vectors += count
+    node_counters(t, s).clocks  += dispatch_end - last_time_stamp
+    last_time_stamp = dispatch_end
+
+一次挂起（thread zero 的 process 节点 p）:
+    node_counters(0, slot(p)).suspends += 1
+```
+
+- **目录里那个格子的值就是这个数的直接投影，不再做任何计算**：`/sys/node/<counter>` 的
+  `row = t`、`column = s` 单元格 = `node_counters(t, s).<counter>`（采集者只做一次 `Relaxed` 读，
+  D1.3）。不跨线程求和（VPP 的行本身就是每线程，V14）、不换算成时间（`clocks` 是裸 ticks，
+  V25、V28）、不做速率（VPP 的 node 家族没有速率条目；`/sys/vector_rate*` 与
+  `/sys/loops_per_worker` 是另一组已注册的采集者，属 ADR-0019 M4，D8）、不做 `clear` 差分
+  （`stats_total - stats_last_clear` 要有 owner 侧基线，Hammer 今天没有 `clear` 面，D7 第 4 条）。
+- **明确不算的东西**：`max_clock`/`max_clock_n`（V4 的 max 分支，只有 `show node` 消费，V25）、
+  32 位溢出的回滚与两级同步（D1.5）、`n_vectors_by_next_node`（VPP 按 next 计数，无消费者）。
+
 **D1.3 轮次的读路径：采集者直接持有各线程的行；没有句柄、没有 `OnceLock`、不取段锁、
 不借 worker 的 `RefCell`。**
 
