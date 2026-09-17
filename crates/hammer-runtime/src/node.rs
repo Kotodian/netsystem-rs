@@ -350,6 +350,11 @@ impl NodeEntry {
 }
 
 pub struct NodeMain {
+    /// This thread's per-node counters: VPP's `vlib_node_runtime_t` counter
+    /// fields in that thread's `node_main.nodes`. Installed once before the
+    /// Worker is launched and never replaced, so the graph holds a bare slice
+    /// rather than a handle to storage it does not own.
+    node_counters: &'static [crate::node_stats::NodeCounters],
     inner: RefCell<NodeRuntimeInner>,
     pending_frames: RefCell<Vec<PendingFrame>>,
     scheduled_nodes: RefCell<Vec<NodeId>>,
@@ -1032,6 +1037,7 @@ impl NodeRuntimeInner {
 impl Default for NodeMain {
     fn default() -> Self {
         Self {
+            node_counters: &[],
             inner: RefCell::new(NodeRuntimeInner {
                 nodes: Vec::new(),
                 node_states: Vec::new(),
@@ -1091,6 +1097,7 @@ impl From<NodeRuntimeInner> for NodeMain {
         let (next_frames, next_frame_indices) = Self::next_frames_for_graph(&inner);
         let enqueue_owners = vec![None; inner.nodes.len()];
         Self {
+            node_counters: &[],
             inner: RefCell::new(inner),
             pending_frames: RefCell::new(Vec::with_capacity(32)),
             scheduled_nodes: RefCell::new(Vec::new()),
@@ -1552,6 +1559,31 @@ impl NodeMain {
             .get(&handle)
             .copied()
             .ok_or(RuntimeError::NodeHandleNotRegistered { handle })
+    }
+
+    /// Installs this thread's counter row.
+    ///
+    /// Called once before the Worker is launched: the row belongs to
+    /// [`crate::node_stats::NodeCounterRows`] and lives for the process, so the
+    /// graph only records the borrow. Refork changes graph facts, not rows.
+    pub(crate) fn install_node_counters(
+        &mut self,
+        row: &'static [crate::node_stats::NodeCounters],
+    ) {
+        self.node_counters = row;
+    }
+
+    /// The counters of `node` in this thread's row, or `None` while the graph
+    /// has no published row.
+    ///
+    /// A row is published when the graph is frozen against the node capacity
+    /// (`start_workers`, before any Worker launch), and every runtime that
+    /// dispatches inside the daemon lifecycle passed that point. A runtime built
+    /// directly (unit tests, benches) never publishes a row and therefore
+    /// accumulates no node counters; that is an ordinary absence, not a bug.
+    #[inline(always)]
+    pub(crate) fn node_counters(&self, node: NodeId) -> Option<&crate::node_stats::NodeCounters> {
+        self.node_counters.get(node.slot() as usize)
     }
 
     #[inline]
@@ -2191,6 +2223,14 @@ impl DataPlaneMain {
         let mut slot = self.nodes.runtime_slot(node)?;
         self.set_current_node(Some(node));
         let count = slot.dispatch(self, frame);
+        // VPP `dispatch_node`: take one timestamp after the node returns, hand
+        // the delta from the start of this dispatch to the counters, and leave
+        // the value as the start of the next dispatch.
+        let dispatch_end = hammer_infra::time::cpu_time_now();
+        if let Some(counters) = self.nodes.node_counters(node) {
+            counters.update_dispatch(count as u64, dispatch_end - self.last_time_stamp);
+        }
+        self.last_time_stamp = dispatch_end;
         let state = slot.runtime_data.take().expect("Node returns its runtime");
         let mut inner = self.nodes.inner.borrow_mut();
         assert!(

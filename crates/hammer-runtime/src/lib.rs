@@ -22,7 +22,10 @@ crate::__declare_registration_image!(
         config::worker::__CONFIG_FN_RUNTIME_WORKER_CONFIG,
         config::stats::__CONFIG_FN_RUNTIME_STATS_CONFIG,
     ];
-    main_loop_enter_functions = [start_workers::__INIT_FN_START_WORKERS];
+    main_loop_enter_functions = [
+        start_workers::__INIT_FN_START_WORKERS,
+        node_stats::__INIT_FN_INSTALL_NODE_STATS,
+    ];
     main_loop_exit_functions = [config::stats::__INIT_FN_EXIT_STATS_MAIN];
     worker_init_functions = [];
     num_workers_change_functions = [];
@@ -40,6 +43,7 @@ crate::__declare_registration_image!(
         config::stats::__STATS_COLLECT_REGISTRATION_REGISTER_STAT_SEGMENT_HEAP,
         config::stats::__STATS_COLLECT_REGISTRATION_REGISTER_WORKER_MAIN_LOOP,
         data_plane::buffer_stats::__STATS_COLLECT_REGISTRATION_REGISTER_BUFFER_POOLS,
+        node_stats::__STATS_COLLECT_REGISTRATION_REGISTER_NODE_STATS,
     ];
 );
 
@@ -77,6 +81,7 @@ pub mod attach;
 pub mod data_plane;
 pub mod handoff;
 pub mod node;
+pub(crate) mod node_stats;
 mod runtime_simd;
 pub mod thread_main;
 pub mod trace;

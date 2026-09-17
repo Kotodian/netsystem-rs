@@ -90,6 +90,7 @@ enum StatsMetric {
     Timestamp,
     SimpleCounter,
     CombinedCounter,
+    NameVector,
     Histogram,
 }
 
@@ -299,12 +300,7 @@ fn stats_field(field: &Field, namespace: &str) -> Result<StatsField> {
         StatsMetricBase::Timestamp => StatsMetric::Timestamp,
         StatsMetricBase::SimpleCounter => StatsMetric::SimpleCounter,
         StatsMetricBase::CombinedCounter => StatsMetric::CombinedCounter,
-        StatsMetricBase::NameVector => {
-            return Err(Error::new_spanned(
-                &field.ty,
-                "`NameVector` requires a typed length input and is not supported by `Stats`",
-            ));
-        }
+        StatsMetricBase::NameVector => StatsMetric::NameVector,
         StatsMetricBase::Histogram => StatsMetric::Histogram,
         StatsMetricBase::Ring => {
             return Err(Error::new_spanned(
@@ -396,6 +392,10 @@ fn stats_metric_operations(field: &StatsField) -> (TokenStream2, TokenStream2) {
         StatsMetric::CombinedCounter => (
             quote!(::hammer_stats::DirectoryType::CounterVectorCombined),
             quote!(segment.add_combined_counter(#path)),
+        ),
+        StatsMetric::NameVector => (
+            quote!(::hammer_stats::DirectoryType::NameVector),
+            quote!(segment.add_name_vector(#path, 0)),
         ),
         StatsMetric::Histogram => (
             quote!(::hammer_stats::DirectoryType::HistogramLog2),

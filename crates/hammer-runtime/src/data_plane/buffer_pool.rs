@@ -131,6 +131,7 @@ impl DataPlaneMain {
             damping_constant: (-1.0_f64 / 20.0).exp(),
             main_loop_exit_now: false,
             main_loop_exit_status: 0,
+            last_time_stamp: hammer_infra::time::cpu_time_now(),
             worker_init_functions_called: hammer_infra::bitmap::Bitmap::new(),
         })
     }

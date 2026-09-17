@@ -124,6 +124,11 @@ impl NodeMain {
         if !self.suspended_processes.contains(&node) {
             self.suspended_processes.push(node);
         }
+        // VPP `p->n_suspends += 1` (`main.c:1272`): this node now waits for an
+        // event, which is one suspend of the process node.
+        if let Some(counters) = self.node_counters(node) {
+            counters.add_suspend();
+        }
         Ok(receiver)
     }
 
@@ -177,6 +182,10 @@ impl NodeMain {
         }
         if !self.suspended_processes.contains(&node) {
             self.suspended_processes.push(node);
+        }
+        // VPP `vlib_process_suspend`: one more suspend of this process node.
+        if let Some(counters) = self.node_counters(node) {
+            counters.add_suspend();
         }
         self.process_timer_state
             .retain(|(current, _)| *current != node);

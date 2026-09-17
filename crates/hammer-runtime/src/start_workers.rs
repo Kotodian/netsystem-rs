@@ -31,13 +31,28 @@ fn start_workers(main: &mut DataPlaneMain) -> RuntimeResult<()> {
         crate::config::worker::handoff().queue_capacity,
         main.nodes().node_count(),
     );
+    // One counter row per thread, at the same frozen node capacity the handoff
+    // uses; thread zero's row goes into this graph and each Worker's row into
+    // that Worker's graph clone before launch.
+    let node_counter_rows =
+        crate::node_stats::NodeCounterRows::install(worker_count + 1, main.nodes().node_count());
+    main.nodes.install_node_counters(
+        node_counter_rows
+            .row(0)
+            .expect("thread zero owns a counter row"),
+    );
     let mut worker_mains = Vec::with_capacity(worker_count as usize);
     for worker_slot in 0..worker_count {
         let thread_index = worker_slot + 1;
         let descriptor = threads
             .thread_by_index(thread_index)
             .expect("configured worker descriptor exists");
-        let (nodes, simd_bytes, _, trace_control) = main.worker_parts();
+        let (mut nodes, simd_bytes, _, trace_control) = main.worker_parts();
+        nodes.install_node_counters(
+            node_counter_rows
+                .row(thread_index)
+                .expect("every Data Worker owns a counter row"),
+        );
         worker_mains.push(Box::new(DataPlaneMain::new_worker(
             nodes,
             simd_bytes,

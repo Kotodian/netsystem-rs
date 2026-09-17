@@ -55,6 +55,10 @@ pub struct DataPlaneMain {
     damping_constant: f64,
     main_loop_exit_now: bool,
     main_loop_exit_status: i32,
+    /// Start of the next Node dispatch's `clocks` measurement: VPP
+    /// `dispatch_node`'s `last_time_stamp`, refreshed once per main-loop
+    /// iteration and otherwise advanced by the dispatch point itself.
+    pub(crate) last_time_stamp: u64,
     pub(crate) worker_init_functions_called: Bitmap,
 }
 
