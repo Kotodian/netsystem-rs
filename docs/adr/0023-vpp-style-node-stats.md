@@ -86,11 +86,11 @@ Date: 2026-09-17
 - **D0 目录契约**：`/sys/node/names`（`NameVector`）+ `/sys/node/{clocks,vectors,calls,suspends}`
   （`CounterVectorSimple`，行 = 线程、列 = 节点）+ `/nodes/<name>/<counter>`（`Symlink`，指向第
   `<node slot>` 列），逐条对应 V10–V13、V19、V22；只在 `per_node_counters = true` 时存在（V16、V24）。
-- **D1 计数存储 = 每个线程图里的每节点四个 `Relaxed` 原子格**（`NodeMain` 的计数器行，
-  槽 = `NodeId::slot()`），在 `start_workers` 按冻结的节点容量随图建好；线程描述符上只放
-  指向该行的句柄（VPP `vlib_worker_thread_t.vlib_main`），不放假存储。归 VPP
-  `vlib_node_runtime_t` 的每线程计数器（V3）；**不复制 VPP 的 32 位累加 + 溢出同步**
-  （理由见 D1.4）。
+- **D1 计数存储 = 每个线程图里的每节点四个 `Relaxed` 格**，槽 = `NodeId::slot()`，就是 VPP
+  `vlib_node_runtime_t` 的每线程计数器（V3）；行按线程建一份、活到进程结束（D1.1），worker 的图
+  克隆在发射前各装自己那一行。**线程描述符上不加字段、不加 `OnceLock`/`Arc`/句柄**（VPP 那里只有
+  一个指向该线程 main 的 `vlib_main` 指针），轮次读的就是这些格（D1.3）；**不复制 VPP 的 32 位
+  累加 + 溢出同步**（D1.5），格是 `Relaxed` 的理由见 D1.4。
 - **D2 `cpu_time_now()` 落在 `hammer-infra::time`**（VPP `clib_cpu_time_now`，V28）：x86_64 用
   std 稳定 intrinsic `core::arch::x86_64::_rdtsc`、aarch64 用一条 `core::arch::asm!("mrs …,
   cntvct_el0")`（std 的 aarch64 稳定模块没有计数器 intrinsic），**不引第三方 crate**（候选对照
@@ -197,33 +197,38 @@ Date: 2026-09-17
 - **客户端语义**：`/sys/node/names` + 四个向量是"原始表"，`/nodes/*` 是"按节点名取一列"的便利面；
   两条路径的值来自同一次投影（同一个采集者的同一格），不承诺跨条目/跨线程的同一瞬间快照（D7 第 2 条）。
 
-### D1 每线程每节点计数器：位置、形状与更新点
+### D1 每线程每节点计数器：位置、更新点与轮次的读路径
 
-**D1.1 位置与形状：计数器是本线程 node 行里的每节点一格（VPP `vlib_node_runtime_t`，
-V3）；线程描述符上只放句柄（VPP `vlib_worker_thread_t.vlib_main` 指向该线程 main 的那一格）。**
+**D1.1 位置：四个格就是该线程 node 行（`NodeMain`）里的每节点计数——VPP `vlib_node_runtime_t`
+的位置（V3）；线程描述符上不放任何东西。**
+
+行的形状与 VPP 逐字对应：一个线程一行、一个节点一槽（`NodeId::slot()`），长度 = 冻结的节点容量
+（H5）。四个格 = VPP 该线程 `node_main.nodes` 里那排 runtime 的 `calls`/`vectors`/
+`clocks_since_last_overflow`（V3）加 process 节点的 `n_suspends`（V1、V9）。单写者是拥有该行的
+线程（派发点写三个计数，thread zero 的 process 挂起点写 `suspends`），读它的只有 thread zero
+上的轮次。
 
 ```rust
 // crates/hammer-runtime/src/node_stats.rs
 
-/// 一个节点的四个累计计数：VPP `vlib_node_runtime_t` 的三个
-/// `calls/vectors/clocks_since_last_overflow`（V3）加 `vlib_node_stats_t.suspends`（V1）。
+/// 一个节点的四个累计计数：VPP `vlib_node_runtime_t` 的
+/// `calls/vectors/clocks_since_last_overflow`（V3）加 process 的 `n_suspends`（V1、V9）。
 ///
-/// 拥有该线程的执行体写 `calls`/`vectors`/`clocks`，thread zero 额外写 `suspends`；
-/// 只有轮次读。四个格子因此各自是一个 `Relaxed` 原子——与 `WorkerThread::main_loop_count`
-/// 同一条纪律（H6）。VPP 在同一位置是无同步的裸读写，并明确接受它的不精确（V17）。
+/// 只有拥有该行的线程写（派发点写三个计数；`suspends` 只有 thread zero 写），只有轮次读。
+/// 跨线程的那一格因此是一次 `Relaxed` 访问——与 ADR-0021 A7/D4（`/sys` 的每线程发布值）、
+/// ADR-0022 D3（池内 `AtomicUsize` 槽）同一条纪律：**一份状态、没有影子字段**。
+/// VPP 在同一位置写裸 32 位字段（V4），那是 C 不需要 data-race 规则；取舍见 D1.4。
+#[repr(C)]
 pub(crate) struct NodeCounters {
-    calls: AtomicU64,
-    vectors: AtomicU64,
     clocks: AtomicU64,
+    vectors: AtomicU64,
+    calls: AtomicU64,
     suspends: AtomicU64,
 }
 
 impl NodeCounters {
-    /// 建一个线程的行：槽 = 节点（`NodeId::slot()`），与 node 向量同长、同一冻结点（H5）。
-    pub(crate) fn row(node_capacity: usize) -> Arc<[NodeCounters]>;
-
-    /// VPP `vlib_node_runtime_update_stats`（V4）里三行的 Hammer 形式：
-    /// 一次派发 = `calls + 1`、`vectors += n`、`clocks += t - last_time_stamp`（V7）。
+    /// VPP `vlib_node_runtime_update_stats`（V4、V7）的三个累加项：
+    /// 一次派发 = `calls += 1`、`vectors += n`、`clocks += t - last_time_stamp`。
     #[inline(always)]
     pub(crate) fn update_dispatch(&self, vectors: u64, clocks: u64);
 
@@ -231,9 +236,20 @@ impl NodeCounters {
     #[inline]
     pub(crate) fn add_suspend(&self);
 
-    /// 读一格（轮次用；`Relaxed`，跨格不承诺一致快照）。
+    /// 读一格（轮次用；跨格不承诺一致快照，D7 第 2 条）。
     #[inline(always)]
     pub(crate) fn value(&self, counter: NodeCounter) -> u64;
+}
+
+/// 每线程一行：VPP "线程 → `node_main.nodes`" 的表（V3、V12）。
+pub(crate) struct NodeCounterRows { … }
+
+impl NodeCounterRows {
+    /// 建行：容量在 main-loop-enter 的冻结点取一次（H5），每线程一行、活到进程结束。
+    pub(crate) fn install(thread_count: u32, node_capacity: usize) -> Self;
+
+    /// 线程 `thread_index` 的行；`0..=worker_count()` 之外没有节点图，返回 `None`。
+    pub(crate) fn row(&self, thread_index: u32) -> Option<&'static [NodeCounters]>;
 }
 ```
 
@@ -242,50 +258,35 @@ impl NodeCounters {
 
 pub struct NodeMain {
     …
-    /// 本线程每个节点槽的四个计数：VPP 该线程 `node_main` 里那一排
-    /// `vlib_node_runtime_t` 的计数器字段。发射前建好、之后不再增长（H3）。
-    node_counters: Arc<[NodeCounters]>,
+    /// 本线程每个节点槽的四个计数：VPP 该线程 `node_main.nodes` 里那排
+    /// `vlib_node_runtime_t` 的计数器字段。发射前装好（A7）、之后不再换行（H3）。
+    node_counters: &'static [NodeCounters],
 }
 
 impl NodeMain {
-    /// 装本线程的行（发射前一次，见 D1.1 的时机）。
-    pub(crate) fn install_node_counters(&mut self, row: Arc<[NodeCounters]>);
+    /// 装本线程的行（发射前一次；`worker_parts` 的每个克隆装自己那一行）。
+    pub(crate) fn install_node_counters(&mut self, row: &'static [NodeCounters]);
 
     #[inline(always)]
     pub(crate) fn node_counters(&self, node: NodeId) -> &NodeCounters;
 }
 ```
 
-```rust
-// crates/hammer-runtime/src/worker_thread.rs（只加句柄，不加存储）
-
-pub struct WorkerThread {
-    …
-    /// 本线程计数器行的句柄：VPP `vlib_worker_thread_t.vlib_main` 指向该线程
-    /// `vlib_main_t` 的那一格。**计数器存储不在这里**（在 D1.1 的图里），这里只是轮次
-    /// 跨线程读的入口，安装形状与 `barrier`/`join_handle` 相同。
-    node_counters: OnceLock<Arc<[NodeCounters]>>,
-}
-
-impl WorkerThread {
-    pub(crate) fn install_node_counters(&self, row: Arc<[NodeCounters]>);
-    /// 轮次用；没有图的 runtime 线程没有这一格（D0 的行集合只含 thread zero + Data Worker）。
-    pub(crate) fn node_counters(&self) -> Option<&[NodeCounters]>;
-}
-```
-
-- **为什么不把存储放在线程描述符上**：VPP 把每线程计数器放在该线程自己的 node main
-  （`vlib_node_runtime_t`，V3），`vlib_worker_thread_t` 上只有指向那个 main 的**指针**。
-  把 `OnceLock<Box<[NodeCounters]>>` 当存储挂在描述符上，既不是 VPP 的位置，也把
-  "节点自己的计数"写成了"线程的计数器数组"。
-- **为什么行是共享句柄（`Arc`）**：轮次在 thread zero 上读别的线程的行；VPP 靠 raw 指针，
-  Rust 里对应的是"发射前建好、交给线程"的共享句柄——仓库里同一形状已有
-  `DataPlaneHandoff`（`Arc<DataPlaneHandoffInner>`）。行按线程各一份，**不跨线程复用**：
-  worker 的图是克隆出来的（`worker_parts`，`node.rs:1076` 的 `Clone for NodeMain`），所以
-  每一份克隆在发射前装自己那一行；refork（`inherit_worker_state`，H3）只改图的事实，不碰这行。
+- **行的所有权与生命周期**：行由 `NodeCounterRows::install` 在容量冻结点分配一次，活到进程结束
+  （`Box::leak`，每线程 `node_capacity × 32B`）。VPP 的每线程 `node_main.nodes` 同样活到进程结束：
+  拥有者线程的图要一直写它、轮次要一直读它，而 worker 的图是发射前克隆出来的（`worker_parts`，
+  `node.rs:1076`）。**行只有一份、没有影子字段**（ADR-0022 D3 的"不新增影子字段"同一条）；
+  `install` 返回的表只持有这些行的引用，行不属于任何后来的安装者。
+- **为什么线程描述符上没有字段**：VPP 把每线程计数器放在该线程自己的 node main
+  （`vlib_node_runtime_t`，V3），`vlib_worker_thread_t` 上只有指向那个 main 的指针。所以这里既不装
+  `OnceLock<…>` 句柄、也不放 `Box<[NodeCounters]>` 存储：行在图的字段里，线程描述符保持原样。
+- **为什么不是 `Arc`**：行按线程各一份，**不跨线程复用**（worker 的图是克隆出来的，
+  `Clone for NodeMain`；每份克隆在发射前装自己那一行），设计里从来没有第二个持有者；`Arc` 只会把
+  "这一行属于哪个线程"变成运行期才知道的共享所有权。refork（`inherit_worker_state`，H3）只改图的
+  事实，不碰行。
 - **建与装的时机**：`start_workers` 读一次冻结的节点容量（`main.nodes().node_count()`，H5）：
-  thread zero 的行装进自己的图，每个 worker 的行装进该 worker 的图克隆与它的描述符。全部在
-  `launch` 之前完成，发射之后没有安装步骤，也没有"按节点数现装的 `Box<[NodeCounters]>`"。
+  建行 → thread zero 的行装进自己的图 → 每个 worker 的行装进该 worker 的图克隆。全部在 `launch`
+  之前完成，发射之后没有安装步骤。
 
 **D1.2 更新点：`DataPlaneMain::dispatch_node`，一次派发写一次本线程图里的格子。**
 
@@ -319,25 +320,43 @@ self.last_time_stamp = dispatch_end;
   上一次派发的结束点起算**——它包含派发之间的主循环工作（文件轮询、handoff、调度），
   这是 VPP 的既有口径（V7、V8），不是"Hammer 累计的纯节点执行时间"。
 
-**D1.3 轮次的读路径：线程描述符里的句柄，不取锁、不借 worker 的 `RefCell`。**
+**D1.3 轮次的读路径：采集者直接持有各线程的行；没有句柄、没有 `OnceLock`、不取段锁、
+不借 worker 的 `RefCell`。**
 
 ```rust
-// crates/hammer-runtime/src/thread_main.rs
+// crates/hammer-runtime/src/node_stats.rs
 
-impl ThreadMain {
-    /// 线程 `thread_index` 的 node 计数器行；`0..=worker_count()` 之外没有图，返回 `None`。
-    pub(crate) fn thread_node_counters(&self, thread_index: u32) -> Option<&[NodeCounters]>;
+/// 四条登记共用的一个采集者类型（D5）：`counter` 决定读哪一格，`rows` 是各线程的行。
+pub(crate) struct NodeCounterCollector {
+    entry_index: DirectoryIndex,
+    counter: NodeCounter,
+    rows: NodeCounterRows,
 }
 ```
 
-轮次按 `0..=worker_count()` 取每一行、按 `NodeId::slot()` 读格子——与 VPP
-`update_node_counters` 遍历各线程 `vlib_main` 的 `node_main.nodes`（V12、V14）同一形状。
+轮次按 `0..=worker_count()` 取每一行、按 `NodeId::slot()` 读格子，写条目的 `row = 线程`、
+`column = 节点槽`——与 VPP `update_node_counters` 遍历各线程 `vlib_main` 的 `node_main.nodes`
+（V12、V14）同一形状。行在安装时就交给采集者实例，所以轮次不需要描述符入口、也不需要第二张表。
 
-**D1.4 为什么不复制 VPP 的"32 位累加 + 溢出同步"（有意差异，需批准）。**
+**D1.4 为什么格是原子（有意差异，需批准）。**
+VPP 在同一位置写裸 32 位字段（V4），采集点也刻意不做 barrier 同步，注释自认读到的计数会不准，
+只求"迟一拍、跨项不同步"的快照（V17）。Rust 里一个线程读另一个线程正在写的裸字段是数据竞争，
+所以跨线程的那一格必须是一次原子访问。这里选 `Relaxed`（不是 `Acquire`/`SeqCst`）的理由是仓库
+既定的统计序：发布的是数值而不是所有权，AGENTS 的同步规则把 `Relaxed` 限定给统计与线程内顺序，
+ADR-0021 A7/D4 已用同一条纪律发布 `/sys/main_loop_count_per_worker` 与 `/sys/loops_per_worker`，
+ADR-0022 D3 用池内 `AtomicUsize` 发布每个 worker 的 cache 长度。代价与 VPP 相同：轮次读到的是
+逐格独立的快照（D7 第 2 条）。
+
+| 被否掉的替代 | 为什么否 |
+| --- | --- |
+| 裸 `u64` + 轮次每轮先 `WorkerBarrier` 停住所有 worker 再读（VPP `vlib_node_get_nodes` 的 `barrier_sync = 1` 路径，V17） | VPP 自己的采集点传的是 `barrier_sync = 0`；为了读统计每轮停住整个数据面，代价与收益不相称，读到的仍然只是"每轮一次"的快照 |
+| 裸 `u64` + 跨线程共享引用（VPP 的 raw 指针写法） | Rust 里对裸字段的跨线程共享读是 UB；"C 靠宽松"换不成安全抽象 |
+| 线程描述符上的 `OnceLock<Arc<[NodeCounters]>>` / `Box<[NodeCounters]>`（前一版） | 既不是 VPP 的位置（计数器在线程自己的 node main 里，V3），也把"节点自己的计数"写成"线程的计数器数组"；还多了一次安装式句柄（`OnceLock`）与共享所有权（`Arc`），见 D1.1 的两条理由 |
+
+**D1.5 为什么不复制 VPP 的"32 位累加 + 溢出同步"（有意差异，需批准）。**
 VPP 的两级结构（32 位 per-thread → 64 位 `stats_total`，V3–V5）服务于两个目的：
 ① 热路径只碰线程私有内存里的窄字段；② 溢出时才付一次同步的代价（V4 的回滚分支）。
-Hammer 的格子**本来就是跨线程发布位置**（线程图里的原子行，与 `main_loop_count` 同一条
-发布纪律，H6），所以：
+Hammer 的格子**本身就是跨线程读的那一份状态**（D1.1、D1.4），所以：
 
 - 64 位 `Relaxed` 的加法在 x86_64/aarch64 上与 32 位同价，而它消掉了溢出分支、回滚、
   采集侧的同步路径与 32/64 两级结构；
@@ -347,7 +366,7 @@ Hammer 的格子**本来就是跨线程发布位置**（线程图里的原子行
 - **保留**的 VPP 形状：per-thread + per-node 的位置（V3）、派发点唯一的更新调用（V7）、
   只增不减的累计量（V1）、`suspends` 只在 thread zero 的 process 路径增加（V6、V9）。
 
-**D1.5 thread zero 的行。**thread zero 不跑数据面派发循环，但它是 process 节点的属主（H15），
+**D1.6 thread zero 的行。**thread zero 不跑数据面派发循环，但它是 process 节点的属主（H15），
 所以它的行只承载 `suspends`（V6 的"PROCESS 节点只在 main thread 同步"在 Hammer 里的对应）。
 
 ### D2 `cpu_time_now`：落在 `hammer-infra`
@@ -550,21 +569,23 @@ fn install_node_stats(main: &mut DataPlaneMain) -> RuntimeResult<()> {
 /// VPP `update_node_counters` 的单元格写（V14）：把自己那个计数器投影到
 /// `row = 线程`、`column = 节点槽` 的单元格。
 ///
-/// 一个类型服务四个计数器：`counter` 就是实例自己的字段（VPP 里对应 `node_counters[]`
-/// 的下标，V11）。采集不取段锁、不分配、不返回 `Result`（ADR-0021 D9.3）。
+/// 一个类型服务四个计数器：`counter` 与 `rows` 都是实例自己的字段——`counter` 决定读哪一格
+/// （VPP `node_counters[]` 的下标，V11），`rows` 是安装时就拿到的各线程行（D1.3）。
+/// 采集不取段锁、不分配、不返回 `Result`（ADR-0021 D9.3）。
 struct NodeCounterCollector {
     entry_index: DirectoryIndex,
     counter: NodeCounter,
+    rows: NodeCounterRows,
 }
 
 impl Collector for NodeCounterCollector {
     fn entry_index(&self) -> DirectoryIndex { self.entry_index }
 
     fn collect(&self, entry: &DirectoryEntry) {
-        let threads = ThreadMain::global();
-        for thread_index in 0..=threads.worker_count() {
-            let counters = threads
-                .thread_node_counters(thread_index)
+        for thread_index in 0..=ThreadMain::global().worker_count() {
+            let counters = self
+                .rows
+                .row(thread_index)
                 .expect("node counter rows cover thread zero and every Data Worker");
             for (slot, node_counters) in counters.iter().enumerate() {
                 entry.set_simple_counter_cell(
@@ -582,7 +603,7 @@ impl Collector for NodeCounterCollector {
   由 D4 发布，采集者只写已发布范围内的格子（越界是采集者自己的 bug，按 ADR-0021 断言语义处理）。
 - **轮次成本**：每轮 `4 × (worker_count + 1) × node_count` 次单元格写（默认
   `update_interval = 10s`），与 VPP 同一数量级（V14 写的是同样多的格子，外加每轮的名字 diff）；
-  不取锁、不分配、不借 worker 的 `RefCell`——只经描述符上的句柄读那一行原子（D1.3）。
+  不取锁、不分配、不借 worker 的 `RefCell`——只读采集者安装时就持有的那一行原子（D1.3）。
 
 ### D6 `suspends`：process 节点的唯一来源（thread zero 行）
 
@@ -603,7 +624,7 @@ impl Collector for NodeCounterCollector {
 
 | 差异 | VPP | Hammer | 理由与回归点 |
 | --- | --- | --- | --- |
-| 每线程计数器与同步 | 32 位 per-thread 累加 + 溢出时同步成 64 位 `stats_total`（V3–V5） | 每线程每节点四个 64 位 `Relaxed` 原子格，存在该线程的图里（`NodeMain`），无溢出路径、无两级结构（D1.1、D1.4） | 格子本来就是跨线程发布位置（H6 的既有形状）；语义（+1/+=n/+=delta）逐条不变 |
+| 每线程计数器与同步 | 32 位 per-thread 累加 + 溢出时同步成 64 位 `stats_total`（V3–V5） | 每线程每节点四个 64 位 `Relaxed` 格，存在该线程自己的图里（`NodeMain`，VPP `vlib_node_runtime_t` 的位置），无溢出路径、无两级结构（D1.1、D1.5） | 格本身就是"拥有者线程写、轮次读"的那一份状态，Rust 里只能是原子（D1.4）；语义（+1/+=n/+=delta）逐条不变 |
 | 采集快照一致性 | 采集不 barrier sync，注释自认计数会不准（V17） | 同样不 barrier；逐格 `Relaxed`，跨格/跨线程不承诺一致快照 | 与 VPP 同一条取舍；若以后需要一致快照，只能用 ADR-0019 D4.6 的第二个选项（轮次前短 barrier）并实测暂停 |
 | 名字/别名维护 | 每轮名字 diff，变化时取段锁重建（V12、V13） | 发布一次（main-loop-enter，D4）；节点身份冻结由 `inherit_worker_state` 断言（H3） | Hammer 没有"节点换名/换序"的运行期路径；代价是一条前提条件（§9 未决项 3） |
 | 单元格语义 | `stats_total - stats_last_clear`（V14），`clear` 命令重置基线（V26） | 单元格 = 累计值（等于 VPP 从未 clear 的情况）；`clear` 面不存在（`Sys.last_stats_clear` 的注释即此） | 差值需要一个 owner 侧基线；Hammer 的 `clear` 面由 ADR-0019 M4 的另一半负责，本 ADR 不预置 |
@@ -621,8 +642,8 @@ impl Collector for NodeCounterCollector {
 - **不给 process 节点插桩 calls/vectors/clocks**（D6）。
 - **不在轮次里做名字 diff、不取段锁、不分配**（D5）；不在采集者里访问 worker 的图
   （`NodeRuntimeInner`/`NodeRuntime`）或借用别的 worker 的状态。
-- **不引入第二套 per-thread 容器**：计数器行就在该线程的图里（`NodeMain`，D1.1），描述符上
-  只有一个句柄；不新增"StatsWorkerSnapshot"/"StatsWorkerView"之类中间对象，也不把行指针缓存在别处。
+- **不引入第二套 per-thread 容器**：计数器行就在该线程的图里（`NodeMain`，D1.1），线程描述符不
+  新增字段、没有句柄；不新增"StatsWorkerSnapshot"/"StatsWorkerView"之类中间对象，也不把行缓存在别处。
 - **不动 `hammer-stats` 的机制 surface**（除 ADR-0021 已批准的那几项）：不加 node 家族字段/
   方法，不加第二条登记通道，不在 `StatsSegment`/`StatsMain` 上出现 `Node*` 类型。
 - **不给 `hammer-infra` 加 TSC 校准/频率校验**（D2）。
@@ -691,9 +712,9 @@ impl Collector for NodeCounterCollector {
 | hammer-infra | 既有内存/分配原语之外，新增 `time::cpu_time_now`（裸计数器读） | stats 类型/路径、runtime 概念、`NodeCounters`、任何"ticks → 秒"换算 | 连续两次读的差值与 TSC 语义一致（同线程单调、可作为差值）；不分配、不取锁 |
 | hammer-core | `NodeId::slot`/`NodeId::new`、图/帧/缓冲原语（既有） | stats 类型、`NodeCounters`、目录名 | 本文不新增 `hammer-core` 类型（H4） |
 | hammer-stats（机制） | 既有目录原语（`validate`/`set_name`/`add_symlink`/条目级写）、采集者表与轮次 | `/sys/node` 名字、`NodeCounter`、`NodeCounters`、`ThreadMain`、任何节点/线程概念 | 机制 crate 在没有 node 声明/采集者时独立编译；`StatsSegment`/`StatsMain` 公共签名不出现 `Node*`；`collect()` 的实现里不出现 node 家族 |
-| hammer-runtime（node 家族 owner，`node_stats.rs`） | `NodeStats` 声明、`NodeCounter`、`NodeCounters` 的读写、`NodeCounterCollector`、两条登记、`ThreadMain` 的只读访问、图事实（`node_count`/`node_name`） | 往机制加 node 字段/方法、第二条登记通道、在采集里取段锁、在采集里访问图内部（`NodeRuntimeInner`/`NodeRuntime`）、替 worker 拥有计数 | 五条条目与声明一一对应；四条登记与四个计数器一一对应；轮次只写自己条目的格子；发布点只出现一次 `validate`/`set_name`/`add_symlink` |
-| `NodeMain`（图侧，计数器行的家） | `node_counters: Arc<[NodeCounters]>`（槽 = 节点）、`install_node_counters`、`node_counters(node)` | 解释计数器的业务含义、跨线程读、轮次语义、替别的线程写格子 | 行随图在发射前建好、长度 = 冻结的节点容量；worker 只写自己图里的行；refork 不换行（H3） |
-| `WorkerThread`/`ThreadMain`（线程域） | 该线程计数器行的**句柄**（`install_node_counters`/`node_counters`、`thread_node_counters`） | 计数器存储（存储在图里）、解释计数器含义、写别的线程的格子 | 句柄在发射前安装、容量与 `with_node_capacity` 同一份；没有图的 runtime 线程返回 `None`；轮次不借 worker 的 `RefCell`、不取锁 |
+| hammer-runtime（node 家族 owner，`node_stats.rs`） | `NodeStats` 声明、`NodeCounter`、`NodeCounters` 的读写、`NodeCounterRows`、`NodeCounterCollector`、两条登记、图事实（`node_count`/`node_name`） | 往机制加 node 字段/方法、第二条登记通道、在采集里取段锁、在采集里访问图内部（`NodeRuntimeInner`/`NodeRuntime`）、替 worker 拥有计数 | 五条条目与声明一一对应；四条登记与四个计数器一一对应；轮次只写自己条目的格子；发布点只出现一次 `validate`/`set_name`/`add_symlink` |
+| `NodeMain`（图侧，计数器行的家） | `node_counters: &'static [NodeCounters]`（槽 = 节点）、`install_node_counters`、`node_counters(node)` | 解释计数器的业务含义、跨线程读、轮次语义、替别的线程写格子 | 行随图在发射前建好、长度 = 冻结的节点容量；worker 只写自己图里的行；refork 不换行（H3） |
+| `NodeCounterRows`（node 家族 owner 里各线程行的表） | 各线程行的 `&'static [NodeCounters]`（`install`/`row`），与采集者实例共享同一份行 | 解释计数器含义、写别的线程的格子、在轮次里重排或重建行 | 行按线程各一份、长度 = 冻结的节点容量（与 `with_node_capacity` 同一份）、活到进程结束；安装后不再增长；`WorkerThread`/`ThreadMain` 不新增字段、不借 worker 的 `RefCell`、不取锁 |
 | `statseg-collector-process`（既有 node） | 每轮一次 `StatsMain::collect()`、`update_interval`、sleep（H8、H12） | node 家族步骤、节点名/槽号/计数器、第二条 process node | node 的代码里不出现 node stats 概念；轮次的全部 node 工作来自登记表 |
 | 外部 stats client | `StatsClient` 的只读映射与 `names()`/`read()`；`NodeStatsProvider`（`PREFIX = "/sys/node"`）把五个基条目投影成 `Option<NodeStats>`，`NodeStats::node(name)` 在客户端本地按 `names` 取列 | 家族方法进 `StatsClient`、把 `/nodes/*` 当第二条数据源、把 `/nodes/*/clocks` 当时间、假设开关打开时条目一定存在、把值当同一瞬间快照、provider 持有基线 | 只读映射、名字/类型/别名解码、开关两种形态都能读（关闭 → `Ok(None)`）、行列数与 `num_worker_threads` 不符时给类型化错误 |
 
@@ -720,14 +741,14 @@ impl Collector for NodeCounterCollector {
 
 | 编号 | 文件 | 类型 / 方法 / 字段 | 动作 |
 | --- | --- | --- | --- |
-| A4 | `crates/hammer-runtime/src/node_stats.rs` | `NodeCounters`（`calls`/`vectors`/`clocks`/`suspends` 四个 `AtomicU64`）+ `row(node_capacity: usize) -> Arc<[NodeCounters]>` + `update_dispatch(&self, vectors: u64, clocks: u64)` + `add_suspend(&self)` + `value(&self, NodeCounter) -> u64` | 新增（**需批准**） |
-| A5 | `crates/hammer-runtime/src/worker_thread.rs` | `WorkerThread.node_counters: OnceLock<Arc<[NodeCounters]>>`（**只是句柄，存储在图里**）、`install_node_counters(&self, row: Arc<[NodeCounters]>)`、`node_counters(&self) -> Option<&[NodeCounters]>` | 新增（**需批准**） |
-| A6 | `crates/hammer-runtime/src/thread_main.rs` | `thread_node_counters(&self, thread_index: u32) -> Option<&[NodeCounters]>` | 新增（**需批准**） |
-| A7 | `crates/hammer-runtime/src/start_workers.rs:20-24` | 在 `with_node_capacity` 的同一处用同一份 `main.nodes().node_count()`：建 thread zero 的行与每个 worker 的行，装进各自的图（A15）与 worker 描述符（A5） | 修改 |
+| A4 | `crates/hammer-runtime/src/node_stats.rs` | `NodeCounters`（`clocks`/`vectors`/`calls`/`suspends` 四个 `AtomicU64`）+ `update_dispatch(&self, vectors: u64, clocks: u64)` + `add_suspend(&self)` + `value(&self, NodeCounter) -> u64` | 新增（**需批准**） |
+| A5 | `crates/hammer-runtime/src/node_stats.rs` | `NodeCounterRows`（各线程行的表）+ `install(thread_count: u32, node_capacity: usize) -> Self` + `row(&self, thread_index: u32) -> Option<&'static [NodeCounters]>` | 新增（**需批准**） |
+| A6 | `crates/hammer-runtime/src/node_stats.rs` | `NodeCounterCollector { entry_index, counter, rows }`（四条登记共用；行在安装时交给它，轮次不查描述符） | 新增（**需批准**） |
+| A7 | `crates/hammer-runtime/src/start_workers.rs:20-24` | 在 `with_node_capacity` 的同一处用同一份 `main.nodes().node_count()`：建行（A5）、把 thread zero 的行装进自己的图、每个 worker 的行装进该 worker 的图克隆（A15），并把行交给四条采集者登记 | 修改 |
 | A8 | `crates/hammer-runtime/src/data_plane/main.rs:40-60` | `pub(crate) last_time_stamp: u64` 字段 + 两个构造点初始化（`new_main`/`new_worker`） | 修改 |
 | A9 | `crates/hammer-runtime/src/main_loop.rs:122-130` 一带、`crates/hammer-runtime/src/node.rs:2190-2205` | 主循环派发前刷新 `last_time_stamp`；`dispatch_node` 收尾读一次 `cpu_time_now` 并写三个计数 | 修改 |
 | A10 | `crates/hammer-runtime/src/process.rs:97-127,173-190` | `process_wait` 与 `take_process_events` 的挂起点各调一次 `add_suspend()`（thread zero 行，写 thread zero 图里的那格） | 修改 |
-| A15 | `crates/hammer-runtime/src/node.rs` | `NodeMain.node_counters: Arc<[NodeCounters]>`、`install_node_counters(&mut self, row)`、`node_counters(&self, node: NodeId) -> &NodeCounters`（`Clone`/`From<NodeRuntimeInner>` 只给空行，真行由 A7 装） | 新增（**需批准**） |
+| A15 | `crates/hammer-runtime/src/node.rs` | `NodeMain.node_counters: &'static [NodeCounters]`、`install_node_counters(&mut self, row: &'static [NodeCounters])`、`node_counters(&self, node: NodeId) -> &NodeCounters`（新建/克隆的图先给空行，真行由 A7 装） | 新增（**需批准**） |
 
 ### 6.4 hammer-runtime：node 家族模块与登记（A11、A12）
 
@@ -819,8 +840,7 @@ impl StatsProvider for NodeStatsProvider {
 | `crates/hammer-component-macros/src/lib.rs` | `NameVector` 字段声明、`columns` 可省略（A2、A3） | 新增 |
 | `crates/hammer-runtime/src/node_stats.rs` | `NodeCounters`、`NodeCounter`、`NodeStats`、`NodeCounterCollector`、两条登记（A4、A11） | 新增 |
 | `crates/hammer-runtime/src/node.rs` | `NodeMain.node_counters` 行与两个访问器（A15） | 新增 |
-| `crates/hammer-runtime/src/worker_thread.rs` | 计数器行**句柄**字段与两个访问器（A5） | 修改 |
-| `crates/hammer-runtime/src/thread_main.rs` | 计数器行只读借出（A6） | 修改 |
+| `crates/hammer-runtime/src/node_stats.rs` | `NodeCounterRows` 与 `NodeCounterCollector`（A5、A6） | 新增 |
 | `crates/hammer-runtime/src/start_workers.rs` | 建行与安装点（A7） | 修改 |
 | `crates/hammer-runtime/src/data_plane/main.rs` | `last_time_stamp` 字段与构造初始化（A8） | 修改 |
 | `crates/hammer-runtime/src/main_loop.rs`、`node.rs` | 主循环刷新与派发点写三个计数（A9） | 修改 |
@@ -834,7 +854,7 @@ impl StatsProvider for NodeStatsProvider {
 | 阶段 | 范围 | 完成证据 |
 | --- | --- | --- |
 | M0 hammer-infra | A1 | 连续两次 `cpu_time_now()` 的差值单调、可作为 `clocks` 的差；不分配、不取锁、`cfg` 未支持架构时编译失败 |
-| M1 计数器行 | A4–A7、A15 | 两个 worker + thread zero 各自的图里有一行按冻结容量建好的计数器；行长度 = `with_node_capacity` 的 `node_count`；发射前装好、之后不再增长；worker 只写自己图里的行；描述符上只有句柄、没有存储 |
+| M1 计数器行 | A4–A7、A15 | 两个 worker + thread zero 各自的图里有一行按冻结容量建好的计数器；行长度 = `with_node_capacity` 的 `node_count`；发射前装好、之后不再增长；worker 只写自己图里的行；线程描述符没有新增字段，采集者拿到的就是这些行本身 |
 | M2 更新点 | A8、A9 | 固定次数派发后 `calls` = 派发次数、`vectors` = 包数之和；同一派发点前后手算 `cpu_time_now` 差值等于写进去的 `clocks`；两个 worker 的行互不影响 |
 | M3 声明/登记/发布/采集 | A2、A3、A10、A11、A12 | 开关打开：五条 `/sys/node/*` + `4 × 节点数` 条 `/nodes/*`（类型与列号正确）、一轮后值与每线程计数器一致、thread 0 行只有 `suspends`；开关关闭：目录里完全没有这些条目；`statseg-collector-process` 的代码不变 |
 | M4（跨仓） | A13、A14 | 客户端对 fixture 与真实映射得到相同 `NodeStats`（名字、行列、四个计数器、`node(name)` 投影）；开关关闭时两处都得到 `Ok(None)`；形状不符给类型化错误；`StatsClient` 公共面不出现家族方法 |
@@ -859,7 +879,7 @@ impl StatsProvider for NodeStatsProvider {
 | 热路径（M2） | release/LTO 下派发基线与汇编 | 三次 `Relaxed` RMW 可解释、不造成可测回归；若可测，降级方案需单独批准，不默认加开关 |
 | 客户端读取（跨进程，M4） | 独立进程只读映射：`names()`、`/sys/node/*`、`/nodes/*` | 名字/类型/别名/列号正确；`names` 长度 = 列数、行数 = `num_worker_threads + 1`；开关关闭时不假设条目存在；不把 `clocks` 当时间 |
 | 客户端 provider（M4） | fixture 与真实映射各跑一遍 `NodeStatsProvider`；再跑一遍开关关闭的映射 | 两份 `NodeStats` 相同；关闭时两处都是 `Ok(None)`；`node(name)` 与 `/nodes/<name>/<counter>` 读到同一列；列数/行数不符时给类型化错误 |
-| 布局 | 编译期 size/align 断言与真实映射 fixture | `STAT_SEGMENT_VERSION` 不变；`WorkerThread` 的既有 cacheline offset 断言仍成立（新增字段只放句柄）；计数器行按节点容量一次分配、长度与冻结点一致 |
+| 布局 | 编译期 size/align 断言与真实映射 fixture | `STAT_SEGMENT_VERSION` 不变；`WorkerThread`/`ThreadMain` 不新增字段，既有 cacheline offset 断言不受影响；计数器行按节点容量一次分配、长度与冻结点一致 |
 
 测试只在最终 pre-commit gate 执行，遵循仓库测试时机规则；不做源文本断言。
 本轮没有执行任何测试、fixture 或性能测量。
@@ -871,8 +891,8 @@ impl StatsProvider for NodeStatsProvider {
 加每节点四条别名（V10–V13、V16、V19），`suspends` 只属于 process 节点（V6、V9），
 `clocks` 是裸 ticks（V25、V28），采集刻意不做 barrier 同步（V17）。Hammer 今天没有任何 node
 计数、名字向量或别名（H8、H18），派发点只有一处（H2），节点身份在 worker 启动前冻结（H3、H5），
-机制原语齐备（H10）。本设计因此把"每线程计数器"落在 `WorkerThread`（与 VPP 的每线程位置同构、
-与 `main_loop_count` 的既有形状同形，H6），把"形状/名字/别名"压成一次发布（H3 的冻结事实），
+机制原语齐备（H10）。本设计因此把"每线程计数器"落在该线程自己的图里（`NodeMain`，VPP `vlib_node_runtime_t` 的位置，
+V3；线程描述符不新增字段），把"形状/名字/别名"压成一次发布（H3 的冻结事实），
 把"投影"写成四条采集者登记（注册而非写死），把 `cpu_time_now` 放进 infra（V28、H17）。
 
 **未决项（实施前需要确认或另行批准）：**
@@ -881,12 +901,14 @@ impl StatsProvider for NodeStatsProvider {
    `columns = <表达式>`、由 install 期 `validate`"——在 H12 的时序下不成立（登记时图还没物化），
    所以要么批准 A2/A3，要么把声明也推迟到 main-loop-enter（那会要求
    `register_collector` 在 `StatsMain` 发布之后仍可调用，与 ADR-0021 D9.1 冲突，需要先改机制决定）。
-2. **计数器行的家与句柄**：本文选"行在该线程的图里（`NodeMain`，VPP `vlib_node_runtime_t` 的位置），
-   线程描述符上只放指向它的句柄（VPP `vlib_worker_thread_t.vlib_main`）"。备选一：存储直接放描述符
-   （前一版的 `OnceLock<Box<[NodeCounters]>>`）——离 VPP 更远，且把"节点自己的计数"写成"线程的数组"；
-   备选二：所有线程的图共享一个扁平 `Arc<[NodeCounters]>`（`thread_index × capacity + slot`）——语义相同、
-   少一层"每线程一行"的所有权，但仍然要有东西把这个句柄交给轮次（描述符或新全局），并没有更简单。
-   三者取一需要在 A5/A6/A15 的审批里确认。
+2. **计数器行的家**：本文选"行在该线程的图里（`NodeMain`，VPP `vlib_node_runtime_t` 的位置，V3），
+   采集者在安装时拿到同一份行（A5、A6），线程描述符保持原样"。备选一：行挂在描述符上
+   （前一版的 `OnceLock<Box<[NodeCounters]>>`/`OnceLock<Arc<[NodeCounters]>>`）——离 VPP 更远（VPP 那里
+   只有指向该线程 main 的指针），把"节点自己的计数"写成"线程的计数器数组"，并且需要一次安装式句柄；
+   备选二：所有线程共享一个扁平 `Arc<[NodeCounters]>`（`thread_index × capacity + slot`）——语义相同，
+   但引入一个从没有第二个持有者的共享所有权，仍然要有东西把它交给轮次。
+   **前提**：行必须活到进程结束（D1.1），所以 `install` 里的行是一次进程生存期分配；如果将来要求
+   行可回收（例如运行期增删 Data Worker），必须先有"行重发"的发布协议（未决项 3）。
 3. **前提条件（必须写进代码注释与验收）**：如果以后出现"运行期增删 Data Worker"
    （`register_thread`/`num_workers_change_functions` 面，H7）或"运行期重编号节点"
    （`rebuild_graph*` 今天只有测试调用者，H3），形状/名字/别名必须重新发布——VPP 每轮 diff 正是
