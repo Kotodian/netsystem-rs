@@ -41,6 +41,7 @@ const VECTOR_MIN_ALIGN: usize = 8;
 
 const TYPE_SCALAR: u32 = 1;
 const TYPE_SIMPLE: u32 = 2;
+const TYPE_NAME_VECTOR: u32 = 4;
 const TYPE_SYMLINK: u32 = 6;
 const TYPE_GAUGE: u32 = 9;
 
@@ -58,6 +59,7 @@ enum Value {
     Scalar(u64),
     Gauge(u64),
     Simple(Vec<Vec<u64>>),
+    Names(Vec<String>),
 }
 
 #[repr(C)]
@@ -235,6 +237,22 @@ impl<'mapping> Fixture<'mapping> {
                     rows.push(values);
                 }
                 Some(Value::Simple(rows))
+            }
+            TYPE_NAME_VECTOR => {
+                let vector = Vector::resolve(self.mapping, *base, entry.data as usize, 8)?;
+                let mut names = Vec::with_capacity(vector.length);
+                for index in 0..vector.length {
+                    match vector.pointer(self.mapping, index) {
+                        None | Some(0) => names.push(String::new()),
+                        Some(pointer) => {
+                            let offset = pointer.checked_sub(*base)?;
+                            let bytes = self.mapping.get(offset..)?;
+                            let end = bytes.iter().position(|byte| *byte == 0)?;
+                            names.push(String::from_utf8(bytes[..end].to_vec()).ok()?);
+                        }
+                    }
+                }
+                Some(Value::Names(names))
             }
             TYPE_SYMLINK => {
                 let target = usize::try_from(entry.data & u64::from(u32::MAX)).expect("low half");
@@ -428,14 +446,27 @@ struct HammerDaemon {
 
 impl HammerDaemon {
     fn start() -> Self {
-        let worker_config = format!(
+        Self::start_with_worker_config(&Self::worker_config())
+    }
+
+    /// Starts a daemon whose `[statseg]` section also carries `statseg_extra`,
+    /// for example `per_node_counters = true`.
+    fn start_with_node_counters() -> Self {
+        Self::start_with_config(&Self::worker_config(), "per_node_counters = true\n")
+    }
+
+    fn worker_config() -> String {
+        format!(
             "[worker]\ncount = {WORKER_COUNT}\n\n[worker.buffer]\nslots_per_numa = {POOL_SLOTS}\n"
-        );
-        Self::start_with_worker_config(&worker_config)
+        )
     }
 
     /// Starts a daemon whose `[worker]` section is exactly `worker_config`.
     fn start_with_worker_config(worker_config: &str) -> Self {
+        Self::start_with_config(worker_config, "")
+    }
+
+    fn start_with_config(worker_config: &str, statseg_extra: &str) -> Self {
         let unique = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .expect("system clock is after the Unix epoch")
@@ -453,7 +484,7 @@ impl HammerDaemon {
         fs::write(
             &config_path,
             format!(
-                "plugins = []\n\n[memory]\nmain_heap_size = \"256 MiB\"\n\n{worker_config}\n[statseg]\nsocket_name = \"{}\"\nupdate_interval = \"50ms\"\n\n[api-segment]\nprefix = \"{prefix}\"\n",
+                "plugins = []\n\n[memory]\nmain_heap_size = \"256 MiB\"\n\n{worker_config}\n[statseg]\nsocket_name = \"{}\"\nupdate_interval = \"50ms\"\n{statseg_extra}\n[api-segment]\nprefix = \"{prefix}\"\n",
                 stats_socket.display()
             ),
         )
@@ -815,6 +846,126 @@ fn stats_segment_publishes_mem_and_system_values() {
         "{}",
         daemon.diagnostics(format!("daemon exits unsuccessfully: {status:?}"))
     );
+}
+
+/// Waits for the node-name vector to be published completely, then returns the
+/// node names by slot.
+///
+/// The shape is published before the names, and both before the first collect
+/// round; a reader that connects early therefore sees a partially filled
+/// vector, which is why this waits for the published column count to match.
+fn published_node_names(fixture: &Fixture<'_>, daemon: &mut HammerDaemon) -> Vec<String> {
+    let deadline = Instant::now() + CONNECT_TIMEOUT;
+    loop {
+        if let Some(Value::Names(names)) = fixture.read("/sys/node/names")
+            && !names.is_empty()
+            && names.iter().all(|name| !name.is_empty())
+        {
+            let columns = match fixture.read("/sys/node/calls") {
+                Some(Value::Simple(rows)) => rows.first().map_or(0, Vec::len),
+                _ => 0,
+            };
+            if columns == names.len() {
+                return names;
+            }
+        }
+        assert!(
+            Instant::now() < deadline,
+            "{}",
+            daemon.diagnostics("`/sys/node/names` is published with one name per node")
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}
+
+/// `/sys/node/*` and `/nodes/<name>/*`: the five fixed entries of VPP's node
+/// collector plus the four aliases of every node (`collector.c:18-27,79-89`).
+#[test]
+fn stats_segment_publishes_node_counters() {
+    let mut daemon = HammerDaemon::start_with_node_counters();
+    let mapping = daemon.mapping();
+    let fixture = Fixture::new(mapping.bytes());
+
+    let names = fixture
+        .names()
+        .unwrap_or_else(|| panic!("{}", daemon.diagnostics("no stable directory")));
+    for expected in [
+        "/sys/node/names",
+        "/sys/node/clocks",
+        "/sys/node/vectors",
+        "/sys/node/calls",
+        "/sys/node/suspends",
+    ] {
+        assert!(
+            names.iter().any(|name| name == expected),
+            "`{expected}` is published: {names:?}"
+        );
+    }
+
+    let node_names = published_node_names(&fixture, &mut daemon);
+    let mut unique = node_names.clone();
+    unique.sort();
+    unique.dedup();
+    assert_eq!(
+        unique.len(),
+        node_names.len(),
+        "node names are unique: {node_names:?}"
+    );
+
+    // Rows are thread zero plus the Data Workers; columns are node slots.
+    let row_count = WORKER_COUNT + 1;
+    for counter in ["clocks", "vectors", "calls", "suspends"] {
+        let rows = counter_rows(&fixture, &format!("/sys/node/{counter}"));
+        assert_eq!(
+            rows.len(),
+            row_count,
+            "`/sys/node/{counter}` has one row per thread"
+        );
+        for row in &rows {
+            assert_eq!(
+                row.len(),
+                node_names.len(),
+                "`/sys/node/{counter}` has one column per node"
+            );
+        }
+    }
+
+    // `/nodes/<name>/<counter>` is a symlink onto that node's column, so it
+    // reads the same values as the column of the vector it aliases.
+    for (slot, name) in node_names.iter().enumerate() {
+        for counter in ["clocks", "vectors", "calls", "suspends"] {
+            // VPP names the alias after the canonical entry leaf plus the node
+            // name (`collector.c:79-89`), so `calls` stays `calls`.
+            let path = format!("/sys/node/{counter}");
+            let column: Vec<u64> = counter_rows(&fixture, &path)
+                .iter()
+                .map(|row| row[slot])
+                .collect();
+            let alias = counter_rows(&fixture, &format!("/nodes/{name}/{counter}"));
+            let selected: Vec<u64> = alias.iter().map(|row| row[0]).collect();
+            assert_eq!(
+                selected, column,
+                "`/nodes/{name}/{counter}` selects column {slot}"
+            );
+        }
+    }
+
+    drop(fixture);
+    drop(mapping);
+    let status = daemon.shutdown();
+    assert!(
+        status.success(),
+        "{}",
+        daemon.diagnostics(format!("daemon exits unsuccessfully: {status:?}"))
+    );
+}
+
+/// One simple counter vector as `row → column → value`.
+fn counter_rows(fixture: &Fixture<'_>, name: &str) -> Vec<Vec<u64>> {
+    match fixture.read(name) {
+        Some(Value::Simple(rows)) => rows,
+        other => panic!("`{name}` is a counter vector, got {other:?}"),
+    }
 }
 
 /// One `/memfd:buffers` mapping of a running daemon, as the kernel reports it.

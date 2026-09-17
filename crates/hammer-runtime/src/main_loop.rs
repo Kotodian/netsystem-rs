@@ -95,6 +95,10 @@ pub fn data_plane_main_loop(main: &mut DataPlaneMain, idle_slice: Duration) -> i
             barrier.refork(&mut main.nodes);
         }
 
+        // VPP `main.c:1519`: one timestamp per iteration; every dispatch in
+        // this iteration measures from it or from the previous dispatch's end.
+        main.last_time_stamp = hammer_infra::time::cpu_time_now();
+
         // Step 2: Poll worker-local File readiness before graph dispatch.
         match main.poll_file_readiness() {
             Ok(dispatched) => progress |= dispatched != 0,
