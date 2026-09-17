@@ -33,10 +33,12 @@ crate::__declare_registration_image!(
     binary_api_methods = [];
     stats_registrations = [
         config::stats::__STATS_REGISTRATION_Sys,
-        thread_main::__STATS_REGISTRATION_REGISTER_NUM_WORKER_THREADS,
-        config::stats::__STATS_REGISTRATION_REGISTER_WORKER_MAIN_LOOP,
-        config::stats::__STATS_REGISTRATION_REGISTER_MAIN_HEAP,
-        config::stats::__STATS_REGISTRATION_REGISTER_STAT_SEGMENT_HEAP,
+        thread_main::__STATS_REGISTRATION_WorkerThreadCount,
+        config::stats::__STATS_REGISTRATION_MainHeapUsage,
+        config::stats::__STATS_REGISTRATION_StatSegmentUsage,
+        config::stats::__STATS_COLLECT_REGISTRATION_REGISTER_MAIN_HEAP,
+        config::stats::__STATS_COLLECT_REGISTRATION_REGISTER_STAT_SEGMENT_HEAP,
+        config::stats::__STATS_COLLECT_REGISTRATION_REGISTER_WORKER_MAIN_LOOP,
     ];
 );
 

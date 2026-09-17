@@ -389,16 +389,15 @@ impl ThreadMain {
     }
 }
 
-/// Creates the worker-count gauge `/sys/num_worker_threads`.
+/// Declares the worker-count gauge `/sys/num_worker_threads`.
 ///
 /// The count belongs to the worker-thread domain: VPP creates this gauge in
 /// `threads.c` and sets it to the number of Data Workers, so the entry is
-/// declared here rather than by the stats mechanism or a heap owner.
-#[hammer_component_macros::stats_registration]
-fn register_num_worker_threads(stats_main: &hammer_stats::StatsMain) -> RuntimeResult<()> {
-    let worker_count = ThreadMain::global().worker_count();
-    let mut segment = stats_main.segment.lock();
-    let gauge = segment.add_gauge("/sys/num_worker_threads")?;
-    segment.set_gauge(gauge.index, u64::from(worker_count));
-    Ok(())
+/// declared here rather than by the stats mechanism or a heap owner. It is not
+/// a collector: `start_workers` writes it once, the way VPP's thread startup
+/// does.
+#[derive(hammer_component_macros::Stats)]
+pub(crate) struct WorkerThreadCount {
+    #[stats(path = "/sys/num_worker_threads")]
+    pub(crate) worker_threads: hammer_stats::Gauge,
 }

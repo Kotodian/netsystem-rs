@@ -623,6 +623,14 @@ pub struct MemHeap {
     name: [u8; 0],
 }
 
+// SAFETY: a heap control block lives in a mapping that outlives every
+// borrower, and every mutation is serialized by the mspace's own lock (the
+// `locked` flag passed to `create_at`); `usage` only reads the mspace
+// accounting, the same reading VPP takes in `clib_mem_get_heap_usage` while
+// other threads allocate. Sharing the heap reference therefore exchanges
+// statistics that may lag by one allocation, not ownership.
+unsafe impl Sync for MemHeap {}
+
 impl MemHeap {
     /// Creates a fixed-capacity heap covering `base..base + size`.
     ///

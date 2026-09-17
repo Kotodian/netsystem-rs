@@ -206,8 +206,14 @@ pub fn run_init_functions(global: &GlobalMain, main: &mut DataPlaneMain) -> Runt
     dispatch_init(&global.init_function_registrations, global, main)
 }
 
-pub(crate) fn run_stats_registrations() -> RuntimeResult<()> {
-    let stats_main = hammer_stats::StatsMain::global()?;
+/// Runs the registration image against the not-yet-published stats owner.
+///
+/// Entry declarations and collector registrations both grow startup-only state,
+/// so they run before `StatsMain::publish`; the `&mut` borrow is the guarantee
+/// that no round or reader can observe the owner while the table grows.
+pub(crate) fn run_stats_registrations(
+    stats_main: &mut hammer_stats::StatsMain,
+) -> RuntimeResult<()> {
     let plugins = crate::PluginMain::global()?;
     let mut result = Ok(());
     plugins.visit_images(|image| {

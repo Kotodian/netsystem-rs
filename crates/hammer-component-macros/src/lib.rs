@@ -17,6 +17,8 @@ use syn::{
 struct StatsFieldArgs {
     path: Option<LitStr>,
     bootstrap: Option<Expr>,
+    columns: Option<Expr>,
+    symlinks: Option<Expr>,
 }
 
 impl Parse for StatsFieldArgs {
@@ -41,11 +43,26 @@ impl Parse for StatsFieldArgs {
                     }
                     args.bootstrap = Some(input.parse()?);
                 }
+                "columns" => {
+                    if args.columns.is_some() {
+                        return Err(Error::new(key.span(), "duplicate `columns` stats argument"));
+                    }
+                    args.columns = Some(input.parse()?);
+                }
+                "symlinks" => {
+                    if args.symlinks.is_some() {
+                        return Err(Error::new(
+                            key.span(),
+                            "duplicate `symlinks` stats argument",
+                        ));
+                    }
+                    args.symlinks = Some(input.parse()?);
+                }
                 other => {
                     return Err(Error::new(
                         key.span(),
                         format!(
-                            "unknown `stats` argument `{other}`; expected `path` or `bootstrap`"
+                            "unknown `stats` argument `{other}`; expected `path`, `bootstrap`, `columns` or `symlinks`"
                         ),
                     ));
                 }
@@ -80,8 +97,18 @@ struct StatsField {
     ident: Ident,
     ty: Type,
     path: LitStr,
+    /// `{name}` placeholders of the path template: each one becomes a `&str`
+    /// parameter of the declaration's `install`, exactly like VPP's
+    /// `"/buffer-pools/%v/cached"` format argument.
+    placeholders: Vec<Ident>,
     metric: StatsMetric,
     bootstrap: Option<Expr>,
+    /// Published row width of a counter vector: `columns = <u32 expression>`
+    /// becomes the `validate` call of the declaration's install step.
+    columns: Option<Expr>,
+    /// Alias declarations `[("name", column), …]`, each published as
+    /// `<path>/<name>` pointing at the target column.
+    symlinks: Option<Expr>,
 }
 
 fn stats_metric_base(field: &Field) -> Result<StatsMetricBase> {
@@ -210,10 +237,28 @@ fn stats_field(field: &Field, namespace: &str) -> Result<StatsField> {
             if parsed.bootstrap.is_some() {
                 args.bootstrap = parsed.bootstrap;
             }
+            if args.columns.is_some() && parsed.columns.is_some() {
+                return Err(Error::new(
+                    attribute.span(),
+                    "duplicate `stats` field argument",
+                ));
+            }
+            if parsed.columns.is_some() {
+                args.columns = parsed.columns;
+            }
+            if args.symlinks.is_some() && parsed.symlinks.is_some() {
+                return Err(Error::new(
+                    attribute.span(),
+                    "duplicate `stats` field argument",
+                ));
+            }
+            if parsed.symlinks.is_some() {
+                args.symlinks = parsed.symlinks;
+            }
         }
     }
 
-    let leaf = args
+    let raw = args
         .path
         .as_ref()
         .map(LitStr::value)
@@ -222,22 +267,26 @@ fn stats_field(field: &Field, namespace: &str) -> Result<StatsField> {
         .path
         .as_ref()
         .map_or_else(|| ident.span(), Spanned::span);
-    if leaf.is_empty() {
+    if raw.is_empty() {
         return Err(Error::new(path_span, "stats paths must not be empty"));
     }
-    if leaf.starts_with('/') || leaf.ends_with('/') || leaf.contains("//") {
+    if raw.ends_with('/') || raw.contains("//") {
         return Err(Error::new(
             path_span,
             "stats paths must not contain duplicate separators",
         ));
     }
-    if leaf
-        .bytes()
-        .any(|byte| byte == 0 || byte.is_ascii_control())
-    {
+    if raw.bytes().any(|byte| byte == 0 || byte.is_ascii_control()) {
         return Err(Error::new(path_span, "stats paths contain an invalid byte"));
     }
-    let path = format!("/{namespace}/{leaf}");
+    let placeholders = stats_path_placeholders(&raw, path_span)?;
+    // A path starting with `/` names the directory entry directly; a relative
+    // leaf stays under the declaring aggregate's namespace.
+    let path = if raw.starts_with('/') {
+        raw
+    } else {
+        format!("/{namespace}/{raw}")
+    };
     if path.len() > 126 {
         return Err(Error::new(
             path_span,
@@ -271,12 +320,66 @@ fn stats_field(field: &Field, namespace: &str) -> Result<StatsField> {
         path: LitStr::new(&path, path_span),
         metric,
         bootstrap: args.bootstrap,
+        placeholders,
+        columns: args.columns,
+        symlinks: args.symlinks,
     })
+}
+
+/// The `{name}` placeholders of one path template, in first-use order.
+///
+/// A placeholder is an install parameter name, not an expression: the
+/// declaration cannot install an entry until its owner supplies the fact the
+/// name is built from (`bp->name` in VPP's format string).
+fn stats_path_placeholders(template: &str, span: Span) -> Result<Vec<Ident>> {
+    let mut placeholders: Vec<Ident> = Vec::new();
+    let mut rest = template;
+    while let Some(start) = rest.find('{') {
+        let after = &rest[start + 1..];
+        let Some(end) = after.find('}') else {
+            return Err(Error::new(span, "stats path placeholder is not closed"));
+        };
+        let name = &after[..end];
+        if name.is_empty() || !name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') {
+            return Err(Error::new(
+                span,
+                "stats path placeholders must be identifiers",
+            ));
+        }
+        if name.chars().next().is_some_and(|c| c.is_ascii_digit()) {
+            return Err(Error::new(
+                span,
+                "stats path placeholders must be identifiers",
+            ));
+        }
+        let ident = Ident::new(name, span);
+        if !placeholders.iter().any(|existing| *existing == ident) {
+            placeholders.push(ident);
+        }
+        rest = &after[end + 1..];
+    }
+    if rest.contains('}') {
+        return Err(Error::new(span, "stats path placeholder is not opened"));
+    }
+    Ok(placeholders)
+}
+
+/// The expression that names one entry at install time.
+///
+/// A template with placeholders is filled from the install parameters, exactly
+/// like `vlib_stats_add_gauge ("/buffer-pools/%v/cached", bp->name)`.
+fn stats_field_name(field: &StatsField) -> TokenStream2 {
+    let path = &field.path;
+    if field.placeholders.is_empty() {
+        quote!(#path)
+    } else {
+        quote!(&::std::format!(#path))
+    }
 }
 
 /// Returns the directory type and the creating operation of one metric family.
 fn stats_metric_operations(field: &StatsField) -> (TokenStream2, TokenStream2) {
-    let path = &field.path;
+    let path = stats_field_name(field);
     match &field.metric {
         StatsMetric::Gauge => (
             quote!(::hammer_stats::DirectoryType::Gauge),
@@ -332,7 +435,7 @@ fn expand_stats_field_binding(field: &StatsField) -> TokenStream2 {
             let #ident = match segment.find(#path, #directory_type) {
                 Ok(index) => #ty { index },
                 Err(error) => {
-                    Self::release_partial(&mut segment, &released);
+                    Self::release_partial(segment, &released);
                     return Err(error.into());
                 }
             };
@@ -345,11 +448,46 @@ fn expand_stats_field_binding(field: &StatsField) -> TokenStream2 {
                     metric
                 }
                 Err(error) => {
-                    Self::release_partial(&mut segment, &released);
+                    Self::release_partial(segment, &released);
                     return Err(error.into());
                 }
             };
         }
+    }
+}
+
+/// Publishes the row width and the aliases of one declared entry.
+///
+/// Both are part of the declaration's registration semantics: the owner states
+/// the shape once, the install step reproduces VPP's `validate` and
+/// `add_symlink` calls in the same order as `vlib_stats_register_mem_heap`.
+fn expand_stats_shape(field: &StatsField) -> TokenStream2 {
+    let ident = &field.ident;
+    let columns = field.columns.as_ref().map(|columns| {
+        quote! {
+            if let Err(error) = segment.validate(#ident.index, 0, (#columns) - 1) {
+                Self::release_partial(segment, &released);
+                return Err(error.into());
+            }
+        }
+    });
+    let entry_name = stats_field_name(field);
+    let symlinks = field.symlinks.as_ref().map(|symlinks| {
+        quote! {
+            for (name, column) in [#symlinks].into_iter().flatten() {
+                match segment.add_symlink(#ident.index, column, &format!("{}/{}", #entry_name, name)) {
+                    Ok(alias) => released.push(alias),
+                    Err(error) => {
+                        Self::release_partial(segment, &released);
+                        return Err(error.into());
+                    }
+                }
+            }
+        }
+    });
+    quote! {
+        #columns
+        #symlinks
     }
 }
 
@@ -568,10 +706,48 @@ fn expand_stats(item: ItemStruct) -> Result<TokenStream2> {
         stats_fields.push(stats_field);
     }
 
+    // One install fills every entry of the declaration, so all its fields must
+    // share the placeholder set: the owner supplies those facts once.
+    let mut parameters: Vec<Ident> = Vec::new();
+    for field in &stats_fields {
+        for placeholder in &field.placeholders {
+            if !parameters.iter().any(|existing| existing == placeholder) {
+                parameters.push(placeholder.clone());
+            }
+        }
+    }
+    for field in &stats_fields {
+        if field.placeholders.len() != parameters.len()
+            || !parameters
+                .iter()
+                .all(|parameter| field.placeholders.contains(parameter))
+        {
+            return Err(Error::new_spanned(
+                &field.ident,
+                "every field of a parameterized stats declaration must use the same placeholders",
+            ));
+        }
+        if !field.placeholders.is_empty() && field.bootstrap.is_some() {
+            return Err(Error::new_spanned(
+                &field.ident,
+                "fixed bootstrap slots cannot be parameterized",
+            ));
+        }
+    }
+    let parametric = !parameters.is_empty();
+    let install_parameters = (!parameters.is_empty()).then(|| quote!(, #(#parameters: &str),*));
+
     let registration_name = format_ident!("__STATS_REGISTRATION_{}", aggregate);
     let owner_name = format_ident!("__STATS_OWNER_{}", aggregate);
     let aggregate_name = LitStr::new(&aggregate.to_string(), aggregate.span());
-    let bindings = stats_fields.iter().map(expand_stats_field_binding);
+    let bindings = stats_fields.iter().map(|field| {
+        let binding = expand_stats_field_binding(field);
+        let shape = expand_stats_shape(field);
+        quote! {
+            #binding
+            #shape
+        }
+    });
     let idents = stats_fields.iter().map(|field| &field.ident);
     let bootstrap = stats_fields
         .iter()
@@ -584,11 +760,56 @@ fn expand_stats(item: ItemStruct) -> Result<TokenStream2> {
             /// The stats owner calls this once before any metric owner
             /// registers, so the fixed slots keep their VPP directory index.
             pub(crate) fn bootstrap(
-                segment: &mut ::hammer_stats::StatsSegment,
+                segment: &::hammer_stats::StatsSegment,
             ) -> ::hammer_stats::StatsResult<()> {
                 #(#bootstrap)*
                 Ok(())
             }
+        }
+    });
+    // A parameterized declaration has no single installed instance: every
+    // owner that installs it supplies its own facts, so it publishes no owner
+    // and contributes no registration-image item. Its owner installs it from
+    // its own collect registration, like VPP's buffer pool loop.
+    let owner_glue = (!parametric).then(|| {
+        quote! {
+            impl #aggregate {
+                /// Registers and publishes this declaration, the owner-side half
+                /// of one `#[derive(Stats)]` declaration in the registration
+                /// image.
+                fn register_owner(
+                    stats_main: &mut ::hammer_stats::StatsMain,
+                ) -> ::hammer_runtime::RuntimeResult<()> {
+                    if #owner_name.get().is_some() {
+                        return Ok(());
+                    }
+                    let stats = Self::install(&stats_main.segment)?;
+                    assert!(
+                        #owner_name.set(stats).is_ok(),
+                        "stats owner changed after installation preflight"
+                    );
+                    Ok(())
+                }
+
+                pub(crate) fn global() -> &'static Self {
+                    #owner_name
+                        .get()
+                        .expect("stats declarations are installed before process startup")
+                }
+            }
+
+            #[allow(non_upper_case_globals)]
+            static #owner_name: ::std::sync::OnceLock<#aggregate> =
+                ::std::sync::OnceLock::new();
+
+            #[doc(hidden)]
+            #[allow(non_upper_case_globals)]
+            pub(crate) static #registration_name:
+                ::hammer_runtime::registration::StatsRegistration =
+                ::hammer_runtime::registration::StatsRegistration {
+                    name: #aggregate_name,
+                    register: #aggregate::register_owner,
+                };
         }
     });
     Ok(quote! {
@@ -596,7 +817,7 @@ fn expand_stats(item: ItemStruct) -> Result<TokenStream2> {
             #bootstrap
 
             fn release_partial(
-                segment: &mut ::hammer_stats::StatsSegment,
+                segment: &::hammer_stats::StatsSegment,
                 released: &[::hammer_stats::DirectoryIndex],
             ) {
                 for index in released.iter().rev() {
@@ -609,46 +830,22 @@ fn expand_stats(item: ItemStruct) -> Result<TokenStream2> {
                 }
             }
 
-            fn install(
-                stats_main: &::hammer_stats::StatsMain,
-            ) -> ::hammer_runtime::RuntimeResult<()> {
-                if #owner_name.get().is_some() {
-                    return Ok(());
-                }
-                let mut segment = stats_main.segment.lock();
+            /// Installs the entries this declaration owns, like the
+            /// `vlib_stats_add_*` calls of the provider that declares them.
+            pub(crate) fn install(
+                segment: &::hammer_stats::StatsSegment #install_parameters,
+            ) -> ::hammer_stats::StatsResult<Self> {
                 let mut released: ::std::vec::Vec<::hammer_stats::DirectoryIndex> =
                     ::std::vec::Vec::new();
                 #(#bindings)*
-                let stats = Self {
+                Ok(Self {
                     #(#idents),*
-                };
-                drop(segment);
-                assert!(
-                    #owner_name.set(stats).is_ok(),
-                    "stats owner changed after installation preflight"
-                );
-                Ok(())
+                })
             }
 
-            pub(crate) fn global() -> &'static Self {
-                #owner_name
-                    .get()
-                    .expect("stats declarations are installed before process startup")
-            }
         }
 
-        #[allow(non_upper_case_globals)]
-        static #owner_name: ::std::sync::OnceLock<#aggregate> =
-            ::std::sync::OnceLock::new();
-
-        #[doc(hidden)]
-        #[allow(non_upper_case_globals)]
-        pub(crate) static #registration_name:
-            ::hammer_runtime::registration::StatsRegistration =
-            ::hammer_runtime::registration::StatsRegistration {
-                name: #aggregate_name,
-                register: #aggregate::install,
-            };
+        #owner_glue
     })
 }
 
@@ -3339,26 +3536,30 @@ pub fn main_loop_exit_function(args: TokenStream, input: TokenStream) -> TokenSt
         .into()
 }
 
-/// Registers a function as one stats registration of its link image.
+/// Registers a function as one stats collect registration of its link image.
 ///
-/// The function declares one metric owner's startup work: it creates the
-/// directory entries that owner owns and registers any collector the mechanism
-/// calls each round. The generated static item is listed by the owning crate's
+/// The function is the owner-side half that declares *how* its entries change
+/// each round: it registers the collectors the mechanism calls. Entry
+/// registration (names, rows, aliases) is the `#[derive(Stats)]` half. The
+/// generated static item is listed by the owning crate's
 /// `__declare_registration_image!(stats_registrations = [...])` or by a plugin's
 /// `#[plugin(stats_registrations = [...])]`; the image list is the only carrier,
 /// so the macro adds no ordering qualifier and no bootstrap.
 ///
 /// Example:
 /// ```ignore
-/// #[stats_registration]
-/// fn register_main_heap(stats_main: &StatsMain) -> RuntimeResult<()> { ... }
+/// #[stats_collect_registration]
+/// fn register_main_heap(stats_main: &mut StatsMain) -> RuntimeResult<()> { ... }
 /// ```
 #[proc_macro_attribute]
-pub fn stats_registration(args: TokenStream, input: TokenStream) -> TokenStream {
+pub fn stats_collect_registration(args: TokenStream, input: TokenStream) -> TokenStream {
     if !args.is_empty() {
-        return Error::new(Span::call_site(), "stats_registration takes no arguments")
-            .to_compile_error()
-            .into();
+        return Error::new(
+            Span::call_site(),
+            "stats_collect_registration takes no arguments",
+        )
+        .to_compile_error()
+        .into();
     }
     let fn_item = parse_macro_input!(input as syn::ItemFn);
     expand_stats_registration(fn_item)
@@ -3395,13 +3596,13 @@ fn expand_stats_registration(function: ItemFn) -> Result<TokenStream2> {
         }
         return Err(Error::new(
             argument.ty.span(),
-            "the stats registration parameter must be `&StatsMain`",
+            "the stats collect registration parameter must be `&mut StatsMain`",
         ));
     }
     if stats_main_count != 1 {
         return Err(Error::new(
             signature.inputs.span(),
-            "stats registrations take exactly one `&StatsMain` argument",
+            "stats collect registrations take exactly one `&mut StatsMain` argument",
         ));
     }
     let ReturnType::Type(_, result) = &signature.output else {
@@ -3421,7 +3622,7 @@ fn expand_stats_registration(function: ItemFn) -> Result<TokenStream2> {
     }
     let function_name = &signature.ident;
     let static_ident = format_ident!(
-        "__STATS_REGISTRATION_{}",
+        "__STATS_COLLECT_REGISTRATION_{}",
         function_name.to_string().to_ascii_uppercase()
     );
     let conditional_attributes: Vec<_> = function
@@ -3446,11 +3647,16 @@ fn expand_stats_registration(function: ItemFn) -> Result<TokenStream2> {
     })
 }
 
+/// Whether one parameter is the `&mut StatsMain` a collect registration takes.
+///
+/// The mutable borrow is what makes startup ordering explicit: entry
+/// declarations and collector registrations both run before the owner is
+/// published, and the mechanism's table is only reachable through `&mut` then.
 fn is_stats_main_reference(ty: &Type) -> bool {
     let Type::Reference(reference) = ty else {
         return false;
     };
-    reference.mutability.is_none() && type_path_ends_with(&reference.elem, "StatsMain")
+    reference.mutability.is_some() && type_path_ends_with(&reference.elem, "StatsMain")
 }
 
 fn expand_main_loop_function(function: ItemFn) -> Result<TokenStream2> {

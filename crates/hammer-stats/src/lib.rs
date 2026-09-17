@@ -11,7 +11,6 @@ use std::sync::OnceLock;
 use std::time::Duration;
 
 use hammer_infra::mem::{MemError, PageSize};
-use hammer_infra::sync::SpinLock;
 
 pub mod mem;
 mod metric;
@@ -28,73 +27,89 @@ pub use protocol::{
 };
 pub use segment::StatsSegment;
 
-/// One collector registration, corresponding to VPP's
-/// `vlib_stats_collector_reg_t`.
+/// One collector, the Rust form of one row of VPP's collector table.
 ///
-/// The owner states which entry (and which row of it) its function fills; the
-/// mechanism does not interpret either value.
-#[derive(Clone, Copy)]
-pub struct CollectorRegistration {
-    /// Called once per round; the second argument is the row inside the entry.
-    pub collect: fn(DirectoryIndex, u32),
-    /// The directory entry this collector fills.
-    pub entry_index: DirectoryIndex,
-    /// The row of that entry this collector fills.
-    pub vector_index: u32,
-}
+/// VPP's row keeps the update logic and the provider's own state in two cells
+/// (`vlib_stats_collector_t { fn, entry_index, vector_index, private_data }`,
+/// `stats.h:51-57`); a concrete type implementing this trait carries both: the
+/// method body is the `fn` cell, and the type's own fields are the
+/// `private_data` cell (VPP stores a heap or pool index there, Hammer stores
+/// the provider's own reference or index). Field names state the domain fact
+/// (`heap`, `threads`, `api_main`), because `private_data` is only the cell
+/// name every provider interprets for itself.
+///
+/// This is the repository's approved dynamic-dispatch exception: the table is a
+/// homogeneous `Vec<Box<dyn Collector>>`, dispatch happens a few times per stats
+/// round and never on the packet path, and the mechanism stays ignorant of every
+/// family type.
+/// The table lives in the process-global [`StatsMain`] and is read by the
+/// stats round, so every collector must be shareable between threads; the
+/// instances themselves only hold process-lifetime references and indices.
+pub trait Collector: Send + Sync {
+    /// The directory entry this row fills (VPP's `entry_index` cell).
+    fn entry_index(&self) -> DirectoryIndex;
 
-/// One row of the process collector table, corresponding to VPP's
-/// `vlib_stats_collector_t`. The table is private to the process and never
-/// enters the shared segment.
-#[derive(Clone, Copy)]
-struct Collector {
-    collect: fn(DirectoryIndex, u32),
-    entry_index: DirectoryIndex,
-    vector_index: u32,
+    /// The round's one call, the Rust form of VPP's `c->fn (&data)`
+    /// (`collector.c:137-146`).
+    ///
+    /// The argument is the shared borrow of that entry, matching VPP's
+    /// `data.entry = sm->directory_vector + c->entry_index`: a collector writes
+    /// only its own cells, never the header, a segment lock or a global lookup.
+    fn collect(&self, entry: &DirectoryEntry);
 }
 
 /// The single process stats owner, corresponding to VPP's `vlib_stats_main_t`.
 pub struct StatsMain {
-    /// The statistics segment, protected by one structural lock.
-    pub segment: SpinLock<StatsSegment>,
+    /// The statistics segment.
+    pub segment: StatsSegment,
     /// Collectors called once per round, in registration order.
-    collectors: SpinLock<Vec<Collector>>,
+    ///
+    /// The table is process-private and never enters the shared segment (VPP
+    /// keeps `sm->collectors` the same way). It grows only during startup, when
+    /// the owner is unpublished and the round cannot run, so it needs no lock.
+    collectors: Vec<Box<dyn Collector>>,
 }
 
 static STATS_MAIN: OnceLock<StatsMain> = OnceLock::new();
 
 impl StatsMain {
-    /// Creates the stats segment and publishes it as the process owner.
-    pub fn init(
+    /// Creates the stats segment and its owner without publishing it.
+    ///
+    /// Startup order is `create` → fixed slots → registration image →
+    /// [`StatsMain::publish`] → listener, like `vlib_stats_init`: registrations
+    /// need `&mut StatsMain`, so they run before the owner is visible to rounds
+    /// and readers.
+    pub fn create(
         name: &str,
         size: usize,
         page_size: PageSize,
         update_interval: Duration,
         node_counters_enabled: bool,
-    ) -> StatsResult<()> {
+    ) -> StatsResult<Self> {
         if STATS_MAIN.get().is_some() {
             return Err(StatsError::AlreadyInitialized);
         }
-        let segment = StatsSegment::create(
-            name,
-            size,
-            page_size,
-            update_interval,
-            node_counters_enabled,
-        )?;
-        if STATS_MAIN
-            .set(Self {
-                segment: SpinLock::new(segment),
-                collectors: SpinLock::new(Vec::new()),
-            })
-            .is_err()
-        {
-            // A concurrent second initialization is a startup programming
-            // error: the raced-in owner stays published and the caller ends the
-            // process instead of continuing with two owners.
-            return Err(StatsError::AlreadyInitialized);
-        }
-        Ok(())
+        Ok(Self {
+            segment: StatsSegment::create(
+                name,
+                size,
+                page_size,
+                update_interval,
+                node_counters_enabled,
+            )?,
+            collectors: Vec::new(),
+        })
+    }
+
+    /// Publishes the owner as the process stats authority.
+    ///
+    /// A concurrent second owner is a startup programming error: the raced-in
+    /// owner stays published and the caller ends the process instead of
+    /// continuing with two owners.
+    pub fn publish(self) -> StatsResult<()> {
+        STATS_MAIN
+            .set(self)
+            .map_err(|_| StatsError::AlreadyInitialized)
     }
 
     pub fn global() -> StatsResult<&'static Self> {
@@ -107,35 +122,36 @@ impl StatsMain {
     /// `statseg-collector-process` node and the Data Workers run, and rounds
     /// only read it. There is no recoverable failure, so the operation returns
     /// `()`; the table is ordinary Main Heap growth and an allocation failure
-    /// ends the process through the allocator's failure path.
-    pub fn register_collector(&self, registration: CollectorRegistration) {
-        self.collectors.lock().push(Collector {
-            collect: registration.collect,
-            entry_index: registration.entry_index,
-            vector_index: registration.vector_index,
-        });
+    /// ends the process through the allocator's failure path. `+ 'static` says
+    /// the registration lives until the process exits, not that the state is
+    /// erased into a pointer.
+    pub fn register_collector(&mut self, collector: impl Collector + 'static) {
+        self.collectors.push(Box::new(collector));
     }
 
     /// Runs one collector round, like `do_stat_segment_updates`.
     ///
     /// Every registered collector runs once in registration order, then the
-    /// heartbeat advances. A collector takes the segment lock itself: the table
-    /// lock is released before the call, so the two locks never nest. The round
-    /// has no recoverable failure, matching the VPP loop.
+    /// heartbeat advances. Neither the table nor the segment is locked: writes
+    /// land on published cells of the shared directory, exactly like VPP's
+    /// loop. A collector that names a missing entry is a declaration/write
+    /// mismatch, which asserts; the round has no recoverable failure and no
+    /// family names.
     pub fn collect(&self) {
-        let mut position = 0;
-        loop {
-            let collector = {
-                let collectors = self.collectors.lock();
-                match collectors.get(position) {
-                    Some(collector) => *collector,
-                    None => break,
-                }
-            };
-            (collector.collect)(collector.entry_index, collector.vector_index);
-            position += 1;
+        for collector in &self.collectors {
+            // VPP: `data.entry = sm->directory_vector + c->entry_index`
+            // (`collector.c:139`): the mechanism resolves the entry and hands it
+            // to the collector.
+            let entry = self
+                .segment
+                .entry(collector.entry_index())
+                .expect("a registered collector names a live directory entry");
+            collector.collect(entry);
         }
-        self.segment.lock().advance_heartbeat();
+        // The last statement takes the heartbeat entry and writes its value + 1,
+        // the same "take entry → write value" shape as every collector above
+        // (`collector.c:149-150`).
+        self.segment.advance_heartbeat();
     }
 }
 
