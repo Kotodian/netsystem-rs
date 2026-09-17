@@ -34,10 +34,10 @@ issue，不启动 daemon。
   Hammer 的池**没有名字字段**（VPP `bp->name`，V8），也**没有任何 stats 面**（H14）。
 - **VPP 的 `n_cached` 是池拥有的 cache-line 槽里的长度**（`vlib_buffer_pool_thread_t.n_cached`，
   `buffer.h:437-444`，V1），由拥有者线程在分配/归还快路径上直接写（`buffer_funcs.h:583-614,739-757`，
-  V10、V11），采集方在池锁下求和（`buffer_get_cached`，`buffer.c:811-825`，V4）。Hammer 的对应物是
-  `BufferPool.workers[thread].len`：它**是池拥有的槽**（与 VPP 同构），但在 Rust 里是
-  `RefCell<BufferThreadCache>`，只有绑定该槽的 worker 能借（H1、H3）——所以轮次不能读它，
-  必须让长度本身成为可在轮次里读的池内计数（D3）。
+  V10、V11），采集方在池锁下求和（`buffer_get_cached`，`buffer.c:811-825`，V4）。Hammer 今天的
+  对应物是 `BufferPool.workers[thread].len`：它**是池拥有的槽**（与 VPP 同构），但在 Rust 里是
+  `RefCell<BufferThreadCache>`，只有绑定该槽的 worker 能借（H1、H3）——轮次连 `borrow()`
+  都会 panic，所以长度必须成为池上、与 `RefCell` 并列、可共享读的那个计数（D3）。
 - **Hammer 的池集合在启动期一次冻结**（`BufferMain::init`：`BUFFER_MAIN.set` 只成功一次，H4），
   空池直接以 `DataPlaneError::BufferPoolsUnavailable` 拒绝启动（`main.rs:94,210`），池只增不减；
   worker 数在 `BufferMain::init` 时决定 cache 槽数（`worker_count + 1`，`main.rs:137,229`）。
@@ -67,9 +67,11 @@ issue，不启动 daemon。
 - **D2 采样：**`hammer-core` 提供一次只读采样 `BufferPoolUsage { buffer_count, available, cached }`
   与三个窄访问器（`pool_count`/`pool_name`/`pool_usage`）；不在 `hammer-core` 里出现任何
   stats 类型、路径或列序（H7）。
-- **D3 缓存长度的发布：**`BufferThreadCache.len` 由 `usize` 变成池拥有的 `AtomicUsize`，
-  拥有者线程在既有四个写点用 `Relaxed` 写、轮次用 `Relaxed` 求和（VPP 的 `n_cached` 是
-  普通 `u32`，VPP 靠池锁求和；Hammer 用池内原子槽，理由见 D3）。不新增第二个"影子字段"。
+- **D3 缓存长度的发布：**长度搬到池上（`BufferPool.cached_counts: Box<[AtomicUsize]>`，一个
+  runtime thread 一个槽，就是 VPP `bp->threads[ti].n_cached` 的位置），`BufferThreadCache`
+  不再有 `len` 字段；拥有者线程在既有四个写点用 `Relaxed` 写自己的槽、轮次用 `Relaxed` 求和
+  （VPP 的 `n_cached` 是普通 `u32`，靠池锁求和；Hammer 的槽本身可共享读，理由见 D3）。
+  长度只存一份，没有影子字段。
 - **D4 采集：**一个采集者类型 `BufferPoolGaugeCollector`（字段 = VPP 的 `entry_index` +
   `private_data` + 该 gauge 的选择器），每池三个实例、三条登记；轮次里只做"取该 gauge 条目 →
   写一个值"（V5、V14）。
@@ -136,7 +138,7 @@ issue，不启动 daemon。
 
 | 条目 | 类型 | owner（业务） | 更新者与节奏 |
 | --- | --- | --- | --- |
-| `/buffer-pools/<pool-name>/cached` | `Gauge` | buffer pool 的 owner：`hammer-runtime`（池由 `DataPlaneMain::new_main` 建立，H12） | 每池一条 `BufferPoolGaugeCollector` 登记项；值 = `Σ BufferThreadCache.len`（V5 的 `_cached_fn`） |
+| `/buffer-pools/<pool-name>/cached` | `Gauge` | buffer pool 的 owner：`hammer-runtime`（池由 `DataPlaneMain::new_main` 建立，H12） | 每池一条 `BufferPoolGaugeCollector` 登记项；值 = `Σ` 池的每线程 `cached_counts` 槽（V5 的 `_cached_fn`，D3） |
 | `/buffer-pools/<pool-name>/used` | `Gauge` | 同上 | 同上；值 = `buffer_count - available - cached`（V5 的 `_used_fn`） |
 | `/buffer-pools/<pool-name>/available` | `Gauge` | 同上 | 同上；值 = `free` 链长度（V5 的 `_available_fn`） |
 
@@ -257,17 +259,41 @@ impl BufferPoolUsage {
 
 impl BufferMain {
     /// 已建立的池数；池集合在 `init` 后不再变化（H4）。
-    pub fn pool_count(&self) -> usize;
+    pub fn pool_count(&self) -> usize {
+        self.pools.len()
+    }
 
     /// 池名（VPP `bp->name`，`buffer.c:529`）；`pool_index` 必须来自 `pool_count()`。
-    pub fn pool_name(&self, pool_index: u8) -> &str;
+    pub fn pool_name(&self, pool_index: u8) -> &str {
+        &self.pools[usize::from(pool_index)].name
+    }
 
     /// 采样一个池；`pool_index` 同上。
     ///
     /// 只读：`available` 在池的 free 链锁内取长度（VPP 读 `n_avail` 不取锁，V4 里那把锁
     /// 保护的是 `n_cached` 的求和；Hammer 的 free 链是 `Spinlock<Vec<u32>>`，读长度必须持锁），
     /// `cached` 用 Relaxed 求和（D3）。没有分配、没有 I/O。
-    pub fn pool_usage(&self, pool_index: u8) -> BufferPoolUsage;
+    pub fn pool_usage(&self, pool_index: u8) -> BufferPoolUsage {
+        let pool = &self.pools[usize::from(pool_index)];
+        // `available` = VPP `n_avail`：free 链长度，就是 `_available_fn` 写的那个值（V5）。
+        let available =
+            u64::try_from(pool.free.lock().len()).expect("a pool's free chain fits u64");
+        // `cached` = VPP `Σ bpt->n_cached`（V4、V5）：每个 runtime thread 自己的槽一次
+        // `Relaxed` 读，不借 `RefCell`、不取池锁——槽本身就是池上可共享读的原子（D3）。
+        let cached = pool
+            .cached_counts
+            .iter()
+            .map(|count| {
+                u64::try_from(count.load(Ordering::Relaxed)).expect("a cached count fits u64")
+            })
+            .sum();
+        BufferPoolUsage {
+            // `buffer_count` 建池后不变（H4），一次读即可（VPP `bp->n_buffers`）。
+            buffer_count: u64::try_from(pool.buffer_count).expect("a pool's buffer count fits u64"),
+            available,
+            cached,
+        }
+    }
 }
 ```
 
@@ -281,23 +307,37 @@ impl BufferMain {
 ### D3 每线程缓存长度的发布：池拥有的原子槽（VPP `n_cached`）
 
 VPP 的 `n_cached` 在池拥有的 `bp->threads[]` 槽里（V1），拥有者线程直接写（V10、V11），
-采集方在池锁下求和（V4）。Hammer 的同位置是 `BufferPool.workers[thread].len`（H1），但它是
-`RefCell` 里的普通 `usize`：worker 自己借得到，轮次借不到（H3）。
+采集方在池锁下求和（V4）。Hammer 今天的同位置是 `BufferPool.workers[thread].len`（H1），但它是
+`RefCell` 里的普通 `usize`：worker 在整次操作里持有该槽的可变借用（H3），轮次连 `borrow()`
+都会 panic——**把 `len` 的类型改成 `AtomicUsize` 也不解决**：原子只让并发读合法，不会让轮次
+拿到那个 `RefCell` 的借用。
 
-**决定：`BufferThreadCache.len` 的类型由 `usize` 改为 `AtomicUsize`，不新增第二个字段。**
+**决定：长度搬到池自己的每线程槽：`BufferPool.cached_counts: Box<[AtomicUsize]>`（一个 runtime
+thread 一个槽，长度 = `workers.len()`，即 `worker_count + 1`，H4），`BufferThreadCache` 的
+`len` 字段删除。**
 
 - **写者**：拥有该槽的 worker，仍只在现有四个写点写（`pool.rs:272-279,283,342-347,351`，H5）。
-  它在一次操作里以局部变量持有长度、在操作结束前用 `Relaxed` 存回
-  （`alloc_indices` 的两条返回路径、`free_buffers` 的循环末尾），语义与 VPP 把
-  `n_cached` 当普通计数器改一样，只是 Rust 里并发读必须走原子。
+  它在一次操作里以局部变量持有长度，在批边界用 `Relaxed` 存进本线程的槽
+  （`self.cached_counts[usize::from(cache.thread_index)].store(len, Ordering::Relaxed)`，
+  `alloc_indices` 的两条返回路径、`free_buffers` 的循环末尾），语义与 VPP 把 `n_cached`
+  当普通计数器改一样，只是 Rust 里并发读必须走原子。
 - **读者**：轮次（thread zero）在 `pool_usage` 里按线程槽 `Relaxed` 求和——就是
-  `buffer_get_cached` 的对应物（V4），但**不取池锁**（VPP 取锁是因为 `n_cached` 是普通
-  `u32`；Hammer 的槽本身是原子的，轮次也不需要与写者建立任何顺序——统计值允许迟一拍，
-  AGENTS 的同步规则里 `Relaxed` 正是给统计的）。
+  `buffer_get_cached` 的对应物（V4），但**不取池锁**、不碰 `workers` 的 `RefCell`（VPP 取锁是
+  因为 `n_cached` 是普通 `u32`；Hammer 的槽本身是原子的，轮次也不需要与写者建立任何顺序——
+  统计值允许迟一拍，AGENTS 的同步规则里 `Relaxed` 正是给统计的）。
+- **为什么槽必须在 `RefCell` 外面**：`BufferPool.workers` 的每个槽是
+  `RefCell<BufferThreadCache>`，worker 独占借它很久（H3）；轮次借不到它，因此也借不到它
+  里面的任何字段，无论那个字段是不是原子。VPP 的 `vlib_buffer_pool_thread_t` 把 indices 与
+  `n_cached` 装在同一个结构里，采集者直接读那个结构（V1、V4）；Hammer 的 `RefCell` 把这个
+  结构一分为二，于是 `n_cached` 的那一半与 `RefCell` 并列放在池上，读者够得到的那一半
+  才是可以共享读的。
+- **一份事实、没有影子字段**：`BufferThreadCache` 不再保存 `len`，唯一的计数就是池上这个
+  槽；`indices` 数组与它的长度不再存两份。
 - **代价与验收**：每个索引的搬动多一次 Relaxed store（分配/归还路径已有 batch 摊薄，H2）；
   M3 用 release/LTO 汇编与基准确认不回归（§8、§9）。
-- **不做**：不给每个池加"缓存总数"聚合原子（那是第二份事实，且 VPP 没有）、不给轮次加锁、
-  不改 `indices` 数组的 worker 独占语义。
+- **不做**：不给每池加"缓存总数"聚合原子（那是第二份事实，且 VPP 没有）、不给轮次加锁、
+  不给槽加 cache-line 隔离包装（VPP 用 `CLIB_CACHE_LINE_ALIGN_MARK`；这里每批只写一次，
+  伪共享代价可以忽略，也不为了占位新增一个包装类型）、不改 `indices` 数组的 worker 独占语义。
 
 ### D4 采集：一个采集者类型，每池三条登记（VPP 三条 `register_collector_fn`）
 
@@ -465,7 +505,7 @@ fixture 上单测，不需要真实 socket 或映射（ADR-0021 §6.4 的同一�
 
 | 层 | 可以调用/持有 | 不可以调用/持有 | 验证边界 |
 | --- | --- | --- | --- |
-| hammer-core（buffer pool 的 owner） | `BufferPool` 的三个事实、一次采样 `BufferPoolUsage`、`pool_count`/`pool_name`/`pool_usage`、池内的 `AtomicUsize` 缓存长度 | 任何 stats 类型/路径/列序/gauge 名字、`StatsSegment`、`StatsMain`、hammer-stats 依赖（H7） | `pool_usage` 数值正确（采样 = 一次读、无分配、无 stats 依赖）、`used()` 不回绕；采样与分配并发时无数据竞争（Relaxed） |
+| hammer-core（buffer pool 的 owner） | `BufferPool` 的三个事实、一次采样 `BufferPoolUsage`、`pool_count`/`pool_name`/`pool_usage`、池上的每线程 `cached_counts` 原子槽 | 任何 stats 类型/路径/列序/gauge 名字、`StatsSegment`、`StatsMain`、hammer-stats 依赖（H7） | `pool_usage` 数值正确（采样 = 一次读、无分配、无 stats 依赖）、`used()` 不回绕；采样与分配并发时无数据竞争（Relaxed） |
 | hammer-stats（机制） | 既有目录原语（`add_gauge`/`set_gauge`/`validate`/`add_symlink`/`entry`）、采集者表与轮次、条目级写 | `/buffer-pools` 的名字、池下标、池对象、`BufferPoolUsage` 之外任何 buffer 概念；`collect()` 的实现里不出现 buffer 家族 | 机制 crate 在没有 buffer 声明/采集者的情况下独立编译；`StatsSegment`/`StatsMain` 的公共签名不出现 `BufferPool*` |
 | `/buffer-pools` 家族模块（`hammer-stats::buffer_pools`） | `BufferPoolGauge`（三个事实的身份）、`BufferPoolUsage` 的换算与条目级写 | 池对象、`BufferMain`、`StatsSegment`/`StatsMain`、条目注册与采集者登记、池名与路径 | 家族模块里没有条目创建、没有池名字、没有锁；换算只有一处（V5 的三个函数体在 Hammer 的单一落点） |
 | hammer-runtime（池条目的 owner） | `BufferPoolGauges` 声明（`path` 模板 + 三个 gauge 字段）、`BufferPoolGaugeCollector`（字段 = `entry_index` + 池下标 + gauge）、`register_buffer_pools` 登记项、image 里的一条列表项 | 给机制加家族字段/方法、把池状态复制进段、替池拥有计数、在采集里取段锁、在轮次里借 worker 的 `RefCell`、在别处再写一次三个 gauge、第二条登记通道 | 声明与目录一致（三条名字/类型）、每池三条登记与声明一一对应、轮次只写自己那条 gauge、登记顺序与 image 一致、池名字与 VPP 格式一致 |
@@ -500,12 +540,17 @@ impl BufferPoolUsage {
 pub(super) struct BufferPool {
     // A3：VPP `bp->name`（`buffer.c:529`）；建池时生成一次，此后不变。
     pub(super) name: String,
+    // A4：VPP `bp->threads[ti].n_cached` 的位置（D3）。一个 runtime thread 一个槽：
+    // 拥有者线程 `Relaxed` 写自己的槽，轮次 `Relaxed` 求和——两者都走 `&BufferPool`，
+    // 因此都绕开了 `workers` 的 `RefCell`。
+    pub(super) cached_counts: Box<[AtomicUsize]>,
     // ...既有字段不变...
 }
 
 pub struct BufferThreadCache {
-    // A4：`len: usize` → 池拥有的原子槽（VPP `n_cached`，D3）。
-    pub(super) len: AtomicUsize,
+    // A4：`len: usize` 删除；长度就是池上的 `cached_counts[thread_index]`（D3），
+    // 一次操作内以局部变量持有、批边界存回。`indices` 数组本身不变。
+    pub(super) indices: [u32; BUFFER_THREAD_CACHE_HIGH_WATER],
     // ...既有字段不变...
 }
 
@@ -522,7 +567,7 @@ impl BufferMain {
 | A1 `BufferPoolUsage` | `crates/hammer-core/src/buffer/main.rs` | 新增（`pub`、`Copy`） | 拥有数值、不借用池；`HeapUsage`（ADR-0021 A1，hammer-infra）的同族形状，消费者是 `hammer-stats::buffer_pools` 与 runtime 的采集者。没有它，采集者要么借 `BufferPool`（`pub(super)`，且会跨线程碰 `RefCell`，H3）要么自己拼三个字段（把业务换算搬进 runtime） |
 | A2 `pool_count`/`pool_name`/`pool_usage` | 同上 | 新增 | 唯一跨线程只读面。没有它，登记项拿不到池名与三个事实（H1、H3）。刻意不返回 `&BufferPool`、不返回 guard、不返回迭代器 |
 | A3 `BufferPool.name` | `main.rs:33-45` | 新增字段 | VPP 的 `bp->name` 在同一个结构里（V2、V8）；没有它，条目名只能由 runtime 自己拼 NUMA 号，池的身份就不在池自己身上 |
-| A4 `BufferThreadCache.len: AtomicUsize` | `main.rs:48-56`；写入点 `pool.rs:272-279,283,342-347,351` | 修改字段类型 + 写点用 `Relaxed` 存回 | 轮次无法借 worker 的 `RefCell`（H3）；没有它就没有 `cached` 这个事实。不新增第二个"影子计数字段"（D3） |
+| A4 `BufferPool.cached_counts: Box<[AtomicUsize]>`（`BufferThreadCache.len` 删除） | `main.rs:33-45`（新字段）、`main.rs:48-56`（删字段）；写入点 `pool.rs:272-279,283,342-347,351` | 新增字段 + 删除字段 + 写点用 `Relaxed` 存回自己的槽 | 轮次无法借 worker 的 `RefCell`（H3），所以 `len` 留在 `RefCell` 里（哪怕类型是 `AtomicUsize`）轮次也够不到；没有它就没有 `cached` 这个事实。长度只存一份（D3 的"没有影子字段"） |
 
 ### 6.2 hammer-stats：`buffer_pools` 家族模块（A5）
 
@@ -681,7 +726,8 @@ impl StatsProvider for BufferPoolStatsProvider {
 | `crates/hammer-core/src/buffer/main.rs` | `BufferPoolUsage` + `used()`（A1） | 新增 |
 | `crates/hammer-core/src/buffer/main.rs` | `BufferPool.name: String`（A3） | 新增字段 |
 | `crates/hammer-core/src/buffer/main.rs` | `BufferMain::pool_count`/`pool_name`/`pool_usage`（A2） | 新增 |
-| `crates/hammer-core/src/buffer/main.rs:48-56` | `BufferThreadCache.len: usize → AtomicUsize`（A4） | 修改 |
+| `crates/hammer-core/src/buffer/main.rs:33-45` | `BufferPool.cached_counts: Box<[AtomicUsize]>`（A4） | 新增字段 |
+| `crates/hammer-core/src/buffer/main.rs:48-56` | `BufferThreadCache.len: usize` 删除（A4） | 修改 |
 | `crates/hammer-core/src/buffer/pool.rs:272-279,283,342-347,351` | 缓存长度的四个写点（`Relaxed` 存回） | 修改 |
 | `crates/hammer-core/src/buffer/pool.rs:79-86` | `cached_free_buffers` 的读（`.load(Relaxed)`） | 修改 |
 | `crates/hammer-stats/src/buffer_pools.rs`、`lib.rs` | `BufferPoolGauge`、`update_pool_gauge`、`pub mod buffer_pools`（A5） | 新增 |
@@ -696,7 +742,7 @@ impl StatsProvider for BufferPoolStatsProvider {
 
 | 阶段 | 范围 | 完成证据 |
 | --- | --- | --- |
-| M0 hammer-core | A1/A2/A3/A4：`BufferPoolUsage`、池名、三个访问器、`len: AtomicUsize` 与四个写点 | 真实池上 `pool_count`/`pool_name` 与 NUMA 节点一致；`pool_usage` 的三个值与已知分配/归还一致；采样不分配、不借别的 worker 的槽；`used()` 在并发采样下不回绕 |
+| M0 hammer-core | A1/A2/A3/A4：`BufferPoolUsage`、池名、三个访问器、每线程 `cached_counts` 槽与四个写点 | 真实池上 `pool_count`/`pool_name` 与 NUMA 节点一致；`pool_usage` 的三个值与已知分配/归还一致；采样不分配、不借别的 worker 的槽、不碰 `RefCell`；`used()` 在并发采样下不回绕 |
 | M1 hammer-stats | A5：`buffer_pools` 家族模块 | 换算单测（三个事实 → 三条 gauge 的值）；`cargo check -p hammer-stats` 在没有 runtime 的情况下通过 |
 | M2 hammer-component-macros | A6：`path` 占位符 + 参数化 `install` | 编译期用例：同一声明 install 两次得到不同名字的两组条目；缺占位符实参是编译错误；既有 `path` 字面量声明（`Sys`、`/mem`）行为不变 |
 | M3 hammer-runtime | A7/A8：owner 声明、采集者、登记项、image 一条 | 两个池的进程里 `/buffer-pools/default-numa-{0,1}/{cached,used,available}` 存在且类型是 `Gauge`；跑一轮后值与采样一致；登记顺序与 image 一致；node 与机制代码里没有 buffer 概念 |
@@ -732,9 +778,10 @@ impl StatsProvider for BufferPoolStatsProvider {
 池名 `default-numa-<n>`、每池三条登记、`private_data` = 池下标，采集函数只做"解析自己那个池 →
 写 `d->entry->value`"（V5–V8、V13、V14）。这三个值来自池自己的三个事实（`n_buffers`/`n_avail`/
 `Σ n_cached`，V1–V3），Hammer 池里同样有这三个事实（H1），但每线程缓存长度今天只能被拥有它的
-worker 借到（H3），所以本设计把它作为池拥有的原子槽（D3）——这与 VPP 把 `n_cached` 放在池拥有的
-`bp->threads[]` 槽里同构（V1），差别只在 VPP 用普通 `u32` + 池锁求和（V4），Hammer 用原子槽 +
-无锁 Relaxed 求和。目录侧不需要新原语（gauge 已存在，H9）；机制（`StatsSegment`/`StatsMain`）、
+worker 借到（H3），所以本设计把它作为池上、与 `workers` 的 `RefCell` 并列的每线程原子槽（D3）
+——这与 VPP 把 `n_cached` 放在池拥有的 `bp->threads[]` 槽里同构（V1），差别只在 VPP 用普通
+`u32` + 池锁求和（V4），Hammer 用原子槽 + 无锁 Relaxed 求和。目录侧不需要新原语（gauge 已存在，
+H9）；机制（`StatsSegment`/`StatsMain`）、
 `Sys`/`/mem` owner、`statseg-collector-process` 都不改（H10、H11）；登记以 owner 模块里
 **一条 `#[derive(Stats)]` 参数化声明 + 一个采集者类型 + 一条 `#[stats_collect_registration]` 登记项**
 参与，池名与三个值的来源都在 `hammer-core`（H7）。唯一的新宏 surface 是 `path` 占位符与参数化
@@ -746,7 +793,7 @@ worker 借到（H3），所以本设计把它作为池拥有的原子槽（D3）
 | 差异 | VPP | Hammer | 理由与回归点 |
 | --- | --- | --- | --- |
 | 采集者数量 | 三个函数（`buffer_gauges_collect_{cached,used,available}_fn`），每池三条登记 | 一个类型 `BufferPoolGaugeCollector` + `gauge` 选择器，仍每池三条登记 | 用户明确要求"一个采集者类型，只是变量不一样"；语义（每条登记写一条 gauge）不变（V5） |
-| `cached` 的求和 | 池锁下求和（`n_cached` 是普通 `u32`） | 池拥有的 `AtomicUsize` + Relaxed 求和，不取池锁 | Rust 不允许数据竞争；统计值允许迟一拍；轮次不因此变慢（D3） |
+| `cached` 的求和 | 池锁下求和（`n_cached` 是普通 `u32`） | 池上每线程 `cached_counts` 原子槽 + Relaxed 求和，不取池锁、不碰 `RefCell` | Rust 不允许数据竞争；统计值允许迟一拍；轮次不因此变慢（D3） |
 | `available` 的读 | `bp->n_avail` 是普通字段，不取锁 | 读 `free` 链长度必须持既有 `Spinlock<Vec<u32>>` | Hammer 的 free 链是受锁容器；临界区只是 `len()`（H5）。这是轮次里唯一的锁，且它属于池而不是 stats |
 | 瞬时不一致 | `used` 用 C 的 `u32` 回绕 | `saturating_sub` 取 0 | 统计值不应回绕成天文数字（D2） |
 | 空池/缺失池 | 登记跳过 `n_buffers == 0`，采集取不到池就静默返回 | 不复制这两个分支：池集合启动期冻结、`init` 拒绝空池（H4），不可达即 bug | 与 ADR-0021 轮次里 `expect("…live directory entry")` 同一条错误规则 |
@@ -758,7 +805,7 @@ worker 借到（H3），所以本设计把它作为池拥有的原子槽（D3）
 1. **A6 的最终语法**：`path` 里的 `{pool_name}` 占位符（本设计）与"显式声明 install 参数的
    属性"（如 `#[stats(instances = [pool_name: &str])]`）之间选一个。若选后者，占位符与参数
    声明必须一致，宏要报不一致的编译错误；两种写法都只允许 `&str`。
-2. **`BufferThreadCache.len` 的写入粒度**：本设计把每次长度变化的最终值 Relaxed 存回
+2. **每线程 `cached_counts` 槽的写入粒度**：本设计把每次长度变化的最终值 Relaxed 存回
    （与 VPP 的逐次写一致）；备选是只在 batch 边界发布（每 32 个索引一次，代价更低但 gauge
    最多滞后一个 batch）。需要 M0/M3 的基线与汇编决定。
 3. **重复 NUMA 节点**：`BufferMain::init` 不去重（H4），生产调用点已去重（H13）。当前选择是

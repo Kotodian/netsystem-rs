@@ -227,29 +227,77 @@ pub(crate) struct NodeCounters {
 }
 
 impl NodeCounters {
+    /// 建一格：四个计数全 0，与 VPP 新建 `vlib_node_runtime_t` 时那排字段的初值相同（V3）。
+    const fn new() -> Self {
+        Self {
+            clocks: AtomicU64::new(0),
+            vectors: AtomicU64::new(0),
+            calls: AtomicU64::new(0),
+            suspends: AtomicU64::new(0),
+        }
+    }
+
     /// VPP `vlib_node_runtime_update_stats`（V4、V7）的三个累加项：
     /// 一次派发 = `calls += 1`、`vectors += n`、`clocks += t - last_time_stamp`。
     #[inline(always)]
-    pub(crate) fn update_dispatch(&self, vectors: u64, clocks: u64);
+    pub(crate) fn update_dispatch(&self, vectors: u64, clocks: u64) {
+        // 三个独立的一次读-改-写，与 VPP 那三行赋值逐条对应（V4）：
+        // `n_calls` 恒为 1（V7），`n_vectors` 是节点函数的返回值，`n_clocks` 是时间戳差。
+        self.calls.fetch_add(1, Ordering::Relaxed);
+        self.vectors.fetch_add(vectors, Ordering::Relaxed);
+        self.clocks.fetch_add(clocks, Ordering::Relaxed);
+    }
 
     /// VPP `p->n_suspends += 1`（V9）的落点；只有 thread zero 调（H15）。
     #[inline]
-    pub(crate) fn add_suspend(&self);
+    pub(crate) fn add_suspend(&self) {
+        self.suspends.fetch_add(1, Ordering::Relaxed);
+    }
 
     /// 读一格（轮次用；跨格不承诺一致快照，D7 第 2 条）。
     #[inline(always)]
-    pub(crate) fn value(&self, counter: NodeCounter) -> u64;
+    pub(crate) fn value(&self, counter: NodeCounter) -> u64 {
+        // 一格一次 `Relaxed` 读，读出什么就写什么：采集者只投影，不求和、
+        // 不换算成时间、不做速率、不做 clear 差分（D1.2、D8）。
+        match counter {
+            NodeCounter::Clocks => self.clocks.load(Ordering::Relaxed),
+            NodeCounter::Vectors => self.vectors.load(Ordering::Relaxed),
+            NodeCounter::Calls => self.calls.load(Ordering::Relaxed),
+            NodeCounter::Suspends => self.suspends.load(Ordering::Relaxed),
+        }
+    }
 }
 
 /// 每线程一行：VPP "线程 → `node_main.nodes`" 的表（V3、V12）。
-pub(crate) struct NodeCounterRows { … }
+pub(crate) struct NodeCounterRows {
+    /// 各线程的行：`install` 分配一次、`Box::leak` 之后活到进程结束，所以这里存
+    /// `&'static` 引用——`row()` 借出的行必须比任何调用者活得久（D1.1）。
+    rows: &'static [Box<[NodeCounters]>],
+}
 
 impl NodeCounterRows {
     /// 建行：容量在 main-loop-enter 的冻结点取一次（H5），每线程一行、活到进程结束。
-    pub(crate) fn install(thread_count: u32, node_capacity: usize) -> Self;
+    pub(crate) fn install(thread_count: u32, node_capacity: usize) -> Self {
+        // 行数 = thread zero + Data Workers、列数 = 冻结的节点容量（`with_node_capacity`
+        // 的同一份 `node_count()`，H5、A7）；这里不再查任何全局。
+        let mut rows = Vec::with_capacity(usize::from(thread_count));
+        for _ in 0..thread_count {
+            let row: Box<[NodeCounters]> =
+                (0..node_capacity).map(|_| NodeCounters::new()).collect();
+            rows.push(row);
+        }
+        Self {
+            rows: Box::leak(rows.into_boxed_slice()),
+        }
+    }
 
     /// 线程 `thread_index` 的行；`0..=worker_count()` 之外没有节点图，返回 `None`。
-    pub(crate) fn row(&self, thread_index: u32) -> Option<&'static [NodeCounters]>;
+    pub(crate) fn row(&self, thread_index: u32) -> Option<&'static [NodeCounters]> {
+        // 先把 `&'static` 拷出字段再索引：行本身是 `'static` 的，
+        // 借出的切片因此也是 `'static`，采集者才能在自己的实例里长期持有它。
+        let rows: &'static [Box<[NodeCounters]>] = self.rows;
+        rows.get(usize::from(thread_index)).map(|row| &row[..])
+    }
 }
 ```
 
@@ -265,10 +313,18 @@ pub struct NodeMain {
 
 impl NodeMain {
     /// 装本线程的行（发射前一次；`worker_parts` 的每个克隆装自己那一行）。
-    pub(crate) fn install_node_counters(&mut self, row: &'static [NodeCounters]);
+    pub(crate) fn install_node_counters(&mut self, row: &'static [NodeCounters]) {
+        // 行归 `NodeCounterRows` 所有并活到进程结束（D1.1），图只记引用：
+        // 装一次、之后不再换，所以没有 `Option`、没有 `OnceLock`、没有第二份存储。
+        self.node_counters = row;
+    }
 
     #[inline(always)]
-    pub(crate) fn node_counters(&self, node: NodeId) -> &NodeCounters;
+    pub(crate) fn node_counters(&self, node: NodeId) -> &NodeCounters {
+        // 槽就是列号（D0）；行宽 = 冻结的节点容量，所以索引不会越界。越界只意味着
+        // "图比行宽"这条不变量被破坏，属于本模块的 bug，直接崩（AGENTS 的错误分类）。
+        &self.node_counters[usize::from(node.slot())]
+    }
 }
 ```
 
@@ -313,9 +369,19 @@ self.last_time_stamp = dispatch_end;
 ```
 
 - `count` 就是节点函数的返回值，即 VPP 的 `n_vectors`（H2、V7）。
-- **主循环刷新**：worker 主循环在派发步之前刷新一次 `last_time_stamp`（V8 的同位，
-  `main_loop.rs:122-130` 的两个 `run_ready_nodes` 之前）；构造时初始化一次，避免 thread zero 在图重建等
-  循环外派发时把"从进程启动到现在"记进 `clocks`。
+- **主循环刷新**：worker 主循环每轮在 VPP 的同一位置刷新一次 `last_time_stamp`——VPP 那行
+  `cpu_time_now = clib_cpu_time_now()`（V8，`main.c:1519`）在 barrier check、handoff 出队与主循环
+  callback 之后，file poll 和所有派发之前；Hammer 的对应点是 `data_plane_main_loop` 循环体里
+  Step 1（barrier check，`main_loop.rs:90-96`）之后、Step 2（file poll，`main_loop.rs:98-105`）之前：
+
+  ```rust
+  // crates/hammer-runtime/src/main_loop.rs（`data_plane_main_loop` 循环体开头，Step 1 之后）
+  // VPP `main.c:1519`：每轮在这里取一次时间戳，本轮所有派发都用它。本轮第一次派发的
+  // `clocks` 因此包含从这一刻到该次派发结束之间的主循环工作（file poll、调度、handoff）。
+  main.last_time_stamp = cpu_time_now();
+  ```
+
+  构造时也初始化一次，避免循环外（例如图重建后的第一次派发）把"从进程启动到现在"记进 `clocks`。
 - `clocks` 的语义因此与 VPP 逐字一致：**本轮第一次派发从"主循环刷新点"起算，其余派发从
   上一次派发的结束点起算**——它包含派发之间的主循环工作（文件轮询、handoff、调度），
   这是 VPP 的既有口径（V7、V8），不是"Hammer 累计的纯节点执行时间"。
@@ -498,10 +564,28 @@ impl NodeCounter {
     pub(crate) const ALL: [Self; 4] = [Self::Clocks, Self::Vectors, Self::Calls, Self::Suspends];
 
     /// VPP `node_counters[].name`：`clocks|vectors|calls|suspends`（V11）。
-    pub(crate) fn name(self) -> &'static str;
+    pub(crate) fn name(self) -> &'static str {
+        // 名字是一个字面量，它同时决定目录条目名的叶子（`/sys/node/<name>`）
+        // 与别名名的叶子（`/nodes/<node>/<name>`），与 VPP `node_counters[]` 同一处（V11）。
+        match self {
+            Self::Clocks => "clocks",
+            Self::Vectors => "vectors",
+            Self::Calls => "calls",
+            Self::Suspends => "suspends",
+        }
+    }
 
     /// VPP `node_counters[].entry_index`（V11）。
-    fn entry_index(self, node_stats: &NodeStats) -> DirectoryIndex;
+    fn entry_index(self, node_stats: &NodeStats) -> DirectoryIndex {
+        // 声明里的字段与计数器一一对应；索引来自 `#[derive(Stats)]` 生成的 install，
+        // 不是在这里 `find` 一遍名字（D3）。
+        match self {
+            Self::Clocks => node_stats.clocks.index,
+            Self::Vectors => node_stats.vectors.index,
+            Self::Calls => node_stats.calls.index,
+            Self::Suspends => node_stats.suspends.index,
+        }
+    }
 }
 
 /// VPP `collector.c:161-176` + `vlib_stats_register_collector_fn`（V16、V23 的登记部分）：
