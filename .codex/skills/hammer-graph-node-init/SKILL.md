@@ -46,11 +46,17 @@ the node needs a Main-owned handle or other runtime state.
 
 ## Lifecycle boundary
 
-`install_packet_graph` walks the link-time `NodeEntry` inventory and invokes each
-node init callback with a worker-owned `DataPlaneMain`. The callback registers
-the node and its named next arcs; it does not initialize plugin Main state.
-Plugin Main initialization belongs to `#[init_function(...)]` and must run
-before `install_packet_graph` via `runs_before = ["install_packet_graph"]`.
+`main_loop::run` completes the registered normal init and config callbacks,
+then calls `DataPlaneMain::init_graph_from_declarations`. That method walks the
+`NodeEntry` inventory and invokes each node init callback with the thread-zero
+`DataPlaneMain`. The callback registers the node and its named next arcs; it
+does not initialize plugin Main state.
+
+Graph materialization is a direct lifecycle call, not a registered init
+function. Never name it in `runs_before` or `runs_after`. Plugin Main
+initialization belongs to `#[init_function(...)]`; every normal init callback
+already completes before graph materialization. Ordering attributes may refer
+only to real registrations in the same lifecycle category.
 
 Worker initialization is separate: use `#[worker_init_function]` only for state
 owned by each Data Worker. Do not use `thread_local!`, a packet-path mutex, or a
@@ -60,7 +66,10 @@ foreign worker mutation to make node setup convenient.
 
 - `crates/hammer-component-macros/src/lib.rs`: `graph_node` expansion,
   generated unit-node init, and `#[node(default)]` handling.
-- `crates/hammer-runtime/src/graph/install.rs`: graph inventory installation.
-- `crates/hammer-plugins/ip/src/ip/input.rs`: explicit node init callback.
-- `crates/hammer-plugins/ip/src/lookup/mod.rs`: stateful node registration
-  with `FibTableHandle` and next-name registration.
+- `crates/hammer-runtime/src/main_loop.rs`: init/config ordering before graph
+  materialization.
+- `crates/hammer-runtime/src/data_plane/dispatch.rs`:
+  `DataPlaneMain::init_graph_from_declarations`.
+- `crates/hammer-plugins/net/ip/src/input.rs`: generated unit-node init.
+- `crates/hammer-plugins/net/ip/src/lookup.rs`: explicit node callbacks and
+  named-next registration.
