@@ -4,6 +4,14 @@ Status: accepted
 
 Date: 2026-09-03
 
+Partial supersession: ADR-0025 replaces every Feature Arc ownership, module,
+initialization, API receiver, interface-deletion, configuration-owner, and test
+decision in this ADR. In the current design `hammer_service::feature::FeatureMain`
+is the independent owner; `feature_arc_init` is the sole startup construction
+callback; there is no `FeatureState`, installed flag, `FeatureArc` aggregate, or
+install API. The IPv4/IPv6 local/receive/end-of-arc nodes, validation, protocol
+tables, and ICMP boundaries below remain in force.
+
 This ADR replaces the IP local-delivery and Feature Arc portions of ADR-0005
 and the Feature Arc publication rule in ADR-0002. Feature Arc is
 protocol-neutral interface infrastructure: declarations describe graph nodes,
@@ -1043,18 +1051,20 @@ per-protocol tests are excluded.
 
 All architecture choices in this ADR are closed:
 
-- Feature Arc is private implementation of `InterfaceMain` and is keyed by
-  `sw_if_index`; `NetMain` has no Feature Arc accessor.
+- Superseded by ADR-0025: Feature Arc is owned by independent `FeatureMain` and
+  remains keyed by `sw_if_index`; neither `NetMain` nor `InterfaceMain` exposes
+  or forwards Feature operations.
 - `#[feature_arc]` and `#[feature]` accept real Graph Node type paths and
   generate direct registration methods on those structs; no registration
   image, marker trait, or metadata-only type is introduced.
-- Declarations close before workers; runtime loading cannot reorder arcs.
-- Runtime feature mutation is an `InterfaceMain` operation and does not depend
-  on Binary API. The owner uses the barrier macro for an actual live change.
+- Declarations run before `feature_arc_init`; late registration is a lifecycle
+  invariant and runtime loading cannot reorder arcs.
+- Runtime feature mutation is a `FeatureMain` operation and does not depend on
+  Binary API. The owner uses the barrier macro for an actual live change.
 - Per-interface configuration is a dense config index into one shared aligned
   heap with a VPP-shaped hidden pool back-pointer. Packet progress uses
   `Buffer::current_config_index`; no arc identity or Feature Arc cursor is
-  carried in `NetworkOpaque`, and `InterfaceMain` stores no `NodeRuntime`.
+  carried in `NetworkOpaque`, and `FeatureMain` stores no `NodeRuntime`.
 - Multi-edge Feature topology updates use one failure-atomic generic
   `NodeRuntime` operation and request one ADR-0003 worker Graph Refork only when
   the main graph actually changes.

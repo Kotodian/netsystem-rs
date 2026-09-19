@@ -245,6 +245,31 @@ be coordinated across network services and device drivers. It is initialized
 before runtime interface configuration is applied.
 _Avoid_: InterfaceControlPlane, interface registry
 
+**FeatureMain**:
+The independent process-global Feature Arc authority corresponding to VPP's
+`vnet_feature_main_t`. It owns Feature registrations and name indexes, one
+FeatureConfigMain per arc, the shared configuration-word Heap, sorted per-arc
+feature nodes, per-interface feature counts, and presence bitmaps. Startup
+declarations are resolved only by `feature_arc_init`; live publication is
+barrier-owned. It is not embedded in or forwarded by InterfaceMain.
+_Avoid_: Interface-owned Feature state, FeatureState, installed FeatureArc,
+install API
+
+**FeatureConfigMain**:
+The private per-arc configuration owner corresponding to VPP's
+`vnet_feature_config_main_t`. It owns the dense interface-to-config-index table
+and embeds one ConfigMain. All per-arc configuration fields belong here or in
+that embedded ConfigMain.
+_Avoid_: public config wrapper, top-level per-interface config table
+
+**ConfigMain**:
+The private generic compiled-configuration owner corresponding to VPP's
+`vnet_config_main_t`. It owns start/default-end/feature-node facts, ConfigEntry
+pool and deduplication index; FeatureMain supplies the shared Heap. ConfigEntry
+and ConfigFeature correspond directly to VPP's `vnet_config_t` and
+`vnet_config_feature_t` rather than introducing a FeatureChain abstraction.
+_Avoid_: FeatureChain, Feature-specific allocator, public config borrow
+
 **DeviceMain**:
 The service-owned device authority corresponding to VPP's
 `vnet_device_main_t`. It is process-global and owns device-input worker scope,

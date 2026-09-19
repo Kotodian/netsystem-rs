@@ -6,6 +6,7 @@ hammer_runtime::__declare_registration_image!(
         session::__INIT_FN_APPLICATION_INIT,
         interface_model::__INIT_FN_INTERFACE_MAIN_INIT,
         net::__INIT_FN_NET_MAIN_INIT,
+        feature::__INIT_FN_FEATURE_MAIN_INIT,
         device::__INIT_FN_DEVICE_MAIN_INIT,
         session::__INIT_FN_SESSION_INIT,
         session::__INIT_FN_SESSION_ATTACH_SERVER,
@@ -18,7 +19,7 @@ hammer_runtime::__declare_registration_image!(
         session::__CONFIG_FN_SESSION_CONFIG,
     ];
     main_loop_enter_functions = [
-        interface_model::feature::__INIT_FN_INTERFACE_FEATURE_INIT,
+        feature::__INIT_FN_FEATURE_ARC_INIT,
     ];
     main_loop_exit_functions = [
         binary_api::__INIT_FN_EXIT_BINARY_API,
@@ -62,6 +63,7 @@ pub mod device;
 pub mod interface;
 mod interface_model;
 pub use interface_model::InterfaceRegistrationImage;
+pub mod feature;
 pub mod net;
 pub mod opaque;
 /// Session layer — shared infrastructure, not a plugin.
