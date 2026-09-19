@@ -185,8 +185,7 @@ impl EthernetMain {
 
 #[hammer_component_macros::init_function(
     name = "ethernet_main_init",
-    runs_after = ["net_main_init"],
-    runs_before = ["install_packet_graph"]
+    runs_after = ["net_main_init"]
 )]
 fn ethernet_main_init() -> RuntimeResult<()> {
     EthernetMain::init()

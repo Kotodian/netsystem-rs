@@ -481,7 +481,9 @@ The actual startup paths are:
    `init_control` -> service image installation -> `main_loop_enter` -> early
    config -> `load_plugins` (early config, init, graph extension, normal
    config) -> normal config/init/stats/enter -> `start_process_nodes`.
-   `install_packet_graph` itself is currently an ordinary init hook.
+   Graph materialization is not an init hook: the current `main_loop::run`
+   completes normal init/config and then directly calls
+   `DataPlaneMain::init_graph_from_declarations`.
 4. **Hammer current worker path:** `start_workers` snapshots graph and copies
    worker-init declarations -> OS-thread closure -> launch-barrier check ->
    construct DataPlaneMain -> install shared control references and TLS ->

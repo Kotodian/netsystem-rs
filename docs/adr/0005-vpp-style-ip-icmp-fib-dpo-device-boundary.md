@@ -239,7 +239,7 @@ net_main_init (constructs embedded InterfaceMain and consumes interface/net imag
     -> device_main_init
 net_main_init -> ip_main_init -> ip4_main_init / ip6_main_init
 ip_main_init -> icmp_init (ICMP DSO declares load_after = ["ip"])
-all declarations -> install_packet_graph -> Binary API route publication
+all declarations -> DataPlaneMain::init_graph_from_declarations -> Binary API route publication
 ```
 
 This is a dependency graph, not a claim that device drivers or IP are one
