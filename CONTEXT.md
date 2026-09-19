@@ -304,6 +304,15 @@ network behavior with the owning network authority and is distinct from a
 runtime software-interface or hardware-interface instance.
 _Avoid_: interface record, interface helper
 
+**Tuntap Main**:
+The tuntap plugin's process-global owner corresponding to VPP's
+`tuntap_main_t`. It retains the Linux TUN/TAP and provisioning descriptors,
+device configuration facts, and the linked hardware/software interface
+indices. Linux owns the persistent netdev while `InterfaceMain` owns Hammer's
+hw/sw interface records; normal configuration creates both and main-loop exit
+deletes both.
+_Avoid_: TuntapState, TuntapInstance, runtime capability, activation stage
+
 ## Network/IP Language
 
 **Independent Plugin**:

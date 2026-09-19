@@ -951,11 +951,13 @@ pub(crate) mod tests {
                 .set(crate::lookup::Ip6Main::new())
                 .is_ok()
         );
-        let hardware = interfaces.register_hardware_interface(0, 0, 0, 0)?;
-        let effective_rx = interfaces
-            .hardware_interface(hardware)
-            .unwrap()
-            .sw_if_index();
+        let hardware = interfaces.register_hardware_interface(
+            interfaces.device_class_index("local"),
+            0,
+            interfaces.hw_class_index("local"),
+            0,
+        )?;
+        let effective_rx = interfaces.hardware_interface(hardware).sw_if_index();
         let raw_rx = net.local_interface_sw_index();
         let families = [
             (

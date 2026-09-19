@@ -428,11 +428,13 @@ pub(crate) fn error_response_source_and_origin(runtime: &mut DataPlaneMain) -> R
     use hammer_core::data_plane::NodeKind;
     use hammer_runtime::node::NodeDescriptor;
     let interfaces = NetMain::global()?.interface_main();
-    let hardware = interfaces.register_hardware_interface(0, 0, 0, 0)?;
-    let rx = interfaces
-        .hardware_interface(hardware)
-        .unwrap()
-        .sw_if_index();
+    let hardware = interfaces.register_hardware_interface(
+        interfaces.device_class_index("local"),
+        0,
+        interfaces.hw_class_index("local"),
+        0,
+    )?;
+    let rx = interfaces.hardware_interface(hardware).sw_if_index();
     for address in ["192.0.2.1/24", "2001:db8::1/64", "fe80::1/64"] {
         interfaces.add_address(rx, address.parse().unwrap())?;
     }

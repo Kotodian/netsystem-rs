@@ -1,5 +1,42 @@
 extern crate self as hammer_service;
 
+#[doc(hidden)]
+pub mod __private {
+    pub use linkme::distributed_slice;
+}
+
+#[linkme::distributed_slice]
+#[doc(hidden)]
+pub static __HAMMER_DEVICE_CLASS_REGISTRATIONS: [device::DeviceClass];
+
+#[linkme::distributed_slice]
+#[doc(hidden)]
+pub static __HAMMER_HW_CLASS_REGISTRATIONS: [device::HwClass];
+
+#[macro_export]
+macro_rules! declare_interface_registration_image {
+    () => {
+        #[::hammer_service::__private::distributed_slice]
+        #[doc(hidden)]
+        pub static __HAMMER_DEVICE_CLASS_REGISTRATIONS: [::hammer_service::device::DeviceClass];
+
+        #[::hammer_service::__private::distributed_slice]
+        #[doc(hidden)]
+        pub static __HAMMER_HW_CLASS_REGISTRATIONS: [::hammer_service::device::HwClass];
+
+        #[unsafe(no_mangle)]
+        #[doc(hidden)]
+        pub static HAMMER_INTERFACE_REGISTRATION_IMAGE:
+            ::hammer_service::InterfaceRegistrationImage =
+            ::hammer_service::InterfaceRegistrationImage::new(
+                &__HAMMER_DEVICE_CLASS_REGISTRATIONS,
+                &__HAMMER_HW_CLASS_REGISTRATIONS,
+                &[],
+                &[],
+            );
+    };
+}
+
 hammer_runtime::__declare_registration_image!(
     init_functions = [
         binary_api::__INIT_FN_BINARY_API_INIT,

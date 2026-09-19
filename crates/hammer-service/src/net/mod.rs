@@ -122,18 +122,15 @@ impl NetMain {
     }
 
     pub fn init(interface_main: Arc<InterfaceMain>) -> RuntimeResult<Arc<NetMain>> {
+        let local_device_class = interface_main.device_class_index("local");
+        let local_hw_class = interface_main.hw_class_index("local");
         let local_hw = interface_main
-            .register_hardware_interface(0, 0, 0, 0)
+            .register_hardware_interface(local_device_class, 0, local_hw_class, 0)
             .map_err(RuntimeError::from)?;
         interface_main
             .set_interface_name(local_hw, "local0")
             .map_err(RuntimeError::from)?;
-        let local_sw = interface_main
-            .hardware_interface(local_hw)
-            .map(|interface| interface.sw_if_index)
-            .ok_or(RuntimeError::RuntimeCapabilityMissing {
-                type_name: "local0",
-            })?;
+        let local_sw = interface_main.hardware_interface(local_hw).sw_if_index;
         let shared = Arc::new(NetMain {
             interface_main,
             dpo_main: RefCell::new(DpoMain::new()),

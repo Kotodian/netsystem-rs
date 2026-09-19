@@ -1,5 +1,9 @@
 # Hammer plugins
 
+Device plugins live under `device/`. The `tuntap` plugin currently owns only
+Linux TUN/TAP control-plane creation and process-exit deletion; packet nodes,
+FileMain integration, punt/inject, and address synchronization are deferred.
+
 Layout follows domain ownership — **not** a flat list of every name:
 
 ```text
