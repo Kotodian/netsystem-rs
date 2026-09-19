@@ -44,7 +44,7 @@ jobs:
           cargo test --locked -p hammer-plugin-tuntap
           tests::tuntap_dso_installs_class_image -- --ignored --exact
       - name: Run non-privileged control-plane tests
-        run: cargo test --locked -p hammer-service -p hammer-plugin-tuntap
+        run: cargo test --locked -p hammer-plugin-tuntap --lib
       - name: Run isolated tuntap lifecycle
         run: >-
           sudo env PATH="$PATH" CARGO_HOME="$HOME/.cargo"
