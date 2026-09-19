@@ -7,6 +7,7 @@ hammer_runtime::__declare_registration_image!(
         interface_model::__INIT_FN_INTERFACE_MAIN_INIT,
         net::__INIT_FN_NET_MAIN_INIT,
         feature::__INIT_FN_FEATURE_MAIN_INIT,
+        ethernet::__INIT_FN_ETHERNET_MAIN_INIT,
         device::__INIT_FN_DEVICE_MAIN_INIT,
         session::__INIT_FN_SESSION_INIT,
         session::__INIT_FN_SESSION_ATTACH_SERVER,
@@ -19,6 +20,7 @@ hammer_runtime::__declare_registration_image!(
         session::__CONFIG_FN_SESSION_CONFIG,
     ];
     main_loop_enter_functions = [
+        feature::__INIT_FN_DEVICE_INPUT_FEATURE_INIT,
         feature::__INIT_FN_FEATURE_ARC_INIT,
     ];
     main_loop_exit_functions = [
@@ -33,6 +35,8 @@ hammer_runtime::__declare_registration_image!(
     graph_nodes = [
         data_plane::__SERVICE_GRAPH_NODE_DROP_NODE,
         data_plane::__SERVICE_GRAPH_NODE_PUNT_NODE,
+        ethernet::__SERVICE_GRAPH_NODE_ETHERNET_INPUT_NODE,
+        device::__SERVICE_GRAPH_NODE_DEVICE_INPUT_NODE,
         interface::__SERVICE_GRAPH_NODE_INTERFACE_OUTPUT_NODE,
         session::node::__SESSION_GRAPH_NODE_APP_SESSION_INPUT_NODE,
         session::node::__SESSION_GRAPH_NODE_SESSION_QUEUE_NODE,
@@ -59,6 +63,8 @@ pub mod binary_api;
 pub mod data_plane;
 /// Device-class abstraction. Concrete drivers live under `hammer-plugins/device/`.
 pub mod device;
+/// Ethernet input parsing and EtherType dispatch.
+pub mod ethernet;
 /// Interface / adjacency control plane — shared infrastructure, not a plugin.
 pub mod interface;
 mod interface_model;

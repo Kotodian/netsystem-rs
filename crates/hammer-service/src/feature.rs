@@ -8,6 +8,7 @@ use hammer_runtime::{DataPlaneMain, NodeMain, RuntimeError, RuntimeResult};
 
 use crate::interface::{InterfaceCallbackRegistration, InterfaceMain, InterfaceResult};
 use crate::net::NetMain;
+use crate::{device::DeviceInputNode, ethernet::EthernetInputNode};
 
 #[derive(Debug, thiserror::Error)]
 pub enum FeatureError {
@@ -110,6 +111,7 @@ pub struct FeatureMain {
     feature_nodes_by_arc: UnsafeCell<Vec<Box<[NodeId]>>>,
     feature_count_by_sw_if_index: UnsafeCell<Vec<Vec<i16>>>,
     sw_if_index_has_features: UnsafeCell<Vec<Bitmap>>,
+    device_input_feature_arc_index: UnsafeCell<u8>,
 }
 
 pub static FEATURE_MAIN: OnceLock<FeatureMain> = OnceLock::new();
@@ -134,6 +136,7 @@ impl FeatureMain {
             feature_nodes_by_arc: UnsafeCell::new(Vec::new()),
             feature_count_by_sw_if_index: UnsafeCell::new(Vec::new()),
             sw_if_index_has_features: UnsafeCell::new(Vec::new()),
+            device_input_feature_arc_index: UnsafeCell::new(u8::MAX),
         }
     }
 
@@ -814,6 +817,24 @@ impl FeatureMain {
     }
 
     #[inline(always)]
+    pub fn start_device_input(
+        &self,
+        sw_if_index: u32,
+        buffer: &mut Buffer,
+        default_next: u16,
+    ) -> u16 {
+        // SAFETY: device_input_feature_init publishes the scalar before Data
+        // Workers start, after which packet code only reads it.
+        let arc_index = unsafe { *self.device_input_feature_arc_index.get() };
+        assert_ne!(
+            arc_index,
+            u8::MAX,
+            "device-input Feature Arc exists before packet processing"
+        );
+        self.start_feature_arc(arc_index, sw_if_index, buffer, default_next)
+    }
+
+    #[inline(always)]
     pub fn start_feature_arc_at_config(
         &self,
         arc_index: u8,
@@ -1048,6 +1069,29 @@ fn feature_sw_interface_add_del(
 )]
 fn feature_main_init() -> RuntimeResult<()> {
     FeatureMain::init()
+}
+
+#[doc(hidden)]
+#[hammer_component_macros::main_loop_enter_function(
+    name = "device_input_feature_init",
+    runs_before = ["feature_arc_init"]
+)]
+pub fn device_input_feature_init(main: &mut DataPlaneMain) -> RuntimeResult<()> {
+    let features = FeatureMain::global()?;
+    let arc_index = (|| {
+        let arc_index = DeviceInputNode::register_feature_arc(features, main.nodes())?;
+        EthernetInputNode::register_feature(features, main.nodes())?;
+        Ok::<u8, FeatureError>(arc_index)
+    })()
+    .map_err(|source| RuntimeError::GraphNodeInitialization {
+        node: DeviceInputNode::NODE_NAME,
+        source: Box::new(source),
+    })?;
+    // SAFETY: main-loop-enter callbacks are serialized before workers start.
+    unsafe {
+        *features.device_input_feature_arc_index.get() = arc_index;
+    }
+    Ok(())
 }
 
 /// Constructs Feature Arcs after graph nodes and declarations exist.
