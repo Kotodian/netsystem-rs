@@ -1050,6 +1050,7 @@ pub(crate) const FEATURE_SW_INTERFACE_CALLBACKS: [InterfaceCallbackRegistration;
     }];
 
 fn feature_sw_interface_add_del(
+    _: &mut DataPlaneMain,
     _: &InterfaceMain,
     sw_if_index: u32,
     is_create: bool,

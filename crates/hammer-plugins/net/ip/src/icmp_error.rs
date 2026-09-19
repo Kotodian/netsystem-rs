@@ -301,37 +301,21 @@ fn generate_error(
         if address.is_unicast_link_local() || address.segments()[..2] == [0xff02, 0]);
     // ip6_sas_by_sw_if_index uses the original interface for link scope;
     // only ordinary address selection follows an unnumbered association.
-    let interface = match interface.unnumbered_sw_if_index.filter(|_| !link_local) {
+    let source_sw_if_index = match interface.unnumbered_sw_if_index.filter(|_| !link_local) {
         Some(index) => match interfaces.software_interface(index) {
-            Some(interface) => interface,
+            Some(_) => index,
             None => return Ok(IcmpError::NoSource),
         },
-        None => interface,
+        None => rx,
     };
-    let mut source = None;
-    let mut best_prefix = 0;
-    for &address in &interface.addresses {
-        let Some(address) = interfaces.interface_address(address) else {
-            continue;
-        };
-        let address = address.addr();
-        let prefix = match (address, destination) {
-            (IpAddr::V4(address), IpAddr::V4(destination)) => {
-                (u32::from(address) ^ u32::from(destination)).leading_zeros()
-            }
-            (IpAddr::V6(address), IpAddr::V6(destination)) => {
-                if link_local && !address.is_unicast_link_local() {
-                    continue;
-                }
-                (u128::from(address) ^ u128::from(destination)).leading_zeros()
-            }
-            _ => continue,
-        };
-        if source.is_none() || prefix > best_prefix {
-            source = Some(address);
-            best_prefix = prefix;
+    let source = match destination {
+        IpAddr::V4(destination) => {
+            crate::interface::ip4_source_address(source_sw_if_index, destination).map(IpAddr::V4)
         }
-    }
+        IpAddr::V6(destination) => {
+            crate::interface::ip6_source_address(source_sw_if_index, destination).map(IpAddr::V6)
+        }
+    };
     let Some(source) = source else {
         return Ok(IcmpError::NoSource);
     };
@@ -429,15 +413,19 @@ pub(crate) fn error_response_source_and_origin(runtime: &mut DataPlaneMain) -> R
     use hammer_runtime::node::NodeDescriptor;
     let interfaces = NetMain::global()?.interface_main();
     let hardware = interfaces.register_hardware_interface(
+        runtime,
         interfaces.device_class_index("local"),
         0,
         interfaces.hw_class_index("local"),
         0,
     )?;
     let rx = interfaces.hardware_interface(hardware).sw_if_index();
-    for address in ["192.0.2.1/24", "2001:db8::1/64", "fe80::1/64"] {
-        interfaces.add_address(rx, address.parse().unwrap())?;
-    }
+    crate::ip4_add_del_interface_address(runtime, rx, "192.0.2.1".parse().unwrap(), 24, false)
+        .unwrap();
+    crate::ip6_add_del_interface_address(runtime, rx, "2001:db8::1".parse().unwrap(), 64, false)
+        .unwrap();
+    crate::ip6_add_del_interface_address(runtime, rx, "fe80::1".parse().unwrap(), 128, false)
+        .unwrap();
     let output = runtime.nodes().try_register_descriptor(
         NodeKind::Internal,
         NodeDescriptor::new(
@@ -567,6 +555,6 @@ pub(crate) fn error_response_source_and_origin(runtime: &mut DataPlaneMain) -> R
         runtime.buffer_free_one(index);
         assert_eq!(runtime.cached_free_buffers(), cached_free + segments);
     }
-    interfaces.delete_hardware_interface(hardware)?;
+    interfaces.delete_hardware_interface(runtime, hardware)?;
     Ok(())
 }

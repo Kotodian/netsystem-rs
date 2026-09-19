@@ -3,7 +3,6 @@ use hammer_runtime::{
     DataPlaneMain, InternalNode, Node, NodeProcessFn, NodeRuntime, RuntimeError, RuntimeResult,
     add_packet_trace, process_frame,
 };
-use ipnet::IpNet;
 
 pub use crate::interface_model::*;
 use crate::net::NetMain;
@@ -15,8 +14,6 @@ pub const DEFAULT_INTERFACE_MTU: u32 = 9_000;
 #[serde(deny_unknown_fields)]
 pub struct InterfaceConfig {
     pub name: String,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub address: Vec<IpNet>,
     #[serde(default)]
     pub mtu: InterfaceConfigMtu,
 }
@@ -277,12 +274,13 @@ mod tests {
         hammer_runtime::ThreadMain::new().unwrap();
         let mut runtime = DataPlaneMain::new(DataPlaneBufferConfig::default());
         let interfaces = Arc::new(InterfaceMain::new());
-        let net = NetMain::init(interfaces)?;
+        let net = NetMain::init(&mut runtime, interfaces)?;
         let child = crate::data_plane::register_drop(&mut runtime)?;
         let output = register_interface_output_graph(&mut runtime)?;
         let interfaces = net.interface_main();
         let hardware = interfaces
             .register_hardware_interface(
+                &mut runtime,
                 interfaces.device_class_index("local"),
                 1,
                 interfaces.hw_class_index("local"),
@@ -312,7 +310,9 @@ mod tests {
             net.lock_dpo(dpo);
             net.unlock_dpo(dpo);
         }
-        interfaces.delete_hardware_interface(hardware).unwrap();
+        interfaces
+            .delete_hardware_interface(&mut runtime, hardware)
+            .unwrap();
         assert!(matches!(
             net.dpo_main_mut().stack_from_node(
                 &mut runtime,

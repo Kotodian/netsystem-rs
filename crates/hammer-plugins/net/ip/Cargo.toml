@@ -20,6 +20,7 @@ hammer-service = { path = "../../../hammer-service", default-features = false }
 hammer-component-macros = { path = "../../../hammer-component-macros" }
 linkme = { workspace = true }
 ipnet = { workspace = true }
+rand_09 = { package = "rand", version = "0.9", default-features = false }
 prost = { workspace = true }
 serde = { workspace = true }
 thiserror = { workspace = true }

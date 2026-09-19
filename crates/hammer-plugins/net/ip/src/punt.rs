@@ -92,7 +92,7 @@ pub enum Ip4DropNext {
     Drop,
 }
 
-#[hammer_component_macros::feature_arc(name = "ip4-drop", start_nodes = [Ip4DropNode], last_in_arc = hammer_service::data_plane::DropNode)]
+#[hammer_component_macros::feature_arc(name = "ip4-drop", start_nodes = [Ip4DropNode, Ip4NotEnabledNode], last_in_arc = hammer_service::data_plane::DropNode)]
 #[hammer_component_macros::graph_node(graph = ip, kind = internal, name = "ip4-drop", next = Ip4DropNext)]
 pub struct Ip4DropNode;
 
@@ -104,35 +104,57 @@ impl Node for Ip4DropNode {
     ) -> usize {
         let process: NodeProcessFn = |runtime, node_runtime, frame| {
             let processed_vectors = frame.len();
-            (|| {
-                {
-                    let features =
-                        FeatureMain::global().expect("IP node requires initialized FeatureMain");
-                    // SAFETY: startup publishes this scalar before workers execute nodes.
-                    let arc = unsafe {
-                        *IP4_MAIN
-                            .get()
-                            .expect("IP main initialized")
-                            .drop_feature_arc_index
-                            .get()
-                    };
-                    hammer_runtime::process_frame!(runtime, node_runtime, frame, |index| {
-                        let buffer = runtime.buffer_mut(index);
-                        // SAFETY: IP ingress initializes the network overlay.
-                        let sw_if_index =
-                            hammer_core::buffer_opaque!(buffer => NetworkOpaque).sw_if_index[0];
-                        features.start_feature_arc(
-                            arc,
-                            sw_if_index,
-                            buffer,
-                            NodeNext::slot(Ip4DropNext::Drop),
-                        )
-                    });
-                }
-            })();
+            let arc = unsafe {
+                *IP4_MAIN
+                    .get()
+                    .expect("IP main initialized")
+                    .drop_feature_arc_index
+                    .get()
+            };
+            process_ip_drop_frame(
+                runtime,
+                node_runtime,
+                frame,
+                arc,
+                NodeNext::slot(Ip4DropNext::Drop),
+            );
             processed_vectors
         };
         process(runtime, node_runtime, frame)
+    }
+}
+
+#[hammer_component_macros::feature(arc = Ip4InputNode, runs_before = [Ip4LookupNode])]
+#[hammer_component_macros::graph_node(
+    graph = ip,
+    kind = internal,
+    name = "ip4-not-enabled",
+    sibling_of = Ip4DropNode,
+)]
+pub struct Ip4NotEnabledNode;
+
+impl Node for Ip4NotEnabledNode {
+    fn process(
+        runtime: &mut DataPlaneMain,
+        node_runtime: &mut hammer_runtime::NodeRuntime,
+        frame: &mut Frame,
+    ) -> usize {
+        let processed_vectors = frame.len();
+        let arc = unsafe {
+            *IP4_MAIN
+                .get()
+                .expect("IP main initialized")
+                .drop_feature_arc_index
+                .get()
+        };
+        process_ip_drop_frame(
+            runtime,
+            node_runtime,
+            frame,
+            arc,
+            NodeNext::slot(Ip4DropNext::Drop),
+        );
+        processed_vectors
     }
 }
 
@@ -217,7 +239,7 @@ pub enum Ip6DropNext {
     Drop,
 }
 
-#[hammer_component_macros::feature_arc(name = "ip6-drop", start_nodes = [Ip6DropNode], last_in_arc = hammer_service::data_plane::DropNode)]
+#[hammer_component_macros::feature_arc(name = "ip6-drop", start_nodes = [Ip6DropNode, Ip6NotEnabledNode], last_in_arc = hammer_service::data_plane::DropNode)]
 #[hammer_component_macros::graph_node(graph = ip, kind = internal, name = "ip6-drop", next = Ip6DropNext)]
 pub struct Ip6DropNode;
 
@@ -229,36 +251,71 @@ impl Node for Ip6DropNode {
     ) -> usize {
         let process: NodeProcessFn = |runtime, node_runtime, frame| {
             let processed_vectors = frame.len();
-            (|| {
-                {
-                    let features =
-                        FeatureMain::global().expect("IP node requires initialized FeatureMain");
-                    // SAFETY: startup publishes this scalar before workers execute nodes.
-                    let arc = unsafe {
-                        *IP6_MAIN
-                            .get()
-                            .expect("IP main initialized")
-                            .drop_feature_arc_index
-                            .get()
-                    };
-                    hammer_runtime::process_frame!(runtime, node_runtime, frame, |index| {
-                        let buffer = runtime.buffer_mut(index);
-                        // SAFETY: IP ingress initializes the network overlay.
-                        let sw_if_index =
-                            hammer_core::buffer_opaque!(buffer => NetworkOpaque).sw_if_index[0];
-                        features.start_feature_arc(
-                            arc,
-                            sw_if_index,
-                            buffer,
-                            NodeNext::slot(Ip6DropNext::Drop),
-                        )
-                    });
-                }
-            })();
+            let arc = unsafe {
+                *IP6_MAIN
+                    .get()
+                    .expect("IP main initialized")
+                    .drop_feature_arc_index
+                    .get()
+            };
+            process_ip_drop_frame(
+                runtime,
+                node_runtime,
+                frame,
+                arc,
+                NodeNext::slot(Ip6DropNext::Drop),
+            );
             processed_vectors
         };
         process(runtime, node_runtime, frame)
     }
+}
+
+#[hammer_component_macros::feature(arc = Ip6InputNode, runs_before = [Ip6LookupNode])]
+#[hammer_component_macros::graph_node(
+    graph = ip,
+    kind = internal,
+    name = "ip6-not-enabled",
+    sibling_of = Ip6DropNode,
+)]
+pub struct Ip6NotEnabledNode;
+
+impl Node for Ip6NotEnabledNode {
+    fn process(
+        runtime: &mut DataPlaneMain,
+        node_runtime: &mut hammer_runtime::NodeRuntime,
+        frame: &mut Frame,
+    ) -> usize {
+        let processed_vectors = frame.len();
+        let arc = unsafe {
+            *IP6_MAIN
+                .get()
+                .expect("IP main initialized")
+                .drop_feature_arc_index
+                .get()
+        };
+        process_ip_drop_frame(
+            runtime,
+            node_runtime,
+            frame,
+            arc,
+            NodeNext::slot(Ip6DropNext::Drop),
+        );
+        processed_vectors
+    }
+}
+
+fn process_ip_drop_frame(
+    runtime: &mut DataPlaneMain,
+    node_runtime: &mut hammer_runtime::NodeRuntime,
+    frame: &mut Frame,
+    arc_index: u8,
+    default_next: u16,
+) {
+    let features = FeatureMain::global().expect("IP node requires initialized FeatureMain");
+    hammer_runtime::process_frame!(runtime, node_runtime, frame, |index| {
+        features.start_feature_arc(arc_index, 0, runtime.buffer_mut(index), default_next)
+    });
 }
 
 /// Registers the IP feature arcs once their nodes exist in the graph.
@@ -299,7 +356,7 @@ fn register_ip_features(
     let arc = Ip4InputNode::register_feature_arc(features, nodes)?;
     // SAFETY: feature declarations are published before workers start.
     unsafe {
-        *main.unicast_feature_arc_index.get() = arc;
+        (*main.lookup_main.get()).unicast_feature_arc_index = arc;
     }
     let arc = Ip4LocalNode::register_feature_arc(features, nodes)?;
     // SAFETY: feature declarations are published before workers start.
@@ -317,6 +374,7 @@ fn register_ip_features(
         *main.drop_feature_arc_index.get() = arc;
     }
     Ip4LookupNode::register_feature(features, nodes)?;
+    Ip4NotEnabledNode::register_feature(features, nodes)?;
     Ip4LocalEndOfArcNode::register_feature(features, nodes)?;
     let node = nodes
         .node_by_name(hammer_service::data_plane::PuntNode::NODE_NAME)
@@ -346,7 +404,7 @@ fn register_ip_features(
     let arc = Ip6InputNode::register_feature_arc(features, nodes)?;
     // SAFETY: feature declarations are published before workers start.
     unsafe {
-        *main.unicast_feature_arc_index.get() = arc;
+        (*main.lookup_main.get()).unicast_feature_arc_index = arc;
     }
     let arc = Ip6LocalNode::register_feature_arc(features, nodes)?;
     // SAFETY: feature declarations are published before workers start.
@@ -364,6 +422,7 @@ fn register_ip_features(
         *main.drop_feature_arc_index.get() = arc;
     }
     Ip6LookupNode::register_feature(features, nodes)?;
+    Ip6NotEnabledNode::register_feature(features, nodes)?;
     Ip6LocalEndOfArcNode::register_feature(features, nodes)?;
     let node = nodes
         .node_by_name(hammer_service::data_plane::PuntNode::NODE_NAME)

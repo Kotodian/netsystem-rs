@@ -268,7 +268,7 @@ pub(crate) fn register_ip4_protocol(
     let next = nodes.add_node_next_slot(local, node)?;
     // SAFETY: startup or the caller's worker barrier excludes packet readers.
     unsafe {
-        (*main.local_next_by_ip_protocol.get())[usize::from(protocol)] = next;
+        (*main.lookup_main.get()).local_next_by_ip_protocol[usize::from(protocol)] = next;
     }
     Ok(())
 }
@@ -280,7 +280,7 @@ pub fn unregister_ip4_protocol(protocol: u8) -> RuntimeResult<()> {
         .ok_or(RuntimeError::PluginStateNotInitialized { plugin: "ip" })?;
     // SAFETY: restore the owner table before the consumer retires under the barrier.
     unsafe {
-        (*main.local_next_by_ip_protocol.get())[usize::from(protocol)] =
+        (*main.lookup_main.get()).local_next_by_ip_protocol[usize::from(protocol)] =
             NodeNext::slot(Ip4LocalNext::Punt);
     }
     Ok(())
@@ -432,7 +432,7 @@ pub(crate) fn register_ip6_protocol(
     let next = nodes.add_node_next_slot(local, node)?;
     // SAFETY: startup or the caller's worker barrier excludes packet readers.
     unsafe {
-        (*main.local_next_by_ip_protocol.get())[usize::from(protocol)] = next;
+        (*main.lookup_main.get()).local_next_by_ip_protocol[usize::from(protocol)] = next;
     }
     Ok(())
 }
@@ -444,7 +444,7 @@ pub fn unregister_ip6_protocol(protocol: u8) -> RuntimeResult<()> {
         .ok_or(RuntimeError::PluginStateNotInitialized { plugin: "ip" })?;
     // SAFETY: restore the owner table before the consumer retires under the barrier.
     unsafe {
-        (*main.local_next_by_ip_protocol.get())[usize::from(protocol)] =
+        (*main.lookup_main.get()).local_next_by_ip_protocol[usize::from(protocol)] =
             NodeNext::slot(Ip6LocalNext::Punt);
     }
     Ok(())
@@ -539,15 +539,17 @@ fn process_index(
                 (*crate::lookup::IP4_MAIN
                     .get()
                     .ok_or(RuntimeError::PluginStateNotInitialized { plugin: "ip" })?
-                    .local_next_by_ip_protocol
-                    .get())[usize::from(protocol)]
+                    .lookup_main
+                    .get())
+                .local_next_by_ip_protocol[usize::from(protocol)]
             }
             IpVersion::V6 => {
                 (*crate::lookup::IP6_MAIN
                     .get()
                     .ok_or(RuntimeError::PluginStateNotInitialized { plugin: "ip" })?
-                    .local_next_by_ip_protocol
-                    .get())[usize::from(protocol)]
+                    .lookup_main
+                    .get())
+                .local_next_by_ip_protocol[usize::from(protocol)]
             }
         }
     };
@@ -951,7 +953,10 @@ pub(crate) mod tests {
                 .set(crate::lookup::Ip6Main::new())
                 .is_ok()
         );
+        (crate::interface::__INIT_FN_IP6_LINK_INIT.func)(runtime)?;
+        interfaces.consume_registration_image(&crate::HAMMER_INTERFACE_REGISTRATION_IMAGE)?;
         let hardware = interfaces.register_hardware_interface(
+            runtime,
             interfaces.device_class_index("local"),
             0,
             interfaces.hw_class_index("local"),
@@ -1126,7 +1131,7 @@ pub(crate) mod tests {
             assert_eq!(interfaces.receive_dpo_interface(dpo), None);
             features.disable_feature(runtime, arc, feature, effective_rx, &[])?;
         }
-        interfaces.delete_hardware_interface(hardware)?;
+        interfaces.delete_hardware_interface(runtime, hardware)?;
 
         Ok(())
     }

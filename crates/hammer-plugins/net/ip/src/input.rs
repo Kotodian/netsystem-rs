@@ -199,7 +199,10 @@ fn next_slot_for_index(
             IpVersion::V6 => 6,
         }));
         ip.set_ip_protocol(Some(u8::from(parsed.protocol)));
-        ip.set_fib_index(crate::lookup::fib_index_for(parsed.version, sw_if_index));
+        ip.set_fib_index(crate::lookup::fib_table_get_index_for_sw_if_index(
+            parsed.version,
+            sw_if_index,
+        ));
     }
     let trace = traced.then_some(IpInputTrace {
         version: Some(parsed.version),
@@ -226,20 +229,26 @@ fn next_slot_for_index(
             };
             let arc_index = unsafe {
                 match version {
-                    IpVersion::V4 => *crate::lookup::IP4_MAIN
-                        .get()
-                        .ok_or(hammer_runtime::RuntimeError::PluginStateNotInitialized {
-                            plugin: "ip",
-                        })?
+                    IpVersion::V4 => {
+                        (*crate::lookup::IP4_MAIN
+                            .get()
+                            .ok_or(hammer_runtime::RuntimeError::PluginStateNotInitialized {
+                                plugin: "ip",
+                            })?
+                            .lookup_main
+                            .get())
                         .unicast_feature_arc_index
-                        .get(),
-                    IpVersion::V6 => *crate::lookup::IP6_MAIN
-                        .get()
-                        .ok_or(hammer_runtime::RuntimeError::PluginStateNotInitialized {
-                            plugin: "ip",
-                        })?
+                    }
+                    IpVersion::V6 => {
+                        (*crate::lookup::IP6_MAIN
+                            .get()
+                            .ok_or(hammer_runtime::RuntimeError::PluginStateNotInitialized {
+                                plugin: "ip",
+                            })?
+                            .lookup_main
+                            .get())
                         .unicast_feature_arc_index
-                        .get(),
+                    }
                 }
             };
             let features = FeatureMain::global()?;

@@ -7,8 +7,7 @@ use std::sync::{Arc, OnceLock};
 use hammer_core::data_plane::NodeId;
 use hammer_infra::bitmap::Bitmap;
 use hammer_infra::pool::Pool;
-use hammer_runtime::{DataWorkerId, RuntimeResult};
-use ipnet::IpNet;
+use hammer_runtime::{DataPlaneMain, DataWorkerId, RuntimeResult};
 
 use crate::interface::{InterfaceError, InterfaceMtu, InterfaceMtuKind, InterfaceResult};
 use crate::net::{DpoError, DpoId, DpoProto, DpoType, InterfaceRxDpo, NetMain, ReceiveDpo};
@@ -20,7 +19,8 @@ pub enum DriverScheduleMode {
     Adaptive,
 }
 
-pub type InterfaceCallback = fn(&InterfaceMain, u32, bool) -> InterfaceResult<()>;
+pub type InterfaceCallback =
+    fn(&mut DataPlaneMain, &InterfaceMain, u32, bool) -> InterfaceResult<()>;
 pub type FormatDeviceNameFn = for<'a, 'b> fn(u32, &'a mut fmt::Formatter<'b>) -> fmt::Result;
 
 bitflags::bitflags! {
@@ -263,7 +263,6 @@ pub struct SwInterface {
     pub unnumbered_sw_if_index: Option<u32>,
     pub hw_if_index: Option<u32>,
     pub mtu: InterfaceMtu,
-    pub addresses: Vec<u32>,
 }
 
 impl SwInterface {
@@ -338,7 +337,6 @@ struct InterfaceState {
     names: HashMap<String, u32>,
     device_class_by_name: HashMap<&'static str, u32>,
     hw_class_by_name: HashMap<&'static str, u32>,
-    addresses: Pool<(u32, IpNet)>,
     receive_dpos: Pool<ReceiveDpo<IpAddr>>,
     device_classes: Vec<DeviceClass>,
     hw_classes: Vec<HwClass>,
@@ -615,12 +613,13 @@ impl InterfaceMain {
 
     pub fn register_hardware_interface(
         &self,
+        main: &mut DataPlaneMain,
         device_class_index: u32,
         device_instance: u32,
         hw_class_index: u32,
         hw_instance: u32,
     ) -> InterfaceResult<u32> {
-        hammer_runtime::ensure_main_thread()?;
+        hammer_runtime::ensure_main_thread_with_barrier()?;
         let state = self.state_mut();
         let device_class = *state
             .device_classes
@@ -680,7 +679,6 @@ impl InterfaceMain {
             unnumbered_sw_if_index: None,
             hw_if_index: Some(hw_if_index),
             mtu: InterfaceMtu::default(),
-            addresses: Vec::new(),
         });
         state
             .hardware_interfaces
@@ -703,18 +701,18 @@ impl InterfaceMain {
             .expect("inserted software interface")
             .sup_sw_if_index = sw_if_index;
         state.names.insert(name, hw_if_index);
-        if let Err(primary) = self.call_sw_interface_add_del(sw_if_index, true) {
-            if let Err(cleanup) = self.call_sw_interface_add_del(sw_if_index, false) {
+        if let Err(primary) = self.call_sw_interface_add_del(main, sw_if_index, true) {
+            if let Err(cleanup) = self.call_sw_interface_add_del(main, sw_if_index, false) {
                 tracing::warn!(%cleanup, sw_if_index, "software interface creation rollback callback failed");
             }
             self.remove_interface_slots(hw_if_index);
             return Err(primary);
         }
-        if let Err(primary) = self.call_hw_interface_add_del(hw_if_index, true) {
-            if let Err(cleanup) = self.call_hw_interface_add_del(hw_if_index, false) {
+        if let Err(primary) = self.call_hw_interface_add_del(main, hw_if_index, true) {
+            if let Err(cleanup) = self.call_hw_interface_add_del(main, hw_if_index, false) {
                 tracing::warn!(%cleanup, hw_if_index, "hardware interface creation rollback callback failed");
             }
-            if let Err(cleanup) = self.call_sw_interface_add_del(sw_if_index, false) {
+            if let Err(cleanup) = self.call_sw_interface_add_del(main, sw_if_index, false) {
                 tracing::warn!(%cleanup, sw_if_index, "software interface creation rollback callback failed");
             }
             self.remove_interface_slots(hw_if_index);
@@ -816,10 +814,11 @@ impl InterfaceMain {
 
     pub fn set_hardware_flags(
         &self,
+        main: &mut DataPlaneMain,
         hw_if_index: u32,
         flags: HwInterfaceFlags,
     ) -> InterfaceResult<()> {
-        hammer_runtime::ensure_main_thread()?;
+        hammer_runtime::ensure_main_thread_with_barrier()?;
         let state = self.state();
         let hardware =
             state
@@ -838,7 +837,12 @@ impl InterfaceMain {
             .expect("hardware interface names an installed class")
             .link_up_down_function;
         if let Some(callback) = callback {
-            callback(self, hw_if_index, flags.contains(HwInterfaceFlags::LINK_UP))?;
+            callback(
+                main,
+                self,
+                hw_if_index,
+                flags.contains(HwInterfaceFlags::LINK_UP),
+            )?;
         }
         self.state_mut()
             .hardware_interfaces
@@ -850,10 +854,11 @@ impl InterfaceMain {
 
     pub fn set_software_flags(
         &self,
+        main: &mut DataPlaneMain,
         sw_if_index: u32,
         flags: SwInterfaceFlags,
     ) -> InterfaceResult<()> {
-        hammer_runtime::ensure_main_thread()?;
+        hammer_runtime::ensure_main_thread_with_barrier()?;
         let state = self.state();
         let software =
             state
@@ -890,7 +895,7 @@ impl InterfaceMain {
             .expect("validated software interface remains occupied")
             .flags = flags;
         if let Some(callback) = device_callback {
-            if let Err(error) = callback(self, hw_if_index, is_up) {
+            if let Err(error) = callback(main, self, hw_if_index, is_up) {
                 self.state_mut()
                     .software_interfaces
                     .get_mut(sw_if_index)
@@ -900,7 +905,7 @@ impl InterfaceMain {
             }
         }
         if let Some(callback) = hw_callback {
-            if let Err(error) = callback(self, hw_if_index, is_up) {
+            if let Err(error) = callback(main, self, hw_if_index, is_up) {
                 self.state_mut()
                     .software_interfaces
                     .get_mut(sw_if_index)
@@ -912,7 +917,11 @@ impl InterfaceMain {
         Ok(())
     }
 
-    pub fn delete_hardware_interface(&self, hw_if_index: u32) -> InterfaceResult<()> {
+    pub fn delete_hardware_interface(
+        &self,
+        main: &mut DataPlaneMain,
+        hw_if_index: u32,
+    ) -> InterfaceResult<()> {
         hammer_runtime::ensure_main_thread_with_barrier()?;
         let hw = self
             .state()
@@ -923,9 +932,9 @@ impl InterfaceMain {
             })?
             .clone();
         let mut primary_error = self
-            .set_hardware_flags(hw_if_index, HwInterfaceFlags::empty())
+            .set_hardware_flags(main, hw_if_index, HwInterfaceFlags::empty())
             .err();
-        if let Err(error) = self.call_hw_interface_add_del(hw_if_index, false) {
+        if let Err(error) = self.call_hw_interface_add_del(main, hw_if_index, false) {
             if primary_error.is_none() {
                 primary_error = Some(error);
             } else {
@@ -933,14 +942,15 @@ impl InterfaceMain {
             }
         }
         self.remove_interface_queues(hw_if_index);
-        if let Err(error) = self.set_software_flags(hw.sw_if_index, SwInterfaceFlags::empty()) {
+        if let Err(error) = self.set_software_flags(main, hw.sw_if_index, SwInterfaceFlags::empty())
+        {
             if primary_error.is_none() {
                 primary_error = Some(error);
             } else {
                 tracing::warn!(%error, sw_if_index = hw.sw_if_index, "software interface down callback failed during deletion");
             }
         }
-        if let Err(error) = self.call_sw_interface_add_del(hw.sw_if_index, false) {
+        if let Err(error) = self.call_sw_interface_add_del(main, hw.sw_if_index, false) {
             if primary_error.is_none() {
                 primary_error = Some(error);
             } else {
@@ -987,11 +997,7 @@ impl InterfaceMain {
         for index in hw.tx_queue_indices {
             state.tx_queues.remove(index);
         }
-        if let Some(software) = state.software_interfaces.remove(hw.sw_if_index) {
-            for address in software.addresses {
-                state.addresses.remove(address);
-            }
-        }
+        state.software_interfaces.remove(hw.sw_if_index);
         state.names.retain(|_, index| *index != hw_if_index);
         state
             .hardware_interfaces
@@ -1007,6 +1013,16 @@ impl InterfaceMain {
     }
     pub fn software_interface(&self, index: u32) -> Option<&SwInterface> {
         self.state().software_interfaces.get(index)
+    }
+
+    pub fn software_interface_indices(&self) -> Vec<u32> {
+        hammer_runtime::ensure_main_thread_with_barrier()
+            .expect("software interface enumeration requires the publication scope");
+        self.state()
+            .software_interfaces
+            .iter()
+            .map(|(index, _)| index)
+            .collect()
     }
 
     pub fn interface_index(&self, name: &str) -> Option<u32> {
@@ -1039,38 +1055,12 @@ impl InterfaceMain {
             .get(index)
             .map(|hw| hw.name.clone())
     }
-    pub fn interface_addresses(&self, index: u32) -> Vec<IpNet> {
-        let state = self.state();
-        let Some(interface) = state.software_interfaces.get(index) else {
-            return Vec::new();
-        };
-        interface
-            .addresses
-            .iter()
-            .filter_map(|index| state.addresses.get(*index))
-            .map(|(_, address)| *address)
-            .collect()
-    }
-    /// Returns a copy of an occupied address slot. Removal invalidates its
-    /// index; later insertion may reuse it, without moving other live slots.
-    pub fn interface_address(&self, index: u32) -> Option<IpNet> {
-        self.state()
-            .addresses
-            .get(index)
-            .map(|(_, address)| *address)
-    }
     pub fn interface_mtu(&self, index: u32) -> Option<InterfaceMtu> {
         self.state()
             .hardware_interfaces
             .get(index)
             .and_then(|hw| self.software_interface(hw.sw_if_index))
             .map(|sw| sw.mtu)
-    }
-    pub fn interface_address_index(&self, index: u32, address: IpNet) -> Option<u32> {
-        self.state()
-            .addresses
-            .iter()
-            .find_map(|(slot, (item, value))| (*item == index && *value == address).then_some(slot))
     }
 
     pub fn register_rx_queue(
@@ -1212,46 +1202,13 @@ impl InterfaceMain {
         sw.mtu.set(kind, value);
         Ok(())
     }
-    pub fn add_address(&self, sw_if_index: u32, address: IpNet) -> InterfaceResult<u32> {
-        let state = self.state_mut();
-        let software = state.software_interfaces.get_mut(sw_if_index).ok_or(
-            InterfaceError::NotRegistered {
-                interface_index: sw_if_index,
-            },
-        )?;
-        if let Some(index) = state.addresses.iter().find_map(|(index, (item, value))| {
-            (*item == sw_if_index && *value == address).then_some(index)
-        }) {
-            return Ok(index);
-        }
-        let index = state.addresses.insert((sw_if_index, address));
-        software.addresses.push(index);
-        Ok(index)
-    }
-    pub fn remove_address(&self, sw_if_index: u32, address: IpNet) -> InterfaceResult<bool> {
-        let state = self.state_mut();
-        let software = state.software_interfaces.get_mut(sw_if_index).ok_or(
-            InterfaceError::NotRegistered {
-                interface_index: sw_if_index,
-            },
-        )?;
-        let Some(index) = state.addresses.iter().find_map(|(index, (item, value))| {
-            (*item == sw_if_index && *value == address).then_some(index)
-        }) else {
-            return Ok(false);
-        };
-        state.addresses.remove(index);
-        if let Some(position) = software.addresses.iter().position(|slot| *slot == index) {
-            software.addresses.remove(position);
-        }
-        Ok(true)
-    }
-
     pub fn call_hw_interface_add_del(
         &self,
+        main: &mut DataPlaneMain,
         hw_if_index: u32,
         is_create: bool,
     ) -> InterfaceResult<()> {
+        hammer_runtime::ensure_main_thread_with_barrier()?;
         let (hw_class, device_class, callbacks) = {
             let state = self.state();
             let hw = state.hardware_interfaces.get(hw_if_index).ok_or(
@@ -1272,26 +1229,34 @@ impl InterfaceMain {
             )
         };
         if let Some(callback) = hw_class {
-            callback(self, hw_if_index, is_create)?;
+            callback(main, self, hw_if_index, is_create)?;
         }
         if let Some(callback) = device_class {
-            callback(self, hw_if_index, is_create)?;
+            callback(main, self, hw_if_index, is_create)?;
         }
         for registration in callbacks {
-            (registration.callback)(self, hw_if_index, is_create)?;
+            (registration.callback)(main, self, hw_if_index, is_create)?;
         }
         Ok(())
     }
 
     pub fn call_sw_interface_add_del(
         &self,
+        main: &mut DataPlaneMain,
         sw_if_index: u32,
         is_create: bool,
     ) -> InterfaceResult<()> {
-        self.call_callbacks(sw_if_index, is_create, self.state().sw_callbacks.clone())
+        hammer_runtime::ensure_main_thread_with_barrier()?;
+        self.call_callbacks(
+            main,
+            sw_if_index,
+            is_create,
+            self.state().sw_callbacks.clone(),
+        )
     }
     fn call_callbacks(
         &self,
+        main: &mut DataPlaneMain,
         sw_if_index: u32,
         state: bool,
         callbacks: Vec<InterfaceCallbackRegistration>,
@@ -1302,7 +1267,7 @@ impl InterfaceMain {
             });
         }
         for registration in callbacks {
-            (registration.callback)(self, sw_if_index, state)?;
+            (registration.callback)(main, self, sw_if_index, state)?;
         }
         Ok(())
     }

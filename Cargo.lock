@@ -1131,6 +1131,7 @@ dependencies = [
  "ipnet",
  "linkme",
  "prost",
+ "rand 0.9.5",
  "serde",
  "thiserror 2.0.18",
  "tokio",
@@ -1201,6 +1202,8 @@ version = "0.1.0"
 dependencies = [
  "abi_stable",
  "hammer-component-macros",
+ "hammer-infra",
+ "hammer-plugin-ip",
  "hammer-runtime",
  "hammer-service",
  "libc",

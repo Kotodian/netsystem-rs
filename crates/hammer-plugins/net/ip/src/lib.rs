@@ -4,6 +4,15 @@ use hammer_core::data_plane::NodeId;
 use hammer_runtime::RuntimeResult;
 use hammer_service::net::{DpoId, DpoProto};
 
+hammer_service::declare_interface_registration_image!(
+    hw_callbacks = [],
+    sw_callbacks = [
+        interface::IP_SW_INTERFACE_CALLBACKS[0],
+        interface::IP_SW_INTERFACE_CALLBACKS[1],
+        interface::IP_SW_INTERFACE_CALLBACKS[2],
+    ]
+);
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum IpNullAction {
     Drop,
@@ -32,9 +41,13 @@ hammer_component_macros::declare_plugin!(
     init_functions = [
         ip::reassembly::__INIT_FN_IP_REASSEMBLY_INIT,
         lookup::__INIT_FN_IP_LOOKUP_INIT,
+        interface::__INIT_FN_IP6_LINK_INIT,
     ],
     config_functions = [ip::reassembly::__CONFIG_FN_IP_REASSEMBLY_CONFIG,],
-    main_loop_enter_functions = [punt::__INIT_FN_IP_FEATURE_INIT],
+    main_loop_enter_functions = [
+        punt::__INIT_FN_IP_FEATURE_INIT,
+        interface::__INIT_FN_IP_INTERFACE_FEATURE_INIT,
+    ],
     main_loop_exit_functions = [],
     worker_init_functions = [],
     graph_nodes = [
@@ -48,8 +61,10 @@ hammer_component_macros::declare_plugin!(
         ip::local::__IP_GRAPH_NODE_IP6_LOCAL_END_OF_ARC_NODE,
         punt::__IP_GRAPH_NODE_IP4_PUNT_NODE,
         punt::__IP_GRAPH_NODE_IP4_DROP_NODE,
+        punt::__IP_GRAPH_NODE_IP4_NOT_ENABLED_NODE,
         punt::__IP_GRAPH_NODE_IP6_PUNT_NODE,
         punt::__IP_GRAPH_NODE_IP6_DROP_NODE,
+        punt::__IP_GRAPH_NODE_IP6_NOT_ENABLED_NODE,
         ip::local::__IP_GRAPH_NODE_IP4_LOCAL_NODE,
         ip::local::__IP_GRAPH_NODE_IP6_LOCAL_NODE,
         ip::local::__IP_GRAPH_NODE_IP4_RECEIVE_NODE,
@@ -68,6 +83,7 @@ hammer_component_macros::declare_plugin!(
 mod config;
 mod fib;
 mod icmp_error;
+mod interface;
 pub mod ip;
 mod lookup;
 mod punt;
@@ -96,6 +112,12 @@ pub fn path_mtu() -> Option<&'static pmtu::IpPathMtu> {
     pmtu::path_mtu()
 }
 
+pub use interface::{
+    IpInterfaceAddressCallback, IpInterfaceAddressError, ip4_add_del_interface_address,
+    ip4_sw_interface_enable_disable, ip6_add_del_interface_address,
+    ip6_sw_interface_enable_disable, register_ip4_add_del_interface_address_callback,
+    register_ip6_add_del_interface_address_callback,
+};
 pub use ip::{
     Ip4InputNext, Ip4InputNode, Ip4LocalNext, Ip4LocalNode, Ip4ReassemblyNext, Ip4ReassemblyNode,
     Ip4ReceiveNode, Ip6InputNext, Ip6InputNode, Ip6LocalNext, Ip6LocalNode, Ip6ReassemblyNext,
@@ -104,6 +126,7 @@ pub use ip::{
     pack_fragment_owner_value, unpack_fragment_owner_value,
 };
 pub use ip::{IpPathFlags, IpRoutePathBehavior};
+pub use lookup::fib_table_get_index_for_sw_if_index;
 pub use protocol::ip::{write_ipv4_push_header, write_ipv6_push_header};
 
 #[cfg(test)]

@@ -398,7 +398,7 @@ mod tests {
         });
         hammer_runtime::ThreadMain::new().unwrap();
         let mut runtime = DataPlaneMain::new(DataPlaneBufferConfig::default());
-        let net = NetMain::init(Arc::new(InterfaceMain::new()))?;
+        let net = NetMain::init(&mut runtime, Arc::new(InterfaceMain::new()))?;
         let terminal = hammer_service::data_plane::register_drop(&mut runtime)?;
         let punt_terminal = runtime
             .nodes()
@@ -551,7 +551,7 @@ mod tests {
         let device_class_index = interfaces.device_class_index("local");
         let hw_class_index = interfaces.hw_class_index("local");
         let hardware = interfaces
-            .register_hardware_interface(device_class_index, 1, hw_class_index, 0)
+            .register_hardware_interface(&mut runtime, device_class_index, 1, hw_class_index, 0)
             .unwrap();
         let software = interfaces.hardware_interface(hardware).sw_if_index;
         let rx4 = interfaces
@@ -590,7 +590,9 @@ mod tests {
         net.unlock_dpo(rx4);
         assert_eq!(hammer_service::net::InterfaceRxDpo::memory().1, 0);
         drop(table);
-        interfaces.delete_hardware_interface(hardware).unwrap();
+        interfaces
+            .delete_hardware_interface(&mut runtime, hardware)
+            .unwrap();
 
         // VPP plugins/unittest/fib_test.c:774-834 checks multipath buckets
         // through a route and pool reclamation after withdrawal. Distinct RX
@@ -601,7 +603,13 @@ mod tests {
         let mut rx_paths = Vec::new();
         for instance in 0..8 {
             let hardware = interfaces
-                .register_hardware_interface(device_class_index, instance, hw_class_index, 0)
+                .register_hardware_interface(
+                    &mut runtime,
+                    device_class_index,
+                    instance,
+                    hw_class_index,
+                    0,
+                )
                 .unwrap();
             let software = interfaces.hardware_interface(hardware).sw_if_index;
             hardware_interfaces.push(hardware);
@@ -806,7 +814,9 @@ mod tests {
         assert_eq!(hammer_service::net::InterfaceRxDpo::memory().1, rx_count);
         drop(table);
         for hardware in hardware_interfaces {
-            interfaces.delete_hardware_interface(hardware).unwrap();
+            interfaces
+                .delete_hardware_interface(&mut runtime, hardware)
+                .unwrap();
         }
         crate::local::tests::receive_interface_and_checksum(&mut runtime).unwrap();
         crate::icmp_error::error_response_source_and_origin(&mut runtime)?;

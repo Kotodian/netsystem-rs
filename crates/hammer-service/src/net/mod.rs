@@ -121,11 +121,14 @@ impl NetMain {
             })
     }
 
-    pub fn init(interface_main: Arc<InterfaceMain>) -> RuntimeResult<Arc<NetMain>> {
+    pub fn init(
+        main: &mut DataPlaneMain,
+        interface_main: Arc<InterfaceMain>,
+    ) -> RuntimeResult<Arc<NetMain>> {
         let local_device_class = interface_main.device_class_index("local");
         let local_hw_class = interface_main.hw_class_index("local");
         let local_hw = interface_main
-            .register_hardware_interface(local_device_class, 0, local_hw_class, 0)
+            .register_hardware_interface(main, local_device_class, 0, local_hw_class, 0)
             .map_err(RuntimeError::from)?;
         interface_main
             .set_interface_name(local_hw, "local0")
@@ -799,12 +802,12 @@ impl NetMain {
 pub static NET_MAIN: OnceLock<Arc<NetMain>> = OnceLock::new();
 
 #[hammer_component_macros::init_function(name = "net_main_init", runs_after = ["interface_main_init"])]
-fn init_net_main() -> RuntimeResult<()> {
+fn init_net_main(main: &mut DataPlaneMain) -> RuntimeResult<()> {
     let interface_main = crate::interface_model::INTERFACE_MAIN
         .get()
         .map(Arc::clone)
         .ok_or(RuntimeError::RuntimeCapabilityMissing {
             type_name: "hammer_service::interface::InterfaceMain",
         })?;
-    NetMain::init(interface_main).map(|_| ())
+    NetMain::init(main, interface_main).map(|_| ())
 }

@@ -1,4 +1,6 @@
 use std::cell::{RefCell, UnsafeCell};
+use std::collections::HashMap;
+use std::hash::Hash;
 use std::net::{Ipv4Addr, Ipv6Addr};
 use std::sync::OnceLock;
 use std::time::Instant;
@@ -6,48 +8,169 @@ use std::time::Instant;
 use hammer_service::net::throttle::Throttle;
 
 use hammer_core::data_plane::{Frame, NodeId, NodeNext};
+use hammer_infra::pool::Pool;
 use hammer_runtime::{DataPlaneMain, Node, NodeProcessFn, NodeRuntime, RuntimeResult};
 use hammer_service::net::{DpoId, DpoProto, DpoType, NetMain};
 use hammer_service::opaque::NetworkOpaque;
 
 use crate::fib::{Ip4FibTable, Ip6FibTable};
+use crate::interface::IpInterfaceAddressCallback;
 use crate::ip::ip_header;
 use crate::protocol::ip::{IpProtocol, IpVersion, ParsedIpPacket};
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub(crate) struct IpInterfaceAddressKey<A> {
+    pub(crate) address: A,
+    pub(crate) fib_index: u32,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct IpInterfaceAddress<A> {
+    pub(crate) address: A,
+    pub(crate) address_length: u8,
+    pub(crate) sw_if_index: u32,
+    pub(crate) next_this_sw_interface: Option<u32>,
+    pub(crate) prev_this_sw_interface: Option<u32>,
+}
+
+pub(crate) struct IpLookupMain<A> {
+    pub(crate) interface_addresses: Pool<IpInterfaceAddress<A>>,
+    pub(crate) interface_address_index_by_key: HashMap<IpInterfaceAddressKey<A>, u32>,
+    pub(crate) interface_address_head_by_sw_if_index: Vec<Option<u32>>,
+    pub(crate) unicast_feature_arc_index: u8,
+    pub(crate) local_next_by_ip_protocol: [u16; 256],
+}
+
+impl<A> IpLookupMain<A>
+where
+    A: Copy + Eq + Hash,
+{
+    fn new(punt_next: u16) -> Self {
+        Self {
+            interface_addresses: Pool::new(),
+            interface_address_index_by_key: HashMap::new(),
+            interface_address_head_by_sw_if_index: Vec::new(),
+            unicast_feature_arc_index: u8::MAX,
+            local_next_by_ip_protocol: [punt_next; 256],
+        }
+    }
+
+    pub(crate) fn add_interface_address(
+        &mut self,
+        key: IpInterfaceAddressKey<A>,
+        sw_if_index: u32,
+        address_length: u8,
+    ) -> u32 {
+        let position = sw_if_index as usize;
+        if self.interface_address_head_by_sw_if_index.len() <= position {
+            self.interface_address_head_by_sw_if_index
+                .resize(position + 1, None);
+        }
+        let mut previous = None;
+        let mut current = self.interface_address_head_by_sw_if_index[position];
+        while let Some(index) = current {
+            previous = current;
+            current = self
+                .interface_addresses
+                .get(index)
+                .expect("interface address chain names an occupied slot")
+                .next_this_sw_interface;
+        }
+        let index = self.interface_addresses.insert(IpInterfaceAddress {
+            address: key.address,
+            address_length,
+            sw_if_index,
+            next_this_sw_interface: None,
+            prev_this_sw_interface: previous,
+        });
+        if let Some(previous) = previous {
+            self.interface_addresses
+                .get_mut(previous)
+                .expect("interface address chain tail remains occupied")
+                .next_this_sw_interface = Some(index);
+        } else {
+            self.interface_address_head_by_sw_if_index[position] = Some(index);
+        }
+        assert!(
+            self.interface_address_index_by_key
+                .insert(key, index)
+                .is_none(),
+            "validated interface address key is unique"
+        );
+        index
+    }
+
+    pub(crate) fn remove_interface_address(
+        &mut self,
+        key: IpInterfaceAddressKey<A>,
+        index: u32,
+    ) -> IpInterfaceAddress<A> {
+        let address = self
+            .interface_addresses
+            .remove(index)
+            .expect("interface address database names an occupied slot");
+        if let Some(previous) = address.prev_this_sw_interface {
+            self.interface_addresses
+                .get_mut(previous)
+                .expect("previous interface address remains occupied")
+                .next_this_sw_interface = address.next_this_sw_interface;
+        } else {
+            self.interface_address_head_by_sw_if_index[address.sw_if_index as usize] =
+                address.next_this_sw_interface;
+        }
+        if let Some(next) = address.next_this_sw_interface {
+            self.interface_addresses
+                .get_mut(next)
+                .expect("next interface address remains occupied")
+                .prev_this_sw_interface = address.prev_this_sw_interface;
+        }
+        assert_eq!(
+            self.interface_address_index_by_key.remove(&key),
+            Some(index)
+        );
+        address
+    }
+}
+
 pub struct Ip4Main {
     pub(crate) local_feature_arc_index: UnsafeCell<u8>,
-    pub(crate) unicast_feature_arc_index: UnsafeCell<u8>,
     pub(crate) punt_feature_arc_index: UnsafeCell<u8>,
     pub(crate) drop_feature_arc_index: UnsafeCell<u8>,
-    pub(crate) local_next_by_ip_protocol: UnsafeCell<[u16; 256]>,
+    pub(crate) lookup_main: UnsafeCell<IpLookupMain<Ipv4Addr>>,
+    pub(crate) fib_index_by_sw_if_index: UnsafeCell<Vec<Option<u32>>>,
+    pub(crate) ip_enabled_by_sw_if_index: UnsafeCell<Vec<u8>>,
+    pub(crate) add_del_interface_address_callbacks:
+        UnsafeCell<Vec<IpInterfaceAddressCallback<Ipv4Addr>>>,
     pub(crate) icmp_throttle: Vec<RefCell<Throttle>>,
     pub(crate) clock_origin: Instant,
     unicast_tables: Vec<Ip4FibTable>,
-    fib_index_by_sw_if_index: Vec<u32>,
 }
 
 impl Ip4Main {
     pub fn new() -> Self {
         Self {
             local_feature_arc_index: UnsafeCell::new(u8::MAX),
-            unicast_feature_arc_index: UnsafeCell::new(u8::MAX),
             punt_feature_arc_index: UnsafeCell::new(u8::MAX),
             drop_feature_arc_index: UnsafeCell::new(u8::MAX),
-            local_next_by_ip_protocol: UnsafeCell::new(
-                [NodeNext::slot(crate::local::Ip4LocalNext::Punt); 256],
-            ),
+            lookup_main: UnsafeCell::new(IpLookupMain::new(NodeNext::slot(
+                crate::local::Ip4LocalNext::Punt,
+            ))),
+            fib_index_by_sw_if_index: UnsafeCell::new(Vec::new()),
+            ip_enabled_by_sw_if_index: UnsafeCell::new(Vec::new()),
+            add_del_interface_address_callbacks: UnsafeCell::new(Vec::new()),
             icmp_throttle: Vec::new(),
             clock_origin: Instant::now(),
             unicast_tables: vec![Ip4FibTable::new(Default::default())],
-            fib_index_by_sw_if_index: vec![0],
         }
     }
 
     #[inline(always)]
     pub fn fib_index(&self, sw_if_index: u32) -> Option<u32> {
-        self.fib_index_by_sw_if_index
+        // SAFETY: main-thread mutation is published under the worker barrier.
+        unsafe { &*self.fib_index_by_sw_if_index.get() }
             .get(sw_if_index as usize)
             .copied()
+            .flatten()
     }
 
     #[inline(always)]
@@ -60,38 +183,43 @@ impl Ip4Main {
 
 pub struct Ip6Main {
     pub(crate) local_feature_arc_index: UnsafeCell<u8>,
-    pub(crate) unicast_feature_arc_index: UnsafeCell<u8>,
     pub(crate) punt_feature_arc_index: UnsafeCell<u8>,
     pub(crate) drop_feature_arc_index: UnsafeCell<u8>,
-    pub(crate) local_next_by_ip_protocol: UnsafeCell<[u16; 256]>,
+    pub(crate) lookup_main: UnsafeCell<IpLookupMain<Ipv6Addr>>,
+    pub(crate) fib_index_by_sw_if_index: UnsafeCell<Vec<Option<u32>>>,
+    pub(crate) ip_enabled_by_sw_if_index: UnsafeCell<Vec<u8>>,
+    pub(crate) add_del_interface_address_callbacks:
+        UnsafeCell<Vec<IpInterfaceAddressCallback<Ipv6Addr>>>,
     pub(crate) icmp_throttle: Vec<RefCell<Throttle>>,
     pub(crate) clock_origin: Instant,
     unicast_tables: Vec<Ip6FibTable>,
-    fib_index_by_sw_if_index: Vec<u32>,
 }
 
 impl Ip6Main {
     pub fn new() -> Self {
         Self {
             local_feature_arc_index: UnsafeCell::new(u8::MAX),
-            unicast_feature_arc_index: UnsafeCell::new(u8::MAX),
             punt_feature_arc_index: UnsafeCell::new(u8::MAX),
             drop_feature_arc_index: UnsafeCell::new(u8::MAX),
-            local_next_by_ip_protocol: UnsafeCell::new(
-                [NodeNext::slot(crate::local::Ip6LocalNext::Punt); 256],
-            ),
+            lookup_main: UnsafeCell::new(IpLookupMain::new(NodeNext::slot(
+                crate::local::Ip6LocalNext::Punt,
+            ))),
+            fib_index_by_sw_if_index: UnsafeCell::new(Vec::new()),
+            ip_enabled_by_sw_if_index: UnsafeCell::new(Vec::new()),
+            add_del_interface_address_callbacks: UnsafeCell::new(Vec::new()),
             icmp_throttle: Vec::new(),
             clock_origin: Instant::now(),
             unicast_tables: vec![Ip6FibTable::new(Default::default())],
-            fib_index_by_sw_if_index: vec![0],
         }
     }
 
     #[inline(always)]
     pub fn fib_index(&self, sw_if_index: u32) -> Option<u32> {
-        self.fib_index_by_sw_if_index
+        // SAFETY: main-thread mutation is published under the worker barrier.
+        unsafe { &*self.fib_index_by_sw_if_index.get() }
             .get(sw_if_index as usize)
             .copied()
+            .flatten()
     }
 
     #[inline(always)]
@@ -113,14 +241,24 @@ unsafe impl Sync for Ip4Main {}
 unsafe impl Sync for Ip6Main {}
 
 #[inline(always)]
-pub(crate) fn fib_index_for(version: IpVersion, sw_if_index: u32) -> Option<u32> {
+pub fn fib_table_get_index_for_sw_if_index(version: IpVersion, sw_if_index: u32) -> Option<u32> {
     match version {
-        IpVersion::V4 => IP4_MAIN.get().and_then(|main| main.fib_index(sw_if_index)),
-        IpVersion::V6 => IP6_MAIN.get().and_then(|main| main.fib_index(sw_if_index)),
+        IpVersion::V4 => IP4_MAIN
+            .get()
+            .expect("IP4 Main is initialized before FIB selection")
+            .fib_index(sw_if_index),
+        IpVersion::V6 => IP6_MAIN
+            .get()
+            .expect("IP6 Main is initialized before FIB selection")
+            .fib_index(sw_if_index),
     }
 }
 
-#[hammer_component_macros::init_function(name = "ip_lookup_init")]
+#[hammer_component_macros::init_function(
+    name = "ip_lookup_init",
+    runs_after = ["interface_main_init"],
+    runs_before = ["net_main_init"]
+)]
 fn init_lookup() -> RuntimeResult<()> {
     assert!(
         IP4_MAIN.get().is_none() && IP6_MAIN.get().is_none(),
