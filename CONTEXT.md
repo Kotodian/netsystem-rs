@@ -444,6 +444,25 @@ A graph node owned by a device plugin that receives ingress packets and chooses
 their next graph target.
 _Avoid_: fixed device input path, service-owned protocol input
 
+**Device Input Arc**:
+The service-owned ingress Feature Arc whose disabled `device-input` Driver Node
+is the shared graph anchor for device RX siblings and whose final feature is
+`ethernet-input`. A concrete device RX node chooses whether an Ethernet packet
+enters this arc; raw-IP and tunnel paths remain device-owned.
+_Avoid_: device driver, protocol dispatcher, fixed IP next
+
+**Ethernet Main**:
+The service-owned process-global authority for Ethernet input EtherType
+dispatch. It owns the startup-published sparse EtherType-to-next-slot mapping;
+the protocol plugin that owns a consumer registers its own EtherTypes.
+_Avoid_: DeviceMain field, InterfaceMain field, IP-specific registry
+
+**Ethernet Input Node**:
+The service-owned Graph Node that borrows Ethernet/VLAN headers in place,
+advances the Buffer cursor to L3, classifies packet errors, and dispatches via
+Ethernet Main's registered next slot.
+_Avoid_: payload copy, IP parser, device-specific parser
+
 **IP/Device Data-Path Seam**:
 The packet-graph seam where device and IP plugins exchange node identity and
 RX/TX interface facts without a fixed protocol path.

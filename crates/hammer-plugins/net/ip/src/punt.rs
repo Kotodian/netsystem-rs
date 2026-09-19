@@ -3,9 +3,13 @@ use crate::ip::local::{Ip4LocalEndOfArcNode, Ip4LocalNode, Ip6LocalEndOfArcNode,
 use crate::lookup::{IP4_MAIN, IP6_MAIN, Ip4LookupNode, Ip6LookupNode};
 use hammer_core::data_plane::{Frame, NodeId, NodeNext};
 use hammer_runtime::{DataPlaneMain, Node, NodeProcessFn, RuntimeResult};
+use hammer_service::ethernet::EthernetMain;
 use hammer_service::feature::{FeatureError, FeatureMain};
 use hammer_service::net::{DpoProto, DpoType, NetMain};
 use hammer_service::opaque::NetworkOpaque;
+
+const IP4_ETHERNET_TYPE: u16 = 0x0800;
+const IP6_ETHERNET_TYPE: u16 = 0x86dd;
 
 #[hammer_component_macros::node_next]
 pub enum Ip4PuntNext {
@@ -265,9 +269,20 @@ impl Node for Ip6DropNode {
 /// main-loop-enter phase, ahead of the service's Feature Arc initialization.
 #[hammer_component_macros::main_loop_enter_function(
     name = "ip_feature_init",
+    runs_after = ["device_input_feature_init"],
     runs_before = ["feature_arc_init"]
 )]
 fn ip_feature_init(main: &mut hammer_runtime::DataPlaneMain) -> RuntimeResult<()> {
+    let nodes = main.nodes();
+    let ethernet = EthernetMain::global()?;
+    let ip4_input = nodes
+        .node_by_name(Ip4InputNode::NODE_NAME)
+        .expect("IP4 input node exists after graph materialization");
+    let ip6_input = nodes
+        .node_by_name(Ip6InputNode::NODE_NAME)
+        .expect("IP6 input node exists after graph materialization");
+    ethernet.register_input_type(nodes, IP4_ETHERNET_TYPE, ip4_input)?;
+    ethernet.register_input_type(nodes, IP6_ETHERNET_TYPE, ip6_input)?;
     register_ip_features(FeatureMain::global()?, main.nodes()).map_err(|source| {
         hammer_runtime::RuntimeError::GraphNodeInitialization {
             node: "ip4-input",

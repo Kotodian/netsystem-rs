@@ -6,9 +6,47 @@ use std::ops::Range;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock};
 
-use hammer_runtime::{DataWorkerId, RuntimeError, RuntimeResult};
+use hammer_core::data_plane::Frame;
+use hammer_runtime::{
+    DataPlaneMain, DataWorkerId, Node, NodeProcessFn, RuntimeError, RuntimeResult,
+};
 
 pub use crate::interface_model::{DeviceClass, HwClass, HwInterface, SwInterface};
+
+#[hammer_component_macros::node_next]
+pub enum DeviceInputNext {
+    #[next("ethernet-input")]
+    Ethernet,
+    #[next("drop")]
+    Drop,
+    #[next("punt")]
+    Punt,
+}
+
+#[hammer_component_macros::feature_arc(
+    name = "device-input",
+    start_nodes = [DeviceInputNode],
+    last_in_arc = crate::ethernet::EthernetInputNode
+)]
+#[hammer_component_macros::graph_node(
+    graph = service,
+    kind = driver,
+    state = disabled,
+    name = "device-input",
+    next = DeviceInputNext
+)]
+pub struct DeviceInputNode;
+
+impl Node for DeviceInputNode {
+    fn process(
+        runtime: &mut DataPlaneMain,
+        node_runtime: &mut hammer_runtime::NodeRuntime,
+        frame: &mut Frame,
+    ) -> usize {
+        let process: NodeProcessFn = |_, _, _| 0;
+        process(runtime, node_runtime, frame)
+    }
+}
 
 #[derive(Debug, thiserror::Error)]
 pub enum DeviceError {
