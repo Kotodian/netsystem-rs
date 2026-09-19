@@ -2,16 +2,35 @@ use hammer_runtime::ThreadMain;
 use hammer_service::interface::{InterfaceError, InterfaceMain};
 use ipnet::IpNet;
 
+hammer_service::declare_interface_registration_image!();
+
+#[derive(hammer_component_macros::DeviceClass)]
+#[device_class(name = "test")]
+struct TestDeviceClass;
+
+#[derive(hammer_component_macros::HwClass)]
+#[hw_class(name = "test")]
+struct TestHwClass;
+
 #[test]
 fn address_removal_preserves_other_interface_addresses() {
     hammer_core::buffer::BufferMain::new(64, 1024, &[0], 2, hammer_infra::PageSize::Default)
         .unwrap();
     ThreadMain::new().unwrap();
     let interfaces = InterfaceMain::new();
-    let ingress = interfaces.register_hardware_interface(0, 1, 0, 0).unwrap();
-    let egress = interfaces.register_hardware_interface(0, 2, 0, 0).unwrap();
-    let ingress_sw = interfaces.hardware_interface(ingress).unwrap().sw_if_index;
-    let egress_sw = interfaces.hardware_interface(egress).unwrap().sw_if_index;
+    interfaces
+        .consume_registration_image(&HAMMER_INTERFACE_REGISTRATION_IMAGE)
+        .unwrap();
+    let device_class_index = interfaces.device_class_index("test");
+    let hw_class_index = interfaces.hw_class_index("test");
+    let ingress = interfaces
+        .register_hardware_interface(device_class_index, 1, hw_class_index, 0)
+        .unwrap();
+    let egress = interfaces
+        .register_hardware_interface(device_class_index, 2, hw_class_index, 0)
+        .unwrap();
+    let ingress_sw = interfaces.hardware_interface(ingress).sw_if_index;
+    let egress_sw = interfaces.hardware_interface(egress).sw_if_index;
     let ip4: IpNet = "192.0.2.1/24".parse().unwrap();
     let ip6: IpNet = "2001:db8::1/64".parse().unwrap();
     let peer: IpNet = "198.51.100.1/24".parse().unwrap();

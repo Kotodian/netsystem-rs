@@ -91,17 +91,15 @@ fn feature_config_lifecycle_preserves_arc_contracts() -> Result<(), Box<dyn std:
     FeatureMain::init()?;
     let features = FeatureMain::global()?;
     let interfaces = net.interface_main();
+    let device_class_index = interfaces.device_class_index("local");
+    let hw_class_index = interfaces.hw_class_index("local");
 
-    let first_hardware = interfaces.register_hardware_interface(0, 1, 0, 0)?;
-    let first_interface = interfaces
-        .hardware_interface(first_hardware)
-        .expect("the first hardware interface is live")
-        .sw_if_index();
-    let second_hardware = interfaces.register_hardware_interface(0, 2, 0, 0)?;
-    let second_interface = interfaces
-        .hardware_interface(second_hardware)
-        .expect("the second hardware interface is live")
-        .sw_if_index();
+    let first_hardware =
+        interfaces.register_hardware_interface(device_class_index, 1, hw_class_index, 0)?;
+    let first_interface = interfaces.hardware_interface(first_hardware).sw_if_index();
+    let second_hardware =
+        interfaces.register_hardware_interface(device_class_index, 2, hw_class_index, 0)?;
+    let second_interface = interfaces.hardware_interface(second_hardware).sw_if_index();
 
     let output = runtime
         .nodes()
@@ -334,10 +332,10 @@ fn feature_config_lifecycle_preserves_arc_contracts() -> Result<(), Box<dyn std:
         Some(shared_config_index),
         "deleting one interface retains a shared config"
     );
-    let replacement_hardware = interfaces.register_hardware_interface(0, 3, 0, 0)?;
+    let replacement_hardware =
+        interfaces.register_hardware_interface(device_class_index, 3, hw_class_index, 0)?;
     let replacement_interface = interfaces
         .hardware_interface(replacement_hardware)
-        .expect("the replacement hardware interface is live")
         .sw_if_index();
     assert_eq!(replacement_interface, first_interface);
     assert_eq!(
@@ -400,11 +398,9 @@ fn feature_config_lifecycle_preserves_arc_contracts() -> Result<(), Box<dyn std:
         drop_node
     );
     interfaces.delete_hardware_interface(replacement_hardware)?;
-    let final_hardware = interfaces.register_hardware_interface(0, 4, 0, 0)?;
-    let final_interface = interfaces
-        .hardware_interface(final_hardware)
-        .expect("the final hardware interface is live")
-        .sw_if_index();
+    let final_hardware =
+        interfaces.register_hardware_interface(device_class_index, 4, hw_class_index, 0)?;
+    let final_interface = interfaces.hardware_interface(final_hardware).sw_if_index();
     assert_eq!(final_interface, replacement_interface);
     assert_eq!(
         features.feature_config_index(output_arc, final_interface)?,

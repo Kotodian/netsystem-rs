@@ -4047,36 +4047,115 @@ pub fn derive_fib_source(input: TokenStream) -> TokenStream {
     .into()
 }
 
+#[derive(Default)]
+struct ClassArgs {
+    name: Option<LitStr>,
+    format_device_name: Option<Expr>,
+    flags: Option<Expr>,
+}
+
+impl Parse for ClassArgs {
+    fn parse(input: ParseStream<'_>) -> Result<Self> {
+        let mut args = Self::default();
+        while !input.is_empty() {
+            let key: Ident = input.parse()?;
+            input.parse::<Token![=]>()?;
+            match key.to_string().as_str() {
+                "name" => {
+                    if args.name.is_some() {
+                        return Err(Error::new(key.span(), "duplicate `name` class argument"));
+                    }
+                    args.name = Some(input.parse()?);
+                }
+                "format_device_name" => {
+                    if args.format_device_name.is_some() {
+                        return Err(Error::new(
+                            key.span(),
+                            "duplicate `format_device_name` class argument",
+                        ));
+                    }
+                    args.format_device_name = Some(input.parse()?);
+                }
+                "flags" => {
+                    if args.flags.is_some() {
+                        return Err(Error::new(key.span(), "duplicate `flags` class argument"));
+                    }
+                    args.flags = Some(input.parse()?);
+                }
+                other => {
+                    return Err(Error::new(
+                        key.span(),
+                        format!("unknown class argument `{other}`"),
+                    ));
+                }
+            }
+            if !input.is_empty() {
+                input.parse::<Token![,]>()?;
+            }
+        }
+        Ok(args)
+    }
+}
+
 fn derive_class(input: TokenStream, device: bool) -> Result<TokenStream2> {
     let item: ItemStruct = syn::parse(input)?;
     let ident = item.ident;
     let attribute_name = if device { "device_class" } else { "hw_class" };
-    let name = item
+    let args = item
         .attrs
         .iter()
         .find(|attribute| attribute.path().is_ident(attribute_name))
-        .and_then(|attribute| {
-            attribute
-                .parse_args_with(|input: ParseStream<'_>| {
-                    let key: Ident = input.parse()?;
-                    input.parse::<Token![=]>()?;
-                    let value: LitStr = input.parse()?;
-                    Ok((key, value))
-                })
-                .ok()
-        })
-        .filter(|(key, _)| key == "name")
-        .map(|(_, value)| value)
+        .map(|attribute| attribute.parse_args::<ClassArgs>())
+        .transpose()?
+        .unwrap_or_default();
+    let name = args
+        .name
         .unwrap_or_else(|| LitStr::new(&ident.to_string(), ident.span()));
-    let ty = if device {
-        quote!(::hammer_service::device::DeviceClass)
+    let static_ident = format_ident!(
+        "__INTERFACE_{}_CLASS_{}",
+        if device { "DEVICE" } else { "HW" },
+        ident.to_string().to_uppercase()
+    );
+    let (ty, registrations, constructor) = if device {
+        if args.flags.is_some() {
+            return Err(Error::new(
+                ident.span(),
+                "`flags` is only valid for `HwClass`",
+            ));
+        }
+        let format = args
+            .format_device_name
+            .map(|format| quote!(.with_format_device_name(#format)))
+            .unwrap_or_default();
+        (
+            quote!(::hammer_service::device::DeviceClass),
+            quote!(crate::__HAMMER_DEVICE_CLASS_REGISTRATIONS),
+            quote!(::hammer_service::device::DeviceClass::new(#name) #format),
+        )
     } else {
-        quote!(::hammer_service::device::HwClass)
+        if args.format_device_name.is_some() {
+            return Err(Error::new(
+                ident.span(),
+                "`format_device_name` is only valid for `DeviceClass`",
+            ));
+        }
+        let flags = args
+            .flags
+            .map(|flags| quote!(.with_flags(#flags)))
+            .unwrap_or_default();
+        (
+            quote!(::hammer_service::device::HwClass),
+            quote!(crate::__HAMMER_HW_CLASS_REGISTRATIONS),
+            quote!(::hammer_service::device::HwClass::new(#name) #flags),
+        )
     };
     Ok(quote! {
         impl #ident {
-            pub const fn registration() -> #ty { #ty::new(#name) }
+            pub const fn registration() -> #ty { #constructor }
         }
+
+        #[::hammer_service::__private::distributed_slice(#registrations)]
+        static #static_ident: #ty = #ident::registration();
     })
 }
 

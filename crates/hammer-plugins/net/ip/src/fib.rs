@@ -548,8 +548,12 @@ mod tests {
         (crate::lookup::__IP_GRAPH_NODE_IP4_INTERFACE_RX_NODE.init)(&runtime)?;
         (crate::lookup::__IP_GRAPH_NODE_IP6_INTERFACE_RX_NODE.init)(&runtime)?;
         let interfaces = net.interface_main();
-        let hardware = interfaces.register_hardware_interface(0, 1, 0, 0).unwrap();
-        let software = interfaces.hardware_interface(hardware).unwrap().sw_if_index;
+        let device_class_index = interfaces.device_class_index("local");
+        let hw_class_index = interfaces.hw_class_index("local");
+        let hardware = interfaces
+            .register_hardware_interface(device_class_index, 1, hw_class_index, 0)
+            .unwrap();
+        let software = interfaces.hardware_interface(hardware).sw_if_index;
         let rx4 = interfaces
             .add_or_lock_rx_dpo(DpoProto::IP4, software)?
             .unwrap();
@@ -597,9 +601,9 @@ mod tests {
         let mut rx_paths = Vec::new();
         for instance in 0..8 {
             let hardware = interfaces
-                .register_hardware_interface(0, instance, 0, 0)
+                .register_hardware_interface(device_class_index, instance, hw_class_index, 0)
                 .unwrap();
-            let software = interfaces.hardware_interface(hardware).unwrap().sw_if_index;
+            let software = interfaces.hardware_interface(hardware).sw_if_index;
             hardware_interfaces.push(hardware);
             rx_paths.push(LoadBalancePath {
                 dpo: interfaces
@@ -621,7 +625,7 @@ mod tests {
         )?;
         let accepting_interfaces: Vec<_> = hardware_interfaces
             .iter()
-            .map(|&hardware| interfaces.hardware_interface(hardware).unwrap().sw_if_index)
+            .map(|&hardware| interfaces.hardware_interface(hardware).sw_if_index)
             .collect();
         let paths = accepting_interfaces
             .iter()

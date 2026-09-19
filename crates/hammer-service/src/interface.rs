@@ -276,12 +276,20 @@ mod tests {
         });
         hammer_runtime::ThreadMain::new().unwrap();
         let mut runtime = DataPlaneMain::new(DataPlaneBufferConfig::default());
-        let net = NetMain::init(Arc::new(InterfaceMain::new()))?;
+        let interfaces = Arc::new(InterfaceMain::new());
+        let net = NetMain::init(interfaces)?;
         let child = crate::data_plane::register_drop(&mut runtime)?;
         let output = register_interface_output_graph(&mut runtime)?;
         let interfaces = net.interface_main();
-        let hardware = interfaces.register_hardware_interface(0, 1, 0, 0).unwrap();
-        let software = interfaces.hardware_interface(hardware).unwrap().sw_if_index;
+        let hardware = interfaces
+            .register_hardware_interface(
+                interfaces.device_class_index("local"),
+                1,
+                interfaces.hw_class_index("local"),
+                0,
+            )
+            .unwrap();
+        let software = interfaces.hardware_interface(hardware).sw_if_index;
         assert_eq!(
             interfaces
                 .software_interface(software)

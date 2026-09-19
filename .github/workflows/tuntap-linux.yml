@@ -1,0 +1,53 @@
+name: Tuntap Linux lifecycle
+run-name: Tuntap Linux lifecycle (${{ github.ref_name }})
+
+on:
+  workflow_dispatch:
+  pull_request:
+    paths:
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - "crates/hammer-component-macros/**"
+      - "crates/hammer-plugins/device/tuntap/**"
+      - "crates/hammer-service/src/interface.rs"
+      - "crates/hammer-service/src/interface_model.rs"
+      - "crates/hammer-service/src/lib.rs"
+      - "crates/hammer-service/src/net/**"
+      - ".github/workflows/tuntap-linux.yml"
+
+permissions:
+  contents: read
+
+jobs:
+  lifecycle:
+    name: Privileged Linux lifecycle
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.96.0
+      - name: Cache Cargo
+        uses: Swatinem/rust-cache@v2
+      - name: Verify TUN capability
+        run: |
+          sudo modprobe tun
+          sudo test -c /dev/net/tun
+      - name: Build dynamic plugin
+        run: cargo build --locked -p hammer-plugin-tuntap
+      - name: Load dynamic class registration image
+        run: >-
+          HAMMER_PLUGIN_DIR="$PWD/target/debug"
+          cargo test --locked -p hammer-plugin-tuntap
+          tests::tuntap_dso_installs_class_image -- --ignored --exact
+      - name: Run non-privileged control-plane tests
+        run: cargo test --locked -p hammer-plugin-tuntap --lib
+      - name: Run isolated tuntap lifecycle
+        run: >-
+          sudo env PATH="$PATH" CARGO_HOME="$HOME/.cargo"
+          unshare --net --mount-proc
+          cargo test --locked -p hammer-plugin-tuntap
+          tests::tuntap_linux_lifecycle -- --ignored --exact
