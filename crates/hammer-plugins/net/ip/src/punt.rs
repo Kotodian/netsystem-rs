@@ -3,7 +3,7 @@ use crate::ip::local::{Ip4LocalEndOfArcNode, Ip4LocalNode, Ip6LocalEndOfArcNode,
 use crate::lookup::{IP4_MAIN, IP6_MAIN, Ip4LookupNode, Ip6LookupNode};
 use hammer_core::data_plane::{Frame, NodeId, NodeNext};
 use hammer_runtime::{DataPlaneMain, Node, NodeProcessFn, RuntimeResult};
-use hammer_service::interface::feature::FeatureError;
+use hammer_service::feature::{FeatureError, FeatureMain};
 use hammer_service::net::{DpoProto, DpoType, NetMain};
 use hammer_service::opaque::NetworkOpaque;
 
@@ -52,8 +52,9 @@ impl Node for Ip4PuntNode {
             let processed_vectors = frame.len();
             (|| {
                 {
-                    let net = NetMain::global().expect("IP node requires initialized NetMain");
-                    // SAFETY: startup installs this scalar before workers execute nodes.
+                    let features =
+                        FeatureMain::global().expect("IP node requires initialized FeatureMain");
+                    // SAFETY: startup publishes this scalar before workers execute nodes.
                     let arc = unsafe {
                         *IP4_MAIN
                             .get()
@@ -66,7 +67,7 @@ impl Node for Ip4PuntNode {
                         // SAFETY: IP ingress initializes the network overlay.
                         let sw_if_index =
                             hammer_core::buffer_opaque!(buffer => NetworkOpaque).sw_if_index[0];
-                        net.interface_main().start_feature_arc(
+                        features.start_feature_arc(
                             arc,
                             sw_if_index,
                             buffer,
@@ -101,8 +102,9 @@ impl Node for Ip4DropNode {
             let processed_vectors = frame.len();
             (|| {
                 {
-                    let net = NetMain::global().expect("IP node requires initialized NetMain");
-                    // SAFETY: startup installs this scalar before workers execute nodes.
+                    let features =
+                        FeatureMain::global().expect("IP node requires initialized FeatureMain");
+                    // SAFETY: startup publishes this scalar before workers execute nodes.
                     let arc = unsafe {
                         *IP4_MAIN
                             .get()
@@ -115,7 +117,7 @@ impl Node for Ip4DropNode {
                         // SAFETY: IP ingress initializes the network overlay.
                         let sw_if_index =
                             hammer_core::buffer_opaque!(buffer => NetworkOpaque).sw_if_index[0];
-                        net.interface_main().start_feature_arc(
+                        features.start_feature_arc(
                             arc,
                             sw_if_index,
                             buffer,
@@ -175,8 +177,9 @@ impl Node for Ip6PuntNode {
             let processed_vectors = frame.len();
             (|| {
                 {
-                    let net = NetMain::global().expect("IP node requires initialized NetMain");
-                    // SAFETY: startup installs this scalar before workers execute nodes.
+                    let features =
+                        FeatureMain::global().expect("IP node requires initialized FeatureMain");
+                    // SAFETY: startup publishes this scalar before workers execute nodes.
                     let arc = unsafe {
                         *IP6_MAIN
                             .get()
@@ -189,7 +192,7 @@ impl Node for Ip6PuntNode {
                         // SAFETY: IP ingress initializes the network overlay.
                         let sw_if_index =
                             hammer_core::buffer_opaque!(buffer => NetworkOpaque).sw_if_index[0];
-                        net.interface_main().start_feature_arc(
+                        features.start_feature_arc(
                             arc,
                             sw_if_index,
                             buffer,
@@ -224,8 +227,9 @@ impl Node for Ip6DropNode {
             let processed_vectors = frame.len();
             (|| {
                 {
-                    let net = NetMain::global().expect("IP node requires initialized NetMain");
-                    // SAFETY: startup installs this scalar before workers execute nodes.
+                    let features =
+                        FeatureMain::global().expect("IP node requires initialized FeatureMain");
+                    // SAFETY: startup publishes this scalar before workers execute nodes.
                     let arc = unsafe {
                         *IP6_MAIN
                             .get()
@@ -238,7 +242,7 @@ impl Node for Ip6DropNode {
                         // SAFETY: IP ingress initializes the network overlay.
                         let sw_if_index =
                             hammer_core::buffer_opaque!(buffer => NetworkOpaque).sw_if_index[0];
-                        net.interface_main().start_feature_arc(
+                        features.start_feature_arc(
                             arc,
                             sw_if_index,
                             buffer,
@@ -258,116 +262,117 @@ impl Node for Ip6DropNode {
 /// VPP's `vnet_feature_init` runs after `vlib_register_all_static_nodes`
 /// (`third_party/vpp/src/vlib/main.c:1899-1900`); Hammer materializes declared
 /// nodes after init functions, so arc registration belongs to the
-/// main-loop-enter phase, ahead of the service's arc installation.
+/// main-loop-enter phase, ahead of the service's Feature Arc initialization.
 #[hammer_component_macros::main_loop_enter_function(
     name = "ip_feature_init",
-    runs_before = ["interface_feature_init"]
+    runs_before = ["feature_arc_init"]
 )]
 fn ip_feature_init(main: &mut hammer_runtime::DataPlaneMain) -> RuntimeResult<()> {
-    let net = NetMain::global()?;
-    let interfaces = net.interface_main();
-    let nodes = main.nodes();
-    let install = || -> Result<(), FeatureError> {
-        let main = IP4_MAIN.get().expect("IP main initialized before graph");
-        let arc = Ip4InputNode::register_feature_arc(interfaces, nodes)?;
-        // SAFETY: feature declarations are installed before workers start.
-        unsafe {
-            *main.unicast_feature_arc_index.get() = arc;
-        }
-        let arc = Ip4LocalNode::register_feature_arc(interfaces, nodes)?;
-        // SAFETY: feature declarations are installed before workers start.
-        unsafe {
-            *main.local_feature_arc_index.get() = arc;
-        }
-        let arc = Ip4PuntNode::register_feature_arc(interfaces, nodes)?;
-        // SAFETY: feature declarations are installed before workers start.
-        unsafe {
-            *main.punt_feature_arc_index.get() = arc;
-        }
-        let arc = Ip4DropNode::register_feature_arc(interfaces, nodes)?;
-        // SAFETY: feature declarations are installed before workers start.
-        unsafe {
-            *main.drop_feature_arc_index.get() = arc;
-        }
-        Ip4LookupNode::register_feature(interfaces, nodes)?;
-        Ip4LocalEndOfArcNode::register_feature(interfaces, nodes)?;
-        let node = nodes
-            .node_by_name(hammer_service::data_plane::PuntNode::NODE_NAME)
-            .ok_or(FeatureError::NodeNotFound {
-                name: hammer_service::data_plane::PuntNode::NODE_NAME,
-            })?;
-        interfaces.register_feature(
-            Ip4PuntNode::FEATURE_ARC_NAME,
-            hammer_service::data_plane::PuntNode::NODE_NAME,
-            node,
-            &[],
-            &[],
-        )?;
-        let node = nodes
-            .node_by_name(hammer_service::data_plane::DropNode::NODE_NAME)
-            .ok_or(FeatureError::NodeNotFound {
-                name: hammer_service::data_plane::DropNode::NODE_NAME,
-            })?;
-        interfaces.register_feature(
-            Ip4DropNode::FEATURE_ARC_NAME,
-            hammer_service::data_plane::DropNode::NODE_NAME,
-            node,
-            &[],
-            &[],
-        )?;
-        let main = IP6_MAIN.get().expect("IP main initialized before graph");
-        let arc = Ip6InputNode::register_feature_arc(interfaces, nodes)?;
-        // SAFETY: feature declarations are installed before workers start.
-        unsafe {
-            *main.unicast_feature_arc_index.get() = arc;
-        }
-        let arc = Ip6LocalNode::register_feature_arc(interfaces, nodes)?;
-        // SAFETY: feature declarations are installed before workers start.
-        unsafe {
-            *main.local_feature_arc_index.get() = arc;
-        }
-        let arc = Ip6PuntNode::register_feature_arc(interfaces, nodes)?;
-        // SAFETY: feature declarations are installed before workers start.
-        unsafe {
-            *main.punt_feature_arc_index.get() = arc;
-        }
-        let arc = Ip6DropNode::register_feature_arc(interfaces, nodes)?;
-        // SAFETY: feature declarations are installed before workers start.
-        unsafe {
-            *main.drop_feature_arc_index.get() = arc;
-        }
-        Ip6LookupNode::register_feature(interfaces, nodes)?;
-        Ip6LocalEndOfArcNode::register_feature(interfaces, nodes)?;
-        let node = nodes
-            .node_by_name(hammer_service::data_plane::PuntNode::NODE_NAME)
-            .ok_or(FeatureError::NodeNotFound {
-                name: hammer_service::data_plane::PuntNode::NODE_NAME,
-            })?;
-        interfaces.register_feature(
-            Ip6PuntNode::FEATURE_ARC_NAME,
-            hammer_service::data_plane::PuntNode::NODE_NAME,
-            node,
-            &[],
-            &[],
-        )?;
-        let node = nodes
-            .node_by_name(hammer_service::data_plane::DropNode::NODE_NAME)
-            .ok_or(FeatureError::NodeNotFound {
-                name: hammer_service::data_plane::DropNode::NODE_NAME,
-            })?;
-        interfaces.register_feature(
-            Ip6DropNode::FEATURE_ARC_NAME,
-            hammer_service::data_plane::DropNode::NODE_NAME,
-            node,
-            &[],
-            &[],
-        )?;
-        Ok(())
-    };
-    install().map_err(
-        |source| hammer_runtime::RuntimeError::GraphNodeInitialization {
+    register_ip_features(FeatureMain::global()?, main.nodes()).map_err(|source| {
+        hammer_runtime::RuntimeError::GraphNodeInitialization {
             node: "ip4-input",
             source: Box::new(source),
-        },
-    )
+        }
+    })
+}
+
+fn register_ip_features(
+    features: &FeatureMain,
+    nodes: &hammer_runtime::NodeMain,
+) -> Result<(), FeatureError> {
+    let main = IP4_MAIN.get().expect("IP main initialized before graph");
+    let arc = Ip4InputNode::register_feature_arc(features, nodes)?;
+    // SAFETY: feature declarations are published before workers start.
+    unsafe {
+        *main.unicast_feature_arc_index.get() = arc;
+    }
+    let arc = Ip4LocalNode::register_feature_arc(features, nodes)?;
+    // SAFETY: feature declarations are published before workers start.
+    unsafe {
+        *main.local_feature_arc_index.get() = arc;
+    }
+    let arc = Ip4PuntNode::register_feature_arc(features, nodes)?;
+    // SAFETY: feature declarations are published before workers start.
+    unsafe {
+        *main.punt_feature_arc_index.get() = arc;
+    }
+    let arc = Ip4DropNode::register_feature_arc(features, nodes)?;
+    // SAFETY: feature declarations are published before workers start.
+    unsafe {
+        *main.drop_feature_arc_index.get() = arc;
+    }
+    Ip4LookupNode::register_feature(features, nodes)?;
+    Ip4LocalEndOfArcNode::register_feature(features, nodes)?;
+    let node = nodes
+        .node_by_name(hammer_service::data_plane::PuntNode::NODE_NAME)
+        .ok_or(FeatureError::NodeNotFound {
+            name: hammer_service::data_plane::PuntNode::NODE_NAME,
+        })?;
+    features.register_feature(
+        Ip4PuntNode::FEATURE_ARC_NAME,
+        hammer_service::data_plane::PuntNode::NODE_NAME,
+        node,
+        &[],
+        &[],
+    )?;
+    let node = nodes
+        .node_by_name(hammer_service::data_plane::DropNode::NODE_NAME)
+        .ok_or(FeatureError::NodeNotFound {
+            name: hammer_service::data_plane::DropNode::NODE_NAME,
+        })?;
+    features.register_feature(
+        Ip4DropNode::FEATURE_ARC_NAME,
+        hammer_service::data_plane::DropNode::NODE_NAME,
+        node,
+        &[],
+        &[],
+    )?;
+    let main = IP6_MAIN.get().expect("IP main initialized before graph");
+    let arc = Ip6InputNode::register_feature_arc(features, nodes)?;
+    // SAFETY: feature declarations are published before workers start.
+    unsafe {
+        *main.unicast_feature_arc_index.get() = arc;
+    }
+    let arc = Ip6LocalNode::register_feature_arc(features, nodes)?;
+    // SAFETY: feature declarations are published before workers start.
+    unsafe {
+        *main.local_feature_arc_index.get() = arc;
+    }
+    let arc = Ip6PuntNode::register_feature_arc(features, nodes)?;
+    // SAFETY: feature declarations are published before workers start.
+    unsafe {
+        *main.punt_feature_arc_index.get() = arc;
+    }
+    let arc = Ip6DropNode::register_feature_arc(features, nodes)?;
+    // SAFETY: feature declarations are published before workers start.
+    unsafe {
+        *main.drop_feature_arc_index.get() = arc;
+    }
+    Ip6LookupNode::register_feature(features, nodes)?;
+    Ip6LocalEndOfArcNode::register_feature(features, nodes)?;
+    let node = nodes
+        .node_by_name(hammer_service::data_plane::PuntNode::NODE_NAME)
+        .ok_or(FeatureError::NodeNotFound {
+            name: hammer_service::data_plane::PuntNode::NODE_NAME,
+        })?;
+    features.register_feature(
+        Ip6PuntNode::FEATURE_ARC_NAME,
+        hammer_service::data_plane::PuntNode::NODE_NAME,
+        node,
+        &[],
+        &[],
+    )?;
+    let node = nodes
+        .node_by_name(hammer_service::data_plane::DropNode::NODE_NAME)
+        .ok_or(FeatureError::NodeNotFound {
+            name: hammer_service::data_plane::DropNode::NODE_NAME,
+        })?;
+    features.register_feature(
+        Ip6DropNode::FEATURE_ARC_NAME,
+        hammer_service::data_plane::DropNode::NODE_NAME,
+        node,
+        &[],
+        &[],
+    )?;
+    Ok(())
 }

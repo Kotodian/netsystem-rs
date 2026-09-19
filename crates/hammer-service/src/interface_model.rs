@@ -13,9 +13,6 @@ use ipnet::IpNet;
 use crate::interface::{InterfaceError, InterfaceMtu, InterfaceMtuKind, InterfaceResult};
 use crate::net::{DpoError, DpoId, DpoProto, DpoType, InterfaceRxDpo, NetMain, ReceiveDpo};
 
-#[path = "interface/feature.rs"]
-pub mod feature;
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DriverScheduleMode {
     Poll,
@@ -305,7 +302,6 @@ impl TxQueue {
 
 #[derive(Default)]
 struct InterfaceState {
-    feature: feature::FeatureState,
     hardware_interfaces: Pool<HwInterface>,
     software_interfaces: Pool<SwInterface>,
     rx_queues: Pool<RxQueue>,
@@ -592,6 +588,28 @@ impl InterfaceMain {
             .get_mut(sw_if_index)
             .expect("inserted software interface")
             .sup_sw_if_index = sw_if_index;
+        if let Err(error) = self.call_sw_interface_add_del(sw_if_index, true) {
+            let state = self.state_mut();
+            let hardware = state
+                .hardware_interfaces
+                .remove(hw_if_index)
+                .expect("a rejected interface creation still owns its hardware slot");
+            for index in hardware.rx_queue_indices {
+                state.rx_queues.remove(index);
+            }
+            for index in hardware.tx_queue_indices {
+                state.tx_queues.remove(index);
+            }
+            let software = state
+                .software_interfaces
+                .remove(sw_if_index)
+                .expect("a rejected interface creation still owns its software slot");
+            for address in software.addresses {
+                state.addresses.remove(address);
+            }
+            state.names.retain(|_, index| *index != hw_if_index);
+            return Err(error);
+        }
         Ok(hw_if_index)
     }
 
@@ -696,14 +714,16 @@ impl InterfaceMain {
         mut remove_file_interest: impl FnMut(u32),
     ) -> InterfaceResult<()> {
         hammer_runtime::ensure_main_thread_with_barrier()?;
-        let state = self.state_mut();
-        let hw = state
+        let hw = self
+            .state()
             .hardware_interfaces
             .get(hw_if_index)
             .ok_or(InterfaceError::NotRegistered {
                 interface_index: hw_if_index,
             })?
             .clone();
+        self.call_sw_interface_add_del(hw.sw_if_index, false)?;
+        let state = self.state_mut();
         for index in &hw.rx_queue_indices {
             if let Some(queue) = state.rx_queues.get(*index) {
                 remove_file_interest(queue.file_index);
@@ -715,7 +735,6 @@ impl InterfaceMain {
         for index in hw.tx_queue_indices {
             state.tx_queues.remove(index);
         }
-        state.feature.remove_interface(hw.sw_if_index);
         if let Some(software) = state.software_interfaces.remove(hw.sw_if_index) {
             for address in software.addresses {
                 state.addresses.remove(address);
@@ -1007,21 +1026,6 @@ impl InterfaceMain {
     ) -> InterfaceResult<()> {
         self.call_callbacks(sw_if_index, is_create, self.state().sw_callbacks.clone())
     }
-    pub fn call_sw_interface_admin_up_down(
-        &self,
-        sw_if_index: u32,
-        is_up: bool,
-    ) -> InterfaceResult<()> {
-        self.call_sw_interface_add_del(sw_if_index, is_up)
-    }
-    pub fn call_sw_interface_mtu_change(
-        &self,
-        sw_if_index: u32,
-        is_create: bool,
-    ) -> InterfaceResult<()> {
-        self.call_sw_interface_add_del(sw_if_index, is_create)
-    }
-
     fn call_callbacks(
         &self,
         sw_if_index: u32,
@@ -1042,10 +1046,20 @@ impl InterfaceMain {
 
 pub static INTERFACE_MAIN: OnceLock<Arc<InterfaceMain>> = OnceLock::new();
 
+static SERVICE_INTERFACE_REGISTRATION_IMAGE: InterfaceRegistrationImage =
+    InterfaceRegistrationImage::new(
+        &[],
+        &[],
+        &[],
+        &crate::feature::FEATURE_SW_INTERFACE_CALLBACKS,
+    );
+
 #[hammer_component_macros::init_function(name = "interface_main_init")]
 pub fn interface_main_init() -> RuntimeResult<()> {
+    let interfaces = Arc::new(InterfaceMain::new());
+    interfaces.consume_registration_image(&SERVICE_INTERFACE_REGISTRATION_IMAGE)?;
     assert!(
-        INTERFACE_MAIN.set(Arc::new(InterfaceMain::new())).is_ok(),
+        INTERFACE_MAIN.set(interfaces).is_ok(),
         "interface initialization callback executes once"
     );
     Ok(())

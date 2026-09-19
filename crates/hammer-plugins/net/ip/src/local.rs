@@ -11,6 +11,7 @@ use hammer_runtime::{
 use hammer_runtime::{RuntimeError, RuntimeResult};
 
 use hammer_service::data_plane::set_index_node_error;
+use hammer_service::feature::FeatureMain;
 use hammer_service::net::{DpoType, NetMain};
 use hammer_service::opaque::{NetworkFlags, NetworkOffloadFlags, NetworkOpaque};
 
@@ -770,7 +771,7 @@ fn process_index(
     refresh_basic_metadata(runtime, index, &parsed, transport_len)?;
 
     if stage.is_head_of_feature_arc() {
-        // SAFETY: arc indices are installed before workers start and never change.
+        // SAFETY: arc indices are published before workers start and never change.
         let arc_index = unsafe {
             match version {
                 IpVersion::V4 => *crate::lookup::IP4_MAIN
@@ -785,7 +786,7 @@ fn process_index(
                     .get(),
             }
         };
-        let net = NetMain::global()?;
+        let features = FeatureMain::global()?;
         let mut buffer = runtime.buffer_mut(index);
         // Preserve the physical RX identity; features use the receive DPO's
         // effective interface, including when the packet arrived elsewhere.
@@ -793,12 +794,8 @@ fn process_index(
         hammer_core::buffer_opaque!(mut buffer => NetworkOpaque)
             .ip_mut()
             .rx_sw_if_index = interface_index;
-        let resolved = net.interface_main().start_feature_arc(
-            arc_index,
-            interface_index,
-            &mut buffer,
-            protocol_next,
-        );
+        let resolved =
+            features.start_feature_arc(arc_index, interface_index, &mut buffer, protocol_next);
         return Ok(resolved);
     }
 
@@ -942,6 +939,8 @@ pub(crate) mod tests {
     ) -> Result<(), Box<dyn std::error::Error>> {
         let net = NetMain::global()?;
         let interfaces = net.interface_main();
+        FeatureMain::init()?;
+        let features = FeatureMain::global()?;
         assert!(
             crate::lookup::IP4_MAIN
                 .set(crate::lookup::Ip4Main::new())
@@ -982,17 +981,17 @@ pub(crate) mod tests {
             } else {
                 "ip6-local-end-of-arc"
             };
-            interfaces.register_feature_arc(name, &[local, receive], Some(end_name))?;
-            interfaces.register_feature(name, end_name, end, &[], &[])?;
+            features.register_feature_arc(name, &[local, receive], Some(end_name))?;
+            features.register_feature(name, end_name, end, &[], &[])?;
         }
-        interfaces.install_feature_arcs(runtime.nodes())?;
+        hammer_service::feature::feature_arc_init(runtime)?;
         for (version, _, receive, end, name, address) in families {
             let end_name = if version == IpVersion::V4 {
                 "ip4-local-end-of-arc"
             } else {
                 "ip6-local-end-of-arc"
             };
-            let arc = interfaces.feature_arc_index(name).unwrap();
+            let arc = features.feature_arc_index(name).unwrap();
             // SAFETY: this fixture runs on the control thread before workers.
             unsafe {
                 match version {
@@ -1012,8 +1011,8 @@ pub(crate) mod tests {
                     }
                 }
             }
-            let feature = interfaces.feature_index(arc, end_name).unwrap();
-            interfaces.enable_feature(runtime, arc, feature, effective_rx, &[])?;
+            let feature = features.feature_index(arc, end_name).unwrap();
+            features.enable_feature(runtime, arc, feature, effective_rx, &[])?;
             let dpo = interfaces
                 .add_or_lock_receive_dpo(effective_rx, address.parse().unwrap())?
                 .unwrap();
@@ -1123,7 +1122,7 @@ pub(crate) mod tests {
             }
             net.unlock_dpo(dpo);
             assert_eq!(interfaces.receive_dpo_interface(dpo), None);
-            interfaces.disable_feature(runtime, arc, feature, effective_rx, &[])?;
+            features.disable_feature(runtime, arc, feature, effective_rx, &[])?;
         }
         interfaces.delete_hardware_interface(hardware)?;
 

@@ -2,11 +2,12 @@
 
 Status: accepted
 
-Partial supersession: ADR-0006 replaces the Feature Arc publication rule and
-the `FeatureArcControl` inventory rows in this ADR. Feature declaration and
-installation are startup operations. `InterfaceMain` owns live per-interface
-Feature Arc mutation and enters `worker_thread_barrier_sync!` internally only
-when a mutation changes worker-visible configuration. Feature Arc does not
+Partial supersession: ADR-0025 replaces the Feature Arc publication rule and
+the `FeatureArcControl` inventory rows in this ADR and ADR-0006. Feature
+declaration and `feature_arc_init` are startup operations. The independent
+`FeatureMain` owns live per-interface Feature Arc mutation and enters
+`worker_thread_barrier_sync!` internally only when a mutation changes
+worker-visible configuration. Feature Arc does not
 depend on a Binary API control surface. When a changed chain adds graph edges,
 the failure-atomic main-graph update requests ADR-0003's coalesced Graph Refork
 before the outermost barrier release.
@@ -140,7 +141,7 @@ or add a second publication protocol around it.
 | API | Binary API `dispatch` | 仅成功解析的非 `mp_safe` handler 进入宏；无 pending 查询或手动 refork finish | handler function-pointer ABI 与 handler 签名不变 | MP-safe、non-MP-safe、missing/invalid dispatch 测试 |
 | API | Session/Application 及 TLS/QUIC/HTTP/TCP/UDP control mutation | 删除内部 acquisition，改用 hidden held assertion；owner-worker 与 transport-control routing 不变 | 公共业务签名不增加 Barrier 参数 | caller-held invariant 与 owner-worker routing 测试 |
 | API | `InterfaceControlPlane::{register_interface, register_interface_with_mtu, set_mtu, set_protocol_mtu, add_address, remove_address}` | 增加显式 `&mut DataPlaneMain` sync context；只在实际 publish 时同步 | breaking，一次性迁移全部调用方 | no-op 不同步与 snapshot publication 测试 |
-| API | `InterfaceMain::{enable_feature, disable_feature, modify_feature_arc_end, reset_feature_arc_end}` | Feature Arc 归接口 authority；增加显式 `&mut DataPlaneMain` sync context，owner 仅在实际配置变化时进入宏；新增 graph edge 通过 failure-atomic batch 请求 ADR-0003 refork | breaking，一次性迁移全部调用方；不要求 Binary API | startup/no-op/live publication、nested Barrier 与 single-refork 测试 |
+| API | `FeatureMain::{enable_feature, disable_feature, modify_feature_arc_end, reset_feature_arc_end}` | 独立 Feature authority 持有配置；显式 `&mut DataPlaneMain` sync context，owner 仅在实际配置变化时进入宏；新增 graph edge 通过 failure-atomic batch 请求 ADR-0003 refork | breaking，一次性迁移全部调用方；不要求 Binary API | startup/no-op/live publication、nested Barrier 与 single-refork 测试 |
 | API | `IpLookupControlPlane::publish` | 增加显式 `&mut DataPlaneMain` sync context并在 owner 内同步 | breaking，一次性迁移全部调用方 | lookup snapshot publication 测试 |
 | API | `GlobalMain::load_plugins` | startup 不同步；runtime loader 不包围整段 Barrier | acquisition behavior breaking；publication 交由 owner | startup/live additive-load integration test |
 

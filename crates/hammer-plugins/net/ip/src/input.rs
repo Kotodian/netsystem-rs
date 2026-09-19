@@ -8,6 +8,7 @@ use hammer_runtime::{
 use crate::ip::{IpInputError, IpInputTarget, IpProtocol, IpVersion, parse_ip_header};
 use crate::protocol::ip_ecn::IpEcnCodepoint;
 use hammer_service::data_plane::set_index_node_error;
+use hammer_service::feature::FeatureMain;
 use hammer_service::opaque::NetworkOpaque;
 
 #[hammer_component_macros::node_next]
@@ -241,16 +242,11 @@ fn next_slot_for_index(
                         .get(),
                 }
             };
-            let net = hammer_service::net::NetMain::global()?;
+            let features = FeatureMain::global()?;
             let mut buffer = runtime.buffer_mut(index);
             let interface_index =
                 hammer_core::buffer_opaque!(buffer => NetworkOpaque).sw_if_index[0];
-            net.interface_main().start_feature_arc(
-                arc_index,
-                interface_index,
-                &mut buffer,
-                default_next,
-            )
+            features.start_feature_arc(arc_index, interface_index, &mut buffer, default_next)
         }
         IpInputTarget::LookupMulticast => match parsed.version {
             IpVersion::V4 => Ip4InputNext::Lookup.slot() as u16,

@@ -1376,8 +1376,8 @@ pub fn feature_arc(args: TokenStream, input: TokenStream) -> TokenStream {
         #item
         impl #impl_generics #ident #ty_generics #where_clause {
             pub const FEATURE_ARC_NAME: &'static str = #name;
-            pub fn register_feature_arc(interfaces: &::hammer_service::interface::InterfaceMain, nodes: &::hammer_runtime::NodeMain) -> Result<u8, ::hammer_service::interface::feature::FeatureError> {
-                interfaces.register_feature_arc(Self::FEATURE_ARC_NAME, &[#(nodes.node_by_name(#starts::NODE_NAME).ok_or(::hammer_service::interface::feature::FeatureError::NodeNotFound { name: #starts::NODE_NAME })?),*], #last)
+            pub fn register_feature_arc(features: &::hammer_service::feature::FeatureMain, nodes: &::hammer_runtime::NodeMain) -> Result<u8, ::hammer_service::feature::FeatureError> {
+                features.register_feature_arc(Self::FEATURE_ARC_NAME, &[#(nodes.node_by_name(#starts::NODE_NAME).ok_or(::hammer_service::feature::FeatureError::NodeNotFound { name: #starts::NODE_NAME })?),*], #last)
             }
         }
     }.into()
@@ -1396,9 +1396,9 @@ pub fn feature(args: TokenStream, input: TokenStream) -> TokenStream {
     quote! {
         #item
         impl #impl_generics #ident #ty_generics #where_clause {
-            pub fn register_feature(interfaces: &::hammer_service::interface::InterfaceMain, nodes: &::hammer_runtime::NodeMain) -> Result<(), ::hammer_service::interface::feature::FeatureError> {
-                let node = nodes.node_by_name(Self::NODE_NAME).ok_or(::hammer_service::interface::feature::FeatureError::NodeNotFound { name: Self::NODE_NAME })?;
-                interfaces.register_feature(#arc::FEATURE_ARC_NAME, Self::NODE_NAME, node, &[#(#before::NODE_NAME),*], &[#(#after::NODE_NAME),*])
+            pub fn register_feature(features: &::hammer_service::feature::FeatureMain, nodes: &::hammer_runtime::NodeMain) -> Result<(), ::hammer_service::feature::FeatureError> {
+                let node = nodes.node_by_name(Self::NODE_NAME).ok_or(::hammer_service::feature::FeatureError::NodeNotFound { name: Self::NODE_NAME })?;
+                features.register_feature(#arc::FEATURE_ARC_NAME, Self::NODE_NAME, node, &[#(#before::NODE_NAME),*], &[#(#after::NODE_NAME),*])
             }
         }
     }.into()
