@@ -4,6 +4,7 @@ use std::collections::BTreeMap;
 use hammer_runtime::RuntimeResult;
 
 use super::dpo::DpoId;
+use super::fib_node::{FibNode, FibNodeSibling, FibNodeType};
 
 /// Baked reverse-path interfaces. Published lists are immutable and shared by
 /// path lists and load-balances, independently of their DPO child references.
@@ -98,36 +99,140 @@ impl super::NetMain {
     }
 }
 
+#[repr(transparent)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub enum FibSourceBehavior {
-    Drop,
-    Api,
-    Simple,
-    RecursiveResolution,
-    Interface,
-    Interpose,
-    Adjacency,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub struct FibSource {
-    pub id: u8,
-    pub priority: u8,
-    pub behavior: FibSourceBehavior,
-}
+pub struct FibSource(u8);
 
 impl FibSource {
-    pub const API: Self = Self {
-        id: 0,
-        priority: 0x80,
-        behavior: FibSourceBehavior::Api,
-    };
+    pub const INVALID: Self = Self(0);
+    pub const INTERFACE: Self = Self(4);
+    pub const API: Self = Self(8);
+    pub const ADJACENCY: Self = Self(15);
+    pub const ATTACHED_EXPORT: Self = Self(17);
 
-    pub const INTERFACE: Self = Self {
-        id: 1,
-        priority: 0x03,
-        behavior: FibSourceBehavior::Interface,
-    };
+    pub const fn new(value: u8) -> Self {
+        Self(value)
+    }
+    pub const fn get(self) -> u8 {
+        self.0
+    }
+}
+
+#[repr(transparent)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FibEntrySourceBehaviorId(u8);
+
+impl FibEntrySourceBehaviorId {
+    pub const SIMPLE: Self = Self(0);
+    pub const API: Self = Self(1);
+    pub const INTERFACE: Self = Self(2);
+    pub const ADJACENCY: Self = Self(3);
+    pub const fn get(self) -> u8 {
+        self.0
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FibSourceRegistration {
+    pub name: &'static str,
+    pub priority: u8,
+    pub priority_slot: u8,
+    pub behavior: FibEntrySourceBehaviorId,
+}
+
+impl FibSourceRegistration {
+    pub const fn new(name: &'static str, priority: u8, behavior: FibEntrySourceBehaviorId) -> Self {
+        Self {
+            name,
+            priority,
+            priority_slot: 0,
+            behavior,
+        }
+    }
+}
+
+pub struct FibSourceMain {
+    registrations: Vec<Option<FibSourceRegistration>>,
+    next_source: u8,
+    priority_slots: [u8; 256],
+}
+
+impl Default for FibSourceMain {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl FibSourceMain {
+    pub fn new() -> Self {
+        Self {
+            registrations: Vec::new(),
+            next_source: 22,
+            priority_slots: [0; 256],
+        }
+    }
+
+    pub fn register(
+        &mut self,
+        source: FibSource,
+        mut registration: FibSourceRegistration,
+    ) -> FibSource {
+        let index = usize::from(source.get());
+        assert_ne!(
+            source,
+            FibSource::INVALID,
+            "invalid FIB source cannot register"
+        );
+        if self.registrations.len() <= index {
+            self.registrations.resize(index + 1, None);
+        }
+        let slot = &mut self.priority_slots[registration.priority as usize];
+        registration.priority_slot = *slot;
+        *slot = slot
+            .checked_add(1)
+            .expect("FIB priority slot space exhausted");
+        self.registrations[index] = Some(registration);
+        source
+    }
+
+    pub fn allocate(&mut self, registration: FibSourceRegistration) -> FibSource {
+        if self.next_source == u8::MAX {
+            return FibSource::INVALID;
+        }
+        let source = FibSource::new(self.next_source);
+        self.next_source += 1;
+        self.register(source, registration)
+    }
+
+    pub fn registration(&self, source: FibSource) -> FibSourceRegistration {
+        self.registrations
+            .get(usize::from(source.get()))
+            .and_then(|entry| *entry)
+            .expect("FIB source must be registered before a route is added")
+    }
+}
+
+#[derive(hammer_component_macros::FibSource)]
+#[fib_source(source = FibSource::INTERFACE, name = "interface", priority = 0x03, behavior = FibEntrySourceBehaviorId::INTERFACE)]
+struct InterfaceSourceRegistration;
+
+#[derive(hammer_component_macros::FibSource)]
+#[fib_source(source = FibSource::API, name = "api", priority = 0x80, behavior = FibEntrySourceBehaviorId::API)]
+struct ApiSourceRegistration;
+
+#[derive(hammer_component_macros::FibSource)]
+#[fib_source(source = FibSource::ADJACENCY, name = "adjacency", priority = 0xd0, behavior = FibEntrySourceBehaviorId::ADJACENCY)]
+struct AdjacencySourceRegistration;
+
+#[derive(hammer_component_macros::FibSource)]
+#[fib_source(source = FibSource::ATTACHED_EXPORT, name = "attached-export", priority = 0xf0, behavior = FibEntrySourceBehaviorId::SIMPLE)]
+struct AttachedExportSourceRegistration;
+
+pub fn register_fib_sources(main: &mut FibSourceMain) {
+    InterfaceSourceRegistration::register_fib_source(main);
+    ApiSourceRegistration::register_fib_source(main);
+    AdjacencySourceRegistration::register_fib_source(main);
+    AttachedExportSourceRegistration::register_fib_source(main);
 }
 
 bitflags::bitflags! {
@@ -176,8 +281,18 @@ bitflags::bitflags! {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct FibPath<N, F> {
+#[repr(u8)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum FibPathMode {
+    AttachedNextHop = 0,
+    Attached = 1,
+    Special = 3,
+    Receive = 8,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FibRoutePath<P, N, F> {
+    pub connected: Option<P>,
     pub sw_if_index: u32,
     pub table_id: u32,
     pub rpf_id: u32,
@@ -187,19 +302,41 @@ pub struct FibPath<N, F> {
     pub next_hop: N,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct FibPathExt<N, F, E> {
-    pub path: FibPath<N, F>,
-    pub path_index: u32,
+pub struct FibPath<P, N, F> {
+    node: FibNode,
+    path_list_index: u32,
+    sibling: Option<FibNodeSibling>,
+    forwarding: Option<DpoId>,
+    resolved: bool,
+    mode: FibPathMode,
+    route: FibRoutePath<P, N, F>,
+}
+
+impl<P: Clone, N: Clone, F: Clone> FibPath<P, N, F> {
+    fn copy_configuration(&self, node_type: FibNodeType, path_list_index: u32) -> Self {
+        Self {
+            node: FibNode::new(node_type),
+            path_list_index,
+            sibling: None,
+            forwarding: None,
+            resolved: false,
+            mode: self.mode,
+            route: self.route.clone(),
+        }
+    }
+}
+
+pub struct FibPathExt<P, N, F, E> {
+    pub route: FibRoutePath<P, N, F>,
+    pub path_index: Option<u32>,
     pub data: E,
 }
 
-#[derive(Debug, Clone)]
-pub struct FibPathExtList<N, F, E> {
-    entries: Vec<FibPathExt<N, F, E>>,
+pub struct FibPathExtList<P, N, F, E> {
+    entries: Vec<FibPathExt<P, N, F, E>>,
 }
 
-impl<N, F, E> Default for FibPathExtList<N, F, E> {
+impl<P, N, F, E> Default for FibPathExtList<P, N, F, E> {
     fn default() -> Self {
         Self {
             entries: Vec::new(),
@@ -207,8 +344,8 @@ impl<N, F, E> Default for FibPathExtList<N, F, E> {
     }
 }
 
-impl<N, F, E> FibPathExtList<N, F, E> {
-    pub fn insert(&mut self, extension: FibPathExt<N, F, E>) {
+impl<P, N, F, E> FibPathExtList<P, N, F, E> {
+    pub fn insert(&mut self, extension: FibPathExt<P, N, F, E>) {
         if let Some(current) = self
             .entries
             .iter_mut()
@@ -220,21 +357,21 @@ impl<N, F, E> FibPathExtList<N, F, E> {
         }
     }
 
-    pub fn remove(&mut self, path_index: u32) -> Option<FibPathExt<N, F, E>> {
+    pub fn remove(&mut self, path_index: u32) -> Option<FibPathExt<P, N, F, E>> {
         let position = self
             .entries
             .iter()
-            .position(|entry| entry.path_index == path_index)?;
+            .position(|entry| entry.path_index == Some(path_index))?;
         Some(self.entries.remove(position))
     }
 
-    pub fn find(&self, path_index: u32) -> Option<&FibPathExt<N, F, E>> {
+    pub fn find(&self, path_index: u32) -> Option<&FibPathExt<P, N, F, E>> {
         self.entries
             .iter()
-            .find(|entry| entry.path_index == path_index)
+            .find(|entry| entry.path_index == Some(path_index))
     }
 
-    pub fn iter(&self) -> impl ExactSizeIterator<Item = &FibPathExt<N, F, E>> {
+    pub fn iter(&self) -> impl ExactSizeIterator<Item = &FibPathExt<P, N, F, E>> {
         self.entries.iter()
     }
 
@@ -243,21 +380,18 @@ impl<N, F, E> FibPathExtList<N, F, E> {
     }
 }
 
-#[derive(Debug, Clone)]
-pub struct FibEntrySrc<N, F, SourceData, PathExt> {
-    pub path_exts: FibPathExtList<N, F, PathExt>,
+pub struct FibEntrySrc<S, P, N, F, E> {
+    pub path_exts: FibPathExtList<P, N, F, E>,
     pub path_list: Option<u32>,
     pub entry_flags: FibEntryFlags,
     pub source: FibSource,
     pub flags: FibEntrySrcFlags,
     pub ref_count: u8,
-    pub cover: Option<(u32, u32)>,
-    pub interpose_dpo: Option<DpoId>,
-    pub source_data: SourceData,
+    pub source_state: S,
 }
 
-impl<N, F, SourceData, PathExt> FibEntrySrc<N, F, SourceData, PathExt> {
-    pub fn new(source: FibSource, source_data: SourceData) -> Self {
+impl<S, P, N, F, E> FibEntrySrc<S, P, N, F, E> {
+    pub fn new(source: FibSource, source_state: S) -> Self {
         Self {
             path_exts: FibPathExtList::default(),
             path_list: None,
@@ -265,9 +399,7 @@ impl<N, F, SourceData, PathExt> FibEntrySrc<N, F, SourceData, PathExt> {
             source,
             flags: FibEntrySrcFlags::ADDED,
             ref_count: 1,
-            cover: None,
-            interpose_dpo: None,
-            source_data,
+            source_state,
         }
     }
 
@@ -289,25 +421,21 @@ impl<N, F, SourceData, PathExt> FibEntrySrc<N, F, SourceData, PathExt> {
 }
 
 #[derive(Debug)]
-pub struct FibPathList<N, F> {
-    pub paths: Vec<FibPath<N, F>>,
-    pub key_flags: FibPathListFlags,
-    pub flags: FibPathListFlags,
-    pub source_count: u32,
-    pub child_count: u32,
-    pub children: Vec<(u16, u32)>,
+pub struct FibPathList {
+    node: FibNode,
+    paths: Vec<u32>,
+    key_flags: FibPathListFlags,
+    flags: FibPathListFlags,
     urpf_index: Option<u32>,
 }
 
-impl<N, F> FibPathList<N, F> {
-    pub fn new(paths: Vec<FibPath<N, F>>, key_flags: FibPathListFlags) -> Self {
+impl FibPathList {
+    pub fn new(node_type: FibNodeType, paths: Vec<u32>, key_flags: FibPathListFlags) -> Self {
         Self {
+            node: FibNode::new(node_type),
             paths,
             key_flags,
             flags: key_flags,
-            source_count: 0,
-            child_count: 0,
-            children: Vec::new(),
             urpf_index: None,
         }
     }
@@ -336,8 +464,9 @@ impl<N, F> FibPathList<N, F> {
     }
 }
 
-impl<N, F> Drop for FibPathList<N, F> {
+impl Drop for FibPathList {
     fn drop(&mut self) {
+        self.node.assert_detached();
         if let Some(index) = self.urpf_index {
             super::NetMain::global()
                 .expect("FIB owner must outlive its path lists")
@@ -575,7 +704,7 @@ where
                         net.unlock_dpo(old);
                     }
                 }
-                Ok(true)
+                Ok(source_removed)
             }
             Err(error) => {
                 (
@@ -627,7 +756,12 @@ where
             self.entries[entry as usize].sources.push((source, entry));
             self.entries[entry as usize]
                 .sources
-                .sort_by_key(|(candidate, _)| candidate.priority);
+                .sort_by_key(|(candidate, _)| {
+                    let registration = super::NetMain::global()
+                        .expect("FIB source requires network Main")
+                        .fib_source(*candidate);
+                    (registration.priority, registration.priority_slot)
+                });
         }
         Ok(entry)
     }
@@ -647,7 +781,7 @@ where
         };
         let key = (entry, source);
         let Some(references) = self.source_references.get_mut(&key) else {
-            return Err(FibError::SourceMissing);
+            return Ok(false);
         };
         if *references > 1 {
             *references -= 1;
@@ -693,8 +827,6 @@ pub enum FibError<E: std::error::Error + 'static> {
     Runtime(#[from] hammer_runtime::RuntimeError),
     #[error("FIB source reference count overflow")]
     ReferenceCountOverflow,
-    #[error("FIB source is not registered for this entry")]
-    SourceMissing,
     #[error("FIB backend mutation failed")]
     Backend(#[source] E),
     #[error("FIB entry count {count} exceeds the index representation")]
@@ -706,15 +838,29 @@ mod tests {
     use super::*;
 
     #[test]
+    fn source_priority_slots_are_unique_within_a_class() {
+        let mut sources = FibSourceMain::new();
+        let registration = FibSourceRegistration::new("route", 0x80, FibEntrySourceBehaviorId::API);
+        let earlier = sources.allocate(registration);
+        let later = sources.allocate(registration);
+        assert_eq!((earlier.get(), later.get()), (22, 23));
+        assert_eq!(sources.registration(earlier).priority_slot, 0);
+        assert_eq!(sources.registration(later).priority_slot, 1);
+        sources.register(earlier, registration);
+        assert_eq!(sources.registration(earlier).priority_slot, 2);
+    }
+
+    #[test]
     fn source_record_retains_references_and_replaces_extensions() {
         let source = FibSource::API;
-        let mut record = FibEntrySrc::<u32, u8, u16, u16>::new(source, 7);
+        let mut record = FibEntrySrc::<u32, (), u8, u16, u16>::new(source, 7);
         assert_eq!(record.ref_count, 1);
         assert!(record.add_reference());
         assert_eq!(record.ref_count, 2);
         assert!(record.remove_reference());
         assert_eq!(record.ref_count, 1);
-        let path = FibPath {
+        let route = FibRoutePath {
+            connected: None,
             sw_if_index: 3,
             table_id: 4,
             rpf_id: 5,
@@ -724,13 +870,13 @@ mod tests {
             next_hop: 10,
         };
         record.path_exts.insert(FibPathExt {
-            path,
-            path_index: 9,
+            route: route.clone(),
+            path_index: Some(9),
             data: 1,
         });
         record.path_exts.insert(FibPathExt {
-            path,
-            path_index: 9,
+            route,
+            path_index: Some(9),
             data: 2,
         });
         assert_eq!(record.path_exts.iter().len(), 1);

@@ -1,6 +1,6 @@
 # ADR-0029: VPP 风格 IP interface admin 与地址路由生命周期
 
-Status: proposed
+Status: accepted
 
 Date: 2026-09-19
 
@@ -703,7 +703,12 @@ pub type FibNodeChildren = fn(index: u32) -> FibNodeList;
 pub type FibNodeSetChildren = fn(index: u32, children: FibNodeList);
 pub type FibNodeLastLock = fn(index: u32);
 pub type FibNodeBackWalk =
-    fn(index: u32, context: &mut FibNodeBackWalkContext) -> FibNodeBackWalkResult;
+    fn(
+        nodes: &mut FibNodeMain,
+        main: &mut DataPlaneMain,
+        index: u32,
+        context: &mut FibNodeBackWalkContext,
+    ) -> FibNodeBackWalkResult;
 pub type FibNodeMemory = fn() -> (usize, usize, usize);
 
 pub struct FibNodeOperations {
@@ -764,14 +769,20 @@ impl FibNodeMain {
     pub fn child_count(&self, parent: FibNodePtr) -> u32;
     pub fn lock(&mut self, node: FibNodePtr);
     pub fn unlock(&mut self, node: FibNodePtr);
-    pub fn walk_sync(&mut self, parent: FibNodePtr, context: &mut FibNodeBackWalkContext);
+    pub fn walk_sync(
+        &mut self,
+        main: &mut DataPlaneMain,
+        parent: FibNodePtr,
+        context: &mut FibNodeBackWalkContext,
+    );
     pub fn walk_async(
         &mut self,
+        main: &mut DataPlaneMain,
         parent: FibNodePtr,
         priority: FibWalkPriority,
         context: FibNodeBackWalkContext,
     );
-    pub fn run_queued_walks(&mut self, budget: usize) -> usize;
+    pub fn run_queued_walks(&mut self, main: &mut DataPlaneMain, budget: usize) -> usize;
 }
 
 impl FibNode {
@@ -780,6 +791,14 @@ impl FibNode {
     pub fn unlock(&mut self) -> bool;
 }
 ```
+
+VPP `fib_path_back_walk_notify`（`third_party/vpp/src/vnet/fib/fib_path.c:955-1015`）
+在回走时重新解析DPO并继续通知path-list；VPP内部可获取process-global execution main。
+Hammer不能从静态回调重新借隐藏的可变`DataPlaneMain`，也不能在持有service图owner的
+`RefCell`可变借用时再次借同一owner。因此注册的回调显式接收现有route/event调用的
+`&mut DataPlaneMain`及临时重借的`&mut FibNodeMain`；后续递归walk沿这两个借用继续，
+不能在回调中再次调用`NetMain::fib_nodes_mut()`或缓存owner引用。静态表只保存函数指针，
+不保存借用，不改变plugin state所有权。
 
 `child_add`经registered operations定位parent，先增加parent lock并惰性创建list；`child_remove`移除
 sibling、在空list时释放head，再释放parent lock。`FibNodeMain::unlock`调用registered `unlock`，
@@ -868,8 +887,10 @@ pub struct AdjacencyNeighborMain<P: FibProtocol> {
 }
 ```
 
-`P::Address`、`P::Prefix`和`P::Link`直接成为`HashMap` key/object field；没有`Ip46Address` conversion、encoded byte
-buffer、hash-only identity、opaque index或第二次lookup。泛型只产生static dispatch，不作`dyn`使用、不进入
+`P::Address`、`P::Prefix`和`P::Link`直接成为`HashMap` key；DB identity没有`Ip46Address` conversion、encoded
+byte buffer、hash-only identity、opaque index或第二次lookup。只有IP plugin内部的concrete adjacency union为
+对齐VPP object layout保存`Ip46Address`，IPv4/IPv6通过union field assignment构造，不经过byte-slice copy。
+泛型只产生static dispatch，不作`dyn`使用、不进入
 registry，也不保存plugin引用。IPv4/IPv6 node仍分别构造，每个concrete `P`只绑定自己的三个node。
 IP插件定义`IpNetLink`并供IP4/IP6实现复用；其它协议模块各自定义link类型，不能把
 IP4/IP6/MPLS/以太网/ARP的variant或`FOR_EACH_VNET_LINK`表放进service `net`。
@@ -1502,22 +1523,22 @@ impl IpNetLink {
 impl FibProtocol for Ip4FibProtocol {
     type Address = Ipv4Addr;
     type Prefix = Ipv4Net;
-    type AdjacencySubtype = Ip4AdjacencySubtype;
+    type AdjacencySubtype = IpAdjacency;
     type Link = IpNetLink;
     const ID: FibProtocolId = FibProtocolId::IP4;
     const DPO_PROTOCOL: DpoProto = DpoProto::IP4;
     fn prefix_address(prefix: Ipv4Net) -> Ipv4Addr { prefix.addr() }
     fn zero_address() -> Ipv4Addr { Ipv4Addr::UNSPECIFIED }
-    fn glean_subtype(connected: Ipv4Net) -> Ip4AdjacencySubtype {
-        Ip4AdjacencySubtype::glean(connected)
+    fn glean_subtype(connected: Ipv4Net) -> IpAdjacency {
+        IpAdjacency::ip4_glean(connected)
     }
-    fn neighbor_subtype(next_hop: Ipv4Addr) -> Ip4AdjacencySubtype {
-        Ip4AdjacencySubtype::neighbor(next_hop)
+    fn neighbor_subtype(next_hop: Ipv4Addr) -> IpAdjacency {
+        IpAdjacency::ip4_neighbor(next_hop)
     }
-    fn glean_prefix(subtype: &Ip4AdjacencySubtype) -> Ipv4Net { subtype.glean_prefix() }
-    fn neighbor_address(subtype: &Ip4AdjacencySubtype) -> Ipv4Addr { subtype.neighbor_address() }
-    fn set_glean_source(subtype: &mut Ip4AdjacencySubtype, source: Ipv4Addr) {
-        subtype.set_glean_source(source);
+    fn glean_prefix(subtype: &IpAdjacency) -> Ipv4Net { subtype.ip4_glean_prefix() }
+    fn neighbor_address(subtype: &IpAdjacency) -> Ipv4Addr { subtype.ip4_neighbor_address() }
+    fn set_glean_source(subtype: &mut IpAdjacency, source: Ipv4Addr) {
+        subtype.set_ip4_glean_source(source);
     }
     fn dpo_protocol(link: IpNetLink) -> DpoProto { link.dpo_protocol() }
     fn mtu_kind(link: IpNetLink) -> InterfaceMtuKind { link.mtu_kind() }
@@ -1530,22 +1551,22 @@ impl FibProtocol for Ip4FibProtocol {
 impl FibProtocol for Ip6FibProtocol {
     type Address = Ipv6Addr;
     type Prefix = Ipv6Net;
-    type AdjacencySubtype = Ip6AdjacencySubtype;
+    type AdjacencySubtype = IpAdjacency;
     type Link = IpNetLink;
     const ID: FibProtocolId = FibProtocolId::IP6;
     const DPO_PROTOCOL: DpoProto = DpoProto::IP6;
     fn prefix_address(prefix: Ipv6Net) -> Ipv6Addr { prefix.addr() }
     fn zero_address() -> Ipv6Addr { Ipv6Addr::UNSPECIFIED }
-    fn glean_subtype(connected: Ipv6Net) -> Ip6AdjacencySubtype {
-        Ip6AdjacencySubtype::glean(connected)
+    fn glean_subtype(connected: Ipv6Net) -> IpAdjacency {
+        IpAdjacency::ip6_glean(connected)
     }
-    fn neighbor_subtype(next_hop: Ipv6Addr) -> Ip6AdjacencySubtype {
-        Ip6AdjacencySubtype::neighbor(next_hop)
+    fn neighbor_subtype(next_hop: Ipv6Addr) -> IpAdjacency {
+        IpAdjacency::ip6_neighbor(next_hop)
     }
-    fn glean_prefix(subtype: &Ip6AdjacencySubtype) -> Ipv6Net { subtype.glean_prefix() }
-    fn neighbor_address(subtype: &Ip6AdjacencySubtype) -> Ipv6Addr { subtype.neighbor_address() }
-    fn set_glean_source(subtype: &mut Ip6AdjacencySubtype, source: Ipv6Addr) {
-        subtype.set_glean_source(source);
+    fn glean_prefix(subtype: &IpAdjacency) -> Ipv6Net { subtype.ip6_glean_prefix() }
+    fn neighbor_address(subtype: &IpAdjacency) -> Ipv6Addr { subtype.ip6_neighbor_address() }
+    fn set_glean_source(subtype: &mut IpAdjacency, source: Ipv6Addr) {
+        subtype.set_ip6_glean_source(source);
     }
     fn dpo_protocol(link: IpNetLink) -> DpoProto { link.dpo_protocol() }
     fn mtu_kind(link: IpNetLink) -> InterfaceMtuKind { link.mtu_kind() }
@@ -3607,7 +3628,45 @@ add helper使用仍在pool中的`if_address_index`；delete helper只接收删�
 | D34 | `FibSource`是1-byte identity；fixed值INTERFACE/API/IP6_ND/ADJ/AE为4/8/14/15/17；dynamic cursor固定从22开始且不受fixed registration顺序影响 | 对齐`fib_source.h:19-135`与`fib_source.c:11,107-132`；撤回扫描fixed identities推进cursor的错误设计 |
 | D35 | `LinkType`不在service net定义；`FibProtocol::Link`由concrete模块提供，IP plugin定义`IpNetLink`，generic ADJ只保存`P::Link`并扫描已有typed DB key；DPO/MTU/rewrite映射由IP static methods承担，hw class只收EtherType/输出bytes；其它模块各自拥有link身份，跨模块与同一IP next-hop的组合仍需单独证明 | V59和H9；保留VPP key、事件和rewrite语义，不复制其全局C enum或把`DpoProto`改名冒充link |
 
-## 14. Vendored VPP复审结论
+## 14. `fib_walk_process` 与 Hammer Process Node
+
+`FibNodeMain::run_queued_walks`不是一个孤立的后台线程。它对应 VPP
+`third_party/vpp/src/vnet/fib/fib_walk.c` 中的 `fib_walk_process_queues()`（451-511）以及
+`fib_walk_process()`（550-604）。VPP 的 `fib_walk_async()`（676-729）只把 walk 放入 HIGH/LOW
+queue 并通过 `vlib_process_signal_event()` 唤醒 `fib_walk_process_node`（647-670）；真正消费
+queue 的是这个 process node，而不是触发 ADJ 事件的调用者。
+
+Hammer 的对应关系固定如下：
+
+```text
+Adjacency/Path event
+  -> FibNodeMain::walk_async(priority, context)
+  -> HIGH/LOW FibNodeMain queue
+  -> fib-walk Process Node event
+  -> FibNodeMain::run_queued_walks(main, quota)
+  -> FibNodeMain::advance_walk / child back-walk
+```
+
+Process Node 使用现有 `hammer-runtime` 的 Tokio process contract：构造函数只取得
+`&mut DataPlaneMain`，注册一个 process event receiver，然后在事件到达时让 thread-zero 的
+process scheduler 运行一个 bounded queue drain；每次 drain 只处理固定 quota，未完成的 walk
+保持在原 queue 中并重新等待事件/短 timer。它不创建第二个 worker、锁、线程或全局回调表。
+
+`FibNodeMain::walk_async` 的实现合同因此是：
+
+1. 建立 walk node、parent sibling 和 priority queue sibling；
+2. 同一次 queue 从空变为非空时只发送一次 process event；
+3. `run_queued_walks` 按 HIGH 后 LOW 顺序调用 `advance_walk`，每次最多消耗 quota；
+4. queue 仍有工作时 process 使用短 timer 继续调度，空 queue 时挂起等待下一次 signal；
+5. `FORCE_SYNC` 永远绕过 queue，直接调用 `walk_sync`，因此 admin-down 的语义不受 Tokio
+   调度延迟影响。
+
+这里的 process 是 VPP `fib_walk_process_node` 的调度等价物；`run_queued_walks` 是其 queue
+drain 内核，不是另一种 walk API。当前 admin up/down、address add/delete 路径只使用同步
+walk；MTU 的 LOW walk 由该 process 消费。Process Node 不参与 packet graph，也不拥有 FIB、ADJ
+或 DPO 对象。
+
+## 15. Vendored VPP复审结论
 
 本节是在上述修订写入后重新读取vendored VPP得到的设计审查，不以旧ADR或当前draft Rust实现反推
 语义。`specified`表示ADR已写清源码合同；`implementation pending`表示Rust代码仍需按合同实现，
@@ -3644,7 +3703,10 @@ DB、DPO、rewrite、walk和错误形状都有源码证据。Rust concrete compo
 `P::AdjacencySubtype`的静态操作也已在4.6.6固定了owner、借用和注册边界；它们是实现合同，不再是设计阻断，
 更不能用第二个对象索引补洞。
 
-**Design review verdict: Contract aligned; Rust implementation pending.** 4.6.6的concrete typed composition owner及
-subtype静态操作已确定；实现仍须依次通过FIB prerequisite、ADJ registration/lifecycle和interface route测试gate。
+**Design review verdict: Accepted for implementation.** 本 ADR 的交付范围是现有 interface address
+生命周期、software-interface admin up/down、FIB interface source、ADJ/DPO route projection 和
+tuntap 所需 callback；ARP/ND packet generation、neighbor completion producer、BFD provider 与
+midchain/mcast forwarding 继续延期。延期能力不得改变本文已实现的 FIB/ADJ/DPO owner、walk、
+错误和 route 生命周期合同。
 ARP/ND packet generation、neighbor completion producer、BFD provider及midchain/mcast forwarding继续延期，但这些延期
 不允许省略generic ADJ framework、delegate、P2P、child/back-walk、ADJ FES或tuntap callback链。

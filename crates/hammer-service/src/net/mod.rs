@@ -8,8 +8,14 @@ use hammer_runtime::{DataPlaneMain, RuntimeError, RuntimeResult};
 
 use crate::interface::InterfaceMain;
 
+pub mod adj;
+pub mod adj_delegate;
+pub mod adj_glean;
+pub mod adj_nbr;
 pub mod dpo;
 pub mod fib;
+pub mod fib_node;
+pub mod rewrite;
 pub mod throttle;
 
 pub use dpo::{
@@ -19,8 +25,8 @@ pub use dpo::{
 };
 pub use fib::{
     FibEntry, FibEntryFlags, FibEntrySrc, FibEntrySrcFlags, FibPath, FibPathExt, FibPathExtList,
-    FibPathList, FibPathListFlags, FibSource, FibSourceBehavior, FibTable, FibTableBackend,
-    FibUrpfList,
+    FibPathList, FibPathListFlags, FibPathMode, FibRoutePath, FibSource, FibSourceMain, FibTable,
+    FibTableBackend, FibUrpfList,
 };
 
 /// Network family used by dial/listen paths.
@@ -98,6 +104,9 @@ pub struct NetMain {
     load_balances: RefCell<Pool<LoadBalanceDpo>>,
     replicates: RefCell<Pool<ReplicateDpo>>,
     urpf_lists: RefCell<Pool<FibUrpfList>>,
+    fib_nodes: RefCell<fib_node::FibNodeMain>,
+    adjacency_delegates: RefCell<adj_delegate::AdjacencyDelegateMain>,
+    fib_sources: RefCell<fib::FibSourceMain>,
     local_interface_hw_index: u32,
     local_interface_sw_index: u32,
 }
@@ -134,12 +143,17 @@ impl NetMain {
             .set_interface_name(local_hw, "local0")
             .map_err(RuntimeError::from)?;
         let local_sw = interface_main.hardware_interface(local_hw).sw_if_index;
+        let mut fib_sources = fib::FibSourceMain::new();
+        fib::register_fib_sources(&mut fib_sources);
         let shared = Arc::new(NetMain {
             interface_main,
             dpo_main: RefCell::new(DpoMain::new()),
             load_balances: RefCell::new(Pool::new()),
             replicates: RefCell::new(Pool::new()),
             urpf_lists: RefCell::new(Pool::new()),
+            fib_nodes: RefCell::new(fib_node::FibNodeMain::default()),
+            adjacency_delegates: RefCell::new(adj_delegate::AdjacencyDelegateMain::default()),
+            fib_sources: RefCell::new(fib_sources),
             local_interface_hw_index: local_hw,
             local_interface_sw_index: local_sw,
         });
@@ -190,6 +204,28 @@ impl NetMain {
 
     pub fn interface_main(&self) -> &InterfaceMain {
         &self.interface_main
+    }
+
+    pub fn fib_nodes_mut(&self) -> RefMut<'_, fib_node::FibNodeMain> {
+        hammer_runtime::ensure_main_thread_with_barrier()
+            .expect("FIB graph mutation requires publication ownership");
+        self.fib_nodes.borrow_mut()
+    }
+
+    pub fn fib_source(&self, source: FibSource) -> fib::FibSourceRegistration {
+        self.fib_sources.borrow().registration(source)
+    }
+
+    pub fn fib_sources_mut(&self) -> RefMut<'_, fib::FibSourceMain> {
+        hammer_runtime::ensure_main_thread_with_barrier()
+            .expect("FIB source registration requires publication ownership");
+        self.fib_sources.borrow_mut()
+    }
+
+    pub fn adjacency_delegates_mut(&self) -> RefMut<'_, adj_delegate::AdjacencyDelegateMain> {
+        hammer_runtime::ensure_main_thread_with_barrier()
+            .expect("adjacency delegate mutation requires publication ownership");
+        self.adjacency_delegates.borrow_mut()
     }
     pub fn dpo_main(&self) -> Ref<'_, DpoMain> {
         hammer_runtime::ensure_main_thread().expect("DPO registry reads require the main thread");
@@ -331,6 +367,18 @@ impl NetMain {
         if let Some(unlock) = unlock {
             unlock(dpo);
         }
+    }
+
+    pub fn copy_dpo(&self, destination: &mut DpoId, source: DpoId) {
+        hammer_runtime::ensure_main_thread_with_barrier()
+            .expect("DPO replacement requires publication ownership");
+        self.lock_dpo(source);
+        let old = std::mem::replace(destination, source);
+        self.unlock_dpo(old);
+    }
+
+    pub fn reset_dpo(&self, destination: &mut DpoId) {
+        self.copy_dpo(destination, DpoId::INVALID);
     }
 
     pub fn create_load_balance(

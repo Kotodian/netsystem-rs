@@ -1,3 +1,4 @@
+use ipnet::{Ipv4Net, Ipv6Net};
 use std::cell::{RefCell, UnsafeCell};
 use std::collections::HashMap;
 use std::hash::Hash;
@@ -10,9 +11,13 @@ use hammer_service::net::throttle::Throttle;
 use hammer_core::data_plane::{Frame, NodeId, NodeNext};
 use hammer_infra::pool::Pool;
 use hammer_runtime::{DataPlaneMain, Node, NodeProcessFn, NodeRuntime, RuntimeResult};
+use hammer_service::net::adj::AdjacencyMain;
+use hammer_service::net::adj_glean::AdjacencyGleanMain;
+use hammer_service::net::adj_nbr::AdjacencyNeighborMain;
 use hammer_service::net::{DpoId, DpoProto, DpoType, NetMain};
 use hammer_service::opaque::NetworkOpaque;
 
+use crate::adjacency::{Ip4FibProtocol, Ip6FibProtocol};
 use crate::fib::{Ip4FibTable, Ip6FibTable};
 use crate::interface::IpInterfaceAddressCallback;
 use crate::ip::ip_header;
@@ -33,23 +38,36 @@ pub(crate) struct IpInterfaceAddress<A> {
     pub(crate) prev_this_sw_interface: Option<u32>,
 }
 
-pub(crate) struct IpLookupMain<A> {
+pub(crate) struct IpInterfacePrefix<P, S> {
+    pub(crate) prefix: P,
+    pub(crate) sw_if_index: u32,
+    pub(crate) reference_count: u32,
+    pub(crate) source: S,
+}
+
+pub(crate) struct IpLookupMain<A, P, S> {
     pub(crate) interface_addresses: Pool<IpInterfaceAddress<A>>,
     pub(crate) interface_address_index_by_key: HashMap<IpInterfaceAddressKey<A>, u32>,
     pub(crate) interface_address_head_by_sw_if_index: Vec<Option<u32>>,
+    pub(crate) interface_prefixes: Pool<IpInterfacePrefix<P, S>>,
+    pub(crate) interface_prefix_index_by_key: HashMap<(P, u32), u32>,
     pub(crate) unicast_feature_arc_index: u8,
     pub(crate) local_next_by_ip_protocol: [u16; 256],
 }
 
-impl<A> IpLookupMain<A>
+impl<A, P, S> IpLookupMain<A, P, S>
 where
     A: Copy + Eq + Hash,
+    P: Copy + Eq + Hash,
+    S: Copy,
 {
     fn new(punt_next: u16) -> Self {
         Self {
             interface_addresses: Pool::new(),
             interface_address_index_by_key: HashMap::new(),
             interface_address_head_by_sw_if_index: Vec::new(),
+            interface_prefixes: Pool::new(),
+            interface_prefix_index_by_key: HashMap::new(),
             unicast_feature_arc_index: u8::MAX,
             local_next_by_ip_protocol: [punt_next; 256],
         }
@@ -130,25 +148,90 @@ where
         );
         address
     }
+
+    pub(crate) fn lock_interface_prefix(&mut self, prefix: P, sw_if_index: u32, source: S) -> bool {
+        if let Some(&index) = self
+            .interface_prefix_index_by_key
+            .get(&(prefix, sw_if_index))
+        {
+            let record = self
+                .interface_prefixes
+                .get_mut(index)
+                .expect("interface prefix DB names a live record");
+            record.reference_count = record
+                .reference_count
+                .checked_add(1)
+                .expect("interface prefix reference count overflow");
+            return false;
+        }
+        let index = self.interface_prefixes.insert(IpInterfacePrefix {
+            prefix,
+            sw_if_index,
+            reference_count: 1,
+            source,
+        });
+        assert!(
+            self.interface_prefix_index_by_key
+                .insert((prefix, sw_if_index), index)
+                .is_none()
+        );
+        true
+    }
+
+    pub(crate) fn unlock_interface_prefix(&mut self, prefix: P, sw_if_index: u32) -> Option<bool> {
+        let Some(&index) = self
+            .interface_prefix_index_by_key
+            .get(&(prefix, sw_if_index))
+        else {
+            tracing::warn!(
+                sw_if_index,
+                "interface prefix record was not found for route withdrawal"
+            );
+            return None;
+        };
+        let record = self
+            .interface_prefixes
+            .get_mut(index)
+            .expect("interface prefix DB names a live record");
+        record.reference_count = record
+            .reference_count
+            .checked_sub(1)
+            .expect("interface prefix reference count underflow");
+        if record.reference_count != 0 {
+            return Some(false);
+        }
+        self.interface_prefix_index_by_key
+            .remove(&(prefix, sw_if_index));
+        self.interface_prefixes
+            .remove(index)
+            .expect("last prefix reference owns a live record");
+        Some(true)
+    }
 }
 
 pub struct Ip4Main {
+    pub(crate) adjacency: UnsafeCell<Option<AdjacencyMain<Ip4FibProtocol>>>,
+    pub(crate) glean: UnsafeCell<Option<AdjacencyGleanMain<Ip4FibProtocol>>>,
+    pub(crate) neighbor: UnsafeCell<Option<AdjacencyNeighborMain<Ip4FibProtocol>>>,
     pub(crate) local_feature_arc_index: UnsafeCell<u8>,
     pub(crate) punt_feature_arc_index: UnsafeCell<u8>,
     pub(crate) drop_feature_arc_index: UnsafeCell<u8>,
-    pub(crate) lookup_main: UnsafeCell<IpLookupMain<Ipv4Addr>>,
+    pub(crate) lookup_main: UnsafeCell<IpLookupMain<Ipv4Addr, Ipv4Net, u32>>,
     pub(crate) fib_index_by_sw_if_index: UnsafeCell<Vec<Option<u32>>>,
     pub(crate) ip_enabled_by_sw_if_index: UnsafeCell<Vec<u8>>,
     pub(crate) add_del_interface_address_callbacks:
         UnsafeCell<Vec<IpInterfaceAddressCallback<Ipv4Addr>>>,
     pub(crate) icmp_throttle: Vec<RefCell<Throttle>>,
     pub(crate) clock_origin: Instant,
-    unicast_tables: Vec<Ip4FibTable>,
+    pub(crate) unicast_tables: UnsafeCell<Vec<Ip4FibTable>>,
 }
 
 impl Ip4Main {
     pub fn new() -> Self {
         Self {
+            adjacency: UnsafeCell::new(None),
+            glean: UnsafeCell::new(None),
+            neighbor: UnsafeCell::new(None),
             local_feature_arc_index: UnsafeCell::new(u8::MAX),
             punt_feature_arc_index: UnsafeCell::new(u8::MAX),
             drop_feature_arc_index: UnsafeCell::new(u8::MAX),
@@ -160,7 +243,7 @@ impl Ip4Main {
             add_del_interface_address_callbacks: UnsafeCell::new(Vec::new()),
             icmp_throttle: Vec::new(),
             clock_origin: Instant::now(),
-            unicast_tables: vec![Ip4FibTable::new(Default::default())],
+            unicast_tables: UnsafeCell::new(vec![Ip4FibTable::new(Default::default())]),
         }
     }
 
@@ -175,29 +258,44 @@ impl Ip4Main {
 
     #[inline(always)]
     pub fn forwarding_dpo(&self, fib_index: u32, address: Ipv4Addr) -> Option<DpoId> {
-        self.unicast_tables
+        // SAFETY: route publication occurs under the worker barrier; packet
+        // lookup only reads the published table outside that scope.
+        unsafe { &*self.unicast_tables.get() }
             .get(fib_index as usize)
             .and_then(|table| table.forwarding_lookup(address))
+    }
+
+    pub(crate) fn fib_table_mut(&self, fib_index: u32) -> &mut Ip4FibTable {
+        // SAFETY: callers hold the main-thread publication scope.
+        unsafe { &mut *self.unicast_tables.get() }
+            .get_mut(fib_index as usize)
+            .expect("IP4 FIB mapping names an installed table")
     }
 }
 
 pub struct Ip6Main {
+    pub(crate) adjacency: UnsafeCell<Option<AdjacencyMain<Ip6FibProtocol>>>,
+    pub(crate) glean: UnsafeCell<Option<AdjacencyGleanMain<Ip6FibProtocol>>>,
+    pub(crate) neighbor: UnsafeCell<Option<AdjacencyNeighborMain<Ip6FibProtocol>>>,
     pub(crate) local_feature_arc_index: UnsafeCell<u8>,
     pub(crate) punt_feature_arc_index: UnsafeCell<u8>,
     pub(crate) drop_feature_arc_index: UnsafeCell<u8>,
-    pub(crate) lookup_main: UnsafeCell<IpLookupMain<Ipv6Addr>>,
+    pub(crate) lookup_main: UnsafeCell<IpLookupMain<Ipv6Addr, Ipv6Net, ()>>,
     pub(crate) fib_index_by_sw_if_index: UnsafeCell<Vec<Option<u32>>>,
     pub(crate) ip_enabled_by_sw_if_index: UnsafeCell<Vec<u8>>,
     pub(crate) add_del_interface_address_callbacks:
         UnsafeCell<Vec<IpInterfaceAddressCallback<Ipv6Addr>>>,
     pub(crate) icmp_throttle: Vec<RefCell<Throttle>>,
     pub(crate) clock_origin: Instant,
-    unicast_tables: Vec<Ip6FibTable>,
+    pub(crate) unicast_tables: UnsafeCell<Vec<Ip6FibTable>>,
 }
 
 impl Ip6Main {
     pub fn new() -> Self {
         Self {
+            adjacency: UnsafeCell::new(None),
+            glean: UnsafeCell::new(None),
+            neighbor: UnsafeCell::new(None),
             local_feature_arc_index: UnsafeCell::new(u8::MAX),
             punt_feature_arc_index: UnsafeCell::new(u8::MAX),
             drop_feature_arc_index: UnsafeCell::new(u8::MAX),
@@ -209,7 +307,7 @@ impl Ip6Main {
             add_del_interface_address_callbacks: UnsafeCell::new(Vec::new()),
             icmp_throttle: Vec::new(),
             clock_origin: Instant::now(),
-            unicast_tables: vec![Ip6FibTable::new(Default::default())],
+            unicast_tables: UnsafeCell::new(vec![Ip6FibTable::new(Default::default())]),
         }
     }
 
@@ -224,9 +322,18 @@ impl Ip6Main {
 
     #[inline(always)]
     pub fn forwarding_dpo(&self, fib_index: u32, address: Ipv6Addr) -> Option<DpoId> {
-        self.unicast_tables
+        // SAFETY: route publication occurs under the worker barrier; packet
+        // lookup only reads the published table outside that scope.
+        unsafe { &*self.unicast_tables.get() }
             .get(fib_index as usize)
             .and_then(|table| table.forwarding_lookup(address))
+    }
+
+    pub(crate) fn fib_table_mut(&self, fib_index: u32) -> &mut Ip6FibTable {
+        // SAFETY: callers hold the main-thread publication scope.
+        unsafe { &mut *self.unicast_tables.get() }
+            .get_mut(fib_index as usize)
+            .expect("IP6 FIB mapping names an installed table")
     }
 }
 

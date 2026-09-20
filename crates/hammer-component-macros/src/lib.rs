@@ -3858,6 +3858,7 @@ pub fn derive_dpo_class(input: TokenStream) -> TokenStream {
     let (impl_generics, ty_generics, where_clause) = item.generics.split_for_impl();
     let mut nodes = Vec::<DpoNodeBinding>::new();
     let mut shared_nodes = false;
+    let mut dpo_type = None::<syn::Path>;
     let mut lock = None::<syn::Path>;
     let mut unlock = None::<syn::Path>;
     let mut operations = [None::<syn::Path>, None, None, None, None, None];
@@ -3875,14 +3876,28 @@ pub fn derive_dpo_class(input: TokenStream) -> TokenStream {
                 let key: Ident = input.parse()?;
                 input.parse::<Token![=]>()?;
                 match key.to_string().as_str() {
+                    "dpo_type" => {
+                        if dpo_type.is_some() {
+                            return Err(Error::new(key.span(), "duplicate `dpo_type`"));
+                        }
+                        dpo_type = Some(input.parse()?);
+                    }
                     "nodes" => {
-                        let content;
-                        bracketed!(content in input);
-                        while !content.is_empty() {
-                            nodes.push(content.parse::<DpoNodeBinding>()?);
-                            if content.parse::<Option<Token![,]>>()?.is_none() {
-                                break;
+                        if input.peek(syn::token::Bracket) {
+                            let content;
+                            bracketed!(content in input);
+                            while !content.is_empty() {
+                                nodes.push(content.parse::<DpoNodeBinding>()?);
+                                if content.parse::<Option<Token![,]>>()?.is_none() {
+                                    break;
+                                }
                             }
+                        } else {
+                            let value: Ident = input.parse()?;
+                            if value != "caller" {
+                                return Err(Error::new(value.span(), "expected `nodes = caller`"));
+                            }
+                            shared_nodes = true;
                         }
                     }
                     "lock" => {
@@ -3914,7 +3929,7 @@ pub fn derive_dpo_class(input: TokenStream) -> TokenStream {
                     _ => {
                         return Err(Error::new(
                             key.span(),
-                            "expected `nodes`, `lock`, `unlock`, `next_nodes`, `mtu`, `urpf`, `interpose`, `format` or `memory`",
+                            "expected `dpo_type`, `nodes`, `lock`, `unlock`, `next_nodes`, `mtu`, `urpf`, `interpose`, `format` or `memory`",
                         ));
                     }
                 }
@@ -3936,6 +3951,10 @@ pub fn derive_dpo_class(input: TokenStream) -> TokenStream {
                 .into_compile_error()
                 .into();
         }
+    };
+    let class = match dpo_type {
+        Some(dpo_type) => quote!(Some(#dpo_type)),
+        None => quote!(None),
     };
     let has_resolver = operations[0].is_some();
     let operations: Vec<_> = operations
@@ -3965,7 +3984,7 @@ pub fn derive_dpo_class(input: TokenStream) -> TokenStream {
                     net: &::hammer_service::net::NetMain,
                     nodes: &[(::hammer_service::net::dpo::DpoProto, &[::hammer_core::data_plane::NodeId])],
                 ) -> Result<::hammer_service::net::dpo::DpoType, ::hammer_service::net::dpo::DpoError> {
-                    net.register_dpo(None, nodes, #locks, #(#operations),*)
+                    net.register_dpo(#class, nodes, #locks, #(#operations),*)
                 }
             }
         }
@@ -3983,7 +4002,7 @@ pub fn derive_dpo_class(input: TokenStream) -> TokenStream {
                 net: &::hammer_service::net::NetMain,
                 #(#arguments: ::hammer_core::data_plane::NodeId),*
             ) -> Result<::hammer_service::net::dpo::DpoType, ::hammer_service::net::dpo::DpoError> {
-                net.register_dpo(None, &[#(#registrations),*], #locks, #(#operations),*)
+                net.register_dpo(#class, &[#(#registrations),*], #locks, #(#operations),*)
             }
         }
     }
@@ -3999,49 +4018,55 @@ pub fn derive_fib_source(input: TokenStream) -> TokenStream {
     let ident = item.ident;
     let mut name = LitStr::new(&ident.to_string(), ident.span());
     let mut priority = quote!(0u8);
-    let mut behavior = quote!(::hammer_service::net::FibSourceBehavior::Api);
+    let mut behavior = None::<syn::Expr>;
+    let mut source = None::<syn::Expr>;
     for attribute in item
         .attrs
         .iter()
         .filter(|attribute| attribute.path().is_ident("fib_source"))
     {
         let parsed = attribute.parse_args_with(|input: ParseStream<'_>| {
-            let mut result = (None, None, None);
             while !input.is_empty() {
                 let key: Ident = input.parse()?;
                 input.parse::<Token![=]>()?;
                 match key.to_string().as_str() {
-                    "name" => result.0 = Some(input.parse::<LitStr>()?),
-                    "priority" => result.1 = Some(input.parse::<syn::LitInt>()?),
-                    "behavior" => result.2 = Some(input.parse::<Ident>()?),
+                    "name" => name = input.parse::<LitStr>()?,
+                    "priority" => {
+                        let value: syn::LitInt = input.parse()?;
+                        priority = quote!(#value);
+                    }
+                    "behavior" => behavior = Some(input.parse()?),
+                    "source" => source = Some(input.parse()?),
                     _ => return Err(Error::new(key.span(), "unknown `fib_source` argument")),
                 }
                 if !input.is_empty() {
                     input.parse::<Token![,]>()?;
                 }
             }
-            Ok(result)
+            Ok(())
         });
-        match parsed {
-            Ok((parsed_name, parsed_priority, parsed_behavior)) => {
-                if let Some(value) = parsed_name {
-                    name = value;
-                }
-                if let Some(value) = parsed_priority {
-                    priority = quote!(#value);
-                }
-                if let Some(value) = parsed_behavior {
-                    behavior = quote!(::hammer_service::net::FibSourceBehavior::#value);
-                }
-            }
-            Err(error) => return error.into_compile_error().into(),
+        if let Err(error) = parsed {
+            return error.into_compile_error().into();
         }
     }
+    let Some(behavior) = behavior else {
+        return Error::new(ident.span(), "FibSource requires `behavior`")
+            .into_compile_error()
+            .into();
+    };
+    let register = match source {
+        Some(source) => quote!(main.register(#source, Self::REGISTRATION)),
+        None => quote!(main.allocate(Self::REGISTRATION)),
+    };
     quote! {
         impl #ident {
-            pub const NAME: &'static str = #name;
-            pub const PRIORITY: u8 = #priority;
-            pub const BEHAVIOR: ::hammer_service::net::FibSourceBehavior = #behavior;
+            pub const REGISTRATION: ::hammer_service::net::fib::FibSourceRegistration =
+                ::hammer_service::net::fib::FibSourceRegistration::new(#name, #priority, #behavior);
+            pub fn register_fib_source(
+                main: &mut ::hammer_service::net::fib::FibSourceMain,
+            ) -> ::hammer_service::net::fib::FibSource {
+                #register
+            }
         }
     }
     .into()

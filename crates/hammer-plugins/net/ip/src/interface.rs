@@ -6,89 +6,47 @@ use std::sync::OnceLock;
 
 use hammer_runtime::DataPlaneMain;
 use hammer_service::feature::FeatureMain;
+use hammer_service::interface::InterfaceMtuKind;
 use hammer_service::interface::{InterfaceCallbackRegistration, InterfaceMain, InterfaceResult};
+use hammer_service::net::fib::FibEntrySourceBehaviorId;
+use hammer_service::net::{
+    DpoId, DpoProto, FibEntryFlags, FibSource, LoadBalanceDpo, LoadBalanceFlags, LoadBalancePath,
+    NetMain,
+};
+use ipnet::{Ipv4Net, Ipv6Net};
 use rand_09::RngCore;
 
+use crate::adjacency::{Ip4FibProtocol, Ip6FibProtocol, IpNetLink};
 use crate::lookup::{IP4_MAIN, IP6_MAIN, IpInterfaceAddress, IpInterfaceAddressKey, IpLookupMain};
+use hammer_service::net::adj::{AdjacencyLookupNext, FibProtocol};
 
 pub type IpInterfaceAddressCallback<A> = fn(&mut DataPlaneMain, u32, A, u8, u32, bool);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum IpInterfaceAddressError<A> {
-    Unsupported {
-        sw_if_index: u32,
-    },
-    AddressLengthMismatch {
-        address: A,
-        address_length: u8,
-    },
-    AddressInUse {
-        address: A,
-        conflicting_sw_if_index: u32,
-    },
-    DuplicateInterfaceAddress {
-        address: A,
-        existing_sw_if_index: u32,
-    },
-    AddressNotFoundForInterface {
-        sw_if_index: u32,
-        address: A,
-    },
-    AddressNotDeletable {
-        sw_if_index: u32,
-        address: A,
-    },
+pub struct IpInterfaceAddressError {
+    code: i32,
 }
 
-impl<A: fmt::Debug> fmt::Display for IpInterfaceAddressError<A> {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::Unsupported { sw_if_index } => {
-                write!(
-                    formatter,
-                    "interface {sw_if_index} does not support IP addressing"
-                )
-            }
-            Self::AddressLengthMismatch {
-                address,
-                address_length,
-            } => write!(
-                formatter,
-                "address {address:?}/{address_length} has an invalid length"
-            ),
-            Self::AddressInUse {
-                address,
-                conflicting_sw_if_index,
-            } => write!(
-                formatter,
-                "address {address:?} conflicts with interface {conflicting_sw_if_index}"
-            ),
-            Self::DuplicateInterfaceAddress {
-                address,
-                existing_sw_if_index,
-            } => write!(
-                formatter,
-                "address {address:?} already exists on interface {existing_sw_if_index}"
-            ),
-            Self::AddressNotFoundForInterface {
-                sw_if_index,
-                address,
-            } => write!(
-                formatter,
-                "address {address:?} was not found on interface {sw_if_index}"
-            ),
-            Self::AddressNotDeletable {
-                sw_if_index,
-                address,
-            } => write!(
-                formatter,
-                "address {address:?} on interface {sw_if_index} is not deletable"
-            ),
-        }
+impl IpInterfaceAddressError {
+    const UNSUPPORTED: Self = Self { code: -126 };
+    const ADDRESS_LENGTH_MISMATCH: Self = Self { code: -59 };
+    const ADDRESS_IN_USE: Self = Self { code: -105 };
+    const DUPLICATE_IF_ADDRESS: Self = Self { code: -127 };
+    const ADDRESS_NOT_FOUND_FOR_INTERFACE: Self = Self { code: -60 };
+    const ADDRESS_NOT_DELETABLE: Self = Self { code: -61 };
+
+    pub const fn code(self) -> i32 {
+        self.code
     }
 }
 
-impl<A: fmt::Debug> std::error::Error for IpInterfaceAddressError<A> {}
+impl fmt::Display for IpInterfaceAddressError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(formatter, "IP interface address API status {}", self.code)
+    }
+}
+
+impl std::error::Error for IpInterfaceAddressError {}
 
 #[derive(Debug, Clone, Copy)]
 struct Ip6Link {
@@ -102,6 +60,8 @@ struct Ip6LinkMain {
 }
 
 impl Ip6LinkMain {
+    const FIB_SOURCE: FibSource = FibSource::new(14);
+
     fn new() -> Self {
         Self {
             links_by_sw_if_index: UnsafeCell::new(Vec::new()),
@@ -138,6 +98,16 @@ fn ip6_link_init() -> hammer_runtime::RuntimeResult<()> {
     Ok(())
 }
 
+#[derive(hammer_component_macros::FibSource)]
+#[fib_source(source = Ip6LinkMain::FIB_SOURCE, name = "ip6-nd", priority = 0xc1, behavior = FibEntrySourceBehaviorId::API)]
+struct Ip6NdSourceRegistration;
+
+#[hammer_component_macros::init_function(name = "ip6_link_fib_source_init", runs_after = ["net_main_init"])]
+fn ip6_link_fib_source_init() -> hammer_runtime::RuntimeResult<()> {
+    Ip6NdSourceRegistration::register_fib_source(&mut NetMain::global()?.fib_sources_mut());
+    Ok(())
+}
+
 pub fn register_ip4_add_del_interface_address_callback(
     callback: IpInterfaceAddressCallback<Ipv4Addr>,
 ) {
@@ -164,7 +134,7 @@ pub fn register_ip6_add_del_interface_address_callback(
 
 fn set_interface_lifecycle(
     main: &mut DataPlaneMain,
-    lookup: &mut IpLookupMain<impl Copy + Eq + Hash>,
+    lookup: &mut IpLookupMain<impl Copy + Eq + Hash, impl Copy + Eq + Hash, impl Copy>,
     fib_indices: &mut Vec<Option<u32>>,
     enabled: &mut Vec<u8>,
     sw_if_index: u32,
@@ -321,6 +291,86 @@ fn ip6_link_sw_interface_add_del(
     Ok(())
 }
 
+fn ip4_sw_interface_admin_up_down(
+    main: &mut DataPlaneMain,
+    _: &InterfaceMain,
+    sw_if_index: u32,
+    is_up: bool,
+) -> InterfaceResult<()> {
+    let family = IP4_MAIN
+        .get()
+        .expect("IP4 Main exists before admin state callbacks");
+    let fib_index = family
+        .fib_index(sw_if_index)
+        .expect("live interface has an IP4 FIB mapping");
+    let lookup = unsafe { &*family.lookup_main.get() };
+    for index in interface_address_indices(lookup, sw_if_index) {
+        let address = lookup
+            .interface_addresses
+            .get(index)
+            .copied()
+            .expect("IP4 interface address chain remains occupied");
+        if is_up {
+            ip4_add_interface_routes(
+                main,
+                sw_if_index,
+                address.address,
+                address.address_length,
+                fib_index,
+            );
+        } else {
+            ip4_del_interface_routes(
+                main,
+                sw_if_index,
+                address.address,
+                address.address_length,
+                fib_index,
+            );
+        }
+    }
+    Ok(())
+}
+
+fn ip6_sw_interface_admin_up_down(
+    main: &mut DataPlaneMain,
+    _: &InterfaceMain,
+    sw_if_index: u32,
+    is_up: bool,
+) -> InterfaceResult<()> {
+    let family = IP6_MAIN
+        .get()
+        .expect("IP6 Main exists before admin state callbacks");
+    let fib_index = family
+        .fib_index(sw_if_index)
+        .expect("live interface has an IP6 FIB mapping");
+    let lookup = unsafe { &*family.lookup_main.get() };
+    for index in interface_address_indices(lookup, sw_if_index) {
+        let address = lookup
+            .interface_addresses
+            .get(index)
+            .copied()
+            .expect("IP6 interface address chain remains occupied");
+        if is_up {
+            ip6_add_interface_routes(
+                main,
+                sw_if_index,
+                address.address,
+                address.address_length,
+                fib_index,
+            );
+        } else {
+            ip6_del_interface_routes(
+                main,
+                sw_if_index,
+                address.address,
+                address.address_length,
+                fib_index,
+            );
+        }
+    }
+    Ok(())
+}
+
 pub(crate) const IP_SW_INTERFACE_CALLBACKS: [InterfaceCallbackRegistration; 3] = [
     InterfaceCallbackRegistration {
         callback: ip4_sw_interface_add_del,
@@ -336,9 +386,400 @@ pub(crate) const IP_SW_INTERFACE_CALLBACKS: [InterfaceCallbackRegistration; 3] =
     },
 ];
 
-fn interface_address_indices<A>(lookup: &IpLookupMain<A>, sw_if_index: u32) -> Vec<u32>
+pub(crate) const IP_ADMIN_UP_DOWN_CALLBACKS: [InterfaceCallbackRegistration; 2] = [
+    InterfaceCallbackRegistration {
+        callback: ip4_sw_interface_admin_up_down,
+        priority: 0,
+    },
+    InterfaceCallbackRegistration {
+        callback: ip6_sw_interface_admin_up_down,
+        priority: 0,
+    },
+];
+
+fn interface_route_dpo(
+    main: &mut DataPlaneMain,
+    proto: DpoProto,
+    child: DpoId,
+    flags: FibEntryFlags,
+) -> DpoId {
+    let net = NetMain::global().expect("interface route requires the network Main");
+    let mut load_balance = LoadBalanceDpo::new(
+        proto,
+        &[LoadBalancePath {
+            dpo: child,
+            path_index: u32::MAX,
+            weight: 1,
+        }],
+        LoadBalanceFlags::empty(),
+        0x9f,
+    )
+    .expect("interface route path is a valid load-balance path");
+    load_balance.fib_entry_flags = flags;
+    let dpo = net
+        .create_load_balance(main, proto, load_balance)
+        .expect("interface route DPO registration is installed");
+    net.unlock_dpo(child);
+    dpo
+}
+
+fn ip4_add_interface_routes(
+    main: &mut DataPlaneMain,
+    sw_if_index: u32,
+    address: Ipv4Addr,
+    address_length: u8,
+    fib_index: u32,
+) {
+    let net = NetMain::global().expect("IP4 interface route requires the network Main");
+    let interfaces = net.interface_main();
+    let local = interfaces
+        .add_or_lock_receive_dpo(sw_if_index, std::net::IpAddr::V4(address))
+        .expect("IP4 receive DPO creation is a control-plane invariant")
+        .expect("live interface has an IP4 receive DPO");
+    let local_dpo = interface_route_dpo(
+        main,
+        DpoProto::IP4,
+        local,
+        FibEntryFlags::CONNECTED | FibEntryFlags::LOCAL,
+    );
+    let family = IP4_MAIN
+        .get()
+        .expect("IP4 Main exists before interface route publication");
+    let host = Ipv4Net::new(address, 32).expect("IPv4 host prefix is valid");
+    family
+        .fib_table_mut(fib_index)
+        .add_route(host, FibSource::INTERFACE, local_dpo)
+        .expect("IP4 local interface route publication cannot fail");
+    net.unlock_dpo(local_dpo);
+
+    if address_length < 32 {
+        let prefix = Ipv4Net::new(address, address_length)
+            .expect("IPv4 interface prefix is valid")
+            .trunc();
+        let first = {
+            let lookup = unsafe { &mut *family.lookup_main.get() };
+            let source = lookup
+                .interface_address_index_by_key
+                .get(&IpInterfaceAddressKey { address, fib_index })
+                .copied()
+                .expect("added IPv4 interface address remains in the pool");
+            lookup.lock_interface_prefix(prefix, sw_if_index, source)
+        };
+        if !first {
+            return;
+        }
+        let mtu = interfaces
+            .software_interface(sw_if_index)
+            .expect("connected route requires a live interface")
+            .mtu
+            .get(InterfaceMtuKind::Ip4)
+            .min(u32::from(u16::MAX)) as u16;
+        let connected = {
+            let adjacency = unsafe { &mut *family.adjacency.get() }
+                .as_mut()
+                .expect("IP4 ADJ is initialized before interface routes");
+            let index = if interfaces.is_p2p(sw_if_index) {
+                let neighbors = unsafe { &mut *family.neighbor.get() }
+                    .as_mut()
+                    .expect("IP4 neighbor DB is initialized before interface routes");
+                let index = neighbors.add_or_lock(
+                    main,
+                    adjacency,
+                    IpNetLink::Ip4,
+                    Ip4FibProtocol::zero_address(),
+                    sw_if_index,
+                    mtu,
+                );
+                if adjacency.get(index).lookup_next == AdjacencyLookupNext::Incomplete {
+                    neighbors.update_rewrite(
+                        main,
+                        &mut net.fib_nodes_mut(),
+                        adjacency,
+                        index,
+                        true,
+                        &[],
+                    );
+                }
+                index
+            } else {
+                unsafe { &mut *family.glean.get() }
+                    .as_mut()
+                    .expect("IP4 glean DB is initialized before interface routes")
+                    .add_or_lock(main, adjacency, IpNetLink::Ip4, sw_if_index, prefix, mtu)
+            };
+            adjacency.dpo(&net.dpo_main(), index)
+        };
+        let connected_dpo = interface_route_dpo(
+            main,
+            DpoProto::IP4,
+            connected,
+            FibEntryFlags::CONNECTED | FibEntryFlags::ATTACHED,
+        );
+        family
+            .fib_table_mut(fib_index)
+            .add_route(prefix, FibSource::INTERFACE, connected_dpo)
+            .expect("IP4 connected interface route publication cannot fail");
+        net.unlock_dpo(connected_dpo);
+        if address_length <= 30 {
+            let network = prefix.network();
+            let broadcast = prefix.broadcast();
+            for special in [network, broadcast] {
+                if special == address {
+                    continue;
+                }
+                let drop = DpoId::drop(DpoProto::IP4);
+                let drop_dpo = interface_route_dpo(
+                    main,
+                    DpoProto::IP4,
+                    drop,
+                    FibEntryFlags::DROP | FibEntryFlags::LOOSE_URPF_EXEMPT,
+                );
+                family
+                    .fib_table_mut(fib_index)
+                    .add_route(
+                        Ipv4Net::new(special, 32).expect("IPv4 special host prefix is valid"),
+                        FibSource::INTERFACE,
+                        drop_dpo,
+                    )
+                    .expect("IP4 interface special route publication cannot fail");
+                net.unlock_dpo(drop_dpo);
+            }
+        } else if address_length == 31 {
+            let peer = Ipv4Addr::from(u32::from(address) ^ 1);
+            let attached = {
+                let adjacency = unsafe { &mut *family.adjacency.get() }
+                    .as_mut()
+                    .expect("IP4 ADJ is initialized before attached host routes");
+                let neighbors = unsafe { &mut *family.neighbor.get() }
+                    .as_mut()
+                    .expect("IP4 neighbor DB is initialized before attached host routes");
+                let next_hop = if interfaces.is_p2p(sw_if_index) {
+                    Ipv4Addr::UNSPECIFIED
+                } else {
+                    peer
+                };
+                let index = neighbors.add_or_lock(
+                    main,
+                    adjacency,
+                    IpNetLink::Ip4,
+                    next_hop,
+                    sw_if_index,
+                    mtu,
+                );
+                if interfaces.is_p2p(sw_if_index)
+                    && adjacency.get(index).lookup_next == AdjacencyLookupNext::Incomplete
+                {
+                    neighbors.update_rewrite(
+                        main,
+                        &mut net.fib_nodes_mut(),
+                        adjacency,
+                        index,
+                        true,
+                        &[],
+                    );
+                }
+                adjacency.dpo(&net.dpo_main(), index)
+            };
+            let attached_dpo =
+                interface_route_dpo(main, DpoProto::IP4, attached, FibEntryFlags::ATTACHED);
+            family
+                .fib_table_mut(fib_index)
+                .add_route(
+                    Ipv4Net::new(peer, 32).expect("IPv4 peer host prefix is valid"),
+                    FibSource::INTERFACE,
+                    attached_dpo,
+                )
+                .expect("IP4 interface peer route publication cannot fail");
+            net.unlock_dpo(attached_dpo);
+        }
+    }
+}
+
+fn ip4_del_interface_routes(
+    _: &mut DataPlaneMain,
+    sw_if_index: u32,
+    address: Ipv4Addr,
+    address_length: u8,
+    fib_index: u32,
+) {
+    let family = IP4_MAIN
+        .get()
+        .expect("IP4 Main exists before interface route withdrawal");
+    let host = Ipv4Net::new(address, 32).expect("IPv4 host prefix is valid");
+    family
+        .fib_table_mut(fib_index)
+        .remove_route(host, FibSource::INTERFACE)
+        .expect("IP4 local interface route withdrawal cannot fail");
+    if address_length < 32 {
+        let prefix = Ipv4Net::new(address, address_length)
+            .expect("IPv4 interface prefix is valid")
+            .trunc();
+        if unsafe { &mut *family.lookup_main.get() }.unlock_interface_prefix(prefix, sw_if_index)
+            != Some(true)
+        {
+            return;
+        }
+        if address_length <= 30 {
+            for special in [prefix.network(), prefix.broadcast()] {
+                if special == address {
+                    continue;
+                }
+                family
+                    .fib_table_mut(fib_index)
+                    .remove_route(
+                        Ipv4Net::new(special, 32).expect("IPv4 special host prefix is valid"),
+                        FibSource::INTERFACE,
+                    )
+                    .expect("IP4 interface special route withdrawal cannot fail");
+            }
+        } else if address_length == 31 {
+            let peer = Ipv4Addr::from(u32::from(address) ^ 1);
+            family
+                .fib_table_mut(fib_index)
+                .remove_route(
+                    Ipv4Net::new(peer, 32).expect("IPv4 peer host prefix is valid"),
+                    FibSource::INTERFACE,
+                )
+                .expect("IP4 interface peer route withdrawal cannot fail");
+        }
+        family
+            .fib_table_mut(fib_index)
+            .remove_route(prefix, FibSource::INTERFACE)
+            .expect("IP4 connected interface route withdrawal cannot fail");
+    }
+}
+
+fn ip6_add_interface_routes(
+    main: &mut DataPlaneMain,
+    sw_if_index: u32,
+    address: Ipv6Addr,
+    address_length: u8,
+    fib_index: u32,
+) {
+    let net = NetMain::global().expect("IP6 interface route requires the network Main");
+    let interfaces = net.interface_main();
+    let local = interfaces
+        .add_or_lock_receive_dpo(sw_if_index, std::net::IpAddr::V6(address))
+        .expect("IP6 receive DPO creation is a control-plane invariant")
+        .expect("live interface has an IP6 receive DPO");
+    let local_dpo = interface_route_dpo(
+        main,
+        DpoProto::IP6,
+        local,
+        FibEntryFlags::CONNECTED | FibEntryFlags::LOCAL,
+    );
+    let family = IP6_MAIN
+        .get()
+        .expect("IP6 Main exists before interface route publication");
+    let host = Ipv6Net::new(address, 128).expect("IPv6 host prefix is valid");
+    family
+        .fib_table_mut(fib_index)
+        .add_route(host, FibSource::INTERFACE, local_dpo)
+        .expect("IP6 local interface route publication cannot fail");
+    net.unlock_dpo(local_dpo);
+
+    if address_length < 128 {
+        let prefix = Ipv6Net::new(address, address_length)
+            .expect("IPv6 interface prefix is valid")
+            .trunc();
+        let first = unsafe { &mut *family.lookup_main.get() }.lock_interface_prefix(
+            prefix,
+            sw_if_index,
+            (),
+        );
+        if !first {
+            return;
+        }
+        let mtu = interfaces
+            .software_interface(sw_if_index)
+            .expect("connected route requires a live interface")
+            .mtu
+            .get(InterfaceMtuKind::Ip6)
+            .min(u32::from(u16::MAX)) as u16;
+        let connected = {
+            let adjacency = unsafe { &mut *family.adjacency.get() }
+                .as_mut()
+                .expect("IP6 ADJ is initialized before interface routes");
+            let index = if interfaces.is_p2p(sw_if_index) {
+                let neighbors = unsafe { &mut *family.neighbor.get() }
+                    .as_mut()
+                    .expect("IP6 neighbor DB is initialized before interface routes");
+                let index = neighbors.add_or_lock(
+                    main,
+                    adjacency,
+                    IpNetLink::Ip6,
+                    Ip6FibProtocol::zero_address(),
+                    sw_if_index,
+                    mtu,
+                );
+                if adjacency.get(index).lookup_next == AdjacencyLookupNext::Incomplete {
+                    neighbors.update_rewrite(
+                        main,
+                        &mut net.fib_nodes_mut(),
+                        adjacency,
+                        index,
+                        true,
+                        &[],
+                    );
+                }
+                index
+            } else {
+                unsafe { &mut *family.glean.get() }
+                    .as_mut()
+                    .expect("IP6 glean DB is initialized before interface routes")
+                    .add_or_lock(main, adjacency, IpNetLink::Ip6, sw_if_index, prefix, mtu)
+            };
+            adjacency.dpo(&net.dpo_main(), index)
+        };
+        let connected_dpo = interface_route_dpo(
+            main,
+            DpoProto::IP6,
+            connected,
+            FibEntryFlags::CONNECTED | FibEntryFlags::ATTACHED,
+        );
+        family
+            .fib_table_mut(fib_index)
+            .add_route(prefix, FibSource::INTERFACE, connected_dpo)
+            .expect("IP6 connected interface route publication cannot fail");
+        net.unlock_dpo(connected_dpo);
+    }
+}
+
+fn ip6_del_interface_routes(
+    _: &mut DataPlaneMain,
+    sw_if_index: u32,
+    address: Ipv6Addr,
+    address_length: u8,
+    fib_index: u32,
+) {
+    let family = IP6_MAIN
+        .get()
+        .expect("IP6 Main exists before interface route withdrawal");
+    if address_length < 128 {
+        let prefix = Ipv6Net::new(address, address_length)
+            .expect("IPv6 interface prefix is valid")
+            .trunc();
+        if unsafe { &mut *family.lookup_main.get() }.unlock_interface_prefix(prefix, sw_if_index)
+            == Some(true)
+        {
+            family
+                .fib_table_mut(fib_index)
+                .remove_route(prefix, FibSource::INTERFACE)
+                .expect("IP6 connected interface route withdrawal cannot fail");
+        }
+    }
+    let host = Ipv6Net::new(address, 128).expect("IPv6 host prefix is valid");
+    family
+        .fib_table_mut(fib_index)
+        .remove_route(host, FibSource::INTERFACE)
+        .expect("IP6 local interface route withdrawal cannot fail");
+}
+
+fn interface_address_indices<A, P, S>(lookup: &IpLookupMain<A, P, S>, sw_if_index: u32) -> Vec<u32>
 where
     A: Copy + Eq + Hash,
+    P: Copy + Eq + Hash,
+    S: Copy,
 {
     let mut indices = Vec::new();
     let mut current = lookup
@@ -359,7 +800,7 @@ where
 
 fn set_ip_interface_enabled<const ZERO_DISABLE_IS_NOOP: bool>(
     main: &mut DataPlaneMain,
-    lookup: &IpLookupMain<impl Copy + Eq + Hash>,
+    lookup: &IpLookupMain<impl Copy + Eq + Hash, impl Copy + Eq + Hash, impl Copy>,
     enabled: &mut Vec<u8>,
     sw_if_index: u32,
     is_enable: bool,
@@ -488,48 +929,43 @@ fn ipv6_prefix_matches(left: Ipv6Addr, right: Ipv6Addr, length: u8) -> bool {
     (u128::from(left) ^ u128::from(right)) & mask == 0
 }
 
-fn add_interface_address<A>(
-    lookup: &mut IpLookupMain<A>,
+fn add_interface_address<A, P, S>(
+    lookup: &mut IpLookupMain<A, P, S>,
     key: IpInterfaceAddressKey<A>,
     sw_if_index: u32,
     address_length: u8,
     width: u8,
-) -> Result<u32, IpInterfaceAddressError<A>>
+) -> Result<u32, IpInterfaceAddressError>
 where
     A: Copy + Eq + Hash,
+    P: Copy + Eq + Hash,
+    S: Copy,
 {
     if address_length == 0 || address_length > width {
-        return Err(IpInterfaceAddressError::AddressLengthMismatch {
-            address: key.address,
-            address_length,
-        });
+        return Err(IpInterfaceAddressError::ADDRESS_LENGTH_MISMATCH);
     }
     Ok(lookup.add_interface_address(key, sw_if_index, address_length))
 }
 
-fn delete_interface_address<A>(
-    lookup: &mut IpLookupMain<A>,
+fn delete_interface_address<A, P, S>(
+    lookup: &mut IpLookupMain<A, P, S>,
     key: IpInterfaceAddressKey<A>,
     sw_if_index: u32,
-) -> Result<(u32, IpInterfaceAddress<A>), IpInterfaceAddressError<A>>
+) -> Result<(u32, IpInterfaceAddress<A>), IpInterfaceAddressError>
 where
     A: Copy + Eq + Hash,
+    P: Copy + Eq + Hash,
+    S: Copy,
 {
     let Some(index) = lookup.interface_address_index_by_key.get(&key).copied() else {
-        return Err(IpInterfaceAddressError::AddressNotFoundForInterface {
-            sw_if_index,
-            address: key.address,
-        });
+        return Err(IpInterfaceAddressError::ADDRESS_NOT_FOUND_FOR_INTERFACE);
     };
     let record = lookup
         .interface_addresses
         .get(index)
         .expect("address hash names an occupied pool slot");
     if record.sw_if_index != sw_if_index {
-        return Err(IpInterfaceAddressError::AddressNotFoundForInterface {
-            sw_if_index,
-            address: key.address,
-        });
+        return Err(IpInterfaceAddressError::ADDRESS_NOT_FOUND_FOR_INTERFACE);
     }
     Ok((index, lookup.remove_interface_address(key, index)))
 }
@@ -540,11 +976,11 @@ pub fn ip4_add_del_interface_address(
     address: Ipv4Addr,
     address_length: u8,
     is_delete: bool,
-) -> Result<(), IpInterfaceAddressError<Ipv4Addr>> {
+) -> Result<(), IpInterfaceAddressError> {
     hammer_runtime::ensure_main_thread_with_barrier()
         .expect("IP4 interface address mutation requires publication ownership");
     if !supports_addressing(sw_if_index) {
-        return Err(IpInterfaceAddressError::Unsupported { sw_if_index });
+        return Err(IpInterfaceAddressError::UNSUPPORTED);
     }
     let family = IP4_MAIN
         .get()
@@ -573,25 +1009,31 @@ pub fn ip4_add_del_interface_address(
                 {
                     continue;
                 }
-                return Err(IpInterfaceAddressError::AddressInUse {
-                    address,
-                    conflicting_sw_if_index: existing.sw_if_index,
-                });
+                return Err(IpInterfaceAddressError::ADDRESS_IN_USE);
             }
         }
         if let Some(index) = lookup.interface_address_index_by_key.get(&key).copied() {
-            let existing = lookup
-                .interface_addresses
-                .get(index)
-                .expect("address hash names an occupied pool slot");
-            return Err(IpInterfaceAddressError::DuplicateInterfaceAddress {
-                address,
-                existing_sw_if_index: existing.sw_if_index,
-            });
+            assert!(
+                lookup.interface_addresses.get(index).is_some(),
+                "address hash names an occupied pool slot"
+            );
+            return Err(IpInterfaceAddressError::DUPLICATE_IF_ADDRESS);
         }
         add_interface_address(lookup, key, sw_if_index, address_length, 32)?
     };
     ip4_sw_interface_enable_disable(main, sw_if_index, !is_delete);
+    let admin_up = NetMain::global()
+        .expect("IP4 address mutation requires the network Main")
+        .interface_main()
+        .software_interface(sw_if_index)
+        .is_some_and(|interface| interface.is_admin_up());
+    if admin_up {
+        if is_delete {
+            ip4_del_interface_routes(main, sw_if_index, address, address_length, fib_index);
+        } else {
+            ip4_add_interface_routes(main, sw_if_index, address, address_length, fib_index);
+        }
+    }
     let callbacks = unsafe { &*family.add_del_interface_address_callbacks.get() };
     for callback in callbacks {
         callback(
@@ -691,18 +1133,15 @@ pub fn ip6_add_del_interface_address(
     address: Ipv6Addr,
     address_length: u8,
     is_delete: bool,
-) -> Result<(), IpInterfaceAddressError<Ipv6Addr>> {
+) -> Result<(), IpInterfaceAddressError> {
     hammer_runtime::ensure_main_thread_with_barrier()
         .expect("IP6 interface address mutation requires publication ownership");
     if !supports_addressing(sw_if_index) {
-        return Err(IpInterfaceAddressError::Unsupported { sw_if_index });
+        return Err(IpInterfaceAddressError::UNSUPPORTED);
     }
     if address.is_unicast_link_local() {
         if address_length != 128 {
-            return Err(IpInterfaceAddressError::AddressLengthMismatch {
-                address,
-                address_length,
-            });
+            return Err(IpInterfaceAddressError::ADDRESS_LENGTH_MISMATCH);
         }
         let current = IP6_LINK_MAIN
             .get()
@@ -714,15 +1153,9 @@ pub fn ip6_add_del_interface_address(
         if is_delete {
             return match current {
                 Some(link) if link.link_local_address == address => {
-                    Err(IpInterfaceAddressError::AddressNotDeletable {
-                        sw_if_index,
-                        address,
-                    })
+                    Err(IpInterfaceAddressError::ADDRESS_NOT_DELETABLE)
                 }
-                _ => Err(IpInterfaceAddressError::AddressNotFoundForInterface {
-                    sw_if_index,
-                    address,
-                }),
+                _ => Err(IpInterfaceAddressError::ADDRESS_NOT_FOUND_FOR_INTERFACE),
             };
         }
         ip6_link_enable(main, sw_if_index, Some(address));
@@ -755,27 +1188,33 @@ pub fn ip6_add_del_interface_address(
                 {
                     continue;
                 }
-                return Err(IpInterfaceAddressError::DuplicateInterfaceAddress {
-                    address,
-                    existing_sw_if_index: existing.sw_if_index,
-                });
+                return Err(IpInterfaceAddressError::DUPLICATE_IF_ADDRESS);
             }
         }
         if let Some(index) = lookup.interface_address_index_by_key.get(&key).copied() {
-            let existing = lookup
-                .interface_addresses
-                .get(index)
-                .expect("address hash names an occupied pool slot");
-            return Err(IpInterfaceAddressError::DuplicateInterfaceAddress {
-                address,
-                existing_sw_if_index: existing.sw_if_index,
-            });
+            assert!(
+                lookup.interface_addresses.get(index).is_some(),
+                "address hash names an occupied pool slot"
+            );
+            return Err(IpInterfaceAddressError::DUPLICATE_IF_ADDRESS);
         }
         add_interface_address(lookup, key, sw_if_index, address_length, 128)?
     };
     ip6_sw_interface_enable_disable(main, sw_if_index, !is_delete);
     if !is_delete {
         ip6_link_enable(main, sw_if_index, None);
+    }
+    let admin_up = NetMain::global()
+        .expect("IP6 address mutation requires the network Main")
+        .interface_main()
+        .software_interface(sw_if_index)
+        .is_some_and(|interface| interface.is_admin_up());
+    if admin_up {
+        if is_delete {
+            ip6_del_interface_routes(main, sw_if_index, address, address_length, fib_index);
+        } else {
+            ip6_add_interface_routes(main, sw_if_index, address, address_length, fib_index);
+        }
     }
     let callbacks = unsafe { &*family.add_del_interface_address_callbacks.get() };
     for callback in callbacks {
@@ -895,7 +1334,7 @@ mod tests {
     use hammer_core::data_plane::Buffer;
     use hammer_runtime::{DataPlaneBufferConfig, DataPlaneMain};
     use hammer_service::feature::FeatureMain;
-    use hammer_service::interface::InterfaceMain;
+    use hammer_service::interface::{InterfaceMain, SwInterfaceFlags};
     use hammer_service::net::NetMain;
 
     use super::*;
@@ -927,14 +1366,29 @@ mod tests {
         let features = FeatureMain::global().unwrap();
 
         let terminal = hammer_service::data_plane::register_drop(&mut data_plane).unwrap();
+        (hammer_service::interface::__SERVICE_GRAPH_NODE_INTERFACE_OUTPUT_NODE.init)(&data_plane)
+            .unwrap();
         (crate::ip::input::__IP_GRAPH_NODE_IP4_INPUT_NODE.init)(&data_plane).unwrap();
         (crate::ip::input::__IP_GRAPH_NODE_IP6_INPUT_NODE.init)(&data_plane).unwrap();
+        (crate::ip::local::__IP_GRAPH_NODE_IP4_LOCAL_NODE.init)(&data_plane).unwrap();
+        (crate::ip::local::__IP_GRAPH_NODE_IP6_LOCAL_NODE.init)(&data_plane).unwrap();
+        (crate::ip::local::__IP_GRAPH_NODE_IP4_RECEIVE_NODE.init)(&data_plane).unwrap();
+        (crate::ip::local::__IP_GRAPH_NODE_IP6_RECEIVE_NODE.init)(&data_plane).unwrap();
         (crate::lookup::__IP_GRAPH_NODE_IP4_LOOKUP_NODE.init)(&data_plane).unwrap();
         (crate::lookup::__IP_GRAPH_NODE_IP6_LOOKUP_NODE.init)(&data_plane).unwrap();
+        (crate::lookup::__IP_GRAPH_NODE_IP4_LOAD_BALANCE_NODE.init)(&data_plane).unwrap();
+        (crate::lookup::__IP_GRAPH_NODE_IP6_LOAD_BALANCE_NODE.init)(&data_plane).unwrap();
         (crate::punt::__IP_GRAPH_NODE_IP4_DROP_NODE.init)(&data_plane).unwrap();
         (crate::punt::__IP_GRAPH_NODE_IP4_NOT_ENABLED_NODE.init)(&data_plane).unwrap();
         (crate::punt::__IP_GRAPH_NODE_IP6_DROP_NODE.init)(&data_plane).unwrap();
         (crate::punt::__IP_GRAPH_NODE_IP6_NOT_ENABLED_NODE.init)(&data_plane).unwrap();
+        (crate::adjacency::__IP_GRAPH_NODE_IP4_GLEAN_NODE.init)(&data_plane).unwrap();
+        (crate::adjacency::__IP_GRAPH_NODE_IP6_GLEAN_NODE.init)(&data_plane).unwrap();
+        (crate::adjacency::__IP_GRAPH_NODE_IP4_INCOMPLETE_NODE.init)(&data_plane).unwrap();
+        (crate::adjacency::__IP_GRAPH_NODE_IP6_INCOMPLETE_NODE.init)(&data_plane).unwrap();
+        (crate::adjacency::__IP_GRAPH_NODE_IP4_REWRITE_NODE.init)(&data_plane).unwrap();
+        (crate::adjacency::__IP_GRAPH_NODE_IP6_REWRITE_NODE.init)(&data_plane).unwrap();
+        data_plane.nodes().resolve_named_next_nodes().unwrap();
 
         let ip4_arc = Ip4InputNode::register_feature_arc(features, data_plane.nodes()).unwrap();
         let ip6_arc = Ip6InputNode::register_feature_arc(features, data_plane.nodes()).unwrap();
@@ -1118,56 +1572,166 @@ mod tests {
 
         let ip4 = Ipv4Addr::new(192, 0, 2, 1);
         assert_eq!(
-            ip4_add_del_interface_address(&mut data_plane, sw_if_index, ip4, 0, false),
-            Err(IpInterfaceAddressError::AddressLengthMismatch {
-                address: ip4,
-                address_length: 0,
-            })
+            ip4_add_del_interface_address(
+                &mut data_plane,
+                net.local_interface_sw_index(),
+                ip4,
+                24,
+                false,
+            )
+            .unwrap_err()
+            .code(),
+            -126
+        );
+        assert_eq!(
+            ip4_add_del_interface_address(&mut data_plane, sw_if_index, ip4, 0, false)
+                .unwrap_err()
+                .code(),
+            -59
         );
         ip4_add_del_interface_address(&mut data_plane, sw_if_index, ip4, 24, false).unwrap();
+        let ip4_host = Ipv4Net::new(ip4, 32).unwrap();
+        let ip4_connected = Ipv4Net::new(ip4, 24).unwrap().trunc();
         assert_eq!(
-            ip4_add_del_interface_address(&mut data_plane, sw_if_index, ip4, 24, false),
-            Err(IpInterfaceAddressError::AddressInUse {
-                address: ip4,
-                conflicting_sw_if_index: sw_if_index,
-            })
+            IP4_MAIN
+                .get()
+                .unwrap()
+                .fib_table_mut(0)
+                .lookup_exact(ip4_host),
+            None
+        );
+        interfaces
+            .set_software_flags(&mut data_plane, sw_if_index, SwInterfaceFlags::ADMIN_UP)
+            .unwrap();
+        assert!(
+            IP4_MAIN
+                .get()
+                .unwrap()
+                .fib_table_mut(0)
+                .forwarding_lookup(ip4)
+                .is_some()
+        );
+        assert!(
+            IP4_MAIN
+                .get()
+                .unwrap()
+                .fib_table_mut(0)
+                .lookup_exact(ip4_connected)
+                .is_some()
+        );
+        interfaces
+            .set_software_flags(&mut data_plane, sw_if_index, SwInterfaceFlags::empty())
+            .unwrap();
+        assert_eq!(
+            IP4_MAIN
+                .get()
+                .unwrap()
+                .fib_table_mut(0)
+                .lookup_exact(ip4_host),
+            None
+        );
+        assert_eq!(
+            IP4_MAIN
+                .get()
+                .unwrap()
+                .fib_table_mut(0)
+                .lookup_exact(ip4_connected),
+            None
+        );
+        assert!(
+            unsafe { &*IP4_MAIN.get().unwrap().lookup_main.get() }
+                .interface_address_index_by_key
+                .contains_key(&IpInterfaceAddressKey {
+                    address: ip4,
+                    fib_index: 0,
+                })
+        );
+        assert_eq!(
+            ip4_add_del_interface_address(&mut data_plane, sw_if_index, ip4, 24, false)
+                .unwrap_err()
+                .code(),
+            -105
         );
         ip4_add_del_interface_address(&mut data_plane, sw_if_index, ip4, 31, true).unwrap();
         assert_eq!(
-            ip4_add_del_interface_address(&mut data_plane, sw_if_index, ip4, 24, true),
-            Err(IpInterfaceAddressError::AddressNotFoundForInterface {
-                sw_if_index,
-                address: ip4,
-            })
+            ip4_add_del_interface_address(&mut data_plane, sw_if_index, ip4, 24, true)
+                .unwrap_err()
+                .code(),
+            -60
         );
 
         let ip6 = "2001:db8::1".parse().unwrap();
         ip6_add_del_interface_address(&mut data_plane, sw_if_index, ip6, 64, false).unwrap();
+        let ip6_host = Ipv6Net::new(ip6, 128).unwrap();
+        let ip6_connected = Ipv6Net::new(ip6, 64).unwrap().trunc();
         assert_eq!(
-            ip6_add_del_interface_address(&mut data_plane, sw_if_index, ip6, 64, false),
-            Err(IpInterfaceAddressError::DuplicateInterfaceAddress {
-                address: ip6,
-                existing_sw_if_index: sw_if_index,
-            })
+            IP6_MAIN
+                .get()
+                .unwrap()
+                .fib_table_mut(0)
+                .lookup_exact(ip6_host),
+            None
+        );
+        interfaces
+            .set_software_flags(&mut data_plane, sw_if_index, SwInterfaceFlags::ADMIN_UP)
+            .unwrap();
+        assert!(
+            IP6_MAIN
+                .get()
+                .unwrap()
+                .fib_table_mut(0)
+                .forwarding_lookup(ip6)
+                .is_some()
+        );
+        assert!(
+            IP6_MAIN
+                .get()
+                .unwrap()
+                .fib_table_mut(0)
+                .lookup_exact(ip6_connected)
+                .is_some()
+        );
+        interfaces
+            .set_software_flags(&mut data_plane, sw_if_index, SwInterfaceFlags::empty())
+            .unwrap();
+        assert_eq!(
+            IP6_MAIN
+                .get()
+                .unwrap()
+                .fib_table_mut(0)
+                .lookup_exact(ip6_host),
+            None
+        );
+        assert_eq!(
+            IP6_MAIN
+                .get()
+                .unwrap()
+                .fib_table_mut(0)
+                .lookup_exact(ip6_connected),
+            None
+        );
+        assert_eq!(
+            ip6_add_del_interface_address(&mut data_plane, sw_if_index, ip6, 64, false)
+                .unwrap_err()
+                .code(),
+            -127
         );
         ip6_add_del_interface_address(&mut data_plane, sw_if_index, ip6, 1, true).unwrap();
 
         let link_local = "fe80::1".parse().unwrap();
         assert_eq!(
-            ip6_add_del_interface_address(&mut data_plane, sw_if_index, link_local, 64, false,),
-            Err(IpInterfaceAddressError::AddressLengthMismatch {
-                address: link_local,
-                address_length: 64,
-            })
+            ip6_add_del_interface_address(&mut data_plane, sw_if_index, link_local, 64, false,)
+                .unwrap_err()
+                .code(),
+            -59
         );
         ip6_add_del_interface_address(&mut data_plane, sw_if_index, link_local, 128, false)
             .unwrap();
         assert_eq!(
-            ip6_add_del_interface_address(&mut data_plane, sw_if_index, link_local, 128, true,),
-            Err(IpInterfaceAddressError::AddressNotDeletable {
-                sw_if_index,
-                address: link_local,
-            })
+            ip6_add_del_interface_address(&mut data_plane, sw_if_index, link_local, 128, true,)
+                .unwrap_err()
+                .code(),
+            -61
         );
 
         interfaces

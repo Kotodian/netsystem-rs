@@ -379,10 +379,20 @@ mod tests {
     use hammer_runtime::{DataPlaneBufferConfig, DataPlaneMain};
     use hammer_service::interface::InterfaceMain;
     use hammer_service::net::{
-        DpoError, DpoProto, DpoType, FibPath, FibPathList, FibPathListFlags, LoadBalanceDpo,
+        DpoError, DpoProto, DpoType, FibPathList, FibPathListFlags, LoadBalanceDpo,
         LoadBalanceFlags, LoadBalancePath, NetMain,
     };
     use std::sync::Arc;
+
+    fn urpf_path_list_lock(_: u32) {}
+    fn urpf_path_list_unlock(_: u32) -> bool {
+        false
+    }
+    fn urpf_path_list_children(_: u32) -> hammer_service::net::fib_node::FibNodeList {
+        hammer_service::net::fib_node::FibNodeList::NONE
+    }
+    fn urpf_path_list_set_children(_: u32, _: hammer_service::net::fib_node::FibNodeList) {}
+    fn urpf_path_list_last_lock(_: u32) {}
 
     #[test]
     fn route_sources_retain_forwarding_until_withdrawal() -> Result<(), DpoError> {
@@ -635,20 +645,17 @@ mod tests {
             .iter()
             .map(|&hardware| interfaces.hardware_interface(hardware).sw_if_index)
             .collect();
-        let paths = accepting_interfaces
-            .iter()
-            .enumerate()
-            .map(|(index, &sw_if_index)| FibPath {
-                sw_if_index,
-                table_id: 0,
-                rpf_id: u32::MAX,
-                weight: 1,
-                preference: 0,
-                flags: IpPathFlags::empty(),
-                next_hop: Ipv4Addr::new(10, 0, 0, index as u8 + 1),
-            })
-            .collect();
-        let mut path_list = FibPathList::new(paths, FibPathListFlags::SHARED);
+        let node_type = net.fib_nodes_mut().register_type(
+            "urpf-path-list",
+            hammer_service::net::fib_node::FibNodeOperations::new(
+                urpf_path_list_lock,
+                urpf_path_list_unlock,
+                urpf_path_list_children,
+                urpf_path_list_set_children,
+                urpf_path_list_last_lock,
+            ),
+        );
+        let mut path_list = FibPathList::new(node_type, Vec::new(), FibPathListFlags::SHARED);
         path_list.bake_urpf(accepting_interfaces.clone())?;
         let shared_urpf = path_list.urpf_index().unwrap();
         assert_eq!(
