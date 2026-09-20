@@ -66,6 +66,7 @@ hammer_runtime::__declare_registration_image!(
     ];
     main_loop_enter_functions = [
         feature::__INIT_FN_DEVICE_INPUT_FEATURE_INIT,
+        interface::__INIT_FN_INTERFACE_OUTPUT_FEATURE_INIT,
         feature::__INIT_FN_FEATURE_ARC_INIT,
     ];
     main_loop_exit_functions = [
@@ -83,6 +84,7 @@ hammer_runtime::__declare_registration_image!(
         ethernet::__SERVICE_GRAPH_NODE_ETHERNET_INPUT_NODE,
         device::__SERVICE_GRAPH_NODE_DEVICE_INPUT_NODE,
         interface::__SERVICE_GRAPH_NODE_INTERFACE_OUTPUT_NODE,
+        interface::__SERVICE_GRAPH_NODE_INTERFACE_OUTPUT_ARC_END_NODE,
         session::node::__SESSION_GRAPH_NODE_APP_SESSION_INPUT_NODE,
         session::node::__SESSION_GRAPH_NODE_SESSION_QUEUE_NODE,
     ];

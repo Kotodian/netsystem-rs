@@ -6,7 +6,7 @@ use hammer_infra::pool::Pool;
 use crate::interface::{InterfaceMain, InterfaceMtuKind};
 
 use super::fib_node::{FibNode, FibNodeList, FibNodePtr, FibNodeType};
-use super::rewrite::AdjacencyRewrite;
+use super::rewrite::RewriteHeader;
 use super::{DpoId, DpoMain, DpoProto, DpoType};
 
 #[repr(transparent)]
@@ -28,6 +28,7 @@ pub enum AdjacencyLookupNext {
     Incomplete = 3,
     Glean = 4,
     Rewrite = 5,
+    Multicast = 6,
     Broadcast = 9,
 }
 
@@ -71,7 +72,8 @@ pub struct Adjacency<P: FibProtocol> {
     pub node: FibNode,
     pub config_index: u32,
     pub subtype: P::AdjacencySubtype,
-    pub rewrite: AdjacencyRewrite,
+    pub rewrite_header: RewriteHeader,
+    pub rewrite_data: [u8; 116],
     pub delegates: u64,
     pub node_index: u32,
     pub lookup_next: AdjacencyLookupNext,
@@ -107,8 +109,6 @@ impl<P: FibProtocol> AdjacencyMain<P> {
         &mut self,
         subtype: P::AdjacencySubtype,
         link: P::Link,
-        sw_if_index: u32,
-        mtu: u16,
         node_index: u32,
         lookup_next: AdjacencyLookupNext,
     ) -> AdjacencyIndex {
@@ -118,7 +118,8 @@ impl<P: FibProtocol> AdjacencyMain<P> {
             node: FibNode::new(self.node_type),
             config_index: u32::MAX,
             subtype,
-            rewrite: AdjacencyRewrite::new(sw_if_index, mtu),
+            rewrite_header: RewriteHeader::poisoned(),
+            rewrite_data: [0xfe; 116],
             delegates: u64::MAX,
             node_index,
             lookup_next,
@@ -183,6 +184,7 @@ impl<P: FibProtocol> AdjacencyMain<P> {
                 DpoType::ADJACENCY_INCOMPLETE
             }
             AdjacencyLookupNext::Rewrite => DpoType::ADJACENCY,
+            AdjacencyLookupNext::Multicast => DpoType::ADJACENCY_MCAST,
         };
         registry
             .identity(class, P::dpo_protocol(adjacency.link), index.0)
@@ -190,11 +192,11 @@ impl<P: FibProtocol> AdjacencyMain<P> {
     }
 
     pub fn mtu(&self, index: AdjacencyIndex) -> u16 {
-        self.get(index).rewrite.max_l3_packet_bytes
+        self.get(index).rewrite_header.max_l3_packet_bytes
     }
 
     pub fn urpf(&self, index: AdjacencyIndex) -> u32 {
-        self.get(index).rewrite.sw_if_index
+        self.get(index).rewrite_header.sw_if_index
     }
 
     pub fn link(&self, index: AdjacencyIndex) -> P::Link {
@@ -202,7 +204,7 @@ impl<P: FibProtocol> AdjacencyMain<P> {
     }
 
     pub fn sw_if_index(&self, index: AdjacencyIndex) -> u32 {
-        self.get(index).rewrite.sw_if_index
+        self.get(index).rewrite_header.sw_if_index
     }
 
     pub fn memory(&self) -> (usize, usize, usize) {
@@ -215,4 +217,4 @@ impl<P: FibProtocol> AdjacencyMain<P> {
 }
 
 const _: () = assert!(size_of::<usize>() == 8);
-const _: () = assert!(align_of::<AdjacencyRewrite>() <= 64);
+const _: () = assert!(align_of::<RewriteHeader>() <= 64);

@@ -560,16 +560,11 @@ mod tests {
         let interfaces = net.interface_main();
         let device_class_index = interfaces.device_class_index("local");
         let hw_class_index = interfaces.hw_class_index("local");
-        let hardware = interfaces
-            .register_hardware_interface(&mut runtime, device_class_index, 1, hw_class_index, 0)
-            .unwrap();
+        let hardware =
+            interfaces.register_interface(&mut runtime, device_class_index, 1, hw_class_index, 0);
         let software = interfaces.hardware_interface(hardware).sw_if_index;
-        let rx4 = interfaces
-            .add_or_lock_rx_dpo(DpoProto::IP4, software)?
-            .unwrap();
-        let shared = interfaces
-            .add_or_lock_rx_dpo(DpoProto::IP4, software)?
-            .unwrap();
+        let rx4 = net.add_or_lock_rx_dpo(DpoProto::IP4, software)?.unwrap();
+        let shared = net.add_or_lock_rx_dpo(DpoProto::IP4, software)?.unwrap();
         assert_eq!(rx4, shared);
         let forwarding = net.create_load_balance(
             &mut runtime,
@@ -596,13 +591,11 @@ mod tests {
         assert_eq!(net.select_load_balance(selected, |_, _| Some(0)), Some(rx4));
         table.remove_route(destination, FibSource::API).unwrap();
         assert!(net.load_balance(forwarding.index()).is_none());
-        assert_eq!(interfaces.rx_dpo_interface(rx4), Some(software));
+        assert_eq!(net.rx_dpo_interface(rx4), Some(software));
         net.unlock_dpo(rx4);
         assert_eq!(hammer_service::net::InterfaceRxDpo::memory().1, 0);
         drop(table);
-        interfaces
-            .delete_hardware_interface(&mut runtime, hardware)
-            .unwrap();
+        interfaces.delete_hardware_interface(&mut runtime, hardware);
 
         // VPP plugins/unittest/fib_test.c:774-834 checks multipath buckets
         // through a route and pool reclamation after withdrawal. Distinct RX
@@ -612,21 +605,17 @@ mod tests {
         let mut hardware_interfaces = Vec::new();
         let mut rx_paths = Vec::new();
         for instance in 0..8 {
-            let hardware = interfaces
-                .register_hardware_interface(
-                    &mut runtime,
-                    device_class_index,
-                    instance,
-                    hw_class_index,
-                    0,
-                )
-                .unwrap();
+            let hardware = interfaces.register_interface(
+                &mut runtime,
+                device_class_index,
+                instance,
+                hw_class_index,
+                0,
+            );
             let software = interfaces.hardware_interface(hardware).sw_if_index;
             hardware_interfaces.push(hardware);
             rx_paths.push(LoadBalancePath {
-                dpo: interfaces
-                    .add_or_lock_rx_dpo(DpoProto::IP4, software)?
-                    .unwrap(),
+                dpo: net.add_or_lock_rx_dpo(DpoProto::IP4, software)?.unwrap(),
                 path_index: instance,
                 weight: 1,
             });
@@ -821,9 +810,7 @@ mod tests {
         assert_eq!(hammer_service::net::InterfaceRxDpo::memory().1, rx_count);
         drop(table);
         for hardware in hardware_interfaces {
-            interfaces
-                .delete_hardware_interface(&mut runtime, hardware)
-                .unwrap();
+            interfaces.delete_hardware_interface(&mut runtime, hardware);
         }
         crate::local::tests::receive_interface_and_checksum(&mut runtime).unwrap();
         crate::icmp_error::error_response_source_and_origin(&mut runtime)?;

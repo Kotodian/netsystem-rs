@@ -549,10 +549,7 @@ impl NodeRuntimeInner {
         );
 
         for slot in 0..current.nodes.len() {
-            assert_eq!(
-                self.node_names[slot], current.node_names[slot],
-                "published worker graph changed node identity"
-            );
+            let recycled = self.node_names[slot] != current.node_names[slot];
             assert_eq!(
                 self.nodes[slot].kind, current.nodes[slot].kind,
                 "published worker graph changed node role"
@@ -562,9 +559,12 @@ impl NodeRuntimeInner {
                 "published worker graph changed node error layout"
             );
 
-            // The main thread publishes topology and process functions. The
-            // worker retains only state owned by its established node instance.
-            self.nodes[slot].runtime_data = current.nodes[slot].runtime_data;
+            // A renamed node is a deliberately recycled identity and keeps
+            // the runtime published by the topology owner. An unchanged node
+            // retains state owned by its established worker-local instance.
+            if !recycled {
+                self.nodes[slot].runtime_data = current.nodes[slot].runtime_data;
+            }
             self.node_states[slot] = current.node_states[slot];
             self.input_main_loops_per_call[slot] = current.input_main_loops_per_call[slot];
         }
@@ -1438,6 +1438,61 @@ impl NodeMain {
         descriptor: NodeDescriptor<'_>,
     ) -> RuntimeResult<NodeId> {
         self.register_descriptor(kind, descriptor)
+    }
+
+    pub fn recycle_node_descriptor(
+        &self,
+        node: NodeId,
+        descriptor: NodeDescriptor<'_>,
+    ) -> RuntimeResult<()> {
+        self.ensure_topology_owner()?;
+        let workers_running =
+            crate::barrier::global().is_some_and(|barrier| barrier.worker_count() != 0);
+        if workers_running {
+            crate::barrier::__assert_held();
+        }
+        let Some(NodeRegistration::Next { name, next_count }) = descriptor.registration else {
+            return Err(RuntimeError::NamedNextRegistrationKindInvalid);
+        };
+        if !descriptor.initial_nexts.is_empty() {
+            return Err(RuntimeError::InitialNextCountMismatch {
+                declared: 0,
+                actual: descriptor.initial_nexts.len(),
+            });
+        }
+
+        let mut inner = self.inner.borrow_mut();
+        inner.validate_node(node)?;
+        let slot = node.slot() as usize;
+        if inner.next_nodes[slot].len() != next_count {
+            return Err(RuntimeError::InitialNextCountMismatch {
+                declared: inner.next_nodes[slot].len(),
+                actual: next_count,
+            });
+        }
+        if let Some(existing) = inner.declared_nodes.get(name)
+            && *existing != node
+        {
+            return Err(RuntimeError::NodeNameAlreadyRegistered { name });
+        }
+        if let Some(old_name) = inner.node_names[slot]
+            && old_name != name
+        {
+            inner.declared_nodes.remove(old_name);
+        }
+        inner.declared_nodes.insert(name, node);
+        inner.node_names[slot] = Some(name);
+        inner.node_trace_formatters[slot] = descriptor.trace_formatter;
+        inner.nodes[slot].process = descriptor.process;
+        inner.nodes[slot].runtime_data = Some(descriptor.runtime_data);
+        drop(inner);
+
+        if let Some(barrier) =
+            crate::barrier::global().filter(|barrier| barrier.worker_count() != 0)
+        {
+            barrier.request_node_refork(self.inner.borrow().clone());
+        }
+        Ok(())
     }
 
     fn register_descriptor(

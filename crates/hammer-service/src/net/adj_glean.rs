@@ -31,7 +31,6 @@ impl<P: FibProtocol> AdjacencyGleanMain<P> {
         link: P::Link,
         sw_if_index: u32,
         connected: P::Prefix,
-        mtu: u16,
     ) -> AdjacencyIndex {
         hammer_runtime::ensure_main_thread_with_barrier()
             .expect("glean publication requires the main-thread barrier");
@@ -42,24 +41,19 @@ impl<P: FibProtocol> AdjacencyGleanMain<P> {
                 let index = adjacency.insert(
                     P::glean_subtype(connected),
                     link,
-                    sw_if_index,
-                    mtu,
                     self.node.slot(),
                     AdjacencyLookupNext::Glean,
                 );
                 let interfaces =
                     NetMain::global().expect("glean rewrite requires the network Main");
                 let object = adjacency.get_mut(index);
-                object.rewrite.init(main, self.node, P::dpo_protocol(link));
-                let length = P::build_rewrite(
-                    interfaces.interface_main(),
-                    sw_if_index,
-                    link,
-                    None,
-                    &mut object.rewrite.data,
-                );
-                object.rewrite.data_bytes =
-                    u16::try_from(length).expect("adjacency rewrite length fits its storage");
+                let target = interfaces
+                    .interface_main()
+                    .tx_node_index_for_sw_interface(sw_if_index);
+                object
+                    .rewrite_header
+                    .init(main, sw_if_index, P::mtu_kind(link), self.node, target);
+                object.rewrite_header.clear_data(&mut object.rewrite_data);
                 self.tables
                     .entry(sw_if_index)
                     .or_default()
@@ -113,7 +107,7 @@ impl<P: FibProtocol> AdjacencyGleanMain<P> {
     pub fn remove(&mut self, adjacency: &AdjacencyMain<P>, index: AdjacencyIndex) {
         let object = adjacency.get(index);
         assert_eq!(object.lookup_next, AdjacencyLookupNext::Glean);
-        let sw_if_index = object.rewrite.sw_if_index;
+        let sw_if_index = object.rewrite_header.sw_if_index;
         let connected = P::glean_prefix(&object.subtype);
         let table = self
             .tables

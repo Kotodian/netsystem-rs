@@ -1,64 +1,84 @@
-use std::mem::{offset_of, size_of};
+use std::mem::size_of;
 
 use hammer_core::data_plane::NodeId;
 use hammer_runtime::DataPlaneMain;
 
-use super::{DpoId, DpoProto, NetMain};
+use crate::interface::{InterfaceMain, InterfaceMtuKind};
+
+pub const REWRITE_HAS_FEATURES: u8 = 1 << 0;
 
 #[repr(C)]
-#[derive(Debug, Clone)]
-pub struct AdjacencyRewrite {
+#[derive(Clone, Copy, Debug)]
+pub struct RewriteHeader {
     pub sw_if_index: u32,
     pub next_index: u16,
     pub data_bytes: u16,
     pub max_l3_packet_bytes: u16,
     pub flags: u8,
     pub dst_mcast_offset: u8,
-    pub data: [u8; 116],
 }
 
-impl AdjacencyRewrite {
-    pub fn new(sw_if_index: u32, mtu: u16) -> Self {
+impl RewriteHeader {
+    pub const fn poisoned() -> Self {
         Self {
-            sw_if_index,
-            next_index: 0,
-            data_bytes: 0,
-            max_l3_packet_bytes: mtu,
+            sw_if_index: u32::MAX,
+            next_index: 0xfefe,
+            data_bytes: 0xfefe,
+            max_l3_packet_bytes: 0xfefe,
             flags: 0,
-            dst_mcast_offset: 0,
-            data: [0xfe; 116],
+            dst_mcast_offset: 0xfe,
         }
     }
 
-    pub fn init(&mut self, main: &mut DataPlaneMain, adjacency_node: NodeId, proto: DpoProto) {
-        let net = NetMain::global().expect("rewrite requires initialized network owner");
-        let output = DpoId::interface_tx(proto, self.sw_if_index);
-        self.next_index = net
-            .dpo_main_mut()
-            .stack_from_node(main, adjacency_node, output)
-            .expect("interface TX node must be registered before adjacency rewrite")
-            .next();
+    pub fn init(
+        &mut self,
+        main: &mut DataPlaneMain,
+        sw_if_index: u32,
+        mtu_kind: InterfaceMtuKind,
+        source_node: NodeId,
+        target_node: NodeId,
+    ) {
+        hammer_runtime::ensure_main_thread_with_barrier()
+            .expect("rewrite initialization requires publication ownership");
+        let interfaces = super::NetMain::global()
+            .expect("rewrite initialization requires the network Main")
+            .interface_main();
+        let interface = interfaces
+            .software_interface(sw_if_index)
+            .expect("rewrite interface must remain live during publication");
+        let mtu = interface.mtu.get(mtu_kind).min(u32::from(u16::MAX)) as u16;
+        let next_index = main
+            .nodes()
+            .add_node_next_slot(source_node, target_node)
+            .expect("rewrite target must be a registered graph node");
+        self.sw_if_index = sw_if_index;
+        self.next_index = next_index;
+        self.max_l3_packet_bytes = mtu;
     }
 
-    pub fn set_data(&mut self, bytes: &[u8]) {
+    pub fn set_data(&mut self, storage: &mut [u8; 116], bytes: &[u8]) {
         assert!(
-            bytes.len() <= self.data.len(),
+            bytes.len() <= storage.len(),
             "adjacency rewrite exceeds 116 bytes"
         );
-        self.data[..bytes.len()].copy_from_slice(bytes);
-        self.data[bytes.len()..].fill(0xfe);
+        storage[..bytes.len()].copy_from_slice(bytes);
+        storage[bytes.len()..].fill(0xfe);
         self.data_bytes = bytes.len() as u16;
     }
 
-    pub fn clear_data(&mut self) {
-        self.data.fill(0xfe);
+    pub fn clear_data(&mut self, storage: &mut [u8; 116]) {
+        storage.fill(0xfe);
         self.data_bytes = 0;
     }
 
-    pub fn update_mtu(&mut self, mtu: u16) {
-        self.max_l3_packet_bytes = mtu;
+    pub fn update_mtu(&mut self, interfaces: &InterfaceMain, mtu_kind: InterfaceMtuKind) {
+        self.max_l3_packet_bytes = interfaces
+            .software_interface(self.sw_if_index)
+            .expect("rewrite interface must remain live during MTU publication")
+            .mtu
+            .get(mtu_kind)
+            .min(u32::from(u16::MAX)) as u16;
     }
 }
 
-const _: () = assert!(size_of::<AdjacencyRewrite>() == 128);
-const _: () = assert!(offset_of!(AdjacencyRewrite, data) == 12);
+const _: () = assert!(size_of::<RewriteHeader>() == 12);

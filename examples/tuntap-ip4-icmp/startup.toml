@@ -1,0 +1,21 @@
+plugins = ["tuntap", "icmp"]
+
+[memory]
+main_heap_size = "256 MiB"
+
+[worker]
+count = 1
+
+[worker.buffer]
+slots_per_numa = 4096
+frame_pool_size = 64
+
+[statseg]
+socket_name = "/tmp/hammer-tuntap-ip4-icmp.stats"
+
+[plugin.tuntap]
+enabled = true
+name = "hammer0"
+mtu = 1500
+admin_up = true
+ip4_address = "192.0.2.1/31"

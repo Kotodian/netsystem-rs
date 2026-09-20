@@ -1203,10 +1203,12 @@ version = "0.1.0"
 dependencies = [
  "abi_stable",
  "hammer-component-macros",
+ "hammer-core",
  "hammer-infra",
  "hammer-plugin-ip",
  "hammer-runtime",
  "hammer-service",
+ "ipnet",
  "libc",
  "linkme",
  "serde",

@@ -511,7 +511,6 @@ fn process_index(
                 .lookup
                 .forwarding;
             let interface = NetMain::global()?
-                .interface_main()
                 .receive_dpo_interface(forwarding)
                 .expect("receive node requires an occupied receive DPO");
             if interface != u32::MAX {
@@ -955,13 +954,13 @@ pub(crate) mod tests {
         );
         (crate::interface::__INIT_FN_IP6_LINK_INIT.func)(runtime)?;
         interfaces.consume_registration_image(&crate::HAMMER_INTERFACE_REGISTRATION_IMAGE)?;
-        let hardware = interfaces.register_hardware_interface(
+        let hardware = interfaces.register_interface(
             runtime,
             interfaces.device_class_index("local"),
             0,
             interfaces.hw_class_index("local"),
             0,
-        )?;
+        );
         let effective_rx = interfaces.hardware_interface(hardware).sw_if_index();
         let raw_rx = net.local_interface_sw_index();
         let families = [
@@ -1020,12 +1019,12 @@ pub(crate) mod tests {
             }
             let feature = features.feature_index(arc, end_name).unwrap();
             features.enable_feature(runtime, arc, feature, effective_rx, &[])?;
-            let dpo = interfaces
+            let dpo = net
                 .add_or_lock_receive_dpo(effective_rx, address.parse().unwrap())?
                 .unwrap();
             net.lock_dpo(dpo);
             net.unlock_dpo(dpo);
-            assert_eq!(interfaces.receive_dpo_interface(dpo), Some(effective_rx));
+            assert_eq!(net.receive_dpo_interface(dpo), Some(effective_rx));
 
             // VPP local accepts already-correct/offloaded checksums and rejects
             // an already-computed failure without recomputing it.
@@ -1128,10 +1127,10 @@ pub(crate) mod tests {
                 assert_eq!(runtime.cached_free_buffers(), cached_free + segments);
             }
             net.unlock_dpo(dpo);
-            assert_eq!(interfaces.receive_dpo_interface(dpo), None);
+            assert_eq!(net.receive_dpo_interface(dpo), None);
             features.disable_feature(runtime, arc, feature, effective_rx, &[])?;
         }
-        interfaces.delete_hardware_interface(runtime, hardware)?;
+        interfaces.delete_hardware_interface(runtime, hardware);
 
         Ok(())
     }

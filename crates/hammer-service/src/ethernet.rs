@@ -2,12 +2,14 @@ use std::cell::UnsafeCell;
 use std::sync::OnceLock;
 
 use hammer_core::data_plane::{Frame, NodeId, NodeNext};
+use hammer_infra::pool::Pool;
 use hammer_infra::sparse_vec::SparseVec;
 use hammer_runtime::node::{NodeErrorCode, NodeErrorDescriptor, NodeErrorSeverity};
 use hammer_runtime::{DataPlaneMain, Node, NodeProcessFn, RuntimeError, RuntimeResult};
 use zerocopy::FromBytes;
 
 use crate::device::DeviceInputNode;
+use crate::interface::HwClass;
 use crate::opaque::NetworkOpaque;
 
 const ETHERNET_HEADER_LEN: usize = 14;
@@ -114,7 +116,33 @@ impl Node for EthernetInputNode {
 
 pub struct EthernetMain {
     next_by_ethertype: UnsafeCell<SparseVec<u16>>,
+    pub(crate) interfaces: UnsafeCell<Pool<EthernetInterface>>,
 }
+
+#[derive(Clone, Copy)]
+pub struct EthernetInterfaceRegistration {
+    pub dev_class_index: u32,
+    pub dev_instance: u32,
+    pub max_frame_size: u16,
+    pub frame_overhead: u16,
+    pub flag_change: Option<fn()>,
+    pub set_max_frame_size: Option<fn()>,
+    pub address: [u8; 6],
+}
+
+pub(crate) struct EthernetInterface {
+    pub(crate) flag_change: Option<fn()>,
+    pub(crate) set_max_frame_size: Option<fn()>,
+    pub(crate) flags: u32,
+    pub(crate) address: [u8; 6],
+}
+
+#[crate::__private::distributed_slice(crate::__HAMMER_HW_CLASS_REGISTRATIONS)]
+static ETHERNET_HW_CLASS: HwClass = {
+    let mut class = HwClass::new("ethernet");
+    class.build_rewrite = Some(ethernet_build_rewrite);
+    class
+};
 
 // SAFETY: startup callbacks mutate the table on the main thread before Data
 // Workers start. Packet processing only reads it after startup publication.
@@ -129,6 +157,7 @@ impl EthernetMain {
     fn new() -> Self {
         Self {
             next_by_ethertype: UnsafeCell::new(SparseVec::with_index_bits(u16::BITS as u8)),
+            interfaces: UnsafeCell::new(Pool::new()),
         }
     }
 
@@ -189,6 +218,49 @@ impl EthernetMain {
 )]
 fn ethernet_main_init() -> RuntimeResult<()> {
     EthernetMain::init()
+}
+
+fn ethernet_build_rewrite(
+    interfaces: &crate::interface::InterfaceMain,
+    sw_if_index: u32,
+    ethernet_type: Option<u16>,
+    destination: Option<&[u8]>,
+    output: &mut [u8],
+) -> usize {
+    let Some(ethernet_type) = ethernet_type else {
+        return 0;
+    };
+    assert!(
+        output.len() >= ETHERNET_HEADER_LEN,
+        "Ethernet rewrite storage holds one header"
+    );
+    let software = interfaces
+        .software_interface(sw_if_index)
+        .expect("Ethernet rewrite requires a live software interface");
+    let primary = interfaces
+        .software_interface(software.sup_sw_if_index)
+        .expect("Ethernet rewrite requires a live super-interface");
+    let hardware = interfaces.hardware_interface(
+        software
+            .hw_if_index
+            .or(primary.hw_if_index)
+            .expect("Ethernet rewrite requires a hardware interface"),
+    );
+    let ethernet = EthernetMain::global().expect("Ethernet Main exists before rewrite building");
+    // SAFETY: Ethernet interface records are immutable after startup publication.
+    let interface = unsafe { &*ethernet.interfaces.get() }
+        .get(hardware.hw_instance)
+        .expect("Ethernet hardware instance names a live Ethernet interface");
+    let destination = destination.unwrap_or(&[u8::MAX; 6]);
+    assert_eq!(
+        destination.len(),
+        6,
+        "Ethernet rewrite destination is one MAC address"
+    );
+    output[..6].copy_from_slice(destination);
+    output[6..12].copy_from_slice(&interface.address);
+    output[12..14].copy_from_slice(&ethernet_type.to_be_bytes());
+    ETHERNET_HEADER_LEN
 }
 
 #[inline(always)]
