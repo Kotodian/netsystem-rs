@@ -749,9 +749,10 @@ mod tests {
                 .try_register_internal(IcmpNextNode { name })?;
         }
 
-        hammer_service::net::NetMain::init(Arc::new(
-            hammer_service::interface::InterfaceMain::new(),
-        ))?;
+        hammer_service::net::NetMain::init(
+            &mut runtime,
+            Arc::new(hammer_service::interface::InterfaceMain::new()),
+        )?;
         crate::IcmpMain::init()?;
         let main = crate::IcmpMain::global()?;
         let ip4_input = runtime.nodes().try_register_internal_with_next_names(

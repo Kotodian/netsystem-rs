@@ -7,8 +7,7 @@ use std::sync::{Arc, OnceLock};
 use hammer_core::data_plane::NodeId;
 use hammer_infra::bitmap::Bitmap;
 use hammer_infra::pool::Pool;
-use hammer_runtime::{DataWorkerId, RuntimeResult};
-use ipnet::IpNet;
+use hammer_runtime::{DataPlaneMain, DataWorkerId, RuntimeResult};
 
 use crate::interface::{InterfaceError, InterfaceMtu, InterfaceMtuKind, InterfaceResult};
 use crate::net::{DpoError, DpoId, DpoProto, DpoType, InterfaceRxDpo, NetMain, ReceiveDpo};
@@ -20,8 +19,11 @@ pub enum DriverScheduleMode {
     Adaptive,
 }
 
-pub type InterfaceCallback = fn(&InterfaceMain, u32, bool) -> InterfaceResult<()>;
+pub type InterfaceCallback =
+    fn(&mut DataPlaneMain, &InterfaceMain, u32, bool) -> InterfaceResult<()>;
 pub type FormatDeviceNameFn = for<'a, 'b> fn(u32, &'a mut fmt::Formatter<'b>) -> fmt::Result;
+pub type BuildRewrite = fn(&InterfaceMain, u32, Option<u16>, Option<&[u8]>, &mut [u8]) -> usize;
+pub type UpdateAdjacency = fn(&mut DataPlaneMain, u32, DpoId);
 
 bitflags::bitflags! {
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -149,8 +151,8 @@ pub struct HwClass {
     pub format_device: Option<fn()>,
     pub unformat_hw_address: Option<fn(&str) -> Result<(), InterfaceError>>,
     pub unformat_header: Option<fn()>,
-    pub build_rewrite: Option<fn()>,
-    pub update_adjacency: Option<fn()>,
+    pub build_rewrite: Option<BuildRewrite>,
+    pub update_adjacency: Option<UpdateAdjacency>,
     pub is_valid_class_for_interface: Option<fn() -> bool>,
     pub hw_class_change: Option<fn()>,
 }
@@ -198,6 +200,7 @@ pub struct InterfaceRegistrationImage {
     pub hw_interface_class_registrations: &'static linkme::DistributedSlice<[HwClass]>,
     pub hw_interface_callbacks: &'static [InterfaceCallbackRegistration],
     pub sw_interface_callbacks: &'static [InterfaceCallbackRegistration],
+    pub admin_up_down_callbacks: &'static [InterfaceCallbackRegistration],
 }
 
 impl InterfaceRegistrationImage {
@@ -206,12 +209,14 @@ impl InterfaceRegistrationImage {
         hw_interface_class_registrations: &'static linkme::DistributedSlice<[HwClass]>,
         hw_interface_callbacks: &'static [InterfaceCallbackRegistration],
         sw_interface_callbacks: &'static [InterfaceCallbackRegistration],
+        admin_up_down_callbacks: &'static [InterfaceCallbackRegistration],
     ) -> Self {
         Self {
             device_class_registrations,
             hw_interface_class_registrations,
             hw_interface_callbacks,
             sw_interface_callbacks,
+            admin_up_down_callbacks,
         }
     }
 }
@@ -263,7 +268,6 @@ pub struct SwInterface {
     pub unnumbered_sw_if_index: Option<u32>,
     pub hw_if_index: Option<u32>,
     pub mtu: InterfaceMtu,
-    pub addresses: Vec<u32>,
 }
 
 impl SwInterface {
@@ -338,12 +342,13 @@ struct InterfaceState {
     names: HashMap<String, u32>,
     device_class_by_name: HashMap<&'static str, u32>,
     hw_class_by_name: HashMap<&'static str, u32>,
-    addresses: Pool<(u32, IpNet)>,
     receive_dpos: Pool<ReceiveDpo<IpAddr>>,
     device_classes: Vec<DeviceClass>,
     hw_classes: Vec<HwClass>,
     hw_callbacks: Vec<InterfaceCallbackRegistration>,
     sw_callbacks: Vec<InterfaceCallbackRegistration>,
+    admin_up_down_callbacks: Vec<InterfaceCallbackRegistration>,
+    mtu_callbacks: Vec<fn(&mut DataPlaneMain, &InterfaceMain, u32)>,
 }
 
 pub struct InterfaceMain {
@@ -548,6 +553,7 @@ impl InterfaceMain {
         self.consume_callback_registrations(
             image.hw_interface_callbacks,
             image.sw_interface_callbacks,
+            image.admin_up_down_callbacks,
         );
         Ok(())
     }
@@ -585,15 +591,22 @@ impl InterfaceMain {
         &self,
         hw_callbacks: &'static [InterfaceCallbackRegistration],
         sw_callbacks: &'static [InterfaceCallbackRegistration],
+        admin_up_down_callbacks: &'static [InterfaceCallbackRegistration],
     ) {
         let state = self.state_mut();
         state.hw_callbacks.extend_from_slice(hw_callbacks);
         state.sw_callbacks.extend_from_slice(sw_callbacks);
         state
+            .admin_up_down_callbacks
+            .extend_from_slice(admin_up_down_callbacks);
+        state
             .hw_callbacks
             .sort_by_key(|registration| registration.priority);
         state
             .sw_callbacks
+            .sort_by_key(|registration| registration.priority);
+        state
+            .admin_up_down_callbacks
             .sort_by_key(|registration| registration.priority);
     }
 
@@ -615,12 +628,13 @@ impl InterfaceMain {
 
     pub fn register_hardware_interface(
         &self,
+        main: &mut DataPlaneMain,
         device_class_index: u32,
         device_instance: u32,
         hw_class_index: u32,
         hw_instance: u32,
     ) -> InterfaceResult<u32> {
-        hammer_runtime::ensure_main_thread()?;
+        hammer_runtime::ensure_main_thread_with_barrier()?;
         let state = self.state_mut();
         let device_class = *state
             .device_classes
@@ -680,7 +694,6 @@ impl InterfaceMain {
             unnumbered_sw_if_index: None,
             hw_if_index: Some(hw_if_index),
             mtu: InterfaceMtu::default(),
-            addresses: Vec::new(),
         });
         state
             .hardware_interfaces
@@ -703,18 +716,18 @@ impl InterfaceMain {
             .expect("inserted software interface")
             .sup_sw_if_index = sw_if_index;
         state.names.insert(name, hw_if_index);
-        if let Err(primary) = self.call_sw_interface_add_del(sw_if_index, true) {
-            if let Err(cleanup) = self.call_sw_interface_add_del(sw_if_index, false) {
+        if let Err(primary) = self.call_sw_interface_add_del(main, sw_if_index, true) {
+            if let Err(cleanup) = self.call_sw_interface_add_del(main, sw_if_index, false) {
                 tracing::warn!(%cleanup, sw_if_index, "software interface creation rollback callback failed");
             }
             self.remove_interface_slots(hw_if_index);
             return Err(primary);
         }
-        if let Err(primary) = self.call_hw_interface_add_del(hw_if_index, true) {
-            if let Err(cleanup) = self.call_hw_interface_add_del(hw_if_index, false) {
+        if let Err(primary) = self.call_hw_interface_add_del(main, hw_if_index, true) {
+            if let Err(cleanup) = self.call_hw_interface_add_del(main, hw_if_index, false) {
                 tracing::warn!(%cleanup, hw_if_index, "hardware interface creation rollback callback failed");
             }
-            if let Err(cleanup) = self.call_sw_interface_add_del(sw_if_index, false) {
+            if let Err(cleanup) = self.call_sw_interface_add_del(main, sw_if_index, false) {
                 tracing::warn!(%cleanup, sw_if_index, "software interface creation rollback callback failed");
             }
             self.remove_interface_slots(hw_if_index);
@@ -816,10 +829,11 @@ impl InterfaceMain {
 
     pub fn set_hardware_flags(
         &self,
+        main: &mut DataPlaneMain,
         hw_if_index: u32,
         flags: HwInterfaceFlags,
     ) -> InterfaceResult<()> {
-        hammer_runtime::ensure_main_thread()?;
+        hammer_runtime::ensure_main_thread_with_barrier()?;
         let state = self.state();
         let hardware =
             state
@@ -838,7 +852,12 @@ impl InterfaceMain {
             .expect("hardware interface names an installed class")
             .link_up_down_function;
         if let Some(callback) = callback {
-            callback(self, hw_if_index, flags.contains(HwInterfaceFlags::LINK_UP))?;
+            callback(
+                main,
+                self,
+                hw_if_index,
+                flags.contains(HwInterfaceFlags::LINK_UP),
+            )?;
         }
         self.state_mut()
             .hardware_interfaces
@@ -850,10 +869,11 @@ impl InterfaceMain {
 
     pub fn set_software_flags(
         &self,
+        main: &mut DataPlaneMain,
         sw_if_index: u32,
         flags: SwInterfaceFlags,
     ) -> InterfaceResult<()> {
-        hammer_runtime::ensure_main_thread()?;
+        hammer_runtime::ensure_main_thread_with_barrier()?;
         let state = self.state();
         let software =
             state
@@ -866,8 +886,13 @@ impl InterfaceMain {
         if old_flags == flags {
             return Ok(());
         }
+        let primary = state
+            .software_interfaces
+            .get(software.sup_sw_if_index)
+            .expect("software interface names an occupied super-interface");
         let hw_if_index = software
             .hw_if_index
+            .or(primary.hw_if_index)
             .expect("hardware software-interface has a hardware owner");
         let hardware = state
             .hardware_interfaces
@@ -883,14 +908,27 @@ impl InterfaceMain {
             .get(hardware.hw_class_index as usize)
             .expect("hardware interface names an installed hardware class")
             .admin_up_down_function;
+        let admin_callbacks = state.admin_up_down_callbacks.clone();
         let is_up = flags.contains(SwInterfaceFlags::ADMIN_UP);
         self.state_mut()
             .software_interfaces
             .get_mut(sw_if_index)
             .expect("validated software interface remains occupied")
             .flags = flags;
+        if (flags | old_flags).contains(SwInterfaceFlags::ADMIN_UP) {
+            for registration in admin_callbacks {
+                if let Err(error) = (registration.callback)(main, self, sw_if_index, is_up) {
+                    self.state_mut()
+                        .software_interfaces
+                        .get_mut(sw_if_index)
+                        .expect("rejected software flag change retains its slot")
+                        .flags = old_flags;
+                    return Err(error);
+                }
+            }
+        }
         if let Some(callback) = device_callback {
-            if let Err(error) = callback(self, hw_if_index, is_up) {
+            if let Err(error) = callback(main, self, hw_if_index, is_up) {
                 self.state_mut()
                     .software_interfaces
                     .get_mut(sw_if_index)
@@ -900,7 +938,7 @@ impl InterfaceMain {
             }
         }
         if let Some(callback) = hw_callback {
-            if let Err(error) = callback(self, hw_if_index, is_up) {
+            if let Err(error) = callback(main, self, hw_if_index, is_up) {
                 self.state_mut()
                     .software_interfaces
                     .get_mut(sw_if_index)
@@ -912,7 +950,11 @@ impl InterfaceMain {
         Ok(())
     }
 
-    pub fn delete_hardware_interface(&self, hw_if_index: u32) -> InterfaceResult<()> {
+    pub fn delete_hardware_interface(
+        &self,
+        main: &mut DataPlaneMain,
+        hw_if_index: u32,
+    ) -> InterfaceResult<()> {
         hammer_runtime::ensure_main_thread_with_barrier()?;
         let hw = self
             .state()
@@ -923,9 +965,9 @@ impl InterfaceMain {
             })?
             .clone();
         let mut primary_error = self
-            .set_hardware_flags(hw_if_index, HwInterfaceFlags::empty())
+            .set_hardware_flags(main, hw_if_index, HwInterfaceFlags::empty())
             .err();
-        if let Err(error) = self.call_hw_interface_add_del(hw_if_index, false) {
+        if let Err(error) = self.call_hw_interface_add_del(main, hw_if_index, false) {
             if primary_error.is_none() {
                 primary_error = Some(error);
             } else {
@@ -933,14 +975,15 @@ impl InterfaceMain {
             }
         }
         self.remove_interface_queues(hw_if_index);
-        if let Err(error) = self.set_software_flags(hw.sw_if_index, SwInterfaceFlags::empty()) {
+        if let Err(error) = self.set_software_flags(main, hw.sw_if_index, SwInterfaceFlags::empty())
+        {
             if primary_error.is_none() {
                 primary_error = Some(error);
             } else {
                 tracing::warn!(%error, sw_if_index = hw.sw_if_index, "software interface down callback failed during deletion");
             }
         }
-        if let Err(error) = self.call_sw_interface_add_del(hw.sw_if_index, false) {
+        if let Err(error) = self.call_sw_interface_add_del(main, hw.sw_if_index, false) {
             if primary_error.is_none() {
                 primary_error = Some(error);
             } else {
@@ -987,11 +1030,7 @@ impl InterfaceMain {
         for index in hw.tx_queue_indices {
             state.tx_queues.remove(index);
         }
-        if let Some(software) = state.software_interfaces.remove(hw.sw_if_index) {
-            for address in software.addresses {
-                state.addresses.remove(address);
-            }
-        }
+        state.software_interfaces.remove(hw.sw_if_index);
         state.names.retain(|_, index| *index != hw_if_index);
         state
             .hardware_interfaces
@@ -1007,6 +1046,62 @@ impl InterfaceMain {
     }
     pub fn software_interface(&self, index: u32) -> Option<&SwInterface> {
         self.state().software_interfaces.get(index)
+    }
+
+    fn hw_class_for_software(&self, sw_if_index: u32) -> HwClass {
+        let state = self.state();
+        let software = state
+            .software_interfaces
+            .get(sw_if_index)
+            .expect("hardware class query requires a live interface");
+        let primary = state
+            .software_interfaces
+            .get(software.sup_sw_if_index)
+            .expect("software interface names a live super-interface");
+        let hardware = state
+            .hardware_interfaces
+            .get(
+                software
+                    .hw_if_index
+                    .or(primary.hw_if_index)
+                    .expect("hardware interface required"),
+            )
+            .expect("software interface names a live hardware interface");
+        state.hw_classes[hardware.hw_class_index as usize]
+    }
+
+    pub fn is_p2p(&self, sw_if_index: u32) -> bool {
+        self.hw_class_for_software(sw_if_index)
+            .flags
+            .contains(HwClassFlags::P2P)
+    }
+
+    pub fn build_rewrite(
+        &self,
+        sw_if_index: u32,
+        ethernet_type: Option<u16>,
+        destination: Option<&[u8]>,
+        output: &mut [u8],
+    ) -> usize {
+        let class = self.hw_class_for_software(sw_if_index);
+        let written = class.build_rewrite.map_or(0, |build| {
+            build(self, sw_if_index, ethernet_type, destination, output)
+        });
+        assert!(
+            written <= output.len(),
+            "interface class exceeded rewrite capacity"
+        );
+        written
+    }
+
+    pub fn software_interface_indices(&self) -> Vec<u32> {
+        hammer_runtime::ensure_main_thread_with_barrier()
+            .expect("software interface enumeration requires the publication scope");
+        self.state()
+            .software_interfaces
+            .iter()
+            .map(|(index, _)| index)
+            .collect()
     }
 
     pub fn interface_index(&self, name: &str) -> Option<u32> {
@@ -1039,38 +1134,12 @@ impl InterfaceMain {
             .get(index)
             .map(|hw| hw.name.clone())
     }
-    pub fn interface_addresses(&self, index: u32) -> Vec<IpNet> {
-        let state = self.state();
-        let Some(interface) = state.software_interfaces.get(index) else {
-            return Vec::new();
-        };
-        interface
-            .addresses
-            .iter()
-            .filter_map(|index| state.addresses.get(*index))
-            .map(|(_, address)| *address)
-            .collect()
-    }
-    /// Returns a copy of an occupied address slot. Removal invalidates its
-    /// index; later insertion may reuse it, without moving other live slots.
-    pub fn interface_address(&self, index: u32) -> Option<IpNet> {
-        self.state()
-            .addresses
-            .get(index)
-            .map(|(_, address)| *address)
-    }
     pub fn interface_mtu(&self, index: u32) -> Option<InterfaceMtu> {
         self.state()
             .hardware_interfaces
             .get(index)
             .and_then(|hw| self.software_interface(hw.sw_if_index))
             .map(|sw| sw.mtu)
-    }
-    pub fn interface_address_index(&self, index: u32, address: IpNet) -> Option<u32> {
-        self.state()
-            .addresses
-            .iter()
-            .find_map(|(slot, (item, value))| (*item == index && *value == address).then_some(slot))
     }
 
     pub fn register_rx_queue(
@@ -1187,71 +1256,67 @@ impl InterfaceMain {
             .map(|(_, queue)| queue.output_slot)
     }
 
-    pub fn set_mtu(&self, sw_if_index: u32, mtu: InterfaceMtu) -> InterfaceResult<()> {
-        self.state_mut()
+    pub fn register_mtu_callback(&self, callback: fn(&mut DataPlaneMain, &InterfaceMain, u32)) {
+        hammer_runtime::ensure_main_thread()
+            .expect("interface MTU callback registration is main-thread-only");
+        assert!(
+            !hammer_runtime::barrier::global().is_some_and(|barrier| barrier.worker_count() != 0),
+            "interface MTU callbacks register before Data Worker startup"
+        );
+        self.state_mut().mtu_callbacks.push(callback);
+    }
+
+    pub fn set_mtu(
+        &self,
+        main: &mut DataPlaneMain,
+        sw_if_index: u32,
+        mtu: InterfaceMtu,
+    ) -> InterfaceResult<()> {
+        hammer_runtime::ensure_main_thread_with_barrier()?;
+        let interface = self
+            .state_mut()
             .software_interfaces
             .get_mut(sw_if_index)
             .ok_or(InterfaceError::NotRegistered {
                 interface_index: sw_if_index,
-            })?
-            .mtu = mtu;
+            })?;
+        if interface.mtu != mtu {
+            interface.mtu = mtu;
+            for callback in self.state().mtu_callbacks.clone() {
+                callback(main, self, sw_if_index);
+            }
+        }
         Ok(())
     }
     pub fn set_protocol_mtu(
         &self,
+        main: &mut DataPlaneMain,
         sw_if_index: u32,
         kind: InterfaceMtuKind,
         value: u32,
     ) -> InterfaceResult<()> {
+        hammer_runtime::ensure_main_thread_with_barrier()?;
         let state = self.state_mut();
         let sw = state.software_interfaces.get_mut(sw_if_index).ok_or(
             InterfaceError::NotRegistered {
                 interface_index: sw_if_index,
             },
         )?;
-        sw.mtu.set(kind, value);
+        if sw.mtu.get(kind) != value {
+            sw.mtu.set(kind, value);
+            for callback in self.state().mtu_callbacks.clone() {
+                callback(main, self, sw_if_index);
+            }
+        }
         Ok(())
     }
-    pub fn add_address(&self, sw_if_index: u32, address: IpNet) -> InterfaceResult<u32> {
-        let state = self.state_mut();
-        let software = state.software_interfaces.get_mut(sw_if_index).ok_or(
-            InterfaceError::NotRegistered {
-                interface_index: sw_if_index,
-            },
-        )?;
-        if let Some(index) = state.addresses.iter().find_map(|(index, (item, value))| {
-            (*item == sw_if_index && *value == address).then_some(index)
-        }) {
-            return Ok(index);
-        }
-        let index = state.addresses.insert((sw_if_index, address));
-        software.addresses.push(index);
-        Ok(index)
-    }
-    pub fn remove_address(&self, sw_if_index: u32, address: IpNet) -> InterfaceResult<bool> {
-        let state = self.state_mut();
-        let software = state.software_interfaces.get_mut(sw_if_index).ok_or(
-            InterfaceError::NotRegistered {
-                interface_index: sw_if_index,
-            },
-        )?;
-        let Some(index) = state.addresses.iter().find_map(|(index, (item, value))| {
-            (*item == sw_if_index && *value == address).then_some(index)
-        }) else {
-            return Ok(false);
-        };
-        state.addresses.remove(index);
-        if let Some(position) = software.addresses.iter().position(|slot| *slot == index) {
-            software.addresses.remove(position);
-        }
-        Ok(true)
-    }
-
     pub fn call_hw_interface_add_del(
         &self,
+        main: &mut DataPlaneMain,
         hw_if_index: u32,
         is_create: bool,
     ) -> InterfaceResult<()> {
+        hammer_runtime::ensure_main_thread_with_barrier()?;
         let (hw_class, device_class, callbacks) = {
             let state = self.state();
             let hw = state.hardware_interfaces.get(hw_if_index).ok_or(
@@ -1272,26 +1337,34 @@ impl InterfaceMain {
             )
         };
         if let Some(callback) = hw_class {
-            callback(self, hw_if_index, is_create)?;
+            callback(main, self, hw_if_index, is_create)?;
         }
         if let Some(callback) = device_class {
-            callback(self, hw_if_index, is_create)?;
+            callback(main, self, hw_if_index, is_create)?;
         }
         for registration in callbacks {
-            (registration.callback)(self, hw_if_index, is_create)?;
+            (registration.callback)(main, self, hw_if_index, is_create)?;
         }
         Ok(())
     }
 
     pub fn call_sw_interface_add_del(
         &self,
+        main: &mut DataPlaneMain,
         sw_if_index: u32,
         is_create: bool,
     ) -> InterfaceResult<()> {
-        self.call_callbacks(sw_if_index, is_create, self.state().sw_callbacks.clone())
+        hammer_runtime::ensure_main_thread_with_barrier()?;
+        self.call_callbacks(
+            main,
+            sw_if_index,
+            is_create,
+            self.state().sw_callbacks.clone(),
+        )
     }
     fn call_callbacks(
         &self,
+        main: &mut DataPlaneMain,
         sw_if_index: u32,
         state: bool,
         callbacks: Vec<InterfaceCallbackRegistration>,
@@ -1302,7 +1375,7 @@ impl InterfaceMain {
             });
         }
         for registration in callbacks {
-            (registration.callback)(self, sw_if_index, state)?;
+            (registration.callback)(main, self, sw_if_index, state)?;
         }
         Ok(())
     }
@@ -1324,6 +1397,7 @@ pub(crate) static SERVICE_INTERFACE_REGISTRATION_IMAGE: InterfaceRegistrationIma
         &crate::__HAMMER_HW_CLASS_REGISTRATIONS,
         &[],
         &crate::feature::FEATURE_SW_INTERFACE_CALLBACKS,
+        &[],
     );
 
 #[hammer_component_macros::init_function(name = "interface_main_init")]
@@ -1332,6 +1406,7 @@ pub fn interface_main_init() -> RuntimeResult<()> {
     interfaces.consume_callback_registrations(
         SERVICE_INTERFACE_REGISTRATION_IMAGE.hw_interface_callbacks,
         SERVICE_INTERFACE_REGISTRATION_IMAGE.sw_interface_callbacks,
+        SERVICE_INTERFACE_REGISTRATION_IMAGE.admin_up_down_callbacks,
     );
     match hammer_runtime::PluginMain::global() {
         Ok(plugins) => {

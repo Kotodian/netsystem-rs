@@ -16,6 +16,13 @@ pub static __HAMMER_HW_CLASS_REGISTRATIONS: [device::HwClass];
 #[macro_export]
 macro_rules! declare_interface_registration_image {
     () => {
+        $crate::declare_interface_registration_image!(
+            hw_callbacks = [],
+            sw_callbacks = [],
+            admin_callbacks = []
+        );
+    };
+    (hw_callbacks = [$($hw_callback:expr),* $(,)?], sw_callbacks = [$($sw_callback:expr),* $(,)?], admin_callbacks = [$($admin_callback:expr),* $(,)?]) => {
         #[::hammer_service::__private::distributed_slice]
         #[doc(hidden)]
         pub static __HAMMER_DEVICE_CLASS_REGISTRATIONS: [::hammer_service::device::DeviceClass];
@@ -31,8 +38,9 @@ macro_rules! declare_interface_registration_image {
             ::hammer_service::InterfaceRegistrationImage::new(
                 &__HAMMER_DEVICE_CLASS_REGISTRATIONS,
                 &__HAMMER_HW_CLASS_REGISTRATIONS,
-                &[],
-                &[],
+                &[$($hw_callback),*],
+                &[$($sw_callback),*],
+                &[$($admin_callback),*],
             );
     };
 }

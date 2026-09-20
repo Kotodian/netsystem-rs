@@ -15,7 +15,7 @@ fn shared_bucket_references_survive_parent_replacement() -> Result<(), DpoError>
         .unwrap();
     hammer_runtime::ThreadMain::new().unwrap();
     let mut runtime = DataPlaneMain::new(DataPlaneBufferConfig::default());
-    let net = NetMain::init(Arc::new(InterfaceMain::new()))?;
+    let net = NetMain::init(&mut runtime, Arc::new(InterfaceMain::new()))?;
     let terminal = hammer_service::data_plane::register_drop(&mut runtime)?;
     // This is a pool-lifetime test, not a packet-forwarding test. Both owning
     // classes use an installed terminal node; no packet processing is invoked.

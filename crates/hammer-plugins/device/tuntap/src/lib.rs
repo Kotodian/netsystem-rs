@@ -1,11 +1,21 @@
+use std::cell::UnsafeCell;
+use std::collections::HashMap;
 use std::fmt;
 use std::io;
 #[cfg(target_os = "linux")]
 use std::mem::size_of;
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::os::fd::RawFd;
 use std::sync::OnceLock;
 
-use hammer_runtime::RuntimeResult;
+use hammer_infra::pool::Pool;
+use hammer_plugin_ip::protocol::ip::IpVersion;
+use hammer_plugin_ip::{
+    fib_table_get_index_for_sw_if_index, ip4_sw_interface_enable_disable,
+    ip6_sw_interface_enable_disable, register_ip4_add_del_interface_address_callback,
+    register_ip6_add_del_interface_address_callback,
+};
+use hammer_runtime::{DataPlaneMain, RuntimeResult};
 use hammer_service::interface::{HwClassFlags, HwInterfaceFlags, SwInterfaceFlags};
 use hammer_service::net::NetMain;
 
@@ -59,13 +69,52 @@ struct TuntapMain {
     ether_dst_mac: [u8; 6],
     hw_if_index: u32,
     sw_if_index: u32,
+    subinterface_addresses: UnsafeCell<Pool<SubinterfaceAddress>>,
+    subinterface_address_index_by_key: UnsafeCell<HashMap<(u32, IpAddr), u32>>,
 }
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct SubinterfaceAddress {
+    sw_if_index: u32,
+    address: IpAddr,
+}
+
+// SAFETY: alias state is accessed only by main-thread IP address callbacks.
+unsafe impl Sync for TuntapMain {}
 
 static TUNTAP_MAIN: OnceLock<TuntapMain> = OnceLock::new();
 
 impl TuntapMain {
+    fn subinterface_address_index(&self, sw_if_index: u32, address: IpAddr) -> u32 {
+        let key = (sw_if_index, address);
+        // SAFETY: IP address callbacks execute serially on the main thread.
+        let indices = unsafe { &mut *self.subinterface_address_index_by_key.get() };
+        if let Some(index) = indices.get(&key).copied() {
+            return index;
+        }
+        let index =
+            unsafe { &mut *self.subinterface_addresses.get() }.insert(SubinterfaceAddress {
+                sw_if_index,
+                address,
+            });
+        indices.insert(key, index);
+        index
+    }
+
+    fn remove_subinterface_address(&self, sw_if_index: u32, address: IpAddr, index: u32) {
+        // SAFETY: IP address callbacks execute serially on the main thread.
+        let removed = unsafe { &mut *self.subinterface_address_index_by_key.get() }
+            .remove(&(sw_if_index, address));
+        assert_eq!(removed, Some(index));
+        let record = unsafe { &mut *self.subinterface_addresses.get() }
+            .remove(index)
+            .expect("tuntap alias hash names an occupied pool slot");
+        assert_eq!(record.sw_if_index, sw_if_index);
+        assert_eq!(record.address, address);
+    }
+
     #[cfg(target_os = "linux")]
-    fn init(config: TuntapConfig) -> RuntimeResult<Self> {
+    fn init(config: TuntapConfig, data_plane: &mut DataPlaneMain) -> RuntimeResult<Self> {
         let mut main = Self {
             dev_net_tun_fd: -1,
             dev_tap_fd: -1,
@@ -75,6 +124,8 @@ impl TuntapMain {
             ether_dst_mac: [0; 6],
             hw_if_index: 0,
             sw_if_index: 0,
+            subinterface_addresses: UnsafeCell::new(Pool::new()),
+            subinterface_address_index_by_key: UnsafeCell::new(HashMap::new()),
         };
         if !config.enabled {
             return Ok(main);
@@ -225,6 +276,7 @@ impl TuntapMain {
             let device_class_index = interfaces.device_class_index("tuntap");
             let hw_class_index = interfaces.hw_class_index("tuntap");
             main.hw_if_index = match interfaces.register_hardware_interface(
+                data_plane,
                 device_class_index,
                 0,
                 hw_class_index,
@@ -237,14 +289,18 @@ impl TuntapMain {
                 .hardware_interface(main.hw_if_index)
                 .sw_if_index();
             interface_registered = true;
-            if let Err(error) =
-                interfaces.set_hardware_flags(main.hw_if_index, HwInterfaceFlags::LINK_UP)
-            {
+            if let Err(error) = interfaces.set_hardware_flags(
+                data_plane,
+                main.hw_if_index,
+                HwInterfaceFlags::LINK_UP,
+            ) {
                 break 'configuration Err(error.into());
             }
-            if let Err(error) =
-                interfaces.set_software_flags(main.sw_if_index, SwInterfaceFlags::ADMIN_UP)
-            {
+            if let Err(error) = interfaces.set_software_flags(
+                data_plane,
+                main.sw_if_index,
+                SwInterfaceFlags::ADMIN_UP,
+            ) {
                 break 'configuration Err(error.into());
             }
             break 'configuration Ok(());
@@ -257,7 +313,7 @@ impl TuntapMain {
             let interfaces = NetMain::global()
                 .expect("tuntap interface registration requires the network main")
                 .interface_main();
-            if let Err(error) = interfaces.delete_hardware_interface(main.hw_if_index) {
+            if let Err(error) = interfaces.delete_hardware_interface(data_plane, main.hw_if_index) {
                 tracing::warn!(%error, hw_if_index = main.hw_if_index, "tuntap interface initialization cleanup failed");
             }
         }
@@ -274,7 +330,7 @@ impl TuntapMain {
     }
 
     #[cfg(not(target_os = "linux"))]
-    fn init(config: TuntapConfig) -> RuntimeResult<Self> {
+    fn init(config: TuntapConfig, _: &mut DataPlaneMain) -> RuntimeResult<Self> {
         let main = Self {
             dev_net_tun_fd: -1,
             dev_tap_fd: -1,
@@ -284,6 +340,8 @@ impl TuntapMain {
             ether_dst_mac: [0; 6],
             hw_if_index: 0,
             sw_if_index: 0,
+            subinterface_addresses: UnsafeCell::new(Pool::new()),
+            subinterface_address_index_by_key: UnsafeCell::new(HashMap::new()),
         };
         if !config.enabled {
             return Ok(main);
@@ -292,6 +350,164 @@ impl TuntapMain {
             source: io::Error::new(io::ErrorKind::Unsupported, "Linux TUN/TAP is unavailable"),
         }
         .into())
+    }
+}
+
+#[cfg(target_os = "linux")]
+#[repr(C)]
+struct In6Ifreq {
+    address: libc::in6_addr,
+    prefix_len: u32,
+    if_index: libc::c_int,
+}
+
+fn tuntap_ip4_add_del_interface_address(
+    data_plane: &mut DataPlaneMain,
+    sw_if_index: u32,
+    address: Ipv4Addr,
+    address_length: u8,
+    _: u32,
+    is_delete: bool,
+) {
+    let Some(main) = TUNTAP_MAIN.get() else {
+        return;
+    };
+    if main.dev_tap_fd < 0 {
+        return;
+    }
+    if fib_table_get_index_for_sw_if_index(IpVersion::V4, sw_if_index)
+        != fib_table_get_index_for_sw_if_index(IpVersion::V4, main.sw_if_index)
+    {
+        return;
+    }
+    let address = IpAddr::V4(address);
+    let alias_index = main.subinterface_address_index(sw_if_index, address);
+    ip4_sw_interface_enable_disable(data_plane, main.sw_if_index, !is_delete);
+
+    #[cfg(target_os = "linux")]
+    {
+        let mut request: libc::ifreq = unsafe { std::mem::zeroed() };
+        let alias = format!("{}:{alias_index}", main.tun_name);
+        for (destination, source) in request
+            .ifr_name
+            .iter_mut()
+            .take(libc::IFNAMSIZ - 1)
+            .zip(alias.bytes())
+        {
+            *destination = source as libc::c_char;
+        }
+        if !is_delete {
+            let socket_address = unsafe {
+                &mut *(&mut request.ifr_ifru.ifru_addr as *mut libc::sockaddr)
+                    .cast::<libc::sockaddr_in>()
+            };
+            socket_address.sin_family = libc::AF_INET as libc::sa_family_t;
+            socket_address.sin_addr.s_addr = u32::from_ne_bytes(match address {
+                IpAddr::V4(address) => address.octets(),
+                _ => unreachable!(),
+            });
+            if unsafe { libc::ioctl(main.dev_tap_fd, libc::SIOCSIFADDR, &request) } < 0 {
+                tracing::warn!(source = %io::Error::last_os_error(), "tuntap SIOCSIFADDR failed");
+            }
+            let mask = u32::MAX << (32 - u32::from(address_length));
+            socket_address.sin_addr.s_addr = u32::from_ne_bytes(mask.to_be_bytes());
+            if unsafe { libc::ioctl(main.dev_tap_fd, libc::SIOCSIFNETMASK, &request) } < 0 {
+                tracing::warn!(source = %io::Error::last_os_error(), "tuntap SIOCSIFNETMASK failed");
+            }
+        } else {
+            main.remove_subinterface_address(sw_if_index, address, alias_index);
+        }
+        if unsafe { libc::ioctl(main.dev_tap_fd, libc::SIOCGIFFLAGS, &mut request) } < 0 {
+            tracing::warn!(source = %io::Error::last_os_error(), "tuntap SIOCGIFFLAGS failed");
+        }
+        unsafe {
+            if is_delete {
+                request.ifr_ifru.ifru_flags &=
+                    !((libc::IFF_UP | libc::IFF_RUNNING) as libc::c_short);
+            } else {
+                request.ifr_ifru.ifru_flags |= (libc::IFF_UP | libc::IFF_RUNNING) as libc::c_short;
+            }
+        }
+        if unsafe { libc::ioctl(main.dev_tap_fd, libc::SIOCSIFFLAGS, &request) } < 0 {
+            tracing::warn!(source = %io::Error::last_os_error(), "tuntap SIOCSIFFLAGS failed");
+        }
+    }
+    #[cfg(not(target_os = "linux"))]
+    if is_delete {
+        main.remove_subinterface_address(sw_if_index, address, alias_index);
+    }
+}
+
+fn tuntap_ip6_add_del_interface_address(
+    data_plane: &mut DataPlaneMain,
+    sw_if_index: u32,
+    address: Ipv6Addr,
+    address_length: u8,
+    _: u32,
+    is_delete: bool,
+) {
+    let Some(main) = TUNTAP_MAIN.get() else {
+        return;
+    };
+    if main.dev_tap_fd < 0 {
+        return;
+    }
+    if fib_table_get_index_for_sw_if_index(IpVersion::V6, sw_if_index)
+        != fib_table_get_index_for_sw_if_index(IpVersion::V6, main.sw_if_index)
+    {
+        return;
+    }
+    let address = IpAddr::V6(address);
+    let alias_index = main.subinterface_address_index(sw_if_index, address);
+    ip6_sw_interface_enable_disable(data_plane, main.sw_if_index, !is_delete);
+
+    #[cfg(target_os = "linux")]
+    {
+        let mut request: libc::ifreq = unsafe { std::mem::zeroed() };
+        let alias = format!("{}:{alias_index}", main.tun_name);
+        for (destination, source) in request
+            .ifr_name
+            .iter_mut()
+            .take(libc::IFNAMSIZ - 1)
+            .zip(alias.bytes())
+        {
+            *destination = source as libc::c_char;
+        }
+        let socket = unsafe { libc::socket(libc::AF_INET6, libc::SOCK_STREAM, 0) };
+        if socket < 0 {
+            tracing::warn!(source = %io::Error::last_os_error(), "tuntap IPv6 provisioning socket failed");
+        }
+        if unsafe { libc::ioctl(socket, libc::SIOCGIFINDEX, &mut request) } < 0 {
+            tracing::warn!(source = %io::Error::last_os_error(), "tuntap SIOCGIFINDEX failed");
+        }
+        let mut request6 = In6Ifreq {
+            address: libc::in6_addr {
+                s6_addr: match address {
+                    IpAddr::V6(address) => address.octets(),
+                    _ => unreachable!(),
+                },
+            },
+            prefix_len: u32::from(address_length),
+            if_index: unsafe { request.ifr_ifru.ifru_ifindex },
+        };
+        let operation = if is_delete {
+            libc::SIOCDIFADDR
+        } else {
+            libc::SIOCSIFADDR
+        };
+        if unsafe { libc::ioctl(socket, operation, &mut request6) } < 0 {
+            tracing::warn!(source = %io::Error::last_os_error(), is_delete, "tuntap IPv6 address ioctl failed");
+        }
+        if socket >= 0 {
+            unsafe { libc::close(socket) };
+        }
+        if is_delete {
+            main.remove_subinterface_address(sw_if_index, address, alias_index);
+        }
+    }
+    #[cfg(not(target_os = "linux"))]
+    if is_delete {
+        main.remove_subinterface_address(sw_if_index, address, alias_index);
     }
 }
 
@@ -356,17 +572,19 @@ enum TuntapConfigError {
 }
 
 #[hammer_component_macros::config_function(name = "tuntap_config", section = "plugin.tuntap")]
-fn tuntap_config(config: TuntapConfig) -> RuntimeResult<()> {
-    let main = TuntapMain::init(config)?;
+fn tuntap_config(config: TuntapConfig, data_plane: &mut DataPlaneMain) -> RuntimeResult<()> {
+    let main = TuntapMain::init(config, data_plane)?;
     assert!(
         TUNTAP_MAIN.set(main).is_ok(),
         "tuntap config callback executes once"
     );
+    register_ip4_add_del_interface_address_callback(tuntap_ip4_add_del_interface_address);
+    register_ip6_add_del_interface_address_callback(tuntap_ip6_add_del_interface_address);
     Ok(())
 }
 
 #[hammer_component_macros::main_loop_exit_function(name = "tuntap_exit")]
-fn tuntap_exit() -> RuntimeResult<()> {
+fn tuntap_exit(data_plane: &mut DataPlaneMain) -> RuntimeResult<()> {
     let Some(main) = TUNTAP_MAIN.get() else {
         return Ok(());
     };
@@ -376,7 +594,7 @@ fn tuntap_exit() -> RuntimeResult<()> {
     if let Ok(net) = NetMain::global()
         && let Err(error) = net
             .interface_main()
-            .delete_hardware_interface(main.hw_if_index)
+            .delete_hardware_interface(data_plane, main.hw_if_index)
     {
         tracing::warn!(%error, hw_if_index = main.hw_if_index, "tuntap interface deletion failed");
     }
@@ -420,7 +638,7 @@ fn tuntap_exit() -> RuntimeResult<()> {
 
 hammer_component_macros::declare_plugin!(
     name = "tuntap",
-    load_after = [],
+    load_after = ["ip"],
     init_functions = [],
     config_functions = [__CONFIG_FN_TUNTAP_CONFIG],
     main_loop_enter_functions = [],
@@ -456,8 +674,8 @@ mod tests {
 
     #[test]
     fn defaults_publish_a_disabled_main() {
-        tuntap_config(TuntapConfig::default()).unwrap();
-        let main = TUNTAP_MAIN.get().unwrap();
+        let mut runtime = DataPlaneMain::new(hammer_runtime::DataPlaneBufferConfig::default());
+        let main = TuntapMain::init(TuntapConfig::default(), &mut runtime).unwrap();
         assert_eq!(main.dev_net_tun_fd, -1);
         assert_eq!(main.dev_tap_fd, -1);
         assert!(!main.is_ether);
@@ -476,14 +694,17 @@ mod tests {
             return;
         }
         if std::env::var_os(CHILD).is_some() {
-            tuntap_config(TuntapConfig {
-                enabled: true,
-                name: "hammer-non-root".to_owned(),
-                mtu: 1_500,
-                ethernet: true,
-            })
+            let mut runtime = DataPlaneMain::new(hammer_runtime::DataPlaneBufferConfig::default());
+            let main = TuntapMain::init(
+                TuntapConfig {
+                    enabled: true,
+                    name: "hammer-non-root".to_owned(),
+                    mtu: 1_500,
+                    ethernet: true,
+                },
+                &mut runtime,
+            )
             .unwrap();
-            let main = TUNTAP_MAIN.get().unwrap();
             assert_eq!(main.dev_net_tun_fd, -1);
             assert_eq!(main.dev_tap_fd, -1);
             assert!(!main.is_ether);
@@ -521,6 +742,7 @@ mod tests {
     #[test]
     fn class_image_creates_and_deletes_interface_main_relationship() {
         hammer_runtime::ThreadMain::new().unwrap();
+        let mut runtime = DataPlaneMain::new(hammer_runtime::DataPlaneBufferConfig::default());
         let interfaces = InterfaceMain::new();
         interfaces
             .consume_registration_image(&HAMMER_INTERFACE_REGISTRATION_IMAGE)
@@ -530,7 +752,7 @@ mod tests {
         assert_ne!(device_class_index, interfaces.device_class_index("local"));
         assert_ne!(hw_class_index, interfaces.hw_class_index("local"));
         let hw_if_index = interfaces
-            .register_hardware_interface(device_class_index, 0, hw_class_index, 0)
+            .register_hardware_interface(&mut runtime, device_class_index, 0, hw_class_index, 0)
             .unwrap();
         let sw_if_index = interfaces.hardware_interface(hw_if_index).sw_if_index();
         assert_eq!(
@@ -543,10 +765,10 @@ mod tests {
         );
         assert_eq!(interfaces.interface_index("tuntap-0"), Some(hw_if_index));
         interfaces
-            .set_hardware_flags(hw_if_index, HwInterfaceFlags::LINK_UP)
+            .set_hardware_flags(&mut runtime, hw_if_index, HwInterfaceFlags::LINK_UP)
             .unwrap();
         interfaces
-            .set_software_flags(sw_if_index, SwInterfaceFlags::ADMIN_UP)
+            .set_software_flags(&mut runtime, sw_if_index, SwInterfaceFlags::ADMIN_UP)
             .unwrap();
         assert_eq!(
             interfaces.hardware_interface(hw_if_index).flags,
@@ -558,7 +780,9 @@ mod tests {
                 .unwrap()
                 .is_admin_up()
         );
-        interfaces.delete_hardware_interface(hw_if_index).unwrap();
+        interfaces
+            .delete_hardware_interface(&mut runtime, hw_if_index)
+            .unwrap();
         assert_eq!(interfaces.interface_index("tuntap-0"), None);
         assert!(interfaces.software_interface(sw_if_index).is_none());
     }
@@ -602,16 +826,20 @@ mod tests {
         interfaces
             .consume_registration_image(&HAMMER_INTERFACE_REGISTRATION_IMAGE)
             .unwrap();
-        NetMain::init(Arc::clone(&interfaces)).unwrap();
+        let mut runtime = DataPlaneMain::new(hammer_runtime::DataPlaneBufferConfig::default());
+        NetMain::init(&mut runtime, Arc::clone(&interfaces)).unwrap();
 
         let name = "hammer335tun";
         assert!(!Path::new(&format!("/sys/class/net/{name}")).exists());
-        tuntap_config(TuntapConfig {
-            enabled: true,
-            name: name.to_owned(),
-            mtu: 4_352,
-            ethernet: false,
-        })
+        tuntap_config(
+            TuntapConfig {
+                enabled: true,
+                name: name.to_owned(),
+                mtu: 4_352,
+                ethernet: false,
+            },
+            &mut runtime,
+        )
         .unwrap();
         let main = TUNTAP_MAIN.get().unwrap();
         assert!(main.dev_net_tun_fd >= 0);
@@ -653,7 +881,7 @@ mod tests {
             Some(main.hw_if_index)
         );
 
-        tuntap_exit().unwrap();
+        tuntap_exit(&mut runtime).unwrap();
         assert_eq!(interfaces.interface_index("tuntap-0"), None);
         assert!(interfaces.software_interface(main.sw_if_index).is_none());
         assert!(!Path::new(&format!("/sys/class/net/{name}")).exists());

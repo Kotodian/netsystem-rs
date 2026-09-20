@@ -87,18 +87,28 @@ fn feature_config_lifecycle_preserves_arc_contracts() -> Result<(), Box<dyn std:
             .get()
             .expect("interface_main_init publishes InterfaceMain"),
     );
-    let net = NetMain::init(interfaces)?;
+    let net = NetMain::init(&mut runtime, interfaces)?;
     FeatureMain::init()?;
     let features = FeatureMain::global()?;
     let interfaces = net.interface_main();
     let device_class_index = interfaces.device_class_index("local");
     let hw_class_index = interfaces.hw_class_index("local");
 
-    let first_hardware =
-        interfaces.register_hardware_interface(device_class_index, 1, hw_class_index, 0)?;
+    let first_hardware = interfaces.register_hardware_interface(
+        &mut runtime,
+        device_class_index,
+        1,
+        hw_class_index,
+        0,
+    )?;
     let first_interface = interfaces.hardware_interface(first_hardware).sw_if_index();
-    let second_hardware =
-        interfaces.register_hardware_interface(device_class_index, 2, hw_class_index, 0)?;
+    let second_hardware = interfaces.register_hardware_interface(
+        &mut runtime,
+        device_class_index,
+        2,
+        hw_class_index,
+        0,
+    )?;
     let second_interface = interfaces.hardware_interface(second_hardware).sw_if_index();
 
     let output = runtime
@@ -325,15 +335,20 @@ fn feature_config_lifecycle_preserves_arc_contracts() -> Result<(), Box<dyn std:
         runtime.nodes().node_next_slot(punt, usize::from(next))?,
         drop_node
     );
-    interfaces.delete_hardware_interface(first_hardware)?;
+    interfaces.delete_hardware_interface(&mut runtime, first_hardware)?;
     assert_eq!(features.feature_count(output_arc, second_interface)?, 1);
     assert_eq!(
         features.feature_config_index(output_arc, second_interface)?,
         Some(shared_config_index),
         "deleting one interface retains a shared config"
     );
-    let replacement_hardware =
-        interfaces.register_hardware_interface(device_class_index, 3, hw_class_index, 0)?;
+    let replacement_hardware = interfaces.register_hardware_interface(
+        &mut runtime,
+        device_class_index,
+        3,
+        hw_class_index,
+        0,
+    )?;
     let replacement_interface = interfaces
         .hardware_interface(replacement_hardware)
         .sw_if_index();
@@ -353,7 +368,7 @@ fn feature_config_lifecycle_preserves_arc_contracts() -> Result<(), Box<dyn std:
         "interface deletion clears every arc before index reuse"
     );
 
-    interfaces.delete_hardware_interface(second_hardware)?;
+    interfaces.delete_hardware_interface(&mut runtime, second_hardware)?;
     features.enable_feature(
         &mut runtime,
         output_arc,
@@ -397,9 +412,14 @@ fn feature_config_lifecycle_preserves_arc_contracts() -> Result<(), Box<dyn std:
             .node_next_slot(output, usize::from(empty_next))?,
         drop_node
     );
-    interfaces.delete_hardware_interface(replacement_hardware)?;
-    let final_hardware =
-        interfaces.register_hardware_interface(device_class_index, 4, hw_class_index, 0)?;
+    interfaces.delete_hardware_interface(&mut runtime, replacement_hardware)?;
+    let final_hardware = interfaces.register_hardware_interface(
+        &mut runtime,
+        device_class_index,
+        4,
+        hw_class_index,
+        0,
+    )?;
     let final_interface = interfaces.hardware_interface(final_hardware).sw_if_index();
     assert_eq!(final_interface, replacement_interface);
     assert_eq!(
@@ -407,7 +427,7 @@ fn feature_config_lifecycle_preserves_arc_contracts() -> Result<(), Box<dyn std:
         None,
         "deletion releases even a count-zero compiled config"
     );
-    interfaces.delete_hardware_interface(final_hardware)?;
+    interfaces.delete_hardware_interface(&mut runtime, final_hardware)?;
 
     Ok(())
 }
