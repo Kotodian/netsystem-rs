@@ -10,20 +10,26 @@ mod endpoint;
 mod lookup;
 mod namespace;
 mod table;
+mod transport;
 
 pub use api::{
     AppNamespaceAddDel, AppNamespaceAddDelReply, AppNamespaceAddDelRetval, InterfaceIndex,
 };
-pub use config::IpSessionTableConfig;
+pub use config::{IpSessionConfig, IpSessionTableConfig};
 pub use endpoint::{
     ENDPOINT_INVALID_INDEX, IpHalfOpenHandle, IpSessionEndpoint, IpTransportConnectionId,
     IpTransportEndpoint, IpTransportEndpointConfig,
 };
 pub use lookup::{IpSessionFamily, IpSessionLookup};
 pub use namespace::{IpNamespaceBinding, IpNamespaceMain, namespaces};
+pub use transport::{IpTransportMain, LocalEndpointError};
 
 static SESSION_TABLE_CONFIG: OnceLock<IpSessionTableConfig> = OnceLock::new();
 static SESSION_LOOKUP: OnceLock<IpSessionLookup> = OnceLock::new();
+
+pub(crate) fn ip_session_config() -> Option<IpSessionConfig> {
+    SESSION_TABLE_CONFIG.get().copied()
+}
 
 #[hammer_component_macros::config_function(
     name = "session_table_config",
@@ -64,6 +70,7 @@ hammer_component_macros::declare_plugin!(
     name = "session",
     load_after = ["ip"],
     init_functions = [
+        transport::__INIT_FN_IP_TRANSPORT_MAIN_INIT,
         __INIT_FN_SESSION_LOOKUP_INIT,
         namespace::__INIT_FN_IP_NAMESPACE_INIT,
     ],

@@ -1,12 +1,12 @@
 use std::cell::UnsafeCell;
-use std::net::SocketAddr;
 use std::sync::OnceLock;
 use std::sync::atomic::AtomicU32;
 
-use hammer_infra::bihash::Bihash;
+use hammer_infra::bihash::{Bihash, BihashKey};
 use hammer_infra::pool::Pool;
 use hammer_infra::sync::SpinLock;
 use hammer_runtime::app::SessionHandle;
+use crate::session::SessionEndpoint;
 use hammer_runtime::session::{
     SessionConnectEndpoint, SessionListenEndpoint, SessionStreamDirection,
 };
@@ -15,9 +15,262 @@ use thiserror::Error;
 
 pub mod congestion;
 
-const LOCAL_ENDPOINT_CAPACITY: usize = 1024;
 const LOCAL_ENDPOINT_CLEANUP_THRESHOLD: usize = 32;
-const ALPN_PROTOCOL_CAPACITY: u32 = 64;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TxMode {
+    Peek,
+    Dequeue,
+    Internal,
+    Datagram,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Service {
+    VirtualCircuit,
+    Connectionless,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Options {
+    name: &'static str,
+    short_name: &'static str,
+    tx_mode: TxMode,
+    service: Service,
+}
+
+impl Options {
+    #[inline(always)]
+    pub const fn new(
+        name: &'static str,
+        short_name: &'static str,
+        tx_mode: TxMode,
+        service: Service,
+    ) -> Self {
+        Self {
+            name,
+            short_name,
+            tx_mode,
+            service,
+        }
+    }
+
+    #[inline(always)]
+    pub const fn name(self) -> &'static str {
+        self.name
+    }
+
+    #[inline(always)]
+    pub const fn short_name(self) -> &'static str {
+        self.short_name
+    }
+
+    #[inline(always)]
+    pub const fn tx_mode(self) -> TxMode {
+        self.tx_mode
+    }
+
+    #[inline(always)]
+    pub const fn service(self) -> Service {
+        self.service
+    }
+}
+
+bitflags::bitflags! {
+    #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+    pub struct ConnectionFlags: u8 {
+        const TX_PACED = 1 << 0;
+        const NO_LOOKUP = 1 << 1;
+        const DESCHEDULED = 1 << 2;
+        const CONNECTIONLESS = 1 << 3;
+        const ERROR = 1 << 4;
+    }
+}
+
+bitflags::bitflags! {
+    #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+    pub struct SendFlags: u8 {
+        const DESCHEDULED = 1 << 0;
+        const POSTPONE = 1 << 1;
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SendParams {
+    Packetized {
+        send_space: u32,
+        tx_offset: u32,
+        mss: u16,
+        flags: SendFlags,
+    },
+    Internal {
+        max_burst_size: u32,
+        bytes_dequeued: u32,
+        flags: SendFlags,
+    },
+}
+
+impl SendParams {
+    #[inline(always)]
+    pub const fn flags(self) -> SendFlags {
+        match self {
+            Self::Packetized { flags, .. } | Self::Internal { flags, .. } => flags,
+        }
+    }
+}
+
+#[derive(Debug)]
+pub struct Pacer {
+    bytes_per_second: u64,
+    bucket: i64,
+    last_update_micros: u64,
+    tokens_per_microsecond: f32,
+    min_burst: u32,
+    max_burst: u32,
+}
+
+impl Pacer {
+    pub const MIN_MSS: u32 = 1460;
+    pub const MIN_BURST: u32 = Self::MIN_MSS;
+    pub const MAX_BURST_PACKETS: u32 = 43;
+    pub const MAX_BURST: u32 = Self::MAX_BURST_PACKETS * Self::MIN_MSS;
+    pub const BURSTS_PER_RTT: u64 = 20;
+
+    pub const fn new() -> Self {
+        Self {
+            bytes_per_second: 0,
+            bucket: 0,
+            last_update_micros: 0,
+            tokens_per_microsecond: 0.0,
+            min_burst: Self::MIN_BURST,
+            max_burst: Self::MAX_BURST,
+        }
+    }
+
+    #[inline(always)]
+    pub const fn rate(&self) -> u64 {
+        self.bytes_per_second
+    }
+
+    #[inline(always)]
+    pub fn update_bytes(&mut self, bytes: u32) {
+        self.bucket = self.bucket.saturating_sub(i64::from(bytes));
+    }
+}
+
+#[repr(C)]
+#[derive(Debug)]
+pub struct Connection<I> {
+    identity: I,
+    connection_index: u32,
+    thread_index: u32,
+    flags: ConnectionFlags,
+    pacer: Pacer,
+}
+
+impl<I> Connection<I> {
+    pub const fn new(identity: I, thread_index: u32) -> Self {
+        Self {
+            identity,
+            connection_index: u32::MAX,
+            thread_index,
+            flags: ConnectionFlags::empty(),
+            pacer: Pacer::new(),
+        }
+    }
+
+    #[inline(always)]
+    pub const fn identity(&self) -> &I {
+        &self.identity
+    }
+
+    #[inline(always)]
+    pub fn identity_mut(&mut self) -> &mut I {
+        &mut self.identity
+    }
+
+    #[inline(always)]
+    pub const fn index(&self) -> u32 {
+        self.connection_index
+    }
+
+    #[inline(always)]
+    pub fn set_index(&mut self, connection_index: u32) {
+        assert_eq!(self.connection_index, u32::MAX);
+        self.connection_index = connection_index;
+    }
+
+    #[inline(always)]
+    pub const fn thread_index(&self) -> u32 {
+        self.thread_index
+    }
+
+    #[inline(always)]
+    pub const fn flags(&self) -> ConnectionFlags {
+        self.flags
+    }
+
+    #[inline(always)]
+    pub fn insert_flags(&mut self, flags: ConnectionFlags) {
+        self.flags.insert(flags);
+    }
+
+    #[inline(always)]
+    pub fn remove_flags(&mut self, flags: ConnectionFlags) {
+        self.flags.remove(flags);
+    }
+
+    #[inline(always)]
+    pub const fn pacer(&self) -> &Pacer {
+        &self.pacer
+    }
+
+    #[inline(always)]
+    pub fn pacer_mut(&mut self) -> &mut Pacer {
+        &mut self.pacer
+    }
+
+    #[inline(always)]
+    pub fn update_tx_bytes(&mut self, bytes: u32) {
+        self.pacer.update_bytes(bytes);
+    }
+}
+
+pub trait Transport<T> {
+    type Error;
+
+    const OPTIONS: Options;
+
+    fn start_listen(&self, endpoint: SessionEndpoint<T>) -> Result<u32, Self::Error>;
+
+    fn stop_listen(&self, connection_index: u32) -> Result<(), Self::Error>;
+
+    fn connect(&self, endpoint: SessionEndpoint<T>) -> Result<u32, Self::Error>;
+
+    fn half_close(&self, _: u32, _: u32) {}
+
+    fn close(&self, connection_index: u32, thread_index: u32);
+
+    fn reset(&self, connection_index: u32, thread_index: u32) {
+        self.close(connection_index, thread_index);
+    }
+
+    fn cleanup(&self, connection_index: u32, thread_index: u32);
+
+    fn cleanup_half_open(&self, _: u32) {}
+
+    fn send_params(
+        &self,
+        connection_index: u32,
+        thread_index: u32,
+    ) -> Result<SendParams, Self::Error>;
+
+    fn update_time(&self, _: f64, _: u32) {}
+
+    fn enable(&self, _: bool) -> Result<(), Self::Error> {
+        Ok(())
+    }
+}
 
 pub type TransportStartListen =
     fn(SessionHandle, u32, Option<u64>, SessionListenEndpoint) -> RuntimeResult<u32>;
@@ -39,334 +292,271 @@ pub type TransportStopSending =
 pub type TransportCloseConnection =
     fn(&mut crate::session::runtime::SessionWorker, u32, u64, &[u8]) -> RuntimeResult<()>;
 
-#[derive(Clone, Copy, Default, PartialEq, Eq)]
-struct TransportEndpointKey([u64; 3]);
-
-impl TransportEndpointKey {
-    #[inline]
-    fn new(endpoint: TransportEndpoint, protocol: u8) -> Self {
-        let (ip_high, ip_low) = match endpoint.address {
-            SocketAddr::V4(address) => (u64::from(u32::from(*address.ip())), 0),
-            SocketAddr::V6(address) => {
-                let octets = address.ip().octets();
-                let mut high = [0; 8];
-                let mut low = [0; 8];
-                high.copy_from_slice(&octets[..8]);
-                low.copy_from_slice(&octets[8..]);
-                (u64::from_be_bytes(high), u64::from_be_bytes(low))
-            }
-        };
-        Self([
-            ip_high,
-            ip_low,
-            (u64::from(endpoint.fib_index) << 32)
-                | (u64::from(endpoint.address.port()) << 8)
-                | u64::from(protocol),
-        ])
-    }
+#[derive(Debug, Clone, Copy, serde::Deserialize, serde::Serialize)]
+#[serde(default)]
+pub struct Config {
+    pub local_endpoints_table_buckets: u32,
+    pub local_endpoints_table_memory: u32,
+    pub min_src_port: u16,
+    pub max_src_port: u16,
 }
 
-impl hammer_infra::bihash::BihashKey for TransportEndpointKey {
-    #[inline(always)]
-    fn hash(self) -> u64 {
-        hammer_infra::bihash::hash_words(&self.0)
-    }
-}
-
-/// Local endpoint facts used as the key for the Transport endpoint table.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct TransportEndpoint {
-    address: SocketAddr,
-    fib_index: u32,
-}
-
-/// VPP-shaped lookup table from a local endpoint tuple to a Pool index.
-type TransportEndpointTable = Bihash<TransportEndpointKey, 4>;
-
-struct LocalEndpoint {
-    endpoint: TransportEndpoint,
-    protocol: u8,
-    ref_count: AtomicU32,
-}
-
-struct LocalEndpointCleanup {
-    pending: Vec<u32>,
-    scheduled: bool,
-}
-
-/// Process-wide Transport policy and lifecycle authority.
-///
-/// Concrete protocol operation tables are deliberately kept in
-/// [`TRANSPORT_VFTS`]. This Main owns Transport-wide state; it does not own a
-/// concrete protocol Main or a Session/Application Main.
-pub struct TransportMain {
-    local_endpoints_table: TransportEndpointTable,
-    local_endpoints: UnsafeCell<Pool<LocalEndpoint>>,
-    cleanup: SpinLock<LocalEndpointCleanup>,
-    port_allocator_seed: u32,
-    port_alloc_max_tries: u16,
-    port_allocator_min_src_port: u16,
-    port_allocator_max_src_port: u16,
-    alpn_protocol_by_name: Bihash<u64, 7>,
-}
-
-impl TransportMain {
-    /// Initializes and publishes the process-global Transport authority.
-    pub fn init() -> RuntimeResult<()> {
-        if TRANSPORT_MAIN.get().is_some() || TRANSPORT_VFTS.get().is_some() {
-            return Err(TransportError::MainAlreadyInitialized.into());
+impl Default for Config {
+    fn default() -> Self {
+        Self {
+            local_endpoints_table_buckets: 0,
+            local_endpoints_table_memory: 0,
+            min_src_port: 1024,
+            max_src_port: u16::MAX,
         }
+    }
+}
 
-        TRANSPORT_MAIN
-            .set(Self::new())
-            .map_err(|_| TransportError::MainAlreadyInitialized)?;
+struct LocalEndpoint<E> {
+    endpoint: SessionEndpoint<E>,
+    references: AtomicU32,
+}
+
+struct EndpointCleanup {
+    free: Vec<u32>,
+    pending: bool,
+}
+
+struct PortAllocator {
+    seed: u32,
+    max_tries: u16,
+    min_src_port: u16,
+    max_src_port: u16,
+}
+
+pub struct TransportMain<E, K: BihashKey, A> {
+    local_endpoints_table: Bihash<K, 4>,
+    local_endpoints: UnsafeCell<Pool<LocalEndpoint<E>>>,
+    endpoint_cleanup: SpinLock<EndpointCleanup>,
+    port_allocator: UnsafeCell<PortAllocator>,
+    alpn_protocol_by_name: A,
+}
+
+unsafe impl<E, K, A> Send for TransportMain<E, K, A>
+where
+    E: Send,
+    K: BihashKey + Send,
+    A: Send,
+{
+}
+
+unsafe impl<E, K, A> Sync for TransportMain<E, K, A>
+where
+    E: Send,
+    K: BihashKey + Send,
+    A: Send + Sync,
+{
+}
+
+impl<E, K, A> TransportMain<E, K, A>
+where
+    E: Copy,
+    K: BihashKey + Copy + Default,
+    for<'a> K: From<&'a SessionEndpoint<E>>,
+{
+    pub fn init(
+        storage: &'static OnceLock<Self>,
+        config: Config,
+        alpn_protocol_by_name: A,
+    ) -> RuntimeResult<()> {
         assert!(
-            TRANSPORT_VFTS.set(TransportVftTable::new()).is_ok(),
-            "Transport VFT authority changed after the initialization preflight"
+            storage
+                .set(Self::new(config, alpn_protocol_by_name))
+                .is_ok(),
+            "TransportMain initialization callback executes once"
         );
         Ok(())
     }
 
-    /// Returns the published process-global Transport authority.
-    pub fn global() -> RuntimeResult<&'static Self> {
-        TRANSPORT_MAIN
+    pub fn global(storage: &'static OnceLock<Self>) -> RuntimeResult<&'static Self> {
+        storage
             .get()
             .ok_or(RuntimeError::PluginStateNotInitialized {
                 plugin: "transport",
             })
     }
-}
 
-// SAFETY: control-path callers mutate the Pool through the `UnsafeCell` while
-// Data Workers only read stable entries and update atomic reference counts.
-// Pool reclamation is performed at the control/barrier boundary after those
-// readers have stopped accessing the reclaimed entry.
-unsafe impl Send for TransportMain {}
-unsafe impl Sync for TransportMain {}
-
-impl TransportMain {
-    #[inline]
-    pub fn new() -> Self {
+    pub fn new(config: Config, alpn_protocol_by_name: A) -> Self {
+        let buckets = if config.local_endpoints_table_buckets == 0 {
+            250_000
+        } else {
+            config.local_endpoints_table_buckets
+        };
+        let memory = if config.local_endpoints_table_memory == 0 {
+            512 << 20
+        } else {
+            config.local_endpoints_table_memory
+        };
         Self {
-            local_endpoints_table: TransportEndpointTable::new(LOCAL_ENDPOINT_CAPACITY as u32),
+            local_endpoints_table: Bihash::with_memory_size(buckets, memory),
             local_endpoints: UnsafeCell::new(Pool::new()),
-            cleanup: SpinLock::new(LocalEndpointCleanup {
-                pending: Vec::new(),
-                scheduled: false,
+            endpoint_cleanup: SpinLock::new(EndpointCleanup {
+                free: Vec::new(),
+                pending: false,
             }),
-            port_allocator_seed: 0,
-            port_alloc_max_tries: 0,
-            port_allocator_min_src_port: 0,
-            port_allocator_max_src_port: u16::MAX,
-            alpn_protocol_by_name: Bihash::new(ALPN_PROTOCOL_CAPACITY),
+            port_allocator: UnsafeCell::new(PortAllocator {
+                seed: 0,
+                max_tries: 0,
+                min_src_port: config.min_src_port,
+                max_src_port: config.max_src_port,
+            }),
+            alpn_protocol_by_name,
         }
     }
 
-    /// Claims one local endpoint for a transport and returns its Pool index.
-    ///
-    /// Pool insertion is rolled back when the endpoint table reports a
-    /// concurrent owner, so a failed claim does not publish partial state.
-    pub fn mark_used(
-        &self,
-        protocol: u8,
-        address: SocketAddr,
-        fib_index: u32,
-    ) -> Result<u32, TransportError> {
-        let endpoint = TransportEndpoint { address, fib_index };
-        let key = TransportEndpointKey::new(endpoint, protocol);
+    pub fn mark_used(&self, endpoint: SessionEndpoint<E>) -> bool {
+        let key = K::from(&endpoint);
         if self.local_endpoints_table.lookup(&key).is_some() {
-            return Err(TransportError::LocalEndpointInUse {
-                address,
-                fib_index,
-                protocol,
-            });
+            return false;
         }
-        // SAFETY: endpoint allocation and the table publication are serialized
-        // on the transport control path.
         let local_endpoints = unsafe { &mut *self.local_endpoints.get() };
         let index = local_endpoints.insert(LocalEndpoint {
             endpoint,
-            protocol,
-            ref_count: AtomicU32::new(1),
+            references: AtomicU32::new(1),
         });
-        match self
+        if self
             .local_endpoints_table
             .insert_if_absent(key, index as u64)
+            .is_ok()
         {
-            Ok(()) => Ok(index),
-            Err(_) => {
+            true
+        } else {
+            let removed = local_endpoints.remove(index);
+            debug_assert!(removed.is_some());
+            false
+        }
+    }
+
+    pub fn share(&self, endpoint: &SessionEndpoint<E>) {
+        let key = K::from(endpoint);
+        let Some(index) = self
+            .local_endpoints_table
+            .lookup(&key)
+            .and_then(|index| u32::try_from(index).ok())
+        else {
+            return;
+        };
+        let local_endpoint = self
+            .local_endpoints()
+            .get(index)
+            .expect("local endpoint table entry remains in the endpoint pool");
+        let previous = local_endpoint
+            .references
+            .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+        assert_ne!(previous, u32::MAX, "local endpoint reference count overflowed");
+    }
+
+    pub fn release(&self, endpoint: &SessionEndpoint<E>) -> bool {
+        let key = K::from(endpoint);
+        let Some(index) = self
+            .local_endpoints_table
+            .lookup(&key)
+            .and_then(|index| u32::try_from(index).ok())
+        else {
+            return false;
+        };
+        let local_endpoint = self
+            .local_endpoints()
+            .get(index)
+            .expect("local endpoint table entry remains in the endpoint pool");
+        let previous = local_endpoint
+            .references
+            .fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
+        assert_ne!(previous, 0, "local endpoint reference count underflowed");
+        if previous != 1 {
+            return false;
+        }
+        self.local_endpoints_table.remove_if_current(&key, index as u64);
+        let mut cleanup = self.endpoint_cleanup.lock();
+        cleanup.free.push(index);
+        if cleanup.free.len() > LOCAL_ENDPOINT_CLEANUP_THRESHOLD {
+            cleanup.pending = true;
+        }
+        true
+    }
+
+    pub fn reclaim(&self) {
+        let free = {
+            let mut cleanup = self.endpoint_cleanup.lock();
+            cleanup.pending = false;
+            std::mem::take(&mut cleanup.free)
+        };
+        let local_endpoints = unsafe { &mut *self.local_endpoints.get() };
+        for index in free {
+            let reclaim = self
+                .local_endpoints()
+                .get(index)
+                .is_some_and(|endpoint| {
+                    endpoint
+                        .references
+                        .load(std::sync::atomic::Ordering::Acquire)
+                        == 0
+                });
+            if reclaim {
                 let removed = local_endpoints.remove(index);
                 debug_assert!(removed.is_some());
-                Err(TransportError::LocalEndpointInUse {
-                    address,
-                    fib_index,
-                    protocol,
-                })
             }
         }
     }
 
-    /// Adds one reference to an existing local endpoint.
-    pub fn share(
-        &self,
-        protocol: u8,
-        address: SocketAddr,
-        fib_index: u32,
-    ) -> Result<(), TransportError> {
-        let key = TransportEndpointKey::new(TransportEndpoint { address, fib_index }, protocol);
-        let Some(index) = self
-            .local_endpoints_table
-            .lookup(&key)
-            .and_then(|index| u32::try_from(index).ok())
-        else {
-            return Err(TransportError::LocalEndpointMissing {
-                address,
-                fib_index,
-                protocol,
-            });
-        };
-        let Some(endpoint) = self.local_endpoints().get(index) else {
-            return Err(TransportError::LocalEndpointMissing {
-                address,
-                fib_index,
-                protocol,
-            });
-        };
-        let mut references = endpoint
-            .ref_count
-            .load(std::sync::atomic::Ordering::Acquire);
-        loop {
-            if references == 0 {
-                return Err(TransportError::LocalEndpointMissing {
-                    address,
-                    fib_index,
-                    protocol,
-                });
-            }
-            let next = references.checked_add(1).ok_or(
-                TransportError::LocalEndpointReferenceOverflow {
-                    address,
-                    fib_index,
-                    protocol,
-                },
-            )?;
-            match endpoint.ref_count.compare_exchange_weak(
-                references,
-                next,
-                std::sync::atomic::Ordering::AcqRel,
-                std::sync::atomic::Ordering::Acquire,
-            ) {
-                Ok(_) => return Ok(()),
-                Err(current) => references = current,
-            }
+    pub fn next_source_port(&self) -> u16 {
+        let allocator = unsafe { &mut *self.port_allocator.get() };
+        let range = allocator.max_src_port.saturating_sub(allocator.min_src_port);
+        if range == 0 {
+            return allocator.min_src_port;
         }
+        allocator.seed = allocator
+            .seed
+            .wrapping_mul(1_664_525)
+            .wrapping_add(1_013_904_223);
+        allocator.min_src_port + (allocator.seed as u16 % range)
     }
 
-    /// Releases one local endpoint reference and queues zero-transition
-    /// entries for control-worker reclamation.
-    pub fn release(
-        &self,
-        protocol: u8,
-        address: SocketAddr,
-        fib_index: u32,
-    ) -> Result<(), TransportError> {
-        let key = TransportEndpointKey::new(TransportEndpoint { address, fib_index }, protocol);
-        let Some(index) = self
-            .local_endpoints_table
-            .lookup(&key)
-            .and_then(|index| u32::try_from(index).ok())
-        else {
-            return Err(TransportError::LocalEndpointMissing {
-                address,
-                fib_index,
-                protocol,
-            });
-        };
-        let Some(endpoint) = self.local_endpoints().get(index) else {
-            return Err(TransportError::LocalEndpointMissing {
-                address,
-                fib_index,
-                protocol,
-            });
-        };
-
-        let mut references = endpoint
-            .ref_count
-            .load(std::sync::atomic::Ordering::Acquire);
-        loop {
-            if references == 0 {
-                return Err(TransportError::LocalEndpointMissing {
-                    address,
-                    fib_index,
-                    protocol,
-                });
-            }
-            let next = references - 1;
-            match endpoint.ref_count.compare_exchange_weak(
-                references,
-                next,
-                std::sync::atomic::Ordering::AcqRel,
-                std::sync::atomic::Ordering::Acquire,
-            ) {
-                Ok(_) if next > 0 => {
-                    return Ok(());
-                }
-                Ok(_) => {
-                    self.local_endpoints_table
-                        .remove_if_current(&key, index as u64);
-                    let mut cleanup = self.cleanup.lock();
-                    cleanup.pending.push(index);
-                    if !cleanup.scheduled
-                        && cleanup.pending.len() > LOCAL_ENDPOINT_CLEANUP_THRESHOLD
-                    {
-                        cleanup.scheduled = true;
-                    }
-                    return Ok(());
-                }
-                Err(current) => references = current,
-            }
-        }
+    pub fn record_port_allocation_tries(&self, tries: u16) {
+        let allocator = unsafe { &mut *self.port_allocator.get() };
+        allocator.max_tries = allocator.max_tries.max(tries);
     }
 
-    /// Reclaims zero-reference local endpoints on the transport control
-    /// worker. Workers only enqueue indexes; Pool mutation stays here.
-    pub fn reclaim(&self) -> Result<(), TransportError> {
-        let pending = {
-            let mut cleanup = self.cleanup.lock();
-            cleanup.scheduled = false;
-            std::mem::take(&mut cleanup.pending)
-        };
-        let mut retained = Vec::new();
-        for index in pending {
-            let reclaim = self.local_endpoints().get(index).is_some_and(|endpoint| {
+    #[inline(always)]
+    pub fn max_port_allocation_tries(&self) -> u16 {
+        unsafe { (&*self.port_allocator.get()).max_tries }
+    }
+
+    pub fn clear_port_allocation_stats(&self) {
+        unsafe { (&mut *self.port_allocator.get()).max_tries = 0 };
+    }
+
+    #[inline(always)]
+    pub const fn alpn_protocols(&self) -> &A {
+        &self.alpn_protocol_by_name
+    }
+
+    pub fn local_endpoints_in_use(&self) -> u32 {
+        let local_endpoints = self.local_endpoints();
+        local_endpoints
+            .iter()
+            .filter(|(_, endpoint)| {
                 endpoint
-                    .ref_count
+                    .references
                     .load(std::sync::atomic::Ordering::Acquire)
-                    == 0
-            });
-            if reclaim {
-                // SAFETY: reclamation runs on the transport control path after
-                // workers have released their endpoint references.
-                let removed = unsafe { &mut *self.local_endpoints.get() }.remove(index);
-                debug_assert!(removed.is_some());
-            } else {
-                retained.push(index);
-            }
-        }
-        let mut cleanup = self.cleanup.lock();
-        cleanup.pending = retained;
-        if cleanup.pending.len() > LOCAL_ENDPOINT_CLEANUP_THRESHOLD {
-            cleanup.scheduled = true;
-        }
-        Ok(())
+                    != 0
+            })
+            .count()
+            .try_into()
+            .expect("local endpoint count fits u32")
+    }
+
+    pub fn cleanup_pending(&self) -> bool {
+        self.endpoint_cleanup.lock().pending
     }
 
     #[inline]
-    fn local_endpoints(&self) -> &Pool<LocalEndpoint> {
-        // SAFETY: the control worker does not reclaim Pool entries while Data
-        // Workers may read them; each worker-visible field is immutable or an
-        // atomic refcount, and reclamation is serialized at the control/barrier
-        // boundary.
+    fn local_endpoints(&self) -> &Pool<LocalEndpoint<E>> {
         unsafe { &*self.local_endpoints.get() }
     }
 }
@@ -410,12 +600,7 @@ impl TransportVft {
     }
 }
 
-/// The process-global Transport Main, published during ordered init.
-pub static TRANSPORT_MAIN: OnceLock<TransportMain> = OnceLock::new();
-
 /// Independent process-global protocol dispatch table, matching VPP's
-/// append-only `tp_vfts` authority rather than embedding dispatch in
-/// `TransportMain`.
 static TRANSPORT_VFTS: OnceLock<TransportVftTable> = OnceLock::new();
 
 struct TransportVftTable {
@@ -458,42 +643,10 @@ unsafe impl Sync for TransportVftTable {}
 #[hammer_component_macros::runtime_error(subsystem = "transport")]
 #[derive(Debug, Error)]
 pub enum TransportError {
-    #[error("global TransportMain or TRANSPORT_VFTS is already initialized")]
-    MainAlreadyInitialized,
     #[error("global TRANSPORT_VFTS is not initialized")]
     RegistryUnavailable,
     #[error("transport protocol slots are exhausted")]
     ProtocolSlotsExhausted,
-    #[error("transport operation `{operation}` is not registered")]
-    OperationUnsupported { operation: &'static str },
-    #[error(
-        "local endpoint {address} on FIB {fib_index} for transport {protocol} is already in use"
-    )]
-    LocalEndpointInUse {
-        address: SocketAddr,
-        fib_index: u32,
-        protocol: u8,
-    },
-    #[error("local endpoint {address} on FIB {fib_index} for transport {protocol} is missing")]
-    LocalEndpointMissing {
-        address: SocketAddr,
-        fib_index: u32,
-        protocol: u8,
-    },
-    #[error(
-        "local endpoint {address} on FIB {fib_index} for transport {protocol} reference count overflowed"
-    )]
-    LocalEndpointReferenceOverflow {
-        address: SocketAddr,
-        fib_index: u32,
-        protocol: u8,
-    },
-}
-
-/// Returns the published process-global Transport authority.
-#[inline]
-pub fn transport_main() -> &'static TransportMain {
-    TransportMain::global().expect("TransportMain is initialized before Transport use")
 }
 
 /// Publishes one concrete transport VFT in the next available protocol slot.
@@ -519,5 +672,9 @@ pub fn transport_vft(protocol: u8) -> Option<TransportVft> {
 
 #[hammer_component_macros::init_function(name = "transport_main_init")]
 fn init_transport_main() -> RuntimeResult<()> {
-    TransportMain::init()
+    assert!(
+        TRANSPORT_VFTS.set(TransportVftTable::new()).is_ok(),
+        "Transport dispatch authority initializes once"
+    );
+    Ok(())
 }

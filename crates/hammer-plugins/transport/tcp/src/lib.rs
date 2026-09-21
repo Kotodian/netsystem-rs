@@ -44,7 +44,10 @@ use hammer_service::session::node::{SessionQueueNode, SessionQueueOutput};
 use hammer_service::session::runtime::{
     SessionTransport, SessionWorker, dispatch_session_queue_events,
 };
-use hammer_service::transport::{TransportVft, register_transport};
+use hammer_service::transport::{
+    Options, SendParams, Service, Transport, TransportVft, TxMode, register_transport,
+};
+use hammer_plugin_session::{IpSessionEndpoint, IpTransportMain};
 
 pub mod config;
 pub mod congestion;
@@ -255,6 +258,63 @@ impl TcpMain {
     }
 }
 
+impl Transport<hammer_plugin_session::IpTransportEndpointConfig> for TcpMain {
+    type Error = RuntimeError;
+
+    const OPTIONS: Options = Options::new(
+        "tcp",
+        "T",
+        TxMode::Peek,
+        Service::VirtualCircuit,
+    );
+
+    fn start_listen(&self, endpoint: IpSessionEndpoint) -> Result<u32, Self::Error> {
+        hammer_runtime::ensure_main_thread_with_barrier()?;
+        let transport = IpTransportMain::global()?;
+        transport.mark_used(&endpoint).map_err(RuntimeError::from)?;
+        let local = endpoint.transport().local;
+        let bind = std::net::SocketAddr::new(local.address, local.port);
+        let result = self.bind_tcp_listener(
+            bind,
+            DataWorkerId::new(0),
+            listener_capabilities(),
+            SessionHandle::new(u32::MAX, 0),
+        );
+        if result.is_err() {
+            transport.release(&endpoint);
+        }
+        result.map_err(RuntimeError::from)
+    }
+
+    fn stop_listen(&self, connection_index: u32) -> Result<(), Self::Error> {
+        hammer_runtime::ensure_main_thread_with_barrier()?;
+        self.listeners
+            .close_connection_index(connection_index)
+            .map_err(RuntimeError::from)
+    }
+
+    fn connect(&self, endpoint: IpSessionEndpoint) -> Result<u32, Self::Error> {
+        drop(endpoint);
+        Err(TcpError::InvalidConnection.into())
+    }
+
+    fn close(&self, connection_index: u32, _: u32) {
+        self.listeners
+            .close_connection_index(connection_index)
+            .expect("TCP transport close keeps a live connection index");
+    }
+
+    fn cleanup(&self, connection_index: u32, _: u32) {
+        self.listeners
+            .close_connection_index(connection_index)
+            .expect("TCP transport cleanup keeps a live connection index");
+    }
+
+    fn send_params(&self, _: u32, _: u32) -> Result<SendParams, Self::Error> {
+        Err(TcpError::InvalidConnection.into())
+    }
+}
+
 // VPP alignment: `tcp_main_t tcp_main;` is a file-scope global in VPP's
 // `tcp.c`; nodes read it directly and `tcp_init` publishes the configured
 // instance before workers start.
@@ -359,7 +419,7 @@ fn configure_tcp(config: crate::config::TcpPluginConfig) -> RuntimeResult<()> {
 
 #[hammer_component_macros::init_function(
     name = "tcp_init",
-    runs_after = ["transport_main_init", "session_init"]
+    runs_after = ["ip_transport_main_init", "session_init"]
 )]
 fn init_tcp() -> RuntimeResult<()> {
     assert!(
