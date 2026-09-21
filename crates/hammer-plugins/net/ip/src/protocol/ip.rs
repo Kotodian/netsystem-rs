@@ -235,6 +235,16 @@ impl Ipv4Header {
     }
 
     #[inline(always)]
+    pub fn set_identification(&mut self, identification: u16) {
+        self.identification = identification.to_be_bytes();
+    }
+
+    #[inline(always)]
+    pub fn swap_addresses(&mut self) {
+        core::mem::swap(&mut self.source, &mut self.destination);
+    }
+
+    #[inline(always)]
     pub fn source(&self) -> Ipv4Addr {
         Ipv4Addr::from(self.source)
     }
@@ -295,6 +305,11 @@ impl Ipv6Header {
     #[inline(always)]
     pub fn set_hop_limit(&mut self, hop_limit: u8) {
         self.hop_limit = hop_limit;
+    }
+
+    #[inline(always)]
+    pub fn swap_addresses(&mut self) {
+        core::mem::swap(&mut self.source, &mut self.destination);
     }
 
     #[inline(always)]
