@@ -1,8 +1,9 @@
-use crate::{TcpError, TcpSegmentFlags, tcp_header};
+use crate::{TcpCapabilities, TcpError, TcpHeader, TcpSegmentFlags, TcpSegmentHeader, tcp_header};
 use hammer_core::data_plane::{BufferPacketCursor, Frame, NodeId};
 use hammer_infra::checksum::{internet_checksum, internet_checksum_parts};
 use hammer_runtime::RuntimeResult;
 use hammer_runtime::{DataPlaneMain, Node, NodeProcessFn, NodeRuntime};
+use zerocopy::FromBytes;
 
 #[hammer_component_macros::node_next]
 pub enum TcpResetNext {
@@ -307,7 +308,7 @@ fn tcp_reset_write_ipv4_reply(
     reset[9] = 6;
     write_bytes(reset, 12, &source[..4]);
     write_bytes(reset, 16, &destination[..4]);
-    tcp_reset_write_tcp_header(
+    write_reset_header(
         &mut reset[IPV4_HEADER_LEN..],
         source_port,
         destination_port,
@@ -323,7 +324,8 @@ fn tcp_reset_write_ipv4_reply(
         &tcp_len_bytes,
         &reset[IPV4_HEADER_LEN..],
     ]);
-    write_be_u16(reset, 36, tcp_checksum);
+    let (tcp, _) = TcpHeader::mut_from_prefix(&mut reset[IPV4_HEADER_LEN..]).ok()?;
+    tcp.set_checksum(tcp_checksum);
     let ip_checksum = internet_checksum(&reset[..IPV4_HEADER_LEN]);
     write_be_u16(reset, 10, ip_checksum);
     Some(total_len)
@@ -350,7 +352,7 @@ fn tcp_reset_write_ipv6_reply(
     reset[7] = 64;
     write_bytes(reset, 8, &source);
     write_bytes(reset, 24, &destination);
-    tcp_reset_write_tcp_header(
+    write_reset_header(
         &mut reset[IPV6_HEADER_LEN..],
         source_port,
         destination_port,
@@ -366,12 +368,13 @@ fn tcp_reset_write_ipv6_reply(
         &[0, 0, 0, 6],
         &reset[IPV6_HEADER_LEN..],
     ]);
-    write_be_u16(reset, 56, tcp_checksum);
+    let (tcp, _) = TcpHeader::mut_from_prefix(&mut reset[IPV6_HEADER_LEN..]).ok()?;
+    tcp.set_checksum(tcp_checksum);
     Some(total_len)
 }
 
 #[inline(always)]
-fn tcp_reset_write_tcp_header(
+fn write_reset_header(
     output: &mut [u8],
     source_port: u16,
     destination_port: u16,
@@ -379,14 +382,21 @@ fn tcp_reset_write_tcp_header(
     acknowledgment: u32,
     flags: u8,
 ) -> Option<()> {
-    let header = output.get_mut(..20)?;
-    write_be_u16(header, 0, source_port);
-    write_be_u16(header, 2, destination_port);
-    write_be_u32(header, 4, sequence);
-    write_be_u32(header, 8, acknowledgment);
-    header[12] = 0x50;
-    header[13] = flags;
-    Some(())
+    let written = TcpSegmentHeader {
+        source_port,
+        destination_port,
+        sequence_number: sequence,
+        acknowledgment_number: acknowledgment,
+        flags: TcpSegmentFlags::from_bits_retain(u16::from(flags)),
+        advertised_window: 0,
+        urgent_pointer: 0,
+        capabilities: TcpCapabilities::default(),
+        timestamp: None,
+        fast_open_cookie: None,
+    }
+    .write_to_buffer(output, None)
+    .ok()?;
+    (written == 20).then_some(())
 }
 
 #[inline(always)]
@@ -411,14 +421,6 @@ fn read_bytes(input: &[u8], output: &mut [u8]) {
 fn write_be_u16(output: &mut [u8], offset: usize, value: u16) {
     output[offset] = (value >> 8) as u8;
     output[offset + 1] = value as u8;
-}
-
-#[inline(always)]
-fn write_be_u32(output: &mut [u8], offset: usize, value: u32) {
-    output[offset] = (value >> 24) as u8;
-    output[offset + 1] = (value >> 16) as u8;
-    output[offset + 2] = (value >> 8) as u8;
-    output[offset + 3] = value as u8;
 }
 
 #[inline(always)]

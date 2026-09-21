@@ -5,7 +5,7 @@ use hammer_core::data_plane::NodeId;
 use hammer_runtime::{DataPlaneMain, RuntimeResult};
 
 pub mod input;
-mod wire;
+mod protocol;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, StableAbi, serde::Deserialize, serde::Serialize)]
 #[repr(u8)]

@@ -10,10 +10,9 @@ pub mod reset;
 pub mod segment;
 
 pub use options::{
-    ParsedTcpOptions, TcpSackBlock, TcpTimestampOption, tcp_capabilities_from_options,
-    tcp_options_from_bytes,
+    TcpOption, TcpOptionIter, TcpSackBlock, TcpTimestampOption, tcp_capabilities_from_options,
 };
-pub use segment::{TcpSegmentHeader, TcpWireHeader, tcp_header};
+pub use segment::{TcpHeader, TcpSegmentHeader, tcp_header};
 
 /// Network-layer facts consumed by TCP after IP input has parsed a packet.
 ///

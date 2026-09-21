@@ -25,7 +25,7 @@ use crate::UdpIpVersion;
 use crate::connection::{UdpConnection, UdpListener};
 use crate::lookup::UdpLookup;
 use crate::output::UdpOutputNode;
-use crate::wire::write_udp_header;
+use crate::protocol::write_udp_header;
 
 const UDP_CONNECTION_CAPACITY: usize = 1024;
 const UDP_LISTENER_CAPACITY: usize = 256;

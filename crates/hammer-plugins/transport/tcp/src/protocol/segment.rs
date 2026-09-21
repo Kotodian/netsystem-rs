@@ -2,6 +2,7 @@ use super::{
     TcpCapabilities, TcpError, TcpFastOpenCookie, TcpSackBlock, TcpSegmentFlags, TcpTimestampOption,
 };
 use std::mem::size_of;
+use zerocopy::FromBytes;
 
 const TCP_HEADER_MIN_LEN: usize = 20;
 const TCP_OPTION_EOL: u8 = 0;
@@ -10,9 +11,9 @@ const TCP_OPTION_SACK: u8 = 5;
 const TCP_OPTION_SACK_BLOCK_BYTES: usize = 8;
 const TCP_MAX_SACK_BLOCKS: usize = 4;
 
-#[repr(C, packed)]
-#[derive(Clone, Copy)]
-pub struct TcpWireHeader {
+#[derive(zerocopy::FromBytes, zerocopy::IntoBytes, zerocopy::KnownLayout, zerocopy::Immutable)]
+#[repr(C)]
+pub struct TcpHeader {
     source_port: [u8; 2],
     destination_port: [u8; 2],
     sequence_number: [u8; 4],
@@ -23,44 +24,44 @@ pub struct TcpWireHeader {
     urgent_pointer: [u8; 2],
 }
 
-impl TcpWireHeader {
+impl TcpHeader {
     #[inline(always)]
-    pub fn header_len(self) -> usize {
+    pub fn header_len(&self) -> usize {
         usize::from(self.data_offset_reserved_flags[0] >> 4) * 4
     }
 
     #[inline(always)]
-    pub fn source_port(self) -> u16 {
+    pub fn source_port(&self) -> u16 {
         u16::from_be_bytes(self.source_port)
     }
 
     #[inline(always)]
-    pub fn destination_port(self) -> u16 {
+    pub fn destination_port(&self) -> u16 {
         u16::from_be_bytes(self.destination_port)
     }
 
     #[inline(always)]
-    pub fn sequence_number(self) -> u32 {
+    pub fn sequence_number(&self) -> u32 {
         u32::from_be_bytes(self.sequence_number)
     }
 
     #[inline(always)]
-    pub fn acknowledgment_number(self) -> u32 {
+    pub fn acknowledgment_number(&self) -> u32 {
         u32::from_be_bytes(self.acknowledgment_number)
     }
 
     #[inline(always)]
-    pub fn advertised_window(self) -> u16 {
+    pub fn advertised_window(&self) -> u16 {
         u16::from_be_bytes(self.advertised_window)
     }
 
     #[inline(always)]
-    pub fn urgent_pointer(self) -> u16 {
+    pub fn urgent_pointer(&self) -> u16 {
         u16::from_be_bytes(self.urgent_pointer)
     }
 
     #[inline(always)]
-    pub fn flags(self) -> TcpSegmentFlags {
+    pub fn flags(&self) -> TcpSegmentFlags {
         let first = self.data_offset_reserved_flags[0];
         let second = self.data_offset_reserved_flags[1];
         let mut flags = TcpSegmentFlags::empty();
@@ -86,6 +87,11 @@ impl TcpWireHeader {
         let data_offset = self.data_offset_reserved_flags[0] & 0xf0;
         let ns = u8::from(flags.contains(TcpSegmentFlags::NS));
         self.data_offset_reserved_flags = [data_offset | ns, (flags.bits() & 0xff) as u8];
+    }
+
+    #[inline(always)]
+    pub(crate) fn set_checksum(&mut self, value: u16) {
+        self.checksum = value.to_be_bytes();
     }
 
     #[inline(always)]
@@ -130,10 +136,10 @@ impl TcpWireHeader {
 }
 
 #[inline]
-pub fn tcp_header(packet: &[u8]) -> Result<TcpWireHeader, TcpError> {
-    let header = read_tcp_wire_header(packet)?;
+pub fn tcp_header(packet: &[u8]) -> Result<&TcpHeader, TcpError> {
+    let (header, _) = TcpHeader::ref_from_prefix(packet).map_err(|_| TcpError::SegmentInvalid)?;
     let header_len = header.header_len();
-    if header_len < size_of::<TcpWireHeader>() {
+    if header_len < size_of::<TcpHeader>() || header_len > 60 || header_len % 4 != 0 {
         return Err(TcpError::SegmentInvalid);
     }
     if packet.get(..header_len).is_none() {
@@ -170,44 +176,23 @@ impl TcpSegmentHeader<'_> {
         sack_blocks: Option<&[TcpSackBlock]>,
     ) -> Result<usize, TcpError> {
         let header_len = self.header_len(sack_blocks);
-        if output.len() < header_len {
+        if header_len > 60 || header_len % 4 != 0 || output.len() < header_len {
             return Err(TcpError::Length);
         }
         output[..header_len].fill(0);
-        let wire = tcp_wire_header_mut(output);
-        wire.set_source_port(self.source_port);
-        wire.set_destination_port(self.destination_port);
-        wire.set_sequence_number(self.sequence_number);
-        wire.set_acknowledgment_number(self.acknowledgment_number);
-        wire.set_data_offset_flags(tcp_data_offset_flags(header_len, self.flags));
-        wire.set_advertised_window(self.advertised_window);
-        wire.set_urgent_pointer(self.urgent_pointer);
+        let (header, _) = TcpHeader::mut_from_prefix(output).map_err(|_| TcpError::Length)?;
+        header.set_source_port(self.source_port);
+        header.set_destination_port(self.destination_port);
+        header.set_sequence_number(self.sequence_number);
+        header.set_acknowledgment_number(self.acknowledgment_number);
+        header.set_data_offset_flags(tcp_data_offset_flags(header_len, self.flags));
+        header.set_advertised_window(self.advertised_window);
+        header.set_checksum(0);
+        header.set_urgent_pointer(self.urgent_pointer);
         let options = &mut output[TCP_HEADER_MIN_LEN..header_len];
         write_tcp_options(options, self, sack_blocks);
         Ok(header_len)
     }
-}
-
-#[inline(always)]
-fn tcp_wire_header_mut(output: &mut [u8]) -> &mut TcpWireHeader {
-    let bytes = output
-        .get_mut(..size_of::<TcpWireHeader>())
-        .expect("tcp header length checked");
-    // SAFETY: `bytes` is exactly the range occupied by `TcpWireHeader`, and
-    // `TcpWireHeader`
-    // contains only byte arrays so field access cannot create unaligned
-    // references to multi-byte fields.
-    unsafe { &mut *bytes.as_mut_ptr().cast::<TcpWireHeader>() }
-}
-
-#[inline(always)]
-fn read_tcp_wire_header(packet: &[u8]) -> Result<TcpWireHeader, TcpError> {
-    let bytes = packet
-        .get(..size_of::<TcpWireHeader>())
-        .ok_or(TcpError::SegmentInvalid)?;
-    // SAFETY: `bytes` covers a full `TcpWireHeader`. Unaligned reads are valid
-    // because packet data can start at arbitrary buffer offsets.
-    Ok(unsafe { bytes.as_ptr().cast::<TcpWireHeader>().read_unaligned() })
 }
 
 #[inline(always)]

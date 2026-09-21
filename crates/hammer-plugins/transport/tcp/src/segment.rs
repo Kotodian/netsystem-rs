@@ -3,9 +3,8 @@ use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 
 use crate::protocol::TcpEcnCodepoint;
 use crate::{
-    TcpCapabilities, TcpError, TcpFastOpenCookie, TcpPacket, TcpSackBlock, TcpSegmentFlags,
-    TcpSegmentHeader, TcpSeq, TcpTimestampOption, TcpWireHeader, tcp_header,
-    tcp_options_from_bytes,
+    TcpCapabilities, TcpError, TcpFastOpenCookie, TcpHeader, TcpOption, TcpOptionIter, TcpPacket,
+    TcpSackBlock, TcpSegmentFlags, TcpSegmentHeader, TcpSeq, TcpTimestampOption, tcp_header,
 };
 use hammer_core::data_plane::BufferPacketCursor;
 use hammer_runtime::DataPlaneMain;
@@ -106,8 +105,11 @@ impl TcpSegment {
         &self,
         buffer: &mut hammer_core::data_plane::Buffer,
     ) -> RuntimeResult<()> {
-        let header =
-            buffer.push_uninit(u8::try_from(self.header_len()).expect("TCP header fits u8"));
+        let header_len = self.header_len();
+        if header_len > 60 || header_len % 4 != 0 {
+            return Err(TcpError::Length.into());
+        }
+        let header = buffer.push_uninit(header_len as u8);
         self.write_header(header)?;
         {
             let network = hammer_core::buffer_opaque!(mut buffer => NetworkOpaque);
@@ -160,11 +162,39 @@ pub(crate) fn tcp_packet(runtime: &DataPlaneMain, index: u32) -> RuntimeResult<T
     let destination_ip = destination_ip(version, network_header)?;
     let options = packet
         .get(
-            cursor.transport_header_offset() + size_of::<TcpWireHeader>()
+            cursor.transport_header_offset() + size_of::<TcpHeader>()
                 ..cursor.transport_header_offset() + header_len,
         )
         .ok_or(TcpError::Length)?;
-    let parsed_options = tcp_options_from_bytes(options);
+    let mut capabilities = TcpCapabilities::default();
+    let mut sack_blocks = Vec::new();
+    let mut timestamp = None;
+    let mut fast_open_cookie = None;
+    for option in TcpOptionIter::new(options) {
+        match option? {
+            TcpOption::End => break,
+            TcpOption::NoOperation | TcpOption::Unknown { .. } => {}
+            TcpOption::MaximumSegmentSize(value) => capabilities.max_segment_size = Some(value),
+            TcpOption::WindowScale(value) => capabilities.window_scale = Some(value),
+            TcpOption::SackPermitted => capabilities.sack = true,
+            TcpOption::SackBlock(block) => sack_blocks.push(block),
+            TcpOption::Timestamp(value) => {
+                capabilities.timestamps = true;
+                timestamp = Some(value);
+            }
+            TcpOption::FastOpenCookie(cookie) => {
+                capabilities.fast_open = true;
+                if !cookie.is_empty() {
+                    fast_open_cookie =
+                        Some(cookie.try_into().map_err(|_| TcpError::SegmentInvalid)?);
+                }
+            }
+            TcpOption::AccurateEcn => {
+                capabilities.ecn = true;
+                capabilities.accurate_ecn = true;
+            }
+        }
+    }
     let flags = tcp.flags();
     Ok(TcpPacket {
         local: SocketAddr::new(destination_ip, tcp.destination_port()),
@@ -175,10 +205,10 @@ pub(crate) fn tcp_packet(runtime: &DataPlaneMain, index: u32) -> RuntimeResult<T
             .then(|| TcpSeq::from(tcp.acknowledgment_number())),
         advertised_window: tcp.advertised_window(),
         flags,
-        capabilities: parsed_options.capabilities,
-        sack_blocks: parsed_options.sack_blocks,
-        timestamp: parsed_options.timestamp,
-        fast_open_cookie: parsed_options.fast_open_cookie,
+        capabilities,
+        sack_blocks,
+        timestamp,
+        fast_open_cookie,
         ip_ecn: network.ip().ip_ecn().map(TcpEcnCodepoint::from),
         payload_offset: cursor.transport_payload_offset(),
         payload_len: first_len
