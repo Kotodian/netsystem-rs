@@ -1,9 +1,7 @@
 use crate::protocol::{IcmpBuildError, IcmpHeader, build_echo_reply};
-use hammer_core::data_plane::{BufferPacketCursor, Frame, NodeId, NodeNext};
-use hammer_plugin_ip::ip::ip_header;
+use hammer_core::data_plane::{Frame, NodeId, NodeNext};
 use hammer_plugin_ip::protocol::icmp::IcmpErrorMetadata;
-use hammer_plugin_ip::protocol::ip::{IpProtocol, IpVersion};
-use hammer_plugin_ip::protocol::wire::read_header;
+use hammer_plugin_ip::protocol::ip::{IpProtocol, IpVersion, Ipv4Header, Ipv6Header};
 use hammer_runtime::RuntimeResult;
 use hammer_runtime::{
     DataPlaneMain, Node, NodeProcessFn, NodeRuntime, TraceFormatter, add_packet_trace,
@@ -13,6 +11,7 @@ use hammer_runtime::{
 use hammer_service::data_plane::set_index_node_error;
 use hammer_service::opaque::{NetworkFlags, NetworkOffloadFlags, NetworkOpaque};
 use rand::RngCore;
+use zerocopy::FromBytes;
 
 #[hammer_component_macros::runtime_error(subsystem = "icmp")]
 #[derive(Debug, thiserror::Error)]
@@ -539,41 +538,83 @@ fn next_slot_for_index(
         next: default_next,
     };
     let selected = (|| {
-        let parsed =
-            ip_header(current, network.packet_cursor()).map_err(|_| IcmpInputError::BadLength)?;
-        trace.version = Some(parsed.version);
-        if parsed.version != version
-            || !matches!(
-                (parsed.version, parsed.protocol),
-                (IpVersion::V4, IpProtocol::Icmpv4) | (IpVersion::V6, IpProtocol::Icmpv6)
-            )
-        {
+        let cursor = network.packet_cursor();
+        let packet_version = network.ip().ip_version();
+        let protocol = network.ip().ip_protocol().map(IpProtocol::from);
+        let ip_offset = cursor.network_header_offset();
+        let ip_end = ip_offset
+            .checked_add(cursor.network_header_len())
+            .ok_or(IcmpInputError::BadLength)?;
+        let ip = current
+            .get(ip_offset..ip_end)
+            .ok_or(IcmpInputError::BadLength)?;
+        let hop_limit = match version {
+            IpVersion::V4 => {
+                let (header, _) =
+                    Ipv4Header::ref_from_prefix(ip).map_err(|_| IcmpInputError::BadLength)?;
+                if header.version() != 4 || header.header_len() != cursor.network_header_len() {
+                    return Err(IcmpInputError::BadLength);
+                }
+                if IpProtocol::from(header.protocol()) != IpProtocol::Icmpv4 {
+                    return Err(IcmpInputError::WrongProtocol);
+                }
+                None
+            }
+            IpVersion::V6 => {
+                let (header, _) =
+                    Ipv6Header::ref_from_prefix(ip).map_err(|_| IcmpInputError::BadLength)?;
+                if header.version() != 6 {
+                    return Err(IcmpInputError::WrongProtocol);
+                }
+                Some(header.hop_limit())
+            }
+        };
+        trace.version = Some(version);
+        let expected_version = match version {
+            IpVersion::V4 => 4,
+            IpVersion::V6 => 6,
+        };
+        let expected_protocol = match version {
+            IpVersion::V4 => IpProtocol::Icmpv4,
+            IpVersion::V6 => IpProtocol::Icmpv6,
+        };
+        if packet_version != Some(expected_version) || protocol != Some(expected_protocol) {
             return Err(IcmpInputError::WrongProtocol);
         }
-        let header = read_header::<IcmpHeader>(current, parsed.transport_header_offset)
-            .map_err(|_| IcmpInputError::BadLength)?;
+        let transport_offset = cursor.transport_header_offset();
+        let transport_packet_offset = transport_offset
+            .checked_sub(ip_offset)
+            .ok_or(IcmpInputError::BadLength)?;
+        if transport_offset < ip_end
+            || cursor.packet_len() < transport_packet_offset.saturating_add(ICMP_HEADER_MIN_LEN)
+        {
+            return Err(IcmpInputError::BadLength);
+        }
+        let transport = current
+            .get(transport_offset..)
+            .ok_or(IcmpInputError::BadLength)?;
+        let (header, _) =
+            IcmpHeader::ref_from_prefix(transport).map_err(|_| IcmpInputError::BadLength)?;
         let icmp_type = header.icmp_type();
         trace.icmp_type = Some(icmp_type);
         trace.code = Some(header.code());
         // SAFETY: only the main-thread publication scope writes these tables.
         // Copy one entry; no table reference escapes into graph or trace calls.
         let entry = unsafe {
-            match parsed.version {
+            match version {
                 IpVersion::V4 => (*main.ip4.get()).entries[usize::from(icmp_type)],
                 IpVersion::V6 => (*main.ip6.get()).entries[usize::from(icmp_type)],
             }
         };
         let mut error = (!entry.registered).then_some(IcmpInputError::UnknownType);
-        if parsed.version == IpVersion::V6 {
+        if version == IpVersion::V6 {
             if header.code() > entry.spec.max_code {
                 error = Some(IcmpInputError::BadCode);
             }
-            if current[parsed.network_header_offset + 7] < entry.spec.min_hop_limit {
+            if hop_limit.is_some_and(|value| value < entry.spec.min_hop_limit) {
                 error = Some(IcmpInputError::HopLimit);
             }
-            if parsed
-                .packet_len
-                .saturating_sub(parsed.transport_header_offset)
+            if cursor.packet_len().saturating_sub(transport_packet_offset)
                 < usize::from(entry.spec.min_len)
             {
                 error = Some(IcmpInputError::TooShort);
@@ -612,32 +653,31 @@ fn next_for_echo_request_index(
     version: IpVersion,
 ) -> RuntimeResult<u16> {
     let net = hammer_service::net::NetMain::global()?;
-    let parsed = {
+    let (cursor, clear_ipv6_fib) = {
         let buffer = runtime.buffer(index);
         // SAFETY: IP local initialized the packet's network overlay before dispatch.
         let network = hammer_core::buffer_opaque!(buffer => NetworkOpaque);
-        ip_header(buffer.current(), network.packet_cursor())
-            .map_err(|_| IcmpBuildError::BadLength)
-            .and_then(|parsed| {
-                if parsed.version == version {
-                    Ok(parsed)
-                } else {
-                    Err(IcmpBuildError::WrongProtocol)
-                }
-            })
+        let cursor = network.packet_cursor();
+        let clear_ipv6_fib = version == IpVersion::V6
+            && buffer
+                .current()
+                .get(cursor.network_header_offset()..)
+                .and_then(|bytes| Ipv6Header::ref_from_prefix(bytes).ok())
+                .is_some_and(|(header, _)| {
+                    header.destination().is_unicast_link_local()
+                        && !header.source().is_unicast_link_local()
+                });
+        (cursor, clear_ipv6_fib)
     };
-    let fragment_id = match &parsed {
-        Ok(parsed) if parsed.version == IpVersion::V4 => runtime.random().next_u32() as u16,
-        _ => 0,
+    let fragment_id = match version {
+        IpVersion::V4 => runtime.random().next_u32() as u16,
+        IpVersion::V6 => 0,
     };
     let buffer = runtime.buffer_mut(index);
-    let reply = parsed.and_then(|parsed| {
-        build_echo_reply(buffer.current_mut(), &parsed, fragment_id)?;
-        Ok(parsed)
-    });
+    let reply = build_echo_reply(buffer, version, fragment_id);
     match reply {
-        Ok(parsed) => {
-            let next = match parsed.version {
+        Ok(()) => {
+            let next = match version {
                 IpVersion::V4 => NodeNext::slot(Icmp4EchoRequestNext::Lookup),
                 IpVersion::V6 => NodeNext::slot(Icmp6EchoRequestNext::Lookup),
             };
@@ -651,33 +691,27 @@ fn next_for_echo_request_index(
                 | NetworkFlags::L4_CHECKSUM_COMPUTED
                 | NetworkFlags::L4_CHECKSUM_CORRECT;
             network.oflags = NetworkOffloadFlags::empty();
-            if parsed.version == IpVersion::V4 {
+            if version == IpVersion::V4 {
                 network.sw_if_index[0] = net.local_interface_sw_index();
             }
-            if let (std::net::IpAddr::V6(source), std::net::IpAddr::V6(destination)) =
-                (parsed.source, parsed.destination)
-            {
-                if destination.is_unicast_link_local() && !source.is_unicast_link_local() {
-                    // The reply targets the original global source. Lookup must
-                    // select the RX interface's FIB, not the request's LL table.
-                    network.ip_mut().set_fib_index(None);
-                    network.ip_mut().set_fib_index_override(None);
-                }
+            if clear_ipv6_fib {
+                // The reply targets the original global source. Lookup must
+                // select the RX interface's FIB, not the request's LL table.
+                network.ip_mut().set_fib_index(None);
+                network.ip_mut().set_fib_index_override(None);
             }
             network.set_packet_cursor(
-                BufferPacketCursor::new()
-                    .with_packet_len(parsed.packet_len)
-                    .with_network_header(parsed.network_header_offset, parsed.network_header_len)
-                    .with_transport_header(parsed.transport_header_offset, ICMP_ECHO_HEADER_LEN)
+                cursor
+                    .with_transport_header(cursor.transport_header_offset(), ICMP_ECHO_HEADER_LEN)
                     .with_transport_payload_offset(
-                        parsed.transport_header_offset + ICMP_ECHO_HEADER_LEN,
+                        cursor.transport_header_offset() + ICMP_ECHO_HEADER_LEN,
                     ),
             );
             add_packet_trace!(
                 runtime,
                 index,
                 IcmpEchoRequestTrace {
-                    packet_len: Some(parsed.packet_len),
+                    packet_len: Some(cursor.packet_len()),
                     error: None,
                     next,
                 },
