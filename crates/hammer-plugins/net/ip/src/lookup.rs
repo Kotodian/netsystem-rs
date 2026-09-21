@@ -8,7 +8,7 @@ use std::time::Instant;
 
 use hammer_service::net::throttle::Throttle;
 
-use hammer_core::data_plane::{Frame, NodeId, NodeNext};
+use hammer_core::data_plane::{BufferPacketCursor, Frame, NodeId, NodeNext};
 use hammer_infra::pool::Pool;
 use hammer_runtime::{DataPlaneMain, Node, NodeProcessFn, NodeRuntime, RuntimeResult};
 use hammer_service::net::adj::AdjacencyMain;
@@ -20,8 +20,8 @@ use hammer_service::opaque::NetworkOpaque;
 use crate::adjacency::{Ip4FibProtocol, Ip6FibProtocol};
 use crate::fib::{Ip4FibTable, Ip6FibTable};
 use crate::interface::IpInterfaceAddressCallback;
-use crate::ip::ip_header;
-use crate::protocol::ip::{IpProtocol, IpVersion, ParsedIpPacket};
+use crate::protocol::ip::{IpProtocol, IpVersion, Ipv4Header, Ipv6Header};
+use zerocopy::FromBytes;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub(crate) struct IpInterfaceAddressKey<A> {
@@ -881,23 +881,24 @@ fn transport_ports(packet: &[u8], offset: usize, protocol: IpProtocol) -> (u16, 
 }
 
 #[inline(always)]
-fn ip4_flow_hash(packet: &[u8], parsed: ParsedIpPacket, config: u16) -> u32 {
-    let (source, destination) = match (parsed.source, parsed.destination) {
-        (std::net::IpAddr::V4(source), std::net::IpAddr::V4(destination)) => (
-            u32::from_ne_bytes(source.octets()),
-            u32::from_ne_bytes(destination.octets()),
-        ),
-        _ => return 0,
-    };
+fn ip4_flow_hash(
+    packet: &[u8],
+    header: &Ipv4Header,
+    cursor: BufferPacketCursor,
+    config: u16,
+) -> u32 {
+    let source = u32::from_ne_bytes(header.source().octets());
+    let destination = u32::from_ne_bytes(header.destination().octets());
+    let protocol = IpProtocol::from(header.protocol());
     let (source_port, destination_port) =
-        transport_ports(packet, parsed.transport_header_offset, parsed.protocol);
+        transport_ports(packet, cursor.transport_header_offset(), protocol);
     let transport_destination_port = destination_port;
     let gtp_teid =
         if config & IP_FLOW_HASH_GTPV1_TEID != 0 && transport_destination_port == GTPV1_PORT_BE {
             packet
                 .get(
-                    parsed.transport_header_offset.saturating_add(8)
-                        ..parsed.transport_header_offset.saturating_add(12),
+                    cursor.transport_header_offset().saturating_add(8)
+                        ..cursor.transport_header_offset().saturating_add(12),
                 )
                 .map(|bytes| u32::from_ne_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]))
                 .unwrap_or(0)
@@ -939,7 +940,7 @@ fn ip4_flow_hash(packet: &[u8], parsed: ParsedIpPacket, config: u16) -> u32 {
         }
     }
     if config & IP_FLOW_HASH_PROTO != 0 {
-        b ^= u32::from(u8::from(parsed.protocol));
+        b ^= u32::from(u8::from(protocol));
     }
     let c = (u32::from(destination_port) << 16) | u32::from(source_port);
     a ^= gtp_teid;
@@ -947,15 +948,17 @@ fn ip4_flow_hash(packet: &[u8], parsed: ParsedIpPacket, config: u16) -> u32 {
 }
 
 #[inline(always)]
-fn ip6_flow_hash(packet: &[u8], parsed: ParsedIpPacket, config: u16) -> u32 {
-    let (source, destination) = match (parsed.source, parsed.destination) {
-        (std::net::IpAddr::V6(source), std::net::IpAddr::V6(destination)) => (source, destination),
-        _ => return 0,
-    };
-    let source = source.octets();
-    let destination = destination.octets();
+fn ip6_flow_hash(
+    packet: &[u8],
+    header: &Ipv6Header,
+    cursor: BufferPacketCursor,
+    protocol: IpProtocol,
+    config: u16,
+) -> u32 {
+    let source = header.source().octets();
+    let destination = header.destination().octets();
     let (source_port, destination_port) =
-        transport_ports(packet, parsed.transport_header_offset, parsed.protocol);
+        transport_ports(packet, cursor.transport_header_offset(), protocol);
     let transport_destination_port = destination_port;
     let source = if config & IP_FLOW_HASH_SRC_ADDR != 0 {
         u64::from_ne_bytes(source[..8].try_into().unwrap())
@@ -994,21 +997,17 @@ fn ip6_flow_hash(packet: &[u8], parsed: ParsedIpPacket, config: u16) -> u32 {
         }
     }
     if config & IP_FLOW_HASH_PROTO != 0 {
-        b ^= u64::from(u8::from(parsed.protocol));
+        b ^= u64::from(u8::from(protocol));
     }
     let mut c = (u64::from(destination_port) << 16) | u64::from(source_port);
     if config & IP_FLOW_HASH_FLOW_LABEL != 0 {
-        let offset = parsed.network_header_offset;
-        if let Some(bytes) = packet.get(offset..offset.saturating_add(4)) {
-            let word = u32::from_be_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]);
-            c ^= u64::from(word & 0x000f_ffff);
-        }
+        c ^= u64::from(header.flow_label());
     }
     if config & IP_FLOW_HASH_GTPV1_TEID != 0
         && transport_destination_port == GTPV1_PORT_BE
         && let Some(bytes) = packet.get(
-            parsed.transport_header_offset.saturating_add(8)
-                ..parsed.transport_header_offset.saturating_add(12),
+            cursor.transport_header_offset().saturating_add(8)
+                ..cursor.transport_header_offset().saturating_add(12),
         )
     {
         a ^= u64::from(u32::from_ne_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]));
@@ -1065,8 +1064,13 @@ fn load_balance_index(runtime: &mut DataPlaneMain, index: u32, version: IpVersio
         IpVersion::V6 => NodeNext::slot(Ip6LookupNext::Drop),
     };
     let buffer = runtime.buffer_mut(index);
-    let opaque = hammer_core::buffer_opaque!(buffer => NetworkOpaque);
-    let cursor = opaque.packet_cursor();
+    let (cursor, protocol) = {
+        let opaque = hammer_core::buffer_opaque!(buffer => NetworkOpaque);
+        (
+            opaque.packet_cursor(),
+            opaque.ip().ip_protocol().map(IpProtocol::from),
+        )
+    };
     let metadata = &mut hammer_core::buffer_opaque!(mut buffer => IpSecondaryOpaque).lookup;
     const MAX_LOOKUPS_PER_PACKET: u8 = 4;
     if metadata.lookup_count >= MAX_LOOKUPS_PER_PACKET {
@@ -1085,7 +1089,6 @@ fn load_balance_index(runtime: &mut DataPlaneMain, index: u32, version: IpVersio
     let Ok(net) = hammer_service::net::NetMain::global() else {
         return drop_next;
     };
-    let parsed = ip_header(buffer.current(), cursor).ok();
     let mut next_flow_hash = None;
     let selected = net.select_load_balance(current, |bucket_count, flow_hash_config| {
         let hash = if bucket_count <= 1 {
@@ -1093,10 +1096,18 @@ fn load_balance_index(runtime: &mut DataPlaneMain, index: u32, version: IpVersio
         } else if flow_hash != 0 {
             flow_hash >> 1
         } else {
-            let parsed = parsed.filter(|packet| packet.version == version)?;
             match version {
-                IpVersion::V4 => ip4_flow_hash(buffer.current(), parsed, flow_hash_config),
-                IpVersion::V6 => ip6_flow_hash(buffer.current(), parsed, flow_hash_config),
+                IpVersion::V4 => {
+                    let bytes = buffer.current().get(cursor.network_header_offset()..)?;
+                    let (header, _) = Ipv4Header::ref_from_prefix(bytes).ok()?;
+                    ip4_flow_hash(buffer.current(), header, cursor, flow_hash_config)
+                }
+                IpVersion::V6 => {
+                    let bytes = buffer.current().get(cursor.network_header_offset()..)?;
+                    let (header, _) = Ipv6Header::ref_from_prefix(bytes).ok()?;
+                    let protocol = protocol?;
+                    ip6_flow_hash(buffer.current(), header, cursor, protocol, flow_hash_config)
+                }
             }
         };
         if bucket_count > 1 {
@@ -1155,17 +1166,26 @@ fn lookup_index(runtime: &mut DataPlaneMain, index: u32, version: IpVersion) -> 
     let Some(fib_index) = fib_index else {
         return drop_next;
     };
-    let forwarding = match ip_header(buffer.current(), opaque.packet_cursor()) {
-        Ok(packet) if packet.version == version => match (version, packet.destination) {
-            (IpVersion::V4, std::net::IpAddr::V4(address)) => IP4_MAIN
-                .get()
-                .and_then(|main| main.forwarding_dpo(fib_index, address)),
-            (IpVersion::V6, std::net::IpAddr::V6(address)) => IP6_MAIN
-                .get()
-                .and_then(|main| main.forwarding_dpo(fib_index, address)),
-            _ => None,
-        },
-        _ => None,
+    let cursor = opaque.packet_cursor();
+    let forwarding = match version {
+        IpVersion::V4 => buffer
+            .current()
+            .get(cursor.network_header_offset()..)
+            .and_then(|bytes| Ipv4Header::ref_from_prefix(bytes).ok())
+            .and_then(|(header, _)| {
+                IP4_MAIN
+                    .get()
+                    .and_then(|main| main.forwarding_dpo(fib_index, header.destination()))
+            }),
+        IpVersion::V6 => buffer
+            .current()
+            .get(cursor.network_header_offset()..)
+            .and_then(|bytes| Ipv6Header::ref_from_prefix(bytes).ok())
+            .and_then(|(header, _)| {
+                IP6_MAIN
+                    .get()
+                    .and_then(|main| main.forwarding_dpo(fib_index, header.destination()))
+            }),
     };
     let metadata = &mut hammer_core::buffer_opaque!(mut buffer => IpSecondaryOpaque).lookup;
     *metadata = LookupMetadata {

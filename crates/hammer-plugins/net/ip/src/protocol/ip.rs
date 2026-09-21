@@ -1,21 +1,21 @@
-use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
+use std::net::{Ipv4Addr, Ipv6Addr};
 
-use super::wire::{header_mut_ptr, read_header};
 use hammer_infra::bihash::{BihashKey, hash_words, splitmix64};
 use hammer_infra::checksum::internet_checksum;
+use zerocopy::{FromBytes, IntoBytes};
 
-const IPV4_HEADER_MIN_LEN: usize = 20;
-const IPV6_HEADER_LEN: usize = 40;
-const IPV4_FLAG_MORE_FRAGMENTS: u16 = 0x2000;
+pub(crate) const IPV4_HEADER_MIN_LEN: usize = 20;
+pub(crate) const IPV6_HEADER_LEN: usize = 40;
+pub(crate) const IPV4_FLAG_MORE_FRAGMENTS: u16 = 0x2000;
 /// IPv4 Don't Fragment flag (RFC 791).
 pub const IPV4_FLAG_DONT_FRAGMENT: u16 = 0x4000;
-const IPV4_FRAGMENT_OFFSET_MASK: u16 = 0x1fff;
+pub(crate) const IPV4_FRAGMENT_OFFSET_MASK: u16 = 0x1fff;
 pub(crate) const IPV6_NEXT_HEADER_HOP_BY_HOP: u8 = 0;
 pub(crate) const IPV6_NEXT_HEADER_ROUTING: u8 = 43;
 pub(crate) const IPV6_NEXT_HEADER_FRAGMENT: u8 = 44;
 pub(crate) const IPV6_NEXT_HEADER_AH: u8 = 51;
 pub(crate) const IPV6_NEXT_HEADER_DESTINATION: u8 = 60;
-const IPV6_FRAGMENT_HEADER_LEN: usize = 8;
+pub(crate) const IPV6_FRAGMENT_HEADER_LEN: usize = 8;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
 pub enum IpProtocol {
@@ -109,31 +109,6 @@ impl From<IpProtocol> for u8 {
     }
 }
 
-#[derive(Debug, Clone, Copy)]
-pub struct ParsedIpPacket {
-    pub version: IpVersion,
-    pub protocol: IpProtocol,
-    pub input_target: IpInputTarget,
-    pub input_error: IpInputError,
-    pub source: IpAddr,
-    pub destination: IpAddr,
-    pub packet_len: usize,
-    pub network_header_offset: usize,
-    pub network_header_len: usize,
-    pub transport_header_offset: usize,
-    pub transport_header_len: usize,
-}
-
-#[derive(Debug, Clone, Copy)]
-pub struct ParsedIpFragment {
-    pub version: IpVersion,
-    pub key: IpFragmentKey,
-    pub payload_offset: usize,
-    pub payload_len: usize,
-    pub more_fragments: bool,
-    pub header_len: usize,
-}
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Deserialize, serde::Serialize)]
 pub enum IpFragmentKey {
     V4 {
@@ -198,8 +173,8 @@ fn fold_u128(value: u128) -> u64 {
     value as u64 ^ (value >> 64) as u64
 }
 
-#[derive(Clone, Copy)]
-#[repr(C, packed)]
+#[derive(zerocopy::FromBytes, zerocopy::IntoBytes, zerocopy::KnownLayout, zerocopy::Immutable)]
+#[repr(C)]
 pub struct Ipv4Header {
     version_ihl: u8,
     dscp_ecn: u8,
@@ -215,53 +190,78 @@ pub struct Ipv4Header {
 
 impl Ipv4Header {
     #[inline(always)]
-    pub fn version(self) -> u8 {
+    pub fn version(&self) -> u8 {
         self.version_ihl >> 4
     }
 
     #[inline(always)]
-    pub fn header_len(self) -> usize {
+    pub fn header_len(&self) -> usize {
         usize::from(self.version_ihl & 0x0f) * 4
     }
 
     #[inline(always)]
-    pub fn total_len(self) -> usize {
+    pub fn total_len(&self) -> usize {
         usize::from(u16::from_be_bytes(self.total_len))
     }
 
     #[inline(always)]
-    pub fn identification(self) -> u16 {
+    pub fn identification(&self) -> u16 {
         u16::from_be_bytes(self.identification)
     }
 
     #[inline(always)]
-    pub fn flags_fragment(self) -> u16 {
+    pub fn flags_fragment(&self) -> u16 {
         u16::from_be_bytes(self.flags_fragment)
     }
 
     #[inline(always)]
-    pub fn dont_fragment(self) -> bool {
+    pub fn dont_fragment(&self) -> bool {
         self.flags_fragment() & IPV4_FLAG_DONT_FRAGMENT != 0
     }
 
     #[inline(always)]
-    pub fn protocol(self) -> u8 {
+    pub fn protocol(&self) -> u8 {
         self.protocol
     }
 
     #[inline(always)]
-    pub fn source(self) -> Ipv4Addr {
+    pub fn ttl(&self) -> u8 {
+        self.ttl
+    }
+
+    #[inline(always)]
+    pub fn set_ttl(&mut self, ttl: u8) {
+        self.ttl = ttl;
+    }
+
+    #[inline(always)]
+    pub fn source(&self) -> Ipv4Addr {
         Ipv4Addr::from(self.source)
     }
 
     #[inline(always)]
-    pub fn destination(self) -> Ipv4Addr {
+    pub fn destination(&self) -> Ipv4Addr {
         Ipv4Addr::from(self.destination)
+    }
+
+    #[inline(always)]
+    pub fn set_total_len(&mut self, total_len: u16) {
+        self.total_len = total_len.to_be_bytes();
+    }
+
+    #[inline(always)]
+    pub fn set_flags_fragment(&mut self, flags_fragment: u16) {
+        self.flags_fragment = flags_fragment.to_be_bytes();
+    }
+
+    #[inline(always)]
+    pub fn set_checksum(&mut self, checksum: u16) {
+        self.checksum = checksum.to_be_bytes();
     }
 }
 
-#[derive(Clone, Copy)]
-#[repr(C, packed)]
+#[derive(zerocopy::FromBytes, zerocopy::IntoBytes, zerocopy::KnownLayout, zerocopy::Immutable)]
+#[repr(C)]
 pub struct Ipv6Header {
     version_traffic_flow: [u8; 4],
     payload_len: [u8; 2],
@@ -273,33 +273,58 @@ pub struct Ipv6Header {
 
 impl Ipv6Header {
     #[inline(always)]
-    pub fn version(self) -> u8 {
+    pub fn version(&self) -> u8 {
         self.version_traffic_flow[0] >> 4
     }
 
     #[inline(always)]
-    pub fn payload_len(self) -> usize {
+    pub fn payload_len(&self) -> usize {
         usize::from(u16::from_be_bytes(self.payload_len))
     }
 
     #[inline(always)]
-    pub fn next_protocol(self) -> u8 {
+    pub fn next_protocol(&self) -> u8 {
         self.next_header
     }
 
     #[inline(always)]
-    pub fn source(self) -> Ipv6Addr {
+    pub fn hop_limit(&self) -> u8 {
+        self.hop_limit
+    }
+
+    #[inline(always)]
+    pub fn set_hop_limit(&mut self, hop_limit: u8) {
+        self.hop_limit = hop_limit;
+    }
+
+    #[inline(always)]
+    pub fn flow_label(&self) -> u32 {
+        u32::from_be_bytes(self.version_traffic_flow) & 0x000f_ffff
+    }
+
+    #[inline(always)]
+    pub fn source(&self) -> Ipv6Addr {
         Ipv6Addr::from(self.source)
     }
 
     #[inline(always)]
-    pub fn destination(self) -> Ipv6Addr {
+    pub fn destination(&self) -> Ipv6Addr {
         Ipv6Addr::from(self.destination)
+    }
+
+    #[inline(always)]
+    pub fn set_payload_len(&mut self, payload_len: u16) {
+        self.payload_len = payload_len.to_be_bytes();
+    }
+
+    #[inline(always)]
+    pub fn set_next_protocol(&mut self, protocol: u8) {
+        self.next_header = protocol;
     }
 }
 
-#[derive(Clone, Copy)]
-#[repr(C, packed)]
+#[derive(zerocopy::FromBytes, zerocopy::IntoBytes, zerocopy::KnownLayout, zerocopy::Immutable)]
+#[repr(C)]
 pub struct Ipv6FragmentHeader {
     next_header: u8,
     reserved: u8,
@@ -309,287 +334,34 @@ pub struct Ipv6FragmentHeader {
 
 impl Ipv6FragmentHeader {
     #[inline(always)]
-    pub fn next_protocol(self) -> u8 {
+    pub fn next_protocol(&self) -> u8 {
         self.next_header
     }
 
     #[inline(always)]
-    pub fn offset_more(self) -> u16 {
+    pub fn offset_more(&self) -> u16 {
         u16::from_be_bytes(self.offset_more)
     }
 
     #[inline(always)]
-    pub fn identification(self) -> u32 {
+    pub fn identification(&self) -> u32 {
         u32::from_be_bytes(self.identification)
     }
-}
-
-pub fn parse_ip_header(packet: &[u8]) -> Result<ParsedIpPacket, IpInputError> {
-    let Some(first) = packet.first().copied() else {
-        return Err(IpInputError::HeaderTooShort);
-    };
-    match first >> 4 {
-        4 => parse_ipv4_packet_header(packet),
-        6 => parse_ipv6_packet_header(packet),
-        _ => Err(IpInputError::Version),
-    }
-}
-
-pub fn parse_ip_fragment(packet: &[u8]) -> Result<ParsedIpFragment, IpInputError> {
-    parse_ip_fragment_with_chain_len(packet, 0)
-}
-
-pub fn parse_ip_fragment_with_chain_len(
-    packet: &[u8],
-    tail_len: usize,
-) -> Result<ParsedIpFragment, IpInputError> {
-    let Some(first) = packet.first().copied() else {
-        return Err(IpInputError::HeaderTooShort);
-    };
-    let chain_len = packet.len().saturating_add(tail_len);
-    match first >> 4 {
-        4 => parse_ipv4_fragment(packet, chain_len),
-        6 => parse_ipv6_fragment(packet, chain_len),
-        _ => Err(IpInputError::Version),
-    }
-}
-
-#[inline(always)]
-fn parse_ipv4_packet_header(packet: &[u8]) -> Result<ParsedIpPacket, IpInputError> {
-    let header = read_header::<Ipv4Header>(packet, 0)?;
-    if header.version() != 4 {
-        return Err(IpInputError::Version);
-    }
-    let ihl = header.header_len();
-    if ihl < IPV4_HEADER_MIN_LEN || packet.len() < ihl {
-        return Err(IpInputError::HeaderTooShort);
-    }
-
-    let total_len = header.total_len();
-    if total_len < ihl {
-        return Err(IpInputError::BadLength);
-    }
-
-    let fragment = header.flags_fragment();
-    let fragment_offset = fragment & IPV4_FRAGMENT_OFFSET_MASK;
-    let checksum_bad = internet_checksum(&packet[..ihl]) != 0;
-    let destination = header.destination();
-    let (input_target, input_error) =
-        if fragment_offset == 1 || checksum_bad || total_len < IPV4_HEADER_MIN_LEN {
-            (
-                IpInputTarget::Drop,
-                if fragment_offset == 1 {
-                    IpInputError::FragmentOffsetOne
-                } else if checksum_bad {
-                    IpInputError::BadChecksum
-                } else {
-                    IpInputError::TooShort
-                },
-            )
-        } else if header.ttl < 1 {
-            (IpInputTarget::IcmpError, IpInputError::TimeExpired)
-        } else if ihl != IPV4_HEADER_MIN_LEN {
-            (IpInputTarget::Options, IpInputError::Options)
-        } else if fragment & (IPV4_FLAG_MORE_FRAGMENTS | IPV4_FRAGMENT_OFFSET_MASK) != 0 {
-            (IpInputTarget::Reassembly, IpInputError::None)
-        } else if destination.is_multicast() {
-            (IpInputTarget::LookupMulticast, IpInputError::None)
-        } else {
-            (IpInputTarget::Lookup, IpInputError::None)
-        };
-
-    Ok(ParsedIpPacket {
-        version: IpVersion::V4,
-        protocol: IpProtocol::from(header.protocol),
-        input_target,
-        input_error,
-        source: IpAddr::V4(header.source()),
-        destination: IpAddr::V4(destination),
-        packet_len: total_len,
-        network_header_offset: 0,
-        network_header_len: ihl,
-        transport_header_offset: ihl,
-        transport_header_len: 0,
-    })
-}
-
-#[inline(always)]
-fn parse_ipv4_fragment(packet: &[u8], chain_len: usize) -> Result<ParsedIpFragment, IpInputError> {
-    let header = read_header::<Ipv4Header>(packet, 0)?;
-    if header.version() != 4 {
-        return Err(IpInputError::Version);
-    }
-    let ihl = header.header_len();
-    if ihl < IPV4_HEADER_MIN_LEN || packet.len() < ihl {
-        return Err(IpInputError::HeaderTooShort);
-    }
-
-    let total_len = header.total_len();
-    if total_len < ihl || total_len > chain_len {
-        return Err(IpInputError::BadLength);
-    }
-
-    let fragment = header.flags_fragment();
-    let payload_len = total_len - ihl;
-    let payload_offset = usize::from(fragment & IPV4_FRAGMENT_OFFSET_MASK) * 8;
-    let more_fragments = fragment & IPV4_FLAG_MORE_FRAGMENTS != 0;
-    if payload_offset == 0 && !more_fragments {
-        return Err(IpInputError::BadLength);
-    }
-
-    Ok(ParsedIpFragment {
-        version: IpVersion::V4,
-        key: IpFragmentKey::V4 {
-            source: header.source(),
-            destination: header.destination(),
-            protocol: header.protocol,
-            identification: header.identification(),
-        },
-        payload_offset,
-        payload_len,
-        more_fragments,
-        header_len: ihl,
-    })
-}
-
-#[inline(always)]
-fn parse_ipv6_packet_header(packet: &[u8]) -> Result<ParsedIpPacket, IpInputError> {
-    let header = read_header::<Ipv6Header>(packet, 0)?;
-    if header.version() != 6 {
-        return Err(IpInputError::Version);
-    }
-    if packet.len() < IPV6_HEADER_LEN {
-        return Err(IpInputError::HeaderTooShort);
-    }
-
-    let payload_len = header.payload_len();
-    let total_len = IPV6_HEADER_LEN
-        .checked_add(payload_len)
-        .ok_or(IpInputError::BadLength)?;
-
-    let source = header.source();
-    let destination = header.destination();
-    let (protocol, input_target, input_error, transport_offset) =
-        if header.next_header == IPV6_NEXT_HEADER_FRAGMENT {
-            if payload_len < IPV6_FRAGMENT_HEADER_LEN {
-                return Err(IpInputError::HeaderTooShort);
-            }
-            let fragment = read_header::<Ipv6FragmentHeader>(packet, IPV6_HEADER_LEN)?;
-            (
-                fragment.next_header,
-                if header.hop_limit < 1 {
-                    IpInputTarget::IcmpError
-                } else {
-                    IpInputTarget::Reassembly
-                },
-                if header.hop_limit < 1 {
-                    IpInputError::TimeExpired
-                } else {
-                    IpInputError::None
-                },
-                IPV6_HEADER_LEN + IPV6_FRAGMENT_HEADER_LEN,
-            )
-        } else if header.hop_limit < 1 {
-            (
-                header.next_header,
-                IpInputTarget::IcmpError,
-                IpInputError::TimeExpired,
-                IPV6_HEADER_LEN,
-            )
-        } else if destination.is_multicast() {
-            (
-                header.next_header,
-                IpInputTarget::LookupMulticast,
-                IpInputError::None,
-                IPV6_HEADER_LEN,
-            )
-        } else {
-            (
-                header.next_header,
-                IpInputTarget::Lookup,
-                IpInputError::None,
-                IPV6_HEADER_LEN,
-            )
-        };
-
-    Ok(ParsedIpPacket {
-        version: IpVersion::V6,
-        protocol: IpProtocol::from(protocol),
-        input_target,
-        input_error,
-        source: IpAddr::V6(source),
-        destination: IpAddr::V6(destination),
-        packet_len: total_len,
-        network_header_offset: 0,
-        network_header_len: IPV6_HEADER_LEN,
-        transport_header_offset: transport_offset,
-        transport_header_len: 0,
-    })
-}
-
-#[inline(always)]
-fn parse_ipv6_fragment(packet: &[u8], chain_len: usize) -> Result<ParsedIpFragment, IpInputError> {
-    let header = read_header::<Ipv6Header>(packet, 0)?;
-    if header.version() != 6 {
-        return Err(IpInputError::Version);
-    }
-    if packet.len() < IPV6_HEADER_LEN + IPV6_FRAGMENT_HEADER_LEN {
-        return Err(IpInputError::HeaderTooShort);
-    }
-
-    let payload_len = header.payload_len();
-    let total_len = IPV6_HEADER_LEN
-        .checked_add(payload_len)
-        .ok_or(IpInputError::BadLength)?;
-    if total_len > chain_len {
-        return Err(IpInputError::BadLength);
-    }
-    if payload_len < IPV6_FRAGMENT_HEADER_LEN {
-        return Err(IpInputError::HeaderTooShort);
-    }
-    if header.next_header != IPV6_NEXT_HEADER_FRAGMENT {
-        return Err(IpInputError::BadLength);
-    }
-
-    let fragment = read_header::<Ipv6FragmentHeader>(packet, IPV6_HEADER_LEN)?;
-    let offset_more = fragment.offset_more();
-    let payload_len = payload_len - IPV6_FRAGMENT_HEADER_LEN;
-    let payload_offset = usize::from(offset_more >> 3) * 8;
-    let more_fragments = offset_more & 1 != 0;
-    if payload_offset == 0 && !more_fragments {
-        return Err(IpInputError::BadLength);
-    }
-
-    Ok(ParsedIpFragment {
-        version: IpVersion::V6,
-        key: IpFragmentKey::V6 {
-            source: header.source(),
-            destination: header.destination(),
-            next_header: fragment.next_header,
-            identification: fragment.identification(),
-        },
-        payload_offset,
-        payload_len,
-        more_fragments,
-        header_len: IPV6_HEADER_LEN + IPV6_FRAGMENT_HEADER_LEN,
-    })
 }
 
 /// Read the IPv4 flags/fragment field from a raw header.
 #[inline]
 pub fn read_ipv4_flags_fragment(header: &[u8]) -> Option<u16> {
-    let bytes = header.get(6..8)?;
-    Some(u16::from_be_bytes([bytes[0], bytes[1]]))
+    let (header, _) = Ipv4Header::ref_from_prefix(header).ok()?;
+    Some(header.flags_fragment())
 }
 
 /// Set or clear the IPv4 Don't Fragment flag on a raw header in place.
 #[inline]
 pub fn apply_ipv4_dont_fragment(output: &mut [u8], enabled: bool) {
-    let Ok(ptr) = header_mut_ptr::<Ipv4Header>(output, 0) else {
+    let Ok((header, _)) = Ipv4Header::mut_from_prefix(output) else {
         return;
     };
-    // SAFETY: `header_mut_ptr` checked the range; fields are byte arrays only.
-    let header = unsafe { &mut *ptr };
     let mut flags = u16::from_be_bytes(header.flags_fragment);
     if enabled {
         flags |= IPV4_FLAG_DONT_FRAGMENT;
@@ -613,32 +385,24 @@ pub fn write_ipv4_push_header(
     total_len: u16,
     dont_fragment: bool,
 ) -> Result<(), IpInputError> {
-    let ptr = header_mut_ptr::<Ipv4Header>(output, 0)?;
-    // SAFETY: `header_mut_ptr` checked the range; `Ipv4Header` fields are only
-    // byte arrays so mutable field access cannot create unaligned multi-byte refs.
-    unsafe {
-        ptr.write(Ipv4Header {
-            version_ihl: 0x45,
-            dscp_ecn: 0,
-            total_len: total_len.to_be_bytes(),
-            identification: [0; 2],
-            flags_fragment: if dont_fragment {
-                IPV4_FLAG_DONT_FRAGMENT.to_be_bytes()
-            } else {
-                [0; 2]
-            },
-            ttl: 255,
-            protocol,
-            checksum: [0; 2],
-            source: src.octets(),
-            destination: dst.octets(),
-        });
-    }
-    let checksum = internet_checksum(&output[..IPV4_HEADER_MIN_LEN]);
-    // SAFETY: range already validated above.
-    unsafe {
-        (*ptr).checksum = checksum.to_be_bytes();
-    }
+    let (header, _) =
+        Ipv4Header::mut_from_prefix(output).map_err(|_| IpInputError::HeaderTooShort)?;
+    header.version_ihl = 0x45;
+    header.dscp_ecn = 0;
+    header.total_len = total_len.to_be_bytes();
+    header.identification = [0; 2];
+    header.flags_fragment = if dont_fragment {
+        IPV4_FLAG_DONT_FRAGMENT.to_be_bytes()
+    } else {
+        [0; 2]
+    };
+    header.ttl = 255;
+    header.protocol = protocol;
+    header.checksum = [0; 2];
+    header.source = src.octets();
+    header.destination = dst.octets();
+    let checksum = internet_checksum(header.as_bytes());
+    header.checksum = checksum.to_be_bytes();
     Ok(())
 }
 
@@ -651,17 +415,14 @@ pub fn write_ipv6_push_header(
     next_header: u8,
     payload_len: u16,
 ) -> Result<(), IpInputError> {
-    let ptr = header_mut_ptr::<Ipv6Header>(output, 0)?;
-    // SAFETY: same as `write_ipv4_push_header` — packed wire layout, byte fields only.
-    let header = unsafe { &mut *ptr };
-    *header = Ipv6Header {
-        version_traffic_flow: [0x60, 0, 0, 0],
-        payload_len: payload_len.to_be_bytes(),
-        next_header,
-        hop_limit: 255,
-        source: src.octets(),
-        destination: dst.octets(),
-    };
+    let (header, _) =
+        Ipv6Header::mut_from_prefix(output).map_err(|_| IpInputError::HeaderTooShort)?;
+    header.version_traffic_flow = [0x60, 0, 0, 0];
+    header.payload_len = payload_len.to_be_bytes();
+    header.next_header = next_header;
+    header.hop_limit = 255;
+    header.source = src.octets();
+    header.destination = dst.octets();
     Ok(())
 }
 

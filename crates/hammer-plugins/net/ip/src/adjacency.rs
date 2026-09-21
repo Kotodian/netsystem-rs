@@ -17,11 +17,12 @@ use hammer_service::net::{DpoId, DpoProto, DpoType, NetMain};
 use hammer_service::opaque::{NetworkFlags, NetworkOpaque};
 use ipnet::{Ipv4Net, Ipv6Net};
 use rand_09::RngCore;
+use zerocopy::FromBytes;
 
 use crate::interface::{ip4_source_address, ip6_multicast_adjacency, ip6_source_address};
 use crate::lookup::{IP4_MAIN, IP6_MAIN, IpSecondaryOpaque};
 use crate::protocol::icmp::IcmpErrorMetadata;
-use crate::protocol::ip::{Ipv4MtuAction, ipv4_mtu_check};
+use crate::protocol::ip::{Ipv4Header, Ipv4MtuAction, Ipv6Header, ipv4_mtu_check};
 use hammer_service::net::adj::{AdjacencyIndex, AdjacencyLookupNext, AdjacencyMain};
 
 #[repr(u8)]
@@ -1119,52 +1120,72 @@ fn rewrite_ip4_buffer(runtime: &mut DataPlaneMain, buffer_index: u32) -> u16 {
     )
     .flags
     .contains(NetworkFlags::LOCALLY_ORIGINATED);
-    let mut ttl_decremented = false;
-    let (packet_len, dont_fragment) = {
+    let (packet_len, dont_fragment, ttl_expired) = {
         let packet = runtime.buffer_mut(buffer_index).current_mut();
-        assert!(
-            packet.len() >= 20 && packet[0] >> 4 == 4,
+        let packet_capacity = packet.len();
+        let (ip_header, _) =
+            Ipv4Header::mut_from_prefix(packet).expect("IP4 rewrite receives an IPv4 header");
+        assert_eq!(
+            ip_header.version(),
+            4,
             "IP4 rewrite receives an IPv4 header"
         );
-        let header_len = usize::from(packet[0] & 0x0f) * 4;
+        let header_len = ip_header.header_len();
         assert!(
-            header_len >= 20 && packet.len() >= header_len,
+            header_len >= 20 && packet_capacity >= header_len,
             "IP4 header is contiguous"
         );
+        let mut ttl_expired = false;
         if !locally_originated {
-            assert_ne!(packet[8], 0, "IP4 input rejects zero TTL");
-            packet[8] -= 1;
-            packet[10..12].fill(0);
-            let checksum = internet_checksum(&packet[..header_len]);
-            packet[10..12].copy_from_slice(&checksum.to_be_bytes());
-            ttl_decremented = true;
-            if packet[8] == 0 {
-                let secondary = hammer_core::buffer_opaque!(
-                    mut runtime.buffer_mut(buffer_index) => crate::lookup::IpSecondaryOpaque
-                );
-                IcmpErrorMetadata::ipv4_time_exceeded().write(secondary);
-                hammer_core::buffer_opaque!(
-                    mut runtime.buffer_mut(buffer_index) => NetworkOpaque
-                )
-                .sw_if_index[1] = u32::MAX;
-                return NodeNext::slot(Ip4RewriteNext::IcmpError);
-            }
+            assert_ne!(ip_header.ttl(), 0, "IP4 input rejects zero TTL");
+            ip_header.set_ttl(ip_header.ttl() - 1);
+            ip_header.set_checksum(0);
+            ttl_expired = ip_header.ttl() == 0;
         }
         (
-            u16::from_be_bytes([packet[2], packet[3]]),
-            u16::from_be_bytes([packet[6], packet[7]]) & 0x4000 != 0,
+            ip_header.total_len() as u16,
+            ip_header.dont_fragment(),
+            ttl_expired,
         )
     };
+    if !locally_originated {
+        let packet = runtime.buffer_mut(buffer_index).current_mut();
+        let header_len = Ipv4Header::ref_from_prefix(packet)
+            .expect("IP4 header remains contiguous")
+            .0
+            .header_len();
+        let checksum = internet_checksum(&packet[..header_len]);
+        Ipv4Header::mut_from_prefix(packet)
+            .expect("IP4 header remains contiguous")
+            .0
+            .set_checksum(checksum);
+    }
+    if ttl_expired {
+        IcmpErrorMetadata::ipv4_time_exceeded().write(hammer_core::buffer_opaque!(
+            mut runtime.buffer_mut(buffer_index) => crate::lookup::IpSecondaryOpaque
+        ));
+        hammer_core::buffer_opaque!(mut runtime.buffer_mut(buffer_index) => NetworkOpaque)
+            .sw_if_index[1] = u32::MAX;
+        return NodeNext::slot(Ip4RewriteNext::IcmpError);
+    }
+    let ttl_decremented = !locally_originated;
     match ipv4_mtu_check(packet_len, header.max_l3_packet_bytes, dont_fragment) {
         Ipv4MtuAction::Ok => {}
         action => {
             if ttl_decremented {
                 let packet = runtime.buffer_mut(buffer_index).current_mut();
-                let header_len = usize::from(packet[0] & 0x0f) * 4;
-                packet[8] += 1;
-                packet[10..12].fill(0);
+                let header_len = {
+                    let (header, _) =
+                        Ipv4Header::mut_from_prefix(packet).expect("IP4 header remains contiguous");
+                    header.set_ttl(header.ttl() + 1);
+                    header.set_checksum(0);
+                    header.header_len()
+                };
                 let checksum = internet_checksum(&packet[..header_len]);
-                packet[10..12].copy_from_slice(&checksum.to_be_bytes());
+                Ipv4Header::mut_from_prefix(packet)
+                    .expect("IP4 header remains contiguous")
+                    .0
+                    .set_checksum(checksum);
             }
             return match action {
                 Ipv4MtuAction::Fragment { .. } => NodeNext::slot(Ip4RewriteNext::Fragment),
@@ -1225,34 +1246,52 @@ fn rewrite_ip6_buffer(runtime: &mut DataPlaneMain, buffer_index: u32) -> u16 {
     )
     .flags
     .contains(NetworkFlags::LOCALLY_ORIGINATED);
-    let (packet_len, multicast_suffix) = {
+    let (packet_len, multicast_suffix, hop_limit_expired) = {
         let packet = runtime.buffer_mut(buffer_index).current_mut();
-        assert!(
-            packet.len() >= 40 && packet[0] >> 4 == 6,
+        let (ip_header, _) =
+            Ipv6Header::mut_from_prefix(packet).expect("IP6 rewrite receives an IPv6 header");
+        assert_eq!(
+            ip_header.version(),
+            6,
             "IP6 rewrite receives an IPv6 header"
         );
+        let destination = ip_header.destination().octets();
+        let mut hop_limit_expired = false;
         if !locally_originated {
-            assert_ne!(packet[7], 0, "IP6 input rejects zero Hop Limit");
-            packet[7] -= 1;
-            if packet[7] == 0 {
-                IcmpErrorMetadata::ipv6_time_exceeded().write(hammer_core::buffer_opaque!(
-                    mut runtime.buffer_mut(buffer_index) => crate::lookup::IpSecondaryOpaque
-                ));
-                hammer_core::buffer_opaque!(
-                    mut runtime.buffer_mut(buffer_index) => NetworkOpaque
-                )
-                .sw_if_index[1] = u32::MAX;
-                return NodeNext::slot(Ip6RewriteNext::IcmpError);
-            }
+            assert_ne!(ip_header.hop_limit(), 0, "IP6 input rejects zero Hop Limit");
+            ip_header.set_hop_limit(ip_header.hop_limit() - 1);
+            hop_limit_expired = ip_header.hop_limit() == 0;
         }
         (
-            u16::from_be_bytes([packet[4], packet[5]]).saturating_add(40),
-            <[u8; 4]>::try_from(&packet[36..40]).expect("IP6 destination suffix is contiguous"),
+            ip_header.payload_len().saturating_add(40),
+            [
+                destination[12],
+                destination[13],
+                destination[14],
+                destination[15],
+            ],
+            hop_limit_expired,
         )
     };
-    if header.max_l3_packet_bytes >= 1280 && packet_len > header.max_l3_packet_bytes {
+    if hop_limit_expired {
+        IcmpErrorMetadata::ipv6_time_exceeded().write(hammer_core::buffer_opaque!(
+            mut runtime.buffer_mut(buffer_index) => crate::lookup::IpSecondaryOpaque
+        ));
+        hammer_core::buffer_opaque!(mut runtime.buffer_mut(buffer_index) => NetworkOpaque)
+            .sw_if_index[1] = u32::MAX;
+        return NodeNext::slot(Ip6RewriteNext::IcmpError);
+    }
+    if header.max_l3_packet_bytes >= 1280 && packet_len > usize::from(header.max_l3_packet_bytes) {
         if !locally_originated {
-            runtime.buffer_mut(buffer_index).current_mut()[7] += 1;
+            let packet = runtime.buffer_mut(buffer_index).current_mut();
+            let hop_limit = Ipv6Header::ref_from_prefix(packet)
+                .expect("IP6 header remains contiguous")
+                .0
+                .hop_limit();
+            Ipv6Header::mut_from_prefix(packet)
+                .expect("IP6 header remains contiguous")
+                .0
+                .set_hop_limit(hop_limit + 1);
             IcmpErrorMetadata::ipv6_packet_too_big(u32::from(header.max_l3_packet_bytes)).write(
                 hammer_core::buffer_opaque!(
                     mut runtime.buffer_mut(buffer_index) => crate::lookup::IpSecondaryOpaque

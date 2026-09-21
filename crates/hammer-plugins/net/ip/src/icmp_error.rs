@@ -17,7 +17,7 @@ use crate::protocol::icmp::{IcmpErrorFamily, IcmpErrorMetadata};
 use crate::protocol::ip::{
     IpProtocol, Ipv4Header, Ipv6Header, write_ipv4_push_header, write_ipv6_push_header,
 };
-use crate::protocol::wire::read_header;
+use zerocopy::FromBytes;
 
 #[hammer_component_macros::node_next]
 enum Ip4IcmpErrorNext {
@@ -259,7 +259,7 @@ fn generate_error(
     let bytes = original.current();
     let (destination, key, header_len, limit) = match family {
         IcmpErrorFamily::Ipv4 => {
-            let Ok(header) = read_header::<Ipv4Header>(bytes, 0) else {
+            let Ok((header, _)) = Ipv4Header::ref_from_prefix(bytes) else {
                 return Ok(IcmpError::BadRequest);
             };
             (
@@ -271,7 +271,7 @@ fn generate_error(
             )
         }
         IcmpErrorFamily::Ipv6 => {
-            let Ok(header) = read_header::<Ipv6Header>(bytes, 0) else {
+            let Ok((header, _)) = Ipv6Header::ref_from_prefix(bytes) else {
                 return Ok(IcmpError::BadRequest);
             };
             let source = u128::from(header.source());
