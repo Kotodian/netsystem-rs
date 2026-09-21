@@ -22,7 +22,7 @@ fmt-check:
 	cargo fmt --all -- --check
 
 verify-allocation-contract:
-	cargo build -p hammer-plugin-ip -p hammer-plugin-tcp -p hammer-plugin-udp
+	cargo build -p hammer-plugin-ip -p hammer-plugin-session -p hammer-plugin-tcp -p hammer-plugin-udp
 	HAMMER_PLUGIN_DIR="$${CARGO_TARGET_DIR:-target}/debug" cargo run -p hammer --example plugin_additive_load
 
 verify-dataplane-performance:

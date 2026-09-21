@@ -40,7 +40,7 @@ frame_pool_size = 32
 [statseg]
 socket_name = "/tmp/hammer-plugin-additive-load.stats"
 "#;
-const PLUGIN_NAMES: [&str; 3] = ["ip", "tcp", "udp"];
+const PLUGIN_NAMES: [&str; 4] = ["ip", "session", "tcp", "udp"];
 
 #[derive(Debug, Default, serde::Deserialize)]
 #[serde(default)]
@@ -175,7 +175,7 @@ fn run_example(
     verify_shared_allocator_images(plugin_path)?;
 
     println!("fixed main heap: {main_heap_capacity} bytes");
-    println!("loaded plugins: ip, tcp, udp");
+    println!("loaded plugins: ip, session, tcp, udp");
     println!("host and plugin images share libhammer_infra allocator authority");
     println!("main graph and live worker update completed");
     Ok(())

@@ -10,24 +10,29 @@ pub mod app;
 pub mod application;
 pub mod config;
 mod control;
+pub mod endpoint;
 pub mod error;
-mod lookup;
+pub mod lookup;
 pub mod node;
 pub mod protocol;
 pub mod runtime;
 pub mod state;
+pub mod table;
 
 pub use app::AppWorker;
 pub use application::{
     APPLICATION_MAIN, ApplicationError, ApplicationMain, ApplicationMqResources, application_main,
 };
 pub use config::Session;
+pub use endpoint::SessionEndpoint;
 pub use error::{SessionConnectError, SessionQueueError};
+pub use lookup::{SessionLookup, SessionLookupResult};
 pub use node::{AppSessionInputNode, SESSION_QUEUE_IO_BUDGET, SessionQueueNext, SessionQueueNode};
 pub use protocol::{SessionAppVft, register_session_app};
 pub use runtime::{
     SESSION_MAIN, SessionAcceptMetadata, SessionEndpointRole, SessionWorker, session_main,
 };
+pub use table::{SessionTable, SessionTableIndex};
 
 static SESSION_CONFIG: OnceLock<Session> = OnceLock::new();
 static APP_SERVER: OnceLock<Arc<AppServer>> = OnceLock::new();

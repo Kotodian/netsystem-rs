@@ -29,7 +29,7 @@ pub fn unregister_dst_port(version: UdpIpVersion, port: u16, node: NodeId) -> Ru
 
 hammer_component_macros::declare_plugin!(
     name = "udp",
-    load_after = ["ip"],
+    load_after = ["ip", "session"],
     init_functions = [worker::__INIT_FN_UDP_INIT],
     config_functions = [],
     main_loop_enter_functions = [],

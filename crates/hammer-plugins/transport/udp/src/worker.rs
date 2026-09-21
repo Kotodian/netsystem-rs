@@ -6,12 +6,12 @@ use std::sync::{Arc, OnceLock};
 use hammer_core::data_plane::{Frame, NodeId, NodeState};
 use hammer_infra::align::CacheLineAlignMark;
 use hammer_infra::pool::Pool;
+use hammer_plugin_session::{IpTransportConnectionId, session_lookup};
 use hammer_runtime::app::{SessionDgramHeader, SessionHandle};
 use hammer_runtime::{
     DataPlaneMain, DataWorkerId, NodeRuntime, RuntimeError, RuntimeResult, SessionConnectEndpoint,
     SessionListenEndpoint,
 };
-use hammer_service::session::SessionQueueNext;
 use hammer_service::session::node::{SessionQueueNode, SessionQueueOutput};
 use hammer_service::session::runtime::{
     SessionDgramArgs, SessionMigrateResult, SessionSwitchPoolArgs, SessionSwitchPoolClosed,
@@ -19,6 +19,7 @@ use hammer_service::session::runtime::{
     SessionSwitchPoolStatus, SessionTransport, SessionWorker, TransportInternalTransport,
     TransportInternalTx, dispatch_session_queue_events, session_main,
 };
+use hammer_service::session::{SessionLookup, SessionLookupResult, SessionQueueNext};
 use hammer_service::transport::{TransportVft, register_transport};
 
 use crate::UdpIpVersion;
@@ -30,6 +31,15 @@ use crate::protocol::write_udp_header;
 const UDP_CONNECTION_CAPACITY: usize = 1024;
 const UDP_LISTENER_CAPACITY: usize = 256;
 const UDP_HEADER_LEN: usize = 8;
+
+fn session_connection_id(
+    protocol: u8,
+    local: SocketAddr,
+    remote: SocketAddr,
+) -> Result<IpTransportConnectionId, UdpTransportError> {
+    IpTransportConnectionId::from_socket_addrs(0, local, remote, protocol)
+        .ok_or(UdpTransportError::InvalidConnection)
+}
 
 #[hammer_component_macros::runtime_error(subsystem = "udp")]
 #[derive(Debug, thiserror::Error)]
@@ -260,10 +270,8 @@ impl UdpWorker {
             return Err(UdpTransportError::InvalidConnection.into());
         }
         self.lookup.insert_tuple(index, local, remote);
-        if !sessions.insert_session_endpoint(session_id, self.protocol, local, remote)? {
-            self.rollback_accept(sessions, session_id, index, local, remote)?;
-            return Err(UdpTransportError::EndpointInUse { endpoint: local }.into());
-        }
+        let connection_id = session_connection_id(self.protocol, local, remote)?;
+        session_lookup().add_connection(&connection_id, sessions.session_handle(session_id));
         let rollback = |sessions: &mut SessionWorker,
                         udp: &mut UdpWorker,
                         session_id,
@@ -337,10 +345,8 @@ impl UdpWorker {
             return Err(UdpTransportError::InvalidConnection.into());
         }
         self.lookup.insert_tuple(index, local, remote);
-        if !sessions.insert_session_endpoint(session_id, self.protocol, local, remote)? {
-            self.rollback_accept(sessions, session_id, index, local, remote)?;
-            return Err(UdpTransportError::EndpointInUse { endpoint: local }.into());
-        }
+        let connection_id = session_connection_id(self.protocol, local, remote)?;
+        session_lookup().add_connection(&connection_id, sessions.session_handle(session_id));
         if let Err(error) = sessions.complete_stream_connect(session_id) {
             if let Err(cleanup_error) =
                 self.rollback_accept(sessions, session_id, index, local, remote)
@@ -365,7 +371,9 @@ impl UdpWorker {
         remote: SocketAddr,
     ) -> RuntimeResult<()> {
         self.lookup.remove_tuple(local, remote);
-        let _ = sessions.remove_session_endpoint(self.protocol, local, remote)?;
+        let connection_id = session_connection_id(self.protocol, local, remote)?;
+        session_lookup()
+            .remove_connection_if_current(&connection_id, sessions.session_handle(session_id));
         self.remove_connection(index);
         sessions.rollback_session_creation(session_id)?;
         Ok(())
@@ -384,7 +392,8 @@ impl UdpWorker {
         listener: Option<UdpListener>,
         return_node: NodeId,
     ) -> RuntimeResult<UdpDelivery> {
-        let endpoint = sessions.lookup_session_endpoint(self.protocol, local, remote)?;
+        let connection_id = session_connection_id(self.protocol, local, remote)?;
+        let endpoint = session_lookup().lookup_session(&connection_id);
         if let Some(connection_index) = self.lookup.find_tuple(&self.connections, local, remote) {
             if endpoint.is_some_and(|handle| handle.thread_index != self.worker.thread_index()) {
                 return Ok(UdpDelivery::WrongWorker);
@@ -410,21 +419,25 @@ impl UdpWorker {
                 UdpDelivery::Delivered
             });
         }
-        if let Some(handle) = sessions.lookup_session_endpoint(self.protocol, local, remote)? {
+        if let Some(handle) = endpoint {
             if handle.thread_index != self.worker.thread_index() {
-                let result = sessions.program_thread_migration(
-                    runtime,
-                    self.worker,
-                    handle,
-                    (self.protocol, local, remote),
-                    SessionDgramArgs {
-                        index,
-                        payload_offset,
-                        payload_len,
-                        urgent,
-                        return_node,
-                    },
-                );
+                let result = match session_lookup().lookup_exact(&connection_id) {
+                    SessionLookupResult::Session(current) if current == handle => sessions
+                        .program_thread_migration(
+                            runtime,
+                            self.worker,
+                            handle,
+                            (self.protocol, local, remote),
+                            SessionDgramArgs {
+                                index,
+                                payload_offset,
+                                payload_len,
+                                urgent,
+                                return_node,
+                            },
+                        ),
+                    _ => SessionMigrateResult::Unavailable,
+                };
                 return Ok(match result {
                     SessionMigrateResult::Queued => UdpDelivery::MigrationQueued,
                     SessionMigrateResult::Handoff
@@ -604,15 +617,21 @@ impl UdpWorker {
                 .connection_mut(connection_index)
                 .is_some_and(|connection| connection.attach_session(session_id));
             let inserted = attached && self.lookup.insert_tuple(connection_index, local, remote);
+            let connection_id = session_connection_id(transport, local, remote)?;
             let published = inserted
-                && sessions
-                    .publish_session_migration(new_handle, transport, local, remote)
-                    .unwrap_or(false);
+                && session_lookup().replace_connection_if_current(
+                    &connection_id,
+                    reply.old_sh,
+                    new_handle,
+                );
             let accepted = published && sessions.accept_migrated_session(session_id).is_ok();
             if !accepted {
                 if published {
-                    let _ =
-                        sessions.replace_session_endpoint(reply.old_sh, transport, local, remote);
+                    session_lookup().replace_connection_if_current(
+                        &connection_id,
+                        new_handle,
+                        reply.old_sh,
+                    );
                 }
                 self.lookup.remove_tuple(local, remote);
                 let _ = self.remove_connection(connection_index);
@@ -677,12 +696,13 @@ impl UdpWorker {
             .notify_migrated_session(session_id, completion.new_sh)
             .is_err()
             || sessions.remove_migrated_session(session_id).is_err()
-            || sessions
-                .remove_session_endpoint(self.protocol, local, remote)
-                .is_err()
         {
             return false;
         }
+        let Ok(connection_id) = session_connection_id(self.protocol, local, remote) else {
+            return false;
+        };
+        session_lookup().remove_connection_if_current(&connection_id, completion.old_sh);
         self.lookup.remove_tuple(local, remote);
         let _ = self.remove_connection(index);
         true
@@ -709,12 +729,10 @@ impl UdpWorker {
         {
             return true;
         }
-        if sessions
-            .remove_session_endpoint(self.protocol, local, remote)
-            .is_err()
-        {
+        let Ok(connection_id) = session_connection_id(self.protocol, local, remote) else {
             return false;
-        }
+        };
+        session_lookup().remove_connection_if_current(&connection_id, closed.new_sh);
         self.lookup.remove_tuple(local, remote);
         let _ = self.remove_connection(index);
         sessions.remove_migrated_session(session_id).is_ok()
@@ -1052,11 +1070,10 @@ impl SessionTransport for UdpWorker {
         };
         self.lookup
             .remove_tuple(connection.local(), connection.remote());
-        let _ = sessions.remove_session_endpoint(
-            self.protocol,
-            connection.local(),
-            connection.remote(),
-        )?;
+        let connection_id =
+            session_connection_id(self.protocol, connection.local(), connection.remote())?;
+        session_lookup()
+            .remove_connection_if_current(&connection_id, sessions.session_handle(session_id));
         self.connections.remove(index);
         sessions.notify_transport_deleted(session_id, index)?;
         Ok(())
