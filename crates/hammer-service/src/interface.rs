@@ -1,7 +1,7 @@
 use hammer_core::data_plane::{Frame, NodeId, NodeRegistration};
 use hammer_runtime::{
-    DataPlaneMain, InternalNode, Node, NodeProcessFn, NodeRuntime, RuntimeError, RuntimeResult,
-    add_packet_trace, process_frame,
+    DataPlaneMain, InternalNode, Node, NodeErrorCode, NodeErrorDescriptor, NodeErrorSeverity,
+    NodeProcessFn, NodeRuntime, RuntimeError, RuntimeResult, process_frame,
 };
 
 pub use crate::interface_model::*;
@@ -127,97 +127,62 @@ impl InterfaceMtuKind {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
-pub enum InterfaceOutputTraceError {
-    MissingEgressInterface,
-    MissingTxNode,
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u16)]
+pub(crate) enum InterfaceOutputError {
+    InterfaceDown,
+    InterfaceDeleted,
+    NoTxQueue,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
-pub struct InterfaceOutputTrace {
-    pub egress_interface: Option<u32>,
-    pub tx_next: Option<u16>,
-    pub error: Option<InterfaceOutputTraceError>,
-    pub next: Option<u16>,
+impl NodeErrorCode for InterfaceOutputError {
+    fn local_code(self) -> u16 {
+        self as u16
+    }
 }
+
+pub(crate) const INTERFACE_OUTPUT_ERROR_DESCRIPTORS: [NodeErrorDescriptor; 3] = [
+    NodeErrorDescriptor::new(
+        "interface-down",
+        NodeErrorSeverity::Error,
+        "Interface is down",
+    ),
+    NodeErrorDescriptor::new(
+        "interface-deleted",
+        NodeErrorSeverity::Error,
+        "Interface is deleted",
+    ),
+    NodeErrorDescriptor::new(
+        "no-tx-queue",
+        NodeErrorSeverity::Error,
+        "No transmit queue is assigned to this worker",
+    ),
+];
 
 #[hammer_component_macros::graph_node(graph = service, init = register_interface_output_graph, name = "interface-output")]
 #[derive(Debug, Clone, Copy)]
 pub struct InterfaceOutputNode;
 
 fn register_interface_output_graph(runtime: &DataPlaneMain) -> RuntimeResult<NodeId> {
-    let node = runtime.nodes().try_register_internal(InterfaceOutputNode)?;
-    let net = NetMain::global()?;
-    net.register_dpo(
-        Some(crate::net::DpoType::INTERFACE_TX),
-        &[],
-        None,
-        Some(InterfaceMain::interface_tx_nodes),
-        None,
-        None,
-        None,
-        None,
-        None,
-    )
-    .map_err(|source| RuntimeError::GraphNodeInitialization {
-        node: "interface-output",
-        source: Box::new(source),
-    })?;
-    net.interface_main().initialize_output_node(node);
-    Ok(node)
+    runtime.nodes().try_register_internal(InterfaceOutputNode)
 }
 
 impl InterfaceOutputNode {
-    fn tx_for_index(runtime: &DataPlaneMain, index: u32, drop_next: u16) -> RuntimeResult<u16> {
+    fn next_for_index(runtime: &DataPlaneMain, index: u32) -> u16 {
         let interface_index = {
             let buffer = runtime.buffer(index);
             let network = hammer_core::buffer_opaque!(buffer => NetworkOpaque);
             network.sw_if_index[1]
         };
-        if interface_index == u32::MAX {
-            let _ = add_packet_trace!(
-                runtime,
-                index,
-                InterfaceOutputTrace {
-                    egress_interface: None,
-                    tx_next: None,
-                    error: Some(InterfaceOutputTraceError::MissingEgressInterface),
-                    next: Some(drop_next)
-                }
-            );
-            return Ok(drop_next);
-        }
-        let worker = runtime.data_worker_id()?;
-        let Some(net) = NetMain::global().ok() else {
-            return Ok(drop_next);
-        };
-        let Some(tx) = net
-            .interface_main()
-            .tx_slot_for_worker(worker, interface_index)
-        else {
-            let _ = add_packet_trace!(
-                runtime,
-                index,
-                InterfaceOutputTrace {
-                    egress_interface: Some(interface_index),
-                    tx_next: None,
-                    error: Some(InterfaceOutputTraceError::MissingTxNode),
-                    next: Some(drop_next)
-                }
-            );
-            return Ok(drop_next);
-        };
-        let _ = add_packet_trace!(
-            runtime,
-            index,
-            InterfaceOutputTrace {
-                egress_interface: Some(interface_index),
-                tx_next: Some(tx),
-                error: None,
-                next: Some(tx)
-            }
+        assert_ne!(
+            interface_index,
+            u32::MAX,
+            "interface-output requires a TX software interface"
         );
-        Ok(tx)
+        NetMain::global()
+            .expect("interface-output requires the network Main")
+            .interface_main()
+            .output_node_next_index_for_sw_interface(interface_index)
     }
 }
 
@@ -246,81 +211,162 @@ fn interface_output_process(
     let processed_vectors = frame.len();
     (|| {
         process_frame!(runtime, node_runtime, frame, |index| {
-            InterfaceOutputNode::tx_for_index(runtime, index, 0).unwrap_or(0)
+            InterfaceOutputNode::next_for_index(runtime, index)
         });
     })();
     processed_vectors
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::net::{DpoError, DpoId, DpoProto, DpoType};
-    use hammer_runtime::DataPlaneBufferConfig;
-    use std::sync::Arc;
+#[hammer_component_macros::graph_node(
+    graph = service,
+    kind = internal,
+    name = "interface-output-arc-end"
+)]
+pub struct InterfaceOutputArcEndNode;
 
-    #[test]
-    fn interface_tx_stack_uses_the_interface_output_node() -> Result<(), DpoError> {
-        crate::BUFFER_MAIN_INIT.call_once(|| {
-            hammer_core::buffer::BufferMain::new(
-                64,
-                1024,
-                &[0],
-                2,
-                hammer_infra::PageSize::Default,
-            )
-            .unwrap();
-        });
-        hammer_runtime::ThreadMain::new().unwrap();
-        let mut runtime = DataPlaneMain::new(DataPlaneBufferConfig::default());
-        let interfaces = Arc::new(InterfaceMain::new());
-        let net = NetMain::init(&mut runtime, interfaces)?;
-        let child = crate::data_plane::register_drop(&mut runtime)?;
-        let output = register_interface_output_graph(&mut runtime)?;
-        let interfaces = net.interface_main();
-        let hardware = interfaces
-            .register_hardware_interface(
-                &mut runtime,
-                interfaces.device_class_index("local"),
-                1,
-                interfaces.hw_class_index("local"),
-                0,
-            )
-            .unwrap();
-        let software = interfaces.hardware_interface(hardware).sw_if_index;
-        assert_eq!(
-            interfaces
-                .software_interface(software)
-                .unwrap()
-                .sup_sw_if_index,
-            software
-        );
-        for software in [net.local_interface_sw_index(), software] {
-            let dpo = net
-                .dpo_main()
-                .identity(DpoType::INTERFACE_TX, DpoProto::IP4, software)?;
-            let stacked = net
-                .dpo_main_mut()
-                .stack_from_node(&mut runtime, child, dpo)?;
-            assert_eq!(stacked.index(), software);
-            assert_eq!(
-                Some(stacked.next()),
-                runtime.nodes().node_next_slot_for_target(child, output)?
+impl Node for InterfaceOutputArcEndNode {
+    fn process(
+        runtime: &mut DataPlaneMain,
+        node_runtime: &mut NodeRuntime,
+        frame: &mut Frame,
+    ) -> usize {
+        let processed = frame.len();
+        let interfaces = NetMain::global()
+            .expect("interface-output-arc-end requires the network Main")
+            .interface_main();
+        process_frame!(runtime, node_runtime, frame, |index| {
+            let sw_if_index =
+                hammer_core::buffer_opaque!(runtime.buffer(index) => NetworkOpaque).sw_if_index[1];
+            let entry = interfaces.interface_lookup_entry(sw_if_index);
+            assert!(
+                entry.has_hardware(),
+                "arc-end requires a live hardware mapping"
             );
-            net.lock_dpo(dpo);
-            net.unlock_dpo(dpo);
-        }
-        interfaces
-            .delete_hardware_interface(&mut runtime, hardware)
-            .unwrap();
-        assert!(matches!(
-            net.dpo_main_mut().stack_from_node(
-                &mut runtime,
-                child,
-                DpoId::interface_tx(DpoProto::IP4, software)
-            ),
-            Err(DpoError::NodeMissing { .. })
-        ));
-        Ok(())
+            assert!(entry.has_arc_end(), "arc-end requires a published TX next");
+            let hardware = interfaces.hardware_interface(entry.hw_if_index);
+            let has_queue = hardware.tx_queue_indices.is_empty()
+                || runtime.data_worker_id().is_ok_and(|worker| {
+                    interfaces.has_tx_queue_for_worker(worker, entry.hw_if_index)
+                });
+            if has_queue {
+                runtime.buffer_mut(index).clear_node_error();
+                entry.if_out_arc_end_next_index
+            } else {
+                let error_index = runtime
+                    .record_current_node_error(InterfaceOutputError::NoTxQueue)
+                    .expect("interface arc-end errors are registered before dispatch");
+                runtime.buffer_mut(index).set_node_error_index(error_index);
+                0
+            }
+        });
+        processed
     }
+}
+
+pub(crate) fn interface_output_template(
+    runtime: &mut DataPlaneMain,
+    node_runtime: &mut NodeRuntime,
+    frame: &mut Frame,
+) -> usize {
+    let processed = frame.len();
+    let hw_if_index = u32::try_from(node_runtime.word(0))
+        .expect("interface output runtime hardware index fits u32");
+    let interfaces = NetMain::global()
+        .expect("interface output requires the network Main")
+        .interface_main();
+    let deleted = node_runtime.word(3) != 0;
+    if deleted {
+        process_frame!(runtime, node_runtime, frame, |index| {
+            let error_index = runtime
+                .record_current_node_error(InterfaceOutputError::InterfaceDeleted)
+                .expect("interface output errors are registered before dispatch");
+            runtime.buffer_mut(index).set_node_error_index(error_index);
+            0
+        });
+        return processed;
+    }
+
+    let hardware = interfaces.hardware_interface(hw_if_index);
+    let sw_if_index = hardware.sw_if_index;
+    let is_up = hardware.flags.contains(HwInterfaceFlags::LINK_UP)
+        && interfaces
+            .software_interface(sw_if_index)
+            .expect("hardware software interface remains live")
+            .flags
+            .contains(SwInterfaceFlags::ADMIN_UP);
+    let has_queue = hardware.tx_queue_indices.is_empty()
+        || runtime
+            .data_worker_id()
+            .is_ok_and(|worker| interfaces.has_tx_queue_for_worker(worker, hw_if_index));
+    let arc_index = interfaces.output_feature_arc_index();
+    let features = crate::feature::FeatureMain::global()
+        .expect("FeatureMain exists before interface output dispatch");
+    process_frame!(runtime, node_runtime, frame, |index| {
+        let error = if !is_up {
+            Some(InterfaceOutputError::InterfaceDown)
+        } else if !has_queue {
+            Some(InterfaceOutputError::NoTxQueue)
+        } else {
+            None
+        };
+        if let Some(error) = error {
+            let error_index = runtime
+                .record_current_node_error(error)
+                .expect("interface output errors are registered before dispatch");
+            runtime.buffer_mut(index).set_node_error_index(error_index);
+            0
+        } else {
+            runtime.buffer_mut(index).clear_node_error();
+            features.start_feature_arc(arc_index, sw_if_index, runtime.buffer_mut(index), 1)
+        }
+    });
+    processed
+}
+
+#[hammer_component_macros::main_loop_enter_function(
+    name = "interface_output_feature_init",
+    runs_after = ["device_input_feature_init"],
+    runs_before = ["feature_arc_init"]
+)]
+fn interface_output_feature_init(main: &mut DataPlaneMain) -> RuntimeResult<()> {
+    let features = crate::feature::FeatureMain::global()?;
+    let arc_end = main
+        .nodes()
+        .node_by_name("interface-output-arc-end")
+        .expect("interface-output-arc-end is materialized");
+    main.register_node_errors(arc_end, &INTERFACE_OUTPUT_ERROR_DESCRIPTORS)?;
+    let arc_index = features
+        .register_feature_arc("interface-output", &[], Some("interface-output-arc-end"))
+        .map_err(|source| RuntimeError::GraphNodeInitialization {
+            node: "interface-output",
+            source: Box::new(source),
+        })?;
+    features
+        .register_feature(
+            "interface-output",
+            "interface-output-arc-end",
+            arc_end,
+            &[],
+            &[],
+        )
+        .map_err(|source| RuntimeError::GraphNodeInitialization {
+            node: "interface-output-arc-end",
+            source: Box::new(source),
+        })?;
+    let public_output = main
+        .nodes()
+        .node_by_name("interface-output")
+        .expect("interface-output is materialized");
+    let drop_node = main
+        .nodes()
+        .node_by_name("drop")
+        .expect("drop is materialized");
+    NetMain::global()?.interface_main().complete_output_graph(
+        main,
+        arc_index,
+        public_output,
+        arc_end,
+        drop_node,
+    );
+    Ok(())
 }

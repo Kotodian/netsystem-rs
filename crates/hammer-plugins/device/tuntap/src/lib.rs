@@ -1,30 +1,29 @@
-use std::cell::UnsafeCell;
-use std::collections::HashMap;
+use std::cell::{RefCell, RefMut, UnsafeCell};
 use std::fmt;
 use std::io;
-#[cfg(target_os = "linux")]
-use std::mem::size_of;
-use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
-use std::os::fd::RawFd;
+use std::os::fd::{AsFd, AsRawFd, FromRawFd, OwnedFd};
 use std::sync::OnceLock;
 
-use hammer_infra::pool::Pool;
-use hammer_plugin_ip::protocol::ip::IpVersion;
-use hammer_plugin_ip::{
-    fib_table_get_index_for_sw_if_index, ip4_sw_interface_enable_disable,
-    ip6_sw_interface_enable_disable, register_ip4_add_del_interface_address_callback,
-    register_ip6_add_del_interface_address_callback,
-};
-use hammer_runtime::{DataPlaneMain, RuntimeResult};
-use hammer_service::interface::{HwClassFlags, HwInterfaceFlags, SwInterfaceFlags};
+use hammer_core::buffer::DEFAULT_BUFFER_FRAME_CAPACITY;
+use hammer_core::data_plane::{Frame, NodeId, NodeState};
+use hammer_infra::align::CacheLineAlignMark;
+use hammer_plugin_ip::{Ip4InputNode, Ip6InputNode, IpInterfaceAddressError};
+use hammer_runtime::file::{FILE_MAIN, File, FileFunctions};
+use hammer_runtime::{DataPlaneMain, Node, NodeRuntime, RuntimeError, RuntimeResult};
+use hammer_service::data_plane::DropNode;
+use hammer_service::feature::FeatureMain;
+use hammer_service::interface::{HwClassFlags, HwInterfaceFlags, InterfaceMtu, SwInterfaceFlags};
 use hammer_service::net::NetMain;
+use hammer_service::opaque::NetworkOpaque;
+use ipnet::Ipv4Net;
 
 hammer_service::declare_interface_registration_image!();
 
 #[derive(hammer_component_macros::DeviceClass)]
 #[device_class(
     name = "tuntap",
-    format_device_name = format_tuntap_interface_name
+    format_device_name = format_tuntap_interface_name,
+    tx_function = tuntap_intfc_tx
 )]
 struct TuntapDeviceClass;
 
@@ -45,7 +44,8 @@ struct TuntapConfig {
     enabled: bool,
     name: String,
     mtu: u32,
-    ethernet: bool,
+    admin_up: bool,
+    ip4_address: Option<Ipv4Net>,
 }
 
 impl Default for TuntapConfig {
@@ -54,461 +54,587 @@ impl Default for TuntapConfig {
             enabled: false,
             name: "vnet".to_owned(),
             mtu: 4_096 + 256,
-            ethernet: false,
+            admin_up: false,
+            ip4_address: None,
         }
     }
 }
 
-#[derive(Debug)]
+enum TuntapFile {
+    Active { control: OwnedFd, file_index: u32 },
+    Closed,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct TuntapRxNext {
+    drop: u16,
+    ip4_input: u16,
+    ip6_input: u16,
+}
+
+impl TuntapRxNext {
+    fn resolve(nodes: &hammer_runtime::NodeMain) -> Self {
+        let rx = nodes
+            .node_by_name(TuntapRxNode::NODE_NAME)
+            .expect("tuntap-rx is materialized before its next layout is resolved");
+        let drop = nodes
+            .node_by_name(DropNode::NODE_NAME)
+            .expect("drop is materialized before tuntap input initialization");
+        let ip4_input = nodes
+            .node_by_name(Ip4InputNode::NODE_NAME)
+            .expect("ip4-input is materialized before tuntap input initialization");
+        let ip6_input = nodes
+            .node_by_name(Ip6InputNode::NODE_NAME)
+            .expect("ip6-input is materialized before tuntap input initialization");
+        Self {
+            drop: Self::slot(nodes, rx, drop),
+            ip4_input: Self::slot(nodes, rx, ip4_input),
+            ip6_input: Self::slot(nodes, rx, ip6_input),
+        }
+    }
+
+    fn slot(nodes: &hammer_runtime::NodeMain, rx: NodeId, target: NodeId) -> u16 {
+        nodes
+            .node_next_slot_for_target(rx, target)
+            .expect("tuntap sibling next lookup uses live nodes")
+            .expect("IP owns the device-input next registration before tuntap initialization")
+    }
+}
+
+struct TuntapThreadState {
+    rx_buffers: Vec<u32>,
+    iovecs: Vec<libc::iovec>,
+}
+
+// SAFETY: iovec pointers are created and consumed synchronously by the runtime
+// thread that owns this state. The state is moved into TuntapMain only while
+// its iovec vector is empty and never migrates after publication.
+unsafe impl Send for TuntapThreadState {}
+
+#[repr(C)]
+struct TuntapThreadSlot {
+    cacheline0: CacheLineAlignMark,
+    state: RefCell<TuntapThreadState>,
+}
+
 struct TuntapMain {
-    dev_net_tun_fd: RawFd,
-    dev_tap_fd: RawFd,
-    is_ether: bool,
-    tun_name: String,
+    file: UnsafeCell<TuntapFile>,
+    rx_next: OnceLock<TuntapRxNext>,
+    threads: Box<[TuntapThreadSlot]>,
+    provisioning_fd: OwnedFd,
     mtu_bytes: u32,
-    ether_dst_mac: [u8; 6],
     hw_if_index: u32,
     sw_if_index: u32,
-    subinterface_addresses: UnsafeCell<Pool<SubinterfaceAddress>>,
-    subinterface_address_index_by_key: UnsafeCell<HashMap<(u32, IpAddr), u32>>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct SubinterfaceAddress {
-    sw_if_index: u32,
-    address: IpAddr,
-}
-
-// SAFETY: alias state is accessed only by main-thread IP address callbacks.
+// SAFETY: every runtime thread permanently borrows only the slot selected by
+// its immutable runtime thread index. File state and rx_next are changed only
+// by thread zero during startup or after packet dispatch has stopped.
 unsafe impl Sync for TuntapMain {}
 
 static TUNTAP_MAIN: OnceLock<TuntapMain> = OnceLock::new();
 
 impl TuntapMain {
-    fn subinterface_address_index(&self, sw_if_index: u32, address: IpAddr) -> u32 {
-        let key = (sw_if_index, address);
-        // SAFETY: IP address callbacks execute serially on the main thread.
-        let indices = unsafe { &mut *self.subinterface_address_index_by_key.get() };
-        if let Some(index) = indices.get(&key).copied() {
-            return index;
-        }
-        let index =
-            unsafe { &mut *self.subinterface_addresses.get() }.insert(SubinterfaceAddress {
-                sw_if_index,
-                address,
-            });
-        indices.insert(key, index);
-        index
-    }
-
-    fn remove_subinterface_address(&self, sw_if_index: u32, address: IpAddr, index: u32) {
-        // SAFETY: IP address callbacks execute serially on the main thread.
-        let removed = unsafe { &mut *self.subinterface_address_index_by_key.get() }
-            .remove(&(sw_if_index, address));
-        assert_eq!(removed, Some(index));
-        let record = unsafe { &mut *self.subinterface_addresses.get() }
-            .remove(index)
-            .expect("tuntap alias hash names an occupied pool slot");
-        assert_eq!(record.sw_if_index, sw_if_index);
-        assert_eq!(record.address, address);
-    }
-
     #[cfg(target_os = "linux")]
     fn init(config: TuntapConfig, data_plane: &mut DataPlaneMain) -> RuntimeResult<Self> {
-        let mut main = Self {
-            dev_net_tun_fd: -1,
-            dev_tap_fd: -1,
-            is_ether: false,
-            tun_name: config.name,
+        let descriptor = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open("/dev/net/tun")
+            .map_err(|source| TuntapConfigError::OpenDevNetTun { source })?;
+        let control: OwnedFd = descriptor.into();
+        let mut request: libc::ifreq = unsafe { std::mem::zeroed() };
+        for (destination, source) in request
+            .ifr_name
+            .iter_mut()
+            .take(libc::IFNAMSIZ - 1)
+            .zip(config.name.bytes())
+        {
+            *destination = source as libc::c_char;
+        }
+        request.ifr_ifru.ifru_flags = (libc::IFF_TUN | libc::IFF_NO_PI) as libc::c_short;
+        if unsafe { libc::ioctl(control.as_raw_fd(), libc::TUNSETIFF, &mut request) } < 0 {
+            return Err(TuntapConfigError::TunSetIff {
+                source: io::Error::last_os_error(),
+            }
+            .into());
+        }
+        if unsafe { libc::ioctl(control.as_raw_fd(), libc::TUNSETPERSIST, 1) } < 0 {
+            return Err(TuntapConfigError::TunSetPersist {
+                source: io::Error::last_os_error(),
+            }
+            .into());
+        }
+        let mut nonblocking = 1;
+        if unsafe { libc::ioctl(control.as_raw_fd(), libc::FIONBIO, &mut nonblocking) } < 0 {
+            let source = io::Error::last_os_error();
+            if unsafe { libc::ioctl(control.as_raw_fd(), libc::TUNSETPERSIST, 0) } < 0 {
+                tracing::warn!(source = %io::Error::last_os_error(), "tuntap persistence cleanup failed");
+            }
+            return Err(TuntapConfigError::SetNonblocking { source }.into());
+        }
+
+        let descriptor = unsafe { libc::socket(libc::AF_INET, libc::SOCK_DGRAM, 0) };
+        if descriptor < 0 {
+            let source = io::Error::last_os_error();
+            if unsafe { libc::ioctl(control.as_raw_fd(), libc::TUNSETPERSIST, 0) } < 0 {
+                tracing::warn!(source = %io::Error::last_os_error(), "tuntap persistence cleanup failed");
+            }
+            return Err(TuntapConfigError::Socket { source }.into());
+        }
+        let provisioning = unsafe { OwnedFd::from_raw_fd(descriptor) };
+        request.ifr_ifru.ifru_mtu = config.mtu as libc::c_int;
+        if unsafe { libc::ioctl(provisioning.as_raw_fd(), libc::SIOCSIFMTU, &mut request) } < 0 {
+            let source = io::Error::last_os_error();
+            if unsafe { libc::ioctl(control.as_raw_fd(), libc::TUNSETPERSIST, 0) } < 0 {
+                tracing::warn!(source = %io::Error::last_os_error(), "tuntap persistence cleanup failed");
+            }
+            return Err(TuntapConfigError::SetMtu { source }.into());
+        }
+        if unsafe { libc::ioctl(provisioning.as_raw_fd(), libc::SIOCGIFFLAGS, &mut request) } < 0 {
+            let source = io::Error::last_os_error();
+            if unsafe { libc::ioctl(control.as_raw_fd(), libc::TUNSETPERSIST, 0) } < 0 {
+                tracing::warn!(source = %io::Error::last_os_error(), "tuntap persistence cleanup failed");
+            }
+            return Err(TuntapConfigError::GetInterfaceFlags { source }.into());
+        }
+        unsafe {
+            request.ifr_ifru.ifru_flags |= (libc::IFF_UP | libc::IFF_RUNNING) as libc::c_short;
+        }
+        if unsafe { libc::ioctl(provisioning.as_raw_fd(), libc::SIOCSIFFLAGS, &mut request) } < 0 {
+            let source = io::Error::last_os_error();
+            if unsafe { libc::ioctl(control.as_raw_fd(), libc::TUNSETPERSIST, 0) } < 0 {
+                tracing::warn!(source = %io::Error::last_os_error(), "tuntap persistence cleanup failed");
+            }
+            return Err(TuntapConfigError::SetInterfaceFlags { source }.into());
+        }
+
+        let interfaces = NetMain::global()?.interface_main();
+        let hw_if_index = interfaces.register_interface(
+            data_plane,
+            interfaces.device_class_index("tuntap"),
+            0,
+            interfaces.hw_class_index("tuntap"),
+            0,
+        );
+        let sw_if_index = interfaces.hardware_interface(hw_if_index).sw_if_index();
+
+        if let Err(startup_error) = interfaces.set_mtu(
+            data_plane,
+            sw_if_index,
+            InterfaceMtu::new(config.mtu, config.mtu, config.mtu, config.mtu),
+        ) {
+            if unsafe { libc::ioctl(control.as_raw_fd(), libc::TUNSETPERSIST, 0) } < 0 {
+                tracing::warn!(source = %io::Error::last_os_error(), "tuntap persistence cleanup failed");
+            }
+            interfaces.delete_hardware_interface(data_plane, hw_if_index);
+            return Err(startup_error.into());
+        }
+        if let Err(startup_error) =
+            interfaces.set_hardware_flags(data_plane, hw_if_index, HwInterfaceFlags::LINK_UP)
+        {
+            if unsafe { libc::ioctl(control.as_raw_fd(), libc::TUNSETPERSIST, 0) } < 0 {
+                tracing::warn!(source = %io::Error::last_os_error(), "tuntap persistence cleanup failed");
+            }
+            interfaces.delete_hardware_interface(data_plane, hw_if_index);
+            return Err(startup_error.into());
+        }
+        if config.admin_up
+            && let Err(startup_error) =
+                interfaces.set_software_flags(data_plane, sw_if_index, SwInterfaceFlags::ADMIN_UP)
+        {
+            if unsafe { libc::ioctl(control.as_raw_fd(), libc::TUNSETPERSIST, 0) } < 0 {
+                tracing::warn!(source = %io::Error::last_os_error(), "tuntap persistence cleanup failed");
+            }
+            interfaces.delete_hardware_interface(data_plane, hw_if_index);
+            return Err(startup_error.into());
+        }
+
+        let file = match register_tuntap_file(control) {
+            Ok(file) => file,
+            Err(startup_error) => {
+                interfaces.delete_hardware_interface(data_plane, hw_if_index);
+                return Err(startup_error);
+            }
+        };
+        let thread_count = hammer_runtime::config::worker::worker_count() + 1;
+        let threads = (0..thread_count)
+            .map(|_| TuntapThreadSlot {
+                cacheline0: CacheLineAlignMark,
+                state: RefCell::new(TuntapThreadState {
+                    rx_buffers: Vec::with_capacity(DEFAULT_BUFFER_FRAME_CAPACITY),
+                    iovecs: Vec::new(),
+                }),
+            })
+            .collect::<Vec<_>>()
+            .into_boxed_slice();
+        let main = Self {
+            file: UnsafeCell::new(file),
+            rx_next: OnceLock::new(),
+            threads,
+            provisioning_fd: provisioning,
             mtu_bytes: config.mtu,
-            ether_dst_mac: [0; 6],
-            hw_if_index: 0,
-            sw_if_index: 0,
-            subinterface_addresses: UnsafeCell::new(Pool::new()),
-            subinterface_address_index_by_key: UnsafeCell::new(HashMap::new()),
+            hw_if_index,
+            sw_if_index,
         };
-        if !config.enabled {
-            return Ok(main);
-        }
-        if unsafe { libc::geteuid() } != 0 {
-            tracing::warn!("tuntap disabled: must be superuser");
-            return Ok(main);
-        }
-
-        main.is_ether = config.ethernet;
-        let mut interface_registered = false;
-        let startup_error = match 'configuration: {
-            main.dev_net_tun_fd = unsafe { libc::open(c"/dev/net/tun".as_ptr(), libc::O_RDWR) };
-            if main.dev_net_tun_fd < 0 {
-                break 'configuration Err(TuntapConfigError::OpenDevNetTun {
-                    source: io::Error::last_os_error(),
-                }
-                .into());
-            }
-            let mut ifr: libc::ifreq = unsafe { std::mem::zeroed() };
-            for (destination, source) in ifr
-                .ifr_name
-                .iter_mut()
-                .take(libc::IFNAMSIZ - 1)
-                .zip(main.tun_name.bytes())
+        if let Some(address) = config.ip4_address
+            && let Err(startup_error) = add_tuntap_ip4_address(data_plane, sw_if_index, address)
+        {
+            let TuntapFile::Active {
+                control,
+                file_index,
+            } = main.file.into_inner()
+            else {
+                unreachable!("tuntap File is active before Main publication")
+            };
+            match FILE_MAIN
+                .get()
+                .expect("FileMain exists during tuntap startup cleanup")
+                .delete(file_index)
             {
-                *destination = source as libc::c_char;
-            }
-            ifr.ifr_ifru.ifru_flags = if main.is_ether {
-                (libc::IFF_TAP | libc::IFF_NO_PI) as libc::c_short
-            } else {
-                (libc::IFF_TUN | libc::IFF_NO_PI) as libc::c_short
-            };
-            if unsafe { libc::ioctl(main.dev_net_tun_fd, libc::TUNSETIFF, &mut ifr) } < 0 {
-                break 'configuration Err(TuntapConfigError::TunSetIff {
-                    source: io::Error::last_os_error(),
-                }
-                .into());
-            }
-            if unsafe { libc::ioctl(main.dev_net_tun_fd, libc::TUNSETPERSIST, 1) } < 0 {
-                break 'configuration Err(TuntapConfigError::TunSetPersist {
-                    source: io::Error::last_os_error(),
-                }
-                .into());
-            }
-
-            main.dev_tap_fd = unsafe {
-                libc::socket(
-                    libc::PF_PACKET,
-                    libc::SOCK_RAW,
-                    i32::from((libc::ETH_P_ALL as u16).to_be()),
-                )
-            };
-            if main.dev_tap_fd < 0 {
-                break 'configuration Err(TuntapConfigError::Socket {
-                    source: io::Error::last_os_error(),
-                }
-                .into());
-            }
-
-            {
-                let mut ifr: libc::ifreq = unsafe { std::mem::zeroed() };
-                for (destination, source) in ifr
-                    .ifr_name
-                    .iter_mut()
-                    .take(libc::IFNAMSIZ - 1)
-                    .zip(main.tun_name.bytes())
-                {
-                    *destination = source as libc::c_char;
-                }
-                if unsafe { libc::ioctl(main.dev_tap_fd, libc::SIOCGIFINDEX, &mut ifr) } < 0 {
-                    break 'configuration Err(TuntapConfigError::GetInterfaceIndex {
-                        source: io::Error::last_os_error(),
-                    }
-                    .into());
-                }
-                let sll = libc::sockaddr_ll {
-                    sll_family: libc::AF_PACKET as libc::c_ushort,
-                    sll_protocol: (libc::ETH_P_ALL as u16).to_be(),
-                    sll_ifindex: unsafe { ifr.ifr_ifru.ifru_ifindex },
-                    sll_hatype: 0,
-                    sll_pkttype: 0,
-                    sll_halen: 0,
-                    sll_addr: [0; 8],
-                };
-                if unsafe {
-                    libc::bind(
-                        main.dev_tap_fd,
-                        (&sll as *const libc::sockaddr_ll).cast(),
-                        size_of::<libc::sockaddr_ll>() as libc::socklen_t,
-                    )
-                } < 0
-                {
-                    break 'configuration Err(TuntapConfigError::Bind {
-                        source: io::Error::last_os_error(),
-                    }
-                    .into());
+                Ok(deleted) => assert!(
+                    deleted,
+                    "published tuntap File index remains live during startup cleanup"
+                ),
+                Err(cleanup_error) => {
+                    tracing::warn!(%cleanup_error, "tuntap File startup cleanup failed");
                 }
             }
-
-            let mut one = 1;
-            if unsafe { libc::ioctl(main.dev_net_tun_fd, libc::FIONBIO, &mut one) } < 0 {
-                break 'configuration Err(TuntapConfigError::SetNonblocking {
-                    source: io::Error::last_os_error(),
-                }
-                .into());
+            if unsafe { libc::ioctl(control.as_raw_fd(), libc::TUNSETPERSIST, 0) } < 0 {
+                tracing::warn!(source = %io::Error::last_os_error(), "tuntap persistence cleanup failed");
             }
-
-            ifr.ifr_ifru.ifru_mtu = main.mtu_bytes as libc::c_int;
-            if unsafe { libc::ioctl(main.dev_tap_fd, libc::SIOCSIFMTU, &mut ifr) } < 0 {
-                break 'configuration Err(TuntapConfigError::SetMtu {
-                    source: io::Error::last_os_error(),
-                }
-                .into());
-            }
-            if unsafe { libc::ioctl(main.dev_tap_fd, libc::SIOCGIFFLAGS, &mut ifr) } < 0 {
-                break 'configuration Err(TuntapConfigError::GetInterfaceFlags {
-                    source: io::Error::last_os_error(),
-                }
-                .into());
-            }
-            unsafe {
-                ifr.ifr_ifru.ifru_flags |= (libc::IFF_UP | libc::IFF_RUNNING) as libc::c_short;
-            }
-            if unsafe { libc::ioctl(main.dev_tap_fd, libc::SIOCSIFFLAGS, &mut ifr) } < 0 {
-                break 'configuration Err(TuntapConfigError::SetInterfaceFlags {
-                    source: io::Error::last_os_error(),
-                }
-                .into());
-            }
-            if main.is_ether {
-                if unsafe { libc::ioctl(main.dev_tap_fd, libc::SIOCGIFHWADDR, &mut ifr) } < 0 {
-                    break 'configuration Err(TuntapConfigError::GetHardwareAddress {
-                        source: io::Error::last_os_error(),
-                    }
-                    .into());
-                }
-                let address = unsafe { ifr.ifr_ifru.ifru_hwaddr.sa_data };
-                for (destination, source) in main.ether_dst_mac.iter_mut().zip(address) {
-                    *destination = source as u8;
-                }
-            }
-
-            let interfaces = match NetMain::global() {
-                Ok(net) => net.interface_main(),
-                Err(error) => break 'configuration Err(error),
-            };
-            let device_class_index = interfaces.device_class_index("tuntap");
-            let hw_class_index = interfaces.hw_class_index("tuntap");
-            main.hw_if_index = match interfaces.register_hardware_interface(
-                data_plane,
-                device_class_index,
-                0,
-                hw_class_index,
-                0,
-            ) {
-                Ok(index) => index,
-                Err(error) => break 'configuration Err(error.into()),
-            };
-            main.sw_if_index = interfaces
-                .hardware_interface(main.hw_if_index)
-                .sw_if_index();
-            interface_registered = true;
-            if let Err(error) = interfaces.set_hardware_flags(
-                data_plane,
-                main.hw_if_index,
-                HwInterfaceFlags::LINK_UP,
-            ) {
-                break 'configuration Err(error.into());
-            }
-            if let Err(error) = interfaces.set_software_flags(
-                data_plane,
-                main.sw_if_index,
-                SwInterfaceFlags::ADMIN_UP,
-            ) {
-                break 'configuration Err(error.into());
-            }
-            break 'configuration Ok(());
-        } {
-            Ok(()) => return Ok(main),
-            Err(error) => error,
-        };
-
-        if interface_registered {
-            let interfaces = NetMain::global()
-                .expect("tuntap interface registration requires the network main")
-                .interface_main();
-            if let Err(error) = interfaces.delete_hardware_interface(data_plane, main.hw_if_index) {
-                tracing::warn!(%error, hw_if_index = main.hw_if_index, "tuntap interface initialization cleanup failed");
-            }
+            interfaces.delete_hardware_interface(data_plane, hw_if_index);
+            drop(control);
+            return Err(RuntimeError::from(startup_error));
         }
-        if main.dev_net_tun_fd >= 0 {
-            if unsafe { libc::ioctl(main.dev_net_tun_fd, libc::TUNSETPERSIST, 0) } < 0 {
-                tracing::warn!(source = %io::Error::last_os_error(), "tuntap TUNSETPERSIST initialization cleanup failed");
-            }
-            unsafe { libc::close(main.dev_net_tun_fd) };
-        }
-        if main.dev_tap_fd >= 0 {
-            unsafe { libc::close(main.dev_tap_fd) };
-        }
-        Err(startup_error)
+        Ok(main)
     }
 
     #[cfg(not(target_os = "linux"))]
-    fn init(config: TuntapConfig, _: &mut DataPlaneMain) -> RuntimeResult<Self> {
-        let main = Self {
-            dev_net_tun_fd: -1,
-            dev_tap_fd: -1,
-            is_ether: false,
-            tun_name: config.name,
-            mtu_bytes: config.mtu,
-            ether_dst_mac: [0; 6],
-            hw_if_index: 0,
-            sw_if_index: 0,
-            subinterface_addresses: UnsafeCell::new(Pool::new()),
-            subinterface_address_index_by_key: UnsafeCell::new(HashMap::new()),
-        };
-        if !config.enabled {
-            return Ok(main);
-        }
+    fn init(_: TuntapConfig, _: &mut DataPlaneMain) -> RuntimeResult<Self> {
         Err(TuntapConfigError::OpenDevNetTun {
-            source: io::Error::new(io::ErrorKind::Unsupported, "Linux TUN/TAP is unavailable"),
+            source: io::Error::new(io::ErrorKind::Unsupported, "Linux TUN is unavailable"),
         }
         .into())
     }
+
+    fn file_index(&self) -> u32 {
+        match unsafe { &*self.file.get() } {
+            TuntapFile::Active { file_index, .. } => *file_index,
+            TuntapFile::Closed => panic!("tuntap File remains active during graph dispatch"),
+        }
+    }
+
+    fn rx_next(&self) -> TuntapRxNext {
+        *self
+            .rx_next
+            .get()
+            .expect("tuntap input next layout is published before graph dispatch")
+    }
+
+    fn thread(&self, runtime: &DataPlaneMain) -> RefMut<'_, TuntapThreadState> {
+        self.threads[runtime.thread_index() as usize]
+            .state
+            .borrow_mut()
+    }
+}
+fn register_tuntap_file(control: OwnedFd) -> RuntimeResult<TuntapFile> {
+    let data =
+        control
+            .as_fd()
+            .try_clone_to_owned()
+            .map_err(|source| RuntimeError::FilePollerIo {
+                operation: "duplicate tuntap descriptor",
+                source,
+            })?;
+    let file = File::new(
+        data,
+        "vnet tuntap".to_owned(),
+        0,
+        FileFunctions {
+            read: Some(tuntap_read_ready),
+            ..FileFunctions::default()
+        },
+    );
+    let file_index = match FILE_MAIN
+        .get()
+        .expect("FileMain exists before tuntap config")
+        .add(file)
+    {
+        Ok(file_index) => file_index,
+        Err(startup_error) => {
+            #[cfg(target_os = "linux")]
+            if unsafe { libc::ioctl(control.as_raw_fd(), libc::TUNSETPERSIST, 0) } < 0 {
+                tracing::warn!(source = %io::Error::last_os_error(), "tuntap persistence cleanup failed");
+            }
+            return Err(startup_error);
+        }
+    };
+    Ok(TuntapFile::Active {
+        control,
+        file_index,
+    })
 }
 
-#[cfg(target_os = "linux")]
-#[repr(C)]
-struct In6Ifreq {
-    address: libc::in6_addr,
-    prefix_len: u32,
-    if_index: libc::c_int,
+fn tuntap_read_ready(graph: &mut hammer_runtime::NodeMain, _: &mut File) -> RuntimeResult<()> {
+    let node = graph
+        .node_by_name(TuntapRxNode::NODE_NAME)
+        .expect("tuntap-rx is materialized before File polling begins");
+    graph.mark_interrupt_pending(node)?;
+    Ok(())
 }
 
-fn tuntap_ip4_add_del_interface_address(
+fn add_tuntap_ip4_address(
     data_plane: &mut DataPlaneMain,
     sw_if_index: u32,
-    address: Ipv4Addr,
-    address_length: u8,
-    _: u32,
-    is_delete: bool,
-) {
-    let Some(main) = TUNTAP_MAIN.get() else {
-        return;
-    };
-    if main.dev_tap_fd < 0 {
-        return;
-    }
-    if fib_table_get_index_for_sw_if_index(IpVersion::V4, sw_if_index)
-        != fib_table_get_index_for_sw_if_index(IpVersion::V4, main.sw_if_index)
-    {
-        return;
-    }
-    let address = IpAddr::V4(address);
-    let alias_index = main.subinterface_address_index(sw_if_index, address);
-    ip4_sw_interface_enable_disable(data_plane, main.sw_if_index, !is_delete);
+    address: Ipv4Net,
+) -> Result<(), TuntapConfigError> {
+    hammer_plugin_ip::ip4_add_del_interface_address(
+        data_plane,
+        sw_if_index,
+        address.addr(),
+        address.prefix_len(),
+        false,
+    )
+    .map_err(|source| TuntapConfigError::Ip4Address {
+        sw_if_index,
+        address,
+        source,
+    })
+}
 
-    #[cfg(target_os = "linux")]
-    {
-        let mut request: libc::ifreq = unsafe { std::mem::zeroed() };
-        let alias = format!("{}:{alias_index}", main.tun_name);
-        for (destination, source) in request
-            .ifr_name
-            .iter_mut()
-            .take(libc::IFNAMSIZ - 1)
-            .zip(alias.bytes())
-        {
-            *destination = source as libc::c_char;
+#[hammer_component_macros::graph_node(
+    graph = tuntap,
+    init = register_tuntap_rx,
+    role = driver,
+    name = "tuntap-rx",
+    sibling_of = hammer_service::device::DeviceInputNode,
+)]
+struct TuntapRxNode;
+
+fn register_tuntap_rx(runtime: &DataPlaneMain) -> RuntimeResult<NodeId> {
+    let node = runtime.nodes().try_register_driver(TuntapRxNode::new())?;
+    runtime.nodes().set_node_state(node, NodeState::Interrupt)?;
+    Ok(node)
+}
+
+impl Node for TuntapRxNode {
+    fn process(
+        runtime: &mut DataPlaneMain,
+        node_runtime: &mut NodeRuntime,
+        frame: &mut Frame,
+    ) -> usize {
+        tuntap_rx(runtime, node_runtime, frame)
+    }
+}
+
+fn tuntap_rx(runtime: &mut DataPlaneMain, node_runtime: &mut NodeRuntime, _: &mut Frame) -> usize {
+    let main = TUNTAP_MAIN
+        .get()
+        .expect("tuntap main exists before graph dispatch");
+    let mut state = main.thread(runtime);
+    if state.rx_buffers.len() < DEFAULT_BUFFER_FRAME_CAPACITY / 2 {
+        let mut allocated = [0_u32; DEFAULT_BUFFER_FRAME_CAPACITY];
+        let requested = DEFAULT_BUFFER_FRAME_CAPACITY - state.rx_buffers.len();
+        let count = runtime.buffer_alloc(&mut allocated[..requested]);
+        state.rx_buffers.extend_from_slice(&allocated[..count]);
+    }
+
+    state.iovecs.clear();
+    let cache_len = state.rx_buffers.len();
+    let mut capacity = 0usize;
+    while state.iovecs.len() < cache_len && capacity < main.mtu_bytes as usize {
+        let offset = state.iovecs.len();
+        let index = state.rx_buffers[cache_len - 1 - offset];
+        runtime.buffer_chain_init(index);
+        let buffer = runtime.buffer_mut(index);
+        let segment_capacity = buffer.space_left_at_end().min(u16::MAX as usize);
+        let segment = buffer.put_uninit(segment_capacity as u16);
+        state.iovecs.push(libc::iovec {
+            iov_base: segment.as_mut_ptr().cast(),
+            iov_len: segment.len(),
+        });
+        capacity += segment.len();
+    }
+    if capacity < main.mtu_bytes as usize {
+        for offset in 0..state.iovecs.len() {
+            runtime.buffer_chain_init(state.rx_buffers[cache_len - 1 - offset]);
         }
-        if !is_delete {
-            let socket_address = unsafe {
-                &mut *(&mut request.ifr_ifru.ifru_addr as *mut libc::sockaddr)
-                    .cast::<libc::sockaddr_in>()
-            };
-            socket_address.sin_family = libc::AF_INET as libc::sa_family_t;
-            socket_address.sin_addr.s_addr = u32::from_ne_bytes(match address {
-                IpAddr::V4(address) => address.octets(),
-                _ => unreachable!(),
+        state.iovecs.clear();
+        return 0;
+    }
+
+    let read = unsafe {
+        FILE_MAIN
+            .get()
+            .expect("FileMain exists before graph dispatch")
+            .readv(main.file_index(), &mut state.iovecs)
+    };
+    let bytes = match read {
+        Ok(Some(bytes)) if bytes != 0 => bytes,
+        Ok(Some(_)) | Ok(None) | Err(RuntimeError::FileRead { .. }) => {
+            for offset in 0..state.iovecs.len() {
+                runtime.buffer_chain_init(state.rx_buffers[cache_len - 1 - offset]);
+            }
+            state.iovecs.clear();
+            return 0;
+        }
+        Err(RuntimeError::FileIndexInvalid { .. }) => {
+            for offset in 0..state.iovecs.len() {
+                runtime.buffer_chain_init(state.rx_buffers[cache_len - 1 - offset]);
+            }
+            state.iovecs.clear();
+            panic!("published tuntap File index must remain live during graph dispatch")
+        }
+        Err(_) => panic!("FileMain::readv returned an undocumented error category"),
+    };
+
+    let prepared = state.iovecs.len();
+    for offset in 0..prepared {
+        runtime.buffer_chain_init(state.rx_buffers[cache_len - 1 - offset]);
+    }
+    let mut chain = [0_u32; DEFAULT_BUFFER_FRAME_CAPACITY];
+    let mut lengths = [0_usize; DEFAULT_BUFFER_FRAME_CAPACITY];
+    let mut remaining = bytes;
+    let mut used = 0usize;
+    while remaining != 0 {
+        chain[used] = state.rx_buffers[cache_len - 1 - used];
+        lengths[used] = remaining.min(state.iovecs[used].iov_len);
+        remaining -= lengths[used];
+        used += 1;
+    }
+    for pair in chain[..used].windows(2) {
+        runtime.buffer_chain_buffer(pair[0], pair[1]);
+    }
+    for position in 0..used {
+        runtime
+            .buffer_mut(chain[position])
+            .put_uninit(lengths[position] as u16);
+    }
+    let head = chain[0];
+    runtime
+        .buffer_mut(head)
+        .set_total_len_not_including_first(bytes - lengths[0])
+        .expect("TUN packet length fits Buffer chain metadata");
+    state.iovecs.clear();
+    state.rx_buffers.truncate(cache_len - used);
+
+    let mut network = NetworkOpaque::default();
+    network.sw_if_index[0] = main.sw_if_index;
+    network.l3_hdr_offset = 0;
+    *hammer_core::buffer_opaque!(mut runtime.buffer_mut(head) => NetworkOpaque) = network;
+
+    let next = main.rx_next();
+    let version = runtime.buffer(head).current()[0] >> 4;
+    let mut next_index = match version {
+        4 => next.ip4_input,
+        6 => next.ip6_input,
+        _ => next.drop,
+    };
+    let admin_up = NetMain::global()
+        .expect("network Main exists before tuntap RX")
+        .interface_main()
+        .software_interface(main.sw_if_index)
+        .expect("tuntap RX interface remains live")
+        .is_admin_up();
+    if !admin_up {
+        next_index = next.drop;
+    }
+    next_index = FeatureMain::global()
+        .expect("Feature Main exists before tuntap RX")
+        .start_device_input(main.sw_if_index, runtime.buffer_mut(head), next_index);
+
+    let vectors_left = {
+        let (vectors, _) = runtime.get_next_frame::<u32, ()>(node_runtime, u32::from(next_index));
+        vectors[0] = head;
+        vectors.len() - 1
+    };
+    runtime.put_next_frame(node_runtime, u32::from(next_index), vectors_left);
+    1
+}
+
+#[hammer_component_macros::graph_node(
+    graph = tuntap,
+    kind = internal,
+    name = "tuntap-tx",
+)]
+struct TuntapTxNode;
+
+impl Node for TuntapTxNode {
+    fn process(
+        runtime: &mut DataPlaneMain,
+        node_runtime: &mut NodeRuntime,
+        frame: &mut Frame,
+    ) -> usize {
+        tuntap_tx(runtime, node_runtime, frame)
+    }
+}
+
+fn tuntap_tx(runtime: &mut DataPlaneMain, _: &mut NodeRuntime, frame: &mut Frame) -> usize {
+    let main = TUNTAP_MAIN
+        .get()
+        .expect("tuntap main exists before graph dispatch");
+    let packet_count = frame.vector_args().len();
+    let mut state = main.thread(runtime);
+    for &head in frame.vector_args() {
+        state.iovecs.clear();
+        let mut packet_bytes = 0usize;
+        let mut segment_index = Some(head);
+        while let Some(index) = segment_index {
+            let segment = runtime.buffer(index);
+            let bytes = segment.current();
+            state.iovecs.push(libc::iovec {
+                iov_base: bytes.as_ptr().cast_mut().cast(),
+                iov_len: bytes.len(),
             });
-            if unsafe { libc::ioctl(main.dev_tap_fd, libc::SIOCSIFADDR, &request) } < 0 {
-                tracing::warn!(source = %io::Error::last_os_error(), "tuntap SIOCSIFADDR failed");
+            packet_bytes += bytes.len();
+            segment_index = segment.next_buffer_slot();
+        }
+        let write = unsafe {
+            FILE_MAIN
+                .get()
+                .expect("FileMain exists before graph dispatch")
+                .writev(main.file_index(), &state.iovecs)
+        };
+        match write {
+            Ok(Some(written)) if written == packet_bytes => {}
+            Ok(Some(_)) | Ok(None) | Err(RuntimeError::FileWrite { .. }) => {}
+            Err(RuntimeError::FileIndexInvalid { .. }) => {
+                panic!("published tuntap File index must remain live during graph dispatch")
             }
-            let mask = u32::MAX << (32 - u32::from(address_length));
-            socket_address.sin_addr.s_addr = u32::from_ne_bytes(mask.to_be_bytes());
-            if unsafe { libc::ioctl(main.dev_tap_fd, libc::SIOCSIFNETMASK, &request) } < 0 {
-                tracing::warn!(source = %io::Error::last_os_error(), "tuntap SIOCSIFNETMASK failed");
-            }
-        } else {
-            main.remove_subinterface_address(sw_if_index, address, alias_index);
+            Err(_) => panic!("FileMain::writev returned an undocumented error category"),
         }
-        if unsafe { libc::ioctl(main.dev_tap_fd, libc::SIOCGIFFLAGS, &mut request) } < 0 {
-            tracing::warn!(source = %io::Error::last_os_error(), "tuntap SIOCGIFFLAGS failed");
-        }
-        unsafe {
-            if is_delete {
-                request.ifr_ifru.ifru_flags &=
-                    !((libc::IFF_UP | libc::IFF_RUNNING) as libc::c_short);
-            } else {
-                request.ifr_ifru.ifru_flags |= (libc::IFF_UP | libc::IFF_RUNNING) as libc::c_short;
-            }
-        }
-        if unsafe { libc::ioctl(main.dev_tap_fd, libc::SIOCSIFFLAGS, &request) } < 0 {
-            tracing::warn!(source = %io::Error::last_os_error(), "tuntap SIOCSIFFLAGS failed");
-        }
+        state.iovecs.clear();
     }
-    #[cfg(not(target_os = "linux"))]
-    if is_delete {
-        main.remove_subinterface_address(sw_if_index, address, alias_index);
-    }
+    runtime.buffer_free(frame.vector_args());
+    packet_count
 }
 
-fn tuntap_ip6_add_del_interface_address(
-    data_plane: &mut DataPlaneMain,
-    sw_if_index: u32,
-    address: Ipv6Addr,
-    address_length: u8,
-    _: u32,
-    is_delete: bool,
-) {
-    let Some(main) = TUNTAP_MAIN.get() else {
-        return;
-    };
-    if main.dev_tap_fd < 0 {
-        return;
-    }
-    if fib_table_get_index_for_sw_if_index(IpVersion::V6, sw_if_index)
-        != fib_table_get_index_for_sw_if_index(IpVersion::V6, main.sw_if_index)
-    {
-        return;
-    }
-    let address = IpAddr::V6(address);
-    let alias_index = main.subinterface_address_index(sw_if_index, address);
-    ip6_sw_interface_enable_disable(data_plane, main.sw_if_index, !is_delete);
+fn tuntap_intfc_tx(
+    runtime: &mut DataPlaneMain,
+    node_runtime: &mut NodeRuntime,
+    frame: &mut Frame,
+) -> usize {
+    tuntap_tx(runtime, node_runtime, frame)
+}
 
-    #[cfg(target_os = "linux")]
-    {
-        let mut request: libc::ifreq = unsafe { std::mem::zeroed() };
-        let alias = format!("{}:{alias_index}", main.tun_name);
-        for (destination, source) in request
-            .ifr_name
-            .iter_mut()
-            .take(libc::IFNAMSIZ - 1)
-            .zip(alias.bytes())
-        {
-            *destination = source as libc::c_char;
-        }
-        let socket = unsafe { libc::socket(libc::AF_INET6, libc::SOCK_STREAM, 0) };
-        if socket < 0 {
-            tracing::warn!(source = %io::Error::last_os_error(), "tuntap IPv6 provisioning socket failed");
-        }
-        if unsafe { libc::ioctl(socket, libc::SIOCGIFINDEX, &mut request) } < 0 {
-            tracing::warn!(source = %io::Error::last_os_error(), "tuntap SIOCGIFINDEX failed");
-        }
-        let mut request6 = In6Ifreq {
-            address: libc::in6_addr {
-                s6_addr: match address {
-                    IpAddr::V6(address) => address.octets(),
-                    _ => unreachable!(),
-                },
-            },
-            prefix_len: u32::from(address_length),
-            if_index: unsafe { request.ifr_ifru.ifru_ifindex },
-        };
-        let operation = if is_delete {
-            libc::SIOCDIFADDR
-        } else {
-            libc::SIOCSIFADDR
-        };
-        if unsafe { libc::ioctl(socket, operation, &mut request6) } < 0 {
-            tracing::warn!(source = %io::Error::last_os_error(), is_delete, "tuntap IPv6 address ioctl failed");
-        }
-        if socket >= 0 {
-            unsafe { libc::close(socket) };
-        }
-        if is_delete {
-            main.remove_subinterface_address(sw_if_index, address, alias_index);
-        }
-    }
-    #[cfg(not(target_os = "linux"))]
-    if is_delete {
-        main.remove_subinterface_address(sw_if_index, address, alias_index);
-    }
+#[hammer_component_macros::main_loop_enter_function(
+    name = "tuntap_input_init",
+    runs_after = ["ip_feature_init"],
+    runs_before = ["feature_arc_init"]
+)]
+fn tuntap_input_init(main: &mut DataPlaneMain) -> RuntimeResult<()> {
+    let Some(tuntap) = TUNTAP_MAIN.get() else {
+        return Ok(());
+    };
+    assert!(
+        tuntap
+            .rx_next
+            .set(TuntapRxNext::resolve(main.nodes()))
+            .is_ok(),
+        "tuntap input next layout is published once"
+    );
+    Ok(())
 }
 
 #[hammer_component_macros::runtime_error(subsystem = "tuntap")]
@@ -524,23 +650,13 @@ enum TuntapConfigError {
         #[source]
         source: io::Error,
     },
-    #[error("TUNSETPERSIST")]
+    #[error("ioctl TUNSETPERSIST")]
     TunSetPersist {
         #[source]
         source: io::Error,
     },
-    #[error("socket")]
+    #[error("open TUN provisioning socket")]
     Socket {
-        #[source]
-        source: io::Error,
-    },
-    #[error("ioctl SIOCGIFINDEX")]
-    GetInterfaceIndex {
-        #[source]
-        source: io::Error,
-    },
-    #[error("bind")]
-    Bind {
         #[source]
         source: io::Error,
     },
@@ -564,22 +680,30 @@ enum TuntapConfigError {
         #[source]
         source: io::Error,
     },
-    #[error("ioctl SIOCGIFHWADDR")]
-    GetHardwareAddress {
+    #[error("configure IPv4 address {address} on interface {sw_if_index}")]
+    Ip4Address {
+        sw_if_index: u32,
+        address: Ipv4Net,
         #[source]
-        source: io::Error,
+        source: IpInterfaceAddressError,
     },
 }
 
 #[hammer_component_macros::config_function(name = "tuntap_config", section = "plugin.tuntap")]
 fn tuntap_config(config: TuntapConfig, data_plane: &mut DataPlaneMain) -> RuntimeResult<()> {
+    if !config.enabled {
+        return Ok(());
+    }
+    #[cfg(target_os = "linux")]
+    if unsafe { libc::geteuid() } != 0 {
+        tracing::warn!("tuntap disabled: must be superuser");
+        return Ok(());
+    }
     let main = TuntapMain::init(config, data_plane)?;
     assert!(
         TUNTAP_MAIN.set(main).is_ok(),
         "tuntap config callback executes once"
     );
-    register_ip4_add_del_interface_address_callback(tuntap_ip4_add_del_interface_address);
-    register_ip6_add_del_interface_address_callback(tuntap_ip6_add_del_interface_address);
     Ok(())
 }
 
@@ -588,49 +712,77 @@ fn tuntap_exit(data_plane: &mut DataPlaneMain) -> RuntimeResult<()> {
     let Some(main) = TUNTAP_MAIN.get() else {
         return Ok(());
     };
-    if main.dev_net_tun_fd <= 0 {
-        return Ok(());
-    }
-    if let Ok(net) = NetMain::global()
-        && let Err(error) = net
-            .interface_main()
-            .delete_hardware_interface(data_plane, main.hw_if_index)
-    {
-        tracing::warn!(%error, hw_if_index = main.hw_if_index, "tuntap interface deletion failed");
-    }
     #[cfg(target_os = "linux")]
     {
-        let sfd = unsafe { libc::socket(libc::AF_INET, libc::SOCK_STREAM, 0) };
-        if sfd < 0 {
-            tracing::warn!(source = %io::Error::last_os_error(), "tuntap provisioning socket cleanup failed");
-        }
-        let mut ifr: libc::ifreq = unsafe { std::mem::zeroed() };
-        for (destination, source) in ifr
-            .ifr_name
-            .iter_mut()
-            .take(libc::IFNAMSIZ - 1)
-            .zip(main.tun_name.bytes())
+        let file = unsafe { &mut *main.file.get() };
+        let active = std::mem::replace(file, TuntapFile::Closed);
+        let TuntapFile::Active {
+            control,
+            file_index,
+        } = active
+        else {
+            return Ok(());
+        };
+
+        let mut request: libc::ifreq = unsafe { std::mem::zeroed() };
+        if unsafe { libc::ioctl(control.as_raw_fd(), libc::TUNGETIFF, &mut request) } < 0 {
+            tracing::warn!(source = %io::Error::last_os_error(), "tuntap interface identity cleanup failed");
+        } else if unsafe {
+            libc::ioctl(
+                main.provisioning_fd.as_raw_fd(),
+                libc::SIOCGIFFLAGS,
+                &mut request,
+            )
+        } < 0
         {
-            *destination = source as libc::c_char;
+            tracing::warn!(source = %io::Error::last_os_error(), "tuntap host flags cleanup failed");
+        } else {
+            unsafe {
+                request.ifr_ifru.ifru_flags &=
+                    !((libc::IFF_UP | libc::IFF_RUNNING) as libc::c_short);
+            }
+            if unsafe {
+                libc::ioctl(
+                    main.provisioning_fd.as_raw_fd(),
+                    libc::SIOCSIFFLAGS,
+                    &mut request,
+                )
+            } < 0
+            {
+                tracing::warn!(source = %io::Error::last_os_error(), "tuntap host state cleanup failed");
+            }
         }
-        if unsafe { libc::ioctl(sfd, libc::SIOCGIFFLAGS, &mut ifr) } < 0 {
-            tracing::warn!(source = %io::Error::last_os_error(), "tuntap SIOCGIFFLAGS cleanup failed");
+        if unsafe { libc::ioctl(control.as_raw_fd(), libc::TUNSETPERSIST, 0) } < 0 {
+            tracing::warn!(source = %io::Error::last_os_error(), "tuntap persistence cleanup failed");
         }
-        unsafe {
-            ifr.ifr_ifru.ifru_flags &= !((libc::IFF_UP | libc::IFF_RUNNING) as libc::c_short);
-        }
-        if unsafe { libc::ioctl(sfd, libc::SIOCSIFFLAGS, &mut ifr) } < 0 {
-            tracing::warn!(source = %io::Error::last_os_error(), "tuntap SIOCSIFFLAGS cleanup failed");
-        }
-        if unsafe { libc::ioctl(main.dev_net_tun_fd, libc::TUNSETPERSIST, 0) } < 0 {
-            tracing::warn!(source = %io::Error::last_os_error(), "tuntap TUNSETPERSIST cleanup failed");
-        }
-        if main.dev_tap_fd >= 0 {
-            unsafe { libc::close(main.dev_tap_fd) };
-        }
-        unsafe { libc::close(main.dev_net_tun_fd) };
-        if sfd >= 0 {
-            unsafe { libc::close(sfd) };
+
+        let file_delete_error = match FILE_MAIN
+            .get()
+            .expect("FileMain exists during tuntap shutdown")
+            .delete(file_index)
+        {
+            Ok(deleted) => {
+                assert!(
+                    deleted,
+                    "published tuntap File index remains live until shutdown"
+                );
+                None
+            }
+            Err(error) => Some(error),
+        };
+        let rx_buffers = {
+            let mut state = main.thread(data_plane);
+            state.iovecs.clear();
+            std::mem::take(&mut state.rx_buffers)
+        };
+        data_plane.buffer_free_no_next(&rx_buffers);
+        drop(control);
+        NetMain::global()
+            .expect("network Main exists during tuntap shutdown")
+            .interface_main()
+            .delete_hardware_interface(data_plane, main.hw_if_index);
+        if let Some(error) = file_delete_error {
+            return Err(error);
         }
     }
     Ok(())
@@ -641,253 +793,14 @@ hammer_component_macros::declare_plugin!(
     load_after = ["ip"],
     init_functions = [],
     config_functions = [__CONFIG_FN_TUNTAP_CONFIG],
-    main_loop_enter_functions = [],
+    main_loop_enter_functions = [__INIT_FN_TUNTAP_INPUT_INIT],
     main_loop_exit_functions = [__INIT_FN_TUNTAP_EXIT],
     worker_init_functions = [],
-    graph_nodes = [],
+    graph_nodes = [
+        __TUNTAP_GRAPH_NODE_TUNTAP_RX_NODE,
+        __TUNTAP_GRAPH_NODE_TUNTAP_TX_NODE,
+    ],
     node_functions = [],
     process_nodes = [],
     binary_api_methods = [],
 );
-
-#[cfg(test)]
-mod tests {
-    use std::error::Error;
-    #[cfg(target_os = "linux")]
-    use std::path::Path;
-    #[cfg(target_os = "linux")]
-    use std::sync::Arc;
-
-    use hammer_service::interface::{HwInterfaceFlags, InterfaceMain, SwInterfaceFlags};
-    use hammer_service::net::NetMain;
-
-    use super::*;
-
-    #[test]
-    fn config_defaults_and_unimplemented_fields_are_explicit() {
-        let config: TuntapConfig = toml::from_str("").unwrap();
-        assert_eq!(config, TuntapConfig::default());
-        assert!(toml::from_str::<TuntapConfig>("mode = \"punt-inject\"").is_err());
-        assert!(toml::from_str::<TuntapConfig>("have_normal_interface = true").is_err());
-        assert!(toml::from_str::<TuntapConfig>("address = \"192.0.2.1/24\"").is_err());
-    }
-
-    #[test]
-    fn defaults_publish_a_disabled_main() {
-        let mut runtime = DataPlaneMain::new(hammer_runtime::DataPlaneBufferConfig::default());
-        let main = TuntapMain::init(TuntapConfig::default(), &mut runtime).unwrap();
-        assert_eq!(main.dev_net_tun_fd, -1);
-        assert_eq!(main.dev_tap_fd, -1);
-        assert!(!main.is_ether);
-        assert_eq!(main.tun_name, "vnet");
-        assert_eq!(main.mtu_bytes, 4_352);
-        assert_eq!(main.ether_dst_mac, [0; 6]);
-        assert_eq!(main.hw_if_index, 0);
-        assert_eq!(main.sw_if_index, 0);
-    }
-
-    #[test]
-    fn non_root_enable_matches_vpp_warning_success() {
-        const CHILD: &str = "HAMMER_TUNTAP_NON_ROOT_TEST_CHILD";
-
-        if unsafe { libc::geteuid() } == 0 {
-            return;
-        }
-        if std::env::var_os(CHILD).is_some() {
-            let mut runtime = DataPlaneMain::new(hammer_runtime::DataPlaneBufferConfig::default());
-            let main = TuntapMain::init(
-                TuntapConfig {
-                    enabled: true,
-                    name: "hammer-non-root".to_owned(),
-                    mtu: 1_500,
-                    ethernet: true,
-                },
-                &mut runtime,
-            )
-            .unwrap();
-            assert_eq!(main.dev_net_tun_fd, -1);
-            assert_eq!(main.dev_tap_fd, -1);
-            assert!(!main.is_ether);
-            return;
-        }
-
-        let status = std::process::Command::new(std::env::current_exe().unwrap())
-            .args([
-                "--exact",
-                "tests::non_root_enable_matches_vpp_warning_success",
-            ])
-            .env(CHILD, "1")
-            .status()
-            .unwrap();
-        assert!(status.success());
-    }
-
-    #[test]
-    fn syscall_error_preserves_tuntap_subsystem_and_source() {
-        let runtime_error = hammer_runtime::RuntimeError::from(TuntapConfigError::TunSetIff {
-            source: io::Error::from_raw_os_error(libc::EINVAL),
-        });
-        let hammer_runtime::RuntimeError::Subsystem { subsystem, source } = runtime_error else {
-            panic!("tuntap error must cross the runtime subsystem boundary");
-        };
-        assert_eq!(subsystem, "tuntap");
-        let error = source.downcast_ref::<TuntapConfigError>().unwrap();
-        let TuntapConfigError::TunSetIff { source } = error else {
-            panic!("runtime source must retain the concrete TUNSETIFF category");
-        };
-        assert_eq!(source.raw_os_error(), Some(libc::EINVAL));
-        assert!(error.source().is_some());
-    }
-
-    #[test]
-    fn class_image_creates_and_deletes_interface_main_relationship() {
-        hammer_runtime::ThreadMain::new().unwrap();
-        let mut runtime = DataPlaneMain::new(hammer_runtime::DataPlaneBufferConfig::default());
-        let interfaces = InterfaceMain::new();
-        interfaces
-            .consume_registration_image(&HAMMER_INTERFACE_REGISTRATION_IMAGE)
-            .unwrap();
-        let device_class_index = interfaces.device_class_index("tuntap");
-        let hw_class_index = interfaces.hw_class_index("tuntap");
-        assert_ne!(device_class_index, interfaces.device_class_index("local"));
-        assert_ne!(hw_class_index, interfaces.hw_class_index("local"));
-        let hw_if_index = interfaces
-            .register_hardware_interface(&mut runtime, device_class_index, 0, hw_class_index, 0)
-            .unwrap();
-        let sw_if_index = interfaces.hardware_interface(hw_if_index).sw_if_index();
-        assert_eq!(
-            interfaces.hardware_interface(hw_if_index).dev_class_index,
-            device_class_index
-        );
-        assert_eq!(
-            interfaces.hardware_interface(hw_if_index).hw_class_index,
-            hw_class_index
-        );
-        assert_eq!(interfaces.interface_index("tuntap-0"), Some(hw_if_index));
-        interfaces
-            .set_hardware_flags(&mut runtime, hw_if_index, HwInterfaceFlags::LINK_UP)
-            .unwrap();
-        interfaces
-            .set_software_flags(&mut runtime, sw_if_index, SwInterfaceFlags::ADMIN_UP)
-            .unwrap();
-        assert_eq!(
-            interfaces.hardware_interface(hw_if_index).flags,
-            HwInterfaceFlags::LINK_UP
-        );
-        assert!(
-            interfaces
-                .software_interface(sw_if_index)
-                .unwrap()
-                .is_admin_up()
-        );
-        interfaces
-            .delete_hardware_interface(&mut runtime, hw_if_index)
-            .unwrap();
-        assert_eq!(interfaces.interface_index("tuntap-0"), None);
-        assert!(interfaces.software_interface(sw_if_index).is_none());
-    }
-
-    #[test]
-    #[ignore = "requires the tuntap dynamic plugin to be built beside the test artifacts"]
-    fn tuntap_dso_installs_class_image() {
-        let mut plugins = hammer_runtime::PluginMain::default();
-        plugins
-            .load(env!("CARGO_PKG_VERSION"), &["tuntap".to_owned()])
-            .unwrap();
-        let image = plugins
-            .get_plugin_symbol::<hammer_service::InterfaceRegistrationImage>(
-                "tuntap",
-                "HAMMER_INTERFACE_REGISTRATION_IMAGE",
-            )
-            .unwrap();
-        let interfaces = InterfaceMain::new();
-        // SAFETY: the service-owned export has this concrete type and
-        // `plugins` retains the defining DSO through both lookups below.
-        interfaces
-            .consume_registration_image(unsafe { &*image })
-            .unwrap();
-        assert_ne!(
-            interfaces.device_class_index("tuntap"),
-            interfaces.device_class_index("local")
-        );
-        assert_ne!(
-            interfaces.hw_class_index("tuntap"),
-            interfaces.hw_class_index("local")
-        );
-    }
-
-    #[cfg(target_os = "linux")]
-    #[test]
-    #[ignore = "requires root, /dev/net/tun, and an isolated network namespace"]
-    fn tuntap_linux_lifecycle() {
-        assert_eq!(unsafe { libc::geteuid() }, 0);
-        hammer_runtime::ThreadMain::new().unwrap();
-        let interfaces = Arc::new(InterfaceMain::new());
-        interfaces
-            .consume_registration_image(&HAMMER_INTERFACE_REGISTRATION_IMAGE)
-            .unwrap();
-        let mut runtime = DataPlaneMain::new(hammer_runtime::DataPlaneBufferConfig::default());
-        NetMain::init(&mut runtime, Arc::clone(&interfaces)).unwrap();
-
-        let name = "hammer335tun";
-        assert!(!Path::new(&format!("/sys/class/net/{name}")).exists());
-        tuntap_config(
-            TuntapConfig {
-                enabled: true,
-                name: name.to_owned(),
-                mtu: 4_352,
-                ethernet: false,
-            },
-            &mut runtime,
-        )
-        .unwrap();
-        let main = TUNTAP_MAIN.get().unwrap();
-        assert!(main.dev_net_tun_fd >= 0);
-        assert!(main.dev_tap_fd >= 0);
-        let dev_net_tun_fd = main.dev_net_tun_fd;
-        let dev_tap_fd = main.dev_tap_fd;
-        assert!(Path::new(&format!("/sys/class/net/{name}")).exists());
-        assert_eq!(
-            interfaces.interface_index("tuntap-0"),
-            Some(main.hw_if_index)
-        );
-        assert_eq!(
-            interfaces.hardware_interface(main.hw_if_index).flags,
-            HwInterfaceFlags::LINK_UP
-        );
-        assert_eq!(
-            interfaces
-                .hardware_interface(main.hw_if_index)
-                .dev_class_index,
-            interfaces.device_class_index("tuntap")
-        );
-        assert_eq!(
-            interfaces
-                .hardware_interface(main.hw_if_index)
-                .hw_class_index,
-            interfaces.hw_class_index("tuntap")
-        );
-        assert!(
-            interfaces
-                .software_interface(main.sw_if_index)
-                .unwrap()
-                .is_admin_up()
-        );
-        assert_eq!(
-            interfaces
-                .software_interface(main.sw_if_index)
-                .unwrap()
-                .hw_if_index(),
-            Some(main.hw_if_index)
-        );
-
-        tuntap_exit(&mut runtime).unwrap();
-        assert_eq!(interfaces.interface_index("tuntap-0"), None);
-        assert!(interfaces.software_interface(main.sw_if_index).is_none());
-        assert!(!Path::new(&format!("/sys/class/net/{name}")).exists());
-        assert_eq!(unsafe { libc::fcntl(dev_net_tun_fd, libc::F_GETFD) }, -1);
-        assert_eq!(io::Error::last_os_error().raw_os_error(), Some(libc::EBADF));
-        assert_eq!(unsafe { libc::fcntl(dev_tap_fd, libc::F_GETFD) }, -1);
-        assert_eq!(io::Error::last_os_error().raw_os_error(), Some(libc::EBADF));
-    }
-}

@@ -1,5 +1,5 @@
-name: Tuntap Linux lifecycle
-run-name: Tuntap Linux lifecycle (${{ github.ref_name }})
+name: TUN IPv4 ICMP
+run-name: TUN IPv4 ICMP (${{ github.ref_name }})
 
 on:
   workflow_dispatch:
@@ -9,18 +9,21 @@ on:
       - "Cargo.lock"
       - "crates/hammer-component-macros/**"
       - "crates/hammer-plugins/device/tuntap/**"
+      - "crates/hammer-plugins/net/icmp/**"
+      - "crates/hammer-plugins/net/ip/**"
       - "crates/hammer-service/src/interface.rs"
       - "crates/hammer-service/src/interface_model.rs"
       - "crates/hammer-service/src/lib.rs"
       - "crates/hammer-service/src/net/**"
+      - "examples/tuntap-ip4-icmp/**"
       - ".github/workflows/tuntap-linux.yml"
 
 permissions:
   contents: read
 
 jobs:
-  lifecycle:
-    name: Privileged Linux lifecycle
+  tuntap-ip4-icmp:
+    name: Privileged startup and ping
     runs-on: ubuntu-24.04
     timeout-minutes: 20
     steps:
@@ -36,18 +39,46 @@ jobs:
         run: |
           sudo modprobe tun
           sudo test -c /dev/net/tun
-      - name: Build dynamic plugin
-        run: cargo build --locked -p hammer-plugin-tuntap
-      - name: Load dynamic class registration image
+      - name: Build daemon and plugins
         run: >-
-          HAMMER_PLUGIN_DIR="$PWD/target/debug"
-          cargo test --locked -p hammer-plugin-tuntap
-          tests::tuntap_dso_installs_class_image -- --ignored --exact
-      - name: Run non-privileged control-plane tests
-        run: cargo test --locked -p hammer-plugin-tuntap --lib
-      - name: Run isolated tuntap lifecycle
-        run: >-
-          sudo env PATH="$PATH" CARGO_HOME="$HOME/.cargo"
-          unshare --net --mount-proc
-          cargo test --locked -p hammer-plugin-tuntap
-          tests::tuntap_linux_lifecycle -- --ignored --exact
+          cargo build --locked
+          -p hammer
+          -p hammer-plugin-ip
+          -p hammer-plugin-icmp
+          -p hammer-plugin-tuntap
+      - name: Create isolated network namespace
+        run: sudo ip netns add hammer-tuntap
+      - name: Start Hammer
+        run: |
+          sudo ip netns exec hammer-tuntap \
+            env HAMMER_PLUGIN_DIR="$PWD/target/debug" \
+            "$PWD/target/debug/hammer" \
+            "$PWD/examples/tuntap-ip4-icmp/startup.toml" \
+            >"$RUNNER_TEMP/hammer-tuntap.log" 2>&1 &
+          echo "$!" >"$RUNNER_TEMP/hammer-tuntap.pid"
+          for attempt in $(seq 1 100); do
+            if sudo ip netns exec hammer-tuntap ip link show hammer0 >/dev/null 2>&1; then
+              exit 0
+            fi
+            if ! kill -0 "$(cat "$RUNNER_TEMP/hammer-tuntap.pid")" 2>/dev/null; then
+              cat "$RUNNER_TEMP/hammer-tuntap.log"
+              exit 1
+            fi
+            sleep 0.1
+          done
+          cat "$RUNNER_TEMP/hammer-tuntap.log"
+          exit 1
+      - name: Configure host peer and ping Hammer
+        run: |
+          sudo ip netns exec hammer-tuntap ip address add 192.0.2.0/31 dev hammer0
+          sudo ip netns exec hammer-tuntap ip link set hammer0 up
+          sudo ip netns exec hammer-tuntap ping -I hammer0 -c 3 -W 1 192.0.2.1
+      - name: Stop and collect diagnostics
+        if: always()
+        run: |
+          if test -f "$RUNNER_TEMP/hammer-tuntap.pid"; then
+            sudo kill "$(cat "$RUNNER_TEMP/hammer-tuntap.pid")" 2>/dev/null || true
+          fi
+          cat "$RUNNER_TEMP/hammer-tuntap.log" 2>/dev/null || true
+          sudo ip netns exec hammer-tuntap ip -details address show 2>/dev/null || true
+          sudo ip netns delete hammer-tuntap 2>/dev/null || true

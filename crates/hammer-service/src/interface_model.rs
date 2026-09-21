@@ -1,16 +1,18 @@
-use std::cell::{RefCell, UnsafeCell};
+use std::cell::UnsafeCell;
 use std::collections::HashMap;
 use std::fmt;
-use std::net::IpAddr;
 use std::sync::{Arc, OnceLock};
 
-use hammer_core::data_plane::NodeId;
+use hammer_core::data_plane::{NodeId, NodeKind, NodeRegistration};
 use hammer_infra::bitmap::Bitmap;
 use hammer_infra::pool::Pool;
-use hammer_runtime::{DataPlaneMain, DataWorkerId, RuntimeResult};
+use hammer_runtime::{
+    DataPlaneMain, DataWorkerId, NodeDescriptor, NodeProcessFn, NodeRuntime, RuntimeResult,
+};
 
+use crate::ethernet::{EthernetInterface, EthernetInterfaceRegistration, EthernetMain};
 use crate::interface::{InterfaceError, InterfaceMtu, InterfaceMtuKind, InterfaceResult};
-use crate::net::{DpoError, DpoId, DpoProto, DpoType, InterfaceRxDpo, NetMain, ReceiveDpo};
+use crate::net::NetMain;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DriverScheduleMode {
@@ -23,7 +25,7 @@ pub type InterfaceCallback =
     fn(&mut DataPlaneMain, &InterfaceMain, u32, bool) -> InterfaceResult<()>;
 pub type FormatDeviceNameFn = for<'a, 'b> fn(u32, &'a mut fmt::Formatter<'b>) -> fmt::Result;
 pub type BuildRewrite = fn(&InterfaceMain, u32, Option<u16>, Option<&[u8]>, &mut [u8]) -> usize;
-pub type UpdateAdjacency = fn(&mut DataPlaneMain, u32, DpoId);
+pub type UpdateAdjacency = fn(&mut DataPlaneMain, u32, u32);
 
 bitflags::bitflags! {
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -57,14 +59,13 @@ pub struct DeviceClass {
     pub index: u32,
     pub interface_add_del_function: Option<InterfaceCallback>,
     pub admin_up_down_function: Option<InterfaceCallback>,
-    pub tx_function: Option<fn()>,
+    pub tx_function: Option<NodeProcessFn>,
     pub format_device_name: Option<FormatDeviceNameFn>,
     pub unformat_device_name: Option<fn(&str) -> Result<(), InterfaceError>>,
     pub subif_add_del_function: Option<fn()>,
     pub rx_mode_change_function: Option<fn()>,
     pub set_l2_mode_function: Option<fn()>,
     pub redistribute: Option<fn()>,
-    pub tx_fn_registrations: Option<&'static [fn()]>,
     pub tx_function_error_strings: Option<&'static [&'static str]>,
     pub tx_function_error_counters: Option<&'static [u64]>,
     pub tx_function_n_errors: Option<u32>,
@@ -100,7 +101,6 @@ impl DeviceClass {
             rx_mode_change_function: None,
             set_l2_mode_function: None,
             redistribute: None,
-            tx_fn_registrations: None,
             tx_function_error_strings: None,
             tx_function_error_counters: None,
             tx_function_n_errors: None,
@@ -125,6 +125,11 @@ impl DeviceClass {
 
     pub const fn with_format_device_name(mut self, format: FormatDeviceNameFn) -> Self {
         self.format_device_name = Some(format);
+        self
+    }
+
+    pub const fn with_tx_function(mut self, function: NodeProcessFn) -> Self {
+        self.tx_function = Some(function);
         self
     }
 
@@ -227,7 +232,9 @@ pub struct HwInterface {
     pub caps: u32,
     pub hw_address: Vec<u8>,
     pub output_node_index: Option<NodeId>,
-    pub tx_node_index: NodeId,
+    pub tx_node_index: Option<NodeId>,
+    pub output_node_next_index: Option<u16>,
+    pub if_out_arc_end_node_next_index: Option<u16>,
     pub dev_class_index: u32,
     pub dev_instance: u32,
     pub hw_class_index: u32,
@@ -237,11 +244,79 @@ pub struct HwInterface {
     pub name: String,
     pub link_speed: u64,
     pub supported_link_speeds: Vec<u64>,
+    pub min_frame_size: u16,
+    pub frame_overhead: u16,
+    pub max_frame_size: u16,
     pub input_node_index: NodeId,
     pub default_rx_mode: DriverScheduleMode,
     pub rx_queue_indices: Vec<u32>,
     pub tx_queue_indices: Vec<u32>,
     pub numa_node: u32,
+}
+
+pub const INVALID_HW_IF_INDEX: u32 = u32::MAX;
+pub const INVALID_NODE_NEXT_INDEX: u16 = u16::MAX;
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct InterfaceLookupEntry {
+    pub(crate) hw_if_index: u32,
+    pub(crate) if_out_arc_end_next_index: u16,
+}
+
+impl InterfaceLookupEntry {
+    pub const ABSENT: Self = Self {
+        hw_if_index: INVALID_HW_IF_INDEX,
+        if_out_arc_end_next_index: INVALID_NODE_NEXT_INDEX,
+    };
+
+    pub const fn has_hardware(self) -> bool {
+        self.hw_if_index != INVALID_HW_IF_INDEX
+    }
+
+    pub const fn has_arc_end(self) -> bool {
+        self.if_out_arc_end_next_index != INVALID_NODE_NEXT_INDEX
+    }
+}
+
+pub(crate) struct InterfaceLookupTable {
+    entries: Vec<InterfaceLookupEntry>,
+}
+
+impl InterfaceLookupTable {
+    pub fn new() -> Self {
+        Self {
+            entries: Vec::new(),
+        }
+    }
+
+    pub fn publish(&mut self, sw_if_index: u32, hw_if_index: u32, if_out_arc_end_next_index: u16) {
+        let position = sw_if_index as usize;
+        if position >= self.entries.len() {
+            self.entries
+                .resize(position + 1, InterfaceLookupEntry::ABSENT);
+        }
+        self.entries[position] = InterfaceLookupEntry {
+            hw_if_index,
+            if_out_arc_end_next_index,
+        };
+    }
+
+    pub fn clear(&mut self, sw_if_index: u32) {
+        let position = sw_if_index as usize;
+        if position >= self.entries.len() {
+            self.entries
+                .resize(position + 1, InterfaceLookupEntry::ABSENT);
+        }
+        self.entries[position] = InterfaceLookupEntry::ABSENT;
+    }
+
+    pub fn entry(&self, sw_if_index: u32) -> InterfaceLookupEntry {
+        self.entries
+            .get(sw_if_index as usize)
+            .copied()
+            .unwrap_or(InterfaceLookupEntry::ABSENT)
+    }
 }
 
 impl HwInterface {
@@ -342,126 +417,25 @@ struct InterfaceState {
     names: HashMap<String, u32>,
     device_class_by_name: HashMap<&'static str, u32>,
     hw_class_by_name: HashMap<&'static str, u32>,
-    receive_dpos: Pool<ReceiveDpo<IpAddr>>,
     device_classes: Vec<DeviceClass>,
     hw_classes: Vec<HwClass>,
     hw_callbacks: Vec<InterfaceCallbackRegistration>,
     sw_callbacks: Vec<InterfaceCallbackRegistration>,
     admin_up_down_callbacks: Vec<InterfaceCallbackRegistration>,
     mtu_callbacks: Vec<fn(&mut DataPlaneMain, &InterfaceMain, u32)>,
+    lookup_table: InterfaceLookupTable,
+    output_feature_arc_index: u8,
+    deleted_node_pairs: Vec<(u32, NodeId, NodeId)>,
+}
+
+impl Default for InterfaceLookupTable {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 pub struct InterfaceMain {
     state: UnsafeCell<InterfaceState>,
-    output_node: OnceLock<NodeId>,
-    rx_dpos: RefCell<Pool<InterfaceRxDpo>>,
-    rx_dpo_by_interface: RefCell<HashMap<(DpoProto, u32), u32>>,
-}
-
-impl InterfaceRxDpo {
-    pub fn lock(dpo: DpoId) {
-        hammer_runtime::ensure_main_thread_with_barrier()
-            .expect("RX DPO acquisition requires the publication scope");
-        let net = NetMain::global().expect("RX DPO requires its interface owner");
-        let mut pool = net.interface_main().rx_dpos.borrow_mut();
-        let object = pool
-            .get_mut(dpo.index())
-            .expect("referenced RX DPO is occupied");
-        assert_eq!(dpo.class(), DpoType::INTERFACE_RX);
-        assert_eq!(dpo.proto(), object.proto);
-        object.lock_count = object
-            .lock_count
-            .checked_add(1)
-            .expect("RX DPO reference count overflow");
-    }
-
-    pub fn unlock(dpo: DpoId) {
-        hammer_runtime::ensure_main_thread_with_barrier()
-            .expect("RX DPO retirement requires the publication scope");
-        let net = NetMain::global().expect("RX DPO requires its interface owner");
-        let interfaces = net.interface_main();
-        let mut pool = interfaces.rx_dpos.borrow_mut();
-        let object = pool
-            .get_mut(dpo.index())
-            .expect("referenced RX DPO is occupied");
-        assert_eq!(dpo.class(), DpoType::INTERFACE_RX);
-        assert_eq!(dpo.proto(), object.proto);
-        object.lock_count = object
-            .lock_count
-            .checked_sub(1)
-            .expect("RX DPO reference count underflow");
-        if object.lock_count == 0 {
-            interfaces
-                .rx_dpo_by_interface
-                .borrow_mut()
-                .remove(&(object.proto, object.sw_if_index));
-            pool.remove(dpo.index());
-        }
-    }
-
-    pub fn format(dpo: DpoId, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        hammer_runtime::ensure_main_thread().expect("RX DPO formatting requires the main thread");
-        let net = NetMain::global().expect("RX DPO requires its interface owner");
-        let pool = net.interface_main().rx_dpos.borrow();
-        match pool.get(dpo.index()) {
-            Some(object) => write!(
-                formatter,
-                "interface-rx {} interface {} proto {} locks {}",
-                dpo.index(),
-                object.sw_if_index,
-                object.proto.get(),
-                object.lock_count
-            ),
-            None => write!(formatter, "interface-rx {} absent", dpo.index()),
-        }
-    }
-
-    pub fn memory() -> (usize, usize, usize) {
-        hammer_runtime::ensure_main_thread().expect("RX DPO diagnostics require the main thread");
-        let net = NetMain::global().expect("RX DPO requires its interface owner");
-        let pool = net.interface_main().rx_dpos.borrow();
-        (size_of::<Self>(), pool.len(), pool.capacity())
-    }
-}
-
-impl ReceiveDpo<IpAddr> {
-    pub fn lock(dpo: DpoId) {
-        hammer_runtime::ensure_main_thread_with_barrier()
-            .expect("receive DPO acquisition requires the publication scope");
-        assert_eq!(dpo.class(), DpoType::RECEIVE);
-        let interfaces = NetMain::global()
-            .expect("receive DPO requires its owner")
-            .interface_main();
-        let object = interfaces
-            .state_mut()
-            .receive_dpos
-            .get_mut(dpo.index())
-            .expect("referenced receive DPO is occupied");
-        object.lock_count = object
-            .lock_count
-            .checked_add(1)
-            .expect("receive DPO reference count overflow");
-    }
-
-    pub fn unlock(dpo: DpoId) {
-        hammer_runtime::ensure_main_thread_with_barrier()
-            .expect("receive DPO retirement requires the publication scope");
-        assert_eq!(dpo.class(), DpoType::RECEIVE);
-        let interfaces = NetMain::global()
-            .expect("receive DPO requires its owner")
-            .interface_main();
-        let pool = &mut interfaces.state_mut().receive_dpos;
-        let object = pool
-            .get_mut(dpo.index())
-            .expect("referenced receive DPO is occupied");
-        object.lock_count = object
-            .lock_count
-            .checked_sub(1)
-            .expect("receive DPO reference count underflow");
-        if object.lock_count == 0 {
-            pool.remove(dpo.index());
-        }
-    }
 }
 
 unsafe impl Send for InterfaceMain {}
@@ -475,11 +449,10 @@ impl Default for InterfaceMain {
 
 impl InterfaceMain {
     pub fn new() -> Self {
+        let mut state = InterfaceState::default();
+        state.output_feature_arc_index = u8::MAX;
         let interfaces = Self {
-            state: UnsafeCell::new(InterfaceState::default()),
-            output_node: OnceLock::new(),
-            rx_dpos: RefCell::new(Pool::new()),
-            rx_dpo_by_interface: RefCell::new(HashMap::new()),
+            state: UnsafeCell::new(state),
         };
         interfaces
             .consume_class_registrations(
@@ -488,46 +461,6 @@ impl InterfaceMain {
             )
             .expect("built-in interface classes fit the class index space");
         interfaces
-    }
-
-    /// Acquires a receive object under the caller's publication barrier.
-    /// An unspecified interface keeps the packet's original receive interface.
-    pub fn add_or_lock_receive_dpo(
-        &self,
-        sw_if_index: u32,
-        address: IpAddr,
-    ) -> Result<Option<DpoId>, DpoError> {
-        hammer_runtime::ensure_main_thread_with_barrier()?;
-        if sw_if_index != u32::MAX && self.software_interface(sw_if_index).is_none() {
-            return Ok(None);
-        }
-        let proto = match address {
-            IpAddr::V4(_) => DpoProto::IP4,
-            IpAddr::V6(_) => DpoProto::IP6,
-        };
-        NetMain::global()?
-            .dpo_main()
-            .identity(DpoType::RECEIVE, proto, 0)?;
-        let index = self.state_mut().receive_dpos.insert(ReceiveDpo {
-            sw_if_index,
-            address,
-            lock_count: 1,
-        });
-        Ok(Some(DpoId::receive(proto, index)))
-    }
-
-    /// Copies the interface fact during synchronous packet processing.
-    #[inline]
-    pub fn receive_dpo_interface(&self, dpo: DpoId) -> Option<u32> {
-        if dpo.class() != DpoType::RECEIVE {
-            return None;
-        }
-        let object = self.state().receive_dpos.get(dpo.index())?;
-        let proto = match object.address {
-            IpAddr::V4(_) => DpoProto::IP4,
-            IpAddr::V6(_) => DpoProto::IP6,
-        };
-        (proto == dpo.proto()).then_some(object.sw_if_index)
     }
 
     fn state(&self) -> &InterfaceState {
@@ -626,19 +559,20 @@ impl InterfaceMain {
             .unwrap_or_else(|| panic!("hardware interface class `{name}` is not installed"))
     }
 
-    pub fn register_hardware_interface(
+    pub fn register_interface(
         &self,
         main: &mut DataPlaneMain,
-        device_class_index: u32,
-        device_instance: u32,
+        dev_class_index: u32,
+        dev_instance: u32,
         hw_class_index: u32,
         hw_instance: u32,
-    ) -> InterfaceResult<u32> {
-        hammer_runtime::ensure_main_thread_with_barrier()?;
+    ) -> u32 {
+        hammer_runtime::ensure_main_thread_with_barrier()
+            .expect("interface registration requires publication ownership");
         let state = self.state_mut();
         let device_class = *state
             .device_classes
-            .get(device_class_index as usize)
+            .get(dev_class_index as usize)
             .expect("device class index names an installed class");
         let hw_class = *state
             .hw_classes
@@ -659,20 +593,22 @@ impl InterfaceMain {
 
                 DeviceName {
                     format,
-                    instance: device_instance,
+                    instance: dev_instance,
                 }
                 .to_string()
             }
-            None => format!("{}{device_instance:x}", hw_class.name),
+            None => format!("{}{dev_instance:x}", hw_class.name),
         };
         let hw_if_index = state.hardware_interfaces.insert(HwInterface {
             flags: HwInterfaceFlags::empty(),
             caps: 0,
             hw_address: Vec::new(),
             output_node_index: None,
-            tx_node_index: NodeId::new(0),
-            dev_class_index: device_class_index,
-            dev_instance: device_instance,
+            tx_node_index: None,
+            output_node_next_index: None,
+            if_out_arc_end_node_next_index: None,
+            dev_class_index,
+            dev_instance,
             hw_class_index,
             hw_instance,
             hw_if_index: 0,
@@ -680,6 +616,9 @@ impl InterfaceMain {
             name: name.clone(),
             link_speed: 0,
             supported_link_speeds: Vec::new(),
+            min_frame_size: 0,
+            frame_overhead: 0,
+            max_frame_size: 0,
             input_node_index: NodeId::new(0),
             default_rx_mode: DriverScheduleMode::Interrupt,
             rx_queue_indices: Vec::new(),
@@ -716,115 +655,121 @@ impl InterfaceMain {
             .expect("inserted software interface")
             .sup_sw_if_index = sw_if_index;
         state.names.insert(name, hw_if_index);
-        if let Err(primary) = self.call_sw_interface_add_del(main, sw_if_index, true) {
-            if let Err(cleanup) = self.call_sw_interface_add_del(main, sw_if_index, false) {
-                tracing::warn!(%cleanup, sw_if_index, "software interface creation rollback callback failed");
-            }
-            self.remove_interface_slots(hw_if_index);
-            return Err(primary);
-        }
-        if let Err(primary) = self.call_hw_interface_add_del(main, hw_if_index, true) {
-            if let Err(cleanup) = self.call_hw_interface_add_del(main, hw_if_index, false) {
-                tracing::warn!(%cleanup, hw_if_index, "hardware interface creation rollback callback failed");
-            }
-            if let Err(cleanup) = self.call_sw_interface_add_del(main, sw_if_index, false) {
-                tracing::warn!(%cleanup, sw_if_index, "software interface creation rollback callback failed");
-            }
-            self.remove_interface_slots(hw_if_index);
-            return Err(primary);
-        }
-        Ok(hw_if_index)
-    }
+        self.if_update_lookup_tables(sw_if_index);
 
-    pub(crate) fn initialize_output_node(&self, node: NodeId) {
-        hammer_runtime::ensure_main_thread_with_barrier()
-            .expect("interface output initialization requires the publication scope");
-        self.output_node
-            .set(node)
-            .expect("interface output node is initialized once");
-    }
+        if let Some(tx_function) = device_class.tx_function {
+            let output_name = Box::leak(
+                format!("{0}-output", self.hardware_interface(hw_if_index).name).into_boxed_str(),
+            );
+            let tx_name = Box::leak(
+                format!("{0}-tx", self.hardware_interface(hw_if_index).name).into_boxed_str(),
+            );
+            let runtime_data = NodeRuntime::from_words([
+                u64::from(hw_if_index),
+                u64::from(sw_if_index),
+                u64::from(dev_instance),
+                0,
+            ]);
+            let recycled = self
+                .state_mut()
+                .deleted_node_pairs
+                .iter()
+                .position(|(class, _, _)| *class == dev_class_index)
+                .map(|position| self.state_mut().deleted_node_pairs.swap_remove(position));
+            let (output_node, tx_node) = if let Some((_, output_node, tx_node)) = recycled {
+                main.nodes()
+                    .recycle_node_descriptor(
+                        tx_node,
+                        NodeDescriptor::new(
+                            tx_function,
+                            runtime_data,
+                            Some(NodeRegistration::next(tx_name, 1)),
+                            &[],
+                            None,
+                        ),
+                    )
+                    .expect("interface TX node recycle must succeed");
+                main.nodes()
+                    .recycle_node_descriptor(
+                        output_node,
+                        NodeDescriptor::new(
+                            crate::interface::interface_output_template,
+                            runtime_data,
+                            Some(NodeRegistration::next(output_name, 2)),
+                            &[],
+                            None,
+                        ),
+                    )
+                    .expect("interface output node recycle must succeed");
+                (output_node, tx_node)
+            } else {
+                let tx_node = main
+                    .nodes()
+                    .try_register_descriptor(
+                        NodeKind::Internal,
+                        NodeDescriptor::new(
+                            tx_function,
+                            runtime_data,
+                            Some(NodeRegistration::next(tx_name, 1)),
+                            &[],
+                            None,
+                        ),
+                    )
+                    .expect("interface TX node registration must succeed");
+                let output_node = main
+                    .nodes()
+                    .try_register_descriptor(
+                        NodeKind::Internal,
+                        NodeDescriptor::new(
+                            crate::interface::interface_output_template,
+                            runtime_data,
+                            Some(NodeRegistration::next(output_name, 2)),
+                            &[],
+                            None,
+                        ),
+                    )
+                    .expect("interface output node registration must succeed");
+                main.register_node_errors(
+                    output_node,
+                    &crate::interface::INTERFACE_OUTPUT_ERROR_DESCRIPTORS,
+                )
+                .expect("interface output errors must register");
+                (output_node, tx_node)
+            };
+            let hardware = self
+                .state_mut()
+                .hardware_interfaces
+                .get_mut(hw_if_index)
+                .expect("registered hardware interface remains live");
+            hardware.output_node_index = Some(output_node);
+            hardware.tx_node_index = Some(tx_node);
 
-    /// Acquires one reference to the shared interface/protocol RX object.
-    /// Publication is owned by the caller's Binary API barrier scope.
-    pub fn add_or_lock_rx_dpo(
-        &self,
-        proto: DpoProto,
-        sw_if_index: u32,
-    ) -> Result<Option<DpoId>, DpoError> {
-        hammer_runtime::ensure_main_thread_with_barrier()?;
-        if self.software_interface(sw_if_index).is_none() {
-            return Ok(None);
-        }
-        NetMain::global()?
-            .dpo_main()
-            .identity(DpoType::INTERFACE_RX, proto, 0)?;
-        let mut pool = self.rx_dpos.borrow_mut();
-        let mut database = self.rx_dpo_by_interface.borrow_mut();
-        let index = match database.get(&(proto, sw_if_index)).copied() {
-            Some(index) => {
-                let object = pool
-                    .get_mut(index)
-                    .expect("RX database names an occupied slot");
-                object.lock_count = object
-                    .lock_count
-                    .checked_add(1)
-                    .expect("RX DPO reference count overflow");
-                index
+            if self.state().output_feature_arc_index != u8::MAX {
+                let public_output = main
+                    .nodes()
+                    .node_by_name("interface-output")
+                    .expect("public interface output is materialized");
+                let arc_end = main
+                    .nodes()
+                    .node_by_name("interface-output-arc-end")
+                    .expect("interface output arc end is materialized");
+                let drop_node = main
+                    .nodes()
+                    .node_by_name("drop")
+                    .expect("drop is materialized");
+                self.complete_output_graph(
+                    main,
+                    self.state().output_feature_arc_index,
+                    public_output,
+                    arc_end,
+                    drop_node,
+                );
             }
-            None => {
-                let index = pool.insert(InterfaceRxDpo {
-                    sw_if_index,
-                    proto,
-                    lock_count: 1,
-                });
-                database.insert((proto, sw_if_index), index);
-                index
-            }
-        };
-        Ok(Some(DpoId::interface_rx(proto, index)))
-    }
-
-    /// Copies the RX interface fact without letting a pool borrow escape a
-    /// worker's synchronous packet operation.
-    #[inline(always)]
-    pub fn rx_dpo_interface(&self, dpo: DpoId) -> Option<u32> {
-        if dpo.class() != DpoType::INTERFACE_RX {
-            return None;
         }
-        let interface = |pool: &Pool<InterfaceRxDpo>| {
-            let object = pool.get(dpo.index())?;
-            (object.proto == dpo.proto()).then_some(object.sw_if_index)
-        };
-        if hammer_runtime::ensure_main_thread().is_ok() {
-            return interface(&self.rx_dpos.borrow());
-        }
-        // SAFETY: a Data Worker cannot acknowledge a barrier during this
-        // synchronous read. All pool mutation requires acknowledged workers;
-        // no reference or RefCell borrow flag escapes the operation.
-        unsafe { interface(&*self.rx_dpos.as_ptr()) }
-    }
 
-    pub(crate) fn interface_tx_nodes(dpo: crate::net::DpoId) -> Vec<NodeId> {
-        let main = crate::net::NetMain::global().expect("interface DPO requires the net owner");
-        let interfaces = main.interface_main();
-        let hardware = interfaces
-            .software_interface(dpo.index())
-            .and_then(|software| {
-                software.hw_if_index.or_else(|| {
-                    interfaces
-                        .software_interface(software.sup_sw_if_index)?
-                        .hw_if_index
-                })
-            })
-            .and_then(|index| interfaces.state().hardware_interfaces.get(index));
-        hardware
-            .and_then(|interface| {
-                interface
-                    .output_node_index
-                    .or_else(|| interfaces.output_node.get().copied())
-            })
-            .into_iter()
-            .collect()
+        drop(self.call_sw_interface_add_del(main, sw_if_index, true));
+        drop(self.call_hw_interface_add_del(main, hw_if_index, true));
+        hw_if_index
     }
 
     pub fn set_hardware_flags(
@@ -950,51 +895,21 @@ impl InterfaceMain {
         Ok(())
     }
 
-    pub fn delete_hardware_interface(
-        &self,
-        main: &mut DataPlaneMain,
-        hw_if_index: u32,
-    ) -> InterfaceResult<()> {
-        hammer_runtime::ensure_main_thread_with_barrier()?;
+    pub fn delete_hardware_interface(&self, main: &mut DataPlaneMain, hw_if_index: u32) {
+        hammer_runtime::ensure_main_thread_with_barrier()
+            .expect("hardware interface deletion requires the main thread barrier");
         let hw = self
             .state()
             .hardware_interfaces
             .get(hw_if_index)
-            .ok_or(InterfaceError::NotRegistered {
-                interface_index: hw_if_index,
-            })?
+            .expect("hardware interface deletion requires a live interface")
             .clone();
-        let mut primary_error = self
-            .set_hardware_flags(main, hw_if_index, HwInterfaceFlags::empty())
-            .err();
-        if let Err(error) = self.call_hw_interface_add_del(main, hw_if_index, false) {
-            if primary_error.is_none() {
-                primary_error = Some(error);
-            } else {
-                tracing::warn!(%error, hw_if_index, "hardware interface delete callback failed");
-            }
-        }
+        drop(self.set_hardware_flags(main, hw_if_index, HwInterfaceFlags::empty()));
+        drop(self.call_hw_interface_add_del(main, hw_if_index, false));
         self.remove_interface_queues(hw_if_index);
-        if let Err(error) = self.set_software_flags(main, hw.sw_if_index, SwInterfaceFlags::empty())
-        {
-            if primary_error.is_none() {
-                primary_error = Some(error);
-            } else {
-                tracing::warn!(%error, sw_if_index = hw.sw_if_index, "software interface down callback failed during deletion");
-            }
-        }
-        if let Err(error) = self.call_sw_interface_add_del(main, hw.sw_if_index, false) {
-            if primary_error.is_none() {
-                primary_error = Some(error);
-            } else {
-                tracing::warn!(%error, sw_if_index = hw.sw_if_index, "software interface delete callback failed");
-            }
-        }
-        self.remove_interface_slots(hw_if_index);
-        match primary_error {
-            Some(error) => Err(error),
-            None => Ok(()),
-        }
+        drop(self.set_software_flags(main, hw.sw_if_index, SwInterfaceFlags::empty()));
+        drop(self.call_sw_interface_add_del(main, hw.sw_if_index, false));
+        self.remove_interface_slots(main, hw_if_index);
     }
 
     fn remove_interface_queues(&self, hw_if_index: u32) {
@@ -1017,18 +932,63 @@ impl InterfaceMain {
         }
     }
 
-    fn remove_interface_slots(&self, hw_if_index: u32) {
+    fn remove_interface_slots(&self, main: &mut DataPlaneMain, hw_if_index: u32) {
         let state = self.state_mut();
         let hw = state
             .hardware_interfaces
             .get(hw_if_index)
             .expect("interface removal retains its hardware slot")
             .clone();
+        if let (Some(output), Some(tx)) = (hw.output_node_index, hw.tx_node_index) {
+            let tx_function = state.device_classes[hw.dev_class_index as usize]
+                .tx_function
+                .expect("interface with a TX node retains its DeviceClass process");
+            let runtime_data = NodeRuntime::from_words([
+                u64::from(hw.hw_if_index),
+                u64::from(hw.sw_if_index),
+                u64::from(hw.dev_instance),
+                1,
+            ]);
+            let output_name =
+                Box::leak(format!("interface-{}-output-deleted", hw.hw_if_index).into_boxed_str());
+            let tx_name =
+                Box::leak(format!("interface-{}-tx-deleted", hw.hw_if_index).into_boxed_str());
+            main.nodes()
+                .recycle_node_descriptor(
+                    output,
+                    NodeDescriptor::new(
+                        crate::interface::interface_output_template,
+                        runtime_data,
+                        Some(NodeRegistration::next(output_name, 2)),
+                        &[],
+                        None,
+                    ),
+                )
+                .expect("deleted interface output runtime must publish");
+            main.nodes()
+                .recycle_node_descriptor(
+                    tx,
+                    NodeDescriptor::new(
+                        tx_function,
+                        runtime_data,
+                        Some(NodeRegistration::next(tx_name, 1)),
+                        &[],
+                        None,
+                    ),
+                )
+                .expect("deleted interface TX runtime must publish");
+        }
         for index in hw.rx_queue_indices {
             state.rx_queues.remove(index);
         }
         for index in hw.tx_queue_indices {
             state.tx_queues.remove(index);
+        }
+        state.lookup_table.clear(hw.sw_if_index);
+        if let (Some(output), Some(tx)) = (hw.output_node_index, hw.tx_node_index) {
+            state
+                .deleted_node_pairs
+                .push((hw.dev_class_index, output, tx));
         }
         state.software_interfaces.remove(hw.sw_if_index);
         state.names.retain(|_, index| *index != hw_if_index);
@@ -1044,8 +1004,139 @@ impl InterfaceMain {
             .get(index)
             .expect("hardware interface index names an occupied slot")
     }
+
     pub fn software_interface(&self, index: u32) -> Option<&SwInterface> {
         self.state().software_interfaces.get(index)
+    }
+
+    pub fn tx_node_index_for_sw_interface(&self, sw_if_index: u32) -> NodeId {
+        let software = self
+            .software_interface(sw_if_index)
+            .expect("TX interface must be live");
+        let super_interface = self
+            .software_interface(software.sup_sw_if_index)
+            .expect("TX interface must name a live super-interface");
+        let hw_if_index = software
+            .hw_if_index
+            .or(super_interface.hw_if_index)
+            .expect("TX interface must resolve to hardware");
+        self.hardware_interface(hw_if_index)
+            .output_node_index
+            .expect("TX interface must have a published output node")
+    }
+
+    fn if_update_lookup_tables(&self, sw_if_index: u32) {
+        let state = self.state_mut();
+        let software = state
+            .software_interfaces
+            .get(sw_if_index)
+            .expect("lookup publication requires a live software interface");
+        let super_interface = state
+            .software_interfaces
+            .get(software.sup_sw_if_index)
+            .expect("lookup publication requires a live super-interface");
+        let hw_if_index = software
+            .hw_if_index
+            .or(super_interface.hw_if_index)
+            .expect("lookup publication requires a hardware interface");
+        let arc_end = state
+            .hardware_interfaces
+            .get(hw_if_index)
+            .expect("lookup publication requires live hardware")
+            .if_out_arc_end_node_next_index
+            .unwrap_or(INVALID_NODE_NEXT_INDEX);
+        state
+            .lookup_table
+            .publish(sw_if_index, hw_if_index, arc_end);
+    }
+
+    pub(crate) fn interface_lookup_entry(&self, sw_if_index: u32) -> InterfaceLookupEntry {
+        self.state().lookup_table.entry(sw_if_index)
+    }
+
+    pub(crate) fn output_feature_arc_index(&self) -> u8 {
+        let index = self.state().output_feature_arc_index;
+        assert_ne!(index, u8::MAX, "interface-output Feature Arc is published");
+        index
+    }
+
+    pub(crate) fn output_node_next_index_for_sw_interface(&self, sw_if_index: u32) -> u16 {
+        let software = self
+            .software_interface(sw_if_index)
+            .expect("output packet requires a live software interface");
+        let super_interface = self
+            .software_interface(software.sup_sw_if_index)
+            .expect("output packet requires a live super-interface");
+        let hw_if_index = software
+            .hw_if_index
+            .or(super_interface.hw_if_index)
+            .expect("output packet requires a hardware interface");
+        self.hardware_interface(hw_if_index)
+            .output_node_next_index
+            .expect("output packet requires a published interface-output edge")
+    }
+
+    pub(crate) fn complete_output_graph(
+        &self,
+        main: &mut DataPlaneMain,
+        arc_index: u8,
+        public_output: NodeId,
+        arc_end: NodeId,
+        drop_node: NodeId,
+    ) {
+        hammer_runtime::ensure_main_thread_with_barrier()
+            .expect("interface output graph publication requires main-thread ownership");
+        self.state_mut().output_feature_arc_index = arc_index;
+        let interfaces = self
+            .state()
+            .hardware_interfaces
+            .iter()
+            .filter_map(|(hw_if_index, hardware)| {
+                Some((
+                    hw_if_index,
+                    hardware.sw_if_index,
+                    hardware.output_node_index?,
+                    hardware.tx_node_index?,
+                ))
+            })
+            .collect::<Vec<_>>();
+        let features = crate::feature::FeatureMain::global()
+            .expect("FeatureMain exists before interface output publication");
+        let drop_slot = main
+            .nodes()
+            .add_node_next_slot(arc_end, drop_node)
+            .expect("interface arc-end drop edge must publish");
+        assert_eq!(drop_slot, 0, "interface arc-end drop slot is zero");
+        for (hw_if_index, sw_if_index, output, tx) in interfaces {
+            main.nodes()
+                .set_node_next_slot(tx, 0, drop_node)
+                .expect("interface TX drop edge must publish");
+            main.nodes()
+                .set_node_next_slot(output, 0, drop_node)
+                .expect("interface output drop edge must publish");
+            main.nodes()
+                .set_node_next_slot(output, 1, tx)
+                .expect("interface output TX edge must publish");
+            features
+                .add_feature_arc_start(main.nodes(), arc_index, output)
+                .expect("interface output start must publish");
+            let arc_end_next = main
+                .nodes()
+                .add_node_next_slot(arc_end, tx)
+                .expect("interface arc-end TX edge must publish");
+            let output_next = main
+                .nodes()
+                .add_node_next_slot(public_output, output)
+                .expect("public interface-output edge must publish");
+            let hardware = self
+                .state_mut()
+                .hardware_interfaces
+                .get_mut(hw_if_index)
+                .expect("interface remains live during graph publication");
+            hardware.output_node_next_index = Some(output_next);
+            hardware.if_out_arc_end_node_next_index = Some(arc_end_next);
+            self.if_update_lookup_tables(sw_if_index);
+        }
     }
 
     fn hw_class_for_software(&self, sw_if_index: u32) -> HwClass {
@@ -1256,6 +1347,13 @@ impl InterfaceMain {
             .map(|(_, queue)| queue.output_slot)
     }
 
+    pub(crate) fn has_tx_queue_for_worker(&self, worker: DataWorkerId, hw_if_index: u32) -> bool {
+        self.state()
+            .tx_queues
+            .iter()
+            .any(|(_, queue)| queue.hw_if_index == hw_if_index && queue.is_assigned_to(worker))
+    }
+
     pub fn register_mtu_callback(&self, callback: fn(&mut DataPlaneMain, &InterfaceMain, u32)) {
         hammer_runtime::ensure_main_thread()
             .expect("interface MTU callback registration is main-thread-only");
@@ -1378,6 +1476,64 @@ impl InterfaceMain {
             (registration.callback)(main, self, sw_if_index, state)?;
         }
         Ok(())
+    }
+}
+
+impl EthernetMain {
+    pub fn eth_register_interface(
+        &self,
+        main: &mut DataPlaneMain,
+        registration: EthernetInterfaceRegistration,
+    ) -> u32 {
+        hammer_runtime::ensure_main_thread_with_barrier()
+            .expect("Ethernet interface registration requires publication ownership");
+        // SAFETY: Ethernet registration is serialized by the startup/main-thread
+        // publication scope and no pool borrow escapes this operation.
+        let ethernet_index = unsafe {
+            (&mut *self.interfaces.get()).insert(EthernetInterface {
+                flag_change: registration.flag_change,
+                set_max_frame_size: registration.set_max_frame_size,
+                flags: 0,
+                address: registration.address,
+            })
+        };
+        let interfaces = NetMain::global()
+            .expect("Ethernet registration requires the network Main")
+            .interface_main();
+        let hw_if_index = interfaces.register_interface(
+            main,
+            registration.dev_class_index,
+            registration.dev_instance,
+            interfaces.hw_class_index("ethernet"),
+            ethernet_index,
+        );
+        let overhead = if registration.frame_overhead == 0 {
+            22
+        } else {
+            registration.frame_overhead
+        };
+        let max_frame_size = if registration.max_frame_size == 0 {
+            9_000u16
+                .checked_add(overhead)
+                .expect("default Ethernet frame size fits u16")
+        } else {
+            registration.max_frame_size
+        };
+        let state = interfaces.state_mut();
+        let hardware = state
+            .hardware_interfaces
+            .get_mut(hw_if_index)
+            .expect("new Ethernet interface remains live during registration");
+        hardware.min_frame_size = 64;
+        hardware.frame_overhead = overhead;
+        hardware.max_frame_size = max_frame_size;
+        hardware.hw_address.clear();
+        hardware.hw_address.extend_from_slice(&registration.address);
+        let sw_if_index = hardware.sw_if_index;
+        interfaces
+            .set_protocol_mtu(main, sw_if_index, InterfaceMtuKind::L3, 9_000)
+            .expect("new Ethernet interface remains live during MTU publication");
+        hw_if_index
     }
 }
 

@@ -1,8 +1,10 @@
+use crate::adjacency::{Ip4RewriteNode, Ip6RewriteNode};
 use crate::ip::input::{Ip4InputNode, Ip6InputNode};
 use crate::ip::local::{Ip4LocalEndOfArcNode, Ip4LocalNode, Ip6LocalEndOfArcNode, Ip6LocalNode};
 use crate::lookup::{IP4_MAIN, IP6_MAIN, Ip4LookupNode, Ip6LookupNode};
 use hammer_core::data_plane::{Frame, NodeId, NodeNext};
 use hammer_runtime::{DataPlaneMain, Node, NodeProcessFn, RuntimeResult};
+use hammer_service::device::DeviceInputNode;
 use hammer_service::ethernet::EthernetMain;
 use hammer_service::feature::{FeatureError, FeatureMain};
 use hammer_service::net::{DpoProto, DpoType, NetMain};
@@ -338,14 +340,74 @@ fn ip_feature_init(main: &mut hammer_runtime::DataPlaneMain) -> RuntimeResult<()
     let ip6_input = nodes
         .node_by_name(Ip6InputNode::NODE_NAME)
         .expect("IP6 input node exists after graph materialization");
+    let device_input = nodes
+        .node_by_name(DeviceInputNode::NODE_NAME)
+        .expect("device-input exists after graph materialization");
+    nodes.add_node_next_slot(device_input, ip4_input)?;
+    nodes.add_node_next_slot(device_input, ip6_input)?;
     ethernet.register_input_type(nodes, IP4_ETHERNET_TYPE, ip4_input)?;
     ethernet.register_input_type(nodes, IP6_ETHERNET_TYPE, ip6_input)?;
+    let (ip4_output, ip6_output) = register_ip_output_arcs(FeatureMain::global()?, nodes)?;
+    unsafe {
+        (*IP4_MAIN
+            .get()
+            .expect("IP4 Main exists before Feature publication")
+            .lookup_main
+            .get())
+        .output_feature_arc_index = ip4_output;
+        (*IP6_MAIN
+            .get()
+            .expect("IP6 Main exists before Feature publication")
+            .lookup_main
+            .get())
+        .output_feature_arc_index = ip6_output;
+    }
+    FeatureMain::global()?
+        .register_feature_update_callback(crate::adjacency::ip_output_feature_update);
     register_ip_features(FeatureMain::global()?, main.nodes()).map_err(|source| {
         hammer_runtime::RuntimeError::GraphNodeInitialization {
             node: "ip4-input",
             source: Box::new(source),
         }
     })
+}
+
+pub(crate) fn register_ip_output_arcs(
+    features: &FeatureMain,
+    nodes: &hammer_runtime::NodeMain,
+) -> RuntimeResult<(u8, u8)> {
+    let ip4_rewrite = nodes
+        .node_by_name(Ip4RewriteNode::NODE_NAME)
+        .expect("ip4-rewrite exists before output Feature publication");
+    let ip6_rewrite = nodes
+        .node_by_name(Ip6RewriteNode::NODE_NAME)
+        .expect("ip6-rewrite exists before output Feature publication");
+    let interface_output = nodes
+        .node_by_name("interface-output")
+        .expect("interface-output exists before IP output Feature publication");
+    let register = |name, start| {
+        let arc = features
+            .register_feature_arc(name, &[start], Some("interface-output"))
+            .map_err(
+                |source| hammer_runtime::RuntimeError::GraphNodeInitialization {
+                    node: name,
+                    source: Box::new(source),
+                },
+            )?;
+        features
+            .register_feature(name, "interface-output", interface_output, &[], &[])
+            .map_err(
+                |source| hammer_runtime::RuntimeError::GraphNodeInitialization {
+                    node: name,
+                    source: Box::new(source),
+                },
+            )?;
+        Ok::<u8, hammer_runtime::RuntimeError>(arc)
+    };
+    Ok((
+        register("ip4-output", ip4_rewrite)?,
+        register("ip6-output", ip6_rewrite)?,
+    ))
 }
 
 fn register_ip_features(

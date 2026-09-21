@@ -4076,6 +4076,7 @@ pub fn derive_fib_source(input: TokenStream) -> TokenStream {
 struct ClassArgs {
     name: Option<LitStr>,
     format_device_name: Option<Expr>,
+    tx_function: Option<Expr>,
     flags: Option<Expr>,
 }
 
@@ -4100,6 +4101,15 @@ impl Parse for ClassArgs {
                         ));
                     }
                     args.format_device_name = Some(input.parse()?);
+                }
+                "tx_function" => {
+                    if args.tx_function.is_some() {
+                        return Err(Error::new(
+                            key.span(),
+                            "duplicate `tx_function` class argument",
+                        ));
+                    }
+                    args.tx_function = Some(input.parse()?);
                 }
                 "flags" => {
                     if args.flags.is_some() {
@@ -4152,16 +4162,26 @@ fn derive_class(input: TokenStream, device: bool) -> Result<TokenStream2> {
             .format_device_name
             .map(|format| quote!(.with_format_device_name(#format)))
             .unwrap_or_default();
+        let tx_function = args
+            .tx_function
+            .map(|function| quote!(.with_tx_function(#function)))
+            .unwrap_or_default();
         (
             quote!(::hammer_service::device::DeviceClass),
             quote!(crate::__HAMMER_DEVICE_CLASS_REGISTRATIONS),
-            quote!(::hammer_service::device::DeviceClass::new(#name) #format),
+            quote!(::hammer_service::device::DeviceClass::new(#name) #format #tx_function),
         )
     } else {
         if args.format_device_name.is_some() {
             return Err(Error::new(
                 ident.span(),
                 "`format_device_name` is only valid for `DeviceClass`",
+            ));
+        }
+        if args.tx_function.is_some() {
+            return Err(Error::new(
+                ident.span(),
+                "`tx_function` is only valid for `DeviceClass`",
             ));
         }
         let flags = args

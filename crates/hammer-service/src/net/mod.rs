@@ -1,5 +1,7 @@
 use std::cell::{Ref, RefCell, RefMut};
+use std::collections::HashMap;
 use std::fmt;
+use std::mem::size_of;
 use std::net::IpAddr;
 use std::sync::{Arc, OnceLock};
 
@@ -107,6 +109,9 @@ pub struct NetMain {
     fib_nodes: RefCell<fib_node::FibNodeMain>,
     adjacency_delegates: RefCell<adj_delegate::AdjacencyDelegateMain>,
     fib_sources: RefCell<fib::FibSourceMain>,
+    receive_dpos: RefCell<Pool<ReceiveDpo<IpAddr>>>,
+    rx_dpos: RefCell<Pool<InterfaceRxDpo>>,
+    rx_dpo_by_interface: RefCell<HashMap<(DpoProto, u32), u32>>,
     local_interface_hw_index: u32,
     local_interface_sw_index: u32,
 }
@@ -119,6 +124,105 @@ unsafe impl Send for NetMain {}
 // SAFETY: the scopes above exclude worker reads during mutation. Main-thread
 // guards also prevent mutation while a control-plane reference remains borrowed.
 unsafe impl Sync for NetMain {}
+
+impl InterfaceRxDpo {
+    pub fn lock(dpo: DpoId) {
+        hammer_runtime::ensure_main_thread_with_barrier()
+            .expect("RX DPO acquisition requires publication ownership");
+        let net = NetMain::global().expect("RX DPO requires the network Main");
+        let mut pool = net.rx_dpos.borrow_mut();
+        let object = pool
+            .get_mut(dpo.index())
+            .expect("referenced RX DPO is occupied");
+        assert_eq!(dpo.class(), DpoType::INTERFACE_RX);
+        assert_eq!(dpo.proto(), object.proto);
+        object.lock_count = object
+            .lock_count
+            .checked_add(1)
+            .expect("RX DPO reference count overflow");
+    }
+
+    pub fn unlock(dpo: DpoId) {
+        hammer_runtime::ensure_main_thread_with_barrier()
+            .expect("RX DPO retirement requires publication ownership");
+        let net = NetMain::global().expect("RX DPO requires the network Main");
+        let mut pool = net.rx_dpos.borrow_mut();
+        let object = pool
+            .get_mut(dpo.index())
+            .expect("referenced RX DPO is occupied");
+        assert_eq!(dpo.class(), DpoType::INTERFACE_RX);
+        assert_eq!(dpo.proto(), object.proto);
+        object.lock_count = object
+            .lock_count
+            .checked_sub(1)
+            .expect("RX DPO reference count underflow");
+        if object.lock_count == 0 {
+            net.rx_dpo_by_interface
+                .borrow_mut()
+                .remove(&(object.proto, object.sw_if_index));
+            pool.remove(dpo.index());
+        }
+    }
+
+    pub fn format(dpo: DpoId, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        hammer_runtime::ensure_main_thread().expect("RX DPO formatting requires the main thread");
+        let net = NetMain::global().expect("RX DPO requires the network Main");
+        let pool = net.rx_dpos.borrow();
+        match pool.get(dpo.index()) {
+            Some(object) => write!(
+                formatter,
+                "interface-rx {} interface {} proto {} locks {}",
+                dpo.index(),
+                object.sw_if_index,
+                object.proto.get(),
+                object.lock_count
+            ),
+            None => write!(formatter, "interface-rx {} absent", dpo.index()),
+        }
+    }
+
+    pub fn memory() -> (usize, usize, usize) {
+        hammer_runtime::ensure_main_thread().expect("RX DPO diagnostics require the main thread");
+        let net = NetMain::global().expect("RX DPO requires the network Main");
+        let pool = net.rx_dpos.borrow();
+        (size_of::<Self>(), pool.len(), pool.capacity())
+    }
+}
+
+impl ReceiveDpo<IpAddr> {
+    pub fn lock(dpo: DpoId) {
+        hammer_runtime::ensure_main_thread_with_barrier()
+            .expect("receive DPO acquisition requires publication ownership");
+        assert_eq!(dpo.class(), DpoType::RECEIVE);
+        let net = NetMain::global().expect("receive DPO requires the network Main");
+        let mut pool = net.receive_dpos.borrow_mut();
+        let object = pool
+            .get_mut(dpo.index())
+            .expect("referenced receive DPO is occupied");
+        object.lock_count = object
+            .lock_count
+            .checked_add(1)
+            .expect("receive DPO reference count overflow");
+    }
+
+    pub fn unlock(dpo: DpoId) {
+        hammer_runtime::ensure_main_thread_with_barrier()
+            .expect("receive DPO retirement requires publication ownership");
+        assert_eq!(dpo.class(), DpoType::RECEIVE);
+        let net = NetMain::global().expect("receive DPO requires the network Main");
+        let mut pool = net.receive_dpos.borrow_mut();
+        let object = pool
+            .get_mut(dpo.index())
+            .expect("referenced receive DPO is occupied");
+        object.lock_count = object
+            .lock_count
+            .checked_sub(1)
+            .expect("receive DPO reference count underflow");
+        if object.lock_count == 0 {
+            pool.remove(dpo.index());
+        }
+    }
+}
 
 impl NetMain {
     pub fn global() -> RuntimeResult<&'static NetMain> {
@@ -136,9 +240,8 @@ impl NetMain {
     ) -> RuntimeResult<Arc<NetMain>> {
         let local_device_class = interface_main.device_class_index("local");
         let local_hw_class = interface_main.hw_class_index("local");
-        let local_hw = interface_main
-            .register_hardware_interface(main, local_device_class, 0, local_hw_class, 0)
-            .map_err(RuntimeError::from)?;
+        let local_hw =
+            interface_main.register_interface(main, local_device_class, 0, local_hw_class, 0);
         interface_main
             .set_interface_name(local_hw, "local0")
             .map_err(RuntimeError::from)?;
@@ -154,6 +257,9 @@ impl NetMain {
             fib_nodes: RefCell::new(fib_node::FibNodeMain::default()),
             adjacency_delegates: RefCell::new(adj_delegate::AdjacencyDelegateMain::default()),
             fib_sources: RefCell::new(fib_sources),
+            receive_dpos: RefCell::new(Pool::new()),
+            rx_dpos: RefCell::new(Pool::new()),
+            rx_dpo_by_interface: RefCell::new(HashMap::new()),
             local_interface_hw_index: local_hw,
             local_interface_sw_index: local_sw,
         });
@@ -161,7 +267,132 @@ impl NetMain {
             NET_MAIN.set(Arc::clone(&shared)).is_ok(),
             "network initialization callback executes once"
         );
+        shared
+            .register_dpo(
+                Some(DpoType::INTERFACE_TX),
+                &[],
+                None,
+                Some(Self::interface_tx_nodes),
+                None,
+                None,
+                None,
+                None,
+                None,
+            )
+            .expect("interface-TX DPO class registration must succeed");
         Ok(shared)
+    }
+
+    pub fn add_or_lock_receive_dpo(
+        &self,
+        sw_if_index: u32,
+        address: IpAddr,
+    ) -> Result<Option<DpoId>, DpoError> {
+        hammer_runtime::ensure_main_thread_with_barrier()?;
+        if sw_if_index != u32::MAX
+            && self
+                .interface_main
+                .software_interface(sw_if_index)
+                .is_none()
+        {
+            return Ok(None);
+        }
+        let proto = match address {
+            IpAddr::V4(_) => DpoProto::IP4,
+            IpAddr::V6(_) => DpoProto::IP6,
+        };
+        self.dpo_main().identity(DpoType::RECEIVE, proto, 0)?;
+        let index = self.receive_dpos.borrow_mut().insert(ReceiveDpo {
+            sw_if_index,
+            address,
+            lock_count: 1,
+        });
+        Ok(Some(DpoId::receive(proto, index)))
+    }
+
+    #[inline]
+    pub fn receive_dpo_interface(&self, dpo: DpoId) -> Option<u32> {
+        if dpo.class() != DpoType::RECEIVE {
+            return None;
+        }
+        let object = if hammer_runtime::ensure_main_thread().is_ok() {
+            self.receive_dpos.borrow().get(dpo.index())?.clone()
+        } else {
+            // SAFETY: workers read during synchronous graph dispatch, while all
+            // mutations require their WorkerBarrier acknowledgement.
+            unsafe { &*self.receive_dpos.as_ptr() }
+                .get(dpo.index())?
+                .clone()
+        };
+        let proto = match object.address {
+            IpAddr::V4(_) => DpoProto::IP4,
+            IpAddr::V6(_) => DpoProto::IP6,
+        };
+        (proto == dpo.proto()).then_some(object.sw_if_index)
+    }
+
+    pub fn add_or_lock_rx_dpo(
+        &self,
+        proto: DpoProto,
+        sw_if_index: u32,
+    ) -> Result<Option<DpoId>, DpoError> {
+        hammer_runtime::ensure_main_thread_with_barrier()?;
+        if self
+            .interface_main
+            .software_interface(sw_if_index)
+            .is_none()
+        {
+            return Ok(None);
+        }
+        self.dpo_main().identity(DpoType::INTERFACE_RX, proto, 0)?;
+        let mut pool = self.rx_dpos.borrow_mut();
+        let mut database = self.rx_dpo_by_interface.borrow_mut();
+        let index = match database.get(&(proto, sw_if_index)).copied() {
+            Some(index) => {
+                let object = pool
+                    .get_mut(index)
+                    .expect("RX database names an occupied slot");
+                object.lock_count = object
+                    .lock_count
+                    .checked_add(1)
+                    .expect("RX DPO reference count overflow");
+                index
+            }
+            None => {
+                let index = pool.insert(InterfaceRxDpo {
+                    sw_if_index,
+                    proto,
+                    lock_count: 1,
+                });
+                database.insert((proto, sw_if_index), index);
+                index
+            }
+        };
+        Ok(Some(DpoId::interface_rx(proto, index)))
+    }
+
+    #[inline(always)]
+    pub fn rx_dpo_interface(&self, dpo: DpoId) -> Option<u32> {
+        if dpo.class() != DpoType::INTERFACE_RX {
+            return None;
+        }
+        if hammer_runtime::ensure_main_thread().is_ok() {
+            let pool = self.rx_dpos.borrow();
+            let object = pool.get(dpo.index())?;
+            return (object.proto == dpo.proto()).then_some(object.sw_if_index);
+        }
+        // SAFETY: workers read during synchronous graph dispatch, while all
+        // mutations require their WorkerBarrier acknowledgement.
+        let object = unsafe { &*self.rx_dpos.as_ptr() }.get(dpo.index())?;
+        (object.proto == dpo.proto()).then_some(object.sw_if_index)
+    }
+
+    fn interface_tx_nodes(dpo: DpoId) -> Vec<hammer_core::data_plane::NodeId> {
+        let net = Self::global().expect("interface-TX DPO requires the network Main");
+        vec![
+            net.interface_main
+                .tx_node_index_for_sw_interface(dpo.index()),
+        ]
     }
 
     fn load_balances(&self) -> Ref<'_, Pool<LoadBalanceDpo>> {

@@ -52,6 +52,7 @@ pub(crate) struct IpLookupMain<A, P, S> {
     pub(crate) interface_prefixes: Pool<IpInterfacePrefix<P, S>>,
     pub(crate) interface_prefix_index_by_key: HashMap<(P, u32), u32>,
     pub(crate) unicast_feature_arc_index: u8,
+    pub(crate) output_feature_arc_index: u8,
     pub(crate) local_next_by_ip_protocol: [u16; 256],
 }
 
@@ -69,6 +70,7 @@ where
             interface_prefixes: Pool::new(),
             interface_prefix_index_by_key: HashMap::new(),
             unicast_feature_arc_index: u8::MAX,
+            output_feature_arc_index: u8::MAX,
             local_next_by_ip_protocol: [punt_next; 256],
         }
     }
@@ -554,7 +556,6 @@ fn process_interface_rx(
             "RX DPO reached the wrong protocol node"
         );
         let sw_if_index = net
-            .interface_main()
             .rx_dpo_interface(forwarding)
             .expect("published interface RX DPO remains retained during packet processing");
         // SAFETY: NetworkOpaque is the asserted packet ABI overlay, and the

@@ -412,13 +412,13 @@ pub(crate) fn error_response_source_and_origin(runtime: &mut DataPlaneMain) -> R
     use hammer_core::data_plane::NodeKind;
     use hammer_runtime::node::NodeDescriptor;
     let interfaces = NetMain::global()?.interface_main();
-    let hardware = interfaces.register_hardware_interface(
+    let hardware = interfaces.register_interface(
         runtime,
         interfaces.device_class_index("local"),
         0,
         interfaces.hw_class_index("local"),
         0,
-    )?;
+    );
     let rx = interfaces.hardware_interface(hardware).sw_if_index();
     crate::ip4_add_del_interface_address(runtime, rx, "192.0.2.1".parse().unwrap(), 24, false)
         .unwrap();
@@ -555,6 +555,6 @@ pub(crate) fn error_response_source_and_origin(runtime: &mut DataPlaneMain) -> R
         runtime.buffer_free_one(index);
         assert_eq!(runtime.cached_free_buffers(), cached_free + segments);
     }
-    interfaces.delete_hardware_interface(runtime, hardware)?;
+    interfaces.delete_hardware_interface(runtime, hardware);
     Ok(())
 }

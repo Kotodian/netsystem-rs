@@ -43,7 +43,6 @@ impl<P: FibProtocol> AdjacencyNeighborMain<P> {
         link: P::Link,
         address: P::Address,
         sw_if_index: u32,
-        mtu: u16,
     ) -> AdjacencyIndex {
         hammer_runtime::ensure_main_thread_with_barrier()
             .expect("neighbor publication requires the main-thread barrier");
@@ -53,16 +52,22 @@ impl<P: FibProtocol> AdjacencyNeighborMain<P> {
                 let index = adjacency.insert(
                     P::neighbor_subtype(address),
                     link,
-                    sw_if_index,
-                    mtu,
                     self.incomplete_node.slot(),
                     AdjacencyLookupNext::Incomplete,
                 );
-                adjacency.get_mut(index).rewrite.init(
+                let interfaces = NetMain::global()
+                    .expect("neighbor rewrite requires the network Main")
+                    .interface_main();
+                let target = interfaces.tx_node_index_for_sw_interface(sw_if_index);
+                adjacency.get_mut(index).rewrite_header.init(
                     main,
+                    sw_if_index,
+                    P::mtu_kind(link),
                     self.incomplete_node,
-                    P::dpo_protocol(link),
+                    target,
                 );
+                let object = adjacency.get_mut(index);
+                object.rewrite_header.clear_data(&mut object.rewrite_data);
                 self.tables
                     .entry(sw_if_index)
                     .or_default()
@@ -113,14 +118,9 @@ impl<P: FibProtocol> AdjacencyNeighborMain<P> {
             if reason == FibWalkReason::ADJ_MTU {
                 let object = adjacency.get_mut(index);
                 let interfaces = NetMain::global().expect("MTU walk requires the network Main");
-                object.rewrite.max_l3_packet_bytes = interfaces
-                    .interface_main()
-                    .software_interface(sw_if_index)
-                    .expect("neighbor interface remains occupied during MTU walk")
-                    .mtu
-                    .get(P::mtu_kind(object.link))
-                    .min(u32::from(u16::MAX))
-                    as u16;
+                object
+                    .rewrite_header
+                    .update_mtu(interfaces.interface_main(), P::mtu_kind(object.link));
                 interfaces
                     .adjacency_delegates_mut()
                     .modified(adjacency, index);
@@ -181,14 +181,25 @@ impl<P: FibProtocol> AdjacencyNeighborMain<P> {
         }
         let object = adjacency.get_mut(index);
         if complete {
+            let interfaces = NetMain::global()
+                .expect("neighbor rewrite requires the network Main")
+                .interface_main();
+            let target =
+                interfaces.tx_node_index_for_sw_interface(object.rewrite_header.sw_if_index);
+            object.rewrite_header.init(
+                main,
+                object.rewrite_header.sw_if_index,
+                P::mtu_kind(object.link),
+                self.rewrite_node,
+                target,
+            );
             object
-                .rewrite
-                .init(main, self.rewrite_node, P::dpo_protocol(object.link));
-            object.rewrite.set_data(bytes);
+                .rewrite_header
+                .set_data(&mut object.rewrite_data, bytes);
             object.node_index = self.rewrite_node.slot();
             object.lookup_next = AdjacencyLookupNext::Rewrite;
         } else {
-            object.rewrite.clear_data();
+            object.rewrite_header.clear_data(&mut object.rewrite_data);
             object.node_index = self.incomplete_node.slot();
             object.lookup_next = AdjacencyLookupNext::Incomplete;
         }
@@ -215,7 +226,7 @@ impl<P: FibProtocol> AdjacencyNeighborMain<P> {
     pub fn remove(&mut self, adjacency: &AdjacencyMain<P>, index: AdjacencyIndex) {
         let object = adjacency.get(index);
         assert_ne!(object.lookup_next, AdjacencyLookupNext::Glean);
-        let sw_if_index = object.rewrite.sw_if_index;
+        let sw_if_index = object.rewrite_header.sw_if_index;
         let address = P::neighbor_address(&object.subtype);
         let Some(table) = self.tables.get_mut(&sw_if_index) else {
             return;

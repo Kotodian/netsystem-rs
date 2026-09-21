@@ -18,8 +18,6 @@ pub enum FeatureError {
     ArcNotFound { name: &'static str },
     #[error("duplicate feature arc {name}")]
     DuplicateArc { name: &'static str },
-    #[error("feature arc {arc} has no start nodes")]
-    EmptyStartNodes { arc: &'static str },
     #[error("feature arc {arc} has no features")]
     EmptyArc { arc: &'static str },
     #[error("graph node {name} is absent")]
@@ -62,7 +60,7 @@ pub enum FeatureError {
 
 struct FeatureArcRegistration {
     name: &'static str,
-    start_nodes: Box<[NodeId]>,
+    start_nodes: Vec<NodeId>,
     last_in_arc: Option<&'static str>,
 }
 
@@ -80,7 +78,7 @@ struct FeatureConfigMain {
 }
 
 struct ConfigMain {
-    start_nodes: Box<[NodeId]>,
+    start_nodes: Vec<NodeId>,
     default_end_node: NodeId,
     feature_node_by_index: Box<[NodeId]>,
     config_pool: Pool<ConfigEntry>,
@@ -112,6 +110,7 @@ pub struct FeatureMain {
     feature_count_by_sw_if_index: UnsafeCell<Vec<Vec<i16>>>,
     sw_if_index_has_features: UnsafeCell<Vec<Bitmap>>,
     device_input_feature_arc_index: UnsafeCell<u8>,
+    update_callbacks: UnsafeCell<Vec<fn(u8, u32)>>,
 }
 
 pub static FEATURE_MAIN: OnceLock<FeatureMain> = OnceLock::new();
@@ -137,6 +136,7 @@ impl FeatureMain {
             feature_count_by_sw_if_index: UnsafeCell::new(Vec::new()),
             sw_if_index_has_features: UnsafeCell::new(Vec::new()),
             device_input_feature_arc_index: UnsafeCell::new(u8::MAX),
+            update_callbacks: UnsafeCell::new(Vec::new()),
         }
     }
 
@@ -169,9 +169,6 @@ impl FeatureMain {
         if arc_index_by_name.contains_key(name) {
             return Err(FeatureError::DuplicateArc { name });
         }
-        if start_nodes.is_empty() {
-            return Err(FeatureError::EmptyStartNodes { arc: name });
-        }
         for (position, &node) in start_nodes.iter().enumerate() {
             if start_nodes[..position].contains(&node) {
                 return Err(FeatureError::DuplicateStartNode { arc: name, node });
@@ -185,11 +182,55 @@ impl FeatureMain {
         let index = registrations.len() as u8;
         registrations.push(FeatureArcRegistration {
             name,
-            start_nodes: start_nodes.into(),
+            start_nodes: start_nodes.to_vec(),
             last_in_arc,
         });
         arc_index_by_name.insert(name, index);
         Ok(index)
+    }
+
+    pub fn add_feature_arc_start(
+        &self,
+        nodes: &NodeMain,
+        arc_index: u8,
+        node: NodeId,
+    ) -> Result<(), FeatureError> {
+        hammer_runtime::ensure_main_thread_with_barrier()
+            .expect("Feature Arc start publication requires the main-thread scope");
+        if nodes.node_kind(node).is_err() {
+            return Err(FeatureError::GraphNodeNotFound { node });
+        }
+        let position = usize::from(arc_index);
+        let registrations = self.arc_registrations_mut();
+        let registration = registrations
+            .get_mut(position)
+            .ok_or(FeatureError::ArcIndexInvalid { arc_index })?;
+        if registration.start_nodes.contains(&node) {
+            return Ok(());
+        }
+        if let Some(&canonical) = registration.start_nodes.first() {
+            let mut slot = 2usize;
+            while let Ok(target) = nodes.node_next_slot(canonical, slot) {
+                let actual = nodes
+                    .add_node_next_slot(node, target)
+                    .expect("validated Feature start graph mutation must succeed");
+                let expected = u16::try_from(slot).expect("Feature next slot fits u16");
+                if actual != expected {
+                    return Err(FeatureError::StartNextMismatch {
+                        arc_index,
+                        node,
+                        expected,
+                        actual,
+                    });
+                }
+                slot += 1;
+            }
+        }
+        registration.start_nodes.push(node);
+        if let Some(config) = self.feature_config_mains_mut().get_mut(position) {
+            config.config_main.start_nodes.push(node);
+        }
+        Ok(())
     }
 
     pub fn register_feature(
@@ -372,6 +413,17 @@ impl FeatureMain {
 
     pub fn feature_arc_index(&self, name: &str) -> Option<u8> {
         self.arc_index_by_name().get(name).copied()
+    }
+
+    pub fn register_feature_update_callback(&self, callback: fn(u8, u32)) {
+        hammer_runtime::ensure_main_thread()
+            .expect("Feature update callback registration is main-thread-only");
+        assert!(
+            !hammer_runtime::barrier::global().is_some_and(|barrier| barrier.worker_count() != 0),
+            "Feature callbacks register before Data Worker startup"
+        );
+        // SAFETY: callback registration is serialized before worker startup.
+        unsafe { &mut *self.update_callbacks.get() }.push(callback);
     }
 
     pub fn feature_index(&self, arc_index: u8, name: &str) -> Option<u32> {
@@ -741,6 +793,11 @@ impl FeatureMain {
         }
         if old != u32::MAX {
             Self::release_config(config, heap, old);
+        }
+        // SAFETY: callbacks are immutable after startup and execute inside the
+        // same publication scope as the completed configuration mutation.
+        for callback in unsafe { &*self.update_callbacks.get() } {
+            callback(arc_index, sw_if_index);
         }
         Ok(())
     }

@@ -6,7 +6,6 @@ use std::sync::OnceLock;
 
 use hammer_runtime::DataPlaneMain;
 use hammer_service::feature::FeatureMain;
-use hammer_service::interface::InterfaceMtuKind;
 use hammer_service::interface::{InterfaceCallbackRegistration, InterfaceMain, InterfaceResult};
 use hammer_service::net::fib::FibEntrySourceBehaviorId;
 use hammer_service::net::{
@@ -16,9 +15,9 @@ use hammer_service::net::{
 use ipnet::{Ipv4Net, Ipv6Net};
 use rand_09::RngCore;
 
-use crate::adjacency::{Ip4FibProtocol, Ip6FibProtocol, IpNetLink};
+use crate::adjacency::{Ip4FibProtocol, Ip6FibProtocol, IpNetLink, update_adjacency_output_config};
 use crate::lookup::{IP4_MAIN, IP6_MAIN, IpInterfaceAddress, IpInterfaceAddressKey, IpLookupMain};
-use hammer_service::net::adj::{AdjacencyLookupNext, FibProtocol};
+use hammer_service::net::adj::{AdjacencyIndex, AdjacencyLookupNext, FibProtocol};
 
 pub type IpInterfaceAddressCallback<A> = fn(&mut DataPlaneMain, u32, A, u8, u32, bool);
 
@@ -52,6 +51,7 @@ impl std::error::Error for IpInterfaceAddressError {}
 struct Ip6Link {
     sw_if_index: u32,
     link_local_address: Ipv6Addr,
+    multicast_adjacency: Option<AdjacencyIndex>,
     locks: u32,
 }
 
@@ -279,12 +279,31 @@ fn ip6_link_sw_interface_add_del(
     is_create: bool,
 ) -> InterfaceResult<()> {
     if !is_create {
-        let links = IP6_LINK_MAIN
+        let removed_link = IP6_LINK_MAIN
             .get()
             .expect("IP6 link Main exists before interface lifecycle callbacks")
-            .links_mut();
-        if links.get(sw_if_index as usize).is_some_and(Option::is_some) {
-            links[sw_if_index as usize] = None;
+            .links_mut()
+            .get_mut(sw_if_index as usize)
+            .and_then(Option::take);
+        let multicast_adjacency = removed_link.and_then(|link| link.multicast_adjacency);
+        if let Some(index) = multicast_adjacency {
+            let family = IP6_MAIN
+                .get()
+                .expect("IP6 Main exists before interface deletion");
+            let adjacency = unsafe { &mut *family.adjacency.get() }
+                .as_mut()
+                .expect("IP6 adjacency owner exists before interface deletion");
+            assert!(
+                adjacency.node_unlock(index),
+                "IP6 link owns the final multicast adjacency lock"
+            );
+            NetMain::global()
+                .expect("network Main exists before multicast adjacency deletion")
+                .adjacency_delegates_mut()
+                .deleted(adjacency, index);
+            adjacency.release(index);
+        }
+        if removed_link.is_some() {
             ip6_sw_interface_enable_disable(main, sw_if_index, false);
         }
     }
@@ -300,6 +319,9 @@ fn ip4_sw_interface_admin_up_down(
     let family = IP4_MAIN
         .get()
         .expect("IP4 Main exists before admin state callbacks");
+    if unsafe { &*family.adjacency.get() }.is_none() {
+        return Ok(());
+    }
     let fib_index = family
         .fib_index(sw_if_index)
         .expect("live interface has an IP4 FIB mapping");
@@ -340,6 +362,9 @@ fn ip6_sw_interface_admin_up_down(
     let family = IP6_MAIN
         .get()
         .expect("IP6 Main exists before admin state callbacks");
+    if unsafe { &*family.adjacency.get() }.is_none() {
+        return Ok(());
+    }
     let fib_index = family
         .fib_index(sw_if_index)
         .expect("live interface has an IP6 FIB mapping");
@@ -432,7 +457,7 @@ fn ip4_add_interface_routes(
 ) {
     let net = NetMain::global().expect("IP4 interface route requires the network Main");
     let interfaces = net.interface_main();
-    let local = interfaces
+    let local = net
         .add_or_lock_receive_dpo(sw_if_index, std::net::IpAddr::V4(address))
         .expect("IP4 receive DPO creation is a control-plane invariant")
         .expect("live interface has an IP4 receive DPO");
@@ -468,12 +493,6 @@ fn ip4_add_interface_routes(
         if !first {
             return;
         }
-        let mtu = interfaces
-            .software_interface(sw_if_index)
-            .expect("connected route requires a live interface")
-            .mtu
-            .get(InterfaceMtuKind::Ip4)
-            .min(u32::from(u16::MAX)) as u16;
         let connected = {
             let adjacency = unsafe { &mut *family.adjacency.get() }
                 .as_mut()
@@ -488,7 +507,6 @@ fn ip4_add_interface_routes(
                     IpNetLink::Ip4,
                     Ip4FibProtocol::zero_address(),
                     sw_if_index,
-                    mtu,
                 );
                 if adjacency.get(index).lookup_next == AdjacencyLookupNext::Incomplete {
                     neighbors.update_rewrite(
@@ -505,10 +523,11 @@ fn ip4_add_interface_routes(
                 unsafe { &mut *family.glean.get() }
                     .as_mut()
                     .expect("IP4 glean DB is initialized before interface routes")
-                    .add_or_lock(main, adjacency, IpNetLink::Ip4, sw_if_index, prefix, mtu)
+                    .add_or_lock(main, adjacency, IpNetLink::Ip4, sw_if_index, prefix)
             };
             adjacency.dpo(&net.dpo_main(), index)
         };
+        update_adjacency_output_config(sw_if_index, DpoProto::IP4);
         let connected_dpo = interface_route_dpo(
             main,
             DpoProto::IP4,
@@ -558,14 +577,8 @@ fn ip4_add_interface_routes(
                 } else {
                     peer
                 };
-                let index = neighbors.add_or_lock(
-                    main,
-                    adjacency,
-                    IpNetLink::Ip4,
-                    next_hop,
-                    sw_if_index,
-                    mtu,
-                );
+                let index =
+                    neighbors.add_or_lock(main, adjacency, IpNetLink::Ip4, next_hop, sw_if_index);
                 if interfaces.is_p2p(sw_if_index)
                     && adjacency.get(index).lookup_next == AdjacencyLookupNext::Incomplete
                 {
@@ -580,6 +593,7 @@ fn ip4_add_interface_routes(
                 }
                 adjacency.dpo(&net.dpo_main(), index)
             };
+            update_adjacency_output_config(sw_if_index, DpoProto::IP4);
             let attached_dpo =
                 interface_route_dpo(main, DpoProto::IP4, attached, FibEntryFlags::ATTACHED);
             family
@@ -658,7 +672,7 @@ fn ip6_add_interface_routes(
 ) {
     let net = NetMain::global().expect("IP6 interface route requires the network Main");
     let interfaces = net.interface_main();
-    let local = interfaces
+    let local = net
         .add_or_lock_receive_dpo(sw_if_index, std::net::IpAddr::V6(address))
         .expect("IP6 receive DPO creation is a control-plane invariant")
         .expect("live interface has an IP6 receive DPO");
@@ -690,12 +704,6 @@ fn ip6_add_interface_routes(
         if !first {
             return;
         }
-        let mtu = interfaces
-            .software_interface(sw_if_index)
-            .expect("connected route requires a live interface")
-            .mtu
-            .get(InterfaceMtuKind::Ip6)
-            .min(u32::from(u16::MAX)) as u16;
         let connected = {
             let adjacency = unsafe { &mut *family.adjacency.get() }
                 .as_mut()
@@ -710,7 +718,6 @@ fn ip6_add_interface_routes(
                     IpNetLink::Ip6,
                     Ip6FibProtocol::zero_address(),
                     sw_if_index,
-                    mtu,
                 );
                 if adjacency.get(index).lookup_next == AdjacencyLookupNext::Incomplete {
                     neighbors.update_rewrite(
@@ -727,10 +734,11 @@ fn ip6_add_interface_routes(
                 unsafe { &mut *family.glean.get() }
                     .as_mut()
                     .expect("IP6 glean DB is initialized before interface routes")
-                    .add_or_lock(main, adjacency, IpNetLink::Ip6, sw_if_index, prefix, mtu)
+                    .add_or_lock(main, adjacency, IpNetLink::Ip6, sw_if_index, prefix)
             };
             adjacency.dpo(&net.dpo_main(), index)
         };
+        update_adjacency_output_config(sw_if_index, DpoProto::IP6);
         let connected_dpo = interface_route_dpo(
             main,
             DpoProto::IP6,
@@ -1027,7 +1035,8 @@ pub fn ip4_add_del_interface_address(
         .interface_main()
         .software_interface(sw_if_index)
         .is_some_and(|interface| interface.is_admin_up());
-    if admin_up {
+    let adjacency_installed = unsafe { &*family.adjacency.get() }.is_some();
+    if admin_up && adjacency_installed {
         if is_delete {
             ip4_del_interface_routes(main, sw_if_index, address, address_length, fib_index);
         } else {
@@ -1082,49 +1091,165 @@ fn generated_link_local(main: &mut DataPlaneMain, sw_if_index: u32) -> Ipv6Addr 
 }
 
 fn ip6_link_enable(main: &mut DataPlaneMain, sw_if_index: u32, address: Option<Ipv6Addr>) {
-    let links = IP6_LINK_MAIN
-        .get()
-        .expect("IP6 link Main is initialized before link enablement")
-        .links_mut();
-    let position = sw_if_index as usize;
-    if links.len() <= position {
-        links.resize(position + 1, None);
-    }
-    if let Some(link) = links[position].as_mut() {
-        if let Some(address) = address {
-            link.link_local_address = address;
-        } else {
-            link.locks = link
-                .locks
-                .checked_add(1)
-                .expect("IP6 link reference count overflow");
+    {
+        let links = IP6_LINK_MAIN
+            .get()
+            .expect("IP6 link Main is initialized before link enablement")
+            .links_mut();
+        let position = sw_if_index as usize;
+        if links.len() <= position {
+            links.resize(position + 1, None);
         }
-        return;
+        if let Some(link) = links[position].as_mut() {
+            if let Some(address) = address {
+                link.link_local_address = address;
+            } else {
+                link.locks = link
+                    .locks
+                    .checked_add(1)
+                    .expect("IP6 link reference count overflow");
+            }
+            return;
+        }
+        links[position] = Some(Ip6Link {
+            sw_if_index,
+            link_local_address: address.unwrap_or_else(|| generated_link_local(main, sw_if_index)),
+            multicast_adjacency: None,
+            locks: 1,
+        });
     }
-    links[position] = Some(Ip6Link {
-        sw_if_index,
-        link_local_address: address.unwrap_or_else(|| generated_link_local(main, sw_if_index)),
-        locks: 1,
-    });
     ip6_sw_interface_enable_disable(main, sw_if_index, true);
+    if unsafe {
+        &*IP6_MAIN
+            .get()
+            .expect("IP6 Main exists before link enablement")
+            .adjacency
+            .get()
+    }
+    .is_some()
+    {
+        ip6_link_install_multicast_adjacency(main, sw_if_index);
+    }
 }
 
 fn ip6_link_disable(main: &mut DataPlaneMain, sw_if_index: u32) {
-    let links = IP6_LINK_MAIN
-        .get()
-        .expect("IP6 link Main is initialized before link disablement")
-        .links_mut();
-    let Some(link) = links.get_mut(sw_if_index as usize).and_then(Option::as_mut) else {
-        return;
+    let multicast_adjacency = {
+        let links = IP6_LINK_MAIN
+            .get()
+            .expect("IP6 link Main is initialized before link disablement")
+            .links_mut();
+        let Some(link) = links.get_mut(sw_if_index as usize).and_then(Option::as_mut) else {
+            return;
+        };
+        link.locks = link
+            .locks
+            .checked_sub(1)
+            .expect("IP6 link reference count is positive");
+        if link.locks != 0 {
+            return;
+        }
+        links[sw_if_index as usize]
+            .take()
+            .expect("zero-lock IP6 link remains installed")
+            .multicast_adjacency
     };
-    link.locks = link
-        .locks
-        .checked_sub(1)
-        .expect("IP6 link reference count is positive");
-    if link.locks == 0 {
-        links[sw_if_index as usize] = None;
-        ip6_sw_interface_enable_disable(main, sw_if_index, false);
+    if let Some(index) = multicast_adjacency {
+        let family = IP6_MAIN
+            .get()
+            .expect("IP6 Main exists before link disablement");
+        let adjacency = unsafe { &mut *family.adjacency.get() }
+            .as_mut()
+            .expect("IP6 adjacency owner exists before link disablement");
+        assert!(
+            adjacency.node_unlock(index),
+            "IP6 link owns the final multicast adjacency lock"
+        );
+        NetMain::global()
+            .expect("network Main exists before multicast adjacency deletion")
+            .adjacency_delegates_mut()
+            .deleted(adjacency, index);
+        adjacency.release(index);
     }
+    ip6_sw_interface_enable_disable(main, sw_if_index, false);
+}
+
+fn ip6_link_install_multicast_adjacency(main: &mut DataPlaneMain, sw_if_index: u32) {
+    if IP6_LINK_MAIN
+        .get()
+        .expect("IP6 link Main exists before multicast adjacency publication")
+        .links()
+        .get(sw_if_index as usize)
+        .and_then(Option::as_ref)
+        .expect("multicast adjacency requires an enabled IP6 link")
+        .multicast_adjacency
+        .is_some()
+    {
+        return;
+    }
+    let net = NetMain::global().expect("multicast adjacency requires the network Main");
+    let interfaces = net.interface_main();
+    let mut rewrite = [0_u8; 116];
+    let rewrite_len = Ip6FibProtocol::build_rewrite(
+        interfaces,
+        sw_if_index,
+        IpNetLink::Ip6,
+        Some(&[0x33, 0x33, 0, 0, 0, 0]),
+        &mut rewrite,
+    );
+    if rewrite_len == 0 {
+        return;
+    }
+    let source = main
+        .nodes()
+        .node_by_name("ip6-rewrite-mcast")
+        .expect("IP6 multicast rewrite is materialized before link publication");
+    let target = interfaces.tx_node_index_for_sw_interface(sw_if_index);
+    let family = IP6_MAIN
+        .get()
+        .expect("IP6 Main exists before multicast adjacency publication");
+    let adjacency = unsafe { &mut *family.adjacency.get() }
+        .as_mut()
+        .expect("IP6 adjacency owner exists before link publication");
+    let index = adjacency.insert(
+        Ip6FibProtocol::neighbor_subtype(Ipv6Addr::UNSPECIFIED),
+        IpNetLink::Ip6,
+        source.slot(),
+        AdjacencyLookupNext::Multicast,
+    );
+    let object = adjacency.get_mut(index);
+    object.rewrite_header.init(
+        main,
+        sw_if_index,
+        Ip6FibProtocol::mtu_kind(IpNetLink::Ip6),
+        source,
+        target,
+    );
+    object
+        .rewrite_header
+        .set_data(&mut object.rewrite_data, &rewrite[..rewrite_len]);
+    object.rewrite_header.dst_mcast_offset =
+        u8::try_from(rewrite_len - 2).expect("Ethernet multicast rewrite offset fits u8");
+    adjacency.node_lock(index);
+    net.adjacency_delegates_mut().created(index);
+    IP6_LINK_MAIN
+        .get()
+        .expect("IP6 link Main exists during multicast adjacency publication")
+        .links_mut()[sw_if_index as usize]
+        .as_mut()
+        .expect("IP6 link remains enabled during multicast adjacency publication")
+        .multicast_adjacency = Some(index);
+    update_adjacency_output_config(sw_if_index, DpoProto::IP6);
+}
+
+pub(crate) fn ip6_multicast_adjacency(sw_if_index: u32) -> Option<AdjacencyIndex> {
+    IP6_LINK_MAIN
+        .get()
+        .expect("IP6 link Main exists before multicast adjacency lookup")
+        .links()
+        .get(sw_if_index as usize)
+        .copied()
+        .flatten()
+        .and_then(|link| link.multicast_adjacency)
 }
 
 pub fn ip6_add_del_interface_address(
@@ -1303,11 +1428,44 @@ fn ip_interface_feature_init(main: &mut DataPlaneMain) -> hammer_runtime::Runtim
                 )
                 .expect("live interface accepts its default IP4 not-enabled feature");
         }
+        if interfaces
+            .software_interface(sw_if_index)
+            .is_some_and(|interface| interface.is_admin_up())
+        {
+            let fib_index = ip4
+                .fib_index(sw_if_index)
+                .expect("live interface has an IP4 FIB mapping");
+            for index in interface_address_indices(ip4_lookup, sw_if_index) {
+                let address = ip4_lookup
+                    .interface_addresses
+                    .get(index)
+                    .copied()
+                    .expect("IP4 startup address remains occupied");
+                ip4_add_interface_routes(
+                    main,
+                    sw_if_index,
+                    address.address,
+                    address.address_length,
+                    fib_index,
+                );
+            }
+        }
         let ip6 = IP6_MAIN
             .get()
             .expect("IP6 Main exists before feature catch-up");
         let ip6_lookup = unsafe { &*ip6.lookup_main.get() };
         let ip6_enabled = unsafe { &*ip6.ip_enabled_by_sw_if_index.get() };
+        if IP6_LINK_MAIN
+            .get()
+            .expect("IP6 link Main exists before feature catch-up")
+            .links()
+            .get(sw_if_index as usize)
+            .copied()
+            .flatten()
+            .is_some()
+        {
+            ip6_link_install_multicast_adjacency(main, sw_if_index);
+        }
         if ip6_enabled.get(sw_if_index as usize).copied().unwrap_or(0) == 0 {
             let features = FeatureMain::global()?;
             let feature = features
@@ -1322,6 +1480,28 @@ fn ip_interface_feature_init(main: &mut DataPlaneMain) -> hammer_runtime::Runtim
                     &[],
                 )
                 .expect("live interface accepts its default IP6 not-enabled feature");
+        }
+        if interfaces
+            .software_interface(sw_if_index)
+            .is_some_and(|interface| interface.is_admin_up())
+        {
+            let fib_index = ip6
+                .fib_index(sw_if_index)
+                .expect("live interface has an IP6 FIB mapping");
+            for index in interface_address_indices(ip6_lookup, sw_if_index) {
+                let address = ip6_lookup
+                    .interface_addresses
+                    .get(index)
+                    .copied()
+                    .expect("IP6 startup address remains occupied");
+                ip6_add_interface_routes(
+                    main,
+                    sw_if_index,
+                    address.address,
+                    address.address_length,
+                    fib_index,
+                );
+            }
         }
     }
     Ok(())
@@ -1425,25 +1605,21 @@ mod tests {
         hammer_service::feature::feature_arc_init(&mut data_plane).unwrap();
         (super::__INIT_FN_IP_INTERFACE_FEATURE_INIT.func)(&mut data_plane).unwrap();
 
-        let hardware = interfaces
-            .register_hardware_interface(
-                &mut data_plane,
-                interfaces.device_class_index("local"),
-                1,
-                interfaces.hw_class_index("local"),
-                0,
-            )
-            .unwrap();
+        let hardware = interfaces.register_interface(
+            &mut data_plane,
+            interfaces.device_class_index("local"),
+            1,
+            interfaces.hw_class_index("local"),
+            0,
+        );
         let sw_if_index = interfaces.hardware_interface(hardware).sw_if_index();
-        let disabled_hardware = interfaces
-            .register_hardware_interface(
-                &mut data_plane,
-                interfaces.device_class_index("local"),
-                2,
-                interfaces.hw_class_index("local"),
-                0,
-            )
-            .unwrap();
+        let disabled_hardware = interfaces.register_interface(
+            &mut data_plane,
+            interfaces.device_class_index("local"),
+            2,
+            interfaces.hw_class_index("local"),
+            0,
+        );
         let disabled_sw_if_index = interfaces
             .hardware_interface(disabled_hardware)
             .sw_if_index();
@@ -1734,12 +1910,8 @@ mod tests {
             -61
         );
 
-        interfaces
-            .delete_hardware_interface(&mut data_plane, hardware)
-            .unwrap();
-        interfaces
-            .delete_hardware_interface(&mut data_plane, disabled_hardware)
-            .unwrap();
+        interfaces.delete_hardware_interface(&mut data_plane, hardware);
+        interfaces.delete_hardware_interface(&mut data_plane, disabled_hardware);
         assert_eq!(
             crate::lookup::fib_table_get_index_for_sw_if_index(IpVersion::V4, sw_if_index),
             None
