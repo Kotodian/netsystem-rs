@@ -32,7 +32,6 @@ use hammer_runtime::{
 use crate::session::app::AppWorkerError;
 use crate::session::application::{ApplicationMain, application_main};
 use crate::session::error::{SessionError, SessionQueueError};
-use crate::session::lookup::SessionEndpointLookup;
 use crate::session::node::{AppSessionInputNode, SessionQueueTransportDispatch};
 use crate::session::protocol::SessionAppVft;
 use crate::session::state::SessionState;
@@ -508,7 +507,6 @@ impl SessionWorkerSlot {
 pub struct SessionMain {
     workers: Box<[SessionWorkerSlot]>,
     listeners: UnsafeCell<Pool<SessionListener>>,
-    endpoint_lookup: SessionEndpointLookup,
 }
 
 /// The process-global Session authority, published by `session_init`.
@@ -549,7 +547,6 @@ impl SessionMain {
         let main = Self {
             workers,
             listeners: UnsafeCell::new(Pool::new()),
-            endpoint_lookup: SessionEndpointLookup::new(),
         };
         assert!(
             SESSION_MAIN.set(main).is_ok(),
@@ -618,55 +615,6 @@ impl SessionMain {
             .load(Ordering::Acquire)
     }
 
-    pub(crate) fn add_connection(
-        &self,
-        local: std::net::SocketAddr,
-        remote: std::net::SocketAddr,
-        transport: u8,
-        handle: SessionHandle,
-    ) -> bool {
-        self.endpoint_lookup
-            .add_connection(local, remote, transport, handle)
-    }
-
-    pub(crate) fn del_connection(
-        &self,
-        local: std::net::SocketAddr,
-        remote: std::net::SocketAddr,
-        transport: u8,
-    ) -> bool {
-        self.endpoint_lookup
-            .del_connection(local, remote, transport)
-    }
-
-    pub(crate) fn replace_connection(
-        &self,
-        local: std::net::SocketAddr,
-        remote: std::net::SocketAddr,
-        transport: u8,
-        new_handle: SessionHandle,
-    ) -> bool {
-        if self
-            .endpoint_lookup
-            .del_connection(local, remote, transport)
-        {
-            self.endpoint_lookup
-                .add_connection(local, remote, transport, new_handle)
-        } else {
-            false
-        }
-    }
-
-    pub fn lookup_connection(
-        &self,
-        local: std::net::SocketAddr,
-        remote: std::net::SocketAddr,
-        transport: u8,
-    ) -> Option<SessionHandle> {
-        self.endpoint_lookup
-            .lookup_connection(local, remote, transport)
-    }
-
     pub fn program_thread_migration(
         &self,
         runtime: &DataPlaneMain,
@@ -675,7 +623,6 @@ impl SessionMain {
         tuple: SessionTuple,
         dgram: SessionDgramArgs,
     ) -> SessionMigrateResult {
-        let (transport, local, remote) = tuple;
         if self.session_migration_shutdown() {
             return SessionMigrateResult::Unavailable;
         }
@@ -685,14 +632,6 @@ impl SessionMain {
         if source_worker == target_worker
             || source_worker.slot() >= self.workers.len()
             || target_worker.slot() >= self.workers.len()
-        {
-            return SessionMigrateResult::Unavailable;
-        }
-
-        if self
-            .endpoint_lookup
-            .lookup_connection(local, remote, transport)
-            != Some(old_handle)
         {
             return SessionMigrateResult::Unavailable;
         }
@@ -715,11 +654,8 @@ impl SessionMain {
         SessionMigrateResult::Queued
     }
 
-    pub(crate) fn cancel_migration(&self, tuple: SessionTuple, old_handle: SessionHandle) -> bool {
-        let (transport, local, remote) = tuple;
-        self.endpoint_lookup
-            .lookup_connection(local, remote, transport)
-            == Some(old_handle)
+    pub(crate) fn cancel_migration(&self, _: SessionTuple, _: SessionHandle) -> bool {
+        !self.session_migration_shutdown()
     }
 
     fn wake_worker(&self, runtime: &DataPlaneMain, worker: DataWorkerId) {
@@ -2682,69 +2618,6 @@ impl SessionWorker {
     pub fn pop_session_switch_pool_closed(&self) -> Option<SessionSwitchPoolClosed> {
         self.migration_queues
             .pop_session_switch_pool_closed(self.worker)
-    }
-
-    pub fn insert_session_endpoint(
-        &self,
-        session_id: u32,
-        transport: u8,
-        local: std::net::SocketAddr,
-        remote: std::net::SocketAddr,
-    ) -> RuntimeResult<bool> {
-        let main = SESSION_MAIN
-            .get()
-            .expect("SessionMain is initialized before endpoint publication");
-        Ok(main.add_connection(local, remote, transport, self.session_handle(session_id)))
-    }
-
-    pub fn remove_session_endpoint(
-        &self,
-        transport: u8,
-        local: std::net::SocketAddr,
-        remote: std::net::SocketAddr,
-    ) -> RuntimeResult<bool> {
-        let main = SESSION_MAIN
-            .get()
-            .expect("SessionMain is initialized before endpoint removal");
-        Ok(main.del_connection(local, remote, transport))
-    }
-
-    pub fn replace_session_endpoint(
-        &self,
-        new_session: SessionHandle,
-        transport: u8,
-        local: std::net::SocketAddr,
-        remote: std::net::SocketAddr,
-    ) -> RuntimeResult<bool> {
-        let main = SESSION_MAIN
-            .get()
-            .expect("SessionMain is initialized before endpoint replacement");
-        Ok(main.replace_connection(local, remote, transport, new_session))
-    }
-
-    pub fn publish_session_migration(
-        &self,
-        new_session: SessionHandle,
-        transport: u8,
-        local: std::net::SocketAddr,
-        remote: std::net::SocketAddr,
-    ) -> RuntimeResult<bool> {
-        let main = SESSION_MAIN
-            .get()
-            .expect("SessionMain is initialized before endpoint publication");
-        Ok(main.replace_connection(local, remote, transport, new_session))
-    }
-
-    pub fn lookup_session_endpoint(
-        &self,
-        transport: u8,
-        local: std::net::SocketAddr,
-        remote: std::net::SocketAddr,
-    ) -> RuntimeResult<Option<SessionHandle>> {
-        let main = SESSION_MAIN
-            .get()
-            .expect("SessionMain is initialized before endpoint lookup");
-        Ok(main.lookup_connection(local, remote, transport))
     }
 
     fn finish_transport_creation(&mut self, session_id: u32, index: u32) -> RuntimeResult<()> {

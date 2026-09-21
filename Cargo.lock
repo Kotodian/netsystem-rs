@@ -1160,6 +1160,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "hammer-plugin-session"
+version = "0.1.0"
+dependencies = [
+ "abi_stable",
+ "hammer-component-macros",
+ "hammer-infra",
+ "hammer-runtime",
+ "hammer-service",
+ "linkme",
+ "serde",
+]
+
+[[package]]
 name = "hammer-plugin-tcp"
 version = "0.1.0"
 dependencies = [
@@ -1171,6 +1184,7 @@ dependencies = [
  "hammer-core",
  "hammer-infra",
  "hammer-plugin-ip",
+ "hammer-plugin-session",
  "hammer-runtime",
  "hammer-service",
  "humantime-serde",
@@ -1227,6 +1241,7 @@ dependencies = [
  "hammer-core",
  "hammer-infra",
  "hammer-plugin-ip",
+ "hammer-plugin-session",
  "hammer-runtime",
  "hammer-service",
  "linkme",

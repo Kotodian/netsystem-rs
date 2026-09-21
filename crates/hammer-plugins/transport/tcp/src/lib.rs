@@ -2,7 +2,7 @@
 
 hammer_component_macros::declare_plugin!(
     name = "tcp",
-    load_after = ["ip"],
+    load_after = ["ip", "session"],
     init_functions = [__INIT_FN_TCP_INIT],
     config_functions = [__CONFIG_FN_TCP_CONFIG],
     main_loop_enter_functions = [],

@@ -36,10 +36,12 @@ struct PageAllocState<K, const KVP: usize> {
     hazards: Vec<NonNull<HazardSlot>>,
     freelists: [Vec<u64>; MAX_LOG2_PAGES + 1],
     retired: Vec<RetiredOffset>,
+    memory_size: usize,
+    allocated_bytes: usize,
 }
 
 impl<K: Copy + Default, const KVP: usize> PageAllocState<K, KVP> {
-    fn new(heap: *mut MemHeap) -> Self {
+    fn new(heap: *mut MemHeap, memory_size: usize) -> Self {
         Self {
             heap_pointer: heap,
             blocks: Vec::new(),
@@ -47,6 +49,8 @@ impl<K: Copy + Default, const KVP: usize> PageAllocState<K, KVP> {
             hazards: Vec::new(),
             freelists: core::array::from_fn(|_| Vec::new()),
             retired: Vec::new(),
+            memory_size,
+            allocated_bytes: 0,
         }
     }
 
@@ -67,6 +71,17 @@ impl<K: Copy + Default, const KVP: usize> PageAllocState<K, KVP> {
         }
 
         let page_count = 1usize << log2_pages;
+        let allocation_bytes = page_count
+            .checked_mul(std::mem::size_of::<ValuePage<K, KVP>>())
+            .expect("bihash page allocation size fits usize");
+        let allocated_bytes = self
+            .allocated_bytes
+            .checked_add(allocation_bytes)
+            .expect("bihash page storage size fits usize");
+        assert!(
+            allocated_bytes <= self.memory_size,
+            "bihash page storage exceeds configured memory size"
+        );
         let pages = allocate_in::<ValuePage<K, KVP>, CACHE_LINE>(page_count, unsafe {
             &*self.heap_pointer
         });
@@ -75,6 +90,7 @@ impl<K: Copy + Default, const KVP: usize> PageAllocState<K, KVP> {
             unsafe { pages.as_ptr().add(index).write(ValuePage::new()) };
         }
         self.blocks.push(PageBlock { pages, log2_pages });
+        self.allocated_bytes = allocated_bytes;
         let offset = u64::try_from(self.blocks.len()).expect("bihash allocator offset fits u64");
         let directory = self.grow_directory();
         (offset, Some(directory))
@@ -179,7 +195,7 @@ unsafe impl<K: Copy + Default + Send, const KVP: usize> Send for PageAlloc<K, KV
 unsafe impl<K: Copy + Default + Send, const KVP: usize> Sync for PageAlloc<K, KVP> {}
 
 impl<K: Copy + Default, const KVP: usize> PageAlloc<K, KVP> {
-    pub(crate) fn new_in(heap: &MemHeap) -> Self {
+    pub(crate) fn new_in(heap: &MemHeap, memory_size: usize) -> Self {
         let heap = if ptr::eq(heap, MemMain::main_heap()) {
             MemMain::main_heap() as *const MemHeap
         } else {
@@ -187,7 +203,7 @@ impl<K: Copy + Default, const KVP: usize> PageAlloc<K, KVP> {
         }
         .cast_mut();
         Self {
-            state: UnsafeCell::new(PageAllocState::new(heap)),
+            state: UnsafeCell::new(PageAllocState::new(heap, memory_size)),
             busy: AtomicBool::new(false),
             directory: AtomicPtr::new(std::ptr::null_mut()),
         }

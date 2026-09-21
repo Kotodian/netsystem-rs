@@ -45,6 +45,7 @@ pub struct Bihash<K: BihashKey, const KVP: usize> {
     len: AtomicUsize,
     nbuckets: u32,
     log2_nbuckets: u8,
+    memory_size: usize,
 }
 
 impl<K: BihashKey + Default, const KVP: usize> Bihash<K, KVP> {
@@ -53,10 +54,15 @@ impl<K: BihashKey + Default, const KVP: usize> Bihash<K, KVP> {
     /// used to select bucket indices from hash bits.
     #[inline]
     pub fn new(nbuckets: u32) -> Self {
-        Self::with_capacity_in(nbuckets, MemMain::main_heap())
+        Self::with_capacity_in(nbuckets, usize::MAX, MemMain::main_heap())
     }
 
-    pub(crate) fn with_capacity_in(mut nbuckets: u32, heap: &MemHeap) -> Self {
+    #[inline]
+    pub fn with_memory_size(nbuckets: u32, memory_size: u32) -> Self {
+        Self::with_capacity_in(nbuckets, memory_size as usize, MemMain::main_heap())
+    }
+
+    pub(crate) fn with_capacity_in(mut nbuckets: u32, memory_size: usize, heap: &MemHeap) -> Self {
         if nbuckets == 0 {
             nbuckets = 1;
         }
@@ -69,10 +75,11 @@ impl<K: BihashKey + Default, const KVP: usize> Bihash<K, KVP> {
         );
         Self {
             buckets,
-            pages: PageAlloc::new_in(heap),
+            pages: PageAlloc::new_in(heap, memory_size),
             len: AtomicUsize::new(0),
             nbuckets: actual_buckets,
             log2_nbuckets: log2,
+            memory_size,
         }
     }
 
@@ -89,6 +96,11 @@ impl<K: BihashKey + Default, const KVP: usize> Bihash<K, KVP> {
     #[inline]
     pub fn nbuckets(&self) -> u32 {
         self.nbuckets
+    }
+
+    #[inline]
+    pub fn memory_size(&self) -> usize {
+        self.memory_size
     }
 
     #[inline]

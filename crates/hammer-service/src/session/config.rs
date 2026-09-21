@@ -8,7 +8,7 @@ const APP_MQ_CAPACITY: usize = 2_048;
 const APP_MQ_CAPACITY_MIN: usize = 128;
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
-#[serde(deny_unknown_fields, default)]
+#[serde(default)]
 pub struct Session {
     #[serde(default)]
     pub attach_socket_path: Option<String>,

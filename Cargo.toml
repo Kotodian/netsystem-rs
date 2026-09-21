@@ -6,6 +6,7 @@ members = [
     "crates/hammer-component-macros",
     "crates/hammer-runtime",
     "crates/hammer-service",
+    "crates/hammer-plugins/session",
     "crates/hammer-plugins/device/tuntap",
     "crates/hammer-plugins/net/ip",
     "crates/hammer-plugins/net/icmp",
