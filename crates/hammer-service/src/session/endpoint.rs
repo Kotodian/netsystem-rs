@@ -5,7 +5,7 @@ pub struct SessionEndpoint<T> {
 }
 
 impl<T> SessionEndpoint<T> {
-    #[inline]
+    #[inline(always)]
     pub const fn new(transport: T, transport_protocol: u8) -> Self {
         Self {
             transport,
@@ -13,18 +13,13 @@ impl<T> SessionEndpoint<T> {
         }
     }
 
-    #[inline]
+    #[inline(always)]
     pub const fn transport(&self) -> &T {
         &self.transport
     }
 
-    #[inline]
+    #[inline(always)]
     pub const fn transport_protocol(&self) -> u8 {
         self.transport_protocol
-    }
-
-    #[inline]
-    pub fn into_transport(self) -> T {
-        self.transport
     }
 }

@@ -150,7 +150,10 @@ pub use ip::{
     pack_fragment_owner_value, unpack_fragment_owner_value,
 };
 pub use ip::{IpPathFlags, IpRoutePathBehavior};
-pub use lookup::fib_table_get_index_for_sw_if_index;
+pub use lookup::{
+    fib_table_find, fib_table_get_index_for_sw_if_index, fib_table_lock, fib_table_unlock,
+};
+pub use protocol::ip::IpVersion;
 pub use protocol::ip::{write_ipv4_push_header, write_ipv6_push_header};
 
 #[cfg(test)]

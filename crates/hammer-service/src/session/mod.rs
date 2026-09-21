@@ -32,7 +32,7 @@ pub use protocol::{SessionAppVft, register_session_app};
 pub use runtime::{
     SESSION_MAIN, SessionAcceptMetadata, SessionEndpointRole, SessionWorker, session_main,
 };
-pub use table::{SessionTable, SessionTableIndex};
+pub use table::SessionTable;
 
 static SESSION_CONFIG: OnceLock<Session> = OnceLock::new();
 static APP_SERVER: OnceLock<Arc<AppServer>> = OnceLock::new();

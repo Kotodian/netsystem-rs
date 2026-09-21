@@ -6,8 +6,10 @@
 
 pub mod attach;
 pub mod echo;
+mod namespace;
 mod session;
 pub mod vcl;
 
 pub use hammer_runtime::app::{AppSession, AppSessionConfig, AppSessionError, SessionHandle};
 pub use hammer_runtime::{DataWorkerId, SessionListenEndpoint};
+pub use namespace::{AppNamespace, AppNamespaceMain};
