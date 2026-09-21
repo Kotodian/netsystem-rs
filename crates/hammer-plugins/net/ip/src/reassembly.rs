@@ -14,20 +14,15 @@ use hammer_runtime::{
 use hammer_runtime::{RuntimeError, RuntimeResult};
 
 use crate::config::{NetworkIpConfig, ReassemblyConfig};
-use crate::ip::{
-    IpFragmentKey, IpProtocol, IpVersion, ParsedIpFragment, ip_header,
-    parse_ip_fragment_with_chain_len,
+use crate::ip::{IpFragmentKey, IpVersion};
+use crate::protocol::ip::{
+    IPV4_FLAG_MORE_FRAGMENTS, IPV4_FRAGMENT_OFFSET_MASK, IPV4_HEADER_MIN_LEN,
+    IPV6_FRAGMENT_HEADER_LEN, IPV6_HEADER_LEN, IPV6_NEXT_HEADER_FRAGMENT, Ipv4Header,
+    Ipv6FragmentHeader, Ipv6Header,
 };
 use hammer_service::opaque::NetworkOpaque;
+use zerocopy::FromBytes;
 
-const IPV4_HEADER_MIN_LEN: usize = 20;
-const IPV6_HEADER_LEN: usize = 40;
-const IPV6_FRAGMENT_HEADER_LEN: usize = 8;
-const IPV4_FLAGS_FRAGMENT_OFFSET: usize = 6;
-const IPV4_TOTAL_LENGTH_OFFSET: usize = 2;
-const IPV4_HEADER_CHECKSUM_OFFSET: usize = 10;
-const IPV6_PAYLOAD_LENGTH_OFFSET: usize = 4;
-const IPV6_NEXT_HEADER_OFFSET: usize = 6;
 const DEFAULT_REASSEMBLY_TIMEOUT: Duration = Duration::from_millis(100);
 const REASSEMBLY_EXPIRE_WALK_INTERVAL: Duration = Duration::from_millis(50);
 const DEFAULT_MAX_REASSEMBLIES: usize = 1024;
@@ -532,11 +527,106 @@ impl IpReassemblyWorker {
         version: IpVersion,
     ) -> RuntimeResult<()> {
         let current_worker = self.worker;
-        let buffer = runtime.buffer(index);
-        let fragment = match parse_ip_fragment_with_chain_len(
-            buffer.current(),
-            buffer.total_len_not_including_first(),
-        ) {
+        let fragment = {
+            let buffer = runtime.buffer(index);
+            let packet = buffer.current();
+            let chain_len = packet
+                .len()
+                .saturating_add(buffer.total_len_not_including_first());
+            match version {
+                IpVersion::V4 => Ipv4Header::ref_from_prefix(packet)
+                    .map_err(|_| crate::protocol::ip::IpInputError::HeaderTooShort)
+                    .and_then(|(header, _)| {
+                        if header.version() != 4 {
+                            return Err(crate::protocol::ip::IpInputError::Version);
+                        }
+                        let header_len = header.header_len();
+                        if header_len < IPV4_HEADER_MIN_LEN || packet.len() < header_len {
+                            return Err(crate::protocol::ip::IpInputError::HeaderTooShort);
+                        }
+                        let packet_len = header.total_len();
+                        if packet_len < header_len || packet_len > chain_len {
+                            return Err(crate::protocol::ip::IpInputError::BadLength);
+                        }
+                        let fragment = header.flags_fragment();
+                        let start = usize::from(fragment & IPV4_FRAGMENT_OFFSET_MASK) * 8;
+                        let payload_len = packet_len - header_len;
+                        let end = start
+                            .checked_add(payload_len)
+                            .ok_or(crate::protocol::ip::IpInputError::BadLength)?;
+                        let more = fragment & IPV4_FLAG_MORE_FRAGMENTS != 0;
+                        if start == 0 && !more {
+                            return Err(crate::protocol::ip::IpInputError::BadLength);
+                        }
+                        Ok((
+                            IpFragmentKey::V4 {
+                                source: header.source(),
+                                destination: header.destination(),
+                                protocol: header.protocol(),
+                                identification: header.identification(),
+                            },
+                            0,
+                            header_len,
+                            start,
+                            end,
+                            more,
+                        ))
+                    }),
+                IpVersion::V6 => Ipv6Header::ref_from_prefix(packet)
+                    .map_err(|_| crate::protocol::ip::IpInputError::HeaderTooShort)
+                    .and_then(|(header, _)| {
+                        if header.version() != 6 {
+                            return Err(crate::protocol::ip::IpInputError::Version);
+                        }
+                        let packet_len = IPV6_HEADER_LEN
+                            .checked_add(header.payload_len())
+                            .ok_or(crate::protocol::ip::IpInputError::BadLength)?;
+                        if packet_len > chain_len
+                            || header.payload_len() < IPV6_FRAGMENT_HEADER_LEN
+                            || header.next_protocol() != IPV6_NEXT_HEADER_FRAGMENT
+                        {
+                            return Err(crate::protocol::ip::IpInputError::BadLength);
+                        }
+                        let (fragment, _) = Ipv6FragmentHeader::ref_from_prefix(
+                            packet
+                                .get(IPV6_HEADER_LEN..)
+                                .ok_or(crate::protocol::ip::IpInputError::HeaderTooShort)?,
+                        )
+                        .map_err(|_| crate::protocol::ip::IpInputError::HeaderTooShort)?;
+                        let offset_more = fragment.offset_more();
+                        let start = usize::from(offset_more >> 3) * 8;
+                        let payload_len = header.payload_len() - IPV6_FRAGMENT_HEADER_LEN;
+                        let end = start
+                            .checked_add(payload_len)
+                            .ok_or(crate::protocol::ip::IpInputError::BadLength)?;
+                        let more = offset_more & 1 != 0;
+                        if start == 0 && !more {
+                            return Err(crate::protocol::ip::IpInputError::BadLength);
+                        }
+                        Ok((
+                            IpFragmentKey::V6 {
+                                source: header.source(),
+                                destination: header.destination(),
+                                next_header: fragment.next_protocol(),
+                                identification: fragment.identification(),
+                            },
+                            IPV6_HEADER_LEN,
+                            IPV6_HEADER_LEN + IPV6_FRAGMENT_HEADER_LEN,
+                            start,
+                            end,
+                            more,
+                        ))
+                    }),
+            }
+        };
+        let (
+            key,
+            fragment_header_offset,
+            fragment_payload_offset,
+            fragment_start,
+            fragment_end,
+            more_fragments,
+        ) = match fragment {
             Ok(fragment) => fragment,
             Err(_) => {
                 let drop_next = match version {
@@ -566,23 +656,18 @@ impl IpReassemblyWorker {
                 return Ok(());
             }
         };
-        if fragment.version != version {
-            let next = match version {
-                IpVersion::V4 => NodeNext::slot(Ip4ReassemblyNext::Drop),
-                IpVersion::V6 => NodeNext::slot(Ip6ReassemblyNext::Drop),
-            };
-            return Self::emit_local(
-                runtime,
-                node_runtime,
-                out_frame,
-                nexts,
-                out_len,
-                next,
-                index,
-            );
+        {
+            let buffer = runtime.buffer_mut(index);
+            hammer_core::buffer_opaque!(mut buffer => NetworkOpaque)
+                .reassembly_mut()
+                .set_fragment(
+                    fragment_header_offset,
+                    fragment_payload_offset,
+                    fragment_start,
+                    fragment_end,
+                    more_fragments,
+                );
         }
-
-        let key = fragment.key;
         let directory = self
             .directory
             .as_ref()
@@ -661,9 +746,9 @@ impl IpReassemblyWorker {
                     )?;
                     return Ok(());
                 }
-                let ctx_index =
-                    self.contexts
-                        .insert(FragmentContext::new(key, fragment.version, now));
+                let ctx_index = self
+                    .contexts
+                    .insert(FragmentContext::new(key, version, now));
                 if let Some(directory) = directory {
                     let (owner, created) =
                         directory.claim_or_lookup(key, ctx_index, current_worker);
@@ -716,13 +801,15 @@ impl IpReassemblyWorker {
                 .contexts
                 .get_mut(pool_index)
                 .ok_or(IpReassemblyError::FragmentContextMissing)?;
-            if fragment.payload_offset == 0 {
+            if fragment_start == 0 {
                 context.sendout_worker = Some(current_worker);
             }
             let outcome = match context.insert_fragment(
                 runtime,
                 index,
-                fragment,
+                fragment_start,
+                fragment_end,
+                more_fragments,
                 now,
                 self.max_fragments_per_reassembly,
             ) {
@@ -872,10 +959,6 @@ impl IpReassemblyWorker {
             } else if let Some(handoff) = &self.handoff {
                 handoff.directory.remove(key);
             }
-            if let Err(error) = refresh_metadata(runtime, index) {
-                runtime.buffer_free_one(index);
-                return Err(error);
-            }
             if let Some(handoff) = &self.handoff {
                 if sendout != current_worker {
                     let _ = add_packet_trace!(
@@ -1020,15 +1103,13 @@ impl FragmentContext {
         &mut self,
         runtime: &mut DataPlaneMain,
         index: u32,
-        fragment: ParsedIpFragment,
+        start: usize,
+        end: usize,
+        more_fragments: bool,
         now: Instant,
         max_fragments: usize,
     ) -> RuntimeResult<ReassemblyInsert> {
         self.updated_at = now;
-        let start = fragment.payload_offset;
-        let Some(end) = start.checked_add(fragment.payload_len) else {
-            return Ok(ReassemblyInsert::Failed(index));
-        };
         if start == end {
             return Ok(ReassemblyInsert::Drop(index));
         }
@@ -1041,19 +1122,15 @@ impl FragmentContext {
         if self.fragments.len() == max_fragments {
             return Ok(ReassemblyInsert::Failed(index));
         }
-        if !fragment.more_fragments {
+        if !more_fragments {
             if self.total_payload_len.is_some_and(|total| total != end) {
                 return Ok(ReassemblyInsert::Failed(index));
             }
             self.total_payload_len = Some(end);
         }
 
-        self.fragments.push(ReassemblyFragment {
-            index,
-            start,
-            end,
-            header_len: fragment.header_len,
-        });
+        self.fragments
+            .push(ReassemblyFragment { index, start, end });
         self.fragments.sort_by_key(|fragment| fragment.start);
 
         let Some(total_payload_len) = self.total_payload_len else {
@@ -1101,8 +1178,12 @@ impl FragmentContext {
         // Validate every retained range before changing any links. Both VPP
         // full-reassembly finalizers trim against the entire sub-chain length.
         for fragment in &self.fragments {
-            let required = fragment
-                .header_len
+            let payload_offset = hammer_core::buffer_opaque!(
+                runtime.buffer(fragment.index) => NetworkOpaque
+            )
+            .reassembly()
+            .fragment_payload_offset();
+            let required = payload_offset
                 .checked_add(fragment.end - fragment.start)
                 .ok_or(IpReassemblyError::FragmentRangeOverflow)?;
             let mut length = 0usize;
@@ -1130,7 +1211,11 @@ impl FragmentContext {
     ) -> RuntimeResult<ReassemblyInsert> {
         let first_offset = self.first_fragment_offset()?;
         let first = self.fragments[first_offset];
-        let header_len = first.header_len;
+        let header_len = hammer_core::buffer_opaque!(
+            runtime.buffer(first.index) => NetworkOpaque
+        )
+        .reassembly()
+        .fragment_payload_offset();
         if header_len < IPV4_HEADER_MIN_LEN
             || runtime.buffer(first.index).current_len() < header_len
         {
@@ -1156,12 +1241,17 @@ impl FragmentContext {
         }
         {
             let buffer = runtime.buffer_mut(complete);
-            let header = &mut buffer.current_mut()[..header_len];
-            header[IPV4_TOTAL_LENGTH_OFFSET..IPV4_TOTAL_LENGTH_OFFSET + 2]
-                .copy_from_slice(&(total_len as u16).to_be_bytes());
-            header[IPV4_FLAGS_FRAGMENT_OFFSET..IPV4_FLAGS_FRAGMENT_OFFSET + 2]
-                .copy_from_slice(&0u16.to_be_bytes());
-            update_ipv4_header_checksum(header, header_len);
+            {
+                let (header, _) = Ipv4Header::mut_from_prefix(buffer.current_mut())
+                    .map_err(|_| IpReassemblyError::FragmentHeaderInvalid)?;
+                header.set_total_len(total_len as u16);
+                header.set_flags_fragment(0);
+                header.set_checksum(0);
+            }
+            let checksum = internet_checksum(&buffer.current()[..header_len]);
+            let (header, _) = Ipv4Header::mut_from_prefix(buffer.current_mut())
+                .map_err(|_| IpReassemblyError::FragmentHeaderInvalid)?;
+            header.set_checksum(checksum);
         }
         let tail_len = total_len - runtime.buffer(complete).current_len();
         runtime
@@ -1180,7 +1270,17 @@ impl FragmentContext {
     ) -> RuntimeResult<ReassemblyInsert> {
         let first_offset = self.first_fragment_offset()?;
         let first = self.fragments[first_offset];
-        if runtime.buffer(first.index).current_len() < IPV6_HEADER_LEN + IPV6_FRAGMENT_HEADER_LEN {
+        let fragment_header_offset = hammer_core::buffer_opaque!(
+            runtime.buffer(first.index) => NetworkOpaque
+        )
+        .reassembly()
+        .fragment_header_offset();
+        let fragment_payload_offset = hammer_core::buffer_opaque!(
+            runtime.buffer(first.index) => NetworkOpaque
+        )
+        .reassembly()
+        .fragment_payload_offset();
+        if runtime.buffer(first.index).current_len() < fragment_payload_offset {
             return Err(IpReassemblyError::FragmentHeaderInvalid.into());
         }
         let payload_len = total_payload_len;
@@ -1190,7 +1290,10 @@ impl FragmentContext {
         let complete = first.index;
         let fragment_next_header = {
             let buffer = runtime.buffer(complete);
-            buffer.current()[IPV6_HEADER_LEN]
+            let (fragment, _) =
+                Ipv6FragmentHeader::ref_from_prefix(&buffer.current()[fragment_header_offset..])
+                    .map_err(|_| IpReassemblyError::FragmentHeaderInvalid)?;
+            fragment.next_protocol()
         };
         let mut last = trim_fragment_payload_chain(runtime, &mut self.fragments[0], true);
         while self.fragments.len() > 1 {
@@ -1207,17 +1310,16 @@ impl FragmentContext {
             let segment_len = buffer.current_len();
             // ip6_full_reass_finalize moves only bytes in the first Buffer;
             // subsequent payload segments retain their windows and storage.
-            buffer.current_mut().copy_within(
-                IPV6_HEADER_LEN + IPV6_FRAGMENT_HEADER_LEN..segment_len,
-                IPV6_HEADER_LEN,
-            );
+            buffer
+                .current_mut()
+                .copy_within(fragment_payload_offset..segment_len, fragment_header_offset);
             buffer
                 .truncate(segment_len - IPV6_FRAGMENT_HEADER_LEN)
                 .expect("removing the Fragment Header shortens the first segment");
-            let header = &mut buffer.current_mut()[..IPV6_HEADER_LEN];
-            header[IPV6_PAYLOAD_LENGTH_OFFSET..IPV6_PAYLOAD_LENGTH_OFFSET + 2]
-                .copy_from_slice(&(payload_len as u16).to_be_bytes());
-            header[IPV6_NEXT_HEADER_OFFSET] = fragment_next_header;
+            let (header, _) = Ipv6Header::mut_from_prefix(buffer.current_mut())
+                .map_err(|_| IpReassemblyError::FragmentHeaderInvalid)?;
+            header.set_payload_len(payload_len as u16);
+            header.set_next_protocol(fragment_next_header);
         }
         let tail_len = IPV6_HEADER_LEN + payload_len - runtime.buffer(complete).current_len();
         runtime
@@ -1242,7 +1344,6 @@ struct ReassemblyFragment {
     index: u32,
     start: usize,
     end: usize,
-    header_len: usize,
 }
 
 enum ReassemblyInsert {
@@ -1253,27 +1354,19 @@ enum ReassemblyInsert {
 }
 
 #[inline(always)]
-fn refresh_metadata(runtime: &DataPlaneMain, index: u32) -> RuntimeResult<()> {
-    let buffer = runtime.buffer(index);
-    let network = hammer_core::buffer_opaque!(buffer => NetworkOpaque);
-    let parsed = ip_header(buffer.current(), network.packet_cursor())?;
-    if !matches!(parsed.protocol, IpProtocol::Other(_)) {
-        Ok(())
-    } else {
-        let protocol = u8::from(parsed.protocol);
-        Err(IpReassemblyError::Unsupportedu8 { protocol }.into())
-    }
-}
-
-#[inline(always)]
 fn trim_fragment_payload_chain(
     runtime: &mut DataPlaneMain,
     fragment: &mut ReassemblyFragment,
     keep_header: bool,
 ) -> u32 {
-    let mut skip = if keep_header { 0 } else { fragment.header_len };
+    let payload_offset = hammer_core::buffer_opaque!(
+        runtime.buffer(fragment.index) => NetworkOpaque
+    )
+    .reassembly()
+    .fragment_payload_offset();
+    let mut skip = if keep_header { 0 } else { payload_offset };
     let mut remaining =
-        fragment.end - fragment.start + if keep_header { fragment.header_len } else { 0 };
+        fragment.end - fragment.start + if keep_header { payload_offset } else { 0 };
     let mut next = Some(fragment.index);
     let mut last = None;
     let mut discarded = [0; DEFAULT_BUFFER_FRAME_CAPACITY];
@@ -1314,15 +1407,6 @@ fn trim_fragment_payload_chain(
     );
     runtime.buffer_free_no_next(&discarded[..discarded_len]);
     last.expect("nonempty fragment range retains a segment")
-}
-
-#[inline(always)]
-fn update_ipv4_header_checksum(packet: &mut [u8], header_len: usize) {
-    packet[IPV4_HEADER_CHECKSUM_OFFSET] = 0;
-    packet[IPV4_HEADER_CHECKSUM_OFFSET + 1] = 0;
-    let checksum = internet_checksum(&packet[..header_len]);
-    packet[IPV4_HEADER_CHECKSUM_OFFSET..IPV4_HEADER_CHECKSUM_OFFSET + 2]
-        .copy_from_slice(&checksum.to_be_bytes());
 }
 
 #[cfg(test)]

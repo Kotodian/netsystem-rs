@@ -221,7 +221,12 @@ pub struct NetworkReassemblyOpaque {
     error_next_index: u32,
     owner_thread_index: u16,
     save_rewrite_length: u8,
-    reserved: [u8; 17],
+    fragment_header_offset: [u8; 2],
+    fragment_payload_offset: [u8; 2],
+    fragment_start: [u8; 2],
+    fragment_end: [u8; 2],
+    more_fragments: u8,
+    reserved: [u8; 8],
 }
 
 impl NetworkReassemblyOpaque {
@@ -237,6 +242,55 @@ impl NetworkReassemblyOpaque {
     #[inline]
     pub fn set_handoff_source_worker(&mut self, worker: Option<u16>) {
         self.owner_thread_index = worker.map_or(0, |value| value.saturating_add(1));
+    }
+
+    #[inline]
+    pub fn fragment_header_offset(&self) -> usize {
+        usize::from(u16::from_ne_bytes(self.fragment_header_offset))
+    }
+
+    #[inline]
+    pub fn fragment_payload_offset(&self) -> usize {
+        usize::from(u16::from_ne_bytes(self.fragment_payload_offset))
+    }
+
+    #[inline]
+    pub fn fragment_start(&self) -> usize {
+        usize::from(u16::from_ne_bytes(self.fragment_start))
+    }
+
+    #[inline]
+    pub fn fragment_end(&self) -> usize {
+        usize::from(u16::from_ne_bytes(self.fragment_end))
+    }
+
+    #[inline]
+    pub fn more_fragments(&self) -> bool {
+        self.more_fragments != 0
+    }
+
+    #[inline]
+    pub fn set_fragment(
+        &mut self,
+        header_offset: usize,
+        payload_offset: usize,
+        fragment_start: usize,
+        fragment_end: usize,
+        more_fragments: bool,
+    ) {
+        self.fragment_header_offset = u16::try_from(header_offset)
+            .expect("fragment header offset exceeds u16")
+            .to_ne_bytes();
+        self.fragment_payload_offset = u16::try_from(payload_offset)
+            .expect("fragment payload offset exceeds u16")
+            .to_ne_bytes();
+        self.fragment_start = u16::try_from(fragment_start)
+            .expect("fragment start exceeds u16")
+            .to_ne_bytes();
+        self.fragment_end = u16::try_from(fragment_end)
+            .expect("fragment end exceeds u16")
+            .to_ne_bytes();
+        self.more_fragments = u8::from(more_fragments);
     }
 }
 

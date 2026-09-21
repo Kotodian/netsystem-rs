@@ -2,7 +2,6 @@ use std::hash::Hasher;
 use std::net::IpAddr;
 
 use crate::protocol::ip::{Ipv4Header, Ipv6Header};
-use crate::protocol::wire::read_header;
 use hammer_core::data_plane::{BufferPacketCursor, Frame, NodeId, NodeNext};
 use hammer_infra::checksum::InternetChecksum;
 use hammer_runtime::{
@@ -15,13 +14,14 @@ use hammer_service::feature::FeatureMain;
 use hammer_service::net::{DpoType, NetMain};
 use hammer_service::opaque::{NetworkFlags, NetworkOffloadFlags, NetworkOpaque};
 
-use super::{IpInputError, IpInputTarget, IpProtocol, IpVersion, ParsedIpPacket, ip_header};
+use super::{IpProtocol, IpVersion};
+use zerocopy::FromBytes;
 
 const TCP_HEADER_MIN_LEN: usize = 20;
 const ICMP_HEADER_MIN_LEN: usize = 4;
 
-#[derive(Clone, Copy)]
-#[repr(C, packed)]
+#[derive(zerocopy::FromBytes, zerocopy::IntoBytes, zerocopy::KnownLayout, zerocopy::Immutable)]
+#[repr(C)]
 struct IcmpHeader {
     icmp_type: u8,
     code: u8,
@@ -520,15 +520,52 @@ fn process_index(
         network.ip_mut().rx_sw_if_index = receive_interface;
     }
     let header_offset = network.packet_cursor().network_header_offset();
-    let protocol = match version {
+    let cursor = network.packet_cursor();
+    if cursor.packet_len() == 0 {
+        set_index_node_error(runtime, index, IpLocalError::BadLength)?;
+        return Ok(match version {
+            IpVersion::V4 => NodeNext::slot(Ip4LocalNext::Drop),
+            IpVersion::V6 => NodeNext::slot(Ip6LocalNext::Drop),
+        });
+    }
+    let (protocol, source, destination) = match version {
         IpVersion::V4 => {
-            let header = read_header::<Ipv4Header>(current, header_offset)?;
+            let bytes = current
+                .get(header_offset..)
+                .ok_or(crate::protocol::ip::IpInputError::HeaderTooShort)?;
+            let (header, _) = Ipv4Header::ref_from_prefix(bytes)
+                .map_err(|_| crate::protocol::ip::IpInputError::HeaderTooShort)?;
+            if header.version() != 4 {
+                return Err(crate::protocol::ip::IpInputError::Version.into());
+            }
             if matches!(stage, LocalStage::End) && header.flags_fragment() & 0x3fff != 0 {
                 return Ok(NodeNext::slot(Ip4LocalNext::Reassembly));
             }
-            header.protocol()
+            (
+                IpProtocol::from(header.protocol()),
+                IpAddr::V4(header.source()),
+                IpAddr::V4(header.destination()),
+            )
         }
-        IpVersion::V6 => read_header::<Ipv6Header>(current, header_offset)?.next_protocol(),
+        IpVersion::V6 => {
+            let bytes = current
+                .get(header_offset..)
+                .ok_or(crate::protocol::ip::IpInputError::HeaderTooShort)?;
+            let (header, _) = Ipv6Header::ref_from_prefix(bytes)
+                .map_err(|_| crate::protocol::ip::IpInputError::HeaderTooShort)?;
+            if header.version() != 6 {
+                return Err(crate::protocol::ip::IpInputError::Version.into());
+            }
+            let protocol = network
+                .ip()
+                .ip_protocol()
+                .ok_or(crate::protocol::ip::IpInputError::BadLength)?;
+            (
+                IpProtocol::from(protocol),
+                IpAddr::V6(header.source()),
+                IpAddr::V6(header.destination()),
+            )
+        }
     };
     // SAFETY: the owning main thread mutates these slots only while workers
     // are stopped; only the copied next slot leaves this read.
@@ -540,7 +577,7 @@ fn process_index(
                     .ok_or(RuntimeError::PluginStateNotInitialized { plugin: "ip" })?
                     .lookup_main
                     .get())
-                .local_next_by_ip_protocol[usize::from(protocol)]
+                .local_next_by_ip_protocol[usize::from(u8::from(protocol))]
             }
             IpVersion::V6 => {
                 (*crate::lookup::IP6_MAIN
@@ -548,88 +585,20 @@ fn process_index(
                     .ok_or(RuntimeError::PluginStateNotInitialized { plugin: "ip" })?
                     .lookup_main
                     .get())
-                .local_next_by_ip_protocol[usize::from(protocol)]
+                .local_next_by_ip_protocol[usize::from(u8::from(protocol))]
             }
         }
     };
     if matches!(stage, LocalStage::End) {
         return Ok(protocol_next);
     }
-    let parsed = match ip_header(current, network.packet_cursor()) {
-        Ok(parsed) if parsed.version == version => parsed,
-        _ => {
-            set_index_node_error(runtime, index, IpLocalError::BadLength)?;
-            let resolved = match version {
-                IpVersion::V4 => NodeNext::slot(Ip4LocalNext::Drop),
-                IpVersion::V6 => NodeNext::slot(Ip6LocalNext::Drop),
-            };
-            let _ = add_packet_trace!(
-                runtime,
-                index,
-                IpLocalTrace {
-                    stage: stage.trace_stage(),
-                    version: None,
-                    protocol: None,
-                    transport_header_len: 0,
-                    error: Some(IpLocalError::BadLength.code()),
-                    next: resolved,
-                },
-            );
-            return Ok(resolved);
-        }
-    };
-    match parsed.input_target {
-        IpInputTarget::Drop | IpInputTarget::IcmpError | IpInputTarget::Options => {
-            let error = error_for_input(parsed.input_error);
-            set_index_node_error(runtime, index, error)?;
-            let resolved = match version {
-                IpVersion::V4 => NodeNext::slot(Ip4LocalNext::Drop),
-                IpVersion::V6 => NodeNext::slot(Ip6LocalNext::Drop),
-            };
-            let _ = add_packet_trace!(
-                runtime,
-                index,
-                IpLocalTrace {
-                    stage: stage.trace_stage(),
-                    version: Some(parsed.version),
-                    protocol: Some(parsed.protocol),
-                    transport_header_len: parsed.transport_header_len,
-                    error: Some(error.code()),
-                    next: resolved,
-                },
-            );
-            return Ok(resolved);
-        }
-        IpInputTarget::Reassembly => {
-            refresh_basic_metadata(runtime, index, &parsed, None)?;
-            let resolved = match version {
-                IpVersion::V4 => NodeNext::slot(Ip4LocalNext::Reassembly),
-                IpVersion::V6 => NodeNext::slot(Ip6LocalNext::Reassembly),
-            };
-            let _ = add_packet_trace!(
-                runtime,
-                index,
-                IpLocalTrace {
-                    stage: stage.trace_stage(),
-                    version: Some(parsed.version),
-                    protocol: Some(parsed.protocol),
-                    transport_header_len: parsed.transport_header_len,
-                    error: None,
-                    next: resolved,
-                },
-            );
-            return Ok(resolved);
-        }
-        IpInputTarget::Punt | IpInputTarget::Lookup | IpInputTarget::LookupMulticast => {}
-    }
-
-    let first_len = current.len().min(parsed.packet_len);
+    let first_len = current.len().min(cursor.packet_len());
     let packet = current
         .get(..first_len)
         .ok_or_else(|| RuntimeError::from(crate::protocol::ip::IpInputError::BadLength))?;
-    let transport = match packet.get(parsed.transport_header_offset..) {
+    let transport = match packet.get(cursor.transport_header_offset()..) {
         Some(transport)
-            if parsed.packet_len
+            if cursor.packet_len()
                 <= buffer.current_len() + buffer.total_len_not_including_first() =>
         {
             transport
@@ -645,8 +614,8 @@ fn process_index(
                 index,
                 IpLocalTrace {
                     stage: stage.trace_stage(),
-                    version: Some(parsed.version),
-                    protocol: Some(parsed.protocol),
+                    version: Some(version),
+                    protocol: Some(protocol),
                     transport_header_len: 0,
                     error: Some(IpLocalError::BadLength.code()),
                     next: resolved,
@@ -656,7 +625,12 @@ fn process_index(
         }
     };
 
-    let transport_len = match validate_transport(transport, &parsed) {
+    let transport_len = match validate_transport(
+        transport,
+        protocol,
+        cursor.packet_len(),
+        cursor.transport_header_offset(),
+    ) {
         Ok(transport_len) => transport_len,
         Err(error) => {
             set_index_node_error(runtime, index, error)?;
@@ -669,8 +643,8 @@ fn process_index(
                 index,
                 IpLocalTrace {
                     stage: stage.trace_stage(),
-                    version: Some(parsed.version),
-                    protocol: Some(parsed.protocol),
+                    version: Some(version),
+                    protocol: Some(protocol),
                     transport_header_len: 0,
                     error: Some(error.code()),
                     next: resolved,
@@ -679,13 +653,13 @@ fn process_index(
             return Ok(resolved);
         }
     };
-    let checksum_required = match parsed.protocol {
-        IpProtocol::Tcp => parsed.version == IpVersion::V4,
+    let checksum_required = match protocol {
+        IpProtocol::Tcp => version == IpVersion::V4,
         IpProtocol::Udp => transport[6..8] != [0, 0],
         IpProtocol::Icmpv4 | IpProtocol::Icmpv6 => true,
         IpProtocol::Other(_) => false,
     };
-    let offloaded = match parsed.protocol {
+    let offloaded = match protocol {
         IpProtocol::Tcp => network.oflags.contains(NetworkOffloadFlags::TCP_CHECKSUM),
         IpProtocol::Udp => network.oflags.contains(NetworkOffloadFlags::UDP_CHECKSUM),
         _ => false,
@@ -696,7 +670,15 @@ fn process_index(
         && !checksum_correct
         && !network.flags.contains(NetworkFlags::L4_CHECKSUM_COMPUTED)
     {
-        checksum_correct = l4_checksum(runtime, index, &parsed)? == 0;
+        checksum_correct = l4_checksum(
+            runtime,
+            index,
+            protocol,
+            source,
+            destination,
+            cursor.packet_len(),
+            cursor.transport_header_offset(),
+        )? == 0;
         let buffer = runtime.buffer_mut(index);
         // SAFETY: the frame owns the initialized network overlay exclusively.
         let network = hammer_core::buffer_opaque!(mut buffer => NetworkOpaque);
@@ -713,7 +695,7 @@ fn process_index(
         });
     }
     let net = NetMain::global()?;
-    let source_error = match (parsed.source, parsed.destination) {
+    let source_error = match (source, destination) {
         (IpAddr::V4(source), IpAddr::V4(destination)) => {
             let source_dpo = network
                 .ip()
@@ -741,7 +723,7 @@ fn process_index(
             }
         }
         (IpAddr::V6(source), _)
-            if parsed.protocol != IpProtocol::Icmpv6 && !source.is_unicast_link_local() =>
+            if protocol != IpProtocol::Icmpv6 && !source.is_unicast_link_local() =>
         {
             let source_dpo = crate::lookup::IP6_MAIN.get().and_then(|main| {
                 network
@@ -769,7 +751,7 @@ fn process_index(
             IpVersion::V6 => NodeNext::slot(Ip6LocalNext::Drop),
         });
     }
-    refresh_basic_metadata(runtime, index, &parsed, transport_len)?;
+    refresh_basic_metadata(runtime, index, cursor, transport_len)?;
 
     if stage.is_head_of_feature_arc() {
         // SAFETY: arc indices are published before workers start and never change.
@@ -806,7 +788,7 @@ fn process_index(
             IpVersion::V4 => NodeNext::slot(Ip4LocalNext::Punt),
             IpVersion::V6 => NodeNext::slot(Ip6LocalNext::Punt),
         }
-        && matches!(parsed.protocol, IpProtocol::Other(_))
+        && matches!(protocol, IpProtocol::Other(_))
     {
         set_index_node_error(runtime, index, IpLocalError::UnknownProtocol)?;
         Some(IpLocalError::UnknownProtocol.code())
@@ -818,8 +800,8 @@ fn process_index(
         index,
         IpLocalTrace {
             stage: stage.trace_stage(),
-            version: Some(parsed.version),
-            protocol: Some(parsed.protocol),
+            version: Some(version),
+            protocol: Some(protocol),
             transport_header_len: transport_len.unwrap_or_default(),
             error,
             next: resolved,
@@ -831,9 +813,11 @@ fn process_index(
 #[inline(always)]
 fn validate_transport(
     transport: &[u8],
-    parsed: &ParsedIpPacket,
+    protocol: IpProtocol,
+    packet_len: usize,
+    transport_header_offset: usize,
 ) -> Result<Option<usize>, IpLocalError> {
-    match parsed.protocol {
+    match protocol {
         IpProtocol::Tcp => {
             let header_len = tcp_header_len(transport)?;
             Ok(Some(header_len))
@@ -841,14 +825,13 @@ fn validate_transport(
         IpProtocol::Udp => {
             let header = transport.get(..8).ok_or(IpLocalError::BadTransportHeader)?;
             let length = usize::from(u16::from_be_bytes([header[4], header[5]]));
-            if length < 8 || length > parsed.packet_len - parsed.transport_header_offset {
+            if length < 8 || length > packet_len - transport_header_offset {
                 return Err(IpLocalError::BadLength);
             }
             Ok(Some(8))
         }
         IpProtocol::Icmpv4 | IpProtocol::Icmpv6 => {
-            read_header::<IcmpHeader>(transport, 0)
-                .map_err(|_| IpLocalError::BadTransportHeader)?;
+            IcmpHeader::ref_from_prefix(transport).map_err(|_| IpLocalError::BadTransportHeader)?;
             Ok(Some(ICMP_HEADER_MIN_LEN))
         }
         IpProtocol::Other(_) => Ok(None),
@@ -869,49 +852,49 @@ fn tcp_header_len(transport: &[u8]) -> Result<usize, IpLocalError> {
 fn refresh_basic_metadata(
     runtime: &mut DataPlaneMain,
     index: u32,
-    parsed: &ParsedIpPacket,
+    cursor: BufferPacketCursor,
     transport_header_len: Option<usize>,
 ) -> RuntimeResult<()> {
     let buffer = runtime.buffer_mut(index);
     let transport_header_len = transport_header_len.unwrap_or_default();
     hammer_core::buffer_opaque!(mut buffer => NetworkOpaque).set_packet_cursor(
         BufferPacketCursor::new()
-            .with_packet_len(parsed.packet_len)
-            .with_network_header(parsed.network_header_offset, parsed.network_header_len)
-            .with_transport_header(parsed.transport_header_offset, transport_header_len)
-            .with_transport_payload_offset(parsed.transport_header_offset + transport_header_len),
+            .with_packet_len(cursor.packet_len())
+            .with_network_header(cursor.network_header_offset(), cursor.network_header_len())
+            .with_transport_header(cursor.transport_header_offset(), transport_header_len)
+            .with_transport_payload_offset(cursor.transport_header_offset() + transport_header_len),
     );
     Ok(())
 }
 
 #[inline(always)]
-fn error_for_input(error: IpInputError) -> IpLocalError {
-    match error {
-        IpInputError::BadChecksum => IpLocalError::BadChecksum,
-        _ => IpLocalError::BadLength,
-    }
-}
-
-#[inline(always)]
-fn l4_checksum(runtime: &DataPlaneMain, index: u32, parsed: &ParsedIpPacket) -> RuntimeResult<u16> {
+fn l4_checksum(
+    runtime: &DataPlaneMain,
+    index: u32,
+    protocol: IpProtocol,
+    source: IpAddr,
+    destination: IpAddr,
+    packet_len: usize,
+    transport_header_offset: usize,
+) -> RuntimeResult<u16> {
     let mut checksum: InternetChecksum = Default::default();
-    let mut remaining = parsed.packet_len - parsed.transport_header_offset;
-    match (parsed.source, parsed.destination) {
-        (IpAddr::V4(source), IpAddr::V4(destination)) if parsed.protocol != IpProtocol::Icmpv4 => {
+    let mut remaining = packet_len - transport_header_offset;
+    match (source, destination) {
+        (IpAddr::V4(source), IpAddr::V4(destination)) if protocol != IpProtocol::Icmpv4 => {
             checksum.write(&source.octets());
             checksum.write(&destination.octets());
-            checksum.write(&[0, parsed.protocol.into()]);
+            checksum.write(&[0, protocol.into()]);
             checksum.write(&(remaining as u16).to_be_bytes());
         }
         (IpAddr::V6(source), IpAddr::V6(destination)) => {
             checksum.write(&source.octets());
             checksum.write(&destination.octets());
             checksum.write(&(remaining as u32).to_be_bytes());
-            checksum.write(&[0, 0, 0, parsed.protocol.into()]);
+            checksum.write(&[0, 0, 0, protocol.into()]);
         }
         _ => {}
     }
-    let mut offset = parsed.transport_header_offset;
+    let mut offset = transport_header_offset;
     for segment in runtime.chain(index) {
         let bytes = segment.current();
         if offset >= bytes.len() {
