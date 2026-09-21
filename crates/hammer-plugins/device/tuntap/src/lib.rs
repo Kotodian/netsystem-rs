@@ -121,7 +121,6 @@ struct TuntapMain {
     file: UnsafeCell<TuntapFile>,
     rx_next: OnceLock<TuntapRxNext>,
     threads: Box<[TuntapThreadSlot]>,
-    provisioning_fd: OwnedFd,
     mtu_bytes: u32,
     hw_if_index: u32,
     sw_if_index: u32,
@@ -182,16 +181,16 @@ impl TuntapMain {
             }
             return Err(TuntapConfigError::Socket { source }.into());
         }
-        let provisioning = unsafe { OwnedFd::from_raw_fd(descriptor) };
+        let host = unsafe { OwnedFd::from_raw_fd(descriptor) };
         request.ifr_ifru.ifru_mtu = config.mtu as libc::c_int;
-        if unsafe { libc::ioctl(provisioning.as_raw_fd(), libc::SIOCSIFMTU, &mut request) } < 0 {
+        if unsafe { libc::ioctl(host.as_raw_fd(), libc::SIOCSIFMTU, &mut request) } < 0 {
             let source = io::Error::last_os_error();
             if unsafe { libc::ioctl(control.as_raw_fd(), libc::TUNSETPERSIST, 0) } < 0 {
                 tracing::warn!(source = %io::Error::last_os_error(), "tuntap persistence cleanup failed");
             }
             return Err(TuntapConfigError::SetMtu { source }.into());
         }
-        if unsafe { libc::ioctl(provisioning.as_raw_fd(), libc::SIOCGIFFLAGS, &mut request) } < 0 {
+        if unsafe { libc::ioctl(host.as_raw_fd(), libc::SIOCGIFFLAGS, &mut request) } < 0 {
             let source = io::Error::last_os_error();
             if unsafe { libc::ioctl(control.as_raw_fd(), libc::TUNSETPERSIST, 0) } < 0 {
                 tracing::warn!(source = %io::Error::last_os_error(), "tuntap persistence cleanup failed");
@@ -201,13 +200,14 @@ impl TuntapMain {
         unsafe {
             request.ifr_ifru.ifru_flags |= (libc::IFF_UP | libc::IFF_RUNNING) as libc::c_short;
         }
-        if unsafe { libc::ioctl(provisioning.as_raw_fd(), libc::SIOCSIFFLAGS, &mut request) } < 0 {
+        if unsafe { libc::ioctl(host.as_raw_fd(), libc::SIOCSIFFLAGS, &mut request) } < 0 {
             let source = io::Error::last_os_error();
             if unsafe { libc::ioctl(control.as_raw_fd(), libc::TUNSETPERSIST, 0) } < 0 {
                 tracing::warn!(source = %io::Error::last_os_error(), "tuntap persistence cleanup failed");
             }
             return Err(TuntapConfigError::SetInterfaceFlags { source }.into());
         }
+        drop(host);
 
         let interfaces = NetMain::global()?.interface_main();
         let hw_if_index = interfaces.register_interface(
@@ -272,7 +272,6 @@ impl TuntapMain {
             file: UnsafeCell::new(file),
             rx_next: OnceLock::new(),
             threads,
-            provisioning_fd: provisioning,
             mtu_bytes: config.mtu,
             hw_if_index,
             sw_if_index,
@@ -655,7 +654,7 @@ enum TuntapConfigError {
         #[source]
         source: io::Error,
     },
-    #[error("open TUN provisioning socket")]
+    #[error("open host interface socket")]
     Socket {
         #[source]
         source: io::Error,
@@ -727,29 +726,25 @@ fn tuntap_exit(data_plane: &mut DataPlaneMain) -> RuntimeResult<()> {
         let mut request: libc::ifreq = unsafe { std::mem::zeroed() };
         if unsafe { libc::ioctl(control.as_raw_fd(), libc::TUNGETIFF, &mut request) } < 0 {
             tracing::warn!(source = %io::Error::last_os_error(), "tuntap interface identity cleanup failed");
-        } else if unsafe {
-            libc::ioctl(
-                main.provisioning_fd.as_raw_fd(),
-                libc::SIOCGIFFLAGS,
-                &mut request,
-            )
-        } < 0
-        {
-            tracing::warn!(source = %io::Error::last_os_error(), "tuntap host flags cleanup failed");
         } else {
-            unsafe {
-                request.ifr_ifru.ifru_flags &=
-                    !((libc::IFF_UP | libc::IFF_RUNNING) as libc::c_short);
-            }
-            if unsafe {
-                libc::ioctl(
-                    main.provisioning_fd.as_raw_fd(),
-                    libc::SIOCSIFFLAGS,
-                    &mut request,
-                )
-            } < 0
-            {
-                tracing::warn!(source = %io::Error::last_os_error(), "tuntap host state cleanup failed");
+            let descriptor = unsafe { libc::socket(libc::AF_INET, libc::SOCK_STREAM, 0) };
+            if descriptor < 0 {
+                tracing::warn!(source = %io::Error::last_os_error(), "tuntap host interface socket cleanup failed");
+            } else {
+                let host = unsafe { OwnedFd::from_raw_fd(descriptor) };
+                if unsafe { libc::ioctl(host.as_raw_fd(), libc::SIOCGIFFLAGS, &mut request) } < 0 {
+                    tracing::warn!(source = %io::Error::last_os_error(), "tuntap host flags cleanup failed");
+                } else {
+                    unsafe {
+                        request.ifr_ifru.ifru_flags &=
+                            !((libc::IFF_UP | libc::IFF_RUNNING) as libc::c_short);
+                    }
+                    if unsafe { libc::ioctl(host.as_raw_fd(), libc::SIOCSIFFLAGS, &mut request) }
+                        < 0
+                    {
+                        tracing::warn!(source = %io::Error::last_os_error(), "tuntap host state cleanup failed");
+                    }
+                }
             }
         }
         if unsafe { libc::ioctl(control.as_raw_fd(), libc::TUNSETPERSIST, 0) } < 0 {

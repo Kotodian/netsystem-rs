@@ -1332,7 +1332,6 @@ struct TuntapMain {
     file: UnsafeCell<TuntapFile>,
     rx_next: OnceLock<TuntapRxNext>,
     threads: Box<[TuntapThreadSlot]>,
-    provisioning_fd: OwnedFd,
     mtu_bytes: u32,
     hw_if_index: u32,
     sw_if_index: u32,
@@ -1471,7 +1470,7 @@ Buffer、不得调用Feature Arc、不得直接执行Node。随后固定main-loo
 `schedule_interrupt_driver_nodes`提交空frame，真正I/O只在`tuntap-rx` process发生。
 
 `FileMain::add`失败时，FileMain撤销其pool insertion并drop duplicate；tuntap config再按已有初始化
-cleanup删除已创建interface、撤销TUN persistence并关闭control/provisioning descriptors，原样返回
+cleanup删除已创建interface、撤销TUN persistence并关闭control descriptor，原样返回
 已有`RuntimeError`及source。不得翻译为InterfaceError或新Tuntap错误。成功add只把active
 `TuntapFile`保留在尚未发布的local `TuntapMain`中；第9.5节IP owner address add也成功后，config才
 一次性发布`TUNTAP_MAIN`。任何fallible startup操作都不得发生在该publication之后。
@@ -1674,14 +1673,15 @@ ownership固定如下：
 | --- | --- | --- | --- |
 | FileMain duplicate descriptor与poll interest | runtime `FileMain` | read-ready、`readv`、`writev` | `FileMain::delete(file_index)`删除interest并close |
 | TUN control descriptor | tuntap `TuntapFile::Active` | config ioctl、exit `TUNSETPERSIST` | exit把state改为`Closed`并drop |
-| provisioning socket | tuntap | host TUN MTU/flags provisioning | exit在对应ioctl后close |
+| host interface socket | tuntap config/exit调用栈 | host TUN MTU/flags ioctl | 对应操作完成后由局部`OwnedFd`立即close，不存入`TuntapMain` |
 | RX free buffer-index cache | executing runtime thread的`TuntapThreadState` | 仅`tuntap-rx` | 先删File interest，再由同一thread `buffer_free_no_next` |
 | TX iovecs scratch | 每thread的`TuntapThreadState` | `tuntap_tx`/`tuntap_intfc_tx` | process lifetime，无payload ownership |
 | linked RX packet | graph Frame | feature/input/downstream nodes | 正常graph terminal释放 |
 
-exit在final WorkerBarrier内执行，固定顺序是：停止host interface、在control descriptor撤销persistence、
+exit在final WorkerBarrier内执行，固定顺序是：临时创建host interface socket并停止host interface、在control descriptor撤销persistence、
 调用`FileMain::delete`停止readiness并close data duplicate、释放thread 0尚未消费的RX cache、关闭control
-和provisioning descriptors、删除interface。cleanup仍按VPP warning policy尽量执行全部步骤；
+descriptor、删除interface。config与exit的host interface socket都只存在于对应调用栈，不进入`TuntapMain`；
+cleanup仍按VPP warning policy尽量执行全部步骤；
 撤销persistence或停止host interface失败只warning并继续；`FileMain::delete`返回的既有
 `RuntimeError`是exit唯一保留并最终返回的typed error，后续cleanup warning不得替换它；`Ok(false)`表示
 active `file_index`已失效这一内部lifecycle invariant，立即assert/panic。无论delete返回error与否，都继续
