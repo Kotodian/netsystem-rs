@@ -14,7 +14,7 @@ use hammer_runtime::{DataPlaneMain, Node, NodeProcessFn, NodeRuntime, RuntimeRes
 use hammer_service::net::adj::AdjacencyMain;
 use hammer_service::net::adj_glean::AdjacencyGleanMain;
 use hammer_service::net::adj_nbr::AdjacencyNeighborMain;
-use hammer_service::net::{DpoId, DpoProto, DpoType, NetMain};
+use hammer_service::net::{DpoId, DpoProto, DpoType, FibSource, NetMain};
 use hammer_service::opaque::NetworkOpaque;
 
 use crate::adjacency::{Ip4FibProtocol, Ip6FibProtocol};
@@ -226,6 +226,8 @@ pub struct Ip4Main {
     pub(crate) icmp_throttle: Vec<RefCell<Throttle>>,
     pub(crate) clock_origin: Instant,
     pub(crate) unicast_tables: UnsafeCell<Vec<Ip4FibTable>>,
+    fib_table_ids: UnsafeCell<Vec<u32>>,
+    fib_table_locks: UnsafeCell<Vec<Vec<(FibSource, u32)>>>,
 }
 
 impl Ip4Main {
@@ -246,6 +248,8 @@ impl Ip4Main {
             icmp_throttle: Vec::new(),
             clock_origin: Instant::now(),
             unicast_tables: UnsafeCell::new(vec![Ip4FibTable::new(Default::default())]),
+            fib_table_ids: UnsafeCell::new(vec![0]),
+            fib_table_locks: UnsafeCell::new(vec![Vec::new()]),
         }
     }
 
@@ -290,6 +294,8 @@ pub struct Ip6Main {
     pub(crate) icmp_throttle: Vec<RefCell<Throttle>>,
     pub(crate) clock_origin: Instant,
     pub(crate) unicast_tables: UnsafeCell<Vec<Ip6FibTable>>,
+    fib_table_ids: UnsafeCell<Vec<u32>>,
+    fib_table_locks: UnsafeCell<Vec<Vec<(FibSource, u32)>>>,
 }
 
 impl Ip6Main {
@@ -310,6 +316,8 @@ impl Ip6Main {
             icmp_throttle: Vec::new(),
             clock_origin: Instant::now(),
             unicast_tables: UnsafeCell::new(vec![Ip6FibTable::new(Default::default())]),
+            fib_table_ids: UnsafeCell::new(vec![0]),
+            fib_table_locks: UnsafeCell::new(vec![Vec::new()]),
         }
     }
 
@@ -360,6 +368,85 @@ pub fn fib_table_get_index_for_sw_if_index(version: IpVersion, sw_if_index: u32)
             .get()
             .expect("IP6 Main is initialized before FIB selection")
             .fib_index(sw_if_index),
+    }
+}
+
+pub fn fib_table_find(version: IpVersion, table_id: u32) -> Option<u32> {
+    let table_ids = match version {
+        IpVersion::V4 => unsafe {
+            &*IP4_MAIN
+                .get()
+                .expect("IP4 Main is initialized before FIB lookup")
+                .fib_table_ids
+                .get()
+        },
+        IpVersion::V6 => unsafe {
+            &*IP6_MAIN
+                .get()
+                .expect("IP6 Main is initialized before FIB lookup")
+                .fib_table_ids
+                .get()
+        },
+    };
+    table_ids
+        .iter()
+        .position(|candidate| *candidate == table_id)
+        .and_then(|index| u32::try_from(index).ok())
+}
+
+pub fn fib_table_lock(version: IpVersion, fib_index: u32, source: FibSource) {
+    hammer_runtime::ensure_main_thread_with_barrier()
+        .expect("FIB table locking requires the Main Thread and WorkerBarrier");
+    let locks = fib_table_locks_mut(version);
+    let table_locks = locks
+        .get_mut(fib_index as usize)
+        .expect("FIB table lock names an installed table");
+    if let Some((_, count)) = table_locks
+        .iter_mut()
+        .find(|(candidate, _)| *candidate == source)
+    {
+        *count = count.checked_add(1).expect("FIB table lock count overflow");
+    } else {
+        table_locks.push((source, 1));
+    }
+}
+
+pub fn fib_table_unlock(version: IpVersion, fib_index: u32, source: FibSource) {
+    hammer_runtime::ensure_main_thread_with_barrier()
+        .expect("FIB table unlocking requires the Main Thread and WorkerBarrier");
+    let locks = fib_table_locks_mut(version);
+    let table_locks = locks
+        .get_mut(fib_index as usize)
+        .expect("FIB table unlock names an installed table");
+    let position = table_locks
+        .iter()
+        .position(|(candidate, _)| *candidate == source)
+        .expect("FIB table unlock requires a matching source lock");
+    let count = &mut table_locks[position].1;
+    *count = count
+        .checked_sub(1)
+        .expect("FIB table lock count underflow");
+    if *count == 0 {
+        table_locks.remove(position);
+    }
+}
+
+fn fib_table_locks_mut(version: IpVersion) -> &'static mut Vec<Vec<(FibSource, u32)>> {
+    match version {
+        IpVersion::V4 => unsafe {
+            &mut *IP4_MAIN
+                .get()
+                .expect("IP4 Main is initialized before FIB locking")
+                .fib_table_locks
+                .get()
+        },
+        IpVersion::V6 => unsafe {
+            &mut *IP6_MAIN
+                .get()
+                .expect("IP6 Main is initialized before FIB locking")
+                .fib_table_locks
+                .get()
+        },
     }
 }
 

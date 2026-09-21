@@ -1,7 +1,5 @@
 use hammer_runtime::app::SessionHandle;
 
-use super::SessionTableIndex;
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SessionLookupResult<H> {
     Session(SessionHandle),
@@ -21,16 +19,12 @@ pub trait SessionLookup {
 
     fn add_session_endpoint(
         &self,
-        table_index: SessionTableIndex,
+        table_index: u32,
         endpoint: &Self::Endpoint,
         handle: SessionHandle,
     ) -> bool;
 
-    fn remove_session_endpoint(
-        &self,
-        table_index: SessionTableIndex,
-        endpoint: &Self::Endpoint,
-    ) -> bool;
+    fn remove_session_endpoint(&self, table_index: u32, endpoint: &Self::Endpoint) -> bool;
 
     fn add_half_open(&self, connection: &Self::ConnectionId, handle: Self::HalfOpenHandle);
 
@@ -58,7 +52,7 @@ pub trait SessionLookup {
 
     fn lookup_listener(
         &self,
-        table_index: SessionTableIndex,
+        table_index: u32,
         endpoint: &Self::Endpoint,
         use_wildcard: bool,
     ) -> Option<SessionHandle>;

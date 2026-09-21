@@ -53,12 +53,13 @@ impl<T> SessionEndpoint<T> {
     pub const fn new(transport: T, transport_protocol: u8) -> Self;
     pub const fn transport(&self) -> &T;
     pub const fn transport_protocol(&self) -> u8;
-    pub fn into_transport(self) -> T;
 }
 ```
 
 `SessionEndpoint<T>` 是拥有数据的参数化类型，不是空 marker trait。service 不增加
 `address()`、`family()`、`fib_index()` 或 key builder；这些事实只存在于 concrete `T`。
+service 也不声明无法通过 orphan rule 合法实现的 generic consuming conversion。concrete owner
+按需要实现 `From<ConcreteSessionEndpoint> for ConcreteTransportEndpoint`，调用方使用 `Into`。
 
 ### 2.2 SessionTable
 
@@ -81,22 +82,8 @@ impl<S, H> SessionTable<S, H> {
 该类型不提供统一 key、不做 family dispatch，也不包含配置、FIB mapping、local/global flag、
 rules handle 或 namespace state。它只是 `session_table.c` 中两类 hash 所共有的参数化结构。
 
-Session table index 是 Session domain identity，保留 VPP 的 `u32::MAX` invalid sentinel，不用
-`Option` 改写 mapping：
-
-```rust
-#[repr(transparent)]
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct SessionTableIndex(u32);
-
-impl SessionTableIndex {
-    pub const INVALID: Self = Self(u32::MAX);
-
-    pub const fn new(index: u32) -> Self;
-    pub const fn value(self) -> u32;
-    pub const fn is_valid(self) -> bool;
-}
-```
+Session table index 直接使用 `u32`，保留 VPP 的 `u32::MAX` invalid sentinel，不增加 index
+newtype，也不用 `Option` 改写 mapping。
 
 ## 3. Service 的行为边界
 
@@ -129,14 +116,14 @@ pub trait SessionLookup {
 
     fn add_session_endpoint(
         &self,
-        table_index: SessionTableIndex,
+        table_index: u32,
         endpoint: &Self::Endpoint,
         handle: SessionHandle,
     ) -> bool;
 
     fn remove_session_endpoint(
         &self,
-        table_index: SessionTableIndex,
+        table_index: u32,
         endpoint: &Self::Endpoint,
     ) -> bool;
 
@@ -176,7 +163,7 @@ pub trait SessionLookup {
 
     fn lookup_listener(
         &self,
-        table_index: SessionTableIndex,
+        table_index: u32,
         endpoint: &Self::Endpoint,
         use_wildcard: bool,
     ) -> Option<SessionHandle>;
@@ -226,6 +213,10 @@ pub struct IpTransportEndpointConfig {
 }
 
 pub type IpSessionEndpoint = SessionEndpoint<IpTransportEndpointConfig>;
+
+impl From<IpSessionEndpoint> for IpTransportEndpointConfig {
+    fn from(endpoint: IpSessionEndpoint) -> Self;
+}
 ```
 
 `port` 保持 network byte order。`mss == 0`、`sw_if_index == u32::MAX`、
@@ -236,7 +227,7 @@ transport connection 的 lookup identity 对应 VPP `transport_connection_t` 的
 前缀。enum 使 mixed-family identity 无法构造：
 
 ```rust
-use std::net::{Ipv4Addr, Ipv6Addr};
+use std::net::{Ipv4Addr, Ipv6Addr, SocketAddrV4, SocketAddrV6};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum IpTransportConnectionId {
@@ -258,6 +249,14 @@ pub enum IpTransportConnectionId {
         dscp: u8,
         transport_protocol: u8,
     },
+}
+
+impl From<(u32, SocketAddrV4, SocketAddrV4, u8)> for IpTransportConnectionId {
+    fn from(value: (u32, SocketAddrV4, SocketAddrV4, u8)) -> Self;
+}
+
+impl From<(u32, SocketAddrV6, SocketAddrV6, u8)> for IpTransportConnectionId {
+    fn from(value: (u32, SocketAddrV6, SocketAddrV6, u8)) -> Self;
 }
 
 #[repr(transparent)]
@@ -307,8 +306,6 @@ lookup owner 保存 VPP 的 table pool 和两个 FIB mappings：
 use std::cell::UnsafeCell;
 
 use hammer_infra::pool::Pool;
-use hammer_service::session::SessionTableIndex;
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum IpSessionFamily {
     Ip4,
@@ -332,25 +329,22 @@ impl IpSessionLookup {
         &self,
         family: IpSessionFamily,
         fib_index: u32,
-    ) -> SessionTableIndex;
+    ) -> u32;
 
     pub fn get_or_alloc_table_index(
         &self,
         family: IpSessionFamily,
         fib_index: u32,
-    ) -> SessionTableIndex;
+    ) -> u32;
 
-    pub fn table_memory_size(&self, table_index: SessionTableIndex) -> u64;
+    pub fn table_memory_size(&self, table_index: u32) -> u64;
 }
 ```
 
-mapping slot 是 `u32`，未分配值是 `SessionTableIndex::INVALID.value()`：
+mapping slot 是 `u32`，未分配值是 `u32::MAX`：
 
 ```rust
-mapping.resize(
-    fib_index as usize + 1,
-    SessionTableIndex::INVALID.value(),
-);
+mapping.resize(fib_index as usize + 1, u32::MAX);
 ```
 
 初始化先分配 FIB index 0 的 IP4 table，再分配 FIB index 0 的 IP6 table，与
@@ -533,8 +527,7 @@ plugin 分别声明对 `ip` 与 `session` 的生命周期依赖，plugin/session
 ## 11. 第一阶段迁移顺序
 
 1. 在 `hammer-service::session` 增加参数化 `SessionEndpoint<T>`、
-   `SessionTable<S, H>`、`SessionTableIndex`、`SessionLookup` 和
-   `SessionLookupResult<H>`。
+   `SessionTable<S, H>`、`SessionLookup` 和 `SessionLookupResult<H>`。
 2. 在 `hammer-infra::bihash` 增加 `with_memory_size`，保持既有 add/overwrite、delete 和 miss
    语义。
 3. 新建 `hammer-plugin-session`，先移植 concrete endpoint、IP4/IP6 key builder、table pool、
@@ -553,8 +546,8 @@ plugin 分别声明对 `ip` 与 `session` 的生命周期依赖，plugin/session
 
 Issue #348 批准以下新增 surface：
 
-- service：`SessionEndpoint<T>`、`SessionTable<S, H>`、`SessionTableIndex`、
-  `SessionLookup` 和 `SessionLookupResult<H>`；
+- service：`SessionEndpoint<T>`、`SessionTable<S, H>`、`SessionLookup` 和
+  `SessionLookupResult<H>`；
 - plugin/session：本 ADR 中的 IP endpoint、connection identity、half-open handle、family、
   table config、lookup owner、global accessor，以及 UDP migration 使用的 compare-current
   replace/remove；

@@ -2,8 +2,10 @@ use std::cell::UnsafeCell;
 use std::net::{Ipv4Addr, Ipv6Addr};
 
 use hammer_infra::pool::Pool;
+use hammer_plugin_ip::{IpVersion, fib_table_lock, fib_table_unlock};
 use hammer_runtime::app::SessionHandle;
-use hammer_service::session::{SessionLookup, SessionLookupResult, SessionTableIndex};
+use hammer_service::net::FibSource;
+use hammer_service::session::{SessionLookup, SessionLookupResult};
 
 use crate::config::IpSessionTableConfig;
 use crate::endpoint::{IpHalfOpenHandle, IpSessionEndpoint, IpTransportConnectionId};
@@ -48,27 +50,22 @@ impl IpSessionLookup {
     }
 
     #[inline]
-    pub fn table_index(&self, family: IpSessionFamily, fib_index: u32) -> SessionTableIndex {
+    pub fn table_index(&self, family: IpSessionFamily, fib_index: u32) -> u32 {
         let state = unsafe { &*self.state.get() };
         state.fib_index_to_table_index[family_index(family)]
             .get(fib_index as usize)
             .copied()
-            .map(SessionTableIndex::new)
-            .unwrap_or(SessionTableIndex::INVALID)
+            .unwrap_or(u32::MAX)
     }
 
-    pub fn get_or_alloc_table_index(
-        &self,
-        family: IpSessionFamily,
-        fib_index: u32,
-    ) -> SessionTableIndex {
+    pub fn get_or_alloc_table_index(&self, family: IpSessionFamily, fib_index: u32) -> u32 {
         assert_ne!(
             fib_index,
             u32::MAX,
             "Session table allocation requires a valid FIB index"
         );
         let table_index = self.table_index(family, fib_index);
-        if table_index.is_valid() {
+        if table_index != u32::MAX {
             return table_index;
         }
 
@@ -83,15 +80,116 @@ impl IpSessionLookup {
         };
         let table_index = state.tables.insert(table);
         let mapping = &mut state.fib_index_to_table_index[family_index(family)];
-        mapping.resize(fib_index as usize + 1, SessionTableIndex::INVALID.value());
+        mapping.resize(fib_index as usize + 1, u32::MAX);
         mapping[fib_index as usize] = table_index;
-        SessionTableIndex::new(table_index)
+        table_index
     }
 
-    pub fn table_memory_size(&self, table_index: SessionTableIndex) -> u64 {
+    pub fn table_memory_size(&self, table_index: u32) -> u64 {
         self.table(table_index)
             .map(IpSessionTable::memory_size)
             .unwrap_or(0)
+    }
+
+    pub fn alloc_local(&self) -> u32 {
+        hammer_runtime::ensure_main_thread_with_barrier()
+            .expect("local Session table allocation requires the Main Thread and WorkerBarrier");
+        let state = unsafe { &mut *self.state.get() };
+        state.tables.insert(IpSessionTable::local(self.config))
+    }
+
+    pub fn bind_local(&self, appns_index: u32, table_index: u32) {
+        hammer_runtime::ensure_main_thread_with_barrier()
+            .expect("local Session table binding requires the Main Thread and WorkerBarrier");
+        let table = self
+            .table_mut(table_index)
+            .expect("local Session table binding names an installed table");
+        assert!(
+            table.is_local(),
+            "local binding requires a local Session table"
+        );
+        assert!(
+            table.appns_indices().is_empty(),
+            "local Session table binds once"
+        );
+        table.appns_indices_mut().push(appns_index);
+    }
+
+    pub fn bind_global(
+        &self,
+        appns_index: u32,
+        family: IpSessionFamily,
+        fib_index: u32,
+        source: FibSource,
+    ) {
+        let table_index = self.get_or_alloc_table_index(family, fib_index);
+        let table = self
+            .table_mut(table_index)
+            .expect("global Session table binding names an installed table");
+        assert!(
+            table.family_matches(matches!(family, IpSessionFamily::Ip4)),
+            "global Session table family matches its FIB"
+        );
+        assert!(
+            !table.appns_indices().contains(&appns_index),
+            "namespace binds to a global Session table once"
+        );
+        table.appns_indices_mut().push(appns_index);
+        fib_table_lock(ip_version(family), fib_index, source);
+    }
+
+    pub fn unbind_global(
+        &self,
+        appns_index: u32,
+        family: IpSessionFamily,
+        fib_index: u32,
+        source: FibSource,
+    ) {
+        hammer_runtime::ensure_main_thread_with_barrier()
+            .expect("global Session table unbinding requires the Main Thread and WorkerBarrier");
+        let table_index = self.table_index(family, fib_index);
+        assert!(
+            table_index != u32::MAX,
+            "global Session table binding must exist"
+        );
+        let state = unsafe { &mut *self.state.get() };
+        let table = state
+            .tables
+            .get_mut(table_index)
+            .expect("global Session table binding remains installed");
+        let position = table
+            .appns_indices()
+            .iter()
+            .position(|candidate| *candidate == appns_index)
+            .expect("namespace must be associated with the global Session table");
+        table.appns_indices_mut().remove(position);
+        fib_table_unlock(ip_version(family), fib_index, source);
+        if table.appns_indices().is_empty() {
+            state.fib_index_to_table_index[family_index(family)][fib_index as usize] = u32::MAX;
+            state
+                .tables
+                .remove(table_index)
+                .expect("unbound global Session table remains installed");
+        }
+    }
+
+    pub fn free_local(&self, appns_index: u32, table_index: u32) {
+        hammer_runtime::ensure_main_thread_with_barrier()
+            .expect("local Session table release requires the Main Thread and WorkerBarrier");
+        let state = unsafe { &mut *self.state.get() };
+        let table = state
+            .tables
+            .get(table_index)
+            .expect("local Session table release names an installed table");
+        assert!(
+            table.is_local(),
+            "local Session table release requires a local table"
+        );
+        assert_eq!(table.appns_indices(), &[appns_index]);
+        state
+            .tables
+            .remove(table_index)
+            .expect("local Session table remains installed until release");
     }
 
     pub fn replace_connection_if_current(
@@ -103,22 +201,27 @@ impl IpSessionLookup {
         let Some(table) = self.table_for_connection(connection) else {
             return false;
         };
-        match (connection, table) {
-            (IpTransportConnectionId::Ip4 { .. }, IpSessionTable::Ip4(table)) => {
+        match connection {
+            IpTransportConnectionId::Ip4 { .. } => {
+                let table = table
+                    .ip4_hashes()
+                    .expect("IP4 connection uses an IP4 Session table");
                 table.sessions().replace_if_current(
                     &ip4_connection_key(connection),
                     expected.into(),
                     replacement.into(),
                 )
             }
-            (IpTransportConnectionId::Ip6 { .. }, IpSessionTable::Ip6(table)) => {
+            IpTransportConnectionId::Ip6 { .. } => {
+                let table = table
+                    .ip6_hashes()
+                    .expect("IP6 connection uses an IP6 Session table");
                 table.sessions().replace_if_current(
                     &ip6_connection_key(connection),
                     expected.into(),
                     replacement.into(),
                 )
             }
-            _ => panic!("Session table family matches the connection family"),
         }
     }
 
@@ -130,24 +233,39 @@ impl IpSessionLookup {
         let Some(table) = self.table_for_connection(connection) else {
             return false;
         };
-        match (connection, table) {
-            (IpTransportConnectionId::Ip4 { .. }, IpSessionTable::Ip4(table)) => table
+        match connection {
+            IpTransportConnectionId::Ip4 { .. } => table
+                .ip4_hashes()
+                .expect("IP4 connection uses an IP4 Session table")
                 .sessions()
                 .remove_if_current(&ip4_connection_key(connection), expected.into()),
-            (IpTransportConnectionId::Ip6 { .. }, IpSessionTable::Ip6(table)) => table
+            IpTransportConnectionId::Ip6 { .. } => table
+                .ip6_hashes()
+                .expect("IP6 connection uses an IP6 Session table")
                 .sessions()
                 .remove_if_current(&ip6_connection_key(connection), expected.into()),
-            _ => panic!("Session table family matches the connection family"),
         }
     }
 
     #[inline]
-    fn table(&self, table_index: SessionTableIndex) -> Option<&IpSessionTable> {
-        if !table_index.is_valid() {
+    fn table(&self, table_index: u32) -> Option<&IpSessionTable> {
+        if table_index == u32::MAX {
             return None;
         }
         let state = unsafe { &*self.state.get() };
-        state.tables.get(table_index.value())
+        state.tables.get(table_index)
+    }
+
+    #[allow(clippy::mut_from_ref)]
+    #[inline]
+    fn table_mut(&self, table_index: u32) -> Option<&mut IpSessionTable> {
+        if table_index == u32::MAX {
+            return None;
+        }
+        hammer_runtime::ensure_main_thread_with_barrier()
+            .expect("Session table mutation requires the Main Thread and WorkerBarrier");
+        let state = unsafe { &mut *self.state.get() };
+        state.tables.get_mut(table_index)
     }
 
     #[inline]
@@ -164,8 +282,11 @@ impl IpSessionLookup {
         connection: &IpTransportConnectionId,
         use_wildcard: bool,
     ) -> Option<SessionHandle> {
-        match (connection, table) {
-            (IpTransportConnectionId::Ip4 { .. }, IpSessionTable::Ip4(table)) => {
+        match connection {
+            IpTransportConnectionId::Ip4 { .. } => {
+                let table = table
+                    .ip4_hashes()
+                    .expect("IP4 connection uses an IP4 Session table");
                 lookup_ip4_listener(
                     table.sessions(),
                     ip4_listener_key_from_connection(connection),
@@ -173,7 +294,10 @@ impl IpSessionLookup {
                     use_wildcard,
                 )
             }
-            (IpTransportConnectionId::Ip6 { .. }, IpSessionTable::Ip6(table)) => {
+            IpTransportConnectionId::Ip6 { .. } => {
+                let table = table
+                    .ip6_hashes()
+                    .expect("IP6 connection uses an IP6 Session table");
                 lookup_ip6_listener(
                     table.sessions(),
                     ip6_listener_key_from_connection(connection),
@@ -181,7 +305,6 @@ impl IpSessionLookup {
                     use_wildcard,
                 )
             }
-            _ => panic!("Session table family matches the connection family"),
         }
     }
 }
@@ -197,18 +320,23 @@ impl SessionLookup for IpSessionLookup {
         let table = self
             .table(table_index)
             .expect("allocated Session table remains live");
-        match (connection, table) {
-            (IpTransportConnectionId::Ip4 { .. }, IpSessionTable::Ip4(table)) => {
+        match connection {
+            IpTransportConnectionId::Ip4 { .. } => {
+                let table = table
+                    .ip4_hashes()
+                    .expect("IP4 connection uses an IP4 Session table");
                 table
                     .sessions()
                     .insert(ip4_connection_key(connection), handle.into());
             }
-            (IpTransportConnectionId::Ip6 { .. }, IpSessionTable::Ip6(table)) => {
+            IpTransportConnectionId::Ip6 { .. } => {
+                let table = table
+                    .ip6_hashes()
+                    .expect("IP6 connection uses an IP6 Session table");
                 table
                     .sessions()
                     .insert(ip6_connection_key(connection), handle.into());
             }
-            _ => panic!("Session table family matches the connection family"),
         }
     }
 
@@ -216,59 +344,62 @@ impl SessionLookup for IpSessionLookup {
         let Some(table) = self.table_for_connection(connection) else {
             return false;
         };
-        match (connection, table) {
-            (IpTransportConnectionId::Ip4 { .. }, IpSessionTable::Ip4(table)) => {
-                table.sessions().remove(&ip4_connection_key(connection))
-            }
-            (IpTransportConnectionId::Ip6 { .. }, IpSessionTable::Ip6(table)) => {
-                table.sessions().remove(&ip6_connection_key(connection))
-            }
-            _ => panic!("Session table family matches the connection family"),
+        match connection {
+            IpTransportConnectionId::Ip4 { .. } => table
+                .ip4_hashes()
+                .expect("IP4 connection uses an IP4 Session table")
+                .sessions()
+                .remove(&ip4_connection_key(connection)),
+            IpTransportConnectionId::Ip6 { .. } => table
+                .ip6_hashes()
+                .expect("IP6 connection uses an IP6 Session table")
+                .sessions()
+                .remove(&ip6_connection_key(connection)),
         }
     }
 
     fn add_session_endpoint(
         &self,
-        table_index: SessionTableIndex,
+        table_index: u32,
         endpoint: &Self::Endpoint,
         handle: SessionHandle,
     ) -> bool {
         let Some(table) = self.table(table_index) else {
             return false;
         };
-        match (endpoint.transport().local.address, table) {
-            (std::net::IpAddr::V4(_), IpSessionTable::Ip4(table)) => {
+        match endpoint.transport().local.address {
+            std::net::IpAddr::V4(_) => {
+                let Some(table) = table.ip4_hashes() else {
+                    return false;
+                };
                 table
                     .sessions()
                     .insert(ip4_listener_key(endpoint), handle.into());
                 true
             }
-            (std::net::IpAddr::V6(_), IpSessionTable::Ip6(table)) => {
+            std::net::IpAddr::V6(_) => {
+                let Some(table) = table.ip6_hashes() else {
+                    return false;
+                };
                 table
                     .sessions()
                     .insert(ip6_listener_key(endpoint), handle.into());
                 true
             }
-            _ => false,
         }
     }
 
-    fn remove_session_endpoint(
-        &self,
-        table_index: SessionTableIndex,
-        endpoint: &Self::Endpoint,
-    ) -> bool {
+    fn remove_session_endpoint(&self, table_index: u32, endpoint: &Self::Endpoint) -> bool {
         let Some(table) = self.table(table_index) else {
             return false;
         };
-        match (endpoint.transport().local.address, table) {
-            (std::net::IpAddr::V4(_), IpSessionTable::Ip4(table)) => {
-                table.sessions().remove(&ip4_listener_key(endpoint))
-            }
-            (std::net::IpAddr::V6(_), IpSessionTable::Ip6(table)) => {
-                table.sessions().remove(&ip6_listener_key(endpoint))
-            }
-            _ => false,
+        match endpoint.transport().local.address {
+            std::net::IpAddr::V4(_) => table
+                .ip4_hashes()
+                .is_some_and(|table| table.sessions().remove(&ip4_listener_key(endpoint))),
+            std::net::IpAddr::V6(_) => table
+                .ip6_hashes()
+                .is_some_and(|table| table.sessions().remove(&ip6_listener_key(endpoint))),
         }
     }
 
@@ -278,18 +409,23 @@ impl SessionLookup for IpSessionLookup {
         let table = self
             .table(table_index)
             .expect("allocated Session table remains live");
-        match (connection, table) {
-            (IpTransportConnectionId::Ip4 { .. }, IpSessionTable::Ip4(table)) => {
+        match connection {
+            IpTransportConnectionId::Ip4 { .. } => {
+                let table = table
+                    .ip4_hashes()
+                    .expect("IP4 connection uses an IP4 Session table");
                 table
                     .half_open()
                     .insert(ip4_connection_key(connection), handle.value());
             }
-            (IpTransportConnectionId::Ip6 { .. }, IpSessionTable::Ip6(table)) => {
+            IpTransportConnectionId::Ip6 { .. } => {
+                let table = table
+                    .ip6_hashes()
+                    .expect("IP6 connection uses an IP6 Session table");
                 table
                     .half_open()
                     .insert(ip6_connection_key(connection), handle.value());
             }
-            _ => panic!("Session table family matches the connection family"),
         }
     }
 
@@ -297,29 +433,35 @@ impl SessionLookup for IpSessionLookup {
         let Some(table) = self.table_for_connection(connection) else {
             return false;
         };
-        match (connection, table) {
-            (IpTransportConnectionId::Ip4 { .. }, IpSessionTable::Ip4(table)) => {
-                table.half_open().remove(&ip4_connection_key(connection))
-            }
-            (IpTransportConnectionId::Ip6 { .. }, IpSessionTable::Ip6(table)) => {
-                table.half_open().remove(&ip6_connection_key(connection))
-            }
-            _ => panic!("Session table family matches the connection family"),
+        match connection {
+            IpTransportConnectionId::Ip4 { .. } => table
+                .ip4_hashes()
+                .expect("IP4 connection uses an IP4 Session table")
+                .half_open()
+                .remove(&ip4_connection_key(connection)),
+            IpTransportConnectionId::Ip6 { .. } => table
+                .ip6_hashes()
+                .expect("IP6 connection uses an IP6 Session table")
+                .half_open()
+                .remove(&ip6_connection_key(connection)),
         }
     }
 
     fn half_open_handle(&self, connection: &Self::ConnectionId) -> Option<Self::HalfOpenHandle> {
         let table = self.table_for_connection(connection)?;
-        match (connection, table) {
-            (IpTransportConnectionId::Ip4 { .. }, IpSessionTable::Ip4(table)) => table
+        match connection {
+            IpTransportConnectionId::Ip4 { .. } => table
+                .ip4_hashes()
+                .expect("IP4 connection uses an IP4 Session table")
                 .half_open()
                 .lookup(&ip4_connection_key(connection))
                 .map(IpHalfOpenHandle::new),
-            (IpTransportConnectionId::Ip6 { .. }, IpSessionTable::Ip6(table)) => table
+            IpTransportConnectionId::Ip6 { .. } => table
+                .ip6_hashes()
+                .expect("IP6 connection uses an IP6 Session table")
                 .half_open()
                 .lookup(&ip6_connection_key(connection))
                 .map(IpHalfOpenHandle::new),
-            _ => panic!("Session table family matches the connection family"),
         }
     }
 
@@ -330,16 +472,25 @@ impl SessionLookup for IpSessionLookup {
         let Some(table) = self.table_for_connection(connection) else {
             return SessionLookupResult::NotFound;
         };
-        let (session, half_open) = match (connection, table) {
-            (IpTransportConnectionId::Ip4 { .. }, IpSessionTable::Ip4(table)) => (
-                table.sessions().lookup(&ip4_connection_key(connection)),
-                table.half_open().lookup(&ip4_connection_key(connection)),
-            ),
-            (IpTransportConnectionId::Ip6 { .. }, IpSessionTable::Ip6(table)) => (
-                table.sessions().lookup(&ip6_connection_key(connection)),
-                table.half_open().lookup(&ip6_connection_key(connection)),
-            ),
-            _ => panic!("Session table family matches the connection family"),
+        let (session, half_open) = match connection {
+            IpTransportConnectionId::Ip4 { .. } => {
+                let table = table
+                    .ip4_hashes()
+                    .expect("IP4 connection uses an IP4 Session table");
+                (
+                    table.sessions().lookup(&ip4_connection_key(connection)),
+                    table.half_open().lookup(&ip4_connection_key(connection)),
+                )
+            }
+            IpTransportConnectionId::Ip6 { .. } => {
+                let table = table
+                    .ip6_hashes()
+                    .expect("IP6 connection uses an IP6 Session table");
+                (
+                    table.sessions().lookup(&ip6_connection_key(connection)),
+                    table.half_open().lookup(&ip6_connection_key(connection)),
+                )
+            }
         };
         if let Some(handle) = session {
             return SessionLookupResult::Session(handle.into());
@@ -360,14 +511,17 @@ impl SessionLookup for IpSessionLookup {
         let Some(table) = self.table_for_connection(connection) else {
             return SessionLookupResult::NotFound;
         };
-        let session = match (connection, table) {
-            (IpTransportConnectionId::Ip4 { .. }, IpSessionTable::Ip4(table)) => {
-                table.sessions().lookup(&ip4_connection_key(connection))
-            }
-            (IpTransportConnectionId::Ip6 { .. }, IpSessionTable::Ip6(table)) => {
-                table.sessions().lookup(&ip6_connection_key(connection))
-            }
-            _ => panic!("Session table family matches the connection family"),
+        let session = match connection {
+            IpTransportConnectionId::Ip4 { .. } => table
+                .ip4_hashes()
+                .expect("IP4 connection uses an IP4 Session table")
+                .sessions()
+                .lookup(&ip4_connection_key(connection)),
+            IpTransportConnectionId::Ip6 { .. } => table
+                .ip6_hashes()
+                .expect("IP6 connection uses an IP6 Session table")
+                .sessions()
+                .lookup(&ip6_connection_key(connection)),
         };
         if let Some(value) = session {
             let handle = SessionHandle::from(value);
@@ -388,14 +542,17 @@ impl SessionLookup for IpSessionLookup {
 
     fn lookup_session(&self, connection: &Self::ConnectionId) -> Option<SessionHandle> {
         let table = self.table_for_connection(connection)?;
-        let established = match (connection, table) {
-            (IpTransportConnectionId::Ip4 { .. }, IpSessionTable::Ip4(table)) => {
-                table.sessions().lookup(&ip4_connection_key(connection))
-            }
-            (IpTransportConnectionId::Ip6 { .. }, IpSessionTable::Ip6(table)) => {
-                table.sessions().lookup(&ip6_connection_key(connection))
-            }
-            _ => panic!("Session table family matches the connection family"),
+        let established = match connection {
+            IpTransportConnectionId::Ip4 { .. } => table
+                .ip4_hashes()
+                .expect("IP4 connection uses an IP4 Session table")
+                .sessions()
+                .lookup(&ip4_connection_key(connection)),
+            IpTransportConnectionId::Ip6 { .. } => table
+                .ip6_hashes()
+                .expect("IP6 connection uses an IP6 Session table")
+                .sessions()
+                .lookup(&ip6_connection_key(connection)),
         };
         established
             .map(SessionHandle::from)
@@ -409,16 +566,25 @@ impl SessionLookup for IpSessionLookup {
         let Some(table) = self.table_for_connection(connection) else {
             return SessionLookupResult::NotFound;
         };
-        let (session, half_open) = match (connection, table) {
-            (IpTransportConnectionId::Ip4 { .. }, IpSessionTable::Ip4(table)) => (
-                table.sessions().lookup(&ip4_connection_key(connection)),
-                table.half_open().lookup(&ip4_connection_key(connection)),
-            ),
-            (IpTransportConnectionId::Ip6 { .. }, IpSessionTable::Ip6(table)) => (
-                table.sessions().lookup(&ip6_connection_key(connection)),
-                table.half_open().lookup(&ip6_connection_key(connection)),
-            ),
-            _ => panic!("Session table family matches the connection family"),
+        let (session, half_open) = match connection {
+            IpTransportConnectionId::Ip4 { .. } => {
+                let table = table
+                    .ip4_hashes()
+                    .expect("IP4 connection uses an IP4 Session table");
+                (
+                    table.sessions().lookup(&ip4_connection_key(connection)),
+                    table.half_open().lookup(&ip4_connection_key(connection)),
+                )
+            }
+            IpTransportConnectionId::Ip6 { .. } => {
+                let table = table
+                    .ip6_hashes()
+                    .expect("IP6 connection uses an IP6 Session table");
+                (
+                    table.sessions().lookup(&ip6_connection_key(connection)),
+                    table.half_open().lookup(&ip6_connection_key(connection)),
+                )
+            }
         };
         session
             .map(|value| SessionLookupResult::Session(value.into()))
@@ -430,25 +596,28 @@ impl SessionLookup for IpSessionLookup {
 
     fn lookup_listener(
         &self,
-        table_index: SessionTableIndex,
+        table_index: u32,
         endpoint: &Self::Endpoint,
         use_wildcard: bool,
     ) -> Option<SessionHandle> {
         let table = self.table(table_index)?;
-        match (endpoint.transport().local.address, table) {
-            (std::net::IpAddr::V4(_), IpSessionTable::Ip4(table)) => lookup_ip4_listener(
-                table.sessions(),
-                ip4_listener_key(endpoint),
-                ip4_proxy_key(endpoint),
-                use_wildcard,
-            ),
-            (std::net::IpAddr::V6(_), IpSessionTable::Ip6(table)) => lookup_ip6_listener(
-                table.sessions(),
-                ip6_listener_key(endpoint),
-                ip6_proxy_key(endpoint),
-                use_wildcard,
-            ),
-            _ => None,
+        match endpoint.transport().local.address {
+            std::net::IpAddr::V4(_) => table.ip4_hashes().and_then(|table| {
+                lookup_ip4_listener(
+                    table.sessions(),
+                    ip4_listener_key(endpoint),
+                    ip4_proxy_key(endpoint),
+                    use_wildcard,
+                )
+            }),
+            std::net::IpAddr::V6(_) => table.ip6_hashes().and_then(|table| {
+                lookup_ip6_listener(
+                    table.sessions(),
+                    ip6_listener_key(endpoint),
+                    ip6_proxy_key(endpoint),
+                    use_wildcard,
+                )
+            }),
         }
     }
 }
@@ -458,6 +627,14 @@ const fn family_index(family: IpSessionFamily) -> usize {
     match family {
         IpSessionFamily::Ip4 => 0,
         IpSessionFamily::Ip6 => 1,
+    }
+}
+
+#[inline]
+const fn ip_version(family: IpSessionFamily) -> IpVersion {
+    match family {
+        IpSessionFamily::Ip4 => IpVersion::V4,
+        IpSessionFamily::Ip6 => IpVersion::V6,
     }
 }
 

@@ -1,4 +1,4 @@
-use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddrV4, SocketAddrV6};
 
 use hammer_service::session::SessionEndpoint;
 
@@ -25,6 +25,13 @@ pub struct IpTransportEndpointConfig {
 
 pub type IpSessionEndpoint = SessionEndpoint<IpTransportEndpointConfig>;
 
+impl From<IpSessionEndpoint> for IpTransportEndpointConfig {
+    #[inline(always)]
+    fn from(endpoint: IpSessionEndpoint) -> Self {
+        *endpoint.transport()
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum IpTransportConnectionId {
     Ip4 {
@@ -47,37 +54,42 @@ pub enum IpTransportConnectionId {
     },
 }
 
-impl IpTransportConnectionId {
-    pub fn from_socket_addrs(
-        fib_index: u32,
-        local: SocketAddr,
-        remote: SocketAddr,
-        transport_protocol: u8,
-    ) -> Option<Self> {
-        match (local, remote) {
-            (SocketAddr::V4(local), SocketAddr::V4(remote)) => Some(Self::Ip4 {
-                remote_address: *remote.ip(),
-                local_address: *local.ip(),
-                fib_index,
-                remote_port: remote.port().to_be(),
-                local_port: local.port().to_be(),
-                dscp: 0,
-                transport_protocol,
-            }),
-            (SocketAddr::V6(local), SocketAddr::V6(remote)) => Some(Self::Ip6 {
-                remote_address: *remote.ip(),
-                local_address: *local.ip(),
-                fib_index,
-                remote_port: remote.port().to_be(),
-                local_port: local.port().to_be(),
-                dscp: 0,
-                transport_protocol,
-            }),
-            _ => None,
+impl From<(u32, SocketAddrV4, SocketAddrV4, u8)> for IpTransportConnectionId {
+    #[inline(always)]
+    fn from(
+        (fib_index, local, remote, transport_protocol): (u32, SocketAddrV4, SocketAddrV4, u8),
+    ) -> Self {
+        Self::Ip4 {
+            remote_address: *remote.ip(),
+            local_address: *local.ip(),
+            fib_index,
+            remote_port: remote.port().to_be(),
+            local_port: local.port().to_be(),
+            dscp: 0,
+            transport_protocol,
         }
     }
+}
 
-    #[inline]
+impl From<(u32, SocketAddrV6, SocketAddrV6, u8)> for IpTransportConnectionId {
+    #[inline(always)]
+    fn from(
+        (fib_index, local, remote, transport_protocol): (u32, SocketAddrV6, SocketAddrV6, u8),
+    ) -> Self {
+        Self::Ip6 {
+            remote_address: *remote.ip(),
+            local_address: *local.ip(),
+            fib_index,
+            remote_port: remote.port().to_be(),
+            local_port: local.port().to_be(),
+            dscp: 0,
+            transport_protocol,
+        }
+    }
+}
+
+impl IpTransportConnectionId {
+    #[inline(always)]
     pub const fn fib_index(self) -> u32 {
         match self {
             Self::Ip4 { fib_index, .. } | Self::Ip6 { fib_index, .. } => fib_index,
@@ -92,12 +104,12 @@ pub struct IpHalfOpenHandle(u64);
 impl IpHalfOpenHandle {
     pub const INVALID: Self = Self(u64::MAX);
 
-    #[inline]
+    #[inline(always)]
     pub const fn new(handle: u64) -> Self {
         Self(handle)
     }
 
-    #[inline]
+    #[inline(always)]
     pub const fn value(self) -> u64 {
         self.0
     }

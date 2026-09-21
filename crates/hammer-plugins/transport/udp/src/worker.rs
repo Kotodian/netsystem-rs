@@ -37,8 +37,11 @@ fn session_connection_id(
     local: SocketAddr,
     remote: SocketAddr,
 ) -> Result<IpTransportConnectionId, UdpTransportError> {
-    IpTransportConnectionId::from_socket_addrs(0, local, remote, protocol)
-        .ok_or(UdpTransportError::InvalidConnection)
+    match (local, remote) {
+        (SocketAddr::V4(local), SocketAddr::V4(remote)) => Ok((0, local, remote, protocol).into()),
+        (SocketAddr::V6(local), SocketAddr::V6(remote)) => Ok((0, local, remote, protocol).into()),
+        _ => Err(UdpTransportError::InvalidConnection),
+    }
 }
 
 #[hammer_component_macros::runtime_error(subsystem = "udp")]

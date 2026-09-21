@@ -4,17 +4,23 @@ use std::sync::OnceLock;
 
 use hammer_runtime::RuntimeResult;
 
+mod api;
 mod config;
 mod endpoint;
 mod lookup;
+mod namespace;
 mod table;
 
+pub use api::{
+    AppNamespaceAddDel, AppNamespaceAddDelReply, AppNamespaceAddDelRetval, InterfaceIndex,
+};
 pub use config::IpSessionTableConfig;
 pub use endpoint::{
     ENDPOINT_INVALID_INDEX, IpHalfOpenHandle, IpSessionEndpoint, IpTransportConnectionId,
     IpTransportEndpoint, IpTransportEndpointConfig,
 };
 pub use lookup::{IpSessionFamily, IpSessionLookup};
+pub use namespace::{IpNamespaceBinding, IpNamespaceMain, namespaces};
 
 static SESSION_TABLE_CONFIG: OnceLock<IpSessionTableConfig> = OnceLock::new();
 static SESSION_LOOKUP: OnceLock<IpSessionLookup> = OnceLock::new();
@@ -56,12 +62,16 @@ pub fn session_lookup() -> &'static IpSessionLookup {
 
 hammer_component_macros::declare_plugin!(
     name = "session",
-    load_after = [],
-    init_functions = [__INIT_FN_SESSION_LOOKUP_INIT],
+    load_after = ["ip"],
+    init_functions = [
+        __INIT_FN_SESSION_LOOKUP_INIT,
+        namespace::__INIT_FN_IP_NAMESPACE_INIT,
+    ],
     config_functions = [__CONFIG_FN_SESSION_TABLE_CONFIG],
     main_loop_enter_functions = [],
     main_loop_exit_functions = [],
     worker_init_functions = [],
+    api_init_functions = [api::__INIT_FN_SESSION_API_HOOKUP],
     graph_nodes = [],
     node_functions = [],
     process_nodes = [],
