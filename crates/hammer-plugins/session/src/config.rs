@@ -3,7 +3,7 @@ const DEFAULT_SESSION_TABLE_MEMORY: u32 = 64 << 20;
 
 #[derive(Debug, Clone, Copy, Default, serde::Deserialize, serde::Serialize)]
 #[serde(default)]
-pub struct IpSessionTableConfig {
+pub struct IpSessionConfig {
     pub v4_session_table_buckets: u32,
     pub v4_session_table_memory: u32,
     pub v4_halfopen_table_buckets: u32,
@@ -12,7 +12,11 @@ pub struct IpSessionTableConfig {
     pub v6_session_table_memory: u32,
     pub v6_halfopen_table_buckets: u32,
     pub v6_halfopen_table_memory: u32,
+    #[serde(flatten)]
+    pub transport: hammer_service::transport::Config,
 }
+
+pub type IpSessionTableConfig = IpSessionConfig;
 
 #[derive(Debug, Default, serde::Deserialize)]
 #[serde(default)]

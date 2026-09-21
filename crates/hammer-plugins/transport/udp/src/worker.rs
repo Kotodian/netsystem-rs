@@ -6,7 +6,7 @@ use std::sync::{Arc, OnceLock};
 use hammer_core::data_plane::{Frame, NodeId, NodeState};
 use hammer_infra::align::CacheLineAlignMark;
 use hammer_infra::pool::Pool;
-use hammer_plugin_session::{IpTransportConnectionId, session_lookup};
+use hammer_plugin_session::{IpSessionEndpoint, IpTransportConnectionId, IpTransportMain, session_lookup};
 use hammer_runtime::app::{SessionDgramHeader, SessionHandle};
 use hammer_runtime::{
     DataPlaneMain, DataWorkerId, NodeRuntime, RuntimeError, RuntimeResult, SessionConnectEndpoint,
@@ -20,7 +20,9 @@ use hammer_service::session::runtime::{
     TransportInternalTx, dispatch_session_queue_events, session_main,
 };
 use hammer_service::session::{SessionLookup, SessionLookupResult, SessionQueueNext};
-use hammer_service::transport::{TransportVft, register_transport};
+use hammer_service::transport::{
+    Options, SendParams, Service, Transport, TransportVft, TxMode, register_transport,
+};
 
 use crate::UdpIpVersion;
 use crate::connection::{UdpConnection, UdpListener};
@@ -196,6 +198,58 @@ impl UdpMain {
             listener,
             return_node,
         )
+    }
+}
+
+impl Transport<hammer_plugin_session::IpTransportEndpointConfig> for UdpMain {
+    type Error = RuntimeError;
+
+    const OPTIONS: Options = Options::new(
+        "udp",
+        "U",
+        TxMode::Datagram,
+        Service::Connectionless,
+    );
+
+    fn start_listen(&self, endpoint: IpSessionEndpoint) -> Result<u32, Self::Error> {
+        hammer_runtime::ensure_main_thread_with_barrier()?;
+        let transport = IpTransportMain::global()?;
+        transport.mark_used(&endpoint).map_err(RuntimeError::from)?;
+        let local = endpoint.transport().local;
+        let listener = UdpListener::new(
+            SocketAddr::new(local.address, local.port),
+            SessionHandle::new(u32::MAX, 0),
+            DataWorkerId::new(0),
+        )
+        .ok_or(UdpTransportError::InvalidConnection)?;
+        self.listeners.get_mut().push(listener);
+        Ok(u32::MAX)
+    }
+
+    fn stop_listen(&self, connection_index: u32) -> Result<(), Self::Error> {
+        hammer_runtime::ensure_main_thread_with_barrier()?;
+        let listeners = self.listeners.get_mut();
+        let position = listeners
+            .iter()
+            .position(|listener| listener.session_listener().session_index == connection_index)
+            .ok_or(UdpTransportError::ListenerMissing {
+                listener: SessionHandle::new(connection_index, 0),
+            })?;
+        listeners.remove(position);
+        Ok(())
+    }
+
+    fn connect(&self, endpoint: IpSessionEndpoint) -> Result<u32, Self::Error> {
+        drop(endpoint);
+        Err(UdpTransportError::InvalidConnection.into())
+    }
+
+    fn close(&self, _: u32, _: u32) {}
+
+    fn cleanup(&self, _: u32, _: u32) {}
+
+    fn send_params(&self, _: u32, _: u32) -> Result<SendParams, Self::Error> {
+        Err(UdpTransportError::InvalidConnection.into())
     }
 }
 
@@ -923,7 +977,7 @@ pub fn connect(
 
 #[hammer_component_macros::init_function(
     name = "udp_init",
-    runs_after = ["transport_main_init", "session_init"]
+    runs_after = ["ip_transport_main_init", "session_init"]
 )]
 fn init_udp() -> RuntimeResult<()> {
     assert!(

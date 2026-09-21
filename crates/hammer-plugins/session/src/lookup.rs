@@ -1,6 +1,4 @@
 use std::cell::UnsafeCell;
-use std::net::{Ipv4Addr, Ipv6Addr};
-
 use hammer_infra::pool::Pool;
 use hammer_plugin_ip::{IpVersion, fib_table_lock, fib_table_unlock};
 use hammer_runtime::app::SessionHandle;
@@ -11,13 +9,152 @@ use crate::config::IpSessionTableConfig;
 use crate::endpoint::{IpHalfOpenHandle, IpSessionEndpoint, IpTransportConnectionId};
 use crate::table::IpSessionTable;
 
-type Ip4SessionKey = u128;
-type Ip6SessionKey = [u64; 6];
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum IpSessionFamily {
     Ip4,
     Ip6,
+}
+
+impl From<IpSessionFamily> for usize {
+    #[inline(always)]
+    fn from(family: IpSessionFamily) -> Self {
+        match family {
+            IpSessionFamily::Ip4 => 0,
+            IpSessionFamily::Ip6 => 1,
+        }
+    }
+}
+
+impl From<IpSessionFamily> for IpVersion {
+    #[inline(always)]
+    fn from(family: IpSessionFamily) -> Self {
+        match family {
+            IpSessionFamily::Ip4 => IpVersion::V4,
+            IpSessionFamily::Ip6 => IpVersion::V6,
+        }
+    }
+}
+
+impl From<&IpTransportConnectionId> for IpSessionFamily {
+    #[inline(always)]
+    fn from(connection: &IpTransportConnectionId) -> Self {
+        match connection {
+            IpTransportConnectionId::Ip4 { .. } => Self::Ip4,
+            IpTransportConnectionId::Ip6 { .. } => Self::Ip6,
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+enum Key {
+    Ip4(u128),
+    Ip6([u64; 6]),
+}
+
+impl From<&IpTransportConnectionId> for Key {
+    #[inline(always)]
+    fn from(connection: &IpTransportConnectionId) -> Self {
+        match connection {
+            IpTransportConnectionId::Ip4 {
+                remote_address,
+                local_address,
+                remote_port,
+                local_port,
+                transport_protocol,
+                ..
+            } => {
+                let remote = u64::from(u32::from(*remote_address));
+                let local = u64::from(u32::from(*local_address));
+                let addresses = (remote << 32) | local;
+                let ports = (u64::from(*transport_protocol) << 32)
+                    | (u64::from(*remote_port) << 16)
+                    | u64::from(*local_port);
+                Self::Ip4(u128::from(addresses) | (u128::from(ports) << 64))
+            }
+            IpTransportConnectionId::Ip6 {
+                remote_address,
+                local_address,
+                remote_port,
+                local_port,
+                transport_protocol,
+                ..
+            } => {
+                let local = local_address.octets();
+                let remote = remote_address.octets();
+                let mut local_first = [0; 8];
+                let mut local_second = [0; 8];
+                let mut remote_first = [0; 8];
+                let mut remote_second = [0; 8];
+                local_first.copy_from_slice(&local[..8]);
+                local_second.copy_from_slice(&local[8..]);
+                remote_first.copy_from_slice(&remote[..8]);
+                remote_second.copy_from_slice(&remote[8..]);
+                Self::Ip6([
+                    u64::from_ne_bytes(local_first),
+                    u64::from_ne_bytes(local_second),
+                    u64::from_ne_bytes(remote_first),
+                    u64::from_ne_bytes(remote_second),
+                    (u64::from(*transport_protocol) << 32)
+                        | (u64::from(*remote_port) << 16)
+                        | u64::from(*local_port),
+                    0,
+                ])
+            }
+        }
+    }
+}
+
+impl From<&IpSessionEndpoint> for Key {
+    #[inline(always)]
+    fn from(endpoint: &IpSessionEndpoint) -> Self {
+        match endpoint.transport().local.address {
+            std::net::IpAddr::V4(address) => {
+                let word = u64::from(u32::from(address));
+                Self::Ip4(
+                    u128::from(word)
+                        | ((u128::from(endpoint.transport_protocol()) << 32
+                            | u128::from(endpoint.transport().local.port))
+                            << 64),
+                )
+            }
+            std::net::IpAddr::V6(address) => {
+                let octets = address.octets();
+                let mut first = [0; 8];
+                let mut second = [0; 8];
+                first.copy_from_slice(&octets[..8]);
+                second.copy_from_slice(&octets[8..]);
+                Self::Ip6([
+                    u64::from_ne_bytes(first),
+                    u64::from_ne_bytes(second),
+                    0,
+                    0,
+                    (u64::from(endpoint.transport_protocol()) << 32)
+                        | u64::from(endpoint.transport().local.port),
+                    0,
+                ])
+            }
+        }
+    }
+}
+
+impl From<Key> for u128 {
+    #[inline(always)]
+    fn from(key: Key) -> Self {
+        match key {
+            Key::Ip4(value) => value,
+            Key::Ip6(_) => panic!("IP4 Session key requires an IP4 endpoint"),
+        }
+    }
+}
+
+impl From<Key> for [u64; 6] {
+    #[inline(always)]
+    fn from(key: Key) -> Self {
+        match key {
+            Key::Ip4(_) => panic!("IP6 Session key requires an IP6 endpoint"),
+            Key::Ip6(value) => value,
+        }
+    }
 }
 
 struct IpSessionLookupState {
@@ -52,7 +189,7 @@ impl IpSessionLookup {
     #[inline]
     pub fn table_index(&self, family: IpSessionFamily, fib_index: u32) -> u32 {
         let state = unsafe { &*self.state.get() };
-        state.fib_index_to_table_index[family_index(family)]
+        state.fib_index_to_table_index[usize::from(family)]
             .get(fib_index as usize)
             .copied()
             .unwrap_or(u32::MAX)
@@ -79,7 +216,7 @@ impl IpSessionLookup {
             IpSessionFamily::Ip6 => IpSessionTable::ip6(self.config),
         };
         let table_index = state.tables.insert(table);
-        let mapping = &mut state.fib_index_to_table_index[family_index(family)];
+        let mapping = &mut state.fib_index_to_table_index[usize::from(family)];
         mapping.resize(fib_index as usize + 1, u32::MAX);
         mapping[fib_index as usize] = table_index;
         table_index
@@ -135,7 +272,7 @@ impl IpSessionLookup {
             "namespace binds to a global Session table once"
         );
         table.appns_indices_mut().push(appns_index);
-        fib_table_lock(ip_version(family), fib_index, source);
+        fib_table_lock(IpVersion::from(family), fib_index, source);
     }
 
     pub fn unbind_global(
@@ -163,9 +300,9 @@ impl IpSessionLookup {
             .position(|candidate| *candidate == appns_index)
             .expect("namespace must be associated with the global Session table");
         table.appns_indices_mut().remove(position);
-        fib_table_unlock(ip_version(family), fib_index, source);
+        fib_table_unlock(IpVersion::from(family), fib_index, source);
         if table.appns_indices().is_empty() {
-            state.fib_index_to_table_index[family_index(family)][fib_index as usize] = u32::MAX;
+            state.fib_index_to_table_index[usize::from(family)][fib_index as usize] = u32::MAX;
             state
                 .tables
                 .remove(table_index)
@@ -207,7 +344,7 @@ impl IpSessionLookup {
                     .ip4_hashes()
                     .expect("IP4 connection uses an IP4 Session table");
                 table.sessions().replace_if_current(
-                    &ip4_connection_key(connection),
+                    &u128::from(Key::from(connection)),
                     expected.into(),
                     replacement.into(),
                 )
@@ -217,7 +354,7 @@ impl IpSessionLookup {
                     .ip6_hashes()
                     .expect("IP6 connection uses an IP6 Session table");
                 table.sessions().replace_if_current(
-                    &ip6_connection_key(connection),
+                    &<[u64; 6]>::from(Key::from(connection)),
                     expected.into(),
                     replacement.into(),
                 )
@@ -238,12 +375,12 @@ impl IpSessionLookup {
                 .ip4_hashes()
                 .expect("IP4 connection uses an IP4 Session table")
                 .sessions()
-                .remove_if_current(&ip4_connection_key(connection), expected.into()),
+                .remove_if_current(&u128::from(Key::from(connection)), expected.into()),
             IpTransportConnectionId::Ip6 { .. } => table
                 .ip6_hashes()
                 .expect("IP6 connection uses an IP6 Session table")
                 .sessions()
-                .remove_if_current(&ip6_connection_key(connection), expected.into()),
+                .remove_if_current(&<[u64; 6]>::from(Key::from(connection)), expected.into()),
         }
     }
 
@@ -273,7 +410,9 @@ impl IpSessionLookup {
         &self,
         connection: &IpTransportConnectionId,
     ) -> Option<&IpSessionTable> {
-        self.table(self.table_index(connection_family(connection), connection.fib_index()))
+        self.table(
+            self.table_index(IpSessionFamily::from(connection), connection.fib_index()),
+        )
     }
 
     fn listener_for_connection(
@@ -282,28 +421,50 @@ impl IpSessionLookup {
         connection: &IpTransportConnectionId,
         use_wildcard: bool,
     ) -> Option<SessionHandle> {
-        match connection {
-            IpTransportConnectionId::Ip4 { .. } => {
-                let table = table
+        table.lookup_listener(Key::from(connection), use_wildcard)
+    }
+}
+
+impl IpSessionTable {
+    #[inline]
+    fn lookup_listener(&self, key: Key, use_wildcard: bool) -> Option<SessionHandle> {
+        match key {
+            Key::Ip4(exact) => {
+                let table = self
                     .ip4_hashes()
-                    .expect("IP4 connection uses an IP4 Session table");
-                lookup_ip4_listener(
-                    table.sessions(),
-                    ip4_listener_key_from_connection(connection),
-                    ip4_proxy_key_from_connection(connection),
-                    use_wildcard,
-                )
+                    .expect("IP4 listener lookup uses an IP4 Session table");
+                if let Some(value) = table.sessions().lookup(&exact) {
+                    return Some(value.into());
+                }
+                if use_wildcard {
+                    let wildcard = exact & !u128::from(u64::MAX);
+                    if let Some(value) = table.sessions().lookup(&wildcard) {
+                        return Some(value.into());
+                    }
+                }
+                let proxy = exact & !(u128::from(u16::MAX) << 64);
+                table.sessions().lookup(&proxy).map(SessionHandle::from)
             }
-            IpTransportConnectionId::Ip6 { .. } => {
-                let table = table
+            Key::Ip6(exact) => {
+                let table = self
                     .ip6_hashes()
-                    .expect("IP6 connection uses an IP6 Session table");
-                lookup_ip6_listener(
-                    table.sessions(),
-                    ip6_listener_key_from_connection(connection),
-                    ip6_proxy_key_from_connection(connection),
-                    use_wildcard,
-                )
+                    .expect("IP6 listener lookup uses an IP6 Session table");
+                if let Some(value) = table.sessions().lookup(&exact) {
+                    return Some(value.into());
+                }
+                if use_wildcard {
+                    let mut wildcard = exact;
+                    wildcard[0] = 0;
+                    wildcard[1] = 0;
+                    if let Some(value) = table.sessions().lookup(&wildcard) {
+                        return Some(value.into());
+                    }
+                }
+                let mut proxy = exact;
+                proxy[2] = 0;
+                proxy[3] = 0;
+                proxy[4] &= !u64::from(u16::MAX);
+                table.sessions().lookup(&proxy).map(SessionHandle::from)
             }
         }
     }
@@ -316,7 +477,10 @@ impl SessionLookup for IpSessionLookup {
 
     fn add_connection(&self, connection: &Self::ConnectionId, handle: SessionHandle) {
         let table_index =
-            self.get_or_alloc_table_index(connection_family(connection), connection.fib_index());
+            self.get_or_alloc_table_index(
+                IpSessionFamily::from(connection),
+                connection.fib_index(),
+            );
         let table = self
             .table(table_index)
             .expect("allocated Session table remains live");
@@ -327,7 +491,7 @@ impl SessionLookup for IpSessionLookup {
                     .expect("IP4 connection uses an IP4 Session table");
                 table
                     .sessions()
-                    .insert(ip4_connection_key(connection), handle.into());
+                    .insert(u128::from(Key::from(connection)), handle.into());
             }
             IpTransportConnectionId::Ip6 { .. } => {
                 let table = table
@@ -335,7 +499,7 @@ impl SessionLookup for IpSessionLookup {
                     .expect("IP6 connection uses an IP6 Session table");
                 table
                     .sessions()
-                    .insert(ip6_connection_key(connection), handle.into());
+                    .insert(<[u64; 6]>::from(Key::from(connection)), handle.into());
             }
         }
     }
@@ -349,12 +513,12 @@ impl SessionLookup for IpSessionLookup {
                 .ip4_hashes()
                 .expect("IP4 connection uses an IP4 Session table")
                 .sessions()
-                .remove(&ip4_connection_key(connection)),
+                .remove(&u128::from(Key::from(connection))),
             IpTransportConnectionId::Ip6 { .. } => table
                 .ip6_hashes()
                 .expect("IP6 connection uses an IP6 Session table")
                 .sessions()
-                .remove(&ip6_connection_key(connection)),
+                .remove(&<[u64; 6]>::from(Key::from(connection))),
         }
     }
 
@@ -374,7 +538,7 @@ impl SessionLookup for IpSessionLookup {
                 };
                 table
                     .sessions()
-                    .insert(ip4_listener_key(endpoint), handle.into());
+                    .insert(u128::from(Key::from(endpoint)), handle.into());
                 true
             }
             std::net::IpAddr::V6(_) => {
@@ -383,7 +547,7 @@ impl SessionLookup for IpSessionLookup {
                 };
                 table
                     .sessions()
-                    .insert(ip6_listener_key(endpoint), handle.into());
+                    .insert(<[u64; 6]>::from(Key::from(endpoint)), handle.into());
                 true
             }
         }
@@ -396,16 +560,27 @@ impl SessionLookup for IpSessionLookup {
         match endpoint.transport().local.address {
             std::net::IpAddr::V4(_) => table
                 .ip4_hashes()
-                .is_some_and(|table| table.sessions().remove(&ip4_listener_key(endpoint))),
+                .is_some_and(|table| {
+                    table
+                        .sessions()
+                        .remove(&u128::from(Key::from(endpoint)))
+                }),
             std::net::IpAddr::V6(_) => table
                 .ip6_hashes()
-                .is_some_and(|table| table.sessions().remove(&ip6_listener_key(endpoint))),
+                .is_some_and(|table| {
+                    table
+                        .sessions()
+                        .remove(&<[u64; 6]>::from(Key::from(endpoint)))
+                }),
         }
     }
 
     fn add_half_open(&self, connection: &Self::ConnectionId, handle: Self::HalfOpenHandle) {
         let table_index =
-            self.get_or_alloc_table_index(connection_family(connection), connection.fib_index());
+            self.get_or_alloc_table_index(
+                IpSessionFamily::from(connection),
+                connection.fib_index(),
+            );
         let table = self
             .table(table_index)
             .expect("allocated Session table remains live");
@@ -416,7 +591,7 @@ impl SessionLookup for IpSessionLookup {
                     .expect("IP4 connection uses an IP4 Session table");
                 table
                     .half_open()
-                    .insert(ip4_connection_key(connection), handle.value());
+                    .insert(u128::from(Key::from(connection)), handle.value());
             }
             IpTransportConnectionId::Ip6 { .. } => {
                 let table = table
@@ -424,7 +599,7 @@ impl SessionLookup for IpSessionLookup {
                     .expect("IP6 connection uses an IP6 Session table");
                 table
                     .half_open()
-                    .insert(ip6_connection_key(connection), handle.value());
+                    .insert(<[u64; 6]>::from(Key::from(connection)), handle.value());
             }
         }
     }
@@ -438,12 +613,12 @@ impl SessionLookup for IpSessionLookup {
                 .ip4_hashes()
                 .expect("IP4 connection uses an IP4 Session table")
                 .half_open()
-                .remove(&ip4_connection_key(connection)),
+                .remove(&u128::from(Key::from(connection))),
             IpTransportConnectionId::Ip6 { .. } => table
                 .ip6_hashes()
                 .expect("IP6 connection uses an IP6 Session table")
                 .half_open()
-                .remove(&ip6_connection_key(connection)),
+                .remove(&<[u64; 6]>::from(Key::from(connection))),
         }
     }
 
@@ -454,13 +629,13 @@ impl SessionLookup for IpSessionLookup {
                 .ip4_hashes()
                 .expect("IP4 connection uses an IP4 Session table")
                 .half_open()
-                .lookup(&ip4_connection_key(connection))
+                .lookup(&u128::from(Key::from(connection)))
                 .map(IpHalfOpenHandle::new),
             IpTransportConnectionId::Ip6 { .. } => table
                 .ip6_hashes()
                 .expect("IP6 connection uses an IP6 Session table")
                 .half_open()
-                .lookup(&ip6_connection_key(connection))
+                .lookup(&<[u64; 6]>::from(Key::from(connection)))
                 .map(IpHalfOpenHandle::new),
         }
     }
@@ -478,8 +653,8 @@ impl SessionLookup for IpSessionLookup {
                     .ip4_hashes()
                     .expect("IP4 connection uses an IP4 Session table");
                 (
-                    table.sessions().lookup(&ip4_connection_key(connection)),
-                    table.half_open().lookup(&ip4_connection_key(connection)),
+                    table.sessions().lookup(&u128::from(Key::from(connection))),
+                    table.half_open().lookup(&u128::from(Key::from(connection))),
                 )
             }
             IpTransportConnectionId::Ip6 { .. } => {
@@ -487,8 +662,12 @@ impl SessionLookup for IpSessionLookup {
                     .ip6_hashes()
                     .expect("IP6 connection uses an IP6 Session table");
                 (
-                    table.sessions().lookup(&ip6_connection_key(connection)),
-                    table.half_open().lookup(&ip6_connection_key(connection)),
+                    table
+                        .sessions()
+                        .lookup(&<[u64; 6]>::from(Key::from(connection))),
+                    table
+                        .half_open()
+                        .lookup(&<[u64; 6]>::from(Key::from(connection))),
                 )
             }
         };
@@ -516,12 +695,12 @@ impl SessionLookup for IpSessionLookup {
                 .ip4_hashes()
                 .expect("IP4 connection uses an IP4 Session table")
                 .sessions()
-                .lookup(&ip4_connection_key(connection)),
+                .lookup(&u128::from(Key::from(connection))),
             IpTransportConnectionId::Ip6 { .. } => table
                 .ip6_hashes()
                 .expect("IP6 connection uses an IP6 Session table")
                 .sessions()
-                .lookup(&ip6_connection_key(connection)),
+                .lookup(&<[u64; 6]>::from(Key::from(connection))),
         };
         if let Some(value) = session {
             let handle = SessionHandle::from(value);
@@ -547,12 +726,12 @@ impl SessionLookup for IpSessionLookup {
                 .ip4_hashes()
                 .expect("IP4 connection uses an IP4 Session table")
                 .sessions()
-                .lookup(&ip4_connection_key(connection)),
+                .lookup(&u128::from(Key::from(connection))),
             IpTransportConnectionId::Ip6 { .. } => table
                 .ip6_hashes()
                 .expect("IP6 connection uses an IP6 Session table")
                 .sessions()
-                .lookup(&ip6_connection_key(connection)),
+                .lookup(&<[u64; 6]>::from(Key::from(connection))),
         };
         established
             .map(SessionHandle::from)
@@ -572,8 +751,8 @@ impl SessionLookup for IpSessionLookup {
                     .ip4_hashes()
                     .expect("IP4 connection uses an IP4 Session table");
                 (
-                    table.sessions().lookup(&ip4_connection_key(connection)),
-                    table.half_open().lookup(&ip4_connection_key(connection)),
+                    table.sessions().lookup(&u128::from(Key::from(connection))),
+                    table.half_open().lookup(&u128::from(Key::from(connection))),
                 )
             }
             IpTransportConnectionId::Ip6 { .. } => {
@@ -581,8 +760,12 @@ impl SessionLookup for IpSessionLookup {
                     .ip6_hashes()
                     .expect("IP6 connection uses an IP6 Session table");
                 (
-                    table.sessions().lookup(&ip6_connection_key(connection)),
-                    table.half_open().lookup(&ip6_connection_key(connection)),
+                    table
+                        .sessions()
+                        .lookup(&<[u64; 6]>::from(Key::from(connection))),
+                    table
+                        .half_open()
+                        .lookup(&<[u64; 6]>::from(Key::from(connection))),
                 )
             }
         };
@@ -601,253 +784,6 @@ impl SessionLookup for IpSessionLookup {
         use_wildcard: bool,
     ) -> Option<SessionHandle> {
         let table = self.table(table_index)?;
-        match endpoint.transport().local.address {
-            std::net::IpAddr::V4(_) => table.ip4_hashes().and_then(|table| {
-                lookup_ip4_listener(
-                    table.sessions(),
-                    ip4_listener_key(endpoint),
-                    ip4_proxy_key(endpoint),
-                    use_wildcard,
-                )
-            }),
-            std::net::IpAddr::V6(_) => table.ip6_hashes().and_then(|table| {
-                lookup_ip6_listener(
-                    table.sessions(),
-                    ip6_listener_key(endpoint),
-                    ip6_proxy_key(endpoint),
-                    use_wildcard,
-                )
-            }),
-        }
+        table.lookup_listener(Key::from(endpoint), use_wildcard)
     }
-}
-
-#[inline]
-const fn family_index(family: IpSessionFamily) -> usize {
-    match family {
-        IpSessionFamily::Ip4 => 0,
-        IpSessionFamily::Ip6 => 1,
-    }
-}
-
-#[inline]
-const fn ip_version(family: IpSessionFamily) -> IpVersion {
-    match family {
-        IpSessionFamily::Ip4 => IpVersion::V4,
-        IpSessionFamily::Ip6 => IpVersion::V6,
-    }
-}
-
-#[inline]
-const fn connection_family(connection: &IpTransportConnectionId) -> IpSessionFamily {
-    match connection {
-        IpTransportConnectionId::Ip4 { .. } => IpSessionFamily::Ip4,
-        IpTransportConnectionId::Ip6 { .. } => IpSessionFamily::Ip6,
-    }
-}
-
-#[inline]
-fn ip4_connection_key(connection: &IpTransportConnectionId) -> Ip4SessionKey {
-    let IpTransportConnectionId::Ip4 {
-        remote_address,
-        local_address,
-        remote_port,
-        local_port,
-        transport_protocol,
-        ..
-    } = connection
-    else {
-        panic!("IP4 key requires an IP4 connection")
-    };
-    let word0 = (u64::from(ip4_word(*remote_address)) << 32) | u64::from(ip4_word(*local_address));
-    let word1 = (u64::from(*transport_protocol) << 32)
-        | (u64::from(*remote_port) << 16)
-        | u64::from(*local_port);
-    u128::from(word0) | (u128::from(word1) << 64)
-}
-
-#[inline]
-fn ip6_connection_key(connection: &IpTransportConnectionId) -> Ip6SessionKey {
-    let IpTransportConnectionId::Ip6 {
-        remote_address,
-        local_address,
-        remote_port,
-        local_port,
-        transport_protocol,
-        ..
-    } = connection
-    else {
-        panic!("IP6 key requires an IP6 connection")
-    };
-    let local = ip6_words(*local_address);
-    let remote = ip6_words(*remote_address);
-    [
-        local[0],
-        local[1],
-        remote[0],
-        remote[1],
-        (u64::from(*transport_protocol) << 32)
-            | (u64::from(*remote_port) << 16)
-            | u64::from(*local_port),
-        0,
-    ]
-}
-
-fn ip4_listener_key(endpoint: &IpSessionEndpoint) -> Ip4SessionKey {
-    let std::net::IpAddr::V4(address) = endpoint.transport().local.address else {
-        panic!("IP4 listener key requires an IP4 endpoint")
-    };
-    ip4_listener_words(
-        address,
-        endpoint.transport().local.port,
-        endpoint.transport_protocol(),
-    )
-}
-
-fn ip4_proxy_key(endpoint: &IpSessionEndpoint) -> Ip4SessionKey {
-    let std::net::IpAddr::V4(address) = endpoint.transport().local.address else {
-        panic!("IP4 proxy key requires an IP4 endpoint")
-    };
-    ip4_listener_words(address, 0, endpoint.transport_protocol())
-}
-
-fn ip6_listener_key(endpoint: &IpSessionEndpoint) -> Ip6SessionKey {
-    let std::net::IpAddr::V6(address) = endpoint.transport().local.address else {
-        panic!("IP6 listener key requires an IP6 endpoint")
-    };
-    ip6_listener_words(
-        address,
-        endpoint.transport().local.port,
-        endpoint.transport_protocol(),
-    )
-}
-
-fn ip6_proxy_key(endpoint: &IpSessionEndpoint) -> Ip6SessionKey {
-    let std::net::IpAddr::V6(address) = endpoint.transport().local.address else {
-        panic!("IP6 proxy key requires an IP6 endpoint")
-    };
-    ip6_listener_words(address, 0, endpoint.transport_protocol())
-}
-
-fn ip4_listener_key_from_connection(connection: &IpTransportConnectionId) -> Ip4SessionKey {
-    let IpTransportConnectionId::Ip4 {
-        local_address,
-        local_port,
-        transport_protocol,
-        ..
-    } = connection
-    else {
-        panic!("IP4 listener key requires an IP4 connection")
-    };
-    ip4_listener_words(*local_address, *local_port, *transport_protocol)
-}
-
-fn ip4_proxy_key_from_connection(connection: &IpTransportConnectionId) -> Ip4SessionKey {
-    let IpTransportConnectionId::Ip4 {
-        local_address,
-        transport_protocol,
-        ..
-    } = connection
-    else {
-        panic!("IP4 proxy key requires an IP4 connection")
-    };
-    ip4_listener_words(*local_address, 0, *transport_protocol)
-}
-
-fn ip6_listener_key_from_connection(connection: &IpTransportConnectionId) -> Ip6SessionKey {
-    let IpTransportConnectionId::Ip6 {
-        local_address,
-        local_port,
-        transport_protocol,
-        ..
-    } = connection
-    else {
-        panic!("IP6 listener key requires an IP6 connection")
-    };
-    ip6_listener_words(*local_address, *local_port, *transport_protocol)
-}
-
-fn ip6_proxy_key_from_connection(connection: &IpTransportConnectionId) -> Ip6SessionKey {
-    let IpTransportConnectionId::Ip6 {
-        local_address,
-        transport_protocol,
-        ..
-    } = connection
-    else {
-        panic!("IP6 proxy key requires an IP6 connection")
-    };
-    ip6_listener_words(*local_address, 0, *transport_protocol)
-}
-
-#[inline]
-fn ip4_listener_words(address: Ipv4Addr, port: u16, protocol: u8) -> Ip4SessionKey {
-    let word0 = u64::from(ip4_word(address));
-    let word1 = (u64::from(protocol) << 32) | u64::from(port);
-    u128::from(word0) | (u128::from(word1) << 64)
-}
-
-#[inline]
-fn ip6_listener_words(address: Ipv6Addr, port: u16, protocol: u8) -> Ip6SessionKey {
-    let address = ip6_words(address);
-    [
-        address[0],
-        address[1],
-        0,
-        0,
-        (u64::from(protocol) << 32) | u64::from(port),
-        0,
-    ]
-}
-
-fn lookup_ip4_listener(
-    sessions: &hammer_infra::bihash::Bihash16x8,
-    exact: Ip4SessionKey,
-    proxy: Ip4SessionKey,
-    use_wildcard: bool,
-) -> Option<SessionHandle> {
-    if let Some(value) = sessions.lookup(&exact) {
-        return Some(value.into());
-    }
-    if use_wildcard {
-        let wildcard = exact & !u128::from(u64::MAX);
-        if let Some(value) = sessions.lookup(&wildcard) {
-            return Some(value.into());
-        }
-    }
-    sessions.lookup(&proxy).map(SessionHandle::from)
-}
-
-fn lookup_ip6_listener(
-    sessions: &hammer_infra::bihash::Bihash48x8,
-    exact: Ip6SessionKey,
-    proxy: Ip6SessionKey,
-    use_wildcard: bool,
-) -> Option<SessionHandle> {
-    if let Some(value) = sessions.lookup(&exact) {
-        return Some(value.into());
-    }
-    if use_wildcard {
-        let mut wildcard = exact;
-        wildcard[0] = 0;
-        wildcard[1] = 0;
-        if let Some(value) = sessions.lookup(&wildcard) {
-            return Some(value.into());
-        }
-    }
-    sessions.lookup(&proxy).map(SessionHandle::from)
-}
-
-#[inline]
-fn ip6_words(address: Ipv6Addr) -> [u64; 2] {
-    let octets = address.octets();
-    let mut first = [0; 8];
-    let mut second = [0; 8];
-    first.copy_from_slice(&octets[..8]);
-    second.copy_from_slice(&octets[8..]);
-    [u64::from_ne_bytes(first), u64::from_ne_bytes(second)]
-}
-
-#[inline]
-fn ip4_word(address: Ipv4Addr) -> u32 {
-    u32::from_ne_bytes(address.octets())
 }
