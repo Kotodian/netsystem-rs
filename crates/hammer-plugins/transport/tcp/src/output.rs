@@ -1,4 +1,4 @@
-use crate::{TCP_FLAG_FIN, TCP_FLAG_SYN, tcp_header};
+use crate::{TCP_FLAG_FIN, TCP_FLAG_SYN, TcpHeader, tcp_header};
 use core::hash::Hasher;
 use hammer_core::data_plane::{BufferPacketCursor, Frame, NodeId, NodeState};
 use hammer_infra::checksum::InternetChecksum;
@@ -9,8 +9,8 @@ use hammer_service::session::node::SessionQueueNode;
 use super::{TcpOutputError, read_tcp_egress_endpoints};
 use hammer_service::opaque::NetworkOpaque;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
+use zerocopy::FromBytes;
 pub const DEFAULT_TCP_OUTPUT_PAYLOAD_LEN: usize = 1_440;
-const TCP_CHECKSUM_OFFSET: usize = 16;
 const TCP_PROTOCOL: u8 = 6;
 
 #[hammer_component_macros::node_next]
@@ -237,15 +237,18 @@ fn set_tcp_checksum<const SIMD_BYTES: usize>(
 ) -> RuntimeResult<()> {
     {
         let buffer = runtime.buffer_mut(index);
-        buffer.current_mut()[TCP_CHECKSUM_OFFSET..TCP_CHECKSUM_OFFSET + 2].fill(0);
+        let (header, _) = TcpHeader::mut_from_prefix(buffer.current_mut())
+            .map_err(|_| TcpOutputError::NoTcpHeader)?;
+        header.set_checksum(0);
     }
     for buffer in runtime.chain(index) {
         checksum.write(buffer.current());
     }
     let value = checksum.finish() as u16;
     let buffer = runtime.buffer_mut(index);
-    buffer.current_mut()[TCP_CHECKSUM_OFFSET..TCP_CHECKSUM_OFFSET + 2]
-        .copy_from_slice(&value.to_be_bytes());
+    let (header, _) = TcpHeader::mut_from_prefix(buffer.current_mut())
+        .map_err(|_| TcpOutputError::NoTcpHeader)?;
+    header.set_checksum(value);
     Ok(())
 }
 

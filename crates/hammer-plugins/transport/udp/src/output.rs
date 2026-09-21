@@ -1,10 +1,14 @@
+use core::hash::Hasher;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 
+use crate::protocol::UdpHeader;
+use crate::worker::UdpTransportError;
 use hammer_core::data_plane::{BufferPacketCursor, Frame, NodeId, NodeState};
-use hammer_infra::checksum::internet_checksum_parts;
+use hammer_infra::checksum::InternetChecksum;
 use hammer_runtime::{DataPlaneMain, Node, NodeProcessFn, NodeRuntime, RuntimeResult};
 use hammer_service::opaque::NetworkOpaque;
 use hammer_service::session::node::SessionQueueNode;
+use zerocopy::FromBytes;
 
 const UDP_PROTOCOL: u8 = 17;
 const UDP_HEADER_LEN: usize = 8;
@@ -203,21 +207,12 @@ fn udp_output_push_ipv4(
 ) -> RuntimeResult<()> {
     let udp_len =
         u16::try_from(usize::from(total_len) - IPV4_HEADER_LEN).expect("IPv4 UDP length fits u16");
-    let checksum = {
-        let buffer = runtime.buffer(index);
-        let datagram = buffer.current();
-        internet_checksum_parts(&[
-            &src.octets(),
-            &dst.octets(),
-            &[0, UDP_PROTOCOL],
-            &udp_len.to_be_bytes(),
-            datagram,
-        ])
-    };
-    {
-        let buffer = runtime.buffer_mut(index);
-        buffer.current_mut()[6..8].copy_from_slice(&checksum.to_be_bytes());
-    }
+    let mut checksum = InternetChecksum::default();
+    checksum.write(&src.octets());
+    checksum.write(&dst.octets());
+    checksum.write(&[0, UDP_PROTOCOL]);
+    checksum.write(&udp_len.to_be_bytes());
+    set_udp_checksum(runtime, index, checksum)?;
 
     let buffer = runtime.buffer_mut(index);
     {
@@ -246,21 +241,12 @@ fn udp_output_push_ipv6(
     dst: Ipv6Addr,
     payload_len: u16,
 ) -> RuntimeResult<()> {
-    let checksum = {
-        let buffer = runtime.buffer(index);
-        let datagram = buffer.current();
-        internet_checksum_parts(&[
-            &src.octets(),
-            &dst.octets(),
-            &u32::from(payload_len).to_be_bytes(),
-            &[0, 0, 0, UDP_PROTOCOL],
-            datagram,
-        ])
-    };
-    {
-        let buffer = runtime.buffer_mut(index);
-        buffer.current_mut()[6..8].copy_from_slice(&checksum.to_be_bytes());
-    }
+    let mut checksum = InternetChecksum::default();
+    checksum.write(&src.octets());
+    checksum.write(&dst.octets());
+    checksum.write(&u32::from(payload_len).to_be_bytes());
+    checksum.write(&[0, 0, 0, UDP_PROTOCOL]);
+    set_udp_checksum(runtime, index, checksum)?;
 
     let buffer = runtime.buffer_mut(index);
     {
@@ -279,6 +265,31 @@ fn udp_output_push_ipv6(
     );
     network.ip_mut().set_ip_version(Some(6));
     network.ip_mut().set_ip_protocol(Some(UDP_PROTOCOL));
+    Ok(())
+}
+
+fn set_udp_checksum(
+    runtime: &mut DataPlaneMain,
+    index: u32,
+    mut checksum: InternetChecksum,
+) -> RuntimeResult<()> {
+    {
+        let buffer = runtime.buffer_mut(index);
+        let (header, _) = UdpHeader::mut_from_prefix(buffer.current_mut())
+            .map_err(|_| UdpTransportError::OutputHeader)?;
+        header.set_checksum(0);
+    }
+    for buffer in runtime.chain(index) {
+        checksum.write(buffer.current());
+    }
+    let value = match checksum.finish() as u16 {
+        0 => u16::MAX,
+        value => value,
+    };
+    let buffer = runtime.buffer_mut(index);
+    let (header, _) = UdpHeader::mut_from_prefix(buffer.current_mut())
+        .map_err(|_| UdpTransportError::OutputHeader)?;
+    header.set_checksum(value);
     Ok(())
 }
 

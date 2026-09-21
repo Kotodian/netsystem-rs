@@ -1,14 +1,13 @@
 use std::cell::UnsafeCell;
-use std::mem::size_of;
-use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
+use std::net::{IpAddr, SocketAddr};
 use std::sync::{Arc, OnceLock};
 
-use crate::wire::UdpHeader;
+use crate::protocol::UdpHeader;
 use hammer_core::data_plane::{BufferPacketCursor, Frame, NodeId};
 use hammer_infra::bitmap::Bitmap;
-use hammer_infra::checksum::internet_checksum_parts;
 use hammer_infra::sparse_vec::SparseVec;
 use hammer_plugin_ip::protocol::icmp::IcmpErrorMetadata;
+use hammer_plugin_ip::protocol::ip::{Ipv4Header, Ipv6Header};
 use hammer_runtime::RuntimeResult;
 use hammer_runtime::{
     DataPlaneMain, Node, NodeProcessFn, NodeRuntime, RuntimeError, TraceFormatter,
@@ -16,6 +15,7 @@ use hammer_runtime::{
 };
 use hammer_service::data_plane::set_index_node_error;
 use hammer_service::opaque::NetworkOpaque;
+use zerocopy::FromBytes;
 
 use crate::UdpIpVersion;
 
@@ -734,9 +734,12 @@ fn next_slot_for_index(
             );
         }
 
-        let header = match read_udp_header(current, cursor.transport_header_offset()) {
-            Ok(header) => header,
-            Err(_) => {
+        let header = match current
+            .get(cursor.transport_header_offset()..)
+            .and_then(|transport| UdpHeader::ref_from_prefix(transport).ok())
+        {
+            Some((header, _)) => header,
+            None => {
                 return resolve_drop_error(
                     runtime,
                     index,
@@ -766,29 +769,7 @@ fn next_slot_for_index(
                 None,
             );
         }
-        let Some(datagram_end) = cursor.transport_header_offset().checked_add(udp_len) else {
-            return resolve_drop_error(
-                runtime,
-                index,
-                UdpInputError::BadLength,
-                None,
-                None,
-                None,
-                None,
-            );
-        };
-        let Some(datagram) = current.get(cursor.transport_header_offset()..datagram_end) else {
-            return resolve_drop_error(
-                runtime,
-                index,
-                UdpInputError::BadLength,
-                None,
-                None,
-                None,
-                None,
-            );
-        };
-        if !udp_checksum_is_valid(current, cursor, version, header.checksum(), datagram) {
+        if !udp_checksum_is_allowed(version, header.checksum()) {
             return resolve_drop_error(
                 runtime,
                 index,
@@ -958,38 +939,20 @@ fn udp_socket_addrs(
     source_port: u16,
     destination_port: u16,
 ) -> Option<(SocketAddr, SocketAddr)> {
+    let network = packet.get(network_header_offset..)?;
     match version {
         UdpIpVersion::V4 => {
-            let source = packet.get(network_header_offset + 12..network_header_offset + 16)?;
-            let destination = packet.get(network_header_offset + 16..network_header_offset + 20)?;
+            let (header, _) = Ipv4Header::ref_from_prefix(network).ok()?;
             Some((
-                SocketAddr::new(
-                    IpAddr::V4(Ipv4Addr::new(
-                        destination[0],
-                        destination[1],
-                        destination[2],
-                        destination[3],
-                    )),
-                    destination_port,
-                ),
-                SocketAddr::new(
-                    IpAddr::V4(Ipv4Addr::new(source[0], source[1], source[2], source[3])),
-                    source_port,
-                ),
+                SocketAddr::new(IpAddr::V4(header.destination()), destination_port),
+                SocketAddr::new(IpAddr::V4(header.source()), source_port),
             ))
         }
         UdpIpVersion::V6 => {
-            let source = packet.get(network_header_offset + 8..network_header_offset + 24)?;
-            let destination = packet.get(network_header_offset + 24..network_header_offset + 40)?;
+            let (header, _) = Ipv6Header::ref_from_prefix(network).ok()?;
             Some((
-                SocketAddr::new(
-                    IpAddr::V6(Ipv6Addr::from(<[u8; 16]>::try_from(destination).ok()?)),
-                    destination_port,
-                ),
-                SocketAddr::new(
-                    IpAddr::V6(Ipv6Addr::from(<[u8; 16]>::try_from(source).ok()?)),
-                    source_port,
-                ),
+                SocketAddr::new(IpAddr::V6(header.destination()), destination_port),
+                SocketAddr::new(IpAddr::V6(header.source()), source_port),
             ))
         }
     }
@@ -1119,41 +1082,10 @@ fn valid_udp_len(transport_header_offset: usize, packet_len: usize, udp_len: usi
 }
 
 #[inline(always)]
-fn udp_checksum_is_valid(
-    packet: &[u8],
-    cursor: BufferPacketCursor,
-    version: UdpIpVersion,
-    checksum: u16,
-    datagram: &[u8],
-) -> bool {
-    let network_header_offset = cursor.network_header_offset();
+fn udp_checksum_is_allowed(version: UdpIpVersion, checksum: u16) -> bool {
     match version {
-        UdpIpVersion::V4 => {
-            if checksum == 0 {
-                return true;
-            }
-            let (Some(source), Some(destination)) = (
-                packet.get(network_header_offset + 12..network_header_offset + 16),
-                packet.get(network_header_offset + 16..network_header_offset + 20),
-            ) else {
-                return false;
-            };
-            let length = (datagram.len() as u16).to_be_bytes();
-            internet_checksum_parts(&[source, destination, &[0, 17], &length, datagram]) == 0
-        }
-        UdpIpVersion::V6 => {
-            if checksum == 0 {
-                return false;
-            }
-            let (Some(source), Some(destination)) = (
-                packet.get(network_header_offset + 8..network_header_offset + 24),
-                packet.get(network_header_offset + 24..network_header_offset + 40),
-            ) else {
-                return false;
-            };
-            let length = (datagram.len() as u32).to_be_bytes();
-            internet_checksum_parts(&[source, destination, &length, &[0, 0, 0, 17], datagram]) == 0
-        }
+        UdpIpVersion::V4 => true,
+        UdpIpVersion::V6 => checksum != 0,
     }
 }
 
@@ -1178,17 +1110,4 @@ fn refresh_udp_cursor(
             .with_transport_payload_offset(transport_payload_offset),
     );
     Ok(())
-}
-
-#[inline(always)]
-fn read_udp_header(packet: &[u8], offset: usize) -> RuntimeResult<UdpHeader> {
-    let end = offset
-        .checked_add(size_of::<UdpHeader>())
-        .ok_or(UdpControlError::HeaderOutOfRange { offset })?;
-    let bytes = packet
-        .get(offset..end)
-        .ok_or(UdpControlError::HeaderOutOfRange { offset })?;
-    // SAFETY: `bytes` has exactly the size of `UdpHeader`; unaligned reads are
-    // valid because network headers may start at arbitrary buffer offsets.
-    Ok(unsafe { bytes.as_ptr().cast::<UdpHeader>().read_unaligned() })
 }
