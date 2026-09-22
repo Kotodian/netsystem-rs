@@ -350,6 +350,7 @@ impl<'a> TcpListener<'a> {
                 TcpConnection::new(
                     None,
                     worker_id,
+                    self.tcp.protocol(),
                     packet.local.port(),
                     Some(packet.local),
                     packet.remote,
@@ -429,6 +430,7 @@ impl<'a> TcpListener<'a> {
                 let mut connection = TcpConnection::new(
                     None,
                     worker_id,
+                    self.tcp.protocol(),
                     packet.local.port(),
                     Some(packet.local),
                     packet.remote,

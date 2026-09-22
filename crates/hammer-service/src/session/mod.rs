@@ -10,6 +10,7 @@ pub mod app;
 pub mod application;
 pub mod config;
 mod control;
+pub mod core;
 pub mod endpoint;
 pub mod error;
 pub mod lookup;
@@ -23,18 +24,27 @@ pub use app::AppWorker;
 pub use application::{
     APPLICATION_MAIN, ApplicationError, ApplicationMain, ApplicationMqResources, application_main,
 };
-pub use config::Session;
+pub use config::Session as SessionSettings;
+pub use core::{
+    PoolReallocationState, SESSION_E_ALLOC, SESSION_E_INVALID, SESSION_E_MQ_MSG_ALLOC,
+    SESSION_E_NOINTF, SESSION_E_NOIP, SESSION_E_NONE, SESSION_E_NOPORT, SESSION_E_NOROUTE,
+    SESSION_E_NOSESSION, SESSION_E_NOSUPPORT, SESSION_E_PORTINUSE, SESSION_E_SEG_CREATE,
+    SESSION_E_SEG_NO_SPACE, SESSION_E_TRANSPORT_NO_REG, SESSION_E_UNKNOWN,
+    SESSION_EVENT_QUEUE_FULL, SESSION_EVENT_QUEUE_LOCK_FAILED, SESSION_INDEX_INVALID, Session,
+    SessionConfig, SessionControlData, SessionDmaTransfer, SessionEvent, SessionEventElement,
+    SessionFlags, SessionHandle, SessionMain, SessionMigrationRequest, SessionMigrationState,
+    SessionRuntimeEngine, SessionRxSegment, SessionState, SessionTxContext, SessionWorker,
+    SessionWorkerFlags, SessionWorkerState,
+};
 pub use endpoint::SessionEndpoint;
 pub use error::{SessionConnectError, SessionQueueError};
 pub use lookup::{SessionLookup, SessionLookupResult};
 pub use node::{AppSessionInputNode, SESSION_QUEUE_IO_BUDGET, SessionQueueNext, SessionQueueNode};
 pub use protocol::{SessionAppVft, register_session_app};
-pub use runtime::{
-    SESSION_MAIN, SessionAcceptMetadata, SessionEndpointRole, SessionWorker, session_main,
-};
+pub use runtime::{SESSION_MAIN, SessionAcceptMetadata, SessionEndpointRole, session_main};
 pub use table::SessionTable;
 
-static SESSION_CONFIG: OnceLock<Session> = OnceLock::new();
+static SESSION_CONFIG: OnceLock<config::Session> = OnceLock::new();
 static APP_SERVER: OnceLock<Arc<AppServer>> = OnceLock::new();
 static APP_SESSION_INPUT_NODE: OnceLock<NodeId> = OnceLock::new();
 
@@ -42,7 +52,7 @@ pub fn app_server() -> Option<Arc<AppServer>> {
     APP_SERVER.get().map(Arc::clone)
 }
 
-pub fn session_config() -> &'static Session {
+pub fn session_config() -> &'static config::Session {
     SESSION_CONFIG
         .get()
         .expect("Session configuration is installed before Session initialization")

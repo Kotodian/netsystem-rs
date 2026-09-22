@@ -18,10 +18,12 @@ use crate::{
     TcpTimestampOption,
 };
 use hammer_infra::align::CacheLineAlignMark;
+use hammer_plugin_session::{IpTransportConnection, IpTransportConnectionId};
 use hammer_runtime::DataWorkerId;
 use hammer_runtime::{RuntimeError, RuntimeResult};
 use hammer_service::session::runtime::RxDelivery;
 use hammer_service::transport::congestion::{CongestionController, CongestionMetrics};
+use hammer_service::transport::{Pacer, TransportConnectionFlags};
 use thiserror::Error;
 
 pub(crate) const TCP_MAX_WINDOW_SCALE: u8 = 14;
@@ -297,6 +299,7 @@ struct TcpConnectionCacheline1 {
 
 #[derive(Debug, Clone)]
 pub struct TcpConnection {
+    pub base: IpTransportConnection,
     cacheline0: TcpConnectionCacheline0,
     cacheline1: TcpConnectionCacheline1,
     retransmit_timeout: TcpRetransmitTimeoutState,
@@ -339,6 +342,7 @@ impl TcpConnection {
     pub fn new(
         connection_id: Option<TcpConnectionId>,
         owner_worker: DataWorkerId,
+        transport_protocol: u8,
         local_port: u16,
         local: Option<SocketAddr>,
         remote: SocketAddr,
@@ -346,7 +350,29 @@ impl TcpConnection {
         let policy = crate::active_tcp_policy();
         let mss = policy.mss as u32;
         let session_id = 0;
+        let local_endpoint = local.unwrap_or_else(|| match remote {
+            SocketAddr::V4(_) => SocketAddr::from(([0, 0, 0, 0], local_port)),
+            SocketAddr::V6(_) => SocketAddr::from(([0, 0, 0, 0, 0, 0, 0, 0], local_port)),
+        });
+        let endpoint = match (local_endpoint, remote) {
+            (SocketAddr::V4(local), SocketAddr::V4(remote)) => {
+                IpTransportConnectionId::from((0, local, remote, transport_protocol))
+            }
+            (SocketAddr::V6(local), SocketAddr::V6(remote)) => {
+                IpTransportConnectionId::from((0, local, remote, transport_protocol))
+            }
+            _ => panic!("TCP connection endpoint family mismatch"),
+        };
         Self {
+            base: IpTransportConnection {
+                session: hammer_service::session::SessionHandle::invalid(),
+                connection_index: u32::MAX,
+                worker_index: owner_worker.slot() as u32,
+                flags: TransportConnectionFlags::default(),
+                endpoint,
+                pacer: Pacer::default(),
+                opaque: 0,
+            },
             cacheline0: TcpConnectionCacheline0 {
                 cacheline0: CacheLineAlignMark,
                 state: TcpState::Closed,
@@ -426,6 +452,10 @@ impl TcpConnection {
         }
         self.cacheline1.session_id = session_id;
         self.cacheline1.connection_id = Some(TcpConnectionId::new(u64::from(session_id)));
+        self.base.session = hammer_service::session::SessionHandle {
+            worker_index: self.base.worker_index,
+            session_index: session_id,
+        };
         Ok(())
     }
 
@@ -1163,6 +1193,11 @@ impl TcpConnection {
         self.snd_nxt = self.iss.advance(1);
         self.fast_open_syn_payload_len = 0;
         self.state = TcpState::SynSent;
+    }
+
+    pub(crate) fn listen_state(&mut self) {
+        assert_eq!(self.state, TcpState::Closed);
+        self.state = TcpState::Listen;
     }
 
     pub fn set_fast_open_cookie(&mut self, cookie: Option<TcpFastOpenCookie>) {

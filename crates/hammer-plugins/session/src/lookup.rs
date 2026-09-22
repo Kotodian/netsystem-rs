@@ -1,9 +1,10 @@
-use std::cell::UnsafeCell;
+use hammer_infra::bihash::BihashIter;
 use hammer_infra::pool::Pool;
 use hammer_plugin_ip::{IpVersion, fib_table_lock, fib_table_unlock};
 use hammer_runtime::app::SessionHandle;
 use hammer_service::net::FibSource;
 use hammer_service::session::{SessionLookup, SessionLookupResult};
+use std::cell::UnsafeCell;
 
 use crate::config::IpSessionTableConfig;
 use crate::endpoint::{IpHalfOpenHandle, IpSessionEndpoint, IpTransportConnectionId};
@@ -13,6 +14,92 @@ use crate::table::IpSessionTable;
 pub enum IpSessionFamily {
     Ip4,
     Ip6,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct IpSessionLookupKey {
+    pub words: [u64; 6],
+    pub word_count: u8,
+}
+
+impl From<&IpTransportConnectionId> for IpSessionLookupKey {
+    #[inline(always)]
+    fn from(connection: &IpTransportConnectionId) -> Self {
+        match Key::from(connection) {
+            Key::Ip4(key) => Self {
+                words: [key as u64, (key >> 64) as u64, 0, 0, 0, 0],
+                word_count: 2,
+            },
+            Key::Ip6(words) => Self {
+                words,
+                word_count: 6,
+            },
+        }
+    }
+}
+
+pub enum SessionTableIterator<'table> {
+    Short(BihashIter<'table, u128, 4>),
+    Long(BihashIter<'table, [u64; 6], 4>),
+    Local {
+        short: BihashIter<'table, u128, 4>,
+        long: BihashIter<'table, [u64; 6], 4>,
+        short_complete: bool,
+    },
+}
+
+impl Iterator for SessionTableIterator<'_> {
+    type Item = (IpSessionLookupKey, u64);
+
+    fn next(&mut self) -> Option<Self::Item> {
+        match self {
+            Self::Short(iterator) => iterator.next().map(|(key, value)| {
+                (
+                    IpSessionLookupKey {
+                        words: [key as u64, (key >> 64) as u64, 0, 0, 0, 0],
+                        word_count: 2,
+                    },
+                    value,
+                )
+            }),
+            Self::Long(iterator) => iterator.next().map(|(words, value)| {
+                (
+                    IpSessionLookupKey {
+                        words,
+                        word_count: 6,
+                    },
+                    value,
+                )
+            }),
+            Self::Local {
+                short,
+                long,
+                short_complete,
+            } => {
+                if !*short_complete {
+                    if let Some((key, value)) = short.next() {
+                        return Some((
+                            IpSessionLookupKey {
+                                words: [key as u64, (key >> 64) as u64, 0, 0, 0, 0],
+                                word_count: 2,
+                            },
+                            value,
+                        ));
+                    }
+                    *short_complete = true;
+                }
+                long.next().map(|(words, value)| {
+                    (
+                        IpSessionLookupKey {
+                            words,
+                            word_count: 6,
+                        },
+                        value,
+                    )
+                })
+            }
+        }
+    }
 }
 
 impl From<IpSessionFamily> for usize {
@@ -184,6 +271,43 @@ impl IpSessionLookup {
             }),
             config,
         }
+    }
+
+    pub fn iter(&self, table_index: u32) -> Option<SessionTableIterator<'_>> {
+        let table = self.table(table_index)?;
+        if table.is_local() {
+            let short = table
+                .ip4_hashes()
+                .expect("local Session table has short hashes")
+                .sessions()
+                .iter();
+            let long = table
+                .ip6_hashes()
+                .expect("local Session table has long hashes")
+                .sessions()
+                .iter();
+            return Some(SessionTableIterator::Local {
+                short,
+                long,
+                short_complete: false,
+            });
+        }
+        if table.family_matches(true) {
+            return Some(SessionTableIterator::Short(
+                table
+                    .ip4_hashes()
+                    .expect("short Session table has short hashes")
+                    .sessions()
+                    .iter(),
+            ));
+        }
+        Some(SessionTableIterator::Long(
+            table
+                .ip6_hashes()
+                .expect("long Session table has long hashes")
+                .sessions()
+                .iter(),
+        ))
     }
 
     #[inline]
@@ -410,9 +534,7 @@ impl IpSessionLookup {
         &self,
         connection: &IpTransportConnectionId,
     ) -> Option<&IpSessionTable> {
-        self.table(
-            self.table_index(IpSessionFamily::from(connection), connection.fib_index()),
-        )
+        self.table(self.table_index(IpSessionFamily::from(connection), connection.fib_index()))
     }
 
     fn listener_for_connection(
@@ -476,11 +598,8 @@ impl SessionLookup for IpSessionLookup {
     type HalfOpenHandle = IpHalfOpenHandle;
 
     fn add_connection(&self, connection: &Self::ConnectionId, handle: SessionHandle) {
-        let table_index =
-            self.get_or_alloc_table_index(
-                IpSessionFamily::from(connection),
-                connection.fib_index(),
-            );
+        let table_index = self
+            .get_or_alloc_table_index(IpSessionFamily::from(connection), connection.fib_index());
         let table = self
             .table(table_index)
             .expect("allocated Session table remains live");
@@ -560,27 +679,18 @@ impl SessionLookup for IpSessionLookup {
         match endpoint.transport().local.address {
             std::net::IpAddr::V4(_) => table
                 .ip4_hashes()
-                .is_some_and(|table| {
-                    table
-                        .sessions()
-                        .remove(&u128::from(Key::from(endpoint)))
-                }),
-            std::net::IpAddr::V6(_) => table
-                .ip6_hashes()
-                .is_some_and(|table| {
-                    table
-                        .sessions()
-                        .remove(&<[u64; 6]>::from(Key::from(endpoint)))
-                }),
+                .is_some_and(|table| table.sessions().remove(&u128::from(Key::from(endpoint)))),
+            std::net::IpAddr::V6(_) => table.ip6_hashes().is_some_and(|table| {
+                table
+                    .sessions()
+                    .remove(&<[u64; 6]>::from(Key::from(endpoint)))
+            }),
         }
     }
 
     fn add_half_open(&self, connection: &Self::ConnectionId, handle: Self::HalfOpenHandle) {
-        let table_index =
-            self.get_or_alloc_table_index(
-                IpSessionFamily::from(connection),
-                connection.fib_index(),
-            );
+        let table_index = self
+            .get_or_alloc_table_index(IpSessionFamily::from(connection), connection.fib_index());
         let table = self
             .table(table_index)
             .expect("allocated Session table remains live");

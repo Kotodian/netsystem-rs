@@ -37,7 +37,8 @@ use hammer_infra::svm::fifo::{Fifo, FifoError};
 use hammer_runtime::DataWorkerId;
 use hammer_runtime::error::RuntimeError;
 use hammer_runtime::session::SessionStreamDirection;
-use hammer_service::session::{SessionEndpointRole, SessionWorker};
+use hammer_service::session::SessionEndpointRole;
+use hammer_service::session::runtime::SessionWorker;
 
 use crate::http_common::{BodyAccumulator, PublishError, publish_body_chunk};
 use crate::http3::preface::encode_control_preface;
