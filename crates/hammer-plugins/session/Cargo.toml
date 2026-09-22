@@ -20,3 +20,4 @@ hammer-component-macros = { path = "../../hammer-component-macros" }
 linkme = { workspace = true }
 serde = { workspace = true }
 tracing = { workspace = true }
+thiserror = { workspace = true }

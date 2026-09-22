@@ -13,7 +13,7 @@ pub struct IpSessionConfig {
     pub v6_halfopen_table_buckets: u32,
     pub v6_halfopen_table_memory: u32,
     #[serde(flatten)]
-    pub transport: hammer_service::transport::Config,
+    pub transport: crate::transport::IpTransportConfig,
 }
 
 pub type IpSessionTableConfig = IpSessionConfig;

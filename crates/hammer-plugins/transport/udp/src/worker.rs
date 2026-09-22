@@ -6,7 +6,10 @@ use std::sync::{Arc, OnceLock};
 use hammer_core::data_plane::{Frame, NodeId, NodeState};
 use hammer_infra::align::CacheLineAlignMark;
 use hammer_infra::pool::Pool;
-use hammer_plugin_session::{IpSessionEndpoint, IpTransportConnectionId, IpTransportMain, session_lookup};
+use hammer_plugin_session::{
+    IpSessionEndpoint, IpSessionMain, IpTransportConnectionId, IpTransportEndpoint,
+    IpTransportEndpointConfig, IpTransportMain, session_lookup,
+};
 use hammer_runtime::app::{SessionDgramHeader, SessionHandle};
 use hammer_runtime::{
     DataPlaneMain, DataWorkerId, NodeRuntime, RuntimeError, RuntimeResult, SessionConnectEndpoint,
@@ -19,9 +22,13 @@ use hammer_service::session::runtime::{
     SessionSwitchPoolStatus, SessionTransport, SessionWorker, TransportInternalTransport,
     TransportInternalTx, dispatch_session_queue_events, session_main,
 };
-use hammer_service::session::{SessionLookup, SessionLookupResult, SessionQueueNext};
+use hammer_service::session::{
+    SESSION_E_INVALID, SESSION_E_NONE, SessionHandle as ServiceSessionHandle, SessionLookup,
+    SessionLookupResult, SessionQueueNext,
+};
 use hammer_service::transport::{
-    Options, SendParams, Service, Transport, TransportVft, TxMode, register_transport,
+    Transport, TransportMain, TransportOptions, TransportSendParams, TransportServiceType,
+    TransportTxMode, TransportVft, register_transport,
 };
 
 use crate::UdpIpVersion;
@@ -69,6 +76,8 @@ pub(crate) enum UdpTransportError {
     InvalidConnection,
     #[error("UDP output header could not be written")]
     OutputHeader,
+    #[error("Session transport registration returned retval {retval}")]
+    SessionTransportRegistration { retval: i32 },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -130,6 +139,7 @@ impl UdpWorkerSlot {
 pub struct UdpMain {
     protocol: u8,
     listeners: Arc<UdpListenerCell>,
+    listener_connections: UnsafeCell<Pool<UdpConnection>>,
     workers: Box<[UdpWorkerSlot]>,
 }
 
@@ -149,6 +159,7 @@ impl UdpMain {
         Self {
             protocol,
             listeners: Arc::new(UdpListenerCell::new()),
+            listener_connections: UnsafeCell::new(Pool::new()),
             workers,
         }
     }
@@ -199,58 +210,269 @@ impl UdpMain {
             return_node,
         )
     }
+
+    pub fn publish_connection(
+        &self,
+        sessions: &IpSessionMain,
+        worker_index: u32,
+        connection_index: u32,
+    ) -> i32 {
+        let Some(connection) = self.connection(connection_index, worker_index) else {
+            return SESSION_E_INVALID;
+        };
+        sessions.publish(connection.base.endpoint, connection.base.session)
+    }
 }
 
-impl Transport<hammer_plugin_session::IpTransportEndpointConfig> for UdpMain {
-    type Error = RuntimeError;
+pub struct UdpTransportAttribute;
 
-    const OPTIONS: Options = Options::new(
-        "udp",
-        "U",
-        TxMode::Datagram,
-        Service::Connectionless,
-    );
+impl Transport<IpTransportEndpointConfig> for UdpMain {
+    type Connection = UdpConnection;
+    type Attribute = UdpTransportAttribute;
 
-    fn start_listen(&self, endpoint: IpSessionEndpoint) -> Result<u32, Self::Error> {
-        hammer_runtime::ensure_main_thread_with_barrier()?;
-        let transport = IpTransportMain::global()?;
-        transport.mark_used(&endpoint).map_err(RuntimeError::from)?;
-        let local = endpoint.transport().local;
+    fn options(&self) -> TransportOptions {
+        TransportOptions::new(
+            TransportTxMode::Datagram,
+            TransportServiceType::Connectionless,
+        )
+    }
+
+    fn connect(&self, endpoint: &IpTransportEndpointConfig, session: ServiceSessionHandle) -> i32 {
+        let local = SocketAddr::new(endpoint.local.address, endpoint.local.port);
+        let remote = SocketAddr::new(endpoint.peer.address, endpoint.peer.port);
+        let Some(slot) = self.workers.get(session.worker_index as usize) else {
+            return SESSION_E_INVALID;
+        };
+        let worker = unsafe { &mut *slot.worker.as_ptr() };
+        let Some(mut connection) =
+            UdpConnection::connected(worker.worker, self.protocol, local, remote)
+        else {
+            return SESSION_E_INVALID;
+        };
+        if !connection.attach_session(session.session_index) {
+            return SESSION_E_INVALID;
+        }
+        let Ok(index) = worker.insert_connection(connection) else {
+            return SESSION_E_INVALID;
+        };
+        let Ok(retval) = i32::try_from(index) else {
+            drop(worker.remove_connection(index));
+            return SESSION_E_INVALID;
+        };
+        worker.lookup.insert_tuple(index, local, remote);
+        retval
+    }
+
+    fn connect_stream(
+        &self,
+        endpoint: &IpTransportEndpointConfig,
+        session: ServiceSessionHandle,
+    ) -> i32 {
+        drop((endpoint, session));
+        hammer_service::session::SESSION_E_NOSUPPORT
+    }
+
+    fn start_listen(
+        &self,
+        endpoint: &IpTransportEndpointConfig,
+        session: ServiceSessionHandle,
+    ) -> u32 {
+        if hammer_runtime::ensure_main_thread_with_barrier().is_err() {
+            return SESSION_E_INVALID as u32;
+        }
+        let session_endpoint = IpSessionEndpoint::new(*endpoint, self.protocol);
+        let Ok(transport) = IpTransportMain::global() else {
+            return SESSION_E_INVALID as u32;
+        };
+        let retval = transport.mark_used(&session_endpoint);
+        if retval != SESSION_E_NONE {
+            return retval as u32;
+        }
+        let local = endpoint.local;
         let listener = UdpListener::new(
             SocketAddr::new(local.address, local.port),
-            SessionHandle::new(u32::MAX, 0),
-            DataWorkerId::new(0),
-        )
-        .ok_or(UdpTransportError::InvalidConnection)?;
+            session.into(),
+            DataWorkerId::new(session.worker_index),
+        );
+        let Some(listener) = listener else {
+            transport.release(&session_endpoint);
+            return SESSION_E_INVALID as u32;
+        };
         self.listeners.get_mut().push(listener);
-        Ok(u32::MAX)
+        let connection_index =
+            unsafe { &mut *self.listener_connections.get() }.insert(UdpConnection::listener(
+                DataWorkerId::new(session.worker_index),
+                self.protocol,
+                SocketAddr::new(local.address, local.port),
+                session.session_index,
+            ));
+        unsafe { &mut *self.listener_connections.get() }
+            .get_mut(connection_index)
+            .expect("inserted UDP listener remains in its pool")
+            .base
+            .connection_index = connection_index;
+        connection_index
     }
 
-    fn stop_listen(&self, connection_index: u32) -> Result<(), Self::Error> {
-        hammer_runtime::ensure_main_thread_with_barrier()?;
+    fn stop_listen(&self, connection_index: u32) -> u32 {
+        if hammer_runtime::ensure_main_thread_with_barrier().is_err() {
+            return SESSION_E_INVALID as u32;
+        }
+        let listener_connections = unsafe { &mut *self.listener_connections.get() };
+        let Some(connection) = listener_connections.get(connection_index) else {
+            return SESSION_E_INVALID as u32;
+        };
+        let Some(session_index) = connection.session() else {
+            return SESSION_E_INVALID as u32;
+        };
+        let endpoint = IpSessionEndpoint::new(
+            udp_endpoint_pair(connection.local(), connection.remote()).0,
+            self.protocol,
+        );
         let listeners = self.listeners.get_mut();
-        let position = listeners
+        let Some(position) = listeners
             .iter()
-            .position(|listener| listener.session_listener().session_index == connection_index)
-            .ok_or(UdpTransportError::ListenerMissing {
-                listener: SessionHandle::new(connection_index, 0),
-            })?;
+            .position(|listener| listener.session_listener().session_index == session_index)
+        else {
+            return SESSION_E_INVALID as u32;
+        };
         listeners.remove(position);
-        Ok(())
+        listener_connections.remove(connection_index);
+        if let Ok(transport) = IpTransportMain::global() {
+            transport.release(&endpoint);
+        }
+        SESSION_E_NONE as u32
     }
 
-    fn connect(&self, endpoint: IpSessionEndpoint) -> Result<u32, Self::Error> {
-        drop(endpoint);
-        Err(UdpTransportError::InvalidConnection.into())
+    fn half_close(&self, connection_index: u32, worker_index: u32) {
+        self.close(connection_index, worker_index);
     }
 
-    fn close(&self, _: u32, _: u32) {}
-
-    fn cleanup(&self, _: u32, _: u32) {}
-
-    fn send_params(&self, _: u32, _: u32) -> Result<SendParams, Self::Error> {
-        Err(UdpTransportError::InvalidConnection.into())
+    fn close(&self, connection_index: u32, worker_index: u32) {
+        if let Some(slot) = self.workers.get(worker_index as usize) {
+            if let Some(connection) =
+                unsafe { &mut *slot.worker.as_ptr() }.connection_mut(connection_index)
+            {
+                connection.close();
+            }
+        }
     }
+
+    fn reset(&self, connection_index: u32, worker_index: u32) {
+        self.close(connection_index, worker_index);
+    }
+
+    fn cleanup(&self, connection_index: u32, worker_index: u32) {
+        if let Some(slot) = self.workers.get(worker_index as usize) {
+            let worker = unsafe { &mut *slot.worker.as_ptr() };
+            let tuple = worker
+                .connection(connection_index)
+                .map(|connection| (connection.local(), connection.remote()));
+            if let Some((local, remote)) = tuple {
+                worker.lookup.remove_tuple(local, remote);
+            }
+            drop(worker.remove_connection(connection_index));
+        }
+    }
+
+    fn cleanup_half_open(&self, _: u32) {}
+
+    fn push_header(&self, _: u32, _: u32, _: &mut [u32], _: u32) -> u32 {
+        0
+    }
+
+    fn send_params(&self, _: u32, _: u32) -> TransportSendParams {
+        TransportSendParams::default()
+    }
+
+    fn update_time(&self, _: f64, _: u32) {}
+
+    fn flush_data(&self, _: u32, _: u32) {}
+
+    fn custom_tx(&self, _: ServiceSessionHandle, _: &mut TransportSendParams) -> i32 {
+        SESSION_E_INVALID
+    }
+
+    fn app_rx_event(&self, _: u32, _: u32) -> i32 {
+        SESSION_E_INVALID
+    }
+
+    #[inline]
+    fn connection(&self, connection_index: u32, worker_index: u32) -> Option<&Self::Connection> {
+        let slot = self.workers.get(worker_index as usize)?;
+        unsafe { (&*slot.worker.as_ptr()).connection(connection_index) }
+    }
+
+    #[inline]
+    fn listener(&self, connection_index: u32) -> Option<&Self::Connection> {
+        unsafe { &*self.listener_connections.get() }.get(connection_index)
+    }
+
+    #[inline]
+    fn half_open(&self, _: u32) -> Option<&Self::Connection> {
+        None
+    }
+
+    fn endpoint(
+        &self,
+        connection_index: u32,
+        worker_index: u32,
+    ) -> (IpTransportEndpointConfig, IpTransportEndpointConfig) {
+        let connection = <Self as Transport<IpTransportEndpointConfig>>::connection(
+            self,
+            connection_index,
+            worker_index,
+        )
+        .expect("UDP endpoint retrieval requires a live connection");
+        udp_endpoint_pair(connection.local(), connection.remote())
+    }
+
+    fn listener_endpoint(
+        &self,
+        connection_index: u32,
+    ) -> (IpTransportEndpointConfig, IpTransportEndpointConfig) {
+        let connection = unsafe { &*self.listener_connections.get() }
+            .get(connection_index)
+            .expect("UDP listener endpoint retrieval requires a live listener");
+        udp_endpoint_pair(connection.local(), connection.remote())
+    }
+
+    fn attribute(&self, _: u32, _: u32, _: &mut Self::Attribute) -> i32 {
+        SESSION_E_INVALID
+    }
+}
+
+fn udp_endpoint_pair(
+    local: SocketAddr,
+    remote: SocketAddr,
+) -> (IpTransportEndpointConfig, IpTransportEndpointConfig) {
+    let local = IpTransportEndpoint {
+        address: local.ip(),
+        port: local.port(),
+        sw_if_index: u32::MAX,
+        fib_index: 0,
+    };
+    let remote = IpTransportEndpoint {
+        address: remote.ip(),
+        port: remote.port(),
+        sw_if_index: u32::MAX,
+        fib_index: 0,
+    };
+    let forward = IpTransportEndpointConfig {
+        local,
+        peer: remote,
+        next_node_index: u32::MAX,
+        next_node_opaque: 0,
+        mss: u16::MAX,
+        dscp: 0,
+        transport_flags: 0,
+    };
+    let reverse = IpTransportEndpointConfig {
+        local: remote,
+        peer: local,
+        ..forward
+    };
+    (forward, reverse)
 }
 
 pub(crate) static UDP_MAIN: OnceLock<UdpMain> = OnceLock::new();
@@ -286,7 +508,13 @@ impl UdpWorker {
     }
 
     fn insert_connection(&mut self, connection: UdpConnection) -> RuntimeResult<u32> {
-        Ok(self.connections.insert(connection))
+        let index = self.connections.insert(connection);
+        self.connections
+            .get_mut(index)
+            .expect("inserted UDP connection remains in its pool")
+            .base
+            .connection_index = index;
+        Ok(index)
     }
 
     fn connection(&self, index: u32) -> Option<&UdpConnection> {
@@ -308,7 +536,7 @@ impl UdpWorker {
         local: SocketAddr,
         remote: SocketAddr,
     ) -> RuntimeResult<(u32, u32)> {
-        let connection = UdpConnection::connected(self.worker, local, remote)
+        let connection = UdpConnection::connected(self.worker, self.protocol, local, remote)
             .ok_or(UdpTransportError::InvalidConnection)?;
         let index = self.insert_connection(connection)?;
         let session_id =
@@ -365,7 +593,7 @@ impl UdpWorker {
         {
             return Err(UdpTransportError::EndpointInUse { endpoint: local }.into());
         }
-        let connection_state = UdpConnection::connected(self.worker, local, remote)
+        let connection_state = UdpConnection::connected(self.worker, self.protocol, local, remote)
             .ok_or(UdpTransportError::InvalidConnection)?;
         let index = self.insert_connection(connection_state)?;
         if endpoint.connection.is_none() && endpoint.app.is_none() {
@@ -652,7 +880,9 @@ impl UdpWorker {
                 self.handoff_migration_datagram_or_drop(runtime, reply);
                 return Ok(());
             };
-            let Some(connection) = UdpConnection::connected(self.worker, local, remote) else {
+            let Some(connection) =
+                UdpConnection::connected(self.worker, self.protocol, local, remote)
+            else {
                 let reply = self.rejected_migration_reply(sessions, reply);
                 self.handoff_migration_datagram_or_drop(runtime, reply);
                 return Ok(());
@@ -995,6 +1225,10 @@ fn init_udp() -> RuntimeResult<()> {
         None,
     ))
     .map_err(RuntimeError::from)?;
+    IpSessionMain::global()
+        .map_err(|retval| UdpTransportError::SessionTransportRegistration { retval })?
+        .register_transport_type(protocol, TransportTxMode::Datagram, u32::MAX)
+        .map_err(|retval| UdpTransportError::SessionTransportRegistration { retval })?;
     let main = UdpMain::new(protocol, hammer_runtime::config::worker::worker_count());
     assert!(
         UDP_MAIN.set(main).is_ok(),

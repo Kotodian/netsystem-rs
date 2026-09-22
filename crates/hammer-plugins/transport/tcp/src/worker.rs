@@ -43,7 +43,13 @@ impl TcpWorker {
 
     #[inline]
     pub(crate) fn insert_connection(&mut self, connection: TcpConnection) -> u32 {
-        self.connections.insert(connection)
+        let index = self.connections.insert(connection);
+        self.connections
+            .get_mut(index)
+            .expect("inserted TCP connection remains in its pool")
+            .base
+            .connection_index = index;
+        index
     }
 
     #[inline]

@@ -1,14 +1,59 @@
+use std::cell::UnsafeCell;
 use std::net::IpAddr;
-use std::sync::OnceLock;
+use std::sync::atomic::{AtomicU32, Ordering};
 
 use hammer_infra::bihash::{Bihash, BihashKey, hash_words};
-use hammer_runtime::{RuntimeError, RuntimeResult};
-use hammer_service::session::SessionEndpoint;
-use hammer_service::transport::{Config, TransportMain};
+use hammer_infra::pool::Pool;
+use hammer_infra::sync::SpinLock;
+use hammer_service::session::{
+    SESSION_E_INVALID, SESSION_E_NOIP, SESSION_E_NONE, SESSION_E_NOPORT, SESSION_E_PORTINUSE,
+    SessionEndpoint,
+};
+use hammer_service::transport::{TransportConnection, TransportMain};
 
 use crate::endpoint::{IpSessionEndpoint, IpTransportConnectionId, IpTransportEndpoint};
 
+const DEFAULT_LOCAL_ENDPOINT_BUCKETS: u32 = 250_000;
+const DEFAULT_LOCAL_ENDPOINT_MEMORY: usize = 512 << 20;
+const LOCAL_ENDPOINT_CLEANUP_THRESHOLD: usize = 32;
+
 type IpLocalEndpoint = SessionEndpoint<IpTransportEndpoint>;
+
+pub type IpTransportConnection = TransportConnection<IpTransportConnectionId>;
+
+#[derive(Debug, Clone, Copy, serde::Deserialize, serde::Serialize)]
+#[serde(default)]
+pub struct IpTransportConfig {
+    #[serde(alias = "local_endpoints_table_buckets")]
+    pub local_endpoint_buckets: u32,
+    #[serde(alias = "local_endpoints_table_memory")]
+    pub local_endpoint_memory: usize,
+    #[serde(alias = "min_src_port")]
+    pub min_source_port: u16,
+    #[serde(alias = "max_src_port")]
+    pub max_source_port: u16,
+}
+
+impl Default for IpTransportConfig {
+    fn default() -> Self {
+        Self {
+            local_endpoint_buckets: DEFAULT_LOCAL_ENDPOINT_BUCKETS,
+            local_endpoint_memory: DEFAULT_LOCAL_ENDPOINT_MEMORY,
+            min_source_port: 1_024,
+            max_source_port: u16::MAX,
+        }
+    }
+}
+
+pub struct LocalEndpointCleanupState {
+    pub freelist: Vec<u32>,
+    pub cleanup_pending: bool,
+}
+
+struct IpLocalEndpointState {
+    endpoint: IpLocalEndpoint,
+    references: AtomicU32,
+}
 
 #[derive(Clone, Copy, Default, PartialEq, Eq)]
 struct IpLocalEndpointKey([u64; 3]);
@@ -20,9 +65,9 @@ impl BihashKey for IpLocalEndpointKey {
     }
 }
 
-impl<'a> From<&'a IpLocalEndpoint> for IpLocalEndpointKey {
+impl From<&IpLocalEndpoint> for IpLocalEndpointKey {
     #[inline(always)]
-    fn from(endpoint: &'a IpLocalEndpoint) -> Self {
+    fn from(endpoint: &IpLocalEndpoint) -> Self {
         let (first, second) = match endpoint.transport().address {
             IpAddr::V4(address) => (u64::from(u32::from(address)), 0),
             IpAddr::V6(address) => {
@@ -31,10 +76,7 @@ impl<'a> From<&'a IpLocalEndpoint> for IpLocalEndpointKey {
                 let mut second = [0; 8];
                 first.copy_from_slice(&octets[..8]);
                 second.copy_from_slice(&octets[8..]);
-                (
-                    u64::from_be_bytes(first),
-                    u64::from_be_bytes(second),
-                )
+                (u64::from_be_bytes(first), u64::from_be_bytes(second))
             }
         };
         Self([
@@ -59,107 +101,219 @@ impl AlpnProtocolTable {
     }
 }
 
-#[hammer_component_macros::runtime_error(subsystem = "transport")]
-#[derive(Debug, thiserror::Error)]
-pub enum LocalEndpointError {
-    #[error("FIB {fib_index} has no route to {remote}")]
-    NoRoute { fib_index: u32, remote: IpAddr },
-    #[error("FIB {fib_index} route to {remote} has no resolving interface")]
-    NoResolvingInterface { fib_index: u32, remote: IpAddr },
-    #[error("interface {sw_if_index} has no local address for {remote}")]
-    NoLocalAddress { sw_if_index: u32, remote: IpAddr },
-    #[error("transport {protocol} has no available local port")]
-    NoLocalPort { protocol: u8 },
-    #[error("local endpoint {endpoint:?} is already in use")]
-    LocalPortInUse { endpoint: IpSessionEndpoint },
-}
-
 pub struct IpTransportMain {
-    main: TransportMain<IpTransportEndpoint, IpLocalEndpointKey, AlpnProtocolTable>,
+    local_endpoints_table: Bihash<IpLocalEndpointKey, 7>,
+    local_endpoints: UnsafeCell<Pool<IpLocalEndpointState>>,
+    port_allocator_seed: AtomicU32,
+    port_allocator_min_src_port: u16,
+    port_allocator_max_src_port: u16,
+    local_endpoint_cleanup: SpinLock<LocalEndpointCleanupState>,
+    alpn_protocols: AlpnProtocolTable,
 }
 
-static TRANSPORT_MAIN: OnceLock<IpTransportMain> = OnceLock::new();
+// SAFETY: the Main Thread is the only pool writer. Data Workers update only
+// endpoint reference counts and the typed cleanup queue; Bihash publishes its
+// own concurrent updates.
+unsafe impl Sync for IpTransportMain {}
 
 impl IpTransportMain {
-    pub fn init(config: Config) -> RuntimeResult<()> {
-        let main = Self {
-            main: TransportMain::new(config, AlpnProtocolTable::new()),
+    #[inline]
+    fn local_endpoints(&self) -> &Pool<IpLocalEndpointState> {
+        unsafe { &*self.local_endpoints.get() }
+    }
+
+    fn reclaim_local_endpoints(&self) {
+        let freelist = {
+            let mut cleanup = self.local_endpoint_cleanup.lock();
+            cleanup.cleanup_pending = false;
+            std::mem::take(&mut cleanup.freelist)
         };
-        assert!(
-            TRANSPORT_MAIN.set(main).is_ok(),
-            "IP TransportMain initialization callback executes once"
-        );
-        Ok(())
-    }
-
-    pub fn global() -> RuntimeResult<&'static Self> {
-        TRANSPORT_MAIN
-            .get()
-            .ok_or(RuntimeError::PluginStateNotInitialized { plugin: "session" })
-    }
-
-    pub fn mark_used(&self, endpoint: &IpSessionEndpoint) -> Result<(), LocalEndpointError> {
-        let local = local_endpoint(endpoint);
-        if self.main.mark_used(local) {
-            Ok(())
-        } else {
-            Err(LocalEndpointError::LocalPortInUse { endpoint: *endpoint })
-        }
-    }
-
-    pub fn share(&self, endpoint: &IpSessionEndpoint) {
-        self.main.share(&local_endpoint(endpoint));
-    }
-
-    pub fn release(&self, endpoint: &IpSessionEndpoint) -> bool {
-        self.main.release(&local_endpoint(endpoint))
-    }
-
-    pub fn allocate_local(
-        &self,
-        mut endpoint: IpSessionEndpoint,
-    ) -> Result<IpSessionEndpoint, LocalEndpointError> {
-        let mut config = *endpoint.transport();
-        if config.local.address.is_unspecified() {
-            return Err(LocalEndpointError::NoLocalAddress {
-                sw_if_index: config.local.sw_if_index,
-                remote: config.peer.address,
-            });
-        }
-        if config.local.port == 0 {
-            let port = self.main.next_source_port();
-            if port == 0 {
-                return Err(LocalEndpointError::NoLocalPort {
-                    protocol: endpoint.transport_protocol(),
-                });
+        let local_endpoints = unsafe { &mut *self.local_endpoints.get() };
+        for index in freelist {
+            let reclaim = local_endpoints
+                .get(index)
+                .is_some_and(|endpoint| endpoint.references.load(Ordering::Acquire) == 0);
+            if reclaim {
+                let removed = local_endpoints.remove(index);
+                debug_assert!(removed.is_some());
             }
-            config.local.port = port;
-            endpoint = SessionEndpoint::new(config, endpoint.transport_protocol());
         }
-        if !self.main.mark_used(local_endpoint(&endpoint)) {
-            return Err(LocalEndpointError::LocalPortInUse { endpoint });
+    }
+
+    fn next_source_port(&self) -> u16 {
+        let range = self
+            .port_allocator_max_src_port
+            .saturating_sub(self.port_allocator_min_src_port);
+        if range == 0 {
+            return self.port_allocator_min_src_port;
         }
-        Ok(endpoint)
-    }
-
-    pub fn local_endpoints_in_use(&self) -> u32 {
-        self.main.local_endpoints_in_use()
-    }
-
-    pub fn max_port_allocation_tries(&self) -> u16 {
-        self.main.max_port_allocation_tries()
-    }
-
-    pub fn clear_port_allocation_stats(&self) {
-        self.main.clear_port_allocation_stats();
+        let mut current = self.port_allocator_seed.load(Ordering::Relaxed);
+        loop {
+            let next = current.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+            match self.port_allocator_seed.compare_exchange_weak(
+                current,
+                next,
+                Ordering::Relaxed,
+                Ordering::Relaxed,
+            ) {
+                Ok(_) => {
+                    return self.port_allocator_min_src_port + (next as u16 % range);
+                }
+                Err(observed) => current = observed,
+            }
+        }
     }
 }
 
+impl TransportMain for IpTransportMain {
+    type Config = IpTransportConfig;
+    type Endpoint = IpSessionEndpoint;
+    type LocalEndpoint = IpLocalEndpoint;
+
+    fn init(config: Self::Config) -> Result<Self, i32> {
+        if config.min_source_port >= config.max_source_port {
+            return Err(SESSION_E_INVALID);
+        }
+        let buckets = if config.local_endpoint_buckets == 0 {
+            DEFAULT_LOCAL_ENDPOINT_BUCKETS
+        } else {
+            config.local_endpoint_buckets
+        };
+        let memory = if config.local_endpoint_memory == 0 {
+            DEFAULT_LOCAL_ENDPOINT_MEMORY
+        } else {
+            config.local_endpoint_memory
+        };
+        Ok(Self {
+            local_endpoints_table: Bihash::with_memory_size(buckets, memory),
+            local_endpoints: UnsafeCell::new(Pool::new()),
+            port_allocator_seed: AtomicU32::new(0),
+            port_allocator_min_src_port: config.min_source_port,
+            port_allocator_max_src_port: config.max_source_port,
+            local_endpoint_cleanup: SpinLock::new(LocalEndpointCleanupState {
+                freelist: Vec::new(),
+                cleanup_pending: false,
+            }),
+            alpn_protocols: AlpnProtocolTable::new(),
+        })
+    }
+
+    fn global() -> Result<&'static Self, i32> {
+        crate::IpSessionMain::global().map(crate::IpSessionMain::transport)
+    }
+
+    fn mark_used(&self, endpoint: &Self::Endpoint) -> i32 {
+        let local = local_endpoint(endpoint);
+        let key = IpLocalEndpointKey::from(&local);
+        if self.local_endpoints_table.lookup(&key).is_some() {
+            return SESSION_E_PORTINUSE;
+        }
+        let local_endpoints = unsafe { &mut *self.local_endpoints.get() };
+        let index = local_endpoints.insert(IpLocalEndpointState {
+            endpoint: local,
+            references: AtomicU32::new(1),
+        });
+        if self
+            .local_endpoints_table
+            .insert_if_absent(key, u64::from(index))
+            .is_err()
+        {
+            let removed = local_endpoints.remove(index);
+            debug_assert!(removed.is_some());
+            return SESSION_E_PORTINUSE;
+        }
+        SESSION_E_NONE
+    }
+
+    fn share(&self, endpoint: &Self::Endpoint) {
+        let local = local_endpoint(endpoint);
+        let key = IpLocalEndpointKey::from(&local);
+        let Some(index) = self
+            .local_endpoints_table
+            .lookup(&key)
+            .and_then(|index| u32::try_from(index).ok())
+        else {
+            return;
+        };
+        let endpoint = self
+            .local_endpoints()
+            .get(index)
+            .expect("local endpoint table entry remains in its pool");
+        let previous = endpoint.references.fetch_add(1, Ordering::AcqRel);
+        assert_ne!(
+            previous,
+            u32::MAX,
+            "local endpoint reference count overflowed"
+        );
+    }
+
+    fn release(&self, endpoint: &Self::Endpoint) -> i32 {
+        let local = local_endpoint(endpoint);
+        let key = IpLocalEndpointKey::from(&local);
+        let Some(index) = self
+            .local_endpoints_table
+            .lookup(&key)
+            .and_then(|index| u32::try_from(index).ok())
+        else {
+            return -1;
+        };
+        let endpoint = self
+            .local_endpoints()
+            .get(index)
+            .expect("local endpoint table entry remains in its pool");
+        let previous = endpoint.references.fetch_sub(1, Ordering::AcqRel);
+        assert_ne!(previous, 0, "local endpoint reference count underflowed");
+        if previous != 1 {
+            return -1;
+        }
+        let removed = self
+            .local_endpoints_table
+            .remove_if_current(&key, u64::from(index));
+        assert!(
+            removed,
+            "released local endpoint remains in its lookup table"
+        );
+        let mut cleanup = self.local_endpoint_cleanup.lock();
+        cleanup.freelist.push(index);
+        if cleanup.freelist.len() > LOCAL_ENDPOINT_CLEANUP_THRESHOLD {
+            cleanup.cleanup_pending = true;
+        }
+        SESSION_E_NONE
+    }
+
+    fn allocate_local(&self, mut endpoint: Self::Endpoint) -> Result<Self::Endpoint, i32> {
+        if self.local_endpoint_cleanup.lock().cleanup_pending {
+            self.reclaim_local_endpoints();
+        }
+        let mut config = *endpoint.transport();
+        if config.local.address.is_unspecified() {
+            return Err(SESSION_E_NOIP);
+        }
+        if config.local.port != 0 {
+            let retval = self.mark_used(&endpoint);
+            return if retval == SESSION_E_NONE {
+                Ok(endpoint)
+            } else {
+                Err(retval)
+            };
+        }
+        let limit = self
+            .port_allocator_max_src_port
+            .saturating_sub(self.port_allocator_min_src_port);
+        for _ in 0..limit {
+            config.local.port = self.next_source_port();
+            endpoint = SessionEndpoint::new(config, endpoint.transport_protocol());
+            if self.mark_used(&endpoint) == SESSION_E_NONE {
+                return Ok(endpoint);
+            }
+        }
+        Err(SESSION_E_NOPORT)
+    }
+}
+
+#[inline(always)]
 fn local_endpoint(endpoint: &IpSessionEndpoint) -> IpLocalEndpoint {
-    SessionEndpoint::new(
-        endpoint.transport().local,
-        endpoint.transport_protocol(),
-    )
+    SessionEndpoint::new(endpoint.transport().local, endpoint.transport_protocol())
 }
 
 impl From<IpSessionEndpoint> for IpTransportConnectionId {
@@ -188,15 +342,4 @@ impl From<IpSessionEndpoint> for IpTransportConnectionId {
             _ => panic!("IP transport endpoint family mismatch"),
         }
     }
-}
-
-#[hammer_component_macros::init_function(
-    name = "ip_transport_main_init",
-    runs_after = ["session_table_config"]
-)]
-fn init_ip_transport_main() -> RuntimeResult<()> {
-    let config = crate::ip_session_config()
-        .map(|config| config.transport)
-        .unwrap_or_default();
-    IpTransportMain::init(config)
 }
