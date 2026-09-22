@@ -76,7 +76,9 @@ fn init_ip_session_main() -> RuntimeResult<()> {
     session_config.configured_worker_mq_length = event_ring_capacity;
     session_config.event_ring_capacity = event_ring_capacity;
     session_config.session_capacity = session_capacity;
-    session_config.session_enable_asap = true;
+    // VPP session nodes start disabled; enablement is an explicit lifecycle
+    // operation after graph materialization.
+    session_config.session_enable_asap = false;
 
     let mapping = Arc::new(
         SsvmPrivate::server_init_fifo_segment(&SsvmConfig {
@@ -97,14 +99,13 @@ fn init_ip_session_main() -> RuntimeResult<()> {
         },
     )
     .map_err(IpSessionInitError::WorkerMessageQueueSegment)?;
-    let main = IpSessionMain::init(
+    IpSessionMain::init(
         session_config,
         table_config,
         table_config.transport,
         segment,
     )
-    .map_err(|retval| IpSessionInitError::SessionCore { retval })?;
-    IpSessionMain::publish_global(main);
+    .map_err(|source| IpSessionInitError::SessionCore { source })?;
     Ok(())
 }
 
@@ -115,7 +116,7 @@ fn init_ip_session_main() -> RuntimeResult<()> {
 fn session_lookup_init() -> RuntimeResult<()> {
     IpSessionMain::global()
         .map(|_| ())
-        .map_err(|retval| IpSessionInitError::SessionCore { retval }.into())
+        .map_err(|source| IpSessionInitError::SessionCore { source }.into())
 }
 
 #[inline]
@@ -136,8 +137,11 @@ enum IpSessionInitError {
     WorkerMessageQueueMapping(#[source] SsvmError),
     #[error("initialize Session worker message-queue segment")]
     WorkerMessageQueueSegment(#[source] FifoSegmentError),
-    #[error("initialize Session core returned retval {retval}")]
-    SessionCore { retval: i32 },
+    #[error("initialize Session core")]
+    SessionCore {
+        #[source]
+        source: hammer_service::session::SessionError,
+    },
 }
 
 hammer_component_macros::declare_plugin!(

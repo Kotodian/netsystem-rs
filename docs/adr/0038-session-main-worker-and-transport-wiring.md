@@ -1,7 +1,7 @@
 # ADR-0038: Session Main、Session Worker 与 Transport 的三层接线
 
 - 日期：2026-09-21
-- 状态：Accepted，Issue #354 实施
+- 状态：Accepted，Issue #354 实施；本次边界修订 Issue #356
 - 范围：Session/Transport 核心，不包含 Application、AppWorker、Application Namespace、socket、
   Binary API 或外部 client
 - VPP 参考：`third_party/vpp/src/vnet/session/session.h`、`session.c`、`session_node.c`、
@@ -13,8 +13,9 @@ inline 和错误边界。Application 相关生命周期先保持在本文之外�
 Session/Transport 必须知道的 handle、FIFO ownership、listener/half-open 关系和 protocol
 connection identity。
 
-本文明确不把现有 Hammer 的 `SessionQueueNode`、`SessionQueueTransportDispatch` 或旧 transport
-callback 表作为目标 Transport 接线。
+本文明确不把现有 Hammer 的 `SessionQueueTransportDispatch` 或旧 transport callback 表作为目标
+Transport 接线。`SessionQueueNode` 仍是 service-owned Session scheduler 与 FIFO packetization owner；
+其 graph/output 接线由 ADR-0039 定义。
 
 ## 1. 背景与问题
 
@@ -73,9 +74,10 @@ service 不依赖 plugin-session、TCP 或 UDP；plugin-session 不依赖 TCP/UD
 plugin-session 和 service。plugin-session 是 IP Session 与 IP Transport 的组合 owner，但不替
 TCP/UDP 持有 protocol state。
 
-`Transport<T>` 是静态 Rust trait contract。Session core 接收 concrete transport 调用方完成
-lifecycle 操作，不从 registry 取 VFT/function pointer，不保存 `dyn Transport`，也不保存 erased
-protocol state。TCP/UDP 的 packet/TX implementation 由各自 protocol worker 直接执行。
+`Transport<T>` 是静态 Rust trait contract。Session core 接收 concrete transport 调用方提交的
+lifecycle 与 send facts，不从 registry 取 VFT/function pointer，不保存 `dyn Transport`，也不保存
+erased protocol state。Session Queue 拥有 FIFO packetization；TCP/UDP 的 send-param 计算、transport
+header 与 protocol state transition 由各自 protocol worker/output node 执行。
 
 ## 3. VPP ownership 依据
 
@@ -139,6 +141,7 @@ ADR-0038 新路径以静态 trait contract 接线，不通过旧 function-pointe
 
 ```rust
 use std::cell::UnsafeCell;
+use std::sync::OnceLock;
 use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 
 use hammer_infra::linked_list::LinkedList;
@@ -149,6 +152,96 @@ use hammer_infra::svm::msg_queue::SvmMsgQ;
 use hammer_infra::timer_wheel::TimerWheel1t2w2048sl;
 
 pub const SESSION_INDEX_INVALID: u32 = u32::MAX;
+
+// VPP source: session_types.h:514-576, foreach_session_error.
+// SESSION_E_NONE maps to Ok and is deliberately not an error variant.
+// No numeric discriminant is part of the internal Rust contract.
+#[hammer_component_macros::runtime_error(subsystem = "session")]
+#[derive(Debug, thiserror::Error)]
+pub enum SessionError {
+    #[error("unknown Session failure")]
+    Unknown,
+    #[error("connection refused")]
+    Refused,
+    #[error("Session operation timed out")]
+    TimedOut,
+    #[error("Session object or memory allocation failed")]
+    Allocation,
+    #[error("Session object is not owned by the caller")]
+    Owner,
+    #[error("no route")]
+    NoRoute,
+    #[error("no resolving interface")]
+    NoInterface,
+    #[error("local interface has no IP address")]
+    NoIp,
+    #[error("no local port is available")]
+    NoPort,
+    #[error("operation is not supported")]
+    NotSupported,
+    #[error("endpoint is not listening")]
+    NotListening,
+    #[error("Session does not exist")]
+    NoSession,
+    #[error("Application is not attached")]
+    NoApplication,
+    #[error("Application is already attached")]
+    ApplicationAttached,
+    #[error("local port is already in use")]
+    PortInUse,
+    #[error("IP address is already in use")]
+    IpInUse,
+    #[error("IP and port pair is already listening")]
+    AlreadyListening,
+    #[error("address is not in use")]
+    AddressNotInUse,
+    #[error("invalid value")]
+    Invalid,
+    #[error("invalid remote IP address")]
+    InvalidRemoteIp,
+    #[error("invalid Application Worker")]
+    InvalidApplicationWorker,
+    #[error("invalid Application Namespace")]
+    InvalidNamespace,
+    #[error("Session segment has no space for a FIFO pair")]
+    SegmentNoSpace,
+    #[error("new Session segment has no space for a FIFO pair")]
+    NewSegmentNoSpace,
+    #[error("Session segment creation failed")]
+    SegmentCreate,
+    #[error("Session was filtered")]
+    Filtered,
+    #[error("requested Session scope is not supported")]
+    ScopeNotSupported,
+    #[error("Binary API connection has no file descriptor")]
+    BinaryApiNoFileDescriptor,
+    #[error("Binary API file descriptor send failed")]
+    BinaryApiSendFileDescriptor,
+    #[error("Binary API registration does not exist")]
+    BinaryApiRegistrationMissing,
+    #[error("Session message allocation failed")]
+    MessageQueueAllocation,
+    #[error("TLS handshake failed")]
+    TlsHandshake,
+    #[error("eventfd allocation failed")]
+    EventFdAllocation,
+    #[error("extended transport configuration is missing")]
+    ExtendedConfigMissing,
+    #[error("crypto engine is missing")]
+    CryptoEngineMissing,
+    #[error("crypto certificate/key pair is missing")]
+    CryptoKeyPairMissing,
+    #[error("local-scope connect failed")]
+    LocalConnect,
+    #[error("Application Namespace secret is incorrect")]
+    WrongNamespaceSecret,
+    #[error("system call failed")]
+    Syscall,
+    #[error("transport is not registered")]
+    TransportNotRegistered,
+    #[error("maximum stream count reached")]
+    MaxStreamsReached,
+}
 
 // VPP: session.h:468-521, session_handle_tu_t carries worker/session pool identity.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -404,6 +497,9 @@ pub struct Session<O = u32> {
     rx_fifo: Option<SvmFifo>,
     tx_fifo: Option<SvmFifo>,
     connection_index: u32,
+    // ADR-0039: owner transport's latest authoritative send facts. None means
+    // no TX grant has been supplied yet; Session Queue defers the TX event.
+    tx_params: Option<TransportSendParams>,
     listener_handle: SessionHandle,
     half_open_index: u32,
     // VPP: session_types.h:286-287. The session core never interprets this.
@@ -515,6 +611,15 @@ pub struct SessionEvent {
     pub payload: [u64; 2],
 }
 
+// VPP source: session.c:34-85. Lock contention and queue capacity are
+// enqueue ownership outcomes, not foreach_session_error values.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SessionEventEnqueue {
+    Enqueued,
+    Busy,
+    Full,
+}
+
 // VPP: transport_types.h:64-72 and transport.h:273-346. Pacing is a
 // transport-neutral connection fact; IP/TCP/UDP only choose how to update it.
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -583,22 +688,25 @@ pub trait TransportMain: Sized {
 
     // VPP: transport_init, transport.c:1251-1290. Configuration is owned by
     // the concrete transport plugin, not by protocol-neutral service state.
-    fn init(config: Self::Config) -> Result<Self, i32>;
+    fn init(config: Self::Config) -> Result<(), SessionError>;
 
     // Only a real process-global concrete instance may return 'static.
-    fn global() -> Result<&'static Self, i32>;
+    fn global() -> Result<&'static Self, SessionError>;
 
     // VPP: transport_mark_used_local_endpoint, transport.c:717-743.
-    fn mark_used(&self, endpoint: &Self::Endpoint) -> i32;
+    fn mark_used(&self, endpoint: &Self::Endpoint) -> Result<(), SessionError>;
 
     // VPP: transport_share_local_endpoint, transport.c:745-763.
     fn share(&self, endpoint: &Self::Endpoint);
 
     // VPP: transport_release_local_endpoint, transport.c:687-715.
-    fn release(&self, endpoint: &Self::Endpoint) -> i32;
+    fn release(&self, endpoint: &Self::Endpoint) -> Result<(), SessionError>;
 
     // VPP: transport_alloc_local_endpoint, transport.c:892-952.
-    fn allocate_local(&self, endpoint: Self::Endpoint) -> Result<Self::Endpoint, i32>;
+    fn allocate_local(
+        &self,
+        endpoint: Self::Endpoint,
+    ) -> Result<Self::Endpoint, SessionError>;
 
 }
 
@@ -610,13 +718,24 @@ pub trait Transport<T> {
     type Attribute;
 
     fn options(&self) -> TransportOptions;
-    // Success is the non-negative connection/half-open index; failures are
-    // negative SESSION_E_* retval values (tcp.c:840-885, udp.c:401-463).
-    fn connect(&self, endpoint: &T, session: SessionHandle) -> i32;
-    fn connect_stream(&self, endpoint: &T, session: SessionHandle) -> i32;
-    // VPP returns a u32 connection index or a negative SESSION_E_* sentinel.
-    fn start_listen(&self, endpoint: &T, session: SessionHandle) -> u32;
-    fn stop_listen(&self, connection_index: u32) -> u32;
+    // VPP source: tcp.c:840-885 and udp.c:401-463 return either an index or
+    // SESSION_E_*. Rust separates the two domains instead of encoding errors in i32.
+    fn connect(
+        &self,
+        endpoint: &T,
+        session: SessionHandle,
+    ) -> Result<u32, SessionError>;
+    fn connect_stream(
+        &self,
+        endpoint: &T,
+        session: SessionHandle,
+    ) -> Result<u32, SessionError>;
+    fn start_listen(
+        &self,
+        endpoint: &T,
+        session: SessionHandle,
+    ) -> Result<u32, SessionError>;
+    fn stop_listen(&self, connection_index: u32) -> Result<u32, SessionError>;
     // VPP: these operations are notifications with no retval; protocol
     // failures are reported through Session state or protocol-owned paths.
     fn half_close(&self, connection_index: u32, worker_index: u32);
@@ -636,8 +755,13 @@ pub trait Transport<T> {
     fn send_params(&self, connection_index: u32, worker_index: u32) -> TransportSendParams;
     fn update_time(&self, now: f64, worker_index: u32);
     fn flush_data(&self, connection_index: u32, worker_index: u32);
-    fn custom_tx(&self, session: SessionHandle, params: &mut TransportSendParams) -> i32;
-    fn app_rx_event(&self, connection_index: u32, worker_index: u32) -> i32;
+    // VPP custom_tx returns packet work, not an error code.
+    fn custom_tx(&self, session: SessionHandle, params: &mut TransportSendParams) -> usize;
+    fn app_rx_event(
+        &self,
+        connection_index: u32,
+        worker_index: u32,
+    ) -> Result<(), SessionError>;
 
     // VPP: transport_get_connection/listener/half_open and endpoint/attribute
     // retrieval wrappers, transport.h:145-190.
@@ -651,15 +775,7 @@ pub trait Transport<T> {
         connection_index: u32,
         worker_index: u32,
         attribute: &mut Self::Attribute,
-    ) -> i32;
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum SessionRuntimeEngine {
-    Disabled,
-    RuleTable,
-    None,
-    Sdl,
+    ) -> Result<(), SessionError>;
 }
 
 // VPP: session_main_t, session.h:211-308. IP table sizing, local endpoint
@@ -668,7 +784,7 @@ pub enum SessionRuntimeEngine {
 // layers, not this protocol-neutral authority.
 pub struct SessionMain<O = u32> {
     config: SessionConfig,
-    workers: Vec<SessionWorker<O>>,
+    workers: Vec<UnsafeCell<SessionWorker<O>>>,
     // session_main_t.session_tx_fns: mode metadata only; no VFT/function ptr.
     session_tx_modes: UnsafeCell<Vec<TransportTxMode>>,
     // session_main_t.session_type_to_next
@@ -685,24 +801,36 @@ pub struct SessionMain<O = u32> {
     // session_main_t lifecycle/config flags
     is_enabled: AtomicBool,
     is_initialized: bool,
-    runtime_engine: SessionRuntimeEngine,
     dump_worker_segments: bool,
 }
 
-impl<O: Default> SessionMain<O> {
+static SESSION_MAIN: OnceLock<SessionMain<u32>> = OnceLock::new();
+
+impl SessionMain<u32> {
     // VPP: session_main_init/session_manager_main_enable, session.c:2018-2050, 2274-2294.
-    pub fn init(config: SessionConfig, worker_mq_segment: SvmFifoSegment) -> Result<Self, i32>;
+    pub fn init(
+        config: SessionConfig,
+        worker_mq_segment: SvmFifoSegment,
+    ) -> Result<(), SessionError>;
+
+    pub fn global() -> Result<&'static Self, SessionError>;
+}
+
+impl<O: Default> SessionMain<O> {
 
     // VPP: session worker MQ segment setup, session.h:238-239; Hammer SVM allocation is
     // SvmFifoSegment::allocate_message_queue, fifo_segment.rs:815-837.
-    pub fn allocate_event_queues(&mut self) -> Result<(), i32>;
+    pub fn allocate_event_queues(&mut self) -> Result<(), SessionError>;
 
     // VPP: session_main_get_worker, session.h:341-353.
     #[inline(always)]
     pub fn worker(&self, worker_index: u32) -> Option<&SessionWorker<O>>;
 
     // VPP: pool publication is control-plane/barrier work, not a packet hot path.
-    pub fn worker_mut(&mut self, worker_index: u32) -> Option<&mut SessionWorker<O>>;
+    pub fn worker_mut(
+        &self,
+        runtime: &mut DataPlaneMain,
+    ) -> &mut SessionWorker<O>;
 
     // VPP: session_main_get_vpp_event_queue, session.h:355-359.
     // Hammer SVM: SvmFifoSegment::message_queue, fifo_segment.rs:895-900.
@@ -717,12 +845,12 @@ impl<O: Default> SessionMain<O> {
         protocol: u8,
         tx_mode: TransportTxMode,
         output_next: u32,
-    ) -> Result<u8, i32>;
+    ) -> Result<u8, SessionError>;
 
     // VPP: session_main_get_worker and pool reallocation barrier fields,
     // session.h:229-236, session.c:2018-2050.
-    pub fn begin_pool_reallocation(&self) -> i32;
-    pub fn finish_pool_reallocation(&self) -> i32;
+    pub fn begin_pool_reallocation(&self);
+    pub fn finish_pool_reallocation(&self);
 
     // VPP: session_main_is_enabled, session.h:361-365. Acquire observes the
     // control-thread publication before a worker processes events.
@@ -733,31 +861,47 @@ impl<O: Default> SessionMain<O> {
 
     // VPP: session_alloc/session_alloc_for_connection, session.h:461-466 and session.c:490-506.
     pub fn allocate(
-        &mut self,
-        worker_index: u32,
+        &self,
+        runtime: &mut DataPlaneMain,
         state: SessionState,
         protocol: u8,
-    ) -> Result<SessionHandle, i32>;
+    ) -> Result<SessionHandle, SessionError>;
 
     // VPP: transport/session backlink assignment, session.c:502-505.
     pub fn attach_transport(
-        &mut self,
+        &self,
+        runtime: &mut DataPlaneMain,
         session: SessionHandle,
         protocol: u8,
         connection_index: u32,
-    ) -> i32;
+    ) -> Result<(), SessionError>;
 
     // VPP: session_transport_cleanup/session_program_cleanup ordering, session.c:344-385.
-    pub fn detach_transport(&mut self, session: SessionHandle) -> i32;
+    pub fn detach_transport(
+        &self,
+        runtime: &mut DataPlaneMain,
+        session: SessionHandle,
+    ) -> Result<(), SessionError>;
 
     // VPP: session_send_evt_to_thread, session.c:34-85; SvmMsgQ is the only queue owner.
-    pub fn enqueue_event(&self, worker_index: u32, event: SessionEvent) -> i32;
+    pub fn enqueue_event(
+        &self,
+        worker_index: u32,
+        event: SessionEvent,
+    ) -> Result<SessionEventEnqueue, SessionError>;
 
     // VPP: session migration request storage, session.h:143-159.
-    pub fn program_migration(&mut self, request: SessionMigrationRequest) -> i32;
+    pub fn program_migration(
+        &self,
+        request: SessionMigrationRequest,
+    ) -> Result<(), SessionError>;
 
     // VPP: session_main_flush_enqueue_events, session.h:635-636.
-    pub fn flush_enqueue_events(&mut self, protocol: u8, worker_index: u32) -> i32;
+    pub fn flush_enqueue_events(
+        &self,
+        protocol: u8,
+        worker_index: u32,
+    ) -> Result<(), SessionError>;
 }
 
 impl<O> SessionWorker<O> {
@@ -771,7 +915,7 @@ impl<O> SessionWorker<O> {
 
     // VPP: session_wrk_handle_mq and session queue processing, session.h:459 and
     // session_node.c:1926-2050. The queue is borrowed directly from SessionMain's segment.
-    pub fn handle_event(&mut self, queue: &SvmMsgQ) -> i32;
+    pub fn handle_event(&mut self, queue: &SvmMsgQ) -> Result<usize, SessionError>;
 
     // VPP: session_evt_alloc_ctrl/new/old and session_evt_add_old,
     // session.h:392-457. The lists contain event-pool indexes and never own
@@ -788,26 +932,37 @@ impl<O> SessionWorker<O> {
 
     // VPP: session_set_state and FIFO notification paths, session.h:909-935.
     #[inline(always)]
-    pub fn store_state(&self, handle: SessionHandle, state: SessionState) -> i32;
+    pub fn store_state(
+        &self,
+        handle: SessionHandle,
+        state: SessionState,
+    ) -> Result<(), SessionError>;
 
     // VPP: session_enqueue_stream_connection/session_enqueue_dgram_connection,
-    // session.h:777-890. The worker records a handle/fact; protocol output
-    // later borrows the same SVM FIFO and owns packetization.
+    // session.h:777-890. The worker records a handle/fact; Session Queue later
+    // packetizes the same SVM FIFO and emits BufferIndex values to output.
     #[inline(always)]
-    pub fn enqueue_ready(&mut self, handle: SessionHandle, protocol: u8) -> i32;
+    pub fn enqueue_ready(
+        &mut self,
+        handle: SessionHandle,
+        protocol: u8,
+    ) -> Result<(), SessionError>;
 
     // VPP: session_evt_ctrl_data_alloc/session_evt_ctrl_data_free,
     // session.h:407-437.
     pub fn allocate_control_data(&mut self, data: SessionControlData) -> u32;
-    pub fn release_control_data(&mut self, index: u32) -> i32;
+    pub fn release_control_data(&mut self, index: u32) -> Result<(), SessionError>;
 
     // VPP: session_send_evt_to_thread, session.c:34-85. The target queue is
     // supplied by SessionMain; this worker only consumes its own queue.
-    pub fn consume_event(&mut self, event: SessionEvent) -> i32;
+    pub fn consume_event(&mut self, event: SessionEvent) -> Result<(), SessionError>;
 
     // VPP: session_worker migration lock/storage, session.h:157-159.
-    pub fn queue_migration(&mut self, request: SessionMigrationRequest) -> i32;
-    pub fn handle_migrations(&mut self) -> i32;
+    pub fn queue_migration(
+        &mut self,
+        request: SessionMigrationRequest,
+    ) -> Result<(), SessionError>;
+    pub fn handle_migrations(&mut self) -> Result<(), SessionError>;
 
     // VPP: worker time update and adaptive queue scheduling, session.c:2044-2062.
     pub fn update_time(&mut self, now: f64, now_us: u64);
@@ -910,22 +1065,25 @@ impl TransportMain for IpTransportMain {
     type LocalEndpoint = IpLocalEndpoint;
 
     // VPP: transport_init, transport.c:1251-1290.
-    fn init(config: IpTransportConfig) -> Result<Self, i32>;
+    fn init(config: IpTransportConfig) -> Result<(), SessionError>;
 
     // VPP process-global tp_main; Hammer global publication is the plugin instance.
-    fn global() -> Result<&'static Self, i32>;
+    fn global() -> Result<&'static Self, SessionError>;
 
     // VPP: transport_mark_used_local_endpoint, transport.c:717-743.
-    fn mark_used(&self, endpoint: &IpSessionEndpoint) -> i32;
+    fn mark_used(&self, endpoint: &IpSessionEndpoint) -> Result<(), SessionError>;
 
     // VPP: transport_share_local_endpoint, transport.c:745-763.
     fn share(&self, endpoint: &IpSessionEndpoint);
 
     // VPP: transport_release_local_endpoint and deferred cleanup, transport.c:687-715.
-    fn release(&self, endpoint: &IpSessionEndpoint) -> i32;
+    fn release(&self, endpoint: &IpSessionEndpoint) -> Result<(), SessionError>;
 
     // VPP: transport_alloc_local_endpoint/transport_alloc_local_port, transport.c:771-952.
-    fn allocate_local(&self, endpoint: IpSessionEndpoint) -> Result<IpSessionEndpoint, i32>;
+    fn allocate_local(
+        &self,
+        endpoint: IpSessionEndpoint,
+    ) -> Result<IpSessionEndpoint, SessionError>;
 
 }
 
@@ -1008,10 +1166,12 @@ impl Iterator for SessionTableIterator<'_> {
 
 // VPP: session lookup and transport/session backlink paths, session.c:1923-1931.
 pub struct IpSessionMain {
-    session: SessionMain<u32>,
+    session: &'static SessionMain<u32>,
     lookup: IpSessionLookup,
-    transport: IpTransportMain,
+    transport: &'static IpTransportMain,
 }
+
+static IP_SESSION_MAIN: OnceLock<IpSessionMain> = OnceLock::new();
 
 impl IpSessionMain {
     // VPP: session manager initialization followed by transport_init;
@@ -1021,11 +1181,17 @@ impl IpSessionMain {
         table_config: IpSessionTableConfig,
         transport_config: IpTransportConfig,
         worker_mq_segment: hammer_infra::svm::fifo_segment::SvmFifoSegment,
-    ) -> Result<Self, i32>;
+    ) -> Result<(), SessionError>;
 
     // VPP: session_main is one process-wide instance, session.h:310 and
     // session.c:2274-2294. Only this plugin publishes the concrete IP Session main.
-    pub fn global() -> Result<&'static Self, i32>;
+    pub fn global() -> Result<&'static Self, SessionError>;
+
+    #[inline(always)]
+    pub fn session(&self) -> &SessionMain<u32>;
+
+    #[inline(always)]
+    pub fn transport(&self) -> &IpTransportMain;
 
     // VPP: session_lookup_6tuple/session lookup table selection,
     // session_lookup.c:217-241, 271-389; session_table.c:15-129.
@@ -1034,31 +1200,41 @@ impl IpSessionMain {
 
     // VPP: established/half-open lookup publication and deletion,
     // session_lookup.c:271-389, 837-870.
-    pub fn publish(&self, key: IpTransportConnectionId, session: SessionHandle) -> i32;
-    pub fn remove(&self, key: &IpTransportConnectionId) -> i32;
+    pub fn add_connection(
+        &self,
+        key: IpTransportConnectionId,
+        session: SessionHandle,
+    ) -> Result<(), SessionError>;
+    pub fn remove(&self, key: &IpTransportConnectionId) -> Result<(), SessionError>;
 
     // VPP: session_alloc_for_connection and transport backlink assignment,
     // session.c:490-506.
     pub fn allocate_for_connection(
-        &mut self,
-        worker_index: u32,
+        &self,
+        runtime: &mut DataPlaneMain,
         endpoint: &IpSessionEndpoint,
         connection_index: u32,
-    ) -> Result<SessionHandle, i32>;
+    ) -> Result<SessionHandle, SessionError>;
 
     // VPP: endpoint mark/share/release before/after connection publication.
-    pub fn prepare_endpoint(&self, endpoint: IpSessionEndpoint) -> Result<IpSessionEndpoint, i32>;
-    pub fn release_endpoint(&self, endpoint: &IpSessionEndpoint) -> i32;
+    pub fn prepare_endpoint(
+        &self,
+        endpoint: IpSessionEndpoint,
+    ) -> Result<IpSessionEndpoint, SessionError>;
+    pub fn release_endpoint(
+        &self,
+        endpoint: &IpSessionEndpoint,
+    ) -> Result<(), SessionError>;
 
     // Direct borrows of the existing SVM FIFO; no callback/closure or legacy
     // FIFO wrapper is introduced. Fifo uses interior atomics for enqueue/dequeue.
-    pub fn rx_fifo(&self, session: SessionHandle) -> Result<&SvmFifo, i32>;
-    pub fn tx_fifo(&self, session: SessionHandle) -> Result<&SvmFifo, i32>;
+    pub fn rx_fifo(&self, session: SessionHandle) -> Result<&SvmFifo, SessionError>;
+    pub fn tx_fifo(&self, session: SessionHandle) -> Result<&SvmFifo, SessionError>;
 
     // VPP: transport close/reset/deleted notification ordering, session.c:344-385.
-    pub fn notify_closed(&mut self, session: SessionHandle, connection_index: u32) -> i32;
-    pub fn notify_reset(&mut self, session: SessionHandle, connection_index: u32) -> i32;
-    pub fn notify_deleted(&mut self, session: SessionHandle, connection_index: u32) -> i32;
+    pub fn notify_closed(&self, session: SessionHandle, connection_index: u32);
+    pub fn notify_reset(&self, session: SessionHandle, connection_index: u32);
+    pub fn notify_deleted(&self, session: SessionHandle, connection_index: u32);
 }
 ```
 
@@ -1097,7 +1273,6 @@ pub struct TcpConnection {
 // Sources: session.h:82-176, session_node.c:1926-2050.
 pub struct TcpWorker {
     pub connections: Pool<TcpConnection>,
-    pub ready_sessions: Vec<SessionHandle>,
     pub worker_index: u32,
 }
 
@@ -1115,7 +1290,9 @@ pub struct TcpTransportAttribute;
 
 impl TcpMain {
     // VPP: transport enable/init sequence, transport.c:1223-1290.
-    pub fn init(config: TcpConfig) -> Result<Self, i32>;
+    pub fn init(config: TcpConfig) -> Result<(), SessionError>;
+
+    pub fn global() -> Result<&'static Self, SessionError>;
 
     // VPP: transport connection retrieval, transport.h:156-173.
     #[inline(always)]
@@ -1123,14 +1300,18 @@ impl TcpMain {
 
     // VPP: transport_connect wrapper, transport.h:131-138; plugin-session owns endpoint preparation.
     pub fn connect(
-        &mut self,
+        &self,
         endpoint: &IpTransportEndpointConfig,
         session: SessionHandle,
-    ) -> i32;
+    ) -> Result<u32, SessionError>;
 
     // VPP: transport_start_listen/stop_listen, transport.h:139-141.
-    pub fn start_listen(&self, endpoint: &IpTransportEndpointConfig, session: SessionHandle) -> u32;
-    pub fn stop_listen(&self, connection_index: u32) -> u32;
+    pub fn start_listen(
+        &self,
+        endpoint: &IpTransportEndpointConfig,
+        session: SessionHandle,
+    ) -> Result<u32, SessionError>;
+    pub fn stop_listen(&self, connection_index: u32) -> Result<u32, SessionError>;
 
     // VPP: connection cleanup/half-open cleanup, transport.h:142-144.
     pub fn cleanup(&self, connection_index: u32, worker_index: u32);
@@ -1141,12 +1322,12 @@ impl TcpMain {
 
     // VPP: transport_get_connection/session_get_transport, transport.h:156-173,
     // session.c:1923-1931; the call is concrete plugin-session attachment.
-    pub fn publish_connection(
+    pub fn attach_session(
         &self,
         sessions: &IpSessionMain,
         worker_index: u32,
         connection_index: u32,
-    ) -> i32;
+    ) -> Result<(), SessionError>;
 }
 
 impl Transport<IpTransportEndpointConfig> for TcpMain {
@@ -1154,10 +1335,22 @@ impl Transport<IpTransportEndpointConfig> for TcpMain {
     type Attribute = TcpTransportAttribute;
 
     fn options(&self) -> TransportOptions;
-    fn connect(&self, endpoint: &IpTransportEndpointConfig, session: SessionHandle) -> i32;
-    fn connect_stream(&self, endpoint: &IpTransportEndpointConfig, session: SessionHandle) -> i32;
-    fn start_listen(&self, endpoint: &IpTransportEndpointConfig, session: SessionHandle) -> u32;
-    fn stop_listen(&self, connection_index: u32) -> u32;
+    fn connect(
+        &self,
+        endpoint: &IpTransportEndpointConfig,
+        session: SessionHandle,
+    ) -> Result<u32, SessionError>;
+    fn connect_stream(
+        &self,
+        endpoint: &IpTransportEndpointConfig,
+        session: SessionHandle,
+    ) -> Result<u32, SessionError>;
+    fn start_listen(
+        &self,
+        endpoint: &IpTransportEndpointConfig,
+        session: SessionHandle,
+    ) -> Result<u32, SessionError>;
+    fn stop_listen(&self, connection_index: u32) -> Result<u32, SessionError>;
     fn half_close(&self, connection_index: u32, worker_index: u32);
     fn close(&self, connection_index: u32, worker_index: u32);
     fn reset(&self, connection_index: u32, worker_index: u32);
@@ -1167,14 +1360,23 @@ impl Transport<IpTransportEndpointConfig> for TcpMain {
     fn send_params(&self, connection_index: u32, worker_index: u32) -> TransportSendParams;
     fn update_time(&self, now: f64, worker_index: u32);
     fn flush_data(&self, connection_index: u32, worker_index: u32);
-    fn custom_tx(&self, session: SessionHandle, params: &mut TransportSendParams) -> i32;
-    fn app_rx_event(&self, connection_index: u32, worker_index: u32) -> i32;
+    fn custom_tx(&self, session: SessionHandle, params: &mut TransportSendParams) -> usize;
+    fn app_rx_event(
+        &self,
+        connection_index: u32,
+        worker_index: u32,
+    ) -> Result<(), SessionError>;
     fn connection(&self, connection_index: u32, worker_index: u32) -> Option<&Self::Connection>;
     fn listener(&self, connection_index: u32) -> Option<&Self::Connection>;
     fn half_open(&self, connection_index: u32) -> Option<&Self::Connection>;
     fn endpoint(&self, connection_index: u32, worker_index: u32) -> (IpTransportEndpointConfig, IpTransportEndpointConfig);
     fn listener_endpoint(&self, connection_index: u32) -> (IpTransportEndpointConfig, IpTransportEndpointConfig);
-    fn attribute(&self, connection_index: u32, worker_index: u32, attribute: &mut Self::Attribute) -> i32;
+    fn attribute(
+        &self,
+        connection_index: u32,
+        worker_index: u32,
+        attribute: &mut Self::Attribute,
+    ) -> Result<(), SessionError>;
 }
 
 // VPP: connectionless transport still uses transport_connection_t facts and Session handle.
@@ -1186,7 +1388,6 @@ pub struct UdpConnection {
 // VPP: per-worker session event processing remains in session worker; UDP owns only UDP state.
 pub struct UdpWorker {
     pub connections: Pool<UdpConnection>,
-    pub ready_sessions: Vec<SessionHandle>,
     pub worker_index: u32,
 }
 
@@ -1200,7 +1401,9 @@ pub struct UdpTransportAttribute;
 
 impl UdpMain {
     // VPP: transport enable/init sequence, transport.c:1223-1290.
-    pub fn init(config: UdpConfig) -> Result<Self, i32>;
+    pub fn init(config: UdpConfig) -> Result<(), SessionError>;
+
+    pub fn global() -> Result<&'static Self, SessionError>;
 
     // VPP: transport_get_connection, transport.h:156-173.
     #[inline(always)]
@@ -1208,24 +1411,28 @@ impl UdpMain {
 
     // VPP: transport_connect/transport_start_listen, transport.h:131-141.
     pub fn connect(
-        &mut self,
+        &self,
         endpoint: &IpTransportEndpointConfig,
         session: SessionHandle,
-    ) -> i32;
-    pub fn start_listen(&self, endpoint: &IpTransportEndpointConfig, session: SessionHandle) -> u32;
-    pub fn stop_listen(&self, connection_index: u32) -> u32;
+    ) -> Result<u32, SessionError>;
+    pub fn start_listen(
+        &self,
+        endpoint: &IpTransportEndpointConfig,
+        session: SessionHandle,
+    ) -> Result<u32, SessionError>;
+    pub fn stop_listen(&self, connection_index: u32) -> Result<u32, SessionError>;
 
     // VPP: transport_cleanup/transport_cleanup_half_open, transport.h:142-144.
     pub fn cleanup(&self, connection_index: u32, worker_index: u32);
     pub fn cleanup_half_open(&self, connection_index: u32);
 
     // VPP: session_get_transport backlink path, session.c:1923-1931.
-    pub fn publish_connection(
+    pub fn attach_session(
         &self,
         sessions: &IpSessionMain,
         worker_index: u32,
         connection_index: u32,
-    ) -> i32;
+    ) -> Result<(), SessionError>;
 }
 
 impl Transport<IpTransportEndpointConfig> for UdpMain {
@@ -1233,10 +1440,22 @@ impl Transport<IpTransportEndpointConfig> for UdpMain {
     type Attribute = UdpTransportAttribute;
 
     fn options(&self) -> TransportOptions;
-    fn connect(&self, endpoint: &IpTransportEndpointConfig, session: SessionHandle) -> i32;
-    fn connect_stream(&self, endpoint: &IpTransportEndpointConfig, session: SessionHandle) -> i32;
-    fn start_listen(&self, endpoint: &IpTransportEndpointConfig, session: SessionHandle) -> u32;
-    fn stop_listen(&self, connection_index: u32) -> u32;
+    fn connect(
+        &self,
+        endpoint: &IpTransportEndpointConfig,
+        session: SessionHandle,
+    ) -> Result<u32, SessionError>;
+    fn connect_stream(
+        &self,
+        endpoint: &IpTransportEndpointConfig,
+        session: SessionHandle,
+    ) -> Result<u32, SessionError>;
+    fn start_listen(
+        &self,
+        endpoint: &IpTransportEndpointConfig,
+        session: SessionHandle,
+    ) -> Result<u32, SessionError>;
+    fn stop_listen(&self, connection_index: u32) -> Result<u32, SessionError>;
     fn half_close(&self, connection_index: u32, worker_index: u32);
     fn close(&self, connection_index: u32, worker_index: u32);
     fn reset(&self, connection_index: u32, worker_index: u32);
@@ -1246,20 +1465,29 @@ impl Transport<IpTransportEndpointConfig> for UdpMain {
     fn send_params(&self, connection_index: u32, worker_index: u32) -> TransportSendParams;
     fn update_time(&self, now: f64, worker_index: u32);
     fn flush_data(&self, connection_index: u32, worker_index: u32);
-    fn custom_tx(&self, session: SessionHandle, params: &mut TransportSendParams) -> i32;
-    fn app_rx_event(&self, connection_index: u32, worker_index: u32) -> i32;
+    fn custom_tx(&self, session: SessionHandle, params: &mut TransportSendParams) -> usize;
+    fn app_rx_event(
+        &self,
+        connection_index: u32,
+        worker_index: u32,
+    ) -> Result<(), SessionError>;
     fn connection(&self, connection_index: u32, worker_index: u32) -> Option<&Self::Connection>;
     fn listener(&self, connection_index: u32) -> Option<&Self::Connection>;
     fn half_open(&self, connection_index: u32) -> Option<&Self::Connection>;
     fn endpoint(&self, connection_index: u32, worker_index: u32) -> (IpTransportEndpointConfig, IpTransportEndpointConfig);
     fn listener_endpoint(&self, connection_index: u32) -> (IpTransportEndpointConfig, IpTransportEndpointConfig);
-    fn attribute(&self, connection_index: u32, worker_index: u32, attribute: &mut Self::Attribute) -> i32;
+    fn attribute(
+        &self,
+        connection_index: u32,
+        worker_index: u32,
+        attribute: &mut Self::Attribute,
+    ) -> Result<(), SessionError>;
 }
 ```
 
 TCP/UDP 的 `connect/listen` 调用顺序由 protocol plugin 或 control caller 编排：先调用
 `IpSessionMain::prepare_endpoint`，再调用具体 Main 的 `Transport<T>` 方法，成功后调用
-`IpSessionMain::allocate_for_connection`/`publish`；失败按 VPP 的 half-open/local-endpoint
+`IpSessionMain::allocate_for_connection`/`add_connection`；失败按 VPP 的 half-open/local-endpoint
 cleanup 顺序回滚。service 不反向调用 `TcpMain`/`UdpMain`。
 
 ## 4. Service 层：Session Core
@@ -1420,19 +1648,29 @@ transport 不得在 service 仍可见 Session 时直接释放 connection pool en
 
 ## 7. Session 到 Transport 的 TX 与 event 接线
 
-不再使用 `SessionQueueNode` 作为 transport dispatcher，也不在 SessionMain 保存每协议 TX
-callback。目标路径是：
+`SessionQueueNode` 是 service-owned scheduler 和 FIFO packetization owner，但不是 protocol callback
+dispatcher。`SessionMain` 不保存每协议 TX callback。目标路径是：
 
-- SessionWorker 记录 FIFO readiness、protocol id 和待处理 fact；
-- TCP/UDP worker/output node 以 concrete protocol 类型读取这些 fact，直接借用 Session FIFO；
-- header prepend、segment/retransmission、datagram framing 和 graph arc 由 TCP/UDP owner 完成；
-- service 只负责 FIFO byte ownership、TX accounting、readiness、state 和 cleanup；
-- protocol worker 完成 work 后调用 service completion/ready operation，service 不反向调用 protocol
-  callback。
+- TCP/UDP worker 在 concrete 类型上计算 `TransportSendParams`，通过 `IpSessionMain` 更新 owner
+  worker 的 Session entry；
+- SessionWorker 记录 FIFO readiness、protocol id、send facts 和待处理 event；
+- Session Queue 按 new/old 顺序消费 event，从 Session-owned SVM FIFO 生成 Data Plane Buffer；
+- Session Queue 按 `session_type_to_next` 把 `BufferIndex` frame 发送给已有 `TcpOutputNode` 或
+  `UdpOutputNode`；
+- output node 只消费 packet buffer，在 concrete `TcpMain`/`UdpMain` 上静态调用 transport header
+  operation，再进入 IP lookup；
+- service 不反向调用 protocol callback，output node 不读取 Session event list，也不直接借用
+  Session FIFO。
+
+VPP 在 `session_node.c:1471-1676` 内完成 FIFO packetization，并把 pending `u32` buffer index 发送到
+`tcp_output.c:2400-2446` / `udp_output.c:202-246` 的 packet-vector node。Hammer 保持相同 frame
+语义；为避免 VFT 与 service 到 plugin 的反向依赖，只把 concrete transport header 调用移动到已有
+output node。完整 queue/node 设计见 ADR-0039。
 
 ordinary IO/control/RPC 使用目标 worker 的 `event_queue`；Session migration 使用 owner worker 的
 migration request/handling storage。生产者只入队并唤醒目标 worker，消费者才修改目标 worker 的
-Session state。队列满、锁失败或目标 worker 无效都返回明确的负 retval，不静默丢弃。
+Session state。队列满、锁失败由 `SessionEventEnqueue::Full/Busy` 明确返回，目标 worker 无效返回
+`SessionError::Invalid`，不静默丢弃。
 
 ## 8. 控制路径顺序
 
@@ -1470,16 +1708,18 @@ transport cleanup。两个层不得复制 close state machine。
 
 初始化顺序固定为：
 
-1. service 构造 Session core、worker slots、per-worker event queues、FIFO policy 和 metadata；
-2. plugin-session 构造 IP lookup/table、`IpTransportMain` 和 `IpSessionMain`；
-3. `IpSessionMain` 发布唯一 embedded service core；
+1. plugin-session 调用 `SessionMain::init`，构造并安装唯一 service Session core、worker slots、
+   per-worker event queues、FIFO policy 和 metadata；
+2. plugin-session 调用 `IpTransportMain::init`，再构造 IP lookup/table 并由 `IpSessionMain::init`
+   安装唯一 IP composition；
+3. 后续代码只通过各自 `global` accessor 取得已安装实例；不存在 `publish`/`bind` API；
 4. TCP/UDP 在其后构造 protocol Main/Worker、connection pools 和 graph nodes；
 5. Data Worker launch 前构造所有 service/protocol worker slots；
 6. Data Worker 运行后只读取自己的 worker entry 和已发布 immutable metadata。
 
-重复 init 是 lifecycle programming bug，使用现有 init assertion；未初始化 global 的读取保留
-现有 subsystem `RuntimeError::PluginStateNotInitialized` 语义。普通 worker borrow 不使用
-`'static`；只有真正的 process-global `OnceLock` accessor 返回 `'static`。
+重复 init 是 lifecycle programming bug，使用现有 init assertion；未初始化 global 返回 service
+`SessionError::Unknown`。普通 worker borrow 不使用 `'static`；只有真正的 process-global `OnceLock`
+accessor 返回 `&'static Self`。
 
 ## 10. Inline 语义
 
@@ -1500,32 +1740,31 @@ inline 不是装饰性约定，而是按 VPP 调用频率和失败前提选择�
 
 ## 11. Error 语义
 
-### 11.1 分类与 owner
+### 11.1 唯一 control-path error
 
-- service 只返回 Session lifecycle、worker ownership、stale handle、FIFO capacity、invalid
-  transition 和 event queue failure；
-- plugin-session 只返回 endpoint/table/local-port/connection identity failure；
-- TCP/UDP 只返回 protocol connection/listener/half-open/timer/output/config failure；
-- packet/node malformed input、checksum、invalid header 不转成逐包 control-plane `Result`；其
-  node-level accounting 不在本 ADR 中定义。
+`hammer-service::session::SessionError` 是 Session/Transport control path 的唯一共享 error enum。
+它逐项对应 `session_types.h:514-576` 的 `foreach_session_error`，并使用已有
+`#[runtime_error(subsystem = "session")]` 宏；不新增 error macro，不定义数字 discriminant，也不把
+error 存成 `i32`。plugin-session、TCP 和 UDP 在 Session/Transport contract 上直接返回该类型，不再
+声明同义的 endpoint/session retval error。
 
-不要创建宽泛的 `SessionError`、`ApiError`、`Internal(String)` 或统一 subsystem error。每个
-owner 使用已有错误宏声明自己的窄错误族，宏声明带 subsystem；错误 variant 必须对应 VPP
-可行动的失败类别。错误只在真实 crate/ABI boundary 翻译一次并保留 source/category。
+`SessionError::Unknown` 只对应 VPP 明确定义的 `SESSION_E_UNKNOWN`，不是字符串 catch-all。
+`SESSION_E_NONE` 映射为 `Ok`。packet/node malformed input、checksum、invalid header 仍走所属 Node 的
+counter/drop/punt，不转成 control-plane `Result`。
 
-### 11.2 retval、sentinel 与正常 miss
+### 11.2 函数结果、sentinel 与正常 miss
 
-- 与 VPP session/transport control path 对齐的 retval 在边界上保持有符号 `i32` 语义；Rust 内部
-  可以使用 owner-local typed `Result`，但不得改变 `SESSION_E_*` 的类别或正负号含义；
-- `session_send_evt_to_thread` 的函数级 retval 单独保留为具名常量：MQ lock 失败为 `-1`，
-  queue/ring full 为 `-2`；它们不伪装成 `SESSION_E_MQ_MSG_ALLOC`；
-- VPP 的负 retval（例如 MQ lock/full）原样表示失败；非负值保留成功/字节数/索引语义；
+- `session_send_evt_to_thread` 的 lock busy 与 queue/ring full 映射为
+  `SessionEventEnqueue::Busy/Full`；它们是“事件尚未提交”的调用结果，不是 `SessionError`；
+- `custom_tx` 返回 packet count，`SessionTxResult` 表达 sent/no-data/no-buffer；这些都不是 error code；
+- message allocation failure 使用 `SessionError::MessageQueueAllocation`，eventfd allocation failure 使用
+  `SessionError::EventFdAllocation`；
 - `u32::MAX`、`ENDPOINT_INVALID_INDEX` 等 sentinel 只有在对应 VPP contract 明确使用时保留，不能
   被 `Option` 静默替换；
 - `Option` 只表示正常 lookup miss，例如 `get_if_valid` 或未命中的 table 查询，不表示需要调用方
   处理的错误；
-- VPP `clib_error_return` 的初始化/enable 失败映射到 owner-local lifecycle/config error，不能
-  变成 packet error；
+- VPP `clib_error_return` 的 Session/Transport 初始化或 enable 失败映射到对应 `SessionError` variant，
+  不能变成 packet error；
 - VPP `ASSERT`/`ALWAYS_ASSERT` 表示 owner 已破坏的不变量，映射为本地 assertion/panic，不翻译
   为 recoverable error。
 
@@ -1533,12 +1772,12 @@ owner 使用已有错误宏声明自己的窄错误族，宏声明带 subsystem�
 
 `transport.c` 的现有类别必须保持语义，不另造同义错误：
 
-- 未注册 transport：`SESSION_E_TRANSPORT_NO_REG`（`transport.c:495,504,535`）；
-- local endpoint 冲突：`SESSION_E_PORTINUSE`（`transport.c:729,943`）；
-- interface 无地址：`SESSION_E_NOIP`（`transport.c:839-856`）；
-- 无路由/无解析 interface：`SESSION_E_NOROUTE`、`SESSION_E_NOINTF`
+- 未注册 transport：`SessionError::TransportNotRegistered`（`transport.c:495,504,535`）；
+- local endpoint 冲突：`SessionError::PortInUse`（`transport.c:729,943`）；
+- interface 无地址：`SessionError::NoIp`（`transport.c:839-856`）；
+- 无路由/无解析 interface：`SessionError::NoRoute`、`SessionError::NoInterface`
   （`transport.c:869-889`）；
-- 无可用 source port：`SESSION_E_NOPORT`（`transport.c:925-930`）。
+- 无可用 source port：`SessionError::NoPort`（`transport.c:925-930`）。
 
 local endpoint mark/share/release 的 refcount 和 table 更新必须 failure-atomic；VPP 的
 `transport.c:695-710` 先删除 table entry、再排入 cleanup，Hammer 不能在返回错误后留下半绑定
@@ -1557,14 +1796,14 @@ ADR-0038 新路径已删除或停止新增：
 
 - `SessionMain` 读取 `TransportVft`、`transport_vft`、`register_transport` 或 operation table；
 - `SessionWorker` 保存每协议 `SessionQueueTransportDispatch` callback；
-- `SessionQueueNode` 作为 TCP/UDP TX/control dispatcher；
+- `SessionQueueNode` 保存或调用 TCP/UDP TX/control callback；
 - service 读取 IP key、FIB、namespace 或 socket endpoint；
 - TCP/UDP 直接修改 plugin-session table pool 或 service Session pool；
 - `dyn Transport`、erased registry、plugin capability wrapper 或 cached pointer；
 - 为连接三层再创建 `TcpTransport`、`UdpTransport`、family-specific generic wrapper 或第二份 Main。
 
-现有 `SessionQueueNode` 只能在迁移期间承载尚未迁移的旧路径；不得作为新 Transport/Session API
-的设计基础。其删除或保留另行决策。
+`SessionQueueNode` 本身保留并迁入 ADR-0039 的 service-owned scheduler/FIFO packetization 设计；
+删除的是 callback attachment 和 protocol dispatch table，不是这个 VPP 对应 node。
 
 ## 13. 迁移顺序
 
@@ -1573,10 +1812,10 @@ ADR-0038 新路径已删除或停止新增：
 2. 在 service 中定义 transport-independent Session/worker operations 与 `Transport<T>` contract。
 3. 在 plugin/session 中组成唯一 `IpSessionMain`，完成 IP lookup、endpoint 和 Session attachment。
 4. TCP/UDP 以自身 Main/Worker 实现 `Transport<T>`，删除对 service VFT 的新增依赖。
-5. 将 TCP/UDP 的 TX/RX packetization、protocol timer、congestion/retransmit 和 migration work
-   迁到各自 protocol worker；通用 `Pacer` 数据保留在 service 的 `TransportConnection` base，更新
-   由 concrete protocol 调用；SessionWorker 保留完整 Session queue/event/DMA/FIFO facts 和 worker
-   handoff。
+5. Session Queue 保留 TX FIFO packetization；TCP/UDP 的 send-param 计算、transport header、protocol
+   timer、congestion/retransmit 和 migration work 迁到各自 protocol worker/output node。通用 `Pacer`
+   数据保留在 service 的 `TransportConnection` base，更新由 concrete protocol 调用；SessionWorker
+   保留完整 Session queue/event/DMA/FIFO facts 和 worker handoff。
 6. 按本 ADR 的 listen/connect/accept/close 顺序迁移调用方，验证 failure-atomicity。
 7. 所有 consumer 切换后删除旧 VFT compatibility layer 和仅为它存在的 dispatch fields。
 
@@ -1584,8 +1823,8 @@ ADR-0038 新路径已删除或停止新增：
 
 该结构保留 VPP 的核心 ownership：Session Main 是 process authority，Session Worker 是 thread
 owner，transport connection 是 protocol owner，Session 通过数值 handle 与 transport 关联，
-worker 间通过 event queue/RPC/migration handoff 通信。它不照搬 VPP 的 C VFT，也不把旧 Session
-Queue 变成新的中心抽象。
+worker 间通过 event queue/RPC/migration handoff 通信。它不照搬 VPP 的 C VFT；Session Queue 只保留
+VPP 已有的调度、FIFO packetization 和 graph fanout authority，不增加 protocol callback authority。
 
 代价是 control caller 必须在 concrete transport 类型上完成一次静态编排；这是避免 VFT、`dyn`
 和 erased registry 的边界成本。以后增加其他 transport，只增加自己的 Main/Worker，并实现
@@ -1598,8 +1837,12 @@ plugin-session/service 的既有 concrete contract，不扩展 service 结构体
 - TCP congestion-control algorithm ownership；
 - Session FIFO memory layout、SVM segment format 或 protocol chain；
 - stats/counter、端口分配最大尝试次数和 local-endpoint count API；
-- 对旧 Application runtime、`TransportVft` 与 `SessionQueueNode` 兼容路径的删除。该路径不参与
-  ADR-0038 的新 Session core 静态接线，待 Application 迁移后单独清理。
+- 对旧 Application runtime、`TransportVft` 与 Session Queue callback attachment 兼容路径的删除。
+  queue node 的静态声明、enable 和 packet output 迁移由 ADR-0039 单独实施。
+
+本次实现先对旧 `TransportVft`、Session Queue callback/attachment 和旧 retval 常量加
+`deprecated` 标记；兼容入口只保留迁移所需的 ABI 过渡，不改变 ADR-0038 的 owner、trait 和
+typed error contract。删除兼容入口不属于本次提交。
 
 ## 16. VPP 源码依据
 

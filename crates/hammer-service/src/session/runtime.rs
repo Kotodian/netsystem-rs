@@ -476,6 +476,7 @@ pub struct SessionWorker {
     app: AppWorker,
     session_evt_q: Arc<SessionMsgQueue>,
     app_session_config: AppSessionConfig,
+    #[deprecated(note = "ADR-0039 removes transport callback tables from Session Worker")]
     pub(crate) transport_dispatches: Vec<SessionQueueTransportDispatch>,
     pub(crate) control_events: LinkedList<SessionEvt>,
     pub(crate) new_io_events: LinkedList<SessionEvt>,
@@ -1036,9 +1037,6 @@ pub fn install_session_worker(
     let setup = (|| -> RuntimeResult<()> {
         engine.set_worker_node_runtime_data(app_session_input, input_data)?;
         engine.set_worker_node_runtime_data(session_queue, session_queue_data)?;
-        engine
-            .nodes()
-            .set_node_state(session_queue, NodeState::Polling)?;
         engine
             .nodes()
             .set_node_state(app_session_input, NodeState::Interrupt)?;
@@ -3880,6 +3878,7 @@ pub struct TxBatchBuffer {
     pub payload_len: usize,
 }
 
+#[deprecated(note = "legacy Session Queue transport callback contract; use service Session Queue facts and concrete protocol workers")]
 pub trait SessionTransport: Sized {
     type Tx: SessionTxStrategy<Self>;
 
@@ -3952,6 +3951,7 @@ pub trait SessionTransport: Sized {
     }
 }
 
+#[deprecated(note = "legacy Session Queue transport callback contract; use service Session Queue facts and concrete protocol workers")]
 pub trait SessionPacketizedTransport: SessionTransport {
     fn control_tx(
         &mut self,
@@ -3981,6 +3981,7 @@ pub trait SessionPacketizedTransport: SessionTransport {
     ) -> RuntimeResult<()>;
 }
 
+#[deprecated(note = "legacy Session Queue transport callback contract; use service Session Queue facts and concrete protocol workers")]
 pub trait TransportInternalTransport: SessionTransport {
     fn internal_tx(
         &mut self,
@@ -3995,6 +3996,7 @@ pub trait TransportInternalTransport: SessionTransport {
     ) -> RuntimeResult<()>;
 }
 
+#[deprecated(note = "legacy transport callback dispatch; ADR-0039 keeps packetization in service")]
 pub trait SessionTxStrategy<T>
 where
     T: SessionTransport,
@@ -4012,7 +4014,9 @@ where
     ) -> RuntimeResult<()>;
 }
 
+#[deprecated(note = "legacy transport callback dispatch; ADR-0039 keeps packetization in service")]
 pub struct SessionPacketizedTx;
+#[deprecated(note = "legacy transport callback dispatch; ADR-0039 keeps packetization in service")]
 pub struct TransportInternalTx;
 
 impl<T> SessionTxStrategy<T> for SessionPacketizedTx
@@ -4149,6 +4153,7 @@ where
     }
 }
 
+#[deprecated(note = "legacy callback-driven queue entry; use the service-owned Session Queue nodes")]
 pub fn dispatch_session_queue_once<T>(
     runtime: &mut DataPlaneMain,
     node_runtime: &mut hammer_runtime::NodeRuntime,
@@ -4179,6 +4184,7 @@ where
     Ok(step)
 }
 
+#[deprecated(note = "legacy callback-driven queue entry; use the service-owned Session Queue nodes")]
 pub fn dispatch_session_queue_pending<T>(
     runtime: &mut DataPlaneMain,
     sessions: &mut SessionWorker,
@@ -4206,6 +4212,7 @@ where
     Ok(step)
 }
 
+#[deprecated(note = "legacy callback-driven queue entry; use the service-owned Session Queue nodes")]
 pub fn dispatch_session_queue_events<T>(
     runtime: &mut DataPlaneMain,
     sessions: &mut SessionWorker,

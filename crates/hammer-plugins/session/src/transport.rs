@@ -5,10 +5,7 @@ use std::sync::atomic::{AtomicU32, Ordering};
 use hammer_infra::bihash::{Bihash, BihashKey, hash_words};
 use hammer_infra::pool::Pool;
 use hammer_infra::sync::SpinLock;
-use hammer_service::session::{
-    SESSION_E_INVALID, SESSION_E_NOIP, SESSION_E_NONE, SESSION_E_NOPORT, SESSION_E_PORTINUSE,
-    SessionEndpoint,
-};
+use hammer_service::session::{SessionEndpoint, SessionError};
 use hammer_service::transport::{TransportConnection, TransportMain};
 
 use crate::endpoint::{IpSessionEndpoint, IpTransportConnectionId, IpTransportEndpoint};
@@ -170,9 +167,9 @@ impl TransportMain for IpTransportMain {
     type Endpoint = IpSessionEndpoint;
     type LocalEndpoint = IpLocalEndpoint;
 
-    fn init(config: Self::Config) -> Result<Self, i32> {
+    fn init(config: Self::Config) -> Result<Self, SessionError> {
         if config.min_source_port >= config.max_source_port {
-            return Err(SESSION_E_INVALID);
+            return Err(SessionError::Invalid);
         }
         let buckets = if config.local_endpoint_buckets == 0 {
             DEFAULT_LOCAL_ENDPOINT_BUCKETS
@@ -198,15 +195,15 @@ impl TransportMain for IpTransportMain {
         })
     }
 
-    fn global() -> Result<&'static Self, i32> {
+    fn global() -> Result<&'static Self, SessionError> {
         crate::IpSessionMain::global().map(crate::IpSessionMain::transport)
     }
 
-    fn mark_used(&self, endpoint: &Self::Endpoint) -> i32 {
+    fn mark_used(&self, endpoint: &Self::Endpoint) -> Result<(), SessionError> {
         let local = local_endpoint(endpoint);
         let key = IpLocalEndpointKey::from(&local);
         if self.local_endpoints_table.lookup(&key).is_some() {
-            return SESSION_E_PORTINUSE;
+            return Err(SessionError::PortInUse);
         }
         let local_endpoints = unsafe { &mut *self.local_endpoints.get() };
         let index = local_endpoints.insert(IpLocalEndpointState {
@@ -220,9 +217,9 @@ impl TransportMain for IpTransportMain {
         {
             let removed = local_endpoints.remove(index);
             debug_assert!(removed.is_some());
-            return SESSION_E_PORTINUSE;
+            return Err(SessionError::PortInUse);
         }
-        SESSION_E_NONE
+        Ok(())
     }
 
     fn share(&self, endpoint: &Self::Endpoint) {
@@ -247,7 +244,7 @@ impl TransportMain for IpTransportMain {
         );
     }
 
-    fn release(&self, endpoint: &Self::Endpoint) -> i32 {
+    fn release(&self, endpoint: &Self::Endpoint) -> Result<(), SessionError> {
         let local = local_endpoint(endpoint);
         let key = IpLocalEndpointKey::from(&local);
         let Some(index) = self
@@ -255,7 +252,7 @@ impl TransportMain for IpTransportMain {
             .lookup(&key)
             .and_then(|index| u32::try_from(index).ok())
         else {
-            return -1;
+            return Err(SessionError::AddressNotInUse);
         };
         let endpoint = self
             .local_endpoints()
@@ -264,7 +261,7 @@ impl TransportMain for IpTransportMain {
         let previous = endpoint.references.fetch_sub(1, Ordering::AcqRel);
         assert_ne!(previous, 0, "local endpoint reference count underflowed");
         if previous != 1 {
-            return -1;
+            return Err(SessionError::AddressNotInUse);
         }
         let removed = self
             .local_endpoints_table
@@ -278,24 +275,23 @@ impl TransportMain for IpTransportMain {
         if cleanup.freelist.len() > LOCAL_ENDPOINT_CLEANUP_THRESHOLD {
             cleanup.cleanup_pending = true;
         }
-        SESSION_E_NONE
+        Ok(())
     }
 
-    fn allocate_local(&self, mut endpoint: Self::Endpoint) -> Result<Self::Endpoint, i32> {
+    fn allocate_local(
+        &self,
+        mut endpoint: Self::Endpoint,
+    ) -> Result<Self::Endpoint, SessionError> {
         if self.local_endpoint_cleanup.lock().cleanup_pending {
             self.reclaim_local_endpoints();
         }
         let mut config = *endpoint.transport();
         if config.local.address.is_unspecified() {
-            return Err(SESSION_E_NOIP);
+            return Err(SessionError::NoIp);
         }
         if config.local.port != 0 {
-            let retval = self.mark_used(&endpoint);
-            return if retval == SESSION_E_NONE {
-                Ok(endpoint)
-            } else {
-                Err(retval)
-            };
+            self.mark_used(&endpoint)?;
+            return Ok(endpoint);
         }
         let limit = self
             .port_allocator_max_src_port
@@ -303,11 +299,13 @@ impl TransportMain for IpTransportMain {
         for _ in 0..limit {
             config.local.port = self.next_source_port();
             endpoint = SessionEndpoint::new(config, endpoint.transport_protocol());
-            if self.mark_used(&endpoint) == SESSION_E_NONE {
-                return Ok(endpoint);
+            match self.mark_used(&endpoint) {
+                Ok(()) => return Ok(endpoint),
+                Err(SessionError::PortInUse) => {}
+                Err(error) => return Err(error),
             }
         }
-        Err(SESSION_E_NOPORT)
+        Err(SessionError::NoPort)
     }
 }
 
