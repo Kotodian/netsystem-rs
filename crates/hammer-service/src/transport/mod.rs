@@ -8,6 +8,8 @@ use hammer_runtime::session::{
 use hammer_runtime::{RuntimeError, RuntimeResult};
 use thiserror::Error;
 
+use crate::session::error::SessionError;
+
 pub mod congestion;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -168,15 +170,29 @@ impl<E, O> TransportConnection<E, O> {
     }
 }
 
+/// Static transport capability contract. The VFT below is retained only as a
+/// migration shim and is not part of the ADR-0038 target path.
 pub trait Transport<T> {
     type Connection;
     type Attribute;
 
     fn options(&self) -> TransportOptions;
-    fn connect(&self, endpoint: &T, session: crate::session::SessionHandle) -> i32;
-    fn connect_stream(&self, endpoint: &T, session: crate::session::SessionHandle) -> i32;
-    fn start_listen(&self, endpoint: &T, session: crate::session::SessionHandle) -> u32;
-    fn stop_listen(&self, connection_index: u32) -> u32;
+    fn connect(
+        &self,
+        endpoint: &T,
+        session: crate::session::SessionHandle,
+    ) -> Result<u32, SessionError>;
+    fn connect_stream(
+        &self,
+        endpoint: &T,
+        session: crate::session::SessionHandle,
+    ) -> Result<u32, SessionError>;
+    fn start_listen(
+        &self,
+        endpoint: &T,
+        session: crate::session::SessionHandle,
+    ) -> Result<u32, SessionError>;
+    fn stop_listen(&self, connection_index: u32) -> Result<u32, SessionError>;
     fn half_close(&self, connection_index: u32, worker_index: u32);
     fn close(&self, connection_index: u32, worker_index: u32);
     fn reset(&self, connection_index: u32, worker_index: u32);
@@ -196,8 +212,12 @@ pub trait Transport<T> {
         &self,
         session: crate::session::SessionHandle,
         params: &mut TransportSendParams,
-    ) -> i32;
-    fn app_rx_event(&self, connection_index: u32, worker_index: u32) -> i32;
+    ) -> usize;
+    fn app_rx_event(
+        &self,
+        connection_index: u32,
+        worker_index: u32,
+    ) -> Result<(), SessionError>;
     fn connection(&self, connection_index: u32, worker_index: u32) -> Option<&Self::Connection>;
     fn listener(&self, connection_index: u32) -> Option<&Self::Connection>;
     fn half_open(&self, connection_index: u32) -> Option<&Self::Connection>;
@@ -208,7 +228,7 @@ pub trait Transport<T> {
         connection_index: u32,
         worker_index: u32,
         attribute: &mut Self::Attribute,
-    ) -> i32;
+    ) -> Result<(), SessionError>;
 }
 
 pub type TransportStartListen =
@@ -236,17 +256,21 @@ pub trait TransportMain: Sized {
     type Endpoint;
     type LocalEndpoint;
 
-    fn init(config: Self::Config) -> Result<Self, i32>;
-    fn global() -> Result<&'static Self, i32>;
-    fn mark_used(&self, endpoint: &Self::Endpoint) -> i32;
+    fn init(config: Self::Config) -> Result<Self, SessionError>;
+    fn global() -> Result<&'static Self, SessionError>;
+    fn mark_used(&self, endpoint: &Self::Endpoint) -> Result<(), SessionError>;
     fn share(&self, endpoint: &Self::Endpoint);
-    fn release(&self, endpoint: &Self::Endpoint) -> i32;
-    fn allocate_local(&self, endpoint: Self::Endpoint) -> Result<Self::Endpoint, i32>;
+    fn release(&self, endpoint: &Self::Endpoint) -> Result<(), SessionError>;
+    fn allocate_local(
+        &self,
+        endpoint: Self::Endpoint,
+    ) -> Result<Self::Endpoint, SessionError>;
 }
 
 /// A concrete transport operation table published in one numeric protocol
 /// slot. The slot is assigned by the process-global transport authority.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[deprecated(note = "use the static Transport trait; VFT is retained only for migration")]
 pub struct TransportVft {
     pub(crate) start_listen: Option<TransportStartListen>,
     pub(crate) stop_listen: Option<TransportStopListen>,
@@ -258,6 +282,7 @@ pub struct TransportVft {
     pub(crate) close_connection: Option<TransportCloseConnection>,
 }
 
+#[allow(deprecated)]
 impl TransportVft {
     #[inline]
     pub const fn new(
@@ -284,6 +309,7 @@ impl TransportVft {
 }
 
 /// Independent process-global protocol dispatch table, matching VPP's
+#[deprecated(note = "use concrete Transport implementations; this registry is a migration shim")]
 static TRANSPORT_VFTS: OnceLock<TransportVftTable> = OnceLock::new();
 
 struct TransportVftTable {
@@ -338,6 +364,7 @@ pub enum TransportError {
 /// Session transport index convention. The returned slot is the only protocol
 /// identity a plugin needs to retain for its own Session records.
 #[inline]
+#[deprecated(note = "use concrete Transport implementations; this registry is a migration shim")]
 pub fn register_transport(vft: TransportVft) -> Result<u8, TransportError> {
     hammer_runtime::ensure_main_thread_with_barrier()
         .expect("Transport registration runs only from Main Thread init under WorkerBarrier");
@@ -349,6 +376,7 @@ pub fn register_transport(vft: TransportVft) -> Result<u8, TransportError> {
 
 /// Returns one published transport VFT by its protocol index.
 #[inline]
+#[deprecated(note = "use concrete Transport implementations; this registry is a migration shim")]
 pub fn transport_vft(protocol: u8) -> Option<TransportVft> {
     TRANSPORT_VFTS.get()?.get(protocol)
 }

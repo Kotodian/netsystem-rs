@@ -3,8 +3,7 @@ use std::sync::OnceLock;
 use hammer_infra::svm::fifo::Fifo as SvmFifo;
 use hammer_infra::svm::fifo_segment::SvmFifoSegment;
 use hammer_service::session::{
-    SESSION_E_NONE, SESSION_E_NOSESSION, SESSION_E_SEG_NO_SPACE, SESSION_E_UNKNOWN, SessionConfig,
-    SessionHandle, SessionLookup, SessionMain, SessionState,
+    SessionConfig, SessionError, SessionHandle, SessionLookup, SessionMain, SessionState,
 };
 use hammer_service::transport::{TransportMain, TransportTxMode};
 
@@ -27,23 +26,21 @@ impl IpSessionMain {
         table_config: IpSessionTableConfig,
         transport_config: IpTransportConfig,
         worker_mq_segment: SvmFifoSegment,
-    ) -> Result<Self, i32> {
-        Ok(Self {
+    ) -> Result<(), SessionError> {
+        let main = Self {
             session: SessionMain::init(session_config, worker_mq_segment)?,
             lookup: IpSessionLookup::new(table_config),
             transport: IpTransportMain::init(transport_config)?,
-        })
-    }
-
-    pub(crate) fn publish_global(main: Self) {
+        };
         assert!(
             IP_SESSION_MAIN.set(main).is_ok(),
             "IP Session Main initialization callback executes once"
         );
+        Ok(())
     }
 
-    pub fn global() -> Result<&'static Self, i32> {
-        IP_SESSION_MAIN.get().ok_or(SESSION_E_UNKNOWN)
+    pub fn global() -> Result<&'static Self, SessionError> {
+        IP_SESSION_MAIN.get().ok_or(SessionError::Unknown)
     }
 
     #[inline(always)]
@@ -66,16 +63,20 @@ impl IpSessionMain {
         self.lookup.lookup_session(key).map(SessionHandle::from)
     }
 
-    pub fn publish(&self, key: IpTransportConnectionId, session: SessionHandle) -> i32 {
+    pub fn publish(
+        &self,
+        key: IpTransportConnectionId,
+        session: SessionHandle,
+    ) -> Result<(), SessionError> {
         self.lookup.add_connection(&key, session.into());
-        SESSION_E_NONE
+        Ok(())
     }
 
-    pub fn remove(&self, key: &IpTransportConnectionId) -> i32 {
+    pub fn remove(&self, key: &IpTransportConnectionId) -> Result<(), SessionError> {
         if self.lookup.remove_connection(key) {
-            SESSION_E_NONE
+            Ok(())
         } else {
-            SESSION_E_NOSESSION
+            Err(SessionError::NoSession)
         }
     }
 
@@ -84,26 +85,25 @@ impl IpSessionMain {
         worker_index: u32,
         endpoint: &IpSessionEndpoint,
         connection_index: u32,
-    ) -> Result<SessionHandle, i32> {
+    ) -> Result<SessionHandle, SessionError> {
         let session = self.session.allocate(
             worker_index,
             SessionState::Connecting,
             endpoint.transport_protocol(),
         )?;
-        let retval =
-            self.session
-                .attach_transport(session, endpoint.transport_protocol(), connection_index);
-        if retval != SESSION_E_NONE {
-            return Err(retval);
-        }
+        self.session
+            .attach_transport(session, endpoint.transport_protocol(), connection_index)?;
         Ok(session)
     }
 
-    pub fn prepare_endpoint(&self, endpoint: IpSessionEndpoint) -> Result<IpSessionEndpoint, i32> {
+    pub fn prepare_endpoint(
+        &self,
+        endpoint: IpSessionEndpoint,
+    ) -> Result<IpSessionEndpoint, SessionError> {
         self.transport.allocate_local(endpoint)
     }
 
-    pub fn release_endpoint(&self, endpoint: &IpSessionEndpoint) -> i32 {
+    pub fn release_endpoint(&self, endpoint: &IpSessionEndpoint) -> Result<(), SessionError> {
         self.transport.release(endpoint)
     }
 
@@ -112,58 +112,66 @@ impl IpSessionMain {
         protocol: u8,
         tx_mode: TransportTxMode,
         output_next: u32,
-    ) -> Result<u8, i32> {
+    ) -> Result<u8, SessionError> {
         self.session
             .register_transport_type(protocol, tx_mode, output_next)
     }
 
-    pub fn rx_fifo(&self, session: SessionHandle) -> Result<&SvmFifo, i32> {
+    pub fn rx_fifo(&self, session: SessionHandle) -> Result<&SvmFifo, SessionError> {
         self.session
             .worker(session.worker_index)
             .and_then(|worker| worker.session(session.session_index))
-            .ok_or(SESSION_E_NOSESSION)?
+            .ok_or(SessionError::NoSession)?
             .rx_fifo()
-            .ok_or(SESSION_E_SEG_NO_SPACE)
+            .ok_or(SessionError::SegmentNoSpace)
     }
 
-    pub fn tx_fifo(&self, session: SessionHandle) -> Result<&SvmFifo, i32> {
+    pub fn tx_fifo(&self, session: SessionHandle) -> Result<&SvmFifo, SessionError> {
         self.session
             .worker(session.worker_index)
             .and_then(|worker| worker.session(session.session_index))
-            .ok_or(SESSION_E_NOSESSION)?
+            .ok_or(SessionError::NoSession)?
             .tx_fifo()
-            .ok_or(SESSION_E_SEG_NO_SPACE)
+            .ok_or(SessionError::SegmentNoSpace)
     }
 
-    pub fn notify_closed(&mut self, session: SessionHandle, connection_index: u32) -> i32 {
+    pub fn notify_closed(
+        &self,
+        session: SessionHandle,
+        connection_index: u32,
+    ) -> Result<(), SessionError> {
         let Some(entry) = self
             .session
             .worker(session.worker_index)
             .and_then(|worker| worker.session(session.session_index))
         else {
-            return SESSION_E_NOSESSION;
+            return Err(SessionError::NoSession);
         };
         if entry.connection_index() != connection_index {
-            return SESSION_E_NOSESSION;
+            return Err(SessionError::NoSession);
         }
         entry.store_state(SessionState::TransportClosed);
-        SESSION_E_NONE
+        Ok(())
     }
 
-    pub fn notify_reset(&mut self, session: SessionHandle, connection_index: u32) -> i32 {
+    pub fn notify_reset(&self, session: SessionHandle, connection_index: u32) -> Result<(), SessionError> {
         self.notify_closed(session, connection_index)
     }
 
-    pub fn notify_deleted(&mut self, session: SessionHandle, connection_index: u32) -> i32 {
+    pub fn notify_deleted(
+        &mut self,
+        session: SessionHandle,
+        connection_index: u32,
+    ) -> Result<(), SessionError> {
         let Some(entry) = self
             .session
             .worker(session.worker_index)
             .and_then(|worker| worker.session(session.session_index))
         else {
-            return SESSION_E_NOSESSION;
+            return Err(SessionError::NoSession);
         };
         if entry.connection_index() != connection_index {
-            return SESSION_E_NOSESSION;
+            return Err(SessionError::NoSession);
         }
         self.session.detach_transport(session)
     }

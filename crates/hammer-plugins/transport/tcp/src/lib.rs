@@ -49,8 +49,7 @@ use hammer_service::session::runtime::{
     SessionTransport, SessionWorker, dispatch_session_queue_events,
 };
 use hammer_service::session::{
-    SESSION_E_INVALID, SESSION_E_NONE, SESSION_E_NOSUPPORT, SessionHandle as ServiceSessionHandle,
-    SessionQueueNext,
+    SessionError, SessionHandle as ServiceSessionHandle, SessionQueueNext,
 };
 use hammer_service::transport::{
     Transport, TransportMain, TransportOptions, TransportSendParams, TransportServiceType,
@@ -105,8 +104,11 @@ enum TcpWorkerError {
     WorkerUnavailable { thread_index: u32 },
     #[error("TCP worker {worker} is outside the configured worker range")]
     WorkerOutOfRange { worker: usize },
-    #[error("Session transport registration returned retval {retval}")]
-    SessionTransportRegistration { retval: i32 },
+    #[error("Session transport registration")]
+    SessionTransportRegistration {
+        #[source]
+        source: SessionError,
+    },
 }
 
 pub(crate) fn publish_tcp_connection(
@@ -317,9 +319,9 @@ impl TcpMain {
         sessions: &IpSessionMain,
         worker_index: u32,
         connection_index: u32,
-    ) -> i32 {
+    ) -> Result<(), SessionError> {
         let Some(connection) = self.connection(connection_index, worker_index) else {
-            return SESSION_E_INVALID;
+            return Err(SessionError::NoSession);
         };
         sessions.publish(connection.base.endpoint, connection.base.session)
     }
@@ -335,14 +337,18 @@ impl Transport<IpTransportEndpointConfig> for TcpMain {
         TransportOptions::new(TransportTxMode::Peek, TransportServiceType::VirtualCircuit)
     }
 
-    fn connect(&self, endpoint: &IpTransportEndpointConfig, session: ServiceSessionHandle) -> i32 {
+    fn connect(
+        &self,
+        endpoint: &IpTransportEndpointConfig,
+        session: ServiceSessionHandle,
+    ) -> Result<u32, SessionError> {
         let local = SocketAddr::new(endpoint.local.address, endpoint.local.port);
         let remote = SocketAddr::new(endpoint.peer.address, endpoint.peer.port);
         if local.is_ipv4() != remote.is_ipv4() || local.port() == 0 || remote.port() == 0 {
-            return SESSION_E_INVALID;
+            return Err(SessionError::Invalid);
         }
         let Some(slot) = self.workers.get(session.worker_index as usize) else {
-            return SESSION_E_INVALID;
+            return Err(SessionError::Invalid);
         };
         let worker = unsafe { &mut *slot.worker.as_ptr() };
         let initial_sequence = worker.lookup.next_initial_sequence(local, remote);
@@ -356,16 +362,12 @@ impl Transport<IpTransportEndpointConfig> for TcpMain {
         );
         connection.connect_state(initial_sequence);
         let connection_index = worker.insert_connection(connection);
-        let Ok(retval) = i32::try_from(connection_index) else {
-            worker.remove_connection(connection_index);
-            return SESSION_E_INVALID;
-        };
         let Some(connection) = worker.connection_mut(connection_index) else {
-            return SESSION_E_INVALID;
+            return Err(SessionError::NoSession);
         };
         if connection.attach_session(session.session_index).is_err() {
             worker.remove_connection(connection_index);
-            return SESSION_E_INVALID;
+            return Err(SessionError::Invalid);
         }
         let published = {
             let TcpWorker {
@@ -374,42 +376,37 @@ impl Transport<IpTransportEndpointConfig> for TcpMain {
                 ..
             } = worker;
             let Some(connection) = connections.get(connection_index) else {
-                return SESSION_E_INVALID;
+                return Err(SessionError::NoSession);
             };
             lookup.publish_connection(session.session_index, connection)
         };
         if published {
             worker.remove_connection(connection_index);
-            return SESSION_E_INVALID;
+            return Err(SessionError::PortInUse);
         }
-        retval
+        Ok(connection_index)
     }
 
     fn connect_stream(
         &self,
         endpoint: &IpTransportEndpointConfig,
         session: ServiceSessionHandle,
-    ) -> i32 {
+    ) -> Result<u32, SessionError> {
         drop((endpoint, session));
-        SESSION_E_NOSUPPORT
+        Err(SessionError::NotSupported)
     }
 
     fn start_listen(
         &self,
         endpoint: &IpTransportEndpointConfig,
         session: ServiceSessionHandle,
-    ) -> u32 {
+    ) -> Result<u32, SessionError> {
         if hammer_runtime::ensure_main_thread_with_barrier().is_err() {
-            return SESSION_E_INVALID as u32;
+            return Err(SessionError::Invalid);
         }
         let session_endpoint = IpSessionEndpoint::new(*endpoint, self.protocol);
-        let Ok(transport) = IpTransportMain::global() else {
-            return SESSION_E_INVALID as u32;
-        };
-        let retval = transport.mark_used(&session_endpoint);
-        if retval != SESSION_E_NONE {
-            return retval as u32;
-        }
+        let transport = IpTransportMain::global()?;
+        transport.mark_used(&session_endpoint)?;
         let local = endpoint.local;
         let bind = std::net::SocketAddr::new(local.address, local.port);
         let result = self.bind_tcp_listener(
@@ -418,15 +415,20 @@ impl Transport<IpTransportEndpointConfig> for TcpMain {
             listener_capabilities(),
             session.into(),
         );
-        if result.is_err() {
-            transport.release(&session_endpoint);
+        match result {
+            Ok(index) => Ok(index),
+            Err(error) => {
+                debug_assert!(transport.release(&session_endpoint).is_ok());
+                Err(SessionError::TransportOpFailed {
+                    source: RuntimeError::from(error),
+                })
+            }
         }
-        result.unwrap_or(SESSION_E_INVALID as u32)
     }
 
-    fn stop_listen(&self, connection_index: u32) -> u32 {
+    fn stop_listen(&self, connection_index: u32) -> Result<u32, SessionError> {
         if hammer_runtime::ensure_main_thread_with_barrier().is_err() {
-            return SESSION_E_INVALID as u32;
+            return Err(SessionError::Invalid);
         }
         let endpoint = self
             .listener_connection(connection_index)
@@ -444,12 +446,14 @@ impl Transport<IpTransportEndpointConfig> for TcpMain {
         {
             Ok(()) => {
                 self.remove_listener_connection(connection_index);
-                if let (Some(endpoint), Ok(transport)) = (endpoint, IpTransportMain::global()) {
-                    transport.release(&endpoint);
+                if let Some(endpoint) = endpoint {
+                    IpTransportMain::global()?.release(&endpoint)?;
                 }
-                SESSION_E_NONE as u32
+                Ok(connection_index)
             }
-            Err(_) => SESSION_E_INVALID as u32,
+            Err(error) => Err(SessionError::TransportOpFailed {
+                source: RuntimeError::from(error),
+            }),
         }
     }
 
@@ -540,12 +544,12 @@ impl Transport<IpTransportEndpointConfig> for TcpMain {
 
     fn flush_data(&self, _: u32, _: u32) {}
 
-    fn custom_tx(&self, _: ServiceSessionHandle, _: &mut TransportSendParams) -> i32 {
-        SESSION_E_INVALID
+    fn custom_tx(&self, _: ServiceSessionHandle, _: &mut TransportSendParams) -> usize {
+        0
     }
 
-    fn app_rx_event(&self, _: u32, _: u32) -> i32 {
-        SESSION_E_INVALID
+    fn app_rx_event(&self, _: u32, _: u32) -> Result<(), SessionError> {
+        Err(SessionError::NotSupported)
     }
 
     #[inline]
@@ -597,8 +601,8 @@ impl Transport<IpTransportEndpointConfig> for TcpMain {
         tcp_endpoint_pair(local, connection.remote())
     }
 
-    fn attribute(&self, _: u32, _: u32, _: &mut Self::Attribute) -> i32 {
-        SESSION_E_INVALID
+    fn attribute(&self, _: u32, _: u32, _: &mut Self::Attribute) -> Result<(), SessionError> {
+        Err(SessionError::NotSupported)
     }
 }
 
@@ -770,9 +774,9 @@ fn init_tcp() -> RuntimeResult<()> {
     ))
     .map_err(RuntimeError::from)?;
     IpSessionMain::global()
-        .map_err(|retval| TcpWorkerError::SessionTransportRegistration { retval })?
+        .map_err(|source| TcpWorkerError::SessionTransportRegistration { source })?
         .register_transport_type(protocol, TransportTxMode::Peek, u32::MAX)
-        .map_err(|retval| TcpWorkerError::SessionTransportRegistration { retval })?;
+        .map_err(|source| TcpWorkerError::SessionTransportRegistration { source })?;
     let config = TCP_CONFIG
         .get()
         .expect("TCP configuration is installed before initialization");
@@ -900,9 +904,6 @@ fn bind_worker_graph(engine: &mut DataPlaneMain) -> RuntimeResult<()> {
     engine.set_worker_node_runtime_data(tcp_rcv_process, rcv_process_data)?;
     engine.set_worker_node_runtime_data(tcp_syn_sent, syn_sent_data)?;
 
-    engine
-        .nodes()
-        .set_node_state(session_queue, NodeState::Polling)?;
     Ok(())
 }
 

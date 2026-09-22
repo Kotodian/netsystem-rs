@@ -1,12 +1,12 @@
 use hammer_core::data_plane::NodeId;
 use hammer_infra::svm::fifo::FifoError;
+use hammer_infra::svm::msg_queue::SvmMsgQError;
 use hammer_runtime::app::{SessionControlError, SessionHandle};
 use hammer_runtime::{DataWorkerId, RuntimeError};
 use thiserror::Error;
 
 #[hammer_component_macros::runtime_error(subsystem = "session queue")]
 #[derive(Debug, Error)]
-#[repr(u16)]
 pub enum SessionQueueError {
     #[error("session queue node is not registered")]
     NodeMissing,
@@ -23,24 +23,97 @@ pub enum SessionQueueError {
     ApplicationMqMissing { application: u32 },
 }
 
-impl SessionQueueError {
-    #[inline(always)]
-    pub const fn code(&self) -> u16 {
-        match self {
-            Self::NodeMissing => 0,
-            Self::WorkerUnavailable { .. } => 1,
-            Self::WorkerOutOfRange { .. } => 2,
-            Self::OutputMissing { .. } => 3,
-            Self::ApplicationMqMissing { .. } => 4,
-        }
-    }
-}
-
 pub use hammer_runtime::app::SessionConnectError;
 
 #[hammer_component_macros::runtime_error(subsystem = "session")]
 #[derive(Debug, Error)]
 pub enum SessionError {
+    // VPP source: session_types.h:519-576, foreach_session_error.
+    #[error("unknown Session failure")]
+    Unknown,
+    #[error("connection refused")]
+    Refused,
+    #[error("Session operation timed out")]
+    TimedOut,
+    #[error("Session allocation failed")]
+    Allocation,
+    #[error("Session object is not owned by the caller")]
+    Owner,
+    #[error("no route")]
+    NoRoute,
+    #[error("no resolving interface")]
+    NoInterface,
+    #[error("local interface has no IP address")]
+    NoIp,
+    #[error("no local port is available")]
+    NoPort,
+    #[error("operation is not supported")]
+    NotSupported,
+    #[error("endpoint is not listening")]
+    NotListening,
+    #[error("Session does not exist")]
+    NoSession,
+    #[error("Application is not attached")]
+    NoApplication,
+    #[error("Application is already attached")]
+    ApplicationAttached,
+    #[error("local port is already in use")]
+    PortInUse,
+    #[error("IP address is already in use")]
+    IpInUse,
+    #[error("IP and port pair is already listening")]
+    AlreadyListening,
+    #[error("address is not in use")]
+    AddressNotInUse,
+    #[error("invalid Session value")]
+    Invalid,
+    #[error("invalid remote IP address")]
+    InvalidRemoteIp,
+    #[error("invalid Application Worker")]
+    InvalidApplicationWorker,
+    #[error("invalid Application Namespace")]
+    InvalidNamespace,
+    #[error("Session segment has no space for a FIFO pair")]
+    SegmentNoSpace,
+    #[error("new Session segment has no space for a FIFO pair")]
+    NewSegmentNoSpace,
+    #[error("Session segment creation failed")]
+    SegmentCreate,
+    #[error("Session was filtered")]
+    Filtered,
+    #[error("requested Session scope is not supported")]
+    ScopeNotSupported,
+    #[error("Binary API connection has no file descriptor")]
+    BinaryApiNoFileDescriptor,
+    #[error("Binary API file descriptor send failed")]
+    BinaryApiSendFileDescriptor,
+    #[error("Binary API registration does not exist")]
+    BinaryApiRegistrationMissing,
+    #[error("Session message allocation failed: {source}")]
+    MessageQueueAllocation {
+        #[source]
+        source: SvmMsgQError,
+    },
+    #[error("TLS handshake failed")]
+    TlsHandshake,
+    #[error("eventfd allocation failed")]
+    EventFdAllocation,
+    #[error("extended transport configuration is missing")]
+    ExtendedConfigMissing,
+    #[error("crypto engine is missing")]
+    CryptoEngineMissing,
+    #[error("crypto certificate/key pair is missing")]
+    CryptoKeyPairMissing,
+    #[error("local-scope connect failed")]
+    LocalConnect,
+    #[error("Application Namespace secret is incorrect")]
+    WrongNamespaceSecret,
+    #[error("system call failed")]
+    Syscall,
+    #[error("transport is not registered")]
+    TransportNotRegistered,
+    #[error("maximum stream count reached")]
+    MaxStreamsReached,
     #[error("session {session_id:?} is not in the session pool")]
     SessionMissing { session_id: u32 },
     #[error("Session App {app:?} is not registered")]
@@ -152,10 +225,51 @@ pub enum SessionError {
 impl From<SessionError> for SessionControlError {
     fn from(error: SessionError) -> Self {
         match error {
+            SessionError::Unknown
+            | SessionError::Refused
+            | SessionError::TimedOut
+            | SessionError::Allocation
+            | SessionError::Owner
+            | SessionError::NoRoute
+            | SessionError::NoInterface
+            | SessionError::NoIp
+            | SessionError::NoPort
+            | SessionError::NotSupported
+            | SessionError::NotListening
+            | SessionError::NoSession
+            | SessionError::NoApplication
+            | SessionError::ApplicationAttached
+            | SessionError::PortInUse
+            | SessionError::IpInUse
+            | SessionError::AlreadyListening
+            | SessionError::AddressNotInUse
+            | SessionError::Invalid
+            | SessionError::InvalidRemoteIp
+            | SessionError::InvalidApplicationWorker
+            | SessionError::InvalidNamespace
+            | SessionError::SegmentNoSpace
+            | SessionError::NewSegmentNoSpace
+            | SessionError::SegmentCreate
+            | SessionError::Filtered
+            | SessionError::ScopeNotSupported
+            | SessionError::BinaryApiNoFileDescriptor
+            | SessionError::BinaryApiSendFileDescriptor
+            | SessionError::BinaryApiRegistrationMissing
+            | SessionError::MessageQueueAllocation { .. }
+            | SessionError::TlsHandshake
+            | SessionError::EventFdAllocation
+            | SessionError::ExtendedConfigMissing
+            | SessionError::CryptoEngineMissing
+            | SessionError::CryptoKeyPairMissing
+            | SessionError::LocalConnect
+            | SessionError::WrongNamespaceSecret
+            | SessionError::Syscall
+            | SessionError::TransportNotRegistered
+            | SessionError::MaxStreamsReached => Self::TransportFailed,
             SessionError::ListenerMissing { .. } => Self::ListenerMissing,
             SessionError::ListenerControlWrongThread => Self::ApplicationControlWrongThread,
-            SessionError::TransportListenUnsupported { .. } => Self::TransportListenUnsupported,
-            SessionError::TransportConnectUnsupported { .. } => Self::TransportConnectUnsupported,
+            SessionError::TransportListenUnsupported => Self::TransportListenUnsupported,
+            SessionError::TransportConnectUnsupported => Self::TransportConnectUnsupported,
             SessionError::ApplicationConnectionMissing => Self::ConnectionMissing,
             SessionError::TransportConnectStreamUnsupported { .. } => {
                 Self::TransportConnectUnsupported

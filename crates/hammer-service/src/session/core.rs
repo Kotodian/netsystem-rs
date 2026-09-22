@@ -13,25 +13,46 @@ use hammer_infra::timer_wheel::TimerWheel1t2w2048sl;
 use zerocopy::{FromBytes, Immutable, IntoBytes, KnownLayout};
 
 use crate::transport::{TransportSendParams, TransportTxMode};
+use super::error::SessionError;
 
 pub const SESSION_INDEX_INVALID: u32 = u32::MAX;
 
+// Compatibility names for callers that still cross the old retval boundary.
+// Internal Session/Transport operations use SessionError below; these are
+// deprecated and are not part of the ADR-0038 Rust contract.
+#[deprecated(note = "use Result<(), SessionError>; SESSION_E_NONE is an ABI retval only")]
 pub const SESSION_E_NONE: i32 = 0;
+#[deprecated(note = "use SessionError::Unknown")]
 pub const SESSION_E_UNKNOWN: i32 = -1;
+#[deprecated(note = "use SessionError::Allocation")]
 pub const SESSION_E_ALLOC: i32 = -4;
+#[deprecated(note = "use SessionError::NoRoute")]
 pub const SESSION_E_NOROUTE: i32 = -6;
+#[deprecated(note = "use SessionError::NoInterface")]
 pub const SESSION_E_NOINTF: i32 = -7;
+#[deprecated(note = "use SessionError::NoIp")]
 pub const SESSION_E_NOIP: i32 = -8;
+#[deprecated(note = "use SessionError::NoPort")]
 pub const SESSION_E_NOPORT: i32 = -9;
+#[deprecated(note = "use SessionError::NotSupported")]
 pub const SESSION_E_NOSUPPORT: i32 = -10;
+#[deprecated(note = "use SessionError::NoSession")]
 pub const SESSION_E_NOSESSION: i32 = -12;
+#[deprecated(note = "use SessionError::PortInUse")]
 pub const SESSION_E_PORTINUSE: i32 = -15;
+#[deprecated(note = "use SessionError::Invalid")]
 pub const SESSION_E_INVALID: i32 = -19;
+#[deprecated(note = "use SessionError::SegmentNoSpace")]
 pub const SESSION_E_SEG_NO_SPACE: i32 = -23;
+#[deprecated(note = "use SessionError::SegmentCreate")]
 pub const SESSION_E_SEG_CREATE: i32 = -25;
+#[deprecated(note = "use SessionError::MessageQueueAllocation")]
 pub const SESSION_E_MQ_MSG_ALLOC: i32 = -31;
+#[deprecated(note = "use SessionError::TransportNotRegistered")]
 pub const SESSION_E_TRANSPORT_NO_REG: i32 = -40;
+#[deprecated(note = "use SessionEventEnqueue::Busy")]
 pub const SESSION_EVENT_QUEUE_LOCK_FAILED: i32 = -1;
+#[deprecated(note = "use SessionEventEnqueue::Full")]
 pub const SESSION_EVENT_QUEUE_FULL: i32 = -2;
 
 #[repr(C)]
@@ -295,27 +316,24 @@ impl<O> SessionWorker<O> {
         self.sessions.get_mut(session_index)
     }
 
-    pub fn handle_event(&mut self, queue: &SvmMsgQ) -> i32 {
+    pub fn handle_event(&mut self, queue: &SvmMsgQ) -> Result<(), SessionError> {
         loop {
             let descriptor = match queue.sub(SvmQueueConditionalWait::Nowait) {
                 Ok(descriptor) => descriptor,
-                Err(SvmMsgQError::Empty) => return SESSION_E_NONE,
-                Err(_) => return SESSION_E_UNKNOWN,
+                Err(SvmMsgQError::Empty) => return Ok(()),
+                Err(source) => return Err(SessionError::MessageQueueAllocation { source }),
             };
             let event = match queue.read::<SessionEventRecord>(descriptor) {
                 Ok(event) => SessionEvent::from(event),
                 Err(_) => {
                     drop(queue.free_msg(descriptor));
-                    return SESSION_E_INVALID;
+                    return Err(SessionError::Invalid);
                 }
             };
-            if queue.free_msg(descriptor).is_err() {
-                return SESSION_E_UNKNOWN;
+            if let Err(source) = queue.free_msg(descriptor) {
+                return Err(SessionError::MessageQueueAllocation { source });
             }
-            let retval = self.consume_event(event);
-            if retval != SESSION_E_NONE {
-                return retval;
-            }
+            self.consume_event(event)?;
         }
     }
 
@@ -358,58 +376,58 @@ impl<O> SessionWorker<O> {
     }
 
     #[inline(always)]
-    pub fn store_state(&self, handle: SessionHandle, state: SessionState) -> i32 {
+    pub fn store_state(&self, handle: SessionHandle, state: SessionState) -> Result<(), SessionError> {
         let Some(session) = self.session_from_handle(handle) else {
-            return SESSION_E_NOSESSION;
+            return Err(SessionError::NoSession);
         };
         session.store_state(state);
-        SESSION_E_NONE
+        Ok(())
     }
 
     #[inline(always)]
-    pub fn enqueue_ready(&mut self, handle: SessionHandle, protocol: u8) -> i32 {
+    pub fn enqueue_ready(&mut self, handle: SessionHandle, protocol: u8) -> Result<(), SessionError> {
         let Some(session) = self.session_from_handle(handle) else {
-            return SESSION_E_NOSESSION;
+            return Err(SessionError::NoSession);
         };
         if session.session_type != protocol {
-            return SESSION_E_INVALID;
+            return Err(SessionError::Invalid);
         }
         self.pending_io_sessions.push(handle);
-        SESSION_E_NONE
+        Ok(())
     }
 
     pub fn allocate_control_data(&mut self, data: SessionControlData) -> u32 {
         self.control_event_data.insert(data)
     }
 
-    pub fn release_control_data(&mut self, index: u32) -> i32 {
+    pub fn release_control_data(&mut self, index: u32) -> Result<(), SessionError> {
         if self.control_event_data.remove(index).is_some() {
-            SESSION_E_NONE
+            Ok(())
         } else {
-            SESSION_E_INVALID
+            Err(SessionError::Invalid)
         }
     }
 
-    pub fn consume_event(&mut self, event: SessionEvent) -> i32 {
+    pub fn consume_event(&mut self, event: SessionEvent) -> Result<(), SessionError> {
         if event.session.worker_index != self.worker_index
             || self.session(event.session.session_index).is_none()
         {
-            return SESSION_E_NOSESSION;
+            return Err(SessionError::NoSession);
         }
         self.pending_io_sessions.push(event.session);
-        SESSION_E_NONE
+        Ok(())
     }
 
-    pub fn queue_migration(&mut self, request: SessionMigrationRequest) -> i32 {
+    pub fn queue_migration(&mut self, request: SessionMigrationRequest) -> Result<(), SessionError> {
         self.migration.lock().requests.push(request);
-        SESSION_E_NONE
+        Ok(())
     }
 
-    pub fn handle_migrations(&mut self) -> i32 {
+    pub fn handle_migrations(&mut self) -> Result<usize, SessionError> {
         let mut migration = self.migration.lock();
         let requests = std::mem::take(&mut migration.requests);
         migration.handling.extend(requests);
-        i32::try_from(migration.handling.len()).unwrap_or(i32::MAX)
+        Ok(migration.handling.len())
     }
 
     pub fn update_time(&mut self, now: f64, now_us: u64) {
@@ -560,6 +578,15 @@ pub struct SessionEvent {
     pub payload: [u64; 2],
 }
 
+/// VPP `session_send_evt_to_thread` enqueue outcomes. Busy and full mean that
+/// no event was committed; they are normal retry results, not Session errors.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SessionEventEnqueue {
+    Enqueued,
+    Busy,
+    Full,
+}
+
 #[repr(C)]
 #[derive(Clone, Copy, KnownLayout, FromBytes, Immutable, IntoBytes)]
 struct SessionEventRecord {
@@ -601,13 +628,6 @@ impl From<SessionEventRecord> for SessionEvent {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum SessionRuntimeEngine {
-    Disabled,
-    RuleTable,
-    None,
-    Sdl,
-}
-
 pub struct SessionMain<O = u32> {
     config: SessionConfig,
     workers: Vec<SessionWorker<O>>,
@@ -619,8 +639,6 @@ pub struct SessionMain<O = u32> {
     last_transport_protocol: AtomicU8,
     is_enabled: AtomicBool,
     is_initialized: bool,
-    runtime_engine: SessionRuntimeEngine,
-    dump_worker_segments: bool,
 }
 
 // SAFETY: workers are constructed before publication and each mutable worker
@@ -630,7 +648,10 @@ pub struct SessionMain<O = u32> {
 unsafe impl<O: Send> Sync for SessionMain<O> {}
 
 impl<O: Default> SessionMain<O> {
-    pub fn init(config: SessionConfig, worker_mq_segment: SvmFifoSegment) -> Result<Self, i32> {
+    pub fn init(
+        config: SessionConfig,
+        worker_mq_segment: SvmFifoSegment,
+    ) -> Result<Self, SessionError> {
         let mut workers = Vec::with_capacity(config.worker_count as usize);
         for worker_index in 0..config.worker_count {
             workers.push(SessionWorker::new(worker_index, config));
@@ -649,16 +670,14 @@ impl<O: Default> SessionMain<O> {
             last_transport_protocol: AtomicU8::new(0),
             is_enabled: AtomicBool::new(config.session_enable_asap),
             is_initialized: true,
-            runtime_engine: SessionRuntimeEngine::None,
-            dump_worker_segments: false,
         };
         main.allocate_event_queues()?;
         Ok(main)
     }
 
-    pub fn allocate_event_queues(&mut self) -> Result<(), i32> {
+    pub fn allocate_event_queues(&mut self) -> Result<(), SessionError> {
         if self.config.event_ring_capacity == 0 || self.config.configured_worker_mq_length == 0 {
-            return Err(SESSION_E_INVALID);
+            return Err(SessionError::Invalid);
         }
         let ring = [SvmMsgQRingConfig::new(
             self.config.event_ring_capacity,
@@ -670,12 +689,11 @@ impl<O: Default> SessionMain<O> {
             rings: &ring,
         };
         for worker_index in self.worker_mq_segment.mqs.len() as u32..self.config.worker_count {
-            if self
+            if let Err(source) = self
                 .worker_mq_segment
                 .allocate_message_queue(worker_index, &config)
-                .is_err()
             {
-                return Err(SESSION_E_MQ_MSG_ALLOC);
+                return Err(SessionError::MessageQueueAllocation { source });
             }
         }
         Ok(())
@@ -702,14 +720,14 @@ impl<O: Default> SessionMain<O> {
         protocol: u8,
         tx_mode: TransportTxMode,
         output_next: u32,
-    ) -> Result<u8, i32> {
+    ) -> Result<u8, SessionError> {
         if hammer_runtime::ensure_main_thread_with_barrier().is_err() {
-            return Err(SESSION_E_INVALID);
+            return Err(SessionError::Invalid);
         }
         let previous = self.last_transport_protocol.load(Ordering::Acquire);
-        let expected = previous.checked_add(1).ok_or(SESSION_E_INVALID)?;
+        let expected = previous.checked_add(1).ok_or(SessionError::Invalid)?;
         if protocol != expected {
-            return Err(SESSION_E_INVALID);
+            return Err(SessionError::Invalid);
         }
         // SAFETY: registration is Main Thread work performed before worker
         // launch or while WorkerBarrier excludes readers.
@@ -720,19 +738,19 @@ impl<O: Default> SessionMain<O> {
         Ok(protocol)
     }
 
-    pub fn begin_pool_reallocation(&self) -> i32 {
+    pub fn begin_pool_reallocation(&self) -> Result<(), SessionError> {
         let mut state = self.pool_reallocation.lock();
         state.workers_at_barrier = state.workers_at_barrier.saturating_add(1);
-        SESSION_E_NONE
+        Ok(())
     }
 
-    pub fn finish_pool_reallocation(&self) -> i32 {
+    pub fn finish_pool_reallocation(&self) -> Result<(), SessionError> {
         let mut state = self.pool_reallocation.lock();
         if state.workers_at_barrier == 0 {
-            return SESSION_E_INVALID;
+            return Err(SessionError::Invalid);
         }
         state.workers_at_barrier -= 1;
-        SESSION_E_NONE
+        Ok(())
     }
 
     #[inline(always)]
@@ -740,13 +758,26 @@ impl<O: Default> SessionMain<O> {
         self.is_enabled.load(Ordering::Acquire)
     }
 
+    /// VPP `session_enable` lifecycle transition. Registration and graph
+    /// materialization remain separate from this flag.
+    pub fn enable(&self) -> Result<(), SessionError> {
+        self.is_enabled.store(true, Ordering::Release);
+        Ok(())
+    }
+
+    /// VPP `session_disable` lifecycle transition.
+    pub fn disable(&self) -> Result<(), SessionError> {
+        self.is_enabled.store(false, Ordering::Release);
+        Ok(())
+    }
+
     pub fn allocate(
         &mut self,
         worker_index: u32,
         state: SessionState,
         protocol: u8,
-    ) -> Result<SessionHandle, i32> {
-        let worker = self.worker_mut(worker_index).ok_or(SESSION_E_INVALID)?;
+    ) -> Result<SessionHandle, SessionError> {
+        let worker = self.worker_mut(worker_index).ok_or(SessionError::Invalid)?;
         let session_index = worker.sessions.insert(Session::new(
             SessionHandle {
                 worker_index,
@@ -773,78 +804,86 @@ impl<O: Default> SessionMain<O> {
         session: SessionHandle,
         protocol: u8,
         connection_index: u32,
-    ) -> i32 {
+    ) -> Result<(), SessionError> {
         let Some(entry) = self
             .worker_mut(session.worker_index)
             .and_then(|worker| worker.session_mut(session.session_index))
         else {
-            return SESSION_E_NOSESSION;
+            return Err(SessionError::NoSession);
         };
         entry.session_type = protocol;
         entry.connection_index = connection_index;
-        SESSION_E_NONE
+        Ok(())
     }
 
-    pub fn detach_transport(&mut self, session: SessionHandle) -> i32 {
+    pub fn detach_transport(&mut self, session: SessionHandle) -> Result<(), SessionError> {
         let Some(entry) = self
             .worker_mut(session.worker_index)
             .and_then(|worker| worker.session_mut(session.session_index))
         else {
-            return SESSION_E_NOSESSION;
+            return Err(SessionError::NoSession);
         };
         entry.connection_index = SESSION_INDEX_INVALID;
         entry.store_state(SessionState::TransportDeleted);
-        SESSION_E_NONE
+        Ok(())
     }
 
-    pub fn enqueue_event(&self, worker_index: u32, event: SessionEvent) -> i32 {
+    pub fn enqueue_event(
+        &self,
+        worker_index: u32,
+        event: SessionEvent,
+    ) -> Result<SessionEventEnqueue, SessionError> {
         let Some(queue) = self.event_queue(worker_index) else {
-            return SESSION_E_INVALID;
+            return Err(SessionError::Invalid);
         };
         let mut producer = match queue.producer(SvmQueueConditionalWait::Nowait) {
             Ok(producer) => producer,
-            Err(SvmMsgQError::LockBusy) => return SESSION_EVENT_QUEUE_LOCK_FAILED,
-            Err(_) => return SESSION_EVENT_QUEUE_LOCK_FAILED,
+            Err(SvmMsgQError::LockBusy) => return Ok(SessionEventEnqueue::Busy),
+            Err(source) => return Err(SessionError::MessageQueueAllocation { source }),
         };
         let descriptor = match producer.alloc_msg(size_of::<SessionEventRecord>()) {
             Ok(descriptor) => descriptor,
             Err(SvmMsgQError::QueueFull | SvmMsgQError::RingFull { .. }) => {
-                return SESSION_EVENT_QUEUE_FULL;
+                return Ok(SessionEventEnqueue::Full);
             }
-            Err(_) => return SESSION_E_MQ_MSG_ALLOC,
+            Err(source) => return Err(SessionError::MessageQueueAllocation { source }),
         };
         let record = SessionEventRecord::from(event);
-        if producer.write(descriptor, &record).is_err() {
-            drop(queue.free_msg(descriptor));
-            return SESSION_E_MQ_MSG_ALLOC;
+        if let Err(source) = producer.write(descriptor, &record) {
+            debug_assert!(queue.free_msg(descriptor).is_ok());
+            return Err(SessionError::MessageQueueAllocation { source });
         }
         match producer.add(descriptor) {
-            Ok(()) => SESSION_E_NONE,
+            Ok(()) => Ok(SessionEventEnqueue::Enqueued),
             Err(
                 SvmMsgQError::SignalAfterCommit { .. }
                 | SvmMsgQError::EventSignalAfterCommit { .. },
-            ) => SESSION_E_UNKNOWN,
+            ) => Err(SessionError::Unknown),
             Err(SvmMsgQError::QueueFull) => {
-                drop(queue.free_msg(descriptor));
-                SESSION_EVENT_QUEUE_FULL
+                debug_assert!(queue.free_msg(descriptor).is_ok());
+                Ok(SessionEventEnqueue::Full)
             }
-            Err(_) => {
-                drop(queue.free_msg(descriptor));
-                SESSION_E_MQ_MSG_ALLOC
+            Err(source) => {
+                debug_assert!(queue.free_msg(descriptor).is_ok());
+                Err(SessionError::MessageQueueAllocation { source })
             }
         }
     }
 
-    pub fn program_migration(&mut self, request: SessionMigrationRequest) -> i32 {
+    pub fn program_migration(&mut self, request: SessionMigrationRequest) -> Result<(), SessionError> {
         let Some(worker) = self.worker_mut(request.old.worker_index) else {
-            return SESSION_E_INVALID;
+            return Err(SessionError::Invalid);
         };
         worker.queue_migration(request)
     }
 
-    pub fn flush_enqueue_events(&mut self, protocol: u8, worker_index: u32) -> i32 {
+    pub fn flush_enqueue_events(
+        &mut self,
+        protocol: u8,
+        worker_index: u32,
+    ) -> Result<(), SessionError> {
         let Some(worker) = self.worker_mut(worker_index) else {
-            return SESSION_E_INVALID;
+            return Err(SessionError::Invalid);
         };
         let sessions = &worker.sessions;
         worker.pending_io_sessions.retain(|handle| {
@@ -852,6 +891,6 @@ impl<O: Default> SessionMain<O> {
                 .get(handle.session_index)
                 .is_some_and(|session| session.session_type != protocol)
         });
-        SESSION_E_NONE
+        Ok(())
     }
 }

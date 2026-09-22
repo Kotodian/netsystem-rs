@@ -1,7 +1,7 @@
 # ADR-0039: Session Queue Node 与 Transport 输出边界
 
 - 日期：2026-09-22
-- 状态：Proposed
+- 状态：Accepted，Issue #356
 - Issue：#356
 - 前置 ADR：ADR-0038
 - 范围：`session-queue`、`session-queue-process`、`session-queue-main`，以及它们与
@@ -540,6 +540,9 @@ inline 仅用于 VPP 已标为 inline/always-inline 且处于每 event/packet ho
 - worker init 中动态安装 transport callback 或强制启用 `session-queue` 的逻辑。
 
 保留并改造已有 `TcpOutputNode`、`UdpOutputNode`；不创建新的 transport graph node。
+
+本次迁移先给上述 callback/attachment 兼容 API 加 `deprecated` 标记，保持已有调用方可编译；
+它们不再作为新的 Session Queue 接线依据。后续协议迁移完成后删除兼容实现。
 
 ## 12. 待批准的新 API
 

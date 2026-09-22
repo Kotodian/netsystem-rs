@@ -1840,6 +1840,10 @@ plugin-session/service 的既有 concrete contract，不扩展 service 结构体
 - 对旧 Application runtime、`TransportVft` 与 Session Queue callback attachment 兼容路径的删除。
   queue node 的静态声明、enable 和 packet output 迁移由 ADR-0039 单独实施。
 
+本次实现先对旧 `TransportVft`、Session Queue callback/attachment 和旧 retval 常量加
+`deprecated` 标记；兼容入口只保留迁移所需的 ABI 过渡，不改变 ADR-0038 的 owner、trait 和
+typed error contract。删除兼容入口不属于本次提交。
+
 ## 16. VPP 源码依据
 
 - `session_worker_t` 字段、worker event/migration storage：

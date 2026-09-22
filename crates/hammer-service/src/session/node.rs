@@ -105,6 +105,9 @@ impl SessionQueueNext {
     }
 }
 
+/// Legacy transport callback used only while protocol workers migrate to the
+/// service-owned Session Queue contract.
+#[deprecated(note = "use Session Queue FIFO packetization; transport callbacks are not part of ADR-0039")]
 pub type SessionQueueDispatchFn = fn(
     &mut DataPlaneMain,
     &mut SessionWorker,
@@ -115,6 +118,9 @@ pub type SessionQueueDispatchFn = fn(
     &mut SessionQueueOutput,
 ) -> RuntimeResult<()>;
 
+/// Legacy transport callback used only while protocol workers migrate to the
+/// service-owned Session Queue contract.
+#[deprecated(note = "use the protocol worker's update_time path; Session Queue does not own transport callbacks")]
 pub type SessionQueueUpdateTimeFn = fn(
     &mut DataPlaneMain,
     &mut SessionWorker,
@@ -127,6 +133,7 @@ pub type SessionQueueUpdateTimeFn = fn(
 
 /// Accumulates Session Queue TX indexes on the driver Frame and records one
 /// local next per entry. Graph Fanout runs once at [`Self::flush`].
+#[deprecated(note = "compatibility accumulator; ADR-0039 Session Queue owns packet fanout directly")]
 pub struct SessionQueueOutput {
     nexts: Vec<u16>,
     io_count: usize,
@@ -201,6 +208,7 @@ impl SessionQueueOutput {
 /// Worker-local transport dispatch, matching VPP's per-worker update-time and
 /// transport output tables.
 #[derive(Clone, Copy)]
+#[deprecated(note = "Session Worker no longer owns protocol dispatch tables under ADR-0039")]
 pub(crate) struct SessionQueueTransportDispatch {
     output_next: SessionQueueNext,
     update_time: SessionQueueUpdateTimeFn,
@@ -325,6 +333,7 @@ impl SessionQueueNode {
     ///
     /// The graph edge is compiled by [`Self::compile_output_next`] on the main
     /// thread. This method owns only the worker's dispatch table.
+    #[deprecated(note = "transport attachment callbacks are a legacy compatibility path; migrate to service Session Queue packetization")]
     pub fn install_worker_attachment(
         runtime: &DataPlaneMain,
         runtime_data: NodeRuntime,
@@ -361,6 +370,7 @@ impl SessionQueueNode {
     }
 
     /// Removes one exact worker-local transport dispatch attachment.
+    #[deprecated(note = "transport attachment callbacks are a legacy compatibility path; migrate to service Session Queue packetization")]
     pub fn remove_worker_attachment(
         runtime: &DataPlaneMain,
         runtime_data: NodeRuntime,

@@ -32,12 +32,13 @@ pub use core::{
     SESSION_E_SEG_NO_SPACE, SESSION_E_TRANSPORT_NO_REG, SESSION_E_UNKNOWN,
     SESSION_EVENT_QUEUE_FULL, SESSION_EVENT_QUEUE_LOCK_FAILED, SESSION_INDEX_INVALID, Session,
     SessionConfig, SessionControlData, SessionDmaTransfer, SessionEvent, SessionEventElement,
+    SessionEventEnqueue,
     SessionFlags, SessionHandle, SessionMain, SessionMigrationRequest, SessionMigrationState,
-    SessionRuntimeEngine, SessionRxSegment, SessionState, SessionTxContext, SessionWorker,
+    SessionRxSegment, SessionState, SessionTxContext, SessionWorker,
     SessionWorkerFlags, SessionWorkerState,
 };
 pub use endpoint::SessionEndpoint;
-pub use error::{SessionConnectError, SessionQueueError};
+pub use error::{SessionConnectError, SessionError, SessionQueueError};
 pub use lookup::{SessionLookup, SessionLookupResult};
 pub use node::{AppSessionInputNode, SESSION_QUEUE_IO_BUDGET, SessionQueueNext, SessionQueueNode};
 pub use protocol::{SessionAppVft, register_session_app};
