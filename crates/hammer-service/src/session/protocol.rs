@@ -5,11 +5,11 @@ use hammer_runtime::{RuntimeError, RuntimeResult};
 
 use super::runtime::SessionWorker;
 
-/// Concrete static callback table matching VPP `session_cb_vft_t`.
+/// Application callback table matching VPP `session_cb_vft_t`.
 ///
 /// All 19 VPP callbacks are present. Unimplemented callbacks remain `None`.
 #[derive(Debug, Clone, Copy)]
-pub struct SessionAppVft {
+pub struct ApplicationCallbacks {
     pub name: &'static str,
     pub add_segment: Option<fn(&mut SessionWorker, u64, u64) -> RuntimeResult<()>>,
     pub del_segment: Option<fn(&mut SessionWorker, u64, u64) -> RuntimeResult<()>>,
@@ -32,7 +32,7 @@ pub struct SessionAppVft {
     pub crypto_async: Option<fn(&mut SessionWorker, u32, u64) -> RuntimeResult<()>>,
 }
 
-impl SessionAppVft {
+impl ApplicationCallbacks {
     pub const fn all_none(name: &'static str) -> Self {
         Self {
             name,
@@ -59,17 +59,22 @@ impl SessionAppVft {
     }
 }
 
-impl Default for SessionAppVft {
+impl Default for ApplicationCallbacks {
     fn default() -> Self {
         Self::all_none("")
     }
 }
 
-/// Registers one owner-defined Session App VFT on its owning Application.
-/// The callback table is already monomorphized in the plugin; Session workers
-/// resolve only the selected numeric slot and never store plugin state.
-pub fn register_session_app(application: u32, vft: SessionAppVft) -> RuntimeResult<u32> {
+#[deprecated(note = "use ApplicationCallbacks; the old VFT name is a compatibility alias")]
+pub type SessionAppVft = ApplicationCallbacks;
+
+/// Registers one owner-defined callback table on its Application.
+#[deprecated(note = "ADR-0040: supply ApplicationCallbacks during attach")]
+pub fn register_session_app(
+    application: u32,
+    callbacks: ApplicationCallbacks,
+) -> RuntimeResult<u32> {
     super::application_main()
-        .register_session_app(application, vft)
+        .register_session_app(application, callbacks)
         .map_err(RuntimeError::from)
 }

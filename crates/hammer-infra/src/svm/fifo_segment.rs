@@ -1,11 +1,10 @@
 //! VPP-style FIFO segment ownership and shared freelists.
 
 use std::alloc::Layout;
-use std::cell::Cell;
 use std::os::fd::{AsRawFd, OwnedFd};
 use std::ptr::NonNull;
 use std::sync::Arc;
-use std::sync::atomic::Ordering;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use crate::pool::Pool;
 use crate::svm::fifo::{
@@ -67,14 +66,18 @@ impl Default for SvmFifoSegmentConfig {
 }
 
 pub struct FifoSlicePrivate {
+    slice_index: u32,
+    segment_header: usize,
     pub fifos: Pool<Fifo>,
     pub active_fifos: Vec<u32>,
 }
 
 impl FifoSlicePrivate {
     #[inline]
-    fn new() -> Self {
+    fn new(slice_index: u32, segment_header: *mut FifoSegmentHeader) -> Self {
         Self {
+            slice_index,
+            segment_header: segment_header as usize,
             fifos: Pool::new(),
             active_fifos: Vec::new(),
         }
@@ -89,7 +92,7 @@ impl FifoSlicePrivate {
 pub struct SvmFifoSegment {
     pub ssvm: Arc<SsvmPrivate>,
     pub h: *mut FifoSegmentHeader,
-    pub slices: Vec<FifoSlicePrivate>,
+    slices: Vec<FifoSlicePrivate>,
     pub mqs: Vec<SvmMsgQ>,
     mq_offsets: Vec<u64>,
     pub max_byte_index: u64,
@@ -99,10 +102,15 @@ pub struct SvmFifoSegment {
     pub flags: FifoSegmentFlags,
     pub high_watermark: u8,
     pub low_watermark: u8,
-    memory_limit: Cell<bool>,
+    memory_limit: AtomicBool,
 }
 
 unsafe impl Send for SvmFifoSegment {}
+// SAFETY: all shared-borrow mutation is confined to atomic shared metadata.
+// Process-local FIFO pools are accessible only through &mut self or unique
+// FifoSlicePrivate values moved out before sharing the segment. MQs provide
+// their own synchronization; segment topology changes require &mut self.
+unsafe impl Sync for SvmFifoSegment {}
 
 #[derive(Debug, thiserror::Error)]
 pub enum FifoSegmentError {
@@ -213,7 +221,8 @@ impl SvmFifoSegment {
                     byte_index: std::sync::atomic::AtomicU64::new(header_bytes as u64),
                     max_byte_index,
                     start_byte_index: header_bytes as u64,
-                    _slice_pad: [0; 40],
+                    slices_offset: FifoSegmentHeader::slices_offset() as u64,
+                    _slice_pad: [0; 32],
                 },
             );
             for slice in (*header).slices_mut() {
@@ -234,7 +243,7 @@ impl SvmFifoSegment {
             flags: FifoSegmentFlags::empty(),
             high_watermark: config.high_watermark,
             low_watermark: config.low_watermark,
-            memory_limit: Cell::new(false),
+            memory_limit: AtomicBool::new(false),
         };
         segment.initialize_slices(config.slices as usize);
         segment.ssvm.publish_ready();
@@ -254,7 +263,10 @@ impl SvmFifoSegment {
         let header_end = header_offset
             .checked_add(std::mem::size_of::<FifoSegmentHeader>() as u64)
             .ok_or(FifoSegmentError::HeaderOutOfBounds)?;
-        if header_end > ssvm.ssvm_size() as u64 || header_end > FS_CHUNK_OFFSET_MASK {
+        if !header_offset.is_multiple_of(std::mem::align_of::<FifoSegmentHeader>() as u64)
+            || header_end > ssvm.ssvm_size() as u64
+            || header_end > FS_CHUNK_OFFSET_MASK
+        {
             return Err(FifoSegmentError::HeaderOutOfBounds);
         }
         let header: *mut FifoSegmentHeader =
@@ -265,15 +277,21 @@ impl SvmFifoSegment {
                 count: shared_slices,
             });
         }
-        let layout = FifoSegmentHeader::layout_bytes(shared_slices as usize) as u64;
-        if header_offset
-            .checked_add(layout)
-            .is_none_or(|end| end > ssvm.ssvm_size() as u64 || end > FS_CHUNK_OFFSET_MASK)
-        {
-            return Err(FifoSegmentError::HeaderOutOfBounds);
-        }
         let max_byte_index = unsafe { (*header).max_byte_index };
-        if max_byte_index > FS_CHUNK_OFFSET_MASK {
+        let slices_offset = unsafe { (*header).slices_offset };
+        let slices_bytes = shared_slices as u64 * std::mem::size_of::<FifoSegmentSlice>() as u64;
+        let start_byte_index = unsafe { (*header).start_byte_index };
+        if slices_offset < std::mem::size_of::<FifoSegmentHeader>() as u64
+            || !slices_offset.is_multiple_of(std::mem::align_of::<FifoSegmentSlice>() as u64)
+            || slices_offset
+                .checked_add(slices_bytes)
+                .is_none_or(|end| end > start_byte_index)
+            || start_byte_index > max_byte_index
+            || header_offset
+                .checked_add(max_byte_index)
+                .is_none_or(|end| end > ssvm.ssvm_size() as u64)
+            || max_byte_index > FS_CHUNK_OFFSET_MASK
+        {
             return Err(FifoSegmentError::HeaderOutOfBounds);
         }
         let mut segment = Self {
@@ -289,7 +307,7 @@ impl SvmFifoSegment {
             flags: FifoSegmentFlags::empty(),
             high_watermark: 0,
             low_watermark: 0,
-            memory_limit: Cell::new(false),
+            memory_limit: AtomicBool::new(false),
         };
         segment.initialize_slices(shared_slices as usize);
         Ok(segment)
@@ -297,9 +315,28 @@ impl SvmFifoSegment {
 
     fn initialize_slices(&mut self, count: usize) {
         self.slices.reserve(count);
-        for _ in 0..count {
-            self.slices.push(FifoSlicePrivate::new());
+        for index in 0..count {
+            self.slices
+                .push(FifoSlicePrivate::new(index as u32, self.h));
         }
+    }
+
+    /// Moves the unique process-local FIFO pools out before sharing the segment
+    /// with workers. Each worker borrows only its own entry from the returned
+    /// vector's native Rust slice.
+    pub fn take_private_slices(&mut self) -> Vec<FifoSlicePrivate> {
+        std::mem::take(&mut self.slices)
+    }
+
+    #[inline(always)]
+    fn private_slice_index(&self, private: &FifoSlicePrivate) -> Result<u32, FifoSegmentError> {
+        if private.segment_header != self.h as usize || private.slice_index >= self.n_slices as u32
+        {
+            return Err(FifoSegmentError::InvalidSlice {
+                slice: private.slice_index,
+            });
+        }
+        Ok(private.slice_index)
     }
 
     #[inline(always)]
@@ -346,7 +383,7 @@ impl SvmFifoSegment {
         unsafe { self.h.cast::<u8>().add(offset as usize).cast() }
     }
 
-    fn allocate_block(&mut self, bytes: usize, align: usize) -> Result<u64, FifoSegmentError> {
+    fn allocate_block(&self, bytes: usize, align: usize) -> Result<u64, FifoSegmentError> {
         if align == 0 || !align.is_power_of_two() {
             return Err(FifoSegmentError::HeaderOutOfBounds);
         }
@@ -361,7 +398,7 @@ impl SvmFifoSegment {
                 .checked_add(bytes as u64)
                 .ok_or(FifoSegmentError::HeaderOutOfBounds)?;
             if end >= self.max_byte_index || end > FS_CHUNK_OFFSET_MASK {
-                self.memory_limit.set(true);
+                self.memory_limit.store(true, Ordering::Relaxed);
                 return Err(FifoError::SegmentExhausted.into());
             }
             match header.byte_index.compare_exchange_weak(
@@ -512,7 +549,7 @@ impl SvmFifoSegment {
     }
 
     fn allocate_chunk(
-        &mut self,
+        &self,
         slice: u32,
         size: usize,
         start_byte: u32,
@@ -546,7 +583,7 @@ impl SvmFifoSegment {
         Ok(offset)
     }
 
-    fn allocate_fifo_header(&mut self, slice: u32) -> Result<u64, FifoSegmentError> {
+    fn allocate_fifo_header(&self, slice: u32) -> Result<u64, FifoSegmentError> {
         if let Some(offset) = self.pop_fifo_header(slice)? {
             return Ok(offset);
         }
@@ -556,17 +593,17 @@ impl SvmFifoSegment {
         )
     }
 
-    pub fn allocate_fifo(
-        &mut self,
+    fn allocate_fifo_value(
+        &self,
         slice: u32,
         capacity: usize,
         ftype: FifoSegmentFtype,
-    ) -> Result<u32, FifoSegmentError> {
+    ) -> Result<Fifo, FifoSegmentError> {
         self.validate_fifo_capacity(capacity)?;
         if matches!(ftype, FifoSegmentFtype::None) {
             return Err(FifoSegmentError::InvalidFifo { fifo: u32::MAX });
         }
-        self.slice(slice)?;
+        self.shared_slice(slice)?;
         let header_offset = self.allocate_fifo_header(slice)?;
         let min_alloc = (capacity * self.header().pct_first_alloc as usize / 100)
             .max(FIFO_SEGMENT_MIN_FIFO_SIZE);
@@ -591,7 +628,7 @@ impl SvmFifoSegment {
                     .store(next, Ordering::Release)
             };
         }
-        let mut fifo = unsafe {
+        let fifo = unsafe {
             Fifo::init_at_svm_shared(
                 Arc::clone(&self.ssvm),
                 header_offset,
@@ -599,16 +636,58 @@ impl SvmFifoSegment {
                 chunks[0],
                 *chunks.last().expect("FIFO allocation has a chunk"),
             )
-        }?;
+        };
+        let mut fifo = match fifo {
+            Ok(fifo) => fifo,
+            Err(error) => {
+                self.release_chunks(slice, &chunks)?;
+                self.push_fifo_header(slice, header_offset)?;
+                return Err(error.into());
+            }
+        };
         fifo.set_slice_index(slice);
+        Ok(fifo)
+    }
+
+    fn record_fifo_allocation(&self, slice: u32, capacity: usize) {
+        self.header().n_active_fifos.fetch_add(1, Ordering::Relaxed);
+        self.shared_slice(slice)
+            .expect("allocated FIFO slice exists")
+            .virtual_mem
+            .fetch_add(capacity as u64, Ordering::Relaxed);
+    }
+
+    pub fn allocate_fifo(
+        &mut self,
+        slice: u32,
+        capacity: usize,
+        ftype: FifoSegmentFtype,
+    ) -> Result<u32, FifoSegmentError> {
+        self.slice(slice)?;
+        let fifo = self.allocate_fifo_value(slice, capacity, ftype)?;
         let fifo_index = self.slice_mut(slice)?.fifos.insert(fifo);
         if matches!(ftype, FifoSegmentFtype::RxFifo) {
             self.slice_mut(slice)?.active_fifos.push(fifo_index);
         }
-        self.header().n_active_fifos.fetch_add(1, Ordering::Relaxed);
-        self.shared_slice(slice)?
-            .virtual_mem
-            .fetch_add(capacity as u64, Ordering::Relaxed);
+        self.record_fifo_allocation(slice, capacity);
+        Ok(fifo_index)
+    }
+
+    /// Allocates the shared FIFO while the caller exclusively owns the matching
+    /// process-local slice and its `Pool<Fifo>`.
+    pub fn allocate_fifo_in(
+        &self,
+        private: &mut FifoSlicePrivate,
+        capacity: usize,
+        ftype: FifoSegmentFtype,
+    ) -> Result<u32, FifoSegmentError> {
+        let slice = self.private_slice_index(private)?;
+        let fifo = self.allocate_fifo_value(slice, capacity, ftype)?;
+        let fifo_index = private.fifos.insert(fifo);
+        if matches!(ftype, FifoSegmentFtype::RxFifo) {
+            private.active_fifos.push(fifo_index);
+        }
+        self.record_fifo_allocation(slice, capacity);
         Ok(fifo_index)
     }
 
@@ -625,6 +704,20 @@ impl SvmFifoSegment {
         let fifo = unsafe { Fifo::attach_at_svm_shared(Arc::clone(&self.ssvm), offset) }?;
         let fifo_index = self.slice_mut(slice)?.fifos.insert(fifo);
         Ok(fifo_index)
+    }
+
+    pub fn attach_fifo_in(
+        &self,
+        private: &mut FifoSlicePrivate,
+        header_offset: usize,
+    ) -> Result<u32, FifoSegmentError> {
+        self.private_slice_index(private)?;
+        let offset = header_offset as u64;
+        if !fs_offset_is_valid(offset, self.max_byte_index) {
+            return Err(FifoSegmentError::InvalidOffset { offset });
+        }
+        let fifo = unsafe { Fifo::attach_at_svm_shared(Arc::clone(&self.ssvm), offset) }?;
+        Ok(private.fifos.insert(fifo))
     }
 
     pub fn duplicate_fifo(&mut self, slice: u32, fifo: u32) -> Result<u32, FifoSegmentError> {
@@ -680,13 +773,8 @@ impl SvmFifoSegment {
         Ok(new_index)
     }
 
-    pub fn free_server_fifo(&mut self, slice: u32, fifo: u32) -> Result<(), FifoSegmentError> {
-        self.slice(slice)?;
-        let fifo_shared = self
-            .fifo(slice, fifo)
-            .ok_or(FifoSegmentError::InvalidFifo { fifo })?
-            .shr;
-        let mut chunk_offset = unsafe { (*fifo_shared).start_chunk.load(Ordering::Acquire) };
+    fn validate_fifo_chunks(&self, fifo: &Fifo) -> Result<(), FifoSegmentError> {
+        let mut chunk_offset = unsafe { (*fifo.shr).start_chunk.load(Ordering::Acquire) };
         while chunk_offset != 0 {
             if !fs_offset_is_valid(chunk_offset, self.max_byte_index) {
                 return Err(FifoSegmentError::InvalidOffset {
@@ -697,14 +785,12 @@ impl SvmFifoSegment {
                 (*self.chunk_ptr(chunk_offset)).next.load(Ordering::Acquire)
             });
         }
-        let fifo_value = self
-            .slice_mut(slice)?
-            .fifos
-            .remove(fifo)
-            .ok_or(FifoSegmentError::InvalidFifo { fifo })?;
-        let capacity = fifo_value.size();
-        self.remove_active(slice, fifo);
-        chunk_offset = unsafe { (*fifo_value.shr).start_chunk.load(Ordering::Acquire) };
+        Ok(())
+    }
+
+    fn release_fifo_value(&self, slice: u32, fifo: Fifo) {
+        let capacity = fifo.size();
+        let mut chunk_offset = unsafe { (*fifo.shr).start_chunk.load(Ordering::Acquire) };
         while chunk_offset != 0 {
             let next = unsafe { (*self.chunk_ptr(chunk_offset)).next.load(Ordering::Acquire) };
             let class = fs_chunk_class(unsafe {
@@ -712,26 +798,79 @@ impl SvmFifoSegment {
                     .length
                     .load(Ordering::Relaxed) as usize
             });
-            self.push_chunk(slice, class, chunk_offset)?;
+            self.push_chunk(slice, class, chunk_offset)
+                .expect("validated FIFO chunk returns to its slice");
             chunk_offset = fs_head_offset(next);
         }
         unsafe {
-            (*fifo_value.shr).start_chunk.store(0, Ordering::Relaxed);
-            (*fifo_value.shr).end_chunk.store(0, Ordering::Relaxed);
-            (*fifo_value.shr).head_chunk.store(0, Ordering::Relaxed);
-            (*fifo_value.shr).tail_chunk.store(0, Ordering::Relaxed);
+            (*fifo.shr).start_chunk.store(0, Ordering::Relaxed);
+            (*fifo.shr).end_chunk.store(0, Ordering::Relaxed);
+            (*fifo.shr).head_chunk.store(0, Ordering::Relaxed);
+            (*fifo.shr).tail_chunk.store(0, Ordering::Relaxed);
         }
-        self.push_fifo_header(slice, fifo_value.hdr_offset())?;
+        self.push_fifo_header(slice, fifo.hdr_offset())
+            .expect("validated FIFO header returns to its slice");
         self.header().n_active_fifos.fetch_sub(1, Ordering::Relaxed);
-        self.shared_slice(slice)?
+        self.shared_slice(slice)
+            .expect("validated FIFO slice exists")
             .virtual_mem
             .fetch_sub(capacity as u64, Ordering::Relaxed);
+    }
+
+    pub fn free_server_fifo(&mut self, slice: u32, fifo: u32) -> Result<(), FifoSegmentError> {
+        self.slice(slice)?;
+        let fifo_value = self
+            .fifo(slice, fifo)
+            .ok_or(FifoSegmentError::InvalidFifo { fifo })?;
+        self.validate_fifo_chunks(fifo_value)?;
+        let fifo_value = self
+            .slice_mut(slice)?
+            .fifos
+            .remove(fifo)
+            .ok_or(FifoSegmentError::InvalidFifo { fifo })?;
+        self.remove_active(slice, fifo);
+        self.release_fifo_value(slice, fifo_value);
+        Ok(())
+    }
+
+    pub fn free_server_fifo_in(
+        &self,
+        private: &mut FifoSlicePrivate,
+        fifo: u32,
+    ) -> Result<(), FifoSegmentError> {
+        let slice = self.private_slice_index(private)?;
+        let fifo_value = private
+            .fifos
+            .get(fifo)
+            .ok_or(FifoSegmentError::InvalidFifo { fifo })?;
+        self.validate_fifo_chunks(fifo_value)?;
+        let fifo_value = private
+            .fifos
+            .remove(fifo)
+            .expect("validated FIFO remains in its private pool");
+        if let Some(position) = private.active_fifos.iter().position(|&index| index == fifo) {
+            private.active_fifos.swap_remove(position);
+        }
+        self.release_fifo_value(slice, fifo_value);
         Ok(())
     }
 
     pub fn free_client_fifo(&mut self, slice: u32, fifo: u32) -> Result<(), FifoSegmentError> {
         self.slice(slice)?;
         self.slice_mut(slice)?
+            .fifos
+            .remove(fifo)
+            .ok_or(FifoSegmentError::InvalidFifo { fifo })?;
+        Ok(())
+    }
+
+    pub fn free_client_fifo_in(
+        &self,
+        private: &mut FifoSlicePrivate,
+        fifo: u32,
+    ) -> Result<(), FifoSegmentError> {
+        self.private_slice_index(private)?;
+        private
             .fifos
             .remove(fifo)
             .ok_or(FifoSegmentError::InvalidFifo { fifo })?;
@@ -759,7 +898,7 @@ impl SvmFifoSegment {
         }
     }
 
-    pub fn fifo(&self, slice: u32, fifo: u32) -> Option<&Fifo> {
+    pub fn fifo(&mut self, slice: u32, fifo: u32) -> Option<&Fifo> {
         self.slices.get(slice as usize)?.fifos.get(fifo)
     }
 
@@ -768,7 +907,7 @@ impl SvmFifoSegment {
     }
 
     #[inline(always)]
-    pub fn fifo_offset(&self, slice: u32, fifo: u32) -> Result<usize, FifoSegmentError> {
+    pub fn fifo_offset(&mut self, slice: u32, fifo: u32) -> Result<usize, FifoSegmentError> {
         let fifo = self
             .fifo(slice, fifo)
             .ok_or(FifoSegmentError::InvalidFifo { fifo })?;
@@ -1078,7 +1217,7 @@ impl SvmFifoSegment {
         self.header().n_active_fifos.load(Ordering::Relaxed)
     }
 
-    pub fn free_fifo_count(&self) -> u32 {
+    pub fn free_fifo_count(&mut self) -> u32 {
         let mut count = 0;
         for slice in unsafe { self.header().slices() } {
             let mut offset = slice.free_fifos.load(Ordering::Acquire);
@@ -1139,11 +1278,11 @@ impl SvmFifoSegment {
             return FifoSegmentMemoryStatus::NoPressure;
         }
         let usage = self.usage_percent();
-        if self.memory_limit.get() {
+        if self.memory_limit.load(Ordering::Relaxed) {
             if usage >= self.high_watermark {
                 return FifoSegmentMemoryStatus::NoMemory;
             }
-            self.memory_limit.set(false);
+            self.memory_limit.store(false, Ordering::Relaxed);
         }
         if usage >= self.high_watermark {
             FifoSegmentMemoryStatus::HighPressure
@@ -1154,7 +1293,7 @@ impl SvmFifoSegment {
         }
     }
 
-    pub fn active_fifos(&self, slice: u32) -> Result<&[u32], FifoSegmentError> {
+    pub fn active_fifos(&mut self, slice: u32) -> Result<&[u32], FifoSegmentError> {
         Ok(&self.slice(slice)?.active_fifos)
     }
 

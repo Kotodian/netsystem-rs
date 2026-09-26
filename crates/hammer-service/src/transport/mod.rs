@@ -134,6 +134,7 @@ impl Default for Pacer {
 }
 
 #[derive(Clone, Copy, Debug)]
+#[repr(C)]
 pub struct TransportConnection<E, O = u32> {
     pub session: crate::session::SessionHandle,
     pub connection_index: u32,
@@ -142,6 +143,7 @@ pub struct TransportConnection<E, O = u32> {
     pub endpoint: E,
     pub pacer: Pacer,
     pub opaque: O,
+    pub cacheline_end: hammer_infra::align::CacheLineAlignMark,
 }
 
 impl<E, O> TransportConnection<E, O> {
@@ -213,11 +215,7 @@ pub trait Transport<T> {
         session: crate::session::SessionHandle,
         params: &mut TransportSendParams,
     ) -> usize;
-    fn app_rx_event(
-        &self,
-        connection_index: u32,
-        worker_index: u32,
-    ) -> Result<(), SessionError>;
+    fn app_rx_event(&self, connection_index: u32, worker_index: u32) -> Result<(), SessionError>;
     fn connection(&self, connection_index: u32, worker_index: u32) -> Option<&Self::Connection>;
     fn listener(&self, connection_index: u32) -> Option<&Self::Connection>;
     fn half_open(&self, connection_index: u32) -> Option<&Self::Connection>;
@@ -261,10 +259,7 @@ pub trait TransportMain: Sized {
     fn mark_used(&self, endpoint: &Self::Endpoint) -> Result<(), SessionError>;
     fn share(&self, endpoint: &Self::Endpoint);
     fn release(&self, endpoint: &Self::Endpoint) -> Result<(), SessionError>;
-    fn allocate_local(
-        &self,
-        endpoint: Self::Endpoint,
-    ) -> Result<Self::Endpoint, SessionError>;
+    fn allocate_local(&self, endpoint: Self::Endpoint) -> Result<Self::Endpoint, SessionError>;
 }
 
 /// A concrete transport operation table published in one numeric protocol
