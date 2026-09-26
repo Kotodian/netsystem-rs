@@ -14,13 +14,14 @@
 use std::ffi::CString;
 use std::io;
 use std::mem::size_of;
-use std::os::fd::RawFd;
+use std::num::NonZeroUsize;
+use std::os::fd::{BorrowedFd, IntoRawFd, RawFd};
 use std::ptr::NonNull;
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::thread::sleep;
 use std::time::{Duration, Instant};
 
-use crate::mem::MemHeap;
+use crate::mem::{MemError, MemHeap, MemMain, PageSize};
 
 const SSVM_MAGIC: u64 = 0x4841_4d4d_4552_5353;
 const SSVM_VERSION: u32 = 1;
@@ -72,7 +73,7 @@ pub struct SsvmConfig {
     /// mappings round this value for the heap and add one header page to the
     /// actual mapping.
     pub size: usize,
-    /// Address hint, and the address an attacher must use when non-zero.
+    /// Requested server address; zero lets the memory main choose one.
     pub requested_va: u64,
     pub huge_page: bool,
     /// How long an attacher waits for the segment and for `ready`.
@@ -104,11 +105,22 @@ pub enum SsvmError {
     MissingBackingDescriptor,
     #[error("shared segment backend {value} is invalid")]
     InvalidBackend { value: u8 },
-    #[error("segment system call failed during {operation}: {source}")]
-    Io {
+    #[error("failed to create segment during {operation}: {source}")]
+    CreateFailure {
         operation: &'static str,
         #[source]
         source: io::Error,
+    },
+    #[error("failed to set segment size: {source}")]
+    SetSize {
+        #[source]
+        source: io::Error,
+    },
+    #[error("failed to map segment during {operation}: {source}")]
+    Mmap {
+        operation: &'static str,
+        #[source]
+        source: MemError,
     },
     #[error("client did not map segment {name} within {seconds} s")]
     ClientTimeout { name: String, seconds: u64 },
@@ -167,6 +179,9 @@ impl SsvmPrivate {
 
     /// Creates a FIFO segment with the owner-private map-only layout.
     pub fn server_init_fifo_segment(config: &SsvmConfig) -> Result<Self, SsvmError> {
+        if config.size == 0 {
+            return Err(SsvmError::NoSize);
+        }
         match config.backend {
             SsvmSegmentBackend::Shm => {
                 let name = validated_name(&config.name)?;
@@ -178,7 +193,7 @@ impl SsvmPrivate {
             }
             SsvmSegmentBackend::Memfd => {
                 let name = validated_name(&config.name)?;
-                let descriptor = create_memfd(&name)?;
+                let descriptor = create_memfd(&name, config.huge_page)?;
                 match Self::create_shared(
                     SsvmSegmentBackend::Memfd,
                     config,
@@ -207,12 +222,26 @@ impl SsvmPrivate {
             return Err(SsvmError::NoSize);
         }
         let name = validated_name(&config.name)?;
-        let page = page_size()?;
+        let page = MemMain::system_page_size();
         let mut rnd_size = rounded_size_for(config.size, page)?;
         let mapping_size = rnd_size.checked_add(page).ok_or(SsvmError::SizeTooSmall {
             requested: config.size,
         })?;
-        let base = map_private(mapping_size)?;
+        let base = MemMain::vm_map(
+            None,
+            mapping_size,
+            PageSize::Default,
+            None,
+            0,
+            0,
+            false,
+            name.to_str().expect("validated segment name"),
+        )
+        .map_err(|source| SsvmError::CreateFailure {
+            operation: "private mapping",
+            source: io::Error::other(source),
+        })?
+        .as_ptr();
         let mut segment = Self {
             base,
             ssvm_size: if map_only { mapping_size } else { rnd_size },
@@ -245,6 +274,9 @@ impl SsvmPrivate {
 
     /// Creates a POSIX shared-memory segment named by `config.name`.
     pub fn server_init_shm(config: &SsvmConfig) -> Result<Self, SsvmError> {
+        if config.size == 0 {
+            return Err(SsvmError::NoSize);
+        }
         let name = validated_name(&config.name)?;
         let descriptor = create_shm(&name)?;
         let result = Self::create_shared(SsvmSegmentBackend::Shm, config, &name, descriptor, false);
@@ -254,8 +286,11 @@ impl SsvmPrivate {
 
     /// Creates a memfd-backed segment named by `config.name`.
     pub fn server_init_memfd(config: &SsvmConfig) -> Result<Self, SsvmError> {
+        if config.size == 0 {
+            return Err(SsvmError::NoSize);
+        }
         let name = validated_name(&config.name)?;
-        let descriptor = create_memfd(&name)?;
+        let descriptor = create_memfd(&name, config.huge_page)?;
         match Self::create_shared(SsvmSegmentBackend::Memfd, config, &name, descriptor, false) {
             Ok(segment) => Ok(segment),
             Err(error) => {
@@ -377,7 +412,7 @@ impl SsvmPrivate {
 
     #[inline(always)]
     pub(crate) fn page_size(&self) -> Result<usize, SsvmError> {
-        page_size()
+        Ok(MemMain::system_page_size())
     }
 
     /// Descriptor owned by this mapping, when the backend keeps one open.
@@ -420,7 +455,7 @@ impl SsvmPrivate {
         self.numa
     }
 
-    /// Huge page request; unused, kept to match `ssvm_private_t`.
+    /// Whether the server requested huge-page memfd backing.
     pub fn huge_page(&self) -> bool {
         self.huge_page
     }
@@ -520,16 +555,64 @@ impl SsvmPrivate {
         if config.size == 0 {
             return Err(SsvmError::NoSize);
         }
-        let mapped_size = mapped_size_for(config.size)?;
-        if unsafe { libc::ftruncate(descriptor, mapped_size as libc::off_t) } != 0 {
-            return Err(io_error("ftruncate"));
+        let backing_page_size = if backend == SsvmSegmentBackend::Memfd && config.huge_page {
+            MemMain::default_hugepage_size().expect("huge-page backing was created")
+        } else {
+            MemMain::system_page_size()
+        };
+        let mapped_size = mapped_size_for(config.size, backing_page_size)?;
+        let backing_length = libc::off_t::try_from(mapped_size).map_err(|_| match backend {
+            SsvmSegmentBackend::Shm => SsvmError::SetSize {
+                source: io::Error::new(io::ErrorKind::InvalidInput, "segment size exceeds off_t"),
+            },
+            SsvmSegmentBackend::Memfd => SsvmError::CreateFailure {
+                operation: "memfd size",
+                source: io::Error::new(io::ErrorKind::InvalidInput, "segment size exceeds off_t"),
+            },
+            SsvmSegmentBackend::Private => unreachable!("private SSVM has its own mapping path"),
+        })?;
+        if unsafe { libc::ftruncate(descriptor, backing_length) } != 0 {
+            let source = io::Error::last_os_error();
+            return Err(match backend {
+                SsvmSegmentBackend::Shm => SsvmError::SetSize { source },
+                SsvmSegmentBackend::Memfd => SsvmError::CreateFailure {
+                    operation: "memfd size",
+                    source,
+                },
+                SsvmSegmentBackend::Private => {
+                    unreachable!("private SSVM has its own mapping path")
+                }
+            });
         }
-        let base = map_raw(
-            config.requested_va as *mut libc::c_void,
+        let requested_va = match backend {
+            SsvmSegmentBackend::Shm => {
+                randomized_shm_va(config.requested_va, MemMain::system_page_size())
+            }
+            SsvmSegmentBackend::Memfd => config.requested_va,
+            SsvmSegmentBackend::Private => unreachable!("private SSVM has its own mapping path"),
+        };
+        let base = MemMain::vm_map(
+            NonZeroUsize::new(requested_va as usize),
             mapped_size,
-            libc::MAP_SHARED,
-            descriptor,
-        )?;
+            PageSize::Default,
+            Some(unsafe { BorrowedFd::borrow_raw(descriptor) }),
+            0,
+            0,
+            false,
+            name.to_str().expect("validated segment name"),
+        )
+        .map_err(|source| match backend {
+            SsvmSegmentBackend::Shm => SsvmError::Mmap {
+                operation: "server mapping",
+                source,
+            },
+            SsvmSegmentBackend::Memfd => SsvmError::CreateFailure {
+                operation: "memfd mapping",
+                source: io::Error::other(source),
+            },
+            SsvmSegmentBackend::Private => unreachable!("private SSVM has its own mapping path"),
+        })?
+        .as_ptr();
         let recorded_va = if map_only { 0 } else { base as u64 };
         let mut segment = Self {
             base,
@@ -542,17 +625,20 @@ impl SsvmPrivate {
             name: name.clone(),
             numa: 0,
             huge_page: config.huge_page,
-            backing: backend_parameter(backend, descriptor, config.attach_timeout),
+            backing: backend_parameter(backend, -1, config.attach_timeout),
         };
         segment.initialize_header(recorded_va);
         if !map_only {
-            let page = page_size()?;
+            let page = MemMain::system_page_size();
             let heap_size = mapped_size
                 .checked_sub(page)
                 .ok_or(SsvmError::SizeTooSmall {
                     requested: config.size,
                 })?;
             segment.initialize_heap(heap_size)?;
+        }
+        if backend == SsvmSegmentBackend::Memfd {
+            segment.backing = SsvmBackendParameter { fd: descriptor };
         }
         Ok(segment)
     }
@@ -566,11 +652,26 @@ impl SsvmPrivate {
         shm_timeout: Duration,
         wait_for_ready: bool,
     ) -> Result<Self, SsvmError> {
-        let page = page_size()?;
-        let probe = map_raw(std::ptr::null_mut(), page, libc::MAP_SHARED, descriptor)?;
-        let header = unsafe { &*shared_header_at(probe) };
+        let page = MemMain::system_page_size();
+        let probe = MemMain::vm_map(
+            None,
+            page,
+            PageSize::Default,
+            Some(unsafe { BorrowedFd::borrow_raw(descriptor) }),
+            0,
+            0,
+            false,
+            "ssvm header probe",
+        )
+        .map_err(|source| SsvmError::Mmap {
+            operation: "header probe",
+            source,
+        })?;
+        let header = unsafe { &*shared_header_at(probe.as_ptr()) };
         if let Err(error) = validate_header(header) {
-            unsafe { libc::munmap(probe.cast(), page) };
+            if unsafe { MemMain::vm_unmap(probe) }.is_err() {
+                std::process::abort();
+            }
             return Err(error);
         }
         if wait_for_ready {
@@ -584,7 +685,9 @@ impl SsvmPrivate {
                         ),
                         Err(error) => error,
                     };
-                    unsafe { libc::munmap(probe.cast(), page) };
+                    if unsafe { MemMain::vm_unmap(probe) }.is_err() {
+                        std::process::abort();
+                    }
                     return Err(error);
                 }
                 sleep(SSVM_POLL_INTERVAL);
@@ -593,19 +696,26 @@ impl SsvmPrivate {
         let name = match name_from_header(header) {
             Ok(name) => name,
             Err(error) => {
-                unsafe { libc::munmap(probe.cast(), page) };
+                if unsafe { MemMain::vm_unmap(probe) }.is_err() {
+                    std::process::abort();
+                }
                 return Err(error);
             }
         };
         let backend = match backend_from_byte(header.segment_type) {
             Ok(backend) => backend,
             Err(error) => {
-                unsafe { libc::munmap(probe.cast(), page) };
+                if unsafe { MemMain::vm_unmap(probe) }.is_err() {
+                    std::process::abort();
+                }
                 return Err(error);
             }
         };
         let probed = (header.ssvm_size, header.ssvm_va, backend, name, header.heap);
-        unsafe { libc::munmap(probe.cast(), page) };
+        unsafe { MemMain::vm_unmap(probe) }.map_err(|source| SsvmError::Mmap {
+            operation: "header probe release",
+            source,
+        })?;
         let (declared_size, declared_va, backend, name, heap) = probed;
         if backend == SsvmSegmentBackend::Private {
             return Err(SsvmError::BackendUnavailable);
@@ -617,17 +727,34 @@ impl SsvmPrivate {
             });
         }
         let mapped_size = declared_size as usize;
-        let flags = if declared_va == 0 {
-            libc::MAP_SHARED
-        } else {
-            libc::MAP_SHARED | libc::MAP_FIXED
-        };
-        let base = map_raw(
-            declared_va as *mut libc::c_void,
+        let base = MemMain::vm_map(
+            NonZeroUsize::new(declared_va as usize),
             mapped_size,
-            flags,
-            descriptor,
-        )?;
+            PageSize::Default,
+            Some(unsafe { BorrowedFd::borrow_raw(descriptor) }),
+            0,
+            0,
+            false,
+            name.to_str().expect("validated segment name"),
+        )
+        .map_err(|source| SsvmError::Mmap {
+            operation: "client mapping",
+            source,
+        })?
+        .as_ptr();
+        if !heap.is_null() {
+            let heap_address = heap as usize;
+            let mapping_end = base
+                .addr()
+                .checked_add(mapped_size)
+                .expect("memory main mapped a non-overflowing address range");
+            if heap_address < base.addr() || heap_address >= mapping_end {
+                if unsafe { MemMain::vm_unmap(NonNull::new(base).expect("mapped base")) }.is_err() {
+                    std::process::abort();
+                }
+                return Err(SsvmError::InvalidMagic);
+            }
+        }
         let segment = Self {
             base,
             ssvm_size: mapped_size,
@@ -644,18 +771,6 @@ impl SsvmPrivate {
         let header = unsafe { &mut *shared_header_at(segment.base) };
         debug_assert_eq!(header.ssvm_size, mapped_size as u64);
         header.client_pid = std::process::id();
-        if !heap.is_null() {
-            let heap_address = heap as usize;
-            let mapping_end = segment.base.addr().checked_add(segment.ssvm_size).ok_or(
-                SsvmError::SizeMismatch {
-                    declared: declared_size,
-                    mapped: mapped_size,
-                },
-            )?;
-            if heap_address < segment.base.addr() || heap_address >= mapping_end {
-                return Err(SsvmError::InvalidMagic);
-            }
-        }
         Ok(segment)
     }
 
@@ -678,7 +793,7 @@ impl SsvmPrivate {
     }
 
     fn initialize_heap(&mut self, heap_size: usize) -> Result<(), SsvmError> {
-        let page = page_size()?;
+        let page = MemMain::system_page_size();
         let heap_base =
             NonNull::new(unsafe { self.base.add(page) }).expect("heap base is non-null");
         if heap_size == 0
@@ -715,8 +830,8 @@ impl Drop for SsvmPrivate {
                 unsafe { heap.destroy() };
             }
         }
-        unsafe {
-            libc::munmap(self.base.cast(), self.mapping_size);
+        if unsafe { MemMain::vm_unmap(NonNull::new(self.base).expect("mapped base")) }.is_err() {
+            std::process::abort();
         }
         if let Some(descriptor) = self.fd() {
             close_descriptor(descriptor);
@@ -800,11 +915,10 @@ fn validated_name(name: &str) -> Result<CString, SsvmError> {
     CString::new(name).map_err(|_| SsvmError::NoName { max: SSVM_NAME_MAX })
 }
 
-fn mapped_size_for(size: usize) -> Result<usize, SsvmError> {
+fn mapped_size_for(size: usize, page: usize) -> Result<usize, SsvmError> {
     if size == 0 {
         return Err(SsvmError::NoSize);
     }
-    let page = page_size()?;
     let mapped = rounded_size_for(size, page)?;
     if mapped < size_of::<SsvmSharedHeader>() {
         return Err(SsvmError::SizeTooSmall { requested: size });
@@ -840,32 +954,35 @@ fn create_shm(name: &CString) -> Result<RawFd, SsvmError> {
         )
     };
     if descriptor < 0 {
-        return Err(io_error("shm_open"));
+        return Err(SsvmError::CreateFailure {
+            operation: "shm_open",
+            source: io::Error::last_os_error(),
+        });
     }
     Ok(descriptor)
 }
 
-fn create_memfd(name: &CString) -> Result<RawFd, SsvmError> {
-    #[cfg(target_os = "linux")]
-    {
-        let descriptor =
-            unsafe { libc::syscall(libc::SYS_memfd_create, name.as_ptr(), libc::MFD_CLOEXEC) };
-        if descriptor < 0 {
-            return Err(io_error("memfd_create"));
-        }
-        Ok(descriptor as RawFd)
-    }
-    #[cfg(not(target_os = "linux"))]
-    {
-        let _ = name;
-        Err(SsvmError::BackendUnavailable)
-    }
+fn create_memfd(name: &CString, huge_page: bool) -> Result<RawFd, SsvmError> {
+    let page_size = if huge_page {
+        PageSize::DefaultHuge
+    } else {
+        PageSize::Default
+    };
+    MemMain::vm_create_backing(page_size, name.to_str().expect("validated segment name"))
+        .map(IntoRawFd::into_raw_fd)
+        .map_err(|source| SsvmError::CreateFailure {
+            operation: "memfd creation",
+            source: io::Error::other(source),
+        })
 }
 
 fn duplicate_descriptor(descriptor: RawFd) -> Result<RawFd, SsvmError> {
     let owned = unsafe { libc::fcntl(descriptor, libc::F_DUPFD_CLOEXEC, 0) };
     if owned < 0 {
-        return Err(io_error("duplicate segment descriptor"));
+        return Err(SsvmError::CreateFailure {
+            operation: "descriptor duplication",
+            source: io::Error::last_os_error(),
+        });
     }
     Ok(owned)
 }
@@ -874,48 +991,19 @@ fn close_descriptor(descriptor: RawFd) {
     unsafe { libc::close(descriptor) };
 }
 
-fn map_private(size: usize) -> Result<*mut u8, SsvmError> {
-    map_raw(
-        std::ptr::null_mut(),
-        size,
-        libc::MAP_PRIVATE | libc::MAP_ANONYMOUS,
-        -1,
-    )
-}
-
-fn map_raw(
-    address: *mut libc::c_void,
-    size: usize,
-    flags: libc::c_int,
-    descriptor: RawFd,
-) -> Result<*mut u8, SsvmError> {
-    let base = unsafe {
-        libc::mmap(
-            address,
-            size,
-            libc::PROT_READ | libc::PROT_WRITE,
-            flags,
-            descriptor,
-            0,
-        )
+fn randomized_shm_va(requested_va: u64, page_size: usize) -> u64 {
+    if requested_va == 0 {
+        return 0;
+    }
+    let mask = if page_size <= 4096 {
+        15
+    } else if page_size <= 65536 {
+        3
+    } else {
+        0
     };
-    if base == libc::MAP_FAILED {
-        return Err(io_error("shared mmap"));
-    }
-    Ok(base.cast())
-}
-
-fn page_size() -> Result<usize, SsvmError> {
-    let page = unsafe { libc::sysconf(libc::_SC_PAGESIZE) };
-    if page <= 0 {
-        return Err(io_error("page size"));
-    }
-    Ok(page as usize)
-}
-
-fn io_error(operation: &'static str) -> SsvmError {
-    SsvmError::Io {
-        operation,
-        source: io::Error::last_os_error(),
-    }
+    let ticks = crate::time::cpu_time_now();
+    requested_va
+        .checked_add((ticks & mask) * page_size as u64)
+        .unwrap_or(requested_va)
 }

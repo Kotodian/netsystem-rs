@@ -7,12 +7,14 @@
 
 #![cfg(target_os = "linux")]
 
+use std::error::Error;
+use std::num::NonZeroUsize;
 use std::process::Command;
 use std::sync::OnceLock;
 use std::time::Duration;
 
 use byte_unit::Byte;
-use hammer_infra::mem::MainHeapConfig;
+use hammer_infra::mem::{MainHeapConfig, MemError, MemMain, PageSize};
 use hammer_infra::svm::ssvm::{
     SSVM_NAME_MAX, SSVM_PAYLOAD_OFFSET, SsvmConfig, SsvmError, SsvmPrivate, SsvmSegmentBackend,
 };
@@ -23,6 +25,8 @@ const PROCESS_MODE: &str = "HAMMER_SSVM_PROCESS_MODE";
 const ATTACH_MODE: &str = "HAMMER_SSVM_ATTACH_MODE";
 const ATTACH_FD: &str = "HAMMER_SSVM_ATTACH_FD";
 const ATTACH_NAME: &str = "HAMMER_SSVM_ATTACH_NAME";
+const ATTACH_BASE: &str = "HAMMER_SSVM_ATTACH_BASE";
+const REQUESTED_BASE: u64 = 0x5000_0000_0000;
 
 fn initialize_main_heap() {
     static MAIN_HEAP: OnceLock<()> = OnceLock::new();
@@ -81,8 +85,10 @@ fn run_attached_process(mode: &str, test_name: &str, descriptor: Option<i32>, na
 }
 
 fn run_attached_child(mode: &str) -> ! {
+    initialize_main_heap();
     match mode {
         "memfd-attach" => {
+            let count = MemMain::mapping_count();
             let descriptor = std::env::var(ATTACH_FD)
                 .expect("memfd descriptor")
                 .parse()
@@ -93,6 +99,9 @@ fn run_attached_child(mode: &str) -> ! {
             assert_eq!(client.name(), "hammer-ssvm-header");
             assert_eq!(client.client_pid(), std::process::id());
             assert!(client.is_ready());
+            assert_eq!(MemMain::mapping_count(), count + 1);
+            drop(client);
+            assert_eq!(MemMain::mapping_count(), count);
         }
         "memfd-not-ready" => {
             let descriptor = std::env::var(ATTACH_FD)
@@ -122,6 +131,44 @@ fn run_attached_child(mode: &str) -> ! {
                 other => panic!("a deleted shm segment must not attach, got {other:?}"),
             }
         }
+        "occupied-attach" => {
+            let descriptor = std::env::var(ATTACH_FD)
+                .expect("memfd descriptor")
+                .parse()
+                .expect("memfd descriptor number");
+            let base = std::env::var(ATTACH_BASE)
+                .expect("requested address")
+                .parse::<usize>()
+                .expect("requested address number");
+            let count = MemMain::mapping_count();
+            let reservation = MemMain::vm_map(
+                NonZeroUsize::new(base),
+                PAYLOAD_BYTES,
+                PageSize::Default,
+                None,
+                0,
+                0,
+                false,
+                "occupied ssvm address",
+            )
+            .expect("reserve SSVM address");
+            match SsvmPrivate::client_init_memfd(descriptor) {
+                Err(SsvmError::Mmap { operation, source }) => {
+                    assert_eq!(operation, "client mapping");
+                    match &source {
+                        MemError::AddressRangeOccupied { base: occupied, .. } => {
+                            assert_eq!(*occupied, base);
+                        }
+                        other => panic!("expected occupied address, got {other:?}"),
+                    }
+                    assert!(source.source().is_some(), "mapping source is preserved");
+                }
+                other => panic!("occupied SSVM address must fail without replacement: {other:?}"),
+            }
+            assert_eq!(MemMain::mapping_count(), count + 1);
+            unsafe { MemMain::vm_unmap(reservation) }.expect("release address reservation");
+            assert_eq!(MemMain::mapping_count(), count);
+        }
         _ => panic!("unknown SSVM attached process mode {mode}"),
     }
     unsafe { libc::_exit(0) }
@@ -142,6 +189,8 @@ fn run_test_process(mode: &str, test_name: &str) {
             "private" => private_mapping_is_never_attachable_case(),
             "invalid" => invalid_names_and_sizes_are_typed_failures_case(),
             "bounds" => offset_access_rejects_out_of_bounds_and_misaligned_ranges_case(),
+            "mapping" => mappings_are_registered_and_requested_addresses_are_fixed_case(),
+            "shm-requested" => shm_requested_address_publishes_actual_mapping_case(),
             _ => panic!("unknown SSVM process mode {child_mode}"),
         }
         unsafe { libc::_exit(0) }
@@ -171,11 +220,13 @@ fn memfd_segment_publishes_identity_and_payload_bounds() {
 }
 
 fn memfd_segment_publishes_identity_and_payload_bounds_case() {
+    let count = MemMain::mapping_count();
     let server =
         SsvmPrivate::server_init_memfd(&memfd_config("hammer-ssvm-identity", PAYLOAD_BYTES))
             .expect("memfd segment");
 
     assert!(server.is_server());
+    assert_eq!(MemMain::mapping_count(), count + 1);
     assert_eq!(server.segment_type(), SsvmSegmentBackend::Memfd);
     assert_eq!(server.name(), "hammer-ssvm-identity");
     assert_eq!(server.server_pid(), std::process::id());
@@ -204,6 +255,119 @@ fn memfd_segment_publishes_identity_and_payload_bounds_case() {
         server.fd().is_some(),
         "a memfd mapping keeps its descriptor"
     );
+    drop(server);
+    assert_eq!(MemMain::mapping_count(), count);
+}
+
+#[test]
+fn mappings_are_registered_and_requested_addresses_are_fixed() {
+    run_test_process(
+        "mapping",
+        "mappings_are_registered_and_requested_addresses_are_fixed",
+    );
+}
+
+fn mappings_are_registered_and_requested_addresses_are_fixed_case() {
+    let count = MemMain::mapping_count();
+    let mut config = memfd_config("hammer-ssvm-fixed", PAYLOAD_BYTES);
+    config.requested_va = REQUESTED_BASE;
+    let server = SsvmPrivate::server_init_memfd(&config).expect("fixed-address memfd segment");
+    assert_eq!(server.ssvm_va(), REQUESTED_BASE);
+    assert_eq!(server.base().addr() as u64, REQUESTED_BASE);
+    assert_eq!(MemMain::mapping_count(), count + 1);
+
+    let descriptor = server.fd().expect("server descriptor");
+    let flags = unsafe { libc::fcntl(descriptor, libc::F_GETFD) };
+    assert!(flags >= 0);
+    assert_eq!(
+        unsafe { libc::fcntl(descriptor, libc::F_SETFD, flags & !libc::FD_CLOEXEC) },
+        0
+    );
+    let output = Command::new(std::env::current_exe().expect("current test executable"))
+        .env(ATTACH_MODE, "occupied-attach")
+        .env(ATTACH_FD, descriptor.to_string())
+        .env(ATTACH_BASE, REQUESTED_BASE.to_string())
+        .arg("--exact")
+        .arg("mappings_are_registered_and_requested_addresses_are_fixed")
+        .arg("--nocapture")
+        .output()
+        .expect("spawn occupied-address client");
+    assert!(
+        output.status.success(),
+        "occupied-address client failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    drop(server);
+    assert_eq!(MemMain::mapping_count(), count);
+
+    let reservation = MemMain::vm_map(
+        NonZeroUsize::new(REQUESTED_BASE as usize),
+        PAYLOAD_BYTES,
+        PageSize::Default,
+        None,
+        0,
+        0,
+        false,
+        "occupied server address",
+    )
+    .expect("reserve server address");
+    match SsvmPrivate::server_init_memfd(&config) {
+        Err(SsvmError::CreateFailure { operation, source }) => {
+            assert_eq!(operation, "memfd mapping");
+            let memory_error = source
+                .get_ref()
+                .expect("memory error source")
+                .downcast_ref::<MemError>()
+                .expect("memory error is retained");
+            match memory_error {
+                MemError::AddressRangeOccupied { base, .. } => {
+                    assert_eq!(*base, REQUESTED_BASE as usize);
+                }
+                other => panic!("expected occupied address, got {other:?}"),
+            }
+        }
+        other => panic!("occupied server address must return CREATE_FAILURE: {other:?}"),
+    }
+    assert_eq!(MemMain::mapping_count(), count + 1);
+    unsafe { MemMain::vm_unmap(reservation) }.expect("release server address reservation");
+    assert_eq!(MemMain::mapping_count(), count);
+}
+
+#[test]
+fn shm_requested_address_publishes_actual_mapping() {
+    run_test_process(
+        "shm-requested",
+        "shm_requested_address_publishes_actual_mapping",
+    );
+}
+
+fn shm_requested_address_publishes_actual_mapping_case() {
+    let name = format!("/hammer-ssvm-requested-{}", std::process::id());
+    let config = SsvmConfig {
+        backend: SsvmSegmentBackend::Shm,
+        name: name.clone(),
+        size: PAYLOAD_BYTES,
+        requested_va: REQUESTED_BASE,
+        huge_page: false,
+        attach_timeout: SHORT_TIMEOUT,
+    };
+    let count = MemMain::mapping_count();
+    let server = SsvmPrivate::server_init_shm(&config).expect("requested-address shm segment");
+    let offset = server.ssvm_va() - REQUESTED_BASE;
+    assert!(offset <= 15 * MemMain::system_page_size() as u64);
+    assert_eq!(offset % MemMain::system_page_size() as u64, 0);
+    assert_eq!(server.base().addr() as u64, server.ssvm_va());
+    assert_eq!(MemMain::mapping_count(), count + 1);
+    server.publish_ready();
+    run_attached_process(
+        "shm-attach",
+        "shm_requested_address_publishes_actual_mapping",
+        None,
+        Some(&name),
+    );
+    server.delete();
+    assert_eq!(MemMain::mapping_count(), count);
 }
 
 #[test]

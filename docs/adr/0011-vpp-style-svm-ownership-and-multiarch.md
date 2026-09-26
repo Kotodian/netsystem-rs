@@ -205,8 +205,27 @@ shared.ssvm_size = rnd_size;
 
 ### 5.2 Mapping 与 ready
 
+`MainHeapConfig::initialize` 是 Hammer 唯一公开的进程启动入口：daemon 在 early
+config 验证后调用它，`MemMain` 先取得平台页信息，再映射并发布 Main Heap，最后启用
+Rust 全局分配拦截。SSVM 运行在这一初始化完成后的进程中，使用同一个 `MemMain`
+的 VM 映射清单；它不负责初始化第二套内存 authority。VPP 的
+`clib_mem_init_internal` 先调用 `clib_mem_main_init`，其 CLI 单测同样在主堆
+初始化后的 VPP 进程中运行。
+
+- `SsvmPrivate` 只创建或接收 backing fd、决定 backend/地址并发布共享头；所有
+  server、client probe、client full 和 PRIVATE 映射都调用
+  `MemMain::vm_map`，释放时调用 `MemMain::vm_unmap`。`MemMain` 不认识 SSVM
+  header、ready 或 FIFO payload。SSVM 映射边界由
+  `cargo test -p hammer-infra --test svm_ssvm` 验证；SSVM 不直接调用
+  `mmap`/`munmap`。
+- VPP 的 server 在 `src/svm/ssvm.c` 中调用 `clib_mem_vm_map_shared`，client
+  probe/full 则直接调用 `mmap`。Hammer 按本仓库的 MemMain 映射 owner 统一登记
+  client 映射；这保留相同地址的共享指针契约，并让映射清单涵盖两端。
 - server 的 `requested_va == 0` 只表示让 OS 选择 creator address；初始化完成后
   shared `ssvm_va` 记录返回的实际非零地址；
+- SHM server 对非零 `requested_va` 按 VPP `clib_mem_vm_randomize_va` 的页数范围
+  增加随机偏移；MEMFD server 直接使用非零请求地址。MemMain 先预留目标 range
+  与前置映射元数据页，地址被占用时不覆盖已有映射。
 - SHM/MEMFD client 先只映射 page 0，读取 size、backend 和 `ssvm_va`，解除 probe，
   再映射完整 segment；
 - generic SSVM 的非零 `ssvm_va` 要求 same-VA attach；目标 range 已占用必须返回
@@ -217,6 +236,20 @@ shared.ssvm_size = rnd_size;
   调 `wait_ready`；
 - `delete` 按 backend 分发，server/client 只释放各自拥有的 mapping/fd/name；
   SHM backing name 只由 lifecycle owner unlink。
+
+SSVM 操作失败仍以枚举表达 VPP `ssvm.h` 的 `NO_NAME`、`NO_SIZE`、
+`CREATE_FAILURE`、`SET_SIZE`、`MMAP`、`CLIENT_TIMEOUT` 类别，不向 Rust 调用方
+返回这些类别的 C 整数值。Hammer 的共享头版本/边界校验错误属于本地 ABI 验证；
+底层 `MemError` 或 `io::Error` 保留在对应类别的 `source` 链中。
+与 `src/svm/ssvm.c` 一致，SHM 的 backing 长度失败归 `SET_SIZE`，MEMFD
+的 backing 长度或 server 映射失败归 `CREATE_FAILURE`；client 映射失败归
+`MMAP`。映射已登记后若初始化失败，SSVM 先通过 MemMain 解除映射，再由 fd
+创建方关闭尚未移交的 descriptor。
+
+VPP 的 `src/plugins/unittest/svm_fifo_test.c` 是在已初始化主堆的 VPP 进程内
+通过 `test svm fifo` CLI 运行；`src/svm/svm_test.c` 只测试 SVM region，
+不是 SSVM 的独立测试入口。Hammer 的 SSVM 定向测试只在需要验证跨地址空间
+attach 时启动另一进程，不据此改变 FIFO 测试的执行方式。
 
 ### 5.3 FIFO segment 特例
 
