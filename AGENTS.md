@@ -95,10 +95,12 @@ Use Rust 2024 conventions and rustfmt defaults: 4-space indentation, `snake_case
 - Do **not** introduce underscore-prefixed variable names such as `_value`. If a parameter or pattern slot is intentionally unused, use the bare `_` pattern. If a local binding is unused, delete it and the work that produced it.
 - Enforce architectural boundaries with visibility, traits, and narrow re-exports instead of comments or convention.
 - Do not introduce `thread_local!` state except the Binary API's `my_api_main`
-  selector, which follows VPP's per-thread current-main pointer and stores no
-  packet or worker protocol state. Other thread-bound state must be owned
-  directly by the runtime, worker, Graph Node, or other value that owns that
-  thread lifecycle. A shared Main that contains fixed per-thread values must
+  selector and `hammer-infra::mem`'s existing allocator-owned `MemThreadMain`
+  selector. The latter is required because Rust `GlobalAlloc` receives no
+  runtime owner argument; neither selector may store packet or worker protocol
+  state. Other thread-bound state must be owned directly by the runtime,
+  worker, Graph Node, or other value that owns that thread lifecycle. A shared
+  Main that contains fixed per-thread values must
   construct its existing `Vec`, slice, or `Pool` entries before worker launch;
   the executing worker borrows only the entry selected by its runtime thread
   index. Do not add a generic per-thread container, cross-thread install/clear
@@ -353,6 +355,51 @@ When working on VPP-related refactors in this repository:
 - Route all ordinary Rust and third-party production allocations through the process-global fixed-capacity Hammer Main Heap. Standard collections are the ordinary collection family; use explicit `hammer-infra` primitives when their VPP/data-plane semantics are required. SVM regions and Buffer Arena packet storage are the only allocation backends exempt from the Main Heap, and neither may fall back to it.
 - Reuse existing APIs before adding new wrappers, helpers, or types. Add new API surface only when reuse is not technically viable. When a missing capability is shared by multiple use cases, add one generic primitive at the owning layer instead of adding per-feature APIs. Any new type or API in non-trivial VPP/TCP work must state the final result, explain why existing surfaces cannot satisfy the need, and receive explicit user approval before implementation.
 - Utility or tool types must remain generic and must not contain business concepts. Business state names must describe the domain state directly; do not use names such as `Cursor`, `Helper`, or `Util` for business records.
+
+### Memory Architecture
+
+- `hammer-infra::mem::MemMain` is the single process memory authority and Rust
+  global allocator. It owns the fixed-capacity Main Heap, page and NUMA facts,
+  heap and registered-thread lists, and its VM mapping inventory. `MemHeap` is
+  the fixed-capacity dlmalloc mspace used by the Main Heap and by process and
+  SVM heaps. `MemThreadMain` selects the active heap for one OS thread; a heap
+  activation must restore the prior selection when its scope ends. See
+  `CONTEXT.md` and ADR-0012 for the ownership and lifetime contracts.
+- `MainHeapConfig::initialize` is the only public Main Heap startup entry.
+  The daemon validates early config, releases pre-init Rust values, then calls
+  it before constructing runtime or SVM state. Initialization obtains platform
+  page/hugepage and NUMA facts, maps and creates the Main Heap, installs the
+  main thread's active heap and heap list, and enables allocation interception
+  last. This follows VPP's `clib_mem_init_internal` calling
+  `clib_mem_main_init` before publishing its main heap. Do not add another
+  memory authority or a lazy platform-init path to accommodate a test.
+- Before interception, Rust `GlobalAlloc` uses `System`; afterward it uses the
+  current thread's active `MemHeap`. A pre-init `System` allocation must not be
+  freed or reallocated after the switch. Free and realloc must not select a
+  heap by scanning pointers or fall back to `System`. Ordinary Rust and
+  third-party allocations use the Main Heap unless an owner explicitly
+  activates another heap. SVM regions and Buffer Arena packet storage retain
+  their documented separate allocation ownership and cannot fall back to it.
+- `MemMain::vm_map` and `vm_unmap` register and release SSVM VM mappings;
+  `vm_create_backing` creates memfd backing. SSVM owns backing descriptors, shared headers,
+  ready publication, and backend lifecycle; it does not call `mmap`/`munmap`
+  itself. Keep SVM region's separate fixed-VA and PVT/Data Heap contract under
+  its own owner; do not infer that every SVM mapping has the SSVM layout.
+- For SSVM, `requested_va == 0` lets the server choose an address; a generic
+  segment publishes the actual mapped VA. For nonzero `requested_va`, SHM
+  server adds a VPP-style randomized page offset, while MEMFD server uses the
+  requested address directly.
+  Clients probe the header and map the full segment at its nonzero published
+  VA; a zero published VA permits an arbitrary address for owner-defined
+  offset-based layouts such as FIFO segments. Occupied fixed ranges must fail
+  without replacing another mapping. Preserve VPP's SSVM failure categories
+  as Rust error variants with their underlying sources, never numeric codes.
+- VPP's FIFO unit tests run through a CLI command after VPP initializes its
+  main heap. Ordinary Rust `#[test]` execution has no equivalent startup
+  boundary: do not switch the process allocator after test-harness allocations
+  or change unrelated tests to subprocesses to make SSVM mapping work. Tests
+  that need the Main Heap must establish its process startup contract; use
+  another process when the behavior actually requires separate address spaces.
 
 ### Hammer/VPP TCP Standards
 
