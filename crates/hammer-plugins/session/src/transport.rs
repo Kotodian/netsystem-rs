@@ -278,10 +278,7 @@ impl TransportMain for IpTransportMain {
         Ok(())
     }
 
-    fn allocate_local(
-        &self,
-        mut endpoint: Self::Endpoint,
-    ) -> Result<Self::Endpoint, SessionError> {
+    fn allocate_local(&self, mut endpoint: Self::Endpoint) -> Result<Self::Endpoint, SessionError> {
         if self.local_endpoint_cleanup.lock().cleanup_pending {
             self.reclaim_local_endpoints();
         }

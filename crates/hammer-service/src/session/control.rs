@@ -113,8 +113,8 @@ impl SessionMain {
                 match self.listen(application_listener, request.transport, request.endpoint) {
                     Ok(listener) => Ok(listener),
                     Err(error) => {
-                        let _ =
-                            application_main().remove_listener(application, application_listener);
+                        let _ = application_main()
+                            .remove_listener_legacy(application, application_listener);
                         Err(SessionControlError::from(error))
                     }
                 }
@@ -266,7 +266,7 @@ impl SessionMain {
                     .map_err(SessionControlError::from)?;
                 self.unlisten(listener).map_err(SessionControlError::from)?;
                 application_main()
-                    .remove_listener(application, application_listener)
+                    .remove_listener_legacy(application, application_listener)
                     .map_err(SessionControlError::from)?;
                 Ok(())
             })
@@ -305,6 +305,9 @@ impl SessionMain {
     }
 }
 
+#[deprecated(
+    note = "ADR-0040: legacy application control protocol; use plugin-session application APIs"
+)]
 impl From<ApplicationError> for SessionControlError {
     fn from(error: ApplicationError) -> Self {
         match error {
@@ -328,6 +331,7 @@ impl From<ApplicationError> for SessionControlError {
             | ApplicationError::MqPublication { .. } => Self::TransportFailed,
             ApplicationError::MqAlreadyAttached { .. } => Self::TransportFailed,
             ApplicationError::SessionAppAlreadyRegistered { .. } => Self::TransportFailed,
+            _ => Self::TransportFailed,
         }
     }
 }

@@ -146,20 +146,30 @@ pub struct FifoSegmentHeader {
     pub byte_index: AtomicU64,
     pub max_byte_index: u64,
     pub start_byte_index: u64,
-    pub _slice_pad: [u8; 40],
+    pub slices_offset: u64,
+    pub _slice_pad: [u8; 32],
 }
 
 impl FifoSegmentHeader {
     pub const MAGIC: u64 = 0x4841_4d4d_4552_4653;
 
-    pub const fn layout_bytes(n_slices: usize) -> usize {
-        std::mem::size_of::<Self>() + n_slices * std::mem::size_of::<FifoSegmentSlice>()
+    pub const fn slices_offset() -> usize {
+        std::mem::size_of::<Self>()
     }
 
+    pub const fn layout_bytes(n_slices: usize) -> usize {
+        Self::slices_offset() + n_slices * std::mem::size_of::<FifoSegmentSlice>()
+    }
+
+    /// The segment owner must validate the explicit offset, length, and mapping
+    /// bounds before accessing this shared-memory slice.
     pub unsafe fn slices(&self) -> &[FifoSegmentSlice] {
         unsafe {
             std::slice::from_raw_parts(
-                (self as *const Self).add(1).cast::<FifoSegmentSlice>(),
+                (self as *const Self)
+                    .cast::<u8>()
+                    .add(self.slices_offset as usize)
+                    .cast::<FifoSegmentSlice>(),
                 self.n_slices as usize,
             )
         }
@@ -168,7 +178,10 @@ impl FifoSegmentHeader {
     pub unsafe fn slices_mut(&mut self) -> &mut [FifoSegmentSlice] {
         unsafe {
             std::slice::from_raw_parts_mut(
-                (self as *mut Self).add(1).cast::<FifoSegmentSlice>(),
+                (self as *mut Self)
+                    .cast::<u8>()
+                    .add(self.slices_offset as usize)
+                    .cast::<FifoSegmentSlice>(),
                 self.n_slices as usize,
             )
         }

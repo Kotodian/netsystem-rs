@@ -42,7 +42,10 @@ pub(crate) enum AppWorkerError {
     AcceptedPublicationUnavailable,
 }
 
-pub struct AppWorker {
+#[deprecated(
+    note = "ADR-0040: migrate app/session slots to the Application worker and SegmentManager ownership"
+)]
+pub struct AppSessionWorker {
     /// Hot per-packet lookup array. Cold accept/detach-only metadata lives in
     /// `attach_slots` at the same index.
     session_slots: Vec<Option<SessionSlot>>,
@@ -282,9 +285,9 @@ impl SegmentManager {
     }
 }
 
-impl fmt::Debug for AppWorker {
+impl fmt::Debug for AppSessionWorker {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("AppWorker")
+        f.debug_struct("AppSessionWorker")
             .field("session_capacity", &self.session_slots.len())
             .field(
                 "active_sessions",
@@ -294,7 +297,7 @@ impl fmt::Debug for AppWorker {
     }
 }
 
-impl AppWorker {
+impl AppSessionWorker {
     #[inline]
     pub fn new(
         session_capacity: usize,
@@ -639,7 +642,7 @@ impl AppWorker {
     }
 }
 
-impl AppWorker {
+impl AppSessionWorker {
     pub(crate) fn create_app_session(
         &mut self,
         allocation_owner: u64,

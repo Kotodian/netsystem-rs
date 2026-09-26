@@ -265,7 +265,7 @@ impl HttpMain {
                 Ok(listener) => listener,
                 Err(error) => {
                     applications
-                        .remove_listener(self.inner_application, inner_application_listener)
+                        .remove_listener_legacy(self.inner_application, inner_application_listener)
                         .expect("failed QUIC inner listen leaves Application listener available");
                     return Err(error.into());
                 }
@@ -335,7 +335,7 @@ impl HttpMain {
             .map_err(RuntimeError::from)?;
         // Inner Application listener removal second.
         application_main()
-            .remove_listener(self.inner_application, context.inner_application_listener)
+            .remove_listener_legacy(self.inner_application, context.inner_application_listener)
             .map_err(RuntimeError::from)?;
         // Outer HTTP context clear last, after both lower teardowns
         // succeeded. The lookup validated the slot, so the indexed store is
@@ -417,7 +417,9 @@ fn init_http_transport() -> RuntimeResult<()> {
         HTTP_MAIN.get().is_none(),
         "HTTP initialization callback executes once"
     );
-    let inner_application = application_main().attach().map_err(RuntimeError::from)?;
+    let inner_application = application_main()
+        .attach_legacy()
+        .map_err(RuntimeError::from)?;
     let session_app = match http_app::register(inner_application) {
         Ok(session_app) => session_app,
         Err(error) => {

@@ -12,8 +12,8 @@ use hammer_infra::sync::SpinLock;
 use hammer_infra::timer_wheel::TimerWheel1t2w2048sl;
 use zerocopy::{FromBytes, Immutable, IntoBytes, KnownLayout};
 
-use crate::transport::{TransportSendParams, TransportTxMode};
 use super::error::SessionError;
+use crate::transport::{TransportSendParams, TransportTxMode};
 
 pub const SESSION_INDEX_INVALID: u32 = u32::MAX;
 
@@ -57,7 +57,7 @@ pub const SESSION_EVENT_QUEUE_FULL: i32 = -2;
 
 #[repr(C)]
 #[derive(
-    Clone, Copy, Debug, Default, PartialEq, Eq, KnownLayout, FromBytes, Immutable, IntoBytes,
+    Clone, Copy, Debug, Default, PartialEq, Eq, Hash, KnownLayout, FromBytes, Immutable, IntoBytes,
 )]
 pub struct SessionHandle {
     pub worker_index: u32,
@@ -218,7 +218,9 @@ pub struct PoolReallocationState {
     pub workers_doing_work: u32,
 }
 
+#[repr(C)]
 pub struct SessionWorker<O = u32> {
+    cacheline0: hammer_infra::align::CacheLineAlignMark,
     sessions: Pool<Session<O>>,
     event_queue_index: u32,
     last_time: f64,
@@ -259,6 +261,7 @@ pub struct SessionWorker<O = u32> {
 impl<O> SessionWorker<O> {
     fn new(worker_index: u32, config: SessionConfig) -> Self {
         Self {
+            cacheline0: hammer_infra::align::CacheLineAlignMark,
             sessions: Pool::with_capacity(config.session_capacity as usize),
             event_queue_index: worker_index,
             last_time: 0.0,
@@ -314,6 +317,86 @@ impl<O> SessionWorker<O> {
     #[inline(always)]
     pub fn session_mut(&mut self, session_index: u32) -> Option<&mut Session<O>> {
         self.sessions.get_mut(session_index)
+    }
+
+    // VPP: listen_session_alloc/session_alloc, session.c:244-304;
+    // session_listen, session.c:1467-1494.
+    pub fn allocate_listening_session(
+        &mut self,
+        session_type: u8,
+        opaque: O,
+    ) -> Result<SessionHandle, SessionError> {
+        let handle = SessionHandle {
+            worker_index: self.worker_index,
+            session_index: SESSION_INDEX_INVALID,
+        };
+        let session_index = self.sessions.insert(Session::new(
+            handle,
+            SessionState::Listening,
+            session_type,
+            opaque,
+        ));
+        let handle = SessionHandle {
+            worker_index: self.worker_index,
+            session_index,
+        };
+        self.sessions
+            .get_mut(session_index)
+            .expect("inserted listening Session remains allocated")
+            .handle = handle;
+        Ok(handle)
+    }
+
+    // VPP: session_listen attaches the transport connection after bind,
+    // session.c:1467-1494.
+    pub fn attach_connection(
+        &mut self,
+        session: SessionHandle,
+        connection_index: u32,
+    ) -> Result<(), SessionError> {
+        if session.worker_index != self.worker_index {
+            return Err(SessionError::NoSession);
+        }
+        let entry = self
+            .sessions
+            .get_mut(session.session_index)
+            .ok_or(SessionError::NoSession)?;
+        entry.connection_index = connection_index;
+        Ok(())
+    }
+
+    // VPP: session_alloc/session_stream_accept, session.c:244-304,752-807.
+    pub fn allocate_connected_session(
+        &mut self,
+        session_type: u8,
+        opaque: O,
+        listener: Option<SessionHandle>,
+    ) -> Result<SessionHandle, SessionError> {
+        let handle = SessionHandle {
+            worker_index: self.worker_index,
+            session_index: SESSION_INDEX_INVALID,
+        };
+        let state = if listener.is_some() {
+            SessionState::Accepting
+        } else {
+            SessionState::Connecting
+        };
+        let session_index = self
+            .sessions
+            .insert(Session::new(handle, state, session_type, opaque));
+        let handle = SessionHandle {
+            worker_index: self.worker_index,
+            session_index,
+        };
+        let entry = self
+            .sessions
+            .get_mut(session_index)
+            .expect("inserted connected Session remains allocated");
+        entry.handle = handle;
+        if let Some(listener) = listener {
+            entry.listener_handle = listener;
+        }
+        Ok(handle)
     }
 
     pub fn handle_event(&mut self, queue: &SvmMsgQ) -> Result<(), SessionError> {
@@ -376,7 +459,11 @@ impl<O> SessionWorker<O> {
     }
 
     #[inline(always)]
-    pub fn store_state(&self, handle: SessionHandle, state: SessionState) -> Result<(), SessionError> {
+    pub fn store_state(
+        &self,
+        handle: SessionHandle,
+        state: SessionState,
+    ) -> Result<(), SessionError> {
         let Some(session) = self.session_from_handle(handle) else {
             return Err(SessionError::NoSession);
         };
@@ -385,7 +472,11 @@ impl<O> SessionWorker<O> {
     }
 
     #[inline(always)]
-    pub fn enqueue_ready(&mut self, handle: SessionHandle, protocol: u8) -> Result<(), SessionError> {
+    pub fn enqueue_ready(
+        &mut self,
+        handle: SessionHandle,
+        protocol: u8,
+    ) -> Result<(), SessionError> {
         let Some(session) = self.session_from_handle(handle) else {
             return Err(SessionError::NoSession);
         };
@@ -418,7 +509,10 @@ impl<O> SessionWorker<O> {
         Ok(())
     }
 
-    pub fn queue_migration(&mut self, request: SessionMigrationRequest) -> Result<(), SessionError> {
+    pub fn queue_migration(
+        &mut self,
+        request: SessionMigrationRequest,
+    ) -> Result<(), SessionError> {
         self.migration.lock().requests.push(request);
         Ok(())
     }
@@ -442,6 +536,7 @@ pub struct Session<O = u32> {
     state: AtomicU8,
     session_type: u8,
     flags: SessionFlags,
+    app_worker_index: Option<u32>,
     rx_fifo: Option<SvmFifo>,
     tx_fifo: Option<SvmFifo>,
     connection_index: u32,
@@ -457,6 +552,7 @@ impl<O> Session<O> {
             state: AtomicU8::new(u8::from(state)),
             session_type: protocol,
             flags: SessionFlags::default(),
+            app_worker_index: None,
             rx_fifo: None,
             tx_fifo: None,
             connection_index: SESSION_INDEX_INVALID,
@@ -484,6 +580,23 @@ impl<O> Session<O> {
     #[inline(always)]
     pub fn opaque_mut(&mut self) -> &mut O {
         &mut self.opaque
+    }
+
+    // VPP: session_t.app_wrk_index, session_types.h:264-271.
+    #[inline(always)]
+    pub const fn app_worker_index(&self) -> Option<u32> {
+        self.app_worker_index
+    }
+
+    // VPP: app_worker_init_accepted/app_worker_init_connected,
+    // application_worker.c:493-631. Only the owning worker mutates a Session.
+    pub fn attach_app_worker(&mut self, app_worker_index: u32) {
+        self.app_worker_index = Some(app_worker_index);
+    }
+
+    // VPP: segment_manager_del_sessions_filter, segment_manager.c:716-743.
+    pub fn detach_app_worker(&mut self) {
+        self.app_worker_index = None;
     }
 
     #[inline(always)]
@@ -599,6 +712,8 @@ struct SessionEventRecord {
     payload: [u64; 2],
 }
 
+pub(crate) const SESSION_EVENT_RECORD_SIZE: u32 = size_of::<SessionEventRecord>() as u32;
+
 impl From<SessionEvent> for SessionEventRecord {
     fn from(event: SessionEvent) -> Self {
         Self {
@@ -627,10 +742,9 @@ impl From<SessionEventRecord> for SessionEvent {
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct SessionMain<O = u32> {
     config: SessionConfig,
-    workers: Vec<SessionWorker<O>>,
+    workers: UnsafeCell<Vec<SessionWorker<O>>>,
     session_tx_modes: UnsafeCell<Vec<TransportTxMode>>,
     session_type_to_next: UnsafeCell<Vec<u32>>,
     transport_cl_thread: u32,
@@ -658,7 +772,7 @@ impl<O: Default> SessionMain<O> {
         }
         let mut main = Self {
             config,
-            workers,
+            workers: UnsafeCell::new(workers),
             session_tx_modes: UnsafeCell::new(Vec::new()),
             session_type_to_next: UnsafeCell::new(Vec::new()),
             transport_cl_thread: 0,
@@ -701,11 +815,15 @@ impl<O: Default> SessionMain<O> {
 
     #[inline(always)]
     pub fn worker(&self, worker_index: u32) -> Option<&SessionWorker<O>> {
-        self.workers.get(worker_index as usize)
+        // SAFETY: worker entries are constructed before publication and are
+        // removed only while the WorkerBarrier excludes Data Workers.
+        unsafe { (&*self.workers.get()).get(worker_index as usize) }
     }
 
     pub fn worker_mut(&mut self, worker_index: u32) -> Option<&mut SessionWorker<O>> {
-        self.workers.get_mut(worker_index as usize)
+        // SAFETY: &mut self is the owner-worker or main-thread exclusive
+        // access required by the existing SessionMain contract.
+        unsafe { (&mut *self.workers.get()).get_mut(worker_index as usize) }
     }
 
     #[inline(always)]
@@ -799,30 +917,76 @@ impl<O: Default> SessionMain<O> {
         Ok(handle)
     }
 
+    // VPP: listen_session_alloc/session_listen, session.c:244-304,1467-1494.
+    // The listener pool is a main/control mutation and is published only
+    // while every Data Worker is stopped by WorkerBarrier.
+    pub fn allocate_listening_session(
+        &self,
+        worker_index: u32,
+        protocol: u8,
+        opaque: O,
+    ) -> Result<SessionHandle, SessionError> {
+        hammer_runtime::ensure_main_thread_with_barrier().map_err(|_| SessionError::Invalid)?;
+        hammer_runtime::worker_thread_barrier_sync!({
+            // SAFETY: the barrier excludes all Data Worker access to this
+            // worker pool for the complete allocation and publication.
+            let workers = unsafe { &mut *self.workers.get() };
+            workers
+                .get_mut(worker_index as usize)
+                .ok_or(SessionError::Invalid)?
+                .allocate_listening_session(protocol, opaque)
+        })
+    }
+
+    // VPP: session_listen, session.c:1467-1494. The transport backlink is
+    // installed after the concrete transport operation for listeners and
+    // active connections alike.
     pub fn attach_transport(
-        &mut self,
+        &self,
         session: SessionHandle,
         protocol: u8,
         connection_index: u32,
     ) -> Result<(), SessionError> {
-        let Some(entry) = self
-            .worker_mut(session.worker_index)
-            .and_then(|worker| worker.session_mut(session.session_index))
-        else {
-            return Err(SessionError::NoSession);
-        };
-        entry.session_type = protocol;
-        entry.connection_index = connection_index;
-        Ok(())
+        hammer_runtime::ensure_main_thread_with_barrier().map_err(|_| SessionError::Invalid)?;
+        hammer_runtime::worker_thread_barrier_sync!({
+            let workers = unsafe { &mut *self.workers.get() };
+            let worker = workers
+                .get_mut(session.worker_index as usize)
+                .ok_or(SessionError::NoSession)?;
+            let entry = worker
+                .session_mut(session.session_index)
+                .ok_or(SessionError::NoSession)?;
+            entry.session_type = protocol;
+            entry.connection_index = connection_index;
+            Ok(())
+        })
     }
 
-    pub fn detach_transport(&mut self, session: SessionHandle) -> Result<(), SessionError> {
-        let Some(entry) = self
-            .worker_mut(session.worker_index)
-            .and_then(|worker| worker.session_mut(session.session_index))
-        else {
-            return Err(SessionError::NoSession);
-        };
+    // VPP: session_free/session_delete, session.c:258-265,1186-1213.
+    // A failed listener construction removes only the just-created pool slot.
+    pub fn remove(&self, session: SessionHandle) -> Result<(), SessionError> {
+        hammer_runtime::ensure_main_thread_with_barrier().map_err(|_| SessionError::Invalid)?;
+        hammer_runtime::worker_thread_barrier_sync!({
+            let workers = unsafe { &mut *self.workers.get() };
+            let worker = workers
+                .get_mut(session.worker_index as usize)
+                .ok_or(SessionError::NoSession)?;
+            if worker.sessions.remove(session.session_index).is_some() {
+                Ok(())
+            } else {
+                Err(SessionError::NoSession)
+            }
+        })
+    }
+
+    pub fn detach_transport(&self, session: SessionHandle) -> Result<(), SessionError> {
+        let workers = unsafe { &mut *self.workers.get() };
+        let worker = workers
+            .get_mut(session.worker_index as usize)
+            .ok_or(SessionError::NoSession)?;
+        let entry = worker
+            .session_mut(session.session_index)
+            .ok_or(SessionError::NoSession)?;
         entry.connection_index = SESSION_INDEX_INVALID;
         entry.store_state(SessionState::TransportDeleted);
         Ok(())
@@ -870,7 +1034,10 @@ impl<O: Default> SessionMain<O> {
         }
     }
 
-    pub fn program_migration(&mut self, request: SessionMigrationRequest) -> Result<(), SessionError> {
+    pub fn program_migration(
+        &mut self,
+        request: SessionMigrationRequest,
+    ) -> Result<(), SessionError> {
         let Some(worker) = self.worker_mut(request.old.worker_index) else {
             return Err(SessionError::Invalid);
         };

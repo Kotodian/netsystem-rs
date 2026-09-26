@@ -1164,12 +1164,17 @@ name = "hammer-plugin-session"
 version = "0.1.0"
 dependencies = [
  "abi_stable",
+ "hammer-app",
  "hammer-component-macros",
  "hammer-infra",
+ "hammer-ipc",
+ "hammer-plugin-ip",
  "hammer-runtime",
  "hammer-service",
  "linkme",
  "serde",
+ "thiserror 2.0.18",
+ "tracing",
 ]
 
 [[package]]
