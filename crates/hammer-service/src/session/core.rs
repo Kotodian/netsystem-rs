@@ -235,6 +235,7 @@ pub struct SessionWorker<O = u32> {
     pending_io_sessions: Vec<SessionHandle>,
     app_workers_pending: Bitmap,
     input_node: Option<NodeId>,
+    queue_node: Option<NodeId>,
     timer_fd: i32,
     timer_fd_file: u64,
     timer: TimerWheel1t2w2048sl<SessionHandle>,
@@ -297,6 +298,7 @@ impl<O> SessionWorker<O> {
             pending_io_sessions: Vec::new(),
             app_workers_pending: Bitmap::new(),
             input_node: None,
+            queue_node: None,
             timer_fd: -1,
             timer_fd_file: u64::MAX,
             timer: TimerWheel1t2w2048sl::new(config.event_ring_capacity as usize),
@@ -379,6 +381,65 @@ impl<O> SessionWorker<O> {
             self.input_node.replace(node).is_none(),
             "session-input installs once"
         );
+    }
+
+    pub(crate) fn install_queue_node(&mut self, node: NodeId) {
+        assert!(
+            self.queue_node.replace(node).is_none(),
+            "session-queue installs once"
+        );
+    }
+
+    /// VPP: session.h:1101-1108, `session_add_pending_tx_buffer`.
+    #[inline(always)]
+    pub fn add_pending_tx_buffer(
+        &mut self,
+        runtime: &DataPlaneMain,
+        buffer_index: u32,
+        next: crate::session::SessionQueueNext,
+    ) {
+        assert_eq!(
+            runtime
+                .data_worker_id()
+                .expect("transport output runs on a Data Worker")
+                .slot(),
+            self.worker_index as usize
+        );
+        self.pending_tx_buffers.push(buffer_index);
+        self.pending_tx_nexts.push(next.slot());
+        if self.state == SessionWorkerState::Interrupt {
+            runtime
+                .set_node_interrupt_pending(
+                    self.queue_node
+                        .expect("session-queue installs before transport output"),
+                )
+                .expect("registered session-queue accepts an interrupt");
+        }
+    }
+
+    /// VPP: session_node.c:1965-1973, `session_flush_pending_tx_buffers`.
+    pub(crate) fn flush_pending_tx_buffers(
+        &mut self,
+        runtime: &mut DataPlaneMain,
+        node: &mut hammer_runtime::NodeRuntime,
+        frame: &mut hammer_core::data_plane::Frame,
+    ) -> usize {
+        assert_eq!(self.pending_tx_buffers.len(), self.pending_tx_nexts.len());
+        let count = self.pending_tx_buffers.len();
+        for offset in (0..self.pending_tx_buffers.len())
+            .step_by(hammer_core::data_plane::DEFAULT_BUFFER_FRAME_CAPACITY)
+        {
+            let end = (offset + hammer_core::data_plane::DEFAULT_BUFFER_FRAME_CAPACITY)
+                .min(self.pending_tx_buffers.len());
+            let buffers = &self.pending_tx_buffers[offset..end];
+            frame.set_vector_count(buffers.len());
+            frame.vector_args_mut().copy_from_slice(buffers);
+            runtime.enqueue_to_next(node, frame, &self.pending_tx_nexts[offset..end]);
+        }
+        frame.set_vector_count(0);
+        self.pending_tx_buffers.clear();
+        self.pending_tx_nexts.clear();
+        count
     }
 
     #[inline(always)]
@@ -705,6 +766,138 @@ impl<O> SessionWorker<O> {
             },
         );
         Some(())
+    }
+
+    /// VPP: `session_transport_closing_notify`, session.c:958-980.
+    pub fn transport_closing(
+        &mut self,
+        runtime: &DataPlaneMain,
+        handle: SessionHandle,
+        connection_index: u32,
+    ) -> Result<(), SessionError> {
+        let session = self.session_from_handle(handle).ok_or(SessionError::NoSession)?;
+        assert_eq!(session.connection_index(), connection_index);
+        let state = session.load_state();
+        if matches!(
+            state,
+            SessionState::TransportClosing
+                | SessionState::Closing
+                | SessionState::AppClosed
+                | SessionState::TransportClosed
+                | SessionState::Closed
+                | SessionState::TransportDeleted
+        ) {
+            return Ok(());
+        }
+        session.store_state(SessionState::TransportClosing);
+        if state != SessionState::Accepting {
+            self.queue_application_event(runtime, handle, SessionEventType::Disconnected, 0);
+        }
+        Ok(())
+    }
+
+    /// VPP: `session_transport_reset_notify`, session.c:1167-1185.
+    pub fn transport_reset(
+        &mut self,
+        runtime: &DataPlaneMain,
+        handle: SessionHandle,
+        connection_index: u32,
+    ) -> Result<(), SessionError> {
+        let session = self.session_from_handle(handle).ok_or(SessionError::NoSession)?;
+        assert_eq!(session.connection_index(), connection_index);
+        let state = session.load_state();
+        if matches!(
+            state,
+            SessionState::TransportClosing
+                | SessionState::Closing
+                | SessionState::AppClosed
+                | SessionState::TransportClosed
+                | SessionState::Closed
+                | SessionState::TransportDeleted
+        ) {
+            return Ok(());
+        }
+        session.store_state(SessionState::TransportClosing);
+        if state != SessionState::Accepting {
+            self.queue_application_event(runtime, handle, SessionEventType::Reset, 0);
+        }
+        Ok(())
+    }
+
+    /// VPP: `session_transport_closed_notify`, session.c:1126-1164.
+    pub fn transport_closed(
+        &mut self,
+        runtime: &DataPlaneMain,
+        handle: SessionHandle,
+        connection_index: u32,
+    ) -> Result<(), SessionError> {
+        let session = self.session_from_handle(handle).ok_or(SessionError::NoSession)?;
+        assert_eq!(session.connection_index(), connection_index);
+        let state = session.load_state();
+        if matches!(
+            state,
+            SessionState::TransportClosed | SessionState::Closed | SessionState::TransportDeleted
+        ) {
+            return Ok(());
+        }
+        if state == SessionState::Ready {
+            self.transport_closing(runtime, handle, connection_index)?;
+        }
+        let session = self
+            .session_from_handle(handle)
+            .expect("transport-closed Session remains allocated");
+        if state == SessionState::AppClosed {
+            session.store_state(SessionState::Closed);
+        } else if matches!(
+            state,
+            SessionState::Created
+                | SessionState::Listening
+                | SessionState::Connecting
+                | SessionState::Accepting
+                | SessionState::Ready
+                | SessionState::Opened
+                | SessionState::TransportClosing
+                | SessionState::Closing
+        ) {
+            session.store_state(SessionState::TransportClosed);
+        }
+        self.queue_application_event(runtime, handle, SessionEventType::TransportClosed, 0);
+        Ok(())
+    }
+
+    fn queue_application_event(
+        &mut self,
+        runtime: &DataPlaneMain,
+        handle: SessionHandle,
+        event_type: SessionEventType,
+        operation: u8,
+    ) {
+        let session = self
+            .session_from_handle(handle)
+            .expect("Application notification retains its Session");
+        let Some(app_worker_index) = session.application_worker() else {
+            return;
+        };
+        let protocol = session.transport_protocol();
+        let application = ApplicationMain::global()
+            .expect("Application Main remains initialized while Session is attached");
+        // SAFETY: this Session worker exclusively executes its AppWorker event
+        // slot; detach waits for WorkerBarrier before removing the AppWorker.
+        let app_worker = unsafe { application.worker(app_worker_index) }
+            .expect("attached Session retains its AppWorker");
+        app_worker.add_event(
+            runtime,
+            self,
+            SessionEvent {
+                event_type: u8::from(event_type),
+                postponed: false,
+                protocol,
+                operation,
+                session: handle,
+                control_data_index: SESSION_INDEX_INVALID,
+                payload: [0; 2],
+            },
+        );
     }
 
     pub fn allocate_control_data(&mut self, data: SessionControlData) -> u32 {
@@ -1256,7 +1449,6 @@ impl<O> SessionMain<O> {
 
     pub fn register_transport_type(
         &self,
-        protocol: u8,
         tx_mode: TransportTxMode,
         output_next: u32,
     ) -> Result<u8, SessionError> {
@@ -1264,10 +1456,7 @@ impl<O> SessionMain<O> {
             return Err(SessionError::Invalid);
         }
         let previous = self.last_transport_protocol.load(Ordering::Acquire);
-        let expected = previous.checked_add(1).ok_or(SessionError::Invalid)?;
-        if protocol != expected {
-            return Err(SessionError::Invalid);
-        }
+        let protocol = previous.checked_add(1).ok_or(SessionError::Invalid)?;
         // SAFETY: registration is Main Thread work performed before worker
         // launch or while WorkerBarrier excludes readers.
         unsafe { &mut *self.session_tx_modes.get() }.push(tx_mode);

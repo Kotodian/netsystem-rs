@@ -9,19 +9,32 @@ hammer_component_macros::declare_plugin!(
     main_loop_exit_functions = [],
     worker_init_functions = [__INIT_FN_TCP_WORKER_INIT],
     graph_nodes = [
-        input::__TCP_WORKER_GRAPH_NODE_TCP_INPUT_NODE,
-        output::__TCP_WORKER_GRAPH_NODE_TCP_OUTPUT_NODE,
-        established::__TCP_WORKER_GRAPH_NODE_TCP_ESTABLISHED_NODE,
-        reset::__SERVICE_GRAPH_NODE_TCP_RESET_NODE,
-        listen::__TCP_WORKER_GRAPH_NODE_TCP_LISTEN_NODE,
-        rcv_process::__TCP_WORKER_GRAPH_NODE_TCP_RCV_PROCESS_NODE,
-        syn_sent::__TCP_WORKER_GRAPH_NODE_TCP_SYN_SENT_NODE,
+        input::__TCP_WORKER_GRAPH_NODE_TCP4_INPUT_NODE,
+        input::__TCP_WORKER_GRAPH_NODE_TCP6_INPUT_NODE,
+        drop::__TCP_WORKER_GRAPH_NODE_TCP4_DROP_NODE,
+        drop::__TCP_WORKER_GRAPH_NODE_TCP6_DROP_NODE,
+        output::__TCP_WORKER_GRAPH_NODE_TCP4_OUTPUT_NODE,
+        output::__TCP_WORKER_GRAPH_NODE_TCP6_OUTPUT_NODE,
+        established::__TCP_WORKER_GRAPH_NODE_TCP4_ESTABLISHED_NODE,
+        established::__TCP_WORKER_GRAPH_NODE_TCP6_ESTABLISHED_NODE,
+        reset::__SERVICE_GRAPH_NODE_TCP4_RESET_NODE,
+        reset::__SERVICE_GRAPH_NODE_TCP6_RESET_NODE,
+        listen::__TCP_WORKER_GRAPH_NODE_TCP4_LISTEN_NODE,
+        listen::__TCP_WORKER_GRAPH_NODE_TCP6_LISTEN_NODE,
+        rcv_process::__TCP_WORKER_GRAPH_NODE_TCP4_RCV_PROCESS_NODE,
+        rcv_process::__TCP_WORKER_GRAPH_NODE_TCP6_RCV_PROCESS_NODE,
+        syn_sent::__TCP_WORKER_GRAPH_NODE_TCP4_SYN_SENT_NODE,
+        syn_sent::__TCP_WORKER_GRAPH_NODE_TCP6_SYN_SENT_NODE,
     ],
     node_functions = [
-        output::__NODE_FUNCTION_TCP_OUTPUT_NODE_PROCESS_SIMD_SCALAR,
-        output::__NODE_FUNCTION_TCP_OUTPUT_NODE_PROCESS_SIMD_SIMD128,
-        output::__NODE_FUNCTION_TCP_OUTPUT_NODE_PROCESS_SIMD_SIMD256,
-        output::__NODE_FUNCTION_TCP_OUTPUT_NODE_PROCESS_SIMD_SIMD512,
+        output::__NODE_FUNCTION_TCP4_OUTPUT_NODE_PROCESS_SIMD_SCALAR,
+        output::__NODE_FUNCTION_TCP4_OUTPUT_NODE_PROCESS_SIMD_SIMD128,
+        output::__NODE_FUNCTION_TCP4_OUTPUT_NODE_PROCESS_SIMD_SIMD256,
+        output::__NODE_FUNCTION_TCP4_OUTPUT_NODE_PROCESS_SIMD_SIMD512,
+        output::__NODE_FUNCTION_TCP6_OUTPUT_NODE_PROCESS_SIMD_SCALAR,
+        output::__NODE_FUNCTION_TCP6_OUTPUT_NODE_PROCESS_SIMD_SIMD128,
+        output::__NODE_FUNCTION_TCP6_OUTPUT_NODE_PROCESS_SIMD_SIMD256,
+        output::__NODE_FUNCTION_TCP6_OUTPUT_NODE_PROCESS_SIMD_SIMD512,
     ],
     process_nodes = [],
 );
@@ -30,7 +43,7 @@ use std::cell::{RefCell, RefMut, UnsafeCell};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::sync::OnceLock;
 
-use hammer_core::data_plane::{BufferPacketCursor, NodeId, NodeState};
+use hammer_core::data_plane::{BufferPacketCursor, NodeId};
 use hammer_runtime::app::SessionHandle;
 use hammer_runtime::{
     DataPlaneMain, DataWorkerId, Node, NodeRuntime, RuntimeError, RuntimeResult,
@@ -52,13 +65,14 @@ use hammer_service::session::{
     SessionError, SessionHandle as ServiceSessionHandle, SessionQueueNext,
 };
 use hammer_service::transport::{
-    Transport, TransportMain, TransportOptions, TransportSendParams, TransportServiceType,
-    TransportTxMode, TransportVft, register_transport,
+    Transport, TransportMain, TransportOptions, TransportSendFlags, TransportSendParams,
+    TransportServiceType, TransportTxMode,
 };
 
 pub mod config;
 pub mod congestion;
 pub mod connection;
+mod drop;
 pub mod established;
 pub mod input;
 pub mod listen;
@@ -82,16 +96,16 @@ pub use connection::{
     TCP_INITIAL_RETRANSMIT_TIMEOUT, TCP_MAX_RETRANSMIT_TIMEOUT, TCP_MIN_RETRANSMIT_TIMEOUT,
     TcpConnection, TcpRetransmitTimeoutState,
 };
-pub use established::{TcpEstablishedNext, TcpEstablishedNode};
-pub use input::{TcpInputControlPlane, TcpInputNode, TcpInputTrace};
-pub use listen::{TcpListenNext, TcpListenNode};
-pub use output::{DEFAULT_TCP_OUTPUT_PAYLOAD_LEN, TcpOutputNext, TcpOutputNode};
+pub use established::{Tcp4EstablishedNode, Tcp6EstablishedNode, TcpEstablishedNext};
+pub use input::{Tcp4InputNode, Tcp6InputNode, TcpInputTrace};
+pub use listen::{Tcp4ListenNode, Tcp6ListenNode, TcpListenNext};
+pub use output::{DEFAULT_TCP_OUTPUT_PAYLOAD_LEN, Tcp4OutputNode, Tcp6OutputNode, TcpOutputNext};
 pub use policy::{TcpPolicy, active_tcp_policy, publish_tcp_policy, tcp_policy};
-pub use rcv_process::{TcpRcvProcessNext, TcpRcvProcessNode};
+pub use rcv_process::{Tcp4RcvProcessNode, Tcp6RcvProcessNode, TcpRcvProcessNext};
 pub use recovery::{TcpRecoveryAck, TcpRecoveryState};
-pub use reset::{TcpResetNext, TcpResetNode};
+pub use reset::{Tcp4ResetNode, Tcp6ResetNode, TcpResetNext};
 use segment::TcpSegment;
-pub use syn_sent::{TcpSynSentNext, TcpSynSentNode};
+pub use syn_sent::{Tcp4SynSentNode, Tcp6SynSentNode, TcpSynSentNext};
 
 pub use worker::TcpWorker;
 
@@ -111,88 +125,6 @@ enum TcpWorkerError {
     },
 }
 
-pub(crate) fn publish_tcp_connection(
-    sessions: &mut SessionWorker,
-    tcp: &mut TcpWorker,
-    session_id: u32,
-) -> RuntimeResult<()> {
-    let index = sessions
-        .transport_connection_index(session_id)
-        .ok_or(TcpNodeError::SessionMissing)?;
-    let (close, half_open) = {
-        let TcpWorker {
-            connections,
-            lookup,
-            ..
-        } = tcp;
-        let connection = connections.get(index).ok_or(TcpNodeError::SessionMissing)?;
-        (
-            lookup.publish_connection(session_id, connection),
-            connection.state() == TcpState::SynSent,
-        )
-    };
-    if half_open {
-        return Ok(());
-    }
-    let rollback = |sessions: &mut SessionWorker, tcp: &mut TcpWorker| {
-        tcp.lookup.forget_session(session_id);
-        tcp.lookup.forget_pending_open(session_id);
-        let session_cleanup = sessions.rollback_session_creation(session_id);
-        tcp.remove_connection(index);
-        match session_cleanup {
-            Err(error) => Err(error),
-            Ok(Some(rollback_index)) if rollback_index != index => {
-                Err(TcpNodeError::SessionMissing.into())
-            }
-            Ok(_) => Ok(()),
-        }
-    };
-    if close {
-        let initial = match sessions.connection_published(session_id) {
-            Ok(initial) => initial,
-            Err(error) => {
-                if let Err(cleanup_error) = rollback(sessions, tcp) {
-                    tracing::error!(
-                        ?session_id,
-                        %cleanup_error,
-                        "TCP connection publication rollback failed"
-                    );
-                }
-                return Err(error);
-            }
-        };
-        let close_reason = tcp.connection(index).and_then(TcpConnection::close_reason);
-        if initial {
-            let error = TcpError::ConnectionClosed.into();
-            if let Err(cleanup_error) = rollback(sessions, tcp) {
-                tracing::error!(
-                    ?session_id,
-                    %cleanup_error,
-                    "closed TCP connection publication rollback failed"
-                );
-            }
-            return Err(error);
-        }
-        if close_reason == Some(TcpCloseReason::RemoteReset) {
-            sessions.notify_transport_reset(session_id, index)?;
-        } else {
-            sessions.notify_transport_closed(session_id, index)?;
-        }
-        tcp.remove_connection(index);
-        sessions.notify_transport_deleted(session_id, index)?;
-    } else if let Err(error) = sessions.complete_stream_connect(session_id) {
-        if let Err(cleanup_error) = rollback(sessions, tcp) {
-            tracing::error!(
-                ?session_id,
-                %cleanup_error,
-                "App publication rollback failed"
-            );
-        }
-        return Err(error);
-    }
-    Ok(())
-}
-
 #[repr(C)]
 struct TcpWorkerSlot {
     cacheline0: CacheLineAlignMark,
@@ -210,8 +142,7 @@ impl TcpWorkerSlot {
 
 pub struct TcpMain {
     protocol: u8,
-    control: TcpInputControlPlane,
-    listener_control: listener_control::TcpListenerControlHandle,
+    listener_control: listener_control::TcpListenerControl,
     listeners: UnsafeCell<Pool<TcpConnection>>,
     workers: Box<[TcpWorkerSlot]>,
 }
@@ -223,8 +154,7 @@ unsafe impl Sync for TcpMain {}
 
 impl TcpMain {
     fn new(protocol: u8, worker_count: usize) -> Self {
-        let control = TcpInputControlPlane::new();
-        let listener_control = listener_control::TcpListenerControlHandle::new(control.clone());
+        let listener_control = listener_control::TcpListenerControl::new();
         let workers = (0..worker_count)
             .map(|worker| {
                 TcpWorkerSlot::new(TcpWorker::new(DataWorkerId::new(worker as u32), protocol))
@@ -233,7 +163,6 @@ impl TcpMain {
             .into_boxed_slice();
         Self {
             protocol,
-            control,
             listener_control,
             listeners: UnsafeCell::new(Pool::new()),
             workers,
@@ -250,10 +179,6 @@ impl TcpMain {
             })
             .map(|slot| slot.worker.borrow_mut())
             .map_err(RuntimeError::from)
-    }
-
-    pub fn control(&self) -> &TcpInputControlPlane {
-        &self.control
     }
 
     pub const fn protocol(&self) -> u8 {
@@ -476,20 +401,13 @@ impl Transport<IpTransportEndpointConfig> for TcpMain {
             let worker = unsafe { &mut *slot.worker.as_ptr() };
             let TcpWorker {
                 connections,
-                timers,
+                timer_wheel: timers,
                 ..
             } = worker;
             if let Some(connection) = connections.get_mut(connection_index) {
                 connection.on_session_close(connection_index, timers);
                 return;
             }
-        }
-        if self
-            .listener_control
-            .close_connection_index(connection_index)
-            .is_ok()
-        {
-            self.remove_listener_connection(connection_index);
         }
     }
 
@@ -509,13 +427,6 @@ impl Transport<IpTransportEndpointConfig> for TcpMain {
                 drop(worker.remove_connection(connection_index));
                 return;
             }
-        }
-        if self
-            .listener_control
-            .close_connection_index(connection_index)
-            .is_ok()
-        {
-            self.remove_listener_connection(connection_index);
         }
     }
 
@@ -539,18 +450,119 @@ impl Transport<IpTransportEndpointConfig> for TcpMain {
         }
     }
 
-    fn push_header(&self, _: u32, _: u32, _: &mut [u32], _: u32) -> u32 {
+    /// VPP: tcp_output.c:980-1035, `tcp_session_push_header`.
+    fn push_header(
+        &self,
+        connection_index: u32,
+        worker_index: u32,
+        buffers: &mut [u32],
+        _: u32,
+    ) -> u32 {
+        let thread_index = DataWorkerId::new(worker_index).thread_index();
+        let mut tcp = self
+            .worker(thread_index)
+            .expect("TCP header push runs on its owner Data Worker");
+        let TcpWorker {
+            connections,
+            lookup,
+            timer_wheel,
+            ..
+        } = &mut *tcp;
+        let connection = connections
+            .get_mut(connection_index)
+            .expect("Session Queue retains a live TCP connection while pushing headers");
+        let capabilities = lookup
+            .pending_open_capabilities(connection.session_id())
+            .unwrap_or_default();
+        let now = std::time::Instant::now();
+        let buffer_main = hammer_core::buffer::BufferMain::global();
+        for &index in buffers.iter() {
+            // SAFETY: Session Queue transfers each live TX Buffer to this
+            // transport operation and does not retain an overlapping borrow.
+            let buffer = unsafe { buffer_main.buffer_mut_for_worker(thread_index, index) };
+            let payload_len = buffer.current_len() + buffer.total_len_not_including_first();
+            let segment = connection
+                .tx_segment(payload_len, capabilities)
+                .expect("Session Queue pushes TCP headers only for a sendable connection");
+            segment
+                .write_to_buffer(buffer)
+                .expect("Session Queue supplies a Buffer with TCP header headroom");
+            let egress = hammer_core::buffer_opaque!(mut buffer => TcpSecondaryOpaque).egress_mut();
+            egress.connection_index = connection_index;
+            egress.worker_index = worker_index;
+            egress.fib_index = connection.base.endpoint.fib_index();
+            connection
+                .commit_payload_tx(payload_len, now)
+                .expect("validated TCP payload length commits after header construction");
+        }
+        if !buffers.is_empty() {
+            connection
+                .sync_payload_tx_timers(connection_index, timer_wheel, now)
+                .expect("TCP timer interval remains valid after payload transmission");
+        }
         0
     }
 
-    fn send_params(&self, _: u32, _: u32) -> TransportSendParams {
+    /// VPP: tcp.c:1170-1198, `tcp_session_send_params`.
+    fn send_params(&self, connection_index: u32, worker_index: u32) -> TransportSendParams {
+        let mut tcp = self
+            .worker(DataWorkerId::new(worker_index).thread_index())
+            .expect("TCP send-params runs on its owner Data Worker");
+        let TcpWorker {
+            connections,
+            lookup,
+            ..
+        } = &mut *tcp;
+        let connection = connections
+            .get_mut(connection_index)
+            .expect("Session Queue retains a live TCP connection while querying send space");
+        let _ = connection.refresh_path_mtu_from_cache();
+        let start = if connection.state() == TcpState::SynSent {
+            connection.iss()
+        } else {
+            connection.snd_una()
+        };
+        let tx_offset = TcpSeq::from(start).distance_to(connection.tx_payload_sequence());
+        let capabilities = lookup
+            .pending_open_capabilities(connection.session_id())
+            .unwrap_or_default();
+        let send_space = connection.tx_payload_budget(
+            u32::MAX as usize,
+            std::time::Instant::now(),
+            capabilities,
+        );
         TransportSendParams {
-            send_mss: u16::try_from(active_tcp_policy().mss).unwrap_or(u16::MAX),
+            send_space: u32::try_from(send_space).unwrap_or(u32::MAX),
+            tx_offset,
+            send_mss: u16::try_from(connection.send_goal_size()).unwrap_or(u16::MAX),
+            flags: TransportSendFlags {
+                deschedule: send_space == 0,
+                postpone: false,
+            },
             ..TransportSendParams::default()
         }
     }
 
-    fn update_time(&self, _: f64, _: u32) {}
+    /// VPP: tcp.c:1361-1369, `tcp_update_time`; tcp.h:76-122,
+    /// `tcp_worker_ctx_t.timer_wheel` and pending timer FIFO.
+    fn update_time(&self, now: f64, worker_index: u32) {
+        let mut tcp = self
+            .worker(DataWorkerId::new(worker_index).thread_index())
+            .expect("TCP update-time subscriber runs on its owner Data Worker");
+        assert!(
+            now.is_finite() && now >= 0.0,
+            "TCP worker time must be finite and nonnegative"
+        );
+        tcp.time_us = now;
+        tcp.time_tstamp = ((now * 1_000.0) as u64) as u32;
+        let origin_seconds = *tcp.time_origin_seconds.get_or_insert(now);
+        let elapsed = (now - origin_seconds).max(0.0);
+        let now = tcp
+            .time_origin
+            .checked_add(std::time::Duration::from_secs_f64(elapsed))
+            .expect("TCP worker monotonic time remains representable");
+        tcp.advance_timer_wheel(now);
+    }
 
     fn flush_data(&self, _: u32, _: u32) {}
 
@@ -744,7 +756,15 @@ fn start_connect(
         .connection_mut(connection_index)
         .ok_or(TcpNodeError::SessionMissing)?;
     connection.attach_session(session_id)?;
-    publish_tcp_connection(sessions, tcp, session_id)?;
+    let TcpWorker {
+        connections,
+        lookup,
+        ..
+    } = tcp;
+    let connection = connections
+        .get(connection_index)
+        .ok_or(TcpNodeError::SessionMissing)?;
+    assert!(!lookup.publish_connection(session_id, connection));
     sessions.mark_ready(session_id);
     Ok(())
 }
@@ -773,43 +793,20 @@ fn init_tcp() -> RuntimeResult<()> {
         TCP_MAIN.get().is_none(),
         "TCP initialization callback executes once"
     );
-    let protocol = register_transport(TransportVft::new(
-        Some(start_listen),
-        Some(stop_listen),
-        Some(connect),
-        None,
-        None,
-        None,
-        None,
-        None,
-    ))
-    .map_err(RuntimeError::from)?;
-    IpSessionMain::global()
+    let protocol = IpSessionMain::global()
         .map_err(|source| TcpWorkerError::SessionTransportRegistration { source })?
-        .register_transport_type(protocol, TransportTxMode::Peek, u32::MAX)
+        .register_transport_type(TransportTxMode::Peek, u32::MAX)
         .map_err(|source| TcpWorkerError::SessionTransportRegistration { source })?;
     let config = TCP_CONFIG
         .get()
         .expect("TCP configuration is installed before initialization");
-    let main = configured_tcp_main(
-        config,
-        protocol,
-        hammer_runtime::config::worker::worker_count(),
-    )?;
+    publish_tcp_policy(TcpPolicy::from_plugin_config(config));
+    let main = TcpMain::new(protocol, hammer_runtime::config::worker::worker_count());
     assert!(
         TCP_MAIN.set(main).is_ok(),
         "TCP initialization callback executes once"
     );
     Ok(())
-}
-
-fn configured_tcp_main(
-    tcp: &crate::config::TcpPluginConfig,
-    protocol: u8,
-    worker_count: usize,
-) -> RuntimeResult<TcpMain> {
-    publish_tcp_policy(TcpPolicy::from_plugin_config(tcp));
-    Ok(TcpMain::new(protocol, worker_count))
 }
 
 fn listener_capabilities() -> TcpCapabilities {
@@ -829,91 +826,77 @@ fn listener_capabilities() -> TcpCapabilities {
     }
 }
 
-pub fn register_tcp_input(runtime: &DataPlaneMain) -> RuntimeResult<NodeId> {
-    let main = TCP_MAIN
-        .get()
-        .ok_or(RuntimeError::PluginStateNotInitialized { plugin: "tcp" })?;
-    let node = if let Some(node) = runtime.nodes().node_by_name("tcp-input") {
+pub fn register_tcp4_input(runtime: &DataPlaneMain) -> RuntimeResult<NodeId> {
+    let node = if let Some(node) = runtime.nodes().node_by_name("tcp4-input") {
         node
     } else {
         runtime.nodes().try_register_internal_with_next_names(
-            main.control().node(None),
+            Tcp4InputNode::new(),
             &TcpInputNext::NEXT_NAMES,
         )?
     };
     hammer_plugin_ip::register_ip4_protocol(runtime.nodes(), 6, node)?;
+    Ok(node)
+}
+
+pub fn register_tcp6_input(runtime: &DataPlaneMain) -> RuntimeResult<NodeId> {
+    let node = if let Some(node) = runtime.nodes().node_by_name("tcp6-input") {
+        node
+    } else {
+        runtime.nodes().try_register_internal_with_next_names(
+            Tcp6InputNode::new(),
+            &[
+                "tcp6-drop",
+                "ip6-punt",
+                "tcp6-listen",
+                "tcp6-rcv-process",
+                "tcp6-syn-sent",
+                "tcp6-established",
+                "tcp6-reset",
+            ],
+        )?
+    };
     hammer_plugin_ip::register_ip6_protocol(runtime.nodes(), 6, node)?;
     Ok(node)
 }
 
 fn bind_worker_graph(engine: &mut DataPlaneMain) -> RuntimeResult<()> {
-    let worker = engine.data_worker_id()?;
     let session_queue =
         engine
             .node_by_name("session-queue")
             .ok_or(TcpWorkerError::NodeMissing {
                 name: "session-queue",
             })?;
-    let tcp_output =
+    let tcp4_output =
         engine
-            .node_by_name(TcpOutputNode::NODE_NAME)
+            .node_by_name(Tcp4OutputNode::NODE_NAME)
             .ok_or(TcpWorkerError::NodeMissing {
-                name: TcpOutputNode::NODE_NAME,
+                name: Tcp4OutputNode::NODE_NAME,
             })?;
-    let tcp_input = engine
-        .node_by_name("tcp-input")
-        .ok_or_else(|| TcpWorkerError::NodeMissing { name: "tcp-input" })?;
-    let tcp_listen = engine
-        .node_by_name("tcp-listen")
-        .ok_or_else(|| TcpWorkerError::NodeMissing { name: "tcp-listen" })?;
-    let tcp_established =
+    let tcp6_output =
         engine
-            .node_by_name("tcp-established")
+            .node_by_name(Tcp6OutputNode::NODE_NAME)
             .ok_or(TcpWorkerError::NodeMissing {
-                name: "tcp-established",
-            })?;
-    let tcp_rcv_process =
-        engine
-            .node_by_name("tcp-rcv-process")
-            .ok_or(TcpWorkerError::NodeMissing {
-                name: "tcp-rcv-process",
-            })?;
-    let tcp_syn_sent =
-        engine
-            .node_by_name("tcp-syn-sent")
-            .ok_or_else(|| TcpWorkerError::NodeMissing {
-                name: "tcp-syn-sent",
+                name: Tcp6OutputNode::NODE_NAME,
             })?;
 
     let session_queue_data = engine.nodes().node_runtime_data(session_queue)?;
-    let session_queue_output =
-        SessionQueueNode::existing_output_next(engine, session_queue, tcp_output)?;
+    let session_queue_output4 =
+        SessionQueueNode::existing_output_next(engine, session_queue, tcp4_output)?;
+    let session_queue_output6 =
+        SessionQueueNode::existing_output_next(engine, session_queue, tcp6_output)?;
     SessionQueueNode::install_worker_attachment(
         engine,
         session_queue_data,
-        session_queue_output,
+        session_queue_output4,
         tcp_session_queue_update_time,
         tcp_session_queue_dispatch,
     )?;
     let main = TCP_MAIN
         .get()
         .ok_or(RuntimeError::PluginStateNotInitialized { plugin: "tcp" })?;
-    let input_data = main.control().node(Some(worker)).node_runtime_data()?;
-    let listen_data = TcpListenNode::new().node_runtime_data()?;
-    let established_data = TcpEstablishedNode::new().node_runtime_data()?;
-    let rcv_process_data = TcpRcvProcessNode::new().node_runtime_data()?;
-    let syn_sent_data = TcpSynSentNode::new().node_runtime_data()?;
-
-    // A worker graph clone can retain the old polling state. Keep the node
-    // dormant until its replacement SessionWorker owns a live readiness file.
-    engine
-        .nodes()
-        .set_node_state(session_queue, NodeState::Disabled)?;
-    engine.set_worker_node_runtime_data(tcp_input, input_data)?;
-    engine.set_worker_node_runtime_data(tcp_listen, listen_data)?;
-    engine.set_worker_node_runtime_data(tcp_established, established_data)?;
-    engine.set_worker_node_runtime_data(tcp_rcv_process, rcv_process_data)?;
-    engine.set_worker_node_runtime_data(tcp_syn_sent, syn_sent_data)?;
+    let mut tcp = main.worker(engine.thread_index())?;
+    tcp.tco_next_node = [session_queue_output4, session_queue_output6];
 
     Ok(())
 }
@@ -1069,55 +1052,6 @@ impl From<TcpNodeError> for RuntimeError {
     }
 }
 
-#[hammer_component_macros::runtime_error(subsystem = "tcp")]
-#[derive(Debug, Error, Clone, Copy, PartialEq, Eq)]
-#[repr(u16)]
-pub enum TcpOutputError {
-    #[error("not a TCP header")]
-    NoTcpHeader,
-    #[error("missing TCP egress endpoints")]
-    MissingEgressEndpoints,
-    #[error("unsupported TCP egress address family")]
-    UnsupportedEgress,
-    #[error("TCP segment is too long for its IP packet")]
-    SegmentTooLong,
-}
-
-impl hammer_runtime::node::NodeErrorCode for TcpOutputError {
-    #[inline(always)]
-    fn local_code(self) -> u16 {
-        self as u16
-    }
-}
-
-impl TcpOutputError {
-    #[inline(always)]
-    pub const fn code(self) -> u16 {
-        self as u16
-    }
-}
-
-#[derive(Debug, Error, Clone, Copy, PartialEq, Eq)]
-#[repr(u16)]
-pub enum TcpResetError {
-    #[error("bad TCP header")]
-    BadTcpHeader,
-}
-
-impl hammer_runtime::node::NodeErrorCode for TcpResetError {
-    #[inline(always)]
-    fn local_code(self) -> u16 {
-        self as u16
-    }
-}
-
-impl TcpResetError {
-    #[inline(always)]
-    pub const fn code(self) -> u16 {
-        self as u16
-    }
-}
-
 #[hammer_component_macros::buffer_opaque(secondary)]
 #[derive(Clone, Copy)]
 #[repr(C)]
@@ -1157,7 +1091,10 @@ struct TcpEgressOpaque {
     pad: [u8; 3],
     local: [u8; 16],
     remote: [u8; 16],
-    reserved: [u8; 16],
+    connection_index: u32,
+    worker_index: u32,
+    fib_index: u32,
+    reserved: [u8; 4],
 }
 
 const _: () = assert!(std::mem::size_of::<TcpEgressOpaque>() == 56);
@@ -1187,7 +1124,10 @@ pub(crate) fn write_tcp_egress_endpoints(
         pad: [0; 3],
         local: local_bytes,
         remote: remote_bytes,
-        reserved: [0; 16],
+        connection_index: u32::MAX,
+        worker_index: u32::MAX,
+        fib_index: u32::MAX,
+        reserved: [0; 4],
     };
 }
 
@@ -1311,14 +1251,15 @@ pub fn tcp_control_cursor(packet: &[u8]) -> Result<BufferPacketCursor, TcpContro
 
 fn enqueue_tcp_segment(
     runtime: &mut DataPlaneMain,
-    frame: &mut hammer_core::data_plane::Frame,
+    _: &mut hammer_core::data_plane::Frame,
     output_next: SessionQueueNext,
-    output: &mut SessionQueueOutput,
+    _: &mut SessionQueueOutput,
+    connection_index: u32,
     segment: TcpSegment,
 ) -> RuntimeResult<()> {
-    if output.remaining_io_budget() == 0 {
-        return Ok(());
-    }
+    let session_main = hammer_service::session::SessionMain::global()?;
+    // SAFETY: TCP output runs on the Data Worker's owning runtime thread.
+    let worker = unsafe { session_main.worker_mut(runtime) }?;
     let mut index = 0;
     if runtime.buffer_alloc(core::slice::from_mut(&mut index)) != 1 {
         return Err(hammer_core::error::DataPlaneError::from(
@@ -1326,25 +1267,34 @@ fn enqueue_tcp_segment(
         )
         .into());
     }
-    segment.write_to_buffer(&mut *runtime.buffer_mut(index))?;
-    let _ = output.try_enqueue_io(frame, output_next, index)?;
+    if let Err(source) = segment.write_to_buffer(&mut *runtime.buffer_mut(index)) {
+        runtime.buffer_free_one(index);
+        return Err(source);
+    }
+    let worker_index = runtime.data_worker_id()?.slot() as u32;
+    let egress = hammer_core::buffer_opaque!(mut runtime.buffer_mut(index) => TcpSecondaryOpaque)
+        .egress_mut();
+    egress.connection_index = connection_index;
+    egress.worker_index = worker_index;
+    worker.add_pending_tx_buffer(runtime, index, output_next);
     Ok(())
 }
 
 #[hammer_component_macros::node_next]
 pub enum TcpInputNext {
+    #[next("tcp4-drop")]
     Drop,
-    #[next("drop")]
+    #[next("ip4-punt")]
     Punt,
-    #[next("tcp-listen")]
+    #[next("tcp4-listen")]
     Listen,
-    #[next("tcp-rcv-process")]
+    #[next("tcp4-rcv-process")]
     RcvProcess,
-    #[next("tcp-syn-sent")]
+    #[next("tcp4-syn-sent")]
     SynSent,
-    #[next("tcp-established")]
+    #[next("tcp4-established")]
     Established,
-    #[next("tcp-reset")]
+    #[next("tcp4-reset")]
     Reset,
 }
 

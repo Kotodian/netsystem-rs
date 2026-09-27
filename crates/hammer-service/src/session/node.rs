@@ -504,13 +504,11 @@ fn session_queue_node_process(
         let now = Instant::now();
         let mut output = SessionQueueOutput::default();
         let ptr = data.word(0) as usize as *const SessionMain;
-        if ptr.is_null() {
-            return ();
-        }
-        // SAFETY: worker NodeRuntime is installed by the owning Data Worker and
-        // points at the process-global SessionMain for its lifetime.
-        let main = unsafe { &*ptr };
-        'dispatch: {
+        if !ptr.is_null() {
+            // SAFETY: worker NodeRuntime is installed by the owning Data Worker
+            // and points at the process-global legacy SessionMain for its lifetime.
+            let main = unsafe { &*ptr };
+            'dispatch: {
             // SAFETY: this Node executes on the DataPlaneMain's owning runtime thread.
             let Ok(mut sessions) = (unsafe { main.worker(runtime.thread_index()) }) else {
                 break 'dispatch;
@@ -555,9 +553,16 @@ fn session_queue_node_process(
             if sessions.update_state(runtime, output.io_count()).is_err() {
                 break 'dispatch;
             }
+            }
         }
         output.flush(runtime, data, frame);
-        ()
-    })();
-    frame.len()
+        let dispatched = frame.len();
+        // VPP: session_node.c:2148-2154. TCP control/retransmit buffers
+        // already carry the Session Queue local next selected by transport.
+        let session_main = core::SessionMain::global()
+            .expect("Session Main initializes before session-queue executes");
+        let session_worker = unsafe { session_main.worker_mut(runtime) }
+            .expect("session-queue executes on its owning Data Worker");
+        dispatched + session_worker.flush_pending_tx_buffers(runtime, data, frame)
+    })()
 }

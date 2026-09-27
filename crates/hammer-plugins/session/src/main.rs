@@ -3,7 +3,9 @@ use std::sync::OnceLock;
 
 use hammer_infra::svm::fifo::Fifo as SvmFifo;
 use hammer_runtime::DataPlaneMain;
-use hammer_service::session::app::{ApplicationError, ApplicationMain};
+use hammer_service::session::app::{
+    ApplicationError, ApplicationEventResult, ApplicationMain,
+};
 use hammer_service::session::{
     SessionEndpoint, SessionError, SessionHandle, SessionLookup, SessionMain, SessionState,
 };
@@ -307,6 +309,52 @@ impl IpSessionMain {
         Ok(session)
     }
 
+    /// VPP: `session_stream_accept`, session.c:1213-1244. Session owns the
+    /// accepted Session/FIFO pair; the caller retains its transport child.
+    pub unsafe fn accept(
+        &self,
+        runtime: &mut DataPlaneMain,
+        listener: SessionHandle,
+        connection_index: u32,
+        protocol: u8,
+    ) -> Result<Option<SessionHandle>, SessionError> {
+        let application = ApplicationMain::global()
+            .expect("Application Main initializes before TCP accepts Sessions");
+        let app_listener = application
+            .listener_for_session(self.session, listener)
+            .ok_or(SessionError::NotListening)?;
+        // SAFETY: the caller executes on the Session's owning Data Worker.
+        let worker = unsafe { self.session.worker_mut(runtime)? };
+        let session = worker.allocate_accepted(listener, connection_index, protocol, 0);
+        match application.init_accepted(runtime, worker, app_listener, session) {
+            Ok(ApplicationEventResult::Queued) => {
+                worker.store_state(session, SessionState::Accepting)?;
+                Ok(Some(session))
+            }
+            Ok(
+                ApplicationEventResult::Deferred
+                | ApplicationEventResult::QueueFull
+                | ApplicationEventResult::LockUnavailable,
+            ) => {
+                worker.cleanup(session).expect("unpublished accepted Session remains allocated");
+                Ok(None)
+            }
+            Err(source) => {
+                worker.cleanup(session).expect("failed accepted Session remains allocated");
+                Err(match source {
+                    ApplicationError::SegmentCreate { source } => SessionError::SegmentCreate { source },
+                    ApplicationError::SegmentNoSpace => SessionError::SegmentNoSpace,
+                    ApplicationError::NoAcceptingWorker
+                    | ApplicationError::InvalidApplicationWorker { .. }
+                    | ApplicationError::WorkerMissing { .. } => SessionError::InvalidApplicationWorker,
+                    ApplicationError::NoListener { .. } => SessionError::NotListening,
+                    ApplicationError::MessageAllocation { source } => SessionError::MessageQueueAllocation { source },
+                    source => panic!("validated accepted Session rejected by Application: {source}"),
+                })
+            }
+        }
+    }
+
     /// Builds a listening request using the Application Namespace's IP binding.
     /// VPP: application.c:1232-1269, `session_endpoint_update_for_app`.
     pub fn listen_endpoint_config(
@@ -372,12 +420,11 @@ impl IpSessionMain {
 
     pub fn register_transport_type(
         &self,
-        protocol: u8,
         tx_mode: TransportTxMode,
         output_next: u32,
     ) -> Result<u8, SessionError> {
         self.session
-            .register_transport_type(protocol, tx_mode, output_next)
+            .register_transport_type(tx_mode, output_next)
     }
 
     /// # Safety
@@ -412,35 +459,26 @@ impl IpSessionMain {
 
     /// # Safety
     /// The runtime must exclusively own the session's worker slot.
+    pub unsafe fn notify_closing(
+        &self,
+        runtime: &mut DataPlaneMain,
+        session: SessionHandle,
+        connection_index: u32,
+    ) -> Result<(), SessionError> {
+        (unsafe { self.session.worker_mut(runtime)? })
+            .transport_closing(runtime, session, connection_index)
+    }
+
+    /// # Safety
+    /// The runtime must exclusively own the session's worker slot.
     pub unsafe fn notify_closed(
         &self,
         runtime: &mut DataPlaneMain,
         session: SessionHandle,
         connection_index: u32,
     ) -> Result<(), SessionError> {
-        let Some(entry) = (unsafe { self.session.worker_mut(runtime)? })
-            .session(session.session_index)
-        else {
-            return Err(SessionError::NoSession);
-        };
-        if entry.handle() != session || entry.connection_index() != connection_index {
-            return Err(SessionError::NoSession);
-        }
-        match entry.load_state() {
-            SessionState::Created
-            | SessionState::Listening
-            | SessionState::Connecting
-            | SessionState::Accepting
-            | SessionState::Ready
-            | SessionState::Opened
-            | SessionState::TransportClosing
-            | SessionState::Closing => entry.store_state(SessionState::TransportClosed),
-            SessionState::AppClosed => entry.store_state(SessionState::Closed),
-            SessionState::TransportClosed
-            | SessionState::Closed
-            | SessionState::TransportDeleted => {}
-        }
-        Ok(())
+        (unsafe { self.session.worker_mut(runtime)? })
+            .transport_closed(runtime, session, connection_index)
     }
 
     /// # Safety
@@ -451,26 +489,8 @@ impl IpSessionMain {
         session: SessionHandle,
         connection_index: u32,
     ) -> Result<(), SessionError> {
-        let Some(entry) = (unsafe { self.session.worker_mut(runtime)? })
-            .session(session.session_index)
-        else {
-            return Err(SessionError::NoSession);
-        };
-        if entry.handle() != session || entry.connection_index() != connection_index {
-            return Err(SessionError::NoSession);
-        }
-        if matches!(
-            entry.load_state(),
-            SessionState::Created
-                | SessionState::Listening
-                | SessionState::Connecting
-                | SessionState::Accepting
-                | SessionState::Ready
-                | SessionState::Opened
-        ) {
-            entry.store_state(SessionState::TransportClosing);
-        }
-        Ok(())
+        (unsafe { self.session.worker_mut(runtime)? })
+            .transport_reset(runtime, session, connection_index)
     }
 
     /// # Safety

@@ -19,7 +19,7 @@ use hammer_runtime::config::worker::worker_count;
 
 use super::core::{
     SessionControlData, SessionEvent, SessionEventRecord, SessionEventType, SessionHandle,
-    SessionWorker,
+    SessionState, SessionWorker,
 };
 use super::error::SessionError;
 use super::segment_manager::{
@@ -600,14 +600,57 @@ impl<'segment> AppWorker<'segment> {
                     }
                     SessionEventType::Accepted => {
                         if valid_session {
+                            let state = session_worker
+                                .session(event.session.session_index)
+                                .expect("validated accepted Session remains allocated")
+                                .load_state();
                             if (application.accepted)(session_worker, event.session).is_err() {
                                 if let Some(session) =
                                     session_worker.session_mut(event.session.session_index)
                                 {
                                     session.detach_application();
                                 }
-                            } else if let Some(session) =
-                                session_worker.session_mut(event.session.session_index)
+                            } else if matches!(
+                                state,
+                                SessionState::TransportClosing
+                                    | SessionState::Closing
+                                    | SessionState::AppClosed
+                                    | SessionState::TransportClosed
+                                    | SessionState::Closed
+                                    | SessionState::TransportDeleted
+                            ) {
+                                // VPP: session_input.c:157-195. The accept callback
+                                // may have set Ready after transport close began.
+                                let session = session_worker
+                                    .session_mut(event.session.session_index)
+                                    .expect("accepted Session remains allocated after callback");
+                                let app_closed = matches!(
+                                    state,
+                                    SessionState::AppClosed
+                                        | SessionState::Closed
+                                        | SessionState::TransportDeleted
+                                ) || matches!(
+                                    session.load_state(),
+                                    SessionState::AppClosed
+                                        | SessionState::Closed
+                                        | SessionState::TransportDeleted
+                                );
+                                if !app_closed {
+                                    session.store_state(state);
+                                }
+                                let rx_pending = session
+                                    .rx_fifo()
+                                    .is_some_and(|fifo| fifo.max_dequeue() != 0);
+                                if rx_pending {
+                                    if let Some(callback) = application.builtin_rx {
+                                        callback(session_worker, event.session);
+                                    }
+                                }
+                                if !app_closed {
+                                    (application.disconnected)(session_worker, event.session);
+                                }
+                            } else if let Some(session) = session_worker
+                                .session_mut(event.session.session_index)
                             {
                                 session.set_rx_ready(true);
                             }

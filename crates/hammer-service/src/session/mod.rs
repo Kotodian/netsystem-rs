@@ -170,12 +170,13 @@ fn init_session_worker(engine: &mut DataPlaneMain) -> RuntimeResult<()> {
             NodeState::Disabled
         },
     )?;
-    unsafe { session_main.worker_mut(engine) }
-        .expect("session worker graph setup runs on a configured Data Worker")
-        .install_input_node(session_input);
+    let worker = unsafe { session_main.worker_mut(engine) }
+        .expect("session worker graph setup runs on a configured Data Worker");
+    worker.install_input_node(session_input);
     let session_queue = engine
         .node_by_name("session-queue")
         .ok_or(error::SessionQueueError::NodeMissing)?;
+    worker.install_queue_node(session_queue);
     engine.nodes().set_node_state(
         session_queue,
         if enabled {

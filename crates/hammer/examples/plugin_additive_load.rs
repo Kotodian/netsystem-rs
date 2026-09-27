@@ -160,7 +160,13 @@ fn run_example(
             actual: loaded_plugins,
         });
     }
-    for name in ["ip4-input", "ip6-input", "tcp-input", "udp-input"] {
+    for name in [
+        "ip4-input",
+        "ip6-input",
+        "tcp4-input",
+        "tcp6-input",
+        "udp-input",
+    ] {
         if main.node_by_name(name).is_none() {
             return Err(ExampleError::PluginNodeMissing { name });
         }

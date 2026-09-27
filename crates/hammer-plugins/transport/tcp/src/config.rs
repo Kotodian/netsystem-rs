@@ -63,6 +63,11 @@ impl Default for TcpPluginConfig {
 
 impl TcpPluginConfig {
     pub fn validate(&self) -> RuntimeResult<()> {
+        if self.congestion != CongestionAlgorithm::Bbr {
+            return Err(RuntimeError::config_validation(
+                "plugin.tcp.congestion must be bbr",
+            ));
+        }
         if self.mss == 0 {
             return Err(RuntimeError::config_validation(
                 "plugin.tcp.mss must be non-zero",

@@ -6,7 +6,7 @@ use hammer_runtime::RuntimeResult;
 use hammer_runtime::{DataPlaneMain, Node, NodeProcessFn, NodeRuntime};
 use hammer_service::session::node::SessionQueueNode;
 
-use super::{TcpOutputError, read_tcp_egress_endpoints};
+use super::{TCP_EGRESS_TAG, TCP_MAIN, TcpError, read_tcp_egress_endpoints};
 use hammer_service::opaque::NetworkOpaque;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use zerocopy::FromBytes;
@@ -17,27 +17,36 @@ const TCP_PROTOCOL: u8 = 6;
 pub enum TcpOutputNext {
     Drop,
     #[next("ip4-lookup")]
-    LookupV4,
-    #[next("ip6-lookup")]
-    LookupV6,
+    Lookup,
 }
 
 #[hammer_component_macros::graph_node(
     graph = tcp_worker,
-    init = crate::output::register_tcp_output,
+    init = crate::output::register_tcp4_output,
     next = TcpOutputNext,
     role = internal,
+    name = "tcp4-output",
 )]
 #[derive(Clone, Copy)]
-pub struct TcpOutputNode;
+pub struct Tcp4OutputNode;
 
-pub fn register_tcp_output(runtime: &DataPlaneMain) -> RuntimeResult<NodeId> {
-    if let Some(node) = runtime.nodes().node_by_name(TcpOutputNode::NODE_NAME) {
+#[hammer_component_macros::graph_node(
+    graph = tcp_worker,
+    init = crate::output::register_tcp6_output,
+    next = TcpOutputNext,
+    role = internal,
+    name = "tcp6-output",
+)]
+#[derive(Clone, Copy)]
+pub struct Tcp6OutputNode;
+
+pub fn register_tcp4_output(runtime: &DataPlaneMain) -> RuntimeResult<NodeId> {
+    if let Some(node) = runtime.nodes().node_by_name(Tcp4OutputNode::NODE_NAME) {
         return Ok(node);
     }
     let node = runtime
         .nodes()
-        .try_register_internal_with_next_names(TcpOutputNode::new(), &TcpOutputNext::NEXT_NAMES)?;
+        .try_register_internal_with_next_names(Tcp4OutputNode::new(), &TcpOutputNext::NEXT_NAMES)?;
     let session_queue = runtime
         .nodes()
         .node_by_name("session-queue")
@@ -49,14 +58,32 @@ pub fn register_tcp_output(runtime: &DataPlaneMain) -> RuntimeResult<NodeId> {
     Ok(node)
 }
 
-impl Node for TcpOutputNode {
+pub fn register_tcp6_output(runtime: &DataPlaneMain) -> RuntimeResult<NodeId> {
+    if let Some(node) = runtime.nodes().node_by_name(Tcp6OutputNode::NODE_NAME) {
+        return Ok(node);
+    }
+    let node = runtime
+        .nodes()
+        .try_register_internal_with_next_names(Tcp6OutputNode::new(), &["drop", "ip6-lookup"])?;
+    let session_queue = runtime
+        .nodes()
+        .node_by_name("session-queue")
+        .expect("Session Queue Graph Node must be registered before TCP output");
+    SessionQueueNode::compile_output_next(runtime, session_queue, node)?;
+    runtime
+        .nodes()
+        .set_node_state(session_queue, NodeState::Disabled)?;
+    Ok(node)
+}
+
+impl Node for Tcp4OutputNode {
     #[inline(always)]
     fn process(
         runtime: &mut DataPlaneMain,
         node_runtime: &mut hammer_runtime::NodeRuntime,
         frame: &mut Frame,
     ) -> usize {
-        let process: NodeProcessFn = tcp_output_node_process;
+        let process: NodeProcessFn = tcp_output_node_process::<true>;
         process(runtime, node_runtime, frame)
     }
 
@@ -66,98 +93,159 @@ impl Node for TcpOutputNode {
     }
 }
 
-fn tcp_output_node_process(
+impl Node for Tcp6OutputNode {
+    #[inline(always)]
+    fn process(
+        runtime: &mut DataPlaneMain,
+        node_runtime: &mut hammer_runtime::NodeRuntime,
+        frame: &mut Frame,
+    ) -> usize {
+        let process: NodeProcessFn = tcp_output_node_process::<false>;
+        process(runtime, node_runtime, frame)
+    }
+}
+
+fn tcp_output_node_process<const IS_IP4: bool>(
     runtime: &mut DataPlaneMain,
     node_runtime: &mut NodeRuntime,
     frame: &mut Frame,
 ) -> usize {
     let processed_vectors = frame.len();
-    tcp_output_node_process_frame::<1>(runtime, node_runtime, frame);
+    tcp_output_node_process_frame::<1, IS_IP4>(runtime, node_runtime, frame);
     processed_vectors
 }
 
-#[hammer_component_macros::node_function(node = TcpOutputNode)]
-fn tcp_output_node_process_simd<const SIMD_BYTES: usize>(
+#[hammer_component_macros::node_function(node = Tcp4OutputNode)]
+fn tcp4_output_node_process_simd<const SIMD_BYTES: usize>(
     runtime: &mut DataPlaneMain,
     node_runtime: &mut NodeRuntime,
     frame: &mut Frame,
 ) -> usize {
     let processed_vectors = frame.len();
-    tcp_output_node_process_frame::<SIMD_BYTES>(runtime, node_runtime, frame);
+    tcp_output_node_process_frame::<SIMD_BYTES, true>(runtime, node_runtime, frame);
     processed_vectors
 }
 
-fn tcp_output_node_process_frame<const SIMD_BYTES: usize>(
+#[hammer_component_macros::node_function(node = Tcp6OutputNode)]
+fn tcp6_output_node_process_simd<const SIMD_BYTES: usize>(
+    runtime: &mut DataPlaneMain,
+    node_runtime: &mut NodeRuntime,
+    frame: &mut Frame,
+) -> usize {
+    let processed_vectors = frame.len();
+    tcp_output_node_process_frame::<SIMD_BYTES, false>(runtime, node_runtime, frame);
+    processed_vectors
+}
+
+fn tcp_output_node_process_frame<const SIMD_BYTES: usize, const IS_IP4: bool>(
     runtime: &mut DataPlaneMain,
     node_runtime: &mut hammer_runtime::NodeRuntime,
     frame: &mut Frame,
 ) -> () {
     hammer_runtime::process_frame!(runtime, node_runtime, frame, |index| {
-        tcp_output_next_for_index::<SIMD_BYTES>(runtime, index).unwrap_or(TcpOutputNext::Drop)
+        tcp_output_next_for_index::<SIMD_BYTES, IS_IP4>(runtime, index)
+            .unwrap_or(TcpOutputNext::Drop)
     })
 }
 
-fn tcp_output_next_for_index<const SIMD_BYTES: usize>(
+fn tcp_output_next_for_index<const SIMD_BYTES: usize, const IS_IP4: bool>(
     runtime: &mut DataPlaneMain,
     index: u32,
 ) -> RuntimeResult<TcpOutputNext> {
     let buffer = runtime.buffer(index);
     let header = buffer.current();
     if tcp_header(header).is_err() {
-        let _ = runtime.record_current_node_error(TcpOutputError::NoTcpHeader);
+        let _ = runtime.record_current_node_error(TcpError::Length);
         return Ok(TcpOutputNext::Drop);
     }
     let tcp_len = buffer
         .current_len()
         .checked_add(buffer.total_len_not_including_first());
-    let endpoints = read_tcp_egress_endpoints(
-        hammer_core::buffer_opaque!(buffer => crate::TcpSecondaryOpaque).egress(),
-    );
+    let egress = *hammer_core::buffer_opaque!(buffer => crate::TcpSecondaryOpaque).egress();
 
     let Some(tcp_len) = tcp_len else {
-        let _ = runtime.record_current_node_error(TcpOutputError::SegmentTooLong);
+        let _ = runtime.record_current_node_error(TcpError::Length);
         return Ok(TcpOutputNext::Drop);
     };
 
-    let Some((local, remote)) = endpoints else {
-        let _ = runtime.record_current_node_error(TcpOutputError::MissingEgressEndpoints);
+    if egress.tag != TCP_EGRESS_TAG {
+        let _ = runtime.record_current_node_error(TcpError::InvalidConnection);
         return Ok(TcpOutputNext::Drop);
+    }
+
+    // VPP: tcp_output.c:2305-2401. Normal packets carry the owner-worker
+    // connection index; only stateless early control packets use endpoint facts.
+    let (local, remote, fib_index) = if egress.connection_index != u32::MAX {
+        let worker_index = runtime.data_worker_id()?.slot() as u32;
+        if egress.worker_index != worker_index {
+            let _ = runtime.record_current_node_error(TcpError::InvalidConnection);
+            return Ok(TcpOutputNext::Drop);
+        }
+        let main = TCP_MAIN
+            .get()
+            .expect("TCP output Node runs after TCP Main initialization");
+        let tcp = main.worker(runtime.thread_index())?;
+        let Some(connection) = tcp.connection(egress.connection_index) else {
+            let _ = runtime.record_current_node_error(TcpError::InvalidConnection);
+            return Ok(TcpOutputNext::Drop);
+        };
+        let Some(local) = connection.local() else {
+            let _ = runtime.record_current_node_error(TcpError::InvalidConnection);
+            return Ok(TcpOutputNext::Drop);
+        };
+        (
+            local.ip(),
+            connection.remote().ip(),
+            connection.base.endpoint.fib_index(),
+        )
+    } else {
+        let Some((local, remote)) = read_tcp_egress_endpoints(&egress) else {
+            let _ = runtime.record_current_node_error(TcpError::InvalidConnection);
+            return Ok(TcpOutputNext::Drop);
+        };
+        let fib_index = if egress.fib_index == u32::MAX {
+            0
+        } else {
+            egress.fib_index
+        };
+        (local, remote, fib_index)
     };
 
     match (local, remote) {
-        (IpAddr::V4(src), IpAddr::V4(dst)) => {
+        (IpAddr::V4(src), IpAddr::V4(dst)) if IS_IP4 => {
             let Some(total_len) = tcp_len
                 .checked_add(20)
                 .and_then(|length| u16::try_from(length).ok())
             else {
-                let _ = runtime.record_current_node_error(TcpOutputError::SegmentTooLong);
+                let _ = runtime.record_current_node_error(TcpError::Length);
                 return Ok(TcpOutputNext::Drop);
             };
-            tcp_output_push_ipv4::<SIMD_BYTES>(runtime, index, src, dst, total_len)?;
-            Ok(TcpOutputNext::LookupV4)
+            tcp_output_push_ipv4::<SIMD_BYTES>(runtime, index, src, dst, total_len, fib_index)?;
+            Ok(TcpOutputNext::Lookup)
         }
-        (IpAddr::V6(src), IpAddr::V6(dst)) => {
+        (IpAddr::V6(src), IpAddr::V6(dst)) if !IS_IP4 => {
             let Ok(payload_len) = u16::try_from(tcp_len) else {
-                let _ = runtime.record_current_node_error(TcpOutputError::SegmentTooLong);
+                let _ = runtime.record_current_node_error(TcpError::Length);
                 return Ok(TcpOutputNext::Drop);
             };
-            tcp_output_push_ipv6::<SIMD_BYTES>(runtime, index, src, dst, payload_len)?;
-            Ok(TcpOutputNext::LookupV6)
+            tcp_output_push_ipv6::<SIMD_BYTES>(runtime, index, src, dst, payload_len, fib_index)?;
+            Ok(TcpOutputNext::Lookup)
         }
         _ => {
-            let _ = runtime.record_current_node_error(TcpOutputError::UnsupportedEgress);
+            let _ = runtime.record_current_node_error(TcpError::InvalidConnection);
             Ok(TcpOutputNext::Drop)
         }
     }
 }
 
 /// VPP `tcp_output_push_ip` → `vlib_buffer_push_ip4(..., is_df=1)`.
-fn tcp_output_push_ipv4<const SIMD_BYTES: usize>(
+pub(crate) fn tcp_output_push_ipv4<const SIMD_BYTES: usize>(
     runtime: &mut DataPlaneMain,
     index: u32,
     src: Ipv4Addr,
     dst: Ipv4Addr,
     total_len: u16,
+    fib_index: u32,
 ) -> RuntimeResult<()> {
     const IPV4_HEADER_LEN: usize = 20;
     let tcp_len = total_len - IPV4_HEADER_LEN as u16;
@@ -178,7 +266,7 @@ fn tcp_output_push_ipv4<const SIMD_BYTES: usize>(
         .map(|tcp| tcp.header_len())
         .unwrap_or(20);
     let network = hammer_core::buffer_opaque!(mut buffer => NetworkOpaque);
-    network.sw_if_index = [u32::MAX; 2];
+    network.sw_if_index = [u32::MAX, fib_index];
     network.set_packet_cursor(
         BufferPacketCursor::new()
             .with_packet_len(packet_len)
@@ -188,16 +276,18 @@ fn tcp_output_push_ipv4<const SIMD_BYTES: usize>(
     );
     network.ip_mut().set_ip_version(Some(4));
     network.ip_mut().set_ip_protocol(Some(6));
+    network.ip_mut().set_fib_index(Some(fib_index));
     Ok(())
 }
 
 /// VPP `tcp_output_push_ip` IPv6 path (`vlib_buffer_push_ip6_custom`).
-fn tcp_output_push_ipv6<const SIMD_BYTES: usize>(
+pub(crate) fn tcp_output_push_ipv6<const SIMD_BYTES: usize>(
     runtime: &mut DataPlaneMain,
     index: u32,
     src: Ipv6Addr,
     dst: Ipv6Addr,
     payload_len: u16,
+    fib_index: u32,
 ) -> RuntimeResult<()> {
     const IPV6_HEADER_LEN: usize = 40;
     let mut checksum = InternetChecksum::<SIMD_BYTES>::default();
@@ -217,7 +307,7 @@ fn tcp_output_push_ipv6<const SIMD_BYTES: usize>(
         .map(|tcp| tcp.header_len())
         .unwrap_or(20);
     let network = hammer_core::buffer_opaque!(mut buffer => NetworkOpaque);
-    network.sw_if_index = [u32::MAX; 2];
+    network.sw_if_index = [u32::MAX, fib_index];
     network.set_packet_cursor(
         BufferPacketCursor::new()
             .with_packet_len(packet_len)
@@ -227,6 +317,7 @@ fn tcp_output_push_ipv6<const SIMD_BYTES: usize>(
     );
     network.ip_mut().set_ip_version(Some(6));
     network.ip_mut().set_ip_protocol(Some(6));
+    network.ip_mut().set_fib_index(Some(fib_index));
     Ok(())
 }
 
@@ -237,8 +328,8 @@ fn set_tcp_checksum<const SIMD_BYTES: usize>(
 ) -> RuntimeResult<()> {
     {
         let buffer = runtime.buffer_mut(index);
-        let (header, _) = TcpHeader::mut_from_prefix(buffer.current_mut())
-            .map_err(|_| TcpOutputError::NoTcpHeader)?;
+        let (header, _) =
+            TcpHeader::mut_from_prefix(buffer.current_mut()).map_err(|_| TcpError::Length)?;
         header.set_checksum(0);
     }
     for buffer in runtime.chain(index) {
@@ -246,8 +337,8 @@ fn set_tcp_checksum<const SIMD_BYTES: usize>(
     }
     let value = checksum.finish() as u16;
     let buffer = runtime.buffer_mut(index);
-    let (header, _) = TcpHeader::mut_from_prefix(buffer.current_mut())
-        .map_err(|_| TcpOutputError::NoTcpHeader)?;
+    let (header, _) =
+        TcpHeader::mut_from_prefix(buffer.current_mut()).map_err(|_| TcpError::Length)?;
     header.set_checksum(value);
     Ok(())
 }
@@ -380,8 +471,8 @@ mod opaque_tests {
             .write_to_buffer(buffer)?;
         }
         assert!(matches!(
-            tcp_output_next_for_index::<1>(&mut runtime, index)?,
-            TcpOutputNext::LookupV4
+            tcp_output_next_for_index::<1, true>(&mut runtime, index)?,
+            TcpOutputNext::Lookup
         ));
         {
             let buffer = runtime.buffer(index);

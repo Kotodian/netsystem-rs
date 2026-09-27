@@ -10,7 +10,7 @@ use super::output::{
 use super::recovery::{TcpRecoveryAck, TcpRecoveryState};
 use super::sack::TcpSackState;
 use super::segment::TcpSegment;
-use super::timers::{TcpTimerKind, TcpTimerState, TcpTimers};
+use super::timers::{self, TcpTimerKind, TcpTimerState};
 use crate::protocol::TcpEcnCodepoint;
 use crate::{
     TcpCapabilities, TcpCloseReason, TcpConnectionId, TcpError, TcpFastOpenCookie,
@@ -18,10 +18,11 @@ use crate::{
     TcpTimestampOption,
 };
 use hammer_infra::align::CacheLineAlignMark;
+use hammer_infra::timer_wheel::TimerWheel1t2w2048sl;
 use hammer_plugin_session::{IpTransportConnection, IpTransportConnectionId};
 use hammer_runtime::DataWorkerId;
 use hammer_runtime::{RuntimeError, RuntimeResult};
-use hammer_service::session::runtime::RxDelivery;
+use hammer_service::session::RxDelivery;
 use hammer_service::transport::congestion::{CongestionController, CongestionMetrics};
 use hammer_service::transport::{Pacer, TransportConnectionFlags};
 use thiserror::Error;
@@ -720,14 +721,20 @@ impl TcpConnection {
     fn observe_activity(
         &mut self,
         index: u32,
-        timers: &mut TcpTimers,
+        timers: &mut TimerWheel1t2w2048sl<u32>,
         now: Instant,
     ) -> RuntimeResult<()> {
         self.keepalive.last_activity_at = now;
         self.keepalive.probes_sent = 0;
         if self.state == TcpState::Established {
             let idle = self.keepalive.config.idle;
-            timers.update(index, &mut self.timers, TcpTimerKind::KeepAlive, idle)?;
+            timers::update(
+                timers,
+                index,
+                &mut self.timers,
+                TcpTimerKind::KeepAlive,
+                idle,
+            )?;
         }
         Ok(())
     }
@@ -750,39 +757,57 @@ impl TcpConnection {
     fn sync_recovery_timers(
         &mut self,
         index: u32,
-        timers: &mut TcpTimers,
+        timers: &mut TimerWheel1t2w2048sl<u32>,
         now: Instant,
         recovery_timing_changed: bool,
     ) -> RuntimeResult<()> {
         if self.snd_wnd == 0 && self.recovery.has_unacked_data() {
             let interval = self.persist_interval();
-            timers.set(index, &mut self.timers, TcpTimerKind::Persist, interval)?;
-            timers.reset(index, &mut self.timers, TcpTimerKind::Rack);
-            timers.reset(index, &mut self.timers, TcpTimerKind::Tlp);
-            timers.reset(index, &mut self.timers, TcpTimerKind::Pacing);
+            timers::set(
+                timers,
+                index,
+                &mut self.timers,
+                TcpTimerKind::Persist,
+                interval,
+            )?;
+            timers::reset(timers, index, &mut self.timers, TcpTimerKind::Rack);
+            timers::reset(timers, index, &mut self.timers, TcpTimerKind::Tlp);
+            timers::reset(timers, index, &mut self.timers, TcpTimerKind::Pacing);
             return Ok(());
         }
 
-        timers.reset(index, &mut self.timers, TcpTimerKind::Persist);
+        timers::reset(timers, index, &mut self.timers, TcpTimerKind::Persist);
         if recovery_timing_changed {
             if let Some(interval) = self.recovery.rack_timeout(now) {
-                timers.update(index, &mut self.timers, TcpTimerKind::Rack, interval)?;
+                timers::update(
+                    timers,
+                    index,
+                    &mut self.timers,
+                    TcpTimerKind::Rack,
+                    interval,
+                )?;
             } else {
-                timers.reset(index, &mut self.timers, TcpTimerKind::Rack);
+                timers::reset(timers, index, &mut self.timers, TcpTimerKind::Rack);
             }
             if let Some(interval) = self.recovery.tlp_timeout(
                 self.retransmit_timeout().smoothed_rtt(),
                 self.retransmit_timeout().retransmit_timeout(),
             ) {
-                timers.update(index, &mut self.timers, TcpTimerKind::Tlp, interval)?;
+                timers::update(timers, index, &mut self.timers, TcpTimerKind::Tlp, interval)?;
             } else {
-                timers.reset(index, &mut self.timers, TcpTimerKind::Tlp);
+                timers::reset(timers, index, &mut self.timers, TcpTimerKind::Tlp);
             }
         }
         if let Some(interval) = self.pacing_interval() {
-            timers.set(index, &mut self.timers, TcpTimerKind::Pacing, interval)?;
+            timers::set(
+                timers,
+                index,
+                &mut self.timers,
+                TcpTimerKind::Pacing,
+                interval,
+            )?;
         } else {
-            timers.reset(index, &mut self.timers, TcpTimerKind::Pacing);
+            timers::reset(timers, index, &mut self.timers, TcpTimerKind::Pacing);
         }
         Ok(())
     }
@@ -1058,13 +1083,14 @@ impl TcpConnection {
     pub(super) fn on_clean_in_order_payload(
         &mut self,
         index: u32,
-        timers: &mut TcpTimers,
+        timers: &mut TimerWheel1t2w2048sl<u32>,
     ) -> RuntimeResult<bool> {
         if self.timers.is_active(TcpTimerKind::DelayedAck) {
-            timers.reset(index, &mut self.timers, TcpTimerKind::DelayedAck);
+            timers::reset(timers, index, &mut self.timers, TcpTimerKind::DelayedAck);
             return Ok(true);
         }
-        timers.set(
+        timers::set(
+            timers,
             index,
             &mut self.timers,
             TcpTimerKind::DelayedAck,
@@ -1249,7 +1275,7 @@ impl TcpConnection {
     pub(super) fn receive_open_reply(
         &mut self,
         index: u32,
-        timers: &mut TcpTimers,
+        timers: &mut TimerWheel1t2w2048sl<u32>,
         packet: &TcpPacket,
         local_capabilities: TcpCapabilities,
         now: Instant,
@@ -1278,7 +1304,7 @@ impl TcpConnection {
             {
                 self.cacheline1.close_reason = Some(TcpCloseReason::RemoteReset);
                 self.state = TcpState::Closed;
-                timers.reset(index, &mut self.timers, TcpTimerKind::Retransmit);
+                timers::reset(timers, index, &mut self.timers, TcpTimerKind::Retransmit);
             }
             return Ok(None);
         }
@@ -1311,7 +1337,7 @@ impl TcpConnection {
             }
             self.snd_una = acknowledgment;
             self.state = TcpState::Established;
-            timers.reset(index, &mut self.timers, TcpTimerKind::Retransmit);
+            timers::reset(timers, index, &mut self.timers, TcpTimerKind::Retransmit);
             self.observe_activity(index, timers, now)?;
             if packet.payload_len != 0 {
                 self.rcv_nxt = packet.sequence.advance(1 + packet.payload_len as u32);
@@ -1360,7 +1386,7 @@ impl TcpConnection {
     pub(super) fn receive_final_ack(
         &mut self,
         index: u32,
-        timers: &mut TcpTimers,
+        timers: &mut TimerWheel1t2w2048sl<u32>,
         packet: &TcpPacket,
         now: Instant,
     ) -> RuntimeResult<Option<TcpSegment>> {
@@ -1376,7 +1402,7 @@ impl TcpConnection {
         if packet.flags.contains(TcpSegmentFlags::RST) {
             self.cacheline1.close_reason = Some(TcpCloseReason::RemoteReset);
             self.state = TcpState::Closed;
-            timers.reset(index, &mut self.timers, TcpTimerKind::Retransmit);
+            timers::reset(timers, index, &mut self.timers, TcpTimerKind::Retransmit);
             return Ok(None);
         }
         let Some(acknowledgment) = packet.acknowledgment else {
@@ -1393,7 +1419,7 @@ impl TcpConnection {
         }
         self.apply_ack(acknowledgment, packet.advertised_window);
         self.state = TcpState::Established;
-        timers.reset(index, &mut self.timers, TcpTimerKind::Retransmit);
+        timers::reset(timers, index, &mut self.timers, TcpTimerKind::Retransmit);
         self.observe_activity(index, timers, now)?;
         Ok(None)
     }
@@ -1604,13 +1630,14 @@ impl TcpConnection {
     pub(super) fn sync_payload_tx_timers(
         &mut self,
         index: u32,
-        timers: &mut TcpTimers,
+        timers: &mut TimerWheel1t2w2048sl<u32>,
         now: Instant,
     ) -> RuntimeResult<()> {
         let retransmit = self.retransmit_timeout().retransmit_timeout();
-        timers.validate_interval(retransmit)?;
+        timers::validate_interval(timers, retransmit)?;
         if self.state != TcpState::Established {
-            return timers.set(
+            return timers::set(
+                timers,
                 index,
                 &mut self.timers,
                 TcpTimerKind::Retransmit,
@@ -1630,42 +1657,67 @@ impl TcpConnection {
             .into_iter()
             .flatten()
         {
-            timers.validate_interval(interval)?;
+            timers::validate_interval(timers, interval)?;
         }
 
-        timers.set(
+        timers::set(
+            timers,
             index,
             &mut self.timers,
             TcpTimerKind::Retransmit,
             retransmit,
         )?;
         if let Some(interval) = rack {
-            timers.update(index, &mut self.timers, TcpTimerKind::Rack, interval)?;
+            timers::update(
+                timers,
+                index,
+                &mut self.timers,
+                TcpTimerKind::Rack,
+                interval,
+            )?;
         } else {
-            timers.reset(index, &mut self.timers, TcpTimerKind::Rack);
+            timers::reset(timers, index, &mut self.timers, TcpTimerKind::Rack);
         }
         if let Some(interval) = tlp {
-            timers.update(index, &mut self.timers, TcpTimerKind::Tlp, interval)?;
+            timers::update(timers, index, &mut self.timers, TcpTimerKind::Tlp, interval)?;
         } else {
-            timers.reset(index, &mut self.timers, TcpTimerKind::Tlp);
+            timers::reset(timers, index, &mut self.timers, TcpTimerKind::Tlp);
         }
         if let Some(interval) = persist {
-            timers.set(index, &mut self.timers, TcpTimerKind::Persist, interval)?;
+            timers::set(
+                timers,
+                index,
+                &mut self.timers,
+                TcpTimerKind::Persist,
+                interval,
+            )?;
         } else {
-            timers.reset(index, &mut self.timers, TcpTimerKind::Persist);
+            timers::reset(timers, index, &mut self.timers, TcpTimerKind::Persist);
         }
         if let Some(interval) = pacing {
-            timers.update(index, &mut self.timers, TcpTimerKind::Pacing, interval)?;
+            timers::update(
+                timers,
+                index,
+                &mut self.timers,
+                TcpTimerKind::Pacing,
+                interval,
+            )?;
         } else {
-            timers.reset(index, &mut self.timers, TcpTimerKind::Pacing);
+            timers::reset(timers, index, &mut self.timers, TcpTimerKind::Pacing);
         }
-        timers.update(index, &mut self.timers, TcpTimerKind::KeepAlive, keepalive)
+        timers::update(
+            timers,
+            index,
+            &mut self.timers,
+            TcpTimerKind::KeepAlive,
+            keepalive,
+        )
     }
 
     pub(super) fn receive_ack_with_timers(
         &mut self,
         index: u32,
-        timers: &mut TcpTimers,
+        timers: &mut TimerWheel1t2w2048sl<u32>,
         packet: &TcpPacket,
         acknowledgment: u32,
         advertised_window: u16,
@@ -1687,16 +1739,28 @@ impl TcpConnection {
         let recovery_timing_changed =
             recovery_progress || (ack_accepted && zero_window_before != (self.snd_wnd == 0));
         self.observe_activity(index, timers, now)?;
-        timers.reset(index, &mut self.timers, TcpTimerKind::DelayedAck);
+        timers::reset(timers, index, &mut self.timers, TcpTimerKind::DelayedAck);
         if self.recovery.has_unacked_data() {
             let interval = self.retransmit_timeout().retransmit_timeout();
             if self.snd_una != snd_una_before {
-                timers.update(index, &mut self.timers, TcpTimerKind::Retransmit, interval)?;
+                timers::update(
+                    timers,
+                    index,
+                    &mut self.timers,
+                    TcpTimerKind::Retransmit,
+                    interval,
+                )?;
             } else {
-                timers.set(index, &mut self.timers, TcpTimerKind::Retransmit, interval)?;
+                timers::set(
+                    timers,
+                    index,
+                    &mut self.timers,
+                    TcpTimerKind::Retransmit,
+                    interval,
+                )?;
             }
         } else {
-            timers.reset(index, &mut self.timers, TcpTimerKind::Retransmit);
+            timers::reset(timers, index, &mut self.timers, TcpTimerKind::Retransmit);
         }
         self.sync_recovery_timers(index, timers, now, recovery_timing_changed)
     }
@@ -1704,7 +1768,7 @@ impl TcpConnection {
     pub(super) fn receive_established_with_timers(
         &mut self,
         index: u32,
-        timers: &mut TcpTimers,
+        timers: &mut TimerWheel1t2w2048sl<u32>,
         packet: &TcpPacket,
         now: Instant,
     ) -> RuntimeResult<Option<TcpSegment>> {
@@ -1759,7 +1823,7 @@ impl TcpConnection {
     pub(super) fn receive_close_side(
         &mut self,
         index: u32,
-        timers: &mut TcpTimers,
+        timers: &mut TimerWheel1t2w2048sl<u32>,
         packet: &TcpPacket,
         now: Instant,
     ) -> RuntimeResult<Option<TcpSegment>> {
@@ -1809,7 +1873,8 @@ impl TcpConnection {
                         .is_some()
                     {
                         let time_wait = self.time_wait;
-                        timers.update(
+                        timers::update(
+                            timers,
                             index,
                             &mut self.timers,
                             TcpTimerKind::TimeWait,
@@ -1841,7 +1906,13 @@ impl TcpConnection {
                     self.rcv_nxt = self.rcv_nxt.advance(1);
                     self.state = TcpState::TimeWait;
                     let time_wait = self.time_wait;
-                    timers.update(index, &mut self.timers, TcpTimerKind::TimeWait, time_wait)?;
+                    timers::update(
+                        timers,
+                        index,
+                        &mut self.timers,
+                        TcpTimerKind::TimeWait,
+                        time_wait,
+                    )?;
                     return Ok(Some(self.control_segment(
                         packet.local,
                         packet.remote,
@@ -1861,7 +1932,13 @@ impl TcpConnection {
                 {
                     self.state = TcpState::TimeWait;
                     let time_wait = self.time_wait;
-                    timers.update(index, &mut self.timers, TcpTimerKind::TimeWait, time_wait)?;
+                    timers::update(
+                        timers,
+                        index,
+                        &mut self.timers,
+                        TcpTimerKind::TimeWait,
+                        time_wait,
+                    )?;
                 }
                 Ok(None)
             }
@@ -1878,7 +1955,13 @@ impl TcpConnection {
             TcpState::TimeWait => {
                 if packet.flags.contains(TcpSegmentFlags::FIN) {
                     let time_wait = self.time_wait;
-                    timers.update(index, &mut self.timers, TcpTimerKind::TimeWait, time_wait)?;
+                    timers::update(
+                        timers,
+                        index,
+                        &mut self.timers,
+                        TcpTimerKind::TimeWait,
+                        time_wait,
+                    )?;
                     return Ok(Some(self.control_segment(
                         packet.local,
                         packet.remote,
@@ -1930,9 +2013,13 @@ impl TcpConnection {
                     .rcv_nxt
                     .advance(accepted.get().saturating_add(promoted));
             }
-            RxDelivery::OutOfOrder { newest, .. } => {
-                let left = self.rcv_nxt.advance(newest.start());
-                let right = left.advance(newest.len().get());
+            RxDelivery::OutOfOrder {
+                newest_start,
+                newest_len,
+                ..
+            } => {
+                let left = self.rcv_nxt.advance(newest_start);
+                let right = left.advance(newest_len.get());
                 self.sack
                     .update_range(self.negotiated_options().sack, self.rcv_nxt, left, right);
                 return Ok(());
@@ -2040,7 +2127,7 @@ impl TcpConnection {
     pub(super) fn on_tcp_ready(
         &mut self,
         index: u32,
-        timers: &mut TcpTimers,
+        timers: &mut TimerWheel1t2w2048sl<u32>,
         has_pending_tx: bool,
         local_capabilities: TcpCapabilities,
         _: Instant,
@@ -2048,31 +2135,55 @@ impl TcpConnection {
         if self.state == TcpState::Established {
             if self.recovery.has_unacked_data() || has_pending_tx {
                 let interval = self.retransmit_timeout().retransmit_timeout();
-                timers.set(index, &mut self.timers, TcpTimerKind::Retransmit, interval)?;
+                timers::set(
+                    timers,
+                    index,
+                    &mut self.timers,
+                    TcpTimerKind::Retransmit,
+                    interval,
+                )?;
             } else {
-                timers.reset(index, &mut self.timers, TcpTimerKind::Retransmit);
+                timers::reset(timers, index, &mut self.timers, TcpTimerKind::Retransmit);
             }
             if self.snd_wnd == 0 && has_pending_tx {
                 let interval = self.persist_interval();
-                timers.set(index, &mut self.timers, TcpTimerKind::Persist, interval)?;
+                timers::set(
+                    timers,
+                    index,
+                    &mut self.timers,
+                    TcpTimerKind::Persist,
+                    interval,
+                )?;
             } else if self.snd_wnd != 0 || !self.recovery.has_unacked_data() {
-                timers.reset(index, &mut self.timers, TcpTimerKind::Persist);
+                timers::reset(timers, index, &mut self.timers, TcpTimerKind::Persist);
             }
             if has_pending_tx {
                 if let Some(interval) = self.pacing_interval() {
-                    timers.set(index, &mut self.timers, TcpTimerKind::Pacing, interval)?;
+                    timers::set(
+                        timers,
+                        index,
+                        &mut self.timers,
+                        TcpTimerKind::Pacing,
+                        interval,
+                    )?;
                 } else {
-                    timers.reset(index, &mut self.timers, TcpTimerKind::Pacing);
+                    timers::reset(timers, index, &mut self.timers, TcpTimerKind::Pacing);
                 }
             } else {
-                timers.reset(index, &mut self.timers, TcpTimerKind::Pacing);
+                timers::reset(timers, index, &mut self.timers, TcpTimerKind::Pacing);
             }
             let keepalive = if self.keepalive.probes_sent == 0 {
                 self.keepalive.config.idle
             } else {
                 self.keepalive.config.probe_interval
             };
-            timers.set(index, &mut self.timers, TcpTimerKind::KeepAlive, keepalive)?;
+            timers::set(
+                timers,
+                index,
+                &mut self.timers,
+                TcpTimerKind::KeepAlive,
+                keepalive,
+            )?;
         }
         let segment = self.ready_segment(has_pending_tx, local_capabilities);
         if matches!(
@@ -2081,29 +2192,35 @@ impl TcpConnection {
         ) && (self.state == TcpState::SynSent || self.snd_una != self.snd_nxt)
         {
             let interval = self.retransmit_timeout().retransmit_timeout();
-            timers.set(index, &mut self.timers, TcpTimerKind::Retransmit, interval)?;
+            timers::set(
+                timers,
+                index,
+                &mut self.timers,
+                TcpTimerKind::Retransmit,
+                interval,
+            )?;
         }
         if self.state != TcpState::Established {
-            timers.reset(index, &mut self.timers, TcpTimerKind::KeepAlive);
-            timers.reset(index, &mut self.timers, TcpTimerKind::Pacing);
+            timers::reset(timers, index, &mut self.timers, TcpTimerKind::KeepAlive);
+            timers::reset(timers, index, &mut self.timers, TcpTimerKind::Pacing);
         }
         Ok(segment)
     }
 
     #[inline]
-    pub(super) fn on_session_close(&mut self, index: u32, timers: &mut TcpTimers) {
+    pub(super) fn on_session_close(&mut self, index: u32, timers: &mut TimerWheel1t2w2048sl<u32>) {
         match self.state {
             TcpState::Established => {
                 self.cacheline1.close_reason = Some(TcpCloseReason::LocalRequest);
                 self.state = TcpState::FinWait1;
-                timers.reset(index, &mut self.timers, TcpTimerKind::KeepAlive);
-                timers.reset(index, &mut self.timers, TcpTimerKind::Pacing);
+                timers::reset(timers, index, &mut self.timers, TcpTimerKind::KeepAlive);
+                timers::reset(timers, index, &mut self.timers, TcpTimerKind::Pacing);
             }
             TcpState::CloseWait => {
                 self.cacheline1.close_reason = Some(TcpCloseReason::LocalRequest);
                 self.state = TcpState::LastAck;
-                timers.reset(index, &mut self.timers, TcpTimerKind::KeepAlive);
-                timers.reset(index, &mut self.timers, TcpTimerKind::Pacing);
+                timers::reset(timers, index, &mut self.timers, TcpTimerKind::KeepAlive);
+                timers::reset(timers, index, &mut self.timers, TcpTimerKind::Pacing);
             }
             _ => {}
         }
@@ -2112,7 +2229,7 @@ impl TcpConnection {
     pub(super) fn on_typed_timer_expiry(
         &mut self,
         index: u32,
-        timers: &mut TcpTimers,
+        timers: &mut TimerWheel1t2w2048sl<u32>,
         kind: TcpTimerKind,
         local_capabilities: TcpCapabilities,
         now: Instant,
@@ -2135,9 +2252,9 @@ impl TcpConnection {
 
         match kind {
             TcpTimerKind::Retransmit => {
-                timers.reset(index, &mut self.timers, TcpTimerKind::Rack);
-                timers.reset(index, &mut self.timers, TcpTimerKind::Tlp);
-                timers.reset(index, &mut self.timers, TcpTimerKind::Pacing);
+                timers::reset(timers, index, &mut self.timers, TcpTimerKind::Rack);
+                timers::reset(timers, index, &mut self.timers, TcpTimerKind::Tlp);
+                timers::reset(timers, index, &mut self.timers, TcpTimerKind::Pacing);
                 if matches!(
                     self.state,
                     TcpState::SynSent
@@ -2147,16 +2264,28 @@ impl TcpConnection {
                         | TcpState::LastAck
                 ) {
                     let interval = self.retransmit_timeout().retransmit_timeout();
-                    timers.update(index, &mut self.timers, TcpTimerKind::Retransmit, interval)?;
+                    timers::update(
+                        timers,
+                        index,
+                        &mut self.timers,
+                        TcpTimerKind::Retransmit,
+                        interval,
+                    )?;
                 } else {
-                    timers.reset(index, &mut self.timers, TcpTimerKind::Retransmit);
+                    timers::reset(timers, index, &mut self.timers, TcpTimerKind::Retransmit);
                 }
             }
             TcpTimerKind::Rack => {
                 if let Some(interval) = self.recovery.rack_timeout(now) {
-                    timers.update(index, &mut self.timers, TcpTimerKind::Rack, interval)?;
+                    timers::update(
+                        timers,
+                        index,
+                        &mut self.timers,
+                        TcpTimerKind::Rack,
+                        interval,
+                    )?;
                 } else {
-                    timers.reset(index, &mut self.timers, TcpTimerKind::Rack);
+                    timers::reset(timers, index, &mut self.timers, TcpTimerKind::Rack);
                 }
             }
             TcpTimerKind::Tlp => {
@@ -2164,28 +2293,46 @@ impl TcpConnection {
                     self.retransmit_timeout().smoothed_rtt(),
                     self.retransmit_timeout().retransmit_timeout(),
                 ) {
-                    timers.update(index, &mut self.timers, TcpTimerKind::Tlp, interval)?;
+                    timers::update(timers, index, &mut self.timers, TcpTimerKind::Tlp, interval)?;
                 } else {
-                    timers.reset(index, &mut self.timers, TcpTimerKind::Tlp);
+                    timers::reset(timers, index, &mut self.timers, TcpTimerKind::Tlp);
                 }
             }
             TcpTimerKind::Persist => {
                 if self.state == TcpState::Established && self.snd_wnd == 0 {
                     let interval = self.persist_interval();
-                    timers.update(index, &mut self.timers, TcpTimerKind::Persist, interval)?;
+                    timers::update(
+                        timers,
+                        index,
+                        &mut self.timers,
+                        TcpTimerKind::Persist,
+                        interval,
+                    )?;
                 }
             }
             TcpTimerKind::KeepAlive => {
                 if self.state == TcpState::Established {
                     let interval = self.keepalive.config.probe_interval;
-                    timers.update(index, &mut self.timers, TcpTimerKind::KeepAlive, interval)?;
+                    timers::update(
+                        timers,
+                        index,
+                        &mut self.timers,
+                        TcpTimerKind::KeepAlive,
+                        interval,
+                    )?;
                 } else {
-                    timers.reset(index, &mut self.timers, TcpTimerKind::KeepAlive);
+                    timers::reset(timers, index, &mut self.timers, TcpTimerKind::KeepAlive);
                 }
             }
             TcpTimerKind::Pacing => {
                 if let Some(interval) = self.pacing_interval() {
-                    timers.update(index, &mut self.timers, TcpTimerKind::Pacing, interval)?;
+                    timers::update(
+                        timers,
+                        index,
+                        &mut self.timers,
+                        TcpTimerKind::Pacing,
+                        interval,
+                    )?;
                 }
             }
             TcpTimerKind::DelayedAck | TcpTimerKind::TimeWait => {}

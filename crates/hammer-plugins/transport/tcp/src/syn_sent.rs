@@ -1,64 +1,92 @@
-use crate::{publish_tcp_connection, read_session_id};
+use crate::read_session_id;
 use hammer_core::data_plane::{DEFAULT_BUFFER_FRAME_CAPACITY, Frame, NodeId, NodeNext};
 use hammer_runtime::{DataPlaneMain, Node, NodeProcessFn, NodeRuntime};
 
 use hammer_runtime::{RuntimeError, RuntimeResult};
 
+use super::TcpError;
 use super::TcpNodeError;
 use super::segment::tcp_packet;
 use hammer_service::session::runtime::{RxDelivery, session_main};
 
 #[hammer_component_macros::node_next]
 pub enum TcpSynSentNext {
-    #[next("tcp-output")]
+    #[next("tcp4-output")]
     Output,
     Drop,
 }
 
 #[hammer_component_macros::graph_node(
     graph = tcp_worker,
-    init = crate::syn_sent::register_tcp_syn_sent,
-    name = "tcp-syn-sent",
+    init = crate::syn_sent::register_tcp4_syn_sent,
+    name = "tcp4-syn-sent",
     next = TcpSynSentNext,
     role = internal,
 )]
-pub struct TcpSynSentNode {}
+pub struct Tcp4SynSentNode {}
 
-pub fn register_tcp_syn_sent(runtime: &DataPlaneMain) -> RuntimeResult<NodeId> {
+#[hammer_component_macros::graph_node(
+    graph = tcp_worker,
+    init = crate::syn_sent::register_tcp6_syn_sent,
+    name = "tcp6-syn-sent",
+    next = TcpSynSentNext,
+    role = internal,
+)]
+pub struct Tcp6SynSentNode {}
+
+pub fn register_tcp4_syn_sent(runtime: &DataPlaneMain) -> RuntimeResult<NodeId> {
     crate::TCP_MAIN
         .get()
         .ok_or(RuntimeError::PluginStateNotInitialized { plugin: "tcp" })?;
-    if let Some(node) = runtime.nodes().node_by_name("tcp-syn-sent") {
+    if let Some(node) = runtime.nodes().node_by_name("tcp4-syn-sent") {
         return Ok(node);
     }
     runtime
         .nodes()
-        .try_register_internal_with_next_names(TcpSynSentNode::new(), &TcpSynSentNext::NEXT_NAMES)
+        .try_register_internal_with_next_names(Tcp4SynSentNode::new(), &TcpSynSentNext::NEXT_NAMES)
 }
 
-impl Node for TcpSynSentNode {
+pub fn register_tcp6_syn_sent(runtime: &DataPlaneMain) -> RuntimeResult<NodeId> {
+    runtime
+        .nodes()
+        .try_register_internal_with_next_names(Tcp6SynSentNode::new(), &["tcp6-output", "drop"])
+}
+
+impl Node for Tcp4SynSentNode {
     #[inline(always)]
     fn process(
         runtime: &mut DataPlaneMain,
         node_runtime: &mut hammer_runtime::NodeRuntime,
         frame: &mut Frame,
     ) -> usize {
-        let process: NodeProcessFn = tcp_syn_sent_process;
+        let process: NodeProcessFn = tcp_syn_sent_process::<true>;
         process(runtime, node_runtime, frame)
     }
 }
 
-pub(crate) fn tcp_syn_sent_process(
+impl Node for Tcp6SynSentNode {
+    #[inline(always)]
+    fn process(
+        runtime: &mut DataPlaneMain,
+        node_runtime: &mut NodeRuntime,
+        frame: &mut Frame,
+    ) -> usize {
+        let process: NodeProcessFn = tcp_syn_sent_process::<false>;
+        process(runtime, node_runtime, frame)
+    }
+}
+
+pub(crate) fn tcp_syn_sent_process<const IS_IP4: bool>(
     runtime: &mut DataPlaneMain,
     node_runtime: &mut NodeRuntime,
     frame: &mut Frame,
 ) -> usize {
     let processed_vectors = frame.len();
-    tcp_syn_sent_frame(runtime, node_runtime, frame);
+    tcp_syn_sent_frame::<IS_IP4>(runtime, node_runtime, frame);
     processed_vectors
 }
 
-fn tcp_syn_sent_frame(
+fn tcp_syn_sent_frame<const IS_IP4: bool>(
     runtime: &mut DataPlaneMain,
     node_runtime: &mut hammer_runtime::NodeRuntime,
     frame: &mut Frame,
@@ -68,7 +96,7 @@ fn tcp_syn_sent_frame(
     let mut nexts = [0u16; DEFAULT_BUFFER_FRAME_CAPACITY];
     let mut out_len = 0usize;
     for &index in frame.vector_args() {
-        match tcp_syn_sent_index(
+        match tcp_syn_sent_index::<IS_IP4>(
             runtime,
             node_runtime,
             index,
@@ -134,22 +162,25 @@ fn emit_local(
     Ok(())
 }
 
-fn tcp_syn_sent_index(
+fn tcp_syn_sent_index<const IS_IP4: bool>(
     runtime: &mut DataPlaneMain,
-    node_runtime: &mut hammer_runtime::NodeRuntime,
+    _: &mut hammer_runtime::NodeRuntime,
     index: u32,
-    out_frame: &mut Frame,
-    nexts: &mut [u16; DEFAULT_BUFFER_FRAME_CAPACITY],
-    out_len: &mut usize,
+    _: &mut Frame,
+    _: &mut [u16; DEFAULT_BUFFER_FRAME_CAPACITY],
+    _: &mut usize,
 ) -> RuntimeResult<bool> {
     let packet = tcp_packet(runtime, index)?;
+    if packet.local.is_ipv4() != IS_IP4 {
+        return Err(TcpError::SegmentInvalid.into());
+    }
     let main = crate::TCP_MAIN
         .get()
         .ok_or(RuntimeError::PluginStateNotInitialized { plugin: "tcp" })?;
     // SAFETY: this Node executes on the DataPlaneMain's owning runtime thread.
     let mut sessions = unsafe { session_main().worker(runtime.thread_index()) }?;
     let mut tcp = main.worker(runtime.thread_index())?;
-    let (keep_current, control_segment) = {
+    let (keep_current, control_segment, connection_index) = {
         let sessions = &mut *sessions;
         let tcp = &mut *tcp;
         let mut keep_current = true;
@@ -160,11 +191,11 @@ fn tcp_syn_sent_index(
         let connection_index = sessions
             .transport_connection_index(session_id)
             .ok_or(TcpNodeError::SynSentSessionMissing)?;
-        let (control, acked_tx_len, established_with_payload) = {
+        let (control, acked_tx_len, established, established_with_payload) = {
             let crate::worker::TcpWorker {
                 connections,
                 lookup,
-                timers,
+                timer_wheel: timers,
                 ..
             } = tcp;
             let local_capabilities = lookup
@@ -187,6 +218,7 @@ fn tcp_syn_sent_index(
             (
                 control,
                 connection.take_acked_tx_len(previous_snd_una),
+                previous_state == crate::TcpState::SynSent && established,
                 previous_state == crate::TcpState::SynSent
                     && established
                     && packet.payload_len != 0,
@@ -215,8 +247,19 @@ fn tcp_syn_sent_index(
             }
             keep_current = false;
         };
-        publish_tcp_connection(sessions, tcp, session_id)?;
-        (keep_current, control)
+        if established {
+            let crate::worker::TcpWorker {
+                connections,
+                lookup,
+                ..
+            } = tcp;
+            let connection = connections
+                .get(connection_index)
+                .ok_or(TcpNodeError::SynSentSessionMissing)?;
+            assert!(!lookup.publish_connection(session_id, connection));
+            sessions.complete_stream_connect(session_id)?;
+        }
+        (keep_current, control, connection_index)
     };
     if let Some(segment) = control_segment {
         let mut allocated = 0;
@@ -226,16 +269,23 @@ fn tcp_syn_sent_index(
             )
             .into());
         }
-        segment.write_to_buffer(&mut *runtime.buffer_mut(allocated))?;
-        emit_local(
+        if let Err(source) = segment.write_to_buffer(&mut *runtime.buffer_mut(allocated)) {
+            runtime.buffer_free_one(allocated);
+            return Err(source);
+        }
+        let worker_index = runtime.data_worker_id()?.slot() as u32;
+        let egress = hammer_core::buffer_opaque!(mut runtime.buffer_mut(allocated) => crate::TcpSecondaryOpaque)
+            .egress_mut();
+        egress.connection_index = connection_index;
+        egress.worker_index = worker_index;
+        let core_sessions = hammer_service::session::SessionMain::global()?;
+        // SAFETY: TCP output runs on this Data Worker's owning thread.
+        let core_worker = unsafe { core_sessions.worker_mut(runtime) }?;
+        core_worker.add_pending_tx_buffer(
             runtime,
-            node_runtime,
-            out_frame,
-            nexts,
-            out_len,
-            TcpSynSentNext::Output,
             allocated,
-        )?;
+            tcp.tco_next_node[usize::from(!packet.local.is_ipv4())],
+        );
     }
     Ok(keep_current)
 }
