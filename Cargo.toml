@@ -12,6 +12,7 @@ members = [
     "crates/hammer-plugins/net/icmp",
     "crates/hammer-plugins/transport/tcp",
     "crates/hammer-plugins/transport/udp",
+    "crates/hammer-plugins/app/iperf3",
     "crates/hammer-plugins/app-session/quic",
     "crates/hammer-plugins/app-session/tls",
     "crates/hammer-plugins/app-session/http",

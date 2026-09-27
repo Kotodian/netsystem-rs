@@ -86,6 +86,7 @@ hammer_runtime::__declare_registration_image!(
         interface::__SERVICE_GRAPH_NODE_INTERFACE_OUTPUT_NODE,
         interface::__SERVICE_GRAPH_NODE_INTERFACE_OUTPUT_ARC_END_NODE,
         session::node::__SESSION_GRAPH_NODE_APP_SESSION_INPUT_NODE,
+        session::node::__SESSION_GRAPH_NODE_SESSION_INPUT_NODE,
         session::node::__SESSION_GRAPH_NODE_SESSION_QUEUE_NODE,
     ];
     node_functions = [];

@@ -41,8 +41,8 @@ use thiserror::Error;
 use hammer_infra::align::CacheLineAlignMark;
 use hammer_infra::pool::Pool;
 use hammer_plugin_session::{
-    IpSessionEndpoint, IpSessionMain, IpTransportEndpoint, IpTransportEndpointConfig,
-    IpTransportMain,
+    IpSessionEndpoint, IpSessionMain, IpTransportConnectionId, IpTransportEndpoint,
+    IpTransportEndpointConfig, IpTransportMain,
 };
 use hammer_service::session::node::{SessionQueueNode, SessionQueueOutput};
 use hammer_service::session::runtime::{
@@ -266,6 +266,7 @@ impl TcpMain {
         owner_worker: DataWorkerId,
         capabilities: TcpCapabilities,
         session_listener: SessionHandle,
+        fib_index: u32,
     ) -> RuntimeResult<lookup::TcpLookupId> {
         let lookup_id =
             self.listener_control
@@ -286,6 +287,15 @@ impl TcpMain {
             remote,
         );
         connection.listen_state();
+        connection.base.endpoint = match (bind, remote) {
+            (SocketAddr::V4(local), SocketAddr::V4(remote)) => {
+                IpTransportConnectionId::from((fib_index, local, remote, self.protocol))
+            }
+            (SocketAddr::V6(local), SocketAddr::V6(remote)) => {
+                IpTransportConnectionId::from((fib_index, local, remote, self.protocol))
+            }
+            _ => unreachable!("listener and remote endpoint share one IP family"),
+        };
         connection.base.session = session_listener.into();
         connection.base.connection_index = lookup_id;
         unsafe { &mut *self.listeners.get() }.insert(connection);
@@ -411,9 +421,10 @@ impl Transport<IpTransportEndpointConfig> for TcpMain {
         let bind = std::net::SocketAddr::new(local.address, local.port);
         let result = self.bind_tcp_listener(
             bind,
-            DataWorkerId::new(session.worker_index),
+            DataWorkerId::new(0),
             listener_capabilities(),
             session.into(),
+            local.fib_index,
         );
         match result {
             Ok(index) => Ok(index),
@@ -434,10 +445,9 @@ impl Transport<IpTransportEndpointConfig> for TcpMain {
             .listener_connection(connection_index)
             .and_then(|connection| {
                 connection.local().map(|local| {
-                    IpSessionEndpoint::new(
-                        tcp_endpoint_pair(local, connection.remote()).0,
-                        self.protocol,
-                    )
+                    let mut transport = tcp_endpoint_pair(local, connection.remote()).0;
+                    transport.local.fib_index = connection.base.endpoint.fib_index();
+                    IpSessionEndpoint::new(transport, self.protocol)
                 })
             });
         match self
@@ -667,6 +677,7 @@ pub(crate) fn start_listen(
         endpoint.worker(),
         listener_capabilities(),
         listener,
+        0,
     )
     .map(|lookup_id| lookup_id)
 }

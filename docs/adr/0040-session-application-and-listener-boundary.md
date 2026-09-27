@@ -54,7 +54,7 @@ composition，不是 application 抽象。
 hammer-service::session
   SessionMain / SessionWorker / Session<O>
   ApplicationMain / Application / AppWorker / ApplicationListener
-  ApplicationCallbacks trait and app/session events
+  application-owned per-event Rust fn callbacks and app/session events
   generic CtMain<E, O> / CtWorker<E, O> / CtConnection<E, O> contracts
   SVM FIFO, SVM message queue, listener segment ownership
   session-queue nodes and worker scheduling
@@ -135,7 +135,8 @@ impl<'app> ApplicationMain<'app> {
     #[inline(always)]
     pub fn global() -> Result<&'static Self, ApplicationError>;
 
-    // VPP: application_alloc_and_init, application.c:664-767.
+    // VPP: vnet_application_attach, application.c:1120-1178,
+    // calls application_alloc_and_init then application_alloc_worker_and_init.
     pub fn attach(&mut self, config: ApplicationConfig) -> Result<u32, ApplicationError>;
 
     // VPP application_t.ns_index, application.h:139-151. The service keeps
@@ -171,9 +172,17 @@ impl<'app> ApplicationMain<'app> {
     pub fn listener(&self, listener: u32) -> Option<&ApplicationListener>;
 
     #[inline]
-    pub fn listener_for_session(&self, session: SessionHandle) -> Option<u32>;
+    pub fn listener_for_session(
+        &self,
+        session_main: &SessionMain<u32>,
+        session: SessionHandle,
+    ) -> Option<u32>;
 }
 ```
+
+`attach` 创建首个 AppWorker（worker-map index 0）后才返回 Application index；若 worker
+segment 创建失败，它释放尚未发布给调用方的 Application。`attach_worker` 只用于之后增加
+worker，builtin app 不在业务插件内重复执行首个 worker 的建立。
 
 `Application` 保存 VPP 的 application-level facts，并保存所选 namespace 的 raw `u32` pool
 index。它不保存 namespace object、socket、IP endpoint、FIB 或 protocol connection。ADR-0036
@@ -209,6 +218,24 @@ lookup 的调用参数仍是普通 `&str`。
 pub struct Application<'app> {
     index: u32,
     flags: ApplicationFlags,
+    // VPP: session_cb_vft_t, application_interface.h:15-59. These are direct
+    // Application fields, not an embedded callback-table struct.
+    add_segment: fn(u32, u64) -> Result<(), ApplicationError>,
+    del_segment: fn(u32, u64) -> Result<(), ApplicationError>,
+    accepted: fn(&mut SessionWorker, SessionHandle) -> Result<(), ApplicationError>,
+    connected: fn(&mut SessionWorker, u32, u64, Option<SessionHandle>, Option<SessionError>)
+        -> Result<(), ApplicationError>,
+    disconnected: fn(&mut SessionWorker, SessionHandle),
+    reset: fn(&mut SessionWorker, SessionHandle),
+    transport_closed: Option<fn(&mut SessionWorker, SessionHandle)>,
+    cleanup: Option<fn(&mut SessionWorker, SessionHandle, SessionCleanup)>,
+    half_open_cleanup: Option<fn(&mut SessionWorker, SessionHandle)>,
+    migrated: Option<fn(&mut SessionWorker, SessionHandle, SessionHandle)>,
+    listened: Option<fn(u32, u32, SessionHandle, Option<SessionError>)
+        -> Result<(), ApplicationError>>,
+    unlistened: Option<fn(u32, SessionHandle, u32, Option<SessionError>)>,
+    builtin_rx: Option<fn(&mut SessionWorker, SessionHandle)>,
+    builtin_tx: Option<fn(&mut SessionWorker, SessionHandle)>,
     segment: SegmentManagerProperties,
     worker_maps: Pool<ApplicationWorkerMap>,
     // Sole owner of the application name bytes. The name is immutable after
@@ -241,71 +268,90 @@ impl<'app> Application<'app> {
 }
 ```
 
-`SessionAppVft`/`session_cb_vft_t` 是迁移兼容面，不是目标字段。目标是静态 trait contract：
-ApplicationMain 不保存 callback table、function pointer 或 `dyn` object；具体 application owner
-以泛型参数实现 trait，并在 event dispatch 时通过 `&mut C` 直接调用。这样多个 application
-仍可共享同一 concrete callback owner，而 service 不需要异构 callback storage。
+`SessionAppVft` 是迁移兼容面。VPP 的 `session_cb_vft_t` 按事件拆开了 callback，
+`session_input.c:119-335` 也按事件选择不同签名和返回语义；一个接受
+`ApplicationEvent` 的总回调会抹掉这些区别。Hammer 把本阶段需要的槽**直接**放进
+`Application`/`ApplicationConfig`，不再包一层 `ApplicationCallbacks` 结构体或 trait。
+每个 `fn` 都实现 Rust `Fn`，可由非捕获闭包提供；捕获闭包不能放进非泛型的
+Application pool。业务可变状态仍由当前 Data Worker 的具体 plugin owner 持有。
 
 ```rust
-// VPP: application_t.cb_fns and callback sites in application_worker.c:934-1001,
-// session_input.c:80-153. Rust uses static dispatch; there is no session_cb_vft_t.
-pub trait ApplicationCallbacks {
-    fn accepted(
-        &mut self,
-        application: u32,
-        session: SessionHandle,
-    ) -> Result<(), ApplicationError>;
-
-    fn connected(
-        &mut self,
-        application: u32,
-        session: Option<SessionHandle>,
-        opaque: u64,
-        error: Option<SessionError>,
-    ) -> Result<(), ApplicationError>;
-
-    fn disconnected(&mut self, application: u32, session: SessionHandle)
-        -> Result<(), ApplicationError>;
-
-    fn reset(&mut self, application: u32, session: SessionHandle)
-        -> Result<(), ApplicationError>;
-
-    fn transport_closed(&mut self, application: u32, session: SessionHandle)
-        -> Result<(), ApplicationError>;
-
-    fn rx(&mut self, application: u32, session: SessionHandle)
-        -> Result<(), ApplicationError>;
-
-    fn tx(&mut self, application: u32, session: SessionHandle)
-        -> Result<(), ApplicationError>;
-
-    fn cleanup(&mut self, application: u32, session: SessionHandle)
-        -> Result<(), ApplicationError>;
-
-    fn half_open_cleanup(&mut self, application: u32, session: SessionHandle)
-        -> Result<(), ApplicationError>;
-
-    fn listened(&mut self, application: u32, listener: u32, opaque: u64)
-        -> Result<(), ApplicationError>;
-
-    fn unlistened(&mut self, application: u32, listener: u32, opaque: u64)
-        -> Result<(), ApplicationError>;
-}
-
-impl<'app> ApplicationMain<'app> {
-    // VPP: app_worker_flush_events_inline and app_worker event callbacks,
-    // session_input.c:80-153. C is monomorphized and borrowed directly.
-    pub fn dispatch_event<C: ApplicationCallbacks>(
-        &self,
-        callbacks: &mut C,
-        event: ApplicationEvent,
-    ) -> Result<(), ApplicationError>;
+// VPP: session_cleanup_ntf_t, session_types.h:173-177.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SessionCleanup {
+    Transport,
+    Session,
 }
 ```
 
+`accepted`、`connected`、`disconnected`、`reset` 是 VPP 校验时要求提供的四个槽
+（`application.c:623-631`）；`add_segment`/`del_segment` 是本阶段 attach/segment 路径的
+必需回调。builtin attach 还必须提供 `builtin_rx`，因为 VPP 在 RX event 上直接调用；
+`builtin_tx: None` 与 VPP 安装 no-op TX callback 等价（`application.c:633-634`）。
+`listened`/`unlistened` 只对 external app 使用，若该路径会产生对应事件，attach 必须有
+对应回调。其余 `Option` 只表示 VPP 真正可缺省的通知；不能以 `None` 吞掉已经产生的
+必需事件。`migrated: None` 时不能发起会产生 migrate event 的操作。
+VPP 在 `session_input.c:121-147` 忽略 builtin RX/TX callback 的 `int`，Rust 槽因此返回
+`()`；应用协议错误由具体插件记录并安排 Session 关闭。accept/connected 的失败按
+`session_input.c:157-232` 拒绝 Session，add/del segment 的失败按 `:313-329` 强制
+detach；它们用 `Result` 表达，不把所有 callback 塞进一个统一返回类型。
+
+VPP 另有 `fifo_tuning_callback`、`proxy_alloc_session_fifos`、
+`proxy_write_early_data`、`app_evt_callback`、`app_crypto_async`
+（`application_interface.h:61-74`）。本阶段没有它们的 service-owned typed 请求，
+也没有 iperf3 调用点；它们留在旧接口待对应功能迁移，不能为填满字段而使用
+`u64`/opaque 假签名或把 crypto/proxy 类型放进 service。
+
 The old `register_session_app(application, SessionAppVft)` and callback-table lookup are deprecated
-for migration and are removed after all consumers use `ApplicationCallbacks`. No replacement
-registration API, provider registry or callback closure is introduced.
+for migration. The in-progress `ApplicationCallbacks` trait/`dispatch_event<C>` and the single
+event-enum callback draft are superseded. There is no separate registration method, provider
+registry or callback-table wrapper.
+
+#### Builtin event dispatch: VPP path and the remaining boundary
+
+VPP does not create an event-consumer Node per builtin application. `app_worker_add_event` appends
+to the owning worker's event FIFO and marks that app worker pending on the Session worker
+(`application_worker.c:934-967`, `session.c:565-576`). The single `session-input` Node scans pending
+app workers, obtains `application_t` through `app_wrk->app_index`, and dispatches each event through
+that application's `cb_fns` (`session_input.c:80-160`, `:353-405`). For a builtin application it
+calls the callback directly on the Session worker; only an external application's event is copied
+to its SVM MQ. The callback runs before the event FIFO head advances, and remaining work re-arms
+`session-input` (`session_input.c:96-117`, `:337-388`). `vperf` supplies its callbacks at attach;
+`application_alloc_and_init` copies them into `application_t` (`vperf_server.c:408-454`,
+`application.c:696-703`). These are **runtime dispatch** facts, not just trait method signatures.
+
+The corresponding Hammer ownership remains service `SessionWorker`/`AppWorker` for the event FIFO,
+pending set, state transition and event order; service `ApplicationMain` for the application id,
+the per-event callback fields and their lifetime; and the application plugin for its concrete
+worker and business logic. Neither plugin-session nor TCP owns this dispatch. The single service
+`session-input` Node looks up the application by `u32`, matches the event, and calls only that
+event's `fn` field on the Session's Data Worker. It does not create an iperf3 Node or second event
+queue. `accepted`/`connected` can reject; `disconnected`/`reset` are notifications; `builtin_rx`
+and `builtin_tx` are direct FIFO-facing application operations. They are not collapsed into a
+single catch-all callback.
+
+Each field is a thin Rust `fn` pointer, not a `Box<dyn Fn>` or an extra callback-table struct.
+Independent plugin DSOs supply non-capturing closures or named functions. A generic `F: Fn` at
+attach alone cannot store different captured `F` types in the same non-generic Application pool
+without erasure; plugin state therefore lives in its own process Main, not in a closure capture.
+No `Arc`, per-callback allocation, VFT, callback-wrapper struct or provider is added. PluginMain
+retains the DSO until process exit (`plugin_loader.rs:35-75`); detach stops workers and removes
+pending events before removing the Application record and its callback entries.
+
+Event delivery retains VPP's builtin/external distinction, bounded flush, stale-session checks,
+callback-before-consume semantics and pending re-arm. Rust may temporarily take the event from
+its queue to end the queue borrow before invoking the closure, but the Session worker retains
+the obligation until the event-specific outcome is committed; a callback rejection follows the
+same accept/connect/segment cleanup decision as VPP and cannot silently lose the event.
+`SESSION_CTRL_EVT_CLEANUP` first notifies the Application only while the Session remains attached;
+the Session-stage cleanup still returns its FIFO pair and removes the Session after a rejected
+accept cleared `app_wrk_index` (`session_input.c:279-305`, `session.c:300-304`). A stale handle
+or a Session now owned by another AppWorker must not be removed by the old worker's event.
+No callback is invoked while holding the ApplicationMain mutation guard, an SVM MQ lock or a
+WorkerBarrier. `app_worker_flush_events_inline` is VPP `always_inline`
+(`session_input.c:80-83`); in Rust only bounded worker-local enqueue/lookup may use `#[inline]`,
+not attach, DSO selection, error conversion or an indirect `fn` call. Callback failure remains a
+typed `ApplicationError` with original plugin source at this DSO boundary, never a numeric retval.
 
 ```rust
 // VPP: application_alloc_and_init, application.c:664-767; application_t.ns_index,
@@ -315,6 +361,24 @@ pub struct ApplicationConfig {
     pub flags: ApplicationFlags,
     pub name: String,
     pub segment: SegmentManagerProperties,
+    // VPP: app_init_args_t.session_cb_vft, application_interface.h:77-84;
+    // copied into application_t.cb_fns at application.c:696-703.
+    pub add_segment: fn(u32, u64) -> Result<(), ApplicationError>,
+    pub del_segment: fn(u32, u64) -> Result<(), ApplicationError>,
+    pub accepted: fn(&mut SessionWorker, SessionHandle) -> Result<(), ApplicationError>,
+    pub connected: fn(&mut SessionWorker, u32, u64, Option<SessionHandle>, Option<SessionError>)
+        -> Result<(), ApplicationError>,
+    pub disconnected: fn(&mut SessionWorker, SessionHandle),
+    pub reset: fn(&mut SessionWorker, SessionHandle),
+    pub transport_closed: Option<fn(&mut SessionWorker, SessionHandle)>,
+    pub cleanup: Option<fn(&mut SessionWorker, SessionHandle, SessionCleanup)>,
+    pub half_open_cleanup: Option<fn(&mut SessionWorker, SessionHandle)>,
+    pub migrated: Option<fn(&mut SessionWorker, SessionHandle, SessionHandle)>,
+    pub listened: Option<fn(u32, u32, SessionHandle, Option<SessionError>)
+        -> Result<(), ApplicationError>>,
+    pub unlistened: Option<fn(u32, SessionHandle, u32, Option<SessionError>)>,
+    pub builtin_rx: Option<fn(&mut SessionWorker, SessionHandle)>,
+    pub builtin_tx: Option<fn(&mut SessionWorker, SessionHandle)>,
 }
 
 // VPP: app_rx_mq_flags_t, application.h:103-107.
@@ -368,7 +432,7 @@ use hammer_infra::pool::Pool;
 use hammer_infra::svm::fifo::Fifo as SvmFifo;
 use hammer_infra::svm::fifo_segment::SvmFifoSegment;
 use hammer_infra::svm::msg_queue::SvmMsgQ;
-use hammer_runtime::sync::RwLock;
+use std::sync::RwLock;
 
 // VPP: segment_manager_props_t, segment_manager.h:15-37.
 pub struct SegmentManagerProperties {
@@ -434,7 +498,13 @@ impl<'segment> SegmentManagerMain<'segment> {
     #[inline(always)]
     pub fn get(&self, manager: u32) -> Option<&SegmentManager<'segment>>;
 
-    pub fn free(&mut self, manager: u32) -> Result<(), SegmentManagerError>;
+}
+
+impl SegmentManagerMain<'static> {
+    // VPP: segment_manager_free_safe, segment_manager.c:566-579;
+    // the thread-zero main loop polls this future under WorkerBarrier, then
+    // Rust drop releases the removed manager and its owned segments.
+    pub(crate) fn remove_detached(index: u32);
 }
 
 impl<'segment> SegmentManager<'segment> {
@@ -450,8 +520,8 @@ impl<'segment> SegmentManager<'segment> {
     pub fn event_queue(&self) -> &'segment SvmMsgQ;
 
     // VPP: segment_manager_alloc_session_fifos,
-    // segment_manager.c:744-892. The pair is allocated before a Session is
-    // inserted into its worker pool; no FIFO field is optional afterwards.
+    // segment_manager.c:744-892. The worker validates its accepted Session,
+    // then allocates and attaches the pair without exposing it to callers.
     pub fn allocate_session_fifos(
         &self,
         worker: DataWorkerId,
@@ -465,27 +535,57 @@ impl<'segment> SegmentManager<'segment> {
         worker: DataWorkerId,
     ) -> Result<(SvmFifo, SvmFifo), SegmentManagerError>;
 
-    // VPP: segment_manager_dealloc_fifos/dealloc_fifos_ct,
-    // segment_manager.h:136-148 and segment_manager.c:892-934.
-    pub fn deallocate_session_fifos(
-        &self,
-        rx_fifo: SvmFifo,
-        tx_fifo: SvmFifo,
-    ) -> Result<(), SegmentManagerError>;
-
     // VPP: segment_manager_init_free/segment_manager_free_safe,
     // segment_manager.c:524-584.
     pub fn mark_detached(&mut self);
-    pub fn free(self) -> Result<(), SegmentManagerError>;
 }
 ```
 
-The only `Option` at this boundary is an ordinary lookup result such as `ApplicationMain::application`
-or a pool lookup. An initialized `Application`, `Session`, `AppWorker` or `CtConnection` always has
-its required name, segment, event-queue address and FIFO values; `rx_fifo`/`tx_fifo` are not optional.
-The SVM segment or manager owns queue storage, while application records retain VPP-style non-owning
-queue references. Allocation failure is returned before publication; cleanup takes the two concrete
-FIFO values back to the same `SegmentManager`.
+The only `Option` at this boundary is an ordinary lookup result or a real Session lifecycle
+distinction: a listening or newly accepted Session has no FIFO pair; after application attachment
+it has both. The SVM segment owns its `Pool<SvmFifo>` and queue storage. The Session worker
+validates the accepted Session before asking the Segment Manager for its pair, then installs both
+values and the AppWorker identity without an intervening fallible step. The pair never leaves this
+owner operation as an unguarded value. VPP `session_cleanup` calls `segment_manager_dealloc_fifos` before
+`session_free` (`session.c:300-304`); Hammer removes the owned Session from its Rust `Pool`, and
+`Session::drop` returns both FIFO pool entries through the segment owner before cleanup returns.
+The removed Session value remains alive during `Drop`, so its FIFO identities are still valid.
+Removing the manager from its pool then drops its segments by Rust ownership. Merely dropping a FIFO borrow
+does not return the SVM shared-memory chunks: infra currently performs that work in
+`SvmFifoSegment::free_server_fifo`. This is an internal owner cleanup step, not a public
+`deallocate_session_fifos`/`free(self)` API or a second `SessionAllocation` ledger. The same
+ownership ordering applies to CT (`application_local.c:214-233`).
+
+若 detach 时仍有 FIFO，manager 留在 service pool 中并拒绝新分配。所属 worker 归还最后一对
+FIFO 后，由 `Session::drop` 调用 `SegmentManagerMain::remove_detached`；它把只捕获 manager `u32` index 的
+future 放入 runtime 的
+`SpinLock<Vec<Pin<Box<dyn Future<Output = ()> + Send>>>>` pending 队列；enqueue 是显式
+`F: Future<Output = ()> + Send + 'static` 泛型，只有入队时才把具体 `F` 擦除。enqueue
+只唤醒 thread-0 main loop，不直接 `spawn` 执行；`Notify` 留在 `main_loop` 内，
+由调度循环直接等待，不暴露额外唤醒 helper。main loop 自己持有 processing Vec，
+每轮在 File 轮询前与 pending 在 SpinLock 下交换，释放锁后持有一次 WorkerBarrier poll
+该批 future；未就绪的 future 在释放 barrier 后回到 pending，后续由其 waker 再唤醒
+main loop。移除前在 barrier 内复查 detached/empty，
+成立才移除 pool entry，由 Rust drop 释放 manager 及其 segments。VPP 对应
+`segment_manager_dealloc_fifos` -> `segment_manager_free_safe` ->
+`vlib_rpc_call_main_thread` -> `vlib_rpc_call_main_thread_process`，其批次交换、barrier
+和调用时机见 `segment_manager.c:892-949,566-579`、`threads.c:1663-1737`、
+`main.c:1497-1512`。类型擦除仅在 runtime 的通用跨 owner future 队列内部，不引入
+service 专用队列、Process Node 或 Session/Transport `dyn` dispatch。
+
+```rust
+// VPP: vlib_rpc_call_main_thread_inline, threads.c:1663-1693;
+// vlib_rpc_call_main_thread_process, threads.c:1709-1737;
+// vlib_main_or_worker_loop, main.c:1497-1512.
+pub fn enqueue_main_thread_future<F>(future: F)
+where
+    F: Future<Output = ()> + Send + 'static,
+{
+    PENDING_MAIN_THREAD_FUTURES.lock().push(Box::pin(future));
+    MAIN_THREAD_FUTURES_READY.notify_one();
+}
+```
+
 
 ### 3.3 AppWorker 与 SVM ownership
 
@@ -553,8 +653,6 @@ impl<'segment> AppWorker<'segment> {
     pub fn flush_events(&mut self, worker: DataWorkerId)
         -> Result<(), ApplicationError>;
 
-    // VPP: app_worker_free, application_worker.c:48-134.
-    pub fn free(self) -> Result<(), ApplicationError>;
 }
 ```
 
@@ -594,6 +692,7 @@ pub enum ApplicationEvent {
     Listened { application: u32, listener: u32, opaque: u64 },
     Unlistened { application: u32, listener: u32, opaque: u64 },
 }
+
 ```
 
 ### 3.4 ApplicationListener
@@ -603,6 +702,7 @@ accepting app workers、accept rotor、由 Session 分配的 global/local listen
 以及 connectionless worker listener 的 service-owned pool mapping。IP key 不进入该 record。
 
 ```rust
+use std::sync::atomic::AtomicU32;
 use hammer_infra::bitmap::Bitmap;
 
 // VPP: app_listener_t, application.h:88-101; application.c:24-186.
@@ -610,7 +710,7 @@ pub struct ApplicationListener {
     index: u32,
     application: u32,
     workers: Bitmap<u32>,
-    accept_rotor: u32,
+    accept_rotor: AtomicU32,
     global_session: Option<SessionHandle>,
     local_session: Option<SessionHandle>,
     worker_sessions: Vec<u32>,
@@ -626,7 +726,7 @@ impl ApplicationListener {
 
     // VPP: app_listener_select_worker, application.c:172-185.
     #[inline]
-    pub fn select_worker(&mut self) -> Result<u32, ApplicationError>;
+    pub fn select_worker(&self) -> Result<u32, ApplicationError>;
 
     // VPP: app_listener_get_session/get_local_session/get_wrk_cl_session,
     // application.c:188-210.
@@ -639,13 +739,19 @@ impl ApplicationListener {
 }
 ```
 
+The accepting-worker bitmap changes only while WorkerBarrier stops Data Workers. Multiple workers
+may select from that published bitmap concurrently, so Rust represents VPP's scalar
+`app_listener_t.accept_rotor` with an atomic compare-exchange; it does not add a listener-table lock
+or a second worker registry (`application.c:172-185`).
+
 Worker attach/detach follows `app_worker_start_listen`/`app_worker_stop_listen`
 (`application_worker.c:338-384`, `:466-490`): the first worker creates the listening Sessions and
 transport listener; each additional app worker only receives a listener segment and is added to the
 worker set. The last-worker path is a two-owner cleanup: `IpSessionMain` removes the IP lookup entry
-and the concrete plugin stops the transport, then `ApplicationMain::remove_listener` deallocates the
-generic listener FIFOs/segments and frees the application listener. `ApplicationListener` itself
-does not call an IP or transport operation.
+and the concrete plugin stops the transport, then `ApplicationMain::remove_listener` detaches the
+listener segment managers, frees its listening Sessions through the supplied `SessionMain`, and
+removes the application listener. `ApplicationListener` itself does not call an IP or transport
+operation.
 
 ## 4. Session record and app/session relation
 
@@ -866,10 +972,10 @@ pub type IpCtMain = CtMain<IpTransportConnectionId, u32>;
 impl IpSessionMain {
     // VPP: application-local setup is part of the concrete session/transport
     // composition; application_local.c:38 and transport.c:1251-1290.
-    pub fn init(config: IpSessionConfig) -> Result<(), IpSessionError>;
+    pub fn init(config: IpSessionConfig) -> Result<(), SessionError>;
 
     #[inline(always)]
-    pub fn global() -> Result<&'static Self, IpSessionError>;
+    pub fn global() -> Result<&'static Self, SessionError>;
 }
 ```
 
@@ -904,6 +1010,7 @@ impl<'app> ApplicationMain<'app> {
 
     pub fn attach_listener_session(
         &mut self,
+        session_main: &SessionMain<u32>,
         listener: u32,
         global: Option<SessionHandle>,
         local: Option<SessionHandle>,
@@ -921,7 +1028,11 @@ impl<'app> ApplicationMain<'app> {
         worker: u32,
     ) -> Result<(), ApplicationError>;
 
-    pub fn remove_listener(&mut self, listener: u32) -> Result<(), ApplicationError>;
+    pub fn remove_listener(
+        &mut self,
+        session_main: &SessionMain<u32>,
+        listener: u32,
+    ) -> Result<(), ApplicationError>;
 }
 
 // VPP: session_listen, session_open, session_open_stream,
@@ -930,8 +1041,13 @@ impl SessionMain {
     pub fn allocate_listening_session<O>(
         &self,
         session_type: u8,
+        application_worker: u32,
         opaque: O,
     ) -> Result<SessionHandle, SessionError>;
+
+    // VPP: listen_session_free, session.h:1060-1065. This is also used
+    // by listen rollback before the ApplicationListener is published.
+    pub fn cleanup_listening_session(&self, session: SessionHandle) -> Option<()>;
 
     pub fn attach_connection(
         &self,
@@ -960,11 +1076,86 @@ These service methods do not accept `SocketAddr`, FIB ids, IP family fields or a
 object. `connection_index` is only the numeric backlink already present in VPP's `session_t`; its
 meaning is owned by the concrete transport.
 
+`allocate_listening_session` records the AppWorker index before transport bind, as
+`app_worker_listen_sep` sets `ls->app_wrk_index` before `session_listen`. Successful
+`attach_listener_session` receives the already borrowed service `SessionMain` and immediately sets
+each listening Session's generic `application_listener: u32` backlink, matching VPP's
+`ls->al_index` assignment after listen succeeds and before lookup publication
+(`application_worker.c:253-315`). Subsequent accepting workers do not replace that Session owner.
+`listener_for_session` reads this direct backlink; it
+does not scan the Application listener pool or re-fetch a process Main per step.
+
+`SessionEndpointConfig<T>` is the protocol-neutral runtime request corresponding to VPP
+`session_endpoint_cfg_t` (`session_types.h:70-112`, `:138-150`). It extends the existing
+`SessionEndpoint<T>` with application worker, opaque, namespace, original transport protocol,
+parent handle and endpoint flags. `T` is owned by the concrete transport boundary; service does
+not interpret its address, family, FIB or interface. No second endpoint base is introduced.
+
+```rust
+// VPP: session_types.h:70-112, :138-150; transport_types.h:229-259.
+pub struct SessionEndpointConfig<T> {
+    pub endpoint: SessionEndpoint<T>,
+    pub application_worker: Option<u32>,
+    pub opaque: Option<u32>,
+    pub namespace: u32,
+    pub original_transport_protocol: Option<u8>,
+    pub parent: Option<SessionHandle>,
+    pub flags: SessionEndpointFlags,
+}
+
+impl<T> SessionEndpointConfig<T> {
+    // VPP: SESSION_ENDPOINT_CFG_NULL. Namespace defaults to index zero;
+    // the absent fields represent invalid defaults or an inactive override.
+    #[inline]
+    pub const fn new(endpoint: SessionEndpoint<T>) -> Self;
+}
+```
+
+VPP sets `app_wrk_index` after resolving the application worker in `vnet_listen`
+(`application.c:1277-1297`), and sets `opaque` from connect context in `vnet_connect`
+(`application.c:1324-1338`). The request constructor therefore leaves those fields absent;
+the owning operation fills them at that point. A transport operation receives
+`&config.endpoint` only after the session/application metadata has been consumed.
+There is intentionally no `From<SessionEndpointConfig<T>> for SessionEndpoint<T>`: such a
+conversion would silently discard that metadata. VPP `ext_cfgs` is a separately owned,
+variable-length transport extension (`transport_types.h:413-439`); this phase does not
+support extended endpoint configuration, so TLS/HTTP/QUIC extension requests cannot be
+represented or accepted as if they were an empty extension.
+
 ### 5.2 Plugin-session composition
 
 `IpSessionMain` owns the concrete IP composition and uses the already initialized service
 `SessionMain`. It does not contain a second SessionMain, an application pool, or application callbacks.
 Its global lifecycle is also only `init` and `global`; there is no publication method.
+
+For a listener, plugin-session resolves the application namespace into the concrete IP
+family, FIB and interface before the transport sees the request. The application's stored
+namespace and the request namespace must be the same; a caller may not use this constructor
+to change an attached application's namespace. Unlike a connect request, the supplied
+`SocketAddr` is the listening local endpoint. Port zero is not rejected by the endpoint
+constructor; port allocation or listener validation belongs to the subsequent operation.
+
+```rust
+// VPP: session_endpoint_update_for_app, application.c:1232-1269;
+// vnet_listen, application.c:1277-1321. IP facts stay in plugin-session.
+pub type IpSessionEndpointConfig = SessionEndpointConfig<IpTransportEndpointConfig>;
+
+impl IpSessionMain {
+    pub fn listen_endpoint_config(
+        &self,
+        address: SocketAddr,
+        namespace: u32,
+        transport_protocol: u8,
+    ) -> Result<IpSessionEndpointConfig, SessionError>;
+}
+```
+
+`listen_endpoint_config` returns `SessionError::InvalidNamespace` for an absent namespace
+and `SessionError::NoRoute` when that namespace has no FIB for the requested family;
+the service error enum uses VPP `SESSION_E_INVALID_NS` and `SESSION_E_NOROUTE` categories
+(`session_types.h:519-576`) without numeric return codes. Address membership validation
+and the actual listener bind remain later listen-stage work; constructing this request
+does not claim that the address is already listening or local to an interface.
 
 ```rust
 use std::sync::OnceLock;
@@ -982,10 +1173,10 @@ pub struct IpSessionMain {
 static IP_SESSION_MAIN: OnceLock<IpSessionMain> = OnceLock::new();
 
 impl IpSessionMain {
-    pub fn init(config: IpSessionConfig) -> Result<(), IpSessionError>;
+    pub fn init(config: IpSessionConfig) -> Result<(), SessionError>;
 
     #[inline(always)]
-    pub fn global() -> Result<&'static Self, IpSessionError>;
+    pub fn global() -> Result<&'static Self, SessionError>;
 
     // VPP: INVALID_NS handling in session_types.h:541-543 and application
     // namespace lookup before app_worker_listen_sep, application_worker.c:230-322.
@@ -994,7 +1185,7 @@ impl IpSessionMain {
         &self,
         application: u32,
         namespace: u32,
-    ) -> Result<(), IpSessionError>;
+    ) -> Result<Option<()>, SessionError>;
 
     #[inline]
     pub fn lookup(&self, connection: &IpTransportConnectionId)
@@ -1015,63 +1206,37 @@ impl IpSessionMain {
         &self,
         connection: IpTransportConnectionId,
         session: SessionHandle,
-    ) -> Result<(), IpSessionError>;
+    ) -> Result<(), SessionError>;
 
     pub fn remove_connection(
         &self,
         connection: &IpTransportConnectionId,
         expected: SessionHandle,
-    ) -> Result<(), IpSessionError>;
+    ) -> Result<(), SessionError>;
 
     // Binds a transport-created listening connection to the service listener.
     // The caller has already performed the concrete Transport<T> operation.
     pub fn add_listener(
         &self,
-        connection: IpTransportConnectionId,
+        endpoint: &IpSessionEndpoint,
         listener: u32,
         session: SessionHandle,
-    ) -> Result<(), IpSessionError>;
+    ) -> Result<(), SessionError>;
 
     pub fn remove_listener(
         &self,
-        connection: &IpTransportConnectionId,
+        endpoint: &IpSessionEndpoint,
         listener: u32,
         session: SessionHandle,
-    ) -> Result<(), IpSessionError>;
+    ) -> Result<(), SessionError>;
 }
 ```
 
-```rust
-// VPP: SESSION_E_NOIP, SESSION_E_NOINTF, SESSION_E_NOROUTE,
-// SESSION_E_PORTINUSE and SESSION_E_ADDR_NOT_IN_USE,
-// session_types.h:526-539. These are IP endpoint/table failures, so their
-// owner is plugin/session rather than the protocol-neutral ApplicationMain.
-#[hammer_component_macros::runtime_error(subsystem = "session ip")]
-#[derive(Debug, thiserror::Error)]
-pub enum IpSessionError {
-    #[error("IP endpoint is invalid for the requested transport")]
-    InvalidEndpoint { protocol: u8 },
-    #[error("IP listener endpoint is already in use")]
-    ListenerInUse,
-    #[error("IP listener endpoint is not present in the lookup table")]
-    ListenerMissing,
-    #[error("IP session lookup entry is missing")]
-    LookupMissing,
-    #[error("application namespace {namespace} does not exist")]
-    InvalidNamespace { namespace: u32 },
-    #[error("IP session lookup entry belongs to another Session")]
-    SessionOwnerMismatch {
-        expected: SessionHandle,
-        actual: SessionHandle,
-    },
-    #[error("IP endpoint has no resolving interface")]
-    InterfaceMissing,
-    #[error("IP endpoint has no local address")]
-    AddressMissing,
-    #[error("IP route is unavailable for the endpoint")]
-    RouteMissing,
-}
-```
+IP lookup methods reuse the existing service `SessionError` categories: `InvalidNamespace`,
+`NoRoute`, `AlreadyListening`, `AddressNotInUse`, and `Owner`. These correspond to VPP
+`SESSION_E_INVALID_NS`, `SESSION_E_NOROUTE`, `SESSION_E_ALREADY_LISTENING`,
+`SESSION_E_ADDR_NOT_IN_USE`, and `SESSION_E_OWNER` (`session_types.h:519-576`). No parallel
+`IpSessionError` is introduced and no numeric retval crosses the Rust boundary.
 
 `IpSessionMain` may call the service `ApplicationMain`/`SessionMain` directly by their concrete
 owner APIs, but service never imports `IpSessionMain`. The IP plugin is therefore the only layer that
@@ -1121,19 +1286,29 @@ owned by another application returns `ApplicationError::AlreadyListening`.
 For a new listener:
 
 1. `ApplicationMain::allocate_listener` creates the generic app-listener record.
-2. `SessionMain::allocate_listening_session` creates the service listening Session on the listener
-   thread, matching VPP's `listen_session_alloc`.
-3. TCP/UDP calls `Transport<IpTransportEndpointConfig>::start_listen` with the existing endpoint.
-4. `IpSessionMain::add_listener` adds the IP lookup identity and validates the Session/connection
-   backlink.
-5. `ApplicationMain::attach_listener_session` and `attach_listener_worker` install the listener
-   Session and allocate the worker's SVM FIFO segment.
+2. `SessionMain::allocate_listening_session` creates the service listening Session in its
+   Main-Thread-owned control pool. VPP's `listen_session_alloc` uses thread 0's pool
+   (`session.h:1044-1052`); Hammer thread 0 is not a Data Worker, so the control handle uses the
+   slot after the configured Data Worker indices while TCP may still accept on Data Worker 0.
+3. TCP/UDP calls `Transport<IpTransportEndpointConfig>::start_listen` with the existing endpoint;
+   `SessionMain::attach_connection` records the returned transport connection index.
+4. `ApplicationMain::attach_listener_session` records the listening Session on the listener.
+5. `IpSessionMain::add_listener` publishes the concrete endpoint in the IP lookup table.
+6. `ApplicationMain::attach_listener_worker` allocates the worker's SVM FIFO segment and sets its
+   accepting-worker bit.
 
-If steps 3-5 fail, cleanup calls the concrete transport stop operation, removes the IP lookup entry,
-stops/frees the service listening Session, and removes the application listener. Cleanup errors are
-reported separately from the primary error; they never replace it. This mirrors VPP's
-`app_worker_listen_sep` rollback and `app_listener_cleanup` (`application_worker.c:230-322`,
-`application.c:145-170`).
+This follows `app_worker_listen_sep`: VPP calls `session_listen`, sets `al->session_index` and
+`ls->al_index`, publishes the lookup entry, then `app_worker_start_listen` allocates the segment
+manager and sets the worker bit (`application_worker.c:275-315`, `:338-384`). If `start_listen`
+fails before step 4, the orchestrator directly calls `SessionMain::cleanup_listening_session` and
+removes the empty listener, matching VPP's immediate `session_free` on `session_listen` failure
+(`application_worker.c:290-295`). Once step 4 succeeds, `ApplicationMain::remove_listener` owns
+Session release even if lookup publication or worker attach later fails. The orchestrator removes
+only a lookup entry it published and stops only a transport it started before that service cleanup;
+it never directly frees the already attached Session. VPP's `vnet_listen` calls
+`app_listener_cleanup` when a failed start left no worker attached; that cleanup stops and frees
+each Session recorded on the listener (`application.c:1303-1315`, `:145-170`). Cleanup errors are
+reported separately from the primary error and never replace it.
 
 Accept and connect use the same ownership direction:
 
@@ -1259,6 +1434,14 @@ pub enum ApplicationError {
     MessageAllocation { source: SvmMsgQError },
     #[error("application callback rejected the session")]
     CallbackRejected,
+    // VPP callback status is interpreted per event in session_input.c:157-232;
+    // Rust keeps a plugin error's source at the DSO/application boundary.
+    #[error("builtin application {application} callback failed")]
+    BuiltinCallback {
+        application: u32,
+        #[source]
+        source: Box<dyn std::error::Error + Send + Sync>,
+    },
     #[error("application listener segment cleanup failed")]
     ListenerSegmentCleanup { listener: u32, source: SegmentError },
     #[error("application event queue detach failed")]
@@ -1296,6 +1479,11 @@ pub enum SessionError {
     TransportNotRegistered { protocol: u8 },
     #[error("session operation is invalid in the current state")]
     InvalidState { session: SessionHandle },
+    // VPP: session_types.h:526-543, SESSION_E_NOROUTE/INVALID_NS.
+    #[error("IP route is unavailable for the requested endpoint")]
+    NoRoute,
+    #[error("invalid Application Namespace")]
+    InvalidNamespace,
     #[error("session FIFO pair could not be allocated")]
     SegmentNoSpace { session: SessionHandle },
     #[error("transport close/delete notification arrived for a missing Session")]
@@ -1391,7 +1579,7 @@ target design and must not be extended:
 
 | Deprecated surface | Replacement | VPP/Hammer evidence |
 | --- | --- | --- |
-| `SessionAppVft`, `session_cb_vft_t`, `register_session_app` and callback-table lookup | `ApplicationCallbacks` static trait plus `ApplicationMain::dispatch_event<C>` | VPP `application_t.cb_fns`, `application.h:127-129`; callback calls `application_worker.c:934-1001` |
+| `SessionAppVft`, `session_cb_vft_t`, `register_session_app` and callback-table lookup; the in-progress `ApplicationCallbacks` trait | per-event Rust `fn` fields directly on `Application` and `ApplicationConfig`, not a callback wrapper struct | VPP `session_cb_vft_t`, `application_interface.h:15-75`; `session_input.c:119-335` |
 | `TransportVft`, function-pointer protocol registry and `dyn Transport` | service `Transport<T>` trait implemented directly by concrete TCP/UDP Main | ADR-0038 static trait decision; VPP transport operations `transport.h:60-154` |
 | `TransportConnection<()>`, `CtTransportConnection`, or a second common transport base | existing `TransportConnection<E, O>` plus generic `CtConnection<E, O>` extension, concretized as `IpCtConnection` in plugin-session | ADR-0038 `TransportConnection<E, O>`, VPP `ct_connection_t`, `application_local.h:31-45` |
 | `ApplicationWorkerState`/`Box<[ApplicationWorkerState]>` and a separate pending queue | `ApplicationMain.pending_rx_mq_heads: Vec<u32>` plus `ApplicationRxMq.next/previous` | VPP `appsl_wrk_t`/`app_rx_mq_elt_t`, `application.h:103-117`, `:196-203` |
@@ -1405,7 +1593,7 @@ does not preserve a second dispatch path.
 ## 10. Migration and non-decisions
 
 1. Keep the existing service `ApplicationMain`, `AppWorker` and SVM FIFO/MQ as the migration starting
-   point; replace the old callback surface with `ApplicationCallbacks` and move only fields that are
+   point; replace the old callback surface with application-owned per-event Rust `fn` fields and move only fields that are
    IP/transport facts into `IpSessionMain`.
 2. Replace numeric internal `SESSION_E_*` returns in the application/session path with the three
    owner-local typed error families above. Do not create `ApiError`, `error_codes!`, numeric code
@@ -1419,8 +1607,8 @@ does not preserve a second dispatch path.
    `ApplicationNamespaceIndex`, FIB fields, `ip4_fib_id + ip6_fib_id`, socket handles or a binding
    object to `Application`/`ApplicationListener`.
 5. Do not add `Vec<Option<_>>`, a new mailbox, `multi_ring_msg_queue`, `SessionRuntimeEngine`,
-   `SessionScheduler`, `publish` APIs, generic provider traits, `dyn` dispatch, or TCP/UDP Session
-   nodes.
+   `SessionScheduler`, `publish` APIs, generic provider traits, `dyn` dispatch or TCP/UDP Session
+   nodes. The application-owned per-event Rust `fn` fields above are the runtime DSO callback boundary.
 6. Do not change `hammer-ipc` ownership. Binary API declarations remain in the owner plugin and IPC
    remains the transport/codec capability as established by earlier ADRs.
 

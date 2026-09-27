@@ -99,6 +99,7 @@ pub use plugin::{
     host_meets_plugin_requirement,
 };
 pub use process::Process;
+pub use main_loop::enqueue_main_thread_future;
 pub use session::{SessionConnectEndpoint, SessionListenEndpoint};
 pub use thread_main::ThreadMain;
 pub use thread_main::{ensure_main_thread, ensure_main_thread_with_barrier};

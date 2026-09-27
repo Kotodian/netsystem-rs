@@ -29,9 +29,9 @@ use hammer_runtime::{
     DataPlaneMain, DataWorkerId, Deadline, FILE_MAIN, File, FileFunctions, NodeMain, NodeRuntime,
 };
 
-use crate::session::app::AppWorkerError;
 use crate::session::application::{ApplicationMain, application_main};
 use crate::session::error::{SessionError, SessionQueueError};
+use crate::session::legacy_app::AppWorkerError;
 use crate::session::node::{AppSessionInputNode, SessionQueueTransportDispatch};
 use crate::session::protocol::SessionAppVft;
 use crate::session::state::SessionState;
@@ -1528,7 +1528,7 @@ impl SessionWorker {
         for buffer in runtime.chain(index) {
             source_len = source_len
                 .checked_add(buffer.current_len())
-                .ok_or(SessionError::RxLengthOverflow { session_id })?;
+                .expect("packet chain length fits usize");
         }
         if payload_end > source_len {
             return Err(SessionError::DatagramLengthMismatch {
@@ -3720,7 +3720,7 @@ impl SessionWorker {
         for buffer in runtime.chain(index) {
             let chunk = buffer.current();
             let chunk_len = u32::try_from(chunk.len())
-                .map_err(|_| SessionError::RxLengthOverflow { session_id })?;
+                .expect("a packet buffer's current length fits the Session FIFO index");
             if accepted == total {
                 let rx_available_before = entry.rx_fifo.max_enqueue();
                 if chunk.len() >= rx_available_before {
@@ -3731,14 +3731,14 @@ impl SessionWorker {
                 let promoted_now = wrote.saturating_sub(accepted_now);
                 accepted = accepted
                     .checked_add(accepted_now as u32)
-                    .ok_or(SessionError::RxLengthOverflow { session_id })?;
+                    .expect("RX packet chain length fits u32");
                 promoted = promoted
                     .checked_add(promoted_now as u32)
-                    .ok_or(SessionError::RxLengthOverflow { session_id })?;
+                    .expect("promoted RX FIFO bytes fit u32");
             }
             total = total
                 .checked_add(chunk_len)
-                .ok_or(SessionError::RxLengthOverflow { session_id })?;
+                .expect("RX packet chain length fits u32");
         }
         self.publish_rx_enqueue(session_id, accepted as usize + promoted as usize)?;
         Ok((accepted, promoted))
@@ -3779,10 +3779,10 @@ impl SessionWorker {
                 })?;
             accepted = accepted
                 .checked_add(result.accepted)
-                .ok_or(SessionError::RxLengthOverflow { session_id })?;
+                .expect("RX packet chain length fits u32");
             delivered = delivered
                 .checked_add(result.delivered)
-                .ok_or(SessionError::RxLengthOverflow { session_id })?;
+                .expect("promoted RX FIFO bytes fit u32");
             if let Some(start) = result.start {
                 let end = start
                     .checked_add(result.len)
@@ -3792,7 +3792,7 @@ impl SessionWorker {
             }
             total_len = total_len
                 .checked_add(current.len() as u32)
-                .ok_or(SessionError::RxLengthOverflow { session_id })?;
+                .expect("RX packet chain length fits u32");
         }
         let newest = match (newest_start, newest_end) {
             (Some(start), Some(end)) => Some((
@@ -3878,7 +3878,9 @@ pub struct TxBatchBuffer {
     pub payload_len: usize,
 }
 
-#[deprecated(note = "legacy Session Queue transport callback contract; use service Session Queue facts and concrete protocol workers")]
+#[deprecated(
+    note = "legacy Session Queue transport callback contract; use service Session Queue facts and concrete protocol workers"
+)]
 pub trait SessionTransport: Sized {
     type Tx: SessionTxStrategy<Self>;
 
@@ -3951,7 +3953,9 @@ pub trait SessionTransport: Sized {
     }
 }
 
-#[deprecated(note = "legacy Session Queue transport callback contract; use service Session Queue facts and concrete protocol workers")]
+#[deprecated(
+    note = "legacy Session Queue transport callback contract; use service Session Queue facts and concrete protocol workers"
+)]
 pub trait SessionPacketizedTransport: SessionTransport {
     fn control_tx(
         &mut self,
@@ -3981,7 +3985,9 @@ pub trait SessionPacketizedTransport: SessionTransport {
     ) -> RuntimeResult<()>;
 }
 
-#[deprecated(note = "legacy Session Queue transport callback contract; use service Session Queue facts and concrete protocol workers")]
+#[deprecated(
+    note = "legacy Session Queue transport callback contract; use service Session Queue facts and concrete protocol workers"
+)]
 pub trait TransportInternalTransport: SessionTransport {
     fn internal_tx(
         &mut self,
@@ -4153,7 +4159,9 @@ where
     }
 }
 
-#[deprecated(note = "legacy callback-driven queue entry; use the service-owned Session Queue nodes")]
+#[deprecated(
+    note = "legacy callback-driven queue entry; use the service-owned Session Queue nodes"
+)]
 pub fn dispatch_session_queue_once<T>(
     runtime: &mut DataPlaneMain,
     node_runtime: &mut hammer_runtime::NodeRuntime,
@@ -4184,7 +4192,9 @@ where
     Ok(step)
 }
 
-#[deprecated(note = "legacy callback-driven queue entry; use the service-owned Session Queue nodes")]
+#[deprecated(
+    note = "legacy callback-driven queue entry; use the service-owned Session Queue nodes"
+)]
 pub fn dispatch_session_queue_pending<T>(
     runtime: &mut DataPlaneMain,
     sessions: &mut SessionWorker,
@@ -4212,7 +4222,9 @@ where
     Ok(step)
 }
 
-#[deprecated(note = "legacy callback-driven queue entry; use the service-owned Session Queue nodes")]
+#[deprecated(
+    note = "legacy callback-driven queue entry; use the service-owned Session Queue nodes"
+)]
 pub fn dispatch_session_queue_events<T>(
     runtime: &mut DataPlaneMain,
     sessions: &mut SessionWorker,

@@ -261,7 +261,9 @@ impl TransportMain for IpTransportMain {
         let previous = endpoint.references.fetch_sub(1, Ordering::AcqRel);
         assert_ne!(previous, 0, "local endpoint reference count underflowed");
         if previous != 1 {
-            return Err(SessionError::AddressNotInUse);
+            // VPP transport.c:711-714 returns -1 here only to report that
+            // the endpoint was not deleted; the reference was released.
+            return Ok(());
         }
         let removed = self
             .local_endpoints_table

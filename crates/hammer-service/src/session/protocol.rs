@@ -8,6 +8,7 @@ use super::runtime::SessionWorker;
 /// Concrete static callback table matching VPP `session_cb_vft_t`.
 ///
 /// All 19 VPP callbacks are present. Unimplemented callbacks remain `None`.
+#[deprecated(note = "Use direct event fields on ApplicationConfig for new applications")]
 #[derive(Debug, Clone, Copy)]
 pub struct SessionAppVft {
     pub name: &'static str,
@@ -32,6 +33,7 @@ pub struct SessionAppVft {
     pub crypto_async: Option<fn(&mut SessionWorker, u32, u64) -> RuntimeResult<()>>,
 }
 
+#[allow(deprecated)]
 impl SessionAppVft {
     pub const fn all_none(name: &'static str) -> Self {
         Self {
@@ -59,6 +61,7 @@ impl SessionAppVft {
     }
 }
 
+#[allow(deprecated)]
 impl Default for SessionAppVft {
     fn default() -> Self {
         Self::all_none("")
@@ -66,8 +69,8 @@ impl Default for SessionAppVft {
 }
 
 /// Registers one owner-defined Session App VFT on its owning Application.
-/// The callback table is already monomorphized in the plugin; Session workers
-/// resolve only the selected numeric slot and never store plugin state.
+#[deprecated(note = "Use direct event fields on ApplicationConfig for new applications")]
+#[allow(deprecated)]
 pub fn register_session_app(application: u32, vft: SessionAppVft) -> RuntimeResult<u32> {
     super::application_main()
         .register_session_app(application, vft)

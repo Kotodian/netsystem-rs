@@ -1142,6 +1142,25 @@ dependencies = [
 ]
 
 [[package]]
+name = "hammer-plugin-iperf3"
+version = "0.1.0"
+dependencies = [
+ "hammer-component-macros",
+ "hammer-infra",
+ "hammer-plugin-session",
+ "hammer-plugin-tcp",
+ "hammer-runtime",
+ "hammer-service",
+ "humantime-serde",
+ "linkme",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.18",
+ "tracing",
+ "zerocopy",
+]
+
+[[package]]
 name = "hammer-plugin-quic"
 version = "0.1.0"
 dependencies = [
@@ -1164,12 +1183,17 @@ name = "hammer-plugin-session"
 version = "0.1.0"
 dependencies = [
  "abi_stable",
+ "hammer-app",
  "hammer-component-macros",
  "hammer-infra",
+ "hammer-ipc",
+ "hammer-plugin-ip",
  "hammer-runtime",
  "hammer-service",
  "linkme",
  "serde",
+ "thiserror 2.0.18",
+ "tracing",
 ]
 
 [[package]]

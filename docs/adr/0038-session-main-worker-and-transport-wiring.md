@@ -785,6 +785,10 @@ pub trait Transport<T> {
 pub struct SessionMain<O = u32> {
     config: SessionConfig,
     workers: Vec<UnsafeCell<SessionWorker<O>>>,
+    // ADR-0040: listen_session_alloc uses VPP thread 0's pool
+    // (session.h:1044-1052). Hammer's Main Thread is not a Data Worker, so
+    // listener records have a separate barrier-published control pool.
+    listening_sessions: UnsafeCell<Pool<Session<O>>>,
     // session_main_t.session_tx_fns: mode metadata only; no VFT/function ptr.
     session_tx_modes: UnsafeCell<Vec<TransportTxMode>>,
     // session_main_t.session_type_to_next

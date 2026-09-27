@@ -1,34 +1,37 @@
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::sync::OnceLock;
 
 use hammer_infra::svm::fifo::Fifo as SvmFifo;
-use hammer_infra::svm::fifo_segment::SvmFifoSegment;
+use hammer_runtime::DataPlaneMain;
+use hammer_service::session::app::{ApplicationError, ApplicationMain};
 use hammer_service::session::{
-    SessionConfig, SessionError, SessionHandle, SessionLookup, SessionMain, SessionState,
+    SessionEndpoint, SessionError, SessionHandle, SessionLookup, SessionMain, SessionState,
 };
-use hammer_service::transport::{TransportMain, TransportTxMode};
+use hammer_service::transport::{Transport, TransportMain, TransportTxMode};
 
 use crate::config::IpSessionTableConfig;
-use crate::endpoint::{IpSessionEndpoint, IpTransportConnectionId};
-use crate::lookup::IpSessionLookup;
+use crate::endpoint::{
+    ENDPOINT_INVALID_INDEX, IpSessionEndpoint, IpSessionEndpointConfig, IpTransportConnectionId,
+    IpTransportEndpoint, IpTransportEndpointConfig,
+};
+use crate::lookup::{IpSessionFamily, IpSessionLookup};
 use crate::transport::{IpTransportConfig, IpTransportMain};
 
 static IP_SESSION_MAIN: OnceLock<IpSessionMain> = OnceLock::new();
 
 pub struct IpSessionMain {
-    session: SessionMain<u32>,
+    session: &'static SessionMain<u32>,
     lookup: IpSessionLookup,
     transport: IpTransportMain,
 }
 
 impl IpSessionMain {
     pub fn init(
-        session_config: SessionConfig,
         table_config: IpSessionTableConfig,
         transport_config: IpTransportConfig,
-        worker_mq_segment: SvmFifoSegment,
     ) -> Result<(), SessionError> {
         let main = Self {
-            session: SessionMain::init(session_config, worker_mq_segment)?,
+            session: SessionMain::global()?,
             lookup: IpSessionLookup::new(table_config),
             transport: IpTransportMain::init(transport_config)?,
         };
@@ -80,20 +83,280 @@ impl IpSessionMain {
         }
     }
 
-    pub fn allocate_for_connection(
-        &mut self,
-        worker_index: u32,
+    /// VPP: `app_listener_lookup`, application.c:87-143;
+    /// `session_lookup_endpoint_listener`, session_lookup.c.
+    #[inline]
+    pub fn lookup_listener(
+        &self,
+        endpoint: &IpSessionEndpoint,
+        use_wildcard: bool,
+    ) -> Option<SessionHandle> {
+        let family = match endpoint.transport().local.address {
+            IpAddr::V4(_) => IpSessionFamily::Ip4,
+            IpAddr::V6(_) => IpSessionFamily::Ip6,
+        };
+        let table = self.lookup.table_index(family, endpoint.transport().local.fib_index);
+        self.lookup
+            .lookup_listener(table, endpoint, use_wildcard)
+            .map(SessionHandle::from)
+    }
+
+    /// VPP: `app_worker_listen_sep`, application_worker.c:297-315. The
+    /// listening Session must already be attached to its ApplicationListener.
+    pub fn add_listener(
+        &self,
+        endpoint: &IpSessionEndpoint,
+        listener: u32,
+        session: SessionHandle,
+    ) -> Result<(), SessionError> {
+        let application_main = ApplicationMain::global()
+            .expect("Application Main initializes before IP listener publication");
+        if application_main.listener_for_session(self.session, session) != Some(listener) {
+            return Err(SessionError::Owner);
+        }
+        let family = match endpoint.transport().local.address {
+            IpAddr::V4(_) => IpSessionFamily::Ip4,
+            IpAddr::V6(_) => IpSessionFamily::Ip6,
+        };
+        let table = self.lookup.table_index(family, endpoint.transport().local.fib_index);
+        if table == ENDPOINT_INVALID_INDEX {
+            return Err(SessionError::NoRoute);
+        }
+        if self.lookup.lookup_listener(table, endpoint, true).is_some() {
+            return Err(SessionError::AlreadyListening);
+        }
+        assert!(
+            self.lookup.add_session_endpoint(table, endpoint, session.into()),
+            "validated IP Session listener table remains allocated"
+        );
+        Ok(())
+    }
+
+    /// VPP: `vnet_listen`, application.c:1277-1321;
+    /// `app_worker_start_listen`, application_worker.c:338-384;
+    /// `session_listen`, session.c:1467-1491.
+    pub fn listen<T: Transport<IpTransportEndpointConfig>>(
+        &self,
+        transport: &T,
+        application: u32,
+        worker_map: u32,
+        request: &IpSessionEndpointConfig,
+    ) -> Result<Option<(u32, SessionHandle)>, SessionError> {
+        let Some(()) = self.validate_application_namespace(application, request.namespace)? else {
+            return Ok(None);
+        };
+        let application_main = ApplicationMain::global()
+            .expect("Application Main initializes before IP listener setup");
+        // SAFETY: listen runs on Main Thread under WorkerBarrier. The
+        // Application cannot be detached while this listener is installed.
+        let app_worker = unsafe { application_main.application(application) }
+            .and_then(|record| record.worker(worker_map))
+            .ok_or(SessionError::InvalidApplicationWorker)?;
+        let family = match request.endpoint.transport().local.address {
+            IpAddr::V4(_) => IpSessionFamily::Ip4,
+            IpAddr::V6(_) => IpSessionFamily::Ip6,
+        };
+        let table = self
+            .lookup
+            .table_index(family, request.endpoint.transport().local.fib_index);
+        if table == ENDPOINT_INVALID_INDEX {
+            return Err(SessionError::NoRoute);
+        }
+        if self
+            .lookup
+            .lookup_listener(table, &request.endpoint, true)
+            .is_some()
+        {
+            return Err(SessionError::AlreadyListening);
+        }
+        let opaque = request.opaque.unwrap_or_default();
+        let listener = application_main
+            .allocate_listener(application, worker_map, u64::from(opaque))
+            .map_err(|source| match source {
+                ApplicationError::WorkerMissing { .. } => SessionError::InvalidApplicationWorker,
+                source => panic!("validated Application listener allocation failed: {source}"),
+            })?;
+        let session = match self.session.allocate_listening_session(
+            request.endpoint.transport_protocol(),
+            app_worker,
+            opaque,
+        ) {
+            Ok(session) => session,
+            Err(source) => {
+                application_main
+                    .remove_listener(self.session, listener)
+                    .expect("unattached listener has no resources to release");
+                return Err(source);
+            }
+        };
+        let connection = match transport.start_listen(request.endpoint.transport(), session) {
+            Ok(connection) => connection,
+            Err(source) => {
+                self.session
+                    .cleanup_listening_session(session)
+                    .expect("unattached listening Session remains allocated");
+                application_main
+                    .remove_listener(self.session, listener)
+                    .expect("unattached listener has no resources to release");
+                return Err(source);
+            }
+        };
+        self.session
+            .attach_connection(session, connection)
+            .expect("new listening Session retains its handle");
+        application_main
+            .attach_listener_session(self.session, listener, Some(session), None)
+            .expect("new Application listener accepts its listening Session");
+        if let Err(source) = self.add_listener(&request.endpoint, listener, session) {
+            transport
+                .stop_listen(connection)
+                .expect("a newly started transport listener can stop");
+            application_main
+                .remove_listener(self.session, listener)
+                .expect("unpublished listener remains allocated until cleanup");
+            return Err(source);
+        }
+        if let Err(source) = application_main.attach_listener_worker(listener, worker_map) {
+            self.unlisten(transport, &request.endpoint, listener, session)
+                .expect("a newly published listener can stop");
+            return Err(match source {
+                ApplicationError::SegmentCreate { source } => SessionError::SegmentCreate { source },
+                ApplicationError::SegmentNoSpace => SessionError::SegmentNoSpace,
+                ApplicationError::ListenerWorkerAttached { .. } => SessionError::AlreadyListening,
+                source => panic!("validated Application listener worker setup failed: {source}"),
+            });
+        }
+        Ok(Some((listener, session)))
+    }
+
+    /// VPP: `vnet_unlisten`, application.c:1466-1490;
+    /// `session_stop_listen`, session.c:1497-1515. IP lookup belongs here,
+    /// while the concrete transport and generic Session retain their owners.
+    pub fn unlisten<T: Transport<IpTransportEndpointConfig>>(
+        &self,
+        transport: &T,
+        endpoint: &IpSessionEndpoint,
+        listener: u32,
+        session: SessionHandle,
+    ) -> Result<(), SessionError> {
+        let application_main = ApplicationMain::global()
+            .expect("Application Main remains initialized until listener removal");
+        if application_main.listener_for_session(self.session, session) != Some(listener) {
+            return Err(SessionError::Owner);
+        }
+        let connection = self
+            .session
+            .listening_connection_index(session)
+            .ok_or(SessionError::NoSession)?;
+        assert_ne!(connection, u32::MAX, "listening Session retains its transport");
+        match self.lookup_listener(endpoint, false) {
+            Some(current) if current == session => {
+                let family = match endpoint.transport().local.address {
+                    IpAddr::V4(_) => IpSessionFamily::Ip4,
+                    IpAddr::V6(_) => IpSessionFamily::Ip6,
+                };
+                let table = self.lookup.table_index(family, endpoint.transport().local.fib_index);
+                assert!(
+                    self.lookup.remove_session_endpoint(table, endpoint),
+                    "validated IP listener lookup remains published until unlisten"
+                );
+            }
+            Some(_) => return Err(SessionError::Owner),
+            None => {}
+        }
+        transport.stop_listen(connection)?;
+        application_main
+            .remove_listener(self.session, listener)
+            .expect("validated listener remains allocated through unlisten");
+        Ok(())
+    }
+
+    /// VPP: `vnet_listen`, application.c:1277-1302; namespace lookup and
+    /// `session_endpoint_in_ns`, application.c:1232-1269. A missing
+    /// Application remains an ordinary lookup absence for Rust callers.
+    pub fn validate_application_namespace(
+        &self,
+        application: u32,
+        namespace: u32,
+    ) -> Result<Option<()>, SessionError> {
+        let application_main = ApplicationMain::global()
+            .expect("Application Main initializes before IP namespace validation");
+        let Some(attached_namespace) = application_main.namespace(application) else {
+            return Ok(None);
+        };
+        if attached_namespace != namespace || crate::namespace::namespaces().get(namespace).is_none()
+        {
+            return Err(SessionError::InvalidNamespace);
+        }
+        Ok(Some(()))
+    }
+
+    /// # Safety
+    /// The runtime must exclusively own the selected Session worker pool.
+    pub unsafe fn allocate_for_connection(
+        &self,
+        runtime: &mut DataPlaneMain,
         endpoint: &IpSessionEndpoint,
         connection_index: u32,
     ) -> Result<SessionHandle, SessionError> {
-        let session = self.session.allocate(
-            worker_index,
-            SessionState::Connecting,
-            endpoint.transport_protocol(),
-        )?;
-        self.session
-            .attach_transport(session, endpoint.transport_protocol(), connection_index)?;
+        // SAFETY: the TCP node calls this for the exclusively executing
+        // Data Worker; no other runtime may borrow this worker's Session pool.
+        let worker = unsafe { self.session.worker_mut(runtime)? };
+        let session = worker.allocate(SessionState::Connecting, endpoint.transport_protocol(), 0);
+        worker.attach_transport(session, connection_index)?;
         Ok(session)
+    }
+
+    /// Builds a listening request using the Application Namespace's IP binding.
+    /// VPP: application.c:1232-1269, `session_endpoint_update_for_app`.
+    pub fn listen_endpoint_config(
+        &self,
+        address: SocketAddr,
+        namespace: u32,
+        transport_protocol: u8,
+    ) -> Result<IpSessionEndpointConfig, SessionError> {
+        let family = if address.is_ipv4() {
+            IpSessionFamily::Ip4
+        } else {
+            IpSessionFamily::Ip6
+        };
+        let binding = crate::namespace::namespaces()
+            .get(namespace)
+            .ok_or(SessionError::InvalidNamespace)?;
+        let binding = binding.binding();
+        let fib_index = binding.fib_index(family);
+        if fib_index == ENDPOINT_INVALID_INDEX {
+            return Err(SessionError::NoRoute);
+        }
+        let local = IpTransportEndpoint {
+            address: address.ip(),
+            port: address.port(),
+            sw_if_index: binding.sw_if_index(),
+            fib_index,
+        };
+        let peer = IpTransportEndpoint {
+            address: match family {
+                IpSessionFamily::Ip4 => IpAddr::V4(Ipv4Addr::UNSPECIFIED),
+                IpSessionFamily::Ip6 => IpAddr::V6(Ipv6Addr::UNSPECIFIED),
+            },
+            port: 0,
+            sw_if_index: ENDPOINT_INVALID_INDEX,
+            fib_index,
+        };
+        let mut config = IpSessionEndpointConfig::new(SessionEndpoint::new(
+            IpTransportEndpointConfig {
+                local,
+                peer,
+                next_node_index: 0,
+                next_node_opaque: 0,
+                mss: 0,
+                dscp: 0,
+                transport_flags: 0,
+            },
+            transport_protocol,
+        ));
+        config.namespace = namespace;
+        Ok(config)
     }
 
     pub fn prepare_endpoint(
@@ -117,62 +380,115 @@ impl IpSessionMain {
             .register_transport_type(protocol, tx_mode, output_next)
     }
 
-    pub fn rx_fifo(&self, session: SessionHandle) -> Result<&SvmFifo, SessionError> {
-        self.session
-            .worker(session.worker_index)
-            .and_then(|worker| worker.session(session.session_index))
+    /// # Safety
+    /// The runtime must exclusively own the session's worker slot.
+    pub unsafe fn rx_fifo<'worker>(
+        &'worker self,
+        runtime: &'worker mut DataPlaneMain,
+        session: SessionHandle,
+    ) -> Result<&'worker SvmFifo, SessionError> {
+        (unsafe { self.session.worker_mut(runtime)? })
+            .session(session.session_index)
+            .filter(|entry| entry.handle() == session)
             .ok_or(SessionError::NoSession)?
             .rx_fifo()
             .ok_or(SessionError::SegmentNoSpace)
     }
 
-    pub fn tx_fifo(&self, session: SessionHandle) -> Result<&SvmFifo, SessionError> {
-        self.session
-            .worker(session.worker_index)
-            .and_then(|worker| worker.session(session.session_index))
+    /// # Safety
+    /// The runtime must exclusively own the session's worker slot.
+    pub unsafe fn tx_fifo<'worker>(
+        &'worker self,
+        runtime: &'worker mut DataPlaneMain,
+        session: SessionHandle,
+    ) -> Result<&'worker SvmFifo, SessionError> {
+        (unsafe { self.session.worker_mut(runtime)? })
+            .session(session.session_index)
+            .filter(|entry| entry.handle() == session)
             .ok_or(SessionError::NoSession)?
             .tx_fifo()
             .ok_or(SessionError::SegmentNoSpace)
     }
 
-    pub fn notify_closed(
+    /// # Safety
+    /// The runtime must exclusively own the session's worker slot.
+    pub unsafe fn notify_closed(
         &self,
+        runtime: &mut DataPlaneMain,
         session: SessionHandle,
         connection_index: u32,
     ) -> Result<(), SessionError> {
-        let Some(entry) = self
-            .session
-            .worker(session.worker_index)
-            .and_then(|worker| worker.session(session.session_index))
+        let Some(entry) = (unsafe { self.session.worker_mut(runtime)? })
+            .session(session.session_index)
         else {
             return Err(SessionError::NoSession);
         };
-        if entry.connection_index() != connection_index {
+        if entry.handle() != session || entry.connection_index() != connection_index {
             return Err(SessionError::NoSession);
         }
-        entry.store_state(SessionState::TransportClosed);
+        match entry.load_state() {
+            SessionState::Created
+            | SessionState::Listening
+            | SessionState::Connecting
+            | SessionState::Accepting
+            | SessionState::Ready
+            | SessionState::Opened
+            | SessionState::TransportClosing
+            | SessionState::Closing => entry.store_state(SessionState::TransportClosed),
+            SessionState::AppClosed => entry.store_state(SessionState::Closed),
+            SessionState::TransportClosed
+            | SessionState::Closed
+            | SessionState::TransportDeleted => {}
+        }
         Ok(())
     }
 
-    pub fn notify_reset(&self, session: SessionHandle, connection_index: u32) -> Result<(), SessionError> {
-        self.notify_closed(session, connection_index)
-    }
-
-    pub fn notify_deleted(
-        &mut self,
+    /// # Safety
+    /// The runtime must exclusively own the session's worker slot.
+    pub unsafe fn notify_reset(
+        &self,
+        runtime: &mut DataPlaneMain,
         session: SessionHandle,
         connection_index: u32,
     ) -> Result<(), SessionError> {
-        let Some(entry) = self
-            .session
-            .worker(session.worker_index)
-            .and_then(|worker| worker.session(session.session_index))
+        let Some(entry) = (unsafe { self.session.worker_mut(runtime)? })
+            .session(session.session_index)
         else {
             return Err(SessionError::NoSession);
         };
-        if entry.connection_index() != connection_index {
+        if entry.handle() != session || entry.connection_index() != connection_index {
             return Err(SessionError::NoSession);
         }
-        self.session.detach_transport(session)
+        if matches!(
+            entry.load_state(),
+            SessionState::Created
+                | SessionState::Listening
+                | SessionState::Connecting
+                | SessionState::Accepting
+                | SessionState::Ready
+                | SessionState::Opened
+        ) {
+            entry.store_state(SessionState::TransportClosing);
+        }
+        Ok(())
+    }
+
+    /// # Safety
+    /// The runtime must exclusively own the session's worker slot.
+    pub unsafe fn notify_deleted(
+        &self,
+        runtime: &mut DataPlaneMain,
+        session: SessionHandle,
+        connection_index: u32,
+    ) -> Result<(), SessionError> {
+        let Some(entry) = (unsafe { self.session.worker_mut(runtime)? })
+            .session(session.session_index)
+        else {
+            return Err(SessionError::NoSession);
+        };
+        if entry.handle() != session || entry.connection_index() != connection_index {
+            return Err(SessionError::NoSession);
+        }
+        unsafe { self.session.detach_transport(runtime, session) }
     }
 }

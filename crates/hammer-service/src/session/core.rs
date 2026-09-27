@@ -1,7 +1,11 @@
 use std::cell::UnsafeCell;
 use std::mem::size_of;
+use std::num::NonZeroU32;
+use std::sync::OnceLock;
 use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 
+use hammer_core::data_plane::NodeId;
+use hammer_infra::bitmap::Bitmap;
 use hammer_infra::linked_list::LinkedList;
 use hammer_infra::pool::Pool;
 use hammer_infra::svm::fifo::Fifo as SvmFifo;
@@ -10,10 +14,13 @@ use hammer_infra::svm::msg_queue::{SvmMsgQ, SvmMsgQConfig, SvmMsgQError, SvmMsgQ
 use hammer_infra::svm::queue::SvmQueueConditionalWait;
 use hammer_infra::sync::SpinLock;
 use hammer_infra::timer_wheel::TimerWheel1t2w2048sl;
+use hammer_runtime::DataPlaneMain;
 use zerocopy::{FromBytes, Immutable, IntoBytes, KnownLayout};
 
-use crate::transport::{TransportSendParams, TransportTxMode};
 use super::error::SessionError;
+use super::app::ApplicationMain;
+use super::segment_manager::{SegmentManager, SegmentManagerError, SegmentManagerMain};
+use crate::transport::{TransportSendParams, TransportTxMode};
 
 pub const SESSION_INDEX_INVALID: u32 = u32::MAX;
 
@@ -57,7 +64,7 @@ pub const SESSION_EVENT_QUEUE_FULL: i32 = -2;
 
 #[repr(C)]
 #[derive(
-    Clone, Copy, Debug, Default, PartialEq, Eq, KnownLayout, FromBytes, Immutable, IntoBytes,
+    Clone, Copy, Debug, Default, PartialEq, Eq, Hash, KnownLayout, FromBytes, Immutable, IntoBytes,
 )]
 pub struct SessionHandle {
     pub worker_index: u32,
@@ -226,6 +233,8 @@ pub struct SessionWorker<O = u32> {
     worker_index: u32,
     transport_time_subscriptions: Vec<u8>,
     pending_io_sessions: Vec<SessionHandle>,
+    app_workers_pending: Bitmap,
+    input_node: Option<NodeId>,
     timer_fd: i32,
     timer_fd_file: u64,
     timer: TimerWheel1t2w2048sl<SessionHandle>,
@@ -256,6 +265,26 @@ pub struct SessionWorker<O = u32> {
     last_event_poll: f64,
 }
 
+/// The FIFO outcome consumed by a transport's ACK and receive-window logic.
+/// VPP: `session_enqueue_stream_connection`, session.h:778-829.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RxDelivery {
+    NotAccepted {
+        rx_available: u32,
+    },
+    InOrder {
+        accepted: NonZeroU32,
+        promoted: u32,
+        rx_available: u32,
+    },
+    OutOfOrder {
+        accepted: NonZeroU32,
+        newest_start: u32,
+        newest_len: NonZeroU32,
+        rx_available: u32,
+    },
+}
+
 impl<O> SessionWorker<O> {
     fn new(worker_index: u32, config: SessionConfig) -> Self {
         Self {
@@ -266,6 +295,8 @@ impl<O> SessionWorker<O> {
             worker_index,
             transport_time_subscriptions: Vec::new(),
             pending_io_sessions: Vec::new(),
+            app_workers_pending: Bitmap::new(),
+            input_node: None,
             timer_fd: -1,
             timer_fd_file: u64::MAX,
             timer: TimerWheel1t2w2048sl::new(config.event_ring_capacity as usize),
@@ -314,6 +345,239 @@ impl<O> SessionWorker<O> {
     #[inline(always)]
     pub fn session_mut(&mut self, session_index: u32) -> Option<&mut Session<O>> {
         self.sessions.get_mut(session_index)
+    }
+
+    #[inline(always)]
+    pub const fn worker_index(&self) -> u32 {
+        self.worker_index
+    }
+
+    /// VPP: `session_wrk_program_app_wrk_evts`, session.c:565-576.
+    #[inline]
+    pub fn program_app_worker(&mut self, runtime: &DataPlaneMain, app_worker: u32) {
+        debug_assert_eq!(
+            runtime
+                .data_worker_id()
+                .expect("Application events execute on a Data Worker")
+                .slot(),
+            self.worker_index as usize
+        );
+        let need_interrupt = self.app_workers_pending.first_set().is_none();
+        self.app_workers_pending.set(app_worker as usize);
+        if need_interrupt {
+            runtime
+                .set_node_interrupt_pending(
+                    self.input_node
+                        .expect("session-input NodeId installs before application events"),
+                )
+                .expect("registered session-input Node accepts an interrupt");
+        }
+    }
+
+    pub(crate) fn install_input_node(&mut self, node: NodeId) {
+        assert!(
+            self.input_node.replace(node).is_none(),
+            "session-input installs once"
+        );
+    }
+
+    #[inline(always)]
+    pub fn pending_app_workers(&self) -> &Bitmap {
+        &self.app_workers_pending
+    }
+
+    #[inline]
+    pub fn clear_pending_app_worker(&mut self, app_worker: u32) {
+        self.app_workers_pending.clear(app_worker as usize);
+    }
+
+    pub fn allocate(&mut self, state: SessionState, protocol: u8, opaque: O) -> SessionHandle {
+        let handle = SessionHandle {
+            worker_index: self.worker_index,
+            session_index: SESSION_INDEX_INVALID,
+        };
+        let session_index = self
+            .sessions
+            .insert(Session::new(handle, state, protocol, opaque));
+        let handle = SessionHandle {
+            session_index,
+            ..handle
+        };
+        self.sessions
+            .get_mut(session_index)
+            .expect("inserted Session remains in its worker pool")
+            .handle = handle;
+        handle
+    }
+
+    /// VPP: `session_stream_accept`, session.c:1215-1276. The connection
+    /// exists before its Session, and the Application adds FIFOs afterward.
+    pub fn allocate_accepted(
+        &mut self,
+        listener: SessionHandle,
+        connection_index: u32,
+        protocol: u8,
+        opaque: O,
+    ) -> SessionHandle {
+        let handle = self.allocate(SessionState::Created, protocol, opaque);
+        let session = self
+            .session_mut(handle.session_index)
+            .expect("new accepted Session remains in its worker pool");
+        session.listener_handle = listener;
+        session.connection_index = connection_index;
+        handle
+    }
+
+    pub fn attach_transport(
+        &mut self,
+        session: SessionHandle,
+        connection_index: u32,
+    ) -> Result<(), SessionError> {
+        if session.worker_index != self.worker_index {
+            return Err(SessionError::NoSession);
+        }
+        let entry = self
+            .session_mut(session.session_index)
+            .ok_or(SessionError::NoSession)?;
+        entry.connection_index = connection_index;
+        Ok(())
+    }
+
+    pub(crate) fn attach_application(
+        &mut self,
+        session: SessionHandle,
+        application_worker: u32,
+        segment: &SegmentManager<'_>,
+    ) -> Result<(), SegmentManagerError> {
+        assert_ne!(application_worker, SESSION_INDEX_INVALID);
+        assert_eq!(session.worker_index, self.worker_index);
+        let worker_index = self.worker_index;
+        let entry = self
+            .session_mut(session.session_index)
+            .expect("validated accepted Session remains allocated");
+        assert_eq!(entry.handle, session);
+        assert_eq!(entry.application_worker, SESSION_INDEX_INVALID);
+        assert!(entry.rx_fifo.is_none() && entry.tx_fifo.is_none());
+        let (rx_fifo, tx_fifo) = segment.allocate_session_fifos(worker_index)?;
+        entry.rx_fifo = Some(rx_fifo);
+        entry.tx_fifo = Some(tx_fifo);
+        entry.application_worker = application_worker;
+        Ok(())
+    }
+
+    /// VPP: `session_cleanup`, session.c:300-304. Removing the owned Session
+    /// runs its Drop, which returns its FIFO pair to the segment owner.
+    pub fn cleanup(&mut self, session: SessionHandle) -> Option<()> {
+        if session.worker_index != self.worker_index {
+            return None;
+        }
+        let entry = self.sessions.get(session.session_index)?;
+        if entry.handle != session {
+            return None;
+        }
+        self.sessions
+            .remove(session.session_index)
+            .expect("validated Session remains in its worker pool until removal");
+        Some(())
+    }
+
+    /// VPP: `session_enqueue_stream_connection`, session.h:778-829.
+    /// The Session owns the only packet-to-application FIFO copy boundary.
+    pub fn enqueue_rx(
+        &mut self,
+        runtime: &DataPlaneMain,
+        handle: SessionHandle,
+        buffer_index: u32,
+        offset: u32,
+    ) -> Result<RxDelivery, SessionError> {
+        let session = self
+            .session_from_handle(handle)
+            .ok_or(SessionError::NoSession)?;
+        let fifo = session.rx_fifo().ok_or(SessionError::Invalid)?;
+        let session_id = handle.session_index;
+        let mut accepted = 0u32;
+        let mut promoted = 0u32;
+        let mut buffered_len = 0u32;
+        let mut newest_start: Option<u32> = None;
+        let mut newest_end: Option<u32> = None;
+        for buffer in runtime.chain(buffer_index) {
+            let bytes = buffer.current();
+            let length = u32::try_from(bytes.len())
+                .expect("a packet buffer's current length fits the Session FIFO index");
+            if offset == 0 {
+                if accepted == buffered_len {
+                    let available = fifo.max_enqueue();
+                    if bytes.len() >= available {
+                        fifo.want_deq_notification();
+                    }
+                    let written = fifo.enqueue(bytes);
+                    let chunk_accepted = written.min(bytes.len()).min(available);
+                    accepted = accepted
+                        .checked_add(chunk_accepted as u32)
+                        .expect("RX packet chain length fits u32");
+                    promoted = promoted
+                        .checked_add((written - chunk_accepted) as u32)
+                        .expect("promoted RX FIFO bytes fit u32");
+                }
+            } else {
+                let chunk_offset = offset.checked_add(buffered_len).ok_or(
+                    SessionError::RxOutOfOrderOffsetOverflow {
+                        session_id,
+                        offset,
+                        buffered_len,
+                    },
+                )?;
+                let result = fifo.enqueue_ooo(chunk_offset, bytes).map_err(|source| {
+                    SessionError::RxOutOfOrderEnqueue {
+                        session_id,
+                        offset: chunk_offset,
+                        source,
+                    }
+                })?;
+                accepted = accepted
+                    .checked_add(result.accepted)
+                    .expect("RX packet chain length fits u32");
+                promoted = promoted
+                    .checked_add(result.delivered)
+                    .expect("promoted RX FIFO bytes fit u32");
+                if let Some(start) = result.start {
+                    let end = start
+                        .checked_add(result.len)
+                        .ok_or(SessionError::OooSpanInvalid { session_id })?;
+                    newest_start = Some(newest_start.map_or(start, |value| value.min(start)));
+                    newest_end = Some(newest_end.map_or(end, |value| value.max(end)));
+                }
+            }
+            buffered_len = buffered_len
+                .checked_add(length)
+                .expect("RX packet chain length fits u32");
+        }
+        let rx_available = u32::try_from(fifo.max_enqueue()).unwrap_or(u32::MAX);
+        if rx_available == 0 {
+            fifo.want_deq_notification();
+        }
+        let Some(accepted) = NonZeroU32::new(accepted) else {
+            return Ok(RxDelivery::NotAccepted { rx_available });
+        };
+        if offset == 0 {
+            Ok(RxDelivery::InOrder {
+                accepted,
+                promoted,
+                rx_available,
+            })
+        } else {
+            let start = newest_start.ok_or(SessionError::OooSpanMissing { session_id })?;
+            let len = newest_end
+                .and_then(|end| end.checked_sub(start))
+                .and_then(NonZeroU32::new)
+                .ok_or(SessionError::OooSpanInvalid { session_id })?;
+            Ok(RxDelivery::OutOfOrder {
+                accepted,
+                newest_start: start,
+                newest_len: len,
+                rx_available,
+            })
+        }
     }
 
     pub fn handle_event(&mut self, queue: &SvmMsgQ) -> Result<(), SessionError> {
@@ -376,7 +640,11 @@ impl<O> SessionWorker<O> {
     }
 
     #[inline(always)]
-    pub fn store_state(&self, handle: SessionHandle, state: SessionState) -> Result<(), SessionError> {
+    pub fn store_state(
+        &self,
+        handle: SessionHandle,
+        state: SessionState,
+    ) -> Result<(), SessionError> {
         let Some(session) = self.session_from_handle(handle) else {
             return Err(SessionError::NoSession);
         };
@@ -385,7 +653,11 @@ impl<O> SessionWorker<O> {
     }
 
     #[inline(always)]
-    pub fn enqueue_ready(&mut self, handle: SessionHandle, protocol: u8) -> Result<(), SessionError> {
+    pub fn enqueue_ready(
+        &mut self,
+        handle: SessionHandle,
+        protocol: u8,
+    ) -> Result<(), SessionError> {
         let Some(session) = self.session_from_handle(handle) else {
             return Err(SessionError::NoSession);
         };
@@ -394,6 +666,45 @@ impl<O> SessionWorker<O> {
         }
         self.pending_io_sessions.push(handle);
         Ok(())
+    }
+
+    /// VPP: `session_enqueue_notify`, session.c:627-647. The Session owns
+    /// RX event coalescing; transport code never dispatches app callbacks.
+    #[inline]
+    pub fn enqueue_notify(
+        &mut self,
+        runtime: &DataPlaneMain,
+        handle: SessionHandle,
+    ) -> Option<()> {
+        let session = self.session_from_handle(handle)?;
+        let app_worker_index = session.application_worker()?;
+        let protocol = session.transport_protocol();
+        let rx_fifo = session
+            .rx_fifo()
+            .expect("an attached Session retains its RX FIFO");
+        if !rx_fifo.set_event() {
+            return Some(());
+        }
+        let application = ApplicationMain::global()
+            .expect("Application Main initializes before Session RX notification");
+        // SAFETY: this Session worker exclusively executes its AppWorker
+        // event slot; detach waits for WorkerBarrier before removing it.
+        let app_worker = unsafe { application.worker(app_worker_index) }
+            .expect("an attached Session retains its AppWorker");
+        app_worker.add_event(
+            runtime,
+            self,
+            SessionEvent {
+                event_type: u8::from(SessionEventType::Rx),
+                postponed: false,
+                protocol,
+                operation: 0,
+                session: handle,
+                control_data_index: SESSION_INDEX_INVALID,
+                payload: [0; 2],
+            },
+        );
+        Some(())
     }
 
     pub fn allocate_control_data(&mut self, data: SessionControlData) -> u32 {
@@ -418,7 +729,10 @@ impl<O> SessionWorker<O> {
         Ok(())
     }
 
-    pub fn queue_migration(&mut self, request: SessionMigrationRequest) -> Result<(), SessionError> {
+    pub fn queue_migration(
+        &mut self,
+        request: SessionMigrationRequest,
+    ) -> Result<(), SessionError> {
         self.migration.lock().requests.push(request);
         Ok(())
     }
@@ -444,7 +758,9 @@ pub struct Session<O = u32> {
     flags: SessionFlags,
     rx_fifo: Option<SvmFifo>,
     tx_fifo: Option<SvmFifo>,
+    application_worker: u32,
     connection_index: u32,
+    application_listener: u32,
     listener_handle: SessionHandle,
     half_open_index: u32,
     opaque: O,
@@ -459,7 +775,9 @@ impl<O> Session<O> {
             flags: SessionFlags::default(),
             rx_fifo: None,
             tx_fifo: None,
+            application_worker: SESSION_INDEX_INVALID,
             connection_index: SESSION_INDEX_INVALID,
+            application_listener: SESSION_INDEX_INVALID,
             listener_handle: SessionHandle::invalid(),
             half_open_index: SESSION_INDEX_INVALID,
             opaque,
@@ -509,6 +827,66 @@ impl<O> Session<O> {
     #[inline(always)]
     pub const fn connection_index(&self) -> u32 {
         self.connection_index
+    }
+
+    #[inline(always)]
+    pub const fn application_worker(&self) -> Option<u32> {
+        if self.application_worker == SESSION_INDEX_INVALID {
+            None
+        } else {
+            Some(self.application_worker)
+        }
+    }
+
+    #[inline(always)]
+    pub const fn application_listener(&self) -> Option<u32> {
+        if self.application_listener == SESSION_INDEX_INVALID {
+            None
+        } else {
+            Some(self.application_listener)
+        }
+    }
+
+    /// VPP: `session_t.listener_handle`, session_types.h:258-275.
+    #[inline(always)]
+    pub const fn listener_handle(&self) -> SessionHandle {
+        self.listener_handle
+    }
+
+    #[inline(always)]
+    pub(crate) const fn rx_ready(&self) -> bool {
+        self.flags.rx_ready
+    }
+
+    #[inline(always)]
+    pub(crate) fn set_rx_ready(&mut self, ready: bool) {
+        self.flags.rx_ready = ready;
+    }
+
+    #[inline(always)]
+    pub(crate) fn detach_application(&mut self) {
+        self.flags.rx_ready = false;
+        self.application_worker = SESSION_INDEX_INVALID;
+    }
+}
+
+impl<O> Drop for Session<O> {
+    fn drop(&mut self) {
+        match (self.rx_fifo.as_ref(), self.tx_fifo.as_ref()) {
+            (Some(rx), Some(tx)) => {
+                let main = SegmentManagerMain::global()
+                    .expect("Segment Manager Main remains initialized while Sessions exist");
+                // SAFETY: the Session owner drops this pair on its worker;
+                // detach retains the manager until all FIFO pairs return.
+                let manager = unsafe { main.get(rx.segment_manager) }
+                    .expect("Session FIFO Segment Manager remains allocated");
+                if manager.release_session_fifos(rx, tx) {
+                    SegmentManagerMain::remove_detached(rx.segment_manager);
+                }
+            }
+            (None, None) => {}
+            _ => panic!("Session {:?} owns only one half of its FIFO pair", self.handle),
+        }
     }
 }
 
@@ -578,6 +956,112 @@ pub struct SessionEvent {
     pub payload: [u64; 2],
 }
 
+/// VPP: `session_evt_type_t`, session_types.h:385-425. Discriminants are
+/// preserved only at the SVM event boundary; Rust code selects enum variants.
+#[repr(u8)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SessionEventType {
+    Rx,
+    Tx,
+    TxFlush,
+    BuiltinRx,
+    TxMain,
+    Rpc,
+    HalfClose,
+    Close,
+    Reset,
+    Bound,
+    UnlistenReply,
+    Accepted,
+    AcceptedReply,
+    Connected,
+    Disconnected,
+    DisconnectedReply,
+    ResetReply,
+    RequestWorkerUpdate,
+    WorkerUpdate,
+    WorkerUpdateReply,
+    Shutdown,
+    Disconnect,
+    Connect,
+    ConnectUri,
+    Listen,
+    ListenUri,
+    Unlisten,
+    AppDetach,
+    AppAddSegment,
+    AppDelSegment,
+    Migrated,
+    Cleanup,
+    AppWorkerRpc,
+    TransportAttribute,
+    TransportAttributeReply,
+    TransportClosed,
+    HalfCleanup,
+    ConnectStream,
+    Terminate,
+}
+
+impl TryFrom<u8> for SessionEventType {
+    type Error = SessionError;
+
+    #[inline]
+    fn try_from(value: u8) -> Result<Self, Self::Error> {
+        const EVENTS: &[SessionEventType] = &[
+            SessionEventType::Rx,
+            SessionEventType::Tx,
+            SessionEventType::TxFlush,
+            SessionEventType::BuiltinRx,
+            SessionEventType::TxMain,
+            SessionEventType::Rpc,
+            SessionEventType::HalfClose,
+            SessionEventType::Close,
+            SessionEventType::Reset,
+            SessionEventType::Bound,
+            SessionEventType::UnlistenReply,
+            SessionEventType::Accepted,
+            SessionEventType::AcceptedReply,
+            SessionEventType::Connected,
+            SessionEventType::Disconnected,
+            SessionEventType::DisconnectedReply,
+            SessionEventType::ResetReply,
+            SessionEventType::RequestWorkerUpdate,
+            SessionEventType::WorkerUpdate,
+            SessionEventType::WorkerUpdateReply,
+            SessionEventType::Shutdown,
+            SessionEventType::Disconnect,
+            SessionEventType::Connect,
+            SessionEventType::ConnectUri,
+            SessionEventType::Listen,
+            SessionEventType::ListenUri,
+            SessionEventType::Unlisten,
+            SessionEventType::AppDetach,
+            SessionEventType::AppAddSegment,
+            SessionEventType::AppDelSegment,
+            SessionEventType::Migrated,
+            SessionEventType::Cleanup,
+            SessionEventType::AppWorkerRpc,
+            SessionEventType::TransportAttribute,
+            SessionEventType::TransportAttributeReply,
+            SessionEventType::TransportClosed,
+            SessionEventType::HalfCleanup,
+            SessionEventType::ConnectStream,
+            SessionEventType::Terminate,
+        ];
+        EVENTS
+            .get(value as usize)
+            .copied()
+            .ok_or(SessionError::Invalid)
+    }
+}
+
+impl From<SessionEventType> for u8 {
+    #[inline(always)]
+    fn from(value: SessionEventType) -> Self {
+        value as Self
+    }
+}
+
 /// VPP `session_send_evt_to_thread` enqueue outcomes. Busy and full mean that
 /// no event was committed; they are normal retry results, not Session errors.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -589,7 +1073,7 @@ pub enum SessionEventEnqueue {
 
 #[repr(C)]
 #[derive(Clone, Copy, KnownLayout, FromBytes, Immutable, IntoBytes)]
-struct SessionEventRecord {
+pub(crate) struct SessionEventRecord {
     event_type: u8,
     postponed: u8,
     protocol: u8,
@@ -627,10 +1111,10 @@ impl From<SessionEventRecord> for SessionEvent {
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct SessionMain<O = u32> {
     config: SessionConfig,
-    workers: Vec<SessionWorker<O>>,
+    workers: Vec<UnsafeCell<SessionWorker<O>>>,
+    listening_sessions: UnsafeCell<Pool<Session<O>>>,
     session_tx_modes: UnsafeCell<Vec<TransportTxMode>>,
     session_type_to_next: UnsafeCell<Vec<u32>>,
     transport_cl_thread: u32,
@@ -641,24 +1125,46 @@ pub struct SessionMain<O = u32> {
     is_initialized: bool,
 }
 
-// SAFETY: workers are constructed before publication and each mutable worker
-// entry is owned by its runtime worker index. Main-thread pool publication is
-// performed only while Data Workers are stopped; SvmMsgQ provides its own
-// producer/consumer synchronization.
-unsafe impl<O: Send> Sync for SessionMain<O> {}
+static SESSION_MAIN: OnceLock<SessionMain<u32>> = OnceLock::new();
 
-impl<O: Default> SessionMain<O> {
+impl SessionMain<u32> {
+    /// VPP: `session_init`, session.c:2274-2294. Build every worker and MQ
+    /// before publishing the process Session Main.
     pub fn init(
         config: SessionConfig,
         worker_mq_segment: SvmFifoSegment,
-    ) -> Result<Self, SessionError> {
+    ) -> Result<(), SessionError> {
+        let main = Self::new(config, worker_mq_segment)?;
+        assert!(
+            SESSION_MAIN.set(main).is_ok(),
+            "Session Main initializes once"
+        );
+        Ok(())
+    }
+
+    #[inline(always)]
+    pub fn global() -> Result<&'static Self, SessionError> {
+        SESSION_MAIN.get().ok_or(SessionError::Unknown)
+    }
+}
+
+// SAFETY: workers are constructed before publication and each mutable worker
+// entry is owned by its runtime worker index. The separate listening pool is
+// mutated only by Main Thread under WorkerBarrier; Data Workers may read its
+// stable entries between barrier publications. SvmMsgQ synchronizes its own
+// producer/consumer operations.
+unsafe impl<O: Send> Sync for SessionMain<O> {}
+
+impl<O> SessionMain<O> {
+    fn new(config: SessionConfig, worker_mq_segment: SvmFifoSegment) -> Result<Self, SessionError> {
         let mut workers = Vec::with_capacity(config.worker_count as usize);
         for worker_index in 0..config.worker_count {
-            workers.push(SessionWorker::new(worker_index, config));
+            workers.push(UnsafeCell::new(SessionWorker::new(worker_index, config)));
         }
         let mut main = Self {
             config,
             workers,
+            listening_sessions: UnsafeCell::new(Pool::new()),
             session_tx_modes: UnsafeCell::new(Vec::new()),
             session_type_to_next: UnsafeCell::new(Vec::new()),
             transport_cl_thread: 0,
@@ -700,19 +1206,52 @@ impl<O: Default> SessionMain<O> {
     }
 
     #[inline(always)]
-    pub fn worker(&self, worker_index: u32) -> Option<&SessionWorker<O>> {
-        self.workers.get(worker_index as usize)
+    pub fn worker(&mut self, worker_index: u32) -> Option<&SessionWorker<O>> {
+        self.workers
+            .get_mut(worker_index as usize)
+            .map(|slot| &*slot.get_mut())
     }
 
-    pub fn worker_mut(&mut self, worker_index: u32) -> Option<&mut SessionWorker<O>> {
-        self.workers.get_mut(worker_index as usize)
+    /// VPP: `app_worker_del_all_events`, session_input.c:35-76. Detach runs
+    /// on Main Thread with WorkerBarrier before the AppWorker pool entry drops.
+    pub fn clear_pending_app_worker(&self, worker_index: u32, app_worker: u32) {
+        assert!(
+            hammer_runtime::ensure_main_thread_with_barrier().is_ok(),
+            "AppWorker pending cleanup requires Main Thread and stopped Data Workers"
+        );
+        let slot = self
+            .workers
+            .get(worker_index as usize)
+            .expect("Application worker event slot was constructed at Session init");
+        // SAFETY: WorkerBarrier excludes the worker's mutable access.
+        unsafe { &mut *slot.get() }.clear_pending_app_worker(app_worker);
+    }
+
+    #[inline(always)]
+    /// # Safety
+    /// The runtime must be the sole executor of this worker slot until the
+    /// returned borrow ends; callers must not create overlapping mutable
+    /// borrows of the same slot. Main-thread access requires stopped workers.
+    pub unsafe fn worker_mut<'worker>(
+        &'worker self,
+        runtime: &DataPlaneMain,
+    ) -> Result<&'worker mut SessionWorker<O>, SessionError> {
+        let worker = runtime
+            .data_worker_id()
+            .map_err(|_| SessionError::Invalid)?;
+        let slot = self
+            .workers
+            .get(worker.slot())
+            .ok_or(SessionError::Invalid)?;
+        // SAFETY: DataPlaneMain is exclusively owned by this Data Worker;
+        // worker slots are fixed before worker launch and never migrate.
+        Ok(unsafe { &mut *slot.get() })
     }
 
     #[inline(always)]
     pub fn event_queue(&self, worker_index: u32) -> Option<&SvmMsgQ> {
-        let worker = self.worker(worker_index)?;
-        self.worker_mq_segment
-            .message_queue(worker.event_queue_index)
+        self.workers.get(worker_index as usize)?;
+        self.worker_mq_segment.message_queue(worker_index)
     }
 
     pub fn register_transport_type(
@@ -776,53 +1315,192 @@ impl<O: Default> SessionMain<O> {
         worker_index: u32,
         state: SessionState,
         protocol: u8,
+        opaque: O,
     ) -> Result<SessionHandle, SessionError> {
-        let worker = self.worker_mut(worker_index).ok_or(SessionError::Invalid)?;
-        let session_index = worker.sessions.insert(Session::new(
-            SessionHandle {
-                worker_index,
-                session_index: SESSION_INDEX_INVALID,
-            },
-            state,
-            protocol,
-            O::default(),
-        ));
-        let handle = SessionHandle {
-            worker_index,
-            session_index,
+        let worker = self
+            .workers
+            .get_mut(worker_index as usize)
+            .ok_or(SessionError::Invalid)?
+            .get_mut();
+        Ok(worker.allocate(state, protocol, opaque))
+    }
+
+    /// VPP: `listen_session_alloc`, session.h:1044-1052. Hammer's Main Thread
+    /// does not run a Data Worker, so its listening pool is separate from the
+    /// Data Worker slots and owns no FIFO pair.
+    pub fn allocate_listening_session(
+        &self,
+        session_type: u8,
+        application_worker: u32,
+        opaque: O,
+    ) -> Result<SessionHandle, SessionError> {
+        assert!(
+            hammer_runtime::ensure_main_thread_with_barrier().is_ok(),
+            "listening Session allocation requires Main Thread and stopped Data Workers"
+        );
+        if application_worker == SESSION_INDEX_INVALID {
+            return Err(SessionError::InvalidApplicationWorker);
+        }
+        // SAFETY: Main Thread holds WorkerBarrier while changing the
+        // listener-only pool; no Data Worker can read it until publication.
+        let sessions = unsafe { &mut *self.listening_sessions.get() };
+        let mut handle = SessionHandle {
+            worker_index: self.config.worker_count,
+            session_index: SESSION_INDEX_INVALID,
         };
-        worker
-            .sessions
-            .get_mut(session_index)
-            .expect("inserted Session remains in its worker pool")
-            .handle = handle;
+        handle.session_index = sessions.insert(Session::new(
+            handle,
+            SessionState::Listening,
+            session_type,
+            opaque,
+        ));
+        let session = sessions
+            .get_mut(handle.session_index)
+            .expect("new listening Session remains allocated");
+        session.handle = handle;
+        session.application_worker = application_worker;
         Ok(handle)
     }
 
-    pub fn attach_transport(
-        &mut self,
+    /// VPP: `session_listen`, session.c:1467-1491. The concrete transport
+    /// starts listening before its connection index is published here.
+    pub fn attach_connection(
+        &self,
         session: SessionHandle,
-        protocol: u8,
         connection_index: u32,
     ) -> Result<(), SessionError> {
-        let Some(entry) = self
-            .worker_mut(session.worker_index)
-            .and_then(|worker| worker.session_mut(session.session_index))
-        else {
+        assert!(
+            hammer_runtime::ensure_main_thread_with_barrier().is_ok(),
+            "Session connection publication requires Main Thread and stopped Data Workers"
+        );
+        if session.worker_index != self.config.worker_count {
             return Err(SessionError::NoSession);
-        };
-        entry.session_type = protocol;
+        }
+        // SAFETY: Main Thread holds WorkerBarrier through listener setup.
+        let sessions = unsafe { &mut *self.listening_sessions.get() };
+        let entry = sessions
+            .get_mut(session.session_index)
+            .filter(|entry| entry.handle == session)
+            .ok_or(SessionError::NoSession)?;
         entry.connection_index = connection_index;
         Ok(())
     }
 
-    pub fn detach_transport(&mut self, session: SessionHandle) -> Result<(), SessionError> {
-        let Some(entry) = self
-            .worker_mut(session.worker_index)
-            .and_then(|worker| worker.session_mut(session.session_index))
+    /// VPP: `app_worker_listen_sep`, application_worker.c:266-309. The
+    /// listening Sessions retain their AppWorker and app-listener backlink.
+    pub(crate) fn attach_listener(
+        &self,
+        listener: u32,
+        global: Option<SessionHandle>,
+        local: Option<SessionHandle>,
+    ) {
+        assert!(
+            hammer_runtime::ensure_main_thread_with_barrier().is_ok(),
+            "listening Session publication requires Main Thread and stopped Data Workers"
+        );
+        assert!(
+            global.is_some() || local.is_some(),
+            "listener publication requires a listening Session"
+        );
+        assert_ne!(global, local, "global and local listening Sessions differ");
+        // SAFETY: Main Thread holds WorkerBarrier through listener setup.
+        let sessions = unsafe { &mut *self.listening_sessions.get() };
+        for handle in [global, local].into_iter().flatten() {
+            assert_eq!(
+                handle.worker_index, self.config.worker_count,
+                "listening Session belongs to the control pool"
+            );
+            let session = sessions
+                .get(handle.session_index)
+                .expect("listening Session remains allocated until publication");
+            assert_eq!(session.handle, handle, "listener Session handle is current");
+            assert_eq!(session.load_state(), SessionState::Listening);
+            assert_eq!(session.application_listener, SESSION_INDEX_INVALID);
+            assert_ne!(
+                session.application_worker, SESSION_INDEX_INVALID,
+                "listening Session retains its Application worker before transport bind"
+            );
+        }
+        for handle in [global, local].into_iter().flatten() {
+            let session = sessions
+                .get_mut(handle.session_index)
+                .expect("validated listening Session remains allocated");
+            session.application_listener = listener;
+        }
+    }
+
+    /// VPP: `app_listener_get_w_handle`, application.c:78-85, follows the
+    /// listening Session's `al_index` without traversing listener records.
+    #[inline]
+    pub(crate) fn application_listener(&self, handle: SessionHandle) -> Option<u32> {
+        if handle.worker_index != self.config.worker_count {
+            return None;
+        }
+        // SAFETY: Main Thread mutates this pool only under WorkerBarrier;
+        // executing Data Workers are stopped before any pool change.
+        let sessions = unsafe { &*self.listening_sessions.get() };
+        sessions
+            .get(handle.session_index)
+            .filter(|session| session.handle() == handle)
+            .and_then(Session::application_listener)
+    }
+
+    /// VPP: `session_stop_listen`, session.c:1497-1515, obtains the bound
+    /// transport connection from the listening Session before unlisten.
+    #[inline]
+    pub fn listening_connection_index(&self, handle: SessionHandle) -> Option<u32> {
+        assert!(
+            hammer_runtime::ensure_main_thread_with_barrier().is_ok(),
+            "listening Session lookup requires Main Thread and stopped Data Workers"
+        );
+        if handle.worker_index != self.config.worker_count {
+            return None;
+        }
+        // SAFETY: Main Thread holds WorkerBarrier while it reads this pool.
+        unsafe { &*self.listening_sessions.get() }
+            .get(handle.session_index)
+            .filter(|session| session.handle() == handle)
+            .map(Session::connection_index)
+    }
+
+    /// VPP: `listen_session_free`, session.h:1060-1065. The concrete
+    /// transport has already stopped listening before this Session is freed.
+    pub fn cleanup_listening_session(&self, handle: SessionHandle) -> Option<()> {
+        assert!(
+            hammer_runtime::ensure_main_thread_with_barrier().is_ok(),
+            "listening Session cleanup requires Main Thread and stopped Data Workers"
+        );
+        if handle.worker_index != self.config.worker_count {
+            return None;
+        }
+        // SAFETY: Main Thread holds WorkerBarrier through listener cleanup.
+        let sessions = unsafe { &mut *self.listening_sessions.get() };
+        let session = sessions.get(handle.session_index)?;
+        if session.handle() != handle {
+            return None;
+        }
+        assert_eq!(session.load_state(), SessionState::Listening);
+        assert!(
+            session.rx_fifo().is_none() && session.tx_fifo().is_none(),
+            "listening Session owns no FIFO pair"
+        );
+        sessions.remove(handle.session_index).map(|_| ())
+    }
+
+    /// # Safety
+    /// The runtime must exclusively own the session's worker slot.
+    pub unsafe fn detach_transport(
+        &self,
+        runtime: &mut DataPlaneMain,
+        session: SessionHandle,
+    ) -> Result<(), SessionError> {
+        let Some(entry) = (unsafe { self.worker_mut(runtime)? }).session_mut(session.session_index)
         else {
             return Err(SessionError::NoSession);
         };
+        if entry.handle != session {
+            return Err(SessionError::NoSession);
+        }
         entry.connection_index = SESSION_INDEX_INVALID;
         entry.store_state(SessionState::TransportDeleted);
         Ok(())
@@ -870,8 +1548,15 @@ impl<O: Default> SessionMain<O> {
         }
     }
 
-    pub fn program_migration(&mut self, request: SessionMigrationRequest) -> Result<(), SessionError> {
-        let Some(worker) = self.worker_mut(request.old.worker_index) else {
+    pub fn program_migration(
+        &mut self,
+        request: SessionMigrationRequest,
+    ) -> Result<(), SessionError> {
+        let Some(worker) = self
+            .workers
+            .get_mut(request.old.worker_index as usize)
+            .map(UnsafeCell::get_mut)
+        else {
             return Err(SessionError::Invalid);
         };
         worker.queue_migration(request)
@@ -882,7 +1567,11 @@ impl<O: Default> SessionMain<O> {
         protocol: u8,
         worker_index: u32,
     ) -> Result<(), SessionError> {
-        let Some(worker) = self.worker_mut(worker_index) else {
+        let Some(worker) = self
+            .workers
+            .get_mut(worker_index as usize)
+            .map(UnsafeCell::get_mut)
+        else {
             return Err(SessionError::Invalid);
         };
         let sessions = &worker.sessions;

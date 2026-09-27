@@ -6,9 +6,67 @@ use hammer_runtime::{RuntimeError, RuntimeResult};
 
 use crate::session::SessionQueueError;
 use crate::session::runtime::{SessionMain, SessionWorker};
+use crate::session::{app, core};
 
 /// Shared Session Queue IO allowance for normal and custom TX in one dispatch.
 pub const SESSION_QUEUE_IO_BUDGET: usize = 128;
+
+/// VPP: `session_input_node`, session_input.c:350-405. This service node
+/// consumes pending AppWorker events; plugin-session supplies no node code.
+#[hammer_component_macros::graph_node(
+    graph = session,
+    init = crate::session::node::register_session_input_node,
+    name = "session-input",
+    kind = driver,
+)]
+#[derive(Clone, Copy, Default)]
+pub struct SessionInputNode;
+
+pub fn register_session_input_node(runtime: &DataPlaneMain) -> RuntimeResult<NodeId> {
+    if let Some(node) = runtime.nodes().node_by_name("session-input") {
+        return Ok(node);
+    }
+    runtime.nodes().try_register_driver(SessionInputNode)
+}
+
+impl Node for SessionInputNode {
+    fn process(runtime: &mut DataPlaneMain, _: &mut NodeRuntime, frame: &mut Frame) -> usize {
+        let vectors = frame.len();
+        let session_main = core::SessionMain::global()
+            .expect("Session Main initializes before session-input executes");
+        let session_worker = unsafe { session_main.worker_mut(runtime) }
+            .expect("session-input runs only on a configured Data Worker");
+        let pending = match app::ApplicationMain::global() {
+            Some(application_main) => match application_main.flush_worker_events(session_worker) {
+                Ok(pending) => pending,
+                Err(source) => {
+                    tracing::error!(%source, "session-input Application event delivery failed");
+                    true
+                }
+            },
+            None => false,
+        };
+        if pending {
+            let node = runtime
+                .current_node()
+                .expect("session-input is executing as a Graph Node");
+            runtime
+                .set_node_interrupt_pending(node)
+                .expect("session-input can reschedule its pending AppWorker events");
+        }
+        vectors
+    }
+}
+
+impl DriverNode for SessionInputNode {
+    #[inline]
+    fn node_registration(&self) -> Option<NodeRegistration>
+    where
+        Self: Sized,
+    {
+        Some(NodeRegistration::next("session-input", 0))
+    }
+}
 
 #[hammer_component_macros::graph_node(
     graph = session,
@@ -107,7 +165,9 @@ impl SessionQueueNext {
 
 /// Legacy transport callback used only while protocol workers migrate to the
 /// service-owned Session Queue contract.
-#[deprecated(note = "use Session Queue FIFO packetization; transport callbacks are not part of ADR-0039")]
+#[deprecated(
+    note = "use Session Queue FIFO packetization; transport callbacks are not part of ADR-0039"
+)]
 pub type SessionQueueDispatchFn = fn(
     &mut DataPlaneMain,
     &mut SessionWorker,
@@ -120,7 +180,9 @@ pub type SessionQueueDispatchFn = fn(
 
 /// Legacy transport callback used only while protocol workers migrate to the
 /// service-owned Session Queue contract.
-#[deprecated(note = "use the protocol worker's update_time path; Session Queue does not own transport callbacks")]
+#[deprecated(
+    note = "use the protocol worker's update_time path; Session Queue does not own transport callbacks"
+)]
 pub type SessionQueueUpdateTimeFn = fn(
     &mut DataPlaneMain,
     &mut SessionWorker,
@@ -133,7 +195,9 @@ pub type SessionQueueUpdateTimeFn = fn(
 
 /// Accumulates Session Queue TX indexes on the driver Frame and records one
 /// local next per entry. Graph Fanout runs once at [`Self::flush`].
-#[deprecated(note = "compatibility accumulator; ADR-0039 Session Queue owns packet fanout directly")]
+#[deprecated(
+    note = "compatibility accumulator; ADR-0039 Session Queue owns packet fanout directly"
+)]
 pub struct SessionQueueOutput {
     nexts: Vec<u16>,
     io_count: usize,
@@ -333,7 +397,9 @@ impl SessionQueueNode {
     ///
     /// The graph edge is compiled by [`Self::compile_output_next`] on the main
     /// thread. This method owns only the worker's dispatch table.
-    #[deprecated(note = "transport attachment callbacks are a legacy compatibility path; migrate to service Session Queue packetization")]
+    #[deprecated(
+        note = "transport attachment callbacks are a legacy compatibility path; migrate to service Session Queue packetization"
+    )]
     pub fn install_worker_attachment(
         runtime: &DataPlaneMain,
         runtime_data: NodeRuntime,
@@ -370,7 +436,9 @@ impl SessionQueueNode {
     }
 
     /// Removes one exact worker-local transport dispatch attachment.
-    #[deprecated(note = "transport attachment callbacks are a legacy compatibility path; migrate to service Session Queue packetization")]
+    #[deprecated(
+        note = "transport attachment callbacks are a legacy compatibility path; migrate to service Session Queue packetization"
+    )]
     pub fn remove_worker_attachment(
         runtime: &DataPlaneMain,
         runtime_data: NodeRuntime,

@@ -1,12 +1,8 @@
 //! Concrete IP Session endpoint and lookup-table plugin.
 
-use std::sync::{Arc, OnceLock};
-use std::time::Duration;
+use std::sync::OnceLock;
 
-use hammer_infra::svm::fifo_segment::{FifoSegmentError, SvmFifoSegment, SvmFifoSegmentConfig};
-use hammer_infra::svm::ssvm::{SsvmConfig, SsvmError, SsvmPrivate, SsvmSegmentBackend};
 use hammer_runtime::RuntimeResult;
-use hammer_service::session::SessionConfig;
 
 mod api;
 mod config;
@@ -22,7 +18,8 @@ pub use api::{
 };
 pub use config::{IpSessionConfig, IpSessionTableConfig};
 pub use endpoint::{
-    ENDPOINT_INVALID_INDEX, IpHalfOpenHandle, IpSessionEndpoint, IpTransportConnectionId,
+    ENDPOINT_INVALID_INDEX, IpHalfOpenHandle, IpSessionEndpoint, IpSessionEndpointConfig,
+    IpTransportConnectionId,
     IpTransportEndpoint, IpTransportEndpointConfig,
 };
 pub use lookup::{IpSessionFamily, IpSessionLookup, IpSessionLookupKey, SessionTableIterator};
@@ -59,52 +56,7 @@ fn configure_session_tables(config: config::NetworkSessionConfig) -> RuntimeResu
 )]
 fn init_ip_session_main() -> RuntimeResult<()> {
     let table_config = SESSION_TABLE_CONFIG.get().copied().unwrap_or_default();
-    let settings = hammer_service::session::session_config();
-    let worker_count = hammer_runtime::config::worker::worker_count();
-    let session_capacity = u32::try_from(settings.pool_capacity).map_err(|_| {
-        IpSessionInitError::SessionCapacityOverflow {
-            capacity: settings.pool_capacity,
-        }
-    })?;
-    let event_ring_capacity = u32::try_from(settings.app_mq_capacity).map_err(|_| {
-        IpSessionInitError::EventQueueCapacityOverflow {
-            capacity: settings.app_mq_capacity,
-        }
-    })?;
-    let mut session_config = SessionConfig::default();
-    session_config.worker_count = worker_count as u32;
-    session_config.configured_worker_mq_length = event_ring_capacity;
-    session_config.event_ring_capacity = event_ring_capacity;
-    session_config.session_capacity = session_capacity;
-    // VPP session nodes start disabled; enablement is an explicit lifecycle
-    // operation after graph materialization.
-    session_config.session_enable_asap = false;
-
-    let mapping = Arc::new(
-        SsvmPrivate::server_init_fifo_segment(&SsvmConfig {
-            backend: SsvmSegmentBackend::Private,
-            name: "hammer-session-worker-mq".to_owned(),
-            size: session_config.worker_mq_segment_size,
-            requested_va: 0,
-            huge_page: false,
-            attach_timeout: Duration::from_secs(1),
-        })
-        .map_err(IpSessionInitError::WorkerMessageQueueMapping)?,
-    );
-    let segment = SvmFifoSegment::new(
-        mapping,
-        SvmFifoSegmentConfig {
-            slices: session_config.worker_count,
-            ..SvmFifoSegmentConfig::default()
-        },
-    )
-    .map_err(IpSessionInitError::WorkerMessageQueueSegment)?;
-    IpSessionMain::init(
-        session_config,
-        table_config,
-        table_config.transport,
-        segment,
-    )
+    IpSessionMain::init(table_config, table_config.transport)
     .map_err(|source| IpSessionInitError::SessionCore { source })?;
     Ok(())
 }
@@ -129,14 +81,6 @@ pub fn session_lookup() -> &'static IpSessionLookup {
 #[hammer_component_macros::runtime_error(subsystem = "session")]
 #[derive(Debug, thiserror::Error)]
 enum IpSessionInitError {
-    #[error("Session capacity {capacity} does not fit u32")]
-    SessionCapacityOverflow { capacity: usize },
-    #[error("Session event queue capacity {capacity} does not fit u32")]
-    EventQueueCapacityOverflow { capacity: usize },
-    #[error("create Session worker message-queue mapping")]
-    WorkerMessageQueueMapping(#[source] SsvmError),
-    #[error("initialize Session worker message-queue segment")]
-    WorkerMessageQueueSegment(#[source] FifoSegmentError),
     #[error("initialize Session core")]
     SessionCore {
         #[source]

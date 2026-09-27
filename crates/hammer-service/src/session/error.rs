@@ -1,9 +1,11 @@
 use hammer_core::data_plane::NodeId;
 use hammer_infra::svm::fifo::FifoError;
+use hammer_infra::svm::fifo_segment::FifoSegmentError;
 use hammer_infra::svm::msg_queue::SvmMsgQError;
 use hammer_runtime::app::{SessionControlError, SessionHandle};
 use hammer_runtime::{DataWorkerId, RuntimeError};
 use thiserror::Error;
+
 
 #[hammer_component_macros::runtime_error(subsystem = "session queue")]
 #[derive(Debug, Error)]
@@ -21,6 +23,15 @@ pub enum SessionQueueError {
     },
     #[error("Application {application:?} has no per-worker MQ registration")]
     ApplicationMqMissing { application: u32 },
+    #[error("Session worker message-queue segment creation failed")]
+    SegmentCreate {
+        #[source]
+        source: FifoSegmentError,
+    },
+    #[error("Session capacity {capacity} does not fit u32")]
+    SessionCapacityOverflow { capacity: usize },
+    #[error("Session event queue capacity {capacity} does not fit u32")]
+    EventQueueCapacityOverflow { capacity: usize },
 }
 
 pub use hammer_runtime::app::SessionConnectError;
@@ -78,7 +89,10 @@ pub enum SessionError {
     #[error("new Session segment has no space for a FIFO pair")]
     NewSegmentNoSpace,
     #[error("Session segment creation failed")]
-    SegmentCreate,
+    SegmentCreate {
+        #[source]
+        source: FifoSegmentError,
+    },
     #[error("Session was filtered")]
     Filtered,
     #[error("requested Session scope is not supported")]
@@ -157,8 +171,6 @@ pub enum SessionError {
         tx_offset: usize,
         payload_len: usize,
     },
-    #[error("session {session_id:?} RX accounting exceeds u32")]
-    RxLengthOverflow { session_id: u32 },
     #[error(
         "session {session_id:?} datagram payload length {payload_len} does not match header length {header_len}"
     )]
@@ -249,7 +261,7 @@ impl From<SessionError> for SessionControlError {
             | SessionError::InvalidNamespace
             | SessionError::SegmentNoSpace
             | SessionError::NewSegmentNoSpace
-            | SessionError::SegmentCreate
+            | SessionError::SegmentCreate { .. }
             | SessionError::Filtered
             | SessionError::ScopeNotSupported
             | SessionError::BinaryApiNoFileDescriptor
@@ -291,7 +303,6 @@ impl From<SessionError> for SessionControlError {
             | SessionError::RxOutOfOrderEnqueue { .. }
             | SessionError::TxOffsetOutOfRange { .. }
             | SessionError::TxFifoRangeInvalid { .. }
-            | SessionError::RxLengthOverflow { .. }
             | SessionError::DatagramLengthMismatch { .. }
             | SessionError::DatagramFifo { .. }
             | SessionError::OooSpanMissing { .. }
