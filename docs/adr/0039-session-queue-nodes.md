@@ -339,24 +339,22 @@ pre-input node 为 disabled，并未在 `session_node_enable_disable` 中启用�
 ```rust
 // VPP source: session.h:310 and session.c:490-506,996-1184.
 pub struct IpSessionMain {
-    session: &'static SessionMain<u32>,
+    session: &'static SessionMain,
     lookup: IpSessionLookup,
-    transport: &'static IpTransportMain,
+    transport: IpTransportMain,
 }
 
 impl IpSessionMain {
     pub fn init(
-        session_config: SessionConfig,
-        table_config: IpSessionTableConfig,
+        table_config: IpSessionConfig,
         transport_config: IpTransportConfig,
-        worker_mq_segment: SvmFifoSegment,
     ) -> Result<(), SessionError>;
 
     #[inline(always)]
     pub fn global() -> Result<&'static Self, SessionError>;
 
     #[inline(always)]
-    pub fn session(&self) -> &SessionMain<u32>;
+    pub fn session(&self) -> &SessionMain;
 
     // Transport -> Session direction. Validates the numeric backlink and
     // mutates only the current runtime worker's Session entry.

@@ -517,7 +517,7 @@ fn configure_iperf3(config: Iperf3Config) -> RuntimeResult<()> {
 
 #[hammer_component_macros::init_function(
     name = "iperf3_init",
-    runs_after = ["tcp_init", "session_lookup_init"]
+    runs_after = ["tcp_init", "session_lookup_init", "application_init"]
 )]
 fn init_iperf3(_: &mut DataPlaneMain) -> RuntimeResult<()> {
     let config = IPERF3_CONFIG.get().cloned().unwrap_or_default();

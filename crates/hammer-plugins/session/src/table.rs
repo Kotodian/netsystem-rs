@@ -1,7 +1,7 @@
 use hammer_infra::bihash::{Bihash16x8, Bihash48x8};
 use hammer_service::session::SessionTable;
 
-use crate::config::IpSessionTableConfig;
+use crate::config::IpSessionConfig;
 
 pub(crate) type Ip4SessionTable = SessionTable<Bihash16x8, Bihash16x8>;
 pub(crate) type Ip6SessionTable = SessionTable<Bihash48x8, Bihash48x8>;
@@ -23,21 +23,21 @@ pub(crate) struct IpSessionTable {
 }
 
 impl IpSessionTable {
-    pub(crate) fn ip4(config: IpSessionTableConfig) -> Self {
+    pub(crate) fn ip4(config: IpSessionConfig) -> Self {
         Self {
             hashes: IpSessionTableHashes::Ip4(ip4_hashes(config)),
             appns_indices: Vec::new(),
         }
     }
 
-    pub(crate) fn ip6(config: IpSessionTableConfig) -> Self {
+    pub(crate) fn ip6(config: IpSessionConfig) -> Self {
         Self {
             hashes: IpSessionTableHashes::Ip6(ip6_hashes(config)),
             appns_indices: Vec::new(),
         }
     }
 
-    pub(crate) fn local(config: IpSessionTableConfig) -> Self {
+    pub(crate) fn local(config: IpSessionConfig) -> Self {
         Self {
             hashes: IpSessionTableHashes::Local(LocalTable {
                 ip4: ip4_hashes(config),
@@ -100,14 +100,14 @@ impl IpSessionTable {
     }
 }
 
-fn ip4_hashes(config: IpSessionTableConfig) -> Ip4SessionTable {
+fn ip4_hashes(config: IpSessionConfig) -> Ip4SessionTable {
     SessionTable::new(
         Bihash16x8::with_memory_size(config.v4_session_buckets(), config.v4_session_memory()),
         Bihash16x8::with_memory_size(config.v4_halfopen_buckets(), config.v4_halfopen_memory()),
     )
 }
 
-fn ip6_hashes(config: IpSessionTableConfig) -> Ip6SessionTable {
+fn ip6_hashes(config: IpSessionConfig) -> Ip6SessionTable {
     SessionTable::new(
         Bihash48x8::with_memory_size(config.v6_session_buckets(), config.v6_session_memory()),
         Bihash48x8::with_memory_size(config.v6_halfopen_buckets(), config.v6_halfopen_memory()),

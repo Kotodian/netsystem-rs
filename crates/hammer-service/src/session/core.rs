@@ -39,44 +39,6 @@ pub type SessionTimeDispatch =
 
 pub const SESSION_INDEX_INVALID: u32 = u32::MAX;
 
-// Compatibility names for callers that still cross the old retval boundary.
-// Internal Session/Transport operations use SessionError below; these are
-// deprecated and are not part of the ADR-0038 Rust contract.
-#[deprecated(note = "use Result<(), SessionError>; SESSION_E_NONE is an ABI retval only")]
-pub const SESSION_E_NONE: i32 = 0;
-#[deprecated(note = "use SessionError::Unknown")]
-pub const SESSION_E_UNKNOWN: i32 = -1;
-#[deprecated(note = "use SessionError::Allocation")]
-pub const SESSION_E_ALLOC: i32 = -4;
-#[deprecated(note = "use SessionError::NoRoute")]
-pub const SESSION_E_NOROUTE: i32 = -6;
-#[deprecated(note = "use SessionError::NoInterface")]
-pub const SESSION_E_NOINTF: i32 = -7;
-#[deprecated(note = "use SessionError::NoIp")]
-pub const SESSION_E_NOIP: i32 = -8;
-#[deprecated(note = "use SessionError::NoPort")]
-pub const SESSION_E_NOPORT: i32 = -9;
-#[deprecated(note = "use SessionError::NotSupported")]
-pub const SESSION_E_NOSUPPORT: i32 = -10;
-#[deprecated(note = "use SessionError::NoSession")]
-pub const SESSION_E_NOSESSION: i32 = -12;
-#[deprecated(note = "use SessionError::PortInUse")]
-pub const SESSION_E_PORTINUSE: i32 = -15;
-#[deprecated(note = "use SessionError::Invalid")]
-pub const SESSION_E_INVALID: i32 = -19;
-#[deprecated(note = "use SessionError::SegmentNoSpace")]
-pub const SESSION_E_SEG_NO_SPACE: i32 = -23;
-#[deprecated(note = "use SessionError::SegmentCreate")]
-pub const SESSION_E_SEG_CREATE: i32 = -25;
-#[deprecated(note = "use SessionError::MessageQueueAllocation")]
-pub const SESSION_E_MQ_MSG_ALLOC: i32 = -31;
-#[deprecated(note = "use SessionError::TransportNotRegistered")]
-pub const SESSION_E_TRANSPORT_NO_REG: i32 = -40;
-#[deprecated(note = "use SessionEventEnqueue::Busy")]
-pub const SESSION_EVENT_QUEUE_LOCK_FAILED: i32 = -1;
-#[deprecated(note = "use SessionEventEnqueue::Full")]
-pub const SESSION_EVENT_QUEUE_FULL: i32 = -2;
-
 #[repr(C)]
 #[derive(
     Clone, Copy, Debug, Default, PartialEq, Eq, Hash, KnownLayout, FromBytes, Immutable, IntoBytes,
@@ -118,9 +80,6 @@ pub struct SessionConfig {
     pub worker_count: u32,
     pub configured_worker_mq_length: u32,
     pub worker_mq_segment_size: usize,
-    pub event_ring_capacity: u32,
-    pub event_element_size: u32,
-    pub session_capacity: u32,
     pub preallocated_sessions: u32,
     pub session_enable_asap: bool,
     pub poll_main: bool,
@@ -133,11 +92,8 @@ impl Default for SessionConfig {
     fn default() -> Self {
         Self {
             worker_count: 1,
-            configured_worker_mq_length: 2_048,
-            worker_mq_segment_size: 64 << 20,
-            event_ring_capacity: 2_048,
-            event_element_size: size_of::<SessionEvent>() as u32,
-            session_capacity: 1_024,
+            configured_worker_mq_length: 0,
+            worker_mq_segment_size: 0,
             preallocated_sessions: 0,
             session_enable_asap: false,
             poll_main: false,
@@ -240,7 +196,9 @@ pub struct PoolReallocationState {
     pub workers_doing_work: u32,
 }
 
+#[repr(C)]
 pub struct SessionWorker {
+    cacheline0: hammer_infra::align::CacheLineAlignMark,
     sessions: Pool<Session>,
     event_queue_index: u32,
     last_time: f64,
@@ -303,9 +261,20 @@ pub enum RxDelivery {
 
 impl SessionWorker {
     fn new(worker_index: u32, config: SessionConfig) -> Self {
+        let preallocated_per_worker = if config.worker_count == 1 {
+            config.preallocated_sessions
+        } else {
+            ((u64::from(config.preallocated_sessions) * 11)
+                / (u64::from(config.worker_count) * 10)) as u32
+        };
+        let event_capacity = config.configured_worker_mq_length.max(2_048) as usize;
         Self {
             cacheline0: hammer_infra::align::CacheLineAlignMark,
-            sessions: Pool::with_capacity(config.session_capacity as usize),
+            sessions: if preallocated_per_worker == 0 {
+                Pool::new()
+            } else {
+                Pool::with_fixed_capacity(preallocated_per_worker)
+            },
             event_queue_index: worker_index,
             last_time: 0.0,
             last_time_us: 0,
@@ -317,7 +286,7 @@ impl SessionWorker {
             queue_node: None,
             timer_fd: -1,
             timer_fd_file: u64::MAX,
-            timer: TimerWheel1t2w2048sl::new(config.event_ring_capacity as usize),
+            timer: TimerWheel1t2w2048sl::new(event_capacity),
             flags: SessionWorkerFlags {
                 adaptive: !config.no_adaptive,
             },
@@ -327,8 +296,8 @@ impl SessionWorker {
                 SessionWorkerState::Interrupt
             },
             tx_context: SessionTxContext::default(),
-            event_elements: Pool::with_capacity(config.event_ring_capacity as usize),
-            control_event_data: Pool::with_capacity(config.event_ring_capacity as usize),
+            event_elements: Pool::with_capacity(event_capacity),
+            control_event_data: Pool::with_capacity(event_capacity),
             control_events: LinkedList::new(),
             new_events: LinkedList::new(),
             old_events: LinkedList::new(),
@@ -2055,17 +2024,15 @@ impl SessionMain {
     }
 
     pub fn allocate_event_queues(&mut self) -> Result<(), SessionError> {
-        if self.config.event_ring_capacity == 0 || self.config.configured_worker_mq_length == 0 {
-            return Err(SessionError::Invalid);
-        }
-        let ring = [SvmMsgQRingConfig::new(
-            self.config.event_ring_capacity,
-            size_of::<SessionEvent>() as u32,
-        )];
+        let queue_length = self.config.configured_worker_mq_length.max(2_048);
+        let rings = [
+            SvmMsgQRingConfig::new(queue_length, size_of::<SessionEvent>() as u32),
+            SvmMsgQRingConfig::new(queue_length >> 1, 256),
+        ];
         let config = SvmMsgQConfig {
             consumer_pid: std::process::id() as i32,
-            q_nitems: self.config.configured_worker_mq_length,
-            rings: &ring,
+            q_nitems: queue_length,
+            rings: &rings,
         };
         for worker_index in self.worker_mq_segment.mqs.len() as u32..self.config.worker_count {
             if let Err(source) = self

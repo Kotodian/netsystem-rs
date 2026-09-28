@@ -300,9 +300,10 @@ hammer_component_macros::declare_plugin!(
 );
 ```
 
-`session_capacity` 由 service `SessionConfig` 提供；FIFO pair 的容量和 segment 参数由
-ADR-0040 `ApplicationConfig.segment: SegmentManagerProperties` 提供。iperf3 不定义同名
-`fifo_capacity`/`session_capacity` 字段。配置中的两个 `SocketAddr` 只是输入值；
+Session pool 默认动态增长；service `SessionConfig.preallocated_sessions` 若非零则按 VPP
+`session.c:2071-2088` 预分配固定池。FIFO pair 的容量和 segment 参数由 ADR-0040
+`ApplicationConfig.segment: SegmentManagerProperties` 提供。iperf3 不定义同名
+`fifo_capacity` 或 Session pool 容量字段。配置中的两个 `SocketAddr` 只是输入值；
 plugin-session 将 namespace/IP 事实解析成既有的
 `IpSessionEndpointConfig = SessionEndpointConfig<IpTransportEndpointConfig>`；plugin-session
 先按 Application Namespace 生成监听实例，Session/application 操作消费 worker、opaque 等请求

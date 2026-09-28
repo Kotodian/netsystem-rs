@@ -6,7 +6,7 @@ use hammer_service::net::FibSource;
 use hammer_service::session::{SessionLookup, SessionLookupResult};
 use std::cell::UnsafeCell;
 
-use crate::config::IpSessionTableConfig;
+use crate::config::IpSessionConfig;
 use crate::endpoint::{IpHalfOpenHandle, IpSessionEndpoint, IpTransportConnectionId};
 use crate::table::IpSessionTable;
 
@@ -251,7 +251,7 @@ struct IpSessionLookupState {
 
 pub struct IpSessionLookup {
     state: UnsafeCell<IpSessionLookupState>,
-    config: IpSessionTableConfig,
+    config: IpSessionConfig,
 }
 
 // SAFETY: table-pool and FIB-map mutation is confined to startup or a
@@ -260,7 +260,7 @@ pub struct IpSessionLookup {
 unsafe impl Sync for IpSessionLookup {}
 
 impl IpSessionLookup {
-    pub fn new(config: IpSessionTableConfig) -> Self {
+    pub fn new(config: IpSessionConfig) -> Self {
         let mut tables = Pool::new();
         let ip4 = tables.insert(IpSessionTable::ip4(config));
         let ip6 = tables.insert(IpSessionTable::ip6(config));

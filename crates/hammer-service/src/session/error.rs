@@ -28,10 +28,6 @@ pub enum SessionQueueError {
         #[source]
         source: FifoSegmentError,
     },
-    #[error("Session capacity {capacity} does not fit u32")]
-    SessionCapacityOverflow { capacity: usize },
-    #[error("Session event queue capacity {capacity} does not fit u32")]
-    EventQueueCapacityOverflow { capacity: usize },
 }
 
 #[hammer_component_macros::runtime_error(subsystem = "session")]

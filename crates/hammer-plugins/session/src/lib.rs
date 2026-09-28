@@ -16,7 +16,7 @@ mod transport;
 pub use api::{
     AppNamespaceAddDel, AppNamespaceAddDelReply, AppNamespaceAddDelRetval, InterfaceIndex,
 };
-pub use config::{IpSessionConfig, IpSessionTableConfig};
+pub use config::IpSessionConfig;
 pub use endpoint::{
     ENDPOINT_INVALID_INDEX, IpHalfOpenHandle, IpSessionEndpoint, IpSessionEndpointConfig,
     IpTransportConnectionId, IpTransportEndpoint, IpTransportEndpointConfig,
@@ -29,7 +29,7 @@ pub use transport::{
     LocalEndpointCleanupState,
 };
 
-static SESSION_TABLE_CONFIG: OnceLock<IpSessionTableConfig> = OnceLock::new();
+static SESSION_TABLE_CONFIG: OnceLock<IpSessionConfig> = OnceLock::new();
 
 pub(crate) fn ip_session_config() -> Option<IpSessionConfig> {
     SESSION_TABLE_CONFIG.get().copied()
@@ -39,7 +39,7 @@ pub(crate) fn ip_session_config() -> Option<IpSessionConfig> {
     name = "session_table_config",
     section = "network",
     early = true,
-    runs_after = ["session_config"]
+    runs_after = ["runtime_worker_config"]
 )]
 fn configure_session_tables(config: config::NetworkSessionConfig) -> RuntimeResult<()> {
     let config = config.session.unwrap_or_default();

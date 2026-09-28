@@ -1,15 +1,15 @@
 //! Session layer — shared in `hammer-service` (not a loadable plugin).
 
-use std::sync::{Arc, OnceLock};
+use std::sync::Arc;
 use std::time::Duration;
 
 use hammer_core::data_plane::NodeState;
 use hammer_infra::svm::fifo_segment::{FifoSegmentError, SvmFifoSegment, SvmFifoSegmentConfig};
+use hammer_infra::svm::msg_queue::{SvmMsgQ, SvmMsgQConfig, SvmMsgQError, SvmMsgQRingConfig};
 use hammer_infra::svm::ssvm::{SsvmConfig, SsvmPrivate, SsvmSegmentBackend};
 use hammer_runtime::{DataPlaneMain, RuntimeResult};
 
 pub mod app;
-pub mod config;
 pub mod core;
 pub mod endpoint;
 pub mod error;
@@ -21,13 +21,8 @@ pub mod table;
 
 pub use app::{ApplicationConfig, ApplicationEventResult, ApplicationFlags, SessionCleanup};
 pub use app::{ApplicationError, ApplicationMain, ApplicationListener, AppWorker};
-pub use config::Session as SessionSettings;
 pub use core::{
-    PoolReallocationState, RxDelivery, SESSION_E_ALLOC, SESSION_E_INVALID, SESSION_E_MQ_MSG_ALLOC,
-    SESSION_E_NOINTF, SESSION_E_NOIP, SESSION_E_NONE, SESSION_E_NOPORT, SESSION_E_NOROUTE,
-    SESSION_E_NOSESSION, SESSION_E_NOSUPPORT, SESSION_E_PORTINUSE, SESSION_E_SEG_CREATE,
-    SESSION_E_SEG_NO_SPACE, SESSION_E_TRANSPORT_NO_REG, SESSION_E_UNKNOWN,
-    SESSION_EVENT_QUEUE_FULL, SESSION_EVENT_QUEUE_LOCK_FAILED, SESSION_INDEX_INVALID, AppSession, Session,
+    PoolReallocationState, RxDelivery, SESSION_INDEX_INVALID, AppSession, Session,
     SessionConfig, SessionControlData, SessionDmaTransfer, SessionEvent, SessionEventElement,
     SessionEventEnqueue, SessionEventType, SessionFlags, SessionHandle, SessionMain,
     SessionMigrationRequest, SessionMigrationState, SessionRxSegment, SessionState,
@@ -46,57 +41,39 @@ pub use segment_manager::{
 };
 pub use table::SessionTable;
 
-static SESSION_CONFIG: OnceLock<config::Session> = OnceLock::new();
-
-pub fn session_config() -> &'static config::Session {
-    SESSION_CONFIG
-        .get()
-        .expect("Session configuration is installed before Session initialization")
-}
-
-#[hammer_component_macros::config_function(
-    name = "session_config",
-    section = "network",
-    early = true,
-    runs_after = ["runtime_worker_config"]
-)]
-fn configure_session(config: config::NetworkSessionConfig) -> RuntimeResult<()> {
-    let session = config.session.unwrap_or_default();
-    session.validate()?;
-    assert!(
-        SESSION_CONFIG.set(session).is_ok(),
-        "Session configuration callback executes once"
-    );
-    Ok(())
-}
-
-#[hammer_component_macros::init_function(
-    name = "session_init",
-    runs_after = ["application_init"]
-)]
+#[hammer_component_macros::init_function(name = "session_init")]
 fn init_session() -> RuntimeResult<()> {
-    let settings = session_config();
     let worker_count = hammer_runtime::config::worker::worker_count();
     let mut config = core::SessionConfig::default();
-    config.worker_count = worker_count as u32;
-    config.session_capacity = u32::try_from(settings.pool_capacity).map_err(|_| {
-        SessionQueueError::SessionCapacityOverflow {
-            capacity: settings.pool_capacity,
-        }
-    })?;
-    let event_capacity = u32::try_from(settings.app_mq_capacity).map_err(|_| {
-        SessionQueueError::EventQueueCapacityOverflow {
-            capacity: settings.app_mq_capacity,
-        }
-    })?;
-    config.configured_worker_mq_length = event_capacity;
-    config.event_ring_capacity = event_capacity;
-    config.session_enable_asap = false;
+    config.worker_count = u32::try_from(worker_count)
+        .expect("configured worker count fits u32");
+    let queue_length = config.configured_worker_mq_length.max(2_048);
+    let rings = [
+        SvmMsgQRingConfig::new(queue_length, std::mem::size_of::<core::SessionEvent>() as u32),
+        SvmMsgQRingConfig::new(queue_length >> 1, 256),
+    ];
+    let queue_config = SvmMsgQConfig {
+        consumer_pid: 0,
+        q_nitems: queue_length,
+        rings: &rings,
+    };
+    // VPP session.c:1737-1765: one two-ring MQ per worker, plus 1 MiB
+    // for extended configuration messages outside the rings.
+    let segment_size = SvmMsgQ::size_to_alloc(&queue_config)
+        .and_then(|size| {
+            size.checked_mul(worker_count)
+                .ok_or(SvmMsgQError::LayoutOverflow)
+        })
+        .and_then(|size| size.checked_add(1 << 20).ok_or(SvmMsgQError::LayoutOverflow))
+        .map_err(|source| SessionQueueError::SegmentCreate {
+            source: FifoSegmentError::from(source),
+        })?
+        .max(config.worker_mq_segment_size);
     let mapping = Arc::new(
         SsvmPrivate::server_init_fifo_segment(&SsvmConfig {
-            backend: SsvmSegmentBackend::Private,
+            backend: SsvmSegmentBackend::Memfd,
             name: "hammer-session-worker-mq".to_owned(),
-            size: config.worker_mq_segment_size,
+            size: segment_size,
             requested_va: 0,
             huge_page: false,
             attach_timeout: Duration::from_secs(1),
@@ -117,7 +94,10 @@ fn init_session() -> RuntimeResult<()> {
     Ok(())
 }
 
-#[hammer_component_macros::init_function(name = "application_init")]
+#[hammer_component_macros::init_function(
+    name = "application_init",
+    runs_after = ["session_init"]
+)]
 fn init_application() -> RuntimeResult<()> {
     SegmentManagerMain::init(SegmentManagerProperties::default());
     app::ApplicationMain::init(

@@ -16,15 +16,13 @@ pub struct IpSessionConfig {
     pub transport: crate::transport::IpTransportConfig,
 }
 
-pub type IpSessionTableConfig = IpSessionConfig;
-
 #[derive(Debug, Default, serde::Deserialize)]
 #[serde(default)]
 pub(crate) struct NetworkSessionConfig {
-    pub session: Option<IpSessionTableConfig>,
+    pub session: Option<IpSessionConfig>,
 }
 
-impl IpSessionTableConfig {
+impl IpSessionConfig {
     #[inline]
     pub(crate) const fn v4_session_buckets(self) -> u32 {
         configured_or_default(self.v4_session_table_buckets, DEFAULT_SESSION_TABLE_BUCKETS)

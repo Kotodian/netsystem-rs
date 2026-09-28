@@ -254,11 +254,11 @@ pub struct SessionHandle {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct SessionConfig {
     pub worker_count: u32,
+    // VPP session.c:1737-1779: at least 2048 entries; two rings per worker.
     pub configured_worker_mq_length: u32,
+    // Zero selects computed MQ size plus 1 MiB; a nonzero value is a floor.
     pub worker_mq_segment_size: usize,
-    pub event_ring_capacity: u32,
-    pub event_element_size: u32,
-    pub session_capacity: u32,
+    // VPP session.c:2071-2088: nonzero preallocation uses a fixed Session pool.
     pub preallocated_sessions: u32,
     pub session_enable_asap: bool,
     pub poll_main: bool,
@@ -1133,11 +1133,11 @@ struct IpSessionLookupState {
 
 pub struct IpSessionLookup {
     state: UnsafeCell<IpSessionLookupState>,
-    config: IpSessionTableConfig,
+    config: IpSessionConfig,
 }
 
 impl IpSessionLookup {
-    pub fn new(config: IpSessionTableConfig) -> Self;
+    pub fn new(config: IpSessionConfig) -> Self;
 
     #[inline]
     pub fn table_index(&self, family: IpSessionFamily, fib_index: u32) -> u32;
@@ -1170,9 +1170,9 @@ impl Iterator for SessionTableIterator<'_> {
 
 // VPP: session lookup and transport/session backlink paths, session.c:1923-1931.
 pub struct IpSessionMain {
-    session: &'static SessionMain<u32>,
+    session: &'static SessionMain,
     lookup: IpSessionLookup,
-    transport: &'static IpTransportMain,
+    transport: IpTransportMain,
 }
 
 static IP_SESSION_MAIN: OnceLock<IpSessionMain> = OnceLock::new();
@@ -1181,10 +1181,8 @@ impl IpSessionMain {
     // VPP: session manager initialization followed by transport_init;
     // session.c:2018-2050, transport.c:1251-1290.
     pub fn init(
-        session_config: SessionConfig,
-        table_config: IpSessionTableConfig,
+        table_config: IpSessionConfig,
         transport_config: IpTransportConfig,
-        worker_mq_segment: hammer_infra::svm::fifo_segment::SvmFifoSegment,
     ) -> Result<(), SessionError>;
 
     // VPP: session_main is one process-wide instance, session.h:310 and
@@ -1192,7 +1190,7 @@ impl IpSessionMain {
     pub fn global() -> Result<&'static Self, SessionError>;
 
     #[inline(always)]
-    pub fn session(&self) -> &SessionMain<u32>;
+    pub fn session(&self) -> &SessionMain;
 
     #[inline(always)]
     pub fn transport(&self) -> &IpTransportMain;
