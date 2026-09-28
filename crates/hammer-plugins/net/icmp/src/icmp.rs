@@ -248,9 +248,10 @@ fn register_icmp4_input(runtime: &DataPlaneMain) -> RuntimeResult<NodeId> {
     )?;
     runtime.register_node_errors(node, &IcmpInputError::DESCRIPTORS)?;
     hammer_plugin_ip::register_ip4_protocol(runtime.nodes(), IpProtocol::Icmpv4.into(), node)?;
-    main.ip4_input_node
-        .set(node)
-        .expect("ICMP input node installed once");
+    assert!(
+        main.ip4_input_node.replace(Some(node)).is_none(),
+        "ICMP input node installed once"
+    );
     Ok(node)
 }
 
@@ -290,9 +291,10 @@ fn register_icmp6_input(runtime: &DataPlaneMain) -> RuntimeResult<NodeId> {
             ip6.entries[icmp_type].spec.min_len = min_len;
         }
     }
-    main.ip6_input_node
-        .set(node)
-        .expect("ICMP input node installed once");
+    assert!(
+        main.ip6_input_node.replace(Some(node)).is_none(),
+        "ICMP input node installed once"
+    );
     Ok(node)
 }
 
@@ -305,7 +307,7 @@ impl crate::IcmpMain {
         node: NodeId,
     ) -> RuntimeResult<u16> {
         hammer_runtime::ensure_main_thread_with_barrier()?;
-        let consumer = *match version {
+        let consumer = match version {
             IpVersion::V4 => self.ip4_input_node.get(),
             IpVersion::V6 => self.ip6_input_node.get(),
         }
@@ -794,9 +796,10 @@ mod tests {
             &Icmp4InputNext::NEXT_NAMES,
         )?;
         runtime.register_node_errors(ip4_input, &IcmpInputError::DESCRIPTORS)?;
-        main.ip4_input_node
-            .set(ip4_input)
-            .expect("ICMP4 input node installs once");
+        assert!(
+            main.ip4_input_node.replace(Some(ip4_input)).is_none(),
+            "ICMP4 input node installs once"
+        );
 
         let ip6_input = runtime.nodes().try_register_internal_with_next_names(
             Icmp6InputNode::new(),
@@ -816,9 +819,10 @@ mod tests {
                 ip6.entries[icmp_type].spec.min_len = min_len;
             }
         }
-        main.ip6_input_node
-            .set(ip6_input)
-            .expect("ICMP6 input node installs once");
+        assert!(
+            main.ip6_input_node.replace(Some(ip6_input)).is_none(),
+            "ICMP6 input node installs once"
+        );
 
         let ip4_echo = runtime.nodes().try_register_internal_with_next_names(
             Icmp4EchoRequestNode::new(),

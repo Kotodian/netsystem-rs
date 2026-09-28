@@ -78,12 +78,6 @@ fn start_workers(main: &mut DataPlaneMain) -> RuntimeResult<()> {
             .install_node_interrupts(main.nodes().node_count());
     }
     let barrier = barrier::install(worker_count, participant_count);
-    for thread_index in 1..threads.thread_count() {
-        threads
-            .thread_by_index(thread_index)
-            .expect("configured runtime thread descriptor exists")
-            .install_barrier(barrier.clone());
-    }
     barrier.arm();
     for (worker_slot, worker_main) in worker_mains.into_iter().enumerate() {
         let thread_index = worker_slot as u32 + 1;

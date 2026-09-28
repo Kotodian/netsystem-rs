@@ -1,6 +1,6 @@
 use std::cell::UnsafeCell;
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, OnceLock};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::thread::JoinHandle;
 use std::time::Duration;
 
@@ -17,7 +17,6 @@ fn data_worker_entry(_: u32) -> RuntimeResult<()> {
 #[repr(C)]
 pub struct WorkerThread {
     cacheline0: CacheLineAlignMark,
-    barrier: OnceLock<crate::WorkerBarrier>,
     cacheline1: CacheLineAlignMark,
     thread_index: u32,
     name: &'static str,
@@ -30,7 +29,8 @@ pub struct WorkerThread {
     numa_memory_binding: bool,
     entry: fn(u32) -> RuntimeResult<()>,
     no_data_structure_clone: bool,
-    join_handle: OnceLock<JoinHandle<RuntimeResult<()>>>,
+    join_handle: UnsafeCell<Option<JoinHandle<RuntimeResult<()>>>>,
+    join_handle_ready: AtomicBool,
     node_interrupts: UnsafeCell<Option<Box<[AtomicU64]>>>,
     cacheline2: CacheLineAlignMark,
     main_loop_count: AtomicU64,
@@ -41,7 +41,6 @@ pub struct WorkerThread {
 const _: () = {
     assert!(core::mem::align_of::<WorkerThread>() == CACHE_LINE);
     assert!(core::mem::offset_of!(WorkerThread, cacheline0) == 0);
-    assert!(core::mem::offset_of!(WorkerThread, barrier) == 0);
     assert!(core::mem::offset_of!(WorkerThread, cacheline1) % CACHE_LINE == 0);
     assert!(
         core::mem::offset_of!(WorkerThread, thread_index)
@@ -51,9 +50,9 @@ const _: () = {
     assert!(core::mem::offset_of!(WorkerThread, loops_per_second) % CACHE_LINE == 0);
 };
 
-// SAFETY: node_interrupts is installed once before any worker launch or
-// producer publication. Its allocation is never replaced afterward; only the
-// contained atomics are accessed concurrently.
+// SAFETY: node_interrupts is installed before worker launch. join_handle has
+// one main-thread writer; its release-ready flag gates every concurrent read.
+// Neither allocation changes after publication.
 unsafe impl Sync for WorkerThread {}
 
 impl WorkerThread {
@@ -78,7 +77,6 @@ impl WorkerThread {
         );
         Self {
             cacheline0: CacheLineAlignMark,
-            barrier: OnceLock::new(),
             cacheline1: CacheLineAlignMark,
             thread_index,
             name,
@@ -91,7 +89,8 @@ impl WorkerThread {
             numa_memory_binding,
             entry: entry.unwrap_or(data_worker_entry),
             no_data_structure_clone,
-            join_handle: OnceLock::new(),
+            join_handle: UnsafeCell::new(None),
+            join_handle_ready: AtomicBool::new(false),
             node_interrupts: UnsafeCell::new(None),
             cacheline2: CacheLineAlignMark,
             main_loop_count: AtomicU64::new(0),
@@ -139,15 +138,14 @@ impl WorkerThread {
         self.no_data_structure_clone
     }
 
-    pub(crate) fn install_barrier(&self, barrier: crate::WorkerBarrier) {
-        assert!(self.barrier.set(barrier).is_ok(), "barrier installs once");
-    }
-
     pub(crate) fn install_node_interrupts(&self, node_count: usize) {
         // SAFETY: start_workers calls this before launching any worker. No
         // producer has a published Session queue NodeId at this point.
         let interrupts = unsafe { &mut *self.node_interrupts.get() };
-        assert!(interrupts.is_none(), "Data Worker node interrupts install once");
+        assert!(
+            interrupts.is_none(),
+            "Data Worker node interrupts install once"
+        );
         *interrupts = Some(
             (0..node_count.div_ceil(64))
                 .map(|_| AtomicU64::new(0))
@@ -166,7 +164,11 @@ impl WorkerThread {
             .get(node.slot() as usize / 64)
             .expect("published node is within the worker graph");
         bit.fetch_or(1_u64 << (node.slot() % 64), Ordering::Release);
-        if let Some(thread) = self.join_handle.get() {
+        if self.join_handle_ready.load(Ordering::Acquire) {
+            // SAFETY: the acquire load observes the main thread's handle install.
+            let thread = unsafe { &*self.join_handle.get() }
+                .as_ref()
+                .expect("ready WorkerThread has a launch handle");
             thread.thread().unpark();
         }
     }
@@ -183,9 +185,16 @@ impl WorkerThread {
 
     #[inline]
     pub(crate) fn is_current(&self) -> bool {
-        self.join_handle
-            .get()
-            .is_some_and(|thread| thread.thread().id() == std::thread::current().id())
+        if !self.join_handle_ready.load(Ordering::Acquire) {
+            return false;
+        }
+        // SAFETY: the acquire load observes the immutable launch handle.
+        unsafe { &*self.join_handle.get() }
+            .as_ref()
+            .expect("ready WorkerThread has a launch handle")
+            .thread()
+            .id()
+            == std::thread::current().id()
     }
 
     pub(crate) fn launch(
@@ -200,14 +209,11 @@ impl WorkerThread {
             "no-data-structure-clone registration controls DataPlaneMain ownership"
         );
         assert!(
-            self.join_handle.get().is_none(),
+            unsafe { &*self.join_handle.get() }.is_none(),
             "WorkerThread launches once"
         );
-        let barrier = self
-            .barrier
-            .get()
-            .expect("worker barrier installs before thread launch")
-            .clone();
+        let barrier =
+            crate::barrier::global().expect("worker barrier installs before thread launch");
         let thread_index = self.thread_index;
         let name = self.name;
         let instance_index = self.instance_index;
@@ -271,10 +277,14 @@ impl WorkerThread {
                 name,
                 source,
             })?;
+        // SAFETY: only the main thread launches workers, and the startup
+        // barrier prevents worker execution until this handle is installed.
+        let handle = unsafe { &mut *self.join_handle.get() };
         assert!(
-            self.join_handle.set(thread).is_ok(),
-            "WorkerThread launch handle installs once"
+            handle.replace(thread).is_none(),
+            "WorkerThread launches once"
         );
+        self.join_handle_ready.store(true, Ordering::Release);
         Ok(())
     }
 }

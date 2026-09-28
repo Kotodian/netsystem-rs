@@ -1,6 +1,7 @@
+use std::cell::UnsafeCell;
 use std::fmt;
+use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, OnceLock};
 use std::thread;
 
 use crate::error::RuntimeResult;
@@ -59,8 +60,13 @@ pub struct DataPlaneHandoff {
 struct DataPlaneHandoffInner {
     queues: Box<[ArrayQueue<HandoffFrame>]>,
     worker_interrupt_pending: Box<[Vec<AtomicBool>]>,
-    worker_interrupt_threads: Box<[OnceLock<thread::Thread>]>,
+    worker_interrupt_threads: Box<[UnsafeCell<Option<thread::Thread>>]>,
+    worker_interrupt_ready: Box<[AtomicBool]>,
 }
+
+// SAFETY: each worker writes only its own thread handle once. A release store
+// to its ready flag publishes the handle to acquire-loading producers.
+unsafe impl Sync for DataPlaneHandoffInner {}
 
 impl fmt::Debug for DataPlaneHandoffInner {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -178,7 +184,8 @@ impl DataPlaneHandoff {
                 worker_interrupt_pending: (0..workers)
                     .map(|_| (0..node_capacity).map(|_| AtomicBool::new(false)).collect())
                     .collect(),
-                worker_interrupt_threads: (0..workers).map(|_| OnceLock::new()).collect(),
+                worker_interrupt_threads: (0..workers).map(|_| UnsafeCell::new(None)).collect(),
+                worker_interrupt_ready: (0..workers).map(|_| AtomicBool::new(false)).collect(),
             }),
         }
     }
@@ -263,9 +270,15 @@ impl DataPlaneHandoffWorker {
 
     #[inline]
     pub(crate) fn attach_current_thread(&self) {
-        if let Some(slot) = self.inner.worker_interrupt_threads.get(self.worker.slot()) {
-            let _ = slot.set(thread::current());
-        }
+        let slot = self.inner.worker_interrupt_threads[self.worker.slot()].get();
+        // SAFETY: only this worker installs its own handle before its loop can
+        // park; acquire readers cannot observe it until ready is published.
+        let handle = unsafe { &mut *slot };
+        assert!(
+            handle.replace(thread::current()).is_none(),
+            "handoff worker attaches once"
+        );
+        self.inner.worker_interrupt_ready[self.worker.slot()].store(true, Ordering::Release);
     }
 
     #[inline]
@@ -279,13 +292,14 @@ impl DataPlaneHandoffWorker {
         if bit.swap(true, Ordering::Release) {
             return;
         }
-        if let Some(thread) = self
-            .inner
-            .worker_interrupt_threads
-            .get(worker.slot())
-            .and_then(OnceLock::get)
-        {
-            thread.unpark();
+        if self.inner.worker_interrupt_ready[worker.slot()].load(Ordering::Acquire) {
+            // SAFETY: the acquire load observes the worker's handle install,
+            // and that handle remains immutable for the handoff lifetime.
+            let thread = unsafe { &*self.inner.worker_interrupt_threads[worker.slot()].get() };
+            thread
+                .as_ref()
+                .expect("ready handoff worker has a thread handle")
+                .unpark();
         }
     }
 

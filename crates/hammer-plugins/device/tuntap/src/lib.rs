@@ -1,4 +1,4 @@
-use std::cell::{RefCell, RefMut, UnsafeCell};
+use std::cell::{Cell, RefCell, RefMut, UnsafeCell};
 use std::fmt;
 use std::io;
 use std::os::fd::{AsFd, AsRawFd, FromRawFd, OwnedFd};
@@ -119,7 +119,7 @@ struct TuntapThreadSlot {
 
 struct TuntapMain {
     file: UnsafeCell<TuntapFile>,
-    rx_next: OnceLock<TuntapRxNext>,
+    rx_next: Cell<Option<TuntapRxNext>>,
     threads: Box<[TuntapThreadSlot]>,
     mtu_bytes: u32,
     hw_if_index: u32,
@@ -127,8 +127,9 @@ struct TuntapMain {
 }
 
 // SAFETY: every runtime thread permanently borrows only the slot selected by
-// its immutable runtime thread index. File state and rx_next are changed only
-// by thread zero during startup or after packet dispatch has stopped.
+// its immutable runtime thread index. File state changes only by thread zero
+// during startup or after packet dispatch has stopped; rx_next is installed
+// before workers launch and stays immutable during dispatch.
 unsafe impl Sync for TuntapMain {}
 
 static TUNTAP_MAIN: OnceLock<TuntapMain> = OnceLock::new();
@@ -270,7 +271,7 @@ impl TuntapMain {
             .into_boxed_slice();
         let main = Self {
             file: UnsafeCell::new(file),
-            rx_next: OnceLock::new(),
+            rx_next: Cell::new(None),
             threads,
             mtu_bytes: config.mtu,
             hw_if_index,
@@ -325,8 +326,7 @@ impl TuntapMain {
     }
 
     fn rx_next(&self) -> TuntapRxNext {
-        *self
-            .rx_next
+        self.rx_next
             .get()
             .expect("tuntap input next layout is published before graph dispatch")
     }
@@ -629,8 +629,8 @@ fn tuntap_input_init(main: &mut DataPlaneMain) -> RuntimeResult<()> {
     assert!(
         tuntap
             .rx_next
-            .set(TuntapRxNext::resolve(main.nodes()))
-            .is_ok(),
+            .replace(Some(TuntapRxNext::resolve(main.nodes())))
+            .is_none(),
         "tuntap input next layout is published once"
     );
     Ok(())

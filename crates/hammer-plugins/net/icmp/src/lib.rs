@@ -1,4 +1,4 @@
-use std::cell::UnsafeCell;
+use std::cell::{Cell, UnsafeCell};
 use std::sync::OnceLock;
 
 use hammer_core::data_plane::{NodeId, NodeNext};
@@ -11,13 +11,14 @@ mod protocol;
 pub struct IcmpMain {
     ip4: UnsafeCell<icmp::IcmpInputTable>,
     ip6: UnsafeCell<icmp::IcmpInputTable>,
-    ip4_input_node: OnceLock<NodeId>,
-    ip6_input_node: OnceLock<NodeId>,
+    ip4_input_node: Cell<Option<NodeId>>,
+    ip6_input_node: Cell<Option<NodeId>>,
 }
 
 // SAFETY: tables are initialized before graph publication. Subsequent writes
 // require the main-thread worker barrier; packet readers copy one entry and
-// do not return references into either table.
+// do not return references into either table. Input Node identities are only
+// accessed on the main thread under that same registration precondition.
 unsafe impl Sync for IcmpMain {}
 
 static ICMP_MAIN: OnceLock<IcmpMain> = OnceLock::new();
@@ -31,8 +32,8 @@ impl IcmpMain {
             ip6: UnsafeCell::new(icmp::IcmpInputTable::new(NodeNext::slot(
                 icmp::Icmp6InputNext::Punt,
             ))),
-            ip4_input_node: OnceLock::new(),
-            ip6_input_node: OnceLock::new(),
+            ip4_input_node: Cell::new(None),
+            ip6_input_node: Cell::new(None),
         };
         assert!(
             ICMP_MAIN.set(main).is_ok(),
